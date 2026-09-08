@@ -1254,6 +1254,22 @@ fn amd_bench(
         // ask whether TP's own geometry (K3's 12 local KDA heads at BV=8, against
         // the 96-head BV=16 shape every block gate validates) changed the answer.
         let dump = |e: &AmdEngine, tag: &str| -> Result<(), Box<dyn std::error::Error>> {
+            // PLOW_DUMP_ACT, same contract as the TP closure below. It used to exist only
+            // there, so every single-GPU model on this box — Gemma-4 among them — silently
+            // dumped nothing and the caller saw an empty range report rather than an error.
+            if let Some(spec) = plowrt::config::RuntimeConfig::get().amd.dump_act.as_ref() {
+                for one in spec.split(',').filter(|s| !s.is_empty()) {
+                    if let Some((name, path)) = one.split_once(':') {
+                        let n = e
+                            .tensor_bytes(name)
+                            .ok_or_else(|| format!("PLOW_DUMP_ACT: no tensor {name}"))?
+                            as usize;
+                        let mut buf = vec![0u8; n];
+                        e.read_tensor(name, &mut buf)?;
+                        std::fs::write(format!("{path}.{tag}.bin"), &buf)?;
+                    }
+                }
+            }
             let Some(dir) = &dump_logits else {
                 return Ok(());
             };

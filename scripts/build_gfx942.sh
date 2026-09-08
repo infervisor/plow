@@ -60,6 +60,18 @@ case "$HIP_VERSION" in
   *) echo "FAIL: expected HIP 7.14 from the flake" >&2; exit 2 ;;
 esac
 INC="-I$R/amd -I$R/common"
+# F5 DEBUG BUILD (`PLOW_NORM_RANGE_CHECK=1`, optionally `PLOW_NORM_SS_MAX=1e12f`): arm op_norm.h's
+# sum-of-squares assertion. It goes on the INCLUDE line, not into an AX_* set, because it has to
+# reach EVERY row -- GM_AX lands only on the GEMM-tile rows, and the point of a range campaign is
+# that no norm anywhere escapes it. NOT A SHIPPING CONFIGURATION: the objects trap on violation,
+# they are not bit-identical to the default build (measured +61 instructions in `d_rmsnorm`, ~9%
+# on a decode norm), and the object contract at the bottom of this script will report the drift.
+# See op_norm.h for the contract and the measured margins that keep it off by default.
+if [ -n "${PLOW_NORM_RANGE_CHECK:-}" ]; then
+  INC="$INC -DPLOW_NORM_RANGE_CHECK=$PLOW_NORM_RANGE_CHECK"
+  [ -n "${PLOW_NORM_SS_MAX:-}" ] && INC="$INC -DPLOW_NORM_SS_MAX=$PLOW_NORM_SS_MAX"
+  echo "   !! NORM RANGE CHECK ARMED (debug build, not shippable): ${INC#*-I$R/common }"
+fi
 JOBS="${JOBS:-8}"
 mkdir -p "$OUT"; cd "$OUT"
 

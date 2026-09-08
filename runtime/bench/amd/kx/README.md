@@ -230,6 +230,7 @@ is the *cheap* half of the evidence, and the campaign is still the *sufficient* 
 | `gemv_mm` | what does a batch-1 packet pay on an MM=4 decode object? | 15.52 vs 25.86 ms/token recorded; kx reads 15.27 vs 26.64, bit-identical output |
 | `gemv_tile` | at short-K decode shapes, does R=2 beat R=4? | R=2 is the shipped choice (3.907 vs 4.039 ms/token); the ragged R=1 tail eats R=4 |
 | `fa_softmax` | does the DPP row softmax cut the tile's LDS permutes, bit-identically? | 160 `ds_bpermute` → 64 `ds_swizzle`, `s_waitcnt` 122 → 47, bit-identical; plus a trap arm that must be rejected |
+| `norm_ss` | what would a scale-safe RMSNorm cost, and is the default-off range check free? | the two-pass is +15.8% of GLM-5.3's per-token norm budget; `PLOW_NORM_RANGE_CHECK=1` is bit-identical and +2.1% |
 
 ## Prior art in this directory
 

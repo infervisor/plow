@@ -1960,7 +1960,7 @@ __device__ __forceinline__ void gemv_norm_lds(bf16* __restrict__ lds, const bf16
             }
         /* block_sum syncthreads on both sides, so the whole workgroup agrees on `inv` before
          * anyone overwrites the staged row it was reduced from. */
-        const float inv = rsqrtf(block_sum(ss, part) / (float)K + eps);
+        const float inv = rsqrtf(rn_ss(block_sum(ss, part)) / (float)K + eps);
 #pragma unroll
         for (int c = 0; c < RN_VEC; c++) {
             const unsigned i = (threadIdx.x + (unsigned)c * PLOW_THREADS) * 8;
@@ -5153,7 +5153,7 @@ __device__ __forceinline__ void gemv_nrn_lds(bf16* __restrict__ lds, bf16* __res
                 const float f = bf2f(bv[c][j]);
                 ssb += f * f;
             }
-        const float invb = rsqrtf(block_sum(ssb, part) / (float)K + eps);
+        const float invb = rsqrtf(rn_ss(block_sum(ssb, part)) / (float)K + eps);
         /* resid = (a + norm(b)*gb) * scale, ROUNDED to bf16; the SECOND reduction runs over the
          * rounded value, exactly reproducing op 23's bf16 store + reload. */
         bf16v8 rv[RN_VEC];
@@ -5171,7 +5171,7 @@ __device__ __forceinline__ void gemv_nrn_lds(bf16* __restrict__ lds, bf16* __res
             }
             rv[c] = r;
         }
-        const float invr = rsqrtf(block_sum(ssr, part) / (float)K + eps);
+        const float invr = rsqrtf(rn_ss(block_sum(ssr, part)) / (float)K + eps);
 #pragma unroll
         for (int c = 0; c < RN_VEC; c++) {
             const unsigned i = (threadIdx.x + (unsigned)c * PLOW_THREADS) * 8;

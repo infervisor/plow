@@ -32,6 +32,34 @@ constexpr unsigned rn_groups = 1;
 constexpr unsigned rn_threads = PLOW_THREADS * rn_groups;
 constexpr unsigned rn_vecs = RN_VEC * rn_groups;
 
+/* THE INPUT-RANGE CONTRACT OF EVERY REDUCTION IN THIS FILE, and the debug build that asserts it.
+ *                                             [F5, plans/gpu-kernel-static-audit-20260908.md]
+ * Every norm here reduces sum(x_i^2) in FP32 over bf16 inputs. bf16 carries FP32's exponent
+ * range with 8 bits of mantissa, so a FINITE, exactly-representable input can square to +inf:
+ * x = 2^64 gives x*x = +inf, and the whole row then normalizes to zero (rsqrt(inf) = 0) or, in
+ * d_layernorm_bias, to NaN (inf - inf). The reduction can also overflow while every individual
+ * square is finite. The contract is therefore
+ *
+ *      sum over the row of x_i^2  <  FLT_MAX          i.e.  max|x_i| < sqrt(FLT_MAX/feat)
+ *
+ * which at feat=6144 is |x| < 7.44e16 and at feat=128 is |x| < 5.16e17.
+ *
+ * IT IS NOT ENFORCED IN THE SHIPPED BODIES, and that is a measurement, not an oversight. On the
+ * two checkpoints this branch serves, the largest value ANY norm input takes is
+ *
+ *      GLM-5.3 TP4   max|x| = 1080    (final model.norm input, ctx 128..8192 + decode)
+ *      Gemma-4 31B   max|x| =   55    (k_norm input; residual path 35.5)
+ *
+ * i.e. 1.7e16x and 3.4e17x below the per-element overflow point, and 1.2e32x / 4.6e34x below the
+ * per-row one. A scale-safe two-pass normalization would buy that margin on every token of every
+ * layer; the margin is already there. See docs/amd/norm-and-recurrent-numerics.md.
+ *
+ * `PLOW_NORM_RANGE_CHECK=1` builds the assertion in: every reduced sum-of-squares in this file
+ * is checked against `PLOW_NORM_SS_MAX` and a violating workgroup traps. Default 0, and the
+ * helper is then an identity, so the shipped objects contain no instruction from it.
+ * The helper itself is in amd_common.h, beside RN_REG and for the same reason: op_gemm.h's
+ * fused-norm GEMV reduces the same sum and is included FIRST. */
+
 __device__ __forceinline__ unsigned rn_index(unsigned c) {
     return (threadIdx.x + (c % RN_VEC) * rn_threads +
             (c / RN_VEC) * PLOW_THREADS) * 8;
@@ -151,7 +179,7 @@ __device__ void d_rmsnorm(bf16* __restrict__ out, const bf16* __restrict__ x,
                 }
             }
             /* CONSUME: reduce, scale, store. No HBM read from here on. */
-            const float inv = rsqrtf(rn_sumsq(v, part) / (float)feat + eps);
+            const float inv = rsqrtf(rn_ss(rn_sumsq(v, part)) / (float)feat + eps);
 #pragma unroll
             for (int c = 0; c < rn_vecs; c++) {
                 const unsigned i = rn_index(c);
@@ -212,7 +240,7 @@ __device__ void d_rmsnorm(bf16* __restrict__ out, const bf16* __restrict__ x,
                 const float v = bf2f(x[base + i]);
                 ss += v * v;
             }
-            const float inv = rsqrtf(block_sum(ss, part) / (float)feat + eps);
+            const float inv = rsqrtf(rn_ss(block_sum(ss, part)) / (float)feat + eps);
             float amax = 0.0f;
             for (unsigned i = threadIdx.x; i < feat; i += PLOW_THREADS) {
                 const float g = gamma ? bf2f(gamma[i]) : 1.0f;
@@ -260,7 +288,7 @@ __device__ void d_rowrms(float* __restrict__ rms, const bf16* __restrict__ x, un
             const float v = bf2f(xg[base + i]);
             ss += v * v;
         }
-        const float inv = rsqrtf(block_sum(ss, part) / (float)feat + eps);
+        const float inv = rsqrtf(rn_ss(block_sum(ss, part)) / (float)feat + eps);
         if (threadIdx.x == 0) st_act<float>(&rms[row], inv);
     }
 }
@@ -272,6 +300,21 @@ __device__ void d_rowrms(float* __restrict__ rms, const bf16* __restrict__ x, un
  * (feat=128) so the streaming path is fine (one CU, ~256 B). Two reductions (sum, sumsq) in one pass;
  * gamma/beta are the learned weight/bias. `out_row0` offsets only the output row (mirrors d_rmsnorm),
  * so the decode step can write the current token's index-key into its [ctx][DI] cache slot. */
+/* `msq - mean*mean` IS NOT EVALUATED AS TWO ROUNDINGS ON gfx942, so the cancellation half of F5
+ * does not describe this build. hipcc -O3 contracts it into ONE `v_fma_f32 v2, -v8, v8, v2`
+ * (verified in the disassembly of this body), i.e. mean*mean is not rounded before the subtract.
+ * The audit's own example -- 127 copies of bf16 255 and one 256 -- is 0.0078125 vs a true
+ * 0.00775146484375 (+0.787%) UNCONTRACTED, and EXACT under the FMA the compiler actually emits.
+ *
+ * The same holds across the magnitude range, and for a structural reason worth keeping: feat is
+ * 128 here, so (a) each thread owns exactly one element and `block_sum` is a balanced butterfly,
+ * (b) `/(float)feat` is a power-of-two division and exact, and (c) severe cancellation requires a
+ * near-constant row, whose bf16 squares share one exponent and therefore sum EXACTLY in fp32.
+ * Simulating the kernel's reduction over near-constant bf16 rows from |x| = 255 to 2^20 gives the
+ * contracted variance exactly right in every case, and never negative -- so the `rsqrt` of a
+ * cancelled-negative variance is not reachable at this shape either. A two-pass centered variance
+ * would cost a second reduction and a second barrier on a one-CU decode packet to fix an error
+ * that is measured at zero. Do not add it here without a shape that shows the error. */
 __device__ void d_layernorm_bias(bf16* __restrict__ out, const bf16* __restrict__ x,
                                  const bf16* __restrict__ gamma, const bf16* __restrict__ beta,
                                  unsigned rows, unsigned feat, float eps, unsigned out_row0,
@@ -290,7 +333,7 @@ __device__ void d_layernorm_bias(bf16* __restrict__ out, const bf16* __restrict_
             ss += v * v;
         }
         const float mean = block_sum(s, part) / (float)feat;
-        const float msq = block_sum(ss, part) / (float)feat;
+        const float msq = rn_ss(block_sum(ss, part)) / (float)feat;
         const float inv = rsqrtf(msq - mean * mean + eps);
         for (unsigned i = threadIdx.x; i < feat; i += PLOW_THREADS) {
             const float g = gamma ? bf2f(gg[i]) : 1.0f;
@@ -477,7 +520,7 @@ __device__ void d_headnorm_rope(bf16* __restrict__ out, const bf16* __restrict__
             float ss = 0.0f;
 #pragma unroll
             for (unsigned e = 0; e < E; e++) ss += v[e] * v[e];
-            inv = rsqrtf(wave_sum(ss) / (float)hd + eps);
+            inv = rsqrtf(rn_ss(wave_sum(ss)) / (float)hd + eps);
         }
 #pragma unroll
         for (unsigned e = 0; e < E; e++) v[e] = v[e] * inv * g[e];
@@ -590,7 +633,7 @@ __device__ void d_headnorm_rope_fp8(unsigned char* __restrict__ out, float* __re
             float ss = 0.0f;
 #pragma unroll
             for (unsigned e = 0; e < E; e++) ss += v[e] * v[e];
-            inv = rsqrtf(wave_sum(ss) / (float)hd + eps);
+            inv = rsqrtf(rn_ss(wave_sum(ss)) / (float)hd + eps);
         }
 #pragma unroll
         for (unsigned e = 0; e < E; e++) v[e] = v[e] * inv * g[e];
@@ -661,7 +704,7 @@ __device__ void d_norm_residual(bf16* __restrict__ out, const bf16* __restrict__
                 }
             }
             /* CONSUME. */
-            const float inv = rsqrtf(rn_sumsq(v, part) / (float)feat + eps);
+            const float inv = rsqrtf(rn_ss(rn_sumsq(v, part)) / (float)feat + eps);
 #pragma unroll
             for (int c = 0; c < rn_vecs; c++) {
                 const unsigned i = rn_index(c);
@@ -681,7 +724,7 @@ __device__ void d_norm_residual(bf16* __restrict__ out, const bf16* __restrict__
                 const float x = bf2f(b[base + i]);
                 ss += x * x;
             }
-            const float inv = rsqrtf(block_sum(ss, part) / (float)feat + eps);
+            const float inv = rsqrtf(rn_ss(block_sum(ss, part)) / (float)feat + eps);
             for (unsigned i = threadIdx.x; i < feat; i += PLOW_THREADS) {
                 const float g = gamma ? bf2f(gamma[i]) : 1.0f;
                 st_act1(&out[base + i], f2bf((bf2f(a[base + i]) + bf2f(b[base + i]) * inv * g) * scale));
@@ -745,7 +788,7 @@ __device__ void d_add_norm(bf16* __restrict__ out, bf16* resid, const bf16* a,
                     r[c * 8 + j] = f;
                     ss += f * f;
                 }
-            const float inv = rsqrtf(block_sum(ss, part) / (float)feat + eps);
+            const float inv = rsqrtf(rn_ss(block_sum(ss, part)) / (float)feat + eps);
 #pragma unroll
             for (int c = 0; c < RN_VEC; c++) {
                 const unsigned i = (threadIdx.x + (unsigned)c * PLOW_THREADS) * 8;
@@ -768,7 +811,7 @@ __device__ void d_add_norm(bf16* __restrict__ out, bf16* resid, const bf16* a,
                 const float f = bf2f(a[base + i]) + bf2f(b[base + i]);
                 ss += f * f;
             }
-            const float inv = rsqrtf(block_sum(ss, part) / (float)feat + eps);
+            const float inv = rsqrtf(rn_ss(block_sum(ss, part)) / (float)feat + eps);
             for (unsigned i = threadIdx.x; i < feat; i += PLOW_THREADS) {
                 const float g = gamma ? bf2f(gamma[i]) : 1.0f;
                 const float f = bf2f(a[base + i]) + bf2f(b[base + i]);
@@ -876,7 +919,7 @@ __device__ void d_norm_residual_norm(bf16* __restrict__ out, bf16* resid, const 
                     const float f = bf2f(bv[c][j]);
                     ssb += f * f;
                 }
-            const float invb = rsqrtf(block_sum(ssb, part) / (float)feat + eps);
+            const float invb = rsqrtf(rn_ss(block_sum(ssb, part)) / (float)feat + eps);
             /* resid = (a + norm(b)*gb) * scale, ROUNDED to bf16; SECOND reduction runs over the
              * rounded value, exactly reproducing NORM_RESIDUAL's bf16 store + RMSNORM's reload. */
             bf16v8 rv[RN_VEC];
@@ -894,7 +937,7 @@ __device__ void d_norm_residual_norm(bf16* __restrict__ out, bf16* resid, const 
                 }
                 rv[c] = r;
             }
-            const float invr = rsqrtf(block_sum(ssr, part) / (float)feat + eps);
+            const float invr = rsqrtf(rn_ss(block_sum(ssr, part)) / (float)feat + eps);
 #pragma unroll
             for (int c = 0; c < RN_VEC; c++) {
                 const unsigned i = (threadIdx.x + (unsigned)c * PLOW_THREADS) * 8;
@@ -915,7 +958,7 @@ __device__ void d_norm_residual_norm(bf16* __restrict__ out, bf16* resid, const 
                 const float f = bf2f(b[base + i]);
                 ssb += f * f;
             }
-            const float invb = rsqrtf(block_sum(ssb, part) / (float)feat + eps);
+            const float invb = rsqrtf(rn_ss(block_sum(ssb, part)) / (float)feat + eps);
             float ssr = 0.0f;
             for (unsigned i = threadIdx.x; i < feat; i += PLOW_THREADS) {
                 const float g = gb ? bf2f(gb[i]) : 1.0f;
@@ -924,7 +967,7 @@ __device__ void d_norm_residual_norm(bf16* __restrict__ out, bf16* resid, const 
                 const float rf = bf2f(rb);
                 ssr += rf * rf;
             }
-            const float invr = rsqrtf(block_sum(ssr, part) / (float)feat + eps);
+            const float invr = rsqrtf(rn_ss(block_sum(ssr, part)) / (float)feat + eps);
             for (unsigned i = threadIdx.x; i < feat; i += PLOW_THREADS) {
                 const float g = gn ? bf2f(gn[i]) : 1.0f;
                 st_act1(&out[base + i], f2bf(bf2f(resid[base + i]) * invr * g));

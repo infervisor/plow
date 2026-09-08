@@ -1195,6 +1195,33 @@ __device__ __forceinline__ float dequant_fp8(unsigned char b) {
 #define RN_REG 16
 #define RN_VEC (RN_REG / 8) /* 16 halves = 2 x bf16v8 */
 
+/* Debug-build assertion on a reduced sum-of-squares. The CONTRACT and the measured margins that
+ * justify leaving it off are documented at the top of op_norm.h; this lives here for the same
+ * reason RN_REG does -- op_gemm.h's fused-norm GEMV reduces the same sum and is included FIRST.
+ * `PLOW_NORM_RANGE_CHECK=1` arms it; `PLOW_NORM_SS_MAX` is the ceiling (default FLT_MAX, the
+ * real overflow point; lower it to bound the observed range from above -- a build at 1e12f that
+ * serves a campaign without trapping proves EVERY row of EVERY layer stayed 26 orders below
+ * overflow, which no post-hoc activation dump can show because the act buffers alias across
+ * layers). Off by default and then an identity, so no shipped object carries an instruction
+ * from it. The predicate is written negated so NaN and +inf both trap.
+ *
+ * A TRAP HERE HANGS, IT DOES NOT ABORT: the trapping workgroup dies and the rest of the persistent
+ * interpreter spins on its counter forever. Verified (a build capped below the measured maximum
+ * stops making progress and needs a manual kill). Every other `__builtin_trap` in this tree
+ * behaves the same way; "the campaign stopped advancing" is the signal. */
+#ifndef PLOW_NORM_RANGE_CHECK
+#define PLOW_NORM_RANGE_CHECK 0
+#endif
+#ifndef PLOW_NORM_SS_MAX
+#define PLOW_NORM_SS_MAX 3.4028234663852886e38f
+#endif
+__device__ __forceinline__ float rn_ss(float ss) {
+#if PLOW_NORM_RANGE_CHECK
+    if (!(ss >= 0.0f && ss <= PLOW_NORM_SS_MAX)) __builtin_trap();
+#endif
+    return ss;
+}
+
 __device__ __forceinline__ float wave_sum(float v) {
 #pragma unroll
     for (int off = 32; off > 0; off >>= 1) v += __shfl_xor(v, off, PLOW_WAVE);
