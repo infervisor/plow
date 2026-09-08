@@ -240,9 +240,9 @@ The compact-tail fixture needed the new optional worker-pinning argument before 
 
 ## Automatic prefix-cache qualification
 
-Prefix reuse now defaults on for validated Hopper (CC9.0) hybrid BF16-KV packets with
-HD256 sliding attention, HD512 full attention and window1024. Both Gemma BF16 and FP8
-weights qualify. The default retained-cache budget is4096MiB, including boundary snapshots;
+Prefix reuse now defaults on for validated Hopper (CC 9.0) hybrid BF16-KV packets with
+HD 256 sliding attention, HD 512 full attention and window 1024. Both Gemma BF16 and FP8
+weights qualify. The default retained-cache budget is 4096 MiB, including boundary snapshots;
 it is a soft cap while entries are pinned. Explicit `--vmm-prefix=false` disables reuse,
 while explicit true retains the broader supported-layout policy. Automatic selection
 excludes TP, recurrent state, mixed/prepared decode, and explicit packed-prefill/live-KV
@@ -251,16 +251,16 @@ packed route. Combined CUDA packed-prefill/prefix execution remains outstanding.
 
 The planner and runtime use the same eligibility decision. Cold-prefill benchmarking checks
 the actual loaded cache state. Host coverage includes selection, geometry rejection and
-explicit overrides:586CUDA/HSA library tests pass,14ignored;9CPUintegration tests pass.
+explicit overrides: 586 CUDA/HSA library tests pass, 14 ignored; 9 CPU integration tests pass.
 
 The frozen `bin/plowrt-prefix-auto` starts both batch-4 models without cache flags and logs
-`requested=None selected=true`. Each precision passes six natural cold/warm pairs at1K/4K/16K:
-all12completions match the preceding cold baseline, including exact warm/cold agreement.
-Four distinct16K cold prompts then complete concurrently, reproduce exactly on isolated
+`requested=None selected=true`. Each precision passes six natural cold/warm pairs at 1K/4K/16K:
+all 12 completions match the preceding cold baseline, including exact warm/cold agreement.
+Four distinct 16K cold prompts then complete concurrently, reproduce exactly on isolated
 replay, and are followed by successful short-request recovery. Output counts and finish
-reasons are checked. FP8 also preserves all9pressure completions from the explicit-cache
-baseline. Retained cache after pressure is3310MiB FP8 and2510MiB BF16, below4096MiB.
-BF16 GPU memory was observed at78880MiB during pressure. Both precisions pass API ragged
+reasons are checked. FP8 also preserves all 9 pressure completions from the explicit-cache
+baseline. Retained cache after pressure is 3310 MiB FP8 and 2510 MiB BF16, below 4096 MiB.
+BF16 GPU memory was observed at 78880 MiB during pressure. Both precisions pass API ragged
 parity, exact output limits, slot reuse, disconnects during prefill/decode, context rejection
 and recovery. An explicit-false FP8 restart generates identical repeated completions with
 zero cached tokens. These are correctness checks; CPU builds overlapped and their timings
@@ -271,3 +271,36 @@ Raw results are `plow-{bf16,fp8}-auto-*`, `plow-fp8-auto-off-*`, and
 H100 batch-4 configuration and default policy; it does not qualify larger batch assets,
 other GPU families, or the missing CUDA token-batch executor. The matched performance grid
 above still loses throughput to vLLM in every cell.
+
+## Larger batch assets and snapshot-copy experiment
+
+H100 assets with 1024-token maximum prefill chunks now compile at BF16 batch 8 and FP8 batch 16,
+with independently emitted widest-only reference packets. Full-logit GPU comparisons are
+bit-exact across 74 BF16 and 118 FP8 snapshots, including sparse slots and reset. VMM prefix
+allocation is enabled for these tests because fully resident virtual KV would exceed 80 GB.
+These gates used the experimental copy runtime described below; serving pressure, quality
+and performance at the larger capacities remain pending. Provenance and object hashes are
+in `larger-batch-c1024-qualification.json`.
+
+A separate experiment grouped snapshot heads with `cuMemcpy2DAsync_v2`. CUDA rejected the
+large partial full-KV VMM pitch: natural completions remained exact but short-prefix cache
+publication failed. The corrected experiment kept full-KV copies per head and grouped only
+sliding windows. It passes the H100 short/full/wrapped pitched-copy test, all 12 natural FP8
+cold/warm completions with exact warm cache counts, all 15 matched cached screen requests,
+four concurrent 16K cold requests with exact replay and short recovery, and all three API
+lifecycle checks. The corrected host suite also passes 586 tests, with 14 ignored.
+
+| Input | Concurrency | Per-head TTFT | Pitched sliding TTFT | Per-head tok/s | Pitched sliding tok/s |
+|---:|---:|---:|---:|---:|---:|
+| 1024 | 1 | 150.1ms | 154.0ms | 39.92 | 39.75 |
+| 1024 | 4 | 310.1ms | 290.0ms | 73.37 | 75.36 |
+| 4096 | 1 | 304.7ms | 288.2ms | 33.15 | 33.75 |
+| 4096 | 4 | 720.6ms | 695.6ms | 52.62 | 53.77 |
+| 16384 | 1 | 718.5ms | 711.3ms | 22.63 | 22.75 |
+| 16384 | 4 | 1766.9ms | 1751.5ms | 30.19 | 30.45 |
+
+These are single-wave screens, with identical prompts, completions and cached-token counts.
+The small changes and the 1K/C1 regression do not justify promotion without stronger timing
+and broader layout qualification. The branch retains the tested per-head copy implementation.
+Experimental binaries, source patches and results remain under `prefix-2d*` and
+`plow-fp8-2d*` in the campaign directory for follow-up.
