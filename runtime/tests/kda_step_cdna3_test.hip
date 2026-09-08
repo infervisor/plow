@@ -306,8 +306,10 @@ int main(int argc, char** argv) {
      * softplus sees. The default [-7,-1] is the K3-measured range (docs/kimi-k3-kda.md 3.1). The
      * TAIL case drives it to [-26,-20], where `log(1.0f + expf(s))` ABSORBS: fp32's `1.0f +` is
      * exactly 1 for every s <= -16.6355, the gate comes out exactly ZERO, and the recurrence stops
-     * forgetting. Nothing in the default case can see that -- its accumulated prefix error stays
-     * under 3e-6 either way -- so the tail case carries its own, tight bar.    [F6, gpu-audit] */
+     * forgetting. Nothing in the default case can see that -- its accumulated prefix error is
+     * 6.8e-5 vs 7.0e-5 either way, both far under the 2e-4 bar -- so the tail case carries its
+     * own, tight bar: 9.3e-13 for the shipped body against 2.8e-6 for the compat one.
+     *                                     [F6, plans/gpu-kernel-static-audit-20260908.md] */
     auto run_prefix = [&](unsigned mode, float dt_lo = -7.f, float dt_hi = -1.f,
                           double bar_g = 2e-4, const char* tag = "") -> double {
         const unsigned PT = 139, PH = 3, PD = 128;

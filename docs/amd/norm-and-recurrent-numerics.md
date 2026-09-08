@@ -124,9 +124,12 @@ prefill: 2048 tokens in 1575.2 ms -> 73115                      63 timed steps 6
 prefill: 8192 tokens in 3599.9 ms -> 429                        63 timed steps 67.952 ms/token
 ```
 
-So across **all 93 layers, every norm packet, every token of three contexts**, no row's
-sum-of-squares reached 1e12 — **3.4e26 x below FLT_MAX**. That is the all-layer statement the
-activation dumps cannot make.
+Gemma-4 31B on the same objects, contexts 128 / 1024 / 8192, 64 greedy decode steps each, also
+**no trap** (98.2 / 277.8 / 1694.7 ms prefill, 35.7 / 36.2 / 36.6 ms/token).
+
+So across **every layer of both models, every norm packet, every token of three contexts each**, no
+row's sum-of-squares reached 1e12 — **3.4e26 x below FLT_MAX**. That is the all-layer statement the
+activation dumps cannot make, because the act buffers alias.
 
 **Negative control**, because a tripwire that cannot fire proves nothing: the same build at
 `PLOW_NORM_SS_MAX=1e3f` (below the measured 2.883e6) does not complete. It **hangs** rather than
@@ -257,6 +260,10 @@ chunk gate bounded    (K3's path)   1.859e-05           1.859e-05        unchang
 chunk gate softplus   (K3 range)    6.822e-05           6.999e-05        bar 2e-4, both pass
 chunk gate softplus tail            2.833e-06           9.326e-13        3.0e6 x closer
 ```
+
+A second run of the same pair reads 7.902e-05 / 3.119e-06 and 9.201e-05 / 1.369e-12: the fixture
+is not bit-reproducible run to run (the numbers move by up to ~1.5x), but the tail separation is
+six orders of magnitude and does not depend on which run you take.
 
 Everything else in the file — BC16/BT64 intra, the W/U transform, the 4-chunk carry, prefill and
 batched-decode state walks, the gated norm, the packed spans — is unchanged and PASSes in both.
