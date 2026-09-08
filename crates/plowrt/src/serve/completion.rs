@@ -96,7 +96,7 @@ pub async fn completions(
         );
     }
     #[cfg(feature = "cuda")]
-    if let Some(mgr) = state.manager() {
+    if let Some(mgr) = state.manager_for(&req.model) {
         if mgr.manages(&req.model) {
             use crate::serve::manager::EnsureError;
             if let Err(e) = mgr.ensure_resident(&req.model).await {

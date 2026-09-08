@@ -94,6 +94,28 @@ pub struct RuntimeConfig {
     )]
     pub drain_timeout_ms: Option<u64>,
 
+    /// Device ordinals to serve on, e.g. `--devices 0,1,2,3`. Unset = every
+    /// GPU the driver enumerates. `CUDA_VISIBLE_DEVICES` / `ROCR_VISIBLE_DEVICES`
+    /// renumber underneath this, as usual.
+    #[arg(
+        long = "devices",
+        env = "PLOW_DEVICES",
+        value_delimiter = ',',
+        global = true
+    )]
+    pub devices: Vec<u32>,
+
+    /// How models are laid out over the visible devices: `spread` (one model
+    /// per GPU where possible), `pack` (fill a GPU while models fit), or
+    /// `explicit` (every model must name its device).
+    #[arg(
+        long = "place",
+        env = "PLOW_PLACE",
+        default_value = "spread",
+        global = true
+    )]
+    pub place: String,
+
     /// Directories under which `POST /v1/models/load` may take an assets dir.
     /// Repeatable; `PLOW_MODELS_ROOT` takes a `:`-separated list.
     ///

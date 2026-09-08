@@ -57,7 +57,7 @@ pub async fn chat_completions(
     // the manager's lock-free fast path. A switch that cannot fit sheds with
     // 503 + Retry-After (the client should back off, not hammer the planner).
     #[cfg(feature = "cuda")]
-    if let Some(mgr) = state.manager() {
+    if let Some(mgr) = state.manager_for(&req.model) {
         if mgr.manages(&req.model) {
             use crate::serve::manager::EnsureError;
             if let Err(e) = mgr.ensure_resident(&req.model).await {

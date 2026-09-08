@@ -34,6 +34,11 @@ pub struct LoadRequest {
     /// Checkpoint dir; defaults to `<assets>/checkpoint`.
     #[serde(default)]
     pub checkpoint: Option<String>,
+    /// Device ordinal to place a NEW model on. Ignored for a slug that is
+    /// already registered — a model does not move between GPUs by being
+    /// loaded again; unload it first.
+    #[serde(default)]
+    pub device: Option<u32>,
     /// Evict LRU co-tenants if the model does not otherwise fit. Off by
     /// default — an admin load must not silently take down another model.
     #[serde(default)]
@@ -85,16 +90,29 @@ pub struct ModelStatus {
     pub weights_mib: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kv_mib: Option<u64>,
+    /// Device ordinals this model is placed on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub devices: Option<Vec<u32>>,
+    /// Index of its device group.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<usize>,
+}
+
+/// One device group: its ordinals, its memory, and what is resident on it.
+#[derive(Debug, Serialize)]
+pub struct GroupStatus {
+    pub group: usize,
+    pub devices: Vec<u32>,
+    pub free_mib: u64,
+    pub total_mib: u64,
+    pub resident: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct StatusResponse {
     pub models: Vec<ModelStatus>,
-    /// Device free/total MiB, when a GPU manager is installed.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub device_free_mib: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub device_total_mib: Option<u64>,
+    /// One entry per device group. Empty on a CPU-only serve.
+    pub groups: Vec<GroupStatus>,
 }
 
 fn err(status: StatusCode, msg: impl std::fmt::Display) -> Response {
@@ -154,7 +172,41 @@ pub async fn load(State(state): State<Arc<AppState>>, Json(req): Json<LoadReques
 
     #[cfg(feature = "cuda")]
     {
-        let Some(mgr) = state.manager().cloned() else {
+        if state.managers().is_empty() {
+            return err(
+                StatusCode::NOT_IMPLEMENTED,
+                "no GPU model manager on this server",
+            );
+        }
+
+        // An already-registered slug keeps its group: loading is not a way to
+        // migrate a model between GPUs, and silently moving one would strand
+        // whatever capacity the operator had planned around it.
+        let target = match state.manager_for(&req.model) {
+            Some(m) => Some((state.slug_group(&req.model).unwrap_or(0), m.clone())),
+            None => {
+                let group = match req.device {
+                    Some(d) => match state
+                        .managers()
+                        .iter()
+                        .position(|m| m.ordinals().first() == Some(&d))
+                    {
+                        Some(g) => Some(g),
+                        None => {
+                            return err(
+                                StatusCode::BAD_REQUEST,
+                                format_args!("no device group starts at ordinal {d}"),
+                            )
+                        }
+                    },
+                    None => None,
+                };
+                state
+                    .manager_for_new(group)
+                    .map(|(g, m)| (g, m.clone()))
+            }
+        };
+        let Some((group, mgr)) = target else {
             return err(
                 StatusCode::NOT_IMPLEMENTED,
                 "no GPU model manager on this server",
@@ -179,6 +231,7 @@ pub async fn load(State(state): State<Arc<AppState>>, Json(req): Json<LoadReques
             if let Err(e) = mgr.register(&req.model, dir, ckpt) {
                 return err(StatusCode::BAD_REQUEST, e);
             }
+            state.set_slug_group(&req.model, group);
         }
 
         if !mgr.manages(&req.model) {
@@ -222,10 +275,10 @@ pub async fn load(State(state): State<Arc<AppState>>, Json(req): Json<LoadReques
 pub async fn unload(State(state): State<Arc<AppState>>, Json(req): Json<UnloadRequest>) -> Response {
     #[cfg(feature = "cuda")]
     {
-        let Some(mgr) = state.manager().cloned() else {
+        let Some(mgr) = state.manager_for(&req.model).cloned() else {
             return err(
-                StatusCode::NOT_IMPLEMENTED,
-                "no GPU model manager on this server",
+                StatusCode::NOT_FOUND,
+                format_args!("no model manager serves {:?}", req.model),
             );
         };
         if !mgr.manages(&req.model) {
@@ -281,32 +334,40 @@ pub async fn status(State(state): State<Arc<AppState>>) -> Response {
             required_mib: None,
             weights_mib: None,
             kv_mib: None,
+            devices: None,
+            group: None,
             model: slug.clone(),
         };
         #[cfg(feature = "cuda")]
-        if let Some(mgr) = state.manager() {
+        if let Some(mgr) = state.manager_for(&slug) {
             entry.required_mib = mgr.required(&slug).map(|b| b / MIB);
             if let Some(plan) = mgr.plan(&slug) {
                 entry.weights_mib = Some(plan.weights_bytes / MIB);
                 entry.kv_mib = Some(plan.kv_bytes / MIB);
             }
+            entry.devices = Some(mgr.ordinals());
+            entry.group = state.slug_group(&slug);
         }
         models.push(entry);
     }
 
-    let (mut device_free_mib, mut device_total_mib) = (None, None);
+    #[allow(unused_mut)]
+    let mut groups: Vec<GroupStatus> = Vec::new();
     #[cfg(feature = "cuda")]
-    if let Some(mgr) = state.manager() {
-        if let Ok((free, total)) = mgr.device_mem_info() {
-            device_free_mib = Some(free / MIB);
-            device_total_mib = Some(total / MIB);
-        }
+    for (i, mgr) in state.managers().iter().enumerate() {
+        let (free, total) = mgr.device_mem_info().unwrap_or((0, 0));
+        groups.push(GroupStatus {
+            group: i,
+            devices: mgr.ordinals(),
+            free_mib: free / MIB,
+            total_mib: total / MIB,
+            resident: mgr
+                .slugs()
+                .into_iter()
+                .filter(|s| state.has_gpu_engine(s))
+                .collect(),
+        });
     }
 
-    Json(StatusResponse {
-        models,
-        device_free_mib,
-        device_total_mib,
-    })
-    .into_response()
+    Json(StatusResponse { models, groups }).into_response()
 }

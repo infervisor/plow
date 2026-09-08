@@ -327,10 +327,19 @@ pub struct AppState {
     /// prefix sharing up) — a scrape must never queue behind a tick.
     #[cfg(feature = "cuda")]
     vmm_stats: RwLock<FxHashMap<String, crate::memory::vmm::VmmStatsHandle>>,
-    /// The S1 multi-model manager (residency + VRAM planner). Installed once
-    /// at startup when any bundle is GPU-managed; `None` on CPU-only serves.
+    /// One S1 residency manager per device group (residency + VRAM planner).
+    /// Installed once at startup; empty on CPU-only serves.
+    ///
+    /// Per group, not one manager taught about devices: every invariant a
+    /// manager holds is already per-card — one free-VRAM figure, one slab pool,
+    /// one LRU order, one switch lock — so instancing it per group keeps a load
+    /// on GPU 1 from serializing behind a switch on GPU 0.
     #[cfg(feature = "cuda")]
-    manager: std::sync::OnceLock<Arc<manager::ModelManager>>,
+    managers: std::sync::OnceLock<Vec<Arc<manager::ModelManager>>>,
+    /// slug → index into `managers`. The request path reads it to find the
+    /// group serving a model; the control plane reports it.
+    #[cfg(feature = "cuda")]
+    slug_group: RwLock<FxHashMap<String, usize>>,
     /// Directories a control-plane `load` may take an assets dir from. Set
     /// once at startup; empty means no assets dir may be named by request.
     models_roots: std::sync::OnceLock<Vec<std::path::PathBuf>>,
@@ -386,7 +395,9 @@ impl AppState {
             #[cfg(feature = "cuda")]
             vmm_stats: RwLock::new(FxHashMap::default()),
             #[cfg(feature = "cuda")]
-            manager: std::sync::OnceLock::new(),
+            managers: std::sync::OnceLock::new(),
+            #[cfg(feature = "cuda")]
+            slug_group: RwLock::new(FxHashMap::default()),
             models_roots: std::sync::OnceLock::new(),
             residency: RwLock::new(FxHashMap::default()),
             record_trace,
@@ -432,16 +443,64 @@ impl AppState {
         self.gpu.write().remove(slug)
     }
 
-    /// Install the S1 model manager (once, at startup).
+    /// Install the per-group residency managers (once, at startup).
     #[cfg(feature = "cuda")]
-    pub fn install_manager(&self, m: Arc<manager::ModelManager>) {
-        let _ = self.manager.set(m);
+    pub fn install_managers(&self, m: Vec<Arc<manager::ModelManager>>) {
+        let _ = self.managers.set(m);
     }
 
-    /// The S1 model manager, when multi-model GPU serving is active.
+    /// Install one manager — the single-group case, and what tests use.
     #[cfg(feature = "cuda")]
-    pub fn manager(&self) -> Option<&Arc<manager::ModelManager>> {
-        self.manager.get()
+    pub fn install_manager(&self, m: Arc<manager::ModelManager>) {
+        self.install_managers(vec![m]);
+    }
+
+    /// Record which group serves `slug`.
+    #[cfg(feature = "cuda")]
+    pub fn set_slug_group(&self, slug: &str, group: usize) {
+        self.slug_group.write().insert(slug.to_string(), group);
+    }
+
+    /// The group index serving `slug`, when placement assigned one.
+    #[cfg(feature = "cuda")]
+    pub fn slug_group(&self, slug: &str) -> Option<usize> {
+        self.slug_group.read().get(slug).copied()
+    }
+
+    /// Every installed manager, one per device group.
+    #[cfg(feature = "cuda")]
+    pub fn managers(&self) -> &[Arc<manager::ModelManager>] {
+        self.managers.get().map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// The manager for `slug`'s group.
+    ///
+    /// Placement is the authority; the fallback scan exists for managers
+    /// installed without a placement pass (tests, and the single-group case),
+    /// and for a slug registered at runtime before its group was recorded.
+    #[cfg(feature = "cuda")]
+    pub fn manager_for(&self, slug: &str) -> Option<&Arc<manager::ModelManager>> {
+        let managers = self.managers();
+        if let Some(g) = self.slug_group(slug) {
+            if let Some(m) = managers.get(g) {
+                return Some(m);
+            }
+        }
+        managers.iter().find(|m| m.manages(slug))
+    }
+
+    /// The manager a NEW model should be registered with: the named group, or
+    /// the one with the most free memory when the caller did not name one.
+    #[cfg(feature = "cuda")]
+    pub fn manager_for_new(&self, group: Option<usize>) -> Option<(usize, &Arc<manager::ModelManager>)> {
+        let managers = self.managers();
+        match group {
+            Some(g) => managers.get(g).map(|m| (g, m)),
+            None => managers
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, m)| m.device_mem_info().map(|(free, _)| free).unwrap_or(0)),
+        }
     }
 
     /// Install the assets-dir allow-list for control-plane loads (once, at

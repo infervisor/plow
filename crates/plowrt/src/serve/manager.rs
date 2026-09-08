@@ -67,9 +67,29 @@ use crate::{Result, RuntimeError};
 
 /// Planner headroom kept free on top of a model's requirement (driver slack,
 /// transient staging).
-const RESERVE: u64 = 256 << 20;
+pub const RESERVE: u64 = 256 << 20;
 /// Non-tensor overhead assumed before the first load measures the real value.
-const DEFAULT_OVERHEAD: u64 = 512 << 20;
+pub const DEFAULT_OVERHEAD: u64 = 512 << 20;
+
+/// Tensor-parallel fan-out declared by a bundle's blob, or 1 when it declares
+/// none. Read before any device is opened, so placement can size groups.
+pub fn tp_degree(dir: &Path) -> Result<u32> {
+    let Some(pkt) = DevBlob::find_in_dir(dir)? else {
+        return Ok(1);
+    };
+    let raw = std::fs::read(&pkt).map_err(|source| RuntimeError::Io {
+        path: pkt.clone(),
+        source,
+    })?;
+    // METADATA ONLY, as in `BlobPlan::from_dir_with_granularity` — this reads
+    // the TP header and never dispatches, so the L2-placement guard (which is
+    // the engine's job, against the code object) must not reject it here.
+    Ok(DevBlob::parse_l2(&raw, true)?
+        .tp
+        .map(|t| t.n_gpu)
+        .unwrap_or(1)
+        .max(1))
+}
 
 /// Per-model VRAM plan, derived from the blob header (sizes only — the blob
 /// carries no addresses).
@@ -123,7 +143,7 @@ impl BlobPlan {
         Self::from_dir_with_granularity(dir, None)
     }
 
-    fn from_dir_with_granularity(dir: &Path, granularity: Option<u64>) -> Result<BlobPlan> {
+    pub fn from_dir_with_granularity(dir: &Path, granularity: Option<u64>) -> Result<BlobPlan> {
         let pkt = DevBlob::find_in_dir(dir)?
             .ok_or_else(|| RuntimeError::Device(format!("no PLOWDEV blob in {}", dir.display())))?;
         let raw = std::fs::read(&pkt).map_err(|source| RuntimeError::Io {
@@ -376,6 +396,12 @@ impl ModelManager {
     /// Every registered slug, in registration order.
     pub fn slugs(&self) -> Vec<String> {
         self.models.read().iter().map(|m| m.slug.clone()).collect()
+    }
+
+    /// The device ordinals this manager's group covers. One today (a manager
+    /// owns one backend); a tensor-parallel group would report its whole run.
+    pub fn ordinals(&self) -> Vec<u32> {
+        vec![u32::from(self.be.device_ordinal)]
     }
 
     /// Device free/total bytes, for capacity reporting on the control plane.
