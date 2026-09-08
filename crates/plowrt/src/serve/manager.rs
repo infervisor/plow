@@ -843,6 +843,35 @@ impl ModelManager {
             ))));
         }
 
+        // `PLOW_PF_SEG_NONCOOP=1` drops the driver's co-residency admission on
+        // an explicitly stated premise: "the grid equals the module's queried
+        // resident capacity AND THE STREAM IS OTHERWISE IDLE, so all blocks
+        // schedule together" (`exec/gpu.rs`). A co-tenant on the same device
+        // makes the second half false, and the documented consequence is a
+        // spin "on counters owned by blocks that were never resident" — a hang,
+        // not an error, with no launch failure to catch it.
+        //
+        // So this is a refusal, not a warning: a diagnostic knob must not be
+        // able to deadlock a device by being left set.
+        if crate::config::RuntimeConfig::get().nv.pf_seg_noncoop {
+            let co_tenants: Vec<String> = self
+                .models
+                .read()
+                .iter()
+                .filter(|o| o.slug != m.slug)
+                .map(|o| o.slug.clone())
+                .filter(|slug| self.is_resident(slug))
+                .collect();
+            if !co_tenants.is_empty() {
+                return Err(EnsureError::Load(RuntimeError::Rejected(format!(
+                    "refusing to make {} co-resident with {:?} while PLOW_PF_SEG_NONCOOP is set: \
+                     non-cooperative launch assumes the device is otherwise idle, and a co-tenant \
+                     turns that assumption into a counter spin-hang. Unset it to share a device.",
+                    m.slug, co_tenants
+                ))));
+            }
+        }
+
         let (free_before, _) = self.be.mem_info().map_err(EnsureError::Load)?;
         let pool_before = VmmOps::pool_bytes(&*self.be);
         let be = Arc::clone(&self.be);
