@@ -54,8 +54,13 @@ emit)
   #     mismatched the reference;
   #   * `generation_config.json` was absent, so the eos set came from the
   #     `config.json` FALLBACK — identical for GLM-5.3 by luck, not by design;
-  #   * `chat_template.jinja` was absent, which nothing reads today but which
-  #     any template-driven prompt build will need.
+  #   * `chat_template.jinja` was absent. That comment used to say "nothing reads
+  #     this today"; it is now false. `serve/chat.rs` prefers the checkpoint's own
+  #     template over the built-in per-family builders, and its own note is the
+  #     reason to link it: the builders "are an approximation of a file the weights
+  #     already carry, and every divergence between the two is a wrong prompt".
+  #     Gemma-4's shipped template carries tool-calling, turn closure and thinking
+  #     content ordering that the built-in text-only subset does not.
   for f in tokenizer.json tokenizer_config.json chat_template.jinja generation_config.json; do
     [ -e "$RAW/$f" ] && ln -sfn "$RAW/$f" "$b/$f"
   done
