@@ -219,6 +219,7 @@ driver_api! {
     cuStreamSynchronize: fn(CUstream) -> CUresult,
     cuMemcpyHtoDAsync_v2: fn(CUdeviceptr, *const c_void, usize, CUstream) -> CUresult,
     cuMemcpyDtoHAsync_v2: fn(*mut c_void, CUdeviceptr, usize, CUstream) -> CUresult,
+    cuMemcpyDtoDAsync_v2: fn(CUdeviceptr, CUdeviceptr, usize, CUstream) -> CUresult,
     cuMemsetD8Async: fn(CUdeviceptr, u8, usize, CUstream) -> CUresult,
     cuEventCreate: fn(*mut CUevent, u32) -> CUresult,
     cuEventDestroy_v2: fn(CUevent) -> CUresult,
@@ -1359,6 +1360,24 @@ impl CudaBackend {
                 )
             },
             "cuMemcpyDtoHAsync",
+        )
+    }
+
+    /// Both device ranges must remain mapped until `stream` completes the copy.
+    pub fn memcpy_dtod_async(
+        &self,
+        dst: u64,
+        src: u64,
+        bytes: u64,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        self.bind()?;
+        self.check(
+            // SAFETY: caller keeps both device ranges live through stream completion.
+            unsafe {
+                (self.api.cuMemcpyDtoDAsync_v2)(dst, src, bytes as usize, stream.raw as CUstream)
+            },
+            "cuMemcpyDtoDAsync",
         )
     }
 

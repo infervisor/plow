@@ -4772,14 +4772,14 @@ impl GpuEngine {
                     let (r1, s1) = (hb + start * hd_b, off);
                     let (r2, s2) = (hb, off + run1 * hd_b);
                     if to_snap {
-                        self.be.memcpy_dtod(s1, r1, run1 * hd_b)?;
+                        self.be.memcpy_dtod_async(s1, r1, run1 * hd_b, &self.stream)?;
                         if run1 < w {
-                            self.be.memcpy_dtod(s2, r2, (w - run1) * hd_b)?;
+                            self.be.memcpy_dtod_async(s2, r2, (w - run1) * hd_b, &self.stream)?;
                         }
                     } else {
-                        self.be.memcpy_dtod(r1, s1, run1 * hd_b)?;
+                        self.be.memcpy_dtod_async(r1, s1, run1 * hd_b, &self.stream)?;
                         if run1 < w {
-                            self.be.memcpy_dtod(r2, s2, (w - run1) * hd_b)?;
+                            self.be.memcpy_dtod_async(r2, s2, (w - run1) * hd_b, &self.stream)?;
                         }
                     }
                     off += w * hd_b;
@@ -4803,9 +4803,9 @@ impl GpuEngine {
         let mut off = buf;
         let mut blit = |dev: u64, snap: u64, bytes: u64| -> Result<()> {
             if to_snap {
-                self.be.memcpy_dtod(snap, dev, bytes)
+                self.be.memcpy_dtod_async(snap, dev, bytes, &self.stream)
             } else {
-                self.be.memcpy_dtod(dev, snap, bytes)
+                self.be.memcpy_dtod_async(dev, snap, bytes, &self.stream)
             }
         };
         for &(sk, sv) in &v.slide_scale {
@@ -4867,8 +4867,8 @@ impl GpuEngine {
                 let dev = self.devp[index].base
                     + ((b as u64 * u64::from(g.kvh_full) + h) * u64::from(g.max_ctx) + row0)
                         * row_bytes;
-                if to_snap { self.be.memcpy_dtod(buf, dev, bytes)?; }
-                else { self.be.memcpy_dtod(dev, buf, bytes)?; }
+                if to_snap { self.be.memcpy_dtod_async(buf, dev, bytes, &self.stream)?; }
+                else { self.be.memcpy_dtod_async(dev, buf, bytes, &self.stream)?; }
                 buf += bytes;
             }
         }
@@ -4879,21 +4879,26 @@ impl GpuEngine {
     /// rings, fp8 ring scales, fp8 full-layer scale prefixes, partial full-KV.
     /// `to_snap` picks the direction (publish writes, attach restores).
     fn vmm_snap_copy(&self, b: usize, p_a: u32, buf: u64, to_snap: bool) -> Result<()> {
-        self.vmm_slide_copy(b, p_a, buf, to_snap)?;
-        let v = self.vmm.as_ref().expect("vmm_snap_copy without vmm");
-        if !v.slide_scale.is_empty() || !v.full_scale.is_empty() {
-            let g = v.kv.geometry();
-            let rings = v.slide.len() as u64
-                * 2
-                * g.kvh_slide as u64
-                * g.window.min(p_a) as u64
-                * (g.hd_slide * g.elem_slide) as u64;
-            self.vmm_scale_copy(b, p_a, buf + rings, to_snap)?;
-        }
-        let partial = buf + v.snap_row_bytes * u64::from(v.kv.geometry().window.min(p_a))
-            + self.vmm_full_scale_bytes(p_a);
-        self.vmm_partial_copy(b, p_a, partial, to_snap)?;
-        Ok(())
+        let copied = (|| {
+            self.vmm_slide_copy(b, p_a, buf, to_snap)?;
+            let v = self.vmm.as_ref().expect("vmm_snap_copy without vmm");
+            if !v.slide_scale.is_empty() || !v.full_scale.is_empty() {
+                let g = v.kv.geometry();
+                let rings = v.slide.len() as u64
+                    * 2
+                    * g.kvh_slide as u64
+                    * g.window.min(p_a) as u64
+                    * (g.hd_slide * g.elem_slide) as u64;
+                self.vmm_scale_copy(b, p_a, buf + rings, to_snap)?;
+            }
+            let partial = buf
+                + v.snap_row_bytes * u64::from(v.kv.geometry().window.min(p_a))
+                + self.vmm_full_scale_bytes(p_a);
+            self.vmm_partial_copy(b, p_a, partial, to_snap)
+        })();
+        // Drain even a partially submitted copy before VMM remapping or snapshot release.
+        let completed = self.be.stream_synchronize(&self.stream);
+        copied.and(completed)
     }
 
     /// Consult the prefix cache for slot `b`'s prompt and attach a published

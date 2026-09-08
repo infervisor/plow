@@ -59,12 +59,40 @@ The current progress commit adds publication at 32-token boundaries. Whole VMM b
 remain shared; partial full-KV blocks and sliding windows are copied from boundary snapshots.
 Snapshots remain pinned through restoration, and short prefixes use second-chance eviction.
 Five new host tests cover partial matching, private allocation, eviction, snapshot lifetime,
-and invalid publication. This path has not yet been validated on H100; the measurements
-above describe the preceding runtime. Prefix caching remains opt-in pending qualification.
+and invalid publication. Initial H100 testing found a warm-request CUDA memory fault:
+default-stream D2D copies could still be running when their VMM backing was remapped.
+Snapshot copies now run on the engine stream and finish before remapping or snapshot release.
+The real H100 backend test checks ordered kernel → D2D → D2H execution and passes.
+CUDA documents that device-to-device transfers do not synchronize the host.
+[CUDA API synchronization behavior](https://docs.nvidia.com/cuda/cuda-driver-api/api-sync-behavior.html).
+
+The corrected FP8 runtime passes six natural-text cold/warm pairs at 1K/4K/16K, all with
+64 generated tokens and exact agreement with the preceding runtime's cold completions.
+The cached workload screen also preserves all 15 measured completions and prompt hashes.
+
+| Input tokens | Cached tokens, concurrency 1 and 4 | TTFT at concurrency 1 | TTFT at concurrency 4 |
+|---|---:|---:|---:|
+| 1024 | 960 | 352 ms | 873 ms |
+| 4096 | 3872 | 993 ms | 2446 ms |
+| 16384 | 15552 | 2065 ms | 5132 ms |
+
+These are single-wave screens, following six cold/warm quality pairs. The preceding
+retirement screen followed six cold quality requests, so cache histories differ.
+Retained cache after the current screen is 3917.5 MiB against the 4096 MiB cap.
+The same FP8 server passes isolated-versus-concurrent ragged request parity, exact output
+limits, slot reuse, disconnects during prefill and decode, context rejection, and recovery.
+Retained cache remains under the cap after these checks.
+The 1K concurrency-1 TTFT still exceeds the earlier vLLM BF16 screen's 33.1 ms.
+BF16 cache serving, the full concurrency matrix, and production qualification remain pending.
+Prefix caching remains opt-in.
 
 Raw artifacts: `/opt/dlami/nvme/tmp/gemma31-glm53-h100-20260908/`.
 Host test log: `/tmp/plow-token-batch-readiness-tests-final.log`.
 Final lifecycle test log: `/tmp/plow-prefix-retire-tests.log`.
 Current partial-prefix host test log: `/tmp/plow-subblock-library-tests.log`.
+Stream-ordering verification: `/tmp/plow-subblock-stream-library-tests.log` and
+`/tmp/plow-subblock-stream-cuda-test.log`.
+Current GPU artifacts: `plow-fp8-stream-*`; source and executable hashes are in
+`plow-fp8-stream-provenance.json` under the raw-artifact directory.
 CPU integration log: `/tmp/plow-token-batch-cpu-integration-tests.log`.
 The compact-tail fixture needed the new optional worker-pinning argument before it could run.
