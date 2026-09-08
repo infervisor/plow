@@ -34,9 +34,12 @@ static int fails = 0;
  * K and V are HEAD-MAJOR: [n_kv_head][n_kv][hd]. See dev_isa.h -- flash reads one head at a
  * time, so head-major makes its rows contiguous. The buffers here are random, so the layout is
  * a free choice; it just has to match the kernel. */
+/* `sinks` (NULL = none) is GPT-OSS `self_attn.sinks`: one extra UNSCALED logit per head that
+ * joins the softmax denominator and contributes no value row — HF's
+ * `softmax(cat([qk*scale, sinks]))[..., :-1]`. dev_isa.h op 13 t3. */
 static void ref_attn(float* O, const bf16* Q, const bf16* K, const bf16* V, unsigned n_q,
                      unsigned n_kv, unsigned n_head, unsigned n_kv_head, unsigned hd,
-                     unsigned q_pos0, unsigned window, float scale) {
+                     unsigned q_pos0, unsigned window, float scale, const bf16* sinks) {
     const unsigned gqa = n_head / n_kv_head;
     double* s = malloc(sizeof(double) * n_kv);
     for (unsigned q = 0; q < n_q; q++)
@@ -54,7 +57,9 @@ static void ref_attn(float* O, const bf16* Q, const bf16* K, const bf16* V, unsi
                 s[kv] = d * scale;
                 if (s[kv] > mx) mx = s[kv];
             }
-            double sum = 0.0;
+            const double sink = sinks ? (double)bf2f(sinks[h]) : -1e300;
+            if (sinks && sink > mx) mx = sink;
+            double sum = sinks ? exp(sink - mx) : 0.0;
             for (unsigned kv = 0; kv < n_kv; kv++) {
                 s[kv] = (s[kv] <= -1e299) ? 0.0 : exp(s[kv] - mx);
                 sum += s[kv];
@@ -103,10 +108,12 @@ static void check(const char* what, const bf16* got, const float* want, size_t n
 static plow_hsa* H;
 static void* dev(size_t b) { return plow_hsa_alloc(H, 0, b); }
 
-static void prefill_case(plow_hsa_kernel* k, plow_hsa_kernel* mk, unsigned NCU,
-                         const char* label, unsigned hd, unsigned n_q, unsigned n_kv,
-                         unsigned n_head, unsigned n_kv_head, unsigned window,
-                         unsigned nsplit) {
+/* `sink_mag` != 0 runs the ATTENTION-SINK merge: per-head sinks are drawn in
+ * [-sink_mag, +sink_mag] and `mk` must be a *_sinks merge kernel (four pointers, not three). */
+static void prefill_case_s(plow_hsa_kernel* k, plow_hsa_kernel* mk, unsigned NCU,
+                           const char* label, unsigned hd, unsigned n_q, unsigned n_kv,
+                           unsigned n_head, unsigned n_kv_head, unsigned window,
+                           unsigned nsplit, float sink_mag) {
     const float SCALE = 1.0f; /* Gemma: no 1/sqrt(d) */
     const size_t nq = (size_t)n_q * n_head * hd;
     const size_t nkv = (size_t)n_kv * n_kv_head * hd;
@@ -115,18 +122,22 @@ static void prefill_case(plow_hsa_kernel* k, plow_hsa_kernel* mk, unsigned NCU,
     bf16* hK = plow_hsa_alloc_host(H, nkv * 2);
     bf16* hV = plow_hsa_alloc_host(H, nkv * 2);
     bf16* hO = plow_hsa_alloc_host(H, nq * 2);
+    bf16* hS = sink_mag ? plow_hsa_alloc_host(H, n_head * 2) : NULL;
     /* Small magnitudes: scale=1.0 over hd=512 means logits of ~sqrt(512)*var, and
      * we want to exercise the softmax, not overflow it. */
     for (size_t i = 0; i < nq; i++) hQ[i] = f2bf(frand() * 0.15f);
     for (size_t i = 0; i < nkv; i++) { hK[i] = f2bf(frand() * 0.15f); hV[i] = f2bf(frand()); }
+    if (hS) for (unsigned h = 0; h < n_head; h++) hS[h] = f2bf(frand() * sink_mag);
 
     void *dQ = dev(nq * 2), *dK = dev(nkv * 2), *dV = dev(nkv * 2), *dO = dev(nq * 2);
+    void* dS = hS ? dev(n_head * 2) : NULL;
     /* Prefill now emits UNNORMALIZED split partials; the merge folds them. */
     void* dOp = dev((size_t)n_q * n_head * nsplit * hd * sizeof(float));
     void* dMl = dev((size_t)n_q * n_head * nsplit * 2 * sizeof(float));
     plow_hsa_copy_h2d(H, 0, dQ, hQ, nq * 2);
     plow_hsa_copy_h2d(H, 0, dK, hK, nkv * 2);
     plow_hsa_copy_h2d(H, 0, dV, hV, nkv * 2);
+    if (hS) plow_hsa_copy_h2d(H, 0, dS, hS, n_head * 2);
 
     struct __attribute__((packed)) {
         void *op, *ml; const void *q, *k, *v;
@@ -141,22 +152,49 @@ static void prefill_case(plow_hsa_kernel* k, plow_hsa_kernel* mk, unsigned NCU,
     struct __attribute__((packed)) {
         void* o; const void *op, *ml; unsigned n_batch, n_head, nsplit;
     } m = {dO, dOp, dMl, n_q, n_head, nsplit};
-    if (plow_hsa_launch(H, 0, mk, NCU * PLOW_WG_THREADS, 1, 1, PLOW_WG_THREADS, 1, 1, 0, &m, sizeof(m)) != 0) {
+    struct __attribute__((packed)) {
+        void* o; const void *op, *ml, *sinks; unsigned n_batch, n_head, nsplit;
+    } ms = {dO, dOp, dMl, dS, n_q, n_head, nsplit};
+    const void* marg = hS ? (const void*)&ms : (const void*)&m;
+    const size_t msz = hS ? sizeof(ms) : sizeof(m);
+    if (plow_hsa_launch(H, 0, mk, NCU * PLOW_WG_THREADS, 1, 1, PLOW_WG_THREADS, 1, 1, 0,
+                        (void*)marg, msz) != 0) {
         fprintf(stderr, "merge launch: %s\n", plow_hsa_last_error()); fails++; return;
     }
     plow_hsa_wait(H, 0);
     plow_hsa_copy_d2h(H, 0, hO, dO, nq * 2);
 
     float* want = malloc(nq * sizeof(float));
-    ref_attn(want, hQ, hK, hV, n_q, n_kv, n_head, n_kv_head, hd, 0, window, SCALE);
+    ref_attn(want, hQ, hK, hV, n_q, n_kv, n_head, n_kv_head, hd, 0, window, SCALE, hS);
     check(label, hO, want, nq);
+    /* The fold must be LIVE: the same partials merged WITHOUT sinks have to disagree with the
+     * sink reference, or a no-op `sinks` argument would pass every case above. */
+    if (hS) {
+        ms.sinks = NULL;
+        plow_hsa_launch(H, 0, mk, NCU * PLOW_WG_THREADS, 1, 1, PLOW_WG_THREADS, 1, 1, 0,
+                        &ms, sizeof(ms));
+        plow_hsa_wait(H, 0);
+        plow_hsa_copy_d2h(H, 0, hO, dO, nq * 2);
+        double md = 0.0;
+        for (size_t i = 0; i < nq; i++) md = fmax(md, fabs(bf2f(hO[i]) - want[i]));
+        printf("  %-38s %s  (no-sink merge differs by %.4f)\n", "^ fold is live",
+               md > 1e-3 ? "PASS" : "FAIL", md);
+        if (!(md > 1e-3)) fails++;
+    }
     free(want);
     plow_hsa_free(H, dQ); plow_hsa_free(H, dK); plow_hsa_free(H, dV); plow_hsa_free(H, dO);
 }
 
-static void decode_case(plow_hsa_kernel* kd, plow_hsa_kernel* km, unsigned NCU,
-                        const char* label, unsigned hd, unsigned n_kv, unsigned n_head,
-                        unsigned n_kv_head, unsigned window, unsigned nsplit) {
+static void prefill_case(plow_hsa_kernel* k, plow_hsa_kernel* mk, unsigned NCU,
+                         const char* label, unsigned hd, unsigned n_q, unsigned n_kv,
+                         unsigned n_head, unsigned n_kv_head, unsigned window,
+                         unsigned nsplit) {
+    prefill_case_s(k, mk, NCU, label, hd, n_q, n_kv, n_head, n_kv_head, window, nsplit, 0.0f);
+}
+
+static void decode_case_s(plow_hsa_kernel* kd, plow_hsa_kernel* km, unsigned NCU,
+                          const char* label, unsigned hd, unsigned n_kv, unsigned n_head,
+                          unsigned n_kv_head, unsigned window, unsigned nsplit, float sink_mag) {
     const float SCALE = 1.0f;
     const unsigned B = 2;
     const size_t nq = (size_t)B * n_head * hd;
@@ -167,18 +205,22 @@ static void decode_case(plow_hsa_kernel* kd, plow_hsa_kernel* km, unsigned NCU,
     bf16* hV = plow_hsa_alloc_host(H, nkv * 2);
     bf16* hO = plow_hsa_alloc_host(H, nq * 2);
     int* hLen = plow_hsa_alloc_host(H, B * 4);
+    bf16* hS = sink_mag ? plow_hsa_alloc_host(H, n_head * 2) : NULL;
     for (size_t i = 0; i < nq; i++) hQ[i] = f2bf(frand() * 0.15f);
     for (size_t i = 0; i < nkv; i++) { hK[i] = f2bf(frand() * 0.15f); hV[i] = f2bf(frand()); }
     for (unsigned b = 0; b < B; b++) hLen[b] = (int)n_kv;
+    if (hS) for (unsigned h = 0; h < n_head; h++) hS[h] = f2bf(frand() * sink_mag);
 
     void *dQ = dev(nq * 2), *dK = dev(nkv * 2), *dV = dev(nkv * 2), *dO = dev(nq * 2);
     void* dLen = dev(B * 4);
+    void* dS = hS ? dev(n_head * 2) : NULL;
     void* dOp = dev((size_t)B * n_head * nsplit * hd * 4);
     void* dMl = dev((size_t)B * n_head * nsplit * 2 * 4);
     plow_hsa_copy_h2d(H, 0, dQ, hQ, nq * 2);
     plow_hsa_copy_h2d(H, 0, dK, hK, nkv * 2);
     plow_hsa_copy_h2d(H, 0, dV, hV, nkv * 2);
     plow_hsa_copy_h2d(H, 0, dLen, hLen, B * 4);
+    if (hS) plow_hsa_copy_h2d(H, 0, dS, hS, n_head * 2);
 
     struct __attribute__((packed)) {
         void* op; void* ml; const void* q; const void* k; const void* v; const void* len;
@@ -189,7 +231,15 @@ static void decode_case(plow_hsa_kernel* kd, plow_hsa_kernel* km, unsigned NCU,
     struct __attribute__((packed)) {
         void* o; const void* op; const void* ml; unsigned n_batch, n_head, nsplit;
     } m = {dO, dOp, dMl, B, n_head, nsplit};
-    plow_hsa_launch(H, 0, km, NCU * PLOW_WG_THREADS, 1, 1, PLOW_WG_THREADS, 1, 1, 0, &m, sizeof(m));
+    struct __attribute__((packed)) {
+        void* o; const void *op, *ml, *sinks; unsigned n_batch, n_head, nsplit;
+    } ms = {dO, dOp, dMl, dS, B, n_head, nsplit};
+    if (hS)
+        plow_hsa_launch(H, 0, km, NCU * PLOW_WG_THREADS, 1, 1, PLOW_WG_THREADS, 1, 1, 0, &ms,
+                        sizeof(ms));
+    else
+        plow_hsa_launch(H, 0, km, NCU * PLOW_WG_THREADS, 1, 1, PLOW_WG_THREADS, 1, 1, 0, &m,
+                        sizeof(m));
     plow_hsa_wait(H, 0);
     plow_hsa_copy_d2h(H, 0, hO, dO, nq * 2);
 
@@ -198,9 +248,15 @@ static void decode_case(plow_hsa_kernel* kd, plow_hsa_kernel* km, unsigned NCU,
     for (unsigned b = 0; b < B; b++)
         ref_attn(want + (size_t)b * n_head * hd, hQ + (size_t)b * n_head * hd,
                  hK + (size_t)b * n_kv * n_kv_head * hd, hV + (size_t)b * n_kv * n_kv_head * hd,
-                 1, n_kv, n_head, n_kv_head, hd, n_kv - 1, window, SCALE);
+                 1, n_kv, n_head, n_kv_head, hd, n_kv - 1, window, SCALE, hS);
     check(label, hO, want, nq);
     free(want);
+}
+
+static void decode_case(plow_hsa_kernel* kd, plow_hsa_kernel* km, unsigned NCU,
+                        const char* label, unsigned hd, unsigned n_kv, unsigned n_head,
+                        unsigned n_kv_head, unsigned window, unsigned nsplit) {
+    decode_case_s(kd, km, NCU, label, hd, n_kv, n_head, n_kv_head, window, nsplit, 0.0f);
 }
 
 int main(void) {
@@ -224,6 +280,15 @@ int main(void) {
     if (plow_hsa_get_kernel(H, 0, "gemma_flash_prefill_128", &p128) ||
         plow_hsa_get_kernel(H, 0, "gemma_flash_merge_128", &m128)) {
         fprintf(stderr, "sym128: %s\n", plow_hsa_last_error()); return 1;
+    }
+
+    plow_hsa_kernel p64, d64, m64, m64s, m128s;
+    if (plow_hsa_get_kernel(H, 0, "gemma_flash_prefill_64", &p64) ||
+        plow_hsa_get_kernel(H, 0, "gemma_flash_decode_64", &d64) ||
+        plow_hsa_get_kernel(H, 0, "gemma_flash_merge_64", &m64) ||
+        plow_hsa_get_kernel(H, 0, "gemma_flash_merge_64_sinks", &m64s) ||
+        plow_hsa_get_kernel(H, 0, "gemma_flash_merge_128_sinks", &m128s)) {
+        fprintf(stderr, "sym64: %s\n", plow_hsa_last_error()); return 1;
     }
 
     plow_hsa_kernel p256, p512, d256, d512, m256, m512;
@@ -252,6 +317,25 @@ int main(void) {
     prefill_case(&p128, &m128, cus, "hd=128 causal  n_q=97  nsplit=3", 128, 97, 97, 8, 2, 0, 3);
     prefill_case(&p128, &m128, cus, "hd=128 GQA4:1  n_q=640 nsplit=8", 128, 640, 640, 32, 8, 0, 8);
 
+    /* D=64 (GPT-OSS), GQA 8:1 and the 128-token sliding window the config declares. */
+    printf("\nPrefill (GPT-OSS hd=64):\n");
+    prefill_case(&p64, &m64, cus, "hd=64 causal   n_q=300 nsplit=1", 64, 300, 300, 16, 2, 0, 1);
+    prefill_case(&p64, &m64, cus, "hd=64 causal   n_q=300 nsplit=4", 64, 300, 300, 16, 2, 0, 4);
+    prefill_case(&p64, &m64, cus, "hd=64 GQA8:1   n_q=520 nsplit=8", 64, 520, 520, 32, 4, 0, 8);
+    prefill_case(&p64, &m64, cus, "hd=64 slide128 n_q=300 nsplit=4", 64, 300, 300, 16, 2, 128, 4);
+
+    /* ATTENTION SINKS (dev_isa.h op 13 t3). sink_mag 4.0 puts sinks both above and below the
+     * per-head split maxima, so the gm' = max(gm, sink) branch is taken in both directions.
+     * hd=128 as well as hd=64: the fold lives in the shared merge body, not in a 64-only arm. */
+    printf("\nPrefill + attention sinks (GPT-OSS):\n");
+    prefill_case_s(&p64, &m64s, cus, "hd=64 sinks causal nsplit=1", 64, 300, 300, 16, 2, 0, 1, 4.0f);
+    prefill_case_s(&p64, &m64s, cus, "hd=64 sinks causal nsplit=4", 64, 300, 300, 16, 2, 0, 4, 4.0f);
+    prefill_case_s(&p64, &m64s, cus, "hd=64 sinks slide128 nsplit=8", 64, 520, 520, 32, 4, 128, 8, 4.0f);
+    /* sink_mag 60: e^(sink-gm) alone would overflow the merge's denominator, and the answer is
+     * O -> 0 (all softmax mass on a row with no value), not NaN. */
+    prefill_case_s(&p64, &m64s, cus, "hd=64 sinks dominant nsplit=4", 64, 300, 300, 16, 2, 0, 4, 60.0f);
+    prefill_case_s(&p128, &m128s, cus, "hd=128 sinks causal nsplit=4", 128, 300, 300, 8, 2, 0, 4, 4.0f);
+
     printf("\nPrefill (Gemma 4 31B geometries):\n");
     /* sliding layers: 32 q heads / 16 kv heads, hd 256, window 1024 */
     /* Sweep nsplit: a split-KV prefill must give the SAME answer for every nsplit, or the
@@ -272,6 +356,10 @@ int main(void) {
     decode_case(&d256, &m256, cus, "hd=256 GQA 2:1 causal, nsplit=4", 256, 500, 8, 4, 0, 4);
     decode_case(&d256, &m256, cus, "hd=256 GQA 2:1 sliding w=64, nsplit=4", 256, 500, 8, 4, 64, 4);
     decode_case(&d512, &m512, cus, "hd=512 MQA causal, nsplit=8", 512, 700, 8, 1, 0, 8);
+    decode_case(&d64, &m64, cus, "hd=64 GQA 8:1 causal, nsplit=4", 64, 500, 16, 2, 0, 4);
+    decode_case(&d64, &m64, cus, "hd=64 GQA 8:1 sliding w=128, nsplit=8", 64, 500, 16, 2, 128, 8);
+    decode_case_s(&d64, &m64s, cus, "hd=64 sinks causal, nsplit=4", 64, 500, 16, 2, 0, 4, 4.0f);
+    decode_case_s(&d64, &m64s, cus, "hd=64 sinks sliding w=128, nsplit=8", 64, 500, 16, 2, 128, 8, 4.0f);
 
     printf("\n%s (%d failure%s)\n", fails ? "ATTENTION FAILED" : "ATTENTION CORRECT", fails,
            fails == 1 ? "" : "s");

@@ -199,6 +199,7 @@ fn the_production_interpreter_dispatches_and_retires() {
         prefill_parked: 0,
         n_prefill_spans: 0,
         n_prefill_rows: 0,
+        token_batch: 0,
     };
     // The kernarg block is the current struct's bytes. `dev_isa.h` static-asserts its size and
     // `packet::dev_abi` pins the Rust mirror against the C header.
@@ -339,6 +340,7 @@ fn gfx950_runs_the_prefill_arena_the_objects_actually_declare() {
         prefill_parked: 0,
         n_prefill_spans: 0,
         n_prefill_rows: 0,
+        token_batch: 0,
     };
     // SAFETY: `DevProgram` is `repr(C)` POD; this is the kernarg memcpy's view.
     let args: &[u8] = unsafe {

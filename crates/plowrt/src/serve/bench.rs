@@ -826,6 +826,8 @@ fn submit(
             ..SamplingParams::default()
         },
         ignore_eos: true,
+        stop: Vec::new(),
+        seed: None,
     };
     let job = Job {
         prompt_ids,

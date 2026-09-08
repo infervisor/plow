@@ -1,6 +1,7 @@
 #ifndef PLOW_NV_PACKED_REQUEST
 #define PLOW_NV_PACKED_REQUEST 0
 #endif
+#include "mixed_step.h"
 /* sm_120 (RTX 5090 / GB202) flash DECODE + MERGE.
  *
  * Port of runtime/amd/op_attention.h d_flash_decode / d_flash_merge to a 32-lane warp.
@@ -20,7 +21,8 @@
  * OPERAND CONTRACT (read off the EMITTER crates/plowc/src/bin/gemma4.rs:1070-1080 and the
  * consumer runtime/amd/interp.hip, NOT crates/packet/src/dev.rs which is stale):
  *   FLASH_DECODE  t0=Opart(f32)  t1=mlpart(f32)  t2=Q(bf16)  t3=K  t4=V  t5=kv_len(i32)
- *                 t6=k_scale     t7=v_scale                (fp8 only; TENSOR_NONE in bf16)
+ *                 t6=decode_slot (bf16 only; TENSOR_NONE means compact b == physical slot)
+ *                 t6=k_scale     t7=v_scale                (fp8 only)
  *                 i0=n_batch i1=n_head i2=n_kv_head i3=kv_stride i4=window
  *                 i5=nsplit  i6=head_dim i7=kv_mask        <-- i7 IS kv_mask (dev.rs omits it)
  *                 f0=scale
@@ -104,8 +106,16 @@ __device__ __forceinline__ float __fa_ex2(float x) {
 #else
 #define FA_DEC_REDUCTION_HEADS(GF) ((int)PLOW_NV_WARPS)
 #endif
-#define FA_DEC_SMEM_FLOATS(D, GF)                                                              \
+#ifndef PLOW_NV_FA_TC_GQA8_HD512
+#define PLOW_NV_FA_TC_GQA8_HD512 0
+#endif
+/* Opt-in HD512/GQA8 decode candidate: 16 padded Q rows and a two-stage 64-row K/V ring. */
+#define FA_DEC_TC_GQA8(HD, GF) (PLOW_NV_FA_TC_GQA8_HD512 && (HD) == 512 && (GF) == 8)
+#define FA_DEC_BASE_SMEM_FLOATS(D, GF)                                                         \
     ((GF) * FA_DEC_TILE + 2 * FA_DEC_REDUCTION_HEADS(GF) + (GF) * ((D) / 2) + FA_DEC_NG(D) * (D))
+#define FA_DEC_SMEM_FLOATS(D, GF)                                                              \
+    (FA_DEC_BASE_SMEM_FLOATS(D, GF) +                                                         \
+     (FA_DEC_TC_GQA8(D, GF) ? (16 + 2 * 64) * ((D) + 8) / 2 : 0))
 
 /* V rows in flight per thread. A fused row feeds GF accumulators, so arithmetic per load
  * grows with GF and the unroll can shrink before the 255-register cliff. */
@@ -397,6 +407,171 @@ template <int N> __device__ __forceinline__ void fa_cp_wait() {
     asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
 }
 
+#if PLOW_NV_FA_TC_GQA8_HD512
+__device__ __forceinline__ unsigned fa_tf32_rn(float value) {
+    unsigned bits;
+    asm volatile("cvt.rn.tf32.f32 %0, %1;" : "=r"(bits) : "f"(value));
+    return bits;
+}
+
+__device__ __forceinline__ void fa_mma_tf32(float (&d)[4], const unsigned (&a)[4],
+                                             const unsigned (&b)[2], const float (&c)[4]) {
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
+                 : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]),
+                   "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));
+}
+
+template <int D, int GF>
+__device__ __forceinline__ void fa_decode_qk_tc_gqa8(
+    float* scores, const __nv_bfloat16* qtile, __nv_bfloat16* ktile,
+    const __nv_bfloat16* kbase, unsigned kv0, unsigned live_rows, unsigned kv_mask,
+    float scale) {
+    static_assert(D == 512 && GF == 8, "tensor-core decode is HD512/GQA8 only");
+    constexpr unsigned STRIDE = D + 8;
+    const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5;
+    for (unsigned r = live_rows + tid; r < FA_DEC_TILE; r += PLOW_NV_THREADS)
+#pragma unroll
+        for (int g = 0; g < GF; ++g) scores[g * FA_DEC_TILE + r] = FA_NEG_INF;
+    constexpr unsigned TILE_ELEMS = 64 * STRIDE;
+    {
+        const unsigned nr = live_rows < 64 ? live_rows : 64;
+        for (unsigned v = tid; v < 64u * (D / 8); v += PLOW_NV_THREADS) {
+            const unsigned r = v / (D / 8), c = (v % (D / 8)) * 8;
+            const bool live = r < nr;
+            const __nv_bfloat16* in = live
+                ? kbase + (size_t)((kv0 + r) & kv_mask) * D + c
+                : kbase;
+            fa_cp_async_cg16(ktile + r * STRIDE + c, in, live ? 16 : 0);
+        }
+        fa_cp_commit();
+    }
+    for (unsigned first = 0; first < live_rows; first += 64) {
+        const unsigned nr = live_rows - first < 64 ? live_rows - first : 64;
+        const unsigned next = first + 64;
+        if (next < live_rows) {
+            const unsigned next_nr = live_rows - next < 64 ? live_rows - next : 64;
+            __nv_bfloat16* next_tile = ktile + (((first / 64) + 1) & 1) * TILE_ELEMS;
+            for (unsigned v = tid; v < 64u * (D / 8); v += PLOW_NV_THREADS) {
+                const unsigned r = v / (D / 8), c = (v % (D / 8)) * 8;
+                const bool live = r < next_nr;
+                const __nv_bfloat16* in = live
+                    ? kbase + (size_t)((kv0 + next + r) & kv_mask) * D + c
+                    : kbase;
+                fa_cp_async_cg16(next_tile + r * STRIDE + c, in, live ? 16 : 0);
+            }
+            fa_cp_commit();
+            fa_cp_wait<1>();
+        } else {
+            fa_cp_wait<0>();
+        }
+        __syncthreads();
+        const __nv_bfloat16* current_tile = ktile + ((first / 64) & 1) * TILE_ELEMS;
+        float acc[4] = {};
+#pragma unroll
+        for (unsigned k0 = 0; k0 < D; k0 += 64) {
+            float partial[4] = {};
+#pragma unroll
+            for (unsigned k = k0; k < k0 + 64; k += 16) {
+                unsigned a[4], b[2];
+                fa_ldmatrix_x4(a, qtile + (lane % 16) * STRIDE + k + (lane / 16) * 8);
+                fa_ldmatrix_x2(b, current_tile + (warp * 8 + (lane & 7)) * STRIDE + k +
+                                                   ((lane >> 3) & 1) * 8);
+                fa_mma(partial, a, b, partial);
+            }
+#pragma unroll
+            for (unsigned e = 0; e < 4; ++e) acc[e] = __fadd_rn(acc[e], partial[e]);
+        }
+#pragma unroll
+        for (unsigned e = 0; e < 4; ++e) {
+            const unsigned g = lane / 4 + (e / 2) * 8;
+            const unsigned r = warp * 8 + (lane % 4) * 2 + (e % 2);
+            if (g < GF && r < nr)
+                scores[g * FA_DEC_TILE + first + r] = acc[e] * FA_SCALE(scale);
+        }
+        __syncthreads();
+    }
+}
+
+template <int D, int GF>
+__device__ __forceinline__ void fa_decode_pv_tc_gqa8(
+    float (&acc)[D / 64][4], const float* scores, __nv_bfloat16* vtile,
+    const __nv_bfloat16* vbase, unsigned kv0, unsigned live_rows, unsigned kv_mask,
+    const float* corr_shared) {
+    static_assert(D == 512 && GF == 8, "tensor-core decode is HD512/GQA8 only");
+    constexpr unsigned STRIDE = D + 8, NJ = D / 64;
+    const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5;
+    const float resc[2] = {lane / 4 < GF ? corr_shared[lane / 4] : 0.0f,
+                           lane / 4 + 8 < GF ? corr_shared[lane / 4 + 8] : 0.0f};
+#pragma unroll
+    for (unsigned j = 0; j < NJ; ++j)
+#pragma unroll
+        for (unsigned e = 0; e < 4; ++e) acc[j][e] *= resc[e / 2];
+    constexpr unsigned TILE_ELEMS = 64 * STRIDE;
+    {
+        const unsigned nr = live_rows < 64 ? live_rows : 64;
+        for (unsigned i = tid; i < 64u * (D / 8); i += PLOW_NV_THREADS) {
+            const unsigned r = i / (D / 8), c = (i % (D / 8)) * 8;
+            const bool live = r < nr;
+            const __nv_bfloat16* in = live
+                ? vbase + (size_t)((kv0 + r) & kv_mask) * D + c
+                : vbase;
+            fa_cp_async_cg16(vtile + r * STRIDE + c, in, live ? 16 : 0);
+        }
+        fa_cp_commit();
+    }
+    for (unsigned first = 0; first < live_rows; first += 64) {
+        const unsigned nr = live_rows - first < 64 ? live_rows - first : 64;
+        const unsigned next = first + 64;
+        if (next < live_rows) {
+            const unsigned next_nr = live_rows - next < 64 ? live_rows - next : 64;
+            __nv_bfloat16* next_tile = vtile + (((first / 64) + 1) & 1) * TILE_ELEMS;
+            for (unsigned i = tid; i < 64u * (D / 8); i += PLOW_NV_THREADS) {
+                const unsigned r = i / (D / 8), c = (i % (D / 8)) * 8;
+                const bool live = r < next_nr;
+                const __nv_bfloat16* in = live
+                    ? vbase + (size_t)((kv0 + next + r) & kv_mask) * D + c
+                    : vbase;
+                fa_cp_async_cg16(next_tile + r * STRIDE + c, in, live ? 16 : 0);
+            }
+            fa_cp_commit();
+            fa_cp_wait<1>();
+        } else {
+            fa_cp_wait<0>();
+        }
+        __syncthreads();
+        const __nv_bfloat16* current_tile = vtile + ((first / 64) & 1) * TILE_ELEMS;
+#pragma unroll
+        for (unsigned k = 0; k < 64; k += 8) {
+            unsigned hi[4], lo[4];
+#pragma unroll
+            for (unsigned e = 0; e < 4; ++e) {
+                const unsigned g = lane / 4 + (e & 1) * 8;
+                const unsigned r = k + lane % 4 + (e / 2) * 4;
+                const float p = g < GF && r < nr
+                    ? scores[g * FA_DEC_TILE + first + r]
+                    : 0.0f;
+                /* The low term retains the signed residual from the first TF32 rounding. */
+                hi[e] = fa_tf32_rn(p);
+                lo[e] = fa_tf32_rn(__fsub_rn(p, __uint_as_float(hi[e])));
+            }
+#pragma unroll
+            for (unsigned j = 0; j < NJ; ++j) {
+                const unsigned col = (warp * NJ + j) * 8 + lane / 4;
+                unsigned b[2] = {
+                    __float_as_uint(__bfloat162float(current_tile[(k + lane % 4) * STRIDE + col])),
+                    __float_as_uint(__bfloat162float(
+                        current_tile[(k + lane % 4 + 4) * STRIDE + col]))};
+                fa_mma_tf32(acc[j], lo, b, acc[j]);
+                fa_mma_tf32(acc[j], hi, b, acc[j]);
+            }
+        }
+        __syncthreads();
+    }
+}
+#endif
+
 /* Persistent-grid body: this block runs work items `slice, slice+nblk, ...`.
  *
  * BATCH>1 (serving pending #4): the KV cache is [n_batch][n_kv_head][kv_stride][D] — each
@@ -409,7 +584,7 @@ template <int N> __device__ __forceinline__ void fa_cp_wait() {
 #ifndef PLOW_NV_KVBOUNDS
 #define PLOW_NV_KVBOUNDS 0
 #endif
-template <int D, int GF, bool FP8KV = false, bool SZKV = false>
+template <int D, int GF, bool FP8KV = false, bool SZKV = false, bool SLOTMAP = false>
 __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ mlpart,
                                const __nv_bfloat16* __restrict__ Q,
                                const __nv_bfloat16* __restrict__ K,
@@ -419,7 +594,8 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
                                float scale, unsigned nsplit, unsigned kv_mask, unsigned slice,
                                unsigned nblk, float* lds, unsigned kv_cap = 0,
                                const float* __restrict__ k_scale = nullptr,
-                               const float* __restrict__ v_scale = nullptr) {
+                               const float* __restrict__ v_scale = nullptr,
+                               const int* __restrict__ decode_slot = nullptr) {
     /* A work item carries GF CONSECUTIVE query heads sharing one KV head (needs GF | gqa).
      * Indexing by head-GROUP, not by kv_head, is what makes GF < gqa correct. */
     static_assert(GF <= (int)PLOW_NV_WARPS || (PLOW_NV_FA_GF16_BENCH && GF == 16), "unsupported decode GQA grouping");
@@ -444,6 +620,12 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
         const unsigned sp = w % nsplit;
         const unsigned hg = (w / nsplit) % n_grp;
         const unsigned b = w / (nsplit * n_grp);
+        unsigned slot = b;
+        if constexpr (SLOTMAP) {
+            const int physical = decode_slot[b];
+            if (physical < 0) __trap();
+            slot = (unsigned)physical;
+        }
         const unsigned h0 = hg * GF;
         const unsigned hkv = h0 / gqa;
 
@@ -462,27 +644,32 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
          * (b*n_kv_head+hkv)*kv_stride + (kv_stride-1) exceeds the declared capacity — i.e. when
          * declare() under-sized the KV tensor for the batch this packet was emitted at. */
 #if PLOW_NV_KVBOUNDS
-        if (kv_cap && (((size_t)b * n_kv_head + hkv) * kv_stride + (kv_stride - 1)) >= kv_cap) {
-            __trap();
+        if constexpr (SLOTMAP) {
+            if (kv_cap && (((size_t)slot * n_kv_head + hkv) * kv_stride + (kv_stride - 1)) >= kv_cap)
+                __trap();
+        } else {
+            if (kv_cap && (((size_t)b * n_kv_head + hkv) * kv_stride + (kv_stride - 1)) >= kv_cap)
+                __trap();
         }
 #endif
-        const __nv_bfloat16* kbase = K + ((size_t)b * n_kv_head + hkv) * (size_t)kv_stride * D;
-        const __nv_bfloat16* vbase = V + ((size_t)b * n_kv_head + hkv) * (size_t)kv_stride * D;
+        const size_t kv_batch = slot;
+        const __nv_bfloat16* kbase = K + (kv_batch * n_kv_head + hkv) * (size_t)kv_stride * D;
+        const __nv_bfloat16* vbase = V + (kv_batch * n_kv_head + hkv) * (size_t)kv_stride * D;
         /* FP8 KV: the cache is uint8 e4m3 (1 byte/elem, HALF the bytes) + a PER-ROW f32 scale, in
          * the SAME head-major RING layout. These byte bases and the per-(kv_head) scale slice are
          * unused on the bf16 instantiation (FP8KV=false compiles them out). */
         /* SZKV: rows are FA_SZ_ROWB(D)-byte blobs, not D elems — same head-major ring indexing. */
         constexpr size_t RB = SZKV ? (size_t)FA_SZ_ROWB(D) : (size_t)D;
-        const unsigned char* kb8 = (const unsigned char*)K + ((size_t)b * n_kv_head + hkv) * (size_t)kv_stride * RB;
-        const unsigned char* vb8 = (const unsigned char*)V + ((size_t)b * n_kv_head + hkv) * (size_t)kv_stride * RB;
+        const unsigned char* kb8 = (const unsigned char*)K + (kv_batch * n_kv_head + hkv) * (size_t)kv_stride * RB;
+        const unsigned char* vb8 = (const unsigned char*)V + (kv_batch * n_kv_head + hkv) * (size_t)kv_stride * RB;
         /* Offset the scale slice only on the FP8KV arm — k_scale/v_scale are null on the bf16
          * instantiation, so forming null+offset (even unused) is UB. if constexpr keeps ksc/vsc
          * in scope for the FP8KV code below with zero runtime cost. */
         const float* ksc = nullptr;
         const float* vsc = nullptr;
         if constexpr (FP8KV) {
-            ksc = k_scale + ((size_t)b * n_kv_head + hkv) * (size_t)kv_stride;
-            vsc = v_scale + ((size_t)b * n_kv_head + hkv) * (size_t)kv_stride;
+            ksc = k_scale + (kv_batch * n_kv_head + hkv) * (size_t)kv_stride;
+            vsc = v_scale + (kv_batch * n_kv_head + hkv) * (size_t)kv_stride;
         }
 
         __syncthreads(); /* previous item's osm reads must finish before qsm is rewritten */
@@ -490,6 +677,19 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
         for (unsigned i = tid; i < GF * D; i += PLOW_NV_THREADS)
             qsm[i] = Q[((size_t)b * n_head + h0 + i / D) * D + i % D];
         __syncthreads();
+#endif
+
+#if PLOW_NV_FA_TC_GQA8_HD512
+        __nv_bfloat16* tc_q = (__nv_bfloat16*)(lds + FA_DEC_BASE_SMEM_FLOATS(D, GF));
+        __nv_bfloat16* tc_kv = tc_q + 16 * (D + 8);
+        if constexpr (FA_DEC_TC_GQA8(D, GF) && !FP8KV && !SZKV) {
+            for (unsigned i = tid; i < 16u * D; i += PLOW_NV_THREADS) {
+                const unsigned g = i / D, c = i % D;
+                tc_q[g * (D + 8) + c] =
+                    g < GF ? qsm[g * D + c] : __float2bfloat16(0.0f);
+            }
+            __syncthreads();
+        }
 #endif
 
 #if PLOW_NV_FA_WPR && PLOW_NV_FA_QREG
@@ -518,6 +718,15 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
         for (int g = 0; g < GF; g++)
 #pragma unroll
             for (int u = 0; u < 8; u++) oacc[g][u] = 0.0f;
+#if PLOW_NV_FA_TC_GQA8_HD512
+        float tc_oacc[D / 64][4];
+        if constexpr (FA_DEC_TC_GQA8(D, GF) && !FP8KV && !SZKV) {
+#pragma unroll
+            for (int j = 0; j < D / 64; ++j)
+#pragma unroll
+                for (int e = 0; e < 4; ++e) tc_oacc[j][e] = 0.0f;
+        }
+#endif
 
         for (unsigned kv0 = lo; kv0 < hi; kv0 += FA_DEC_TILE) {
             /* Live rows in this tile. Entries [rmax_t, FA_DEC_TILE) are NEG_INF in BOTH bodies
@@ -527,6 +736,14 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
             const unsigned rmax_t = (hi - kv0 < (unsigned)FA_DEC_TILE) ? (hi - kv0)
                                                                        : (unsigned)FA_DEC_TILE;
             float s[GF];
+#if PLOW_NV_FA_TC_GQA8_HD512
+            if constexpr (FA_DEC_TC_GQA8(D, GF) && !FP8KV && !SZKV) {
+                fa_decode_qk_tc_gqa8<D, GF>(Ssm, tc_q, tc_kv, kbase, kv0, rmax_t,
+                                             kv_mask, scale);
+#pragma unroll
+                for (int g = 0; g < GF; ++g) s[g] = Ssm[g * FA_DEC_TILE + tid];
+            } else
+#endif
 #if PLOW_NV_FA_WPR
           /* WARP-PER-ROW SCORE PHASE (H100 round 9). The default body gives each THREAD a whole
            * KV row, so one warp instruction issues 32 requests D*2 bytes apart -- 32 scattered
@@ -764,6 +981,11 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
 #pragma unroll
             for (int g = 0; g < GF; g++) pe[g] = FA_EXP(s[g] - mnew[g]);
             __syncthreads();
+#if PLOW_NV_FA_TC_GQA8_HD512
+            if constexpr (FA_DEC_TC_GQA8(D, GF) && !FP8KV && !SZKV) {
+                if (tid < GF) hmax[tid] = corr[tid];
+            }
+#endif
 #pragma unroll
             for (int g = 0; g < GF; g++) Ssm[g * FA_DEC_TILE + tid] = pe[g];
             __syncthreads();
@@ -801,6 +1023,13 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
                 l_st[g] = l_st[g] * corr[g] + hsum[g];
                 m_st[g] = mnew[g];
             }
+#if PLOW_NV_FA_TC_GQA8_HD512
+            if constexpr (FA_DEC_TC_GQA8(D, GF) && !FP8KV && !SZKV) {
+                fa_decode_pv_tc_gqa8<D, GF>(tc_oacc, Ssm, tc_kv, vbase, kv0,
+                                             rmax_t, kv_mask, hmax);
+            } else
+#endif
+            {
 #pragma unroll
             for (int g = 0; g < GF; g++)
 #pragma unroll
@@ -889,8 +1118,34 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
                 }
             }
             __syncthreads();
+            }
         }
 
+#if PLOW_NV_FA_TC_GQA8_HD512
+        if constexpr (FA_DEC_TC_GQA8(D, GF) && !FP8KV && !SZKV) {
+#pragma unroll
+            for (unsigned j = 0; j < D / 64; ++j)
+#pragma unroll
+                for (unsigned e = 0; e < 4; ++e) {
+                    const unsigned g = lane / 4 + (e / 2) * 8;
+                    const unsigned d =
+                        (warp * (D / 64) + j) * 8 + (lane % 4) * 2 + (e % 2);
+                    if (g < GF)
+                        Opart[((size_t)(b * n_head + h0 + g) * nsplit + sp) * D + d] =
+                            tc_oacc[j][e];
+                }
+#pragma unroll
+            for (unsigned g = 0; g < GF; ++g) {
+                if (tid == g) {
+                    float* ml =
+                        mlpart + ((size_t)(b * n_head + h0 + g) * nsplit + sp) * 2;
+                    ml[0] = m_st[g];
+                    ml[1] = l_st[g];
+                }
+            }
+        } else
+#endif
+        {
         /* Fold the NG row-group partials, one query head at a time; osm is REUSED across the GF
          * heads rather than sized GF*NG*D. Runs once per work item, so the barriers are free. */
 #pragma unroll
@@ -914,16 +1169,31 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
                 ml[1] = l_st[g];
             }
         }
+        }
     }
+}
+
+template <int D, int GF>
+__device__ __noinline__ void d_flash_decode_slots(
+    float* Opart, float* mlpart, const __nv_bfloat16* Q, const __nv_bfloat16* K,
+    const __nv_bfloat16* V, const int* kv_len, unsigned n_batch, unsigned n_head,
+    unsigned n_kv_head, unsigned kv_stride, unsigned window, float scale, unsigned nsplit,
+    unsigned kv_mask, unsigned slice, unsigned nblk, float* lds, unsigned kv_cap,
+    const int* decode_slot) {
+    d_flash_decode<D, GF, false, false, true>(
+        Opart, mlpart, Q, K, V, kv_len, n_batch, n_head, n_kv_head, kv_stride, window, scale,
+        nsplit, kv_mask, slice, nblk, lds, kv_cap, nullptr, nullptr, decode_slot);
 }
 
 /* Combine the split partials: standard online-softmax merge, work unit = (batch, head).
  * Deliberately NOT split over the feature axis — see the AMD comment: widening the merge
  * widens its consumer's gate and made the TOKEN slower there. Kept identical here. */
-template <int D>
+template <int D, bool SINKS = false>
 __device__ void d_flash_merge(__nv_bfloat16* __restrict__ O, const float* __restrict__ Opart,
                               const float* __restrict__ mlpart, unsigned n_batch, unsigned n_head,
-                              unsigned nsplit, unsigned slice, unsigned nblk, const int* req = nullptr) {
+                              unsigned nsplit, unsigned slice, unsigned nblk,
+                              const int* req = nullptr,
+                              const __nv_bfloat16* __restrict__ sinks = nullptr) {
     /* BRANCHLESS: the old body computed the exp weight under an `== NEG_INF` guard per (d, s)
      * element — nsplit FSETP+guarded-EX2 chains per output, predicate pressure high enough that
      * ptxas spilled predicates (P2R). The guard is unnecessary: an empty split carries
@@ -947,11 +1217,17 @@ __device__ void d_flash_merge(__nv_bfloat16* __restrict__ O, const float* __rest
 
         float gm = FA_NEG_INF;
         for (unsigned s = 0; s < nsplit; s++) gm = fmaxf(gm, ml2[s].x);
+        float sink = FA_NEG_INF;
+        if constexpr (SINKS) {
+            sink = FA_SCALE(__bfloat162float(sinks[h]));
+            gm = fmaxf(gm, sink);
+        }
         float gl = 0.0f;
         for (unsigned s = 0; s < nsplit; s++) {
             const float2 ml = ml2[s];
             gl += ml.y * FA_EXP(ml.x - gm);
         }
+        if constexpr (SINKS) gl += FA_EXP(sink - gm);
         const float inv = (gl > 0.0f) ? (1.0f / gl) : 0.0f;
 
         for (unsigned d = threadIdx.x; d < D; d += PLOW_NV_THREADS) {
@@ -3434,3 +3710,32 @@ __device__ void d_flash_prefill_mux(const int* __restrict__ req, float* __restri
         }
     }
 }
+
+#if PLOW_MIXED_STEP
+template <int HD, int BQ, int BKV>
+__device__ void d_flash_prefill_mixed(const PlowProgram* prog, float* __restrict__ Opart,
+                                     float* __restrict__ mlpart,
+                                     const __nv_bfloat16* __restrict__ Q,
+                                     const __nv_bfloat16* __restrict__ K,
+                                     const __nv_bfloat16* __restrict__ V,
+                                     __nv_bfloat16* __restrict__ O, unsigned seq_q,
+                                     unsigned n_head, unsigned n_kv_head, unsigned window,
+                                     unsigned nsplit, unsigned kv_stride, unsigned kv_mask,
+                                     float scale, unsigned slice, unsigned nblk, float* lds,
+                                     const void* __restrict__ mapkv = nullptr) {
+    if (!plow_mixed_step_enabled(prog) || seq_q != prog->n_prefill_rows || nsplit != 1u || !O)
+        __trap();
+    for (unsigned si = 0; si < prog->n_prefill_spans; ++si) {
+        const PlowPrefillSpan* span = plow_mixed_prefill_span(prog, si);
+        const size_t qoff = (size_t)span->row0 * n_head * HD;
+        const size_t kvoff = (size_t)span->slot * n_kv_head * kv_stride * HD;
+        const void* descriptor = mapkv ? (const void*)((const uint64_t*)mapkv)[span->slot] : nullptr;
+        d_flash_prefill<HD, BQ, BKV>(
+            Opart + qoff, mlpart + (size_t)span->row0 * n_head * 2u, Q + qoff, K + kvoff,
+            V + kvoff, O + qoff, span->n_rows, span->kv_len, n_head, n_kv_head,
+            span->kv_row0, window, 1u, kv_stride, kv_mask, scale, slice, nblk, lds, nullptr,
+            descriptor);
+        __syncthreads();
+    }
+}
+#endif

@@ -94,7 +94,17 @@ __device__ void d_residual(bf16* __restrict__ out, const bf16* __restrict__ a,
  *
  * Gemma is GeGLU (gelu_pytorch_tanh), NOT SwiGLU. `act` selects so the same op
  * serves Llama/Qwen-style silu gating. */
-enum { PLOW_ACT_GELU_TANH_ = 0, PLOW_ACT_SILU_ = 1, PLOW_ACT_SITU_ = 2 };
+enum {
+    PLOW_ACT_GELU_TANH_ = 0,
+    PLOW_ACT_SILU_ = 1,
+    PLOW_ACT_SITU_ = 2,
+    /* DeepSeek-V4's clamped SwiGLU: silu(min(g, L)) * clamp(u, ±L), L = swiglu_limit = 10
+     * (model.py:601-611). A PAIR form -- see the note on PLOW_MOE_ACT_SWIGLU_CLAMP in op_moe.h
+     * for why it is a fourth code and not GPT-OSS's act 3 at alpha = 1 (act 3 adds 1 to the up
+     * branch). V4's SHARED expert takes this path; its 256 routed experts take op_moe.h's.
+     * [DSV4-ACT] */
+    PLOW_ACT_SWIGLU_CLAMP_ = 4
+};
 
 /* The GATE-ONLY half of a GLU epilogue, for every fused path that computes
  * `act(gate) * up` and therefore CANNOT express Kimi-K3's `situ`.
@@ -112,13 +122,23 @@ enum { PLOW_ACT_GELU_TANH_ = 0, PLOW_ACT_SILU_ = 1, PLOW_ACT_SITU_ = 2 };
  * calls a pair-form helper (`moe_glu`, `k3_situ_gate`/`k3_situ_up`) instead of
  * this. Every caller here is one that does not. */
 __device__ __forceinline__ float act_gate_only(float g, unsigned act) {
-    if (act == PLOW_ACT_SITU_) return __builtin_nanf("");
+    if (act == PLOW_ACT_SITU_ || act == PLOW_ACT_SWIGLU_CLAMP_) return __builtin_nanf("");
     return (act == PLOW_ACT_SILU_) ? act_silu(g) : act_gelu_tanh(g);
+}
+
+/* The GLU epilogue as a PAIR, `A(g) * B(u)`, for the codes that transform the up branch. For
+ * every gate-only activation this is byte-identical to `act_gate_only(g, act) * u`. */
+__device__ __forceinline__ float act_glu_pair(float g, float u, unsigned act, float limit) {
+    if (act == PLOW_ACT_SWIGLU_CLAMP_) {
+        const float gc = fminf(g, limit); /* upper clamp only -- model.py:607 */
+        return act_silu(gc) * fminf(fmaxf(u, -limit), limit);
+    }
+    return act_gate_only(g, act) * u;
 }
 
 __device__ void d_glu(bf16* __restrict__ out, const bf16* __restrict__ gate,
                       const bf16* __restrict__ up, unsigned n, unsigned act,
-                      unsigned slice, unsigned nblk) {
+                      unsigned slice, unsigned nblk, float limit = 0.0f) {
     const unsigned stride = nblk * PLOW_THREADS * 8;
     const auto* gg = as_glob(gate);
     const auto* ug = as_glob(up);
@@ -129,16 +149,12 @@ __device__ void d_glu(bf16* __restrict__ out, const bf16* __restrict__ gate,
             bf16v8 vo;
 #pragma unroll
             for (int j = 0; j < 8; j++) {
-                const float g = bf2f(vg[j]);
-                const float a = act_gate_only(g, act);
-                vo[j] = f2bf(a * bf2f(vu[j]));
+                vo[j] = f2bf(act_glu_pair(bf2f(vg[j]), bf2f(vu[j]), act, limit));
             }
             st_glob8(og + i, vo);
         } else {
             for (unsigned j = i; j < n; j++) {
-                const float g = bf2f(gate[j]);
-                const float a = act_gate_only(g, act);
-                st_act1(&out[j], f2bf(a * bf2f(up[j])));
+                st_act1(&out[j], f2bf(act_glu_pair(bf2f(gate[j]), bf2f(up[j]), act, limit)));
             }
         }
     }
@@ -188,6 +204,48 @@ __device__ void d_embed(bf16* __restrict__ out, const bf16* __restrict__ table,
         } else {
             for (unsigned i = threadIdx.x; i < hidden; i += PLOW_THREADS)
                 st_act1(&out[dst + i], f2bf(bf2f(table[src + i]) * scale));
+        }
+    }
+}
+
+/* Compact hidden-row gather — the unified token batch's terminal row selection.
+ *
+ * out[s][h] = x[rows[s]][h], for s in [0, S), over H features.
+ *
+ * NOT d_embed. That gathers EMBEDDING-TABLE rows by token id and scales by sqrt(hidden); this
+ * gathers rows of a hidden activation by PACKED ROW INDEX and copies them verbatim, because the
+ * final RMSNorm that follows must see exactly the bytes the body wrote.
+ *
+ * `rows[s] >= live` TRAPS. A clamped index is not a degraded answer: it is another request's
+ * hidden row, and the token it produces is fluent and wrong. This interpreter's dispatch
+ * `default:` already writes nothing and does not trap, so every check that CAN be explicit
+ * here should be.
+ *
+ * `noinline` PINS what the compiler already does. It changed no counted instruction when it
+ * was added, but plow_exec's register pressure IS this object's spill budget (see the note in
+ * the body), and an inlining decision that flips later would move that budget silently. */
+__device__ __attribute__((noinline)) void d_row_gather(bf16* __restrict__ out,
+                             const bf16* __restrict__ x,
+                             const unsigned* __restrict__ rows, unsigned n_sample,
+                             unsigned hidden, unsigned live, unsigned slice, unsigned nblk) {
+    /* The geometry check lives HERE, not at the dispatch site. plow_exec is the per-packet
+     * dispatcher and its register pressure is the object's spill budget: hoisting three
+     * immediate compares into the switch arm cost 72 scratch ops in plow_exec alone
+     * (153 -> 225 on interp_prefill), for checks that are free inside an already-outlined
+     * body. */
+    if (!n_sample || !hidden || !live) __builtin_trap();
+    const auto* xg = as_glob(x);
+    auto* og = as_glob(out);
+    for (unsigned s = slice; s < n_sample; s += nblk) {
+        const unsigned src_row = rows[s];
+        if (src_row >= live) __builtin_trap();
+        const size_t src = (size_t)src_row * hidden, dst = (size_t)s * hidden;
+        if ((hidden & 7u) == 0) {
+            for (unsigned i = threadIdx.x * 8; i < hidden; i += PLOW_THREADS * 8)
+                st_glob8(og + dst + i, ld_glob8(xg + src + i));
+        } else {
+            for (unsigned i = threadIdx.x; i < hidden; i += PLOW_THREADS)
+                st_act1(&out[dst + i], x[src + i]);
         }
     }
 }

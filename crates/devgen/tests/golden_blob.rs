@@ -595,10 +595,6 @@ fn emit_block(dir: &Path, block: &str) {
     });
 }
 
-fn emit_arch_ctx(dir: &Path) {
-    emit_arch(dir, "gfx950", "MI350X", None);
-}
-
 fn precision(dir: &Path) -> serde_json::Value {
     let man: serde_json::Value =
         serde_json::from_slice(&std::fs::read(dir.join("build.json")).unwrap()).unwrap();
@@ -699,9 +695,13 @@ fn w8a8_is_emitted_where_it_exists_and_refused_where_it_does_not() {
     }
     let p = precision(&dense);
     assert_eq!(p["weight_enc"], "fp8");
+    // The dense W8A8 profile narrows the activation IN PREFILL ONLY: the GEMMs emit
+    // `QuantFp8`, while `GemvFp8`/`GemvGluFp8` take bf16 activations and widen the weight
+    // on load. `mixed` is the honest name for a packet that disagrees with itself; reading
+    // the arm union alone reported `fp8` and overstated the decode half.
     assert_eq!(
-        p["act_enc"], "fp8",
-        "dense: W8A8 narrows the activation too — QuantFp8 is emitted"
+        p["act_enc"], "mixed",
+        "dense: W8A8 quantizes prefill activations but decode stays w8a16"
     );
 
     let mla = tempdir("axis_mla_w8a8");
@@ -779,9 +779,7 @@ fn a_mxfp4_tied_head_keeps_the_bf16_embedding_table() {
         let _e = EnvScope::set(&[("PLOW_MX4_HEAD", "1")]);
         emit(&dir, 512, 128, 1)
     };
-    let has = |b: &[u8], n: &str| {
-        b.windows(n.len()).any(|w| w == n.as_bytes())
-    };
+    let has = |b: &[u8], n: &str| b.windows(n.len()).any(|w| w == n.as_bytes());
     assert!(
         has(&quantized, "mxfp4/model.embed_tokens.weight_scale"),
         "the E8M0 block scales are `<weight name>_scale`, the same suffix rule as the fp8 twins"
@@ -795,4 +793,194 @@ fn a_mxfp4_tied_head_keeps_the_bf16_embedding_table() {
         !has(&plain, "mxfp4/"),
         "unset must leave the blob exactly as it was"
     );
+}
+
+/// `build.json`'s `emit_config.replay` must be ENOUGH TO REBUILD THE BLOB.
+///
+/// This is the property the section exists for. Until now the only durable record of a winning
+/// emit configuration was prose in a markdown file: `build.json` carried the tuning source and
+/// the precision axes but not the ~146 knob values that produced the packet, so "re-emit the
+/// configuration we measured" meant reading a report and retyping env vars. A record that is
+/// merely descriptive would pass a shallower test and still not survive contact with that job,
+/// so the assertion is on the BLOB BYTES and not on the section's contents.
+#[test]
+fn the_recorded_knobs_replay_the_same_blob() {
+    let _g = emit_guard();
+
+    // A knob that demonstrably changes the packet, so a replay that silently dropped it would
+    // fail here rather than pass by emitting the default twice.
+    let first = tempdir("replay_first");
+    write_qwen3_config(&first);
+    let original = {
+        let _e = EnvScope::set(&[("PLOW_DECODE_BATCH", "4"), ("PLOW_GEMV_SPLIT", "2")]);
+        emit_arch(&first, "gfx942", "MI300X", None);
+        std::fs::read(first.join("model.pkt")).unwrap()
+    };
+
+    let man: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(first.join("build.json")).unwrap()).unwrap();
+    let replay = man["emit_config"]["replay"].as_object().unwrap().clone();
+    assert!(
+        replay.contains_key("PLOW_DECODE_BATCH") && replay.contains_key("PLOW_GEMV_SPLIT"),
+        "replay must name every knob that was set: {replay:?}"
+    );
+
+    // Re-emit from the record ALONE. The originals are cleared first, so a knob the record
+    // failed to mention cannot be supplied by a leftover environment — which is exactly how a
+    // reproduction script passes in the tree that wrote it and fails everywhere else.
+    let second = tempdir("replay_second");
+    write_qwen3_config(&second);
+    let replayed = {
+        let _clear = EnvScope::set(&[("PLOW_DECODE_BATCH", ""), ("PLOW_GEMV_SPLIT", "")]);
+        std::env::remove_var("PLOW_DECODE_BATCH");
+        std::env::remove_var("PLOW_GEMV_SPLIT");
+        let pairs: Vec<(String, String)> = replay
+            .iter()
+            .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
+            .collect();
+        let refs: Vec<(&str, &str)> = pairs
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let _e = EnvScope::set(&refs);
+        emit_arch(&second, "gfx942", "MI300X", None);
+        std::fs::read(second.join("model.pkt")).unwrap()
+    };
+
+    assert_eq!(
+        fnv1a(&original),
+        fnv1a(&replayed),
+        "the recorded knobs did not reproduce the blob: {} bytes vs {}",
+        original.len(),
+        replayed.len()
+    );
+}
+
+/// A defaulted emit records a defaulted configuration, and replaying it is still a no-op.
+///
+/// The complement of the test above, and not redundant with it: a `replay` that wrongly wrote
+/// down every DEFAULT would reproduce this blob too, and would silently pin today's defaults
+/// into every rebuild — so a future promotion would reach a fresh build and not a replayed one.
+#[test]
+fn a_default_emit_records_an_empty_replay() {
+    let _g = emit_guard();
+    let td = tempdir("replay_defaults");
+    write_qwen3_config(&td);
+    {
+        let _e = EnvScope::set(&[("PLOW_DECODE_BATCH", "")]);
+        std::env::remove_var("PLOW_DECODE_BATCH");
+        emit_arch(&td, "gfx942", "MI300X", None);
+    }
+    let man: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(td.join("build.json")).unwrap()).unwrap();
+    assert_eq!(
+        man["emit_config"]["replay"].as_object().map(|m| m.len()),
+        Some(0),
+        "defaults must not be pinned into the replay set: {}",
+        man["emit_config"]["replay"]
+    );
+    // The knobs themselves are still all recorded — "unset" is the fact a later diff needs.
+    assert!(
+        man["emit_config"]["knob_count"].as_u64().unwrap_or(0) > 100,
+        "every declared knob is recorded whether or not it was set"
+    );
+}
+
+/// Two emits of one blob must produce byte-identical `emit_config` and `dispatch_audit`
+/// sections, because the entire value of both is that a REGRESSION SHOWS UP IN A DIFF.
+///
+/// A section that reorders itself between runs, or that carries a float whose last digit
+/// wanders, is one that gets filtered out of review as noise — and then the one line that
+/// mattered goes with it.
+#[test]
+fn the_new_manifest_sections_are_byte_stable() {
+    let _g = emit_guard();
+    let section_bytes = |name: &str, dir_name: &str| {
+        let td = tempdir(dir_name);
+        write_qwen3_config(&td);
+        {
+            let _e = EnvScope::set(&[("PLOW_DECODE_BATCH", "2")]);
+            emit_arch(&td, "gfx942", "MI300X", None);
+        }
+        let man: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(td.join("build.json")).unwrap()).unwrap();
+        serde_json::to_vec_pretty(&man[name]).unwrap()
+    };
+    for name in ["emit_config", "dispatch_audit"] {
+        assert_eq!(
+            section_bytes(name, "stable_a"),
+            section_bytes(name, "stable_b"),
+            "{name} is not byte-stable across two emits of the same blob"
+        );
+    }
+}
+
+/// The audit must reach every blob, and must carry the two numbers the bug class hides behind:
+/// the CU set an op is actually dispatched on, and the object's compiled GEMV row ceiling.
+#[test]
+fn the_audit_records_the_cu_set_and_the_gemv_ceiling() {
+    let _g = emit_guard();
+    let td = tempdir("audit_present");
+    write_qwen3_config(&td);
+    {
+        let _e = EnvScope::set(&[("PLOW_DECODE_BATCH", "4")]);
+        emit_arch(&td, "gfx942", "MI300X", None);
+    }
+    let man: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(td.join("build.json")).unwrap()).unwrap();
+    let audit = &man["dispatch_audit"];
+
+    // `cus` is the per-op CU set, NOT the machine width — the distinction the `pick_tile`
+    // budget defect turned on. A fixture emitted for 256 CUs whose every row said 256 would
+    // mean the audit had reproduced the bug instead of reporting it.
+    let ops = audit["ops"].as_array().expect("audit rows");
+    assert!(!ops.is_empty(), "a dense blob has matmuls");
+    assert!(
+        ops.iter().any(|r| r["cus"].as_u64() != Some(256)),
+        "every row claims the whole machine; `cus` is not the per-op CU set"
+    );
+
+    // The ceiling is the same constant the backend asks the object to be built with.
+    assert_eq!(
+        audit["gemv_ceiling"]["compiled_m"], man["tuning"]["gv_mm_max"],
+        "the audit's ceiling and the object's -D must be one number"
+    );
+    assert_eq!(
+        audit["thresholds"]["promote_to_refusal_env"],
+        "PLOW_AUDIT_STRICT"
+    );
+}
+
+/// The threshold is CONFIGURABLE, and lowering it must actually silence a finding — otherwise
+/// the escape hatch named in the refusal text does not exist.
+#[test]
+fn the_occupancy_floor_is_configurable() {
+    let _g = emit_guard();
+    let findings = |floor: &str, dir_name: &str| {
+        let td = tempdir(dir_name);
+        write_qwen3_config(&td);
+        {
+            let _e = EnvScope::set(&[("PLOW_AUDIT_OCC_FLOOR", floor)]);
+            emit_arch(&td, "gfx942", "MI300X", None);
+        }
+        let man: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(td.join("build.json")).unwrap()).unwrap();
+        // OCCUPANCY findings only. `PLOW_AUDIT_OCC_FLOOR` governs one of the audit's two
+        // kinds, and counting both made this test a hostage to the other: the gfx942
+        // production decode ladder (`1,2,4,8`) makes a narrow rung run on a wider compiled
+        // GEMV object, which is a real `gemv_ceiling` finding and has nothing to do with the
+        // floor under test. It is silenced by `PLOW_AUDIT_GEMV_WASTE_MAX`, a different knob.
+        man["dispatch_audit"]["findings"]
+            .as_array()
+            .map(|f| {
+                f.iter()
+                    .filter(|r| r["kind"].as_str() == Some("occupancy"))
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+    // A floor of 0 admits everything; the section still exists, it simply has nothing to say.
+    assert_eq!(findings("0", "floor_zero"), 0);
+    // A floor of 100 demands a perfectly packed dispatch, which this tiny fixture is not.
+    assert!(findings("100", "floor_full") > 0);
 }

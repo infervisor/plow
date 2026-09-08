@@ -1,6 +1,6 @@
 use crate::program::{Packet, Program};
 use crate::splitk::ProjectionAccess;
-use packet::dev::{DevOp, TENSOR_NONE16};
+use packet::dev::{DevOp, ROPE_PAIR_HALF, TENSOR_NONE16};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -204,7 +204,7 @@ impl Manifest {
                     && !c.pair.contains(&self.position)
                     && !c.pair.contains(&self.kv_length)
                     && c.heads > 0
-                    && matches!(c.hd, 256 | 512)
+                    && matches!(c.hd, 64 | 256 | 512)
                     && c.stride > 0
                     && if c.window == 0 {
                         c.stride == self.max_ctx && c.mask == u32::MAX
@@ -320,6 +320,19 @@ impl Manifest {
                     } else {
                         op == DevOp::FlashDecode
                             && d.t[5] == self.kv_length
+                            && d.t[7] == TENSOR_NONE16
+                            && crate::mixed_step::validate_decode_slot_tensor(
+                                d.t[6],
+                                p.rows,
+                                tensor(d.t[6]).ok().map(|slot_map| {
+                                    crate::mixed_step::TensorContract {
+                                        name: slot_map.name,
+                                        bytes: slot_map.bytes,
+                                        initialized: slot_map.initialized,
+                                    }
+                                }),
+                            )
+                            .is_ok()
                             && d.i[0] == p.rows
                             && (d.i[2], d.i[6], d.i[3], d.i[4], d.i[7])
                                 == (c.heads, c.hd, c.stride, c.window, c.mask)
@@ -350,6 +363,12 @@ impl Manifest {
                                 d.i[0] == p.rows
                                     && d.i[1] == c.heads
                                     && d.i[2] == c.hd
+                                    && d.i[5]
+                                        == if c.hd == 64 && h == c.pair[0] {
+                                            ROPE_PAIR_HALF
+                                        } else {
+                                            0
+                                        }
                                     && d.i[3] == 0
                                     && d.fj[1] == c.stride
                                     && d.fj[2] == c.mask
@@ -406,7 +425,18 @@ fn direct_operands(op: DevOp) -> Result<()> {
                 | DevOp::ZeroF32
                 | DevOp::GemmSplitK
                 | DevOp::CastF32Bf16
+                | DevOp::MoeRouterTopkPf
+                | DevOp::MoeAlignPf
+                | DevOp::MoeCombinePf
+                | DevOp::MoeGluMx
+                | DevOp::MoeDownMx
+                | DevOp::MoeGluMxPf
+                | DevOp::MoeDownMxPf
         ),
         "opcode has no audited direct-operand access contract",
     )
 }
+
+#[cfg(test)]
+#[path = "live_kv_tests.rs"]
+mod tests;

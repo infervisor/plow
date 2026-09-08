@@ -1226,6 +1226,17 @@ impl AmdTpGroup {
             .then_some(t)
     }
 
+    /// §5.4's D-class span limit, agreed across ranks: the MINIMUM, and 0 for a rank that
+    /// refuses the program, so a disagreeing group admits no packed span rather than a plan one
+    /// rank cannot execute. Every rank carries the same program, so in practice they agree.
+    pub fn packed_prefill_span_limit(&self, prog: usize) -> u32 {
+        self.ranks
+            .iter()
+            .map(|rank| rank.packed_prefill_span_limit(prog).unwrap_or(0))
+            .min()
+            .unwrap_or(0)
+    }
+
     /// True only when every rank can route this exact program through packed prefill.
     pub fn packed_prefill_prog_capable(&self, prog: usize) -> bool {
         self.prefill_prog_t(prog).is_some()

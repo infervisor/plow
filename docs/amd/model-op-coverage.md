@@ -102,3 +102,856 @@ weights, an NVIDIA experiment), `NOP`.
 | Kimi K2.7 / DeepSeek / GLM 5.2 | yes (`PLOW_MLA_PREFILL=1`, unvalidated on HW) | yes |
 | Gemma4 MoE | no | no |
 | Mamba2 hybrids | no | no |
+
+
+---
+
+## MLA attention arm coverage on gfx942 (MI300X)
+
+The shared MLA family in `runtime/amd/op_attention.h` + `runtime/amd/interp.hip`
+serves GLM-5.2/5.3, DeepSeek-V2/V3 and Kimi-K2.7/K3. This is an audit of every
+place where a legally-emitted MLA packet either finds **no arm at all**, or finds
+a far slower arm than the one it should have — and what was done about each.
+
+## Why a missing arm is not merely slow
+
+On AMD the interpreter's dispatch `default:` **writes nothing and does not trap**
+(`crates/plowrt/src/exec/amd.rs`, `check_k3_arms`). The same is true one level
+down: an arm that ignores an operand it does not understand runs to completion on
+the operands it does understand. Both failure modes are finite, fluent and wrong.
+So the audit sorts holes by *class* first and cost second:
+
+| class | meaning | acceptable fix |
+|---|---|---|
+| **HAZARD** | a legal blob produces wrong output with no trap, NaN or error | a kernel, **or** a loud refusal naming the capability |
+| **SLOW** | correct output, wrong arm | a kernel, or a documented refusal if no model needs it |
+| **DEAD** | body exists, nothing dispatches it | delete, or wire it |
+
+A loud refusal is a *complete* fix for a HAZARD. It is not a complete fix for a
+SLOW path, but it is strictly better than a silent degradation, because the
+degradation announces itself at load instead of in a benchmark six weeks later.
+
+## Triage table
+
+| # | hole | class | models exposed | disposition |
+|---|------|-------|----------------|-------------|
+| 1 | NoPE MLA prefill (DR=0) has no tiled arm — falls to the scalar decode-body `d_flash_mla_prefill<512,0,GF>`, O(T·ctx) through the VALU | SLOW | Kimi-K3 (avoids it via DR=64 + identity rope table), DeepSeek-V4, any `qk_rope_head_dim=0` model | **CLOSED, kernel.** `d_flash_mla_prefill_v2<512,0>`, built generically as `if constexpr (DR > 0)`. Zero register cost; oracle-qualified |
+| 2 | DSA gathered prefill: op 51 carrying a `t7` union table runs **dense** and silently ignores `t7` on any object built without `PLOW_DSA_PF_ARM`, or on the 8-wave object | **HAZARD** | GLM-5.2/5.3 DSA | **CLOSED, refusal.** Object marker `plow_dsa_pf_arm` + blob `requires PLOW_DSA_PF_ARM=1` + a device-side trap on the 8-wave path |
+| 3 | Geometry rigidity: `DK=512`, `DR∈{0,64}` are template arguments at every dispatch site; `kv_lora_rank`/`qk_rope_head_dim`/`v_head_dim` are read from `config.json` and never checked | **HAZARD** | any future MLA model off the DeepSeek geometry | **NOT CLOSED — diagnosed, with the refusal written and tested but not wired.** The emit-time placement the hole seems to call for is blocked by a tree-wide test convention; the correct home is plowrt's load path. See below |
+| 4 | `MlaMergeFold` cliff: the fast fold map needs `v1-v0 == VT` and `V % VEC == 0`; `V < 128` took a scalar body measured **7.7x slower** | SLOW | none shipping (K3's `V=128` was already closed) | **CLOSED, dispatch fix at zero code growth** + the body's first correctness oracle. `V % VEC` folded into #3's refusal |
+| 5 | fp8-KV holes: no fp8 GATHER decode or prefill, no q-rope fold on fp8/gather, V2 fp8 arm has no ns-split/ofold/gather, K3 materialized prefill bf16-only | SLOW (**not** a hazard — every combination is emit-excluded) | GLM-5.3-FP8 | **DOCUMENTED, not closed.** One root cause, and it is a packet change not a kernel one — see "fp8 slot exhaustion" |
+| 6 | Dead bodies: `d_flash_mla_decode_mfma`, `d_index_score`, `d_index_score_fast` never dispatched; `DevOp::AttnSelect` (op 53) dispatched but **emitted by nothing** | DEAD | — | **DOCUMENTED at the dispatch site.** Op 53 is the real one, and it is not free — see "dead code" |
+
+## What each fix does
+
+### 1. `d_flash_mla_prefill_v2<512, 0>` — the generic zero-rope arm
+
+The V2 prefill body was already structurally indifferent to `DR`: its k-tiles are
+the same 32-deep MFMA shim for latent and rope, and outside the FP8 arm — where
+the two halves carry different dequant scales and must stay separate — they all
+accumulate into one `sacc`. What blocked `DR = 0` was three *integer divisions by
+`DR`* in the K-staging. They are dead at zero (their loop bound is `BKV * DR`) but
+still **compiled**, and division by a compile-time zero is UB the backend may
+render as a trap. A fourth site, the `Qrope` fall-through in the Q-fragment stage,
+would have underflowed `c - DK` into a wild global address.
+
+All four are now `if constexpr (DR > 0)`-guarded. Nothing else changes: same
+schedule, same LDS layout, a strictly smaller slab
+(`FA_MLA_PF2_LDS_BYTES(512, 0)`).
+
+**Built generically on purpose.** There is one body, not a NoPE special case — a
+`static_assert` states the contract (`DR == 0 || DR % 32 == 0`). A sibling adding
+`<512,0>` for DeepSeek-V4 should instantiate from this, not write a second arm.
+Only 0 and 64 are oracle-qualified, which is what `require_mla_geometry` refuses
+on.
+
+**Cost: nothing.** A/B build of `interp_flash`, same tree, arm on vs off:
+
+| | VGPR | AGPR | LDS | spill | `.elf` bytes |
+|---|---|---|---|---|---|
+| without the arm | 512 | 256 | 58,368 | 0 | 175,320 |
+| with the arm | 512 | 256 | 58,368 | 0 | 202,624 |
+
+The 27 KB confirms the body is genuinely emitted rather than folded away, and the
+identical register envelope is why the arm is **default-on**
+(`PLOW_MLA_PF2_NOPE_ARM`) rather than build-gated like `PLOW_DSA_PF_ARM`, which
+really does cost spill.
+
+**Oracle** (`runtime/tests/mla_ref.rs` + `mla_gfx950_test.c`, leased MI300X):
+three NoPE fixture cases (`n_head` 8/64/16, one ragged `ctx=4093` because the
+zero-rope slab is `DK` wide so its staging tail lands on a different thread).
+Their rope tables are identically **zero**, so the f64 CPU golden's `qrope·krope`
+term vanishes and the golden it computes *is* the NoPE golden — the same reference
+path that validates every other case, not a self-consistency check. Two claims per
+row, both required:
+
+* **vs the decode oracle, normalized**: max rel err **3.97e-05** (`n_head` 8/64)
+  and **5.39e-04** (ragged ctx), tolerance 2e-02 — the same numbers the roped V2
+  scores.
+* **vs the roped `<512,64>` body on the same zeroed tables: bit-exact.** 0 floats
+  differing, over every case × {1, 4, 33, 64, 65, 130} tokens. Adding `0*k` into an
+  f32 MFMA accumulator is exact, so any difference would mean a guard removed work
+  that was **not** dead. memcmp, not a tolerance — this is what pins the guards.
+
+Full harness: `MLA CORRECT (0 failures)`, no movement in any pre-existing case.
+The fixture magic is bumped `MLA1` → `MLA2` with its 8th header word, so a stale
+fixture is refused rather than mis-slicing every array after it.
+
+### 2. `PLOW_DSA_PF_ARM` — the capability that had no name
+
+The sparse V2 prefill arm is build-gated (the gathered instantiation raised the
+flash object's spill 98 → 287, so it is off by default). The gate was correct;
+what was missing was any way for a *blob* to say it needs it. A DSA blob loaded
+against a stock flash object left `t7` unread and ran **dense attention where the
+model was trained sparse** — no trap, no NaN, a fluent answer to a different
+question. The 8-wave object did the same for a different reason: its
+`exec_flash_mla_prefill` reads `t7` only on op 55 (where it is the per-query top-k
+table) and never on op 51.
+
+Three changes, mirroring the `PLOW_GLM_OFOLD` precedent exactly:
+
+* `interp.hip` exports `plow_dsa_pf_arm` under `#if PLOW_DSA_PF_ARM`, so the
+  object answers for itself from `.symtab` before it is on a device.
+* `manifest.rs` classifies any `FlashMlaPrefill` with `t[7] != NONE` as
+  `glm_dsa_pf` and pushes `PLOW_DSA_PF_ARM=1` into the blob's `requires`.
+* `check_dsa_pf_arm` refuses the pairing at load and — like ofold — additionally
+  requires `PLOW_MLA_PF_V2=1`, because without V2 routing the segment lands on the
+  8-wave kernel which has no gathered arm at all.
+
+`t7` is the whole discriminator between the **three** arms multiplexed onto
+`i[6]` — `ns`, `ofold`, `cap` — so the new test pins all three directions,
+including that `cap=4` is not read as `ns=4` and `cap=256` is not read as the
+ofold bit. A device-side `__builtin_trap()` on the 8-wave path is the belt to that
+braces, for the case where the object was never asked.
+
+### 3. Geometry refusal — written, tested, and deliberately NOT wired at emit
+
+`cfg_glm` and `cfg_k3` read `kv_lora_rank`, `qk_rope_head_dim` and `v_head_dim`
+straight from `config.json` and compare them to nothing, while every MLA dispatch
+site hardcodes `<512, 64>` or `<512, 0>`. A model at `kv_lora_rank = 384` would
+emit correctly-shaped tensors and have the kernel read 512 elements out of each
+384-wide latent row.
+
+**Generalizing `DK` is not tractable and the honest answer is to say so.** `DK`
+sets the staged LDS slab, the QK k-tile count `NKT`, the output n-tile count `NT`
+and therefore the `oacc[NT]` register file, and the `d_mla_merge_fold` fold map. A
+runtime `DK` costs the arm the register allocation that is its entire reason to
+exist, and each new compile-time `DK` is a full re-qualification of the 4-wave
+flash object against its 512-register cliff. `DR` is **not** impossible, only
+unqualified — the body is general in it now — so its message points at the oracle
+coverage that would qualify a new value, not at the kernel.
+
+So `require_mla_geometry` (`crates/devgen/src/lib.rs`) exists, names the value, the
+constant and the file, and has a unit test pinning all three refusals and the two
+accepted geometries. **What it does not yet have is a call site**, and that is a
+finding rather than an omission.
+
+**The config parse is the wrong place, on every MLA path.** It was tried there
+first and it refuses the test suite, because devgen's tests are built on *faithful
+miniatures*:
+
+| fixture | geometry | what it actually tests |
+|---|---|---|
+| `golden_blob.rs::write_kimi_config` | `kimi_k2`, hidden 256, kv_lora **32**, qk_rope **16**, v_head 64 | quantization-axis naming across two emitter families |
+| `kimi_k3.rs::k3_json` | 6 layers, hidden 256, kv_lora **32**, v_head **16** | layer maps, gap reports, tensor naming |
+| `kimi_tests.rs` | hand-built `K3Cfg`, kv_lora **64** | packet shapes at TP1/4/8 |
+
+Each describes a model the kernels could not serve — which is **fine, because it
+is never served**: no blob they emit is ever loaded onto a device. Dozens of
+derived assertions are scaled to match those numbers, so rewriting them to
+512-wide would destroy the property that makes them useful, and asserting over
+them refuses ~20 legitimate tests. (This is the same shape as the reverted attempt
+to refuse the FP8 indexer dtype in the emitter, which "broke seven legitimate
+tests" for the same structural reason.)
+
+**The correct home is plowrt's load path** — the boundary between "a blob was
+emitted" and "a blob will be executed", which is exactly where the other three
+gates in this audit ended up (`check_k3_arms`, `check_dsa_pf_arm`,
+`check_mla_nope_arm`). The wiring that is missing is one hop of plumbing:
+`kv_lora` currently reaches the manifest only through `BlockDims`
+(`mla.rs`, `BlockDescriptor`), not through the instruction scan that builds
+`requires`, and plowrt silently `continue`s past a `requires` flag it does not
+recognise — so a geometry entry pushed today would be ignored rather than refused.
+Closing it means (a) surfacing `kv_lora`/`qk_rope`/`v_head` into the `requires`
+builder and (b) making an unrecognised `PLOW_MLA_GEOMETRY_*` entry a hard refusal
+instead of a skip.
+
+**Until then the exposure stands**, and it is worth stating plainly: any MLA model
+at `kv_lora_rank != 512` emits without complaint and reads past its latent cache
+on device. Nothing in the tree or on the immediate horizon is such a model —
+GLM-5.2/5.3, DeepSeek-V2/V3/V4 and Kimi-K2.7/K3 are all 512, and K3's real config
+is pinned at 512 by its own test — which is why this is filed as a diagnosed
+hazard with a located fix rather than left as a silent one.
+
+### 4. `MlaMergeFold` at `V < 128`, and the oracle it never had
+
+The `V ∈ [128, 256)` half of this cliff was already closed. `V < 128` fell into
+the `<512, 256>` arm, where `vtiles = 1`, `v1 - v0 = V ≠ 256`, and every workgroup
+takes the scalar `else`. The note there promised the shape would "announce itself
+rather than silently degrade"; it did not.
+
+Fixed at **zero code growth**: `<512, PLOW_MLA_FOLD_VT>` is already compiled for
+the first branch, and any `V` that is a nonzero multiple of `VT` hands it full
+tiles. A/B of the decode objects: VGPR 256 / AGPR 0 / LDS 64,560 / spill 2,
+byte-identical across all ten rows; `interp_decode.elf` grows 1,104 bytes — the
+branch, not a fold body (compare the flash object's real new instantiation at
++27,304). No shipping model moves: GLM-5.2 (`V=256`) takes the first branch and
+Kimi-K3 (`V=128`) the `<512,128>` one, both excluded by the `V < 128` bound.
+
+**The oracle did not exist.** `d_mla_merge_fold` had a bench
+(`runtime/tests/decode_bench_gfx942.c`) and no correctness test — which is exactly
+how a 7.7x scalar fallback survives, since everything measured how fast it ran and
+nothing checked what it computed. It is also the largest single line in a GLM
+decode token and it *fuses* two steps that used to be separate ops, so a fault in
+either half is invisible to any test of the flash kernels alone.
+
+The new phase checks the device against an f64 CPU golden over the **VT dispatch
+table** rather than a sample:
+
+| V | nsplit | VT | max rel err (tol 2e-02) |
+|---|---|---|---|
+| 32 | 1 | 32 | 1.79e-03 |
+| 64 | 8 | 32 | 3.31e-03 |
+| 96 | 4 | 32 | 1.89e-03 |
+| 128 | 8 | 32 | 3.20e-03 |
+| 128 | 8 | 128 | 2.74e-03 |
+| 256 | 8 | 256 | 2.28e-03 |
+
+`V=32/64/96` through `<512,32>` is the coverage that did not exist; `V=128` runs
+through both tiles to pin the property the new branch relies on. `nsplit` is swept
+1 and 8 so the merge half and its `MS=8` blocked path are both exercised, with a
+deliberately **dead** split (`m=-inf, l=0`) in every split case to test the
+branch-free zero weighting. A `<512,128>` test wrapper was added; that tile was
+dispatched but never built here.
+
+> **The oracle earned itself on its first run** by failing five of six rows —
+> every one with `nsplit > 1`, including the shipping GLM and K3 tiles. That was
+> the *golden*, not the kernel: `FA_EXP` is `__builtin_amdgcn_exp2f`, so every
+> flash epilogue stores `m` in **log2 space** and the merge weight is
+> `exp2(m - gm)`. `exp` and `exp2` agree exactly at `nsplit == 1`, which is
+> precisely why only the unsplit row passed. Recorded in the test, because the next
+> person to write a golden against these partials will reach for `exp()` too.
+
+**Residual**: a `V` that is a multiple of `VEC` but not of `VT` (e.g. 68) still
+takes the scalar body. Closing it needs a finer instantiation, which costs
+registers in the decode object for a shape no model in this tree has.
+
+### 5. fp8 slot exhaustion — why this is documented, not closed
+
+Every fp8 hole in the audit is the same root cause: **`t7` is the last tensor
+slot, and three features want it.** On op 51 it is the union table (DSA), the fp8
+KV dequant scales, or nothing. On op 50 it is the q-rope cos table, the gather
+index, or the fp8 scales. There is no bit left to disambiguate a fourth meaning,
+and the emitter already asserts the exclusions (`mla.rs`: `PLOW_GLM_OFOLD` "cannot
+combine with `PLOW_GLM_DSA_PF` or `PLOW_GLM_FP8_KV`"), so **no blob can express
+the missing combination** — which is why these are SLOW-path absences and not
+hazards.
+
+Closing them is a *packet* change — a slot widening, or an i-slot demotion of the
+kind `GemvQkvg` established — not a kernel change, and it should be done once for
+the family rather than three times for three pairs. Recorded here as the
+prerequisite rather than attempted piecemeal.
+
+**One more combination is deliberately left trapping: NoPE × fp8-KV.** The
+zero-rope arm added in #1 covers the bf16 twin (op 51) only; op 110
+(`FLASH_MLA_PREFILL_FP8`) still `__builtin_trap()`s on `i[3]` bit 31. That is
+unchanged behaviour, not a regression — the old code trapped for both — and it is
+deliberate: the fp8 body keeps the latent and rope halves in **separate
+accumulators** because they carry different dequant scales, and that split has no
+oracle coverage at `DR = 0`. Running it would apply one scale across the whole
+score. No model needs the pairing today (Kimi-K3 is the NoPE model and declares
+`DR=64` with an identity rope table; GLM-5.3-FP8 is not NoPE), so the trap stands
+rather than an unqualified arm. Note this one is a *trap*, not a load-time
+refusal: the `mla_pf_nope` manifest flag covers op 51 only, on purpose, because
+the marker lives on the same object and a `requires` entry would produce a false
+all-clear followed by the trap anyway.
+
+Worth noting that the reference implementations are **not ahead of plow here**:
+vLLM gates fp8 MLA *prefill* to gfx950 only (`_fp8_mla_prefill_supported()` checks
+`on_gfx950()` and otherwise falls back to `flash_attn_varlen_func`), so on MI300X
+it has no fp8 MLA prefill either.
+
+### 6. Dead code
+
+* `d_flash_mla_decode_mfma` — a complete MFMA decode body, never dispatched. It
+  has `test_kernels.hip` coverage and an argued design note; a *staged* kernel,
+  not a mistake. Kept.
+* `d_index_score` / `d_index_score_fast` — superseded by `d_index_score_mfma`
+  (which op 58 dispatches). Kept as the **reduction-order reference** the MFMA
+  body is qualified against; `op_attention.h` already says so.
+* **`DevOp::AttnSelect` (op 53)** — the one that is genuinely dead in the direction
+  that matters. The interpreter dispatches it, `packet/src/dev.rs`,
+  `packet/src/slots.rs` and a `manifest.rs` test list know it, and **no `b.emit(…)`
+  anywhere produces it**. The shipping DSA selector is `IndexScore(58)` →
+  `IndexSelect`, a different chain; this fused one-workgroup score+rank was
+  superseded and never retired.
+
+  It is **not free**: `PLOW_DECODE_INVENTORY_PRUNE` defaults to 0, so the body is
+  compiled into every shipped decode object, where register allocation is the worst
+  case over every inlined arm. It is left in place rather than deleted because it
+  has a passing hardware test (`runtime/tests/attn_select_gfx950_test.c`) and
+  removing a tested ISA opcode is a larger decision than an arm audit should take
+  on its own — but anyone hunting decode register pressure should look here first.
+  Recorded at the dispatch site.
+
+## Adapted from AITER / vLLM
+
+Nothing was copied verbatim, so no licence headers were carried. What the two
+open implementations on this host (`/workspace/aiter`, vLLM 0.28+rocm723) actually
+contributed:
+
+* **The zero-rope pattern (#1).** AITER's Triton MLA decode
+  (`aiter/ops/triton/_triton_kernels/attention/mla_decode_rope.py`) derives
+  `qk_rope_head_dim` at runtime and carries a `USE_ROPE: tl.constexpr` flag that
+  compiles the rotation math away. That is the same shape as the
+  `if constexpr (DR > 0)` guards here, and it was the confirmation that a
+  compile-time flag over one body is the idiomatic answer rather than a second
+  kernel. **No production kernel in either codebase runs at rope dim 0** — AITER's
+  asm `.co` binaries are hand-written for 576 = 512+64 and its HipKittens v4 path
+  fixes `V4_DIM_QK_PACKED=512` / `V4_DIM_ROPE=64` in a struct — so plow's `<512,0>`
+  arm has no upstream counterpart to copy.
+* **Refusal as the answer to geometry rigidity (#3).** vLLM's ROCm sparse MLA
+  asserts `nope_head_dim == 448 && rope_head_dim == 64` outright
+  (`rocm_aiter_mla_sparse.py::_validate_dsv4_sparse_dims`), and AITER's MLA reduce
+  (`csrc/kernels/mla/reduce.cu`) dispatches from a compile-time enumerated
+  `(num_heads, head_dim)` table whose fallthrough is `AITER_CHECK(false, …)`. Both
+  reach the same conclusion this audit did — a hard refusal naming the geometry —
+  which is why #3 is a refusal and not an attempt at a runtime `DK`.
+* **Head-count restrictions are normal, not a plow defect (#2).** plow's gathered
+  V2 arm requires `n_head == 8`. AITER's sparse MLA prefill requires
+  `num_query_heads % BLOCK_M(16) == 0`, and its MLA family generally requires
+  `num_heads < 16` (padded to 16) or a multiple of 16
+  (`AiterMLAHelper.check_num_heads_validity`). Both restrictions are of the same
+  kind, so the `n_head == 8` gate was left alone.
+* **A design data point not taken.** vLLM's *production* ROCm sparse path does not
+  use a bespoke sparse kernel at all: it converts top-k indices into a standard
+  paged layout (`triton_convert_req_index_to_global_index`) and reuses the dense
+  MFMA decode kernel for both prefill and decode. plow's union-table approach keeps
+  more information (per-query membership masks over a shared tile walk) and is
+  measured 3.8x better on rows/query; noted here so the alternative is on record
+  rather than rediscovered.
+* **Nothing to adapt for the fold (#4).** Neither codebase fuses the split-KV
+  reduce with the output projection — the `W_uv` bmm is separate Python-level
+  `torch.bmm` in both — so `d_mla_merge_fold` has no upstream equivalent. AITER's
+  reduce does adapt to small `D` (`kNumWarps = (kSizeDV < 128) ? 1 : 2`, plus a
+  dedicated `d64` fast path), which is the same instinct as the `V < 128` routing
+  fix, but the code shares no structure.
+
+## Verification
+
+Every body touched is gated against the f64/CPU oracle before any serving claim.
+The precedent this follows is a sibling's recent 10x accuracy regression, which
+the serving-identity gate reported only as "different": `O` was accumulated from a
+bf16 `P` while `l` summed the f32 `p` — a discrepancy that cancels under a running
+max but not against a fixed frame. The lesson taken here is that **an arm with no
+oracle coverage is an untested arm**, regardless of how well the serving gate
+does; hence the fold oracle in #4, for a body that had only a bench.
+
+Command used for the device runs (leased single MI300X):
+
+```sh
+PLOW_HIP_ARCH=gfx942 nix develop /app/plow --command scripts/build_mla.sh /tmp/mlab942
+GPU_LEASE_TIMEOUT=21600 perf-data/tools/gpulease -n 1 mla-oracle \
+    sh -c 'cd /tmp/mlab942 && LD_LIBRARY_PATH=/opt/rocm-7.2.4/lib ./mla_test fixture.bin'
+```
+
+Note that `scripts/build_mla.sh` hardcodes `-I/opt/rocm/include` for the host
+half, which has no `hsa/hsa.h` on this box; the harness was linked against
+`/opt/rocm-7.2.4` instead. That is a pre-existing script bug, not a change made
+here.
+
+
+---
+
+## Dense GQA/MHA attention on gfx942: the AMD arm inventory
+
+The family that serves **Gemma-4 (31B / 12B / 26B-A4B), Llama, Qwen3 and GPT-OSS**. Two
+emitters produce all of it: `emit_dense_gqa` in `crates/devgen/src/lib.rs` (Gemma-4, Llama,
+Qwen3) and `crates/devgen/src/gptoss.rs` (GPT-OSS).
+
+## Why an inventory and not a test run
+
+On AMD the interpreter's dispatch `default:` is `/* PLOW_DOP_NOP */` — it writes **nothing**.
+It does not trap, unlike sm_120's `default: __trap()`. So an opcode with no arm is not a slow
+path and not a crash: the op leaves its output buffer exactly as it found it and the model
+decodes fluently off whatever was in memory. Three separate holes of this shape have been
+found in this family (`GFX950_DISPATCHED`'s founding four, the Gemma-4 MoE port, and hd=64),
+and none of them was found by serving — they were found by reading the dispatch.
+
+Two gates already exist against it and both are checked against the artefact rather than
+against a build flag: `check_gfx950_opcode_coverage` (`lib.rs:7063`) refuses at **emit** time
+if a packet carries an opcode with no `case` label anywhere in `interp.hip`, and the
+`*_SYM` marker checks in `crates/plowrt/src/exec/amd.rs` refuse at **load** time if an object
+was built without the axis a packet's opcodes need (the loader reads `.symtab`, so the object
+answers for itself and a stale `-D` on someone's shell cannot lie about it).
+
+## Build axes the shipped gfx942 dense rows set
+
+From the `ROWS` table in `scripts/build_gfx942.sh`:
+
+| object (+ `_gq` twin) | axes that decide a `case` |
+|---|---|
+| `interp_prefill` | `PLOW_BUCKET_PREFILL=1`, `PLOW_WG_WAVES=8`, `PLOW_MOE_GEMMA=1`, `PLOW_MOE_GEMMA_PF=1`, `PLOW_PACKED_PREFILL_DENSE_CONSUMERS=1` |
+| `interp_decode` | `PLOW_BUCKET_DECODE=1`, `PLOW_GEMV_MM=1`, `PLOW_WG_WAVES=8`, `PLOW_MOE_GEMMA(+_PF)=1`, `FA_DEC_ILV=1` |
+| `interp_flash` | `PLOW_BUCKET_FLASH`, **`PLOW_WG_WAVES=4`**, `FA_DC=256`, `FA_DBUF=1`, `PLOW_MOE_GEMMA(+_PF)=1` |
+| `interp_mixed` | `PLOW_MIXED_STEP=1`, `PLOW_WG_WAVES=4`, `FA_DC=256`, `FA_DBUF=1` — **no** `PLOW_MOE_GEMMA` |
+| `*_fp8` / `*_fp8kv` | `+ PLOW_FP8=1` / `+ PLOW_FP8=1 PLOW_FP8_KV=1` |
+
+Never set on a dense row: `PLOW_MXFP4`, `PLOW_MOE_PREFILL`, `PLOW_MLA_PREFILL`, `PLOW_K3`,
+`PLOW_SEQ_PAR_SEAMS`, `PLOW_DECODE_INVENTORY_PRUNE`. Because `PLOW_DECODE_INVENTORY_PRUNE`
+defaults to 0 (`interp.hip:94`), every `!PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_*` guard is
+vacuously true in the shipped build; those are folded to "unguarded" below.
+
+## The inventory
+
+`G` = Gemma-4 31B/12B dense · `G26` = Gemma-4 26B-A4B MoE branch · `LQ` = Llama/Qwen3 ·
+`OSS` = GPT-OSS. Status is against `runtime/amd/interp.hip`.
+
+| op | `DevOp` | `PLOW_DOP_` | emitters | AMD arm |
+|---|---|---|---|---|
+| 1 | RmsNorm | RMSNORM | G G26 LQ OSS | yes |
+| 3 | HeadNormRope | HEADNORM_ROPE | G G26 LQ OSS | yes |
+| 4 | Residual | RESIDUAL | LQ | yes |
+| 5 | Glu | GLU | G G26 LQ | yes |
+| 6 | Embed | EMBED | G G26 LQ OSS | yes |
+| 7 | SoftCap | SOFTCAP | G G26 | yes |
+| 8 | Gemm | GEMM | G G26 LQ OSS | yes |
+| 10 | Gemv | GEMV | G G26 LQ OSS | yes (two arms: prefill-side under `!PLOW_MIXED_STEP`, decode-side) |
+| 11 | FlashPrefill | FLASH_PREFILL | G G26 LQ OSS | yes (`#else` of `PLOW_FP8_KV`) |
+| 12 | FlashDecode | FLASH_DECODE | G G26 LQ OSS | yes (`#else` of `PLOW_FP8_KV`) |
+| 13 | FlashMerge | FLASH_MERGE | G G26 LQ OSS | yes |
+| 14 | GemmSmall | GEMM_SMALL | G G26 LQ | yes |
+| 15 | GemmMed | GEMM_MED | G G26 LQ | yes |
+| 16 | NormResidual | NORM_RESIDUAL | G G26 | yes |
+| 17 | Argmax | ARGMAX | G G26 LQ OSS | yes |
+| 18 | ArgmaxFin | ARGMAX_FIN | G G26 LQ OSS | yes |
+| 19 | GemvGlu | GEMV_GLU | G G26 LQ | yes |
+| 20 | GemmGlu | GEMM_GLU | G G26 LQ | yes — `PLOW_WAVES == 8 \|\| PLOW_MIXED_STEP` |
+| 21 | AddNorm | ADD_NORM | LQ OSS | yes |
+| 22 | GemvQkv | GEMV_QKV | G G26 LQ OSS | yes |
+| 23 | NormResidualNorm | NORM_RESIDUAL_NORM | G G26 | yes |
+| 24 | XReduce | XREDUCE | G G26 LQ (tp>1) | yes — `if/else` chain at `interp.hip:4992`, `!defined(PLOW_BUCKET_FLASH)` |
+| 25 | XReduceScatter | XREDUCESCATTER | G G26 LQ | **`PLOW_SEQ_PAR_SEAMS` — not set on any row** |
+| 26 | XAllGather | XALLGATHER | G G26 LQ | **`PLOW_SEQ_PAR_SEAMS` — not set on any row** |
+| 29 | XReduceTwoShot | XREDUCE2 | G G26 LQ (tp>1) | yes |
+| 30-36, 100, 101, 115 | Gemv/Gemm fp8 family | `*_FP8` | G G26 LQ | yes — `PLOW_FP8` |
+| 37 | HeadNormRopeFp8 | HEADNORM_ROPE_FP8 | G G26 LQ | yes — `PLOW_FP8_KV` |
+| 38 | FlashDecodeFp8 | FLASH_DECODE_FP8 | G G26 LQ | yes — `PLOW_FP8_KV` |
+| 39 | FlashPrefillFp8 | FLASH_PREFILL_FP8 | G G26 LQ | yes — `PLOW_FP8_KV` |
+| 61-77, 81, 82 | Gemma-4 MoE family | `MOE_*_GEMMA*` | G26 | yes — `PLOW_MOE_GEMMA` / `_PF` (+ `PLOW_FP8` for 65/66/81/82) |
+| **80** | **GemvArgmax** | **GEMV_ARGMAX** | **G G26 LQ** (`PLOW_FUSE_ARGMAX=1`) | **NO ARM — no `case` anywhere** |
+| 83, 84, 87 | MoeRouterTopkPf / MoeAlignPf / MoeCombinePf | `MOE_*_PF` | OSS | **`PLOW_MOE_PREFILL` — not set on any dense row** |
+| 91-93, 96-99, 113 | mxfp4 Gemv/Gemm family | `*_MXFP4` | G G26 LQ OSS | **`PLOW_MXFP4` — not set on any dense row** |
+| 94 | GemmWide | GEMM_WIDE | G G26 LQ | yes |
+| 95 | GemmC5 | GEMM_C5 | G G26 LQ | yes |
+| **150** | **MoeGluMx** | **MOE_GLU_MX** | **G26 (mxfp4), OSS** | **NO ARM** |
+| **151** | **MoeDownMx** | **MOE_DOWN_MX** | **G26 (mxfp4), OSS** | **NO ARM** |
+| **152** | **MoeGluMxPf** | **MOE_GLU_MX_PF** | **G26 (mxfp4), OSS** | **NO ARM** |
+| **153** | **MoeDownMxPf** | **MOE_DOWN_MX_PF** | **G26 (mxfp4), OSS** | **NO ARM** |
+
+Ops 150-153 and 80 have only CPU arms (`runtime/cpu/dev/avx512/gptoss.c`,
+`runtime/cpu/dev/amx/moe_amx.c`, `runtime/cpu/dev/golden/control.c`).
+
+Reverse direction: ops 62 (`MOE_EXPERT_GLU_GEMMA`) and 64 (`MOE_COMBINE_GEMMA`) have live AMD
+arms that no dense emitter emits any more — superseded by 71 and 70/72. Dead weight, not a gap;
+`gfx950_coverage_tests::every_dispatched_arm_has_an_emit_site` watches that direction.
+
+### The one live emit hole this inventory found
+
+`check_gfx950_opcode_coverage` is called from `emit_dense_gqa` (`lib.rs:7972`) and **was not
+called from `gptoss::run` at all** — and `gptoss.rs` is the emitter that emits ops 150-153. A
+`plowc ... --arch gfx942` GPT-OSS blob would therefore have been written with four expert
+opcodes that have no AMD arm, and would have decoded fluently with every expert output buffer
+untouched. The call is now made from `gptoss::run` before the blob is written; it names the
+missing capability (`gfx950_opcode_arm`) and lists the opcodes.
+
+Consequence, stated plainly: **the attention-sink fix below makes GPT-OSS attention on AMD
+numerically correct; it does not make GPT-OSS servable on AMD.** The MXFP4 expert ops still
+have no arm, and the emit now refuses rather than shipping a blob that pretends otherwise.
+
+## What was closed
+
+### 1. Attention sinks in `d_flash_merge` (op 13 `t3`)
+
+`dev_isa.h:196-213` has specified the fold since GPT-OSS was first emitted. NVIDIA
+(`runtime/nvidia/op_attention.cuh:1196`) and both CPU tiers
+(`runtime/cpu/dev/golden/attention.c:156`, `runtime/cpu/dev/avx512/attention.c:523`) implement
+it. AMD ignored `t3`, so a GPT-OSS blob's softmax denominator was short one term per head on
+every token — the merge ran and wrote a plausible, wrong `O`.
+
+The fold, per the ISA note, with `gm' = max(gm, sink)`:
+
+```
+rescale = e^(gm - gm')
+gl'     = gl * rescale + e^(sink - gm')
+O       = (sum_s O_s e^(m_s - gm)) * rescale / gl'
+```
+
+The accumulator keeps `gm` as its exponent base and only `inv` carries the sink, so the D loop
+is unchanged. Written this way rather than as the algebraically equal
+`acc / (gl + e^(sink - gm))`, whose denominator overflows when the sink sits far above every
+split's max — and it can: with all splits empty `gm` is `FA_NEG_INF`, where this form gives
+`rescale = 0`, `gl' = 1`, `O = 0`, which is the right answer (all softmax mass on a row that
+has no value) rather than a NaN. `FA_SCALE` lifts the raw sink logit into the log2 domain the
+flash bodies write their `(m, l)` in; it is the identity when `FA_USE_EXP2` is off.
+
+`sinks == nullptr` leaves `rescale` at exactly `1.0f`, an exact multiplicand, so every other
+model's merge is bit-for-bit what it was.
+
+The two hand-copied `FLASH_MERGE` dispatch chains are now one `exec_flash_merge`. They had
+already drifted once — the hd=64 arm went into both by hand, and this fold would have had to
+as well. `exec_mixed_prefill_merge` carries `t3` too, so a sinks model cannot lose the fold by
+being routed through the mixed step.
+
+### 2. Head-dim refusal
+
+`exec_flash_prefill`, both chains in `exec_flash_decode`, the merge chain and both fp8-KV twins
+(`exec_flash_prefill_fp8`, `exec_flash_decode_fp8`) all ended without an `else`. That is the exact
+shape the hd=64 hole had. Each now `__builtin_trap()`s.
+
+The dense head-dim set is closed at **64 / 128 / 256 / 512** and nothing shipping can reach the
+trap:
+
+| model | prefill/decode head dims |
+|---|---|
+| Gemma-4 31B | 256 (sliding, 16 kv heads), 512 (full, 4 kv heads — `global_head_dim`) |
+| Gemma-4 12B / 26B-A4B | 256 / 512, same split |
+| Llama, Qwen3 | 128 |
+| GPT-OSS | 64 |
+
+Under `PLOW_FP8_KV` the set is 128/256/512 (no fp8-KV model has a 64-wide head), and hd=64
+traps there too.
+
+### 3. Golden coverage for hd=64
+
+`runtime/amd/test_kernels.hip` had **no** hd=64 wrappers, so the arms added with the dispatch
+fix had never been run against the f64 CPU oracle — the only evidence they worked was that the
+blob stopped writing zeros. It now exports `gemma_flash_{prefill,decode,merge}_64` and
+`gemma_flash_merge_{64,128}_sinks`. The sink merges are separate symbols rather than a widened
+signature on the existing ones, because `attention_gfx950_test` and `decode_bench_gfx942` build
+their kernarg struct by hand and a widened signature would read past their packet silently
+instead of failing to link.
+
+`runtime/tests/attention_gfx950_test.c` grows eleven cases: hd=64 prefill and decode, causal,
+GQA 8:1, and the 128-token sliding window GPT-OSS declares; sinks at hd=64 and hd=128;
+and a `sink_mag=60` case that is the overflow argument above. Every sinks case also re-merges
+the **same** partials with `t3=NONE` and requires the answer to change, so a no-op fold cannot
+pass.
+
+#### Oracle errors
+
+All 40 cases pass against the f64 CPU reference, at **both** wave axes — the default, and the
+4-wave flash axes (`PLOW_WG_WAVES=4 FA_DC=256 FA_DBUF=1 GM_BM=64 GM_BN=128`) that the shipped
+`interp_flash` object is built at and that exposed the `FA_DBUF` V-slab overrun.
+
+| case | max rel | rms rel |
+|---|---|---|
+| hd=64 prefill, causal, nsplit 1/4 | 0.0027 / 0.0026 | 0.00183 / 0.00185 |
+| hd=64 prefill, GQA 8:1, nsplit 8 | 0.0029 | 0.00186 |
+| hd=64 prefill, sliding 128 | 0.0027 | 0.00190 |
+| hd=64 **sinks** prefill, nsplit 1/4/8 | 0.0027 / 0.0027 / 0.0029 | 0.00207 / 0.00200 / 0.00201 |
+| hd=64 **sinks dominant** (`sink_mag=60`) | 0.0026 | 0.00188 |
+| hd=128 **sinks** prefill, nsplit 4 | 0.0028 | 0.00204 |
+| hd=64 decode, causal / sliding 128 | 0.0032 / 0.0031 | 0.00166 / 0.00178 |
+| hd=64 **sinks** decode, causal / sliding 128 | 0.0027 / 0.0022 | 0.00168 / 0.00169 |
+| (unchanged) hd=128/256/512 prefill + decode | 0.0021 - 0.0030 | 0.00163 - 0.00201 |
+
+Errors are normalised by `|O|max`, not per element. ~2-3e-3 is the floor the harness
+documents: like every FlashAttention, prefill rounds the softmax probabilities `P` to bf16
+before the matrix core, so each of ~`n_kv` accumulated terms carries ~0.4% quantisation. The
+sink cases sit inside the same band as the rest — the fold adds no error of its own.
+
+The no-sink control fires as intended: merging the same partials with `t3=NONE` moves the
+answer by 0.87-1.00 in absolute terms against `|O|max ≈ 1`.
+
+Full gfx942 build (45 objects) clean, instruction-selection audit PASS over 36 objects,
+register/LDS/spill counts unchanged on every row.
+
+#### Serving qualification
+
+The bit-identity claim (`sinks == nullptr` leaves `rescale` at exactly `1.0f`) was checked on the
+machine, not only in the argument. Same Gemma-4 31B bf16 blob served twice on one leased MI300X,
+once against `build-gemma31/hsaco-tiered` (built before this change) and once against objects
+built from this tree, everything else held: **9/9 greedy completions character-identical, token
+agreement 1.0000**, 3 prompts x 3 context lengths (128 / 2048 / 8192) x 64 tokens. TPOT moved
++0.1% to +1.1% across five input lengths from 128 to 122880, i.e. within run-to-run noise.
+
+Gemma has no sinks, which is the point: the fold must be invisible to every model that does not
+carry `t3`.
+
+## What was NOT closed, and why
+
+### Gemma-4 `k_eq_v` stores both K and V — required by the kernels, not an emit artefact
+
+The question was whether the 8192 B/pos on Gemma-4's ten full-attention layers (4096 for K plus
+4096 for V, at `global_head_dim` 512 x `num_global_key_value_heads` 4) is a duplicate an
+emitter could stop writing.
+
+**It is not.** `attention_k_eq_v: true` means there is no `v_proj`, not that K and V are the
+same bytes. Both come from one `k_proj(x)`, and then they diverge:
+
+```
+K = RoPE( k_norm(kg) )        HeadNormRope with gamma = k_norm.weight, cos/sin bound
+V = v_norm(kg)                HeadNormRope with gamma = NONE, cos = NONE  (weightless, no RoPE)
+```
+
+Confirmed at the emit site — `lib.rs:4363` leaves `d.t[2]`, `d.t[3]`, `d.t[4]` at
+`TENSOR_NONE` on the V packet while `lib.rs:4317` binds all three on the K packet — and in the
+ISA (`dev_isa.h:67-70`: "`gamma==NONE` is the weightless RMSNorm (Gemma's v_norm)",
+"`cos==NONE` skips RoPE (that is v_norm)"). `op_attention.h:32` already warned that "feeding K
+in as V is a real and tempting bug".
+
+**But V is exactly recoverable from K**, and the checkpoint says the precondition holds with a
+large margin. Measured over all ten full layers of `build-gemma31/checkpoint`:
+
+* `self_attn.k_norm.weight` is a **constant scalar broadcast across all 512 channels** on every
+  full layer — `min == max` to the last bit, ranging 0.0601 to 0.0654 across layers. Zero
+  channels below 1e-2. So `gamma_k` is a scalar, and dividing by it is exact to bf16 rounding
+  and cannot amplify a near-zero channel.
+* Full layers use **partial RoPE**: `rope_parameters.full_attention.partial_rotary_factor` is
+  0.25, so `inv_freq` is non-zero only for `i < 64` and the rotated pairs are `(i, i+256)`.
+  **384 of 512 channels are never rotated at all.**
+
+So `V = unRoPE(K) / gamma_k` is a scalar multiply on 384 of 512 channels and a scalar multiply
+plus one 2x2 inverse rotation on the remaining 128 — and the flash-decode body already has the
+K row in hand in the same loop iteration it wants V. That is a real route to the
+-1.3 ms/token, and it halves full-layer KV **capacity** as well as bandwidth.
+
+It is also a **new kernel body**, not an emit fix: the K row is staged transposed for the QK
+MFMA and the P.V phase wants it natural, so the reuse is not free in LDS, and the epilogue
+would need `cos`/`sin` for each KV position it un-rotates. Left as a measured, quantified
+follow-up rather than attempted here.
+
+### fp8 KV on the dense path: it works, and it is a capacity lever, not a speed lever
+
+The roofline named dense fp8 KV the largest absolute decode prize in the model set, sized on a
+Llama-70B-class **all-full-attention** GQA-128/8kv archetype: 43 GB -> 22 GB at 128k, about
+-5.1 ms/token. Nobody had taken it end to end on a dense model. This is that measurement, on
+Gemma-4 31B, and the answer is no on speed and a large yes on capacity.
+
+#### It builds, emits and serves
+
+`PLOW_FP8_KV=1` (the alias `PLOW_KV_FP8` is deprecated; leave `PLOW_FP8_KV_FULL` **unset** — the
+mixed per-layer profile puts both halves of a swap in one decode program and the loader's
+`check_kv_encoding` correctly refuses whichever object it is given). The dense emitter is fully
+wired: `emit_dense_gqa` swaps op 3 -> **37** `HeadNormRopeFp8` for the K and V norms
+(`lib.rs:4309-4313`, Q stays bf16 — it is not cached), op 12 -> **38** `FlashDecodeFp8`
+(`lib.rs:4540`) and op 11 -> **39** `FlashPrefillFp8` (`lib.rs:4572`). Both K and V go e4m3 with a
+**per-row f32 scale** — one scalar per (token, kv_head), `scale = amax/448`, quantised at the norm
+that writes the cache (`op_norm.h:518-529`) and dequantised at LDS staging so the MFMA is
+unchanged. The shipped `build-gemma31/hsaco-tiered` already carries the six gfx942 fp8kv objects
+with the `plow_fp8_kv_1` marker; no object rebuild is needed.
+
+Two routes refuse fp8 KV and are not hit by default: packed prefill
+(`plow-asset/src/packed_prefill.rs:110`) and the mixed step
+(`plow-asset/src/mixed_step.rs:1011`).
+
+#### Setup
+
+Gemma-4 31B (`build-gemma31/checkpoint`), one leased MI300X, TP1. Two blobs from the same
+`plowc`, identical in every knob but `PLOW_FP8_KV`:
+
+```
+PLOW_AMD=1 PLOW_L2_PLACE=0 PLOW_DECODE_BATCH=4 PLOW_DECODE_BATCH_LADDER=1,2,4 \
+PLOW_MAX_CHUNK=8192 [PLOW_FP8_KV=1] \
+  plowc --hf-dir build-gemma31/checkpoint --gpu MI300X --arch gfx942 --num-gpus 1 \
+        --max-ctx 131072 --out <dir>
+```
+
+Objects: `scripts/build_gfx942.sh` at `PLOW_DECODE_BATCH=4` from this tree, **same set for both
+arms**. `PLOW_DECODE_TIERS` deliberately off: `hsaco-tiered/lowrung{1,2}` hold only *bf16-KV*
+decode objects, so leaving the tiers on would have given the bf16 arm a batch-width-matched
+decode object (worth ~28% TPOT on its own) that the fp8 arm cannot have — the A/B would have
+measured the tiers. **That gap is real and is the first thing to fix if fp8 KV is ever pursued:
+there is no `_fp8kv` row in the low-rung tier build.**
+
+Serving: `PLOW_PF_BATCH=1 PLOW_PF_CHUNK=8192 PLOW_MULTISTEP=4 PLOW_TP_NO_AUDIT=1`, concurrency 1,
+64 output tokens, 1 warmup + 3 repeats, medians. Backend line confirmed `HSA backend selected
+device=gfx942` and `variant=Fp8Kv` on all three object roles for the fp8 arm.
+
+#### Capacity: -49.4%
+
+At `--max-ctx 131072`, `PLOW_DECODE_BATCH=4`, straight from the emitter:
+
+| | KV cache | weights | activations | total |
+|---|---:|---:|---:|---:|
+| bf16 KV | **90.00 GiB** | 57.2 GiB | 2.69 GiB | 149.9 GiB |
+| fp8 KV | **45.55 GiB** | 57.2 GiB | 2.69 GiB | 105.4 GiB |
+
+44.45 GiB freed. Not exactly half — the per-row f32 scale strips cost 0.55 GiB. On a 192 GB
+MI300X that is the difference between ~30 GiB of headroom and ~74 GiB, i.e. roughly a doubling of
+the batch-or-context ceiling. **This is the real result.**
+
+#### Speed: slower at every context measured
+
+Median TPOT / TTFT, concurrency 1, 64 output tokens:
+
+| input | bf16 TPOT ms | fp8 TPOT ms | Δ | bf16 TTFT ms | fp8 TTFT ms | Δ |
+|---:|---:|---:|---:|---:|---:|---:|
+| 128 | 31.28 | 35.08 | **+12.2%** | 72.5 | 72.5 | +0.1% |
+| 4096 | 31.76 | 35.48 | +11.7% | 816 | 897 | +9.9% |
+| 16384 | 32.49 | 36.23 | +11.5% | 3876 | 4488 | +15.8% |
+| 65536 | 35.49 | 38.91 | +9.6% | 28979 | 36625 | +26.4% |
+| 122880 | 38.85 | 41.99 | **+8.1%** | 83947 | 109519 | **+30.5%** |
+
+Two things are visible and they are the whole story.
+
+**The fp8 decode body costs a fixed ~3.8 ms/token.** At input 128 the KV stream is negligible and
+fp8 is already +3.80 ms. The penalty then *shrinks* with context — +3.80, +3.72, +3.74, +3.42,
++3.14 — which is the byte saving slowly arriving underneath a constant overhead. (I did not
+profile to attribute that overhead; the dequant multiply on every staged K and V element and the
+two `nsplit` branches gated on `fp8_kv` at `lib.rs:3882`/`:3929` are the candidates.)
+
+**The byte saving that does arrive is an eighth of what the byte count promises.** The
+context-dependent part of a token, 128 -> 122880, is **7.57 ms in bf16 and 6.91 ms in fp8** — a
+-8.7% context slope against a -50% cut in KV bytes. Halving the bytes at the bf16 path's own
+bytes-per-millisecond would have saved 3.8 ms; it saved 0.66. The fp8 KV stream is not
+byte-limited.
+
+Extrapolating that slope difference, fp8 KV would need roughly **700k tokens** of context to pay
+off its fixed cost. `max_ctx` is 131072. On this model it is never a decode win.
+
+**Gemma-4 31B is structurally the wrong model for this lever, and that is the main reason the
+roofline's number does not appear.** 50 of its 60 layers are sliding-window at 1024 and their KV
+does not grow with context at all; only the 10 full layers scale. At 122880 the whole KV read is
+~10.9 GB/token, of which ~0.84 GB is the fixed sliding-window part. The roofline's -5.1 ms was
+priced on an archetype where *every* layer is full attention. A Llama-70B-class GQA-128/8kv model
+is where this should be re-measured; nothing here says the lever is dead in general, only that it
+does not exist on Gemma-4 and that a ~3.8 ms/token fixed cost has to be paid out of whatever it
+does buy.
+
+**Prefill is worse, and worsens with context** (+30.5% TTFT at 122880). Prefill re-reads the KV it
+has just written in a compute-bound O(n^2) walk, so the dequant is added work against no saving.
+
+#### Quality cost
+
+fp8 KV changes the arithmetic by design, so this is reported as agreement and first divergence,
+not pass/fail. `scripts/gemma4_greedy_quality.py`, chat mode, 3 prompts x 3 context lengths x 64
+greedy tokens, both arms on the same prompts and the same objects.
+
+| context | token agreement | character-identical | median first divergence |
+|---:|---:|---:|---:|
+| 128 | 0.760 | 1/3 | token 31 |
+| 2048 | 0.427 | 1/3 | token 7.5 |
+| 8192 | **1.000** | **3/3** | — |
+| overall | **0.729** | 4/9 | |
+
+Per prompt, first divergence: 25, none, 37 (at 128); 7, none, 8 (at 2048); none, none, none (at
+8192).
+
+Two honest qualifications. **Agreement is prompt-dependent, not monotone in context** — the
+8192-token prompts were character-identical in all three cases and are ordinary prose, not a
+degenerate repetition that would make agreement trivially 1.0. And **where the streams do
+separate they stay fluent and on-topic**: the divergences are paraphrases at a token boundary
+("...directing them to specific measurement results" vs "...detailing the specific environment
+variables"), not a collapse. That is what a 4-5% logit perturbation looks like at greedy decode,
+and it is consistent with the sm_120 note in `docs/flags-reference.md:232` ("greedy diverges after
+~21 tokens").
+
+Nothing here measures whether the answers are *worse*. A paired retrieval or facts gate is the
+right instrument for that and was not run.
+
+#### Verdict
+
+Dense fp8 KV on gfx942 is **correct, servable and a 49% KV-capacity lever** — and on Gemma-4 31B
+it costs 8-12% TPOT and up to 31% TTFT. Land it as a capacity option, never as a speed default.
+A sibling reached the same shape of conclusion for GLM's MLA latent cache; the dense arithmetic is
+different (K and V are both stored, so the byte saving really is larger) and the conclusion still
+comes out the same way, for a different reason: there, capacity; here, a fixed body cost that the
+bytes never repay.
+
+### Ops 150-153 (MXFP4 MoE) have no AMD arm
+
+Out of the dense-attention remit and owned by the MoE work. Closed with a **refusal** at emit
+instead — see "the one live emit hole" above.
+
+## What was read from AITER and vLLM, and what was taken
+
+Both trees are on this host: vLLM 0.28+rocm723 at
+`.venv-vllm028/lib/python3.12/site-packages/vllm`, AITER at `/workspace/aiter`. Nothing was
+copied — plow's ISA already specified both mechanisms — so this is a **conformance check** of the
+reimplementation against two independent references, which is what it was worth.
+
+### Attention sinks
+
+| reference | where | what it says |
+|---|---|---|
+| vLLM | `v1/attention/ops/triton_attention_helpers.py:129-138` + `triton_unified_attention.py:377-381` (Apache-2.0, authors Ringlein / van Lunteren, IBM Zurich) | seeds the online-softmax running max `M` with the sink and `L` with `1.0` — the implied `exp(sink − M) = 1` **is** the sink's term |
+| vLLM | `triton_unified_attention.py:685-771` | `reduce_segments` never mentions the sink; only `segm_idx == 0` seeds it, and the plain LSE reducer carries it through exactly once |
+| AITER | `aiter/test_mha_common.py:583-593` (MIT) | the reference math: sink concatenated as an extra score column, then `attention[..., :-1]` — denominator only, no value row |
+| AITER | `aiter/ops/triton/_triton_kernels/attention/unified_attention.py:176-185` | its vLLM fork uses `exp2`, so it **prescales the sink by `RCP_LN2`** |
+| AITER | `aiter/mla.py:770-775` | "folds it into the last split's running denominator (gated by `kv_offset == 0`); the reducer's standard formula then routes `exp(sink)` into the global denominator exactly once" |
+
+Four things had to agree and do:
+
+1. **Denominator only, no value row.** Both references; plow's `acc` never receives a sink term.
+2. **Raw post-`scale` logit, NOT multiplied by the attention scale.** vLLM applies
+   `score_scale * dot(Q, K)` to the scores and loads the sink unscaled. plow's `FA_SCALE` is the
+   *log2-domain* lift, not the attention scale — it multiplies by `log2(e)`, exactly AITER's
+   `RCP_LN2` prescale, and is the identity when `FA_USE_EXP2` is off. Getting this wrong
+   (multiplying by `softmax_scale`) is the most likely reimplementation error and both references
+   agree it would be wrong.
+3. **Exactly once across splits.** The references achieve this with a segment-0 gate inside the
+   kernel plus an untouched reducer. plow's ISA puts the fold at the merge, which is the single
+   point after all splits, so "exactly once" is structural rather than gated — simpler, and the
+   reason `dev_isa.h:209-213` requires a `FLASH_MERGE` at every `nsplit` including 1 and
+   `FLASH_PREFILL.t5` at NONE. `gptoss.rs:302` already honours that.
+4. **The `-inf` hazard.** AITER materialises a null sink as a **finite** `-1.0e30`
+   (`aiter/ops/attention.py:484-489`) because "`-inf` can produce inf/NaN in the in-kernel sink
+   merge". plow takes `nullptr` instead of a sentinel, so the hazard does not arise; the
+   `sink_mag=60` golden case is the equivalent check from the other side (a sink far *above* every
+   split max, where the naive denominator would overflow).
+
+### fp8 KV
+
+vLLM's ROCm scheme differs from plow's in the one dimension that matters, and the difference is
+worth recording because it bears directly on the measurement above.
+
+| | vLLM on ROCm | plow |
+|---|---|---|
+| storage | `uint8` viewed as `float8_e4m3fnuz` on gfx942, `e4m3fn` on gfx950 (`platforms/rocm.py:980-985`) | e4m3, same split |
+| K and V | both (`csrc/libtorch_stable/cache_kernels.cu:349-357`) | both |
+| **scale granularity** | **one fp32 scalar per layer** by default (`layers/attention/attention.py:124-146`); per-*head* only via compressed-tensors `strategy: attn_head` | **per row — one f32 per (token, kv_head)** (`op_norm.h:568-580`) |
+| where quantised | on cache write, in `reshape_and_cache*` (`v / scale`) | on cache write, in `HeadNormRopeFp8` (`scale = amax/448`) |
+| where dequantised | `k_scale` folded into the softmax scale, `v_scale` applied to the PV accumulator (`csrc/rocm/attention.cu:583-585`, `:860-862`) | at LDS staging, so the MFMA is unchanged |
+| calibration | checkpoint `.attn.k_scale` / `.v_scale`, doubled when `is_fp8_fnuz()`; **silently 1.0 + `warning_once` when uncalibrated** (`quantization/kv_cache.py:99-151`) | none needed — the scale is computed from the row |
+
+plow's per-row scale is **strictly more accurate and strictly more expensive**, and that trade is
+visible in the numbers above. vLLM folds a per-layer scalar into the softmax scale and into the
+output accumulator — two multiplies per *token*, off the inner loop entirely. plow computes
+`amax` per row at write and multiplies per *element* at read. That is the most likely home of the
+~3.8 ms/token fixed cost, and it is the first thing to try if dense fp8 KV is revisited: a
+per-layer (or per-head) scalar would move the dequant out of the staging loop the way both
+references do, at the cost of the accuracy that produced 4/9 character-identical completions.
+
+## Numerical contracts of the norm family and the recurrent gates
+
+`docs/amd/norm-and-recurrent-numerics.md` — measured answers to findings F5 and F6 of
+`plans/gpu-kernel-static-audit-20260908.md`, on gfx942:
+
+* every `op_norm.h` reduction runs at `max|x| < sqrt(FLT_MAX/feat)`; the shipped checkpoints stay
+  16-17 orders below it (GLM-5.3 max 1080, Gemma-4 max 55). No arithmetic change: the scale-safe
+  two-pass costs +15.8% of the norm budget per token, and `PLOW_NORM_RANGE_CHECK=1` (default off,
+  no instruction in a shipped object) can assert the contract on demand.
+* `d_layernorm_bias`'s `msq - mean*mean` compiles to ONE `v_fma_f32` on gfx942, so the audit's
+  cancellation example is computed exactly rather than to 0.787%.
+* `kda_softplus` lost its whole tail (`log(1 + exp(x))` is exactly 0 for `x <= -16.6355`, so the
+  gate stops forgetting). Fixed with a series branch below -8: 625 x closer to an f64 oracle over
+  8192 steps for +14 instructions in `d_kda_gate`. `PLOW_KDA_SOFTPLUS_FLA_COMPAT=1` restores the
+  `[fla]` expression.
+
+## Follow-ups this work leaves open
+
+1. **The gfx942 tile store is now stale.** Any edit reachable from `interp.hip` re-keys
+   `kernelcaps::BuildId::label`, so `cargo test -p devgen --test tuned_tile_selection` loses
+   `gfx942_measurements_reach_the_compiler` (3 passing at the branch tip, 2 after this work; the
+   other four were already failing there). Until `scripts/rebench_tune_gemm_gfx942.sh` is re-run,
+   every gfx942 compile picks GEMM tiles from the analytical model and reports tier `portable`.
+   Both fp8-KV arms above were emitted that way, so the A/B is internally consistent but its
+   absolute numbers are not comparable with the published measured-tile Gemma sweep. Not run here
+   because that script refuses while any `plowrt` is serving and siblings were serving throughout
+   — and because the next edit to the shared `op_attention.h` re-stales it again.
+2. **No `_fp8kv` low-rung decode row.** See the fp8-KV section.
+3. **Ops 150-153 and op 80 still have no AMD arm.** Refused at emit, not implemented.
+4. **`V = unRoPE(K) / gamma_k` on Gemma-4's full layers.** Measured precondition, unbuilt kernel.
+   See the `k_eq_v` section.

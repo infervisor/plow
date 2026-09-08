@@ -29,6 +29,7 @@ Usage: quantize_fp8.py <src-model-dir> <out-dir> [prefix]
   prefix default "model.language_model." (Gemma-4 multimodal re-export).
   --scale-mode packed-tensor uses one scalar per vLLM packed dense matrix, broadcast
   into the existing scale vectors. Output tensors remain separate row-major matrices.
+  --scale-mode vllm-channel uses the vLLM 0.28 per-channel weight scale floor.
   This exports weights only; it does not enable FP8 activations or claim W8A8 parity.
 """
 import sys, os, struct, json, mmap, ctypes, argparse, hashlib
@@ -182,11 +183,12 @@ def main():
     parser.add_argument("src_dir")
     parser.add_argument("out_dir")
     parser.add_argument("prefix", nargs="?", default="model.language_model.")
-    parser.add_argument("--scale-mode", choices=["per-channel", "packed-tensor"], default="per-channel")
+    parser.add_argument("--scale-mode", choices=["per-channel", "packed-tensor", "vllm-channel"], default="per-channel")
     args = parser.parse_args()
     src_dir, out_dir, prefix = args.src_dir, args.out_dir, args.prefix
-    if args.scale_mode == "packed-tensor" and os.path.exists(os.path.join(out_dir, "model.safetensors")):
-        raise FileExistsError("packed-tensor export requires a new output file")
+    matching = args.scale_mode != "per-channel"
+    if matching and os.path.exists(os.path.join(out_dir, "model.safetensors")):
+        raise FileExistsError("matching export requires a new output file")
     weight_map, shards = open_sources(src_dir)
     layers = 1 + max(int(k.split("layers.")[1].split(".")[0])
                      for k in weight_map if "layers." in k)
@@ -216,16 +218,25 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     out = os.path.join(out_dir, "model.safetensors")
     written = 0
-    with open(out, "xb" if args.scale_mode == "packed-tensor" else "wb") as o:
+    sources = {}
+    with open(out, "xb" if matching else "wb") as o:
         o.write(struct.pack("<Q", len(hdr_bytes)))
         o.write(hdr_bytes)
         assert o.tell() == 8 + len(hdr_bytes)
         for i, (wname, sname, src_name, _wshape, _sshape, N, K) in enumerate(plan):
             scale_parts = []
+            digest = hashlib.sha256() if args.scale_mode == "vllm-channel" else None
             for w, _raw in source_chunks(src_name, N, K, weight_map, shards):
+                if digest is not None:
+                    digest.update(_raw)
+                    if not torch.isfinite(w).all():
+                        raise ValueError(f"{src_name}: nonfinite source weight")
                 if args.scale_mode == "packed-tensor":
                     scale = torch.full((w.shape[0],), scales[src_name], dtype=torch.float32)
                     q = (w * scale.unsqueeze(1).reciprocal()).clamp(-E4M3_MAX, E4M3_MAX).to(torch.float8_e4m3fn)
+                elif args.scale_mode == "vllm-channel":
+                    scale = (w.abs().amax(dim=1) / E4M3_MAX).clamp_min(1 / (E4M3_MAX * 512))
+                    q = (w / scale.unsqueeze(1)).clamp(-E4M3_MAX, E4M3_MAX).to(torch.float8_e4m3fn)
                 else:
                     amax = w.abs().amax(dim=1)
                     scale = torch.where(amax > 0, amax / E4M3_MAX, torch.ones_like(amax))
@@ -234,6 +245,8 @@ def main():
                 scale_parts.append(raw_bytes(scale.to(torch.float32)))
             for scale_bytes in scale_parts:
                 o.write(scale_bytes)
+            if digest is not None:
+                sources[src_name] = {"shape": _wshape, "sha256": digest.hexdigest()}
             written += N * K + N * 4
             if i % 40 == 0:
                 print(f"  [{i+1}/{len(plan)}] {src_name}  N={N} K={K}  "
@@ -241,7 +254,7 @@ def main():
     for _, _, mm, backing in shards.values():
         mm.close()
         backing.close()
-    if args.scale_mode == "packed-tensor":
+    if matching:
         with open(os.path.join(src_dir, "config.json"), "rb") as f:
             config_sha256 = hashlib.sha256(f.read()).hexdigest()
         with open(__file__, "rb") as f:
@@ -261,6 +274,15 @@ def main():
             "activation_gap": "Plow QuantFp8 floor1e-12 differs from vLLM native fallback1/(448*512); CUDA parity unverified",
             "groups": groups,
         }
+        if args.scale_mode == "vllm-channel":
+            metadata.update(
+                scale_storage="one FP32 scale per output channel",
+                weight_rule="max(FP32 row amax/448,1/(448*512)); FP32 division, finite clamp, E4M3FN round-to-nearest",
+                reference="vLLM0.28 Fp8PtpcOnlineLinearMethod; FN bytes with half the gfx942 FNUZ scale",
+                reference_activation="dynamic per-token in prefill and decode; stock and AITER differ",
+                activation_gap="Plow decode retains BF16 activations; no end-to-end W8A8 equivalence",
+                sources=sources,
+            )
         with open(os.path.join(out_dir, "quantization.json"), "w") as f:
             json.dump(metadata, f, indent=2)
     print(f"done: {out}  ({written/1e9:.2f} GB over {len(plan)} projections)")

@@ -16,7 +16,7 @@
 //! blob's op-major `GQ01` tables in the kernarg, so the same code drives a
 //! `PLOW_NV_SCHED=0` or `=1` cubin — each build reads only its own tables.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use packet::dev::{DevInst64, DevOp, DevProgram, CTR_STRIDE, TENSOR_NONE16};
@@ -52,6 +52,8 @@ mod decode_object;
 use decode_object::{BoundDecodeObject, DecodeModule};
 #[path = "gpu_decode_rung.rs"]
 mod gpu_decode_rung;
+#[path = "gpu_mixed_step.rs"]
+mod gpu_mixed_step;
 use gpu_cublaslt::CublasLtDecodeRoute;
 use gpu_decode_rung::{
     decode_rung_index, decode_selection, effective_decode_widths, validate_decode_ladder,
@@ -144,6 +146,104 @@ fn read_cubin_candidate(path: &Path) -> Option<Vec<u8>> {
     cubin::is_elf64_le(&image).then_some(image)
 }
 
+fn interp_candidate(
+    image: &[u8],
+    profile: &InterpreterProfile,
+    want_sm: u32,
+    role: Role,
+) -> std::result::Result<String, String> {
+    let Some(info) = cubin::inspect(image) else {
+        return Err("not an ELF cubin".into());
+    };
+    if cubin::global_u32(image, plow_asset::mixed_step::OBJECT_CAPABILITY).is_some() {
+        return Err("mixed-step auxiliary object is not an ordinary interpreter".into());
+    }
+    if cubin::global_u32(image, plow_asset::packed_prefill::CAPABILITY).is_some() {
+        return Err("packed-prefill auxiliary object is not an ordinary interpreter".into());
+    }
+    if info.sm != want_sm {
+        return Err(format!("built for sm_{}, device is sm_{want_sm}", info.sm));
+    }
+    match info.interp_entry(role) {
+        Some(sym) => Ok(sym.to_string()),
+        None if info.entries.is_empty() => Ok(profile.symbol(role).to_string()),
+        None => Err(format!(
+            "no {} entry — has {}",
+            role.as_str(),
+            cubin::describe(image)
+        )),
+    }
+}
+
+fn embedded_interp_image(
+    blob: &DevBlob,
+    raw: &[u8],
+    profile: &InterpreterProfile,
+    want_sm: u32,
+    role: Role,
+    rejected: &mut Vec<String>,
+) -> Option<InterpImage> {
+    for s in blob
+        .sections
+        .iter()
+        .filter(|s| s.kind == packet::devbuild::SECT_CUBIN)
+    {
+        let Some(data) = raw.get(s.offset..s.offset + s.size) else {
+            continue;
+        };
+        match interp_candidate(data, profile, want_sm, role) {
+            Ok(entry) => {
+                return Some(InterpImage {
+                    image: data.to_vec(),
+                    entry,
+                    source: format!("embedded section '{}'", s.name),
+                })
+            }
+            Err(why) => rejected.push(format!("embedded '{}': {why}", s.name)),
+        }
+    }
+    None
+}
+
+fn filesystem_interp_image(
+    assets_dir: &Path,
+    profile: &InterpreterProfile,
+    want_sm: u32,
+    role: Role,
+    rejected: &mut Vec<String>,
+) -> Option<InterpImage> {
+    let mut paths = vec![assets_dir.join(profile.file(role))];
+    if let Ok(rd) = std::fs::read_dir(assets_dir) {
+        let mut rest: Vec<std::path::PathBuf> = rd
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p != &paths[0])
+            .collect();
+        rest.sort();
+        paths.extend(rest);
+    }
+    for path in paths {
+        let Some(image) = read_cubin_candidate(&path) else {
+            continue;
+        };
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        match interp_candidate(&image, profile, want_sm, role) {
+            Ok(entry) => {
+                return Some(InterpImage {
+                    image,
+                    entry,
+                    source: name,
+                })
+            }
+            Err(why) => rejected.push(format!("{name}: {why}")),
+        }
+    }
+    None
+}
+
 /// Find the interpreter object for `role` BY CONTENT.
 ///
 /// A cubin names its own SM (`e_flags`) and its own entry points (`.symtab`),
@@ -177,23 +277,7 @@ fn resolve_interp_image(
     // `None` from `inspect` means unparseable, not "no entry" — a hand-built
     // object with a stripped symbol table still loads under the profile's
     // expected symbol, which is what the pre-discovery loader always did.
-    let judge = |image: &[u8]| -> std::result::Result<String, String> {
-        let Some(info) = cubin::inspect(image) else {
-            return Err("not an ELF cubin".into());
-        };
-        if info.sm != want_sm {
-            return Err(format!("built for sm_{}, device is sm_{want_sm}", info.sm));
-        }
-        match info.interp_entry(role) {
-            Some(sym) => Ok(sym.to_string()),
-            None if info.entries.is_empty() => Ok(profile.symbol(role).to_string()),
-            None => Err(format!(
-                "no {} entry — has {}",
-                role.as_str(),
-                cubin::describe(image)
-            )),
-        }
-    };
+    let judge = |image: &[u8]| interp_candidate(image, profile, want_sm, role);
 
     // 1. Operator override: forced, and loud when wrong. The CLI flag is read
     // as well as the env var — declaring `--nv-cubin` and then consulting only
@@ -226,56 +310,15 @@ fn resolve_interp_image(
     // 2. Embedded sections. The section NAME is not load-bearing: `plowc
     //    --embed-cubin` labels every image `interp_sm120` regardless of the arch
     //    it just compiled, so only the content can decide.
-    for s in blob
-        .sections
-        .iter()
-        .filter(|s| s.kind == packet::devbuild::SECT_CUBIN)
-    {
-        let Some(data) = raw.get(s.offset..s.offset + s.size) else {
-            continue;
-        };
-        match judge(data) {
-            Ok(entry) => {
-                return Ok(Some(InterpImage {
-                    image: data.to_vec(),
-                    entry,
-                    source: format!("embedded section '{}'", s.name),
-                }))
-            }
-            Err(why) => rejected.push(format!("embedded '{}': {why}", s.name)),
-        }
+    if let Some(image) = embedded_interp_image(blob, raw, profile, want_sm, role, &mut rejected) {
+        return Ok(Some(image));
     }
 
     // 3. The assets dir — the profile's expected name first, then everything
     //    else that looks like a cubin, so a misnamed bundle still serves.
-    let mut paths = vec![assets_dir.join(profile.file(role))];
-    if let Ok(rd) = std::fs::read_dir(assets_dir) {
-        let mut rest: Vec<std::path::PathBuf> = rd
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p != &paths[0])
-            .collect();
-        rest.sort();
-        paths.extend(rest);
-    }
-    for path in paths {
-        let Some(image) = read_cubin_candidate(&path) else {
-            continue;
-        };
-        let name = path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned();
-        match judge(&image) {
-            Ok(entry) => {
-                return Ok(Some(InterpImage {
-                    image,
-                    entry,
-                    source: name,
-                }))
-            }
-            Err(why) => rejected.push(format!("{name}: {why}")),
-        }
+    if let Some(image) = filesystem_interp_image(assets_dir, profile, want_sm, role, &mut rejected)
+    {
+        return Ok(Some(image));
     }
 
     if !rejected.is_empty() {
@@ -499,6 +542,13 @@ fn segment_role_metadata(blob: &DevBlob, raw: &[u8]) -> Result<Option<SegmentRol
     SegmentRoles::parse(bytes, blob).map(Some)
 }
 
+fn prefill_needs_segment_pair(blob: &DevBlob, roles: Option<&SegmentRoles>) -> bool {
+    blob.prefill_progs().iter().enumerate().any(|(index, g)| {
+        g.check_coarse_single_segment().is_err()
+            && roles.and_then(|roles| roles.program(index)).is_none()
+    })
+}
+
 trait SegmentRoleValidation: Sized {
     fn parse(bytes: &[u8], blob: &DevBlob) -> Result<Self>;
     fn validate(
@@ -522,14 +572,31 @@ impl SegmentRoleValidation for SegmentRoles {
             .collect();
         value.validate(&blob.progs, &indices, &blob.tensors)?;
         for program in &value.programs {
+            let fp8_pcs: Vec<_> = program
+                .roles
+                .iter()
+                .enumerate()
+                .filter(|(_, role)| **role == plow_asset::segment_roles::FP8_M1)
+                .map(|(seg, _)| {
+                    let g = &blob.progs[program.index];
+                    g.gq_stream[g.gq_seg_ofs[seg] as usize].inst as usize
+                })
+                .collect();
+            if !fp8_pcs.is_empty() {
+                blob.with_packet_view(|p| {
+                    plow_asset::fp8_m1_role::validate_all(p, program.index, &fp8_pcs)
+                })
+                .map_err(RuntimeError::Rejected)?;
+            }
             for (seg, &role) in program.roles.iter().enumerate() {
-                if role == plow_asset::segment_roles::FP8_M1 {
+                if role == plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32 {
                     let g = &blob.progs[program.index];
                     let pc = g.gq_stream[g.gq_seg_ofs[seg] as usize].inst as usize;
-                    blob.with_packet_view(|p| {
-                        plow_asset::fp8_m1_role::validate(p, program.index, pc)
-                    })
-                    .map_err(RuntimeError::Rejected)?;
+                    if u32::from(g.insts[pc].blocks) != blob.n_cu {
+                        return Err(RuntimeError::Rejected(
+                            "HD512 WG32 role requires one slice per packet block".into(),
+                        ));
+                    }
                 }
             }
         }
@@ -552,7 +619,9 @@ impl SegmentRoleValidation for SegmentRoles {
             let object_decode = p.roles.iter().any(|&role| {
                 matches!(
                     role,
-                    plow_asset::segment_roles::GEMV_CTA512 | plow_asset::segment_roles::FP8_M1
+                    plow_asset::segment_roles::GEMV_CTA512
+                        | plow_asset::segment_roles::FP8_M1
+                        | plow_asset::segment_roles::MXFP4_MOE
                 )
             });
             let library_decode = p.roles.contains(&plow_asset::segment_roles::CUBLASLT);
@@ -571,6 +640,7 @@ impl SegmentRoleValidation for SegmentRoles {
                                 plow_asset::segment_roles::INTERPRETER
                                     | plow_asset::segment_roles::GEMV_CTA512
                                     | plow_asset::segment_roles::FP8_M1
+                                    | plow_asset::segment_roles::MXFP4_MOE
                                     | plow_asset::segment_roles::CUBLASLT
                             )
                         })))
@@ -621,6 +691,7 @@ impl SegmentRoleValidation for SegmentRoles {
 
 struct PacketRole {
     function: KernelFn,
+    grid: u32,
     smem: u32,
     block: u32,
     _module: Arc<DecodeModule>,
@@ -637,6 +708,36 @@ fn check_attention_role(arch: &str, capability: Option<u32>, block: Option<u32>)
     if arch != "sm90a" || capability != Some(1) || block != Some(BLOCK) {
         return Err(RuntimeError::Rejected(
             "incompatible HD256 attention role".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn check_attention_hd512_role(
+    arch: &str,
+    object: &plow_asset::segment_roles::SegmentObject,
+    capability: Option<u32>,
+    block: Option<u32>,
+    geometry: [Option<u32>; 4],
+) -> Result<()> {
+    let expected = object.attention.as_ref();
+    if arch != "sm90a"
+        || capability != Some(1)
+        || block != Some(BLOCK)
+        || expected.is_none_or(|a| {
+            a.profile != arch
+                || a.dtype != "bf16"
+                || geometry
+                    != [
+                        Some(a.head_dim),
+                        Some(a.query_tile),
+                        Some(a.kv_tile),
+                        Some(a.warps),
+                    ]
+        })
+    {
+        return Err(RuntimeError::Rejected(
+            "incompatible HD512 WG32 attention role".into(),
         ));
     }
     Ok(())
@@ -700,13 +801,94 @@ fn validate_gemv_decode_role_inst(
     Ok(())
 }
 
+fn validate_mxfp4_moe_role_inst(
+    d: &DevInst64,
+    rows: u32,
+    slices: usize,
+    tensors: &[crate::asset::devblob::DevTensor],
+) -> Result<()> {
+    let reject = || RuntimeError::Rejected("invalid MXFP4 MoE role geometry".into());
+    if rows != 1
+        || d.i[6] != rows
+        || usize::from(d.blocks) != slices
+        || d.i[0] == 0
+        || d.i[0] > 16
+        || d.i[3] == 0
+    {
+        return Err(reject());
+    }
+    let extent = |slot: usize, bytes: u64, optional: bool| -> Result<()> {
+        if optional && d.t[slot] == TENSOR_NONE16 {
+            return Ok(());
+        }
+        if d.t[slot] == TENSOR_NONE16
+            || tensors
+                .get(d.t[slot] as usize)
+                .is_none_or(|tensor| tensor.bytes < bytes)
+        {
+            return Err(reject());
+        }
+        Ok(())
+    };
+    let checked = |values: &[u64]| {
+        values
+            .iter()
+            .try_fold(1u64, |acc, &value| acc.checked_mul(value))
+            .ok_or_else(reject)
+    };
+    let ksel = u64::from(d.i[0]);
+    let experts = u64::from(d.i[3]);
+    extent(2, ksel.checked_mul(8).ok_or_else(reject)?, false)?;
+    match DevOp::from_u16(d.op) {
+        Some(DevOp::MoeGluMx)
+            if d.i[1] > 0
+                && d.i[2] > 0
+                && d.i[2] % 32 == 0
+                && d.i[4] <= 1
+                && d.i[5] <= 3
+                && f32::from_bits(d.fj[0]).is_finite()
+                && f32::from_bits(d.fj[1]).is_finite() =>
+        {
+            let inter = u64::from(d.i[1]);
+            let hidden = u64::from(d.i[2]);
+            extent(0, checked(&[ksel, inter, 2])?, false)?;
+            extent(1, checked(&[hidden, 2])?, false)?;
+            extent(
+                3,
+                checked(&[experts, 2 * inter, hidden.div_ceil(2)])?,
+                false,
+            )?;
+            extent(
+                4,
+                checked(&[experts, 2 * inter, hidden.div_ceil(32)])?,
+                false,
+            )?;
+            extent(5, checked(&[experts, 2 * inter, 2])?, true)?;
+        }
+        Some(DevOp::MoeDownMx) if d.i[1] > 0 && d.i[2] > 0 && d.i[2] % 32 == 0 => {
+            let hidden = u64::from(d.i[1]);
+            let inter = u64::from(d.i[2]);
+            extent(0, checked(&[ksel, hidden, 4])?, false)?;
+            extent(1, checked(&[ksel, inter, 2])?, false)?;
+            extent(3, checked(&[experts, hidden, inter.div_ceil(2)])?, false)?;
+            extent(4, checked(&[experts, hidden, inter.div_ceil(32)])?, false)?;
+            extent(5, checked(&[experts, hidden, 2])?, true)?;
+        }
+        _ => return Err(reject()),
+    }
+    Ok(())
+}
+
 fn validate_attention_role_inst(
     d: &DevInst64,
     rows: u32,
     tensors: &[crate::asset::devblob::DevTensor],
+    hd_required: u32,
+    require_tma_map: bool,
+    allow_fused: bool,
 ) -> Result<()> {
     let reject =
-        || RuntimeError::Rejected("unsupported HD256 attention role operands or geometry".into());
+        || RuntimeError::Rejected("unsupported attention role operands or geometry".into());
     let prefill = d.op == DevOp::FlashPrefill as u16;
     let (heads, splits, hd) = if prefill {
         (d.i[2], d.i[7], d.i[6])
@@ -715,15 +897,15 @@ fn validate_attention_role_inst(
     } else {
         return Err(reject());
     };
-    if rows == 0 || d.i[0] != rows || heads == 0 || splits == 0 || hd != 256 {
+    if rows == 0 || d.i[0] != rows || heads == 0 || splits == 0 || hd != hd_required {
         return Err(reject());
     }
     let work = rows.checked_mul(heads).ok_or_else(reject)?;
     let partials = u64::from(work)
         .checked_mul(u64::from(splits))
         .ok_or_else(reject)?;
-    let output_bytes = u64::from(work) * 256 * 2;
-    let partial_bytes = partials.checked_mul(256 * 4).ok_or_else(reject)?;
+    let output_bytes = u64::from(work) * u64::from(hd) * 2;
+    let partial_bytes = partials.checked_mul(u64::from(hd) * 4).ok_or_else(reject)?;
     let ml_bytes = partials.checked_mul(8).ok_or_else(reject)?;
     let extent = |slot: usize, bytes: u64| -> Result<()> {
         if d.t[slot] == TENSOR_NONE16
@@ -741,10 +923,18 @@ fn validate_attention_role_inst(
         }
     }
     if prefill {
+        let fused = d.t[5] != TENSOR_NONE16;
         if d.i[1] == 0
             || d.i[3] == 0
             || heads % d.i[3] != 0
-            || d.t[5..].iter().any(|&t| t != TENSOR_NONE16)
+            || (fused && (!allow_fused || splits != 1))
+            || d.t[6] != TENSOR_NONE16
+            || (require_tma_map
+                && (d.t[7] == TENSOR_NONE16
+                    || tensors
+                        .get(d.t[7] as usize)
+                        .is_none_or(|tensor| tensor.bytes != 256)))
+            || (!require_tma_map && d.t[7] != TENSOR_NONE16)
             || !f32::from_bits(d.fj[0]).is_finite()
             || rows
                 .div_ceil(64)
@@ -757,13 +947,19 @@ fn validate_attention_role_inst(
         let stride = if d.fj[1] == 0 { d.i[1] } else { d.fj[1] };
         let kv_bytes = u64::from(stride)
             .checked_mul(u64::from(d.i[3]))
-            .and_then(|bytes| bytes.checked_mul(256 * 2))
+            .and_then(|bytes| bytes.checked_mul(u64::from(hd) * 2))
             .ok_or_else(reject)?;
         extent(0, partial_bytes)?;
         extent(1, ml_bytes)?;
         extent(2, output_bytes)?;
         extent(3, kv_bytes)?;
         extent(4, kv_bytes)?;
+        if fused {
+            if d.t[..5].contains(&d.t[5]) {
+                return Err(reject());
+            }
+            extent(5, output_bytes)?;
+        }
     } else {
         extent(0, output_bytes)?;
         extent(1, partial_bytes)?;
@@ -793,7 +989,14 @@ fn packet_role_segments(
         || roles
             .iter()
             .any(|&role| role > plow_asset::segment_roles::MAX_ROLE)
-        || (g.packed_prefill_only && roles.contains(&plow_asset::segment_roles::PREFILL_ATTENTION))
+        || (g.packed_prefill_only
+            && roles.iter().any(|&role| {
+                matches!(
+                    role,
+                    plow_asset::segment_roles::PREFILL_ATTENTION
+                        | plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32
+                )
+            }))
     {
         return Err(RuntimeError::Rejected(
             "invalid packet segment role count or id".into(),
@@ -840,9 +1043,18 @@ fn packet_role_segments(
                     ));
                 }
             } else if role == plow_asset::segment_roles::PREFILL_ATTENTION {
-                validate_attention_role_inst(d, g.t, tensors)?;
+                validate_attention_role_inst(d, g.t, tensors, 256, false, false)?;
+            } else if role == plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32 {
+                if d.op != DevOp::FlashPrefill as u16 {
+                    return Err(RuntimeError::Rejected(
+                        "HD512 WG32 role requires FlashPrefill".into(),
+                    ));
+                }
+                validate_attention_role_inst(d, g.t, tensors, 512, true, true)?;
             } else if role == plow_asset::segment_roles::GEMV_CTA512 {
                 validate_gemv_decode_role_inst(d, g.t, g.stream_ofs.len(), tensors)?;
+            } else if role == plow_asset::segment_roles::MXFP4_MOE {
+                validate_mxfp4_moe_role_inst(d, g.t, g.stream_ofs.len(), tensors)?;
             } else if role == plow_asset::segment_roles::FP8_M1
                 && (g.t != 1 || d.op != DevOp::GemmFp8 as u16)
             {
@@ -883,6 +1095,14 @@ fn packet_role_segments(
         selected.push(role);
     }
     Ok(selected)
+}
+
+fn packet_role_index(roles: &[u8], segment: usize) -> Option<usize> {
+    roles
+        .get(segment)
+        .copied()
+        .filter(|&role| role != plow_asset::segment_roles::INTERPRETER)
+        .map(|role| role as usize - 1)
 }
 
 struct SegPf {
@@ -1309,7 +1529,7 @@ pub struct GpuEngine {
     /// Segmented-prefill object pair (PLOW_PF_SEG_DIR); None = single-object prefill.
     seg_pf: Option<SegPf>,
     qwen_prefill: Option<crate::device::cuda::qwen_gdn::NativeGdn>,
-    packet_roles: [Option<PacketRole>; 4],
+    packet_roles: [Option<PacketRole>; plow_asset::segment_roles::MAX_ROLE as usize],
     decode_packet_roles: Vec<u8>,
     cublaslt_decode: Vec<Option<CublasLtDecodeRoute>>,
     cublaslt_decode_graph: Option<crate::device::cuda::GraphExec>,
@@ -1457,10 +1677,13 @@ pub struct GpuEngine {
     /// VMM prefix sharing (`PLOW_VMM_PREFIX=1`); `None` = the cudaMalloc
     /// default path, byte-identical behavior to before this feature.
     vmm: Option<VmmServe>,
-    /// PX-1 cross-request batched prefill (`PLOW_PF_BATCH=1`); `None` = the
-    /// per-slot serialized prefill, byte-identical behavior to before.
+    /// Cross-request batched prefill selected by packet metadata or legacy
+    /// runtime opt-in; `None` uses per-slot serialized prefill.
     pf_batch: Option<PfBatch>,
+    /// Next physical slot considered first by cross-request prefill admission.
+    prefill_turn: usize,
     packed_prefill: Option<plow_asset::packed_prefill::Manifest>,
+    mixed_step: Option<gpu_mixed_step::MixedCudaStep>,
 }
 
 /// Full model-load wall timeline (`PLOW_LOAD_PROFILE=1`).
@@ -2244,7 +2467,6 @@ struct MultiStep {
     /// `[batch]` i32 active-row flags (device) + pinned staging.
     d_fed: DeviceMem,
     fed_host: PinnedHost,
-    batch: usize,
 }
 
 /// Outcome of one [`GpuEngine::prefill_chunk`] call.
@@ -2322,20 +2544,43 @@ impl GpuEngine {
             "parsed PLOWDEV blob"
         );
         let live_kv_manifest = crate::memory::vmm::LiveKvLayout::manifest(&blob, &raw)?;
-        let packed_prefill = blob
+        let packed_prefill_metadata = blob
             .reserved_metadata(&raw, plow_asset::packed_prefill::SECTION)?
             .map(|bytes| {
                 serde_json::from_slice::<plow_asset::packed_prefill::Manifest>(bytes)
                     .map_err(|e| RuntimeError::Rejected(format!("packed prefill metadata: {e}")))
             })
             .transpose()?;
-        if let Some(pack) = &packed_prefill {
+        let mixed_packet = if blob
+            .sections
+            .iter()
+            .any(|section| section.name == plow_asset::mixed_step::SECTION)
+        {
+            crate::exec::mixed_packet::load_from_devblob(
+                &blob,
+                &raw,
+                plow_asset::mixed_step::PayloadKind::Cubin,
+                |object, name| Ok(cubin::global_u32(object.bytes, name)),
+            )?
+        } else {
+            None
+        };
+        if let Some(pack) = &packed_prefill_metadata {
             let live = live_kv_manifest.as_ref().ok_or_else(|| {
                 RuntimeError::Rejected("packed prefill requires compiled LIVE contract".into())
             })?;
             blob.with_packet_view(|p| pack.validate(p, live))
                 .map_err(RuntimeError::Rejected)?;
         }
+        let config = RuntimeConfig::get();
+        let packed_prefill = if config.nv_vmm_prefix() || config.nv.prefix_cache {
+            if packed_prefill_metadata.is_some() {
+                tracing::info!("packed prefill disabled because prefix reuse is active");
+            }
+            None
+        } else {
+            packed_prefill_metadata.clone()
+        };
         let decode_objects = decode_object::parse(&blob, &raw)?;
         let prepared_contexts = decode_context::prepare(&blob, &raw, assets_dir)?;
         if blob
@@ -2361,7 +2606,9 @@ impl GpuEngine {
             .any(|&role| {
                 matches!(
                     role,
-                    plow_asset::segment_roles::GEMV_CTA512 | plow_asset::segment_roles::FP8_M1
+                    plow_asset::segment_roles::GEMV_CTA512
+                        | plow_asset::segment_roles::FP8_M1
+                        | plow_asset::segment_roles::MXFP4_MOE
                 )
             })
             .then(|| decode_roles.clone())
@@ -2373,8 +2620,7 @@ impl GpuEngine {
             || prepared_contexts.is_some()
             || !decode_packet_roles.is_empty()
             || cublaslt_enabled
-            || recurrent.is_some()
-            || nv_config.vmm_live;
+            || recurrent.is_some();
         let effective_multistep = if multistep_disabled_by_decode {
             if configured_multistep > 1 {
                 tracing::info!(
@@ -2606,7 +2852,15 @@ impl GpuEngine {
         let vmm = {
             let run = || {
                 let config = RuntimeConfig::get();
-                let live = config.nv_vmm_live();
+                let live = config.nv_live_kv_enabled(
+                    packed_prefill.is_some(),
+                    live_kv_manifest.as_ref().is_some_and(|manifest| {
+                        manifest.caches.iter().any(|cache| cache.window == 0)
+                    }),
+                );
+                if live && !config.nv_vmm_live() {
+                    tracing::info!("live KV allocation enabled by packet metadata");
+                }
                 let rings = config.nv_vmm_live_rings();
                 if rings && !live {
                     return Err(RuntimeError::Rejected(
@@ -2784,7 +3038,7 @@ impl GpuEngine {
             while *cur < blob.tensors.len() && n < budget {
                 let td = &blob.tensors[*cur];
                 *cur += 1;
-                if !is_checkpoint_tensor(*cur - 1, &td.name, packed_prefill.as_ref()) {
+                if !is_checkpoint_tensor(*cur - 1, &td.name, packed_prefill_metadata.as_ref()) {
                     continue;
                 }
                 if let Some(s) = ckpt.span(&td.name, 0, td.bytes as usize) {
@@ -2852,7 +3106,9 @@ impl GpuEngine {
                         td.name
                     )));
                 }
-                if !packet_cache && is_checkpoint_tensor(i, &td.name, packed_prefill.as_ref()) {
+                if !packet_cache
+                    && is_checkpoint_tensor(i, &td.name, packed_prefill_metadata.as_ref())
+                {
                     let src = ckpt.tensor(&td.name).ok_or_else(|| {
                         RuntimeError::Device(format!("MISSING WEIGHT: {}", td.name))
                     })?;
@@ -3133,11 +3389,9 @@ impl GpuEngine {
             tm.log_stage("moe_tables", sys_moe, std::time::SystemTime::now(), ms);
         }
 
-        // ---- PX-1 batched-prefill buffers (`--pf-batch` / PLOW_PF_BATCH=1) ----
-        // Allocated BEFORE the tensor table so their pointers ride in it past
-        // the blob's handles (h_slot = len, h_req = len+1). Tiny (≤32 KiB), so
-        // allocation is unconditional on the flag only; the mode itself is
-        // finalized after the prefill object loads (see below).
+        // ---- Cross-request prefill buffers ----
+        // A validated packet manifest owns packet-declared tables. Legacy
+        // packets retain the explicit runtime opt-in and appended tables.
         let t_decode = std::time::Instant::now();
         let decode_t0 = load_tim.as_ref().map(|t| t.ms_since_t0()).unwrap_or(0.0);
         let sys_decode = std::time::SystemTime::now();
@@ -3149,13 +3403,13 @@ impl GpuEngine {
             .max()
             .unwrap_or(0);
         let dbatch_blob = blob.decode_prog().map(|g| g.t as usize).unwrap_or(1);
-        let pf_bufs = if pf_batch_env && packed_prefill.is_some() {
-            let p = packed_prefill.as_ref().unwrap();
+        let pf_batch_requested = packed_prefill.is_some() || pf_batch_env;
+        let pf_bufs = if let Some(p) = &packed_prefill {
             Some((
                 DeviceMem::view(devp[p.slot as usize].base, devp[p.slot as usize].len),
                 DeviceMem::view(devp[p.request as usize].base, devp[p.request as usize].len),
             ))
-        } else if pf_batch_env && pf_max_t_blob > 0 {
+        } else if pf_batch_requested && pf_max_t_blob > 0 {
             Some((
                 be.alloc(0, (pf_max_t_blob * 4) as u64)?,
                 be.alloc(0, ((1 + 4 * dbatch_blob) * 4) as u64)?,
@@ -3226,11 +3480,14 @@ impl GpuEngine {
         // Decode batch: the compiler emits the decode program with t == B
         // (PLOW_DECODE_BATCH). Cross-check against the [B]-sized in.kvlen.
         let batch = g.t as usize;
-        if blob.tensors[t_kvlen].bytes != (batch * 4) as u64 {
+        let kvlen_bytes = blob.tensors[t_kvlen].bytes;
+        if (mixed_packet.is_none() && kvlen_bytes != (batch * 4) as u64)
+            || kvlen_bytes < (batch * 4) as u64
+        {
             return Err(RuntimeError::Device(format!(
                 "in.kvlen is {} B but the decode program's batch is {batch} \
                  (want {} B) — blob/tensor mismatch",
-                blob.tensors[t_kvlen].bytes,
+                kvlen_bytes,
                 batch * 4
             )));
         }
@@ -3369,6 +3626,7 @@ impl GpuEngine {
             prefill_parked: 0,
             n_prefill_spans: 0,
             n_prefill_rows: 0,
+            token_batch: 0,
         };
 
         let decode_rungs = if select_decode_rungs && !cublaslt_enabled {
@@ -3491,7 +3749,15 @@ impl GpuEngine {
         }
 
         // Stop set from the checkpoint's generation_config (fallback config).
-        let stop_ids = crate::asset::checkpoint::read_eos_ids(checkpoint_dir);
+        // BOTH sources, matching the AMD and CPU engines. This read only
+        // `read_eos_ids`, so a family whose turn actually ends at a token that
+        // lives in `tokenizer_config.json` rather than in the eos list — K3
+        // closes on `<|close|>` — ran past its own turn boundary on NVIDIA
+        // while stopping correctly on the other two backends.
+        let mut stop_ids = crate::asset::checkpoint::read_eos_ids(checkpoint_dir);
+        stop_ids.extend(crate::asset::checkpoint::chat_stop_ids(checkpoint_dir, &stop_ids));
+        stop_ids.sort_unstable();
+        stop_ids.dedup();
         if let Some(tm) = load_tim.as_mut() {
             let ms = t_decode.elapsed().as_secs_f64() * 1e3;
             tm.decode_tables_ms = ms;
@@ -3525,11 +3791,12 @@ impl GpuEngine {
                 &be,
                 pf,
                 &blob,
+                assets_dir,
                 d_tens.base,
                 grid,
                 profile.tag,
                 segment_roles.as_ref(),
-                pf_batch_env && packed_prefill.is_some(),
+                packed_prefill.is_some(),
             ) {
                 Ok((f_pf, smem_pf, module_pf, buckets, seg_pf)) => {
                     tracing::info!(
@@ -3572,8 +3839,8 @@ impl GpuEngine {
             (None, SMEM_PF, None, Vec::new(), None)
         };
 
-        let mut packet_roles: [Option<PacketRole>; plow_asset::segment_roles::FP8_M1 as usize] =
-            [None, None, None, None];
+        let mut packet_roles: [Option<PacketRole>; plow_asset::segment_roles::MAX_ROLE as usize] =
+            std::array::from_fn(|_| None);
         for (&id, object) in segment_roles.iter().flat_map(|r| &r.objects) {
             if id == plow_asset::segment_roles::FP8_M1 {
                 packet_roles[plow_asset::segment_roles::FP8_M1 as usize - 1] = Some(
@@ -3581,22 +3848,23 @@ impl GpuEngine {
                 );
                 continue;
             }
-            if id != plow_asset::segment_roles::GEMV_CTA512
-                && (prefill.is_empty() || seg_pf.is_some())
+            if !matches!(
+                id,
+                plow_asset::segment_roles::GEMV_CTA512 | plow_asset::segment_roles::MXFP4_MOE
+            ) && prefill.is_empty()
             {
                 return Err(RuntimeError::Rejected(
-                    "packet roles require prefill without a legacy role pair".into(),
+                    "prefill packet roles require a prefill object".into(),
                 ));
             }
             if matches!(
                 id,
                 plow_asset::segment_roles::PREFILL_ATTENTION
+                    | plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32
                     | plow_asset::segment_roles::GEMV_CTA512
             ) && profile.tag != "sm90a"
             {
-                return Err(RuntimeError::Rejected(
-                    "HD256 attention role requires SM90".into(),
-                ));
+                return Err(RuntimeError::Rejected("packet role requires SM90".into()));
             }
             let (marker, block, entry, arena) = match id {
                 plow_asset::segment_roles::FP8_PREFILL_GEMM => (
@@ -3611,11 +3879,23 @@ impl GpuEngine {
                     "_Z17interp_sm90a_pffa11PlowProgram",
                     "plow_arena_bytes_pffa",
                 ),
+                plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32 => (
+                    "plow_attention_sm90_hd512_wg32_abi",
+                    "plow_block_pfattn_hd512",
+                    "plow_sm90a_pfattn_hd512",
+                    "plow_arena_bytes_pfattn_hd512",
+                ),
                 plow_asset::segment_roles::GEMV_CTA512 => (
                     "plow_gemv_sm90_cta512_abi",
                     "plow_block_gemv512",
                     "_Z20interp_sm90a_gemv51211PlowProgram",
                     "plow_arena_bytes_gemv512",
+                ),
+                plow_asset::segment_roles::MXFP4_MOE => (
+                    "plow_mxfp4_moe_sm90_abi",
+                    "plow_block_mxfp4_moe",
+                    "plow_sm90a_mxfp4_moe",
+                    "plow_arena_bytes_mxfp4_moe",
                 ),
                 _ => {
                     return Err(RuntimeError::Rejected(
@@ -3626,14 +3906,31 @@ impl GpuEngine {
             let path = assets_dir.join(&object.file);
             let image = std::fs::read(&path)
                 .map_err(|e| RuntimeError::Device(format!("{}: {e}", path.display())))?;
-            let module = DecodeModule::load(&be, &image)?;
-            if pf_batch_env
-                && packed_prefill.is_some()
-                && be.module_global_u32(&module, plow_asset::packed_prefill::CAPABILITY)? != Some(1)
+            if id == plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32
+                && object.sha256.as_deref()
+                    != Some(plow_asset::decode_objects::image_sha256(&image).as_str())
             {
                 return Err(RuntimeError::Rejected(
-                    "packet role lacks packed request ABI1".into(),
+                    "HD512 attention role object hash mismatch".into(),
                 ));
+            }
+            if id == plow_asset::segment_roles::MXFP4_MOE
+                && object.sha256.as_deref()
+                    != Some(plow_asset::decode_objects::image_sha256(&image).as_str())
+            {
+                return Err(RuntimeError::Rejected(
+                    "MXFP4 MoE role object hash mismatch".into(),
+                ));
+            }
+            let module = DecodeModule::load(&be, &image)?;
+            if packed_prefill.is_some()
+                && be.module_global_u32(&module, plow_asset::packed_prefill::CAPABILITY)?
+                    != Some(plow_asset::packed_prefill::CAPABILITY_VALUE)
+            {
+                return Err(RuntimeError::Rejected(format!(
+                    "packet role lacks packed request ABI{}",
+                    plow_asset::packed_prefill::CAPABILITY_VALUE
+                )));
             }
             let capability = be.module_global_u32(&module, marker)?;
             let block = be.module_global_u32(&module, block)?;
@@ -3644,9 +3941,28 @@ impl GpuEngine {
                 plow_asset::segment_roles::PREFILL_ATTENTION => {
                     check_attention_role(profile.tag, capability, block)?
                 }
+                plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32 => {
+                    check_attention_hd512_role(
+                        profile.tag,
+                        object,
+                        capability,
+                        block,
+                        [
+                            be.module_global_u32(&module, "plow_attention_head_dim")?,
+                            be.module_global_u32(&module, "plow_attention_query_tile")?,
+                            be.module_global_u32(&module, "plow_attention_kv_tile")?,
+                            be.module_global_u32(&module, "plow_attention_warps")?,
+                        ],
+                    )?
+                }
                 plow_asset::segment_roles::GEMV_CTA512 => {
                     if capability != Some(1) || block != Some(512) {
                         return Err(RuntimeError::Rejected("incompatible GEMV512 role".into()));
+                    }
+                }
+                plow_asset::segment_roles::MXFP4_MOE => {
+                    if capability != Some(1) || block != Some(BLOCK) {
+                        return Err(RuntimeError::Rejected("incompatible MXFP4 MoE role".into()));
                     }
                 }
                 _ => unreachable!("object role validated above"),
@@ -3665,8 +3981,24 @@ impl GpuEngine {
             }
             let capacity =
                 be.occupancy_blocks_per_sm(function, block, smem as usize)? * be.sm_count();
+            let role_grid = if id == plow_asset::segment_roles::MXFP4_MOE {
+                let multiplier = be
+                    .module_global_u32(&module, "plow_mxfp4_moe_ctas_per_sm")?
+                    .filter(|&value| value == 4)
+                    .ok_or_else(|| {
+                        RuntimeError::Rejected("MXFP4 MoE role lacks CTA capability".into())
+                    })?;
+                grid.checked_mul(multiplier)
+                    .ok_or_else(|| RuntimeError::Rejected("MXFP4 MoE role grid overflows".into()))?
+            } else {
+                grid
+            };
             if (id == plow_asset::segment_roles::GEMV_CTA512 && capacity < grid)
-                || (id != plow_asset::segment_roles::GEMV_CTA512 && capacity != grid)
+                || (id == plow_asset::segment_roles::MXFP4_MOE && capacity < role_grid)
+                || (!matches!(
+                    id,
+                    plow_asset::segment_roles::GEMV_CTA512 | plow_asset::segment_roles::MXFP4_MOE
+                ) && capacity != grid)
             {
                 return Err(RuntimeError::Rejected(
                     "packet role occupancy must equal packet grid".into(),
@@ -3674,6 +4006,7 @@ impl GpuEngine {
             }
             packet_roles[id as usize - 1] = Some(PacketRole {
                 function,
+                grid: role_grid,
                 smem,
                 block,
                 _module: module,
@@ -3692,17 +4025,17 @@ impl GpuEngine {
             None
         };
 
-        // ---- PX-1 batched-prefill mode (finalized once the prefill object is up) ----
-        // Requirements: env flag, prefill loaded, no VMM prefix sharing (its
-        // per-slot attach/publish assumes the serialized per-slot chain), and
-        // at least one FUSED (ns==1, t5=at) bucket to harvest the per-layer
-        // `n.at` handles from. Anything missing → warn + serialized prefill.
+        // ---- Cross-request prefill mode (finalized once the prefill object is up) ----
+        // A validated manifest selects its packet-defined chain without a
+        // runtime knob. The legacy prototype retains its old opt-in/fallback.
         let pf_batch: Option<PfBatch> = match (pf_bufs, pf_handles) {
             (Some((d_slot, d_req)), Some((h_slot, h_req)))
                 if f_pf.is_some() && !prefill.is_empty() =>
             {
                 if packed_prefill.is_some() {
                     if vmm.as_ref().is_some_and(|v| v.kv.prefix_reuse())
+                        || recurrent.is_some()
+                        || prefill.iter().any(|b| b.fp8_kv)
                         || prefill.iter().any(|b| {
                             b.seg_class.len() < 2 || b.qwen_segments.iter().any(Option::is_some)
                         })
@@ -3768,6 +4101,11 @@ impl GpuEngine {
                     }
                 }
             }
+            (Some(_), _) if packed_prefill.is_some() => {
+                return Err(RuntimeError::Rejected(
+                    "packed prefill manifest requires a loaded prefill object and buckets".into(),
+                ));
+            }
             (Some(_), _) => {
                 tracing::warn!("PLOW_PF_BATCH=1 ignored: prefill object not loaded");
                 None
@@ -3820,6 +4158,16 @@ impl GpuEngine {
             true => Some(StepTiming::new(&be)?),
             false => None,
         };
+        let mixed_step = mixed_packet
+            .map(|packet| {
+                if recurrent.is_some() {
+                    return Err(RuntimeError::Rejected(
+                        "mixed dense step does not support recurrent state".into(),
+                    ));
+                }
+                gpu_mixed_step::MixedCudaStep::load(&be, packet, &blob, &devp, d_tens.base, batch)
+            })
+            .transpose()?;
 
         // ---- device stochastic sampler (PLOW_DEV_SAMPLE=1; plan stage 4) ----
         // Loads a `plow_sample` cubin and allocates its per-slot param + [B][V]
@@ -3923,7 +4271,9 @@ impl GpuEngine {
             timing,
             vmm,
             pf_batch,
+            prefill_turn: 0,
             packed_prefill,
+            mixed_step,
         };
         if engine.cublaslt_decode_capture {
             engine.capture_decode_graph()?;
@@ -3951,9 +4301,20 @@ impl GpuEngine {
         module: &Module,
         assets_dir: &Path,
     ) -> Result<()> {
+        Self::check_packet_pairing_suffix(be, module, assets_dir, "")
+    }
+
+    fn check_packet_pairing_suffix(
+        be: &Arc<CudaBackend>,
+        module: &Module,
+        assets_dir: &Path,
+        suffix: &str,
+    ) -> Result<()> {
+        let lo_name = format!("plow_packet_hash_lo{suffix}");
+        let hi_name = format!("plow_packet_hash_hi{suffix}");
         let (lo, hi) = (
-            be.module_global_u32(module, "plow_packet_hash_lo")?,
-            be.module_global_u32(module, "plow_packet_hash_hi")?,
+            be.module_global_u32(module, &lo_name)?,
+            be.module_global_u32(module, &hi_name)?,
         );
         let (Some(lo), Some(hi)) = (lo, hi) else {
             // Unstamped ⇒ a general object. Nothing to check.
@@ -4379,7 +4740,6 @@ impl GpuEngine {
             ring_host,
             d_fed,
             fed_host,
-            batch,
         }))
     }
 
@@ -4551,7 +4911,7 @@ impl GpuEngine {
         effective_decode_widths(
             self.decode_rungs.iter().map(|r| r.rows),
             self.batch,
-            self.multistep.is_some() || self.decode_rungs.is_empty(),
+            self.decode_rungs.is_empty(),
         )
     }
 
@@ -4579,11 +4939,9 @@ impl GpuEngine {
         self.vmm_attached.get(b).copied().unwrap_or(0)
     }
 
-    /// Prefix-cache attach for the DECODE-ONLY prompt path (no prefill
-    /// object): consult the cache once for a fresh slot and return the row
-    /// the caller should resume feeding from — the attached rows' KV is
-    /// already mapped, so only the tail goes through per-token decode steps.
-    /// A no-op (returns 0) with VMM off or on a warm slot.
+    /// Prefix-cache attach for a fresh slot. The attached rows' KV is already
+    /// mapped, so decode-only and mixed-prefill callers feed only the tail. A
+    /// no-op (returns 0) with VMM off or on a warm slot.
     pub fn attach_prompt(&mut self, b: usize, prompt: &[u32]) -> Result<usize> {
         if self.pos[b] == 0 && self.vmm_prefix_enabled() {
             self.vmm_attach(b, prompt)?;
@@ -4619,7 +4977,7 @@ impl GpuEngine {
             )));
         }
         if total > self.max_ctx {
-            return Err(RuntimeError::Rejected(format!(
+            return Err(RuntimeError::ContextLength(format!(
                 "prompt + max_tokens = {total} exceeds the compiled context {}",
                 self.max_ctx
             )));
@@ -4647,6 +5005,7 @@ impl GpuEngine {
         self.vmm_attached[b] = 0;
         if let Some(v) = &self.vmm {
             self.seq_tokens[b].clear();
+            self.seq_tokens[b].reserve(total);
             v.kv.begin_seq(b);
             v.kv.ensure_rows(b, 1)?;
         }
@@ -5217,34 +5576,47 @@ impl GpuEngine {
     /// kernel advances each row's device-owned pos/kvlen and appends its token
     /// to the ring between launches, so no per-token host round trip happens.
     /// `out` is filled row-major (`feeds.len() × K`, fed row r → `out[r*K..]`)
-    /// and `K` is returned. Token-identical to K [`Self::step_slots`] calls.
-    /// Requires the multi-step bringup (`has_multistep`); errors otherwise so
-    /// the caller falls back to per-token stepping.
+    /// and the executed `K` is returned, capped by remaining context.
+    /// Token-identical to K [`Self::step_slots`] calls.
     pub fn multi_step(&mut self, feeds: &[(usize, u32)], out: &mut Vec<u32>) -> Result<usize> {
+        self.multi_step_at_most(feeds, usize::MAX, out)
+    }
+
+    /// Cap a quantum by the caller's remaining output budget and live context.
+    pub fn multi_step_at_most(
+        &mut self,
+        feeds: &[(usize, u32)],
+        requested: usize,
+        out: &mut Vec<u32>,
+    ) -> Result<usize> {
         out.clear();
         let Some(ms) = self.multistep.as_ref() else {
             return Err(RuntimeError::Rejected("multi-step not enabled".into()));
         };
-        let (k, f_adv) = (ms.quantum, ms.f_advance);
-        if feeds.is_empty() {
+        let f_adv = ms.f_advance;
+        let k = crate::sched::multistep::decode_quantum(
+            feeds.iter().map(|&(slot, _)| slot),
+            &self.pos,
+            self.max_ctx,
+            requested,
+            ms.quantum,
+        )
+        .map_err(|error| RuntimeError::Rejected(error.to_string()))?;
+        if k == 0 {
             return Ok(k);
         }
         let bsz = self.batch;
-        for &(b, _) in feeds {
-            if b >= bsz {
-                return Err(RuntimeError::Rejected(format!("slot {b} out of range")));
+        let rung = self.select_decode(feeds.iter().map(|&(slot, _)| slot))?;
+        let launch_rows = self.selected_decode(rung).map_or(bsz, |r| r.rows);
+        // VMM: map every row this quantum will write. Fed rows need the full
+        // quantum; idle rows in the selected rung need their one garbage row.
+        if let Some(v) = &mut self.vmm {
+            if let Some(rings) = &mut v.rings {
+                rings.ensure_prefix(launch_rows)?;
             }
-            if self.pos[b] as usize + k > self.max_ctx {
-                return Err(RuntimeError::Rejected(format!(
-                    "multi-step quantum {k} from pos {} exceeds context {}",
-                    self.pos[b], self.max_ctx
-                )));
-            }
-        }
-        // VMM: map every row this quantum will write (fed rows pos..pos+K).
-        if let Some(v) = &self.vmm {
-            for &(b, _) in feeds {
-                let need = self.pos[b] + k as u32;
+            for b in 0..launch_rows {
+                let active = feeds.iter().any(|&(slot, _)| slot == b);
+                let need = self.pos[b] + if active { k as u32 } else { 1 };
                 if v.kv.mapped_rows(b) < need {
                     v.kv.ensure_rows(b, need)?;
                 }
@@ -5303,22 +5675,8 @@ impl GpuEngine {
         // Enqueue [memset → decode → advance] × K on the stream — no sync.
         let advance_grid = (bsz as u32).div_ceil(256);
         for step in 0..k {
-            self.be.memset_d8_async(
-                self.d_ctr.base,
-                0,
-                self.ctr_bytes.max(4) + self.cursor_bytes,
-                &self.stream,
-            )?;
-            let mut arg = self.kernarg;
-            let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
-            self.be.launch_cooperative(
-                self.f,
-                self.grid,
-                BLOCK,
-                self.smem,
-                &mut params,
-                Some(&self.stream),
-            )?;
+            self.reset_selected_decode_counters(rung)?;
+            self.launch_selected_decode(rung)?;
             let mut a_ids = self.devp[self.t_ids].base;
             let mut a_pos = self.devp[self.t_pos].base;
             let mut a_kvl = self.devp[self.t_kvlen].base;
@@ -5414,12 +5772,19 @@ impl GpuEngine {
         self.sampler.is_some()
     }
 
-    /// Whether PX-1 cross-request batched prefill is active (`PLOW_PF_BATCH=1`
-    /// and every load-time requirement held). The mux then routes ALL prefill
-    /// through [`Self::prefill_batched`] and takes each request's first token
-    /// from a batched decode step of its last prompt token.
+    /// Whether packet-selected or legacy opt-in cross-request prefill is active.
+    /// The mux routes all prefill through [`Self::prefill_batched`] and takes
+    /// each request's first token from a decode step of its last prompt token.
     pub fn pf_batch_enabled(&self) -> bool {
         self.pf_batch.is_some()
+    }
+
+    pub fn prefill_turn(&self) -> usize {
+        self.prefill_turn % self.batch.max(1)
+    }
+
+    pub fn advance_prefill_turn(&mut self, slot: usize) {
+        self.prefill_turn = (slot + 1) % self.batch.max(1);
     }
 
     /// Largest prefill bucket's row count — the mux's per-launch token budget.
@@ -5453,6 +5818,7 @@ impl GpuEngine {
         be: &Arc<CudaBackend>,
         pf: InterpImage,
         blob: &DevBlob,
+        assets_dir: &Path,
         d_tens: u64,
         grid: u32,
         interp_tag: &str,
@@ -5460,13 +5826,7 @@ impl GpuEngine {
         packed_requests: bool,
     ) -> Result<(KernelFn, u32, Module, Vec<PrefillBucket>, Option<SegPf>)> {
         let module = be.module_load(&pf.image)?;
-        if packed_requests
-            && be.module_global_u32(&module, plow_asset::packed_prefill::CAPABILITY)? != Some(1)
-        {
-            return Err(RuntimeError::Rejected(
-                "prefill object lacks packed request ABI1".into(),
-            ));
-        }
+        Self::check_packet_pairing_suffix(be, &module, assets_dir, "_pf")?;
         let kname = crate::config::RuntimeConfig::get()
             .nv
             .kernel_pf
@@ -5484,27 +5844,28 @@ impl GpuEngine {
         };
         be.set_max_dynamic_smem(f_pf, smem_pf)?;
 
-        // Segmented-prefill pair (T9c). `--pf-seg-dir` / PLOW_PF_SEG_DIR names a directory
-        // holding interp_<tag>_pfseg.cubin + interp_<tag>_pfgemm.cubin;
-        // packets must be emitted WITHOUT
-        // PLOW_UNISEG. Next step: promote to the asset manifest once the A/B settles.
+        // Fine-gated packets select the segmented pair from their own asset directory.
+        // `--pf-seg-dir` remains an explicit object-directory override.
         let small_gemm_path = crate::config::RuntimeConfig::get()
             .nv
             .pf_seg_gemm_small
             .as_deref();
-        if small_gemm_path.is_some()
-            && crate::config::RuntimeConfig::get()
-                .nv
-                .pf_seg_dir
-                .as_deref()
-                .is_none_or(str::is_empty)
-        {
+        let configured_seg_dir = crate::config::RuntimeConfig::get()
+            .nv
+            .pf_seg_dir
+            .as_deref()
+            .filter(|dir| !dir.is_empty())
+            .map(PathBuf::from);
+        let segment_dir = configured_seg_dir.or_else(|| {
+            prefill_needs_segment_pair(blob, segment_roles).then(|| assets_dir.to_path_buf())
+        });
+        if small_gemm_path.is_some() && segment_dir.is_none() {
             return Err(RuntimeError::Rejected(
                 "PLOW_PF_SEG_GEMM_SMALL requires PLOW_PF_SEG_DIR".into(),
             ));
         }
-        let seg_pf = match crate::config::RuntimeConfig::get().nv.pf_seg_dir.clone() {
-            Some(dir) if !dir.is_empty() => {
+        let seg_pf = match segment_dir {
+            Some(dir) => {
                 // Segmented objects currently have only bf16-KV variants. Loading one for an
                 // fp8-KV packet would resolve valid symbols and then reinterpret the cache with
                 // the wrong element width, so reject the requested pairing before loading it.
@@ -5513,45 +5874,53 @@ impl GpuEngine {
                         || inst.op == DevOp::FlashPrefillFp8 as u16
                 }) {
                     return Err(RuntimeError::Device(
-                        "PLOW_PF_SEG_DIR cannot be used with fp8-KV packets: segmented NVIDIA \
-                         prefill objects currently have no fp8-KV variants"
+                        "segmented NVIDIA prefill objects cannot be used with fp8-KV packets: \
+                         no fp8-KV variant is available"
                             .into(),
                     ));
                 }
-                let load =
-                    |file: &str, sym: &str, arena: &str| -> Result<(Module, KernelFn, u32, u32)> {
-                        let img =
-                            std::fs::read(std::path::Path::new(&dir).join(file)).map_err(|e| {
-                                RuntimeError::Device(format!("PLOW_PF_SEG_DIR: read {file}: {e}"))
-                            })?;
-                        let m = be.module_load(&img)?;
-                        if packed_requests
-                            && be.module_global_u32(&m, plow_asset::packed_prefill::CAPABILITY)?
-                                != Some(1)
-                        {
-                            return Err(RuntimeError::Rejected(format!(
-                                "{file} lacks packed request ABI1"
-                            )));
-                        }
-                        let f = be.get_function(&m, sym)?;
-                        let sm = be.module_global_u32(&m, arena)?.unwrap_or(smem_pf);
-                        be.set_max_dynamic_smem(f, sm)?;
-                        let occ = be.occupancy_blocks_per_sm(f, BLOCK, sm as usize)?;
-                        Ok((m, f, sm, occ * be.sm_count()))
-                    };
-                let seg_file = format!("interp_{interp_tag}_pfseg.cubin");
-                let gemm_file = format!("interp_{interp_tag}_pfgemm.cubin");
-                let seg_sym_name = format!("interp_{interp_tag}_pfseg");
-                let gemm_sym_name = format!("interp_{interp_tag}_pfgemm");
+                let load = |file: &str,
+                            sym: &str,
+                            suffix: &str,
+                            arena: &str|
+                 -> Result<(Module, KernelFn, u32, u32)> {
+                    let img = std::fs::read(dir.join(file)).map_err(|e| {
+                        RuntimeError::Device(format!("segmented prefill object: read {file}: {e}"))
+                    })?;
+                    let m = be.module_load(&img)?;
+                    Self::check_packet_pairing_suffix(be, &m, assets_dir, suffix)?;
+                    if packed_requests
+                        && be.module_global_u32(&m, plow_asset::packed_prefill::CAPABILITY)?
+                            != Some(plow_asset::packed_prefill::CAPABILITY_VALUE)
+                    {
+                        return Err(RuntimeError::Rejected(format!(
+                            "{file} lacks packed request ABI{}",
+                            plow_asset::packed_prefill::CAPABILITY_VALUE
+                        )));
+                    }
+                    let f = be.get_function(&m, sym)?;
+                    let sm = be.module_global_u32(&m, arena)?.unwrap_or(smem_pf);
+                    be.set_max_dynamic_smem(f, sm)?;
+                    let occ = be.occupancy_blocks_per_sm(f, BLOCK, sm as usize)?;
+                    Ok((m, f, sm, occ * be.sm_count()))
+                };
+                let suffix = if packed_requests { "pfpacked" } else { "pf" };
+                let seg_file = format!("interp_{interp_tag}_{suffix}seg.cubin");
+                let gemm_file = format!("interp_{interp_tag}_{suffix}gemm.cubin");
+                let seg_sym_name = format!("interp_{interp_tag}_{suffix}seg");
+                let gemm_sym_name = format!("interp_{interp_tag}_{suffix}gemm");
                 let seg_sym = format!("_Z{}{}11PlowProgram", seg_sym_name.len(), seg_sym_name);
                 let gemm_sym = format!("_Z{}{}11PlowProgram", gemm_sym_name.len(), gemm_sym_name);
-                let (m1, f1, s1, g1) = load(&seg_file, &seg_sym, "plow_arena_bytes_pfseg")?;
+                let seg_global_suffix = format!("_{suffix}seg");
+                let gemm_global_suffix = format!("_{suffix}gemm");
+                let seg_arena = format!("plow_arena_bytes{seg_global_suffix}");
+                let gemm_arena = format!("plow_arena_bytes{gemm_global_suffix}");
+                let (m1, f1, s1, g1) = load(&seg_file, &seg_sym, &seg_global_suffix, &seg_arena)?;
                 let (m2, f2, s2, _g2unused) =
-                    load(&gemm_file, &gemm_sym, "plow_arena_bytes_pfgemm")?;
+                    load(&gemm_file, &gemm_sym, &gemm_global_suffix, &gemm_arena)?;
                 // T31: the GEMM object may declare its own launch block size (384-thread ws).
-                let blk2 = be
-                    .module_global_u32(&m2, "plow_block_pfgemm")?
-                    .unwrap_or(BLOCK);
+                let gemm_block = format!("plow_block{gemm_global_suffix}");
+                let blk2 = be.module_global_u32(&m2, &gemm_block)?.unwrap_or(BLOCK);
                 let g2 = be.occupancy_blocks_per_sm(f2, blk2, s2 as usize)? * be.sm_count();
                 let small_gemm = if let Some(path) = small_gemm_path {
                     if blk2 != 384 {
@@ -5565,11 +5934,12 @@ impl GpuEngine {
                     let module = be.module_load(&img)?;
                     if packed_requests
                         && be.module_global_u32(&module, plow_asset::packed_prefill::CAPABILITY)?
-                            != Some(1)
+                            != Some(plow_asset::packed_prefill::CAPABILITY_VALUE)
                     {
-                        return Err(RuntimeError::Rejected(
-                            "small GEMM object lacks packed request ABI1".into(),
-                        ));
+                        return Err(RuntimeError::Rejected(format!(
+                            "small GEMM object lacks packed request ABI{}",
+                            plow_asset::packed_prefill::CAPABILITY_VALUE
+                        )));
                     }
                     let abi = be
                         .module_global_u32(&module, "plow_gemm_shape_abi_pfgemm")?
@@ -5615,10 +5985,11 @@ impl GpuEngine {
                 // file exists — the classing env (PLOW_PF_SEG_FA512) decides whether class-2
                 // segments are emitted at all.
                 let fa_file = format!("interp_{interp_tag}_pffa.cubin");
-                let fa = if std::path::Path::new(&dir).join(&fa_file).exists() {
+                let fa = if !packed_requests && dir.join(&fa_file).exists() {
                     let fa_sym_name = format!("interp_{interp_tag}_pffa");
                     let fa_sym = format!("_Z{}{}11PlowProgram", fa_sym_name.len(), fa_sym_name);
-                    let (m3, f3, s3, g3) = load(&fa_file, &fa_sym, "plow_arena_bytes_pffa")?;
+                    let (m3, f3, s3, g3) =
+                        load(&fa_file, &fa_sym, "_pffa", "plow_arena_bytes_pffa")?;
                     // PLOW_PF_SEG_FA512=all classes hd256 FlashPrefill onto this object too,
                     // but its hd256 arm exists only when built PLOW_BUILD_FA_HD256=1 —
                     // without it the dispatch hits a bare __trap(): LAUNCH_FAILED, poisoned
@@ -5752,12 +6123,7 @@ impl GpuEngine {
             let declared_roles = segment_roles.and_then(|r| r.program(program_index));
             let mut qwen_segments = qwen_prefill_segments(g, &blob.tensors)?;
             let packet_segment_roles = if let Some(p) = declared_roles {
-                if seg_mode {
-                    return Err(RuntimeError::Rejected(
-                        "packet roles cannot mix with legacy role pair".into(),
-                    ));
-                }
-                if qwen_segments.is_empty() {
+                if qwen_segments.is_empty() && !seg_mode {
                     qwen_segments = vec![None; p.roles.len()];
                 }
                 let selected = packet_role_segments(g, &p.roles, &blob.tensors)?;
@@ -5765,7 +6131,16 @@ impl GpuEngine {
                     program_index,
                     launches = p.roles.len(),
                     gemm_launches = selected.iter().filter(|&&x| x == 1).count(),
-                    attention_launches = selected.iter().filter(|&&x| x == 2).count(),
+                    attention_launches = selected
+                        .iter()
+                        .filter(|&&role| {
+                            matches!(
+                                role,
+                                plow_asset::segment_roles::PREFILL_ATTENTION
+                                    | plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32
+                            )
+                        })
+                        .count(),
                     "packet segment roles loaded"
                 );
                 selected
@@ -5882,6 +6257,7 @@ impl GpuEngine {
                 prefill_parked: 0,
                 n_prefill_spans: 0,
                 n_prefill_rows: 0,
+                token_batch: 0,
             };
 
             // Precompute the per-chunk patch sites (harness inner loop): KV-write
@@ -6026,7 +6402,7 @@ impl GpuEngine {
             return Err(RuntimeError::Rejected("empty prompt".into()));
         }
         if n > self.max_ctx {
-            return Err(RuntimeError::Rejected(format!(
+            return Err(RuntimeError::ContextLength(format!(
                 "prompt {n} exceeds the compiled context {}",
                 self.max_ctx
             )));
@@ -6363,16 +6739,12 @@ impl GpuEngine {
                         native.launch(tensors, inst.i[0] as usize, &self.stream)?;
                     }
                 }
-                let role_id = self.prefill[bi]
-                    .packet_segment_roles
-                    .get(seg)
-                    .copied()
-                    .unwrap_or(0);
-                let role = role_id.checked_sub(1).map(|id| {
-                    self.packet_roles[id as usize]
-                        .as_ref()
-                        .expect("validated packet role object")
-                });
+                let role =
+                    packet_role_index(&self.prefill[bi].packet_segment_roles, seg).map(|index| {
+                        self.packet_roles[index]
+                            .as_ref()
+                            .expect("validated packet role object")
+                    });
                 segment_window(&mut arg, &self.prefill[bi].kernarg, seg, role.is_some());
                 let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
                 self.be.launch_cooperative(
@@ -6384,7 +6756,13 @@ impl GpuEngine {
                     Some(&self.stream),
                 )?;
             }
-        } else if seg_class.len() > 1 && self.seg_pf.is_some() {
+        } else if self.seg_pf.is_some()
+            && (seg_class.len() > 1
+                || self.prefill[bi]
+                    .packet_segment_roles
+                    .iter()
+                    .any(|&role| role != plow_asset::segment_roles::INTERPRETER))
+        {
             let sp = self.seg_pf.as_ref().expect("checked");
             // T35 (PLOW_PF_SEG_GRAPH=1): submit the whole per-chunk segment chain as ONE
             // CUDA graph. Per-node kernargs (cur_seg baked per node) are copied at build;
@@ -6407,6 +6785,14 @@ impl GpuEngine {
                         .iter()
                         .enumerate()
                         .map(|(seg, &cls)| {
+                            if let Some(index) =
+                                packet_role_index(&self.prefill[bi].packet_segment_roles, seg)
+                            {
+                                let role = self.packet_roles[index]
+                                    .as_ref()
+                                    .expect("validated packet role object");
+                                return Ok((role.function, self.grid, role.block, role.smem));
+                            }
                             Ok(match cls {
                                 4 => (sp.f_flash, sp.grid_flash, BLOCK, sp.smem_flash),
                                 2 => {
@@ -6472,7 +6858,15 @@ impl GpuEngine {
             let mut evs: Vec<(u8, CudaEvent, CudaEvent)> = Vec::new();
             for (seg, &cls) in seg_class.iter().enumerate() {
                 arg.cur_seg = seg as u32;
-                let (f, gr, sm, blk) = if fat_only || cls == 4 {
+                let role =
+                    packet_role_index(&self.prefill[bi].packet_segment_roles, seg).map(|index| {
+                        self.packet_roles[index]
+                            .as_ref()
+                            .expect("validated packet role object")
+                    });
+                let (f, gr, sm, blk) = if let Some(role) = role {
+                    (role.function, self.grid, role.smem, role.block)
+                } else if fat_only || cls == 4 {
                     (sp.f_flash, sp.grid_flash, sp.smem_flash, BLOCK)
                 } else if cls == 2 {
                     // T12: hd512 flash segments on the dedicated *_pffa object.
@@ -6500,6 +6894,15 @@ impl GpuEngine {
                     }
                 };
                 if seg_time {
+                    tracing::debug!(
+                        segment = seg,
+                        class = cls,
+                        grid = gr,
+                        block = blk,
+                        smem = sm,
+                        packet_role = role.is_some(),
+                        "prefill segment launch"
+                    );
                     let e0 = self.be.event_create(true)?;
                     let e1 = self.be.event_create(true)?;
                     self.be.event_record(&e0, &self.stream)?;
@@ -6610,7 +7013,7 @@ impl GpuEngine {
                 }
             }
             for &pc in &b.merge_sites {
-                b.h_inst[pc].t[3] = pack.request;
+                b.h_inst[pc].t[7] = pack.request;
             }
             for &pc in &b.lmhead_sites {
                 b.h_inst[pc].i[4] = 0;
@@ -6981,6 +7384,23 @@ impl GpuEngine {
             RuntimeError::Rejected(format!("no tensor named {name:?} in the blob"))
         })?;
         self.be.download(&self.devp[i], 0, dst)
+    }
+
+    /// Read a byte range from a named tensor for block-harness diagnostics.
+    pub fn read_tensor_range(&self, name: &str, offset: u64, dst: &mut [u8]) -> Result<()> {
+        let i = self.handle_of(name).ok_or_else(|| {
+            RuntimeError::Rejected(format!("no tensor named {name:?} in the blob"))
+        })?;
+        let end = offset
+            .checked_add(dst.len() as u64)
+            .ok_or_else(|| RuntimeError::Rejected("tensor read range overflow".into()))?;
+        if end > self.devp[i].len {
+            return Err(RuntimeError::Rejected(format!(
+                "read_tensor_range {name}: range {offset}..{end} exceeds {} bytes",
+                self.devp[i].len
+            )));
+        }
+        self.be.download(&self.devp[i], offset, dst)
     }
 
     /// Byte size of a named tensor's device allocation.
@@ -7367,12 +7787,17 @@ mod prefill_patch_tests {
     #[ignore = "GPU Gemma direct-KV block qualification; root-owned launch only"]
     fn packed_segmented_block_matches_serialized() -> Result<()> {
         assert_eq!(std::env::var("TEST_PACKED_PREFILL_GPU").as_deref(), Ok("1"));
+        let config = crate::config::RuntimeConfig::get();
+        assert!(!config.nv.pf_batch);
+        assert!(!config.nv_vmm_prefix());
         let assets = std::path::PathBuf::from(std::env::var("TEST_PACKED_PREFILL_ASSETS").unwrap());
         let bytes = std::fs::read(assets.join("model.pkt")).unwrap();
         let blob = DevBlob::parse(&bytes).unwrap();
         let live = crate::memory::vmm::LiveKvLayout::manifest(&blob, &bytes)
             .unwrap()
             .unwrap();
+        let live_requested =
+            config.nv_vmm_live() || live.caches.iter().any(|cache| cache.window == 0);
         let block: serde_json::Value =
             serde_json::from_slice(&std::fs::read(assets.join("block.json")).unwrap()).unwrap();
         let hidden = block["hidden"].as_u64().unwrap() as usize;
@@ -7382,6 +7807,10 @@ mod prefill_patch_tests {
         let be = Arc::new(CudaBackend::new(0)?);
         let mut e = GpuEngine::load(be, &assets, &assets.join("checkpoint"))?;
         assert!(e.packed_prefill.is_some() && e.pf_batch.is_some() && e.batch >= 16);
+        assert_eq!(
+            e.vmm.as_ref().is_some_and(|v| !v.kv.prefix_reuse()),
+            live_requested
+        );
         assert!(e.prefill.iter().all(|b| b.seg_class.len() > 1));
         let tensor_rows = e.tensor_bytes("act.x").unwrap() as usize / 2 / hidden;
         let input = |slot: usize, row: usize, col: usize| {
@@ -7432,81 +7861,87 @@ mod prefill_patch_tests {
             all
         };
         let lens = [31usize, 63];
-        let slots = [3usize, 15];
         let prompts: Vec<Vec<u32>> = lens.iter().map(|&len| vec![100; len]).collect();
-        let mut reference: Option<Vec<u8>> = None;
-        for arm in 0..3 {
-            e.begin_slot(0, 256).unwrap();
-            stage(&mut e, &[(0, 0, 17)]);
-            e.prefill_slot(0, &vec![100; 17]).unwrap();
-            let idle = kv(&e, &[(0, 17)]);
-            for &slot in &slots {
-                e.begin_slot(slot, 256).unwrap();
-            }
-            let mut got = Vec::new();
-            if arm == 0 {
-                for i in 0..2 {
-                    stage(&mut e, &[(slots[i], 0, lens[i])]);
-                    e.prefill_slot(slots[i], &prompts[i]).unwrap();
-                    got.extend(output(&e, lens[i]));
+        for (slots, idle_slot) in [([0usize, 3], 15usize), ([3, 15], 0)] {
+            let mut reference: Option<Vec<u8>> = None;
+            for arm in 0..3 {
+                e.begin_slot(idle_slot, 256).unwrap();
+                stage(&mut e, &[(idle_slot, 0, 17)]);
+                e.prefill_slot(idle_slot, &vec![100; 17]).unwrap();
+                let idle = kv(&e, &[(idle_slot, 17)]);
+                for &slot in &slots {
+                    e.begin_slot(slot, 256).unwrap();
                 }
-            } else {
-                stage(&mut e, &[(slots[0], 0, lens[0]), (slots[1], 0, lens[1])]);
-                let requests: Vec<_> = (0..2)
-                    .map(|i| PfBatchReq {
-                        slot: slots[i],
-                        prompt: &prompts[i],
-                        c0: 0,
-                        len: lens[i],
-                    })
-                    .collect();
-                e.prefill_batched(&requests).unwrap();
-                got = output(&e, lens.iter().sum());
-                let before = kv(&e, &[(slots[0], lens[0]), (slots[1], lens[1])]);
-                let duplicate = [
-                    PfBatchReq {
-                        slot: 3,
-                        prompt: &prompts[0],
-                        c0: 31,
-                        len: 1,
-                    },
-                    PfBatchReq {
-                        slot: 3,
-                        prompt: &prompts[0],
-                        c0: 31,
-                        len: 1,
-                    },
-                ];
-                assert!(e.prefill_batched(&duplicate).is_err());
-                assert_eq!(before, kv(&e, &[(slots[0], lens[0]), (slots[1], lens[1])]));
-            }
-            assert_eq!(idle, kv(&e, &[(0, 17)]), "request isolation: slot0 idle KV");
-            got.extend(kv(&e, &[(slots[0], lens[0]), (slots[1], lens[1])]));
-            for i in 0..2 {
-                let continuation = vec![100; lens[i] + 1];
-                stage(&mut e, &[(slots[i], lens[i], 1)]);
-                e.prefill_slot(slots[i], &continuation).unwrap();
-                got.extend(output(&e, 1));
-            }
-            got.extend(kv(&e, &[(slots[0], lens[0] + 1), (slots[1], lens[1] + 1)]));
-            stage(&mut e, &[(0, 17, 1)]);
-            e.prefill_slot(0, &vec![100; 18]).unwrap();
-            got.extend(output(&e, 1));
-            got.extend(kv(&e, &[(0, 18)]));
-            assert_eq!(e.pos[3], 32);
-            assert_eq!(e.pos[15], 64);
-            if let Some(expected) = &reference {
-                assert_eq!(got.len(), expected.len());
-                assert!(
-                    got.iter().zip(expected).all(|(a, b)| a == b),
-                    "arm {arm}: first differing byte {:?}",
-                    got.iter().zip(expected).position(|(a, b)| a != b)
+                let mut got = Vec::new();
+                if arm == 0 {
+                    for i in 0..2 {
+                        stage(&mut e, &[(slots[i], 0, lens[i])]);
+                        e.prefill_slot(slots[i], &prompts[i]).unwrap();
+                        got.extend(output(&e, lens[i]));
+                    }
+                } else {
+                    stage(&mut e, &[(slots[0], 0, lens[0]), (slots[1], 0, lens[1])]);
+                    let requests: Vec<_> = (0..2)
+                        .map(|i| PfBatchReq {
+                            slot: slots[i],
+                            prompt: &prompts[i],
+                            c0: 0,
+                            len: lens[i],
+                        })
+                        .collect();
+                    e.prefill_batched(&requests).unwrap();
+                    got = output(&e, lens.iter().sum());
+                    let before = kv(&e, &[(slots[0], lens[0]), (slots[1], lens[1])]);
+                    let duplicate_prompt = vec![100; lens[0] + 1];
+                    let duplicate = [
+                        PfBatchReq {
+                            slot: slots[0],
+                            prompt: &duplicate_prompt,
+                            c0: lens[0],
+                            len: 1,
+                        },
+                        PfBatchReq {
+                            slot: slots[0],
+                            prompt: &duplicate_prompt,
+                            c0: lens[0],
+                            len: 1,
+                        },
+                    ];
+                    assert!(e.prefill_batched(&duplicate).is_err());
+                    assert_eq!(before, kv(&e, &[(slots[0], lens[0]), (slots[1], lens[1])]));
+                }
+                assert_eq!(
+                    idle,
+                    kv(&e, &[(idle_slot, 17)]),
+                    "request isolation: slot{idle_slot} idle KV"
                 );
-            } else {
-                reference = Some(got);
+                got.extend(kv(&e, &[(slots[0], lens[0]), (slots[1], lens[1])]));
+                for i in 0..2 {
+                    let continuation = vec![100; lens[i] + 1];
+                    stage(&mut e, &[(slots[i], lens[i], 1)]);
+                    e.prefill_slot(slots[i], &continuation).unwrap();
+                    got.extend(output(&e, 1));
+                }
+                got.extend(kv(&e, &[(slots[0], lens[0] + 1), (slots[1], lens[1] + 1)]));
+                stage(&mut e, &[(idle_slot, 17, 1)]);
+                e.prefill_slot(idle_slot, &vec![100; 18]).unwrap();
+                got.extend(output(&e, 1));
+                got.extend(kv(&e, &[(idle_slot, 18)]));
+                assert_eq!(e.pos[slots[0]], 32);
+                assert_eq!(e.pos[slots[1]], 64);
+                if let Some(expected) = &reference {
+                    assert_eq!(got.len(), expected.len());
+                    assert!(
+                        got.iter().zip(expected).all(|(a, b)| a == b),
+                        "slots {slots:?} arm {arm}: first differing byte {:?}",
+                        got.iter().zip(expected).position(|(a, b)| a != b)
+                    );
+                } else {
+                    reference = Some(got);
+                }
             }
         }
-        eprintln!("packed segmented block PASS: physical slots3/15,94 real+34 pad rows,2 repeats,KV and continuation exact");
+        eprintln!("packed segmented block PASS: physical slots0/3 and3/15,94 real+34 pad rows,2 repeats,full activations/KV and continuation exact");
         Ok(())
     }
 
@@ -7595,6 +8030,20 @@ mod slab_tests {
 mod profile_tests {
     use super::*;
 
+    fn prefill_images() -> (InterpreterProfile, Vec<u8>, Vec<u8>) {
+        let profile = interpreter_profile((9, 0)).unwrap();
+        let ordinary = plow_asset::cubin::synthetic_elf(profile.prefill_symbol, &[], 90);
+        let mixed = plow_asset::cubin::synthetic_elf(
+            profile.prefill_symbol,
+            &[(
+                plow_asset::mixed_step::OBJECT_CAPABILITY,
+                plow_asset::mixed_step::VERSION,
+            )],
+            90,
+        );
+        (profile, ordinary, mixed)
+    }
+
     #[test]
     fn selects_native_hopper_for_h100_and_h200() {
         let p = interpreter_profile((9, 0)).unwrap();
@@ -7610,6 +8059,102 @@ mod profile_tests {
         assert_eq!(p.prefill_symbol, "_Z15interp_sm120_pf11PlowProgram");
         assert!(interpreter_profile((8, 9)).is_none());
         assert!(interpreter_profile((10, 0)).is_none());
+    }
+
+    #[test]
+    fn auxiliary_mixed_object_cannot_win_ordinary_prefill_discovery() {
+        let (profile, ordinary, mixed) = prefill_images();
+        assert_eq!(
+            interp_candidate(&ordinary, &profile, 90, Role::Prefill).unwrap(),
+            profile.prefill_symbol
+        );
+        assert!(interp_candidate(&mixed, &profile, 90, Role::Prefill)
+            .unwrap_err()
+            .contains("mixed-step auxiliary object"));
+    }
+
+    #[test]
+    fn auxiliary_packed_object_cannot_win_ordinary_prefill_discovery() {
+        let (profile, ordinary, _) = prefill_images();
+        let packed = plow_asset::cubin::synthetic_elf(
+            profile.prefill_symbol,
+            &[(
+                plow_asset::packed_prefill::CAPABILITY,
+                plow_asset::packed_prefill::CAPABILITY_VALUE,
+            )],
+            90,
+        );
+        assert_eq!(
+            interp_candidate(&ordinary, &profile, 90, Role::Prefill).unwrap(),
+            profile.prefill_symbol
+        );
+        assert!(interp_candidate(&packed, &profile, 90, Role::Prefill)
+            .unwrap_err()
+            .contains("packed-prefill auxiliary object"));
+    }
+
+    #[test]
+    fn embedded_mixed_object_is_skipped_for_ordinary_prefill() {
+        use crate::asset::devblob::DevSection;
+
+        let (profile, ordinary, mixed) = prefill_images();
+        let mut raw = mixed.clone();
+        raw.extend_from_slice(&ordinary);
+        let blob = DevBlob {
+            n_cu: 0,
+            flags: 0,
+            target: 0,
+            tensors: Vec::new(),
+            init: Vec::new(),
+            kvrow: Vec::new(),
+            progs: Vec::new(),
+            sections: vec![
+                DevSection {
+                    kind: packet::devbuild::SECT_CUBIN,
+                    name: "mixed".into(),
+                    offset: 0,
+                    size: mixed.len(),
+                },
+                DevSection {
+                    kind: packet::devbuild::SECT_CUBIN,
+                    name: "ordinary".into(),
+                    offset: mixed.len(),
+                    size: ordinary.len(),
+                },
+            ],
+            gen: Vec::new(),
+            tp: None,
+        };
+        let mut rejected = Vec::new();
+        let selected =
+            embedded_interp_image(&blob, &raw, &profile, 90, Role::Prefill, &mut rejected).unwrap();
+        assert_eq!(selected.image, ordinary);
+        assert_eq!(selected.source, "embedded section 'ordinary'");
+        assert!(rejected[0].contains("mixed-step auxiliary object"));
+    }
+
+    #[test]
+    fn filesystem_mixed_object_is_skipped_for_ordinary_prefill() {
+        let (profile, ordinary, mixed) = prefill_images();
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "plow-interp-discovery-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join(profile.prefill_file), mixed).unwrap();
+        std::fs::write(dir.join("ordinary.cubin"), &ordinary).unwrap();
+
+        let mut rejected = Vec::new();
+        let selected =
+            filesystem_interp_image(&dir, &profile, 90, Role::Prefill, &mut rejected).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(selected.image, ordinary);
+        assert_eq!(selected.source, "ordinary.cubin");
+        assert!(rejected[0].contains("mixed-step auxiliary object"));
     }
 }
 
@@ -7921,6 +8466,10 @@ mod decode_rung_tests;
 #[cfg(test)]
 #[path = "gpu_gemv_role_tests.rs"]
 mod gemv_role_tests;
+
+#[cfg(test)]
+#[path = "gpu_mxfp4_moe_role_tests.rs"]
+mod mxfp4_moe_role_tests;
 
 #[path = "gpu_fp8_m1_role.rs"]
 mod fp8_m1_role;

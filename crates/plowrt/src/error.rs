@@ -74,6 +74,16 @@ pub enum RuntimeError {
     #[error("request rejected: {0}")]
     Rejected(String),
 
+    /// The prompt plus its requested output does not fit the compiled context.
+    /// SEPARATE from [`Rejected`](Self::Rejected) because the HTTP mapping has
+    /// to differ: a shed request is retryable (429) and this one can never
+    /// succeed, so it must be a 400 with `context_length_exceeded`. It used to
+    /// come back as 429 on CUDA and the AMD padded-cover path, and as a bare
+    /// 500 on the AMD raw-prompt path — three answers to one question, none of
+    /// them the one a client can act on.
+    #[error("context length exceeded: {0}")]
+    ContextLength(String),
+
     #[error("{0}")]
     Msg(String),
 }

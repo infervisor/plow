@@ -29,6 +29,14 @@
   "-> checks. _arch is asserted against each object's ELF header before any rule runs."
  ],
  "_arch": "gfx942",
+ "interp_mixed": {
+  "plow_exec": {
+   "require_min": {
+    "v_mfma_f32_32x32x8_bf16": 1
+   },
+   "forbid": ["v_mfma_f32_32x32x64_f8f6f4", "v_mfma_scale"]
+  }
+ },
  "_k3_decode_note": [
   "K3 decode is MXFP4 expert GEMV, not a matrix-core path on CDNA3. The two outlined expert",
   "bodies must retain the software fp4 -> fp16 decode and f32 accumulation used by gfx942.",
@@ -83,15 +91,32 @@
  "_k3_fp8kv_note": [
   "K3's fp8kv prefill rows use FP8 only for KV-cache storage. Their simulated A4W4 grouped",
   "MoE path dequantizes MXFP4 activations and weights to bf16 on CDNA3, so it must select the",
-  "gfx942 bf16 MFMA and must not inherit the native-fp8 expectation from interp_prefill_fp8."
+  "gfx942 bf16 MFMA and must not inherit the native-fp8 expectation from interp_prefill_fp8.",
+  "",
+  "THE 16x16x16 ASSERTION IS ON THE MLA BODY, NOT ON THE INTERPRETER ENTRY POINT. Those MFMAs",
+  "come from d_flash_mla_prefill_v2, and whether the compiler inlines that body into",
+  "plow_interp_flash or emits it as its own symbol is an inliner cost decision that any",
+  "unrelated edit to op_attention.h can flip -- narrowing the FA_DBUF V walk from FA_DC to DCH",
+  "(the out-of-bounds fix for D < FA_DC) flipped it. Keying the mnemonic on the body follows",
+  "the code. Note the cost: asm_audit's patterns are substring matches and an entry that",
+  "matches no kernel does not fail, so if a later compiler inlines the body again this row",
+  "stops asserting the shape and has to be re-homed onto plow_interp_flash."
  ],
  "interp_flash_fp8kv": {
   "plow_interp_flash": {
    "require_min": {
-    "v_mfma_f32_16x16x16_bf16": 1,
     "v_perm_b32": 1
    },
    "no_scratch": true,
+   "forbid": [
+    "v_mfma_f32_32x32x64_f8f6f4",
+    "v_mfma_scale_f32_32x32x64_f8f6f4"
+   ]
+  },
+  "d_flash_mla_prefill_v2": {
+   "require_min": {
+    "v_mfma_f32_16x16x16_bf16": 1
+   },
    "forbid": [
     "v_mfma_f32_32x32x64_f8f6f4",
     "v_mfma_scale_f32_32x32x64_f8f6f4"

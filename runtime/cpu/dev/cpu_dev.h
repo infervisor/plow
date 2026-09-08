@@ -19,6 +19,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "dev_isa.h"
+#include "token_batch.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -84,6 +85,40 @@ plow_cpu_kernel_fn plow_cpu_kernel(uint16_t op);
 /* Convenience dispatch (lookup + call). 0 on success, -1 if `op` has no kernel. */
 int plow_cpu_exec(const PlowDevInst* in, uint32_t slice, uint32_t nblk, void* const* tensors,
                   PlowCpuCtx* ctx);
+
+/* --- Unified token batch: the host twin of the shared row resolver ----------------
+ *
+ * `runtime/common/token_batch.h` is the ONE resolver; HIP and CUDA compile it as device code
+ * and trap, the host compiles the same source and reports. These wrappers are the C entry
+ * point the Rust runtime and the CPU interpreter use, and the Rust twin in
+ * `crates/plow-asset/src/token_batch.rs` is checked against them over identical span tables.
+ *
+ * The device row struct holds a POINTER to its span, which does not survive the FFI boundary,
+ * so the flat form reports the span's INDEX instead. `PLOW_TB_SPAN_NONE` is a padding row. */
+#define PLOW_TB_SPAN_NONE 0xFFFFFFFFu
+
+typedef struct {
+    uint32_t span;       /* index into tb->spans, PLOW_TB_SPAN_NONE for a padding row */
+    uint32_t local_row;
+    uint32_t slot;
+    uint32_t state_slot;
+    uint32_t position;
+    uint32_t active;
+} PlowTokenRowFlat;
+
+/* PLOW_TB_OK, or the PLOW_TB_E_* code naming the invariant that failed. Run this BEFORE any
+ * launch: a malformed table must be refused on the host, not trapped on the device. */
+int plow_token_batch_validate_host(const PlowTokenBatch* tb);
+
+/* Resolve one packed row. Validates first, so the return code names the fault rather than
+ * aborting; `out` is written only on PLOW_TB_OK. */
+int plow_token_row_host(const PlowTokenBatch* tb, uint32_t row, PlowTokenRowFlat* out);
+
+/* The `s`-th selected hidden row, as an index into the body's rows. */
+int plow_token_sample_row_host(const PlowTokenBatch* tb, uint32_t s, uint32_t* out);
+
+/* PLOW_TOKEN_BATCH_VERSION as this library was compiled against it. */
+uint32_t plow_token_batch_descriptor_version(void);
 
 /* --- Weight prepack (load time, off the hot path) ------------------------------- */
 

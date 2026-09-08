@@ -18,13 +18,18 @@ fn main() {
 
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
     let mut args = std::env::args().skip(1);
-    let blob: PathBuf = args.next().expect("usage: cpu_chat <model.pkt> <checkpoint-dir>").into();
-    let ckpt: PathBuf = args.next().expect("usage: cpu_chat <model.pkt> <checkpoint-dir>").into();
+    let blob: PathBuf = args
+        .next()
+        .expect("usage: cpu_chat <model.pkt> <checkpoint-dir>")
+        .into();
+    let ckpt: PathBuf = args
+        .next()
+        .expect("usage: cpu_chat <model.pkt> <checkpoint-dir>")
+        .into();
     let mut n_tokens = 16usize;
     let mut opts = CpuEngineOpts::default();
     let mut prompt = String::from("The capital of France is");
@@ -41,7 +46,9 @@ fn main() {
                 }
             }
             "--prompt" => prompt = args.next().unwrap(),
-            "--prompt-file" => prompt = std::fs::read_to_string(args.next().unwrap()).expect("prompt file"),
+            "--prompt-file" => {
+                prompt = std::fs::read_to_string(args.next().unwrap()).expect("prompt file")
+            }
             // Gemma-4 chat template (chat_template.jinja, thinking off): `<|turn>` 105 / `<turn|>` 106 /
             // `<|channel>` 100 / `<channel|>` 101 are single added tokens; the generation prompt opens
             // an EMPTY thought channel exactly as HF's apply_chat_template does. (`<start_of_turn>`
@@ -67,7 +74,11 @@ fn main() {
     }
 
     let tok = load_tokenizer(&ckpt);
-    assert!(!tok.is_byte_fallback(), "no tokenizer.json in {}", ckpt.display());
+    assert!(
+        !tok.is_byte_fallback(),
+        "no tokenizer.json in {}",
+        ckpt.display()
+    );
     let ids = tok.encode_with_special_tokens(&prompt, true);
     println!("prompt: {prompt:?} -> {} tokens {:?}", ids.len(), ids);
 

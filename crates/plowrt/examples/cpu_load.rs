@@ -10,13 +10,18 @@ fn main() {
 
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
     let mut args = std::env::args().skip(1);
-    let blob: PathBuf = args.next().expect("usage: cpu_load <model.pkt> <checkpoint-dir>").into();
-    let ckpt: PathBuf = args.next().expect("usage: cpu_load <model.pkt> <checkpoint-dir>").into();
+    let blob: PathBuf = args
+        .next()
+        .expect("usage: cpu_load <model.pkt> <checkpoint-dir>")
+        .into();
+    let ckpt: PathBuf = args
+        .next()
+        .expect("usage: cpu_load <model.pkt> <checkpoint-dir>")
+        .into();
 
     let isa = ffi::init(ffi::Isa::Amx).expect("cpu kernel init");
     println!("kernel tier: {isa:?}");
@@ -46,12 +51,19 @@ fn main() {
         m.wk.ids, m.wk.pos, m.wk.kvlen, m.wk.logits
     );
     // Which tier each op actually resolved to — a golden entry on a hot op is a perf bug.
-    let mut ops: Vec<u16> = m.blob.progs.iter().flat_map(|p| p.insts.iter().map(|d| d.op)).collect();
+    let mut ops: Vec<u16> = m
+        .blob
+        .progs
+        .iter()
+        .flat_map(|p| p.insts.iter().map(|d| d.op))
+        .collect();
     ops.sort_unstable();
     ops.dedup();
     println!("kernel tiers:");
     for op in ops {
-        let name = packet::dev::DevOp::from_u16(op).map(|o| o.c_name()).unwrap_or("?");
+        let name = packet::dev::DevOp::from_u16(op)
+            .map(|o| o.c_name())
+            .unwrap_or("?");
         println!("  {:>4} {:<32} {:?}", op, name, ffi::tier_of(op));
     }
 }

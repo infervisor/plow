@@ -115,7 +115,7 @@ impl KdaCfg {
     ///
     /// f32 is settled from the reference implementation, not from prose. AMD's day-0 post says
     /// "FP32 KDA SSM states" but its own formula uses 2 bytes per element
-    /// (`docs/amd/kimi-k3-atom-day0.md` §4), so the two halves of that document disagree.
+    /// (`docs/amd/kimi-k3-mi325x.md` Appendix A §4), so the two halves of that document disagree.
     /// `fla/ops/kda/fused_recurrent.py` allocates `dtype=torch.float32` in both layout branches
     /// and accumulates in `tl.float32`; `naive_recurrent_kda` casts every input to `torch.float`;
     /// vLLM's `mamba_utils.py` hardcodes fp32 independently. The state is a running accumulator

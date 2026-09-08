@@ -407,3 +407,88 @@ pub(crate) fn place_lm_head_row(
     insts[lm].i[4] = row;
     Some(lm)
 }
+
+/// KV rows one MLA flash step stages (`op_attention.h` `FA_BKV`) — the tile a
+/// split divides. A split covering no whole tile writes `-inf` and is pure
+/// overhead, so the split count never exceeds the tile count.
+const MLA_FA_BKV: u32 = 32;
+/// Latent bytes per split at which the decode saving stops beating the
+/// `O(nsplit)` merge growth. Mirrors `devgen::mla::glm_nsplit`'s `NS_PER`.
+const MLA_NS_PER: u32 = 256;
+/// Split floor — below it the fixed decode overhead already dominates. Mirrors
+/// `devgen::mla::glm_nsplit`'s `NS_FLOOR`.
+const MLA_NS_FLOOR: u32 = 16;
+
+/// The MLA flash-decode KV-split count for a LIVE `kv_len`, given the count the
+/// emitter baked for its `max_ctx`.
+///
+/// `devgen::mla::glm_nsplit` picks `nsplit` from the EMIT-TIME `max_ctx`, so one
+/// blob runs one split count across every context it serves — a 32768-max-ctx
+/// server blob runs `ns=64` at live 1024, where the measured chain optimum is 16
+/// (81.1 us/layer against 61.1, +33%). The kernel takes `nsplit` as a plain
+/// runtime argument (`d_flash_mla_decode`'s `n_work = n_batch*n_tok*n_grp*nsplit`,
+/// grid-strided from `slice` by `nblk`), so a smaller split count simply leaves
+/// the tail workgroups with no work item — no dispatch, buffer or counter change.
+///
+/// This reproduces `glm_nsplit`'s ctx-scaled term and its floor, and takes the
+/// baked value as the CEILING rather than recomputing the chip-fill cap, the
+/// measured `NS_CEIL` and the TP head shard: all three are already folded into
+/// what the emitter wrote, and clamping to it means the live value can only ever
+/// go DOWN. At `kv_len == max_ctx` it returns the baked value exactly, so the
+/// top of the served range is byte-for-byte the shipped dispatch.
+///
+/// NOT bit-identical across split counts: the partials are merged in split
+/// order, so a different partition reassociates the online-softmax sum. The
+/// value is a policy choice at every context, and the emitted one is equally
+/// arbitrary below `max_ctx`.
+pub(crate) fn mla_live_nsplit(baked: u32, kv_len: u32) -> u32 {
+    let tiles = kv_len.div_ceil(MLA_FA_BKV).max(1);
+    (kv_len / MLA_NS_PER)
+        .max(MLA_NS_FLOOR)
+        .min(tiles)
+        .max(1)
+        .min(baked.max(1))
+}
+
+/// The decode program's MLA split sites — every instruction whose `i[4]` is the
+/// KV-split count — and the count the emitter baked into them.
+///
+/// The flash and its merge MUST agree: the partials are laid out
+/// `[b][t][head][nsplit][DK]`, so `d_mla_merge_fold` strides by the same
+/// `nsplit` the flash wrote with. Both fields therefore move together or not at
+/// all, which is why this returns ONE list rather than two.
+///
+/// Returns `None` — leaving the baked value in place — when the program is not a
+/// plain dense MLA decode:
+///
+/// * a `FlashGatherDecode` site is present (the DSA arm splits over the SELECTED
+///   rows, `min(top_k, kv_len)`, not the KV window, so the live rule below is the
+///   wrong function for it);
+/// * the flash and merge site counts differ, or the sites do not all carry the
+///   same baked count (nothing in the emitter produces that, and a partial patch
+///   would desynchronise a flash/merge pair);
+/// * there are no MLA flash sites at all.
+pub(crate) fn derive_mla_nsplit(insts: &[DevInst64]) -> Option<(Vec<u32>, u32)> {
+    let gather = DevOp::FlashGatherDecode as u16;
+    let flash = [DevOp::FlashMlaDecode as u16, DevOp::FlashMlaDecodeFp8 as u16];
+    let merge = DevOp::MlaMergeFold as u16;
+    let (mut sites, mut baked, mut n_flash, mut n_merge) = (Vec::new(), None, 0usize, 0usize);
+    for (k, d) in insts.iter().enumerate() {
+        if d.op == gather {
+            return None;
+        }
+        if !flash.contains(&d.op) && d.op != merge {
+            continue;
+        }
+        if d.op == merge {
+            n_merge += 1;
+        } else {
+            n_flash += 1;
+        }
+        if *baked.get_or_insert(d.i[4]) != d.i[4] {
+            return None;
+        }
+        sites.push(k as u32);
+    }
+    (n_flash > 0 && n_flash == n_merge).then_some((sites, baked?))
+}

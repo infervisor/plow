@@ -7,6 +7,7 @@
 //! ignored and missing fields fall back to architecture defaults.
 
 mod deepseek;
+mod deepseek_v4;
 mod gemma;
 mod gemma4_multimodal;
 mod glm;
@@ -21,6 +22,9 @@ mod qwen_vl;
 mod siglip;
 
 pub use deepseek::DeepSeekConfig;
+pub use deepseek_v4::{
+    DeepSeekV4Config, DeepSeekV4QuantizationConfig, DeepSeekV4RopeScaling, V4Attn, MXFP4_GROUP,
+};
 pub use gemma::{GemmaConfig, RopeParameters, RopeSpec};
 pub use gemma4_multimodal::{Gemma4MultimodalConfig, MmProjectorConfig};
 pub use glm::GlmConfig;
@@ -64,6 +68,10 @@ pub enum ModelConfig {
     /// Qwen3.5/Qwen3.8 hybrid full-attention + gated-delta text decoder.
     Qwen35(Qwen35Config),
     DeepSeek(DeepSeekConfig),
+    /// DeepSeek-V4-Flash: CSA/indexed hybrid attention, mHC residuals, MQA at a
+    /// 512-wide latent, a grouped output LoRA, MXFP4 routed experts beside
+    /// block-FP8 projections, and an attached DSpark speculative module.
+    DeepSeekV4(DeepSeekV4Config),
     Siglip(SiglipConfig),
     QwenVl(QwenVlVisionConfig),
     QwenImageDit(QwenImageDitConfig),
@@ -177,12 +185,7 @@ impl ModelConfig {
             }
             "qwen3_5_text" => parse_qwen35(v),
             "deepseek" | "deepseek_v2" | "deepseek_v3" => parse_deepseek(v),
-            "deepseek_v4" => Err(ConfigError::Unsupported(
-                "deepseek_v4 (CSA/HCA hybrid attention, mHC residuals, mixed FP4/FP8 \
-                 experts, and the attached DSpark speculative module are not implemented; \
-                 refusing DeepSeek-V3 MLA fallback)"
-                    .to_string(),
-            )),
+            "deepseek_v4" => parse_deepseek_v4(v),
             "muse_glimmer" | "muse_glimmer_text" | "muse_glimmer_vision" => {
                 Err(ConfigError::Unsupported(
                     "muse_glimmer (Muse Glimmer text uses alternating sliding/NoPE attention, \
@@ -250,6 +253,16 @@ fn parse_qwen35(v: serde_json::Value) -> Result<ModelConfig, ConfigError> {
     Ok(ModelConfig::Qwen35(cfg))
 }
 
+/// DeepSeek-V4 parses and validates; the refusal moved to the emit path
+/// ([`crate::models::build_graph`]), where [`DeepSeekV4Config::unimplemented`]
+/// lists exactly which pieces are missing. Parsing here is what makes that list
+/// derivable from the checkpoint's own numbers instead of a fixed sentence.
+fn parse_deepseek_v4(v: serde_json::Value) -> Result<ModelConfig, ConfigError> {
+    let cfg: DeepSeekV4Config = serde_json::from_value(v)?;
+    cfg.validate()?;
+    Ok(ModelConfig::DeepSeekV4(cfg))
+}
+
 fn parse_deepseek(v: serde_json::Value) -> Result<ModelConfig, ConfigError> {
     let cfg: DeepSeekConfig = serde_json::from_value(v)?;
     cfg.validate().map_err(ConfigError::Unsupported)?;
@@ -274,6 +287,7 @@ fn model_type(v: &serde_json::Value) -> Option<String> {
         .and_then(|a| a.as_str())?;
     let mapped = match arch {
         a if a.starts_with("Gemma") => "gemma3",
+        a if a.starts_with("DeepseekV4") => "deepseek_v4",
         a if a.starts_with("DeepseekV3") || a.starts_with("DeepseekV2") => "deepseek_v3",
         a if a.starts_with("GlmMoeDsa") || a.starts_with("Glm") => "glm_moe_dsa",
         // `KimiLinear*` is Kimi-K3, NOT K2, and the two share almost no

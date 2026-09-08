@@ -20,11 +20,13 @@
 # .elf stems carry no arch and a shared directory lets a gfx950 object be handed
 # to an MI300X. Point plowrt at it with PLOW_HSACO=<dir>.
 #
-# Measured on ROCm 7.14 / clang-23, all rows within the cliff:
-#   interp_decode          VGPR 253  AGPR   0  LDS 64,520  spill  0   occ 2
-#   interp_prefill         VGPR 256  AGPR   0  LDS 64,520  spill  6   occ 2
-#   interp_flash           VGPR 512  AGPR 256  LDS 58,368  spill 98   occ 1
-#   interp_prefill_mla_moe VGPR 256  AGPR   0  LDS 64,520  spill  6   occ 2
+# THE RESOURCE TABLE IS NO LONGER A COMMENT HERE. It used to be four hand-maintained lines
+# claiming interp_prefill "spill 6", and it was stale by two orders of magnitude: the note says
+# 126 and the ISA says 1799 scratch ops across the object, 1588 of them in outlined bodies that
+# `.vgpr_spill_count` cannot see at all. A table nobody diffs goes stale; the table now lives in
+# scripts/obj_baseline_gfx942.json, is DERIVED from each object's own ELF, is asserted on every
+# build by `asm_audit.py --contract` at the bottom of this script, and is re-blessed explicitly
+# (--bless) so a change to it lands in a commit.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -58,6 +60,18 @@ case "$HIP_VERSION" in
   *) echo "FAIL: expected HIP 7.14 from the flake" >&2; exit 2 ;;
 esac
 INC="-I$R/amd -I$R/common"
+# F5 DEBUG BUILD (`PLOW_NORM_RANGE_CHECK=1`, optionally `PLOW_NORM_SS_MAX=1e12f`): arm op_norm.h's
+# sum-of-squares assertion. It goes on the INCLUDE line, not into an AX_* set, because it has to
+# reach EVERY row -- GM_AX lands only on the GEMM-tile rows, and the point of a range campaign is
+# that no norm anywhere escapes it. NOT A SHIPPING CONFIGURATION: the objects trap on violation,
+# they are not bit-identical to the default build (measured +61 instructions in `d_rmsnorm`, ~9%
+# on a decode norm), and the object contract at the bottom of this script will report the drift.
+# See op_norm.h for the contract and the measured margins that keep it off by default.
+if [ -n "${PLOW_NORM_RANGE_CHECK:-}" ]; then
+  INC="$INC -DPLOW_NORM_RANGE_CHECK=$PLOW_NORM_RANGE_CHECK"
+  [ -n "${PLOW_NORM_SS_MAX:-}" ] && INC="$INC -DPLOW_NORM_SS_MAX=$PLOW_NORM_SS_MAX"
+  echo "   !! NORM RANGE CHECK ARMED (debug build, not shippable): ${INC#*-I$R/common }"
+fi
 JOBS="${JOBS:-8}"
 mkdir -p "$OUT"; cd "$OUT"
 
@@ -69,7 +83,10 @@ mkdir -p "$OUT"; cd "$OUT"
 # see op_gemm.h's GM_DBUF note), so the ping-pong stays OFF on CDNA3. Forcing the
 # tile from outside would silently override the header's defaults; the flags stay
 # only as an A/B escape hatch.
-CDNA3_TILE="-DPLOW_WG_WAVES=8${GM_BM:+ -DGM_BM=$GM_BM}${GM_BN:+ -DGM_BN=$GM_BN}${GM_BK:+ -DGM_BK=$GM_BK}${GM_DBUF:+ -DGM_DBUF=$GM_DBUF}"
+# GM_AX is the same escape hatch one level down: raw -D for the per-rung geometry and schedule
+# knobs op_gemm.h `#ifndef`-guards (GM_SM_BK, GM_MD_*, GM_PGR2, GM_PLR, GM_PRIO). They have no
+# dedicated variable because there are a dozen of them and each is an A/B, not a policy.
+CDNA3_TILE="-DPLOW_WG_WAVES=8${GM_BM:+ -DGM_BM=$GM_BM}${GM_BN:+ -DGM_BN=$GM_BN}${GM_BK:+ -DGM_BK=$GM_BK}${GM_DBUF:+ -DGM_DBUF=$GM_DBUF}${GM_AX:+ $GM_AX}"
 # The 4-wave flash object: GM_WN=2 there, so the wave-grid assert is satisfied at
 # BN=128 and the smaller tile leaves room for the 58,368 B flash arena.
 CDNA3_TILE_4W="-DGM_BM=64 -DGM_BN=128${GM_DBUF:+ -DGM_DBUF=$GM_DBUF}"
@@ -87,7 +104,7 @@ CDNA3_TILE_4W="-DGM_BM=64 -DGM_BN=128${GM_DBUF:+ -DGM_DBUF=$GM_DBUF}"
 # Folding them in is only affordable because both halves are free at the cliff
 # (measured, and re-checked by the table this script prints).
 AX_GMOE="-DPLOW_MOE_GEMMA=1 -DPLOW_MOE_GEMMA_PF=1"
-AX_PREFILL="-DPLOW_BUCKET_DECODE=0 $CDNA3_TILE $AX_GMOE"
+AX_PREFILL="-DPLOW_PACKED_PREFILL_DENSE_CONSUMERS=1 -DPLOW_BUCKET_DECODE=0 $CDNA3_TILE $AX_GMOE"
 # PLOW_GEMV_MM is next_pow2(PLOW_DECODE_BATCH) CLAMPED TO 16, not the batch itself. The GEMV
 # ladder instantiates MM in {1,2,4,8,16} and one instantiation with a runtime M serves every
 # M <= MM, so the bucket is a CEILING. Passing the raw batch through was a bug in this script:
@@ -101,8 +118,41 @@ if [ "$RAW_BATCH" -lt 1 ] || [ "$RAW_BATCH" -gt 128 ]; then
   echo "PLOW_DECODE_BATCH must be in 1..128, got $RAW_BATCH" >&2
   exit 1
 fi
+
+# PLOW_DECODE_TIER=<n>: THIS DECODE OBJECT IS A LOW-RUNG TIER and will only ever be handed
+# packets of at most n rows. plowrt's `PLOW_HSACO_LOWRUNG=<dir>:n` co-loads such an object and
+# runs its pairing checks with n, not with the blob's widest batch, so the GEMV bucket must
+# follow the TIER width here too. Everything else about the row is unchanged, which is the point:
+# the tier and the wide object differ in PLOW_GEMV_MM and in nothing else.
+#
+# WHY A TIER IS WORTH BUILDING. `PLOW_GEMV_MM` is a compiled CEILING and one instantiation serves
+# every M <= MM by predicating each activation row with `live = (m < M)` -- and then computing its
+# dot product anyway. On gfx942, which has no `v_dot2c_f32_bf16`, that discarded work is 24 VALU
+# operations per 16 bytes of weight per dead row, and the unroll is cut with it (GV_UNROLL_M4 = 6
+# against GV_UNROLL = 11). Measured on the Gemma-4 31B decode shapes
+# (runtime/bench/amd/gemma31_gemv_decode_bench.*, per-token totals over the T=4 instance counts):
+#
+#   compiled bucket / runtime rows      MM=1 M=1   MM=4 M=1   MM=4 M=2   MM=4 M=4
+#   plain-GEMV projection total, ms       15.43      26.04      26.77      27.49
+#
+# i.e. a batch-1 packet on the MM=4 object pays 1.69x for arithmetic it discards. A blob whose
+# decode ladder is 1/2/4 therefore wants three decode objects, not one.
+TIER="${PLOW_DECODE_TIER:-0}"
+case "$TIER" in
+  ''|*[!0-9]*) echo "PLOW_DECODE_TIER must be an integer" >&2; exit 1 ;;
+esac
+if [ "$TIER" -gt 0 ]; then
+  if [ "$TIER" -gt "$RAW_BATCH" ]; then
+    echo "REFUSING: PLOW_DECODE_TIER=$TIER exceeds PLOW_DECODE_BATCH=$RAW_BATCH." >&2
+    echo "  A tier serves a SUBSET of the ladder; widen the batch or narrow the tier." >&2
+    exit 1
+  fi
+  WIDTH="$TIER"
+else
+  WIDTH="$RAW_BATCH"
+fi
 P2=1
-while [ "$P2" -lt "$RAW_BATCH" ]; do P2=$((P2 * 2)); done
+while [ "$P2" -lt "$WIDTH" ]; do P2=$((P2 * 2)); done
 [ "$P2" -gt 16 ] && P2=16
 GVMM="$P2"
 
@@ -115,8 +165,8 @@ case "$WALK" in
   1) AX_GEMV_WALK="-DPLOW_GEMV_WALK=1" ;;
   *) echo "PLOW_GEMV_WALK must be 0 or 1" >&2; exit 1 ;;
 esac
-if [ "$RAW_BATCH" -gt 16 ] && [ "$WALK" != 1 ]; then
-  echo "REFUSING: PLOW_DECODE_BATCH=$RAW_BATCH requires PLOW_GEMV_WALK=1 above 16 rows." >&2
+if [ "$WIDTH" -gt 16 ] && [ "$WALK" != 1 ]; then
+  echo "REFUSING: decode width $WIDTH requires PLOW_GEMV_WALK=1 above 16 rows." >&2
   exit 1
 fi
 if [ -n "${PLOW_GEMV_MM:-}" ]; then
@@ -125,15 +175,15 @@ if [ -n "${PLOW_GEMV_MM:-}" ]; then
     1|2|4|8|16) ;;
     *) echo "PLOW_GEMV_MM must be one of 1,2,4,8,16" >&2; exit 1 ;;
   esac
-  if [ "$PLOW_GEMV_MM" -lt "$RAW_BATCH" ] && [ "$WALK" != 1 ]; then
-    echo "REFUSING: PLOW_GEMV_MM=$PLOW_GEMV_MM < batch $RAW_BATCH with PLOW_GEMV_WALK unset." >&2
+  if [ "$PLOW_GEMV_MM" -lt "$WIDTH" ] && [ "$WALK" != 1 ]; then
+    echo "REFUSING: PLOW_GEMV_MM=$PLOW_GEMV_MM < width $WIDTH with PLOW_GEMV_WALK unset." >&2
     echo "  Without the walk, gemv_rows<MM> writes rows 0..MM-1 and leaves the rest STALE." >&2
     exit 1
   fi
   GVMM="$PLOW_GEMV_MM"
 fi
 AX_DECODE="-DPLOW_BUCKET_DECODE=1 -DPLOW_GEMV_MM=$GVMM $AX_GEMV_WALK $CDNA3_TILE $AX_GMOE"
-echo "   decode GEMV batch bucket: PLOW_GEMV_MM=$GVMM walk=$WALK (PLOW_DECODE_BATCH=${PLOW_DECODE_BATCH:-1})"
+echo "   decode GEMV batch bucket: PLOW_GEMV_MM=$GVMM walk=$WALK (PLOW_DECODE_BATCH=${PLOW_DECODE_BATCH:-1} tier=${PLOW_DECODE_TIER:-0})"
 # OPT-IN (PLOW_GEMV_WALK=1): the §6g-WALK row-block outer loop — the object serves any M in
 # ceil(M/MM) passes of the compiled bucket, and the LDS staging bound becomes min(MM,M)*K.
 # REQUIRED for a PLOW_DECODE_BATCH>16 ladder (PLOW_GEMV_MAXM caps the bucket at 16; without
@@ -171,11 +221,47 @@ fi
 # symbol is REJECTED, and the rejection is an `info!` degrade ("no flash object
 # -- flash segments run on the 8-wave interpreter"), not an error. See the note
 # on AX_GMOE above for why that degrade is not benign.
-AX_FLASH="-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 $CDNA3_TILE_4W $AX_GMOE"
+AX_FLASH="-DPLOW_PACKED_PREFILL_DENSE_CONSUMERS=1 -DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 $CDNA3_TILE_4W $AX_GMOE"
 # V2 MLA prefill arm (d_flash_mla_prefill_v2): the full-column-wave layout that needs this
 # object's 512-register budget. Marker `plow_mla_pf_v2_arm_1`; the host routes FlashMlaPrefill
 # segments here only under PLOW_MLA_PF_V2=1, so carrying the arm costs Gemma nothing.
 AX_FLASH="$AX_FLASH -DPLOW_MLA_PF_V2_ARM=1"
+# The V2 MLA-prefill KV slab depth. 32 is shipped; 48 is the deepest that fits the 64 KiB
+# LDS budget (62,304 B against 83,040 B at 64) and pays the per-(query,tile) softmax
+# bookkeeping a third fewer times. FLASH OBJECT ONLY — the V2 body lives there.
+if [ -n "${FA_MLA_PF2_BKV:-}" ]; then
+  AX_FLASH="$AX_FLASH -DFA_MLA_PF2_BKV=$FA_MLA_PF2_BKV"
+fi
+# The V2 MLA prefill's DEFERRED-FRAME online softmax (op_attention.h FA_MLA_PF2_DEFER),
+# DEFAULT ON for CDNA3. The accumulator lives in an integer exponent frame instead of
+# tracking the running max, so the 128-mul 512-wide rescale and both quarter-wave reduces
+# leave the per-KV-tile path: the rescale rides on frame re-takes (a handful over the ~1000
+# tiles of a 32k row) and the l reduce happens once in the epilogue. FLASH OBJECT ONLY — the
+# V2 body lives there, behind PLOW_MLA_PF_V2_ARM, so no other object's register cliff moves.
+#
+# NOT BIT-IDENTICAL, which is what separates it from PLOW_MLA_PF_SV and PLOW_MLA_FOLD_TB
+# above: the exp arguments move by the frame offset, so greedy completions of a long prompt
+# eventually diverge on a near-tie and a character-identity gate CANNOT pass by construction.
+# It is gated instead on (a) mla_test's decode-oracle error, which stays in the shipped
+# body's class on all 16 shapes including the fp8 arm, and (b) long-context needle retrieval
+# and coherence at 8k/32k. Measured TTFT at TP4 (2 interleaved rounds, control spread 0.3%):
+# -2.0% @4k, -3.2% @8k, -4.8% @16k, -7.1% @32k; the fitted T^2 (attention) coefficient falls
+# 12.5% while the linear coefficient moves 0.3%. See docs/amd/glm53-longctx-and-throughput.md
+# section 7. FA_MLA_PF2_DEFER=0 restores the shipped running-max form for A/B.
+if [ -n "${FA_MLA_PF2_DEFER:-}" ]; then
+  AX_FLASH="$AX_FLASH -DFA_MLA_PF2_DEFER=$FA_MLA_PF2_DEFER"
+fi
+# Log2 headroom the re-taken frame keeps above the row max (default 8). Larger = rarer
+# re-takes, at the cost of dynamic range below the max.
+if [ -n "${FA_MLA_PF2_FRAME:-}" ]; then
+  AX_FLASH="$AX_FLASH -DFA_MLA_PF2_FRAME=$FA_MLA_PF2_FRAME"
+fi
+# The frame arm's NaN-free f32->bf16 for the P strip (default on; only reachable under
+# FA_MLA_PF2_DEFER, where p is provably in [0,1] and f2bf's guard is dead code). Worth
+# another -1.0% at 32k on top of the frame, and value-identical over that domain.
+if [ -n "${FA_MLA_PF2_FASTBF:-}" ]; then
+  AX_FLASH="$AX_FLASH -DFA_MLA_PF2_FASTBF=$FA_MLA_PF2_FASTBF"
+fi
 # Small K3 buckets remain L2-placed while machine-filling V2 buckets use wave segments.
 # The dispatch arm is inert when `l2_domains == 0`, so one object safely serves both forms.
 AX_FLASH="$AX_FLASH -DPLOW_L2_PLACE_DISPATCH=1"
@@ -186,6 +272,20 @@ AX_FLASH="$AX_FLASH -DPLOW_L2_PLACE_DISPATCH=1"
 # 4-wave flash object has the 512-reg budget. Default OFF.
 if [ "${PLOW_FA_LAZY:-0}" = 1 ]; then
   AX_FLASH="$AX_FLASH -DFA_LAZY_RESCALE=1"
+fi
+# DPP/swizzle half-wave reductions (PLOW_FA_RED_DPP, default ON) and the interior-tile mask
+# skip (PLOW_FA_FASTMASK, default ON). Both are bit-identical and both are FLASH-OBJECT ONLY
+# for the same register-cliff reason as PLOW_FA_LAZY above: the 8-wave prefill/decode rows hold
+# 256 registers and are not re-qualified here. Measured on d_flash_prefill<256>, one KV tile:
+# 1651 -> 1584 instructions, ds_bpermute 160 -> 64 ds_swizzle, s_waitcnt 163 -> 91, and
+# d_flash_prefill<512> scratch spill 47 -> 10 B. Gemma-4 31B cold-prefill TTFT -0.6/-2.0/-3.5%
+# at 128/1024/4096 tokens with identical greedy output; docs/amd/gemma4-31b-mi300x.md.
+[ "${PLOW_FA_RED_DPP:-1}" = 0 ] || AX_FLASH="$AX_FLASH -DPLOW_WAVE_RED_DPP=1"
+[ "${PLOW_FA_FASTMASK:-1}" = 0 ] || AX_FLASH="$AX_FLASH -DFA_FASTMASK=1"
+# OPT-IN (PLOW_FA_HEAD_MAJOR=1): head-slowest prefill work order, for the KV-window/L2 study.
+# Measured and a small loss (op_attention.h FA_HEAD_MAJOR); kept as the arm that prices it.
+if [ "${PLOW_FA_HEAD_MAJOR:-0}" = 1 ]; then
+  AX_FLASH="$AX_FLASH -DFA_HEAD_MAJOR=1"
 fi
 AX_FP8="-DPLOW_FP8=1"
 AX_FP8KV="-DPLOW_FP8_KV=1"
@@ -340,8 +440,16 @@ fi
 # the decode program's segments are then gated by two different protocols and the run deadlocks.
 # The measurement above was taken with the flag on the DECODE object alone, so that is where it
 # goes. Do not widen this without re-running the hang test.
+AX_DECODE_GQ=""
 if [ "${PLOW_L2HIER:-1}" = 1 ]; then
-  AX_DECODE="$AX_DECODE -DPLOW_L2_PLACE_DISPATCH=1 -DPLOW_GATE_HIER=1"
+  AX_DECODE="$AX_DECODE -DPLOW_L2_PLACE_DISPATCH=1"
+  # A/B ARM (PLOW_GATE_HIER=0): placement WITHOUT the two-level rendezvous. The table above
+  # prices the two together and the pair only activates on an L2-PLACED blob, so until that
+  # blob existed on this model there was no way to ask which half pays. Placement's half is
+  # locality (a consumer reads its producer out of its own XCD's L2, and it lands in the op
+  # BODIES); the hierarchy's half is the per-workgroup wbl2/inv at the gate. Objects with the
+  # define off are byte-identical to a build from before it existed.
+  [ "${PLOW_GATE_HIER:-1}" = 0 ] || AX_DECODE_GQ="-DPLOW_GATE_HIER=1"
 fi
 
 # OPT-IN (PLOW_GLM_GF8=1): compile the GF=8 MLA flash-decode arm so PLOW_GLM_GF=4-vs-8
@@ -376,15 +484,30 @@ if [ "${PLOW_GLM_FUSE_QNORM:-1}" = 1 ]; then
   AX_DECODE="$AX_DECODE -DPLOW_GLM_FUSE_QNORM=1"
 fi
 
-# OPT-IN (PLOW_L2HIER_PF=1): the same pair on the PREFILL objects, for blobs whose
-# prefill program is PLACED (GLM: uni-segment prefill, one object per program run, so
-# the mixed-protocol deadlock above cannot arise -- that hang needed one placed
-# program's segments split across objects with and without the define). On an
-# UNPLACED blob the define is inert (GATE_HIER's runtime precondition is
-# l2_domains != 0). Still: re-run the hang test (amd-bench --prompt at 2-4k completes
-# in normal wall time) before trusting any build that widens this.
+# OPT-IN (PLOW_L2HIER_PF=1): L2-DOMAIN DISPATCH ON THE PREFILL ROWS, for blobs emitted with
+# PLOW_L2_PLACE_PREFILL=1 (which is NOT the AMD default -- see crates/devgen/src/lib.rs).
+# Without this the prefill objects lack the axis and plowrt refuses a prefill-placed blob. The
+# FLASH rows already carry it unconditionally (AX_FLASH above), which is why Gemma's split
+# prefill program only needs this one knob.
+#
+# PLACEMENT ONLY, and that is a hard limit rather than caution. This block used to add
+# `-DPLOW_GATE_HIER=1` as well, and an object built that way DOES NOT COMPILE: the guard at the
+# top of interp.hip is
+#     #if PLOW_GATE_HIER && (!PLOW_BUCKET_DECODE || !PLOW_GLOBAL_QUEUE || !PLOW_L2_PLACE_DISPATCH)
+#     #error "PLOW_GATE_HIER requires a decode global-queue object with L2-domain dispatch"
+# and AX_PREFILL carries -DPLOW_BUCKET_DECODE=0. Verified by compiling the row by hand: one
+# error, no object. plowrt's `check_gate_hier_object` refuses the same pairing a second time at
+# load. So the two-level gate is DECODE-ONLY by construction, and the hierarchy half of
+# "PLOW_L2HIER_PF" was never buildable; what remains here is the placement half.
+#
+# MEASURED AND NOT DEFAULTED. With these objects a prefill-placed Gemma-4-31B blob (dense, whose
+# prefill program spans the prefill AND flash objects -- the shape recorded above as hanging
+# amd-bench) runs to completion in normal wall time and moves TTFT -1.4/-2.1/-6.2% at 128/2048/8192
+# tokens solo, with one reproducible +3.2% at 2048/conc-4 and decode untouched. Left opt-in for
+# blast radius, not for the number: it makes every prefill object in a tree incompatible with a
+# default emit. docs/amd/gemma4-31b-mi300x.md has the table.
 if [ "${PLOW_L2HIER_PF:-0}" = 1 ]; then
-  AX_PREFILL="$AX_PREFILL -DPLOW_L2_PLACE_DISPATCH=1 -DPLOW_GATE_HIER=1"
+  AX_PREFILL="$AX_PREFILL -DPLOW_L2_PLACE_DISPATCH=1"
 fi
 
 # OPT-IN (PLOW_MLA_PF_QK1=1): MLA prefill computes QK^T + softmax on ONE wave per M-tile
@@ -398,6 +521,26 @@ fi
 # A sparse blob loaded against an object built WITHOUT this reads no t7 and runs dense.
 if [ "${PLOW_DSA_PF:-0}" = 1 ]; then
   AX_FLASH="$AX_FLASH -DPLOW_DSA_PF_ARM=1"
+fi
+
+# OPT-IN (PLOW_MLA_PF_NOPE=1): the DR=0 arm of the V2 MLA prefill -- DeepSeek-V4-Flash's
+# geometry, where the rope strip lives inside the cached 512-wide row so QK and PV both run
+# over the full 512 and there is no Krope cache. FLASH OBJECT ONLY, and opt-in for the same
+# reason PLOW_DSA_PF is: the megakernel inlines every arm and its register allocation is the
+# worst case over all of them, so two more full-column-wave bodies must not be forced on the
+# GLM / V3 blobs that never emit a NoPE packet. Without it the NoPE bit still TRAPS, so a
+# blob that needs the arm and an object that lacks it is a hard stop, not a wrong answer.
+if [ "${PLOW_MLA_PF_NOPE:-0}" = 1 ]; then
+  AX_FLASH="$AX_FLASH -DPLOW_MLA_PF_NOPE_ARM=1"
+fi
+
+# OPT-IN (PLOW_DSA_IDX64=1): the 64-index-head arm of the DSA prefill indexer score (op 117).
+# GLM-5.3 has 32 index heads and DeepSeek-V4 has 64; the 32x32 MFMA A-tile's M axis IS the head
+# axis, so 64 is a second head group and a second live query fragment set. PREFILL OBJECT ONLY,
+# opt-in so the GLM blobs that never emit a 64-head packet do not pay the registers. Without it
+# a 64-head packet TRAPS rather than being scored against half its heads.
+if [ "${PLOW_DSA_IDX64:-0}" = 1 ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_DSA_IDX64_ARM=1"
 fi
 
 if [ "${PLOW_MLA_PF_QK1:-0}" = 1 ]; then
@@ -635,6 +778,15 @@ fi
 # is only reached when the packet arms i[5]); a new blob on a PRE-ARM object is a LOUD refusal.
 if [ "${PLOW_MOE_PF_DET:-1}" != 0 ]; then
   AX_PREFILL="$AX_PREFILL -DPLOW_MOE_PF_DET=${PLOW_MOE_PF_DET:-1}"
+  # THE DECODE ROW NEEDS IT TOO ONCE A DECODE BATCH IS COMPILED IN, for exactly the reason
+  # $AX_MOE is added to $AX_DECODE above: at rows>1 the GLM decode program emits its MoE seam
+  # with the grouped PREFILL family (ops 83-87), so op 86/87's deterministic arm is reached from
+  # the DECODE object. Without this a blob emitted PLOW_MOE_PF_DET=1 is refused at load —
+  # "requires PLOW_MOE_PF_DET=1 but the DECODE object was built WITHOUT it" — which is what a
+  # GLM-5.3 TP4 serve did here on its first attempt.
+  if [ "${PLOW_DECODE_BATCH:-1}" -gt 1 ]; then
+    AX_DECODE="$AX_DECODE -DPLOW_MOE_PF_DET=${PLOW_MOE_PF_DET:-1}"
+  fi
 fi
 
 # CEILING INSTRUMENT ONLY (PLOW_MLA_PF2_ABL=1..4): the V2 MLA prefill's ablation probes —
@@ -824,6 +976,28 @@ if [ "${PLOW_GEMV_LG:-1}" = 1 ]; then
   AX_DECODE="$AX_DECODE -DPLOW_GEMV_LG=1${PLOW_GEMV_LG_RG:+ -DPLOW_GEMV_LG_RG=$PLOW_GEMV_LG_RG}${PLOW_GEMV_LG_UNR:+ -DPLOW_GEMV_LG_UNR=$PLOW_GEMV_LG_UNR}"
 fi
 
+# DEFAULT OFF, AND IT MUST STAY OFF UNTIL A MODEL OWNER SAYS OTHERWISE (PLOW_GEMV_MFMA4=1):
+# the BATCHED bf16 decode GEMV runs on the matrix core -- `gemv_rows_mfma4` (op_gemm.h), the
+# 4x4x4 bf16 diagonal arrangement vLLM 0.28's `wvSplitK_hf_sml_` uses, with the shipped memory
+# pattern unchanged (one wave owns one output row, 64 lanes read 1024 contiguous bytes of it
+# through one buffer descriptor).
+#
+# THIS FLAG REDEFINES PLOW'S DECODE REFERENCE ARITHMETIC. `gemv_rows` reduces a column as a
+# per-lane chain of `dot8(w, x, 0.0f)` -- four nested fma pairs -- then an xor-butterfly
+# `wave_sum`. Every MFMA on gfx942 reduces >= 4 products in hardware order inside ONE
+# instruction, so no MFMA arrangement reproduces that nesting; bit identity is impossible by
+# construction and every decode golden in the tree moves. That is why this is a build flag and
+# not a measured default: it is a model-owner decision, not a performance one.
+#
+# WHAT IT BUYS, and it is only at BATCH > 1 (gemma31_mfma_decode_bench, Gemma-4 31B BF16 TP1
+# shapes, per-token ms over the T=4 instance counts): MM=2 19.007 -> 15.039, MM=4 27.832 ->
+# 16.388 (1.70x), MM=8 61.599 -> 41.844. MM=1 is 1.05x and the arm REFUSES it (see the
+# `MM >= 2` guard in d_gemv_t), so a concurrency-1 tier keeps the shipped bit-identical body
+# and turning this on cannot perturb a batch-1 sequence.
+if [ "${PLOW_GEMV_MFMA4:-0}" = 1 ]; then
+  AX_DECODE="$AX_DECODE -DGV_MFMA4=1${PLOW_GEMV_MFMA4_UN_M4:+ -DGV_MFMA4_UN_M4=$PLOW_GEMV_MFMA4_UN_M4}${PLOW_GEMV_MFMA4_YT_M4:+ -DGV_MFMA4_YT_M4=$PLOW_GEMV_MFMA4_YT_M4}${PLOW_GEMV_MFMA4_UN_M2:+ -DGV_MFMA4_UN_M2=$PLOW_GEMV_MFMA4_UN_M2}${PLOW_GEMV_MFMA4_YT_M2:+ -DGV_MFMA4_YT_M2=$PLOW_GEMV_MFMA4_YT_M2}"
+fi
+
 # CEILING INSTRUMENT ONLY (PLOW_MOE_DEC_ABL=1|2): the block-fp8 decode expert DOWN with its body
 # deleted — 1 keeps the walk and the store and drops every load + the dot, 2 retires the op. WRONG
 # OUTPUT by construction; this prices what the packet costs when the kernel costs nothing, and must
@@ -832,6 +1006,35 @@ if [ "${PLOW_MOE_DEC_ABL:-0}" != 0 ]; then
   AX_DECODE="$AX_DECODE -DPLOW_MOE_DEC_ABL=${PLOW_MOE_DEC_ABL}"
 fi
 
+# PACKED-PREFILL OPERATOR-FAMILY OBJECTS (PLOW_PACKED_PREFILL_CONSUMERS=1, default off).
+#
+# These are the three LEAN objects `PLOW_PACKED_PREFILL_ROUTE=1` opens by literal name
+# (exec/amd.rs `load_packed_family`). gfx942 never built them: the gfx950 side gets them from
+# runtime/CMakeLists.txt behind PLOW_HSACO_PACKED_PREFILL_CONSUMERS (also default OFF), and this
+# script has no cmake path at all. The consequence was silent -- `load_packed_family` returns
+# `Ok(None)` on a missing file -- so PLOW_PACKED_PREFILL_ROUTE=1 on MI300X loaded nothing and
+# then refused every MLA co-pack at `check_packed_prefill_program`.
+#
+# LEAN IS THE POINT. Each object carries ONE operator family and nothing else:
+#   interp_packed_mla_norm   class 5 -- RmsNorm / HeadNormRope(+Fp8), the 8-wave bucket.
+#   interp_packed_mla_flash  class 6 -- FlashMlaPrefill(+Fp8), the 4-wave / 512-reg bucket.
+#   interp_packed_kda        class 7 -- KDA serial (and chunk under PLOW_KDA_CHUNK=1).
+# Compiling any packed call arm into the full interpreter raises its spill count (the cmake
+# comment records 116 VGPR spills on the K3 row), which is why they are separate objects rather
+# than defines on the rows above.
+#
+# NO $AX_GMOE and no $AX_MOE: a family object only ever runs its own class, so the Gemma-MoE and
+# expert arms it cannot dispatch would only grow the register union. `check_moe_gemma_arms` is
+# not a blanket check for these -- exec/amd.rs validates them through `load_packed_family`,
+# which asks for the family markers instead.
+AX_PACKED_MLA_NORM="-DPLOW_BUCKET_DECODE=0 $CDNA3_TILE $AX_MLA \
+  -DPLOW_BUCKET_PACKED_MLA_NORM=1 -DPLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS=1"
+AX_PACKED_MLA_FLASH="-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 \
+  -DFA_DC=256 -DFA_DBUF=1 $CDNA3_TILE_4W -DPLOW_MLA_PF_V2_ARM=1 \
+  -DPLOW_PACKED_PREFILL_MLA_FLASH_CONSUMERS=1"
+AX_PACKED_KDA="-DPLOW_BUCKET_DECODE=0 $CDNA3_TILE -DPLOW_K3=1 $AX_KDA_CHUNK \
+  -DPLOW_BUCKET_PACKED_KDA=1 -DPLOW_PACKED_PREFILL_KDA_CONSUMERS=1"
+
 # THE TABLE: <stem>|<axes>. Names must match exec/amd.rs `object_name()`
 # EXACTLY -- it composes stem + variant infix + arm infix + sched suffix and
 # opens the result by literal filename.
@@ -839,6 +1042,29 @@ ROWS=(
   "interp_prefill|$AX_PREFILL"
   "interp_decode|$AX_DECODE"
   "interp_flash|$AX_FLASH"
+  "interp_mixed|-DPLOW_MIXED_STEP=1 -DPLOW_BUCKET_DECODE=0 -DPLOW_WG_WAVES=4 -DPLOW_GEMV_MM=4 -DGM_BM=64 -DGM_BN=128 -DFA_DC=256 -DFA_DBUF=1"
+  # UNIFIED TOKEN BATCH, dense GQA (plans/unified-token-batch.md §8 Phase 2). The mixed object's
+  # exact shape plus PLOW_TOKEN_BATCH=1, which REPLACES its phase-band projections with one
+  # matmul over the combined M and its per-span attention loop with a flat query-tile schedule.
+  # A separate row, not a define on the one above: the two routes are different dispatch and
+  # `interp_mixed` stays byte-for-byte the qualified object it is today.
+  # GM_BM=256, NOT the mixed row's 64, and it is the single biggest thing measured about this
+  # route. `mixed_program::synthesize` rewrites every GEMM opcode -- `GemmWide` and `GemmC5`
+  # included -- onto plain `Gemm`, so this object's ONE compiled tile runs every dense
+  # projection of a prefill chunk. At 64x128 that is the slowest rung in op_gemm.h's own
+  # inventory: 332-458 TF/s against 192x256's 1033-1236 on exactly the Gemma-31B shapes
+  # (see the tile-inventory table above GM_WD_BM). BN stays 128 because the fused-GLU
+  # epilogue's `SN == 2` pins it there at four waves; BM is free, and 256x128 is 2x the
+  # arithmetic intensity of 64x128 for NOTHING: 64/192/256 all measure 446 vgpr / 190 agpr /
+  # 64,544 B LDS / 0 spill on this row, because the arena is already sized at `GM_C5_*` (see
+  # PLOW_GM_ARENA under PLOW_MIXED_STEP) and the wave grid is 2x2 either way. The object was
+  # paying for a 192x256 arena and running 64x128 inside it.
+  # Serving delta on Gemma-4 31B at concurrency 8, token batch against the ordinary route:
+  # 7168 input -18.4% -> -1.8%, 4096 -17.8% -> -4.5%, 2048 -12.4% -> -2.4% output tokens/s;
+  # at concurrency 1 with `--amd-token-batch-solo` (no packing at all, so the prefill chunk
+  # alone) 7168 goes -24.8% -> -6.5% and its TTFT +64.8% -> +13.0%.
+  # `TB_GM_BM`/`TB_GM_BN` stay overridable so the A/B that found this is one env away.
+  "interp_tokbatch|-DPLOW_TOKEN_BATCH=1 -DPLOW_MIXED_STEP=1 -DPLOW_BUCKET_DECODE=0 -DPLOW_WG_WAVES=4 -DPLOW_GEMV_MM=4 -DGM_BM=${TB_GM_BM:-256} -DGM_BN=${TB_GM_BN:-128} -DFA_DC=256 -DFA_DBUF=1"
   "interp_prefill_fp8|$AX_PREFILL $AX_FP8"
   "interp_decode_fp8|$AX_DECODE $AX_FP8"
   "interp_prefill_fp8kv|$AX_PREFILL $AX_FP8 $AX_FP8KV"
@@ -866,14 +1092,25 @@ ROWS=(
   "interp_prefill_k3_moe_a4w4|$AX_PREFILL $AX_MLA_K3 $AX_MOE $AX_A4W4 $AX_K3_A4W4 $AX_K3_A4W4_TUNE $AX_K3_PF_STATE $AX_MXFP4"
   "interp_prefill_fp8kv_k3_moe_a4w4|$AX_PREFILL $AX_MLA_K3 $AX_MOE $AX_A4W4 $AX_K3_A4W4 $AX_K3_A4W4_TUNE $AX_K3_PF_STATE $AX_MXFP4 $AX_FP8KV"
 )
+if [ "${PLOW_PACKED_PREFILL_CONSUMERS:-0}" = 1 ]; then
+  ROWS+=(
+    "interp_packed_mla_norm|$AX_PACKED_MLA_NORM"
+    "interp_packed_mla_flash|$AX_PACKED_MLA_FLASH"
+    "interp_packed_kda|$AX_PACKED_KDA"
+  )
+fi
 
-# PLOW_ROWS_ONLY=<substring>: build only the rows whose stem matches — for iterating on
+# PLOW_ROWS_ONLY=<substring> (or =<exact-stem>): build only matching rows — for iterating on
 # ONE object family (e.g. interp_flash) without paying the full 28-object build. The
 # resulting dir is PARTIAL; copy it over a full set before serving from it.
 if [ -n "${PLOW_ROWS_ONLY:-}" ]; then
   FILTERED=()
   for row in "${ROWS[@]}"; do
-    case "${row%%|*}" in *"${PLOW_ROWS_ONLY}"*) FILTERED+=("$row");; esac
+    if [[ "$PLOW_ROWS_ONLY" == =* ]]; then
+      if [ "${row%%|*}" = "${PLOW_ROWS_ONLY#=}" ]; then FILTERED+=("$row"); fi
+    else
+      case "${row%%|*}" in *"${PLOW_ROWS_ONLY}"*) FILTERED+=("$row");; esac
+    fi
   done
   # A mistyped filter matching NOTHING must refuse, not print "ready (0 objects)" — that state
   # has already invalidated performance work once (see LESSONS).
@@ -903,12 +1140,65 @@ one() {  # <stem> <axes...>
 }
 export -f one; export HIPCC ARCH R INC BUN
 
+# test_kernels.elf is STARTED HERE, alongside the row batch, and waited on after it.
+# It shares no input with the rows and nothing between here and the wait consumes it, so
+# the only thing its old position bought was serialisation: measured 29.7 s of a 79.4 s
+# build at JOBS=48, against a 30.1 s critical path for the whole parallel batch. See the
+# body below the wait for what it is and why it must be rebuilt with the interpreter.
+if [ -z "${PLOW_ROWS_ONLY:-}" ]; then
+  (
+    if "$HIPCC" --offload-arch="$ARCH" -O3 -w --genco "$R/amd/test_kernels.hip" \
+          -o tk.co $INC > test_kernels.log 2>&1; then
+      "$BUN" --unbundle --type=o --targets="hipv4-amdgcn-amd-amdhsa--$ARCH" \
+          --input=tk.co --output=test_kernels.elf
+      rm -f tk.co test_kernels.log
+    else
+      exit 1
+    fi
+  ) &
+  TK_PID=$!
+fi
+
 # Both scheduler twins: which one a packet needs is decided by the packet
 # (gq_seg_ofs), not by this build, and plowrt opens the twin by literal name.
 printf '%s\n' "${ROWS[@]}" | while IFS='|' read -r stem axes; do
   echo "$stem|$axes"
-  echo "${stem}_gq|$axes $AX_GQ"
+  case "$stem" in
+    interp_decode*) echo "${stem}_gq|$axes $AX_GQ $AX_DECODE_GQ" ;;
+    *) echo "${stem}_gq|$axes $AX_GQ" ;;
+  esac
 done | xargs -P "$JOBS" -I{} bash -c 'IFS="|" read -r s a <<< "{}"; one "$s" $a'
+
+# THE `-D` SET EACH OBJECT WAS ACTUALLY COMPILED WITH, written next to the objects.
+#
+# `asm_audit.py --contract` reads this and asserts, for every geometry macro in it, that the
+# object carries a `plow_geom_<MACRO>` marker holding that value. That is the check for the
+# defect this file's GM_AX hatch had: five per-rung GEMM knobs were bare `#define`s in
+# op_gemm.h, a bare #define after a command-line -D is a redefinition the header wins, and -w
+# hides the warning -- so every A/B ever run through GM_AX measured an unchanged object.
+#
+# Composed from the same $ROWS and the same $AX_GQ branch the compile loop uses, one line up,
+# rather than from a second table that would drift from it. `$(echo $a)` re-splits on
+# whitespace to fold the backslash-continued axis strings onto one JSON line.
+{
+  printf '{\n'
+  sep=""
+  for row in "${ROWS[@]}"; do
+    stem="${row%%|*}"; axes="${row#*|}"
+    case "$stem" in
+      interp_decode*) gq_axes="$axes $AX_GQ $AX_DECODE_GQ" ;;
+      *) gq_axes="$axes $AX_GQ" ;;
+    esac
+    for pair in "$stem|$axes" "${stem}_gq|$gq_axes"; do
+      printf '%s "%s": "-DPLOW_ARCH_SUFFIX=%s %s"' "$sep" "${pair%%|*}" "$ARCH" "$(echo ${pair#*|})"
+      sep=$',\n'
+    done
+  done
+  # test_kernels.elf takes no axes at all; it is listed so the contract audits it as an
+  # object rather than skipping it for want of a defines entry.
+  printf '%s "test_kernels": "-DPLOW_ARCH_SUFFIX=%s"' "$sep" "$ARCH"
+  printf '\n}\n'
+} > build_defines.json
 
 # test_kernels.elf -- the golden __device__ wrappers, which call the SAME op_*.h bodies the
 # interpreter runs, so they must be rebuilt WITH it or a test passes against a stale kernel.
@@ -923,15 +1213,13 @@ done | xargs -P "$JOBS" -I{} bash -c 'IFS="|" read -r s a <<< "{}"; one "$s" $a'
 #
 # Skipped under PLOW_ROWS_ONLY, which is for iterating on one interpreter family and does not
 # want the extra minute.
-if [ -z "${PLOW_ROWS_ONLY:-}" ]; then
-  if "$HIPCC" --offload-arch="$ARCH" -O3 -w --genco "$R/amd/test_kernels.hip" \
-        -o tk.co $INC > test_kernels.log 2>&1; then
-    "$BUN" --unbundle --type=o --targets="hipv4-amdgcn-amd-amdhsa--$ARCH" \
-        --input=tk.co --output=test_kernels.elf
-    rm -f tk.co test_kernels.log
+# Started above, alongside the row batch. `wait` on a specific PID returns that job's
+# exit status, so a test_kernels failure still fails the build here rather than earlier.
+if [ -n "${TK_PID:-}" ]; then
+  if wait "$TK_PID"; then
     echo "ok    test_kernels"
   else
-    echo "FAIL  test_kernels"; tail -20 test_kernels.log; exit 1
+    echo "FAIL  test_kernels"; [ -f test_kernels.log ] && tail -20 test_kernels.log; exit 1
   fi
 fi
 
@@ -954,10 +1242,34 @@ for row in "${ROWS[@]}"; do
       echo "  MISSING PACKED-PREFILL ABI: expected plow_packed_prefill_abi_1"
       fail=1
     }
-    if grep -qE "OBJECT .* plow_packed_prefill_(mla|kda)_consumers_1$" <<<"$symbols"; then
-      echo "  UNEXPECTED PACKED-PREFILL CONSUMERS: default objects must remain resource-clean"
-      fail=1
-    fi
+    case "$stem" in
+      # The family objects EXIST to carry these markers, and exec/amd.rs refuses one that does
+      # not advertise them. Assert them positively here instead: a family object that silently
+      # lost its marker is loaded as `Ok(None)` and the route degrades to nothing.
+      interp_packed_mla_norm*)
+        grep -qE "OBJECT .* plow_packed_prefill_mla_norm_segments_1$" <<<"$symbols" || {
+          echo "  MISSING PACKED MLA-NORM SEGMENTS: expected plow_packed_prefill_mla_norm_segments_1"
+          fail=1
+        } ;;
+      interp_packed_mla_flash*)
+        grep -qE "OBJECT .* plow_packed_prefill_mla_flash_segments_1$" <<<"$symbols" || {
+          echo "  MISSING PACKED MLA-FLASH SEGMENTS: expected plow_packed_prefill_mla_flash_segments_1"
+          fail=1
+        } ;;
+      interp_packed_kda*)
+        for m in plow_kda_family_segments_1 plow_packed_prefill_kda_serial_segments_1 \
+                 plow_packed_prefill_kda_consumers_1; do
+          grep -qE "OBJECT .* $m\$" <<<"$symbols" || {
+            echo "  MISSING PACKED KDA MARKER: expected $m"
+            fail=1
+          }
+        done ;;
+      *)
+        if grep -qE "OBJECT .* plow_packed_prefill_(mla|kda)_consumers_1$" <<<"$symbols"; then
+          echo "  UNEXPECTED PACKED-PREFILL CONSUMERS: default objects must remain resource-clean"
+          fail=1
+        fi ;;
+    esac
     # 65536 B is the CDNA3 workgroup LDS ceiling; the 4-wave flash rows get the
     # 512-register budget, every 8-wave row must hold 256 total.
     #
@@ -969,10 +1281,58 @@ for row in "${ROWS[@]}"; do
     # that only has 512 -- so adding them fails every 4-wave row for no reason.
     [ "$l" -le 65536 ] || { echo "  OVER LDS: $l > 65536"; fail=1; }
     case "$stem" in
-      interp_flash*) [ "$v" -le 512 ] || { echo "  OVER REG: $v > 512"; fail=1; } ;;
+      interp_flash*|interp_mixed*|interp_tokbatch*|interp_packed_mla_flash*) [ "$v" -le 512 ] || { echo "  OVER REG: $v > 512"; fail=1; } ;;
       *)             [ "$v" -le 256 ] || { echo "  OVER REG: $v > 256"; fail=1; } ;;
     esac
     case "$stem" in
+      interp_mixed*)
+        grep -qE "OBJECT .* plow_mixed_step_bf16_1$" <<<"$symbols" || {
+          echo "  MISSING MIXED BF16 CONSUMERS: expected plow_mixed_step_bf16_1"
+          fail=1
+        }
+        grep -qE "OBJECT .* plow_mixed_block$" <<<"$symbols" || {
+          echo "  MISSING MIXED BLOCK CONTRACT: expected plow_mixed_block"
+          fail=1
+        }
+        grep -qE "OBJECT .* plow_mixed_gemm_glu_1$" <<<"$symbols" || {
+          echo "  MISSING MIXED GLU: expected plow_mixed_gemm_glu_1"
+          fail=1
+        }
+        grep -qE "OBJECT .* plow_mixed_prefill_split_1$" <<<"$symbols" || {
+          echo "  MISSING MIXED PREFILL MERGE: expected plow_mixed_prefill_split_1"
+          fail=1
+        }
+        grep -qE "OBJECT .* plow_mixed_dynamic_rows_1$" <<<"$symbols" || {
+          echo "  MISSING MIXED DYNAMIC ROWS: expected plow_mixed_dynamic_rows_1"
+          fail=1
+        }
+        grep -qE "OBJECT .* plow_mixed_glu_lds_halves$" <<<"$symbols" || {
+          echo "  MISSING MIXED GLU LDS CAPACITY: expected plow_mixed_glu_lds_halves"
+          fail=1
+        }
+        grep -qE "OBJECT .* plow_gemv_mm_cap_4$" <<<"$symbols" || {
+          echo "  MISSING MIXED SMALL-M CAPACITY: expected plow_gemv_mm_cap_4"
+          fail=1
+        }
+        ;;
+      interp_tokbatch*)
+        # The four capability markers exec/amd.rs reads out of .symtab before the object reaches
+        # a device. AMD's dispatch `default:` writes nothing and does not trap, so an object
+        # missing an arm a packet needs is a silent wrong answer; a name costs nothing here and
+        # a device round trip everywhere else.
+        for m in plow_token_batch_1 plow_token_batch_dense_gqa_1 \
+                 plow_token_batch_combined_m_1 plow_token_batch_span_attn_1; do
+          grep -qE "OBJECT .* $m\$" <<<"$symbols" || {
+            echo "  MISSING TOKEN-BATCH MARKER: expected $m"
+            fail=1
+          }
+        done
+        # The route is built ON the mixed object, so it must still answer for that contract.
+        grep -qE "OBJECT .* plow_mixed_step_bf16_1$" <<<"$symbols" || {
+          echo "  MISSING MIXED BF16 CONSUMERS on the token-batch row"
+          fail=1
+        }
+        ;;
       interp_prefill_k3*|interp_prefill_fp8kv_k3*)
         if [ -n "$AX_KDA_CHUNK" ]; then
           grep -qE "OBJECT .* plow_kda_chunk_bt64_arm_1$" <<<"$symbols" || {
@@ -1046,14 +1406,27 @@ done
 # reused -- CDNA3's bf16 MFMA is v_mfma_f32_32x32x8_bf16 (half the K) and its only fp8 MFMA is
 # the one that file FORBIDS -- so the contract has its own file, and asm_audit.py refuses the
 # cross-arch pairing by reading each object's ELF header. Skipped when the file is absent.
+#
+# THE STATIC PERFORMANCE CONTRACT rides in the SAME invocation, sharing the one disassembly
+# pass -- it is the object-side twin of crates/devgen/src/dispatch_audit.rs and it costs about
+# as much as the audit above, so running it separately would double a step that is already 20%
+# of this build. Six checks: the geometry `-D` markers (a `-D` that did not take), spill counted
+# from the ISA rather than from `.vgpr_spill_count`, LDS-crossbar and 2-byte-LDS density
+# (reported, not failed), head-dim arm coverage, and the resource budget that used to be the
+# stale comment at the top of this file. PLOW_AUDIT_STRICT=1 promotes the two reports to
+# refusals, as it does on the emit side. NOT skipped under PLOW_ROWS_ONLY: the rules that need
+# no baseline still apply to a partial build.
 EXPECT="$REPO/scripts/asm_expect_gfx942.json"
+BASELINE="$REPO/scripts/obj_baseline_gfx942.json"
 if [ -f "$EXPECT" ] && command -v python3 >/dev/null; then
   echo ""
-  echo "   --- instruction-selection audit ---"
+  echo "   --- instruction-selection audit + static performance contract ---"
   # Captured rather than piped: `cmd | tail` reports tail's status, so piping would swallow the
   # audit's exit code and the gate would print FAIL lines and then say the build is ready.
-  audit=$(python3 "$REPO/scripts/asm_audit.py" --expect "$EXPECT" ./*.elf) || fail=1
-  echo "$audit" | tail -20
+  # --quiet drops the per-kernel instruction dump; the contract table below replaces it.
+  audit=$(python3 "$REPO/scripts/asm_audit.py" --quiet --expect "$EXPECT" \
+      ${BASELINE:+--contract "$BASELINE"} --defines build_defines.json ./*.elf) || fail=1
+  echo "$audit"
 fi
 
 # B>1 K3 decode dispatches grouped ops 85/86 with MXFP4 encoding. Check the
@@ -1083,5 +1456,29 @@ if { [ "${PLOW_DECODE_BATCH:-1}" -gt 1 ] || [ "${PLOW_K3_DECODE_GROUPED:-0}" = 1
 fi
 
 echo ""
-[ "$fail" = 0 ] && echo ">>> $OUT ready ($(ls "$OUT"/*.elf | wc -l) objects)" || {
-  echo "!!! one or more rows are over the cliff or missing"; exit 1; }
+[ "$fail" = 0 ] || { echo "!!! one or more rows are over the cliff or missing"; exit 1; }
+
+# THE LOW-RUNG DECODE TIERS, built as subdirectories of this object set.
+#
+# `PLOW_DECODE_TIERS=1,2` re-enters this script once per width to fill `$OUT/lowrung<w>` with the
+# decode rows compiled for THAT width (see PLOW_DECODE_TIER above for the measurement). plowrt
+# co-loads them with `PLOW_HSACO_LOWRUNG=<dir>:<w>,...` and picks the narrowest tier that fits
+# each dispatch; scripts/glm53_serve_inner.sh does that automatically when the subdirectories are
+# present, so a blob with a 1/2/4 decode ladder gets a matched object per rung by default.
+#
+# Recursive rather than a loop over $ROWS: a tier is exactly this script with one variable moved,
+# and duplicating the row table, the axis composition and the cliff check to build it inside the
+# loop is how the two drift apart.
+if [ -n "${PLOW_DECODE_TIERS:-}" ] && [ -z "${PLOW_DECODE_TIER:-}" ]; then
+  for w in ${PLOW_DECODE_TIERS//,/ }; do
+    case "$w" in ''|*[!0-9]*) echo "PLOW_DECODE_TIERS must be a comma list of widths" >&2; exit 1;; esac
+    if [ "$w" -ge "$RAW_BATCH" ]; then continue; fi  # the wide object already serves this rung
+    echo ""
+    echo ">>> low-rung decode tier: width $w -> $OUT/lowrung$w"
+    ( unset PLOW_DECODE_TIERS PLOW_GEMV_MM
+      PLOW_DECODE_TIER="$w" PLOW_ROWS_ONLY==interp_decode \
+        "$REPO/scripts/build_gfx942.sh" "$OUT/lowrung$w" ) || exit 1
+  done
+fi
+
+echo ">>> $OUT ready ($(ls "$OUT"/*.elf | wc -l) objects)"

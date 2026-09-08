@@ -48,6 +48,7 @@ use serde_json::Value;
 
 mod checkpoint;
 use checkpoint::{layer_scalars, validate_coverage};
+mod attention_prefill_role;
 mod block;
 use block::{parse_block, write_block_descriptor};
 mod config;
@@ -63,8 +64,10 @@ mod qwen35;
 mod test_env;
 use mla::{glm_emit_block, glm_main, kimi_emit_block, nemotron_emit_block, MlaArch};
 mod decode_objects;
+pub mod dispatch_audit;
 mod gemv_decode_role;
 pub mod manifest;
+mod mxfp4_moe_role;
 mod projection_rewrite;
 pub mod tune_demand;
 
@@ -780,8 +783,13 @@ fn glu_era_inventory_mxfp4() -> &'static kernelcaps::Inventory {
 fn glu_era_inventory() -> &'static kernelcaps::Inventory {
     use std::sync::OnceLock;
     const RUNGS: [DevOp; 3] = [DevOp::Gemm, DevOp::GemmMed, DevOp::GemmSmall];
-    static INV: OnceLock<kernelcaps::Inventory> = OnceLock::new();
-    INV.get_or_init(|| {
+    static CDNA3: OnceLock<kernelcaps::Inventory> = OnceLock::new();
+    static CDNA4: OnceLock<kernelcaps::Inventory> = OnceLock::new();
+    let cell = match amd_target::active().1 {
+        hwspec::IsaLevel::Gfx942 => &CDNA3,
+        _ => &CDNA4,
+    };
+    cell.get_or_init(|| {
         let src = gfx950_gemm_inventory();
         kernelcaps::Inventory::probed(
             src.build().clone(),
@@ -901,8 +909,8 @@ fn gfx950_gemm_measurements() -> &'static GemmMeasurements {
             None => return GemmMeasurements { by_case },
             Some(s) => s,
         };
-        let store = tunedb::TuneStore::new(std::path::PathBuf::from(root));
-        let source_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let store = tunedb::TuneStore::new(std::path::PathBuf::from(root.clone()));
+        let source_root = kernelcaps::source_root();
         let Ok(build) = kernelcaps::dense_gemm_tuning_build(&source_root, amd_target::active().1)
         else {
             return GemmMeasurements { by_case };
@@ -942,8 +950,15 @@ fn gfx950_gemm_measurements() -> &'static GemmMeasurements {
         // identical bytes, so silence reads as success. A wholly stale campaign is a
         // re-measure request and has to say so.
         if stale > 0 {
+            // NAME THE INPUTS, not just the verdict. A digest alone is unfalsifiable: it
+            // cannot distinguish "the source really changed" from "this binary is
+            // fingerprinting a different checkout than the campaign published against",
+            // and the second is what a shared CARGO_TARGET_DIR across worktrees produces.
+            // Three agents chased the first reading of this line while the second was true.
             eprintln!(
-                "  tunedb {}: {stale} record(s) skipped as STALE against the probed build {}{}",
+                "  tunedb {}: {stale} record(s) skipped as STALE against the probed build {}{}\n\
+                 \x20   probed source root : {}\n\
+                 \x20   tuning store       : {}",
                 cell,
                 want.interpreter,
                 if by_case.is_empty() {
@@ -951,7 +966,9 @@ fn gfx950_gemm_measurements() -> &'static GemmMeasurements {
                      analytical model. Re-run the campaign or this compile is unmeasured."
                 } else {
                     ""
-                }
+                },
+                source_root.display(),
+                root,
             );
         }
         GemmMeasurements { by_case }
@@ -1366,7 +1383,7 @@ fn amd_gemm_inventory(isa: hwspec::IsaLevel) -> &'static kernelcaps::Inventory {
         _ => &CDNA4,
     };
     cell.get_or_init(|| {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let root = kernelcaps::source_root();
         match kernelcaps::dense_gemm_inventory(&root, isa) {
             Ok(inv) => inv,
             Err(e) => {
@@ -1427,6 +1444,42 @@ const GFX950_RUNGS: [(DevOp, DevOp, DevOp, i64, i64, i64); 5] = [
     ),
 ];
 
+/// The (BM, BN) a tiled prefill GEMM opcode actually runs, and the half-bytes one weight
+/// element costs in its encoding.
+///
+/// Derived from [`GFX950_RUNGS`] for the same reason [`gemm_family_ops`] is: a hand-listed
+/// copy is what went stale when the 128x256/192x256 rungs landed. Half-bytes rather than
+/// bytes so mxfp4 (4 bits) is an integer — the dispatch audit's cost ordering must be exact
+/// integer arithmetic or two emits of one blob stop being byte-identical.
+///
+/// `i7` is the instruction's seventh immediate, read ONLY to honour [`GEMM_WIDE_C8_TAG`]:
+/// a `GemmWide` carrying it is the gfx950 128x384x64 body, not the 128x256 the table names.
+/// `arm_of` in `crates/devgen/src/manifest.rs` already decodes the same tag into an arm
+/// variant; the two must not disagree.
+///
+/// `None` for every opcode whose tile is NOT a compile-time constant this compiler chose:
+/// the GLU-fused GEMMs take their tile from `GM_BM`/`GM_BN`, which are `-D` defines of the
+/// object (192 or 256 depending on the build), and the grouped-MoE ops carry no token count
+/// in the packet at all. Reporting a guessed tile for those would put a fabricated occupancy
+/// in the manifest, which is worse than reporting none.
+pub(crate) fn gemm_tile_of(op: DevOp, i7: u32) -> Option<(u32, u32, u32)> {
+    if op == DevOp::GemmWide && i7 == packet::dev::GEMM_WIDE_C8_TAG {
+        return Some((128, 384, 4));
+    }
+    GFX950_RUNGS.iter().find_map(|&(bf16, fp8, mx, bm, bn, _)| {
+        let half_bytes = if op == bf16 {
+            4
+        } else if op == fp8 {
+            2
+        } else if op == mx {
+            1
+        } else {
+            return None;
+        };
+        Some((bm as u32, bn as u32, half_bytes))
+    })
+}
+
 /// Every opcode [`pick_tile`] can answer with, in any encoding — the set a test asks "is this a
 /// tiled prefill GEMM?" about.
 ///
@@ -1459,6 +1512,18 @@ fn amd_rung_specs(build_label: &str, isa: hwspec::IsaLevel) -> Vec<kernelcaps::K
     use kernelcaps::{KernelSpec, QuantScheme};
     let mut out = Vec::with_capacity(GFX950_RUNGS.len() * 3);
     for (bf16, fp8, mx, bm, bn, bk) in GFX950_RUNGS {
+        // The SATURATING rung is the one rung whose geometry is a `-D` of the object rather
+        // than a header constant, so it is the one that differs per part: CDNA3's 64 KiB
+        // workgroup cannot hold 256x256x64 (73,728 B single-buffered), and the object is
+        // therefore built GM_BM=192 GM_BN=256. Naming gfx950's 256x256 here handed gfx942 an
+        // inventory whose top rung does not fit the part, and the store disagreed with it —
+        // a timing filed against the real 192x256x64 `Gemm` selected a tile this table said
+        // was 256 wide. `hwspec` already declares the per-ISA answer; take it from there
+        // rather than restating it, which is the drift `kernelcaps` exists to prevent.
+        let (bm, bn, bk) = match (bf16, isa.geometry()) {
+            (DevOp::Gemm, Some(g)) => (g.gemm_tile.bm as i64, g.gemm_tile.bn as i64, g.gemm_tile.bk as i64),
+            _ => (bm, bn, bk),
+        };
         for (op, quant, mma) in [
             (bf16, QuantScheme::None, MmaDtype::Bf16),
             (fp8, QuantScheme::W8A8, MmaDtype::Fp8),
@@ -2179,10 +2244,22 @@ fn declare(
                 let gu = gu_n * c.hidden as u64;
                 let dn = dn_n * c.moe_inter as u64;
                 ex4 = [
-                    b.tensor(&format!("mxfp4/{prefix}layers.{l}.experts.gate_up_proj"), gu / 2),
-                    b.tensor(&format!("mxfp4/{prefix}layers.{l}.experts.gate_up_proj_scale"), gu / 32),
-                    b.tensor(&format!("mxfp4/{prefix}layers.{l}.experts.down_proj"), dn / 2),
-                    b.tensor(&format!("mxfp4/{prefix}layers.{l}.experts.down_proj_scale"), dn / 32),
+                    b.tensor(
+                        &format!("mxfp4/{prefix}layers.{l}.experts.gate_up_proj"),
+                        gu / 2,
+                    ),
+                    b.tensor(
+                        &format!("mxfp4/{prefix}layers.{l}.experts.gate_up_proj_scale"),
+                        gu / 32,
+                    ),
+                    b.tensor(
+                        &format!("mxfp4/{prefix}layers.{l}.experts.down_proj"),
+                        dn / 2,
+                    ),
+                    b.tensor(
+                        &format!("mxfp4/{prefix}layers.{l}.experts.down_proj_scale"),
+                        dn / 32,
+                    ),
                 ];
             } else if fp8 {
                 b.tensor(
@@ -2265,17 +2342,52 @@ fn declare(
             wg8: w8(b, "mlp.gate_proj.weight", (inter_sh * c.hidden) as u64),
             wu8: w8(b, "mlp.up_proj.weight", (inter_sh * c.hidden) as u64),
             wd8: w8(b, "mlp.down_proj.weight", (c.hidden * inter_sh) as u64),
-            sq: sc(b, "self_attn.q_proj.weight", qd as u64, (qd * c.hidden) as u64),
-            sk: sc(b, "self_attn.k_proj.weight", kd as u64, (kd * c.hidden) as u64),
+            sq: sc(
+                b,
+                "self_attn.q_proj.weight",
+                qd as u64,
+                (qd * c.hidden) as u64,
+            ),
+            sk: sc(
+                b,
+                "self_attn.k_proj.weight",
+                kd as u64,
+                (kd * c.hidden) as u64,
+            ),
             sv: if keqv {
                 TENSOR_NONE
             } else {
-                sc(b, "self_attn.v_proj.weight", kd as u64, (kd * c.hidden) as u64)
+                sc(
+                    b,
+                    "self_attn.v_proj.weight",
+                    kd as u64,
+                    (kd * c.hidden) as u64,
+                )
             },
-            so: sc(b, "self_attn.o_proj.weight", c.hidden as u64, (c.hidden * qd) as u64),
-            sg: sc(b, "mlp.gate_proj.weight", inter_sh as u64, (inter_sh * c.hidden) as u64),
-            su: sc(b, "mlp.up_proj.weight", inter_sh as u64, (inter_sh * c.hidden) as u64),
-            sd: sc(b, "mlp.down_proj.weight", c.hidden as u64, (c.hidden * inter_sh) as u64),
+            so: sc(
+                b,
+                "self_attn.o_proj.weight",
+                c.hidden as u64,
+                (c.hidden * qd) as u64,
+            ),
+            sg: sc(
+                b,
+                "mlp.gate_proj.weight",
+                inter_sh as u64,
+                (inter_sh * c.hidden) as u64,
+            ),
+            su: sc(
+                b,
+                "mlp.up_proj.weight",
+                inter_sh as u64,
+                (inter_sh * c.hidden) as u64,
+            ),
+            sd: sc(
+                b,
+                "mlp.down_proj.weight",
+                c.hidden as u64,
+                (c.hidden * inter_sh) as u64,
+            ),
             g_in: w(b, "input_layernorm.weight", c.hidden as u64 * BF16),
             g_pa: w(b, "post_attention_layernorm.weight", c.hidden as u64 * BF16),
             // Gemma's sandwich has two extra norms; Llama/Qwen do not.
@@ -2357,6 +2469,49 @@ fn declare(
 /// `max_splits` are derived from the SAME number, so they cannot disagree with each other, and
 /// changing it repartitions every prefill program (a measurement, not a correctness fix).
 const Q_TILE_ROWS: u32 = 8 * 32;
+
+/// `nsplit` for a dense-GQA `FlashPrefill` packet, and whether the flash writes its own bf16
+/// epilogue instead of leaving a `FlashMerge` to combine partials.
+///
+/// Extracted from `emit_phase` so the unified token-batch route's precondition is a TEST rather
+/// than a device trap. That route (`plans/unified-token-batch.md` §8 Phase 2,
+/// `docs/arch/17-unified-token-batch.md (Part II)`) schedules attention as one flat work list
+/// over every span's query tiles, and that schedule is bit-identical to an isolated per-request
+/// run only while the KV partition does not move with a span boundary — i.e. only at
+/// `nsplit == 1`. `runtime/amd/interp.hip` traps a `FlashPrefill` packet with `i7 != 1` rather
+/// than silently re-approximating, so an emitter change that reintroduced a split under packing
+/// would turn every packed prefill into a hard stop. `packing_pins_an_unsplit_fused_flash`
+/// catches that here instead.
+///
+/// When `nsplit == 1` there is nothing for `d_flash_merge` to combine: flash_prefill normalizes
+/// in its own epilogue and writes the final bf16 straight to `n.at`, and the merge op is not
+/// emitted at all. Prefill-only — decode always keeps `ns > 1`.
+fn dense_flash_split(
+    gemv_family: bool,
+    packed_prefill: bool,
+    n_cu: u32,
+    heads: u32,
+    t: u32,
+) -> (u32, bool) {
+    let ns = if gemv_family {
+        n_cu.div_ceil(heads).max(1)
+    } else if packed_prefill {
+        // Request packing must not change the softmax reduction with the bucket.
+        1
+    } else {
+        // `PLOW_DENSE_PF_NS` CAPS this, it does not replace it: a cap can only ever remove
+        // splits the heuristic asked for, so a value above the heuristic cannot over-split a
+        // bucket past the `Opart`/`mlpart` capacity `max_splits` sized from the same formula.
+        let heuristic = n_cu
+            .div_ceil((t.div_ceil(Q_TILE_ROWS) * heads).max(1))
+            .max(1);
+        match emit_config::active().dense_pf_ns {
+            Some(cap) => heuristic.min(cap.max(1)),
+            None => heuristic,
+        }
+    };
+    (ns, !gemv_family && ns == 1)
+}
 
 /// The q-tile height `d_flash_prefill` ACTUALLY uses: `PLOW_WAVES * FA_BQ`, with `PLOW_WAVES = 4`.
 ///
@@ -2459,7 +2614,7 @@ fn gemv_row_bucket(t: u32) -> u32 {
     p.min(GEMV_MAXM)
 }
 
-/// Rows a fused decode GEMV stages in LDS at once — the quantity the fusion gate must bound.
+/// Rows a fused AMD decode GEMV stages in LDS at once — the quantity the fusion gate must bound.
 ///
 /// # This is the §6g-WALK companion change, and without it the walk buys nothing
 ///
@@ -2492,6 +2647,36 @@ fn gemv_staged_rows(t: u32) -> u32 {
     } else {
         t
     }
+}
+
+/// Whether the fused QKV/GLU input representation fits the backend body.
+///
+/// AMD's fused bodies stage every active row in LDS and therefore need the arena bound above.
+/// NVIDIA's batched bodies use `gemv_walk` over global activation rows; only their separate M=1
+/// overload stages one row in shared memory. Applying the AMD bound to CUDA made Gemma-4-31B's
+/// B16 rung drop both fusions and invalidated the otherwise uniform decode-object ladder.
+fn gemv_fused_input_fits(amd: bool, t: u32, hidden: u32) -> bool {
+    let staged_rows = if amd {
+        gemv_staged_rows(t)
+    } else if t <= 1 {
+        t
+    } else {
+        return true;
+    };
+    staged_rows as u64 * hidden as u64 <= dec_stage_halves()
+}
+
+/// The decode object's GEMV staging arena, in halves.
+///
+/// [`gm_lds_halves`] reads `hwspec`'s `decode_gemm_tile`, which on gfx942 is the `PLOW_OCC4` /
+/// `PLOW_DEC_SQUEEZE` re-cut (15,360 halves) and NOT what a default `build_gfx942.sh` decode
+/// object is built at (192x256x64 -> 32,256). `PLOW_DEC_STAGE_HALVES` states the object's real
+/// arena; the runtime refuses the pairing if the object turns out to be smaller, so an
+/// overstated value cannot corrupt — see `EmitConfig::dec_stage_halves`.
+pub(crate) fn dec_stage_halves() -> u64 {
+    emit_config::active()
+        .dec_stage_halves
+        .map_or_else(gm_lds_halves, u64::from)
 }
 
 /// Largest prefill chunk. Mirrors `PLOW_MAX_CHUNK` in `dev_isa.h`.
@@ -3055,7 +3240,7 @@ enum Mode {
 impl Mode {
     /// One query row, KV append + ring mask, decode's nsplit and one-shot all-reduce.
     fn decode_shape(self) -> bool {
-        self != Mode::Prefill
+        matches!(self, Mode::Decode | Mode::DecodeTiled)
     }
     /// The GEMV opcode family and every fusion that exists only to serve it, plus flash-decode.
     fn gemv(self) -> bool {
@@ -3179,6 +3364,7 @@ fn emit_phase(
     // the `hn_dep` closure below already binds a `gemv: u32` parameter that would shadow it.)
     let decode = mode.decode_shape();
     let gemv_family = mode.gemv();
+    // The mixed AMD object has one GEMM tile, shared with its four-wave attention body.
     // MXFP4 dense decode (PLOW_MXFP4=1): q/k/v/o/down through GemvMxfp4 (91), gate|up through
     // GemvGluMxfp4 (92). Exclusive with the fp8 axis.
     let mx4 = emit_config::active().mxfp4;
@@ -3246,16 +3432,14 @@ fn emit_phase(
     // recorded above d_norm_residual_norm in runtime/amd/op_norm.h. Read that before widening
     // this. At decode batch B the row axis already gives it B workgroups for free.
     let elem = |n: u32| -> Vec<u32> { (0..n.div_ceil(512 * 8).max(1).min(n_cu)).collect() };
-    let ns = if gemv_family {
-        n_cu.div_ceil(heads).max(1)
-    } else {
-        n_cu.div_ceil((t.div_ceil(Q_TILE_ROWS) * heads).max(1))
-            .max(1)
-    };
-    // When nsplit==1 there is nothing for d_flash_merge to combine: flash_prefill normalizes
-    // in its own epilogue and writes the final bf16 straight to n.at, and the merge op is not
-    // emitted at all. Prefill-only (decode always keeps ns>1).
-    let fused = !gemv_family && ns == 1;
+    let (ns, fused_epilogue) = dense_flash_split(
+        gemv_family,
+        emit_config::active().packed_prefill_on(),
+        n_cu,
+        heads,
+        t,
+    );
+    let fused = fused_epilogue;
 
     let escale = c.emb_scale;
     // Block mode: no token embedding — `act.x` is uploaded by the harness (the
@@ -3326,6 +3510,32 @@ fn emit_phase(
                 cus: Vec<u32>,
                 deps: &[u32]|
      -> u32 {
+        // THE CU BUDGET THIS OP ACTUALLY GETS, not the whole machine.
+        //
+        // `tile_cost` ranks by `rounds x per-tile cost` with `rounds = ceil(tiles / n_units)`, so
+        // `n_units` decides where the "more tiles fill more CUs" term stops paying. Passing the
+        // global `n_cu` there was a compiled ceiling in the same shape as `PLOW_GEMV_MM`: q/k/v
+        // and gate/up are emitted as CONCURRENT ops over DISJOINT CU sets (`split3`/`split2`
+        // below), so an op sized for 304 CUs is then handed 76 or 152 and runs its tiles in two
+        // or four rounds instead of one. Measured on Gemma-4-31B/MI300X: gate at T=128 is
+        // 168 GemmMed tiles on 152 slices — two rounds of a 128x128 tile where one round of a
+        // 128x256 tile moves strictly fewer bytes per CU; k/v at T=512 are 256 GemmSmall tiles
+        // on 76 slices, four rounds where GemmWide needs one.
+        //
+        // ONLY WHERE THE OP IS CU-STARVED AT THE NOMINAL TILE, and that bound is measured, not
+        // caution. `rounds = ceil(tiles / n_units)`: once `tiles > n_units` the budget is very
+        // nearly a common divisor across every candidate and cancels out of the RANKING, so
+        // substituting it there re-decides the shape on ceiling quantization alone. Doing that
+        // unconditionally flipped q/k/v at T=2048 from GemmWide to the 192x256 rung — which the
+        // byte model prefers (3 rounds x 448 against 4 x 384) and the machine does not: +1.3%
+        // TTFT at 2048, +0.2% at 8192, against -5.2% at 128 and -4.7% at 512. Where the op
+        // cannot fill even its own share, every viable candidate is single-round, the ranking is
+        // per-tile bytes, and the budget is the only honest `n_units`.
+        let budget = if tiles(m, nn) <= cus.len() as u32 {
+            cus.len() as u32
+        } else {
+            n_cu
+        };
         if gemv_family && fp8 {
             return b.emit(DevOp::GemvFp8, gemv_wg_cap(cus), deps, |d| {
                 d.t[0] = out;
@@ -3341,7 +3551,10 @@ fn emit_phase(
         if gemv_family && mx4 {
             // Op 91 has no norm-fold slot; every caller passes TENSOR_NONE (the norm is a shared
             // packet), so a gamma here would be a silently dropped norm — refuse instead.
-            assert_eq!(gamma, TENSOR_NONE, "mxfp4 GEMV cannot fold a norm (gamma) — emit it as a packet");
+            assert_eq!(
+                gamma, TENSOR_NONE,
+                "mxfp4 GEMV cannot fold a norm (gamma) — emit it as a packet"
+            );
             return b.emit(DevOp::GemvMxfp4, gemv_wg_cap(cus), deps, |d| {
                 d.t[0] = out;
                 d.t[1] = a;
@@ -3361,7 +3574,7 @@ fn emit_phase(
                 "mxfp4 prefill GEMM has no fp4 twin for this projection — the bf16 weight it \
                  would fall back to is no longer declared"
             );
-            let op = pick_tile(m, nn, k, n_cu, kernelcaps::QuantScheme::Mxfp4);
+            let op = pick_tile(m, nn, k, budget, kernelcaps::QuantScheme::Mxfp4);
             return b.emit(op, cus, deps, |d| {
                 d.t[0] = out;
                 d.t[1] = a;
@@ -3386,7 +3599,7 @@ fn emit_phase(
         // the encoding also lets the answer DIFFER from bf16's, which is the point of making
         // precision an input.
         if !gemv_family && fp8 {
-            let op = pick_tile(m, nn, k, n_cu, kernelcaps::QuantScheme::W8A8);
+            let op = pick_tile(m, nn, k, budget, kernelcaps::QuantScheme::W8A8);
             // sm_90a TMA (see `tmap` above): w8a8 only — both operands are e4m3 tensors
             // the TMA e4m3 maps can describe. The w8a16 body keeps cp.async (its A is
             // bf16 and its weight is dequanted in-kernel; no TMA arm exists for it).
@@ -3418,7 +3631,7 @@ fn emit_phase(
         let op = if gemv_family {
             DevOp::Gemv
         } else {
-            pick_tile(m, nn, k, n_cu, kernelcaps::QuantScheme::None)
+            pick_tile(m, nn, k, budget, kernelcaps::QuantScheme::None)
         };
         // Only the three plain-tile rungs have the sm_90a TMA arm; Wide/C5 (gfx950) and
         // GLU/fp8 keep i6/i7 zero until their forks land.
@@ -3570,11 +3783,9 @@ fn emit_phase(
         // (q/k/v as three separate bf16 Gemv packets = +2 packets/layer, uneven CU fill). Tokens
         // are bit-identical (each output column is the same per-column dot). Off by default =>
         // byte-identical stream. Measures the marginal TPOT cost of a 2-gate/layer reduction.
-        // THE SAME LDS PRECONDITION `glu_fused` CHECKS. `gemv_qkv_rows` reads x
-        // only through `ld_lds8` — it has no global-read arm — and `op_gemm.h`
-        // says so: *"x is ALWAYS staged in LDS here: plowc emits this op only
-        // when M*K fits GM_LDS_HALVES."* That precondition was stated and never
-        // enforced for THIS op, only for `GemvGlu`.
+        // AMD has the same LDS precondition as `glu_fused`: its `gemv_qkv_rows` reads x only
+        // through LDS. CUDA's batched overload reads x from global memory through `gemv_walk`,
+        // so applying that constraint there changes ladder composition without protecting memory.
         //
         // MEASURED, Gemma-4-31B (hidden 5376), PLOW_DECODE_BATCH=16: the arena
         // holds 73728 halves, `M*K` is 16*5376 = 86016, and row `m` lives at
@@ -3587,9 +3798,7 @@ fn emit_phase(
             && !keqv
             && !fp8
             && !mx4
-            // `gemv_staged_rows`, not `t`: with `PLOW_GEMV_WALK` the staging moves inside the
-            // row loop and the bound stops depending on M. See §6g-WALK's companion change.
-            && (gemv_staged_rows(t) as u64 * c.hidden as u64) <= gm_lds_halves()
+            && gemv_fused_input_fits(amd, t, c.hidden)
             && !emit_config::active().no_fuse_qkv;
         // FUSED Q|K|V, per-channel fp8 (DevOp::GemvQkvFp8, op 115) — the arm the comment above
         // called "opcode 26 deferred", landed but OFF BY DEFAULT, because it MEASURES SLOWER.
@@ -4184,7 +4393,7 @@ fn emit_phase(
                 d.t[3] = cs;
                 d.t[4] = sn;
                 d.t[5] = n.pos;
-                d.t[6] = n.kcs[l]; // fp8-KV per-row scale (NONE in bf16 mode)
+                d.t[6] = n.kcs[l];
                 d.i[0] = t;
                 d.i[1] = kvh;
                 d.i[2] = hd;
@@ -4227,7 +4436,7 @@ fn emit_phase(
                 d.t[0] = n.vc[l];
                 d.t[1] = v_src;
                 d.t[5] = n.pos;
-                d.t[6] = n.vcs[l]; // fp8-KV per-row scale (NONE in bf16 mode)
+                d.t[6] = n.vcs[l];
                 d.i[0] = t;
                 d.i[1] = kvh;
                 d.i[2] = hd;
@@ -4477,14 +4686,14 @@ fn emit_phase(
                 d.j[1] = kvm; // head-major; RING on a sliding layer
             })
         };
-        if !gemv_family && emit_config::active().emit_packed_prefill {
+        if !gemv_family && emit_config::active().packed_prefill_on() {
             b.isolate(c_fa);
         }
         // When fused, flash_prefill already wrote the normalized bf16 to n.at, so there is no
         // FlashMerge op and o_proj depends on the flash op directly. Coarse: n.at row r needs
         // every head of its q-tile, which is spread across the flash workgroups.
-        let attn_dep = if fused || fuse_merge {
-            c_fa
+        let attn_deps = if fused || fuse_merge {
+            vec![c_fa]
         } else {
             // L1: fold a D-chunk axis into the merge's work id so it can occupy more than
             // `t*heads` (= 32 at Gemma-31B decode) of 256 CUs. `flash_merge_map` and
@@ -4511,7 +4720,7 @@ fn emit_phase(
                 all.len() as u32,
                 mg_cus.len() as u32,
             );
-            b.emit_dep(
+            vec![b.emit_dep(
                 DevOp::FlashMerge,
                 mg_cus,
                 vec![Dep::Fine {
@@ -4519,7 +4728,7 @@ fn emit_phase(
                     map,
                 }],
                 fill,
-            )
+            )]
         };
 
         // o_proj is ROW-parallel: input = this rank's qd heads, output =
@@ -4528,7 +4737,11 @@ fn emit_phase(
         // partials into the replicated `og` that NormResidual consumes — all-reduce #1 of the layer.
         // proj() picks the fp8 (GemvFp8) arm on the decode fp8 path via the wo8/so operands.
         // w8a8: quant the (qd-width) attention output feeding o_proj.
-        let do_ = quant(b, n.xqo, n.aso, n.at, qd, attn_dep);
+        let o_deps = if w8a8 {
+            vec![quant(b, n.xqo, n.aso, n.at, qd, attn_deps[0])]
+        } else {
+            attn_deps
+        };
         let c_o = if tp > 1 {
             let c_op = proj(
                 b,
@@ -4544,7 +4757,7 @@ fn emit_phase(
                 qd,
                 TENSOR_NONE,
                 all.clone(),
-                &[do_],
+                &o_deps,
             );
             emit_xreduce(b, &mut xgate, decode, &xr_cus, c_op, n.og, xr_elems, tp, 0)
         } else {
@@ -4562,7 +4775,7 @@ fn emit_phase(
                 qd,
                 TENSOR_NONE,
                 all.clone(),
-                &[do_],
+                &o_deps,
             )
         };
         // FIRST RESIDUAL + PRE-MLP NORM — the biggest structural fork.
@@ -4670,10 +4883,8 @@ fn emit_phase(
         // gate-vs-up), so only when pick_tile would have chosen Gemm anyway.
         // gate/up are COLUMN-parallel (inter_l lanes on this rank); the GLU is elementwise on the
         // rank's own lanes, so no communication. `c_gl` is the dependency feeding down_proj.
-        // Same bound, same reason as `fuse_qkv` above: `gemv_glu_rows` also reads x only
-        // through LDS, and with the walk on it stages `min(MM, M)` rows, not M.
-        let glu_fused =
-            gemv_family && (gemv_staged_rows(t) as u64 * c.hidden as u64) <= gm_lds_halves();
+        // Same backend-specific bound as `fuse_qkv` above.
+        let glu_fused = gemv_family && gemv_fused_input_fits(amd, t, c.hidden);
         let gemm_glu = !gemv_family && glu_fusion_wins(t, inter_l, c.hidden, n_cu);
         // w8a8: quant the (hidden-width) pre-FF norm output feeding gate/up. Reuses xqh/ash (q/k/v
         // already consumed them; the c_pf→o_proj→flash→qkv chain serializes the reuse). Inert
@@ -4740,18 +4951,23 @@ fn emit_phase(
                 })
             } else if mx4 {
                 // w.wg8/wu8 and w.sg/su carry the mxfp4 twins (e2m1 rows + E8M0 scale rows).
-                b.emit(DevOp::GemvGluMxfp4, gemv_wg_cap(all.clone()), &[c_pf], |d| {
-                    d.t[0] = n.fu;
-                    d.t[1] = mlp_src;
-                    d.t[2] = w.wg8;
-                    d.t[5] = w.wu8;
-                    d.t[3] = w.sg;
-                    d.t[4] = w.su;
-                    d.i[0] = t;
-                    d.i[1] = inter_l;
-                    d.i[2] = c.hidden;
-                    d.i[5] = c.mlp_act;
-                })
+                b.emit(
+                    DevOp::GemvGluMxfp4,
+                    gemv_wg_cap(all.clone()),
+                    &[c_pf],
+                    |d| {
+                        d.t[0] = n.fu;
+                        d.t[1] = mlp_src;
+                        d.t[2] = w.wg8;
+                        d.t[5] = w.wu8;
+                        d.t[3] = w.sg;
+                        d.t[4] = w.su;
+                        d.i[0] = t;
+                        d.i[1] = inter_l;
+                        d.i[2] = c.hidden;
+                        d.i[5] = c.mlp_act;
+                    },
+                )
             } else {
                 b.emit(DevOp::GemvGlu, all.clone(), &[c_pf], |d| {
                     d.t[0] = n.fu;
@@ -4802,7 +5018,10 @@ fn emit_phase(
         } else if mx4_pf && !gemv_family && glu_fusion_wins_mxfp4(t, inter_l, c.hidden, n_cu) {
             // PREFILL fp4 GLU (op 113): gate|up as two e2m1 matrices with their own E8M0 scale
             // rows, SwiGLU/GeGLU fused in the epilogue. Same slot map as the decode twin (92).
-            assert!(w.wg8 != TENSOR_NONE && w.sg != TENSOR_NONE, "mxfp4 prefill GLU has no fp4 twin");
+            assert!(
+                w.wg8 != TENSOR_NONE && w.sg != TENSOR_NONE,
+                "mxfp4 prefill GLU has no fp4 twin"
+            );
             b.emit(DevOp::GemmGluMxfp4, all.clone(), &[c_pf], |d| {
                 d.t[0] = n.fu;
                 d.t[1] = mlp_src;
@@ -5040,66 +5259,66 @@ fn emit_phase(
                         d.i[6] = nb;
                     })]
                 } else {
-                let c_glu = if fp8 {
-                    // fp8 path: separate norm + expert GLU (no fused fp8 norm variant)
-                    let c_xn2_local = b.emit(DevOp::RmsNorm, rows.clone(), &[c_pf], |d| {
-                        d.t[0] = n.moe_xn2;
-                        d.t[1] = n.x;
-                        d.t[2] = w.g_pre2;
-                        d.i[0] = t;
-                        d.i[1] = c.hidden;
-                        d.f[0] = c.eps;
-                    });
-                    b.emit(
-                        DevOp::MoeExpertGluGemmaFp8,
-                        glu_cus,
-                        &[c_rt, c_xn2_local],
-                        |d| {
+                    let c_glu = if fp8 {
+                        // fp8 path: separate norm + expert GLU (no fused fp8 norm variant)
+                        let c_xn2_local = b.emit(DevOp::RmsNorm, rows.clone(), &[c_pf], |d| {
+                            d.t[0] = n.moe_xn2;
+                            d.t[1] = n.x;
+                            d.t[2] = w.g_pre2;
+                            d.i[0] = t;
+                            d.i[1] = c.hidden;
+                            d.f[0] = c.eps;
+                        });
+                        b.emit(
+                            DevOp::MoeExpertGluGemmaFp8,
+                            glu_cus,
+                            &[c_rt, c_xn2_local],
+                            |d| {
+                                d.t[0] = n.moe_mfu;
+                                d.t[1] = n.moe_xn2;
+                                d.t[2] = n.moe_tab;
+                                d.t[3] = w.ewt;
+                                d.t[4] = w.est;
+                                d.i[0] = c.top_k;
+                                d.i[1] = c.moe_inter;
+                                d.i[2] = c.hidden;
+                                d.i[3] = c.n_exp;
+                                d.i[5] = nb; // BATCH B (0 at B=1: byte-identical)
+                            },
+                        )
+                    } else {
+                        // bf16 path: fused norm + expert GLU (one fewer gate)
+                        b.emit(DevOp::MoeExpertGluNormGemma, glu_cus, &[c_rt, c_pf], |d| {
                             d.t[0] = n.moe_mfu;
-                            d.t[1] = n.moe_xn2;
+                            d.t[1] = n.x;
                             d.t[2] = n.moe_tab;
                             d.t[3] = w.ewt;
-                            d.t[4] = w.est;
+                            d.t[4] = w.g_pre2;
                             d.i[0] = c.top_k;
                             d.i[1] = c.moe_inter;
                             d.i[2] = c.hidden;
                             d.i[3] = c.n_exp;
                             d.i[5] = nb; // BATCH B (0 at B=1: byte-identical)
-                        },
-                    )
-                } else {
-                    // bf16 path: fused norm + expert GLU (one fewer gate)
-                    b.emit(DevOp::MoeExpertGluNormGemma, glu_cus, &[c_rt, c_pf], |d| {
-                        d.t[0] = n.moe_mfu;
-                        d.t[1] = n.x;
+                            d.f[0] = c.eps;
+                        })
+                    };
+                    let down_op = if fp8 {
+                        DevOp::MoeExpertDownGemmaFp8
+                    } else {
+                        DevOp::MoeExpertDownGemma
+                    };
+                    vec![b.emit(down_op, down_cus, &[c_glu], |d| {
+                        d.t[0] = n.moe_part;
+                        d.t[1] = n.moe_mfu;
                         d.t[2] = n.moe_tab;
                         d.t[3] = w.ewt;
-                        d.t[4] = w.g_pre2;
+                        d.t[4] = w.est;
                         d.i[0] = c.top_k;
-                        d.i[1] = c.moe_inter;
-                        d.i[2] = c.hidden;
+                        d.i[1] = c.hidden;
+                        d.i[2] = c.moe_inter;
                         d.i[3] = c.n_exp;
                         d.i[5] = nb; // BATCH B (0 at B=1: byte-identical)
-                        d.f[0] = c.eps;
-                    })
-                };
-                let down_op = if fp8 {
-                    DevOp::MoeExpertDownGemmaFp8
-                } else {
-                    DevOp::MoeExpertDownGemma
-                };
-                vec![b.emit(down_op, down_cus, &[c_glu], |d| {
-                    d.t[0] = n.moe_part;
-                    d.t[1] = n.moe_mfu;
-                    d.t[2] = n.moe_tab;
-                    d.t[3] = w.ewt;
-                    d.t[4] = w.est;
-                    d.i[0] = c.top_k;
-                    d.i[1] = c.hidden;
-                    d.i[2] = c.moe_inter;
-                    d.i[3] = c.n_exp;
-                    d.i[5] = nb; // BATCH B (0 at B=1: byte-identical)
-                })]
+                    })]
                 };
                 // fused combine + rmsnorm + residual: saves 2 counter gates per layer.
                 let mut comb_deps: Vec<u32> = c_dn;
@@ -5469,15 +5688,15 @@ fn emit_phase(
             Some("0") => false,
             _ => amd,
         };
+    let (lm_m, lm_row0) = if decode { (t, 0) } else { (1, t - 1) };
     let lm_op = if gemv_family || pf_gemv_head {
         DevOp::Gemv
     } else {
-        pick_tile(1, vocab_l, c.hidden, n_cu, kernelcaps::QuantScheme::None)
+        pick_tile(lm_m, vocab_l, c.hidden, n_cu, kernelcaps::QuantScheme::None)
     };
     // PREFILL takes only the LAST prompt row's logits (M=1, a_row0=t-1). DECODE takes ALL t rows,
     // one per sequence (M=t, a_row0=0) — batch>1 samples a token per sequence. Decode B=1 gives
     // (M=1, a_row0=0), identical to the old (1, t-1) since t==1 there.
-    let (lm_m, lm_row0) = if decode { (t, 0) } else { (1, t - 1) };
     // PLOW_FP8_HEAD: weight-only fp8 lm_head (GemvFp8, dequant-on-load, per-row scale).
     // The tied embedding LOOKUP stays bf16 (reads the original table); only the head GEMV
     // reads the fp8 twin. Own reporting row — vLLM's fp8 recipe keeps lm_head bf16.
@@ -5562,7 +5781,7 @@ fn emit_phase(
     // without the guard every prefill bucket emitted argmax over t "sequences", reading
     // t*vocab logits from the [dbatch][vocab] tensor (a 64 MiB OOB read at t=8192) and
     // clobbering ids[0..t]. Prefill is always single-sequence (lm_head M=1 → logits row 0).
-    let nb_argmax = if decode && t > 1 { t } else { 0 };
+    let nb_argmax = if lm_m > 1 { lm_m } else { 0 };
     // FUSED (fuse_am): GemvArgmax already wrote the `all.len()` partials — skip the Argmax packet
     // and fold that many. CLASSIC: the 64-block Argmax strides the full vocab, folding AMAX_BLOCKS.
     let (c_am, nparts) = if fuse_am {
@@ -6200,15 +6419,49 @@ struct EmitCapabilities {
     dense_packet_contracts: bool,
     decode_objects: bool,
     cublaslt_decode: bool,
+    decode_ladder: bool,
 }
 
 fn emit_capabilities(model_type: &str) -> EmitCapabilities {
-    let dense = matches!(model_type, "gemma4" | "gemma4_text" | "llama" | "qwen3");
+    let dense = matches!(
+        model_type,
+        "gemma4" | "gemma4_text" | "gemma4_unified" | "gemma4_unified_text" | "llama" | "qwen3"
+    );
     EmitCapabilities {
         dense_packet_contracts: dense,
         decode_objects: dense || model_type == "qwen3_5",
         cublaslt_decode: model_type == "qwen3_5",
+        decode_ladder: dense || model_type == "gpt_oss",
     }
+}
+
+fn apply_production_defaults(
+    cfg: &mut emit_config::EmitConfig,
+    capabilities: EmitCapabilities,
+    arch: &str,
+    tp: u32,
+) {
+    // gfx942 STOPS AT 8, sm_90a KEEPS 16. `GEMV_MAXM` caps the compiled row bucket at 16, and at
+    // t=16 the fused bodies' LDS staging (`16 * 5376 > 73728`) overflows, so the emitter drops
+    // both `fuse_qkv` and `glu_fused` — measured 202.3 -> 142.4 tok/s going from B=8 to B=16.
+    // A 16 rung is only worth emitting here once `PLOW_GEMV_WALK` moves the staging inside the
+    // row loop; until then it is a rung that costs throughput to select.
+    let ladder = match arch {
+        "sm_90a" => Some("1,2,4,8,16"),
+        "gfx942" => Some("1,2,4,8"),
+        _ => None,
+    };
+    let eligible =
+        cfg.decode_ladder.is_none() && cfg.decode_batch == 1 && capabilities.decode_ladder && tp == 1;
+    if let (Some(ladder), true) = (ladder, eligible) {
+        cfg.decode_ladder = Some(ladder.into());
+        cfg.decode_ladder_default = true;
+        // The knob record must describe the config that EMITTED the blob, not the one that was
+        // parsed. This is the only place in the tree where the two differ.
+        emit_config::note_production_default("decode_ladder", ladder.into());
+    }
+    cfg.packed_prefill_default =
+        capabilities.dense_packet_contracts && arch == "sm_90a" && tp == 1 && !cfg.fp8_kv;
 }
 
 fn cublaslt_emit_supported(
@@ -6240,9 +6493,21 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
         whole_graph_fusions,
     } = args;
 
-    // Resolve the unified emit config: either from the CLI (plowc path) or from env vars (legacy).
+    let model_type =
+        serde_json::from_slice::<Value>(&std::fs::read(dir.join("config.json")).unwrap())
+            .ok()
+            .and_then(|v| {
+                v.get("model_type")
+                    .and_then(|m| m.as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+    let capabilities = emit_capabilities(&model_type);
+    let mut emit_cfg = _emit_cfg.unwrap_or_else(emit_config::EmitConfig::from_env);
+    apply_production_defaults(&mut emit_cfg, capabilities, &arch, tp);
+
     // Installed process-wide so deeply nested emit functions can call emit_config::active().
-    emit_config::install(_emit_cfg.unwrap_or_else(emit_config::EmitConfig::from_env));
+    emit_config::install(emit_cfg);
     install_whole_graph_fusions(whole_graph_fusions);
     clear_attention_decisions();
 
@@ -6255,15 +6520,6 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
 
     // GLM-5.2 (GlmMoeDsa) — MLA + DSA + block-fp8 MoE — is a wholly separate emit path (glm_main).
     // Dispatch on model_type before the dense-GQA cfg parse, which would panic on GLM's config.
-    let model_type =
-        serde_json::from_slice::<Value>(&std::fs::read(dir.join("config.json")).unwrap())
-            .ok()
-            .and_then(|v| {
-                v.get("model_type")
-                    .and_then(|m| m.as_str())
-                    .map(str::to_string)
-            })
-            .unwrap_or_default();
     // GPT-OSS: its own emitter (gptoss.rs) over the CPU-tier contracts; `cfg_from` would panic
     // on its config and the dense path has no MoE-with-bias/sinks arm.
     if model_type == "gpt_oss" {
@@ -6285,7 +6541,6 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
         );
         return;
     }
-    let capabilities = emit_capabilities(&model_type);
     if emit_config::active().decode_cublaslt {
         assert!(
             cublaslt_emit_supported(
@@ -6301,13 +6556,24 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
         !emit_config::active().gemv_decode_role || capabilities.dense_packet_contracts,
         "GEMV decode role currently requires the dense BF16 emitter"
     );
-    if emit_config::active().emit_packed_prefill {
+    if emit_config::active().packed_prefill_on() {
+        // ONE FLAG, TWO THINGS, and asserting one contract for both made the second
+        // unreachable. On NVIDIA `PLOW_EMIT_PACKED_PREFILL` emits the packed-REQUEST ABI — a
+        // metadata section plus `pf.request.*` tensors — which really is a Hopper / TP1 /
+        // BF16-KV contract. On AMD it emits the family-segmented sibling TOPOLOGY: the same
+        // buckets a second time with `set_packed_prefill_segments`, which the runtime
+        // resolves to only while it is staging a packed binding. That has no Hopper, no TP1
+        // and no KV-encoding requirement, and it is what `PLOW_PACKED_PREFILL_ROUTE=1` needs
+        // in order to find a pure MLA/KDA segment to route.
+        //
+        // `mla/kimi_k3.rs` has asked for the sibling topology since it was written and this
+        // assertion is why it could never be given one; a GLM-5.3 gfx942 TP4 emit died here.
         assert!(
-            arch == "sm_90a" && tp == 1 && !emit_config::active().fp8_kv,
+            emit_is_amd() || (arch == "sm_90a" && tp == 1 && !emit_config::active().fp8_kv),
             "packed request emission requires Hopper single-GPU BF16 KV"
         );
         assert!(
-            capabilities.dense_packet_contracts,
+            emit_is_amd() || capabilities.dense_packet_contracts,
             "packed requests require the compiled direct-KV emitter access contract"
         );
     }
@@ -6680,6 +6946,78 @@ pub(crate) fn require_mla_rope(
     }
 }
 
+/// The latent width every MLA kernel in the tree is instantiated at.
+///
+/// Not a tuning constant and not a default — a TEMPLATE ARGUMENT, at every dispatch site in
+/// `runtime/amd/interp.hip` and `runtime/nvidia/`. See [`require_mla_geometry`].
+pub(crate) const MLA_DK: u32 = 512;
+
+/// The bf16 lane width `d_mla_merge_fold`'s fast map loads through (`PLOW_MLA_FOLD_VEC`). A
+/// `v_head_dim` that is not a multiple of it makes the fast map unreachable in every arm.
+pub(crate) const MLA_FOLD_VEC: u32 = 4;
+
+/// Refuse to emit an MLA packet whose geometry no kernel in this tree is instantiated for.
+///
+/// Same discipline and same call site as [`require_mla_rope`]: at the `config.json` parse, once,
+/// with the model's name still in hand.
+///
+/// # Why this is a refusal and not a generalization
+///
+/// `cfg_glm` reads `kv_lora_rank`, `qk_rope_head_dim` and `v_head_dim` straight from the config
+/// and never compared them to anything. Every MLA dispatch site then hardcodes `<512, 64>` or
+/// `<512, 0>`. A model at `kv_lora_rank = 384` would emit correctly-shaped tensors and have the
+/// kernel read 512 elements out of each 384-wide row — past the end of the latent cache, into
+/// whatever follows it. That is the worst class in this file: not a missing arm (which on AMD
+/// merely writes nothing), but a present arm reading a shape it was not built for.
+///
+/// **`DK` cannot be made runtime-general and it is more honest to say so than to pretend.** It
+/// sets the staged LDS slab (`FA_MLA_PF2_LDS_BYTES`), the QK k-tile count `NKT`, the output
+/// n-tile count `NT` and therefore the size of the `oacc[NT]` register file, and the
+/// `d_mla_merge_fold` fold map. A runtime `DK` costs the arm the register allocation that is its
+/// entire reason to exist, and each additional compile-time `DK` is a full re-qualification of
+/// the 4-wave flash object against its 512-register cliff. The reference implementations reach
+/// the same conclusion: vLLM's ROCm sparse MLA asserts `nope_head_dim == 448 && rope_head_dim ==
+/// 64` outright (`rocm_aiter_mla_sparse.py::_validate_dsv4_sparse_dims`), and AITER's MLA reduce
+/// dispatches from a compile-time enumerated `(num_heads, head_dim)` table whose fallthrough is
+/// `AITER_CHECK(false, ...)`.
+///
+/// `DR` **is** general as of the zero-rope V2 arm: 0, or any multiple of the 32-deep MFMA k-tile
+/// shim that the emitter's rope tables can fill. Only 0 and 64 are exercised, so anything else is
+/// refused as unqualified rather than as impossible — the message says which.
+///
+/// `v_head_dim` is checked here because it is the same class of silent degradation one level
+/// down: `d_mla_merge_fold`'s fast map needs `V % PLOW_MLA_FOLD_VEC == 0`, and a `V` that misses
+/// it takes the scalar body in every arm — measured 7.7x slower, with nothing to say so.
+pub(crate) fn require_mla_geometry(kv_lora: u32, qk_rope: u32, v_head: u32, model: &str) {
+    assert!(
+        kv_lora == MLA_DK,
+        "{model}: kv_lora_rank = {kv_lora}, but every MLA kernel in this tree is instantiated at \
+         DK = {MLA_DK} as a TEMPLATE ARGUMENT (runtime/amd/op_attention.h: d_flash_mla_decode, \
+         d_flash_mla_prefill, d_flash_mla_prefill_v2, d_mla_merge_fold; runtime/amd/interp.hip \
+         hardcodes <512, ...> at every dispatch site). Emitting anyway would produce \
+         correctly-shaped tensors and have the kernel read {MLA_DK} elements out of each \
+         {kv_lora}-wide latent row — past the end of the cache, into whatever follows it. DK is \
+         not a runtime knob: it sizes the staged LDS slab, the QK k-tile count, and the register \
+         file of the output accumulator, so a new value is a new instantiation and a full \
+         re-qualification of the 4-wave flash object's 512-register budget, not a config change."
+    );
+    assert!(
+        qk_rope == 0 || qk_rope == 64,
+        "{model}: qk_rope_head_dim = {qk_rope}. The MLA bodies are general in DR (0, or a \
+         multiple of the 32-deep MFMA k-tile shim), but only 0 (NoPE) and 64 are instantiated and \
+         oracle-qualified. Add the instantiation at the interp.hip dispatch sites and give it \
+         coverage in runtime/tests/mla_gfx950_test.c before emitting for it — an uninstantiated \
+         DR does not trap on AMD, it selects a neighbouring arm that reads the wrong stride."
+    );
+    assert!(
+        v_head > 0 && v_head % MLA_FOLD_VEC == 0,
+        "{model}: v_head_dim = {v_head} is not a positive multiple of {MLA_FOLD_VEC} \
+         (PLOW_MLA_FOLD_VEC). d_mla_merge_fold's fast map requires `V % VEC == 0` and there is no \
+         arm without it, so every workgroup would fall into the scalar fold body — measured 7.7x \
+         slower, correct, and completely silent about it."
+    );
+}
+
 /// The opcodes the gfx950 interpreter actually dispatches.
 ///
 /// Kept as `PLOW_DOP_*` spellings so the drift test can compare them to `runtime/amd/interp.hip`
@@ -6812,9 +7150,20 @@ const GFX950_DISPATCHED: &[&str] = &[
     "PLOW_DOP_NORM_RESIDUAL_NORM",
     "PLOW_DOP_O_UV_FOLD",
     "PLOW_DOP_QUANT_FP8",
+    "PLOW_DOP_QWEN_GATED_NORM",
+    "PLOW_DOP_QWEN_GDN_CONV",
+    "PLOW_DOP_QWEN_GDN_CONV_PREFILL",
+    "PLOW_DOP_QWEN_GDN_GATE_PREP",
+    "PLOW_DOP_QWEN_GDN_QKV_PREP",
+    "PLOW_DOP_QWEN_GDN_STEP",
+    "PLOW_DOP_QWEN_HEADNORM_ROPE",
+    "PLOW_DOP_QWEN_Q_GATE_SPLIT",
+    "PLOW_DOP_QWEN_RMSNORM",
+    "PLOW_DOP_QWEN_SIGMOID_GATE",
     "PLOW_DOP_RESIDUAL",
     "PLOW_DOP_RMSNORM",
     "PLOW_DOP_ROWRMS",
+    "PLOW_DOP_ROW_GATHER",
     "PLOW_DOP_SITU_GLU",
     "PLOW_DOP_SOFTCAP",
     "PLOW_DOP_XALLGATHER",
@@ -6972,6 +7321,47 @@ fn warn_uniseg_on_amd(amd: bool) {
              that is not a flash. Emitting with wave-class segmentation instead."
         );
     }
+}
+
+/// Report the dispatch audit's findings at emit — a WARN by default, a refusal under
+/// `PLOW_AUDIT_STRICT=1`.
+///
+/// A warning and not a refusal by default, by the rule `warn_uniseg_on_amd` states: the test
+/// is "what does the caller get if I ignore this?", and here the caller gets a CORRECT blob
+/// that is slower than it needed to be. Refusing on a performance threshold would block good
+/// packets on a judgement call — while saying nothing is exactly the condition that let a 4x
+/// GEMV ceiling and a 27.6%-occupancy projection ship, each for weeks, each found only by
+/// disassembling the object.
+///
+/// `PLOW_AUDIT_STRICT=1` is for the build that has already been tuned: a campaign re-emitting
+/// a configuration it measured, or CI holding a blob to a floor it has met before.
+pub(crate) fn report_dispatch_audit(man: &serde_json::Value) {
+    let Some(audit) = man.get("dispatch_audit") else {
+        return;
+    };
+    let Err(report) = dispatch_audit::check(audit) else {
+        return;
+    };
+    if !emit_config::active().audit_strict {
+        eprintln!(
+            "  WARNING: dispatch audit findings (build.json: dispatch_audit.findings). These \
+             cost throughput, not correctness — the blob is written and is right.\n{report}  \
+             Retune the floor with PLOW_AUDIT_OCC_FLOOR / PLOW_AUDIT_GEMV_WASTE_MAX, or set \
+             PLOW_AUDIT_STRICT=1 to make findings fatal."
+        );
+        return;
+    }
+    eprintln!(
+        "dispatch audit refused this blob (PLOW_AUDIT_STRICT=1):\n{report}Missing capability: \
+         `dispatch_audit_clean` — one or more matmuls do not meet the configured floor. Each \
+         line above names the op and the number. Either fix the dispatch (a GEMV ceiling is \
+         the decode object's PLOW_GEMV_MM against this blob's decode rungs; a low occupancy is \
+         the CU set the op is emitted on against the tiles it has), raise the floor with \
+         PLOW_AUDIT_OCC_FLOOR / PLOW_AUDIT_GEMV_WASTE_MAX, or drop PLOW_AUDIT_STRICT to emit \
+         anyway. NOT auto-relaxed: a threshold that moves itself to fit the build it is \
+         checking records nothing."
+    );
+    std::process::exit(1);
 }
 
 /// Warn when `--arch` and `--gpu` name different vendors.
@@ -7231,8 +7621,16 @@ fn emit_dense_gqa(
     const LADDER_BM: u32 = 128;
     const LADDER_BN: u32 = 128;
     let cap = ctx.min(max_chunk(c.window));
-    let shipped: Vec<u32> = [128u32, 512, 1024, 2048, 4096, 8192]
-        .into_iter()
+    // SUB-128 PREFILL RUNGS (32, 64), AMD only and OFF BY DEFAULT — see `PLOW_PF_FLOOR`, which
+    // carries the measurement that withdrew them. The short version: sublinear saving because
+    // `GM_BM=192` means the GEMM does not shrink below t=192 at all, zero in two serving
+    // campaigns, and they cap the decode ladder at 16 because prefill and decode rungs share one
+    // width-ordered space.
+    let floor: &[u32] = if amd && ecfg.pf_floor { &[32, 64] } else { &[] };
+    let shipped: Vec<u32> = floor
+        .iter()
+        .copied()
+        .chain([128u32, 512, 1024, 2048, 4096, 8192])
         .filter(|&x| x <= cap)
         .collect();
     // PLOW_PF_LADDER is sm_120-only, and its own comment above says why: the rungs are derived from
@@ -7318,11 +7716,11 @@ fn emit_dense_gqa(
     // so B=32 only fits at a reduced ctx. Raising it further needs no kernel work.
     // The rung ladder, ASCENDING. `[decode_batch]` when PLOW_DECODE_BATCH_LADDER is unset,
     // so `dbatch` below is the value it always was and the emit is byte-identical.
-    let rungs: Vec<u32> = ecfg.decode_rungs();
+    let mut rungs: Vec<u32> = ecfg.decode_rungs();
     // Every per-slot resource is sized at the WIDEST rung, and that is the whole design:
     // slot `s`'s offset into the KV cache is `s * (kv_head*ring*hd)` — INVARIANT in B — so a
     // sequence keeps its slot while the program under it changes rung to rung.
-    let dbatch: u32 = *rungs.last().expect("decode_rungs is non-empty");
+    let mut dbatch: u32 = *rungs.last().expect("decode_rungs is non-empty");
     // 26B-A4B MoE decode is BATCHED (B in 1..=32): the router family, the flat expert GLU/down
     // and the combine all carry a batch row count and index [B][k] routing slots. See the
     // work-item ordering note in runtime/nvidia/op_moe.cuh for the weight-reuse design.
@@ -7343,23 +7741,54 @@ fn emit_dense_gqa(
     // Phase 1: the DenseGqaEmitter owns the dense
     // tensor declaration (declare) and the emit_phase call sites. Byte-identical —
     // `new` forwards to the same `declare`, `emit_*` to the same `emit_phase`.
-    let (emitter, tensors, gen) = DenseGqaEmitter::new(
-        &c,
-        &ls,
-        n_cu,
-        ctx,
-        fp8,
-        w8a8,
-        fp8_kv,
-        fp8_kv_full,
-        block.clone(),
-        block_mode,
-        ns_pre,
-        dbatch,
-        moe_pf,
-        amd,
-    );
+    let declare = |dbatch| {
+        DenseGqaEmitter::new(
+            &c,
+            &ls,
+            n_cu,
+            ctx,
+            fp8,
+            w8a8,
+            fp8_kv,
+            fp8_kv_full,
+            block.clone(),
+            block_mode,
+            ns_pre,
+            dbatch,
+            moe_pf,
+            amd,
+        )
+    };
+    let (mut emitter, mut tensors, mut gen) = declare(dbatch);
+    if ecfg.decode_ladder_default {
+        if let Some(target) = hwspec::registry::lookup(&gpu) {
+            let budget = target.mem.capacity.0.saturating_sub(2 << 30);
+            loop {
+                let resident: u64 = tensors.iter().map(|t| t.bytes).sum();
+                if resident <= budget || rungs.len() == 1 {
+                    break;
+                }
+                rungs.pop();
+                dbatch = *rungs.last().unwrap();
+                (emitter, tensors, gen) = declare(dbatch);
+            }
+            eprintln!("  default decode ladder after full-context memory sizing: {rungs:?}");
+        }
+    }
 
+    // PREFILL PLACEMENT IS OFF BY DEFAULT ON AMD, and that is what makes the DECODE placement
+    // usable at all. `PLOW_L2_PLACE` already defaults ON for gfx942/gfx950, but
+    // `scripts/build_gfx942.sh` gates `-DPLOW_L2_PLACE_DISPATCH` on the PREFILL objects behind
+    // `PLOW_L2HIER_PF`, which is off — so `plowrt` REFUSES a blob whose prefill programs are
+    // placed, and the only way past that was `PLOW_L2_PLACE=0`, which throws away the decode
+    // half too. That is how the shipped Gemma-4-31B blob came to be unplaced (`PLOWDEV\x09`,
+    // not `\x0b`) with `PLOW_GATE_HIER` compiled into the decode object and INERT at run time:
+    // the hierarchy's precondition is `prog.l2_domains != 0`. Measured cost of that accident,
+    // Gemma-4-31B BF16 TP1 MI300X, served, medians of six: TPOT +4.7% to +8.0%.
+    // An explicit `PLOW_L2_PLACE_PREFILL=1` still asks for it (pair it with `PLOW_L2HIER_PF=1`
+    // objects); NVIDIA is unchanged, where one cooperative launch reads no wave class.
+    let l2_place_prefill = ecfg.l2_place_prefill
+        && (!amd || std::env::var_os("PLOW_L2_PLACE_PREFILL").is_some());
     let mut progs = Vec::new();
     let mut tlist = Vec::new();
     for &t in &buckets {
@@ -7369,7 +7798,7 @@ fn emit_dense_gqa(
         let mut b = Builder::new(n_cu);
         b.set_fuse_materialized_residual_inputs(ecfg.fuse_residual_input);
         b.adopt_tensors(tensors.clone());
-        b.set_l2_placement(l2_layout); // PLOW_L2_PLACE: None ⇒ byte-identical
+        b.set_l2_placement(l2_layout.filter(|_| l2_place_prefill));
         b.set_lean_moe_stage2_segments(amd && emit_config::active().moe_stage2_lean);
         b.set_lean_moe_stage1_segments(amd && emit_config::active().moe_stage1_lean);
         b.set_lean_moe_combine_segments(amd && emit_config::active().moe_combine_lean);
@@ -7397,7 +7826,7 @@ fn emit_dense_gqa(
                 && (emit_config::active().kda_wu_lean || emit_config::active().kda_carry_keyfeed),
         );
         b.set_kda_carry_keyfeed_segments(emit_config::active().kda_carry_keyfeed);
-        if amd || emit_config::active().emit_packed_prefill {
+        if amd || emit_config::active().packed_prefill_on() {
             b.deny_uniseg(); // PLOW_UNISEG collapses the wave-class split — see `warn_uniseg_amd`
         }
         // T18 (PLOW_UNISEG_MAX_T=<t>): small buckets emit ONE segment so the serve side takes
@@ -7593,11 +8022,13 @@ fn emit_dense_gqa(
     // site's — to downgrade "no usable verifier here" into an `Ok` carrying a
     // skip reason. Anything that reaches this `Err` is the verifier saying the
     // program is wrong, i.e. a real bug caught, and must be loud.
-    if ecfg.emit_packed_prefill {
+    let mut packed_prefill_emitted = false;
+    if ecfg.packed_prefill_on() {
         assert!(
             !emit_is_amd() && !fp8_kv,
             "packed prefill requires dense BF16 KV NVIDIA packet"
         );
+        let packed_tensor_base = m.tensors.len();
         let max_rows = m.prog_t[..packet::devbuild::decode_rung_lo(&m.prog_t)]
             .iter()
             .copied()
@@ -7633,8 +8064,8 @@ fn emit_dense_gqa(
             });
             maps.push(plow_asset::packed_prefill::Map { original, slots });
         }
-        let manifest = plow_asset::program::with_model(&m, |p| {
-            let live = plow_asset::live_kv::emit(p).expect("packed LIVE geometry");
+        let manifest = plow_asset::program::with_model(&m, |p| -> Result<_, String> {
+            let live = plow_asset::live_kv::emit(p)?;
             let request = plow_asset::packed_prefill::Manifest {
                 version: 1,
                 slot,
@@ -7645,16 +8076,26 @@ fn emit_dense_gqa(
                     .map(plow_asset::live_kv::program_digest)
                     .collect(),
             };
-            request.validate(p, &live).expect("packed request contract");
-            request
+            request.validate(p, &live)?;
+            Ok(request)
         });
-        sections.push(packet::devbuild::SectionData {
-            kind: packet::devbuild::SECT_METADATA,
-            name: plow_asset::packed_prefill::SECTION.into(),
-            data: serde_json::to_vec(&manifest).unwrap(),
-        });
+        match manifest {
+            Ok(manifest) => {
+                sections.push(packet::devbuild::SectionData {
+                    kind: packet::devbuild::SECT_METADATA,
+                    name: plow_asset::packed_prefill::SECTION.into(),
+                    data: serde_json::to_vec(&manifest).unwrap(),
+                });
+                packed_prefill_emitted = true;
+            }
+            Err(error) if ecfg.emit_packed_prefill.is_none() => {
+                m.tensors.truncate(packed_tensor_base);
+                eprintln!("  packed prefill not selected: {error}");
+            }
+            Err(error) => panic!("packed request contract: {error}"),
+        }
     }
-    if projection_bindings.is_some() || ecfg.emit_packed_prefill {
+    if projection_bindings.is_some() || packed_prefill_emitted {
         let manifest = plow_asset::program::with_model(&m, plow_asset::live_kv::emit)
             .unwrap_or_else(|error| panic!("compiled LIVE KV geometry: {error}"));
         sections.push(packet::devbuild::SectionData {
@@ -7682,6 +8123,13 @@ fn emit_dense_gqa(
         )
     }
     .unwrap_or_else(|error| panic!("decode objects: {error}"));
+    attention_prefill_role::apply_output_object(
+        &mut m,
+        &mut sections,
+        &arch,
+        std::path::Path::new(&out),
+    )
+    .unwrap_or_else(|error| panic!("prefill attention object: {error}"));
     let blob = if sections.is_empty() {
         m.to_blob()
     } else {
@@ -7730,7 +8178,8 @@ fn emit_dense_gqa(
     // Skipped when `arch` is empty (the legacy `gemma4` CLI), so that path's output
     // is unchanged.
     if !arch.is_empty() {
-        let man = manifest::build(&m, &arch, &lean);
+        let man = manifest::build_for_packet(&m, &arch, &lean, &sections);
+        report_dispatch_audit(&man);
         let mpath = std::path::Path::new(&out).with_file_name("build.json");
         let cpath = std::path::Path::new(&out).with_file_name("plow_config.h");
         manifest::write_config_header(&cpath, &man)
@@ -7874,5 +8323,9 @@ mod chunk_default_tests;
 #[cfg(test)]
 #[path = "lib_tests/emit_capabilities.rs"]
 mod emit_capabilities_tests;
+
+#[cfg(test)]
+#[path = "lib_tests/token_batch_contract.rs"]
+mod token_batch_contract_tests;
 
 pub mod fp8_m1_role;

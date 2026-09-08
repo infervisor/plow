@@ -26,13 +26,64 @@ pub struct ChatRequest {
     pub ignore_eos: Option<bool>,
     #[serde(default)]
     pub stream_options: Option<StreamOptions>,
+    /// OpenAI `stop`: a string or up to four strings. APPLIED — generation ends
+    /// at the first match and the matched text is withheld from the output.
+    #[serde(default)]
+    pub stop: Option<StopSpec>,
+    /// Mixed into the sampling RNG so a run is reproducible on request.
+    #[serde(default)]
+    pub seed: Option<u64>,
+    // The rest are parsed ONLY so the handler can REFUSE them. Serde drops
+    // unknown fields silently, and a silently dropped `tools` or `n` is a
+    // wrong answer that scores as a successful request — the failure mode the
+    // image refusal already guards against.
+    #[serde(default)]
+    pub n: Option<u32>,
+    #[serde(default)]
+    pub logprobs: Option<serde_json::Value>,
+    #[serde(default)]
+    pub top_logprobs: Option<serde_json::Value>,
+    #[serde(default)]
+    pub tools: Option<serde_json::Value>,
+    #[serde(default)]
+    pub tool_choice: Option<serde_json::Value>,
+    #[serde(default)]
+    pub functions: Option<serde_json::Value>,
+    #[serde(default)]
+    pub function_call: Option<serde_json::Value>,
+    #[serde(default)]
+    pub response_format: Option<serde_json::Value>,
+}
+
+/// OpenAI `stop`: the wire form is a bare string or an array of them.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum StopSpec {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl StopSpec {
+    /// The stop strings, empty ones dropped (an empty stop would halt at once).
+    pub fn list(&self) -> Vec<String> {
+        match self {
+            StopSpec::One(s) => vec![s.clone()],
+            StopSpec::Many(v) => v.clone(),
+        }
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect()
+    }
 }
 
 /// `POST /v1/completions` request body (supported subset).
 #[derive(Clone, Debug, Deserialize)]
 pub struct CompletionRequest {
     pub model: String,
-    pub prompt: String,
+    /// OpenAI allows `str | [str] | [int] | [[int]]`. A bare `String` here made
+    /// `client.completions.create(prompt=[...])` fail with a 422 before any
+    /// handler ran, so accept the array forms and refuse BATCHES explicitly.
+    pub prompt: PromptSpec,
     #[serde(default = "default_add_special_tokens")]
     pub add_special_tokens: bool,
     #[serde(default)]
@@ -50,6 +101,31 @@ pub struct CompletionRequest {
     /// Plow parity extension. Available only for non-streaming requests.
     #[serde(default)]
     pub return_token_ids: bool,
+    #[serde(default)]
+    pub stop: Option<StopSpec>,
+    #[serde(default)]
+    pub seed: Option<u64>,
+    // Parsed to be REFUSED, as on the chat request.
+    #[serde(default)]
+    pub n: Option<u32>,
+    #[serde(default)]
+    pub best_of: Option<u32>,
+    #[serde(default)]
+    pub echo: Option<bool>,
+    #[serde(default)]
+    pub logprobs: Option<serde_json::Value>,
+    #[serde(default)]
+    pub suffix: Option<String>,
+}
+
+/// A `/v1/completions` prompt in any of OpenAI's four wire forms.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum PromptSpec {
+    Text(String),
+    Tokens(Vec<u32>),
+    Batch(Vec<String>),
+    TokenBatch(Vec<Vec<u32>>),
 }
 
 fn default_add_special_tokens() -> bool {
@@ -67,7 +143,29 @@ pub struct StreamOptions {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Message {
     pub role: String,
-    pub content: Content,
+    /// OPTIONAL. An assistant turn that carried a tool call has `content: null`,
+    /// and a non-`Option` field here made replaying such a conversation fail
+    /// with a 422 inside the extractor, before the handler could say why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<Content>,
+    /// The model's thinking trace, split out of the raw generation so that
+    /// `content` carries the ANSWER alone. GLM's generation prompt leaves
+    /// `<think>` open and `</think>` is not a special token, so without this
+    /// the whole trace landed in `content` as literal text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+}
+
+impl Message {
+    /// The message's text, empty when absent.
+    pub fn text(&self) -> String {
+        self.content.as_ref().map(Content::as_text).unwrap_or_default()
+    }
+
+    /// Whether this message carries an image part.
+    pub fn has_image(&self) -> bool {
+        self.content.as_ref().is_some_and(Content::has_image)
+    }
 }
 
 /// Message content: a plain string or multimodal parts (`text` / `image_url`).
@@ -142,6 +240,10 @@ pub struct ImageUrl {
 pub struct ChatResponse {
     pub id: String,
     pub object: &'static str,
+    /// Unix seconds. REQUIRED by the OpenAI schema and previously absent from
+    /// every response this server produced, which made strict clients reject it
+    /// and lenient ones surface an undefined value.
+    pub created: u64,
     pub model: String,
     pub choices: Vec<Choice>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -181,7 +283,11 @@ impl From<crate::serve::stream::TokenUsage> for Usage {
 pub struct Choice {
     pub index: u32,
     pub message: Message,
-    pub finish_reason: &'static str,
+    pub finish_reason: Option<&'static str>,
+    /// Present only when the wire `finish_reason` had to be widened to fit the
+    /// OpenAI vocabulary — currently a preemption reported as `"length"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x_plow_finish_reason: Option<&'static str>,
 }
 
 /// One streamed `chat.completion.chunk`.
@@ -189,6 +295,8 @@ pub struct Choice {
 pub struct ChatChunk {
     pub id: String,
     pub object: &'static str,
+    /// Stamped once per request and repeated on every chunk of that stream.
+    pub created: u64,
     pub model: String,
     pub choices: Vec<ChunkChoice>,
     /// Set on the final frame only (OpenAI stream-usage shape).
@@ -209,12 +317,16 @@ pub struct Delta {
     pub role: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    /// Streamed thinking trace, before the answer starts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct CompletionResponse {
     pub id: String,
     pub object: &'static str,
+    pub created: u64,
     pub model: String,
     pub choices: Vec<CompletionChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -248,7 +360,54 @@ pub struct ModelList {
 pub struct ModelCard {
     pub id: String,
     pub object: &'static str,
+    pub created: u64,
     pub owned_by: &'static str,
+}
+
+/// Unix seconds, for the `created` field every OpenAI object carries.
+pub fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The OpenAI error envelope: `{"error": {"message", "type", "code"}}`.
+/// Every error this server returns goes through here. It used to emit a bare
+/// `{"error": "<string>"}`, which openai-python cannot read — it looks up
+/// `body["error"]["message"]` — so a client got a useless message and no code
+/// to branch on.
+#[derive(Clone, Debug, Serialize)]
+pub struct ApiErrorBody {
+    pub error: ApiError,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ApiError {
+    pub message: String,
+    pub r#type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub param: Option<String>,
+}
+
+impl ApiErrorBody {
+    pub fn new(
+        message: impl Into<String>,
+        r#type: &'static str,
+        code: Option<&'static str>,
+        param: Option<String>,
+    ) -> Self {
+        ApiErrorBody {
+            error: ApiError {
+                message: message.into(),
+                r#type,
+                code,
+                param,
+            },
+        }
+    }
 }
 
 #[cfg(test)]

@@ -182,6 +182,7 @@ pub fn run(opts: &TuneOptions) -> Result<(), Box<dyn std::error::Error>> {
     println!("tuning digest: {}", tuning_build.label());
     println!("inventory   : probed from {}", reg.build().label());
     println!("             defines: {}", reg.build().defines.join(" "));
+    warn_if_root_disagrees_with_the_compiler(&opts.root, hw.isa, &tuning_build);
     println!();
 
     match &opts.action {
@@ -209,6 +210,52 @@ pub fn run(opts: &TuneOptions) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+/// Say so when `--root` names a different checkout than the one tile selection will probe.
+///
+/// Every `plowc tune` subcommand reports on the tree named by `--root`. Tile selection at emit
+/// probes [`kernelcaps::source_root`] instead. When the two are the same tree — the normal
+/// case — this is silent. When they are not, `tune status` was previously reporting a store as
+/// CURRENT against a digest the compiler would never look up, which reads as "the campaign
+/// worked" while every emit falls back to the analytical model. That is the one failure a
+/// status command must not be able to miss, so it is checked here rather than inferred later.
+fn warn_if_root_disagrees_with_the_compiler(
+    root: &std::path::Path,
+    isa: hwspec::IsaLevel,
+    reported: &kernelcaps::BuildId,
+) {
+    let compiler_root = kernelcaps::source_root();
+    let same = match (root.canonicalize(), compiler_root.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        // Cannot tell; do not invent an alarm.
+        _ => true,
+    };
+    if same {
+        return;
+    }
+    println!();
+    println!("WARNING: --root is NOT the checkout tile selection probes.");
+    println!("  --root (reported above) : {}", root.display());
+    println!("  compiler probes         : {}", compiler_root.display());
+    match dense_gemm_tuning_build(&compiler_root, isa) {
+        Ok(theirs) if theirs.label() == reported.label() => {
+            println!("  both fingerprint {} — the two checkouts agree, so this", theirs.label());
+            println!("  is cosmetic. Records published here remain selectable.");
+        }
+        Ok(theirs) => {
+            println!("  compiler digest         : {}", theirs.label());
+            println!();
+            println!("  THE DIGESTS DIFFER, so every record this command reports as CURRENT is");
+            println!("  STALE to the compiler, and re-running the campaign cannot fix it: the");
+            println!("  campaign publishes under {} while", reported.label());
+            println!("  tile selection looks up {}.", theirs.label());
+            println!("  This is what a CARGO_TARGET_DIR shared between git worktrees produces —");
+            println!("  the binary carries the path of whichever worktree last built it. Rebuild");
+            println!("  plowc from this checkout, or set PLOW_SOURCE_ROOT to name one tree.");
+        }
+        Err(e) => println!("  (could not fingerprint that checkout: {e})"),
+    }
 }
 
 fn inventory(reg: &Inventory, hw: &HardwareFingerprint) {

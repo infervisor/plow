@@ -796,8 +796,11 @@ pub fn compile(src: &Source, opts: &Options) -> Result<Report, PlowcError> {
         let hw = hwspec::registry::lookup(&opts.gpu)
             .and_then(kernelcaps::HardwareFingerprint::from_spec);
         match hw {
+            // `Path::new(".")` was a THIRD answer to "which checkout describes this
+            // object", disagreeing with `devgen::pick_tile` whenever plowc is invoked from
+            // anywhere but the tree it was built from. One resolver, one answer.
             Some(hw) => Box::new(tuned::CompilerOracle::new(
-                std::path::Path::new("."),
+                &kernelcaps::source_root(),
                 &hw,
                 opts.tuning_db.as_ref(),
             )),
