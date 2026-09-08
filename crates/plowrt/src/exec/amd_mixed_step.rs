@@ -490,8 +490,18 @@ impl AmdEngine {
             return None;
         }
         let step = self.step_ref(route)?;
+        // ATTRIBUTION KNOB, not a tuning one. This route is confined to buckets with
+        // `nsplit == 1`, which on a blob whose small rungs split their attention means it runs
+        // a DIFFERENT bucket from the ordinary route for the same prompt — so a greedy output
+        // difference has two candidate causes at once, the packing and the bucket. Pinning the
+        // bucket holds the packing fixed and moves only the reduction order, which is what
+        // separates them. Unset in every measured configuration.
+        let pinned = std::env::var("PLOW_TOKEN_BATCH_ROWS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok());
         step.programs
             .iter()
+            .filter(|p| pinned.is_none_or(|rows| p.rows == rows))
             .filter(|p| {
                 p.samples && decode_rows <= p.decode_rows as usize && p.rows as usize > decode_rows
             })
