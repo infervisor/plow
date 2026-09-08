@@ -407,7 +407,7 @@ pub fn spawn(
     // GPU-engine bundles are bucketless: take both capacity and the optional
     // decode ladder from the loaded engine once, before the hot loop starts.
     #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
-    let gpu_shape = state.gpu_engine(bundle.network()).map(|e| {
+    let gpu_shape = state.gpu_engine(&slug).map(|e| {
         let e = e.lock();
         (e.batch(), e.decode_rungs())
     });
@@ -507,7 +507,17 @@ pub fn spawn(
         // GPU-engine models never run the CPU bucket walk — skip the ladder
         // scan + bufs machinery on the dispatcher critical path entirely.
         #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
-        let has_gpu = state.gpu_engine(bundle.network()).is_some();
+        let has_gpu = state.gpu_engine(&slug).is_some();
+        // Whose turn it is on this model's device. `None` on a CPU serve, and
+        // a no-op under `--co-sched free` (the default), where the driver
+        // admits whoever is ready and nothing here orders anything.
+        #[cfg(feature = "cuda")]
+        let device_turn = state.device_turn(&slug);
+        // Held across ticks so a quantum can span them; dropped whenever this
+        // model parks, so an idle model never sits on a GPU its co-tenant is
+        // waiting for.
+        #[cfg(feature = "cuda")]
+        let mut turn = crate::serve::cosched::Turn::default();
         #[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
         let has_gpu = false;
         // Dedicated engine/submission thread for GPU models: every tick runs
@@ -530,6 +540,8 @@ pub fn spawn(
             // Drain completion: if draining and no in-flight slots remain,
             // signal the drain future and exit the dispatcher loop.
             if draining && live == 0 {
+                #[cfg(feature = "cuda")]
+                turn.release();
                 if let Some(done) = drain_done.take() {
                     let _ = done.send(());
                 }
@@ -563,6 +575,10 @@ pub fn spawn(
             // Cold start: no live slots — block until an arrival (or exit
             // when every ModelMux clone has dropped and the channel closes).
             if live == 0 {
+                // Parking with the turn held would starve a co-tenant for as
+                // long as this model has nothing to do, which is unbounded.
+                #[cfg(feature = "cuda")]
+                turn.release();
                 let Some(msg) = rx.recv().await else { break };
                 note_dequeued(&msg, &metrics);
                 match msg {
@@ -860,6 +876,7 @@ pub fn spawn(
             };
             let bundle_ref = Arc::clone(&bundle);
             let state_ref = Arc::clone(&state);
+            let slug_for_tick = slug.clone();
             let key_for_tick = key;
             let vocab_for_tick = taken_bufs.as_ref().map(|b| b.vocab).unwrap_or(256);
 
@@ -888,6 +905,7 @@ pub fn spawn(
             let tick = move || {
                 run_one_tick(
                     &state_ref,
+                    &slug_for_tick,
                     &bundle_ref,
                     key_for_tick,
                     vocab_for_tick,
@@ -899,6 +917,14 @@ pub fn spawn(
                     steps,
                 )
             };
+            // Under `--co-sched rr`, wait for this device group's turn
+            // before submitting. Awaited HERE, off the engine thread, so a
+            // model waiting for the device is not occupying a submission
+            // thread while it waits.
+            #[cfg(feature = "cuda")]
+            if let Some(dt) = &device_turn {
+                turn.take(dt).await;
+            }
             // GPU models tick on the dedicated engine thread; the dispatcher
             // task stays hot for arrivals/cancellation either way.
             let joined = match &engine_thread {
@@ -1255,6 +1281,15 @@ fn live_kv_rows(slots: &[Option<Slot>]) -> impl Iterator<Item = SlotHandle> + '_
 /// ticks via `AppState::step_token` — the phase-1 behavior.
 fn run_one_tick(
     state: &AppState,
+    // The API slug, which is the key engines are INSTALLED under. Distinct
+    // from `bundle.network()`, the manifest's network name: `--assets DIR
+    // --slug other` registers under `other` while the manifest still says
+    // whatever it says. Looking the engine up by network therefore missed it
+    // for any slug override and fell through to the CPU reference
+    // interpreter — fluent, wrong, and fast, with nothing in the log. It only
+    // ever bites when a slug differs from a network name, which is to say when
+    // more than one model is in play.
+    slug: &str,
     bundle: &ModelBundle,
     key: Option<BucketKey>,
     vocab: usize,
@@ -1291,7 +1326,7 @@ fn run_one_tick(
     // prefill rows when available; otherwise prefill runs before one batched
     // decode launch.
     #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
-    if let Some(eng) = state.gpu_engine(bundle.network()) {
+    if let Some(eng) = state.gpu_engine(slug) {
         let mut guard = eng.lock();
         // Per-backend tick bodies, because the two engines differ in kind: the
         // sm_120 engine is slotted (B sequences, chunked prefill, prefix

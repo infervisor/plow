@@ -116,6 +116,29 @@ pub struct RuntimeConfig {
     )]
     pub place: String,
 
+    /// How co-resident models take a shared GPU: `free` (private streams, the
+    /// driver admits whoever is ready — fastest, and the default) or `rr`
+    /// (round-robin turns, which bounds starvation and makes the interleaving
+    /// reproducible at the cost of overlap).
+    #[arg(
+        long = "co-sched",
+        env = "PLOW_CO_SCHED",
+        default_value = "free",
+        global = true
+    )]
+    pub co_sched: String,
+
+    /// Consecutive ticks one model keeps the device under `--co-sched rr`.
+    /// Not 1 by default: models with different dynamic shared-memory requests
+    /// force an SM carveout reconfiguration on every alternation (~150-300us).
+    #[arg(
+        long = "co-sched-quantum",
+        env = "PLOW_CO_SCHED_QUANTUM",
+        default_value_t = 4,
+        global = true
+    )]
+    pub co_sched_quantum: u32,
+
     /// Directories under which `POST /v1/models/load` may take an assets dir.
     /// Repeatable; `PLOW_MODELS_ROOT` takes a `:`-separated list.
     ///

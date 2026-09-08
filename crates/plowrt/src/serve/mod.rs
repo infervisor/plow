@@ -4,6 +4,7 @@ pub mod admin;
 pub mod bench;
 pub mod chat;
 pub mod completion;
+pub mod cosched;
 #[cfg(feature = "cpu")]
 pub mod cpu_serve;
 /// The loaded device engine behind a slug, as one type over both backends —
@@ -453,6 +454,13 @@ impl AppState {
     #[cfg(feature = "cuda")]
     pub fn install_manager(&self, m: Arc<manager::ModelManager>) {
         self.install_managers(vec![m]);
+    }
+
+    /// The co-tenant turn for `slug`'s device group, when one is installed.
+    /// `None` on a CPU serve, which has no device to take turns on.
+    #[cfg(feature = "cuda")]
+    pub fn device_turn(&self, slug: &str) -> Option<Arc<cosched::DeviceTurn>> {
+        self.manager_for(slug).map(|m| Arc::clone(m.turn()))
     }
 
     /// Record which group serves `slug`.
