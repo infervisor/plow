@@ -63,10 +63,12 @@ fn production_defaults_are_capability_and_target_driven() {
     assert_eq!(unsupported.decode_rungs(), [1]);
     assert!(!unsupported.packed_prefill_on());
 
-    // gfx942 STOPS AT 8. The 16 rung is not merely unmeasured there — selecting it costs
-    // throughput (GEMV_MAXM=16 with the fused bodies' LDS staging overflowing at t=16, so the
-    // emitter drops fuse_qkv and glu_fused: 202.3 -> 142.4 tok/s). Pin the width so a later
-    // "make the ladders match" tidy-up has to argue with this instead of silently adding it.
+    // gfx942 STOPS AT 8, and NOT for the reason this comment used to give. The 16 rung is a
+    // 25% device-throughput WIN there (130.7 -> 163.3 tok/s, `amd-bench --batched`, n_cu 304);
+    // what it costs is the NARROWER rungs, because a ladder has one decode object and the
+    // MM=16 that rung needs takes served c=8 from 117.3 to 85.0 tok/s. See
+    // `apply_production_defaults`. Pin the width so a later "make the ladders match" tidy-up
+    // has to argue with that instead of silently adding it.
     let mut amd = EmitArgsForTest::try_parse_from(["test"]).unwrap().emit;
     apply_production_defaults(&mut amd, emit_capabilities("gemma4"), "gfx942", 1);
     assert_eq!(amd.decode_rungs(), [1, 2, 4, 8]);

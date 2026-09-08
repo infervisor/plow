@@ -2626,17 +2626,45 @@ fn gemv_row_bucket(t: u32) -> u32 {
 /// campaign (§6g-BATCH: slots 13/14/15 fluent-but-WRONG), and the fix at the time was to
 /// switch the fusion OFF at t=16 rather than to make it fit.
 ///
-/// Switching it off is not free, and §6g-BATCH prices it: the B=16 device ceiling is
-/// **142.4 tok/s against B=8's 202.3** — a 30% REGRESSION at twice the batch. Two things
-/// cause it at once, `MM=16` spilling (16 scratch ops, 5536 B/lane) and the loss of BOTH
-/// `fuse_qkv` and `glu_fused`; the instruction stream differs in COMPOSITION between t=8 and
-/// t=16, not just in width.
-///
 /// `PLOW_GEMV_WALK` (`op_gemm.h`, default 0) moves the staging INSIDE the row loop, so the
-/// bound becomes `min(MM, M) * K` — **independent of M**. At `MM = 8`, `8 * 5376 = 43008`
-/// fits, and a t=16 program keeps both fusions. That is what this function expresses, and it
-/// is the falsifiable half of the walk's case: at MM=8 serving t=16, B=16 should recover from
-/// 142.4 toward 202.3. If it does not, the LDS/fusion explanation is wrong.
+/// bound becomes `min(MM, M) * K` — **independent of M**. That is what this function
+/// expresses, and it is still the right bound.
+///
+/// # THE PREDICTION THIS COMMENT CARRIED IS FALSIFIED — measured 2026-09-08, gfx942
+///
+/// It said: *"at MM=8 serving t=16, B=16 should recover from 142.4 toward 202.3, because the
+/// walk restores both fusions. If it does not, the LDS/fusion explanation is wrong."* Both
+/// halves failed, and the fusion half could never have held ON THIS PART.
+///
+/// **73,728 is gfx950's arena, not gfx942's.** [`dec_stage_halves`] reads `hwspec`'s gfx942
+/// `decode_gemm_tile` — **15,360** halves. At `hidden = 5376` that admits t=2 and refuses
+/// t=3, so the 4 and 8 rungs already shipping have no `fuse_qkv` and no `glu_fused` either,
+/// and `min(MM, t) * 5376 > 15360` for every MM the walk can be built at. Measured: a
+/// Gemma-4-31B B=16 blob emitted with `PLOW_GEMV_WALK=1` is BYTE-IDENTICAL to one emitted
+/// without it on gfx942. The walk is an OBJECT change here and nothing else.
+///
+/// **And the walk costs throughput rather than recovering it.** `amd-bench --batched`,
+/// n_cu 304, blob and object matched at each width, ctx 1024:
+///
+/// | blob | object | tok/s |
+/// |---|---|--:|
+/// | B=8  | MM=8, walk off  | 130.7 |
+/// | B=16 | MM=16, walk off | **163.3** |
+/// | B=16 | MM=8, walk on   | 143.8 |
+/// | B=32 | MM=16, walk on  | 174.4 |
+/// | B=32 | MM=8, walk on   | 153.5 |
+///
+/// Each halving of MM doubles the weight passes and costs ~12%, at B=16 and B=32 alike —
+/// exactly the cost model `op_gemm.h` states, and no fusion term is needed to explain any of
+/// it. The 202.3/142.4 pair itself does not reproduce: B=16 is a 25% WIN over B=8 here, and
+/// the most likely reason the old pair looked otherwise is that it predates the
+/// [`gm_lds_halves`] fix, so its B=8 blob fused (wrongly) and its B=16 blob did not.
+///
+/// What the walk IS worth is capacity: one MM=8 walking object serves B=16, B=24 and B=32
+/// with a byte-identical `interp_decode.elf`, and it is the cheapest object in the set
+/// (322 ISA scratch ops against MM=8/walk-off's 537 and MM=16's 777). Fewer registers buy
+/// nothing on a step that is bandwidth-bound on 57 GiB of weights.
+/// See docs/amd/gemma4-31b-mi300x.md, "Decode concurrency 16 and 32".
 ///
 /// **Byte-identical when the walk is off, and byte-identical when it is on with no
 /// `PLOW_GEMV_MM` override**, because then `gemv_row_bucket(t) >= t` and the `min` is `t`.
@@ -6441,11 +6469,23 @@ fn apply_production_defaults(
     arch: &str,
     tp: u32,
 ) {
-    // gfx942 STOPS AT 8, sm_90a KEEPS 16. `GEMV_MAXM` caps the compiled row bucket at 16, and at
-    // t=16 the fused bodies' LDS staging (`16 * 5376 > 73728`) overflows, so the emitter drops
-    // both `fuse_qkv` and `glu_fused` — measured 202.3 -> 142.4 tok/s going from B=8 to B=16.
-    // A 16 rung is only worth emitting here once `PLOW_GEMV_WALK` moves the staging inside the
-    // row loop; until then it is a rung that costs throughput to select.
+    // gfx942 STOPS AT 8, sm_90a KEEPS 16 — and the reason is the OBJECT, not the rung.
+    //
+    // The fusion argument that stood here was wrong twice, and [`gemv_staged_rows`] now
+    // carries the measurement. It cited `16 * 5376 > 73728`, which is gfx950's decode arena;
+    // gfx942's is 15,360 halves, so the 4 and 8 rungs this ladder already ships have no
+    // fusions either and `PLOW_GEMV_WALK` cannot bring them back. And 202.3 -> 142.4 does not
+    // reproduce: re-measured at n_cu 304 with blob and object matched, B=8 is 130.7 tok/s and
+    // B=16 is 163.3 — the 16 rung is a 25% THROUGHPUT WIN at 1.6x the per-token latency.
+    //
+    // What still stops it is that a ladder has ONE decode object. `PLOW_GEMV_MM` is a
+    // compiled ceiling whose dead rows are computed and discarded, so the MM=16 object a 16
+    // rung needs costs every NARROWER rung: served through the mux, c=8 measures 117.3 tok/s
+    // on the MM=8 object and 85.0 on the MM=16 one — -27.5% for concurrency the rung never
+    // reaches. Adding the rung trades a quarter of the c<=8 throughput for a quarter more at
+    // c=16, which is a loss for a mux that spends most of its time below 8.
+    // `PLOW_DECODE_TIERS` (a per-rung object) is what makes the 16 rung payable; until a
+    // tiered gfx942 recipe ships and is measured, the ladder stops at 8.
     let ladder = match arch {
         "sm_90a" => Some("1,2,4,8,16"),
         "gfx942" => Some("1,2,4,8"),
