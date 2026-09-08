@@ -1719,6 +1719,48 @@ mod tests {
         assert!(!EmitConfig::from_env().fuse_residual_input);
     }
 
+    /// The default tuning store follows the checkout `plowc` is RUN in, not the one it was
+    /// BUILT in.
+    ///
+    /// The regression this pins is the one 27d596fc fixed everywhere else: with a
+    /// `CARGO_TARGET_DIR` shared across worktrees, `env!("CARGO_MANIFEST_DIR")` names whichever
+    /// worktree last rebuilt the binary. Tile selection keys records on
+    /// `kernelcaps::source_root`, so a `tunedb_root` that disagreed would read a different
+    /// checkout's `tuning/` than the digest it looks records up by — every record reads STALE
+    /// and no campaign can fix it. `PLOW_SOURCE_ROOT` is `source_root`'s first resolution step,
+    /// so pointing it somewhere neither checkout is the only way to tell the two answers apart.
+    #[test]
+    fn the_default_tunedb_root_follows_the_probed_source_root() {
+        let _guard = crate::test_env::env_guard();
+        let elsewhere = std::env::temp_dir().join("plow-tunedb-root-guard");
+        let _scope = crate::test_env::EnvScope::set(&[(
+            "PLOW_SOURCE_ROOT",
+            elsewhere.to_str().expect("temp dir is utf-8"),
+        )]);
+        std::env::remove_var("PLOW_TUNEDB");
+
+        let cfg = EmitConfig::from_env();
+        assert_eq!(
+            cfg.tunedb_root().map(std::path::PathBuf::from),
+            Some(kernelcaps::source_root().join("tuning")),
+        );
+        assert_eq!(
+            cfg.tunedb_root().map(std::path::PathBuf::from),
+            Some(elsewhere.join("tuning")),
+            "the default store must come from the probed source root, not from \
+             CARGO_MANIFEST_DIR"
+        );
+
+        // An explicit `--tuning-db` still wins, and `=\"\"` still disables tuning.
+        std::env::set_var("PLOW_TUNEDB", "/somewhere/else");
+        assert_eq!(
+            EmitConfig::from_env().tunedb_root().as_deref(),
+            Some("/somewhere/else")
+        );
+        std::env::set_var("PLOW_TUNEDB", "");
+        assert_eq!(EmitConfig::from_env().tunedb_root(), None);
+    }
+
     #[test]
     fn attnres_norm_fusion_defaults_on_and_allows_capture_opt_out() {
         let _guard = crate::test_env::env_guard();
