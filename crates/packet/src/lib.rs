@@ -414,7 +414,11 @@ pub struct TokenBody {
     pub in_slot: u16,
     pub out_slot: u16,
     pub kind: u8,
-    pub _pad: u8,
+    pub _pad0: u8,
+    /// Explicit tail of the 4-byte gap before `vocab`. Without it these two
+    /// bytes are implicit padding, which `push_pod` would serialise
+    /// uninitialised — making the emitted stream non-reproducible.
+    pub _pad1: u16,
     pub vocab: u32,
     pub arg: u32,
 }
@@ -803,7 +807,8 @@ impl Body {
                     in_slot,
                     out_slot,
                     kind,
-                    _pad: 0,
+                    _pad0: 0,
+                    _pad1: 0,
                     vocab,
                     arg,
                 },
@@ -1200,6 +1205,78 @@ mod tests {
             assert_eq!(sz % 4, 0);
             assert!(al <= 4);
         }
+    }
+
+    /// `push_pod` copies `size_of::<T>()` bytes, so any byte a record's declared
+    /// fields do not cover is implicit padding — which Rust never initialises and
+    /// which would therefore land in the emitted stream as stack garbage, making
+    /// `model.pkt` differ between two compiles of the same model.
+    #[test]
+    fn pushed_records_have_no_implicit_padding() {
+        fn field_size<T>(_: &T) -> usize {
+            size_of::<T>()
+        }
+        macro_rules! fields_tile {
+            ($t:ty, $($f:ident),+ $(,)?) => {{
+                // Safe for these records: every field is an integer or an array of
+                // integers, for which the all-zero bit pattern is valid.
+                let v: $t = unsafe { core::mem::zeroed() };
+                let mut next = 0usize;
+                $(
+                    assert_eq!(
+                        core::mem::offset_of!($t, $f), next,
+                        concat!(stringify!($t), ".", stringify!($f),
+                                " leaves an implicit padding gap before it"),
+                    );
+                    next += field_size(&v.$f);
+                )+
+                assert_eq!(
+                    next, size_of::<$t>(),
+                    concat!(stringify!($t), " has implicit tail padding"),
+                );
+            }};
+        }
+        fields_tile!(Header, opcode, resource, unit, index, wait_len, succ_len, _pad);
+        fields_tile!(DmaBody, bytes, tensor, slot, kind, access);
+        fields_tile!(RdmaBody, bytes, src_unit, dst_unit, _pad);
+        fields_tile!(GemmBody, coord0, coord1, m, n, k, bm, bn, bk, out, tmem, _pad);
+        fields_tile!(
+            FlashBody, coord0, coord1, seq_q, seq_kv, head_dim, bq, bkv, heads, out, tmem, window,
+            kv_heads, _pad,
+        );
+        fields_tile!(RowBody, coord, rows, feat, args, br, out, operands, _pad);
+        fields_tile!(
+            LayoutBody, kind, rank, elem_size, _pad0, out, _pad1, shape, in_stride, out_stride,
+            in_base, out_base,
+        );
+        fields_tile!(TokenBody, in_slot, out_slot, kind, _pad0, _pad1, vocab, arg);
+        fields_tile!(Counter, id, threshold, scope, _pad);
+    }
+
+    /// The padding a record reserves must be emitted as zeros, not left to
+    /// whatever the constructing stack frame happened to hold.
+    #[test]
+    fn token_record_pads_are_emitted_as_zero() {
+        let program = Program {
+            insts: vec![Inst {
+                resource: ResourceKind::Host,
+                unit: 0,
+                index: 0,
+                body: Body::Token {
+                    in_slot: 1,
+                    out_slot: 2,
+                    kind: Opcode::TOKEN_SAMPLE_GREEDY,
+                    vocab: 32000,
+                    arg: 0,
+                },
+                wait: Vec::new(),
+                succ: Vec::new(),
+            }],
+            ..Program::default()
+        };
+        let bytes = program.to_bytes();
+        let body = &bytes[STREAM_HEADER_SIZE + size_of::<Header>()..][..size_of::<TokenBody>()];
+        assert_eq!(&body[5..8], &[0, 0, 0], "TokenBody padding must be zeroed");
     }
 
     #[test]
