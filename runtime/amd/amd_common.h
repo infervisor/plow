@@ -1065,6 +1065,66 @@ __device__ __forceinline__ float wave_max(float v) {
  * largest element uses the full e4m3 range; the reciprocal is what the write multiplies by. */
 #define PLOW_FP8_E4M3_MAX 448.0f
 
+/* PLOW_QUANT_SCALE_EXP — how the power-of-two ("ROUND_SCALE=True") quantization scale is built.
+ *
+ * The reference is `fast_round_scale`: `exp2(ceil(log2(amax / top)))`, and the shipped arm is a
+ * literal transliteration of it — `log2f` (35 instructions in the audit's probe), `ceilf`,
+ * `exp2f` (28) — followed by one IEEE divide per quantized element.
+ *
+ *   0  SHIPPED.
+ *   1  the exponent directly: `frexpf` gives `v = m * 2^e` with m in [0.5, 1), so
+ *      `ceil(log2 v) = e` unless v is an exact power of two (m == 0.5), where it is `e - 1`.
+ *      Both the scale and its exact reciprocal are then one `v_ldexp_f32` each, and the
+ *      per-element divide becomes a multiply that is BIT-IDENTICAL to it (multiplying by an
+ *      exactly representable power of two is exact, and every reachable scale here has one:
+ *      the amax floors put the exponent in [-126, -22]).
+ *
+ * ARM 1 IS NOT A REFACTOR — IT CHANGES VALUES, and only in one direction: `log2f` is not
+ * correctly rounded, so for a v just above a power of two the f32 result can land exactly on the
+ * integer and `ceilf` then returns one exponent too LOW, giving a scale that is half what the
+ * exact ceiling would give. Arm 1 returns the exact ceiling and therefore disagrees with the
+ * shipped arm on that boundary. Which is "right" is a compatibility question about the vendor
+ * kernel, not an accuracy one, so arm 1 is default-off. Boundary cases — exact powers of two,
+ * one ULP either side of them, the 1e-4 and 6*2^-126 amax floors, the FP8 e4m3 448 maximum — are
+ * enumerated in `runtime/tests/quant_scale_gfx942_test.hip`. */
+#ifndef PLOW_QUANT_SCALE_EXP
+#define PLOW_QUANT_SCALE_EXP 0
+#endif
+#if PLOW_QUANT_SCALE_EXP != 0 && PLOW_QUANT_SCALE_EXP != 1
+#error "PLOW_QUANT_SCALE_EXP must be 0 or 1"
+#endif
+
+/* The power-of-two scale for `amax`, and its reciprocal. `top` is the format maximum (448 for
+ * e4m3, 6 for e2m1). `amax` is caller-floored to a positive normal, which is what lets arm 1 skip
+ * every zero/subnormal/nonfinite guard `frexpf` would otherwise need.
+ *
+ * ARM 0 LEAVES `*inv_scale` UNWRITTEN. It is not `1.0f / s`: at the two `op_dsa_pool.h` sites the
+ * scale is used for exactly ONE divide per thread, so materializing a reciprocal there would ADD
+ * a divide rather than remove one. `PLOW_QUANT_SCALE_DIV` below is what selects the form, and
+ * arm 0's ISA is asserted bit-identical to the pre-arm source. */
+__device__ __forceinline__ void plow_round_scale(float amax, float top, float* scale,
+                                                 float* inv_scale) {
+#if PLOW_QUANT_SCALE_EXP
+    int e;
+    const float m = frexpf(amax / top, &e);
+    const int k = (m == 0.5f) ? e - 1 : e;
+    *scale = ldexpf(1.0f, k);
+    *inv_scale = ldexpf(1.0f, -k);
+#else
+    *scale = exp2f(ceilf(log2f(amax / top)));
+    (void)inv_scale;
+#endif
+}
+
+/* Divide by a `plow_round_scale` scale. Arm 1's multiply is BIT-IDENTICAL to arm 0's divide for
+ * every scale this codebase can produce — `inv` is an exactly representable power of two there,
+ * and `x * 2^-k` and `x / 2^k` are then the same correctly rounded value. */
+#if PLOW_QUANT_SCALE_EXP
+#define PLOW_QUANT_SCALE_DIV(x, scale, inv) ((x) * (inv))
+#else
+#define PLOW_QUANT_SCALE_DIV(x, scale, inv) ((x) / (scale))
+#endif
+
 /* One e4m3 OCP byte -> f32, portable (identical on CDNA3/CDNA4 — `plow_fp8_ocp_to_bf16` is the
  * exact software table both archs already share for anything that must be bit-faithful, see
  * amd_arch.h). Exact: e4m3 has 3 mantissa bits, bf16/f32 have more, so no rounding either step. */

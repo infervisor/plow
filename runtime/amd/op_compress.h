@@ -103,9 +103,10 @@ __device__ __forceinline__ void cmp_fake_quant_block(float* __restrict__ lds, un
     float amax = 0.0f;
     for (unsigned i = 0; i < blk; i++) amax = fmaxf(amax, fabsf(lds[c0 + i]));
     amax = fmaxf(amax, floor_);
-    const float s = exp2f(ceilf(log2f(amax / top)));
+    float s, inv_s;
+    plow_round_scale(amax, top, &s, &inv_s);
     for (unsigned i = 0; i < blk; i++) {
-        const float q = fminf(fmaxf(lds[c0 + i] / s, -top), top);
+        const float q = fminf(fmaxf(PLOW_QUANT_SCALE_DIV(lds[c0 + i], s, inv_s), -top), top);
         const float r = ROTATE ? cmp_dequant_fp4(quant_fp4(q)) : dequant_fp8(quant_fp8(q));
         lds[c0 + i] = bf2f(f2bf(r * s));
     }
