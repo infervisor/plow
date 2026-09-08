@@ -45,6 +45,7 @@
 #endif
 
 #include "amd_common.h"
+#include "token_batch.h"
 
 #define FA_BQ 32   /* query rows per wave; 4 waves => 128-row q-tile */
 #define FA_BKV 32  /* KV rows staged per step (one MFMA N tile)      */
@@ -231,7 +232,22 @@
  * chunk masks correctly against cached history).
  * `window == 0` means full causal.
  * ------------------------------------------------------------------------- */
-template <int D, bool FP8KV = false, int DV = D>
+/* TB (token batch) — the class-C conversion this operator needs (§3, §5.2, §8 Phase 2).
+ *
+ * `q_pos0` is ONE PACKET SCALAR from which every row's absolute position is derived. That is
+ * correct for one request's contiguous chunk and SILENTLY WRONG for a packed batch: rows of an
+ * earlier span get a later request's sequence length, its causal bound and its KV slot, and
+ * nothing traps. With TB the work list is flat over (span, q-tile, head, split) and every one
+ * of those five quantities — n_q, n_kv, q_pos0, the Q/O row base and the K/V slot base — is
+ * read from the row's OWN span. `q_pos0` is then unread on this route, which is what makes the
+ * unconverted form unreachable rather than merely unused (§9's second clause).
+ *
+ * It is a FLAT list, not a loop over spans: the same grid covers every span's tiles at once, so
+ * a short span does not get a whole grid to itself and there is no barrier between requests.
+ *
+ * TB == false discards every branch below at instantiation, so the shipped objects keep the
+ * exact body they had. That is checked by object A/B, not asserted. */
+template <int D, bool FP8KV = false, int DV = D, bool TB = false>
 __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ mlpart,
                                 bf16* __restrict__ O_final,
                                 const bf16* __restrict__ Q, const bf16* __restrict__ K,
@@ -241,7 +257,12 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
                                 unsigned nsplit, unsigned slice,
                                 unsigned nblk, bf16* lds,
                                 const float* __restrict__ k_scale = nullptr,
-                                const float* __restrict__ v_scale = nullptr) {
+                                const float* __restrict__ v_scale = nullptr
+#if PLOW_TOKEN_BATCH
+                                ,
+                                const PlowTokenBatchView* tb = nullptr
+#endif
+                                ) {
     constexpr int NK = D / MFMA_K;    /* QK^T k-steps                       */
     /* KV block and the number of 32-wide MFMA N-subtiles it spans. BKV==32 => NKT==1
      * (the D=256/512 path, unchanged); BKV==64 => NKT==2 (D=128), two subtiles under
@@ -299,11 +320,67 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
      * online-softmax rescale -- exactly the machinery the decode path already used. The
      * split is over the q-tile's OWN causal/window-valid KV range, not over [0, n_kv), so
      * the splits within a tile are balanced rather than mostly-masked. */
-    const unsigned q_tiles = (n_q + PLOW_WAVES * FA_BQ - 1) / (PLOW_WAVES * FA_BQ);
-    const unsigned n_work = q_tiles * n_head * nsplit;
+    constexpr unsigned FA_QT = PLOW_WAVES * FA_BQ; /* query rows per q-tile */
+    const unsigned q_tiles = (n_q + FA_QT - 1) / FA_QT;
     const unsigned gqa = n_head / n_kv_head;
 
+    /* Loop-invariant when !TB; re-derived per work item from the owning span when TB. Kept as
+     * plain locals rather than reassigning the parameters, because `Q`/`K`/`V` are __restrict__
+     * and a restrict-qualified pointer must not be re-based inside the region it qualifies. */
+    unsigned n_q_w = n_q, n_kv_w = n_kv, q_pos0_w = q_pos0;
+    const bf16* Q_w = Q;
+    const bf16* K_w = K;
+    const bf16* V_w = V;
+    bf16* O_final_w = O_final;
+    float* Opart_w = Opart;
+    float* mlpart_w = mlpart;
+    unsigned q_tiles_w = q_tiles;
+    unsigned n_work = q_tiles * n_head * nsplit;
+#if PLOW_TOKEN_BATCH
+    unsigned tb_n_spans = 0u;
+    if constexpr (TB) {
+        static_assert(!FP8KV, "token-batch flash prefill is qualified for bf16 KV only");
+        if (!tb) plow_tb_trap();
+        tb_n_spans = tb->n_spans;
+        n_work = 0u;
+        for (unsigned i = 0; i < tb_n_spans; ++i) {
+            const PlowPrefillSpan* s = tb->spans + i;
+            n_work += ((s->n_rows + FA_QT - 1u) / FA_QT) * n_head * nsplit;
+        }
+    }
+#endif
+
     for (unsigned w = slice; w < n_work; w += nblk) {
+        unsigned w_span = w;
+#if PLOW_TOKEN_BATCH
+        if constexpr (TB) {
+            /* Find the span owning this work index. `w` is workgroup-uniform, so this is a
+             * scalar walk over a table with one entry per admitted request — negligible beside
+             * the KV loop it precedes, and it is what removes the per-span launch. */
+            unsigned si = 0u, base = 0u;
+            for (; si < tb_n_spans; ++si) {
+                const unsigned n = ((tb->spans[si].n_rows + FA_QT - 1u) / FA_QT) * n_head * nsplit;
+                if (w_span < base + n) break;
+                base += n;
+            }
+            if (si >= tb_n_spans) plow_tb_trap();
+            const PlowPrefillSpan* sp_span = tb->spans + si;
+            w_span -= base;
+            q_tiles_w = (sp_span->n_rows + FA_QT - 1u) / FA_QT;
+            n_q_w = sp_span->n_rows;
+            n_kv_w = sp_span->kv_len;   /* this request's own live KV length */
+            q_pos0_w = sp_span->kv_row0; /* this request's own frontier, not a packet scalar */
+            if (q_pos0_w + n_q_w != n_kv_w) plow_tb_trap();
+            const size_t qoff = (size_t)sp_span->row0 * n_head;
+            const size_t kvoff = (size_t)sp_span->slot * n_kv_head * kv_stride;
+            Q_w = Q + qoff * D;
+            K_w = K + kvoff * D;
+            V_w = V + kvoff * (DV == D ? D : DV);
+            O_final_w = O_final ? O_final + qoff * DV : nullptr;
+            Opart_w = Opart + qoff * nsplit * DV;
+            mlpart_w = mlpart + qoff * nsplit * 2u;
+        }
+#endif
 #if FA_HEAD_MAJOR
         /* [FA_HEAD_MAJOR] KV-window locality. The shipped order is split-fastest, then head,
          * then q-tile, so the ~nblk work items running at any instant span EVERY head — for a
@@ -311,15 +388,15 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
          * one XCD's 4 MiB L2. Making the head the SLOWEST axis narrows the live window to
          * ceil(nblk / (q_tiles*nsplit)) heads instead. Pure re-indexing of the same bijection:
          * every (qt, h, sp) is still visited exactly once, so it cannot change any output. */
-        const unsigned per_head = q_tiles * nsplit;
-        const unsigned h = w / per_head;
-        const unsigned rem = w - h * per_head;
+        const unsigned per_head = q_tiles_w * nsplit;
+        const unsigned h = w_span / per_head;
+        const unsigned rem = w_span - h * per_head;
         const unsigned qt = rem / nsplit;
         const unsigned sp = rem - qt * nsplit;
 #else
-        const unsigned sp = w % nsplit;
-        const unsigned h = (w / nsplit) % n_head;
-        const unsigned qt = w / (nsplit * n_head);
+        const unsigned sp = w_span % nsplit;
+        const unsigned h = (w_span / nsplit) % n_head;
+        const unsigned qt = w_span / (nsplit * n_head);
 #endif
         const unsigned hkv = h / gqa;
         const unsigned q_base = qt * PLOW_WAVES * FA_BQ; /* first row of this q-tile */
@@ -364,7 +441,7 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
         const unsigned qrow = my_q0 + frow;                                               \
         const unsigned d0 = mfma_frag_k(lane, ((ST0) + _i) * MFMA_K);                     \
         bf16 t[8] = {0, 0, 0, 0, 0, 0, 0, 0};                                             \
-        if (qrow < n_q) __builtin_memcpy(t, &Q[((size_t)qrow * n_head + h) * D + d0], 16);\
+        if (qrow < n_q_w) __builtin_memcpy(t, &Q_w[((size_t)qrow * n_head + h) * D + d0], 16);\
         _Pragma("unroll") for (int j = 0; j < 8; j++) {                                    \
             bf16_t v;                                                                     \
             __builtin_memcpy(&v, &t[j], 2);                                               \
@@ -382,12 +459,12 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
          * That is undefined behaviour, and in practice it silently corrupts the
          * output rather than hanging. Bound by the LAST row of the whole q-tile
          * and let the per-element mask below do the exact work. */
-        const unsigned q_tile_last = q_pos0 + q_base + PLOW_WAVES * FA_BQ - 1;
-        const unsigned kv_end = (q_tile_last + 1 < n_kv) ? (q_tile_last + 1) : n_kv;
+        const unsigned q_tile_last = q_pos0_w + q_base + PLOW_WAVES * FA_BQ - 1;
+        const unsigned kv_end = (q_tile_last + 1 < n_kv_w) ? (q_tile_last + 1) : n_kv_w;
         /* Likewise the sliding-window skip: a tile may only be skipped if it is
          * outside the window for EVERY row in the workgroup, i.e. for the
          * earliest query row. */
-        const unsigned q_tile_first = q_pos0 + q_base;
+        const unsigned q_tile_first = q_pos0_w + q_base;
         const unsigned win_lo =
             (window && q_tile_first >= window) ? (q_tile_first - window + 1) : 0;
 
@@ -459,9 +536,9 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
         const unsigned e = threadIdx.x * 8 + it * (PLOW_THREADS * 8);                            \
         const unsigned kv = (KVB) + e / D;                                                       \
         if constexpr (FP8KV) {                                                                    \
-            if (kv < n_kv) FA_DB_FP8(nk[it], K, k_scale, e % D) else nk[it] = bf16v8_zero();      \
+            if (kv < n_kv_w) FA_DB_FP8(nk[it], K_w, k_scale, e % D) else nk[it] = bf16v8_zero();      \
         } else {                                                                                  \
-        nk[it] = (kv < n_kv) ? ld_glob8(as_glob(K) + ((size_t)hkv * kv_stride + (kv & kv_mask)) * D + e % D) \
+        nk[it] = (kv < n_kv_w) ? ld_glob8(as_glob(K_w) + ((size_t)hkv * kv_stride + (kv & kv_mask)) * D + e % D) \
                              : bf16v8_zero();                                                     \
         }                                                                                         \
     }                                                                                            \
@@ -470,13 +547,13 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
         const unsigned kv = (KVB) + e / DCH;                                                     \
         if constexpr (FP8KV) {                                                                    \
             static_assert(DV == D, "rectangular fp8 flash is not implemented");                  \
-            if (kv < n_kv) FA_DB_FP8(nv[it], V, v_scale, d_off + e % DCH) else nv[it] = bf16v8_zero(); \
+            if (kv < n_kv_w) FA_DB_FP8(nv[it], V_w, v_scale, d_off + e % DCH) else nv[it] = bf16v8_zero(); \
         } else {                                                                                  \
         if constexpr (DV == D)                                                                    \
-            nv[it] = (kv < n_kv) ? ld_glob8(as_glob(V) + ((size_t)hkv * kv_stride + (kv & kv_mask)) * D + d_off + e % DCH) \
+            nv[it] = (kv < n_kv_w) ? ld_glob8(as_glob(V_w) + ((size_t)hkv * kv_stride + (kv & kv_mask)) * D + d_off + e % DCH) \
                                  : bf16v8_zero();                                                 \
         else                                                                                      \
-            nv[it] = (kv < n_kv) ? ld_glob8(as_glob(V) + ((size_t)hkv * kv_stride + (kv & kv_mask)) * DV + d_off + e % DCH) \
+            nv[it] = (kv < n_kv_w) ? ld_glob8(as_glob(V_w) + ((size_t)hkv * kv_stride + (kv & kv_mask)) * DV + d_off + e % DCH) \
                                  : bf16v8_zero();                                                 \
         }                                                                                         \
     }
@@ -510,16 +587,16 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
                     const unsigned r = e / D, c = e % D;
                     const unsigned kv = kv0 + r;
                     bf16 tk[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-                    if (kv < n_kv) {
+                    if (kv < n_kv_w) {
                         const size_t off = ((size_t)hkv * kv_stride + (kv & kv_mask)) * D + c;
                         if constexpr (FP8KV) {
                             const bf16v8 dv = fp8v8_to_bf16v8(
-                                ld_glob_fp8v8((const unsigned char*)K + off));
+                                ld_glob_fp8v8((const unsigned char*)K_w + off));
                             const float ks = k_scale[(size_t)hkv * kv_stride + (kv & kv_mask)];
 #pragma unroll
                             for (int j = 0; j < 8; j++) tk[j] = f2bf(bf2f(dv[j]) * ks);
                         } else {
-                            __builtin_memcpy(tk, &K[off], 16);
+                            __builtin_memcpy(tk, &K_w[off], 16);
                         }
                     }
                     __builtin_memcpy(&Ksm[r * STRIDE + c], tk, 16);
@@ -528,17 +605,17 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
                     const unsigned r = e / DCH, c = e % DCH;
                     const unsigned kv = kv0 + r;
                     bf16 tv[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-                    if (kv < n_kv) {
+                    if (kv < n_kv_w) {
                         const size_t row = (size_t)hkv * kv_stride + (kv & kv_mask);
                         const size_t off = row * (DV == D ? D : DV) + d_off + c;
                         if constexpr (FP8KV) {
                             const bf16v8 dv = fp8v8_to_bf16v8(
-                                ld_glob_fp8v8((const unsigned char*)V + off));
+                                ld_glob_fp8v8((const unsigned char*)V_w + off));
                             const float vs = v_scale[(size_t)hkv * kv_stride + (kv & kv_mask)];
 #pragma unroll
                             for (int j = 0; j < 8; j++) tv[j] = f2bf(bf2f(dv[j]) * vs);
                         } else {
-                            __builtin_memcpy(tv, &V[off], 16);
+                            __builtin_memcpy(tv, &V_w[off], 16);
                         }
                     }
                     __builtin_memcpy(&Vsm[r * VSTRIDE + c], tv, 16);
@@ -597,9 +674,9 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
                      * lane divergence. BIT-IDENTICAL: the taken path is exactly the all-valid
                      * path of the masked form. */
                     const bool full_tile =
-                        (my_q0 + FA_BQ <= n_q) && (kv0 + BKV <= n_kv) &&
-                        (kv0 + BKV - 1 <= q_pos0 + my_q0) &&
-                        (!window || (q_pos0 + my_q0 + FA_BQ - 1) - kv0 < window);
+                        (my_q0 + FA_BQ <= n_q_w) && (kv0 + BKV <= n_kv_w) &&
+                        (kv0 + BKV - 1 <= q_pos0_w + my_q0) &&
+                        (!window || (q_pos0_w + my_q0 + FA_BQ - 1) - kv0 < window);
                     if (full_tile) {
 #pragma unroll
                         for (int i = 0; i < 16; i++) p[i] = s[i] * FA_SCALE(scale);
@@ -608,11 +685,11 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
 #pragma unroll
                     for (int i = 0; i < 16; i++) {
                         const unsigned qi = my_q0 + mfma_acc_m(lane, i);
-                        const unsigned qg = q_pos0 + qi;
+                        const unsigned qg = q_pos0_w + qi;
                         const unsigned kg = kv0 + accn;
                         /* sliding window is INCLUSIVE of the current token:
                          * keep iff 0 <= qg - kg <= window-1 */
-                        const bool valid = (qi < n_q) && (kg < n_kv) && (kg <= qg) &&
+                        const bool valid = (qi < n_q_w) && (kg < n_kv_w) && (kg <= qg) &&
                                            (!window || (qg - kg) < window);
                         p[i] = valid ? (s[i] * FA_SCALE(scale)) : FA_NEG_INF;
                     }
@@ -738,10 +815,10 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
 #pragma unroll
                         for (int i = 0; i < 16; i++) {
                             const unsigned qi = my_q0 + mfma_acc_m(lane, i);
-                            const unsigned qg = q_pos0 + qi;
+                            const unsigned qg = q_pos0_w + qi;
                             const unsigned kg = kv0 + n * MFMA_N + accn;
                             /* sliding window INCLUSIVE: keep iff 0 <= qg - kg <= window-1 */
-                            const bool valid = (qi < n_q) && (kg < n_kv) && (kg <= qg) &&
+                            const bool valid = (qi < n_q_w) && (kg < n_kv_w) && (kg <= qg) &&
                                                (!window || (qg - kg) < window);
                             p[n][i] = valid ? (s[n][i] * FA_SCALE(scale)) : FA_NEG_INF;
                         }
@@ -826,12 +903,12 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
              * (neither macro) where the D=256/512 arms are compiled-but-never-run: adding the
              * fused write there pushes it 258 > 256 over the cliff for no benefit. */
 #if defined(PLOW_BUCKET_FLASH) || defined(PLOW_FLASH_HD128) || PLOW_MIXED_STEP
-            if (nsplit == 1 && O_final != nullptr) {
+            if (nsplit == 1 && O_final_w != nullptr) {
                 const unsigned qd = n_head * DV; /* row stride of n.at */
 #pragma unroll
                 for (int i = 0; i < 16; i++) {
                     const unsigned qi = my_q0 + mfma_acc_m(lane, i);
-                    if (qi >= n_q) continue;
+                    if (qi >= n_q_w) continue;
 /* v_rcp_f32, not the IEEE divide. `1.0f / l` lowers to the correctly-rounded sequence --
                      * v_div_scale x2, v_rcp, a Newton chain, v_div_fmas, v_div_fixup, ~12
                      * instructions -- for a reciprocal this softmax does not need that precisely.
@@ -844,7 +921,7 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
                     /* One base pointer per row (as the partial path does), so the epilogue's
                      * 64-bit address math stays out of the unrolled store loop and does not
                      * blow up register pressure / scratch for the hot KV loop. */
-                    bf16* orow = O_final + ((size_t)qi * qd + h * DV + d_off + accn);
+                    bf16* orow = O_final_w + ((size_t)qi * qd + h * DV + d_off + accn);
 #pragma unroll
                     for (int t = 0; t < NDT; t++) {
                         /* Branchless RNE f32->bf16. A softmax-normalized attention output is
@@ -868,15 +945,15 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
 #pragma unroll
             for (int i = 0; i < 16; i++) {
                 const unsigned qi = my_q0 + mfma_acc_m(lane, i);
-                if (qi >= n_q) continue;
-                float* op = Opart + ((size_t)(qi * n_head + h) * nsplit + sp) * DV;
+                if (qi >= n_q_w) continue;
+                float* op = Opart_w + ((size_t)(qi * n_head + h) * nsplit + sp) * DV;
 #pragma unroll
                 for (int t = 0; t < NDT; t++)
                     st_act<float>(&op[d_off + t * MFMA_N + accn], oacc[t][i]);
                 /* 32 lanes share this qi (they hold different d), so exactly one writes
                  * (m, l) -- and only once, not once per output chunk. */
                 if (ch == 0 && accn == 0) {
-                    float* ml = mlpart + ((size_t)(qi * n_head + h) * nsplit + sp) * 2;
+                    float* ml = mlpart_w + ((size_t)(qi * n_head + h) * nsplit + sp) * 2;
                     st_act<float>(&ml[0], m_st[i]);
                     st_act<float>(&ml[1], l_st[i]);
                 }
@@ -1144,7 +1221,14 @@ __device__ __forceinline__ float fa_merge_ml(const float* __restrict__ ml, unsig
 #endif /* FA_MERGE_UNROLL4 */
 }
 
-template <int D, int GF, bool FP8KV = false, bool NRF = false, bool SLOTMAP = false>
+/* TB (token batch) — class B, per plans/unified-token-batch.md §3: the per-row indirection
+ * this operator needs ALREADY EXISTS (`decode_slot[b]`, `kv_len[b]`). The descriptor's only job
+ * is to fill it, so TB reads the physical slot and the post-step KV length straight from the
+ * row's SPAN instead of requiring two host-staged tensors. That matters beyond tidiness on the
+ * dense emit path: `t6` there is the fp8-KV K-scale handle, so a host-staged `decode_slot` and
+ * fp8 KV cannot coexist. A descriptor-sourced slot frees the operand. */
+template <int D, int GF, bool FP8KV = false, bool NRF = false, bool SLOTMAP = false,
+          bool TB = false>
 __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ mlpart,
                                const bf16* __restrict__ Q, const bf16* __restrict__ K,
                                const bf16* __restrict__ V, const int* __restrict__ kv_len,
@@ -1161,7 +1245,12 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
                                const float* __restrict__ nrf_sin = nullptr, float nrf_eps = 0.0f,
                                unsigned nrf_skip = 0, unsigned* mrg_ctr = nullptr,
                                bf16* o_final = nullptr,
-                               const int* __restrict__ decode_slot = nullptr) {
+                               const int* __restrict__ decode_slot = nullptr
+#if PLOW_TOKEN_BATCH
+                               ,
+                               const PlowTokenBatchView* tb = nullptr
+#endif
+                               ) {
     /* A work item carries GF CONSECUTIVE query heads. They share a KV head as long as GF divides
      * GQA — which is the only thing this kernel needs, and is weaker than GF == GQA. On Gemma the
      * two coincide (hd 256 -> GQA 2 -> GF 2; hd 512 -> GQA 8 -> GF 8), but a true-MQA model has
@@ -1191,10 +1280,30 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
             if (physical < 0) __builtin_trap();
             slot = (unsigned)physical;
         }
+#if PLOW_TOKEN_BATCH
+        unsigned tb_len = 0u;
+        if constexpr (TB) {
+            static_assert(!SLOTMAP, "the token batch IS the slot map; do not stack the two");
+            if (!tb || b >= tb->n_spans) plow_tb_trap();
+            const PlowPrefillSpan* sp_row = tb->spans + b;
+            /* A decode contribution is ONE row, and — spans being contiguous and decode-first
+             * (§4.1) — it is row b. Anything else means the interpreter handed this operator a
+             * span partition it does not own, which must trap, not attend at the wrong length. */
+            if (sp_row->n_rows != 1u || sp_row->row0 != b) plow_tb_trap();
+            slot = sp_row->slot;
+            tb_len = sp_row->kv_len;
+            if (!tb_len || sp_row->kv_row0 + 1u != tb_len) plow_tb_trap();
+            if (kv_len && (unsigned)kv_len[b] != tb_len) plow_tb_trap();
+        }
+#endif
         const unsigned h0 = hg * GF;   /* the GF consecutive query heads this item carries */
         const unsigned hkv = h0 / gqa; /* they all share this KV head (GF divides gqa) */
 
+#if PLOW_TOKEN_BATCH
+        const unsigned len = TB ? tb_len : (unsigned)kv_len[b];
+#else
         const unsigned len = (unsigned)kv_len[b];
+#endif
         const unsigned qpos = len - 1; /* the query token is the newest one */
 
         /* THIS SPLIT'S KV RANGE — CLAMPED TO THE WINDOW.
