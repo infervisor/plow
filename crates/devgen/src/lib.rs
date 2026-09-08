@@ -2499,8 +2499,16 @@ fn dense_flash_split(
         // Request packing must not change the softmax reduction with the bucket.
         1
     } else {
-        n_cu.div_ceil((t.div_ceil(Q_TILE_ROWS) * heads).max(1))
-            .max(1)
+        // `PLOW_DENSE_PF_NS` CAPS this, it does not replace it: a cap can only ever remove
+        // splits the heuristic asked for, so a value above the heuristic cannot over-split a
+        // bucket past the `Opart`/`mlpart` capacity `max_splits` sized from the same formula.
+        let heuristic = n_cu
+            .div_ceil((t.div_ceil(Q_TILE_ROWS) * heads).max(1))
+            .max(1);
+        match emit_config::active().dense_pf_ns {
+            Some(cap) => heuristic.min(cap.max(1)),
+            None => heuristic,
+        }
     };
     (ns, !gemv_family && ns == 1)
 }

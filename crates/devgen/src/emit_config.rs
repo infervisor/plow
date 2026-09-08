@@ -583,6 +583,26 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_PF_NS")]
     pub glm_pf_ns: Option<u32>,
 
+    /// CAP on the dense-GQA prefill `FlashPrefill` KV split (`dense_flash_split`). Unset = the
+    /// CU-fill heuristic, unchanged.
+    ///
+    /// `=1` is the interesting value and the reason this exists: it is the unified token batch's
+    /// precondition. That route is qualified only at `nsplit == 1`, and the heuristic gives
+    /// `ceil(n_cu / (ceil(t/256) * heads))` — on gfx942/Gemma-4-31B that is 10, 10, 10, 5, 3, 2,
+    /// 1, 1 across buckets 32..8192, so the route can execute exactly the two WIDEST buckets and
+    /// every prompt at or under 2048 falls back.
+    ///
+    /// The split is there to FILL THE MACHINE: at `t=128` one q-tile times 32 heads is 32 work
+    /// items against 304 CUs, and `ns=10` takes that to 320. Capping it at 1 gives that fill up
+    /// — in an ISOLATED prefill. The falsifiable claim this knob exists to test is that a token
+    /// batch does not need it, because the step is filled by the other spans and the decode rows
+    /// sharing it rather than by splitting one prompt's attention.
+    ///
+    /// Emit-time only, and it moves emitted bytes: `ns == 1` also switches the flash to its own
+    /// bf16 epilogue and drops the `FlashMerge` entirely (see [`dense_flash_split`]).
+    #[arg(long, env = "PLOW_DENSE_PF_NS")]
+    pub dense_pf_ns: Option<u32>,
+
     /// Widen prefill norm/residual dispatch across CUs. DEFAULT ON (`=0` restores the
     /// single-workgroup emit for A/B). Bit-identical either way.
     #[arg(long, env = "PLOW_GLM_PF_WIDE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
@@ -983,6 +1003,7 @@ impl EmitConfig {
             glm_gemv_wg: env_u32("PLOW_GLM_GEMV_WG"),
             glm_ofold: env_bool("PLOW_GLM_OFOLD"),
             glm_pf_ns: env_u32("PLOW_GLM_PF_NS"),
+            dense_pf_ns: env_u32("PLOW_DENSE_PF_NS"),
             glm_pf_wide: env_opt_out("PLOW_GLM_PF_WIDE"),
             glm_place_pf: env_bool("PLOW_GLM_PLACE_PF"),
             glm_xr_band: env_u32("PLOW_GLM_XR_BAND"),
