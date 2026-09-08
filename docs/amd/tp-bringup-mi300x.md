@@ -277,6 +277,38 @@ issued as 16 separate dispatches, each occupying 38 of 304 CUs (12.5%). That is
 the decode-side twin of §4's `GemmSmall` occupancy result, and it is the reason
 K2.7's expert shapes measure as badly as they do below.
 
+### The block executes on GPU — and one layer kind faults
+
+`plowrt amd-block` runs a block through the AMD engine. With no `--checkpoint`
+it says so itself — *"NO CHECKPOINT — weights are uninitialised; timings are
+real, tokens are not"* — which makes it a legitimate execution check but not a
+numerics one. (It is also not a timer: it is the A/B vehicle for numerics and
+reports no latency. `plowrt amd-probe` would, but that path documents itself as
+"never a model-quality or performance result", so no block latency is claimed
+here.)
+
+Emitted at `--num-gpus 1` (the engine refuses a tp=8 packet on one rank, by
+design: "every projection in it is 1/8 wide, so binding it here would fail at
+the first weight") with `PLOW_MLA_PREFILL=full:128`:
+
+| block | layer kind | emit | GPU run |
+|---|---|---|---|
+| `--block 3` | MoE (top-8 of 384) | 33 decode ops + 23-op T=128 prefill | **runs clean** |
+| `--block 0` | dense (`first_k_dense_replace=1`) | 15 decode ops + 19-op T=128 prefill | **memory access fault** |
+
+The dense block faults on gfx942:
+
+```
+INFO  dense-FFN prefill pointer tables bound (grouped-arm 1-expert path)
+Memory access fault by GPU node-8 ... on address 0x7ff1a13a4000. Reason: Unknown.
+```
+
+The MoE block, emitted and run the same way in the same lease, does not. That
+localises the defect to the **dense-FFN "grouped-arm 1-expert path"** in the
+Kimi block prefill — the arm that expresses a dense MLP as a one-expert grouped
+MoE — rather than to the MLA attention half or to block emit generally. It is
+the next concrete bug on this path, and it reproduces in two commands.
+
 ### Measured ceiling at K2.7's own shapes
 
 `bringup_ceiling.py --model k27 --tp 8`, per-rank, M=4096 (`e4m3fnuz`):
