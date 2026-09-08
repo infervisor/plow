@@ -7615,6 +7615,8 @@ struct AmdGq {
 
 #[path = "amd_mixed_step.rs"]
 mod amd_mixed_step;
+#[path = "amd_token_batch.rs"]
+mod amd_token_batch;
 
 /// The AMD serving engine.
 pub struct AmdEngine {
@@ -11341,6 +11343,33 @@ impl AmdEngine {
             kvlen = t_kvlen.map(|t| format!("{:#x}+{}", devp[t].base, devp[t].len)),
             "decode scalar tensors"
         );
+
+        // UNIFIED TOKEN BATCH (plans/unified-token-batch.md §8 Phase 2), dense GQA.
+        //
+        // Probed at load whether or not it will be used, and logged ONCE with `armed` and
+        // `fires` as SEPARATE fields. They are separate claims: an object carrying the arms is
+        // armed; a step that ran with a descriptor covering more than one request has fired.
+        // A route that reports only "enabled" is how three campaigns on this branch measured
+        // "no effect" from something that never fired, and only `fires` licenses a measurement.
+        //
+        // The refusal is by CAPABILITY NAME, never a fallback: AMD's dispatch `default:` writes
+        // nothing and does not trap, so serving a token-batch packet against an object without
+        // the arms is a silent wrong answer, not a slow path.
+        {
+            let cap =
+                amd_token_batch::probe_token_batch(hsaco_dir, &arch, |p| std::fs::read(p), elf_symbol_u32);
+            // The plan side cannot fire yet and says exactly why rather than going quiet: the
+            // shared planner still emits a decode BAND ahead of the span table, so the
+            // descriptor does not cover [0, M). `admit_token_batch` is what a caller consults
+            // once that lands; here it is asked about the shape the planner actually produces,
+            // so the line tells the truth about this build rather than about the plan.
+            let fires = amd_token_batch::admit_token_batch(
+                u32::try_from(batch.saturating_sub(1)).unwrap_or(u32::MAX),
+                1,
+                true,
+            );
+            amd_token_batch::log_route_once(&cap, fires);
+        }
 
         let mixed_step = if crate::config::RuntimeConfig::get().fusion && tp.is_none() && batch > 1
         {
