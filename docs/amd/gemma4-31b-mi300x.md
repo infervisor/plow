@@ -3571,3 +3571,201 @@ pairing refusal read the blob and the object symbols, which are the same on both
 gfx950 puts `-DPLOW_L2_PLACE_DISPATCH` on its PREFILL and FLASH objects by default, so on that
 target `PLOW_L2_PLACE_PREFILL=1` at emit needs no object rebuild at all — the gfx942 measurement
 above is a caution to re-take, not a number to carry across.
+
+## A same-session vLLM 0.28 control, BF16 and FP8, 2026-09-08
+
+Every vLLM number above was taken on an earlier day. This section replaces the
+reference with one measured **today**, on this host, with both precisions served
+concurrently on separate leased cards, so the branch's final comparison is
+against a control taken beside it rather than against a remembered scorecard.
+The lane is deliberately independent of plow: vLLM does not read plow's tuning
+store, so the tile-store problem blocking plow-side absolutes cannot touch it.
+
+Results, manifests and greedy captures:
+`docs/amd/gemma4-31b-vllm028-control-20260908.json`.
+
+### The two recipes
+
+Both servers are TP1 on one MI300X, each under its own `gpulease -n 1`
+(BF16 on gpu0, FP8 on gpu1), started within two seconds of each other and held
+for the whole session. `gpulease --audit` reported no foreign compute process
+on either card before or after.
+
+```bash
+# BF16 — the recipe every published vLLM number on this branch used
+env PATH=/app/plow/build-glm53/rocm-shim/bin:$PATH \
+    CC=/app/plow/build-glm53/rocm-shim/bin/vllm-cc \
+    VLLM_ROCM_LIB=/opt/rocm/core-7.14/lib \
+    ROCM_PATH=/opt/rocm-7.2.4 VLLM_ROCM_USE_AITER=0 HF_HUB_OFFLINE=1 \
+  build-gemma31/vllm-python -m vllm.entrypoints.openai.api_server \
+    --model build-gemma31/checkpoint --served-model-name gemma-4-31B-it \
+    --dtype bfloat16 --kv-cache-dtype auto --tensor-parallel-size 1 \
+    --max-model-len 131072 --max-num-seqs 4 --max-num-batched-tokens 8192 \
+    --no-enable-prefix-caching --language-model-only \
+    --gpu-memory-utilization 0.92 \
+    --compilation-config '{"custom_ops":["none","+gelu_and_mul"]}' --port 8410
+
+# FP8 — byte-identical flags except the checkpoint, the served name and the port
+    --model build-gemma31/fp8-vllm-ckpt --served-model-name gemma-4-31B-it-fp8 \
+    --port 8411
+```
+
+`vllm 0.28.0`, `torch 2.12.0+git6bbd260`, HIP `7.2.53211`, `TRITON_ATTN`
+backend, AITER off, CUDA graphs on, inductor compile mode 3.
+
+### What each server reported loading
+
+| | BF16 | FP8 |
+|---|---|---|
+| `quantization=` | `None` | **`compressed-tensors`** |
+| kernel selected | — | **`Selected RowWiseTorchFP8ScaledMMLinearKernel for CompressedTensorsW8A8Fp8`** |
+| model loading | 57.82 GiB | **30.41 GiB** |
+| KV cache | 116.66 GiB, 656,459 tokens | 144.0 GiB, 810,294 tokens |
+
+The FP8 arm reproduces the earlier load exactly: `compressed-tensors`, the
+row-wise kernel, 30.41 GiB. The checkpoint was not rebuilt; its shard hashes are
+recorded in the manifest, as are the BF16 shard hashes, which are byte-identical
+to the ones in the earlier vLLM manifest.
+
+**The activation correction was verified in the graph, not in the log.** Both
+servers load an AOT-compiled graph from `~/.cache/vllm/torch_compile_cache`, and
+grepping the generated inductor source for the op finds `_C.gelu_tanh_and_mul`
+eight times and `_C.gelu_and_mul` zero times, in **both** arms. The startup
+warning about PyTorch's native tanh GELU still prints and still cannot tell you
+which implementation runs; the graph can.
+
+### The sweep
+
+`scripts/bench_packed_serve.py`, outputs 64. Three passes; each pass is one
+warmup plus one timed repeat per cell, and **the two arms run each pass
+concurrently on their separate cards**, so both sample the same three wall-clock
+windows. That is stronger than round-robining repeats inside one arm: a sibling
+measured 4% between-arm drift at concurrency 1 from server-process drift alone,
+and simultaneity removes the drift from the comparison rather than averaging
+over it. The reported figure is the median of the three passes. Each cell is
+**output tokens/s / median TTFT ms / median TPOT ms**; the ratio columns are
+FP8/BF16 for throughput and BF16/FP8 for the latencies, so above 1.00 always
+means FP8 wins.
+
+One pass is two client invocations per arm, run with no GPU lease of their own
+because the client holds no card:
+
+```bash
+python3 scripts/bench_packed_serve.py --url http://127.0.0.1:$PORT \
+  --out $ARM-c1-pass$N.jsonl --label vllm028-$ARM --manifest manifest-$ARM.json \
+  --inputs 128 512 2048 8192 32768 --outputs 64 --concurrency 1 \
+  --repeats 1 --warmups 1
+python3 scripts/bench_packed_serve.py --url http://127.0.0.1:$PORT \
+  --out $ARM-c4-pass$N.jsonl --label vllm028-$ARM --manifest manifest-$ARM.json \
+  --inputs 128 512 2048 8192 --outputs 64 --concurrency 4 \
+  --repeats 1 --warmups 1
+```
+
+with `--inputs 122880 --concurrency 1` run the same way as a third invocation.
+
+| Input / concurrency | vLLM 0.28 BF16 | vLLM 0.28 FP8 | tok/s | TTFT | TPOT |
+|---|---:|---:|---:|---:|---:|
+| 128 / 1 | 55.19 / 45.7 / 17.68 | 67.75 / 37.3 / 14.40 | 1.23x | 1.23x | 1.23x |
+| 512 / 1 | 52.29 / 82.0 / 18.12 | 65.58 / 54.7 / 14.62 | 1.25x | 1.50x | 1.24x |
+| 2048 / 1 | 44.40 / 266.9 / 18.64 | 56.08 / 186.1 / 15.16 | 1.26x | 1.43x | 1.23x |
+| 8192 / 1 | 25.60 / 1220.1 / 20.31 | 31.62 / 941.1 / 17.18 | 1.24x | 1.30x | 1.18x |
+| 32768 / 1 | 6.89 / 7814.9 / 23.47 | 8.01 / 6676.5 / 20.87 | 1.16x | 1.17x | 1.12x |
+| 122880 / 1 | 0.87 / 71271.5 / 28.65 | 0.94 / 66342.4 / 26.05 | 1.08x | 1.07x | 1.10x |
+| 128 / 4 | 183.33 / 106.8 / 20.43 | 251.65 / 75.4 / 14.95 | 1.37x | 1.42x | 1.37x |
+| 512 / 4 | 161.60 / 269.7 / 20.86 | 224.59 / 167.8 / 15.42 | 1.39x | 1.61x | 1.35x |
+| 2048 / 4 | 104.56 / 1046.8 / 22.22 | 147.16 / 708.2 / 16.36 | 1.41x | 1.48x | 1.36x |
+| 8192 / 4 | 39.80 / 4266.1 / 33.86 | 51.75 / 3280.4 / 26.03 | 1.30x | 1.30x | 1.30x |
+
+Within-cell stability across the three passes is tight and **asymmetric**: the
+BF16 arm's throughput spread is 1.5-2.4% of the median while the FP8 arm's is
+0.4-1.3%. Every FP8 cell measured here lands within 2.4% of the corresponding
+published FP8 cell (128/1 67.75 against 66.19, 32768/1 8.01 against 7.97,
+122880/1 0.94 against 0.95, 8192/4 51.75 against 51.41), so the earlier FP8
+column and this one are the same measurement taken twice. The BF16 column is new
+at this configuration.
+
+FP8's advantage is largest where decode dominates and shrinks monotonically with
+prompt length — 1.37-1.41x at concurrency 4 below 2048 tokens, 1.08x at 122880/1
+— which is what a weight-bandwidth saving should look like once attention over a
+long KV cache, which is BF16 in both arms, becomes the larger term.
+
+### Which precision each engine actually ran
+
+The two engines' "FP8" are not the same arithmetic, and the tables must not be
+read as though they were.
+
+| | weights | prefill activations | decode activations | KV | `lm_head` |
+|---|---|---|---|---|---|
+| vLLM BF16 | BF16 | BF16 | BF16 | BF16 | BF16 |
+| vLLM FP8 | e4m3, per-output-channel scale | **e4m3, dynamic per-token** | **e4m3, dynamic per-token** | BF16 | BF16 (in the `ignore` list) |
+| plow FP8 | e4m3, per-output-channel scale | e4m3 | **BF16** | BF16 | BF16 |
+
+vLLM is W8A8 in both phases. plow is **W8A8 prefill, W8A16 decode, BF16 KV,
+BF16 `lm_head`** — its `build.json` `precision` triple overstates this, because
+`act_enc` was derived from a `QuantFp8` op appearing anywhere in the stream and
+`QuantFp8` appears only in the prefill programs (since fixed to report `mixed`).
+Any table that pairs the two columns is comparing W8A8 against a mixed arm, and
+should say so.
+
+### Quality: what FP8 costs, and how well that can be known
+
+`scripts/gemma4_greedy_quality.py` in `chat` mode, temperature 0, 64 tokens,
+completions re-tokenized with the checkpoint tokenizer and compared position by
+position. Corpus is technical prose drawn from this repository's own
+`docs/amd/` files at commit `0fe2751c`; the exact file list is in the results
+JSON. Both captures ran concurrently against the two live servers.
+
+```bash
+python3 scripts/gemma4_greedy_quality.py capture --url http://127.0.0.1:$PORT \
+  --label vllm028-$ARM --out quality8-$ARM.jsonl \
+  --tokenizer build-gemma31/checkpoint/tokenizer.json \
+  --corpus docs/amd/deepseek-v4-mi300x.md docs/amd/model-op-coverage.md \
+           docs/amd/norm-and-recurrent-numerics.md docs/amd/kimi-k3-mi325x-recipe.md \
+           docs/amd/qwen35-gdn-mi300x.md docs/amd/token-batch-recurrent-and-window.md \
+  --lengths 128 512 2048 8192 --per-length 8 --max-tokens 64 --mode chat
+python3 scripts/gemma4_greedy_quality.py compare --left quality8-fp8.jsonl \
+  --right quality8-bf16.jsonl --tokenizer build-gemma31/checkpoint/tokenizer.json \
+  --out quality8-fp8-vs-bf16.json
+```
+
+| comparison | prompts | token agreement | 95% CI over prompts |
+|---|---:|---:|---:|
+| vLLM BF16 vs itself, second capture | 32 | **1.0000** (32/32 character-identical) | — |
+| vLLM FP8 vs itself, second capture | 32 | **1.0000** (32/32 character-identical) | — |
+| vLLM FP8 vs vLLM BF16, 12-prompt corpus | 12 | 0.449 | 0.288 - 0.620 |
+| vLLM FP8 vs vLLM BF16, 32-prompt corpus | 32 | **0.473** | 0.373 - 0.576 |
+
+The two self-comparisons are the control that makes the third and fourth rows
+mean anything: each server is exactly reproducible, so all of the disagreement
+is the precision change and none of it is run-to-run noise.
+
+**The symmetry claim survives, but the numbers behind it never had the precision
+they were quoted to.** The earlier finding — plow 0.520 against vLLM 0.529,
+"near-identical prices for the same arithmetic change" — was measured on twelve
+prompts. A percentile bootstrap over the prompt set (20,000 resamples) puts the
+95% interval for a twelve-prompt estimate at **0.33 wide**, and even at
+thirty-two prompts it is 0.20 wide. A 0.009 difference is two orders of
+magnitude below that resolution. Today's vLLM figure, 0.473 on a fresh corpus
+and 0.449 on a smaller one, sits comfortably inside the interval around the
+published 0.550 for the same arm; the corpus, not the engine, moves this
+statistic. So the honest statement is that **FP8 costs both engines roughly half
+of a 64-token greedy trajectory, and this measurement cannot distinguish the two
+prices** — which is enough to make the speed comparison fair, and is not a
+licence to rank the engines by these numbers.
+
+Greedy trajectories separate early in both directions because a 64-token
+continuation only has to cross one near-tied logit to diverge for good; median
+first divergence sits at token 16-32 across lengths.
+
+### Cells not measured, and why
+
+* **131072 / 1** — a prompt of exactly `max_model_len` leaves no room for the 64
+  output tokens. 122880 / 1 is measured in its place, as before.
+* **32768 / 4, 16384 / 4** — outside the requested grid, which stops concurrency
+  4 at 8192. Worth recording that this is *not* a capacity limit for vLLM on
+  this configuration: its KV cache holds 656,459 tokens in BF16 and 810,294 in
+  FP8, so four 32768-token prompts would fit in either arm. The concurrency-4
+  ceiling documented earlier is plow's, not vLLM's.
+* **plow FP8 vs plow BF16 greedy agreement** — not re-measured. This lane is the
+  vLLM control and does not start plow, so the 0.520 quoted above is the
+  previously published figure carried forward, not a same-session number.
