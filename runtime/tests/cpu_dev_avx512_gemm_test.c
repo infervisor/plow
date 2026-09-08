@@ -179,6 +179,33 @@ static uint8_t fp8_oracle(float x) {
     return sign | (dl < dh || (dl == dh && !(lo & 1)) ? lo : hi);
 }
 
+/* v_gelu_tanh must keep the far-negative tail. Evaluating 0.5*x*(1 + tanh(c)) there cancels away
+ * the whole result -- the scalar tier's tanhf saturates to exactly -1 and flushes the output to
+ * zero -- so the kernel uses the identity x * sigmoid(2c). The reference is that identity in
+ * double, which is the one form that stays accurate here. */
+static int gelu_tail_check(void) {
+    enum { N = 64 };
+    plow_bf16 gate[N], up[N], out[N];
+    for (unsigned i = 0; i < N; i++) {
+        gate[i] = plow_f2bf(-4.0f - 5.0f * (float)i / (N - 1));
+        up[i] = plow_f2bf(1.0f);
+    }
+    PlowDevInst in = {0}; in.op = PLOW_DOP_GLU;
+    for (unsigned i = 0; i < 8; i++) in.t[i] = i < 3 ? i : PLOW_TENSOR_NONE;
+    in.i[0] = N; in.i[1] = 0;
+    void* T[] = {out, gate, up}; PlowCpuCtx ctx = {0};
+    plow_cpu_kernel(in.op)(&in, 0, 1, T, &ctx);
+    int bad = 0;
+    for (unsigned i = 0; i < N; i++) {
+        const double g = plow_bf2f(gate[i]);
+        const double c = 2.0 * 0.7978845608028654 * (g + 0.044715 * g * g * g);
+        const double want = g / (1.0 + exp(-c));
+        bad += fabs(plow_bf2f(out[i]) - want) > 0.02 * fabs(want);
+    }
+    if (bad) printf("FAIL gelu tail (%d)\n", bad);
+    return bad;
+}
+
 static int activation_quant_check(void) {
     int bad = 0;
     for (unsigned code = 0; code < 126; code++) {
@@ -248,6 +275,47 @@ static int activation_quant_check(void) {
                 : 0.5f * g * (1.0f + tanhf(0.7978845608028654f * (g + 0.044715f*g*g*g)));
             bad += fabsf(plow_bf2f(x[k]) - activated*u) > 0.005f * fabsf(activated*u) + 1e-6f;
             bad += q[k] != fp8_oracle(plow_bf2f(x[k]) * (1.0f / scales[k/17]));
+        }
+    }
+    /* The vectorized fused gate/up path against golden, over widths that exercise the masked
+     * tail and every slice split. The two tiers evaluate the activation differently, so the
+     * bound is against each row's own dynamic range -- what the fp8 scale encodes -- and not
+     * against bit patterns: deep in the gelu tail both tiers sit within noise of zero, while a
+     * masking, slicing or indexing regression moves a value by a sizable fraction of its row.
+     * The gate stride keeps every row spanning the whole range, so no row is all-tail. */
+    for (unsigned act = 0; act < 2; act++) {
+        const unsigned widths[] = {1, 15, 16, 17, 129, 1024};
+        for (unsigned shape = 0; shape < sizeof widths / sizeof widths[0]; shape++) {
+            const unsigned K = widths[shape], M = 5, n = M * K;
+            plow_bf16* gate = malloc(n*2), *up = malloc(n*2), *x = malloc(n*2), *xr = malloc(n*2);
+            uint8_t* q = malloc(n), *qr = malloc(n);
+            float sc[5], scr[5];
+            for (unsigned i = 0; i < n; i++) {
+                gate[i] = plow_f2bf(((int)((i * 37) % 97) - 48) / 12.0f);
+                up[i] = plow_f2bf(((int)((i * 11) % 53) - 26) / 9.0f);
+            }
+            PlowDevInst in = {0}; in.op = PLOW_DOP_QUANT_FP8;
+            for (unsigned i = 0; i < 8; i++) in.t[i] = i < 5 ? i : PLOW_TENSOR_NONE;
+            in.i[0] = M; in.i[1] = K; in.i[2] = act;
+            void* Tg[] = {qr, xr, scr, gate, up}, *Tv[] = {q, x, sc, gate, up};
+            PlowCpuCtx ctx = {0};
+            for (unsigned blocks = 1; blocks <= 7; blocks += 6)
+                for (unsigned slice = 0; slice < blocks; slice++) {
+                    gold[in.op](&in, slice, blocks, Tg, &ctx);
+                    plow_cpu_kernel(in.op)(&in, slice, blocks, Tv, &ctx);
+                }
+            for (unsigned m = 0; m < M; m++) {
+                float hi = 0;
+                for (unsigned k = 0; k < K; k++) hi = fmaxf(hi, fabsf(plow_bf2f(xr[m*K+k])));
+                bad += fabsf(sc[m] - scr[m]) > 0.01f * scr[m];
+                for (unsigned k = 0; k < K; k++) {
+                    const unsigned i = m * K + k;
+                    bad += fabsf(plow_bf2f(x[i]) - plow_bf2f(xr[i])) > 0.01f * hi;
+                    /* fp8 codes are only comparable where the value carries signal. */
+                    bad += fabsf(plow_bf2f(xr[i])) > 0.05f * hi && abs((int)q[i] - (int)qr[i]) > 1;
+                }
+            }
+            free(gate); free(up); free(x); free(xr); free(q); free(qr);
         }
     }
     if (bad) printf("FAIL activation FP8 quantization (%d)\n", bad);
@@ -340,7 +408,7 @@ int main(int argc, char** argv) {
     if (plow_cpu_init(PLOW_CPU_ISA_AVX512) < PLOW_CPU_ISA_AVX512) return 77;
     const uint16_t ops[] = {PLOW_DOP_GEMM, PLOW_DOP_GEMM_SMALL, PLOW_DOP_GEMM_MED,
         PLOW_DOP_GEMM_WIDE, PLOW_DOP_GEMM_C5, PLOW_DOP_GEMM_NORM, PLOW_DOP_GEMM_GLU};
-    int bad = splitk_check() + activation_quant_check() + moe_fp8_check();
+    int bad = splitk_check() + activation_quant_check() + moe_fp8_check() + gelu_tail_check();
     for (size_t i = 0; i < sizeof ops / sizeof ops[0]; i++) {
         bad += check(ops[i], 7, 19, 1, 0);
         bad += check(ops[i], 17, 259, 33, 0);

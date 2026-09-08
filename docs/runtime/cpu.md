@@ -36,8 +36,10 @@ subnormals and NaNs. MXFP4 uses the existing packed even-K row layout and E8M0
 block scales. Packet tile/slice ownership is preserved.
 
 `QUANT_FP8` supports per-row BF16-to-e4m3fn activation quantization with FP32
-scales, round-to-nearest ties-to-even, and finite saturation. Its ordinary path
-uses AVX-512; fused gate/up activation uses the scalar reference. Compile W8A8
+scales, round-to-nearest ties-to-even, and finite saturation. Both its ordinary
+path and its fused gate/up activation use AVX-512; the fused form computes the
+activation, the bf16 store, and the row maximum in one pass, measuring 9.7-13.4x
+its scalar reference on one EPYC 9654 core. Compile W8A8
 without `--qnorm-fuse`: CPU loading rejects that unsupported RMSNorm fusion.
 W8A16 uses FP8 weights and BF16 activations; neither mode requires native FP8
 arithmetic instructions. Gemma FP8 expert GLU/down kernels have scalar and
@@ -54,7 +56,12 @@ assets; tensor-handle validation is not a complete sandbox for hostile packets.
 
 Vector reductions can differ from sequential f32 accumulation. Kernel tests use
 numerical tolerances and independent references where available; bit-identical
-generated text across ISA tiers is not promised. Existing optional INT8/INT16 MoE
+generated text across ISA tiers is not promised. The vector gelu evaluates
+`0.5*x*(1 + tanh(c))` in its equivalent `x * sigmoid(2c)` form, which the scalar
+tier does not: below roughly `x = -4` the `1 + tanh` form cancels down to noise
+and `tanhf` then saturates the scalar tier's output to zero, so the two tiers
+disagree in that tail, on values whose magnitude is far under one fp8 code of the
+row scale. Existing optional INT8/INT16 MoE
 paths and approximate FP8 decode GEMVs retain their earlier accuracy tradeoffs.
 
 ## NUMA policy

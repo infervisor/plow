@@ -110,12 +110,16 @@ static inline __m512 v_tanh(__m512 x) {
     const __m512 e = v_expf(_mm512_mul_ps(two, x));
     return _mm512_sub_ps(one, _mm512_div_ps(two, _mm512_add_ps(one, e)));
 }
+/* 0.5*x*(1 + tanh(c)) == x * sigmoid(2c), so the constant carries the doubling. The tanh form
+ * cancels catastrophically once tanh(c) approaches -1: `1 + tanh` then keeps only the bits the
+ * subtraction inside v_tanh left behind, which in the far-negative tail is a few percent of the
+ * result. The sigmoid form is the same function evaluated without that cancellation, and one
+ * operation cheaper. */
 static inline __m512 v_gelu_tanh(__m512 x) {
     const __m512 c = _mm512_mul_ps(
-        _mm512_set1_ps(0.7978845608028654f),
+        _mm512_set1_ps(2.0f * 0.7978845608028654f),
         _mm512_fmadd_ps(_mm512_set1_ps(0.044715f), _mm512_mul_ps(_mm512_mul_ps(x, x), x), x));
-    return _mm512_mul_ps(_mm512_mul_ps(_mm512_set1_ps(0.5f), x),
-                         _mm512_add_ps(_mm512_set1_ps(1.0f), v_tanh(c)));
+    return _mm512_mul_ps(x, v_sigmoid(c));
 }
 /* act 0 = gelu_tanh, 1 = silu, 2 = situ pair form (caller handles); NaN otherwise like golden. */
 static inline __m512 v_act_gate(__m512 g, uint32_t act) {

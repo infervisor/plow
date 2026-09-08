@@ -1,6 +1,5 @@
 #include "avx512.h"
 #include "../mxfp4_common.h"
-#include "golden/fp8.h"
 #include "golden/gptoss.h"
 
 static __m128i fp8_encode(__m512 x) {
@@ -20,23 +19,48 @@ static __m128i fp8_encode(__m512 x) {
     return _mm512_cvtepi32_epi8(_mm512_or_si512(code, sign));
 }
 
+/* Fused gate/up (t3 present): x = act(gate) * up, rounded to bf16 and stored, with |x| folded
+ * into the row max in the same pass. Golden maxes over the ROUNDED value, so the bf16 round
+ * point precedes the abs. A NaN lane contributes 0, matching golden's fmaxf, which returns its
+ * non-NaN operand; act >= 2 poisons every lane to NaN in both tiers. Tail lanes are dropped from
+ * the max explicitly rather than leaning on act(0) == 0. */
+static inline __m512 quant_fused_row(plow_bf16* x, const plow_bf16* gate, const plow_bf16* up,
+                                     uint32_t K, uint32_t act) {
+    __m512 amax = _mm512_setzero_ps();
+    for (uint32_t k = 0; k < K; k += 16) {
+        const __mmask16 mask = K - k >= 16 ? 0xffff : v_tail16(K - k);
+        const __m512 g = v_act_gate(v_load_bf16_mask(gate + k, mask), act);
+        const __m256bh b = _mm512_cvtneps_pbh(_mm512_mul_ps(g, v_load_bf16_mask(up + k, mask)));
+        _mm256_mask_storeu_epi16(x + k, mask, (__m256i)b);
+        const __m512 v = _mm512_abs_ps(_mm512_cvtpbh_ps(b));
+        amax = _mm512_max_ps(amax, _mm512_maskz_mov_ps(mask & _mm512_cmp_ps_mask(v, v, _CMP_ORD_Q), v));
+    }
+    return amax;
+}
+
 V_K(v_quant_fp8) {
-    if (PLOW_CPU_TEN(in, T, 3)) { g_quant_fp8(in, slice, nblk, T, ctx); return; }
+    (void)ctx;
     uint8_t* q = PLOW_CPU_TEN(in, T, 0);
-    const plow_bf16* x = PLOW_CPU_TEN(in, T, 1);
+    plow_bf16* x = PLOW_CPU_TEN(in, T, 1);
     float* scales = PLOW_CPU_TEN(in, T, 2);
+    const plow_bf16* gate = PLOW_CPU_TEN(in, T, 3);
+    const plow_bf16* up = PLOW_CPU_TEN(in, T, 4);
     const uint32_t K = in->i[1];
     uint32_t lo, hi;
     g_range(in->i[0], slice, nblk, &lo, &hi);
     for (uint32_t m = lo; m < hi; m++) {
         const size_t row = (size_t)m * K;
         __m512 amax = _mm512_setzero_ps();
-        for (uint32_t k = 0; k < K; k += 16) {
-            const __mmask16 mask = K - k >= 16 ? 0xffff : (1u << (K - k)) - 1;
-            const __m512i b = _mm512_cvtepu16_epi32(_mm256_maskz_loadu_epi16(mask, x + row + k));
-            __m512 v = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_and_si512(b, _mm512_set1_epi32(0x7fff)), 16));
-            v = _mm512_maskz_mov_ps(_mm512_cmp_ps_mask(v, v, _CMP_ORD_Q), v);
-            amax = _mm512_max_ps(amax, v);
+        if (gate) {
+            amax = quant_fused_row(x + row, gate + row, up + row, K, in->i[2]);
+        } else {
+            for (uint32_t k = 0; k < K; k += 16) {
+                const __mmask16 mask = K - k >= 16 ? 0xffff : (1u << (K - k)) - 1;
+                const __m512i b = _mm512_cvtepu16_epi32(_mm256_maskz_loadu_epi16(mask, x + row + k));
+                __m512 v = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_and_si512(b, _mm512_set1_epi32(0x7fff)), 16));
+                v = _mm512_maskz_mov_ps(_mm512_cmp_ps_mask(v, v, _CMP_ORD_Q), v);
+                amax = _mm512_max_ps(amax, v);
+            }
         }
         scales[m] = fmaxf(_mm512_reduce_max_ps(amax) * (1.0f / 448.0f), 1e-12f);
         const __m512 inv = _mm512_set1_ps(1.0f / scales[m]);
