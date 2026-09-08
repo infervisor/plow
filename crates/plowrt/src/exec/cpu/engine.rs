@@ -1159,19 +1159,39 @@ fn cu_domains(progs: &[DevProg], n_cu: u32) -> Option<(Vec<u32>, u32)> {
     Some((dom, domains))
 }
 
+/// Stream entries each cu runs, summed over the programs — the work unit the static walk executes.
+fn cu_work(progs: &[DevProg], n_cu: u32) -> Vec<u64> {
+    let mut w = vec![0u64; n_cu as usize];
+    for p in progs {
+        for (cu, slot) in w.iter_mut().enumerate() {
+            *slot += *p.stream_len.get(cu).unwrap_or(&0) as u64;
+        }
+    }
+    w
+}
+
 /// Node position for every cu, from the packet's locality domains.
 ///
-/// Applied only when the domains divide evenly over the nodes: same-domain cus then share a node
-/// AND every node keeps an identical share of the cus. Spreading work over all nodes is the larger,
-/// measured effect (the release report puts distributed placement at 2.3-2.6x node-0-only at 24
-/// workers), so an uneven split is not worth trading for locality — `None` falls back to the
-/// round-robin, which is exactly balanced by construction.
-fn node_plan(cu_dom: &[u32], domains: u32, nodes: usize) -> Option<Vec<u32>> {
+/// Requires the domains to divide over the nodes AND the resulting split to leave no node busier
+/// than the round-robin would. That second test is the one that matters, and it is measured, not
+/// assumed: a domain is a GPU L2 partition, and nothing makes its slices equal in COST. The blocked
+/// map (`cu / sms_per_partition`) is the worst case — low-numbered cus carry every op that is
+/// sliced narrowly, so grouping them puts a third of the packet on one node. On a real H100-mapped
+/// Gemma-4 blob that is a 3.0-4.1x work spread across nodes against round-robin's 1.04-1.12x, and
+/// it measured 1.5x slower end to end. The makespan is set by the busiest node, so comparing peaks
+/// is the right test; `None` falls back to the round-robin.
+fn node_plan(cu_dom: &[u32], domains: u32, nodes: usize, work: &[u64]) -> Option<Vec<u32>> {
     if nodes < 2 || (domains as usize) < nodes || !(domains as usize).is_multiple_of(nodes) {
         return None;
     }
     let per = domains as usize / nodes;
-    Some(cu_dom.iter().map(|&d| (d as usize / per) as u32).collect())
+    let plan: Vec<u32> = cu_dom.iter().map(|&d| (d as usize / per) as u32).collect();
+    let (mut placed, mut rr) = (vec![0u64; nodes], vec![0u64; nodes]);
+    for (cu, &w) in work.iter().enumerate().take(plan.len()) {
+        placed[plan[cu] as usize] += w;
+        rr[cu % nodes] += w;
+    }
+    (placed.iter().max() <= rr.iter().max()).then_some(plan)
 }
 
 #[cfg(test)]
@@ -1246,7 +1266,8 @@ mod placement_tests {
     #[test]
     fn node_plan_groups_domains_onto_nodes() {
         let (dom, domains) = cu_domains(&[prog(64, 8, |cu| cu % 8)], 64).unwrap();
-        let plan = node_plan(&dom, domains, 2).expect("8 domains divide over 2 nodes");
+        let flat = vec![1u64; 64];
+        let plan = node_plan(&dom, domains, 2, &flat).expect("8 domains divide over 2 nodes");
         for cu in 0..64u32 {
             assert_eq!(plan[cu as usize], dom[cu as usize] / 4);
         }
@@ -1255,15 +1276,67 @@ mod placement_tests {
         }
     }
 
-    /// Spreading over every node is the larger measured effect, so a split that would leave the
-    /// nodes uneven -- or that has fewer domains than nodes -- declines rather than trade it away.
+    /// The AMD round-robin map is `cu % domains`, so at `domains == nodes` the plan reduces to
+    /// `cu % nodes` — exactly the placement it replaces. A real gfx950 blob lands here on an
+    /// 8-node host, which is why an A/B of the two placements only says anything at other node
+    /// counts; the plan diverges as soon as the counts differ.
+    #[test]
+    fn an_amd_map_matching_the_node_count_reproduces_the_round_robin() {
+        let (dom, domains) = cu_domains(&[prog(304, 8, |cu| cu % 8)], 304).unwrap();
+        let flat = vec![1u64; 304];
+        let same = node_plan(&dom, domains, 8, &flat).unwrap();
+        assert!(
+            (0..304).all(|cu| same[cu] == cu as u32 % 8),
+            "identical at 8 nodes"
+        );
+        let differs = node_plan(&dom, domains, 2, &flat).unwrap();
+        assert!(
+            (0..304).any(|cu| differs[cu] != cu as u32 % 2),
+            "and diverges at 2 nodes, where the A/B is meaningful"
+        );
+    }
+
+    /// Spreading over every node is the larger measured effect, so a split with fewer domains than
+    /// nodes, or one that does not divide, declines rather than trade it away.
     #[test]
     fn node_plan_declines_when_it_cannot_stay_balanced() {
         let (dom, domains) = cu_domains(&[prog(64, 8, |cu| cu % 8)], 64).unwrap();
-        assert!(node_plan(&dom, domains, 3).is_none(), "8 domains, 3 nodes");
-        assert!(node_plan(&dom, domains, 1).is_none(), "single node");
-        assert!(node_plan(&dom, domains, 16).is_none(), "domains < nodes");
-        assert!(node_plan(&dom, domains, 8).is_some(), "one domain per node");
+        let flat = vec![1u64; 64];
+        assert!(
+            node_plan(&dom, domains, 3, &flat).is_none(),
+            "8 domains, 3 nodes"
+        );
+        assert!(node_plan(&dom, domains, 1, &flat).is_none(), "single node");
+        assert!(
+            node_plan(&dom, domains, 16, &flat).is_none(),
+            "domains < nodes"
+        );
+        assert!(
+            node_plan(&dom, domains, 8, &flat).is_some(),
+            "one domain per node"
+        );
+    }
+
+    /// The measured failure, reproduced: the blocked map puts every narrowly-sliced op's cus on
+    /// one node. Equal cu COUNTS per node say nothing about equal cost, so the guard compares the
+    /// busiest node's work against what the round-robin would give it. This shape ran 1.5x slower
+    /// end to end on the real blob, and must be declined.
+    #[test]
+    fn node_plan_declines_a_plan_that_makes_the_busiest_node_worse() {
+        // 132 cus, blocked over 8 domains of 18: domain 7 gets 6 cus, and low cus carry more work.
+        let (dom, domains) = cu_domains(&[prog(132, 8, |cu| (cu / 18).min(7))], 132).unwrap();
+        let skewed: Vec<u64> = (0..132).map(|cu| 132 - cu as u64).collect();
+        assert!(
+            node_plan(&dom, domains, 8, &skewed).is_none(),
+            "declines the skew"
+        );
+        // The same domains with flat per-cu cost still balance, so the guard is not blanket-off.
+        let flat = vec![1u64; 132];
+        let n = node_plan(&dom, domains, 8, &flat);
+        assert!(
+            n.is_none(),
+            "18/18/../6 cus per node is already worse than round-robin"
+        );
     }
 }
 
@@ -1532,10 +1605,15 @@ impl CpuEngine {
         })?);
         // The packet's locality hint, mapped onto this host's nodes. Absent for an unplaced blob,
         // one node, or domains that do not divide over the nodes: placement stays cu % nodes.
-        let cu_dom = cu_domains(&model.blob.progs, n_cu);
-        let plan = cu_dom
-            .as_ref()
-            .and_then(|(d, n)| node_plan(d, *n, nodes.len()).map(|p| (p, *n)));
+        let cu_dom = crate::config::RuntimeConfig::get()
+            .cpu
+            .l2_place
+            .then(|| cu_domains(&model.blob.progs, n_cu))
+            .flatten();
+        let plan = cu_dom.as_ref().and_then(|(d, n)| {
+            let work = cu_work(&model.blob.progs, n_cu);
+            node_plan(d, *n, nodes.len(), &work).map(|p| (p, *n))
+        });
         match &plan {
             Some((_, domains)) => tracing::info!(
                 domains,

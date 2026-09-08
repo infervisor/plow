@@ -81,22 +81,30 @@ therefore serves any core count, and `n_cu` never has to match it. Compile once
 at a width that divides the largest core count you intend to serve; the emitter
 caps `n_cu` at 256, because the per-domain slice count is a nine-bit field.
 
-Executors are then assigned to nodes from the packet's L2 locality domains when
-the blob carries them (`PLOW_L2_PLACE`), so cus that feed each other share a
-node. Domains are read back from the per-entry domain bits, which makes the
-recovery independent of the emitter's workgroup-to-domain map. The domain is a
-relative hint, never a node id: the mapping onto real nodes happens at load,
-where the host topology is known, which is what keeps one blob portable across
-hosts with different node counts. Each worker's first global-queue claim follows
-the same assignment instead of its bare node index.
+Executors are placed on node `cu % nodes`. Placing them by the packet's L2
+locality domains instead is implemented behind `--cpu-l2-place` and is **off**,
+because it measured 1.5x slower and never faster; see the
+[placement report](../../perf-data/cpu-numa-placement/epyc9654-avx512/README.md).
 
-Placement falls back to the previous `cu % nodes` round-robin whenever the blob
-expresses no usable locality: no `PLOW_L2_PLACE`, the legacy layout that encoded
-the domain in `seg`, a single node or domain, placed programs that disagree, or
-domains that do not divide evenly over the nodes. The last case is deliberate —
-spreading over every node is the larger measured effect, so an uneven split is
-not traded for locality. An unplaced program alongside a placed one is
-indifferent to the choice and simply follows it.
+The reason is worth keeping, because the idea is superficially attractive. An L2
+domain says which slices share a *GPU* cache. It does not say which weights they
+touch, and CPU model tensors are interleaved across every node regardless — so
+grouping by domain creates no memory locality on this engine. It does destroy the
+round-robin's load balance, because nothing makes domains equal in cost: under the
+blocked map (`cu / sms_per_partition`) the low-numbered cus carry every narrowly
+sliced op, so one node inherits a third of the packet. On an H100-mapped
+Gemma-4-31B that is a 3.0-4.1x work spread across nodes against round-robin's
+1.04-1.12x.
+
+The mechanism is kept, tested, and A/B-able because it costs nothing when off and
+a host with balanced domains has not been measured. When it is on, `node_plan`
+still declines any plan that would leave a node busier than the round-robin
+would, which is what rejects the case above; it also declines when the blob
+carries no domains, when the legacy layout encoded the domain in `seg`, on a
+single node or domain, when placed programs disagree, and when the domains do not
+divide evenly over the nodes. Under the AMD round-robin map the plan reduces to
+`cu % nodes` exactly whenever the domain count equals the node count, so on an
+8-node host an 8-XCD blob would see no difference either way.
 
 | Setting | Workers | Large model tensors |
 | --- | --- | --- |
@@ -117,13 +125,12 @@ or tensor allocation is added to a kernel invocation.
 This is a shared-memory engine with interleaved tensors, not NUMA tensor parallelism.
 It does not replicate weights or KV by socket, nor use remote-node work stealing
 outside the global queue's own stealing. Those require model-level measurements and
-a matching compiler/runtime ownership design. Executor placement follows the packet's
-locality domains, but the packet still carries no host topology and the compiler emits
-none: a blob is never built for a particular node count. Interleave requests balanced
-page placement; allocation fallback can still concentrate physical pages on fewer
-nodes. Domain-following placement is a locality hint acted on at load, not a guarantee
-of local access or of a multi-socket inference speedup; it is not yet measured against
-the round-robin on a placed blob.
+a matching compiler/runtime ownership design. The packet carries no host topology and
+the compiler emits none: a blob is never built for a particular node count, and
+executor placement is decided at load. Interleave requests balanced page placement;
+allocation fallback can still concentrate physical pages on fewer nodes. It does not
+guarantee local access or a multi-socket inference speedup, and following the packet's
+locality domains measured slower rather than faster.
 
 ## Verification on EPYC 9654
 
