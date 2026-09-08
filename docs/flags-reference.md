@@ -762,6 +762,34 @@ values cost.
 
 ---
 
+## CPU runtime knobs (`plowrt --cpu-*`)
+
+Only present in a build carrying the `cpu` feature. Every one is a CLI flag with an
+environment twin, and the CLI wins. Full prose, plus how to compile a CPU-loadable
+bundle in the first place, in [CPU execution](runtime/cpu.md).
+
+| flag | env | default | effect |
+|---|---|---|---|
+| `--cpu-threads N` | `PLOW_CPU_THREADS` | 0 | Persistent kernel workers. `0` = model-dependent width (physical cores for MoE, logical CPUs for dense decode). Independent of the packet's `--n-cu`: the pool maps any thread count onto the virtual executors, so one bundle serves any core count. |
+| `--cpu-numa MODE` | `PLOW_CPU_NUMA` | `auto` | `auto` interleaves large tensors across allowed nodes (best effort); `off` keeps OS/`numactl` policy; `0,1` requires successful binding and rejects unavailable nodes. Topology honours cpusets and `taskset`. |
+| `--cpu-isa TIER` | `PLOW_CPU_ISA` | `auto` | Tier ceiling `scalar` / `avx512` / `amx`. Never activates above what cpuid and OS register state permit, so this only ever narrows. |
+| `--cpu-huge-pages=B` | `PLOW_CPU_HUGE_PAGES` | unset | Override THP *advice* (default: ordinary pages when interleaved, huge-page advice for single-node/OS placement). Advice only — not the system THP setting. |
+| `--cpu-spin-us N` | `PLOW_CPU_SPIN_US` | 2000 | Spin budget (µs) before a blocked worker yields and parks. Decode packets are 100–500 µs apart; parking every gap measured **+17% TPOT** at 50 µs vs 1000. |
+| `--cpu-prefill-chunk N` | `PLOW_CPU_PF_CHUNK` | 0 (off) | Largest prefill chunk (rows) a tick may run while other slots decode. Measured **negative at concurrency ≥ 4** — the threads are throughput-bound, not stall-bound — so it stays off. |
+| `--cpu-mxfp4-dir DIR` | `PLOW_MXFP4_DIR` | unset | MXFP4 weight twin (`mxfp4/<name>` + `_scale` E8M0 rows; `perf-data/tools/quantize_mxfp4.py`). |
+| `--fp8-dir DIR` | `PLOW_FP8_DIR` | unset | fp8 weight twin. Runtime-wide, but this is how a CPU bundle gets W8A16/W8A8 weights. |
+| `--cpu-global-queue=B` | `PLOW_CPU_GQ` | off | Global op-major work queue (windowed per segment and L2 domain, with stealing) instead of static per-cu streams. **~2x slower** on the EPYC 9654; kept for A/B. |
+| `--cpu-l2-place=B` | `PLOW_CPU_L2_PLACE` | off | Place executors by the packet's L2 locality domains instead of `cu % nodes`. **1.5x slower**, never faster ([report](../perf-data/cpu-numa-placement/epyc9654-avx512/README.md)). Inert without domains in the blob; a balance guard declines a losing plan even when on. |
+
+The last two are off because they were *measured* worse, not because they are
+unfinished — neither changes what is computed, so both are safe to flip for an A/B
+on another host.
+
+Compile-side, there is no CPU emit target: `plowc` emits for a device target and the
+CPU interprets that packet. Use an **NVIDIA** `--gpu` (a gfx942/gfx950 packet is
+rejected at load), and set `--n-cu` explicitly — it is the virtual executor count,
+capped at 256, and need not match any thread count.
+
 ## Serving / runtime knobs (`plowrt` env)
 
 | var | default | effect |

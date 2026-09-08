@@ -13,7 +13,7 @@ use std::ffi::c_void;
 use std::path::Path;
 use std::time::Instant;
 
-use packet::dev::{DevInst64, DevOp, StreamEnt, TENSOR_NONE16};
+use packet::dev::{DevInst64, DevOp, StreamEnt, SE_DOMAIN_MASK, SE_DOMAIN_SHIFT, TENSOR_NONE16};
 
 use crate::asset::checkpoint::Checkpoint;
 use crate::asset::devblob::{DevBlob, DevProg};
@@ -1109,6 +1109,391 @@ fn dense_row_decode(p: &DevProg) -> bool {
     })
 }
 
+/// cu -> L2 locality domain, plus the domain count, recovered from the bits the emitter tags onto
+/// every stream entry (`SE_DOMAIN_MASK`). `L2Layout::domain_of` is a pure function of the workgroup
+/// index and one layout serves a whole build, so each cu's entries all carry the same value and the
+/// placed programs agree; both are checked rather than assumed.
+///
+/// `None` keeps placement on the topology-only round-robin, which is the right answer whenever the
+/// blob expresses no locality: no `PLOW_L2_PLACE` at compile time, the legacy layout that encoded
+/// the domain in `seg` rather than in flags (every domain bit reads zero), a single domain, or
+/// placed programs that disagree. The domain is a RELATIVE hint about which slices share producers
+/// — never a node id — so the mapping onto real NUMA nodes happens here, at load, where the host
+/// topology is known. That is what keeps one blob portable across hosts with different node counts.
+pub fn cu_domains(progs: &[DevProg], n_cu: u32) -> Option<(Vec<u32>, u32)> {
+    let mut dom = vec![u32::MAX; n_cu as usize];
+    let mut domains = 0u32;
+    for p in progs.iter().filter(|p| p.l2_domains != 0) {
+        if domains != 0 && domains != p.l2_domains {
+            return None;
+        }
+        // `validate_cpu_blob` has already sized these, but this stays total for any caller.
+        if p.stream_ofs.len() < n_cu as usize || p.stream_len.len() < n_cu as usize {
+            return None;
+        }
+        domains = p.l2_domains;
+        for (cu, slot) in dom.iter_mut().enumerate() {
+            let start = p.stream_ofs[cu] as usize;
+            // Slicing directly would panic on a blob that never went through `validate_cpu_blob`,
+            // which a caller outside the engine (the l2_probe example) does not run.
+            let entries = start
+                .checked_add(p.stream_len[cu] as usize)
+                .and_then(|end| p.stream.get(start..end))?;
+            for e in entries {
+                let d = ((e.flags & SE_DOMAIN_MASK) >> SE_DOMAIN_SHIFT) as u32;
+                if d >= domains {
+                    return None;
+                }
+                if *slot == u32::MAX {
+                    *slot = d;
+                } else if *slot != d {
+                    return None;
+                }
+            }
+        }
+    }
+    if domains < 2 || dom.iter().all(|&d| d == u32::MAX) {
+        return None;
+    }
+    // A cu no placed program gave work to carries no hint; spread those so they stay balanced.
+    for (cu, d) in dom.iter_mut().enumerate() {
+        if *d == u32::MAX {
+            *d = cu as u32 % domains;
+        }
+    }
+    Some((dom, domains))
+}
+
+/// Workers to spawn: the width the topology and model want, but never more than the packet has
+/// executors.
+///
+/// `cu_map` deals cus `0..n_cu` over the pool, so a worker past `n_cu` owns nothing in EVERY
+/// program. It cannot be rescued by any later narrowing: it wakes on each run, finds an empty
+/// stream, returns to the control ring, and spins `--cpu-spin-us` before parking — on the cores the
+/// working set needs. This is NOT the per-program narrowing that measured worse (see the note at
+/// the call site); those workers were idle for one program and busy for another, while these are
+/// unusable for the whole model, so there is no width tradeoff to lose.
+///
+/// Measured on Gemma-4-31B dense, `n_cu = 144`, 8-node EPYC 9654, means of 3 (TTFT / decode step):
+///
+/// | workers | TTFT | decode step |
+/// |---|---|---|
+/// | 384 (all logical, the old default) | 20.50 s | 3459 ms |
+/// | 192 (all physical) | 16.24 s | 1196 ms |
+/// | 144 (`n_cu`) | 14.08 s | 415 ms |
+///
+/// The decode penalty tracks the idle count — 240 idle is 8.3x, 48 idle is 2.9x, 0 is baseline.
+///
+/// The global queue is exempt: there every worker claims from the shared window, so workers past
+/// `n_cu` do useful work rather than idling. An explicit `--cpu-threads` is always honoured.
+fn worker_width(explicit: usize, want: usize, n_cu: u32, gq: bool) -> usize {
+    if explicit != 0 {
+        return explicit;
+    }
+    if gq {
+        return want.max(1);
+    }
+    want.min(n_cu as usize).max(1)
+}
+
+/// Stream entries each cu runs, ONE VECTOR PER PROGRAM — the work unit the static walk executes.
+///
+/// Kept per program rather than summed because programs are ALTERNATIVES: a prefill bucket or the
+/// decode program is chosen per dispatch, and their loads never overlap. Summing them lets a plan
+/// that ruins one program hide behind another that leans the other way — two programs at 200/2 and
+/// 2/200 across a pair of nodes total 202/202 and look perfectly balanced, while each one on its
+/// own is a 100x spread.
+pub fn cu_work(progs: &[DevProg], n_cu: u32) -> Vec<Vec<u64>> {
+    progs
+        .iter()
+        .map(|p| {
+            (0..n_cu as usize)
+                .map(|cu| *p.stream_len.get(cu).unwrap_or(&0) as u64)
+                .collect()
+        })
+        .collect()
+}
+
+/// Busiest node under `plan` and under the `cu % nodes` round-robin, for one program's work.
+fn peak_loads(plan: &[u32], work: &[u64], nodes: usize) -> (u64, u64) {
+    let (mut placed, mut rr) = (vec![0u64; nodes], vec![0u64; nodes]);
+    for (cu, &w) in work.iter().enumerate().take(plan.len()) {
+        placed[plan[cu] as usize % nodes] += w;
+        rr[cu % nodes] += w;
+    }
+    (
+        placed.into_iter().max().unwrap_or(0),
+        rr.into_iter().max().unwrap_or(0),
+    )
+}
+
+/// Node position for every cu, from the packet's locality domains.
+///
+/// Requires the domains to divide over the nodes AND the resulting split to leave no node busier
+/// than the round-robin would, in EVERY program. That second test is the one that matters, and it
+/// is measured, not assumed: a domain is a GPU L2 partition, and nothing makes its slices equal in
+/// COST. The blocked map (`cu / sms_per_partition`) is the worst case — low-numbered cus carry every
+/// op that is sliced narrowly, so grouping them puts a third of the packet on one node. On a real
+/// H100-mapped Gemma-4 blob that is a 3.0-4.1x work spread across nodes against round-robin's
+/// 1.04-1.12x, and it measured 1.5x slower end to end. The makespan is set by the busiest node, so
+/// comparing peaks is the right test; `None` falls back to the round-robin.
+pub fn node_plan(
+    cu_dom: &[u32],
+    domains: u32,
+    nodes: usize,
+    work: &[Vec<u64>],
+) -> Option<Vec<u32>> {
+    if nodes < 2 || (domains as usize) < nodes || !(domains as usize).is_multiple_of(nodes) {
+        return None;
+    }
+    // No work to judge means nothing establishes the plan is safe; `all()` on an empty slice is
+    // vacuously true, which would turn "unknown" into "approved".
+    if work.is_empty() {
+        return None;
+    }
+    let per = domains as usize / nodes;
+    let plan: Vec<u32> = cu_dom.iter().map(|&d| (d as usize / per) as u32).collect();
+    work.iter()
+        .all(|w| {
+            let (placed, rr) = peak_loads(&plan, w, nodes);
+            placed <= rr
+        })
+        .then_some(plan)
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::*;
+
+    fn prog(n_cu: u32, l2_domains: u32, dom_of: impl Fn(u32) -> u32) -> DevProg {
+        let (mut stream, mut ofs, mut len) = (Vec::new(), Vec::new(), Vec::new());
+        for cu in 0..n_cu {
+            ofs.push(stream.len() as u32);
+            len.push(2);
+            for _ in 0..2 {
+                stream.push(StreamEnt {
+                    flags: (dom_of(cu) as u16) << SE_DOMAIN_SHIFT,
+                    ..Default::default()
+                });
+            }
+        }
+        DevProg {
+            t: 1,
+            packed_prefill_only: false,
+            n_counter: 0,
+            insts: Vec::new(),
+            stream,
+            stream_ofs: ofs,
+            stream_len: len,
+            waits: Vec::new(),
+            succs: Vec::new(),
+            gq_stream: Vec::new(),
+            gq_seg_ofs: Vec::new(),
+            l2_domains,
+        }
+    }
+
+    /// Both hardware maps the emitter can have used: AMD CDNA round-robin and NVIDIA blocked.
+    /// The recovery reads the tagged bits, so it does not need to know which.
+    #[test]
+    fn recovers_either_hardware_domain_map() {
+        for map in [(|cu: u32| cu % 8) as fn(u32) -> u32, |cu: u32| cu / 8] {
+            let (dom, domains) = cu_domains(&[prog(64, 8, map)], 64).expect("placed blob");
+            assert_eq!(domains, 8);
+            assert_eq!(dom, (0..64).map(map).collect::<Vec<_>>());
+        }
+    }
+
+    /// A blob that expresses no locality must leave placement alone. The legacy layout that put
+    /// the domain in `seg` reads as all-zero domain bits, which is the `l2_domains == 0` case.
+    #[test]
+    fn unplaced_or_single_domain_blob_has_no_plan() {
+        assert!(cu_domains(&[prog(64, 0, |cu| cu % 8)], 64).is_none());
+        assert!(cu_domains(&[prog(64, 1, |_| 0)], 64).is_none());
+        assert!(cu_domains(&[], 64).is_none());
+    }
+
+    /// One layout serves a whole build, so placed programs must agree; a blob that disagrees has
+    /// no single map to honour. An unplaced program alongside a placed one is fine -- it expresses
+    /// no locality, so it is indifferent to where its cus land.
+    #[test]
+    fn disagreeing_programs_have_no_plan() {
+        let progs = vec![prog(64, 8, |cu| cu % 8), prog(64, 8, |cu| cu / 8)];
+        assert!(cu_domains(&progs, 64).is_none());
+        let mixed = vec![prog(64, 8, |cu| cu % 8), prog(64, 0, |_| 0)];
+        assert!(cu_domains(&mixed, 64).is_some());
+    }
+
+    #[test]
+    fn domain_beyond_the_declared_count_is_rejected() {
+        assert!(cu_domains(&[prog(64, 4, |cu| cu % 8)], 64).is_none());
+    }
+
+    /// Same-domain cus share a node, and every node keeps an equal share.
+    #[test]
+    fn node_plan_groups_domains_onto_nodes() {
+        let (dom, domains) = cu_domains(&[prog(64, 8, |cu| cu % 8)], 64).unwrap();
+        let flat = vec![vec![1u64; 64]];
+        let plan = node_plan(&dom, domains, 2, &flat).expect("8 domains divide over 2 nodes");
+        for cu in 0..64u32 {
+            assert_eq!(plan[cu as usize], dom[cu as usize] / 4);
+        }
+        for node in 0..2u32 {
+            assert_eq!(plan.iter().filter(|&&p| p == node).count(), 32);
+        }
+    }
+
+    /// The AMD round-robin map is `cu % domains`, so at `domains == nodes` the plan reduces to
+    /// `cu % nodes` — exactly the placement it replaces. A real gfx950 blob lands here on an
+    /// 8-node host, which is why an A/B of the two placements only says anything at other node
+    /// counts; the plan diverges as soon as the counts differ.
+    #[test]
+    fn an_amd_map_matching_the_node_count_reproduces_the_round_robin() {
+        let (dom, domains) = cu_domains(&[prog(304, 8, |cu| cu % 8)], 304).unwrap();
+        let flat = vec![vec![1u64; 304]];
+        let same = node_plan(&dom, domains, 8, &flat).unwrap();
+        assert!(
+            (0..304).all(|cu| same[cu] == cu as u32 % 8),
+            "identical at 8 nodes"
+        );
+        let differs = node_plan(&dom, domains, 2, &flat).unwrap();
+        assert!(
+            (0..304).any(|cu| differs[cu] != cu as u32 % 2),
+            "and diverges at 2 nodes, where the A/B is meaningful"
+        );
+    }
+
+    /// Spreading over every node is the larger measured effect, so a split with fewer domains than
+    /// nodes, or one that does not divide, declines rather than trade it away.
+    #[test]
+    fn node_plan_declines_when_it_cannot_stay_balanced() {
+        let (dom, domains) = cu_domains(&[prog(64, 8, |cu| cu % 8)], 64).unwrap();
+        let flat = vec![vec![1u64; 64]];
+        assert!(
+            node_plan(&dom, domains, 3, &flat).is_none(),
+            "8 domains, 3 nodes"
+        );
+        assert!(node_plan(&dom, domains, 1, &flat).is_none(), "single node");
+        assert!(
+            node_plan(&dom, domains, 16, &flat).is_none(),
+            "domains < nodes"
+        );
+        assert!(
+            node_plan(&dom, domains, 8, &flat).is_some(),
+            "one domain per node"
+        );
+    }
+
+    /// The measured failure, reproduced: the blocked map puts every narrowly-sliced op's cus on
+    /// one node. Equal cu COUNTS per node say nothing about equal cost, so the guard compares the
+    /// busiest node's work against what the round-robin would give it. This shape ran 1.5x slower
+    /// end to end on the real blob, and must be declined.
+    #[test]
+    fn node_plan_declines_a_plan_that_makes_the_busiest_node_worse() {
+        // 132 cus, blocked over 8 domains of 18: domain 7 gets 6 cus, and low cus carry more work.
+        let (dom, domains) = cu_domains(&[prog(132, 8, |cu| (cu / 18).min(7))], 132).unwrap();
+        let skewed = vec![(0..132).map(|cu| 132 - cu as u64).collect::<Vec<u64>>()];
+        assert!(
+            node_plan(&dom, domains, 8, &skewed).is_none(),
+            "declines the skew"
+        );
+        // The same domains with flat per-cu cost still balance, so the guard is not blanket-off.
+        let flat = vec![vec![1u64; 132]];
+        let n = node_plan(&dom, domains, 8, &flat);
+        assert!(
+            n.is_none(),
+            "18/18/../6 cus per node is already worse than round-robin"
+        );
+    }
+
+    /// Programs are ALTERNATIVES, so the balance test has to hold for each separately. Two that
+    /// lean opposite ways sum to a perfectly balanced total while each on its own is ruinous —
+    /// summing first would approve exactly the placement the guard exists to reject.
+    #[test]
+    fn a_program_cannot_hide_its_imbalance_behind_another() {
+        // 4 cus, 2 domains, 2 nodes: cus 0,1 -> node 0 and cus 2,3 -> node 1 under the plan,
+        // against round-robin's 0,2 -> node 0 and 1,3 -> node 1.
+        let (dom, domains) = cu_domains(&[prog(4, 2, |cu| cu / 2)], 4).unwrap();
+        let a = vec![100u64, 100, 1, 1]; // plan 200/2, round-robin 101/101
+        let b = vec![1u64, 1, 100, 100]; // plan 2/200, round-robin 101/101
+        for one in [&a, &b] {
+            assert!(
+                node_plan(&dom, domains, 2, std::slice::from_ref(one)).is_none(),
+                "each program alone is a 200-vs-2 split and must be declined"
+            );
+        }
+        assert!(
+            node_plan(&dom, domains, 2, &[a.clone(), b.clone()]).is_none(),
+            "and together too: their sum balances, but neither program ever runs as the sum"
+        );
+        // The hole this closes, made explicit: summing first yields a flat 101 per cu, which the
+        // peak test then waves through. That was the earlier `cu_work`, and it is why the work is
+        // now carried one row per program.
+        let summed: Vec<u64> = (0..4).map(|i| a[i] + b[i]).collect();
+        assert!(summed.iter().all(|&x| x == 101));
+        assert!(
+            node_plan(&dom, domains, 2, &[summed]).is_some(),
+            "the summed view approves the very placement each program rejects"
+        );
+        // Sanity that this shape is otherwise acceptable, so the rejection is the imbalance.
+        let flat = vec![vec![1u64; 4]];
+        assert!(node_plan(&dom, domains, 2, &flat).is_some());
+    }
+
+    /// No work rows means nothing established the plan is safe. `all()` over an empty slice is
+    /// vacuously true, so this has to be rejected explicitly or "unknown" reads as "approved".
+    #[test]
+    fn node_plan_declines_with_no_work_to_judge() {
+        let (dom, domains) = cu_domains(&[prog(64, 8, |cu| cu % 8)], 64).unwrap();
+        assert!(node_plan(&dom, domains, 8, &[]).is_none());
+    }
+
+    /// `cu_domains` is `pub` and the probe calls it on a blob that never saw `validate_cpu_blob`,
+    /// so a stream window past the end has to decline rather than panic.
+    #[test]
+    fn cu_domains_declines_a_stream_window_past_the_end() {
+        let mut p = prog(8, 2, |cu| cu / 4);
+        p.stream_len[3] = 9_999;
+        assert!(cu_domains(&[p], 8).is_none());
+        let mut q = prog(8, 2, |cu| cu / 4);
+        q.stream_ofs[5] = u32::MAX;
+        assert!(cu_domains(&[q], 8).is_none());
+    }
+
+    /// A worker past `n_cu` owns nothing in any program and only costs its spin, so the auto width
+    /// is capped. Measured 8.3x on decode; the explicit override and the global queue are exempt.
+    #[test]
+    fn worker_width_never_exceeds_the_packet() {
+        assert_eq!(worker_width(0, 384, 144, false), 144, "capped at n_cu");
+        assert_eq!(
+            worker_width(0, 96, 144, false),
+            96,
+            "no cap needed below n_cu"
+        );
+        assert_eq!(
+            worker_width(0, 384, 144, true),
+            384,
+            "global queue uses every worker"
+        );
+        assert_eq!(
+            worker_width(192, 384, 144, false),
+            192,
+            "explicit --cpu-threads wins"
+        );
+        assert_eq!(worker_width(512, 384, 144, false), 512, "even above n_cu");
+        assert_eq!(worker_width(0, 8, 0, false), 1, "never zero workers");
+    }
+
+    /// `cu_work` keeps one row per program rather than collapsing them.
+    #[test]
+    fn cu_work_is_per_program() {
+        let progs = vec![prog(4, 2, |cu| cu / 2), prog(4, 2, |cu| cu / 2)];
+        let w = cu_work(&progs, 4);
+        assert_eq!(w.len(), 2, "one row per program, not one summed row");
+        assert!(w.iter().all(|r| r.len() == 4 && r.iter().all(|&x| x == 2)));
+    }
+}
+
 fn loaded(
     p: &DevProg,
     n_cu: u32,
@@ -1361,7 +1746,12 @@ impl CpuEngine {
         // pool whose prefill was narrowed to 8. Fixing that needs the idle worker to stop polling,
         // which is the real prerequisite for per-phase widths.
         let wants_logical = model.blob.progs.iter().any(dense_row_decode);
-        let threads = threads.max(if wants_logical { logical_w } else { physical_w });
+        let threads = worker_width(
+            opts.threads,
+            threads.max(if wants_logical { logical_w } else { physical_w }),
+            n_cu,
+            crate::config::RuntimeConfig::get().cpu.gq_opt_in,
+        );
         tracing::info!(
             threads,
             ?isa,
@@ -1372,7 +1762,38 @@ impl CpuEngine {
         let exec = Arc::new(KernelExec::new(&model, threads, |w| {
             placement[w % placement.len()].1
         })?);
-        let pool = WorkerPool::spawn(&topo, threads, &opts.numa, opts.spin_us, n_cu, exec);
+        // The packet's locality hint, mapped onto this host's nodes. Absent for an unplaced blob,
+        // one node, or domains that do not divide over the nodes: placement stays cu % nodes.
+        let cu_dom = crate::config::RuntimeConfig::get()
+            .cpu
+            .l2_place
+            .then(|| cu_domains(&model.blob.progs, n_cu))
+            .flatten();
+        let plan = cu_dom.as_ref().and_then(|(d, n)| {
+            let work = cu_work(&model.blob.progs, n_cu);
+            node_plan(d, *n, nodes.len(), &work).map(|p| (p, *n))
+        });
+        match &plan {
+            Some((_, domains)) => tracing::info!(
+                domains,
+                nodes = nodes.len(),
+                "CPU NUMA placement follows the packet's L2 locality domains"
+            ),
+            None => tracing::debug!(
+                nodes = nodes.len(),
+                l2_domains = cu_dom.as_ref().map(|(_, n)| *n).unwrap_or(0),
+                "CPU NUMA placement is round-robin; no usable packet locality plan"
+            ),
+        }
+        let pool = WorkerPool::spawn(
+            &topo,
+            threads,
+            &opts.numa,
+            opts.spin_us,
+            n_cu,
+            plan.as_ref().map(|(p, n)| (p.as_slice(), *n)),
+            exec,
+        );
         let progs: Vec<Arc<LoadedProgram>> = model
             .blob
             .progs

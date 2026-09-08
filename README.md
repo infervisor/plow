@@ -209,8 +209,39 @@ jq -r .network "$ASSETS/weights.json"
 Streaming: `"stream": true`. Also `/healthz`, `/metrics`. Multiple
 `--assets DIR` register more models.
 
-For CPU-only builds, AVX-512 coverage, and NUMA placement, see
-[CPU execution](docs/runtime/cpu.md).
+## CPU-only (no GPU)
+
+Same three steps, minus the interpreter objects — the CPU backend interprets the
+packet directly, so **step 2 is skipped entirely** and nothing links CUDA or HSA:
+
+```bash
+# 1. Build. --no-default-features drops the GPU backends.
+cargo build --release -p plowc
+cargo build --release -p plowrt --no-default-features --features cpu
+
+# 2. Compile the packet. plowc always emits for a device target; pick an NVIDIA
+#    one — an AMD gfx942/gfx950 packet does NOT load on the CPU backend.
+CKPT="$HOME/models/gemma-4-12B-it"
+./target/release/plowc --hf-dir "$CKPT" \
+  --gpu rtx6000pro --n-cu 96 --max-ctx 2048 \
+  --batch 1,4 --seq 128,512 --out "$ASSETS"
+
+# 3. Serve. --rt-checkpoint is required; the bundle carries no weights.
+./target/release/plowrt serve --assets "$ASSETS" --rt-checkpoint "$CKPT" \
+  --cpu-isa avx512 --cpu-numa auto
+```
+
+`--n-cu` sets the packet's *virtual* executor count, not a thread count: the
+worker pool maps any number of threads onto it, so one bundle serves any core
+count. Fewer threads than executors is fine; more is wasteful, so the automatic
+worker width caps itself at `--n-cu`. Compile once at a width that divides the
+largest machine you intend to serve (the emitter caps it at 256).
+
+Runtime knobs are all `--cpu-*` (`--cpu-threads`, `--cpu-numa`, `--cpu-isa`,
+`--cpu-spin-us`, …), each with a `PLOW_CPU_*` env twin — full table in
+[CPU execution](docs/runtime/cpu.md#flags), which also covers AVX-512/AMX
+coverage, NUMA policy, and the two A/B knobs that are off because they measured
+slower.
 
 ## Contributing
 
