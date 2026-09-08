@@ -1,9 +1,95 @@
-use packet::dev::{PrefillSpan, PREFILL_SPAN_RESET_STATE};
+use packet::dev::{DevOp, PrefillSpan, PREFILL_SPAN_RESET_STATE};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct PackedRows {
     pub n_spans: u32,
     pub real_rows: u32,
+}
+
+/// How many request spans one packed launch of a program may carry, as far as its RECURRENT
+/// operators are concerned. `u32::MAX` means "as many as the row budget fits".
+///
+/// This is §3's D class in `plans/unified-token-batch.md` made executable, restricted to the
+/// operator family that actually has the property: a recurrent operator's carried state is an
+/// operand whose SHAPE has no request axis (`QwenGdnPrefill`'s `state`/`outstate` `[1,HV,V,K]`,
+/// `QwenGdnConvPrefill`'s `history[1,C,W-1]`), so a launch either has a per-span form that walks
+/// the span table itself, or it can express exactly one request. §5.4's contract is that the
+/// limit is STATED and enforced, not that it is hidden: the dense, MoE, norm and output work of
+/// a GDN/KDA model still packs.
+///
+/// Three dispositions, and the third is the one this file exists for:
+///
+/// * **Per-span form present.** The AMD arm loops `prog->prefill_spans` itself
+///   (`d_kda_chunk_*_packed_bt64`, `d_kda_conv3_packed`, `d_kda_state_step_packed`). No limit.
+/// * **Row-agnostic over the packed row axis.** `KdaGate` and `KdaGatedNorm` are elementwise /
+///   per-row over `T` with no carried state at all — class A, no limit.
+/// * **Single-sequence, no per-span form.** One span, or the program is refused outright when
+///   even one span would not be correct.
+///
+/// An unlisted recurrent opcode is NOT given the benefit of the doubt. §3: "An opcode with no
+/// classification is treated as C and refused." That matters more here than anywhere else,
+/// because AMD's interpreter dispatch `default:` is a silent NOP outside `PLOW_MIXED_STEP`
+/// builds, so an unrouted recurrent op leaves its state exactly as it found it and the run
+/// completes, fluently, on the previous request's state.
+pub(super) fn recurrent_span_limit(ops: impl IntoIterator<Item = u16>) -> Result<u32, String> {
+    let mut limit = u32::MAX;
+    for raw in ops {
+        let Some(op) = DevOp::from_u16(raw) else {
+            continue;
+        };
+        match op {
+            // Per-span arms exist in runtime/amd/op_kda.h; the dispatch in interp.hip selects
+            // them under PLOW_PACKED_PREFILL_KDA_CONSUMERS.
+            DevOp::KdaChunkPrepare
+            | DevOp::KdaChunkIntra
+            | DevOp::KdaChunkWu
+            | DevOp::KdaChunkCarry
+            | DevOp::KdaConv3
+            | DevOp::KdaStateStep
+            | DevOp::KdaStateStepG => {}
+            // Stateless over the packed row axis.
+            DevOp::KdaGate | DevOp::KdaGatedNorm => {}
+            // Single-sequence with no per-span arm: one request per launch.
+            DevOp::KdaDecodeFused => limit = limit.min(1),
+            // Single-sequence prefill state with no per-span arm. `KdaConv`/`KdaConvStateStepG`
+            // are additionally rejected by `packed_kda_compatible`; naming them here too keeps
+            // the refusal legible when a program carries one and no other KDA operator.
+            DevOp::KdaConv
+            | DevOp::KdaConvStateStepG
+            | DevOp::Mamba2Scan
+            | DevOp::QwenGdnConvPrefill
+            | DevOp::QwenGdnQkvPrep
+            | DevOp::QwenGdnGatePrep
+            | DevOp::QwenGdnPrefill => {
+                return Err(format!(
+                    "packed prefill has no per-span arm for {op:?} (op {raw}): its carried state \
+                     is an operand with no request axis and no AMD arm reads the span table for \
+                     it, so a packed launch would run every span against one request's state. \
+                     Serve this program on the isolated prefill route, or land the per-span arm \
+                     and its oracle first (plans/unified-token-batch.md §5.4)."
+                ));
+            }
+            // Decode-shaped recurrent ops: their row axis is the SLOT (`active[B]`), not the
+            // token. A packed-prefill launch's rows are tokens of a span, so binding one of
+            // these to a span table is a category error, not a missing arm.
+            DevOp::QwenGdnConv
+            | DevOp::QwenGdnStep
+            | DevOp::QwenGatedNorm
+            | DevOp::QwenQGateSplit
+            | DevOp::QwenSigmoidGate
+            | DevOp::QwenRmsNorm
+            | DevOp::QwenHeadNormRope => {
+                return Err(format!(
+                    "packed prefill cannot carry {op:?} (op {raw}): it is indexed by decode SLOT \
+                     through the ISA's `active[B]` mask, and a packed-prefill row is a token of a \
+                     span. This program belongs on the decode path (plans/unified-token-batch.md \
+                     §5.4)."
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(limit)
 }
 
 /// Validate the row layout shared by AMD packed prefill and a future mixed-step adapter.
@@ -108,6 +194,92 @@ pub(super) fn validate_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_packed_kda_operator_group_carries_as_many_spans_as_fit() {
+        // Every one of these has a `d_kda_*_packed_bt64` arm that walks `prog->prefill_spans`
+        // itself, so the span table is the only thing bounding the launch.
+        let ops = [
+            DevOp::KdaChunkPrepare,
+            DevOp::KdaChunkIntra,
+            DevOp::KdaChunkWu,
+            DevOp::KdaChunkCarry,
+            DevOp::KdaConv3,
+            DevOp::KdaStateStepG,
+            DevOp::KdaGate,
+            DevOp::KdaGatedNorm,
+            DevOp::Gemm,
+            DevOp::FlashPrefill,
+        ];
+        assert_eq!(
+            recurrent_span_limit(ops.iter().map(|&op| op as u16)),
+            Ok(u32::MAX)
+        );
+    }
+
+    #[test]
+    fn a_single_sequence_recurrent_arm_is_capped_at_one_span() {
+        assert_eq!(
+            recurrent_span_limit([DevOp::KdaDecodeFused as u16, DevOp::Gemm as u16]),
+            Ok(1)
+        );
+    }
+
+    #[test]
+    fn recurrent_operators_with_no_per_span_arm_are_refused_by_name() {
+        // The four that would otherwise fall through `check_packed_prefill_program` to `Ok`:
+        // none of them belongs to a family that function recognises, and AMD's dispatch
+        // `default:` writes nothing rather than trapping.
+        for op in [
+            DevOp::QwenGdnPrefill,
+            DevOp::QwenGdnConvPrefill,
+            DevOp::QwenGdnQkvPrep,
+            DevOp::QwenGdnGatePrep,
+            DevOp::Mamba2Scan,
+            DevOp::KdaConv,
+            DevOp::KdaConvStateStepG,
+        ] {
+            let error = recurrent_span_limit([DevOp::Gemm as u16, op as u16])
+                .expect_err("must refuse, not cap");
+            assert!(
+                error.contains(&format!("{op:?}")) && error.contains("per-span"),
+                "refusal must name the operator and the missing capability: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_shaped_recurrent_operators_are_refused_as_a_category_error() {
+        for op in [
+            DevOp::QwenGdnConv,
+            DevOp::QwenGdnStep,
+            DevOp::QwenGatedNorm,
+            DevOp::QwenQGateSplit,
+            DevOp::QwenSigmoidGate,
+            DevOp::QwenRmsNorm,
+            DevOp::QwenHeadNormRope,
+        ] {
+            let error = recurrent_span_limit([op as u16]).expect_err("must refuse");
+            assert!(
+                error.contains(&format!("{op:?}")) && error.contains("active[B]"),
+                "refusal must name the operator and the mask it is indexed by: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_program_with_no_recurrent_operator_is_unbounded() {
+        assert_eq!(
+            recurrent_span_limit([
+                DevOp::Gemm as u16,
+                DevOp::FlashPrefill as u16,
+                DevOp::RmsNorm as u16,
+                DevOp::SoftCap as u16,
+            ]),
+            Ok(u32::MAX)
+        );
+    }
+
     use plow_asset::mixed_step::{self, DecodeRequest, PrefillRequest};
 
     fn span(row0: u32, slot: u32, program: u32) -> PrefillSpan {

@@ -7551,6 +7551,11 @@ struct AmdProg {
     packed_needs_kda: bool,
     packed_kda_compatible: bool,
     packed_kda_segmented: bool,
+    /// §3/§5.4 of `plans/unified-token-batch.md`, from
+    /// [`crate::exec::amd_packed::recurrent_span_limit`]: `Ok(n)` = at most `n` request spans in
+    /// one packed launch, `Err(msg)` = this program's recurrent operators have no packed form at
+    /// all and `msg` names which one. Computed once at load, not per tick.
+    packed_recurrent_spans: std::result::Result<u32, String>,
     n_inst: u32,
     trace_records: usize,
     n_counter: u32,
@@ -10933,6 +10938,9 @@ impl AmdEngine {
                 }),
                 packed_kda_compatible: packed_kda_compatible(p),
                 packed_kda_segmented,
+                packed_recurrent_spans: crate::exec::amd_packed::recurrent_span_limit(
+                    p.insts.iter().map(|d| d.op),
+                ),
                 decode_routes,
                 prefill_routes,
                 _xreduce_attnres_args: xreduce_attnres_args,
@@ -11696,7 +11704,28 @@ impl AmdEngine {
                 ));
             }
         }
+        // The recurrent (D-class) audit. It is LAST because the family-specific refusals above
+        // give a more useful message when they apply; it is a DEFAULT-DENY because everything
+        // above is a series of "if this family, check that", and an operator family none of them
+        // recognises used to fall straight through to `Ok`. On AMD that is not a slow path:
+        // the interpreter's dispatch `default:` writes nothing and does not trap.
+        program
+            .packed_recurrent_spans
+            .as_ref()
+            .map_err(|error| RuntimeError::Device(error.clone()))?;
         Ok(program.t)
+    }
+
+    /// The most request spans one packed launch of this program may carry (§5.4's D-class limit),
+    /// or `None` when the program cannot take the packed route at all. The scheduler asks BEFORE
+    /// it touches cursors, so a legal plan is chosen rather than an illegal one refused.
+    pub fn packed_prefill_span_limit(&self, prog: usize) -> Option<u32> {
+        self.progs
+            .get(prog)?
+            .packed_recurrent_spans
+            .as_ref()
+            .ok()
+            .copied()
     }
 
     /// Resolve an ordinary prefill rung to its packed-only sibling. Legacy
@@ -11734,6 +11763,21 @@ impl AmdEngine {
     ) -> Result<()> {
         self.packed_prefill = None;
         let rung = self.check_packed_prefill_program(prog)?;
+        // REFUSED, NOT TRUNCATED (plans/unified-token-batch.md §9, "Recurrent"). Executing the
+        // first `limit` spans of a plan that asked for more is a silently short answer: the
+        // requests whose spans were dropped keep their cursors and their KV frontiers are
+        // committed by the caller on the strength of a launch that never covered them.
+        let limit = self
+            .progs
+            .get(prog)
+            .and_then(|p| p.packed_recurrent_spans.as_ref().ok().copied())
+            .unwrap_or(u32::MAX);
+        if spans.len() as u64 > u64::from(limit) {
+            return Err(RuntimeError::Device(format!(
+                "packed prefill plan has {} spans but program {prog} carries a recurrent operator                  limited to {limit} span(s) per launch (plans/unified-token-batch.md §5.4). The                  plan is refused, not truncated.",
+                spans.len()
+            )));
+        }
         let binding = validate_packed_prefill(prog, rung, self.batch, spans, parked)?;
         if spans.len() > self.prefill_span_capacity || parked.len() > self.prefill_row_capacity {
             return Err(RuntimeError::Device(format!(
