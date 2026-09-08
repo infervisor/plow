@@ -3332,3 +3332,220 @@ FP8 and kernel agents report no owned GPU processes or leases. Unrelated machine
 workloads were left untouched.
 
 The GFUSE stop record (raw artefact removed; see the tables above) preserves44/72 completed runs,176 requests and22,528 output tokens, plus two interrupted run directories without completed accounting. No complete-crossover performance conclusion is drawn. GitHub branch checks are separate from stopped GPU experiments.
+
+---
+
+## L2 placement and the per-XCD gate, made default and made visible (2026-09-08)
+
+The section above established that the feature existed and was inert. This one re-measures it
+against a control emitted from the same tree, states what was made default and what deliberately
+was not, and adds the two things that were missing from a feature nobody could tell was running:
+a load-time claim that separates ARMED from FIRING, and a `build.json` field that moves when
+placement does.
+
+Everything below is BF16, TP1, one leased MI300X, 131072-context blobs at `PLOW_MAX_CHUNK=8192`,
+decode ladder 1/2/4, 64 output tokens, `scripts/bench_packed_serve.py` with 1 warmup and 3 repeats
+per cell, palindromic two-round A/B (medians of six per cell). Control and candidate blobs are
+emitted by the same `plowc` from the same tree and differ ONLY in `PLOW_L2_PLACE`; `build.json` is
+byte-identical between them apart from the new `l2_placement` key. The control reproduces the
+shipped numbers at every cell it shares with them (128/1 41.80 vs 41.86 tok/s, 8192/4 22.90 vs
+22.92, 32768/1 5.45 / 10115 ms / 25.72 ms vs 5.45 / 10122 / 25.74), which is what makes it a valid
+A/B partner.
+
+### Is the feature active in the shipping configuration?
+
+**Not in anything published before 2026-09-08, and yes in what the tree emits today.** The four
+switches and where each stands:
+
+| half | where | state |
+|---|---|---|
+| decode object carries `-DPLOW_GATE_HIER` + `-DPLOW_L2_PLACE_DISPATCH` | `scripts/build_gfx942.sh` `PLOW_L2HIER` | default ON, and `build-gemma31/hsaco-tiered` carries both markers |
+| blob's decode programs L2-placed | `plowc` `PLOW_L2_PLACE` | default ON for gfx942/gfx950 |
+| blob's PREFILL programs L2-placed | `plowc` `PLOW_L2_PLACE_PREFILL` | default OFF on AMD, matching the objects the build script produces |
+| runtime accepts a placed blob | `PLOW_L2_PLACE_DISPATCH` | **not consulted on AMD** — see below |
+
+`build-gemma31/assets-final-plain`, the blob under every number in this document before that
+date, starts `PLOWDEV\x09`. A default emit from this tree starts `PLOWDEV\x0b`.
+
+### What it buys
+
+Unplaced control vs decode-placed candidate, objects `build-gemma31/hsaco-tiered` unchanged
+across both arms:
+
+| input / conc | ctl tok/s | placed tok/s | tok/s | ctl TTFT | placed TTFT | ctl TPOT | placed TPOT | TPOT |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 128 / 1 | 41.80 | 44.92 | **+7.5%** | 73.4 | 74.8 | 23.14 | 21.43 | **-7.4%** |
+| 128 / 4 | 90.57 | 97.57 | **+7.7%** | 268.3 | 263.2 | 38.76 | 35.85 | **-7.5%** |
+| 512 / 1 | 38.92 | 41.92 | **+7.7%** | 149.7 | 150.1 | 23.72 | 21.84 | **-7.9%** |
+| 512 / 4 | 81.15 | 86.93 | **+7.1%** | 480.5 | 469.2 | 40.98 | 38.05 | **-7.2%** |
+| 2048 / 1 | 32.81 | 34.83 | **+6.2%** | 442.2 | 443.3 | 23.94 | 22.12 | **-7.6%** |
+| 2048 / 4 | 57.98 | 61.35 | **+5.8%** | 1255.4 | 1201.5 | 48.58 | 45.81 | **-5.7%** |
+| 8192 / 1 | 19.80 | 20.50 | **+3.5%** | 1689.1 | 1692.7 | 24.48 | 22.68 | **-7.3%** |
+| 8192 / 4 | 22.90 | 23.47 | **+2.5%** | 7749.6 | 7628.0 | 52.97 | 50.47 | **-4.7%** |
+| 32768 / 1 | 5.45 | 5.49 | +0.7% | 10115.2 | 10130.1 | 25.72 | 24.10 | **-6.3%** |
+
+TPOT is down 4.7-7.9% at every one of the ten cells; TTFT is flat, which is the correct negative
+control — only the decode programs are placed. Throughput follows TPOT and decays with prompt
+length exactly as the decode share of the wall clock does. This reproduces the twelve-cell result
+in the section above on independently emitted blobs.
+
+### Does the output hold?
+
+**Yes, on both corpora, at every cell, with no within-arm instability.**
+
+* `bench_packed_serve.py` corpus, 128/512/2048/8192 x concurrency 1 and 4 x two rounds x three
+  repeats: **20 completion keys, all character-identical between arms, 0 unstable within an arm.**
+* `scripts/gemma31_prompt_identity.py` — new, because the bench derives its prompt from the
+  request index and therefore carries exactly ONE prompt per length at concurrency 1, which
+  cannot satisfy a ">= 3 prompts" gate. Four distinct prompts per length at 128 / 2048 / 8192,
+  concurrency 1 AND 4, 64 greedy tokens, two repeats: **24 completion keys, all
+  character-identical between arms, 0 unstable.**
+
+### What was made default, and what was not
+
+**Decode placement and the two-level gate: default, and already were.** `PLOW_L2HIER=1` in the
+build script and `PLOW_L2_PLACE` in `plowc` both default on; the missing piece was prefill
+placement's default, fixed in the section above. Nothing further needed flipping. This work
+verified the pairing end to end rather than inheriting it.
+
+**`PLOW_L2_PLACE_DISPATCH` stays `false`, deliberately.** It looks like the flag standing between
+the shipping configuration and the win, and it is not: `AmdEngine::load` parses with
+`l2_dispatch_ok = true` and then checks every code object for `plow_l2_place_dispatch_1`.
+Inspecting the object is strictly stronger than an operator asserting it, and the assertion is
+the ONLY guard on the CUDA path, where nothing reads the cubin. Flipping it would buy AMD nothing
+and would remove a real check elsewhere. Verified rather than reasoned: serving
+`assets-placed` with the variable UNSET logs
+
+```
+L2 hierarchical gate: FIRING — one L2 writeback+invalidate per XCD per packet
+  armed=true firing=true l2_domains=8 rendezvous_entries=292732 decode_queue_entries=295749
+```
+
+`scripts/glm53_serve_inner.sh` still exports it, now with a comment saying it is not required on
+AMD.
+
+**Prefill placement stays opt-in.** Measured below; the win is real but confined to TTFT at long
+prompts, it costs a rebuild of every prefill object, and one cell regresses reproducibly.
+
+### ARMED is not FIRING, and the load path now says which
+
+Three preconditions have to line up before a single `buffer_wbl2` is saved, and until now nothing
+printed any of them. `interp.hip` takes the hierarchy only when `prog.hier_base != 0` (i.e. the
+program is L2-placed), the stream entry's per-domain slice count `PLOW_SE_NPER` is above 1, and
+the object was built with `PLOW_GATE_HIER`. The engine now evaluates that same predicate on the
+host and says so once per rank. The three states, all captured from real serves:
+
+| pairing | line |
+|---|---|
+| placed blob, `hsaco-tiered` | `FIRING — one L2 writeback+invalidate per XCD per packet` (`l2_domains=8`, 292732 of 295749 decode queue entries rendezvous) |
+| unplaced blob, same objects | `ARMED BUT INERT — the decode object carries PLOW_GATE_HIER and this blob is NOT L2-placed, which is its runtime precondition. Re-emit with PLOW_L2_PLACE=1` |
+| placed blob, objects without `-DPLOW_GATE_HIER` | `off: the blob is L2-placed but the decode object was built without -DPLOW_GATE_HIER` |
+
+The second line is what every number in this document before today would have printed.
+
+### The mismatch is refused by name, in both directions
+
+A placed blob against an object without the dispatch axis was already a hard stop. It now names
+BOTH halves and BOTH fixes, because the emit-side flag and the object-side flag are different
+names living in different files and a reader who knows one cannot act on
+"lacks `plow_l2_place_dispatch_1`". Serving the prefill-placed blob against `hsaco-tiered`:
+
+```
+L2 PLACEMENT PAIRING: this blob's prefill programs are L2-placed (PLOW_L2_PLACE; `build.json`
+records it under `l2_placement`), but .../interp_prefill_gq.elf was built WITHOUT
+-DPLOW_L2_PLACE_DISPATCH. A placed program's `seg` is an L2 domain, not a wave class, so this
+object would run every packet on the wrong domain — plausible output, inverted locality, no
+error. Fix EITHER half: rebuild the objects with scripts/build_gfx942.sh PLOW_L2HIER_PF=1, which
+puts -DPLOW_L2_PLACE_DISPATCH on the prefill AND flash rows; build_gfx950.sh already passes it
+under PLOW_L2_PLACE=1, or re-emit the blob with no PLOW_L2_PLACE_PREFILL=1, which is the AMD
+default and leaves decode placement on.
+```
+
+The reverse direction — an unplaced blob against objects that DO carry the axis — is legal and
+byte-identical, which is why it logs rather than refuses.
+
+### `build.json` now records placement
+
+A placed and an unplaced emit of the same model produced **byte-identical `build.json`**. That is
+how a whole document's worth of numbers came to be taken with the feature off and nothing in the
+artifact disagreeing. `crates/devgen/src/manifest.rs` now writes a top-level `l2_placement`:
+
+```json
+{"domains": 8, "decode": true, "prefill": false,
+ "requires_object_define": "PLOW_L2_PLACE_DISPATCH"}
+```
+
+Outside `pairing_hash` on purpose, like `dispatch_audit`: placement does not change what
+`plow_config.h` compiles, and stamping it would invalidate every existing packet/object pair.
+The object side already had its half — `scripts/obj_baseline_gfx942.json` records
+`PLOW_L2_PLACE_DISPATCH` and `PLOW_GATE_HIER` per row, and `check_build_matrix.py` already
+refuses a `plow_gate_hier_1` object that lacks `plow_l2_place_dispatch_1`.
+
+### `PLOW_L2HIER_PF=1` never compiled
+
+The build script's prefill opt-in added `-DPLOW_L2_PLACE_DISPATCH=1 -DPLOW_GATE_HIER=1` to
+`AX_PREFILL`, and `AX_PREFILL` carries `-DPLOW_BUCKET_DECODE=0`. The guard at the top of
+`interp.hip` is
+
+```c
+#if PLOW_GATE_HIER && (!PLOW_BUCKET_DECODE || !PLOW_GLOBAL_QUEUE || !PLOW_L2_PLACE_DISPATCH)
+#error "PLOW_GATE_HIER requires a decode global-queue object with L2-domain dispatch"
+#endif
+```
+
+so the row does not build. Compiled by hand with exactly those axes: one error, no object. Had it
+built, `plowrt`'s `check_gate_hier_object` would have refused it a second time at load. **The
+two-level gate is decode-only by construction**, and the hierarchy half of `PLOW_L2HIER_PF` was
+never a thing that could be measured. The flag now adds `-DPLOW_L2_PLACE_DISPATCH=1` alone, which
+is the half a prefill-placed blob actually needs.
+
+That also disposes of the 680-second `amd-bench` hang this file records as the reason not to widen
+the define: that hang needed one placed program's segments split across objects with and without
+`PLOW_GATE_HIER`, and no prefill or flash object can carry `PLOW_GATE_HIER` at all. With
+placement alone on the prefill AND flash rows, Gemma's split-object prefill program ran to
+completion at every prompt length, in normal wall time, on the first attempt.
+
+### Prefill placement: measured, and left opt-in
+
+`hsaco-pfplace` = `PLOW_DECODE_BATCH=4 PLOW_DECODE_TIERS=1,2 PLOW_L2HIER_PF=1`. One object set
+serves BOTH arms (the axis is inert when `l2_domains == 0`), so this is a blob-only A/B:
+decode-placed vs decode+prefill-placed.
+
+| input / conc | TTFT dec | TTFT +pf | TTFT | tok/s dec | tok/s +pf | TPOT dec | TPOT +pf |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 128 / 1 | 74.1 | 73.1 | **-1.4%** | 45.24 | 45.05 | 21.28 | 21.38 |
+| 128 / 4 | 272.9 | 259.2 | **-5.0%** | 97.74 | 97.58 | 35.82 | 35.91 |
+| 512 / 1 | 149.8 | 148.8 | -0.7% | 42.10 | 42.02 | 21.74 | 21.81 |
+| 512 / 4 | 467.9 | 497.1 | +6.2% | 86.82 | 86.09 | 38.00 | 38.07 |
+| 2048 / 1 | 442.0 | 432.6 | **-2.1%** | 34.97 | 35.08 | 22.03 | 22.09 |
+| 2048 / 4 | 1200.2 | 1238.2 | **+3.2%** | 61.40 | 61.10 | 45.80 | 45.63 |
+| 8192 / 1 | 1691.2 | 1586.1 | **-6.2%** | 20.54 | 21.25 | 22.60 | 22.61 |
+| 8192 / 4 | 7686.4 | 7467.9 | **-2.8%** | 23.41 | 23.83 | 50.34 | 50.26 |
+| 32768 / 1 | 10162.7 | 9749.6 | **-4.1%** | 5.47 | 5.65 | 24.53 | 24.90 |
+
+TPOT moves by at most 0.5% in either direction, which is the negative control this arm should
+produce: the decode programs are identical in both blobs. **The 512/4 cell is not a result** — it
+is bimodal in BOTH arms across rounds (527.7 / 467.6 control, 527.9 / 466.2 candidate), so the
+paired medians land on different modes; it is a concurrency-4 scheduling bistability that predates
+this change. The 2048/4 loss IS reproducible (1196/1201 vs 1237/1239).
+
+The prefill-placed arm is **character-identical** to the decode-placed one on the same
+multi-prompt corpus: 24 completion keys over 128 / 2048 / 8192 tokens x concurrency 1 and 4 x
+four prompts x two repeats, no key differing, none unstable within an arm.
+
+So prefill placement is a TTFT win that grows with prompt length, worth -6.2% at 8192 tokens
+solo, against one reproducible +3.2% regression and no effect on decode. **Left opt-in**, for
+reasons that are about blast radius rather than about the number: it changes every prefill object
+in the tree, so every existing object directory becomes unusable with a default emit the moment
+it lands, and the payoff is confined to one metric at long prompts. `PLOW_L2HIER_PF=1` plus
+`PLOW_L2_PLACE_PREFILL=1` now works end to end and is the arm that prices it.
+
+### gfx950
+
+Nothing here is arch-specific and nothing here was run on gfx950. The load-time claim and the
+pairing refusal read the blob and the object symbols, which are the same on both targets, and
+`scripts/build_gfx950.sh` already gates the same two defines behind `PLOW_L2_PLACE` /
+`PLOW_GATE_HIER`, both default on. One asymmetry worth knowing before anyone tries this there:
+gfx950 puts `-DPLOW_L2_PLACE_DISPATCH` on its PREFILL and FLASH objects by default, so on that
+target `PLOW_L2_PLACE_PREFILL=1` at emit needs no object rebuild at all — the gfx942 measurement
+above is a caution to re-take, not a number to carry across.
