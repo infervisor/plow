@@ -522,7 +522,7 @@ pub fn spawn(
             // reaches the message channel between ticks — this flag is the
             // one bounded-latency path in.
             if preempt_seen.swap(false, Ordering::AcqRel) {
-                preempt_slots(&mut slots, &arena);
+                preempt_slots(&mut slots, &arena).await;
                 draining = true;
             }
             let live = slots.iter().filter(|s| s.is_some()).count();
@@ -1137,12 +1137,12 @@ fn release_kv(arena: &Option<SharedKvState>, handle: Option<SlotHandle>) {
 /// as it does when a client disconnects mid-generation (the sanctioned
 /// teardown path: take the slot, release its KV; the engine's sequence slot
 /// is reclaimed on the next admit).
-fn preempt_slots(slots: &mut [Option<Slot>], arena: &Option<SharedKvState>) {
+async fn preempt_slots(slots: &mut [Option<Slot>], arena: &Option<SharedKvState>) {
     for slot_opt in slots.iter_mut() {
         let Some(slot) = slot_opt.take() else {
             continue;
         };
-        let _ = slot.respond.try_send(StreamChunk::Done {
+        let done = StreamChunk::Done {
             executed: slot.executed,
             reason: FinishReason::Preempted,
             usage: crate::serve::stream::TokenUsage {
@@ -1150,10 +1150,38 @@ fn preempt_slots(slots: &mut [Option<Slot>], arena: &Option<SharedKvState>) {
                 cached_tokens: slot.cached_tokens,
                 completion_tokens: slot.out_ids.len(),
             },
-        });
+        };
+        // A dropped terminal is not a lost token — it is a 500 ("stream ended
+        // without a finish reason") on the buffered path and a stream that
+        // just stops on SSE. `try_send` alone lost it whenever the client's
+        // 32-slot channel happened to be full, which is precisely the client
+        // that is behind and most needs telling why its answer stopped.
+        //
+        // `Closed` needs no delivery (the handler is gone). `Full` waits, but
+        // bounded: the dispatcher is on its way out and must not be pinned by
+        // a client that has stopped reading without disconnecting.
+        match slot.respond.try_send(done) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Closed(_)) => {}
+            Err(mpsc::error::TrySendError::Full(done)) => {
+                if tokio::time::timeout(TERMINAL_DELIVERY, slot.respond.send(done))
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(
+                        "preempt: client did not drain in {}ms — terminal chunk dropped",
+                        TERMINAL_DELIVERY.as_millis()
+                    );
+                }
+            }
+        }
         release_kv(arena, slot.kv);
     }
 }
+
+/// How long a preempt waits for a backpressured client to make room for its
+/// terminal chunk before giving up on it.
+const TERMINAL_DELIVERY: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Refresh `obs.indirection[KV_PAGES]` from the arena: for each live row (in
 /// compact order — idle slots and slots without a KV handle are skipped) write

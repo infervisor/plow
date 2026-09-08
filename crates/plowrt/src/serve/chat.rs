@@ -776,6 +776,7 @@ fn sse_response(
                                     reasoning_content: reasoning,
                                 },
                                 finish_reason: None,
+                                x_plow_finish_reason: None,
                             }],
                             usage: None,
                         };
@@ -797,6 +798,11 @@ fn sse_response(
                                 // The wire value: "preempted" is not an OpenAI
                                 // finish_reason and a typed client rejects it.
                                 finish_reason: Some(reason.as_openai()),
+                                // ...so the true cause rides alongside it, as
+                                // it already does on the buffered path.
+                                x_plow_finish_reason: reason
+                                    .is_vendor_specific()
+                                    .then(|| reason.as_str()),
                             }],
                             usage: None,
                         };

@@ -313,6 +313,9 @@ async fn buffer_and_reply(
             text,
             logprobs: None,
             finish_reason: Some(finish.as_openai()),
+            // `Preempted` widens to "length" on the wire; without this the
+            // caller cannot tell an operator-forced stop from max_tokens.
+            x_plow_finish_reason: finish.is_vendor_specific().then(|| finish.as_str()),
         }],
         usage,
         token_ids: prompt_token_ids.map(|prompt| CompletionTokenIds {
@@ -376,6 +379,7 @@ fn sse_response(
                                 text,
                                 logprobs: None,
                                 finish_reason: None,
+                                x_plow_finish_reason: None,
                             }],
                             None,
                             false,
@@ -387,6 +391,9 @@ fn sse_response(
                             text: String::new(),
                             logprobs: None,
                             finish_reason: Some(reason.as_openai()),
+                            x_plow_finish_reason: reason
+                                .is_vendor_specific()
+                                .then(|| reason.as_str()),
                         }],
                         include_usage.then(|| usage.into()),
                         true,
@@ -493,6 +500,7 @@ mod tests {
                 text: "x".into(),
                 logprobs: None,
                 finish_reason: Some("length"),
+                x_plow_finish_reason: None,
             }],
             usage: None,
             token_ids: Some(CompletionTokenIds {
