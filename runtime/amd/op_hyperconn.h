@@ -42,6 +42,53 @@
  * before ever selecting this kernel — see the opcode's doc comment. */
 #define PLOW_HC_POST_MULT 2.0f
 
+/* PLOW_HC_SINKHORN_RCP — the Sinkhorn normalize's divisor is loop-invariant across the row
+ * (or column) it normalizes, but an IEEE `f32` divide is NOT strength-reducible to a
+ * reciprocal-and-multiply by the compiler, so the shipped body issues one full `v_div_*`
+ * expansion per matrix element: at n=4 and sinkhorn_repeat=20 that is 640 of them per token,
+ * on lane 0, serially.
+ *
+ *   0  SHIPPED. One IEEE divide per element. This is the arm the gfx950 oracle run signed off.
+ *   1  One IEEE divide for the row/column reciprocal, then multiplies: 640 divides -> 160.
+ *   2  As 1, but the reciprocal is `v_rcp_f32` (~1 ULP): 0 divides.
+ *
+ * 1 and 2 CHANGE ROUNDING and are default-off — the standing policy on this branch for any
+ * arm that moves a bit (`PLOW_GEMV_MFMA4` is the precedent). See the measured instruction
+ * counts, the oracle error and the null result in `docs/amd/instruction-cost-arms-20260908.md`. */
+#ifndef PLOW_HC_SINKHORN_RCP
+#define PLOW_HC_SINKHORN_RCP 0
+#endif
+#if PLOW_HC_SINKHORN_RCP < 0 || PLOW_HC_SINKHORN_RCP > 2
+#error "PLOW_HC_SINKHORN_RCP must be 0, 1 or 2"
+#endif
+
+/* The reciprocal arms' normalize step. Arm 0 does NOT go through here — its four call sites keep
+ * the shipped expression character for character below, so that the default build's codegen is
+ * not merely equivalent but IDENTICAL. That is not pedantry: an earlier version of this file
+ * routed arm 0 through a `__forceinline__` helper, which produced the same opcode histogram and
+ * the same VGPR count and STILL moved 7 register assignments inside the outlined
+ * `d_hyperconn_pre` of all 14 K3 objects. Equivalent-but-different codegen is exactly what a
+ * default is not allowed to be here.
+ *
+ * `eps` is added AFTER the multiply for the initial softmax (`x/s + eps`) and folded into the
+ * divisor by the caller for every Sinkhorn pass (`x/(s + eps)`), which is why ADD_EPS is a
+ * template parameter and not a `0.0f` addend — `x + 0.0f` is not removable under IEEE. */
+#if PLOW_HC_SINKHORN_RCP
+template <bool ADD_EPS>
+__device__ __forceinline__ void hc_normalize(float* v, unsigned base, unsigned stride,
+                                             unsigned cnt, float den, float eps) {
+#if PLOW_HC_SINKHORN_RCP == 2
+    const float r = __builtin_amdgcn_rcpf(den);
+#else
+    const float r = 1.0f / den;
+#endif
+    for (unsigned k = 0; k < cnt; k++) {
+        const float q = v[base + k * stride] * r;
+        v[base + k * stride] = ADD_EPS ? q + eps : q;
+    }
+}
+#endif
+
 /* op 121 — hyper-connections pre-block. See the file header for the shape of the whole
  * thing; this computes `(post_mix, comb_mix, layer_input)` from `mixes` (an ordinary
  * Gemv/Gemm's output — the projection itself is NOT this op's job) and `residual`.
@@ -123,25 +170,41 @@ __device__ void d_hyperconn_pre(float* __restrict__ post_mix, float* __restrict_
                     comb_lds[i * n + j] = e;
                     s += e;
                 }
+#if PLOW_HC_SINKHORN_RCP
+                hc_normalize<true>(comb_lds, i * n, 1, n, s, hc_eps);
+#else
                 for (unsigned j = 0; j < n; j++) comb_lds[i * n + j] = comb_lds[i * n + j] / s + hc_eps;
+#endif
             }
             for (unsigned j = 0; j < n; j++) {
                 float s = 0.0f;
                 for (unsigned i = 0; i < n; i++) s += comb_lds[i * n + j];
+#if PLOW_HC_SINKHORN_RCP
+                hc_normalize<false>(comb_lds, j, n, n, s + hc_eps, hc_eps);
+#else
                 for (unsigned i = 0; i < n; i++) comb_lds[i * n + j] = comb_lds[i * n + j] / (s + hc_eps);
+#endif
             }
             for (unsigned r = 1; r < sinkhorn_repeat; r++) {
                 for (unsigned i = 0; i < n; i++) {
                     float s = 0.0f;
                     for (unsigned j = 0; j < n; j++) s += comb_lds[i * n + j];
+#if PLOW_HC_SINKHORN_RCP
+                    hc_normalize<false>(comb_lds, i * n, 1, n, s + hc_eps, hc_eps);
+#else
                     for (unsigned j = 0; j < n; j++)
                         comb_lds[i * n + j] = comb_lds[i * n + j] / (s + hc_eps);
+#endif
                 }
                 for (unsigned j = 0; j < n; j++) {
                     float s = 0.0f;
                     for (unsigned i = 0; i < n; i++) s += comb_lds[i * n + j];
+#if PLOW_HC_SINKHORN_RCP
+                    hc_normalize<false>(comb_lds, j, n, n, s + hc_eps, hc_eps);
+#else
                     for (unsigned i = 0; i < n; i++)
                         comb_lds[i * n + j] = comb_lds[i * n + j] / (s + hc_eps);
+#endif
                 }
             }
             for (unsigned k = 0; k < n * n; k++) comb_mix[(size_t)t * n * n + k] = comb_lds[k];
