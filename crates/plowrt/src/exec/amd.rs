@@ -11824,14 +11824,16 @@ impl AmdEngine {
         self.h_prefill_meta.as_mut_slice()[..span_bytes].copy_from_slice(as_bytes(spans));
         self.h_prefill_meta.as_mut_slice()[parked_off..parked_off + parked_bytes]
             .copy_from_slice(as_bytes(parked));
-        self.be.memcpy_htod_pinned(
-            self.d_prefill_spans.base,
-            &self.h_prefill_meta.as_slice()[..span_bytes],
-        )?;
-        self.be.memcpy_htod_pinned(
-            self.d_prefill_parked.base,
-            &self.h_prefill_meta.as_slice()[parked_off..parked_off + parked_bytes],
-        )?;
+        self.be.memcpy_htod_pinned_batch(&[
+            (
+                self.d_prefill_spans.base,
+                &self.h_prefill_meta.as_slice()[..span_bytes],
+            ),
+            (
+                self.d_prefill_parked.base,
+                &self.h_prefill_meta.as_slice()[parked_off..parked_off + parked_bytes],
+            ),
+        ])?;
         self.packed_prefill = Some(binding);
         Ok(())
     }
@@ -11976,19 +11978,21 @@ impl AmdEngine {
     fn rearm_bank(&self, p: usize, bank: u32) -> Result<()> {
         let g = &self.progs[p];
         let n = g.n_counter as usize * CTR_STRIDE_U32 * 4;
+        let mut zeroing: Vec<(u64, &[u8])> = Vec::with_capacity(2);
         if n > 0 {
-            self.be.memcpy_htod_pinned(
+            zeroing.push((
                 g.d_ctr.base + bank as u64 * g.ctr_span,
                 &self.h_zero.as_slice()[..n],
-            )?;
+            ));
         }
         if let Some(q) = &g.gq {
             let n = q.n_seg.max(1) as usize * CTR_STRIDE_U32 * 4;
-            self.be.memcpy_htod_pinned(
+            zeroing.push((
                 q.d_cursor.base + bank as u64 * q.cur_span,
                 &self.h_zero.as_slice()[..n],
-            )?;
+            ));
         }
+        self.be.memcpy_htod_pinned_batch(&zeroing)?;
         Ok(())
     }
 
@@ -13280,10 +13284,10 @@ impl AmdEngine {
         }
         let ptr_pos = self.devp[self.need(self.t_pos, "in.pos")?].base;
         let ptr_kvlen = self.devp[self.need(self.t_kvlen, "in.kvlen")?].base;
-        self.be
-            .memcpy_htod_pinned(ptr_pos, &self.h_scalar.as_slice()[..4])?;
-        self.be
-            .memcpy_htod_pinned(ptr_kvlen, &self.h_scalar.as_slice()[4..8])?;
+        self.be.memcpy_htod_pinned_batch(&[
+            (ptr_pos, &self.h_scalar.as_slice()[..4]),
+            (ptr_kvlen, &self.h_scalar.as_slice()[4..8]),
+        ])?;
         Ok(())
     }
 
@@ -13563,10 +13567,10 @@ impl AmdEngine {
             self.devp[self.need(self.t_pos, "in.pos")?].base,
         );
         let nb = ch as usize * 4;
-        self.be
-            .memcpy_htod_pinned(d_ids, &self.h_scalar.as_slice()[..nb])?;
-        self.be
-            .memcpy_htod_pinned(d_pos, &self.h_scalar.as_slice()[nb..nb * 2])?;
+        self.be.memcpy_htod_pinned_batch(&[
+            (d_ids, &self.h_scalar.as_slice()[..nb]),
+            (d_pos, &self.h_scalar.as_slice()[nb..nb * 2]),
+        ])?;
         self.patch_prefill(step.prog, step.c0, step.clen)
     }
 
@@ -13615,10 +13619,10 @@ impl AmdEngine {
         let bytes = rung as usize * 4;
         let d_ids = self.devp[self.need(self.t_ids, "in.ids")?].base;
         let d_pos = self.devp[self.need(self.t_pos, "in.pos")?].base;
-        self.be
-            .memcpy_htod_pinned(d_ids, &self.h_scalar.as_slice()[..bytes])?;
-        self.be
-            .memcpy_htod_pinned(d_pos, &self.h_scalar.as_slice()[bytes..bytes * 2])?;
+        self.be.memcpy_htod_pinned_batch(&[
+            (d_ids, &self.h_scalar.as_slice()[..bytes]),
+            (d_pos, &self.h_scalar.as_slice()[bytes..bytes * 2]),
+        ])?;
         self.patch_prefill_rows(prog, 0, rows, Some(rung))
     }
 
@@ -14228,10 +14232,10 @@ impl AmdEngine {
         }
         let d_pos = self.devp[self.need(self.t_pos, "in.pos")?].base;
         let d_kvlen = self.devp[self.need(self.t_kvlen, "in.kvlen")?].base;
-        self.be
-            .memcpy_htod_pinned(d_pos, &self.h_scalar.as_slice()[..b * 4])?;
-        self.be
-            .memcpy_htod_pinned(d_kvlen, &self.h_scalar.as_slice()[b * 4..b * 8])?;
+        self.be.memcpy_htod_pinned_batch(&[
+            (d_pos, &self.h_scalar.as_slice()[..b * 4]),
+            (d_kvlen, &self.h_scalar.as_slice()[b * 4..b * 8]),
+        ])?;
         Ok(())
     }
 

@@ -407,26 +407,34 @@ impl AmdEngine {
                 bytemuck::cast_slice_mut(mixed.host.as_mut_slice()),
                 plan,
             )?;
-            let upload = |base: u64, range: &std::ops::Range<usize>, words: usize| -> Result<()> {
-                self.be.memcpy_htod_pinned(
-                    base,
-                    &mixed.host.as_slice()[range.start * 4..(range.start + words) * 4],
-                )
+            // ONE completion wait for the whole descriptor, not seven. Four of
+            // these slices are a word per row — 32 bytes at concurrency 8 — so
+            // issued singly they are seven signal lifecycles and seven blocked
+            // waits sitting in front of the launch, and none of it overlaps.
+            // `memcpy_htod_pinned_batch` defaults to the same loop, so a backend
+            // that cannot batch stays correct.
+            let slice = |range: &std::ops::Range<usize>, words: usize| -> &[u8] {
+                &mixed.host.as_slice()[range.start * 4..(range.start + words) * 4]
             };
-            upload(mixed.ids_base, &mixed.layout.ids, rows as usize)?;
-            upload(mixed.pos_base, &mixed.layout.pos, rows as usize)?;
-            upload(mixed.kvlen_base, &mixed.layout.kvlen, rows as usize)?;
-            upload(program.decode_slot, &mixed.layout.decode_slot, decode.len())?;
-            upload(
-                mixed.metadata.base,
-                &mixed.layout.prefill_spans,
-                prefill.len() * SPAN_WORDS,
-            )?;
-            upload(mixed.parked_base, &mixed.layout.parked, rows as usize)?;
-            self.be.memcpy_htod_pinned(
-                program.arg.counters,
-                &mixed.zero.as_slice()[..program.counter_bytes],
-            )?;
+            let uploads: [(u64, &[u8]); 7] = [
+                (mixed.ids_base, slice(&mixed.layout.ids, rows as usize)),
+                (mixed.pos_base, slice(&mixed.layout.pos, rows as usize)),
+                (mixed.kvlen_base, slice(&mixed.layout.kvlen, rows as usize)),
+                (
+                    program.decode_slot,
+                    slice(&mixed.layout.decode_slot, decode.len()),
+                ),
+                (
+                    mixed.metadata.base,
+                    slice(&mixed.layout.prefill_spans, prefill.len() * SPAN_WORDS),
+                ),
+                (mixed.parked_base, slice(&mixed.layout.parked, rows as usize)),
+                (
+                    program.arg.counters,
+                    &mixed.zero.as_slice()[..program.counter_bytes],
+                ),
+            ];
+            self.be.memcpy_htod_pinned_batch(&uploads)?;
             let mut arg = program.arg;
             arg.n_prefill_spans = prefill.len() as u32;
             let started = Instant::now();

@@ -1448,6 +1448,18 @@ impl crate::exec::device_api::EngineDevice for HsaBackend {
         HsaBackend::memcpy_dtod_batch(self, pairs)
     }
 
+    fn memcpy_htod_pinned(&self, dptr: u64, src: &[u8]) -> Result<()> {
+        HsaBackend::memcpy_htod_pinned(self, dptr, src)
+    }
+
+    fn memcpy_dtoh_pinned(&self, dst: &mut [u8], dptr: u64) -> Result<()> {
+        HsaBackend::memcpy_dtoh_pinned(self, dst, dptr)
+    }
+
+    fn memcpy_htod_pinned_batch(&self, pairs: &[(u64, &[u8])]) -> Result<()> {
+        HsaBackend::memcpy_htod_pinned_batch(self, pairs)
+    }
+
     fn host_alloc_pinned(&self, bytes: usize) -> Result<HsaPinned> {
         HsaBackend::host_alloc_pinned(self, bytes)
     }
@@ -2999,6 +3011,76 @@ impl HsaBackend {
             (self.shared.drv.hsa_signal_destroy)(sig);
         }
         Ok(())
+    }
+
+    /// Many H2D copies from already agent-visible host memory under ONE
+    /// completion signal — the batched form of
+    /// [`HsaBackend::memcpy_htod_pinned`].
+    ///
+    /// One signal lifecycle and one blocked wait for the whole set, instead of
+    /// one per copy. A mixed/token-batch step uploads seven descriptor slices
+    /// per token and four of them are one word per row, so the per-copy
+    /// synchronisation is the cost, not the bytes.
+    ///
+    /// # Why the shortfall is subtracted before the wait
+    ///
+    /// The signal is created holding `live.len()`, and each copy decrements it
+    /// once on completion. A copy the runtime REFUSED was never issued and will
+    /// never decrement, so the signal can no longer reach zero and a
+    /// `wait(LT 1, u64::MAX)` would block the thread forever — a hang, not an
+    /// error return. Subtracting the un-issued count restores the invariant the
+    /// wait depends on. (`memcpy_dtod_batch` above has this bug: it waits on a
+    /// signal that a mid-loop failure has left permanently short.)
+    pub fn memcpy_htod_pinned_batch(&self, pairs: &[(u64, &[u8])]) -> Result<()> {
+        let live: Vec<&(u64, &[u8])> = pairs.iter().filter(|p| !p.1.is_empty()).collect();
+        if live.is_empty() {
+            return Ok(());
+        }
+        self.guard()?;
+        let mut sig = HsaSignal { handle: 0 };
+        let rc = unsafe {
+            (self.shared.drv.hsa_signal_create)(live.len() as i64, 0, std::ptr::null(), &mut sig)
+        };
+        self.check(rc, "hsa_signal_create (htod batch)")?;
+        let mut issued = 0usize;
+        let mut failed = None;
+        for &&(dptr, src) in &live {
+            let rc = unsafe {
+                (self.shared.drv.hsa_amd_memory_async_copy)(
+                    dptr as *mut c_void,
+                    self.agent,
+                    src.as_ptr() as *const c_void,
+                    self.cpu_agent,
+                    src.len(),
+                    0,
+                    std::ptr::null(),
+                    sig,
+                )
+            };
+            if rc != HSA_STATUS_SUCCESS {
+                failed = Some(rc);
+                break;
+            }
+            issued += 1;
+        }
+        if issued < live.len() {
+            let short = (live.len() - issued) as i64;
+            unsafe { (self.shared.drv.hsa_signal_add_screlease)(sig, -short) };
+        }
+        unsafe {
+            (self.shared.drv.hsa_signal_wait_scacquire)(
+                sig,
+                HSA_SIGNAL_CONDITION_LT,
+                1,
+                u64::MAX,
+                HSA_WAIT_STATE_BLOCKED,
+            );
+            (self.shared.drv.hsa_signal_destroy)(sig);
+        }
+        match failed {
+            Some(rc) => Err(self.fault(rc, "async_copy (htod batch)")),
+            None => Ok(()),
+        }
     }
 
     /// D2H copy whose destination is already agent-visible (a [`HsaPinned`]
