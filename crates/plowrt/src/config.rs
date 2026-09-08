@@ -230,6 +230,18 @@ pub struct CpuRuntimeConfig {
     /// with a different type.
     #[arg(long = "cpu-global-queue", env = "PLOW_CPU_GQ", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub gq_opt_in: bool,
+
+    /// Place executors by the packet's L2 locality domains instead of `cu % nodes`.
+    ///
+    /// OFF, because it measured 1.5x SLOWER on the one blob shape testable here (an H100-mapped
+    /// Gemma-4-31B, blocked domain map) and never faster on any node count tried. A domain is a
+    /// GPU L2 partition: it says which slices share a GPU cache, not which weights they touch, and
+    /// CPU model tensors are interleaved across nodes anyway — so grouping by it buys no locality
+    /// while costing the round-robin's balance. Kept for A/B on a host whose blob has balanced
+    /// domains. Inert on a blob carrying none, and `node_plan` declines a plan that would leave
+    /// any node busier than the round-robin even when this is on.
+    #[arg(long = "cpu-l2-place", env = "PLOW_CPU_L2_PLACE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub l2_place: bool,
 }
 
 /// NVIDIA / sm_120 runtime knobs.

@@ -39,10 +39,20 @@ struct Shared {
     n_workers: u32,
 }
 
-/// cu -> worker ownership: node = `cu % nodes`, then round-robin within the node, restricted to the
-/// first `active` workers. Used both at spawn (for the pool's own bookkeeping) and per program, so
-/// prefill and decode can run on different widths without respawning threads.
-pub fn cu_map(n_cu: u32, per_node: &[Vec<u32>], nodes: usize, active: usize) -> Vec<Vec<u32>> {
+/// cu -> worker ownership, then round-robin within the node, restricted to the first `active`
+/// workers. Used both at spawn (for the pool's own bookkeeping) and per program, so prefill and
+/// decode can run on different widths without respawning threads.
+///
+/// `node_of_cu` is the packet's locality plan (`engine::node_plan`) when the blob carries L2
+/// domains and they divide over the nodes; without it the node is `cu % nodes`, which spreads
+/// evenly but is blind to which slices actually feed each other.
+pub fn cu_map(
+    n_cu: u32,
+    per_node: &[Vec<u32>],
+    nodes: usize,
+    active: usize,
+    node_of_cu: Option<&[u32]>,
+) -> Vec<Vec<u32>> {
     let mut out: Vec<Vec<u32>> =
         vec![Vec::new(); per_node.iter().map(Vec::len).sum::<usize>().max(active)];
     let live: Vec<Vec<u32>> = per_node
@@ -54,8 +64,14 @@ pub fn cu_map(n_cu: u32, per_node: &[Vec<u32>], nodes: usize, active: usize) -> 
                 .collect()
         })
         .collect();
+    // Per-node round-robin cursor. Under the fallback `cu % nodes` the k-th cu on a node is
+    // `k * nodes + np`, so this counts exactly what `cu / nodes` used to.
+    let mut seen = vec![0usize; nodes.max(1)];
     for cu in 0..n_cu {
-        let np = (cu as usize) % nodes.max(1);
+        let np = match node_of_cu {
+            Some(m) => m[cu as usize] as usize % nodes.max(1),
+            None => (cu as usize) % nodes.max(1),
+        };
         let ws = if live.get(np).is_some_and(|v| !v.is_empty()) {
             &live[np]
         } else {
@@ -64,7 +80,8 @@ pub fn cu_map(n_cu: u32, per_node: &[Vec<u32>], nodes: usize, active: usize) -> 
                 None => return out, // no active worker at all; caller rejects
             }
         };
-        let w = ws[(cu as usize / nodes.max(1)) % ws.len()];
+        let w = ws[seen[np] % ws.len()];
+        seen[np] += 1;
         out[w as usize].push(cu);
     }
     out
@@ -76,6 +93,9 @@ struct WorkerInit {
     node: u32,
     node_pos: u32,
     cpu: u32,
+    /// GQ window this worker claims from first. The packet's locality domain when the blob carries
+    /// one and it maps onto the nodes, else the node position, as before.
+    domain: u32,
 }
 
 /// Keeps the program and counters of the in-flight run alive for the workers,
@@ -105,15 +125,20 @@ struct Host {
 
 impl WorkerPool {
     /// Spawn `threads` persistent workers (0 = one per online logical cpu on the
-    /// selected nodes). Virtual executor `cu` is placed on node `cu % nodes`,
-    /// round-robin across that node's workers, so `n_cu` need not equal the
-    /// thread count.
+    /// selected nodes). Virtual executor `cu` is placed on the node `place` names for it, or on
+    /// `cu % nodes` without one, round-robin across that node's workers — so `n_cu` need not equal
+    /// the thread count, and one blob serves any core count.
+    ///
+    /// `place` is the packet's locality plan: `(node_of_cu, domains)` from `engine::node_plan`.
+    /// It moves same-domain cus onto one node and points each worker's first GQ claim at a domain
+    /// that node owns, instead of at its bare node index.
     pub fn spawn(
         topo: &Topology,
         threads: usize,
         numa: &NumaMode,
         spin_us: u32,
         n_cu: u32,
+        place: Option<(&[u32], u32)>,
         exec: Arc<dyn Exec>,
     ) -> WorkerPool {
         let nodes = topo.select_nodes(numa);
@@ -130,12 +155,29 @@ impl WorkerPool {
         let placement: Vec<(u32, u32)> = (0..threads).map(|k| cpus[k % cpus.len()]).collect();
         let node_pos = |n: u32| nodes.iter().position(|&x| x == n).unwrap_or(0) as u32;
 
-        // cu → worker: node = cu % nodes, then round-robin within the node.
+        // cu → worker: the locality plan's node (else cu % nodes), then round-robin within it.
         let mut per_node: Vec<Vec<u32>> = vec![Vec::new(); nodes.len()];
         for (w, &(_, n)) in placement.iter().enumerate() {
             per_node[node_pos(n) as usize].push(w as u32);
         }
-        let mut cus_of = cu_map(n_cu, &per_node, nodes.len(), threads);
+        let mut cus_of = cu_map(n_cu, &per_node, nodes.len(), threads, place.map(|(m, _)| m));
+
+        // Each node owns a contiguous run of `per` domains under `node_plan`; spread that node's
+        // workers over them, so no window is left to be reached only by stealing. `spawn` resolves
+        // the node list itself, so re-derive the split here instead of trusting the caller's.
+        let per = place
+            .map(|(_, domains)| domains as usize)
+            .filter(|d| *d >= nodes.len() && d.is_multiple_of(nodes.len()))
+            .map(|d| d / nodes.len());
+        let mut worker_domain = vec![0u32; threads];
+        for (p, ws) in per_node.iter().enumerate() {
+            for (k, &w) in ws.iter().enumerate() {
+                worker_domain[w as usize] = match per {
+                    Some(per) => (p * per + k % per) as u32,
+                    None => p as u32,
+                };
+            }
+        }
 
         let shared = Arc::new(Shared {
             ring: ControlRing::new(threads),
@@ -157,6 +199,7 @@ impl WorkerPool {
                 idx: w as u32,
                 node,
                 node_pos: node_pos(node),
+                domain: worker_domain[w],
                 cpu,
             };
             let sh = shared.clone();
@@ -422,7 +465,7 @@ fn worker_main(init: WorkerInit, sh: Arc<Shared>, exec: Arc<dyn Exec>) {
         worker: init.idx,
         node: init.node,
         cpu: init.cpu,
-        domain: init.node_pos,
+        domain: init.domain,
     };
     let mut st = StaticState::new(init.idx as usize, init.cus);
     let mut gq = GqState::new();
@@ -493,5 +536,65 @@ fn worker_main(init: WorkerInit, sh: Arc<Shared>, exec: Arc<dyn Exec>) {
             CMD_STOP => return,
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::cu_map;
+
+    /// Workers laid out over `nodes`, node-major, as `spawn` builds `per_node`.
+    fn per_node(nodes: usize, per: usize) -> Vec<Vec<u32>> {
+        (0..nodes)
+            .map(|n| ((n * per) as u32..((n + 1) * per) as u32).collect())
+            .collect()
+    }
+
+    /// Without a plan the node is `cu % nodes` and the worker within it is `cu / nodes` — the
+    /// mapping this pool has always used. Pinned so the locality plan stays purely additive.
+    #[test]
+    fn without_a_plan_placement_is_the_old_round_robin() {
+        let pn = per_node(2, 3);
+        let got = cu_map(24, &pn, 2, 6, None);
+        for (w, cus) in got.iter().enumerate() {
+            for &cu in cus {
+                assert_eq!(cu as usize % 2, w / 3, "cu {cu} on the wrong node");
+                assert_eq!((cu as usize / 2) % 3, w % 3, "cu {cu} on the wrong worker");
+            }
+        }
+        assert_eq!(got.iter().map(Vec::len).sum::<usize>(), 24);
+        assert!(got.iter().all(|c| c.len() == 4), "even by construction");
+    }
+
+    /// With a plan every cu of one domain lands on that domain's node, and the nodes still split
+    /// the work evenly — locality must not cost balance.
+    #[test]
+    fn a_plan_groups_domains_without_costing_balance() {
+        let pn = per_node(2, 3);
+        let plan: Vec<u32> = (0..24u32).map(|cu| (cu % 8) / 4).collect();
+        let got = cu_map(24, &pn, 2, 6, Some(&plan));
+        for (w, cus) in got.iter().enumerate() {
+            for &cu in cus {
+                assert_eq!(plan[cu as usize] as usize, w / 3, "cu {cu} left its node");
+            }
+        }
+        assert_eq!(got.iter().map(Vec::len).sum::<usize>(), 24);
+        assert!(
+            got.iter().all(|c| c.len() == 4),
+            "3 workers x 12 cus per node"
+        );
+    }
+
+    /// A node with no live worker still has its cus placed somewhere rather than dropped.
+    #[test]
+    fn a_plan_survives_a_node_with_no_active_worker() {
+        let pn = per_node(2, 3);
+        let plan: Vec<u32> = (0..12u32).map(|cu| cu % 2).collect();
+        let got = cu_map(12, &pn, 2, 3, Some(&plan));
+        assert_eq!(got.iter().map(Vec::len).sum::<usize>(), 12);
+        assert!(
+            got[3..].iter().all(Vec::is_empty),
+            "workers past `active` own nothing"
+        );
     }
 }

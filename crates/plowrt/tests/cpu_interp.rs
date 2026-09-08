@@ -195,7 +195,7 @@ impl Recorder {
 
 fn pool(threads: usize, n_cu: u32, exec: Arc<dyn Exec>) -> WorkerPool {
     let topo = Topology::detect();
-    WorkerPool::spawn(&topo, threads, &NumaMode::Off, 20, n_cu, exec)
+    WorkerPool::spawn(&topo, threads, &NumaMode::Off, 20, n_cu, None, exec)
 }
 
 fn run_once(
@@ -307,6 +307,90 @@ fn threads_fewer_than_cus_does_not_deadlock() {
         assert_eq!(rec.count.load(Ordering::Relaxed), total_slices(&ops));
     }
     assert_eq!(rec.violations.load(Ordering::Relaxed), 0);
+}
+
+/// Records which OS thread served each run. `ThreadId`s are unique for the lifetime of a thread,
+/// so an identical set across many runs is direct evidence the pool never respawned one.
+#[derive(Default)]
+struct Threads(std::sync::Mutex<std::collections::HashSet<std::thread::ThreadId>>);
+
+impl Exec for Threads {
+    fn exec(&self, _inst: &DevInst64, _slice: u32, _nblk: u32, _w: &WorkerCtx) {
+        self.0.lock().unwrap().insert(std::thread::current().id());
+    }
+}
+
+/// Workers are PERSISTENT: spawned once and returned to the control loop, never re-created per
+/// run. `p.threads()` only counts join handles, which cannot change, so this checks the identity
+/// of the threads that actually ran the work — the same set, every run, for every width.
+#[test]
+fn the_same_os_threads_serve_every_run() {
+    let ops = fan_ops();
+    let (prog, ctrs) = build(&ops, 8, 1, 0);
+    let prog = Arc::new(prog);
+    let ctr = Arc::new(CounterPool::from_counters(&ctrs));
+    for threads in [1usize, 4, 8] {
+        let rec = Arc::new(Threads::default());
+        let p = pool(threads, 8, rec.clone());
+        let mut first: Option<std::collections::HashSet<_>> = None;
+        for i in 0..200 {
+            rec.0.lock().unwrap().clear();
+            let gen = p.run(&prog, 0, &ctr);
+            assert_eq!(p.wait_done(gen), None, "fault on run {i}");
+            ctr.reset_all();
+            let seen = rec.0.lock().unwrap().clone();
+            assert!(!seen.is_empty(), "run {i} executed nothing");
+            match &first {
+                None => first = Some(seen),
+                Some(f) => assert_eq!(&seen, f, "run {i} ran on a different thread set"),
+            }
+        }
+        // Every worker that ever ran is one of the pool's own, and no more than the pool has.
+        assert!(first.unwrap().len() <= threads);
+        assert_eq!(p.threads(), threads);
+    }
+}
+
+/// A locality plan moves WHERE a cu runs, never WHAT runs: every slice still executes exactly
+/// once and no dependency inverts, at any thread count. The plans are supplied directly so the
+/// check does not depend on how many NUMA nodes the test host happens to have — an out-of-range
+/// node index in a plan has to fold safely rather than drop the cu.
+#[test]
+fn a_locality_plan_changes_placement_but_not_execution() {
+    let ops = diamond_ops();
+    let (prog, ctrs) = build(&ops, 16, 1, 0);
+    let prog = Arc::new(prog);
+    let ctr = Arc::new(CounterPool::from_counters(&ctrs));
+    let plans: [(Vec<u32>, u32); 3] = [
+        (vec![0; 16], 2),                        // every cu onto one node
+        ((0..16).map(|cu| cu % 2).collect(), 2), // interleaved groups
+        ((0..16).map(|cu| cu / 2).collect(), 8), // blocked, more groups than nodes
+    ];
+    for (plan, domains) in plans {
+        for threads in [1usize, 3, 16] {
+            let rec = Arc::new(Recorder::new(&ops, Duration::ZERO));
+            let topo = Topology::detect();
+            let p = WorkerPool::spawn(
+                &topo,
+                threads,
+                &NumaMode::Off,
+                20,
+                16,
+                Some((&plan, domains)),
+                rec.clone(),
+            );
+            for _ in 0..20 {
+                rec.reset();
+                run_once(&p, &prog, &ctr, 0, &rec);
+                assert_eq!(rec.count.load(Ordering::Relaxed), total_slices(&ops));
+            }
+            assert_eq!(
+                rec.violations.load(Ordering::Relaxed),
+                0,
+                "threads={threads}"
+            );
+        }
+    }
 }
 
 #[test]
