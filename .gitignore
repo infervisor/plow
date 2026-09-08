@@ -19,9 +19,13 @@ build-*/
 __pycache__block-assets/
 __pycache__
 
-# Isolated cargo target for `--features hsa` builds, so a concurrent agent
-# rebuilding the shared `target/` without that feature cannot break amd-bench.
-target-hsa/
+# ISOLATED CARGO TARGET DIRS. One per concurrent agent or feature set, so a
+# rebuild of the shared `target/` under different features cannot break another
+# run's binaries — `--features hsa` is the usual reason, and a shared target dir
+# is what once made `plowc` fingerprint a different worktree's source tree.
+# Globbed rather than enumerated: this list had four entries and three more
+# arrived untracked in a single session.
+target-*/
 ba_agt/
 ba_ctl/
 ba_hier/
@@ -46,8 +50,6 @@ plow_profile.sqlite
 
 # plowc/plowrt emitted serve-asset bundles for this campaign (model.pkt, weights.json, cubins)
 assets-run/
-target-glm53/
-target-glm53-check/
 venv-sglang/
 .venv-sglang/
 sglang-pkgs/
