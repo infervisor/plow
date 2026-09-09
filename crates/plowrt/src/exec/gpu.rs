@@ -54,6 +54,8 @@ use decode_object::{BoundDecodeObject, DecodeModule};
 mod gpu_decode_rung;
 #[path = "gpu_mixed_step.rs"]
 mod gpu_mixed_step;
+#[path = "gpu_packed_terminal.rs"]
+mod gpu_packed_terminal;
 use gpu_cublaslt::CublasLtDecodeRoute;
 use gpu_decode_rung::{
     decode_rung_index, decode_selection, effective_decode_widths, validate_decode_ladder,
@@ -1698,6 +1700,7 @@ pub struct GpuEngine {
     /// Next physical slot considered first by cross-request prefill admission.
     prefill_turn: usize,
     packed_prefill: Option<plow_asset::packed_prefill::Manifest>,
+    packed_terminal: Option<gpu_packed_terminal::PackedTerminal>,
     mixed_step: Option<gpu_mixed_step::MixedCudaStep>,
 }
 
@@ -4326,8 +4329,10 @@ impl GpuEngine {
             pf_batch,
             prefill_turn: 0,
             packed_prefill,
+            packed_terminal: None,
             mixed_step,
         };
+        engine.packed_terminal = gpu_packed_terminal::PackedTerminal::load(&engine)?;
         if engine.cublaslt_decode_capture {
             engine.capture_decode_graph()?;
         }
@@ -7589,7 +7594,7 @@ impl GpuEngine {
         }
         for r in reqs {
             self.pos[r.slot] = (r.c0 + r.len) as u32;
-            if self.vmm_prefix_enabled() && r.c0 + r.len + 1 == r.prompt.len() {
+            if self.vmm_prefix_enabled() && r.c0 + r.len + 1 >= r.prompt.len() {
                 let end = r.c0 + r.len;
                 self.seq_tokens[r.slot].clear();
                 self.seq_tokens[r.slot].extend_from_slice(&r.prompt[..end]);

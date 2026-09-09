@@ -299,7 +299,7 @@ fn select_row_capacity(
         .map(|(rows, _, _)| rows)
 }
 
-fn upload_program(
+pub(super) fn upload_program(
     be: &Arc<CudaBackend>,
     program: &plow_asset::aux_program::Program,
     tensor_table: u64,

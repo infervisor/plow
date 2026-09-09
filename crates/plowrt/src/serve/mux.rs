@@ -1522,19 +1522,33 @@ fn run_one_tick(
 
             let pack_t = packlog::on().then(Instant::now);
             if e.pf_batch_enabled() {
-                // PX-1 cross-request batched prefill: pack every waiting request's
-                // next chunk (up to `n-1` prompt rows each) into shared launches
-                // under a token budget, then feed each finished request's LAST
-                // prompt token through the batched decode step below — which both
-                // writes its final KV row and produces its first token, batched
-                // with every live decode stream.
-                if let Some(f) =
-                    gpu_prefill_batched_pass(&mut *e, &mut slots, cap, &arena, feeds.is_empty())
-                {
+                let compact = e.has_packed_terminal();
+                let mut completed = std::mem::take(&mut obs.host.prefill_tokens);
+                completed.clear();
+                if let Some(f) = gpu_prefill_batched_pass(
+                    &mut *e, &mut slots, cap, &arena, feeds.is_empty(), &mut completed,
+                ) {
                     if tick_fault.is_none() {
                         tick_fault = Some(f);
                     }
                 }
+                for (row, &(i, token)) in completed.iter().enumerate() {
+                    let Some(slot) = slots[i].as_mut() else { continue };
+                    match gpu_finish_token(&mut *e, row, slot, token) {
+                        Ok(token) => handle_produced_token(
+                            &mut slots[i], &arena, bundle, token, 1,
+                            &mut tokens_this_tick, Some(stop.as_slice()),
+                        ),
+                        Err(err) => {
+                            note_fault(&mut tick_fault, &err);
+                            if let Some(taken) = slots[i].take() {
+                                release_kv(&arena, taken.kv);
+                                let _ = taken.respond.try_send(StreamChunk::Err(err));
+                            }
+                        }
+                    }
+                }
+                obs.host.prefill_tokens = completed;
                 for i in 0..slots.len().min(cap) {
                     let Some(s) = slots[i].as_ref() else { continue };
                     if s.step != 0 {
@@ -1550,7 +1564,7 @@ fn run_one_tick(
                         }
                         continue;
                     }
-                    if !e.packed_slot_ready(i) || s.pf_pos + 1 != n {
+                    if compact || !e.packed_slot_ready(i) || s.pf_pos + 1 != n {
                         continue; // still mid-prefill
                     }
                     if s.respond.is_closed() {
@@ -3219,17 +3233,9 @@ fn pf_chunk_rows() -> usize {
     crate::config::RuntimeConfig::get().nv.pf_chunk_rows()
 }
 
-/// PX-1: pack every mid-prefill slot's next chunk into shared batched-prefill
-/// launches. Per launch, each waiting request contributes up to its remaining
-/// `n-1` prompt rows (the last prompt token is fed through the batched decode
-/// step instead — that step writes its KV row AND yields the first generated
-/// token, so no per-request lm_head is needed in the shared launch). The row
-/// budget per launch is the largest prefill bucket when no decode stream is
-/// live (fastest cold TTFT), else `PLOW_PF_INTERLEAVE` rows — the same bounded
-/// stall as the serialized path, now shared by N requests instead of one.
-/// Chunk boundaries are bit-invariant for the fused (nsplit=1) flash — masked
-/// tiles are exact no-ops and the KV tile grid is absolutely aligned — so
-/// packing decisions cannot change any request's tokens.
+/// Pack waiting prompt rows under the prefill quantum. Compact terminal outputs
+/// stop the pass before another launch can overwrite their logits. The legacy
+/// route leaves the last prompt row for decode.
 #[cfg(feature = "cuda")]
 fn gpu_prefill_batched_pass(
     e: &mut crate::exec::gpu::GpuEngine,
@@ -3237,9 +3243,13 @@ fn gpu_prefill_batched_pass(
     cap: usize,
     arena: &Option<SharedKvState>,
     cold: bool,
+    completed: &mut Vec<(usize, u32)>,
 ) -> Option<crate::DeviceErrorInfo> {
     use crate::exec::gpu::PfBatchReq;
 
+    completed.clear();
+    let compact = e.has_packed_terminal();
+    let withheld = usize::from(!compact);
     let mut tick_fault: Option<crate::DeviceErrorInfo> = None;
     let budget_max = e.pf_max_rows();
     if budget_max == 0 {
@@ -3302,7 +3312,7 @@ fn gpu_prefill_batched_pass(
             .filter(|(i, _)| e.packed_slot_ready(*i))
             .filter_map(|(_, s)| s.as_ref())
             .filter(|s| s.step == 0)
-            .map(|s| (s.prompt_ids.len().max(1) - 1).saturating_sub(s.pf_pos))
+            .map(|s| s.prompt_ids.len().saturating_sub(withheld).saturating_sub(s.pf_pos))
             .sum();
         if avail == 0 {
             return tick_fault;
@@ -3311,10 +3321,10 @@ fn gpu_prefill_batched_pass(
         let candidates = slots.iter().enumerate().take(cap).filter_map(|(i, slot)| {
             let s = slot.as_ref()?;
             let n = s.prompt_ids.len();
-            if !e.packed_slot_ready(i) || s.step != 0 || n == 0 || s.pf_pos + 1 >= n {
+            if !e.packed_slot_ready(i) || s.step != 0 || n == 0 || s.pf_pos + withheld >= n {
                 return None;
             }
-            let remaining = (n - 1 - s.pf_pos).min(chunk_cap);
+            let remaining = (n - withheld - s.pf_pos).min(chunk_cap);
             let n_rows = u32::try_from(remaining).ok()?;
             let slot = u32::try_from(i).ok()?;
             let kv_row0 = u32::try_from(s.pf_pos).ok()?;
@@ -3354,7 +3364,11 @@ fn gpu_prefill_batched_pass(
                 len,
             })
             .collect();
-        let res = e.prefill_batched(&reqs);
+        let res = if compact {
+            e.prefill_batched_complete(&reqs, completed)
+        } else {
+            e.prefill_batched(&reqs)
+        };
         drop(reqs);
         match res {
             Ok(()) => {
@@ -3385,7 +3399,7 @@ fn gpu_prefill_batched_pass(
                 return tick_fault;
             }
         }
-        if !cold {
+        if !completed.is_empty() || !cold {
             return tick_fault; // bounded stall: decode now, next pack next tick
         }
         // Cold path: stop as soon as any request is ready so its first token
@@ -3396,7 +3410,7 @@ fn gpu_prefill_batched_pass(
                     e.packed_slot_ready(i)
                         && s.step == 0
                         && !s.prompt_ids.is_empty()
-                        && s.pf_pos + 1 == s.prompt_ids.len()
+                        && s.pf_pos + withheld == s.prompt_ids.len()
                 })
                 .unwrap_or(false)
         });

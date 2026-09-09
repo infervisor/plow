@@ -14,7 +14,7 @@ rollback. This is capability-gated selection, not production qualification of ev
 | Failed AMD kernel lookup | Module now owned by the cleanup guard before lookup. |
 | Startup observability | `armed` and `ready` are separate; `fires=false` until a successful device dispatch. |
 | Post-dispatch validation | Invalid token IDs or failed frontier commit are device errors; no ordinary-path retry. |
-| Host verification | CUDA + HSA library suite: 592 passed, 15 ignored, zero failures. |
+| Host verification | CUDA + HSA library suite: 594 passed, 16 ignored, zero failures. |
 | Shared contract and CPU integration | 18 asset-contract tests, 5 C/Rust resolver checks and 4 compact-tail tests passed. |
 | H100 default/fallback smoke | FP8 server starts with `token_batch=true`, explicitly reports CUDA executor unavailable, and generates through ordinary execution. |
 | AMD device correctness/performance | Not tested on this host. |
@@ -412,7 +412,7 @@ source patch, build logs, output arrays and SHA256 records are preserved in
 Run the harness with `nix develop -c cargo run -p plowrt --example prefix_logits
 --features cuda,hsa,hub -- <assets> <mode> <cases.json> <new-output-directory> [reference]`.
 Cases contain `messages`, `prompt_tokens`, and `steps`. Run `ordinary` first, then pass
-its output directory to `split`, `packed`, or `packed-tail`. Use prefix reuse and disable
+its output directory to `split`, `packed`, `packed-tail`, or `packed-complete`. Use prefix reuse and disable
 multistep; packed modes also require compatible packed-prefix runtime support and assets.
 The rejected prototype's patch is preserved externally as `packed-prefix2-source.patch`.
 
@@ -441,10 +441,63 @@ waiter before a new arrival. Cancelling all slots still permits decode in the hi
 slot, exercising every idle-row mapping. The device test passes in addition to the
 592-test host suite; it remains ignored in ordinary host runs.
 
-This combination remains experimental and off by default. It still uses decode for the
-last prompt token, with the numerical differences documented above. Compact terminal
-output, matched performance qualification, FP8 packed assets, and the CUDA unified
-token-batch executor remain outstanding. Admission validation is not a vLLM win claim.
+At this admission milestone, the experimental combination still used decode for the
+last prompt token, with the numerical differences documented above. The compact terminal
+correction is described below. Matched performance qualification, FP8 packed assets,
+and the CUDA unified token-batch executor remain outstanding. Admission validation is
+not a vLLM win claim.
 Functional pressure durations include a CPU diagnostic build and are not performance
 evidence. Raw proof and hashes are `plow-bf16-b8-packed-admission2-*`,
 `packed-admission2-gpu-test.log`, and `packed-admission2-qualification.json`.
+
+## Compact BF16 packed-prefix terminal, 2026-09-09
+
+Compatible explicit packed-prefix execution now includes the final prompt row in the
+packed transformer body. Completed requests gather their residual rows into a compact
+buffer and run the ordinary RmsNorm → GEMM head → SoftCap → Argmax chain. Sampling reads
+compact logits rows while decode continues on each request's physical slot. Intermediate
+chunks produce no output; completion stops the prefill pass before another launch can
+overwrite logits. Upload buffers survive until the engine stream drains, including errors.
+
+Load-time checks require matching ordinary BF16 tails across prefill buckets, valid buffer
+capacities, non-overlapping residual storage, and a prefill object with RowGather support.
+Unsupported tails retain the legacy final-token decode route. The compact implementation
+currently runs after the body's unused original tail, so it still pays for an extra head.
+It does not implement the shared-descriptor CUDA token-batch executor or enable FP8 packing.
+
+The single-request probe compares 128 complete vocabulary snapshots with ordinary prefill:
+1055- and 16415-token prompts, 64 teacher-forced steps each. Every BF16 logit is bit-exact.
+A second GPU test completes ragged final chunks in reversed order on physical slots 3 and
+7, checks both compact output rows, then teacher-forces decode through step 64. All 128
+snapshots are bit-exact against the same ordinary references. The admission device test
+still passes with the extra terminal buffers; the host suite passes 594 tests, 16 ignored.
+
+All 12 natural cold/warm completions now match ordinary BF16, including the four completions
+that differed under the previous final-token decode route. All six warm cache counts and
+the three API lifecycle checks pass. Eight cold 16K requests, eight exact isolated replays,
+and recovery pass. Eight streams are cancelled after observing KV admission waiting;
+one-token-prompt recovery remains exact. Sixteen isolated/concurrent sampling pairs also
+match, covering penalties, logit bias, nonzero temperature, reversed submission order,
+and one-token prompts.
+
+The combination remains experimental and off by default; automatic ordinary prefix
+caching remains enabled on its qualified layouts.
+
+The matched nine-cell screen uses 1K/4K/16K input, concurrency 1/4/8, 32 output tokens,
+and 95% requested shared prefix. All 39 prompt hashes, texts and cached-token counts
+match ordinary BF16. No CPU builds or other GPU jobs overlapped these timings.
+
+| Input / concurrency | Ordinary → compact TTFT, ms | Ordinary → compact median TPOT, ms | Ordinary → compact output tok/s |
+|---|---:|---:|---:|
+| 1K / 8 | 1914 → 1478 | 124.66 → 76.55 | 42.00 → 66.44 |
+| 4K / 8 | 5247 → 4568 | 211.46 → 78.77 | 21.09 → 36.50 |
+| 16K / 4 | 5746 → 6081 | 168.75 → 128.94 | 11.52 → 12.50 |
+| 16K / 8 | 10393 → 15682 | 349.65 → 87.46 | 11.84 → 13.91 |
+
+These are single-wave screens, not production performance qualification. Long-context
+TTFT still regresses; this does not meet the all-metrics target or establish a vLLM win.
+The frozen runtime is `bin/plowrt-packed-terminal`, SHA256
+`f9c46bd79de758bb5010cf2bf358f297d2e5fab063cc8cdb02dee4337f3005c6`.
+Raw proof, scripts and hashes are preserved under the campaign directory in
+`packed-terminal-qualification.json`, `bf16-b8-packed-terminal-preflight-comparison.json`,
+`plow-bf16-b8-packed-terminal-*`, and `packed-terminal-final-*-gpu.log`.

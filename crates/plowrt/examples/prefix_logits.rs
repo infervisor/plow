@@ -1,5 +1,5 @@
 //! Compare full-prompt prefill, split prefill plus decode, and packed prefill.
-//! prefix_logits <assets> <ordinary|split|packed|packed-tail> <cases.json> <out> [reference]
+//! prefix_logits <assets> <ordinary|split|packed|packed-tail|packed-complete> <cases.json> <out> [reference]
 
 #[cfg(not(feature = "cuda"))]
 fn main() {
@@ -17,7 +17,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mode = args.next().ok_or("mode required")?;
     assert!(matches!(
         mode.as_str(),
-        "ordinary" | "split" | "packed" | "packed-tail"
+        "ordinary" | "split" | "packed" | "packed-tail" | "packed-complete"
     ));
     let packed = mode.starts_with("packed");
     let cases: Vec<serde_json::Value> =
@@ -56,15 +56,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             assert_eq!(e.attach_prompt(0, &prompt)?, 0);
             let mut position = 0;
-            while position + 1 < prompt.len() {
-                let len = (prompt.len() - 1 - position).min(e.pf_max_rows());
+            let end = prompt.len() - usize::from(mode != "packed-complete");
+            let mut completed = Vec::new();
+            while position < end {
+                let len = (end - position).min(e.pf_max_rows());
                 if packed {
-                    e.prefill_batched(&[PfBatchReq {
+                    let reqs = [PfBatchReq {
                         slot: 0,
                         prompt: &prompt,
                         c0: position,
                         len,
-                    }])?;
+                    }];
+                    if mode == "packed-complete" {
+                        e.prefill_batched_complete(&reqs, &mut completed)?;
+                    } else {
+                        e.prefill_batched(&reqs)?;
+                    }
                     position += len;
                 } else {
                     position = match e.prefill_chunk(0, &prompt[..prompt.len() - 1], len)? {
@@ -73,7 +80,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     };
                 }
             }
-            if mode == "packed-tail" {
+            if mode == "packed-complete" {
+                assert_eq!(completed.len(), 1);
+                assert_eq!(completed[0].0, 0);
+                completed[0].1
+            } else if mode == "packed-tail" {
                 match e.prefill_chunk(0, &prompt, 1)? {
                     PrefillStep::Done(token) => token,
                     PrefillStep::Progress(_) => return Err("final prompt row not consumed".into()),
