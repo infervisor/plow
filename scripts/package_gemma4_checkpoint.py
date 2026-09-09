@@ -54,6 +54,10 @@ def main():
             assert digest(target) == digest(source), "conflicting library names"
         else:
             shutil.copy2(source, target)
+        if source.name == "ld-linux-x86-64.so.2":
+            # The NVIDIA driver loads these compatibility libraries at runtime.
+            for name in ["libdl.so.2", "libpthread.so.0", "librt.so.1"]:
+                shutil.copy2(source.resolve().parent / name, args.out / "lib" / name)
     assert (args.out / "lib/ld-linux-x86-64.so.2").is_file()
     for source in args.evidence:
         target = args.out / "evidence" / source.name

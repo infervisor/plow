@@ -1016,3 +1016,41 @@ Campaign `prefix-lazy-qualification.json` records source and 46 artifact hashes.
 
 The checkpoint request for BF16 weights with FP8 KV is a separate configuration:
 the results above use BF16 KV for both weight precisions.
+
+### BF16 weights / FP8 KV runnable checkpoint (2026-09-09)
+
+Saved the complete local checkpoint at
+`/opt/dlami/nvme/plow-checkpoints/gemma4-31b-it-h100/bf16-fp8kv-20260909`.
+It contains frozen plowrt source `25fb3d7`, regular Hugging Face weight files
+from revision `842da3794eaa0b77d5f08bae87a17459d91ff475`, tokenizer/chat template,
+all emitted cubins and programs, bundled ELF libraries, launch/workload scripts,
+and a SHA-256 manifest. Decode rungs **1/2/4/8/16** and prefill buckets
+**128/512/1024** are retained and usable. Context limit is 32768; physical slots
+are 16. See [build and run instructions](../docs/runtime/gemma4-h100-checkpoint.md).
+
+FP8-KV ladder validation now checks cache data, per-row scale storage and
+reader/writer addressing. Verification passed:
+
+- 600 host tests; 19 hardware/environment tests ignored in the host run.
+- 122 full-vocabulary comparisons against an independently emitted widest-only
+  FP8-KV build, including sparse/reversed slots, every rung, reset and retirement.
+- 240 cached full-vocabulary comparisons against 48 resident-prefix reference
+  frames, with identical suffix buckets, at 127/129/513/1057/2113/16417 tokens.
+- Six real-text cold/warm pairs at 1K/4K/16K: identical text and expected hits.
+- Sixteen concurrent cold 16K requests, sixteen exact isolated replays, recovery,
+  and the three API lifecycle checks.
+- Packaged launch from `/` with ambient Plow/library settings cleared: no Nix
+  libraries mapped; 22 sample requests passed, including 16 concurrent warm
+  replays. Test servers stopped afterward.
+
+The launcher selects FP8-KV cubins explicitly and enables prefix reuse. This
+configuration uses ordinary single-segment prefill and disables multi-step;
+segmented/packed FP8-KV prefill is unavailable. CUDA still uses the serving
+fallback executor. Cold/warm bucket changes can alter logits: maxima 0.84375
+at 129 tokens and 1.25 at 513 tokens were reproduced without a cache attach.
+Cache restoration itself was bit-exact against the matching suffix computation.
+All six natural completions differed from the BF16-KV reference; text agreement
+is not a quality score. Broader quality and sustained-load qualification remain
+open. Serving checks overlapped checkpoint copying/hashing and are functional
+evidence, not performance measurements. No vLLM win or off-instance backup is
+claimed. The checkpoint's `evidence/qualification.json` records the detailed proof.
