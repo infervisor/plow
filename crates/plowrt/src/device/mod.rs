@@ -358,6 +358,21 @@ pub trait Backend: Send + Sync {
         None
     }
 
+    /// Identify this device as a [`hwspec::isa::HardwareFingerprint`].
+    ///
+    /// The runtime could not describe its own hardware: nothing under
+    /// `crates/plowrt` built a fingerprint, so `tuning_path()` and `satisfies()`
+    /// were compile-time-only, and the closest asset-vs-machine check
+    /// (`main.rs`, `registry::lookup(manifest.gpu)`) matched at *vendor*
+    /// granularity — an MI300X bundle passed it on a gfx950 box and failed later
+    /// at the CU-count gate.
+    ///
+    /// `None` for a device the registry does not describe, or for the CPU
+    /// reference backend, which serves any packet and identifies no silicon.
+    fn fingerprint(&self) -> Option<hwspec::isa::HardwareFingerprint> {
+        None
+    }
+
     /// Publish each executor's capability descriptor.
     fn enumerate(&self) -> Vec<ExecutorTarget>;
 

@@ -159,6 +159,11 @@ const HSA_AMD_SEGMENT_GLOBAL: u32 = 0;
 // hsa_amd_memory_pool_info_t
 const HSA_AMD_MEMORY_POOL_INFO_SEGMENT: u32 = 0;
 const HSA_AMD_MEMORY_POOL_INFO_GLOBAL_FLAGS: u32 = 1;
+/// Pool capacity in bytes. This is how much HBM the agent has, and it is the
+/// ONLY thing that distinguishes MI300X from MI325X: both are gfx942 with 304
+/// CUs and the same LDS, differing at 192 vs 256 GiB. Without it a probe cannot
+/// name the part it is running on.
+const HSA_AMD_MEMORY_POOL_INFO_SIZE: u32 = 2;
 /// Recommended physical-allocation granule for `hsa_amd_vmem_handle_create`
 /// (the ROCr analogue of `CU_MEM_ALLOC_GRANULARITY_RECOMMENDED`). The *required*
 /// granule is `..._RUNTIME_ALLOC_GRANULE = 6`; the recommended one is what
@@ -1158,6 +1163,20 @@ impl Backend for HsaBackend {
 
     fn vendor(&self) -> Option<hwspec::Vendor> {
         Some(hwspec::Vendor::Amd)
+    }
+
+    /// The agent name IS the ISA key on AMD: `HSA_AGENT_INFO_NAME` returns
+    /// `gfx942`, which is the same string spliced into the kernel symbol the
+    /// loader resolves. Capacity then picks the SKU, since MI300X and MI325X
+    /// share gfx942 and 304 CUs.
+    fn fingerprint(&self) -> Option<hwspec::isa::HardwareFingerprint> {
+        let (major, minor) = self.rocr_version();
+        hwspec::isa::HardwareFingerprint::from_live(
+            &self.device_name,
+            self.cu_count,
+            self.vram_bytes(),
+            Some(format!("rocr-{major}.{minor}")),
+        )
     }
 
     fn enumerate(&self) -> Vec<ExecutorTarget> {
@@ -2611,6 +2630,36 @@ impl HsaBackend {
     /// Per-CU LDS budget in bytes.
     pub fn lds_bytes(&self) -> u32 {
         self.lds_bytes
+    }
+
+    /// Device-local memory capacity, from the coarse-grained VRAM pool.
+    ///
+    /// Queried live rather than taken from a table because it is the field that
+    /// identifies the part: MI300X and MI325X are both gfx942 at 304 CUs and
+    /// differ only here. `0` when ROCr declines to answer — a caller treats that
+    /// as "unknown", never as "no memory".
+    pub fn vram_bytes(&self) -> u64 {
+        let mut size: u64 = 0;
+        let st = unsafe {
+            (self.shared.drv.hsa_amd_memory_pool_get_info)(
+                self.vram_pool,
+                HSA_AMD_MEMORY_POOL_INFO_SIZE,
+                &mut size as *mut u64 as *mut c_void,
+            )
+        };
+        if st == HSA_STATUS_SUCCESS {
+            size
+        } else {
+            0
+        }
+    }
+
+    /// The ROCr *interface* version (`HSA_SYSTEM_INFO_VERSION_MAJOR`/`_MINOR`),
+    /// e.g. `1.14`. Note this is not the ROCm release: it is `1.x` on every
+    /// ROCm, so it identifies the ABI a code object was loaded against, not the
+    /// stack it came from.
+    pub fn rocr_version(&self) -> (u16, u16) {
+        self.rocr_version
     }
 
     /// The single ordered queue, as a stream handle.

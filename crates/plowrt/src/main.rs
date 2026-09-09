@@ -2050,6 +2050,26 @@ fn devices(
                 None => "no".into(),
             }
         );
+        // The identity an asset is selected against. Printed here because this
+        // is the report an operator pastes when a bundle refuses to load, and
+        // because a wrong SKU is otherwise invisible until a much later failure.
+        match be.fingerprint() {
+            Some(fp) => println!(
+                "       isa={} sku={} units={} mem={:.1} GiB lds={} KiB regs={} driver={} tuning={}",
+                fp.isa.arch_flag(),
+                fp.sku,
+                fp.units,
+                fp.mem_bytes as f64 / (1u64 << 30) as f64,
+                fp.shared_mem_bytes / 1024,
+                fp.regs_32bit,
+                fp.driver.as_deref().unwrap_or("-"),
+                fp.tuning_path(),
+            ),
+            None => println!(
+                "       no fingerprint — this device is not in the hwspec registry, so no \
+                 compiled asset can be selected for it"
+            ),
+        }
     }
 
     let Some(n) = tp else {
