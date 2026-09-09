@@ -64,6 +64,7 @@ mod qwen35;
 mod test_env;
 use mla::{glm_emit_block, glm_main, kimi_emit_block, nemotron_emit_block, MlaArch};
 mod decode_objects;
+mod dense_cublaslt;
 pub mod dispatch_audit;
 mod gemv_decode_role;
 pub mod manifest;
@@ -3798,6 +3799,7 @@ fn emit_phase(
             && !keqv
             && !fp8
             && !mx4
+            && !emit_config::active().decode_cublaslt
             && gemv_fused_input_fits(amd, t, c.hidden)
             && !emit_config::active().no_fuse_qkv;
         // FUSED Q|K|V, per-channel fp8 (DevOp::GemvQkvFp8, op 115) — the arm the comment above
@@ -4884,7 +4886,9 @@ fn emit_phase(
         // gate/up are COLUMN-parallel (inter_l lanes on this rank); the GLU is elementwise on the
         // rank's own lanes, so no communication. `c_gl` is the dependency feeding down_proj.
         // Same backend-specific bound as `fuse_qkv` above.
-        let glu_fused = gemv_family && gemv_fused_input_fits(amd, t, c.hidden);
+        let glu_fused = gemv_family
+            && gemv_fused_input_fits(amd, t, c.hidden)
+            && !emit_config::active().decode_cublaslt;
         let gemm_glu = !gemv_family && glu_fusion_wins(t, inter_l, c.hidden, n_cu);
         // w8a8: quant the (hidden-width) pre-FF norm output feeding gate/up. Reuses xqh/ash (q/k/v
         // already consumed them; the c_pf→o_proj→flash→qkv chain serializes the reuse). Inert
@@ -6430,7 +6434,11 @@ fn emit_capabilities(model_type: &str) -> EmitCapabilities {
     EmitCapabilities {
         dense_packet_contracts: dense,
         decode_objects: dense || model_type == "qwen3_5",
-        cublaslt_decode: model_type == "qwen3_5",
+        cublaslt_decode: model_type == "qwen3_5"
+            || matches!(
+                model_type,
+                "gemma4" | "gemma4_text" | "gemma4_unified" | "gemma4_unified_text"
+            ),
         decode_ladder: dense || model_type == "gpt_oss",
     }
 }
@@ -7927,6 +7935,13 @@ fn emit_dense_gqa(
             .unwrap_or_else(|error| panic!("decode projection tuning: {error}"));
     // Emit v6 with sections when --embed-cubin/--embed-hsaco given, else v5.
     let mut sections = Vec::new();
+    if ecfg.decode_cublaslt {
+        assert!(
+            !fp8 && !c.moe && !amd,
+            "Gemma cuBLASLt decode requires dense BF16 CUDA"
+        );
+        sections.push(dense_cublaslt::apply(&mut m).expect("Gemma cuBLASLt decode segments"));
+    }
     if ecfg.gemv_decode_role {
         assert!(
             !amd && arch == "sm_90a" && !fp8 && !c.moe && rungs == [1],

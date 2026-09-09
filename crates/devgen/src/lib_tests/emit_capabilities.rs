@@ -20,7 +20,7 @@ fn packet_capabilities_are_explicit() {
         let capabilities = emit_capabilities(model_type);
         assert!(capabilities.dense_packet_contracts);
         assert!(capabilities.decode_objects);
-        assert!(!capabilities.cublaslt_decode);
+        assert_eq!(capabilities.cublaslt_decode, model_type.starts_with("gemma4"));
         assert!(capabilities.decode_ladder);
     }
     let qwen = emit_capabilities("qwen3_5");
@@ -106,7 +106,7 @@ fn cublaslt_emission_rejects_unloadable_combinations() {
     assert!(!cublaslt_emit_supported(qwen, "gfx950", 1, false));
     assert!(!cublaslt_emit_supported(qwen, "sm_90a", 2, false));
     assert!(!cublaslt_emit_supported(qwen, "sm_90a", 1, true));
-    assert!(!cublaslt_emit_supported(
+    assert!(cublaslt_emit_supported(
         emit_capabilities("gemma4"),
         "sm_90a",
         1,

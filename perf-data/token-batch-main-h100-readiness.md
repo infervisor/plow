@@ -670,3 +670,40 @@ tail distributions. Raw waves, quality captures, metrics, frozen server logs and
 verified hashes are in `plow-fp8-packed-occ1-full-qualification.json`,
 `fp8-packed-cached-comparison.json` and `fp8-packed-vs-prior-b4-quality.json`
 under the campaign directory. The compute performance goal remains unmet.
+
+## Experimental Gemma BF16 cuBLASLt decode
+
+The opcode traces identify matrix-vector bodies as the main sampled decode cost:
+about 80% of block-0 cycles for BF16 batch 8 and 75% for FP8 batch 16. These are
+bounded, instrumented single-block samples, not whole-GPU performance counters.
+Nsight Compute did not produce a usable report.
+
+Gemma's existing `--emit-decode-cublaslt=true` compiler option now supports a
+single explicit BF16 decode rung, for example `--emit-decode-batch-ladder=8`.
+It separates Q/K/V and gate/up projections and isolates body GEMV instructions
+for the existing cuBLASLt runtime integration. Segmentation preserves instruction
+operands and dependencies; the LM head keeps its native GEMV. Compilation without
+the option produces a byte-identical BF16 packet.
+
+In a fresh direct-engine diagnostic with a 1K synthetic prompt, 16 warmup steps
+and 64 measured steps, the batch-8 median falls from 76.51 ms to 36.24 ms (2.11×).
+With one active slot, the fixed batch-8 candidate regresses from 28.61 ms to
+31.02 ms. These are decode-step measurements, not serving throughput.
+
+Functional checks pass: 12 matching cold/warm natural completions with expected
+cache reuse, eight concurrent cold 16K requests and exact isolated replays,
+three API lifecycle checks, 32 sampling pairs, and 16 cancelled streams followed
+by exact recovery. Compiler tests cover isolation, unchanged dependencies,
+unsupported combinations, and the existing Qwen cuBLASLt behavior.
+
+Numerics change when replacing fused GEMV bodies with separate BF16 projections
+and cuBLASLt. Initial prefill logits are exact; teacher-forced decode top choices
+agree on 126/128 frames. The minimum full-logit cosine similarity is 0.99970,
+but the maximum absolute difference reaches 1.50. Three of six natural responses
+match the prior Plow path, and two match vLLM; text agreement is not an accuracy
+score. Quality assessment and adaptive decode widths remain necessary before
+default promotion. This option is experimental and does not meet the full goal.
+
+Raw results and hashes are in `gemma-cublaslt-experimental-qualification.json`,
+`gemma-cublaslt-logits-comparison.json`, and
+`gemma-bf16-cublaslt-step-comparison.json` under the campaign directory.
