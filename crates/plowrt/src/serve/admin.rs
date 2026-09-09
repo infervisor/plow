@@ -295,7 +295,18 @@ pub async fn unload(State(state): State<Arc<AppState>>, Json(req): Json<UnloadRe
             Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
         };
         if req.deregister {
+            // Registration and deregistration are ONE lifecycle. Dropping only
+            // the registry entry left the manager holding this slug's assets
+            // dir, checkpoint path and memory plan, so re-registering the slug
+            // against different assets kept the old ones — a new tokenizer
+            // driving old weights, which reads as fluent wrong output rather
+            // than an error.
             let _ = state.registry.unload(&req.model);
+            mgr.deregister(&req.model);
+            state.clear_slug_group(&req.model);
+            // The unload pinned it; with the slug gone there is nothing left to
+            // pin, and a stale pin would refuse a later re-registration.
+            state.set_residency(&req.model, Residency::Auto);
         }
         return Json(UnloadResponse {
             model: req.model,

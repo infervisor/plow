@@ -2498,14 +2498,36 @@ async fn bringup_runtime(
     //
     // The CUDA probe keeps a TYPED handle: the sm_120 engine needs the
     // backend's cooperative-launch surface, which `dyn Backend` erases.
+    // Probe the FIRST REQUESTED device, not device 0. Opening 0 unconditionally
+    // retained a primary context on a GPU `--devices 1` explicitly excluded —
+    // and, worse, left it in the backend list so placement handed it the first
+    // model. The device this opens is a device we intend to use.
     #[cfg(feature = "cuda")]
-    let cuda: Option<Arc<device::cuda::CudaBackend>> = match device::cuda::CudaBackend::new(0) {
-        Ok(b) => Some(Arc::new(b)),
-        Err(e) => {
-            tracing::warn!(%e, "no CUDA backend");
-            None
-        }
-    };
+    let cuda_probe: u8 = RuntimeConfig::get()
+        .devices
+        .first()
+        .copied()
+        .unwrap_or(0)
+        .min(u32::from(u8::MAX)) as u8;
+    #[cfg(feature = "cuda")]
+    let cuda: Option<Arc<device::cuda::CudaBackend>> =
+        match device::cuda::CudaBackend::new(cuda_probe) {
+            Ok(b) => Some(Arc::new(b)),
+            // A device the operator NAMED must not degrade to a CPU fallback:
+            // that answers requests with reference-interpreter output at
+            // fictional speed, which is the failure mode this file already
+            // refuses elsewhere.
+            Err(e) if !RuntimeConfig::get().devices.is_empty() => {
+                return Err(format!(
+                    "--devices names device {cuda_probe}, which will not open: {e}"
+                )
+                .into())
+            }
+            Err(e) => {
+                tracing::warn!(%e, "no CUDA backend");
+                None
+            }
+        };
     #[cfg(feature = "cuda")]
     let backend: Arc<dyn Backend> = match &cuda {
         Some(c) => Arc::clone(c) as Arc<dyn Backend>,
@@ -2710,18 +2732,18 @@ async fn bringup_runtime(
                 .into());
             }
 
+            // STRICTLY the requested set: `--devices 1` must not serve on GPU
+            // 0. The already-open probe backend is reused only if its ordinal
+            // is actually in that set.
+            let probe_ordinal = u32::from(cuda.device_ordinal);
+            let wanted = placement::requested_ordinals(&configured, visible_count);
             let mut backends: Vec<(u32, Arc<device::cuda::CudaBackend>)> =
-                vec![(u32::from(cuda.device_ordinal), Arc::clone(cuda))];
-            let wanted: Vec<u32> = if configured.is_empty() {
-                (1..visible_count).collect()
-            } else {
-                configured
-                    .iter()
-                    .copied()
-                    .filter(|&d| d != u32::from(cuda.device_ordinal))
-                    .collect()
-            };
+                Vec::with_capacity(wanted.len());
             for d in wanted {
+                if d == probe_ordinal {
+                    backends.push((d, Arc::clone(cuda)));
+                    continue;
+                }
                 match device::cuda::CudaBackend::new(d as u8) {
                     Ok(b) => backends.push((d, Arc::new(b))),
                     // Enumerated but not usable. Not a "that was the last one"
@@ -2735,17 +2757,30 @@ async fn bringup_runtime(
                     }
                 }
             }
-            backends.sort_by_key(|(d, _)| *d);
             let visible: Vec<u32> = backends.iter().map(|(d, _)| *d).collect();
-            let capacity = {
-                let (_, total) = cuda.mem_info()?;
-                budget.map(|b| b.min(total)).unwrap_or(total)
-            };
 
             let width = placement::grouping_width(&specs, visible.len())
                 .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
-            let groups = placement::plan_groups(&visible, width, capacity)
+            // Capacity is filled in per group below — a node's cards are not
+            // necessarily the same size, and using device 0's total for all of
+            // them either rejects a model that fits or places one on a card too
+            // small for it and fails at load.
+            let mut groups = placement::plan_groups(&visible, width, 0)
                 .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
+            for group in &mut groups {
+                let mut total_bytes = u64::MAX;
+                for ord in &group.ordinals {
+                    let be = backends
+                        .iter()
+                        .find(|(d, _)| d == ord)
+                        .map(|(_, b)| b)
+                        .expect("group ordinal came from the opened set");
+                    // A TP group is only as large as its smallest member.
+                    total_bytes = total_bytes.min(be.mem_info()?.1);
+                }
+                group.capacity = budget.map(|b| b.min(total_bytes)).unwrap_or(total_bytes);
+            }
+            let groups = groups;
             let layout = placement::assign(&specs, &groups, policy)
                 .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
 
@@ -2762,16 +2797,17 @@ async fn bringup_runtime(
                     .filter(|(i, _)| layout.assignment[*i] == g)
                     .map(|(_, m)| m.clone())
                     .collect();
-                if mine.is_empty() {
-                    tracing::info!(group = g, devices = ?group.ordinals, "placement: group unused");
-                    continue;
-                }
+                // A group with no initial model still gets a manager. Skipping
+                // it left an idle GPU with nothing to address, so a later
+                // `POST /v1/models/load {"device": 1}` answered "no device group
+                // starts at ordinal 1" on a node with a perfectly free card.
                 tracing::info!(
                     group = g,
                     devices = ?group.ordinals,
                     models = ?members,
+                    capacity_gib = group.capacity as f64 / (1u64 << 30) as f64,
                     ?policy,
-                    "placement: group assigned"
+                    "placement: group ready"
                 );
                 let be = backends
                     .iter()

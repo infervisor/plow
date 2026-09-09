@@ -322,6 +322,7 @@ impl ModelManager {
     ) -> Result<ModelManager> {
         let mut managed = Vec::with_capacity(models.len());
         for (slug, dir, ckpt) in models {
+            check_single_device(&slug, &dir)?;
             let plan = BlobPlan::from_dir_with_granularity(&dir, Some(be.granularity()?))?;
             tracing::info!(
                 %slug,
@@ -381,9 +382,24 @@ impl ModelManager {
     /// file read `new` does) so a bad bundle is refused here rather than
     /// halfway through a load. Idempotent for an already-registered slug.
     pub fn register(&self, slug: &str, dir: PathBuf, ckpt: PathBuf) -> Result<()> {
-        if self.manages(slug) {
-            return Ok(());
+        if let Some(existing) = self.managed(slug) {
+            // Idempotent for the SAME bundle, refused for a different one.
+            // Returning Ok here regardless meant a re-register with new assets
+            // kept the old dir, checkpoint and memory plan while the registry
+            // took the new bundle — a new tokenizer driving old weights, which
+            // produces fluent wrong output rather than an error.
+            if existing.dir == dir && existing.ckpt == ckpt {
+                return Ok(());
+            }
+            return Err(RuntimeError::Rejected(format!(
+                "{slug} is already registered from {} (checkpoint {}); unload it with \
+                 \"deregister\": true before registering {} in its place",
+                existing.dir.display(),
+                existing.ckpt.display(),
+                dir.display()
+            )));
         }
+        check_single_device(slug, &dir)?;
         let plan = BlobPlan::from_dir_with_granularity(&dir, Some(self.be.granularity()?))?;
         tracing::info!(
             %slug,
@@ -398,6 +414,26 @@ impl ModelManager {
             plan,
         });
         Ok(())
+    }
+
+    /// Drop `slug` from this manager entirely: its plan, its measured
+    /// overhead and its LRU position.
+    ///
+    /// The engine and mux must already be gone (`unload`). Without this, a
+    /// deregistered slug kept its `Managed` record, so re-registering it with a
+    /// different assets dir silently reused the old checkpoint, packet path and
+    /// memory plan. Registration and deregistration are one lifecycle.
+    pub fn deregister(&self, slug: &str) -> bool {
+        let mut models = self.models.write();
+        let Some(i) = models.iter().position(|m| m.slug == slug) else {
+            return false;
+        };
+        models.remove(i);
+        drop(models);
+        self.overhead.lock().remove(slug);
+        self.last_use.lock().remove(slug);
+        tracing::info!(%slug, "planner: model deregistered");
+        true
     }
 
     /// Every registered slug, in registration order.
@@ -511,18 +547,24 @@ impl ModelManager {
         if !self.manages(slug) {
             return Err(EnsureError::Load(RuntimeError::UnknownModel(slug.into())));
         }
-        if self.is_resident(slug) {
+        // Fast path: resident AND not being taken down. The residency test
+        // belongs here too — mid-unload a model is briefly still resident, and
+        // admitting then would hand the request a mux that is about to vanish.
+        let state = self.state()?;
+        if self.is_resident(slug) && state.residency(slug).admits() {
             self.touch(slug);
             return Ok(());
         }
-        // An explicitly unloaded model must STAY unloaded: demand-loading here
-        // is exactly how an operator's unload would be undone by the next
-        // request to arrive.
-        if !self.state()?.residency(slug).admits() {
-            return Err(EnsureError::Unloaded);
-        }
 
         let _g = self.switch.lock().await;
+        // RE-READ residency under the lock. Checking it before the wait and
+        // never again let a request queued behind an in-flight unload sail past
+        // the check, then demand-load the model the operator had just taken
+        // down — undoing the unload with no trace. An explicitly unloaded model
+        // must STAY unloaded until an explicit load.
+        if !state.residency(slug).admits() {
+            return Err(EnsureError::Unloaded);
+        }
         if self.is_resident(slug) {
             self.touch(slug);
             return Ok(());
@@ -911,6 +953,30 @@ impl ModelManager {
         state.install_mux(m.slug.clone(), mux);
         Ok(())
     }
+}
+
+/// Refuse a bundle compiled for tensor parallelism.
+///
+/// A `ModelManager` owns exactly ONE backend and `GpuEngine::load` takes one
+/// backend, so the CUDA serving engine is single-device. Placement can form a
+/// group several ordinals wide (`--place` sizes groups by the widest declared
+/// TP degree), but only the group's first device would ever be handed to the
+/// engine — so a TP4 bundle would load as if it were TP1: no peer buffers, no
+/// rank wiring, one quarter of the weights, and confident wrong output rather
+/// than an error.
+///
+/// AMD serves TP through `AmdServe`, which is deliberately not under this
+/// manager. Until a CUDA TP engine exists, refusing is the honest answer.
+fn check_single_device(slug: &str, dir: &Path) -> Result<()> {
+    let tp = tp_degree(dir)?;
+    if tp > 1 {
+        return Err(RuntimeError::Rejected(format!(
+            "{slug} declares tensor-parallel degree {tp}, and the CUDA serving engine is \
+             single-device (one backend per engine). Serving it here would load one shard \
+             and answer with it. Compile a TP1 bundle, or serve it on the AMD engine."
+        )));
+    }
+    Ok(())
 }
 
 /// `--co-sched`, refused loudly rather than silently falling back: a

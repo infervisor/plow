@@ -469,6 +469,12 @@ impl AppState {
         self.slug_group.write().insert(slug.to_string(), group);
     }
 
+    /// Forget which group served `slug` (deregistration).
+    #[cfg(feature = "cuda")]
+    pub fn clear_slug_group(&self, slug: &str) {
+        self.slug_group.write().remove(slug);
+    }
+
     /// The group index serving `slug`, when placement assigned one.
     #[cfg(feature = "cuda")]
     pub fn slug_group(&self, slug: &str) -> Option<usize> {

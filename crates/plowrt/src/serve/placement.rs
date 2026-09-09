@@ -208,36 +208,44 @@ pub fn assign(
         if assignment[i] != usize::MAX {
             continue;
         }
-        if m.required > groups[0].capacity {
+        // Groups are NOT interchangeable: a node can mix card sizes, and the
+        // capacity that matters is each group's own. Comparing every model
+        // against `groups[0]` rejected one that fits a larger card, and let
+        // `spread` drop a model onto a card too small to hold it — a startup
+        // failure at load time instead of a placement decision.
+        let fits = |g: usize| m.required <= groups[g].capacity;
+        let biggest = groups.iter().map(|g| g.capacity).max().unwrap_or(0);
+        if !(0..groups.len()).any(fits) {
             return Err(PlacementError::WontFitAnywhere {
                 slug: m.slug.clone(),
                 required: m.required,
-                capacity: groups[0].capacity,
+                capacity: biggest,
             });
         }
+        let emptiest_that_fits = |used: &[u64]| {
+            (0..groups.len())
+                .filter(|&g| fits(g))
+                .min_by_key(|&g| (used[g], g))
+                .expect("checked non-empty above")
+        };
         let g = match policy {
             Place::Explicit => {
                 return Err(PlacementError::MissingDevice {
                     slug: m.slug.clone(),
                 })
             }
-            // Emptiest group wins, ties to the lowest ordinal: with as many
-            // groups as models this puts each on its own device, and past that
-            // it degrades to balanced co-residency rather than piling onto one.
-            Place::Spread => (0..groups.len())
-                .min_by_key(|&g| (used[g], g))
-                .expect("non-empty"),
-            // First group with room, else the emptiest — packing must not fail
-            // outright just because no group has room to spare, since the
-            // manager can still switch models in and out of an oversubscribed
-            // group.
+            // Emptiest group that can hold it, ties to the lowest ordinal: with
+            // as many groups as models this puts each on its own device, and
+            // past that it degrades to balanced co-residency rather than piling
+            // onto one.
+            Place::Spread => emptiest_that_fits(&used),
+            // First group with room to spare, else the emptiest that could hold
+            // it at all — packing must not fail outright just because nothing
+            // has spare room, since the manager still switches models in and
+            // out of an oversubscribed group.
             Place::Pack => (0..groups.len())
-                .find(|&g| used[g] + m.required <= groups[g].capacity)
-                .unwrap_or_else(|| {
-                    (0..groups.len())
-                        .min_by_key(|&g| (used[g], g))
-                        .expect("non-empty")
-                }),
+                .find(|&g| fits(g) && used[g] + m.required <= groups[g].capacity)
+                .unwrap_or_else(|| emptiest_that_fits(&used)),
         };
         assignment[i] = g;
         used[g] += m.required;
@@ -247,6 +255,24 @@ pub fn assign(
         groups: groups.to_vec(),
         assignment,
     })
+}
+
+/// The device ordinals to actually serve on.
+///
+/// `configured` is `--devices`; empty means "every visible device". The result
+/// is sorted and deduplicated, and — the point of the function — contains
+/// ordinal 0 ONLY when it was asked for. plowrt opens a probe device before it
+/// can count devices at all, and building the serving set around that probe
+/// meant `--devices 1` still placed the first model on GPU 0.
+pub fn requested_ordinals(configured: &[u32], visible_count: u32) -> Vec<u32> {
+    let mut wanted: Vec<u32> = if configured.is_empty() {
+        (0..visible_count).collect()
+    } else {
+        configured.to_vec()
+    };
+    wanted.sort_unstable();
+    wanted.dedup();
+    wanted
 }
 
 /// Parse `--pin slug@ordinal` entries into a slug -> ordinal map.
@@ -453,6 +479,79 @@ mod tests {
                 visible: 2
             })
         );
+    }
+
+    /// `--devices 1` must not serve on GPU 0. plowrt has to open some device
+    /// before it can ask how many there are, and the serving set used to be
+    /// built around that probe — so the excluded card got the first model.
+    #[test]
+    fn requested_ordinals_excludes_device_zero_unless_asked_for() {
+        assert_eq!(requested_ordinals(&[1], 4), vec![1]);
+        assert_eq!(requested_ordinals(&[2, 3], 4), vec![2, 3]);
+        // Unset means every visible device, which does include 0.
+        assert_eq!(requested_ordinals(&[], 3), vec![0, 1, 2]);
+        // Sorted and deduplicated, so `--devices 1,1,0` is two devices.
+        assert_eq!(requested_ordinals(&[1, 1, 0], 4), vec![0, 1]);
+    }
+
+    /// A node can mix card sizes. Capacity is per group, and using group 0's
+    /// for all of them rejects a model that fits a bigger card.
+    #[test]
+    fn a_model_too_big_for_group_zero_lands_on_a_group_that_fits_it() {
+        let groups = vec![
+            Group {
+                ordinals: vec![0],
+                capacity: 24 * GIB,
+            },
+            Group {
+                ordinals: vec![1],
+                capacity: 80 * GIB,
+            },
+        ];
+        let models = vec![spec("big", 40 * GIB)];
+        let l = assign(&models, &groups, Place::Spread).unwrap();
+        assert_eq!(l.assignment, vec![1]);
+    }
+
+    /// ...and spread must not drop a model onto a card too small for it just
+    /// because that card is emptier.
+    #[test]
+    fn spread_will_not_place_a_model_on_a_group_that_cannot_hold_it() {
+        let groups = vec![
+            Group {
+                ordinals: vec![0],
+                capacity: 80 * GIB,
+            },
+            Group {
+                ordinals: vec![1],
+                capacity: 24 * GIB,
+            },
+        ];
+        // `small` goes to the empty big card first; `big` then has only group 0
+        // available to it, even though group 1 is emptier.
+        let models = vec![spec("small", 8 * GIB), spec("big", 40 * GIB)];
+        let l = assign(&models, &groups, Place::Spread).unwrap();
+        assert_eq!(l.assignment[1], 0, "big model placed on the 24 GiB card");
+    }
+
+    #[test]
+    fn a_model_larger_than_every_group_reports_the_biggest_one() {
+        let groups = vec![
+            Group {
+                ordinals: vec![0],
+                capacity: 24 * GIB,
+            },
+            Group {
+                ordinals: vec![1],
+                capacity: 80 * GIB,
+            },
+        ];
+        match assign(&[spec("huge", 200 * GIB)], &groups, Place::Spread).unwrap_err() {
+            PlacementError::WontFitAnywhere { capacity, .. } => {
+                assert_eq!(capacity, 80 * GIB, "should quote the LARGEST group")
+            }
+            other => panic!("expected WontFitAnywhere, got {other:?}"),
+        }
     }
 
     #[test]
