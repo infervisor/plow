@@ -491,6 +491,77 @@ for this model; it was simply never requested — the route reports
 `armed=true fires=false`, "opt-in per (backend, family) pair until that pair is
 measured". Measuring that pair is §7c.
 
+## 7c. Throughput, long context, and the levers that did NOT work
+
+Continuing §7b. All arms: 8x MI300X TP8, one lease per group, base re-measured
+where the group allowed it. Run-to-run noise was measured directly — two
+independent servers on the same config gave 52.12 and 52.06 out tok/s (0.1%) —
+so anything under ~1% here is noise, not a result.
+
+### Decode batch ladder 4 -> 8 — the throughput lever
+
+The frozen recipe emits `PLOW_DECODE_BATCH_LADDER=1,2,4` against objects built
+at `PLOW_DECODE_BATCH=4`. At concurrency 8 the admission log shows the widest
+rung reached is **4**, so eight concurrent requests decode in two batches per
+step. Rebuilding at `PLOW_DECODE_BATCH=8` with `PLOW_DECODE_TIERS=1,2,4` and
+emitting the ladder `1,2,4,8`:
+
+| in=4096 | conc | out tok/s | TTFT mean | TPOT med |
+|---|---:|---:|---:|---:|
+| §3 baseline (ladder 4, no tiers) | 4 | 40.52 | 1550 ms | 86.96 |
+| tiers + audit off, ladder 4 | 8 | 43.08 | 10270 ms | 85.81 |
+| **tiers + ladder 8** | **8** | **52.12** | **2511 ms** | 139.40 |
+| tiers + ladder 8 | 16 | 52.54 | 16666 ms | 144.45 |
+
+**Throughput saturates at ~52 tok/s.** Concurrency 16 buys 0.8% over
+concurrency 8 while doubling TPOT, so the knee is at 8 and the ladder is now
+matched to it. Against the §3 row this is **+28.6%**; against the same
+concurrency with the old ladder it is +21.0%.
+
+### The unified token batch — eligible, still unmeasured
+
+`plowrt op-audit` classifies the TP8 decode program `[PACKABLE]`, so the route
+is legal. It still never fires, and the refusal is precise:
+
+```
+capability `token_batch_unsplit_attention`: no prefill bucket in this blob has
+nsplit=1 with a fused flash epilogue
+```
+
+Two conditions, and the recipe defeats both. `PLOW_GLM_PF_NS=2` forces
+nsplit=2, and the fused epilogue is `PLOW_GLM_OFOLD`, which the recipe never
+sets. Setting `PLOW_GLM_PF_NS=1` alone is **not** enough — the route still
+refuses. Setting `PLOW_GLM_OFOLD=1` emits, then refuses at LOAD:
+
+```
+MISSING WEIGHT: model.layers.0.self_attn.derived.o_fold.weight
+```
+
+so the fused epilogue needs a derived tensor `scripts/glm53_prep.py` does not
+write. **The token-batch route is therefore blocked on a checkpoint prep step,
+not on the runtime.** Any earlier number attributed to it is not one: the
+`PLOW_TOKEN_BATCH=1` arms measured 43.38 and 43.11 out tok/s against 43.08 with
+the route inert, which is the route not running.
+
+### Levers that did not work — recorded because they were measured
+
+| lever | result | why |
+|---|---|---|
+| `PLOW_GLM_PF_NS=1` vs `=2` | 43.60 vs 43.08 @4096c8; 33.41 vs 33.67 @8192c8 | noise. The knob earns nothing at these shapes and costs the token-batch precondition — **drop it from the recipe** |
+| Full GEMM tile retune | 43.88 / 52.13 vs 43.88 / 52.12 | **no change.** `plowc tune status` reported all 4043 MI300X records STALE and selection falling back to the analytical model; a fresh campaign published 288 records and took the emit from "228 of 2472 tiles by measurement" to "**all 2472 by measurement**" — and the served numbers did not move. For these shapes the analytical model was already choosing equivalent tiles |
+| `PLOW_GLM_DSA=1` | 52.06 vs 52.12 | **the lever never armed.** `dsa()` requires `ctx > 65536` and this blob is `--max-ctx 18432`, so no `FlashGather`/`Index` op is emitted — verified by disassembling both packets. DSA is a >64k-context feature, not a knob for an 18k deployment. Its crossover constant is also documented as measured at TP4 with an explicit note to recalibrate for TP8 |
+| `GLM_SHARED_CUS` 32 / 48 / 76 | 43.77 / 43.88 / 43.24 | the recipe's 48 is already the best of the three; the MoE CU partition is not where the remaining time is |
+
+### What bounds the rest
+
+§7b's attribution is the answer: GPU drain is 91.6% of a decode token and all
+host work together is 7.8%. Every lever above that worked did so by removing
+GPU work (a narrower decode object, a wider batch per step); every lever that
+failed either never engaged or moved a term that was not the cost. The
+remaining gap to a 50% target is **kernel work on the MoE expert path** — §4's
+ceiling puts those GEMMs at 160-304 TF/s against 1057 on the dense shapes — not
+another knob.
+
 ## 8. Unrelated issue observed
 
 `cargo test -p devgen mla` fails `k3::tests::the_mla_prefill_arm_forces_one_split`
