@@ -1579,6 +1579,69 @@ grouped MoE k-loop against CK/aiter's pipelining (worth 3-7x on what would then 
 wall). Neither is a configuration change, and neither was reachable by the flag search this
 campaign began with.
 
+## 7i. The MoE GEMM is not the constraint — it is 21.6% of the term blamed on it
+
+Everything this document has said about the linear path, including 7h above, derives its GEMM
+rate by dividing the whole `interpreter` segment by the MoE's FLOP count. That segment holds the
+MoE and dense GEMMs, the router, the align op, the gather and scatter, the norms AND the TP
+collectives, so 87.7 TF/s was never a measurement of the GEMM — it was a measurement of all of
+them at once, attributed to one.
+
+`PLOW_MOE_PF_ABL=1` caps the grouped prefill GEMM's k-loop at a single tile. Wrong output by
+construction — it computes a 1/NT slice of each dot product — and it must never touch a serve
+asset, exactly like `PLOW_MLA_PF_ABL` and `PLOW_XR_NOWAIT`. Everything else is still paid:
+staging, routing, epilogue, scatter, collectives. Two objects differing in that one define, same
+packet, same lease, one 70k request each:
+
+```
+                     flash        interp        total
+ full              15,003 ms     8,251 ms     23,254 ms
+ k-loop ablated    14,749 ms     6,471 ms     21,221 ms
+                    -1.7%        -21.6%
+```
+
+The full arm reproduces the 8,254 ms baseline to 3 ms, and flash moves 1.7% — the controls hold.
+
+**The entire MoE k-loop is 1,780 ms of the 8,251 ms linear term.** `down` runs NT=4 so a quarter
+of its inner work survives the cap; gemm1 runs NT=96 so essentially none of its does. Against the
+work actually done,
+
+```
+75 MoE layers x 9 active experts x 3 matrices x 6144 x 2048 x 2 x 70,000 / 8 ranks
+  = 4.459e14 FLOP per rank,  in 1.780 s  =  251 TF/s per rank
+```
+
+which sits inside the 160-304 TF/s band 4 already measured for these exact shapes. **The grouped
+MoE GEMM is performing as expected.** It is not 3-7x off, there is no 4x hiding in its k-loop,
+and the CK port that 7f, 7g and 7h all rank first would, at its theoretical best, remove 1.78 s
+from a 25.6 s prefill — 7%.
+
+This supersedes, in this document alone: 7f's "the binding constraint is the MoE and projection
+GEMM path"; 7g's "the MoE/linear term is 80% of prefill and 87.7 TF/s"; and 7h's entire framing,
+whose MPF_BM result (-5.1%) and chunk-16384 result (+3.3%) are now explained rather than merely
+bounded — both moved a small term, because the term they moved was small.
+
+### Where the 6,471 ms actually is
+
+Not measured individually here, but the candidates are enumerable and two are already on record:
+
+* **the dense projections.** `build.json`'s own dispatch audit flags 21 occupancy findings on
+  this blob, `GemmSmall` shapes filling **10.5% to 42.1%** of their dispatch — e.g.
+  `8192x64x6144 @t8192` at 42.1% (128 tiles over 304 CUs) and `2048x64x6144` at 10.5%. A GEMM
+  that occupies a tenth of the machine is not a kernel-quality problem, it is a shape problem,
+  and the emitter already knows it;
+* **the TP collectives**, two per layer over `[8192, 6144]` bf16 — 100 MB each, ~175 MB per rank
+  per layer of xGMI traffic after the two-shot;
+* **the MoE fixed costs the ablation deliberately keeps**: the align op, the row_token gather,
+  the padded-row scatter and the epilogue, plus `fu_g` — `[65536, 6144]` bf16 of gathered
+  activation written and read back per layer.
+
+The ranked work for this target therefore changes. It is no longer "port CK's grouped GEMM". It
+is: find which of those three owns the 6,471 ms, with the same ablation discipline used here —
+one define, one variable, controls that hold — and attack that. The instrument for the first is
+already in the tree (`PLOW_XR_NOWAIT` prices the collective's synchronization); the occupancy
+findings for the second are already computed on every emit and have simply never been acted on.
+
 ## 8. Unrelated issue observed
 
 `cargo test -p devgen mla` fails `k3::tests::the_mla_prefill_arm_forces_one_split`

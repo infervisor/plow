@@ -674,6 +674,16 @@ if [ "${PLOW_MOE_PF_EPI:-1}" != 0 ]; then
   AX_PREFILL="$AX_PREFILL -DPLOW_MOE_PF_EPI=${PLOW_MOE_PF_EPI:-1}"
 fi
 
+# CEILING INSTRUMENT ONLY (PLOW_MOE_PF_ABL=1): the grouped MoE prefill GEMM with its k-loop
+# capped at one tile (op_moe.h PLOW_MOE_PF_ABL). WRONG OUTPUT by construction, never a serve
+# asset -- the same contract as PLOW_MLA_PF_ABL and PLOW_XR_NOWAIT above. It prices the k-loop
+# against everything else the `interpreter` segment contains (router, gather/scatter, norms,
+# collectives), which is the measurement that decides whether a faster GEMM can carry this
+# target or whether the term is elsewhere.
+if [ "${PLOW_MOE_PF_ABL:-0}" != 0 ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_MOE_PF_ABL=${PLOW_MOE_PF_ABL}"
+fi
+
 # MPF_BM A/B escape hatch for the PREFILL objects (the decode row has carried its MPF_BK twin
 # since the OCC4 recut). The grouped MoE prefill GEMM is the term that binds once attention is
 # sparse -- 11.8 ms per layer per rank, 87.7 TF/s, 3.4% of this part's fp8 peak -- and TP8 is

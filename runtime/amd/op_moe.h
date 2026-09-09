@@ -2118,6 +2118,11 @@ __device__ __forceinline__ double mpf_det_q(float v) {
  * read (rows `rowbase + 0 .. rowbase + MPF_BM-1`, which `d_moe_align_pf` initialises over the
  * whole padded range), the same dwords reach the same elements, and the arithmetic is
  * untouched. DOWN arm only -- GLU passes `row_partidx = row_gate = nullptr`. */
+/* CEILING INSTRUMENT ONLY -- see the note at its use site in d_moe_group_pf_t. Default off. */
+#ifndef PLOW_MOE_PF_ABL
+#define PLOW_MOE_PF_ABL 0
+#endif
+
 #ifndef PLOW_MOE_PF_EPI
 #define PLOW_MOE_PF_EPI 0
 #endif
@@ -2699,8 +2704,23 @@ __device__ void d_moe_group_pf_t(void* __restrict__ Cout, const bf16* __restrict
     const unsigned total_tiles = (unsigned)tilep[n_exp];
     const unsigned tn = (N + NB - 1u) / NB;
     const unsigned n_tiles = total_tiles * tn;
-    const unsigned NT = (K + MPF_BK - 1u) / MPF_BK; /* k-tiles */
-    const unsigned KB = (K + 127u) >> 7;            /* scale blocks along K */
+    /* CEILING INSTRUMENT ONLY (-DPLOW_MOE_PF_ABL=1): cap the k-loop at ONE tile. WRONG OUTPUT
+     * by construction -- it computes a 1/NT slice of each dot product -- and it must never
+     * touch a serve asset. It exists to answer the one question the segment timer cannot:
+     * the `interpreter` segment is 8,254 ms of a 70k prefill and it holds the MoE and dense
+     * GEMMs, the router, the gather/scatter, the norms AND the TP collectives, so a GEMM rate
+     * derived from it is a claim about all of them at once. Ablated minus full is the k-loop's
+     * own share: gemm1 runs NT=96 tiles and `down` NT=4 (K = moe_intermediate/TP = 256), so
+     * the delta is ~99% of gemm1's and ~75% of down's inner work with every fixed cost --
+     * staging, routing, epilogue, collectives -- still paid. That is what decides whether a
+     * faster grouped GEMM can reach this target or whether the term is somewhere else. */
+    const unsigned NT_full = (K + MPF_BK - 1u) / MPF_BK; /* k-tiles */
+#if PLOW_MOE_PF_ABL
+    const unsigned NT = NT_full > 1u ? 1u : NT_full;
+#else
+    const unsigned NT = NT_full;
+#endif
+    const unsigned KB = (K + 127u) >> 7; /* scale blocks along K */
 
 #define MPF_ASM(b) (lds + (b) * MPF_TILE)
 #define MPF_BSM(b) (lds + (b) * MPF_TILE + MPF_BM * MPF_STRIDE)
