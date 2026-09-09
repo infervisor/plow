@@ -1232,6 +1232,67 @@ object's spill from 98 to 287 whether or not a blob ever emits a union table. A 
 against an object built without it reads no `t7` and silently runs dense, which is why the
 control arm below runs the *dense* packet against the *sparse* object.
 
+### Measured: the gather works, and it reached 21 of 78 layers
+
+`PLOW_GLM_DSA_PF=1` packet, `PLOW_DSA_PF=1` objects, everything else the frozen recipe. The
+object build is exactly one define wide — `-DPLOW_DSA_PF_ARM=1` on the four flash rows and
+nothing else — and the ASM contract passed over all 47 objects unchanged, so no bless was
+needed. The register cost the build script warns about (spill 98 -> 287) did not materialise
+here: `interp_flash` went 454/198 to 458/202 VGPR/spill, and the object grew 180 KB to 193 KB.
+
+Segment timing, same 70k request and chunk as the dense table above:
+
+```
+              dense        sparse        delta
+ flash      17,391 ms    12,644 ms      -27.3%
+ interp      8,254 ms    10,926 ms      +32.4%
+            ---------    ---------
+ total      25,645 ms    23,570 ms       -8.1%
+```
+
+End to end at the target cell (70000 in / 700 out, concurrency 20, TP8) that is a wash:
+**18.22 out tok/s sparse against 18.22 dense**, TTFT median 465.2 s against 465.7 s, TPOT 188.4
+against 177.4. Both arms ran in the same lease; the control reproduces the previous lease's
+18.67 to within 2.4%.
+
+The two halves of that table are both worth reading exactly.
+
+**The flash number is a hit, not a miss.** 27.3% of the attention wall disappeared, and 21 of
+GLM-5.3's 78 layers are `indexer_types: "full"` — 26.9%. The gathered layers went essentially
+free. Nothing is wrong with the gather arm; there were simply 57 layers it never applied to.
+
+**The interpreter number is the indexer's own cost**, +2,672 ms, and it grows with `c0` (1,021 ms
+at the first chunk to 1,388 ms at the last) because the lightning indexer's score is itself
+O(T·S) — a small GEMM per key, but still quadratic in the request. That is the term that ate the
+attention saving.
+
+### Why only 21 layers — a predicate that disagrees with its own comment
+
+```rust
+let sparse = glm_dsa_pf_bucket(c, t) && w.iwqb != TENSOR_NONE && nh_l == 8;
+```
+
+`iwqb` is bound only where `indexer_is_full(l)`, so `sparse` is false on every 'shared' layer.
+The comment directly above it says the opposite — that "shared layers reuse the previous full
+layer's union table" and that "`c_uni` threads that reuse". **`c_uni` does not exist**; it appears
+nowhere in the tree but in that sentence. The reuse was documented and never implemented.
+
+The DECODE chain does implement it, and gates the way prefill should:
+
+```rust
+if dsa {
+    d.t[7] = n.iidx; // idx table (this or the last full layer's selection)
+```
+
+keyed on the model-level `dsa`, not on `full`, with `c_sel` pushed into the flash's dep list only
+on full layers — the ordering carried transitively through the residual stream rather than by an
+explicit edge. `n.iuni` is likewise a single buffer, not one per layer, so a shared layer reading
+it costs nothing to produce.
+
+Dropping the `iwqb` requirement (keeping it only to decide which layers RUN the indexer) is
+therefore the free half of the feature: the scoring, top-k and union work is already paid on the
+21 full layers, and the other 57 would gather against a table that is already sitting there.
+
 ## 8. Unrelated issue observed
 
 `cargo test -p devgen mla` fails `k3::tests::the_mla_prefill_arm_forces_one_split`

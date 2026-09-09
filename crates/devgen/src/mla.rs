@@ -4831,12 +4831,34 @@ pub(crate) fn emit_glm_mla_prefill(
     //   routing degrades to dense (the 8-wave kernel ignores t7) rather than corrupting.
     // B2's head-batched gather fills the 64 M-rows with (8 queries x 8 heads); a shard with
     // any other per-rank head count has no row map, so those configs stay dense.
-    let sparse = glm_dsa_pf_bucket(c, t) && w.iwqb != TENSOR_NONE && nh_l == 8;
-    // The indexer chain is emitted on the layers that carry its weights ('full' layers); shared
-    // layers reuse the previous full layer's union table, exactly as the decode chain reuses its
-    // idx. `c_uni` threads that reuse: it is the last emitted union's dep, or the flash's own deps
-    // when no chain has run yet in this program.
-    let c_sel_pf = if sparse {
+    //
+    // GATHER ON EVERY LAYER, not only the ones that own an indexer. `indexer_types` is
+    // ['full','full','full','shared','shared','shared','full',...] — 21 'full' against 57
+    // 'shared' on GLM-5.3 — and a 'shared' layer's whole definition is that it REUSES the
+    // previous full layer's selection. The DECODE chain already gates exactly this way
+    // (`d.t[7] = n.iidx; // idx table (this or the last full layer's selection)`, keyed on `dsa`
+    // and not on `full`); prefill additionally required `w.iwqb != TENSOR_NONE`, which bound it
+    // to the 21 layers whose weights are declared.
+    //
+    // MEASURED, and the ceiling was exactly the layer count: against the dense run's 17,391 ms
+    // of flash over a 70k prefill, gathering 21 of 78 layers took it to 12,644 ms — 27.3% off,
+    // against 26.9% of layers. The gathered layers go nearly free; there were just too few.
+    // The indexer chain still runs ONLY where the weights are (`sel_here`), so extending the
+    // gather to the shared layers adds no scoring, no top-k and no union work — its whole cost
+    // is already paid. docs/amd/tp-bringup-mi300x.md 7g.
+    let sparse = glm_dsa_pf_bucket(c, t) && nh_l == 8;
+    // Whether THIS layer owns an indexer and so writes `n.iuni`; the shared layers read whatever
+    // the last full layer left there. One buffer, not one per layer — that is what makes the
+    // reuse free rather than merely cheap.
+    //
+    // ORDERING IS TRANSITIVE, not assumed. A shared layer's flash depends on its own input norm,
+    // which depends on the previous layer's residual, which depends on that layer's flash — so
+    // every union write precedes every reader through the residual stream, and layer 0 is 'full'
+    // so a write always precedes the first read. This is the same argument the decode chain makes
+    // ("sequential layer chain => n.iidx already holds it"), which likewise pushes `c_sel` into
+    // the flash's dep list only on full layers.
+    let sel_here = sparse && w.iwqb != TENSOR_NONE;
+    let c_sel_pf = if sel_here {
         Some(emit_glm_dsa_prefill_select(
             b,
             c,
