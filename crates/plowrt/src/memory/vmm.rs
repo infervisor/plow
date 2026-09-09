@@ -474,6 +474,11 @@ impl LiveKvLayout {
         blob: &crate::asset::devblob::DevBlob,
         m: &plow_asset::live_kv::Manifest,
     ) -> Result<Self> {
+        if m.caches.iter().any(|cache| cache.scales.is_some()) {
+            return Err(RuntimeError::Rejected(
+                "LIVE allocator FP8 scale ownership is not implemented".into(),
+            ));
+        }
         let mut full_tensors = Vec::new();
         let mut ring_tensors = Vec::new();
         let mut cache_tensors = Vec::new();
@@ -1998,6 +2003,56 @@ mod tests {
             blob.with_packet_view(|p| plow_asset::live_kv::program_digest(&p.programs[1]));
         assert!(blob.with_packet_view(|p| bad.validate(p)).is_err());
     }
+    #[test]
+    fn fp8_manifest_validation_does_not_enable_unimplemented_live_scale_ownership() {
+        use crate::asset::devblob::DevTensor;
+        use packet::dev::DevOp;
+        let mut blob = live_blob();
+        for h in [1, 2] {
+            blob.tensors[h].bytes /= 2;
+        }
+        for name in ["cache.key.scale", "cache.value.scale"] {
+            blob.tensors.push(DevTensor {
+                name: name.into(),
+                bytes: 4 * 1024 * 4,
+                init: None,
+            });
+        }
+        for p in &mut blob.progs {
+            for d in &mut p.insts {
+                match DevOp::from_u16(d.op).unwrap() {
+                    DevOp::HeadNormRope => {
+                        d.op = DevOp::HeadNormRopeFp8 as u16;
+                        d.t[6] = if d.t[0] == 1 { 4 } else { 5 };
+                    }
+                    DevOp::FlashPrefill | DevOp::FlashDecode => {
+                        d.op = if d.op == DevOp::FlashPrefill as u16 {
+                            DevOp::FlashPrefillFp8 as u16
+                        } else {
+                            DevOp::FlashDecodeFp8 as u16
+                        };
+                        d.t[6..8].copy_from_slice(&[4, 5]);
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+        let manifest = blob.with_packet_view(plow_asset::live_kv::emit).unwrap();
+        assert_eq!(manifest.version, 2);
+        assert_eq!(manifest.caches[0].scales, Some([4, 5]));
+        for operand in [6, 7] {
+            let saved = blob.progs[0].insts[2].t[operand];
+            blob.progs[0].insts[2].t[operand] = if operand == 6 { 5 } else { 4 };
+            assert!(blob.with_packet_view(plow_asset::live_kv::emit).is_err());
+            blob.progs[0].insts[2].t[operand] = saved;
+        }
+        let error = LiveKvLayout::from_manifest(&blob, &manifest)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("FP8 scale ownership"));
+    }
+
     #[test]
     fn sliding_only_manifest_is_valid_but_allocator_limitation_is_explicit() {
         let mut blob = live_blob();

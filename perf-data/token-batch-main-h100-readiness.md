@@ -1299,3 +1299,25 @@ golden, decode-ladder and MXFP4 tests before the unsupported AMD fixture failed;
 the corrected packed matrix and remaining tuned-tile tests passed separately.
 AMD device validation, packed NVIDIA FP8-KV execution, model quality and sustained
 production SLO/performance qualification remain open.
+
+## Shared FP8-KV access contract
+
+The shared LIVE KV manifest now describes E4M3 caches and their per-row F32 K/V
+scales. Version2 validates exact tensor extents, scale ownership, encoding,
+ring/position geometry and complete reader/writer coverage across all rungs.
+BF16 manifests retain version1 and omit scale fields. Unrelated operations and
+generators cannot alias scale tensors. AMD's direct BF16 GEMM tile variants are
+also audited; the contract has no backend or model-family whitelist.
+
+Six actual two-layer Gemma31-shape emits pass: AMD gfx942 and NVIDIA sm_90a,
+each with BF16, all-layer FP8 and full-attention-only FP8 KV. Every default
+decode rung and prefill128/512/1024 is retained. These structural emits have no
+weights; they add no GPU numerical or performance claim.
+
+Validation:88 asset unit tests and10 integration tests;648 runtime host tests
+with22 ignored;20 compiler integration tests; final focused6 asset and44 VMM
+tests; independent HSA-only and CUDA-only all-target checks. Logs are campaign
+fp8-live-contract-*.log. The old LIVE allocator explicitly rejects FP8 scale
+ownership until its allocation path supports it. Packed compiler, runtime and
+kernel execution gates remain closed for FP8 KV. The sealed checkpoint is
+unchanged. This contract is a prerequisite for unified FP8-KV execution.

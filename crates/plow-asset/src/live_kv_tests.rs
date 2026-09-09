@@ -12,6 +12,81 @@ fn inst(op: DevOp) -> DevInst64 {
     }
 }
 
+fn fp8_cache(insts: &mut Vec<DevInst64>, tensors: &mut Vec<Tensor<'_>>) {
+    for h in [2, 3] {
+        tensors[h].bytes /= 2;
+    }
+    for name in ["kv.k.scale", "kv.v.scale"] {
+        tensors.push(Tensor {
+            name,
+            bytes: 32,
+            initialized: false,
+        });
+    }
+    insts[0].op = DevOp::FlashDecodeFp8 as u16;
+    insts[0].t[6..8].copy_from_slice(&[7, 8]);
+    for (d, scale) in insts[1..].iter_mut().zip([7, 8]) {
+        d.op = DevOp::HeadNormRopeFp8 as u16;
+        d.t[6] = scale;
+    }
+}
+
+#[test]
+fn fp8_cache_requires_exact_scale_ownership_and_extents() {
+    validate_all(None, fp8_cache).unwrap();
+    let mutations: &[fn(&mut Vec<DevInst64>, &mut Vec<Tensor<'_>>)] = &[
+        |_, ts| ts[7].bytes -= 4,
+        |_, ts| ts[8].bytes += 4,
+        |_, ts| ts[7].initialized = true,
+        |_, ts| ts[2].bytes *= 2,
+        |ds, _| ds[0].t[6] = 8,
+        |ds, _| ds[0].t[7] = TENSOR_NONE16,
+        |ds, _| ds[0].t[6] = 2,
+        |ds, _| ds[1].t[6] = 8,
+        |ds, _| ds[2].t[6] = 7,
+        |ds, _| ds[1].t[6] = TENSOR_NONE16,
+        |ds, _| ds[1].op = DevOp::HeadNormRope as u16,
+        |ds, _| ds[0].op = DevOp::FlashDecode as u16,
+        |ds, _| ds[1].fj[1] *= 2,
+        |ds, _| ds[1].t[5] = 7,
+        |ds, _| ds[1].t[7] = 8,
+        |ds, _| ds[1].t[0] = 7,
+    ];
+    for (i, mutate) in mutations.iter().enumerate() {
+        assert!(
+            validate_all(None, |ds, ts| {
+                fp8_cache(ds, ts);
+                mutate(ds, ts);
+            })
+            .is_err(),
+            "mutation {i}"
+        );
+    }
+    for op in [
+        DevOp::Gemm,
+        DevOp::GemmMed,
+        DevOp::GemmSmall,
+        DevOp::GemmWide,
+        DevOp::GemmC5,
+        DevOp::GemvFp8,
+        DevOp::HeadNormRope,
+        DevOp::Residual,
+    ] {
+        for operand in 0..8 {
+            assert!(
+                validate_all(None, |ds, ts| {
+                    fp8_cache(ds, ts);
+                    let mut d = inst(op);
+                    d.t[operand] = 7;
+                    ds.push(d);
+                })
+                .is_err(),
+                "{op:?} operand {operand}"
+            );
+        }
+    }
+}
+
 #[test]
 fn fp8_direct_operands_cannot_alias_cache() {
     for op in [
