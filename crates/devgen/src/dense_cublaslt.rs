@@ -3,10 +3,22 @@ use packet::devbuild::{Builder, Model, SectionData, SECT_METADATA};
 use plow_asset::segment_roles::{CUBLASLT, INTERPRETER, SECTION};
 
 pub(crate) fn apply(model: &mut Model) -> Result<SectionData, String> {
-    let index = packet::devbuild::decode_rung_lo(&model.prog_t);
-    if index + 1 != model.progs.len() {
-        return Err("Gemma cuBLASLt currently requires one explicit decode rung".into());
+    let mut programs = Vec::new();
+    for index in packet::devbuild::decode_rung_lo(&model.prog_t)..model.progs.len() {
+        let roles = apply_program(model, index)?;
+        programs.push(serde_json::json!({"index": index, "roles": roles}));
     }
+    Ok(SectionData {
+        kind: SECT_METADATA,
+        name: SECTION.into(),
+        data: serde_json::to_vec(&serde_json::json!({
+            "version": 1, "objects": {}, "programs": programs
+        }))
+        .map_err(|e| e.to_string())?,
+    })
+}
+
+fn apply_program(model: &mut Model, index: usize) -> Result<Vec<u8>, String> {
     let dependencies = plow_asset::program::with_model(model, |packet| {
         plow_asset::splitk::dependencies(&packet.programs[index])
     })?;
@@ -86,14 +98,7 @@ pub(crate) fn apply(model: &mut Model) -> Result<SectionData, String> {
         roles[segment] = CUBLASLT;
     }
     model.progs[index] = program;
-    Ok(SectionData {
-        kind: SECT_METADATA,
-        name: SECTION.into(),
-        data: serde_json::to_vec(&serde_json::json!({
-            "version": 1, "objects": {}, "programs": [{"index": index, "roles": roles}]
-        }))
-        .map_err(|e| e.to_string())?,
-    })
+    Ok(roles)
 }
 
 #[cfg(test)]
@@ -101,9 +106,13 @@ mod tests {
     use super::*;
 
     fn model() -> Model {
+        model_rows(&[128, 8])
+    }
+
+    fn model_rows(widths: &[u32]) -> Model {
         let mut programs = Vec::new();
         let mut tensors = Vec::new();
-        for rows in [128, 8] {
+        for &rows in widths {
             let mut b = Builder::new(2);
             b.force_uniseg();
             let input = b.tensor("act.x", 128 * 64 * 2);
@@ -127,7 +136,7 @@ mod tests {
             target: 0,
             tensors,
             progs: programs,
-            prog_t: vec![128, 8],
+            prog_t: widths.to_vec(),
             gen: Vec::new(),
             kv_row_insts: vec![1],
         }
@@ -173,13 +182,18 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unqualified_ladders_and_nonordinary_operands() {
+    fn emits_each_decode_width_and_rejects_nonordinary_operands() {
+        let mut ladder = model_rows(&[128, 1, 4, 8]);
+        let metadata = apply(&mut ladder).unwrap();
+        let metadata = plow_asset::segment_roles::SegmentRoles::from_bytes(&metadata.data).unwrap();
+        assert_eq!(metadata.programs.len(), 3);
+        for (index, program) in metadata.programs.iter().enumerate() {
+            assert_eq!(program.index, index + 1);
+            assert_eq!(program.roles, [INTERPRETER, CUBLASLT, INTERPRETER]);
+        }
         let mut m = model();
         m.prog_t = vec![1, 8];
-        assert!(apply(&mut m)
-            .err()
-            .unwrap()
-            .contains("one explicit decode rung"));
+        assert!(apply(&mut m).err().unwrap().contains("ordinary BF16"));
         let mut m = model();
         m.progs[1].insts[1].i[4] = 1;
         assert!(apply(&mut m).err().unwrap().contains("ordinary BF16"));

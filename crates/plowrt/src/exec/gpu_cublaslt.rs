@@ -20,18 +20,18 @@ pub(super) struct CublasLtDecodeRoute {
 }
 
 pub(super) fn prepare_routes(
-    be: &Arc<CudaBackend>,
+    lt: &Arc<crate::device::cuda::lt::Lt>,
     segments: Vec<Option<DecodeSegment>>,
     insts: &mut [DevInst64],
     devp: &[DeviceMem],
+    templates: Option<&[Option<CublasLtDecodeRoute>]>,
 ) -> Result<Vec<Option<CublasLtDecodeRoute>>> {
     let mut routes = Vec::new();
     if segments.is_empty() {
         return Ok(routes);
     }
-    let lt = crate::device::cuda::lt::Lt::load(be)?;
     let mut plans = std::collections::HashMap::new();
-    for segment in segments {
+    for (index, segment) in segments.into_iter().enumerate() {
         let route = if let Some(segment) = segment {
             let d = &mut insts[segment.instruction];
             let key = (segment.m, segment.n, segment.k);
@@ -58,7 +58,22 @@ pub(super) fn prepare_routes(
             let plan = match plans.entry(key) {
                 std::collections::hash_map::Entry::Occupied(e) => Arc::clone(e.get()),
                 std::collections::hash_map::Entry::Vacant(e) => {
-                    Arc::clone(e.insert(lt.plan(key.0, key.1, key.2, weight)?))
+                    let template = templates
+                        .map(|routes| {
+                            routes.get(index).and_then(Option::as_ref).ok_or_else(|| {
+                                RuntimeError::Rejected(
+                                    "cuBLASLt rung template route missing".into(),
+                                )
+                            })
+                        })
+                        .transpose()?;
+                    Arc::clone(e.insert(lt.plan(
+                        key.0,
+                        key.1,
+                        key.2,
+                        weight,
+                        template.map(|r| r.plan.as_ref()),
+                    )?))
                 }
             };
             d.op = DevOp::Nop as u16;
@@ -80,6 +95,57 @@ pub(super) fn prepare_routes(
         "cuBLASLt decode routes prepared"
     );
     Ok(routes)
+}
+
+pub(super) struct CublasLtDecodeGraph {
+    be: Arc<CudaBackend>,
+    graph: Option<crate::device::cuda::GraphExec>,
+    _routes: Vec<Option<CublasLtDecodeRoute>>,
+}
+
+impl CublasLtDecodeGraph {
+    pub(super) fn capture(
+        be: &Arc<CudaBackend>,
+        stream: &CudaStream,
+        base: DevProgram,
+        function: KernelFn,
+        grid: u32,
+        smem: u32,
+        routes: Vec<Option<CublasLtDecodeRoute>>,
+    ) -> Result<Self> {
+        let graph = be.graph_capture(stream, || {
+            for (seg, route) in routes.iter().enumerate() {
+                if let Some(route) = route {
+                    route
+                        .plan
+                        .run(route.input, route.weight, route.output, stream)?;
+                }
+                let mut arg = base;
+                segment_window(&mut arg, &base, seg, false);
+                let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
+                be.launch_cooperative(function, grid, BLOCK, smem, &mut params, Some(stream))?;
+            }
+            Ok(())
+        })?;
+        Ok(Self {
+            be: Arc::clone(be),
+            graph: Some(graph),
+            _routes: routes,
+        })
+    }
+
+    pub(super) fn launch(&self, stream: &CudaStream) -> Result<()> {
+        self.be
+            .graph_launch(self.graph.as_ref().expect("captured decode graph"), stream)
+    }
+}
+
+impl Drop for CublasLtDecodeGraph {
+    fn drop(&mut self) {
+        if let Some(graph) = self.graph.take() {
+            self.be.graph_destroy(graph);
+        }
+    }
 }
 
 impl GpuEngine {

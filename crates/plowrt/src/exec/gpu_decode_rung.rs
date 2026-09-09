@@ -2,6 +2,7 @@ use super::*;
 use packet::dev::ROPE_PAIR_HALF;
 
 pub(super) struct DecodeRung {
+    pub(super) library: Option<super::gpu_cublaslt::CublasLtDecodeGraph>,
     pub(super) rows: usize,
     pub(super) object: Option<Arc<BoundDecodeObject>>,
     pub(super) kernarg: DevProgram,
@@ -42,6 +43,62 @@ pub(super) fn effective_decode_widths(
 }
 
 pub(super) fn validate_decode_ladder(blob: &DevBlob) -> Result<bool> {
+    validate_decode_ladder_impl(blob, false)
+}
+
+pub(super) fn validate_cublaslt_ladder(blob: &DevBlob, metadata: &SegmentRoles) -> Result<bool> {
+    if blob.decode_progs().len() < 2 {
+        return Ok(false);
+    }
+    let start = blob.progs.len() - blob.decode_progs().len();
+    let mut previous_roles = None;
+    for (index, program) in blob.progs.iter().enumerate().skip(start) {
+        let roles = &metadata
+            .program(index)
+            .ok_or_else(|| {
+                RuntimeError::Rejected(
+                    "cuBLASLt ladder requires roles for every decode width".into(),
+                )
+            })?
+            .roles;
+        if !roles.contains(&plow_asset::segment_roles::CUBLASLT)
+            || previous_roles.is_some_and(|previous| previous != roles)
+        {
+            return Err(RuntimeError::Rejected(
+                "cuBLASLt ladder projection roles differ".into(),
+            ));
+        }
+        packet_role_segments(program, roles, &blob.tensors)?;
+        previous_roles = Some(roles);
+    }
+    blob.with_packet_view(|packet| {
+        let mut previous = None;
+        for program in &packet.programs[start..] {
+            let mut stream = program.stream.to_vec();
+            let mut queue = program.gq_stream.to_vec();
+            for entry in stream.iter_mut().chain(&mut queue) {
+                entry.seg = 0;
+            }
+            let window = [0, queue.len() as u32];
+            let normalized = plow_asset::program::Program {
+                stream: &stream,
+                gq_stream: &queue,
+                gq_seg_ofs: &window,
+                ..*program
+            };
+            let dependencies = plow_asset::splitk::dependencies(&normalized)?;
+            if previous.as_ref().is_some_and(|old| old != &dependencies) {
+                return Err("cuBLASLt ladder dependencies differ".to_string());
+            }
+            previous = Some(dependencies);
+        }
+        Ok(())
+    })
+    .map_err(RuntimeError::Rejected)?;
+    validate_decode_ladder_impl(blob, true)
+}
+
+fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool) -> Result<bool> {
     let splitk = blob
         .with_packet_view(plow_asset::splitk::validate)
         .map_err(RuntimeError::Rejected)?;
@@ -89,7 +146,8 @@ pub(super) fn validate_decode_ladder(blob: &DevBlob) -> Result<bool> {
     }
     // Optional placed, segmented and opaque programs retain the existing widest path.
     if programs.iter().any(|g| {
-        g.l2_domains != 0 || g.gq_seg_ofs.len() != 2 || g.check_coarse_single_segment().is_err()
+        g.l2_domains != 0
+            || (!segmented && (g.gq_seg_ofs.len() != 2 || g.check_coarse_single_segment().is_err()))
     }) {
         return Ok(false);
     }
@@ -359,6 +417,15 @@ impl DecodeRung {
         g: &crate::asset::devblob::DevProg,
         base: DevProgram,
     ) -> Result<Self> {
+        Self::upload_with_insts(be, g, base, &g.insts)
+    }
+
+    pub(super) fn upload_with_insts(
+        be: &CudaBackend,
+        g: &crate::asset::devblob::DevProg,
+        base: DevProgram,
+        insts: &[DevInst64],
+    ) -> Result<Self> {
         let upload = |bytes: &[u8]| -> Result<DeviceMem> {
             let mem = be.alloc(0, bytes.len().max(4) as u64)?;
             if !bytes.is_empty() {
@@ -367,7 +434,7 @@ impl DecodeRung {
             Ok(mem)
         };
         let tables = vec![
-            upload(pod_bytes(&g.insts))?,
+            upload(pod_bytes(insts))?,
             upload(pod_bytes(&g.stream))?,
             upload(pod_bytes(&g.stream_ofs))?,
             upload(pod_bytes(&g.stream_len))?,
@@ -377,7 +444,7 @@ impl DecodeRung {
             upload(pod_bytes(&g.gq_seg_ofs))?,
         ];
         let cursor_offset = (g.n_counter as usize * CTR_STRIDE as usize * 4).max(4);
-        let counter_bytes = cursor_offset + CTR_STRIDE as usize * 4;
+        let counter_bytes = cursor_offset + (g.gq_seg_ofs.len() - 1) * CTR_STRIDE as usize * 4;
         let counters = be.alloc(0, counter_bytes as u64)?;
         let kernarg = DevProgram {
             insts: tables[0].base,
@@ -393,6 +460,7 @@ impl DecodeRung {
             ..base
         };
         Ok(Self {
+            library: None,
             rows: g.t as usize,
             object: None,
             kernarg,

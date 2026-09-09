@@ -678,8 +678,8 @@ about 80% of block-0 cycles for BF16 batch 8 and 75% for FP8 batch 16. These are
 bounded, instrumented single-block samples, not whole-GPU performance counters.
 Nsight Compute did not produce a usable report.
 
-Gemma's existing `--emit-decode-cublaslt=true` compiler option now supports a
-single explicit BF16 decode rung, for example `--emit-decode-batch-ladder=8`.
+Gemma's existing `--emit-decode-cublaslt=true` compiler option supports BF16
+decode widths, for example `--emit-decode-batch-ladder=1,2,4,8`.
 It separates Q/K/V and gate/up projections and isolates body GEMV instructions
 for the existing cuBLASLt runtime integration. Segmentation preserves instruction
 operands and dependencies; the LM head keeps its native GEMV. Compilation without
@@ -720,3 +720,34 @@ C4/C8 cells but regresses in all three C1 cells. At 1K/C8 it rises from 84.25 to
 All cells are in `gemma31-h100-bf16-cublaslt-preflight.csv`; raw comparison is
 `gemma-bf16-cublaslt-serving-comparison.json` in the campaign directory. These
 single-wave results support investigating adaptive widths, not default promotion.
+
+## Adaptive cuBLASLt decode widths
+
+The compiler emits projection roles for every requested width. The CUDA loader
+checks role coverage, matching dependencies, instruction equivalence and KV
+addressing before selecting a narrower graph. Each graph owns its route plans
+and instruction tables; the plans share one 256 MiB workspace on the ordered
+engine stream. Counter storage includes a separate cursor for every segment.
+
+Narrower plans reuse the widest projection's algorithm after a cuBLASLt geometry
+and workspace compatibility check. Independently tuning each width changed
+reduction order and failed the sparse-slot numerical check, reaching a 6.5
+absolute logit difference. Reusing algorithms restores exact full-logit equality
+in the 78-frame transition screen. The test covers widths 1/2/4/8, reversed and
+sparse slot lists, repeated transitions, slot reset, prompt continuation, and
+retirement of lower slots while the highest slot continues decoding.
+
+The transition test reuses the same loaded plans to isolate width selection from
+load-time autotuning. A separate 128-frame natural-prompt capture at 1K and 16K
+also matches the earlier fixed-width cuBLASLt reference exactly. The full runtime
+host suite passes 596 tests, with 17 device/asset-dependent tests ignored; the
+78-frame GPU test is run explicitly. All seven CUDA objects compile successfully.
+
+These results do not establish equality with native GEMV or vLLM;
+the existing cuBLASLt numerical differences and model-quality caveat still apply.
+Adaptive serving qualification and performance measurements remain pending.
+The option remains experimental and is not enabled by default.
+
+Raw results and artifact hashes are in
+`cublaslt-ladder-experimental-qualification.json`, `cublaslt-ladder-exact-gpu.log`
+and `cublaslt-ladder-shared-natural-comparison.json` in the campaign directory.

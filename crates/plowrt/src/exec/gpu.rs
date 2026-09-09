@@ -58,8 +58,8 @@ mod gpu_mixed_step;
 mod gpu_packed_terminal;
 use gpu_cublaslt::CublasLtDecodeRoute;
 use gpu_decode_rung::{
-    decode_rung_index, decode_selection, effective_decode_widths, validate_decode_ladder,
-    DecodeRung, DecodeSelection,
+    decode_rung_index, decode_selection, effective_decode_widths, validate_cublaslt_ladder,
+    validate_decode_ladder, DecodeRung, DecodeSelection,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -637,8 +637,9 @@ impl SegmentRoleValidation for SegmentRoles {
                     && p.roles.contains(&plow_asset::segment_roles::GEMV_CTA512))
                 || (object_decode && library_decode)
                 || (decode
-                    && (p.index + 1 != programs.len()
-                        || programs.len() != prefill.len() + 1
+                    && ((!library_decode
+                        && (p.index + 1 != programs.len()
+                            || programs.len() != prefill.len() + 1))
                         || (!object_decode && !library_decode)
                         || (object_decode && g.t != 1)
                         || p.roles.iter().any(|&role| {
@@ -2702,7 +2703,16 @@ impl GpuEngine {
             )?;
         }
         let single_bound_decode = decode_objects.is_some() && blob.decode_progs().len() == 1;
-        let mut select_decode_rungs = single_bound_decode || validate_decode_ladder(&blob)?;
+        let mut select_decode_rungs = if cublaslt_enabled {
+            if decode_objects.is_some() || prepared_contexts.is_some() {
+                return Err(RuntimeError::Rejected(
+                    "cuBLASLt decode cannot use decode objects or context variants".into(),
+                ));
+            }
+            validate_cublaslt_ladder(&blob, segment_roles.as_ref().expect("library roles"))?
+        } else {
+            single_bound_decode || validate_decode_ladder(&blob)?
+        };
         if recurrent.is_some() {
             let config = RuntimeConfig::get();
             if prefix_requested || config.nv.prefix_cache {
@@ -3625,8 +3635,15 @@ impl GpuEngine {
             kvrow.clear();
             tracing::info!("decode: dynamic B=1 KV row — immutable instruction stream");
         }
-        let cublaslt_decode =
-            gpu_cublaslt::prepare_routes(&be, cublaslt_segments, &mut insts, &devp)?;
+        // Rung graphs run serially on the engine stream and share one Lt workspace.
+        let cublaslt = cublaslt_enabled
+            .then(|| crate::device::cuda::lt::Lt::load(&be))
+            .transpose()?;
+        let cublaslt_decode = if let Some(lt) = &cublaslt {
+            gpu_cublaslt::prepare_routes(lt, cublaslt_segments, &mut insts, &devp, None)?
+        } else {
+            Vec::new()
+        };
         let d_inst = upload_pod(pod_bytes(&insts))?;
         let d_stream = upload_pod(pod_bytes(&g.stream))?;
         let d_sofs = upload_pod(pod_bytes(&g.stream_ofs))?;
@@ -3682,12 +3699,32 @@ impl GpuEngine {
             token_batch: 0,
         };
 
-        let decode_rungs = if select_decode_rungs && !cublaslt_enabled {
+        let stream = be.stream_create()?;
+        let decode_rungs = if select_decode_rungs {
             blob.decode_progs()[..blob.decode_progs().len() - 1]
                 .iter()
                 .enumerate()
                 .map(|(index, g)| {
-                    let mut rung = DecodeRung::upload(&be, g, kernarg)?;
+                    let mut rung = if let Some(lt) = &cublaslt {
+                        let roles = &segment_roles
+                            .as_ref()
+                            .unwrap()
+                            .program(blob.progs.len() - blob.decode_progs().len() + index)
+                            .unwrap()
+                            .roles;
+                        let segments = gpu_cublaslt::decode_segments(g, &blob.tensors, roles)?;
+                        let mut insts = g.insts.clone();
+                        let routes = gpu_cublaslt::prepare_routes(
+                            lt, segments, &mut insts, &devp, Some(&cublaslt_decode),
+                        )?;
+                        let mut rung = DecodeRung::upload_with_insts(&be, g, kernarg, &insts)?;
+                        rung.library = Some(gpu_cublaslt::CublasLtDecodeGraph::capture(
+                            &be, &stream, rung.kernarg, f, grid, smem, routes,
+                        )?);
+                        rung
+                    } else {
+                        DecodeRung::upload(&be, g, kernarg)?
+                    };
                     if let (Some(metadata), Some(objects)) = (&decode_objects, &bound_objects) {
                         rung.object = Some(Arc::clone(&objects[&metadata.programs[index].object]));
                         tracing::info!(
@@ -4204,7 +4241,6 @@ impl GpuEngine {
         // The engine's ordered device queue + pinned per-step staging + the
         // flag-gated (`--step-time` / PLOW_STEP_TIME=1) CUDA-event timing
         // (plan stage 1: async submission path).
-        let stream = be.stream_create()?;
         let stage = StepStage::new(&be, batch, recurrent.is_some())?;
         let h2d_ev = be.event_create(false)?;
         let timing = match crate::config::RuntimeConfig::get().nv.step_time {
@@ -5765,6 +5801,9 @@ impl GpuEngine {
 
     fn launch_selected_decode(&mut self, selection: DecodeSelection) -> Result<()> {
         if let Some(r) = self.selected_decode(selection) {
+            if let Some(library) = &r.library {
+                return library.launch(&self.stream);
+            }
             let mut arg = r.kernarg;
             let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
             let object = r.object.as_deref();
@@ -7932,6 +7971,7 @@ impl Drop for GpuEngine {
             report(&e, "synchronize at engine unload");
         }
         drop(self.decode_contexts.take());
+        self.decode_rungs.clear();
         drop(self.qwen_prefill.take());
         if let Some(m) = self.module_pf.take() {
             if let Err(e) = self.be.module_unload(&m) {
