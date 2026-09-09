@@ -78,6 +78,7 @@ pub const H100_SXM5: GpuSpec = GpuSpec {
     chiplet: None, // Monolithic GH100 die.
     l2_partitioning: Some(GH100_L2),
     clock_boost: Hertz::from_mhz(1980),
+    soc: None,
 };
 
 /// H200 SXM — Hopper GH100 with 141 GiB HBM3e and 4.8 TB/s memory bandwidth.
@@ -107,6 +108,7 @@ pub const H200_SXM: GpuSpec = GpuSpec {
     chiplet: None,
     l2_partitioning: Some(GH100_L2),
     clock_boost: Hertz::from_mhz(1830),
+    soc: None,
 };
 
 /// H100 PCIe — 114 SMs, 80 GiB HBM2e, ~2.0 TB/s, lower boost clock.
@@ -137,6 +139,7 @@ pub const H100_PCIE: GpuSpec = GpuSpec {
     chiplet: None, // Monolithic GH100 die.
     l2_partitioning: Some(GH100_L2),
     clock_boost: Hertz::from_mhz(1755),
+    soc: None,
 };
 
 /// H100 NVL (per-GPU of the paired board) — 132 SMs, 94 GiB HBM3e, ~3.9 TB/s.
@@ -167,4 +170,5 @@ pub const H100_NVL: GpuSpec = GpuSpec {
     chiplet: None, // Monolithic GH100 die.
     l2_partitioning: Some(GH100_L2),
     clock_boost: Hertz::from_mhz(1785),
+    soc: None,
 };

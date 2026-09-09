@@ -92,7 +92,7 @@ pub fn class_of(op: DevOp) -> RowClass {
         // elementwise, quantization, argmax, the collectives, and the whole MoE routing /
         // grouping / combine chain, whose row maps are built from the batch it is given.
         Nop | RmsNorm | RowRms | Residual | Glu | SituGlu | SoftCap | LayerNorm | NormResidual
-        | AddNorm | NormResidualNorm | QuantFp8 | ZeroF32 | CastF32Bf16 | MlaOutGate
+        | AddNorm | NormResidualNorm | PerLayerInput | QuantFp8 | ZeroF32 | CastF32Bf16 | MlaOutGate
         | KdaGatedNorm | QwenGatedNorm | QwenQGateSplit | QwenSigmoidGate | QwenRmsNorm => {
             RowClass::A
         }

@@ -30,6 +30,7 @@ fn setting_lean_verify_without_feature_fails_with_disabled_error() {
         tuning_db: None,
         gpu: "H100 SXM5".into(),
         num_gpus: 1,
+        unit_shares: None,
         parallel: Parallel::Tp,
         batches: vec![1],
         seqs: vec![128],

@@ -52,4 +52,5 @@ pub const RTX_4090: GpuSpec = GpuSpec {
     chiplet: None,      // Monolithic AD102 die.
     l2_partitioning: None,
     clock_boost: Hertz::from_mhz(2520),
+    soc: None,
 };

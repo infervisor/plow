@@ -34,7 +34,7 @@ impl PrefetchStats {
 /// A safetensors checkpoint directory: every `*.safetensors` shard mmap'd,
 /// with one metadata parse per shard (name → shard/offset resolved up front,
 /// tensor bytes served as zero-copy mmap slices).
-pub(crate) struct Checkpoint {
+pub struct Checkpoint {
     shards: Vec<(memmap2::Mmap, usize)>, // (map, data-section offset)
     /// name → where the bytes are, and what shape they are.
     index: FxHashMap<String, Entry>,
@@ -74,7 +74,7 @@ impl Checkpoint {
     }
 
     /// Same as [`Self::open`], optionally filling per-phase Instant breakdowns.
-    pub fn open_with_timing(
+    pub(crate) fn open_with_timing(
         dir: &Path,
         mut timing: Option<&mut CheckpointOpenTiming>,
     ) -> Result<Checkpoint> {
@@ -216,7 +216,7 @@ impl Checkpoint {
     /// `off`/`len` are a sub-range **of the tensor**, because a column-parallel
     /// rank binds a contiguous 1/tp slice and prefetching the whole tensor would
     /// read four times what that rank will touch.
-    pub fn span(&self, name: &str, off: usize, len: usize) -> Option<Span> {
+    pub(crate) fn span(&self, name: &str, off: usize, len: usize) -> Option<Span> {
         let e = self.index.get(name)?;
         let (map, base) = &self.shards[e.shard];
         let lo = base + e.range.start + off;
@@ -269,10 +269,15 @@ impl Checkpoint {
     /// hint on a file-backed mapping does nothing at all here. It would also aim
     /// at the wrong term — the cold cost is device I/O, which a huge page does
     /// not reduce by one byte.
-    pub fn populate(&self, span: Span) -> bool {
+    pub(crate) fn populate(&self, span: Span) -> bool {
         let (map, _) = &self.shards[span.shard];
-        map.advise_range(memmap2::Advice::PopulateRead, span.off, span.len)
-            .is_ok()
+        // MADV_POPULATE_READ is Linux 5.14+; elsewhere WILLNEED is the closest
+        // (async readahead, PTEs still fault in one at a time).
+        #[cfg(target_os = "linux")]
+        let advice = memmap2::Advice::PopulateRead;
+        #[cfg(not(target_os = "linux"))]
+        let advice = memmap2::Advice::WillNeed;
+        map.advise_range(advice, span.off, span.len).is_ok()
     }
 }
 

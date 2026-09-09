@@ -272,6 +272,7 @@ const DOC: &[S] = &[
     S { op: DevOp::MoeDownMx, t: &["part", "fu", "table", "W_d", "S_d", "bias_d?"], i: &["k", "H", "I", "n_exp", "", "", "n_batch"], f: &[], j: &[] },
     S { op: DevOp::MoeGluMxPf, t: &["fu_g", "xn2", "W_gu", "S_gu", "meta", "row_token", "bias_gu?"], i: &["I", "K", "n_exp", "layout", "", "act"], f: &["alpha", "limit"], j: &[] },
     S { op: DevOp::MoeDownMxPf, t: &["part", "fu_g", "W_d", "S_d", "meta", "bias_d?", "row_partidx", "row_gate"], i: &["H", "I", "n_exp"], f: &[], j: &[] },
+    S { op: DevOp::PerLayerInput, t: &["x", "Wg", "Wp", "gamma_post", "ple", "hn_out?", "gamma_next?"], i: &["T", "H", "P", "col0", "stride"], f: &["eps", "layer_scalar"], j: &[] },
 ];
 
 /// Ops that say "As [`DevOp::X`]" / "twin of [`DevOp::X`]" / "Same operands as

@@ -53,6 +53,8 @@ mod block;
 use block::{parse_block, write_block_descriptor};
 mod config;
 pub mod emit_config;
+pub mod hetero;
+mod hetero_channel;
 pub mod k3;
 pub mod kda;
 use config::*;
@@ -463,6 +465,66 @@ fn pick_tile(m: u32, n: u32, k: u32, n_cu: u32, quant: kernelcaps::QuantScheme) 
     pick_tile_tiered(m, n, k, n_cu, quant).0
 }
 
+thread_local! {
+    static EMIT_IS_APPLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn emit_is_apple() -> bool {
+    EMIT_IS_APPLE.with(|c| c.get())
+}
+
+/// Scoped "the target is an Apple GPU (metal3)" flag, as [`EmitAmdGuard`] for AMD.
+struct EmitAppleGuard {
+    prev: bool,
+}
+
+impl EmitAppleGuard {
+    fn set(apple: bool) -> Self {
+        let prev = EMIT_IS_APPLE.with(|c| c.replace(apple));
+        Self { prev }
+    }
+}
+
+impl Drop for EmitAppleGuard {
+    fn drop(&mut self) {
+        EMIT_IS_APPLE.with(|c| c.set(self.prev));
+    }
+}
+
+/// Apple prefill GEMM tile: the Metal interpreter partitions work in 128x128 or 64x128 tiles
+/// (ops GemmMed/GemmSmall and their fp8 twins; Gemm = 256x256 is never chosen here), one
+/// threadgroup per tile, on a 16-core part: 128x128 unless it leaves cores idle.
+fn apple_prefill_tile(m: u32, n: u32, n_cu: u32, quant: kernelcaps::QuantScheme) -> DevOp {
+    let fp8 = matches!(
+        quant,
+        kernelcaps::QuantScheme::W8A16 | kernelcaps::QuantScheme::W8A8
+    );
+    let mx4 = matches!(quant, kernelcaps::QuantScheme::Mxfp4);
+    assert!(
+        matches!(quant, kernelcaps::QuantScheme::None) || fp8 || mx4,
+        "Apple pick_tile: no prefill GEMM opcode for quant {quant:?}"
+    );
+    // Measured (v3 tiles, M4 Pro): 128x128 beats 256x256 at every shape (3.8 vs 2.9 TFLOPS at
+    // 512x3072x3072); the 64x64 small tile (Metal geometry of GemmSmall) is for the narrow
+    // projections where 128x128 leaves cores idle.
+    let tiles = |bm: u32, bn: u32| m.div_ceil(bm) * n.div_ceil(bn);
+    if tiles(128, 128) >= n_cu {
+        if fp8 {
+            DevOp::GemmMedFp8
+        } else if mx4 {
+            DevOp::GemmMedMxfp4
+        } else {
+            DevOp::GemmMed
+        }
+    } else if fp8 {
+        DevOp::GemmSmallFp8
+    } else if mx4 {
+        DevOp::GemmSmallMxfp4
+    } else {
+        DevOp::GemmSmall
+    }
+}
+
 pub(crate) fn pick_gemm_emit_plan(
     m: u32,
     n: u32,
@@ -521,6 +583,12 @@ fn pick_tile_tiered(
     // from the gfx950 analytical inventory while emitting for Hopper/Blackwell put
     // `PLOW_DOP_GEMM_WIDE` into GH200 packets; the NVIDIA interp has no case → `default:
     // __trap()` → `CUDA_ERROR_LAUNCH_FAILED` on first prefill.
+    if emit_is_apple() {
+        return (
+            apple_prefill_tile(m, n, n_cu, quant),
+            kernelcaps::CalibrationTier::Portable,
+        );
+    }
     if !emit_is_amd() {
         return (
             nvidia_prefill_gemm_op(quant),
@@ -1622,6 +1690,15 @@ struct Tn {
     // fold is enabled, so every other blob stays byte-identical.
     mrgc: u32,
     hn: u32,
+    // Gemma-4 E-series per-layer inputs (TENSOR_NONE elsewhere): the packed embedding table
+    // [vocab][L*P], the context projection [L*P][H] and its norm gamma [P]; activations
+    // `ple_raw` (token part), `ple_pp` (projection) and `ple` (combined) are [rows][L*P] bf16.
+    ple_tab: u32,
+    ple_proj: u32,
+    ple_norm: u32,
+    ple_raw: u32,
+    ple_pp: u32,
+    ple: u32,
     qg: u32,
     kg: u32,
     vg: u32,
@@ -1701,6 +1778,10 @@ struct LW {
     g_po: u32,
     qn: u32,
     kn: u32,
+    // E-series per-layer input block (op 155): gate [P][H], projection [H][P], post norm [H].
+    plg: u32,
+    plp: u32,
+    g_pl: u32,
     // Gemma-4 MoE (26B-A4B) per-layer weights + the loader-filled expert pointer table.
     // TENSOR_NONE on the dense 12B/31B path. rproj/rscale/rpes = router; g_pf1/g_pf2/g_pre2 = the
     // three extra sandwich norms. ewt = Persistent u64[E*2] {gate_up base, down base} per expert,
@@ -1939,6 +2020,45 @@ fn declare(
             TENSOR_NONE
         },
         hn: ac(b, "hn", (rows * c.hidden) as u64 * BF16),
+        ple_tab: if c.ple > 0 {
+            b.tensor(
+                &format!("{}embed_tokens_per_layer.weight", c.prefix),
+                (c.vocab as u64) * (c.layers * c.ple) as u64 * BF16,
+            )
+        } else {
+            TENSOR_NONE
+        },
+        ple_proj: if c.ple > 0 {
+            b.tensor(
+                &format!("{}per_layer_model_projection.weight", c.prefix),
+                (c.layers * c.ple) as u64 * c.hidden as u64 * BF16,
+            )
+        } else {
+            TENSOR_NONE
+        },
+        ple_norm: if c.ple > 0 {
+            b.tensor(
+                &format!("{}per_layer_projection_norm.weight", c.prefix),
+                c.ple as u64 * BF16,
+            )
+        } else {
+            TENSOR_NONE
+        },
+        ple_raw: if c.ple > 0 {
+            ac(b, "ple_raw", (rows * c.layers * c.ple) as u64 * BF16)
+        } else {
+            TENSOR_NONE
+        },
+        ple_pp: if c.ple > 0 {
+            ac(b, "ple_pp", (rows * c.layers * c.ple) as u64 * BF16)
+        } else {
+            TENSOR_NONE
+        },
+        ple: if c.ple > 0 {
+            ac(b, "ple", (rows * c.layers * c.ple) as u64 * BF16)
+        } else {
+            TENSOR_NONE
+        },
         qg: ac(b, "qg", (rows * qd_max) as u64 * BF16),
         kg: ac(b, "kg", (rows * kd_max) as u64 * BF16),
         vg: ac(b, "vg", (rows * kd_max) as u64 * BF16),
@@ -2135,6 +2255,10 @@ fn declare(
         let fp8_kv = fp8_kv && (full || !fp8_kv_full);
         let hd = if full { c.hd_full } else { c.hd_slide };
         let kvh = if full { c.kvh_full } else { c.kvh_slide };
+        // KV sharing (E-series): this layer reads the KV cache of `kv_src` and owns no k/v
+        // projection, k norm or cache of its own.
+        let kv_src = c.kv_source(l as usize);
+        let shared = kv_src != l as usize;
         // KV CACHE, HEAD-MAJOR [kv_head][ctx][hd] (see dev_isa.h "THE KV CACHE IS HEAD-MAJOR").
         // Exactly the layout HeadNormRope writes (op_norm.h d_headnorm_rope, out_stride = kvr)
         // and the layout FlashDecode reads with kv_stride — so the cache write is not a separate
@@ -2159,7 +2283,9 @@ fn declare(
         // ((b*n_kv_head+hkv)*kv_stride+row)*hd, so the per-batch stride is kv_head*ring*hd and the
         // tensor is dbatch* that. dbatch==1 => byte-identical to the single-sequence cache.
         let db = dbatch as u64;
-        t.kc.push(if in_block {
+        t.kc.push(if shared {
+            t.kc[kv_src]
+        } else if in_block {
             b.tensor(
                 &format!("kv.{l}.k"),
                 db * (kvr * kvh_local * hd) as u64 * kv_elt,
@@ -2167,7 +2293,9 @@ fn declare(
         } else {
             TENSOR_NONE
         });
-        t.vc.push(if in_block {
+        t.vc.push(if shared {
+            t.vc[kv_src]
+        } else if in_block {
             b.tensor(
                 &format!("kv.{l}.v"),
                 db * (kvr * kvh_local * hd) as u64 * kv_elt,
@@ -2175,7 +2303,9 @@ fn declare(
         } else {
             TENSOR_NONE
         });
-        t.kcs.push(if fp8_kv && in_block {
+        t.kcs.push(if shared {
+            t.kcs[kv_src]
+        } else if fp8_kv && in_block {
             b.tensor(
                 &format!("kv.{l}.k_scale"),
                 db * (kvr * kvh_local) as u64 * F32,
@@ -2183,7 +2313,9 @@ fn declare(
         } else {
             TENSOR_NONE
         });
-        t.vcs.push(if fp8_kv && in_block {
+        t.vcs.push(if shared {
+            t.vcs[kv_src]
+        } else if fp8_kv && in_block {
             b.tensor(
                 &format!("kv.{l}.v_scale"),
                 db * (kvr * kvh_local) as u64 * F32,
@@ -2307,12 +2439,16 @@ fn declare(
         };
         t.lw.push(LW {
             wq: wproj(b, "self_attn.q_proj.weight", (qd * c.hidden) as u64 * BF16),
-            wk: wproj(b, "self_attn.k_proj.weight", (kd * c.hidden) as u64 * BF16),
+            wk: if shared {
+                TENSOR_NONE
+            } else {
+                wproj(b, "self_attn.k_proj.weight", (kd * c.hidden) as u64 * BF16)
+            },
             // Gemma full layers have NO v_proj: V is the raw k_proj output (k_eq_v). Llama/Qwen
             // always have a real v_proj. (fp8 mode elides the bf16 twin like the other projections.)
             wv: wopt(
                 b,
-                !keqv && !fp8 && !mx4_pf,
+                !keqv && !fp8 && !mx4_pf && !shared,
                 "self_attn.v_proj.weight",
                 (kd * c.hidden) as u64 * BF16,
             ),
@@ -2332,8 +2468,12 @@ fn declare(
             // Dims use the TP-sharded shard extents (qd/kd/inter_sh); at tp==1 these equal the full
             // extents, so the single-GPU fp8 pkt is unaffected by the TP structure.
             wq8: w8(b, "self_attn.q_proj.weight", (qd * c.hidden) as u64),
-            wk8: w8(b, "self_attn.k_proj.weight", (kd * c.hidden) as u64),
-            wv8: if keqv {
+            wk8: if shared {
+                TENSOR_NONE
+            } else {
+                w8(b, "self_attn.k_proj.weight", (kd * c.hidden) as u64)
+            },
+            wv8: if keqv || shared {
                 TENSOR_NONE
             } else {
                 w8(b, "self_attn.v_proj.weight", (kd * c.hidden) as u64)
@@ -2348,13 +2488,17 @@ fn declare(
                 qd as u64,
                 (qd * c.hidden) as u64,
             ),
-            sk: sc(
-                b,
-                "self_attn.k_proj.weight",
-                kd as u64,
-                (kd * c.hidden) as u64,
-            ),
-            sv: if keqv {
+            sk: if shared {
+                TENSOR_NONE
+            } else {
+                sc(
+                    b,
+                    "self_attn.k_proj.weight",
+                    kd as u64,
+                    (kd * c.hidden) as u64,
+                )
+            },
+            sv: if keqv || shared {
                 TENSOR_NONE
             } else {
                 sc(
@@ -2411,9 +2555,27 @@ fn declare(
             ),
             kn: wopt(
                 b,
-                c.has_qk_norm,
+                c.has_qk_norm && !shared,
                 "self_attn.k_norm.weight",
                 hd as u64 * BF16,
+            ),
+            plg: wopt(
+                b,
+                c.ple > 0,
+                "per_layer_input_gate.weight",
+                (c.ple * c.hidden) as u64 * BF16,
+            ),
+            plp: wopt(
+                b,
+                c.ple > 0,
+                "per_layer_projection.weight",
+                (c.hidden * c.ple) as u64 * BF16,
+            ),
+            g_pl: wopt(
+                b,
+                c.ple > 0,
+                "post_per_layer_input_norm.weight",
+                c.hidden as u64 * BF16,
             ),
             // MoE (26B-A4B): router + FUSED 3D expert weights + the 3 extra sandwich norms. The
             // ewt pointer table is NOT a checkpoint tensor — it is a Persistent buffer the harness/
@@ -3358,6 +3520,9 @@ fn emit_phase(
     amd: bool,
     // Shared GEN_TMAP_BF16 mint registry (see TmapMint). Inert unless PLOW_TMA_GEMM=1.
     tmaps: &std::cell::RefCell<TmapMint>,
+    // Heterogeneous prefill lane collector (Apple SoC row split); `None` for decode.
+    hetero: Option<&std::cell::RefCell<hetero::ProgCollector>>,
+    channel: Option<&std::cell::RefCell<Vec<plow_asset::hetero_channel::Span>>>,
 ) {
     // The two axes the old `decode` bool used to carry at once. Every former use site below is
     // now one or the other: `decode` for shape, `gemv_family` for kernel family. (Not `gemv` —
@@ -3432,6 +3597,35 @@ fn emit_phase(
     // recorded above d_norm_residual_norm in runtime/amd/op_norm.h. Read that before widening
     // this. At decode batch B the row axis already gives it B workgroups for free.
     let elem = |n: u32| -> Vec<u32> { (0..n.div_ceil(512 * 8).max(1).min(n_cu)).collect() };
+    // HETEROGENEOUS PREFILL ROW SPLIT (hetero.rs). The GPU packet keeps rows [0, tg) of every
+    // projection/norm/residual; the ANE/CPU lanes take the rest concurrently, joined by host
+    // segments (`Builder::host_join`). Dense, single-GPU, bf16-activation prefill only.
+    let split = hetero
+        .and_then(|_| hetero::RowSplit::from_env())
+        // E-series (per-layer inputs, KV sharing) is not in the ANE lane's layer graph yet.
+        .filter(|_| {
+            !gemv_family
+                && tp == 1
+                && !c.moe
+                && !block_mode
+                && !w8a8
+                && (!mx4 || mx4_pf)
+                && c.ple == 0
+                && c.kv_shared == 0
+        });
+    let tg = split.map_or(t, |s| s.rows(t).0);
+    let rows_g: Vec<u32> = (0..tg.min(n_cu).max(1)).collect();
+    let hj = split.is_some();
+    let rec = |ctr: u32| {
+        if hj {
+            hetero.unwrap().borrow_mut().split_op(ctr);
+        }
+    };
+    let join = || {
+        if hj {
+            hetero.unwrap().borrow_mut().flush();
+        }
+    };
     let (ns, fused_epilogue) = dense_flash_split(
         gemv_family,
         emit_config::active().packed_prefill_on(),
@@ -3457,6 +3651,69 @@ fn emit_phase(
             d.f[0] = escale;
         })
     };
+    // Gemma-4 E-series PER-LAYER INPUTS (dev_isa.h op 155), once per token for all layers:
+    // ple_raw = embed_per_layer[ids] * sqrt(P); ple_pp = x . Wproj^T (the 1/sqrt(H) is dropped:
+    // the RMSNorm that follows is scale-invariant); ple = (RMSNorm_P(ple_pp) * gamma + ple_raw) / sqrt(2).
+    // Every layer's block then reads its P-column slice of `ple`. Emitted before the hetero
+    // join so the CPU lane's rows see it.
+    assert!(
+        !(block_mode && (c.ple > 0 || c.kv_shared > 0)),
+        "block mode uploads act.x only: a per-layer-input or KV-shared model has no per-layer inputs \
+         or source caches inside one block"
+    );
+    let c_ple = if c.ple > 0 {
+        let lp = c.layers * c.ple;
+        let c_pe = b.emit(DevOp::Embed, rows.clone(), &[], |d| {
+            d.t[0] = n.ple_raw;
+            d.t[1] = n.ple_tab;
+            d.t[2] = n.ids;
+            d.i[0] = t;
+            d.i[1] = lp;
+            // HF casts the scale to the weight dtype (bf16) before multiplying.
+            d.f[0] = crate::config::bf16_round((c.ple as f32).sqrt());
+        });
+        let fill = |d: &mut DevInst| {
+            d.t[0] = n.ple_pp;
+            d.t[1] = n.x;
+            d.t[2] = n.ple_proj;
+            d.i[0] = t;
+            d.i[1] = lp;
+            d.i[2] = c.hidden;
+        };
+        let c_pp = if gemv_family {
+            b.emit(DevOp::Gemv, gemv_wg_cap(all.clone()), &[dep], fill)
+        } else {
+            let op = pick_tile(t, lp, c.hidden, n_cu, kernelcaps::QuantScheme::None);
+            b.emit(op, all.clone(), &[dep], fill)
+        };
+        let nrows = t * c.layers;
+        let c_pn = b.emit(
+            DevOp::RmsNorm,
+            (0..nrows.min(n_cu).max(1)).collect(),
+            &[c_pp],
+            |d| {
+                d.t[0] = n.ple;
+                d.t[1] = n.ple_pp;
+                d.t[2] = n.ple_norm;
+                d.i[0] = nrows;
+                d.i[1] = c.ple;
+                d.f[0] = c.eps;
+            },
+        );
+        b.emit(DevOp::Residual, elem(t * lp), &[c_pn, c_pe], |d| {
+            d.t[0] = n.ple;
+            d.t[1] = n.ple;
+            d.t[2] = n.ple_raw;
+            d.i[0] = t * lp;
+            d.f[0] = std::f32::consts::FRAC_1_SQRT_2;
+        })
+    } else {
+        0
+    };
+    if hj {
+        b.host_join();
+        join();
+    }
 
     // In decode, every projection is a GEMV (M=1): a 32x32 matrix core would run with 1 of
     // 32 M-lanes live, and the step is bandwidth-bound on the 57 GiB of weights anyway.
@@ -3742,6 +3999,7 @@ fn emit_phase(
     let fuse_nrn = gfuse
         && fp8
         && amd
+        && c.ple == 0
         && !block_mode
         && n.xr != TENSOR_NONE
         && (c.hidden & 7) == 0
@@ -3753,6 +4011,9 @@ fn emit_phase(
 
     for l in block.clone() {
         let full = c.is_full[l];
+        // KV sharing (E-series): no k/v projection, norm or cache write; attention reads the
+        // source layer's cache (`n.kc[l]` aliases it, see declare()).
+        let shared = c.kv_is_shared(l);
         // MIXED fp8-KV (PLOW_FP8_KV_FULL=1): per-layer effective flag — see declare(). Ops keyed
         // on it (HeadNormRope[Fp8], FlashDecode[Fp8], FlashPrefill[Fp8], the fp8-tuned nsplit
         // gates) all follow the LAYER's cache dtype.
@@ -3796,6 +4057,7 @@ fn emit_phase(
         // precondition with nothing checking it.
         let fuse_qkv = gemv_family
             && !keqv
+            && !shared
             && !fp8
             && !mx4
             && gemv_fused_input_fits(amd, t, c.hidden)
@@ -3819,6 +4081,7 @@ fn emit_phase(
         // the AMD side, so the gate lives here.
         let fuse_qkv_fp8 = gemv_family
             && !keqv
+            && !shared
             && fp8
             && amd
             && (gemv_staged_rows(t) as u64 * c.hidden as u64) <= gm_lds_halves()
@@ -4049,7 +4312,7 @@ fn emit_phase(
             } else {
                 &[dep]
             };
-            b.emit(DevOp::RmsNorm, rows.clone(), nd, |d| {
+            let cn = b.emit(DevOp::RmsNorm, rows_g.clone(), nd, |d| {
                 d.t[0] = n.hn;
                 d.t[1] = n.x;
                 d.t[2] = w.g_in;
@@ -4057,10 +4320,12 @@ fn emit_phase(
                     d.t[3] = n.xqh; // fused w8a8 activation quant (T11): xq out
                     d.t[4] = n.ash; //   + per-row a_scale out
                 }
-                d.i[0] = t;
+                d.i[0] = tg;
                 d.i[1] = c.hidden;
                 d.f[0] = c.eps;
-            })
+            });
+            rec(cn);
+            cn
         };
         let (qkv_src, qkv_g) = (n.hn, TENSOR_NONE);
 
@@ -4113,14 +4378,16 @@ fn emit_phase(
             (c_q, c_k, c_v, v_src) = (fused, fused, fused, n.vg);
             let _ = qkv_g; // norm is a shared packet here, never folded into the fused GEMV
         } else {
-            let (cq, ck, cv) = if gemv_family {
+            let (cq, ck, cv) = if shared {
+                (all.clone(), Vec::new(), Vec::new())
+            } else if gemv_family {
                 split3(gemv_wg_n(n_cu), qd, kd, if keqv { 0 } else { kd })
             } else {
                 split3(
                     n_cu,
-                    tiles(t, qd),
-                    tiles(t, kd),
-                    if keqv { 0 } else { tiles(t, kd) },
+                    tiles(tg, qd),
+                    tiles(tg, kd),
+                    if keqv { 0 } else { tiles(tg, kd) },
                 )
             };
             (nq, nk, nv) = (cq.len() as u32, ck.len() as u32, cv.len() as u32);
@@ -4175,7 +4442,7 @@ fn emit_phase(
                     w.sq,
                     n.xqh,
                     n.ash,
-                    t,
+                    tg,
                     qd,
                     c.hidden,
                     qkv_g,
@@ -4183,7 +4450,10 @@ fn emit_phase(
                     &[dq],
                 )
             };
-            let ckc = if let Some(f) = &nrn {
+            rec(cqc);
+            let ckc = if shared {
+                cqc
+            } else if let Some(f) = &nrn {
                 fold_proj(b, n.kg, w.wk8, w.sk, kd, ck, false, f)
             } else {
                 proj(
@@ -4195,7 +4465,7 @@ fn emit_phase(
                     w.sk,
                     n.xqh,
                     n.ash,
-                    t,
+                    tg,
                     kd,
                     c.hidden,
                     qkv_g,
@@ -4203,7 +4473,12 @@ fn emit_phase(
                     &[dq],
                 )
             };
-            let (vsrc, cvc) = if keqv {
+            if !shared {
+                rec(ckc);
+            }
+            let (vsrc, cvc) = if shared {
+                (n.vg, cqc)
+            } else if keqv {
                 (n.kg, ckc) // k_eq_v: V is the RAW k_proj output
             } else if let Some(f) = &nrn {
                 (n.vg, fold_proj(b, n.vg, w.wv8, w.sv, kd, cv, false, f))
@@ -4219,7 +4494,7 @@ fn emit_phase(
                         w.sv,
                         n.xqh,
                         n.ash,
-                        t,
+                        tg,
                         kd,
                         c.hidden,
                         qkv_g,
@@ -4228,7 +4503,26 @@ fn emit_phase(
                     ),
                 )
             };
+            if !keqv && !shared {
+                rec(cvc);
+            }
             (c_q, c_k, c_v, v_src) = (cqc, ckc, cvc, vsrc);
+        }
+        // J1: every unit's q/k/v rows are in place before RoPE / the KV append / attention.
+        if hj {
+            let mut h = hetero.unwrap().borrow_mut();
+            h.ane = match h.ane.take() {
+                Some(prev) => Some(hetero::AneLane {
+                    kind: "mid".into(),
+                    layer: prev.layer,
+                }),
+                None => Some(hetero::AneLane {
+                    kind: "pre".into(),
+                    layer: l as u32,
+                }),
+            };
+            h.flush();
+            b.host_join();
         }
 
         // headnorm+RoPE for q; and for k/v the store goes STRAIGHT INTO THE KV CACHE at
@@ -4335,6 +4629,7 @@ fn emit_phase(
         // (correct, token-identical, and the trade flips where fine deps do not exist — the
         // static scheduler, or a launch-per-op backend). Opt in with PLOW_FUSE_HNR=1.
         let fuse_hnr = gemv_family
+            && !shared
             && amd
             && t == 1
             && !fp8_kv
@@ -4383,7 +4678,7 @@ fn emit_phase(
         } else {
             DevOp::HeadNormRope
         };
-        let c_kn = if fuse_hnr {
+        let c_kn = if fuse_hnr || shared {
             0
         } else {
             b.emit_dep(hn_op, hn_set(1), hn_dep(c_k, nk, kvh), |d| {
@@ -4419,17 +4714,19 @@ fn emit_phase(
                 }
             })
         };
-        if decode && !fuse_hnr {
+        if decode && !fuse_hnr && !shared {
             kv_rows.push(c_kn);
         }
         // v_norm: WEIGHTLESS (gamma NONE) and NO RoPE (cos NONE).
         // On a full layer V comes from the RAW k_proj output, so its producer is c_k (nk wgs).
-        let vn_dep = if keqv {
+        let vn_dep = if shared {
+            Vec::new()
+        } else if keqv {
             hn_dep(c_v, nk, kvh)
         } else {
             hn_dep(c_v, nv, kvh)
         };
-        let c_vn = if fuse_hnr {
+        let c_vn = if fuse_hnr || shared {
             0
         } else {
             b.emit_dep(hn_op, hn_set(2), vn_dep, |d| {
@@ -4450,7 +4747,7 @@ fn emit_phase(
                 }
             })
         };
-        if decode && !fuse_hnr {
+        if decode && !fuse_hnr && !shared {
             kv_rows.push(c_vn);
         }
 
@@ -4459,6 +4756,9 @@ fn emit_phase(
         // PREVIOUS decode step (a previous launch), so within this program flash depends only on
         // the three headnorms' work for its own head — not on all of them.
         let fa_dep = || -> Vec<Dep> {
+            if shared {
+                return vec![Dep::Coarse(c_qn)];
+            }
             if !gemv_family {
                 return vec![Dep::Coarse(c_qn), Dep::Coarse(c_kn), Dep::Coarse(c_vn)];
             }
@@ -4654,7 +4954,12 @@ fn emit_phase(
             // k_eq_v just encodes the same base at both pair slots.
             let fa_tm = (tma_gemm && !fp8_kv && (hd == 256 || hd == 512) && !gemv_family)
                 .then(|| tmap_kv(n.kc[l], n.vc[l], kvr, hd, kvh));
-            b.emit(fa_op, all.clone(), &[c_qn, c_kn, c_vn], |d| {
+            let fa_deps: Vec<u32> = if shared {
+                vec![c_qn]
+            } else {
+                vec![c_qn, c_kn, c_vn]
+            };
+            b.emit(fa_op, all.clone(), &fa_deps, |d| {
                 d.t[0] = n.opart;
                 d.t[1] = n.mlpart;
                 d.t[2] = n.q;
@@ -4737,6 +5042,11 @@ fn emit_phase(
         // partials into the replicated `og` that NormResidual consumes — all-reduce #1 of the layer.
         // proj() picks the fp8 (GemvFp8) arm on the decode fp8 path via the wo8/so operands.
         // w8a8: quant the (qd-width) attention output feeding o_proj.
+        // J2: attention over all rows is complete; the post-attention part is row-split again.
+        if hj {
+            join();
+            b.host_join();
+        }
         let o_deps = if w8a8 {
             vec![quant(b, n.xqo, n.aso, n.at, qd, attn_deps[0])]
         } else {
@@ -4761,7 +5071,7 @@ fn emit_phase(
             );
             emit_xreduce(b, &mut xgate, decode, &xr_cus, c_op, n.og, xr_elems, tp, 0)
         } else {
-            proj(
+            let co = proj(
                 b,
                 n.og,
                 n.at,
@@ -4770,13 +5080,21 @@ fn emit_phase(
                 w.so,
                 n.xqo,
                 n.aso,
-                t,
+                tg,
                 c.hidden,
                 qd,
                 TENSOR_NONE,
                 all.clone(),
                 &o_deps,
-            )
+            );
+            rec(co);
+            if hj {
+                hetero.unwrap().borrow_mut().ane = Some(hetero::AneLane {
+                    kind: "post".into(),
+                    layer: l as u32,
+                });
+            }
+            co
         };
         // FIRST RESIDUAL + PRE-MLP NORM — the biggest structural fork.
         //   Gemma SANDWICH: x = x + post_attn_norm(o); then hn = pre_feedforward_norm(x).
@@ -4827,27 +5145,28 @@ fn emit_phase(
             })
         } else {
             let c_r1 = if gemma {
-                b.emit(DevOp::NormResidual, rows.clone(), &[c_o], |d| {
+                b.emit(DevOp::NormResidual, rows_g.clone(), &[c_o], |d| {
                     d.t[0] = n.x;
                     d.t[1] = n.x;
                     d.t[2] = n.og;
                     d.t[3] = w.g_pa;
-                    d.i[0] = t;
+                    d.i[0] = tg;
                     d.i[1] = c.hidden;
                     d.f[0] = c.eps;
                     d.f[1] = 1.0;
                 })
             } else {
-                b.emit(DevOp::Residual, elem(t * c.hidden), &[c_o], |d| {
+                b.emit(DevOp::Residual, elem(tg * c.hidden), &[c_o], |d| {
                     d.t[0] = n.x;
                     d.t[1] = n.x;
                     d.t[2] = n.og;
-                    d.i[0] = t * c.hidden;
+                    d.i[0] = tg * c.hidden;
                     d.f[0] = 1.0;
                 })
             };
+            rec(c_r1);
             let pre_mlp_norm = if gemma { w.g_pf } else { w.g_pa };
-            b.emit(DevOp::RmsNorm, rows.clone(), &[c_r1], |d| {
+            let cpf = b.emit(DevOp::RmsNorm, rows_g.clone(), &[c_r1], |d| {
                 d.t[0] = n.hn;
                 d.t[1] = n.x;
                 d.t[2] = pre_mlp_norm;
@@ -4855,12 +5174,15 @@ fn emit_phase(
                     d.t[3] = n.xqh; // fused w8a8 activation quant (T11) — see the pre-qkv site
                     d.t[4] = n.ash;
                 }
-                d.i[0] = t;
+                d.i[0] = tg;
                 d.i[1] = c.hidden;
                 d.f[0] = c.eps;
-            })
+            });
+            rec(cpf);
+            cpf
         };
         let (mlp_src, mlp_g) = (n.hn, TENSOR_NONE);
+        let mlp_start = b.n_insts() as u32;
         // GATE|UP AS ONE GEMV WITH A FUSED GLU EPILOGUE -- the fusion every BLAS ships.
         //
         // gate and up read the same x and have the same shape, so one GEMV can compute BOTH
@@ -4885,7 +5207,7 @@ fn emit_phase(
         // rank's own lanes, so no communication. `c_gl` is the dependency feeding down_proj.
         // Same backend-specific bound as `fuse_qkv` above.
         let glu_fused = gemv_family && gemv_fused_input_fits(amd, t, c.hidden);
-        let gemm_glu = !gemv_family && glu_fusion_wins(t, inter_l, c.hidden, n_cu);
+        let gemm_glu = !gemv_family && glu_fusion_wins(tg, inter_l, c.hidden, n_cu);
         // w8a8: quant the (hidden-width) pre-FF norm output feeding gate/up. Reuses xqh/ash (q/k/v
         // already consumed them; the c_pf→o_proj→flash→qkv chain serializes the reuse). Inert
         // (returns c_pf) off the w8a8 path, so glu_fused/bf16 arms below keep their c_pf dep.
@@ -4993,7 +5315,7 @@ fn emit_phase(
                     tmap8(w.wu8, inter_l, c.hidden),
                 )
             });
-            b.emit(DevOp::GemmGluFp8, all.clone(), &[dmlp], |d| {
+            let cg = b.emit(DevOp::GemmGluFp8, all.clone(), &[dmlp], |d| {
                 d.t[0] = n.fu;
                 d.t[2] = w.wg8;
                 d.t[5] = w.wu8;
@@ -5005,7 +5327,7 @@ fn emit_phase(
                 } else {
                     d.t[1] = mlp_src;
                 }
-                d.i[0] = t;
+                d.i[0] = tg;
                 d.i[1] = inter_l;
                 d.i[2] = c.hidden;
                 d.i[5] = c.mlp_act; // 0 GeGLU (Gemma), 1 SwiGLU (Llama/Qwen)
@@ -5014,7 +5336,9 @@ fn emit_phase(
                     d.i[7] = mg;
                     d.i[3] = mu;
                 }
-            })
+            });
+            rec(cg);
+            cg
         } else if mx4_pf && !gemv_family && glu_fusion_wins_mxfp4(t, inter_l, c.hidden, n_cu) {
             // PREFILL fp4 GLU (op 113): gate|up as two e2m1 matrices with their own E8M0 scale
             // rows, SwiGLU/GeGLU fused in the epilogue. Same slot map as the decode twin (92).
@@ -5022,18 +5346,20 @@ fn emit_phase(
                 w.wg8 != TENSOR_NONE && w.sg != TENSOR_NONE,
                 "mxfp4 prefill GLU has no fp4 twin"
             );
-            b.emit(DevOp::GemmGluMxfp4, all.clone(), &[c_pf], |d| {
+            let cg = b.emit(DevOp::GemmGluMxfp4, all.clone(), &[c_pf], |d| {
                 d.t[0] = n.fu;
                 d.t[1] = mlp_src;
                 d.t[2] = w.wg8;
                 d.t[5] = w.wu8;
                 d.t[3] = w.sg;
                 d.t[4] = w.su;
-                d.i[0] = t;
+                d.i[0] = tg;
                 d.i[1] = inter_l;
                 d.i[2] = c.hidden;
                 d.i[5] = c.mlp_act;
-            })
+            });
+            rec(cg);
+            cg
         } else if gemm_glu && !mx4_pf {
             // Not under mx4_pf: the bf16 gate/up weights are no longer declared, so the shapes the
             // fp4 GLU epilogue does not cover (op 113 is 256x256 only) must take the UNFUSED fp4
@@ -5046,12 +5372,12 @@ fn emit_phase(
                     tmap(w.wu, inter_l, c.hidden),
                 )
             });
-            b.emit(DevOp::GemmGlu, all.clone(), &[c_pf], |d| {
+            let cg = b.emit(DevOp::GemmGlu, all.clone(), &[c_pf], |d| {
                 d.t[0] = n.fu;
                 d.t[1] = mlp_src;
                 d.t[2] = w.wg;
                 d.t[5] = w.wu;
-                d.i[0] = t;
+                d.i[0] = tg;
                 d.i[1] = inter_l;
                 d.i[2] = c.hidden;
                 d.i[5] = c.mlp_act; // 0 GeGLU (Gemma), 1 SwiGLU (Llama/Qwen)
@@ -5060,13 +5386,15 @@ fn emit_phase(
                     d.i[7] = mg;
                     d.i[3] = mu;
                 }
-            })
+            });
+            rec(cg);
+            cg
         } else {
             // gate and up: same argument as q/k/v -- independent, so disjoint CU sets.
             let (cg, cu) = if gemv_family {
                 split2(n_cu, 1, 1)
             } else {
-                split2(n_cu, tiles(t, inter_l), tiles(t, inter_l))
+                split2(n_cu, tiles(tg, inter_l), tiles(tg, inter_l))
             };
             let c_g = proj(
                 b,
@@ -5077,13 +5405,14 @@ fn emit_phase(
                 w.sg,
                 n.xqh,
                 n.ash,
-                t,
+                tg,
                 inter_l,
                 c.hidden,
                 mlp_g,
                 cg,
                 &[dmlp],
             );
+            rec(c_g);
             let c_u = proj(
                 b,
                 n.ut,
@@ -5093,13 +5422,14 @@ fn emit_phase(
                 w.su,
                 n.xqh,
                 n.ash,
-                t,
+                tg,
                 inter_l,
                 c.hidden,
                 mlp_g,
                 cu,
                 &[dmlp],
             );
+            rec(c_u);
             if qnorm_fuse {
                 // T11 GLU-INTO-QUANT: one row-owning packet computes fu = act(g)*u AND its
                 // fp8 quant (QuantFp8 t3/t4/i2 — see d_quant_fp8), deleting the elementwise
@@ -5116,13 +5446,15 @@ fn emit_phase(
                     d.i[2] = c.mlp_act; // 0 GeGLU (Gemma), 1 SwiGLU
                 })
             } else {
-                b.emit(DevOp::Glu, elem(t * inter_l), &[c_g, c_u], |d| {
+                let cgl = b.emit(DevOp::Glu, elem(tg * inter_l), &[c_g, c_u], |d| {
                     d.t[0] = n.fu;
                     d.t[1] = n.gt;
                     d.t[2] = n.ut;
-                    d.i[0] = t * inter_l;
+                    d.i[0] = tg * inter_l;
                     d.i[1] = c.mlp_act; // 0 GeGLU (Gemma), 1 SwiGLU
-                })
+                });
+                rec(cgl);
+                cgl
             }
         };
         // down_proj is ROW-parallel (input = inter_l lanes) → a PARTIAL H-vector. Under TP it
@@ -5157,7 +5489,7 @@ fn emit_phase(
                 b, &mut xgate, decode, &xr_cus, c_dp, n.dg, xr_elems, tp, slot_b,
             )
         } else {
-            proj(
+            let cd = proj(
                 b,
                 n.dg,
                 n.fu,
@@ -5166,13 +5498,15 @@ fn emit_phase(
                 w.sd,
                 n.xqi,
                 n.asi,
-                t,
+                tg,
                 c.hidden,
                 inter_l,
                 TENSOR_NONE,
                 all.clone(),
                 &[dfu],
-            )
+            );
+            rec(cd);
+            cd
         };
         // ===== Gemma-4 26B-A4B MoE branch (decode, B=1) =====
         // The dense MLP above produced `n.dg`. The MoE block adds a routed-expert branch and sums
@@ -5559,6 +5893,27 @@ fn emit_phase(
         // SECOND RESIDUAL.
         //   Gemma: x = (x + post_ffn_norm(d)) * layer_scalar — the learned scalar folds in.
         //   Llama/Qwen: x = x + d (plain).
+        // E-series per-layer input block (op 155) after the sandwich residual; `hn_out`/`gnext`
+        // fold the next layer's input norm in (decode), TENSOR_NONE leaves it to a RmsNorm packet.
+        let ple_block =
+            |b: &mut Builder, cus: Vec<u32>, nrows: u32, dep: u32, hn_out: u32, gnext: u32| -> u32 {
+                b.emit(DevOp::PerLayerInput, cus, &[dep, c_ple], |d| {
+                    d.t[0] = n.x;
+                    d.t[1] = w.plg;
+                    d.t[2] = w.plp;
+                    d.t[3] = w.g_pl;
+                    d.t[4] = n.ple;
+                    d.t[5] = hn_out;
+                    d.t[6] = gnext;
+                    d.i[0] = nrows;
+                    d.i[1] = c.hidden;
+                    d.i[2] = c.ple;
+                    d.i[3] = l as u32 * c.ple;
+                    d.i[4] = c.layers * c.ple;
+                    d.f[0] = c.eps;
+                    d.f[1] = ls[l];
+                })
+            };
         dep = if let Some(ct) = moe_fused_tail {
             // op72 already produced the new residual (n.x) AND the next input norm (n.hn).
             ct
@@ -5599,6 +5954,21 @@ fn emit_phase(
                 // layer folds into q+k only (no v proj exists).
                 nrn_pending = Some((ffn_out, w.g_po, next_gin, ls[l]));
                 c_d
+            } else if c.ple > 0 {
+                // E-series: the sandwich residual, then the per-layer input block carrying the
+                // layer scalar AND the next layer's input norm (t5/t6), so the packet count per
+                // layer stays at the fused pair's.
+                let cr = b.emit(DevOp::NormResidual, rows.clone(), &[c_d], |d| {
+                    d.t[0] = n.x;
+                    d.t[1] = n.x;
+                    d.t[2] = ffn_out;
+                    d.t[3] = w.g_po;
+                    d.i[0] = t;
+                    d.i[1] = c.hidden;
+                    d.f[0] = c.eps;
+                    d.f[1] = 1.0;
+                });
+                ple_block(b, rows.clone(), t, cr, n.hn, next_gin)
             } else {
                 b.emit(DevOp::NormResidualNorm, rows.clone(), &[c_d], |d| {
                     d.t[0] = n.hn;
@@ -5614,25 +5984,51 @@ fn emit_phase(
                 })
             }
         } else if gemma {
-            b.emit(DevOp::NormResidual, rows.clone(), &[c_d], |d| {
+            let cr = b.emit(DevOp::NormResidual, rows_g.clone(), &[c_d], |d| {
                 d.t[0] = n.x;
                 d.t[1] = n.x;
                 d.t[2] = ffn_out;
                 d.t[3] = w.g_po;
-                d.i[0] = t;
+                d.i[0] = tg;
                 d.i[1] = c.hidden;
                 d.f[0] = c.eps;
-                d.f[1] = ls[l];
-            })
+                // E-series: the layer scalar applies after the per-layer input block below.
+                d.f[1] = if c.ple > 0 { 1.0 } else { ls[l] };
+            });
+            rec(cr);
+            if c.ple > 0 {
+                let cp = ple_block(b, rows_g.clone(), tg, cr, TENSOR_NONE, TENSOR_NONE);
+                rec(cp);
+                cp
+            } else {
+                cr
+            }
         } else {
-            b.emit(DevOp::Residual, elem(t * c.hidden), &[c_d], |d| {
+            let cr = b.emit(DevOp::Residual, elem(tg * c.hidden), &[c_d], |d| {
                 d.t[0] = n.x;
                 d.t[1] = n.x;
                 d.t[2] = ffn_out;
-                d.i[0] = t * c.hidden;
+                d.i[0] = tg * c.hidden;
                 d.f[0] = 1.0;
-            })
+            });
+            rec(cr);
+            cr
         };
+        if let Some(channel) = channel {
+            channel.borrow_mut().push(plow_asset::hetero_channel::Span {
+                layer: l as u32,
+                insts: [mlp_start, b.n_insts() as u32],
+                input: b.tensor_name(mlp_src).into(),
+                residual: b.tensor_name(n.x).into(),
+                intermediate: b.tensor_name(n.fu).into(),
+                down_output: b.tensor_name(n.dg).into(),
+            });
+        }
+    }
+    // J3: the residual stream is complete on every unit before the final norm reads it.
+    if hj && !block_mode {
+        join();
+        b.host_join();
     }
 
     // BLOCK MODE: stop here. `act.x` (n.x) — the post-FFN residual the loop's
@@ -5891,7 +6287,8 @@ fn mx4_prefill_on() -> bool {
         && match emit_config::active().mx4_prefill.as_deref() {
             Some("1") => true,
             Some("0") => false,
-            _ => emit_is_amd(),
+            // The Metal interpreter carries the fp4 prefill rungs (93/96/97/98, 113) too.
+            _ => emit_is_amd() || emit_is_apple(),
         }
 }
 
@@ -6254,6 +6651,10 @@ struct DenseGqaEmitter<'a> {
     amd: bool,
     /// See [`TmapMint`]. RefCell: `emit_prefill`/`emit_decode` take `&self`.
     tmaps: std::cell::RefCell<TmapMint>,
+    /// Heterogeneous prefill (see `hetero.rs`): armed per program by `emit_dense_gqa`, drained after.
+    hetero_on: std::cell::Cell<bool>,
+    hetero: std::cell::RefCell<hetero::ProgCollector>,
+    channel: std::cell::RefCell<Vec<plow_asset::hetero_channel::Span>>,
 }
 
 impl<'a> DenseGqaEmitter<'a> {
@@ -6338,6 +6739,9 @@ impl<'a> DenseGqaEmitter<'a> {
                 base: tensors.len() as u32,
                 ..Default::default()
             }),
+            hetero_on: std::cell::Cell::new(false),
+            hetero: std::cell::RefCell::new(hetero::ProgCollector::default()),
+            channel: std::cell::RefCell::new(Vec::new()),
         };
         (e, tensors, gen)
     }
@@ -6357,6 +6761,77 @@ impl<'a> DenseGqaEmitter<'a> {
             gens.push(g);
         }
         (decls, gens)
+    }
+
+    /// The `hetero.json` sidecar (see `hetero.rs`): activation/weight tensor NAMES so the runtime
+    /// binds by name, plus the per-program lane plans collected during `emit_prefill`.
+    fn hetero_plan(
+        &self,
+        programs: Vec<hetero::ProgPlan>,
+        tensors: &[packet::devbuild::TensorDecl],
+        fp8: bool,
+    ) -> hetero::HeteroPlan {
+        use plow_asset::hetero::WeightEncoding;
+        let mx4 = mx4_prefill_on();
+        let name = |h: u32| tensors[h as usize].name.clone();
+        let opt = |h: u32| (h != TENSOR_NONE).then(|| name(h));
+        let n = &self.tn;
+        let c = self.c;
+        let split = hetero::RowSplit::from_env().unwrap_or_default();
+        hetero::HeteroPlan {
+            schema: plow_asset::hetero::SCHEMA.into(),
+            arch: format!("{:?}", c.arch).to_ascii_lowercase(),
+            hidden: c.hidden,
+            inter: c.inter,
+            qd: c.heads * c.hd_full,
+            kd: c.kvh_full * c.hd_full,
+            eps: c.eps,
+            mlp_act: c.mlp_act,
+            fp8,
+            weight_encoding: if mx4 {
+                WeightEncoding::Mxfp4
+            } else if fp8 {
+                WeightEncoding::Fp8
+            } else {
+                WeightEncoding::Bf16
+            },
+            ane_pct: split.ane_pct,
+            cpu_pct: split.cpu_pct,
+            tensors: hetero::ActTensors {
+                x: name(n.x),
+                hn: name(n.hn),
+                qg: name(n.qg),
+                kg: name(n.kg),
+                vg: name(n.vg),
+                at: name(n.at),
+                og: name(n.og),
+                fu: name(n.fu),
+                dg: name(n.dg),
+            },
+            layers: n
+                .lw
+                .iter()
+                .map(|w| hetero::LayerWeights {
+                    g_in: name(w.g_in),
+                    g_pa: name(w.g_pa),
+                    wq: name(if fp8 || mx4 { w.wq8 } else { w.wq }),
+                    wk: name(if fp8 || mx4 { w.wk8 } else { w.wk }),
+                    wv: name(if fp8 || mx4 { w.wv8 } else { w.wv }),
+                    wo: name(if fp8 || mx4 { w.wo8 } else { w.wo }),
+                    wg: name(if fp8 || mx4 { w.wg8 } else { w.wg }),
+                    wu: name(if fp8 || mx4 { w.wu8 } else { w.wu }),
+                    wd: name(if fp8 || mx4 { w.wd8 } else { w.wd }),
+                    sq: opt(w.sq),
+                    sk: opt(w.sk),
+                    sv: opt(w.sv),
+                    so: opt(w.so),
+                    sg: opt(w.sg),
+                    su: opt(w.su),
+                    sd: opt(w.sd),
+                })
+                .collect(),
+            programs,
+        }
     }
 }
 
@@ -6381,6 +6856,8 @@ impl DevblobEmitter for DenseGqaEmitter<'_> {
             self.block_mode,
             self.amd,
             &self.tmaps,
+            self.hetero_on.get().then_some(&self.hetero),
+            (emit_config::active().ane_mlp_channels.is_some() && t == 128).then_some(&self.channel),
         );
     }
     fn emit_decode(&self, b: &mut Builder, dbatch: u32, dmode: Mode, kv_rows: &mut Vec<u32>) {
@@ -6403,6 +6880,8 @@ impl DevblobEmitter for DenseGqaEmitter<'_> {
             self.block_mode,
             self.amd,
             &self.tmaps,
+            None,
+            None,
         );
     }
 }
@@ -6505,6 +6984,19 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
     let capabilities = emit_capabilities(&model_type);
     let mut emit_cfg = _emit_cfg.unwrap_or_else(emit_config::EmitConfig::from_env);
     apply_production_defaults(&mut emit_cfg, capabilities, &arch, tp);
+    if emit_cfg.ane_mlp_channels.is_some() {
+        assert!(
+            arch == "metal3" && tp == 1 && matches!(model_type.as_str(), "llama" | "qwen3"),
+            "channel MLP requires Metal dense Llama/Qwen3 TP1"
+        );
+        assert!(
+            emit_cfg.row_split.is_none()
+                && !emit_cfg.w8a8
+                && !emit_cfg.packed_prefill_on()
+                && block_spec.is_none(),
+            "channel MLP cannot combine row split, packed prefill, W8A8 or block mode"
+        );
+    }
 
     // Installed process-wide so deeply nested emit functions can call emit_config::active().
     emit_config::install(emit_cfg);
@@ -6527,6 +7019,7 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
             embed_cubin.is_none() && embed_hsaco.is_none(),
             "gpt_oss has no GPU interpreter object to embed (CPU-tier ops only)"
         );
+        let _apple_target = EmitAppleGuard::set(arch == "metal3");
         gptoss::run(
             &dir,
             ctx,
@@ -7498,6 +7991,7 @@ fn emit_dense_gqa(
     let amd = target_is_amd(&arch, &gpu);
     // Same no-target rule as run_verified's guard: legacy (golden) emission stays AMD.
     let _emit_target = EmitAmdGuard::set(amd || (arch.is_empty() && gpu.is_empty()));
+    let _apple_target = EmitAppleGuard::set(arch == "metal3");
     // Same reason as the other entry: the tile selector must cost against THIS part, and
     // `--arch` is the fallback when --gpu cannot answer.
     if amd {
@@ -7545,6 +8039,18 @@ fn emit_dense_gqa(
     // drift when the flags are restructured again.
     let ecfg = emit_config::active();
     let fp8 = ecfg.any_fp8_weights();
+    if let Some(channels) = ecfg.ane_mlp_channels {
+        assert!(
+            !c.moe
+                && c.mlp_act == 1
+                && channels > 0
+                && channels < c.inter
+                && channels % 32 == 0
+                && c.hidden % 32 == 0
+                && c.inter % 32 == 0,
+            "channel MLP requires dense SwiGLU and nonempty 32-aligned channel partitions"
+        );
+    }
     // T8 w8a8 (PLOW_W8A8=1, requires PLOW_FP8=1). PREFILL emits the true fp8 tensor-core path:
     // ONE per-row DevOp::QuantFp8 per activation site + GEMM_FP8/GEMM_GLU_FP8 re-pointed at the
     // fp8 activation (t1=xq) + a_scale (t3). The SAME opcodes serve T6 w8a16 (bf16 activation) —
@@ -7791,6 +8297,8 @@ fn emit_dense_gqa(
         && (!amd || std::env::var_os("PLOW_L2_PLACE_PREFILL").is_some());
     let mut progs = Vec::new();
     let mut tlist = Vec::new();
+    let mut hetero_progs: Vec<hetero::ProgPlan> = Vec::new();
+    let mut channel_progs = Vec::new();
     for &t in &buckets {
         if c.moe && !moe_pf {
             break;
@@ -7837,7 +8345,31 @@ fn emit_dense_gqa(
                 b.force_uniseg();
             }
         }
+        let split = hetero::RowSplit::from_env();
+        emitter.hetero_on.set(split.is_some());
         emitter.emit_prefill(&mut b, t);
+        emitter.hetero_on.set(false);
+        let spans = std::mem::take(&mut *emitter.channel.borrow_mut());
+        if !spans.is_empty() {
+            channel_progs.push(hetero_channel::program(
+                progs.len() as u32,
+                t,
+                c.hidden,
+                spans,
+            ));
+        }
+        let coll = std::mem::take(&mut *emitter.hetero.borrow_mut());
+        if !coll.segments.is_empty() {
+            let (rows_gpu, rows_ane, rows_cpu) = split.unwrap().rows(t);
+            hetero_progs.push(hetero::ProgPlan {
+                prog: progs.len() as u32,
+                t,
+                rows_gpu,
+                rows_ane,
+                rows_cpu,
+                segments: coll.segments,
+            });
+        }
         progs.push(b.finish());
         tlist.push(t);
     }
@@ -8139,6 +8671,13 @@ fn emit_dense_gqa(
     // benchmarked by someone. PLOW_SKIP_COVERAGE=1 is the deliberate escape hatch for
     // partial/renamed checkpoints; it is loud because it re-arms the silent-wrong-model
     // failure mode this gate exists to prevent.
+    let kv_dead: Vec<String> = (0..c.layers as usize)
+        .filter(|&l| c.kv_is_shared(l))
+        .flat_map(|l| {
+            ["k_proj", "v_proj", "k_norm"]
+                .map(|w| format!("{}layers.{l}.self_attn.{w}.weight", c.prefix))
+        })
+        .collect();
     match validate_coverage(
         &dir,
         &c.prefix,
@@ -8147,7 +8686,10 @@ fn emit_dense_gqa(
         // The dense path declares every weight it reads; nothing reaches the device by a
         // name-pattern bind, a load-time fold or a host-side absorption, and nothing it
         // declares is synthesized before the bind, and no weight is conditionally covered.
-        &[],
+        // The one exception is ARCHITECTURAL: a KV-shared layer (Gemma-4 E-series) ships k/v
+        // projections and a k norm that no forward pass reads — HF lists them in
+        // `_keys_to_ignore_on_load_unexpected` — so those exact names are waived here.
+        &kv_dead.iter().map(String::as_str).collect::<Vec<_>>(),
         &[],
         &[],
     ) {
@@ -8165,10 +8707,24 @@ fn emit_dense_gqa(
     check_fp8_a_scale_bound(&m, &arch, &gpu);
     check_gfx950_opcode_coverage(&m, amd);
     check_nvidia_opcode_coverage(&m, amd);
+    check_apple_only_opcodes(&m, arch == "metal3");
     check_group_routing_supported(&m, amd, &arch);
     warn_arch_gpu_vendor_mismatch(&arch, &gpu);
 
+    let channel_plan = ecfg.ane_mlp_channels.map(|channels| {
+        let weights = emitter.hetero_plan(Vec::new(), &m.tensors, fp8);
+        hetero_channel::plan(&m, channels, weights, channel_progs)
+            .unwrap_or_else(|e| panic!("{e}"))
+    });
     std::fs::write(&out, blob).unwrap();
+    if let Some(plan) = channel_plan {
+        let path = std::path::Path::new(&out).with_file_name(plow_asset::hetero::FILE);
+        std::fs::write(&path, serde_json::to_vec_pretty(&plan).unwrap()).unwrap();
+        eprintln!(
+            "  experimental channel MLP plan -> {}; runtime opt-in required (PLOW_ANE_MLP=1)",
+            path.display()
+        );
+    }
 
     // BUILD MANIFEST (`build.json`, beside the .pkt). Derived from `m` — the exact
     // programs just serialized — so it cannot describe a packet other than the one
@@ -8180,6 +8736,19 @@ fn emit_dense_gqa(
     if !arch.is_empty() {
         let man = manifest::build_for_packet(&m, &arch, &lean, &sections);
         report_dispatch_audit(&man);
+        if !hetero_progs.is_empty() {
+            let plan = emitter.hetero_plan(std::mem::take(&mut hetero_progs), &m.tensors, fp8);
+            let hpath = std::path::Path::new(&out).with_file_name("hetero.json");
+            std::fs::write(&hpath, serde_json::to_vec_pretty(&plan).unwrap())
+                .unwrap_or_else(|e| panic!("{}: hetero plan not written: {e}", hpath.display()));
+            eprintln!(
+                "  heterogeneous prefill plan -> {} (ane {}%, cpu {}%, {} programs)",
+                hpath.display(),
+                plan.ane_pct,
+                plan.cpu_pct,
+                plan.programs.len()
+            );
+        }
         let mpath = std::path::Path::new(&out).with_file_name("build.json");
         let cpath = std::path::Path::new(&out).with_file_name("plow_config.h");
         manifest::write_config_header(&cpath, &man)
@@ -8329,3 +8898,27 @@ mod emit_capabilities_tests;
 mod token_batch_contract_tests;
 
 pub mod fp8_m1_role;
+
+/// Opcodes only the Metal interpreter (and the CPU golden tier) implement. Refused at emit for
+/// any other GPU target, so an E-series blob cannot reach a CUDA/HIP interpreter's
+/// `default: __trap()`.
+fn check_apple_only_opcodes(m: &Model, apple: bool) {
+    if apple {
+        return;
+    }
+    const APPLE_ONLY: [DevOp; 1] = [DevOp::PerLayerInput];
+    let bad: Vec<&'static str> = APPLE_ONLY
+        .iter()
+        .filter(|op| {
+            m.progs
+                .iter()
+                .any(|p| p.insts.iter().any(|i| i.op == **op as u16))
+        })
+        .map(|op| op.c_name())
+        .collect();
+    assert!(
+        bad.is_empty(),
+        "this packet carries opcode(s) only the Apple (metal3) interpreter implements: {bad:?}; \
+         emit with --gpu <apple part> or a CPU target"
+    );
+}

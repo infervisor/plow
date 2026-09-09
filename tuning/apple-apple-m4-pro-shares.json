@@ -1,0 +1,55 @@
+{
+  "cells": [
+    {
+      "cpu_share_pct": 0,
+      "cpu_side_ms": 0.0,
+      "decode_ms_median": 19.443542,
+      "ops": null,
+      "split_ops": 0,
+      "text": " Paris. The capital of Italy is Rome. The capital of Spain"
+    },
+    {
+      "cpu_share_pct": 15,
+      "cpu_side_ms": 2.8719990000000006,
+      "decode_ms_median": 23.734125,
+      "ops": 8,
+      "split_ops": 8,
+      "text": " Paris. The capital of Italy is Rome. The capital of Spain"
+    },
+    {
+      "cpu_share_pct": 30,
+      "cpu_side_ms": 3.0085840000000004,
+      "decode_ms_median": 23.6615,
+      "ops": 8,
+      "split_ops": 8,
+      "text": " Paris. The capital of Italy is Rome. The capital of Spain"
+    },
+    {
+      "cpu_share_pct": 15,
+      "cpu_side_ms": 78.39466800000004,
+      "decode_ms_median": 113.282417,
+      "ops": null,
+      "split_ops": 169,
+      "text": " Paris. The capital of Italy is Rome. The capital of Spain"
+    },
+    {
+      "cpu_share_pct": 30,
+      "cpu_side_ms": 71.072082,
+      "decode_ms_median": 113.74245900000001,
+      "ops": null,
+      "split_ops": 169,
+      "text": " Paris. The capital of Italy is Rome. The capital of Spain"
+    }
+  ],
+  "chosen": {
+    "ane": 0.0,
+    "cpu": 0.0,
+    "gpu": 1.0
+  },
+  "gpu": "Apple M4 Pro",
+  "gpu_only_ms": 19.443542,
+  "model": "llama3b-w8",
+  "phase": "decode",
+  "rule": "whole-step median; share = argmin if it beats gpu-only by > 5%, else 0",
+  "schema": "apple-unit-shares-v2"
+}
