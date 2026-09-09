@@ -879,6 +879,40 @@ and the fact that a 21.7% faster prefill kernel bought nothing at concurrency 20
 the second reading, not the first. The next diagnostic is not another kernel: it is finding what
 20 concurrent prefills contend on that one does not.
 
+### The concurrency ceiling is kernel-independent — 1,960 tok/s
+
+Backing the aggregate prefill rate out of the two concurrency-20 runs (total input over the
+benchmark duration minus the decode time its own TPOT implies):
+
+| arm | single-stream prefill | **aggregate prefill @ conc 20** | unaccounted |
+|---|---:|---:|---:|
+| packed prefill, no DMA | 2,529 tok/s | **1,960 tok/s** | 19.2% |
+| + direct-to-LDS staging | 3,078 tok/s | **1,962 tok/s** | 30.5% |
+
+**Two kernels 21.7% apart land on the same number.** And that number is BELOW the slower kernel's
+single-stream rate: concurrency does not merely fail to help prefill here, it costs 22%. A ceiling
+that does not move when the kernel underneath it gets faster is not a kernel ceiling.
+
+The mechanism is in `serve/mux.rs`, and it is stated in the source: **"ONE prefill chunk per tick,
+oldest pending request first"**, and "PREFILL AND DECODE NOW SHARE THE TICK". Sharing the tick was
+itself a fix — before it, a tick was *either* a prefill *or* a decode and every decode stream
+stalled for the whole of someone else's prefill (measured 49.3 tok/s at concurrency 16 against
+91.3 under `amd-bench`). But the pairing is one-to-one: each tick advances exactly one request's
+prefill by one chunk, and also runs a decode step, which at concurrency 20 costs ~190 ms. Prefill
+progress is therefore bounded by the tick rate rather than by how fast a chunk computes, which is
+exactly the invariance the table shows.
+
+There is no knob for it. `PLOW_DSTEP_EVERY` is a per-step *timing* interval, not a scheduling
+cadence. Changing it means changing the mux: admit more than one prefill chunk per tick, or
+decouple the decode cadence from the prefill cadence, both of which have to keep the property the
+shared tick was introduced to get.
+
+**This supersedes §7e's reading.** That section concluded the GPU was saturated by a single
+request, because twenty took ~20x one request's time. The evidence now says otherwise: if the GPU
+were saturated, a 21.7% faster prefill kernel would have produced ~21.7% more aggregate
+throughput. It produced 0.1%. The 20x is a scheduling artifact, not a saturation one, and the next
+work on this target belongs in the scheduler.
+
 ### The comparison target is not ROCm-vs-ROCm
 
 Worth stating before adapting anything: **GLM-5.3's head geometry has no AITER ASM kernel.** The
