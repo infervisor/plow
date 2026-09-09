@@ -568,19 +568,22 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
 #if FA_LDS_DMA
 /* DIRECT-TO-LDS K/V STAGING (opt-in, `-DFA_LDS_DMA=1`).            [LDS-DMA-4B]
  *
- * The register-staged prime/prefetch below holds a whole K and V tile in VGPRs while the previous
- * tile computes. That is the one structural difference between this kernel and AITER's shipped
- * gfx942 MLA prefill, which moves K/V global->LDS with `buffer_load_dword … lds` and never lands
- * them in a register (132 sites there, 0 here). The tiling already matches; the staging did not.
- * See docs/amd/tp-bringup-mi300x.md §7f.
+ * The register prime/prefetch below holds a whole K and V tile in VGPRs while the previous tile
+ * computes. That is the one structural difference between this kernel and AITER's shipped gfx942
+ * MLA prefill, which moves K/V global->LDS with `buffer_load_dword ... lds` and never lands them
+ * in a register (132 sites there, 0 here). The tiling already matches at BM 128 / BN 32 / 4 waves;
+ * the staging did not. docs/amd/tp-bringup-mi300x.md 7f.
  *
  * ONE WAVE ISSUE = 128 bf16 laid down contiguously from a UNIFORM LDS address (cp_async4's
- * contract), so a row of D is D/128 issues and the `+8` LDS pad is never crossed as long as D is
- * a multiple of 128 — which is why this arm asserts that rather than assuming it. Work is split
- * per wave, not per thread: the destination must be wave-uniform.
+ * contract), so a K row is D/128 issues and the `+8` LDS pad is never crossed while D is a
+ * multiple of 128. Work is split per WAVE, not per thread: the destination must be wave-uniform.
  *
- * bf16 ONLY. The fp8-KV arm dequantizes DURING staging (fp8 -> bf16 times the row scale), and a
- * DMA that writes raw bytes cannot do arithmetic on the way, so FP8KV keeps the register path. */
+ * THE ELSE BRANCH IS THE ORIGINAL PATH, character for character -- the same FA_DB_LOAD prime, the
+ * same memcpy into Ksm/Vsm, the same prefetch. That is deliberate: FP8KV dequantizes WHILE staging
+ * (uint8 e4m3 times a per-row f32 scale) and a DMA writes raw bytes, so it can never take this
+ * path; rewriting its staging into "something equivalent" changed instruction selection enough
+ * that `d_flash_mla_prefill_v2` stopped matching its ASM contract. Shapes that cannot DMA keep
+ * exactly the object they had. */
 #define FA_DMA_STAGE(KVB)                                                                        \
     {                                                                                            \
         const unsigned wave_ = threadIdx.x / PLOW_WAVE;                                          \
@@ -604,40 +607,30 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
                           &Vsm[r_ * VSTRIDE + i_ * CP_ASYNC4_BF16]);                             \
         }                                                                                        \
     }
+            /* Eligibility is compile-time: a whole number of 128-bf16 issues per row, square V,
+             * and never fp8. GLM's D=512 / DCH=256 qualify; a 64-wide rope tile does not. */
+            constexpr bool FA_DMA_OK = !FP8KV && (D % CP_ASYNC4_BF16 == 0)
+                                       && (DCH % CP_ASYNC4_BF16 == 0) && (DV == D);
+            if constexpr (!FA_DMA_OK) { FA_DB_LOAD(my_lo); } /* prime, register path only */
             for (unsigned kv0 = my_lo; kv0 < my_hi; kv0 += BKV) {
-                __syncthreads();          /* previous tile's Ksm/Vsm reads are done */
-                /* CAPABILITY-GATED PER INSTANTIATION, not asserted: this kernel is built for
-                 * many head dims, and cp_async4 lays 64 lanes down contiguously at 4 B each, so a
-                 * row must be a whole number of 128-bf16 issues for the LDS pad never to be
-                 * crossed. GLM's D=512 / DCH=256 both divide; a 64-wide rope tile does not.
-                 * FP8KV never takes it — that arm dequantizes while staging and a DMA cannot do
-                 * arithmetic on the way. Everything else keeps the register path, byte-identical. */
-                if constexpr (!FP8KV && (D % CP_ASYNC4_BF16 == 0)
-                              && (DCH % CP_ASYNC4_BF16 == 0) && (DV == D)) {
-                    FA_DMA_STAGE(kv0);    /* global -> LDS, never a VGPR */
-                    cp_async_wait();      /* drain vmcnt BEFORE the barrier publishes the tile */
+                __syncthreads(); /* previous tile's Ksm/Vsm reads are done */
+                if constexpr (FA_DMA_OK) {
+                    FA_DMA_STAGE(kv0); /* global -> LDS, never a VGPR */
+                    cp_async_wait();   /* drain vmcnt BEFORE the barrier publishes the tile */
                 } else {
-                    for (unsigned e = threadIdx.x * 8; e < BKV * D; e += PLOW_THREADS * 8) {
-                        const unsigned r = e / D, c = e % D, kv = kv0 + r;
-                        const bf16v8 tk =
-                            (kv < n_kv_w)
-                                ? ld_glob8(as_glob(K_w)
-                                           + ((size_t)hkv * kv_stride + (kv & kv_mask)) * D + c)
-                                : bf16v8_zero();
-                        __builtin_memcpy(&Ksm[r * STRIDE + c], &tk, 16);
+#pragma unroll
+                    for (int it = 0; it < KPT; it++) {
+                        const unsigned e = threadIdx.x * 8 + it * (PLOW_THREADS * 8);
+                        __builtin_memcpy(&Ksm[(e / D) * STRIDE + e % D], &nk[it], 16);
                     }
-                    for (unsigned e = threadIdx.x * 8; e < BKV * DCH; e += PLOW_THREADS * 8) {
-                        const unsigned r = e / DCH, c = e % DCH, kv = kv0 + r;
-                        const bf16v8 tv =
-                            (kv < n_kv_w)
-                                ? ld_glob8(as_glob(V_w)
-                                           + ((size_t)hkv * kv_stride + (kv & kv_mask)) * DV
-                                           + d_off + c)
-                                : bf16v8_zero();
-                        __builtin_memcpy(&Vsm[r * VSTRIDE + c], &tv, 16);
+#pragma unroll
+                    for (int it = 0; it < VPT; it++) {
+                        const unsigned e = threadIdx.x * 8 + it * (PLOW_THREADS * 8);
+                        __builtin_memcpy(&Vsm[(e / DCH) * VSTRIDE + e % DCH], &nv[it], 16);
                     }
+                    if (kv0 + BKV < my_hi) FA_DB_LOAD(kv0 + BKV);
                 }
-                __syncthreads();          /* Ksm/Vsm visible */
+                __syncthreads(); /* Ksm/Vsm visible */
 #else
             FA_DB_LOAD(my_lo); /* prime */
             for (unsigned kv0 = my_lo; kv0 < my_hi; kv0 += BKV) {
