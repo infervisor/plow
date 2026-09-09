@@ -1454,3 +1454,33 @@ FP8 unified rows with aligned prefix replay. These tests are ignored and have
 not run. The user reinforced the GPU launch pause; there were no GPU launches.
 This candidate is for development and has no production or performance
 qualification. The sealed production-testing release remains unchanged.
+
+## Reclaim unused prefill admission rows
+
+The shared fair-split planner could leave capacity idle when a short request
+appeared late in rotation: offers 100/1 with a 64-row budget produced 32/1 rows.
+It now preserves initial shares and returns leftover rows to admitted requests
+in rotation order, producing 63/1. Request caps, rotation, token order, KV
+frontiers and the existing tick budget remain binding. Whole-span admission,
+used by AMD's fixed program chunks, is unchanged. No allocations were added.
+
+The regression failed before the fix. Nine planner tests now pass, including
+40,000 combinations of demand, budget and rotation that check dense coverage,
+capacity use, per-request bounds and unique slots. Full runtime host suite:
+652 passed, 25 ignored; independent HSA/CUDA all-target checks pass.
+
+CPU-only optimized planner benchmark, median of five 50,000-plan samples:
+
+| Requests | Late-short rows before → after | Planner ns before → after |
+| --- | --- | --- |
+| 2 | 513 → 1024 | 150.5 → 193.8 |
+| 4 | 769 → 1024 | 177.6 → 223.1 |
+| 16 | 961 → 1024 | 345.2 → 408.4 |
+| 128 | 1017 → 1024 | 1982.9 → 2203.7 |
+
+Already-full batches retained 1024 rows; measured planner overhead increased
+by 24–55 ns across these sizes. These numbers include the benchmark's result
+consumption and are not GPU or serving throughput measurements. Harness,
+before/after binaries, paired CSVs and check logs are under campaign
+`prefill-admission-*`. GPU launches remain paused; frozen assets and binaries
+were not replaced.
