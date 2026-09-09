@@ -558,5 +558,35 @@ requested concurrency queues over those slots.
 No CPU builds or other GPU workloads overlapped the run. The raw waves, quality
 capture, metrics, frozen server log and hashes are recorded in
 `plow-bf16-packed-occ1-full-qualification.json` and `plow-bf16-packed-occ1-full.*`
-under the campaign directory. This completes the Plow BF16 grid; the fresh matched
-vLLM BF16 run is still pending. It is not evidence of a vLLM performance win.
+under the campaign directory.
+
+## Clean matched BF16 comparison
+
+The fresh vLLM 0.28.0 run also completes all 90 waves and 1875 requests with no
+overlapping CPU builds or other GPU workloads. All prompt hashes and output lengths
+match Plow. vLLM reports 16 cache misses; Plow reports none. Completion text matches
+for 1687/1875 requests and four of the six natural prompts. Text agreement is a
+numerical diagnostic, not a task-quality score.
+
+Plow loses all 30 cells on median TTFT, median end-to-end latency, median TPOT and
+median-wave throughput. The prefix-cache improvements do not meet the performance goal.
+
+| Input / concurrency | Plow / vLLM TTFT p50, ms | Plow / vLLM TPOT p50, ms | Plow / vLLM output tok/s |
+|---|---:|---:|---:|
+| 1K / 1 | 153 / 34 | 28.66 / 23.58 | 30.70 / 41.82 |
+| 1K / 64 | 11510 / 350 | 76.69 / 42.45 | 83.12 / 1202.64 |
+| 16K / 1 | 699 / 146 | 30.02 / 23.79 | 19.60 / 36.13 |
+| 16K / 64 | 33329 / 7112 | 87.56 / 49.63 | 31.94 / 124.07 |
+
+Both engines use BF16 weights, activations and KV. Plow has eight physical slots;
+vLLM permits up to 64 sequences under its memory scheduler. Both receive concurrency
+through 64. Prefill limits are 1024 tokens for Plow and 2048 for vLLM. Plow uses a
+4096 MiB retained-prefix budget; vLLM uses 90% GPU memory utilization. These are the
+tested serving configurations. The CSV includes p50/p95/p99 distributions and
+per-cell cache-miss counts; text-chunk delivery gaps do not guarantee per-token ITL.
+
+Full results are in `gemma31-h100-bf16-cached-clean-comparison.csv`. Raw proof and
+hashes are `bf16-cached-clean-comparison.json`,
+`vllm-bf16-cached-clean-qualification.json`, and `vllm-bf16-cached-clean.*` under
+the campaign directory. FP8 packing and a faster batched decode path remain work
+toward the requested result; the full objective is not achieved.
