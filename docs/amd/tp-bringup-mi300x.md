@@ -1737,6 +1737,43 @@ order of magnitude every time it was used. The instruments are now in the tree
 (`PLOW_MOE_PF_ABL`, `PLOW_GEMM_ABL`, alongside the existing `PLOW_MLA_PF_ABL` and
 `PLOW_XR_NOWAIT`); the next person to rank work on this target should ablate first.
 
+### Matched-count control: it is the DISTANCE, not the share
+
+Span moves two things at once — the reuse distance and the number of sparse layers — so span 1
+correct / span 2 wrong could not distinguish "a union goes stale two layers on" from "plow's
+selection is only good enough for half the model". `PLOW_GLM_DSA_PF_DEXACT=d` admits ONLY layers
+exactly `d` past an indexer, which holds the count fixed while moving the distance:
+
+```
+ config     gathering layers   reuse distance   40k needle
+ span1            40                  1           FOUND
+ dexact2          41                  2           MISSED
+```
+
+Forty against forty-one, and the outcomes differ. **The reuse distance is the cause.** The share
+of sparse layers is not: 41 sparse layers are fine at distance 1 and broken at distance 2.
+
+The failure is also graded rather than catastrophic — dexact2 returns `' -ALPHA-93.00...'`,
+recovering most of the planted string and dropping its leading `71`, and its repeated-phrase
+continuation is still clean (`' quick brown fox jumps over the lazy dog...'`) where the 78-layer
+build's was not. A union that is stale or subtly wrong degrades the selection; it does not
+corrupt the arithmetic.
+
+So the defect has a narrow, actionable signature: **`n.iuni` is correct for the layer immediately
+after its writer and wrong for the next one**, while nothing writes it in between and the
+reference reuses it across all three layers of a run. Candidates worth checking in that order:
+
+* the counter-graph reduction, which removes exactly 78 edges as "implied by a path" on the
+  all-layer emit — one per layer — and whose implication argument runs through the residual
+  stream that also carries the ordering;
+* whether the flash's GATHER arm writes anything back into the union's mask words (`mlo`/`mhi`
+  live inside the same `n.iuni` allocation as the positions it walks);
+* the `n.iumask` scratch, which op 119 slice-indexes per in-flight workgroup and which is sized
+  by `n_cu`, not by the pack count.
+
+Closing it is worth the rest of the attention term: the 78-layer configuration already measured
+2,747 ms of flash against dense's 17,391 ms, and 13,640 ms of prefill against 25,645 ms.
+
 ## 8. Unrelated issue observed
 
 `cargo test -p devgen mla` fails `k3::tests::the_mla_prefill_arm_forces_one_split`

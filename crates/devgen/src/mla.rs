@@ -4872,7 +4872,21 @@ pub(crate) fn emit_glm_mla_prefill(
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(1);
-    let reuses = (1..=span).any(|d| slot >= d && c.indexer_is_full((slot - d) as u32));
+    // PLOW_GLM_DSA_PF_DEXACT=d admits ONLY layers exactly d past an indexer, where SPAN admits
+    // everything up to d. That is what separates the two live explanations for the span-2
+    // failure, which span alone cannot: span 1 (40 layers, all reuse at distance 1) is correct
+    // and span 2 (59 layers, distances 1 and 2) is not, so distance and layer COUNT both moved.
+    // DEXACT=2 gathers on the 21 indexer layers plus the 19 at exactly distance 2 -- 40 layers,
+    // the SAME count as span 1, with every reuse at distance 2. Correct => the count is what
+    // matters and plow's selection quality is the ceiling; wrong => the distance is, and it is a
+    // bug worth the remaining 6.3x on attention.
+    let dexact = std::env::var("PLOW_GLM_DSA_PF_DEXACT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok());
+    let reuses = match dexact {
+        Some(d) => slot >= d && c.indexer_is_full((slot - d) as u32),
+        None => (1..=span).any(|d| slot >= d && c.indexer_is_full((slot - d) as u32)),
+    };
     let sparse = glm_dsa_pf_bucket(c, t) && (w.iwqb != TENSOR_NONE || reuses) && nh_l == 8;
     let c_sel_pf = if sparse && w.iwqb != TENSOR_NONE {
         Some(emit_glm_dsa_prefill_select(
