@@ -855,6 +855,30 @@ Remaining gap to §7e's target is still large — this is ~22% of a ~10x deficit
 first measured movement on the prefill bottleneck, and it came from the one structural difference
 the AITER disassembly identified.
 
+### The single-stream win does NOT transfer to the target concurrency
+
+The same object, at the actual target workload (70k in / 700 out, concurrency 20, TP8):
+
+| arm | out tok/s | total tok/s | TTFT med | TPOT med |
+|---|---:|---:|---:|---:|
+| baseline (chunk 8192, no route) | 16.09 | 1,625 | 408 s | 439 ms |
+| packed prefill firing | 16.76 | 1,692 | 533 s | 173 ms |
+| **+ direct-to-LDS staging** | **16.53** | **1,670** | 496 s | 191 ms |
+| *vLLM target* | *273.67* | *27,269* | *0.9 s* | *77.8* |
+
+**+21.7% single-stream, 0% at concurrency 20.** That is the result, and it is worth more than the
+21.7% was: a prefill kernel improvement measured in isolation did not move the saturated
+multi-request case at all. Whatever governs throughput at concurrency 20 is not the flash
+kernel's staging, so quoting the single-request figure as progress toward this target would have
+been wrong.
+
+It also re-opens a question §7e closed too early. §7e concluded the GPU is saturated by one
+request because 20 requests took ~20x one request's time. That is consistent with saturation, but
+it is equally consistent with a per-request serialization that a faster kernel cannot help —
+and the fact that a 21.7% faster prefill kernel bought nothing at concurrency 20 is evidence for
+the second reading, not the first. The next diagnostic is not another kernel: it is finding what
+20 concurrent prefills contend on that one does not.
+
 ### The comparison target is not ROCm-vs-ROCm
 
 Worth stating before adapting anything: **GLM-5.3's head geometry has no AITER ASM kernel.** The
