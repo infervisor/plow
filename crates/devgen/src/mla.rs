@@ -5768,6 +5768,17 @@ fn mxfp4_bf16_exceptions() -> &'static [&'static str] {
 /// So this reads `quantization_config` and nothing else.
 fn mla_ckpt_enc(dir: &Path) -> Option<MoeEnc> {
     let v: Value = serde_json::from_slice(&std::fs::read(dir.join("config.json")).ok()?).ok()?;
+    // A multimodal wrapper nests `quantization_config` under `text_config` with the rest of the
+    // text geometry. Reading only the root found NOTHING on such a checkpoint and returned None,
+    // which this function's caller reads as "unquantized" and answers with the flags — so a
+    // Kimi-K2.7-Code emit produced bf16 expert ops for a checkpoint whose routed experts are
+    // 4-bit. That is the exact substitution the refusal below exists to prevent, reached by
+    // looking in the wrong place rather than by a missing arm.
+    let root = &v;
+    let v = match root["model_type"].as_str() {
+        Some("glm5_next") | Some("kimi_k25") => root.get("text_config").unwrap_or(root),
+        _ => root,
+    };
     let q = v.get("quantization_config")?;
     let method = q.get("quant_method").and_then(|m| m.as_str()).unwrap_or("");
     let fmt = q.get("fmt").and_then(|m| m.as_str()).unwrap_or("");
