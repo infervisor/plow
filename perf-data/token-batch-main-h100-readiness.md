@@ -874,3 +874,44 @@ packed checks on the same bucket preserve full logits. Raw logs are
 `packed-tail-skip-{bf16,fp8}-gpu.log` and `packed-tail-skip-host-tests.log` in the
 campaign directory. This change is within the existing packed-prefix path;
 request-latency measurements are pending.
+
+
+## Opt-in FP8 tensor cores inside the decode interpreter
+
+`PLOW_NV_FP8_DECODE_MMA=1` now selects a native BF16 MMA implementation with
+exact E4M3 weight conversion on Hopper. GEMV uses it for M≥8; fused GLU for
+M≥16. Both require K divisible by 256 and the existing 256-thread block.
+The instruction's output-slice ownership and activation precision are preserved,
+with no new scratch allocation, launch or inter-block reduction. The flag
+defaults to zero; rebuilding without it produces the identical baseline cubin.
+
+Final paired synthetic 1K decode-step results, same frozen helper for both
+assets, 16 warmups and 64 measured steps:
+
+| Active slots | Baseline mean ms | Candidate mean ms | Reduction |
+|---:|---:|---:|---:|
+| 1 | 20.983 | 20.954 | 0.1% |
+| 8 | 92.263 | 85.761 | 7.0% |
+| 16 | 109.139 | 107.570 | 1.4% |
+
+The helper predates the latest packed-serving changes. These are decode-step
+measurements, with no CPU builds or other GPU jobs overlapping, not serving
+throughput or vLLM wins. Preserving the interpreter's slice geometry loses
+much of the standalone prototype's speedup. An initial M=8 tensor-core GLU
+regressed, so that shape retains the existing FFMA implementation.
+
+The final probe passes 90 numerical, output-guard and slice-ownership checks;
+Compute Sanitizer reports zero errors. The complete interpreter uses 189
+registers versus 188, with zero stack/local memory and unchanged shared memory.
+
+Model-level checks cover 1K/16K natural prompts at physical slots 7 and 15,
+forcing decode widths 8 and 16. All 256 frames are finite, all four initial
+prefill frames are bit-exact, and greedy top-1 agrees in every frame. Logits
+are not bit-exact: maximum absolute difference 1.078125, minimum cosine
+0.9994801, maximum relative L2 difference 0.0347104. Broad model-quality and
+serving qualification remain open; the route is not promoted to a default.
+
+Reproduction and controls are documented in
+`runtime/nvidia/experiments/gemma_fp8_persistent_probe.md`. Campaign proofs are
+`gemma-fp8-persistent2-qualification.json`, `gemma-fp8-persistent2-step-results.json`
+and `fp8-mma2-model-logits-comparison.json`.

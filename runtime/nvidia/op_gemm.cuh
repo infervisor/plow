@@ -2647,11 +2647,24 @@ __device__ __forceinline__ void gemv_rows_fp8(__nv_bfloat16* __restrict__ C,
     }
 }
 
+#ifndef PLOW_NV_FP8_DECODE_MMA
+#define PLOW_NV_FP8_DECODE_MMA 0
+#endif
+#if PLOW_NV_FP8_DECODE_MMA && defined(PLOW_NV_HOPPER) && PLOW_NV_HOPPER
+#include "op_gemv_fp8_mma.cuh"
+#endif
+
 /* Non-arena overload: standalone test kernels that don't run in the persistent interpreter.
  * MM ladder {1,2,4,8} + block-walk for M>8, identical shape to d_gemv. */
 static __device__ void d_gemv_fp8(__nv_bfloat16* __restrict__ C, const __nv_bfloat16* __restrict__ x,
                            const uint8_t* __restrict__ W, const float* __restrict__ scale,
                            unsigned M, unsigned N, unsigned K, unsigned slice, unsigned nblk) {
+#if PLOW_NV_FP8_DECODE_MMA && defined(PLOW_NV_HOPPER) && PLOW_NV_HOPPER
+    if (M >= 8 && K && !(K % 256) && blockDim.x == 256) {
+        d_gemv_fp8_mma<false>(C, x, W, nullptr, scale, nullptr, M, N, K, 0, slice, nblk);
+        return;
+    }
+#endif
     gemv_walk(M, [&](auto mm, unsigned m0, unsigned rows) {
         gemv_rows_fp8<decltype(mm)::v>(C + (size_t)m0 * N, x + (size_t)m0 * K, W, scale, rows, N,
                                        K, slice, nblk);
@@ -2811,6 +2824,12 @@ static __device__ void d_gemv_glu_fp8(__nv_bfloat16* __restrict__ C, const __nv_
                                const float* __restrict__ sg, const float* __restrict__ su,
                                unsigned M, unsigned N, unsigned K, unsigned act, unsigned slice,
                                unsigned nblk) {
+#if PLOW_NV_FP8_DECODE_MMA && defined(PLOW_NV_HOPPER) && PLOW_NV_HOPPER
+    if (M >= 16 && K && !(K % 256) && blockDim.x == 256) {
+        d_gemv_fp8_mma<true>(C, x, Wg, Wu, sg, su, M, N, K, act, slice, nblk);
+        return;
+    }
+#endif
     gemv_walk(M, [&](auto mm, unsigned m0, unsigned rows) {
         gemv_glu_rows_fp8<decltype(mm)::v>(C + (size_t)m0 * N, x + (size_t)m0 * K, Wg, Wu, sg, su,
                                            rows, N, K, act, slice, nblk);
