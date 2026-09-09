@@ -124,8 +124,13 @@ const CDNA4: [MmaShape; 2] = [
     },
 ];
 
+/// Apple `simdgroup_matrix`: one cooperative 8x8x8 fp16/bf16 tile per simdgroup; the only
+/// matrix shape the ISA offers, so every tile is a multiple of 8 on each axis.
+const APPLE: &[MmaShape] = &[MmaShape { m: 8, n: 8, k: 8 }];
+
 pub fn shapes_for(arch: Arch) -> &'static [MmaShape] {
     match arch {
+        Arch::AppleM3 | Arch::AppleM4 => APPLE,
         Arch::AdaLovelace => &ADA,
         Arch::Hopper => &HOPPER,
         Arch::Blackwell => &BLACKWELL,

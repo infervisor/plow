@@ -815,6 +815,16 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_UNISEG_MAX_T")]
     pub uniseg_max_t: Option<u32>,
 
+    /// Heterogeneous prefill row split on a unified-memory SoC: `ane=<pct>[,cpu=<pct>]` of every
+    /// prefill bucket's rows go to the Neural Engine / CPU lanes (see `hetero.rs`).
+    #[arg(long, env = "PLOW_ROW_SPLIT")]
+    pub row_split: Option<String>,
+
+    /// Emit an experimental channel-MLP sidecar for this many ANE channels.
+    /// Runtime offload additionally requires PLOW_ANE_MLP=1 and ANE placement verification.
+    #[arg(long, env = "PLOW_ANE_MLP_CHANNELS")]
+    pub ane_mlp_channels: Option<u32>,
+
     /// Narrow GLM dispatch to the workgroups that own work. DEFAULT ON (`=0` for the
     /// A/B control arm); the emitted arithmetic is unchanged either way.
     #[arg(long, env = "PLOW_GLM_WGFIT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
@@ -1072,6 +1082,12 @@ impl EmitConfig {
             qwen_prefill: std::env::var("PLOW_QWEN_PREFILL").ok(),
             pf_gfuse: env_bool("PLOW_PF_GFUSE"),
             uniseg_max_t: env_u32("PLOW_UNISEG_MAX_T"),
+            row_split: std::env::var("PLOW_ROW_SPLIT")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            ane_mlp_channels: std::env::var("PLOW_ANE_MLP_CHANNELS")
+                .ok()
+                .map(|v| v.parse().expect("ANE MLP channel count")),
             glm_wgfit: env_opt_out("PLOW_GLM_WGFIT"),
             tunedb: std::env::var("PLOW_TUNEDB").ok(), // preserves "" for "disable tuning"
             audit_occ_floor: env_u32("PLOW_AUDIT_OCC_FLOOR"),
@@ -1510,7 +1526,10 @@ mod tests {
         found.sort();
         found.dedup();
         let diagnostic = |k: &str| {
-            k.ends_with("_DUMP") || k.ends_with("_REPORT") || k.ends_with("_QUIET") || k == "PLOW_ROOT"
+            k.ends_with("_DUMP")
+                || k.ends_with("_REPORT")
+                || k.ends_with("_QUIET")
+                || k == "PLOW_ROOT"
         };
         let missing: Vec<&String> = found
             .iter()

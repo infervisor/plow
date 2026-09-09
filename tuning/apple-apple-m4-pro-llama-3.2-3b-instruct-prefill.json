@@ -1,0 +1,58 @@
+{
+  "schema": "apple-prefill-split-v1",
+  "gpu": "Apple M4 Pro",
+  "model": "Llama-3.2-3B-Instruct",
+  "prompt_tokens": 128,
+  "rule": "whole-prefill median; split = argmin if it beats gpu-only by > 5% with the same first token, else 0",
+  "gpu_only_ms": 405.6865,
+  "cells": [
+    {
+      "ane_pct": 0,
+      "cpu_pct": 0,
+      "prefill_ms_median": 405.6865,
+      "prefill_ms_min": 405.341084,
+      "ane_ms": 0.0,
+      "cpu_ms": 0.0,
+      "gpu_wait_ms": 0.0,
+      "first_token": 1105,
+      "same_first_token": true
+    },
+    {
+      "ane_pct": 25,
+      "cpu_pct": 0,
+      "prefill_ms_median": 415.712666,
+      "prefill_ms_min": 415.153292,
+      "ane_ms": 165.14837,
+      "cpu_ms": 0.0,
+      "gpu_wait_ms": 155.479166,
+      "first_token": 1105,
+      "same_first_token": true
+    },
+    {
+      "ane_pct": 40,
+      "cpu_pct": 0,
+      "prefill_ms_median": 414.701875,
+      "prefill_ms_min": 413.88408300000003,
+      "ane_ms": 164.64583299999998,
+      "cpu_ms": 0.0,
+      "gpu_wait_ms": 153.944833,
+      "first_token": 1105,
+      "same_first_token": true
+    },
+    {
+      "ane_pct": 50,
+      "cpu_pct": 0,
+      "prefill_ms_median": 263.26975000000004,
+      "prefill_ms_min": 262.856459,
+      "ane_ms": 165.23208800000003,
+      "cpu_ms": 0.0,
+      "gpu_wait_ms": 3.399415,
+      "first_token": 1105,
+      "same_first_token": true
+    }
+  ],
+  "chosen": {
+    "ane_pct": 50,
+    "cpu_pct": 0
+  }
+}

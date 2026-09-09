@@ -1,6 +1,7 @@
 /* Norm family: op_norm.h ported 1:1. Rows are the slice axis (row = slice; row += nblk),
  * except HEADNORM_ROPE whose item is a (token, head) packed G_WAVES per workgroup. */
 #include "golden.h"
+#include "../fp8_common.h"
 
 static float row_ss(const plow_bf16* x, uint32_t n) {
     float ss = 0.0f;
@@ -11,8 +12,7 @@ static float row_ss(const plow_bf16* x, uint32_t n) {
     return ss;
 }
 
-/* t0=out t1=x t2=gamma?  i0=rows i1=feat i2=out_row0  f0=eps.
- * t3/t4 (fused w8a8 activation quant) are not ported: a packet carrying them gets a qNaN row. */
+/* t0=out t1=x t2=gamma? t3=quant? t4=scale? i0=rows i1=feat i2=out_row0 f0=eps. */
 G_K(g_rmsnorm) {
     (void)ctx;
     plow_bf16* out = PLOW_CPU_TEN(in, T, 0);
@@ -24,11 +24,19 @@ G_K(g_rmsnorm) {
     for (uint32_t row = slice; row < rows; row += nblk) {
         const plow_bf16* xr = x + (size_t)row * feat;
         plow_bf16* o = out + (size_t)(out_row0 + row) * feat;
-        if (quant) { g_poison_row(o, feat); continue; }
         const float inv = g_rsqrt(row_ss(xr, feat) / (float)feat + eps);
         for (uint32_t i = 0; i < feat; i++) {
             const float g = gamma ? plow_bf2f(gamma[i]) : 1.0f;
             o[i] = plow_f2bf(plow_bf2f(xr[i]) * inv * g);
+        }
+        if (quant) {
+            uint8_t* q = PLOW_CPU_TEN(in, T, 3);
+            float* scale = PLOW_CPU_TEN(in, T, 4);
+            float amax = 0.0f;
+            for (uint32_t i = 0; i < feat; i++) amax = fmaxf(amax, fabsf(plow_bf2f(o[i])));
+            scale[row] = fmaxf(amax * (1.0f / PLOW_FP8_E4M3_MAX), 1e-12f);
+            const float qinv = 1.0f / scale[row];
+            for (uint32_t i = 0; i < feat; i++) q[(size_t)row * feat + i] = plow_f32_to_e4m3(plow_bf2f(o[i]) * qinv);
         }
     }
 }
@@ -89,6 +97,7 @@ G_K(g_headnorm_rope) {
     const uint32_t skip_norm = in->i[4], n_batch_kv = in->i[6];
     const uint32_t out_stride = in->fj[1].u, kv_mask = in->fj[2].u;
     const float eps = in->fj[0].f;
+    const int fp8 = in->op == PLOW_DOP_HEADNORM_ROPE_FP8;
     /* i5: 0 = the legacy rule (hd 64 interleaved, hd 128 half-split), 1 = force interleaved at
      * hd 128, 2 = force half-split (GPT-OSS NeoX at hd 64). */
     const int interleave = in->i[5] == 2u ? 0 : (hd == 64u) || (hd == 128u && in->i[5] == 1u);
@@ -131,7 +140,16 @@ G_K(g_headnorm_rope) {
                 }
                 for (uint32_t i = 0; i < hd; i++) v[i] = r[i];
             }
-            for (uint32_t i = 0; i < hd; i++) out[obase + i] = plow_f2bf(v[i]);
+            if (fp8) {
+                float amax = 0.0f;
+                for (uint32_t i = 0; i < hd; i++) amax = fmaxf(amax, fabsf(v[i]));
+                const float qinv = amax > 0.0f ? PLOW_FP8_E4M3_MAX / amax : 0.0f;
+                float* scales = PLOW_CPU_TEN(in, T, 6);
+                scales[obase / hd] = amax * (1.0f / PLOW_FP8_E4M3_MAX);
+                for (uint32_t i = 0; i < hd; i++) ((uint8_t*)out)[obase + i] = plow_f32_to_e4m3(v[i] * qinv);
+            } else {
+                for (uint32_t i = 0; i < hd; i++) out[obase + i] = plow_f2bf(v[i]);
+            }
         }
     }
 }
@@ -213,6 +231,61 @@ G_K(g_norm_residual_norm) {
         for (uint32_t i = 0; i < feat; i++) {
             const float g = gn ? plow_bf2f(gn[i]) : 1.0f;
             out[base + i] = plow_f2bf(plow_bf2f(resid[base + i]) * invr * g);
+        }
+    }
+}
+
+/* Op 155 (dev_isa.h): Gemma-4 E-series per-layer input block, in place on x.
+ * t0=x t1=Wg[P][H] t2=Wp[H][P] t3=gamma_post[H] t4=ple[T][stride] t5=hn_out? t6=gamma_next?
+ * i0=T i1=H i2=P i3=col0 i4=stride  f0=eps f1=layer_scalar.
+ * bf16 rounding follows the HF module boundaries (gate out, act, product, projection out). */
+G_K(g_per_layer_input) {
+    plow_bf16* x = PLOW_CPU_TEN(in, T, 0);
+    const plow_bf16* wg = PLOW_CPU_TEN(in, T, 1);
+    const plow_bf16* wp = PLOW_CPU_TEN(in, T, 2);
+    const plow_bf16* gamma = PLOW_CPU_TEN(in, T, 3);
+    const plow_bf16* ple = PLOW_CPU_TEN(in, T, 4);
+    plow_bf16* hn = PLOW_CPU_TEN(in, T, 5);
+    const plow_bf16* gnext = PLOW_CPU_TEN(in, T, 6);
+    const uint32_t rows = in->i[0], H = in->i[1], P = in->i[2], col0 = in->i[3], stride = in->i[4];
+    const float eps = in->fj[0].f, ls = in->fj[1].f;
+    if (P > 1024u || !ctx || !ctx->scratch || ctx->scratch_bytes < (size_t)(P + H) * sizeof(float)) {
+        for (uint32_t t = slice; t < rows; t += nblk) g_poison_row(x + (size_t)t * H, H);
+        return;
+    }
+    float* a = (float*)ctx->scratch;
+    float* y = a + P;
+    for (uint32_t t = slice; t < rows; t += nblk) {
+        plow_bf16* xr = x + (size_t)t * H;
+        const plow_bf16* pr = ple + (size_t)t * stride + col0;
+        for (uint32_t p = 0; p < P; p++) {
+            const plow_bf16* w = wg + (size_t)p * H;
+            float s = 0.0f;
+            for (uint32_t h = 0; h < H; h++) s += plow_bf2f(w[h]) * plow_bf2f(xr[h]);
+            const float g = plow_bf2f(plow_f2bf(g_gelu_tanh(plow_bf2f(plow_f2bf(s)))));
+            a[p] = plow_bf2f(plow_f2bf(g * plow_bf2f(pr[p])));
+        }
+        float ss = 0.0f;
+        for (uint32_t h = 0; h < H; h++) {
+            const plow_bf16* w = wp + (size_t)h * P;
+            float s = 0.0f;
+            for (uint32_t p = 0; p < P; p++) s += plow_bf2f(w[p]) * a[p];
+            y[h] = plow_bf2f(plow_f2bf(s));
+            ss += y[h] * y[h];
+        }
+        const float inv = g_rsqrt(ss / (float)H + eps);
+        for (uint32_t h = 0; h < H; h++) {
+            const float g = gamma ? plow_bf2f(gamma[h]) : 1.0f;
+            const float n = plow_bf2f(plow_f2bf(y[h] * inv * g));
+            xr[h] = plow_f2bf(plow_bf2f(plow_f2bf(plow_bf2f(xr[h]) + n)) * ls);
+        }
+        if (hn) {
+            const float inv2 = g_rsqrt(row_ss(xr, H) / (float)H + eps);
+            plow_bf16* o = hn + (size_t)t * H;
+            for (uint32_t h = 0; h < H; h++) {
+                const float g = gnext ? plow_bf2f(gnext[h]) : 1.0f;
+                o[h] = plow_f2bf(plow_bf2f(xr[h]) * inv2 * g);
+            }
         }
     }
 }

@@ -76,6 +76,12 @@ struct Cli {
     #[arg(long, default_value_t = 1)]
     num_gpus: usize,
 
+    /// Apple SoC unit shares, e.g. `gpu:0.7,cpu:0.3` or `gpu:1,ane:0` (rung 3 of the Apple
+    /// plan): the compiler's `Soc::heterogeneous` weights. Take them from a measurement
+    /// (`plowrt` example `apple_calibrate`); a zero share drops the unit.
+    #[arg(long)]
+    unit_shares: Option<String>,
+
     /// Parallel strategy across the GPUs.
     #[arg(long, value_enum, default_value_t = Parallel::Tp)]
     parallel: Parallel,
@@ -546,6 +552,35 @@ struct VizCli {
     open: bool,
 }
 
+/// `gpu:0.7,cpu:0.3,ane:0` -> unit weights; unknown unit names and non-numbers are errors.
+fn parse_unit_shares(spec: &str) -> Result<Vec<(costmodel::UnitKind, f64)>, String> {
+    let mut out = Vec::new();
+    for part in spec.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let (name, w) = part
+            .split_once(':')
+            .ok_or_else(|| format!("--unit-shares: expected unit:weight, got {part:?}"))?;
+        let kind = match name.trim().to_ascii_lowercase().as_str() {
+            "gpu" => costmodel::UnitKind::Gpu,
+            "cpu" => costmodel::UnitKind::Cpu,
+            "ane" | "npu" => costmodel::UnitKind::Ane,
+            other => {
+                return Err(format!(
+                    "--unit-shares: unknown unit {other:?} (gpu|cpu|ane)"
+                ))
+            }
+        };
+        let w: f64 = w
+            .trim()
+            .parse()
+            .map_err(|e| format!("--unit-shares: weight for {name}: {e}"))?;
+        out.push((kind, w));
+    }
+    if out.is_empty() {
+        return Err("--unit-shares: no units".into());
+    }
+    Ok(out)
+}
+
 /// Apply `--replay-knobs <build.json>`'s recorded configuration to the environment.
 ///
 /// The read half of the emit-knob record. `build.json` now carries every knob `EmitConfig`
@@ -626,6 +661,15 @@ fn main() -> ExitCode {
     };
     devgen::emit_config::record_knobs(Some(&matches));
 
+    // An Apple target has no `sm_*`/`gfx*` object: the Metal interpreter compiles its MSL at
+    // load and executes the same single-segment (uniseg) packet shape as sm_120. Resolve the
+    // arch from the part unless one was named explicitly.
+    if let Some(spec) = hwspec::registry::lookup(&cli.gpu) {
+        if spec.vendor == hwspec::Vendor::Apple && cli.arch == "sm_120a" {
+            cli.arch = hwspec::IsaLevel::Metal3.arch_flag().to_string();
+        }
+    }
+
     // DEFAULT ON FOR sm_120. The persistent sm_120 interpreter runs every op in one cooperative
     // launch and implements the coarse single-segment path only, so a segmented blob is not
     // something that target can express. Without this, a plain `--hf-dir --arch sm_120a` compile
@@ -650,6 +694,45 @@ fn main() -> ExitCode {
             "uniseg",
             if cli.emit_cfg.uniseg { "true" } else { "false" }.into(),
         );
+    }
+    // `--unit-shares` on an Apple target is the heterogeneous prefill ROW split (devgen `hetero.rs`):
+    // the ANE/CPU shares become row percentages of every prefill bucket. `--row-split` wins if given.
+    if cli.arch == "metal3" && cli.emit_cfg.row_split.is_none() {
+        if let Some(spec) = cli.unit_shares.as_deref() {
+            let shares = match parse_unit_shares(spec) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let total: f64 = shares.iter().map(|(_, w)| w).sum();
+            let pct = |kind: costmodel::UnitKind| -> u32 {
+                shares
+                    .iter()
+                    .filter(|(k, _)| *k == kind)
+                    .map(|(_, w)| (w / total.max(1e-9) * 100.0).round() as u32)
+                    .sum()
+            };
+            let (ane, cpu) = (pct(costmodel::UnitKind::Ane), pct(costmodel::UnitKind::Cpu));
+            if ane + cpu > 0 {
+                let spec = format!("ane={ane},cpu={cpu}");
+                std::env::set_var("PLOW_ROW_SPLIT", &spec);
+                cli.emit_cfg.row_split = Some(spec);
+            }
+        } else if let Some(spec) = hwspec::registry::lookup(&cli.gpu) {
+            // Legacy records cannot qualify a dtype/OS/kernel/real-row cell. Until the
+            // row-range policy loader is implemented, only explicit settings enable lanes.
+            let slug = spec.name.to_lowercase().replace(' ', "-");
+            if let Some(model_slug) = cli.hf_dir.as_deref().map(plowc::hf_config::dir_slug) {
+                let path = std::path::PathBuf::from(format!(
+                    "tuning/apple-{slug}-{model_slug}-prefill.json"
+                ));
+                if path.exists() {
+                    tracing::warn!(record = %path.display(), "apple: unqualified prefill calibration ignored; GPU-only (use --row-split for an explicit experiment)");
+                }
+            }
+        }
     }
     let cli = cli;
 
@@ -1582,7 +1665,7 @@ fn build_cubin_from_manifest(
 fn effective_uniseg(arch: &str, configured: bool, segmented: bool, env_present: bool) -> bool {
     if segmented {
         false
-    } else if arch.starts_with("sm_120") && !env_present {
+    } else if (arch.starts_with("sm_120") || arch == "metal3") && !env_present {
         true
     } else {
         configured
@@ -1852,6 +1935,10 @@ fn run(cli: Cli) -> Result<Report, Box<dyn std::error::Error>> {
         gpu: cli.gpu,
         num_gpus: cli.num_gpus,
         parallel: cli.parallel,
+        unit_shares: match &cli.unit_shares {
+            None => None,
+            Some(spec) => Some(parse_unit_shares(spec)?),
+        },
         batches,
         seqs,
         phases: cli.phase.phases(),

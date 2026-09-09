@@ -12,9 +12,20 @@
 #else
 #define PLOW_X86 0
 #endif
+#if defined(__aarch64__)
+#define PLOW_ARM64 1
+#else
+#define PLOW_ARM64 0
+#endif
 #if defined(__linux__)
 #include <sys/syscall.h>
 #include <unistd.h>
+#if PLOW_ARM64
+#include <sys/auxv.h>
+#endif
+#endif
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
 #endif
 
 /* Linux: request XTILEDATA before any AMX instruction, or the first one SIGILLs. */
@@ -58,6 +69,23 @@ static int detect_isa(void) {
     /* XTILECFG (17) and XTILEDATA (18) must be enabled in XCR0 after the request. */
     if ((xgetbv0() & (3ull << 17)) != (3ull << 17)) return PLOW_CPU_ISA_AVX512;
     return PLOW_CPU_ISA_AMX;
+#elif PLOW_ARM64
+    /* The NEON tier is armv8.6: it needs FEAT_BF16 (bfdot/bfmmla) and FEAT_I8MM. */
+#if defined(__APPLE__)
+    int bf16 = 0, i8mm = 0;
+    size_t n = sizeof(int);
+    if (sysctlbyname("hw.optional.arm.FEAT_BF16", &bf16, &n, NULL, 0) != 0) bf16 = 0;
+    n = sizeof(int);
+    if (sysctlbyname("hw.optional.arm.FEAT_I8MM", &i8mm, &n, NULL, 0) != 0) i8mm = 0;
+    if (!(bf16 && i8mm)) return PLOW_CPU_ISA_SCALAR;
+#elif defined(__linux__)
+    /* HWCAP2 bits: I8MM = 13, BF16 = 14 (arch/arm64/include/uapi/asm/hwcap.h). */
+    unsigned long hw2 = getauxval(AT_HWCAP2);
+    if (!((hw2 >> 13) & 1) || !((hw2 >> 14) & 1)) return PLOW_CPU_ISA_SCALAR;
+#else
+    return PLOW_CPU_ISA_SCALAR;
+#endif
+    return PLOW_CPU_ISA_NEON;
 #else
     return PLOW_CPU_ISA_SCALAR;
 #endif
@@ -75,6 +103,7 @@ int plow_cpu_init(int isa_cap) {
     plow_cpu_register_golden(tab);
     plow_cpu_register_golden_fp8(tab);
     plow_cpu_table_mark(before, PLOW_CPU_ISA_SCALAR);
+#if PLOW_X86
     if (isa >= PLOW_CPU_ISA_AVX512) {
         memcpy(before, tab, sizeof(before));
         plow_cpu_register_avx512(tab);
@@ -87,6 +116,14 @@ int plow_cpu_init(int isa_cap) {
         plow_cpu_register_amx_fp8(tab);
         plow_cpu_table_mark(before, PLOW_CPU_ISA_AMX);
     }
+#elif PLOW_ARM64
+    if (isa >= PLOW_CPU_ISA_NEON) {
+        memcpy(before, tab, sizeof(before));
+        plow_cpu_register_neon(tab);
+        plow_cpu_register_neon_fp8(tab);
+        plow_cpu_table_mark(before, PLOW_CPU_ISA_NEON);
+    }
+#endif
     /* Debug bisection: PLOW_CPU_GOLDEN_OPS="1,16,20" pins the listed ops back to their
      * golden kernels while every other op keeps its fast tier — localizes a tier bug
      * inside a real model run without rebuilding. */
@@ -117,7 +154,9 @@ int plow_cpu_thread_init(PlowCpuCtx* ctx) {
     if (!ctx) return -EINVAL;
     if (g_isa < 0) return -EAGAIN;
     ctx->isa = (uint32_t)g_isa;
+#if PLOW_X86
     if (g_isa >= PLOW_CPU_ISA_AMX) return plow_cpu_thread_init_amx(ctx);
+#endif
     return 0;
 }
 

@@ -1405,3 +1405,22 @@ FP8 packed compiler emission and runtime execution remain gated pending device
 qualification and object routing. User explicitly paused GPU launches while
 authorizing continued code/build work. Frozen release assets and the manual
 traffic service remain unchanged. Campaign logs: `fp8-packed-*.log`.
+
+## Main refresh with GPU launches paused
+
+Integrated main `c7a6a0b` (Apple Silicon PR20). Compiler conflict resolution keeps
+the cuBLASLt fusion exclusion and Apple's effective GPU row count. Configuration
+resolution retains both shared prefix/token-batch default tests and Apple's
+independent default-off channel test.
+
+Post-merge checks pass: 92 asset unit tests plus10 integration tests;398 compiler
+unit tests and the six KV/18 packed-default emit cases;650 runtime host tests;
+independent HSA-only and CUDA-only all-target checks. The H100 packed PX-4 object
+was rebuilt against the merged ISA header and its two ABI markers verified on
+the CPU. The release build and CLI help check pass. No GPU launch was made.
+
+Development binary (separate from the frozen release): campaign
+`bin/plowrt-main-c7a6a0b-packed-fp8-contract`, SHA-256
+`0a2755cdf67269321616b430ef9d99c722b64241f87d3efbe9d3ce442a00a965`.
+Logs: `main-c7a6a0b-*.log`. This binary has no new device qualification. The
+FP8 packed execution/default gates and production qualification remain open.

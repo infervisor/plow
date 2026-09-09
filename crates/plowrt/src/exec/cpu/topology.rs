@@ -192,6 +192,18 @@ impl Topology {
     }
 
     fn fallback() -> Topology {
+        // macOS: only the performance cluster. Apple's E-cores have a fraction of the P-core
+        // memory bandwidth and vector throughput, and the static per-CU streams hand every
+        // worker the same share, so an E-core worker stalls the step (M4 Pro, Llama-3.2-3B bf16:
+        // 8 P-core workers 43.8 ms/tok, 12 workers 105.6 ms/tok). No hard affinity exists on
+        // Darwin; workers.rs asks for the user-interactive QoS class instead.
+        #[cfg(all(target_os = "macos", feature = "cpu"))]
+        let n = darwin_perf_cores().unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1) as u32
+        });
+        #[cfg(not(all(target_os = "macos", feature = "cpu")))]
         let n = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1) as u32;
@@ -356,4 +368,22 @@ mod tests {
             assert!(bad.parse::<NumaMode>().is_err(), "{bad}");
         }
     }
+}
+
+#[cfg(all(target_os = "macos", feature = "cpu"))]
+fn darwin_perf_cores() -> Option<u32> {
+    let name = b"hw.perflevel0.logicalcpu\0";
+    let mut v: u32 = 0;
+    let mut len = std::mem::size_of::<u32>();
+    // SAFETY: sysctlbyname with a NUL-terminated name, an out buffer of `len` bytes, no new value.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr() as *const libc::c_char,
+            &mut v as *mut u32 as *mut libc::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (rc == 0 && v > 0).then_some(v)
 }

@@ -43,6 +43,10 @@ pub enum IsaLevel {
     Gfx942,
     /// AMD CDNA 4 (MI350X/MI355X). 160 KiB LDS, double-K bf16 MFMA.
     Gfx950,
+    /// Apple GPU family 9 (M3/M4): Metal 3 shading language, `simdgroup_matrix`, 32-lane
+    /// simdgroups, 32 KiB threadgroup memory, no tensor units. One level for both chips because
+    /// a `.metallib` (or MSL source compiled at load) built for one runs on the other.
+    Metal3,
     /// Portable scalar reference. Always available; never fast.
     CpuRef,
 }
@@ -57,6 +61,7 @@ impl IsaLevel {
             IsaLevel::Sm120a => "sm_120a",
             IsaLevel::Gfx942 => "gfx942",
             IsaLevel::Gfx950 => "gfx950",
+            IsaLevel::Metal3 => "metal3",
             IsaLevel::CpuRef => "cpu",
         }
     }
@@ -67,6 +72,7 @@ impl IsaLevel {
                 Vendor::Nvidia
             }
             IsaLevel::Gfx942 | IsaLevel::Gfx950 => Vendor::Amd,
+            IsaLevel::Metal3 => Vendor::Apple,
             // The CPU reference has no vendor in the GPU sense; it is reported as
             // NVIDIA only because `Vendor` has no third variant. Callers should
             // branch on `IsaLevel`, which is why this is the one lossy mapping.
@@ -85,6 +91,7 @@ impl IsaLevel {
             (Vendor::Nvidia, (12, 0)) => IsaLevel::Sm120a,
             (Vendor::Amd, (9, 4)) => IsaLevel::Gfx942,
             (Vendor::Amd, (9, 5)) => IsaLevel::Gfx950,
+            (Vendor::Apple, (3, _) | (4, _)) => IsaLevel::Metal3,
             _ => return None,
         })
     }
@@ -210,6 +217,22 @@ impl IsaLevel {
                     MmaDtype::Fp4,
                     MmaDtype::Int8,
                 ],
+            },
+            // `simdgroup_matrix` is a cooperative 8x8 fp16/bf16 matmul on the SIMD ALUs — not
+            // a tensor core, and not `mma.sync` in the PTX sense; the flags below are all
+            // NVIDIA/AMD instruction families this ISA does not have.
+            IsaLevel::Metal3 => IsaCaps {
+                mma_sync: false,
+                wgmma: false,
+                tcgen05: false,
+                tmem: false,
+                tma: false,
+                dsm_cluster: false,
+                mfma: false,
+                block_scale_mma: false,
+                mx_scale_cvt: false,
+                warp_lanes: 32,
+                mma_dtypes: &[MmaDtype::Fp16, MmaDtype::Bf16],
             },
             IsaLevel::CpuRef => IsaCaps {
                 mma_sync: false,
@@ -479,6 +502,7 @@ impl HardwareFingerprint {
         let vendor = match self.isa.vendor() {
             Vendor::Nvidia => "nvidia",
             Vendor::Amd => "amd",
+            Vendor::Apple => "apple",
         };
         let sku: String = self
             .sku
@@ -654,6 +678,7 @@ mod tests {
             IsaLevel::Sm120a,
             IsaLevel::Gfx942,
             IsaLevel::Gfx950,
+            IsaLevel::Metal3,
             IsaLevel::CpuRef,
         ] {
             assert_eq!(

@@ -19,6 +19,9 @@ pub enum UnitKind {
     Gpu,
     Npu,
     Cpu,
+    /// Apple Neural Engine: static-shape CoreML programs driven from the host (see
+    /// plans/apple-silicon-backend.md §4.5); a coarse unit, never a live-counter one.
+    Ane,
 }
 
 /// One compute unit: its cost model plus a relative throughput weight used to
@@ -39,6 +42,11 @@ pub struct MemoryModel {
     /// shared operand is staged from DRAM once. Discrete memory would make
     /// cross-unit operands explicit interconnect transfers.
     pub unified: bool,
+    /// One memory bus shared by every unit, in bytes/s: the sum of the units' DRAM traffic is
+    /// capped here rather than per unit. `None` = each unit has its own memory system (a discrete
+    /// GPU's HBM). Measured on the M4 Pro: GPU alone 255 GB/s, GPU + CPU together 247 GB/s — a
+    /// per-unit sum would predict 490 (plans/apple-silicon-backend.md §9).
+    pub shared_bw: Option<f64>,
 }
 
 /// A heterogeneous System-on-Chip: a set of units over a memory model.
@@ -65,7 +73,10 @@ impl<'a> Soc<'a> {
                 weight: 1.0,
                 cm: CostModel::new(spec, page_bytes),
             }],
-            memory: MemoryModel { unified: true },
+            memory: MemoryModel {
+                unified: true,
+                shared_bw: None,
+            },
         }
     }
 
@@ -81,7 +92,51 @@ impl<'a> Soc<'a> {
             .collect();
         Soc {
             units,
-            memory: MemoryModel { unified: true },
+            memory: MemoryModel {
+                unified: true,
+                shared_bw: None,
+            },
+        }
+    }
+
+    /// A unified-memory SoC with per-unit throughput weights — the rung-3 shape of
+    /// plans/apple-silicon-backend.md. `units` are `(kind, weight)`; a zero weight is dropped, so
+    /// `[(Gpu, 1.0), (Cpu, 0.0), (Ane, 0.0)]` degenerates to [`Soc::single`]. Every unit shares
+    /// the GPU spec's cost model: the partition granularity (`mma::max_n`) is per arch, and on
+    /// Apple parts it is the same 8 for the GPU's `simdgroup_matrix` as for the NEON/ANE tiles.
+    pub fn heterogeneous(
+        spec: &'a GpuSpec,
+        page_bytes: u64,
+        units: &[(UnitKind, f64)],
+        shared_bw: Option<f64>,
+    ) -> Soc<'a> {
+        let units: Vec<Unit<'a>> = units
+            .iter()
+            .filter(|(_, w)| *w > 0.0)
+            .enumerate()
+            .map(|(id, &(kind, weight))| Unit {
+                id,
+                kind,
+                weight,
+                cm: CostModel::new(spec, page_bytes),
+            })
+            .collect();
+        let units = if units.is_empty() {
+            vec![Unit {
+                id: 0,
+                kind: UnitKind::Gpu,
+                weight: 1.0,
+                cm: CostModel::new(spec, page_bytes),
+            }]
+        } else {
+            units
+        };
+        Soc {
+            units,
+            memory: MemoryModel {
+                unified: true,
+                shared_bw,
+            },
         }
     }
 

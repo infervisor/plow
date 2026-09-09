@@ -15,6 +15,7 @@ fn opts(out: std::path::PathBuf) -> Options {
         tuning_db: None,
         gpu: "H100 SXM5".into(),
         num_gpus: 1,
+        unit_shares: None,
         parallel: Parallel::Tp,
         // Realistic shapes: fine per-tile counters (ClusterMode::Fine, now the
         // default) emit per-consumer-tile counters that match the fine schedule,

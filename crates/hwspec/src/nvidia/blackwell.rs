@@ -114,6 +114,7 @@ pub const B200: GpuSpec = GpuSpec {
     chiplet: None, // Each die is a separate unit in the Soc; no intra-unit chiplets.
     l2_partitioning: Some(GB100_L2),
     clock_boost: Hertz::from_mhz(1965),
+    soc: None,
 };
 
 /// RTX 5090 — 170 SMs, 32 GiB GDDR7, ~1.8 TB/s.
@@ -139,6 +140,7 @@ pub const RTX_5090: GpuSpec = GpuSpec {
     chiplet: None,      // Monolithic GB202 die.
     l2_partitioning: None,
     clock_boost: Hertz::from_mhz(2407),
+    soc: None,
 };
 
 /// RTX PRO 6000 Blackwell — full-fat GB202, 188 SMs, 96 GB GDDR7, ~1.8 TB/s.
@@ -164,4 +166,5 @@ pub const RTX_6000_PRO: GpuSpec = GpuSpec {
     chiplet: None,      // Monolithic GB202 die.
     l2_partitioning: None,
     clock_boost: Hertz::from_mhz(2617),
+    soc: None,
 };

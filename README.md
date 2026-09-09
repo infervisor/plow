@@ -243,6 +243,143 @@ Runtime knobs are all `--cpu-*` (`--cpu-threads`, `--cpu-numa`, `--cpu-isa`,
 coverage, NUMA policy, and the two A/B knobs that are off because they measured
 slower.
 
+## Apple Silicon (Metal + ANE)
+
+macOS on Apple Silicon runs the packet on three units: a persistent Metal
+interpreter on the GPU, the NEON CPU tier, and — opt-in — the Neural Engine
+through CoreML. There are no interpreter objects to build: the Metal shader is
+compiled at load, so **step 2 of the quickstart is skipped**, exactly as on the
+CPU backend.
+
+| Chip | `--gpu` | GPU cores | Notes |
+|------|---------|-----------|-------|
+| **Apple M4 Pro** | `m4pro` | 16 | The part every number below was measured on |
+| Apple M4 | `m4` | 10 | |
+| Apple M4 Max | `m4max` | 32 / 40 | `--n-cu` overrides the registry for the 40-core SKU |
+
+`--gpu` fixes the packet's executor count, and an emit is **not** portable
+across core counts. `--arch` is inferred (`metal3`); do not pass an
+NVIDIA/AMD arch.
+
+### What runs
+
+Each row is checked instruction-by-instruction against the CPU golden tier by
+`examples/apple_lockstep` (below) — zero mismatching outputs on prefill and
+decode:
+
+| Model | Precision | `plowc` flags | Twin |
+|-------|-----------|---------------|------|
+| Llama-3.2-3B | bf16 | — | — |
+| Llama-3.2-3B | w8a16 (fp8 weights) | `--fp8 --w8a16` | fp8 |
+| Llama-3.2-3B | w8a8 | `--fp8 --w8a8` | fp8 |
+| Llama-3.2-3B | w8a16 + fp8 KV cache | `--fp8 --w8a16 --fp8-kv` | fp8 |
+| Llama-3.2-3B | MXFP4 (w4a16) | `--mxfp4` | mxfp4 |
+| Gemma-4-E4B | w8a16 + fp8 head | `--fp8 --w8a16 --fp8-head` | fp8 |
+| Gemma-4-E4B | MXFP4 | `--mxfp4` | mxfp4 |
+| GPT-OSS-20B | MXFP4 MoE | — (the checkpoint is already fp4) | — |
+
+Qwen3 and Gemma-4 12B/26B-A4B emit for `metal3` on the same recipe. The
+Metal interpreter implements 50 of the 156 device opcodes — the dense +
+GQA-attention + fp8/mxfp4 + GPT-OSS-MoE set. MLA, KDA and the Gemma MoE
+families emit but have no Metal kernels yet, so they refuse at load rather
+than run wrong.
+
+### 1. Build
+
+```bash
+cargo build --release -p plowc
+cargo build --release -p plowrt --features metal        # GPU + CPU
+cargo build --release -p plowrt --features ane          # + Neural Engine
+```
+
+`metal` implies `cpu` (unified memory: the host tensors *are* the device
+buffers), and `ane` implies `metal`. Nothing links CUDA or HSA.
+
+### 2. Quantized weight twins (optional)
+
+A twin is a second safetensors file holding quantized copies of the dense
+projections; the packet names them and the runtime mmaps them next to the
+bf16 checkpoint.
+
+```bash
+CKPT="$HOME/models/Llama-3.2-3B-Instruct"
+
+# fp8 (e4m3, per-output-channel) — pure Rust, no torch
+cargo run --release --features cpu --example quantize_fp8 -- "$CKPT" "$HOME/plow-assets/llama3b-fp8" "model."
+
+# MXFP4 (e2m1 + E8M0 block scales) — needs the torch shell
+nix develop .#quantize -c python3 perf-data/tools/quantize_mxfp4.py "$CKPT" "$HOME/plow-assets/llama3b-mx4" "model."
+```
+
+### 3. Compile the packet
+
+```bash
+ASSETS="$HOME/plow-assets/llama3b"; mkdir -p "$ASSETS"
+
+PLOW_FA_GF_FULL=1 ./target/release/plowc \
+  --hf-dir "$CKPT" --gpu m4pro --max-ctx 4096 --fp8 --w8a16 --out "$ASSETS"
+```
+
+`PLOW_FA_GF_FULL=1` is Llama's GQA-3 flash grouping (no CLI twin). Gemma-4-E
+adds `--fp8-head`; MXFP4 replaces `--fp8 --w8a16` with `--mxfp4`. `--fp8-kv`
+halves the KV cache but is lossy — greedy generation diverges after ~20
+tokens, so treat it as a memory lever, not a free one.
+
+> Re-emit after pulling: device opcodes are renumbered when branches collide,
+> and a stale `model.pkt` dispatches to the wrong kernel rather than failing
+> cleanly.
+
+### 4. Run
+
+```bash
+# One-shot chat with per-step timings
+PLOW_FP8_DIR="$HOME/plow-assets/llama3b-fp8" \
+  ./target/release/examples/apple_chat "$ASSETS/model.pkt" "$CKPT" \
+  --tokens 100 --chat "Explain in two sentences why the sky is blue."
+
+# OpenAI-compatible server (Metal is the default on a metal/ane build)
+./target/release/plowrt serve --assets "$ASSETS" --port 8080 \
+  --fp8-dir "$HOME/plow-assets/llama3b-fp8"
+```
+
+`PLOW_BACKEND=cpu` (or `--apple-backend cpu`) runs the same bundle on the NEON
+CPU tier instead — useful for A/B and for the golden reference.
+
+### 5. Verify
+
+```bash
+# Every instruction on GPU and CPU, operand-for-operand
+PLOW_FP8_DIR="$HOME/plow-assets/llama3b-fp8" \
+  ./target/release/examples/apple_lockstep "$ASSETS/model.pkt" "$CKPT" \
+  --prompt "The history of computation"
+# => "0 mismatching outputs" for prefill and decode
+
+# GEMM microbenchmark, golden-checked on the model's real shapes
+./target/release/examples/metal_gemm_bench "$ASSETS/model.pkt" "$CKPT" --check
+```
+
+### Neural Engine (experimental)
+
+The ANE is **off by default** and never improves a dense decode; it is a
+prefill-only lever. Two mechanisms exist:
+
+* **Row split** — `PLOW_ROW_SPLIT=ane=50,cpu=10` (or `plowc --unit-shares
+  gpu:5,ane:4`) cuts every prefill bucket into GPU/ANE/CPU row blocks and
+  writes a `hetero.json` sidecar; `examples/apple_prefill_calibrate` sweeps the grid and keeps a split
+  only when it beats GPU-only by >5% with the same first token.
+* **Channel MLP** — `PLOW_ANE_MLP_CHANNELS=<n>` at emit plus `--ane-mlp` at
+  run splits each MLP by intermediate channel. Requires the `ane` feature and
+  a placement probe; it refuses to combine with row split, w8a8 or serial mode,
+  and falls back to unsplit GPU if the graph is rejected.
+
+CoreML compiles one program per (layer, kind, row count) and caches them under
+`<assets>/ane/`; the first prefill at a new shape pays that compile.
+
+Runtime knobs are `--ane-*` / `--apple-*` with `PLOW_*` env twins (`plowrt
+serve --help`, "Apple runtime" heading). Design notes and measurements:
+[`plans/apple-silicon-backend.md`](plans/apple-silicon-backend.md) and
+[`plans/apple-heterogeneous-emit.md`](plans/apple-heterogeneous-emit.md).
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Please follow the

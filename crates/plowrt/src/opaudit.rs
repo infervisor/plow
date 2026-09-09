@@ -294,6 +294,7 @@ pub fn classify(op: DevOp) -> OpClass {
         DevOp::NormResidual => a_rows("i0=rows"),
         DevOp::AddNorm => a_rows("i0=rows"),
         DevOp::NormResidualNorm => a_rows("i0=rows"),
+        DevOp::PerLayerInput => a_rows("i0=T, row-local per-layer input block"),
         DevOp::SituGlu => a_elem("i0=n"),
         DevOp::MlaOutGate => a_elem("i0=n"),
         DevOp::ZeroF32 => a_rows("i0=M"),

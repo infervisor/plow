@@ -6,6 +6,7 @@
 //! `--gpu "RTX 6000 Pro Blackwell"`). Lookup is always case-insensitive.
 
 use crate::amd::{mi300, mi350};
+use crate::apple::m4;
 use crate::nvidia::{ada, blackwell, h100};
 use crate::spec::GpuSpec;
 
@@ -23,6 +24,9 @@ pub const ALL: &[&GpuSpec] = &[
     &mi300::MI325X,
     &mi350::MI350X,
     &mi350::MI355X,
+    &m4::APPLE_M4,
+    &m4::APPLE_M4_PRO,
+    &m4::APPLE_M4_MAX,
 ];
 
 /// Short aliases mapping to canonical spec names. Each entry is
@@ -57,6 +61,12 @@ pub const ALIASES: &[(&str, &str)] = &[
     ("mi350x", "MI350X"),
     ("mi355", "MI355X"),
     ("mi355x", "MI355X"),
+    // Apple M4 family (canonical names match `MTLDevice.name`, so the runtime can look itself up)
+    ("m4", "Apple M4"),
+    ("m4pro", "Apple M4 Pro"),
+    ("m4-pro", "Apple M4 Pro"),
+    ("m4max", "Apple M4 Max"),
+    ("m4-max", "Apple M4 Max"),
 ];
 
 /// Resolve a model name (case-insensitive) to its spec.
