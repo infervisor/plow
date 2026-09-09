@@ -992,6 +992,40 @@ So the residual ~27% (2,239 aggregate against 3,078 single-stream) is **not** th
 itself (`amd_prefill_pick` advances a single request's chunk per tick even uncapped) and the
 co-packing bootstrap above — both scheduler-side, neither a kernel.
 
+### fp8 KV: the memory is there, the arm is not
+
+At ctx 81920 the bf16 latent cache is 58.9 GB/rank and fp8 would be 29.4, which is exactly what a
+decode ladder of 16 needs to fit (58.9 + 99.9 = 158.8 GB against 217.7 for bf16 at 16, on a
+206.1 GB card). It would also halve the KV bytes the flash kernel reads during prefill. Two
+constraints at once, so it was worth trying.
+
+It cannot be emitted for this workload:
+
+```
+PLOW_GLM_FP8_KV=1 with a batched decode program (rows=2): the fp8 latent writer's
+batch-ring form is unvalidated on GLM. Emit the ladder blob without fp8-KV.
+```
+
+fp8 KV forces `PLOW_DECODE_BATCH_LADDER=1`. At concurrency 20 that trades a decode batch of 8 for
+a batch of 1, which costs far more than the KV it saves. The capability gap is named and specific
+— the batch-ring form of the fp8 latent writer — not a knob.
+
+### The operand budget is what stops features combining
+
+Three separate attempts in this campaign died the same way, and it is worth stating as one fact
+rather than three incidents. `t[7]` and `i[6]` are the last free operand slots on the MLA decode
+op, and **DSA, fp8-KV and the fused q-rope all need them**:
+
+* `PLOW_GLM_DSA=1` + `PLOW_GLM_FUSE_ROPE=1` — "the q-rope fold needs t[7] for the cos table and
+  i[6] for the sin handle, which that arm already spends (GATHER: idx/top_k)"
+* `PLOW_GLM_FP8_KV=1` + `PLOW_GLM_FUSE_ROPE=1` — the same message, with `fp8-KV: kv_scale`
+* and DSA additionally requires single-row decode, as fp8-KV does
+
+So the shipped recipe's `PLOW_GLM_FUSE_ROPE=1` is not free: it forecloses both sparse attention
+and fp8 KV. Any future attempt at either has to drop it first, and a packet ABI with more operand
+room would remove the exclusivity entirely. That is a structural note for whoever picks this up —
+it is not visible from any one flag's documentation.
+
 ### The comparison target is not ROCm-vs-ROCm
 
 Worth stating before adapting anything: **GLM-5.3's head geometry has no AITER ASM kernel.** The
