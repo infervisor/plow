@@ -1542,6 +1542,43 @@ gather — yet the end-to-end gain is 6.9%. Three things absorb the rest:
 So the lever is real, it is directionally the right one, and it is not close to sufficient on its
 own — the reference's 273.67 out tok/s needs the linear term as well, which 7h sizes.
 
+### span=2 fails: the boundary is the reuse DISTANCE, and it is sharp
+
+```
+ span   gather ops   40k needle   repeat continuation
+   0      21 / 78      FOUND      clean
+   1      40 / 78      FOUND      clean
+   2      59 / 78      MISSED     ' quick brown fox the the..</think></think></think>}}'
+   3+     78 / 78      MISSED     ' the fox over dog over over the the'
+```
+
+A layer may reuse the union written one layer earlier and not two. That is a sharper statement
+than "too many layers are sparse", and it is diagnostic: the SHARE hypothesis would degrade
+gradually with the layer count, and this does not — 40 layers is clean and 59 is broken, with the
+only structural difference being that span 2 admits readers two layers downstream of the writer.
+
+It is also a plow-specific failure, because the reference reuses at distances 1, 2 AND 3 by
+construction (`indexer_types` runs are three long, and every layer in a run reads the same
+`topk_indices_buffer`). So there is a defect with a narrow signature: something invalidates
+`n.iuni` for readers more than one layer after its writer, while leaving the immediate next layer
+correct. Ordering against the WRITER is not it — that is the same edge span 1 relies on, and span
+1 is correct.
+
+`PLOW_GLM_DSA_PF_SPAN` therefore defaults to **1**, not 0: span 1 is measured both faster and
+correct against span 0, and a knob whose best value is known should not default to a worse one.
+The whole path stays behind `PLOW_GLM_DSA_PF`, so a build that does not ask for sparse prefill is
+unaffected. `=0` restores the indexer-layers-only behaviour; `=2` or more reproduces the failure
+for whoever picks up the defect.
+
+**Where that leaves the target.** Best correct cell is now 19.47 out tok/s against the reference's
+273.67. Attention is no longer the first-order term in a span-1 build; the 8,254 ms MoE and
+projection path is, and 7h sizes it at 87.7 TF/s per rank with both amortization hypotheses
+bounded at ~5%. The two pieces of work that remain are both kernel-level: fix the distance-2
+union defect (worth the rest of the 6.3x attention reduction, i.e. prefill 1.88x) and rewrite the
+grouped MoE k-loop against CK/aiter's pipelining (worth 3-7x on what would then be 80% of the
+wall). Neither is a configuration change, and neither was reachable by the flag search this
+campaign began with.
+
 ## 8. Unrelated issue observed
 
 `cargo test -p devgen mla` fails `k3::tests::the_mla_prefill_arm_forces_one_split`

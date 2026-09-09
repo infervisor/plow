@@ -4863,10 +4863,15 @@ pub(crate) fn emit_glm_mla_prefill(
     // (vllm/models/deepseek_v32/attention.py: `topk_indices_buffer` is passed to the attention
     // call unconditionally, and `self.skip_topk` is hardcoded False -- only whether the layer
     // OWNS an indexer varies), so a correct plow reaches span 3.
+    // DEFAULT 1, not 0: span 1 is measured both FASTER and CORRECT against span 0, so a flag
+    // whose best value is known has no business defaulting to a worse one. The whole DSA prefill
+    // path is opt-in behind PLOW_GLM_DSA_PF, so this changes nothing for a build that does not
+    // ask for it. Set 0 to get the indexer-layers-only behaviour back, 2+ to reproduce the
+    // failure.
     let span = std::env::var("PLOW_GLM_DSA_PF_SPAN")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(0);
+        .unwrap_or(1);
     let reuses = (1..=span).any(|d| slot >= d && c.indexer_is_full((slot - d) as u32));
     let sparse = glm_dsa_pf_bucket(c, t) && (w.iwqb != TENSOR_NONE || reuses) && nh_l == 8;
     let c_sel_pf = if sparse && w.iwqb != TENSOR_NONE {
