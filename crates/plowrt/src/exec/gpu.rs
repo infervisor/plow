@@ -2631,7 +2631,7 @@ impl GpuEngine {
             selected = prefix_layout.is_some(),
             "VMM prefix cache selection"
         );
-        let packed_prefill = if (prefix_requested && !packed_prefix) || config.nv.prefix_cache {
+        let packed_prefill = if prefix_requested && !packed_prefix {
             if packed_prefill_metadata.is_some() {
                 tracing::info!("packed prefill disabled because prefix reuse is active");
             }
@@ -2719,8 +2719,7 @@ impl GpuEngine {
             single_bound_decode || validate_decode_ladder(&blob)?
         };
         if recurrent.is_some() {
-            let config = RuntimeConfig::get();
-            if prefix_requested || config.nv.prefix_cache {
+            if prefix_requested {
                 return Err(RuntimeError::Rejected(
                     "recurrent state does not support prefix caching".into(),
                 ));
@@ -2936,7 +2935,7 @@ impl GpuEngine {
                     ));
                 }
                 if live {
-                    if prefix_requested || config.nv.prefix_cache {
+                    if prefix_requested {
                         return Err(RuntimeError::Rejected(
                             "live KV allocation requires prefix caching off".into(),
                         ));
@@ -4565,7 +4564,6 @@ impl GpuEngine {
                     || config.pf_batch
                     || config.nv_vmm_live()
                     || config.nv_vmm_live_rings()
-                    || config.nv.prefix_cache
                     || blob.tp.is_some()
                     || blob.sections.iter().any(|section| {
                         matches!(
@@ -4756,7 +4754,7 @@ impl GpuEngine {
         // 128k-dedup campaign can still raise it via PLOW_VMM_BLOCK_MIB=64.
         let rt = crate::config::RuntimeConfig::get();
         let block_hint = (rt.nv_vmm_block_mib() as u64) << 20;
-        let cache_cap = (rt.nv_vmm_cache_mib() as u64) << 20;
+        let cache_cap = (rt.prefix_cache_mib() as u64) << 20;
         match crate::memory::vmm::VmmKv::new(
             Arc::clone(be) as Arc<dyn crate::memory::vmm::VmmOps>,
             geo,
@@ -8630,7 +8628,7 @@ mod prefix_selection_tests {
         cfg.nv.vmm_prefix = None;
         cfg.nv.vmm_live = false;
         cfg.nv.vmm_live_rings = false;
-        cfg.nv.prefix_cache = false;
+        cfg.prefix_cache = true;
         cfg.pf_batch = false;
         let selected = |blob: &DevBlob, cfg: &RuntimeConfig, cc, gran| {
             GpuEngine::select_vmm_prefix_layout(blob, &dir, cfg, cc, gran).is_some()

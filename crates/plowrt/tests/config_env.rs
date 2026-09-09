@@ -22,6 +22,8 @@ fn env_zero_and_one_mean_false_and_true() {
     std::env::set_var("PLOW_PF_INTERLEAVE", "1024");
     std::env::set_var("PLOW_PF_DEFER_DECODE", "1");
     std::env::set_var("PLOW_PF_BATCH", "1");
+    std::env::set_var("PLOW_PREFIX_CACHE", "0");
+    std::env::set_var("PLOW_VMM_CACHE_MIB", "512");
     std::env::set_var("PLOW_TP_PREFILL_SEGMENT_MAJOR", "0");
 
     let c = RuntimeConfig::get();
@@ -37,5 +39,7 @@ fn env_zero_and_one_mean_false_and_true() {
     assert_eq!(c.pf_interleave, 1024);
     assert!(c.pf_defer_decode);
     assert!(c.pf_batch);
+    assert!(!c.prefix_cache);
+    assert_eq!(c.vmm_cache_mib, 512);
     assert!(!c.amd.tp_prefill_segment_major);
 }

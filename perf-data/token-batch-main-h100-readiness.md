@@ -1218,3 +1218,54 @@ successful requests, including 192/192 pressure hits. Campaign
 `prompt-retention-qualification.json` records source and runtime hashes plus the
 four result files. Frozen runtime SHA-256:
 `28ccb9aae26ec04dee46a7cf3fbf28573305c69bd14b74065d5a223205664175`.
+
+### Shared default prefix control and AMD composition (2026-09-09)
+
+RuntimeConfig now owns both default-on selectors: prefix_cache and token_batch.
+The existing 4 GiB prefix budget is also shared. The canonical prefix opt-out
+overrides NVIDIA's legacy VMM opt-in; removing the old TP-cache exclusions keeps
+qualified Hopper packed assets enabled with the shared default.
+
+AMD flat-KV serving now recognizes single-rank prefix snapshots, arms the first
+useful prompt boundary, and retains prefix metadata after unified completion.
+Snapshots include recurrent state, the needed sliding-window rows and FP8 KV
+scales. They copy wrapped head-major ranges at the recorded boundary, with
+bounded LRU allocation and cache omission on OOM. Idle normal and deferred
+decode retain a write position beyond the cached prefix. Snapshot-taking chunks
+remain isolated; compatible subsequent chunks can use unified dispatch.
+Cached-token usage is propagated through the common sequence-engine interface.
+
+The AMD snapshot layout is derived from instructions and tensor geometry.
+Host tests emit real gfx942 Gemma BF16/FP8-KV packets with all requested decode
+and prefill rungs. The miniature model's window snapshots occupy 262144/139264
+bytes independently of its larger physical rings. Tests also cover FP8 scales,
+aliased K/V, folded NRF fields, ring wrap, unknown-layout refusal, admission,
+eviction eligibility, cancellation invalidation and retired-slot positions.
+
+Validation: 648 host tests passed, 22 ignored; 17 configuration/mux/co-serving/
+preemption integration tests passed, plus independent HSA-only and CUDA-only
+all-target checks. H100 BF16 and FP8 each passed 32 matching-computation
+full-vocabulary frames. The AMD ring-wrap/idle-dispatch/unified-completion GPU
+regression is compiled but unrun on this H100 host.
+
+Four final H100 serving campaigns completed 113 requests: default BF16 trace,
+FP8 64-request pressure plus recovery, prefix disabled, and unified batching
+disabled. The pressure campaign retained all 64 cache hits and identical text
+per repeated prompt. Prefix disabled reported zero cached tokens even with the
+legacy VMM prefix opt-in set; unified disabled retained prefix hits and logged
+zero mixed commits. These permissive-SLO diagnostic screens are not sustained
+production throughput or deadline qualification.
+
+Frozen runtime: campaign bin/plowrt-shared-prefix, SHA-256
+7627b1ce9afb3b455776a1c213db4c4fb67e9d833805d229731b74cb75ed3461.
+shared-prefix-qualification.json records the four result-file hashes.
+Production logic matches the reviewed changes; later source edits only changed
+comments/formatting, redundant parentheses and an additional host regression.
+
+AMD reuse is currently per physical slot with flat KV. Lazy VMM reuse, AMD
+hardware correctness/performance qualification and AMD TP unified batching
+remain unsupported or unverified. Explicit fusion keeps its existing route.
+Fresh compiler defaults, packed FP8-KV runtime qualification, mixed sampling
+performance, model-quality and sustained SLO work remain open. The sealed
+BF16-weight/FP8-KV checkpoint is unchanged. Operator controls and limitations:
+docs/runtime/prefix-cache.md.

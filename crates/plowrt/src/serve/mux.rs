@@ -2392,6 +2392,7 @@ fn run_one_tick(
                                     if let Some(s) = slots[slot].as_mut() {
                                         if s.step == 0 {
                                             s.pf_pos = s.prompt_ids.len();
+                                        s.cached_tokens = e.cached_rows(slot);
                                         }
                                     }
                                 }
@@ -2722,6 +2723,7 @@ fn run_one_tick(
                 // active, while `PLOW_PF_BATCH=1` rotates fairly across pending AMD slots.
                 let pf = e.prefill_chunked_at_most(i, &slot_ref.prompt_ids, tick_max);
                 let frontier = e.prefill_frontier(i).unwrap_or(slot_ref.prompt_ids.len());
+                if let Some(s) = slots[i].as_mut() { s.cached_tokens = e.cached_rows(i); }
                 crate::obs::ttft::PREFILL.add(t_pf.elapsed().as_nanos() as u64);
                 match pf {
                     Ok(None) => {

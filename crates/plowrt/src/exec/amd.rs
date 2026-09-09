@@ -7617,6 +7617,8 @@ struct AmdGq {
 mod amd_mixed_step;
 #[path = "amd_token_batch.rs"]
 mod amd_token_batch;
+#[path = "amd_prefix.rs"]
+mod amd_prefix;
 
 /// The AMD serving engine.
 pub struct AmdEngine {
@@ -7824,9 +7826,12 @@ pub struct AmdEngine {
     /// and `conv_state`, per-slot strided, `blkres` excluded for the reason
     /// [`AmdEngine::begin_slot`] gives. This is what a prefix snapshot copies.
     carried_slot: Vec<(usize, u64)>,
-    /// Per-slot snapshot of `carried_slot` taken at a prompt prefix boundary,
-    /// for [`AmdEngine::restore_carried`]. `None` until a slot arms one.
+    /// Per-slot snapshot of recurrent state and sliding KV at a prefix boundary.
     prefix_snap: Vec<Option<DeviceMem>>,
+    prefix_regions: Option<Vec<amd_prefix::Region>>,
+    prefix_rows: Vec<u32>,
+    prefix_used: Vec<u64>,
+    prefix_tick: u64,
     /// `(alternate bank, legacy bank, bytes)` for the B1 KDA conv-window ping-pong arm.
     kda_conv_bank_pairs: Vec<(u64, u64, u64)>,
     /// Legacy prefill updates only bank 0; a set bit requires one bank0→bank1 mirror before
@@ -11385,8 +11390,6 @@ impl AmdEngine {
             Some("token batching does not support tensor parallelism".to_owned())
         } else if batch <= 1 {
             Some("token batching requires multiple slots".to_owned())
-        } else if cfg.nv.prefix_cache {
-            Some("token batching does not support prefix-cache mode".to_owned())
         } else if arch != "gfx942" {
             Some(format!("token batching is not qualified for {arch}"))
         } else {
@@ -11516,6 +11519,11 @@ impl AmdEngine {
             kv_slot: 0,
             carried_slot,
             prefix_snap: (0..batch).map(|_| None).collect(),
+            prefix_regions: amd_prefix::snapshot_regions(&blob.tensors,
+                blob.progs.iter().flat_map(|p| &p.insts), batch, max_ctx),
+            prefix_used: vec![0; batch],
+            prefix_rows: vec![0; batch],
+            prefix_tick: 0,
             kda_conv_bank_pairs,
             kda_conv_alt_stale: vec![false; batch],
             vmm,
@@ -13868,6 +13876,33 @@ impl AmdEngine {
         r
     }
 
+    pub(crate) fn prefill_slot_cached(
+        &mut self, slot: usize, prompt: &[u32], resume: u32, arm: u32,
+    ) -> Result<u32> {
+        self.kv_rebase(slot)?;
+        let result = (|| {
+            let mut from = resume;
+            if resume > 0 {
+                self.restore_carried(slot)?;
+            } else if arm > 0 {
+                let chunks = self.plan_for(arm)?;
+                for step in self.chunk_steps_from(&chunks, 0, arm)? {
+                    self.prefill_chunk(prompt, step)?;
+                }
+                self.snapshot_carried(slot, arm)?;
+                from = arm;
+            }
+            let end = prompt.len() as u32;
+            let chunks = self.plan_for(end - from)?;
+            for step in self.chunk_steps_from(&chunks, from, end)? {
+                self.prefill_chunk(prompt, step)?;
+            }
+            self.read_sampled()
+        })();
+        self.kv_rebase(0)?;
+        result
+    }
+
     /// Rows a prefill of `n_prompt` tokens WRITES, which is the padded bucket
     /// cover, not `n_prompt`. `prefill_prepare` zero-pads the last chunk out to
     /// its bucket width and those pad rows write KV (nothing reads them —
@@ -14100,20 +14135,40 @@ impl AmdEngine {
         Ok(())
     }
 
-    /// Bytes one slot's carried recurrent state occupies — the size of a prefix snapshot.
+    /// Bytes one slot's carried recurrent state occupies.
     pub fn carried_bytes(&self) -> u64 {
         self.carried_slot.iter().map(|&(_, n)| n).sum()
     }
 
     /// Has slot `slot` got a prefix snapshot armed?
     pub fn has_snapshot(&self, slot: usize) -> bool {
-        self.prefix_snap
-            .get(slot)
-            .map(|s| s.is_some())
-            .unwrap_or(false)
+        self.prefix_rows.get(slot).copied().unwrap_or(0) > 0
+            && (self.prefix_regions.as_ref().is_some_and(Vec::is_empty)
+                || self.prefix_snap.get(slot).is_some_and(Option::is_some))
     }
 
-    /// Capture slot `slot`'s carried recurrent state, so a later prompt sharing the prefix that
+    pub fn prefix_cache_capable(&self) -> bool {
+        let cap = (crate::config::RuntimeConfig::get().prefix_cache_mib() as u64) << 20;
+        self.vmm.is_none()
+            && self.prefix_regions.as_ref().is_some_and(|regions| {
+                cap == 0 || regions.iter().map(amd_prefix::Region::bytes).sum::<u64>() <= cap
+            })
+    }
+
+    fn evict_prefix_snapshot(&mut self, keep: usize) -> bool {
+        let victim = (0..self.batch)
+            .filter(|&slot| slot != keep && self.prefix_snap[slot].is_some())
+            .min_by_key(|&slot| self.prefix_used[slot]);
+        if let Some(slot) = victim {
+            self.prefix_snap[slot] = None;
+            self.prefix_rows[slot] = 0;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Capture slot `slot`'s recurrent state and sliding KV, so a later prompt sharing the prefix that
     /// produced it can resume from here instead of re-prefilling those tokens.
     ///
     /// This is the half of prefix caching that a KV cache alone cannot provide. Reusing KV rows
@@ -14124,7 +14179,7 @@ impl AmdEngine {
     /// The snapshot is exact rather than approximate because `rebase_chunk` sets every KDA op's
     /// row count to `clen`, not to the padded bucket width — so a chunk with `clen == P` leaves
     /// the recurrence at exactly `P` and the split point needs no bucket alignment.
-    pub fn snapshot_carried(&mut self, slot: usize) -> Result<()> {
+    pub fn snapshot_carried(&mut self, slot: usize, rows: u32) -> Result<()> {
         if slot >= self.batch {
             return Err(RuntimeError::Device(format!(
                 "snapshot_carried {slot} past batch {}",
@@ -14132,33 +14187,65 @@ impl AmdEngine {
             )));
         }
         self.sync_kda_conv_alt(slot)?;
-        let total = self.carried_bytes();
+        let total = self.prefix_regions.as_ref().map_or_else(|| self.carried_bytes(),
+            |regions| regions.iter().map(amd_prefix::Region::bytes).sum());
         if total == 0 {
+            self.prefix_rows[slot] = rows;
             return Ok(());
         }
         if self.prefix_snap[slot].is_none() {
-            self.prefix_snap[slot] = Some(EngineDevice::alloc(&*self.be, total)?);
+            let cap = (crate::config::RuntimeConfig::get().prefix_cache_mib() as u64) << 20;
+            while cap > 0 && self.prefix_snap.iter().flatten().map(|m| m.len).sum::<u64>() + total > cap {
+                if !self.evict_prefix_snapshot(slot) { return Ok(()); }
+            }
+            loop {
+                match EngineDevice::alloc(&*self.be, total) {
+                    Ok(mem) => { self.prefix_snap[slot] = Some(mem); break; }
+                    Err(RuntimeError::Oom(_)) => {
+                        if !self.evict_prefix_snapshot(slot) { return Ok(()); }
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
         }
+        self.prefix_tick += 1;
+        self.prefix_used[slot] = self.prefix_tick;
         let dst_base = self.prefix_snap[slot]
             .as_ref()
             .expect("just allocated")
             .base;
-        let mut off = 0u64;
-        let mut pairs = Vec::with_capacity(self.carried_slot.len());
-        for &(i, stride) in &self.carried_slot {
-            pairs.push((
-                dst_base + off,
-                self.devp[i].base + stride * slot as u64,
-                stride,
-            ));
-            off += stride;
-        }
+        let pairs = self.prefix_copy_pairs(slot, rows, dst_base, false);
         // ONE completion wait for all 276 tensors. Per-copy `memcpy_dtod` blocks the host on its
         // own signal, and at this count that synchronisation — not the 56 MiB — is the cost.
         let t = std::time::Instant::now();
         self.be.memcpy_dtod_batch(&pairs)?;
+        self.prefix_rows[slot] = rows;
         crate::obs::pfx::SNAP.add(t.elapsed().as_nanos() as u64);
         Ok(())
+    }
+
+    fn prefix_copy_pairs(&self, slot: usize, rows: u32, buffer: u64, restore: bool) -> Vec<(u64, u64, u64)> {
+        let capacity = self.prefix_regions.as_ref().map_or(self.carried_slot.len(),
+            |regions| regions.iter().map(amd_prefix::Region::max_copies).sum());
+        let mut pairs = Vec::with_capacity(capacity);
+        let mut offset = 0;
+        if let Some(regions) = &self.prefix_regions {
+            for region in regions {
+                let base = self.devp[region.tensor].base + region.slot_bytes * slot as u64;
+                region.copy_spans(rows, |dst, src, bytes| {
+                    let (snapshot, live) = (buffer + offset + dst, base + src);
+                    pairs.push(if restore { (live, snapshot, bytes) } else { (snapshot, live, bytes) });
+                });
+                offset += region.bytes();
+            }
+        } else {
+            for &(index, stride) in &self.carried_slot {
+                let (snapshot, live) = (buffer + offset, self.devp[index].base + stride * slot as u64);
+                pairs.push(if restore { (live, snapshot, stride) } else { (snapshot, live, stride) });
+                offset += stride;
+            }
+        }
+        pairs
     }
 
     /// Put slot `slot`'s carried state back to its snapshot. The inverse of
@@ -14169,17 +14256,13 @@ impl AmdEngine {
                 "restore_carried: slot {slot} has no snapshot"
             )));
         }
-        let src_base = self.prefix_snap[slot].as_ref().expect("checked").base;
-        let mut off = 0u64;
-        let mut pairs = Vec::with_capacity(self.carried_slot.len());
-        for &(i, stride) in &self.carried_slot {
-            pairs.push((
-                self.devp[i].base + stride * slot as u64,
-                src_base + off,
-                stride,
-            ));
-            off += stride;
+        if self.prefix_regions.as_ref().is_some_and(Vec::is_empty) {
+            return Ok(());
         }
+        self.prefix_tick += 1;
+        self.prefix_used[slot] = self.prefix_tick;
+        let src_base = self.prefix_snap[slot].as_ref().expect("checked").base;
+        let pairs = self.prefix_copy_pairs(slot, self.prefix_rows[slot], src_base, true);
         let t = std::time::Instant::now();
         self.be.memcpy_dtod_batch(&pairs)?;
         self.kda_conv_alt_stale[slot] = false;

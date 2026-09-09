@@ -73,6 +73,19 @@ pub struct RuntimeConfig {
     #[arg(long = "token-batch", env = "PLOW_TOKEN_BATCH", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub token_batch: bool,
 
+    /// Prefix reuse on compatible AMD and NVIDIA assets.
+    #[arg(long = "prefix-cache", env = "PLOW_PREFIX_CACHE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub prefix_cache: bool,
+
+    /// Soft cap on prefix blocks and boundary snapshots in MiB. 0 = OOM-driven eviction only.
+    #[arg(
+        long = "vmm-cache-mib",
+        env = "PLOW_VMM_CACHE_MIB",
+        default_value_t = 4096,
+        global = true
+    )]
+    pub vmm_cache_mib: u32,
+
     /// Cross-request prefill scheduling. CUDA packs chunks into one launch. AMD packs only
     /// exact-capability programs; unsupported programs retain fair isolated scheduling.
     #[arg(long = "pf-batch", env = "PLOW_PF_BATCH", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
@@ -386,15 +399,6 @@ pub struct NvidiaRuntimeConfig {
     )]
     pub vmm_block_mib: u32,
 
-    /// Soft cap on VMM prefix blocks and boundary snapshots in MiB. 0 = OOM-driven eviction only.
-    #[arg(
-        long = "vmm-cache-mib",
-        env = "PLOW_VMM_CACHE_MIB",
-        default_value_t = 4096,
-        global = true
-    )]
-    pub vmm_cache_mib: u32,
-
     /// VMM lazy-commit weight slab (CUDA default ON). --no-nv-weight-vmm to disable.
     #[arg(long = "nv-weight-vmm", env = "PLOW_WEIGHT_VMM", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub weight_vmm: bool,
@@ -402,10 +406,6 @@ pub struct NvidiaRuntimeConfig {
     /// Direct upload path (CUDA). --no-nv-upload-direct to disable.
     #[arg(long = "nv-upload-direct", env = "PLOW_UPLOAD_DIRECT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub upload_direct: bool,
-
-    /// TP-only prefix cache.
-    #[arg(long = "prefix-cache", env = "PLOW_PREFIX_CACHE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub prefix_cache: bool,
 
     /// Force decode cubin path (bypass discovery).
     #[arg(long = "nv-cubin", env = "PLOW_NV_CUBIN", global = true)]
@@ -958,7 +958,7 @@ impl RuntimeConfig {
         prefix: bool,
     ) -> bool {
         self.nv_vmm_live()
-            || (packed_prefill && full_cache && !prefix && !self.nv.prefix_cache)
+            || (packed_prefill && full_cache && !prefix)
     }
 
     #[cfg(feature = "cuda")]
@@ -972,6 +972,9 @@ impl RuntimeConfig {
 
     #[cfg(feature = "cuda")]
     pub(crate) fn nv_vmm_prefix(&self) -> Option<bool> {
+        if !self.prefix_cache {
+            return Some(false);
+        }
         if Self::is_initialized() {
             self.nv.vmm_prefix
         } else {
@@ -988,10 +991,9 @@ impl RuntimeConfig {
         )
     }
 
-    #[cfg(feature = "cuda")]
-    pub(crate) fn nv_vmm_cache_mib(&self) -> u32 {
+    pub(crate) fn prefix_cache_mib(&self) -> u32 {
         select_compat(
-            self.nv.vmm_cache_mib,
+            self.vmm_cache_mib,
             Self::env_parse("PLOW_VMM_CACHE_MIB"),
             !Self::is_initialized(),
         )
@@ -1159,9 +1161,28 @@ mod tests {
     }
 
     #[test]
+    fn shared_prefix_and_token_batch_defaults_allow_independent_rollback() {
+        use clap::{Args, FromArgMatches};
+        let command = super::RuntimeConfig::augment_args(clap::Command::new("test"));
+        for field in ["prefix_cache", "token_batch"] {
+            assert_eq!(command.get_arguments().find(|arg| arg.get_id() == field)
+                .unwrap().get_default_values(), ["true"]);
+        }
+        let matches = command.try_get_matches_from([
+            "test", "--prefix-cache=false", "--vmm-prefix=true", "--vmm-cache-mib=512",
+        ]).unwrap();
+        let config = super::RuntimeConfig::from_arg_matches(&matches).unwrap();
+        assert!(!config.prefix_cache);
+        assert!(config.token_batch);
+        assert_eq!(config.vmm_cache_mib, 512);
+        #[cfg(feature = "cuda")]
+        assert_eq!(config.nv_vmm_prefix(), Some(false));
+    }
+
+    #[test]
     fn prefix_cache_defaults_to_auto_with_a_bounded_budget_and_explicit_overrides() {
         use clap::{Args, FromArgMatches};
-        let command = super::NvidiaRuntimeConfig::augment_args(clap::Command::new("test"));
+        let command = super::RuntimeConfig::augment_args(clap::Command::new("test"));
         let prefix = command
             .get_arguments()
             .find(|arg| arg.get_id() == "vmm_prefix")
@@ -1178,9 +1199,9 @@ mod tests {
                 .try_get_matches_from(["test", flag])
                 .unwrap();
             assert_eq!(
-                super::NvidiaRuntimeConfig::from_arg_matches(&matches)
+                super::RuntimeConfig::from_arg_matches(&matches)
                     .unwrap()
-                    .vmm_prefix,
+                    .nv.vmm_prefix,
                 Some(expected)
             );
         }
@@ -1200,13 +1221,11 @@ mod tests {
                 "test",
                 "--vmm-live=true",
                 "--vmm-prefix=false",
-                "--prefix-cache=false",
             ])
             .unwrap();
         let config = super::NvidiaRuntimeConfig::from_arg_matches(&matches).unwrap();
         assert!(config.vmm_live);
         assert_eq!(config.vmm_prefix, Some(false));
-        assert!(!config.prefix_cache);
         assert!(!config.vmm_live_rings);
         let command = super::NvidiaRuntimeConfig::augment_args(clap::Command::new("test"));
         let arg = command

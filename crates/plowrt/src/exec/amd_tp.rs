@@ -1171,9 +1171,9 @@ impl AmdTpGroup {
     /// The recurrence is sharded by head, so a snapshot is only meaningful if every rank takes
     /// one at the same point in the token stream — a rank that skipped it would resume from a
     /// state one prefix behind its peers and the group would disagree from the first token.
-    pub fn snapshot_carried(&mut self, slot: usize) -> Result<()> {
+    pub fn snapshot_carried(&mut self, slot: usize, rows: u32) -> Result<()> {
         for e in &mut self.ranks {
-            e.snapshot_carried(slot)?;
+            e.snapshot_carried(slot, rows)?;
         }
         Ok(())
     }
@@ -1342,7 +1342,7 @@ impl AmdTpGroup {
             resume
         } else if arm > 0 {
             self.prefill_span(prompt, 0, arm)?;
-            self.snapshot_carried(slot)?;
+            self.snapshot_carried(slot, arm)?;
             arm
         } else {
             0
