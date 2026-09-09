@@ -134,12 +134,12 @@ use crate::asset::devblob::{DevBlob, DevProg};
 use crate::device::hsa::{HsaBackend, HsaKernel, HsaPinned};
 use crate::device::{DeviceMem, Module};
 use crate::exec::amd_packed::validate_rows as validate_amd_packed_rows;
-use crate::exec::amd_sparse_mla;
 use crate::exec::device_api::EngineDevice;
 use crate::exec::kvrow::{
     derive_kvrow, derive_mla_nsplit, is_lm_head_matmul, kvrow_span, mla_live_nsplit,
     prefill_row_field, rebase_chunk_rows, RowField,
 };
+use crate::exec::{amd_moe_aiter, amd_sparse_mla};
 use crate::memory::vmm::{VmmGeometry, VmmKv, VmmOps, WeightSlab};
 use crate::{Result, RuntimeError};
 
@@ -1025,6 +1025,7 @@ struct MoeEpCombineRoute {
 enum PrefillSegmentRoute {
     Interpreter,
     SparseMla(amd_sparse_mla::Route),
+    MoeAiter(amd_moe_aiter::Route),
     XReduceWaveRs,
     GraphPhaseXReduceWaveRs,
     XReduceAttnRes {
@@ -5738,6 +5739,7 @@ fn check_packed_dense_program(insts: &[DevInst64]) -> Result<()> {
 fn packed_mla_compatible(prog: &DevProg) -> bool {
     !prog.insts.iter().any(|d| {
         sparse_fp8(d)
+            || d.op == DevOp::MoeAiterFp8Pf as u16
             || d.op == DevOp::FlashGatherPrefill as u16
             || ((d.op == DevOp::FlashMlaPrefill as u16 || d.op == DevOp::FlashMlaPrefillFp8 as u16)
                 && (d.i[3] & 0x8000_0000 != 0
@@ -7851,6 +7853,7 @@ pub struct AmdEngine {
     k_mla_materialize_pack: Option<HsaKernel>,
     k_mla_materialized_prefill: Option<HsaKernel>,
     sparse_mla: Option<amd_sparse_mla::SparseMla>,
+    moe_aiter: Option<amd_moe_aiter::MoeAiter>,
     k_xaudit: Option<HsaKernel>,
     k_state_clear: Option<HsaKernel>,
     k_token_capture: Option<HsaKernel>,
@@ -8601,6 +8604,18 @@ impl AmdEngine {
                 "materialized MLA prefill requires gfx950, but this device is {arch}"
             )));
         }
+        let has_moe_aiter =
+            |p: &DevProg| p.insts.iter().any(|d| d.op == DevOp::MoeAiterFp8Pf as u16);
+        let use_moe_aiter = blob.progs.iter().any(has_moe_aiter);
+        if use_moe_aiter
+            && (arch != "gfx942"
+                || tp.is_none_or(|b| b.n_gpu != 8)
+                || blob.progs[dec_ix..].iter().any(has_moe_aiter))
+        {
+            return Err(RuntimeError::Device(
+                "AITER MoE requires gfx942 TP8 prefill".into(),
+            ));
+        }
         let use_sparse_mla = crate::config::RuntimeConfig::get().amd.mla_pf_aiter;
         check_sparse_fp8_packet(&blob.progs, &blob.tensors, &arch)?;
         if use_sparse_mla && arch != "gfx942" {
@@ -8746,6 +8761,11 @@ impl AmdEngine {
             let syms = elf_symbol_names(&image);
             if phase == Phase::Prefill {
                 prefill_moe_align_bm64 = syms.contains(&"plow_moe_align_bm64_1");
+                if use_moe_aiter && !prefill_moe_align_bm64 {
+                    return Err(RuntimeError::Device(
+                        "AITER MoE requires an MPF_BM=64 align object".into(),
+                    ));
+                }
             }
             check_gate_hier_object(&syms, &path, phase, sched)?;
             if phase == Phase::Decode {
@@ -10275,6 +10295,23 @@ impl AmdEngine {
             None
         };
 
+        let moe_aiter = if use_moe_aiter {
+            let rows = blob.progs[..dec_ix]
+                .iter()
+                .filter(|p| has_moe_aiter(p))
+                .map(|p| p.t)
+                .max()
+                .unwrap();
+            Some(amd_moe_aiter::MoeAiter::load(
+                &be,
+                hsaco_dir,
+                rows,
+                &mut modules,
+            )?)
+        } else {
+            None
+        };
+
         // --- tensors + weights ------------------------------------------------
         // Staging is one pinned slab, filled and pushed in `STAGE` chunks. The
         // source is an mmap of the checkpoint, and `upload` would pin it per
@@ -10971,6 +11008,21 @@ impl AmdEngine {
                         }
                     }
                 }
+                if use_moe_aiter {
+                    for (seg, route) in amd_moe_aiter::routes(p, &blob.tensors, seg_class.len())?
+                        .into_iter()
+                        .enumerate()
+                    {
+                        if let Some(route) = route {
+                            if !matches!(prefill_routes[seg], PrefillSegmentRoute::Interpreter) {
+                                return Err(RuntimeError::Device(
+                                    "AITER MoE overlaps another native route".into(),
+                                ));
+                            }
+                            prefill_routes[seg] = PrefillSegmentRoute::MoeAiter(route);
+                        }
+                    }
+                }
                 promote_kda_intra_wave_items_routes(p, &seg_class, &mut prefill_routes)?;
                 promote_kda_carry_regstate_routes(p, &seg_class, &devp, &mut prefill_routes)?;
                 promote_kda_wu_lean_routes(
@@ -11036,9 +11088,11 @@ impl AmdEngine {
                         p.t
                     )));
                 }
-                if use_sparse_mla && !prefill_segment_specialization_allowed(dispatch) {
+                if (use_sparse_mla || use_moe_aiter)
+                    && !prefill_segment_specialization_allowed(dispatch)
+                {
                     return Err(RuntimeError::Device(
-                        "sparse AITER MLA requires ordered segment dispatch".into(),
+                        "native AITER kernels require ordered segment dispatch".into(),
                     ));
                 }
                 if has_ep && !prefill_segment_specialization_allowed(dispatch) {
@@ -11716,6 +11770,7 @@ impl AmdEngine {
             k_mla_materialize_pack,
             k_mla_materialized_prefill,
             sparse_mla,
+            moe_aiter,
             k_xaudit,
             k_state_clear,
             k_token_capture,
@@ -12357,6 +12412,7 @@ impl AmdEngine {
         if !active {
             match route {
                 PrefillSegmentRoute::SparseMla(route) if route.active => return "mla_sparse_aiter",
+                PrefillSegmentRoute::MoeAiter(_) => return "moe_aiter_fp8",
                 PrefillSegmentRoute::MlaMaterializePack { .. } => return "mla_materialize_pack",
                 PrefillSegmentRoute::MlaMaterializedPrefill { .. } => {
                     return "mla_materialized_prefill";
@@ -12516,6 +12572,16 @@ impl AmdEngine {
         }
         let active = self.packed_prefill.is_some_and(|b| b.prog == p);
         if !active {
+            if let Some(PrefillSegmentRoute::MoeAiter(route)) =
+                self.progs[p].prefill_routes.get(seg).copied()
+            {
+                let kernel = self.moe_aiter.as_ref().ok_or_else(|| {
+                    RuntimeError::Device("AITER MoE route has no loaded kernels".into())
+                })?;
+                kernel.enqueue(&self.be, route, &self.tens_table)?;
+                self.seg_launches += 4;
+                return Ok(());
+            }
             if let Some(PrefillSegmentRoute::SparseMla(route)) =
                 self.progs[p].prefill_routes.get(seg).copied()
             {
@@ -13014,6 +13080,7 @@ impl AmdEngine {
         }
         match self.progs[p].prefill_routes.get(seg) {
             Some(PrefillSegmentRoute::SparseMla(route)) if route.active => 3,
+            Some(PrefillSegmentRoute::MoeAiter(_)) => 4,
             Some(PrefillSegmentRoute::MoeEpAlign(_)) if self.k_moe_ep_align.is_some() => 4,
             Some(PrefillSegmentRoute::MoeStage1A4Reuse(_))
                 if self.k_moe_stage1_a4_quant.is_some() && self.k_moe_stage1_a4_reuse.is_some() =>
@@ -13709,6 +13776,9 @@ impl AmdEngine {
         for route in &mut self.progs[prog].prefill_routes {
             if let PrefillSegmentRoute::SparseMla(route) = route {
                 route.rebase(rows, c0)?;
+            }
+            if let PrefillSegmentRoute::MoeAiter(route) = route {
+                route.rebase(rows)?;
             }
         }
         rebase_mla_materialized_routes(

@@ -2321,7 +2321,7 @@ with exact numerical equality checked across all weights.
 At 8192 live rows, plow takes **4.833 ms**, resident AITER assembly **1.971 ms**,
 and CK **2.371 ms**. A native packing helper accepts the existing weight/scale
 pointer tables and uses a reusable **1.125 GiB** output workspace, avoiding
-about **87.75 GiB/rank** of persistent weight duplication across 78 layers.
+about **84.4 GiB/rank** of persistent weight duplication across 75 routed layers.
 Hoisting expert pointers out of the packing loop cuts packing time from
 **1.285 to 0.674 ms**. Every packed byte matches AITER, including reversed
 expert tables and restored reuse.
@@ -2339,3 +2339,47 @@ FP64 combine contract as well as full-model quality. No AITER MoE production
 route or new serving gain is claimed here; H200 parity remains unmet.
 
 See [capture reproduction and measured records](../../runtime/bench/amd/moe_aiter/README.md#actual-glm-capture-and-reusable-weight-packing).
+
+## 16. Native A8 MoE prefill (2026-09-09)
+
+An opt-in `MoeAiterFp8Pf` instruction now launches the qualified gfx942 AITER
+assembly through HSA. Its contract explicitly includes per-128-element A8
+quantization and BF16 routed accumulation. It stores FP32 for the existing
+shared-expert/TP combine. The default FP64 path and decode remain unchanged.
+Enable with `--glm-moe-aiter=true --emit-packed-prefill=false` on the qualified
+TP8 GLM configuration.
+
+Four ordered launches pack weights, prepare activations/routing, run assembly
+and store output. The workspace is **1.268 GiB/rank**, reused across all 75
+routed layers. The loader validates the pinned object hash, helper ABI,
+alignment geometry, tensor capacities and a pure segment without interpreter
+counter obligations. The serving process needs neither HIP nor Python.
+
+On captured layer-40 inputs, the direct HIP harness measures **4.833 → 2.975 ms**
+at 8192 rows and **2.825 → 2.186 ms** at 4464 rows, including weight packing and
+the output conversion. Input bytes, scales and routing match AITER exactly.
+Sampled FP32-oracle error remains 3.55–3.85%. A per-slot FP64 reduction prototype
+passed its repeat checks but took 4.194 ms at 8192 rows; the faster fused path
+therefore has its own opt-in numerical contract.
+
+TP8 B8/BF16-KV retrieval passes **18/18** through 68.8k prompt tokens, with
+**17/18** continuations text-identical to the B8 baseline. Packet/operand ABI,
+native route, HSA ragged-row and CUDA+HSA checks pass. Lean verifies every
+emitted program. The option-off compiler reproduces the old B8 packet exactly.
+These checks qualify the limited retrieval workload, not broad model accuracy.
+
+An adjacent 20-request C20 screen with the same final runtime and GPU objects
+confirms **28.216 → 29.960 output tokens/s (+6.2%)**. Mean TTFT falls
+**196.985 → 178.419 s (−9.4%)**, mean TPOT **216.916 → 205.565 ms (−5.2%)**,
+and P99 ITL **1686.281 → 1471.807 ms (−12.7%)**. Median ITL regresses
+**116.833 → 119.005 ms (+1.9%)**. Both runs complete 20/20 with zero failures
+and identical per-request token lengths, totaling 1,414,538 input and 13,795
+output tokens. The earlier B8 result, 28.191 tokens/s, agrees with this new
+baseline within 0.1%.
+
+This is a measured serving improvement, smaller than the isolated MoE gain.
+Keep the changed numerical path opt-in. No speculative decoding was added;
+the H200 100-request target of 273.67 tokens/s remains unmet.
+
+See [native adapter reproduction](../../runtime/bench/amd/moe_aiter/README.md#native-gfx942-serving-adapter)
+and the [measured record](../../runtime/bench/amd/moe_aiter/mi300x-native-results.json).

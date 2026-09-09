@@ -470,6 +470,7 @@ pub fn classify(op: DevOp) -> OpClass {
         DevOp::MoeAlignGemmaPf => b("i0=T; builds row_token / row_partidx / row_gate maps"),
         DevOp::MoeGroupGluPf => b("t5=row_token gathers the source token per gathered row"),
         DevOp::MoeGroupDownPf => b("t6=row_partidx / t7=row_gate scatter per gathered row"),
+        DevOp::MoeAiterFp8Pf => b("i0=T; native A8 MoE reads aligned row maps in t4..t7"),
         DevOp::MoeGroupGluGemmaPf => b("t4=row_token"),
         DevOp::MoeGroupDownGemmaPf => b("t4=row_partidx / t5=row_gate"),
         DevOp::MoeGroupGluGemmaPfW8a8 => b("t4=row_token, t5=ascale[T]"),

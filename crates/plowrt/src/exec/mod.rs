@@ -10,6 +10,8 @@
 #[cfg(feature = "hsa")]
 pub mod amd;
 #[cfg(feature = "hsa")]
+mod amd_moe_aiter;
+#[cfg(feature = "hsa")]
 mod amd_packed;
 #[cfg(feature = "hsa")]
 mod amd_sparse_mla;

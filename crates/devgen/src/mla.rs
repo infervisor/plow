@@ -368,8 +368,7 @@ fn cfg_glm(dir: &Path) -> GlmCfg {
             rp["rope_type"].as_str(),
             // A scheme this parse RESOLVED is no longer an unhandled one. The gate still fires
             // for llama3/linear and for any yarn shape the branch above refused.
-            v["rope_scaling"].as_object().is_some()
-                && rope_scale == packet::rope::RopeScale::None,
+            v["rope_scaling"].as_object().is_some() && rope_scale == packet::rope::RopeScale::None,
             model,
         );
     } else {
@@ -5285,7 +5284,22 @@ fn emit_glm_moe_ffn_prefill(
     // It is the earliest packet of the MoE chain (router -> align -> GLU -> DOWN), so the
     // existing edges already order the zero before every writer — no new packet, no new gate.
     // `tk.is_power_of_two()` is what makes `tok = pidx >> log2(k)` exact.
-    let det = moe_pf_fuse(tk) == MoePfFuse::Det;
+    let native_moe = emit_config::active().glm_moe_aiter;
+    if native_moe {
+        assert!(
+            !emit_config::active().packed_prefill_on(),
+            "PLOW_GLM_MOE_AITER requires --emit-packed-prefill=false"
+        );
+        assert!(
+            enc == MoeEnc::Fp8Blk
+                && tp == 8
+                && n_cu == 304
+                && (128..=8192).contains(&t)
+                && (h, imoe_e, e, tk) == (6144, 256, 256, 8),
+            "PLOW_GLM_MOE_AITER requires gfx942 TP8 GLM block-FP8 prefill, rows 128..8192"
+        );
+    }
+    let det = !native_moe && moe_pf_fuse(tk) == MoePfFuse::Det;
     let align_par = emit_config::active().moe_align_par && t >= 1024;
     let router_blocks: Vec<_> = (0..t.min(n_cu)).collect();
     let c_router = b.emit(DevOp::MoeRouterTopkPf, router_blocks, &[c_score], |d| {
@@ -5435,55 +5449,74 @@ fn emit_glm_moe_ffn_prefill(
     // 18 grouped gate/up + GLU over the sorted rows. A is gathered from xn2 by row_token, so an
     //    expert's gate|up crosses HBM ONCE for every token that chose it — the reuse decode cannot
     //    have. i[3] picks the block-fp8 or bf16 weight arm from the same tables decode uses.
-    let c_g = b.emit(DevOp::MoeGroupGluPf, all.clone(), &[c_align, c_rn2], |d| {
-        d.t[0] = n.fu_g;
-        d.t[1] = n.xn2;
-        d.t[2] = w.ewt;
-        d.t[3] = w.est;
-        d.t[4] = n.meta;
-        d.t[5] = n.row_token;
-        // A4W4 binds two more: t6 = row_partidx, so the fused bridge can tell a PAD row from a live
-        // one and skip it (the bf16/fp8 arms let pad rows fall out in DOWN's scatter instead, but a
-        // bridge that quantized them would write E8M0 bytes for rows nothing reads); t7 = the E8M0
-        // scale rows it WRITES, because the bridge is this op's epilogue rather than a separate op.
-        if enc == MoeEnc::Mxfp4 {
+    let c_d = if native_moe {
+        let counter = b.emit(DevOp::MoeAiterFp8Pf, one.clone(), &[c_align, c_rn2], |d| {
+            d.t = [
+                n.part,
+                n.xn2,
+                w.ewt,
+                w.est,
+                n.meta,
+                n.row_token,
+                n.row_partidx,
+                n.row_gate,
+            ];
+            d.i = [t, h, imoe_e, e, tk, 64, 0, 0];
+        });
+        b.isolate(counter);
+        counter
+    } else {
+        let c_g = b.emit(DevOp::MoeGroupGluPf, all.clone(), &[c_align, c_rn2], |d| {
+            d.t[0] = n.fu_g;
+            d.t[1] = n.xn2;
+            d.t[2] = w.ewt;
+            d.t[3] = w.est;
+            d.t[4] = n.meta;
+            d.t[5] = n.row_token;
+            // A4W4 binds two more: t6 = row_partidx, so the fused bridge can tell a PAD row from a live
+            // one and skip it (the bf16/fp8 arms let pad rows fall out in DOWN's scatter instead, but a
+            // bridge that quantized them would write E8M0 bytes for rows nothing reads); t7 = the E8M0
+            // scale rows it WRITES, because the bridge is this op's epilogue rather than a separate op.
+            if enc == MoeEnc::Mxfp4 {
+                d.t[6] = n.row_partidx;
+                d.t[7] = n.fu_scale;
+            }
+            d.i[0] = imoe_e;
+            d.i[1] = h;
+            d.i[2] = e;
+            d.i[MoeEnc::PREFILL_SLOT] = enc.code();
+            d.i[5] = GLM_ACT_SILU;
+        });
+        // 19 grouped down + gate-scale + SCATTER into part[T*k, H]. row_partidx carries each gathered
+        //    row's fixed destination, so the align op's nondeterministic within-expert row ORDER does
+        //    not reach the output — the combine below still sums part in FIXED slot order.
+        let c_d = b.emit(DevOp::MoeGroupDownPf, all.clone(), &[c_g], |d| {
+            d.t[0] = n.part;
+            d.t[1] = n.fu_g;
+            d.t[2] = w.ewt;
+            d.t[3] = w.est;
+            d.t[4] = n.meta;
+            // t5 = the E8M0 rows the bridge wrote — DOWN's A operand is fp4 + these, so under A4W4 the
+            // activation never returns to bf16 between the two GEMMs.
+            if enc == MoeEnc::Mxfp4 {
+                d.t[5] = n.fu_scale;
+            }
             d.t[6] = n.row_partidx;
-            d.t[7] = n.fu_scale;
-        }
-        d.i[0] = imoe_e;
-        d.i[1] = h;
-        d.i[2] = e;
-        d.i[MoeEnc::PREFILL_SLOT] = enc.code();
-        d.i[5] = GLM_ACT_SILU;
-    });
-    // 19 grouped down + gate-scale + SCATTER into part[T*k, H]. row_partidx carries each gathered
-    //    row's fixed destination, so the align op's nondeterministic within-expert row ORDER does
-    //    not reach the output — the combine below still sums part in FIXED slot order.
-    let c_d = b.emit(DevOp::MoeGroupDownPf, all.clone(), &[c_g], |d| {
-        d.t[0] = n.part;
-        d.t[1] = n.fu_g;
-        d.t[2] = w.ewt;
-        d.t[3] = w.est;
-        d.t[4] = n.meta;
-        // t5 = the E8M0 rows the bridge wrote — DOWN's A operand is fp4 + these, so under A4W4 the
-        // activation never returns to bf16 between the two GEMMs.
-        if enc == MoeEnc::Mxfp4 {
-            d.t[5] = n.fu_scale;
-        }
-        d.t[6] = n.row_partidx;
-        d.t[7] = n.row_gate;
-        d.i[0] = h;
-        d.i[1] = imoe_e;
-        d.i[2] = e;
-        d.i[MoeEnc::PREFILL_SLOT] = enc.code();
-        // PLOW_MOE_PF_DET: log2(k)+1 in i[5]. `row_partidx[row] == token*k + slot`
-        // (d_moe_align_pf), so the epilogue recovers the token with one shift and adds into
-        // acc[token][H]. i[4] was the retired atomic arm's field; an object carrying one arm can
-        // never read a blob emitted for the other as its own.
-        if det {
-            d.i[5] = tk.trailing_zeros() + 1;
-        }
-    });
+            d.t[7] = n.row_gate;
+            d.i[0] = h;
+            d.i[1] = imoe_e;
+            d.i[2] = e;
+            d.i[MoeEnc::PREFILL_SLOT] = enc.code();
+            // PLOW_MOE_PF_DET: log2(k)+1 in i[5]. `row_partidx[row] == token*k + slot`
+            // (d_moe_align_pf), so the epilogue recovers the token with one shift and adds into
+            // acc[token][H]. i[4] was the retired atomic arm's field; an object carrying one arm can
+            // never read a blob emitted for the other as its own.
+            if det {
+                d.i[5] = tk.trailing_zeros() + 1;
+            }
+        });
+        c_d
+    };
     // 20 T-token combine. Under TP `shared`/`part` are PARTIALS, so the combine residual must NOT be
     //    xmid (XReduce would sum it tp times): it writes the partial with a zero residual, the
     //    two-shot all-reduce folds the ranks, and a Residual then adds the real xmid. tp==1 keeps
@@ -5521,7 +5554,7 @@ fn emit_glm_moe_ffn_prefill(
                     d.i[0] = h;
                     // PLOW_MOE_PF_DET: op 86 already summed the k slots in place, so this
                     // reads ONE contiguous stream. Same kernel, same expression, k = 1.
-                    d.i[1] = if det { 1 } else { tk };
+                    d.i[1] = if det || native_moe { 1 } else { tk };
                     d.i[2] = rows;
                     d.i[3] = i * rows; // t_row0
                     d.i[4] = u32::from(det); // f64 fixed-point accumulator (PLOW_MOE_PF_DET)
@@ -5573,7 +5606,7 @@ fn emit_glm_moe_ffn_prefill(
             d.t[2] = n.shared;
             d.t[3] = n.part;
             d.i[0] = h;
-            d.i[1] = if det { 1 } else { tk }; // see the banded twin
+            d.i[1] = if det || native_moe { 1 } else { tk }; // see the banded twin
             d.i[2] = t;
             d.i[4] = u32::from(det); // see the banded twin
         })
@@ -5875,7 +5908,10 @@ fn mla_ckpt_enc(dir: &Path) -> Option<MoeEnc> {
         let num = |k: &str| w.get(k).and_then(|v| v.as_u64());
         let fmt = q.get("format").and_then(|f| f.as_str()).unwrap_or("");
         let ty = w.get("type").and_then(|t| t.as_str()).unwrap_or("");
-        let sym = w.get("symmetric").and_then(|t| t.as_bool()).unwrap_or(false);
+        let sym = w
+            .get("symmetric")
+            .and_then(|t| t.as_bool())
+            .unwrap_or(false);
         let bits = num("num_bits").unwrap_or(0);
         let group = num("group_size").unwrap_or(0);
         assert!(

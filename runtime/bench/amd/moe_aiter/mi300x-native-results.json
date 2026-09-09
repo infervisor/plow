@@ -1,0 +1,854 @@
+{
+  "schema": "plow.glm53.native-moe.v1",
+  "date": "2026-09-09",
+  "source_base_commit": "a48f416a3a5678dcb373c899035f0712c74116a4",
+  "gpu": "MI300X gfx942",
+  "gpu_lease_count": 8,
+  "tp": 8,
+  "decode_batch_capacity": 8,
+  "kv_format": "bf16",
+  "speculative_decoding": false,
+  "numerics": "BF16 input dynamically quantized to FNUZ e4m3 per 128 elements; OCP weights reuse canonicalized bytes and doubled block scales; fused BF16 routed accumulation stored as FP32; existing shared-expert/TP combine.",
+  "routed_layers": 75,
+  "workspace_bytes_per_rank": 1361486080,
+  "assembly": {
+    "object": "fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256.co",
+    "sha256": "65b4c0a0b290dd83039047c18e0bb86f4253790e926dce324ddb6b45a7b28650",
+    "kernarg_bytes": 448,
+    "descriptor_size_offset": "0x1d08",
+    "descriptor_normalization": "only kernarg size, after exact image hash verification"
+  },
+  "adapter_sha256": "0a0f5e210387df98289678c00c5c732408a38a71aced63ff6dc5e4833b42b093",
+  "packet_sha256": "0b86073279396a0d1377eba3e76b6e1709fbd9e9ca5f62332650cdcec280983e",
+  "quality_runtime_sha256": "371d38062460a3085df39d31b8ffbf4be37547c0571cff63cd222057b948f71c",
+  "benchmark_runtime_sha256": "47c9ff62a83600edc6c986f741aa4503470a3d2f6edb9dcfa9874e0472648a96",
+  "runtime_difference": "The final runtime validates the existing plow_moe_align_bm64_1 marker instead of the equivalent MPF_BM geometry symbol. Kernel arithmetic and dispatch are unchanged.",
+  "emit_config": {
+    "replay": {
+      "GLM_MOE_CORESIDENT": "2",
+      "GLM_SHARD_HEAD": "1",
+      "GLM_SHARED_CUS": "48",
+      "PLOW_DECODE_BATCH_LADDER": "1,2,4,8",
+      "PLOW_EMIT_PACKED_PREFILL": "false",
+      "PLOW_FP8": "1",
+      "PLOW_GLM_DSA": "1",
+      "PLOW_GLM_DSA_PF": "1",
+      "PLOW_GLM_FUSE_B1": "1",
+      "PLOW_GLM_FUSE_ROPE": "false",
+      "PLOW_GLM_FUSE_SEAM": "1",
+      "PLOW_GLM_MOE_AITER": "true",
+      "PLOW_MLA_PREFILL": "full:128,512,2048,8192",
+      "PLOW_MOE_PF_DET": "1"
+    },
+    "unrecorded_env": {
+      "PLOW_UNISEG": "0",
+      "PLOW_GLM_DSA_PF_SPAN": "3",
+      "PLOW_MLA_PF_V2": "1",
+      "PLOW_MLA_PF_AITER": "1"
+    }
+  },
+  "lean": {
+    "verified": true,
+    "oracle": true,
+    "reason": null,
+    "note": "`verified` = a Lean ordering certificate (plow_verify checkpoint D) was obtained for EVERY program in this blob; `oracle` = the Lean decode lower-bound query ran. false means NOT CHECKED (see `reason`), never `checked and rejected` \u2014 a rejection aborts emission, so a blob with a rejected program never reaches disk and has no manifest."
+  },
+  "default_off_packet_byte_identical": true,
+  "final_native_packet_byte_identical": true,
+  "kernel_timing_boundary": "HIP graph/event harness: reusable weight pack, four plow align phases, quantization/routing/clear, assembly, FP32 output store. Excludes router top-k, shared expert, TP collectives and serving protocol. Captured plow baseline uses BF16 output combine.",
+  "kernel_records": [
+    {
+      "arm": "native",
+      "layer": 40,
+      "rank": 0,
+      "tp": 8,
+      "rows": 8192,
+      "hidden": 6144,
+      "intermediate": 256,
+      "experts": 256,
+      "topk": 8,
+      "torch": "2.12.0+git6bbd260",
+      "hip": "7.2.53211",
+      "gpu": "AMD Instinct MI300X",
+      "aiter": "0.1.19",
+      "oracle_rows": [
+        0,
+        4096,
+        8191
+      ],
+      "relative_l2": 0.038534339517354965,
+      "ms": 2.9748408794403076,
+      "capture_check": null,
+      "weight_pack_ms": 0.6916729807853699,
+      "repeat_check": null,
+      "native_check": {
+        "fp8_input_bytes_exact": 50331648,
+        "input_scales_exact": 393216,
+        "routing_entries": 65536,
+        "padded_entries": 74304
+      },
+      "object_sha256": "65b4c0a0b290dd83039047c18e0bb86f4253790e926dce324ddb6b45a7b28650",
+      "slot_input_strategy": null,
+      "reusable_weight_pack_bytes": 1208254464,
+      "library_sha256": "78727b71c84a049f3995db662b18a61ca6c49297c8f4e9ce653b08c4fb07f2eb",
+      "source_sha256": "2d723d5ce02c42d210529532198f4e4bce019638dd200572f6cc21cb4ee2975c",
+      "capture_sha256": {
+        "fu.bin": "bb5f141e92abe07789eb5f0217f422e0551e504214757742fc2467933c63fd23",
+        "len.bin": "6b1e73a0094b7b812d3b9e22cffb4f8239319847522c4fa103753b6950020f93",
+        "meta.bin": "d29d01a32b09d327a8beec12c37d3c6c0b550106df278f05eba909082d4dc81f",
+        "rg.bin": "c203ddb4a58d550049ed0566e06d1072fe58163bb61a191d62b4550f7e572646",
+        "rp.bin": "afe147ea38c48d979f4069f273d96def2a226ad8a525255cdb07e54964e6df51",
+        "rt.bin": "36f62da93b3c6b8f93fc6bde6a26aea6e6ff97d5e811643db5f0425b3aa1693b",
+        "tab.bin": "37039e210a24287319c0ce9d0d0e833e12f4e7fcebfefa761027c8687f27c855",
+        "x.bin": "14a5e1e47a3f48a167b94eb974525ee3fd16acc49344c44441dfc9ea3830ff1c"
+      },
+      "checkpoint": {
+        "header_sha256": {
+          "model-00060-of-00141.safetensors": "843648c3c4fd6c90bce4aa6aef3fb9cd4667baa24df304beb31a22a46a1b1d88",
+          "model-00061-of-00141.safetensors": "3eaaca475e3db5f7cd43c89b95c48f1ec9ab26ca4388770c3e1a350303060354",
+          "model-00062-of-00141.safetensors": "223b2acdc251053c81433b4a478b8987db2e7ce01f37c64232f03d71a54b56ab"
+        },
+        "selected_tp_weight_sha256": "14b3e4146cb63f643528acebd18b46d0d9bda128f9bbba0b20b878a715184d42",
+        "negative_zeros_canonicalized": 4523
+      },
+      "boundary": "align, activation quantization if applicable, expert GLU/down, routing-weight combine; aiter-repack also includes weight shuffle and scale conversion on every dispatch; excludes checkpoint loading, router top-k, shared expert, residual and TP communication"
+    },
+    {
+      "arm": "native",
+      "layer": 40,
+      "rank": 0,
+      "tp": 8,
+      "rows": 4464,
+      "hidden": 6144,
+      "intermediate": 256,
+      "experts": 256,
+      "topk": 8,
+      "torch": "2.12.0+git6bbd260",
+      "hip": "7.2.53211",
+      "gpu": "AMD Instinct MI300X",
+      "aiter": "0.1.19",
+      "oracle_rows": [
+        0,
+        2232,
+        4463
+      ],
+      "relative_l2": 0.03549964725971222,
+      "ms": 2.1858630180358887,
+      "capture_check": null,
+      "weight_pack_ms": 0.6792939901351929,
+      "repeat_check": null,
+      "native_check": {
+        "fp8_input_bytes_exact": 27426816,
+        "input_scales_exact": 214272,
+        "routing_entries": 35712,
+        "padded_entries": 44736
+      },
+      "object_sha256": "65b4c0a0b290dd83039047c18e0bb86f4253790e926dce324ddb6b45a7b28650",
+      "slot_input_strategy": null,
+      "reusable_weight_pack_bytes": 1208254464,
+      "library_sha256": "78727b71c84a049f3995db662b18a61ca6c49297c8f4e9ce653b08c4fb07f2eb",
+      "source_sha256": "2d723d5ce02c42d210529532198f4e4bce019638dd200572f6cc21cb4ee2975c",
+      "capture_sha256": {
+        "fu.bin": "23703920603b0933648aede1ea29d13bd28d78963589268ed93b75790e74a941",
+        "len.bin": "39d44c5083db0e4960eb372534739a02552fbe071e577170cbacf9e9a2f0689e",
+        "meta.bin": "e4a2923c3146fc80b410b5b8c1b80b0e77f8e57dc14f50d9d6cd78c8c02347d8",
+        "rg.bin": "3f078cf34c2a8b069200feecb631ecd39ea5279fd08a21129f1f9f53baa137e2",
+        "rp.bin": "076440dbc06f5eefdc09ba91f5757fa0e763aa13d6cdb4a16e31c7dba428aa2f",
+        "rt.bin": "19e748bfa3ae25e6609376ddce8b8e9f7e65c035d6d275d1a344630dd5478111",
+        "tab.bin": "b2ad04cd5025d75febdba02faf395a6222dea359b6b60e154e4cc5241ae0f022",
+        "x.bin": "189d2a85aa71b096eee551befe1e9426cc649a23a129fb179b717e2faf0e49a5"
+      },
+      "checkpoint": {
+        "header_sha256": {
+          "model-00060-of-00141.safetensors": "843648c3c4fd6c90bce4aa6aef3fb9cd4667baa24df304beb31a22a46a1b1d88",
+          "model-00061-of-00141.safetensors": "3eaaca475e3db5f7cd43c89b95c48f1ec9ab26ca4388770c3e1a350303060354",
+          "model-00062-of-00141.safetensors": "223b2acdc251053c81433b4a478b8987db2e7ce01f37c64232f03d71a54b56ab"
+        },
+        "selected_tp_weight_sha256": "14b3e4146cb63f643528acebd18b46d0d9bda128f9bbba0b20b878a715184d42",
+        "negative_zeros_canonicalized": 4523
+      },
+      "boundary": "align, activation quantization if applicable, expert GLU/down, routing-weight combine; aiter-repack also includes weight shuffle and scale conversion on every dispatch; excludes checkpoint loading, router top-k, shared expert, residual and TP communication"
+    }
+  ],
+  "deterministic_experiment": {
+    "arm": "aiter-slots",
+    "layer": 40,
+    "rank": 0,
+    "tp": 8,
+    "rows": 8192,
+    "hidden": 6144,
+    "intermediate": 256,
+    "experts": 256,
+    "topk": 8,
+    "torch": "2.12.0+git6bbd260",
+    "hip": "7.2.53211",
+    "gpu": "AMD Instinct MI300X",
+    "aiter": "0.1.19",
+    "oracle_rows": [
+      0,
+      4096,
+      8191
+    ],
+    "relative_l2": 0.03843648359179497,
+    "ms": 4.194100856781006,
+    "capture_check": null,
+    "weight_pack_ms": 0.6937559843063354,
+    "repeat_check": {
+      "bit_identical_repeats": [
+        true,
+        true,
+        true
+      ],
+      "fp64_combine_exact": true
+    },
+    "slot_input_strategy": "quantize_once_then_repeat_fp8",
+    "reusable_weight_pack_bytes": 1208254464,
+    "library_sha256": "362a7388d01fcb8ebc84f3de83a8a6bb022142380cdd1eaeceb8cb98302abab0",
+    "source_sha256": "e4e25fc7f5eba507b959d761e8c8ee41ea2eba0c89960770fcd21498ebeff2c5",
+    "capture_sha256": {
+      "fu.bin": "bb5f141e92abe07789eb5f0217f422e0551e504214757742fc2467933c63fd23",
+      "len.bin": "6b1e73a0094b7b812d3b9e22cffb4f8239319847522c4fa103753b6950020f93",
+      "meta.bin": "d29d01a32b09d327a8beec12c37d3c6c0b550106df278f05eba909082d4dc81f",
+      "rg.bin": "c203ddb4a58d550049ed0566e06d1072fe58163bb61a191d62b4550f7e572646",
+      "rp.bin": "afe147ea38c48d979f4069f273d96def2a226ad8a525255cdb07e54964e6df51",
+      "rt.bin": "36f62da93b3c6b8f93fc6bde6a26aea6e6ff97d5e811643db5f0425b3aa1693b",
+      "tab.bin": "37039e210a24287319c0ce9d0d0e833e12f4e7fcebfefa761027c8687f27c855",
+      "x.bin": "14a5e1e47a3f48a167b94eb974525ee3fd16acc49344c44441dfc9ea3830ff1c"
+    },
+    "checkpoint": {
+      "header_sha256": {
+        "model-00060-of-00141.safetensors": "843648c3c4fd6c90bce4aa6aef3fb9cd4667baa24df304beb31a22a46a1b1d88",
+        "model-00061-of-00141.safetensors": "3eaaca475e3db5f7cd43c89b95c48f1ec9ab26ca4388770c3e1a350303060354",
+        "model-00062-of-00141.safetensors": "223b2acdc251053c81433b4a478b8987db2e7ce01f37c64232f03d71a54b56ab"
+      },
+      "selected_tp_weight_sha256": "14b3e4146cb63f643528acebd18b46d0d9bda128f9bbba0b20b878a715184d42",
+      "negative_zeros_canonicalized": 4523
+    },
+    "boundary": "align, activation quantization if applicable, expert GLU/down, routing-weight combine; aiter-repack also includes weight shuffle and scale conversion on every dispatch; excludes checkpoint loading, router top-k, shared expert, residual and TP communication"
+  },
+  "quality": {
+    "arm": "moe-a8-b8",
+    "concurrency": 8,
+    "cells": [
+      {
+        "length_label": 8000,
+        "depth": 0.1,
+        "needle": "code",
+        "expected": "7429",
+        "text": " 7429-BLUE. The code is 7429-BLUE. The code is 7",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 5437,
+          "completion_tokens": 24,
+          "total_tokens": 5461,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "seconds": 8.720060064981226
+      },
+      {
+        "length_label": 8000,
+        "depth": 0.1,
+        "needle": "city",
+        "expected": "Trondheim",
+        "text": " Trondheim. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream, so a token",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 5438,
+          "completion_tokens": 24,
+          "total_tokens": 5462,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "seconds": 8.833224572998006
+      },
+      {
+        "length_label": 8000,
+        "depth": 0.9,
+        "needle": "code",
+        "expected": "7429",
+        "text": " 7429-BLUE. The code is 7429-BLUE. The code is 7",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 5437,
+          "completion_tokens": 24,
+          "total_tokens": 5461,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "seconds": 10.380578898999374
+      },
+      {
+        "length_label": 8000,
+        "depth": 0.5,
+        "needle": "mass",
+        "expected": "312",
+        "text": " exactly 312 grams. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream,",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 5433,
+          "completion_tokens": 24,
+          "total_tokens": 5457,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "seconds": 11.533714291988872
+      },
+      {
+        "length_label": 8000,
+        "depth": 0.9,
+        "needle": "city",
+        "expected": "Trondheim",
+        "text": " Trondheim. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream, so a token",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 5438,
+          "completion_tokens": 24,
+          "total_tokens": 5462,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "seconds": 12.705111410003155
+      },
+      {
+        "length_label": 8000,
+        "depth": 0.5,
+        "needle": "city",
+        "expected": "Trondheim",
+        "text": " Trondheim. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream, so a token",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 5438,
+          "completion_tokens": 24,
+          "total_tokens": 5462,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "seconds": 13.928760304988828
+      },
+      {
+        "length_label": 8000,
+        "depth": 0.5,
+        "needle": "code",
+        "expected": "7429",
+        "text": " 7429-BLUE. The code is 7429-BLUE. The code is 7",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 5437,
+          "completion_tokens": 24,
+          "total_tokens": 5461,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "seconds": 15.202731909987051
+      },
+      {
+        "length_label": 8000,
+        "depth": 0.1,
+        "needle": "mass",
+        "expected": "312",
+        "text": " exactly 312 grams. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream,",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 5433,
+          "completion_tokens": 24,
+          "total_tokens": 5457,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "seconds": 16.530284737003967
+      },
+      {
+        "length_label": 8000,
+        "depth": 0.9,
+        "needle": "mass",
+        "expected": "312",
+        "text": " exactly 312 grams. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream,",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 5433,
+          "completion_tokens": 24,
+          "total_tokens": 5457,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "seconds": 28.54527198697906
+      },
+      {
+        "length_label": 100000,
+        "depth": 0.1,
+        "needle": "code",
+        "expected": "7429",
+        "text": " 7429-BLUE. The code is 7429-BLUE. The code is 7",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 68801,
+          "completion_tokens": 24,
+          "total_tokens": 68825,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "seconds": 39.63293171004625
+      },
+      {
+        "length_label": 100000,
+        "depth": 0.1,
+        "needle": "city",
+        "expected": "Trondheim",
+        "text": " Trondheim. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream, so a token",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 68802,
+          "completion_tokens": 24,
+          "total_tokens": 68826,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "seconds": 49.50317434000317
+      },
+      {
+        "length_label": 100000,
+        "depth": 0.1,
+        "needle": "mass",
+        "expected": "312",
+        "text": " exactly 312 grams. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream,",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 68797,
+          "completion_tokens": 24,
+          "total_tokens": 68821,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "seconds": 59.80217021104181
+      },
+      {
+        "length_label": 100000,
+        "depth": 0.5,
+        "needle": "code",
+        "expected": "7429",
+        "text": " 7429-BLUE. The code is 7429-BLUE. The code is 7",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 68801,
+          "completion_tokens": 24,
+          "total_tokens": 68825,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "seconds": 70.09504718700191
+      },
+      {
+        "length_label": 100000,
+        "depth": 0.5,
+        "needle": "city",
+        "expected": "Trondheim",
+        "text": " Trondheim. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream, so a token",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 68802,
+          "completion_tokens": 24,
+          "total_tokens": 68826,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "seconds": 80.32544297201093
+      },
+      {
+        "length_label": 100000,
+        "depth": 0.9,
+        "needle": "city",
+        "expected": "Trondheim",
+        "text": " Trondheim.",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 68802,
+          "completion_tokens": 4,
+          "total_tokens": 68806,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "seconds": 65.91129640798317
+      },
+      {
+        "length_label": 100000,
+        "depth": 0.5,
+        "needle": "mass",
+        "expected": "312",
+        "text": " exactly 312 grams. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream,",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 68797,
+          "completion_tokens": 24,
+          "total_tokens": 68821,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "seconds": 90.49713620898547
+      },
+      {
+        "length_label": 100000,
+        "depth": 0.9,
+        "needle": "code",
+        "expected": "7429",
+        "text": " 7429-BLUE. The code is 7429-BLUE. The code is 7",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 68801,
+          "completion_tokens": 24,
+          "total_tokens": 68825,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "seconds": 96.15074149298016
+      },
+      {
+        "length_label": 100000,
+        "depth": 0.9,
+        "needle": "mass",
+        "expected": "312",
+        "text": " exactly 312 grams. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream,",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 68797,
+          "completion_tokens": 24,
+          "total_tokens": 68821,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "seconds": 65.68073062895564
+      }
+    ],
+    "baseline": "tp8-b8-bf16 / section12",
+    "passed": 18,
+    "text_identical": 17,
+    "raw_sha256": "2166f9308a20fe77ca4cbca0f89979abb77050385974f4629763551b58800843"
+  },
+  "verification": {
+    "packet_tests": 129,
+    "manifest_tests": 47,
+    "native_route_test": true,
+    "hsa_dispatch_test": "rows 1,129,1 with varying expert scales and unequal routing weights",
+    "cuda_hsa_compile": true
+  },
+  "serving_native": {
+    "date": "20260909-224118",
+    "endpoint_type": "vllm",
+    "backend": "vllm",
+    "label": null,
+    "model_id": "glm-5.3-plow-lite",
+    "tokenizer_id": "zai-org/GLM-5.3",
+    "num_prompts": 20,
+    "request_rate": "inf",
+    "burstiness": 1.0,
+    "max_concurrency": 20,
+    "duration": 460.45358319499064,
+    "completed": 20,
+    "failed": 0,
+    "total_input_tokens": 1414538,
+    "total_output_tokens": 13795,
+    "request_throughput": 0.04343543134407643,
+    "request_goodput": null,
+    "output_throughput": 29.959588769576715,
+    "total_token_throughput": 3102.0129978989357,
+    "max_output_tokens_per_s": 72.0,
+    "max_concurrent_requests": 20,
+    "rtfx": 0.0,
+    "mean_ttft_ms": 178418.57218314835,
+    "median_ttft_ms": 189476.47371998755,
+    "std_ttft_ms": 120061.63976104943,
+    "p99_ttft_ms": 380260.16212481476,
+    "mean_tpot_ms": 205.56492102293734,
+    "median_tpot_ms": 228.2178121615911,
+    "std_tpot_ms": 45.747472556195625,
+    "p99_tpot_ms": 266.9229710928318,
+    "mean_itl_ms": 205.03807772599407,
+    "median_itl_ms": 119.00478700408712,
+    "std_itl_ms": 312.9704899238162,
+    "p99_itl_ms": 1471.8065749213565,
+    "input_lens": [
+      76873,
+      72685,
+      70219,
+      65488,
+      66234,
+      61003,
+      61674,
+      60523,
+      63635,
+      76141,
+      72929,
+      78091,
+      70072,
+      72091,
+      79228,
+      74499,
+      72593,
+      70856,
+      71175,
+      78529
+    ],
+    "output_lens": [
+      656,
+      763,
+      734,
+      602,
+      680,
+      771,
+      711,
+      608,
+      753,
+      746,
+      769,
+      636,
+      619,
+      772,
+      606,
+      709,
+      617,
+      661,
+      697,
+      685
+    ],
+    "raw_sha256": "111bb2e9235307ef777b14caf1b8cf057a04f271629c06323e81fe4aedc66828"
+  },
+  "serving_historical_baseline": {
+    "date": "20260909-202544",
+    "endpoint_type": "vllm",
+    "backend": "vllm",
+    "label": null,
+    "model_id": "glm-5.3-plow-lite",
+    "tokenizer_id": "zai-org/GLM-5.3",
+    "num_prompts": 20,
+    "request_rate": "inf",
+    "burstiness": 1.0,
+    "max_concurrency": 20,
+    "duration": 489.3467448769952,
+    "completed": 20,
+    "failed": 0,
+    "total_input_tokens": 1414538,
+    "total_output_tokens": 13795,
+    "request_throughput": 0.04087081442633752,
+    "request_goodput": null,
+    "output_throughput": 28.1906442505663,
+    "total_token_throughput": 2918.8566491006973,
+    "max_output_tokens_per_s": 72.0,
+    "max_concurrent_requests": 20,
+    "rtfx": 0.0,
+    "mean_ttft_ms": 195138.61438784224,
+    "median_ttft_ms": 203803.46655801986,
+    "std_ttft_ms": 127853.80545359559,
+    "p99_ttft_ms": 410364.8503502912,
+    "mean_tpot_ms": 218.67563437592773,
+    "median_tpot_ms": 242.9876530152903,
+    "std_tpot_ms": 50.92174143539112,
+    "p99_tpot_ms": 272.1699668988488,
+    "mean_itl_ms": 216.53108694121423,
+    "median_itl_ms": 116.59842601511627,
+    "std_itl_ms": 368.60167722439496,
+    "p99_itl_ms": 1684.9973415140994,
+    "input_lens": [
+      76873,
+      72685,
+      70219,
+      65488,
+      66234,
+      61003,
+      61674,
+      60523,
+      63635,
+      76141,
+      72929,
+      78091,
+      70072,
+      72091,
+      79228,
+      74499,
+      72593,
+      70856,
+      71175,
+      78529
+    ],
+    "output_lens": [
+      656,
+      763,
+      734,
+      602,
+      680,
+      771,
+      711,
+      608,
+      753,
+      746,
+      769,
+      636,
+      619,
+      772,
+      606,
+      709,
+      617,
+      661,
+      697,
+      685
+    ],
+    "raw_sha256": "dcb09b2eca795fd956cb1d4c1b596170614a3f4307eee60ce30357d9f6019e3b"
+  },
+  "matched_historical_token_lengths": true,
+  "source_sha256": {
+    "crates/plowrt/src/exec/amd_moe_aiter.rs": "ba73e651671a14010aeac894bac34973a2f944f2c6d40ff32438cf5ade0d7acb",
+    "runtime/amd/moe_aiter_adapter.hip": "e8432ff9661bb758d43be49ca9949e40f06a1d9fc917ddd610f93e51993f2971",
+    "runtime/bench/amd/moe_aiter/kernels.hip": "6bc0cb6694ed3443c5b267d3109297780609b4ec241b4a3af158c78041c8778c",
+    "runtime/bench/amd/moe_aiter/captured.py": "b035a359f078849f4aea71b38a0b1f8ff17631ac6fd65712dae82fe6d2449e76",
+    "scripts/build_moe_aiter.sh": "f892cbd11181316ade0ffdb09120a37ea5de91f93da9e70410992ff51ad54b35"
+  },
+  "source_note": "Kernel records retain the measured harness hashes. The final captured.py fixes native/slot temporary naming and clarifies timing-boundary text; the measured arithmetic is unchanged.",
+  "verification_log_sha256": {
+    "packet-tests-verified.log": "8c00b6f65bd05501f0496c095478a8ffa86015c889abf28b8fe7165718c685bc",
+    "manifest-tests.log": "173f1d5dcec056fff5e9511aa021af9e2da237ad07b356d023e22b485c914d45",
+    "route-tests-final.log": "b691e065f3c3be85903c34dfc18ef67ad317324718c6039bf612155bb3d3986e",
+    "hsa.log": "46a0819018b4a63d14a7e55de6f23a2b81a957634b04cde4965892c60a763bc4",
+    "check-final.log": "d7ae204894d13c4bbfbbff1a8e95497d8fe5d9727a5cef0234ebef1b9b469d9d"
+  },
+  "historical_baseline_object_comparison": "Interpreter and decode-rung objects match exactly. The MLA helper was rebuilt with FP8 support after the historical BF16 run, so an adjacent baseline with the final runtime and identical objects is measured separately.",
+  "serving_adjacent_baseline": {
+    "date": "20260909-225131",
+    "endpoint_type": "vllm",
+    "backend": "vllm",
+    "label": null,
+    "model_id": "glm-5.3-plow-lite",
+    "tokenizer_id": "zai-org/GLM-5.3",
+    "num_prompts": 20,
+    "request_rate": "inf",
+    "burstiness": 1.0,
+    "max_concurrency": 20,
+    "duration": 488.90585604897933,
+    "completed": 20,
+    "failed": 0,
+    "total_input_tokens": 1414538,
+    "total_output_tokens": 13795,
+    "request_throughput": 0.04090767118566968,
+    "request_goodput": null,
+    "output_throughput": 28.216066200315662,
+    "total_token_throughput": 2921.4888353820565,
+    "max_output_tokens_per_s": 72.0,
+    "max_concurrent_requests": 20,
+    "rtfx": 0.0,
+    "mean_ttft_ms": 196985.17530139943,
+    "median_ttft_ms": 205974.5942800073,
+    "std_ttft_ms": 128746.37458772512,
+    "p99_ttft_ms": 411137.80977792275,
+    "mean_tpot_ms": 216.91576821936735,
+    "median_tpot_ms": 232.89870894060155,
+    "std_tpot_ms": 47.155735840084326,
+    "p99_tpot_ms": 282.5525148610654,
+    "mean_itl_ms": 217.66837234412202,
+    "median_itl_ms": 116.83281796285883,
+    "std_itl_ms": 366.9391361386323,
+    "p99_itl_ms": 1686.2808007956482,
+    "input_lens": [
+      76873,
+      72685,
+      70219,
+      65488,
+      66234,
+      61003,
+      61674,
+      60523,
+      63635,
+      76141,
+      72929,
+      78091,
+      70072,
+      72091,
+      79228,
+      74499,
+      72593,
+      70856,
+      71175,
+      78529
+    ],
+    "output_lens": [
+      656,
+      763,
+      734,
+      602,
+      680,
+      771,
+      711,
+      608,
+      753,
+      746,
+      769,
+      636,
+      619,
+      772,
+      606,
+      709,
+      617,
+      661,
+      697,
+      685
+    ],
+    "raw_sha256": "a6f759bb6e68785c04a30f522a6ea77f6c611afb9da1e11f721f64cd26f4f806"
+  },
+  "serving_comparison": {
+    "matched_per_request_token_lengths": true,
+    "same_runtime_binary": true,
+    "same_interpreter_and_attention_objects": true,
+    "native_measured_before_baseline": true,
+    "native_packed_prefill_emit": false,
+    "baseline_packed_prefill_emit": true,
+    "note": "Native MoE requires unpacked prefill. The existing baseline contains packed companions; sparse MLA prevents their use for this workload. One 20-request screen per arm, not the 100-request H200 benchmark.",
+    "delta_percent": {
+      "duration": -5.8195811119796215,
+      "output_throughput": 6.179183720661774,
+      "mean_ttft_ms": -9.425380915006942,
+      "p99_ttft_ms": -7.510291420238547,
+      "mean_tpot_ms": -5.232836362984394,
+      "p99_tpot_ms": -5.531553586036509,
+      "mean_itl_ms": -5.802540112791455,
+      "median_itl_ms": 1.8590401901619424,
+      "p99_itl_ms": -12.718772921632926
+    }
+  },
+  "runtime_env": {
+    "PLOW_MLA_PF_V2": "1",
+    "PLOW_MLA_PF_AITER": "1",
+    "PLOW_PF_CHUNK": "8192",
+    "PLOW_PF_INTERLEAVE": "0"
+  },
+  "shared_objects_sha256": {
+    "interp_prefill_mla_moe_gq.elf": "3a21ac052261d8156aa1f42ec5d635829e3b9635f8bcad22926639f4a861e272",
+    "interp_decode_gq.elf": "bacb869f9ac3333dd3211336944f901498cd4206774b27831838f9060c696e13",
+    "interp_flash_gq.elf": "54d7c08558e89c96624822e3755dde56cb4d58ab2a1e8fc284eae15c226554ce",
+    "mla_sparse_adapter_gfx942.elf": "a77f08c610bcda50a535e9a86caa601517e5f55368d17f4a47cc72679128774c",
+    "mla_a16w16_qh8_qseqlen1_gqaratio8_v3.co": "cd8fa62e18abada15beeeedd49357bcc1e9e2eee7353d038533f30cac93c3607",
+    "lowrung1/interp_decode_gq.elf": "62ab42721209621e451226817db86f50460a1943714b29ba6d740ea2c7abe0b7",
+    "lowrung2/interp_decode_gq.elf": "2d3a3bf0c61a8d167830adff7adb60bd6c9bee7b560a1d8657537b66ebef3e54",
+    "lowrung4/interp_decode_gq.elf": "047caaf4a014269b4d7d3baace43f982a2816ad78a268aa9eb8e6a8c8b7fab1d"
+  },
+  "serving_log_sha256": {
+    "server-perf.log": "488c0cff34729ebaf6eda30a08d69618ab6bee4420969606549bcf867170159e",
+    "bench20.log": "f948012d47b8e4eae013e7c19df7938d41f92a1ce721297d90235cd74c0cef6e",
+    "baseline-current/server-perf.log": "33b52123d2518649e504a2a91735e25c8808c4c464255885e8f066df77ec365e",
+    "baseline-current/bench20.log": "f62a21dc167f19596a03b423681259e8b27edd01bee280e25024c2daa843e97d"
+  }
+}

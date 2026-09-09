@@ -2269,11 +2269,9 @@ impl Builder {
         // The HSA queue barrier between segment launches already orders every earlier segment
         // before every later one, so cross-segment counter edges are redundant. Keep all
         // same-segment edges unchanged; this applies only to programs carrying the raw boundary.
-        let raw_segmented = self
-            .ops
-            .iter()
-            .any(|op| op.inst.op == DevOp::KdaDecodeFused as u16)
-            || lean_moe_stage2
+        let raw_segmented = self.ops.iter().any(|op| {
+            op.inst.op == DevOp::KdaDecodeFused as u16 || op.inst.op == DevOp::MoeAiterFp8Pf as u16
+        }) || lean_moe_stage2
             || lean_moe_stage1
             || lean_moe_combine
             || lean_attn_res_f32mix
@@ -5704,6 +5702,32 @@ mod v6_tests {
 #[cfg(test)]
 mod isolated_segment_tests {
     use super::*;
+    use crate::dev::SE_XCTR;
+
+    #[test]
+    fn native_moe_boundary_orders_segments_without_counter_obligations() {
+        let mut b = Builder::new(4);
+        b.force_uniseg();
+        let first = b.emit(DevOp::Nop, b.all(), &[], |_| {});
+        let second = b.emit(DevOp::Nop, b.all(), &[first], |_| {});
+        let raw = b.emit(DevOp::MoeAiterFp8Pf, vec![0], &[second], |_| {});
+        b.isolate(raw);
+        b.emit(DevOp::Nop, b.all(), &[raw], |_| {});
+        let p = b.finish();
+        assert!(p.insts[1].wait_len > 0);
+        for stream in [&p.stream, &p.gq_stream] {
+            for entry in stream {
+                if entry.inst == raw {
+                    assert_eq!(entry.seg, 1);
+                    assert_eq!((entry.wait_len, entry.succ_len, entry.flags & SE_XCTR), (0, 0, 0));
+                }
+                if entry.inst == raw + 1 {
+                    assert_eq!(entry.seg, 2);
+                    assert_eq!(entry.wait_len, 0);
+                }
+            }
+        }
+    }
 
     fn program(isolate: bool) -> Program {
         let mut b = Builder::new(4);

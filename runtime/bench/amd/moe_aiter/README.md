@@ -2,8 +2,8 @@
 
 This compares the emitted per-rank shape: H=6144, expert I=256, E=256, top-k=8.
 It calls plow's actual grouped align/GLU/down/combine bodies and AITER's fused
-MoE entry point on the same synthetic inputs. It is a kernel screening tool,
-not a serving implementation.
+MoE entry point on synthetic and captured inputs. The native adapter also has
+an opt-in serving route, described below.
 
 Inside `nix develop`, with ROCm PyTorch and `amd-aiter==0.1.19` available:
 
@@ -108,7 +108,7 @@ Resident and repacked assembly runs differ by 0.20–0.28% despite identical
 packed weights. Do not assume the fused output preserves plow's deterministic
 FP64 combine contract; that needs an explicit integration decision and test.
 
-Keeping a shuffled copy of every layer would duplicate about 87.75 GiB/rank
+Keeping a shuffled copy of all 75 routed layers would duplicate about 84.4 GiB/rank
 for these expert weights, before scale storage. Instead, `plow_moe_pack`
 accepts plow's per-expert weight/scale pointer tables and packs one layer into
 **1,208,254,464 reusable bytes** (about 1.125 GiB). Weight shuffling and doubled
@@ -160,7 +160,110 @@ for arm in plow aiter ck aiter-repack; do
 done
 ```
 
-Next integration gate: native HSA dispatch from an ordered, pure MoE segment,
-with a reusable packed-weight workspace and correct shared-expert/TP combine.
-The activation quantization change then needs full-model quality and serving
-A/B measurements. This commit does not enable AITER MoE in production.
+## Native gfx942 serving adapter
+
+`--glm-moe-aiter=true` (`PLOW_GLM_MOE_AITER=1`) emits `MoeAiterFp8Pf` (156)
+for routed prefill MoE. The instruction explicitly specifies dynamic A8
+activation quantization and BF16 routed accumulation, stored as FP32 for
+plow's existing shared-expert/TP combine. The previous FP64 path remains the
+default and still handles decode. This option requires TP8, H6144/I256/E256,
+top-k 8, buckets 128..8192 and `--emit-packed-prefill=false`.
+
+Each isolated segment enqueues four ordered HSA kernels: weight packing,
+input quantization/routing conversion/output clear, pinned AITER assembly,
+and BF16-to-FP32 output storage. There is no HIP or Python dependency in the
+serving process. One **1,361,486,080-byte workspace per rank** serves all
+75 routed layers at the 8192-row capacity. The three dense layers use the
+existing path; the earlier 78-layer duplication estimate included those
+dense layers and overstated the avoided weight storage.
+
+The loader verifies the assembly SHA-256, gfx942/TP8 geometry, adapter ABI,
+64-row alignment marker, tensor capacities and isolated segments without
+interpreter counter obligations. It refuses decode and packed uses. The
+pinned assembly descriptor omits its kernarg size; after checking its hash,
+the loader fills the 448-byte size at the known descriptor offset for ROCr.
+The assembly instructions remain unchanged.
+
+| Captured live rows | Plow, ms | Native adapter, ms | Reduction |
+|---:|---:|---:|---:|
+| 8192 | 4.833 | 2.975 | 38.4% |
+| 4464 | 2.825 | 2.186 | 22.6% |
+
+These HIP-harness measurements include per-dispatch weight packing, plow alignment,
+quantization, assembly and output storage. Input FP8 bytes, scales and routed
+entries match AITER exactly. Sampled FP32-oracle relative L2 is 3.85% / 3.55%.
+The direct HSA test also exercises ragged rows 1/129, varying expert scales,
+unequal routing weights and workspace reuse.
+
+A deterministic experiment (`--arm aiter-slots`) quantizes once, duplicates
+FP8 inputs for eight top-k-1 calls' rows, and sums their BF16 expert outputs
+in FP64. It passed exact reduction and three identical repeats, but took
+**4.194 ms** at 8192 rows versus 4.541 ms when duplicating BF16 before
+quantization. Its extra per-slot storage and smaller speedup made the explicit
+fused BF16 option the better serving candidate. This experiment does not
+establish determinism for other inputs or hardware.
+
+Build the adapter beside the already qualified interpreter/MLA objects:
+
+```sh
+# Run inside nix develop. Supply the object from amd-aiter 0.1.19.
+bash scripts/build_moe_aiter.sh "$OBJECT_DIR" "$AITER_MOE_OBJECT"
+```
+
+The accepted assembly object is named above and has SHA-256
+`65b4c0a0b290dd83039047c18e0bb86f4253790e926dce324ddb6b45a7b28650`.
+No third-party binary is vendored. Its launch contract follows
+[AITER's native wrapper](https://github.com/ROCm/aiter/blob/main/csrc/py_itfs_cu/asm_fmoe.cu).
+
+Replay the qualified BF16-KV B8 compiler configuration, preserving the
+unrecorded sparse-attention knobs as well:
+
+```sh
+PLOW_UNISEG=0 PLOW_GLM_DSA_PF_SPAN=3 PLOW_MLA_PF_V2=1 PLOW_MLA_PF_AITER=1 \
+  target/release/plowc --replay-knobs "$BASELINE_ASSETS/build.json" \
+    --hf-dir /workspace/models/GLM-5.3-plow-lite --emit devblob \
+    --gpu MI300X --arch gfx942 --max-ctx 81920 --n-cu 0 --num-gpus 8 \
+    --glm-moe-aiter=true --emit-packed-prefill=false --out "$ASSETS/model.pkt"
+PLOW_HSACO="$OBJECT_DIR" PLOW_MLA_PF_V2=1 PLOW_MLA_PF_AITER=1 \
+PLOW_PF_CHUNK=8192 PLOW_PF_INTERLEAVE=0 \
+  perf-data/tools/gpulease -n 8 moe-native target/release/plowrt serve \
+    --assets "$ASSETS" --port 18965
+```
+
+Use the existing checkpoint/tokenizer/weights metadata alongside the emitted
+packet. Packet/operand ABI tests, native route tests, CUDA+HSA compilation and
+Lean ordering certificates pass. With the option off, the compiler reproduces
+the previous baseline packet byte-for-byte. TP8 B8 retrieval passes **18/18**
+through 68.8k prompt tokens; **17/18** outputs match the baseline text exactly.
+This is a limited retrieval gate, not a broad accuracy evaluation.
+
+### Matched serving screen
+
+An adjacent baseline uses the same final runtime and interpreter/attention
+objects, TP8 B8, BF16 KV, chunk 8192 and no prefill interleaving. Both runs
+complete **20/20, zero failures**, with identical per-request input/output
+lengths: 1,414,538 input and 13,795 output tokens. The client uses the user's
+70k/700, range-ratio 0.14, C20, seed-0 random workload, reduced to 20 requests
+for screening. No speculative decoding is enabled.
+
+| Metric | Baseline | Native A8 MoE | Change |
+|---|---:|---:|---:|
+| Duration, s | 488.906 | 460.454 | −5.8% |
+| Output tokens/s | 28.216 | 29.960 | +6.2% |
+| Mean TTFT, s | 196.985 | 178.419 | −9.4% |
+| P99 TTFT, s | 411.138 | 380.260 | −7.5% |
+| Mean TPOT, ms | 216.916 | 205.565 | −5.2% |
+| P99 TPOT, ms | 282.553 | 266.923 | −5.5% |
+| Median ITL, ms | 116.833 | 119.005 | +1.9% |
+| P99 ITL, ms | 1686.281 | 1471.807 | −12.7% |
+
+The earlier B8 baseline was 28.191 tokens/s; the adjacent baseline confirms
+it within 0.1%. This is one screen per arm. The median-ITL regression and
+limited accuracy coverage keep the new numerical path opt-in. The H200
+100-request target of 273.67 tokens/s remains unmet.
+
+[The measured record](mi300x-native-results.json) includes both serving
+summaries, per-request lengths, retrieval outputs, kernel measurements,
+runtime/object/packet hashes, configuration and verification results. The
+baseline contains unused packed-prefill companions; the native option omits
+them. Sparse MLA prevents their use in this serving workload.

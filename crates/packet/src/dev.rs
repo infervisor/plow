@@ -1832,6 +1832,12 @@ pub enum DevOp {
     /// `t0=x t1=Wg t2=Wp t3=gamma_post t4=ple t5=hn_out? t6=gamma_next?` ·
     /// `i0=T i1=H i2=P i3=col0 i4=stride` · `f0=eps f1=layer_scalar`.
     PerLayerInput = 155,
+    /// Native gfx942 A8 block-FP8 MoE prefill. Quantizes BF16 input in 128-element
+    /// groups and combines routed experts in BF16; writes the result as FP32.
+    /// This is a separate numerical contract from the FP64 grouped-down path.
+    /// `t0=out t1=x t2=weights t3=scales t4=meta t5=row_token t6=row_part t7=row_gate` ·
+    /// `i0=T i1=H i2=I i3=E i4=topk i5=align_tile`. Requires an isolated native segment.
+    MoeAiterFp8Pf = 156,
 }
 
 /// GLU-family `act` code for GPT-OSS's `swiglu_oai` (pair form, `f0 = alpha`, `f1 = limit`).
@@ -2003,6 +2009,7 @@ impl DevOp {
         DevOp::MoeDownMxPf,
         DevOp::RowGather,
         DevOp::PerLayerInput,
+        DevOp::MoeAiterFp8Pf,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -2179,6 +2186,7 @@ impl DevOp {
             DevOp::MoeDownMxPf => "PLOW_DOP_MOE_DOWN_MX_PF",
             DevOp::RowGather => "PLOW_DOP_ROW_GATHER",
             DevOp::PerLayerInput => "PLOW_DOP_PER_LAYER_INPUT",
+            DevOp::MoeAiterFp8Pf => "PLOW_DOP_MOE_AITER_FP8_PF",
         }
     }
 
@@ -2220,7 +2228,7 @@ impl DevOp {
     /// collision-at-merge as 111 -> 113, resolved the same way (renumber the later merge).
     /// 154 -> 155 for `RowGather = 154` (the unified token batch's terminal row selection).
     /// 155 -> 156 for `PerLayerInput = 155` (Gemma-4 E-series per-layer inputs).
-    pub const COUNT: u16 = 156;
+    pub const COUNT: u16 = 157;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///

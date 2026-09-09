@@ -2526,6 +2526,16 @@ impl GpuEngine {
                     source,
                 })?;
                 let blob = DevBlob::parse(&raw)?;
+                if blob
+                    .progs
+                    .iter()
+                    .flat_map(|p| &p.insts)
+                    .any(|d| d.op == DevOp::MoeAiterFp8Pf as u16)
+                {
+                    return Err(RuntimeError::Device(
+                        "AITER MoE is supported only on gfx942".into(),
+                    ));
+                }
                 if blob.progs.iter().flat_map(|p| &p.insts).any(|d| {
                     (d.op == DevOp::IndexSelect as u16 && d.i[3] != 0)
                         || (matches!(

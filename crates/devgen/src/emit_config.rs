@@ -571,6 +571,10 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_FP8_KV", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_fp8_kv: bool,
 
+    /// Use native gfx942 A8 MoE prefill with BF16 routed accumulation.
+    #[arg(long, env = "PLOW_GLM_MOE_AITER", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_moe_aiter: bool,
+
     /// Cap the dispatch width of every blocked GEMV. Unset ⇒ byte-identical.
     #[arg(long, env = "PLOW_GLM_GEMV_WG")]
     pub glm_gemv_wg: Option<u32>,
@@ -1033,6 +1037,7 @@ impl EmitConfig {
             gemv_wg_tuning: env_str("PLOW_GEMV_WG_TUNING"),
             glm_dsa_pf: env_bool("PLOW_GLM_DSA_PF"),
             glm_fp8_kv: env_bool("PLOW_GLM_FP8_KV"),
+            glm_moe_aiter: env_bool("PLOW_GLM_MOE_AITER"),
             glm_gemv_wg: env_u32("PLOW_GLM_GEMV_WG"),
             glm_ofold: env_bool("PLOW_GLM_OFOLD"),
             glm_pf_ns: env_u32("PLOW_GLM_PF_NS"),

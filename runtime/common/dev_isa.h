@@ -1346,6 +1346,10 @@ enum {
      * whose 1/sqrt(2) the emitter already applied when it combined the table); Wp is the checkpoint
      * weight verbatim. t5/t6 fold the NEXT layer's input norm. */
     PLOW_DOP_PER_LAYER_INPUT = 155,
+    /* Native gfx942 A8 block-FP8 MoE, BF16 routed accumulation -> FP32 output.
+     * t0=out t1=x t2=weights t3=scales t4=meta t5=row_token t6=row_part t7=row_gate
+     * i0=T i1=H i2=I i3=E i4=topk i5=align_tile. Isolated native segment only. */
+    PLOW_DOP_MOE_AITER_FP8_PF = 156,
 
     PLOW_DOP__COUNT
 };

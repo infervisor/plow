@@ -64,39 +64,104 @@ extern "C" int plow_moe(void *out, void *x, void *wt, void *st, void *table,
     return hipGetLastError();
 }
 
-template <unsigned N, unsigned K, bool GU>
-__device__ void pack_weight(uint4* out, const unsigned long long* wt) {
-    constexpr unsigned vectors = N * K / 16;
-    const unsigned e = blockIdx.x / 8u;
-    const auto* first = (const uint4*)wt[e * 3u + (GU ? 0u : 2u)];
-    const auto* second = GU ? (const uint4*)wt[e * 3u + 1u] : first;
-    for (unsigned v = blockIdx.x % 8u * blockDim.x + threadIdx.x; v < vectors;
-         v += blockDim.x * 8u) {
-        const unsigned row = (v / (32u * (K / 32u))) * 16u + v % 16u;
-        const unsigned col = (v / 32u) % (K / 32u) * 2u + (v / 16u) % 2u;
-        const unsigned source_row = GU ? row % 256u : row;
-        const auto* src = GU && row >= 256u ? second : first;
-        out[e * vectors + v] = src[source_row * (K / 16u) + col];
-    }
-}
-
-__global__ void pack_moe(uint4* gu, uint4* down, float* gs, float* ds,
-                         const unsigned long long* wt, const unsigned long long* st) {
-    // Runtime weights already scrub OCP -0. Keep their bytes and double FNUZ scales.
-    pack_weight<512, 6144, true>(gu, wt);
-    pack_weight<6144, 256, false>(down, wt);
-    if (blockIdx.x % 8u == 0 && threadIdx.x < 96u) {
-        const unsigned e = blockIdx.x / 8u, j = threadIdx.x;
-        gs[e * 192u + j] = 2.0f * ((const float*)st[e * 3u])[j];
-        gs[e * 192u + 96u + j] = 2.0f * ((const float*)st[e * 3u + 1u])[j];
-        ds[e * 96u + j] = 2.0f * ((const float*)st[e * 3u + 2u])[j];
-    }
-}
+#include "moe_aiter_adapter.hip"
 
 extern "C" int plow_moe_pack(void* gu, void* down, void* gs, void* ds,
                              void* wt, void* st, void* stream) {
     pack_moe<<<256 * 8, 256, 0, (hipStream_t)stream>>>((uint4*)gu, (uint4*)down,
         (float*)gs, (float*)ds, (const unsigned long long*)wt,
         (const unsigned long long*)st);
+    return hipGetLastError();
+}
+
+__global__ void reduce_moe_slots(double* acc, unsigned short* out,
+                                 const unsigned short* parts, unsigned rows) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    for (unsigned i = blockIdx.x * blockDim.x + threadIdx.x; i < rows * 6144u;
+         i += blockDim.x * gridDim.x) {
+        const unsigned row = i / 6144u, col = i % 6144u;
+        double sum = 0;
+#pragma unroll
+        for (unsigned slot = 0; slot < 8; ++slot)
+            sum += (double)bf2f(parts[(row * 8u + slot) * 6144u + col]);
+        acc[i] = sum;
+        out[i] = f2bf((float)sum);
+    }
+#endif
+}
+
+extern "C" int plow_moe_reduce_slots(void* acc, void* out, void* parts,
+                                     unsigned rows, void* stream) {
+    reduce_moe_slots<<<304, 256, 0, (hipStream_t)stream>>>((double*)acc,
+        (unsigned short*)out, (const unsigned short*)parts, rows);
+    return hipGetLastError();
+}
+
+static hipModule_t moe_module;
+static hipFunction_t moe_function;
+
+extern "C" int plow_moe_native_load(const char* path) {
+    hipError_t status = hipModuleLoad(&moe_module, path);
+    if (status != hipSuccess) return status;
+    return hipModuleGetFunction(&moe_function, moe_module,
+        "_ZN5aiter50fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256E");
+}
+
+extern "C" int plow_moe_native_prepare(MoePrepareArgs* args, void* stream) {
+    plow_moe_aiter_prepare<<<304 * 4, 256, 0, (hipStream_t)stream>>>(*args);
+    return hipGetLastError();
+}
+
+extern "C" int plow_moe_native_align(void* meta, void* table, void* rt, void* rp,
+                                      void* rg, unsigned rows, void* stream) {
+    align_moe<<<64, 512, 0, (hipStream_t)stream>>>(meta, table, rt, rp, rg, rows, 1);
+    align_moe<<<1, 512, 0, (hipStream_t)stream>>>(meta, table, rt, rp, rg, rows, 2);
+    align_moe<<<64, 512, 0, (hipStream_t)stream>>>(meta, table, rt, rp, rg, rows, 3);
+    align_moe<<<64, 512, 0, (hipStream_t)stream>>>(meta, table, rt, rp, rg, rows, 4);
+    return hipGetLastError();
+}
+
+extern "C" int plow_moe_native_execute(void* out, void* q, void* gu, void* down,
+                                         void* qs, void* gs, void* ds, void* ids,
+                                         void* weights, void* experts, void* valid,
+                                         unsigned rows, void* stream) {
+    uint64_t args[56] = {};
+    args[0] = (uint64_t)out;
+    args[2] = (uint64_t)q;
+    args[4] = (uint64_t)gu;
+    args[6] = (uint64_t)valid;
+    args[8] = (uint64_t)down;
+    args[10] = (uint64_t)qs;
+    args[12] = (uint64_t)gs;
+    args[14] = (uint64_t)ds;
+    args[18] = (uint64_t)ids;
+    args[20] = (uint64_t)weights;
+    args[22] = (uint64_t)experts;
+    args[24] = 6144;
+    args[26] = 256;
+    args[28] = rows;
+    args[30] = 256;
+    args[32] = 6144;
+    args[34] = 6144;
+    args[36] = 256;
+    args[38] = 6144 * 2;
+    args[40] = 512 * 6144;
+    args[42] = 256 * 6144;
+    args[44] = 192 * 4;
+    args[46] = 96 * 4;
+    args[48] = 256 * 4;
+    args[50] = 8;
+    args[52] = 304;
+    args[54] = 1;
+    size_t size = sizeof(args);
+    void* config[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, args,
+                     HIP_LAUNCH_PARAM_BUFFER_SIZE, &size, HIP_LAUNCH_PARAM_END};
+    return hipModuleLaunchKernel(moe_function, 304, 1, 1, 256, 1, 1, 0,
+                                  (hipStream_t)stream, nullptr, config);
+}
+
+extern "C" int plow_moe_native_store(void* out, void* src, unsigned rows, void* stream) {
+    plow_moe_aiter_store<<<304, 256, 0, (hipStream_t)stream>>>((float*)out,
+        (const unsigned short*)src, rows);
     return hipGetLastError();
 }

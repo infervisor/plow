@@ -118,7 +118,7 @@ pub fn class_of(op: DevOp) -> RowClass {
         MoeRouter | MoeRouterTopk | MoeRouterTopkPf | MoeAlignPf | MoeExpertGlu | MoeExpertDown
         | MoeCombine | MoeCombinePf | MoeGroupGluPf | MoeGroupDownPf | MoeExpertGluFp8Blk
         | MoeExpertDownFp8Blk | MoeGroupGluFp8Blk | MoeGroupDownFp8Blk | MoeGluMx | MoeDownMx
-        | MoeGluMxPf | MoeDownMxPf => RowClass::A,
+        | MoeGluMxPf | MoeDownMxPf | MoeAiterFp8Pf => RowClass::A,
         MoeRouterGemma
         | MoeRouterGemmaScore
         | MoeRouterGemmaScoreFast
