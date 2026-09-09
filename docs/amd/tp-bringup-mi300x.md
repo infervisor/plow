@@ -1437,6 +1437,111 @@ banking the 5% requires generalising the epilogue hoist to two waves — one loa
 select per row block instead of one `ds_bpermute_b32` — which is worth doing only alongside the
 k-loop work, not for its own sake.
 
+### Correction: the reference DOES gather on every layer
+
+The commit above concluded that "a 'shared' layer is not entitled to attend the previous full
+layer's 8-query union". **That is wrong**, and the reference implementation on this host says so
+directly (`vllm/models/deepseek_v32/attention.py`, which is what serves `glm_moe_dsa`):
+
+```python
+skip_topk = max(layer_id - index_skip_topk_offset + 1, 0) % index_topk_freq != 0
+...
+indexer = None
+if not skip_topk or is_mtp_layer:
+    indexer = type(self).indexer_cls(..., topk_indices_buffer, ...)
+...
+self.skip_topk = False          # ALWAYS, unconditionally
+```
+
+`skip_topk` decides only whether the layer **owns an indexer**. The runtime flag `self.skip_topk`
+is hardcoded `False`, and `self.topk_indices_buffer` — one buffer shared by every layer — is
+passed into the attention call unconditionally, whether or not `self.indexer is None`. A layer
+without an indexer contributes nothing to the buffer and attends against whatever the last
+indexer layer wrote. That is exactly the reuse plow's comment described and plow's code did not
+do, and `index_skip_topk_offset: 3` / `index_topk_freq: 4` reproduce GLM-5.3's 21-full/57-shared
+split from that formula.
+
+So the 78-layer configuration is what the reference computes, the 1.88x is the right target, and
+the needle failure is a DEFECT IN PLOW that the 21-layer configuration masks — not a semantic
+boundary. Three candidate causes have been eliminated by measurement rather than argument:
+
+* **not a race** — the degraded output is identical across repeated identical requests;
+* **not the indexer weights** — `scripts/glm53_dsa_verify.py` against the loader's fp8->bf16
+  upcast is **4/4 bit-identical**, `max|d| = 0.000e+00` over 18.4 M elements, which is the check
+  whose own docstring warns that a scale-grid error yields "an indexer of exactly the right SIZE
+  and the right general magnitude that selects the wrong KV rows";
+* **not a truncated scoring range** — `IndexScorePf` reads `n.kidx[slot]`, the persistent
+  per-full-layer indexer K cache sized `dbatch * ctx * di`, not the chunk-sized `kidx_pf`
+  staging buffer, so the selection can see position 0 from any chunk.
+
+What remains is either the ordering of the shared `n.iuni` buffer against its readers — the
+all-layer emit's counter-graph reduction removes exactly 78 edges as "implied by a path", one per
+layer — or a selection-quality effect that only shows once more than a quarter of the layers
+depend on it. `PLOW_GLM_DSA_PF_SPAN` bisects those: it admits reuse only within `n` layers of an
+indexer, so span 1 tests distance-1 reuse alone and span >= 3 is every layer.
+
+### The bisect: reuse is sound, and 40 of 78 layers gather correctly
+
+`PLOW_GLM_DSA_PF_SPAN=n` admits the gather on any layer within `n` of an indexer, so the union's
+reuse DISTANCE and the SHARE of sparse layers can be moved together and read off separately:
+
+```
+ span   flash ops on the GATHER arm    40k needle    repeat continuation
+   0            21 / 78                 FOUND        clean   (the shipped guard)
+   1            40 / 78                 FOUND        clean
+   2            59 / 78                 -            -
+   3+           78 / 78                 MISSED       ' the fox over dog over over the the'
+```
+
+**span=1 is correct.** Every reuse in it is at distance 1 from the indexer that wrote the union,
+40 of 78 flash ops take the gather arm — verified on the raw operand, `t7=iuni i6=16384 x40` — and
+it recovers `71-ALPHA-93` from the front of a 40k haystack while returning the clean repeated
+phrase. So sharing one `n.iuni` across layers is SOUND: the transitive ordering through the
+residual stream holds, and a layer with no indexer of its own attends correctly against the
+previous indexer layer's selection.
+
+That retires the conclusion recorded on the guard two commits ago — "a 'shared' layer is not
+entitled to attend the previous full layer's union" is false, and the reference agrees (see the
+correction above). What is actually true is narrower: reuse works, and something degrades as the
+sparse share grows past roughly half the model.
+
+Two candidates remain for the span-3 failure, and the span-2 row separates them:
+
+* **distance** — a union reused three layers later is too stale, in which case span=2 also fails;
+* **share** — plow's selection is good enough for half the layers but not all of them, i.e. a
+  selection-QUALITY gap against the reference (which does run all 78), in which case span=2 is
+  correct or marginal and the ceiling is a property of the indexer, not the plumbing.
+
+Either way there is now a correct configuration strictly faster than dense, which there was not
+before: span=1 gathers on 51% of layers where the shipped guard gathers on 27%.
+
+### span=1 measured at the target cell: 19.47 out tok/s, and correct
+
+Same lease, same client, one variable — the packet:
+
+```
+                       out tok/s   TTFT median   TPOT     40k needle
+ ilv0 (dense control)    18.22       465.7 s     177.4      FOUND
+ span1 (40/78 gather)    19.47       420.8 s     187.6      FOUND
+                         +6.9%        -9.6%
+```
+
+This is the **first correct configuration in this campaign that beats the dense baseline**, and
+the first improvement in it that comes from doing less work rather than from scheduling. It also
+tops the previous best cell on record (19.28, the `c16k` arm), which was dense.
+
+The size of it is instructive and worth stating plainly rather than rounding up. Attention is 68%
+of prefill, gathering removes essentially all of a gathered layer's cost, and 40 of 78 layers
+gather — yet the end-to-end gain is 6.9%. Three things absorb the rest:
+
+* the indexer's own O(T·S) score, which costs +2.67 s on the 21 layers that run it and does not
+  shrink when more layers consume its output;
+* the 8,254 ms MoE/projection term, untouched by any of this and now the majority of the wall;
+* concurrency-20 scheduling, where TTFT improves more (-9.6%) than throughput (+6.9%).
+
+So the lever is real, it is directionally the right one, and it is not close to sufficient on its
+own — the reference's 273.67 out tok/s needs the linear term as well, which 7h sizes.
+
 ## 8. Unrelated issue observed
 
 `cargo test -p devgen mla` fails `k3::tests::the_mla_prefill_arm_forces_one_split`

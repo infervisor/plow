@@ -4852,8 +4852,24 @@ pub(crate) fn emit_glm_mla_prefill(
     // So a 'shared' layer may not simply attend the previous full layer's union. Whatever it is
     // entitled to reuse, plow's 8-query union is not it, and the missing piece is a semantic
     // one, not the plumbing. docs/amd/tp-bringup-mi300x.md 7g.
-    let sparse = glm_dsa_pf_bucket(c, t) && w.iwqb != TENSOR_NONE && nh_l == 8;
-    let c_sel_pf = if sparse {
+    // BISECT (PLOW_GLM_DSA_PF_SPAN): how many layers past the indexer may reuse its union.
+    //   0  the shipped 21 -- only layers that own an indexer.
+    //   1  full + the layer immediately after it (~42 layers), so every reuse is at distance 1.
+    //   n  full + n following layers; >=3 is every layer, since 'shared' runs come in threes.
+    // This separates the two live explanations for the all-layer failure. If distance-1 reuse is
+    // correct, the union is being shared soundly and what degrades is the SHARE of layers running
+    // sparse (a selection-quality effect). If distance-1 is already wrong, reuse itself is broken
+    // and the distance does not matter. The reference reuses at distances 1..3
+    // (vllm/models/deepseek_v32/attention.py: `topk_indices_buffer` is passed to the attention
+    // call unconditionally, and `self.skip_topk` is hardcoded False -- only whether the layer
+    // OWNS an indexer varies), so a correct plow reaches span 3.
+    let span = std::env::var("PLOW_GLM_DSA_PF_SPAN")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0);
+    let reuses = (1..=span).any(|d| slot >= d && c.indexer_is_full((slot - d) as u32));
+    let sparse = glm_dsa_pf_bucket(c, t) && (w.iwqb != TENSOR_NONE || reuses) && nh_l == 8;
+    let c_sel_pf = if sparse && w.iwqb != TENSOR_NONE {
         Some(emit_glm_dsa_prefill_select(
             b,
             c,
