@@ -1066,6 +1066,45 @@ So the ordered work for this target is:
 Doing (2) before (1) cannot reach the target, which is worth knowing before anyone spends a month
 on an indexer.
 
+### The MoE kernel is not shape-limited — a falsified prediction
+
+The expert GEMM's efficiency depends on M per expert = `chunk x top_k / n_exp`, and the library
+ceiling at those shapes climbs steeply with it (`bringup_ceiling.py --model glm53 --tp 8 --rows N`):
+
+| chunk | M/expert | gate/up | down |
+|---:|---:|---:|---:|
+| 4,096 | 128 | 303.6 | 160.2 TF/s |
+| 8,192 (shipped) | 256 | 478.9 | 310.4 |
+| 16,384 | 512 | 681.1 | 583.0 |
+| 32,768 | 1024 | 805.1 | 730.6 |
+
+**Prediction: chunk 8192 -> 16384 should be worth 1.4-1.9x on the MoE share.** A 16384 rung was
+emitted (32768 still OOMs on prefill scratch at ctx 81920) and served at chunk 16384.
+
+**Measured: +3.3%.** 19.28 out tok/s against 18.67; aggregate prefill 2,239 -> 2,347.
+
+The prediction is falsified and that is the answer: **plow's MoE prefill is not shape-limited.**
+The library gains 1.4-1.9x from exactly this M change and plow gains 3%, which can only mean plow
+is nowhere near the shape ceiling to begin with. The arithmetic agrees — §7f's fit gives the whole
+linear path 0.13142 ms/token, i.e. **~95 TF/s per rank** against a library reaching 310-681 TF/s at
+the same shapes. **3-7x off, and it is kernel quality, not the shape it is handed and not the
+scheduler.**
+
+That closes the diagnosis. Ranked, with the evidence for each:
+
+1. **The MoE / dense-GEMM prefill kernel, ~3-7x off its own shape ceiling.** Bounds everything:
+   even a free attention kernel leaves 3.5x. CK ships a source reference at plow's exact scale
+   layout — `example/65_gemm_multiply_multiply/moe_gemm1_xdl_fp8_blockscale.cpp`,
+   `Scale_Block_{M,N,K} = 1,128,128`, device-side routing via `p_sorted_token_ids` /
+   `p_sorted_expert_ids`, and `blockwise_gemm_pipeline_xdlops_moe_blockscale_b_preshuffle_gufusion_*`
+   fusing the gate/up GLU.
+2. **Sparse prefill attention**, for the 60% share above it — and blocked today by the operand
+   budget, not by the kernel.
+3. **The scheduler residue** — one-slot-per-tick, the two-span co-packing bootstrap.
+
+Chunk 16384 is nonetheless the best measured configuration and is kept: 19.28 out tok/s, +19.8%
+over the §7e baseline of 16.09.
+
 ### The comparison IS ROCm-vs-ROCm — corrected
 
 Earlier revisions of this section hedged that the target host was unidentified and that, if it were
