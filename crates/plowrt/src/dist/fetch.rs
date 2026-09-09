@@ -273,7 +273,12 @@ mod tests {
     #[cfg(not(feature = "dist"))]
     #[test]
     fn without_the_dist_feature_a_network_registry_names_the_build() {
-        let err = transport("dist.infervisor.ai").unwrap_err().to_string();
+        // Matched rather than `unwrap_err`, which would need `Debug` on
+        // `Box<dyn Fetch>` — a bound the trait has no reason to carry.
+        let err = match transport("dist.infervisor.ai") {
+            Ok(_) => panic!("a build with no HTTP client reached a network registry"),
+            Err(e) => e.to_string(),
+        };
         assert!(err.contains("without the `dist` feature"), "{err}");
     }
 }
