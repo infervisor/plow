@@ -1892,6 +1892,98 @@ any future work against it. Before more effort is spent closing a 14x gap, someo
 establish that gap on hardware and software that can be run side by side — either by getting the
 AITER path working here, or by obtaining the reference run's host and configuration.
 
+## 7p. Every GEMM tile in this model was chosen by the analytical model, not measured
+
+`plowc tune status --gpu MI300X` says it plainly, and it has been saying it on every emit this
+campaign ever ran:
+
+```
+records     : 4619 (4619 qualified)
+digest census — which build each record is keyed to:
+  0f4260a582715fa8      96 records   STALE — changed: implementation, interpreter, toolchain
+  ... twelve digests ...
+  9994a4419860debf     288 records   STALE — changed: implementation, interpreter
+
+*** EVERY RECORD IN THIS CELL IS STALE. ***
+```
+
+The MI300X cell held 4,619 measurements spread over twelve historical build digests and the
+compiler could use **none** of them, so `pick_tile` fell back to the analytical model for all
+5,070 dense-GEMM tile lookups and reported tier `portable`. Every GEMM number in 7f through 7o —
+the dense projections at 150 TF/s per rank, the 10.5-42.1% dispatch occupancies, the whole
+`interpreter` segment — was measured on a MODELLED tile. The emit prints this on every build; no
+campaign in this document acted on it.
+
+Re-running it is one command and about ninety seconds of GPU:
+
+```
+GLM_FULL=1 PLOW_FP8=1 ... plowc --hf-dir <ckpt> --gpu MI300X --arch gfx942 \
+  --max-ctx 81920 --num-gpus 8 tune gemm --gpu MI300X \
+    --obj build-amd/hsaco/db16-dsapf --samples <out.jsonl> --campaign glm53-tp8-2026-09
+```
+
+`--shapes auto` derives the shape list from the compiler's own demand rather than a hand-kept
+list, which is why it needs the full emit env: the demand only exists for the whole model. It
+derived **34 shapes, every one a MISS**, and they are exactly the shapes the dispatch audit
+complains about — `8192x64x6144`, `8192x32x6144`, `2048x64x6144`, `128x2048x6144`. It published
+**204 qualified records**, and the cell now reads:
+
+```
+  434de661e3cf28bc     204 records    204 qualified  CURRENT — the compiler can use these
+selectable  : 34 op cases against the probed build
+```
+
+The next emit changed its verdict from
+
+```
+>>> tunedb: ALL 5070 dense-GEMM tile(s) chosen by the ANALYTICAL MODEL. This build is UNMEASURED
+```
+
+to
+
+```
+tunedb: all 5070 dense-GEMM tile(s) chosen BY MEASUREMENT
+```
+
+with `build.json` carrying `"tile_source": "measured", "tile_measured": 5070`. The packets differ
+(`cmp` at byte 113,520,661), so the measured tiles are genuinely not the modelled ones.
+
+**This is the technique the rest of this document was missing.** Not a new kernel — plow already
+has the mechanism, and it is the designed answer to "which tile for this shape on this part". It
+went stale because the digest keys on implementation, interpreter and toolchain, all of which this
+campaign changed repeatedly, and nothing in the workflow re-ran it. Any future object-recipe change
+(a new `-D`, a toolchain bump) stales the cell again and silently reverts every shape to the model.
+Re-running the campaign belongs in the build/freeze procedure, not in someone's memory.
+
+### Measured: the campaign is worth about 1%, and that is the point
+
+Same lease, one variable (the packet's tiles), target cell:
+
+```
+                       out tok/s   TTFT median
+ span1  (modelled)       19.60       415.4 s
+ tuned  (measured)       19.80       415.5 s
+                         +1.0%        +0.0%
+```
+
+span1 alone drifts 19.47 to 19.60 between leases (0.7%), so +1.0% is at the edge of what this
+cell resolves. **The tile campaign is roughly neutral on throughput.**
+
+That is worth stating as plainly as the discovery was. The analytical model was already choosing
+near-optimal tiles for these thirty-four shapes; being UNMEASURED was a provenance defect, not a
+performance one, and the `10.5-42.1%` dispatch occupancies the audit reports are a property of the
+SHAPES (N=32, N=64 against a 256-wide tile) that no tile choice in the inventory can fix.
+
+It is the fifth time in this document that a lever which looked large by inspection measured small
+once ablated or A/B'd -- after the CK GEMM port, the MPF tile, sparse attention's "2.7x", and the
+collective. The pattern is now the most reliable finding here: **on this stack, size the lever
+before building it.**
+
+What the campaign does buy is real but not throughput: the build is reproducible, `tile_source` is
+`measured`, and a future object-recipe change that genuinely does move the right tile will now be
+visible as a diff against measurements rather than silently absorbed by the model. Re-running it
+belongs in the freeze procedure for that reason.
+
 ## 8. Unrelated issue observed
 
 `cargo test -p devgen mla` fails `k3::tests::the_mla_prefill_arm_forces_one_split`
