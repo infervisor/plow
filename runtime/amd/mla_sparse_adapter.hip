@@ -1,4 +1,7 @@
 #include <hip/hip_runtime.h>
+#if defined(__HIP_DEVICE_COMPILE__)
+#include "amd_common.h"
+#endif
 
 struct SparsePackArgs {
     uint4 *q, *kv;
@@ -8,7 +11,8 @@ struct SparsePackArgs {
 };
 static_assert(sizeof(SparsePackArgs) == 88);
 
-extern "C" __global__ void plow_mla_sparse_pack(SparsePackArgs a) {
+template <bool FP8>
+__device__ void sparse_pack(SparsePackArgs a, const float* scales) {
     const unsigned first = blockIdx.x * blockDim.x + threadIdx.x;
     const unsigned stride = blockDim.x * gridDim.x;
     for (unsigned i = first; i < a.rows * 8u * 72u; i += stride) {
@@ -17,7 +21,19 @@ extern "C" __global__ void plow_mla_sparse_pack(SparsePackArgs a) {
     }
     for (unsigned i = first; i < a.ctx * 72u; i += stride) {
         const unsigned row = i / 72u, col = i % 72u;
-        a.kv[i] = col < 64u ? a.ck[row * 64u + col] : a.kr[row * 8u + col - 64u];
+        if (col >= 64u) {
+            a.kv[i] = a.kr[row * 8u + col - 64u];
+        } else if constexpr (FP8) {
+#if defined(__HIP_DEVICE_COMPILE__)
+            bf16v8 v = fp8v8_to_bf16v8(ld_glob_fp8v8(
+                (const unsigned char*)a.ck + (size_t)row * 512u + col * 8u));
+#pragma unroll
+            for (unsigned j = 0; j < 8; ++j) v[j] = f2bf(bf2f(v[j]) * scales[row]);
+            __builtin_memcpy(&a.kv[i], &v, 16);
+#endif
+        } else {
+            a.kv[i] = a.ck[row * 64u + col];
+        }
     }
     for (unsigned row = first; row <= a.rows; row += stride) {
         a.qp[row] = row;
@@ -25,6 +41,20 @@ extern "C" __global__ void plow_mla_sparse_pack(SparsePackArgs a) {
         a.splits[row] = row * 2u;
         if (row < a.rows) a.last[row] = 1;
     }
+}
+
+extern "C" __global__ void plow_mla_sparse_pack(SparsePackArgs a) {
+    sparse_pack<false>(a, nullptr);
+}
+
+struct SparsePackFp8Args {
+    SparsePackArgs base;
+    const float* scales;
+};
+static_assert(sizeof(SparsePackFp8Args) == 96);
+
+extern "C" __global__ void plow_mla_sparse_pack_fp8(SparsePackFp8Args a) {
+    sparse_pack<true>(a.base, a.scales);
 }
 
 struct SparseReduceArgs {
@@ -56,3 +86,4 @@ extern "C" __global__ void plow_mla_sparse_reduce(SparseReduceArgs a) {
 }
 
 extern "C" __device__ unsigned plow_mla_sparse_adapter_abi_1 = 1;
+extern "C" __device__ unsigned plow_mla_sparse_adapter_fp8_abi_1 = 1;

@@ -312,12 +312,12 @@ const INHERIT: &[(DevOp, DevOp, S)] = &[
      S { op: DevOp::FlashMlaDecodeFp8,
          t: &["Opart", "mlpart", "Qabs", "Qrope", "Ckv", "Krope", "kv_len", "kv_scale"],
          i: &["n_batch", "n_head", "kv_stride", "window", "nsplit", "kv_mask", "krot_fp8", "gf"],
-         f: &["scale"], j: &[] }),
+         f: &["scale"], j: &["selected_handle_plus_one"] }),
     (DevOp::FlashMlaPrefillFp8, DevOp::FlashMlaDecode,
      S { op: DevOp::FlashMlaPrefillFp8,
          t: &["Opart", "mlpart", "Qabs", "Qrope", "Ckv", "Krope", "kv_len", "kv_scale"],
          i: &["n_batch", "n_head", "kv_stride", "window", "n_tok", "kv_mask", "krot_fp8", "gf"],
-         f: &["scale"], j: &[] }),
+         f: &["scale"], j: &["selected_handle_plus_one"] }),
     // "Operands are identical to opcode 67."
     (DevOp::MoeRouterGemmaScoreFast, DevOp::MoeRouterGemmaScore, NONE),
     // "ABI mirrors [`DevOp::FlashMerge`] with `t1..` in peer_scratch + xctr gates."

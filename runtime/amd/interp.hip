@@ -1850,15 +1850,13 @@ __device__ __forceinline__ void exec_flash_mla_decode(CInst in, CTens T, unsigne
 }
 
 #if PLOW_FP8_KV
+extern "C" __device__ unsigned plow_mla_sparse_fp8_decode_arm = 1;
 /* FP8 (e4m3) LATENT MLA decode (op 109). [MLA-FP8-KV]
  *
  * The MLA twin of `exec_flash_decode_fp8`, and compiled ONLY into the fp8-KV object — the KV
  * encoding is a SWAP axis, not an additive one (see the dispatch note below).
  *
- * DENSE ONLY, and that is a constraint rather than an omission: the gathered twin needs `t7` for
- * its `idx` table and `t7` is where the scale array lives, so a gathered fp8 latent has nowhere to
- * put the dequant. `PLOW_DOP_FLASH_GATHER_DECODE` therefore keeps its bf16 arm in BOTH objects
- * (see the dispatch), so a DSA packet cannot land on a missing arm and silently no-op.
+ * fj[1] = selected-index handle + 1 selects sparse FP8; zero retains dense semantics.
  *
  *   t0=Opart t1=mlpart t2=Qabs t3=Qrope t4=Ckv(fp8) t5=Krope t6=kv_len t7=kv_scale
  *   i0=n_batch i1=n_head i2=kv_stride i3=window i4=nsplit i5=kv_mask i6=krot_fp8 i7=gf  f0=scale */
@@ -1869,6 +1867,16 @@ __device__ __forceinline__ void exec_flash_mla_decode_fp8(CInst in, CTens T, uns
      * Trap rather than read address 0 — this object has no silent-NOP budget left. */
     if (TEN(7) == nullptr) __builtin_trap();
     const unsigned gf = in->i[7] ? in->i[7] : (unsigned)GLM_MLA_GF;
+    if (in->fj[1].u != 0) {
+        if (gf != 4 || in->i[1] != 8 || in->i[3] != 0 || in->i[6] != 2048)
+            __builtin_trap();
+        d_flash_mla_decode<512, 64, 4, /*GATHER=*/true, /*FP8=*/true>(
+            (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
+            (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), in->i[0], in->i[1],
+            in->i[2], 0, in->fj[0].f, in->i[4], in->i[5], slice, nblk, lds,
+            (const int*)T[in->fj[1].u - 1u], in->i[6], 1, (const float*)TEN(7), 0);
+        return;
+    }
     if (gf == 2)
         d_flash_mla_decode<512, 64, 2, /*GATHER=*/false, /*FP8=*/true>(
             (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
@@ -1892,7 +1900,7 @@ __device__ __forceinline__ void exec_flash_mla_prefill_fp8(CInst in, CTens T, un
                                                            unsigned nblk, float* lds,
                                                            const PlowProgram* prog) {
 #define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
-    if (TEN(7) == nullptr) __builtin_trap();
+    if (TEN(7) == nullptr || in->fj[1].u != 0) __builtin_trap();
 #if PLOW_PACKED_PREFILL_MLA_FLASH_CONSUMERS
     if (plow_packed_prefill_enabled(prog)) {
         const unsigned gf = in->i[7] ? in->i[7] : (unsigned)GLM_MLA_GF;
@@ -2598,6 +2606,9 @@ extern "C" __device__ unsigned plow_glm_ofold_arm = 1;
  * this symbol; see check_dsa_pf_arm in crates/plowrt/src/exec/amd.rs. */
 #if PLOW_DSA_PF_ARM
 extern "C" __device__ unsigned plow_dsa_pf_arm = 1;
+#if PLOW_FP8_KV
+extern "C" __device__ unsigned plow_mla_sparse_fp8_prefill_arm = 1;
+#endif
 #endif
 
 /* ZERO-ROPE (NoPE) V2 MLA prefill — `d_flash_mla_prefill_v2<512, 0>`.
@@ -2771,6 +2782,20 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
 #if !defined(PLOW_BUCKET_MLA_V2_RAW)
     if (in->op == PLOW_DOP_FLASH_MLA_PREFILL_FP8 && !pf_nope) {
 #define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
+#if PLOW_DSA_PF_ARM
+        if (in->fj[1].u != 0) {
+            if (in->i[0] != 1 || in->i[1] != 8 || in->i[3] != 0 || TEN(7) == nullptr)
+                __builtin_trap();
+            d_flash_mla_prefill_v2<512, 64, /*GATHER=*/true, /*FP8=*/true>(
+                (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
+                (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), in->i[0],
+                in->i[4], in->i[1], in->i[2], 0, in->fj[0].f, in->i[5], slice, nblk,
+                sm->fa, (const unsigned char*)T[in->fj[1].u - 1u], in->i[6], 1, false,
+                (const float*)TEN(7), 0);
+        } else
+#else
+        if (in->fj[1].u != 0) __builtin_trap();
+#endif
 #if PLOW_PACKED_PREFILL_MLA_FLASH_CONSUMERS
         if (plow_packed_prefill_enabled(prog_meta))
             exec_flash_mla_prefill_v2_packed</*FP8=*/true>(in, T, slice, nblk, sm->fa,

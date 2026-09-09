@@ -18,7 +18,8 @@ mkdir -p "$out"
 stem=$(mktemp "$out/.mla-sparse.XXXXXX")
 trap 'rm -f "$stem" "$stem.co" "$stem.elf"' EXIT
 "${PLOW_HIPCC:?run inside nix develop}" --genco --offload-arch=gfx942 -O3 -w \
-    -std=c++17 "$root/runtime/amd/mla_sparse_adapter.hip" \
+    -std=c++17 -I"$root/runtime/amd" -I"$root/runtime/common" \
+    "$root/runtime/amd/mla_sparse_adapter.hip" \
     -o "$stem.co"
 "${PLOW_BUNDLER:?run inside nix develop}" --unbundle --type=o \
     --targets=hipv4-amdgcn-amd-amdhsa--gfx942 --input="$stem.co" --output="$stem.elf"

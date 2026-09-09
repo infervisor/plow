@@ -4716,6 +4716,101 @@ fn check_dsa_decode_batch(
     Ok(())
 }
 
+fn sparse_fp8(inst: &DevInst64) -> bool {
+    matches!(
+        DevOp::from_u16(inst.op),
+        Some(DevOp::FlashMlaDecodeFp8 | DevOp::FlashMlaPrefillFp8)
+    ) && inst.fj[1] != 0
+}
+
+fn check_sparse_fp8_packet(
+    progs: &[DevProg],
+    tensors: &[crate::asset::devblob::DevTensor],
+    arch: &str,
+) -> Result<()> {
+    for d in progs
+        .iter()
+        .flat_map(|p| &p.insts)
+        .filter(|d| sparse_fp8(d))
+    {
+        let decode = d.op == DevOp::FlashMlaDecodeFp8 as u16;
+        let rows = u64::from(if decode { d.i[0] } else { d.i[4] });
+        let ctx = u64::from(d.i[2]);
+        if arch != "gfx942"
+            || d.i[1] != 8
+            || d.i[3] != 0
+            || d.i[5] != u32::MAX
+            || d.fj[2] != 0
+            || ctx < 2048
+            || ctx > 81920
+            || rows == 0
+            || (decode && (rows > 20 || d.i[6] != 2048 || d.i[7] != 4))
+            || (!decode
+                && (d.i[0] != 1
+                    || rows < 2048
+                    || rows > 8192
+                    || d.i[6] != d.i[2].min(16384)
+                    || !mla_pf_v2_enabled()))
+        {
+            return Err(RuntimeError::Device(
+                "sparse FP8 MLA requires qualified gfx942 QH8 geometry and V2 prefill routing"
+                    .into(),
+            ));
+        }
+        let slots = u64::from(d.i[0]);
+        let selected = if decode {
+            rows * 2048 * 4
+        } else {
+            (rows.div_ceil(8) * 4).div_ceil(256) * 256 + rows.div_ceil(8) * u64::from(d.i[6]) * 12
+        };
+        for (handle, bytes) in [
+            (d.fj[1] - 1, selected),
+            (u32::from(d.t[4]), slots * ctx * 512),
+            (u32::from(d.t[5]), slots * ctx * 64 * 2),
+            (u32::from(d.t[7]), slots * ctx * 4),
+        ] {
+            if handle >= u32::from(packet::dev::TENSOR_NONE16)
+                || tensors.get(handle as usize).is_none_or(|t| t.bytes < bytes)
+            {
+                return Err(RuntimeError::Device(
+                    "sparse FP8 MLA operand capacity is insufficient".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn check_sparse_fp8_object(
+    syms: &[&str],
+    path: &Path,
+    progs: &[DevProg],
+    decode: bool,
+) -> Result<()> {
+    let op = if decode {
+        DevOp::FlashMlaDecodeFp8
+    } else {
+        DevOp::FlashMlaPrefillFp8
+    };
+    let marker = if decode {
+        "plow_mla_sparse_fp8_decode_arm"
+    } else {
+        "plow_mla_sparse_fp8_prefill_arm"
+    };
+    if progs
+        .iter()
+        .flat_map(|p| &p.insts)
+        .any(|d| d.op == op as u16 && sparse_fp8(d))
+        && !syms.contains(&marker)
+    {
+        return Err(RuntimeError::Device(format!(
+            "{} lacks required sparse FP8 MLA marker {marker}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 /// `PLOW_DSA_PF_ARM=1` — the GATHERED (DSA sparse) V2 MLA-prefill arm.
 ///
 /// Present iff the build axis is on, exactly like [`K3_ARMS_SYM`] and for a stronger reason: the
@@ -5408,9 +5503,10 @@ fn derive_segments_for(prog: &DevProg, v2: bool) -> Result<Vec<u8>> {
             // on the 8-wave kernel anyway -- while `v2` is true so the old guard stayed silent.
             // The requirement is not "the env is set", it is "THIS packet's segment was actually
             // routed to the V2 arm", which is only known once the class pass below has run.
-            if op == DevOp::FlashMlaPrefill as u16
+            if (op == DevOp::FlashMlaPrefill as u16
                 && d.i[6] > 1
-                && d.t[7] == packet::dev::TENSOR_NONE16
+                && d.t[7] == packet::dev::TENSOR_NONE16)
+                || sparse_fp8(d)
             {
                 needs_v2.push((e.seg as usize, d.i[6]));
             }
@@ -5641,7 +5737,8 @@ fn check_packed_dense_program(insts: &[DevInst64]) -> Result<()> {
 
 fn packed_mla_compatible(prog: &DevProg) -> bool {
     !prog.insts.iter().any(|d| {
-        d.op == DevOp::FlashGatherPrefill as u16
+        sparse_fp8(d)
+            || d.op == DevOp::FlashGatherPrefill as u16
             || ((d.op == DevOp::FlashMlaPrefill as u16 || d.op == DevOp::FlashMlaPrefillFp8 as u16)
                 && (d.i[3] & 0x8000_0000 != 0
                     || (d.t[7] != packet::dev::TENSOR_NONE16
@@ -8505,9 +8602,10 @@ impl AmdEngine {
             )));
         }
         let use_sparse_mla = crate::config::RuntimeConfig::get().amd.mla_pf_aiter;
-        if use_sparse_mla && (arch != "gfx942" || variant == Variant::Fp8Kv) {
+        check_sparse_fp8_packet(&blob.progs, &blob.tensors, &arch)?;
+        if use_sparse_mla && arch != "gfx942" {
             return Err(RuntimeError::Device(
-                "sparse AITER MLA requires gfx942 and BF16 KV".into(),
+                "sparse AITER MLA requires gfx942".into(),
             ));
         }
         let need_xr_attnres = blob.progs[..dec_ix]
@@ -8773,6 +8871,9 @@ impl AmdEngine {
                 check_xargmax_capacity(&syms, &path, gemv_need.unwrap_or(max_decode_batch))?;
                 check_dec_stage_capacity(&image, &path, &blob.progs[dec_ix..])?;
                 check_dsa_decode_batch(&syms, &path, &blob.progs[dec_ix..], arch == "gfx942")?;
+                check_sparse_fp8_object(&syms, &path, &blob.progs[dec_ix..], true)?;
+            } else if phase == Phase::Flash {
+                check_sparse_fp8_object(&syms, &path, &blob.progs[..dec_ix], false)?;
             }
             // Whether this object carries the PLOW_K3 arms the packet dispatches. Refused here
             // rather than tolerated, because AMD's dispatch default is a silent NOP: the run
@@ -10153,10 +10254,7 @@ impl AmdEngine {
                 .flat_map(|p| {
                     p.insts
                         .iter()
-                        .filter(|d| {
-                            d.op == DevOp::FlashMlaPrefill as u16
-                                && d.t[7] != packet::dev::TENSOR_NONE16
-                        })
+                        .filter(|d| amd_sparse_mla::union_handle(d).is_some())
                         .map(move |d| (p.t, d.i[2]))
                 });
             let (rows, ctx) = candidates.fold((0, 0), |(r, c), (rr, cc)| (r.max(rr), c.max(cc)));
@@ -10170,6 +10268,7 @@ impl AmdEngine {
                 hsaco_dir,
                 rows,
                 ctx,
+                variant == Variant::Fp8Kv,
                 &mut modules,
             )?)
         } else {
@@ -17854,6 +17953,35 @@ mod tests {
             true
         )
         .is_ok());
+    }
+
+    #[test]
+    fn sparse_fp8_rejects_stale_objects_and_invalid_handles() {
+        let mut p = segmented_prog(&[DevOp::FlashMlaDecodeFp8], &[0]);
+        p.insts[0].i = [16, 8, 81920, 0, 16, u32::MAX, 2048, 4];
+        p.insts[0].t = [0; 8];
+        p.insts[0].fj = [0.0625f32.to_bits(), 1, 0];
+        let tensors = vec![crate::asset::devblob::DevTensor {
+            name: "large".into(),
+            bytes: 16 * 81920 * 512,
+            init: None,
+        }];
+        assert!(check_sparse_fp8_packet(std::slice::from_ref(&p), &tensors, "gfx942").is_ok());
+        assert!(check_sparse_fp8_packet(std::slice::from_ref(&p), &tensors, "gfx950").is_err());
+        assert!(
+            check_sparse_fp8_object(&[], Path::new("old"), std::slice::from_ref(&p), true).is_err()
+        );
+        assert!(check_sparse_fp8_object(
+            &["plow_mla_sparse_fp8_decode_arm"],
+            Path::new("new"),
+            std::slice::from_ref(&p),
+            true
+        )
+        .is_ok());
+        p.insts[0].fj[1] = u32::MAX;
+        assert!(check_sparse_fp8_packet(std::slice::from_ref(&p), &tensors, "gfx942").is_err());
+        p.insts[0].fj[1] = 0;
+        assert!(check_sparse_fp8_object(&[], Path::new("old"), &[p], true).is_ok());
     }
 
     #[test]

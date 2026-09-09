@@ -945,6 +945,9 @@ enum {
      *   t0=Opart t1=mlpart t2=Qabs t3=Qrope t4=Ckv(fp8) t5=Krope t6=kv_len t7=kv_scale
      *   i0=n_batch i1=n_head i2=kv_stride i3=window i4=nsplit(decode)/n_tok(prefill) i5=kv_mask
      *   i6=krot_fp8 i7=gf   f0=scale
+     * Sparse extension (object marker required): fj[1].u = selected tensor handle + 1,
+     * zero = dense. Decode uses an idx table and i6=top_k; prefill uses a union table
+     * and i6=capacity. Both sparse forms retain BF16 rope and t7=latent scales.
      * See d_flash_mla_decode<...,FP8=true> in op_attention.h. */
     PLOW_DOP_FLASH_MLA_DECODE_FP8 = 109,
     PLOW_DOP_FLASH_MLA_PREFILL_FP8 = 110, /* same operands; i4 = n_tok (PLOW_MLA_PREFILL) */

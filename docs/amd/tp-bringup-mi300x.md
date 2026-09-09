@@ -2242,7 +2242,8 @@ prefill and sparse decode; it does not isolate either change. The candidate
 retains TP audit and B8 capacity. It is not the 100-request H200 comparison.
 
 See the [DSA decode qualification and reproduction](../../runtime/bench/amd/dsa_decode/README.md).
-Pooled batched DSA, MXFP4 indexers and batched FP8 KV remain unsupported.
+Pooled batched DSA and MXFP4 indexers remain unsupported. Batched FP8 KV
+was subsequently qualified as an opt-in path in section 14.
 Sparse decode requires disabling the incompatible q-RoPE fusion. No speculative
 decoding is added; H200 serving parity remains unproven.
 
@@ -2258,8 +2259,8 @@ The unexposed gathered FP8 V2 prefill template had a scale-address defect:
 KV loads followed the union's selected cache positions, while scales used
 union entry numbers. Correct both softmax variants and PV scale addressing.
 Matched synthetic T129 relative L2 falls from 1.543 to 0.001557. Tests also
-cover T1/4464 and inactive union/cache tails. Production sparse FP8 and batched
-FP8 emission remain refused; this change does not enable FP8 serving.
+cover T1/4464 and inactive union/cache tails. At this stage, production sparse FP8 and batched
+FP8 emission remained refused. Section 14 records the subsequent integration.
 
 FP8 is a capacity opportunity with a prefill cost. B20/16-split standalone
 decode measures 0.1343 ms vs BF16 0.1459 ms, but the actual layer-77 sparse
@@ -2272,3 +2273,36 @@ excluding weights and scratch. Preserve native AITER prefill through an FP8
 packing/dequantization adapter before pursuing B16/20 serving; the interpreter
 FP8 prefill regression makes a flag-only enablement unattractive. No new
 serving gain is claimed. See [tests, results and reproduction](../../runtime/bench/amd/mla_fp8_kv/README.md).
+
+
+## 14. Sparse FP8 KV runtime and batch-16 serving (2026-09-09)
+
+Sparse FP8 now uses the existing 109/110 opcodes with a demoted selected-index
+or union handle. The AMD loader requires new object markers and validates
+capacities, gfx942 QH8 geometry and pure V2 prefill routing. Decode writers
+use per-slot positions, including rung 1. Native AITER packing dequantizes the
+live FP8 latent cache once into its existing BF16 workspace; the pinned
+assembly and FP32 reduction remain unchanged. This is opt-in through
+`--glm-fp8-kv=true`, with the incompatible q-RoPE fusion disabled.
+
+TP8 batch 16 passes **18/18** retrieval cases at concurrency 16 through actual
+68.8k-token prompts. The HSA adapter test checks varying row scales, two cache
+slots, exact packed values and attention output for rows 1/129. Emitter,
+manifest, loader and packet-ABI tests pass, as does the CUDA/HSA compile check.
+This is limited retrieval qualification, not a broad model accuracy claim.
+
+The 20-request C20 serving screen has identical per-request input/output
+lengths to section 12 and completes 20/20 with zero failures. Output throughput
+is **28.19 → 29.51 tok/s (+4.70%)** and mean TTFT **195.14 → 158.19 s**.
+However, mean TPOT regresses **218.68 → 327.23 ms (+49.64%)**. KV format and
+batch capacity change together; this single comparison cannot isolate either.
+Keep this as a capacity option, not a default latency improvement. B20 is still
+only a cache-allocation estimate and template test, not a serving qualification.
+
+See the [runtime record and reproduction](../../runtime/bench/amd/mla_fp8_kv/README.md#runtime-qualification).
+The 100-request H200 target remains unmet; no speculative decoding was added.
+Prefill index scoring/selection and native FP8 MoE remain the next measured
+kernel opportunities. vLLM also supports data-parallel attention with expert
+parallelism, which warrants a separate architecture study for MLA/MoE; the
+reference server's topology is unknown.
+[vLLM deployment documentation](https://docs.vllm.ai/en/stable/serving/data_parallel_deployment/).

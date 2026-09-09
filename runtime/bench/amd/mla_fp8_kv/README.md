@@ -1,9 +1,9 @@
 # GLM sparse MLA with FP8 KV on MI300X
 
-This qualifies existing device templates, not FP8 serving. GLM's emitter still
-refuses batched FP8 KV and sparse FP8 prefill. Packet operands, object capability
-checks and the native AITER packing adapter need integration before those
-refusals can be removed. No speculative decoding is involved.
+GLM sparse FP8 KV now has an opt-in MI300X runtime path, including batched
+decode and native AITER prefill. TP8 batch 16 passes the retrieval screen.
+The serving screen gains 4.7% throughput but regresses mean TPOT by 49.6%;
+this is a capacity option, not a new default. No speculative decoding is involved.
 
 ## Correctness finding
 
@@ -65,11 +65,107 @@ At ctx81920, 78 latent/rope caches plus 21 BF16 indexer caches require:
 
 These are allocation formulas, excluding weights, activations, workspaces and
 allocator overhead. They do not establish that B20 serving fits or is faster.
-The next integration should preserve the qualified native AITER prefill path
-by packing/dequantizing FP8 latent rows once, then measure full-model quality
-and serving. Simply enabling the interpreter FP8 path regresses prefill here.
+The runtime integration below preserves native AITER prefill by dequantizing
+FP8 latent rows once into its BF16 workspace. Simply enabling the interpreter
+FP8 path regresses prefill in the captured attention measurement above.
 
-## Reproduce
+## Runtime qualification
+
+The [runtime record](mi300x-runtime-results.json) contains the serving metrics,
+per-request lengths, retrieval responses and artifact hashes. The earlier
+[template record](mi300x-results.json) remains a separate kernel experiment.
+
+Opcodes 109/110 retain scales in `t7`; `j0 = selected_handle + 1` selects sparse
+indices/union, and zero keeps dense semantics. The AMD loader validates handles,
+capacities, qualified gfx942 QH8 geometry and new object markers, including
+smaller decode rungs. Sparse prefill must route through a pure V2 segment.
+The final release emitter reproduces the benchmarked B16 packet byte-for-byte.
+CUDA, packed prefill and unqualified batched dense GLM FP8 remain refused.
+
+The native adapter adds an FP8 pack entry while preserving the BF16 ABI and
+pinned AITER assembly. It dequantizes each live latent row into BF16, copies
+rope and queries, then uses the existing two-split attention and FP32 reduction.
+Scratch remains 438,961,152 bytes/rank. The HSA test checks BF16/FP8, two slots,
+rows 1/129, varying row scales, exact packed FP8 values and attention output.
+
+TP8 batch 16 passes **18/18** retrieval cases at concurrency 16, prompt lengths
+5433–5438 and 68797–68802, depths 0.1/0.5/0.9 and three facts. Both the earlier
+BF16 B8 screen and this screen pass all cases; 14/18 responses are text-identical.
+Concurrency changes too, so this is not an isolated quantization comparison or
+broad model accuracy evaluation.
+
+| 20-request C20 serving screen | BF16 B8 | FP8 B16 |
+|---|---:|---:|
+| Successful / failed | 20 / 0 | 20 / 0 |
+| Duration, s | 489.35 | 467.39 |
+| Output tok/s | 28.19 | 29.51 |
+| Mean TTFT, s | 195.14 | 158.19 |
+| Mean TPOT, ms | 218.68 | 327.23 |
+| Median ITL, ms | 116.60 | 161.28 |
+| P99 ITL, ms | 1685.00 | 1778.82 |
+
+Both screens use identical per-request input/output lengths: 1,414,538 input
+and 13,795 output tokens. FP8 B16 gives **+4.70% throughput**, **−18.94% mean
+TTFT**, and **+49.64% mean TPOT**. This single before/after changes KV format
+and decode capacity together; it is not a repeated A/B or isolated kernel gain.
+It uses 20 requests, not the H200 reference's 100. The reference's 273.67 output
+tok/s remains unmet. Its aggregate includes speculative decoding and its server
+sampling/topology are unspecified; plow uses device argmax and no speculation.
+
+### Build and serve
+
+Run inside `nix develop`. Start from the qualified BF16 sparse-serving object
+set, then build the FP8 families in **separate directories** so each audit keeps
+its own `build_defines.json`. Overlay their ELF files into `OBJECT_DIR`:
+
+```sh
+PLOW_DECODE_BATCH=16 PLOW_DSA_PF=1 PLOW_ROWS_ONLY==interp_decode_fp8kv \
+  scripts/build_gfx942.sh "$BUILD/decode"
+PLOW_DECODE_BATCH=16 PLOW_DSA_PF=1 PLOW_ROWS_ONLY==interp_prefill_fp8kv_mla_moe \
+  scripts/build_gfx942.sh "$BUILD/prefill"
+PLOW_DECODE_BATCH=16 PLOW_DSA_PF=1 PLOW_ROWS_ONLY==interp_flash_fp8kv \
+  scripts/build_gfx942.sh "$BUILD/flash"
+for rung in 1 2 4 8; do
+  PLOW_DECODE_BATCH=16 PLOW_DECODE_TIER="$rung" PLOW_DSA_PF=1 \
+  PLOW_ROWS_ONLY==interp_decode_fp8kv \
+    scripts/build_gfx942.sh "$OBJECT_DIR/lowrung$rung"
+done
+scripts/build_mla_sparse_aiter.sh "$OBJECT_DIR" "$AITER_QH8_OBJECT"
+```
+
+`PLOW_DECODE_TIERS` currently rebuilds BF16 decode families; use the explicit
+FP8 loop above. The loader enforces `plow_mla_sparse_fp8_decode_arm`,
+`plow_mla_sparse_fp8_prefill_arm` and the FP8 adapter ABI marker. The manifest
+names this capability `PLOW_MLA_SPARSE_FP8=1`; it is not a separate build switch.
+The decode/flash axes differ from the stored static baseline, so their audit
+reports do not establish unchanged baseline resource budgets.
+
+Use the previous all-layer sparse TP8 `build.json` as `REPLAY`:
+
+```sh
+PLOW_VERIFY_BIN=lean-plow/.lake/build/bin/plow_verify GLM_FULL=1 \
+PLOW_MLA_PF_AITER=1 PLOW_MLA_PF_V2=1 PLOW_UNISEG=0 PLOW_GLM_DSA_PF_SPAN=3 \
+  target/release/plowc --hf-dir /workspace/models/GLM-5.3-plow-lite \
+    --emit devblob --gpu MI300X --arch gfx942 --max-ctx 81920 --num-gpus 8 \
+    --replay-knobs "$REPLAY" --glm-dsa 1 --glm-fuse-rope=false \
+    --glm-fp8-kv=true --emit-decode-batch-ladder 1,2,4,8,16 --out "$ASSETS"
+```
+
+Under an eight-GPU lease, serve with:
+
+```sh
+PLOW_HSACO="$OBJECT_DIR" PLOW_MLA_PF_AITER=1 PLOW_MLA_PF_V2=1 \
+PLOW_PF_CHUNK=8192 PLOW_PF_INTERLEAVE=0 \
+  target/release/plowrt serve --assets "$ASSETS" --port 8080
+```
+
+Use the [existing retrieval client](../mla_sparse_aiter/quality.py) with
+`--concurrency 16`. The serving client is the supplied vLLM command with
+`--num-prompts 20`, this server address and model `glm-5.3-plow-lite`.
+Assert 20 completed, zero failed and nonzero output in the saved JSON; the
+client can exit successfully even when requests fail.
+
+## Reproduce template tests
 
 Build inside `nix develop`, once for each softmax variant:
 

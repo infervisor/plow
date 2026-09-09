@@ -308,6 +308,7 @@ struct Shapes {
     /// was trained sparse: no trap, no NaN, a fluent answer to a different question.
     glm_dsa_pf: bool,
     dsa_decode_batch: bool,
+    mla_sparse_fp8: bool,
     /// Any `FlashMlaPrefill` (op 51) with `i[3]` bit 31 — a NoPE (zero-rope) MLA, which the
     /// four-wave V2 kernel can only run if it carries the `<512, 0>` instantiation
     /// (PLOW_MLA_PF2_NOPE_ARM). An object that predates the arm traps on the packet rather than
@@ -471,6 +472,7 @@ fn shapes(m: &Model) -> Shapes {
                     }
                 }
                 DevOp::FlashGatherDecode | DevOp::FlashMlaDecodeFp8 => {
+                    s.mla_sparse_fp8 |= op == DevOp::FlashMlaDecodeFp8 && inst.j[0] != 0;
                     if decode {
                         s.decode_batch = s.decode_batch.max(inst.i[0]);
                     }
@@ -507,6 +509,10 @@ fn shapes(m: &Model) -> Shapes {
                 }
                 DevOp::IndexSelect => {
                     s.dsa_decode_batch |= inst.i[3] != 0;
+                }
+                DevOp::FlashMlaPrefillFp8 => {
+                    s.mla_sparse_fp8 |= inst.j[0] != 0;
+                    s.glm_dsa_pf |= op == DevOp::FlashMlaPrefillFp8 && inst.j[0] != 0;
                 }
                 DevOp::FlashMlaPrefill => {
                     if (inst.i[6] & 0xff) > 1 && inst.t[7] == packet::TENSOR_NONE {
@@ -812,6 +818,7 @@ fn encoding_features(f: &mut Map<String, Value>, s: &Shapes) {
     f.insert("glm_ofold".into(), json!(s.glm_ofold));
     f.insert("glm_dsa_pf".into(), json!(s.glm_dsa_pf));
     f.insert("dsa_decode_batch".into(), json!(s.dsa_decode_batch));
+    f.insert("mla_sparse_fp8".into(), json!(s.mla_sparse_fp8));
     f.insert("mla_pf_nope".into(), json!(s.mla_pf_nope));
     f.insert("glm_fuse_rope".into(), json!(s.glm_fuse_rope));
     f.insert("glm_fuse_qnorm".into(), json!(s.glm_fuse_qnorm));
@@ -1203,6 +1210,9 @@ fn backend_amd(
     }
     if on("dsa_decode_batch") {
         req.push("PLOW_DSA_DECODE_BATCH=1".into());
+    }
+    if on("mla_sparse_fp8") {
+        req.push("PLOW_MLA_SPARSE_FP8=1".into());
     }
     // The DSA sparse V2 prefill arm (op 51 t[7] = union table). A BUILD AXIS that is OFF by
     // default, so this is the strongest entry in the list after PLOW_K3: absence does not mean
@@ -2958,6 +2968,41 @@ mod tests {
         };
         assert!(qpre_req(true).iter().any(|r| r == "PLOW_KDA_CHUNK_QPRE=1"));
         assert!(!qpre_req(false).iter().any(|r| r == "PLOW_KDA_CHUNK_QPRE=1"));
+    }
+
+    #[test]
+    fn sparse_fp8_requires_object_support_and_prefill_routing() {
+        for op in [DevOp::FlashMlaDecodeFp8, DevOp::FlashMlaPrefillFp8] {
+            for handle in [0, 1, 65535] {
+                let mut d = inst(op, [0; 8]);
+                d.j[0] = handle;
+                let m = Model {
+                    n_cu: 256,
+                    target: 0,
+                    tensors: vec![],
+                    progs: vec![prog(vec![d])],
+                    kv_row_insts: vec![],
+                    prog_t: vec![if op == DevOp::FlashMlaPrefillFp8 {
+                        8192
+                    } else {
+                        1
+                    }],
+                    gen: vec![],
+                };
+                let manifest = build(&m, "gfx942");
+                let req = manifest["backends"]["gfx942"]["requires"]
+                    .as_array()
+                    .unwrap();
+                assert_eq!(
+                    req.iter().any(|r| r == "PLOW_MLA_SPARSE_FP8=1"),
+                    handle != 0
+                );
+                assert_eq!(
+                    req.iter().any(|r| r == "PLOW_DSA_PF_ARM=1"),
+                    handle != 0 && op == DevOp::FlashMlaPrefillFp8
+                );
+            }
+        }
     }
 
     #[test]

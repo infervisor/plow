@@ -397,6 +397,88 @@ fn glm_dsa_selector_is_bound_to_the_live_kv_length_and_declares_its_geometry() {
 }
 
 #[test]
+fn glm_sparse_fp8_cache_writer_and_attention_operands() {
+    let _g = crate::test_env::env_guard();
+    let _env = crate::test_env::EnvScope::set(&[
+        ("PLOW_GLM_FP8_KV", "1"),
+        ("PLOW_GLM_DSA", "1"),
+        ("PLOW_GLM_FUSE_ROPE", "0"),
+        ("PLOW_GLM_DSA_PF", "1"),
+    ]);
+    let mut c = glm_ref_cfg();
+    c.heads = 8;
+    c.indexer_full[3] = true;
+    let ctx = 81920;
+    let mut declarations = Builder::new(256);
+    let n = declare_glm_rows_batched(&mut declarations, &c, ctx, &[3], 8192, 16, MoeEnc::Fp8Blk);
+    let tensors = declarations.tensors();
+    assert_eq!(tensors[n.ckv[0] as usize].bytes, 16 * u64::from(ctx) * 512);
+    assert_eq!(
+        tensors[n.kv_scale[0] as usize].bytes,
+        16 * u64::from(ctx) * 4
+    );
+    for rows in [1, 8, 16] {
+        let mut b = Builder::new(256);
+        b.adopt_tensors(tensors.clone());
+        emit_glm_mla(
+            &mut b,
+            &c,
+            &n,
+            0,
+            ctx,
+            rows,
+            16,
+            MoeEnc::Fp8Blk,
+            n.x,
+            &[],
+            false,
+            &mut 0,
+            &[],
+        );
+        let p = b.finish();
+        let writer = p.insts.iter().find(|d| d.t[0] == n.ckv[0]).unwrap();
+        assert_eq!(writer.op, DevOp::HeadNormRopeFp8 as u16);
+        assert_eq!((writer.i[0], writer.i[6], writer.j[0]), (rows, rows, ctx));
+        assert_eq!(writer.t[6], n.kv_scale[0]);
+        let flash = p
+            .insts
+            .iter()
+            .find(|d| d.op == DevOp::FlashMlaDecodeFp8 as u16)
+            .unwrap();
+        assert_eq!(
+            (flash.t[7], flash.j[0], flash.i[6]),
+            (n.kv_scale[0], n.iidx + 1, 2048)
+        );
+    }
+    let mut b = Builder::new(256);
+    b.adopt_tensors(tensors);
+    emit_glm_mla_prefill(
+        &mut b,
+        &c,
+        &n,
+        0,
+        ctx,
+        8192,
+        MoeEnc::Fp8Blk,
+        n.x,
+        &[],
+        false,
+        &mut 0,
+        &[],
+    );
+    let p = b.finish();
+    let flash = p
+        .insts
+        .iter()
+        .find(|d| d.op == DevOp::FlashMlaPrefillFp8 as u16)
+        .unwrap();
+    assert_eq!(
+        (flash.t[7], flash.j[0], flash.i[6]),
+        (n.kv_scale[0], n.iuni + 1, 16384)
+    );
+}
+
+#[test]
 fn glm_dsa_decode_batch_strides_producers_and_serializes_selection() {
     let mut c = glm_ref_cfg();
     c.indexer_full[3] = true;

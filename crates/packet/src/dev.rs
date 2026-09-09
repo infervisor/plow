@@ -1217,7 +1217,10 @@ pub enum DevOp {
     /// second pass — where a per-tensor scale would have to be chosen before the context exists.
     /// `t0=Opart(f32) t1=mlpart(f32) t2=Qabs t3=Qrope t4=Ckv t5=Krope t6=kv_len(i32) t7=kv_scale` ·
     /// `i0=n_batch i1=n_head i2=kv_stride i3=window i4=nsplit i5=kv_mask i6=krot_fp8 i7=gf` ·
-    /// `f0=scale`.
+    /// `f0=scale` · `j0=selected_handle_plus_one`.
+    /// Sparse extension: `j0=selected_handle_plus_one` identifies the idx tensor;
+    /// i6 carries top_k. Zero j0 is dense.
+    /// Sparse FP8 requires BF16 rope and a compatible object marker.
     FlashMlaDecodeFp8 = 109,
     /// FP8-KV twin of [`DevOp::FlashMlaPrefill`]. Same operands as [`DevOp::FlashMlaDecodeFp8`]
     /// with `i4 = n_tok` instead of `nsplit` — the same slot reuse the bf16 MLA prefill makes,
@@ -1225,7 +1228,9 @@ pub enum DevOp {
     /// `PLOW_MLA_PREFILL`.
     /// `t0=Opart(f32) t1=mlpart(f32) t2=Qabs t3=Qrope t4=Ckv t5=Krope t6=kv_len(i32) t7=kv_scale` ·
     /// `i0=n_batch i1=n_head i2=kv_stride i3=window i4=n_tok i5=kv_mask i6=krot_fp8 i7=gf` ·
-    /// `f0=scale`.
+    /// `f0=scale` · `j0=selected_handle_plus_one`.
+    /// Sparse extension: `j0=selected_handle_plus_one` identifies the union tensor;
+    /// i6 carries union capacity.
     FlashMlaPrefillFp8 = 110,
     /// KDA short conv over all THREE streams in one packet — [`DevOp::KdaConv`] merged along the
     /// CHANNEL axis, which is its output axis.

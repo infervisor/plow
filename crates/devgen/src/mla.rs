@@ -1347,9 +1347,8 @@ fn glm_ofold(enc: MoeEnc) -> bool {
 /// (`i[6]=0`), matching the shipped K3 arm. NOT bit-identical to the bf16 arm — e4m3 has 3
 /// mantissa bits — so this ships only behind its own serve gate. Unset = byte-identical emit.
 ///
-/// Incompatible with an armed DSA gate: `FlashGatherDecode` has no fp8 twin (its `t7` is the idx
-/// table, where the scale array would live), so a gathered packet would read fp8 bytes as bf16.
-/// The emitters assert.
+/// Sparse FP8 uses the same opcodes with `j[0] = selected-handle + 1`; zero remains dense.
+/// The runtime requires sparse-FP8 object markers before accepting that extension.
 fn glm_fp8_kv() -> bool {
     emit_config::active().glm_fp8_kv
 }
@@ -3443,9 +3442,8 @@ pub(crate) fn emit_glm_mla(
     //   kv_row_writer scan patches its i[3]; the bf16 RmsNorm writer's row is i[2].
     let fp8kv = glm_fp8_kv();
     assert!(
-        !(fp8kv && rows > 1),
-        "PLOW_GLM_FP8_KV=1 with a batched decode program (rows={rows}): the fp8 latent writer's \
-         batch-ring form is unvalidated on GLM. Emit the ladder blob without fp8-KV."
+        !(fp8kv && dbatch > 1 && !c.dsa(ctx)),
+        "batched GLM FP8 KV requires the qualified sparse AMD decode path"
     );
     let c_rnkv = if fp8kv {
         b.emit(DevOp::HeadNormRopeFp8, one.clone(), &[c_ckvd], |d| {
@@ -3454,12 +3452,16 @@ pub(crate) fn emit_glm_mla(
             d.t[2] = w.gkva;
             d.t[5] = n.pos;
             d.t[6] = n.kv_scale[slot];
-            d.i[0] = 1;
+            d.i[0] = rows;
             d.i[1] = 1;
             d.i[2] = dk;
             d.i[3] = 0; // row, patched per step
             d.i[4] = 0; // apply RMSNorm before quantizing
             d.f[0] = eps;
+            if rows > 1 || dbatch > 1 {
+                d.i[6] = rows;
+                d.j[0] = ctx;
+            }
             d.j[1] = KV_MASK_NONE;
         })
     } else if rows > 1 || dbatch > 1 {
@@ -3565,13 +3567,6 @@ pub(crate) fn emit_glm_mla(
     }
     //   Sized to `n_batch*n_tok*(nh_l/GF)*nsplit` (`flash_mla_cus`), which is exactly `n_cu` at
     //   GF=4 and half of it at GF=2 — see the helper for why the two do not cancel.
-    // `FlashGatherDecode` has no fp8 twin (t7 = idx table, where the scales would live), so a
-    // gathered packet would read fp8 latent bytes as bf16 — refuse the combination at emit.
-    assert!(
-        !(fp8kv && dsa),
-        "PLOW_GLM_FP8_KV=1 with an armed DSA gate (ctx={ctx}): FlashGatherDecode keeps its bf16 \
-         arm in the fp8kv object and cannot dequant an fp8 latent. Set PLOW_GLM_DSA=0."
-    );
     // The q-rope fold spends `t[7]` (cos) and `i[6]` (sin, as a demoted handle — the
     // `DevOp::GemvQkvg` rule). BOTH other features on this packet already own those two slots:
     // GATHER puts its idx table in t7 and its top_k in i6, fp8-KV puts its per-row scale strip
@@ -3589,11 +3584,22 @@ pub(crate) fn emit_glm_mla(
             "PLOW_GLM_FP8_KV=1"
         }
     );
+    if dsa && fp8kv {
+        assert!(
+            nh_l == 8
+                && dk == 512
+                && dr == 64
+                && rows <= 20
+                && glm_gf(ctx, nh_l) == 4
+                && glm_dsa_select_width(c, ctx) == 2048,
+            "sparse FP8 decode requires qualified QH8 latent512/rope64 GF4 geometry"
+        );
+    }
     let c_fl = b.emit(
         match (dsa, fp8kv) {
-            (true, _) => DevOp::FlashGatherDecode,
+            (_, true) => DevOp::FlashMlaDecodeFp8,
+            (true, false) => DevOp::FlashGatherDecode,
             (false, false) => DevOp::FlashMlaDecode,
-            (false, true) => DevOp::FlashMlaDecodeFp8,
         },
         flash_mla_cus(&all, rows, 1, nh_l, glm_gf(ctx, nh_l), ns_attn),
         &fl_deps,
@@ -3639,7 +3645,11 @@ pub(crate) fn emit_glm_mla(
                 d.i[6] = 0; // krot stays bf16 (the shipped K3 form)
             }
             if dsa {
-                d.t[7] = n.iidx; // idx table (this or the last full layer's selection)
+                if fp8kv {
+                    d.j[0] = n.iidx + 1;
+                } else {
+                    d.t[7] = n.iidx;
+                }
                 d.i[6] = glm_dsa_select_width(c, ctx); // fixed selection-row width
             }
         },
@@ -4889,12 +4899,6 @@ pub(crate) fn emit_glm_mla_prefill(
     } else {
         None
     };
-    assert!(
-        !(sparse && fp8kv),
-        "PLOW_GLM_DSA_PF=1 with fp8 latent KV: the V2 flash GATHER arm is bf16-only (op 110 never \
-         routes to the flash object), so the gathered packet would read fp8 latent bytes as bf16. \
-         Unset one of PLOW_GLM_FP8_KV / PLOW_GLM_DSA_PF."
-    );
     // OFOLD (fusion-audit seam 1): flash writes normalized bf16 partials (i[6]), the merge
     // packet disappears, o_proj becomes the fused W_ofold GEMM. Refuse the arms it cannot
     // compose with rather than silently downgrade — both would corrupt (sparse/fp8kv own
@@ -4949,7 +4953,11 @@ pub(crate) fn emit_glm_mla_prefill(
             d.t[5] = if dr > 0 { n.krot[slot] } else { n.ckv[slot] };
             d.t[6] = n.kvlen;
             if fp8kv {
-                d.t[7] = n.kv_scale[slot]; // per-row dequant scales; the kernel traps on NULL
+                d.t[7] = n.kv_scale[slot];
+                if sparse {
+                    d.j[0] = n.iuni + 1;
+                    d.i[6] = glm_dsa_pf_cap(c, ctx);
+                }
             } else if sparse {
                 d.t[7] = n.iuni; // the union table; its presence selects the GATHER arm
                 d.i[6] = glm_dsa_pf_cap(c, ctx);
