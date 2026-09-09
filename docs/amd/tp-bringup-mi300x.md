@@ -1774,6 +1774,42 @@ reference reuses it across all three layers of a run. Candidates worth checking 
 Closing it is worth the rest of the attention term: the 78-layer configuration already measured
 2,747 ms of flash against dense's 17,391 ms, and 13,640 ms of prefill against 25,645 ms.
 
+#### The likeliest mechanism is write-after-read, not read-after-write
+
+Every hypothesis above assumed the risk was a reader running before its writer. The matched-count
+result points the other way. In the run `0F 1F 2F 3S 4S 5S 6F ...`, layer 2 writes the union and
+the NEXT writer is layer 6, so what varies with distance is not the gap behind the reader but the
+slack in front of it:
+
+```
+ reader   reads union of   next writer   slack   observed
+ layer 3      layer 2        layer 6       3     correct   (span 1)
+ layer 4      layer 2        layer 6       2     wrong     (dexact 2)
+ layer 5      layer 2        layer 6       1     wrong     (span 3 / all-layer)
+```
+
+The failure orders exactly by slack, and it degrades progressively rather than switching — span 3
+loses the needle entirely and mangles the repeated phrase, dexact 2 loses one leading token of the
+needle and keeps the phrase clean. That is the signature of layer 6's `IndexUnionPf` overwriting
+`n.iuni` while a nearer reader's flash is still walking it: a WRITE-AFTER-READ hazard on a buffer
+that is shared by every layer and rebuilt every four.
+
+It also explains why the read-after-write argument checked out. `n.iuni`'s writer IS ordered
+before its readers, transitively through the residual stream, and span 1 proves that ordering
+holds. Nothing in the emit orders a writer AFTER the readers of the previous generation.
+
+Two fixes follow, and they are cheap relative to what they unlock (prefill 25,645 -> 13,640 ms):
+
+* **Double-buffer `n.iuni`**, alternating per full layer, so a writer never lands on the
+  generation a live reader is walking. Costs one more union allocation and no synchronisation.
+* **Add the WAR edge** — make each `IndexUnionPf` depend on the flash ops of the layers that read
+  the previous union. Free in memory, but it serialises the indexer behind the previous group's
+  attention, which is exactly the overlap the chain is built to get.
+
+The first is preferable. Note also that `PLOW_GLM_DSA_PF_SPAN=1` is safe under this reading for a
+structural reason rather than a lucky one: a distance-1 reader always has the full run of shared
+layers between it and the next writer.
+
 ## 8. Unrelated issue observed
 
 `cargo test -p devgen mla` fails `k3::tests::the_mla_prefill_arm_forces_one_split`
