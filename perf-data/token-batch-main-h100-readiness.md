@@ -624,3 +624,15 @@ existing differences; unrelated formatting is unchanged.
 `fp8-packed-functional-qualification.json` records source, binary, asset and raw
 proof hashes in the campaign directory. The runtime SHA256 is
 `3b769811adc02fd90273c29c546eef29253d16fec50b9b19c4fbc18cd8da23e3`.
+
+The six-cell FP8 screen preserves all 15 prompt hashes, completion texts and cached
+token counts against the prior ordinary batch-16 reclaim runtime. Throughput rises
+in all six cells, but 16K/C4 median TTFT regresses from 1732 ms to 2642 ms. At that
+cell, median TPOT improves from 82.73 ms to 49.47 ms and throughput from 29.00 to
+30.62 tokens/s. This is one measured wave per cell after warmup, covering
+1K/4K/16K at concurrency 1/4; it does not qualify a default change. The candidate
+also includes subsequent prefix-cache fixes, so this is a serving comparison,
+not an isolated kernel experiment. No builds or other GPU workloads overlap timing.
+Results are in `gemma31-h100-fp8-packed-preflight.csv`; raw proof is
+`fp8-packed-preflight-comparison.json` and `plow-fp8-packed-occ1-preflight.*` in
+the campaign directory. The full FP8 grid is pending.
