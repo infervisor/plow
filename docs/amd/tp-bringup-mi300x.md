@@ -655,6 +655,36 @@ of the three. It is new kernel work, and it should be measured against the fp8 r
 assumed faster — §4 already shows fp8 LOSING to bf16 on DSV4's `expert down` at M=96, so narrow
 weights do not automatically win at decode-shaped M.
 
+### Measured: what the fp8 route costs numerically
+
+`scripts/kimi_k27_prep.py --verify` dequantizes a real expert exactly (unpack order mirrored from
+`compressed_tensors.unpack_from_int32`, not guessed: nibble `i` of packed word `c` is column
+`8c+i`, stored unsigned with an offset of 8), re-encodes it to block-fp8, and round-trips it
+through the same arithmetic the kernel does — `fp8 * scale_inv`. Layer 3, `gate_proj`:
+
+| scale grid | mean rel. err | max rel. err | in-block scale spread |
+|---|---:|---:|---:|
+| `[128,128]` (the shipped arm) | **2.264%** | 3.5% | 6.4x |
+| `[32,32]` (ablation) | **2.169%** | 3.0% | 6.4x |
+
+**The grid is not the problem.** Refining it 4x along K — to the source's own group size — buys
+0.1 percentage points. The 2.2% is e4m3's own precision, and it has a specific cause: the int4
+values are integers in ±1..8, which e4m3 represents EXACTLY, but dividing them by a block scale
+incommensurate with their per-32 group scale turns them into arbitrary reals that need mantissa
+bits e4m3 does not have. (This is the same property mxfp4 sidesteps with power-of-two E8M0
+scales — and the reason a finer f32 grid cannot recover it.)
+
+So the fp8 route costs ~2.2% RMS on the routed-expert weights, on top of a checkpoint already
+quantized to int4. Whether that is acceptable is a judgement, and the honest framing is the ratio:
+int4's own step is 1/8 = 12.5% of a group's maximum, which this model was QAT-trained to tolerate,
+and 2.2% RMS is a fraction of that. It is also the same order as the fp8 error GLM-5.3 already
+serves under in §3. It is NOT free, and it is not something to discover after converting 555 GB —
+which is why the verifier exists and why it runs on four experts in seconds.
+
+The native int4-g32 arm remains the only route with **zero** added error, and it is also the
+smallest (71.3 GB/rank). The fp8 route's case is that it reuses a qualified arm and can be
+measured this week; the int4 arm's case is that it is exact. Both should be built; fp8 first.
+
 ### Gates after the encoding, unchanged in substance
 
 Full-model emit (`kimi_emit_block` is `--block`-only; the `glm_main` analogue is unwritten), the
