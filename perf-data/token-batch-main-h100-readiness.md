@@ -745,9 +745,21 @@ host suite passes 596 tests, with 17 device/asset-dependent tests ignored; the
 
 These results do not establish equality with native GEMV or vLLM;
 the existing cuBLASLt numerical differences and model-quality caveat still apply.
-Adaptive serving qualification and performance measurements remain pending.
+Adaptive serving checks pass: all 12 cold/warm natural completions match the
+fixed-width cuBLASLt reference, eight concurrent cold 16K requests match their
+isolated replays, and recovery, three API checks, 32 sampling pairs and 16
+cancelled streams complete successfully. The matched serving screen is pending.
 The option remains experimental and is not enabled by default.
 
 Raw results and artifact hashes are in
 `cublaslt-ladder-experimental-qualification.json`, `cublaslt-ladder-exact-gpu.log`
 and `cublaslt-ladder-shared-natural-comparison.json` in the campaign directory.
+
+A fresh direct-engine comparison at 1K context, with 16 warmup steps and 64
+measured steps, removes the fixed-width single-request regression. At one active
+slot, median step time is 27.59 ms vs native 28.62 ms. At eight active slots it
+is 36.22 ms vs 76.55 ms. Both paths use the same newly built benchmark binary;
+no builds or other GPU jobs overlap timing. These are decode-step diagnostics,
+not serving throughput or a vLLM comparison. Raw measurements are in
+`gemma-bf16-cublaslt-adaptive-step-comparison.json` and
+`gemma-bf16-{native,adaptive}-shared-step-b{1,8}.log` in the campaign directory.
