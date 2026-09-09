@@ -12,6 +12,7 @@
 //! `exec/gpu.rs`'s pairing check already refuses on principle.
 
 pub mod fetch;
+pub mod prepare;
 pub mod pull;
 pub mod reference;
 pub mod store;

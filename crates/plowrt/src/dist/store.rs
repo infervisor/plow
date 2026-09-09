@@ -3,8 +3,7 @@
 //! ```text
 //! ~/.plow/
 //!   blobs/sha256/<hex>                                   every file, content-addressed
-//!   manifests/<registry>/<namespace>/<name>/<label>@g<n>
-//!   refs/<registry>/<namespace>/<name>                   the pinned variant_id
+//!   refs/<digest>.json                                   {ref, variant} for one pin
 //!   bundles/<variant_id>/                                links into blobs/ — what --assets gets
 //! ```
 //!
@@ -199,33 +198,41 @@ impl Store {
         Ok(dir)
     }
 
+    /// A pin's filename: a digest of the reference, not the reference itself.
+    ///
+    /// A reference contains `://` and `/`, and using it as a path both nests
+    /// unpredictably and does not survive the round trip — `PathBuf::join`
+    /// collapses `file:///store` to `file:/store`, so a listed pin could not be
+    /// re-parsed and `upgrade --all` would fail on exactly the mirrors that
+    /// motivate a local registry.
+    fn pin_file(&self, reference: &str) -> PathBuf {
+        let key = &plow_asset::decode_objects::image_sha256(reference.as_bytes())[..16];
+        self.root.join("refs").join(format!("{key}.json"))
+    }
+
     /// Record which variant a reference currently resolves to.
     ///
     /// A pin is written by `load` and moved only by `upgrade`: a served model
     /// must not drift under a running server because a catalog refreshed.
-    pub fn pin(&self, ref_path: &str, variant_id: &str) -> Result<()> {
-        let p = self.root.join("refs").join(ref_path);
-        if let Some(parent) = p.parent() {
-            std::fs::create_dir_all(parent).map_err(|source| RuntimeError::Io {
-                path: parent.to_path_buf(),
+    pub fn pin(&self, reference: &str, variant_id: &str) -> Result<()> {
+        let p = self.pin_file(reference);
+        let body = serde_json::json!({ "ref": reference, "variant": variant_id });
+        std::fs::write(&p, serde_json::to_vec(&body).unwrap_or_default()).map_err(|source| {
+            RuntimeError::Io {
+                path: p.clone(),
                 source,
-            })?;
-        }
-        std::fs::write(&p, variant_id).map_err(|source| RuntimeError::Io {
-            path: p.clone(),
-            source,
+            }
         })
     }
 
-    pub fn pinned(&self, ref_path: &str) -> Option<String> {
-        std::fs::read_to_string(self.root.join("refs").join(ref_path))
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
+    pub fn pinned(&self, reference: &str) -> Option<String> {
+        let raw = std::fs::read(self.pin_file(reference)).ok()?;
+        let v: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+        v.get("variant")?.as_str().map(str::to_string)
     }
 
-    pub fn unpin(&self, ref_path: &str) -> Result<()> {
-        let p = self.root.join("refs").join(ref_path);
+    pub fn unpin(&self, reference: &str) -> Result<()> {
+        let p = self.pin_file(reference);
         match std::fs::remove_file(&p) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -233,10 +240,28 @@ impl Store {
         }
     }
 
-    /// Every pinned reference, as `(ref_path, variant_id)`.
+    /// Every pin, as `(reference, variant_id)`.
+    ///
+    /// The reference comes back exactly as it was written, so a caller can
+    /// re-parse it — which is what `upgrade --all` does.
     pub fn pins(&self) -> Vec<(String, String)> {
         let mut out = Vec::new();
-        collect_pins(&self.root.join("refs"), &mut String::new(), &mut out);
+        if let Ok(rd) = std::fs::read_dir(self.root.join("refs")) {
+            for e in rd.flatten() {
+                let Ok(raw) = std::fs::read(e.path()) else {
+                    continue;
+                };
+                let Ok(v) = serde_json::from_slice::<serde_json::Value>(&raw) else {
+                    continue;
+                };
+                if let (Some(r), Some(id)) = (
+                    v.get("ref").and_then(|x| x.as_str()),
+                    v.get("variant").and_then(|x| x.as_str()),
+                ) {
+                    out.push((r.to_string(), id.to_string()));
+                }
+            }
+        }
         out.sort();
         out
     }
@@ -289,32 +314,6 @@ fn is_safe_relative(name: &str) -> bool {
         && std::path::Path::new(name)
             .components()
             .all(|c| matches!(c, Component::Normal(_)))
-}
-
-fn collect_pins(dir: &Path, prefix: &mut String, out: &mut Vec<(String, String)>) {
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for e in rd.flatten() {
-        let name = e.file_name().to_string_lossy().into_owned();
-        let path = e.path();
-        if path.is_dir() {
-            let saved = prefix.len();
-            if !prefix.is_empty() {
-                prefix.push('/');
-            }
-            prefix.push_str(&name);
-            collect_pins(&path, prefix, out);
-            prefix.truncate(saved);
-        } else if let Ok(v) = std::fs::read_to_string(&path) {
-            let key = if prefix.is_empty() {
-                name
-            } else {
-                format!("{prefix}/{name}")
-            };
-            out.push((key, v.trim().to_string()));
-        }
-    }
 }
 
 #[cfg(test)]

@@ -426,7 +426,18 @@ fn assess_one<'a>(v: &'a Variant, live: &LiveTarget, c: &Constraints) -> Assessm
                 });
             }
         }
-        if v.target.mem_bytes > live.mem_bytes {
+        // A variant records the datasheet capacity of the part it was built
+        // for; a probe reports the USABLE pool, which is always somewhat under
+        // it. On a live MI300X that gap is 206,141,652,992 vs 206,158,430,208 —
+        // 16 MiB, 0.008% — so a strict `>=` rejects a part for being itself.
+        //
+        // Two quantities, so two rules. The same SKU is by construction the same
+        // part and needs no byte comparison; a different SKU is compared with a
+        // tolerance far below the ~25% that separates real capacity classes
+        // (MI300X 192 GiB vs MI325X 256 GiB).
+        let same_part = live.sku.as_deref() == Some(v.target.sku.as_str());
+        if !same_part && v.target.mem_bytes.saturating_sub(v.target.mem_bytes / 64) > live.mem_bytes
+        {
             return Some(Reject::Mem {
                 want: v.target.mem_bytes,
                 live: live.mem_bytes,

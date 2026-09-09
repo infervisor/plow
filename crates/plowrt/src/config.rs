@@ -46,6 +46,16 @@ pub struct RuntimeConfig {
     #[arg(long = "plow-home", env = "PLOW_HOME", global = true)]
     pub plow_home: Option<String>,
 
+    /// Asset registry a bare model reference resolves against. A `file://` URL
+    /// or an absolute path selects a local mirror and needs no HTTP client.
+    #[arg(
+        long = "registry",
+        env = "PLOW_REGISTRY",
+        default_value = crate::dist::reference::DEFAULT_REGISTRY,
+        global = true
+    )]
+    pub registry: String,
+
     /// Checkpoint prefetch depth in tensors.
     #[arg(
         long = "rt-prefetch",

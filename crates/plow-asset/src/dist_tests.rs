@@ -104,6 +104,32 @@ fn memory_is_what_separates_mi300x_from_mi325x() {
     assert_eq!(picked.unwrap().target.sku, "MI325X");
 }
 
+// A variant records the datasheet capacity; a probe reports the usable pool.
+// These are the numbers measured on a live MI300X — 16 MiB apart — and a strict
+// `>=` between them rejects the part for being itself.
+#[test]
+fn a_probe_under_the_datasheet_capacity_still_matches_its_own_part() {
+    const SPEC: u64 = 206_158_430_208; // 192 GiB, MI300X datasheet
+    const PROBED: u64 = 206_141_652_992; // what ROCr reports as the usable pool
+    assert!(PROBED < SPEC);
+
+    let vs = vec![variant(
+        "gfx942-mi300x-tp1",
+        1,
+        target("gfx942", "MI300X", 304, SPEC),
+        "tp",
+        1,
+    )];
+    let mut l = live("gfx942", "MI300X", 304, PROBED, 8);
+    assert!(select(&vs, &l, &Constraints::default()).is_ok());
+
+    // A genuinely smaller part is still refused: the classes are ~25% apart, far
+    // outside the tolerance.
+    l.sku = Some("MI210".into());
+    l.mem_bytes = 64 << 30;
+    assert!(select(&vs, &l, &Constraints::default()).is_err());
+}
+
 #[test]
 fn refuses_a_narrower_part_naming_the_unit_counts() {
     let vs = vec![variant(

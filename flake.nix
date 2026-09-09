@@ -341,6 +341,12 @@
               # Lean 4 toolchain manager — installs the version pinned by
               # lean-plow/lean-toolchain on first `lake` invocation.
               pkgs.elan
+              # Asset publishing: blobs are stored compressed and keyed on the
+              # UNCOMPRESSED digest (scripts/publish_dist.py). Producer-side
+              # only — a serving host decompresses with the `zstd` crate linked
+              # into plowrt under the `dist` feature, and needs neither this nor
+              # nix.
+              pkgs.zstd
             ] ++ pkgs.lib.optionals isGpuHost [
               # GPU dev requirements (x86_64-linux only; darwin builds plowc and
               # the CPU plowrt, nothing else): hipcc + nvcc from nix, so kernel
