@@ -428,6 +428,69 @@ checkpoint's own template over the built-in builders, and the TP4/TP8 bundles
 found on this host were missing all three, so they had been served through an
 approximation of a file the weights already carry.
 
+## 7b. Optimization — measured against the §3 baseline
+
+Every arm below ran in ONE lease, one lever at a time, against the same bundle,
+with the base arm re-measured in that lease rather than carried from §3. It
+reproduced the frozen numbers to within noise (33.34 vs 33.36 out tok/s, TPOT
+28.88 vs 28.85), which is what makes the deltas trustworthy.
+
+| arm | in=128 c=1 tok/s | TPOT ms | in=1024 c=1 tok/s | TPOT ms |
+|---|---:|---:|---:|---:|
+| base (§3 recipe) | 33.34 | 28.88 | 31.56 | 29.79 |
+| + low-rung decode tiers | 41.64 | 22.90 | 38.95 | 23.80 |
+| + TP audit off | **43.88** | **21.63** | **40.93** | **22.55** |
+| | **+31.6%** | **−25.1%** | **+29.7%** | **−24.3%** |
+
+**Low-rung decode tiers (+24.9%) were free and were simply not built.** The §3
+objects are compiled at `PLOW_DECODE_BATCH=4` while the packet's decode ladder
+is `1,2,4`, so at concurrency 1 a rung-1 packet ran the width-4 object's body:
+`PLOW_GEMV_MM` is a compiled CEILING, so every decode GEMV computed four rows
+and discarded three. `scripts/build_gfx942.sh PLOW_DECODE_TIERS=1,2` builds the
+matched objects into `lowrung{1,2}/`, and plowrt co-loads them when
+`PLOW_HSACO_LOWRUNG` names them. The baseline served with
+`hsaco_lowrung: None`.
+
+**TP audit off is a further +5.4%, and is a real tradeoff, not a free win.**
+`audit` is one 12 KiB readback per rank per decode step; the code sanctions
+`PLOW_TP_NO_AUDIT=1` "for a timing run" and what it catches is a silently wrong
+token. It is reported here because it is measurable, not recommended for
+production without deciding that risk. `PLOW_TP_AGREE_EVERY` reduces the cadence
+instead of removing the check and is the safer knob.
+
+### Where the remaining time is — decode-step attribution
+
+`PLOW_DSTEP_LOG=1` on the best config, single steady stream, n=64 tokens:
+
+| phase | µs/token | % |
+|---|---:|---:|
+| **GPU drain (all ranks)** | **19832.9** | **91.6%** |
+| pre rearm_prog (local counters), 8 calls/tok | 1382.0 | 6.4% |
+| pre decode_prepare | 140.2 | 0.6% |
+| pre zero_xctr | 88.9 | 0.4% |
+| post read_sampled | 74.3 | 0.3% |
+| idle between mux ticks | 53.0 | 0.2% |
+| post TP safety audit | 0.0 | 0.0% |
+| HOST TOTAL | 1699.1 | 7.8% |
+
+This bounds the rest of the campaign: **host work is 7.8% of a token**, so every
+remaining host-side optimization together cannot buy more than that, and the
+next real gains have to come from the GPU side. `rearm_prog` at 1382 µs across
+8 calls is the only host term worth attacking, and it is worth at most 6.4%.
+
+Against §4's roofline this also re-frames the 5.3% figure: the GPU is busy for
+91.6% of the token while moving 6.22 GB, so the gap is not host stalls — it is
+what the GPU is doing during those 19.8 ms.
+
+### Token batch — the packet is eligible
+
+`plowrt op-audit` classifies the whole TP8 decode program **`[PACKABLE]`**:
+1860 instructions, 18 distinct opcodes, 1392 class-A (ready) and 468 class-B
+(descriptor-fills), none class-C/D. So the unified token-batch route is legal
+for this model; it was simply never requested — the route reports
+`armed=true fires=false`, "opt-in per (backend, family) pair until that pair is
+measured". Measuring that pair is §7c.
+
 ## 8. Unrelated issue observed
 
 `cargo test -p devgen mla` fails `k3::tests::the_mla_prefill_arm_forces_one_split`
