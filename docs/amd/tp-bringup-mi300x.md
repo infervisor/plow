@@ -942,6 +942,35 @@ target being compared against, so decode latency is the one budget this workload
 It is not the whole gap. Uncapped aggregate prefill is 2,239 tok/s against a single-stream 3,078,
 so ~27% is still lost to concurrency after the cap is gone.
 
+### The full 2x2: the cap only bites when the chunk exceeds it
+
+Two levers, crossed, at 70k / conc 20 / TP8 (all on the direct-to-LDS object):
+
+| prefill chunk | per-tick row cap | co-packing | out tok/s |
+|---|---|---|---:|
+| 2048 | 2048 (default) | fires, `spans=2` | 16.76 |
+| 2048 | uncapped | fires, `spans=2` | 16.67 |
+| 8192 | 2048 (default) | never fires | 16.53 |
+| **8192** | **uncapped** | never fires | **18.67** |
+
+**The cap is only binding when the chunk is larger than it.** At chunk 2048 lifting it changes
+nothing (16.76 -> 16.67); the whole +13% comes from letting an 8192-row chunk actually deliver
+8192 rows in a tick instead of being truncated to 2048. Stated the other way round: with the
+shipped default, `PLOW_PF_CHUNK` above 2048 buys nothing at all once anything is decoding, which
+is a silent interaction between two knobs that are documented independently.
+
+**Co-packing is not the lever here.** It DOES fire — `AMD packed prefill fired spans=2 program=3`
+— and always at exactly two spans, which is the bootstrap defect
+`docs/amd/gemma4-31b-mi300x.md` records: a pack can only consider a slot that already holds a
+prefill cursor, the isolated path is what grants one, and the mux skips that path on any tick where
+a pack ran, so N simultaneous arrivals bootstrap to a two-member pack and stop. Two spans is worth
+less than the larger chunk it costs: the packing arms (16.67-16.76) lose to the non-packing
+uncapped arm (18.67). Fixing the bootstrap to reach 4 members is the open question; two members is
+not worth the chunk it requires.
+
+(An earlier note here claimed co-packing never fires. That was a grep for `advanced`, which is a
+DEBUG line; the INFO marker is `fired`. It fires.)
+
 ### Two nulls that bound where the remaining 27% is not
 
 **`PLOW_PF_DEFER_DECODE=1` adds nothing** once the interleave is uncapped: 18.61 out tok/s against
