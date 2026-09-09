@@ -1,0 +1,37 @@
+# DeepSeek-V4-Flash on MI300X — REFUSED.
+#
+# A refused recipe is a statement of support, not a build. It exists so "can
+# plow serve this?" is answerable from the catalog rather than by reading a
+# 2,700-line investigation log, and so the answer carries the file:line that
+# would have to change.
+#
+# It is publishable and appears in `plowrt show`, but is never selectable.
+
+schema = "plow.recipe.v1"
+namespace = "infervisor"
+name = "deepseek-v4"
+label = "gfx942-mi300x-tp8"
+network = "deepseek-v4"
+status = "refused"
+plow_git = "c7a6a0b782d3db58bc0e281dea54e16632c4d1dd"
+doc = "docs/amd/deepseek-v4-mi300x.md"
+
+refusal = "crates/nn-graph/src/models/config/deepseek_v4.rs:261 — plowc refuses a DeepSeek-V4 emit"
+
+# What would unblock it, from the doc's own gap list: the indexer, mHC
+# residuals, and the DSpark/MTP layer have no emit path. The kernels have unit
+# tests; nothing has been measured on a V4 checkpoint on any GPU.
+unblocked_by = "docs/amd/deepseek-v4-mi300x.md §7 'Gap list blocking emit'"
+
+[target]
+vendor = "amd"
+isa = "gfx942"
+sku = "MI300X"
+units = 304
+num_gpus = 8
+parallel = "tp"
+
+[checkpoint]
+source = "hf:deepseek-ai/DeepSeek-V4-Flash-0731"
+shards = 0
+layout = "native-mxfp4"

@@ -1,0 +1,91 @@
+# GLM-5.3-FP8 on 4x MI300X.
+#
+# Transcribed from scripts/glm53_mi300x.sh and docs/amd/glm53-mi300x.md.
+# `scripts/check_recipe.py` asserts this against what a build produced.
+
+schema = "plow.recipe.v1"
+namespace = "infervisor"
+name = "glm-5.3"
+label = "gfx942-mi300x-tp4-18k-fp8"
+network = "glm-5.3"
+status = "emits"
+plow_git = "c7a6a0b782d3db58bc0e281dea54e16632c4d1dd"
+doc = "docs/amd/glm53-mi300x.md"
+
+[target]
+vendor = "amd"
+isa = "gfx942"
+sku = "MI300X"
+units = 304
+num_gpus = 4
+parallel = "tp"
+max_ctx = 18432
+toolchain = "rocm-7.14.0-nix"
+
+# The PREPPED directory, not the raw HF snapshot: the blob binds
+# `derived.q_absorb`/`v_absorb`/`kv_a_latent` and bf16 `q_a_proj`/`o_proj`/
+# `shared_experts`, which only the prep writes. A raw-HF checkpoint either
+# refuses on a shard-size mismatch or, with folds armed, faults the GPU at load.
+[checkpoint]
+source = "hf:zai-org/GLM-5.3-FP8"
+shards = 79
+layout = "plow-glm-lite"
+
+# GLM-5.3's checkpoint ships its own tokenizer, so the distribution does not
+# carry one — `prepare` links it from the snapshot.
+[tokenizer]
+source = "checkpoint"
+
+# The overlay: derived and dequantised tensors written into `zz-derived-*`
+# shards that sort after `model-*`, ~40 GB rather than the ~750 GB a full copy
+# would cost.
+[[prepare]]
+tool = "scripts/glm52_prep_lite.py"
+shell = "nix develop .#quantize"
+args = ["--model", "$CKPT", "--out", "$WORK/glm53-lite"]
+produces = ["zz-derived-00001.safetensors"]
+
+[objects]
+script = "scripts/build_gfx942.sh"
+env = { PLOW_DECODE_TIERS = "1,2,4,8", JOBS = "8" }
+
+# Batch-width-matched decode tiers. `PLOW_GEMV_MM` is a compiled CEILING, so
+# without them a rung-1 packet runs the wide object's body and computes — then
+# discards — one dot product per dead activation row.
+[[objects.lowrung]]
+max = 1
+env = { PLOW_DECODE_TIER = "1", PLOW_ROWS_ONLY = "=interp_decode" }
+
+[[objects.lowrung]]
+max = 2
+env = { PLOW_DECODE_TIER = "2", PLOW_ROWS_ONLY = "=interp_decode" }
+
+# The GLM-5.2 campaign's knob set minus `PLOW_GLM_FUSE_QNORM`: its M>1 staging
+# is unvalidated and the emit refuses it alongside a decode-batch ladder.
+[emit]
+env = { GLM_FULL = "1", PLOW_FP8 = "1", PLOW_MLA_PREFILL = "full:128,512,2048,8192", PLOW_MLA_PF_V2 = "1", PLOW_GLM_PF_NS = "2", PLOW_GLM_DSA = "0", GLM_MOE_CORESIDENT = "2", GLM_SHARED_CUS = "48", GLM_SHARD_HEAD = "1", PLOW_GLM_FUSE_ROPE = "1", PLOW_GLM_FUSE_SEAM = "1", PLOW_GLM_FUSE_B1 = "1", PLOW_MOE_PF_DET = "1", PLOW_DECODE_BATCH_LADDER = "1,2,4" }
+args = [
+  "--emit", "devblob",
+  "--arch", "gfx942",
+  "--gpu", "MI300X",
+  "--num-gpus", "4",
+  "--parallel", "tp",
+  "--max-ctx", "18432",
+]
+
+# `PLOW_L2_PLACE_DISPATCH` is not required on AMD — `AmdEngine::load` checks each
+# code object for `plow_l2_place_dispatch_1`, a stronger guard — and is kept so
+# an operator copying this onto the CUDA path gets the same behaviour.
+[serve]
+env = { PLOW_MLA_PF_V2 = "1", PLOW_L2_PLACE_DISPATCH = "1" }
+lowrung_from_objects = true
+
+[[gates]]
+name = "smoke"
+cmd = "scripts/glm53_mi300x.sh smoke 18930"
+
+# No [measured] block: this records the CONFIGURATION, and the bench tables in
+# docs/amd/glm53-mi300x.md were taken with a different harness invocation than
+# the one a release gate runs. `emits` is therefore the honest status — it is
+# publishable and selectable, and it ranks BELOW a validated variant. Promoting
+# it to `validated` requires a release that fills [measured] from its own gate.
