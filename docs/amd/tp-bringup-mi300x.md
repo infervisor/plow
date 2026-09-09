@@ -1348,6 +1348,56 @@ item left in this campaign — **1.88x on prefill, and the removal of the quadra
 but claiming it needs the per-layer selection semantics to be established against the reference,
 not the plumbing, which already works.
 
+### The next term, sized: the down GEMM's K is 256 because TP8 shards it
+
+The 78-layer gather run makes this concrete rather than hypothetical: with attention at
+2,747 ms the linear term is 10,893 ms, i.e. **80% of prefill**. Segment timing prices it exactly
+even in the dense run -- 923 ms per 8192-token chunk over 78 layers is 11.8 ms per layer per
+rank. Against the
+active-parameter count that is
+
+```
+per layer, per rank: 8192 tokens x (9 experts x 3 x 6144 x 2048 + attn proj) x 2 / 8 ranks
+                   = 1.03e12 FLOP in 11.8 ms = 87.7 TF/s
+```
+
+which is **3.4% of the part's fp8 peak** and 2.5% of its measured HBM bandwidth — so the path is
+neither compute- nor bandwidth-bound, and even against plow's OWN measured 160-304 TF/s on these
+shapes it is 2-3.5x down. The overhead is real and it is per-tile.
+
+TP8 is what makes it per-tile. The two grouped GEMMs see opposite shapes on a rank:
+
+```
+                 K      N       NT = K/MPF_BK     tn = N/NB      tiles per m-tile
+ gemm1 (glu)   6144    512           96               4                 4
+ down           256   6144            4              24                24
+```
+
+`down`'s K is `moe_intermediate / TP = 2048 / 8`, so its k-loop runs **four** iterations — and
+every fixed cost the grouped form carries (the LDS stage, two `__syncthreads()` per k-tile, the
+prologue address math, the epilogue's scatter) amortizes over four, against gemm1's ninety-six.
+It also emits six times as many output tiles as gemm1 while doing half the FLOPs.
+
+The lever that follows from this is `MPF_BM`: it is `#ifndef`-guarded, already threaded into
+`AX_DECODE` by `build_gfx942.sh`, `PLOW_GEOM_MARK`ed, and at 128 the arena still fits
+(`(128+256)*64*2 = 49,152 B` against 64,512, DBUF=1 exactly as now). Doubling it halves the tile
+count for both GEMMs and so halves the per-tile overhead the `down` arm is dominated by.
+
+Two things must be handled together with it, which is why this is a change rather than a sweep:
+
+* `PLOW_MOE_PF_EPI` `#error`s unless `MPF_BM == PLOW_WAVE`, because its hoist puts one m-tile row
+  per lane of a single wave and reads it back with `ds_bpermute_b32`. At BM=128 the rows span two
+  waves, so the hoist needs two loads and a lane-half select. Testing BM=128 with EPI=0 instead
+  would confound the measurement with the loss of a hoist already measured to pay.
+* `build_gfx942.sh` threads `MPF_BM` into the decode row only; the prefill/MLA-MoE objects need
+  the same passthrough.
+
+Note this is NOT the "raise M per expert" hypothesis that chunk 16384 already falsified (+3.3%).
+That test doubled the ROWS per expert, which amortizes the weight STREAM; this changes the tile
+the rows are cut into, which amortizes the per-tile FIXED cost. The falsified result is in fact
+evidence for this one: if weight bandwidth were the constraint, halving it would not have
+returned 3.3%.
+
 ## 8. Unrelated issue observed
 
 `cargo test -p devgen mla` fails `k3::tests::the_mla_prefill_arm_forces_one_split`
