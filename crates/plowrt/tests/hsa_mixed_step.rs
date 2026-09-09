@@ -579,7 +579,7 @@ mod dynamic_serving {
         let limits = [16usize, 3, 1];
         let be: Arc<dyn Backend> = Arc::new(HsaBackend::new(0).unwrap());
         let execset = Arc::new(ExecutorSet::bringup(be).unwrap());
-        let mut registry = Registry::new();
+        let registry = Registry::new();
         let slug = registry.load(assets, None).unwrap();
         let state = Arc::new(AppState::new(registry, execset));
         state.install_gpu_engine(slug.clone(), ServeEngine::Amd(engine));

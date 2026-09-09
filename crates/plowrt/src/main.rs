@@ -1060,6 +1060,22 @@ mod amd_bench_cli_tests {
     }
 }
 
+/// Names the visible-device mask in force, for the tail of a "not enough
+/// devices" error. Empty when none is set — in which case the device count is
+/// the machine's and there is nothing to point at.
+fn visible_mask_hint() -> String {
+    let set = plowrt::device::visibility::describe_env();
+    if set.is_empty() {
+        return String::new();
+    }
+    let list = set
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(" (a visible-device mask is in force: {list})")
+}
+
 fn runtime_environment() -> Vec<(String, String)> {
     let mut vars: Vec<_> = std::env::vars()
         .filter(|(key, _)| {
@@ -2050,9 +2066,9 @@ fn devices(
     };
     if n as usize > all.len() {
         return Err(format!(
-            "--tp {n} but only {} devices are visible \
-             (AMD: the visible set is ROCR_VISIBLE_DEVICES, not HIP_VISIBLE_DEVICES)",
-            all.len()
+            "--tp {n} but only {} devices are visible{}",
+            all.len(),
+            visible_mask_hint()
         )
         .into());
     }
@@ -2491,14 +2507,36 @@ async fn bringup_runtime(
     //
     // The CUDA probe keeps a TYPED handle: the sm_120 engine needs the
     // backend's cooperative-launch surface, which `dyn Backend` erases.
+    // Probe the FIRST REQUESTED device, not device 0. Opening 0 unconditionally
+    // retained a primary context on a GPU `--devices 1` explicitly excluded —
+    // and, worse, left it in the backend list so placement handed it the first
+    // model. The device this opens is a device we intend to use.
     #[cfg(feature = "cuda")]
-    let cuda: Option<Arc<device::cuda::CudaBackend>> = match device::cuda::CudaBackend::new(0) {
-        Ok(b) => Some(Arc::new(b)),
-        Err(e) => {
-            tracing::warn!(%e, "no CUDA backend");
-            None
-        }
-    };
+    let cuda_probe: u8 = RuntimeConfig::get()
+        .devices
+        .first()
+        .copied()
+        .unwrap_or(0)
+        .min(u32::from(u8::MAX)) as u8;
+    #[cfg(feature = "cuda")]
+    let cuda: Option<Arc<device::cuda::CudaBackend>> =
+        match device::cuda::CudaBackend::new(cuda_probe) {
+            Ok(b) => Some(Arc::new(b)),
+            // A device the operator NAMED must not degrade to a CPU fallback:
+            // that answers requests with reference-interpreter output at
+            // fictional speed, which is the failure mode this file already
+            // refuses elsewhere.
+            Err(e) if !RuntimeConfig::get().devices.is_empty() => {
+                return Err(format!(
+                    "--devices names device {cuda_probe}, which will not open: {e}"
+                )
+                .into())
+            }
+            Err(e) => {
+                tracing::warn!(%e, "no CUDA backend");
+                None
+            }
+        };
     #[cfg(feature = "cuda")]
     let backend: Arc<dyn Backend> = match &cuda {
         Some(c) => Arc::clone(c) as Arc<dyn Backend>,
@@ -2507,6 +2545,15 @@ async fn bringup_runtime(
     #[cfg(not(feature = "cuda"))]
     let backend: Arc<dyn Backend> = device::select(executors);
     let vendor = backend.vendor();
+    let cfg = RuntimeConfig::get();
+    if vendor != Some(hwspec::Vendor::Nvidia)
+        && (!cfg.devices.is_empty()
+            || !cfg.pin.is_empty()
+            || cfg.place != plowrt::serve::placement::Place::Spread
+            || cfg.nv.vram_budget_mib.is_some())
+    {
+        return Err("model placement and VRAM residency management currently require CUDA; use ROCR_VISIBLE_DEVICES to restrict AMD devices".into());
+    }
     if vendor.is_some() {
         tracing::info!(class = ?backend.class(), vendor = ?vendor, "backend ready — GPU accelerated");
     } else if cfg!(feature = "cpu") {
@@ -2522,7 +2569,7 @@ async fn bringup_runtime(
     }
     let execset = Arc::new(ExecutorSet::bringup(backend)?);
 
-    let mut registry = Registry::new();
+    let registry = Registry::new();
     for dir in &assets {
         let slug = registry.load(dir, None)?;
         let target = registry.get(&slug)?.manifest.gpu.clone();
@@ -2572,21 +2619,47 @@ async fn bringup_runtime(
 
     let state = Arc::new(AppState::with_trace(registry, execset, trace));
 
-    // GPU-managed models: any bundle whose assets dir carries a PLOWDEV
-    // device blob goes under the S1 model manager — it plans each model's
-    // VRAM footprint from the blob header, loads the registration-order
-    // subset that fits (co-residency), and switches the rest on demand
-    // (evict-LRU + load) from the request path. Checkpoint dir is
-    // `<assets>/checkpoint` (`--rt-checkpoint` / PLOW_CHECKPOINT overrides);
-    // the initial loads are the slow part of startup (a 12B checkpoint is
-    // ~22 GiB of H2D), done before the listeners open. `--vram-budget-mib` /
-    // `PLOW_VRAM_BUDGET_MIB` caps the planner's view of the card (A/B, tests).
+    // Where a control-plane load may take an assets dir from. Explicit
+    // `--models-root` entries, plus the parents of the dirs this process was
+    // started with — so the common case (serve two of the bundles that already
+    // live side by side) needs no extra flag, while an arbitrary path in a
+    // request body stays refused. `serve::admin` canonicalizes both sides
+    // before the prefix test.
+    let mut roots: Vec<PathBuf> = RuntimeConfig::get()
+        .models_root
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+    roots.extend(
+        assets
+            .iter()
+            .filter_map(|a| a.parent().map(std::path::Path::to_path_buf)),
+    );
+    state.install_models_roots(roots);
+
+    // GPU-managed models: any bundle whose assets dir carries a PLOWDEV device
+    // blob goes under an S1 residency manager, which plans its VRAM footprint
+    // from the blob header, loads the subset that fits (co-residency) and
+    // switches the rest on demand. Checkpoint dir is `<assets>/checkpoint`
+    // (`--rt-checkpoint` / PLOW_CHECKPOINT overrides); the initial loads are
+    // the slow part of startup (a 12B checkpoint is ~22 GiB of H2D) and happen
+    // before the listeners open. `--vram-budget-mib` caps the planner's view of
+    // a card (A/B, tests).
+    //
+    // PLACEMENT decides which device each model lands on, and it runs entirely
+    // on blob headers — nothing is loaded to find out where it goes.
+    // `--devices` picks the visible ordinals (default: probe upward until one
+    // fails to open), `--place` picks the policy, and one manager is built per
+    // group that actually receives a model.
     #[cfg(feature = "cuda")]
     let mut managed_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
     #[cfg(feature = "cuda")]
     if let Some(cuda) = &cuda {
+        use plowrt::memory::vmm::VmmOps as _;
+        use plowrt::serve::placement::{self, ModelSpec, Place};
+
         let mut models: Vec<(String, PathBuf, PathBuf)> = Vec::new();
-        let slugs: Vec<String> = state.registry.slugs().map(str::to_string).collect();
+        let slugs: Vec<String> = state.registry.slugs();
         for slug in slugs {
             let bundle = state.registry.get(&slug)?;
             if plowrt::asset::devblob::DevBlob::find_in_dir(&bundle.dir)?.is_none() {
@@ -2600,19 +2673,185 @@ async fn bringup_runtime(
             managed_slugs.insert(slug.clone());
             models.push((slug, bundle.dir.clone(), ckpt));
         }
-        // Keep CLI registration order (registry iteration is hash-order).
+        // Keep CLI registration order (registry iteration is sorted by slug).
         models.sort_by_key(|(_, dir, _)| assets.iter().position(|a| a == dir));
+
         if !models.is_empty() {
             let budget = RuntimeConfig::get().nv.vram_budget_mib.map(|mib| mib << 20);
-            let mgr = Arc::new(plowrt::serve::manager::ModelManager::new(
-                Arc::clone(cuda),
-                &state,
-                mux_cfg,
-                models,
-                budget,
-            )?);
-            state.install_manager(Arc::clone(&mgr));
-            mgr.load_initial().await?;
+            let policy: Place = RuntimeConfig::get().place;
+
+            // Per-model footprint and TP degree, both from the blob header.
+            let granularity = cuda.granularity()?;
+            let mut specs: Vec<ModelSpec> = Vec::with_capacity(models.len());
+            for (slug, dir, _) in &models {
+                let plan = plowrt::serve::manager::BlobPlan::from_dir_with_granularity(
+                    dir,
+                    Some(granularity),
+                )?;
+                specs.push(ModelSpec {
+                    slug: slug.clone(),
+                    tp: plowrt::serve::manager::tp_degree(dir)?,
+                    required: plan.tensor_total()
+                        + plowrt::serve::manager::DEFAULT_OVERHEAD
+                        + plowrt::serve::manager::RESERVE,
+                    device: None,
+                });
+            }
+
+            // `--pin slug@ordinal`. A pin naming a model this server does not
+            // serve is an error: it is almost always a typo, and honouring the
+            // rest of the pins while dropping that one places a model somewhere
+            // the operator did not ask for.
+            for (slug, ordinal) in placement::parse_pins(&RuntimeConfig::get().pin)
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?
+            {
+                match specs.iter_mut().find(|s| s.slug == slug) {
+                    Some(spec) => spec.device = Some(ordinal),
+                    None => {
+                        return Err(format!(
+                            "--pin {slug}@{ordinal} names a model this server does not serve"
+                        )
+                        .into())
+                    }
+                }
+            }
+
+            // Visible ordinals.
+            //
+            // `CUDA_VISIBLE_DEVICES` is applied by libcuda at `cuInit`, so the
+            // count below and every ordinal plowrt uses are ALREADY indices
+            // into the masked set — `--devices 1` means the second visible GPU,
+            // not physical GPU 1. That is the vendor's numbering and matching
+            // it is the point; the startup log prints both so the mapping is
+            // never something an operator has to infer.
+            let visible_count = cuda.device_count()?;
+            let mask = device::visibility::describe_env();
+            if !mask.is_empty() {
+                tracing::info!(
+                    visible_devices = ?mask,
+                    visible_count,
+                    "visible-device mask in force; every ordinal below indexes the MASKED set"
+                );
+            }
+
+            let configured = RuntimeConfig::get().devices.clone();
+            // Validate against the visible set BEFORE opening anything, so an
+            // out-of-range ordinal reads as what it is rather than as a device
+            // that would not initialise.
+            if let Some(&bad) = configured.iter().find(|&&d| d >= visible_count) {
+                let hint = if mask.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (a visible-device mask is in force: {mask:?})")
+                };
+                return Err(format!(
+                    "--devices names device {bad}, but only {visible_count} device(s) are \
+                     visible to this process{hint}"
+                )
+                .into());
+            }
+
+            // STRICTLY the requested set: `--devices 1` must not serve on GPU
+            // 0. The already-open probe backend is reused only if its ordinal
+            // is actually in that set.
+            let probe_ordinal = u32::from(cuda.device_ordinal);
+            let wanted = placement::requested_ordinals(&configured, visible_count);
+            let mut backends: Vec<(u32, Arc<device::cuda::CudaBackend>)> =
+                Vec::with_capacity(wanted.len());
+            for d in wanted {
+                if d == probe_ordinal {
+                    backends.push((d, Arc::clone(cuda)));
+                    continue;
+                }
+                match device::cuda::CudaBackend::new(d as u8) {
+                    Ok(b) => backends.push((d, Arc::new(b))),
+                    // Enumerated but not usable. Not a "that was the last one"
+                    // break any more: the count came from the driver, so this
+                    // is a real failure on a device we were told exists.
+                    Err(e) => {
+                        return Err(format!(
+                            "device {d} of {visible_count} visible will not open: {e}"
+                        )
+                        .into())
+                    }
+                }
+            }
+            let visible: Vec<u32> = backends.iter().map(|(d, _)| *d).collect();
+
+            let width = placement::grouping_width(&specs, visible.len())
+                .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
+            // Capacity is filled in per group below — a node's cards are not
+            // necessarily the same size, and using device 0's total for all of
+            // them either rejects a model that fits or places one on a card too
+            // small for it and fails at load.
+            let mut groups = placement::plan_groups(&visible, width, 0)
+                .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
+            for group in &mut groups {
+                let mut total_bytes = u64::MAX;
+                for ord in &group.ordinals {
+                    let be = backends
+                        .iter()
+                        .find(|(d, _)| d == ord)
+                        .map(|(_, b)| b)
+                        .expect("group ordinal came from the opened set");
+                    // A TP group is only as large as its smallest member.
+                    total_bytes = total_bytes.min(be.mem_info()?.1);
+                }
+                group.capacity = budget.map(|b| b.min(total_bytes)).unwrap_or(total_bytes);
+            }
+            let groups = groups;
+            let layout = placement::assign(&specs, &groups, policy)
+                .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
+
+            // One manager per group that received a model. A group's manager
+            // owns that group's backend, free-VRAM view, slab pool, LRU order
+            // and switch lock, so a load on one GPU never serializes behind a
+            // switch on another.
+            let mut managers = Vec::with_capacity(layout.groups.len());
+            for (g, group) in layout.groups.iter().enumerate() {
+                let members = layout.members(&specs, g);
+                let mine: Vec<(String, PathBuf, PathBuf)> = models
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| layout.assignment[*i] == g)
+                    .map(|(_, m)| m.clone())
+                    .collect();
+                // A group with no initial model still gets a manager. Skipping
+                // it left an idle GPU with nothing to address, so a later
+                // `POST /v1/models/load {"device": 1}` answered "no device group
+                // starts at ordinal 1" on a node with a perfectly free card.
+                tracing::info!(
+                    group = g,
+                    devices = ?group.ordinals,
+                    models = ?members,
+                    capacity_gib = group.capacity as f64 / (1u64 << 30) as f64,
+                    ?policy,
+                    "placement: group ready"
+                );
+                let be = backends
+                    .iter()
+                    .find(|(d, _)| *d == group.first())
+                    .map(|(_, b)| Arc::clone(b))
+                    .expect("group ordinal came from the opened set");
+                let mgr = Arc::new(plowrt::serve::manager::ModelManager::new(
+                    be, &state, mux_cfg, mine, budget,
+                )?);
+                let index = managers.len();
+                for slug in members {
+                    state.set_slug_group(slug, index);
+                }
+                managers.push(mgr);
+            }
+            state.install_managers(managers.clone());
+            // One co-tenant turn per group, installed before `load_initial`
+            // spawns the first dispatcher — a mux resolves its turn at spawn.
+            state.install_device_turns(layout.groups.len());
+            // Load each group's initial residents. Sequential: the loads are
+            // H2D-bound and share host bandwidth, so overlapping them buys
+            // little while making a failure harder to attribute.
+            for mgr in &managers {
+                mgr.load_initial().await?;
+            }
         }
     }
     #[cfg(not(feature = "cuda"))]
@@ -2620,8 +2859,13 @@ async fn bringup_runtime(
 
     // AMD/gfx950 engines. Deliberately NOT under the S1 `ModelManager`: that is
     // the multi-model residency planner (VRAM planning, co-residency, evict-LRU)
-    // and it is CUDA-only. An AMD serve is one model, loaded once, up for the
-    // life of the process — so the install is a straight loop here.
+    // and it is CUDA-only. Every bundle is loaded once and stays up for the life
+    // of the process, so the install is a straight loop here.
+    //
+    // Note that this loop DOES install an engine per bundle, and each opens
+    // ordinal 0 — so two AMD models genuinely do share one agent, with no
+    // planner accounting for it. `--co-sched rr` is the only ordering available
+    // to them until the manager grows an AMD backend.
     //
     // A bundle qualifies exactly as on the CUDA side: its assets dir carries a
     // PLOWDEV blob. It additionally needs the gfx950 code objects, whose dir is
@@ -2629,7 +2873,21 @@ async fn bringup_runtime(
     // the packet.
     #[cfg(feature = "hsa")]
     if vendor == Some(hwspec::Vendor::Amd) {
-        let slugs: Vec<String> = state.registry.slugs().map(str::to_string).collect();
+        let slugs: Vec<String> = state.registry.slugs();
+        // Count the bundles that will actually reach the AMD engine. The loop
+        // below skips any without a PLOWDEV blob, so counting every registered
+        // slug refused a serve that pairs one AMD bundle with a CPU-reference
+        // one — two models registered, but only ever one on the agent.
+        let mut co_resident = 0usize;
+        for slug in &slugs {
+            let bundle = state.registry.get(slug)?;
+            if plowrt::asset::devblob::DevBlob::find_in_dir(&bundle.dir)?.is_some() {
+                co_resident += 1;
+            }
+        }
+        if co_resident > 1 && cfg.co_sched != plowrt::serve::cosched::CoSched::Rr {
+            return Err("AMD co-resident models require --co-sched rr; separate HSA queues do not guarantee whole-grid residency".into());
+        }
         for slug in slugs {
             let bundle = state.registry.get(&slug)?;
             let Some(blob) = plowrt::asset::devblob::DevBlob::find_in_dir(&bundle.dir)? else {
@@ -2676,7 +2934,7 @@ async fn bringup_runtime(
     // interpreter. Same tokenizer refusal as the GPU paths.
     #[cfg(feature = "cpu")]
     if vendor.is_none() {
-        let slugs: Vec<String> = state.registry.slugs().map(str::to_string).collect();
+        let slugs: Vec<String> = state.registry.slugs();
         for slug in slugs {
             let bundle = state.registry.get(&slug)?;
             let Some(blob) = plowrt::asset::devblob::DevBlob::find_in_dir(&bundle.dir)? else {
@@ -2721,11 +2979,20 @@ async fn bringup_runtime(
         }
     }
 
+    // Backends other than the CUDA placement path serve ONE device set, so one
+    // turn covers it. A no-op when that path already installed the real group
+    // count. This is not CUDA-only for a reason: the AMD loop above installs an
+    // engine per bundle and each opens the same ROCr agent, so two AMD models
+    // on one card is a shape that already exists — and HSA has no
+    // cooperative-launch refusal to turn the resulting CU oversubscription into
+    // an error rather than a hang.
+    state.install_device_turns(1);
+
     // Spawn a per-model dispatcher: bucket-mux + arrival-rate batch formation.
     // Each dispatcher owns a Sender clone via AppState::mux(slug). Managed
     // (GPU) models are skipped — their dispatcher lifecycle belongs to the
     // manager (spawned on load, drained+removed on evict).
-    let slugs: Vec<String> = state.registry.slugs().map(str::to_string).collect();
+    let slugs: Vec<String> = state.registry.slugs();
     for slug in slugs {
         if managed_slugs.contains(&slug) {
             continue;
@@ -2782,11 +3049,7 @@ async fn bench(
     plowrt::serve::bench::validate_request_layout(&input, warmup_requests, requests)?;
     validate_token_audit_options(token_audit, &input, warmup_requests, requests, output_len)?;
     let state = bringup_runtime(vec![assets], executors, false, mux_cfg).await?;
-    let models = state
-        .registry
-        .slugs()
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
+    let models = state.registry.slugs();
     let [model] = models.as_slice() else {
         return Err(format!("bench requires exactly one model, loaded {}", models.len()).into());
     };
@@ -2971,7 +3234,7 @@ async fn serve(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let state = bringup_runtime(assets, executors, trace, mux_cfg).await?;
 
-    let router = app(state);
+    let router = app(Arc::clone(&state));
 
     // TCP listener: unchanged, always on.
     let tcp_addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
@@ -2985,7 +3248,7 @@ async fn serve(
     });
 
     // Optional UDS listener: bridged through hyper directly (axum 0.7's
-    // `serve` accepts only TcpListener). Same router as the TCP path.
+    // `serve` accepts only TcpListener). Also exposes privileged model control.
     let uds_task = if let Some(path) = socket {
         // Clear a stale socket (previous crashed instance left it behind).
         if path.exists() {
@@ -2997,10 +3260,10 @@ async fn serve(
         {
             use std::os::unix::fs::PermissionsExt;
             let perm = std::fs::Permissions::from_mode(0o600);
-            let _ = std::fs::set_permissions(&path, perm);
+            std::fs::set_permissions(&path, perm)?;
         }
         tracing::info!(socket = %path.display(), "plowrt serving OpenAI API over UDS");
-        let uds_router = router.clone();
+        let uds_router = router.clone().merge(plowrt::serve::admin_app(state));
         Some(tokio::spawn(async move {
             let svc = hyper_util::service::TowerToHyperService::new(uds_router);
             loop {

@@ -119,7 +119,7 @@ async fn device_fault_kills_engine_and_rejects_typed() {
     }
 
     let be = Arc::new(CudaBackend::new(0).expect("CUDA backend"));
-    let mut registry = Registry::new();
+    let registry = Registry::new();
     let slug = registry.load(assets.clone(), None).expect("load");
     let backend: Arc<dyn Backend> = Arc::clone(&be) as Arc<dyn Backend>;
     let execset = Arc::new(ExecutorSet::bringup(backend).expect("execset"));

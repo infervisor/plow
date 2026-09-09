@@ -33,7 +33,7 @@ fn setup_sweep(slug: &str, batches: &[i64]) -> Arc<AppState> {
 
     let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new(4));
     let execset = Arc::new(ExecutorSet::bringup(backend).unwrap());
-    let mut registry = Registry::new();
+    let registry = Registry::new();
     registry.load(&dir, None).unwrap();
     Arc::new(AppState::new(registry, execset))
 }
