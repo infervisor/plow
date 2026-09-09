@@ -11,9 +11,13 @@
 //! publishable. Two implementations could disagree, which is the hazard
 //! `exec/gpu.rs`'s pairing check already refuses on principle.
 
+pub mod fetch;
+pub mod pull;
 pub mod reference;
 pub mod store;
 
+pub use fetch::{transport, Fetch};
+pub use pull::{pull, Resolved, Transfer};
 pub use reference::Reference;
 pub use store::{Digest, Store};
 

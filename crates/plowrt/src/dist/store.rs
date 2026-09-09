@@ -166,7 +166,22 @@ impl Store {
                     "{name}: blob {digest} is not in the store — run `plowrt pull` first"
                 )));
             }
+            // A manifest is fetched over the network, so its file names are
+            // untrusted input: a `..` or an absolute path would write outside
+            // the bundle. Objects legitimately sit under `hsaco/`, so nested
+            // paths are allowed, but only downward.
+            if !is_safe_relative(name) {
+                return Err(RuntimeError::Device(format!(
+                    "{name}: a bundle file name must be a relative path with no `..` component"
+                )));
+            }
             let dst = dir.join(name);
+            if let Some(parent) = dst.parent() {
+                std::fs::create_dir_all(parent).map_err(|source| RuntimeError::Io {
+                    path: parent.to_path_buf(),
+                    source,
+                })?;
+            }
             if dst.exists() {
                 std::fs::remove_file(&dst).map_err(|source| RuntimeError::Io {
                     path: dst.clone(),
@@ -265,6 +280,15 @@ impl Store {
         }
         Ok((n, freed))
     }
+}
+
+/// A path that stays inside the bundle: relative, no `..`, no root, no prefix.
+fn is_safe_relative(name: &str) -> bool {
+    use std::path::Component;
+    !name.is_empty()
+        && std::path::Path::new(name)
+            .components()
+            .all(|c| matches!(c, Component::Normal(_)))
 }
 
 fn collect_pins(dir: &Path, prefix: &mut String, out: &mut Vec<(String, String)>) {

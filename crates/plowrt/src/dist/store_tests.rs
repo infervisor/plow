@@ -133,6 +133,32 @@ fn two_variants_sharing_a_packet_store_it_once() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+// Manifest file names arrive over the network, so they are untrusted input.
+// Objects legitimately live under `hsaco/`, so nesting is allowed — downward only.
+#[test]
+fn a_bundle_file_name_may_nest_but_never_escape() {
+    let (s, root) = store("nesting");
+    let obj = b"an elf".to_vec();
+    let d = Digest::of(&obj);
+    s.put(&d, &obj).unwrap();
+
+    let dir = s
+        .materialize("v", &[("hsaco/interp_decode.elf".into(), d.clone())])
+        .unwrap();
+    assert_eq!(
+        std::fs::read(dir.join("hsaco/interp_decode.elf")).unwrap(),
+        obj
+    );
+
+    for bad in ["../escape", "/etc/passwd", "a/../../b", ""] {
+        assert!(
+            s.materialize("v", &[(bad.into(), d.clone())]).is_err(),
+            "accepted {bad:?}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[test]
 fn materializing_a_missing_blob_names_the_fix() {
     let (s, root) = store("missing");
@@ -148,38 +174,38 @@ fn materializing_a_missing_blob_names_the_fix() {
 #[test]
 fn pins_are_recorded_listed_and_removed() {
     let (s, root) = store("pins");
-    assert_eq!(s.pinned("dist.plow.dev/infervisor/kimi-k3"), None);
-    s.pin("dist.plow.dev/infervisor/kimi-k3", "variant-a")
+    assert_eq!(s.pinned("dist.infervisor.ai/infervisor/kimi-k3"), None);
+    s.pin("dist.infervisor.ai/infervisor/kimi-k3", "variant-a")
         .unwrap();
-    s.pin("dist.plow.dev/acme/other", "variant-b").unwrap();
+    s.pin("dist.infervisor.ai/acme/other", "variant-b").unwrap();
     assert_eq!(
-        s.pinned("dist.plow.dev/infervisor/kimi-k3").as_deref(),
+        s.pinned("dist.infervisor.ai/infervisor/kimi-k3").as_deref(),
         Some("variant-a")
     );
     assert_eq!(
         s.pins(),
         vec![
             (
-                "dist.plow.dev/acme/other".to_string(),
+                "dist.infervisor.ai/acme/other".to_string(),
                 "variant-b".to_string()
             ),
             (
-                "dist.plow.dev/infervisor/kimi-k3".to_string(),
+                "dist.infervisor.ai/infervisor/kimi-k3".to_string(),
                 "variant-a".to_string()
             ),
         ]
     );
     // Re-pinning moves it; that is what `upgrade` does.
-    s.pin("dist.plow.dev/infervisor/kimi-k3", "variant-c")
+    s.pin("dist.infervisor.ai/infervisor/kimi-k3", "variant-c")
         .unwrap();
     assert_eq!(
-        s.pinned("dist.plow.dev/infervisor/kimi-k3").as_deref(),
+        s.pinned("dist.infervisor.ai/infervisor/kimi-k3").as_deref(),
         Some("variant-c")
     );
-    s.unpin("dist.plow.dev/infervisor/kimi-k3").unwrap();
-    assert_eq!(s.pinned("dist.plow.dev/infervisor/kimi-k3"), None);
+    s.unpin("dist.infervisor.ai/infervisor/kimi-k3").unwrap();
+    assert_eq!(s.pinned("dist.infervisor.ai/infervisor/kimi-k3"), None);
     // Unpinning what is not pinned is not an error.
-    assert!(s.unpin("dist.plow.dev/infervisor/kimi-k3").is_ok());
+    assert!(s.unpin("dist.infervisor.ai/infervisor/kimi-k3").is_ok());
     let _ = std::fs::remove_dir_all(root);
 }
 

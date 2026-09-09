@@ -62,6 +62,11 @@ futures = "0.3"
 tokenizers = { version = "0.20", optional = true }
 safetensors = { version = "0.4", optional = true }
 hf-hub = { workspace = true, optional = true }
+# Asset distribution (`dist` feature): an HTTP client for the registry and zstd
+# for the transport codec. Deliberately optional — `serve` performs no network
+# I/O, and CI asserts no HTTP/TLS crate is present in the serve-only feature set.
+ureq = { version = "2", default-features = false, features = ["tls", "gzip"], optional = true }
+zstd = { version = "0.13", optional = true }
 # Runtime `dlopen` of the driver libs (see `device::cuda`/`device::hsa`): the
 # static binary carries no link-time GPU dependency, and NVIDIA + AMD libs can be
 # loaded side-by-side in one process (distinct `cu*` / `hsa_*` symbol namespaces).
@@ -102,6 +107,11 @@ ane = ["metal", "dep:objc2-core-ml"]
 hf-tokenizer = ["dep:tokenizers"]
 # Real HF tokenizer + safetensors weight loading + hub downloads.
 hub = ["hf-tokenizer", "dep:safetensors", "dep:hf-hub"]
+# Fetch compiled assets from a registry: `pull`, `load`, `upgrade`, `search`.
+# `hf-hub` joins it because `load` also resolves the checkpoint, which the
+# distribution never carries — weights always come from HuggingFace or a local
+# directory.
+dist = ["dep:ureq", "dep:zstd", "dep:hf-hub", "hf-tokenizer"]
 # CUDA driver-API backend. The driver lib is `dlopen`ed at runtime (no link-time
 # `-lcuda`), so the binary stays static except for libcuda. Pulls safetensors:
 # a GPU serve is meaningless without real checkpoint weights (`exec::gpu`) —
