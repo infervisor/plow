@@ -91,10 +91,72 @@ the tested path. The measured difference does not establish that replacing
 intrinsics with inline assembly alone would help: work decomposition, selected
 KV traffic and instruction scheduling differ together.
 
-The useful next integration is a per-query sparse arm using this assembly
-object or an equivalent native kernel, qualified with actual model selections.
-Retain the union path where selection reuse wins. The adapter demonstrates the
-layout conversion and numerical boundary before modifying serving dispatch.
+## Native ABI and actual model capture
+
+`native.hip` launches the pinned assembly object directly and reduces its two
+FP32 splits. Its 320-byte argument layout is object-specific; the runner refuses
+a different SHA256. The native reduction writes a normalized FP32 partial and
+`(m,l)=(0,1)` for each head, matching the existing one-split merge/fold contract.
+Torch still owns benchmark buffers and event timing; the native adapter's GPU
+path is two packing kernels, assembly attention and native FP32 reduction.
+
+```sh
+"$PLOW_HIPCC" --offload-arch=gfx942 -O3 -w -std=c++17 -fPIC \
+  -c "$bench/native.hip" -o /tmp/mla-native.o
+c++ -shared /tmp/mla-native.o -L"$ROCM_PATH/lib" \
+  -Wl,-rpath,"$ROCM_PATH/lib" -lamdhip64 -o /tmp/mla-native.so
+perf-data/tools/gpulease -n 1 mla-native python "$bench/compare.py" \
+  --library /tmp/mla-compare.so --native-library /tmp/mla-native.so \
+  --out /tmp/mla-native.json --rows 1 129 8192
+```
+
+All nine [native synthetic cells](mi300x-native-results.json) passed the sampled FP32 oracle and finite-output
+check, including a ragged pack. The normalizer contract is checked everywhere.
+
+The actual-model capture uses GLM layer 77 after 67,584 deterministic random
+prompt tokens, with the last 2,048 query rows, TP8, B1, context capacity 81,920,
+and all 78 sparse layers enabled. The shared layer uses layer 74's selected
+indices. Its mean 8-query union is **3,902.8**, much smaller than the synthetic
+distinct-selection case. This is a model-tensor capture, not the vLLM workload.
+The model attention scale is **0.0625**, supplied explicitly.
+
+The B1 bundle was emitted with `--emit-decode-batch-ladder 1
+--emit-packed-prefill=false`, replaying the all-layer sparse TP8 `build.json`.
+Its layer-77 attention is segment 155. To capture from this exact bundle, create
+`/tmp/mla-capture` and run the existing prefill sweep with:
+
+```sh
+export PLOW_PF_CAPTURE='2048:155:act.iidx_pf=/tmp/mla-capture/idx.bin,act.qa=/tmp/mla-capture/qa.bin,act.qr=/tmp/mla-capture/qr.bin,in.kvlen=/tmp/mla-capture/len.bin,kv.77.ckv=/tmp/mla-capture/ck.bin,kv.77.krot=/tmp/mla-capture/kr.bin'
+# Add to the TP8 plowrt bench invocation for the B1 bundle:
+# --prefill-sweep --prefill-lengths 67584 --prefill-reps 1 --prefill-warmups 0
+perf-data/tools/gpulease -n 1 mla-capture python "$bench/compare.py" \
+  --library /tmp/mla-compare.so --native-library /tmp/mla-native.so \
+  --capture /tmp/mla-capture --rows 2048 --scale 0.0625 \
+  --out /tmp/mla-model.json
+```
+
+The runner validates unique causal indices, hashes all six capture files, and
+reads only the live query prefix. Raw tensors total 226 MiB and are not committed.
+The final repeated measurement is recorded in
+[mi300x-model-results.json](mi300x-model-results.json):
+
+| Path | ms | Sampled relative L2 vs FP32 |
+|---|---:|---:|
+| Plow attention + normalization | 0.920 | 0.000166 |
+| AITER Python adapter, including packing | 0.662 | 0.001774 |
+| Native FP32 adapter, including packing | 0.652 | 0.000553 |
+
+Native adapter latency is **29.1% lower** for this captured layer/chunk. Union
+construction is separately 0.200 ms; packing the entire KV cache is included in
+both adapter times. The reducer uses aligned float4 accesses to share its softmax weights across
+four columns; the scalar reducer measured 0.670 ms including the adapter.
+Neither measurement establishes a serving improvement or full-model quality.
+
+Production integration still needs HSA dispatch, workspace lifetime, early
+chunks with fewer than 2048 causal keys, KV-slot rebasing and ragged rows. A raw
+assembly replacement must also preserve or explicitly remove cross-segment
+counter edges; HSA queue ordering alone does not publish interpreter counters.
+Retain the union path where selection reuse wins.
 
 Primary sources:
 

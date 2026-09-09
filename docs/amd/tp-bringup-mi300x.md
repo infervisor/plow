@@ -2090,8 +2090,9 @@ benchmark prototype; production dispatch is unchanged.
 The isolated gain depends on selection overlap and index order. Packing costs
 do not erase the distinct-selection advantage. Shared-indexer layers amortize
 plow's union construction, so its separate cost cannot be charged on every layer.
-Model selection captures and the merge/fold boundary still need qualification
-before using the assembly arm in serving. The installed AITER automatic
+An actual layer-77 capture and a native FP32 split reducer now qualify the
+isolated merge/fold output contract; production dispatch and model-level quality
+still need qualification. The installed AITER automatic
 single-split path produced NaNs and a GPU memory fault; the benchmark fixes two
 splits. This failure is not attributed to a proven root cause.
 
@@ -2113,6 +2114,32 @@ Sources inspected: [AITER MLA](https://github.com/ROCm/aiter/blob/10f8874dc2cd69
 and [AMD workload guidance](https://rocm.docs.amd.com/projects/ai-ecosystem/en/latest/optimization/workload-optimization.html).
 AITER source review is pinned to `10f8874dc2cd69c07ed84b5f125c27d12baccb10`;
 measurements use the installed `amd-aiter 0.1.19` object identified in the comparison.
+
+### Actual MLA capture and matched grouped MoE
+
+At GLM layer 77, the last 2048 queries of a 67,584-token deterministic prefill
+have a mean 8-query union of **3902.8**. The native AITER adapter, including
+packing Q and the entire KV cache plus FP32 split reduction, measured
+**0.652 ms vs plow's 0.920 ms**: 29.1% lower kernel latency. Sampled relative
+L2 vs an independent FP32 oracle was 0.000553 vs plow's 0.000166. The native
+launcher pins the assembly object by hash and writes `(m,l)=(0,1)` with its
+normalized partial. All nine native synthetic cells also passed. See the
+[MLA capture and ABI record](../../runtime/bench/amd/mla_sparse_aiter/README.md#native-abi-and-actual-model-capture).
+
+The [matched grouped MoE benchmark](../../runtime/bench/amd/moe_aiter/README.md)
+now includes activation quantization, sorting and combine. At 8192 tokens and
+the actual TP8 expert width 256, plow measured **4.732 ms**, AITER assembly
+**2.640 ms**, and AITER two-stage CK **2.439 ms**. Assembly wins at 128/2048
+tokens; CK wins at 8192. Inputs have numerically identical OCP/FNUZ weights and
+independently varying 128x128 block scales. Preshuffling is outside timing.
+All nine cells passed their explicit screening thresholds, but AITER's sampled
+relative L2 was **4.06–4.37%**, vs plow's **0.23–0.24%**. Its additional FP8
+activation quantization needs actual-model quality checks before adoption.
+
+Neither result is a serving speedup. The native MLA route still needs HSA
+dispatch and correct counter edges, early causal rows, ragged rows and KV-slot
+rebasing. MoE additionally changes activation precision. These measured
+boundaries support native integration work, not an unqualified ASM rewrite.
 
 ### Corrected GEMM ceiling and FP8 assumptions
 
