@@ -4,6 +4,12 @@
  * Online softmax runs per element here (the GPU runs it per 32-row tile); the rounding differs
  * in f32 only. P is rounded to bf16 before PV in prefill (MFMA operand), kept f32 in decode. */
 #include "golden.h"
+#include "../fp8_common.h"
+
+static float kv_value(const plow_bf16* data, const float* scales, size_t row, uint32_t D, uint32_t d) {
+    return scales ? plow_e4m3_to_f32(((const uint8_t*)data)[row * D + d]) * scales[row]
+                  : plow_bf2f(data[row * D + d]);
+}
 
 #define FA_BQ_TILE 128u /* query rows per work item: 4 waves x FA_BQ (the Gemma flash object) */
 #define FA_BKV 32u
@@ -20,6 +26,9 @@ G_K(g_flash_prefill) {
     const plow_bf16* Q = PLOW_CPU_TEN(in, T, 2);
     const plow_bf16* K = PLOW_CPU_TEN(in, T, 3);
     const plow_bf16* V = PLOW_CPU_TEN(in, T, 4);
+    const int fp8 = in->op == PLOW_DOP_FLASH_PREFILL_FP8;
+    const float* ks = fp8 ? PLOW_CPU_TEN(in, T, 6) : NULL;
+    const float* vs = fp8 ? PLOW_CPU_TEN(in, T, 7) : NULL;
     plow_bf16* O_final = PLOW_CPU_TEN(in, T, 5);
     const uint32_t n_q = in->i[0], n_kv = in->i[1], n_head = in->i[2], n_kv_head = in->i[3];
     const uint32_t q_pos0 = in->i[4], window = in->i[5], D = in->i[6];
@@ -47,8 +56,6 @@ G_K(g_flash_prefill) {
         const uint32_t my_lo = kv_lo + sp * per * FA_BKV;
         uint32_t my_hi = kv_lo + (sp + 1) * per * FA_BKV;
         if (my_hi > kv_end) my_hi = kv_end;
-        const plow_bf16* kbase = K + (size_t)hkv * kv_stride * D;
-        const plow_bf16* vbase = V + (size_t)hkv * kv_stride * D;
 
         for (uint32_t qi = q_base; qi < q_base + FA_BQ_TILE && qi < n_q; qi++) {
             const plow_bf16* q = Q + ((size_t)qi * n_head + h) * D;
@@ -57,17 +64,16 @@ G_K(g_flash_prefill) {
             memset(acc, 0, sizeof(float) * D);
             for (uint32_t kg = my_lo; kg < my_hi; kg++) {
                 if (!(kg < n_kv && kg <= qg && (!window || qg - kg < window))) continue;
-                const plow_bf16* kr = kbase + (size_t)(kg & kv_mask) * D;
-                const plow_bf16* vr = vbase + (size_t)(kg & kv_mask) * D;
+                const size_t row = (size_t)hkv * kv_stride + (kg & kv_mask);
                 float s = 0.0f;
-                for (uint32_t d = 0; d < D; d++) s += plow_bf2f(q[d]) * plow_bf2f(kr[d]);
+                for (uint32_t d = 0; d < D; d++) s += plow_bf2f(q[d]) * kv_value(K, ks, row, D, d);
                 s *= scale;
                 const float mnew = m > s ? m : s;
                 const float corr = m == G_NEG_INF ? 0.0f : expf(m - mnew);
                 const float pe = plow_bf2f(plow_f2bf(expf(s - mnew)));
                 l = l * corr + pe;
                 m = mnew;
-                for (uint32_t d = 0; d < D; d++) acc[d] = acc[d] * corr + pe * plow_bf2f(vr[d]);
+                for (uint32_t d = 0; d < D; d++) acc[d] = acc[d] * corr + pe * kv_value(V, vs, row, D, d);
             }
             if (nsplit == 1u && O_final) {
                 const float inv = l > 0.0f ? 1.0f / l : 0.0f;
@@ -95,6 +101,9 @@ G_K(g_flash_decode) {
     const plow_bf16* Q = PLOW_CPU_TEN(in, T, 2);
     const plow_bf16* K = PLOW_CPU_TEN(in, T, 3);
     const plow_bf16* V = PLOW_CPU_TEN(in, T, 4);
+    const int fp8 = in->op == PLOW_DOP_FLASH_DECODE_FP8;
+    const float* ks = fp8 ? PLOW_CPU_TEN(in, T, 6) : NULL;
+    const float* vs = fp8 ? PLOW_CPU_TEN(in, T, 7) : NULL;
     const int32_t* kv_len = PLOW_CPU_TEN(in, T, 5);
     const int nrf = (in->i[1] & 0x10000u) != 0;
     const uint32_t n_batch = nrf ? (in->i[0] & 0xFFu) : in->i[0];
@@ -121,8 +130,6 @@ G_K(g_flash_decode) {
         const uint32_t first = (window && len > window) ? len - window : 0u;
         const uint32_t span = len - first, per = (span + nsplit - 1) / nsplit;
         const uint32_t lo = first + sp * per, hi = lo + per < len ? lo + per : len;
-        const plow_bf16* kbase = K + ((size_t)b * n_kv_head + hkv) * kv_stride * D;
-        const plow_bf16* vbase = V + ((size_t)b * n_kv_head + hkv) * kv_stride * D;
 
         for (uint32_t h = h0; h < h0 + gf && h < n_head; h++) {
             float* op = Opart + ((size_t)(b * n_head + h) * nsplit + sp) * D;
@@ -138,17 +145,16 @@ G_K(g_flash_decode) {
             memset(acc, 0, sizeof(float) * D);
             for (uint32_t kv = lo; kv < hi; kv++) {
                 if (!(kv <= qpos && (!window || qpos - kv < window))) continue;
-                const plow_bf16* kr = kbase + (size_t)(kv & kv_mask) * D;
-                const plow_bf16* vr = vbase + (size_t)(kv & kv_mask) * D;
+                const size_t row = ((size_t)b * n_kv_head + hkv) * kv_stride + (kv & kv_mask);
                 float s = 0.0f;
-                for (uint32_t d = 0; d < D; d++) s += plow_bf2f(kr[d]) * plow_bf2f(q[d]);
+                for (uint32_t d = 0; d < D; d++) s += kv_value(K, ks, row, D, d) * plow_bf2f(q[d]);
                 s *= scale;
                 const float mnew = m > s ? m : s;
                 const float corr = m == G_NEG_INF ? 0.0f : expf(m - mnew);
                 const float pe = expf(s - mnew);
                 l = l * corr + pe;
                 m = mnew;
-                for (uint32_t d = 0; d < D; d++) acc[d] = acc[d] * corr + pe * plow_bf2f(vr[d]);
+                for (uint32_t d = 0; d < D; d++) acc[d] = acc[d] * corr + pe * kv_value(V, vs, row, D, d);
             }
             memcpy(op, acc, sizeof(float) * D);
             ml[0] = m;

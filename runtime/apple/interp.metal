@@ -53,6 +53,22 @@ inline float rbf(float f) { return bf2f(f2bf(f)); }
 constant float E4M3_REBIAS = 0x1p120f;
 inline float e4m3_raw(uint c) { return as_type<float>(((c & 0x7Fu) << 20) | ((c & 0x80u) << 24)); }
 inline float e4m3(uint c) { return e4m3_raw(c) * E4M3_REBIAS; }
+inline uchar f2e4m3(float x) {
+    uint u = as_type<uint>(x), sign = (u >> 24) & 0x80u;
+    u &= 0x7fffffffu;
+    if (u > 0x7f800000u) return uchar(sign | 0x7fu);
+    float v = as_type<float>(u);
+    if (v >= 448.0f) return uchar(sign | 0x7eu);
+    if (v < 0x1p-6f) return uchar(sign | uint(rint(v * 512.0f)));
+    u += 0x7ffffu + ((u >> 20) & 1u);
+    return uchar(sign | ((u - 0x3c000000u) >> 20));
+}
+inline float e4m3_exact(uint c) {
+    uint mag = c & 0x7fu;
+    float v = mag < 8u ? float(mag) * 0x1p-9f
+        : (mag == 0x7fu ? NAN : as_type<float>((mag << 20) + 0x3c000000u));
+    return (c & 0x80u) ? -v : v;
+}
 inline float4 e4m3x4_raw(uchar4 c) {
     uint4 u = uint4(c);
     return as_type<float4>(((u & 0x7Fu) << 20) | ((u & 0x80u) << 24));
@@ -403,6 +419,8 @@ void op_gemv_glu_fp8(const thread Inst& in, device const ulong* tab, uint slice,
 // or e4m3 (per-column scale in the epilogue); GLU shares the machinery on 64x32 sub-tiles.
 struct GemmArgs {
     device const ushort* A;      // [M][K] bf16 (row m offset applied by caller)
+    device const uchar* A8;
+    device const float* ascale;
     device const ushort* B16;    // [N][K] bf16, or
     device const uchar* B8;      //          e4m3, or
     device const uchar* B4;      //          e2m1 packed (row stride K/2) with
@@ -419,6 +437,7 @@ struct GemmArgs {
     uint rs, ro;                 // B row of output n = n*rs + ro
 };
 inline void gemm_args_reset(thread GemmArgs& g) {
+    g.A8 = (device const uchar*)0; g.ascale = (device const float*)0;
     g.B16 = (device const ushort*)0; g.B8 = (device const uchar*)0; g.B4 = (device const uchar*)0;
     g.S8 = (device const uchar*)0; g.wscale = (device const float*)0; g.bias = (device const ushort*)0;
     g.arow = (device const uint*)0; g.Cf = (device float*)0; g.crow = (device const uint*)0;
@@ -433,6 +452,7 @@ inline void epilogue8x8(simdgroup_float8x8 acc, threadgroup float* scratch, uint
         uint m = m_base + e / 8u, n = n_base + e % 8u;
         if (m < m1 && n < n1) {
             float v = scratch[e];
+            if (g.ascale) v *= g.ascale[m];
             if (g.B8) v *= g.wscale[n];
             if (g.bias) v += bf2f(g.bias[n * g.rs + g.ro]);
             if (g.rowscale) v *= g.rowscale[m];
@@ -587,6 +607,12 @@ inline ushort4 load_arow(thread const GemmArgs& g, uint m, uint k) {
     if (m >= g.M) return ushort4(0);
     uint r = g.arow ? g.arow[m] : m;
     if (r == 0xffffffffu) return ushort4(0);
+    if (g.A8) {
+        ushort4 v = ushort4(0);
+        for (uint j = 0; j < 4u && k + j < g.K; j++)
+            v[j] = f2bf(e4m3_exact(g.A8[r * g.K + k + j]));
+        return v;
+    }
     return load_a16(g.A, 0xffffffffu, g.K, r, k);
 }
 inline ushort4 load_b16(thread const GemmArgs& g, uint n, uint k) {
@@ -607,6 +633,11 @@ inline ushort4 load_b16(thread const GemmArgs& g, uint n, uint k) {
             uchar c = g.B4[n * (K / 2u) + ((k + j) >> 1)];
             v[j] = f2bf(E2M1[((k + j) & 1u) ? (c >> 4) : (c & 15u)] * s);
         }
+        return v;
+    }
+    if (g.A8 && g.B8) {
+        ushort4 v = ushort4(0);
+        for (uint j = 0; j < 4u && k + j < K; j++) v[j] = f2bf(e4m3_exact(g.B8[n * K + k + j]));
         return v;
     }
     if ((K & 3u) == 0u)
@@ -777,6 +808,7 @@ inline void gemm_sub_glu(thread const GemmArgs& gg, thread const GemmArgs& gu, d
                 uint m = mb + e / 8u, n = nb + e % 8u;
                 if (m >= m1 || n >= n1) continue;
                 float gv = scratch[e], uv = scratch[64u + e];
+                if (gg.ascale) { gv *= gg.ascale[m]; uv *= gg.ascale[m]; }
                 if (fp8) { gv *= gg.wscale[n]; uv *= gu.wscale[n]; }
                 if (gg.bias) gv += bf2f(gg.bias[n * gg.rs + gg.ro]);
                 if (gu.bias) uv += bf2f(gu.bias[n * gu.rs + gu.ro]);
@@ -802,7 +834,7 @@ inline void gemm_tile2_glu(thread const GemmArgs& gg, thread const GemmArgs& gu,
     }
 }
 // t0=C t1=A t2=B t7=bias?  i0=M i1=N i2=K i4=a_row0 i5=c_row0   (bf16)
-// t0=C t1=A t2=B(e4m3) t3=a_scale? t4=w_scale i0=M i1=N i2=K i4=a_row0 i5=c_row0 (fp8; a_scale -> poison)
+// t0=C t1=A t2=B(e4m3) t3=a_scale? t4=w_scale i0=M i1=N i2=K i4=a_row0 i5=c_row0
 // enc: 0 = bf16 weights, 1 = e4m3 + per-channel f32 scale (t4), 2 = MXFP4 (t3 = E8M0 scales)
 void op_gemm(const thread Inst& in, device const ulong* tab, uint slice, uint nblk, uint BM, uint BN, uint enc,
              threadgroup float* tile, uint lid, uint sg, uint lane) {
@@ -812,6 +844,10 @@ void op_gemm(const thread Inst& in, device const ulong* tab, uint slice, uint nb
     GemmArgs g;
     gemm_args_reset(g);
     g.A = ten<ushort>(tab, in, 1) + in.i[4] * K;
+    if (fp8 && ten<float>(tab, in, 3)) {
+        g.A8 = ten<uchar>(tab, in, 1) + in.i[4] * K;
+        g.ascale = ten<float>(tab, in, 3) + in.i[4];
+    }
     g.B16 = enc == 0u ? ten<ushort>(tab, in, 2) : (device const ushort*)0;
     g.B8 = fp8 ? ten<uchar>(tab, in, 2) : (device const uchar*)0;
     g.B4 = mx4 ? ten<uchar>(tab, in, 2) : (device const uchar*)0;
@@ -819,7 +855,7 @@ void op_gemm(const thread Inst& in, device const ulong* tab, uint slice, uint nb
     g.wscale = fp8 ? ten<float>(tab, in, 4) : (device const float*)0;
     g.bias = enc == 0u ? ten<ushort>(tab, in, 7) : (device const ushort*)0;
     g.K = K; g.M = M; g.N = N;
-    bool poison = (fp8 && (ten<float>(tab, in, 3) != 0 || !g.wscale)) || (mx4 && !g.S8);
+    bool poison = (fp8 && !g.wscale) || (mx4 && !g.S8);
     // The small tile op narrows to 64 columns only when 128-wide tiles would leave executors
     // idle (a 64-wide sub-tile halves the matrix work per simdgroup, so it must buy parallelism).
     if (BM == 64u && BN == 64u) {
@@ -861,6 +897,8 @@ void op_gemm_glu(const thread Inst& in, device const ulong* tab, uint slice, uin
     if (fp8) {
         gg.B8 = ten<uchar>(tab, in, 2); gu.B8 = ten<uchar>(tab, in, 5);
         gg.wscale = ten<float>(tab, in, 4); gu.wscale = ten<float>(tab, in, 6);
+        gg.ascale = gu.ascale = ten<float>(tab, in, 3);
+        if (gg.ascale) gg.A8 = gu.A8 = ten<uchar>(tab, in, 1);
     } else if (mx4) {
         gg.B4 = ten<uchar>(tab, in, 2); gu.B4 = ten<uchar>(tab, in, 5);
         gg.S8 = ten<uchar>(tab, in, 3); gu.S8 = ten<uchar>(tab, in, 4);
@@ -868,7 +906,7 @@ void op_gemm_glu(const thread Inst& in, device const ulong* tab, uint slice, uin
         gg.B16 = ten<ushort>(tab, in, 2); gu.B16 = ten<ushort>(tab, in, 5);
         gg.bias = ten<ushort>(tab, in, 6); gu.bias = ten<ushort>(tab, in, 7);
     }
-    bool poison = (fp8 && (ten<float>(tab, in, 3) != 0 || !gg.wscale || !gu.wscale)) || (mx4 && (!gg.S8 || !gu.S8));
+    bool poison = (fp8 && (!gg.wscale || !gu.wscale)) || (mx4 && (!gg.S8 || !gu.S8));
     const uint BM = 256, BN = 128;
     uint tm = (M + BM - 1) / BM, tn = (N + BN - 1) / BN;
     for (uint lin = slice; lin < tm * tn; lin += nblk) {
@@ -883,8 +921,45 @@ void op_gemm_glu(const thread Inst& in, device const ulong* tab, uint slice, uin
     }
 }
 
+inline float tg_max(float v, threadgroup float* red, uint lid, uint sg, uint lane) {
+    v = simd_max(v);
+    if (lane == 0) red[sg] = v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float s = 0.0f;
+    for (uint k = 0; k < NSG; k++) s = max(s, red[k]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return s;
+}
+inline void quant_row(device const ushort* x, device uchar* q, device float* scale, uint K,
+                      threadgroup float* red, uint lid, uint sg, uint lane) {
+    float amax = 0.0f;
+    for (uint k = lid; k < K; k += NT) amax = max(amax, abs(bf2f(x[k])));
+    float s = max(tg_max(amax, red, lid, sg, lane) * (1.0f / 448.0f), 1e-12f);
+    if (lid == 0) *scale = s;
+    for (uint k = lid; k < K; k += NT) q[k] = f2e4m3(bf2f(x[k]) * (1.0f / s));
+}
+void op_quant_fp8(const thread Inst& in, device const ulong* tab, uint slice, uint nblk,
+                  threadgroup float* red, uint lid, uint sg, uint lane) {
+    device uchar* q = ten<uchar>(tab, in, 0);
+    device ushort* x = ten<ushort>(tab, in, 1);
+    device float* scales = ten<float>(tab, in, 2);
+    device const ushort* gate = ten<ushort>(tab, in, 3);
+    device const ushort* up = ten<ushort>(tab, in, 4);
+    uint K = in.i[1], lo, hi;
+    range(in.i[0], slice, nblk, lo, hi);
+    for (uint m = lo; m < hi; m++) {
+        ulong row = ulong(m) * K;
+        if (gate) {
+            for (uint k = lid; k < K; k += NT)
+                x[row + k] = f2bf(act_gate_only(bf2f(gate[row + k]), in.i[2]) * bf2f(up[row + k]));
+            threadgroup_barrier(mem_flags::mem_device);
+        }
+        quant_row(x + row, q + row, scales + m, K, red, lid, sg, lane);
+    }
+}
+
 // ---- norms (rows = slice axis; whole threadgroup per row) ------------------------------------------
-// t0=out t1=x t2=gamma? (t3 -> poison)  i0=rows i1=feat i2=out_row0  f0=eps
+// t0=out t1=x t2=gamma? t3=quant? t4=scale? i0=rows i1=feat i2=out_row0 f0=eps
 void op_rmsnorm(const thread Inst& in, device const ulong* tab, uint slice, uint nblk, threadgroup float* red,
                 uint lid, uint sg, uint lane) {
     device ushort* out = ten<ushort>(tab, in, 0);
@@ -896,7 +971,6 @@ void op_rmsnorm(const thread Inst& in, device const ulong* tab, uint slice, uint
     for (uint row = slice; row < rows; row += nblk) {
         device const ushort* xr = x + row * feat;
         device ushort* o = out + (out_row0 + row) * feat;
-        if (quant) { for (uint i = lid; i < feat; i += NT) o[i] = ushort(0x7fc1); continue; }
         float ss = 0.0f;
         for (uint i = lid; i < feat; i += NT) { float v = bf2f(xr[i]); ss += v * v; }
         ss = tg_sum(ss, red, lid, sg, lane);
@@ -904,6 +978,11 @@ void op_rmsnorm(const thread Inst& in, device const ulong* tab, uint slice, uint
         for (uint i = lid; i < feat; i += NT) {
             float g = gamma ? bf2f(gamma[i]) : 1.0f;
             o[i] = f2bf(bf2f(xr[i]) * inv * g);
+        }
+        if (quant) {
+            threadgroup_barrier(mem_flags::mem_device);
+            quant_row(o, ten<uchar>(tab, in, 3) + row * feat, ten<float>(tab, in, 4) + row,
+                      feat, red, lid, sg, lane);
         }
     }
 }
@@ -989,6 +1068,7 @@ void op_norm_residual_norm(const thread Inst& in, device const ulong* tab, uint 
 // ---- HEADNORM_ROPE: (token, head) items packed 8 per workgroup, one simdgroup each ----------------
 // t0=out t1=x t2=gamma? t3=cos? t4=sin? t5=pos(i32)?
 // i0=ntok i1=nhead i2=hd i3=out_row0 i4=skip_norm i5=rope_form i6=n_batch_kv  f0=eps fj1=out_stride fj2=kv_mask
+template <bool FP8>
 void op_headnorm_rope(const thread Inst& in, device const ulong* tab, uint slice, uint nblk, uint sg, uint lane) {
     device ushort* out = ten<ushort>(tab, in, 0);
     device const ushort* x = ten<ushort>(tab, in, 1);
@@ -1041,7 +1121,17 @@ void op_headnorm_rope(const thread Inst& in, device const ulong* tab, uint slice
             }
             for (uint j = 0; j < per; j++) v[j] = r[j];
         }
-        for (uint j = 0; j < per; j++) out[obase + lane + 32u * j] = f2bf(v[j]);
+        if (FP8) {
+            float amax = 0.0f;
+            for (uint j = 0; j < per; j++) amax = max(amax, abs(v[j]));
+            amax = simd_max(amax);
+            float s = amax * (1.0f / 448.0f), inv = amax > 0.0f ? 448.0f / amax : 0.0f;
+            if (lane == 0) ten<float>(tab, in, 6)[obase / hd] = s;
+            for (uint j = 0; j < per; j++)
+                ten<uchar>(tab, in, 0)[obase + lane + 32u * j] = f2e4m3(v[j] * inv);
+        } else {
+            for (uint j = 0; j < per; j++) out[obase + lane + 32u * j] = f2bf(v[j]);
+        }
     }
 }
 
@@ -1117,7 +1207,141 @@ constant uint FA_BQ_TILE = 128, FA_BKV = 32, FA_GF = 2;
 
 // Online-softmax accumulation of one query against KV rows [lo, hi) (validity by caller's predicate).
 // q/acc are per-lane slices: element d = lane + 32*j. Returns (m, l) via refs.
-inline void attend_rows(device const ushort* q, device const ushort* kbase, device const ushort* vbase,
+inline float kv_value(device const ushort* row, device const float* scales, uint r, uint d) { return bf2f(row[d]); }
+inline float kv_value(device const uchar* row, device const float* scales, uint r, uint d) { return e4m3_exact(row[d]) * scales[r]; }
+inline ushort kv_raw(device const ushort* row, uint d) { return row[d]; }
+inline ushort kv_raw(device const uchar* row, uint d) { return f2bf(e4m3_exact(row[d])); }
+
+template <uint D, typename KV>
+void flash_prefill_tile(const thread Inst& in, device const ulong* tab, uint slice, uint nblk,
+                        threadgroup float* tile, uint sg, uint lane) {
+    device float* Opart = ten<float>(tab, in, 0);
+    device float* mlpart = ten<float>(tab, in, 1);
+    device const ushort* Q = ten<ushort>(tab, in, 2);
+    device const KV* K = ten<KV>(tab, in, 3);
+    device const KV* V = ten<KV>(tab, in, 4);
+    device ushort* O = ten<ushort>(tab, in, 5);
+    device const float* KS = ten<float>(tab, in, 6);
+    device const float* VS = ten<float>(tab, in, 7);
+    uint nq = in.i[0], nkv = in.i[1], nh = in.i[2], nkh = in.i[3];
+    uint pos = in.i[4], window = in.i[5], splits = max(in.i[7], 1u);
+    uint stride = in.fj[1], mask = in.fj[2], gqa = nh / nkh;
+    float scale = as_type<float>(in.fj[0]);
+    uint lid = sg * 32u + lane;
+    threadgroup float* scores = tile;
+    threadgroup ushort* qs = (threadgroup ushort*)(tile + 1024);
+    threadgroup ushort* kvs = (threadgroup ushort*)(tile + 2048);
+    threadgroup float* ps = tile + 3072;
+    threadgroup float* state = tile + 4096;
+    threadgroup float* scratch = tile + 4192 + sg * 64u;
+    uint work = ((nq + 31u) / 32u) * nh * splits;
+    for (uint w = slice; w < work; w += nblk) {
+        uint sp = w % splits, h = (w / splits) % nh, qb = w / (splits * nh) * 32u;
+        uint isa_qb = qb / FA_BQ_TILE * FA_BQ_TILE;
+        uint end = min(pos + isa_qb + FA_BQ_TILE, nkv);
+        uint first = window && pos + isa_qb >= window ? pos + isa_qb - window + 1u : 0u;
+        uint lo = first / FA_BKV * FA_BKV;
+        uint tiles = end > lo ? (end - lo + FA_BKV - 1u) / FA_BKV : 0u;
+        uint per = (tiles + splits - 1u) / splits;
+        uint hi = min(lo + (sp + 1u) * per * FA_BKV, end);
+        lo += sp * per * FA_BKV;
+        // Preserve the ISA's split ownership, but skip tiles masked for every query here.
+        uint valid_first = window && pos + qb >= window ? pos + qb - window + 1u : 0u;
+        lo = max(lo, valid_first / FA_BKV * FA_BKV);
+        hi = min(hi, pos + min(qb + 32u, nq));
+        ulong base = ulong(h / gqa) * stride;
+        simdgroup_float8x8 out[D / 64u];
+        for (uint dc = 0; dc < D / 64u; dc++) out[dc] = simdgroup_float8x8(0.0f);
+        float m = NEG_INF, l = 0.0f;
+        if (lane == 0) { state[sg] = m; state[32u + sg] = l; }
+        for (uint kb = lo; kb < hi; kb += 32u) {
+            simdgroup_float8x8 score(0.0f);
+            for (uint dc = 0; dc < D; dc += 64u) {
+                for (uint e = lid; e < 32u * 64u; e += NT) {
+                    uint r = e / 64u, d = dc + e % 64u;
+                    qs[e] = qb + r < nq ? Q[(ulong(qb + r) * nh + h) * D + d] : ushort(0);
+                    kvs[e] = kb + r < hi ? kv_raw(K + (base + ((kb + r) & mask)) * D, d) : ushort(0);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (sg < 16u) {
+                    for (uint k = 0; k < 64u; k += 8u) {
+                        simdgroup_bfloat8x8 a, b;
+                        simdgroup_load(a, (threadgroup bfloat*)qs + (sg / 4u) * 8u * 64u + k, 64u);
+                        simdgroup_load(b, (threadgroup bfloat*)kvs + (sg % 4u) * 8u * 64u + k, 64u, ulong2(0), true);
+                        simdgroup_multiply_accumulate(score, a, b, score);
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            if (sg < 16u) simdgroup_store(score, scores + (sg / 4u) * 8u * 32u + (sg % 4u) * 8u, 32u);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            uint qpos = pos + qb + sg, key = kb + lane;
+            bool valid = qb + sg < nq && key < hi && key <= qpos && (!window || qpos - key < window);
+            float s = scores[sg * 32u + lane] * scale;
+            if (sizeof(KV) == 1u && key < hi) s *= KS[base + (key & mask)];
+            s = valid ? s : NEG_INF;
+            float next = max(m, simd_max(s));
+            float corr = m == NEG_INF ? 0.0f : exp(m - next);
+            // The golden contract rounds P at each key's running maximum. Prefix maxima
+            // preserve that rounding before expressing the whole tile at its final maximum.
+            float prefix = max(m, s);
+            for (uint offset = 1u; offset < 32u; offset *= 2u) {
+                float prev = simd_shuffle_up(prefix, offset);
+                if (lane >= offset) prefix = max(prefix, prev);
+            }
+            float p = valid ? rbf(exp(s - prefix)) * exp(prefix - next) : 0.0f;
+            l = l * corr + simd_sum(p);
+            m = next;
+            ps[sg * 32u + lane] = p;
+            if (lane == 0) { state[sg] = m; state[32u + sg] = l; state[64u + sg] = corr; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint dc = 0; dc < D / 64u; dc++) {
+                for (uint e = lid; e < 32u * 64u; e += NT) {
+                    uint r = e / 64u, d = dc * 64u + e % 64u;
+                    ulong row = base + ((kb + r) & mask);
+                    (tile + 1024)[e] = kb + r < hi ? kv_value(V + row * D, VS, uint(row), d) : 0.0f;
+                }
+                uint qr = sg / 8u * 8u, col = sg % 8u * 8u;
+                simdgroup_store(out[dc], scratch, 8u);
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+                for (uint e = lane; e < 64u; e += 32u) scratch[e] *= state[64u + qr + e / 8u];
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                simdgroup_load(out[dc], scratch, 8u);
+                for (uint k = 0; k < 32u; k += 8u) {
+                    simdgroup_float8x8 a, b;
+                    simdgroup_load(a, ps + qr * 32u + k, 32u);
+                    simdgroup_load(b, tile + 1024 + k * 64u + col, 64u);
+                    simdgroup_multiply_accumulate(out[dc], a, b, out[dc]);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint dc = 0; dc < D / 64u; dc++) {
+            simdgroup_store(out[dc], scratch, 8u);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint e = lane; e < 64u; e += 32u) {
+                uint qr = sg / 8u * 8u + e / 8u, q = qb + qr;
+                uint d = dc * 64u + sg % 8u * 8u + e % 8u;
+                if (q < nq) {
+                    if (splits == 1u && O) {
+                        float den = state[32u + qr];
+                        O[(ulong(q) * nh + h) * D + d] = f2bf(den > 0.0f ? scratch[e] / den : 0.0f);
+                    } else Opart[((ulong(q) * nh + h) * splits + sp) * D + d] = scratch[e];
+                }
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (!(splits == 1u && O) && qb + sg < nq && lane == 0) {
+            ulong off = ((ulong(qb + sg) * nh + h) * splits + sp) * 2u;
+            mlpart[off] = m; mlpart[off + 1u] = l;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+template <typename KV>
+inline void attend_rows(device const ushort* q, device const KV* kbase, device const KV* vbase,
+                        device const float* ks, device const float* vs,
                         uint D, uint kv_mask, float scale, uint lo, uint hi, uint qpos, uint window, bool bf16_p,
                         uint lane, thread float (&acc)[16], thread float& m, thread float& l) {
     uint per = D / 32u;
@@ -1125,10 +1349,11 @@ inline void attend_rows(device const ushort* q, device const ushort* kbase, devi
     for (uint j = 0; j < per; j++) qv[j] = bf2f(q[lane + 32u * j]);
     for (uint kv = lo; kv < hi; kv++) {
         if (!(kv <= qpos && (window == 0u || qpos - kv < window))) continue;
-        device const ushort* kr = kbase + ulong(kv & kv_mask) * D;
-        device const ushort* vr = vbase + ulong(kv & kv_mask) * D;
+        uint r = kv & kv_mask;
+        device const KV* kr = kbase + ulong(r) * D;
+        device const KV* vr = vbase + ulong(r) * D;
         float s = 0.0f;
-        for (uint j = 0; j < per; j++) s += qv[j] * bf2f(kr[lane + 32u * j]);
+        for (uint j = 0; j < per; j++) s += qv[j] * kv_value(kr, ks, r, lane + 32u * j);
         s = simd_sum(s) * scale;
         float mnew = max(m, s);
         float corr = m == NEG_INF ? 0.0f : exp(m - mnew);
@@ -1136,17 +1361,26 @@ inline void attend_rows(device const ushort* q, device const ushort* kbase, devi
         if (bf16_p) pe = rbf(pe);
         l = l * corr + pe;
         m = mnew;
-        for (uint j = 0; j < per; j++) acc[j] = acc[j] * corr + pe * bf2f(vr[lane + 32u * j]);
+        for (uint j = 0; j < per; j++) acc[j] = acc[j] * corr + pe * kv_value(vr, vs, r, lane + 32u * j);
     }
 }
 // t0=Opart t1=mlpart t2=Q t3=K t4=V t5=O_final?  i0=n_q i1=n_kv i2=n_head i3=n_kv_head i4=q_pos0 i5=window
 // i6=hd i7=nsplit  f0=scale fj1=kv_stride fj2=kv_mask
-void op_flash_prefill(const thread Inst& in, device const ulong* tab, uint slice, uint nblk, uint sg, uint lane) {
+template <typename KV>
+void op_flash_prefill(const thread Inst& in, device const ulong* tab, uint slice, uint nblk, threadgroup float* tile, uint sg, uint lane) {
+    switch (in.i[6]) {
+        case 64: flash_prefill_tile<64, KV>(in, tab, slice, nblk, tile, sg, lane); return;
+        case 128: flash_prefill_tile<128, KV>(in, tab, slice, nblk, tile, sg, lane); return;
+        case 256: flash_prefill_tile<256, KV>(in, tab, slice, nblk, tile, sg, lane); return;
+        case 512: flash_prefill_tile<512, KV>(in, tab, slice, nblk, tile, sg, lane); return;
+    }
     device float* Opart = ten<float>(tab, in, 0);
     device float* mlpart = ten<float>(tab, in, 1);
     device const ushort* Q = ten<ushort>(tab, in, 2);
-    device const ushort* K = ten<ushort>(tab, in, 3);
-    device const ushort* V = ten<ushort>(tab, in, 4);
+    device const KV* K = ten<KV>(tab, in, 3);
+    device const KV* V = ten<KV>(tab, in, 4);
+    device const float* KS = ten<float>(tab, in, 6);
+    device const float* VS = ten<float>(tab, in, 7);
     device ushort* O_final = ten<ushort>(tab, in, 5);
     uint n_q = in.i[0], n_kv = in.i[1], n_head = in.i[2], n_kv_head = in.i[3];
     uint q_pos0 = in.i[4], window = in.i[5], D = in.i[6];
@@ -1155,31 +1389,36 @@ void op_flash_prefill(const thread Inst& in, device const ulong* tab, uint slice
     uint kv_stride = in.fj[1], kv_mask = in.fj[2];
     if (D > 512u || (D & 31u)) return;
     uint gqa = n_head / n_kv_head;
-    uint q_tiles = (n_q + FA_BQ_TILE - 1) / FA_BQ_TILE;
+    uint q_tiles = (n_q + NSG - 1) / NSG;
     uint n_work = q_tiles * n_head * nsplit;
     uint per = D / 32u;
     for (uint w = slice; w < n_work; w += nblk) {
         uint sp = w % nsplit, h = (w / nsplit) % n_head, qt = w / (nsplit * n_head);
         uint hkv = h / gqa;
-        uint q_base = qt * FA_BQ_TILE;
-        uint q_tile_last = q_pos0 + q_base + FA_BQ_TILE - 1;
+        uint q_base = qt * NSG;
+        // KV split ownership stays on the ISA's 128-query tile, even though scheduling uses
+        // one query per simdgroup. Changing that boundary changes partial-softmax outputs.
+        uint split_q_base = q_base / FA_BQ_TILE * FA_BQ_TILE;
+        uint q_tile_last = q_pos0 + split_q_base + FA_BQ_TILE - 1;
         uint kv_end = min(q_tile_last + 1, n_kv);
-        uint q_tile_first = q_pos0 + q_base;
+        uint q_tile_first = q_pos0 + split_q_base;
         uint win_lo = (window && q_tile_first >= window) ? q_tile_first - window + 1 : 0;
         uint kv_lo = (win_lo / FA_BKV) * FA_BKV;
         uint tiles_kv = kv_end > kv_lo ? (kv_end - kv_lo + FA_BKV - 1) / FA_BKV : 0u;
         uint perp = (tiles_kv + nsplit - 1) / nsplit;
         uint my_lo = kv_lo + sp * perp * FA_BKV;
         uint my_hi = min(kv_lo + (sp + 1) * perp * FA_BKV, kv_end);
-        device const ushort* kbase = K + ulong(hkv) * kv_stride * D;
-        device const ushort* vbase = V + ulong(hkv) * kv_stride * D;
-        for (uint qi = q_base + sg; qi < q_base + FA_BQ_TILE && qi < n_q; qi += NSG) {
+        device const KV* kbase = K + ulong(hkv) * kv_stride * D;
+        device const KV* vbase = V + ulong(hkv) * kv_stride * D;
+        device const float* ks = KS ? KS + ulong(hkv) * kv_stride : KS;
+        device const float* vs = VS ? VS + ulong(hkv) * kv_stride : VS;
+        for (uint qi = q_base + sg; qi < q_base + NSG && qi < n_q; qi += NSG) {
             device const ushort* q = Q + (ulong(qi) * n_head + h) * D;
             uint qg = q_pos0 + qi;
             float m = NEG_INF, l = 0.0f, acc[16];
             for (uint j = 0; j < 16; j++) acc[j] = 0.0f;
             // rows past n_kv are excluded by my_hi <= kv_end <= n_kv
-            attend_rows(q, kbase, vbase, D, kv_mask, scale, my_lo, my_hi, qg, window, true, lane, acc, m, l);
+            attend_rows(q, kbase, vbase, ks, vs, D, kv_mask, scale, my_lo, my_hi, qg, window, true, lane, acc, m, l);
             if (nsplit == 1u && O_final) {
                 float inv = l > 0.0f ? 1.0f / l : 0.0f;
                 device ushort* orow = O_final + (ulong(qi) * n_head + h) * D;
@@ -1197,13 +1436,16 @@ void op_flash_prefill(const thread Inst& in, device const ulong* tab, uint slice
 }
 // t0=Opart t1=mlpart t2=Q t3=K t4=V t5=kv_len(i32)  i0=n_batch i1=n_head i2=n_kv_head i3=kv_stride i4=window
 // i5=nsplit i6=hd i7=kv_mask  f0=scale   (i1 bit 16 NRF fold -> poison)
+template <typename KV>
 void op_flash_decode(const thread Inst& in, device const ulong* tab, uint slice, uint nblk,
                      threadgroup float* tile, uint sg, uint lane) {
     device float* Opart = ten<float>(tab, in, 0);
     device float* mlpart = ten<float>(tab, in, 1);
     device const ushort* Q = ten<ushort>(tab, in, 2);
-    device const ushort* K = ten<ushort>(tab, in, 3);
-    device const ushort* V = ten<ushort>(tab, in, 4);
+    device const KV* K = ten<KV>(tab, in, 3);
+    device const KV* V = ten<KV>(tab, in, 4);
+    device const float* KS = ten<float>(tab, in, 6);
+    device const float* VS = ten<float>(tab, in, 7);
     device const int* kv_len = ten<int>(tab, in, 5);
     bool nrf = (in.i[1] & 0x10000u) != 0u;
     uint n_batch = nrf ? (in.i[0] & 0xFFu) : in.i[0];
@@ -1233,8 +1475,11 @@ void op_flash_decode(const thread Inst& in, device const ulong* tab, uint slice,
         uint first = (window && len > window) ? len - window : 0u;
         uint span = len - first, perp = (span + nsplit - 1) / nsplit;
         uint lo = first + sp * perp, hi = min(lo + perp, len);
-        device const ushort* kbase = K + (ulong(b) * n_kv_head + hkv) * kv_stride * D;
-        device const ushort* vbase = V + (ulong(b) * n_kv_head + hkv) * kv_stride * D;
+        ulong base = (ulong(b) * n_kv_head + hkv) * kv_stride;
+        device const KV* kbase = K + base * D;
+        device const KV* vbase = V + base * D;
+        device const float* ks = KS ? KS + base : KS;
+        device const float* vs = VS ? VS + base : VS;
         for (uint hh = 0; hh < gf; hh++) {
             uint h = h0 + hh;
             if (h >= n_head) break;
@@ -1254,7 +1499,7 @@ void op_flash_decode(const thread Inst& in, device const ulong* tab, uint slice,
                 uint my_lo = lo + sg * chunk, my_hi = min(my_lo + chunk, hi);
                 float m = NEG_INF, l = 0.0f, acc[16];
                 for (uint j = 0; j < 16; j++) acc[j] = 0.0f;
-                attend_rows(q, kbase, vbase, D, kv_mask, scale, my_lo, my_hi, qpos, window, false, lane, acc, m, l);
+                attend_rows(q, kbase, vbase, ks, vs, D, kv_mask, scale, my_lo, my_hi, qpos, window, false, lane, acc, m, l);
                 threadgroup float* part = tile + sg * stride;
                 if (lane == 0) { part[0] = m; part[1] = l; }
                 for (uint j = 0; j < per; j++) part[2u + lane + 32u * j] = acc[j];
@@ -1749,7 +1994,9 @@ bool exec_op(const thread Inst& in, device const ulong* tab, uint slice, uint nb
     switch (in.op) {
         case 0: return true;
         case 1: op_rmsnorm(in, tab, slice, nblk, red, lid, sg, lane); return true;
-        case 3: op_headnorm_rope(in, tab, slice, nblk, sg, lane); return true;
+        case 3: op_headnorm_rope<false>(in, tab, slice, nblk, sg, lane); return true;
+        case 37: op_headnorm_rope<true>(in, tab, slice, nblk, sg, lane); return true;
+        case 32: op_quant_fp8(in, tab, slice, nblk, red, lid, sg, lane); return true;
         case 4: op_residual(in, tab, slice, nblk, lid); return true;
         case 6: op_embed(in, tab, slice, nblk, lid); return true;
         case 7: op_softcap(in, tab, slice, nblk, lid); return true;
@@ -1778,8 +2025,10 @@ bool exec_op(const thread Inst& in, device const ulong* tab, uint slice, uint nb
         case 22: op_gemv_qkv(in, tab, slice, nblk, sg, lane); return true;
         case 30: op_gemv_fp8(in, tab, slice, nblk, sg, lane); return true;
         case 31: op_gemv_glu_fp8(in, tab, slice, nblk, sg, lane); return true;
-        case 11: op_flash_prefill(in, tab, slice, nblk, sg, lane); return true;
-        case 12: op_flash_decode(in, tab, slice, nblk, tile, sg, lane); return true;
+        case 11: op_flash_prefill<ushort>(in, tab, slice, nblk, tile, sg, lane); return true;
+        case 12: op_flash_decode<ushort>(in, tab, slice, nblk, tile, sg, lane); return true;
+        case 39: op_flash_prefill<uchar>(in, tab, slice, nblk, tile, sg, lane); return true;
+        case 38: op_flash_decode<uchar>(in, tab, slice, nblk, tile, sg, lane); return true;
         case 13: op_flash_merge(in, tab, slice, nblk, lid); return true;
         case 16: op_norm_residual(in, tab, slice, nblk, red, lid, sg, lane); return true;
         case 17: op_argmax(in, tab, slice, nblk, keys, lid); return true;

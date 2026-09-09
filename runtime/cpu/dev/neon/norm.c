@@ -24,13 +24,12 @@ N_K(n_rmsnorm) {
     plow_bf16* out = PLOW_CPU_TEN(in, T, 0);
     const plow_bf16* x = PLOW_CPU_TEN(in, T, 1);
     const plow_bf16* gamma = PLOW_CPU_TEN(in, T, 2);
-    const int quant = PLOW_CPU_TEN(in, T, 3) != NULL;
+    if (PLOW_CPU_TEN(in, T, 3)) { g_rmsnorm(in, slice, nblk, T, ctx); return; }
     const uint32_t rows = in->i[0], feat = in->i[1], out_row0 = in->i[2];
     const float eps = in->fj[0].f;
     for (uint32_t row = slice; row < rows; row += nblk) {
         const plow_bf16* xr = x + (size_t)row * feat;
         plow_bf16* o = out + (size_t)(out_row0 + row) * feat;
-        if (quant) { g_poison_row(o, feat); continue; }
         n_scale_row(o, xr, gamma, g_rsqrt(n_row_ss(xr, feat) / (float)feat + eps), feat);
     }
 }

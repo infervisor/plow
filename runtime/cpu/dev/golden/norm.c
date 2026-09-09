@@ -1,6 +1,7 @@
 /* Norm family: op_norm.h ported 1:1. Rows are the slice axis (row = slice; row += nblk),
  * except HEADNORM_ROPE whose item is a (token, head) packed G_WAVES per workgroup. */
 #include "golden.h"
+#include "../fp8_common.h"
 
 static float row_ss(const plow_bf16* x, uint32_t n) {
     float ss = 0.0f;
@@ -11,8 +12,7 @@ static float row_ss(const plow_bf16* x, uint32_t n) {
     return ss;
 }
 
-/* t0=out t1=x t2=gamma?  i0=rows i1=feat i2=out_row0  f0=eps.
- * t3/t4 (fused w8a8 activation quant) are not ported: a packet carrying them gets a qNaN row. */
+/* t0=out t1=x t2=gamma? t3=quant? t4=scale? i0=rows i1=feat i2=out_row0 f0=eps. */
 G_K(g_rmsnorm) {
     (void)ctx;
     plow_bf16* out = PLOW_CPU_TEN(in, T, 0);
@@ -24,11 +24,19 @@ G_K(g_rmsnorm) {
     for (uint32_t row = slice; row < rows; row += nblk) {
         const plow_bf16* xr = x + (size_t)row * feat;
         plow_bf16* o = out + (size_t)(out_row0 + row) * feat;
-        if (quant) { g_poison_row(o, feat); continue; }
         const float inv = g_rsqrt(row_ss(xr, feat) / (float)feat + eps);
         for (uint32_t i = 0; i < feat; i++) {
             const float g = gamma ? plow_bf2f(gamma[i]) : 1.0f;
             o[i] = plow_f2bf(plow_bf2f(xr[i]) * inv * g);
+        }
+        if (quant) {
+            uint8_t* q = PLOW_CPU_TEN(in, T, 3);
+            float* scale = PLOW_CPU_TEN(in, T, 4);
+            float amax = 0.0f;
+            for (uint32_t i = 0; i < feat; i++) amax = fmaxf(amax, fabsf(plow_bf2f(o[i])));
+            scale[row] = fmaxf(amax * (1.0f / PLOW_FP8_E4M3_MAX), 1e-12f);
+            const float qinv = 1.0f / scale[row];
+            for (uint32_t i = 0; i < feat; i++) q[(size_t)row * feat + i] = plow_f32_to_e4m3(plow_bf2f(o[i]) * qinv);
         }
     }
 }
@@ -89,6 +97,7 @@ G_K(g_headnorm_rope) {
     const uint32_t skip_norm = in->i[4], n_batch_kv = in->i[6];
     const uint32_t out_stride = in->fj[1].u, kv_mask = in->fj[2].u;
     const float eps = in->fj[0].f;
+    const int fp8 = in->op == PLOW_DOP_HEADNORM_ROPE_FP8;
     /* i5: 0 = the legacy rule (hd 64 interleaved, hd 128 half-split), 1 = force interleaved at
      * hd 128, 2 = force half-split (GPT-OSS NeoX at hd 64). */
     const int interleave = in->i[5] == 2u ? 0 : (hd == 64u) || (hd == 128u && in->i[5] == 1u);
@@ -131,7 +140,16 @@ G_K(g_headnorm_rope) {
                 }
                 for (uint32_t i = 0; i < hd; i++) v[i] = r[i];
             }
-            for (uint32_t i = 0; i < hd; i++) out[obase + i] = plow_f2bf(v[i]);
+            if (fp8) {
+                float amax = 0.0f;
+                for (uint32_t i = 0; i < hd; i++) amax = fmaxf(amax, fabsf(v[i]));
+                const float qinv = amax > 0.0f ? PLOW_FP8_E4M3_MAX / amax : 0.0f;
+                float* scales = PLOW_CPU_TEN(in, T, 6);
+                scales[obase / hd] = amax * (1.0f / PLOW_FP8_E4M3_MAX);
+                for (uint32_t i = 0; i < hd; i++) ((uint8_t*)out)[obase + i] = plow_f32_to_e4m3(v[i] * qinv);
+            } else {
+                for (uint32_t i = 0; i < hd; i++) out[obase + i] = plow_f2bf(v[i]);
+            }
         }
     }
 }
