@@ -12,7 +12,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
 use plowrt::config::RuntimeConfig;
 use plowrt::device::{self, Backend};
@@ -432,7 +432,8 @@ enum Cmd {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|err| err.exit());
     let filter =
         tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
     let filter_str = format!("{filter}");
@@ -487,7 +488,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // only what this serve chose away from the tree's defaults, in the spelling that sets
             // it again — greppable out of a log a campaign already keeps.
             tracing::info!(
-                replay = ?plowrt::config::serve_replay(),
+                replay = ?plowrt::config::serve_replay(&matches),
                 "serve replay — the runtime half of build.json's emit_config.replay"
             );
             serve(

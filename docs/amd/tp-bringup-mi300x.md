@@ -681,7 +681,8 @@ and the dense-arm prefill fault localised in §5.
 
 ## 7e. The 70k-context target — where plow actually stands
 
-Target, from a vLLM run on GLM-5.3-FP8 at 70k input / ~700 output, concurrency 20, 100 prompts:
+Cross-hardware reference, from a vLLM run on H200 with GLM-5.3-FP8 at ~70k input /
+~700 output, concurrency 20, 100 prompts (workload details and speculation caveat in §7f):
 **273.67 output tok/s, 27,269 total tok/s, TTFT median 905 ms, TPOT median 77.82 ms.**
 
 plow could not accept that workload at all before this: the frozen blob is `--max-ctx 18432` and
@@ -1105,31 +1106,24 @@ That closes the diagnosis. Ranked, with the evidence for each:
 Chunk 16384 is nonetheless the best measured configuration and is kept: 19.28 out tok/s, +19.8%
 over the §7e baseline of 16.09.
 
-### The comparison IS ROCm-vs-ROCm — corrected
+### Reference hardware correction (2026-09-09)
 
-Earlier revisions of this section hedged that the target host was unidentified and that, if it were
-NVIDIA, part of the gap would be a kernel ecosystem rather than plow. That hedge is wrong and is
-retracted.
+The user confirmed that the `10.7.21.13:8080` vLLM run was on **H200**, not MI300X.
+The earlier inference from neighbouring IP addresses was wrong. Its 273.67 output tok/s
+is a cross-hardware reference, not evidence of a 14.5x software gap on identical silicon.
+The reference GPU count, TP configuration and server flags were not supplied.
 
-The target run named `--host 10.7.21.13`. This machine is `10.7.21.15`, hostname
-`innmi1srmi300x-p01.neysaai.infra` — an **MI300X** pool node — two addresses away in the same /24.
-Port 8080 there is closed now, so the server could not be queried directly and this is inference
-from addressing and the cluster's own naming rather than a banner. But the reading is that vLLM
-reached **27,269 tok/s total / 273.67 output tok/s on the same 8x MI300X hardware** where plow
-reaches 1,886 / 18.67.
+The supplied client used 100 prompts, seed 0, concurrency 20, random input length 70000,
+random output length 700 and `--random-range-ratio 0.14`: inputs span 60200–79801 tokens
+and outputs 602–799. It did not set `--ignore-eos` or `--temperature=0`. Earlier plow
+cells used 20 fixed-length prompts, so those cells do not reproduce this workload.
 
-**That makes the gap ~14.5x of software on identical silicon, not a hardware or ecosystem
-difference.** Everything below about "no AITER ASM kernel for qk256/v256" still stands as a fact
-about AITER's shipped `.co` set, but it stops being an excuse: vLLM is not using an AITER MLA
-prefill ASM kernel for this model either. It is using the **ROCm sparse path** —
-`vllm/v1/attention/ops/rocm_aiter_mla_sparse.py`, with `flydsl_fp8_mqa_logits` (a hand-written
-gfx942 MFMA indexer kernel) and a hipcub `top_k_per_row_prefill` — which plow has no equivalent of
-for prefill, and which §7f's operand-budget note shows plow cannot even emit alongside its current
-recipe.
+The reference also enabled speculative decoding (acceptance length 1.25). Future plow
+work excludes speculation as requested; the pasted throughput cannot be converted into
+a non-speculative baseline by subtracting accepted tokens or dividing by acceptance length.
 
-So the single highest-value item for this target is not a faster dense flash kernel. It is DSA
-sparse prefill on gfx942, which **already exists in open source, on this exact hardware**, and
-which the operand budget currently forecloses.
+Prioritise measured plow A/B improvements with the same workload and correctness gates.
+A same-hardware engine comparison would require a separate reference run.
 
 ### AITER's ASM kernel set does not cover this geometry
 
@@ -1139,8 +1133,8 @@ row is fp8 on **gfx950**. GLM-5.3 is qk 256 / v 256 bf16 on gfx942, so on ROCm i
 — which penalizes that shape specifically: in `fmha_fwd.py`'s `get_pipelines`,
 `if hdim == 256 and hdim_v == 256:` selects only `qr` pipelines while every other head dim gets
 `qr_async`, losing the async direct-to-LDS pipeline. There is no vendor kernel for this geometry to
-benchmark against, and the target numbers in §7e came from an unidentified host — if that host is
-NVIDIA, part of the gap is a kernel ecosystem, not plow.
+benchmark against, and the target numbers in §7e came from H200. They do not establish the size of
+a software-only gap on MI300X.
 
 ## 7g. The gap is attention after all, and the sparse arm was never armed
 
@@ -1851,10 +1845,9 @@ narrower than this one did.
 
 ## 7o. The reference could not be reproduced on this host
 
-Everything in 7d through 7n ranks work against 273.67 out tok/s / 905 ms median TTFT, taken from
-a pasted `vllm bench serve` summary. 7f corrected an earlier hedge by asserting the comparison
-"IS ROCm-vs-ROCm" on the same silicon. That assertion was never tested. It has now been, and the
-reference stack does not run here.
+The historical attempt below tried to establish a local MI300X reference. The user has
+since confirmed that the pasted 273.67 output tok/s / 905 ms median TTFT run used H200.
+Failure of the local ROCm stack does not explain or invalidate that H200 result.
 
 vLLM 0.28.0 from `/app/plow/.venv-vllm028`, serving `/workspace/models/GLM-5.3-FP8` at
 `--tensor-parallel-size 8 --max-model-len 80000` on these eight MI300X:
@@ -1873,24 +1866,10 @@ vLLM 0.28.0 from `/app/plow/.venv-vllm028`, serving `/workspace/models/GLM-5.3-F
 So on this host, in this environment, vLLM cannot serve GLM-5.3 with sparse attention at all —
 it refuses without AITER and crashes with it.
 
-**What this does and does not mean.** It does not show the reference numbers are wrong; they were
-plainly produced somewhere, and the FLOP argument in 7g independently shows they must come from a
-sparse path, which the refusal above confirms is exactly the path vLLM takes for this model. What
-it does mean is narrower and worth stating plainly:
-
-* the "14x on identical silicon" framing is **unverified**. The comparison host, its AITER build
-  and its serving flags are all unknown to this campaign;
-* nothing here establishes that 273.67 is reachable on THIS host's software stack, because the
-  only implementation known to reach it will not start on it;
-* the one number this campaign could have anchored on — a reference run reproduced under the same
-  conditions as the plow runs — does not exist.
-
-Every plow measurement in this document stands: they are self-consistent, controlled, and
-reproduce to ±0.09%. The prefill decomposition, the sparse-prefill gain, the ablation shares and
-the union defect are all unaffected. What is affected is the TARGET, and therefore the ranking of
-any future work against it. Before more effort is spent closing a 14x gap, someone should
-establish that gap on hardware and software that can be run side by side — either by getting the
-AITER path working here, or by obtaining the reference run's host and configuration.
+The local failure leaves no same-hardware vLLM baseline for this campaign. Keep the
+recorded plow A/B deltas separate from the H200 comparison; those deltas do not require
+a working local vLLM server. The host and client-workload correction in §7f supersedes
+the earlier claims of identical hardware.
 
 ## 7p. Every GEMM tile in this model was chosen by the analytical model, not measured
 
@@ -1990,3 +1969,30 @@ belongs in the freeze procedure for that reason.
 (`crates/devgen/src/k3.rs:6126`, `Option::unwrap` on `None`) on **clean `main`**.
 It passes when run in isolation, so it is order- or environment-dependent. Not
 touched by this work; recorded here because it will fail anyone else's gate run.
+
+## 9. Consolidated review (2026-09-09)
+
+Measured GLM-5.3 levers on TP8, with their original comparison conditions:
+
+| Change | Recorded gain | Scope |
+|---|---:|---|
+| Matched low-rung decode objects | +24.9% output tok/s | concurrency 1; §7b |
+| Decode ladder 4 → 8 | +21.0% output tok/s | 4096 input, concurrency 8; TPOT increases; §7c |
+| `PLOW_FA_LDS_DMA=1` | +21.7% prefill tok/s | single 70k request; no measured gain at concurrency 20; §7f |
+| `PLOW_PF_CHUNK=8192 PLOW_PF_INTERLEAVE=0` | +13.0% output tok/s | 70k input, concurrency 20; §7f |
+| Sparse prefill, span 1 | +6.9% output tok/s | 70k input, concurrency 20; limited quality probes only; §7g |
+| GEMM retune | approximately neutral | +1.0%, near measured run-to-run noise; §7p |
+
+These deltas have different baselines and must not be added. Sparse spans 2 and 3
+fail the recorded quality probes and remain experimental. Audit-off results also
+remove a correctness check; matched decode tiers provide a gain independently.
+
+The review fixes two runtime configuration defects: serving replay now uses the actual
+parsed CLI, including overrides of environment settings; an explicit empty
+`PLOW_HSACO_LOWRUNG` now disables discovery as documented. Neither changes kernel math
+or establishes a new throughput result. No speculative decoding was added.
+
+Review validation: 28 GLM emitter tests passed with one test thread;
+`cargo test -p plowrt --features hsa --test config_env` passed, including a CLI
+override after the `serve` subcommand and an explicit empty tier setting.
+Formatting and `git diff --check` passed. No new GPU timing was taken in this review.

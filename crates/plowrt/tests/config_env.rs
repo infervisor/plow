@@ -58,4 +58,24 @@ fn env_zero_and_one_mean_false_and_true() {
     );
     assert_eq!(c.apple.ane_mlp_fail.as_deref(), Some("after_join"));
     assert_eq!(c.apple.backend.as_deref(), Some("cpu"));
+
+    use clap::{Args, FromArgMatches};
+    let matches = RuntimeConfig::augment_args(clap::Command::new("plowrt"))
+        .subcommand(clap::Command::new("serve"))
+        .try_get_matches_from([
+            "plowrt",
+            "serve",
+            "--pf-interleave",
+            "0",
+            "--amd-hsaco-lowrung",
+            "",
+        ])
+        .unwrap();
+    let resolved = RuntimeConfig::from_arg_matches(&matches).unwrap();
+    let replay = plowrt::config::serve_replay(&matches);
+    assert_eq!(resolved.nv.pf_interleave, 0);
+    assert_eq!(replay["PLOW_PF_INTERLEAVE"], "0");
+    assert_eq!(replay["PLOW_PF_CHUNK"], "4096");
+    assert_eq!(replay["PLOW_HSACO_LOWRUNG"], "");
+    assert!(!replay.contains_key("PLOW_TP_NO_AUDIT"));
 }

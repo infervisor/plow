@@ -8513,7 +8513,6 @@ impl AmdEngine {
             .amd
             .hsaco_lowrung
             .clone()
-            .filter(|d| !d.is_empty())
             // DISCOVERED, not required. `scripts/build_gfx942.sh PLOW_DECODE_TIERS=…`
             // writes the matched objects to `<objdir>/lowrung<w>/`, and until now the only
             // thing that turned them into a `dir:w` spec was a loop in
@@ -8548,7 +8547,8 @@ impl AmdEngine {
                     ),
                 }
                 found
-            });
+            })
+            .filter(|d| !d.is_empty());
         let mut dense_prefill_object = false;
         // ARMED-ness of the decode object, for the one status line at the end of load.
         // Every decode object opened must carry it, low rungs included: a ladder whose
