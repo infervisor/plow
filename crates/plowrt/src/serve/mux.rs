@@ -1606,6 +1606,7 @@ fn run_one_tick(
                 completed.clear();
                 if let Some(f) = gpu_prefill_batched_pass(
                     &mut *e, &mut slots, cap, &arena, feeds.is_empty(), co_scheduled, &mut completed,
+                    &mut feeds, &mut obs.host.token_batch_tokens,
                 ) {
                     if tick_fault.is_none() {
                         tick_fault = Some(f);
@@ -3347,10 +3348,11 @@ fn pf_chunk_rows() -> usize {
     crate::config::RuntimeConfig::get().pf_chunk_rows()
 }
 
-/// Pack waiting prompt rows under the prefill quantum. Compact terminal outputs
+/// Pack prompt rows and optional decode feeds under the prefill quantum. Compact outputs
 /// stop the pass before another launch can overwrite their logits. The legacy
 /// route leaves the last prompt row for decode.
 #[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
 fn gpu_prefill_batched_pass(
     e: &mut crate::exec::gpu::GpuEngine,
     slots: &mut [Option<Slot>],
@@ -3359,22 +3361,28 @@ fn gpu_prefill_batched_pass(
     cold: bool,
     bounded_tick: bool,
     completed: &mut Vec<(usize, u32)>,
+    feeds: &mut Vec<(usize, u32)>,
+    unified_output: &mut Vec<(u32, u32)>,
 ) -> Option<crate::DeviceErrorInfo> {
     use crate::exec::gpu::PfBatchReq;
 
     completed.clear();
     let compact = e.has_packed_terminal();
+    let unified =
+        e.token_batch_enabled() && !crate::config::RuntimeConfig::get().pf_no_interleave;
+    let decode_rows = if unified { feeds.len() } else { 0 };
     let withheld = usize::from(!compact);
     let mut tick_fault: Option<crate::DeviceErrorInfo> = None;
     let budget_max = e.pf_max_rows();
     if budget_max == 0 {
         return tick_fault;
     }
-    let per_launch = if cold && !bounded_tick {
+    let per_launch = (if cold && !bounded_tick {
         budget_max
     } else {
         pf_interleave_rows().min(budget_max)
-    };
+    })
+    .min(budget_max.saturating_sub(decode_rows));
     // Bound each candidate before fair sharing. Short requests return unused
     // rows to later candidates in the same launch.
     let chunk_cap = pf_chunk_rows();
@@ -3470,23 +3478,63 @@ fn gpu_prefill_batched_pass(
         if pack.is_empty() {
             return tick_fault;
         }
-        let reqs: Vec<PfBatchReq> = pack
-            .iter()
-            .map(|&(i, c0, len)| PfBatchReq {
-                slot: i,
-                prompt: &slots[i].as_ref().expect("packed slot is Some").prompt_ids,
-                c0,
-                len,
-            })
-            .collect();
-        let res = if compact {
-            e.prefill_batched_complete(&reqs, completed)
+        let res = if unified {
+            use plow_asset::token_batch::{Phase, Request, Selection};
+            let decode = feeds.iter().map(|&(i, ref token)| {
+                let slot = slots[i].as_ref().expect("decode slot is Some");
+                Request {
+                    id: i as u32,
+                    slot: i as u32,
+                    state_slot: i as u32,
+                    generation: e.slot_generation(i).expect("valid slot"),
+                    phase: Phase::Decode,
+                    tokens: std::slice::from_ref(token),
+                    prompt_len: slot.prompt_ids.len() as u32,
+                    selection: Selection::default(),
+                }
+            });
+            let prefill = pack.iter().map(|&(i, c0, len)| {
+                let slot = slots[i].as_ref().expect("prefill slot is Some");
+                Request {
+                    id: i as u32,
+                    slot: i as u32,
+                    state_slot: i as u32,
+                    generation: e.slot_generation(i).expect("valid slot"),
+                    phase: Phase::Prefill,
+                    tokens: &slot.prompt_ids[c0..c0 + len],
+                    prompt_len: slot.prompt_ids.len() as u32,
+                    selection: Selection::default(),
+                }
+            });
+            let requests: smallvec::SmallVec<[_; 16]> = decode.chain(prefill).collect();
+            let result = e.token_batch_step(&requests, unified_output);
+            if result.is_ok() {
+                completed.extend(
+                    unified_output.iter().map(|&(slot, token)| (slot as usize, token)),
+                );
+            }
+            result
         } else {
-            e.prefill_batched(&reqs)
+            let reqs: Vec<PfBatchReq> = pack
+                .iter()
+                .map(|&(i, c0, len)| PfBatchReq {
+                    slot: i,
+                    prompt: &slots[i].as_ref().expect("packed slot is Some").prompt_ids,
+                    c0,
+                    len,
+                })
+                .collect();
+            if compact {
+                e.prefill_batched_complete(&reqs, completed)
+            } else {
+                e.prefill_batched(&reqs)
+            }
         };
-        drop(reqs);
         match res {
             Ok(()) => {
+                if unified {
+                    feeds.clear();
+                }
                 for &(i, c0, len) in &pack {
                     slots[i].as_mut().expect("packed slot is Some").pf_pos = c0 + len;
                 }
@@ -3503,12 +3551,26 @@ fn gpu_prefill_batched_pass(
                 );
                 note_fault(&mut tick_fault, &err);
                 let msg = err.to_string();
+                if unified {
+                    for (i, _) in feeds.drain(..) {
+                        if let Some(taken) = slots[i].take() {
+                            release_kv(arena, taken.kv);
+                            let _ = taken
+                                .respond
+                                .try_send(StreamChunk::Err(fanout_err(&err, &msg)));
+                        }
+                        e.retire_slot(i, false);
+                    }
+                }
                 for &(i, _, _) in &pack {
                     if let Some(taken) = slots[i].take() {
                         release_kv(arena, taken.kv);
                         let _ = taken
                             .respond
                             .try_send(StreamChunk::Err(fanout_err(&err, &msg)));
+                    }
+                    if unified {
+                        e.retire_slot(i, false);
                     }
                 }
                 return tick_fault;

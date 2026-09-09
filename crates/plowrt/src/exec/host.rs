@@ -56,6 +56,7 @@ pub struct HostExecutor {
     /// Compact prefill outputs: physical slot and token, ordered by logits row.
     #[cfg(feature = "cuda")]
     pub prefill_tokens: Vec<(usize, u32)>,
+    pub token_batch_tokens: Vec<(u32, u32)>,
     /// Input text a TOKENIZE packet encodes into `token_ids` (when the host owns
     /// tokenization). Empty for the `--net` path (input is already `tokens`).
     pub input_text: Option<String>,

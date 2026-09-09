@@ -2530,16 +2530,6 @@ impl GpuEngine {
     /// server startup, never on the request path.
     pub fn load(be: Arc<CudaBackend>, assets_dir: &Path, checkpoint_dir: &Path) -> Result<Self> {
         let t0 = std::time::Instant::now();
-        if crate::config::RuntimeConfig::get().token_batch {
-            tracing::info!(
-                route = "unified-token-batch",
-                backend = "cuda",
-                ready = false,
-                fires = false,
-                reason = "CUDA unified serving integration pending; using ordinary execution",
-                "token-batch route status"
-            );
-        }
         let load_prof = load_profile();
         let mut load_tim = load_prof.then(|| LoadTiming::new(t0));
         if load_prof {
@@ -2625,7 +2615,11 @@ impl GpuEngine {
                 )
             });
         let prefix_requested = config.nv_vmm_prefix() == Some(true) || prefix_layout.is_some();
-        let packed_prefix = prefix_requested && config.pf_batch;
+        let unified_packed = config.token_batch
+            && !config.fusion
+            && prefix_layout.is_some()
+            && packed_prefill_metadata.is_some();
+        let packed_prefix = prefix_requested && (config.pf_batch || unified_packed);
         if packed_prefix && (prefix_layout.is_none() || packed_prefill_metadata.is_none()) {
             return Err(RuntimeError::Rejected(
                 "packed prefix reuse requires compiled packed-prefill metadata and a valid VMM layout"
@@ -4389,6 +4383,20 @@ impl GpuEngine {
         };
         engine.packed_terminal = gpu_packed_terminal::PackedTerminal::load(&engine)?;
         engine.token_batch = gpu_token_batch::CudaTokenBatch::load(&engine);
+        if config.token_batch {
+            tracing::info!(
+                route = "unified-token-batch",
+                backend = "cuda",
+                ready = engine.token_batch_enabled(),
+                fires = false,
+                reason = if engine.token_batch_enabled() {
+                    "packed-prefill and compact-output capabilities loaded"
+                } else {
+                    "unsupported device, model, object or execution mode; using ordinary execution"
+                },
+                "token-batch route status"
+            );
+        }
         if engine.cublaslt_decode_capture {
             engine.capture_decode_graph()?;
         }

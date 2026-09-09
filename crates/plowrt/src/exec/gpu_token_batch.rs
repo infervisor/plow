@@ -155,6 +155,13 @@ impl GpuEngine {
                 );
                 state.fired = true;
             }
+            tracing::debug!(
+                decode = requests.iter().filter(|r| r.phase == Phase::Decode).count(),
+                prefill = requests.iter().filter(|r| r.phase == Phase::Prefill).count(),
+                rows,
+                samples = output.len(),
+                "unified token batch committed"
+            );
             Ok(())
         })();
         if result.is_err() {

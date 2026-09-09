@@ -1111,8 +1111,8 @@ the compact tail on isolated requests reproduced the difference without batching
 This establishes batching parity for the selected computation, not equivalence
 between output algorithms or model-quality qualification.
 
-The adapter is not yet wired into the serving mux and currently accepts greedy
-selection only. Unified serving default promotion, stochastic sampling, SLO-aware
+At this adapter-only milestone it was not yet wired into the serving mux and
+accepted greedy selection only (superseded by the serving milestone below). Unified serving default promotion, stochastic sampling, SLO-aware
 admission and packed FP8-KV assets remain pending. The immutable checkpoint is
 unchanged. These functional checks are not throughput measurements.
 
@@ -1121,3 +1121,48 @@ the tokenizer API special-token expectation (also blocks `nix build`), the
 kernelcaps RowGather guard/callee parser test, the unregistered legacy AMD
 benchmark script, and repository-wide formatting. The branch remains a draft
 for merge preparation until the relevant readiness work and checks are resolved.
+
+
+### Default unified serving on qualified packed assets (2026-09-09)
+
+Qualified Hopper packed-prefill assets now select prefix reuse and unified
+serving with `PLOW_VMM_PREFIX`, `PLOW_PF_BATCH` and `PLOW_TOKEN_BATCH` unset.
+The mux combines existing decode inputs with admitted prompt spans, reserves
+compiled row capacity for decode, and uses the shared fair prefill planner.
+It delivers compact outputs by logical slot and consumes each decode feed once.
+A failed combined launch retires all participating slots. Pure decode retains
+the ordinary adaptive ladder. Unsupported configurations retain ordinary
+execution; startup reports the capability actually loaded.
+
+Both BF16-weight/B8 and FP8-weight/B16 H100 assets use BF16 KV. Each passed
+12-request functional serving screens covering warm 1K/16K cache hits, overlapping
+prefill/decode, stochastic sampling, exact output limits, cancellation and context
+rejection/recovery. Debug logs show 19 BF16 and 25 FP8 committed mixed batches.
+A larger screen completed 77 requests per precision, including 64 queued requests
+and recovery, with 87/72 mixed batches. All 32 copies of each pressure prompt
+produced identical four-token text. These are 64 queued requests served through
+physical B8/B16, not 64 resident sequences.
+
+The first BF16 burst hit the default 32-request ingress bound and returned 429;
+that failed run is preserved. The successful 64-request screens explicitly use
+`--max-queued-requests 256`. All serving screens use `--slo-ms 600000` and diagnostic
+logging, so they do not prove deadline compliance or production throughput.
+Long-prefix cache hits under pressure were 24/32 BF16 versus 4/32 FP8; bounded
+cache retention remains a performance concern.
+
+`PLOW_TOKEN_BATCH=0` passed the same 12-request BF16 functional screen, retained
+prefix hits and produced zero mixed commits. The API's existing host sampling
+path handles stochastic and penalty-adjusted compact outputs. Restoring the
+device-sampling fast path for mixed stochastic rows remains pending.
+
+Host validation: 638 passed, 20 ignored; 17 configuration/mux/co-serving/preemption
+integration tests passed. All-target checks passed for CUDA+HSA together and each
+backend separately. With selector overrides unset, the BF16 GPU test passed 32
+full-vocabulary matching-computation frames plus intermediate/final/stale/duplicate
+checks. Campaign `unified-serving-default-qualification.json` records the frozen
+binary hash and the five final HTTP campaigns (190 successful requests).
+
+This enables actual default dispatch on the qualified H100 assets. AMD prefix
+integration, fresh compiler defaults, packed FP8-KV assets, ordinary-decode quality
+comparison, cache retention, sampling performance and broader production
+qualification remain open. The sealed BF16-weight/FP8-KV checkpoint is unchanged.
