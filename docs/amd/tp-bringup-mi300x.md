@@ -679,6 +679,88 @@ derived MLA tensors a prep must write (`q_absorb`, `kv_a_latent`, `k_rope`, `q_r
 `language_model.model.` wrapper prefix), the tokenizer (`tiktoken.model`, no `tokenizer.json`),
 and the dense-arm prefill fault localised in §5.
 
+## 7e. The 70k-context target — where plow actually stands
+
+Target, from a vLLM run on GLM-5.3-FP8 at 70k input / ~700 output, concurrency 20, 100 prompts:
+**273.67 output tok/s, 27,269 total tok/s, TTFT median 905 ms, TPOT median 77.82 ms.**
+
+plow could not accept that workload at all before this: the frozen blob is `--max-ctx 18432` and
+a request above the compiled context is refused, so the first step was re-emitting at 81920.
+
+### Result
+
+20 prompts, 70k input, concurrency 20, TP8:
+
+| arm | out tok/s | total tok/s | TTFT med | TPOT med |
+|---|---:|---:|---:|---:|
+| chunk 8192, no packed route | 16.09 | 1,625 | 408 s | 439 ms |
+| chunk 2048, no route | 15.91 | 1,606 | 554 s | 177 ms |
+| **packed prefill firing** | **16.76** | 1,692 | 533 s | 173 ms |
+| *vLLM target* | *273.67* | *27,269* | *0.9 s* | *77.8* |
+
+**Decode already beats the target and prefill misses it by ~10x.** A single-stream 70k request
+measures TPOT **35.2 ms** against the target's 77.8. Total throughput is not decode-limited.
+
+### A wrong diagnosis, corrected
+
+Median TTFT at concurrency 20 is almost exactly 20x the single-request TTFT, which reads like
+serialized prefill. It is not. ONE 70k prefill takes 27.5 s — 2,550 tok/s — so twenty of them is
+~549 s of work at that rate against 835 s measured. The GPU is saturated by a single request;
+there was no idle capacity for overlap to reclaim, which is why co-packing bought 4% and not 10x.
+Check the single-request rate before attributing a concurrency gap to scheduling.
+
+### Packed prefill needs FIVE preconditions, and each fails differently
+
+Worth recording because four of the five fail silently or name only themselves:
+
+| # | precondition | symptom when missing |
+|---|---|---|
+| 1 | family objects built (`PLOW_PACKED_PREFILL_CONSUMERS=1`) | none — `load_packed_family` returns `Ok(None)` on a missing file. gfx942 had never built them |
+| 2 | `PLOW_PACKED_PREFILL_ROUTE=1` | "every prefill rung refuses route=false" |
+| 3 | `--pf-batch` | — |
+| 4 | chunk **strictly narrower** than the widest rung | `admit` packs whole spans into one rung; chunk 8192 on an 8192 ladder admits exactly one span and `packed.len() >= 2` never fires |
+| 5 | `PLOW_EMIT_PACKED_PREFILL=1` at EMIT | "packed-prefill MLA consumer is in a mixed segment" |
+
+### Decode width and context multiply — the OOM is KV, not activations
+
+Activations are single-block and address-reused; they are megabytes. `kv.{l}.ckv` is
+`dbatch x ctx x dk` **per layer**, x78, and none of it is aliasable: layer `l`'s history is re-read
+at every later step and each slot owns its own. At ctx 81920 that is 58.9 GB at `dbatch=8` and
+117.8 GB at 16 — against 99.9 GB of weights on a 206.1 GB card, so M=16 OOMs
+(`hsa_amd_memory_pool_allocate(1207959552)` / `HSA_STATUS_ERROR_OUT_OF_RESOURCES`) and M=8 fits.
+Long context therefore CAPS decode width: this model affords M=8 at 80k, so concurrency-20
+traffic decodes in 8-wide batches whatever the ladder says. A 32768 prefill rung OOMs for the
+same reason (prefill scratch scales with rung width).
+
+### Where the 10x actually is
+
+Prefill FLOPs per rank for one 70k request, from the geometry:
+
+| term | FLOPs/layer | share |
+|---|---:|---:|
+| attention (causal, n^2) | 2.01e13 | **64.5%** |
+| projections + MoE (linear in n) | 1.10e13 | 35.5% |
+| x78 layers | **2.43e15** | |
+
+At 27.45 s that is **88 TF/s per rank**, against §4's measured ceiling of 160–304 TF/s on the
+expert shapes and 1057 TF/s dense. Two independent deficits:
+
+* **~2.7x — dense attention.** vLLM serves this checkpoint with DSA armed (`index_topk 2048`);
+  plow always emits the dense `FlashMlaPrefill`. Sparse selection would cut the n^2 term ~34x,
+  which is 2.7x off the TOTAL. `FlashGatherPrefill` exists and is correct, but nothing produces
+  its per-query `idx` array (§4's note), so the win is unclaimed.
+* **~3.7x — prefill kernel efficiency**, the residue after that.
+
+Neither is a knob. The target is reachable only through a T-row indexer feeding
+`FlashGatherPrefill` plus prefill kernel work; no combination of ladder, chunk, tier, route or
+audit setting closes a 10x deficit in work done.
+
+### Frozen
+
+`scripts/freeze_serving_set.sh` wrote the packet, the 53 objects + 4 tier dirs, the HSA-linked
+`plowrt` and the serve replay to one directory (455 MB, pairing `0x9fd0e880fb6fbf09`), so the
+numbers above have an artifact behind them rather than a scratch path.
+
 ## 8. Unrelated issue observed
 
 `cargo test -p devgen mla` fails `k3::tests::the_mla_prefill_arm_forces_one_split`
