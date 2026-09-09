@@ -6,6 +6,10 @@ use std::collections::BTreeSet;
 pub const SECTION: &str = "packed_prefill";
 pub const CAPABILITY: &str = "plow_pf_request_abi";
 pub const CAPABILITY_VALUE: u32 = 2;
+pub const FP8_CAPABILITY: &str = "plow_pf_fp8_request_abi";
+pub const FP8_CAPABILITY_VALUE: u32 = 1;
+// FP8 attention uses t6/t7 for scales; tagged i4 carries the request handle.
+pub const FP8_REQUEST_TAG: u32 = 1 << 31;
 type Result<T> = std::result::Result<T, String>;
 fn need(ok: bool, text: &str) -> Result<()> {
     if ok {
@@ -21,7 +25,10 @@ fn downstream_merge(insts: &[DevInst64], pc: usize) -> Result<&DevInst64> {
     let mut merges = insts[pc + 1..]
         .iter()
         .take_while(|m| {
-            !(m.op == DevOp::FlashPrefill as u16 && m.t[..2].iter().any(|h| d.t[..2].contains(h)))
+            !(matches!(
+                DevOp::from_u16(m.op),
+                Some(DevOp::FlashPrefill | DevOp::FlashPrefillFp8)
+            ) && m.t[..2].iter().any(|h| d.t[..2].contains(h)))
         })
         .filter(|m| m.op == DevOp::FlashMerge as u16 && m.t[1] == d.t[0] && m.t[2] == d.t[1]);
     let merge = merges
@@ -46,10 +53,38 @@ pub struct Manifest {
     pub programs: Vec<String>,
 }
 impl Manifest {
+    /// Bind a validated prefill instruction, or restore its ordinary request operands.
+    pub fn bind_request(&self, d: &mut DevInst64, packed: bool) {
+        let slot = if packed { self.slot } else { TENSOR_NONE16 };
+        let request = if packed { self.request } else { TENSOR_NONE16 };
+        match DevOp::from_u16(d.op) {
+            Some(DevOp::HeadNormRope) => d.t[6] = slot,
+            Some(DevOp::HeadNormRopeFp8) => d.t[7] = slot,
+            Some(DevOp::FlashPrefill) => {
+                d.t[6] = request;
+                for map in &self.maps {
+                    if d.t[7] == if packed { map.original } else { map.slots } {
+                        d.t[7] = if packed { map.slots } else { map.original };
+                        break;
+                    }
+                }
+            }
+            Some(DevOp::FlashPrefillFp8) => {
+                d.i[4] = if packed {
+                    FP8_REQUEST_TAG | u32::from(self.request)
+                } else {
+                    0
+                };
+            }
+            Some(DevOp::FlashMerge) => d.t[7] = request,
+            _ => {}
+        }
+    }
+
     pub fn validate(&self, p: &Packet<'_>, live: &live_kv::Manifest) -> Result<()> {
         live.validate(p)?;
         need(
-            self.version == 1 && !p.tp && p.prefill_count > 0,
+            self.version == live.version && !p.tp && p.prefill_count > 0,
             "version/topology",
         )?;
         need(
@@ -112,15 +147,6 @@ impl Manifest {
             !p.programs.iter().flat_map(|g| g.insts).any(|d| {
                 matches!(
                     DevOp::from_u16(d.op),
-                    Some(DevOp::HeadNormRopeFp8 | DevOp::FlashPrefillFp8 | DevOp::FlashDecodeFp8)
-                )
-            }),
-            "FP8 KV is unsupported",
-        )?;
-        need(
-            !p.programs.iter().flat_map(|g| g.insts).any(|d| {
-                matches!(
-                    DevOp::from_u16(d.op),
                     Some(
                         DevOp::KdaConv
                             | DevOp::KdaGate
@@ -170,11 +196,13 @@ impl Manifest {
                     continue;
                 }
                 let op = DevOp::from_u16(d.op).ok_or("packed opcode")?;
-                if op == DevOp::FlashPrefill {
+                if matches!(op, DevOp::FlashPrefill | DevOp::FlashPrefillFp8) {
                     flash_sites += 1;
                     need(
-                        matches!(d.i[6], 256 | 512) && d.i[7] > 0 && d.t[6] == TENSOR_NONE16,
-                        "BF16 attention contract",
+                        matches!(d.i[6], 256 | 512)
+                            && d.i[7] > 0
+                            && (op == DevOp::FlashPrefillFp8 || d.t[6] == TENSOR_NONE16),
+                        "attention contract",
                     )?;
                     let product = |xs: &[u32], bytes: u64| -> Result<u64> {
                         xs.iter().try_fold(bytes, |n, &x| {
@@ -237,8 +265,9 @@ impl Manifest {
                     }
                     need(covering == 1, "attention segment coverage")?;
                 }
-                if op == DevOp::HeadNormRope {
-                    need(d.t[6] == TENSOR_NONE16, "existing slot map")?;
+                if matches!(op, DevOp::HeadNormRope | DevOp::HeadNormRopeFp8) {
+                    let slot_operand = if op == DevOp::HeadNormRopeFp8 { 7 } else { 6 };
+                    need(d.t[slot_operand] == TENSOR_NONE16, "existing slot map")?;
                     slot_writers += usize::from(d.fj[1] != 0);
                 }
                 if op == DevOp::FlashMerge {
@@ -338,6 +367,29 @@ pub fn plan(
 mod tests {
     use super::*;
     #[test]
+    #[ignore = "CPU cubin inspection; set TEST_PACKED_FP8_CUBINS to colon-separated paths"]
+    fn fp8_objects_advertise_both_request_contracts() {
+        let paths = std::env::var_os("TEST_PACKED_FP8_CUBINS").unwrap();
+        let paths: Vec<_> = std::env::split_paths(&paths).collect();
+        assert!(!paths.is_empty());
+        for path in paths {
+            let image = std::fs::read(&path).unwrap();
+            assert_eq!(
+                crate::cubin::global_u32(&image, CAPABILITY),
+                Some(CAPABILITY_VALUE),
+                "{}",
+                path.display()
+            );
+            assert_eq!(
+                crate::cubin::global_u32(&image, FP8_CAPABILITY),
+                Some(FP8_CAPABILITY_VALUE),
+                "{}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
     fn layer_scratch_reuse_requires_a_merge_before_overwrite() {
         let mut flash = DevInst64 {
             op: DevOp::FlashPrefill as u16,
@@ -356,6 +408,11 @@ mod tests {
         assert!(downstream_merge(&[flash, flash, merge], 0).is_err());
         assert!(downstream_merge(&[merge, flash], 1).is_err());
         assert!(downstream_merge(&[flash, merge, merge], 0).is_err());
+        let mut fp8 = flash;
+        fp8.op = DevOp::FlashPrefillFp8 as u16;
+        assert!(downstream_merge(&[fp8, merge, flash, merge], 0).is_ok());
+        assert!(downstream_merge(&[fp8, flash, merge], 0).is_err());
+        assert!(downstream_merge(&[flash, fp8, merge], 0).is_err());
     }
     #[test]
     fn ragged_physical_slots_and_padding() {

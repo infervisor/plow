@@ -1376,3 +1376,32 @@ sliding-cache slot, with flat and lazy scale allocation. It has **not run**:
 the manual frozen FP8 service owns the H100 on port8080. LIVE FP8 allocation
 therefore remains device-unqualified; no performance or production-readiness
 claim follows from these host checks.
+
+## Packed FP8 request binding and kernel builds
+
+Packed manifest version2 now validates FP8 cache/scale ownership, attention
+extents and isolated segment coverage. Reversible request binding preserves
+scale handles: FP8 rope uses t7 for the slot map; FP8 attention uses tagged i4
+for the request table. BF16 keeps its existing ABI. Returning to ordinary
+prefill now clears FlashMerge's actual request operand t7; the old path cleared
+t3 and left the request table bound.
+
+The experimental packed FP8 interpreter offsets Q/output rows, KV bytes and F32
+scale rows separately, calling the existing arithmetic kernels per request.
+H100 PIPE=0 and PX-4/PX-23 packed objects compile, as does the BF16 packed control.
+They retain the existing request ABI2 and add `plow_pf_fp8_request_abi=1` for FP8.
+The PIPE=0 mixed-cache build required fixing the descriptor argument list in the
+BF16 request wrapper. PX-8 remains unavailable on H100: its existing ldmatrix.b8
+instruction fails assembly for sm_90a.
+
+Verification: 88 asset unit and10 integration tests; six shared BF16/FP8/mixed
+KV compiler emits and18 packed-default emits;649 runtime host tests; separate
+HSA-only/CUDA-only all-target checks. The NVIDIA emit cases additionally check
+all bucket bindings, repeated restore, scale preservation, and rejection of
+bad request tags, short Q tensors and invalid attention slices with regenerated
+digests. These are host and build checks, not numerical GPU evidence.
+
+FP8 packed compiler emission and runtime execution remain gated pending device
+qualification and object routing. User explicitly paused GPU launches while
+authorizing continued code/build work. Frozen release assets and the manual
+traffic service remain unchanged. Campaign logs: `fp8-packed-*.log`.

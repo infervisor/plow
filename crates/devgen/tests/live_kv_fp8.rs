@@ -89,6 +89,9 @@ fn emitted_bf16_fp8_and_mixed_kv_contracts_preserve_both_backend_ladders() {
                             serde_json::from_str(&encoded).unwrap();
                         assert_eq!(roundtrip, live);
                         roundtrip.validate(p).unwrap();
+                        if arch == "sm_90a" {
+                            packed_contract(p, &live);
+                        }
                         if fp8 {
                             let mut bad = live.clone();
                             bad.version = 1;
@@ -112,4 +115,156 @@ fn emitted_bf16_fp8_and_mixed_kv_contracts_preserve_both_backend_ladders() {
         }
     }
     std::fs::remove_dir_all(root).unwrap();
+}
+
+fn packed_contract(p: &plow_asset::program::Packet<'_>, live: &plow_asset::live_kv::Manifest) {
+    use packet::dev::{DevOp, TENSOR_NONE16};
+    use plow_asset::packed_prefill::{Manifest, Map, FP8_REQUEST_TAG};
+    use plow_asset::program::{Packet, Tensor};
+
+    let mut tensors = p.tensors.to_vec();
+    let slot = tensors.len() as u16;
+    tensors.push(Tensor {
+        name: "pf.request.slot",
+        bytes: 1024 * 4,
+        initialized: false,
+    });
+    let request = tensors.len() as u16;
+    tensors.push(Tensor {
+        name: "pf.request.table",
+        bytes: (1 + 4 * u64::from(live.batch)) * 4,
+        initialized: false,
+    });
+    let names: Vec<_> = live
+        .maps
+        .iter()
+        .map(|m| format!("pf.request.maps.{}", m.handle))
+        .collect();
+    let mut maps = Vec::new();
+    for (m, name) in live.maps.iter().zip(&names) {
+        maps.push(Map {
+            original: m.handle as u16,
+            slots: tensors.len() as u16,
+        });
+        tensors.push(Tensor {
+            name,
+            bytes: 8 * u64::from(live.batch),
+            initialized: false,
+        });
+    }
+    let packet = Packet {
+        tensors: &tensors,
+        ..*p
+    };
+    let manifest = Manifest {
+        version: live.version,
+        slot,
+        request,
+        maps,
+        programs: p.programs[..p.prefill_count]
+            .iter()
+            .map(plow_asset::live_kv::program_digest)
+            .collect(),
+    };
+    manifest.validate(&packet, live).unwrap();
+    let roundtrip: Manifest =
+        serde_json::from_str(&serde_json::to_string(&manifest).unwrap()).unwrap();
+    assert_eq!(manifest, roundtrip);
+    let mut bad = manifest.clone();
+    bad.version = if live.version == 1 { 2 } else { 1 };
+    assert!(bad.validate(&packet, live).is_err());
+    bad = manifest.clone();
+    bad.request = bad.slot;
+    assert!(bad.validate(&packet, live).is_err());
+    for (pi, program) in p.programs[..p.prefill_count].iter().enumerate() {
+        let pc = program
+            .insts
+            .iter()
+            .position(|d| {
+                matches!(
+                    DevOp::from_u16(d.op),
+                    Some(DevOp::FlashPrefill | DevOp::FlashPrefillFp8)
+                )
+            })
+            .unwrap();
+        for mutation in 0..3 {
+            let mut insts = program.insts.to_vec();
+            let mut entries = program.gq_stream.to_vec();
+            let mut tensors = tensors.clone();
+            match mutation {
+                0 => insts[pc].i[4] = FP8_REQUEST_TAG | u32::from(request),
+                1 => tensors[insts[pc].t[2] as usize].bytes = 1,
+                2 => {
+                    let entry = entries.iter_mut().find(|e| e.inst as usize == pc).unwrap();
+                    entry.slice = u32::from(insts[pc].blocks);
+                }
+                _ => unreachable!(),
+            }
+            let mut programs = p.programs.to_vec();
+            programs[pi].insts = &insts;
+            programs[pi].gq_stream = &entries;
+            let changed = Packet {
+                programs: &programs,
+                tensors: &tensors,
+                ..packet
+            };
+            if let Ok(live) = plow_asset::live_kv::emit(&changed) {
+                let mut bad = manifest.clone();
+                bad.programs = programs[..p.prefill_count]
+                    .iter()
+                    .map(plow_asset::live_kv::program_digest)
+                    .collect();
+                assert!(
+                    bad.validate(&changed, &live).is_err(),
+                    "bucket {} mutation {mutation}",
+                    program.rows
+                );
+            }
+        }
+    }
+    for program in &p.programs[..p.prefill_count] {
+        for baseline in program.insts {
+            let mut d = *baseline;
+            for _ in 0..2 {
+                manifest.bind_request(&mut d, true);
+                match DevOp::from_u16(d.op) {
+                    Some(DevOp::HeadNormRopeFp8) => {
+                        assert_eq!(d.t[6], baseline.t[6]);
+                        assert_eq!(d.t[7], slot);
+                    }
+                    Some(DevOp::FlashPrefillFp8) => {
+                        assert_eq!(d.t, baseline.t);
+                        assert_eq!(d.i[4], FP8_REQUEST_TAG | u32::from(request));
+                    }
+                    Some(DevOp::HeadNormRope) => assert_eq!(d.t[6], slot),
+                    Some(DevOp::FlashPrefill | DevOp::FlashMerge) => assert_eq!(
+                        d.t[if d.op == DevOp::FlashMerge as u16 {
+                            7
+                        } else {
+                            6
+                        }],
+                        request
+                    ),
+                    _ => {}
+                }
+                let bound = d;
+                manifest.bind_request(&mut d, true);
+                assert_eq!((d.t, d.i, d.fj), (bound.t, bound.i, bound.fj));
+                manifest.bind_request(&mut d, false);
+                if d.op == DevOp::FlashMerge as u16 {
+                    assert_eq!(d.t[7], TENSOR_NONE16);
+                }
+                assert_eq!(
+                    (d.op, d.blocks, d.t, d.i, d.fj),
+                    (
+                        baseline.op,
+                        baseline.blocks,
+                        baseline.t,
+                        baseline.i,
+                        baseline.fj
+                    )
+                );
+            }
+        }
+    }
 }

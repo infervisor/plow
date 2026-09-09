@@ -2601,6 +2601,11 @@ impl GpuEngine {
             })?;
             blob.with_packet_view(|p| pack.validate(p, live))
                 .map_err(RuntimeError::Rejected)?;
+            if pack.version != 1 {
+                return Err(RuntimeError::Rejected(
+                    "packed FP8 KV execution is not enabled".into(),
+                ));
+            }
         }
         let config = RuntimeConfig::get();
         let prefix_layout = crate::memory::vmm::VmmOps::granularity(be.as_ref())
@@ -6933,17 +6938,13 @@ impl GpuEngine {
                 terminal.patch_discarded_tail(bucket, false);
             }
             for &pc in &bucket.rope_sites {
-                bucket.h_inst[pc].t[6] = TENSOR_NONE16;
+                pack.bind_request(&mut bucket.h_inst[pc], false);
             }
             for &pc in &bucket.flash_sites {
-                let d = &mut bucket.h_inst[pc];
-                d.t[6] = TENSOR_NONE16;
-                if let Some(m) = pack.maps.iter().find(|m| m.slots == d.t[7]) {
-                    d.t[7] = m.original;
-                }
+                pack.bind_request(&mut bucket.h_inst[pc], false);
             }
             for &pc in &bucket.merge_sites {
-                bucket.h_inst[pc].t[3] = TENSOR_NONE16;
+                pack.bind_request(&mut bucket.h_inst[pc], false);
             }
             bucket.batch_patched = false;
         }
@@ -7329,17 +7330,13 @@ impl GpuEngine {
                 terminal.patch_discarded_tail(b, true);
             }
             for &pc in &b.rope_sites {
-                b.h_inst[pc].t[6] = pack.slot;
+                pack.bind_request(&mut b.h_inst[pc], true);
             }
             for &pc in &b.flash_sites {
-                let d = &mut b.h_inst[pc];
-                d.t[6] = pack.request;
-                if let Some(m) = pack.maps.iter().find(|m| m.original == d.t[7]) {
-                    d.t[7] = m.slots;
-                }
+                pack.bind_request(&mut b.h_inst[pc], true);
             }
             for &pc in &b.merge_sites {
-                b.h_inst[pc].t[7] = pack.request;
+                pack.bind_request(&mut b.h_inst[pc], true);
             }
             for &pc in &b.lmhead_sites {
                 b.h_inst[pc].i[4] = 0;
