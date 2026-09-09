@@ -761,6 +761,78 @@ audit setting closes a 10x deficit in work done.
 `plowrt` and the serve replay to one directory (455 MB, pairing `0x9fd0e880fb6fbf09`), so the
 numbers above have an artifact behind them rather than a scratch path.
 
+## 7f. Where the prefill gap is, measured against AITER's own kernel
+
+§7e put ~10x of the 70k deficit in prefill. `PLOW_PREFILL_SEG_TIMING` then splits prefill itself,
+and the split is not subtle. Per layer, per 8192-row chunk (156 segments = 78 layers x 2):
+
+| segment family | critical_us |
+|---|---:|
+| `flash_interpreter` (attention) | **~31,500** |
+| `interpreter` (MoE + projections) | ~10,700 |
+
+**Attention is ~75% of prefill wall time.** At the last chunk's shape (6465 queries x 72001 keys,
+8 heads/rank, QK+PV) that segment does ~3.8e12 FLOP in 31.5 ms = **~121 TF/s**, against the
+549-630 TF/s bf16 GEMM rate §4 measures on this part — **~20% of the achievable matrix rate.**
+
+Two things this rules out, both measured rather than argued:
+
+* **Not tile selection.** A GEMM tile campaign re-run against this exact recipe took the emit from
+  "all analytical" to "**all 4944 tiles chosen BY MEASUREMENT**". Prefill went 2,550 -> 2,529 tok/s.
+  No change, the second time tile coverage has come up empty here (§7c).
+* **Not the absorbed/materialized choice.** plow's prefill already uses the absorbed form
+  (`MlaMergeFold` folding `derived.v_absorb`, `nsplit=1`), so it is not making the naive
+  materialize-K/V mistake.
+
+### Against AITER's shipped gfx942 kernel
+
+AITER's MLA prefill for DeepSeek's 192x128 shape is hand-written GCN assembly shipped as `.co`
+(`hsa/gfx942/fmha_v3_fwd/MI300/fwd_hd192x128_bf16_causal_*.co`; no source is published, so the
+figures below are from its manifest CSV, its host launcher, ELF metadata and disassembly).
+Disassembling plow's `interp_flash_gq.elf` the same way:
+
+| | AITER `hd192x128` | plow `interp_flash_gq` |
+|---|---|---|
+| workgroup | 256 thr / 4 waves | 256 thr / 4 waves |
+| VGPR | 512 (1 wave/SIMD) | 512 (1 wave/SIMD) |
+| LDS | 65536 B | 58376 B |
+| Q tile (BM) | 128 | 128 (`FA_BM`) |
+| KV tile (BN) | 32 | 32 (`FA_BKV`) |
+| MFMA | 216 x `32x32x8_bf16`, only | 272 x `16x16x16_bf16` + 176 x `32x32x8_bf16` |
+| **global->LDS DMA** | **132 x `buffer_load_dword … lds`** | **0** |
+
+**The tiling already matches. The staging does not.** AITER moves K/V global->LDS without the data
+ever entering a VGPR; plow stages it through registers, in a kernel whose register file is already
+fully committed (512 VGPR at one wave per SIMD). That is the shape of a kernel pinned at 20% of
+matrix rate.
+
+plow ALREADY HAS the primitive: `cp_async16` in `runtime/amd/amd_common.h`, over
+`__builtin_amdgcn_global_load_lds`, whose own comment says it "writes straight into LDS with NO
+VGPRs, which is the only reason this is [worth it]". Its call sites are all in `op_gemm.h`. The
+attention path never uses it. So the GEMMs stream and the flash kernel — 75% of prefill — does not.
+
+### Ranked, from the AITER comparison
+
+1. **`cp_async16` in the flash K/V stager.** The one verified structural difference, in the kernel
+   that owns 75% of prefill. plow has the primitive and uses it elsewhere.
+2. **Causal head/tail Q-tile pairing.** AITER pairs an early and a late Q tile per workgroup so the
+   triangle balances (`get_grid_dim`, `tg_div = mask ? 2 : 1`) — and **explicitly disables it for
+   192x128 on gfx942**. It is unclaimed headroom in their kernel too, and the imbalance is large at
+   an 8192-row chunk against 70k of context.
+3. **MFMA shape.** AITER's materialized kernel is `32x32x8` exclusively; it uses `16x16x16` only for
+   the *absorbed* skinny-M kernels. plow's flash is 60% `16x16x16`.
+
+### The comparison target is not ROCm-vs-ROCm
+
+Worth stating before adapting anything: **GLM-5.3's head geometry has no AITER ASM kernel.** The
+v3 dispatcher admits exactly `(128,128)`, `(192,128)` and `(256,256)`, and the only shipped 256/256
+row is fp8 on **gfx950**. GLM-5.3 is qk 256 / v 256 bf16 on gfx942, so on ROCm it would fall to CK
+— which penalizes that shape specifically: in `fmha_fwd.py`'s `get_pipelines`,
+`if hdim == 256 and hdim_v == 256:` selects only `qr` pipelines while every other head dim gets
+`qr_async`, losing the async direct-to-LDS pipeline. There is no vendor kernel for this geometry to
+benchmark against, and the target numbers in §7e came from an unidentified host — if that host is
+NVIDIA, part of the gap is a kernel ecosystem, not plow.
+
 ## 8. Unrelated issue observed
 
 `cargo test -p devgen mla` fails `k3::tests::the_mla_prefill_arm_forces_one_split`
