@@ -501,3 +501,39 @@ The frozen runtime is `bin/plowrt-packed-terminal`, SHA256
 Raw proof, scripts and hashes are preserved under the campaign directory in
 `packed-terminal-qualification.json`, `bf16-b8-packed-terminal-preflight-comparison.json`,
 `plow-bf16-b8-packed-terminal-*`, and `packed-terminal-final-*-gpu.log`.
+
+## Packed BF16 GEMM register budget
+
+The H100 packed BF16 GEMM kernel was capped at 128 registers and used 1128 bytes of
+stack per thread. `PLOW_NV_SEG_OCC1=1` permits 255 registers and reduces the stack
+to 112 bytes. CMake now selects it for Hopper Gemma packed GEMM without W8A8 or
+FP8 KV. Ordinary BF16, packed W8A8, Blackwell and other model families keep their
+previous settings; ordinary Hopper Gemma W8A8 already uses OCC1. The existing
+`PLOW_EXTRA_DEFINES=-DPLOW_NV_SEG_OCC1=0` override restores the cap.
+
+Only the packed GEMM cubin changes. Its 128 sparse/reversed-slot full-logit snapshots
+are bit-exact against ordinary prefill. All 12 natural outputs and all 39 matched
+cached-screen outputs, prompt hashes and cache counts remain exact. The default
+CMake build produces a byte-identical cubin to the device-tested candidate; six
+configuration checks cover selection, rollback and excluded scopes.
+
+| Input / concurrency | Previous → OCC1 TTFT, ms | Previous → OCC1 output tok/s |
+|---|---:|---:|
+| 1K / 1 | 426 → 154 | 24.33 → 30.67 |
+| 4K / 8 | 4568 → 1336 | 36.50 → 67.68 |
+| 16K / 1 | 2295 → 703 | 9.91 → 19.56 |
+| 16K / 8 | 15682 → 5173 | 13.91 → 32.41 |
+
+All nine cells improve TTFT and throughput. This is one measured wave per cell,
+with no build or other GPU workload overlap. Decode is unchanged: 16K/C8 median
+TPOT is 87.46 → 87.61 ms. Full data is in
+`gemma31-h100-bf16-packed-occ1-comparison.csv`. The combined packed-prefix route
+remains opt-in, and a full BF16 comparison against vLLM remains outstanding.
+
+Eight cold 16K requests, eight exact isolated replays, short recovery, all three API
+lifecycle checks, 16 sampling pairs, and cancellation of eight streams after observed
+KV admission waiting pass. Pressure durations include a CMake build and are excluded
+from performance claims. The candidate/default cubin SHA256 is
+`62a313cd4fce717db1bb13e26f85774fe59c40052700b9675e566b37d0033005`.
+Raw data, scripts, build scope checks and hashes are recorded in
+`bf16-packed-occ1-qualification.json` under the campaign directory.

@@ -665,6 +665,13 @@ data race; used only to price a protocol cost): `PLOW_GATE_HIER_CEIL`,
 
 ### GEMM / GEMV
 
+Hopper Gemma CMake builds select `PLOW_NV_SEG_OCC1=1` for ordinary W8A8 GEMM
+segments and packed BF16-KV GEMM segments without W8A8. This removes the
+128-register cap. The packed BF16 H100 qualification is recorded in
+`perf-data/token-batch-main-h100-readiness.md`. Rebuild with
+`PLOW_EXTRA_DEFINES="-DPLOW_NV_SEG_OCC1=0"` to restore that cap. This build
+default does not enable packed serving or the CUDA unified token-batch executor.
+
 | flag | default | effect |
 |---|---|---|
 | `PGM_BM` | 128 | GEMM M-tile height (`BM/WARPS_M` must be ×16). Overridable but no shipped alternate object. |
