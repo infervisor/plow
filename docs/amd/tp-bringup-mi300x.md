@@ -919,6 +919,29 @@ were saturated, a 21.7% faster prefill kernel would have produced ~21.7% more ag
 throughput. It produced 0.1%. The 20x is a scheduling artifact, not a saturation one, and the next
 work on this target belongs in the scheduler.
 
+### Lifting the cap: +13% throughput, and the decode latency it protected never appeared
+
+`amd_prefill_tick_cap` returns `interleave` — **default 2048** — as soon as ANY request is
+decoding. Prefill therefore advances at most 2048 rows per tick however large the chunk is, which
+is why an 8192-row chunk behaved like a 2048-row one and why a 21.7%-faster flash kernel produced
+no aggregate difference. `PLOW_PF_INTERLEAVE=0` maps to `u32::MAX`.
+
+| in=70k, conc=20, TP8 | out tok/s | total tok/s | agg prefill | TTFT med | TPOT med |
+|---|---:|---:|---:|---:|---:|
+| capped at 2048 (default) | 16.53 | 1,670 | 1,951 | 496 s | 177.0 ms |
+| **uncapped** | **18.67** | **1,886** | **2,239** | **466 s** | **177.8 ms** |
+| | **+13.0%** | +13.0% | **+14.8%** | −6% | unchanged |
+
+**The cap was paying for nothing on this workload.** It exists to keep a long prefill from
+stalling live decode streams, and that is a real hazard — the shared-tick comment records 49.3
+tok/s at concurrency 16 before prefill and decode were interleaved. But here TPOT does not move
+when the cap is lifted, so the latency it was protecting did not materialise, while the throughput
+it cost was 14.8% of prefill. There is also headroom by construction: TPOT is 2.2x better than the
+target being compared against, so decode latency is the one budget this workload can spend.
+
+It is not the whole gap. Uncapped aggregate prefill is 2,239 tok/s against a single-stream 3,078,
+so ~27% is still lost to concurrency after the cap is gone.
+
 ### The comparison target is not ROCm-vs-ROCm
 
 Worth stating before adapting anything: **GLM-5.3's head geometry has no AITER ASM kernel.** The
