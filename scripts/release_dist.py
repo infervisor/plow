@@ -101,11 +101,9 @@ def run_step(cmd: list[str], what: str, dry: bool) -> None:
 def validate(recipe: dict, bundle: dict, objset: dict, status: str) -> list[str]:
     """Checks that need no hardware. The recipe's own gates need the GPU."""
     notes = []
-    t = recipe.get("target", {})
-    if t.get("isa") and t["isa"] != objset["target"]["isa"]:
-        pd.die(f"recipe targets {t['isa']}, objset was built for {objset['target']['isa']}")
-    if t.get("sku") and t["sku"] != objset["target"]["sku"]:
-        pd.die(f"recipe targets {t['sku']}, objset was built for {objset['target']['sku']}")
+    # Shared with check_recipe.py: one implementation of what may be called
+    # `validated`, so the checker and the publisher cannot disagree.
+    pd.recipe_target_matches(recipe, objset["target"], "objset")
 
     # The pairing rule, enforced here as well as in pack_bundle: a release must
     # not be the first place it is noticed.
@@ -116,14 +114,8 @@ def validate(recipe: dict, bundle: dict, objset: dict, status: str) -> list[str]
             pd.die(f"{o['name']} is stamped for packet {stamp}, the bundle's packet is {pairing}")
 
     if status == "validated":
-        m = recipe.get("measured") or {}
-        if not m.get("tok_s"):
-            pd.die(
-                "status `validated` requires `[measured] tok_s` in the recipe: a validated "
-                "variant outranks an unmeasured one at selection, so publishing one without a "
-                "measurement would misreport it"
-            )
-        notes.append(f"measured {m['tok_s']} tok/s")
+        pd.recipe_invariants({**recipe, "status": "validated"})
+        notes.append(f"measured {(recipe.get('measured') or {})['tok_s']} tok/s")
     else:
         notes.append("unmeasured — publishable only as `emits`")
     return notes
@@ -317,12 +309,12 @@ def self_test() -> None:
         "objects": [{"name": "i.elf", "packet_hash": "0x1"}],
     }
     bundle = {"pairing_hash": "0x1"}
-    recipe = {"target": {"isa": "gfx942", "sku": "MI325X"}}
+    recipe = {"target": {"isa": "gfx942", "sku": "MI325X"}, "plow_git": "a" * 40}
     try:
         validate(recipe, bundle, objset, "validated")
         raise AssertionError("accepted validated with no measurement")
     except pd.Fail as e:
-        assert "requires `[measured] tok_s`" in str(e)
+        assert "must carry `[measured] tok_s`" in str(e)
     assert validate(recipe, bundle, objset, "emits")
 
     recipe_ok = dict(recipe, measured={"tok_s": 131.162})

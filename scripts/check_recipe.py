@@ -203,29 +203,11 @@ def check(recipe_path: Path, bundle: Path | None, objects: Path | None, strict: 
     recipe = pd.load_toml(recipe_path)
     notes: list[str] = []
 
-    status = recipe.get("status", "emits")
-    need(
-        status in ("validated", "emits", "refused"),
-        f"status must be validated|emits|refused, got {status!r}",
-    )
-    if status == "refused":
-        # A refused recipe is a statement of support, not a build: it names what
-        # blocks it and stops there.
-        need(
-            bool(recipe.get("refusal")),
-            "a `refused` recipe must record `refusal` (the file:line that refuses it)",
-        )
-        need(
-            not recipe.get("emit") and not recipe.get("measured"),
-            "a `refused` recipe cannot carry [emit] or [measured]",
-        )
+    # The status/measured/refusal rules live in plow_dist so the publisher and
+    # this checker cannot disagree about what may be called `validated`.
+    pd.recipe_invariants(recipe)
+    if recipe.get("status", "emits") == "refused":
         return check_provenance(recipe, strict)
-    if status == "validated":
-        need(
-            bool((recipe.get("measured") or {}).get("tok_s")),
-            "a `validated` recipe must carry [measured] tok_s — it outranks an unmeasured "
-            "variant at selection",
-        )
 
     notes += check_provenance(recipe, strict)
 
@@ -346,7 +328,7 @@ def self_test() -> None:
         try:
             check(write(bad), bundle, objects, strict=False)
             raise AssertionError("accepted a contradicted emit knob")
-        except Invalid as e:
+        except pd.Fail as e:
             assert "contradictory PLOW_FP8_KV" in str(e), e
 
         # A knob the build never saw.
@@ -355,7 +337,7 @@ def self_test() -> None:
         try:
             check(write(bad), bundle, objects, strict=False)
             raise AssertionError("accepted an unknown emit knob")
-        except Invalid as e:
+        except pd.Fail as e:
             assert "no such knob" in str(e)
 
         # Target disagreements.
@@ -365,7 +347,7 @@ def self_test() -> None:
             try:
                 check(write(bad), bundle, objects, strict=False)
                 raise AssertionError(f"accepted target {field}={value}")
-            except Invalid:
+            except pd.Fail:
                 pass
 
         # A recorded digest that does not match the file.
@@ -374,7 +356,7 @@ def self_test() -> None:
         try:
             check(write(bad), bundle, objects, strict=False)
             raise AssertionError("accepted a wrong artifact digest")
-        except Invalid as e:
+        except pd.Fail as e:
             assert "hashes to" in str(e)
 
         # validated without a measurement.
@@ -383,8 +365,8 @@ def self_test() -> None:
         try:
             check(write(bad), bundle, objects, strict=False)
             raise AssertionError("accepted validated with no measurement")
-        except Invalid as e:
-            assert "must carry [measured]" in str(e)
+        except pd.Fail as e:
+            assert "must carry `[measured] tok_s`" in str(e)
 
         # A refused recipe states what blocks it and carries no build.
         refused = {
@@ -403,7 +385,7 @@ def self_test() -> None:
         try:
             check(write(bad), None, None, strict=False)
             raise AssertionError("accepted a refused recipe with no reason")
-        except Invalid:
+        except pd.Fail:
             pass
 
 

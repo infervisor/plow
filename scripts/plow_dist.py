@@ -224,6 +224,48 @@ def load_toml(path: Path):
         die(f"{path}: not valid TOML: {e}")
 
 
+def recipe_invariants(recipe: dict) -> None:
+    """The rules a recipe must satisfy, wherever it is read.
+
+    Shared by `check_recipe.py` (which validates a recipe against a build) and
+    `release_dist.py` (which validates one before publishing), because two
+    implementations of "may this be called validated?" could disagree — the same
+    hazard the packet-pairing check refuses on principle.
+    """
+    status = recipe.get("status", "emits")
+    if status not in ("validated", "emits", "refused"):
+        die(f"status must be validated|emits|refused, got {status!r}")
+
+    if status == "refused":
+        if not recipe.get("refusal"):
+            die("a `refused` recipe must record `refusal` — the file:line that refuses it")
+        if recipe.get("emit") or recipe.get("measured"):
+            die("a `refused` recipe cannot carry [emit] or [measured]")
+        return
+
+    if status == "validated" and not (recipe.get("measured") or {}).get("tok_s"):
+        die(
+            "a `validated` recipe must carry `[measured] tok_s`: a validated variant outranks "
+            "an unmeasured one at selection, so publishing one without a measurement would "
+            "misreport it. Use `emits` until a gate run fills it in."
+        )
+
+    git = recipe.get("plow_git")
+    if not git:
+        die("recipe has no `plow_git`: an asset is tied to the compiler source that built it")
+    if len(git) != 40:
+        die(f"`plow_git` must be a full 40-hex commit, got {git!r}")
+
+
+def recipe_target_matches(recipe: dict, target: dict, where: str) -> None:
+    """A recipe's `[target]` against a built artifact's target block."""
+    t = recipe.get("target") or {}
+    for field in ("isa", "sku"):
+        want, got = t.get(field), target.get(field)
+        if want and got and want != got:
+            die(f"{where}: recipe targets {field}={want}, artifact was built for {got}")
+
+
 def no_nix_store_paths(obj, where: str) -> None:
     """A published manifest must not reference the build host.
 
