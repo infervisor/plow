@@ -111,9 +111,43 @@ def to_block_fp8(w, block=BLOCK):
     return fp8, scale_inv
 
 
-def verify(root, index, layer, experts, proj, block=BLOCK):
+
+# e2m1 (mxfp4 element) magnitudes. 8 of them, non-uniform, with a power-of-two E8M0 scale per
+# group of 32 — the same group size this checkpoint already uses, which is why the mxfp4 route
+# can keep the source's grid where the block-fp8 route cannot.
+E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
+E2M1_MAX = 6.0
+
+
+def to_mxfp4(w, group=GROUP):
+    """Exact-dequantized float32 -> (values on the e2m1 grid, E8M0 power-of-two scale per group).
+
+    Returned as the DEQUANTIZED product rather than packed bytes: this is the error probe, and
+    packing is a separate, purely mechanical step. The scale is a power of two by construction —
+    E8M0 stores an exponent — so it is chosen as the smallest 2^e with max|w|/2^e <= 6.
+    """
     torch = _torch()
-    print(f"# layer {layer} proj {proj}: int4 g32 -> block-fp8 [{block},{block}]")
+    n, k = w.shape
+    ng = (k + group - 1) // group
+    grid = torch.tensor(E2M1, dtype=torch.float32)
+    out = torch.zeros_like(w)
+    for g in range(ng):
+        c0, c1 = g * group, min((g + 1) * group, k)
+        blk = w[:, c0:c1]
+        amax = blk.abs().amax(dim=1, keepdim=True)
+        # 2^e >= amax/6, i.e. e = ceil(log2(amax/6)); a zero group keeps scale 1.
+        e = torch.where(amax > 0, torch.ceil(torch.log2((amax / E2M1_MAX).clamp(min=1e-30))), torch.zeros_like(amax))
+        s = torch.pow(2.0, e)
+        r = blk / s
+        idx = (r.abs().unsqueeze(-1) - grid).abs().argmin(dim=-1)
+        out[:, c0:c1] = torch.sign(r) * grid[idx] * s
+    return out
+
+
+def verify(root, index, layer, experts, proj, block=BLOCK, enc="fp8"):
+    torch = _torch()
+    what = "mxfp4 g32 (e2m1 + E8M0)" if enc == "mxfp4" else f"block-fp8 [{block},{block}]"
+    print(f"# layer {layer} proj {proj}: int4 g32 -> {what}")
     print(
         f"{'expert':>6} {'rel_err_mean':>13} {'rel_err_max':>12} "
         f"{'scale_spread':>13} {'w_amax':>10}"
@@ -125,11 +159,16 @@ def verify(root, index, layer, experts, proj, block=BLOCK):
         scale = load_tensor(root, index, base + ".weight_scale")
         shape = load_tensor(root, index, base + ".weight_shape")
         w = dequantize_expert(packed, scale, shape)
-        fp8, sinv = to_block_fp8(w, block)
+        if enc == "mxfp4":
+            back = to_mxfp4(w)
+            sinv = None
+        else:
+            fp8, sinv = to_block_fp8(w, block)
         # Round-trip through the SAME arithmetic the kernel does: fp8 value * block scale.
-        back = fp8.to(torch.float32) * sinv.repeat_interleave(block, 0).repeat_interleave(
-            block, 1
-        )[: w.shape[0], : w.shape[1]]
+        if sinv is not None:
+            back = fp8.to(torch.float32) * sinv.repeat_interleave(block, 0).repeat_interleave(
+                block, 1
+            )[: w.shape[0], : w.shape[1]]
         denom = w.abs().mean().item()
         err = (back - w).abs()
         rel_mean = err.mean().item() / denom
@@ -153,6 +192,7 @@ def main():
     ap.add_argument("--experts", default="0,1,2,3", help="comma list")
     ap.add_argument("--proj", default="gate", choices=["gate", "up", "down"])
     ap.add_argument("--verify", action="store_true")
+    ap.add_argument("--enc", default="fp8", choices=["fp8", "mxfp4"])
     ap.add_argument(
         "--block",
         type=int,
@@ -165,7 +205,7 @@ def main():
     index = json.load(open(os.path.join(a.ckpt, "model.safetensors.index.json")))["weight_map"]
     if a.verify:
         experts = [int(x) for x in a.experts.split(",") if x != ""]
-        verify(a.ckpt, index, a.layer, experts, a.proj, a.block)
+        verify(a.ckpt, index, a.layer, experts, a.proj, a.block, a.enc)
         return
     print("nothing to do: pass --verify (conversion of the full 555 GB is a separate run)")
 

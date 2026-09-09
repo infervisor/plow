@@ -638,52 +638,38 @@ So this is a requantization, not a relabelling.
 | requantize to mxfp4 g32 + e8m0 | 539 GB | 67.4 | 32.7% | shipped (`MoeEnc::Mxfp4`) |
 | dequantize to fp8 e4m3 + [128,128] block | 1015 GB | **126.9** | **61.6%** | shipped (`MoeEnc::Fp8Blk`) |
 
-**The fp8 route is the one to take first**, despite being the largest:
+**Measurement overturned the first recommendation. The native int4 arm is the route.**
 
-* it fits with room — 126.9 GB/rank leaves ~79 GB for KV, activations and the non-expert weights,
-  where §3's TP4 failure was at 94.7% occupancy;
-* it reuses the arm GLM-5.3 is **already qualified on** in this document (ops 45/46/48/49,
-  block-fp8 e4m3 with a [128,128] `weight_scale_inv` grid) rather than a second arm;
-* it is numerically a WIDENING. e4m3 carries more precision than int4, so dequantizing the
-  shipped values into fp8 reproduces them closely. Requantizing to mxfp4 instead stacks a
-  *second* lossy quantization — into a different, non-uniform grid — on top of a checkpoint
-  Moonshot trained with QAT **for int4**. That risk is real and unquantified, and it is the wrong
-  thing to accept on a first bringup when a safer arm fits.
+This section originally argued for the fp8 route because it reuses a qualified arm. Two facts
+measured afterwards removed both conversion routes:
 
-The native int4-g32 arm (route 1) stays the right end state: it is exact, and it is the smallest
-of the three. It is new kernel work, and it should be measured against the fp8 route rather than
-assumed faster — §4 already shows fp8 LOSING to bf16 on DSV4's `expert down` at M=96, so narrow
-weights do not automatically win at decode-shaped M.
+**1. fp8 does not fit on this host.** 1015 GB of experts plus the non-expert weights is ~1.03 TB.
+`/workspace` has **881 GB free** (8.7 TB, 90% used, 2.1 TB of it models). The route that reuses
+the shipped arm cannot be materialised here without deleting other checkpoints.
 
-### Measured: what the fp8 route costs numerically
+**2. mxfp4 costs 4.4x the error of fp8.** Same verifier, same expert, same round-trip:
 
-`scripts/kimi_k27_prep.py --verify` dequantizes a real expert exactly (unpack order mirrored from
-`compressed_tensors.unpack_from_int32`, not guessed: nibble `i` of packed word `c` is column
-`8c+i`, stored unsigned with an offset of 8), re-encodes it to block-fp8, and round-trips it
-through the same arithmetic the kernel does — `fp8 * scale_inv`. Layer 3, `gate_proj`:
+| route | mean rel. err | max rel. err | total | GB/rank TP8 | fits? |
+|---|---:|---:|---:|---:|---|
+| int4 g32, native arm | **0** | **0** | 571 GB | 71.3 | yes |
+| block-fp8 `[128,128]` | 2.26% | 3.5% | 1015 GB | 126.9 | **no — 881 GB free** |
+| mxfp4 g32 | **9.96%** | 15.2% | 539 GB | 67.4 | yes |
 
-| scale grid | mean rel. err | max rel. err | in-block scale spread |
-|---|---:|---:|---:|
-| `[128,128]` (the shipped arm) | **2.264%** | 3.5% | 6.4x |
-| `[32,32]` (ablation) | **2.169%** | 3.0% | 6.4x |
+e2m1 has eight magnitudes — `{0, .5, 1, 1.5, 2, 3, 4, 6}` — against int4's sixteen uniform
+levels, so the remap discards information the checkpoint carries however the scale is chosen.
+~10% RMS on the routed-expert weights of a model QAT-trained for int4 is not a first-bringup
+risk worth taking, and it is the same order as int4's own 12.5% step rather than a fraction of
+it.
 
-**The grid is not the problem.** Refining it 4x along K — to the source's own group size — buys
-0.1 percentage points. The 2.2% is e4m3's own precision, and it has a specific cause: the int4
-values are integers in ±1..8, which e4m3 represents EXACTLY, but dividing them by a block scale
-incommensurate with their per-32 group scale turns them into arbitrary reals that need mantissa
-bits e4m3 does not have. (This is the same property mxfp4 sidesteps with power-of-two E8M0
-scales — and the reason a finer f32 grid cannot recover it.)
+So the ordering is: **build the int4-group-32 arm.** It is the only route that is exact, it is the
+smallest of the three, it fits with the most headroom, and it needs no 555 GB conversion pass at
+all — the checkpoint serves as shipped. The kernel work it requires is real, but it is now the
+*cheapest* path to a correct Kimi serve rather than the most expensive, because the two routes
+that avoided kernel work are respectively unmaterialisable and inaccurate on this host.
 
-So the fp8 route costs ~2.2% RMS on the routed-expert weights, on top of a checkpoint already
-quantized to int4. Whether that is acceptable is a judgement, and the honest framing is the ratio:
-int4's own step is 1/8 = 12.5% of a group's maximum, which this model was QAT-trained to tolerate,
-and 2.2% RMS is a fraction of that. It is also the same order as the fp8 error GLM-5.3 already
-serves under in §3. It is NOT free, and it is not something to discover after converting 555 GB —
-which is why the verifier exists and why it runs on four experts in seconds.
-
-The native int4-g32 arm remains the only route with **zero** added error, and it is also the
-smallest (71.3 GB/rank). The fp8 route's case is that it reuses a qualified arm and can be
-measured this week; the int4 arm's case is that it is exact. Both should be built; fp8 first.
+`scripts/kimi_k27_prep.py` keeps both conversions and the verifier: they are how the above was
+established, they price any future host with more disk, and the exact dequantizer in it is the
+reference an int4 arm has to match.
 
 ### Gates after the encoding, unchanged in substance
 
