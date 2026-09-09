@@ -2501,9 +2501,21 @@ pub(crate) fn declare_glm_rows_batched(
             // Dense-FFN weights. Block-fp8 keeps the checkpoint's own byte layout and its
             // [N/128][K/128] f32 `weight_scale_inv` grid; MXFP4 halves the weight and swaps the
             // grid for E8M0 rows. `mxd`/`mxd_s` pick per encoding so the two never disagree.
+            //
+            // BF16 IS ITS OWN ARM, and it has to be. The catch-all used to size every non-MXFP4
+            // dense weight at ONE byte per element and declare a `weight_scale_inv` beside it,
+            // which is block-fp8's layout, not bf16's. Kimi-K2.7-Code's `ignore` list excludes
+            // `mlp.(gate|up|gate_up|down)_proj` from quantization, so its dense weights really
+            // are BF16 [18432, 7168] with no scale grid at all -- and the catch-all declared
+            // 132,120,576 bytes for a 264,241,152-byte tensor. The grouped prefill arm, correctly
+            // told `fp8=0`, then read two bytes per element out of a half-sized allocation and
+            // walked off the end: `Memory access fault by GPU node-8 ... Reason: Unknown` on the
+            // dense block, while the MoE block in the same lease ran clean. Sizing follows the
+            // encoding here so a bf16 dense layer cannot be handed an fp8 footprint again.
             dgate: if dense {
                 match enc {
                     MoeEnc::Mxfp4 => t(b, "mlp.gate_proj.weight", (di_l * h) as u64 / 2),
+                    MoeEnc::Bf16 => t(b, "mlp.gate_proj.weight", (di_l * h) as u64 * BF16),
                     _ => t(b, "mlp.gate_proj.weight", (di_l * h) as u64),
                 }
             } else {
@@ -2512,6 +2524,9 @@ pub(crate) fn declare_glm_rows_batched(
             dgate_s: if dense {
                 match enc {
                     MoeEnc::Mxfp4 => mxs(b, "mlp.gate_proj.weight", di_l as u64, h as u64),
+                    // bf16 dense carries NO scale grid; declaring one invents a tensor the
+                    // checkpoint does not have and desynchronises the arm from the weight.
+                    MoeEnc::Bf16 => TENSOR_NONE,
                     _ => t(
                         b,
                         "mlp.gate_proj.weight_scale_inv",
@@ -2524,6 +2539,7 @@ pub(crate) fn declare_glm_rows_batched(
             dup: if dense {
                 match enc {
                     MoeEnc::Mxfp4 => t(b, "mlp.up_proj.weight", (di_l * h) as u64 / 2),
+                    MoeEnc::Bf16 => t(b, "mlp.up_proj.weight", (di_l * h) as u64 * BF16),
                     _ => t(b, "mlp.up_proj.weight", (di_l * h) as u64),
                 }
             } else {
@@ -2532,6 +2548,7 @@ pub(crate) fn declare_glm_rows_batched(
             dup_s: if dense {
                 match enc {
                     MoeEnc::Mxfp4 => mxs(b, "mlp.up_proj.weight", di_l as u64, h as u64),
+                    MoeEnc::Bf16 => TENSOR_NONE,
                     _ => t(b, "mlp.up_proj.weight_scale_inv", (db_l * hb) as u64 * F32),
                 }
             } else {
@@ -2540,6 +2557,7 @@ pub(crate) fn declare_glm_rows_batched(
             ddown: if dense {
                 match enc {
                     MoeEnc::Mxfp4 => t(b, "mlp.down_proj.weight", (h * di_l) as u64 / 2),
+                    MoeEnc::Bf16 => t(b, "mlp.down_proj.weight", (h * di_l) as u64 * BF16),
                     _ => t(b, "mlp.down_proj.weight", (h * di_l) as u64),
                 }
             } else {
@@ -2548,6 +2566,7 @@ pub(crate) fn declare_glm_rows_batched(
             ddown_s: if dense {
                 match enc {
                     MoeEnc::Mxfp4 => mxs(b, "mlp.down_proj.weight", h as u64, di_l as u64),
+                    MoeEnc::Bf16 => TENSOR_NONE,
                     _ => t(
                         b,
                         "mlp.down_proj.weight_scale_inv",
@@ -6789,10 +6808,17 @@ pub(crate) fn emit_glm_moe_ffn(
 /// The dense-FFN down projection's opcode for an encoding. Block-fp8 and bf16 both go through
 /// `GEMV_FP8_BLK` (the dense down has no bf16-specific op); MXFP4 has its own.
 fn dense_down_op(enc: MoeEnc) -> DevOp {
-    if enc == MoeEnc::Mxfp4 {
-        DevOp::GemvMxfp4
-    } else {
-        DevOp::GemvFp8Blk
+    match enc {
+        MoeEnc::Mxfp4 => DevOp::GemvMxfp4,
+        // A BF16 dense layer is not block-fp8 with the scales left off: `GemvFp8Blk` casts its
+        // weight to `const unsigned char*` and its scale to `const float*`, so pointing it at a
+        // bf16 weight reads half the bytes and dereferences a null grid. Kimi-K2.7-Code's
+        // `ignore` list excludes `mlp.(gate|up|gate_up|down)_proj`, so its dense FFN really is
+        // bf16 and needs the plain arm. The operand slots already line up -- `Gemv` is
+        // [C, x, W] with i = [M, N, K], which is what this call site binds -- so only the opcode
+        // changes; `ddown_s` is TENSOR_NONE on this arm and the t5 bind below is inert.
+        MoeEnc::Bf16 => DevOp::Gemv,
+        _ => DevOp::GemvFp8Blk,
     }
 }
 
@@ -6856,7 +6882,22 @@ pub(crate) fn emit_glm_dense_ffn(
     // the E8M0 rows land in t3/t4 exactly where the block-fp8 grids did. i[0]/i[1] swap meaning
     // between the two ops (op 47 is i0=N i1=K; op 92 is i0=M i1=N i2=K), which is why this is a
     // separate emit rather than an opcode substitution.
-    let c_glu = if enc == MoeEnc::Mxfp4 {
+    let c_glu = if enc == MoeEnc::Bf16 {
+        // BF16 dense SwiGLU: the plain fused GLU (`GemvGlu`), same operands minus the scale
+        // grids. The index meanings DIFFER from op 47 -- `GemvGlu` is i0=M i1=N i2=K where
+        // block-fp8 is i0=N i1=K -- which is why this is its own emit and not an opcode swap,
+        // exactly as the MXFP4 arm below is.
+        b.emit(DevOp::GemvGlu, all.clone(), &[c_rn2], |d| {
+            d.t[0] = n.dfu;
+            d.t[1] = n.xn2;
+            d.t[2] = w.dgate;
+            d.t[5] = w.dup;
+            d.i[0] = 1;
+            d.i[1] = di_l;
+            d.i[2] = h;
+            d.i[5] = GLM_ACT_SILU;
+        })
+    } else if enc == MoeEnc::Mxfp4 {
         b.emit(DevOp::GemvGluMxfp4, all.clone(), &[c_rn2], |d| {
             d.t[0] = n.dfu;
             d.t[1] = n.xn2;
