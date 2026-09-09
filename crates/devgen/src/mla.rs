@@ -4851,54 +4851,16 @@ pub(crate) fn emit_glm_mla_prefill(
     // B2's head-batched gather fills the 64 M-rows with (8 queries x 8 heads); a shard with
     // any other per-rank head count has no row map, so those configs stay dense.
     //
-    // `w.iwqb != TENSOR_NONE` RESTRICTS THIS TO THE 21 'full' INDEXER LAYERS, AND THAT IS LOAD
-    // BEARING — it is not the oversight the next sentence of the old comment made it look like.
-    // GLM-5.3's `indexer_types` is 21 'full' to 57 'shared', and the comment here used to say
-    // that shared layers "reuse the previous full layer's union table" and that "`c_uni` threads
-    // that reuse". `c_uni` does not exist anywhere in this tree; that sentence described
-    // behaviour no code implements, so it reads as a missing feature. It was TRIED:
-    //
-    //   * dropping the `iwqb` term takes the gather from 21 of 78 flash ops to 78 of 78
-    //     (verified on the raw operand — both arms are opcode 51 and it is t7's presence that
-    //     selects the gather: `t7=NONE x57, t7=iuni x21` became `t7=iuni x78`);
-    //   * it is a large, real speedup — 70k prefill attention 17,391 ms -> 2,747 ms (6.3x) and
-    //     flat in context instead of quadratic, whole prefill 25,645 -> 13,640 ms (1.88x);
-    //   * and it is WRONG. A needle planted at the front of a 40k haystack, which both dense and
-    //     the 21-layer gather recover, is MISSED; the continuation of a repeated phrase degrades
-    //     to 'the fox over dog over over the the'. Deterministic across repeats, so it is the
-    //     selection semantics and not a race on the shared `n.iuni` buffer.
-    //
-    // So a 'shared' layer may not simply attend the previous full layer's union. Whatever it is
-    // entitled to reuse, plow's 8-query union is not it, and the missing piece is a semantic
-    // one, not the plumbing. docs/amd/tp-bringup-mi300x.md 7g.
-    // BISECT (PLOW_GLM_DSA_PF_SPAN): how many layers past the indexer may reuse its union.
-    //   0  the shipped 21 -- only layers that own an indexer.
-    //   1  full + the layer immediately after it (~42 layers), so every reuse is at distance 1.
-    //   n  full + n following layers; >=3 is every layer, since 'shared' runs come in threes.
-    // This separates the two live explanations for the all-layer failure. If distance-1 reuse is
-    // correct, the union is being shared soundly and what degrades is the SHARE of layers running
-    // sparse (a selection-quality effect). If distance-1 is already wrong, reuse itself is broken
-    // and the distance does not matter. The reference reuses at distances 1..3
-    // (vllm/models/deepseek_v32/attention.py: `topk_indices_buffer` is passed to the attention
-    // call unconditionally, and `self.skip_topk` is hardcoded False -- only whether the layer
-    // OWNS an indexer varies), so a correct plow reaches span 3.
-    // DEFAULT 1, not 0: span 1 is measured both FASTER and CORRECT against span 0, so a flag
-    // whose best value is known has no business defaulting to a worse one. The whole DSA prefill
-    // path is opt-in behind PLOW_GLM_DSA_PF, so this changes nothing for a build that does not
-    // ask for it. Set 0 to get the indexer-layers-only behaviour back, 2+ to reproduce the
-    // failure.
+    // Shared layers consume the last full layer's union. Ragged chunks must patch the
+    // selection chain and flash to the same live row count: both derive causal query
+    // positions and the union header from it (see plowrt::exec::kvrow).
+    // SPAN: 0 = indexer layers only, 1 = one successor, 3 = every GLM-5.3 layer.
+    // Keep the default at 1 while qualifying all-layer reuse after the row-count fix.
     let span = std::env::var("PLOW_GLM_DSA_PF_SPAN")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(1);
-    // PLOW_GLM_DSA_PF_DEXACT=d admits ONLY layers exactly d past an indexer, where SPAN admits
-    // everything up to d. That is what separates the two live explanations for the span-2
-    // failure, which span alone cannot: span 1 (40 layers, all reuse at distance 1) is correct
-    // and span 2 (59 layers, distances 1 and 2) is not, so distance and layer COUNT both moved.
-    // DEXACT=2 gathers on the 21 indexer layers plus the 19 at exactly distance 2 -- 40 layers,
-    // the SAME count as span 1, with every reuse at distance 2. Correct => the count is what
-    // matters and plow's selection quality is the ceiling; wrong => the distance is, and it is a
-    // bug worth the remaining 6.3x on attention.
+    // Exact-distance selection holds the sparse layer count constant for a reuse bisect.
     let dexact = std::env::var("PLOW_GLM_DSA_PF_DEXACT")
         .ok()
         .and_then(|v| v.parse::<usize>().ok());

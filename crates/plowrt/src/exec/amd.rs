@@ -18608,6 +18608,41 @@ mod tests {
         assert_eq!(insts[11].i, before[11].i, "a banded GEMM was rewritten");
     }
 
+    #[test]
+    fn ragged_sparse_prefill_keeps_selection_and_flash_layouts_equal() {
+        const T: u32 = 8192;
+        let inst = |op: DevOp, i: [u32; 8]| DevInst64 {
+            op: op as u16,
+            t: [u16::MAX; 8],
+            i,
+            ..Default::default()
+        };
+        let chain = vec![
+            inst(DevOp::LayerNorm, [T, 128, 0, 0, 0, 0, 0, 0]),
+            inst(DevOp::IndexScorePf, [T, 32, 81920, 128, 0, 0, 0, 0]),
+            inst(DevOp::IndexSelectPf, [T, 2048, 81920, 0, 0, 0, 0, 0]),
+            inst(DevOp::IndexUnionPf, [T, 2048, 81920, 16384, 8, 0, 0, 0]),
+            inst(
+                DevOp::FlashMlaPrefill,
+                [1, 8, 81920, 0, T, u32::MAX, 16384, 0],
+            ),
+        ];
+        for rows in [1, 2049, 4097, T] {
+            let mut insts = chain.clone();
+            rebase_chunk_rows(&mut insts, &[], T, rows, T, Some(T));
+            for d in &insts[..4] {
+                assert_eq!(d.i[0], insts[4].i[4], "op {} retained padded rows", d.op);
+            }
+            assert_eq!(insts[4].i[4], rows);
+            for (before, after) in chain[..4].iter().zip(&insts[..4]) {
+                assert_eq!(before.i[1..], after.i[1..], "index geometry changed");
+            }
+            let union_header = (insts[3].i[0].div_ceil(8) * 4).div_ceil(256) * 256;
+            let flash_header = (insts[4].i[4].div_ceil(8) * 4).div_ceil(256) * 256;
+            assert_eq!(union_header, flash_header);
+        }
+    }
+
     /// A FULL last chunk (`clen == T`) must leave every instruction alone — the
     /// shrink is a no-op on an exactly-covered prompt, which is what keeps
     /// 1024/4096/8192/16384 byte-identical to the padded path.

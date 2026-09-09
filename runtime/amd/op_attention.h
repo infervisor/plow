@@ -5692,16 +5692,18 @@ __device__ void d_index_union_pf(unsigned char* __restrict__ uni,
             const unsigned long long m =
                 (s < tile_end) ? atomicOr(&mrow[s], 0ull) : 0ull;
             const unsigned flag = m != 0ull;
-            sc[tid] = flag;
+            const unsigned lane = tid % PLOW_WAVE, wave = tid / PLOW_WAVE;
+            const unsigned long long bits = __ballot(flag);
+            unsigned rank = __popcll(bits & ((1ull << lane) - 1ull));
+            if (lane == 0) sc[wave] = __popcll(bits);
             __syncthreads();
-            for (unsigned off = 1; off < PLOW_THREADS; off <<= 1) {
-                const unsigned v = (tid >= off) ? sc[tid - off] : 0u;
-                __syncthreads();
-                sc[tid] += v;
-                __syncthreads();
+            unsigned total = 0;
+#pragma unroll
+            for (unsigned w = 0; w < PLOW_WAVES; ++w) {
+                const unsigned count = sc[w];
+                if (w < wave) rank += count;
+                total += count;
             }
-            const unsigned rank = sc[tid] - flag;
-            const unsigned total = sc[PLOW_THREADS - 1];
             if (flag && base + rank < cap) {
                 st_act<int>(&as_glob(upos)[base + rank], (int)s);
                 st_act<unsigned>(&as_glob(ulo)[base + rank], (unsigned)(m & 0xFFFFFFFFull));

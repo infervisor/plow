@@ -12,6 +12,10 @@ actually measured: the hardware ceiling at their own per-rank shapes, which
 bounds them on this part. No end-to-end serving number is invented for a model
 that does not serve.
 
+**2026-09-09 correction:** §10 identifies and fixes the ragged-row defect behind
+the historical sparse-span failures. The reuse-distance explanations in §7 are
+superseded. The H200 serving target has not been matched.
+
 ---
 
 ## 0. Target parameter block
@@ -1984,7 +1988,8 @@ Measured GLM-5.3 levers on TP8, with their original comparison conditions:
 | GEMM retune | approximately neutral | +1.0%, near measured run-to-run noise; §7p |
 
 These deltas have different baselines and must not be added. Sparse spans 2 and 3
-fail the recorded quality probes and remain experimental. Audit-off results also
+failed the original quality probes; §10 corrects the cause and records the fix.
+They remain experimental pending broader qualification. Audit-off results also
 remove a correctness check; matched decode tiers provide a gain independently.
 
 The review fixes two runtime configuration defects: serving replay now uses the actual
@@ -1996,3 +2001,77 @@ Review validation: 28 GLM emitter tests passed with one test thread;
 `cargo test -p plowrt --features hsa --test config_env` passed, including a CLI
 override after the `serve` subcommand and an explicit empty tier setting.
 Formatting and `git diff --check` passed. No new GPU timing was taken in this review.
+
+## 10. Ragged sparse prefill: correctness fix and union compaction (2026-09-09)
+
+The all-layer failure was a runtime row-count defect. `rebase_chunk_rows` shrank
+flash and the projections to the final chunk's live length, but left `LayerNorm`,
+`IndexScorePf`, `IndexSelectPf`, and `IndexUnionPf` at the compiled bucket length.
+Selection consequently computed the wrong causal query positions. Union and flash
+also disagreed on the size of the aligned count header, so flash read the wrong
+locations in the union table. This invalidates the earlier reuse-distance and
+selection-quality explanations; those experiments ran with inconsistent layouts.
+
+Add those four operations to `PREFILL_ROW_FIELDS`. A regression test fails before
+the fix and checks the complete selection chain against flash for live row counts
+1, 2049, 4097, and 8192. Eight ragged-prefill tests pass afterward. The serving
+release binary builds with `--features hsa`.
+
+Same-host TP8 quality checks, BF16 KV, sparse prefill on, sparse decode off,
+8192-token chunks, no prefill interleaving, V2 flash, audit retained:
+
+| Runtime / sparse layers | Actual prompt tokens | Fact retrieval |
+|---|---:|---:|
+| Original, span 1 (40/78) | 27,505–27,510 | 3/3 |
+| Original, all 78 | 27,505–27,510 | 0/3 |
+| Original, all 78, ragged chunks disabled | 41,269–41,274 | 3/3 |
+| Fixed, all 78, ragged chunks enabled | 27,505–27,510; 41,269–41,274; 68,797–68,802 | 9/9 |
+| Fixed + optimized union, all 78, depths 0.5 and 0.9 | 68,797–68,802 | 6/6 |
+
+These use `scripts/glm53_needle_probe.py`, three facts at depth 0.1 unless stated, temperature 0,
+24 output tokens. The script's requested lengths are estimates; the table reports
+tokenized lengths. Retrieval checks are limited quality evidence, not a general
+model-quality evaluation. The emitter default remains span 1. Explicit
+`PLOW_GLM_DSA_PF_SPAN` and `PLOW_GLM_DSA_PF_DEXACT` settings now appear in the build
+manifest's `unrecorded_env` section so different sparse packets are distinguishable;
+these raw settings still need to be supplied explicitly when reproducing an emit.
+
+With the fixed runtime and the same optimized union objects in both arms, a
+same-lease `amd-bench --prefill-sweep 70000 --prefill-reps 3 --steps 1` comparison
+measured span 1 at **18,899.957 ms** (0.89% spread) and all 78 layers at
+**13,183.719 ms** (0.47% spread): 30.2% less prefill time, or 1.43x throughput.
+Each arm discarded one warmup. This is a single-prompt prefill measurement, not
+concurrency-20 serving. Both assets use max context 81920, decode batch 8, and
+prefill buckets 128/512/2048/8192. The checkpoint is `GLM-5.3-plow-lite`.
+
+Separately, `d_index_union_pf` replaces the workgroup-wide LDS prefix scan with
+wave ballots and a scan of wave counts. It preserves ascending positions and all
+64 membership bits. The independent HIP test compares counts, positions, and
+masks exactly against a host union, including short/ragged packs and a representative
+8192-row, 81920-context, top-k 2048 case.
+
+An A/B/A/B on one leased MI300X measured the representative union at
+1.7160/1.6959 ms before and 1.1434/1.1725 ms afterward: approximately 32% less time.
+All three cases passed exact comparison on both runs. A separate full-model
+70k prefill comparison, span 1 with the original runtime, measured medians
+19,133.384 ms before and 19,044.211 ms afterward (three samples after warmup).
+The 0.47% difference is within the observed 0.50–0.75% spread; it does **not**
+establish a serving speedup. The production interpreter build passes its object
+contract check with unchanged build defines and resource usage.
+
+Reproduce the union test inside `nix develop` (use a free GPU lease):
+
+```sh
+"$PLOW_HIPCC" --offload-arch=gfx942 -O3 -w -std=c++17 \
+  -Iruntime/amd -Iruntime/common -c runtime/tests/dsa_union_gfx942_test.hip \
+  -o /tmp/dsa-union.o
+c++ /tmp/dsa-union.o -L"$ROCM_PATH/lib" -Wl,-rpath,"$ROCM_PATH/lib" \
+  -lamdhip64 -o /tmp/dsa-union
+perf-data/tools/gpulease -n 1 dsa-union /tmp/dsa-union
+```
+
+The target remains 100 requests at concurrency 20, 70k/700 random lengths with
+ratio 0.14 and seed 0: 273.67 output tok/s, 1.431 s mean TTFT, and 65.92 ms mean
+TPOT on the supplied H200 run. No speculative decoding is enabled by these changes.
+The reference's aggregate serving measurements include speculation and cannot be
+converted into a measured non-speculative baseline by ignoring its acceptance table.
