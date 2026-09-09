@@ -748,7 +748,7 @@ the existing cuBLASLt numerical differences and model-quality caveat still apply
 Adaptive serving checks pass: all 12 cold/warm natural completions match the
 fixed-width cuBLASLt reference, eight concurrent cold 16K requests match their
 isolated replays, and recovery, three API checks, 32 sampling pairs and 16
-cancelled streams complete successfully. The matched serving screen is pending.
+cancelled streams complete successfully.
 The option remains experimental and is not enabled by default.
 
 Raw results and artifact hashes are in
@@ -763,3 +763,18 @@ no builds or other GPU jobs overlap timing. These are decode-step diagnostics,
 not serving throughput or a vLLM comparison. Raw measurements are in
 `gemma-bf16-cublaslt-adaptive-step-comparison.json` and
 `gemma-bf16-{native,adaptive}-shared-step-b{1,8}.log` in the campaign directory.
+
+The matched nine-cell serving screen completes all 39 requests with identical
+prompt hashes, cache counts and output lengths. All 39 completion texts match
+fixed-width cuBLASLt; 38 match native BF16. Adaptive throughput exceeds native
+BF16 in all nine cells, including all three single-request cases. At 1K/C1,
+throughput rises from 30.67 to 31.90 output tokens/s; at 1K/C8, from 84.25 to
+142.41. Median TPOT improves in every cell.
+
+TTFT remains mixed: four cells regress vs native, including 1K/C4 from 305 to
+441 ms and 4K/C8 from 1336 to 1407 ms. Adaptive throughput also regresses vs the
+fixed-width candidate at 4K/C4, from 72.91 to 65.17 tokens/s. This is one measured
+wave per cell after warmup, with no overlapping builds or GPU jobs; it does not
+establish a vLLM win or qualify default promotion. Full results are in
+`gemma31-h100-bf16-cublaslt-adaptive-preflight.csv`, with raw comparison in
+`gemma-bf16-cublaslt-adaptive-serving-comparison.json` in the campaign directory.
