@@ -140,7 +140,7 @@ impl GpuEngine {
                     self.seq_tokens[chunk.slot].extend_from_slice(chunk.tokens);
                 }
                 for slot in completed {
-                    self.vmm_tail_publish(slot);
+                    self.vmm_publish(slot, self.pos[slot].saturating_sub(1));
                 }
             }
             if !state.fired {
@@ -200,9 +200,19 @@ mod tests {
     #[test]
     #[ignore = "requires H100 packed-prefix assets and natural prompt reference metadata"]
     fn unified_cuda_rows_match_isolated_suffixes_and_commit_once() {
+        check_unified_rows(false);
+    }
+
+    #[test]
+    #[ignore = "requires H100 packed-prefix assets and natural prompt reference metadata"]
+    fn unified_cuda_aligned_prompts_reuse_prefixes() {
+        check_unified_rows(true);
+    }
+
+    fn check_unified_rows(aligned: bool) {
         let assets = PathBuf::from(std::env::var("CUDA_TOKEN_BATCH_TEST_ASSETS").unwrap());
         let reference = PathBuf::from(std::env::var("CUDA_TOKEN_BATCH_TEST_REFERENCE").unwrap());
-        let prompts: Vec<Vec<u32>> = (0..2)
+        let mut prompts: Vec<Vec<u32>> = (0..2)
             .map(|i| {
                 let record: serde_json::Value = serde_json::from_slice(
                     &std::fs::read(reference.join(format!("{i}.json"))).unwrap(),
@@ -211,6 +221,10 @@ mod tests {
                 serde_json::from_value(record["prompt_ids"].clone()).unwrap()
             })
             .collect();
+        if aligned {
+            prompts[0].truncate(1024);
+            prompts[1].truncate(16384);
+        }
         let mut e = GpuEngine::load(
             Arc::new(CudaBackend::new(0).unwrap()),
             &assets,
@@ -339,6 +353,9 @@ mod tests {
         assert_eq!(output.len(), 1);
         assert_eq!(output[0].0, 123);
         assert_eq!(e.pos[slot], 256);
+        e.begin_slot(1, 257).unwrap();
+        assert_eq!(e.attach_prompt(1, prompt).unwrap(), 224);
+        e.retire_slot(1, false);
 
         let token = [output[0].1];
         let stale = request(&e, 123, slot, Phase::Decode, &token, 256);

@@ -5229,7 +5229,7 @@ impl GpuEngine {
         // of re-prefilling it — then drop the previous sequence's mappings/
         // cache references. Prefix admission maps after lookup; every execution
         // path maps the rows it writes, including inactive decode rows.
-        self.vmm_tail_publish(b);
+        self.vmm_publish(b, self.pos[b]);
         self.pos[b] = 0;
         self.vmm_attached[b] = 0;
         if let Some(v) = &self.vmm {
@@ -5251,7 +5251,7 @@ impl GpuEngine {
             return;
         }
         if cache_output {
-            self.vmm_tail_publish(b);
+            self.vmm_publish(b, self.pos[b]);
         }
         self.pos[b] = 0;
         self.vmm_attached[b] = 0;
@@ -5333,13 +5333,13 @@ impl GpuEngine {
         }
     }
 
-    /// Publish slot `b`'s current sequence up to its last 32-token boundary —
-    /// prompt AND generated rows — into the prefix cache. Skips (never
-    /// fails serving) when the row-token record is inconsistent, the
+    /// Publish slot `b` up to a computed 32-token boundary. Prompt publication
+    /// limits rows to prompt_len - 1 so an identical prompt can replay its tail.
+    /// Skips without failing serving when the row-token record is inconsistent, the
     /// sequence is shorter than 32 tokens, or the sliding rings no longer
     /// hold the boundary's window rows (`rows - p_a > ring - window`:
     /// wrapped past, unrecoverable).
-    fn vmm_tail_publish(&self, b: usize) {
+    fn vmm_publish(&self, b: usize, max_rows: u32) {
         let Some(v) = self.vmm.as_ref().filter(|v| v.kv.prefix_reuse()) else {
             return;
         };
@@ -5349,7 +5349,7 @@ impl GpuEngine {
             return;
         }
         let g = v.kv.geometry();
-        let p_a = (rows / 32) * 32;
+        let p_a = (rows.min(max_rows) / 32) * 32;
         if p_a == 0 {
             return;
         }
@@ -6772,7 +6772,7 @@ impl GpuEngine {
             self.seq_tokens[b].extend_from_slice(prompt);
         }
         if let Some(v) = self.vmm.as_ref().filter(|v| v.kv.prefix_reuse()) {
-            let p_a = (n as u32 / 32) * 32;
+            let p_a = (n.saturating_sub(1) as u32 / 32) * 32;
             if p_a > 0 {
                 let snap_bytes = self.vmm_snap_bytes(p_a);
                 if let Err(e) = v.kv.publish_at(b, prompt, p_a, snap_bytes, |dst| {
@@ -7437,7 +7437,7 @@ impl GpuEngine {
                 let end = r.c0 + r.len;
                 self.seq_tokens[r.slot].clear();
                 self.seq_tokens[r.slot].extend_from_slice(&r.prompt[..end]);
-                self.vmm_tail_publish(r.slot);
+                self.vmm_publish(r.slot, r.prompt.len().saturating_sub(1) as u32);
             }
         }
         Ok(())

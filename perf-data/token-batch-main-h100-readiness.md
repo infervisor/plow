@@ -1166,3 +1166,55 @@ This enables actual default dispatch on the qualified H100 assets. AMD prefix
 integration, fresh compiler defaults, packed FP8-KV assets, ordinary-decode quality
 comparison, cache retention, sampling performance and broader production
 qualification remain open. The sealed BF16-weight/FP8-KV checkpoint is unchanged.
+
+### Prompt snapshot retention and aligned boundaries (2026-09-09)
+
+Two cache misses were reproduced before the fix: generated-output snapshots
+could evict a reusable prompt snapshot under the shared VMM budget, and a prompt
+ending exactly on a 32-token boundary published only its complete length, which
+an identical prompt cannot attach because sampling must recompute an input row.
+
+Shared VMM now retains the admission prompt length across publications and
+reclaims unheld output-only snapshots before prompt snapshots or their KV blocks.
+A generated boundary gains prompt priority when a follow-up actually attaches it.
+Existing LRU turnover, restore pins and OOM reclamation remain tested. This policy
+uses the common VmmOps interface, with no CUDA-specific branch or budget increase.
+The NVIDIA adapter publishes completed prompts below the final input token in
+ordinary, packed and unified execution; output publication still covers consumed
+rows. No compiled ladder rungs or checkpoint assets changed.
+
+Validation: 640 host tests passed, 21 ignored; independent HSA-only and CUDA-only
+all-target checks passed. BF16 and FP8 aligned 1K/16K H100 tests each passed 32
+full-vocabulary matching-computation frames, completed 256-token unified-prefix
+reattachment, intermediate/final output handling and stale/duplicate rejection.
+The FP8 isolated ordinary tail differed from its compact tail on one frame
+(max absolute difference 0.0625); exact comparisons still use the matched compact
+tail. H100 evidence does not qualify AMD prefix integration or AMD device execution.
+
+The same functional pressure driver queued 64 requests (32 each at 1055/16415
+input tokens, four output tokens) after its warmup/cancellation checks:
+
+| Runtime / weight precision / cache | 1K cache hits | 16K cache hits | Median 1K E2E | Median 16K E2E |
+|---|---:|---:|---:|---:|
+| Previous / FP8 / 4 GiB repeat | 25/32 | 10/32 | 4.579 s | 154.088 s |
+| Previous / FP8 / 8 GiB | 32/32 | 32/32 | 3.853 s | 5.839 s |
+| Retention fix / FP8 / 4 GiB | 32/32 | 32/32 | 4.023 s | 6.229 s |
+| Retention fix / FP8 / 4 GiB repeat | 32/32 | 32/32 | 3.835 s | 6.115 s |
+| Retention fix / BF16 / 4 GiB | 32/32 | 32/32 | 5.339 s | 6.073 s |
+
+Each candidate campaign completed 77 requests, including recovery; repeated
+pressure prompts returned identical text within each prompt group. They logged
+11/10/18 mixed commits respectively. In the first FP8 candidate run, cache bytes
+before and after pressure were 4,115,660,800 (below 4 GiB), with zero radix-node
+evictions and 64 additional attach hits. The larger-budget control and candidate
+comparisons ran without overlapping CPU builds or GPU jobs. These results isolate
+cache retention in this workload; the permissive SLO, explicit queue bound and
+diagnostic logging do not establish production throughput or deadline compliance.
+Both weight precisions still use BF16 KV here.
+
+The candidate rollback screen (`PLOW_TOKEN_BATCH=0`) completed 12 requests with
+prefix hits and zero mixed commits. The four final candidate campaigns total 243
+successful requests, including 192/192 pressure hits. Campaign
+`prompt-retention-qualification.json` records source and runtime hashes plus the
+four result files. Frozen runtime SHA-256:
+`28ccb9aae26ec04dee46a7cf3fbf28573305c69bd14b74065d5a223205664175`.

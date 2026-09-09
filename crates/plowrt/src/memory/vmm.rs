@@ -604,6 +604,7 @@ struct BoundaryKey {
 struct SlotSeq {
     hashes: Vec<BlockHash>,
     tokens: Vec<u32>,
+    prompt_rows: usize,
     held: usize,
     snapshot: Option<BoundaryKey>,
 }
@@ -617,6 +618,7 @@ struct Snap {
     users: usize,
     last_used: u64,
     referenced: bool,
+    reusable_prompt: bool,
 }
 
 struct Inner {
@@ -984,6 +986,7 @@ impl VmmKv {
             inner.seqs[seq] = SlotSeq {
                 hashes,
                 tokens: prompt.to_vec(),
+                prompt_rows: prompt.len(),
                 held: 0,
                 snapshot: None,
             };
@@ -1001,6 +1004,7 @@ impl VmmKv {
         inner.seqs[seq] = SlotSeq {
             hashes,
             tokens: prompt.to_vec(),
+            prompt_rows: prompt.len(),
             held: pick,
             snapshot: Some(snap_key),
         };
@@ -1011,6 +1015,7 @@ impl VmmKv {
         snap.users += 1;
         snap.last_used = tick;
         snap.referenced = true;
+        snap.reusable_prompt = true;
         let attach = Attach { rows, snap_va: snap.va, snap_bytes: snap.bytes };
 
         // COMMIT the whole attach under the lock — slot table, refcounts,
@@ -1200,6 +1205,11 @@ impl VmmKv {
         }
         let hashes = hash_blocks(&tokens[..rows as usize], s.block_rows);
         let n_pub = hashes.len();
+        let prompt_rows = match inner.seqs[seq].prompt_rows {
+            0 => tokens.len(),
+            rows => rows,
+        };
+        let reusable_prompt = (rows as usize) < prompt_rows;
 
         let m = inner.cache.lookup(&hashes, tokens);
         let pid = inner.next_pub;
@@ -1238,6 +1248,7 @@ impl VmmKv {
         release_prefix_hold(&mut inner, seq);
         inner.seqs[seq] = SlotSeq {
             tokens: tokens.to_vec(),
+            prompt_rows,
             hashes,
             held: n_pub,
             snapshot: None,
@@ -1258,6 +1269,7 @@ impl VmmKv {
             .and_then(|list| list.iter_mut().find(|snap| snap.rows == rows && snap.tail == tail))
         {
             snap.last_used = tick;
+            snap.reusable_prompt |= reusable_prompt;
         } else {
             let va = loop {
                 match s.ops.alloc(snap_bytes) {
@@ -1280,6 +1292,7 @@ impl VmmKv {
                     users: 0,
                     last_used: tick,
                     referenced: false,
+                    reusable_prompt,
                 });
             inner.stats.snapshot_bytes += snap_bytes;
             inner.stats.cache_bytes += snap_bytes;
@@ -1500,9 +1513,19 @@ fn free_snapshot(s: &Shared, inner: &mut Inner, snap: Snap) {
     s.ops.free(snap.va);
 }
 
-/// Evict the LRU zero-ref radix leaf, dereferencing its blocks and freeing
-/// its boundary snapshot. `false` when nothing is evictable.
+/// Reclaim output snapshots first, then LRU cache entries. `false` when pinned.
 fn evict_one(s: &Shared, inner: &mut Inner, preserve_hot: bool) -> bool {
+    // Output-only boundaries cannot replay the original prompt. Reclaim them
+    // before removing prompt snapshots or the KV blocks those snapshots need.
+    if let Some((node, index)) = inner.published.iter()
+        .flat_map(|(&node, snaps)| snaps.iter().enumerate().map(move |(i, snap)| (node, i, snap)))
+        .filter(|(_, _, snap)| snap.users == 0 && !snap.reusable_prompt)
+        .min_by_key(|(_, _, snap)| snap.last_used)
+        .map(|(node, index, _)| (node, index))
+    {
+        remove_snapshot(s, inner, node, index);
+        return true;
+    }
     let Some(key) = inner.cache.evict_lru() else {
         // A radix lease protects shared KV, but snapshots are only needed while
         // restoring an attachment. Protect the most recently reused snapshot
@@ -1527,9 +1550,7 @@ fn evict_one(s: &Shared, inner: &mut Inner, preserve_hot: bool) -> bool {
         {
             return false;
         }
-        let snap = inner.published.get_mut(&node).unwrap().swap_remove(index);
-        if inner.published[&node].is_empty() { inner.published.remove(&node); }
-        free_snapshot(s, inner, snap);
+        remove_snapshot(s, inner, node, index);
         return true;
     };
     if let Some(ids) = inner.node_blocks.remove(&key) {
@@ -1544,6 +1565,12 @@ fn evict_one(s: &Shared, inner: &mut Inner, preserve_hot: bool) -> bool {
     }
     inner.stats.nodes_evicted += 1;
     true
+}
+
+fn remove_snapshot(s: &Shared, inner: &mut Inner, node: Option<(u32, u32)>, index: usize) {
+    let snap = inner.published.get_mut(&node).unwrap().swap_remove(index);
+    if inner.published[&node].is_empty() { inner.published.remove(&node); }
+    free_snapshot(s, inner, snap);
 }
 
 fn deref_block(s: &Shared, inner: &mut Inner, id: u32) {
@@ -2784,6 +2811,50 @@ mod tests {
         let mut oldest = prompt(7);
         oldest[0] = 10;
         assert!(p.try_attach(1, &oldest).unwrap().is_none());
+        assert_eq!(p.stats().cache_bytes, 96);
+        assert_eq!(p.stats().snapshots_evicted, 1);
+    }
+
+    #[test]
+    fn output_snapshots_leave_room_for_reusable_prompt_boundaries() {
+        let p = pool_with_cap(Arc::new(MockVmm::default()), 400);
+        let mut short = prompt(7);
+        short[0] = 99;
+        p.try_attach(0, &short).unwrap();
+        p.ensure_rows(0, 7).unwrap();
+        p.publish_at(0, &short, 6, 48, |_| Ok(())).unwrap();
+        p.begin_seq(0);
+
+        let long = prompt(17);
+        p.try_attach(0, &long).unwrap();
+        p.ensure_rows(0, 21).unwrap();
+        p.publish_at(0, &long, 16, 48, |_| Ok(())).unwrap();
+        p.try_attach(1, &short).unwrap().unwrap();
+        p.finish_attach(1);
+
+        let generated = prompt(21);
+        p.publish_at(0, &generated, 18, 48, |_| Ok(())).unwrap();
+        p.publish_at(0, &generated, 20, 48, |_| Ok(())).unwrap();
+        p.begin_seq(1);
+        let attached = p.try_attach(1, &long).unwrap().expect("prompt boundary retained");
+        assert_eq!(attached.rows, 16);
+        assert!(p.stats().cache_bytes <= 400);
+        assert_eq!(p.stats().snapshots_evicted, 1);
+    }
+
+    #[test]
+    fn output_snapshot_reused_by_a_followup_gets_prompt_priority() {
+        let p = pool_with_cap(Arc::new(MockVmm::default()), 96);
+        let tokens = prompt(7);
+        p.try_attach(0, &tokens[..3]).unwrap();
+        p.ensure_rows(0, 7).unwrap();
+        p.publish_at(0, &tokens[..3], 2, 48, |_| Ok(())).unwrap();
+        p.publish_at(0, &tokens[..5], 4, 48, |_| Ok(())).unwrap();
+        assert_eq!(p.try_attach(1, &tokens[..5]).unwrap().unwrap().rows, 4);
+        p.finish_attach(1);
+        p.begin_seq(1);
+        p.publish_at(0, &tokens, 6, 48, |_| Ok(())).unwrap();
+        assert_eq!(p.try_attach(1, &tokens).unwrap().unwrap().rows, 4);
         assert_eq!(p.stats().cache_bytes, 96);
         assert_eq!(p.stats().snapshots_evicted, 1);
     }
