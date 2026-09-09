@@ -873,7 +873,7 @@ sparse highest slots and reversed completion order. Additional packed→ordinary
 packed checks on the same bucket preserve full logits. Raw logs are
 `packed-tail-skip-{bf16,fp8}-gpu.log` and `packed-tail-skip-host-tests.log` in the
 campaign directory. This change is within the existing packed-prefix path;
-request-latency measurements are pending.
+request-latency results follow below.
 
 
 ## Opt-in FP8 tensor cores inside the decode interpreter
@@ -915,3 +915,32 @@ Reproduction and controls are documented in
 `runtime/nvidia/experiments/gemma_fp8_persistent_probe.md`. Campaign proofs are
 `gemma-fp8-persistent2-qualification.json`, `gemma-fp8-persistent2-step-results.json`
 and `fp8-mma2-model-logits-comparison.json`.
+
+
+### Matched cached-request latency after removing the discarded terminal
+
+The old and new runtimes used identical qualified packed assets for each
+precision. This screen used one-token completions on natural 1055/16415-token
+prompts, concurrency 1/8, two warmup waves and 12 measured waves per cell.
+All 864 measured requests reported the expected cached-token count (1024 or
+16384); every measured text matched between runtimes. No CPU builds or other
+GPU jobs overlapped the timing. All four owned servers stopped afterward.
+
+Median HTTP request latency, milliseconds:
+
+| Precision | Prompt | Concurrency | Control | Skip discarded tail | Reduction |
+|---|---:|---:|---:|---:|---:|
+| BF16 | 1055 | 1 | 137.72 | 136.02 | 1.2% |
+| BF16 | 1055 | 8 | 592.84 | 565.97 | 4.5% |
+| BF16 | 16415 | 1 | 203.94 | 203.93 | <0.1% |
+| BF16 | 16415 | 8 | 1201.17 | 1217.40 | -1.4% |
+| FP8 | 1055 | 1 | 131.92 | 122.60 | 7.1% |
+| FP8 | 1055 | 8 | 607.88 | 593.13 | 2.4% |
+| FP8 | 16415 | 1 | 230.14 | 193.54 | 15.9% |
+| FP8 | 16415 | 8 | 1186.21 | 1181.72 | 0.4% |
+
+Results are mixed: the largest gain is FP8 at 16K/C1, while BF16 at 16K/C8
+regresses. These nearly fully cached, one-token latency measurements do not
+establish longer-output throughput or a vLLM win. The CSV is
+`gemma31-h100-packed-tail-latency.csv`; raw requests, source and artifact hashes
+are recorded in campaign `packed-tail-skip-qualification.json`.
