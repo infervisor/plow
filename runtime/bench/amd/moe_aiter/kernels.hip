@@ -63,3 +63,40 @@ extern "C" int plow_moe(void *out, void *x, void *wt, void *st, void *table,
     combine_moe<<<304, 512, 0, stream>>>(out, part, M);
     return hipGetLastError();
 }
+
+template <unsigned N, unsigned K, bool GU>
+__device__ void pack_weight(uint4* out, const unsigned long long* wt) {
+    constexpr unsigned vectors = N * K / 16;
+    const unsigned e = blockIdx.x / 8u;
+    const auto* first = (const uint4*)wt[e * 3u + (GU ? 0u : 2u)];
+    const auto* second = GU ? (const uint4*)wt[e * 3u + 1u] : first;
+    for (unsigned v = blockIdx.x % 8u * blockDim.x + threadIdx.x; v < vectors;
+         v += blockDim.x * 8u) {
+        const unsigned row = (v / (32u * (K / 32u))) * 16u + v % 16u;
+        const unsigned col = (v / 32u) % (K / 32u) * 2u + (v / 16u) % 2u;
+        const unsigned source_row = GU ? row % 256u : row;
+        const auto* src = GU && row >= 256u ? second : first;
+        out[e * vectors + v] = src[source_row * (K / 16u) + col];
+    }
+}
+
+__global__ void pack_moe(uint4* gu, uint4* down, float* gs, float* ds,
+                         const unsigned long long* wt, const unsigned long long* st) {
+    // Runtime weights already scrub OCP -0. Keep their bytes and double FNUZ scales.
+    pack_weight<512, 6144, true>(gu, wt);
+    pack_weight<6144, 256, false>(down, wt);
+    if (blockIdx.x % 8u == 0 && threadIdx.x < 96u) {
+        const unsigned e = blockIdx.x / 8u, j = threadIdx.x;
+        gs[e * 192u + j] = 2.0f * ((const float*)st[e * 3u])[j];
+        gs[e * 192u + 96u + j] = 2.0f * ((const float*)st[e * 3u + 1u])[j];
+        ds[e * 96u + j] = 2.0f * ((const float*)st[e * 3u + 2u])[j];
+    }
+}
+
+extern "C" int plow_moe_pack(void* gu, void* down, void* gs, void* ds,
+                             void* wt, void* st, void* stream) {
+    pack_moe<<<256 * 8, 256, 0, (hipStream_t)stream>>>((uint4*)gu, (uint4*)down,
+        (float*)gs, (float*)ds, (const unsigned long long*)wt,
+        (const unsigned long long*)st);
+    return hipGetLastError();
+}

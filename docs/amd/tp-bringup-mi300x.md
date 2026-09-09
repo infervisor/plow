@@ -2306,3 +2306,36 @@ kernel opportunities. vLLM also supports data-parallel attention with expert
 parallelism, which warrants a separate architecture study for MLA/MoE; the
 reference server's topology is unknown.
 [vLLM deployment documentation](https://docs.vllm.ai/en/stable/serving/data_parallel_deployment/).
+
+
+## 15. Captured GLM MoE and bounded packing cost (2026-09-09)
+
+The AITER MoE comparison now uses layer-40 activations, actual expert routing
+and the checkpoint's TP8 weight slices at two positions in a 70k prefill.
+The standalone plow GLU matches every captured value bit-for-bit: 16.78 million
+values in the full chunk and 9.14 million in the tail. The harness must match
+the runtime's negative-zero upload scrub; 4523 checkpoint bytes require it.
+OCP-to-FNUZ conversion reuses canonicalized bytes and doubles block scales,
+with exact numerical equality checked across all weights.
+
+At 8192 live rows, plow takes **4.833 ms**, resident AITER assembly **1.971 ms**,
+and CK **2.371 ms**. A native packing helper accepts the existing weight/scale
+pointer tables and uses a reusable **1.125 GiB** output workspace, avoiding
+about **87.75 GiB/rank** of persistent weight duplication across 78 layers.
+Hoisting expert pointers out of the packing loop cuts packing time from
+**1.285 to 0.674 ms**. Every packed byte matches AITER, including reversed
+expert tables and restored reuse.
+
+Including packing on every dispatch, assembly takes **2.647 ms at 8192 rows**
+and **1.918 ms at 4464 rows**, versus plow's **4.833 / 2.825 ms**. The full-chunk
+kernel boundary improves 45.2%. This includes activation quantization, sorting,
+expert computation and reduction, but excludes shared expert, residual, TP
+communication and a production HSA launch boundary.
+
+Sampled FP32-oracle error is **0.237% plow vs 3.55–3.85% AITER**. All-output
+relative L2 against plow is 3.54–3.60%; resident and repacked assembly outputs
+are not bit-identical. Native integration must address the existing deterministic
+FP64 combine contract as well as full-model quality. No AITER MoE production
+route or new serving gain is claimed here; H200 parity remains unmet.
+
+See [capture reproduction and measured records](../../runtime/bench/amd/moe_aiter/README.md#actual-glm-capture-and-reusable-weight-packing).

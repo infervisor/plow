@@ -74,3 +74,93 @@ Adapting these kernels requires activation block quantization, scale/weight
 layout conversion, native launch boundaries and actual-model quality checks.
 The result supports that work; it does not establish that rewriting plow's
 existing inner loop in assembly would yield the same gain.
+
+
+## Actual GLM capture and reusable weight packing
+
+`captured.py` reads the checkpoint's TP8 expert slices and actual layer-40
+activations/routing from a 70k-token prefill. Two captures cover the full
+8192-token chunk at c0=57344 and the final 4464 live rows at c0=65536.
+The baseline GLU is **bit-identical across all 16,777,216 / 9,142,272 captured
+values**, after matching the runtime's OCP negative-zero canonicalization.
+This checks the capture, gate/up order, expert routing and TP weight slices.
+
+OCP-to-FNUZ conversion must preserve values near the format limit. Reinterpret
+canonicalized OCP bytes as FNUZ and double the weight block scales. The runner
+checks exact value equality across every weight. Casting OCP values directly
+to FNUZ would overflow values above FNUZ's range. The checkpoint slice contains
+4523 negative-zero bytes; matching the runtime's upload scrub is necessary for
+plow's optimized CDNA3 weight staging too.
+
+| Captured live rows | Plow, ms | AITER assembly, ms | AITER CK, ms | Assembly + reusable packing, ms |
+|---:|---:|---:|---:|---:|
+| 8192 | 4.833 | 1.971 | 2.371 | 2.647 |
+| 4464 | 2.825 | 1.245 | 1.485 | 1.918 |
+
+The full-chunk path is **45.2% faster including packing**, or 1.83x the baseline
+throughput at this kernel boundary. Sampled FP32-oracle relative L2 is
+**0.237% plow vs 3.80–3.85% AITER** for the full chunk and **0.237% vs
+3.55–3.56%** for the tail. These are three sampled output rows, not model-level
+quality or serving measurements. The standalone baseline reproduces the model's
+GLU exactly, but its downstream combine excludes shared expert and TP work.
+Across every output element, AITER differs from plow by 3.54–3.60% relative L2.
+Resident and repacked assembly runs differ by 0.20–0.28% despite identical
+packed weights. Do not assume the fused output preserves plow's deterministic
+FP64 combine contract; that needs an explicit integration decision and test.
+
+Keeping a shuffled copy of every layer would duplicate about 87.75 GiB/rank
+for these expert weights, before scale storage. Instead, `plow_moe_pack`
+accepts plow's per-expert weight/scale pointer tables and packs one layer into
+**1,208,254,464 reusable bytes** (about 1.125 GiB). Weight shuffling and doubled
+scales are included on every dispatch in the `aiter-repack` arm. Input
+quantization, sorting, expert computation and reduction are included too.
+
+The first pack loop took 1.285 ms. Assigning eight workgroups per expert and
+hoisting the expert pointers outside each copy loop reduced this to about
+0.674 ms. Both versions match every packed weight and scale byte against
+AITER's shuffle. The final test also reverses the expert pointer tables and
+restores them, checking exact packed bytes after each reuse. No additional
+assembly was needed for this packing loop. The attention-independent MoE
+assembly object remains the one named above.
+
+The [capture result record](mi300x-captured-results.json) includes artifact,
+checkpoint-slice and source hashes. All measurements held eight GPU leases and
+used one GPU for the isolated MoE kernels. Captures used TP8 BF16 KV, native
+AITER sparse attention and the existing B1 packet; the capture request uses
+seed 0. They do not use the vLLM serving benchmark's random-token generator.
+
+### Reproduce the capture
+
+Use the B1 native sparse-MLA bundle from the
+[MLA capture instructions](../mla_sparse_aiter/README.md), whose layer-40
+post-attention/MoE work completes in segment 82. Set `CAPTURE` to a fresh
+existing directory; snapshots use create-new semantics. Inside `nix develop`:
+
+```sh
+# C0=57344 for all 8192 rows; C0=65536 for the 4464-row tail.
+export PLOW_PF_CAPTURE="8192@$C0:82:act.xn2=$CAPTURE/x.bin,act.tab=$CAPTURE/tab.bin,act.moe_fug=$CAPTURE/fu.bin,act.moe_meta=$CAPTURE/meta.bin,act.moe_rowtok=$CAPTURE/rt.bin,act.moe_rowpart=$CAPTURE/rp.bin,act.moe_rowgate=$CAPTURE/rg.bin,in.kvlen=$CAPTURE/len.bin"
+PLOW_HSACO="$OBJECT_DIR" PLOW_MLA_PF_AITER=1 PLOW_MLA_PF_V2=1 \
+PLOW_PF_CHUNK=8192 PLOW_PF_INTERLEAVE=0 \
+  perf-data/tools/gpulease -n 8 moe-capture target/release/plowrt bench \
+    --assets "$B1_ASSETS" --prefill-sweep --prefill-lengths 70000 \
+    --prefill-reps 1 --prefill-warmups 0
+unset PLOW_PF_CAPTURE
+```
+
+Build the library with the command at the top of this document. Then run each
+arm with ROCm PyTorch/AITER, using `ROWS=8192` or `ROWS=4464` for its capture:
+
+```sh
+for arm in plow aiter ck aiter-repack; do
+  perf-data/tools/gpulease -n 8 moe-captured env AITER_FLYDSL_FORCE=0 \
+    python runtime/bench/amd/moe_aiter/captured.py --arm "$arm" \
+      --library /tmp/moe-compare.so --capture "$CAPTURE" \
+      --checkpoint /workspace/models/GLM-5.3-plow-lite --layer 40 --rank 0 \
+      --rows "$ROWS" --out "/tmp/moe-captured-$arm.json"
+done
+```
+
+Next integration gate: native HSA dispatch from an ordered, pure MoE segment,
+with a reusable packed-weight workspace and correct shared-expert/TP combine.
+The activation quantization change then needs full-model quality and serving
+A/B measurements. This commit does not enable AITER MoE in production.
