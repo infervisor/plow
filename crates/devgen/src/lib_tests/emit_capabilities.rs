@@ -81,12 +81,12 @@ fn production_defaults_are_capability_and_target_driven() {
 }
 
 #[test]
-fn fp8_packed_metadata_requires_explicit_selection_without_changing_planning() {
-    for flag in ["--fp8", "--w8a8", "--w8a16"] {
+fn qualified_fp8_weight_metadata_follows_production_defaults() {
+    for flag in ["--fp8", "--w8a16"] {
         let mut cfg = EmitArgsForTest::try_parse_from(["test", flag]).unwrap().emit;
         apply_production_defaults(&mut cfg, emit_capabilities("gemma4"), "sm_90a", 1);
         assert!(cfg.packed_prefill_on());
-        assert!(!cfg.packed_prefill_metadata_on());
+        assert!(cfg.packed_prefill_metadata_on());
         cfg.emit_packed_prefill = Some(true);
         assert!(cfg.packed_prefill_metadata_on());
         cfg.emit_packed_prefill = Some(false);
@@ -95,6 +95,16 @@ fn fp8_packed_metadata_requires_explicit_selection_without_changing_planning() {
     }
     let mut cfg = EmitArgsForTest::try_parse_from(["test"]).unwrap().emit;
     apply_production_defaults(&mut cfg, emit_capabilities("gemma4"), "sm_90a", 1);
+    assert!(cfg.packed_prefill_metadata_on());
+}
+
+#[test]
+fn activation_fp8_packing_still_requires_explicit_selection() {
+    let mut cfg = EmitArgsForTest::try_parse_from(["test", "--w8a8"]).unwrap().emit;
+    apply_production_defaults(&mut cfg, emit_capabilities("gemma4"), "sm_90a", 1);
+    assert!(cfg.packed_prefill_on());
+    assert!(!cfg.packed_prefill_metadata_on());
+    cfg.emit_packed_prefill = Some(true);
     assert!(cfg.packed_prefill_metadata_on());
 }
 

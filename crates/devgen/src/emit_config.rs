@@ -1191,9 +1191,8 @@ impl EmitConfig {
     }
 
     pub fn packed_prefill_metadata_on(&self) -> bool {
-        // FP8 packed execution is opt-in; preserve ordinary attention planning defaults.
-        self.packed_prefill_on()
-            && (!self.any_fp8_weights() || self.emit_packed_prefill == Some(true))
+        // Activation-FP8 packing remains opt-in pending execution qualification.
+        self.packed_prefill_on() && (!self.w8a8 || self.emit_packed_prefill == Some(true))
     }
 
     /// The decode widths this emit builds programs for, ASCENDING.

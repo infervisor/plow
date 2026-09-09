@@ -1269,3 +1269,33 @@ Fresh compiler defaults, packed FP8-KV runtime qualification, mixed sampling
 performance, model-quality and sustained SLO work remain open. The sealed
 BF16-weight/FP8-KV checkpoint is unchanged. Operator controls and limitations:
 docs/runtime/prefix-cache.md.
+
+## Fresh compiler defaults on AMD and NVIDIA
+
+BF16-activation FP8 weights (`--fp8` / `--w8a16`) now inherit packed-request
+metadata defaults on eligible single-GPU Hopper BF16-KV builds. Activation-FP8
+packing remains opt-in. AMD packed emission bypasses NVIDIA request metadata;
+this fixes an explicit AMD packed build reaching a NVIDIA-only assertion.
+Shared runtime selectors, scheduling, kernel choices and ladder policy are
+unchanged by this compiler fix.
+
+Both failures were reproduced before the fix. Validation passed 395 compiler
+unit tests and 28 integration tests across the final runs, plus independent
+HSA-only and CUDA-only all-target runtime checks. The new integration test emits
+18 combinations: automatic/on/off packed selection for AMD BF16, W8A8 and FP8
+KV, and NVIDIA BF16, FP8 and W8A16. It preserves decode 1/2/4/8 on gfx942 and
+1/2/4/8/16 on sm_90a, with prefill 128/512/1024 on both. Automatic and explicitly
+enabled NVIDIA packets are byte-identical, including validated packed metadata.
+AMD packets contain no NVIDIA request tensors.
+
+The initial integration matrix also reproduced the existing AMD dense W8A16
+prefill rejection for missing activation scales. That unsupported combination
+remains rejected; the final matrix uses AMD W8A8. These two-layer Gemma31-shape
+emits are structural checks without weights, not new GPU numerical evidence.
+No sealed checkpoint files or compiled ladder rungs were modified.
+
+Logs: campaign compiler-packed-*.log. The first aggregate run passed all unit,
+golden, decode-ladder and MXFP4 tests before the unsupported AMD fixture failed;
+the corrected packed matrix and remaining tuned-tile tests passed separately.
+AMD device validation, packed NVIDIA FP8-KV execution, model quality and sustained
+production SLO/performance qualification remain open.

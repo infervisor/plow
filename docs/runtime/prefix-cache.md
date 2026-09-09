@@ -30,6 +30,13 @@ require all ranks; AMD unified batching still requires its single-GPU packet
 and code-object capabilities. All compiled decode and prefill rungs remain
 available to ordinary execution.
 
+Fresh single-GPU Hopper builds emit packed-request metadata by default for
+BF16 weights and BF16-activation FP8 weights (`--fp8` or `--w8a16`) with BF16 KV.
+`--emit-packed-prefill=false` disables that emission. Activation-FP8 packing
+(`--w8a8`) remains explicit opt-in; packed FP8-KV execution is not qualified.
+AMD retains its own packed-program contract and does not receive NVIDIA request
+metadata, including when `--emit-packed-prefill=true` is selected.
+
 Host tests and emitted AMD BF16/FP8-KV packet checks cover the snapshot layout,
 window wrap, configuration and scheduling invariants. H100 tests cover actual
 BF16/FP8-weight dispatch. AMD device correctness/performance and sustained
