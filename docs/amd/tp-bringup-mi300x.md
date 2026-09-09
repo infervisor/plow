@@ -884,10 +884,16 @@ the second reading, not the first. The next diagnostic is not another kernel: it
 Backing the aggregate prefill rate out of the two concurrency-20 runs (total input over the
 benchmark duration minus the decode time its own TPOT implies):
 
-| arm | single-stream prefill | **aggregate prefill @ conc 20** | unaccounted |
+| arm | chunk | single-stream prefill | **aggregate prefill @ conc 20** |
 |---|---:|---:|---:|
-| packed prefill, no DMA | 2,529 tok/s | **1,960 tok/s** | 19.2% |
-| + direct-to-LDS staging | 3,078 tok/s | **1,962 tok/s** | 30.5% |
+| packed prefill, no DMA | 2048 | 2,529 tok/s | **1,960 tok/s** |
+| **+ direct-to-LDS staging** | **2048** | **3,078 tok/s** | **1,951 tok/s** |
+| + direct-to-LDS staging | 8192 | 3,078 tok/s | 1,962 tok/s |
+
+The middle row is the single-variable A/B. The first pair compared here differed in CHUNK as well
+as in the object (8192 against 2048), so it isolated nothing; re-run with the chunk held at 2048,
+a kernel 21.7% faster single-stream produces an aggregate of 1,951 against 1,960 — no difference,
+and if anything marginally lower.
 
 **Two kernels 21.7% apart land on the same number.** And that number is BELOW the slower kernel's
 single-stream rate: concurrency does not merely fail to help prefill here, it costs 22%. A ceiling
