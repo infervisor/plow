@@ -28,6 +28,7 @@ G_K(g_headnorm_rope);
 G_K(g_norm_residual);
 G_K(g_add_norm);
 G_K(g_norm_residual_norm);
+G_K(g_per_layer_input);
 /* gemm.c */
 G_K(g_zero_f32);
 G_K(g_gemm_splitk);

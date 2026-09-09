@@ -85,6 +85,7 @@ pub const MI300X: GpuSpec = GpuSpec {
     }),
     l2_partitioning: Some(MI300_L2),
     clock_boost: Hertz::from_mhz(2100),
+    soc: None,
 };
 
 /// MI325X — same 304-CU die, 256 GiB HBM3e, ~6.0 TB/s.
@@ -121,4 +122,5 @@ pub const MI325X: GpuSpec = GpuSpec {
     }),
     l2_partitioning: Some(MI300_L2),
     clock_boost: Hertz::from_mhz(2100),
+    soc: None,
 };

@@ -14,6 +14,8 @@ use crate::units::{Bytes, GBps, Hertz};
 pub enum Vendor {
     Nvidia,
     Amd,
+    /// Apple Silicon: the GPU is one unit of a unified-memory SoC (see [`SocSpec`]).
+    Apple,
 }
 
 /// Microarchitecture generation. Drives tile-shape selection in the cost model.
@@ -28,6 +30,10 @@ pub enum Arch {
     CdnaV3,
     /// AMD CDNA 4 (MI350 series). gfx950: 160 KiB LDS, double-K bf16 MFMA.
     CdnaV4,
+    /// Apple GPU family 9 (M3). 32 KiB threadgroup memory, `simdgroup_matrix`, no tensor units.
+    AppleM3,
+    /// Apple GPU family 9 (M4). Same ISA level as M3 (`metal3`); Dynamic Caching.
+    AppleM4,
 }
 
 /// On-package memory technology.
@@ -40,6 +46,8 @@ pub enum MemKind {
     Gddr6x,
     /// GDDR7 (Blackwell consumer: RTX 5090, RTX 6000 Pro).
     Gddr7,
+    /// LPDDR5X unified memory (Apple Silicon): one bus shared by CPU, GPU and ANE.
+    Lpddr5x,
 }
 
 /// The cross-SM shared-memory domain kind. On Hopper, SMs within one GPC
@@ -246,6 +254,26 @@ impl MemorySpec {
     }
 }
 
+/// The rest of a unified-memory SoC around its GPU: the CPU clusters and the neural engine
+/// that the compiler can partition work onto (`costmodel::Soc`), and the fact that all three
+/// draw from one memory bus — which is why a per-unit bandwidth split does not add up.
+#[derive(Clone, Copy, Debug)]
+pub struct SocSpec {
+    /// Performance cores (the CPU executor pool; efficiency cores only host sampling/IO).
+    pub cpu_p_cores: u32,
+    pub cpu_e_cores: u32,
+    /// What the CPU clusters can pull from the shared bus on their own.
+    pub cpu_bandwidth: GBps,
+    pub cpu_bandwidth_measured: Option<GBps>,
+    /// Neural Engine cores and its datasheet int8 rate (fp16 is roughly half).
+    pub ane_cores: u32,
+    pub ane_int8_tops: u32,
+    /// Achieved fp16 GEMM rate through CoreML, where measured.
+    pub ane_fp16_tflops_measured: Option<f32>,
+    /// One coherent address space for every unit (a cross-unit hand-off is a barrier, not a copy).
+    pub unified_memory: bool,
+}
+
 /// A complete static descriptor for one GPU model/SKU.
 #[derive(Clone, Copy, Debug)]
 pub struct GpuSpec {
@@ -277,6 +305,8 @@ pub struct GpuSpec {
     pub l2_partitioning: Option<L2Partitioning>,
     /// Peak boost clock.
     pub clock_boost: Hertz,
+    /// The surrounding SoC on unified-memory parts (Apple); `None` for discrete GPUs.
+    pub soc: Option<SocSpec>,
 }
 
 impl GpuSpec {

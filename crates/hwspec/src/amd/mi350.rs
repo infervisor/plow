@@ -100,6 +100,7 @@ pub const MI350X: GpuSpec = GpuSpec {
     }),
     l2_partitioning: Some(MI350_L2),
     clock_boost: Hertz::from_mhz(2200), // measured
+    soc: None,
 };
 
 /// MI355X — same 256-CU die as [`MI350X`], liquid-cooled, higher sustained clock.

@@ -10,11 +10,66 @@ use std::sync::Arc;
 use packet::dev::PrefillSpan;
 
 use super::engine::SeqEngine;
-use crate::exec::cpu::engine::{next_chunk, CpuEngine, CpuEngineOpts};
+use crate::exec::cpu::engine::{next_chunk, Chunk, CpuEngine, CpuEngineOpts, CpuModel};
 use crate::{Result, RuntimeError};
 
+/// The slot-engine surface this serve engine drives. Implemented by the CPU worker-pool engine
+/// and the Metal engine: both load through [`CpuModel`] and share the program/slot semantics
+/// (single-sequence prefill rebased onto a slot, one batched decode step on the narrowest rung),
+/// so one serve engine and one mux tick body cover both units.
+pub trait SlotEngine: Send {
+    fn prefill_buckets(&self) -> Vec<(usize, u32)>;
+    fn prefill_slot(&mut self, slot: usize, prompt: &[u32]) -> Result<u32>;
+    fn prefill_slot_chunk(&mut self, slot: usize, prompt: &[u32], ch: Chunk) -> Result<()>;
+    fn last_token(&self) -> Result<u32>;
+    fn decode_step_batched_at(
+        &mut self,
+        pos: &[u32],
+        kvlen: &[u32],
+        ids: &[u32],
+        dp: usize,
+    ) -> Result<Vec<u32>>;
+    fn model(&self) -> &CpuModel;
+    fn max_ctx(&self) -> usize;
+    /// One line for the ready log (unit, threads, tier).
+    fn describe(&self) -> String;
+}
+
+impl SlotEngine for CpuEngine {
+    fn prefill_buckets(&self) -> Vec<(usize, u32)> {
+        CpuEngine::prefill_buckets(self)
+    }
+    fn prefill_slot(&mut self, slot: usize, prompt: &[u32]) -> Result<u32> {
+        CpuEngine::prefill_slot(self, slot, prompt)
+    }
+    fn prefill_slot_chunk(&mut self, slot: usize, prompt: &[u32], ch: Chunk) -> Result<()> {
+        CpuEngine::prefill_slot_chunk(self, slot, prompt, ch)
+    }
+    fn last_token(&self) -> Result<u32> {
+        CpuEngine::last_token(self)
+    }
+    fn decode_step_batched_at(
+        &mut self,
+        pos: &[u32],
+        kvlen: &[u32],
+        ids: &[u32],
+        dp: usize,
+    ) -> Result<Vec<u32>> {
+        CpuEngine::decode_step_batched_at(self, pos, kvlen, ids, dp)
+    }
+    fn model(&self) -> &CpuModel {
+        CpuEngine::model(self)
+    }
+    fn max_ctx(&self) -> usize {
+        CpuEngine::max_ctx(self)
+    }
+    fn describe(&self) -> String {
+        format!("cpu threads={} isa={:?}", self.threads, self.isa)
+    }
+}
+
 pub struct CpuServe {
-    eng: CpuEngine,
+    eng: Box<dyn SlotEngine>,
     stop_ids: Arc<Vec<u32>>,
     decode_rungs: Box<[u32]>,
     batch: usize,
@@ -42,12 +97,17 @@ pub struct CpuServe {
 
 impl CpuServe {
     pub fn load(blob: &Path, checkpoint: &Path, opts: &CpuEngineOpts) -> Result<Self> {
+        let eng = CpuEngine::load(blob, checkpoint, opts)?;
+        Self::from_engine(Box::new(eng), checkpoint)
+    }
+
+    /// Wrap an already-loaded slot engine (CPU or Metal).
+    pub fn from_engine(eng: Box<dyn SlotEngine>, checkpoint: &Path) -> Result<Self> {
         let mut ids = crate::asset::checkpoint::read_eos_ids(checkpoint);
         ids.extend(crate::asset::checkpoint::chat_stop_ids(checkpoint, &ids));
-        let eng = CpuEngine::load(blob, checkpoint, opts)?;
         let max_ctx = eng.max_ctx();
-        let batch = eng.batch();
-        let decode_rungs = eng.decode_rungs().into_boxed_slice();
+        let batch = eng.model().batch;
+        let decode_rungs = eng.model().decode_rungs().into_boxed_slice();
         let buckets = eng.prefill_buckets();
         if buckets.is_empty() {
             return Err(RuntimeError::Device(
@@ -61,10 +121,9 @@ impl CpuServe {
             rungs = ?decode_rungs,
             prefill_buckets = ?buckets,
             pf_chunk,
-            threads = eng.threads,
-            isa = ?eng.isa,
+            engine = %eng.describe(),
             stop_ids = ?ids,
-            "CPU serve engine ready"
+            "slot serve engine ready"
         );
         Ok(CpuServe {
             eng,
@@ -97,8 +156,8 @@ impl CpuServe {
         self.batch
     }
 
-    pub fn engine(&self) -> &CpuEngine {
-        &self.eng
+    pub fn engine(&self) -> &dyn SlotEngine {
+        &*self.eng
     }
 
     fn check_slot(&self, slot: usize) -> Result<()> {

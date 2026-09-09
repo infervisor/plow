@@ -92,13 +92,21 @@ file(GLOB PLOW_CPU_DEV_SRC
     ${CMAKE_CURRENT_SOURCE_DIR}/cpu/dev/golden/*.c)
 # Tier sources carry their own -m flags (runtime cpuid picks the tier, so the base
 # library must stay runnable on a non-AVX-512 host). Mirrors plowrt/build.rs.
-file(GLOB PLOW_CPU_DEV_AVX512_SRC ${CMAKE_CURRENT_SOURCE_DIR}/cpu/dev/avx512/*.c)
-file(GLOB PLOW_CPU_DEV_AMX_SRC ${CMAKE_CURRENT_SOURCE_DIR}/cpu/dev/amx/*.c)
-set_source_files_properties(${PLOW_CPU_DEV_AVX512_SRC} PROPERTIES COMPILE_OPTIONS
-    "-mavx512f;-mavx512bw;-mavx512vl;-mavx512bf16;-mavx512vnni")
-set_source_files_properties(${PLOW_CPU_DEV_AMX_SRC} PROPERTIES COMPILE_OPTIONS
-    "-mavx512f;-mavx512bw;-mavx512vl;-mavx512bf16;-mavx512vnni;-mamx-tile;-mamx-bf16;-mamx-int8")
-add_library(plow_cpu_dev STATIC ${PLOW_CPU_DEV_SRC} ${PLOW_CPU_DEV_AVX512_SRC} ${PLOW_CPU_DEV_AMX_SRC})
+# Tier directories are per target ISA (x86_64: avx512/ amx/; aarch64: neon/).
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+    file(GLOB PLOW_CPU_DEV_AVX512_SRC ${CMAKE_CURRENT_SOURCE_DIR}/cpu/dev/avx512/*.c)
+    file(GLOB PLOW_CPU_DEV_AMX_SRC ${CMAKE_CURRENT_SOURCE_DIR}/cpu/dev/amx/*.c)
+    set_source_files_properties(${PLOW_CPU_DEV_AVX512_SRC} PROPERTIES COMPILE_OPTIONS
+        "-mavx512f;-mavx512bw;-mavx512vl;-mavx512bf16;-mavx512vnni")
+    set_source_files_properties(${PLOW_CPU_DEV_AMX_SRC} PROPERTIES COMPILE_OPTIONS
+        "-mavx512f;-mavx512bw;-mavx512vl;-mavx512bf16;-mavx512vnni;-mamx-tile;-mamx-bf16;-mamx-int8")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+    file(GLOB PLOW_CPU_DEV_NEON_SRC ${CMAKE_CURRENT_SOURCE_DIR}/cpu/dev/neon/*.c)
+    set_source_files_properties(${PLOW_CPU_DEV_NEON_SRC} PROPERTIES COMPILE_OPTIONS
+        "-march=armv8.6-a+bf16+i8mm+fp16")
+endif()
+add_library(plow_cpu_dev STATIC ${PLOW_CPU_DEV_SRC} ${PLOW_CPU_DEV_AVX512_SRC} ${PLOW_CPU_DEV_AMX_SRC}
+    ${PLOW_CPU_DEV_NEON_SRC})
 target_include_directories(plow_cpu_dev PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/common
     ${CMAKE_CURRENT_SOURCE_DIR}/cpu/dev)
@@ -115,7 +123,7 @@ add_test(NAME cpu_dev_golden COMMAND cpu_dev_golden_test)
 
 # Tier tests: each compares its tier's kernels against the golden tier on random inputs.
 # Guarded so the tree configures before a tier's test exists.
-foreach(tier avx512 avx512_attn avx512_gemm amx fp8 gptoss route moe_gemma)
+foreach(tier avx512 avx512_attn avx512_gemm amx fp8 gptoss route moe_gemma neon neon_attn neon_gemm neon_fp8)
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu_dev_${tier}_test.c)
         add_executable(cpu_dev_${tier}_test tests/cpu_dev_${tier}_test.c)
         target_compile_options(cpu_dev_${tier}_test PRIVATE -Wall -Wextra -Werror -O2)

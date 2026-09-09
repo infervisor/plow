@@ -23,6 +23,13 @@ fn env_zero_and_one_mean_false_and_true() {
     std::env::set_var("PLOW_PF_DEFER_DECODE", "1");
     std::env::set_var("PLOW_PF_BATCH", "1");
     std::env::set_var("PLOW_TP_PREFILL_SEGMENT_MAJOR", "0");
+    std::env::set_var("PLOW_ANE_MLP", "1");
+    std::env::set_var("PLOW_METAL_SERIAL", "0");
+    std::env::set_var("PLOW_ANE_MLP_LAYERS", "2");
+    std::env::set_var("PLOW_ANE_MLP_PLACEMENT", "/tmp/placement-probe");
+    std::env::set_var("PLOW_ANE_MLP_CACHE", "/tmp/channel-cache");
+    std::env::set_var("PLOW_ANE_MLP_FAIL", "after_join");
+    std::env::set_var("PLOW_BACKEND", "cpu");
 
     let c = RuntimeConfig::get();
     assert!(!c.preload, "PLOW_PRELOAD=0 must disable preload");
@@ -38,4 +45,17 @@ fn env_zero_and_one_mean_false_and_true() {
     assert!(c.nv.pf_defer_decode);
     assert!(c.nv.pf_batch);
     assert!(!c.amd.tp_prefill_segment_major);
+    assert!(c.apple.ane_mlp);
+    assert!(!c.apple.serial);
+    assert_eq!(c.apple.ane_mlp_layers, Some(2));
+    assert_eq!(
+        c.apple.ane_mlp_placement.as_deref(),
+        Some(std::path::Path::new("/tmp/placement-probe"))
+    );
+    assert_eq!(
+        c.apple.ane_mlp_cache.as_deref(),
+        Some(std::path::Path::new("/tmp/channel-cache"))
+    );
+    assert_eq!(c.apple.ane_mlp_fail.as_deref(), Some("after_join"));
+    assert_eq!(c.apple.backend.as_deref(), Some("cpu"));
 }
