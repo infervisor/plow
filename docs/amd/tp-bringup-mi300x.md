@@ -2383,3 +2383,32 @@ the H200 100-request target of 273.67 tokens/s remains unmet.
 
 See [native adapter reproduction](../../runtime/bench/amd/moe_aiter/README.md#native-gfx942-serving-adapter)
 and the [measured record](../../runtime/bench/amd/moe_aiter/mi300x-native-results.json).
+
+## 17. Query-partitioned prefill indexer prototype (2026-09-09)
+
+The packet repeats index score and exact radix top-k work on every TP rank.
+A captured-input TP8 prototype partitions query rows while retaining the
+global causal base and all 32 index heads. It gathers selected int32 indices:
+64 MiB total at 8192 rows, rather than the multi-GiB score matrix. Equal,
+padded row bands handle ragged chunks without splitting an index row.
+
+The full layer-38 chunk measures **19.000 → 4.051 ms** at 8192 query rows and
+65536 context tokens. Its actual 4464-row/70000-token tail measures
+**12.094 → 2.359 ms**. Both include all eight GPUs, host submission/completion
+and the direct GPU gather. Tiny early chunks regress, so the eventual route
+must retain replicated execution for those cases.
+
+Standalone all-row and partitioned scores match bit-for-bit; top-k sets match
+the model captures; gathered buffers match across all ranks. Checks also
+cover empty ranks, 129-row chunks, causal masking and unowned/padded writes.
+Assembly inspection caught LLVM splitting some contracted head-reduction FMAs
+after inlining. Explicit GLM FMAs preserve the interpreter's fused rounding,
+and the benchmark uses the exact emitted scale bits `0x3c7fffff`.
+
+This prototype is not wired into serving. Device-side ready/completion
+rendezvous and audited scratch reuse are required before integration: normal
+segment-major dispatch queues later work without a host barrier per segment.
+The next gates are native HSA integration, retrieval quality and a C20 A/B.
+The latest measured serving rate remains **29.960 output tokens/s** (§16).
+
+See [reproduction and raw records](../../runtime/bench/amd/dsa_pf_tp/README.md).

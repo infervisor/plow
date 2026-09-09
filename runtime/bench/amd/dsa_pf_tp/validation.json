@@ -1,0 +1,45 @@
+{
+  "gfx942_default_interpreter_metadata_identical": true,
+  "interpreter_metadata_sha256": "aaa199e67eff57ebdbee953b564d365cacc3ab0cfd49a904f131e76b5f1cb7b5",
+  "default_function_code": {
+    "paths": [
+      "build-amd/hsaco/db16-dsapf/interp_prefill_mla_moe_gq.elf",
+      "/tmp/tp-glm53-index/interp-default.elf"
+    ],
+    "functions": [
+      {
+        "_Z20d_index_score_pf_rowILi128ELi32ELj64": {
+          "size": 1580,
+          "sha256": "af883fd2e9bda1f14964b2058694b1a1ac83f1e88addae1a189563be9712f1a2"
+        },
+        "_Z17d_index_select_pfILb1": {
+          "size": 2740,
+          "sha256": "c556d65761b0af391d696299f0aa39f455b5950605b434971d62631c15457f71"
+        }
+      },
+      {
+        "_Z20d_index_score_pf_rowILi128ELi32ELj64": {
+          "size": 1580,
+          "sha256": "a8e55719565fffe1f0677a0ce3efef2409174a4b83906799619e408b161468d8"
+        },
+        "_Z17d_index_select_pfILb1": {
+          "size": 2740,
+          "sha256": "c556d65761b0af391d696299f0aa39f455b5950605b434971d62631c15457f71"
+        }
+      }
+    ],
+    "byte_identical": false
+  },
+  "measured_library_sha256": "ecdc77be1ba56f00e2a2f3fb20c77b010b79f2a7c5f249fab3644fdd86ecab0e",
+  "final_scoped_library_sha256": "6eed079002d3d6a6e7af707963a5ed03ad5082b205640cca0afaeec79759e081",
+  "measured_and_scoped_gpu_text_identical": true,
+  "gpu_text_sha256": [
+    "62543e213bce745b321ae7251f7692cc3041bb712db1a87499e020c758189611"
+  ],
+  "checks": [
+    "HIP wrappers and default interpreter compiled under nix develop",
+    "full and actual tail model top-k capture equality",
+    "TP8 score bits, selected sets, gathered bytes and write-boundary checks",
+    "Python syntax and git diff --check"
+  ]
+}

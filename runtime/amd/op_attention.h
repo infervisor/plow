@@ -5442,7 +5442,8 @@ __device__ void d_index_score_pf_row(float* __restrict__ Score, const bf16* __re
                                      const bf16* __restrict__ Kidx, const bf16* __restrict__ W,
                                      const int* __restrict__ kv_len, unsigned n_tok,
                                      unsigned kv_stride, float scale, unsigned slice,
-                                     unsigned nblk, bf16* ktile /* TILE_N * KSTRIDE */) {
+                                     unsigned nblk, bf16* ktile /* TILE_N * KSTRIDE */,
+                                     unsigned row_begin = 0u, unsigned row_limit = ~0u) {
     static_assert(DI % 16 == 0, "DI must be a whole number of MFMA k-steps");
     /* The 32x32 MFMA's M axis IS the index heads, so a head count that is not a multiple of 32
      * either wastes A-tile rows or reads off the end of a query row. DeepSeek-V4 has 64 index
@@ -5474,7 +5475,9 @@ __device__ void d_index_score_pf_row(float* __restrict__ Score, const bf16* __re
     const unsigned mbase = 4u * (lane / 32u);
     const unsigned len = (unsigned)as_glob(kv_len)[0];
     const unsigned q_pos0 = len - n_tok;
-    const unsigned n_pack = (n_tok + NW - 1u) / NW;
+    const unsigned end = row_limit < n_tok ? row_limit : n_tok;
+    const unsigned rows = row_begin < end ? end - row_begin : 0u;
+    const unsigned n_pack = (rows + NW - 1u) / NW;
     const unsigned n_span = (len + IDXPF_SPAN - 1u) / IDXPF_SPAN;
     const unsigned n_work = n_pack * n_span;
 
@@ -5483,15 +5486,15 @@ __device__ void d_index_score_pf_row(float* __restrict__ Score, const bf16* __re
      * and those gate compute only, never a barrier. */
     for (unsigned w = slice; w < n_work; w += nblk) {
         const unsigned p = w / n_span, sp = w % n_span;
-        unsigned pack_last = p * NW + (NW - 1u);
-        if (pack_last >= n_tok) pack_last = n_tok - 1u;
+        unsigned pack_last = row_begin + p * NW + (NW - 1u);
+        if (pack_last >= end) pack_last = end - 1u;
         const unsigned pack_end = q_pos0 + pack_last + 1u; /* causal bound of the pack's last row */
         const unsigned s_lo = sp * IDXPF_SPAN;
         if (s_lo >= pack_end) continue; /* whole pack is causally below this span */
         const unsigned s_hi = (s_lo + IDXPF_SPAN < pack_end) ? (s_lo + IDXPF_SPAN) : pack_end;
 
-        const unsigned t = p * NW + wave;
-        const bool live = t < n_tok;
+        const unsigned t = row_begin + p * NW + wave;
+        const bool live = t < end;
         const unsigned row_end = live ? (q_pos0 + t + 1u) : 0u;
         /* A-fragments + this row's lane-local head weights: loaded ONCE for the whole span. */
         bf16x8 qf[HG][NK];
@@ -5540,7 +5543,11 @@ __device__ void d_index_score_pf_row(float* __restrict__ Score, const bf16* __re
 #pragma unroll
                     for (int i = 0; i < 16; i++) {
                         const float d = acc[i];
-                        part += wv[g][i] * (d > 0.0f ? d : 0.0f);
+                        // Keep GLM's interpreter rounding when inlined into a native kernel.
+                        if constexpr (HIc == 32)
+                            part = __builtin_fmaf(wv[g][i], d > 0.0f ? d : 0.0f, part);
+                        else
+                            part += wv[g][i] * (d > 0.0f ? d : 0.0f);
                     }
                 }
                 part += __shfl_xor(part, 32, PLOW_WAVE);
@@ -5573,7 +5580,8 @@ template <bool FAST_EXIT>
 __device__ void d_index_select_pf(int* __restrict__ idx, const float* __restrict__ Score,
                                   const int* __restrict__ kv_len, unsigned n_tok, unsigned top_k,
                                   unsigned kv_stride, unsigned slice, unsigned nblk,
-                                  unsigned* lh, unsigned* red, unsigned pool_size = 1u) {
+                                  unsigned* lh, unsigned* red, unsigned pool_size = 1u,
+                                  unsigned row_begin = 0u, unsigned row_limit = ~0u) {
     const auto* const Sc = as_glob(Score);
     int* const ib = as_glob(idx);
     const unsigned tid = threadIdx.x;
@@ -5587,7 +5595,8 @@ __device__ void d_index_select_pf(int* __restrict__ idx, const float* __restrict
      * correctly excluded, not an off-by-one. */
     const unsigned len = (unsigned)as_glob(kv_len)[0];
     const unsigned q_pos0 = len - n_tok;
-    for (unsigned t = slice; t < n_tok; t += nblk) {
+    const unsigned end = row_limit < n_tok ? row_limit : n_tok;
+    for (unsigned t = row_begin + slice; t < end; t += nblk) {
         const unsigned row_len_tokens = q_pos0 + t + 1u;
         const unsigned row_len = row_len_tokens / pool_size;
         int* const row = ib + (size_t)t * top_k;
