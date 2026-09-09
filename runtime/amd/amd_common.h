@@ -363,6 +363,51 @@ __device__ __forceinline__ void cp_async16(const PLOW_GLOB bf16* src,
     (void)dst_lane_contiguous;
 #endif
 }
+/* 4 BYTES PER LANE, and on CDNA3 that is the ONLY width that is actually direct-to-LDS.
+ *                                                                        [LDS-DMA-4B]
+ * `cp_async16` above asks for 16 B/lane, which gfx942 does not implement, so its CDNA3 arm is a
+ * VGPR-staged copy — correct, but it spends exactly the registers the technique exists to save.
+ * This is the width the hardware has: `global_load_lds_dword`, verified emitted by clang for
+ * gfx942 (a HIP probe compiles to a single `global_load_lds_dword`, no VGPR round trip).
+ *
+ * WHY IT MATTERS HERE. AITER's shipped gfx942 MLA-prefill kernel
+ * (`fwd_hd192x128_bf16_causal_*.co`) issues 132 `buffer_load_dword … lds`; plow's flash object
+ * issues ZERO and stages K/V through a register file that is already fully committed (512 VGPR,
+ * one wave per SIMD). That is the one structural difference between the two kernels — the tiling
+ * already matches at BM 128 / BN 32 / 4 waves — and the flash segment is ~75% of long-context
+ * prefill wall time (docs/amd/tp-bringup-mi300x.md §7f).
+ *
+ * THE CONTRACT IS THE SAME SHARP ONE `cp_async16` DOCUMENTS, at a different stride: the LDS
+ * destination comes from M0 and is UNIFORM, and the hardware lays the 64 lanes down contiguously
+ * at the ISSUE width — so here lane `l` lands at `dst + l*4 bytes` = `dst + l*2` bf16, and ONE
+ * wave issue moves 64 x 4 B = 256 B = 128 bf16. The global source may be per-lane; the LDS
+ * destination may not. A caller whose LDS tile is padded (the usual bank-conflict `+8`) must
+ * therefore issue in runs that never cross the pad — which is free when the row width is a
+ * multiple of 128 bf16, as D=512 is.
+ *
+ * Tracked on vmcnt like every other global load, so `cp_async_wait()` drains it. */
+__device__ __forceinline__ void cp_async4(const PLOW_GLOB bf16* src, bf16* dst_wave_contiguous) {
+#ifdef __HIP_DEVICE_COMPILE__
+#if defined(__clang_major__) && __clang_major__ >= 23
+    __builtin_amdgcn_global_load_lds(
+        (PLOW_GLOB void*)(const PLOW_GLOB void*)src,
+        (__attribute__((address_space(3))) void*)dst_wave_contiguous,
+        4 /* bytes per lane — the only CDNA3 width */, 0 /* offset */, 0 /* aux */);
+#else
+    __builtin_amdgcn_global_load_lds(
+        (const PLOW_GLOB unsigned*)(const PLOW_GLOB void*)src,
+        (__attribute__((address_space(3))) unsigned*)(__attribute__((address_space(3))) void*)
+            dst_wave_contiguous,
+        4, 0, 0);
+#endif
+#else
+    (void)src;
+    (void)dst_wave_contiguous;
+#endif
+}
+/* bf16 moved by ONE `cp_async4` wave issue: 64 lanes x 2. */
+#define CP_ASYNC4_BF16 (PLOW_WAVE * 2)
+
 __device__ __forceinline__ void cp_async_wait(void) {
     asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
 }

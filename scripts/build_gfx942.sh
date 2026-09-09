@@ -273,6 +273,23 @@ AX_FLASH="$AX_FLASH -DPLOW_L2_PLACE_DISPATCH=1"
 if [ "${PLOW_FA_LAZY:-0}" = 1 ]; then
   AX_FLASH="$AX_FLASH -DFA_LAZY_RESCALE=1"
 fi
+# OPT-IN (PLOW_FA_LDS_DMA=1): stage the flash K/V tile global->LDS with `global_load_lds_dword`
+# instead of through VGPRs (op_attention.h FA_LDS_DMA / amd_common.h cp_async4). FLASH OBJECT
+# ONLY and bf16 only -- the fp8-KV arm dequantizes DURING staging and a DMA cannot do arithmetic
+# on the way.
+#
+# WHY IT EXISTS: AITER's shipped gfx942 MLA prefill issues 132 `buffer_load_dword ... lds` and
+# never lands K/V in a register; plow's flash object issued ZERO and staged through a register
+# file already fully committed at 512 VGPR / one wave per SIMD. The tiling was already the same
+# (BM 128, BN 32, 4 waves) -- the staging was the difference, and the flash segment is ~75% of
+# long-context prefill wall time. docs/amd/tp-bringup-mi300x.md 7f.
+#
+# NOT bit-identical in scheduling and NOT yet measured, so it is OFF by default: cp_async4 moves
+# 4 B/lane (the only width CDNA3 implements), which lays lanes down at a lane*4 stride, so the
+# staging loop is per-WAVE rather than per-thread and the LDS destination must be wave-uniform.
+if [ "${PLOW_FA_LDS_DMA:-0}" = 1 ]; then
+  AX_FLASH="$AX_FLASH -DFA_LDS_DMA=1"
+fi
 # DPP/swizzle half-wave reductions (PLOW_FA_RED_DPP, default ON) and the interior-tile mask
 # skip (PLOW_FA_FASTMASK, default ON). Both are bit-identical and both are FLASH-OBJECT ONLY
 # for the same register-cliff reason as PLOW_FA_LAZY above: the 8-wave prefill/decode rows hold
