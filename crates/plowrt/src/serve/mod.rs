@@ -1,8 +1,10 @@
 //! §G OpenAI-compatible API server.
 
+pub mod admin;
 pub mod bench;
 pub mod chat;
 pub mod completion;
+pub mod cosched;
 #[cfg(feature = "cpu")]
 pub mod cpu_serve;
 /// The loaded device engine behind a slug, as one type over both backends —
@@ -14,6 +16,7 @@ pub mod manager;
 pub mod models;
 pub mod mux;
 pub mod openai;
+pub mod placement;
 pub mod stream;
 pub mod template;
 pub mod tokenize;
@@ -250,12 +253,7 @@ pub(crate) fn seeded_unit(prompt: &[u32], out: &[u32], step: usize) -> f32 {
 /// The same draw, with an optional caller-supplied OpenAI `seed` mixed in.
 /// Without it the draw is derived from the token stream alone — deterministic,
 /// but not something a client can choose, which is what `seed` is for.
-pub(crate) fn seeded_unit_with(
-    prompt: &[u32],
-    out: &[u32],
-    step: usize,
-    seed: Option<u64>,
-) -> f32 {
+pub(crate) fn seeded_unit_with(prompt: &[u32], out: &[u32], step: usize, seed: Option<u64>) -> f32 {
     (fnv_seed(prompt, out, step, seed) % 10_000) as f32 / 10_000.0
 }
 
@@ -325,13 +323,62 @@ pub struct AppState {
     /// prefix sharing up) — a scrape must never queue behind a tick.
     #[cfg(feature = "cuda")]
     vmm_stats: RwLock<FxHashMap<String, crate::memory::vmm::VmmStatsHandle>>,
-    /// The S1 multi-model manager (residency + VRAM planner). Installed once
-    /// at startup when any bundle is GPU-managed; `None` on CPU-only serves.
+    /// One S1 residency manager per device group (residency + VRAM planner).
+    /// Installed once at startup; empty on CPU-only serves.
+    ///
+    /// Per group, not one manager taught about devices: every invariant a
+    /// manager holds is already per-card — one free-VRAM figure, one slab pool,
+    /// one LRU order, one switch lock — so instancing it per group keeps a load
+    /// on GPU 1 from serializing behind a switch on GPU 0.
     #[cfg(feature = "cuda")]
-    manager: std::sync::OnceLock<Arc<manager::ModelManager>>,
+    managers: std::sync::OnceLock<Vec<Arc<manager::ModelManager>>>,
+    /// slug → device-group index. The request path reads it to find the group
+    /// serving a model; the control plane reports it. NOT vendor-gated: the
+    /// AMD and CPU engines serve device groups too, they just only ever have
+    /// one.
+    slug_group: RwLock<FxHashMap<String, usize>>,
+    /// One co-tenant turn per device group ([`cosched`]). Installed at startup
+    /// by whichever backend path came up. Vendor-neutral by construction —
+    /// taking turns is host-side sequencing, and every backend that can hold
+    /// two models on one device needs it.
+    turns: std::sync::OnceLock<Vec<Arc<cosched::DeviceTurn>>>,
+    /// Directories a control-plane `load` may take an assets dir from. Set
+    /// once at startup; empty means no assets dir may be named by request.
+    models_roots: std::sync::OnceLock<Vec<std::path::PathBuf>>,
+    /// Operator-set residency overrides, slug → state. Absent = [`Residency::Auto`].
+    /// Only the control plane writes here; the manager and the request path read it.
+    residency: RwLock<FxHashMap<String, Residency>>,
+    control: Mutex<FxHashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     /// When set, each run records a timeline dumpable at `GET /trace`.
     record_trace: bool,
     trace: Mutex<Timeline>,
+}
+
+/// Operator-visible residency state of a registered slug.
+///
+/// This exists because residency is otherwise purely demand-driven: an
+/// operator's unload would be undone by the very next request (which calls
+/// `ensure_resident`) or by the speculative preloader. `Unloaded` is the state
+/// that makes an explicit unload stick.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Residency {
+    /// Registered; the manager loads and evicts it on demand.
+    #[default]
+    Auto,
+    /// An unload is in flight. Handlers refuse new work for this slug BEFORE
+    /// the mux is removed, so a request cannot slip into the window between
+    /// `remove_mux` and the dispatcher's exit and be dropped without a terminal.
+    Unloading,
+    /// Explicitly unloaded. `ensure_resident` refuses and the preloader skips
+    /// it until an explicit load returns it to `Auto`.
+    Unloaded,
+}
+
+impl Residency {
+    /// Whether new requests for this slug may be admitted.
+    pub fn admits(self) -> bool {
+        matches!(self, Residency::Auto)
+    }
 }
 
 impl AppState {
@@ -351,7 +398,12 @@ impl AppState {
             #[cfg(feature = "cuda")]
             vmm_stats: RwLock::new(FxHashMap::default()),
             #[cfg(feature = "cuda")]
-            manager: std::sync::OnceLock::new(),
+            managers: std::sync::OnceLock::new(),
+            slug_group: RwLock::new(FxHashMap::default()),
+            turns: std::sync::OnceLock::new(),
+            models_roots: std::sync::OnceLock::new(),
+            residency: RwLock::new(FxHashMap::default()),
+            control: Mutex::new(FxHashMap::default()),
             record_trace,
             trace: Mutex::new(Timeline::new()),
         }
@@ -387,24 +439,174 @@ impl AppState {
         }
     }
 
-    /// Remove a GPU engine (S1 eviction). The caller drops the returned `Arc`
-    /// — the last drop is the model unload that returns the VRAM.
-    #[cfg(feature = "cuda")]
+    /// Remove a GPU engine (eviction / unload). The caller drops the returned
+    /// `Arc` — the last drop is the model unload that returns the device memory.
+    ///
+    /// Available on every backend that can INSTALL an engine. It used to be
+    /// CUDA-only while `install_gpu_engine` was not, so an AMD or CPU serve
+    /// could bring an engine up and had no way to take it down — teardown is
+    /// lifecycle, not a vendor feature. Only the VMM stats handle is
+    /// CUDA-specific, and that is gated inside.
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
     pub fn remove_gpu_engine(&self, slug: &str) -> Option<Arc<Mutex<engine::ServeEngine>>> {
+        #[cfg(feature = "cuda")]
         self.vmm_stats.write().remove(slug);
         self.gpu.write().remove(slug)
     }
 
-    /// Install the S1 model manager (once, at startup).
+    /// Install the per-group residency managers (once, at startup).
     #[cfg(feature = "cuda")]
-    pub fn install_manager(&self, m: Arc<manager::ModelManager>) {
-        let _ = self.manager.set(m);
+    pub fn install_managers(&self, m: Vec<Arc<manager::ModelManager>>) {
+        self.install_device_turns(m.len());
+        let _ = self.managers.set(m);
     }
 
-    /// The S1 model manager, when multi-model GPU serving is active.
+    /// Install one manager — the single-group case, and what tests use.
     #[cfg(feature = "cuda")]
-    pub fn manager(&self) -> Option<&Arc<manager::ModelManager>> {
-        self.manager.get()
+    pub fn install_manager(&self, m: Arc<manager::ModelManager>) {
+        self.install_managers(vec![m]);
+    }
+
+    /// Install one co-tenant turn per device group (once, at startup).
+    ///
+    /// Called by every backend path, not just CUDA: two AMD models on one agent
+    /// is a thing that already happens — the AMD startup loop installs an
+    /// engine per bundle and each opens the same ROCr agent — and HSA has no
+    /// cooperative-launch refusal to catch the resulting CU oversubscription.
+    /// The CPU engine gives every model its own worker pool, so turns bound
+    /// thread contention there.
+    pub fn install_device_turns(&self, groups: usize) {
+        self.turns.get_or_init(|| {
+            let turns = (0..groups.max(1))
+                .map(|_| Arc::new(cosched::DeviceTurn::from_config()))
+                .collect::<Vec<_>>();
+            if let Some(first) = turns.first() {
+                tracing::info!(
+                    groups = turns.len(),
+                    mode = ?first.mode(),
+                    quantum = first.quantum(),
+                    "co-tenant scheduling installed"
+                );
+            }
+            turns
+        });
+    }
+
+    /// The co-tenant turn for `slug`'s device group, when turns are installed.
+    ///
+    /// A slug with no recorded group takes group 0's turn: the AMD and CPU
+    /// paths serve one device set and never record a group, and defaulting to
+    /// "no turn" there would silently disable ordering on exactly the backend
+    /// that most needs it.
+    pub fn device_turn(&self, slug: &str) -> Option<Arc<cosched::DeviceTurn>> {
+        let turns = self.turns.get()?;
+        turns
+            .get(self.slug_group(slug).unwrap_or(0))
+            .map(Arc::clone)
+    }
+
+    /// Record which group serves `slug`.
+    pub fn set_slug_group(&self, slug: &str, group: usize) {
+        self.slug_group.write().insert(slug.to_string(), group);
+    }
+
+    /// Forget which group served `slug` (deregistration).
+    pub fn clear_slug_group(&self, slug: &str) {
+        self.slug_group.write().remove(slug);
+    }
+
+    /// The group index serving `slug`, when placement assigned one.
+    pub fn slug_group(&self, slug: &str) -> Option<usize> {
+        self.slug_group.read().get(slug).copied()
+    }
+
+    /// Every installed manager, one per device group.
+    #[cfg(feature = "cuda")]
+    pub fn managers(&self) -> &[Arc<manager::ModelManager>] {
+        self.managers.get().map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// The manager for `slug`'s group.
+    ///
+    /// Placement is the authority; the fallback scan exists for managers
+    /// installed without a placement pass (tests, and the single-group case),
+    /// and for a slug registered at runtime before its group was recorded.
+    #[cfg(feature = "cuda")]
+    pub fn manager_for(&self, slug: &str) -> Option<&Arc<manager::ModelManager>> {
+        let managers = self.managers();
+        if let Some(g) = self.slug_group(slug) {
+            if let Some(m) = managers.get(g) {
+                return Some(m);
+            }
+        }
+        managers.iter().find(|m| m.manages(slug))
+    }
+
+    /// The manager a NEW model should be registered with: the named group, or
+    /// the one with the most free memory when the caller did not name one.
+    #[cfg(feature = "cuda")]
+    pub fn manager_for_new(
+        &self,
+        group: Option<usize>,
+    ) -> Option<(usize, &Arc<manager::ModelManager>)> {
+        let managers = self.managers();
+        match group {
+            Some(g) => managers.get(g).map(|m| (g, m)),
+            None => managers
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, m)| m.device_mem_info().map(|(free, _)| free).unwrap_or(0)),
+        }
+    }
+
+    pub async fn control_lock(&self, slug: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self.control.lock();
+            locks.retain(|_, lock| lock.strong_count() != 0);
+            match locks.get(slug).and_then(std::sync::Weak::upgrade) {
+                Some(lock) => lock,
+                None => {
+                    let lock = Arc::new(tokio::sync::Mutex::new(()));
+                    locks.insert(slug.to_string(), Arc::downgrade(&lock));
+                    lock
+                }
+            }
+        };
+        lock.lock_owned().await
+    }
+
+    /// Install the assets-dir allow-list for control-plane loads (once, at
+    /// startup). Paths are canonicalized here so the prefix test at request
+    /// time compares two real paths.
+    pub fn install_models_roots(&self, roots: impl IntoIterator<Item = std::path::PathBuf>) {
+        let roots: Vec<std::path::PathBuf> = roots
+            .into_iter()
+            .filter_map(|p| p.canonicalize().ok())
+            .collect();
+        let _ = self.models_roots.set(roots);
+    }
+
+    /// The assets-dir allow-list. Empty until `install_models_roots`.
+    pub fn models_roots(&self) -> &[std::path::PathBuf] {
+        self.models_roots.get().map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// Residency state of `slug` (defaults to [`Residency::Auto`]).
+    pub fn residency(&self, slug: &str) -> Residency {
+        self.residency.read().get(slug).copied().unwrap_or_default()
+    }
+
+    /// Set the residency state of `slug`. `Auto` clears the override.
+    pub fn set_residency(&self, slug: &str, state: Residency) {
+        let mut map = self.residency.write();
+        match state {
+            Residency::Auto => {
+                map.remove(slug);
+            }
+            _ => {
+                map.insert(slug.to_string(), state);
+            }
+        }
     }
 
     /// Register a dispatcher for a model slug. Called once at startup.
@@ -761,4 +963,13 @@ pub(crate) fn status_for(err: &RuntimeError) -> axum::http::StatusCode {
         RuntimeError::DeviceFault { info } if info.fatal => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
+}
+
+/// Privileged routes, mounted only on the owner-only Unix socket by the CLI.
+pub fn admin_app(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/v1/models/load", post(admin::load))
+        .route("/v1/models/unload", post(admin::unload))
+        .route("/v1/models/status", get(admin::status))
+        .with_state(state)
 }

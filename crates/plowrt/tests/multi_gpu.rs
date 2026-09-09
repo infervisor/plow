@@ -18,9 +18,11 @@
 //!   PLOW_GPU_TEST=1 ROCR_VISIBLE_DEVICES=4,5,6,7 \
 //!     cargo test -p plowrt --features hsa --test multi_gpu
 //!
-//! NOTE `ROCR_VISIBLE_DEVICES`, not `HIP_VISIBLE_DEVICES`: plowrt dlopens ROCr
-//! directly and never loads the HIP runtime, so the HIP variable is ignored
-//! (measured — `HIP_VISIBLE_DEVICES=4,5,6,7` still enumerated all 8 agents).
+//! NOTE `ROCR_VISIBLE_DEVICES` rather than `HIP_VISIBLE_DEVICES`: plowrt
+//! dlopens ROCr directly and never loads the HIP runtime, so ROCr is what
+//! actually masks agents. `HIP_VISIBLE_DEVICES` alone is now applied by plowrt
+//! itself (`device::visibility`), but setting BOTH makes the HIP one ignored —
+//! it indexes into the set ROCr already narrowed. Use one.
 
 #![cfg(feature = "hsa")]
 
@@ -61,8 +63,9 @@ fn backends() -> &'static Vec<std::sync::Arc<dyn device::Backend>> {
         assert!(
             all.len() >= 2,
             "PLOW_GPU_TEST=1 but only {} device(s) visible — this suite needs at \
-             least 2 GPUs. Set ROCR_VISIBLE_DEVICES (HIP_VISIBLE_DEVICES has no \
-             effect on ROCr), and run inside `nix develop` under `sg render`.",
+             least 2 GPUs. Set ROCR_VISIBLE_DEVICES (not both it and \
+             HIP_VISIBLE_DEVICES — they do not compose), and run inside \
+             `nix develop` under `sg render`.",
             all.len()
         );
         for (i, be) in all.iter().enumerate() {

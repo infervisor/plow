@@ -96,7 +96,7 @@ pub async fn completions(
         );
     }
     #[cfg(feature = "cuda")]
-    if let Some(mgr) = state.manager() {
+    if let Some(mgr) = state.manager_for(&req.model) {
         if mgr.manages(&req.model) {
             use crate::serve::manager::EnsureError;
             if let Err(e) = mgr.ensure_resident(&req.model).await {
@@ -104,6 +104,12 @@ pub async fn completions(
                     EnsureError::WontFit { .. } => (
                         axum::http::StatusCode::SERVICE_UNAVAILABLE,
                         [("retry-after", "30")],
+                        Json(serde_json::json!({"error": e.to_string()})),
+                    )
+                        .into_response(),
+                    // No `retry-after`: only an explicit load brings it back.
+                    EnsureError::Unloaded => (
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
                         Json(serde_json::json!({"error": e.to_string()})),
                     )
                         .into_response(),
@@ -307,6 +313,9 @@ async fn buffer_and_reply(
             text,
             logprobs: None,
             finish_reason: Some(finish.as_openai()),
+            // `Preempted` widens to "length" on the wire; without this the
+            // caller cannot tell an operator-forced stop from max_tokens.
+            x_plow_finish_reason: finish.is_vendor_specific().then(|| finish.as_str()),
         }],
         usage,
         token_ids: prompt_token_ids.map(|prompt| CompletionTokenIds {
@@ -370,6 +379,7 @@ fn sse_response(
                                 text,
                                 logprobs: None,
                                 finish_reason: None,
+                                x_plow_finish_reason: None,
                             }],
                             None,
                             false,
@@ -381,6 +391,9 @@ fn sse_response(
                             text: String::new(),
                             logprobs: None,
                             finish_reason: Some(reason.as_openai()),
+                            x_plow_finish_reason: reason
+                                .is_vendor_specific()
+                                .then(|| reason.as_str()),
                         }],
                         include_usage.then(|| usage.into()),
                         true,
@@ -487,6 +500,7 @@ mod tests {
                 text: "x".into(),
                 logprobs: None,
                 finish_reason: Some("length"),
+                x_plow_finish_reason: None,
             }],
             usage: None,
             token_ids: Some(CompletionTokenIds {

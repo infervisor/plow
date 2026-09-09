@@ -852,15 +852,76 @@ capped at 256, and need not match any thread count.
 | `PLOW_WEIGHT_SLAB` | on | single-allocation weight slab; `=0` turns it off (both backends). |
 | `PLOW_UPLOAD_SLOTS=N` | 4 | AMD upload-ring pipeline depth; `1` = pre-pipeline one-slab shape. |
 | `PLOW_SHARE_CKPT` | on | shared (vs per-rank) checkpoint mapping across TP ranks; `=0` restores per-rank. |
-| `PLOW_VRAM_BUDGET_MIB=M` | unset | cap the ModelManager VRAM budget (MiB). |
+| `PLOW_VRAM_BUDGET_MIB=M` | unset | CUDA: cap each device group ModelManager VRAM budget (MiB). |
 | `PLOW_WEIGHT_VMM` | CUDA on, AMD off | VMM (reserve+map) weight slab; `=0` falls back to one flat allocation (`=1` opts AMD in). |
 | `PLOW_SLAB_KEEP` | multi-model on | park evicted models' 256 MiB slab chunks in a per-device pool for the next load; `=0` releases them (`=1` forces on for single-model). |
 | `PLOW_KV_POOL_MIB=N` | 512 | per-engine KV physical-block reuse pool cap (MiB); `0` disables pooling. |
 | `PLOW_DRAIN_TIMEOUT_MS=N` | unset (unbounded) | S1 switch drain deadline; past it the victim's live generations are preempted (`Preempted` finish, queued jobs 429). `0` preempts immediately. |
 | `PLOW_PRELOAD` | on | speculative next-model preload after an S1 switch; `=0` disables. |
+| `PLOW_DEVICES=0,1` | all visible | CUDA device ordinals to serve on. Indices into the **visible** set, not the physical one. |
+| `PLOW_PLACE=spread\|pack\|explicit` | `spread` | CUDA: how models are laid out over the visible devices. |
+| `PLOW_PIN=slug@2,...` | unset | CUDA: pin a model to a device; required for every model under `--place explicit`. |
+| `PLOW_CO_SCHED=free\|rr` | `free` | how co-resident models take a shared device group; `rr` adds FIFO turns on CUDA, AMD and CPU. AMD multi-model startup requires `rr`. |
+| `PLOW_CO_SCHED_QUANTUM=N` | 4 | consecutive mux ticks one model keeps its group under `rr`; not a token or wall-time limit. |
+| `PLOW_MODELS_ROOT=dir[:dir]` | startup `--assets` parents | directories `POST /v1/models/load` may take an assets dir from. Defaults closed. |
 | `PLOW_TP_AGREE_EVERY=N` | 1 | TP cross-rank agreement interval. `PLOW_TP_NO_AUDIT=1` disables the redundant-rank audit (timing runs); `PLOW_TP_SERIAL_LOAD=1` restores one-at-a-time per-rank load. |
 | `PLOW_LOAD_PROFILE=1` | off | split upload wall time into alloc / stage+DMA profiling. |
 | `PLOW_STEP_TIME=1`, `PLOW_TTFT_LOG=1` | off | per-decode-step host-op timing / TTFT breakdown logging (diagnostics). |
+
+## Visible devices: `CUDA_VISIBLE_DEVICES`, `ROCR_VISIBLE_DEVICES`, `HIP_VISIBLE_DEVICES`
+
+The three are not equivalent, and one of them used to do nothing at all.
+
+| variable | who applies it | effect on plowrt |
+|---|---|---|
+| `CUDA_VISIBLE_DEVICES` | libcuda, at `cuInit` | honoured. Every ordinal plowrt uses is already an index into the masked set. |
+| `ROCR_VISIBLE_DEVICES` | ROCr, at `hsa_init` | honoured. `hsa_iterate_agents` returns the masked set. |
+| `HIP_VISIBLE_DEVICES` | the HIP runtime | **plowrt never loads HIP** — it dlopens ROCr directly. plowrt applies this one itself, but only when `ROCR_VISIBLE_DEVICES` is unset. |
+
+Before this, `HIP_VISIBLE_DEVICES` had no effect whatsoever on plowrt
+(measured: `HIP_VISIBLE_DEVICES=4,5,6,7` still enumerated all 8 agents), so an
+operator who leased one GPU that way got a process quietly using every GPU on
+the box.
+
+**The two AMD variables do not compose the way they look.** HIP indexes into
+the set ROCr already made visible. With `ROCR_VISIBLE_DEVICES=4` there is one
+visible agent, at index 0, and `HIP_VISIBLE_DEVICES=4` then names nothing. So:
+
+* `ROCR_VISIBLE_DEVICES` set → it decides the set; `HIP_VISIBLE_DEVICES` is
+  ignored, with a warning saying so. This keeps lease tooling that exports both
+  to the same absolute id working, and plowrt can only ever reach GPUs ROCr
+  granted it.
+* only `HIP_VISIBLE_DEVICES` set → plowrt applies it as an index mask over the
+  enumerated agents, and logs that it did.
+* `HIP_VISIBLE_DEVICES` naming devices by UUID (`GPU-...`) with no
+  `ROCR_VISIBLE_DEVICES` → **refused**, because plowrt cannot resolve a UUID
+  without HIP and silently ignoring a visible-device mask is how a lease gets
+  violated.
+
+Both vendor runtimes **truncate** a list at the first entry that does not parse
+rather than skipping it, so `0,1,x,3` means devices 0 and 1 — device 3 is
+silently gone. plowrt reports the truncation point.
+
+CUDA `--devices` / `PLOW_DEVICES` indexes the visible set, so with
+`CUDA_VISIBLE_DEVICES=4,5` the two GPUs are `--devices 0,1`. AMD currently uses
+its first visible device (or the first TP-width visible devices) for every
+startup model. Restrict that set with `ROCR_VISIBLE_DEVICES`; independent AMD
+model placement and residency management are not implemented. Placement flags
+on a non-CUDA backend are rejected.
+
+Model load/unload/status routes are privileged and are served only on the
+owner-only Unix socket (`--socket`), not the public TCP listener. For example:
+`curl --unix-socket /tmp/plow.sock http://localhost/v1/models/status`.
+The public `/v1/models` catalogue remains available on both listeners. CUDA
+supports managed demand load, eviction and explicit load/unload. AMD and CPU
+load their native models at startup; control-plane load/unload returns an error.
+
+Round-robin turns are independent per device group. Each tick can contain a
+bounded prefill chunk and multistep decode, so quantum 4 does not mean four
+tokens or four milliseconds. Cold prefill yields between chunks under `rr`,
+including when decode deferral or no-interleave is configured. Slow response
+consumers receive an explicit error after the token buffer fills; they do not
+block another model's submission thread.
 
 `plowrt bench` always records AMD overlap capability under
 `engine.amd_overlap`. Current HSA engines report shared prefill/decode scratch,

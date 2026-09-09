@@ -35,12 +35,12 @@ fn make_app_with_tokenizer(tokenizer_json: Option<&str>) -> axum::Router {
 
     let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new(4));
     let execset = Arc::new(ExecutorSet::bringup(backend).unwrap());
-    let mut registry = Registry::new();
+    let registry = Registry::new();
     registry.load(&dir, None).unwrap();
     let state = Arc::new(AppState::new(registry, execset));
 
     // Match the production shape: install a bucket muxer per registered slug.
-    let slugs: Vec<String> = state.registry.slugs().map(str::to_string).collect();
+    let slugs: Vec<String> = state.registry.slugs();
     for slug in slugs {
         let bundle = state.registry.get(&slug).unwrap();
         let m = mux::spawn(

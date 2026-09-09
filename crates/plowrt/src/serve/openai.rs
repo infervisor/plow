@@ -309,6 +309,12 @@ pub struct ChunkChoice {
     pub index: u32,
     pub delta: Delta,
     pub finish_reason: Option<&'static str>,
+    /// Same widening note as [`Choice::x_plow_finish_reason`]. The streamed
+    /// path used to omit it, so an operator-forced stop reached a streaming
+    /// client as an ordinary `"length"` and was indistinguishable from the
+    /// model simply hitting `max_tokens`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x_plow_finish_reason: Option<&'static str>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -347,6 +353,11 @@ pub struct CompletionChoice {
     pub text: String,
     pub logprobs: Option<serde_json::Value>,
     pub finish_reason: Option<&'static str>,
+    /// Same widening note as [`Choice::x_plow_finish_reason`]. `/v1/completions`
+    /// carried no such field at all, so a preemption there was reported purely
+    /// as `"length"` with no way for a caller to tell the two apart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x_plow_finish_reason: Option<&'static str>,
 }
 
 /// `GET /v1/models` response.
