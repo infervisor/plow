@@ -835,3 +835,23 @@ errors. Their adjacent Markdown files document controls, reproduction and result
 Standalone grids and register pressure differ from the persistent interpreter.
 Full-model arithmetic, fused GLU, sparse rows and serving require qualification
 before either candidate can become a production route.
+
+
+### Default-cache serving qualification after launch elision
+
+The final `b828a24` runtime passes a serving check with `PLOW_VMM_PREFIX`,
+`PLOW_TOKEN_BATCH` and `PLOW_PF_BATCH` omitted. Startup selects VMM prefix caching
+automatically; token-batch selection remains enabled but explicitly reports the
+missing CUDA executor and uses ordinary execution. Packed prefill is not selected
+by this default-cache configuration.
+
+All 12 cold/warm natural completions at 1K/4K/16K match each other and the previous
+adaptive runtime. Warm requests have the required cache counts, including 16384
+cached tokens for the 16K cases. Eight concurrent cold 16K requests complete; all
+eight isolated replays match, followed by successful short-request recovery and
+three API checks. This is functional evidence, not a new performance campaign.
+
+The runner stopped its owned server after completion.
+`cublaslt-elide-experimental-qualification.json` records source, artifact hashes,
+controlled logits, direct-step timing and the default-serving results. Raw
+serving artifacts use `plow-bf16-cublaslt-elide-default-*` in the campaign directory.
