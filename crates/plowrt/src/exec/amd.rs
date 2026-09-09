@@ -7870,6 +7870,31 @@ pub struct AmdEngine {
     seg_window: bool,
 }
 
+/// Batch-width-matched decode tiers sitting next to the primary object directory, as the
+/// `dir:width[,dir:width]` spec `PLOW_HSACO_LOWRUNG` takes.
+///
+/// `scripts/build_gfx942.sh PLOW_DECODE_TIERS=1,2` writes `<objdir>/lowrung<w>/`. Only widths
+/// that actually carry a decode object are returned, so a half-finished build contributes
+/// nothing rather than a path that fails to open later. Returns `None` when there are none,
+/// which keeps `PLOW_HSACO_LOWRUNG` unset and the load byte-identical to before.
+fn discover_lowrung_tiers(hsaco_dir: &Path) -> Option<String> {
+    // The widths the ladder can express. Ordered, because the spec is parsed as an ordered
+    // rung table and an unordered one would put a wider tier in front of a narrower rung.
+    let spec = [1u32, 2, 4, 8]
+        .iter()
+        .filter_map(|w| {
+            let d = hsaco_dir.join(format!("lowrung{w}"));
+            // Probe the same object name the gq decode load asks for. Any decode object in
+            // the directory would do as an existence check, but probing the one that is
+            // actually opened means a directory that would fail at load fails here instead.
+            d.join("interp_decode_gq.elf")
+                .is_file()
+                .then(|| format!("{}:{}", d.display(), w))
+        })
+        .collect::<Vec<_>>();
+    (!spec.is_empty()).then(|| spec.join(","))
+}
+
 impl AmdEngine {
     pub fn overlap_evidence(&self, rank: usize) -> AmdOverlapRankEvidence {
         let range = |name: String, address_space, start, len: u64| AmdOwnedRange {
@@ -8488,7 +8513,24 @@ impl AmdEngine {
             .amd
             .hsaco_lowrung
             .clone()
-            .filter(|d| !d.is_empty());
+            .filter(|d| !d.is_empty())
+            // DISCOVERED, not required. `scripts/build_gfx942.sh PLOW_DECODE_TIERS=…`
+            // writes the matched objects to `<objdir>/lowrung<w>/`, and until now the only
+            // thing that turned them into a `dir:w` spec was a loop in
+            // `scripts/glm53_serve_inner.sh` — so every OTHER caller (bringup_gate.sh, a
+            // bare `plowrt serve`, anyone following docs/BUILD.md) silently served without
+            // them even when they sat right there next to the object it did load.
+            //
+            // That is not a small default. `PLOW_GEMV_MM` is a compiled CEILING, so a
+            // rung-1 packet running a width-4 object computes four rows per decode GEMV and
+            // discards three: building the tiers and naming them is worth +24.9% output
+            // tok/s and -20.7% TPOT at concurrency 1 on GLM-5.3 TP8
+            // (docs/amd/tp-bringup-mi300x.md §7b), and the campaign that froze that
+            // baseline had `hsaco_lowrung: None`.
+            //
+            // An explicit setting still wins, and an empty one still means "off" — this
+            // only fills in the value the directory layout already implies.
+            .or_else(|| discover_lowrung_tiers(hsaco_dir));
         let mut dense_prefill_object = false;
         // ARMED-ness of the decode object, for the one status line at the end of load.
         // Every decode object opened must carry it, low rungs included: a ladder whose
