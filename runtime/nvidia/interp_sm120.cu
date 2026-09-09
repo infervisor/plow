@@ -828,9 +828,19 @@ static_assert(PLOW_NV_GEMV_STAGING_BYTES <= PLOW_NV_BASE_ARENA_FLOATS * sizeof(f
 #endif
 #if PLOW_NV_GEMV512_ROLE
 #define PLOW_NV_ARENA_FLOATS 16384u
+#elif PLOW_NV_FP8_DECODE_WGMMA_ACTIVE
+#define PLOW_NV_FP8_DECODE_WGMMA_ARENA_FLOATS ((PLOW_NV_FP8_DECODE_WGMMA_ARENA_BYTES + 3u) / 4u)
+#define PLOW_NV_NON_FP8_ARENA_FLOATS \
+    (PLOW_NV_BASE_ARENA_FLOATS > PLOW_NV_M16_ARENA_FLOATS ? PLOW_NV_BASE_ARENA_FLOATS : PLOW_NV_M16_ARENA_FLOATS)
+#define PLOW_NV_ARENA_FLOATS \
+    (PLOW_NV_NON_FP8_ARENA_FLOATS > PLOW_NV_FP8_DECODE_WGMMA_ARENA_FLOATS ? PLOW_NV_NON_FP8_ARENA_FLOATS : PLOW_NV_FP8_DECODE_WGMMA_ARENA_FLOATS)
 #else
 #define PLOW_NV_ARENA_FLOATS                                                                  \
     (PLOW_NV_BASE_ARENA_FLOATS > PLOW_NV_M16_ARENA_FLOATS ? PLOW_NV_BASE_ARENA_FLOATS : PLOW_NV_M16_ARENA_FLOATS)
+#endif
+#if PLOW_NV_FP8_DECODE_WGMMA_ACTIVE
+static_assert(PLOW_NV_ARENA_FLOATS * sizeof(float) >= PLOW_NV_FP8_DECODE_WGMMA_ARENA_BYTES,
+              "FP8 decode WGMMA requires its full arena; incompatible role flags are unsupported");
 #endif
 /* block_max_u64 needs PLOW_NV_WARPS u64 = 2*WARPS floats; block_sum needs WARPS floats. Both
  * fit inside the flash claim at any supported head dim, but the max above keeps that true if
@@ -1818,7 +1828,11 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
      * GEMV_GLU_FP8 t0=fu t1=x t2=Wg(fp8) t5=Wu(fp8) t3=g_scale t4=u_scale  i0=M i1=N i2=K i5=act. */
 #if PLOW_HAS_GEMV_FP8
     case PLOW_DOP_GEMV_FP8:
-        if (in->i[2] <= PLOW_NV_GEMV_STAGING_BYTES / 2u)
+        if (in->i[2] <= PLOW_NV_GEMV_STAGING_BYTES / 2u
+#if PLOW_NV_FP8_DECODE_WGMMA_ACTIVE
+            || gemv_fp8_wgmma_supported(in->i[0], in->i[2])
+#endif
+        )
             d_gemv_fp8((__nv_bfloat16*)TEN(0),
                        (const __nv_bfloat16*)TEN(1) + (size_t)in->i[4] * in->i[2],
                        (const uint8_t*)TEN(2), (const float*)TEN(5), in->i[0], in->i[1], in->i[2],

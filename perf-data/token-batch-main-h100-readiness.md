@@ -1054,3 +1054,25 @@ is not a quality score. Broader quality and sustained-load qualification remain
 open. Serving checks overlapped checkpoint copying/hashing and are functional
 evidence, not performance measurements. No vLLM win or off-instance backup is
 claimed. The checkpoint's `evidence/qualification.json` records the detailed proof.
+
+### Experimental native FP8 WGMMA decode (2026-09-09)
+
+The default-off `PLOW_NV_FP8_DECODE_WGMMA=1` path quantizes BF16 activations
+inside each CTA and uses Hopper E4M3 tensor cores for M8/M16 projections.
+It uses FP8 weights and BF16 KV; the saved BF16-weight/FP8-KV checkpoint is
+unchanged. [Implementation and evidence](../runtime/nvidia/experiments/gemma_fp8_w8a8_persistent.md).
+
+Matched isolated full-model decode steps at 1024 context, 16 warmups and 64
+measurements: B1 **21.012→21.177 ms** (+0.79%), B8 **92.319→43.465 ms**
+(2.124× faster), B16 **109.235→60.527 ms** (1.805× faster). No CPU builds or
+other GPU jobs overlapped these measurements. These are direct steps, not HTTP
+throughput or vLLM wins.
+
+All 384 M1/M2/M4 full-vocabulary fallback frames were bit-exact. M8 and M16
+matched each other on 128 frames; each matched the native top prediction on
+125/128. Maximum logit difference was 4.3125, worst cosine 0.9954132, and
+worst relative L2 0.1604071. Activation precision changes with the rung, so
+model-quality qualification remains open. The production-dispatch probe passed
+171 checks plus 12 fallback checks; bounded memcheck reported zero errors.
+Default-off cubin bytes remain identical. Full proof is in campaign
+`fp8-w8a8-model-qualification.json`; this option remains off by default.
