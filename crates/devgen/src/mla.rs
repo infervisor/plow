@@ -1140,6 +1140,12 @@ pub(crate) enum MoeEnc {
     /// bridge — SwiGLU, MXFP4 quantize and the E8M0 scale write all happen there, so `fu` is
     /// written already-fp4 in the sorted layout DOWN reads and no bf16 intermediate exists.
     Mxfp4 = 2,
+    /// compressed-tensors `pack-quantized` int4: symmetric, `group_size` 32, stored as an unsigned
+    /// nibble with an offset of 8, one BF16 scale per group. Kimi-K2.7-Code's routed experts, and
+    /// the ONLY encoding that reads that checkpoint without re-quantizing it — measured
+    /// alternatives cost 2.26% (block-fp8, and it does not fit this host) or 9.96% (mxfp4) mean
+    /// weight error. w4a16: the activation stays bf16, as on the block-fp8 arms.
+    Int4G32 = 3,
 }
 
 impl MoeEnc {
@@ -5806,6 +5812,32 @@ fn mla_ckpt_enc(dir: &Path) -> Option<MoeEnc> {
         );
         return Some(MoeEnc::Fp8Blk);
     }
+    // compressed-tensors `pack-quantized` int4 (Kimi-K2.7-Code's routed experts). Every field is
+    // CHECKED rather than assumed, because each one that differs is a different kernel: the
+    // container is only byte-compatible with the mxfp4 load at 4 bits, the fragment only covers
+    // exactly one scale at group_size 32, and the offset-8 decode in `plow_int4x8_to_f16x4` is
+    // only correct for a SYMMETRIC scheme (an asymmetric one carries its own zero point per
+    // group, which nothing here binds).
+    if method == "compressed-tensors" {
+        let g = q.get("config_groups").and_then(|g| g.as_object());
+        let w = g
+            .and_then(|g| g.values().next())
+            .and_then(|v| v.get("weights"))
+            .unwrap_or_else(|| {
+                panic!("checkpoint quantization_config.config_groups has no weights entry")
+            });
+        let num = |k: &str| w.get(k).and_then(|v| v.as_u64());
+        let fmt = q.get("format").and_then(|f| f.as_str()).unwrap_or("");
+        let ty = w.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let sym = w.get("symmetric").and_then(|t| t.as_bool()).unwrap_or(false);
+        let bits = num("num_bits").unwrap_or(0);
+        let group = num("group_size").unwrap_or(0);
+        assert!(
+            fmt == "pack-quantized" && ty == "int" && sym && bits == 4 && group == 32,
+            "checkpoint compressed-tensors weights are format={fmt:?} type={ty:?}              symmetric={sym} num_bits={bits} group_size={group}; the int4 arm reads              pack-quantized int4, symmetric, group_size 32 and nothing else. Missing              capability: `ckpt_quant_ct_{ty}{bits}_g{group}`."
+        );
+        return Some(MoeEnc::Int4G32);
+    }
     // Anything else is a quantization we cannot emit. REFUSE rather than fall back to bf16: the
     // weights on disk are not bf16, so a bf16 packet is a WRONG packet, not an unoptimised one —
     // the same rule that makes w8a16-on-gfx950 a refusal rather than a silent substitution.
@@ -6584,6 +6616,14 @@ pub(crate) fn emit_glm_moe_ffn(
         });
         vec![c_d]
     } else {
+        // Int4G32 is DETECTED (mla_ckpt_enc) and has decode primitives (amd_common.h
+        // [INT4-G32-DECODE]), but no emit site routes to them yet, and the `else` below is bf16.
+        // Falling through would emit bf16 expert ops against 4-bit weights — the substitution
+        // `mla_ckpt_enc` exists to refuse, arrived at from the other side. Refuse here instead.
+        assert!(
+            enc != MoeEnc::Int4G32,
+            "MoeEnc::Int4G32 has no decode emit site yet: the kernel primitives exist              (plow_int4x8_to_f16x4 / int4_dot32 / wave_dot_int4_g32) but no DevOp selects them,              so this would emit bf16 expert ops against 4-bit weights. Missing capability:              `moe_decode_int4_g32`. Convert the experts to block-fp8 for a single-block bringup              (scripts/kimi_k27_prep.py), or wire the arm."
+        );
         let (glu_op, down_op) = if use_fp8 {
             (DevOp::MoeExpertGluFp8Blk, DevOp::MoeExpertDownFp8Blk)
         } else {

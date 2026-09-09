@@ -148,6 +148,11 @@ __device__ __forceinline__ unsigned moe_bound_topk(unsigned char* table, unsigne
 #define PLOW_MOE_ENC_BF16   0u
 #define PLOW_MOE_ENC_FP8BLK 1u
 #define PLOW_MOE_ENC_MXFP4  2u
+/* compressed-tensors `pack-quantized` int4: symmetric, group_size 32, an unsigned nibble with an
+ * offset of 8, and one BF16 scale per group. Kimi-K2.7-Code's routed experts. Shares the mxfp4
+ * arm's 16-byte-per-32-values load and lane order (the containers are byte-identical); differs in
+ * the element decode and in the scale's TYPE. See [INT4-G32-DECODE] in amd_common.h. */
+#define PLOW_MOE_ENC_INT4G32 3u
 
 /* GLU activation, matching op_elementwise.h / the Rust reference. act: 0 = gelu_tanh, 1 = silu. */
 #define PLOW_MOE_ACT_GELU_TANH 0u
@@ -1069,6 +1074,58 @@ __device__ __forceinline__ void moe_down_lg_rows(
 }
 
 
+/* INT4 group-32 wave-reduced dot of ONE output channel — the int4 twin of wave_dot_mxfp4, for
+ * the DECODE experts.                                                      [INT4-G32-DECODE]
+ *
+ * The weight walk is the mxfp4 one VERBATIM: 16 bytes per lane is 32 int4 is exactly one group,
+ * so `k>>5` indexes both the fragment and its scale, and no scale varies inside a fragment. What
+ * differs is the scale's TYPE — one BF16 per group here against an E8M0 byte — which is why the
+ * row arrives as `const bf16*` rather than through `e8m0_to_f32`.
+ *
+ * `xsum` IS COMPUTED HERE rather than hoisted, and that is a known cost, not an oversight: the
+ * bias term of the offset-8 decode needs sum(x) over the fragment (see int4_dot32), and the same
+ * activation fragment is re-dotted against every routed expert row, so a caller that walks rows
+ * in the inner loop can compute it once and pass it down. Correctness first; the hoist is a
+ * measured optimisation and belongs with the walk that owns the row loop. */
+__device__ __forceinline__ float wave_dot_int4_g32(const bf16* x, const unsigned char* Wrow,
+                                                   const bf16* srow, unsigned K, unsigned lane) {
+    const unsigned step = PLOW_WAVE * 32; /* 64 lanes x 32 int4 = 2048 K per pass */
+    const unsigned nchunk = (K + step - 1) / step;
+    const PLOW_GLOB fp4v32* const W = (const PLOW_GLOB fp4v32*)(const PLOW_GLOB void*)Wrow;
+    float acc = 0.0f;
+    for (unsigned c = 0; c < nchunk; c++) {
+        const unsigned k = c * step + lane * 32;
+        if (k + 32u <= K) {
+            const bf16v8 x0 = ld_glob8(x + k), x1 = ld_glob8(x + k + 8);
+            const bf16v8 x2 = ld_glob8(x + k + 16), x3 = ld_glob8(x + k + 24);
+            float xsum = 0.0f;
+            const bf16v8 xs[4] = {x0, x1, x2, x3};
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                bf16v8_pairs xp{xs[i]};
+#pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    /* bf16 -> f32 is a 16-bit shift, not a numeric conversion. */
+                    const unsigned xu = __builtin_bit_cast(unsigned, xp.p[j]);
+                    float a, b;
+                    unsigned t = xu << 16;
+                    __builtin_memcpy(&a, &t, 4);
+                    t = xu & 0xffff0000u;
+                    __builtin_memcpy(&b, &t, 4);
+                    xsum += a + b;
+                }
+            }
+            const unsigned su = __builtin_bit_cast(unsigned short, srow[k >> 5]);
+            float sf;
+            const unsigned st = su << 16;
+            __builtin_memcpy(&sf, &st, 4);
+            const int4_frag32 wf = int4_prep32(W[k >> 5], sf);
+            acc = int4_dot32(wf, x0, x1, x2, x3, xsum, acc);
+        }
+    }
+    return wave_sum(acc);
+}
+
 /* ONE quantized-expert dot, encoding selected at runtime. PLOW_MOE_ENC_* as on ops 85/86.
  * `srow_f` is the block-fp8 scale row (f32), `srow_b` the MXFP4 E8M0 row; the caller passes
  * whichever its encoding uses and the other is ignored.
@@ -1098,6 +1155,11 @@ __device__ __forceinline__ float wave_dot_enc(unsigned enc, const bf16* x,
                                               const unsigned char* srow_b, unsigned K,
                                               unsigned lane) {
     if (enc == PLOW_MOE_ENC_MXFP4) return wave_dot_mxfp4(x, Wrow, srow_b, K, lane);
+    /* int4 g32 rides `srow_b` because it is the BYTE row operand and this encoding's scale is a
+     * BF16 per group — 2 bytes at stride K/32 — not an E8M0 byte. No signature change, and the
+     * fp8 f32 row stays untouched. */
+    if (enc == PLOW_MOE_ENC_INT4G32)
+        return wave_dot_int4_g32(x, Wrow, (const bf16*)(const void*)srow_b, K, lane);
     if (enc != PLOW_MOE_ENC_FP8BLK) return __builtin_nanf(""); /* POISON — see the note above */
     return wave_dot_fp8_blk(x, Wrow, srow_f, K, lane);
 }
