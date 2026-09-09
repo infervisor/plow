@@ -110,6 +110,21 @@ fn chain(insts: Vec<DevInst64>, grid: u32, rows: u32) -> plow_asset::aux_program
 }
 
 impl PackedTerminal {
+    pub(super) fn patch_discarded_tail(&self, bucket: &mut PrefillBucket, discard: bool) {
+        let end = bucket.h_inst.len();
+        for (inst, original) in bucket.h_inst[end - self.template.len()..]
+            .iter_mut()
+            .zip(&self.template)
+        {
+            inst.op = if discard {
+                DevOp::Nop as u16
+            } else {
+                original.op
+            };
+        }
+        bucket.inst_range.end = end;
+    }
+
     pub(super) fn load(e: &GpuEngine) -> Result<Option<Self>> {
         if !e.vmm_prefix_enabled() || e.packed_prefill.is_none() || e.pf_batch.is_none() {
             return Ok(None);
@@ -484,7 +499,10 @@ mod tests {
             })
             .collect();
         e.prefill_batched_complete(&requests, &mut output).unwrap();
-        assert_eq!(output, vec![(slots[1], feeds[1][0]), (slots[0], feeds[0][0])]);
+        assert_eq!(
+            output,
+            vec![(slots[1], feeds[1][0]), (slots[0], feeds[0][0])]
+        );
         let mut logits = Vec::new();
         for (row, i) in [1, 0].into_iter().enumerate() {
             e.logits_row(row, &mut logits).unwrap();
@@ -520,5 +538,47 @@ mod tests {
             }
         }
         eprintln!("PASS compact terminal: 128 full-logit snapshots, sparse slots {slots:?}, reversed request order, sample rows 4/7");
+
+        let prompt = &prompts[0][..e.pf_max_rows()];
+        e.begin_slot(0, prompt.len() + 1).unwrap();
+        e.prefill_batched_complete(
+            &[PfBatchReq {
+                slot: 0,
+                prompt,
+                c0: 0,
+                len: prompt.len(),
+            }],
+            &mut output,
+        )
+        .unwrap();
+        let mut packed_logits = Vec::new();
+        e.logits_row(0, &mut packed_logits).unwrap();
+        e.begin_slot(0, prompt.len() + 1).unwrap();
+        e.run_one_prefill_chunk(e.f_pf.unwrap(), 0, prompt, 0, prompt.len())
+            .unwrap();
+        e.logits_row(0, &mut logits).unwrap();
+        assert!(logits
+            .iter()
+            .zip(&packed_logits)
+            .all(|(a, b)| a.to_bits() == b.to_bits()));
+        e.begin_slot(0, prompt.len() + 1).unwrap();
+        e.prefill_batched_complete(
+            &[PfBatchReq {
+                slot: 0,
+                prompt,
+                c0: 0,
+                len: prompt.len(),
+            }],
+            &mut output,
+        )
+        .unwrap();
+        e.logits_row(0, &mut logits).unwrap();
+        assert!(logits
+            .iter()
+            .zip(&packed_logits)
+            .all(|(a, b)| a.to_bits() == b.to_bits()));
+        eprintln!(
+            "PASS compact terminal: packed/ordinary/packed tail restoration, full logits exact"
+        );
     }
 }

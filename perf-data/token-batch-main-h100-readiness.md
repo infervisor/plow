@@ -855,3 +855,22 @@ The runner stopped its owned server after completion.
 `cublaslt-elide-experimental-qualification.json` records source, artifact hashes,
 controlled logits, direct-step timing and the default-serving results. Raw
 serving artifacts use `plow-bf16-cublaslt-elide-default-*` in the campaign directory.
+
+
+## Skip the discarded packed-prefill terminal
+
+When a validated compact terminal is available, packed prefill now replaces its
+unused final normalization, vocabulary projection, soft cap and two argmax
+instructions with no-ops. Their counters and dependency signals remain intact.
+The compact terminal still gathers the completing requests' hidden rows and
+performs the original normalization and vocabulary math. Switching a bucket
+back to ordinary prefill restores the five opcodes and uploads the full changed
+instruction range.
+
+The runtime host suite passes 597 tests with 17 ignored. BF16 and FP8 GPU checks
+each match all 128 ordinary-reference full-vocabulary snapshots exactly, including
+sparse highest slots and reversed completion order. Additional packed→ordinary→
+packed checks on the same bucket preserve full logits. Raw logs are
+`packed-tail-skip-{bf16,fp8}-gpu.log` and `packed-tail-skip-host-tests.log` in the
+campaign directory. This change is within the existing packed-prefix path;
+request-latency measurements are pending.

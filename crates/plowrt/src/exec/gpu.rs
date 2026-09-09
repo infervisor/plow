@@ -6903,6 +6903,9 @@ impl GpuEngine {
         if self.packed_prefill.is_some() && self.prefill[bi].batch_patched {
             let pack = self.packed_prefill.as_ref().unwrap();
             let bucket = &mut self.prefill[bi];
+            if let Some(terminal) = &self.packed_terminal {
+                terminal.patch_discarded_tail(bucket, false);
+            }
             for &pc in &bucket.rope_sites {
                 bucket.h_inst[pc].t[6] = TENSOR_NONE16;
             }
@@ -7296,6 +7299,9 @@ impl GpuEngine {
         }
         if let Some(pack) = &self.packed_prefill {
             let b = &mut self.prefill[bi];
+            if let Some(terminal) = &self.packed_terminal {
+                terminal.patch_discarded_tail(b, true);
+            }
             for &pc in &b.rope_sites {
                 b.h_inst[pc].t[6] = pack.slot;
             }
