@@ -4832,33 +4832,28 @@ pub(crate) fn emit_glm_mla_prefill(
     // B2's head-batched gather fills the 64 M-rows with (8 queries x 8 heads); a shard with
     // any other per-rank head count has no row map, so those configs stay dense.
     //
-    // GATHER ON EVERY LAYER, not only the ones that own an indexer. `indexer_types` is
-    // ['full','full','full','shared','shared','shared','full',...] — 21 'full' against 57
-    // 'shared' on GLM-5.3 — and a 'shared' layer's whole definition is that it REUSES the
-    // previous full layer's selection. The DECODE chain already gates exactly this way
-    // (`d.t[7] = n.iidx; // idx table (this or the last full layer's selection)`, keyed on `dsa`
-    // and not on `full`); prefill additionally required `w.iwqb != TENSOR_NONE`, which bound it
-    // to the 21 layers whose weights are declared.
+    // `w.iwqb != TENSOR_NONE` RESTRICTS THIS TO THE 21 'full' INDEXER LAYERS, AND THAT IS LOAD
+    // BEARING — it is not the oversight the next sentence of the old comment made it look like.
+    // GLM-5.3's `indexer_types` is 21 'full' to 57 'shared', and the comment here used to say
+    // that shared layers "reuse the previous full layer's union table" and that "`c_uni` threads
+    // that reuse". `c_uni` does not exist anywhere in this tree; that sentence described
+    // behaviour no code implements, so it reads as a missing feature. It was TRIED:
     //
-    // MEASURED, and the ceiling was exactly the layer count: against the dense run's 17,391 ms
-    // of flash over a 70k prefill, gathering 21 of 78 layers took it to 12,644 ms — 27.3% off,
-    // against 26.9% of layers. The gathered layers go nearly free; there were just too few.
-    // The indexer chain still runs ONLY where the weights are (`sel_here`), so extending the
-    // gather to the shared layers adds no scoring, no top-k and no union work — its whole cost
-    // is already paid. docs/amd/tp-bringup-mi300x.md 7g.
-    let sparse = glm_dsa_pf_bucket(c, t) && nh_l == 8;
-    // Whether THIS layer owns an indexer and so writes `n.iuni`; the shared layers read whatever
-    // the last full layer left there. One buffer, not one per layer — that is what makes the
-    // reuse free rather than merely cheap.
+    //   * dropping the `iwqb` term takes the gather from 21 of 78 flash ops to 78 of 78
+    //     (verified on the raw operand — both arms are opcode 51 and it is t7's presence that
+    //     selects the gather: `t7=NONE x57, t7=iuni x21` became `t7=iuni x78`);
+    //   * it is a large, real speedup — 70k prefill attention 17,391 ms -> 2,747 ms (6.3x) and
+    //     flat in context instead of quadratic, whole prefill 25,645 -> 13,640 ms (1.88x);
+    //   * and it is WRONG. A needle planted at the front of a 40k haystack, which both dense and
+    //     the 21-layer gather recover, is MISSED; the continuation of a repeated phrase degrades
+    //     to 'the fox over dog over over the the'. Deterministic across repeats, so it is the
+    //     selection semantics and not a race on the shared `n.iuni` buffer.
     //
-    // ORDERING IS TRANSITIVE, not assumed. A shared layer's flash depends on its own input norm,
-    // which depends on the previous layer's residual, which depends on that layer's flash — so
-    // every union write precedes every reader through the residual stream, and layer 0 is 'full'
-    // so a write always precedes the first read. This is the same argument the decode chain makes
-    // ("sequential layer chain => n.iidx already holds it"), which likewise pushes `c_sel` into
-    // the flash's dep list only on full layers.
-    let sel_here = sparse && w.iwqb != TENSOR_NONE;
-    let c_sel_pf = if sel_here {
+    // So a 'shared' layer may not simply attend the previous full layer's union. Whatever it is
+    // entitled to reuse, plow's 8-query union is not it, and the missing piece is a semantic
+    // one, not the plumbing. docs/amd/tp-bringup-mi300x.md 7g.
+    let sparse = glm_dsa_pf_bucket(c, t) && w.iwqb != TENSOR_NONE && nh_l == 8;
+    let c_sel_pf = if sparse {
         Some(emit_glm_dsa_prefill_select(
             b,
             c,

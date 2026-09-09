@@ -1293,6 +1293,61 @@ Dropping the `iwqb` requirement (keeping it only to decide which layers RUN the 
 therefore the free half of the feature: the scoring, top-k and union work is already paid on the
 21 full layers, and the other 57 would gather against a table that is already sitting there.
 
+### Extending the gather to all 78 layers: 1.88x, and wrong
+
+The `iwqb` term looked like an oversight, because the comment sitting on top of it describes a
+mechanism (`c_uni`) that exists in no other line of the tree, and because the DECODE chain gates
+the same decision on the model-level `dsa` rather than on `full`. It was tried.
+
+Dropping it moves every flash op onto the gather arm. Verified statically before spending a
+lease, by reading the raw operand rather than the instruction mix — both arms are opcode 51, and
+it is `t7`'s presence that selects the gather:
+
+```
+before   t7=NONE  i6=0      x57      t7=iuni i6=16384  x21
+after                                t7=iuni i6=16384  x78
+```
+
+and the speedup is large and exactly where the model says it should be:
+
+```
+                dense      21 layers    78 layers
+ flash        17,391 ms    12,644 ms     2,747 ms     6.3x, and FLAT in context
+ interp        8,254 ms    10,926 ms    10,893 ms     unchanged — the indexer still runs on 21
+              ---------    ---------    ---------
+ total        25,645 ms    23,570 ms    13,640 ms     1.88x
+```
+
+Per-layer flash goes 2,960 us at `c0=0` to 4,562 us at `c0=57344`, against dense's 3,758 to
+37,550: the quadratic term is gone, which is the O(T·top_k) signature and the whole point of the
+feature. Attention drops from 68% of prefill to 20%, and the MoE/linear term becomes 80% of what
+is left — the crossover this document predicted.
+
+**And the output is wrong.** Three configurations, same probes, one lease:
+
+```
+                      short == dense   repeat stable   40k needle
+ dense                     —                yes          FOUND
+ 21-layer gather          yes               yes          FOUND
+ 78-layer gather          yes               yes          MISSED
+```
+
+The short prompt agrees across all three, as it must — it rides the t=128 bucket, which the gate
+keeps dense, so it only proves the object and emit are sound. The long probes are the result: the
+78-layer build misses a fact planted at the FRONT of a 40k-token haystack that both other builds
+recover, and degrades a repeated-phrase continuation to `' the fox over dog over over the the'` —
+the right vocabulary in the wrong order.
+
+It is DETERMINISTIC (`rep1 == rep2`), which rules out the obvious suspicion: the shared `n.iuni`
+buffer is not being read out from under its writer. The transitive ordering argument holds. What
+fails is the semantics — a 'shared' layer is not entitled to attend the previous full layer's
+8-query union, whatever else it is entitled to reuse.
+
+So the guard stays, with this recorded on it. The prize is quantified and it is the largest single
+item left in this campaign — **1.88x on prefill, and the removal of the quadratic term entirely** —
+but claiming it needs the per-layer selection semantics to be established against the reference,
+not the plumbing, which already works.
+
 ## 8. Unrelated issue observed
 
 `cargo test -p devgen mla` fails `k3::tests::the_mla_prefill_arm_forces_one_split`
