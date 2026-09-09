@@ -200,17 +200,40 @@ mod tests {
     #[test]
     #[ignore = "requires H100 packed-prefix assets and natural prompt reference metadata"]
     fn unified_cuda_rows_match_isolated_suffixes_and_commit_once() {
-        check_unified_rows(false);
+        check_unified_rows(false, false);
     }
 
     #[test]
     #[ignore = "requires H100 packed-prefix assets and natural prompt reference metadata"]
     fn unified_cuda_aligned_prompts_reuse_prefixes() {
-        check_unified_rows(true);
+        check_unified_rows(true, false);
     }
 
-    fn check_unified_rows(aligned: bool) {
+    #[test]
+    #[ignore = "requires H100 FP8-KV packed-prefix assets and natural prompt reference metadata"]
+    fn unified_cuda_fp8_kv_rows_and_prefixes_match_isolated() {
+        check_unified_rows(true, true);
+    }
+
+    fn check_unified_rows(aligned: bool, require_fp8_kv: bool) {
         let assets = PathBuf::from(std::env::var("CUDA_TOKEN_BATCH_TEST_ASSETS").unwrap());
+        if require_fp8_kv {
+            let bytes = std::fs::read(assets.join("model.pkt")).unwrap();
+            let blob = DevBlob::parse(&bytes).unwrap();
+            let live = crate::memory::vmm::LiveKvLayout::manifest(&blob, &bytes)
+                .unwrap()
+                .unwrap();
+            assert_eq!(live.version, 2);
+            assert!(live.caches.iter().all(|c| c.scales.is_some()));
+            assert_eq!(
+                blob.decode_progs().iter().map(|p| p.t).collect::<Vec<_>>(),
+                [1, 2, 4, 8, 16]
+            );
+            assert_eq!(
+                blob.prefill_progs().iter().map(|p| p.t).collect::<Vec<_>>(),
+                [128, 512, 1024]
+            );
+        }
         let reference = PathBuf::from(std::env::var("CUDA_TOKEN_BATCH_TEST_REFERENCE").unwrap());
         let mut prompts: Vec<Vec<u32>> = (0..2)
             .map(|i| {

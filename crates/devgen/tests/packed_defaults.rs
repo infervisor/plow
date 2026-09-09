@@ -28,14 +28,21 @@ fn packed_defaults_preserve_backend_contracts_and_ladders() {
     .unwrap();
 
     for arch in ["gfx942", "sm_90a"] {
-        let precisions = if arch == "gfx942" {
-            [None, Some("--w8a8"), Some("--fp8-kv")]
+        let precisions: &[&[&str]] = if arch == "gfx942" {
+            &[&[], &["--w8a8"], &["--fp8-kv"]]
         } else {
-            [None, Some("--fp8"), Some("--w8a16")]
+            &[
+                &[],
+                &["--fp8"],
+                &["--w8a16"],
+                &["--fp8-kv"],
+                &["--fp8-kv", "--fp8-kv-full"],
+                &["--fp8", "--fp8-kv"],
+            ]
         };
         for precision in precisions {
             let mut argv = vec!["test"];
-            argv.extend(precision);
+            argv.extend_from_slice(precision);
             let mut cfg = Args::try_parse_from(argv).unwrap().emit;
             cfg.max_chunk = Some(1024);
             let mut automatic = None;
@@ -82,7 +89,8 @@ fn packed_defaults_preserve_backend_contracts_and_ladders() {
                     }
                 );
                 assert_eq!(prefill, BTreeSet::from([128, 512, 1024]));
-                let request_metadata = arch == "sm_90a" && selection != Some(false);
+                let request_metadata = arch == "sm_90a"
+                    && (selection == Some(true) || (selection.is_none() && !cfg.fp8_kv));
                 assert_eq!(
                     blob.windows(b"pf.request.slot".len())
                         .any(|w| w == b"pf.request.slot"),
@@ -94,9 +102,22 @@ fn packed_defaults_preserve_backend_contracts_and_ladders() {
                         manifest["objects"]["packed_prefill"]["required"],
                         request_metadata
                     );
+                    let fp8_cap = &manifest["objects"]["packed_prefill"]["fp8_capability"];
+                    if request_metadata && cfg.fp8_kv {
+                        assert_eq!(
+                            fp8_cap["symbol"],
+                            plow_asset::packed_prefill::FP8_CAPABILITY
+                        );
+                        assert_eq!(
+                            fp8_cap["value"],
+                            plow_asset::packed_prefill::FP8_CAPABILITY_VALUE
+                        );
+                    } else {
+                        assert!(fp8_cap.is_null());
+                    }
                     if selection.is_none() {
                         automatic = Some(blob);
-                    } else if selection == Some(true) {
+                    } else if selection == Some(true) && !cfg.fp8_kv {
                         assert!(
                             automatic.as_ref().unwrap() == &blob,
                             "automatic vs explicit packet differs: {precision:?}"

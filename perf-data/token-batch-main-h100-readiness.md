@@ -1424,3 +1424,33 @@ Development binary (separate from the frozen release): campaign
 `0a2755cdf67269321616b430ef9d99c722b64241f87d3efbe9d3ce442a00a965`.
 Logs: `main-c7a6a0b-*.log`. This binary has no new device qualification. The
 FP8 packed execution/default gates and production qualification remain open.
+
+## Explicit FP8-KV packed candidate (CPU verification only)
+
+Explicit packed emission now supports FP8 KV and publishes the version2 request
+contract. The automatic FP8-KV emission gate stays off pending device validation.
+The shared contract requires request ABI2 plus FP8 request ABI1; the NVIDIA
+loader checks both before loading packed segment, GEMM or optional role objects.
+Distinct `_pfpackedseg_fp8kv` and `_pfpackedgemm_fp8kv` cubins prevent selecting
+BF16-KV objects by filename. AMD retains its existing segmented packet ABI and
+shared scheduling/default policy.
+
+Compiled candidate: campaign `bf16-b16-c1024-packed-fp8kv-candidate`, with BF16
+weights/activations, E4M3 KV and F32 scales, context32768, decode1/2/4/8/16 and
+prefill128/512/1024. All eleven cubins built, including BF16 packed controls and
+both FP8 packed objects. This uses the existing PIPE=0 arithmetic. The checkpoint
+link reads the sealed release; no frozen payload was replaced.
+
+Verification: 93 asset unit and10 integration tests;27 compiler packed-default
+emits across AMD/NVIDIA precisions and explicit/default/disabled selection;
+650 runtime host tests;combined and separate HSA/CUDA all-target checks. An
+additional CPU-only test parsed the actual Gemma31 packet, validated LIVE and
+packed contracts, checked every ladder rung, matched both packed objects' kernel
+symbols and packet hashes, and rejected the BF16 controls for the FP8 contract.
+Logs: campaign `fp8-packed-routing-*.log`.
+
+Prepared GPU tests compare packed/ordinary cache bytes and F32 scales and check
+FP8 unified rows with aligned prefix replay. These tests are ignored and have
+not run. The user reinforced the GPU launch pause; there were no GPU launches.
+This candidate is for development and has no production or performance
+qualification. The sealed production-testing release remains unchanged.

@@ -2601,11 +2601,6 @@ impl GpuEngine {
             })?;
             blob.with_packet_view(|p| pack.validate(p, live))
                 .map_err(RuntimeError::Rejected)?;
-            if pack.version != 1 {
-                return Err(RuntimeError::Rejected(
-                    "packed FP8 KV execution is not enabled".into(),
-                ));
-            }
         }
         let config = RuntimeConfig::get();
         let prefix_layout = crate::memory::vmm::VmmOps::granularity(be.as_ref())
@@ -3901,7 +3896,7 @@ impl GpuEngine {
                 grid,
                 profile.tag,
                 segment_roles.as_ref(),
-                packed_prefill.is_some(),
+                packed_prefill.as_ref(),
             ) {
                 Ok((f_pf, smem_pf, module_pf, buckets, seg_pf)) => {
                     tracing::info!(
@@ -4027,16 +4022,11 @@ impl GpuEngine {
                     "MXFP4 MoE role object hash mismatch".into(),
                 ));
             }
-            let module = DecodeModule::load(&be, &image)?;
-            if packed_prefill.is_some()
-                && be.module_global_u32(&module, plow_asset::packed_prefill::CAPABILITY)?
-                    != Some(plow_asset::packed_prefill::CAPABILITY_VALUE)
-            {
-                return Err(RuntimeError::Rejected(format!(
-                    "packet role lacks packed request ABI{}",
-                    plow_asset::packed_prefill::CAPABILITY_VALUE
-                )));
+            if let Some(pack) = &packed_prefill {
+                pack.validate_object(|name| cubin::global_u32(&image, name))
+                    .map_err(RuntimeError::Rejected)?;
             }
+            let module = DecodeModule::load(&be, &image)?;
             let capability = be.module_global_u32(&module, marker)?;
             let block = be.module_global_u32(&module, block)?;
             match id {
@@ -4140,7 +4130,6 @@ impl GpuEngine {
                 if packed_prefill.is_some() {
                     if (vmm.as_ref().is_some_and(|v| v.kv.prefix_reuse()) && !packed_prefix)
                         || recurrent.is_some()
-                        || prefill.iter().any(|b| b.fp8_kv)
                         || prefill.iter().any(|b| {
                             b.seg_class.len() < 2 || b.qwen_segments.iter().any(Option::is_some)
                         })
@@ -6149,8 +6138,9 @@ impl GpuEngine {
         grid: u32,
         interp_tag: &str,
         segment_roles: Option<&SegmentRoles>,
-        packed_requests: bool,
+        packed: Option<&plow_asset::packed_prefill::Manifest>,
     ) -> Result<(KernelFn, u32, Module, Vec<PrefillBucket>, Option<SegPf>)> {
+        let packed_requests = packed.is_some();
         let module = be.module_load(&pf.image)?;
         Self::check_packet_pairing_suffix(be, &module, assets_dir, "_pf")?;
         let kname = crate::config::RuntimeConfig::get()
@@ -6192,16 +6182,14 @@ impl GpuEngine {
         }
         let seg_pf = match segment_dir {
             Some(dir) => {
-                // Segmented objects currently have only bf16-KV variants. Loading one for an
-                // fp8-KV packet would resolve valid symbols and then reinterpret the cache with
-                // the wrong element width, so reject the requested pairing before loading it.
-                if blob.progs.iter().flat_map(|p| &p.insts).any(|inst| {
-                    inst.op == DevOp::HeadNormRopeFp8 as u16
-                        || inst.op == DevOp::FlashPrefillFp8 as u16
-                }) {
+                if !packed_requests
+                    && blob.progs.iter().flat_map(|p| &p.insts).any(|inst| {
+                        inst.op == DevOp::HeadNormRopeFp8 as u16
+                            || inst.op == DevOp::FlashPrefillFp8 as u16
+                    })
+                {
                     return Err(RuntimeError::Device(
-                        "segmented NVIDIA prefill objects cannot be used with fp8-KV packets: \
-                         no fp8-KV variant is available"
+                        "FP8-KV segmented prefill requires a compiled packed request contract"
                             .into(),
                     ));
                 }
@@ -6213,17 +6201,12 @@ impl GpuEngine {
                     let img = std::fs::read(dir.join(file)).map_err(|e| {
                         RuntimeError::Device(format!("segmented prefill object: read {file}: {e}"))
                     })?;
+                    if let Some(pack) = packed {
+                        pack.validate_object(|name| cubin::global_u32(&img, name))
+                            .map_err(|e| RuntimeError::Rejected(format!("{file}: {e}")))?;
+                    }
                     let m = be.module_load(&img)?;
                     Self::check_packet_pairing_suffix(be, &m, assets_dir, suffix)?;
-                    if packed_requests
-                        && be.module_global_u32(&m, plow_asset::packed_prefill::CAPABILITY)?
-                            != Some(plow_asset::packed_prefill::CAPABILITY_VALUE)
-                    {
-                        return Err(RuntimeError::Rejected(format!(
-                            "{file} lacks packed request ABI{}",
-                            plow_asset::packed_prefill::CAPABILITY_VALUE
-                        )));
-                    }
                     let f = be.get_function(&m, sym)?;
                     let sm = be.module_global_u32(&m, arena)?.unwrap_or(smem_pf);
                     be.set_max_dynamic_smem(f, sm)?;
@@ -6231,8 +6214,13 @@ impl GpuEngine {
                     Ok((m, f, sm, occ * be.sm_count()))
                 };
                 let suffix = if packed_requests { "pfpacked" } else { "pf" };
-                let seg_file = format!("interp_{interp_tag}_{suffix}seg.cubin");
-                let gemm_file = format!("interp_{interp_tag}_{suffix}gemm.cubin");
+                let kv_suffix = if packed.is_some_and(|p| p.version == 2) {
+                    "_fp8kv"
+                } else {
+                    ""
+                };
+                let seg_file = format!("interp_{interp_tag}_{suffix}seg{kv_suffix}.cubin");
+                let gemm_file = format!("interp_{interp_tag}_{suffix}gemm{kv_suffix}.cubin");
                 let seg_sym_name = format!("interp_{interp_tag}_{suffix}seg");
                 let gemm_sym_name = format!("interp_{interp_tag}_{suffix}gemm");
                 let seg_sym = format!("_Z{}{}11PlowProgram", seg_sym_name.len(), seg_sym_name);
@@ -6257,16 +6245,11 @@ impl GpuEngine {
                     let img = std::fs::read(path).map_err(|e| {
                         RuntimeError::Device(format!("PLOW_PF_SEG_GEMM_SMALL: read {path}: {e}"))
                     })?;
-                    let module = be.module_load(&img)?;
-                    if packed_requests
-                        && be.module_global_u32(&module, plow_asset::packed_prefill::CAPABILITY)?
-                            != Some(plow_asset::packed_prefill::CAPABILITY_VALUE)
-                    {
-                        return Err(RuntimeError::Rejected(format!(
-                            "small GEMM object lacks packed request ABI{}",
-                            plow_asset::packed_prefill::CAPABILITY_VALUE
-                        )));
+                    if let Some(pack) = packed {
+                        pack.validate_object(|name| cubin::global_u32(&img, name))
+                            .map_err(RuntimeError::Rejected)?;
                     }
+                    let module = be.module_load(&img)?;
                     let abi = be
                         .module_global_u32(&module, "plow_gemm_shape_abi_pfgemm")?
                         .unwrap_or(0);
@@ -8249,15 +8232,18 @@ mod prefill_patch_tests {
         let kv = |e: &GpuEngine, spans: &[(usize, usize)]| {
             let mut all = Vec::new();
             for c in &live.caches {
-                for &handle in &c.pair {
+                let elem = if c.scales.is_some() { 1 } else { 2 };
+                let tensors = c.pair.into_iter()
+                    .map(|h| (h, c.hd as usize * elem))
+                    .chain(c.scales.into_iter().flatten().map(|h| (h, 4)));
+                for (handle, row_bytes) in tensors {
                     for &(slot, len) in spans {
                         for head in 0..c.heads as usize {
                             assert!(len <= c.stride as usize);
                             let offset = ((slot * c.heads as usize + head)
                                 * c.stride as usize
-                                * c.hd as usize
-                                * 2) as u64;
-                            let mut raw = vec![0; len * c.hd as usize * 2];
+                                * row_bytes) as u64;
+                            let mut raw = vec![0; len * row_bytes];
                             e.be.download(&e.devp[handle as usize], offset, &mut raw)
                                 .unwrap();
                             all.extend(raw);
@@ -8436,6 +8422,58 @@ mod slab_tests {
 #[cfg(test)]
 mod profile_tests {
     use super::*;
+
+    #[test]
+    #[ignore = "CPU asset inspection; set TEST_PACKED_FP8_ASSETS to compiled H100 assets"]
+    fn fp8_packed_assets_match_packet_and_reject_bf16_objects() {
+        let assets = PathBuf::from(std::env::var_os("TEST_PACKED_FP8_ASSETS").unwrap());
+        let raw = std::fs::read(assets.join("model.pkt")).unwrap();
+        let blob = DevBlob::parse(&raw).unwrap();
+        let live = crate::memory::vmm::LiveKvLayout::manifest(&blob, &raw)
+            .unwrap()
+            .unwrap();
+        let pack: plow_asset::packed_prefill::Manifest = serde_json::from_slice(
+            blob.reserved_metadata(&raw, plow_asset::packed_prefill::SECTION)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(live.version, 2);
+        assert_eq!(pack.version, 2);
+        assert!(!live.caches.is_empty());
+        assert!(live.caches.iter().all(|c| c.scales.is_some()));
+        blob.with_packet_view(|p| pack.validate(p, &live)).unwrap();
+        assert_eq!(
+            blob.decode_progs().iter().map(|p| p.t).collect::<Vec<_>>(),
+            [1, 2, 4, 8, 16]
+        );
+        assert_eq!(
+            blob.prefill_progs().iter().map(|p| p.t).collect::<Vec<_>>(),
+            [128, 512, 1024]
+        );
+        let build: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(assets.join("build.json")).unwrap()).unwrap();
+        let hash = build["pairing"]["hash"].as_str().unwrap();
+        let hash = u64::from_str_radix(hash.trim_start_matches("0x"), 16).unwrap();
+        for role in ["pfpackedseg", "pfpackedgemm"] {
+            let name = format!("interp_sm90a_{role}");
+            let image = std::fs::read(assets.join(format!("{name}_fp8kv.cubin"))).unwrap();
+            pack.validate_object(|n| cubin::global_u32(&image, n))
+                .unwrap();
+            let info = cubin::inspect(&image).unwrap();
+            assert_eq!(info.sm, 90);
+            assert!(info
+                .entries
+                .contains(&format!("_Z{}{name}11PlowProgram", name.len())));
+            let lo = cubin::global_u32(&image, &format!("plow_packet_hash_lo_{role}")).unwrap();
+            let hi = cubin::global_u32(&image, &format!("plow_packet_hash_hi_{role}")).unwrap();
+            assert_eq!((u64::from(hi) << 32) | u64::from(lo), hash);
+            let bf16 = std::fs::read(assets.join(format!("{name}.cubin"))).unwrap();
+            assert!(pack
+                .validate_object(|n| cubin::global_u32(&bf16, n))
+                .is_err());
+        }
+    }
 
     fn prefill_images() -> (InterpreterProfile, Vec<u8>, Vec<u8>) {
         let profile = interpreter_profile((9, 0)).unwrap();

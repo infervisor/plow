@@ -650,6 +650,11 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN)
             list(APPEND _cubin_rows
                 "${_vstem}_pfpackedseg|${_ksym_pfpackedseg}|_ax_packed_seg_fat|"
                 "${_vstem}_pfpackedgemm|${_ksym_pfpackedgemm}|_ax_packed_seg_gemm|")
+            if(PLOW_SM120_CUBIN_FP8KV)
+                list(APPEND _cubin_rows
+                    "${_vstem}_pfpackedseg_fp8kv|${_ksym_pfpackedseg}|_ax_packed_seg_fat|_ax_fp8kv_pf"
+                    "${_vstem}_pfpackedgemm_fp8kv|${_ksym_pfpackedgemm}|_ax_packed_seg_gemm|_ax_fp8kv_pf")
+            endif()
         endif()
 
         foreach(_row ${_cubin_rows})

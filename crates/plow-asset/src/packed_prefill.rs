@@ -53,6 +53,24 @@ pub struct Manifest {
     pub programs: Vec<String>,
 }
 impl Manifest {
+    pub fn validate_object(
+        &self,
+        mut read_capability: impl FnMut(&str) -> Option<u32>,
+    ) -> Result<()> {
+        need(matches!(self.version, 1 | 2), "object manifest version")?;
+        need(
+            read_capability(CAPABILITY) == Some(CAPABILITY_VALUE),
+            "object requires packed request ABI2",
+        )?;
+        if self.version == 2 {
+            need(
+                read_capability(FP8_CAPABILITY) == Some(FP8_CAPABILITY_VALUE),
+                "object requires FP8 request ABI1",
+            )?;
+        }
+        Ok(())
+    }
+
     /// Bind a validated prefill instruction, or restore its ordinary request operands.
     pub fn bind_request(&self, d: &mut DevInst64, packed: bool) {
         let slot = if packed { self.slot } else { TENSOR_NONE16 };
@@ -366,6 +384,35 @@ pub fn plan(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn object_contract_refuses_missing_or_incompatible_fp8_bindings() {
+        for (version, base, fp8, valid) in [
+            (1, Some(2), None, true),
+            (1, Some(2), Some(1), true),
+            (1, Some(1), None, false),
+            (2, Some(2), Some(1), true),
+            (2, Some(2), None, false),
+            (2, Some(1), Some(1), false),
+            (2, None, Some(1), false),
+            (2, Some(2), Some(2), false),
+            (3, Some(2), Some(1), false),
+        ] {
+            let m = Manifest {
+                version,
+                slot: 0,
+                request: 1,
+                maps: Vec::new(),
+                programs: Vec::new(),
+            };
+            assert_eq!(
+                m.validate_object(|name| if name == CAPABILITY { base } else { fp8 })
+                    .is_ok(),
+                valid,
+                "version={version} base={base:?} fp8={fp8:?}"
+            );
+        }
+    }
+
     #[test]
     #[ignore = "CPU cubin inspection; set TEST_PACKED_FP8_CUBINS to colon-separated paths"]
     fn fp8_objects_advertise_both_request_contracts() {

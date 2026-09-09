@@ -7061,7 +7061,7 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
         // ONE FLAG, TWO THINGS, and asserting one contract for both made the second
         // unreachable. On NVIDIA `PLOW_EMIT_PACKED_PREFILL` emits the packed-REQUEST ABI — a
         // metadata section plus `pf.request.*` tensors — which really is a Hopper / TP1 /
-        // BF16-KV contract. On AMD it emits the family-segmented sibling TOPOLOGY: the same
+        // direct-KV contract. On AMD it emits the family-segmented sibling TOPOLOGY: the same
         // buckets a second time with `set_packed_prefill_segments`, which the runtime
         // resolves to only while it is staging a packed binding. That has no Hopper, no TP1
         // and no KV-encoding requirement, and it is what `PLOW_PACKED_PREFILL_ROUTE=1` needs
@@ -7070,8 +7070,8 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
         // `mla/kimi_k3.rs` has asked for the sibling topology since it was written and this
         // assertion is why it could never be given one; a GLM-5.3 gfx942 TP4 emit died here.
         assert!(
-            emit_is_amd() || (arch == "sm_90a" && tp == 1 && !emit_config::active().fp8_kv),
-            "packed request emission requires Hopper single-GPU BF16 KV"
+            emit_is_amd() || (arch == "sm_90a" && tp == 1),
+            "packed request emission requires Hopper single-GPU direct KV"
         );
         assert!(
             emit_is_amd() || capabilities.dense_packet_contracts,
@@ -8571,10 +8571,6 @@ fn emit_dense_gqa(
     // program is wrong, i.e. a real bug caught, and must be loud.
     let mut packed_prefill_emitted = false;
     if !emit_is_amd() && ecfg.packed_prefill_metadata_on() {
-        assert!(
-            !fp8_kv,
-            "packed prefill requires dense BF16 KV NVIDIA packet"
-        );
         let packed_tensor_base = m.tensors.len();
         let max_rows = m.prog_t[..packet::devbuild::decode_rung_lo(&m.prog_t)]
             .iter()
@@ -8614,7 +8610,7 @@ fn emit_dense_gqa(
         let manifest = plow_asset::program::with_model(&m, |p| -> Result<_, String> {
             let live = plow_asset::live_kv::emit(p)?;
             let request = plow_asset::packed_prefill::Manifest {
-                version: 1,
+                version: live.version,
                 slot,
                 request,
                 maps,
