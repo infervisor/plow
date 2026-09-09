@@ -8023,7 +8023,7 @@ fn emit_dense_gqa(
     // skip reason. Anything that reaches this `Err` is the verifier saying the
     // program is wrong, i.e. a real bug caught, and must be loud.
     let mut packed_prefill_emitted = false;
-    if ecfg.packed_prefill_on() {
+    if ecfg.packed_prefill_metadata_on() {
         assert!(
             !emit_is_amd() && !fp8_kv,
             "packed prefill requires dense BF16 KV NVIDIA packet"

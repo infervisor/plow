@@ -1,6 +1,6 @@
 use crate::program::{Packet, Program};
 use crate::splitk::ProjectionAccess;
-use packet::dev::{DevOp, ROPE_PAIR_HALF, TENSOR_NONE16};
+use packet::dev::{DevInst64, DevOp, ROPE_PAIR_HALF, TENSOR_NONE16};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -298,7 +298,7 @@ impl Manifest {
             let mut writes = BTreeSet::new();
             for (pc, d) in p.insts.iter().enumerate() {
                 let op = DevOp::from_u16(d.op).ok_or("unknown opcode access contract")?;
-                direct_operands(op)?;
+                direct_operands(op, d)?;
                 if matches!(op, DevOp::FlashDecode | DevOp::FlashPrefill) {
                     let pair = [d.t[3], d.t[4]];
                     let c = caches.get(&pair).ok_or("undeclared attention cache pair")?;
@@ -396,7 +396,26 @@ impl Manifest {
     }
 }
 
-fn direct_operands(op: DevOp) -> Result<()> {
+fn direct_operands(op: DevOp, d: &DevInst64) -> Result<()> {
+    match op {
+        DevOp::GemmFp8 => {
+            return require(
+                d.i[6] == 0 && d.i[7] == 0,
+                "unaudited FP8 GEMM tensor-map operands",
+            );
+        }
+        DevOp::GemmGluFp8 => {
+            return require(
+                d.i[3] == 0 && d.i[6] == 0 && d.i[7] == 0,
+                "unaudited FP8 GLU tensor-map operands",
+            );
+        }
+        DevOp::GemvGluFp8 => {
+            return require(d.fj[2] == 0, "unaudited FP8 GLU folded operands");
+        }
+        DevOp::GemvFp8 | DevOp::QuantFp8 => return Ok(()),
+        _ => {}
+    }
     require(
         matches!(
             op,

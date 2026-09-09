@@ -12,6 +12,56 @@ fn inst(op: DevOp) -> DevInst64 {
     }
 }
 
+#[test]
+fn fp8_direct_operands_cannot_alias_cache() {
+    for op in [
+        DevOp::GemvFp8,
+        DevOp::GemvGluFp8,
+        DevOp::QuantFp8,
+        DevOp::GemmFp8,
+        DevOp::GemmGluFp8,
+    ] {
+        let mut d = inst(op);
+        d.t = [5; 8];
+        assert!(validate_all(None, |ops, _| ops.push(d)).is_ok());
+        for operand in 0..8 {
+            let mut alias = d;
+            alias.t[operand] = 2;
+            assert!(validate_all(None, |ops, _| ops.push(alias))
+                .unwrap_err()
+                .contains("unsupported cache operand access"));
+            alias.t[operand] = 100;
+            assert!(validate_all(None, |ops, _| ops.push(alias))
+                .unwrap_err()
+                .contains("operand handle out of range"));
+        }
+    }
+}
+
+#[test]
+fn fp8_indirect_operands_remain_rejected() {
+    for (op, operands) in [
+        (DevOp::GemmFp8, &[6, 7][..]),
+        (DevOp::GemmGluFp8, &[3, 6, 7][..]),
+    ] {
+        for &operand in operands {
+            for handle in [2, 5, u32::MAX] {
+                let mut d = inst(op);
+                d.i[operand] = handle;
+                assert!(validate_all(None, |ops, _| ops.push(d))
+                    .unwrap_err()
+                    .contains("tensor-map operands"));
+            }
+        }
+    }
+    let mut d = inst(DevOp::GemvGluFp8);
+    d.fj[2] = 1;
+    d.i[3] = 2;
+    assert!(validate_all(None, |ops, _| ops.push(d))
+        .unwrap_err()
+        .contains("folded operands"));
+}
+
 fn validate(slot_map: Option<Tensor<'_>>, mutate: impl FnOnce(&mut DevInst64)) -> Result<()> {
     validate_all(slot_map, |insts, _| mutate(&mut insts[0]))
 }

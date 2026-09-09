@@ -81,6 +81,24 @@ fn production_defaults_are_capability_and_target_driven() {
 }
 
 #[test]
+fn fp8_packed_metadata_requires_explicit_selection_without_changing_planning() {
+    for flag in ["--fp8", "--w8a8", "--w8a16"] {
+        let mut cfg = EmitArgsForTest::try_parse_from(["test", flag]).unwrap().emit;
+        apply_production_defaults(&mut cfg, emit_capabilities("gemma4"), "sm_90a", 1);
+        assert!(cfg.packed_prefill_on());
+        assert!(!cfg.packed_prefill_metadata_on());
+        cfg.emit_packed_prefill = Some(true);
+        assert!(cfg.packed_prefill_metadata_on());
+        cfg.emit_packed_prefill = Some(false);
+        assert!(!cfg.packed_prefill_on());
+        assert!(!cfg.packed_prefill_metadata_on());
+    }
+    let mut cfg = EmitArgsForTest::try_parse_from(["test"]).unwrap().emit;
+    apply_production_defaults(&mut cfg, emit_capabilities("gemma4"), "sm_90a", 1);
+    assert!(cfg.packed_prefill_metadata_on());
+}
+
+#[test]
 fn cublaslt_emission_rejects_unloadable_combinations() {
     let qwen = emit_capabilities("qwen3_5");
     assert!(cublaslt_emit_supported(qwen, "sm_90a", 1, false));

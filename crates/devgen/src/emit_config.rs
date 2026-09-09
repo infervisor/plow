@@ -1190,6 +1190,12 @@ impl EmitConfig {
             .unwrap_or(self.packed_prefill_default)
     }
 
+    pub fn packed_prefill_metadata_on(&self) -> bool {
+        // FP8 packed execution is opt-in; preserve ordinary attention planning defaults.
+        self.packed_prefill_on()
+            && (!self.any_fp8_weights() || self.emit_packed_prefill == Some(true))
+    }
+
     /// The decode widths this emit builds programs for, ASCENDING.
     ///
     /// Without `PLOW_DECODE_BATCH_LADDER` this is exactly `[decode_batch]`.

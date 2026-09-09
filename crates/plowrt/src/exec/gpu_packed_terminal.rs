@@ -449,7 +449,7 @@ mod tests {
         )
         .unwrap();
         assert!(e.has_packed_terminal() && e.batch >= 8);
-        let slots = [7, 3];
+        let slots = [e.batch - 1, e.batch / 2 - 1];
         let ends = [prompts[0].len() - 3, prompts[1].len() - 5];
         let mut pos = [0, 0];
         for i in 0..2 {
@@ -484,7 +484,7 @@ mod tests {
             })
             .collect();
         e.prefill_batched_complete(&requests, &mut output).unwrap();
-        assert_eq!(output, vec![(3, feeds[1][0]), (7, feeds[0][0])]);
+        assert_eq!(output, vec![(slots[1], feeds[1][0]), (slots[0], feeds[0][0])]);
         let mut logits = Vec::new();
         for (row, i) in [1, 0].into_iter().enumerate() {
             e.logits_row(row, &mut logits).unwrap();
@@ -519,6 +519,6 @@ mod tests {
                 );
             }
         }
-        eprintln!("PASS compact terminal: 128 full-logit snapshots, sparse slots, reversed request order, sample rows 4/7");
+        eprintln!("PASS compact terminal: 128 full-logit snapshots, sparse slots {slots:?}, reversed request order, sample rows 4/7");
     }
 }

@@ -590,3 +590,37 @@ hashes are `bf16-cached-clean-comparison.json`,
 `vllm-bf16-cached-clean-qualification.json`, and `vllm-bf16-cached-clean.*` under
 the campaign directory. FP8 packing and a faster batched decode path remain work
 toward the requested result; the full objective is not achieved.
+
+## FP8 packed contract qualification
+
+The LIVE KV audit now accepts direct FP8 GEMV, GEMM and activation-quantization
+operands. Tensor handles still undergo range and cache-alias checks. Indirect
+FP8 tensor-map handles and folded GLU operands remain rejected. FP8 packed
+metadata requires explicit compiler selection; ordinary attention planning is
+preserved. Recompiling the full model produces byte-identical default and explicit
+packets against their respective references.
+
+On the H100, explicit packed prefill plus VMM prefix caching passes with physical
+batch 16, a 1024-token chunk, FP8 weights and BF16 KV:
+
+- 87 asset tests, 594 runtime tests and four compiler capability tests pass.
+  Sixteen runtime GPU tests remain ignored in the host suite; the selected GPU
+  checks below ran separately.
+- Packed-complete and sparse-slot execution each match 128 ordinary full-vocabulary
+  logit snapshots bit for bit. Sparse slots 15 and 7 advance to the widest decode rung.
+- Admission retries preserve waiter priority without allocation while blocked;
+  retirement, cancellation and recovery pass on the GPU.
+- All 12 natural completions match the prior FP8 path, with expected warm cache counts.
+  All 16 concurrent cold 16K requests finish and match their isolated replays.
+- Three API lifecycle checks, 32 isolated/concurrent sampling pairs and 16 cancelled
+  streams followed by exact one-token-prompt recovery pass.
+
+This qualification uses a manually rebuilt packed GEMM with OCC1; that FP8 CMake
+default is not promoted. Performance measurement follows separately. Combined
+packed-prefix execution remains opt-in, and this work does not implement the
+shared CUDA token-batch executor. Repository-wide formatting checks still report
+existing differences; unrelated formatting is unchanged.
+
+`fp8-packed-functional-qualification.json` records source, binary, asset and raw
+proof hashes in the campaign directory. The runtime SHA256 is
+`3b769811adc02fd90273c29c546eef29253d16fec50b9b19c4fbc18cd8da23e3`.
