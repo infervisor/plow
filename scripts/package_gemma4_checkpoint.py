@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Freeze an existing Gemma 4 BF16/FP8-KV H100 build without pruning its programs."""
+"""Freeze a validated Gemma 4 H100 serving profile without pruning its programs."""
 import argparse
 import hashlib
 import json
@@ -21,14 +21,22 @@ def main():
     ap.add_argument("--runtime", required=True, type=Path)
     ap.add_argument("--out", required=True, type=Path)
     ap.add_argument("--evidence", action="append", default=[], type=Path)
+    ap.add_argument("--profile", choices=["bf16-fp8kv", "bf16-unified", "fp8-unified"], default="bf16-fp8kv")
+    ap.add_argument("--runtime-source-commit")
+    ap.add_argument("--runtime-source-note", default="")
+    ap.add_argument("--model-source-revision")
     args = ap.parse_args()
     build = json.loads((args.assets / "build.json").read_text())
     assert build["arch"] == "sm_90a" and build["n_cu"] == 132
-    assert build["precision"]["weight_enc"] == "bf16"
-    assert set(build["shapes"]["kv_dtype"].values()) == {"e4m3"}
+    unified = args.profile != "bf16-fp8kv"
+    assert build["precision"]["weight_enc"] == ("fp8" if args.profile == "fp8-unified" else "bf16")
+    assert set(build["shapes"]["kv_dtype"].values()) == ({"bf16"} if unified else {"e4m3"})
+    if unified:
+        assert build["objects"]["packed_prefill"]["required"]
     decode = sorted({p["batch"] for p in build["programs"] if p["kind"] == "decode"})
     prefill = sorted({p["bucket"] for p in build["programs"] if p["kind"] == "prefill"})
-    assert decode == [1, 2, 4, 8, 16] and prefill == [128, 512, 1024]
+    assert decode == ([1, 2, 4, 8] if args.profile == "bf16-unified" else [1, 2, 4, 8, 16])
+    assert prefill == [128, 512, 1024]
     packet = json.loads(subprocess.check_output(
         [str(args.runtime.resolve()), "disasm", str(args.assets / "model.pkt"),
          "--format", "json", "--tensors", "--no-analysis", "--range", "0..0"],
@@ -47,17 +55,19 @@ def main():
     subprocess.run(["cp", "--reflink=auto", "-L", "-R",
                     str(args.assets / "checkpoint") + "/.", str(checkpoint)], check=True)
     linked = subprocess.check_output(["ldd", str(args.runtime)], text=True)
-    for name in re.findall(r"(/[^\s()]+)", linked):
-        source = Path(name)
+    def copy_library(source):
         target = args.out / "lib" / source.name
         if target.exists():
             assert digest(target) == digest(source), "conflicting library names"
         else:
             shutil.copy2(source, target)
+    for name in re.findall(r"(/[^\s()]+)", linked):
+        source = Path(name)
+        copy_library(source)
         if source.name == "ld-linux-x86-64.so.2":
             # The NVIDIA driver loads these compatibility libraries at runtime.
             for name in ["libdl.so.2", "libpthread.so.0", "librt.so.1"]:
-                shutil.copy2(source.resolve().parent / name, args.out / "lib" / name)
+                copy_library(source.resolve().parent / name)
     assert (args.out / "lib/ld-linux-x86-64.so.2").is_file()
     for source in args.evidence:
         target = args.out / "evidence" / source.name
@@ -65,13 +75,17 @@ def main():
         shutil.copy2(source, target)
     scripts = Path(__file__).resolve().parent
     shutil.copy2(scripts / "gemma4_checkpoint_workloads.py", args.out / "workloads.py")
-    (args.out / "serve.sh").write_text('''#!/usr/bin/env bash
+    launcher = '''#!/usr/bin/env bash
 set -euo pipefail
 checkpoint_root="$(cd -- "$(dirname -- "$0")" && pwd)"
 export PLOW_LIBCUDA="${PLOW_LIBCUDA:-/usr/lib/x86_64-linux-gnu/libcuda.so.1}"
 export PLOW_NV_CUBIN="$checkpoint_root/assets/interp_sm90a_fp8kv.cubin"
 export PLOW_NV_CUBIN_PF="$checkpoint_root/assets/interp_sm90a_pf_fp8kv.cubin"
 export PLOW_VMM_PREFIX=1
+export PLOW_PREFIX_CACHE=1
+export PLOW_VMM_LIVE=0
+export PLOW_VMM_LIVE_RINGS=0
+export PLOW_VMM_CACHE_MIB=4096
 export PLOW_PF_BATCH=0
 export PLOW_MULTISTEP=0
 export PLOW_TOKEN_BATCH=1
@@ -80,8 +94,19 @@ exec "$checkpoint_root/lib/ld-linux-x86-64.so.2" \\
   "$checkpoint_root/bin/plowrt" serve --assets "$checkpoint_root/assets" \\
   --port "${PORT:-8080}" --max-hold-ms 0 --slo-ms "${SLO_MS:-600000}" \\
   --max-queued-requests "${MAX_QUEUED_REQUESTS:-64}" "$@"
-''')
+'''
+    if unified:
+        launcher = launcher.replace(
+            'export PLOW_NV_CUBIN="$checkpoint_root/assets/interp_sm90a_fp8kv.cubin"\n'
+            'export PLOW_NV_CUBIN_PF="$checkpoint_root/assets/interp_sm90a_pf_fp8kv.cubin"',
+            'unset PLOW_NV_CUBIN PLOW_NV_CUBIN_PF')
+    (args.out / "serve.sh").write_text(launcher)
     (args.out / "serve.sh").chmod(0o755)
+    (args.out / "serve-ordinary.sh").write_text('''#!/usr/bin/env bash
+set -euo pipefail
+exec "$(cd -- "$(dirname -- "$0")" && pwd)/serve.sh" --token-batch=false "$@"
+''')
+    (args.out / "serve-ordinary.sh").chmod(0o755)
     (args.out / "verify.py").write_text('''#!/usr/bin/env python3
 import hashlib, json
 from pathlib import Path
@@ -98,7 +123,7 @@ assert sorted({p["batch"] for p in build["programs"] if p["kind"] == "decode"}) 
 assert sorted({p["bucket"] for p in build["programs"] if p["kind"] == "prefill"}) == manifest["prefill_buckets"]
 print("Verified", len(manifest["files"]), "files; decode", manifest["decode_rungs"], "prefill", manifest["prefill_buckets"])
 ''')
-    (args.out / "README.md").write_text('''# Gemma 4 31B IT / plowrt checkpoint
+    readme = '''# Gemma 4 31B IT / plowrt checkpoint
 
 BF16 weights and activations; E4M3 FP8 KV with FP32 per-row scales.
 Target: one H100 SXM5 80GB, sm_90a, 132 SMs. Context limit: 32768 tokens
@@ -135,18 +160,38 @@ override its path. This checkpoint is stored on this instance's local disk;
 it is not an off-instance backup. Preserve the whole directory when copying.
 `manifest.json` records source, precision, rungs, and SHA-256 hashes.
 `evidence/` contains the validation logs supplied during packaging.
-''')
+'''
+    if unified:
+        readme = readme.replace(
+            "BF16 weights and activations; E4M3 FP8 KV with FP32 per-row scales.",
+            f"{build['precision']['weight_enc'].upper()} weights; {build['precision']['act_enc']} activations; BF16 KV.")
+        readme = readme.replace("Physical slots: 16. Decode rungs: 1, 2, 4, 8, 16.",
+            f"Physical slots: {decode[-1]}. Decode rungs: {', '.join(map(str, decode))}.")
+        start = readme.index("Prefix reuse is explicitly enabled.")
+        end = readme.index("Weights, tokenizer, compiled assets", start)
+        readme = readme[:start] + """Prefix caching and unified token batching are enabled with the validated packed
+packet and objects. Multi-step decode is disabled. Use `./serve-ordinary.sh` to
+disable unified dispatch while retaining prefix caching. This profile has host,
+H100 matching-computation logits and functional serving qualification. Sustained
+production SLO/performance and application-quality qualification remain open.
+No vLLM performance win is claimed. See `evidence/` for the exact test scope.
+
+""" + readme[end:]
+    (args.out / "README.md").write_text(readme)
     repo = scripts.parent
     manifest = {
         "schema": 1, "model": "google/gemma-4-31B-it",
-        "source_revision": (args.assets / "checkpoint").resolve().name,
+        "profile": args.profile,
+        "source_revision": args.model_source_revision or (args.assets / "checkpoint").resolve().name,
         "runtime_source_commit": subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip(),
-        "runtime_source_diff": subprocess.check_output(
+            ["git", "rev-parse", "--verify", (args.runtime_source_commit or "HEAD") + "^{commit}"], cwd=repo, text=True).strip(),
+        "runtime_source_note": args.runtime_source_note,
+        "runtime_source_diff": "" if args.runtime_source_commit else subprocess.check_output(
             ["git", "diff", "HEAD", "--", "crates/plowrt"], cwd=repo, text=True),
         "precision": build["precision"], "arch": build["arch"],
         "decode_rungs": decode, "prefill_buckets": prefill,
-        "max_context": 32768, "physical_slots": 16, "files": {},
+        "max_context": 32768, "physical_slots": decode[-1], "unified_execution_validated": unified,
+        "qualification": "functional; sustained production SLO and application quality pending", "files": {},
     }
     for path in sorted(args.out.rglob("*")):
         if path.is_file():

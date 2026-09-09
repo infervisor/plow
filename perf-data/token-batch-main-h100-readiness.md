@@ -1321,3 +1321,33 @@ fp8-live-contract-*.log. The old LIVE allocator explicitly rejects FP8 scale
 ownership until its allocation path supports it. Packed compiler, runtime and
 kernel execution gates remain closed for FP8 KV. The sealed checkpoint is
 unchanged. This contract is a prerequisite for unified FP8-KV execution.
+
+## Frozen release for manual production-traffic tests
+
+Release: `/opt/dlami/nvme/plow-releases/gemma4-31b-h100-20260909`.
+BF16/BF16-KV B8 and FP8-weight/BF16-KV B16 profiles freeze the qualified runtime
+SHA 7627b1ce9afb3b455776a1c213db4c4fb67e9d833805d229731b74cb75ed3461
+(production logic 3ca64e9). A third profile copies the previously sealed
+BF16-weight/FP8-KV B16 checkpoint, retaining runtime 25fb3d7 and its qualification.
+All profiles contain independent regular-file weights, binaries, libraries,
+tokenizers and complete program ladders. No development allocation changes are
+included in these binaries.
+
+Each profile launched from `/tmp` using the release's bundled ELF loader and
+libraries. The document workloads passed 14/22/22 requests at concurrency 8/16/16
+and 32 maximum output tokens. Warm prefix reuse and exact concurrent warm text
+passed. Unified routing fired for both BF16-KV profiles; the FP8-KV profile
+retains ordinary fallback. These are functional smoke tests; packaging I/O
+overlapped some runs, so their timings are not performance evidence.
+
+All 138 profile payload hashes and the root index passed verification. The 153
+indexed payload files were made read-only. The release occupies about 203 GiB.
+Index SHA-256:
+3577f42048a285c15907fd16d184399753fe0d072aeba8d6aa3ea7d573187685.
+Root `evidence/qualification.json` and server/workload logs record the smoke
+results. Campaign logs are `production-freeze-*.log`. The original FP8-KV
+checkpoint was not modified. Launch and rollback instructions:
+[frozen release](../docs/runtime/gemma4-h100-release.md).
+
+Sustained production SLO and application-quality qualification remain open.
+The release remains fixed while development continues separately.
