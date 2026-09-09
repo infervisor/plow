@@ -303,6 +303,18 @@ impl PackedTerminal {
         }
         Ok(())
     }
+
+    pub(super) fn run_rows(
+        &mut self,
+        e: &GpuEngine,
+        rows: &[u32],
+        live: usize,
+    ) -> Result<&[u32]> {
+        self.host_rows.clear();
+        self.host_rows.extend_from_slice(rows);
+        self.run(e, live)?;
+        Ok(&self.host_ids[..rows.len()])
+    }
 }
 
 impl GpuEngine {

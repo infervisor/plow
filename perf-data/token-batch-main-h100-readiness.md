@@ -1076,3 +1076,48 @@ model-quality qualification remains open. The production-dispatch probe passed
 171 checks plus 12 fallback checks; bounded memcheck reported zero errors.
 Default-off cubin bytes remain identical. Full proof is in campaign
 `fp8-w8a8-model-qualification.json`; this option remains off by default.
+
+
+### Shared scheduling controls and unified adapter qualification (2026-09-09)
+
+Prefill batching, interleave/chunk caps, no-chunk/no-interleave and deferred
+decode controls now belong to shared runtime configuration. Both AMD and NVIDIA
+read those fields; CLI names, environment variables and default values are
+preserved. The common token planner no longer allocates an ordering vector on
+every step. Eighteen planner tests, 638 runtime host tests and 17 configuration,
+mux, co-serving and preemption integration tests passed. All-target checks passed
+with CUDA+HSA together and each GPU backend separately. No AMD hardware run was
+performed on this H100 instance.
+
+The NVIDIA execution adapter now consumes the common token plan, preserving
+logical output ownership and checking slot generations before planning and
+commit. It borrows input slices, commits host frontiers only after the body and
+compact output complete, appends prefix history once, and publishes snapshots
+only for completed prefill spans. It reuses existing packed-prefill bodies and
+supports intermediate chunks with no sampled output.
+
+H100 BF16-weight/B8 and FP8-weight/B16 assets, both with BF16 KV, each passed
+32 full-vocabulary comparisons against isolated execution on the same resident
+prefix with the same compact output tail. Coverage includes a cached 16K suffix
+combined with 1K decode, reversed sparse slots, frontier/history checks,
+intermediate zero-output chunks, final output without replay, stale generations
+and duplicate refusal. Campaign logs: `unified-compact-control-{bf16,fp8}-gpu.log`.
+
+The ordinary and compact output tails use different RMSNorm reductions. Before
+matching the reference tail, the BF16 test failed at step 7 with maximum logit
+difference 0.0625; repeating the ordinary reference reproduced it exactly. Using
+the compact tail on isolated requests reproduced the difference without batching:
+2/32 BF16 and 1/32 FP8 frames differ from the ordinary tail, maximum 0.125.
+This establishes batching parity for the selected computation, not equivalence
+between output algorithms or model-quality qualification.
+
+The adapter is not yet wired into the serving mux and currently accepts greedy
+selection only. Unified serving default promotion, stochastic sampling, SLO-aware
+admission and packed FP8-KV assets remain pending. The immutable checkpoint is
+unchanged. These functional checks are not throughput measurements.
+
+Main `38e3316` is merged. Merge checks still expose unchanged-main failures:
+the tokenizer API special-token expectation (also blocks `nix build`), the
+kernelcaps RowGather guard/callee parser test, the unregistered legacy AMD
+benchmark script, and repository-wide formatting. The branch remains a draft
+for merge preparation until the relevant readiness work and checks are resolved.

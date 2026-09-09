@@ -56,6 +56,8 @@ mod gpu_decode_rung;
 mod gpu_mixed_step;
 #[path = "gpu_packed_terminal.rs"]
 mod gpu_packed_terminal;
+#[path = "gpu_token_batch.rs"]
+mod gpu_token_batch;
 use gpu_cublaslt::CublasLtDecodeRoute;
 use gpu_decode_rung::{
     decode_rung_index, decode_selection, effective_decode_widths, validate_cublaslt_ladder,
@@ -1703,6 +1705,8 @@ pub struct GpuEngine {
     packed_prefill: Option<plow_asset::packed_prefill::Manifest>,
     packed_terminal: Option<gpu_packed_terminal::PackedTerminal>,
     mixed_step: Option<gpu_mixed_step::MixedCudaStep>,
+    token_batch: Option<gpu_token_batch::CudaTokenBatch>,
+    slot_generations: Vec<u32>,
 }
 
 /// Full model-load wall timeline (`PLOW_LOAD_PROFILE=1`).
@@ -2426,6 +2430,13 @@ pub struct PfBatchReq<'a> {
     pub len: usize,
 }
 
+struct PackedTokenReq<'a> {
+    slot: usize,
+    tokens: &'a [u32],
+    c0: usize,
+    prompt_len: usize,
+}
+
 /// Per-row device sampling request (plan stage 4). `temp <= 0` is greedy
 /// (the device sampler writes the argmax, identical to `ARGMAX_FIN`), so a
 /// spec array can carry greedy and stochastic rows together. `rng01` is the
@@ -2525,7 +2536,7 @@ impl GpuEngine {
                 backend = "cuda",
                 ready = false,
                 fires = false,
-                reason = "CUDA token-batch executor unavailable; using ordinary execution",
+                reason = "CUDA unified serving integration pending; using ordinary execution",
                 "token-batch route status"
             );
         }
@@ -4373,8 +4384,11 @@ impl GpuEngine {
             packed_prefill,
             packed_terminal: None,
             mixed_step,
+            token_batch: None,
+            slot_generations: vec![0; batch],
         };
         engine.packed_terminal = gpu_packed_terminal::PackedTerminal::load(&engine)?;
+        engine.token_batch = gpu_token_batch::CudaTokenBatch::load(&engine);
         if engine.cublaslt_decode_capture {
             engine.capture_decode_graph()?;
         }
@@ -5188,6 +5202,7 @@ impl GpuEngine {
             )));
         }
         self.reset_packed_admission(b);
+        self.slot_generations[b] = self.slot_generations[b].wrapping_add(1);
         if let Some(state) = &self.recurrent {
             for &(index, stride) in &state.tensors {
                 self.be.memset_d8_async(
@@ -5222,6 +5237,7 @@ impl GpuEngine {
     }
 
     pub fn retire_slot(&mut self, b: usize, cache_output: bool) {
+        self.slot_generations[b] = self.slot_generations[b].wrapping_add(1);
         self.reset_packed_admission(b);
         if !self.vmm_active[b] {
             return;
@@ -7389,6 +7405,37 @@ impl GpuEngine {
     /// decode step of the last prompt token (`step_slots`), so no lm_head
     /// readback happens here.
     pub fn prefill_batched(&mut self, reqs: &[PfBatchReq]) -> Result<()> {
+        let chunks = reqs
+            .iter()
+            .map(|r| {
+                let end = r.c0.checked_add(r.len).ok_or_else(|| {
+                    RuntimeError::Rejected("packed chunk end overflow".into())
+                })?;
+                let tokens = r.prompt.get(r.c0..end).ok_or_else(|| {
+                    RuntimeError::Rejected("packed chunk outside prompt".into())
+                })?;
+                Ok(PackedTokenReq {
+                    slot: r.slot,
+                    tokens,
+                    c0: r.c0,
+                    prompt_len: r.prompt.len(),
+                })
+            })
+            .collect::<Result<smallvec::SmallVec<[_; 16]>>>()?;
+        self.packed_token_body(&chunks)?;
+        for r in reqs {
+            self.pos[r.slot] = (r.c0 + r.len) as u32;
+            if self.vmm_prefix_enabled() && r.c0 + r.len + 1 >= r.prompt.len() {
+                let end = r.c0 + r.len;
+                self.seq_tokens[r.slot].clear();
+                self.seq_tokens[r.slot].extend_from_slice(&r.prompt[..end]);
+                self.vmm_tail_publish(r.slot);
+            }
+        }
+        Ok(())
+    }
+
+    fn packed_token_body(&mut self, reqs: &[PackedTokenReq<'_>]) -> Result<()> {
         let Some(f_pf) = self.f_pf else {
             return Err(RuntimeError::Rejected("prefill object not loaded".into()));
         };
@@ -7401,7 +7448,7 @@ impl GpuEngine {
         let request_plan = if self.packed_prefill.is_some() {
             let total = reqs
                 .iter()
-                .try_fold(0usize, |n, r| n.checked_add(r.len))
+                .try_fold(0usize, |n, r| n.checked_add(r.tokens.len()))
                 .ok_or_else(|| RuntimeError::Rejected("packed row overflow".into()))?;
             let bucket = self
                 .prefill
@@ -7413,8 +7460,8 @@ impl GpuEngine {
                 .map(|r| plow_asset::packed_prefill::Request {
                     slot: r.slot,
                     start: r.c0,
-                    len: r.len,
-                    prompt: r.prompt.len(),
+                    len: r.tokens.len(),
+                    prompt: r.prompt_len,
                 })
                 .collect();
             Some(
@@ -7437,12 +7484,15 @@ impl GpuEngine {
                     r.slot, self.batch
                 )));
             }
-            if r.len == 0 || r.c0 + r.len > r.prompt.len() {
+            let end = r.c0.checked_add(r.tokens.len()).ok_or_else(|| {
+                RuntimeError::Rejected("packed chunk end overflow".into())
+            })?;
+            if r.tokens.is_empty() || end > r.prompt_len {
                 return Err(RuntimeError::Rejected(format!(
                     "pf-batch: bad chunk c0={} len={} prompt={}",
                     r.c0,
-                    r.len,
-                    r.prompt.len()
+                    r.tokens.len(),
+                    r.prompt_len
                 )));
             }
             if r.c0 != self.pos[r.slot] as usize {
@@ -7451,14 +7501,16 @@ impl GpuEngine {
                     r.slot, self.pos[r.slot], r.c0
                 )));
             }
-            if r.c0 + r.len > self.max_ctx {
+            if end > self.max_ctx {
                 return Err(RuntimeError::Rejected(format!(
                     "pf-batch: chunk end {} exceeds compiled context {}",
-                    r.c0 + r.len,
+                    end,
                     self.max_ctx
                 )));
             }
-            total += r.len;
+            total = total.checked_add(r.tokens.len()).ok_or_else(|| {
+                RuntimeError::Rejected("packed row overflow".into())
+            })?;
         }
         // Covering bucket for the pack: smallest T >= Σ len (minimal padding).
         let bi = self
@@ -7502,7 +7554,7 @@ impl GpuEngine {
         // an async H2D of these bytes (memcpy_htod_async src-lifetime contract).
         let kvlen_bytes = reqs
             .iter()
-            .map(|r| (r.c0 + r.len) as i32)
+            .map(|r| (r.c0 + r.tokens.len()) as i32)
             .max()
             .unwrap_or(0)
             .to_le_bytes();
@@ -7514,24 +7566,24 @@ impl GpuEngine {
             pb.req_buf.push(reqs.len() as i32);
             let mut cur = 0usize;
             for r in reqs {
-                for k in 0..r.len {
-                    self.pf_ids[cur + k] = r.prompt[r.c0 + k] as i32;
+                for (k, &token) in r.tokens.iter().enumerate() {
+                    self.pf_ids[cur + k] = token as i32;
                     self.pf_pos[cur + k] = (r.c0 + k) as i32;
                     pb.slot_buf[cur + k] = r.slot as i32;
                 }
                 pb.req_buf.extend_from_slice(&[
                     cur as i32,
-                    r.len as i32,
+                    r.tokens.len() as i32,
                     r.slot as i32,
-                    (r.c0 + r.len) as i32,
+                    (r.c0 + r.tokens.len()) as i32,
                 ]);
-                cur += r.len;
+                cur += r.tokens.len();
             }
             // Trailing pad rows continue the LAST request's positions (legacy
             // pad semantics: garbage KV past a frontier lands in rows that
             // slot's own next writes overwrite before they become readable).
             let last = reqs.last().expect("non-empty");
-            let (mut p, s) = (last.c0 + last.len, last.slot as i32);
+            let (mut p, s) = (last.c0 + last.tokens.len(), last.slot as i32);
             for k in cur..tc {
                 self.pf_ids[k] = 0;
                 self.pf_pos[k] = p.min(self.max_ctx - 1) as i32;
@@ -7637,7 +7689,7 @@ impl GpuEngine {
             use std::fmt::Write as _;
             let mut chunks = String::new();
             for (i, r) in reqs.iter().enumerate() {
-                let _ = write!(chunks, "{}{}", if i == 0 { "" } else { "," }, r.len);
+                let _ = write!(chunks, "{}{}", if i == 0 { "" } else { "," }, r.tokens.len());
             }
             eprintln!(
                 "PACKLOG R={} rows={} bucket={} chunks=[{}]",
@@ -7646,15 +7698,6 @@ impl GpuEngine {
                 tc,
                 chunks
             );
-        }
-        for r in reqs {
-            self.pos[r.slot] = (r.c0 + r.len) as u32;
-            if self.vmm_prefix_enabled() && r.c0 + r.len + 1 >= r.prompt.len() {
-                let end = r.c0 + r.len;
-                self.seq_tokens[r.slot].clear();
-                self.seq_tokens[r.slot].extend_from_slice(&r.prompt[..end]);
-                self.vmm_tail_publish(r.slot);
-            }
         }
         Ok(())
     }
