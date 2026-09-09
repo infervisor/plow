@@ -1142,6 +1142,96 @@ row is fp8 on **gfx950**. GLM-5.3 is qk 256 / v 256 bf16 on gfx942, so on ROCm i
 benchmark against, and the target numbers in §7e came from an unidentified host — if that host is
 NVIDIA, part of the gap is a kernel ecosystem, not plow.
 
+## 7g. The gap is attention after all, and the sparse arm was never armed
+
+Everything in 7f rests on a fit — `T(n) = a·n + b·n²` against three points of a scaling sweep —
+and a fit cannot tell a kernel from a collective. `PLOW_PREFILL_SEG_TIMING=1` measures it
+directly: the AMD TP executor already splits each prefill chunk into per-family segments and
+times each one's critical path. One 70k request, chunk 8192, on the frozen best recipe:
+
+```
+c0        flash_interpreter        interpreter
+          (MLA attention)          (MoE + projections + collectives)
+0            293 ms                   932 ms
+8192         675                      923
+16384      1,054                      924
+24576      1,433                      925
+32768      1,807                      924
+40960      2,184                      946
+49152      2,563                      923
+57344      2,929                      944
+65536      2,454 (tail)               813
+        --------                 --------
+          17,391 ms                8,254 ms      total 25.6 s
+```
+
+Two facts fall straight out.
+
+* **The linear term is exactly what the fit said.** 923 ms per 8192-token chunk is 0.1127
+  ms/token against the fit's a = 0.13142. The MoE/projection path is real and it is 8.25 s.
+* **Attention is 68% of the wall, not 60%, and it is the term that grows.** Per-layer flash time
+  goes 3.76 ms at c0=0 to 37.6 ms at c0=57344 — dead linear in context, i.e. quadratic in the
+  request.
+
+### The target is not reachable with dense attention — an arithmetic proof
+
+GLM-5.3 dense MLA prefill for one 70k request is
+
+```
+78 layers x 2 x 64 heads x (576 qk + 512 v) x 70000^2/2  =  2.661e16 FLOP
+```
+
+Eight MI300X at their bf16 peak (8 x 1307 TF/s) is 10.5 PF/s, so **2.55 s of attention at 100%
+of peak, for one request**. The reference run does 100 x 70k prompts at 27,269 total tok/s, i.e.
+**2.57 s of wall per request** — inclusive of MoE, collectives, decode and scheduling.
+
+No kernel is 100% of peak. The reference is therefore not computing dense attention, and the
+checkpoint says what it is computing instead: `index_topk: 2048`. Top-2048 selection replaces
+`70000²/2 = 2.45e9` query-key pairs with `70000 x 2048 = 1.43e8` — **17.1x less attention work**,
+0.149 s at peak, which leaves room for everything else in 2.57 s.
+
+This retires the framing of 7f's "sparse attention cannot close this gap". The claim there was
+that a free attention kernel still leaves 3.5x; that remains arithmetically true and the 8.25 s
+linear term still has to be attacked. But it was used to rank sparse prefill *below* the MoE
+GEMM, and that ranking was wrong: sparse attention is the difference between a term that is 68%
+of the wall and a term that is 4%, and no amount of MoE work reaches the target while the other
+two thirds stay quadratic.
+
+### `PLOW_GLM_DSA=1` was the wrong knob — there are two gates, not one
+
+7d recorded DSA as tried and null ("the lever never armed... `dsa()` requires `ctx > 65536`").
+That is correct and it is about **decode**. `mla.rs` has a second, independent gate:
+
+```rust
+fn dsa(&self, ctx: u32) -> bool     // DECODE indexer. CROSSOVER = 65536 on --max-ctx.
+fn dsa_pf(&self) -> bool            // PREFILL. `PLOW_GLM_DSA_PF`. No ctx crossover at all.
+```
+
+and the comment on `dsa_pf` states the economics plainly: prefill selection is per query token,
+so it pays "as soon as the causal mean row length exceeds `index_topk`", from T ≈ 2·2048 up. The
+bucket gate is `glm_dsa_pf_bucket`: `t >= 2048 && t > index_topk`. At the shipping chunk of 8192
+that is **true**, and it has been true for every configuration this campaign measured. The knob
+was simply never set — the campaign tested the decode gate, read "never armed", and moved on.
+
+Emitting with `PLOW_GLM_DSA_PF=1` and nothing else changed adds four opcodes, all of them
+already implemented in `interp.hip`:
+
+```
+IndexScorePf (117)  IndexSelectPf (118)  IndexUnionPf (119)  LayerNorm
+```
+
+and grows the T=8192 bucket from 2246 to 2435 ops while T=128/512/2048 are untouched — the
+indexer chain appearing in exactly the rung the gate admits. The 22 indexer layers the
+checkpoint carries (`index_topk_freq: 4`, layers 0,1,2 then every fourth) are all present in the
+prepped lite checkpoint: `indexer.wq_b`, `indexer.wk`, `indexer.k_norm`, `indexer.weights_proj`.
+
+The object side needs `PLOW_DSA_PF=1`, which arms the gathered body of the V2 MLA prefill. It is
+opt-in for a real reason recorded in `build_gfx942.sh` — the megakernel inlines every arm and its
+register allocation is the worst case over all of them, so the gathered body takes the flash
+object's spill from 98 to 287 whether or not a blob ever emits a union table. A sparse blob run
+against an object built without it reads no `t7` and silently runs dense, which is why the
+control arm below runs the *dense* packet against the *sparse* object.
+
 ## 8. Unrelated issue observed
 
 `cargo test -p devgen mla` fails `k3::tests::the_mla_prefill_arm_forces_one_split`
