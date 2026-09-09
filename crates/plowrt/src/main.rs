@@ -1051,6 +1051,22 @@ mod amd_bench_cli_tests {
     }
 }
 
+/// Names the visible-device mask in force, for the tail of a "not enough
+/// devices" error. Empty when none is set — in which case the device count is
+/// the machine's and there is nothing to point at.
+fn visible_mask_hint() -> String {
+    let set = plowrt::device::visibility::describe_env();
+    if set.is_empty() {
+        return String::new();
+    }
+    let list = set
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(" (a visible-device mask is in force: {list})")
+}
+
 fn runtime_environment() -> Vec<(String, String)> {
     let mut vars: Vec<_> = std::env::vars()
         .filter(|(key, _)| {
@@ -2041,9 +2057,9 @@ fn devices(
     };
     if n as usize > all.len() {
         return Err(format!(
-            "--tp {n} but only {} devices are visible \
-             (AMD: the visible set is ROCR_VISIBLE_DEVICES, not HIP_VISIBLE_DEVICES)",
-            all.len()
+            "--tp {n} but only {} devices are visible{}",
+            all.len(),
+            visible_mask_hint()
         )
         .into());
     }
@@ -2469,10 +2485,6 @@ fn simulate(
     Ok(())
 }
 
-/// Upper bound on the auto-probe for CUDA devices when `--devices` is unset.
-#[cfg(feature = "cuda")]
-const MAX_PROBED_DEVICES: u32 = 16;
-
 async fn bringup_runtime(
     assets: Vec<PathBuf>,
     executors: u32,
@@ -2663,15 +2675,45 @@ async fn bringup_runtime(
                 }
             }
 
-            // Visible ordinals. Device 0 is already open; the rest are found by
-            // opening them, because the driver device-count call is not bound
-            // here and an ordinal that will not open is one we could not have
-            // used anyway. Capped so a misconfiguration cannot spin.
+            // Visible ordinals.
+            //
+            // `CUDA_VISIBLE_DEVICES` is applied by libcuda at `cuInit`, so the
+            // count below and every ordinal plowrt uses are ALREADY indices
+            // into the masked set — `--devices 1` means the second visible GPU,
+            // not physical GPU 1. That is the vendor's numbering and matching
+            // it is the point; the startup log prints both so the mapping is
+            // never something an operator has to infer.
+            let visible_count = cuda.device_count()?;
+            let mask = device::visibility::describe_env();
+            if !mask.is_empty() {
+                tracing::info!(
+                    visible_devices = ?mask,
+                    visible_count,
+                    "visible-device mask in force; every ordinal below indexes the MASKED set"
+                );
+            }
+
             let configured = RuntimeConfig::get().devices.clone();
+            // Validate against the visible set BEFORE opening anything, so an
+            // out-of-range ordinal reads as what it is rather than as a device
+            // that would not initialise.
+            if let Some(&bad) = configured.iter().find(|&&d| d >= visible_count) {
+                let hint = if mask.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (a visible-device mask is in force: {mask:?})")
+                };
+                return Err(format!(
+                    "--devices names device {bad}, but only {visible_count} device(s) are \
+                     visible to this process{hint}"
+                )
+                .into());
+            }
+
             let mut backends: Vec<(u32, Arc<device::cuda::CudaBackend>)> =
                 vec![(u32::from(cuda.device_ordinal), Arc::clone(cuda))];
             let wanted: Vec<u32> = if configured.is_empty() {
-                (1..MAX_PROBED_DEVICES).collect()
+                (1..visible_count).collect()
             } else {
                 configured
                     .iter()
@@ -2682,15 +2724,14 @@ async fn bringup_runtime(
             for d in wanted {
                 match device::cuda::CudaBackend::new(d as u8) {
                     Ok(b) => backends.push((d, Arc::new(b))),
+                    // Enumerated but not usable. Not a "that was the last one"
+                    // break any more: the count came from the driver, so this
+                    // is a real failure on a device we were told exists.
                     Err(e) => {
-                        if configured.is_empty() {
-                            // End of the probe, not a failure.
-                            tracing::debug!(device = d, %e, "no further CUDA devices");
-                            break;
-                        }
-                        return Err(
-                            format!("--devices names device {d}, which will not open: {e}").into(),
-                        );
+                        return Err(format!(
+                            "device {d} of {visible_count} visible will not open: {e}"
+                        )
+                        .into())
                     }
                 }
             }

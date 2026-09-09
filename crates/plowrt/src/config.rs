@@ -95,8 +95,13 @@ pub struct RuntimeConfig {
     pub drain_timeout_ms: Option<u64>,
 
     /// Device ordinals to serve on, e.g. `--devices 0,1,2,3`. Unset = every
-    /// GPU the driver enumerates. `CUDA_VISIBLE_DEVICES` / `ROCR_VISIBLE_DEVICES`
-    /// renumber underneath this, as usual.
+    /// visible GPU.
+    ///
+    /// These index the VISIBLE set, not the physical one: `CUDA_VISIBLE_DEVICES`
+    /// and `ROCR_VISIBLE_DEVICES` are applied by the vendor runtime before
+    /// plowrt sees a device, so with `ROCR_VISIBLE_DEVICES=4,5` the two visible
+    /// GPUs are `--devices 0,1`. Startup logs the mask in force and the visible
+    /// count, and an out-of-range ordinal is refused by name.
     #[arg(
         long = "devices",
         env = "PLOW_DEVICES",

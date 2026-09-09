@@ -119,6 +119,7 @@ fn err(status: StatusCode, msg: impl std::fmt::Display) -> Response {
     (status, Json(serde_json::json!({ "error": msg.to_string() }))).into_response()
 }
 
+#[cfg(feature = "cuda")]
 const MIB: u64 = 1 << 20;
 
 /// Resolve a requested assets dir against the `--models-root` allow-list.

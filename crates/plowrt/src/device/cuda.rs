@@ -173,6 +173,7 @@ driver_api! {
     cuDriverGetVersion: fn(*mut i32) -> CUresult,
     cuGetErrorName: fn(CUresult, *mut *const c_char) -> CUresult,
     cuDeviceGet: fn(*mut CUdevice, i32) -> CUresult,
+    cuDeviceGetCount: fn(*mut i32) -> CUresult,
     cuDeviceGetName: fn(*mut c_char, i32, CUdevice) -> CUresult,
     cuDeviceGetAttribute: fn(*mut i32, i32, CUdevice) -> CUresult,
     cuDevicePrimaryCtxRetain: fn(*mut CUcontext, CUdevice) -> CUresult,
@@ -906,6 +907,22 @@ impl CudaBackend {
         )?;
         LAST_CTX.with(|c| c.set(ctx));
         Ok(())
+    }
+
+    /// GPUs the driver makes visible to this process.
+    ///
+    /// This is the post-`CUDA_VISIBLE_DEVICES` count — libcuda applies that
+    /// mask at `cuInit`, so every ordinal plowrt passes to `cuDeviceGet` is
+    /// already an index into the masked set. Callers enumerate against this
+    /// instead of probing ordinals until one fails, which cannot tell "that
+    /// was the last device" apart from "that device would not initialise".
+    pub fn device_count(&self) -> Result<u32> {
+        let mut n: i32 = 0;
+        self.check(
+            unsafe { (self.api.cuDeviceGetCount)(&mut n) },
+            "cuDeviceGetCount",
+        )?;
+        Ok(n.max(0) as u32)
     }
 
     pub fn sm_count(&self) -> u32 {
