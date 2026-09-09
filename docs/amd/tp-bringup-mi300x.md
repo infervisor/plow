@@ -1642,6 +1642,47 @@ one define, one variable, controls that hold — and attack that. The instrument
 already in the tree (`PLOW_XR_NOWAIT` prices the collective's synchronization); the occupancy
 findings for the second are already computed on every emit and have simply never been acted on.
 
+### And it is not the collective's synchronisation either — 1.3%
+
+`PLOW_XR_NOWAIT=1` deletes both two-shot rendezvous waits from the prefill collective
+(op_collective.h). Wrong output by construction, same ceiling-instrument contract. Same packet,
+same lease:
+
+```
+                     flash        interp        total
+ full              15,003 ms     8,253 ms     23,256 ms
+ xr nowait         14,912 ms     8,144 ms     23,056 ms
+                    -0.6%         -1.3%
+```
+
+The full arm now reproduces across three independent leases at 8,251 / 8,253 / 8,254 ms — a
+±3 ms control on an 8.25 s measurement, which is what makes 1.3% readable as a real null rather
+than noise.
+
+So the decomposition of the linear term stands at:
+
+```
+ MoE GEMM k-loop         1,780 ms   21.6%   (PLOW_MOE_PF_ABL)
+ TP collective sync        109 ms    1.3%   (PLOW_XR_NOWAIT)
+ everything else         6,364 ms   77.1%   (by difference)
+```
+
+Two of the three candidates named in 7i are now measured and both are small. What remains in the
+6,364 ms is the dense projections, the MoE's own fixed costs (align, `row_token` gather, padded
+scatter, epilogue, the `fu_g` round trip), and the collective's DATA movement — `XR_NOWAIT`
+removes the waits, not the 175 MB per rank per layer the two-shot actually moves.
+
+Of those, one is already quantified and has never been acted on: this blob's dispatch audit
+reports 21 occupancy findings, `GemmSmall` shapes filling 10.5% to 42.1% of their dispatch. A
+projection that occupies a tenth of the machine cannot be fixed by a better inner loop, and the
+emitter computes that number on every build.
+
+**The methodological point is the durable one.** Three of this campaign's ranked-first items —
+the CK GEMM port, the MPF tile, sparse attention as "worth 2.7x" — were ranked from arithmetic
+over a segment total rather than from an ablation, and each was wrong about its own size by
+between 3x and an order of magnitude. Every number in this section and 7i cost one define, one
+rebuild and one 70k request, and the controls hold to 0.04%.
+
 ## 8. Unrelated issue observed
 
 `cargo test -p devgen mla` fails `k3::tests::the_mla_prefill_arm_forces_one_split`
