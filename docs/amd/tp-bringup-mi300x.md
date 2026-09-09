@@ -942,6 +942,27 @@ target being compared against, so decode latency is the one budget this workload
 It is not the whole gap. Uncapped aggregate prefill is 2,239 tok/s against a single-stream 3,078,
 so ~27% is still lost to concurrency after the cap is gone.
 
+### Two nulls that bound where the remaining 27% is not
+
+**`PLOW_PF_DEFER_DECODE=1` adds nothing** once the interleave is uncapped: 18.61 out tok/s against
+18.67, TPOT 173.3 against 177.8. That is not a surprising measurement, it is a redundant one —
+`amd_prefill_tick_cap` returns `u32::MAX` when `interleave == 0` OR `defer_decode`, so with the
+cap already lifted the second flag cannot change the cap it shares. Recorded because "defer decode
+during prefill" is an obvious thing to reach for next, and it is already covered.
+
+**Co-packing is armed but never fires.** The serve log carries `packed prefill armed route` on all
+8 ranks and no `AMD packed prefill advanced` on any of them. All five emit/build/runtime
+preconditions are satisfied (§7e) and the route still does not pack a launch, which points at the
+second-order defect `docs/amd/gemma4-31b-mi300x.md` already records: co-packing can only consider a
+slot that already holds a prefill cursor, the isolated prefill path is what creates one, and the
+mux skips that path on any tick where a pack ran — so a burst of N fresh requests bootstraps to a
+two-member pack and stops. With 20 simultaneous arrivals that is the shape here.
+
+So the residual ~27% (2,239 aggregate against 3,078 single-stream) is **not** the tick cap, and
+**not** decode stealing prefill ticks. The unexamined candidates are the one-slot-per-tick pick
+itself (`amd_prefill_pick` advances a single request's chunk per tick even uncapped) and the
+co-packing bootstrap above — both scheduler-side, neither a kernel.
+
 ### The comparison target is not ROCm-vs-ROCm
 
 Worth stating before adapting anything: **GLM-5.3's head geometry has no AITER ASM kernel.** The
