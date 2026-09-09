@@ -321,3 +321,66 @@ fn actual_packet_ring_prefix_reservations() {
     drop(rings);
     ops.empty();
 }
+
+#[test]
+#[ignore = "CPU actual FP8 KV packet; set TEST_LIVE_RING_PACKET"]
+fn actual_fp8_packet_scale_slots_share_pages_without_changing_stride() {
+    use std::collections::BTreeSet;
+    let path = std::env::var("TEST_LIVE_RING_PACKET").unwrap();
+    let blob = crate::asset::devblob::DevBlob::parse(&std::fs::read(&path).unwrap()).unwrap();
+    let manifest = blob.with_packet_view(plow_asset::live_kv::emit).unwrap();
+    assert!(manifest.caches.iter().any(|c| c.scales.is_some()));
+    let layout = LiveKvLayout::from_manifest(&blob, &manifest).unwrap();
+    assert_eq!(layout.geometry.batch, 16);
+    assert_eq!(
+        blob.decode_progs().iter().map(|p| p.t).collect::<Vec<_>>(),
+        [1, 2, 4, 8, 16]
+    );
+    assert_eq!(
+        blob.prefill_progs().iter().map(|p| p.t).collect::<Vec<_>>(),
+        [128, 512, 1024]
+    );
+    let granularity = 2 << 20;
+    assert!(layout
+        .ring_tensors
+        .iter()
+        .any(|t| t.slot_bytes < granularity));
+    let ops = Arc::new(Mock::with_granularity(granularity));
+    let mut rings = VmmRings::new(ops.clone(), &layout.ring_tensors, 16).unwrap();
+    let mut slots = BTreeSet::new();
+    let expected = |slots: &BTreeSet<usize>| -> u64 {
+        layout
+            .ring_tensors
+            .iter()
+            .map(|t| {
+                assert_eq!(t.slot_bytes * 16, blob.tensors[t.tensor].bytes);
+                let pages: BTreeSet<_> = slots
+                    .iter()
+                    .flat_map(|&slot| {
+                        let start = slot as u64 * t.slot_bytes;
+                        start / granularity..(start + t.slot_bytes).div_ceil(granularity)
+                    })
+                    .collect();
+                pages.len() as u64 * granularity
+            })
+            .sum()
+    };
+    for slot in [15, 0, 7, 3] {
+        rings.ensure_slot(slot).unwrap();
+        slots.insert(slot);
+        assert_eq!(rings.stats().resident_bytes, expected(&slots));
+        assert_eq!(rings.stats().mapped_slots, slots.len());
+        let calls = ops.calls();
+        rings.ensure_slot(slot).unwrap();
+        assert_eq!(ops.calls(), calls);
+    }
+    for width in [1, 2, 4, 8, 16] {
+        rings.ensure_prefix(width).unwrap();
+        slots.extend(0..width);
+        assert_eq!(rings.stats().resident_bytes, expected(&slots));
+    }
+    eprintln!("{path}: {} whole-slot KV/scale tensors, {} resident bytes; all rungs and out-of-order slots passed",
+        layout.ring_tensors.len(), rings.stats().resident_bytes);
+    drop(rings);
+    ops.empty();
+}

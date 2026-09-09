@@ -1351,3 +1351,28 @@ checkpoint was not modified. Launch and rollback instructions:
 
 Sustained production SLO and application-quality qualification remain open.
 The release remains fixed while development continues separately.
+
+## FP8-KV LIVE allocation prerequisite
+
+The shared allocator now derives full-cache element size from the validated
+manifest and retains each declared FP8 scale tensor's per-slot extent. Sliding
+caches may use a different encoding from full caches. Full-cache geometry and
+encoding must remain uniform. Scale tensors use ordinary allocation by default;
+optional LIVE ring mapping covers their pages without changing logical strides.
+This replaces the earlier explicit FP8 allocation refusal. FP8 packed execution
+gates remain closed, and frozen release binaries/assets are unchanged.
+
+Validation: 649 runtime host tests passed, 23 ignored; separate HSA-only and
+CUDA-only all-target checks passed. An additional CPU mapper test read the actual
+B16 FP8-KV checkpoint and checked 220 whole-slot KV/scale tensors with 2 MiB
+mapping granularity, out-of-order slot admission, shared scale pages, repeated
+admission and cleanup. Decode1/2/4/8/16 and prefill128/512/1024 were retained.
+Logs: campaign `fp8-live-allocation-final-*.log` and
+`fp8-live-allocation-actual-packet.log`.
+
+The new ignored GPU regression compiles. It compares full-vocabulary logits
+against the ordinary prefix allocator across every decode rung and a reused
+sliding-cache slot, with flat and lazy scale allocation. It has **not run**:
+the manual frozen FP8 service owns the H100 on port8080. LIVE FP8 allocation
+therefore remains device-unqualified; no performance or production-readiness
+claim follows from these host checks.

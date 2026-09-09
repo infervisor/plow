@@ -474,27 +474,32 @@ impl LiveKvLayout {
         blob: &crate::asset::devblob::DevBlob,
         m: &plow_asset::live_kv::Manifest,
     ) -> Result<Self> {
-        if m.caches.iter().any(|cache| cache.scales.is_some()) {
-            return Err(RuntimeError::Rejected(
-                "LIVE allocator FP8 scale ownership is not implemented".into(),
-            ));
-        }
         let mut full_tensors = Vec::new();
         let mut ring_tensors = Vec::new();
         let mut cache_tensors = Vec::new();
         let mut full_shape = None;
         for c in &m.caches {
             cache_tensors.extend(c.pair.map(usize::from));
+            let elem = if c.scales.is_some() { 1 } else { 2 };
             if c.window == 0 {
-                if full_shape.is_some_and(|shape| shape != (c.heads, c.hd)) {
+                if full_shape.is_some_and(|shape| shape != (c.heads, c.hd, elem)) {
                     return Err(RuntimeError::Rejected(
-                        "LIVE allocator requires uniform full-cache head geometry".into(),
+                        "LIVE allocator requires uniform full-cache head geometry and encoding".into(),
                     ));
                 }
-                full_shape = Some((c.heads, c.hd));
+                full_shape = Some((c.heads, c.hd, elem));
                 full_tensors.push(c.pair.map(usize::from));
             } else {
                 for tensor in c.pair.map(usize::from) {
+                    ring_tensors.push(LiveRingTensor {
+                        tensor,
+                        slot_bytes: blob.tensors[tensor].bytes / u64::from(m.batch),
+                    });
+                }
+            }
+            if let Some(scales) = c.scales {
+                for tensor in scales.map(usize::from) {
+                    cache_tensors.push(tensor);
                     ring_tensors.push(LiveRingTensor {
                         tensor,
                         slot_bytes: blob.tensors[tensor].bytes / u64::from(m.batch),
@@ -517,7 +522,7 @@ impl LiveKvLayout {
                 kvh_slide: 0,
                 hd_slide: 0,
                 window: 0,
-                elem: 2,
+                elem: full_shape.2,
                 elem_slide: 2,
                 max_ctx: m.max_ctx,
                 batch: m.batch,
@@ -2004,7 +2009,7 @@ mod tests {
         assert!(blob.with_packet_view(|p| bad.validate(p)).is_err());
     }
     #[test]
-    fn fp8_manifest_validation_does_not_enable_unimplemented_live_scale_ownership() {
+    fn fp8_live_geometry_tracks_cache_bytes_and_scale_slots() {
         use crate::asset::devblob::DevTensor;
         use packet::dev::DevOp;
         let mut blob = live_blob();
@@ -2046,11 +2051,142 @@ mod tests {
             assert!(blob.with_packet_view(plow_asset::live_kv::emit).is_err());
             blob.progs[0].insts[2].t[operand] = saved;
         }
-        let error = LiveKvLayout::from_manifest(&blob, &manifest)
-            .err()
-            .unwrap()
-            .to_string();
-        assert!(error.contains("FP8 scale ownership"));
+        let layout = LiveKvLayout::from_manifest(&blob, &manifest).unwrap();
+        assert_eq!(layout.geometry.elem, 1);
+        assert_eq!(layout.geometry.full_tensor_bytes(), blob.tensors[1].bytes);
+        assert_eq!(layout.full_tensors, [[1, 2]]);
+        assert_eq!(layout.cache_tensors, [1, 2, 4, 5]);
+        assert_eq!(
+            layout
+                .ring_tensors
+                .iter()
+                .map(|t| (t.tensor, t.slot_bytes))
+                .collect::<Vec<_>>(),
+            [(4, 1024 * 4), (5, 1024 * 4)]
+        );
+        let ops = Arc::new(MockVmm::default());
+        let mut scales = VmmRings::new(ops.clone(), &layout.ring_tensors, 4).unwrap();
+        scales.ensure_slot(3).unwrap();
+        assert_eq!(scales.stats().resident_bytes, 2 * 1024 * 4);
+        scales.ensure_prefix(4).unwrap();
+        assert_eq!(scales.stats().resident_bytes, 4 * 2 * 1024 * 4);
+        scales.ensure_slot(3).unwrap();
+        assert_eq!(ops.creates.load(Ordering::SeqCst), 8);
+        drop(scales);
+        assert_eq!(ops.releases.load(Ordering::SeqCst), 8);
+    }
+
+    #[test]
+    fn mixed_kv_layout_keeps_each_cache_and_scale_slot_extent() {
+        use crate::asset::devblob::DevTensor;
+        use packet::dev::{DevOp, TENSOR_NONE16};
+        for full_fp8 in [false, true] {
+            for slide_fp8 in [false, true] {
+                let mut blob = live_blob();
+                for (index, fp8) in [full_fp8, slide_fp8].into_iter().enumerate() {
+                    let bytes = 4 * 1024 * 256 * if fp8 { 1 } else { 2 };
+                    let pair = if index == 0 {
+                        blob.tensors[1].bytes = bytes;
+                        blob.tensors[2].bytes = bytes;
+                        [1, 2]
+                    } else {
+                        let h = blob.tensors.len() as u16;
+                        for name in ["slide.key", "slide.value"] {
+                            blob.tensors.push(DevTensor {
+                                name: name.into(),
+                                bytes,
+                                init: None,
+                            });
+                        }
+                        [h, h + 1]
+                    };
+                    let scales = if fp8 {
+                        let h = blob.tensors.len() as u16;
+                        for which in ["key", "value"] {
+                            blob.tensors.push(DevTensor {
+                                name: format!("scale.{index}.{which}"),
+                                bytes: 4 * 1024 * 4,
+                                init: None,
+                            });
+                        }
+                        [h, h + 1]
+                    } else {
+                        [TENSOR_NONE16; 2]
+                    };
+                    let window = if index == 0 { 0 } else { 512 };
+                    let mask = if index == 0 { u32::MAX } else { 1023 };
+                    for (pi, p) in blob.progs.iter_mut().enumerate() {
+                        let mut ops = p.insts[..3].to_vec();
+                        for k in 0..2 {
+                            ops[k].op = if fp8 {
+                                DevOp::HeadNormRopeFp8
+                            } else {
+                                DevOp::HeadNormRope
+                            } as u16;
+                            ops[k].t[0] = pair[k];
+                            ops[k].t[6] = scales[k];
+                            ops[k].fj[2] = mask;
+                        }
+                        let d = &mut ops[2];
+                        d.op = match (pi == 0, fp8) {
+                            (true, true) => DevOp::FlashPrefillFp8,
+                            (true, false) => DevOp::FlashPrefill,
+                            (false, true) => DevOp::FlashDecodeFp8,
+                            (false, false) => DevOp::FlashDecode,
+                        } as u16;
+                        d.t[3..5].copy_from_slice(&pair);
+                        d.t[6..8].copy_from_slice(&scales);
+                        if pi == 0 {
+                            d.i[5] = window;
+                            d.fj[2] = mask;
+                        } else {
+                            d.i[4] = window;
+                            d.i[7] = mask;
+                        }
+                        if index == 0 {
+                            p.insts = ops;
+                        } else {
+                            p.insts.extend(ops);
+                        }
+                    }
+                }
+                let manifest = blob.with_packet_view(plow_asset::live_kv::emit).unwrap();
+                let layout = LiveKvLayout::from_manifest(&blob, &manifest).unwrap();
+                assert_eq!(layout.geometry.elem, if full_fp8 { 1 } else { 2 });
+                assert_eq!(layout.geometry.full_tensor_bytes(), blob.tensors[1].bytes);
+                for c in &manifest.caches {
+                    for h in c.pair.into_iter().chain(c.scales.into_iter().flatten()) {
+                        assert!(layout.cache_tensors.contains(&(h as usize)));
+                        if c.window != 0 || c.scales.is_some_and(|pair| pair.contains(&h)) {
+                            let region = layout
+                                .ring_tensors
+                                .iter()
+                                .find(|t| t.tensor == h as usize)
+                                .unwrap();
+                            assert_eq!(region.slot_bytes * 4, blob.tensors[h as usize].bytes);
+                        }
+                    }
+                }
+                for p in &mut blob.progs {
+                    for d in &mut p.insts[3..5] {
+                        d.fj[2] = u32::MAX;
+                    }
+                    let d = &mut p.insts[5];
+                    if p.t == 128 {
+                        d.i[5] = 0;
+                        d.fj[2] = u32::MAX;
+                    } else {
+                        d.i[4] = 0;
+                        d.i[7] = u32::MAX;
+                    }
+                }
+                let manifest = blob.with_packet_view(plow_asset::live_kv::emit).unwrap();
+                assert_eq!(
+                    LiveKvLayout::from_manifest(&blob, &manifest).is_ok(),
+                    full_fp8 == slide_fp8
+                );
+            }
+        }
     }
 
     #[test]
