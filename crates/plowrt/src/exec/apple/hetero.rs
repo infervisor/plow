@@ -6,7 +6,7 @@
 //!
 //! * ANE lane: one CoreML program per layer (`pre` = norm+QKV, `mid` = o_proj..MLP of layer l
 //!   plus norm+QKV of l+1, `post` = o_proj..MLP of the last layer), weights baked fp16 from the
-//!   packet's fp8 twins with the norm gammas folded into the consuming projections. The
+//!   packet's quantized twins with the norm gammas folded into the consuming projections. The
 //!   residual stream rides the ANE scaled by `RESID_SCALE` (o_proj/down weights carry the same
 //!   factor) so the fp16 sum of squares inside the norm cannot overflow on Llama's massive
 //!   activations; the norm is scale-invariant, so q/k/v come out at true scale.
@@ -22,7 +22,9 @@ use std::sync::{Arc, Barrier, Condvar, Mutex};
 use std::time::Instant;
 
 use packet::dev::{DevInst64, DevOp};
-use plow_asset::hetero::{AneLane, HeteroPlan, ProgPlan, SegPlan, FILE, SCHEMA};
+#[cfg(feature = "ane")]
+use plow_asset::hetero::WeightEncoding;
+use plow_asset::hetero::{AneLane, HeteroPlan, ProgPlan, SegPlan, FILE};
 
 use crate::exec::cpu::engine::CpuModel;
 use crate::exec::cpu::ffi;
@@ -38,16 +40,27 @@ pub const RESID_SCALE: f32 = 1.0 / 16.0;
 /// lane's block is walked in 64-row calls with the last one zero-padded in the staging buffer.
 pub const ANE_ROWS: usize = 64;
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
+pub struct LaneProfile {
+    pub input_convert_ms: f64,
+    pub output_convert_ms: f64,
+    pub residual_ms: f64,
+    #[cfg(feature = "ane")]
+    pub coreml: crate::exec::ane::RunTimings,
+}
+
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
 pub struct Stats {
     pub segs: usize,
     pub ane_runs: usize,
+    /// Whole host lane, including conversion and CoreML; not pure ANE execution time.
     pub ane_ms: f64,
     pub cpu_ops: usize,
     pub cpu_ms: f64,
     /// Host time spent waiting for the GPU after its own lanes finished (the GPU was the
     /// critical path) — summed over segments.
     pub gpu_wait_ms: f64,
+    pub profile: LaneProfile,
 }
 
 #[derive(Clone, Copy)]
@@ -68,8 +81,85 @@ pub struct Hetero {
     #[cfg(feature = "ane")]
     ane: Option<AneLanes>,
     pub stats: Stats,
+    pub profile_enabled: bool,
     /// Rows of the current chunk that hold real tokens (`prepare_chunk`).
     pub clen: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inactive_lanes_restore_all_gpu_rows() {
+        let mut h = Hetero {
+            plan: HeteroPlan {
+                ane_pct: 50,
+                programs: vec![ProgPlan {
+                    t: 128,
+                    rows_gpu: 64,
+                    rows_ane: 64,
+                    segments: vec![SegPlan {
+                        cpu_insts: vec![0],
+                        ..SegPlan::default()
+                    }],
+                    ..ProgPlan::default()
+                }],
+                ..HeteroPlan::default()
+            },
+            by_prog: vec![Some(0)],
+            h: Handles {
+                x: 0,
+                at: 0,
+                qg: 0,
+                kg: 0,
+                vg: 0,
+            },
+            threads: 0,
+            pool: None,
+            #[cfg(feature = "ane")]
+            ane: None,
+            stats: Stats::default(),
+            profile_enabled: false,
+            clen: 0,
+        };
+        let mut d = DevInst64 {
+            op: 34,
+            ..DevInst64::default()
+        };
+        d.i[0] = 64;
+        let mut insts = [d];
+        h.prepare_chunk(0, &mut insts, &[d], 8);
+        assert!(!h.has_active_lanes(0));
+        assert_eq!(insts[0].i[0], 8);
+        h.prepare_chunk(0, &mut insts, &[d], 128);
+        assert!(h.has_active_lanes(0));
+        assert_eq!(insts[0].i[0], 64);
+        h.plan.ane_pct = 0;
+        h.prepare_chunk(0, &mut insts, &[d], 128);
+        assert!(!h.has_active_lanes(0));
+        assert_eq!(insts[0].i[0], 128);
+        assert!(!h.has_active_lanes(1));
+        h.plan.ane_pct = 50;
+        for (rows, ane) in [
+            (31, 8),
+            (32, 16),
+            (33, 16),
+            (63, 24),
+            (64, 32),
+            (65, 32),
+            (127, 56),
+            (128, 64),
+        ] {
+            assert_eq!(h.rows_for_chunk(0, rows), Some((rows - ane, ane, 0)));
+        }
+        assert_eq!(h.rows_for_chunk(1, 64), None);
+        h.profile_enabled = true;
+        h.stats.profile.input_convert_ms = 3.0;
+        h.reset_stats();
+        assert!(h.profile_enabled);
+        assert_eq!(h.stats.profile.input_convert_ms, 0.0);
+    }
 }
 
 impl Hetero {
@@ -79,15 +169,21 @@ impl Hetero {
         let Ok(bytes) = std::fs::read(&path) else {
             return Ok(None);
         };
-        let plan: HeteroPlan = serde_json::from_slice(&bytes)
-            .map_err(|e| RuntimeError::Device(format!("{}: {e}", path.display())))?;
-        if plan.schema != SCHEMA {
-            return Err(RuntimeError::Device(format!(
-                "{}: schema {:?}, expected {SCHEMA:?}",
-                path.display(),
-                plan.schema
-            )));
-        }
+        let plan = match plow_asset::hetero::parse(&bytes)
+            .map_err(|e| RuntimeError::Device(format!("{}: {e}", path.display())))?
+        {
+            plow_asset::hetero::Plan::Row(plan) => plan,
+            plow_asset::hetero::Plan::Channel(plan) => {
+                model
+                    .blob
+                    .with_packet_view(|p| plan.validate(p))
+                    .map_err(RuntimeError::Device)?;
+                if !crate::config::RuntimeConfig::get().apple.ane_mlp {
+                    eprintln!("channel MLP: validated plan; offload disabled, using unsplit GPU");
+                }
+                return Ok(None);
+            }
+        };
         let handle =
             |name: &str| -> Result<usize> {
                 model.names.iter().position(|n| n == name).ok_or_else(|| {
@@ -127,11 +223,10 @@ impl Hetero {
             }
             by_prog[p] = Some(i);
         }
-        let threads = std::env::var("PLOW_CPU_THREADS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(8usize)
-            .max(1);
+        let threads = match crate::config::RuntimeConfig::get().cpu.threads {
+            0 => 8,
+            n => n as usize,
+        };
         let any_cpu = plan.programs.iter().any(|p| p.rows_cpu > 0);
         let any_ane = plan.programs.iter().any(|p| p.rows_ane > 0);
         let pool = any_cpu.then(|| LanePool::new(threads));
@@ -163,6 +258,7 @@ impl Hetero {
             #[cfg(feature = "ane")]
             ane,
             stats: Stats::default(),
+            profile_enabled: false,
             clen: 0,
         }))
     }
@@ -173,6 +269,13 @@ impl Hetero {
             .copied()
             .flatten()
             .map(|i| &self.plan.programs[i])
+    }
+
+    pub fn has_active_lanes(&self, p: usize) -> bool {
+        self.prog_plan(p).is_some_and(|pp| {
+            let (_, a, c) = self.split(pp);
+            a > 0 || c > 0
+        })
     }
 
     /// Chunk staging for a planned program: the bucket-row shrink of `rebase_chunk_rows` must
@@ -211,7 +314,15 @@ impl Hetero {
     /// its block in [`ANE_ROWS`] calls, the CPU kernels take any row count. The compile-time
     /// blocks in the plan only fix the GPU tile choice and the segment structure.
     fn split(&self, pp: &ProgPlan) -> (u32, u32, u32) {
-        let clen = self.clen.max(1).min(pp.t);
+        self.split_rows(pp, self.clen)
+    }
+
+    pub fn rows_for_chunk(&self, p: usize, rows: u32) -> Option<(u32, u32, u32)> {
+        self.prog_plan(p).map(|pp| self.split_rows(pp, rows))
+    }
+
+    fn split_rows(&self, pp: &ProgPlan, rows: u32) -> (u32, u32, u32) {
+        let clen = rows.max(1).min(pp.t);
         let r8 = |pct: u32| (clen * pct / 100) / 8 * 8;
         let (mut a, mut c) = (
             if pp.rows_ane > 0 {
@@ -286,7 +397,11 @@ impl Hetero {
         if let (Some(lane), Some((row0, rows))) = (&sp.ane, ane) {
             let t0 = Instant::now();
             let ane_l = self.ane.as_mut().expect("ANE lanes built at load");
+            ane_l.profile = self.profile_enabled.then_some(self.stats.profile);
             ane_l.run(lane, row0 as usize, rows as usize, &self.h, table)?;
+            if let Some(profile) = ane_l.profile {
+                self.stats.profile = profile;
+            }
             self.stats.ane_runs += 1;
             self.stats.ane_ms += t0.elapsed().as_secs_f64() * 1e3;
         }
@@ -363,6 +478,11 @@ fn cpu_rebase(
         | DevOp::GemmFp8
         | DevOp::GemmMedFp8
         | DevOp::GemmSmallFp8
+        | DevOp::GemmMxfp4
+        | DevOp::GemmMedMxfp4
+        | DevOp::GemmSmallMxfp4
+        | DevOp::GemmWideMxfp4
+        | DevOp::GemmGluMxfp4
         | DevOp::GemmGlu
         | DevOp::GemmGluFp8 => {
             let (n, k) = (d.i[1] as usize, d.i[2] as usize);
@@ -532,6 +652,7 @@ struct AneLanes {
     /// carrying the residual in fp16 (`PLOW_ANE_RESID=fused`; 0.12, same speed).
     host_resid: bool,
     pub compile_ms: f64,
+    profile: Option<LaneProfile>,
 }
 
 #[cfg(feature = "ane")]
@@ -543,10 +664,10 @@ struct Dims {
     kd: usize,
     eps: f32,
     gelu: bool,
-    fp8: bool,
+    encoding: WeightEncoding,
 }
 
-/// One weight matrix `[n][k]`: e4m3 bytes + per-row f32 scale (w8a16), or bf16.
+/// One weight matrix in the plan's encoding; scale storage is f32 for FP8, E8M0 for MXFP4.
 #[cfg(feature = "ane")]
 #[derive(Clone, Copy)]
 struct WSrc {
@@ -577,7 +698,7 @@ unsafe impl Send for AneLanes {}
 #[cfg(feature = "ane")]
 /// `PLOW_ANE_W8=1`: ANE programs carry 8-bit linear-quantized weights (half the bytes).
 pub fn ane_w8() -> bool {
-    std::env::var("PLOW_ANE_W8").as_deref() == Ok("1")
+    crate::config::RuntimeConfig::get().apple.ane_w8
 }
 
 fn e4m3_lut() -> [f32; 256] {
@@ -615,6 +736,16 @@ fn f32_to_bf16(v: f32) -> u16 {
 #[cfg(feature = "ane")]
 impl AneLanes {
     fn new(model: &CpuModel, plan: &HeteroPlan, blob: &Path) -> Result<AneLanes> {
+        let encoding = if plan.fp8 {
+            if plan.weight_encoding == WeightEncoding::Mxfp4 {
+                return Err(RuntimeError::Device(
+                    "hetero: conflicting weight encodings".into(),
+                ));
+            }
+            WeightEncoding::Fp8
+        } else {
+            plan.weight_encoding
+        };
         if !(plan.arch == "llama" || plan.arch == "qwen3") || plan.mlp_act != 1 {
             return Err(RuntimeError::Device(format!(
                 "hetero: the ANE lane implements Llama-style layers only (arch {:?}, mlp_act {})",
@@ -629,20 +760,39 @@ impl AneLanes {
         };
         let w = |name: &str, scale: &Option<String>, n: usize, k: usize| -> Result<WSrc> {
             let (p, bytes) = ten(name)?;
-            let need = if plan.fp8 { n * k } else { n * k * 2 };
+            let (need, scale_bytes) = match encoding {
+                WeightEncoding::Bf16 => (n * k * 2, 0),
+                WeightEncoding::Fp8 => (n * k, n * 4),
+                WeightEncoding::Mxfp4 => {
+                    if k % 2 != 0 {
+                        return Err(RuntimeError::Device(format!(
+                            "hetero: {name}: odd MXFP4 width {k}"
+                        )));
+                    }
+                    (n * (k / 2), n * k.div_ceil(32))
+                }
+            };
             if bytes < need {
                 return Err(RuntimeError::Device(format!(
                     "hetero: {name} has {bytes} bytes, need {need} for [{n}][{k}]"
                 )));
             }
-            let sc = match (plan.fp8, scale) {
-                (true, Some(s)) => ten(s)?.0 as *const f32,
-                (true, None) => {
+            let sc = match (scale_bytes, scale) {
+                (0, _) => std::ptr::null(),
+                (_, Some(s)) => {
+                    let (p, bytes) = ten(s)?;
+                    if bytes < scale_bytes {
+                        return Err(RuntimeError::Device(format!(
+                            "hetero: {s} has {bytes} bytes, need {scale_bytes}"
+                        )));
+                    }
+                    p as *const f32
+                }
+                (_, None) => {
                     return Err(RuntimeError::Device(format!(
-                        "hetero: {name}: fp8 twin without scale"
+                        "hetero: {name}: quantized twin without scale"
                     )))
                 }
-                (false, _) => std::ptr::null(),
             };
             Ok(WSrc {
                 w: p,
@@ -671,9 +821,13 @@ impl AneLanes {
                 wd: w(&l.wd, &l.sd, h, i)?,
             });
         }
-        let units = match std::env::var("PLOW_ANE_UNITS").as_deref() {
-            Ok("cpu") => objc2_core_ml::MLComputeUnits::CPUOnly,
-            Ok("all") => objc2_core_ml::MLComputeUnits::All,
+        let units = match crate::config::RuntimeConfig::get()
+            .apple
+            .ane_units
+            .as_deref()
+        {
+            Some("cpu") => objc2_core_ml::MLComputeUnits::CPUOnly,
+            Some("all") => objc2_core_ml::MLComputeUnits::All,
             _ => objc2_core_ml::MLComputeUnits::CPUAndNeuralEngine,
         };
         let max_rows = ANE_ROWS;
@@ -688,7 +842,7 @@ impl AneLanes {
                 kd,
                 eps: plan.eps,
                 gelu: plan.mlp_act == 0,
-                fp8: plan.fp8,
+                encoding,
             },
             nets: HashMap::new(),
             xin: vec![0.0; max_rows * h],
@@ -696,15 +850,20 @@ impl AneLanes {
             xo: vec![0.0; max_rows * h],
             qkv: vec![0.0; max_rows * (qd + 2 * kd)],
             tmp: vec![0.0; max_rows * h],
-            host_resid: std::env::var("PLOW_ANE_RESID").as_deref() != Ok("fused"),
+            host_resid: crate::config::RuntimeConfig::get()
+                .apple
+                .ane_resid
+                .as_deref()
+                != Some("fused"),
             compile_ms: 0.0,
+            profile: None,
         })
     }
 
     /// fp16 `[n][k]` of `src` with `factor[k]` (a folded norm gamma) and a scalar `mul` applied.
     fn fold(&self, src: WSrc, factor: Option<*const u16>, mul: f32, out: &mut [u16]) {
         let lut = e4m3_lut();
-        let (n, k, fp8) = (src.n, src.k, self.dims.fp8);
+        let (n, k, encoding) = (src.n, src.k, self.dims.encoding);
         let threads = 8usize;
         let chunk = n.div_ceil(threads);
         let f = factor.map(|p| p as usize);
@@ -718,16 +877,30 @@ impl AneLanes {
                         let nn = n0 + r;
                         // SAFETY: row `nn < n` of a validated `[n][k]` tensor; the gamma has k entries.
                         unsafe {
-                            let s = if fp8 {
+                            let s = if encoding == WeightEncoding::Fp8 {
                                 *(sp as *const f32).add(nn)
                             } else {
                                 1.0
                             } * mul;
                             for kk in 0..k {
-                                let wv = if fp8 {
-                                    lut[*(wp as *const u8).add(nn * k + kk) as usize]
-                                } else {
-                                    bf16_to_f32(*(wp as *const u16).add(nn * k + kk))
+                                let wv = match encoding {
+                                    WeightEncoding::Fp8 => {
+                                        lut[*(wp as *const u8).add(nn * k + kk) as usize]
+                                    }
+                                    WeightEncoding::Bf16 => {
+                                        bf16_to_f32(*(wp as *const u16).add(nn * k + kk))
+                                    }
+                                    WeightEncoding::Mxfp4 => {
+                                        const E2M1: [f32; 16] = [
+                                            0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5,
+                                            -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+                                        ];
+                                        let packed = *(wp as *const u8).add(nn * (k / 2) + kk / 2);
+                                        let code = (packed >> ((kk % 2) * 4)) & 15;
+                                        let scale =
+                                            *(sp as *const u8).add(nn * k.div_ceil(32) + kk / 32);
+                                        E2M1[code as usize] * f32::from_bits((scale as u32) << 23)
+                                    }
                                 };
                                 let g = match f {
                                     Some(fp) => bf16_to_f32(*(fp as *const u16).add(kk)),
@@ -958,7 +1131,10 @@ impl AneLanes {
             t_enum: vec![t],
             flex_outputs: false,
             range: false,
-            out_range: std::env::var("PLOW_OUT_RANGE").is_ok(),
+            out_range: crate::config::RuntimeConfig::get()
+                .apple
+                .out_range
+                .is_some(),
             w8: ane_w8(),
             layers,
         }
@@ -985,7 +1161,17 @@ impl AneLanes {
     fn net(&mut self, lane: &AneLane, t: usize) -> Result<&mut crate::exec::ane::AneNet> {
         let key = (lane.kind.clone(), lane.layer, t);
         if !self.nets.contains_key(&key) {
-            let name = format!("v1-l{}-{}-t{t}{}", lane.layer, lane.kind, if ane_w8() { "-w8" } else { "" });
+            let name = format!(
+                "v1-l{}-{}-t{t}{}{}",
+                lane.layer,
+                lane.kind,
+                if self.dims.encoding == WeightEncoding::Mxfp4 {
+                    "-mx4"
+                } else {
+                    ""
+                },
+                if ane_w8() { "-w8" } else { "" }
+            );
             let cached = crate::exec::ane::AneNet::cached(&self.dir, &name);
             let t0 = Instant::now();
             let io = self.io(lane);
@@ -1002,6 +1188,34 @@ impl AneLanes {
             self.nets.insert(key.clone(), net);
         }
         Ok(self.nets.get_mut(&key).unwrap())
+    }
+
+    fn run_net(
+        &mut self,
+        lane: &AneLane,
+        t: usize,
+        inputs: &[&[f32]],
+        outputs: &mut [&mut [f32]],
+    ) -> Result<()> {
+        let mut timings = self
+            .profile
+            .map(|_| crate::exec::ane::RunTimings::default());
+        self.net(lane, t)?
+            .run_timed(t, inputs, outputs, timings.as_mut())?;
+        if let (Some(profile), Some(timings)) = (&mut self.profile, timings) {
+            profile.coreml.accumulate(timings);
+        }
+        Ok(())
+    }
+
+    fn profile_start(&self) -> Option<Instant> {
+        self.profile.map(|_| Instant::now())
+    }
+
+    fn profile_host(&mut self, start: Option<Instant>, field: fn(&mut LaneProfile) -> &mut f64) {
+        if let (Some(profile), Some(start)) = (&mut self.profile, start) {
+            *field(profile) += start.elapsed().as_secs_f64() * 1e3;
+        }
     }
 
     /// Run `lane` on rows `[row0, row0+rows)` in [`ANE_ROWS`]-row calls (the last zero-padded).
@@ -1047,6 +1261,7 @@ impl AneLanes {
             std::mem::take(&mut self.tmp),
         );
         let r = (|| -> Result<()> {
+            let start = self.profile_start();
             // SAFETY: as in `run_call`.
             unsafe {
                 let xp = (table[h.x] as *const u16).add(row0 * hid);
@@ -1055,7 +1270,9 @@ impl AneLanes {
                 }
                 xo[rows * hid..t * hid].fill(0.0);
             }
+            self.profile_host(start, |p| &mut p.input_convert_ms);
             if lane.kind != "pre" {
+                let start = self.profile_start();
                 unsafe {
                     let ap = (table[h.at] as *const u16).add(row0 * qd);
                     for i in 0..rows * qd {
@@ -1063,43 +1280,50 @@ impl AneLanes {
                     }
                     atin[rows * qd..t * qd].fill(0.0);
                 }
+                self.profile_host(start, |p| &mut p.input_convert_ms);
                 let key = AneLane {
                     kind: "o".into(),
                     layer: l,
                 };
-                self.net(&key, t)?
-                    .run(t, &[&atin[..t * qd]], &mut [&mut tmp[..t * hid]])?;
+                self.run_net(&key, t, &[&atin[..t * qd]], &mut [&mut tmp[..t * hid]])?;
+                let start = self.profile_start();
                 for i in 0..t * hid {
                     xo[i] += tmp[i];
                     xin[i] = xo[i] * RESID_SCALE;
                 }
+                self.profile_host(start, |p| &mut p.residual_ms);
                 let key = AneLane {
                     kind: "mlp".into(),
                     layer: l,
                 };
-                self.net(&key, t)?
-                    .run(t, &[&xin[..t * hid]], &mut [&mut tmp[..t * hid]])?;
+                self.run_net(&key, t, &[&xin[..t * hid]], &mut [&mut tmp[..t * hid]])?;
+                let start = self.profile_start();
                 for i in 0..t * hid {
                     xo[i] += tmp[i];
                 }
+                self.profile_host(start, |p| &mut p.residual_ms);
+                let start = self.profile_start();
                 unsafe {
                     let xp = (table[h.x] as *mut u16).add(row0 * hid);
                     for i in 0..rows * hid {
                         *xp.add(i) = f32_to_bf16(xo[i]);
                     }
                 }
+                self.profile_host(start, |p| &mut p.output_convert_ms);
             }
             if lane.kind != "post" {
                 let ql = if lane.kind == "pre" { l } else { l + 1 };
+                let start = self.profile_start();
                 for i in 0..t * hid {
                     xin[i] = xo[i] * RESID_SCALE;
                 }
+                self.profile_host(start, |p| &mut p.input_convert_ms);
                 let key = AneLane {
                     kind: "qkv".into(),
                     layer: ql,
                 };
-                self.net(&key, t)?
-                    .run(t, &[&xin[..t * hid]], &mut [&mut qkv[..t * n]])?;
+                self.run_net(&key, t, &[&xin[..t * hid]], &mut [&mut qkv[..t * n]])?;
+                let start = self.profile_start();
                 unsafe {
                     let qp = (table[h.qg] as *mut u16).add(row0 * qd);
                     let kp = (table[h.kg] as *mut u16).add(row0 * kd);
@@ -1115,6 +1339,7 @@ impl AneLanes {
                         }
                     }
                 }
+                self.profile_host(start, |p| &mut p.output_convert_ms);
             }
             Ok(())
         })();
@@ -1143,6 +1368,7 @@ impl AneLanes {
         let with_at = lane.kind != "pre";
         let with_qkv = lane.kind != "post";
         let t = ANE_ROWS;
+        let start = self.profile_start();
         // SAFETY: the activation tensors are `[T][feat]` bf16 with T >= row0+rows (the bucket).
         unsafe {
             let xp = (table[h.x] as *const u16).add(row0 * hid);
@@ -1158,6 +1384,7 @@ impl AneLanes {
                 self.atin[rows * qd..t * qd].fill(0.0);
             }
         }
+        self.profile_host(start, |p| &mut p.input_convert_ms);
         let n = qd + 2 * kd;
         let (xin, atin) = (
             std::mem::take(&mut self.xin),
@@ -1165,15 +1392,16 @@ impl AneLanes {
         );
         let (mut xo, mut qkv) = (std::mem::take(&mut self.xo), std::mem::take(&mut self.qkv));
         let r = {
-            let net = self.net(lane, t)?;
             match lane.kind.as_str() {
-                "pre" => net.run(t, &[&xin[..t * hid]], &mut [&mut qkv[..t * n]]),
-                "post" => net.run(
+                "pre" => self.run_net(lane, t, &[&xin[..t * hid]], &mut [&mut qkv[..t * n]]),
+                "post" => self.run_net(
+                    lane,
                     t,
                     &[&xin[..t * hid], &atin[..t * qd]],
                     &mut [&mut xo[..t * hid]],
                 ),
-                _ => net.run(
+                _ => self.run_net(
+                    lane,
                     t,
                     &[&xin[..t * hid], &atin[..t * qd]],
                     &mut [&mut xo[..t * hid], &mut qkv[..t * n]],
@@ -1185,6 +1413,7 @@ impl AneLanes {
         self.xo = xo;
         self.qkv = qkv;
         r?;
+        let start = self.profile_start();
         // SAFETY: as above; this lane owns exactly these rows of x/qg/kg/vg in this segment.
         unsafe {
             if with_at {
@@ -1209,6 +1438,7 @@ impl AneLanes {
                 }
             }
         }
+        self.profile_host(start, |p| &mut p.output_convert_ms);
         Ok(())
     }
 }

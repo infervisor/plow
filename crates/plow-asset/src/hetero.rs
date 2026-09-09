@@ -8,9 +8,41 @@
 use serde::{Deserialize, Serialize};
 
 pub const FILE: &str = "hetero.json";
-pub const SCHEMA: &str = "plow-hetero-v1";
+pub const SCHEMA: &str = "plow-hetero-v2";
 
-/// Per-layer weight tensor names (fp8 twin + scale when the packet is w8a16, else bf16).
+#[derive(Debug)]
+pub enum Plan {
+    Row(HeteroPlan),
+    Channel(crate::hetero_channel::ChannelPlan),
+}
+
+pub fn parse(bytes: &[u8]) -> Result<Plan, String> {
+    #[derive(Deserialize)]
+    struct Header {
+        schema: String,
+    }
+    let header: Header = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+    match header.schema.as_str() {
+        "plow-hetero-v1" | SCHEMA => serde_json::from_slice(bytes)
+            .map(Plan::Row)
+            .map_err(|e| e.to_string()),
+        crate::hetero_channel::SCHEMA => serde_json::from_slice(bytes)
+            .map(Plan::Channel)
+            .map_err(|e| e.to_string()),
+        other => Err(format!("unsupported heterogeneous schema {other:?}")),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WeightEncoding {
+    #[default]
+    Bf16,
+    Fp8,
+    Mxfp4,
+}
+
+/// Per-layer weight tensor names and scales for the plan's weight encoding.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct LayerWeights {
     pub g_in: String,
@@ -90,10 +122,39 @@ pub struct HeteroPlan {
     pub eps: f32,
     /// 0 = GeGLU (Gemma), 1 = SwiGLU (Llama/Qwen).
     pub mlp_act: u32,
+    /// Legacy v1 encoding flag; v2 carries `weight_encoding`.
+    #[serde(default)]
     pub fp8: bool,
+    #[serde(default)]
+    pub weight_encoding: WeightEncoding,
     pub ane_pct: u32,
     pub cpu_pct: u32,
     pub tensors: ActTensors,
     pub layers: Vec<LayerWeights>,
     pub programs: Vec<ProgPlan>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_encoding_and_mxfp4_roundtrip() {
+        let mut old = serde_json::to_value(HeteroPlan::default()).unwrap();
+        old.as_object_mut().unwrap().remove("weight_encoding");
+        old["schema"] = "plow-hetero-v1".into();
+        old["fp8"] = true.into();
+        let legacy: HeteroPlan = serde_json::from_value(old).unwrap();
+        assert!(legacy.fp8);
+        assert_eq!(legacy.weight_encoding, WeightEncoding::Bf16);
+        let plan = HeteroPlan {
+            schema: SCHEMA.into(),
+            weight_encoding: WeightEncoding::Mxfp4,
+            ..HeteroPlan::default()
+        };
+        let bytes = serde_json::to_vec(&plan).unwrap();
+        let loaded: HeteroPlan = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(loaded.weight_encoding, WeightEncoding::Mxfp4);
+        assert!(!loaded.fp8);
+    }
 }

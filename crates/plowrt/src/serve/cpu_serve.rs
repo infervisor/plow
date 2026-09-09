@@ -18,6 +18,7 @@ use crate::{Result, RuntimeError};
 /// (single-sequence prefill rebased onto a slot, one batched decode step on the narrowest rung),
 /// so one serve engine and one mux tick body cover both units.
 pub trait SlotEngine: Send {
+    fn prefill_buckets(&self) -> Vec<(usize, u32)>;
     fn prefill_slot(&mut self, slot: usize, prompt: &[u32]) -> Result<u32>;
     fn prefill_slot_chunk(&mut self, slot: usize, prompt: &[u32], ch: Chunk) -> Result<()>;
     fn last_token(&self) -> Result<u32>;
@@ -35,6 +36,9 @@ pub trait SlotEngine: Send {
 }
 
 impl SlotEngine for CpuEngine {
+    fn prefill_buckets(&self) -> Vec<(usize, u32)> {
+        CpuEngine::prefill_buckets(self)
+    }
     fn prefill_slot(&mut self, slot: usize, prompt: &[u32]) -> Result<u32> {
         CpuEngine::prefill_slot(self, slot, prompt)
     }
@@ -104,9 +108,7 @@ impl CpuServe {
         let max_ctx = eng.max_ctx();
         let batch = eng.model().batch;
         let decode_rungs = eng.model().decode_rungs().into_boxed_slice();
-        let buckets: Vec<(usize, u32)> = (0..eng.model().dec_ix)
-            .map(|i| (i, eng.model().blob.progs[i].t))
-            .collect();
+        let buckets = eng.prefill_buckets();
         if buckets.is_empty() {
             return Err(RuntimeError::Device(
                 "CPU serve blob has no prefill program".into(),

@@ -2706,7 +2706,12 @@ async fn bringup_runtime(
             // The Metal engine rides the same slot-serve engine; `PLOW_BACKEND=cpu` keeps the
             // worker-pool engine on a Metal-enabled build.
             #[cfg(all(feature = "metal", target_os = "macos"))]
-            let eng = if std::env::var("PLOW_BACKEND").map_or(true, |v| v != "cpu") {
+            let eng = if plowrt::config::RuntimeConfig::get()
+                .apple
+                .backend
+                .as_deref()
+                != Some("cpu")
+            {
                 let m = plowrt::exec::apple::MetalEngine::load(&blob, &ckpt)?;
                 plowrt::serve::engine::CpuServe::from_engine(Box::new(m), &ckpt)?
             } else {

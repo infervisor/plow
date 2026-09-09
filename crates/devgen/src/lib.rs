@@ -54,6 +54,7 @@ use block::{parse_block, write_block_descriptor};
 mod config;
 pub mod emit_config;
 pub mod hetero;
+mod hetero_channel;
 pub mod k3;
 pub mod kda;
 use config::*;
@@ -3521,6 +3522,7 @@ fn emit_phase(
     tmaps: &std::cell::RefCell<TmapMint>,
     // Heterogeneous prefill lane collector (Apple SoC row split); `None` for decode.
     hetero: Option<&std::cell::RefCell<hetero::ProgCollector>>,
+    channel: Option<&std::cell::RefCell<Vec<plow_asset::hetero_channel::Span>>>,
 ) {
     // The two axes the old `decode` bool used to carry at once. Every former use site below is
     // now one or the other: `decode` for shape, `gemv_family` for kernel family. (Not `gemv` —
@@ -3602,7 +3604,14 @@ fn emit_phase(
         .and_then(|_| hetero::RowSplit::from_env())
         // E-series (per-layer inputs, KV sharing) is not in the ANE lane's layer graph yet.
         .filter(|_| {
-            !gemv_family && tp == 1 && !c.moe && !block_mode && !w8a8 && !mx4 && c.ple == 0 && c.kv_shared == 0
+            !gemv_family
+                && tp == 1
+                && !c.moe
+                && !block_mode
+                && !w8a8
+                && (!mx4 || mx4_pf)
+                && c.ple == 0
+                && c.kv_shared == 0
         });
     let tg = split.map_or(t, |s| s.rows(t).0);
     let rows_g: Vec<u32> = (0..tg.min(n_cu).max(1)).collect();
@@ -5173,6 +5182,7 @@ fn emit_phase(
             cpf
         };
         let (mlp_src, mlp_g) = (n.hn, TENSOR_NONE);
+        let mlp_start = b.n_insts() as u32;
         // GATE|UP AS ONE GEMV WITH A FUSED GLU EPILOGUE -- the fusion every BLAS ships.
         //
         // gate and up read the same x and have the same shape, so one GEMV can compute BOTH
@@ -5336,18 +5346,20 @@ fn emit_phase(
                 w.wg8 != TENSOR_NONE && w.sg != TENSOR_NONE,
                 "mxfp4 prefill GLU has no fp4 twin"
             );
-            b.emit(DevOp::GemmGluMxfp4, all.clone(), &[c_pf], |d| {
+            let cg = b.emit(DevOp::GemmGluMxfp4, all.clone(), &[c_pf], |d| {
                 d.t[0] = n.fu;
                 d.t[1] = mlp_src;
                 d.t[2] = w.wg8;
                 d.t[5] = w.wu8;
                 d.t[3] = w.sg;
                 d.t[4] = w.su;
-                d.i[0] = t;
+                d.i[0] = tg;
                 d.i[1] = inter_l;
                 d.i[2] = c.hidden;
                 d.i[5] = c.mlp_act;
-            })
+            });
+            rec(cg);
+            cg
         } else if gemm_glu && !mx4_pf {
             // Not under mx4_pf: the bf16 gate/up weights are no longer declared, so the shapes the
             // fp4 GLU epilogue does not cover (op 113 is 256x256 only) must take the UNFUSED fp4
@@ -6002,6 +6014,16 @@ fn emit_phase(
             rec(cr);
             cr
         };
+        if let Some(channel) = channel {
+            channel.borrow_mut().push(plow_asset::hetero_channel::Span {
+                layer: l as u32,
+                insts: [mlp_start, b.n_insts() as u32],
+                input: b.tensor_name(mlp_src).into(),
+                residual: b.tensor_name(n.x).into(),
+                intermediate: b.tensor_name(n.fu).into(),
+                down_output: b.tensor_name(n.dg).into(),
+            });
+        }
     }
     // J3: the residual stream is complete on every unit before the final norm reads it.
     if hj && !block_mode {
@@ -6632,6 +6654,7 @@ struct DenseGqaEmitter<'a> {
     /// Heterogeneous prefill (see `hetero.rs`): armed per program by `emit_dense_gqa`, drained after.
     hetero_on: std::cell::Cell<bool>,
     hetero: std::cell::RefCell<hetero::ProgCollector>,
+    channel: std::cell::RefCell<Vec<plow_asset::hetero_channel::Span>>,
 }
 
 impl<'a> DenseGqaEmitter<'a> {
@@ -6718,6 +6741,7 @@ impl<'a> DenseGqaEmitter<'a> {
             }),
             hetero_on: std::cell::Cell::new(false),
             hetero: std::cell::RefCell::new(hetero::ProgCollector::default()),
+            channel: std::cell::RefCell::new(Vec::new()),
         };
         (e, tensors, gen)
     }
@@ -6747,13 +6771,15 @@ impl<'a> DenseGqaEmitter<'a> {
         tensors: &[packet::devbuild::TensorDecl],
         fp8: bool,
     ) -> hetero::HeteroPlan {
+        use plow_asset::hetero::WeightEncoding;
+        let mx4 = mx4_prefill_on();
         let name = |h: u32| tensors[h as usize].name.clone();
         let opt = |h: u32| (h != TENSOR_NONE).then(|| name(h));
         let n = &self.tn;
         let c = self.c;
         let split = hetero::RowSplit::from_env().unwrap_or_default();
         hetero::HeteroPlan {
-            schema: "plow-hetero-v1".into(),
+            schema: plow_asset::hetero::SCHEMA.into(),
             arch: format!("{:?}", c.arch).to_ascii_lowercase(),
             hidden: c.hidden,
             inter: c.inter,
@@ -6762,6 +6788,13 @@ impl<'a> DenseGqaEmitter<'a> {
             eps: c.eps,
             mlp_act: c.mlp_act,
             fp8,
+            weight_encoding: if mx4 {
+                WeightEncoding::Mxfp4
+            } else if fp8 {
+                WeightEncoding::Fp8
+            } else {
+                WeightEncoding::Bf16
+            },
             ane_pct: split.ane_pct,
             cpu_pct: split.cpu_pct,
             tensors: hetero::ActTensors {
@@ -6781,13 +6814,13 @@ impl<'a> DenseGqaEmitter<'a> {
                 .map(|w| hetero::LayerWeights {
                     g_in: name(w.g_in),
                     g_pa: name(w.g_pa),
-                    wq: name(if fp8 { w.wq8 } else { w.wq }),
-                    wk: name(if fp8 { w.wk8 } else { w.wk }),
-                    wv: name(if fp8 { w.wv8 } else { w.wv }),
-                    wo: name(if fp8 { w.wo8 } else { w.wo }),
-                    wg: name(if fp8 { w.wg8 } else { w.wg }),
-                    wu: name(if fp8 { w.wu8 } else { w.wu }),
-                    wd: name(if fp8 { w.wd8 } else { w.wd }),
+                    wq: name(if fp8 || mx4 { w.wq8 } else { w.wq }),
+                    wk: name(if fp8 || mx4 { w.wk8 } else { w.wk }),
+                    wv: name(if fp8 || mx4 { w.wv8 } else { w.wv }),
+                    wo: name(if fp8 || mx4 { w.wo8 } else { w.wo }),
+                    wg: name(if fp8 || mx4 { w.wg8 } else { w.wg }),
+                    wu: name(if fp8 || mx4 { w.wu8 } else { w.wu }),
+                    wd: name(if fp8 || mx4 { w.wd8 } else { w.wd }),
                     sq: opt(w.sq),
                     sk: opt(w.sk),
                     sv: opt(w.sv),
@@ -6824,6 +6857,7 @@ impl DevblobEmitter for DenseGqaEmitter<'_> {
             self.amd,
             &self.tmaps,
             self.hetero_on.get().then_some(&self.hetero),
+            (emit_config::active().ane_mlp_channels.is_some() && t == 128).then_some(&self.channel),
         );
     }
     fn emit_decode(&self, b: &mut Builder, dbatch: u32, dmode: Mode, kv_rows: &mut Vec<u32>) {
@@ -6846,6 +6880,7 @@ impl DevblobEmitter for DenseGqaEmitter<'_> {
             self.block_mode,
             self.amd,
             &self.tmaps,
+            None,
             None,
         );
     }
@@ -6949,6 +6984,19 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
     let capabilities = emit_capabilities(&model_type);
     let mut emit_cfg = _emit_cfg.unwrap_or_else(emit_config::EmitConfig::from_env);
     apply_production_defaults(&mut emit_cfg, capabilities, &arch, tp);
+    if emit_cfg.ane_mlp_channels.is_some() {
+        assert!(
+            arch == "metal3" && tp == 1 && matches!(model_type.as_str(), "llama" | "qwen3"),
+            "channel MLP requires Metal dense Llama/Qwen3 TP1"
+        );
+        assert!(
+            emit_cfg.row_split.is_none()
+                && !emit_cfg.w8a8
+                && !emit_cfg.packed_prefill_on()
+                && block_spec.is_none(),
+            "channel MLP cannot combine row split, packed prefill, W8A8 or block mode"
+        );
+    }
 
     // Installed process-wide so deeply nested emit functions can call emit_config::active().
     emit_config::install(emit_cfg);
@@ -7991,6 +8039,18 @@ fn emit_dense_gqa(
     // drift when the flags are restructured again.
     let ecfg = emit_config::active();
     let fp8 = ecfg.any_fp8_weights();
+    if let Some(channels) = ecfg.ane_mlp_channels {
+        assert!(
+            !c.moe
+                && c.mlp_act == 1
+                && channels > 0
+                && channels < c.inter
+                && channels % 32 == 0
+                && c.hidden % 32 == 0
+                && c.inter % 32 == 0,
+            "channel MLP requires dense SwiGLU and nonempty 32-aligned channel partitions"
+        );
+    }
     // T8 w8a8 (PLOW_W8A8=1, requires PLOW_FP8=1). PREFILL emits the true fp8 tensor-core path:
     // ONE per-row DevOp::QuantFp8 per activation site + GEMM_FP8/GEMM_GLU_FP8 re-pointed at the
     // fp8 activation (t1=xq) + a_scale (t3). The SAME opcodes serve T6 w8a16 (bf16 activation) —
@@ -8238,6 +8298,7 @@ fn emit_dense_gqa(
     let mut progs = Vec::new();
     let mut tlist = Vec::new();
     let mut hetero_progs: Vec<hetero::ProgPlan> = Vec::new();
+    let mut channel_progs = Vec::new();
     for &t in &buckets {
         if c.moe && !moe_pf {
             break;
@@ -8288,6 +8349,15 @@ fn emit_dense_gqa(
         emitter.hetero_on.set(split.is_some());
         emitter.emit_prefill(&mut b, t);
         emitter.hetero_on.set(false);
+        let spans = std::mem::take(&mut *emitter.channel.borrow_mut());
+        if !spans.is_empty() {
+            channel_progs.push(hetero_channel::program(
+                progs.len() as u32,
+                t,
+                c.hidden,
+                spans,
+            ));
+        }
         let coll = std::mem::take(&mut *emitter.hetero.borrow_mut());
         if !coll.segments.is_empty() {
             let (rows_gpu, rows_ane, rows_cpu) = split.unwrap().rows(t);
@@ -8641,7 +8711,20 @@ fn emit_dense_gqa(
     check_group_routing_supported(&m, amd, &arch);
     warn_arch_gpu_vendor_mismatch(&arch, &gpu);
 
+    let channel_plan = ecfg.ane_mlp_channels.map(|channels| {
+        let weights = emitter.hetero_plan(Vec::new(), &m.tensors, fp8);
+        hetero_channel::plan(&m, channels, weights, channel_progs)
+            .unwrap_or_else(|e| panic!("{e}"))
+    });
     std::fs::write(&out, blob).unwrap();
+    if let Some(plan) = channel_plan {
+        let path = std::path::Path::new(&out).with_file_name(plow_asset::hetero::FILE);
+        std::fs::write(&path, serde_json::to_vec_pretty(&plan).unwrap()).unwrap();
+        eprintln!(
+            "  experimental channel MLP plan -> {}; runtime opt-in required (PLOW_ANE_MLP=1)",
+            path.display()
+        );
+    }
 
     // BUILD MANIFEST (`build.json`, beside the .pkt). Derived from `m` — the exact
     // programs just serialized — so it cannot describe a packet other than the one

@@ -11,7 +11,7 @@
 //! per program and segment, the ANE program (one coarse CoreML graph per layer: post-attention
 //! of layer `l` fused with pre-attention of layer `l+1`) and the GPU instructions whose row
 //! range the CPU re-bases onto its block. Weights are named so the runtime builds the ANE
-//! programs from the packet's own tensors (fp8 twins dequantized to fp16).
+//! programs from the packet's own tensors (quantized twins dequantized to fp16).
 
 pub use plow_asset::hetero::{ActTensors, AneLane, HeteroPlan, LayerWeights, ProgPlan, SegPlan};
 
@@ -114,5 +114,74 @@ mod tests {
         assert_eq!(s.rows(16), (8, 8, 0));
         assert!(RowSplit::parse("ane=60,cpu=40").is_err());
         assert!(RowSplit::parse("gpu=100").unwrap().rows(128) == (128, 0, 0));
+    }
+
+    #[test]
+    fn apple_mxfp4_emits_ane_weight_bindings() {
+        use crate::{EmitArgs, WholeGraphFusionDecisions};
+        use plow_asset::hetero::{HeteroPlan, WeightEncoding, SCHEMA};
+        let _env = crate::test_env::env_guard();
+        let _scope = crate::test_env::EnvScope::set(&[
+            ("PLOW_MXFP4", "1"),
+            ("PLOW_ROW_SPLIT", "ane=50,cpu=10"),
+            ("PLOW_MAX_CHUNK", "128"),
+        ]);
+        let dir = std::env::temp_dir().join(format!("plow-apple-mx4-ane-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{
+            "model_type":"qwen3","hidden_size":512,"intermediate_size":1024,
+            "num_hidden_layers":2,"num_attention_heads":8,"head_dim":64,
+            "num_key_value_heads":2,"rms_norm_eps":1e-6,"vocab_size":4096,
+            "rope_theta":1000000.0,"tie_word_embeddings":true
+        }"#,
+        )
+        .unwrap();
+        crate::run(EmitArgs {
+            dir: dir.clone(),
+            ctx: 256,
+            out: dir.join("model.pkt").to_str().unwrap().into(),
+            n_cu: 16,
+            tp: 1,
+            block_spec: None,
+            embed_cubin: None,
+            embed_hsaco: None,
+            rope_gen: true,
+            l2_layout: None,
+            gpu: "m4pro".into(),
+            arch: "metal3".into(),
+            emit_cfg: None,
+            whole_graph_fusions: WholeGraphFusionDecisions::default(),
+        });
+        let plan: HeteroPlan =
+            serde_json::from_slice(&std::fs::read(dir.join("hetero.json")).unwrap()).unwrap();
+        assert_eq!(plan.schema, SCHEMA);
+        assert_eq!(plan.weight_encoding, WeightEncoding::Mxfp4);
+        assert!(!plan.fp8);
+        assert_eq!(plan.layers.len(), 2);
+        for layer in &plan.layers {
+            for (weight, scale) in [
+                (&layer.wq, &layer.sq),
+                (&layer.wk, &layer.sk),
+                (&layer.wv, &layer.sv),
+                (&layer.wo, &layer.so),
+                (&layer.wg, &layer.sg),
+                (&layer.wu, &layer.su),
+                (&layer.wd, &layer.sd),
+            ] {
+                assert!(weight.starts_with("mxfp4/"), "{weight}");
+                assert_eq!(scale.as_deref(), Some(format!("{weight}_scale").as_str()));
+            }
+        }
+        assert!(!plan.programs.is_empty());
+        for program in plan.programs {
+            assert_eq!(
+                (program.rows_gpu, program.rows_ane, program.rows_cpu),
+                (56, 64, 8)
+            );
+            assert!(program.segments.iter().any(|s| s.ane.is_some()));
+            assert!(program.segments.iter().any(|s| !s.cpu_insts.is_empty()));
+        }
     }
 }

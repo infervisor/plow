@@ -20,6 +20,8 @@ pub mod amd_tp;
 /// boundaries of the Metal walk. See `plans/apple-silicon-backend.md` §4.5.
 #[cfg(all(feature = "ane", target_os = "macos"))]
 pub mod ane;
+#[cfg(all(feature = "ane", target_os = "macos"))]
+pub mod ane_mlp;
 /// Apple Silicon GPU engine: the device-ISA interpreter as a Metal kernel over the CPU
 /// engine's unified-memory tensors. See `plans/apple-silicon-backend.md`.
 #[cfg(all(feature = "metal", target_os = "macos"))]

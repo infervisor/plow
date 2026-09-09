@@ -36,6 +36,8 @@ use crate::exec::cpu::ffi::{self, Isa};
 use crate::exec::kvrow::{place_lm_head_row, rebase_chunk_rows};
 use crate::{Result, RuntimeError};
 
+#[cfg(feature = "ane")]
+pub mod channel;
 pub mod hetero;
 
 const MSL: &str = include_str!("../../../../../runtime/apple/interp.metal");
@@ -94,6 +96,13 @@ struct CpuSlot {
     threads: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
+pub struct ExecutionProfile {
+    pub command_buffers: usize,
+    pub gpu_device_ms: f64,
+    pub gpu_wait_ms: f64,
+}
+
 pub struct MetalEngine {
     pub model: CpuModel,
     _device: Retained<ProtocolObject<dyn MTLDevice>>,
@@ -124,6 +133,9 @@ pub struct MetalEngine {
     pub last_cpu: Option<(usize, f64)>,
     /// Compiler-planned heterogeneous prefill (`hetero.json` beside the blob).
     pub hetero: Option<hetero::Hetero>,
+    #[cfg(feature = "ane")]
+    pub channel: Option<channel::Channel>,
+    pub profile: Option<ExecutionProfile>,
 }
 
 // SAFETY: Metal and CoreML objects are thread-safe per Apple's documentation, and the serve
@@ -131,6 +143,9 @@ pub struct MetalEngine {
 unsafe impl Send for MetalEngine {}
 
 impl crate::serve::cpu_serve::SlotEngine for MetalEngine {
+    fn prefill_buckets(&self) -> Vec<(usize, u32)> {
+        MetalEngine::prefill_buckets(self)
+    }
     fn prefill_slot(&mut self, slot: usize, prompt: &[u32]) -> Result<u32> {
         MetalEngine::prefill_slot(self, slot, prompt)
     }
@@ -180,8 +195,20 @@ impl MetalEngine {
         // The default language version follows the SDK the binary was linked against (the nix
         // SDK is older); `atomic_thread_fence` with a device scope needs MSL 3.2.
         opts.setLanguageVersion(MTLLanguageVersion::Version3_2);
+        #[cfg(feature = "ane")]
+        let channel_enabled = crate::config::RuntimeConfig::get().apple.ane_mlp;
+        #[cfg(not(feature = "ane"))]
+        if crate::config::RuntimeConfig::get().apple.ane_mlp {
+            return Err(err("channel MLP", "build with --features ane"));
+        }
+        #[cfg(feature = "ane")]
+        let channel_source = channel_enabled.then(|| format!("{MSL}\n{}", channel::MSL));
+        #[cfg(feature = "ane")]
+        let source = channel_source.as_deref().unwrap_or(MSL);
+        #[cfg(not(feature = "ane"))]
+        let source = MSL;
         let lib = device
-            .newLibraryWithSource_options_error(&NSString::from_str(MSL), Some(&opts))
+            .newLibraryWithSource_options_error(&NSString::from_str(source), Some(&opts))
             .map_err(|e| err("MSL compile", e))?;
         let func = lib
             .newFunctionWithName(&NSString::from_str("plow_interp"))
@@ -195,7 +222,7 @@ impl MetalEngine {
         let pso_single = device
             .newComputePipelineStateWithFunction_error(&func_single)
             .map_err(|e| err("pipeline single", e))?;
-        let serial = std::env::var("PLOW_METAL_SERIAL").map_or(false, |v| v == "1");
+        let serial = crate::config::RuntimeConfig::get().apple.serial;
 
         // Tensors: wrap the host allocations; fall back to a shared copy.
         let n = model.names.len();
@@ -335,13 +362,24 @@ impl MetalEngine {
                     .into(),
             ));
         }
-        Ok(MetalEngine {
+        #[cfg(feature = "ane")]
+        if channel_enabled
+            && (serial || !ane.is_empty() || !cpu_slots.is_empty() || hetero.is_some())
+        {
+            return Err(err(
+                "channel MLP",
+                "cannot combine serial, row, per-op ANE or CPU offload",
+            ));
+        }
+        let mut engine = MetalEngine {
             #[cfg(feature = "ane")]
             ane,
             last_ane: None,
             cpu_slots,
             last_cpu: None,
             hetero,
+            #[cfg(feature = "ane")]
+            channel: None,
             model,
             _device: device,
             queue,
@@ -355,10 +393,24 @@ impl MetalEngine {
             fault,
             progs,
             max_ctx,
-            spin_max: 1 << 26,
+            spin_max: crate::config::RuntimeConfig::get()
+                .apple
+                .spin_max
+                .unwrap_or(1 << 22),
             last_run_us: 0.0,
+            profile: None,
             gpu_name,
-        })
+        };
+        #[cfg(feature = "ane")]
+        if channel_enabled {
+            match objc2::rc::autoreleasepool(|_| channel::Channel::load(&engine, &lib, blob)) {
+                Ok(channel) => engine.channel = Some(channel),
+                Err(e) => {
+                    tracing::warn!(error = %e, "channel MLP load rejected; retaining unsplit GPU")
+                }
+            }
+        }
+        Ok(engine)
     }
 
     pub fn max_ctx(&self) -> usize {
@@ -369,7 +421,7 @@ impl MetalEngine {
     /// all) GEMV-family instructions of the batch-1 decode program. The GPU walk stops after
     /// each such instruction; the two halves run concurrently and join at the boundary.
     fn cpu_slots(model: &CpuModel) -> Result<Vec<CpuSlot>> {
-        let Ok(spec) = std::env::var("PLOW_CPU_SHARE") else {
+        let Some(spec) = &crate::config::RuntimeConfig::get().apple.cpu_share else {
             return Ok(Vec::new());
         };
         if spec.is_empty() || spec == "0" {
@@ -388,11 +440,10 @@ impl MetalEngine {
                 usize::MAX,
             ),
         };
-        let threads = std::env::var("PLOW_CPU_THREADS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(8usize)
-            .max(1);
+        let threads = match crate::config::RuntimeConfig::get().cpu.threads {
+            0 => 8,
+            n => n as usize,
+        };
         let dp = model.decode_prog_for(1);
         let mut out = Vec::new();
         for (i, d) in model.blob.progs[dp].insts.iter().enumerate() {
@@ -492,7 +543,7 @@ impl MetalEngine {
     fn ane_slots(model: &CpuModel) -> Result<Vec<AneSlot>> {
         use crate::exec::ane::{f32_to_f16, AneGemm};
         use packet::dev::TENSOR_NONE16;
-        let Ok(spec) = std::env::var("PLOW_ANE") else {
+        let Some(spec) = &crate::config::RuntimeConfig::get().apple.ane else {
             return Ok(Vec::new());
         };
         if spec.is_empty() || spec == "0" {
@@ -627,18 +678,20 @@ impl MetalEngine {
         let a_row0 = d.i[4] as usize;
         let c_row0 = d.i[5] as usize;
         let (ha, hc) = (d.t[1] as usize, d.t[0] as usize);
+        let a = self.host_ptr(ha);
+        let c = self.host_ptr(hc);
         let slot = &mut self.ane[si];
         let t = slot.gemm.t;
         // SAFETY: quiescent between command buffers; the tensors hold (a_row0 + t) x K and (c_row0 + t) x N.
         unsafe {
-            let a = self.model.tensor(ha).as_ptr().add(a_row0 * k * 2) as *const u16;
+            let a = a.add(a_row0 * k * 2) as *const u16;
             for i in 0..t * k {
                 slot.x[i] = f32::from_bits((std::ptr::read_unaligned(a.add(i)) as u32) << 16);
             }
         }
         slot.gemm.run(&slot.x, &mut slot.y)?;
         unsafe {
-            let c = self.model.tensor(hc).as_ptr().add(c_row0 * n * 2) as *mut u16;
+            let c = c.add(c_row0 * n * 2) as *mut u16;
             for i in 0..t * n {
                 let f = slot.y[i];
                 let u = f.to_bits();
@@ -716,11 +769,18 @@ impl MetalEngine {
             );
             std::ptr::write_bytes(self.fault.contents().as_ptr() as *mut u8, 0, 64);
         }
-        if self
-            .hetero
-            .as_ref()
-            .is_some_and(|h| h.prog_plan(p).is_some())
-        {
+        #[cfg(feature = "ane")]
+        if self.channel.as_ref().is_some_and(|c| c.eligible(p)) {
+            let mut channel = self.channel.take().unwrap();
+            let result = channel.run(self);
+            if result.is_err() {
+                channel.stats.disabled = true;
+            }
+            self.channel = Some(channel);
+            self.last_run_us = t0.elapsed().as_secs_f64() * 1e6;
+            return result;
+        }
+        if self.hetero.as_ref().is_some_and(|h| h.has_active_lanes(p)) {
             self.run_prog_hetero(p)?;
             self.last_run_us = t0.elapsed().as_secs_f64() * 1e6;
             return self.check_fault(p);
@@ -821,6 +881,7 @@ impl MetalEngine {
             }
             let t = Instant::now();
             cb.waitUntilCompleted();
+            self.record_gpu_profile(&cb, t);
             if let Some(h) = self.hetero.as_mut() {
                 h.stats.segs += 1;
                 if sp.is_some() {
@@ -869,7 +930,11 @@ impl MetalEngine {
     /// `[inst_lo, inst_hi)`; waits for completion.
     fn dispatch_range(&mut self, p: usize, inst_lo: u32, inst_hi: u32) -> Result<()> {
         let cb = self.commit_range(p, inst_lo, inst_hi)?;
+        let start = self.profile.map(|_| Instant::now());
         cb.waitUntilCompleted();
+        if let Some(start) = start {
+            self.record_gpu_profile(&cb, start);
+        }
         if cb.status() != MTLCommandBufferStatus::Completed {
             let e = cb.error().map(|e| e.to_string()).unwrap_or_default();
             return Err(RuntimeError::Device(format!(
@@ -878,6 +943,22 @@ impl MetalEngine {
             )));
         }
         Ok(())
+    }
+
+    fn record_gpu_profile(&mut self, cb: &ProtocolObject<dyn MTLCommandBuffer>, start: Instant) {
+        if let Some(profile) = &mut self.profile {
+            profile.command_buffers += 1;
+            profile.gpu_wait_ms += start.elapsed().as_secs_f64() * 1e3;
+            profile.gpu_device_ms += (cb.GPUEndTime() - cb.GPUStartTime()).max(0.0) * 1e3;
+        }
+    }
+
+    pub fn set_profiling(&mut self, enabled: bool) {
+        self.profile = enabled.then_some(ExecutionProfile::default());
+        if let Some(h) = &mut self.hetero {
+            h.profile_enabled = enabled;
+            h.reset_stats();
+        }
     }
 
     /// As [`Self::dispatch_range`] but returns the committed command buffer without waiting, so
@@ -1053,6 +1134,13 @@ impl MetalEngine {
         if ch.prog >= self.model.dec_ix
             || end.is_none_or(|e| e as usize > prompt.len())
             || ch.clen == 0
+            || end.is_some_and(|e| e as usize > self.max_ctx)
+            || self
+                .model
+                .blob
+                .progs
+                .get(ch.prog)
+                .is_some_and(|p| ch.clen > p.t)
         {
             return Err(RuntimeError::Device(format!("bad prefill chunk {ch:?}")));
         }
@@ -1081,6 +1169,10 @@ impl MetalEngine {
         let pg = &mut self.progs[ch.prog];
         pg.insts_host.copy_from_slice(&pristine);
         rebase_chunk_rows(&mut pg.insts_host, &names, ch.c0, ch.clen, t, Some(t));
+        #[cfg(feature = "ane")]
+        if let Some(channel) = &mut self.channel {
+            channel.clen = ch.clen;
+        }
         if let Some(h) = self.hetero.as_mut() {
             h.prepare_chunk(ch.prog, &mut pg.insts_host, &pristine, ch.clen);
         }

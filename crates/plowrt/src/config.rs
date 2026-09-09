@@ -148,6 +148,69 @@ pub struct RuntimeConfig {
     // ──────────────────────────────────────────────────────────────────────────
     #[command(flatten)]
     pub cpu: CpuRuntimeConfig,
+
+    #[command(flatten)]
+    pub apple: AppleRuntimeConfig,
+}
+
+#[derive(Args, Debug, Clone)]
+#[command(next_help_heading = "Apple runtime (experimental)")]
+pub struct AppleRuntimeConfig {
+    /// Select CPU instead of Metal on a Metal-enabled serving build.
+    #[arg(long = "apple-backend", env = "PLOW_BACKEND", global = true)]
+    pub backend: Option<String>,
+    /// Dispatch Metal instructions individually.
+    #[arg(long = "metal-serial", env = "PLOW_METAL_SERIAL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub serial: bool,
+    /// Iterations a threadgroup spins on an unmet dependency before it faults the dispatch.
+    /// This bounds how long a wrong packet can hold the GPU — and on Apple Silicon that GPU
+    /// also draws the display, so the budget is a responsiveness knob, not just a timeout.
+    /// Measured at 120 ns/iteration on an M4 Pro (16 threadgroups), so the default is ~0.5 s;
+    /// raise it only if a legitimately slow producer starts faulting.
+    #[arg(long = "metal-spin-max", env = "PLOW_METAL_SPIN_MAX", global = true)]
+    pub spin_max: Option<u32>,
+    /// CPU decode column share: percent[:instruction count].
+    #[arg(long = "apple-cpu-share", env = "PLOW_CPU_SHARE", global = true)]
+    pub cpu_share: Option<String>,
+    /// Legacy per-instruction ANE selection: count, all, or program:instruction.
+    #[arg(long = "apple-ane", env = "PLOW_ANE", global = true)]
+    pub ane: Option<String>,
+    /// Enable explicit v3 channel-MLP execution. Not a calibrated policy.
+    #[arg(long = "ane-mlp", env = "PLOW_ANE_MLP", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub ane_mlp: bool,
+    /// Offload only the first N planned layers; unset selects all planned layers.
+    #[arg(long = "ane-mlp-layers", env = "PLOW_ANE_MLP_LAYERS", global = true)]
+    pub ane_mlp_layers: Option<usize>,
+    /// Built ane_placement probe required for channel graph admission.
+    #[arg(
+        long = "ane-mlp-placement",
+        env = "PLOW_ANE_MLP_PLACEMENT",
+        global = true
+    )]
+    pub ane_mlp_placement: Option<std::path::PathBuf>,
+    /// Channel compiled-model cache directory.
+    #[arg(long = "ane-mlp-cache", env = "PLOW_ANE_MLP_CACHE", global = true)]
+    pub ane_mlp_cache: Option<std::path::PathBuf>,
+    /// Inject before_submit, after_submit, or after_join channel failure.
+    #[arg(
+        long = "ane-mlp-fail",
+        env = "PLOW_ANE_MLP_FAIL",
+        hide = true,
+        global = true
+    )]
+    pub ane_mlp_fail: Option<String>,
+    /// Quantize legacy row-ANE weights to eight bits.
+    #[arg(long = "ane-w8", env = "PLOW_ANE_W8", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub ane_w8: bool,
+    /// Legacy row-ANE compute units override.
+    #[arg(long = "ane-units", env = "PLOW_ANE_UNITS", global = true)]
+    pub ane_units: Option<String>,
+    /// Legacy row-ANE residual mode; fused keeps the addition in the graph.
+    #[arg(long = "ane-resid", env = "PLOW_ANE_RESID", global = true)]
+    pub ane_resid: Option<String>,
+    /// Enable legacy CoreML output-range diagnostics when present.
+    #[arg(long = "ane-out-range", env = "PLOW_OUT_RANGE", global = true)]
+    pub out_range: Option<String>,
 }
 
 /// Kernel-tier ceiling for the CPU engine (`--cpu-isa`).
@@ -656,7 +719,11 @@ pub struct AmdRuntimeConfig {
     /// route — which means a differing greedy token has two candidate causes at once, the
     /// packing and the reduction order. Pinning the rung holds the packing fixed and moves
     /// only the second.
-    #[arg(long = "amd-token-batch-rows", env = "PLOW_TOKEN_BATCH_ROWS", global = true)]
+    #[arg(
+        long = "amd-token-batch-rows",
+        env = "PLOW_TOKEN_BATCH_ROWS",
+        global = true
+    )]
     pub token_batch_rows: Option<u32>,
 
     /// Unified token batch: admit a step with only ONE participant.
@@ -1061,6 +1128,37 @@ mod tests {
     }
 
     #[test]
+    fn apple_channel_defaults_off_and_has_explicit_cli_overrides() {
+        use clap::{Args, FromArgMatches};
+        let command = super::AppleRuntimeConfig::augment_args(clap::Command::new("test"));
+        let arg = command
+            .get_arguments()
+            .find(|a| a.get_id() == "ane_mlp")
+            .unwrap();
+        assert_eq!(arg.get_default_values(), ["false"]);
+        for (flag, enabled) in [("--ane-mlp", true), ("--ane-mlp=false", false)] {
+            let matches = command
+                .clone()
+                .try_get_matches_from([
+                    "test",
+                    flag,
+                    "--ane-mlp-layers",
+                    "2",
+                    "--ane-mlp-placement",
+                    "/tmp/probe",
+                ])
+                .unwrap();
+            let config = super::AppleRuntimeConfig::from_arg_matches(&matches).unwrap();
+            assert_eq!(config.ane_mlp, enabled);
+            assert_eq!(config.ane_mlp_layers, Some(2));
+            assert_eq!(
+                config.ane_mlp_placement.as_deref(),
+                Some(std::path::Path::new("/tmp/probe"))
+            );
+        }
+    }
+
+    #[test]
     fn live_kv_defaults_off_and_can_be_enabled_without_prefix_reuse() {
         use clap::{Args, FromArgMatches};
         let command = super::NvidiaRuntimeConfig::augment_args(clap::Command::new("test"));
@@ -1238,6 +1336,7 @@ mod tests {
             "pub struct RuntimeConfig {",
             "pub struct NvidiaRuntimeConfig {",
             "pub struct AmdRuntimeConfig {",
+            "pub struct AppleRuntimeConfig {",
         ] {
             let start = me
                 .find(marker)
@@ -1297,7 +1396,9 @@ mod tests {
             let lines: Vec<&str> = text.lines().collect();
             let cut = lines
                 .windows(2)
-                .position(|w| w[0].trim() == "#[cfg(test)]" && w[1].trim_start().starts_with("mod tests"))
+                .position(|w| {
+                    w[0].trim() == "#[cfg(test)]" && w[1].trim_start().starts_with("mod tests")
+                })
                 .unwrap_or(lines.len());
             for (i, line) in lines[..cut].iter().enumerate() {
                 for pat in ["std::env::var(\"", "std::env::var_os(\""] {

@@ -721,33 +721,15 @@ fn main() -> ExitCode {
                 cli.emit_cfg.row_split = Some(spec);
             }
         } else if let Some(spec) = hwspec::registry::lookup(&cli.gpu) {
-            // No split named: take the measured one (`apple_prefill_calibrate`) if this part has
-            // a record. Absent record = GPU-only, exactly as before.
-            // One record per (part, model): a split is measured against one model's layer shapes
-            // and ANE programs, so calibrating another model must not replace it.
+            // Legacy records cannot qualify a dtype/OS/kernel/real-row cell. Until the
+            // row-range policy loader is implemented, only explicit settings enable lanes.
             let slug = spec.name.to_lowercase().replace(' ', "-");
-            let Some(model_slug) = cli.hf_dir.as_deref().map(plowc::hf_config::dir_slug) else {
-                return ExitCode::FAILURE;
-            };
-            let path = std::path::PathBuf::from(format!("tuning/apple-{slug}-{model_slug}-prefill.json"));
-            if let Ok(bytes) = std::fs::read(&path) {
-                let doc: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
-                let ane = doc["chosen"]["ane_pct"].as_u64().unwrap_or(0);
-                let cpu = doc["chosen"]["cpu_pct"].as_u64().unwrap_or(0);
-                // The split was measured for ONE model (its ANE programs are that model's layers);
-                // another checkpoint on the same part stays GPU-only until it is calibrated.
-                let this_model = cli.hf_dir.as_deref().map(plowc::hf_config::dir_slug);
-                let same_model = doc["model"]
-                    .as_str()
-                    .is_some_and(|m| this_model.as_deref() == Some(m.to_lowercase().as_str()));
-                if ane + cpu > 0 && !same_model {
-                    tracing::info!(record = %path.display(), model = ?doc["model"].as_str(), "apple: prefill split record is for another model; GPU-only");
-                }
-                if ane + cpu > 0 && same_model {
-                    let rs = format!("ane={ane},cpu={cpu}");
-                    tracing::info!(record = %path.display(), split = %rs, "apple: calibrated prefill row split");
-                    std::env::set_var("PLOW_ROW_SPLIT", &rs);
-                    cli.emit_cfg.row_split = Some(rs);
+            if let Some(model_slug) = cli.hf_dir.as_deref().map(plowc::hf_config::dir_slug) {
+                let path = std::path::PathBuf::from(format!(
+                    "tuning/apple-{slug}-{model_slug}-prefill.json"
+                ));
+                if path.exists() {
+                    tracing::warn!(record = %path.display(), "apple: unqualified prefill calibration ignored; GPU-only (use --row-split for an explicit experiment)");
                 }
             }
         }

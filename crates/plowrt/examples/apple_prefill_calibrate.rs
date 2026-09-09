@@ -1,12 +1,9 @@
-//! Prefill row-share calibrator (plans/apple-heterogeneous-emit.md §6): emit the model once per
-//! cell of an (ANE %, CPU %) grid through `plowc --row-split`, time a full-bucket prefill on
-//! each, and write the winning split to `tuning/apple-<gpu>-prefill.json`, which `plowc` reads
-//! for an Apple target when no `--row-split`/`--unit-shares` is given. Rule: a split is chosen
-//! only if it beats GPU-only by > 5% AND produces the same first token.
+//! Legacy emit-grid exploration. Reports candidates, never production policy.
+//! Use apple_split_bench for precision identities, counterbalanced runs and quality metrics.
 //!
 //! `cargo run --release --features ane --example apple_prefill_calibrate -- <hf-dir> <fp8-dir>
 //!     [--gpu m4pro] [--plowc target/release/plowc] [--ane 0,25,40,50] [--cpu 0,10] [--reps 5]
-//!     [--work ~/plow-assets/calib] [--keep]`
+//!     --output <new-report.json> [--work ~/plow-assets/calib] [--keep]`
 //! Extra emit knobs come from the environment (e.g. `PLOW_FA_GF_FULL=1` for Llama).
 
 #[cfg(all(feature = "ane", target_os = "macos"))]
@@ -27,10 +24,11 @@ fn main() {
     let mut gpu = String::from("m4pro");
     let mut plowc = PathBuf::from("target/release/plowc");
     let mut ane_grid: Vec<u32> = vec![0, 25, 40, 50];
-    let mut cpu_grid: Vec<u32> = vec![0, 10];
-    let mut reps = 5usize;
+    let mut cpu_grid: Vec<u32> = vec![0];
+    let mut reps = 20usize;
     let mut work = PathBuf::from(std::env::var("HOME").unwrap()).join("plow-assets/calib");
     let mut keep = false;
+    let mut output: Option<PathBuf> = None;
     let list =
         |s: String| -> Vec<u32> { s.split(',').map(|v| v.trim().parse().unwrap()).collect() };
     while let Some(a) = args.next() {
@@ -42,9 +40,22 @@ fn main() {
             "--reps" => reps = args.next().unwrap().parse().unwrap(),
             "--work" => work = args.next().unwrap().into(),
             "--keep" => keep = true,
+            "--output" => output = Some(args.next().unwrap().into()),
             other => panic!("unknown arg {other}"),
         }
     }
+    let output =
+        output.expect("--output <new-report.json> is required; tuning records are not written");
+    assert!(!output.exists(), "output already exists");
+    assert!(reps > 0);
+    assert_eq!(ane_grid.first(), Some(&0), "GPU baseline must run first");
+    assert_eq!(cpu_grid.first(), Some(&0), "GPU baseline must run first");
+    // All generated assets and caches belong to this invocation, including cleanup.
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    work = work.join(format!("run-{}-{nonce}", std::process::id()));
     std::env::set_var("PLOW_FP8_DIR", &fp8);
     let tok = load_tokenizer(&ckpt);
     // A prompt that fills the smallest bucket (128 rows): every lane has real rows.
@@ -70,7 +81,6 @@ fn main() {
                 continue;
             }
             let dir = work.join(format!("ane{ane}-cpu{cpu}"));
-            let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             let mut cmd = std::process::Command::new(&plowc);
             cmd.args(["--hf-dir"])
@@ -111,28 +121,27 @@ fn main() {
                 }
                 let t = Instant::now();
                 let f = eng.prefill(ids).expect("prefill");
-                ms.push(t.elapsed().as_secs_f64() * 1e3);
+                ms.push((
+                    t.elapsed().as_secs_f64() * 1e3,
+                    eng.hetero.as_ref().map(|h| h.stats).unwrap_or_default(),
+                ));
                 assert_eq!(f, first);
             }
-            ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            let med = ms[ms.len() / 2];
-            let (ane_ms, cpu_ms, wait_ms) = eng
-                .hetero
-                .as_ref()
-                .map(|h| (h.stats.ane_ms, h.stats.cpu_ms, h.stats.gpu_wait_ms))
-                .unwrap_or((0.0, 0.0, 0.0));
+            ms.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let (med, stats) = ms[ms.len() / 2];
+            let (ane_ms, cpu_ms, wait_ms) = (stats.ane_ms, stats.cpu_ms, stats.gpu_wait_ms);
             if ane + cpu == 0 {
                 gpu_only = Some((med, first));
             }
             let same = gpu_only.is_none_or(|(_, f)| f == first);
             println!(
                 "ane {ane:>2}% cpu {cpu:>2}%: prefill {med:7.1} ms (min {:.1})  ane {ane_ms:.1} ms  cpu {cpu_ms:.1} ms  gpu-wait {wait_ms:.1} ms  first {first} {:?}{}  [emit {emit_s:.0}s]",
-                ms[0],
+                ms[0].0,
                 tok.decode(&[first]),
                 if same { "" } else { " (DIFFERS from gpu-only)" }
             );
             cells.push(serde_json::json!({
-                "ane_pct": ane, "cpu_pct": cpu, "prefill_ms_median": med, "prefill_ms_min": ms[0],
+                "ane_pct": ane, "cpu_pct": cpu, "prefill_ms_median": med, "prefill_ms_min": ms[0].0,
                 "ane_ms": ane_ms, "cpu_ms": cpu_ms, "gpu_wait_ms": wait_ms, "first_token": first,
                 "same_first_token": same,
             }));
@@ -165,29 +174,32 @@ fn main() {
         })
         .unwrap_or((0, 0));
     println!(
-        "gpu-only {base_ms:.1} ms -> chosen prefill split ane {}% cpu {}%",
+        "gpu-only {base_ms:.1} ms -> exploratory candidate ane {}% cpu {}% (not qualified)",
         chosen.0, chosen.1
     );
     let spec = hwspec::registry::lookup(&gpu).expect("known --gpu");
-    let slug = spec.name.to_lowercase().replace(' ', "-");
     let doc = serde_json::json!({
-        "schema": "apple-prefill-split-v1",
+        "schema": "apple-prefill-exploration-v2",
+        "eligible_for_policy": false,
+        "missing_gates": ["precision identity", "counterbalanced timing", "logit and sequence validation", "placement and memory admission"],
         "gpu": spec.name,
         "model": ckpt.file_name().map(|s| s.to_string_lossy().to_string()),
         "prompt_tokens": ids.len(),
         "rule": "whole-prefill median; split = argmin if it beats gpu-only by > 5% with the same first token, else 0",
         "gpu_only_ms": base_ms,
         "cells": cells,
-        "chosen": {"ane_pct": chosen.0, "cpu_pct": chosen.1},
+        "candidate": {"ane_pct": chosen.0, "cpu_pct": chosen.1},
     });
-    let model_slug = ckpt
-        .file_name()
-        .map(|s| s.to_string_lossy().to_lowercase())
-        .unwrap_or_else(|| "model".into());
-    let path = PathBuf::from(format!("tuning/apple-{slug}-{model_slug}-prefill.json"));
-    std::fs::create_dir_all(path.parent().unwrap()).ok();
-    std::fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).expect("write");
-    println!("wrote {}", path.display());
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&output)
+        .expect("new report");
+    serde_json::to_writer_pretty(file, &doc).expect("write report");
+    println!(
+        "wrote {} (exploration only; no policy selected)",
+        output.display()
+    );
     if !keep {
         let _ = std::fs::remove_dir_all(&ane_cache);
     }

@@ -8,9 +8,11 @@
 //!     [--m 128,512] [--splits gpu100,ane100,cpu100,g50a50,g60a40,g45a45c10,g80c20] [--reps 5]`
 //!
 //! Rooflines (M4 Pro, from the microbenchmarks in this tree): GPU 4.1 TFLOPS matrix peak and
-//! 273 GB/s bus; ANE 4.0 TFLOPS with a ~0.3 ms program call; CPU (NEON, 8 P-cores) 0.5 TFLOPS.
-//! A unit's floor for its rows is max(FLOP / peak, weight bytes / bus); the split's floor is the
-//! slowest unit's floor (they run in parallel); "ideal" is the whole GEMM at the summed peaks.
+//! 255 GB/s measured shared bus; ANE 4.0 TFLOPS with a ~0.3 ms program call; CPU (NEON,
+//! 8 P-cores) 0.5 TFLOPS. These empirical envelopes are not hardware peaks. The model takes
+//! the maximum of the per-unit compute times and SUMMED traffic over the shared bus. ANE
+//! reads fp16 weights even for a quantized GPU model. "pooled" excludes call overhead and
+//! assumes perfect balancing across only the active units. CPU timing includes its ANE join.
 
 #[cfg(all(feature = "ane", target_os = "macos"))]
 fn main() {
@@ -29,7 +31,7 @@ fn main() {
     const ANE_TFLOPS: f64 = 4.0;
     const ANE_CALL_MS: f64 = 0.3;
     const CPU_TFLOPS: f64 = 0.5;
-    const BUS_GBS: f64 = 273.0;
+    const BUS_GBS: f64 = 255.0;
 
     let mut args = std::env::args().skip(1);
     let blob: PathBuf = args.next().expect("usage: <model.pkt> <ckpt>").into();
@@ -47,7 +49,14 @@ fn main() {
     let mut reps = 5usize;
     while let Some(a) = args.next() {
         match a.as_str() {
-            "--m" => ms_list = args.next().unwrap().split(',').map(|v| v.parse().unwrap()).collect(),
+            "--m" => {
+                ms_list = args
+                    .next()
+                    .unwrap()
+                    .split(',')
+                    .map(|v| v.parse().unwrap())
+                    .collect()
+            }
             "--reps" => reps = args.next().unwrap().parse().unwrap(),
             "--splits" => {
                 splits = args
@@ -75,9 +84,15 @@ fn main() {
                                     num.clear();
                                 }
                                 cur = ch;
-                                if s.starts_with("gpu") { cur = 'g'; }
-                                if s.starts_with("ane") { cur = 'a'; }
-                                if s.starts_with("cpu") { cur = 'c'; }
+                                if s.starts_with("gpu") {
+                                    cur = 'g';
+                                }
+                                if s.starts_with("ane") {
+                                    cur = 'a';
+                                }
+                                if s.starts_with("cpu") {
+                                    cur = 'c';
+                                }
                             }
                         }
                         (g, a, c)
@@ -87,6 +102,8 @@ fn main() {
             other => panic!("unknown arg {other}"),
         }
     }
+    assert!(reps > 0 && splits.iter().all(|&(g, a, c)| g + a + c == 100));
+    assert!(ms_list.iter().all(|&m| m > 0));
     let mut gpu = MetalEngine::load(&blob, &ckpt).expect("metal load");
     ffi::init(Isa::Amx).expect("cpu kernels");
     let n_t = gpu.model.names.len();
@@ -97,6 +114,11 @@ fn main() {
     for p in 0..gpu.model.dec_ix {
         for (i, d) in gpu.insts_host(p).iter().enumerate() {
             if matches!(d.op, 33 | 34 | 35) {
+                assert_eq!(
+                    d.t[3],
+                    packet::dev::TENSOR_NONE16,
+                    "use w8a16, not w8a8, for this benchmark"
+                );
                 shapes.entry((d.i[1], d.i[2])).or_insert((*d, p, i));
             }
         }
@@ -132,14 +154,31 @@ fn main() {
             }
         })
         .collect();
-    let ane_dir = std::env::temp_dir().join("plow-hetero-gemm-bench");
-    let _ = std::fs::remove_dir_all(&ane_dir);
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let ane_dir = std::env::temp_dir().join(format!(
+        "plow-hetero-gemm-bench-{}-{nonce}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&ane_dir).expect("private benchmark cache");
     let mut nets: HashMap<(u32, u32, u32), AneNet> = HashMap::new();
     let threads = 8usize;
     let round8 = |v: u32| v / 8 * 8;
     println!(
         "{:<11} {:>4} {:>12} {:>8} {:>7} {:>7} {:>7} {:>8} {:>8} {:>6}  {}",
-        "shape N.K", "M", "split g/a/c", "total ms", "gpu ms", "ane ms", "cpu ms", "floor ms", "ideal ms", "eff%", "check"
+        "shape N.K",
+        "M",
+        "split g/a/c",
+        "total ms",
+        "gpu ms",
+        "ane ms",
+        "cpu join",
+        "model ms",
+        "pooled ms",
+        "ratio%",
+        "check"
     );
     for ((nn, k), (d0, p, i)) in &shapes {
         let (nn, k) = (*nn, *k);
@@ -151,7 +190,8 @@ fn main() {
         let w16: Vec<u16> = (0..(nn * k) as usize)
             .map(|e| {
                 let n = e / k as usize;
-                let s = f32::from_le_bytes([sb[4 * n], sb[4 * n + 1], sb[4 * n + 2], sb[4 * n + 3]]);
+                let s =
+                    f32::from_le_bytes([sb[4 * n], sb[4 * n + 1], sb[4 * n + 2], sb[4 * n + 3]]);
                 f32_to_f16(lut[wb[e] as usize] * s)
             })
             .collect();
@@ -175,7 +215,11 @@ fn main() {
                 let (mut ra, mut rc) = (round8(m * pa / 100), round8(m * pc / 100));
                 if pg == 0 && pa + pc > 0 {
                     // No GPU rows: give the rounding remainder to the first non-GPU unit.
-                    if pa > 0 { ra = m - rc; } else { rc = m; }
+                    if pa > 0 {
+                        ra = m - rc;
+                    } else {
+                        rc = m;
+                    }
                 }
                 let rg = m - ra - rc;
                 let (row_a, row_c) = (rg, rg + ra);
@@ -198,8 +242,21 @@ fn main() {
                         }],
                     };
                     let io = (spec.inputs.clone(), spec.outputs.clone());
-                    let net = AneNet::new(&ane_dir, &format!("ip-{nn}x{k}-t{ra}{}", if plowrt::exec::apple::hetero::ane_w8() { "-w8" } else { "" }), move || spec, io, MLComputeUnits::CPUAndNeuralEngine)
-                        .expect("ane program");
+                    let net = AneNet::new(
+                        &ane_dir,
+                        &format!(
+                            "ip-{nn}x{k}-t{ra}{}",
+                            if plowrt::exec::apple::hetero::ane_w8() {
+                                "-w8"
+                            } else {
+                                ""
+                            }
+                        ),
+                        move || spec,
+                        io,
+                        MLComputeUnits::CPUAndNeuralEngine,
+                    )
+                    .expect("ane program");
                     nets.insert((nn, k, ra), net);
                 }
                 // Clear the output rows so a unit that did nothing is caught by the check.
@@ -209,7 +266,8 @@ fn main() {
                     unsafe { std::ptr::write_bytes(cp, 0, (m * nn) as usize) };
                 }
                 let mut best = f64::INFINITY;
-                let (mut t_gpu, mut t_ane, mut t_cpu) = (0.0f64, 0.0f64, 0.0f64);
+                let (mut t_gpu, mut t_ane) = (0.0f64, 0.0f64);
+                let mut best_units = (0.0, 0.0, 0.0);
                 let mut xin = vec![0f32; (ra * k) as usize];
                 let mut yout = vec![0f32; (ra * nn) as usize];
                 for _ in 0..reps {
@@ -223,7 +281,6 @@ fn main() {
                     } else {
                         None
                     };
-                    let tg0 = Instant::now();
                     // CPU rows [row_c, m): NEON fp8 GEMM on `threads` scoped threads.
                     let tc = Instant::now();
                     let cpu_ms = if rc > 0 {
@@ -235,8 +292,10 @@ fn main() {
                         let a_h = d.t[1] as usize;
                         // SAFETY: row offsets inside the tensors.
                         unsafe {
-                            table[c_h] = (table[c_h] as *mut u8).add((row_c * nn * 2) as usize) as *mut c_void;
-                            table[a_h] = (table[a_h] as *mut u8).add((row_c * k * 2) as usize) as *mut c_void;
+                            table[c_h] = (table[c_h] as *mut u8).add((row_c * nn * 2) as usize)
+                                as *mut c_void;
+                            table[a_h] = (table[a_h] as *mut u8).add((row_c * k * 2) as usize)
+                                as *mut c_void;
                         }
                         let f = ffi::kernel(33).expect("cpu fp8 gemm");
                         let tp = table.as_ptr() as usize;
@@ -250,7 +309,15 @@ fn main() {
                                     ctx.scratch_bytes = scratch_bytes as u32;
                                     let _ = ffi::thread_init(&mut ctx);
                                     // SAFETY: disjoint tiles of one op on rows no other unit writes.
-                                    unsafe { f(&d, w as u32, threads as u32, tp as *const *mut c_void, &mut ctx) };
+                                    unsafe {
+                                        f(
+                                            &d,
+                                            w as u32,
+                                            threads as u32,
+                                            tp as *const *mut c_void,
+                                            &mut ctx,
+                                        )
+                                    };
                                 });
                             }
                             // ANE rows [row_a, row_c) on this thread while the CPU threads run.
@@ -260,11 +327,14 @@ fn main() {
                                 // SAFETY: rows [row_a, row_a+ra) of A.
                                 unsafe {
                                     for e in 0..(ra * k) as usize {
-                                        xin[e] = f32::from_bits((*ap.add((row_a * k) as usize + e) as u32) << 16);
+                                        xin[e] = f32::from_bits(
+                                            (*ap.add((row_a * k) as usize + e) as u32) << 16,
+                                        );
                                     }
                                 }
                                 let net = nets.get_mut(&(nn, k, ra)).unwrap();
-                                net.run(ra as usize, &[&xin], &mut [&mut yout]).expect("ane run");
+                                net.run(ra as usize, &[&xin], &mut [&mut yout])
+                                    .expect("ane run");
                                 let cp = gpu.host_ptr(d0.t[0] as usize) as *mut u16;
                                 // SAFETY: rows [row_a, row_a+ra) of C.
                                 unsafe {
@@ -272,7 +342,8 @@ fn main() {
                                         let v = yout[e];
                                         let x = v.to_bits();
                                         let r = 0x7fff + ((x >> 16) & 1);
-                                        *cp.add((row_a * nn) as usize + e) = (x.wrapping_add(r) >> 16) as u16;
+                                        *cp.add((row_a * nn) as usize + e) =
+                                            (x.wrapping_add(r) >> 16) as u16;
                                     }
                                 }
                                 t_ane = ta.elapsed().as_secs_f64() * 1e3;
@@ -286,18 +357,22 @@ fn main() {
                             // SAFETY: as above.
                             unsafe {
                                 for e in 0..(ra * k) as usize {
-                                    xin[e] = f32::from_bits((*ap.add((row_a * k) as usize + e) as u32) << 16);
+                                    xin[e] = f32::from_bits(
+                                        (*ap.add((row_a * k) as usize + e) as u32) << 16,
+                                    );
                                 }
                             }
                             let net = nets.get_mut(&(nn, k, ra)).unwrap();
-                            net.run(ra as usize, &[&xin], &mut [&mut yout]).expect("ane run");
+                            net.run(ra as usize, &[&xin], &mut [&mut yout])
+                                .expect("ane run");
                             let cp = gpu.host_ptr(d0.t[0] as usize) as *mut u16;
                             // SAFETY: as above.
                             unsafe {
                                 for e in 0..(ra * nn) as usize {
                                     let x = yout[e].to_bits();
                                     let r = 0x7fff + ((x >> 16) & 1);
-                                    *cp.add((row_a * nn) as usize + e) = (x.wrapping_add(r) >> 16) as u16;
+                                    *cp.add((row_a * nn) as usize + e) =
+                                        (x.wrapping_add(r) >> 16) as u16;
                                 }
                             }
                             t_ane = ta.elapsed().as_secs_f64() * 1e3;
@@ -306,17 +381,24 @@ fn main() {
                     };
                     if let Some(cb) = cb {
                         cb.waitUntilCompleted();
+                        t_gpu = (cb.GPUEndTime() - cb.GPUStartTime()) * 1e3;
                     }
-                    t_gpu = if rg > 0 { tg0.elapsed().as_secs_f64() * 1e3 } else { 0.0 };
-                    t_cpu = cpu_ms;
-                    best = best.min(t0.elapsed().as_secs_f64() * 1e3);
+                    let elapsed = t0.elapsed().as_secs_f64() * 1e3;
+                    if elapsed < best {
+                        best = elapsed;
+                        best_units = (t_gpu, t_ane, cpu_ms);
+                    }
                 }
                 // Check against the GPU-only reference.
                 let cnow = gpu.tensor_bytes(d0.t[0] as usize);
                 let (mut bad, mut worst) = (0usize, 0f32);
                 for e in 0..(m * nn) as usize {
-                    let x = f32::from_bits((u16::from_le_bytes([cnow[2 * e], cnow[2 * e + 1]]) as u32) << 16);
-                    let y = f32::from_bits((u16::from_le_bytes([cref[2 * e], cref[2 * e + 1]]) as u32) << 16);
+                    let x = f32::from_bits(
+                        (u16::from_le_bytes([cnow[2 * e], cnow[2 * e + 1]]) as u32) << 16,
+                    );
+                    let y = f32::from_bits(
+                        (u16::from_le_bytes([cref[2 * e], cref[2 * e + 1]]) as u32) << 16,
+                    );
                     let dif = (x - y).abs();
                     if !(dif <= 2e-2 * y.abs() + 2e-2) {
                         bad += 1;
@@ -331,28 +413,37 @@ fn main() {
                     } else {
                         let f = 2.0 * rows as f64 * nn as f64 * k as f64;
                         let compute = f / (peak * 1e9);
-                        let bw = wbytes / (BUS_GBS * 1e6);
-                        compute.max(bw) + fixed
+                        compute + fixed
                     }
                 };
+                let traffic = if rg > 0 { wbytes } else { 0.0 }
+                    + if ra > 0 { 2.0 * wbytes } else { 0.0 }
+                    + if rc > 0 { wbytes } else { 0.0 }
+                    + 2.0 * m as f64 * (nn + k) as f64;
+                let bus_ms = traffic / (BUS_GBS * 1e6);
                 let floor = floor_unit(rg, GPU_TFLOPS, 0.0)
                     .max(floor_unit(ra, ANE_TFLOPS, ANE_CALL_MS))
-                    .max(floor_unit(rc, CPU_TFLOPS, 0.0));
-                let ideal = flops / ((GPU_TFLOPS + ANE_TFLOPS + CPU_TFLOPS) * 1e9);
+                    .max(floor_unit(rc, CPU_TFLOPS, 0.0))
+                    .max(bus_ms);
+                let active_peak = if rg > 0 { GPU_TFLOPS } else { 0.0 }
+                    + if ra > 0 { ANE_TFLOPS } else { 0.0 }
+                    + if rc > 0 { CPU_TFLOPS } else { 0.0 };
+                let ideal = (flops / (active_peak * 1e9)).max(bus_ms);
                 println!(
                     "{:<11} {:>4} {:>12} {:>8.3} {:>7.2} {:>7.2} {:>7.2} {:>8.3} {:>8.3} {:>5.0}%  {}",
                     format!("{nn}.{k}"),
                     m,
                     format!("{pg}/{pa}/{pc}"),
                     best,
-                    t_gpu,
-                    t_ane,
-                    t_cpu,
+                    best_units.0,
+                    best_units.1,
+                    best_units.2,
                     floor,
                     ideal,
                     100.0 * floor / best,
                     if bad == 0 { format!("ok {worst:.3}") } else { format!("{bad} OFF {worst:.3}") }
                 );
+                assert_eq!(bad, 0, "split output differs from GPU reference");
             }
             gpu.insts_host_mut(*p)[*i] = *d0;
         }

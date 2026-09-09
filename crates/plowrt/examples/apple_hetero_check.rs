@@ -42,8 +42,7 @@ fn main() {
         let first = eng.prefill(&ids).expect("prefill");
         let h = eng.model.wk.logits.expect("act.logits");
         let bytes = eng.tensor_bytes(h);
-        let vocab = eng.model.names.len(); // placeholder, replaced below
-        let _ = vocab;
+        let bytes = &bytes[..bytes.len() / eng.model.batch];
         // bf16 unless the tensor is exactly vocab*4 wide — read as bf16 (the dense path's lm_head).
         let v: Vec<f32> = bytes
             .chunks_exact(2)
@@ -60,6 +59,7 @@ fn main() {
         let first = cpu.prefill(&ids).expect("cpu prefill");
         let h = cpu.model().wk.logits.expect("act.logits");
         let bytes = unsafe { cpu.model().tensor(h).as_slice() };
+        let bytes = &bytes[..bytes.len() / cpu.model().batch];
         let v: Vec<f32> = bytes
             .chunks_exact(2)
             .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))

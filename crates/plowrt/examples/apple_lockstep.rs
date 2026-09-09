@@ -60,8 +60,11 @@ fn main() {
 
     let outs_of = |op: u16| -> Vec<usize> {
         match op {
-            11 => vec![0, 1, 5],
-            12 => vec![0, 1],
+            11 | 39 => vec![0, 1, 5],
+            12 | 38 => vec![0, 1],
+            37 => vec![0, 6],
+            32 => vec![0, 1, 2],
+            1 => vec![0, 3, 4],
             22 => vec![0, 3, 5],
             21 | 23 => vec![0, 1],
             84 => vec![0, 2, 3, 4],
@@ -86,16 +89,18 @@ fn main() {
         let insts: Vec<DevInst64> = gpu.insts_host(p).to_vec();
         println!("== {label}: program {p}, {} instructions", insts.len());
         if time_only {
-            // GPU time per op class, one dispatch per instruction (includes per-dispatch overhead
-            // of ~0.1 ms; a persistent run has none of that, so read this as relative weight).
+            use objc2_metal::MTLCommandBuffer;
+            // Device timestamps exclude host dispatch/wait. Standalone dispatches still differ
+            // from the persistent interpreter's cache state and inter-packet synchronization.
             let mut by_op: std::collections::BTreeMap<u16, (usize, f64)> =
                 std::collections::BTreeMap::new();
             let t_all = std::time::Instant::now();
             let mut each: Vec<(f64, usize)> = Vec::with_capacity(insts.len());
             for (i, d) in insts.iter().enumerate() {
-                let t = std::time::Instant::now();
-                gpu.run_inst(p, i).expect("run_inst");
-                let ms = t.elapsed().as_secs_f64() * 1e3;
+                let cb = gpu.run_inst_async(p, i).expect("run_inst");
+                cb.waitUntilCompleted();
+                let ms = (cb.GPUEndTime() - cb.GPUStartTime()) * 1e3;
+                assert!(ms.is_finite() && ms > 0.0, "missing GPU timestamps");
                 each.push((ms, i));
                 let e = by_op.entry(d.op).or_default();
                 e.0 += 1;
@@ -113,7 +118,8 @@ fn main() {
                     &d.t[..4]
                 );
             }
-            let total = t_all.elapsed().as_secs_f64() * 1e3;
+            let wall = t_all.elapsed().as_secs_f64() * 1e3;
+            let total: f64 = by_op.values().map(|(_, ms)| ms).sum();
             let mut rows: Vec<_> = by_op.into_iter().collect();
             rows.sort_by(|a, b| b.1 .1.partial_cmp(&a.1 .1).unwrap());
             println!("  {:<24} {:>6} {:>10} {:>7}", "op", "insts", "ms", "%");
@@ -124,7 +130,7 @@ fn main() {
                     100.0 * ms / total
                 );
             }
-            println!("  total {total:.1} ms (serial dispatch)");
+            println!("  total {total:.1} ms device; {wall:.1} ms wall (serial dispatch)");
             return;
         }
         let mut bad_ops = 0;
@@ -152,6 +158,7 @@ fn main() {
                 }
             } else {
                 println!("  inst {i:4} {op:<24}: no CPU kernel");
+                bad_ops += 1;
             }
             // GPU
             if let Err(e) = gpu.run_inst(p, i) {
@@ -165,7 +172,12 @@ fn main() {
                 let c = &tmp[j].1;
                 let name = &gpu.model.names[h];
                 let (vg, vc, kind) = match d.op {
-                    11 | 12 if k < 2 => (f32s(g), f32s(c), "f32"),
+                    11 | 12 | 38 | 39 if k < 2 => (f32s(g), f32s(c), "f32"),
+                    1 if k == 4 => (f32s(g), f32s(c), "f32"),
+                    32 if k == 2 => (f32s(g), f32s(c), "f32"),
+                    37 if k == 6 => (f32s(g), f32s(c), "f32"),
+                    1 if k == 3 => (Vec::new(), Vec::new(), "raw"),
+                    32 | 37 if k == 0 => (Vec::new(), Vec::new(), "raw"),
                     // MoE: f32 partials; the route table is {u32 eid, f32 gate} (an eid
                     // mismatch shows as a huge diff); align outputs are integer/f32 exact.
                     83 | 151 | 153 => (f32s(g), f32s(c), "f32"),
@@ -206,6 +218,7 @@ fn main() {
             }
         }
         println!("== {label}: {bad_ops} mismatching outputs");
+        assert_eq!(bad_ops, 0, "{label} lockstep failed");
     };
 
     let buckets = gpu.prefill_buckets();

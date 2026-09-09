@@ -814,6 +814,10 @@ impl Builder {
         self.tensors.len()
     }
 
+    pub fn n_insts(&self) -> usize {
+        self.ops.len()
+    }
+
     /// The declared name of handle `h`.
     pub fn tensor_name(&self, h: u32) -> &str {
         &self.tensors[h as usize].name
