@@ -11544,7 +11544,7 @@ impl AmdEngine {
     fn report_packed_prefill_route(&self, hsaco_dir: &Path) {
         let cfg = crate::config::RuntimeConfig::get();
         let route = cfg.amd.packed_prefill_route;
-        let pf_batch = cfg.nv.pf_batch;
+        let pf_batch = cfg.pf_batch;
         if !route && !pf_batch {
             return;
         }

@@ -2614,7 +2614,7 @@ impl GpuEngine {
                 )
             });
         let prefix_requested = config.nv_vmm_prefix() == Some(true) || prefix_layout.is_some();
-        let packed_prefix = prefix_requested && config.nv.pf_batch;
+        let packed_prefix = prefix_requested && config.pf_batch;
         if packed_prefix && (prefix_layout.is_none() || packed_prefill_metadata.is_none()) {
             return Err(RuntimeError::Rejected(
                 "packed prefix reuse requires compiled packed-prefill metadata and a valid VMM layout"
@@ -3458,7 +3458,7 @@ impl GpuEngine {
         let t_decode = std::time::Instant::now();
         let decode_t0 = load_tim.as_ref().map(|t| t.ms_since_t0()).unwrap_or(0.0);
         let sys_decode = std::time::SystemTime::now();
-        let pf_batch_env = crate::config::RuntimeConfig::get().nv.pf_batch;
+        let pf_batch_env = crate::config::RuntimeConfig::get().pf_batch;
         let pf_max_t_blob = blob
             .prefill_progs()
             .iter()
@@ -4540,7 +4540,7 @@ impl GpuEngine {
         if requested == Some(false)
             || (requested.is_none()
                 && (capability != (9, 0)
-                    || config.nv.pf_batch
+                    || config.pf_batch
                     || config.nv_vmm_live()
                     || config.nv_vmm_live_rings()
                     || config.nv.prefix_cache
@@ -8149,7 +8149,7 @@ mod prefill_patch_tests {
     fn packed_segmented_block_matches_serialized() -> Result<()> {
         assert_eq!(std::env::var("TEST_PACKED_PREFILL_GPU").as_deref(), Ok("1"));
         let config = crate::config::RuntimeConfig::get();
-        assert!(!config.nv.pf_batch);
+        assert!(!config.pf_batch);
         assert_ne!(config.nv_vmm_prefix(), Some(true));
         let assets = std::path::PathBuf::from(std::env::var("TEST_PACKED_PREFILL_ASSETS").unwrap());
         let bytes = std::fs::read(assets.join("model.pkt")).unwrap();
@@ -8580,16 +8580,16 @@ mod prefix_selection_tests {
         cfg.nv.vmm_live = false;
         cfg.nv.vmm_live_rings = false;
         cfg.nv.prefix_cache = false;
-        cfg.nv.pf_batch = false;
+        cfg.pf_batch = false;
         let selected = |blob: &DevBlob, cfg: &RuntimeConfig, cc, gran| {
             GpuEngine::select_vmm_prefix_layout(blob, &dir, cfg, cc, gran).is_some()
         };
         assert!(selected(&blob, &cfg, (9, 0), 2 << 20));
         assert!(!selected(&blob, &cfg, (12, 0), 2 << 20));
         assert!(!selected(&blob, &cfg, (9, 0), 16 << 20));
-        cfg.nv.pf_batch = true;
+        cfg.pf_batch = true;
         assert!(!selected(&blob, &cfg, (9, 0), 2 << 20));
-        cfg.nv.pf_batch = false;
+        cfg.pf_batch = false;
         cfg.nv.vmm_live = true;
         assert!(!selected(&blob, &cfg, (9, 0), 2 << 20));
         assert!(cfg.nv_live_kv_enabled(true, true, false));

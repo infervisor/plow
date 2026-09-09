@@ -32,10 +32,10 @@ fn env_zero_and_one_mean_false_and_true() {
     );
     assert_eq!(c.kv_pool_mib, 256);
     assert_eq!(c.nv.pf_seg_pure.as_deref(), Some("fp8"));
-    assert_eq!(c.nv.pf_chunk, 4096);
-    assert_eq!(c.nv.pf_chunk_rows(), 4096);
-    assert_eq!(c.nv.pf_interleave, 1024);
-    assert!(c.nv.pf_defer_decode);
-    assert!(c.nv.pf_batch);
+    assert_eq!(c.pf_chunk, 4096);
+    assert_eq!(c.pf_chunk_rows(), 4096);
+    assert_eq!(c.pf_interleave, 1024);
+    assert!(c.pf_defer_decode);
+    assert!(c.pf_batch);
     assert!(!c.amd.tp_prefill_segment_major);
 }

@@ -2093,8 +2093,8 @@ fn run_one_tick(
             // `--pf-no-interleave` / `PLOW_PF_NO_INTERLEAVE=1` restores the old
             // prefill-only tick.
             let mut did_prefill = false;
-            let nv = &crate::config::RuntimeConfig::get().nv;
-            let no_interleave = nv.pf_no_interleave;
+            let rt = crate::config::RuntimeConfig::get();
+            let no_interleave = rt.pf_no_interleave;
             let decode_rows = slots[..b.min(slots.len())]
                 .iter()
                 .filter(|slot| slot.as_ref().is_some_and(|slot| slot.step > 0))
@@ -2103,10 +2103,10 @@ fn run_one_tick(
             let tick_max = amd_prefill_tick_cap(
                 has_decode || co_scheduled,
                 no_interleave && !co_scheduled,
-                nv.pf_defer_decode && !co_scheduled,
-                nv.pf_interleave,
+                rt.pf_defer_decode && !co_scheduled,
+                rt.pf_interleave,
             );
-            if nv.pf_batch
+            if rt.pf_batch
                 && slots[..b.min(slots.len())]
                     .iter()
                     .flatten()
@@ -2144,7 +2144,7 @@ fn run_one_tick(
                     .enumerate()
                     .take(b)
                     .filter_map(|(i, slot)| {
-                        if no_interleave || nv.pf_defer_decode {
+                        if no_interleave || rt.pf_defer_decode {
                             return None;
                         }
                         let slot = slot.as_ref()?;
@@ -2224,7 +2224,7 @@ fn run_one_tick(
             //  * A member may consume its prompt to the end. `token_batch_prefill_rows` does
             //    not hold the last token back, and the sampled ids for prompts that finish
             //    here follow the decode feeds in `output`.
-            if !no_interleave && !nv.pf_defer_decode && e.token_batch_rows(1, 1).is_some() {
+            if !no_interleave && !rt.pf_defer_decode && e.token_batch_rows(1, 1).is_some() {
                 let feeds: Vec<(usize, u32)> = slots
                     .iter()
                     .enumerate()
@@ -2272,7 +2272,7 @@ fn run_one_tick(
                         continue;
                     }
                     let pack =
-                        amd_mixed_prefill_pack(list, capacity, nv.pf_batch, e.prefill_turn(), b);
+                        amd_mixed_prefill_pack(list, capacity, rt.pf_batch, e.prefill_turn(), b);
                     if pack.len() != take {
                         continue;
                     }
@@ -2443,7 +2443,7 @@ fn run_one_tick(
             }
             if has_decode
                 && !no_interleave
-                && !nv.pf_defer_decode
+                && !rt.pf_defer_decode
                 && e.mixed_step_rows(decode_rows, 1).is_some()
             {
                 let mut candidates: Vec<_> = slots
@@ -2470,7 +2470,7 @@ fn run_one_tick(
                     let pack = amd_mixed_prefill_pack(
                         candidates,
                         capacity,
-                        nv.pf_batch,
+                        rt.pf_batch,
                         e.prefill_turn(),
                         b,
                     );
@@ -2578,11 +2578,11 @@ fn run_one_tick(
                     let slot = slots[i].as_ref()?;
                     (slot.step == 0 && !slot.respond.is_closed()).then_some((i, slot.arrived))
                 }),
-                nv.pf_batch,
+                rt.pf_batch,
                 e.prefill_turn(),
                 b.min(slots.len()),
             );
-            if nv.pf_batch {
+            if rt.pf_batch {
                 let packed = amd_prefill_pack(
                     (0..b.min(slots.len())).filter_map(|i| {
                         slots[i]
@@ -2697,14 +2697,14 @@ fn run_one_tick(
                 let prefill_remains = slots[..b.min(slots.len())]
                     .iter()
                     .any(|s| s.as_ref().is_some_and(|s| s.step == 0));
-                if amd_defer_decode(nv.pf_defer_decode, prefill_remains) {
+                if amd_defer_decode(rt.pf_defer_decode, prefill_remains) {
                     tracing::debug!("amd: decode deferred while prefill remains");
                     return (slots, bufs, obs, tokens_this_tick, true, tick_fault, None);
                 }
             }
             let pending = amd_prefill_isolated_fallback(isolated, did_prefill);
             if let Some(i) = pending {
-                if nv.pf_batch {
+                if rt.pf_batch {
                     e.advance_prefill_turn(i);
                 }
                 // AMD prefill and decode share scratch and run sequentially.
@@ -2775,7 +2775,7 @@ fn run_one_tick(
                 let prefill_remains = slots[..b.min(slots.len())]
                     .iter()
                     .any(|s| s.as_ref().is_some_and(|s| s.step == 0));
-                if amd_defer_decode(nv.pf_defer_decode, prefill_remains) {
+                if amd_defer_decode(rt.pf_defer_decode, prefill_remains) {
                     tracing::debug!("amd: decode deferred while prefill remains");
                     return (slots, bufs, obs, tokens_this_tick, true, tick_fault, None);
                 }
@@ -3147,10 +3147,10 @@ fn predicted_wait_ms(live: usize, capacity: usize, service_ms: f64) -> f64 {
 /// The serve-layer interleave bound: max prefill-chunk rows per tick while
 /// other slots are mid-decode. `PLOW_PF_INTERLEAVE` overrides (rows; `0` =
 /// whole prompt in one tick, the pre-interleave behavior). Read once.
-/// Reads `RuntimeConfig::get().nv.pf_interleave_rows()`.
+/// Reads `RuntimeConfig::get().pf_interleave_rows()`.
 #[cfg(feature = "cuda")]
 fn pf_interleave_rows() -> usize {
-    crate::config::RuntimeConfig::get().nv.pf_interleave_rows()
+    crate::config::RuntimeConfig::get().pf_interleave_rows()
 }
 
 /// Prompt rows one model may consume while holding its device turn, when there
@@ -3199,7 +3199,7 @@ fn co_sched_prefill_rows(bucket: usize, interleave: usize) -> usize {
 /// serving default.
 #[cfg(feature = "cuda")]
 fn pf_defer_decode() -> bool {
-    crate::config::RuntimeConfig::get().nv.pf_defer_decode
+    crate::config::RuntimeConfig::get().pf_defer_decode
 }
 
 #[cfg(feature = "cuda")]
@@ -3341,10 +3341,10 @@ fn amd_prefill_isolated_fallback(isolated: Option<usize>, packed: bool) -> Optio
 /// a launch, never any request's tokens). Read once. Default `0` (off) — this
 /// is opt-in alongside `PLOW_PF_BATCH=1`, matching the rest of the PX-1 knobs.
 /// Unset and `0` both mean uncapped, so the default IS the zero sentinel.
-/// Reads `RuntimeConfig::get().nv.pf_chunk_rows()`.
+/// Reads `RuntimeConfig::get().pf_chunk_rows()`.
 #[cfg(feature = "cuda")]
 fn pf_chunk_rows() -> usize {
-    crate::config::RuntimeConfig::get().nv.pf_chunk_rows()
+    crate::config::RuntimeConfig::get().pf_chunk_rows()
 }
 
 /// Pack waiting prompt rows under the prefill quantum. Compact terminal outputs

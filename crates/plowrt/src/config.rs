@@ -73,6 +73,43 @@ pub struct RuntimeConfig {
     #[arg(long = "token-batch", env = "PLOW_TOKEN_BATCH", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub token_batch: bool,
 
+    /// Cross-request prefill scheduling. CUDA packs chunks into one launch. AMD packs only
+    /// exact-capability programs; unsupported programs retain fair isolated scheduling.
+    #[arg(long = "pf-batch", env = "PLOW_PF_BATCH", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub pf_batch: bool,
+
+    /// Chunked prefill quantum — rows admitted per tick before decode runs.
+    /// 0 = uncapped.
+    #[arg(
+        long = "pf-interleave",
+        env = "PLOW_PF_INTERLEAVE",
+        default_value_t = 2048,
+        global = true
+    )]
+    pub pf_interleave: u32,
+
+    /// Per-request prefill chunk-row cap. 0 = off.
+    #[arg(
+        long = "pf-chunk",
+        env = "PLOW_PF_CHUNK",
+        default_value_t = 0,
+        global = true
+    )]
+    pub pf_chunk: u32,
+
+    /// Disable chunked prefill (whole-prompt-per-tick).
+    #[arg(long = "pf-no-chunk", env = "PLOW_PF_NO_CHUNK", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub pf_no_chunk: bool,
+
+    /// Disable prefill/decode interleave (prefill-only tick).
+    #[arg(long = "pf-no-interleave", env = "PLOW_PF_NO_INTERLEAVE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub pf_no_interleave: bool,
+
+    /// Throughput mode: run prefill chains to completion, skip decode until all
+    /// prompts are resident. Trades streaming latency for aggregate tok/s.
+    #[arg(long = "pf-defer-decode", env = "PLOW_PF_DEFER_DECODE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub pf_defer_decode: bool,
+
     /// Override whether freed slabs remain in the process reuse pool.
     #[arg(long = "rt-slab-keep", env = "PLOW_SLAB_KEEP", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub slab_keep: Option<bool>,
@@ -366,43 +403,6 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "nv-upload-direct", env = "PLOW_UPLOAD_DIRECT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub upload_direct: bool,
 
-    /// Cross-request prefill scheduling. CUDA packs chunks into one launch. AMD packs only
-    /// exact-capability programs; unsupported programs retain fair isolated scheduling.
-    #[arg(long = "pf-batch", env = "PLOW_PF_BATCH", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub pf_batch: bool,
-
-    /// Chunked prefill quantum — rows admitted per tick before decode runs.
-    /// 0 = uncapped.
-    #[arg(
-        long = "pf-interleave",
-        env = "PLOW_PF_INTERLEAVE",
-        default_value_t = 2048,
-        global = true
-    )]
-    pub pf_interleave: u32,
-
-    /// Per-request prefill chunk-row cap. 0 = off.
-    #[arg(
-        long = "pf-chunk",
-        env = "PLOW_PF_CHUNK",
-        default_value_t = 0,
-        global = true
-    )]
-    pub pf_chunk: u32,
-
-    /// Disable chunked prefill (whole-prompt-per-tick).
-    #[arg(long = "pf-no-chunk", env = "PLOW_PF_NO_CHUNK", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub pf_no_chunk: bool,
-
-    /// Disable prefill/decode interleave (prefill-only tick).
-    #[arg(long = "pf-no-interleave", env = "PLOW_PF_NO_INTERLEAVE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub pf_no_interleave: bool,
-
-    /// Throughput mode: run prefill chains to completion, skip decode until all
-    /// prompts are resident. Trades streaming latency for aggregate tok/s.
-    #[arg(long = "pf-defer-decode", env = "PLOW_PF_DEFER_DECODE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub pf_defer_decode: bool,
-
     /// TP-only prefix cache.
     #[arg(long = "prefix-cache", env = "PLOW_PREFIX_CACHE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub prefix_cache: bool,
@@ -545,7 +545,7 @@ pub struct NvidiaRuntimeConfig {
     pub pf_seg_eqsmem: bool,
 }
 
-impl NvidiaRuntimeConfig {
+impl RuntimeConfig {
     /// Prefill interleave rows with "zero = unbounded" semantics.
     /// 0 → `usize::MAX` (no bound), else the configured value.
     pub fn pf_interleave_rows(&self) -> usize {
@@ -1296,10 +1296,10 @@ mod tests {
             .expect("KDA family route argument");
         assert_eq!(arg.get_default_values(), ["true"]);
 
-        // `--pf-batch` is the mux half and lives on the other config struct; it is off by
+        // `--pf-batch` is the shared mux half; it is off by
         // default too, so neither flag alone can start a co-packed dispatch.
-        let nv = super::NvidiaRuntimeConfig::augment_args(clap::Command::new("test"));
-        let arg = nv
+        let shared = super::RuntimeConfig::augment_args(clap::Command::new("test"));
+        let arg = shared
             .get_arguments()
             .find(|arg| arg.get_id() == "pf_batch")
             .expect("pf-batch argument");

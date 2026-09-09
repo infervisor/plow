@@ -885,10 +885,10 @@ mod amd_serve {
                 batch,
                 decode_rungs = ?decode_rungs,
                 decode_only = !has_prefill,
-                pf_batch = crate::config::RuntimeConfig::get().nv.pf_batch,
-                pf_chunk = crate::config::RuntimeConfig::get().nv.pf_chunk,
-                pf_interleave = crate::config::RuntimeConfig::get().nv.pf_interleave,
-                pf_defer_decode = crate::config::RuntimeConfig::get().nv.pf_defer_decode,
+                pf_batch = crate::config::RuntimeConfig::get().pf_batch,
+                pf_chunk = crate::config::RuntimeConfig::get().pf_chunk,
+                pf_interleave = crate::config::RuntimeConfig::get().pf_interleave,
+                pf_defer_decode = crate::config::RuntimeConfig::get().pf_defer_decode,
                 stop_ids = ?stop_ids,
                 "AMD serve engine ready"
             );
@@ -910,8 +910,8 @@ mod amd_serve {
                 cached_prompt: vec![Vec::new(); batch],
                 snap_at: vec![0; batch],
                 pf: (0..batch).map(|_| None).collect(),
-                chunk_prefill: !crate::config::RuntimeConfig::get().nv.pf_no_chunk,
-                prefill_chunk_rows: match crate::config::RuntimeConfig::get().nv.pf_chunk {
+                chunk_prefill: !crate::config::RuntimeConfig::get().pf_no_chunk,
+                prefill_chunk_rows: match crate::config::RuntimeConfig::get().pf_chunk {
                     0 => u32::MAX,
                     rows => rows,
                 },
