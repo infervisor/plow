@@ -8,6 +8,29 @@
 //! counts ticks, not tokens, kernel segments, or elapsed time. Round-robin also
 //! bounds cold prefill work so an entire prompt cannot hide inside one tick.
 //! The default quantum of four amortizes CUDA shared-memory carveout changes.
+//!
+//! # Why there is nothing to overlap
+//!
+//! Free is not "parallel" and Rr is not "serializing something that was
+//! concurrent". On CUDA the interpreter grid is `occupancy × sm_count` — the
+//! whole device — and `cuLaunchCooperativeKernel` is
+//! all-blocks-co-resident-or-fail, so a second model's grid is admitted only
+//! once the first VACATES. Two co-resident models never execute at the same
+//! time whatever the host does.
+//!
+//! What co-tenancy buys is therefore (a) no switch cost, and (b) a device that
+//! changes hands at every launch boundary instead of every model switch.
+//! Segmented dispatch is what makes (b) fine-grained: each segment is its own
+//! admission point, so the window a co-tenant can be blocked for is one segment
+//! rather than one prompt — and it is why bounding a tick's prefill work
+//! matters at all. Free leaves the choice of who goes next to the backend; Rr
+//! makes it FIFO, which costs nothing in overlap (there was none) and buys a
+//! starvation bound and an order that repeats run to run.
+//!
+//! The quantum is not 1 for a measured reason: two models with different
+//! dynamic shared-memory requests force an SM carveout reconfiguration on every
+//! alternation (~150-300 us, `exec/gpu.rs`). Several consecutive ticks amortise
+//! that; too many is Free with extra steps.
 
 use std::sync::Arc;
 

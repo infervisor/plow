@@ -1670,7 +1670,7 @@ fn run_one_tick(
                 // decoders live, stop once a request becomes ready for decode,
                 // unless the caller explicitly defers decode.
                 let cap_rows = if co_scheduled {
-                    e.pf_max_rows().max(1).min(pf_interleave_rows())
+                    co_sched_prefill_rows(e.pf_max_rows(), pf_interleave_rows())
                 } else if feeds.is_empty() {
                     usize::MAX
                 } else {
@@ -3147,6 +3147,34 @@ fn pf_interleave_rows() -> usize {
     crate::config::RuntimeConfig::get().nv.pf_interleave_rows()
 }
 
+/// Prompt rows one model may consume while holding its device turn, when there
+/// is no prefill object and the prompt is fed token by token. A bound on
+/// launches per turn rather than on a bucket's rows: ~256 decode-shaped
+/// launches is a turn hold in the low milliseconds, which is the same order as
+/// the quantum's worth of decode ticks it is competing with.
+#[cfg(feature = "cuda")]
+const CO_SCHED_DECODE_ONLY_ROWS: usize = 256;
+
+/// Prompt rows to consume in one co-scheduled tick.
+///
+/// `bucket` is `GpuEngine::pf_max_rows()`, which is 0 EXACTLY when the engine
+/// has no prefill object — and that is also the only case where the caller
+/// feeds the prompt token by token. Flooring the whole expression at 1 (the
+/// obvious reading) therefore made every such prompt advance ONE token per
+/// tick under `--co-sched rr`, each with a full turn acquire/release: a 4k
+/// prompt became 4096 ticks. `pf_interleave_rows()` is no help on its own
+/// either — it is `usize::MAX` when interleaving is unbounded, which would put
+/// the entire prompt back inside one turn.
+#[cfg(feature = "cuda")]
+fn co_sched_prefill_rows(bucket: usize, interleave: usize) -> usize {
+    if bucket == 0 {
+        interleave.min(CO_SCHED_DECODE_ONLY_ROWS)
+    } else {
+        bucket.min(interleave)
+    }
+    .max(1)
+}
+
 /// PX-17 throughput mode: with `--pf-defer-decode` /
 /// `PLOW_PF_DEFER_DECODE=1`, a tick that still has
 /// ANY slot mid-prefill runs its prefill chain to completion and skips the
@@ -3861,6 +3889,24 @@ mod tests {
             super::earliest_stop_cut("abcSTOPdef", 5, 5, &stops),
             Some(0)
         );
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn co_scheduled_prefill_rows_never_collapse_to_one_token() {
+        // No prefill object (`pf_max_rows() == 0`) with interleaving unbounded:
+        // the bound has to come from the decode-only cap, not from 1.
+        assert_eq!(
+            super::co_sched_prefill_rows(0, usize::MAX),
+            super::CO_SCHED_DECODE_ONLY_ROWS
+        );
+        // A tighter interleave setting still wins.
+        assert_eq!(super::co_sched_prefill_rows(0, 32), 32);
+        // With a prefill object, one bucket's rows, capped by interleave.
+        assert_eq!(super::co_sched_prefill_rows(8192, usize::MAX), 8192);
+        assert_eq!(super::co_sched_prefill_rows(8192, 512), 512);
+        // Never zero: the caller uses this as a chunk width.
+        assert_eq!(super::co_sched_prefill_rows(0, 0), 1);
     }
 
     /// A held prefix that turns out not to begin a match is released, not dropped.

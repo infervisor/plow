@@ -2865,7 +2865,18 @@ async fn bringup_runtime(
     #[cfg(feature = "hsa")]
     if vendor == Some(hwspec::Vendor::Amd) {
         let slugs: Vec<String> = state.registry.slugs();
-        if slugs.len() > 1 && cfg.co_sched != plowrt::serve::cosched::CoSched::Rr {
+        // Count the bundles that will actually reach the AMD engine. The loop
+        // below skips any without a PLOWDEV blob, so counting every registered
+        // slug refused a serve that pairs one AMD bundle with a CPU-reference
+        // one — two models registered, but only ever one on the agent.
+        let mut co_resident = 0usize;
+        for slug in &slugs {
+            let bundle = state.registry.get(slug)?;
+            if plowrt::asset::devblob::DevBlob::find_in_dir(&bundle.dir)?.is_some() {
+                co_resident += 1;
+            }
+        }
+        if co_resident > 1 && cfg.co_sched != plowrt::serve::cosched::CoSched::Rr {
             return Err("AMD co-resident models require --co-sched rr; separate HSA queues do not guarantee whole-grid residency".into());
         }
         for slug in slugs {
