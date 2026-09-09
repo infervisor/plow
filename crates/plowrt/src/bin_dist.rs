@@ -13,6 +13,20 @@ use plowrt::dist::{self, prepare, pull, reference, store::Store, Reference};
 
 type Err = Box<dyn std::error::Error>;
 
+/// Print a distribution failure and exit non-zero.
+///
+/// Returning the error from `main` would render it through `Debug`, which wraps
+/// it in `Dist("…")` and escapes every newline — and the most important thing
+/// these commands print on failure is the multi-line table of variants and why
+/// each one was rejected. That has to arrive as text a person can read.
+pub fn report(r: Result<(), Err>) -> Result<(), Err> {
+    if let Err(e) = r {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
 fn store() -> Result<Store, Err> {
     Ok(Store::open_default()?)
 }
@@ -77,7 +91,7 @@ pub fn cmd_pull(model: &str, c: plow_asset::dist::Constraints, dry_run: bool) ->
         return Ok(());
     }
     let (dir, t) = pull::pull(&st, &*f, &resolved)?;
-    st.pin(&r.ref_path(), &v.variant_id)?;
+    st.pin(&r.pin_key(), &v.variant_id)?;
     println!("transferred: {t}");
     println!("bundle: {}", dir.display());
     Ok(())
@@ -144,7 +158,7 @@ pub fn cmd_load(
     }
 
     let farm = prepare::build(st.root(), &resolved.bundle, &dir, &ckpt)?;
-    st.pin(&r.ref_path(), &v.variant_id)?;
+    st.pin(&r.pin_key(), &v.variant_id)?;
     println!(
         "checkpoint: {} ({} shards{})",
         farm.dir.display(),
@@ -205,10 +219,10 @@ pub fn cmd_ls(upgradable: bool) -> Result<(), Err> {
         return Ok(());
     }
     let live = upgradable.then(live);
-    for (ref_path, variant_id) in pins {
-        print!("{ref_path}  {variant_id}");
+    for (reference, variant_id) in pins {
+        print!("{reference}  {variant_id}");
         if let Some(live) = &live {
-            match check_newer(&ref_path, variant_id.as_str(), live) {
+            match check_newer(&reference, variant_id.as_str(), live) {
                 Ok(Some((label, gen, t))) => {
                     print!("  → {label}@g{gen} available, {} to fetch", pull::human(t))
                 }
@@ -222,11 +236,11 @@ pub fn cmd_ls(upgradable: bool) -> Result<(), Err> {
 }
 
 fn check_newer(
-    ref_path: &str,
+    reference: &str,
     pinned: &str,
     live: &plow_asset::dist::LiveTarget,
 ) -> Result<Option<(String, u32, u64)>, Err> {
-    let r = parse(ref_path)?;
+    let r = parse(reference)?;
     let f = dist::transport(&r.registry)?;
     let resolved = pull::resolve(&*f, &r, live, Default::default())?;
     if resolved.variant.variant_id == pinned {
@@ -243,7 +257,7 @@ fn check_newer(
 pub fn cmd_upgrade(model: Option<&str>, all: bool, dry_run: bool) -> Result<(), Err> {
     let st = store()?;
     let targets: Vec<String> = match (model, all) {
-        (Some(m), false) => vec![parse(m)?.ref_path()],
+        (Some(m), false) => vec![parse(m)?.pin_key()],
         (None, true) => st.pins().into_iter().map(|(k, _)| k).collect(),
         _ => return Err("give a model reference, or --all".into()),
     };
@@ -252,19 +266,19 @@ pub fn cmd_upgrade(model: Option<&str>, all: bool, dry_run: bool) -> Result<(), 
         return Ok(());
     }
     let live = live();
-    for ref_path in targets {
-        let r = parse(&ref_path)?;
+    for pin in targets {
+        let r = parse(&pin)?;
         let f = dist::transport(&r.registry)?;
         let resolved = pull::resolve(&*f, &r, &live, Default::default())?;
-        let pinned = st.pinned(&ref_path);
+        let pinned = st.pinned(&pin);
         if pinned.as_deref() == Some(resolved.variant.variant_id.as_str()) {
-            println!("{ref_path}: current at g{}", resolved.variant.generation);
+            println!("{pin}: current at g{}", resolved.variant.generation);
             continue;
         }
         let plan = resolved.plan(&st)?;
         if dry_run {
             println!(
-                "{ref_path}: g{} available, would transfer {}",
+                "{pin}: g{} available, would transfer {}",
                 resolved.variant.generation,
                 pull::human(plan.fetched_bytes)
             );
@@ -273,8 +287,8 @@ pub fn cmd_upgrade(model: Option<&str>, all: bool, dry_run: bool) -> Result<(), 
         let (_, t) = pull::pull(&st, &*f, &resolved)?;
         // The pin moves only after every blob is present and verified, so an
         // interrupted upgrade leaves the previous generation servable.
-        st.pin(&ref_path, &resolved.variant.variant_id)?;
-        println!("{ref_path}: → g{} ({t})", resolved.variant.generation);
+        st.pin(&pin, &resolved.variant.variant_id)?;
+        println!("{pin}: → g{} ({t})", resolved.variant.generation);
     }
     Ok(())
 }
@@ -297,10 +311,10 @@ pub fn cmd_prepare(model: &str, checkpoint: Option<PathBuf>) -> Result<(), Err> 
 pub fn cmd_rm(model: &str, gc: bool) -> Result<(), Err> {
     let r = parse(model)?;
     let st = store()?;
-    let Some(variant_id) = st.pinned(&r.ref_path()) else {
+    let Some(variant_id) = st.pinned(&r.pin_key()) else {
         return Err(format!("{r} is not pinned").into());
     };
-    st.unpin(&r.ref_path())?;
+    st.unpin(&r.pin_key())?;
     let bundle = st.root().join("bundles").join(&variant_id);
     let _ = std::fs::remove_dir_all(&bundle);
     println!("unpinned {r}");
@@ -318,7 +332,7 @@ pub fn cmd_rm(model: &str, gc: bool) -> Result<(), Err> {
 pub fn resolve_local(model: &str) -> Result<PathBuf, Err> {
     let r = parse(model)?;
     let st = store()?;
-    let variant_id = st.pinned(&r.ref_path()).ok_or_else(|| {
+    let variant_id = st.pinned(&r.pin_key()).ok_or_else(|| {
         format!("{r} has not been pulled on this machine — run `plowrt load {model}` first")
     })?;
     let dir = st.root().join("bundles").join(&variant_id);

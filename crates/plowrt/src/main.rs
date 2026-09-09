@@ -442,7 +442,13 @@ enum Cmd {
     // ── asset distribution ────────────────────────────────────────────────
     /// Fetch a model's assets into the local store. Contacts no server.
     Pull {
-        /// `[<registry>/]<namespace>/<name>[:<label>][@g<n>]`, or a bare name.
+        /// The model to act on.
+        ///
+        /// `[<registry>/]<namespace>/<name>[:<label>][@g<n>]`. A bare name takes
+        /// the default namespace and `--registry`, so `kimi-k3` means
+        /// `infervisor/kimi-k3`. Omit the label to let the probe choose the
+        /// variant this machine can run; give one to pin it, and `@g<n>` to pin
+        /// a specific generation.
         model: String,
         #[command(flatten)]
         pick: SelectArgs,
@@ -456,6 +462,13 @@ enum Cmd {
     /// Picks the variant this machine can run, fetches what is missing, joins
     /// it to the checkpoint, and prints the `serve` line.
     Load {
+        /// The model to act on.
+        ///
+        /// `[<registry>/]<namespace>/<name>[:<label>][@g<n>]`. A bare name takes
+        /// the default namespace and `--registry`, so `kimi-k3` means
+        /// `infervisor/kimi-k3`. Omit the label to let the probe choose the
+        /// variant this machine can run; give one to pin it, and `@g<n>` to pin
+        /// a specific generation.
         model: String,
         #[command(flatten)]
         pick: SelectArgs,
@@ -470,7 +483,16 @@ enum Cmd {
     },
 
     /// Every published variant of a model, and which ones this machine can run.
-    Show { model: String },
+    Show {
+        /// The model to act on.
+        ///
+        /// `[<registry>/]<namespace>/<name>[:<label>][@g<n>]`. A bare name takes
+        /// the default namespace and `--registry`, so `kimi-k3` means
+        /// `infervisor/kimi-k3`. Omit the label to let the probe choose the
+        /// variant this machine can run; give one to pin it, and `@g<n>` to pin
+        /// a specific generation.
+        model: String,
+    },
 
     /// What is in the local store.
     Ls {
@@ -481,7 +503,10 @@ enum Cmd {
 
     /// Move a pin to the newest compatible generation.
     Upgrade {
-        /// Omit with `--all`.
+        /// The model to upgrade. Omit with `--all`.
+        ///
+        /// Same grammar as `load`; a label or generation here would defeat the
+        /// point, since upgrading means moving to the newest compatible build.
         model: Option<String>,
         #[arg(long, default_value_t = false)]
         all: bool,
@@ -491,6 +516,13 @@ enum Cmd {
 
     /// Build the checkpoint farm for an already-pulled model.
     Prepare {
+        /// The model to act on.
+        ///
+        /// `[<registry>/]<namespace>/<name>[:<label>][@g<n>]`. A bare name takes
+        /// the default namespace and `--registry`, so `kimi-k3` means
+        /// `infervisor/kimi-k3`. Omit the label to let the probe choose the
+        /// variant this machine can run; give one to pin it, and `@g<n>` to pin
+        /// a specific generation.
         model: String,
         #[arg(long)]
         checkpoint: Option<PathBuf>,
@@ -498,6 +530,13 @@ enum Cmd {
 
     /// Drop a pin, and optionally collect blobs nothing references any more.
     Rm {
+        /// The model to act on.
+        ///
+        /// `[<registry>/]<namespace>/<name>[:<label>][@g<n>]`. A bare name takes
+        /// the default namespace and `--registry`, so `kimi-k3` means
+        /// `infervisor/kimi-k3`. Omit the label to let the probe choose the
+        /// variant this machine can run; give one to pin it, and `@g<n>` to pin
+        /// a specific generation.
         model: String,
         #[arg(long, default_value_t = false)]
         gc: bool,
@@ -703,22 +742,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             model,
             pick,
             dry_run,
-        } => dist_cmd::cmd_pull(&model, pick.constraints(), dry_run),
+        } => dist_cmd::report(dist_cmd::cmd_pull(&model, pick.constraints(), dry_run)),
         Cmd::Load {
             model,
             pick,
             checkpoint,
             fetch_weights,
-        } => dist_cmd::cmd_load(&model, pick.constraints(), checkpoint, fetch_weights),
-        Cmd::Show { model } => dist_cmd::cmd_show(&model),
-        Cmd::Ls { upgradable } => dist_cmd::cmd_ls(upgradable),
+        } => dist_cmd::report(dist_cmd::cmd_load(
+            &model,
+            pick.constraints(),
+            checkpoint,
+            fetch_weights,
+        )),
+        Cmd::Show { model } => dist_cmd::report(dist_cmd::cmd_show(&model)),
+        Cmd::Ls { upgradable } => dist_cmd::report(dist_cmd::cmd_ls(upgradable)),
         Cmd::Upgrade {
             model,
             all,
             dry_run,
-        } => dist_cmd::cmd_upgrade(model.as_deref(), all, dry_run),
-        Cmd::Prepare { model, checkpoint } => dist_cmd::cmd_prepare(&model, checkpoint),
-        Cmd::Rm { model, gc } => dist_cmd::cmd_rm(&model, gc),
+        } => dist_cmd::report(dist_cmd::cmd_upgrade(model.as_deref(), all, dry_run)),
+        Cmd::Prepare { model, checkpoint } => {
+            dist_cmd::report(dist_cmd::cmd_prepare(&model, checkpoint))
+        }
+        Cmd::Rm { model, gc } => dist_cmd::report(dist_cmd::cmd_rm(&model, gc)),
         #[cfg(feature = "hsa")]
         Cmd::AmdBench {
             blob,

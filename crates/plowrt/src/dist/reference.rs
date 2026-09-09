@@ -38,8 +38,13 @@ impl Reference {
         )
     }
 
-    /// Where this reference's pin lives in the local store.
-    pub fn ref_path(&self) -> String {
+    /// The canonical reference a pin is recorded under: registry, namespace and
+    /// name, with no label or generation.
+    ///
+    /// The registry is part of the key because two registries may publish the
+    /// same name. The label is not: a pin records WHICH variant was chosen, and
+    /// that is the variant id it points at.
+    pub fn pin_key(&self) -> String {
         format!("{}/{}/{}", self.registry, self.namespace, self.name)
     }
 }
@@ -241,6 +246,6 @@ mod tests {
         // Two registries may publish the same name; their pins must not collide.
         let a = parse("kimi-k3").unwrap();
         let b = parse("mirror.internal/infervisor/kimi-k3").unwrap();
-        assert_ne!(a.ref_path(), b.ref_path());
+        assert_ne!(a.pin_key(), b.pin_key());
     }
 }

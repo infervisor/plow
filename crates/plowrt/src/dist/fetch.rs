@@ -81,15 +81,15 @@ impl Fetch for HttpFetch {
             Ok(resp) => {
                 let mut buf = Vec::new();
                 std::io::Read::read_to_end(&mut resp.into_reader(), &mut buf)
-                    .map_err(|e| RuntimeError::Device(format!("{url}: body read failed: {e}")))?;
+                    .map_err(|e| RuntimeError::Dist(format!("{url}: body read failed: {e}")))?;
                 Ok(Some(buf))
             }
             Err(ureq::Error::Status(404, _)) => Ok(None),
-            Err(ureq::Error::Status(code, resp)) => Err(RuntimeError::Device(format!(
+            Err(ureq::Error::Status(code, resp)) => Err(RuntimeError::Dist(format!(
                 "{url}: HTTP {code} {}",
                 resp.status_text()
             ))),
-            Err(e) => Err(RuntimeError::Device(format!("{url}: {e}"))),
+            Err(e) => Err(RuntimeError::Dist(format!("{url}: {e}"))),
         }
     }
 
@@ -121,7 +121,7 @@ pub fn transport(registry: &str) -> Result<Box<dyn Fetch>> {
     }
     #[cfg(not(feature = "dist"))]
     {
-        Err(RuntimeError::Device(format!(
+        Err(RuntimeError::Dist(format!(
             "cannot reach {registry}: this plowrt was built without the `dist` feature, so it has \
              no HTTP client. Serving reads only the local store; use a `file://` registry, or \
              fetch with a plowrt built with `--features dist`."
@@ -142,7 +142,7 @@ pub fn blob(f: &dyn Fetch, digest: &super::Digest) -> Result<Vec<u8>> {
     }
     match f.get(&plain)? {
         Some(b) => Ok(b),
-        None => Err(RuntimeError::Device(format!(
+        None => Err(RuntimeError::Dist(format!(
             "{}: blob {digest} is not published (tried {zst} and {plain})",
             f.describe()
         ))),
@@ -152,12 +152,12 @@ pub fn blob(f: &dyn Fetch, digest: &super::Digest) -> Result<Vec<u8>> {
 #[cfg(feature = "dist")]
 fn decompress(compressed: &[u8], digest: &super::Digest) -> Result<Vec<u8>> {
     zstd::stream::decode_all(compressed)
-        .map_err(|e| RuntimeError::Device(format!("blob {digest}: zstd stream is damaged: {e}")))
+        .map_err(|e| RuntimeError::Dist(format!("blob {digest}: zstd stream is damaged: {e}")))
 }
 
 #[cfg(not(feature = "dist"))]
 fn decompress(_compressed: &[u8], digest: &super::Digest) -> Result<Vec<u8>> {
-    Err(RuntimeError::Device(format!(
+    Err(RuntimeError::Dist(format!(
         "blob {digest} is published zstd-compressed, but this plowrt was built without the \
          `dist` feature and cannot decompress it"
     )))

@@ -96,17 +96,36 @@ def git_is_clean(repo: Path) -> bool:
 _ARM_RE = re.compile(r"\b(plow_[A-Za-z0-9_]+)\b")
 
 
-def readelf_bin() -> str:
-    for env in ("PLOW_READELF", "PLOW_K3_READELF"):
-        v = os.environ.get(env)
-        if v and shutil.which(v):
-            return v
+# Set once from the command line, so the tool a producer used is an explicit
+# argument rather than something read from the ambient environment at an
+# arbitrary depth. `nix develop` exports PLOW_READELF, which is what
+# `build_gfx942.sh` itself requires, so that is the default — but it is a
+# DEFAULT, visible in `--help`, not a hidden lookup.
+_READELF: str | None = None
+
+
+def set_readelf(path: str | None) -> None:
+    global _READELF
+    _READELF = path
+
+
+def default_readelf() -> str | None:
+    """What `--readelf` defaults to: the toolchain's, then anything on PATH."""
+    v = os.environ.get("PLOW_READELF")
+    if v and shutil.which(v):
+        return v
     for cand in ("llvm-readelf", "readelf"):
         if shutil.which(cand):
             return cand
+    return None
+
+
+def readelf_bin() -> str:
+    if _READELF and shutil.which(_READELF):
+        return _READELF
     die(
-        "no readelf found. Run inside `nix develop`, which sets PLOW_READELF to "
-        "the toolchain's llvm-readelf."
+        "no readelf available. Pass --readelf <path>, or run inside `nix develop`, "
+        "which exports PLOW_READELF pointing at the toolchain's llvm-readelf."
     )
 
 

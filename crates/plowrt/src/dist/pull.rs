@@ -111,19 +111,19 @@ impl Resolved {
 
 fn parse_json<T: serde::de::DeserializeOwned>(what: &str, bytes: &[u8]) -> Result<T> {
     serde_json::from_slice(bytes)
-        .map_err(|e| RuntimeError::Device(format!("{what}: not valid JSON for this schema: {e}")))
+        .map_err(|e| RuntimeError::Dist(format!("{what}: not valid JSON for this schema: {e}")))
 }
 
 fn require(f: &dyn Fetch, path: &str) -> Result<Vec<u8>> {
     f.get(path)?
-        .ok_or_else(|| RuntimeError::Device(format!("{}: {path} is not published", f.describe())))
+        .ok_or_else(|| RuntimeError::Dist(format!("{}: {path} is not published", f.describe())))
 }
 
 /// Fetch a model's variant index.
 pub fn index(f: &dyn Fetch, r: &Reference) -> Result<ModelIndex> {
     let raw = require(f, &r.index_path())?;
     let idx: ModelIndex = parse_json("index.json", &raw)?;
-    idx.validate().map_err(RuntimeError::Device)?;
+    idx.validate().map_err(RuntimeError::Dist)?;
     Ok(idx)
 }
 
@@ -138,8 +138,8 @@ pub fn resolve(
     extra: Constraints,
 ) -> Result<Resolved> {
     let idx = index(f, r)?;
-    let variant = super::resolve(&idx, r, live, extra)
-        .map_err(RuntimeError::Device)?
+    let variant = super::select_variant(&idx, r, live, extra)
+        .map_err(RuntimeError::Dist)?
         .clone();
 
     let raw = require(
@@ -150,14 +150,14 @@ pub fn resolve(
     // it is a mismatched or tampered publication, not merely a stale cache.
     let got = Digest::of(&raw);
     if got.as_str() != variant.sha256 {
-        return Err(RuntimeError::Device(format!(
+        return Err(RuntimeError::Dist(format!(
             "{}@g{}: the index says its manifest hashes to {}, but the published manifest hashes \
              to {got}",
             variant.label, variant.generation, variant.sha256
         )));
     }
     let bundle: Bundle = parse_json("bundle.json", &raw)?;
-    bundle.validate().map_err(RuntimeError::Device)?;
+    bundle.validate().map_err(RuntimeError::Dist)?;
 
     let mut objsets = Vec::new();
     let mut want: Vec<(Option<u32>, String, String)> = vec![(
@@ -175,17 +175,17 @@ pub fn resolve(
     for (rung, path, sha) in want {
         let raw = require(f, &path)?;
         if !sha.is_empty() && Digest::of(&raw).as_str() != sha {
-            return Err(RuntimeError::Device(format!(
+            return Err(RuntimeError::Dist(format!(
                 "{path}: objset manifest does not match the digest the bundle records"
             )));
         }
         let set: ObjSet = parse_json(&path, &raw)?;
-        set.validate().map_err(RuntimeError::Device)?;
+        set.validate().map_err(RuntimeError::Dist)?;
         // A specialised object pairs only with the packet that produced it.
         // Checking here means a mismatched publication is refused before a
         // single object byte moves, rather than twenty frames into the loader.
         set.pairs_with(bundle.pairing_hash.as_deref())
-            .map_err(RuntimeError::Device)?;
+            .map_err(RuntimeError::Dist)?;
         objsets.push((rung, set));
     }
 
@@ -215,7 +215,7 @@ pub fn pull(
         // reaches the store under a name that promises its content.
         store
             .put(digest, &raw)
-            .map_err(|e| RuntimeError::Device(format!("{name}: {e}")))?;
+            .map_err(|e| RuntimeError::Dist(format!("{name}: {e}")))?;
         t.fetched_blobs += 1;
         t.fetched_bytes += raw.len() as u64;
     }

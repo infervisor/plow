@@ -31,7 +31,7 @@ impl Digest {
                 .bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         {
-            return Err(RuntimeError::Device(format!(
+            return Err(RuntimeError::Dist(format!(
                 "`{s}` is not a sha256 digest (64 lowercase hex characters)"
             )));
         }
@@ -64,7 +64,7 @@ impl Store {
             Some(p) => PathBuf::from(p),
             None => {
                 let home = std::env::var_os("HOME").ok_or_else(|| {
-                    RuntimeError::Device(
+                    RuntimeError::Dist(
                         "neither --plow-home nor HOME is set; pass an explicit store path".into(),
                     )
                 })?;
@@ -105,7 +105,7 @@ impl Store {
     pub fn put(&self, want: &Digest, bytes: &[u8]) -> Result<bool> {
         let got = Digest::of(bytes);
         if &got != want {
-            return Err(RuntimeError::Device(format!(
+            return Err(RuntimeError::Dist(format!(
                 "digest mismatch: expected {want}, content hashes to {got} ({} bytes). \
                  The blob was corrupted in transit or the manifest is wrong; nothing was stored.",
                 bytes.len()
@@ -140,7 +140,7 @@ impl Store {
         // reproduce exactly the class of failure this store exists to stop.
         let got = Digest::of(&bytes);
         if &got != d {
-            return Err(RuntimeError::Device(format!(
+            return Err(RuntimeError::Dist(format!(
                 "stored blob {d} hashes to {got} — the store is corrupt; remove {} and re-pull",
                 p.display()
             )));
@@ -161,7 +161,7 @@ impl Store {
         })?;
         for (name, digest) in files {
             if !self.has(digest) {
-                return Err(RuntimeError::Device(format!(
+                return Err(RuntimeError::Dist(format!(
                     "{name}: blob {digest} is not in the store — run `plowrt pull` first"
                 )));
             }
@@ -170,7 +170,7 @@ impl Store {
             // the bundle. Objects legitimately sit under `hsaco/`, so nested
             // paths are allowed, but only downward.
             if !is_safe_relative(name) {
-                return Err(RuntimeError::Device(format!(
+                return Err(RuntimeError::Dist(format!(
                     "{name}: a bundle file name must be a relative path with no `..` component"
                 )));
             }
@@ -217,11 +217,15 @@ impl Store {
     pub fn pin(&self, reference: &str, variant_id: &str) -> Result<()> {
         let p = self.pin_file(reference);
         let body = serde_json::json!({ "ref": reference, "variant": variant_id });
-        std::fs::write(&p, serde_json::to_vec(&body).unwrap_or_default()).map_err(|source| {
-            RuntimeError::Io {
-                path: p.clone(),
-                source,
-            }
+        // Not `unwrap_or_default`: an empty pin file is an unparseable pin, and
+        // silently writing one would lose the record rather than report it.
+        let bytes = serde_json::to_vec(&body).map_err(|source| RuntimeError::Json {
+            path: p.clone(),
+            source,
+        })?;
+        std::fs::write(&p, bytes).map_err(|source| RuntimeError::Io {
+            path: p.clone(),
+            source,
         })
     }
 

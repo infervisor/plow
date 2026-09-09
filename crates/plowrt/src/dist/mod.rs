@@ -73,7 +73,10 @@ pub fn constraints_for(r: &Reference) -> Constraints {
 }
 
 /// Pick the variant this machine should run, or explain why none fits.
-pub fn resolve<'a>(
+///
+/// Operates on an index already in hand. [`pull::resolve`] is the layer above:
+/// it fetches the index and the manifests, then calls this.
+pub fn select_variant<'a>(
     index: &'a ModelIndex,
     r: &Reference,
     live: &LiveTarget,

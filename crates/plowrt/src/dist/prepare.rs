@@ -68,7 +68,7 @@ pub fn build(
     snapshot: &Path,
 ) -> Result<Farm> {
     if !snapshot.is_dir() {
-        return Err(RuntimeError::Device(format!(
+        return Err(RuntimeError::Dist(format!(
             "checkpoint {} is not a directory. {} needs the {} snapshot at revision {}; \
              pass --checkpoint <dir> or fetch it with --fetch-weights.",
             snapshot.display(),
@@ -102,13 +102,13 @@ pub fn build(
         }
     }
     if shards == 0 {
-        return Err(RuntimeError::Device(format!(
+        return Err(RuntimeError::Dist(format!(
             "{}: no *.safetensors found — this does not look like a checkpoint",
             snapshot.display()
         )));
     }
     if shards < bundle.checkpoint.shards as usize {
-        return Err(RuntimeError::Device(format!(
+        return Err(RuntimeError::Dist(format!(
             "{}: found {shards} shards, the bundle was built against {}. A partial snapshot \
              loads and then produces wrong output, so this is refused.",
             snapshot.display(),
@@ -130,13 +130,13 @@ pub fn build(
         if f.role == "derived_shard" {
             let src = bundle_dir.join(&f.name);
             if !src.is_file() {
-                return Err(RuntimeError::Device(format!(
+                return Err(RuntimeError::Dist(format!(
                     "{}: the bundle declares a derived shard that was not materialized",
                     f.name
                 )));
             }
             if names.iter().any(|n| n.as_str() >= f.name.as_str()) {
-                return Err(RuntimeError::Device(format!(
+                return Err(RuntimeError::Dist(format!(
                     "{}: the derived sidecar must sort after every base shard, because the \
                      loader's last-writer-wins glob is what makes it an override. Rename it so \
                      it sorts last.",
@@ -156,7 +156,7 @@ pub fn build(
         Provenance::Derived => {
             let src = bundle_dir.join(&tok.file);
             if !src.is_file() {
-                return Err(RuntimeError::Device(format!(
+                return Err(RuntimeError::Dist(format!(
                     "{}: the bundle declares a derived tokenizer that was not materialized",
                     tok.file
                 )));
@@ -166,7 +166,7 @@ pub fn build(
         Provenance::Checkpoint => {
             let src = snapshot.join(&tok.file);
             if !src.is_file() {
-                return Err(RuntimeError::Device(format!(
+                return Err(RuntimeError::Dist(format!(
                     "{}: {} declares its tokenizer comes from the checkpoint, but {} has none. \
                      A checkpoint that ships only `tiktoken.model` needs a generated \
                      tokenizer.json — that is what `scripts/kimi_k3_tokenizer.py` produces, and \

@@ -814,6 +814,21 @@ CPU interprets that packet. Use an **NVIDIA** `--gpu` (a gfx942/gfx950 packet is
 rejected at load), and set `--n-cu` explicitly — it is the virtual executor count,
 capped at 256, and need not match any thread count.
 
+## Asset distribution (`plowrt pull` / `load` / `serve --model`)
+
+Two knobs, both with CLI twins, both consumed only by the distribution
+subcommands. `serve` reads the local store and never the network; see
+[`DISTRIBUTION.md`](DISTRIBUTION.md).
+
+| var | default | effect |
+|---|---|---|
+| `PLOW_HOME` / `--plow-home` | `$HOME/.plow` | Root of the local asset store: `blobs/sha256/` (content-addressed), `refs/` (pins), `bundles/` (materialized directories `--assets` receives), `checkpoints/` (the farms `prepare` builds). |
+| `PLOW_REGISTRY` / `--registry` | `dist.infervisor.ai` | Where a bare model reference resolves. A `file://` URL or an absolute path selects a local mirror and needs no HTTP client, which is how an air-gapped host and every test fetch. |
+
+`PLOW_CHECKPOINT` / `--rt-checkpoint` (below) doubles as `load`'s default
+checkpoint location, because the weights a bundle needs are the same weights
+`serve` binds.
+
 ## Serving / runtime knobs (`plowrt` env)
 
 | var | default | effect |

@@ -118,9 +118,16 @@ def run() -> None:
     ap.add_argument("--plow-git", dest="plow_git", default=None, help="full 40-hex commit")
     ap.add_argument("--script", default="scripts/build_gfx942.sh")
     ap.add_argument("--env", action="append", help="KEY=VALUE the build was driven with")
+    ap.add_argument(
+        "--readelf",
+        default=pd.default_readelf(),
+        help="readelf used to read each object's symbol table "
+        "(default: $PLOW_READELF, then llvm-readelf or readelf on PATH)",
+    )
     ap.add_argument("--out", help="write objset.json here (default: stdout)")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
+    pd.set_readelf(args.readelf)
 
     if args.self_test:
         self_test()
