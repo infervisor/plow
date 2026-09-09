@@ -1026,7 +1026,33 @@ and fp8 KV. Any future attempt at either has to drop it first, and a packet ABI 
 room would remove the exclusivity entirely. That is a structural note for whoever picks this up —
 it is not visible from any one flag's documentation.
 
-### The comparison target is not ROCm-vs-ROCm
+### The comparison IS ROCm-vs-ROCm — corrected
+
+Earlier revisions of this section hedged that the target host was unidentified and that, if it were
+NVIDIA, part of the gap would be a kernel ecosystem rather than plow. That hedge is wrong and is
+retracted.
+
+The target run named `--host 10.7.21.13`. This machine is `10.7.21.15`, hostname
+`innmi1srmi300x-p01.neysaai.infra` — an **MI300X** pool node — two addresses away in the same /24.
+Port 8080 there is closed now, so the server could not be queried directly and this is inference
+from addressing and the cluster's own naming rather than a banner. But the reading is that vLLM
+reached **27,269 tok/s total / 273.67 output tok/s on the same 8x MI300X hardware** where plow
+reaches 1,886 / 18.67.
+
+**That makes the gap ~14.5x of software on identical silicon, not a hardware or ecosystem
+difference.** Everything below about "no AITER ASM kernel for qk256/v256" still stands as a fact
+about AITER's shipped `.co` set, but it stops being an excuse: vLLM is not using an AITER MLA
+prefill ASM kernel for this model either. It is using the **ROCm sparse path** —
+`vllm/v1/attention/ops/rocm_aiter_mla_sparse.py`, with `flydsl_fp8_mqa_logits` (a hand-written
+gfx942 MFMA indexer kernel) and a hipcub `top_k_per_row_prefill` — which plow has no equivalent of
+for prefill, and which §7f's operand-budget note shows plow cannot even emit alongside its current
+recipe.
+
+So the single highest-value item for this target is not a faster dense flash kernel. It is DSA
+sparse prefill on gfx942, which **already exists in open source, on this exact hardware**, and
+which the operand budget currently forecloses.
+
+### AITER's ASM kernel set does not cover this geometry
 
 Worth stating before adapting anything: **GLM-5.3's head geometry has no AITER ASM kernel.** The
 v3 dispatcher admits exactly `(128,128)`, `(192,128)` and `(256,256)`, and the only shipped 256/256
