@@ -2245,3 +2245,30 @@ See the [DSA decode qualification and reproduction](../../runtime/bench/amd/dsa_
 Pooled batched DSA, MXFP4 indexers and batched FP8 KV remain unsupported.
 Sparse decode requires disabling the incompatible q-RoPE fusion. No speculative
 decoding is added; H200 serving parity remains unproven.
+
+## 13. FP8 KV capacity investigation (2026-09-09)
+
+The existing gathered decode template passes FP32 oracles through B20 with
+per-row OCP FP8 latent scales and BF16 rope. Twelve cache-writer cases cover
+slot positions, ring wrapping, zeros and untouched tails; 24 attention cases
+cover short/empty/70k contexts and split merging. The maximum FP8 decode
+kernel relative L2 error is 8.10e-7 against the quantized-cache oracle.
+
+The unexposed gathered FP8 V2 prefill template had a scale-address defect:
+KV loads followed the union's selected cache positions, while scales used
+union entry numbers. Correct both softmax variants and PV scale addressing.
+Matched synthetic T129 relative L2 falls from 1.543 to 0.001557. Tests also
+cover T1/4464 and inactive union/cache tails. Production sparse FP8 and batched
+FP8 emission remain refused; this change does not enable FP8 serving.
+
+FP8 is a capacity opportunity with a prefill cost. B20/16-split standalone
+decode measures 0.1343 ms vs BF16 0.1459 ms, but the actual layer-77 sparse
+capture measures **2.414 ms FP8 vs 1.901 ms BF16**. Its five sampled queries
+show 0.0718% kernel error against quantized-cache FP32 and 1.321% difference
+against original BF16-cache FP32. This is not model-level qualification.
+
+At ctx81920, B20's calculated cache storage falls from 145.31 to 84.85 GiB/rank,
+excluding weights and scratch. Preserve native AITER prefill through an FP8
+packing/dequantization adapter before pursuing B16/20 serving; the interpreter
+FP8 prefill regression makes a flag-only enablement unattractive. No new
+serving gain is claimed. See [tests, results and reproduction](../../runtime/bench/amd/mla_fp8_kv/README.md).

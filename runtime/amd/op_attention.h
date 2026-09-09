@@ -3853,6 +3853,12 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
         const float* csc = FP8 ? kv_scale + (size_t)b * kv_stride : nullptr;
         const float* rsc = FP8 ? kv_scale + (size_t)(n_batch + b) * kv_stride : nullptr;
 
+        auto scale_row = [&](unsigned kv) -> unsigned {
+            if constexpr (GATHER)
+                return kv < ucount ? ((unsigned)as_glob(upos)[kv] & kv_mask) : 0u;
+            return kv & kv_mask;
+        };
+
         /* Q -> REGISTERS, once: lane's A-fragment row is my_q0+fr, k-slice kt*32 + kg*8. */
         bf16x8 qa[NKT];
         {
@@ -4188,7 +4194,7 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
                     }
                     float score = sacc[nt][i];
                     if constexpr (FP8) {
-                        const unsigned row = kvg & kv_mask;
+                        const unsigned row = scale_row(kvg);
                         const float cs = csc[row];
                         const float rs = krot_fp8 ? rsc[row] : 1.0f;
                         score = score * cs + srope[nt][i] * rs;
@@ -4262,7 +4268,7 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
                     }
                     float score = sacc[nt][i];
                     if constexpr (FP8) {
-                        const unsigned row = kvg & kv_mask;
+                        const unsigned row = scale_row(kvg);
                         const float cs = csc[row];
                         const float rs = krot_fp8 ? rsc[row] : 1.0f;
                         score = score * cs + srope[nt][i] * rs;
@@ -4301,7 +4307,7 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
                 for (int i = 0; i < 4; i++) {
                     float p = pe[nt][i];
                     if constexpr (FP8)
-                        p *= csc[(kv0 + (unsigned)nt * 16 + fr) & kv_mask];
+                        p *= csc[scale_row(kv0 + (unsigned)nt * 16 + fr)];
                     Pw[(kg * 4 + i) * BKV + (unsigned)nt * 16 + fr] = f2bf(p);
                 }
 #endif
