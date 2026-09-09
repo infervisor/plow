@@ -406,11 +406,113 @@ fn decode_ladder_accepts_runtime_input_capacity_beyond_widest_rung() {
     assert!(validate_decode_ladder(&blob).unwrap());
 }
 
+fn fp8_kv_fixture() -> DevBlob {
+    let mut blob = fixture();
+    for index in [3, 4] {
+        blob.tensors[index].bytes /= 2;
+    }
+    for name in ["key.scale", "value.scale"] {
+        blob.tensors.push(DevTensor {
+            name: name.into(),
+            bytes: 16 * 1024 * 4,
+            init: None,
+        });
+    }
+    for g in &mut blob.progs {
+        for index in 0..2 {
+            g.insts[index].op = DevOp::HeadNormRopeFp8 as u16;
+            g.insts[index].t[6] = 8 + index as u16;
+        }
+        g.insts[2].op = DevOp::FlashDecodeFp8 as u16;
+        g.insts[2].t[6..8].copy_from_slice(&[8, 9]);
+    }
+    blob
+}
+
+#[test]
+fn fp8_kv_ladder_validates_full_and_sliding_cache_geometry() {
+    for hd in [256, 512] {
+        for window in [0, 512] {
+            let mut blob = fp8_kv_fixture();
+            for index in [3, 4, 5, 7] {
+                blob.tensors[index].bytes *= u64::from(hd / 256);
+            }
+            for g in &mut blob.progs {
+                for index in 0..2 {
+                    g.insts[index].i[2] = hd;
+                    g.insts[index].fj[2] = if window == 0 { u32::MAX } else { 1023 };
+                }
+                g.insts[2].i[4] = window;
+                g.insts[2].i[6] = hd;
+                g.insts[2].i[7] = if window == 0 { u32::MAX } else { 1023 };
+                g.insts[3].i[3] = hd;
+            }
+            assert!(
+                validate_decode_ladder(&blob).unwrap(),
+                "hd={hd} window={window}"
+            );
+        }
+    }
+}
+
+#[test]
+fn fp8_kv_ladder_rejects_invalid_scale_storage_and_aliases() {
+    for mutation in 0..6 {
+        let mut blob = fp8_kv_fixture();
+        match mutation {
+            0 => blob.tensors[8].bytes -= 4,
+            1 => blob.tensors[9].bytes *= 2,
+            2 => blob.tensors[8].init = Some(0..4),
+            3 => {
+                for g in &mut blob.progs {
+                    g.insts[2].t[7] = 8;
+                }
+            }
+            4 => {
+                for g in &mut blob.progs {
+                    g.insts[2].t[6] = TENSOR_NONE16;
+                }
+            }
+            5 => {
+                for g in &mut blob.progs {
+                    g.insts[2].t[6] = 3;
+                }
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            validate_decode_ladder(&blob).is_err(),
+            "mutation={mutation}"
+        );
+    }
+}
+
+#[test]
+fn fp8_kv_ladder_rejects_changed_reader_writer_and_scale_addressing() {
+    for mutation in 0..6 {
+        let mut blob = fp8_kv_fixture();
+        let g = &mut blob.progs[0];
+        match mutation {
+            0 => g.insts[0].t[6] = 9,
+            1 => g.insts[2].t[6..8].swap(0, 1),
+            2 => g.insts[0].i[6] = 0,
+            3 => g.insts[0].op = DevOp::HeadNormRope as u16,
+            4 => g.insts[2].op = DevOp::FlashDecode as u16,
+            5 => g.insts[3].t[0] = 8,
+            _ => unreachable!(),
+        }
+        assert!(
+            validate_decode_ladder(&blob).is_err(),
+            "mutation={mutation}"
+        );
+    }
+}
+
 #[test]
 fn unsupported_families_and_single_rung_keep_widest_execution() {
     let mut blob = fixture();
     for g in &mut blob.progs {
-        g.insts[2].op = DevOp::FlashDecodeFp8 as u16;
+        g.insts[2].op = DevOp::FlashPrefillFp8 as u16;
     }
     assert!(!validate_decode_ladder(&blob).unwrap());
     let mut blob = fixture();
@@ -446,6 +548,82 @@ fn gpu_decode_rungs_match_widest_full_logits() {
 #[ignore = "GPU cuBLASLt gate; set TEST_DECODE_RUNG_GPU, TEST_DECODE_RUNG_ASSETS, TEST_DECODE_RUNG_BASELINE"]
 fn gpu_cublaslt_rungs_match_widest_logits() {
     check_gpu_decode_rungs(true);
+}
+
+#[test]
+#[ignore = "H100 FP8-KV prefix gate; set TEST_FP8_KV_ASSETS and PLOW_VMM_PREFIX=1, PLOW_MULTISTEP=0"]
+fn gpu_fp8_kv_cached_rungs_match_uncached_suffix_logits() {
+    let assets = std::path::PathBuf::from(std::env::var("TEST_FP8_KV_ASSETS").unwrap());
+    let mut e = GpuEngine::load(
+        Arc::new(CudaBackend::new(0).unwrap()),
+        &assets,
+        &assets.join("checkpoint"),
+    )
+    .unwrap();
+    assert!(e.vmm_prefix_enabled() && e.multistep.is_none());
+    assert_eq!(e.batch(), 16);
+    assert!(e.prefill.iter().all(|p| p.fp8_kv));
+    assert_eq!(
+        e.decode_rungs.iter().map(|r| r.rows).collect::<Vec<_>>(),
+        [1, 2, 4, 8]
+    );
+    for length in [127, 129, 513, 1057, 2113, 16417] {
+        let prompt: Vec<_> = (0..length)
+            .map(|i| 100 + ((i * 13 + length * 17) % 2000) as u32)
+            .collect();
+        let mut reference = Vec::new();
+        for (pass, slot) in [15, 0, 1, 3, 7, 15].into_iter().enumerate() {
+            e.begin_slot(slot, length + 8).unwrap();
+            assert_eq!(e.vmm.as_ref().unwrap().kv.mapped_rows(slot), 0);
+            let cached = e.attach_prompt(slot, &prompt).unwrap();
+            assert_eq!(cached, if pass == 0 { 0 } else { (length - 1) / 32 * 32 });
+            let mut next = e.prefill_slot(slot, &prompt).unwrap();
+            if pass == 0 {
+                // Recompute the suffix with the warm path's bucket while keeping
+                // the independently computed prefix resident in its original slot.
+                let mut cold = Vec::new();
+                e.logits_row(0, &mut cold).unwrap();
+                e.pos[slot] = ((length - 1) / 32 * 32) as u32;
+                next = e.prefill_slot(slot, &prompt).unwrap();
+                let mut suffix = Vec::new();
+                e.logits_row(0, &mut suffix).unwrap();
+                let max_abs = cold
+                    .iter()
+                    .zip(&suffix)
+                    .map(|(a, b)| (*a - *b).abs())
+                    .fold(0.0f32, f32::max);
+                eprintln!("FP8 KV length={length}: cold vs suffix-bucket max_abs={max_abs}");
+            }
+            for step in 0..8 {
+                let mut logits = Vec::new();
+                e.logits_row(if step == 0 { 0 } else { slot }, &mut logits)
+                    .unwrap();
+                assert_eq!(logits.len(), e.vocab);
+                assert!(logits.iter().all(|v| v.is_finite()));
+                let bits: Vec<_> = logits.iter().map(|v| v.to_bits()).collect();
+                if pass == 0 {
+                    reference.push(bits);
+                } else {
+                    let max_abs = logits
+                        .iter()
+                        .zip(&reference[step])
+                        .map(|(a, b)| (*a - f32::from_bits(*b)).abs())
+                        .fold(0.0f32, f32::max);
+                    assert!(
+                        bits == reference[step],
+                        "length={length} slot={slot} step={step} max_abs={max_abs}"
+                    );
+                }
+                if step < 7 {
+                    let mut ids = Vec::new();
+                    e.step_slots(&[(slot, next)], &mut ids).unwrap();
+                    next = ids[0];
+                }
+            }
+            e.retire_slot(slot, false);
+            eprintln!("FP8 KV prefix length={length} slot={slot} cached={cached}: 8 full-logit frames exact");
+        }
+    }
 }
 
 fn check_gpu_decode_rungs(library: bool) {

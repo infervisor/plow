@@ -204,6 +204,7 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool) -> Result<bool> 
                     DevOp::RmsNorm
                     | DevOp::RowRms
                     | DevOp::HeadNormRope
+                    | DevOp::HeadNormRopeFp8
                     | DevOp::Gemm
                     | DevOp::GemmNorm
                     | DevOp::Gemv
@@ -217,19 +218,27 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool) -> Result<bool> 
                     | DevOp::AddNorm
                     | DevOp::Embed
                     | DevOp::FlashDecode
+                    | DevOp::FlashDecodeFp8
                     | DevOp::FlashMerge,
                 ) => {
                     if d.i[0] != g.t {
                         return Err(reject("instruction rows disagree with rung width"));
                     }
                     d.i[0] = 1;
-                    if d.op == DevOp::HeadNormRope as u16 && d.i[6] != 0 {
+                    if matches!(
+                        DevOp::from_u16(d.op),
+                        Some(DevOp::HeadNormRope | DevOp::HeadNormRopeFp8)
+                    ) && d.i[6] != 0
+                    {
                         if d.i[6] != g.t {
                             return Err(reject("KV writer uses a different slot count"));
                         }
                         d.i[6] = 1;
                     }
-                    if d.op == DevOp::FlashDecode as u16 {
+                    if matches!(
+                        DevOp::from_u16(d.op),
+                        Some(DevOp::FlashDecode | DevOp::FlashDecodeFp8)
+                    ) {
                         d.i[5] = 0;
                         d.fj[1] = 0;
                     } else if d.op == DevOp::FlashMerge as u16 {
@@ -262,11 +271,19 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool) -> Result<bool> 
         return Err(reject("runtime inputs do not cover physical slots"));
     }
     let mut caches = std::collections::BTreeMap::new();
+    let mut scales = std::collections::BTreeMap::new();
     for d in &widest.insts {
-        if d.op != DevOp::FlashDecode as u16 {
+        if !matches!(
+            DevOp::from_u16(d.op),
+            Some(DevOp::FlashDecode | DevOp::FlashDecodeFp8)
+        ) {
             continue;
         }
-        if d.t[6] != TENSOR_NONE16 || d.t[7] != TENSOR_NONE16 || !matches!(d.i[6], 64 | 256 | 512) {
+        let fp8 = d.op == DevOp::FlashDecodeFp8 as u16;
+        if !matches!(d.i[6], 64 | 256 | 512)
+            || (fp8 && d.i[6] == 64)
+            || (!fp8 && (d.t[6] != TENSOR_NONE16 || d.t[7] != TENSOR_NONE16))
+        {
             return Ok(false);
         }
         let (heads, hd, stride, window, mask) = (d.i[2], d.i[6], d.i[3], d.i[4], d.i[7]);
@@ -284,9 +301,22 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool) -> Result<bool> 
         let bytes = u64::from(widest.t)
             .checked_mul(u64::from(heads))
             .and_then(|n| n.checked_mul(u64::from(stride)))
-            .and_then(|n| n.checked_mul(u64::from(hd) * 2))
+            .and_then(|n| n.checked_mul(u64::from(hd) * if fp8 { 1 } else { 2 }))
             .ok_or_else(|| reject("KV extent overflow"))?;
         for (kind, &id) in d.t[3..5].iter().enumerate() {
+            let scale = fp8.then_some(d.t[6 + kind]);
+            if let Some(scale) = scale {
+                let scale_bytes = u64::from(widest.t) * u64::from(heads) * u64::from(stride) * 4;
+                if blob
+                    .tensors
+                    .get(scale as usize)
+                    .is_none_or(|t| t.bytes != scale_bytes || t.init.is_some())
+                    || [pos, kvlen, ids].contains(&(scale as usize))
+                    || scales.insert(scale, id).is_some()
+                {
+                    return Err(reject("invalid or aliased FP8 KV scale tensor"));
+                }
+            }
             let pair_mode = if hd == 64 && kind == 0 {
                 ROPE_PAIR_HALF
             } else {
@@ -297,13 +327,16 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool) -> Result<bool> 
                 .get(id as usize)
                 .is_none_or(|t| t.bytes != bytes || t.init.is_some())
                 || caches
-                    .insert(id, (heads, hd, stride, mask, pair_mode))
+                    .insert(id, (heads, hd, stride, mask, pair_mode, scale))
                     .is_some()
                 || [pos, kvlen, ids].contains(&(id as usize))
             {
-                return Err(reject("invalid or aliased BF16 KV tensor extent"));
+                return Err(reject("invalid or aliased KV tensor extent"));
             }
         }
+    }
+    if scales.keys().any(|id| caches.contains_key(id)) {
+        return Err(reject("FP8 KV scale aliases cache data"));
     }
     if caches.is_empty() {
         return Ok(false);
@@ -311,7 +344,10 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool) -> Result<bool> 
     for g in programs {
         let mut writes = std::collections::BTreeSet::new();
         for (ix, d) in g.insts.iter().enumerate() {
-            if d.op == DevOp::FlashDecode as u16 {
+            if matches!(
+                DevOp::from_u16(d.op),
+                Some(DevOp::FlashDecode | DevOp::FlashDecodeFp8)
+            ) {
                 if d.t[5] as usize != kvlen
                     || d.i[5] == 0
                     || d.t[3] == d.t[4]
@@ -354,7 +390,11 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool) -> Result<bool> 
                     .iter()
                     .rev()
                     .find(|a| {
-                        a.op == DevOp::FlashDecode as u16 && a.t[0] == d.t[1] && a.t[1] == d.t[2]
+                        matches!(
+                            DevOp::from_u16(a.op),
+                            Some(DevOp::FlashDecode | DevOp::FlashDecodeFp8)
+                        ) && a.t[0] == d.t[1]
+                            && a.t[1] == d.t[2]
                     })
                     .ok_or_else(|| reject("merge has no matching attention producer"))?;
                 if [d.i[1], d.i[2], d.i[3]] != [producer.i[1], producer.i[5], producer.i[6]] {
@@ -373,16 +413,40 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool) -> Result<bool> 
                 }
             }
             for (operand, &id) in d.t.iter().enumerate() {
-                let Some(&(heads, hd, stride, mask, pair_mode)) = caches.get(&id) else {
+                if let Some(&cache) = scales.get(&id) {
+                    let valid = match DevOp::from_u16(d.op) {
+                        Some(DevOp::HeadNormRopeFp8) => operand == 6 && d.t[0] == cache,
+                        Some(DevOp::FlashDecodeFp8) => {
+                            (operand == 6 || operand == 7) && d.t[operand - 3] == cache
+                        }
+                        _ => false,
+                    };
+                    if !valid {
+                        return Err(reject("FP8 KV scale has an incompatible reader or writer"));
+                    }
+                }
+                let Some(&(heads, hd, stride, mask, pair_mode, scale)) = caches.get(&id) else {
                     continue;
                 };
                 match DevOp::from_u16(d.op) {
-                    Some(DevOp::FlashDecode) if operand == 3 || operand == 4 => {
+                    Some(DevOp::FlashDecode | DevOp::FlashDecodeFp8)
+                        if operand == 3 || operand == 4 =>
+                    {
+                        if (d.op == DevOp::FlashDecodeFp8 as u16) != scale.is_some()
+                            || scale.is_some_and(|scale| d.t[operand + 3] != scale)
+                        {
+                            return Err(reject("KV reader encoding or scale changes across rungs"));
+                        }
                         if (d.i[2], d.i[6], d.i[3], d.i[7]) != (heads, hd, stride, mask) {
                             return Err(reject("KV reader addressing changes across rungs"));
                         }
                     }
-                    Some(DevOp::HeadNormRope) if operand == 0 => {
+                    Some(DevOp::HeadNormRope | DevOp::HeadNormRopeFp8) if operand == 0 => {
+                        if (d.op == DevOp::HeadNormRopeFp8 as u16) != scale.is_some()
+                            || scale.is_some_and(|scale| d.t[6] != scale || d.t[7] != TENSOR_NONE16)
+                        {
+                            return Err(reject("KV writer encoding or scale changes across rungs"));
+                        }
                         if d.i[6] != g.t
                             || d.i[3] != 0
                             || d.t[5] as usize != pos
@@ -393,7 +457,7 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool) -> Result<bool> 
                                 "KV writer requires physical-slot position addressing",
                             ));
                         }
-                        if d.t[6] != TENSOR_NONE16 || d.t[7] != TENSOR_NONE16 {
+                        if scale.is_none() && (d.t[6] != TENSOR_NONE16 || d.t[7] != TENSOR_NONE16) {
                             return Ok(false);
                         }
                         if !writes.insert(id) {
