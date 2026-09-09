@@ -17,6 +17,7 @@ pub mod cpu;
 pub mod cuda;
 #[cfg(feature = "hsa")]
 pub mod hsa;
+pub mod visibility;
 
 /// Bring up the best backend this host can actually offer.
 ///
@@ -70,23 +71,33 @@ pub fn select(executors: u32) -> Arc<dyn Backend> {
 /// fallback is a one-element vector, never a fake multi-device set, so
 /// [`crate::exec::tp`] fails the bring-up loudly instead of pretending to shard.
 ///
-/// On AMD the visible set is chosen by **`ROCR_VISIBLE_DEVICES`**, not
-/// `HIP_VISIBLE_DEVICES`: plowrt dlopens ROCr directly and never loads the HIP
-/// runtime, so the HIP variable has no effect here.
+/// The visible set comes from the vendor masks — `CUDA_VISIBLE_DEVICES` on
+/// NVIDIA, `ROCR_VISIBLE_DEVICES` on AMD, both applied by the vendor runtime
+/// before plowrt sees a device. `HIP_VISIBLE_DEVICES` is the exception that
+/// needs help: plowrt dlopens ROCr directly and never loads the HIP runtime,
+/// so [`hsa::HsaBackend::new`] applies it, and only when
+/// `ROCR_VISIBLE_DEVICES` is unset. See [`visibility`].
 pub fn select_all(executors_per_device: u32) -> Vec<Arc<dyn Backend>> {
     let mut backends: Vec<Arc<dyn Backend>> = Vec::new();
 
     #[cfg(feature = "cuda")]
     {
-        // Probe device count via the backend's enumerate path.
-        // In production: cuDeviceGetCount → iterate [0..count).
-        if let Ok(b) = cuda::CudaBackend::new(0) {
-            backends.push(Arc::new(b));
-            // Additional devices: try indices 1..8 until failure.
-            for dev in 1..8u8 {
+        // Ordinal 0 answers how many devices the driver made visible, so the
+        // rest of the loop enumerates rather than probing until an open fails.
+        // Probing hid two different outcomes behind one `break` — "that was the
+        // last device" and "that device would not initialise" — and the second
+        // silently produced a short TP group, which is the same failure the HSA
+        // arm below already calls out.
+        if let Ok(first) = cuda::CudaBackend::new(0) {
+            let n = first.device_count().unwrap_or(1);
+            backends.push(Arc::new(first));
+            for dev in 1..n as u8 {
                 match cuda::CudaBackend::new(dev) {
                     Ok(b) => backends.push(Arc::new(b)),
-                    Err(_) => break,
+                    Err(e) => {
+                        tracing::error!(%e, dev, n, "CUDA device enumerated but not usable");
+                        break;
+                    }
                 }
             }
         }

@@ -31,11 +31,11 @@ fn make_app_with_batches(slug: &str, batches: &[i64]) -> axum::Router {
 
     let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new(4));
     let execset = Arc::new(ExecutorSet::bringup(backend).unwrap());
-    let mut registry = Registry::new();
+    let registry = Registry::new();
     registry.load(&dir, None).unwrap();
     let state = Arc::new(AppState::new(registry, execset));
 
-    let slugs: Vec<String> = state.registry.slugs().map(str::to_string).collect();
+    let slugs: Vec<String> = state.registry.slugs();
     for slug in slugs {
         let bundle = state.registry.get(&slug).unwrap();
         let m = mux::spawn(
@@ -193,10 +193,10 @@ async fn sample_batch_bundle_uses_batched_path() {
 
     let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new(4));
     let execset = Arc::new(ExecutorSet::bringup(backend).unwrap());
-    let mut registry = Registry::new();
+    let registry = Registry::new();
     registry.load(&dir, None).unwrap();
     let state = Arc::new(AppState::new(registry, execset));
-    let slugs: Vec<String> = state.registry.slugs().map(str::to_string).collect();
+    let slugs: Vec<String> = state.registry.slugs();
     for slug in slugs {
         let bundle = state.registry.get(&slug).unwrap();
         let m = mux::spawn(
@@ -304,7 +304,7 @@ async fn kv_oom_sheds_excess_requests() {
 
     let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new(4));
     let execset = Arc::new(ExecutorSet::bringup(backend).unwrap());
-    let mut registry = Registry::new();
+    let registry = Registry::new();
     registry.load(&dir, None).unwrap();
     let state = Arc::new(AppState::new(registry, execset));
     let bundle = state.registry.get("oom-model").unwrap();
@@ -369,7 +369,7 @@ async fn cancellation_frees_the_slot() {
 
     let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new(4));
     let execset = Arc::new(ExecutorSet::bringup(backend).unwrap());
-    let mut registry = Registry::new();
+    let registry = Registry::new();
     registry.load(&dir, None).unwrap();
     let state = Arc::new(AppState::new(registry, execset));
     let bundle = state.registry.get("cancel-model").unwrap();

@@ -787,6 +787,69 @@ impl HsaBackend {
         if acc.gpus.is_empty() {
             return Err(RuntimeError::Device("no GPU agents found".into()));
         }
+
+        // Apply `HIP_VISIBLE_DEVICES` ourselves when ROCr did not already
+        // narrow the set. plowrt dlopens ROCr directly and never loads the HIP
+        // runtime, so nothing else in this process will honour that variable —
+        // an operator who leased one GPU with it used to get a plowrt happily
+        // using every GPU on the box. See `device::visibility` for the full
+        // decision table and why the ROCr-set case deliberately ignores HIP.
+        let enumerated = acc.gpus.len();
+        match crate::device::visibility::hsa_visibility_from_env() {
+            crate::device::visibility::HsaVisibility::All => {}
+            crate::device::visibility::HsaVisibility::RocrApplied(rocr) => {
+                visibility_note(|| {
+                    tracing::info!(
+                        rocr_visible_devices = %rocr,
+                        agents = enumerated,
+                        "ROCr applied the visible-device mask"
+                    )
+                });
+            }
+            crate::device::visibility::HsaVisibility::HipIgnored { rocr, hip } => {
+                visibility_note(|| {
+                    tracing::warn!(
+                        rocr_visible_devices = %rocr,
+                        hip_visible_devices = %hip,
+                        agents = enumerated,
+                        "HIP_VISIBLE_DEVICES ignored: ROCR_VISIBLE_DEVICES already selected the \
+                         visible set and HIP's indices address a numbering that no longer exists. \
+                         Set one or the other."
+                    )
+                });
+            }
+            crate::device::visibility::HsaVisibility::HipUnresolvable { hip } => {
+                // Refused, not ignored: ignoring a visible-device mask is how a
+                // GPU lease gets violated.
+                return Err(RuntimeError::Device(format!(
+                    "HIP_VISIBLE_DEVICES={hip} names devices by UUID, which plowrt cannot \
+                     resolve (it talks to ROCr directly, not HIP). Use ROCR_VISIBLE_DEVICES, \
+                     or give ordinals."
+                )));
+            }
+            crate::device::visibility::HsaVisibility::ApplyHip { mask } => {
+                let keep = mask.apply(enumerated).expect("indices checked by hsa_visibility");
+                if keep.is_empty() {
+                    return Err(RuntimeError::Device(format!(
+                        "HIP_VISIBLE_DEVICES={} selects no device out of the {enumerated} ROCr \
+                         enumerated",
+                        mask.raw
+                    )));
+                }
+                visibility_note(|| {
+                    tracing::info!(
+                        hip_visible_devices = %mask,
+                        enumerated,
+                        visible = ?keep,
+                        "applied HIP_VISIBLE_DEVICES (plowrt uses ROCr directly, so nothing else \
+                         in this process would have)"
+                    )
+                });
+                // The mask's ORDER is the new ordinal order, so index 0 is the
+                // first entry of the mask, not the first agent on the node.
+                acc.gpus = keep.iter().map(|&i| acc.gpus[i as usize]).collect();
+            }
+        }
         let cpu_agent = acc
             .cpu
             .ok_or_else(|| RuntimeError::Device("no CPU agent found".into()))?;
@@ -1855,15 +1918,26 @@ impl PeerMemory for HsaBackend {
     }
 }
 
+/// Log a visible-device note once per process. `HsaBackend::new` runs per
+/// ordinal, and repeating the same warning eight times buries it.
+fn visibility_note(f: impl FnOnce()) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(f);
+}
+
 impl HsaBackend {
     /// Number of GPU agents ROCr made visible to this process.
     ///
     /// This is the real device count, so multi-GPU bring-up enumerates instead
-    /// of probing ordinals until one fails. Note that the visible set is
-    /// selected by **`ROCR_VISIBLE_DEVICES`**, not `HIP_VISIBLE_DEVICES`:
-    /// plowrt talks to ROCr directly and never loads the HIP runtime, so the
-    /// HIP variable is ignored (measured — `HIP_VISIBLE_DEVICES=4,5,6,7` still
-    /// enumerated all 8 agents).
+    /// of probing ordinals until one fails.
+    ///
+    /// The visible set is normally chosen by **`ROCR_VISIBLE_DEVICES`**, which
+    /// ROCr applies at `hsa_init`. `HIP_VISIBLE_DEVICES` is a different matter:
+    /// plowrt talks to ROCr directly and never loads the HIP runtime, so
+    /// nothing would apply it (measured — `HIP_VISIBLE_DEVICES=4,5,6,7` still
+    /// enumerated all 8 agents). [`HsaBackend::new`] therefore applies it here,
+    /// but ONLY when `ROCR_VISIBLE_DEVICES` is unset; see
+    /// [`crate::device::visibility`] for why the two must not compose.
     pub fn gpu_count(&self) -> u32 {
         self.agents.len() as u32
     }

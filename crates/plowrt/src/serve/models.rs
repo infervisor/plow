@@ -12,8 +12,9 @@ pub async fn list_models(State(state): State<Arc<AppState>>) -> Json<ModelList> 
     let data = state
         .registry
         .slugs()
+        .into_iter()
         .map(|slug| ModelCard {
-            id: slug.to_string(),
+            id: slug,
             object: "model",
             // REQUIRED by the schema and previously absent. Process start is
             // the honest value: it is when this server began offering the slug.

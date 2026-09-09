@@ -94,6 +94,77 @@ pub struct RuntimeConfig {
     )]
     pub drain_timeout_ms: Option<u64>,
 
+    /// Device ordinals to serve on, e.g. `--devices 0,1,2,3`. Unset = every
+    /// visible GPU.
+    ///
+    /// These index the VISIBLE set, not the physical one: `CUDA_VISIBLE_DEVICES`
+    /// and `ROCR_VISIBLE_DEVICES` are applied by the vendor runtime before
+    /// plowrt sees a device, so with `ROCR_VISIBLE_DEVICES=4,5` the two visible
+    /// GPUs are `--devices 0,1`. Startup logs the mask in force and the visible
+    /// count, and an out-of-range ordinal is refused by name.
+    #[arg(
+        long = "devices",
+        env = "PLOW_DEVICES",
+        value_delimiter = ',',
+        global = true
+    )]
+    pub devices: Vec<u32>,
+
+    /// How models are laid out over the visible devices: `spread` (one model
+    /// per GPU where possible), `pack` (fill a GPU while models fit), or
+    /// `explicit` (every model must name its device).
+    #[arg(
+        long = "place",
+        env = "PLOW_PLACE",
+        default_value = "spread",
+        global = true
+    )]
+    pub place: crate::serve::placement::Place,
+
+    /// Pin a model to a device: `--pin slug@2`, repeatable. The ordinal is the
+    /// first device of the group the model must occupy. Required for every
+    /// model under `--place explicit`; an override elsewhere.
+    #[arg(long = "pin", env = "PLOW_PIN", value_delimiter = ',', global = true)]
+    pub pin: Vec<String>,
+
+    /// How co-resident models take a shared GPU: `free` (private streams, the
+    /// driver admits whoever is ready — fastest, and the default) or `rr`
+    /// (round-robin turns, which bounds starvation and makes the interleaving
+    /// reproducible at the cost of overlap).
+    #[arg(
+        long = "co-sched",
+        env = "PLOW_CO_SCHED",
+        default_value = "free",
+        global = true
+    )]
+    pub co_sched: crate::serve::cosched::CoSched,
+
+    /// Consecutive ticks one model keeps the device under `--co-sched rr`.
+    /// Not 1 by default: models with different dynamic shared-memory requests
+    /// force an SM carveout reconfiguration on every alternation (~150-300us).
+    #[arg(
+        long = "co-sched-quantum",
+        env = "PLOW_CO_SCHED_QUANTUM",
+        default_value_t = 4,
+        global = true
+    )]
+    pub co_sched_quantum: u32,
+
+    /// Directories under which `POST /v1/models/load` may take an assets dir.
+    /// Repeatable; `PLOW_MODELS_ROOT` takes a `:`-separated list.
+    ///
+    /// This is a security boundary, not ergonomics: loading a bundle loads and
+    /// EXECUTES its cubins/hsaco, so an unconstrained path in a request body is
+    /// arbitrary code execution. Unset = only the assets dirs the process was
+    /// started with (their parents) are reachable.
+    #[arg(
+        long = "models-root",
+        env = "PLOW_MODELS_ROOT",
+        value_delimiter = ':',
+        global = true
+    )]
+    pub models_root: Vec<String>,
+
     /// Speculative next-model preload after an S1 switch. --no-preload disables.
     #[arg(long = "preload", env = "PLOW_PRELOAD", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub preload: bool,
@@ -656,7 +727,11 @@ pub struct AmdRuntimeConfig {
     /// route — which means a differing greedy token has two candidate causes at once, the
     /// packing and the reduction order. Pinning the rung holds the packing fixed and moves
     /// only the second.
-    #[arg(long = "amd-token-batch-rows", env = "PLOW_TOKEN_BATCH_ROWS", global = true)]
+    #[arg(
+        long = "amd-token-batch-rows",
+        env = "PLOW_TOKEN_BATCH_ROWS",
+        global = true
+    )]
     pub token_batch_rows: Option<u32>,
 
     /// Unified token batch: admit a step with only ONE participant.
@@ -1297,7 +1372,9 @@ mod tests {
             let lines: Vec<&str> = text.lines().collect();
             let cut = lines
                 .windows(2)
-                .position(|w| w[0].trim() == "#[cfg(test)]" && w[1].trim_start().starts_with("mod tests"))
+                .position(|w| {
+                    w[0].trim() == "#[cfg(test)]" && w[1].trim_start().starts_with("mod tests")
+                })
                 .unwrap_or(lines.len());
             for (i, line) in lines[..cut].iter().enumerate() {
                 for pat in ["std::env::var(\"", "std::env::var_os(\""] {

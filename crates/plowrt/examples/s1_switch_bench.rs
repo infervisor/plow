@@ -120,7 +120,7 @@ async fn main() {
     );
 
     let be = Arc::new(CudaBackend::new(0).expect("CUDA backend"));
-    let mut registry = Registry::new();
+    let registry = Registry::new();
     let slug_a = registry.load(&dir_a, None).expect("load A");
     let slug_b = registry.load(&dir_b, None).expect("load B");
     assert_ne!(slug_a, slug_b, "need two distinct networks");

@@ -95,7 +95,8 @@ pub type ChunkSender = mpsc::Sender<StreamChunk>;
 pub type ChunkReceiver = mpsc::Receiver<StreamChunk>;
 
 pub fn channel() -> (ChunkSender, ChunkReceiver) {
-    mpsc::channel(32)
+    // Up to 32 queued tokens plus a reserved terminal event.
+    mpsc::channel(33)
 }
 
 /// Serialize a chunk to its SSE `data:` payload.

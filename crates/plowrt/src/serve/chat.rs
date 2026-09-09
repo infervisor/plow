@@ -57,7 +57,7 @@ pub async fn chat_completions(
     // the manager's lock-free fast path. A switch that cannot fit sheds with
     // 503 + Retry-After (the client should back off, not hammer the planner).
     #[cfg(feature = "cuda")]
-    if let Some(mgr) = state.manager() {
+    if let Some(mgr) = state.manager_for(&req.model) {
         if mgr.manages(&req.model) {
             use crate::serve::manager::EnsureError;
             if let Err(e) = mgr.ensure_resident(&req.model).await {
@@ -65,6 +65,14 @@ pub async fn chat_completions(
                     EnsureError::WontFit { .. } => (
                         axum::http::StatusCode::SERVICE_UNAVAILABLE,
                         [("retry-after", "30")],
+                        Json(serde_json::json!({"error": e.to_string()})),
+                    )
+                        .into_response(),
+                    // No `retry-after`: retrying cannot help. The model is
+                    // resident-capable but an operator took it down, and only
+                    // an explicit load brings it back.
+                    EnsureError::Unloaded => (
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
                         Json(serde_json::json!({"error": e.to_string()})),
                     )
                         .into_response(),
@@ -768,6 +776,7 @@ fn sse_response(
                                     reasoning_content: reasoning,
                                 },
                                 finish_reason: None,
+                                x_plow_finish_reason: None,
                             }],
                             usage: None,
                         };
@@ -789,6 +798,11 @@ fn sse_response(
                                 // The wire value: "preempted" is not an OpenAI
                                 // finish_reason and a typed client rejects it.
                                 finish_reason: Some(reason.as_openai()),
+                                // ...so the true cause rides alongside it, as
+                                // it already does on the buffered path.
+                                x_plow_finish_reason: reason
+                                    .is_vendor_specific()
+                                    .then(|| reason.as_str()),
                             }],
                             usage: None,
                         };

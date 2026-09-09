@@ -97,10 +97,10 @@ fn load_and_generate() {
     let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new(4));
     let execset = Arc::new(ExecutorSet::bringup(backend).unwrap());
 
-    let mut registry = Registry::new();
+    let registry = Registry::new();
     registry.load(&dir, None).unwrap();
     assert_eq!(registry.len(), 1);
-    assert!(registry.slugs().any(|s| s == "tiny-test-model"));
+    assert!(registry.slugs().iter().any(|s| s == "tiny-test-model"));
 
     let state = AppState::new(registry, execset);
     let gen = plowrt::serve::GenParams {
