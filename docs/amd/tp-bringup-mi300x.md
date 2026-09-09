@@ -1026,6 +1026,46 @@ and fp8 KV. Any future attempt at either has to drop it first, and a packet ABI 
 room would remove the exclusivity entirely. That is a structural note for whoever picks this up —
 it is not visible from any one flag's documentation.
 
+### Sparse attention cannot close this gap — the LINEAR term is the constraint
+
+Fit `T(n) = a·n + b·n²` to the concurrency-1 scaling sweep (639.54 ms at 4096, 2902.27 at 16384,
+20866.24 at 65536): the linear term is the MoE and projection GEMMs, the quadratic is attention.
+
+```
+a = 0.13142 ms/token      b = 2.853e-6 ms/token^2
+at n = 70000:  linear 9,199 ms (40%)   attention 13,979 ms (60%)   total 23,178 ms
+```
+
+**Set the attention term to zero and plow still tops out at 1000/a = 7,609 tok/s.** vLLM reaches
+**27,000 tok/s with attention included**. So plow is **3.5x short of the target even with a
+perfect, free attention kernel** — and that bound holds however good any sparse-prefill
+implementation turns out to be.
+
+This supersedes two earlier claims in this document and one in the campaign log:
+
+* that sparse attention was worth ~2.7x of the total — it is worth at most the 60% attention share,
+  and the DSA research puts the realistic ceiling near 6x on that share rather than 34x;
+* that DSA sparse prefill is "the single highest-value item" — it is not. Even done perfectly it
+  leaves a 3.5x deficit.
+
+**The binding constraint is the MoE and projection GEMM path**, and §4 already measured why: the
+routed-expert shapes reach 160-304 TF/s where the same library reaches 1,057 TF/s on the dense
+shapes on this part, i.e. 15-29%. At top-8 of 256 over a 4096-row chunk each expert sees M=128, and
+that is where the model's weight lives — 75 of 78 layers.
+
+So the ordered work for this target is:
+
+1. **The grouped/fused MoE GEMM at small per-expert M.** The reference exists and targets this
+   part: CK's `example/65_gemm_multiply_multiply/moe_gemm1_xdl_fp8_blockscale.cpp` with
+   `Scale_Block_{M,N,K} = 1,128,128` — plow's exact scale layout — device-side routing through
+   `p_sorted_token_ids`/`p_sorted_expert_ids`, and `gufusion` pipeline variants that fuse the
+   gate/up GLU. Source, not disassembly.
+2. Sparse prefill attention, for the 60% above it.
+3. The scheduler residue (one-slot-per-tick, the two-span co-packing bootstrap).
+
+Doing (2) before (1) cannot reach the target, which is worth knowing before anyone spends a month
+on an indexer.
+
 ### The comparison IS ROCm-vs-ROCm — corrected
 
 Earlier revisions of this section hedged that the target host was unidentified and that, if it were
