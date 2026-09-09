@@ -635,4 +635,38 @@ also includes subsequent prefix-cache fixes, so this is a serving comparison,
 not an isolated kernel experiment. No builds or other GPU workloads overlap timing.
 Results are in `gemma31-h100-fp8-packed-preflight.csv`; raw proof is
 `fp8-packed-preflight-comparison.json` and `plow-fp8-packed-occ1-preflight.*` in
-the campaign directory. The full FP8 grid is pending.
+the campaign directory.
+
+## Full matched FP8 packed comparison
+
+The packed batch-16 candidate completes all 90 waves and 1875 requests across
+1K/2K/4K/8K/16K and concurrency 1/4/8/16/32/64. All requests reuse the expected
+32-token-aligned prefix; all prompt hashes, output lengths and completion texts
+match the preceding ordinary batch-4 Plow run. The six natural completions also
+match the qualified FP8 path. Retained prefix memory after the run is 3455 MiB
+against the 4096 MiB budget.
+
+Against the matched vLLM 0.28.0 FP8 reference, all 1875 prompt hashes and output
+lengths agree; 1475 completion texts agree. vLLM has one cache miss, Plow none.
+Plow loses all 30 cells on median TTFT, median end-to-end latency and median-wave
+throughput. Median TPOT is lower in one cell, 16K/C64, without a throughput win.
+
+| Input / concurrency | Plow / vLLM TTFT p50, ms | Plow / vLLM TPOT p50, ms | Plow / vLLM output tok/s |
+|---|---:|---:|---:|
+| 1K / 1 | 141 / 24 | 21.08 / 15.16 | 40.24 / 64.75 |
+| 1K / 64 | 8303 / 384 | 109.12 / 29.80 | 109.64 / 1567.88 |
+| 16K / 1 | 670 / 135 | 22.43 / 15.35 | 23.39 / 52.20 |
+| 16K / 64 | 41650 / 3165 | 130.97 / 133.28 | 27.96 / 267.17 |
+
+Both engines use the same per-channel FP8 weights and BF16 KV. Plow uses FP8
+prefill activations and BF16 decode activations; vLLM uses FP8 activations for
+both. Plow has 16 physical slots and queues higher concurrency; vLLM permits
+up to 64 sequences under its memory scheduler. The prefill limits remain 1024
+tokens for Plow and 2048 for vLLM. No builds or other GPU workloads overlap
+the timed run. These results do not qualify combined packing as the default.
+
+`gemma31-h100-fp8-packed-cached-comparison.csv` contains all cells and request
+tail distributions. Raw waves, quality captures, metrics, frozen server logs and
+verified hashes are in `plow-fp8-packed-occ1-full-qualification.json`,
+`fp8-packed-cached-comparison.json` and `fp8-packed-vs-prior-b4-quality.json`
+under the campaign directory. The compute performance goal remains unmet.
