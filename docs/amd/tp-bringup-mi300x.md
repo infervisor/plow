@@ -1810,6 +1810,45 @@ The first is preferable. Note also that `PLOW_GLM_DSA_PF_SPAN=1` is safe under t
 structural reason rather than a lucky one: a distance-1 reader always has the full run of shared
 layers between it and the next writer.
 
+#### Falsified: double-buffering the union changes nothing
+
+The write-after-read reading above is wrong, and the test that would have confirmed it refutes it.
+`n.iuni` was made two buffers indexed by full-layer parity (`glm_uni_gen`), so a writer always
+lands on the generation opposite the one its predecessors' readers are walking — the exact fix the
+hazard argument prescribes. Verified in the packet: the flash ops alternate two distinct handles,
+37 on one and 41 on the other, all 78 gathering.
+
+The all-layer build still fails, identically:
+
+```
+ needle: MISSED   ' was without without without without without ...'
+ repeat: ' the fox over dog over over the the the the the``'
+```
+
+So the mechanism is now constrained from four sides and none of them is it:
+
+* **not read-after-write** — span 1 reuses across a layer boundary and is correct;
+* **not write-after-read** — double-buffering removes that hazard entirely and changes nothing;
+* **not the indexer weights** — 4/4 bit-identical against the reference dequantisation;
+* **not a race** — the degraded output is identical across repeated identical requests, and it
+  stayed identical after the buffering change.
+
+What survives is that a 'shared' layer two or more past its indexer computes something wrong from
+a union that is byte-correct and correctly ordered. That points at the READ side — how a layer far
+from the writer indexes or interprets the table — rather than at the table's lifetime. Two things
+worth checking that this campaign did not: whether `IndexUnionPf`'s per-pack header count
+(`cnt = (unsigned*)uni`, `n_qt` entries before `hdr`) is sized or indexed against the WRITING
+layer's geometry rather than the reader's, and whether the gathered flash's `kv_len` operand
+(`d.t[6] = n.kvlen`) is per-layer state that a distant reader pairs with a stale union.
+
+The slack correlation in the table above is therefore a coincidence of the layer pattern, not a
+mechanism — with runs of three, distance and slack move together and cannot be separated by
+choosing layers. Separating them needs a synthetic `indexer_types`, which the checkpoint fixes.
+
+`PLOW_GLM_DSA_PF_SPAN=1` remains the correct, measured configuration; the defect behind spans 2
+and 3 is open, and this section records the four things it is not so the next attempt starts
+narrower than this one did.
+
 ## 8. Unrelated issue observed
 
 `cargo test -p devgen mla` fails `k3::tests::the_mla_prefill_arm_forces_one_split`
