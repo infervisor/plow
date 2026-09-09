@@ -816,6 +816,64 @@ __device__ __forceinline__ float fp4_dot32(const fp4_frag32& f, bf16v8 x0, bf16v
 #endif
 }
 
+/* 32 INT4 (one compressed-tensors group of 32) + one BF16 group scale, dotted against 32 bf16
+ * activations. The int4 twin of `fp4_prep32` / `fp4_dot32`.        [INT4-G32-DECODE]
+ *
+ * SAME SHAPE AS THE MXFP4 ARM ON PURPOSE. A lane's b128 weight load is 16 bytes = 32 int4 =
+ * EXACTLY one group of 32, so one load consumes one scale and the scale never varies inside a
+ * fragment — the alignment property `fp4v32`'s header is about, and it holds here for the same
+ * reason: group_size 32 and 4 bits. The load, the `k>>5` indexing, the wave reduction and the
+ * caller are therefore shared verbatim with the mxfp4 path; only the element decode and the
+ * scale's TYPE differ (BF16 per group here, an E8M0 byte there).
+ *
+ * THE BIAS IS WHY THIS IS NOT JUST `fp4_dot32` WITH ANOTHER CONVERTER. `plow_int4x8_to_f16x4`
+ * leaves every element high by `PLOW_INT4_BIAS`, so the true dot is
+ * `s * (sum(v_i * x_i) - 1032 * sum(x_i))`. Subtracting per element would cost 32 extra VALU per
+ * fragment; the sum of the activations costs 32 adds ONCE and is then reused, and in the MoE
+ * decode walk the same activation fragment is dotted against every routed expert row, so this
+ * term is amortized over the whole walk rather than paid per row. `xsum` is that value; a caller
+ * that has not computed it can pass the fragment's own sum. */
+struct int4_frag32 {
+    unsigned h[16]; /* raw fp16 pairs: the value biased by +1032 */
+    float s;        /* the group's BF16 scale, applied once to the finished sum */
+};
+
+__device__ __forceinline__ int4_frag32 int4_prep32(fp4v32 w, float scale) {
+    int4_frag32 f;
+#pragma unroll
+    for (int i = 0; i < 4; i++) plow_int4x8_to_f16x4((unsigned)w[i], &f.h[i * 4]);
+    f.s = scale;
+    return f;
+}
+
+/* `xsum` is sum(x0..x3) over the 32 activations — the bias term's multiplicand. */
+__device__ __forceinline__ float int4_dot32(const int4_frag32& f, bf16v8 x0, bf16v8 x1, bf16v8 x2,
+                                            bf16v8 x3, float xsum, float acc) {
+    const bf16v8 xs[4] = {x0, x1, x2, x3};
+    float p[4];
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        bf16v8_pairs xp{xs[i]};
+        float s0 = 0.0f, s1 = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            const plow_f16x2 wv = __builtin_bit_cast(plow_f16x2, f.h[i * 4 + j]);
+            /* bf16 -> f32 is a 16-bit SHIFT, not a numeric conversion — same note as fp4_dot32. */
+            const unsigned xu = __builtin_bit_cast(unsigned, xp.p[j]);
+            float xa, xb;
+            unsigned t = xu << 16;
+            __builtin_memcpy(&xa, &t, 4);
+            t = xu & 0xffff0000u;
+            __builtin_memcpy(&xb, &t, 4);
+            s0 = __builtin_fmaf((float)wv[0], xa, s0); /* v_fma_mix_f32: f16 source, f32 acc */
+            s1 = __builtin_fmaf((float)wv[1], xb, s1);
+        }
+        p[i] = s0 + s1;
+    }
+    const float biased = (p[0] + p[1]) + (p[2] + p[3]);
+    return acc + (biased - PLOW_INT4_BIAS * xsum) * f.s;
+}
+
 /* One u32 (8 fp4) + one E8M0 scale -> bf16v8, the per-word slice of fp4_to_bf16v8x4. Used by the
  * w4a16 prefill GEMM's dequant-on-load B-fetch, where the 8-half load granularity wants exactly 8
  * bf16 at a time (an 8-element load never crosses a 32-element MX block, so one scale byte covers
