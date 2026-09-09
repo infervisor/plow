@@ -508,15 +508,18 @@ pub fn spawn(
         // scan + bufs machinery on the dispatcher critical path entirely.
         #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
         let has_gpu = state.gpu_engine(&slug).is_some();
-        // Whose turn it is on this model's device. `None` on a CPU serve, and
-        // a no-op under `--co-sched free` (the default), where the driver
-        // admits whoever is ready and nothing here orders anything.
-        #[cfg(feature = "cuda")]
+        // Whose turn it is on this model's device. `None` when no turns were
+        // installed, and a no-op under `--co-sched free` (the default), where
+        // whoever is ready goes first and nothing here orders anything.
+        //
+        // Not vendor-gated. Taking turns is host-side sequencing of ticks, and
+        // every backend that can hold two models on one device wants it — AMD
+        // most of all, since HSA has no cooperative-launch refusal to turn CU
+        // oversubscription into an error instead of a hang.
         let device_turn = state.device_turn(&slug);
         // Held across ticks so a quantum can span them; dropped whenever this
-        // model parks, so an idle model never sits on a GPU its co-tenant is
+        // model parks, so an idle model never sits on a device its co-tenant is
         // waiting for.
-        #[cfg(feature = "cuda")]
         let mut turn = crate::serve::cosched::Turn::default();
         #[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
         let has_gpu = false;
@@ -540,7 +543,6 @@ pub fn spawn(
             // Drain completion: if draining and no in-flight slots remain,
             // signal the drain future and exit the dispatcher loop.
             if draining && live == 0 {
-                #[cfg(feature = "cuda")]
                 turn.release();
                 if let Some(done) = drain_done.take() {
                     let _ = done.send(());
@@ -577,7 +579,6 @@ pub fn spawn(
             if live == 0 {
                 // Parking with the turn held would starve a co-tenant for as
                 // long as this model has nothing to do, which is unbounded.
-                #[cfg(feature = "cuda")]
                 turn.release();
                 let Some(msg) = rx.recv().await else { break };
                 note_dequeued(&msg, &metrics);
@@ -921,7 +922,6 @@ pub fn spawn(
             // before submitting. Awaited HERE, off the engine thread, so a
             // model waiting for the device is not occupying a submission
             // thread while it waits.
-            #[cfg(feature = "cuda")]
             if let Some(dt) = &device_turn {
                 turn.take(dt).await;
             }

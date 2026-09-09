@@ -78,6 +78,20 @@ impl DeviceTurn {
         }
     }
 
+    /// Build a turn from `--co-sched` / `--co-sched-quantum`.
+    ///
+    /// A bad mode is refused loudly rather than falling back in silence: a
+    /// misspelled scheduler that quietly served `free` would look exactly like
+    /// a round-robin that does not work.
+    pub fn from_config() -> DeviceTurn {
+        let cfg = crate::config::RuntimeConfig::get();
+        let mode = cfg.co_sched.parse().unwrap_or_else(|e: String| {
+            tracing::error!(raw = %cfg.co_sched, %e, "invalid --co-sched; using free");
+            CoSched::Free
+        });
+        DeviceTurn::new(mode, cfg.co_sched_quantum)
+    }
+
     pub fn mode(&self) -> CoSched {
         self.mode
     }

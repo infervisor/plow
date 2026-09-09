@@ -23,6 +23,56 @@ mod common;
 use std::sync::atomic::{AtomicU32, Ordering};
 static DIR_SEQ: AtomicU32 = AtomicU32::new(0);
 
+/// The CPU-backed AppState the router is built over, for assertions that are
+/// about state wiring rather than HTTP.
+fn make_state() -> Arc<AppState> {
+    let n = DIR_SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("plowrt_admin_state_{}_{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    common::write_bundle(&dir, "state-model");
+
+    let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new(2));
+    let execset = Arc::new(ExecutorSet::bringup(backend).unwrap());
+    let registry = Registry::new();
+    registry.load(&dir, None).unwrap();
+    Arc::new(AppState::new(registry, execset))
+}
+
+/// Co-tenant scheduling is host-side sequencing of ticks, not a vendor
+/// feature. It used to be compiled out unless the CUDA feature was on, which
+/// silently disabled it on AMD — where two models already share one ROCr agent
+/// and HSA has no cooperative-launch refusal to catch the oversubscription —
+/// and on CPU, where each model owns its own worker pool.
+#[test]
+fn device_turns_are_available_without_a_gpu_backend() {
+    let state = make_state();
+    // Nothing installed yet: no turn to take.
+    assert!(state.device_turn("state-model").is_none());
+
+    state.install_device_turns(1);
+    assert!(
+        state.device_turn("state-model").is_some(),
+        "a CPU serve got no co-tenant turn — the mechanism was compiled out"
+    );
+    // A slug with no recorded group falls back to group 0 rather than to
+    // "unordered", which is what the AMD and CPU paths rely on.
+    assert!(state.device_turn("never-registered").is_some());
+}
+
+/// Group mapping is not a CUDA concept either — every backend serves a device
+/// set, they just mostly have one.
+#[test]
+fn slug_group_mapping_works_without_a_gpu_backend() {
+    let state = make_state();
+    state.install_device_turns(2);
+    assert_eq!(state.slug_group("state-model"), None);
+    state.set_slug_group("state-model", 1);
+    assert_eq!(state.slug_group("state-model"), Some(1));
+    assert!(state.device_turn("state-model").is_some());
+    state.clear_slug_group("state-model");
+    assert_eq!(state.slug_group("state-model"), None);
+}
+
 fn make_app() -> axum::Router {
     let n = DIR_SEQ.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!("plowrt_admin_{}_{n}", std::process::id()));

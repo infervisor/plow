@@ -2824,6 +2824,9 @@ async fn bringup_runtime(
                 managers.push(mgr);
             }
             state.install_managers(managers.clone());
+            // One co-tenant turn per group, installed before `load_initial`
+            // spawns the first dispatcher — a mux resolves its turn at spawn.
+            state.install_device_turns(layout.groups.len());
             // Load each group's initial residents. Sequential: the loads are
             // H2D-bound and share host bandwidth, so overlapping them buys
             // little while making a failure harder to attribute.
@@ -2837,8 +2840,13 @@ async fn bringup_runtime(
 
     // AMD/gfx950 engines. Deliberately NOT under the S1 `ModelManager`: that is
     // the multi-model residency planner (VRAM planning, co-residency, evict-LRU)
-    // and it is CUDA-only. An AMD serve is one model, loaded once, up for the
-    // life of the process — so the install is a straight loop here.
+    // and it is CUDA-only. Every bundle is loaded once and stays up for the life
+    // of the process, so the install is a straight loop here.
+    //
+    // Note that this loop DOES install an engine per bundle, and each opens
+    // ordinal 0 — so two AMD models genuinely do share one agent, with no
+    // planner accounting for it. `--co-sched rr` is the only ordering available
+    // to them until the manager grows an AMD backend.
     //
     // A bundle qualifies exactly as on the CUDA side: its assets dir carries a
     // PLOWDEV blob. It additionally needs the gfx950 code objects, whose dir is
@@ -2937,6 +2945,15 @@ async fn bringup_runtime(
             state.install_gpu_engine(slug, plowrt::serve::engine::ServeEngine::Cpu(eng));
         }
     }
+
+    // Backends other than the CUDA placement path serve ONE device set, so one
+    // turn covers it. A no-op when that path already installed the real group
+    // count. This is not CUDA-only for a reason: the AMD loop above installs an
+    // engine per bundle and each opens the same ROCr agent, so two AMD models
+    // on one card is a shape that already exists — and HSA has no
+    // cooperative-launch refusal to turn the resulting CU oversubscription into
+    // an error rather than a hang.
+    state.install_device_turns(1);
 
     // Spawn a per-model dispatcher: bucket-mux + arrival-rate batch formation.
     // Each dispatcher owns a Sender clone via AppState::mux(slug). Managed

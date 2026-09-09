@@ -337,10 +337,16 @@ pub struct AppState {
     /// on GPU 1 from serializing behind a switch on GPU 0.
     #[cfg(feature = "cuda")]
     managers: std::sync::OnceLock<Vec<Arc<manager::ModelManager>>>,
-    /// slug → index into `managers`. The request path reads it to find the
-    /// group serving a model; the control plane reports it.
-    #[cfg(feature = "cuda")]
+    /// slug → device-group index. The request path reads it to find the group
+    /// serving a model; the control plane reports it. NOT vendor-gated: the
+    /// AMD and CPU engines serve device groups too, they just only ever have
+    /// one.
     slug_group: RwLock<FxHashMap<String, usize>>,
+    /// One co-tenant turn per device group ([`cosched`]). Installed at startup
+    /// by whichever backend path came up. Vendor-neutral by construction —
+    /// taking turns is host-side sequencing, and every backend that can hold
+    /// two models on one device needs it.
+    turns: std::sync::OnceLock<Vec<Arc<cosched::DeviceTurn>>>,
     /// Directories a control-plane `load` may take an assets dir from. Set
     /// once at startup; empty means no assets dir may be named by request.
     models_roots: std::sync::OnceLock<Vec<std::path::PathBuf>>,
@@ -397,8 +403,8 @@ impl AppState {
             vmm_stats: RwLock::new(FxHashMap::default()),
             #[cfg(feature = "cuda")]
             managers: std::sync::OnceLock::new(),
-            #[cfg(feature = "cuda")]
             slug_group: RwLock::new(FxHashMap::default()),
+            turns: std::sync::OnceLock::new(),
             models_roots: std::sync::OnceLock::new(),
             residency: RwLock::new(FxHashMap::default()),
             record_trace,
@@ -436,10 +442,17 @@ impl AppState {
         }
     }
 
-    /// Remove a GPU engine (S1 eviction). The caller drops the returned `Arc`
-    /// — the last drop is the model unload that returns the VRAM.
-    #[cfg(feature = "cuda")]
+    /// Remove a GPU engine (eviction / unload). The caller drops the returned
+    /// `Arc` — the last drop is the model unload that returns the device memory.
+    ///
+    /// Available on every backend that can INSTALL an engine. It used to be
+    /// CUDA-only while `install_gpu_engine` was not, so an AMD or CPU serve
+    /// could bring an engine up and had no way to take it down — teardown is
+    /// lifecycle, not a vendor feature. Only the VMM stats handle is
+    /// CUDA-specific, and that is gated inside.
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
     pub fn remove_gpu_engine(&self, slug: &str) -> Option<Arc<Mutex<engine::ServeEngine>>> {
+        #[cfg(feature = "cuda")]
         self.vmm_stats.write().remove(slug);
         self.gpu.write().remove(slug)
     }
@@ -456,27 +469,51 @@ impl AppState {
         self.install_managers(vec![m]);
     }
 
-    /// The co-tenant turn for `slug`'s device group, when one is installed.
-    /// `None` on a CPU serve, which has no device to take turns on.
-    #[cfg(feature = "cuda")]
+    /// Install one co-tenant turn per device group (once, at startup).
+    ///
+    /// Called by every backend path, not just CUDA: two AMD models on one agent
+    /// is a thing that already happens — the AMD startup loop installs an
+    /// engine per bundle and each opens the same ROCr agent — and HSA has no
+    /// cooperative-launch refusal to catch the resulting CU oversubscription.
+    /// The CPU engine gives every model its own worker pool, so turns bound
+    /// thread contention there.
+    pub fn install_device_turns(&self, groups: usize) {
+        let turns = (0..groups.max(1))
+            .map(|_| Arc::new(cosched::DeviceTurn::from_config()))
+            .collect::<Vec<_>>();
+        if let Some(first) = turns.first() {
+            tracing::info!(
+                groups = turns.len(),
+                mode = ?first.mode(),
+                quantum = first.quantum(),
+                "co-tenant scheduling installed"
+            );
+        }
+        let _ = self.turns.set(turns);
+    }
+
+    /// The co-tenant turn for `slug`'s device group, when turns are installed.
+    ///
+    /// A slug with no recorded group takes group 0's turn: the AMD and CPU
+    /// paths serve one device set and never record a group, and defaulting to
+    /// "no turn" there would silently disable ordering on exactly the backend
+    /// that most needs it.
     pub fn device_turn(&self, slug: &str) -> Option<Arc<cosched::DeviceTurn>> {
-        self.manager_for(slug).map(|m| Arc::clone(m.turn()))
+        let turns = self.turns.get()?;
+        turns.get(self.slug_group(slug).unwrap_or(0)).map(Arc::clone)
     }
 
     /// Record which group serves `slug`.
-    #[cfg(feature = "cuda")]
     pub fn set_slug_group(&self, slug: &str, group: usize) {
         self.slug_group.write().insert(slug.to_string(), group);
     }
 
     /// Forget which group served `slug` (deregistration).
-    #[cfg(feature = "cuda")]
     pub fn clear_slug_group(&self, slug: &str) {
         self.slug_group.write().remove(slug);
     }
 
     /// The group index serving `slug`, when placement assigned one.
-    #[cfg(feature = "cuda")]
     pub fn slug_group(&self, slug: &str) -> Option<usize> {
         self.slug_group.read().get(slug).copied()
     }

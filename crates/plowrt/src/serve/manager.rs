@@ -304,9 +304,6 @@ pub struct ModelManager {
     budget: Option<u64>,
     /// Last completed switch (None until the first one).
     pub last_switch: Mutex<Option<SwitchReport>>,
-    /// Whose turn it is on this group's device, when co-resident models are
-    /// ordered rather than left to the driver (`--co-sched`).
-    turn: Arc<crate::serve::cosched::DeviceTurn>,
 }
 
 impl ModelManager {
@@ -359,10 +356,6 @@ impl ModelManager {
             overhead: Mutex::new(FxHashMap::default()),
             budget,
             last_switch: Mutex::new(None),
-            turn: Arc::new(crate::serve::cosched::DeviceTurn::new(
-                cosched_mode(),
-                crate::config::RuntimeConfig::get().co_sched_quantum,
-            )),
         })
     }
 
@@ -439,12 +432,6 @@ impl ModelManager {
     /// Every registered slug, in registration order.
     pub fn slugs(&self) -> Vec<String> {
         self.models.read().iter().map(|m| m.slug.clone()).collect()
-    }
-
-    /// This group's co-tenant turn. Shared by every model placed here — the
-    /// device is the thing being taken turns on.
-    pub fn turn(&self) -> &Arc<crate::serve::cosched::DeviceTurn> {
-        &self.turn
     }
 
     /// The device ordinals this manager's group covers. One today (a manager
@@ -977,17 +964,6 @@ fn check_single_device(slug: &str, dir: &Path) -> Result<()> {
         )));
     }
     Ok(())
-}
-
-/// `--co-sched`, refused loudly rather than silently falling back: a
-/// misspelled scheduler that quietly serves `free` would look exactly like a
-/// round-robin that does not work.
-fn cosched_mode() -> crate::serve::cosched::CoSched {
-    let raw = &crate::config::RuntimeConfig::get().co_sched;
-    raw.parse().unwrap_or_else(|e| {
-        tracing::error!(%raw, %e, "invalid --co-sched; using free");
-        crate::serve::cosched::CoSched::Free
-    })
 }
 
 /// `--drain-timeout-ms` / `PLOW_DRAIN_TIMEOUT_MS`: how long an eviction lets
