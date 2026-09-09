@@ -537,3 +537,26 @@ from performance claims. The candidate/default cubin SHA256 is
 `62a313cd4fce717db1bb13e26f85774fe59c40052700b9675e566b37d0033005`.
 Raw data, scripts, build scope checks and hashes are recorded in
 `bf16-packed-occ1-qualification.json` under the campaign directory.
+
+## Full BF16 cached workload
+
+The packed OCC1 runtime completes the full 1K/2K/4K/8K/16K grid at requested
+concurrency 1/4/8/16/32/64: three measured waves per cell, 32 generated tokens,
+and 95% requested shared prefix. All 1875 measured requests reuse the expected
+32-token-aligned prefix; none report a cache miss. All six natural completions
+match the preceding qualified BF16 runtime. Retained cache after the run is
+3935 MiB against the 4096 MiB budget. Physical capacity is eight slots; higher
+requested concurrency queues over those slots.
+
+| Input / concurrency | Request TTFT p50, ms | Request TPOT p50, ms | Median wave output tok/s |
+|---|---:|---:|---:|
+| 1K / 1 | 153 | 28.66 | 30.70 |
+| 1K / 64 | 11510 | 76.69 | 83.12 |
+| 16K / 1 | 699 | 30.02 | 19.60 |
+| 16K / 64 | 33329 | 87.56 | 31.94 |
+
+No CPU builds or other GPU workloads overlapped the run. The raw waves, quality
+capture, metrics, frozen server log and hashes are recorded in
+`plow-bf16-packed-occ1-full-qualification.json` and `plow-bf16-packed-occ1-full.*`
+under the campaign directory. This completes the Plow BF16 grid; the fresh matched
+vLLM BF16 run is still pending. It is not evidence of a vLLM performance win.
