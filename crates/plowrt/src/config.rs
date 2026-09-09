@@ -41,6 +41,11 @@ pub struct RuntimeConfig {
     )]
     pub checkpoint: Option<String>,
 
+    /// Root of the local asset store (`blobs/`, `refs/`, `bundles/`).
+    /// Defaults to `$HOME/.plow`.
+    #[arg(long = "plow-home", env = "PLOW_HOME", global = true)]
+    pub plow_home: Option<String>,
+
     /// Checkpoint prefetch depth in tensors.
     #[arg(
         long = "rt-prefetch",
