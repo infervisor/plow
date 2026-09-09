@@ -707,3 +707,16 @@ default promotion. This option is experimental and does not meet the full goal.
 Raw results and hashes are in `gemma-cublaslt-experimental-qualification.json`,
 `gemma-cublaslt-logits-comparison.json`, and
 `gemma-bf16-cublaslt-step-comparison.json` under the campaign directory.
+
+
+The fixed-width serving screen completes nine cells: 1K/4K/16K inputs at
+concurrency 1/4/8, 95% shared prefix, 32 output tokens, one measured wave after
+warmup. All 39 prompt hashes, output lengths and cache counts match the native
+packed BF16 control; 38 completion texts agree. Throughput improves in all six
+C4/C8 cells but regresses in all three C1 cells. At 1K/C8 it rises from 84.25 to
+142.78 output tokens/s; at 1K/C1 it falls from 30.67 to 28.77. TTFT is mixed:
+1K/C4 regresses from 305 to 514 ms. No builds or other GPU jobs overlap timing.
+
+All cells are in `gemma31-h100-bf16-cublaslt-preflight.csv`; raw comparison is
+`gemma-bf16-cublaslt-serving-comparison.json` in the campaign directory. These
+single-wave results support investigating adaptive widths, not default promotion.
