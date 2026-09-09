@@ -539,6 +539,103 @@ mod tests {
         }
         eprintln!("PASS compact terminal: 128 full-logit snapshots, sparse slots {slots:?}, reversed request order, sample rows 4/7");
 
+        for &slot in &slots {
+            e.retire_slot(slot, false);
+        }
+        let slots = [slots[1], slots[0]];
+        let mut requests = Vec::new();
+        for i in 0..2 {
+            e.begin_slot(slots[i], prompts[i].len() + 64).unwrap();
+            assert_eq!(e.vmm.as_ref().unwrap().kv.mapped_rows(slots[i]), 0);
+            let cached = e.attach_prompt(slots[i], &prompts[i]).unwrap();
+            assert_eq!(cached, (prompts[i].len() - 1) / 32 * 32);
+            requests.push(PfBatchReq {
+                slot: slots[i],
+                prompt: &prompts[i],
+                c0: cached,
+                len: prompts[i].len() - cached,
+            });
+        }
+        e.prefill_batched_complete(&requests, &mut output).unwrap();
+        for step in 0..64 {
+            if step > 0 {
+                e.step_slots(
+                    &[
+                        (slots[0], feeds[0][step - 1]),
+                        (slots[1], feeds[1][step - 1]),
+                    ],
+                    &mut ids,
+                )
+                .unwrap();
+            }
+            for i in 0..2 {
+                e.logits_row(if step == 0 { i } else { slots[i] }, &mut logits)
+                    .unwrap();
+                assert!(
+                    logits
+                        .iter()
+                        .zip(&expected[i][step * e.vocab..(step + 1) * e.vocab])
+                        .all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "cached case {i} step {step}"
+                );
+            }
+        }
+        eprintln!(
+            "PASS cached compact terminal: 128 full-logit snapshots, retired and swapped slots"
+        );
+
+        for &slot in &slots {
+            e.retire_slot(slot, false);
+        }
+        let prompt = &prompts[1][..2113];
+        let mut cold = Vec::new();
+        for (pass, slot) in [slots[0], slots[1]].into_iter().enumerate() {
+            e.begin_slot(slot, prompt.len() + 16).unwrap();
+            let mut pos = if pass == 0 {
+                0
+            } else {
+                let cached = e.attach_prompt(slot, prompt).unwrap();
+                assert_eq!(cached, 2112);
+                cached
+            };
+            while pos < prompt.len() {
+                let len = (prompt.len() - pos).min(e.pf_max_rows());
+                e.prefill_batched_complete(
+                    &[PfBatchReq {
+                        slot,
+                        prompt,
+                        c0: pos,
+                        len,
+                    }],
+                    &mut output,
+                )
+                .unwrap();
+                pos += len;
+            }
+            let mut next = output[0].1;
+            for step in 0..16 {
+                e.logits_row(if step == 0 { 0 } else { slot }, &mut logits)
+                    .unwrap();
+                if pass == 0 {
+                    cold.push(logits.clone());
+                } else {
+                    assert!(
+                        logits
+                            .iter()
+                            .zip(&cold[step])
+                            .all(|(a, b)| a.to_bits() == b.to_bits()),
+                        "wrapped snapshot step {step}"
+                    );
+                }
+                if step + 1 < 16 {
+                    e.step_slots(&[(slot, next)], &mut ids).unwrap();
+                    next = ids[0];
+                }
+            }
+            e.retire_slot(slot, false);
+        }
+        eprintln!("PASS cached wrapped snapshot: boundary 2112, 16 full-logit frames exact");
+
         let prompt = &prompts[0][..e.pf_max_rows()];
         e.begin_slot(0, prompt.len() + 1).unwrap();
         e.prefill_batched_complete(

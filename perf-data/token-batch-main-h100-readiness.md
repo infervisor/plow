@@ -944,3 +944,75 @@ regresses. These nearly fully cached, one-token latency measurements do not
 establish longer-output throughput or a vLLM win. The CSV is
 `gemma31-h100-packed-tail-latency.csv`; raw requests, source and artifact hashes
 are recorded in campaign `packed-tail-skip-qualification.json`.
+
+
+### Prefix snapshot copies and deferred row-zero allocation
+
+Prefix admission now waits until cache lookup before allocating private KV.
+Previously `begin_slot` mapped row zero, and `try_attach` immediately unmapped
+that allocation on a hit. Execution still maps every row it writes, including
+inactive decode rows; packed admission retains its capacity reservation.
+Live-only KV keeps its existing initialization.
+
+Sliding-window snapshots use depth-one `cuMemcpy3DAsync_v2` transfers with
+one pitched row per attention head. The snapshot layout and stream-drain
+contract are unchanged. Gemma's 50 sliding layers now need 100 driver calls
+per nonwrapped snapshot, instead of 1600; a wrapped snapshot needs at most
+200 instead of 3200. Partial full-KV and FP8 scale copies retain their existing
+implementation. The 3D API avoids the allocation-pitch restriction documented
+for `cuMemcpy2DAsync`.
+
+An isolated 800 MiB snapshot benchmark alternated 64 measured repetitions per
+variant. Median restore time fell from 4.81 to 1.27 ms without wrap and from
+8.44 to 1.55 ms with wrap. Copy-only HTTP results were mixed for BF16 and
+improved FP8 by 2–7%; that experiment is preserved separately in campaign
+`pitched-prefix-qualification.json`.
+
+The combined change was compared with `plowrt-packed-tail-skip`, using the
+same qualified native packed assets, natural 1055/16415-token prompts,
+concurrency 1/8, one-token completions, two warmup waves and 12 measured waves.
+All 864 measured requests reported the expected 1024/16384 cached tokens;
+all measured text matched. No CPU builds or other GPU jobs overlapped timing.
+All four servers stopped afterward.
+
+Median HTTP request latency, milliseconds:
+
+| Precision | Prompt | Concurrency | Previous runtime | Combined change | Reduction |
+|---|---:|---:|---:|---:|---:|
+| BF16 | 1055 | 1 | 133.20 | 123.20 | 7.5% |
+| BF16 | 1055 | 8 | 563.77 | 488.64 | 13.3% |
+| BF16 | 16415 | 1 | 205.55 | 195.66 | 4.8% |
+| BF16 | 16415 | 8 | 1202.30 | 1143.99 | 4.8% |
+| FP8 | 1055 | 1 | 124.93 | 112.84 | 9.7% |
+| FP8 | 1055 | 8 | 551.14 | 461.88 | 16.2% |
+| FP8 | 16415 | 1 | 192.43 | 184.66 | 4.0% |
+| FP8 | 16415 | 8 | 1191.76 | 1125.93 | 5.5% |
+
+This is a cached one-token latency screen, not a fresh full vLLM comparison
+or evidence of longer-output throughput. The full 1K–16K/concurrency-64 goal
+remains unmet. Results are in `gemma31-h100-prefix-admission-latency.csv`.
+
+Verification: 597 host tests passed, 18 tests ignored by the host
+suite. Explicit H100 tests pass 27 pitched-copy geometries with sentinel
+padding and byte-exact round trips. Both BF16 and FP8 pass 272 full-logit
+comparisons each, including cached reuse after retirement into swapped slots
+and a snapshot at boundary 2112 crossing the ring wrap. The cache test also
+asserts that a fresh prefix slot has no mapped rows before lookup. The initial
+backend test exposed a pageable-upload/default-stream setup race; its fixture
+now synchronizes uploads before the nonblocking copy stream starts.
+
+Default-serving checks omitted prefix, token-batch, packed-prefill and multi-step
+enable flags. Both precisions selected prefix reuse automatically and enabled
+multi-step quantum 8; CUDA unified batching still reported its explicit
+fallback. All 24 cold/warm natural completions at 1K/4K/16K matched the previous
+runtime, with every expected warm cache count.
+
+Packed pressure checks completed eight concurrent cold 16K requests for BF16
+and sixteen for FP8, followed by exact isolated replays and short recovery
+requests. Admission exercised its memory-pressure wait path. Both precisions
+passed the three API lifecycle checks (ragged prompts/output limits/slot reuse,
+cancellation/recovery, and context rejection/recovery). All owned servers stopped.
+Campaign `prefix-lazy-qualification.json` records source and 46 artifact hashes.
+
+The checkpoint request for BF16 weights with FP8 KV is a separate configuration:
+the results above use BF16 KV for both weight precisions.

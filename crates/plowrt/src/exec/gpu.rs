@@ -4915,30 +4915,32 @@ impl GpuEngine {
         let g = v.kv.geometry();
         let w = g.window.min(p_a) as u64;
         let hd_b = (g.hd_slide * g.elem_slide) as u64;
-        let ring = v.ring;
+        let start = (p_a as u64 - w) & (v.ring - 1);
+        let run1 = w.min(v.ring - start);
         let mut off = buf;
         for &(ik, iv, stride) in &v.slide {
             for idx in [ik, iv] {
                 let base = self.devp[idx].base + b as u64 * stride;
-                for h in 0..g.kvh_slide as u64 {
-                    let hb = base + h * ring * hd_b;
-                    let start = (p_a as u64 - w) & (ring - 1);
-                    let run1 = w.min(ring - start);
-                    let (r1, s1) = (hb + start * hd_b, off);
-                    let (r2, s2) = (hb, off + run1 * hd_b);
-                    if to_snap {
-                        self.be.memcpy_dtod_async(s1, r1, run1 * hd_b, &self.stream)?;
-                        if run1 < w {
-                            self.be.memcpy_dtod_async(s2, r2, (w - run1) * hd_b, &self.stream)?;
-                        }
+                for (dev, snap, rows) in [
+                    (base + start * hd_b, off, run1),
+                    (base, off + run1 * hd_b, w - run1),
+                ] {
+                    let ring = (dev, v.ring * hd_b);
+                    let snapshot = (snap, w * hd_b);
+                    let (dst, src) = if to_snap {
+                        (snapshot, ring)
                     } else {
-                        self.be.memcpy_dtod_async(r1, s1, run1 * hd_b, &self.stream)?;
-                        if run1 < w {
-                            self.be.memcpy_dtod_async(r2, s2, (w - run1) * hd_b, &self.stream)?;
-                        }
-                    }
-                    off += w * hd_b;
+                        (ring, snapshot)
+                    };
+                    self.be.memcpy_dtod_pitched_async(
+                        dst,
+                        src,
+                        rows * hd_b,
+                        g.kvh_slide,
+                        &self.stream,
+                    )?;
                 }
+                off += u64::from(g.kvh_slide) * w * hd_b;
             }
         }
         Ok(())
@@ -5202,8 +5204,8 @@ impl GpuEngine {
         // VMM: publish the finished sequence's generated whole blocks first —
         // a follow-up turn embedding this turn's output then attaches instead
         // of re-prefilling it — then drop the previous sequence's mappings/
-        // cache references and re-map row 0 (idle-row garbage writes land
-        // there).
+        // cache references. Prefix admission maps after lookup; every execution
+        // path maps the rows it writes, including inactive decode rows.
         self.vmm_tail_publish(b);
         self.pos[b] = 0;
         self.vmm_attached[b] = 0;
@@ -5212,7 +5214,9 @@ impl GpuEngine {
             self.seq_tokens[b].clear();
             self.seq_tokens[b].reserve(total);
             v.kv.begin_seq(b);
-            v.kv.ensure_rows(b, 1)?;
+            if !v.kv.prefix_reuse() {
+                v.kv.ensure_rows(b, 1)?;
+            }
         }
         Ok(())
     }
