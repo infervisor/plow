@@ -600,6 +600,69 @@ tradeoff on this list is `PLOW_TP_NO_AUDIT` (+5.4%, at the cost of the check tha
 silently wrong token); recording it does not resolve that, it just makes it auditable before
 someone ships it by accident.
 
+## 5b. Kimi-K2.7-Code — the critical path to serving, costed
+
+§5's gate list is now ordered by what actually blocks: the **checkpoint encoding**, not the
+emitter. `mla_ckpt_enc` refuses with `ckpt_quant_compressed-tensors` before any emit decision is
+reached, so every other gate is downstream of this one.
+
+### What the checkpoint is, measured from a shard header
+
+Routed experts only — the `ignore` list leaves attention, shared experts, dense MLP and `lm_head`
+in bf16:
+
+| tensor | dtype | shape | meaning |
+|---|---|---|---|
+| `…experts.N.gate_proj.weight_packed` | `I32` | `[2048, 896]` | 8 x int4 per int32; 896*8 = 7168 = K |
+| `…experts.N.gate_proj.weight_scale` | `BF16` | `[2048, 224]` | 224 = 7168/32, one scale per group |
+| `…experts.N.gate_proj.weight_shape` | `I32` | `[2]` | |
+
+`kimi_k3_prep.py` records that K3's mxfp4 experts are *byte-for-byte* what `DevOp::GemvMxfp4`
+wants — `weight_packed` `[N, K/2]` u8 with the low nibble at even k, `weight_scale` one **E8M0
+byte** per 32 of K. K2.7-Code shares the tensor NAMES and the group size and matches on neither
+of the three things that matter:
+
+1. **container** — `I32 [N, K/8]` against `U8 [N, K/2]`;
+2. **scale dtype** — `BF16` against `E8M0` (a power-of-two exponent byte);
+3. **value encoding** — int4 symmetric (uniform) against e2m1 (non-uniform float4).
+
+So this is a requantization, not a relabelling.
+
+### The three routes, with the capacity each needs
+
+1.015 T routed-expert params (384 experts x 3 mats x 2048 x 7168 x 60 MoE layers):
+
+| route | total | GB/rank TP8 | % of a 206.1 GB card | arm |
+|---|---:|---:|---:|---|
+| int4 g32 + bf16 scale (as shipped) | 571 GB | 71.3 | 34.6% | **none — no MoeEnc variant** |
+| requantize to mxfp4 g32 + e8m0 | 539 GB | 67.4 | 32.7% | shipped (`MoeEnc::Mxfp4`) |
+| dequantize to fp8 e4m3 + [128,128] block | 1015 GB | **126.9** | **61.6%** | shipped (`MoeEnc::Fp8Blk`) |
+
+**The fp8 route is the one to take first**, despite being the largest:
+
+* it fits with room — 126.9 GB/rank leaves ~79 GB for KV, activations and the non-expert weights,
+  where §3's TP4 failure was at 94.7% occupancy;
+* it reuses the arm GLM-5.3 is **already qualified on** in this document (ops 45/46/48/49,
+  block-fp8 e4m3 with a [128,128] `weight_scale_inv` grid) rather than a second arm;
+* it is numerically a WIDENING. e4m3 carries more precision than int4, so dequantizing the
+  shipped values into fp8 reproduces them closely. Requantizing to mxfp4 instead stacks a
+  *second* lossy quantization — into a different, non-uniform grid — on top of a checkpoint
+  Moonshot trained with QAT **for int4**. That risk is real and unquantified, and it is the wrong
+  thing to accept on a first bringup when a safer arm fits.
+
+The native int4-g32 arm (route 1) stays the right end state: it is exact, and it is the smallest
+of the three. It is new kernel work, and it should be measured against the fp8 route rather than
+assumed faster — §4 already shows fp8 LOSING to bf16 on DSV4's `expert down` at M=96, so narrow
+weights do not automatically win at decode-shaped M.
+
+### Gates after the encoding, unchanged in substance
+
+Full-model emit (`kimi_emit_block` is `--block`-only; the `glm_main` analogue is unwritten), the
+derived MLA tensors a prep must write (`q_absorb`, `kv_a_latent`, `k_rope`, `q_rope`, `v_absorb` —
+`kimi_k3_prep.py` is the working template, and it already handles this checkpoint's
+`language_model.model.` wrapper prefix), the tokenizer (`tiktoken.model`, no `tokenizer.json`),
+and the dense-arm prefill fault localised in §5.
+
 ## 8. Unrelated issue observed
 
 `cargo test -p devgen mla` fails `k3::tests::the_mla_prefill_arm_forces_one_split`
