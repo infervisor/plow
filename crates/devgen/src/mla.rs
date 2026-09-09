@@ -8090,9 +8090,28 @@ pub(crate) fn kimi_emit_block(
         "tp={tp} must divide n_head={} (each rank owns a whole head shard)",
         c.heads
     );
-    let enc = mla_moe_enc_env(dir);
-    let use_fp8 = enc == MoeEnc::Fp8Blk;
     let block = parse_block(spec, c.layers as usize);
+    // The checkpoint's expert encoding is an authority over a block that HAS routed experts.
+    // Consulting it unconditionally made a dense-FFN block inherit the refusal owed to the MoE
+    // layers, which takes the single-block bringup path (docs/bringup/05-single-block-sweep.md)
+    // away from exactly the checkpoints that need it most: a model whose experts are in an
+    // encoding plow cannot emit is still worth extracting an attention block from.
+    //
+    // NARROWED HERE AND NOT IN `glm_emit_block`, and that asymmetry is the checkpoints, not an
+    // oversight. Kimi-K2.7-Code quantizes ONLY the routed experts — its `ignore` list names
+    // `self_attn`, `shared_experts`, `mlp.(gate|up|down)_proj` and `lm_head` — so its dense
+    // layers really are bf16. GLM-5.3-FP8 is block-fp8 THROUGHOUT, dense FFN included, so the
+    // same narrowing there would emit bf16 ops against fp8 dense weights: the very substitution
+    // `mla_ckpt_enc` exists to refuse.
+    //
+    // A block that does carry routed experts still consults it and still refuses.
+    let has_moe = (block.start..block.end).any(|l| !c.is_dense(l as u32));
+    let enc = if has_moe {
+        mla_moe_enc_env(dir)
+    } else {
+        MoeEnc::Bf16
+    };
+    let use_fp8 = enc == MoeEnc::Fp8Blk;
     let model = dir
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
