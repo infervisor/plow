@@ -1398,6 +1398,45 @@ the rows are cut into, which amortizes the per-tile FIXED cost. The falsified re
 evidence for this one: if weight bandwidth were the constraint, halving it would not have
 returned 3.3%.
 
+#### Measured: MPF_BM=128 is -5.1%, which bounds the tile hypothesis rather than confirming it
+
+Two objects differing in `MPF_BM` and nothing else, both with `PLOW_MOE_PF_EPI=0` because the
+hoist `#error`s unless `MPF_BM == PLOW_WAVE` — comparing a BM=128/EPI=0 build against the
+shipped BM=64/EPI=1 one would have measured the hoist. Same dense packet, same lease, one 70k
+request each:
+
+```
+                    flash        interp        total
+ BM=64  EPI=0     15,016 ms     9,381 ms     24,397 ms
+ BM=128 EPI=0     15,038 ms     8,903 ms     23,941 ms
+                   +0.1%         -5.1%
+```
+
+Flash is unchanged to 0.1%, which is the control working: the lever must not touch attention.
+Both arms return the correct continuation, so the wider tile is numerically sound — worth
+recording, because it means the 64-row assumptions in the epilogue are the only thing standing
+between this and a shipping config.
+
+**-5.1% is the useful part, and it is a bound, not a win.** Halving the tile count halves every
+per-tile fixed cost the short k-loop cannot amortize, and it bought 5%. So the per-tile overhead
+is NOT where 87.7 TF/s against a 2,615 TF/s fp8 peak goes. Together with the chunk-16384 test
+(+3.3%, which doubled rows per expert and so halved the weight stream), the two amortization
+hypotheses are now both bounded at about 5%:
+
+* not the weight stream — halving it returned 3.3%;
+* not the tile count — halving it returned 5.1%.
+
+What is left is the inside of the k-loop, which is where `PLOW_MOE_PF_PIPE`'s note already
+locates it: the shipped loop's waits are dataflow-forced, draining to `vmcnt(0)` three or four
+times per k-tile where aiter's `fmoe` sustains 13-39 outstanding loads on partial waits. That is
+a kernel rewrite against a reference, not a tile parameter, and it is the honest description of
+the remaining 3-7x.
+
+Note also that BM=128/EPI=0 (8,903 ms) is still slower than the SHIPPED BM=64/EPI=1 (8,254 ms):
+banking the 5% requires generalising the epilogue hoist to two waves — one load and a lane-half
+select per row block instead of one `ds_bpermute_b32` — which is worth doing only alongside the
+k-loop work, not for its own sake.
+
 ## 8. Unrelated issue observed
 
 `cargo test -p devgen mla` fails `k3::tests::the_mla_prefill_arm_forces_one_split`

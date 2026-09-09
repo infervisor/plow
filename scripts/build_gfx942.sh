@@ -674,6 +674,24 @@ if [ "${PLOW_MOE_PF_EPI:-1}" != 0 ]; then
   AX_PREFILL="$AX_PREFILL -DPLOW_MOE_PF_EPI=${PLOW_MOE_PF_EPI:-1}"
 fi
 
+# MPF_BM A/B escape hatch for the PREFILL objects (the decode row has carried its MPF_BK twin
+# since the OCC4 recut). The grouped MoE prefill GEMM is the term that binds once attention is
+# sparse -- 11.8 ms per layer per rank, 87.7 TF/s, 3.4% of this part's fp8 peak -- and TP8 is
+# what makes its overhead PER-TILE rather than per-byte: `down`'s K is moe_intermediate/TP =
+# 2048/8 = 256, so its k-loop runs FOUR iterations while gemm1's runs ninety-six, and it emits
+# 24 n-tiles per m-tile against gemm1's 4. Raising BM halves the tile count and so halves the
+# fixed cost that k-loop is too short to amortize. At 128 the arena still fits: the single
+# buffer is (128+256)*64*2 = 49,152 B against `plow_smem`'s 64,512, and MPF_DBUF stays 1
+# exactly as it already is at BM=64 (2*40,960 is already over budget). docs 7h.
+#
+# PLOW_MOE_PF_EPI must come OFF with it: that hoist puts one m-tile row per LANE of a single
+# wave and reads it back with `ds_bpermute_b32`, so op_moe.h `#error`s unless
+# MPF_BM == PLOW_WAVE. A BM=128 arm therefore has to be compared against a BM=64 arm built with
+# EPI=0 too, or the measurement is the hoist and not the tile.
+if [ -n "${MPF_BM:-}" ]; then
+  AX_PREFILL="$AX_PREFILL -DMPF_BM=$MPF_BM"
+fi
+
 # OPT-IN (PLOW_MOE_PF_EPI_SIB=1): THE SAME HOIST AT THE TWO SIBLING SITES (op_moe.h
 # PLOW_MOE_PF_EPI_SIB) -- `d_moe_group_pf_a4w4` (native CDNA4 and simulated CDNA3) and
 # `d_moe_group_gemma_pf_t` (the Gemma-4 MoE twin, ops 75/76 and 81/82; its w8a8 arm carries a
