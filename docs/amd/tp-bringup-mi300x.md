@@ -1849,6 +1849,49 @@ choosing layers. Separating them needs a synthetic `indexer_types`, which the ch
 and 3 is open, and this section records the four things it is not so the next attempt starts
 narrower than this one did.
 
+## 7o. The reference could not be reproduced on this host
+
+Everything in 7d through 7n ranks work against 273.67 out tok/s / 905 ms median TTFT, taken from
+a pasted `vllm bench serve` summary. 7f corrected an earlier hedge by asserting the comparison
+"IS ROCm-vs-ROCm" on the same silicon. That assertion was never tested. It has now been, and the
+reference stack does not run here.
+
+vLLM 0.28.0 from `/app/plow/.venv-vllm028`, serving `/workspace/models/GLM-5.3-FP8` at
+`--tensor-parallel-size 8 --max-model-len 80000` on these eight MI300X:
+
+```
+ without AITER   loads all 141 shards, initialises the MoE, then raises
+                 RuntimeError("Sparse attention indexer ROCm path is only supported on
+                 AITER. Please enable aiter with VLLM_ROCM_USE_AITER=1")
+                 -- vllm/model_executor/layers/sparse_attn_indexer.py:878
+
+ with AITER      *** stack smashing detected ***: terminated
+                 aborts before emitting a single log line. Reproduced twice, with
+                 PYTHONUNBUFFERED=1 and PYTHONFAULTHANDLER=1 on the second.
+```
+
+So on this host, in this environment, vLLM cannot serve GLM-5.3 with sparse attention at all —
+it refuses without AITER and crashes with it.
+
+**What this does and does not mean.** It does not show the reference numbers are wrong; they were
+plainly produced somewhere, and the FLOP argument in 7g independently shows they must come from a
+sparse path, which the refusal above confirms is exactly the path vLLM takes for this model. What
+it does mean is narrower and worth stating plainly:
+
+* the "14x on identical silicon" framing is **unverified**. The comparison host, its AITER build
+  and its serving flags are all unknown to this campaign;
+* nothing here establishes that 273.67 is reachable on THIS host's software stack, because the
+  only implementation known to reach it will not start on it;
+* the one number this campaign could have anchored on — a reference run reproduced under the same
+  conditions as the plow runs — does not exist.
+
+Every plow measurement in this document stands: they are self-consistent, controlled, and
+reproduce to ±0.09%. The prefill decomposition, the sparse-prefill gain, the ablation shares and
+the union defect are all unaffected. What is affected is the TARGET, and therefore the ranking of
+any future work against it. Before more effort is spent closing a 14x gap, someone should
+establish that gap on hardware and software that can be run side by side — either by getting the
+AITER path working here, or by obtaining the reference run's host and configuration.
+
 ## 8. Unrelated issue observed
 
 `cargo test -p devgen mla` fails `k3::tests::the_mla_prefill_arm_forces_one_split`
