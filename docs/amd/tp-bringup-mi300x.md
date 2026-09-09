@@ -822,6 +822,39 @@ attention path never uses it. So the GEMMs stream and the flash kernel — 75% o
 3. **MFMA shape.** AITER's materialized kernel is `32x32x8` exclusively; it uses `16x16x16` only for
    the *absorbed* skinny-M kernels. plow's flash is 60% `16x16x16`.
 
+### Adapted, and measured: +21.7% prefill
+
+`cp_async4` (`amd_common.h` [LDS-DMA-4B]) + `FA_LDS_DMA` (`op_attention.h`, opt-in via
+`PLOW_FA_LDS_DMA=1`). Single request, 70k input, TP8, same packet and serve env; the only
+difference is a flash object built with the axis on:
+
+| | baseline | + direct-to-LDS | Δ |
+|---|---:|---:|---|
+| prefill | 2,529 tok/s | **3,078 tok/s** | **+21.7%** |
+| TTFT (70k) | 27,678 ms | **22,742 ms** | **−17.8%** |
+| TPOT | 35.24 ms | 35.14 ms | unchanged |
+
+TPOT not moving is the control: this is a prefill-staging change and decode does not use the path.
+
+**`cp_async16` could not supply it.** It asks for 16 B/lane, which is CDNA4-only, so its CDNA3 arm
+is a VGPR-staged copy — it spends exactly the registers the technique exists to save. gfx942
+implements 4 B/lane, and a HIP probe confirms clang emits `global_load_lds_dword` for it.
+
+**Issue count is not the lever.** Unrolling the staging loops took the object from 6 to 36
+direct-to-LDS sites and prefill did not move (22,745 vs 22,742 ms). The win is removing the VGPR
+staging, not the number of issues — so AITER's 132 sites are a consequence of their unrolling, not
+the reason their kernel is fast. `unroll 1` is kept: same throughput, less code.
+
+Three gates caught real defects on the way, none of which would have shown up as a wrong number:
+a fallback that loaded FP8KV as bf16 (the ASM contract refused it — that arm dequantizes WHILE
+staging); a blanket `static_assert` that failed the build for a 64-wide rope tile which cannot use
+a 128-bf16 issue (now `if constexpr`); and a dropped preprocessor `#else` that removed the loop
+header at `FA_LDS_DMA=0`.
+
+Remaining gap to §7e's target is still large — this is ~22% of a ~10x deficit — but it is the
+first measured movement on the prefill bottleneck, and it came from the one structural difference
+the AITER disassembly identified.
+
 ### The comparison target is not ROCm-vs-ROCm
 
 Worth stating before adapting anything: **GLM-5.3's head geometry has no AITER ASM kernel.** The
