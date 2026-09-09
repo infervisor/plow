@@ -49,22 +49,47 @@ fn packed_defaults_preserve_backend_contracts_and_ladders() {
             for selection in [None, Some(true), Some(false)] {
                 cfg.emit_packed_prefill = selection;
                 let out = root.join("model.pkt");
-                devgen::run(devgen::EmitArgs {
-                    dir: root.clone(),
-                    ctx: 2048,
-                    out: out.display().to_string(),
-                    n_cu: if arch == "gfx942" { 304 } else { 132 },
-                    tp: 1,
-                    block_spec: None,
-                    embed_cubin: None,
-                    embed_hsaco: None,
-                    rope_gen: true,
-                    l2_layout: None,
-                    gpu: String::new(),
-                    arch: arch.into(),
-                    emit_cfg: Some(cfg.clone()),
-                    whole_graph_fusions: devgen::WholeGraphFusionDecisions::default(),
-                });
+                let amd_bf16 = arch == "gfx942" && precision.is_empty();
+                devgen::run_verified(
+                    devgen::EmitArgs {
+                        dir: root.clone(),
+                        ctx: 2048,
+                        out: out.display().to_string(),
+                        n_cu: if arch == "gfx942" { 304 } else { 132 },
+                        tp: 1,
+                        block_spec: None,
+                        embed_cubin: None,
+                        embed_hsaco: None,
+                        rope_gen: true,
+                        l2_layout: None,
+                        gpu: String::new(),
+                        arch: arch.into(),
+                        emit_cfg: Some(cfg.clone()),
+                        whole_graph_fusions: devgen::WholeGraphFusionDecisions::default(),
+                    },
+                    Some(Box::new(move |model| {
+                        if amd_bf16 {
+                            let flash: Vec<_> = model
+                                .progs
+                                .iter()
+                                .flat_map(|p| &p.insts)
+                                .filter(|i| i.op == packet::dev::DevOp::FlashPrefill as u16)
+                                .collect();
+                            assert!(!flash.is_empty());
+                            assert_eq!(
+                                flash
+                                    .iter()
+                                .all(|i| i.i[7] == 1 && i.t[5] != packet::dev::TENSOR_NONE),
+                                selection != Some(false)
+                            );
+                        }
+                        Ok(devgen::LeanReport {
+                            verified: false,
+                            oracle: false,
+                            reason: Some("structural contract test".into()),
+                        })
+                    })),
+                );
                 let blob = std::fs::read(out).unwrap();
                 let manifest: serde_json::Value =
                     serde_json::from_slice(&std::fs::read(root.join("build.json")).unwrap())
@@ -115,12 +140,14 @@ fn packed_defaults_preserve_backend_contracts_and_ladders() {
                     } else {
                         assert!(fp8_cap.is_null());
                     }
+                }
+                if arch == "sm_90a" || amd_bf16 {
                     if selection.is_none() {
                         automatic = Some(blob);
                     } else if selection == Some(true) && !cfg.fp8_kv {
                         assert!(
                             automatic.as_ref().unwrap() == &blob,
-                            "automatic vs explicit packet differs: {precision:?}"
+                            "automatic vs explicit packet differs: {arch} {precision:?}"
                         );
                     }
                 }

@@ -71,13 +71,30 @@ fn production_defaults_are_capability_and_target_driven() {
     apply_production_defaults(&mut amd, emit_capabilities("gemma4"), "gfx942", 1);
     assert_eq!(amd.decode_rungs(), [1, 2, 4, 8]);
     assert!(amd.decode_ladder_default);
-    // Packed prefill stays sm_90a-only; the decode ladder moving does not move it.
+    assert!(amd.packed_prefill_on());
+    amd.emit_packed_prefill = Some(false);
     assert!(!amd.packed_prefill_on());
 
     let mut other_target = EmitArgsForTest::try_parse_from(["test"]).unwrap().emit;
     apply_production_defaults(&mut other_target, emit_capabilities("gemma4"), "gfx950", 1);
     assert_eq!(other_target.decode_rungs(), [1]);
     assert!(!other_target.packed_prefill_on());
+}
+
+#[test]
+fn amd_packed_defaults_require_dense_bf16_single_gpu() {
+    for flag in ["--fp8", "--w8a8", "--w8a16", "--fp8-kv"] {
+        let mut cfg = EmitArgsForTest::try_parse_from(["test", flag])
+            .unwrap()
+            .emit;
+        apply_production_defaults(&mut cfg, emit_capabilities("gemma4"), "gfx942", 1);
+        assert!(!cfg.packed_prefill_on(), "{flag}");
+    }
+    for (model, tp) in [("gemma4", 2), ("qwen3_5", 1), ("kimi_k3", 1)] {
+        let mut cfg = EmitArgsForTest::try_parse_from(["test"]).unwrap().emit;
+        apply_production_defaults(&mut cfg, emit_capabilities(model), "gfx942", tp);
+        assert!(!cfg.packed_prefill_on(), "{model} tp={tp}");
+    }
 }
 
 #[test]

@@ -1518,3 +1518,37 @@ Artifacts: campaign `amd-token-batch-cmake/hsaco`; evidence and logs:
 `amd-token-batch-*`. No AMD or NVIDIA device was launched. These are build and
 load-contract checks; AMD numerical/production qualification remains open.
 The sealed H100 release remains unchanged.
+
+## Fresh AMD compiler defaults reach the unified route
+
+A fresh Gemma31 gfx942 packet still failed unified admission after the object
+build fix: its 128-row prefill bucket used ten attention splits, while the
+runtime requires unsplit attention with a fused epilogue. Synthesis alone had
+passed and was insufficient evidence of route eligibility.
+
+The compiler now defaults packed emission on for dense BF16 gfx942 TP1 packets.
+This produces the unsplit prefill programs required by the existing runtime
+route. Explicit disablement remains available. AMD quantized weights, FP8 KV,
+TP and unsupported targets retain their prior automatic selection. NVIDIA
+selection is unchanged; no new model-family list was introduced.
+
+Host evidence: the actual Gemma31 packet failed at `nsplit=10` before the change.
+Fresh automatic emission now passes all prefill admission, scratch-capacity and
+operator-contract checks with decode1/2/4/8 and prefill128/512/1024 retained at
+context32768. Its packet bytes equal explicit enablement. Explicit disablement
+reproduces the previous full packet byte-for-byte. The compiler's 27-case emit
+matrix checks AMD unsplit/fused emission, automatic/explicit parity, rollback,
+both backend ladders and existing precision policies.
+
+Candidate packets are campaign `bf16-b8-c1024-gfx942-packed-{auto,on,off}`;
+the prior control is `bf16-b8-c1024-default-gfx942-candidate`.
+Logs: `amd-fresh-default-*.log`. Changing the attention partition on fresh AMD
+packets still needs numerical and performance validation on hardware. GPU
+launches remain paused and these candidates have no new device qualification.
+
+Final checks: six compiler-default unit tests, 27 emitted cases, the actual
+packet contract test, 652 runtime host tests and separate HSA/CUDA all-target
+checks pass. The release build includes the shared admission fix. Development
+binary: campaign `bin/plowrt-shared-defaults-c263-plus-admission`, SHA-256
+`3e6ed3b9eb2ee5a4ae46c4f0486d71466996205a85fa76de96762909923bd735`.
+It is separate from the sealed production-testing release.

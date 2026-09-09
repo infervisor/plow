@@ -6947,8 +6947,10 @@ fn apply_production_defaults(
         // parsed. This is the only place in the tree where the two differ.
         emit_config::note_production_default("decode_ladder", ladder.into());
     }
-    cfg.packed_prefill_default =
-        capabilities.dense_packet_contracts && arch == "sm_90a" && tp == 1 && !cfg.fp8_kv;
+    cfg.packed_prefill_default = capabilities.dense_packet_contracts
+        && tp == 1
+        && !cfg.fp8_kv
+        && (arch == "sm_90a" || (arch == "gfx942" && !cfg.any_fp8_weights()));
 }
 
 fn cublaslt_emit_supported(

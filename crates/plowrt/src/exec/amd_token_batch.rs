@@ -210,6 +210,84 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "CPU packet inspection; set TEST_AMD_TOKEN_BATCH_ASSETS to a fresh BF16 Gemma31 packet"]
+    fn fresh_gemma_packet_preserves_rungs_and_passes_unified_contracts() {
+        use crate::asset::devblob::DevBlob;
+        use packet::dev::{DevOp, TENSOR_NONE16};
+        use plow_asset::mixed_step::TensorContract;
+
+        let directory = PathBuf::from(std::env::var_os("TEST_AMD_TOKEN_BATCH_ASSETS").unwrap());
+        let raw = std::fs::read(directory.join("model.pkt")).unwrap();
+        let blob = DevBlob::parse_l2(&raw, true).unwrap();
+        assert_eq!(
+            blob.decode_progs().iter().map(|p| p.t).collect::<Vec<_>>(),
+            [1, 2, 4, 8]
+        );
+        let batch = blob.decode_progs().last().unwrap().t as usize;
+        let synthesized = crate::exec::mixed_program::synthesize(&blob, batch, false).unwrap();
+        assert_eq!(
+            synthesized
+                .programs
+                .iter()
+                .map(|p| p.program.rows)
+                .collect::<Vec<_>>(),
+            [128, 512, 1024]
+        );
+        let mut tensors: Vec<_> = blob
+            .tensors
+            .iter()
+            .map(|t| TensorContract {
+                name: &t.name,
+                bytes: t.bytes,
+                initialized: t.init.is_some(),
+            })
+            .collect();
+        for tensor in &synthesized.tensors {
+            tensors.resize(
+                tensors.len().max(tensor.handle as usize + 1),
+                TensorContract {
+                    name: "",
+                    bytes: 0,
+                    initialized: false,
+                },
+            );
+            tensors[tensor.handle as usize] = TensorContract {
+                name: &tensor.name,
+                bytes: tensor.bytes,
+                initialized: false,
+            };
+        }
+        for spec in &synthesized.programs {
+            let program = &spec.program;
+            assert!(program
+                .insts
+                .iter()
+                .any(|i| i.op == DevOp::FlashPrefill as u16));
+            for inst in program
+                .insts
+                .iter()
+                .filter(|i| i.op == DevOp::FlashPrefill as u16)
+            {
+                admit_token_batch(0, inst.i[7], inst.t[5] != TENSOR_NONE16)
+                    .unwrap_or_else(|e| panic!("bucket {}: {e}", program.rows));
+            }
+            plow_asset::mixed_step::dense_amd_capacity_consumer_contract(
+                program,
+                spec.decode_rows,
+                &tensors,
+            )
+            .unwrap();
+            plow_asset::token_batch::Capabilities::amd_dense_gqa(
+                "gfx942",
+                program.rows,
+                spec.decode_rows,
+            )
+            .refuse_program(program.insts.iter().map(|i| i.op))
+            .unwrap();
+        }
+    }
+
+    #[test]
     #[ignore = "CPU ELF inspection; set TEST_AMD_TOKEN_BATCH_OBJECTS to the compiled object directory"]
     fn compiled_objects_advertise_token_batch_and_reject_mixed_control() {
         use super::super::{elf_symbol_names, elf_symbol_u32};
