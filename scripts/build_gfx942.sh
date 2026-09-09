@@ -674,6 +674,13 @@ if [ "${PLOW_MOE_PF_EPI:-1}" != 0 ]; then
   AX_PREFILL="$AX_PREFILL -DPLOW_MOE_PF_EPI=${PLOW_MOE_PF_EPI:-1}"
 fi
 
+# CEILING INSTRUMENT ONLY (PLOW_GEMM_ABL=1): the DENSE GEMM with its k-loop capped at one tile
+# (op_gemm.h PLOW_GEMM_ABL) -- the twin of the MoE ablation below, for the projections. WRONG
+# OUTPUT, never a serve asset.
+if [ "${PLOW_GEMM_ABL:-0}" != 0 ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_GEMM_ABL=${PLOW_GEMM_ABL}"
+fi
+
 # CEILING INSTRUMENT ONLY (PLOW_MOE_PF_ABL=1): the grouped MoE prefill GEMM with its k-loop
 # capped at one tile (op_moe.h PLOW_MOE_PF_ABL). WRONG OUTPUT by construction, never a serve
 # asset -- the same contract as PLOW_MLA_PF_ABL and PLOW_XR_NOWAIT above. It prices the k-loop

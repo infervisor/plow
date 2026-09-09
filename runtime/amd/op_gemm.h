@@ -1,3 +1,20 @@
+
+/* CEILING INSTRUMENT ONLY (-DPLOW_GEMM_ABL=1) -- the dense twin of op_moe.h's
+ * PLOW_MOE_PF_ABL. Caps this GEMM's k-loop at ONE tile: wrong output by construction, never a
+ * serve asset. The MoE ablation showed the grouped GEMM's k-loop is 21.6% of the linear term
+ * and the collective's sync 1.3%, leaving 77% unattributed; the dense projections are the
+ * largest named candidate for it, and the emit's own dispatch audit already reports them
+ * filling 10.5-42.1% of the machine. Full minus ablated is their inner loop's share, with
+ * staging, epilogue and dispatch still paid. docs/amd/tp-bringup-mi300x.md 7i/7j. */
+#ifndef PLOW_GEMM_ABL
+#define PLOW_GEMM_ABL 0
+#endif
+#if PLOW_GEMM_ABL
+#define PLOW_GEMM_ABL_NT(nt) ((nt) > 1u ? 1u : (nt))
+#else
+#define PLOW_GEMM_ABL_NT(nt) (nt)
+#endif
+
 /* op_gemm.h — bf16 MFMA GEMM family (CDNA4 / gfx950).
  *
  *   C[M,N] = A[M,K] . B[N,K]^T
@@ -776,7 +793,7 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
         }
         __syncthreads();
 
-        const unsigned NT = (K + BK - 1) / BK;
+        const unsigned NT = PLOW_GEMM_ABL_NT((K + BK - 1) / BK);
         unsigned buf = 0;
         /* PGR2 PRIMES BANK 0 WITH K-TILE 1 HERE, one k-tile ahead of the loop.
          * From then on iteration kt fetches tile kt+2 into the bank it is NOT about to commit,
@@ -1620,7 +1637,7 @@ __device__ void d_gemm_fp8_t(bf16* __restrict__ C, const unsigned char* __restri
         GM8_COMMIT(0);
         __syncthreads();
 
-        const unsigned NT = (K + FBK - 1) / FBK;
+        const unsigned NT = PLOW_GEMM_ABL_NT((K + FBK - 1) / FBK);
         unsigned buf = 0;
         if (PP && wm == 1) __builtin_amdgcn_s_barrier();
 

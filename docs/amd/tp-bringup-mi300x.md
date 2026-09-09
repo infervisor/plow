@@ -1683,6 +1683,60 @@ over a segment total rather than from an ablation, and each was wrong about its 
 between 3x and an order of magnitude. Every number in this section and 7i cost one define, one
 rebuild and one 70k request, and the controls hold to 0.04%.
 
+### The map, finished: 12.8% of prefill is GEMM math
+
+`PLOW_GEMM_ABL=1` is the dense twin of the MoE instrument — it caps `d_gemm_t`'s and the
+fused-8 GEMM's k-loop at one tile. Same contract, same discipline:
+
+```
+                     flash        interp        total
+ full              15,021 ms     8,266 ms     23,287 ms
+ dense k-loop cap  14,786 ms     6,767 ms     21,553 ms
+                    -1.6%        -18.1%
+```
+
+The full arm has now reproduced across four independent leases at 8,251 / 8,253 / 8,254 /
+8,266 ms — ±0.09% on an 8.25 s measurement.
+
+With four ablations the 70k prefill decomposes completely:
+
+```
+ total                          25,657 ms
+   attention                    17,391 ms   67.8%
+   linear                        8,266 ms   32.2%
+     MoE GEMM k-loop             1,780 ms   21.5% of linear   PLOW_MOE_PF_ABL
+     dense projection k-loop     1,499 ms   18.1%             PLOW_GEMM_ABL
+     TP collective sync            109 ms    1.3%             PLOW_XR_NOWAIT
+     orchestration / movement    4,878 ms   59.0%             by difference
+
+ ALL GEMM inner-loop math        3,279 ms = 12.8% of prefill
+ everything else                22,378 ms = 87.2%
+```
+
+**Twelve point eight percent of this prefill is the multiply-accumulate loops.** Every kernel
+this campaign proposed to rewrite — the CK grouped GEMM, the MPF tile, the aiter-style k-loop
+pipeline — lives inside that 12.8%, and their combined theoretical ceiling is a 1.15x on the
+request.
+
+The dense projections run at 150 TF/s per rank over their 2.25e14 FLOP, which is consistent with
+the occupancy the emitter already reports for them (10.5-42.1% of dispatch). But like the MoE
+GEMM, they are too small a share to carry the target on their own.
+
+The 4,878 ms of orchestration is now the largest single item in the linear path and the least
+examined thing in this document: the MoE align op, the `row_token` gather, the padded-row
+scatter and combine, the `fu_g` round trip, the norms and ropes, the per-op dispatch, and the
+collective's data movement (which `XR_NOWAIT` does not touch — it removes waits, not the ~175 MB
+per rank per layer the two-shot actually moves). Attention at 17,391 ms remains the larger term
+overall and is 6.3x recoverable once the distance-2 union defect is fixed.
+
+**The lesson that generalises past this model.** Four ablations, one define each, cost about
+three hours and moved every ranked item in this document. The rankings they replaced were built
+by dividing segment totals by FLOP counts — a method that cannot distinguish a kernel from the
+sixty percent of the segment that is not a kernel, and which was wrong here by between 3x and an
+order of magnitude every time it was used. The instruments are now in the tree
+(`PLOW_MOE_PF_ABL`, `PLOW_GEMM_ABL`, alongside the existing `PLOW_MLA_PF_ABL` and
+`PLOW_XR_NOWAIT`); the next person to rank work on this target should ablate first.
+
 ## 8. Unrelated issue observed
 
 `cargo test -p devgen mla` fails `k3::tests::the_mla_prefill_arm_forces_one_split`
