@@ -1662,14 +1662,14 @@ pub(crate) struct GlmTn {
     iidx_pf: u32,     // i32 [T][top_k] per-query selection (-1 pads)
     iuni: u32,        // per-64-query-tile union table (see op 119)
     iumask: u32,      // u64 [n_qt][ctx] membership scratch for the union build
-    qidx: u32,        // rope'd indexer query [HI*DI]
-    kidx_raw: u32,    // wk @ xn [DI] (pre-norm)
-    kidx_normed: u32, // k_norm(kidx_raw) [DI] (pre-rope)
-    widx: u32,        // weights_proj @ xn [HI]
-    iscore: u32,      // f32 [ctx] indexer scores
-    iidx: u32,        // i32 [index_topk] selected positions (the gather idx; shared reuse target)
-    ighist: u32,      // u32 [7*256] radix histograms (host-zeroed once)
-    igctl: u32,       // u32 [3] grid-barrier ctl (host-zeroed once)
+    qidx: u32,        // rope'd indexer query [B][HI*DI]
+    kidx_raw: u32,    // wk @ xn [B][DI] (pre-norm)
+    kidx_normed: u32, // k_norm(kidx_raw) [B][DI] (pre-rope)
+    widx: u32,        // weights_proj @ xn [B][HI]
+    iscore: u32,      // f32 [B][ctx] indexer scores
+    iidx: u32, // i32 [B][index_topk] selected positions (the gather idx; shared reuse target)
+    ighist: u32, // u32 [7*256] radix histograms (host-zeroed once)
+    igctl: u32, // u32 [3] grid-barrier ctl (host-zeroed once)
     icos: u32,
     isin: u32,
     // `index_kpool>1` DECODE-path per-step scratch (TENSOR_NONE otherwise). `iidx`/`iscore`
@@ -1999,16 +1999,16 @@ pub(crate) fn declare_glm_rows_batched(
     let idx_on = dsa || c.dsa_pf();
     let (qidx, kidx_raw, kidx_normed, widx, iscore, iidx, ighist, igctl) = if dsa {
         (
-            ac(b, "qidx", (hi * di) as u64 * BF16),
-            ac(b, "kidx_raw", di as u64 * BF16),
-            ac(b, "kidx_normed", di as u64 * BF16),
-            ac(b, "widx", hi as u64 * BF16),
-            ac(b, "iscore", ctx as u64 * F32),
+            ac(b, "qidx", dbatch as u64 * (hi * di) as u64 * BF16),
+            ac(b, "kidx_raw", dbatch as u64 * di as u64 * BF16),
+            ac(b, "kidx_normed", dbatch as u64 * di as u64 * BF16),
+            ac(b, "widx", dbatch as u64 * hi as u64 * BF16),
+            ac(b, "iscore", dbatch as u64 * ctx as u64 * F32),
             // `+ (index_kpool - 1)` headroom for `DsaPoolExpand`'s tail-append (`topk +
             // pool_size - 1` output slots, see its packet doc comment) — a no-op at
             // index_kpool==1 (`c.index_kpool.max(1) - 1 == 0`), so GLM-5.2's `iidx` byte size
             // is unchanged.
-            ac(b, "iidx", select_width as u64 * I32),
+            ac(b, "iidx", dbatch as u64 * select_width as u64 * I32),
             b.tensor_init("act.ighist", vec![0u8; 7 * 256 * 4]),
             b.tensor_init("act.igctl", vec![0u8; 3 * 4]),
         )
@@ -3544,7 +3544,7 @@ pub(crate) fn emit_glm_mla(
     let full = dsa && w.iwqb != TENSOR_NONE; // 'full' indexer layer (weights bound only there)
     let itk = c.index_topk.min(ctx);
     let c_sel = emit_glm_dsa_decode_select(
-        b, c, n, w, slot, ctx, rows, enc, &all, eps, ql, h, c_rnq, c_rn1, &rq, &rk,
+        b, c, n, w, slot, ctx, rows, dbatch, enc, &all, eps, ql, h, c_rnq, c_rn1, &rq, &rk,
     );
     // 9 FLASH (MLA) DECODE — dense (ctx<=2048) or GATHER over the top_k selected latent rows (ctx>2048).
     //   Runs this rank's nh_l head-shard; the latent ckv/krot caches are REPLICATED (all heads read
@@ -3782,6 +3782,7 @@ fn emit_glm_dsa_decode_select(
     slot: usize,
     ctx: u32,
     rows: u32,
+    dbatch: u32,
     enc: MoeEnc,
     all: &[u32],
     eps: f32,
@@ -3794,14 +3795,9 @@ fn emit_glm_dsa_decode_select(
 ) -> u32 {
     let one = vec![0u32];
     let dsa = c.dsa(ctx);
-    // The indexer is single-row end to end: `IndexSelect` has no batch axis (one cooperative
-    // grid-sync over one [ctx] score array) and every scratch row (`iscore`/`iidx`/`qidx`/...)
-    // is declared one row wide. A batched gate would need per-row histograms and a widened
-    // scratch family; refuse until that exists.
     assert!(
-        !(dsa && rows > 1),
-        "DSA indexer with a batched decode program (rows={rows}): IndexSelect and the indexer \
-         scratch are single-row. Emit the ladder blob with PLOW_GLM_DSA=0 or max-ctx <= 65536."
+        !(dsa && rows > 1 && c.index_kpool > 1),
+        "batched pooled DSA decode is not qualified; emit a single-row ladder or disable DSA"
     );
     // The DSA lightning indexer has NO MXFP4 path: plow reads `wq_b`/`wk`/`weights_proj` as bf16
     // and none of the three ops takes an encoding. (A block-fp8 checkpoint does quantize wq_b and
@@ -3831,7 +3827,7 @@ fn emit_glm_dsa_decode_select(
                 d.t[0] = out;
                 d.t[1] = x;
                 d.t[2] = wt;
-                d.i[0] = 1;
+                d.i[0] = rows;
                 d.i[1] = nn;
                 d.i[2] = k;
             })
@@ -3841,8 +3837,8 @@ fn emit_glm_dsa_decode_select(
         let c_q0 = gemv_blk(b, n.qidx, n.qlat, w.iwqb, hi * di, ql, &[c_rnq]);
         // The indexer ropes are concurrent with each other AND with the q/k pair above (all four
         // hang off the input norm), so they continue the same disjoint allocation.
-        let riq = rope_cus(all, rq.len() + rk.len(), 1, hi);
-        let rik = rope_cus(all, rq.len() + rk.len() + riq.len(), 1, 1);
+        let riq = rope_cus(all, rq.len() + rk.len(), rows, hi);
+        let rik = rope_cus(all, rq.len() + rk.len() + riq.len(), rows, 1);
         let c_qi = b.emit(DevOp::HeadNormRope, riq.clone(), &[c_q0], |d| {
             d.t[0] = n.qidx;
             d.t[1] = n.qidx;
@@ -3850,7 +3846,7 @@ fn emit_glm_dsa_decode_select(
             d.t[3] = n.icos;
             d.t[4] = n.isin;
             d.t[5] = n.pos;
-            d.i[0] = 1;
+            d.i[0] = rows;
             d.i[1] = hi;
             d.i[2] = di;
             d.i[3] = 0;
@@ -3868,7 +3864,7 @@ fn emit_glm_dsa_decode_select(
             d.t[1] = n.kidx_raw;
             d.t[2] = w.iknw;
             d.t[3] = w.iknb;
-            d.i[0] = 1;
+            d.i[0] = rows;
             d.i[1] = di;
             d.i[3] = 0;
             d.f[0] = 1e-6; // k_norm eps
@@ -4010,14 +4006,17 @@ fn emit_glm_dsa_decode_select(
                 d.t[3] = n.icos;
                 d.t[4] = n.isin;
                 d.t[5] = n.pos;
-                d.i[0] = 1;
+                d.i[0] = rows;
                 d.i[1] = 1;
                 d.i[2] = di;
                 d.i[3] = 0;
                 d.i[4] = 1;
                 d.i[5] = 1;
                 d.f[0] = eps;
-                d.j[0] = 0;
+                if rows > 1 || dbatch > 1 {
+                    d.i[6] = rows;
+                    d.j[0] = ctx;
+                }
                 d.j[1] = KV_MASK_NONE;
             });
             // w = weights_proj @ xn  [HI]  (bf16 GEMV)
@@ -4028,7 +4027,7 @@ fn emit_glm_dsa_decode_select(
                 d.t[0] = n.widx;
                 d.t[1] = n.xn;
                 d.t[2] = w.iwp;
-                d.i[0] = 1;
+                d.i[0] = rows;
                 d.i[1] = hi;
                 d.i[2] = h;
                 d.f[0] = 1.0;
@@ -4041,7 +4040,7 @@ fn emit_glm_dsa_decode_select(
                 d.t[2] = n.kidx[slot];
                 d.t[3] = n.widx;
                 d.t[4] = n.kvlen;
-                d.i[0] = 1;
+                d.i[0] = rows;
                 // i1/i3 are the indexer geometry the ISA contract has always specified (dev_isa.h:419)
                 // and that this emitter left at ZERO, while `interp.hip` hardcoded `DI_=128, HI_=32`.
                 // They are now WRITTEN — see `glm_assert_indexer_geom` for why writing them is not the
@@ -4061,20 +4060,26 @@ fn emit_glm_dsa_decode_select(
             // see d_index_select_coop). All 32 are co-resident under the persistent interp (256 CUs
             // resident, this op gates on INDEX_SCORE, so its 32 WGs run together).
             let sel_wgs: Vec<u32> = (0..32.min(b.n_cu())).collect();
-            b.emit(DevOp::IndexSelect, sel_wgs, &[c_sc], |d| {
-                d.t[0] = n.iidx;
-                d.t[1] = n.iscore;
-                d.t[2] = n.ighist;
-                d.t[3] = n.igctl;
-                // The LIVE kv occupancy. `i[0]` below is only the packet's max ctx, and INDEX_SCORE
-                // writes `iscore[pos]` for `pos < kvlen` ONLY — so without this operand the radix
-                // ranked `ctx - kvlen` never-written words and selected rows past the end of the
-                // latent cache, which the gather then read unmasked. DSA arms only above a 64k
-                // crossover, so that gap was the overwhelming majority of every scan.
-                d.t[4] = n.kvlen;
-                d.i[0] = ctx;
-                d.i[1] = itk;
-            })
+            let mut selected = c_sc;
+            // Each row owns the shared radix histogram/control until its successor starts.
+            for row in 0..rows {
+                selected = b.emit(DevOp::IndexSelect, sel_wgs.clone(), &[selected], |d| {
+                    d.t[0] = n.iidx;
+                    d.t[1] = n.iscore;
+                    d.t[2] = n.ighist;
+                    d.t[3] = n.igctl;
+                    // The LIVE kv occupancy. `i[0]` below is only the packet's max ctx, and INDEX_SCORE
+                    // writes `iscore[pos]` for `pos < kvlen` ONLY — so without this operand the radix
+                    // ranked `ctx - kvlen` never-written words and selected rows past the end of the
+                    // latent cache, which the gather then read unmasked. DSA arms only above a 64k
+                    // crossover, so that gap was the overwhelming majority of every scan.
+                    d.t[4] = n.kvlen;
+                    d.i[0] = ctx;
+                    d.i[1] = itk;
+                    d.i[3] = row;
+                });
+            }
+            selected
         }
     } else {
         0

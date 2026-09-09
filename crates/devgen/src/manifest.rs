@@ -307,6 +307,7 @@ struct Shapes {
     /// arm it falls to never reads `t[7]`. The result is full causal attention where the model
     /// was trained sparse: no trap, no NaN, a fluent answer to a different question.
     glm_dsa_pf: bool,
+    dsa_decode_batch: bool,
     /// Any `FlashMlaPrefill` (op 51) with `i[3]` bit 31 — a NoPE (zero-rope) MLA, which the
     /// four-wave V2 kernel can only run if it carries the `<512, 0>` instantiation
     /// (PLOW_MLA_PF2_NOPE_ARM). An object that predates the arm traps on the packet rather than
@@ -503,6 +504,9 @@ fn shapes(m: &Model) -> Shapes {
                     if inst.t[3] != packet::TENSOR_NONE {
                         s.attention_sinks = true;
                     }
+                }
+                DevOp::IndexSelect => {
+                    s.dsa_decode_batch |= inst.i[3] != 0;
                 }
                 DevOp::FlashMlaPrefill => {
                     if (inst.i[6] & 0xff) > 1 && inst.t[7] == packet::TENSOR_NONE {
@@ -807,6 +811,7 @@ fn encoding_features(f: &mut Map<String, Value>, s: &Shapes) {
     f.insert("mla_pf_ns".into(), json!(s.mla_pf_ns));
     f.insert("glm_ofold".into(), json!(s.glm_ofold));
     f.insert("glm_dsa_pf".into(), json!(s.glm_dsa_pf));
+    f.insert("dsa_decode_batch".into(), json!(s.dsa_decode_batch));
     f.insert("mla_pf_nope".into(), json!(s.mla_pf_nope));
     f.insert("glm_fuse_rope".into(), json!(s.glm_fuse_rope));
     f.insert("glm_fuse_qnorm".into(), json!(s.glm_fuse_qnorm));
@@ -1195,6 +1200,9 @@ fn backend_amd(
     // enforces both.
     if on("glm_ofold") {
         req.push("PLOW_GLM_OFOLD=1".into());
+    }
+    if on("dsa_decode_batch") {
+        req.push("PLOW_DSA_DECODE_BATCH=1".into());
     }
     // The DSA sparse V2 prefill arm (op 51 t[7] = union table). A BUILD AXIS that is OFF by
     // default, so this is the strongest entry in the list after PLOW_K3: absence does not mean
@@ -2950,6 +2958,28 @@ mod tests {
         };
         assert!(qpre_req(true).iter().any(|r| r == "PLOW_KDA_CHUNK_QPRE=1"));
         assert!(!qpre_req(false).iter().any(|r| r == "PLOW_KDA_CHUNK_QPRE=1"));
+    }
+
+    #[test]
+    fn dsa_decode_batch_requires_a_row_aware_object() {
+        for row in [0, 1, 7] {
+            let mut d = inst(DevOp::IndexSelect, [0; 8]);
+            d.i[3] = row;
+            let m = Model {
+                n_cu: 256,
+                target: 0,
+                tensors: vec![],
+                progs: vec![prog(vec![d])],
+                kv_row_insts: vec![],
+                prog_t: vec![1],
+                gen: vec![],
+            };
+            let manifest = build(&m, "gfx942");
+            let req = manifest["backends"]["gfx942"]["requires"]
+                .as_array()
+                .unwrap();
+            assert_eq!(req.iter().any(|r| r == "PLOW_DSA_DECODE_BATCH=1"), row != 0);
+        }
     }
 
     /// The three arms multiplexed onto `FlashMlaPrefill`'s `i[6]`/`t[7]` must ask for the

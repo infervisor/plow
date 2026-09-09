@@ -2204,3 +2204,44 @@ index scoring/selection, attention and collective work. Per-packet body/stall
 times overlap and include protocol work; they are not additive wall attribution.
 The H200 serving target remains unmet, and the kernel ratios above are not a
 claim of a new serving speedup. No speculative decoding was added.
+
+## 12. Batched sparse decode and the CDNA3 index-score LDS fix (2026-09-09)
+
+The decode indexer now supports the 1/2/4/8 ladder. Scratch is sized by decode
+capacity; projections, normalization and scoring use the live rung width.
+Indexer key writes use each slot's position, including the one-row rung of a
+B8 blob. Selection serializes one row per packet over the shared radix scratch,
+with `IndexSelect.i[3]` selecting the score/index/KV-length row. Gathered MLA
+already has the corresponding batch axis. The loader requires the new object
+marker and retains the CUDA refusal for batched DSA.
+
+Full-model testing exposed a separate existing defect: the MI300X decode
+index-score kernel carved **78,464 bytes** from a **64 KiB LDS** arena. It used
+the CDNA4 256-position tile. CDNA3 now uses a 128-position tile occupying
+**43,648 bytes**, with a compile-time assertion against the actual interpreter
+arena. CDNA4 retains its original tile. The loader also rejects old CDNA3
+score objects for single-row DSA.
+
+The first concurrent retrieval screen passed only **2/18** cases. Rebuilding
+the score kernel with the smaller tile, using the same packet and runtime settings,
+raised that to **18/18**: concurrency 8, actual prompt lengths 5433–5438 and
+68797–68802, three depths and three facts. This is limited retrieval evidence.
+The independent GPU oracle checks all live scores for eight distinct rows,
+exact top-k sets with ties and poisoned tails, and repeated shared-scratch use.
+Emitter tests cover row strides, capacities and selection dependencies;
+loader/manifest tests cover object compatibility. The final emitter reproduces
+the tested B8 packet byte-for-byte.
+
+A 20-request serving screen with the reference's variable 70k/700 lengths,
+ratio 0.14 and concurrency 20 completed **20/20, zero failures** in **489.35 s**.
+Output throughput increased **23.63 → 28.19 tok/s (+19.3%)**, mean TPOT fell
+**264.88 → 218.68 ms**, and mean TTFT fell **223.01 → 195.14 s**. Both screens
+have identical per-request input/output counts, totaling 1,414,538 input and
+13,795 output tokens. This before/after comparison combines native AITER
+prefill and sparse decode; it does not isolate either change. The candidate
+retains TP audit and B8 capacity. It is not the 100-request H200 comparison.
+
+See the [DSA decode qualification and reproduction](../../runtime/bench/amd/dsa_decode/README.md).
+Pooled batched DSA, MXFP4 indexers and batched FP8 KV remain unsupported.
+Sparse decode requires disabling the incompatible q-RoPE fusion. No speculative
+decoding is added; H200 serving parity remains unproven.

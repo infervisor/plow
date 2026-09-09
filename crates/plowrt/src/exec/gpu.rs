@@ -2526,6 +2526,17 @@ impl GpuEngine {
                     source,
                 })?;
                 let blob = DevBlob::parse(&raw)?;
+                if blob
+                    .progs
+                    .iter()
+                    .flat_map(|p| &p.insts)
+                    .any(|d| d.op == DevOp::IndexSelect as u16 && d.i[3] != 0)
+                {
+                    return Err(RuntimeError::Device(
+                        "batched DSA selection is currently supported only by the AMD interpreter"
+                            .into(),
+                    ));
+                }
                 Ok((pkt, raw, blob))
             };
             if let Some(tm) = load_tim.as_mut() {

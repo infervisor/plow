@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Concurrent GLM retrieval screen. Arguments: server URL, arm label, output JSON."""
 
+import argparse
 import concurrent.futures
 import importlib.util
 import json
 from pathlib import Path
-import sys
 import time
 import urllib.request
 
@@ -17,7 +17,13 @@ spec.loader.exec_module(needle)
 
 
 def main():
-    url, arm, path = sys.argv[1:]
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("url")
+    parser.add_argument("arm")
+    parser.add_argument("path")
+    parser.add_argument("--concurrency", type=int, choices=range(1, 33), default=4)
+    args = parser.parse_args()
+    url, arm, path = args.url, args.arm, args.path
     model = json.load(urllib.request.urlopen(url + "/v1/models"))["data"][0]["id"]
     cases = []
     for length in (8000, 100000):
@@ -43,12 +49,12 @@ def main():
         )
 
     records = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.concurrency) as pool:
         for future in concurrent.futures.as_completed([pool.submit(run, case) for case in cases]):
             record = future.result()
             records.append(record)
             print(json.dumps(record), flush=True)
-            Path(path).write_text(json.dumps(dict(arm=arm, concurrency=4, cells=records), indent=2) + "\n")
+            Path(path).write_text(json.dumps(dict(arm=arm, concurrency=args.concurrency, cells=records), indent=2) + "\n")
     assert all(record["passed"] for record in records), "retrieval failures"
 
 

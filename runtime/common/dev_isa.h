@@ -517,8 +517,9 @@ enum {
      * host-patched every decode step); i2=pool_size (GLM-5.3-Flash pooled indexer, DEFAULT 1 — unset
      * on every existing emission, dispatch treats zero as 1, no existing blob changes) divides it down
      * to whatever granularity len_max/Score were emitted in. t0=idx(i32) t1=Score(f32) t2=gHist(u32
-     * [7*256]) t3=gCtl(u32[3]) t4=kv_len(i32); i0=len_max i1=top_k i2=pool_size. Host zeroes gHist/gCtl
-     * once; kernel leaves them clean. [GLM52-DSA] */
+     * [7*256]) t3=gCtl(u32[3]) t4=kv_len(i32); i0=len_max i1=top_k i2=pool_size i3=batch_row. Score/idx use
+     * [batch][len_max/top_k] strides; kv_len uses batch_row. Rows serialize over gHist/gCtl.
+     * Host zeroes gHist/gCtl once; kernel leaves them clean. [GLM52-DSA] */
     PLOW_DOP_INDEX_SELECT = 59,
 
     /* LayerNorm WITH bias + mean-subtract (d_layernorm_bias, op_norm.h): the DSA indexer k_norm

@@ -727,6 +727,9 @@ extern "C" __device__ unsigned plow_gate_hier_1 = 1;
 #ifndef PLOW_GQ_BATCH
 #define PLOW_GQ_BATCH 1
 #endif
+#if PLOW_GQ_BATCH == 1 && (!PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_INDEX_SELECT)
+extern "C" __device__ unsigned plow_dsa_decode_batch_arm = 1;
+#endif
 /* Hoist the instruction fetch above the gate poll (see the probe at the poll). Default OFF. */
 #ifndef PLOW_INST_PF
 #define PLOW_INST_PF 0
@@ -4253,18 +4256,22 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
          * scheduler — the DECODE DEFAULT — the workgroup running a stream entry is not the entry's
          * logical index, so a blockIdx.x stride left slabs of `Score` UNWRITTEN. Carves three
          * scratch tiles from the raw arena: qlds (HI*QSTRIDE bf16) | ktile
-         * (TILE_N*KSTRIDE bf16) | wlds (HI f32) = 78464 B, well under the raw arena (147464 B) so
-         * occupancy is unchanged (relmax 0.0000 vs the _fast/scalar path).
+         * (TILE_N*KSTRIDE bf16) | wlds (HI f32). CDNA3 uses 128 positions (43648 B);
+         * the 256-position CDNA4 tile needs 78464 B and overruns CDNA3's 64 KiB LDS.
          * index_head_dim=128, index_n_heads=32 are GLM-fixed (template).
          * t0=Score t1=Qidx t2=Kidx t3=W t4=kv_len; i0=n_batch i2=kv_stride; f0=scale. [GLM52-DSA] */
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_INDEX_SCORE
         case PLOW_DOP_INDEX_SCORE: {
             constexpr int DI_ = 128, HI_ = 32;
-            constexpr int QSTRIDE = DI_ + FA_PAD, KSTRIDE = DI_ + FA_PAD, TILE_N = PLOW_WAVES * 32;
+            constexpr int QSTRIDE = DI_ + FA_PAD, KSTRIDE = DI_ + FA_PAD;
+            constexpr int TILE_N = (PLOW_CDNA4 ? PLOW_WAVES : (PLOW_WAVES < 4 ? PLOW_WAVES : 4)) * 32;
+            static_assert((HI_ * QSTRIDE + TILE_N * KSTRIDE) * sizeof(bf16)
+                              + HI_ * sizeof(float) <= sizeof(sm->raw),
+                          "DSA score tiles exceed interpreter LDS");
             bf16* qlds = (bf16*)sm->raw;
             bf16* ktile = qlds + HI_ * QSTRIDE;
             float* wlds = (float*)(ktile + TILE_N * KSTRIDE);
-            d_index_score_mfma<DI_, HI_>((float*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+            d_index_score_mfma<DI_, HI_, TILE_N>((float*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
                                          (const bf16*)TEN(3), (const int*)TEN(4), in->i[0], in->i[2],
                                          in->fj[0].f, slice, nblk, qlds, ktile, wlds);
             break;
@@ -4298,7 +4305,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
             const unsigned pool_size = in->i[2] ? in->i[2] : 1u;
             d_index_select_coop((int*)TEN(0), (const float*)TEN(1), in->i[0], in->i[1],
                                 (unsigned*)TEN(2), (unsigned*)TEN(3), slice, nblk, lh, lh + 256,
-                                (const int*)TEN(4), pool_size);
+                                (const int*)TEN(4), pool_size, in->i[3]);
             break;
         }
 #endif

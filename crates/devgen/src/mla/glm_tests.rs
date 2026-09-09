@@ -397,6 +397,79 @@ fn glm_dsa_selector_is_bound_to_the_live_kv_length_and_declares_its_geometry() {
 }
 
 #[test]
+fn glm_dsa_decode_batch_strides_producers_and_serializes_selection() {
+    let mut c = glm_ref_cfg();
+    c.indexer_full[3] = true;
+    let ctx = 81920;
+    let mut tb = Builder::new(256);
+    let n = declare_glm_rows_batched(&mut tb, &c, ctx, &[3], 8192, 8, MoeEnc::Fp8Blk);
+    let tensors = tb.tensors();
+    for (handle, bytes) in [
+        (n.qidx, 8 * 32 * 128 * 2),
+        (n.kidx_raw, 8 * 128 * 2),
+        (n.kidx_normed, 8 * 128 * 2),
+        (n.widx, 8 * 32 * 2),
+        (n.iscore, 8 * ctx * 4),
+        (n.iidx, 8 * 2048 * 4),
+    ] {
+        assert_eq!(tensors[handle as usize].bytes, bytes as u64);
+    }
+    for rows in [1, 2, 8] {
+        let mut b = Builder::new(256);
+        b.adopt_tensors(tensors.clone());
+        emit_glm_block(
+            &mut b,
+            &c,
+            &n,
+            0,
+            ctx,
+            rows,
+            8,
+            MoeEnc::Fp8Blk,
+            n.x,
+            n.xnext,
+            &[],
+            &mut 0,
+            &[],
+        );
+        let prog = b.finish();
+        for output in [n.qidx, n.kidx_raw, n.kidx_normed, n.widx, n.iscore] {
+            for d in prog.insts.iter().filter(|d| d.t[0] == output) {
+                assert_eq!(d.i[0], rows, "producer op {}", d.op);
+            }
+        }
+        let writer = prog.insts.iter().find(|d| d.t[0] == n.kidx[0]).unwrap();
+        assert_eq!((writer.i[0], writer.i[6], writer.j[0]), (rows, rows, ctx));
+        let select: Vec<_> = prog
+            .insts
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.op == DevOp::IndexSelect as u16)
+            .collect();
+        assert_eq!(select.len(), rows as usize);
+        for (row, (_, d)) in select.iter().enumerate() {
+            assert_eq!((d.i[0], d.i[1], d.i[3]), (ctx, 2048, row as u32));
+            assert_eq!(d.t[4], n.kvlen);
+        }
+        for pair in select.windows(2) {
+            let before = prog
+                .stream
+                .iter()
+                .find(|e| e.inst as usize == pair[0].0)
+                .unwrap();
+            let after = prog
+                .stream
+                .iter()
+                .find(|e| e.inst as usize == pair[1].0)
+                .unwrap();
+            let succs = &prog.succs[before.succ_ofs as usize..][..before.succ_len as usize];
+            let waits = &prog.waits[after.wait_ofs as usize..][..after.wait_len as usize];
+            assert!(waits.iter().any(|w| succs.contains(&w.id)));
+        }
+    }
+}
+
+#[test]
 fn glm_dsa_full_layer_emits_indexer() {
     use DevOp::*;
     // ctx>CROSSOVER, 'full': indexer (2 fp8 projections + LayerNorm + 2 rope + weights_proj GEMV +

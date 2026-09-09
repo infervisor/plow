@@ -4828,7 +4828,7 @@ __device__ void d_index_score_fast(float* __restrict__ Score, const bf16* __rest
  * __shfl_xor(.,32) folds the two halves into score[pos]. Q fragments (A operand, rows = heads) are
  * hoisted to VGPR once per batch and reused across every key slab; only K streams. bf16 in, fp32
  * accumulate — same math as the scalar/fast path (relmax 0.0000 vs the CPU weighted-ReLU ref). */
-template <int DI, int HIc>
+template <int DI, int HIc, int TILE_N = PLOW_WAVES * 32>
 __device__ void d_index_score_mfma(float* __restrict__ Score, const bf16* __restrict__ Qidx,
                                    const bf16* __restrict__ Kidx, const bf16* __restrict__ W,
                                    const int* __restrict__ kv_len, unsigned n_batch,
@@ -4840,7 +4840,7 @@ __device__ void d_index_score_mfma(float* __restrict__ Score, const bf16* __rest
     constexpr int NK = DI / MFMA_K;          /* wide-K contraction steps (DI=128 -> 8)   */
     constexpr int QSTRIDE = DI + FA_PAD;     /* padded LDS row to break bank conflicts    */
     constexpr int KSTRIDE = DI + FA_PAD;
-    constexpr int TILE_N = PLOW_WAVES * 32;  /* positions per workgroup slab (8*32 = 256) */
+    static_assert(TILE_N % 32 == 0 && TILE_N <= PLOW_WAVES * 32);
     auto* const Sc = as_glob(Score);
     const auto* const Qg = as_glob(Qidx);
     const auto* const Kg = as_glob(Kidx);
@@ -4886,28 +4886,30 @@ __device__ void d_index_score_mfma(float* __restrict__ Score, const bf16* __rest
                     (pos < len) ? ld_glob8(&Kg[((size_t)b * kv_stride + pos) * DI + c8]) : bf16v8_zero();
             }
             __syncthreads(); /* key slab visible to all waves before the MFMA reads */
-            /* this wave's 32-position subtile: D[head][pos] = Qidx . Kidx over DI. */
-            const unsigned krow0 = wave * 32; /* first ktile row this wave owns */
-            f32x16 acc = (f32x16)(0.0f);
+            if (wave < TILE_N / 32) {
+                /* this wave's 32-position subtile: D[head][pos] = Qidx . Kidx over DI. */
+                const unsigned krow0 = wave * 32; /* first ktile row this wave owns */
+                f32x16 acc = (f32x16)(0.0f);
 #pragma unroll
-            for (int ks = 0; ks < NK; ks++) {
-                const unsigned d0 = mfma_frag_k(lane, ks * MFMA_K);
-                const bf16x8 kfrag = __builtin_bit_cast(bf16x8, ld_lds8(&ktile[(krow0 + frow) * KSTRIDE + d0]));
-                acc = plow_mfma_bf16_32x32(qf[ks], kfrag, acc);
-            }
-            /* epilogue: this lane owns pos = lane%32, and 16 of the 32 heads (l and l+32 split). */
-            const unsigned mbase = 4 * (lane / 32);
-            float part = 0.0f;
+                for (int ks = 0; ks < NK; ks++) {
+                    const unsigned d0 = mfma_frag_k(lane, ks * MFMA_K);
+                    const bf16x8 kfrag = __builtin_bit_cast(bf16x8, ld_lds8(&ktile[(krow0 + frow) * KSTRIDE + d0]));
+                    acc = plow_mfma_bf16_32x32(qf[ks], kfrag, acc);
+                }
+                /* epilogue: this lane owns pos = lane%32, and 16 of the 32 heads (l and l+32 split). */
+                const unsigned mbase = 4 * (lane / 32);
+                float part = 0.0f;
 #pragma unroll
-            for (int i = 0; i < 16; i++) {
-                const unsigned h = mbase + (i % 4) + 8 * (i / 4);
-                const float d = acc[i];
-                part += wlds[h] * (d > 0.0f ? d : 0.0f); /* w-weighted ReLU */
-            }
-            part += __shfl_xor(part, 32, PLOW_WAVE); /* fold the two head-halves for this pos */
-            if (lane < 32) {
-                const unsigned pos = base + krow0 + lane;
-                if (pos < len) st_act<float>(&Sc[(size_t)b * kv_stride + pos], part * scale);
+                for (int i = 0; i < 16; i++) {
+                    const unsigned h = mbase + (i % 4) + 8 * (i / 4);
+                    const float d = acc[i];
+                    part += wlds[h] * (d > 0.0f ? d : 0.0f); /* w-weighted ReLU */
+                }
+                part += __shfl_xor(part, 32, PLOW_WAVE); /* fold the two head-halves for this pos */
+                if (lane < 32) {
+                    const unsigned pos = base + krow0 + lane;
+                    if (pos < len) st_act<float>(&Sc[(size_t)b * kv_stride + pos], part * scale);
+                }
             }
         }
     }
@@ -5201,16 +5203,16 @@ __device__ void d_index_select_coop(int* __restrict__ idx, const float* __restri
                                     unsigned* __restrict__ gCtl, unsigned slice, unsigned nwg,
                                     unsigned* lh /* [SEL_NB] LDS */, unsigned* red /* [3] LDS */,
                                     const int* __restrict__ kv_len = nullptr,
-                                    unsigned pool_size = 1u) {
-    const auto* const Sc = as_glob(Score);
-    int* const ib = as_glob(idx);
+                                    unsigned pool_size = 1u, unsigned batch_row = 0u) {
+    const auto* const Sc = as_glob(Score) + (size_t)batch_row * len_max;
+    int* const ib = as_glob(idx) + (size_t)batch_row * top_k_max;
     unsigned* const Hg = as_glob(gHist);
     unsigned* const Cg = as_glob(gCtl);
     /* Only the rows the score kernel actually wrote, and only as many as exist. `kv_len` is
      * TOKEN-granular; `len_max`/`len` are whatever granularity the emitter chose for THIS
      * packet (token for plain IndexSelect, pool for GLM-5.3-Flash's kpool path) — dividing
      * the live token count by `pool_size` (1 = no-op) is what makes the two comparable. */
-    const unsigned nkv = kv_len ? (unsigned)as_glob(kv_len)[0] / pool_size : len_max;
+    const unsigned nkv = kv_len ? (unsigned)as_glob(kv_len)[batch_row] / pool_size : len_max;
     const unsigned len = nkv < len_max ? nkv : len_max;
     const unsigned top_k = top_k_max < len ? top_k_max : len;
     /* `bid` IS THE LOGICAL SLICE, NOT `blockIdx.x`, AND THE DIFFERENCE IS THE WHOLE END-TO-END BUG.

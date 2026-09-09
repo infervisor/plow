@@ -4697,6 +4697,25 @@ fn check_k3_arms(syms: &[&str], path: &Path, need: Option<DevOp>) -> Result<()> 
     )))
 }
 
+fn check_dsa_decode_batch(
+    syms: &[&str],
+    path: &Path,
+    progs: &[DevProg],
+    cdna3: bool,
+) -> Result<()> {
+    if progs.iter().flat_map(|p| &p.insts).any(|d| {
+        (d.op == DevOp::IndexSelect as u16 && d.i[3] != 0)
+            || (cdna3 && d.op == DevOp::IndexScore as u16)
+    }) && !syms.contains(&"plow_dsa_decode_batch_arm")
+    {
+        return Err(RuntimeError::Device(format!(
+            "{} lacks qualified DSA score/selection with PLOW_GQ_BATCH=1; rebuild the decode object",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 /// `PLOW_DSA_PF_ARM=1` — the GATHERED (DSA sparse) V2 MLA-prefill arm.
 ///
 /// Present iff the build axis is on, exactly like [`K3_ARMS_SYM`] and for a stronger reason: the
@@ -8753,6 +8772,7 @@ impl AmdEngine {
             if phase == Phase::Decode {
                 check_xargmax_capacity(&syms, &path, gemv_need.unwrap_or(max_decode_batch))?;
                 check_dec_stage_capacity(&image, &path, &blob.progs[dec_ix..])?;
+                check_dsa_decode_batch(&syms, &path, &blob.progs[dec_ix..], arch == "gfx942")?;
             }
             // Whether this object carries the PLOW_K3 arms the packet dispatches. Refused here
             // rather than tolerated, because AMD's dispatch default is a silent NOP: the run
@@ -17810,6 +17830,59 @@ mod tests {
     /// Both halves are tested independently because they fail for different reasons and an
     /// operator has a different remedy for each: the routing is a serve-time env var, the arm is
     /// a rebuild.
+    #[test]
+    fn dsa_decode_score_requires_the_cdna3_lds_fix() {
+        let prog = segmented_prog(&[DevOp::IndexScore], &[0]);
+        assert!(check_dsa_decode_batch(
+            &[],
+            Path::new("old.elf"),
+            std::slice::from_ref(&prog),
+            true
+        )
+        .is_err());
+        assert!(check_dsa_decode_batch(
+            &[],
+            Path::new("old.elf"),
+            std::slice::from_ref(&prog),
+            false
+        )
+        .is_ok());
+        assert!(check_dsa_decode_batch(
+            &["plow_dsa_decode_batch_arm"],
+            Path::new("new.elf"),
+            &[prog],
+            true
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn dsa_decode_batch_refuses_an_object_without_row_offsets() {
+        let mut prog = segmented_prog(&[DevOp::IndexSelect], &[0]);
+        assert!(check_dsa_decode_batch(
+            &[],
+            Path::new("old.elf"),
+            std::slice::from_ref(&prog),
+            true
+        )
+        .is_ok());
+        prog.insts[0].i[3] = 1;
+        assert!(check_dsa_decode_batch(
+            &[],
+            Path::new("old.elf"),
+            std::slice::from_ref(&prog),
+            true
+        )
+        .is_err());
+        assert!(check_dsa_decode_batch(
+            &["plow_dsa_decode_batch_arm"],
+            Path::new("new.elf"),
+            &[prog],
+            true
+        )
+        .is_ok());
+    }
+
     #[test]
     fn a_sparse_mla_prefill_blob_needs_both_the_v2_routing_and_the_gathered_arm() {
         let obj = Path::new("interp_flash.elf");
