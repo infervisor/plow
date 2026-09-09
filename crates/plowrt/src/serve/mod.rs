@@ -15,8 +15,8 @@ pub mod engine;
 pub mod manager;
 pub mod models;
 pub mod mux;
-pub mod placement;
 pub mod openai;
+pub mod placement;
 pub mod stream;
 pub mod template;
 pub mod tokenize;
@@ -253,12 +253,7 @@ pub(crate) fn seeded_unit(prompt: &[u32], out: &[u32], step: usize) -> f32 {
 /// The same draw, with an optional caller-supplied OpenAI `seed` mixed in.
 /// Without it the draw is derived from the token stream alone — deterministic,
 /// but not something a client can choose, which is what `seed` is for.
-pub(crate) fn seeded_unit_with(
-    prompt: &[u32],
-    out: &[u32],
-    step: usize,
-    seed: Option<u64>,
-) -> f32 {
+pub(crate) fn seeded_unit_with(prompt: &[u32], out: &[u32], step: usize, seed: Option<u64>) -> f32 {
     (fnv_seed(prompt, out, step, seed) % 10_000) as f32 / 10_000.0
 }
 
@@ -353,6 +348,7 @@ pub struct AppState {
     /// Operator-set residency overrides, slug → state. Absent = [`Residency::Auto`].
     /// Only the control plane writes here; the manager and the request path read it.
     residency: RwLock<FxHashMap<String, Residency>>,
+    control: Mutex<FxHashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     /// When set, each run records a timeline dumpable at `GET /trace`.
     record_trace: bool,
     trace: Mutex<Timeline>,
@@ -407,6 +403,7 @@ impl AppState {
             turns: std::sync::OnceLock::new(),
             models_roots: std::sync::OnceLock::new(),
             residency: RwLock::new(FxHashMap::default()),
+            control: Mutex::new(FxHashMap::default()),
             record_trace,
             trace: Mutex::new(Timeline::new()),
         }
@@ -460,6 +457,7 @@ impl AppState {
     /// Install the per-group residency managers (once, at startup).
     #[cfg(feature = "cuda")]
     pub fn install_managers(&self, m: Vec<Arc<manager::ModelManager>>) {
+        self.install_device_turns(m.len());
         let _ = self.managers.set(m);
     }
 
@@ -478,18 +476,20 @@ impl AppState {
     /// The CPU engine gives every model its own worker pool, so turns bound
     /// thread contention there.
     pub fn install_device_turns(&self, groups: usize) {
-        let turns = (0..groups.max(1))
-            .map(|_| Arc::new(cosched::DeviceTurn::from_config()))
-            .collect::<Vec<_>>();
-        if let Some(first) = turns.first() {
-            tracing::info!(
-                groups = turns.len(),
-                mode = ?first.mode(),
-                quantum = first.quantum(),
-                "co-tenant scheduling installed"
-            );
-        }
-        let _ = self.turns.set(turns);
+        self.turns.get_or_init(|| {
+            let turns = (0..groups.max(1))
+                .map(|_| Arc::new(cosched::DeviceTurn::from_config()))
+                .collect::<Vec<_>>();
+            if let Some(first) = turns.first() {
+                tracing::info!(
+                    groups = turns.len(),
+                    mode = ?first.mode(),
+                    quantum = first.quantum(),
+                    "co-tenant scheduling installed"
+                );
+            }
+            turns
+        });
     }
 
     /// The co-tenant turn for `slug`'s device group, when turns are installed.
@@ -500,7 +500,9 @@ impl AppState {
     /// that most needs it.
     pub fn device_turn(&self, slug: &str) -> Option<Arc<cosched::DeviceTurn>> {
         let turns = self.turns.get()?;
-        turns.get(self.slug_group(slug).unwrap_or(0)).map(Arc::clone)
+        turns
+            .get(self.slug_group(slug).unwrap_or(0))
+            .map(Arc::clone)
     }
 
     /// Record which group serves `slug`.
@@ -543,7 +545,10 @@ impl AppState {
     /// The manager a NEW model should be registered with: the named group, or
     /// the one with the most free memory when the caller did not name one.
     #[cfg(feature = "cuda")]
-    pub fn manager_for_new(&self, group: Option<usize>) -> Option<(usize, &Arc<manager::ModelManager>)> {
+    pub fn manager_for_new(
+        &self,
+        group: Option<usize>,
+    ) -> Option<(usize, &Arc<manager::ModelManager>)> {
         let managers = self.managers();
         match group {
             Some(g) => managers.get(g).map(|m| (g, m)),
@@ -552,6 +557,22 @@ impl AppState {
                 .enumerate()
                 .max_by_key(|(_, m)| m.device_mem_info().map(|(free, _)| free).unwrap_or(0)),
         }
+    }
+
+    pub async fn control_lock(&self, slug: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self.control.lock();
+            locks.retain(|_, lock| lock.strong_count() != 0);
+            match locks.get(slug).and_then(std::sync::Weak::upgrade) {
+                Some(lock) => lock,
+                None => {
+                    let lock = Arc::new(tokio::sync::Mutex::new(()));
+                    locks.insert(slug.to_string(), Arc::downgrade(&lock));
+                    lock
+                }
+            }
+        };
+        lock.lock_owned().await
     }
 
     /// Install the assets-dir allow-list for control-plane loads (once, at
@@ -788,13 +809,6 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/tokenize", post(tokenize::tokenize))
         .route("/detokenize", post(tokenize::detokenize))
         .route("/v1/models", get(models::list_models))
-        // Control plane. Privileged: `load` executes the cubins in the dir it
-        // is given and `unload` terminates other clients' generations, and the
-        // server authenticates nobody — so where these are mounted IS the
-        // access control. See `serve::admin`.
-        .route("/v1/models/load", post(admin::load))
-        .route("/v1/models/unload", post(admin::unload))
-        .route("/v1/models/status", get(admin::status))
         // BOTH spellings. vLLM serves `/health`, and every k8s probe and
         // benchmark harness copied from vLLM asks for it; plowrt served only
         // `/healthz`, so all of them got a 404 from a healthy server.
@@ -943,4 +957,13 @@ pub(crate) fn status_for(err: &RuntimeError) -> axum::http::StatusCode {
         RuntimeError::DeviceFault { info } if info.fatal => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
+}
+
+/// Privileged routes, mounted only on the owner-only Unix socket by the CLI.
+pub fn admin_app(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/v1/models/load", post(admin::load))
+        .route("/v1/models/unload", post(admin::unload))
+        .route("/v1/models/status", get(admin::status))
+        .with_state(state)
 }

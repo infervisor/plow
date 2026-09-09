@@ -187,6 +187,7 @@ pub struct ModelMux {
     /// the ONLY signal that reaches it while a full slot table keeps it away
     /// from the message channel (see [`ModelMux::preempt`]).
     preempt: Arc<std::sync::atomic::AtomicBool>,
+    preempt_notify: Arc<tokio::sync::Notify>,
 }
 
 /// Internal messages to the dispatcher: jobs or control signals.
@@ -312,6 +313,7 @@ impl ModelMux {
     /// Returns when the dispatcher has exited.
     pub async fn preempt(&self) {
         self.preempt.store(true, Ordering::Release);
+        self.preempt_notify.notify_one();
         // The Drain message wakes a dispatcher blocked on recv (idle path)
         // and carries the completion signal; the flag is what the tick loop
         // sees when a full slot table keeps it off the channel.
@@ -393,6 +395,8 @@ pub fn spawn(
 ) -> ModelMux {
     let preempt_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let preempt_seen = Arc::clone(&preempt_flag);
+    let preempt_notify = Arc::new(tokio::sync::Notify::new());
+    let preempt_wake = Arc::clone(&preempt_notify);
     let metrics = Arc::clone(&state.metrics);
     let handle_metrics = Arc::clone(&metrics);
 
@@ -535,6 +539,7 @@ pub fn spawn(
             // reaches the message channel between ticks — this flag is the
             // one bounded-latency path in.
             if preempt_seen.swap(false, Ordering::AcqRel) {
+                turn.release();
                 preempt_slots(&mut slots, &arena).await;
                 draining = true;
             }
@@ -893,6 +898,17 @@ pub fn spawn(
                 Vec::new()
             };
 
+            if let Some(dt) = &device_turn {
+                tokio::select! {
+                    biased;
+                    _ = preempt_wake.notified() => continue,
+                    _ = turn.take(dt) => {}
+                }
+            }
+            if preempt_seen.load(Ordering::Acquire) {
+                continue;
+            }
+            let co_scheduled = device_turn.as_ref().is_some_and(|dt| dt.ordered());
             let taken_slots = std::mem::take(&mut slots);
             let taken_obs = obs.take().unwrap_or_else(|| {
                 let mut obs = RunObserver::new(state.record_trace, indirection_size);
@@ -916,15 +932,9 @@ pub fn spawn(
                     arena_ref,
                     kv_pages_for_tick,
                     steps,
+                    co_scheduled,
                 )
             };
-            // Under `--co-sched rr`, wait for this device group's turn
-            // before submitting. Awaited HERE, off the engine thread, so a
-            // model waiting for the device is not occupying a submission
-            // thread while it waits.
-            if let Some(dt) = &device_turn {
-                turn.take(dt).await;
-            }
             // GPU models tick on the dedicated engine thread; the dispatcher
             // task stays hot for arrivals/cancellation either way.
             let joined = match &engine_thread {
@@ -1039,6 +1049,7 @@ pub fn spawn(
         tx,
         metrics: handle_metrics,
         preempt: preempt_flag,
+        preempt_notify,
     }
 }
 
@@ -1138,8 +1149,8 @@ fn admit_into(
         out_ids: Vec::new(),
         gen: job.gen,
         arrived: job.arrived,
-            stop_tail: String::new(),
-            stop_pending: String::new(),
+        stop_tail: String::new(),
+        stop_pending: String::new(),
         respond: job.respond,
         prefix_offset: 0,
         read_offset: 0,
@@ -1299,6 +1310,11 @@ fn run_one_tick(
     arena: Option<SharedKvState>,
     kv_pages_range: std::ops::Range<usize>,
     steps: u32,
+    #[cfg_attr(
+        not(any(feature = "cuda", feature = "hsa", feature = "cpu")),
+        allow(unused_variables)
+    )]
+    co_scheduled: bool,
 ) -> (
     Vec<Option<Slot>>,
     Option<BucketBufs>,
@@ -1590,9 +1606,14 @@ fn run_one_tick(
                 // prompt token through the batched decode step below — which both
                 // writes its final KV row and produces its first token, batched
                 // with every live decode stream.
-                if let Some(f) =
-                    gpu_prefill_batched_pass(&mut *e, &mut slots, cap, &arena, feeds.is_empty())
-                {
+                if let Some(f) = gpu_prefill_batched_pass(
+                    &mut *e,
+                    &mut slots,
+                    cap,
+                    &arena,
+                    feeds.is_empty(),
+                    co_scheduled,
+                ) {
                     if tick_fault.is_none() {
                         tick_fault = Some(f);
                     }
@@ -1648,7 +1669,9 @@ fn run_one_tick(
                 // whole prompt); the decode launch below runs between chunks. With no
                 // decoders live, stop once a request becomes ready for decode,
                 // unless the caller explicitly defers decode.
-                let cap_rows = if feeds.is_empty() {
+                let cap_rows = if co_scheduled {
+                    e.pf_max_rows().max(1).min(pf_interleave_rows())
+                } else if feeds.is_empty() {
                     usize::MAX
                 } else {
                     pf_interleave_rows()
@@ -1729,7 +1752,12 @@ fn run_one_tick(
                             }
                         }
                     }
-                    if gpu_prefill_should_yield(!feeds.is_empty(), defer_decode, slot_opt.as_ref())
+                    if co_scheduled
+                        || gpu_prefill_should_yield(
+                            !feeds.is_empty(),
+                            defer_decode,
+                            slot_opt.as_ref(),
+                        )
                     {
                         // New decoders join next tick; their first token was already emitted.
                         break;
@@ -2068,9 +2096,9 @@ fn run_one_tick(
                 .count();
             let has_decode = decode_rows > 0;
             let tick_max = amd_prefill_tick_cap(
-                has_decode,
-                no_interleave,
-                nv.pf_defer_decode,
+                has_decode || co_scheduled,
+                no_interleave && !co_scheduled,
+                nv.pf_defer_decode && !co_scheduled,
                 nv.pf_interleave,
             );
             if nv.pf_batch
@@ -2276,7 +2304,8 @@ fn run_one_tick(
                     // the first campaign measured; it exists so the policy stays falsifiable.
                     let members = feeds.len() + pack.len();
                     if feeds.len() + completing > 0
-                        && (members >= 2 || crate::config::RuntimeConfig::get().amd.token_batch_solo)
+                        && (members >= 2
+                            || crate::config::RuntimeConfig::get().amd.token_batch_solo)
                     {
                         chosen = Some((rows, pack));
                         break;
@@ -3025,13 +3054,12 @@ fn run_one_tick(
                     // No bucket in the bundle — direct-sample against reference
                     // logits. Matches the fallback in generate_with_bucket.
                     obs.host.tokens.clear();
-                    obs.host.rng01 =
-                        crate::serve::seeded_unit_with(
-                            &slot.prompt_ids,
-                            &slot.out_ids,
-                            slot.step,
-                            slot.gen.seed,
-                        );
+                    obs.host.rng01 = crate::serve::seeded_unit_with(
+                        &slot.prompt_ids,
+                        &slot.out_ids,
+                        slot.step,
+                        slot.gen.seed,
+                    );
                     crate::serve::reference_logits(
                         &slot.prompt_ids,
                         &slot.out_ids,
@@ -3303,6 +3331,7 @@ fn gpu_prefill_batched_pass(
     cap: usize,
     arena: &Option<SharedKvState>,
     cold: bool,
+    bounded_tick: bool,
 ) -> Option<crate::DeviceErrorInfo> {
     use crate::exec::gpu::PfBatchReq;
 
@@ -3311,7 +3340,7 @@ fn gpu_prefill_batched_pass(
     if budget_max == 0 {
         return tick_fault;
     }
-    let per_launch = if cold {
+    let per_launch = if cold && !bounded_tick {
         budget_max
     } else {
         pf_interleave_rows().min(budget_max)
@@ -3444,7 +3473,7 @@ fn gpu_prefill_batched_pass(
                 return tick_fault;
             }
         }
-        if !cold {
+        if !cold || bounded_tick {
             return tick_fault; // bounded stall: decode now, next pack next tick
         }
         // Cold path: stop as soon as any request is ready so its first token
@@ -3506,13 +3535,24 @@ fn gpu_prefill_advance(
         // maps the cached rows, so only the tail is fed token by token.
         // `consume_prompt` overlaps host submit with the in-flight
         // interpreter (one D2H+sync after the last token).
-        let start = e.attach_prompt(slot_idx, &slot.prompt_ids)?;
-        slot.cached_tokens = start;
-        let tail = &slot.prompt_ids[start..];
+        let start = if slot.pf_pos == 0 {
+            let attached = e.attach_prompt(slot_idx, &slot.prompt_ids)?;
+            slot.cached_tokens = attached;
+            attached
+        } else {
+            slot.pf_pos
+        };
+        let end = start
+            .saturating_add(cap_rows.max(1))
+            .min(slot.prompt_ids.len());
+        let tail = &slot.prompt_ids[start..end];
         if !tail.is_empty() {
             tok = e.consume_prompt(slot_idx, tail, &mut toks)?;
         }
-        slot.pf_pos = slot.prompt_ids.len();
+        slot.pf_pos = end;
+        if end < slot.prompt_ids.len() {
+            return Ok(None);
+        }
         tok
     };
     // Parity artifact: these ids + the per-step tokens are what the
@@ -3635,15 +3675,8 @@ fn handle_produced_token(
         &mut slot.read_offset,
     );
 
-    // `try_send` fails two ways and they are NOT the same event: `Closed` is
-    // the client dropping (implicit cancellation, the intended path) and `Full`
-    // is a consumer 32 tokens behind (`serve/stream.rs` bounds the channel at
-    // 32 — ~1.3 s at 40 ms/token, reachable on a slow SSE reader or TCP
-    // backpressure). Both free the slot WITHOUT a `Done` or an `Err`, so the
-    // receiver only sees the stream end. The receiving side must therefore
-    // never render a terminal-less stream as a clean stop — see
-    // `chat::buffer_and_reply` and `chat::sse_response`, which is where that is
-    // enforced.
+    // Token sends leave one channel entry for Done/Err. Backpressure ends
+    // this request explicitly without blocking another model's submission thread.
     // Stop conditions: the model's eos set when known (GPU path), else the
     // reference path's newline-byte heuristic; and max_tokens.
     //
@@ -3729,6 +3762,17 @@ fn handle_produced_token(
         }
         None => (delta, false),
     };
+    if !stop_token && slot.respond.capacity() <= 1 {
+        let _ = slot
+            .respond
+            .try_send(StreamChunk::Err(crate::RuntimeError::Rejected(
+                "response consumer is too slow".into(),
+            )));
+        if let Some(taken) = slot_opt.take() {
+            release_kv(arena, taken.kv);
+        }
+        return;
+    }
     if !stop_token
         && slot
             .respond
@@ -3813,7 +3857,10 @@ mod tests {
         assert_eq!(super::earliest_stop_cut("abcST", 0, 5, &stops), None);
         assert_eq!(super::stop_prefix_held("abcST", &stops, 5), 2);
         // Second delta completes it: nothing of "OPdef" survives.
-        assert_eq!(super::earliest_stop_cut("abcSTOPdef", 5, 5, &stops), Some(0));
+        assert_eq!(
+            super::earliest_stop_cut("abcSTOPdef", 5, 5, &stops),
+            Some(0)
+        );
     }
 
     /// A held prefix that turns out not to begin a match is released, not dropped.
@@ -3892,6 +3939,7 @@ mod tests {
             tx,
             metrics: Arc::clone(&metrics),
             preempt: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            preempt_notify: Arc::new(tokio::sync::Notify::new()),
         };
 
         assert!(mux.submit(test_job()).is_ok());
@@ -4278,15 +4326,10 @@ mod tests {
             |_| 1,
         );
         assert_eq!(pack.iter().map(|s| s.slot).collect::<Vec<_>>(), [0]);
-        assert!(amd_prefill_pack(
-            [span(0, 3, 7), span(1, 3, 7)],
-            8,
-            0,
-            3,
-            |_| Some(4),
-            |_| 0,
-        )
-        .is_empty());
+        assert!(
+            amd_prefill_pack([span(0, 3, 7), span(1, 3, 7)], 8, 0, 3, |_| Some(4), |_| 0,)
+                .is_empty()
+        );
     }
 
     #[cfg(feature = "hsa")]
@@ -4325,8 +4368,14 @@ mod tests {
             ),
             []
         );
-        assert_eq!(amd_prefill_pack([valid], 0, 0, 4, |_| Some(8), |_| u32::MAX), []);
-        assert_eq!(amd_prefill_pack([valid], 8, 0, 4, |_| None, |_| u32::MAX), []);
+        assert_eq!(
+            amd_prefill_pack([valid], 0, 0, 4, |_| Some(8), |_| u32::MAX),
+            []
+        );
+        assert_eq!(
+            amd_prefill_pack([valid], 8, 0, 4, |_| None, |_| u32::MAX),
+            []
+        );
     }
 
     #[cfg(feature = "hsa")]

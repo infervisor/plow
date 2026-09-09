@@ -381,7 +381,7 @@ impl ModelManager {
             // kept the old dir, checkpoint and memory plan while the registry
             // took the new bundle — a new tokenizer driving old weights, which
             // produces fluent wrong output rather than an error.
-            if existing.dir == dir && existing.ckpt == ckpt {
+            if same_path(&existing.dir, &dir) && same_path(&existing.ckpt, &ckpt) {
                 return Ok(());
             }
             return Err(RuntimeError::Rejected(format!(
@@ -416,7 +416,7 @@ impl ModelManager {
     /// deregistered slug kept its `Managed` record, so re-registering it with a
     /// different assets dir silently reused the old checkpoint, packet path and
     /// memory plan. Registration and deregistration are one lifecycle.
-    pub fn deregister(&self, slug: &str) -> bool {
+    fn deregister(&self, slug: &str) -> bool {
         let mut models = self.models.write();
         let Some(i) = models.iter().position(|m| m.slug == slug) else {
             return false;
@@ -447,7 +447,11 @@ impl ModelManager {
 
     /// The parsed plan for `slug` (tests / capacity reporting).
     pub fn plan(&self, slug: &str) -> Option<BlobPlan> {
-        self.models.read().iter().find(|m| m.slug == slug).map(|m| m.plan)
+        self.models
+            .read()
+            .iter()
+            .find(|m| m.slug == slug)
+            .map(|m| m.plan)
     }
 
     /// Planner requirement for `slug`: tensor total + (measured|default)
@@ -544,6 +548,14 @@ impl ModelManager {
         }
 
         let _g = self.switch.lock().await;
+        self.ensure_resident_locked(slug).await
+    }
+
+    async fn ensure_resident_locked(
+        self: &Arc<Self>,
+        slug: &str,
+    ) -> std::result::Result<(), EnsureError> {
+        let state = self.state()?;
         // RE-READ residency under the lock. Checking it before the wait and
         // never again let a request queued behind an in-flight unload sail past
         // the check, then demand-load the model the operator had just taken
@@ -556,7 +568,9 @@ impl ModelManager {
             self.touch(slug);
             return Ok(());
         }
-        let m = self.managed(slug).expect("managed");
+        let m = self
+            .managed(slug)
+            .ok_or_else(|| EnsureError::Load(RuntimeError::UnknownModel(slug.into())))?;
         let need = self.required(slug).expect("managed") + RESERVE;
         let mut report = SwitchReport {
             target: slug.to_string(),
@@ -646,11 +660,31 @@ impl ModelManager {
     /// Ends in `Residency::Unloaded`, which is what stops the next request (or
     /// the speculative preloader) from silently loading it again.
     pub async fn unload(&self, slug: &str) -> std::result::Result<UnloadReport, EnsureError> {
+        self.unload_and_deregister(slug, false).await
+    }
+
+    pub async fn unload_and_deregister(
+        &self,
+        slug: &str,
+        deregister: bool,
+    ) -> std::result::Result<UnloadReport, EnsureError> {
+        let _g = self.switch.lock().await;
+        let report = self.unload_locked(slug).await?;
+        if deregister {
+            let state = self.state()?;
+            let _ = state.registry.unload(slug);
+            self.deregister(slug);
+            state.clear_slug_group(slug);
+            state.set_residency(slug, crate::serve::Residency::Auto);
+        }
+        Ok(report)
+    }
+
+    async fn unload_locked(&self, slug: &str) -> std::result::Result<UnloadReport, EnsureError> {
         if !self.manages(slug) {
             return Err(EnsureError::Load(RuntimeError::UnknownModel(slug.into())));
         }
         let state = self.state()?;
-        let _g = self.switch.lock().await;
 
         // Before `remove_mux`, not after: this is what closes the late-submit
         // window rather than merely narrowing it.
@@ -696,6 +730,7 @@ impl ModelManager {
         if !self.manages(slug) {
             return Err(EnsureError::Load(RuntimeError::UnknownModel(slug.into())));
         }
+        let _g = self.switch.lock().await;
         let state = self.state()?;
         let was = state.residency(slug);
         // `ensure_resident` and the fit path below both refuse a pinned slug,
@@ -721,16 +756,13 @@ impl ModelManager {
         }
         if evict_lru {
             let t0 = Instant::now();
-            self.ensure_resident(slug).await?;
+            self.ensure_resident_locked(slug).await?;
             return Ok(ms(t0));
         }
 
-        let _g = self.switch.lock().await;
-        if self.is_resident(slug) {
-            self.touch(slug);
-            return Ok(0.0);
-        }
-        let m = self.managed(slug).expect("managed");
+        let m = self
+            .managed(slug)
+            .ok_or_else(|| EnsureError::Load(RuntimeError::UnknownModel(slug.into())))?;
         let need = self.required(slug).expect("managed") + RESERVE;
         // Same accounting as the switch path: chunks the incoming slab cannot
         // consume have to be real free memory before the load.
@@ -852,7 +884,9 @@ impl ModelManager {
                 tracing::error!(%slug, holders, "engine still referenced at evict — VRAM leak");
             }
         }
-        drop(engine);
+        tokio::task::spawn_blocking(move || drop(engine))
+            .await
+            .map_err(|e| EnsureError::Load(RuntimeError::Msg(format!("unload task: {e}"))))?;
         let unload_ms = ms(t1);
         let (free, _) = self.be.mem_info().map_err(EnsureError::Load)?;
         tracing::info!(%slug, drain_ms, unload_ms, free_gib = gib(free), "model evicted");
@@ -1076,4 +1110,12 @@ mod tests {
         assert_eq!(pick_victim(&residents, &lru).as_deref(), Some("a"));
         assert_eq!(pick_victim(&[], &lru), None);
     }
+}
+
+fn same_path(a: &Path, b: &Path) -> bool {
+    a == b
+        || a.canonicalize()
+            .ok()
+            .zip(b.canonicalize().ok())
+            .is_some_and(|(a, b)| a == b)
 }

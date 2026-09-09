@@ -116,7 +116,11 @@ pub struct StatusResponse {
 }
 
 fn err(status: StatusCode, msg: impl std::fmt::Display) -> Response {
-    (status, Json(serde_json::json!({ "error": msg.to_string() }))).into_response()
+    (
+        status,
+        Json(serde_json::json!({ "error": msg.to_string() })),
+    )
+        .into_response()
 }
 
 #[cfg(feature = "cuda")]
@@ -161,6 +165,7 @@ fn resolve_assets(state: &AppState, dir: &str) -> std::result::Result<PathBuf, R
 /// `POST /v1/models/load` — make a model resident, registering its assets dir
 /// first when the slug is new.
 pub async fn load(State(state): State<Arc<AppState>>, Json(req): Json<LoadRequest>) -> Response {
+    let _control = state.control_lock(&req.model).await;
     // The path check comes FIRST, before any backend or slug lookup. It is a
     // security boundary, and a boundary that only fires on builds which happen
     // to have a GPU manager is not one — the refusal must not depend on how far
@@ -202,9 +207,7 @@ pub async fn load(State(state): State<Arc<AppState>>, Json(req): Json<LoadReques
                     },
                     None => None,
                 };
-                state
-                    .manager_for_new(group)
-                    .map(|(g, m)| (g, m.clone()))
+                state.manager_for_new(group).map(|(g, m)| (g, m.clone()))
             }
         };
         let Some((group, mgr)) = target else {
@@ -219,7 +222,16 @@ pub async fn load(State(state): State<Arc<AppState>>, Json(req): Json<LoadReques
             // and bucket ladder reachable; registering with the manager is what
             // gives it a VRAM plan. A slug already known to either is left alone
             // so the call stays idempotent.
-            if !state.registry.contains(&req.model) {
+            let newly_registered = !state.registry.contains(&req.model);
+            if let Ok(existing) = state.registry.get(&req.model) {
+                if existing.dir.canonicalize().ok().as_ref() != Some(&dir) {
+                    return err(
+                        StatusCode::CONFLICT,
+                        "model is registered from different assets; deregister it first",
+                    );
+                }
+            }
+            if newly_registered {
                 if let Err(e) = state.registry.load(&dir, Some(req.model.clone())) {
                     return err(StatusCode::BAD_REQUEST, e);
                 }
@@ -230,6 +242,9 @@ pub async fn load(State(state): State<Arc<AppState>>, Json(req): Json<LoadReques
                 .map(PathBuf::from)
                 .unwrap_or_else(|| dir.join("checkpoint"));
             if let Err(e) = mgr.register(&req.model, dir, ckpt) {
+                if newly_registered {
+                    let _ = state.registry.unload(&req.model);
+                }
                 return err(StatusCode::BAD_REQUEST, e);
             }
             state.set_slug_group(&req.model, group);
@@ -273,7 +288,11 @@ pub async fn load(State(state): State<Arc<AppState>>, Json(req): Json<LoadReques
 
 /// `POST /v1/models/unload` — stop and flush this model, release its device
 /// memory, and leave every other model serving.
-pub async fn unload(State(state): State<Arc<AppState>>, Json(req): Json<UnloadRequest>) -> Response {
+pub async fn unload(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<UnloadRequest>,
+) -> Response {
+    let _control = state.control_lock(&req.model).await;
     #[cfg(feature = "cuda")]
     {
         let Some(mgr) = state.manager_for(&req.model).cloned() else {
@@ -289,25 +308,11 @@ pub async fn unload(State(state): State<Arc<AppState>>, Json(req): Json<UnloadRe
             );
         }
         use crate::serve::manager::EnsureError;
-        let report = match mgr.unload(&req.model).await {
+        let report = match mgr.unload_and_deregister(&req.model, req.deregister).await {
             Ok(r) => r,
             Err(EnsureError::Load(e)) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
             Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
         };
-        if req.deregister {
-            // Registration and deregistration are ONE lifecycle. Dropping only
-            // the registry entry left the manager holding this slug's assets
-            // dir, checkpoint path and memory plan, so re-registering the slug
-            // against different assets kept the old ones — a new tokenizer
-            // driving old weights, which reads as fluent wrong output rather
-            // than an error.
-            let _ = state.registry.unload(&req.model);
-            mgr.deregister(&req.model);
-            state.clear_slug_group(&req.model);
-            // The unload pinned it; with the slug gone there is nothing left to
-            // pin, and a stale pin would refuse a later re-registration.
-            state.set_residency(&req.model, Residency::Auto);
-        }
         return Json(UnloadResponse {
             model: req.model,
             state: "unloaded",

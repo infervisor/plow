@@ -240,6 +240,23 @@ driver_api! {
     cuGraphExecDestroy: fn(CUgraphExec) -> CUresult,
 }
 
+thread_local! {
+    static LAST_CTX: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+static NEXT_CONTEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+// Cache the retained lifetime, not a driver handle that can be recycled on
+// another thread. Every context mutation must update this cache.
+unsafe fn bind_context(api: &Api, ctx: usize, id: u64) -> CUresult {
+    if LAST_CTX.with(|c| c.get()) == id {
+        return 0;
+    }
+    let rc = (api.cuCtxSetCurrent)(ctx as CUcontext);
+    LAST_CTX.with(|c| c.set(if rc == 0 { id } else { 0 }));
+    rc
+}
+
 type CUgraph = *mut c_void;
 type CUgraphNode = *mut c_void;
 type CUgraphExec = *mut c_void;
@@ -309,6 +326,7 @@ pub struct KernelFn(usize);
 struct CudaFreer {
     api: Arc<Api>,
     ctx: usize,
+    context_id: u64,
     dev: CUdevice,
     /// The backend's poison latch, shared so late frees on a dead context
     /// (which all fail with the same sticky status) report at debug, not one
@@ -326,7 +344,7 @@ impl crate::device::DeviceFree for CudaFreer {
         // SAFETY: rebind the retained context (threads vary); `base` came from
         // cuMemAlloc and DeviceMem's ownership rule frees it exactly once.
         let rc = unsafe {
-            (self.api.cuCtxSetCurrent)(self.ctx as CUcontext);
+            bind_context(&self.api, self.ctx, self.context_id);
             (self.api.cuMemFree_v2)(base)
         };
         if rc != 0 {
@@ -342,6 +360,11 @@ impl crate::device::DeviceFree for CudaFreer {
 impl Drop for CudaFreer {
     fn drop(&mut self) {
         // SAFETY: pairs the single cuDevicePrimaryCtxRetain in `new()`.
+        LAST_CTX.with(|c| {
+            if c.get() == self.context_id {
+                c.set(0);
+            }
+        });
         let rc = unsafe { (self.api.cuDevicePrimaryCtxRelease_v2)(self.dev) };
         if rc != 0 {
             if self.poisoned.get().is_some() {
@@ -371,7 +394,7 @@ impl Drop for CudaStream {
     fn drop(&mut self) {
         // SAFETY: handle from cuStreamCreate, destroyed exactly once.
         let rc = unsafe {
-            let _ = (self.keep.api.cuCtxSetCurrent)(self.keep.ctx as CUcontext);
+            let _ = bind_context(&self.keep.api, self.keep.ctx, self.keep.context_id);
             (self.keep.api.cuStreamDestroy_v2)(self.raw as CUstream)
         };
         if rc != 0 {
@@ -400,7 +423,7 @@ impl Drop for CudaEvent {
     fn drop(&mut self) {
         // SAFETY: handle from cuEventCreate, destroyed exactly once.
         let rc = unsafe {
-            let _ = (self.keep.api.cuCtxSetCurrent)(self.keep.ctx as CUcontext);
+            let _ = bind_context(&self.keep.api, self.keep.ctx, self.keep.context_id);
             (self.keep.api.cuEventDestroy_v2)(self.raw as CUevent)
         };
         if rc != 0 {
@@ -456,7 +479,7 @@ impl Drop for PinnedHost {
     fn drop(&mut self) {
         // SAFETY: ptr from cuMemHostAlloc, freed exactly once.
         let rc = unsafe {
-            let _ = (self.keep.api.cuCtxSetCurrent)(self.keep.ctx as CUcontext);
+            let _ = bind_context(&self.keep.api, self.keep.ctx, self.keep.context_id);
             (self.keep.api.cuMemFreeHost)(self.ptr as *mut c_void)
         };
         if rc != 0 {
@@ -637,7 +660,11 @@ impl CudaBackend {
                 (api.cuDevicePrimaryCtxRetain)(&mut ctx, dev),
                 "cuDevicePrimaryCtxRetain",
             )?;
-            check((api.cuCtxSetCurrent)(ctx), "cuCtxSetCurrent")?;
+            let context_id = NEXT_CONTEXT_ID.fetch_add(1, Ordering::Relaxed);
+            check(
+                bind_context(&api, ctx as usize, context_id),
+                "cuCtxSetCurrent",
+            )?;
 
             let mut buf = [0 as c_char; 128];
             check(
@@ -688,6 +715,7 @@ impl CudaBackend {
             let api = Arc::new(api);
             let poisoned = Arc::new(std::sync::OnceLock::new());
             let freer = Arc::new(CudaFreer {
+                context_id,
                 api: Arc::clone(&api),
                 ctx: ctx as usize,
                 dev,
@@ -769,7 +797,7 @@ impl CudaBackend {
         let bd = [64u32, box_rows, 1u32];
         let es = [1u32, 1u32, 1u32];
         self.check(
-            unsafe { (self.api.cuCtxSetCurrent)(self.ctx as CUcontext) },
+            unsafe { bind_context(&self.api, self.ctx, self.freer.context_id) },
             "cuCtxSetCurrent",
         )?;
         // SAFETY: as encode_tmap; rank 3.
@@ -822,7 +850,7 @@ impl CudaBackend {
         let bd = [if e4m3 { 128u32 } else { 64u32 }, box_rows];
         let es = [1u32, 1u32];
         self.check(
-            unsafe { (self.api.cuCtxSetCurrent)(self.ctx as CUcontext) },
+            unsafe { bind_context(&self.api, self.ctx, self.freer.context_id) },
             "cuCtxSetCurrent",
         )?;
         // Constants transcribed from cuda.h, byte-for-byte the probe's make_map():
@@ -893,20 +921,10 @@ impl CudaBackend {
         if let Some(info) = self.poisoned.get() {
             return Err(RuntimeError::DeviceFault { info: info.clone() });
         }
-        thread_local! {
-            static LAST_CTX: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-        }
-        let ctx = self.ctx;
-        if LAST_CTX.with(|c| c.get()) == ctx {
-            return Ok(());
-        }
-        // SAFETY: rebinding a retained context.
         self.check(
-            unsafe { (self.api.cuCtxSetCurrent)(ctx as CUcontext) },
+            unsafe { bind_context(&self.api, self.ctx, self.freer.context_id) },
             "cuCtxSetCurrent",
-        )?;
-        LAST_CTX.with(|c| c.set(ctx));
-        Ok(())
+        )
     }
 
     /// GPUs the driver makes visible to this process.
@@ -1619,7 +1637,7 @@ impl crate::memory::vmm::VmmOps for CudaBackend {
         // SAFETY: va/bytes from a prior reserve; freed exactly once (pool
         // contract). Infallible teardown path — log, don't propagate.
         let rc = unsafe {
-            let _ = (self.api.cuCtxSetCurrent)(self.ctx as CUcontext);
+            let _ = bind_context(&self.api, self.ctx, self.freer.context_id);
             (self.api.cuMemAddressFree)(va, bytes as usize)
         };
         if rc != 0 {
@@ -1646,7 +1664,7 @@ impl crate::memory::vmm::VmmOps for CudaBackend {
     fn release(&self, handle: u64) {
         // SAFETY: handle from create, released exactly once (pool refcount).
         let rc = unsafe {
-            let _ = (self.api.cuCtxSetCurrent)(self.ctx as CUcontext);
+            let _ = bind_context(&self.api, self.ctx, self.freer.context_id);
             (self.api.cuMemRelease)(handle)
         };
         if rc != 0 {
@@ -1674,7 +1692,7 @@ impl crate::memory::vmm::VmmOps for CudaBackend {
     fn unmap(&self, va: u64, bytes: u64) {
         // SAFETY: exactly the mapped range (pool contract).
         let rc = unsafe {
-            let _ = (self.api.cuCtxSetCurrent)(self.ctx as CUcontext);
+            let _ = bind_context(&self.api, self.ctx, self.freer.context_id);
             (self.api.cuMemUnmap)(va, bytes as usize)
         };
         if rc != 0 {
@@ -1716,7 +1734,7 @@ impl crate::memory::vmm::VmmOps for CudaBackend {
     fn free(&self, va: u64) {
         // SAFETY: va from VmmOps::alloc, freed exactly once (pool contract).
         let rc = unsafe {
-            let _ = (self.api.cuCtxSetCurrent)(self.ctx as CUcontext);
+            let _ = bind_context(&self.api, self.ctx, self.freer.context_id);
             (self.api.cuMemFree_v2)(va)
         };
         if rc != 0 {
@@ -1778,7 +1796,7 @@ impl Drop for CudaBackend {
         // the backend is its terminal owner.
         let poisoned = self.is_poisoned();
         unsafe {
-            (self.api.cuCtxSetCurrent)(self.ctx as CUcontext);
+            bind_context(&self.api, self.ctx, self.freer.context_id);
             for (id, raw) in self.modules.lock().drain() {
                 let rc = (self.api.cuModuleUnload)(raw as CUmodule);
                 if rc != 0 {

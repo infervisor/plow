@@ -94,7 +94,7 @@ fn make_app() -> axum::Router {
         );
         state.install_mux(slug, m);
     }
-    app(state)
+    app(Arc::clone(&state)).merge(plowrt::serve::admin_app(state))
 }
 
 async fn body_string(resp: axum::response::Response) -> String {
@@ -187,4 +187,51 @@ async fn unload_without_a_manager_is_not_a_success() {
 async fn load_of_an_unknown_slug_is_not_a_success() {
     let resp = post("/v1/models/load", r#"{"model":"no-such-model"}"#).await;
     assert_ne!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn public_router_does_not_expose_model_control() {
+    let state = make_state();
+    for (method, uri) in [
+        ("POST", "/v1/models/load"),
+        ("POST", "/v1/models/unload"),
+        ("GET", "/v1/models/status"),
+    ] {
+        let response = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"model":"state-model"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri} is public");
+    }
+}
+
+#[tokio::test]
+async fn lifecycle_operations_serialize_per_model_without_blocking_other_models() {
+    let state = make_state();
+    let first = state.control_lock("a").await;
+    let other = tokio::time::timeout(std::time::Duration::from_secs(1), state.control_lock("b"))
+        .await
+        .unwrap();
+    let s = state.clone();
+    let mut same = tokio::spawn(async move { s.control_lock("a").await });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(20), &mut same)
+            .await
+            .is_err()
+    );
+    drop(first);
+    drop(
+        tokio::time::timeout(std::time::Duration::from_secs(1), same)
+            .await
+            .unwrap()
+            .unwrap(),
+    );
+    drop(other);
 }

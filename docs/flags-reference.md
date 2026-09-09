@@ -845,17 +845,17 @@ capped at 256, and need not match any thread count.
 | `PLOW_WEIGHT_SLAB` | on | single-allocation weight slab; `=0` turns it off (both backends). |
 | `PLOW_UPLOAD_SLOTS=N` | 4 | AMD upload-ring pipeline depth; `1` = pre-pipeline one-slab shape. |
 | `PLOW_SHARE_CKPT` | on | shared (vs per-rank) checkpoint mapping across TP ranks; `=0` restores per-rank. |
-| `PLOW_VRAM_BUDGET_MIB=M` | unset | cap the ModelManager VRAM budget (MiB). |
+| `PLOW_VRAM_BUDGET_MIB=M` | unset | CUDA: cap each device group ModelManager VRAM budget (MiB). |
 | `PLOW_WEIGHT_VMM` | CUDA on, AMD off | VMM (reserve+map) weight slab; `=0` falls back to one flat allocation (`=1` opts AMD in). |
 | `PLOW_SLAB_KEEP` | multi-model on | park evicted models' 256 MiB slab chunks in a per-device pool for the next load; `=0` releases them (`=1` forces on for single-model). |
 | `PLOW_KV_POOL_MIB=N` | 512 | per-engine KV physical-block reuse pool cap (MiB); `0` disables pooling. |
 | `PLOW_DRAIN_TIMEOUT_MS=N` | unset (unbounded) | S1 switch drain deadline; past it the victim's live generations are preempted (`Preempted` finish, queued jobs 429). `0` preempts immediately. |
 | `PLOW_PRELOAD` | on | speculative next-model preload after an S1 switch; `=0` disables. |
-| `PLOW_DEVICES=0,1` | all visible | device ordinals to serve on. Indices into the **visible** set, not the physical one. |
-| `PLOW_PLACE=spread\|pack\|explicit` | `spread` | how models are laid out over the visible devices. |
-| `PLOW_PIN=slug@2,...` | unset | pin a model to a device; required for every model under `--place explicit`. |
-| `PLOW_CO_SCHED=free\|rr` | `free` | how co-resident models take a shared GPU; `rr` adds round-robin turns. |
-| `PLOW_CO_SCHED_QUANTUM=N` | 4 | consecutive ticks one model keeps the device under `rr`. |
+| `PLOW_DEVICES=0,1` | all visible | CUDA device ordinals to serve on. Indices into the **visible** set, not the physical one. |
+| `PLOW_PLACE=spread\|pack\|explicit` | `spread` | CUDA: how models are laid out over the visible devices. |
+| `PLOW_PIN=slug@2,...` | unset | CUDA: pin a model to a device; required for every model under `--place explicit`. |
+| `PLOW_CO_SCHED=free\|rr` | `free` | how co-resident models take a shared device group; `rr` adds FIFO turns on CUDA, AMD and CPU. AMD multi-model startup requires `rr`. |
+| `PLOW_CO_SCHED_QUANTUM=N` | 4 | consecutive mux ticks one model keeps its group under `rr`; not a token or wall-time limit. |
 | `PLOW_MODELS_ROOT=dir[:dir]` | startup `--assets` parents | directories `POST /v1/models/load` may take an assets dir from. Defaults closed. |
 | `PLOW_TP_AGREE_EVERY=N` | 1 | TP cross-rank agreement interval. `PLOW_TP_NO_AUDIT=1` disables the redundant-rank audit (timing runs); `PLOW_TP_SERIAL_LOAD=1` restores one-at-a-time per-rank load. |
 | `PLOW_LOAD_PROFILE=1` | off | split upload wall time into alloc / stage+DMA profiling. |
@@ -895,10 +895,26 @@ Both vendor runtimes **truncate** a list at the first entry that does not parse
 rather than skipping it, so `0,1,x,3` means devices 0 and 1 — device 3 is
 silently gone. plowrt reports the truncation point.
 
-`--devices` / `PLOW_DEVICES` indexes the visible set, so with
-`ROCR_VISIBLE_DEVICES=4,5` the two GPUs are `--devices 0,1`. Startup logs the
-mask in force alongside the visible count, and an out-of-range ordinal is
-refused by name instead of surfacing as a device that would not initialise.
+CUDA `--devices` / `PLOW_DEVICES` indexes the visible set, so with
+`CUDA_VISIBLE_DEVICES=4,5` the two GPUs are `--devices 0,1`. AMD currently uses
+its first visible device (or the first TP-width visible devices) for every
+startup model. Restrict that set with `ROCR_VISIBLE_DEVICES`; independent AMD
+model placement and residency management are not implemented. Placement flags
+on a non-CUDA backend are rejected.
+
+Model load/unload/status routes are privileged and are served only on the
+owner-only Unix socket (`--socket`), not the public TCP listener. For example:
+`curl --unix-socket /tmp/plow.sock http://localhost/v1/models/status`.
+The public `/v1/models` catalogue remains available on both listeners. CUDA
+supports managed demand load, eviction and explicit load/unload. AMD and CPU
+load their native models at startup; control-plane load/unload returns an error.
+
+Round-robin turns are independent per device group. Each tick can contain a
+bounded prefill chunk and multistep decode, so quantum 4 does not mean four
+tokens or four milliseconds. Cold prefill yields between chunks under `rr`,
+including when decode deferral or no-interleave is configured. Slow response
+consumers receive an explicit error after the token buffer fills; they do not
+block another model's submission thread.
 
 `plowrt bench` always records AMD overlap capability under
 `engine.amd_overlap`. Current HSA engines report shared prefill/decode scratch,

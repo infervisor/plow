@@ -119,7 +119,7 @@ pub struct RuntimeConfig {
         default_value = "spread",
         global = true
     )]
-    pub place: String,
+    pub place: crate::serve::placement::Place,
 
     /// Pin a model to a device: `--pin slug@2`, repeatable. The ordinal is the
     /// first device of the group the model must occupy. Required for every
@@ -137,7 +137,7 @@ pub struct RuntimeConfig {
         default_value = "free",
         global = true
     )]
-    pub co_sched: String,
+    pub co_sched: crate::serve::cosched::CoSched,
 
     /// Consecutive ticks one model keeps the device under `--co-sched rr`.
     /// Not 1 by default: models with different dynamic shared-memory requests
@@ -727,7 +727,11 @@ pub struct AmdRuntimeConfig {
     /// route — which means a differing greedy token has two candidate causes at once, the
     /// packing and the reduction order. Pinning the rung holds the packing fixed and moves
     /// only the second.
-    #[arg(long = "amd-token-batch-rows", env = "PLOW_TOKEN_BATCH_ROWS", global = true)]
+    #[arg(
+        long = "amd-token-batch-rows",
+        env = "PLOW_TOKEN_BATCH_ROWS",
+        global = true
+    )]
     pub token_batch_rows: Option<u32>,
 
     /// Unified token batch: admit a step with only ONE participant.
@@ -1368,7 +1372,9 @@ mod tests {
             let lines: Vec<&str> = text.lines().collect();
             let cut = lines
                 .windows(2)
-                .position(|w| w[0].trim() == "#[cfg(test)]" && w[1].trim_start().starts_with("mod tests"))
+                .position(|w| {
+                    w[0].trim() == "#[cfg(test)]" && w[1].trim_start().starts_with("mod tests")
+                })
                 .unwrap_or(lines.len());
             for (i, line) in lines[..cut].iter().enumerate() {
                 for pat in ["std::env::var(\"", "std::env::var_os(\""] {

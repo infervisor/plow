@@ -342,7 +342,10 @@ fn llama3_full_runtime_load_and_execute() {
 
     let mut registry = Registry::new();
     registry.load(&dir, None).unwrap();
-    assert!(registry.slugs().any(|s| s == "transformer-block-llama3-8b"));
+    assert!(registry
+        .slugs()
+        .iter()
+        .any(|s| s == "transformer-block-llama3-8b"));
 
     let state = AppState::new(registry, execset);
     let gen = plowrt::serve::GenParams {

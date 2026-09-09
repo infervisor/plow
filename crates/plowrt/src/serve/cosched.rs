@@ -1,30 +1,13 @@
-//! §I.5 Co-tenant scheduling — whose turn it is when models share a GPU.
+//! Per-device-group scheduling for co-resident models.
 //!
-//! Two models resident on one device do not execute concurrently, whatever the
-//! host does. The interpreter grid is `occupancy × sm_count` — the whole device
-//! — and `cuLaunchCooperativeKernel` is all-blocks-co-resident-or-fail, so a
-//! second model's grid is admitted only once the first VACATES. What co-tenancy
-//! actually buys is (a) no switch cost, and (b) the device changing hands at
-//! every launch boundary instead of every model switch. Segmented dispatch is
-//! what makes (b) fine-grained: each segment is a separate admission point, so
-//! the window a co-tenant can be blocked for is one segment rather than one
-//! prompt.
+//! Free leaves launch admission to each backend. Round-robin holds a FIFO
+//! async turn for a configured number of mux ticks. Separate groups have
+//! separate turns; waiting consumes no engine submission thread.
 //!
-//! [`CoSched::Free`] leaves that to the driver — each engine keeps its own
-//! `CU_STREAM_NON_BLOCKING` stream, host work and copies overlap the co-tenant's
-//! compute, and whoever is ready when the device drains gets it. It is the
-//! default and it is the fastest thing available.
-//!
-//! [`CoSched::Rr`] adds a per-device turn instead, handed round in arrival
-//! order. It costs overlap and buys two things Free cannot give: a starvation
-//! bound, and a launch order that repeats run to run — which is what makes a
-//! co-residency benchmark mean anything.
-//!
-//! The quantum is not 1 for a measured reason: two models with different
-//! dynamic shared-memory requests force an SM carveout reconfiguration on every
-//! alternation (~150–300 µs, `exec/gpu.rs`). Handing a model several
-//! consecutive ticks amortises that; handing it too many is just Free with
-//! extra steps.
+//! A tick can include a prefill chunk and bounded multistep decode. The quantum
+//! counts ticks, not tokens, kernel segments, or elapsed time. Round-robin also
+//! bounds cold prefill work so an entire prompt cannot hide inside one tick.
+//! The default quantum of four amortizes CUDA shared-memory carveout changes.
 
 use std::sync::Arc;
 
@@ -85,11 +68,7 @@ impl DeviceTurn {
     /// a round-robin that does not work.
     pub fn from_config() -> DeviceTurn {
         let cfg = crate::config::RuntimeConfig::get();
-        let mode = cfg.co_sched.parse().unwrap_or_else(|e: String| {
-            tracing::error!(raw = %cfg.co_sched, %e, "invalid --co-sched; using free");
-            CoSched::Free
-        });
-        DeviceTurn::new(mode, cfg.co_sched_quantum)
+        DeviceTurn::new(cfg.co_sched, cfg.co_sched_quantum)
     }
 
     pub fn mode(&self) -> CoSched {
@@ -196,7 +175,10 @@ mod tests {
         assert!(!blocked.is_finished(), "B entered while A held the turn");
 
         a.release();
-        assert!(blocked.await.unwrap(), "B never got the turn after A released");
+        assert!(
+            blocked.await.unwrap(),
+            "B never got the turn after A released"
+        );
     }
 
     /// A quantum of N means N consecutive ticks, then the turn goes back to the

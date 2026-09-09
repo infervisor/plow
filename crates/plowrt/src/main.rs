@@ -2536,6 +2536,15 @@ async fn bringup_runtime(
     #[cfg(not(feature = "cuda"))]
     let backend: Arc<dyn Backend> = device::select(executors);
     let vendor = backend.vendor();
+    let cfg = RuntimeConfig::get();
+    if vendor != Some(hwspec::Vendor::Nvidia)
+        && (!cfg.devices.is_empty()
+            || !cfg.pin.is_empty()
+            || cfg.place != plowrt::serve::placement::Place::Spread
+            || cfg.nv.vram_budget_mib.is_some())
+    {
+        return Err("model placement and VRAM residency management currently require CUDA; use ROCR_VISIBLE_DEVICES to restrict AMD devices".into());
+    }
     if vendor.is_some() {
         tracing::info!(class = ?backend.class(), vendor = ?vendor, "backend ready — GPU accelerated");
     } else if cfg!(feature = "cpu") {
@@ -2612,7 +2621,11 @@ async fn bringup_runtime(
         .iter()
         .map(PathBuf::from)
         .collect();
-    roots.extend(assets.iter().filter_map(|a| a.parent().map(std::path::Path::to_path_buf)));
+    roots.extend(
+        assets
+            .iter()
+            .filter_map(|a| a.parent().map(std::path::Path::to_path_buf)),
+    );
     state.install_models_roots(roots);
 
     // GPU-managed models: any bundle whose assets dir carries a PLOWDEV device
@@ -2656,10 +2669,7 @@ async fn bringup_runtime(
 
         if !models.is_empty() {
             let budget = RuntimeConfig::get().nv.vram_budget_mib.map(|mib| mib << 20);
-            let policy: Place = RuntimeConfig::get()
-                .place
-                .parse()
-                .map_err(|e: String| -> Box<dyn std::error::Error> { e.into() })?;
+            let policy: Place = RuntimeConfig::get().place;
 
             // Per-model footprint and TP degree, both from the blob header.
             let granularity = cuda.granularity()?;
@@ -2855,6 +2865,9 @@ async fn bringup_runtime(
     #[cfg(feature = "hsa")]
     if vendor == Some(hwspec::Vendor::Amd) {
         let slugs: Vec<String> = state.registry.slugs();
+        if slugs.len() > 1 && cfg.co_sched != plowrt::serve::cosched::CoSched::Rr {
+            return Err("AMD co-resident models require --co-sched rr; separate HSA queues do not guarantee whole-grid residency".into());
+        }
         for slug in slugs {
             let bundle = state.registry.get(&slug)?;
             let Some(blob) = plowrt::asset::devblob::DevBlob::find_in_dir(&bundle.dir)? else {
@@ -3201,7 +3214,7 @@ async fn serve(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let state = bringup_runtime(assets, executors, trace, mux_cfg).await?;
 
-    let router = app(state);
+    let router = app(Arc::clone(&state));
 
     // TCP listener: unchanged, always on.
     let tcp_addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
@@ -3215,7 +3228,7 @@ async fn serve(
     });
 
     // Optional UDS listener: bridged through hyper directly (axum 0.7's
-    // `serve` accepts only TcpListener). Same router as the TCP path.
+    // `serve` accepts only TcpListener). Also exposes privileged model control.
     let uds_task = if let Some(path) = socket {
         // Clear a stale socket (previous crashed instance left it behind).
         if path.exists() {
@@ -3227,10 +3240,10 @@ async fn serve(
         {
             use std::os::unix::fs::PermissionsExt;
             let perm = std::fs::Permissions::from_mode(0o600);
-            let _ = std::fs::set_permissions(&path, perm);
+            std::fs::set_permissions(&path, perm)?;
         }
         tracing::info!(socket = %path.display(), "plowrt serving OpenAI API over UDS");
-        let uds_router = router.clone();
+        let uds_router = router.clone().merge(plowrt::serve::admin_app(state));
         Some(tokio::spawn(async move {
             let svc = hyper_util::service::TowerToHyperService::new(uds_router);
             loop {
