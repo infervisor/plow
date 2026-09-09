@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Practical GEMM ceiling on THIS box at YOUR model's exact prefill shapes
-(docs/bringup/07-perf-campaign.md). cuBLASLt via torch._scaled_mm (fp8) and torch.matmul (bf16).
+(docs/bringup/07-perf-campaign.md). Torch library dispatch via torch._scaled_mm (fp8) and torch.matmul (bf16).
 
 Knowing the real ceiling is what separates "the kernel is slow" from "the box
 is the wall": on GH200/Gemma-12B it measured fp8 1324-1468 / bf16 804-861 TF/s
@@ -48,23 +48,28 @@ def _glm53(tp: int, m: int = 4096):
     # DOWN-projections (q_a, kv_a) are NOT sharded — every rank computes the
     # full latent, which is why they carry no `/tp` and why their cost does not
     # fall as TP rises.
-    h, heads, qk, v = 6144, 64, 256, 256
+    h, heads, v = 6144, 64, 256
     q_lora, kv_lora, rope = 2048, 512, 64
-    nope = 192
     hd = heads // tp
+    expert_i = 2048 // tp
     return [
         (m, q_lora, h, "q_a_proj"),
-        (m, hd * qk, q_lora, "q_b_proj"),
-        (m, kv_lora + rope, h, "kv_a_proj"),
-        (m, hd * (nope + v), kv_lora, "kv_b_proj"),
+        # Plow emits the absorbed query and split latent/rope projections.
+        (m, hd * kv_lora, q_lora, "q_absorb"),
+        (m, 32 * 128, q_lora, "index_q"),
+        (m, hd * rope, q_lora, "q_rope"),
+        (m, kv_lora, h, "kv_a_latent"),
+        (m, rope, h, "k_rope"),
+        (m, 128, h, "index_k"),
+        (m, 32, h, "index_weights"),
         (m, h, hd * v, "o_proj"),
         # Dense layers (first_k_dense_replace = 3) keep intermediate_size 12288.
         (m, 2 * (12288 // tp), h, "dense gate/up"),
         (m, h, 12288 // tp, "dense down"),
         # MoE: 256 experts, top-8, moe_intermediate_size 2048. The per-expert M
         # is the routed share of the chunk, not the chunk: top_k/n_exp of it.
-        (max(1, m * 8 // 256), 2 * 2048, h, "expert gate/up"),
-        (max(1, m * 8 // 256), h, 2048, "expert down"),
+        (max(1, m * 8 // 256), 2 * expert_i, h, "expert gate/up"),
+        (max(1, m * 8 // 256), h, expert_i, "expert down"),
     ]
 
 

@@ -2075,3 +2075,79 @@ ratio 0.14 and seed 0: 273.67 output tok/s, 1.431 s mean TTFT, and 65.92 ms mean
 TPOT on the supplied H200 run. No speculative decoding is enabled by these changes.
 The reference's aggregate serving measurements include speculation and cannot be
 converted into a measured non-speculative baseline by ignoring its acceptance table.
+
+## 11. AITER, hipBLASLt, ROCm and vLLM kernel review (2026-09-09)
+
+The strongest isolated candidate is AITER's **gfx942 BF16 latent MLA assembly**
+for 8 heads and 576 QK / 512 value dimensions. Earlier inspection of ordinary
+QK256/V256 MHA kernels did not answer whether this absorbed MLA shape exists.
+It does, and the installed object executes successfully with two KV splits.
+The [reproducible comparison](../../runtime/bench/amd/mla_sparse_aiter/README.md)
+includes plow's actual union/flash bodies, a vectorized native packing adapter,
+independent FP32 oracle checks and recorded GPU graph timings. This adds a
+benchmark prototype; production dispatch is unchanged.
+
+The isolated gain depends on selection overlap and index order. Packing costs
+do not erase the distinct-selection advantage. Shared-indexer layers amortize
+plow's union construction, so its separate cost cannot be charged on every layer.
+Model selection captures and the merge/fold boundary still need qualification
+before using the assembly arm in serving. The installed AITER automatic
+single-split path produced NaNs and a GPU memory fault; the benchmark fixes two
+splits. This failure is not attributed to a proven root cause.
+
+### What the source and kernel review establishes
+
+| Area | Finding | Adaptation constraint |
+|---|---|---|
+| Sparse MLA | vLLM maps selected queries to a ragged decode-style batch; AITER supplies a matching per-query assembly kernel | Plow's split latent/rope layout and unnormalized partial/fold contract differ |
+| MoE | AITER's block-scale CK path uses pre-shuffled weights and explicit pipeline scheduling; assembly is not always its selected implementation | Match TP-sharded width, expert routing, activation quantization, scale granularity and epilogue before comparing |
+| GEMM | hipBLASLt supplies tuned kernels and grouped GEMM with device-side arguments; TensileLite can generate new schedules | A host library call cannot be placed inside plow's persistent device interpreter; use a dispatch boundary or adapt the device loop |
+| ISA | Plow already issues MFMA through intrinsics and uses direct LDS loading; the tested AITER object uses 16x16 BF16 MFMA, vector loads and explicit waits | Assembly alone is not the measured independent variable; decomposition and memory access also change |
+
+Sources inspected: [AITER MLA](https://github.com/ROCm/aiter/blob/10f8874dc2cd69c07ed84b5f125c27d12baccb10/aiter/mla.py),
+[AITER MoE dispatch](https://github.com/ROCm/aiter/blob/10f8874dc2cd69c07ed84b5f125c27d12baccb10/aiter/fused_moe.py),
+[CK block-scale implementation](https://github.com/ROCm/aiter/blob/10f8874dc2cd69c07ed84b5f125c27d12baccb10/csrc/ck_gemm_moe_2stages_codegen/gemm_moe_ck2stages_common_blockscale.cuh),
+[vLLM sparse MLA](https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/backends/mla/rocm_aiter_mla_sparse.py),
+[hipBLASLt grouped API](https://rocm.docs.amd.com/projects/hipBLASLt/en/latest/reference/ext-reference.html),
+[TensileLite tuning](https://rocm.blogs.amd.com/artificial-intelligence/hipblaslt-tensilelite-tuning/README.html),
+and [AMD workload guidance](https://rocm.docs.amd.com/projects/ai-ecosystem/en/latest/optimization/workload-optimization.html).
+AITER source review is pinned to `10f8874dc2cd69c07ed84b5f125c27d12baccb10`;
+measurements use the installed `amd-aiter 0.1.19` object identified in the comparison.
+
+### Corrected GEMM ceiling and FP8 assumptions
+
+`bringup_ceiling.py --model glm53 --tp 8 --rows 8192` now follows the emitted
+absorbed projections. The index-query projection remains 4096-wide independently
+of TP. Expert intermediate width is **256 per rank**, not the unsharded 2048:
+at uniform routing, gate/up is `(M,N,K)=(256,512,6144)` and down is
+`(256,6144,256)`. These shapes were checked against packet disassembly.
+
+The local Torch library calls measured q-a FP8/BF16 at 0.195/0.323 ms and o-proj
+at 0.219/0.362 ms. The small per-expert calls were approximately 20–22 us in
+either dtype. These are standalone API measurements with unit row/channel FP8
+scales, not grouped, block-scaled checkpoint MoE; activation quantization is
+excluded. They neither measure the complete MoE path nor exhaust library tuning.
+
+Two comments incorrectly claimed CDNA3 FP8 has no compute advantage over BF16.
+They are corrected: native FP8 has twice the theoretical throughput. At 32x32,
+K=64 takes four FP8 K16 issues vs eight BF16 K8 issues. Plow's BF16-dequantizing
+path preserves compact weights but forgoes that compute ceiling. Any native FP8
+arm must retain OCP/FNUZ handling and measured staging/epilogue costs.
+[AMD instruction/format reference](https://rocm.blogs.amd.com/software-tools-optimization/matrix-cores-cdna/README.html).
+
+### Whole-model boundary
+
+The fixed all-layer sparse configuration completed a 20-request screening with
+the reference's variable-length distribution and concurrency 20: 20 successes,
+0 failures, 583.69 s, 1,414,538 input and 13,795 output tokens, **23.63 output
+tok/s**, mean TTFT **223.008 s**, mean TPOT **264.88 ms**. Active decode capacity
+is 8. This is not the required 100-request comparison. AMD currently ignores
+nonzero sampling temperature and uses device argmax, another fidelity difference
+from the reference's unspecified server default.
+
+A traced single 70k prefill took 13.366 s. Its segment timings were 10.705 s
+interpreter and 2.584 s flash. The final 4464-row chunk showed substantial MoE,
+index scoring/selection, attention and collective work. Per-packet body/stall
+times overlap and include protocol work; they are not additive wall attribution.
+The H200 serving target remains unmet, and the kernel ratios above are not a
+claim of a new serving speedup. No speculative decoding was added.

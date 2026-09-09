@@ -5758,10 +5758,9 @@ __device__ void d_moe_combine_norm_gemma_pf(bf16* out, const float* part, const 
  * WHY W8A8 DECODES TO bf16 INSTEAD OF USING THE fp8 MATRIX CORE, and it is not a shortcut.
  * Every e4m3 value is exact in bf16 (3 mantissa bits into 7) and every e4m3 x e4m3 product is
  * exact in f32, so decode-then-bf16-MFMA computes the SAME products as an fp8 MFMA and differs
- * only in accumulation grouping. On CDNA3 it also costs nothing: the part's fp8 matrix core is
- * K=16 and runs at the SAME MACs/cycle as its bf16 one (amd_arch.h), so the 2x an fp8 core buys
- * on CDNA4 does not exist here — fp8 buys memory footprint, which this path keeps in full. And
- * it side-steps the e4m3fnuz/OCP divergence in the matrix core entirely.
+ * only in accumulation grouping. This preserves the compact weight stream but forgoes CDNA3's
+ * 2x theoretical fp8 compute throughput. A native fp8 arm must account for the FNUZ/OCP
+ * difference (amd_arch.h) and qualify its full staging and epilogue costs against this path.
  *
  * `Ain` is bf16* when W8A8 is false and unsigned char* when it is true. `ascale` is the A-side
  * per-row f32 scale (per TOKEN on the GLU arm, indexed by row_token; per GATHERED ROW on the

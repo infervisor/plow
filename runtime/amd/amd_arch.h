@@ -101,10 +101,9 @@ __device__ __forceinline__ f32x4 plow_mfma_bf16_16x16(bf16x8 a, bf16x8 b, f32x4 
  * IDENTICALLY, so every product still pairs A[m][k] with B[k][n], and the four issues partition
  * K=64 exactly once. Only the f32 accumulation GROUPING differs from CDNA4.
  *
- * RATE: this is where CDNA3 gives up the most. op_gemm.h measured the scaled/unscaled K=64 form
- * at 4532 TF/s -- exactly 2x bf16 -- while CDNA3's K=16 fp8 runs at the SAME rate as its bf16
- * (hwspec mi300.rs: fp8 512 vs bf16 256 MACs/cycle/core, i.e. 2x per instruction but a quarter
- * of the K per issue). So on gfx942 fp8 prefill buys memory footprint, not throughput.
+ * RATE: CDNA3 fp8 has twice the theoretical throughput of its bf16 core (hwspec mi300.rs:
+ * 512 vs 256 MACs/cycle/core). At 32x32, K=64 takes four fp8 issues versus eight bf16 issues.
+ * Real GEMM gains still depend on staging, occupancy and activation-quantization costs.
  *
  * FORMAT, and it is the whole reason PLOW_FP8_MMA_FIX exists. The CDNA3 matrix core reads its
  * fp8 operands as e4m3FNUZ while plow's bytes are OCP e4m3 -- see the fp8 section below, where
