@@ -3639,6 +3639,11 @@ impl GpuEngine {
         let cublaslt = cublaslt_enabled
             .then(|| crate::device::cuda::lt::Lt::load(&be))
             .transpose()?;
+        let ordered_waits = if cublaslt_enabled {
+            Some(gpu_cublaslt::ordered_waits(g, &cublaslt_segments)?)
+        } else {
+            None
+        };
         let cublaslt_decode = if let Some(lt) = &cublaslt {
             gpu_cublaslt::prepare_routes(lt, cublaslt_segments, &mut insts, &devp, None)?
         } else {
@@ -3648,7 +3653,7 @@ impl GpuEngine {
         let d_stream = upload_pod(pod_bytes(&g.stream))?;
         let d_sofs = upload_pod(pod_bytes(&g.stream_ofs))?;
         let d_slen = upload_pod(pod_bytes(&g.stream_len))?;
-        let d_waits = upload_pod(pod_bytes(&g.waits))?;
+        let d_waits = upload_pod(pod_bytes(ordered_waits.as_deref().unwrap_or(&g.waits)))?;
         let d_succs = upload_pod(pod_bytes(&g.succs))?;
         let d_gq_stream = upload_pod(pod_bytes(&g.gq_stream))?;
         let d_gq_seg = upload_pod(pod_bytes(&g.gq_seg_ofs))?;
@@ -3713,11 +3718,12 @@ impl GpuEngine {
                             .unwrap()
                             .roles;
                         let segments = gpu_cublaslt::decode_segments(g, &blob.tensors, roles)?;
+                        let waits = gpu_cublaslt::ordered_waits(g, &segments)?;
                         let mut insts = g.insts.clone();
                         let routes = gpu_cublaslt::prepare_routes(
                             lt, segments, &mut insts, &devp, Some(&cublaslt_decode),
                         )?;
-                        let mut rung = DecodeRung::upload_with_insts(&be, g, kernarg, &insts)?;
+                        let mut rung = DecodeRung::upload_with_insts(&be, g, kernarg, &insts, &waits)?;
                         rung.library = Some(gpu_cublaslt::CublasLtDecodeGraph::capture(
                             &be, &stream, rung.kernarg, f, grid, smem, routes,
                         )?);

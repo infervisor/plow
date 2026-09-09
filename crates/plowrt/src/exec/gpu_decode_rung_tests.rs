@@ -487,6 +487,7 @@ fn check_gpu_decode_rungs(library: bool) {
             .eq(ladder_blob.tensors.iter().map(|t| (&t.name, t.bytes))),
         "baseline tensor geometry differs"
     );
+    let original_waits = library.then(|| ladder_blob.decode_prog().unwrap().waits.clone());
     drop((base_blob, ladder_blob));
     let be = Arc::new(CudaBackend::new(0).unwrap());
     let mut references: Vec<(String, u32, Vec<u32>)> = Vec::new();
@@ -496,12 +497,23 @@ fn check_gpu_decode_rungs(library: bool) {
     let mut library_rungs = library_engine
         .as_mut()
         .map(|e| std::mem::take(&mut e.decode_rungs));
+    let mut library_control = library_engine.as_mut().map(|e| {
+        let bytes = pod_bytes(original_waits.as_ref().unwrap());
+        let waits = be.alloc(0, bytes.len().max(4) as u64).unwrap();
+        be.upload(&waits, 0, bytes).unwrap();
+        let reference = e.capture_library_reference_graph(waits.base).unwrap();
+        let elided = e.cublaslt_decode_graph.replace(reference).unwrap();
+        (waits, Some(elided))
+    });
     for (candidate, assets) in [(false, &baseline), (true, &ladder)] {
         let mut native_engine = (!library)
             .then(|| GpuEngine::load(Arc::clone(&be), assets, &assets.join("checkpoint")).unwrap());
         let mut e = if let Some(e) = library_engine.as_mut() {
             if candidate {
                 e.decode_rungs = library_rungs.take().unwrap();
+                let elided = library_control.as_mut().unwrap().1.take().unwrap();
+                let reference = e.cublaslt_decode_graph.replace(elided).unwrap();
+                be.graph_destroy(reference);
             }
             e
         } else {

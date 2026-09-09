@@ -778,3 +778,60 @@ wave per cell after warmup, with no overlapping builds or GPU jobs; it does not
 establish a vLLM win or qualify default promotion. Full results are in
 `gemma31-h100-bf16-cublaslt-adaptive-preflight.csv`, with raw comparison in
 `gemma-bf16-cublaslt-adaptive-serving-comparison.json` in the campaign directory.
+
+
+## cuBLASLt decode launch elision, 2026-09-09
+
+The runtime removes the interpreter launch after each isolated cuBLASLt projection.
+For the Gemma packet this removes 410 launches from its 651-segment decode chain.
+The loader validates ordered coarse dependencies, then clears only waits on
+library-produced counters in the uploaded tables. Each consumer launch follows
+the complete library operation on the same CUDA stream. Ordinary counter waits
+remain intact; captured and direct launch paths use the same rule.
+
+The final host suite passes 597 tests with 17 ignored. A controlled GPU check
+compares the original launch sequence against elided adaptive graphs using the
+same cuBLASLt plans: all 78 full-vocabulary frames are bit-exact across widths
+1/2/4/8, sparse/reversed slots and lifecycle transitions. That GPU binary preceded
+a final loader-only guard requiring dependency thresholds to equal producer block
+counts; the final host suite includes that rejection case.
+
+A fresh, isolated 1K direct-step screen used the same packet, 16 warmups and 64
+measured steps per case:
+
+| Active slots | Original median ms | Elided median ms | Reduction |
+|---:|---:|---:|---:|
+| 1 | 27.585 | 25.807 | 6.4% |
+| 8 | 36.222 | 34.349 | 5.2% |
+
+These are decode-step measurements, not serving throughput or vLLM wins. Each
+runtime loaded and autotuned independently. A separate natural-prompt comparison
+against a previous process load was exact for all 64 frames at 16K, but at 1K
+matched top-1 in 62/64 frames (max absolute difference 1.515625, minimum cosine
+0.999710). Cross-load algorithm selection is a possible cause; it is not established
+by that comparison. The same-plan controlled test above isolates the launch change.
+
+Raw evidence in the campaign directory: `cublaslt-elide-final-host-tests.log`,
+`cublaslt-elide-controlled-gpu.log`, `cublaslt-elide-natural-comparison.json`, and
+`gemma-bf16-cublaslt-elision-step-comparison.json`.
+
+## Native tensor-core projection screens, 2026-09-09
+
+Two standalone experiments are now included under `runtime/nvidia/experiments/`.
+They do not change serving dispatch or defaults.
+
+- `gemma31_decode_tc.cu`: transposed BF16 MMA tiles improve all 24 dense shape/batch
+  cells against production GEMV and the existing split-K tensor-core control.
+  cuBLASLt remains faster in all 24 cells. At B8 the candidate takes 15.81–88.93 us
+  across eight shapes, versus cuBLASLt 14.30–81.38 us.
+- `gemma_fp8_w8a16_probe.cu`: exact E4M3-to-BF16 conversion followed by BF16 MMA
+  preserves activation precision. Selected candidates improve nine synthetic
+  projection cells by 1.32–3.29x against the best measured production GEMV grid.
+  Maximum selected-candidate relative L2 difference is 6.42e-5; maximum absolute
+  difference is 0.015625.
+
+Both pass sampled FP64 reference checks and Compute Sanitizer memcheck with zero
+errors. Their adjacent Markdown files document controls, reproduction and results.
+Standalone grids and register pressure differ from the persistent interpreter.
+Full-model arithmetic, fused GLU, sparse rows and serving require qualification
+before either candidate can become a production route.

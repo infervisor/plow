@@ -417,7 +417,7 @@ impl DecodeRung {
         g: &crate::asset::devblob::DevProg,
         base: DevProgram,
     ) -> Result<Self> {
-        Self::upload_with_insts(be, g, base, &g.insts)
+        Self::upload_with_insts(be, g, base, &g.insts, &g.waits)
     }
 
     pub(super) fn upload_with_insts(
@@ -425,6 +425,7 @@ impl DecodeRung {
         g: &crate::asset::devblob::DevProg,
         base: DevProgram,
         insts: &[DevInst64],
+        waits: &[packet::dev::Wait],
     ) -> Result<Self> {
         let upload = |bytes: &[u8]| -> Result<DeviceMem> {
             let mem = be.alloc(0, bytes.len().max(4) as u64)?;
@@ -438,7 +439,7 @@ impl DecodeRung {
             upload(pod_bytes(&g.stream))?,
             upload(pod_bytes(&g.stream_ofs))?,
             upload(pod_bytes(&g.stream_len))?,
-            upload(pod_bytes(&g.waits))?,
+            upload(pod_bytes(waits))?,
             upload(pod_bytes(&g.succs))?,
             upload(pod_bytes(&g.gq_stream))?,
             upload(pod_bytes(&g.gq_seg_ofs))?,
