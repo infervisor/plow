@@ -9,6 +9,18 @@
     let
       systems = [ "aarch64-darwin" "x86_64-darwin" "x86_64-linux" "aarch64-linux" ];
       forAll = nixpkgs.lib.genAttrs systems;
+
+      # ONE source for the version. It used to be the string "0.1.0" written out
+      # in five derivations, independent of `[workspace.package]`, so the flake
+      # and cargo could disagree about what they had just built.
+      cargoVersion =
+        (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
+      # A release is `<semver>+<git12>`: the semver says what changed, the commit
+      # says exactly which source produced the bytes. `self.shortRev` exists only
+      # for a clean tree, which is the point — an artifact built from a dirty
+      # checkout must not claim a commit it does not correspond to.
+      gitShort = self.shortRev or self.dirtyShortRev or "unknown";
+      releaseVersion = "${cargoVersion}+${gitShort}";
       # allowUnfree is for the CUDA toolchain only (nvcc's EULA); ROCm is free.
       # The insecure-package allowance is exactly the optional vllm baseline
       # shell (nixpkgs flags this release; it never enters a plow build).
@@ -137,13 +149,70 @@
           src = ./.;
           gpu = gpuToolsFor pkgs;
 
+          # The platform triple a release is keyed by, and the one a client
+          # matches itself against in `v1/runtime/index.json`.
+          releaseTriple =
+            {
+              "x86_64-linux" = "x86_64-unknown-linux-gnu";
+              "aarch64-linux" = "aarch64-unknown-linux-gnu";
+              "aarch64-darwin" = "aarch64-apple-darwin";
+              "x86_64-darwin" = "x86_64-apple-darwin";
+            }
+            .${system};
+
+          # A release asset: the binary, a tarball, and the digest a client
+          # verifies before it runs anything.
+          #
+          # The digest is computed here rather than by the publisher so it is a
+          # property of the BUILD, not of whatever later handled the bytes.
+          mkRelease =
+            { features
+            , target ? null
+            , rustPlatform ? pkgs.rustPlatform
+            , suffix ? ""
+            }:
+            let
+              triple = if target != null then target else releaseTriple;
+              bin = rustPlatform.buildRustPackage {
+                pname = "plowrt";
+                version = cargoVersion;
+                inherit src cargoLock;
+                buildFeatures = features;
+                cargoBuildFlags = [ "--package" "plowrt" ];
+                # The release build is the artifact; its tests run in CI on the
+                # feature set that owns them, not again per triple.
+                doCheck = false;
+              };
+              name = "plowrt-${releaseVersion}-${triple}${suffix}";
+            in
+            pkgs.runCommand name { nativeBuildInputs = [ pkgs.gnutar pkgs.gzip pkgs.coreutils ]; } ''
+              mkdir -p $out "$TMPDIR/${name}"
+              cp ${bin}/bin/plowrt "$TMPDIR/${name}/plowrt"
+              # Deterministic: a fixed mtime, sorted entries, owner stripped, and
+              # no gzip timestamp, so rebuilding the same commit reproduces the
+              # same digest and the store dedups it.
+              tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
+                  -C "$TMPDIR" -cf - "${name}" | gzip -n -9 > "$out/${name}.tar.gz"
+              ( cd $out && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256" )
+              cat > $out/release.json <<EOF
+              {
+                "version": "${releaseVersion}",
+                "semver": "${cargoVersion}",
+                "commit": "${gitShort}",
+                "triple": "${triple}",
+                "features": [${lib.concatMapStringsSep ", " (f: ''"${f}"'') features}],
+                "file": "${name}.tar.gz"
+              }
+              EOF
+            '';
+
           # One cmake configure per served-object family, driving the canonical
           # tables in runtime/CMakeLists.txt (never the per-object scripts: the
           # tables are the single definition of each object's define set, and
           # this file must not become another copy that drifts).
           mkHsaco = arch: extraFlags: pkgs.stdenv.mkDerivation {
             pname = "plow-interp-${arch}";
-            version = "0.1.0";
+            version = cargoVersion;
             src = ./runtime;
             nativeBuildInputs = [ pkgs.cmake ];
             cmakeFlags = [
@@ -168,7 +237,7 @@
 
           mkNvCubin = tag: flags: pkgs.stdenv.mkDerivation {
             pname = "plow-interp-${tag}";
-            version = "0.1.0";
+            version = cargoVersion;
             src = ./runtime;
             nativeBuildInputs = [ pkgs.cmake ];
             cmakeFlags = [
@@ -201,7 +270,7 @@
           # too: macOS is a supported plowc host.
           plowc = pkgs.rustPlatform.buildRustPackage {
             pname = "plowc";
-            version = "0.1.0";
+            version = cargoVersion;
             inherit src cargoLock;
 
             cargoBuildFlags = [ "--package" "plowc" ];
@@ -234,7 +303,7 @@
           # macOS, so the GPU features stay off and the binary serves the CPU path.
           plowrt = pkgs.rustPlatform.buildRustPackage {
             pname = "plowrt";
-            version = "0.1.0";
+            version = cargoVersion;
             inherit src cargoLock;
 
             # `hsa`, not "rocm": the AMD backend is direct ROCr (dlopen of
@@ -257,7 +326,7 @@
           # PIC so the GPU plugins can absorb it. Runs the ctest suite on build.
           plow-runtime = pkgs.stdenv.mkDerivation {
             pname = "plow-runtime";
-            version = "0.1.0";
+            version = cargoVersion;
             # The whole tree, not ./runtime: the C core includes ../include/packet.h
             # (the ABI header the Rust side shares), which a runtime-only src cuts off.
             inherit src;
@@ -306,6 +375,34 @@
               plow-interp-sm120a
             ];
           };
+        }
+        // {
+          # --- release assets --------------------------------------------------
+          #
+          # A runtime release is a tarball per platform triple, named
+          # `<semver>+<git12>`, plus the sha256 a client verifies it against.
+          # `scripts/release_runtime.py` turns these into `v1/runtime/index.json`
+          # and the blobs a `plowrt` client reads.
+          #
+          # `dist` is in every feature set: the released binary is exactly the
+          # one that can `pull`. `serve` still performs no network I/O — that is
+          # a property of the code path, not of the build, and CI asserts it.
+          plowrt-release = mkRelease {
+            features = lib.optionals isLinux [ "cuda" "hsa" ] ++ [ "cpu" "dist" ];
+          };
+
+          # A fully static, CPU-only runtime. `docs/BUILD.md` already establishes
+          # why this cannot be the default: a `crt-static` binary cannot `dlopen`,
+          # so a static GPU build makes the GPU path dead code. It exists for
+          # hosts where a glibc floor is the problem and no GPU is the answer.
+          plowrt-release-static = lib.optionalAttrs (system == "x86_64-linux") (
+            mkRelease {
+              features = [ "dist" ];
+              target = "x86_64-unknown-linux-musl";
+              rustPlatform = pkgs.pkgsStatic.rustPlatform;
+              suffix = "-static";
+            }
+          );
         }));
 
       # `nix flake check`: compiler + runtime everywhere; the C core (whose ctest
