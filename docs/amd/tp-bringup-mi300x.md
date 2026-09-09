@@ -562,6 +562,44 @@ remaining gap to a 50% target is **kernel work on the MoE expert path** — §4'
 ceiling puts those GEMMs at 160-304 TF/s against 1057 on the dense shapes — not
 another knob.
 
+## 7d. Reproducing a SERVE, not just a compile
+
+`build.json` reproduces the compile: 149 emit knobs with clap-sourced provenance, a `replay` map
+in env spelling, `unrecorded_env` for the vars that escape `EmitConfig`, a `pairing.hash`
+(fnv1a64 over `union`, `objects`, `tuning`) that a cubin stamps and the loader refuses on
+mismatch, and arm-level `requires` checked against the object's symbol table.
+
+Nothing reproduced the serve, and the two are different configurations. `PLOW_HSACO_LOWRUNG`,
+`PLOW_TP_NO_AUDIT` and `PLOW_L2_PLACE_DISPATCH` change throughput and — for the audit one — the
+odds of a silently wrong token, and none of them appears in the packet's manifest. §7b is what
+that costs: the frozen baseline served with `hsaco_lowrung: None` and gave up 24.9% output tok/s,
+and nothing in the bundle recorded it.
+
+Two records close it:
+
+* **`serve replay`** — the runtime twin of `emit_config.replay`: only the knobs this serve
+  resolved away from their defaults, in the spelling that sets them again, provenance from clap's
+  `ValueSource` rather than probed from the environment (inferring is wrong the moment a flag
+  overrides an env var). For the tuned TP8 arm it is exactly four entries:
+  `PLOW_HSACO`, `PLOW_L2_PLACE_DISPATCH`, `PLOW_MLA_PF_V2`, `PLOW_TP_NO_AUDIT`. The pre-existing
+  `resolved serve configuration` line stays: it is every knob plus every ambient `PLOW_*` var
+  (`PLOW_HIPCC`, `PLOW_NVCC`, toolchain paths), which records the machine. This one records the
+  decision.
+* **the discovered tier spec** — a DERIVED decision, which is the one thing an env dump cannot
+  show. Auto-discovery (§7b) fills in `PLOW_HSACO_LOWRUNG` from the directory layout, so the
+  operator sets nothing and the env record stays silent about a 24.9% difference. It now logs
+  what it found, and logs the absence too, naming the build flag that produces them.
+
+**Cost: none measurable.** 43.92 out tok/s with both records against 43.88 without, inside the
+0.1% run-to-run noise established in §7c. Both run once at startup — one clap parse and one map —
+and read no per-token state, so the decode step is unchanged.
+
+The tension worth naming is not reproducibility against performance. It is the reverse: the
+missing record WAS the performance loss, because a silent default cannot be A/B'd. The one real
+tradeoff on this list is `PLOW_TP_NO_AUDIT` (+5.4%, at the cost of the check that catches a
+silently wrong token); recording it does not resolve that, it just makes it auditable before
+someone ships it by accident.
+
 ## 8. Unrelated issue observed
 
 `cargo test -p devgen mla` fails `k3::tests::the_mla_prefill_arm_forces_one_split`

@@ -1024,6 +1024,56 @@ impl RuntimeConfig {
     }
 }
 
+/// The runtime knobs this serve actually resolved AWAY from their defaults, in the env spelling
+/// that sets them again — the serving twin of `build.json`'s `emit_config.replay`.
+///
+/// `build.json` reproduces the COMPILE. Nothing reproduced the SERVE, and the two are not the
+/// same configuration: `PLOW_HSACO_LOWRUNG`, `PLOW_TP_NO_AUDIT` and `PLOW_L2_PLACE_DISPATCH`
+/// change throughput and, for the audit one, the odds of a silently wrong token, and none of them
+/// appears in the packet's manifest. That gap is not hypothetical — the frozen GLM-5.3 baseline in
+/// docs/amd/tp-bringup-mi300x.md served with `hsaco_lowrung: None` and gave up 24.9% output
+/// tok/s, and nothing in the bundle recorded it.
+///
+/// Defaults are omitted for the same reason `emit_config.replay` omits them: a replay should
+/// follow the tree's defaults rather than pin today's. Provenance comes from clap's own
+/// `ValueSource`, not from probing the environment — inferring it is wrong the moment a flag
+/// overrides an env var, which is exactly the drift a record exists to remove.
+///
+/// This runs ONCE, at startup, off the hot path. It reads no per-token state and adds nothing to
+/// a decode step.
+pub fn serve_replay() -> std::collections::BTreeMap<String, String> {
+    use clap::Args;
+    let cmd = RuntimeConfig::augment_args(clap::Command::new("plowrt"));
+    let m = match cmd.clone().try_get_matches_from(["plowrt"]) {
+        Ok(m) => m,
+        // A parse of an empty command line cannot fail today; if it ever does, an empty replay is
+        // the honest answer rather than a partial one that reads as complete.
+        Err(_) => return Default::default(),
+    };
+    let mut out = std::collections::BTreeMap::new();
+    for arg in cmd.get_arguments() {
+        let id = arg.get_id().as_str();
+        // `try_get_matches_from` with no argv resolves env vars, so EnvVariable here means "this
+        // serve set it"; DefaultValue and missing both mean "the tree decided".
+        if m.value_source(id) != Some(clap::parser::ValueSource::EnvVariable) {
+            continue;
+        }
+        let Some(env) = arg.get_env().map(|e| e.to_string_lossy().into_owned()) else {
+            continue;
+        };
+        let val = m
+            .get_raw(id)
+            .map(|v| {
+                v.map(|s| s.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .unwrap_or_default();
+        out.insert(env, val);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

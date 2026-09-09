@@ -8530,7 +8530,25 @@ impl AmdEngine {
             //
             // An explicit setting still wins, and an empty one still means "off" — this
             // only fills in the value the directory layout already implies.
-            .or_else(|| discover_lowrung_tiers(hsaco_dir));
+            .or_else(|| {
+                let found = discover_lowrung_tiers(hsaco_dir);
+                // LOGGED, because a derived decision is the one thing an env dump cannot show.
+                // `serve_replay` records what the operator set; this is what the layout decided
+                // for them, and the difference between the two is 24.9% output tok/s.
+                match &found {
+                    Some(spec) => tracing::info!(
+                        spec = %spec,
+                        "decode tiers discovered next to the object dir (PLOW_HSACO_LOWRUNG unset)"
+                    ),
+                    None => tracing::info!(
+                        dir = %hsaco_dir.display(),
+                        "no decode tiers: no lowrung<w>/ beside the object dir. A packet whose \
+                         decode ladder is wider than 1 runs the wide object's body at every rung \
+                         — build them with scripts/build_gfx942.sh PLOW_DECODE_TIERS=…"
+                    ),
+                }
+                found
+            });
         let mut dense_prefill_object = false;
         // ARMED-ness of the decode object, for the one status line at the end of load.
         // Every decode object opened must carry it, low rungs included: a ladder whose

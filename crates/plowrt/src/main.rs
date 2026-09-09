@@ -481,6 +481,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 environment = ?runtime_environment(),
                 "resolved serve configuration"
             );
+            // The REPLAY line, separate from the Debug dump above on purpose: that dump is every
+            // knob at its resolved value plus every ambient PLOW_* var (PLOW_HIPCC, PLOW_NVCC,
+            // toolchain paths), which records the machine rather than the decision. This one is
+            // only what this serve chose away from the tree's defaults, in the spelling that sets
+            // it again — greppable out of a log a campaign already keeps.
+            tracing::info!(
+                replay = ?plowrt::config::serve_replay(),
+                "serve replay — the runtime half of build.json's emit_config.replay"
+            );
             serve(
                 assets,
                 port,
