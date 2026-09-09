@@ -1484,3 +1484,37 @@ consumption and are not GPU or serving throughput measurements. Harness,
 before/after binaries, paired CSVs and check logs are under campaign
 `prefill-admission-*`. GPU launches remain paused; frozen assets and binaries
 were not replaced.
+
+## AMD unified object in the default CMake build
+
+The gfx942 standalone script already emitted `interp_tokbatch_gq.elf`, which
+the default-on runtime route requires. The served-object CMake build omitted
+it. CMake now includes static and global-queue token-batch objects, using the
+existing 256×128 GEMM tile and four-wave ABI. Like the mixed-step object, these
+runtime-synthesized schedules use a universal object without packet inventory
+specialization. No compiler ladder or runtime policy changed.
+
+Build-time checks now require all eight mixed/unified capability symbols.
+The resource certificate also stops adding the accumulator subset twice:
+CDNA metadata's VGPR count already includes it. This fixes static/GQ totals
+from 576/580 to 416/418 without changing the actual compiler resource gate.
+All three ELF hashes stayed identical after the certificate correction.
+
+CPU cross-compilation with Nix ROCm 7.14 passed for both token-batch objects and
+the mixed-step GQ control. Token-batch LDS is 64,544 bytes, occupancy one wave
+per SIMD, and workgroup size 256. VGPR spill count is zero, but SGPR spills and
+a 1,484-byte private segment remain; this is not a spill-free kernel claim.
+
+Verification: CMake regression tests failed before the new row, then passed
+for gfx942 GQ on/off and gfx950 exclusion, target dependencies, symbols and
+specialization isolation. Five existing gfx950 object tests and the NVIDIA
+axis test pass. Runtime host tests: 652 passed, 26 ignored; combined HSA/CUDA
+all-target check passes. CPU inspection through the runtime ELF reader checks
+both entries, all capability values, block size, universal pairing, corrected
+resource totals and rejection of the mixed-step control. The certificate test
+also failed before its correction.
+
+Artifacts: campaign `amd-token-batch-cmake/hsaco`; evidence and logs:
+`amd-token-batch-*`. No AMD or NVIDIA device was launched. These are build and
+load-contract checks; AMD numerical/production qualification remains open.
+The sealed H100 release remains unchanged.

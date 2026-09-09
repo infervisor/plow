@@ -209,6 +209,45 @@ pub(super) fn log_route(cap: &TokenBatchCapability, ready: bool, reason: Option<
 mod tests {
     use super::*;
 
+    #[test]
+    #[ignore = "CPU ELF inspection; set TEST_AMD_TOKEN_BATCH_OBJECTS to the compiled object directory"]
+    fn compiled_objects_advertise_token_batch_and_reject_mixed_control() {
+        use super::super::{elf_symbol_names, elf_symbol_u32};
+
+        let directory = PathBuf::from(std::env::var_os("TEST_AMD_TOKEN_BATCH_OBJECTS").unwrap());
+        let cap = probe_token_batch(&directory, "gfx942", |p| std::fs::read(p), elf_symbol_u32);
+        assert!(cap.armed, "{:?}", cap.refusal);
+        for (name, suffix) in [("interp_tokbatch.elf", ""), (TOKEN_BATCH_OBJECT, "_gq")] {
+            let image = std::fs::read(directory.join(name)).unwrap();
+            let symbol = format!("plow_interp_tokbatch_gfx942{suffix}");
+            assert!(elf_symbol_names(&image).contains(&symbol.as_str()));
+            for marker in TOKEN_BATCH_MARKERS.into_iter().chain([
+                "plow_mixed_dynamic_rows_1",
+                "plow_mixed_step_bf16_1",
+                "plow_mixed_gemm_glu_1",
+                "plow_mixed_prefill_split_1",
+            ]) {
+                assert_eq!(elf_symbol_u32(&image, marker), Some(1), "{name}: {marker}");
+            }
+            assert_eq!(elf_symbol_u32(&image, "plow_mixed_block"), Some(256));
+            assert_eq!(elf_symbol_u32(&image, "plow_packet_hash_lo"), None);
+            let resources: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(directory.join(format!("{name}.resources.json"))).unwrap(),
+            )
+            .unwrap();
+            let total = resources["total_registers"].as_u64().unwrap();
+            assert_eq!(total, resources["vgpr"].as_u64().unwrap());
+            assert!(total <= resources["contract"]["max_total_registers"].as_u64().unwrap());
+        }
+        let mixed = std::fs::read(directory.join("interp_mixed_gq.elf")).unwrap();
+        let cap = probe_token_batch(&directory, "gfx942", |_| Ok(mixed.clone()), elf_symbol_u32);
+        assert!(!cap.armed);
+        assert!(matches!(
+            cap.refusal,
+            Some(TokenBatchRefusal::MarkersMissing { .. })
+        ));
+    }
+
     fn syms(present: &[&str]) -> impl Fn(&[u8], &str) -> Option<u32> {
         let owned: Vec<String> = present.iter().map(|s| s.to_string()).collect();
         move |_img: &[u8], want: &str| owned.iter().any(|s| s == want).then_some(1)
