@@ -134,6 +134,7 @@ use crate::asset::devblob::{DevBlob, DevProg};
 use crate::device::hsa::{HsaBackend, HsaKernel, HsaPinned};
 use crate::device::{DeviceMem, Module};
 use crate::exec::amd_packed::validate_rows as validate_amd_packed_rows;
+use crate::exec::amd_sparse_mla;
 use crate::exec::device_api::EngineDevice;
 use crate::exec::kvrow::{
     derive_kvrow, derive_mla_nsplit, is_lm_head_matmul, kvrow_span, mla_live_nsplit,
@@ -1023,6 +1024,7 @@ struct MoeEpCombineRoute {
 #[derive(Clone, Copy, Debug)]
 enum PrefillSegmentRoute {
     Interpreter,
+    SparseMla(amd_sparse_mla::Route),
     XReduceWaveRs,
     GraphPhaseXReduceWaveRs,
     XReduceAttnRes {
@@ -4106,7 +4108,7 @@ fn graph_phase_xreduce_segments_from_manifest(
 /// is checked so a truncated or foreign file yields an empty list instead of a
 /// panic. A file this cannot parse is reported by the CALLER as "unverifiable",
 /// never as "the arm is missing" — a parser bug must not become a refusal.
-fn elf_symbol_names(img: &[u8]) -> Vec<&str> {
+pub(super) fn elf_symbol_names(img: &[u8]) -> Vec<&str> {
     let mut out = Vec::new();
     let u16at = |o: usize| -> Option<usize> {
         img.get(o..o + 2)
@@ -7732,6 +7734,7 @@ pub struct AmdEngine {
     k_xreduce_wave_rs: Option<HsaKernel>,
     k_mla_materialize_pack: Option<HsaKernel>,
     k_mla_materialized_prefill: Option<HsaKernel>,
+    sparse_mla: Option<amd_sparse_mla::SparseMla>,
     k_xaudit: Option<HsaKernel>,
     k_state_clear: Option<HsaKernel>,
     k_token_capture: Option<HsaKernel>,
@@ -8481,6 +8484,12 @@ impl AmdEngine {
             return Err(RuntimeError::Device(format!(
                 "materialized MLA prefill requires gfx950, but this device is {arch}"
             )));
+        }
+        let use_sparse_mla = crate::config::RuntimeConfig::get().amd.mla_pf_aiter;
+        if use_sparse_mla && (arch != "gfx942" || variant == Variant::Fp8Kv) {
+            return Err(RuntimeError::Device(
+                "sparse AITER MLA requires gfx942 and BF16 KV".into(),
+            ));
         }
         let need_xr_attnres = blob.progs[..dec_ix]
             .iter()
@@ -10117,6 +10126,35 @@ impl AmdEngine {
             std::mem::size_of::<MlaMaterializedPrefillArgs>() as u32,
             149_760,
         )?;
+        let sparse_mla = if use_sparse_mla {
+            let candidates = blob.progs[..dec_ix]
+                .iter()
+                .filter(|p| !p.packed_prefill_only && p.t >= 2048)
+                .flat_map(|p| {
+                    p.insts
+                        .iter()
+                        .filter(|d| {
+                            d.op == DevOp::FlashMlaPrefill as u16
+                                && d.t[7] != packet::dev::TENSOR_NONE16
+                        })
+                        .map(move |d| (p.t, d.i[2]))
+                });
+            let (rows, ctx) = candidates.fold((0, 0), |(r, c), (rr, cc)| (r.max(rr), c.max(cc)));
+            if rows == 0 || rows > 8192 || ctx < 2048 || ctx > 81920 {
+                return Err(RuntimeError::Device(
+                    "sparse AITER MLA requires eligible rows<=8192 and ctx<=81920".into(),
+                ));
+            }
+            Some(amd_sparse_mla::SparseMla::load(
+                &be,
+                hsaco_dir,
+                rows,
+                ctx,
+                &mut modules,
+            )?)
+        } else {
+            None
+        };
 
         // --- tensors + weights ------------------------------------------------
         // Staging is one pinned slab, filled and pushed in `STAGE` chunks. The
@@ -10799,6 +10837,21 @@ impl AmdEngine {
             if prog_ix < dec_ix {
                 add_kda_key_factor_routes(p, &devp, &mut prefill_routes, kda_key_factor_scratch)?;
                 mla_materialized_routes(p, &devp, &mut prefill_routes)?;
+                if use_sparse_mla {
+                    for (seg, route) in amd_sparse_mla::routes(p, &blob.tensors, seg_class.len())?
+                        .into_iter()
+                        .enumerate()
+                    {
+                        if let Some(route) = route {
+                            if !matches!(prefill_routes[seg], PrefillSegmentRoute::Interpreter) {
+                                return Err(RuntimeError::Device(
+                                    "sparse MLA overlaps another native route".into(),
+                                ));
+                            }
+                            prefill_routes[seg] = PrefillSegmentRoute::SparseMla(route);
+                        }
+                    }
+                }
                 promote_kda_intra_wave_items_routes(p, &seg_class, &mut prefill_routes)?;
                 promote_kda_carry_regstate_routes(p, &seg_class, &devp, &mut prefill_routes)?;
                 promote_kda_wu_lean_routes(
@@ -10863,6 +10916,11 @@ impl AmdEngine {
                         "prefill program {prog_ix} (T={}) places materialized MLA raw opcodes in L2-domain windows; standalone objects require ordered wave segments",
                         p.t
                     )));
+                }
+                if use_sparse_mla && !prefill_segment_specialization_allowed(dispatch) {
+                    return Err(RuntimeError::Device(
+                        "sparse AITER MLA requires ordered segment dispatch".into(),
+                    ));
                 }
                 if has_ep && !prefill_segment_specialization_allowed(dispatch) {
                     return Err(RuntimeError::Device(format!(
@@ -11538,6 +11596,7 @@ impl AmdEngine {
             k_xreduce_wave_rs,
             k_mla_materialize_pack,
             k_mla_materialized_prefill,
+            sparse_mla,
             k_xaudit,
             k_state_clear,
             k_token_capture,
@@ -12178,6 +12237,7 @@ impl AmdEngine {
         let active = self.packed_prefill.is_some_and(|b| b.prog == p);
         if !active {
             match route {
+                PrefillSegmentRoute::SparseMla(route) if route.active => return "mla_sparse_aiter",
                 PrefillSegmentRoute::MlaMaterializePack { .. } => return "mla_materialize_pack",
                 PrefillSegmentRoute::MlaMaterializedPrefill { .. } => {
                     return "mla_materialized_prefill";
@@ -12337,6 +12397,18 @@ impl AmdEngine {
         }
         let active = self.packed_prefill.is_some_and(|b| b.prog == p);
         if !active {
+            if let Some(PrefillSegmentRoute::SparseMla(route)) =
+                self.progs[p].prefill_routes.get(seg).copied()
+            {
+                if route.active {
+                    let sparse = self.sparse_mla.as_ref().ok_or_else(|| {
+                        RuntimeError::Device("sparse MLA route has no loaded kernels".into())
+                    })?;
+                    sparse.enqueue(&self.be, route, &self.tens_table)?;
+                    self.seg_launches += 3;
+                    return Ok(());
+                }
+            }
             if let Some(PrefillSegmentRoute::MlaMaterializePack {
                 args,
                 grid,
@@ -12822,6 +12894,7 @@ impl AmdEngine {
             return 1;
         }
         match self.progs[p].prefill_routes.get(seg) {
+            Some(PrefillSegmentRoute::SparseMla(route)) if route.active => 3,
             Some(PrefillSegmentRoute::MoeEpAlign(_)) if self.k_moe_ep_align.is_some() => 4,
             Some(PrefillSegmentRoute::MoeStage1A4Reuse(_))
                 if self.k_moe_stage1_a4_quant.is_some() && self.k_moe_stage1_a4_reuse.is_some() =>
@@ -13514,6 +13587,11 @@ impl AmdEngine {
         } else {
             self.progs[prog].t
         };
+        for route in &mut self.progs[prog].prefill_routes {
+            if let PrefillSegmentRoute::SparseMla(route) = route {
+                route.rebase(rows, c0)?;
+            }
+        }
         rebase_mla_materialized_routes(
             insts,
             &self.tensor_names,

@@ -216,6 +216,7 @@ const MAX_PREFILL_CAPTURE_BYTES: u64 = 256 << 20;
 #[derive(Debug, Eq, PartialEq)]
 struct PrefillCaptureRequest {
     program_t: u32,
+    chunk_base: Option<u32>,
     segment: usize,
     targets: Vec<(String, PathBuf)>,
 }
@@ -223,17 +224,31 @@ struct PrefillCaptureRequest {
 #[derive(Debug)]
 struct PrefillCapture {
     program: usize,
+    chunk_base: Option<u32>,
     segment: usize,
     targets: Vec<(String, PathBuf)>,
 }
 
 fn parse_prefill_capture(spec: &str) -> Result<PrefillCaptureRequest> {
     let (program_t, rest) = spec.split_once(':').ok_or_else(|| {
-        RuntimeError::Device("PLOW_PF_CAPTURE must be T:SEG:tensor=path[,tensor=path...]".into())
+        RuntimeError::Device(
+            "PLOW_PF_CAPTURE must be T[@C0]:SEG:tensor=path[,tensor=path...]".into(),
+        )
     })?;
     let (segment, targets) = rest.split_once(':').ok_or_else(|| {
-        RuntimeError::Device("PLOW_PF_CAPTURE must be T:SEG:tensor=path[,tensor=path...]".into())
+        RuntimeError::Device(
+            "PLOW_PF_CAPTURE must be T[@C0]:SEG:tensor=path[,tensor=path...]".into(),
+        )
     })?;
+    let (program_t, chunk_base) = match program_t.split_once('@') {
+        Some((t, base)) => (
+            t,
+            Some(base.parse::<u32>().map_err(|_| {
+                RuntimeError::Device("PLOW_PF_CAPTURE has an invalid chunk base".into())
+            })?),
+        ),
+        None => (program_t, None),
+    };
     let program_t = program_t
         .parse::<u32>()
         .map_err(|_| RuntimeError::Device("PLOW_PF_CAPTURE has an invalid program T".into()))?;
@@ -282,13 +297,23 @@ fn parse_prefill_capture(spec: &str) -> Result<PrefillCaptureRequest> {
     }
     Ok(PrefillCaptureRequest {
         program_t,
+        chunk_base,
         segment,
         targets: parsed,
     })
 }
 
-fn prefill_capture_due(capture: Option<&PrefillCapture>, program: usize, segment: usize) -> bool {
-    capture.is_some_and(|capture| capture.program == program && capture.segment == segment)
+fn prefill_capture_due(
+    capture: Option<&PrefillCapture>,
+    program: usize,
+    segment: usize,
+    c0: u32,
+) -> bool {
+    capture.is_some_and(|capture| {
+        capture.program == program
+            && capture.segment == segment
+            && capture.chunk_base.is_none_or(|base| base == c0)
+    })
 }
 
 fn agreement_due(tick: &mut u32, every: u32) -> bool {
@@ -623,6 +648,7 @@ impl AmdTpGroup {
                 }
                 Ok(PrefillCapture {
                     program,
+                    chunk_base: request.chunk_base,
                     segment: request.segment,
                     targets: request.targets,
                 })
@@ -1481,7 +1507,7 @@ impl AmdTpGroup {
                     submit_begin.elapsed().as_secs_f64() * 1e6,
                 );
             }
-            if prefill_capture_due(self.prefill_capture.as_ref(), step.prog, seg) {
+            if prefill_capture_due(self.prefill_capture.as_ref(), step.prog, seg, step.c0) {
                 let capture = self.prefill_capture.take().expect("capture was due");
                 for (tensor, path) in capture.targets {
                     let bytes = self.ranks[0].snapshot_tensor(&tensor)?;
@@ -1915,15 +1941,19 @@ mod tests {
 
     #[test]
     fn prefill_capture_is_exact_one_shot_selection() {
-        assert!(!prefill_capture_due(None, 2, 7));
-        let capture = PrefillCapture {
+        assert!(!prefill_capture_due(None, 2, 7, 0));
+        let mut capture = PrefillCapture {
             program: 2,
+            chunk_base: None,
             segment: 7,
             targets: vec![("act.pf.q".into(), "/tmp/q.bin".into())],
         };
-        assert!(prefill_capture_due(Some(&capture), 2, 7));
-        assert!(!prefill_capture_due(Some(&capture), 1, 7));
-        assert!(!prefill_capture_due(Some(&capture), 2, 6));
+        assert!(prefill_capture_due(Some(&capture), 2, 7, 0));
+        assert!(!prefill_capture_due(Some(&capture), 1, 7, 0));
+        assert!(!prefill_capture_due(Some(&capture), 2, 6, 0));
+        capture.chunk_base = Some(65536);
+        assert!(!prefill_capture_due(Some(&capture), 2, 7, 0));
+        assert!(prefill_capture_due(Some(&capture), 2, 7, 65536));
     }
 
     #[test]
@@ -1933,6 +1963,13 @@ mod tests {
         assert_eq!(request.program_t, 8192);
         assert_eq!(request.segment, 17);
         assert_eq!(request.targets.len(), 2);
+        assert_eq!(request.chunk_base, None);
+        assert_eq!(
+            parse_prefill_capture("8192@65536:17:act.q=/tmp/q.bin")
+                .unwrap()
+                .chunk_base,
+            Some(65536)
+        );
 
         for spec in [
             "8192:17:act.pf.q=/tmp/q.bin,act.pf.q=/tmp/q2.bin",
@@ -1941,6 +1978,7 @@ mod tests {
             "8192:17:",
             "8192:x:act.pf.q=/tmp/q.bin",
             "0:17:act.pf.q=/tmp/q.bin",
+            "8192@bad:17:act.pf.q=/tmp/q.bin",
         ] {
             assert!(parse_prefill_capture(spec).is_err(), "accepted {spec:?}");
         }

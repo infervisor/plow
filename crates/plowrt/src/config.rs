@@ -929,7 +929,7 @@ pub struct AmdRuntimeConfig {
     )]
     pub snap_slot: usize,
 
-    /// One-shot rank-0 tensor capture after an exact TP prefill segment drain.
+    /// One-shot rank-0 capture: `T[@C0]:SEG:tensor=path[,tensor=path...]`.
     #[arg(
         long = "amd-pf-capture",
         env = "PLOW_PF_CAPTURE",
@@ -965,6 +965,10 @@ pub struct AmdRuntimeConfig {
     /// fluent, and wrong. Enabled by default for production AMD packets.
     #[arg(long = "amd-mla-pf-v2", env = "PLOW_MLA_PF_V2", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub mla_pf_v2: bool,
+
+    /// Use the qualified gfx942 sparse MLA assembly object at isolated prefill boundaries.
+    #[arg(long = "amd-mla-pf-aiter", env = "PLOW_MLA_PF_AITER", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub mla_pf_aiter: bool,
 
     /// Prequantize sorted MXFP4 MoE stage-1 activations once and reuse them across N tiles.
     #[arg(long = "amd-moe-stage1-a4-reuse", env = "PLOW_MOE_STAGE1_A4_REUSE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]

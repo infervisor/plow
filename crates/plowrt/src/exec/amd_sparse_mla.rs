@@ -1,0 +1,511 @@
+use std::collections::BTreeSet;
+use std::path::Path;
+
+use packet::dev::{DevInst64, DevOp, SE_XCTR, TENSOR_NONE16};
+
+use crate::asset::devblob::{DevProg, DevTensor};
+use crate::device::hsa::{HsaBackend, HsaKernel};
+use crate::device::{DeviceMem, Module};
+use crate::exec::device_api::EngineDevice;
+use crate::{Result, RuntimeError};
+
+const OBJECT_HASH: &str = "cd8fa62e18abada15beeeedd49357bcc1e9e2eee7353d038533f30cac93c3607";
+const OBJECT: &str = "mla_a16w16_qh8_qseqlen1_gqaratio8_v3.co";
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Route {
+    inst: DevInst64,
+    index: u16,
+    rows: u32,
+    kv_len: u32,
+    pub active: bool,
+}
+
+impl Route {
+    pub fn rebase(&mut self, rows: u32, prior: u32) -> Result<()> {
+        if rows > self.inst.i[4] || prior.checked_add(rows).is_none_or(|n| n > self.inst.i[2]) {
+            return Err(RuntimeError::Device(
+                "sparse MLA chunk exceeds its query/KV capacity".into(),
+            ));
+        }
+        self.rows = rows;
+        self.kv_len = prior + rows;
+        // Fixed-width CSR is valid only when every row has all 2048 causal keys.
+        self.active = rows != 0 && prior >= 2047;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use packet::dev::StreamEnt;
+
+    #[test]
+    #[ignore = "requires a gfx942 GPU lease and PLOW_TEST_AITER_DIR"]
+    fn sparse_mla_hsa_dispatch() {
+        let dir = std::env::var("PLOW_TEST_AITER_DIR").unwrap();
+        let be = HsaBackend::new(0).unwrap();
+        let mut modules = Vec::new();
+        let kernel = SparseMla::load(&be, Path::new(&dir), 129, 4096, &mut modules).unwrap();
+        let sizes = [
+            129 * 8 * 512 * 4,
+            129 * 8 * 2 * 4,
+            129 * 8 * 512 * 2,
+            129 * 8 * 64 * 2,
+            2 * 4096 * 512 * 2,
+            2 * 4096 * 64 * 2,
+            4,
+            4,
+            129 * 2048 * 4,
+        ];
+        let mut buffers = Vec::new();
+        for bytes in sizes {
+            let buf = EngineDevice::alloc(&be, bytes).unwrap();
+            EngineDevice::upload(&be, &buf, 0, &vec![0; bytes as usize]).unwrap();
+            buffers.push(buf);
+        }
+        let mut ck = vec![0x3f80u16; 2 * 4096 * 512];
+        ck[4096 * 512..].fill(0x4000);
+        EngineDevice::upload(&be, &buffers[4], 0, bytemuck::cast_slice(&ck)).unwrap();
+        let idx: Vec<u32> = (0..129 * 2048).map(|i| i % 2048).collect();
+        EngineDevice::upload(&be, &buffers[8], 0, bytemuck::cast_slice(&idx)).unwrap();
+        let mut route = Route {
+            inst: DevInst64 {
+                t: [0, 1, 2, 3, 4, 5, 6, 7],
+                i: [1, 8, 4096, 0, 129, u32::MAX, 0, 0],
+                fj: [0.0625f32.to_bits(), 0, 0],
+                ..Default::default()
+            },
+            index: 8,
+            rows: 129,
+            kv_len: 0,
+            active: false,
+        };
+        for slot in 0..2u64 {
+            let mut table: Vec<u64> = buffers.iter().map(|m| m.base).collect();
+            table[4] += slot * 4096 * 512 * 2;
+            table[5] += slot * 4096 * 64 * 2;
+            for rows in [1, 129] {
+                route.rebase(rows, 2048).unwrap();
+                kernel
+                    .enqueue(&be, route, bytemuck::cast_slice(&table))
+                    .unwrap();
+                be.synchronize().unwrap();
+                let mut out = vec![0f32; rows as usize * 8 * 512];
+                EngineDevice::download(&be, &buffers[0], 0, bytemuck::cast_slice_mut(&mut out))
+                    .unwrap();
+                assert!(out.iter().all(|&x| x == (slot + 1) as f32));
+                let mut ml = vec![0f32; rows as usize * 8 * 2];
+                EngineDevice::download(&be, &buffers[1], 0, bytemuck::cast_slice_mut(&mut ml))
+                    .unwrap();
+                assert!(ml.chunks_exact(2).all(|x| x == [0.0, 1.0]));
+            }
+        }
+    }
+
+    fn fixture() -> (DevProg, Vec<DevTensor>) {
+        let union = DevInst64 {
+            op: DevOp::IndexUnionPf as u16,
+            t: [
+                7,
+                9,
+                8,
+                6,
+                TENSOR_NONE16,
+                TENSOR_NONE16,
+                TENSOR_NONE16,
+                TENSOR_NONE16,
+            ],
+            i: [8192, 2048, 81920, 16384, 8, 0, 0, 0],
+            ..Default::default()
+        };
+        let flash = DevInst64 {
+            op: DevOp::FlashMlaPrefill as u16,
+            t: [0, 1, 2, 3, 4, 5, 6, 7],
+            i: [1, 8, 81920, 0, 8192, u32::MAX, 16384, 4],
+            fj: [0.0625f32.to_bits(), 0, 0],
+            ..Default::default()
+        };
+        let prog = DevProg {
+            t: 8192,
+            packed_prefill_only: false,
+            n_counter: 0,
+            insts: vec![union, flash],
+            stream: vec![StreamEnt {
+                inst: 1,
+                seg: 1,
+                ..Default::default()
+            }],
+            stream_ofs: vec![],
+            stream_len: vec![],
+            waits: vec![],
+            succs: vec![],
+            gq_stream: vec![],
+            gq_seg_ofs: vec![],
+            l2_domains: 0,
+        };
+        let tensors = (0..10)
+            .map(|i| DevTensor {
+                name: i.to_string(),
+                bytes: 256 << 20,
+                init: None,
+            })
+            .collect();
+        (prog, tensors)
+    }
+
+    #[test]
+    fn sparse_mla_rebases_ragged_rows_and_restores_early_fallback() {
+        let (prog, tensors) = fixture();
+        let mut route = routes(&prog, &tensors, 2).unwrap()[1].unwrap();
+        route.rebase(129, 65536).unwrap();
+        assert!(route.active);
+        assert_eq!(route.rows, 129);
+        route.rebase(8192, 0).unwrap();
+        assert!(!route.active);
+        route.rebase(1, 2046).unwrap();
+        assert!(!route.active);
+        route.rebase(1, 2047).unwrap();
+        assert!(route.active);
+        assert!(route.rebase(8193, 0).is_err());
+        assert!(route.rebase(129, 81920).is_err());
+    }
+
+    #[test]
+    fn sparse_mla_rejects_counter_obligations_in_both_streams() {
+        for global in [false, true] {
+            for kind in 0..3 {
+                let (mut prog, tensors) = fixture();
+                prog.gq_stream = prog.stream.clone();
+                let entry = if global {
+                    &mut prog.gq_stream[0]
+                } else {
+                    &mut prog.stream[0]
+                };
+                match kind {
+                    0 => entry.wait_len = 1,
+                    1 => entry.succ_len = 1,
+                    _ => entry.flags = SE_XCTR,
+                }
+                assert!(routes(&prog, &tensors, 2).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_mla_rejects_mixed_segments_and_wrong_geometry() {
+        for kind in 0..6 {
+            let (mut prog, mut tensors) = fixture();
+            match kind {
+                0 => prog.stream.push(StreamEnt {
+                    inst: 0,
+                    seg: 1,
+                    ..Default::default()
+                }),
+                1 => prog.stream.push(StreamEnt {
+                    inst: 1,
+                    seg: 0,
+                    ..Default::default()
+                }),
+                2 => prog.insts[0].i[1] = 1024,
+                3 => prog.insts[1].i[1] = 16,
+                4 => tensors[4].bytes = 16,
+                _ => prog.insts[1].t[2] = TENSOR_NONE16,
+            }
+            assert!(routes(&prog, &tensors, 2).is_err());
+        }
+    }
+}
+
+pub(super) fn routes(
+    prog: &DevProg,
+    tensors: &[DevTensor],
+    segments: usize,
+) -> Result<Vec<Option<Route>>> {
+    let mut routes = vec![None; segments];
+    if prog.packed_prefill_only || prog.t < 2048 {
+        return Ok(routes);
+    }
+    for (ix, inst) in prog.insts.iter().enumerate() {
+        if inst.op != DevOp::FlashMlaPrefill as u16 || inst.t[7] == TENSOR_NONE16 {
+            continue;
+        }
+        let err = |s: &str| RuntimeError::Device(format!("sparse AITER MLA instruction {ix}: {s}"));
+        if inst.i[0] != 1
+            || inst.i[1] != 8
+            || inst.i[2] > 81920
+            || inst.i[2] < 2048
+            || inst.i[3] != 0
+            || inst.i[4] != prog.t
+            || inst.i[5] != u32::MAX
+            || prog.t > 8192
+            || inst.fj[1..] != [0, 0]
+            || !f32::from_bits(inst.fj[0]).is_finite()
+            || f32::from_bits(inst.fj[0]) <= 0.0
+        {
+            return Err(err(
+                "requires BF16 QH8 latent512/rope64, rows<=8192, ctx<=81920",
+            ));
+        }
+        let union = prog.insts[..ix]
+            .iter()
+            .rev()
+            .find(|d| d.op == DevOp::IndexUnionPf as u16 && d.t[0] == inst.t[7])
+            .ok_or_else(|| err("no preceding index union"))?;
+        if union.i[..5] != [prog.t, 2048, inst.i[2], inst.i[6], 8] || union.t[3] != inst.t[6] {
+            return Err(err(
+                "index union does not describe 2048 selected keys per query",
+            ));
+        }
+        let ctx = u64::from(inst.i[2]);
+        let rows = u64::from(prog.t);
+        for (handle, bytes) in [
+            (inst.t[0], rows * 8 * 512 * 4),
+            (inst.t[1], rows * 8 * 2 * 4),
+            (inst.t[2], rows * 8 * 512 * 2),
+            (inst.t[3], rows * 8 * 64 * 2),
+            (inst.t[4], ctx * 512 * 2),
+            (inst.t[5], ctx * 64 * 2),
+            (union.t[2], rows * 2048 * 4),
+        ] {
+            if handle == TENSOR_NONE16
+                || tensors.get(handle as usize).is_none_or(|t| t.bytes < bytes)
+            {
+                return Err(err("operand capacity is insufficient"));
+            }
+        }
+        let mut owner = BTreeSet::new();
+        for entry in prog
+            .stream
+            .iter()
+            .chain(&prog.gq_stream)
+            .filter(|e| e.inst as usize == ix)
+        {
+            if entry.wait_len != 0 || entry.succ_len != 0 || entry.flags & SE_XCTR != 0 {
+                return Err(err(
+                    "counter obligations remain; re-emit with PLOW_MLA_PF_AITER=1",
+                ));
+            }
+            owner.insert(entry.seg as usize);
+        }
+        if owner.len() != 1 {
+            return Err(err("requires exactly one segment owner"));
+        }
+        let seg = *owner.first().unwrap();
+        if seg >= segments
+            || prog
+                .stream
+                .iter()
+                .chain(&prog.gq_stream)
+                .any(|e| e.seg as usize == seg && e.inst as usize != ix)
+        {
+            return Err(err("segment contains other interpreter work"));
+        }
+        routes[seg] = Some(Route {
+            inst: *inst,
+            index: union.t[2],
+            rows: prog.t,
+            kv_len: 0,
+            active: false,
+        });
+    }
+    Ok(routes)
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct PackArgs {
+    q: u64,
+    kv: u64,
+    qa: u64,
+    qr: u64,
+    ck: u64,
+    kr: u64,
+    qp: u64,
+    kp: u64,
+    last: u64,
+    splits: u64,
+    rows: u32,
+    ctx: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct ReduceArgs {
+    out: u64,
+    ml: u64,
+    part: u64,
+    lse: u64,
+    rows: u32,
+    pad: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<PackArgs>() == 88);
+const _: () = assert!(std::mem::size_of::<ReduceArgs>() == 40);
+
+pub(super) struct SparseMla {
+    pack: HsaKernel,
+    attention: HsaKernel,
+    reduce: HsaKernel,
+    _scratch: DeviceMem,
+    q: u64,
+    kv: u64,
+    part: u64,
+    lse: u64,
+    qp: u64,
+    kp: u64,
+    last: u64,
+    splits: u64,
+}
+
+impl SparseMla {
+    pub fn load(
+        be: &HsaBackend,
+        dir: &Path,
+        rows: u32,
+        ctx: u32,
+        modules: &mut Vec<Module>,
+    ) -> Result<Self> {
+        let path = dir.join(OBJECT);
+        let mut image = std::fs::read(&path)
+            .map_err(|e| RuntimeError::Device(format!("{}: {e}", path.display())))?;
+        if plow_asset::decode_objects::image_sha256(&image) != OBJECT_HASH {
+            return Err(RuntimeError::Device(
+                "sparse AITER MLA object hash does not match qualified ABI".into(),
+            ));
+        }
+        // This exact object declares 320 bytes in metadata but leaves KERNARG_SIZE
+        // unspecified in its descriptor. ROCr reports the descriptor's zero, unlike HIP.
+        // The hash fixes the descriptor at file offset 0x1000; only its size is normalized.
+        image[0x1008..0x100c].copy_from_slice(&320u32.to_le_bytes());
+        let module = EngineDevice::module_load(be, &image)?;
+        let attention = EngineDevice::get_function(
+            be,
+            &module,
+            "_ZN5aiter36mla_a16w16_qh8_qseqlen1_gqaratio8_v3E",
+        )?;
+        if attention.kernarg_size() != 320
+            || attention.private_segment_size() != 0
+            || HsaBackend::kernel_lds_bytes(&attention) != 65536
+        {
+            return Err(RuntimeError::Device(format!(
+                "sparse AITER MLA resource ABI mismatch: kernarg={}, private={}, LDS={}",
+                attention.kernarg_size(),
+                attention.private_segment_size(),
+                HsaBackend::kernel_lds_bytes(&attention)
+            )));
+        }
+        modules.push(module);
+        let path = dir.join("mla_sparse_adapter_gfx942.elf");
+        let image = std::fs::read(&path)
+            .map_err(|e| RuntimeError::Device(format!("{}: {e}", path.display())))?;
+        if !super::amd::elf_symbol_names(&image).contains(&"plow_mla_sparse_adapter_abi_1") {
+            return Err(RuntimeError::Device(
+                "sparse MLA adapter lacks ABI marker".into(),
+            ));
+        }
+        let module = EngineDevice::module_load(be, &image)?;
+        let pack = EngineDevice::get_function(be, &module, "plow_mla_sparse_pack")?;
+        let reduce = EngineDevice::get_function(be, &module, "plow_mla_sparse_reduce")?;
+        for (kernel, size) in [(pack, 88), (reduce, 40)] {
+            if ![size, size + 256].contains(&kernel.kernarg_size())
+                || kernel.private_segment_size() != 0
+            {
+                return Err(RuntimeError::Device(
+                    "sparse MLA adapter resource ABI mismatch".into(),
+                ));
+            }
+        }
+        modules.push(module);
+        let rows = u64::from(rows);
+        let sizes = [
+            rows * 8 * 576 * 2,
+            u64::from(ctx) * 576 * 2,
+            rows * 2 * 8 * 512 * 4,
+            rows * 2 * 8 * 4,
+            (rows + 1) * 4,
+            (rows + 1) * 4,
+            (rows + 1) * 4,
+            (rows + 1) * 4,
+        ];
+        let bytes = sizes.iter().map(|s| s.div_ceil(256) * 256).sum();
+        let scratch = EngineDevice::alloc(be, bytes)?;
+        let mut ptr = scratch.base;
+        let offsets = sizes.map(|size| {
+            let p = ptr;
+            ptr += size.div_ceil(256) * 256;
+            p
+        });
+        let [q, kv, part, lse, qp, kp, last, splits] = offsets;
+        tracing::info!(bytes, "allocated sparse AITER MLA workspace");
+        Ok(Self {
+            pack,
+            attention,
+            reduce,
+            _scratch: scratch,
+            q,
+            kv,
+            part,
+            lse,
+            qp,
+            kp,
+            last,
+            splits,
+        })
+    }
+
+    pub fn enqueue(&self, be: &HsaBackend, route: Route, tensor_table: &[u8]) -> Result<()> {
+        let addr = |handle: u16| {
+            let at = usize::from(handle) * 8;
+            u64::from_le_bytes(tensor_table[at..at + 8].try_into().unwrap())
+        };
+        let t = route.inst.t;
+        let pack = PackArgs {
+            q: self.q,
+            kv: self.kv,
+            qa: addr(t[2]),
+            qr: addr(t[3]),
+            ck: addr(t[4]),
+            kr: addr(t[5]),
+            qp: self.qp,
+            kp: self.kp,
+            last: self.last,
+            splits: self.splits,
+            rows: route.rows,
+            // VMM may leave the capacity beyond the live prefix unmapped.
+            ctx: route.kv_len,
+        };
+        be.launch(self.pack, 304, 256, 0, bytemuck::bytes_of(&pack))?;
+        let mut args = [0u64; 40];
+        args[0] = self.part;
+        args[2] = self.lse;
+        args[4] = self.q;
+        args[6] = self.kv;
+        args[8] = self.kp;
+        args[10] = addr(route.index);
+        args[12] = self.last;
+        args[14] = u64::from(route.inst.fj[0]);
+        args[16] = 8;
+        args[18] = 2;
+        args[20] = 8 * 576 * 2;
+        args[22] = 576 * 2;
+        args[26] = self.qp;
+        args[28] = self.splits;
+        be.launch_3d(
+            self.attention,
+            [1, route.rows, 2],
+            256,
+            bytemuck::cast_slice(&args),
+        )?;
+        let reduce = ReduceArgs {
+            out: addr(t[0]),
+            ml: addr(t[1]),
+            part: self.part,
+            lse: self.lse,
+            rows: route.rows,
+            pad: 0,
+        };
+        be.launch(self.reduce, 304, 256, 0, bytemuck::bytes_of(&reduce))
+    }
+}

@@ -2084,15 +2084,15 @@ QK256/V256 MHA kernels did not answer whether this absorbed MLA shape exists.
 It does, and the installed object executes successfully with two KV splits.
 The [reproducible comparison](../../runtime/bench/amd/mla_sparse_aiter/README.md)
 includes plow's actual union/flash bodies, a vectorized native packing adapter,
-independent FP32 oracle checks and recorded GPU graph timings. This adds a
-benchmark prototype; production dispatch is unchanged.
+independent FP32 oracle checks and recorded GPU graph timings. The opt-in
+`PLOW_MLA_PF_AITER=1` runtime now dispatches the qualified object through HSA.
 
 The isolated gain depends on selection overlap and index order. Packing costs
 do not erase the distinct-selection advantage. Shared-indexer layers amortize
 plow's union construction, so its separate cost cannot be charged on every layer.
-An actual layer-77 capture and a native FP32 split reducer now qualify the
-isolated merge/fold output contract; production dispatch and model-level quality
-still need qualification. The installed AITER automatic
+An actual layer-77 capture and a native FP32 split reducer qualify the
+merge/fold output contract; runtime and limited retrieval qualification are
+recorded below. The installed AITER automatic
 single-split path produced NaNs and a GPU memory fault; the benchmark fixes two
 splits. This failure is not attributed to a proven root cause.
 
@@ -2117,14 +2117,17 @@ measurements use the installed `amd-aiter 0.1.19` object identified in the compa
 
 ### Actual MLA capture and matched grouped MoE
 
-At GLM layer 77, the last 2048 queries of a 67,584-token deterministic prefill
-have a mean 8-query union of **3902.8**. The native AITER adapter, including
+At GLM layer 77, the last 4464 queries of a 70,000-token deterministic prefill
+have a mean 8-query union of **3931.8**. The native AITER adapter, including
 packing Q and the entire KV cache plus FP32 split reduction, measured
-**0.652 ms vs plow's 0.920 ms**: 29.1% lower kernel latency. Sampled relative
-L2 vs an independent FP32 oracle was 0.000553 vs plow's 0.000166. The native
+**1.377 ms vs plow's 1.984 ms**: 30.6% lower kernel latency. Sampled relative
+L2 vs an independent FP32 oracle was 0.000368 vs plow's 0.000387. The native
 launcher pins the assembly object by hash and writes `(m,l)=(0,1)` with its
 normalized partial. All nine native synthetic cells also passed. See the
 [MLA capture and ABI record](../../runtime/bench/amd/mla_sparse_aiter/README.md#native-abi-and-actual-model-capture).
+This supersedes the earlier T2048 capture, whose dense bucket retained indices
+from the preceding chunk. The corrected capture explicitly selects T8192 at
+chunk base 65536 and uses the current layer-74 indices.
 
 The [matched grouped MoE benchmark](../../runtime/bench/amd/moe_aiter/README.md)
 now includes activation quantization, sorting and combine. At 8192 tokens and
@@ -2136,10 +2139,33 @@ All nine cells passed their explicit screening thresholds, but AITER's sampled
 relative L2 was **4.06–4.37%**, vs plow's **0.23–0.24%**. Its additional FP8
 activation quantization needs actual-model quality checks before adoption.
 
-Neither result is a serving speedup. The native MLA route still needs HSA
-dispatch and correct counter edges, early causal rows, ragged rows and KV-slot
-rebasing. MoE additionally changes activation precision. These measured
-boundaries support native integration work, not an unqualified ASM rewrite.
+Neither isolated result is a serving speedup. MoE changes activation precision
+and remains a benchmark candidate. Native MLA integration is qualified below.
+
+### Native MLA runtime integration
+
+Re-emitting with `PLOW_MLA_PF_AITER=1 PLOW_MLA_PF_V2=1` removes cross-segment
+counter edges at ordered launch boundaries. The loader checks geometry, pure
+segment ownership, counter obligations, adapter ABI and the exact AITER object
+hash. Eligible segments enqueue packing, assembly attention and FP32 reduction
+through HSA. One 438,961,152-byte workspace per rank is reused without hot-path
+allocation. Early causal rows, dense buckets and packed prefill retain their
+interpreter route. Ragged rows and rebased KV slots are supported.
+
+A paired full-model TP8 B8 prefill sweep, all 78 sparse layers, BF16 KV,
+81920 context and audit retained, measured 70k mean time at **13,254.466 ms
+interpreter vs 12,379.396 ms native**: **6.60% lower** over three repeats after
+one warmup per arm. The same packet and runtime build were used for both timed
+processes. Short 8192/8321-token fallback controls were effectively unchanged.
+A separate instrumented run confirms all 78 native attention segments execute
+in a ragged second chunk.
+
+Each arm passed 18/18 concurrent retrieval cases across two lengths, three
+depths and three facts; 13/18 paired continuations were text-identical. This
+screen does not establish general model-quality equivalence. Native HSA tests
+also pass rows 1/129 across two KV slots and verify the merge normalizer.
+See [runtime results and reproduction](../../runtime/bench/amd/mla_sparse_aiter/README.md#full-model-runtime-qualification).
+Concurrency-20 serving throughput has not been remeasured for this route.
 
 ### Corrected GEMM ceiling and FP8 assumptions
 

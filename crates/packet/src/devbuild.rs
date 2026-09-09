@@ -1947,6 +1947,7 @@ impl Builder {
                 // runs that ordered segment on the ordinary 8-wave interpreter.
                 _ => self.place_l2.is_some(),
             };
+        let mla_aiter = mla_v2 && std::env::var("PLOW_MLA_PF_AITER").ok().as_deref() == Some("1");
         // Opt-in only: live packed serving remains disabled. Giving descriptor-consuming
         // families distinct classes lets a future runtime route them to lean objects without
         // putting their branches in the production megakernel. Unset preserves packet bytes.
@@ -2281,6 +2282,7 @@ impl Builder {
             || lean_kda_key_factor
             || xr_attnres
             || mla_materialized
+            || mla_aiter
             || decode_mla_segments
             || decode_grouped_moe
             || isolate_xreduce;

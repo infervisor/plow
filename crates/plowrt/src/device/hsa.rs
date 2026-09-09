@@ -3320,6 +3320,33 @@ impl HsaBackend {
         )
     }
 
+    pub(crate) fn launch_3d(
+        &self,
+        f: HsaKernel,
+        grid: [u32; 3],
+        block: u16,
+        args: &[u8],
+    ) -> Result<()> {
+        let grid_x = grid[0].checked_mul(u32::from(block)).filter(|&n| n != 0);
+        if grid_x.is_none() || grid[1] == 0 || grid[2] == 0 || block > 1024 {
+            return Err(RuntimeError::Device(format!(
+                "invalid 3D launch: grid={grid:?}, block={block}"
+            )));
+        }
+        self.dispatch(
+            &f,
+            grid_x.unwrap(),
+            grid[1],
+            grid[2],
+            block,
+            1,
+            1,
+            0,
+            args.as_ptr().cast(),
+            args.len(),
+        )
+    }
+
     /// No-op with a range check. HSA carries `group_segment_size` in the
     /// dispatch packet, so there is no per-function opt-in to set; the check
     /// keeps an over-budget request from silently becoming a launch failure.

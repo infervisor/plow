@@ -3,7 +3,7 @@
 This isolates the GLM TP8 attention geometry: 8 query heads, 512 latent + 64
 rope dimensions, BF16 Q/KV, top-k 2048, context 81920. It compares plow's
 8-query union walk against AITER's per-query assembly kernel. It is an adapter
-prototype and oracle, not a serving backend.
+prototype and oracle. An opt-in native runtime route is qualified below.
 
 `kernels.hip` calls the actual `d_index_union_pf` and
 `d_flash_mla_prefill_v2<512,64,true>` bodies, with LDS DMA enabled. Union launches 512 threads, matching the
@@ -113,10 +113,10 @@ perf-data/tools/gpulease -n 1 mla-native python "$bench/compare.py" \
 All nine [native synthetic cells](mi300x-native-results.json) passed the sampled FP32 oracle and finite-output
 check, including a ragged pack. The normalizer contract is checked everywhere.
 
-The actual-model capture uses GLM layer 77 after 67,584 deterministic random
-prompt tokens, with the last 2,048 query rows, TP8, B1, context capacity 81,920,
+The actual-model capture uses GLM layer 77 after 70,000 deterministic random
+prompt tokens, with the last 4,464 query rows in the 8192-row bucket, TP8, B1, context capacity 81,920,
 and all 78 sparse layers enabled. The shared layer uses layer 74's selected
-indices. Its mean 8-query union is **3,902.8**, much smaller than the synthetic
+indices. Its mean 8-query union is **3,931.8**, much smaller than the synthetic
 distinct-selection case. This is a model-tensor capture, not the vLLM workload.
 The model attention scale is **0.0625**, supplied explicitly.
 
@@ -126,12 +126,12 @@ Its layer-77 attention is segment 155. To capture from this exact bundle, create
 `/tmp/mla-capture` and run the existing prefill sweep with:
 
 ```sh
-export PLOW_PF_CAPTURE='2048:155:act.iidx_pf=/tmp/mla-capture/idx.bin,act.qa=/tmp/mla-capture/qa.bin,act.qr=/tmp/mla-capture/qr.bin,in.kvlen=/tmp/mla-capture/len.bin,kv.77.ckv=/tmp/mla-capture/ck.bin,kv.77.krot=/tmp/mla-capture/kr.bin'
+export PLOW_PF_CAPTURE='8192@65536:155:act.iidx_pf=/tmp/mla-capture/idx.bin,act.qa=/tmp/mla-capture/qa.bin,act.qr=/tmp/mla-capture/qr.bin,in.kvlen=/tmp/mla-capture/len.bin,kv.77.ckv=/tmp/mla-capture/ck.bin,kv.77.krot=/tmp/mla-capture/kr.bin'
 # Add to the TP8 plowrt bench invocation for the B1 bundle:
-# --prefill-sweep --prefill-lengths 67584 --prefill-reps 1 --prefill-warmups 0
+# --prefill-sweep --prefill-lengths 70000 --prefill-reps 1 --prefill-warmups 0
 perf-data/tools/gpulease -n 1 mla-capture python "$bench/compare.py" \
   --library /tmp/mla-compare.so --native-library /tmp/mla-native.so \
-  --capture /tmp/mla-capture --rows 2048 --scale 0.0625 \
+  --capture /tmp/mla-capture --rows 4464 --scale 0.0625 \
   --out /tmp/mla-model.json
 ```
 
@@ -142,21 +142,103 @@ The final repeated measurement is recorded in
 
 | Path | ms | Sampled relative L2 vs FP32 |
 |---|---:|---:|
-| Plow attention + normalization | 0.920 | 0.000166 |
-| AITER Python adapter, including packing | 0.662 | 0.001774 |
-| Native FP32 adapter, including packing | 0.652 | 0.000553 |
+| Plow attention + normalization | 1.984 | 0.000387 |
+| AITER Python adapter, including packing | 1.420 | 0.001703 |
+| Native FP32 adapter, including packing | 1.377 | 0.000368 |
 
-Native adapter latency is **29.1% lower** for this captured layer/chunk. Union
-construction is separately 0.200 ms; packing the entire KV cache is included in
-both adapter times. The reducer uses aligned float4 accesses to share its softmax weights across
-four columns; the scalar reducer measured 0.670 ms including the adapter.
-Neither measurement establishes a serving improvement or full-model quality.
+Native adapter latency is **30.6% lower** for this captured layer/chunk. Union
+construction is separately 0.412 ms; packing the entire KV cache is included in
+both adapter times. The reducer uses aligned float4 accesses to share its softmax
+weights across four columns. This isolated measurement does not establish a serving improvement.
 
-Production integration still needs HSA dispatch, workspace lifetime, early
-chunks with fewer than 2048 causal keys, KV-slot rebasing and ragged rows. A raw
-assembly replacement must also preserve or explicitly remove cross-segment
-counter edges; HSA queue ordering alone does not publish interpreter counters.
-Retain the union path where selection reuse wins.
+This replaces the earlier T2048 capture: that bucket uses dense attention and
+retained indices from the preceding chunk. Its Q/K and selected indices were
+not a current sparse-attention pair. The optional `@C0` selector now captures
+the intended chunk explicitly; the replacement uses current layer-74 indices.
+
+## Native plow runtime route
+
+`PLOW_MLA_PF_AITER=1` opts into the native HSA route. Emit a new asset with that
+variable and `PLOW_MLA_PF_V2=1`; the emitter removes cross-segment counter edges
+at ordered launch boundaries. The loader rejects sparse segments that still
+have counter obligations, mix other instructions, or have unsupported geometry.
+The original interpreter route remains available with the runtime flag off.
+
+Build the adapter beside the existing interpreter objects, using the qualified
+AITER code object from the installed wheel:
+
+```sh
+bash scripts/build_mla_sparse_aiter.sh "$OBJECT_DIR" \
+  "$AITER_META/hsa/gfx942/mla/mla_a16w16_qh8_qseqlen1_gqaratio8_v3.co"
+# Add PLOW_MLA_PF_AITER=1 to the normal TP8 plowc emit environment.
+PLOW_MLA_PF_AITER=1 PLOW_HSACO="$OBJECT_DIR" \
+  target/release/plowrt serve --assets "$NEW_ASSET_DIR" --port 8080
+```
+
+The production adapter is `runtime/amd/mla_sparse_adapter.hip`. Each eligible
+segment launches packing/CSR initialization, assembly attention, and FP32
+reduction through HSA. A 438,961,152-byte workspace per rank is reused at the
+8192-row / 81920-context ceiling. The hot path allocates no buffers. Packing
+uses the live KV prefix, including rebased slots, so unused VMM capacity is not
+read. Early chunks whose first query has fewer than 2048 causal keys retain
+plow's interpreter kernel. Ragged rows update the native launch extent.
+Packed-prefill dispatch also retains its existing route.
+
+The exact AITER object leaves `KERNARG_SIZE` unspecified in its descriptor while
+metadata declares 320 bytes. HIP accepts this; ROCr reports zero to plow's
+bounded argument allocator. After checking the original hash, the loader sets
+that descriptor field to 320 in its in-memory image. Instructions and the file
+on disk are unchanged. See the
+[LLVM kernel descriptor contract](https://llvm.org/docs/AMDGPUUsage.html#kernel-descriptor).
+
+The ignored `sparse_mla_hsa_dispatch` test exercises native HSA launch, two KV
+slots, rows 1/129, and the merge normalizer contract. Run it inside a GPU lease
+with `PLOW_TEST_AITER_DIR` pointing to the built object directory. Ordinary
+unit tests check ragged/early chunk transitions, capacity limits, counter
+obligations in static/global streams, mixed segments and unsupported shapes.
+
+## Full-model runtime qualification
+
+Paired TP8 measurements use the same newly emitted B8 packet, all 78 sparse
+prefill layers, BF16 KV, context 81920, chunk 8192, no prefill interleaving,
+and TP audit retained. Each arm discards one warmup and measures three repeats.
+
+| Prompt tokens | Interpreter mean ms | Native mean ms |
+|---|---:|---:|
+| 8192 | 1250.450 | 1248.894 |
+| 8321 | 1494.294 | 1494.483 |
+| 70000 | 13254.466 | 12379.396 |
+
+The 70k prefill mean is **6.60% lower**, saving 875 ms. The two short cases use
+the interpreter fallback and produce identical output checksums between arms.
+The long-case checksum changes. A separate instrumented 12,288-token run
+confirms 78 native segments in the ragged second chunk; its barrier-instrumented
+timings are excluded from the table.
+
+Both arms pass **18/18 concurrent fact-retrieval cases**: actual prompt lengths
+5433–5438 and 68797–68802, depths 0.1/0.5/0.9, three facts, concurrency 4,
+temperature 0, and 24 output tokens. Text is identical in 13/18 paired cases;
+the five different continuations still retrieve the expected fact. This is a
+limited quality screen, not a general model-quality evaluation. Results and
+object/packet hashes are in [mi300x-runtime-results.json](mi300x-runtime-results.json).
+
+Inside one eight-GPU lease, run both arms with the same assets and objects:
+
+```sh
+export PLOW_MLA_PF_V2=1 PLOW_PF_CHUNK=8192 PLOW_PF_INTERLEAVE=0
+export PLOW_HSACO="$OBJECT_DIR"
+for arm in 0 1; do
+  PLOW_MLA_PF_AITER=$arm target/release/plowrt bench --assets "$NEW_ASSET_DIR" \
+    --prefill-sweep --prefill-lengths 8192,8321,70000 \
+    --prefill-reps 3 --prefill-warmups 1 --engine-diagnostics > "sweep-$arm.log" 2>&1
+done
+# For each arm's separately started server:
+python "$bench/quality.py" http://127.0.0.1:8080 "$arm" "quality-$arm.json"
+```
+
+These results measure prefill and retrieval. They do not establish improved
+concurrency-20 serving throughput or parity with the supplied H200 reference.
+Decode remains dense; no speculative decoding is added.
 
 Primary sources:
 
