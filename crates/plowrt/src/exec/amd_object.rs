@@ -1814,13 +1814,13 @@ pub(super) fn check_dsa_select_local(
         {
             let err = || {
                 RuntimeError::Device(
-                "local DSA selection requires unpacked gfx942 TP8 decode rows 2/4/8/16, unpooled top2048 and row-sized operands".into())
+                "local DSA selection requires unpacked gfx942 TP8 decode rows 2/4/8/16/20, unpooled top2048 and row-sized operands".into())
             };
             if arch != "gfx942"
                 || !tp8
                 || program < dec_ix
                 || p.packed_prefill_only
-                || !matches!(p.t, 2 | 4 | 8 | 16)
+                || !matches!(p.t, 2 | 4 | 8 | 16 | 20)
                 || u32::from(d.blocks) != p.t
                 || !(2048..=131072).contains(&d.i[0])
                 || d.i[1..] != [2048, 0, 0, 1, 0, 0, 0]

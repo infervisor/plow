@@ -4096,8 +4096,8 @@ fn emit_glm_dsa_decode_select(
             });
             if emit_config::active().glm_select_local && rows > 1 {
                 assert!(
-                    c.tp == 8 && b.n_cu() == 304 && matches!(rows, 2 | 4 | 8 | 16),
-                    "local GLM decode selection requires gfx942 TP8 with 2/4/8/16 rows"
+                    c.tp == 8 && b.n_cu() == 304 && matches!(rows, 2 | 4 | 8 | 16 | 20),
+                    "local GLM decode selection requires gfx942 TP8 with 2/4/8/16/20 rows"
                 );
                 return b.emit(DevOp::IndexSelect, (0..rows).collect(), &[c_sc], |d| {
                     d.t[0] = n.iidx;

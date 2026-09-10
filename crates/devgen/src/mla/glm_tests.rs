@@ -487,14 +487,14 @@ fn glm_dsa_local_selection_keeps_one_completion_for_independent_rows() {
     c.indexer_full[3] = true;
     let ctx = 81920;
     let mut declarations = Builder::new(304);
-    let n = declare_glm_rows_batched(&mut declarations, &c, ctx, &[3], 8192, 16, MoeEnc::Fp8Blk);
+    let n = declare_glm_rows_batched(&mut declarations, &c, ctx, &[3], 8192, 20, MoeEnc::Fp8Blk);
     let tensors = declarations.tensors();
-    for rows in [1, 2, 4, 8, 16] {
+    for rows in [1, 2, 4, 8, 16, 20] {
         let mut b = Builder::new(304);
         b.adopt_tensors(tensors.clone());
         let ready = b.emit(DevOp::Nop, vec![0], &[], |_| {});
         let complete = emit_glm_dsa_decode_select(
-            &mut b, &c, &n, &n.lw[0], 0, ctx, rows, 16, MoeEnc::Fp8Blk,
+            &mut b, &c, &n, &n.lw[0], 0, ctx, rows, 20, MoeEnc::Fp8Blk,
             &(0..304).collect::<Vec<_>>(), c.eps as f32, c.q_lora, c.hidden,
             ready, ready, &(0..32).collect::<Vec<_>>(), &[0],
         );

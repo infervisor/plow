@@ -24,8 +24,8 @@ lowest-index tie-break. All 111 synthetic cases and six captured cases pass.
 Coverage includes batches 1/2/4/8/16/20/32, live lengths
 0/1/129/2047/2048/8192/65537/79800, tied and unique scores, permuted logical
 workgroup slices, twelve scratch reuses, untouched inactive output and a
-512-byte output guard. Batch widths above 16 are isolated kernel experiments;
-they do not establish runtime support.
+512-byte output guard. These isolated measurements do not establish runtime
+support at batch widths above 16.
 
 The capture contains the last indexer's eight score rows after decode step 2
 at 65,003 live KV positions. Its selected sets also match the CPU oracle.
@@ -83,7 +83,7 @@ is claimed, and no assembly change is justified by these measurements.
 ## Local workgroup selection
 
 `--glm-select-local=true` (`PLOW_GLM_SELECT_LOCAL=1`) opts gfx942 TP8 decode
-rows 2/4/8/16 into the existing prefill radix selector, rebased to one sequence
+rows 2/4/8/16/20 into the existing prefill radix selector, rebased to one sequence
 per workgroup. Row 1 and pooled selection retain the cooperative path. The
 selector stays inside the interpreter, preserves per-XCD placement, and adds
 no raw launches or cross-workgroup barriers. Every loaded decode tier must
@@ -112,6 +112,37 @@ exactly; selected-index ordering can change downstream accumulation, so broader
 quality equivalence remains unqualified. This is one matched pair, without a
 repeat or confidence interval; it is not the 100-request H200 comparison. The
 option remains off by default.
+
+### FP8-KV batch 20
+
+The local selector also supports rung 20. Its full-model packet replaces 420
+serial selector instructions with 21 independent-row selectors. Prefill and
+row 1 are unchanged; the disabled packet is byte-identical to the preceding
+native-decode-GEMM packet. 179 AMD runtime tests, 36 GLM emitter tests, the release
+build and all ten programs' Lean ordering/LDS checks pass.
+
+The matched 20-request random70k/700/.14/C20 seed0 serving pair uses the same
+FP8-KV B20 model and main MM16/WALK1 image in both arms, with native decode GEMM
+enabled and native fold disabled. Narrow tiers are explicitly disabled in both
+arms: the existing main image contains the local selector, but the older FP8
+tier images do not. No kernel was rebuilt for this comparison. One exclusive
+eight-GPU lease covers both arms, without concurrent builds or other GPU work.
+
+| Metric | Cooperative | Local workgroup | Change |
+|---|---:|---:|---:|
+| Output throughput, tok/s | 38.523 | 42.604 | +10.59% |
+| Mean TTFT, ms | 114802.69 | 112565.06 | -1.95% |
+| Mean TPOT, ms | 315.860 | 281.661 | -10.83% |
+| P99 TPOT, ms | 443.242 | 422.664 | -4.64% |
+| Median ITL, ms | 181.884 | 147.288 | -19.02% |
+
+Both arms complete 20 requests without failures and pass all 18 retrieval cases
+at C20. Input/output length arrays match exactly: 1,414,538 input tokens and
+13,795 output tokens. Four of 20 generated texts match exactly. This is one
+pair, without a repeatability estimate or broad model-quality qualification;
+the option remains false by default. It does not establish parity with the
+100-request H200 reference. [Batch-20 evidence](mi300x-local-b20.json) includes
+the source/object hashes, packet checks, quality outputs and reproduction recipes.
 
 ## Per-XCD defaults and prefill pairing
 

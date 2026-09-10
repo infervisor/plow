@@ -3082,7 +3082,7 @@ fn local_dsa_selection_checks_rows_operands_and_object() {
             arch == "gfx942" && tp8 && dec_ix == 0
         );
     }
-    for rows in [1, 2, 4, 8, 16, 32] {
+    for rows in [1, 2, 4, 8, 16, 20, 32] {
         prog.t = rows;
         prog.insts[0].blocks = rows as u16;
         assert_eq!(
@@ -3090,6 +3090,31 @@ fn local_dsa_selection_checks_rows_operands_and_object() {
                 .is_ok(),
             matches!(rows, 2 | 4 | 8)
         );
+    }
+    let mut wide: Vec<_> = [20 * 2048 * 4, 20 * 81920 * 4, 20 * 4]
+        .into_iter()
+        .enumerate()
+        .map(|(i, bytes)| crate::asset::devblob::DevTensor {
+            name: format!("act.{i}"),
+            bytes,
+            init: None,
+        })
+        .collect();
+    for rows in [16, 20, 21, 32] {
+        prog.t = rows;
+        prog.insts[0].blocks = rows as u16;
+        assert_eq!(
+            check_dsa_select_local(std::slice::from_ref(&prog), &wide, 0, "gfx942", true)
+                .is_ok(),
+            matches!(rows, 16 | 20)
+        );
+    }
+    prog.t = 20;
+    prog.insts[0].blocks = 20;
+    for operand in 0..3 {
+        wide[operand].bytes -= 1;
+        assert!(check_dsa_select_local(std::slice::from_ref(&prog), &wide, 0, "gfx942", true).is_err());
+        wide[operand].bytes += 1;
     }
     prog.t = 8;
     prog.insts[0].blocks = 8;
