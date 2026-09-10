@@ -278,6 +278,7 @@ __device__ void d_flash_prefill_sm90_wgitem(
     for (unsigned witem = slice * 2u + (unsigned)wg; witem < n_work; witem += nblk * 2u) {
         unsigned sp, h, q0, sq = seq_q, skv = seq_kv, qp0 = q_pos0, ns = nsplit;
         size_t qoff = 0, kvoff = 0;
+        const void* item_mapkv = mapkv;
         if (req) {
             unsigned rem = witem;
             int r = 0, qlen;
@@ -298,6 +299,11 @@ __device__ void d_flash_prefill_sm90_wgitem(
             qp0 = (unsigned)(kvlen - qlen);
             qoff = (size_t)rq0 * n_head * HD;
             kvoff = (size_t)slot * n_kv_head * (size_t)kv_stride * HD;
+#if defined(PLOW_NV_PACKED_FA_TMA) && PLOW_NV_PACKED_FA_TMA
+            item_mapkv = mapkv ? (const void*)((const uint64_t*)mapkv)[slot] : nullptr;
+#else
+            if (kvoff) item_mapkv = nullptr;
+#endif
         } else {
             sp = witem % nsplit;
             h = (witem / nsplit) % n_head;
@@ -323,7 +329,7 @@ __device__ void d_flash_prefill_sm90_wgitem(
         if ((long)qabs_max < cap) cap = (long)qabs_max;
         const int ntile = (cap >= (long)eff_lo) ? (int)((cap - (long)eff_lo) / BKV) + 1 : 0;
 
-        const bool use_tma = mapkv != nullptr && kvoff == 0;
+        const bool use_tma = item_mapkv != nullptr;
         auto stageKV = [&](unsigned kv0, int buf) {
             __nv_bfloat16* kd = Ks + (size_t)buf * NSUB * KT;
             __nv_bfloat16* vd = Vs + (size_t)buf * NSUB * KT;
@@ -336,9 +342,9 @@ __device__ void d_flash_prefill_sm90_wgitem(
                     const int kvrow = (int)(kv0 & kv_mask);
 #pragma unroll
                     for (int sub = 0; sub < NSUB; sub++) {
-                        sm90_tma3d(sm90_su32(kd + sub * KT), mapkv, sub * 64, kvrow, (int)hkv,
+                        sm90_tma3d(sm90_su32(kd + sub * KT), item_mapkv, sub * 64, kvrow, (int)hkv,
                                    bar);
-                        sm90_tma3d(sm90_su32(vd + sub * KT), (const char*)mapkv + 128, sub * 64,
+                        sm90_tma3d(sm90_su32(vd + sub * KT), (const char*)item_mapkv + 128, sub * 64,
                                    kvrow, (int)hkv, bar);
                     }
                 }
@@ -614,6 +620,7 @@ __device__ void d_flash_prefill_sm90(float* __restrict__ Opart, float* __restric
     for (unsigned witem = slice; witem < n_work; witem += nblk) {
         unsigned sp, h, q0, sq = seq_q, skv = seq_kv, qp0 = q_pos0, ns = nsplit;
         size_t qoff = 0, kvoff = 0;
+        const void* item_mapkv = mapkv;
         if (req) {
             unsigned rem = witem;
             int r = 0, qlen;
@@ -634,6 +641,11 @@ __device__ void d_flash_prefill_sm90(float* __restrict__ Opart, float* __restric
             qp0 = (unsigned)(kvlen - qlen);
             qoff = (size_t)rq0 * n_head * HD;
             kvoff = (size_t)slot * n_kv_head * (size_t)kv_stride * HD;
+#if defined(PLOW_NV_PACKED_FA_TMA) && PLOW_NV_PACKED_FA_TMA
+            item_mapkv = mapkv ? (const void*)((const uint64_t*)mapkv)[slot] : nullptr;
+#else
+            if (kvoff) item_mapkv = nullptr;
+#endif
         } else {
 #if PLOW_NV_FA_SPLIT_OUTER
             if constexpr (HD == 256 && BQ == 64 && BKV == 32) {
@@ -676,15 +688,13 @@ __device__ void d_flash_prefill_sm90(float* __restrict__ Opart, float* __restric
         /* --- staging. cp.async writes 16 B (8 bf16) straight into the 128B-swizzled sub-tile;
          * out-of-range rows pass src-size 0, which zero-fills (so a masked P never multiplies
          * stale V, and QK of a pad row is 0). --- */
-        /* TMA eligibility per work item: the pair maps address the base KV tensor; a
-         * nonzero batch-slot offset (PX-1 varlen, slot>0) would need slot as a 4th
-         * coordinate, so those items keep cp.async. */
+        /* Packed items resolve a descriptor pair whose base already includes the slot. */
         /* The kv-pair map's box is 32 rows, so the staging loop below walks a tile in BKV/32
          * steps: at BKV<32 it runs ZERO times AFTER the barrier is armed for the full byte
          * count, and waitKV() then spins forever (reachable via the documented
          * -DPLOW_NV_FA512_WG=1 -DPLOW_NV_FA_PX4=0 build). BKV is a template constant, so this
          * term folds away; a sub-32 BKV simply keeps the cp.async path below. */
-        const bool use_tma = mapkv != nullptr && kvoff == 0 && (BKV % 32 == 0);
+        const bool use_tma = item_mapkv != nullptr && (BKV % 32 == 0);
         auto stageKV = [&](unsigned kv0, int buf) {
             __nv_bfloat16* kd = Ks + (size_t)buf * NSUB * KT;
             __nv_bfloat16* vd = Vs + (size_t)buf * NSUB * KT;
@@ -699,10 +709,10 @@ __device__ void d_flash_prefill_sm90(float* __restrict__ Opart, float* __restric
                     for (int sub = 0; sub < NSUB; sub++)
 #pragma unroll
                         for (int hb = 0; hb < BKV / 32; hb++) { /* kv-pair map box is 32 rows */
-                            sm90_tma3d(sm90_su32(kd + sub * KT + hb * 32 * 64), mapkv, sub * 64,
+                            sm90_tma3d(sm90_su32(kd + sub * KT + hb * 32 * 64), item_mapkv, sub * 64,
                                        kvrow + hb * 32, (int)hkv, bar);
                             sm90_tma3d(sm90_su32(vd + sub * KT + hb * 32 * 64),
-                                       (const char*)mapkv + 128, sub * 64, kvrow + hb * 32,
+                                       (const char*)item_mapkv + 128, sub * 64, kvrow + hb * 32,
                                        (int)hkv, bar);
                         }
                 }

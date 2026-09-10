@@ -3659,9 +3659,14 @@ __device__ void d_flash_prefill_mux(const int* __restrict__ req, float* __restri
         if constexpr (FA_SM90_WG_ELIGIBLE(HD, BQ, BKV)) {
             if (O && nsplit == 1) {
                 // Packed mapkv holds per-slot pointers, not a CUtensorMap pair.
+#if defined(PLOW_NV_PACKED_FA_TMA) && PLOW_NV_PACKED_FA_TMA
+                const void* packed_maps = mapkv;
+#else
+                const void* packed_maps = nullptr;
+#endif
                 d_flash_prefill<HD,BQ,BKV>(Opart,mlpart,Q,K,V,O,seq_q,seq_kv,
                     n_head,n_kv_head,q_pos0,window,nsplit,kv_stride,kv_mask,
-                    scale,slice,nblk,lds,req,nullptr);
+                    scale,slice,nblk,lds,req,packed_maps);
                 const unsigned real=req[1+4*(count-1)]+req[2+4*(count-1)];
                 const size_t begin=(size_t)real*n_head*HD, end=(size_t)seq_q*n_head*HD;
                 for (size_t i=begin+(size_t)slice*blockDim.x+threadIdx.x;i<end;i+=(size_t)nblk*blockDim.x)
