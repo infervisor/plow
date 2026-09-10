@@ -1,0 +1,10 @@
+==WARNING== Could not determine user home directory for section deployment.
+==WARNING== Using "/opt/nvidia/nsight-compute/2026.1.0/target/linux-desktop-glibc_2_11_3-x64/../../sections" instead.
+==WARNING== See https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html#faq.
+==PROF== Connected to process 133374 (/home/lava/plow/plans/gemma4-12b-roofline/decode_tc_driver_probe)
+==PROF== Disconnected from process 133374
+"ID","Process ID","Process Name","Host Name","Kernel Name","Context","Stream","Block Size","Grid Size","Device","CC","Section Name","Metric Name","Metric Unit","Metric Value"
+"0","133374","decode_tc_driver_probe","127.0.0.1","plow_gemv_bf16_m16_bk256_s2","1","7","(128, 1, 1)","(240, 1, 1)","0","9.0","Command line profiler metrics","l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum","","6121"
+"0","133374","decode_tc_driver_probe","127.0.0.1","plow_gemv_bf16_m16_bk256_s2","1","7","(128, 1, 1)","(240, 1, 1)","0","9.0","Command line profiler metrics","l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum","","0"
+"0","133374","decode_tc_driver_probe","127.0.0.1","plow_gemv_bf16_m16_bk256_s2","1","7","(128, 1, 1)","(240, 1, 1)","0","9.0","Command line profiler metrics","l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum","sector","0"
+"0","133374","decode_tc_driver_probe","127.0.0.1","plow_gemv_bf16_m16_bk256_s2","1","7","(128, 1, 1)","(240, 1, 1)","0","9.0","Command line profiler metrics","l1tex__t_sectors_pipe_lsu_mem_local_op_st.sum","sector","0"

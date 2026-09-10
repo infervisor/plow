@@ -1,0 +1,22 @@
+========= COMPUTE-SANITIZER
+# NVIDIA H100 80GB HBM3, 132 SMs, cold weights, 3 repetitions; synthetic BF16 inputs
+M,N,K,variant,us,weight_GBs,lt_mismatches,max_abs_lt,cpu_max_abs,cpu_failures,repeat_mismatches
+16,83,136,cublaslt,154.336,0.15,0,0,0.000243227,0,0
+16,83,136,native_gemv_grid132,69.344,0.33,0,0,0.000243227,0,0
+16,83,136,native_gemv_grid528,69.728,0.32,0,0,0.000243227,0,0
+16,83,136,existing_s1,130.656,0.17,0,0,0.000243227,0,0
+16,83,136,transpose_bk128_d3_s1,103.840,0.22,0,0,0.000243227,0,0
+16,83,136,transpose_bk256_d2_s1,104.160,0.22,0,0,0.000243227,0,0
+16,83,136,driver_transpose_bk128_d3_s1,104.288,0.22,0,0,0.000243227,0,0
+16,83,136,driver_transpose_bk256_d2_s1,98.688,0.23,0,0,0.000243227,0,0
+16,83,136,existing_s4,93.984,0.24,0,0,0.000243227,0,0
+16,83,136,transpose_bk128_d3_s4,95.520,0.24,0,0,0.000243227,0,0
+16,83,136,transpose_bk256_d2_s4,137.024,0.16,0,0,0.000243227,0,0
+16,83,136,driver_transpose_bk128_d3_s4,96.416,0.23,0,0,0.000243227,0,0
+16,83,136,driver_transpose_bk256_d2_s4,122.496,0.18,0,0,0.000243227,0,0
+16,83,136,existing_s8,96.608,0.23,0,0,0.000243227,0,0
+16,83,136,transpose_bk128_d3_s8,103.424,0.22,0,0,0.000243227,0,0
+16,83,136,transpose_bk256_d2_s8,129.952,0.17,0,0,0.000243227,0,0
+16,83,136,driver_transpose_bk128_d3_s8,104.480,0.22,0,0,0.000243227,0,0
+16,83,136,driver_transpose_bk256_d2_s8,131.040,0.17,0,0,0.000243227,0,0
+========= ERROR SUMMARY: 0 errors

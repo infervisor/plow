@@ -1,0 +1,1349 @@
+{
+  "cases": 900,
+  "driver_cases": 300,
+  "oracle": "128 deterministic sampled FP64 dots per case; tolerance 0.0001+abs(reference)/128",
+  "cubin_sha256": "fbfb26837e770730b630c30fdd4668fef52052a083409c27f2bddf0f85080ac9",
+  "repetitions": 11,
+  "weighted_projection_ms": {
+    "1": {
+      "native_vector": 11.867360000000001,
+      "native_driver": 10.267872,
+      "cublaslt": 9.777184
+    },
+    "2": {
+      "native_vector": 13.635231999999998,
+      "native_driver": 10.151968,
+      "cublaslt": 9.780351999999999
+    },
+    "4": {
+      "native_vector": 16.546656000000002,
+      "native_driver": 10.12416,
+      "cublaslt": 9.760224000000001
+    },
+    "8": {
+      "native_vector": 22.299200000000003,
+      "native_driver": 10.367136,
+      "cublaslt": 9.760288
+    },
+    "16": {
+      "native_vector": 41.931872000000006,
+      "native_driver": 10.948576000000001,
+      "cublaslt": 9.773728000000002
+    }
+  },
+  "cells": [
+    {
+      "m": 1,
+      "n": 83,
+      "k": 136,
+      "occurrences": 0,
+      "native_vector": {
+        "variant": "native_gemv_grid132",
+        "us": 4.352
+      },
+      "native_driver": {
+        "variant": "driver_transpose_bk256_d2_s1",
+        "us": 4.704
+      },
+      "cublaslt": {
+        "variant": "cublaslt",
+        "us": 4.512
+      }
+    },
+    {
+      "m": 1,
+      "n": 512,
+      "k": 3840,
+      "occurrences": 8,
+      "native_vector": {
+        "variant": "native_gemv_grid132",
+        "us": 10.496
+      },
+      "native_driver": {
+        "variant": "driver_transpose_bk256_d2_s8",
+        "us": 9.056
+      },
+      "cublaslt": {
+        "variant": "cublaslt",
+        "us": 10.336
+      }
+    },
+    {
+      "m": 1,
+      "n": 2048,
+      "k": 3840,
+      "occurrences": 80,
+      "native_vector": {
+        "variant": "native_gemv_grid132",
+        "us": 15.424
+      },
+      "native_driver": {
+        "variant": "driver_transpose_bk128_d3_s4",
+        "us": 12.512
+      },
+      "cublaslt": {
+        "variant": "cublaslt",
+        "us": 12.8
+      }
+    },
+    {
+      "m": 1,
+      "n": 3840,
+      "k": 4096,
+      "occurrences": 40,
+      "native_vector": {
+        "variant": "native_gemv_grid528",
+        "us": 20.448
+      },
+      "native_driver": {
+        "variant": "driver_transpose_bk128_d3_s4",
+        "us": 17.504
+      },
+      "cublaslt": {
+        "variant": "cublaslt",
+        "us": 15.104
+      }
+    },
+    {
+      "m": 1,
+      "n": 3840,
+      "k": 8192,
+      "occurrences": 8,
+      "native_vector": {
+        "variant": "native_gemv_grid528",
+        "us": 36.224
+      },
+      "native_driver": {
+        "variant": "driver_transpose_bk256_d2_s4",
+        "us": 28.128
+      },
+      "cublaslt": {
+        "variant": "cublaslt",
+        "us": 27.456
+      }
+    },
+    {
+      "m": 1,
+      "n": 3840,
+      "k": 15360,
+      "occurrences": 48,
+      "native_vector": {
+        "variant": "native_gemv_grid528",
+        "us": 65.056
+      },
+      "native_driver": {
+        "variant": "driver_transpose_bk256_d2_s4",
+        "us": 47.584
+      },
+      "cublaslt": {
+        "variant": "cublaslt",
+        "us": 45.984
+      }
+    },
+    {
+      "m": 1,
+      "n": 4096,
+      "k": 3840,
+      "occurrences": 40,
+      "native_vector": {
+        "variant": "native_gemv_grid528",
+        "us": 19.616
+      },
+      "native_driver": {
+        "variant": "driver_transpose_bk256_d2_s4",
+        "us": 18.208
+      },
+      "cublaslt": {
+        "variant": "cublaslt",
+        "us": 17.632
+      }
+    },
+    {
+      "m": 1,
+      "n": 8192,
+      "k": 3840,
+      "occurrences": 8,
+      "native_vector": {
+        "variant": "native_gemv_grid528",
+        "us": 29.92
+      },
+      "native_driver": {
+        "variant": "driver_transpose_bk128_d3_s1",
+        "us": 25.12
+      },
+      "cublaslt": {
+        "variant": "cublaslt",
+        "us": 24.768
+      }
+    },
+    {
+      "m": 1,
+      "n": 15360,
+      "k": 3840,
+      "occurrences": 96,
+      "native_vector": {
+        "variant": "native_gemv_grid528",
+        "us": 48.448
+      },
+      "native_driver": {
+        "variant": "driver_transpose_bk128_d3_s1",
+        "us": 45.76
+      },
+      "cublaslt": {
+        "variant": "cublaslt",
+        "us": 42.72
+      }
+    },
+    {
+      "m": 1,
+      "n": 262144,
+      "k": 3840,
+      "occurrences": 1,
+      "native_vector": {
+        "variant": "native_gemv_grid528",
+        "us": 644.064
+      },
+      "native_driver": {
+        "variant": "driver_transpose_bk256_d2_s1",
+        "us": 663.008
+      },
+      "cublaslt": {
+        "variant": "cublaslt",
+        "us": 634.912
+      }
+    },
+    {
+      "m": 2,
+      "n": 83,
+      "k": 136,
+      "occurrences": 0,
+      "native_vector": {
+        "variant": "native_gemv_grid528",
+        "us": 4.864
+      },
+      "native_driver": {
+        "variant": "driver_transpose_bk256_d2_s1",
+        "us": 4.736
+      },
+      "cublaslt": {
+        "variant": "cublaslt",
+        "us": 5.024
+      }
+    },
+    {
+      "m": 2,
+      "n": 512,
+      "k": 3840,
+      "occurrences": 8,
+      "native_vector": {
+        "variant": "native_gemv_grid132",
+        "us": 13.408
+      },
+      "native_driver": {
+        "variant": "driver_transpose_bk256_d2_s8",
+        "us": 9.056
+      },
+      "cublaslt": {
+        "variant": "cublaslt",
+        "us": 10.176
+      }
+    },
+    {
+      "m": 2,
+      "n": 2048,
+      "k": 3840,
+      "occurrences": 80,
+      "native_vector": {
+        "variant": "native_gemv_grid132",
+        "us": 19.104
+      },
+      "native_driver": {
+        "variant": "driver_transpose_bk128_d3_s8",
+        "us": 12.128
+      },
+      "cublaslt": {
+        "variant": "cublaslt",
+        "us": 12.768
+      }
+    },
+    {
+      "m": 2,
+      "n": 3840,
+      "k": 4096,
+      "occurrences": 40,
+      "native_vector": {
+        "variant": "native_gemv_grid528",
+        "us": 24.672
+      },
+      "native_driver": {
+        "variant": "driver_transpose_bk256_d2_s4",
+        "us": 17.856
+      },
+      "cublaslt": {
+        "variant": "cublaslt",
+        "us": 15.872
+      }
+    },
+    {
+      "m": 2,
+      "n": 3840,
+      "k": 8192,
+      "occurrences": 8,
+      "native_vector": {
+        "variant": "native_gemv_grid528",
+        "us": 42.112
+      },
+      "native_driver": {
+        "variant": "driver_transpose_bk256_d2_s4",
+        "us": 28.448
+      },
+      "cublaslt": {
+        "variant": "cublaslt",
+        "us": 28.064
+      }
+    },
+    {
+      "m": 2,
+      "n": 3840,
+      "k": 15360,
+      "occurrences": 48,
+      "native_vector": {
+        "variant": "native_gemv_grid528",
+        "us": 76.16
+      },
+      "native_driver": {
+        "variant": "driver_transpose_bk256_d2_s4",
+        "us": 47.552
+      },
+      "cublaslt": {
+        "variant": "cublaslt",
+        "us": 45.696
+      }
+    },
+    {
+      "m": 2,
+      "n": 4096,
+      "k": 3840,
+      "occurrences": 40,
+      "native_vector": {
+        "variant": "native_gemv_grid528",
+        "us": 23.968
+      },
+      "native_driver": {
+        "variant": "driver_transpose_bk256_d2_s4",
+        "us": 18.208
+      },
+      "cublaslt": {
+        "variant": "cublaslt",
+        "us": 16.192
+      }
+    },
+    {
+      "m": 2,
+      "n": 8192,
+      "k": 3840,
+      "occurrences": 8,
+      "native_vector": {
+        "variant": "native_gemv_grid528",
+        "us": 34.464
+      },
+      "native_driver": {
+        "variant": "driver_transpose_bk256_d2_s1",
+        "us": 26.016
+      },
+      "cublaslt": {
+        "variant": "cublaslt",
+        "us": 25.632
+      }
+    },
+    {
+      "m": 2,
+      "n": 15360,
+      "k": 3840,
+      "occurrences": 96,
+      "native_vector": {
+        "variant": "native_gemv_grid528",
+        "us": 53.44
+      },
+      "native_driver": {
+        "variant": "driver_transpose_bk256_d2_s1",
+        "us": 44.608
+      },
+      "cublaslt": {
+        "variant": "cublaslt",
+        "us": 43.072
+      }
+    },
+    {
+      "m": 2,
+      "n": 262144,
+      "k": 3840,
+      "occurrences": 1,
+      "native_vector": {
+        "variant": "native_gemv_grid528",
+        "us": 655.52
+      },
+      "native_driver": {
+        "variant": "driver_transpose_bk256_d2_s1",
+        "us": 666.144
+      },
+      "cublaslt": {
+        "variant": "cublaslt",
+        "us": 637.056
+      }
+    },
+    {
+      "m": 4,
+      "n": 83,
+      "k": 136,
+      "occurrences": 0,
+      "native_vector": {
+        "variant": "native_gemv_grid528",
+        "us": 5.024
+      },
+      "native_driver": {
+        "variant": "driver_transpose_bk256_d2_s1",
+        "us": 4.704
+      },
+      "cublaslt": {
+        "variant": "cublaslt",
+        "us": 5.056
+      }
+    },
+    {
+      "m": 4,
+      "n": 512,
+      "k": 3840,
+      "occurrences": 8,
+      "native_vector": {
+        "variant": "native_gemv_grid132",
+        "us": 14.56
+      },
+      "native_driver": {
+        "variant": "driver_transpose_bk256_d2_s8",
+        "us": 9.024
+      },
+      "cublaslt": {
+        "variant": "cublaslt",
+        "us": 10.368
+      }
+    },
+    {
+      "m": 4,
+      "n": 2048,
+      "k": 3840,
+      "occurrences": 80,
+      "native_vector": {
+        "variant": "native_gemv_grid132",
+        "us": 21.856
+      },
+      "native_driver": {
+        "variant": "driver_transpose_bk256_d2_s8",
+        "us": 12.16
+      },
+      "cublaslt": {
+        "variant": "cublaslt",
+        "us": 12.64
+      }
+    },
+    {
+      "m": 4,
+      "n": 3840,
+      "k": 4096,
+      "occurrences": 40,
+      "native_vector": {
+        "variant": "native_gemv_grid528",
+        "us": 27.68
+      },
+      "native_driver": {
+        "variant": "driver_transpose_bk256_d2_s4",
+        "us": 17.504
+      },
+      "cublaslt": {
+        "variant": "cublaslt",
+        "us": 15.008
+      }
+    },
+    {
+      "m": 4,
+      "n": 3840,
+      "k": 8192,
+      "occurrences": 8,
+      "native_vector": {
+        "variant": "native_gemv_grid528",
+        "us": 46.656
+      },
+      "native_driver": {
+        "variant": "driver_transpose_bk128_d3_s4",
+        "us": 28.512
+      },
+      "cublaslt": {
+        "variant": "cublaslt",
+        "us": 28.128
+      }
+    },
+    {
+      "m": 4,
+      "n": 3840,
+      "k": 15360,
+      "occurrences": 48,
+      "native_vector": {
+        "variant": "native_gemv_grid528",
+        "us": 104.256
+      },
+      "native_driver": {
+        "variant": "driver_transpose_bk256_d2_s4",
+        "us": 47.936
+      },
+      "cublaslt": {
+        "variant": "cublaslt",
+        "us": 45.824
+      }
+    },
+    {
+      "m": 4,
+      "n": 4096,
+      "k": 3840,
+      "occurrences": 40,
+      "native_vector": {
+        "variant": "native_gemv_grid528",
+        "us": 26.432
+      },
+      "native_driver": {
+        "variant": "driver_transpose_bk128_d3_s4",
+        "us": 18.208
+      },
+      "cublaslt": {
+        "variant": "cublaslt",
+        "us": 16.992
+      }
+    },
+    {
+      "m": 4,
+      "n": 8192,
+      "k": 3840,
+      "occurrences": 8,
+      "native_vector": {
+        "variant": "native_gemv_grid528",
+        "us": 39.488
+      },
+      "native_driver": {
+        "variant": "driver_transpose_bk256_d2_s1",
+        "us": 26.4
+      },
+      "cublaslt": {
+        "variant": "cublaslt",
+        "us": 24.992
+      }
+    },
+    {
+      "m": 4,
+      "n": 15360,
+      "k": 3840,
+      "occurrences": 96,
+      "native_vector": {
+        "variant": "native_gemv_grid528",
+        "us": 63.136
+      },
+      "native_driver": {
+        "variant": "driver_transpose_bk256_d2_s1",
+        "us": 44.16
+      },
+      "cublaslt": {
+        "variant": "cublaslt",
+        "us": 42.944
+      }
+    },
+    {
+      "m": 4,
+      "n": 262144,
+      "k": 3840,
+      "occurrences": 1,
+      "native_vector": {
+        "variant": "native_gemv_grid528",
+        "us": 762.72
+      },
+      "native_driver": {
+        "variant": "driver_transpose_bk256_d2_s1",
+        "us": 671.104
+      },
+      "cublaslt": {
+        "variant": "cublaslt",
+        "us": 638.944
+      }
+    },
+    {
+      "m": 8,
+      "n": 83,
+      "k": 136,
+      "occurrences": 0,
+      "native_vector": {
+        "variant": "native_gemv_grid132",
+        "us": 5.568
+      },
+      "native_driver": {
+        "variant": "driver_transpose_bk256_d2_s1",
+        "us": 4.736
+      },
+      "cublaslt": {
+        "variant": "cublaslt",
+        "us": 6.08
+      }
+    },
+    {
+      "m": 8,
+      "n": 512,
+      "k": 3840,
+      "occurrences": 8,
+      "native_vector": {
+        "variant": "native_gemv_grid132",
+        "us": 14.912
+      },
+      "native_driver": {
+        "variant": "driver_transpose_bk256_d2_s8",
+        "us": 8.992
+      },
+      "cublaslt": {
+        "variant": "cublaslt",
+        "us": 10.272
+      }
+    },
+    {
+      "m": 8,
+      "n": 2048,
+      "k": 3840,
+      "occurrences": 80,
+      "native_vector": {
+        "variant": "native_gemv_grid132",
+        "us": 25.28
+      },
+      "native_driver": {
+        "variant": "driver_transpose_bk256_d2_s4",
+        "us": 12.48
+      },
+      "cublaslt": {
+        "variant": "cublaslt",
+        "us": 12.768
+      }
+    },
+    {
+      "m": 8,
+      "n": 3840,
+      "k": 4096,
+      "occurrences": 40,
+      "native_vector": {
+        "variant": "native_gemv_grid528",
+        "us": 35.072
+      },
+      "native_driver": {
+        "variant": "driver_transpose_bk128_d3_s4",
+        "us": 18.048
+      },
+      "cublaslt": {
+        "variant": "cublaslt",
+        "us": 15.904
+      }
+    },
+    {
+      "m": 8,
+      "n": 3840,
+      "k": 8192,
+      "occurrences": 8,
+      "native_vector": {
+        "variant": "native_gemv_grid528",
+        "us": 63.648
+      },
+      "native_driver": {
+        "variant": "driver_transpose_bk128_d3_s4",
+        "us": 28.992
+      },
+      "cublaslt": {
+        "variant": "cublaslt",
+        "us": 28.0
+      }
+    },
+    {
+      "m": 8,
+      "n": 3840,
+      "k": 15360,
+      "occurrences": 48,
+      "native_vector": {
+        "variant": "native_gemv_grid528",
+        "us": 128.832
+      },
+      "native_driver": {
+        "variant": "driver_transpose_bk128_d3_s4",
+        "us": 49.184
+      },
+      "cublaslt": {
+        "variant": "cublaslt",
+        "us": 46.336
+      }
+    },
+    {
+      "m": 8,
+      "n": 4096,
+      "k": 3840,
+      "occurrences": 40,
+      "native_vector": {
+        "variant": "native_gemv_grid528",
+        "us": 34.432
+      },
+      "native_driver": {
+        "variant": "driver_transpose_bk256_d2_s4",
+        "us": 18.304
+      },
+      "cublaslt": {
+        "variant": "cublaslt",
+        "us": 15.008
+      }
+    },
+    {
+      "m": 8,
+      "n": 8192,
+      "k": 3840,
+      "occurrences": 8,
+      "native_vector": {
+        "variant": "native_gemv_grid528",
+        "us": 55.008
+      },
+      "native_driver": {
+        "variant": "driver_transpose_bk256_d2_s1",
+        "us": 26.816
+      },
+      "cublaslt": {
+        "variant": "cublaslt",
+        "us": 25.472
+      }
+    },
+    {
+      "m": 8,
+      "n": 15360,
+      "k": 3840,
+      "occurrences": 96,
+      "native_vector": {
+        "variant": "native_gemv_grid528",
+        "us": 93.44
+      },
+      "native_driver": {
+        "variant": "driver_transpose_bk256_d2_s1",
+        "us": 45.376
+      },
+      "cublaslt": {
+        "variant": "cublaslt",
+        "us": 42.976
+      }
+    },
+    {
+      "m": 8,
+      "n": 262144,
+      "k": 3840,
+      "occurrences": 1,
+      "native_vector": {
+        "variant": "native_gemv_grid528",
+        "us": 1273.92
+      },
+      "native_driver": {
+        "variant": "driver_transpose_bk256_d2_s1",
+        "us": 679.328
+      },
+      "cublaslt": {
+        "variant": "cublaslt",
+        "us": 642.592
+      }
+    },
+    {
+      "m": 16,
+      "n": 83,
+      "k": 136,
+      "occurrences": 0,
+      "native_vector": {
+        "variant": "native_gemv_grid132",
+        "us": 7.264
+      },
+      "native_driver": {
+        "variant": "driver_transpose_bk256_d2_s1",
+        "us": 5.024
+      },
+      "cublaslt": {
+        "variant": "cublaslt",
+        "us": 5.888
+      }
+    },
+    {
+      "m": 16,
+      "n": 512,
+      "k": 3840,
+      "occurrences": 8,
+      "native_vector": {
+        "variant": "native_gemv_grid132",
+        "us": 25.216
+      },
+      "native_driver": {
+        "variant": "driver_transpose_bk256_d2_s8",
+        "us": 9.472
+      },
+      "cublaslt": {
+        "variant": "cublaslt",
+        "us": 10.688
+      }
+    },
+    {
+      "m": 16,
+      "n": 2048,
+      "k": 3840,
+      "occurrences": 80,
+      "native_vector": {
+        "variant": "native_gemv_grid132",
+        "us": 41.6
+      },
+      "native_driver": {
+        "variant": "driver_transpose_bk256_d2_s8",
+        "us": 13.088
+      },
+      "cublaslt": {
+        "variant": "cublaslt",
+        "us": 12.864
+      }
+    },
+    {
+      "m": 16,
+      "n": 3840,
+      "k": 4096,
+      "occurrences": 40,
+      "native_vector": {
+        "variant": "native_gemv_grid528",
+        "us": 61.472
+      },
+      "native_driver": {
+        "variant": "driver_transpose_bk256_d2_s4",
+        "us": 18.656
+      },
+      "cublaslt": {
+        "variant": "cublaslt",
+        "us": 15.232
+      }
+    },
+    {
+      "m": 16,
+      "n": 3840,
+      "k": 8192,
+      "occurrences": 8,
+      "native_vector": {
+        "variant": "native_gemv_grid528",
+        "us": 123.168
+      },
+      "native_driver": {
+        "variant": "driver_transpose_bk128_d3_s4",
+        "us": 30.048
+      },
+      "cublaslt": {
+        "variant": "cublaslt",
+        "us": 28.032
+      }
+    },
+    {
+      "m": 16,
+      "n": 3840,
+      "k": 15360,
+      "occurrences": 48,
+      "native_vector": {
+        "variant": "native_gemv_grid528",
+        "us": 255.424
+      },
+      "native_driver": {
+        "variant": "driver_transpose_bk256_d2_s4",
+        "us": 49.856
+      },
+      "cublaslt": {
+        "variant": "cublaslt",
+        "us": 45.856
+      }
+    },
+    {
+      "m": 16,
+      "n": 4096,
+      "k": 3840,
+      "occurrences": 40,
+      "native_vector": {
+        "variant": "native_gemv_grid528",
+        "us": 59.968
+      },
+      "native_driver": {
+        "variant": "driver_transpose_bk256_d2_s4",
+        "us": 18.88
+      },
+      "cublaslt": {
+        "variant": "cublaslt",
+        "us": 15.392
+      }
+    },
+    {
+      "m": 16,
+      "n": 8192,
+      "k": 3840,
+      "occurrences": 8,
+      "native_vector": {
+        "variant": "native_gemv_grid528",
+        "us": 96.448
+      },
+      "native_driver": {
+        "variant": "driver_transpose_bk256_d2_s1",
+        "us": 30.336
+      },
+      "cublaslt": {
+        "variant": "cublaslt",
+        "us": 24.928
+      }
+    },
+    {
+      "m": 16,
+      "n": 15360,
+      "k": 3840,
+      "occurrences": 96,
+      "native_vector": {
+        "variant": "native_gemv_grid528",
+        "us": 176.352
+      },
+      "native_driver": {
+        "variant": "driver_transpose_bk256_d2_s1",
+        "us": 49.504
+      },
+      "cublaslt": {
+        "variant": "cublaslt",
+        "us": 43.328
+      }
+    },
+    {
+      "m": 16,
+      "n": 262144,
+      "k": 3840,
+      "occurrences": 1,
+      "native_vector": {
+        "variant": "native_gemv_grid528",
+        "us": 2597.472
+      },
+      "native_driver": {
+        "variant": "driver_transpose_bk256_d2_s1",
+        "us": 695.776
+      },
+      "cublaslt": {
+        "variant": "cublaslt",
+        "us": 649.888
+      }
+    }
+  ],
+  "note": "Cold-weight standalone projection sum. Does not model fused projections, interpreter resource coupling, packets, attention or serving.",
+  "swizzle": {
+    "cubin_sha256": "d446972bdd8a9b1981f68ac5433f9537bdf3f38abd5a2e61edd839a6bbea3313",
+    "weighted_projection_ms": {
+      "1": 9.944032,
+      "2": 9.853280000000002,
+      "4": 9.914112000000001,
+      "8": 9.945632000000002,
+      "16": 10.142368
+    },
+    "cells": [
+      {
+        "m": 1,
+        "n": 83,
+        "k": 136,
+        "variant": "driver_transpose_bk256_d2_s1",
+        "us": 4.896,
+        "occurrences": 0
+      },
+      {
+        "m": 1,
+        "n": 512,
+        "k": 3840,
+        "variant": "driver_transpose_bk256_d2_s8",
+        "us": 9.504,
+        "occurrences": 8
+      },
+      {
+        "m": 1,
+        "n": 2048,
+        "k": 3840,
+        "variant": "driver_transpose_bk256_d2_s8",
+        "us": 12.384,
+        "occurrences": 80
+      },
+      {
+        "m": 1,
+        "n": 3840,
+        "k": 4096,
+        "variant": "driver_transpose_bk128_d3_s4",
+        "us": 17.632,
+        "occurrences": 40
+      },
+      {
+        "m": 1,
+        "n": 3840,
+        "k": 8192,
+        "variant": "driver_transpose_bk128_d3_s4",
+        "us": 27.904,
+        "occurrences": 8
+      },
+      {
+        "m": 1,
+        "n": 3840,
+        "k": 15360,
+        "variant": "driver_transpose_bk256_d2_s4",
+        "us": 47.2,
+        "occurrences": 48
+      },
+      {
+        "m": 1,
+        "n": 4096,
+        "k": 3840,
+        "variant": "driver_transpose_bk256_d2_s4",
+        "us": 17.184,
+        "occurrences": 40
+      },
+      {
+        "m": 1,
+        "n": 8192,
+        "k": 3840,
+        "variant": "driver_transpose_bk256_d2_s1",
+        "us": 25.824,
+        "occurrences": 8
+      },
+      {
+        "m": 1,
+        "n": 15360,
+        "k": 3840,
+        "variant": "driver_transpose_bk128_d3_s1",
+        "us": 43.264,
+        "occurrences": 96
+      },
+      {
+        "m": 1,
+        "n": 262144,
+        "k": 3840,
+        "variant": "driver_transpose_bk256_d2_s1",
+        "us": 635.872,
+        "occurrences": 1
+      },
+      {
+        "m": 2,
+        "n": 83,
+        "k": 136,
+        "variant": "driver_transpose_bk256_d2_s1",
+        "us": 4.832,
+        "occurrences": 0
+      },
+      {
+        "m": 2,
+        "n": 512,
+        "k": 3840,
+        "variant": "driver_transpose_bk128_d3_s8",
+        "us": 9.344,
+        "occurrences": 8
+      },
+      {
+        "m": 2,
+        "n": 2048,
+        "k": 3840,
+        "variant": "driver_transpose_bk128_d3_s8",
+        "us": 12.448,
+        "occurrences": 80
+      },
+      {
+        "m": 2,
+        "n": 3840,
+        "k": 4096,
+        "variant": "driver_transpose_bk256_d2_s4",
+        "us": 17.664,
+        "occurrences": 40
+      },
+      {
+        "m": 2,
+        "n": 3840,
+        "k": 8192,
+        "variant": "driver_transpose_bk256_d2_s4",
+        "us": 27.68,
+        "occurrences": 8
+      },
+      {
+        "m": 2,
+        "n": 3840,
+        "k": 15360,
+        "variant": "driver_transpose_bk256_d2_s4",
+        "us": 46.24,
+        "occurrences": 48
+      },
+      {
+        "m": 2,
+        "n": 4096,
+        "k": 3840,
+        "variant": "driver_transpose_bk256_d2_s4",
+        "us": 17.28,
+        "occurrences": 40
+      },
+      {
+        "m": 2,
+        "n": 8192,
+        "k": 3840,
+        "variant": "driver_transpose_bk256_d2_s1",
+        "us": 25.28,
+        "occurrences": 8
+      },
+      {
+        "m": 2,
+        "n": 15360,
+        "k": 3840,
+        "variant": "driver_transpose_bk128_d3_s1",
+        "us": 42.752,
+        "occurrences": 96
+      },
+      {
+        "m": 2,
+        "n": 262144,
+        "k": 3840,
+        "variant": "driver_transpose_bk256_d2_s1",
+        "us": 637.536,
+        "occurrences": 1
+      },
+      {
+        "m": 4,
+        "n": 83,
+        "k": 136,
+        "variant": "driver_transpose_bk256_d2_s1",
+        "us": 4.896,
+        "occurrences": 0
+      },
+      {
+        "m": 4,
+        "n": 512,
+        "k": 3840,
+        "variant": "driver_transpose_bk256_d2_s8",
+        "us": 9.504,
+        "occurrences": 8
+      },
+      {
+        "m": 4,
+        "n": 2048,
+        "k": 3840,
+        "variant": "driver_transpose_bk256_d2_s8",
+        "us": 12.416,
+        "occurrences": 80
+      },
+      {
+        "m": 4,
+        "n": 3840,
+        "k": 4096,
+        "variant": "driver_transpose_bk256_d2_s4",
+        "us": 17.344,
+        "occurrences": 40
+      },
+      {
+        "m": 4,
+        "n": 3840,
+        "k": 8192,
+        "variant": "driver_transpose_bk128_d3_s4",
+        "us": 27.904,
+        "occurrences": 8
+      },
+      {
+        "m": 4,
+        "n": 3840,
+        "k": 15360,
+        "variant": "driver_transpose_bk128_d3_s4",
+        "us": 46.4,
+        "occurrences": 48
+      },
+      {
+        "m": 4,
+        "n": 4096,
+        "k": 3840,
+        "variant": "driver_transpose_bk128_d3_s4",
+        "us": 17.568,
+        "occurrences": 40
+      },
+      {
+        "m": 4,
+        "n": 8192,
+        "k": 3840,
+        "variant": "driver_transpose_bk256_d2_s1",
+        "us": 25.984,
+        "occurrences": 8
+      },
+      {
+        "m": 4,
+        "n": 15360,
+        "k": 3840,
+        "variant": "driver_transpose_bk256_d2_s1",
+        "us": 43.232,
+        "occurrences": 96
+      },
+      {
+        "m": 4,
+        "n": 262144,
+        "k": 3840,
+        "variant": "driver_transpose_bk128_d3_s1",
+        "us": 639.744,
+        "occurrences": 1
+      },
+      {
+        "m": 8,
+        "n": 83,
+        "k": 136,
+        "variant": "driver_transpose_bk256_d2_s1",
+        "us": 4.832,
+        "occurrences": 0
+      },
+      {
+        "m": 8,
+        "n": 512,
+        "k": 3840,
+        "variant": "driver_transpose_bk256_d2_s8",
+        "us": 9.504,
+        "occurrences": 8
+      },
+      {
+        "m": 8,
+        "n": 2048,
+        "k": 3840,
+        "variant": "driver_transpose_bk128_d3_s8",
+        "us": 12.288,
+        "occurrences": 80
+      },
+      {
+        "m": 8,
+        "n": 3840,
+        "k": 4096,
+        "variant": "driver_transpose_bk128_d3_s4",
+        "us": 17.888,
+        "occurrences": 40
+      },
+      {
+        "m": 8,
+        "n": 3840,
+        "k": 8192,
+        "variant": "driver_transpose_bk256_d2_s4",
+        "us": 27.552,
+        "occurrences": 8
+      },
+      {
+        "m": 8,
+        "n": 3840,
+        "k": 15360,
+        "variant": "driver_transpose_bk256_d2_s4",
+        "us": 47.04,
+        "occurrences": 48
+      },
+      {
+        "m": 8,
+        "n": 4096,
+        "k": 3840,
+        "variant": "driver_transpose_bk256_d2_s4",
+        "us": 17.856,
+        "occurrences": 40
+      },
+      {
+        "m": 8,
+        "n": 8192,
+        "k": 3840,
+        "variant": "driver_transpose_bk256_d2_s1",
+        "us": 25.248,
+        "occurrences": 8
+      },
+      {
+        "m": 8,
+        "n": 15360,
+        "k": 3840,
+        "variant": "driver_transpose_bk128_d3_s1",
+        "us": 43.04,
+        "occurrences": 96
+      },
+      {
+        "m": 8,
+        "n": 262144,
+        "k": 3840,
+        "variant": "driver_transpose_bk256_d2_s1",
+        "us": 644.64,
+        "occurrences": 1
+      },
+      {
+        "m": 16,
+        "n": 83,
+        "k": 136,
+        "variant": "driver_transpose_bk256_d2_s1",
+        "us": 5.312,
+        "occurrences": 0
+      },
+      {
+        "m": 16,
+        "n": 512,
+        "k": 3840,
+        "variant": "driver_transpose_bk256_d2_s8",
+        "us": 9.952,
+        "occurrences": 8
+      },
+      {
+        "m": 16,
+        "n": 2048,
+        "k": 3840,
+        "variant": "driver_transpose_bk256_d2_s8",
+        "us": 12.864,
+        "occurrences": 80
+      },
+      {
+        "m": 16,
+        "n": 3840,
+        "k": 4096,
+        "variant": "driver_transpose_bk128_d3_s4",
+        "us": 17.984,
+        "occurrences": 40
+      },
+      {
+        "m": 16,
+        "n": 3840,
+        "k": 8192,
+        "variant": "driver_transpose_bk128_d3_s4",
+        "us": 28.896,
+        "occurrences": 8
+      },
+      {
+        "m": 16,
+        "n": 3840,
+        "k": 15360,
+        "variant": "driver_transpose_bk128_d3_s4",
+        "us": 47.328,
+        "occurrences": 48
+      },
+      {
+        "m": 16,
+        "n": 4096,
+        "k": 3840,
+        "variant": "driver_transpose_bk256_d2_s4",
+        "us": 17.696,
+        "occurrences": 40
+      },
+      {
+        "m": 16,
+        "n": 8192,
+        "k": 3840,
+        "variant": "driver_transpose_bk256_d2_s4",
+        "us": 30.368,
+        "occurrences": 8
+      },
+      {
+        "m": 16,
+        "n": 15360,
+        "k": 3840,
+        "variant": "driver_transpose_bk128_d3_s1",
+        "us": 43.808,
+        "occurrences": 96
+      },
+      {
+        "m": 16,
+        "n": 262144,
+        "k": 3840,
+        "variant": "driver_transpose_bk128_d3_s1",
+        "us": 655.008,
+        "occurrences": 1
+      }
+    ]
+  }
+}

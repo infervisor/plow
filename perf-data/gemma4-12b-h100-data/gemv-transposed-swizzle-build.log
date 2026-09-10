@@ -1,0 +1,26 @@
+ptxas info    : 8 bytes gmem
+ptxas info    : Compiling entry function 'plow_gemv_bf16_reduce' for 'sm_90a'
+ptxas info    : Function properties for plow_gemv_bf16_reduce
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 32 registers, used 0 barriers
+ptxas info    : Compile time = 7.534 ms
+ptxas info    : Compiling entry function 'plow_gemv_bf16_m16_bk256_s2' for 'sm_90a'
+ptxas info    : Function properties for plow_gemv_bf16_m16_bk256_s2
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 48 registers, used 1 barriers
+ptxas info    : Compile time = 90.592 ms
+ptxas info    : Compiling entry function 'plow_gemv_bf16_m16_bk128_s3' for 'sm_90a'
+ptxas info    : Function properties for plow_gemv_bf16_m16_bk128_s3
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 48 registers, used 1 barriers
+ptxas info    : Compile time = 81.852 ms
+ptxas info    : Compiling entry function 'plow_gemv_bf16_m8_bk256_s2' for 'sm_90a'
+ptxas info    : Function properties for plow_gemv_bf16_m8_bk256_s2
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 48 registers, used 1 barriers
+ptxas info    : Compile time = 75.959 ms
+ptxas info    : Compiling entry function 'plow_gemv_bf16_m8_bk128_s3' for 'sm_90a'
+ptxas info    : Function properties for plow_gemv_bf16_m8_bk128_s3
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 48 registers, used 1 barriers
+ptxas info    : Compile time = 75.738 ms

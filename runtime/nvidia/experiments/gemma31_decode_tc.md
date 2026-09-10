@@ -15,13 +15,16 @@ Build and run from the repository root:
 ```sh
 nix develop -c /usr/local/cuda/bin/nvcc -std=c++17 -O3 -arch=sm_90a \
   -I runtime/common -I runtime/nvidia -Xptxas=-v \
-  runtime/nvidia/experiments/gemma31_decode_tc.cu -lcublasLt \
+  runtime/nvidia/experiments/gemma31_decode_tc.cu -lcublasLt -lcuda \
   -o /tmp/gemma31-decode-tc
 nix develop -c /tmp/gemma31-decode-tc 31 8
 ```
 
-Arguments are repetitions, optional batch (`0`, `4`, `8`, `16`), and optional
-shape index (`0`–`8`; omitted = all). Shape 8 is the ragged `N83/K136` guard.
+Arguments are repetitions, optional batch (`0`, `1`, `2`, `4`, `8`, `16`), optional
+shape index (`-1` = all), optional `gemma4`, and optional native cubin path.
+Gemma 31B uses shape indices 0–8 and defaults to batches 4/8/16. `gemma4`
+uses indices 0–9 and defaults to batches 1/2/4/8/16. The last shape is the
+ragged `N83/K136` guard.
 The CUDA loader must resolve the real driver, without toolkit `stubs` entries
 in `LD_LIBRARY_PATH`.
 

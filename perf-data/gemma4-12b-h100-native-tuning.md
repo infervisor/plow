@@ -218,3 +218,49 @@ with system NVCC, C++17, `-gencode arch=compute_90a,code=sm_90a`, includes
 the two producer flags and candidate with both set to one. Pair each with the
 correspondingly built production cubin. Run through `nix develop` with system
 CUDA libraries, not Nix's CUDA stubs.
+
+## Exported native BF16 decode object (2026-09-10)
+
+`runtime/nvidia/gemv_sm90_transposed.cu` now exports four shape/tile entry points
+and deterministic FP32 split reduction. The probe and object share the body in
+`op_gemv_transposed.cuh`. The object does not depend on cuBLASLt or CUTLASS.
+Runtime packet routing is not yet integrated. Its launch and scratch contract
+is documented in `runtime/nvidia/gemv_sm90_transposed.md`.
+
+Two 900-case screens passed sampled FP64 numerical checks, including 300 actual
+driver-loaded object cases each, across B1/B2/B4/B8/B16 and ten shapes (nine
+Gemma shapes plus N83/K136 tails). Transposed variants passed repeatability.
+Each screen uses 11 timed cold-weight repetitions after warmup; the best tile
+and split are selected from that screen, without an independent holdout.
+
+Weighted sum of standalone projections, milliseconds:
+
+| Batch | Native vector | Native padded object | Native XOR object | cuBLASLt |
+|---:|---:|---:|---:|---:|
+| 1 | 11.867 | 10.268 | 9.944 | 9.777 |
+| 2 | 13.635 | 10.152 | 9.853 | 9.780 |
+| 4 | 16.547 | 10.124 | 9.914 | 9.760 |
+| 8 | 22.299 | 10.367 | 9.946 | 9.760 |
+| 16 | 41.932 | 10.949 | 10.142 | 9.774 |
+
+These sums do not model fused projections, interpreter resource coupling,
+attention, counters or serving. Arithmetic need not be bit-exact to vector
+GEMV or cuBLASLt. Independent full-model quality remains unqualified.
+
+Padded projection entry points use 40–58 registers; XOR entries use 48. All
+report zero stack and spills. One actual M16/N15360/K3840/BK256/split1 launch
+was profiled per layout: shared-load bank conflicts 7350 padded / 6121 XOR;
+shared-store conflicts and local load/store sectors zero for both. This does
+not certify every shape or attribute all conflicts to one instruction.
+XOR is opt-in: across all candidate variants it slightly regresses B1–B8's
+geometric mean, while its per-shape winners improve the weighted totals.
+
+Compute Sanitizer reports zero errors for padded B16 and XOR B1/B16 tail
+cases, including empty splits. Rebuilding the default object after adding
+the optional layout produces a byte-identical cubin.
+
+Evidence: [shape selections and object hashes](gemma4-12b-h100-data/decode-tc-driver-analysis.json),
+[padded screen](gemma4-12b-h100-data/decode-tc-driver-screen.csv),
+[XOR screen](gemma4-12b-h100-data/decode-tc-swizzle-screen.csv),
+[padded counters](gemma4-12b-h100-data/decode-tc-driver-ncu.csv),
+[XOR counters](gemma4-12b-h100-data/decode-tc-swizzle-ncu.csv).
