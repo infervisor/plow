@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 
 #include "dev_isa.h"
@@ -52,7 +53,7 @@ template<class T> static T* upload(const std::vector<T>& host) {
 }
 
 template<int HD, int BKV> static bool check(unsigned kv_heads, unsigned stride,
-                                          unsigned mask, unsigned window, bool tma) {
+                                          unsigned mask, unsigned window, bool tma, bool profile) {
     const auto q = values(size_t(capacity) * heads * HD, 123);
     const auto k = values(size_t(3) * kv_heads * stride * HD, 456);
     const auto v = values(k.size(), 789);
@@ -93,7 +94,7 @@ template<int HD, int BKV> static bool check(unsigned kv_heads, unsigned stride,
     cudaEvent_t start, stop;
     CK(cudaEventCreate(&start)); CK(cudaEventCreate(&stop));
     std::vector<float> samples;
-    for (unsigned sample = 0; sample < 7; ++sample) {
+    for (unsigned sample = 0; sample < (profile ? 0u : 7u); ++sample) {
         CK(cudaEventRecord(start));
         for (unsigned repeat = 0; repeat < 10; ++repeat)
             run_attention<HD,BKV><<<blocks,256,smem>>>(dq,dk,dv,out,partial,stats,dr,kv_heads,stride,mask,window,table);
@@ -147,19 +148,24 @@ template<int HD, int BKV> static bool check(unsigned kv_heads, unsigned stride,
         }
     }
     ok &= worst < 0.004 && max_error < 0.01;
-    std::printf("HD=%d KV=%u window=%u maps=%d checked=%u worst_relL2=%.6g max_abs=%.6g warm_us=%.3f %s\n",
-                HD,kv_heads,window,int(tma),checked,worst,max_error,samples[3],ok?"PASS":"FAIL");
+    std::printf("HD=%d BKV=%d KV=%u window=%u maps=%d checked=%u worst_relL2=%.6g max_abs=%.6g warm_us=%.3f %s\n",
+                HD,BKV,kv_heads,window,int(tma),checked,worst,max_error,
+                samples.empty() ? NAN : samples[3],ok?"PASS":"FAIL");
     CK(cudaFree(dq)); CK(cudaFree(dk)); CK(cudaFree(dv)); CK(cudaFree(out));
     CK(cudaFree(partial)); CK(cudaFree(stats)); CK(cudaFree(dr));
     if (tma) { CK(cudaFree(table)); CK(cudaFree(dm)); }
     return ok;
 }
 
-int main() {
+int main(int argc, char** argv) {
+    const bool profile = argc == 2 && std::strcmp(argv[1], "--profile") == 0;
+    if (argc != 1 && !profile) return 2;
     bool ok = true;
     for (bool tma : {false, true}) {
-        ok &= check<256,32>(8,2048,2047,1024,tma);
-        ok &= check<512,16>(1,16384,0xffffffffu,0,tma);
+        ok &= check<256,32>(8,2048,2047,1024,tma,profile);
+        ok &= check<256,64>(8,2048,2047,1024,tma,profile);
+        ok &= check<512,16>(1,16384,0xffffffffu,0,tma,profile);
+        ok &= check<512,32>(1,16384,0xffffffffu,0,tma,profile);
     }
     return ok ? 0 : 1;
 }

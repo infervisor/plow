@@ -1176,6 +1176,9 @@ static __device__ void d_quant_fp8_ws384(uint8_t* __restrict__ xq, __nv_bfloat16
 #ifndef PGM90_WS384_ISSUE_CURSOR
 #define PGM90_WS384_ISSUE_CURSOR 0
 #endif
+#ifndef PGM90_WS384_PREFETCH
+#define PGM90_WS384_PREFETCH 0
+#endif
 __device__ __forceinline__ void ws384_wg_bar(int cwg) {
     asm volatile("bar.sync %0, %1;" ::"r"(cwg + 1), "r"(128) : "memory");
 }
@@ -1212,6 +1215,12 @@ static __device__ void d_gemm_sm90_tma_ws384_role(__nv_bfloat16* __restrict__ C,
     uint8_t* Bs = base + NS * PGM90_A8BUF;
     const int tid = (int)threadIdx.x;
 
+#if PGM90_WS384_PREFETCH
+    if (PROD && tid == 0) {
+        sm90_tmap_prefetch(mapA);
+        sm90_tmap_prefetch(mapB);
+    }
+#endif
     if (PROD && tid < NS) {
         sm90_mbar_init(bfull + tid, 1);
         sm90_mbar_init(bempty + tid, 2); /* one rep per CONSUMER warpgroup */

@@ -181,6 +181,67 @@ fn program_arms(m: &Model) -> Vec<ProgramArms> {
     out
 }
 
+fn kernel_cases(m: &Model) -> Value {
+    #[derive(PartialEq, Eq, PartialOrd, Ord)]
+    struct Case {
+        op: u16,
+        blocks: u16,
+        i: [u32; 8],
+        f_bits: [u32; 2],
+        j: [u32; 2],
+        operand_present: [bool; 8],
+        tensor_bytes: [Option<u64>; 8],
+    }
+    let decode = packet::devbuild::decode_rung_lo(&m.prog_t);
+    let programs: Vec<_> = m
+        .progs
+        .iter()
+        .enumerate()
+        .map(|(index, p)| {
+            let mut cases = BTreeMap::<Case, Vec<usize>>::new();
+            for (pc, d) in p.insts.iter().enumerate() {
+                cases
+                    .entry(Case {
+                        op: d.op,
+                        blocks: d.blocks,
+                        i: d.i,
+                        f_bits: d.f.map(f32::to_bits),
+                        j: d.j,
+                        operand_present: d.t.map(|t| t != packet::TENSOR_NONE),
+                        tensor_bytes: d.t.map(|t| m.tensors.get(t as usize).map(|t| t.bytes)),
+                    })
+                    .or_default()
+                    .push(pc);
+            }
+            let cases: Vec<_> = cases
+                .into_iter()
+                .map(|(c, pcs)| {
+                    json!({
+                        "op": c.op,
+                        "arm": op_of(c.op).map(|op| arm_of(op, &c.i).key()),
+                        "blocks": c.blocks, "i": c.i, "f_bits": c.f_bits, "j": c.j,
+                        "operand_present": c.operand_present, "tensor_bytes": c.tensor_bytes,
+                        "pcs": pcs,
+                    })
+                })
+                .collect();
+            let encoded = m.prog_t.get(index).copied().unwrap_or(0);
+            json!({
+                "program": index,
+                "kind": if index < decode { "prefill" } else { "decode" },
+                "rows": packet::devbuild::program_rows(encoded),
+                "packed_only": packet::devbuild::is_packed_prefill_program(encoded),
+                "instruction_count": p.insts.len(), "cases": cases,
+            })
+        })
+        .collect();
+    json!({
+        "programs": programs,
+        "performance_evidence": null,
+        "note": "All emitted ops and raw parameters, including handle-valued immediates. Operand extents are bytes, not dtypes. Cases are coverage inventory, not measured kernel selections; tensor bindings, aliasing, dependencies and runtime object overrides require separate validation.",
+    })
+}
+
 /// Split one program's arms by segment. A single-segment program yields exactly
 /// one entry with `seg: None`, so the unsegmented case reads as it always did.
 #[allow(clippy::type_complexity)]
@@ -1976,6 +2037,7 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport, packed_prefill: 
         // artifact?", and both have a value that means "not established".
         "lean": lean_block(lean),
         "programs": programs,
+        "kernel_cases": kernel_cases(m),
         "dispatch_chains": dispatch_chains(&progs, arch),
         "objects": objects,
         // What a specialised object must compile: the union over every program
@@ -2412,6 +2474,41 @@ mod tests {
             prog_t: vec![1024, 8],
             gen: vec![],
         }
+    }
+
+    #[test]
+    fn kernel_cases_cover_every_op_and_preserve_variant_parameters() {
+        let mut m = model();
+        m.progs[0].insts = DevOp::ALL.iter().map(|&op| inst(op, [0; 8])).collect();
+        let cases = kernel_cases(&m);
+        let rows = cases["programs"][0]["cases"].as_array().unwrap();
+        assert_eq!(rows.len(), DevOp::ALL.len());
+        assert_eq!(
+            rows.iter()
+                .map(|c| c["pcs"].as_array().unwrap().len())
+                .sum::<usize>(),
+            m.progs[0].insts.len()
+        );
+        assert!(rows.iter().all(|c| c["arm"].is_string()));
+
+        let base = inst(DevOp::RmsNorm, [128, 3840, 0, 0, 0, 0, 0, 0]);
+        let mut width = base;
+        width.i[1] = 4096;
+        let mut epsilon = base;
+        epsilon.f[0] = f32::from_bits(0x7fc00001);
+        let mut stride = base;
+        stride.j[0] = 16384;
+        let mut operand = base;
+        operand.t[3] = packet::TENSOR_NONE;
+        m.progs[0].insts = vec![base, base, width, epsilon, stride, operand];
+        let cases = kernel_cases(&m);
+        let rows = cases["programs"][0]["cases"].as_array().unwrap();
+        assert_eq!(rows.len(), 5);
+        assert!(rows.iter().any(|c| c["pcs"] == json!([0, 1])));
+        assert!(rows.iter().any(|c| c["f_bits"][0] == 0x7fc00001u32));
+        assert_eq!(cases["programs"][1]["kind"], "decode");
+        assert_eq!(cases["programs"][1]["rows"], 8);
+        assert!(cases["performance_evidence"].is_null());
     }
 
     /// The manifest must reflect the STREAM. An op nothing emitted must not

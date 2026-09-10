@@ -32,8 +32,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .iter()
                         .map(|&id| blob.tensors.get(id as usize).map(|t| t.name.as_str()))
                         .collect();
+                    let tensor_bytes: Vec<_> = inst
+                        .t
+                        .iter()
+                        .map(|&id| blob.tensors.get(id as usize).map(|t| t.bytes))
+                        .collect();
                     json!({"pc": pc, "op": op, "blocks": inst.blocks,
-                   "i": inst.i, "t": inst.t, "tensors": tensors})
+                   "i": inst.i, "fj_bits": inst.fj, "t": inst.t,
+                   "tensors": tensors, "tensor_bytes": tensor_bytes})
                 })
                 .collect();
             let segments: Vec<_> = p
@@ -50,6 +56,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             json!({"index": index, "phase": if index < decode {"prefill"} else {"decode"},
                "rows": packet::devbuild::program_rows(p.t),
                "packed_only": p.packed_prefill_only, "op_counts": counts,
+               "counter_count": p.n_counter, "wait_count": p.waits.len(),
                "segment_offsets": p.gq_seg_ofs, "segments": segments, "instructions": insts})
         })
         .collect();
