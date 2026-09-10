@@ -2526,14 +2526,13 @@ impl GpuEngine {
                     source,
                 })?;
                 let blob = DevBlob::parse(&raw)?;
-                if blob
-                    .progs
-                    .iter()
-                    .flat_map(|p| &p.insts)
-                    .any(|d| d.op == DevOp::MoeAiterFp8Pf as u16 || d.op == DevOp::IndexTpPf as u16)
-                {
+                if blob.progs.iter().flat_map(|p| &p.insts).any(|d| {
+                    d.op == DevOp::MoeAiterFp8Pf as u16
+                        || d.op == DevOp::IndexTpPf as u16
+                        || d.op == DevOp::GemmLtPf as u16
+                }) {
                     return Err(RuntimeError::Device(
-                        "native AITER MoE and TP indexer are supported only on gfx942".into(),
+                        "native AITER MoE, TP indexer and hipBLASLt projections are supported only on gfx942".into(),
                     ));
                 }
                 if blob.progs.iter().flat_map(|p| &p.insts).any(|d| {

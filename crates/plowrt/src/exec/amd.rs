@@ -139,7 +139,7 @@ use crate::exec::kvrow::{
     derive_kvrow, derive_mla_nsplit, is_lm_head_matmul, kvrow_span, mla_live_nsplit,
     prefill_row_field, rebase_chunk_rows, RowField,
 };
-use crate::exec::{amd_index_tp, amd_moe_aiter, amd_sparse_mla};
+use crate::exec::{amd_gemm_lt, amd_index_tp, amd_moe_aiter, amd_sparse_mla};
 use crate::memory::vmm::{VmmGeometry, VmmKv, VmmOps, WeightSlab};
 use crate::{Result, RuntimeError};
 
@@ -1027,6 +1027,7 @@ enum PrefillSegmentRoute {
     SparseMla(amd_sparse_mla::Route),
     MoeAiter(amd_moe_aiter::Route),
     IndexTp(amd_index_tp::Route),
+    GemmLt(amd_gemm_lt::Route),
     XReduceWaveRs,
     GraphPhaseXReduceWaveRs,
     XReduceAttnRes {
@@ -5742,6 +5743,7 @@ fn packed_mla_compatible(prog: &DevProg) -> bool {
         sparse_fp8(d)
             || d.op == DevOp::MoeAiterFp8Pf as u16
             || d.op == DevOp::IndexTpPf as u16
+            || d.op == DevOp::GemmLtPf as u16
             || d.op == DevOp::FlashGatherPrefill as u16
             || ((d.op == DevOp::FlashMlaPrefill as u16 || d.op == DevOp::FlashMlaPrefillFp8 as u16)
                 && (d.i[3] & 0x8000_0000 != 0
@@ -7857,6 +7859,7 @@ pub struct AmdEngine {
     sparse_mla: Option<amd_sparse_mla::SparseMla>,
     moe_aiter: Option<amd_moe_aiter::MoeAiter>,
     index_tp: Option<amd_index_tp::IndexTp>,
+    gemm_lt: Option<amd_gemm_lt::GemmLt>,
     k_xaudit: Option<HsaKernel>,
     k_state_clear: Option<HsaKernel>,
     k_token_capture: Option<HsaKernel>,
@@ -8606,6 +8609,17 @@ impl AmdEngine {
             return Err(RuntimeError::Device(format!(
                 "materialized MLA prefill requires gfx950, but this device is {arch}"
             )));
+        }
+        let has_gemm_lt = |p: &DevProg| p.insts.iter().any(|d| d.op == DevOp::GemmLtPf as u16);
+        let use_gemm_lt = blob.progs.iter().any(has_gemm_lt);
+        if use_gemm_lt
+            && (arch != "gfx942"
+                || tp.is_none_or(|b| b.n_gpu != 8)
+                || blob.progs[dec_ix..].iter().any(has_gemm_lt))
+        {
+            return Err(RuntimeError::Device(
+                "hipBLASLt projection requires gfx942 TP8 prefill".into(),
+            ));
         }
         let has_index_tp = |p: &DevProg| p.insts.iter().any(|d| d.op == DevOp::IndexTpPf as u16);
         let use_index_tp = blob.progs.iter().any(has_index_tp);
@@ -10310,6 +10324,11 @@ impl AmdEngine {
             None
         };
 
+        let gemm_lt = if use_gemm_lt {
+            Some(amd_gemm_lt::GemmLt::load(&be, &hsaco_dir, &mut modules)?)
+        } else {
+            None
+        };
         let index_tp = if use_index_tp {
             Some(amd_index_tp::IndexTp::load(&be, &hsaco_dir, &mut modules)?)
         } else {
@@ -11028,6 +11047,21 @@ impl AmdEngine {
                         }
                     }
                 }
+                if use_gemm_lt {
+                    for (seg, route) in amd_gemm_lt::routes(p, &blob.tensors, seg_class.len())?
+                        .into_iter()
+                        .enumerate()
+                    {
+                        if let Some(route) = route {
+                            if !matches!(prefill_routes[seg], PrefillSegmentRoute::Interpreter) {
+                                return Err(RuntimeError::Device(
+                                    "hipBLASLt projection overlaps another native route".into(),
+                                ));
+                            }
+                            prefill_routes[seg] = PrefillSegmentRoute::GemmLt(route);
+                        }
+                    }
+                }
                 if use_index_tp {
                     for (seg, route) in
                         amd_index_tp::routes(p, &blob.tensors, seg_class.len(), tp.unwrap())?
@@ -11124,7 +11158,7 @@ impl AmdEngine {
                         p.t
                     )));
                 }
-                if (use_sparse_mla || use_moe_aiter || use_index_tp)
+                if (use_sparse_mla || use_moe_aiter || use_index_tp || use_gemm_lt)
                     && !prefill_segment_specialization_allowed(dispatch)
                 {
                     return Err(RuntimeError::Device(
@@ -11808,6 +11842,7 @@ impl AmdEngine {
             sparse_mla,
             moe_aiter,
             index_tp,
+            gemm_lt,
             k_xaudit,
             k_state_clear,
             k_token_capture,
@@ -12451,6 +12486,7 @@ impl AmdEngine {
                 PrefillSegmentRoute::SparseMla(route) if route.active => return "mla_sparse_aiter",
                 PrefillSegmentRoute::MoeAiter(_) => return "moe_aiter_fp8",
                 PrefillSegmentRoute::IndexTp(_) => return "index_tp",
+                PrefillSegmentRoute::GemmLt(_) => return "gemm_lt",
                 PrefillSegmentRoute::MlaMaterializePack { .. } => return "mla_materialize_pack",
                 PrefillSegmentRoute::MlaMaterializedPrefill { .. } => {
                     return "mla_materialized_prefill";
@@ -12610,6 +12646,16 @@ impl AmdEngine {
         }
         let active = self.packed_prefill.is_some_and(|b| b.prog == p);
         if !active {
+            if let Some(PrefillSegmentRoute::GemmLt(route)) =
+                self.progs[p].prefill_routes.get(seg).copied()
+            {
+                let kernel = self.gemm_lt.as_ref().ok_or_else(|| {
+                    RuntimeError::Device("hipBLASLt projection route has no loaded kernel".into())
+                })?;
+                kernel.enqueue(&self.be, route, &self.tens_table)?;
+                self.seg_launches += 1;
+                return Ok(());
+            }
             if let Some(PrefillSegmentRoute::IndexTp(route)) =
                 self.progs[p].prefill_routes.get(seg).copied()
             {
@@ -13128,6 +13174,7 @@ impl AmdEngine {
         }
         match self.progs[p].prefill_routes.get(seg) {
             Some(PrefillSegmentRoute::SparseMla(route)) if route.active => 3,
+            Some(PrefillSegmentRoute::GemmLt(_)) => 1,
             Some(PrefillSegmentRoute::MoeAiter(_) | PrefillSegmentRoute::IndexTp(_)) => 4,
             Some(PrefillSegmentRoute::MoeEpAlign(_)) if self.k_moe_ep_align.is_some() => 4,
             Some(PrefillSegmentRoute::MoeStage1A4Reuse(_))
@@ -13829,6 +13876,9 @@ impl AmdEngine {
                 route.rebase(rows)?;
             }
             if let PrefillSegmentRoute::IndexTp(route) = route {
+                route.rebase(rows)?;
+            }
+            if let PrefillSegmentRoute::GemmLt(route) = route {
                 route.rebase(rows)?;
             }
         }

@@ -4305,6 +4305,44 @@ fn glm_gf_prefill(ctx: u32, nh_l: u32) -> u32 {
     gf
 }
 
+#[allow(clippy::too_many_arguments)]
+fn emit_glm_lt_gemm(
+    b: &mut Builder,
+    c: &GlmCfg,
+    out: u32,
+    x: u32,
+    weight: u32,
+    t: u32,
+    nn: u32,
+    k: u32,
+    deps: &[u32],
+) -> Option<u32> {
+    if !emit_config::active().glm_gemm_lt
+        || t < 2048
+        || !matches!((nn, k), (2048, 6144) | (512, 6144) | (4096, 2048))
+    {
+        return None;
+    }
+    assert!(
+        c.tp == 8
+            && c.hidden == 6144
+            && b.n_cu() == 304
+            && t <= 8192
+            && !emit_config::active().packed_prefill_on(),
+        "PLOW_GLM_GEMM_LT requires unpacked gfx942 TP8 GLM prefill"
+    );
+    let counter = b.emit(DevOp::GemmLtPf, vec![0], deps, |d| {
+        d.t[0] = out;
+        d.t[1] = x;
+        d.t[2] = weight;
+        d.i[0] = t;
+        d.i[1] = nn;
+        d.i[2] = k;
+    });
+    b.isolate(counter);
+    Some(counter)
+}
+
 /// Emit the MLA attention sub-block for a PREFILL bucket of `t` query rows: the T-row twin of
 /// [`emit_glm_mla`]. Writes `n.xn2` (what the FFN would consume) and returns its completion dep.
 ///
@@ -4385,6 +4423,9 @@ fn emit_glm_dsa_prefill_select(
     // every other unquantized prefill projection uses, not `emit_pf_gemm_fp8_blk`.
     let bf16_gemm =
         |b: &mut Builder, out: u32, x: u32, wt: u32, nn: u32, k: u32, deps: &[u32]| -> u32 {
+            if let Some(counter) = emit_glm_lt_gemm(b, c, out, x, wt, t, nn, k, deps) {
+                return counter;
+            }
             let op = pick_tile(t, nn, k, n_cu, kernelcaps::QuantScheme::None);
             b.emit(op, all.to_vec(), deps, |d| {
                 d.t[0] = out;
@@ -4745,6 +4786,11 @@ pub(crate) fn emit_glm_mla_prefill(
         // What it cost: Kimi's `kv_a_proj` (M=128, N=576) is THREE 256x256 tiles on 256 CUs,
         // measured at ≈0.4% of peak — the worst number in the campaign. `op_gemm.h` now
         // instantiates the fp4 body at all five rungs, so the selection applies.
+        if enc != MoeEnc::Mxfp4 {
+            if let Some(counter) = emit_glm_lt_gemm(b, c, out, x, wt, t, nn, k, deps) {
+                return counter;
+            }
+        }
         let op = pick_tile(t, nn, k, n_cu, mxfp4_quant(enc));
         b.emit(op, all.clone(), deps, |d| {
             d.t[0] = out;

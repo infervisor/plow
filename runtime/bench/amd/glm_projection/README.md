@@ -147,7 +147,83 @@ perf-data/tools/gpulease -n 8 glm-lt-hsa python "$bench/hsa.py" \
   --capture /path/to/capture --expected /tmp/lt-expected --out /tmp/lt-hsa.json
 ```
 
-No serving adapter or new serving gain is claimed here. Next are an isolated,
-opt-in HSA route, full-model retrieval checks and an adjacent C20 comparison.
-The latest qualified serving result remains 32.478 output tokens/s; the H200
-100-request target remains unmet.
+## Native HSA serving
+
+`--glm-gemm-lt=true` / `PLOW_GLM_GEMM_LT=1` enables an isolated `GemmLtPf`
+route for unpacked TP8 GLM prefill buckets of 2048–8192 rows on gfx942.
+It replaces BF16 Q-A (N2048/K6144), KV-latent (N512/K6144), and absorbed-Q /
+indexer-Q (N4096/K2048) projections. Smaller buckets and other shapes retain
+the existing implementation. Kernel selection uses the actual live row count:
+the qualified 4464-row choice through 4464 rows, then the 8192-row choice.
+
+Build the pinned object into the existing qualified MLA/MoE/indexer object
+directory and emit inside `nix develop`:
+
+```sh
+co=/opt/rocm/core-7.14/lib/hipblaslt/library/gfx942/TensileLibrary_BB_BB_HA_Bias_SAV_UA_Type_BB_HPA_Contraction_l_Alik_Bljk_Cijk_Dijk_gfx942.co
+bash scripts/build_glm_lt.sh /path/to/objects "$co"
+PLOW_UNISEG=0 PLOW_GLM_DSA_PF_SPAN=3 PLOW_MLA_PF_V2=1 PLOW_MLA_PF_AITER=1 \
+plowc --hf-dir /path/to/GLM-5.3-plow-lite --gpu MI300X --num-gpus 8 \
+  --batch 1,4,8 --seq 512,2048,8192 --max-ctx 81920 --arch gfx942 \
+  --emit devblob --replay-knobs /path/to/qualified/build.json \
+  --glm-gemm-lt=true --emit-packed-prefill=false --out /path/to/native-assets
+PLOW_HSACO=/path/to/objects PLOW_MLA_PF_V2=1 PLOW_MLA_PF_AITER=1 \
+PLOW_PF_CHUNK=8192 PLOW_PF_INTERLEAVE=0 \
+plowrt serve --assets /path/to/native-assets --port 8080
+```
+
+The build helper verifies both compressed and unbundled hashes. The runtime
+verifies the full object before filling the four pinned descriptors' missing
+argument-size fields. It checks kernel resources, operand capacities and
+segment isolation. Each projection uses one ordered HSA launch, stack arguments
+and no additional activation workspace. Serving requires neither HIP nor a
+hipBLASLt library call. The existing native MLA, MoE and indexer options remain
+part of the measured configuration.
+
+The emitted 8192-row program has 255 native projections: 78 each of Q-A,
+KV-latent and absorbed-Q, plus 21 indexer-Q projections. Lean verifies all
+eight programs, and option-off emission is byte-identical to the preceding
+native-indexer packet. Packet tests (120), manifest tests (47), route/ABI tests
+(2), CUDA+HSA compilation and the release build pass. The config suite passes
+23/24; its existing `no_raw_env_reads` failure names `PLOW_GLM_DSA_PF_SPAN`
+and `PLOW_GLM_DSA_PF_DEXACT` reads already present before this change.
+
+Full-model retrieval passes 18/18 through 68,802 actual prompt tokens; 12/18
+continuations match the preceding native-indexer packet exactly. This limited
+check does not establish general quality equivalence. Keep the option opt-in.
+
+## Paired serving screen
+
+Both arms use the same frozen runtime and object directory, native MLA/MoE/
+indexer, TP8 B8 and BF16 KV. Only `--glm-gemm-lt` differs. The vLLM client
+uses random 70k/700 lengths, range ratio 0.14, seed 0, concurrency 20 and its
+sampling defaults. No speculative decoding is added.
+
+| Metric | Projection route off | Projection route on | Change |
+|---|---:|---:|---:|
+| Output tokens/s | 32.726 | 33.400 | +2.1% |
+| Mean TTFT, s | 160.345 | 155.044 | -3.3% |
+| Median TTFT, s | 173.793 | 165.733 | -4.6% |
+| P99 TTFT, s | 338.879 | 329.360 | -2.8% |
+| Mean TPOT, ms | 188.317 | 186.924 | -0.7% |
+| Median TPOT, ms | 195.904 | 198.048 | +1.1% |
+| P99 TPOT, ms | 245.095 | 235.226 | -4.0% |
+| Mean ITL, ms | 188.220 | 186.170 | -1.1% |
+| Median ITL, ms | 117.299 | 116.366 | -0.8% |
+| P99 ITL, ms | 1161.941 | 1132.449 | -2.5% |
+
+Both complete 20/20 with zero failures and identical per-request token lengths:
+1,414,538 input and 13,795 output tokens. Native runs first. This is a modest
+**2.1% throughput gain in one screen per arm**, not a repeated estimate.
+Median TPOT regresses 1.1%; the other reported latency metrics improve.
+The supplied H200 result uses 100 requests and includes speculative decoding.
+Its non-speculative contribution cannot be inferred from aggregate metrics;
+H200 parity remains unmet.
+
+After timing, loader ownership validation was changed from repeated stream
+scans to a single scan per program. Dispatch and arithmetic are unchanged;
+the final loader passes its tests and another 18/18 retrieval run (14/18
+continuations match the indexer baseline, 15/18 the earlier native run).
+Atomic selection ordering does not promise repeated text identity. The
+[serving record](mi300x-serving.json) distinguishes both runtime hashes and
+includes metrics, quality cells, resolved knobs, object/source hashes and logs.

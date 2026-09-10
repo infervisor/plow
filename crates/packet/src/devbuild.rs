@@ -2273,6 +2273,7 @@ impl Builder {
             op.inst.op == DevOp::KdaDecodeFused as u16
                 || op.inst.op == DevOp::MoeAiterFp8Pf as u16
                 || op.inst.op == DevOp::IndexTpPf as u16
+                || op.inst.op == DevOp::GemmLtPf as u16
         }) || lean_moe_stage2
             || lean_moe_stage1
             || lean_moe_combine

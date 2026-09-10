@@ -2490,3 +2490,43 @@ These qualify a native assembly candidate, not a serving route. The next gates
 are opt-in isolated HSA dispatch, full-model quality and paired serving tests.
 The qualified serving rate remains **32.478 output tokens/s**; H200 parity is
 unmet. See [reproduction, source references and raw records](../../runtime/bench/amd/glm_projection/README.md).
+
+
+## 20. Native hipBLASLt projection route (2026-09-10)
+
+`--glm-gemm-lt=true` adds direct HSA dispatch for three qualified BF16
+projection shapes in unpacked TP8 gfx942 prefill buckets of 2048–8192 rows.
+Q-A, KV-latent, absorbed-Q and selected indexer-Q sites account for 255 native
+projections per large program. Four pinned assembly kernels cover full and
+ragged chunks; the actual row count selects the kernel. Smaller buckets and
+unmatched shapes retain the previous implementation.
+
+Each projection uses one ordered launch, stack arguments and no additional
+activation workspace. Loading validates the full object hash before filling
+four pinned descriptors' missing argument-size fields. Resource metadata,
+operand capacities and segment isolation are checked before dispatch. HIP and
+hipBLASLt library calls are absent from this serving route.
+
+Retrieval passes **18/18**, with **12/18** continuations text-identical to the
+preceding native-indexer packet. This limited quality check does not establish
+general equivalence; the option stays opt-in. Packet tests (120), manifest
+tests (47), native route/ABI tests (2), CUDA+HSA compilation and release build
+pass. Lean verifies all eight programs, and option-off emission reproduces
+the baseline packet byte-for-byte. The config suite passes 23/24; the existing
+`no_raw_env_reads` failure names DSA span/exact knobs present before this change.
+
+An adjacent C20 screen measures **32.726 → 33.400 output tokens/s (+2.1%)**.
+Mean TTFT falls **160.345 → 155.044 s (−3.3%)**, mean TPOT
+**188.317 → 186.924 ms (−0.7%)**, and P99 ITL
+**1161.941 → 1132.449 ms (−2.5%)**. Median TPOT regresses
+**195.904 → 198.048 ms (+1.1%)**. Both arms complete 20/20 without failure,
+with identical per-request lengths totaling 1,414,538 input and 13,795 output
+tokens. Both use the same frozen runtime/objects with native MLA/MoE/indexer;
+only the projection option differs. Native runs first.
+
+This is a modest gain in one screen per arm, not a repeated estimate or the
+H200 100-request benchmark. H200 parity remains unmet. After timing, loader
+ownership validation was reduced to one stream scan per program; dispatch
+and arithmetic are unchanged. The final loader also passes 18/18 retrieval
+cases; validation and the two runtime hashes are recorded separately. See [reproduction and all metrics](../../runtime/bench/amd/glm_projection/README.md#paired-serving-screen)
+and [serving evidence](../../runtime/bench/amd/glm_projection/mi300x-serving.json).
