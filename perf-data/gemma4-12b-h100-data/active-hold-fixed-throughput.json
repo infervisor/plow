@@ -1,0 +1,132 @@
+{
+  "raw_sha256": "401a90d17353cc89bb9154076ecfba37d9b93d467adbf465c052e3f820ea8cd3",
+  "max_hold_ms": 8,
+  "physical_batch": 16,
+  "results": [
+    {
+      "schema_version": 2,
+      "label": "active-hold-throughput-qku32",
+      "model": "checkpoint",
+      "manifest": null,
+      "warmups_per_case": 0,
+      "input": 1024,
+      "requested_cached_prefix_tokens": 0,
+      "cached_tokens": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0
+      },
+      "output": 128,
+      "concurrency": 16,
+      "repeat": 0,
+      "elapsed_s": 3.612406595995708,
+      "output_tok_s": 566.9350737733049,
+      "request_s": 4.429180263853945,
+      "ttft_ms": 917.8675474977354,
+      "latency_ms": {
+        "p50": 3606.593451997469,
+        "p95": 3610.39476300175,
+        "p99": 3610.7305134002672
+      },
+      "tpot_ms": {
+        "p50": 21.174611452735242,
+        "p95": 24.88544554922899,
+        "p99": 26.653329821663387
+      }
+    },
+    {
+      "schema_version": 2,
+      "label": "active-hold-throughput-qku32",
+      "model": "checkpoint",
+      "manifest": null,
+      "warmups_per_case": 0,
+      "input": 1024,
+      "requested_cached_prefix_tokens": 0,
+      "cached_tokens": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0
+      },
+      "output": 128,
+      "concurrency": 128,
+      "repeat": 0,
+      "elapsed_s": 29.132096173998434,
+      "output_tok_s": 562.4037454133966,
+      "request_s": 4.393779261042161,
+      "ttft_ms": 13091.912463500194,
+      "latency_ms": {
+        "p50": 16206.068372001027,
+        "p95": 29032.31925695036,
+        "p99": 29054.25546517952
+      },
+      "tpot_ms": {
+        "p50": 22.558218570854415,
+        "p95": 26.46436578738865,
+        "p99": 26.474001830792986
+      }
+    },
+    {
+      "schema_version": 2,
+      "label": "active-hold-throughput-qku32",
+      "model": "checkpoint",
+      "manifest": null,
+      "warmups_per_case": 0,
+      "input": 16384,
+      "requested_cached_prefix_tokens": 0,
+      "cached_tokens": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0
+      },
+      "output": 128,
+      "concurrency": 16,
+      "repeat": 0,
+      "elapsed_s": 21.749809691995324,
+      "output_tok_s": 94.16174343602346,
+      "request_s": 0.7356386205939333,
+      "ttft_ms": 18005.630702002236,
+      "latency_ms": {
+        "p50": 21742.155208499753,
+        "p95": 21746.54851174455,
+        "p99": 21746.611806346118
+      },
+      "tpot_ms": {
+        "p50": 29.422383980312674,
+        "p95": 59.293266618123035,
+        "p99": 130.9554211787452
+      }
+    },
+    {
+      "schema_version": 2,
+      "label": "active-hold-throughput-qku32",
+      "model": "checkpoint",
+      "manifest": null,
+      "warmups_per_case": 0,
+      "input": 16384,
+      "requested_cached_prefix_tokens": 0,
+      "cached_tokens": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0
+      },
+      "output": 128,
+      "concurrency": 128,
+      "repeat": 0,
+      "elapsed_s": 164.23590234800213,
+      "output_tok_s": 99.75894287281764,
+      "request_s": 0.7793667411938878,
+      "ttft_ms": 88787.18264749841,
+      "latency_ms": {
+        "p50": 92734.52472449935,
+        "p95": 164067.39418474754,
+        "p99": 164072.5774840524
+      },
+      "tpot_ms": {
+        "p50": 30.282233322832614,
+        "p95": 62.84885348896056,
+        "p99": 62.858671264167334
+      }
+    }
+  ],
+  "note": "One repeat per case, no per-case warmup; serving verification conditioned the fresh server. All 288 requests completed128 tokens with zero cached tokens. Screening evidence, not randomized A/B."
+}

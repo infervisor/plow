@@ -1,0 +1,390 @@
+{
+  "runs": [
+    {
+      "label": "base",
+      "raw_sha256": "f30457a212d82e09bfe8b80d121dae9c6c5a47a7be5612d69fee57d1aad77977",
+      "results": [
+        {
+          "schema_version": 2,
+          "label": "active-hold-fixed-base",
+          "model": "checkpoint",
+          "manifest": null,
+          "warmups_per_case": 1,
+          "input": 1024,
+          "requested_cached_prefix_tokens": 0,
+          "cached_tokens": {
+            "p50": 0.0,
+            "p95": 0.0,
+            "p99": 0.0
+          },
+          "output": 128,
+          "concurrency": 1,
+          "repeat": 0,
+          "elapsed_s": 1.6629872570047155,
+          "output_tok_s": 76.96992232553052,
+          "request_s": 0.6013275181682072,
+          "ttft_ms": 85.11100400210125,
+          "latency_ms": {
+            "p50": 1662.766436005768,
+            "p95": 1662.766436005768,
+            "p99": 1662.766436005768
+          },
+          "tpot_ms": {
+            "p50": 12.422483716564305,
+            "p95": 12.422483716564305,
+            "p99": 12.422483716564305
+          }
+        },
+        {
+          "schema_version": 2,
+          "label": "active-hold-fixed-base",
+          "model": "checkpoint",
+          "manifest": null,
+          "warmups_per_case": 1,
+          "input": 1024,
+          "requested_cached_prefix_tokens": 0,
+          "cached_tokens": {
+            "p50": 0.0,
+            "p95": 0.0,
+            "p99": 0.0
+          },
+          "output": 128,
+          "concurrency": 1,
+          "repeat": 1,
+          "elapsed_s": 1.6624062400005641,
+          "output_tok_s": 76.9968235922626,
+          "request_s": 0.6015376843145516,
+          "ttft_ms": 83.91288099664962,
+          "latency_ms": {
+            "p50": 1662.1932259949972,
+            "p95": 1662.1932259949972,
+            "p99": 1662.1932259949972
+          },
+          "tpot_ms": {
+            "p50": 12.427404291325571,
+            "p95": 12.427404291325571,
+            "p99": 12.427404291325571
+          }
+        },
+        {
+          "schema_version": 2,
+          "label": "active-hold-fixed-base",
+          "model": "checkpoint",
+          "manifest": null,
+          "warmups_per_case": 1,
+          "input": 1024,
+          "requested_cached_prefix_tokens": 0,
+          "cached_tokens": {
+            "p50": 0.0,
+            "p95": 0.0,
+            "p99": 0.0
+          },
+          "output": 128,
+          "concurrency": 1,
+          "repeat": 2,
+          "elapsed_s": 1.6678950360001181,
+          "output_tok_s": 76.7434384282147,
+          "request_s": 0.5995581127204274,
+          "ttft_ms": 89.43631400325103,
+          "latency_ms": {
+            "p50": 1667.6758380053798,
+            "p95": 1667.6758380053798,
+            "p99": 1667.6758380053798
+          },
+          "tpot_ms": {
+            "p50": 12.427082866158495,
+            "p95": 12.427082866158495,
+            "p99": 12.427082866158495
+          }
+        },
+        {
+          "schema_version": 2,
+          "label": "active-hold-fixed-base",
+          "model": "checkpoint",
+          "manifest": null,
+          "warmups_per_case": 1,
+          "input": 16384,
+          "requested_cached_prefix_tokens": 0,
+          "cached_tokens": {
+            "p50": 0.0,
+            "p95": 0.0,
+            "p99": 0.0
+          },
+          "output": 128,
+          "concurrency": 1,
+          "repeat": 0,
+          "elapsed_s": 2.8354401429969585,
+          "output_tok_s": 45.14290323360824,
+          "request_s": 0.35267893151256435,
+          "ttft_ms": 1133.0380459985463,
+          "latency_ms": {
+            "p50": 2834.820429001411,
+            "p95": 2834.820429001411,
+            "p99": 2834.820429001411
+          },
+          "tpot_ms": {
+            "p50": 13.399861283487123,
+            "p95": 13.399861283487123,
+            "p99": 13.399861283487123
+          }
+        },
+        {
+          "schema_version": 2,
+          "label": "active-hold-fixed-base",
+          "model": "checkpoint",
+          "manifest": null,
+          "warmups_per_case": 1,
+          "input": 16384,
+          "requested_cached_prefix_tokens": 0,
+          "cached_tokens": {
+            "p50": 0.0,
+            "p95": 0.0,
+            "p99": 0.0
+          },
+          "output": 128,
+          "concurrency": 1,
+          "repeat": 1,
+          "elapsed_s": 2.8425025200049276,
+          "output_tok_s": 45.03074283986144,
+          "request_s": 0.3518026784364175,
+          "ttft_ms": 1140.701006996096,
+          "latency_ms": {
+            "p50": 2841.8844569969224,
+            "p95": 2841.8844569969224,
+            "p99": 2841.8844569969224
+          },
+          "tpot_ms": {
+            "p50": 13.395145275597057,
+            "p95": 13.395145275597057,
+            "p99": 13.395145275597057
+          }
+        },
+        {
+          "schema_version": 2,
+          "label": "active-hold-fixed-base",
+          "model": "checkpoint",
+          "manifest": null,
+          "warmups_per_case": 1,
+          "input": 16384,
+          "requested_cached_prefix_tokens": 0,
+          "cached_tokens": {
+            "p50": 0.0,
+            "p95": 0.0,
+            "p99": 0.0
+          },
+          "output": 128,
+          "concurrency": 1,
+          "repeat": 2,
+          "elapsed_s": 2.8509846169981756,
+          "output_tok_s": 44.89676978151226,
+          "request_s": 0.35075601391806455,
+          "ttft_ms": 1150.7011810026597,
+          "latency_ms": {
+            "p50": 2850.427026001853,
+            "p95": 2850.427026001853,
+            "p99": 2850.427026001853
+          },
+          "tpot_ms": {
+            "p50": 13.38366807085979,
+            "p95": 13.38366807085979,
+            "p99": 13.38366807085979
+          }
+        }
+      ]
+    },
+    {
+      "label": "qku32",
+      "raw_sha256": "41043726702cd1b6cf7bfc0ad27246f85c89d0b7e44c411da205437451dea5af",
+      "results": [
+        {
+          "schema_version": 2,
+          "label": "active-hold-fixed-qku32",
+          "model": "checkpoint",
+          "manifest": null,
+          "warmups_per_case": 1,
+          "input": 1024,
+          "requested_cached_prefix_tokens": 0,
+          "cached_tokens": {
+            "p50": 0.0,
+            "p95": 0.0,
+            "p99": 0.0
+          },
+          "output": 128,
+          "concurrency": 1,
+          "repeat": 0,
+          "elapsed_s": 1.6506073659984395,
+          "output_tok_s": 77.54721239994818,
+          "request_s": 0.6058375968745952,
+          "ttft_ms": 80.72729999548756,
+          "latency_ms": {
+            "p50": 1650.2702739962842,
+            "p95": 1650.2702739962842,
+            "p99": 1650.2702739962842
+          },
+          "tpot_ms": {
+            "p50": 12.358606094494462,
+            "p95": 12.358606094494462,
+            "p99": 12.358606094494462
+          }
+        },
+        {
+          "schema_version": 2,
+          "label": "active-hold-fixed-qku32",
+          "model": "checkpoint",
+          "manifest": null,
+          "warmups_per_case": 1,
+          "input": 1024,
+          "requested_cached_prefix_tokens": 0,
+          "cached_tokens": {
+            "p50": 0.0,
+            "p95": 0.0,
+            "p99": 0.0
+          },
+          "output": 128,
+          "concurrency": 1,
+          "repeat": 1,
+          "elapsed_s": 1.6467839690012624,
+          "output_tok_s": 77.72725652511005,
+          "request_s": 0.6072441916024223,
+          "ttft_ms": 78.02630200603744,
+          "latency_ms": {
+            "p50": 1646.397683005489,
+            "p95": 1646.397683005489,
+            "p99": 1646.397683005489
+          },
+          "tpot_ms": {
+            "p50": 12.349380952751586,
+            "p95": 12.349380952751586,
+            "p99": 12.349380952751586
+          }
+        },
+        {
+          "schema_version": 2,
+          "label": "active-hold-fixed-qku32",
+          "model": "checkpoint",
+          "manifest": null,
+          "warmups_per_case": 1,
+          "input": 1024,
+          "requested_cached_prefix_tokens": 0,
+          "cached_tokens": {
+            "p50": 0.0,
+            "p95": 0.0,
+            "p99": 0.0
+          },
+          "output": 128,
+          "concurrency": 1,
+          "repeat": 2,
+          "elapsed_s": 1.6542060020001372,
+          "output_tok_s": 77.37851261888324,
+          "request_s": 0.6045196298350253,
+          "ttft_ms": 82.26224599638954,
+          "latency_ms": {
+            "p50": 1653.7627239958965,
+            "p95": 1653.7627239958965,
+            "p99": 1653.7627239958965
+          },
+          "tpot_ms": {
+            "p50": 12.374019511807141,
+            "p95": 12.374019511807141,
+            "p99": 12.374019511807141
+          }
+        },
+        {
+          "schema_version": 2,
+          "label": "active-hold-fixed-qku32",
+          "model": "checkpoint",
+          "manifest": null,
+          "warmups_per_case": 1,
+          "input": 16384,
+          "requested_cached_prefix_tokens": 0,
+          "cached_tokens": {
+            "p50": 0.0,
+            "p95": 0.0,
+            "p99": 0.0
+          },
+          "output": 128,
+          "concurrency": 1,
+          "repeat": 0,
+          "elapsed_s": 2.767717447000905,
+          "output_tok_s": 46.24749543660992,
+          "request_s": 0.361308558098515,
+          "ttft_ms": 1080.022984999232,
+          "latency_ms": {
+            "p50": 2766.9499840048957,
+            "p95": 2766.9499840048957,
+            "p99": 2766.9499840048957
+          },
+          "tpot_ms": {
+            "p50": 13.282889755950107,
+            "p95": 13.282889755950107,
+            "p99": 13.282889755950107
+          }
+        },
+        {
+          "schema_version": 2,
+          "label": "active-hold-fixed-qku32",
+          "model": "checkpoint",
+          "manifest": null,
+          "warmups_per_case": 1,
+          "input": 16384,
+          "requested_cached_prefix_tokens": 0,
+          "cached_tokens": {
+            "p50": 0.0,
+            "p95": 0.0,
+            "p99": 0.0
+          },
+          "output": 128,
+          "concurrency": 1,
+          "repeat": 1,
+          "elapsed_s": 2.7573255639945273,
+          "output_tok_s": 46.42179424564101,
+          "request_s": 0.3626702675440704,
+          "ttft_ms": 1072.1677939945948,
+          "latency_ms": {
+            "p50": 2756.6104819998145,
+            "p95": 2756.6104819998145,
+            "p99": 2756.6104819998145
+          },
+          "tpot_ms": {
+            "p50": 13.263328252009604,
+            "p95": 13.263328252009604,
+            "p99": 13.263328252009604
+          }
+        },
+        {
+          "schema_version": 2,
+          "label": "active-hold-fixed-qku32",
+          "model": "checkpoint",
+          "manifest": null,
+          "warmups_per_case": 1,
+          "input": 16384,
+          "requested_cached_prefix_tokens": 0,
+          "cached_tokens": {
+            "p50": 0.0,
+            "p95": 0.0,
+            "p99": 0.0
+          },
+          "output": 128,
+          "concurrency": 1,
+          "repeat": 2,
+          "elapsed_s": 2.7524059979987214,
+          "output_tok_s": 46.504767135760126,
+          "request_s": 0.363318493248126,
+          "ttft_ms": 1073.533058995963,
+          "latency_ms": {
+            "p50": 2751.744704997691,
+            "p95": 2751.744704997691,
+            "p99": 2751.744704997691
+          },
+          "tpot_ms": {
+            "p50": 13.214264929147463,
+            "p95": 13.214264929147463,
+            "p99": 13.214264929147463
+          }
+        }
+      ]
+    }
+  ],
+  "max_hold_ms": 8,
+  "note": "Sequential fresh-server screens; same burst conditioning, 3 repeats after 1 warmup per input, C1, 128 output tokens, zero cached tokens. Baseline/candidate differ only HD512 object; both run fixed scheduler."
+}

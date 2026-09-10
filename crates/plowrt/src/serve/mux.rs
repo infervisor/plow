@@ -859,14 +859,8 @@ pub fn spawn(
                     }
                     continue;
                 }
-                Admit::Defer => {
-                    let hold_ms = formation_window_ms(load.lambda.get(), cfg.max_hold_ms);
-                    if hold_ms > 0.0 {
-                        tokio::time::sleep(std::time::Duration::from_secs_f64(hold_ms / 1000.0))
-                            .await;
-                    }
-                }
-                Admit::Now => {}
+                // Formation waits belong to the idle ingress path; live work must advance.
+                Admit::Defer | Admit::Now => {}
             }
 
             Metrics::add(&metrics.batch_size_sum, live as u64);

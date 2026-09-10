@@ -1,0 +1,266 @@
+   Compiling plowrt v0.1.0 (/home/lava/plow/crates/plowrt)
+warning: unused import: `RopeScale`
+ --> crates/devgen/src/mla.rs:8:31
+  |
+8 | use packet::rope::{GenTensor, RopeScale};
+  |                               ^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `MLA_DK` is never used
+    --> crates/devgen/src/lib.rs:7476:18
+     |
+7476 | pub(crate) const MLA_DK: u32 = 512;
+     |                  ^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `MLA_FOLD_VEC` is never used
+    --> crates/devgen/src/lib.rs:7480:18
+     |
+7480 | pub(crate) const MLA_FOLD_VEC: u32 = 4;
+     |                  ^^^^^^^^^^^^
+
+warning: function `require_mla_geometry` is never used
+    --> crates/devgen/src/lib.rs:7514:15
+     |
+7514 | pub(crate) fn require_mla_geometry(kv_lora: u32, qk_rope: u32, v_head: u32, model: &str) {
+     |               ^^^^^^^^^^^^^^^^^^^^
+
+warning: `devgen` (lib) generated 4 warnings (run `cargo fix --lib -p devgen` to apply 1 suggestion)
+warning: unused import: `status_for`
+  --> crates/plowrt/src/serve/chat.rs:14:20
+   |
+14 | use crate::serve::{status_for, AppState};
+   |                    ^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `status_for`
+  --> crates/plowrt/src/serve/completion.rs:14:20
+   |
+14 | use crate::serve::{status_for, AppState};
+   |                    ^^^^^^^^^^
+
+warning: use of deprecated associated function `minijinja::Environment::<'source>::new`: Attempted to instantiate an environment with serde.  Future versions of MiniJinja will require enabling the 'serde' feature to use serde types.  To silence this warning add 'serde' to the list of features of minijinja.
+  --> crates/plowrt/src/serve/template.rs:95:36
+   |
+95 |         let mut env = Environment::new();
+   |                                    ^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+warning: unused variable: `slug`
+    --> crates/plowrt/src/serve/mux.rs:1297:5
+     |
+1297 |     slug: &str,
+     |     ^^^^ help: if this is intentional, prefix it with an underscore: `_slug`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: associated items `env_nonempty` and `prefix_cache_mib` are never used
+    --> crates/plowrt/src/config.rs:1007:8
+     |
+ 994 | impl RuntimeConfig {
+     | ------------------ associated items in this implementation
+...
+1007 |     fn env_nonempty(var: &str) -> Option<String> {
+     |        ^^^^^^^^^^^^
+...
+1061 |     pub(crate) fn prefix_cache_mib(&self) -> u32 {
+     |                   ^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: struct `HostLayout` is never constructed
+   --> crates/plowrt/src/exec/mixed_step_staging.rs:215:19
+    |
+215 | pub(crate) struct HostLayout {
+    |                   ^^^^^^^^^^
+
+warning: associated items `new` and `words` are never used
+   --> crates/plowrt/src/exec/mixed_step_staging.rs:228:19
+    |
+227 | impl HostLayout {
+    | --------------- associated items in this implementation
+228 |     pub(crate) fn new(rows: usize, decode: usize, spans: usize) -> crate::Result<Self> {
+    |                   ^^^
+...
+259 |     pub(crate) fn words(&self) -> usize {
+    |                   ^^^^^
+
+warning: function `fill_words` is never used
+   --> crates/plowrt/src/exec/mixed_step_staging.rs:264:15
+    |
+264 | pub(crate) fn fill_words(
+    |               ^^^^^^^^^^
+
+warning: `plowrt` (lib test) generated 8 warnings (run `cargo fix --lib -p plowrt --tests` to apply 3 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 10.90s
+     Running unittests src/lib.rs (target/debug/deps/plowrt-ef6aca6325662474)
+
+running 20 tests
+test serve::mux::tests::decode_progress_uses_completed_steps_and_physical_extent ... ok
+test serve::mux::tests::a_stop_string_split_across_deltas_does_not_leak_its_prefix ... ok
+test serve::mux::tests::a_prefix_that_does_not_complete_is_released ... ok
+test serve::mux::tests::decode_rung_attribution_uses_only_fed_slots ... ok
+test serve::mux::tests::deferred_token_ring_is_row_major_and_bounds_checked ... ok
+test serve::mux::tests::health_degrades_on_nonfatal_and_recovers_on_success ... ok
+test serve::mux::tests::health_ignores_clean_ticks ... ok
+test serve::mux::tests::bounded_ingress_reports_full_closed_and_depth ... ok
+test serve::mux::tests::health_dies_on_fatal_and_stays_dead ... ok
+test serve::mux::tests::predicted_wait_is_batched_not_serial ... ok
+test serve::mux::tests::multiple_stops_cut_at_the_earliest_match_not_the_first_listed ... ok
+test serve::mux::tests::kv_state_keeps_address_space_alive ... ok
+test serve::mux::tests::no_flash_leaves_kv_writes_empty ... ok
+test serve::mux::tests::flash_records_kv_pages_snapshot ... ok
+test serve::mux::tests::incremental_delta_matches_full_decode ... ok
+test serve::mux::tests::refresh_wipes_stale_kv_entries ... ok
+test serve::mux::tests::the_longest_live_prefix_is_the_one_withheld ... ok
+test serve::mux::tests::service_sample_excludes_prefill_ticks ... ok
+test serve::mux::tests::refresh_without_arena_is_a_wipe ... ok
+test serve::mux::tests::refresh_populates_all_entries_for_32_layers_batch_4 ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 306 filtered out; finished in 0.00s
+
+warning: unused import: `RopeScale`
+ --> crates/devgen/src/mla.rs:8:31
+  |
+8 | use packet::rope::{GenTensor, RopeScale};
+  |                               ^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `MLA_DK` is never used
+    --> crates/devgen/src/lib.rs:7476:18
+     |
+7476 | pub(crate) const MLA_DK: u32 = 512;
+     |                  ^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `MLA_FOLD_VEC` is never used
+    --> crates/devgen/src/lib.rs:7480:18
+     |
+7480 | pub(crate) const MLA_FOLD_VEC: u32 = 4;
+     |                  ^^^^^^^^^^^^
+
+warning: function `require_mla_geometry` is never used
+    --> crates/devgen/src/lib.rs:7514:15
+     |
+7514 | pub(crate) fn require_mla_geometry(kv_lora: u32, qk_rope: u32, v_head: u32, model: &str) {
+     |               ^^^^^^^^^^^^^^^^^^^^
+
+warning: `devgen` (lib) generated 4 warnings (run `cargo fix --lib -p devgen` to apply 1 suggestion)
+warning: unused import: `status_for`
+  --> crates/plowrt/src/serve/chat.rs:14:20
+   |
+14 | use crate::serve::{status_for, AppState};
+   |                    ^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `status_for`
+  --> crates/plowrt/src/serve/completion.rs:14:20
+   |
+14 | use crate::serve::{status_for, AppState};
+   |                    ^^^^^^^^^^
+
+warning: use of deprecated associated function `minijinja::Environment::<'source>::new`: Attempted to instantiate an environment with serde.  Future versions of MiniJinja will require enabling the 'serde' feature to use serde types.  To silence this warning add 'serde' to the list of features of minijinja.
+  --> crates/plowrt/src/serve/template.rs:95:36
+   |
+95 |         let mut env = Environment::new();
+   |                                    ^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+warning: unused variable: `slug`
+    --> crates/plowrt/src/serve/mux.rs:1297:5
+     |
+1297 |     slug: &str,
+     |     ^^^^ help: if this is intentional, prefix it with an underscore: `_slug`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: associated items `env_nonempty` and `prefix_cache_mib` are never used
+    --> crates/plowrt/src/config.rs:1007:8
+     |
+ 994 | impl RuntimeConfig {
+     | ------------------ associated items in this implementation
+...
+1007 |     fn env_nonempty(var: &str) -> Option<String> {
+     |        ^^^^^^^^^^^^
+...
+1061 |     pub(crate) fn prefix_cache_mib(&self) -> u32 {
+     |                   ^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: struct `HostLayout` is never constructed
+   --> crates/plowrt/src/exec/mixed_step_staging.rs:215:19
+    |
+215 | pub(crate) struct HostLayout {
+    |                   ^^^^^^^^^^
+
+warning: associated items `new` and `words` are never used
+   --> crates/plowrt/src/exec/mixed_step_staging.rs:228:19
+    |
+227 | impl HostLayout {
+    | --------------- associated items in this implementation
+228 |     pub(crate) fn new(rows: usize, decode: usize, spans: usize) -> crate::Result<Self> {
+    |                   ^^^
+...
+259 |     pub(crate) fn words(&self) -> usize {
+    |                   ^^^^^
+
+warning: function `fill_words` is never used
+   --> crates/plowrt/src/exec/mixed_step_staging.rs:264:15
+    |
+264 | pub(crate) fn fill_words(
+    |               ^^^^^^^^^^
+
+warning: `plowrt` (lib test) generated 8 warnings (run `cargo fix --lib -p plowrt --tests` to apply 3 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.12s
+     Running unittests src/lib.rs (target/debug/deps/plowrt-ef6aca6325662474)
+
+running 37 tests
+test sched::mdq::tests::batching_pays_near_saturation ... ok
+test sched::mdq::tests::per_token_falls_with_batch_but_not_linearly ... ok
+test sched::mdq::tests::md1_is_exactly_half_mm1 ... ok
+test sched::mdq::tests::no_batching_at_low_load ... ok
+test sched::mdq::tests::pk_interpolates_the_two_corners ... ok
+test sched::mdq::tests::deadline_sheds_under_overload ... ok
+test sched::mdq::tests::mm1_quantile_matches_its_own_tail ... ok
+test sched::mdq::tests::table_lookup_rounds_up ... ok
+test sched::mdq::tests::fit_rejects_degenerate_input ... ok
+test sched::mdq::tests::fit_recovers_known_parameters ... ok
+test sched::mdq::tests::window_optimum_beats_its_neighbours ... ok
+test sched::prefill::tests::a_chunk_filling_the_widest_rung_admits_one_span_and_half_of_it_admits_two ... ok
+test sched::prefill::tests::fair_split_never_emits_zero_rows_when_candidates_outnumber_budget ... ok
+test sched::prefill::tests::fair_split_rotates_and_reclaims_short_request_rows ... ok
+test sched::prefill::tests::fair_split_reclaims_rows_from_a_short_last_request ... ok
+test sched::multistep::tests::sparse_decode_budget_obeys_every_active_context ... ok
+test sched::prefill::tests::limit_spans_keeps_the_rotation_prefix_and_is_idempotent ... ok
+test sched::prefill::tests::invalid_or_duplicate_physical_slots_are_excluded ... ok
+test sched::rungs::tests::backlog_widens_to_the_smallest_covering_rung ... ok
+test sched::prefill::tests::saturated_launches_rotate_the_first_admitted_request ... ok
+test sched::rungs::tests::invalid_timing_does_not_poison_either_estimate ... ok
+test sched::rungs::tests::narrowing_changes_admission_before_high_slots_drain ... ok
+test sched::rungs::tests::quantum_length_does_not_inflate_utilization_or_widen_admission ... ok
+test sched::prefill::tests::whole_spans_preserve_program_and_leave_bucket_padding ... ok
+test sched::rungs::tests::service_and_slo_are_keyed_by_actual_rung ... ok
+test sched::rungs::tests::validates_arbitrary_ascending_widths_including_one ... ok
+test sched::rungs::tests::single_rung_is_an_exact_policy_bypass ... ok
+test sched::rungs::tests::variable_completed_quanta_keep_a_per_step_average ... ok
+test sched::rungs::tests::waiting_uses_the_whole_quantum_even_when_capacity_uses_steps ... ok
+test sched::rungs::tests::occupied_extent_not_live_count_selects_the_execution_rung ... ok
+test sched::rungs::tests::unseen_wider_rung_uses_conservative_width_scaled_service ... ok
+test serve::cosched::tests::parses_its_modes_and_rejects_others ... ok
+test serve::cosched::tests::free_never_takes_the_turn ... ok
+test serve::cosched::tests::two_models_interleave_under_rr ... ok
+test serve::cosched::tests::rr_holds_the_turn_and_excludes_a_co_tenant ... ok
+test sched::prefill::tests::fair_split_uses_available_rows_without_exceeding_request_caps ... ok
+test serve::cosched::tests::a_holder_yields_after_its_quantum ... ok
+
+test result: ok. 37 passed; 0 failed; 0 ignored; 0 measured; 289 filtered out; finished in 0.13s
+

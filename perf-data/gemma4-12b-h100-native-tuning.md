@@ -478,3 +478,37 @@ performance objective.
 
 [Conditioned C1 screens](gemma4-12b-h100-data/active-hold-latency-screen.json)
 retain the raw-file hashes and measured repeat summaries.
+
+## Active-batch admission delay removed
+
+The mux no longer sleeps on `Admit::Defer` after admitting live requests.
+Batch formation still waits on idle ingress; overload shedding is unchanged.
+Arrival-rate history can outlive a burst, so applying a formation hold to each
+active decode tick inserted about 9 ms/token (8 ms plus timer scheduling).
+
+With the default `max_hold_ms=8`, the baseline kernel now measures median
+16K/C1 TPOT 13.395 ms, matching the earlier hold-disabled control (13.384 ms)
+instead of the earlier conditioned 22.50 ms result. Fresh baseline and QK32
+servers ran the same serving verification sequence, then three measured C1
+repeats after one warmup per input:
+
+| Kernel | Input | TTFT (ms) | TPOT (ms) | Output tokens/s |
+|---|---:|---:|---:|---:|
+| Baseline | 1024 | 85.111 | 12.427 | 76.970 |
+| QK32 | 1024 | 80.727 | 12.359 | 77.547 |
+| Baseline | 16384 | 1140.701 | 13.395 | 45.031 |
+| QK32 | 16384 | 1073.533 | 13.263 | 46.422 |
+
+The fixed QK32 throughput screen gives 566.935/562.404 tokens/s at 1K C16/C128
+and 94.162/99.759 at 16K C16/C128. This is one repeat per cell after serving
+verification, without additional per-case warmups; C128 uses physical B16.
+All 300 measured requests across latency and throughput completed 128 tokens
+with zero cached tokens. Serving cancellation, slot reuse, ragged prompts and
+context rejection pass for all three fresh server runs. Mux20+scheduler37
+unit tests pass; the CUDA release build succeeds.
+
+[Latency evidence](gemma4-12b-h100-data/active-hold-fixed-latency.json),
+[throughput evidence](gemma4-12b-h100-data/active-hold-fixed-throughput.json),
+[unit tests](gemma4-12b-h100-data/active-hold-tests.log).
+This removes a scheduler latency defect; it does not close the vLLM gap.
+Recorded vLLM 16K C1/C128 throughput remains 64.692/196.035 tokens/s.
