@@ -3,7 +3,7 @@ use super::*;
 pub(super) struct Native {
     be: Arc<CudaBackend>,
     _module: Arc<DecodeModule>,
-    kernels: [KernelFn; 4],
+    kernels: Vec<KernelFn>,
     reduce: KernelFn,
     workspace: DeviceMem,
 }
@@ -25,9 +25,15 @@ fn selection(m: u32, n: u32, k: u32) -> Result<(usize, u32, u32)> {
                 "native decode has no measured BF16 shape M{m}/N{n}/K{k}"
             ))
         })?;
-    let capacity = if m <= 8 { 8 } else { 16 };
+    let capacity = if m <= 8 {
+        8
+    } else if m <= 16 {
+        16
+    } else {
+        32
+    };
     let stages = if bk == 128 { 3 } else { 2 };
-    let kernel = usize::from(m > 8) * 2 + usize::from(bk == 256);
+    let kernel = (usize::from(m > 8) + usize::from(m > 16)) * 2 + usize::from(bk == 256);
     Ok((kernel, splits, stages * (64 + capacity) * (bk + 8) * 2))
 }
 
@@ -52,6 +58,14 @@ impl Native {
                 "native decode object hash or ABI mismatch".into(),
             ));
         }
+        let wide = segments.iter().flatten().any(|s| s.m > 16);
+        if wide
+            && plow_asset::cubin::global_u32(&image, "plow_gemv_transposed_max_rows") != Some(32)
+        {
+            return Err(RuntimeError::Rejected(
+                "native decode object has no B32 capability".into(),
+            ));
+        }
         let bytes = segments
             .iter()
             .flatten()
@@ -70,7 +84,10 @@ impl Native {
         }
         let module = DecodeModule::load(be, &image)?;
         let mut kernels = Vec::new();
-        for capacity in [8, 16] {
+        for capacity in [8, 16, 32]
+            .into_iter()
+            .filter(|&capacity| capacity <= 16 || wide)
+        {
             for (bk, stages) in [(128, 3), (256, 2)] {
                 let f = be.get_function(
                     &module,
@@ -86,7 +103,7 @@ impl Native {
         Ok(Arc::new(Self {
             be: Arc::clone(be),
             _module: module,
-            kernels: kernels.try_into().ok().expect("four kernels"),
+            kernels,
             reduce,
             workspace,
         }))
@@ -111,9 +128,15 @@ impl Native {
             }
             // Rung changes must preserve the FP32 summation order.
             let bk = if template.kernel % 2 == 0 { 128 } else { 256 };
-            let capacity = if m <= 8 { 8 } else { 16 };
+            let capacity = if m <= 8 {
+                8
+            } else if m <= 16 {
+                16
+            } else {
+                32
+            };
             let stages = if bk == 128 { 3 } else { 2 };
-            kernel = usize::from(m > 8) * 2 + template.kernel % 2;
+            kernel = (usize::from(m > 8) + usize::from(m > 16)) * 2 + template.kernel % 2;
             splits = template.splits;
             smem = stages * (64 + capacity) * (bk + 8) * 2;
         }
@@ -188,15 +211,15 @@ mod tests {
 
     #[test]
     fn measured_shapes_have_bounded_launch_and_scratch() {
-        assert_eq!(SHAPES.len(), 40);
+        assert_eq!(SHAPES.len(), 54);
         for &(m, n, k, _, _) in SHAPES {
             let (kernel, splits, smem) = selection(m, n, k).unwrap();
-            assert!(kernel < 4 && [1, 4, 8].contains(&splits));
-            assert!(smem <= 84480 && u64::from(m) * u64::from(n) <= i32::MAX as u64);
+            assert!(kernel < 6 && [1, 4, 8].contains(&splits));
+            assert!(smem <= 101376 && u64::from(m) * u64::from(n) <= i32::MAX as u64);
         }
-        assert!(selection(32, 15360, 3840).is_err());
+        assert!(selection(64, 15360, 3840).is_err());
         assert!(selection(16, 15360, 3848).is_err());
-        assert!(selection(16, 262144, 3840).is_err());
+        assert!(selection(16, 262145, 3840).is_err());
     }
 }
 
@@ -209,6 +232,7 @@ const SHAPES: &[(u32, u32, u32, u32, u32)] = &[
     (1, 4096, 3840, 256, 4),
     (1, 8192, 3840, 256, 1),
     (1, 15360, 3840, 128, 1),
+    (1, 262144, 3840, 256, 1),
     (2, 512, 3840, 128, 8),
     (2, 2048, 3840, 128, 8),
     (2, 3840, 4096, 256, 4),
@@ -217,6 +241,7 @@ const SHAPES: &[(u32, u32, u32, u32, u32)] = &[
     (2, 4096, 3840, 256, 4),
     (2, 8192, 3840, 256, 1),
     (2, 15360, 3840, 128, 1),
+    (2, 262144, 3840, 256, 1),
     (4, 512, 3840, 256, 8),
     (4, 2048, 3840, 256, 8),
     (4, 3840, 4096, 256, 4),
@@ -225,6 +250,7 @@ const SHAPES: &[(u32, u32, u32, u32, u32)] = &[
     (4, 4096, 3840, 128, 4),
     (4, 8192, 3840, 256, 1),
     (4, 15360, 3840, 256, 1),
+    (4, 262144, 3840, 256, 1),
     (8, 512, 3840, 256, 8),
     (8, 2048, 3840, 128, 8),
     (8, 3840, 4096, 128, 4),
@@ -233,6 +259,7 @@ const SHAPES: &[(u32, u32, u32, u32, u32)] = &[
     (8, 4096, 3840, 256, 4),
     (8, 8192, 3840, 256, 1),
     (8, 15360, 3840, 128, 1),
+    (8, 262144, 3840, 256, 1),
     (16, 512, 3840, 256, 8),
     (16, 2048, 3840, 256, 8),
     (16, 3840, 4096, 128, 4),
@@ -241,4 +268,14 @@ const SHAPES: &[(u32, u32, u32, u32, u32)] = &[
     (16, 4096, 3840, 256, 4),
     (16, 8192, 3840, 256, 4),
     (16, 15360, 3840, 128, 1),
+    (16, 262144, 3840, 256, 1),
+    (32, 512, 3840, 256, 8),
+    (32, 2048, 3840, 256, 8),
+    (32, 3840, 4096, 128, 4),
+    (32, 3840, 8192, 128, 4),
+    (32, 3840, 15360, 128, 4),
+    (32, 4096, 3840, 128, 4),
+    (32, 8192, 3840, 128, 1),
+    (32, 15360, 3840, 128, 1),
+    (32, 262144, 3840, 256, 1),
 ];

@@ -7,6 +7,7 @@
 extern "C" {
 __device__ unsigned plow_gemv_transposed_abi = 1;
 __device__ unsigned plow_gemv_transposed_block = 128;
+__device__ unsigned plow_gemv_transposed_max_rows = 32;
 }
 
 #define PLOW_TRANSPOSE_ENTRY(RM, BK, STAGES) \
@@ -27,6 +28,8 @@ PLOW_TRANSPOSE_ENTRY(8, 128, 3)
 PLOW_TRANSPOSE_ENTRY(8, 256, 2)
 PLOW_TRANSPOSE_ENTRY(16, 128, 3)
 PLOW_TRANSPOSE_ENTRY(16, 256, 2)
+PLOW_TRANSPOSE_ENTRY(32, 128, 3)
+PLOW_TRANSPOSE_ENTRY(32, 256, 2)
 
 extern "C" __global__ void plow_gemv_bf16_reduce(
         __nv_bfloat16* out, const float* partial, int count, int splits) {

@@ -175,6 +175,9 @@ extern "C" __device__ __constant__ unsigned plow_pf_fp8_request_abi = 1;
 #if defined(PLOW_NV_GEMM_SPLITK) && PLOW_NV_GEMM_SPLITK
 #include "op_gemm_splitk.cuh"
 #endif
+#ifndef PLOW_NV_PREFILL
+#define PLOW_NV_PREFILL 0
+#endif
 #include "op_norm.cuh"
 #ifndef PLOW_NV_QWEN_GDN
 #define PLOW_NV_QWEN_GDN 0
@@ -431,9 +434,6 @@ __device__ __forceinline__ PlowStreamEnt ld_stream_ent(const PlowStreamEnt* p) {
  * FLASH_DECODE) compile OUT here; the prefill-only arms compile out of the decode object. Exported
  * symbols are suffixed `_pf` so both objects link into one harness. The default Qwen3 DECODE object
  * and the Gemma DECODE object are byte-identical to before (PLOW_NV_PREFILL=0). */
-#ifndef PLOW_NV_PREFILL
-#define PLOW_NV_PREFILL 0
-#endif
 /* PLOW_NV_PREFILL without PLOW_NV_GEMMA is the hd=128-only (Qwen) prefill
  * object: tiled GEMM + flash_prefill<128> + norms, no hd=256/512 arms. */
 
@@ -881,6 +881,9 @@ extern "C" __device__ unsigned PLOW_SYM(plow_arena_bytes) = PLOW_NV_ARENA_FLOATS
  * correctness ceiling: M > GV_MM_MAX walks multiple weight passes. The decode loader reads
  * it to report the packet/object pairing and refuses zero, which would make the walk stall. */
 extern "C" __device__ unsigned PLOW_SYM(plow_gemv_mm_cap) = GV_MM_MAX;
+#if !PLOW_NV_PREFILL && !PLOW_NV_T17_MIN_ROWS
+extern "C" __device__ unsigned PLOW_SYM(plow_decode_block_norm_abi) = 1;
+#endif
 /* T31: this object's launch block size (the segmented launcher reads it; absent/256 = legacy). */
 extern "C" __device__ unsigned PLOW_SYM(plow_block) = PLOW_NV_SEG_WS384 ? 384u : PLOW_NV_THREADS;
 #if PLOW_NV_SEG_M64N64 || PLOW_NV_SEG_M64N128

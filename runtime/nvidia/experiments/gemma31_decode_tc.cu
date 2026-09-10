@@ -91,7 +91,7 @@ int main(int argc, char** argv) {
     int only_shape = argc > 3 ? atoi(argv[3]) : -1;
     const bool gemma4 = argc > 4 && std::string(argv[4]) == "gemma4";
     if (argc > 4 && !gemma4) return 2;
-    if (reps < 3 || (only_m && only_m != 1 && only_m != 2 && only_m != 4 && only_m != 8 && only_m != 16)) return 2;
+    if (reps < 3 || (only_m && only_m != 1 && only_m != 2 && only_m != 4 && only_m != 8 && only_m != 16 && only_m != 32)) return 2;
     cudaDeviceProp prop; CU(cudaGetDeviceProperties(&prop, 0));
     printf("# %s, %d SMs, cold weights, %d repetitions; synthetic BF16 inputs\n", prop.name, prop.multiProcessorCount, reps);
     unsigned *flush, *sink; CU(cudaMalloc(&flush,192ull<<20)); CU(cudaMemset(flush,0x5a,192ull<<20));
@@ -113,7 +113,8 @@ int main(int argc, char** argv) {
             {3840,15360},{4096,3840},{8192,3840},{15360,3840},{262144,3840},{83,136}}
         : std::vector<std::pair<int,int>>{{8192,5376},{4096,5376},{16384,5376},{2048,5376},
             {21504,5376},{5376,8192},{5376,16384},{5376,21504},{83,136}};
-    const std::vector<int> batches = gemma4 ? std::vector<int>{1,2,4,8,16} : std::vector<int>{4,8,16};
+    const std::vector<int> batches = only_m == 32 ? std::vector<int>{32} :
+        (gemma4 ? std::vector<int>{1,2,4,8,16} : std::vector<int>{4,8,16});
     if (only_shape < -1 || only_shape >= int(shapes.size())) return 2;
     for (int shape = 0; shape < int(shapes.size()); ++shape) for (int M : batches) {
         if (only_shape >= 0 && shape != only_shape) continue;
@@ -148,15 +149,16 @@ int main(int argc, char** argv) {
             native_gemv<<<grid,256>>>(y,x,w,M,N,K);
         }});
         for(int s : {1,4,8}) {
-            variants.push_back({"existing_s"+std::to_string(s),[=] {
+            if (M <= 16) variants.push_back({"existing_s"+std::to_string(s),[=] {
                 CU(cudaMemset(partial,0,size_t(count)*4));
                 control_tc<<<528,128,3*(16+64)*(128+8)*2>>>(partial,x,w,M,N,K,s);
                 reduce_parts<<<(count+255)/256,256>>>(y,partial,count,1);
             }});
             if(M<=8) { add_variant<8,128,3>(variants,y,partial,x,w,M,N,K,s); add_variant<8,256,2>(variants,y,partial,x,w,M,N,K,s); }
-            else { add_variant<16,128,3>(variants,y,partial,x,w,M,N,K,s); add_variant<16,256,2>(variants,y,partial,x,w,M,N,K,s); }
+            else if (M<=16) { add_variant<16,128,3>(variants,y,partial,x,w,M,N,K,s); add_variant<16,256,2>(variants,y,partial,x,w,M,N,K,s); }
+            else { add_variant<32,128,3>(variants,y,partial,x,w,M,N,K,s); add_variant<32,256,2>(variants,y,partial,x,w,M,N,K,s); }
             if (module) for (int bk : {128,256}) {
-                int rm = M <= 8 ? 8 : 16, stages = bk == 128 ? 3 : 2;
+                int rm = M <= 8 ? 8 : M <= 16 ? 16 : 32, stages = bk == 128 ? 3 : 2;
                 std::string symbol = "plow_gemv_bf16_m" + std::to_string(rm) +
                     "_bk" + std::to_string(bk) + "_s" + std::to_string(stages);
                 CUfunction kernel, reduce;

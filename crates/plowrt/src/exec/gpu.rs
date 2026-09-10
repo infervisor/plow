@@ -3539,6 +3539,14 @@ impl GpuEngine {
         // Decode batch: the compiler emits the decode program with t == B
         // (PLOW_DECODE_BATCH). Cross-check against the [B]-sized in.kvlen.
         let batch = g.t as usize;
+        if batch > 16
+            && decode_roles.contains(&plow_asset::segment_roles::NATIVE_DECODE_TC)
+            && be.module_global_u32(&module, "plow_decode_block_norm_abi")? != Some(1)
+        {
+            return Err(RuntimeError::Rejected(
+                "native B32 decode requires rung-invariant block normalization".into(),
+            ));
+        }
         let kvlen_bytes = blob.tensors[t_kvlen].bytes;
         if (mixed_packet.is_none() && kvlen_bytes != (batch * 4) as u64)
             || kvlen_bytes < (batch * 4) as u64

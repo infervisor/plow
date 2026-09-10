@@ -4,6 +4,9 @@ Target: `google/gemma-4-12B-it`, H100 `sm_90a`. Compilation coverage is not
 performance qualification. Native bodies can remain in a shared interpreter;
 a separate object per opcode is not a requirement.
 
+Latest B32 candidate: see [B32 all-op cases](#b32-all-op-cases) below. Earlier
+sections describe retained historical packets, including their then-open gaps.
+
 The BF16 8K aggregate-budget packet has prefill rungs 128, 512, 1024, 2048,
 4096, 8192 and decode rungs 1, 2, 4, 8. Each prefill rung emits 766
 instructions; each decode rung emits 542. Every compile now inventories the
@@ -196,3 +199,36 @@ The contract remains opt-in. [Artifact hashes and checks](gemma4-12b-h100-data/r
 [serving checks](gemma4-12b-h100-data/request-limit-serve-verify.log) record the
 tested scope. No C128 screen or independent full-model logit comparison was
 run for this candidate.
+
+## B32 all-op cases
+
+The BF16 native-head candidate emits six prefill rungs
+128/512/1024/2048/4096/8192 and six decode rungs 1/2/4/8/16/32.
+The strict packet/build audit passes **12 programs, 8,904 instructions and
+2,736 exact cases**. The [case inventory](gemma4-12b-h100-data/b32-head-ladder-cases.json)
+retains all PCs, shape immediates, operand extents, launch blocks and roles.
+All **329 decode GEMVs per rung**, including the tied LM head, bind native
+role 8: 1,974 projection sites across the ladder. Runtime selection covers
+54 BF16 M/N/K cells; smaller rungs inherit the widest rung's BK/split choice
+to preserve summation order. Unknown shapes and incompatible objects fail.
+
+| Family | Prefill / decode instructions per rung | Current qualification |
+|---|---:|---|
+| Gemm / Gemv | 329 / 329 | Native SM90 prefill tiles; decode now includes B32 and LM-head tensor-core cells. All prefill cells still need launch-level performance qualification. |
+| FlashPrefill / FlashDecode + FlashMerge | 48 / 48 + 48 | HD256/512 bodies; full rung/history timing and counter matrix remains open. |
+| HeadNormRope | 144 / 144 | Fused dimension-specific bodies, masked-padding checks. Exact-case performance remains open. |
+| RmsNorm | 97 / 1 | Decode block reduction now invariant through B32; full-logit rung checks pass. Exact-case performance remains open. |
+| NormResidual / NormResidualNorm | 96 / 96 | Residual/normalization fusion retained. Exact-case performance remains open. |
+| Glu | 48 / 48 | Native pointwise body, exposed by projection unfusing. Exact-case performance remains open. |
+| Embed, SoftCap, Argmax, ArgmaxFin | 1 each / 1 each | Shared native bodies; exact-case performance remains open. |
+
+B32 requires a projection capability marker and a decode normalization ABI
+marker. An old main interpreter produced different full-model logits at a
+rung transition; the fixed decode reduction passes 170 full-logit snapshots
+at each of 128 and 16,384 prompt rows. Startup rejects the old main object.
+These compare native narrow/widest execution, not independent model quality.
+
+The [B32 evidence](gemma4-12b-h100-data/b32-native-screen.json) records tested
+objects and numerical/serving limits. Per-op specialized high performance
+for **every** emitted case is still incomplete. These H100 BF16 checks do not
+qualify FP8, AMD or CPU.

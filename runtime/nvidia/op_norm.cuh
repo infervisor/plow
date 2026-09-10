@@ -66,10 +66,13 @@ static __device__ __forceinline__ float gemma_postnorm_round(float x) {
 #endif
 #define RN_VEC (RN_REG / 8)
 
-/* T17 warp-per-row cut-in (see the note on d_rmsnorm). Above the widest decode batch the
- * emitter mints (`PLOW_DECODE_BATCH` 1..8, clamped to 16), below any prefill chunk — so the
- * new reduction order applies to prefill only and batched decode stays byte-identical. */
+/* Decode rungs must use one reduction order even when the batch reaches the
+ * prefill warp-per-row threshold. Standalone probes retain the row heuristic. */
+#if defined(PLOW_NV_PREFILL) && !PLOW_NV_PREFILL
+#define PLOW_NV_T17_MIN_ROWS 0u
+#else
 #define PLOW_NV_T17_MIN_ROWS 32u
+#endif
 
 /* RMSNorm over `feat`. One block per row, strided by nblk.
  *
@@ -87,12 +90,8 @@ static __device__ __forceinline__ float gemma_postnorm_round(float x) {
  * accumulation order changes (lane-strided vs thread-strided), so outputs can differ in the
  * last bf16 ulp from the legacy body — DECODE keeps the legacy path and stays byte-identical.
  *
- * That last guarantee is why the threshold is NOT PLOW_NV_WARPS: `rows` is packet i[0], which
- * decode sets to its batch width (`dbatch`), so a gate at 8 silently moved batched decode onto
- * the new reduction order at the shipped PLOW_DECODE_BATCH=8. The threshold sits above the
- * widest decode batch the emitter will mint (documented 1..8, clamped to 16) and far below any
- * prefill chunk (smallest bucket T is hundreds of rows), so it partitions the two phases
- * exactly.
+ * The decode object disables this row threshold: `rows` is also its batch width,
+ * so a threshold alone changes reduction order when a decode ladder reaches B32.
  *
  * T11 w8a8 QUANT FUSION (t3=xq e4m3, t4=ascale f32[rows]; both null on legacy packets):
  * the row is already normed in registers, so the per-row fp8 activation quant that would
@@ -104,7 +103,7 @@ static __device__ void d_rmsnorm(__nv_bfloat16* __restrict__ out, const __nv_bfl
                           float eps, unsigned out_row0, unsigned slice, unsigned nblk,
                           float* part, uint8_t* __restrict__ xq = nullptr,
                           float* __restrict__ ascale = nullptr) {
-    if (rows >= PLOW_NV_T17_MIN_ROWS && (feat & 7u) == 0) {
+    if (PLOW_NV_T17_MIN_ROWS && rows >= PLOW_NV_T17_MIN_ROWS && (feat & 7u) == 0) {
         /* T17 warp-per-row (see header comment). Row set of this block is unchanged:
          * {slice + k*nblk}; warp w takes k ≡ w (mod WARPS). */
         const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
@@ -371,7 +370,7 @@ static __device__ void d_norm_residual(__nv_bfloat16* __restrict__ out, const __
                                 const __nv_bfloat16* __restrict__ gamma, unsigned rows,
                                 unsigned feat, float eps, float scale, unsigned slice,
                                 unsigned nblk, float* part) {
-    if (rows >= PLOW_NV_T17_MIN_ROWS && (feat & 7u) == 0) {
+    if (PLOW_NV_T17_MIN_ROWS && rows >= PLOW_NV_T17_MIN_ROWS && (feat & 7u) == 0) {
         /* T17 warp-per-row — see d_rmsnorm. */
         const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
         const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
@@ -479,7 +478,7 @@ static __device__ void d_norm_residual_norm(__nv_bfloat16* __restrict__ out, __n
                                      unsigned feat, float eps, float scale, unsigned slice,
                                      unsigned nblk, float* part) {
 #if PLOW_NV_NRN_WPR
-    if (rows >= PLOW_NV_T17_MIN_ROWS && (feat & 7u) == 0) {
+    if (PLOW_NV_T17_MIN_ROWS && rows >= PLOW_NV_T17_MIN_ROWS && (feat & 7u) == 0) {
         const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
         const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
         for (unsigned k = warp;; k += PLOW_NV_WARPS) {

@@ -3,9 +3,13 @@ use packet::devbuild::{Builder, Model, SectionData, SECT_METADATA};
 use plow_asset::segment_roles::{CUBLASLT, INTERPRETER, SECTION};
 
 pub(crate) fn apply(model: &mut Model) -> Result<SectionData, String> {
+    apply_projections(model, false)
+}
+
+fn apply_projections(model: &mut Model, head: bool) -> Result<SectionData, String> {
     let mut programs = Vec::new();
     for index in packet::devbuild::decode_rung_lo(&model.prog_t)..model.progs.len() {
-        let roles = apply_program(model, index)?;
+        let roles = apply_program(model, index, head)?;
         programs.push(serde_json::json!({"index": index, "roles": roles}));
     }
     Ok(SectionData {
@@ -25,9 +29,9 @@ pub(crate) fn apply_native(
     let file = "gemv_sm90_transposed.cubin";
     if model.prog_t[packet::devbuild::decode_rung_lo(&model.prog_t)..]
         .iter()
-        .any(|&m| ![1, 2, 4, 8, 16].contains(&m))
+        .any(|&m| ![1, 2, 4, 8, 16, 32].contains(&m))
     {
-        return Err("native tensor-core decode requires measured B1/B2/B4/B8/B16 rungs".into());
+        return Err("native tensor-core decode requires measured B1/B2/B4/B8/B16/B32 rungs".into());
     }
     let path = output
         .parent()
@@ -40,7 +44,12 @@ pub(crate) fn apply_native(
     {
         return Err("native decode object requires transposed ABI1".into());
     }
-    let mut section = apply(model)?;
+    if model.prog_t.iter().any(|&m| m == 32)
+        && plow_asset::cubin::global_u32(&image, "plow_gemv_transposed_max_rows") != Some(32)
+    {
+        return Err("native decode object has no B32 capability".into());
+    }
+    let mut section = apply_projections(model, true)?;
     let mut roles = plow_asset::segment_roles::SegmentRoles::from_bytes(&section.data)?;
     for p in &mut roles.programs {
         for role in &mut p.roles {
@@ -64,7 +73,7 @@ pub(crate) fn apply_native(
     Ok(section)
 }
 
-fn apply_program(model: &mut Model, index: usize) -> Result<Vec<u8>, String> {
+fn apply_program(model: &mut Model, index: usize, head: bool) -> Result<Vec<u8>, String> {
     let dependencies = plow_asset::program::with_model(model, |packet| {
         plow_asset::splitk::dependencies(&packet.programs[index])
     })?;
@@ -85,8 +94,12 @@ fn apply_program(model: &mut Model, index: usize) -> Result<Vec<u8>, String> {
     builder.adopt_tensors(model.tensors.clone());
     let mut projections = Vec::new();
     for (pc, inst) in old.insts.iter().enumerate() {
-        let selected = inst.op == DevOp::Gemv as u16
-            && model.tensors[inst.t[2] as usize].name.contains(".layers.");
+        let selected = inst.op == DevOp::Gemv as u16 && {
+            let name = &model.tensors[inst.t[2] as usize].name;
+            name.contains(".layers.")
+                || (head
+                    && (name.ends_with("lm_head.weight") || name.ends_with("embed_tokens.weight")))
+        };
         if selected
             && (!(1..=32).contains(&inst.i[0])
                 || inst.i[0] != model.prog_t[index]
@@ -246,18 +259,38 @@ mod tests {
         let metadata = plow_asset::segment_roles::SegmentRoles::from_bytes(&section.data).unwrap();
         assert_eq!(
             metadata.programs[0].roles,
-            [0, plow_asset::segment_roles::NATIVE_DECODE_TC, 0]
+            [
+                0,
+                plow_asset::segment_roles::NATIVE_DECODE_TC,
+                plow_asset::segment_roles::NATIVE_DECODE_TC
+            ]
         );
         assert_eq!(
             metadata.objects[&plow_asset::segment_roles::NATIVE_DECODE_TC].sha256,
             Some(plow_asset::decode_objects::image_sha256(&image))
         );
+        let mut wide = model_rows(&[128, 1, 16, 32]);
+        assert!(apply_native(&mut wide, &directory.join("model.pkt"))
+            .err()
+            .expect("missing B32 capability")
+            .contains("B32 capability"));
+        let wide_image = plow_asset::cubin::synthetic_elf(
+            "plow_gemv_bf16_m32_bk128_s3",
+            &[
+                ("plow_gemv_transposed_abi", 1),
+                ("plow_gemv_transposed_block", 128),
+                ("plow_gemv_transposed_max_rows", 32),
+            ],
+            90,
+        );
+        std::fs::write(directory.join("gemv_sm90_transposed.cubin"), &wide_image).unwrap();
+        assert!(apply_native(&mut wide, &directory.join("model.pkt")).is_ok());
         std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
     fn native_decode_rejects_unmeasured_batch_before_object_loading() {
-        let mut m = model_rows(&[128, 32]);
+        let mut m = model_rows(&[128, 64]);
         let error = apply_native(&mut m, std::path::Path::new("missing/model.pkt"))
             .err()
             .expect("unmeasured batch");

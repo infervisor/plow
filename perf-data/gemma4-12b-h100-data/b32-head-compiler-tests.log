@@ -1,0 +1,52 @@
+   Compiling devgen v0.1.0 (/home/lava/plow/crates/devgen)
+warning: unused import: `super::*`
+   --> crates/devgen/src/checkpoint.rs:438:9
+    |
+438 |     use super::*;
+    |         ^^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `RopeScale`
+ --> crates/devgen/src/mla.rs:8:31
+  |
+8 | use packet::rope::{GenTensor, RopeScale};
+  |                               ^^^^^^^^^
+
+warning: function `amd_analytical_inventory` is never used
+    --> crates/devgen/src/lib.rs:1609:4
+     |
+1609 | fn amd_analytical_inventory(isa: hwspec::IsaLevel) -> kernelcaps::Inventory {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `silu` is never used
+ --> crates/devgen/src/mla/nemotron_tests.rs:5:4
+  |
+5 | fn silu(x: f32) -> f32 {
+  |    ^^^^
+
+warning: variant `Ignored` is never constructed
+   --> crates/devgen/src/lib_tests/gfx950_coverage.rs:422:5
+    |
+415 | enum Knob {
+    |      ---- variant in this enum
+...
+422 |     Ignored(&'static str),
+    |     ^^^^^^^
+    |
+    = note: `Knob` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: `devgen` (lib test) generated 5 warnings (run `cargo fix --lib -p devgen --tests` to apply 2 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.59s
+     Running unittests src/lib.rs (target/debug/deps/devgen-ce02750766e53432)
+
+running 4 tests
+test dense_cublaslt::tests::native_decode_rejects_unmeasured_batch_before_object_loading ... ok
+test dense_cublaslt::tests::isolates_body_projection_without_changing_math_or_dependencies ... ok
+test dense_cublaslt::tests::emits_each_decode_width_and_rejects_nonordinary_operands ... ok
+test dense_cublaslt::tests::native_object_is_hash_bound_and_does_not_declare_library_roles ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 413 filtered out; finished in 0.00s
+

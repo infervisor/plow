@@ -623,3 +623,63 @@ GEMM and attention dominate the remaining prefill work; further optimization
 should prioritize them and batching capacity. The vLLM objective remains unmet.
 [Control profile](gemma4-12b-h100-data/lightonly-profile-control.log),
 [stripped profile](gemma4-12b-h100-data/lightonly-profile-slices.log).
+
+## B32 native projections and LM head
+
+The opt-in native route now includes all 329 BF16 decode projections at
+B1/2/4/8/16/32, including the tied vocabulary head. It keeps residual/norm
+fusion and uses the existing ordered segment graph route. B32 adds native
+RM32/BK128/stages3 and RM32/BK256/stages2 bodies with 66/64 registers and no
+stack or spills. These use `cp.async` and `mma.sync`, not TMA/WGMMA. The main
+decode interpreter still uses 198 registers with no stack/spills; projection
+objects have independent resource footprints.
+
+The B32 padded-layout screen passes 150 numerical cells, including 60 actual
+driver-entry cases over eight layer shapes, the LM head and an N83/K136 tail.
+Checks include 128 sampled FP64 dots per case, full-output finiteness and
+repeat determinism. The padded tail passes Compute Sanitizer with zero errors.
+Weighted cold-layer time at the selected cells is 11.550 ms native vs
+9.175 ms cuBLASLt and 75.124 ms vector. B32 LM-head time is 739 us native vs
+664 us cuBLASLt and 5,331 us vector. These are standalone screens, not actual
+graph timings or held-out tuning measurements. The experimental XOR layout
+reaches 9.757 ms at its best layer cells but is not integrated or tail-memcheck
+qualified. [Padded screen](gemma4-12b-h100-data/b32-driver-screen.csv),
+[XOR screen](gemma4-12b-h100-data/b32-xor-screen.csv),
+[tail memcheck](gemma4-12b-h100-data/b32-tail-memcheck.log).
+
+B32 exposed a normalization correctness issue: the row-count heuristic
+switched decode to the prefill reduction order. Keeping block reduction in
+the decode object fixes the observed full-logit rung mismatch. The runtime
+requires the new marker and rejects old main objects for native B32. Both
+layer-only and native-head variants pass 170 full-logit snapshots at each of
+128 and 16,384 prompt rows, including resets and sparse high slots. These
+compare narrow execution against the same native widest-rung implementation;
+they do not establish vector-head or independent HF/vLLM equivalence.
+
+Sequential two-repeat serving screens use physical B32, queue128,
+context20480, aggregate prefill8192/request1024, cache disabled and 128 output
+tokens, with one warmup per cell. Both variants pass serving verification.
+All 264 measured requests complete 128 tokens with cache0.
+
+| Input / concurrency | Vector head tok/s | Native head tok/s |
+|---|---:|---:|
+| 1K / C1 | 75.825 | 76.107 |
+| 1K / C32 | 693.261 | 779.734 |
+| 16K / C1 | 45.233 | 45.180 |
+| 16K / C32 | 100.648 | 103.575 |
+
+At 1K/C32 median TPOT falls from 32.506 to 27.558 ms. Paired output text
+matches for 129/132 requests; three 16K/C32 hyphen continuations differ.
+This screen does not isolate their cause. The configuration remains opt-in;
+long-prefill throughput and complete all-op performance qualification remain
+open. [Artifact hashes, checks and results](gemma4-12b-h100-data/b32-native-screen.json).
+
+The native-head C128 follow-up completes 256/256 requests with 128 tokens and
+cache0: **763.294 tokens/s at 1K and 101.940 at 16K**. Serving verification
+passes before this single-repeat screen; no additional per-cell warmup is
+used. The retained B16 screens were 569.525/101.845 tokens/s. This improves
+short-context throughput, with no meaningful long-context gain established.
+Historical vLLM BF16 C128 results are 2,131.578/196.035 tokens/s; the objective
+remains unmet. These are historical sequential comparisons, not a fresh
+interleaved vLLM A/B. [C128 raw results](gemma4-12b-h100-data/b32-screen-head-c128.json),
+[serving checks](gemma4-12b-h100-data/b32-screen-head-c128-verify.log).

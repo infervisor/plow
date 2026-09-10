@@ -7,14 +7,15 @@ The Gemma 4 compiler opt-in is `--emit-decode-native-tc` (or
 `PLOW_EMIT_DECODE_NATIVE_TC=true`). Place the object at
 `OUTPUT_DIRECTORY/gemv_sm90_transposed.cubin` before compiling. The packet
 pins its SHA256 and declares native projection role 8. This cannot be combined
-with `--emit-decode-cublaslt` and currently supports B1/B2/B4/B8/B16.
+with `--emit-decode-cublaslt` and supports B1/B2/B4/B8/B16/B32.
 
 The CUDA runtime shares the existing ordered projection-segment graph route,
 checks the object hash/ABI and tensor extents/alignment/aliasing, and selects
 from the measured Gemma 12B shapes. Unknown shapes are rejected. Plans share
 one scratch allocation across serialized rung graphs. The native route does
 not load cuBLASLt. Projection fusion is disabled to expose individual GEMVs;
-residual/normalization fusion is retained. Serving validation is required
+residual/normalization fusion is retained. Native routing includes the BF16
+LM head, using BK256 and split 1 across the decode ladder. Serving validation is required
 before treating that tradeoff as a win.
 
 Build from the repository root, under `nix develop`:
@@ -31,13 +32,20 @@ uses padded rows. Select by measured shape; the XOR layout is not uniformly
 faster or free of measured shared-load bank conflicts.
 
 ABI marker `plow_gemv_transposed_abi=1`, projection block size marker 128.
-Entry names are `plow_gemv_bf16_m{8,16}_bk{128,256}_s{3,2}`: BK128 has three
+Entry names are `plow_gemv_bf16_m{8,16,32}_bk{128,256}_s{3,2}`: BK128 has three
 stages; BK256 has two. Parameters:
 
 ```
 (bf16* output, float* partials, const bf16* input, const bf16* weight,
  int M, int N, int K, int splits)
 ```
+
+B32 requires `plow_gemv_transposed_max_rows=32` in this object and
+`plow_decode_block_norm_abi=1` in the main decode interpreter. Rebuild the
+main interpreter as well as the projection object. Decode normalization must
+keep its block reduction across all rungs; switching to the prefill warp
+reduction at B32 changes full-model logits during rung transitions. Older
+projection objects remain usable for B1–B16.
 
 Contract:
 

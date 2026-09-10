@@ -11,7 +11,7 @@ template<int RM, int BK, int STAGES, bool SPLIT>
 __device__ __forceinline__ void d_gemv_transposed_tc(
         __nv_bfloat16* out, float* partial, const __nv_bfloat16* x, const __nv_bfloat16* w,
         int M, int N, int K, int splits, __nv_bfloat16* sm) {
-    static_assert(RM == 8 || RM == 16);
+    static_assert(RM == 8 || RM == 16 || RM == 32);
     static_assert((BK == 128 && STAGES == 3) || (BK == 256 && STAGES == 2));
     constexpr int BN = 64;
     constexpr int XS = PLOW_GEMV_TRANSPOSE_SWIZZLE ? BK : BK + 8, WS = XS;
