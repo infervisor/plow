@@ -493,8 +493,14 @@ pub(crate) fn derive_mla_nsplit(insts: &[DevInst64]) -> Option<(Vec<u32>, u32)> 
     (n_flash > 0 && n_flash == n_merge).then_some((sites, baked?))
 }
 
+// The KV contract has no caller until the head handoff lands. Keep it here
+// rather than deferring it: the transferable-set rule belongs beside the other
+// KV-row rules this module exists to hold in one place, and splitting it across
+// commits is how the two engines' notions of "which tensors carry a sequence"
+// drifted apart before.
 /// One transferable KV cache in a loaded packet: where the engine's tensor
 /// table holds it, and the geometry the twin must match.
+#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct KvSlotTensor {
     /// Index into the packet's tensor table.
@@ -515,6 +521,7 @@ pub(crate) struct KvSlotTensor {
 /// carried recurrent state when the blob's `PLOW_KDA_F_SEQ_ROWS` carrier says
 /// it is per-slot. A row range does not reconstruct a recurrence, so the head
 /// path excludes it here and refuses the model at admission instead.
+#[allow(dead_code)]
 pub(crate) fn kv_slot_tensors(
     blob: &crate::asset::devblob::DevBlob,
     batch: u32,
@@ -543,6 +550,7 @@ pub(crate) fn kv_slot_tensors(
 
 /// The digest a device packet and its CPU twin must agree on before a head's KV
 /// rows may be copied between them.
+#[allow(dead_code)]
 pub(crate) fn kv_contract_digest(tensors: &[KvSlotTensor]) -> String {
     let set: Vec<_> = tensors
         .iter()

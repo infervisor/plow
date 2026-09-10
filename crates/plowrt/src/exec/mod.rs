@@ -16,6 +16,11 @@ mod amd_packed;
 /// all-ranks, with a host barrier — see the module note for why the two differ.
 #[cfg(feature = "hsa")]
 pub mod amd_tp;
+/// Core reservation and thread priority for the CPU prefill-head pool. Gated on
+/// `cpu` because a head runs on `exec::cpu`, so a build without it has no head
+/// to place — and that is also where `libc` enters the dependency set.
+#[cfg(feature = "cpu")]
+pub mod affinity;
 pub mod counters;
 /// CPU engine: device-ISA interpreter on persistent pinned worker threads,
 /// C kernels via `cpu::ffi`. See `plans/cpu-backend.md`.

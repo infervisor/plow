@@ -148,6 +148,42 @@ pub struct RuntimeConfig {
     // ──────────────────────────────────────────────────────────────────────────
     #[command(flatten)]
     pub cpu: CpuRuntimeConfig,
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Heterogeneous prefill (feature = "cpu")
+    // ──────────────────────────────────────────────────────────────────────────
+    #[command(flatten)]
+    pub het: HetRuntimeConfig,
+}
+
+/// Core reservation for the CPU prefill-head pool.
+///
+/// OFF unless one of these is set, and off means the process places no thread it
+/// did not place before. The head pool spends CPU the serving path is not using,
+/// so the reservation has to be stated rather than guessed: an under-reservation
+/// costs GPU tick latency, which is the one thing this must not do.
+#[derive(Args, Debug, Clone)]
+#[command(next_help_heading = "Heterogeneous prefill")]
+pub struct HetRuntimeConfig {
+    /// Logical CPUs the prefill-head pool may use (`4-7,12`). The serving path
+    /// takes the rest. Overrides `--het-reserve-cores`.
+    #[arg(long = "het-cores", env = "PLOW_HET_CORES", global = true)]
+    pub cores: Option<String>,
+
+    /// Physical cores reserved for the serving path — engine threads, H2D
+    /// staging, interrupt/completion work — with the head pool taking what is
+    /// left. 0 leaves heterogeneous prefill off entirely.
+    ///
+    /// WHOLE cores including their SMT siblings: a sibling running a head shares
+    /// the core's execution resources with the engine thread, so reserving one
+    /// thread of a core and handing the other to the head pool reserves nothing.
+    #[arg(
+        long = "het-reserve-cores",
+        env = "PLOW_HET_RESERVE_CORES",
+        default_value_t = 0,
+        global = true
+    )]
+    pub reserve_cores: u32,
 }
 
 /// Kernel-tier ceiling for the CPU engine (`--cpu-isa`).
