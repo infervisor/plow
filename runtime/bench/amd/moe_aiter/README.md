@@ -611,3 +611,50 @@ decode kernel cost; these aggregate latencies do not attribute the interruptions
 to a particular cause. The frozen runtime predates the subsequent exec/Gemma
 consolidation commit. Retrieval screening does not establish broad quality
 equivalence.
+
+### Current resident decode and prefill diagnostics
+
+[mi300x-resident-trace.json](mi300x-resident-trace.json) populates all 20 KV
+slots with 65,535 copies of token ID 1, then runs six decode steps with the first
+discarded. The control averages 108.464 ms per step; the traced run averages
+103.153 ms. All eight ranks agree within each run, but the generated chains
+differ between runs. This one ordered pair does not reliably estimate trace
+overhead or establish general output equivalence.
+
+All eight final-step traces pass exact instruction and slice coverage checks,
+with stale prefill records excluded using the latest Embed completion. The
+rank-0 trace spans 102.134 ms after Embed. Native GEMM (633 instructions) and
+MoE (75 instructions) do not write interpreter trace records.
+
+| Interpreter operation | Sum of completion tails per rank (ms), min–max |
+| --- | ---: |
+| Remaining GEMV | 11.416–12.714 |
+| FP8 MLA decode | 13.560–13.670 |
+| Cross-GPU reduction | 6.139–19.987 |
+| AddNorm | 8.258–8.333 |
+
+Tails exclude work before the last workgroup becomes ready; intervals overlap,
+so these sums are not wall-time fractions. The rank-dependent collective waits
+require care. AddNorm uses one workgroup for all 20 rows, despite the body
+supporting independent row workgroups. This motivates a scheduling experiment,
+not a claimed speedup.
+
+[mi300x-resident-prefill.json](mi300x-resident-prefill.json) compares one cold
+70k-token prefill through the production mux with and without per-segment
+instrumentation. Prefix caching is disabled in these two diagnostic processes.
+Normal TTFT is 8.084 s; instrumentation raises it to 9.080 s by adding all-rank
+drains. All 7,029 segment records cover the nine chunks completely.
+
+| Segment family | Instrumented submission-to-completion sum (s) |
+| --- | ---: |
+| General interpreter | 3.859 |
+| Native sparse MLA | 1.679 |
+| Native MoE | 1.597 |
+| Native GEMM | 0.719 |
+| TP indexer | 0.489 |
+| Flash interpreter | 0.270 |
+
+These sums include host submission and synchronization under altered execution
+boundaries. They guide further kernel investigation; they are not a normal
+serving wall-time attribution. The prompt generator also differs from vLLM's
+random benchmark.
