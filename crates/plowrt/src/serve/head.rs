@@ -20,10 +20,11 @@
 //! running still saturates the memory controllers — which is why the pool's
 //! width is a budget and the contention guard watches service time.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::exec::cpu::engine::{next_chunk, CpuEngine, CpuEngineOpts};
+use crate::exec::cpu::ffi::Isa;
 use crate::exec::cpu::topology::{Core, Topology};
 use crate::exec::kv_handoff::{self, CopySpan};
 use crate::exec::kvrow::{self, KvSlotTensor};
@@ -44,6 +45,58 @@ pub enum HeadEnd {
 pub struct Head {
     pub rows: u32,
     pub end: HeadEnd,
+}
+
+/// Where a head's twin packet comes from, and whether this host can run one.
+///
+/// A twin is another VARIANT of the same model — same context, a target the CPU
+/// interpreter accepts — so selecting one is variant selection and belongs to
+/// whatever pulled the bundle. This resolves the packet inside the bundle that
+/// selection materialised: `--het-twin` names it outright, otherwise the
+/// conventional `cpu-twin/model.pkt` beside the device packet.
+///
+/// `None` is the ordinary answer on a bundle that carries no twin, and it means
+/// heads are off for that model. Not an error: a device packet without a twin
+/// is a complete, servable bundle.
+pub fn resolve_twin(assets: &Path, configured: Option<&str>) -> Option<PathBuf> {
+    if let Some(p) = configured {
+        let p = PathBuf::from(p);
+        // A directory names a bundle; a file names the packet in one.
+        let pkt = if p.is_dir() { p.join("model.pkt") } else { p };
+        return pkt.is_file().then_some(pkt);
+    }
+    let conventional = assets.join("cpu-twin").join("model.pkt");
+    conventional.is_file().then_some(conventional)
+}
+
+/// Whether this host can run prefill heads at all, independent of load.
+///
+/// Two gates, and both are about not making serving worse:
+///
+/// * **A vector tier.** A scalar CPU prefill of a serving-sized model is slow
+///   enough that no queue hides it, so the head would be abandoned every time
+///   and the pool would only ever cost cores. AVX-512 or AMX is the floor.
+/// * **A reservation.** With no cores reserved a head runs on the serving
+///   path's, which is the one thing this must not do.
+///
+/// Returns the reason rather than a bool: a host that cannot run heads should
+/// say why once at load, not silently serve as though the feature were off.
+pub fn host_supports_heads(isa: Isa, reserved_cores: usize) -> std::result::Result<(), String> {
+    if matches!(isa, Isa::Scalar) {
+        return Err(
+            "CPU prefill heads need the AVX-512 or AMX tier; this host probed scalar, where a \
+             head is slower than any queue it could hide in"
+                .into(),
+        );
+    }
+    if reserved_cores == 0 {
+        return Err(
+            "no cores reserved for prefill heads; set --het-reserve-cores or --het-cores, or a \
+             head would run on the serving path's cores"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 pub struct HeadPool {
@@ -246,6 +299,71 @@ mod tests {
             cores: (0..4).map(|i| core(i, i / 2, &[i, i + 4])).collect(),
             nodes: vec![0, 1],
         }
+    }
+
+    #[test]
+    fn a_bundle_without_a_twin_simply_has_no_heads() {
+        // Not an error: a device packet with no twin is a complete bundle.
+        let dir = std::env::temp_dir().join("plow_head_none");
+        let _ = std::fs::create_dir_all(&dir);
+        assert_eq!(resolve_twin(&dir, None), None);
+    }
+
+    #[test]
+    fn the_conventional_location_is_beside_the_device_packet() {
+        let dir = std::env::temp_dir().join("plow_head_conv");
+        let twin = dir.join("cpu-twin");
+        std::fs::create_dir_all(&twin).unwrap();
+        let pkt = twin.join("model.pkt");
+        std::fs::write(&pkt, b"x").unwrap();
+        assert_eq!(resolve_twin(&dir, None), Some(pkt));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_configured_directory_names_a_bundle_and_a_file_names_a_packet() {
+        let dir = std::env::temp_dir().join("plow_head_cfg");
+        std::fs::create_dir_all(&dir).unwrap();
+        let pkt = dir.join("model.pkt");
+        std::fs::write(&pkt, b"x").unwrap();
+        assert_eq!(
+            resolve_twin(Path::new("/nonexistent"), Some(dir.to_str().unwrap())),
+            Some(pkt.clone())
+        );
+        assert_eq!(
+            resolve_twin(Path::new("/nonexistent"), Some(pkt.to_str().unwrap())),
+            Some(pkt)
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_configured_twin_that_is_not_there_resolves_to_nothing() {
+        // Reported as "no heads" by the caller rather than papered over with
+        // the conventional path, which would serve a twin the operator did not
+        // ask for.
+        assert_eq!(
+            resolve_twin(Path::new("/nonexistent"), Some("/nonexistent/model.pkt")),
+            None
+        );
+    }
+
+    #[test]
+    fn a_scalar_host_cannot_run_heads() {
+        let err = host_supports_heads(Isa::Scalar, 8).unwrap_err();
+        assert!(err.contains("AVX-512 or AMX"), "{err}");
+    }
+
+    #[test]
+    fn no_reservation_means_no_heads() {
+        let err = host_supports_heads(Isa::Avx512, 0).unwrap_err();
+        assert!(err.contains("no cores reserved"), "{err}");
+    }
+
+    #[test]
+    fn a_vector_host_with_a_reservation_can() {
+        assert!(host_supports_heads(Isa::Avx512, 4).is_ok());
+        assert!(host_supports_heads(Isa::Amx, 4).is_ok());
     }
 
     #[test]

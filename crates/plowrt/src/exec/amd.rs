@@ -13832,6 +13832,58 @@ impl AmdEngine {
     /// the base before returning. A stale rebase would put ALL sequences'
     /// decode KV inside one slot's block — hence the invariant is enforced in
     /// [`AmdEngine::decode_step_batched`] rather than left to callers.
+    /// Write a CPU prefill head's KV rows into this engine's caches.
+    ///
+    /// `plan` addresses the device side by tensor handle and byte offset;
+    /// `src` yields the matching bytes out of the head engine's host tensors.
+    /// The two agree because the packets' KV contracts were checked equal at
+    /// load, and that check is exactly what makes this a byte copy rather than
+    /// a translation.
+    ///
+    /// One upload per span, not a pinned-staging batch. The head engine's
+    /// tensors are ordinary host allocations rather than agent-visible memory,
+    /// so `memcpy_htod_pinned_batch` would need them staged into a pinned slab
+    /// first. That is worth doing once the transfer is measured and not before:
+    /// this runs while the request is still waiting for a slot, off the
+    /// per-token path.
+    pub fn write_kv_rows<'a>(
+        &self,
+        plan: &[crate::exec::kv_handoff::CopySpan],
+        src: impl Fn(&crate::exec::kv_handoff::CopySpan) -> Result<&'a [u8]>,
+    ) -> Result<u64> {
+        let mut moved = 0u64;
+        for span in plan {
+            let dst = self.devp.get(span.handle).ok_or_else(|| {
+                RuntimeError::Device(format!(
+                    "head handoff names tensor {}, past this packet's {}",
+                    span.handle,
+                    self.devp.len()
+                ))
+            })?;
+            let end = span.dst_off.checked_add(span.bytes).ok_or_else(|| {
+                RuntimeError::Device("head handoff span overflows".into())
+            })?;
+            if end > dst.len {
+                return Err(RuntimeError::Device(format!(
+                    "head handoff writes {}+{} of `{}`, which holds {} bytes",
+                    span.dst_off, span.bytes, self.tensor_names[span.handle], dst.len
+                )));
+            }
+            let bytes = src(span)?;
+            if bytes.len() as u64 != span.bytes {
+                return Err(RuntimeError::Device(format!(
+                    "head handoff source for `{}` is {} bytes, plan says {}",
+                    self.tensor_names[span.handle],
+                    bytes.len(),
+                    span.bytes
+                )));
+            }
+            EngineDevice::upload(&*self.be, dst, span.dst_off, bytes)?;
+            moved += span.bytes;
+        }
+        Ok(moved)
+    }
+
     pub fn kv_rebase(&mut self, slot: usize) -> Result<()> {
         if self.kv_slot == slot || self.kv_slot_stride.is_empty() {
             return Ok(());
