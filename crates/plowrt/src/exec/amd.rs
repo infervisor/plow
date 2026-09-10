@@ -204,6 +204,7 @@ enum DecodeSegmentKind {
     MlaAttention,
     KdaDecodeFused(usize),
     MoeAiter,
+    GemmLt,
     GroupedMoeMxfp4 { glu: usize, down: usize },
 }
 
@@ -244,9 +245,12 @@ fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
                 }
             } else if inst.op == DevOp::KdaDecodeFused as u16
                 || inst.op == DevOp::MoeAiterFp8Pf as u16
+                || inst.op == DevOp::GemmLtPf as u16
             {
                 let name = if inst.op == DevOp::MoeAiterFp8Pf as u16 {
                     "MoeAiterFp8Pf"
+                } else if inst.op == DevOp::GemmLtPf as u16 {
+                    "GemmLtPf"
                 } else {
                     "KdaDecodeFused"
                 };
@@ -296,6 +300,8 @@ fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
         if let Some(inst) = fused_inst {
             let name = if prog.insts[inst].op == DevOp::MoeAiterFp8Pf as u16 {
                 "MoeAiterFp8Pf"
+            } else if prog.insts[inst].op == DevOp::GemmLtPf as u16 {
+                "GemmLtPf"
             } else {
                 "KdaDecodeFused"
             };
@@ -311,6 +317,8 @@ fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
             }
             kinds[seg] = if prog.insts[inst].op == DevOp::MoeAiterFp8Pf as u16 {
                 DecodeSegmentKind::MoeAiter
+            } else if prog.insts[inst].op == DevOp::GemmLtPf as u16 {
+                DecodeSegmentKind::GemmLt
             } else {
                 DecodeSegmentKind::KdaDecodeFused(inst)
             };
@@ -2654,6 +2662,7 @@ enum DecodeSegmentRoute {
     MlaAttention,
     KdaDecodeFused(KdaDecodeFusedArgs),
     MoeAiter(amd_moe_aiter::Route),
+    GemmLt(amd_gemm_lt::Route),
     GroupedMoeMxfp4 {
         glu: GroupedMoeGluArgs,
         down: GroupedMoeDownArgs,
@@ -2675,6 +2684,7 @@ fn decode_segment_routes(
 ) -> Result<Vec<DecodeSegmentRoute>> {
     let kinds = decode_segment_kinds(prog)?;
     let aiter = amd_moe_aiter::routes(prog, tensors, kinds.len())?;
+    let gemm_lt = amd_gemm_lt::routes(prog, tensors, kinds.len())?;
     let mut routes = Vec::with_capacity(kinds.len());
     for (seg, kind) in kinds.into_iter().enumerate() {
         let inst_ix = match kind {
@@ -2689,6 +2699,12 @@ fn decode_segment_routes(
             DecodeSegmentKind::MoeAiter => {
                 routes.push(DecodeSegmentRoute::MoeAiter(aiter[seg].ok_or_else(
                     || RuntimeError::Device("native MoE segment has no validated route".into()),
+                )?));
+                continue;
+            }
+            DecodeSegmentKind::GemmLt => {
+                routes.push(DecodeSegmentRoute::GemmLt(gemm_lt[seg].ok_or_else(
+                    || RuntimeError::Device("native GEMM segment has no validated route".into()),
                 )?));
                 continue;
             }
@@ -6063,10 +6079,15 @@ impl AmdEngine {
         if use_gemm_lt
             && (arch != "gfx942"
                 || tp.is_none_or(|b| b.n_gpu != 8)
-                || blob.progs[dec_ix..].iter().any(has_gemm_lt))
+                || blob.progs.iter().enumerate().any(|(ix, p)| {
+                    p.insts.iter().any(|d| {
+                        d.op == DevOp::GemmLtPf as u16 && d.i[3] != u32::from(ix >= dec_ix)
+                    })
+                }))
         {
             return Err(RuntimeError::Device(
-                "hipBLASLt projection requires gfx942 TP8 prefill".into(),
+                "hipBLASLt projection requires gfx942 TP8 and a matching prefill/decode mode"
+                    .into(),
             ));
         }
         let has_index_tp = |p: &DevProg| p.insts.iter().any(|d| d.op == DevOp::IndexTpPf as u16);
@@ -10684,6 +10705,12 @@ impl AmdEngine {
                 })?;
                 kernel.enqueue(&self.be, route, &self.tens_table)?;
                 self.seg_launches += route.launches() - 1;
+            }
+            DecodeSegmentRoute::GemmLt(route) => {
+                let kernel = self.gemm_lt.as_ref().ok_or_else(|| {
+                    RuntimeError::Device("native decode GEMM has no loaded kernels".into())
+                })?;
+                kernel.enqueue(&self.be, route, &self.tens_table)?;
             }
             DecodeSegmentRoute::KdaDecodeFused(args) => {
                 let kernel = self.k_kda_decode_fused.ok_or_else(|| {

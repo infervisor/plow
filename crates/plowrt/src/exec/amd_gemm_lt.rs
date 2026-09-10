@@ -19,7 +19,7 @@ pub(super) struct Route {
 
 impl Route {
     pub fn rebase(&mut self, rows: u32) -> Result<()> {
-        if rows == 0 || rows > self.inst.i[0] {
+        if rows == 0 || rows > self.inst.i[0] || (self.inst.i[3] == 1 && rows != self.inst.i[0]) {
             return Err(RuntimeError::Device(
                 "hipBLASLt chunk exceeds row capacity".into(),
             ));
@@ -29,6 +29,9 @@ impl Route {
     }
 
     fn kernel_choice(self) -> (usize, u32) {
+        if self.inst.i[3] == 1 {
+            return decode_choice(self.rows, self.inst.i[1], self.inst.i[2]).unwrap();
+        }
         let tail = self.rows <= 4464;
         let kv = self.inst.i[1] == 512;
         let index = usize::from(kv) * 2 + usize::from(tail);
@@ -41,6 +44,20 @@ impl Route {
         };
         (index, (8 << 16) | mapping)
     }
+}
+
+fn decode_choice(rows: u32, n: u32, k: u32) -> Option<(usize, u32)> {
+    Some(match (rows, n, k) {
+        (16, 512, 6144) => (5, 524289),
+        (16, 2048, 6144) => (6, 524289),
+        (16, 4096, 2048) => (8, 524289),
+        (16, 6144, 2048) => (11, 524289),
+        (20, 512, 6144) => (5, 524294),
+        (20, 2048, 6144) => (5, 524296),
+        (20, 4096, 2048) => (9, 524294),
+        (20, 6144, 2048) => (10, 524289),
+        _ => return None,
+    })
 }
 
 pub(super) fn routes(
@@ -90,20 +107,25 @@ pub(super) fn routes(
             continue;
         }
         let err = |s: &str| RuntimeError::Device(format!("hipBLASLt instruction {ix}: {s}"));
+        let shape_ok = match inst.i[3] {
+            0 => {
+                (2048..=8192).contains(&prog.t)
+                    && matches!(
+                        (inst.i[1], inst.i[2]),
+                        (2048, 6144) | (512, 6144) | (4096, 2048)
+                    )
+            }
+            1 => decode_choice(prog.t, inst.i[1], inst.i[2]).is_some(),
+            _ => false,
+        };
         if prog.packed_prefill_only
-            || !(2048..=8192).contains(&prog.t)
+            || !shape_ok
             || inst.i[0] != prog.t
-            || !matches!(
-                (inst.i[1], inst.i[2]),
-                (2048, 6144) | (512, 6144) | (4096, 2048)
-            )
-            || inst.i[3..] != [0; 5]
+            || inst.i[4..] != [0; 4]
             || inst.fj != [0; 3]
             || inst.t[3..] != [TENSOR_NONE16; 5]
         {
-            return Err(err(
-                "requires an unpacked qualified BF16 prefill projection",
-            ));
+            return Err(err("requires an unpacked qualified BF16 projection"));
         }
         if inst.t[0] == inst.t[1] || inst.t[0] == inst.t[2] || inst.t[1] == inst.t[2] {
             return Err(err("operands alias"));
@@ -172,17 +194,22 @@ fn arguments(route: Route, tensors: [u64; 3], spec: &KernelSpec, info1: u32) -> 
 }
 
 pub(super) struct GemmLt {
-    kernels: [HsaKernel; 4],
-    specs: [KernelSpec; 4],
+    kernels: Vec<HsaKernel>,
+    specs: Vec<KernelSpec>,
 }
 
 impl GemmLt {
     pub fn load(be: &HsaBackend, dir: &Path, modules: &mut Vec<Module>) -> Result<Self> {
-        let specs: [KernelSpec; 4] =
+        let mut specs: Vec<KernelSpec> =
             serde_json::from_str(include_str!("../../../../runtime/amd/glm_lt_gfx942.json"))
                 .map_err(|e| {
                     RuntimeError::Device(format!("hipBLASLt kernel specification: {e}"))
                 })?;
+        let decode_specs: Vec<KernelSpec> = serde_json::from_str(include_str!(
+            "../../../../runtime/amd/glm_lt_decode_gfx942.json"
+        ))
+        .map_err(|e| RuntimeError::Device(format!("hipBLASLt decode specification: {e}")))?;
+        specs.extend(decode_specs);
         let path = dir.join("glm_lt_gfx942.elf");
         let mut image = std::fs::read(&path)
             .map_err(|e| RuntimeError::Device(format!("{}: {e}", path.display())))?;
@@ -220,10 +247,7 @@ impl GemmLt {
             kernels.push(kernel);
         }
         modules.push(module);
-        Ok(Self {
-            kernels: kernels.try_into().ok().unwrap(),
-            specs,
-        })
+        Ok(Self { kernels, specs })
     }
 
     pub fn enqueue(&self, be: &HsaBackend, route: Route, tensor_table: &[u8]) -> Result<()> {
@@ -337,7 +361,7 @@ mod tests {
 
     #[test]
     fn lt_arguments_preserve_live_rows_and_inline_abi() {
-        let specs: [KernelSpec; 4] =
+        let mut specs: Vec<KernelSpec> =
             serde_json::from_str(include_str!("../../../../runtime/amd/glm_lt_gfx942.json"))
                 .unwrap();
         for (n, k) in [(2048, 6144), (512, 6144), (4096, 2048)] {
@@ -369,4 +393,26 @@ mod tests {
             assert!(route.rebase(8193).is_err());
         }
     }
+    #[test]
+    fn decode_routes_check_mode_geometry_and_rebasing() {
+        for rows in [16, 20] {
+            for (n, k) in [(2048, 6144), (512, 6144), (4096, 2048), (6144, 2048)] {
+                let (mut p, t) = fixture();
+                p.t = rows;
+                p.insts[0].i = [rows, n, k, 1, 0, 0, 0, 0];
+                let mut route = routes(&p, &t, 1).unwrap()[0].unwrap();
+                let (index, _) = route.kernel_choice();
+                assert!((4..12).contains(&index));
+                route.rebase(rows).unwrap();
+                assert!(route.rebase(rows - 1).is_err());
+                p.insts[0].i[3] = 0;
+                assert!(routes(&p, &t, 1).is_err());
+                p.insts[0].i[3] = 1;
+                p.t = 8;
+                p.insts[0].i[0] = 8;
+                assert!(routes(&p, &t, 1).is_err());
+            }
+        }
+    }
+
 }

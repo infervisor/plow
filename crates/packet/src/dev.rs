@@ -1847,8 +1847,8 @@ pub enum DevOp {
     /// `i0=T i1=ctx i2=topk i3=tp i4=slot_bytes i5=enter_gate i6=complete_gate` · `f0=scale`.
     /// Requires an isolated native segment and three consecutive system-scope arrival gates.
     IndexTpPf = 157,
-    /// Native gfx942 BF16 prefill projection using qualified hipBLASLt assembly.
-    /// `t0=out t1=x t2=weight` · `i0=T i1=N i2=K`. Requires an isolated native segment.
+    /// Native gfx942 BF16 projection using qualified hipBLASLt assembly.
+    /// `t0=out t1=x t2=weight` · `i0=T i1=N i2=K i3=decode`. Requires an isolated native segment.
     GemmLtPf = 158,
 }
 

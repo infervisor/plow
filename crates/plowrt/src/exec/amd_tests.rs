@@ -4539,3 +4539,36 @@ fn native_moe_decode_keeps_ordered_xcd_boundaries() {
         assert!(decode_segment_kinds(&p).is_err(), "case {bad}");
     }
 }
+
+#[test]
+fn native_gemm_decode_keeps_ordered_xcd_boundaries() {
+    let make = || {
+        let mut p = segmented_decode_probe();
+        p.t = 20;
+        p.insts[1].op = DevOp::GemmLtPf as u16;
+        p
+    };
+    let mut p = make();
+    assert_eq!(
+        decode_segment_kinds(&p).unwrap()[1],
+        DecodeSegmentKind::GemmLt
+    );
+    validate_decode_dispatch(std::slice::from_ref(&p), 0).unwrap();
+    p.l2_domains = 8;
+    assert!(validate_decode_dispatch(std::slice::from_ref(&p), 0).is_err());
+    p.gq_stream = p.stream.clone();
+    p.gq_seg_ofs = std::iter::once(0)
+        .chain((1..=3).flat_map(|n| std::iter::repeat_n(n, 8)))
+        .collect();
+    validate_decode_dispatch(std::slice::from_ref(&p), 0).unwrap();
+    for bad in 0..4 {
+        let mut p = make();
+        match bad {
+            0 => p.stream[1].wait_len = 1,
+            1 => p.stream[1].succ_len = 1,
+            2 => p.stream[1].flags |= SE_XCTR,
+            _ => p.stream[0].seg = 1,
+        }
+        assert!(decode_segment_kinds(&p).is_err(), "case {bad}");
+    }
+}

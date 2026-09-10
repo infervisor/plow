@@ -282,3 +282,78 @@ earlier runtime's 33.400 tokens/s screen; it does not replace that result or
 establish parity with the supplied 100-request H200 result. The
 [record](mi300x-gemv-width.json) includes raw metric summaries, quality outputs,
 source/object hashes, recipes and the disabled MFMA4 path inspection.
+
+
+## Small-batch decode projections
+
+The [batch-16/20 record](mi300x-decode-native.json) compares the production
+`d_gemv` body (MM16, row walk enabled) with hipBLAS/hipBLASLt and direct HIP
+module launches of the selected assembly. Inputs are captured layer-77 rank-0
+BF16 activations and TP8 weights from the full GLM-5.3 model.
+
+| Projection | GEMV warm, µs | Direct Lt warm, µs | GEMV cold, µs | Direct Lt cold, µs |
+|---|---:|---:|---:|---:|
+| q_a | 53.47 | 8.39 | 77.28 | 21.59 |
+| kv_latent | 34.46 | 8.15 | 61.01 | 16.34 |
+| q_absorb | 53.59 | 6.50 | 65.46 | 20.39 |
+| o_proj | 82.29 | 7.28 | 91.82 | 21.75 |
+| router | 33.66 | 7.97 | 59.69 | 14.78 |
+| shared_down | 46.50 | 4.43 | 52.72 | 10.49 |
+
+The table uses batch 20 and the library's XCD mapping. Cold runs flush 512 MiB
+before each projection; warm runs replay 20 projections per GPU graph. All 60
+library/direct cells pass a complete CPU FP64 oracle (<1% relative L2), three
+poisoned output reuses and guards. Twelve separate C HSA cases match the direct
+HIP outputs exactly, including three reuses and a 512-byte output guard.
+
+The eight small-batch assembly kernels already exist in the pinned
+`glm_lt_gfx942.elf`. Direct calls use its 160-byte inline ABI, GSU=1, and no
+library matmul or weight conversion in the timed path. This establishes a
+native dispatch candidate, not a serving gain. The diagnostic prompts repeat
+across slots; the standalone GEMV does not reproduce the persistent interpreter's
+register allocation and scheduling.
+
+Build inside `nix develop`:
+
+```sh
+"$PLOW_HIPCC" --offload-arch=gfx942 -O3 -w -std=c++17 -fPIC \
+  -Iruntime/amd -Iruntime/common \
+  -c runtime/bench/amd/glm_projection/decode_kernels.hip -o /tmp/decode-projection.o
+c++ -shared /tmp/decode-projection.o -L"$ROCM_PATH/lib" \
+  -Wl,-rpath,"$ROCM_PATH/lib" -lamdhip64 -o /tmp/decode-projection.so
+```
+
+With ROCm PyTorch, use `decode.py --mode library` or `--mode direct`, passing
+`--library /tmp/decode-projection.so --capture CAPTURE --out RESULT.json`.
+Direct mode also needs `--object glm_lt_gfx942.elf --selected
+runtime/bench/amd/glm_projection/decode-selected.json`. The capture directory
+contains `x`, `qlat`, `oat`, `xn2`, `shfu`, `wqa`, `wkv`, `wabs`, `wout`,
+`wrouter`, and `wshared`, each with suffix `.b001.bin`. Optional `--export DIR`
+writes direct-XCD outputs for comparison through the existing C HSA driver.
+
+The batch-20 trace spans 183.698 ms versus a 185.754 ms diagnostic decode step.
+Summed packet envelopes overlap (648.917 ms total); they are not a wall-time
+breakdown. `glm53_trace_attrib.py` now labels the arrival-to-last-ready envelope
+and completion tail explicitly and no longer calls their sum a serialized chain.
+
+
+The opt-in `--glm-gemm-lt-decode` / `PLOW_GLM_GEMM_LT_DECODE` path uses the
+shared native GEMM adapter for q_a, kv_latent, q_absorb and o_proj at decode
+rungs 16/20 on gfx942 TP8. Router and shared_down are benchmarked only. The
+312 projections in each qualified rung retain ordered segment boundaries and
+all eight XCD domains. Prefill and rungs 1/2/4/8 have unchanged disassembly;
+the disabled packet is byte-identical to the preceding FP8-KV batch-20 packet.
+
+A single paired serving screen (20 random requests, 70k/700 tokens, ratio .14,
+concurrency 20, seed 0, no speculation) measures 39.3717 output tokens/s enabled
+vs 37.2436 disabled (+5.71%). Mean TPOT falls 337.76 -> 315.33 ms (-6.64%);
+P99 TPOT rises 448.80 -> 462.32 ms (+3.01%). Both arms complete 20/20 requests
+with identical input/output lengths, and both pass 18/18 retrieval cases at
+concurrency 20. The same runtime and GPU objects run under one exclusive
+8x MI300X lease, enabled first, with no concurrent compilation or GPU tests.
+This is a small screen, not the supplied 100-request H200 comparison. The flag
+remains false by default pending repeatability and broader quality checks.
+
+Validation: 177 AMD runtime tests (5 ignored), 35 GLM emitter tests, 120 packet
+tests, release build, and Lean ordering/LDS checks for all 10 full-model programs.
+The record contains both metric summaries, result hashes and the serving recipe.

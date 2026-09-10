@@ -3161,6 +3161,33 @@ pub(crate) fn emit_glm_mla(
         } else {
             DevOp::Gemv
         };
+        if emit_config::active().glm_gemm_lt_decode
+            && matches!(rows, 16 | 20)
+            && matches!(
+                (nn, k),
+                (2048, 6144) | (512, 6144) | (4096, 2048) | (6144, 2048)
+            )
+        {
+            assert!(
+                crate::emit_is_amd()
+                    && c.tp == 8
+                    && c.hidden == 6144
+                    && b.n_cu() == 304
+                    && enc != MoeEnc::Mxfp4,
+                "native GLM decode GEMM requires gfx942 TP8 BF16 projections"
+            );
+            let counter = b.emit(DevOp::GemmLtPf, vec![0], deps, |d| {
+                d.t[0] = out;
+                d.t[1] = x;
+                d.t[2] = wt;
+                d.i[0] = rows;
+                d.i[1] = nn;
+                d.i[2] = k;
+                d.i[3] = 1;
+            });
+            b.isolate(counter);
+            return counter;
+        }
         b.emit(op, glm_decode_gemv_cus(&all, op, nn, k), deps, |d| {
             d.t[0] = out;
             d.t[1] = x;
@@ -7504,6 +7531,13 @@ fn glm_emit_full(
             assert!(
                 crate::emit_is_amd() && target == "gfx942",
                 "flat GLM MoE requires gfx942"
+            );
+            b.deny_uniseg();
+        }
+        if emit_config::active().glm_gemm_lt_decode && matches!(rb, 16 | 20) {
+            assert!(
+                crate::emit_is_amd() && target == "gfx942",
+                "native GLM decode GEMM requires gfx942"
             );
             b.deny_uniseg();
         }

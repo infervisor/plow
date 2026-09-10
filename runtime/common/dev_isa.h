@@ -1359,8 +1359,8 @@ enum {
      * i0=T i1=ctx i2=topk i3=tp i4=slot_bytes i5=enter_gate i6=complete_gate f0=scale.
      * Isolated native segment with three consecutive system-scope arrival gates. */
     PLOW_DOP_INDEX_TP_PF = 157,
-    /* Native gfx942 BF16 prefill projection using qualified hipBLASLt assembly.
-     * t0=out t1=x t2=weight i0=T i1=N i2=K. Isolated native segment only. */
+    /* Native gfx942 BF16 projection using qualified hipBLASLt assembly.
+     * t0=out t1=x t2=weight i0=T i1=N i2=K i3=decode. Isolated native segment only. */
     PLOW_DOP_GEMM_LT_PF = 158,
 
     PLOW_DOP__COUNT
