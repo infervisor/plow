@@ -57,6 +57,7 @@ pub mod hetero;
 mod hetero_channel;
 pub mod k3;
 pub mod kda;
+pub mod kv_contract;
 use config::*;
 mod gptoss;
 mod ladder;
@@ -6490,6 +6491,12 @@ pub(crate) fn apply_verify_gate(
     m: &packet::devbuild::Model,
     verify: Option<&VerifyHook>,
 ) -> LeanReport {
+    // The one place every emitter is holding the finished model, which makes it
+    // the one place the KV contract can be recorded without teaching each
+    // emitter to hand its model back. Process-global for the same reason
+    // `emit_config::active()` is, and with the same caveat: an emit is a
+    // process, and the tests that emit twice already serialize on `emit_guard`.
+    kv_contract::record(m);
     match verify {
         Some(v) => match v(m) {
             Ok(r) => r,
