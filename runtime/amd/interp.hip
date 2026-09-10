@@ -4126,18 +4126,24 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
          * lm_head (PLOW_FP8_HEAD off), and a bf16-weight/fp8-KV program emits GEMV_GLU and
          * GEMV_QKV — which this object used to drop. Measured: 248/0/occ 2/spill 0 with the bf16
          * arms back, IDENTICAL to without them. */
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMV_FP8
         case PLOW_DOP_GEMV_FP8:
             exec_gemv_fp8(in, T, slice, nblk, sm->gm);
             break;
+#endif
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMV_GLU_FP8
         case PLOW_DOP_GEMV_GLU_FP8:
             exec_gemv_glu_fp8(in, T, slice, nblk, sm->gm);
             break;
+#endif
         /* FUSED Q|K|V, per-channel fp8 — op 22's twin, sharing op 30's body (that one is this with
          * Nk=Nv=0). The three f32 scale rows are handles in i5/i6/i7; the arm TRAPS on a malformed
          * packet rather than running a narrower sweep, because `default:` here writes nothing. */
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMV_QKV_FP8
         case PLOW_DOP_GEMV_QKV_FP8:
             exec_gemv_qkv_fp8(in, T, slice, nblk, sm->gm);
             break;
+#endif
 #endif
 #if PLOW_MXFP4
         case PLOW_DOP_GEMV_MXFP4:
@@ -4202,9 +4208,11 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
 #if PLOW_FP8_KV
         /* fp8-KV decode object: SWAP in the fp8 flash so the bf16 flash_decode is not compiled and
          * the register budget stays flat against the 256/occ-2 cliff. */
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_FLASH_DECODE_FP8
         case PLOW_DOP_FLASH_DECODE_FP8:
             exec_flash_decode_fp8(in, T, slice, nblk, sm->fd);
             break;
+#endif
 #else
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_FLASH_DECODE
         case PLOW_DOP_FLASH_DECODE:
@@ -4229,12 +4237,16 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
          * REAL arm instead of the silent-NOP `default:`. The cost is that the bf16 instantiation
          * is still in this object, so the swap buys no register headroom for MLA — it buys the
          * halved KV, which is the point. */
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_FLASH_MLA_DECODE_FP8
         case PLOW_DOP_FLASH_MLA_DECODE_FP8:
             exec_flash_mla_decode_fp8(in, T, slice, nblk, PLOW_FMLA(sm));
             break;
+#endif
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_FLASH_GATHER_DECODE
         case PLOW_DOP_FLASH_GATHER_DECODE:
             exec_flash_mla_decode(in, T, slice, nblk, PLOW_FMLA(sm));
             break;
+#endif
 #else
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_FLASH_MLA_DECODE
         case PLOW_DOP_FLASH_MLA_DECODE:
