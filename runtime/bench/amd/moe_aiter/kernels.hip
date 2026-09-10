@@ -1,5 +1,7 @@
 #define PLOW_WG_WAVES 8
+#ifndef PLOW_MOE_PF_EPI
 #define PLOW_MOE_PF_EPI 1
+#endif
 #define PLOW_MOE_PF_DET 1
 #include <hip/hip_runtime.h>
 #if defined(__HIP_DEVICE_COMPILE__)
@@ -47,6 +49,18 @@ __global__ void combine_moe(void *out, void *part, unsigned M) {
                      blockIdx.x, gridDim.x, 0, 1);
 #endif
 }
+static void launch_align(void* meta, void* table, void* rt, void* rp, void* rg,
+                         unsigned M, hipStream_t stream) {
+#ifdef PLOW_MOE_BENCH_DECODE
+    align_moe<<<1, 512, 0, stream>>>(meta, table, rt, rp, rg, M, 0);
+#else
+    align_moe<<<64, 512, 0, stream>>>(meta, table, rt, rp, rg, M, 1);
+    align_moe<<<1, 512, 0, stream>>>(meta, table, rt, rp, rg, M, 2);
+    align_moe<<<64, 512, 0, stream>>>(meta, table, rt, rp, rg, M, 3);
+    align_moe<<<64, 512, 0, stream>>>(meta, table, rt, rp, rg, M, 4);
+#endif
+}
+
 extern "C" int plow_moe(void *out, void *x, void *wt, void *st, void *table,
                         void *meta, void *rt, void *rp, void *rg, void *fu,
                         void *part, unsigned M, void *s) {
@@ -54,10 +68,7 @@ extern "C" int plow_moe(void *out, void *x, void *wt, void *st, void *table,
     hipError_t rc = hipMemsetAsync(part, 0, (size_t)M * 6144 * 8, stream);
     if (rc != hipSuccess)
         return rc;
-    align_moe<<<64, 512, 0, stream>>>(meta, table, rt, rp, rg, M, 1);
-    align_moe<<<1, 512, 0, stream>>>(meta, table, rt, rp, rg, M, 2);
-    align_moe<<<64, 512, 0, stream>>>(meta, table, rt, rp, rg, M, 3);
-    align_moe<<<64, 512, 0, stream>>>(meta, table, rt, rp, rg, M, 4);
+    launch_align(meta, table, rt, rp, rg, M, stream);
     glu_moe<<<304, 512, 0, stream>>>(fu, x, wt, st, meta, rt);
     down_moe<<<304, 512, 0, stream>>>(part, fu, wt, st, meta, rp, rg);
     combine_moe<<<304, 512, 0, stream>>>(out, part, M);
@@ -114,10 +125,7 @@ extern "C" int plow_moe_native_prepare(MoePrepareArgs* args, void* stream) {
 
 extern "C" int plow_moe_native_align(void* meta, void* table, void* rt, void* rp,
                                       void* rg, unsigned rows, void* stream) {
-    align_moe<<<64, 512, 0, (hipStream_t)stream>>>(meta, table, rt, rp, rg, rows, 1);
-    align_moe<<<1, 512, 0, (hipStream_t)stream>>>(meta, table, rt, rp, rg, rows, 2);
-    align_moe<<<64, 512, 0, (hipStream_t)stream>>>(meta, table, rt, rp, rg, rows, 3);
-    align_moe<<<64, 512, 0, (hipStream_t)stream>>>(meta, table, rt, rp, rg, rows, 4);
+    launch_align(meta, table, rt, rp, rg, rows, (hipStream_t)stream);
     return hipGetLastError();
 }
 
@@ -163,5 +171,28 @@ extern "C" int plow_moe_native_execute(void* out, void* q, void* gu, void* down,
 extern "C" int plow_moe_native_store(void* out, void* src, unsigned rows, void* stream) {
     plow_moe_aiter_store<<<304, 256, 0, (hipStream_t)stream>>>((float*)out,
         (const unsigned short*)src, rows);
+    return hipGetLastError();
+}
+
+__global__ void pack_active_moe(uint4* gu, uint4* down, float* gs, float* ds,
+                               const unsigned long long* wt,
+                               const unsigned long long* st, const unsigned* meta) {
+    const unsigned e = blockIdx.x / 8u;
+    if (meta[256u + e] == 0) return;
+    pack_weight<512, 6144, true>(gu, wt);
+    pack_weight<6144, 256, false>(down, wt);
+    if (blockIdx.x % 8u == 0 && threadIdx.x < 96u) {
+        const unsigned j = threadIdx.x;
+        gs[e * 192u + j] = 2.0f * ((const float*)st[e * 3u])[j];
+        gs[e * 192u + 96u + j] = 2.0f * ((const float*)st[e * 3u + 1u])[j];
+        ds[e * 96u + j] = 2.0f * ((const float*)st[e * 3u + 2u])[j];
+    }
+}
+
+extern "C" int plow_moe_pack_active(void* gu, void* down, void* gs, void* ds,
+                                    void* wt, void* st, void* meta, void* stream) {
+    pack_active_moe<<<256 * 8, 256, 0, (hipStream_t)stream>>>((uint4*)gu, (uint4*)down,
+        (float*)gs, (float*)ds, (const unsigned long long*)wt,
+        (const unsigned long long*)st, (const unsigned*)meta);
     return hipGetLastError();
 }

@@ -9,6 +9,7 @@ import importlib.metadata
 import json
 from pathlib import Path
 import struct
+import statistics
 
 import aiter
 from aiter.fused_moe import fused_moe, moe_sorting
@@ -87,7 +88,7 @@ def checkpoint_weights(directory, layer, rank):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--arm", choices=["plow", "aiter", "ck", "aiter-repack", "aiter-slots", "native"], required=True)
+    parser.add_argument("--arm", choices=["plow", "aiter", "ck", "aiter-repack", "aiter-slots", "native", "native-active", "native-resident"], required=True)
     parser.add_argument("--library", type=Path, required=True)
     parser.add_argument("--object", type=Path)
     parser.add_argument("--capture", type=Path, required=True)
@@ -96,7 +97,12 @@ def main():
     parser.add_argument("--rank", type=int, default=0)
     parser.add_argument("--rows", type=int, default=4464)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--oracle-all-rows", action="store_true")
+    parser.add_argument("--cache-flush-mib", type=int, default=0)
+    parser.add_argument("--verify-part", action="store_true")
     args = parser.parse_args()
+    assert 0 <= args.cache_flush_mib <= 16384
+    native = args.arm.startswith("native")
     assert "gfx942" in torch.cuda.get_device_properties(0).gcnArchName
     assert 0 <= args.rank < 8 and 0 < args.rows <= 8192
     rows, hidden, intermediate, experts, topk = args.rows, 6144, 256, 256, 8
@@ -150,7 +156,7 @@ def main():
         wp1 = shuffle_weight(fnuz_weight(w1), (16, 16))
         wp2 = shuffle_weight(fnuz_weight(w2), (16, 16))
         sp1, sp2 = s1 * 2, s2 * 2
-        if args.arm in ["aiter-repack", "aiter-slots", "native"]:
+        if args.arm in ["aiter-repack", "aiter-slots"] or native:
             lib.plow_moe_pack.argtypes = [ctypes.c_void_p] * 7
             lib.plow_moe_pack.restype = ctypes.c_int
 
@@ -179,7 +185,7 @@ def main():
             del expected
             pack_ms = timing.bench(pack)
 
-        if args.arm == "native":
+        if native:
             assert args.object and sha(args.object) == "65b4c0a0b290dd83039047c18e0bb86f4253790e926dce324ddb6b45a7b28650"
             lib.plow_moe_native_load.argtypes = [ctypes.c_char_p]
             lib.plow_moe_native_load.restype = ctypes.c_int
@@ -236,6 +242,42 @@ def main():
                 assert (sorted_experts[lo:hi] == e).all()
             native_check = {"fp8_input_bytes_exact": q.numel(), "input_scales_exact": qs.numel(),
                             "routing_entries": rows*topk, "padded_entries": padded}
+            native_check["active_experts"] = ids.unique().numel()
+            if args.arm == "native-active":
+                lib.plow_moe_pack_active.argtypes = [ctypes.c_void_p] * 8
+                lib.plow_moe_pack_active.restype = ctypes.c_int
+
+                def pack_active():
+                    assert lib.plow_moe_pack_active(*(t.data_ptr() for t in
+                        (wp1, wp2, sp1, sp2, wt, st, meta)),
+                        torch.cuda.current_stream().cuda_stream) == 0
+
+                expected = [t.view(torch.uint8).clone() for t in (wp1, wp2, sp1, sp2)]
+                active = ids.unique().long()
+                inactive = torch.ones(experts, dtype=torch.bool, device="cuda")
+                inactive[active] = False
+                for t in (wp1, wp2, sp1, sp2):
+                    t.view(torch.uint8).fill_(0xff)
+                pack_active()
+                for t, e in zip((wp1, wp2, sp1, sp2), expected):
+                    assert torch.equal(t.view(torch.uint8)[active], e[active])
+                    assert (t.view(torch.uint8)[inactive] == 0xff).all()
+                # Reuse the workspace with another layer's pointer table.
+                wt.copy_(saved_wt.flip(0))
+                st.copy_(saved_st.flip(0))
+                pack_active()
+                for t, e in zip((wp1, wp2, sp1, sp2), expected):
+                    assert torch.equal(t.view(torch.uint8)[active], e.flip(0)[active])
+                    assert (t.view(torch.uint8)[inactive] == 0xff).all()
+                wt.copy_(saved_wt)
+                st.copy_(saved_st)
+                pack_active()
+                for t, e in zip((wp1, wp2, sp1, sp2), expected):
+                    assert torch.equal(t.view(torch.uint8)[active], e[active])
+                del expected
+                pack_ms = timing.bench(pack_active)
+                native_check["active_pack_exact_and_reusable"] = True
+
 
         if args.arm == "aiter-slots":
             lib.plow_moe_reduce_slots.argtypes = [ctypes.c_void_p] * 3 + [ctypes.c_uint, ctypes.c_void_p]
@@ -249,8 +291,10 @@ def main():
             nonlocal latest_parts
             if args.arm in ["aiter-repack", "aiter-slots", "native"]:
                 pack()
-            if args.arm == "native":
+            if native:
                 prepare()
+                if args.arm == "native-active":
+                    pack_active()
                 stream = torch.cuda.current_stream().cuda_stream
                 assert lib.plow_moe_native_execute(*(t.data_ptr() for t in
                     [partial, q, wp1, wp2, qs, sp1, sp2, sorted_ids, sorted_weights, sorted_experts, valid]), rows, stream) == 0
@@ -306,8 +350,13 @@ def main():
         capture_check = {"glu_relative_l2": rel, "elements": before.numel(),
                          "exact_fraction": (before == after).float().mean().item()}
         assert rel < 0.01, capture_check
+        if args.verify_part:
+            captured_part = read("part.bin", torch.float64)[:rows*hidden].reshape(rows, hidden)
+            capture_check["part_elements"] = part.numel()
+            capture_check["part_exact"] = torch.equal(part, captured_part)
+            assert capture_check["part_exact"], capture_check
 
-    picks = list(dict.fromkeys([0, rows//2, rows-1]))
+    picks = list(range(rows)) if args.oracle_all_rows else list(dict.fromkeys([0, rows//2, rows-1]))
     gold = torch.zeros(len(picks), hidden, device="cuda")
     for j, row in enumerate(picks):
         for slot in range(topk):
@@ -318,12 +367,30 @@ def main():
             gold[j] += (b @ (torch.nn.functional.silu(gate) * up)) * weights[row, slot]
     rel = ((out[picks].float()-gold).square().sum() / gold.square().sum()).sqrt().item()
     assert rel < (0.01 if args.arm == "plow" else 0.1), rel
+    warm_ms = timing.bench(run)
+    cold_samples = []
+    if args.cache_flush_mib:
+        flush = torch.empty(args.cache_flush_mib * 1024 * 1024, device="cuda", dtype=torch.uint8)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            retained_output = run()
+        for _ in range(9):
+            flush.zero_()
+            start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            start.record()
+            graph.replay()
+            end.record()
+            end.synchronize()
+            cold_samples.append(start.elapsed_time(end))
+        del retained_output
     record = {
         "arm": args.arm, "layer": args.layer, "rank": args.rank, "tp": 8, "rows": rows,
         "hidden": hidden, "intermediate": intermediate, "experts": experts, "topk": topk,
         "torch": torch.__version__, "hip": torch.version.hip, "gpu": torch.cuda.get_device_name(0),
         "aiter": importlib.metadata.version("amd-aiter"), "oracle_rows": picks,
-        "relative_l2": rel, "ms": timing.bench(run), "capture_check": capture_check,
+        "relative_l2": rel, "ms": warm_ms, "capture_check": capture_check,
+        "cache_flush_mib": args.cache_flush_mib, "cold_samples_ms": cold_samples,
+        "cold_ms": statistics.median(cold_samples) if cold_samples else None,
         "weight_pack_ms": pack_ms,
         "repeat_check": repeat_check,
         "native_check": native_check,
@@ -334,7 +401,7 @@ def main():
         "library_sha256": sha(args.library), "source_sha256": sha(Path(__file__)),
         "capture_sha256": {p.name: sha(p) for p in sorted(args.capture.glob("*.bin"))},
         "checkpoint": checkpoint_meta,
-        "boundary": "align, activation quantization if applicable, expert GLU/down and routing-weight combine; aiter-repack, aiter-slots and native include weight packing on every dispatch; native also stores FP32 output; excludes checkpoint loading, router top-k, shared expert, residual and TP communication",
+        "boundary": "native-active packs only routed experts; native-resident excludes weight packing (requires resident shuffled weights); align, activation quantization if applicable, expert GLU/down and routing-weight combine; aiter-repack, aiter-slots and native include weight packing on every dispatch; native also stores FP32 output; excludes checkpoint loading, router top-k, shared expert, residual and TP communication",
     }
     torch.save(out.cpu(), args.out.with_suffix(".pt"))
     args.out.write_text(json.dumps(record, indent=2) + "\n")

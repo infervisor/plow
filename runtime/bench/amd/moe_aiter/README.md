@@ -267,3 +267,85 @@ summaries, per-request lengths, retrieval outputs, kernel measurements,
 runtime/object/packet hashes, configuration and verification results. The
 baseline contains unused packed-prefill companions; the native option omits
 them. Sparse MLA prevents their use in this serving workload.
+
+## GLM batch-8 decode screen (2026-09-10)
+
+[mi300x-decode.json](mi300x-decode.json) records two rank-zero, layer-77 decode
+captures from TP8. The emitted B8 packet uses the same grouped operator family
+as prefill: `MoeAlignPf`, `MoeGroupGluPf`, `MoeGroupDownPf`, `MoeCombinePf`.
+The ordinary single-row decode kernels are a different path and are not covered.
+The benchmark build matches the decode tile: BM64/BK64/DBUF1, eight waves,
+`PLOW_MOE_PF_DET=1`, `PLOW_MOE_PF_EPI=0`. Both arms use the emitted
+single-workgroup phase-0 alignment (`PLOW_MOE_BENCH_DECODE=1`). The baseline
+clears its fixed-point accumulator separately; production router top-k normally
+performs that clear. Initial four-phase alignment screens were superseded.
+
+| Capture | Active experts | Plow cold (µs) | AITER active-pack cold (µs) | Reduction |
+|---|---:|---:|---:|---:|
+| Step 0 | 18 | 280.70 | 220.73 | 21.4% |
+| Step 1 | 21 | 284.86 | 241.12 | 15.4% |
+
+At step 1, packing all 256 experts costs 823.95 µs including execution.
+The resident-weight lower bound is 121.82 µs, but retaining shuffled copies of
+all 75 MoE layers requires another 84.4 GiB per rank. Selective packing retains
+the existing 1,208,254,464-byte packed-weight/scale allocation and only writes
+experts whose aligned routing count is nonzero. It does not need a second copy
+of every layer. This kernel is currently in the benchmark only.
+
+Cold timings are medians of nine graph replays, each preceded by a 512 MiB
+cache flush outside the timed region. Warm timings and cold samples are in the
+record. Both arms include alignment and routed expert combination. Native arms
+also include activation quantization and the final FP32 store; `native-active`
+includes selective packing on every replay. Shared experts, residual, router
+top-k, interpreter overhead, and TP communication are excluded from both arms.
+
+Both captures match all 16,384 baseline GLU values and all 49,152 fixed-point
+FP64 accumulator values exactly. All eight output rows are checked against an
+FP32 checkpoint-weight oracle. Plow relative L2 error is 0.23%; AITER is
+3.07–3.11%. Selected packed bytes/scales match the full-pack reference; poisoned
+inactive experts remain untouched, including after reversing and restoring the
+weight/scale pointer tables. Activation quantization and aligned routing are
+also checked against the installed AITER implementation.
+
+These are diagnostic prompts with distinct repeated token IDs per slot, not the
+random serving workload. The primitive result does not establish model quality
+or a serving throughput gain. Production native MoE remains prefill-only.
+Decode integration must add ordered TP segments, validate counter boundaries,
+and pass model-level quality and matched serving runs before enabling it.
+
+Reproduce under an exclusive eight-GPU lease using the qualified runtime,
+packet, object overlay, and checkpoint paths (hashes are in the record):
+
+```sh
+python3 runtime/bench/amd/moe_aiter/capture_decode.py \
+  --runtime "$PLOW_RUNTIME" --blob "$PLOW_PACKET" --objects "$PLOW_OBJECTS" \
+  --checkpoint "$PLOW_LITE_CHECKPOINT" --out "$PLOW_CAPTURE"
+```
+
+Build the benchmark library in `nix develop`:
+
+```sh
+"$PLOW_HIPCC" --offload-arch=gfx942 -O3 -w -std=c++17 -fPIC \
+  -DPLOW_MOE_PF_EPI=0 -DMPF_DBUF=1 -DMPF_BK=64 -DPLOW_MOE_BENCH_DECODE=1 \
+  -Iruntime/amd -Iruntime/common -c runtime/bench/amd/moe_aiter/kernels.hip \
+  -o /tmp/moe-decode.o
+c++ -shared /tmp/moe-decode.o -L"$ROCM_PATH/lib" -Wl,-rpath,"$ROCM_PATH/lib" \
+  -lamdhip64 -o /tmp/moe-decode.so
+```
+
+For each capture and arm, run the following with the AITER/Torch Python
+environment under an exclusive single-GPU lease. Add `--verify-part` for
+`--arm plow`. The other arms are `native`, `native-active`, and
+`native-resident`.
+
+```sh
+python runtime/bench/amd/moe_aiter/captured.py --arm plow \
+  --library /tmp/moe-decode.so --object "$PLOW_AITER_OBJECT" \
+  --capture "$PLOW_CAPTURE/step1" --checkpoint "$PLOW_FP8_CHECKPOINT" \
+  --layer 77 --rows 8 --oracle-all-rows --cache-flush-mib 512 \
+  --verify-part --out /tmp/moe-decode-plow.json
+```
+
+The capture helper reproduces the executed capture command; the original
+capture-script hash is retained separately. Upstream dispatch reference:
+[ROCm AITER fused MoE](https://github.com/ROCm/aiter/blob/main/aiter/fused_moe.py).
