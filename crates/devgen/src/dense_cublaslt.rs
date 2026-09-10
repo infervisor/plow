@@ -18,6 +18,52 @@ pub(crate) fn apply(model: &mut Model) -> Result<SectionData, String> {
     })
 }
 
+pub(crate) fn apply_native(
+    model: &mut Model,
+    output: &std::path::Path,
+) -> Result<SectionData, String> {
+    let file = "gemv_sm90_transposed.cubin";
+    if model.prog_t[packet::devbuild::decode_rung_lo(&model.prog_t)..]
+        .iter()
+        .any(|&m| ![1, 2, 4, 8, 16].contains(&m))
+    {
+        return Err("native tensor-core decode requires measured B1/B2/B4/B8/B16 rungs".into());
+    }
+    let path = output
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join(file);
+    let image = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if plow_asset::cubin::global_u32(&image, "plow_gemv_transposed_abi") != Some(1)
+        || plow_asset::cubin::global_u32(&image, "plow_gemv_transposed_block") != Some(128)
+        || plow_asset::cubin::inspect(&image).is_none_or(|i| i.sm != 90)
+    {
+        return Err("native decode object requires transposed ABI1".into());
+    }
+    let mut section = apply(model)?;
+    let mut roles = plow_asset::segment_roles::SegmentRoles::from_bytes(&section.data)?;
+    for p in &mut roles.programs {
+        for role in &mut p.roles {
+            if *role == CUBLASLT {
+                *role = plow_asset::segment_roles::NATIVE_DECODE_TC;
+            }
+        }
+    }
+    roles.objects.insert(
+        plow_asset::segment_roles::NATIVE_DECODE_TC,
+        plow_asset::segment_roles::SegmentObject {
+            abi: "gemv_transposed_sm90_bf16_v1".into(),
+            file: file.into(),
+            sha256: Some(plow_asset::decode_objects::image_sha256(&image)),
+            promote_k512: None,
+            attention: None,
+        },
+    );
+    roles.validate_schema()?;
+    section.data = serde_json::to_vec(&roles).map_err(|e| e.to_string())?;
+    Ok(section)
+}
+
 fn apply_program(model: &mut Model, index: usize) -> Result<Vec<u8>, String> {
     let dependencies = plow_asset::program::with_model(model, |packet| {
         plow_asset::splitk::dependencies(&packet.programs[index])
@@ -179,6 +225,43 @@ mod tests {
         })
         .unwrap();
         assert_eq!(after, deps);
+    }
+
+    #[test]
+    fn native_object_is_hash_bound_and_does_not_declare_library_roles() {
+        let directory =
+            std::env::temp_dir().join(format!("plow-native-role-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let image = plow_asset::cubin::synthetic_elf(
+            "plow_gemv_bf16_m8_bk128_s3",
+            &[
+                ("plow_gemv_transposed_abi", 1),
+                ("plow_gemv_transposed_block", 128),
+            ],
+            90,
+        );
+        std::fs::write(directory.join("gemv_sm90_transposed.cubin"), &image).unwrap();
+        let mut m = model();
+        let section = apply_native(&mut m, &directory.join("model.pkt")).unwrap();
+        let metadata = plow_asset::segment_roles::SegmentRoles::from_bytes(&section.data).unwrap();
+        assert_eq!(
+            metadata.programs[0].roles,
+            [0, plow_asset::segment_roles::NATIVE_DECODE_TC, 0]
+        );
+        assert_eq!(
+            metadata.objects[&plow_asset::segment_roles::NATIVE_DECODE_TC].sha256,
+            Some(plow_asset::decode_objects::image_sha256(&image))
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn native_decode_rejects_unmeasured_batch_before_object_loading() {
+        let mut m = model_rows(&[128, 32]);
+        let error = apply_native(&mut m, std::path::Path::new("missing/model.pkt"))
+            .err()
+            .expect("unmeasured batch");
+        assert!(error.contains("measured B1/B2/B4/B8/B16"));
     }
 
     #[test]

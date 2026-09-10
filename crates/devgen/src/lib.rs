@@ -4062,6 +4062,7 @@ fn emit_phase(
             && !fp8
             && !mx4
             && !emit_config::active().decode_cublaslt
+            && !emit_config::active().decode_native_tc
             && gemv_fused_input_fits(amd, t, c.hidden)
             && !emit_config::active().no_fuse_qkv;
         // FUSED Q|K|V, per-channel fp8 (DevOp::GemvQkvFp8, op 115) — the arm the comment above
@@ -5210,7 +5211,8 @@ fn emit_phase(
         // Same backend-specific bound as `fuse_qkv` above.
         let glu_fused = gemv_family
             && gemv_fused_input_fits(amd, t, c.hidden)
-            && !emit_config::active().decode_cublaslt;
+            && !emit_config::active().decode_cublaslt
+            && !emit_config::active().decode_native_tc;
         let gemm_glu = !gemv_family && glu_fusion_wins(tg, inter_l, c.hidden, n_cu);
         // w8a8: quant the (hidden-width) pre-FF norm output feeding gate/up. Reuses xqh/ash (q/k/v
         // already consumed them; the c_pf→o_proj→flash→qkv chain serializes the reuse). Inert
@@ -7046,7 +7048,15 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
         );
         return;
     }
-    if emit_config::active().decode_cublaslt {
+    if emit_config::active().decode_cublaslt || emit_config::active().decode_native_tc {
+        assert!(
+            !emit_config::active().decode_native_tc || model_type.starts_with("gemma4"),
+            "native tensor-core decode currently requires the Gemma 4 emitter"
+        );
+        assert!(
+            !(emit_config::active().decode_cublaslt && emit_config::active().decode_native_tc),
+            "select one decode projection backend"
+        );
         assert!(
             cublaslt_emit_supported(
                 capabilities,
@@ -8499,12 +8509,19 @@ fn emit_dense_gqa(
             .unwrap_or_else(|error| panic!("decode projection tuning: {error}"));
     // Emit v6 with sections when --embed-cubin/--embed-hsaco given, else v5.
     let mut sections = Vec::new();
-    if ecfg.decode_cublaslt {
+    if ecfg.decode_cublaslt || ecfg.decode_native_tc {
         assert!(
             !fp8 && !c.moe && !amd,
             "Gemma cuBLASLt decode requires dense BF16 CUDA"
         );
-        sections.push(dense_cublaslt::apply(&mut m).expect("Gemma cuBLASLt decode segments"));
+        sections.push(
+            if ecfg.decode_native_tc {
+                dense_cublaslt::apply_native(&mut m, std::path::Path::new(&out))
+            } else {
+                dense_cublaslt::apply(&mut m)
+            }
+            .expect("dense decode projection segments"),
+        );
     }
     if ecfg.gemv_decode_role {
         assert!(

@@ -1202,6 +1202,18 @@ impl CudaBackend {
         params: &mut [*mut c_void],
         stream: Option<&CudaStream>,
     ) -> Result<()> {
+        self.launch_kernel_grid(f, [grid, 1, 1], block, smem_bytes, params, stream)
+    }
+
+    pub fn launch_kernel_grid(
+        &self,
+        f: KernelFn,
+        grid: [u32; 3],
+        block: u32,
+        smem_bytes: u32,
+        params: &mut [*mut c_void],
+        stream: Option<&CudaStream>,
+    ) -> Result<()> {
         self.bind()?;
         // SAFETY: param pointers valid for the call; the driver copies kernel
         // arguments out before returning.
@@ -1209,9 +1221,9 @@ impl CudaBackend {
             unsafe {
                 (self.api.cuLaunchKernel)(
                     f.0 as CUfunction,
-                    grid,
-                    1,
-                    1,
+                    grid[0],
+                    grid[1],
+                    grid[2],
                     block,
                     1,
                     1,

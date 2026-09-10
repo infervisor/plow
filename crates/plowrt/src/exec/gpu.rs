@@ -62,6 +62,7 @@ mod decode_object;
 use decode_object::{BoundDecodeObject, DecodeModule};
 mod decode_rung;
 mod mixed_step;
+mod native_decode;
 mod packed_terminal;
 mod token_batch;
 use cublaslt::CublasLtDecodeRoute;
@@ -574,7 +575,11 @@ impl SegmentRoleValidation for SegmentRoles {
                         | plow_asset::segment_roles::MXFP4_MOE
                 )
             });
-            let library_decode = p.roles.contains(&plow_asset::segment_roles::CUBLASLT);
+            let library_decode = p
+                .roles
+                .iter()
+                .copied()
+                .any(plow_asset::segment_roles::is_projection);
             if !seen.insert(p.index)
                 || (p.roles.contains(&plow_asset::segment_roles::FP8_M1)
                     && p.roles.contains(&plow_asset::segment_roles::GEMV_CTA512))
@@ -593,6 +598,7 @@ impl SegmentRoleValidation for SegmentRoles {
                                     | plow_asset::segment_roles::FP8_M1
                                     | plow_asset::segment_roles::MXFP4_MOE
                                     | plow_asset::segment_roles::CUBLASLT
+                                    | plow_asset::segment_roles::NATIVE_DECODE_TC
                             )
                         })))
                 || (!decode
@@ -602,6 +608,7 @@ impl SegmentRoleValidation for SegmentRoles {
                             plow_asset::segment_roles::GEMV_CTA512
                                 | plow_asset::segment_roles::FP8_M1
                                 | plow_asset::segment_roles::CUBLASLT
+                                | plow_asset::segment_roles::NATIVE_DECODE_TC
                         )
                     }))
             {
@@ -953,7 +960,11 @@ fn packet_role_segments(
             "invalid packet segment role count or id".into(),
         ));
     }
-    if roles.contains(&plow_asset::segment_roles::CUBLASLT) {
+    if roles
+        .iter()
+        .copied()
+        .any(plow_asset::segment_roles::is_projection)
+    {
         cublaslt::decode_segments(g, tensors, roles)?;
     }
     let mut selected = Vec::new();
@@ -2634,7 +2645,11 @@ impl GpuEngine {
             .and_then(|r| r.program(blob.progs.len() - 1))
             .map(|p| p.roles.clone())
             .unwrap_or_default();
-        let cublaslt_enabled = decode_roles.contains(&plow_asset::segment_roles::CUBLASLT);
+        let native_enabled = decode_roles.contains(&plow_asset::segment_roles::NATIVE_DECODE_TC);
+        let cublaslt_enabled = decode_roles
+            .iter()
+            .copied()
+            .any(plow_asset::segment_roles::is_projection);
         let decode_packet_roles = decode_roles
             .iter()
             .any(|&role| {
@@ -3617,9 +3632,25 @@ impl GpuEngine {
             tracing::info!("decode: dynamic B=1 KV row — immutable instruction stream");
         }
         // Rung graphs run serially on the engine stream and share one Lt workspace.
-        let cublaslt = cublaslt_enabled
-            .then(|| crate::device::cuda::lt::Lt::load(&be))
-            .transpose()?;
+        let cublaslt = if native_enabled {
+            let object = &segment_roles.as_ref().expect("native roles").objects
+                [&plow_asset::segment_roles::NATIVE_DECODE_TC];
+            Some(cublaslt::ProjectionBackend::Native(
+                native_decode::Native::load(
+                    &be,
+                    assets_dir,
+                    object,
+                    profile.tag,
+                    &cublaslt_segments,
+                )?,
+            ))
+        } else if cublaslt_enabled {
+            Some(cublaslt::ProjectionBackend::Lt(
+                crate::device::cuda::lt::Lt::load(&be)?,
+            ))
+        } else {
+            None
+        };
         let ordered_waits = if cublaslt_enabled {
             Some(cublaslt::ordered_waits(g, &cublaslt_segments)?)
         } else {
@@ -3919,6 +3950,9 @@ impl GpuEngine {
         let mut packet_roles: [Option<PacketRole>; plow_asset::segment_roles::MAX_ROLE as usize] =
             std::array::from_fn(|_| None);
         for (&id, object) in segment_roles.iter().flat_map(|r| &r.objects) {
+            if id == plow_asset::segment_roles::NATIVE_DECODE_TC {
+                continue;
+            }
             if id == plow_asset::segment_roles::FP8_M1 {
                 packet_roles[plow_asset::segment_roles::FP8_M1 as usize - 1] = Some(
                     load_fp8_m1_role(&be, assets_dir, object, profile.tag, grid)?,

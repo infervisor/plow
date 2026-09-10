@@ -224,7 +224,7 @@ CUDA libraries, not Nix's CUDA stubs.
 `runtime/nvidia/gemv_sm90_transposed.cu` now exports four shape/tile entry points
 and deterministic FP32 split reduction. The probe and object share the body in
 `op_gemv_transposed.cuh`. The object does not depend on cuBLASLt or CUTLASS.
-Runtime packet routing is not yet integrated. Its launch and scratch contract
+Runtime packet routing is now available through the native opt-in below. Its launch and scratch contract
 is documented in `runtime/nvidia/gemv_sm90_transposed.md`.
 
 Two 900-case screens passed sampled FP64 numerical checks, including 300 actual
@@ -264,3 +264,51 @@ Evidence: [shape selections and object hashes](gemma4-12b-h100-data/decode-tc-dr
 [XOR screen](gemma4-12b-h100-data/decode-tc-swizzle-screen.csv),
 [padded counters](gemma4-12b-h100-data/decode-tc-driver-ncu.csv),
 [XOR counters](gemma4-12b-h100-data/decode-tc-swizzle-ncu.csv).
+
+## Native runtime integration (2026-09-10)
+
+`--emit-decode-native-tc` selects native role 8 for Gemma 4 BF16 SM90 TP1,
+B1/B2/B4/B8/B16. The packet pins the external object's SHA256. The runtime
+rejects unknown shapes or mismatched hash/ABI and shares the existing ordered
+segment/graph machinery with one 7.5 MiB scratch allocation. It does not load
+cuBLASLt. Narrower rungs inherit the widest rung's BK and split count to
+preserve summation order; the standalone best-per-rung table above is therefore
+not the exact serving selection. The tested object uses the XOR layout.
+
+Validation: 101 GPU-runtime unit tests, five role-schema tests and four compiler
+tests passed. The native packet passed 122 bit-exact full-logit snapshots
+across rung changes, holes, slot reuse and continuation. A corrupted cubin was
+rejected for hash/ABI mismatch. Serving verification passed cancellation,
+ragged concurrency, output limits, recovery and context rejection.
+
+Physical B16, queue concurrency up to 128, PF chunk 1024/budget 2048, context
+20480, prefix cache disabled, 128 output tokens per request:
+
+| Input | Concurrency | Median TTFT (ms) | Output tokens/s |
+|---:|---:|---:|---:|
+| 1024 | 1 | 91.73 | 66.92 |
+| 1024 | 16 | 967.91 | 540.20 |
+| 16384 | 1 | 1191.33 | 42.28 |
+| 16384 | 16 | 21526.86 | 80.60 |
+| 1024 | 128 | 13808.98 | 531.36 |
+| 16384 | 128 | 96670.34 | 82.50 |
+
+All 290 measured requests completed with 128 outputs/cache zero. C1/C16 used
+one warmup and one measured repeat per cell; C128 used one measured repeat
+on the warmed server with no additional warmup. This is screening, not an
+interleaved repeated A/B. Against the preceding Plow screen, short C16 rises
+from 263.81 to 540.20 tokens/s and long C16 from 74.54 to 80.60. Long TTFT
+regresses. Recorded vLLM BF16 reaches 969.38 and 176.84 tokens/s respectively;
+the performance goal remains unmet.
+
+Final generated text matches the preceding Plow screen on 33/34 synthetic
+prompts. One 16K/C16 prompt differs in a repetitive hyphen sequence, also
+compared with the initial native prototype. The cause has not been isolated.
+The full-logit rung test establishes internal consistency, not agreement with
+HF or vLLM; independent model-quality qualification remains open.
+
+Evidence: [C1/C16](gemma4-12b-h100-data/native-tc-final-output128.json),
+[C128](gemma4-12b-h100-data/native-tc-final-c128-output128.json),
+[serving verification](gemma4-12b-h100-data/native-tc-final-verify.log),
+[rung logits](gemma4-12b-h100-data/native-tc-rung-gpu.log),
+[corrupted-object rejection](gemma4-12b-h100-data/native-tc-badhash.log).

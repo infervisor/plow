@@ -28,6 +28,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    for (index, p) in blob.progs.iter().enumerate() {
+        if p.gq_seg_ofs.first() != Some(&0)
+            || p.gq_seg_ofs.last().copied().map(|n| n as usize) != Some(p.gq_stream.len())
+            || p.gq_seg_ofs.windows(2).any(|w| w[0] > w[1])
+        {
+            return Err(format!("program {index}: invalid queue window bounds").into());
+        }
+        let mut covered = vec![false; p.insts.len()];
+        for entry in &p.gq_stream {
+            let slot = covered
+                .get_mut(entry.inst as usize)
+                .ok_or_else(|| format!("program {index}: queue instruction out of range"))?;
+            *slot = true;
+        }
+        for (pc, inst) in p.insts.iter().enumerate() {
+            if DevOp::from_u16(inst.op).is_none() {
+                return Err(format!("program {index} PC {pc}: unknown opcode {}", inst.op).into());
+            }
+            if !covered[pc] {
+                return Err(format!("program {index} PC {pc}: no queue coverage").into());
+            }
+        }
+    }
     let decode = blob.decode_rung_lo();
     let programs: Vec<_> = blob
         .progs
@@ -44,6 +67,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             let mut counts = BTreeMap::<String, usize>::new();
+            let mut cases = BTreeMap::new();
             let insts: Vec<_> = p
                 .insts
                 .iter()
@@ -63,6 +87,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .iter()
                         .map(|&id| blob.tensors.get(id as usize).map(|t| t.bytes))
                         .collect();
+                    let key = (
+                        inst.op,
+                        inst.blocks,
+                        inst.i,
+                        inst.fj,
+                        inst.t
+                            .map(|id| blob.tensors.get(id as usize).map(|t| t.bytes)),
+                        pc_windows[pc]
+                            .iter()
+                            .map(|&window| program_roles.map(|program| program.roles[window]))
+                            .collect::<BTreeSet<_>>(),
+                    );
+                    cases.entry(key).or_insert_with(Vec::new).push(pc);
                     json!({"pc": pc, "op": op, "blocks": inst.blocks,
                    "i": inst.i, "fj_bits": inst.fj, "t": inst.t,
                    "tensors": tensors, "tensor_bytes": tensor_bytes,
@@ -89,11 +126,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }})
                 })
                 .collect();
+            let cases: Vec<_> = cases
+                .into_iter()
+                .map(|((op, blocks, i, fj, tensor_bytes, roles), pcs)| {
+                    json!({"op": format!("{:?}", DevOp::from_u16(op).unwrap()),
+                    "blocks": blocks, "i": i, "fj_bits": fj,
+                    "tensor_bytes": tensor_bytes, "declared_roles": roles, "pcs": pcs,
+                    "performance_evidence": null})
+                })
+                .collect();
             json!({"index": index, "phase": if index < decode {"prefill"} else {"decode"},
                "rows": packet::devbuild::program_rows(p.t),
                "packed_only": p.packed_prefill_only, "op_counts": counts,
                "counter_count": p.n_counter, "wait_count": p.waits.len(),
-               "segment_offsets": p.gq_seg_ofs, "segments": segments, "instructions": insts})
+               "segment_offsets": p.gq_seg_ofs, "segments": segments, "instructions": insts,
+               "kernel_cases": cases})
         })
         .collect();
     std::fs::write(

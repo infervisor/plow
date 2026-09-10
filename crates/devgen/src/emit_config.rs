@@ -824,6 +824,12 @@ pub struct EmitConfig {
     /// Emit packet segments eligible for the optional runtime cuBLASLt decode route.
     #[arg(long = "emit-decode-cublaslt", env = "PLOW_EMIT_DECODE_CUBLASLT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub decode_cublaslt: bool,
+    #[arg(
+        long = "emit-decode-native-tc",
+        env = "PLOW_EMIT_DECODE_NATIVE_TC",
+        default_value_t = false
+    )]
+    pub decode_native_tc: bool,
 
     #[arg(long, env = "PLOW_QWEN_FUSE_AB", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub qwen_fuse_ab: bool,
@@ -1117,6 +1123,7 @@ impl EmitConfig {
             qwen_fp8_m1_tma: env_bool("PLOW_QWEN_FP8_M1_TMA"),
             qwen_w8a8_prefill: env_bool("PLOW_QWEN_W8A8_PREFILL"),
             decode_cublaslt: env_bool("PLOW_EMIT_DECODE_CUBLASLT"),
+            decode_native_tc: env_bool("PLOW_EMIT_DECODE_NATIVE_TC"),
             qwen_fuse_ab: env_bool("PLOW_QWEN_FUSE_AB"),
             qwen_fuse_mlp: env_bool("PLOW_QWEN_FUSE_MLP"),
             qwen_projection_dag: env_bool("PLOW_QWEN_PROJECTION_DAG"),

@@ -13,10 +13,29 @@ pub(super) struct DecodeSegment {
 }
 
 pub(super) struct CublasLtDecodeRoute {
-    plan: Arc<crate::device::cuda::lt::Plan>,
+    plan: Arc<ProjectionPlan>,
     input: u64,
     weight: u64,
     output: u64,
+}
+
+pub(super) enum ProjectionBackend {
+    Lt(Arc<crate::device::cuda::lt::Lt>),
+    Native(Arc<native_decode::Native>),
+}
+
+enum ProjectionPlan {
+    Lt(Arc<crate::device::cuda::lt::Plan>),
+    Native(native_decode::Plan),
+}
+
+impl ProjectionPlan {
+    fn run(&self, input: u64, weight: u64, output: u64, stream: &CudaStream) -> Result<()> {
+        match self {
+            Self::Lt(p) => p.run(input, weight, output, stream),
+            Self::Native(p) => p.run(input, weight, output, stream),
+        }
+    }
 }
 
 pub(super) fn ordered_waits(
@@ -84,7 +103,7 @@ pub(super) fn ordered_waits(
 }
 
 pub(super) fn prepare_routes(
-    lt: &Arc<crate::device::cuda::lt::Lt>,
+    backend: &ProjectionBackend,
     segments: Vec<Option<DecodeSegment>>,
     insts: &mut [DevInst64],
     devp: &[DeviceMem],
@@ -131,13 +150,31 @@ pub(super) fn prepare_routes(
                             })
                         })
                         .transpose()?;
-                    Arc::clone(e.insert(lt.plan(
-                        key.0,
-                        key.1,
-                        key.2,
-                        weight,
-                        template.map(|r| r.plan.as_ref()),
-                    )?))
+                    let plan = match backend {
+                        ProjectionBackend::Lt(lt) => {
+                            let template = template
+                                .map(|r| match r.plan.as_ref() {
+                                    ProjectionPlan::Lt(p) => Ok(p.as_ref()),
+                                    _ => Err(RuntimeError::Rejected(
+                                        "decode projection backend changed".into(),
+                                    )),
+                                })
+                                .transpose()?;
+                            ProjectionPlan::Lt(lt.plan(key.0, key.1, key.2, weight, template)?)
+                        }
+                        ProjectionBackend::Native(native) => {
+                            let template = template
+                                .map(|r| match r.plan.as_ref() {
+                                    ProjectionPlan::Native(p) => Ok(p),
+                                    _ => Err(RuntimeError::Rejected(
+                                        "decode projection backend changed".into(),
+                                    )),
+                                })
+                                .transpose()?;
+                            ProjectionPlan::Native(native.plan(key.0, key.1, key.2, template)?)
+                        }
+                    };
+                    Arc::clone(e.insert(Arc::new(plan)))
                 }
             };
             d.op = DevOp::Nop as u16;
@@ -156,7 +193,8 @@ pub(super) fn prepare_routes(
         segments = routes.len(),
         projections = routes.iter().flatten().count(),
         plans = plans.len(),
-        "cuBLASLt decode routes prepared"
+        native = matches!(backend, ProjectionBackend::Native(_)),
+        "decode projection routes prepared"
     );
     Ok(routes)
 }
@@ -322,7 +360,10 @@ pub(super) fn decode_segments(
     let count = program.gq_seg_ofs.len().checked_sub(1).ok_or_else(fail)?;
     if count == 0
         || roles.len() != count
-        || !roles.contains(&plow_asset::segment_roles::CUBLASLT)
+        || !roles
+            .iter()
+            .copied()
+            .any(plow_asset::segment_roles::is_projection)
         || program.gq_seg_ofs.first() != Some(&0)
         || program.gq_seg_ofs.last().copied() != Some(program.gq_stream.len() as u32)
     {
@@ -337,12 +378,13 @@ pub(super) fn decode_segments(
         if entries.is_empty() || entries.iter().any(|entry| entry.seg as usize != segment) {
             return Err(fail());
         }
-        if roles[segment] != plow_asset::segment_roles::CUBLASLT {
+        if !plow_asset::segment_roles::is_projection(roles[segment]) {
             continue;
         }
         let instruction = entries[0].inst as usize;
         let op = program.insts.get(instruction).ok_or_else(fail)?;
         if op.op != DevOp::Gemv as u16
+            || op.t[3..].iter().any(|&t| t != packet::dev::TENSOR_NONE16)
             || op.i[0] != program.t
             || op.i[1] == 0
             || op.i[2] == 0
@@ -407,6 +449,7 @@ mod tests {
         };
         let mut gemv = ordinary;
         gemv.op = DevOp::Gemv as u16;
+        gemv.t.fill(packet::dev::TENSOR_NONE16);
         gemv.t[..3].copy_from_slice(&[0, 1, 2]);
         gemv.i[..3].copy_from_slice(&[batch, 48, 5120]);
         let stream: Vec<_> = (0..3)
@@ -527,6 +570,19 @@ mod tests {
                 ]
             );
         }
+    }
+
+    #[test]
+    fn native_projection_reuses_geometry_and_rejects_bias() {
+        let (mut program, tensors) = fixture(4);
+        let native_roles = [0, plow_asset::segment_roles::NATIVE_DECODE_TC, 0];
+        let routes = decode_segments(&program, &tensors, &native_roles).unwrap();
+        assert_eq!(
+            routes,
+            decode_segments(&program, &tensors, &roles()).unwrap()
+        );
+        program.insts[1].t[7] = 0;
+        assert!(decode_segments(&program, &tensors, &native_roles).is_err());
     }
 
     #[test]

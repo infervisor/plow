@@ -1,8 +1,21 @@
 # Native SM90 BF16 decode projections
 
 `gemv_sm90_transposed.cu` exports the body shared with the Gemma decode probe
-through `op_gemv_transposed.cuh`. It does not link cuBLASLt or CUTLASS. Runtime
-packet selection is not yet integrated.
+through `op_gemv_transposed.cuh`. It does not link cuBLASLt or CUTLASS.
+
+The Gemma 4 compiler opt-in is `--emit-decode-native-tc` (or
+`PLOW_EMIT_DECODE_NATIVE_TC=true`). Place the object at
+`OUTPUT_DIRECTORY/gemv_sm90_transposed.cubin` before compiling. The packet
+pins its SHA256 and declares native projection role 8. This cannot be combined
+with `--emit-decode-cublaslt` and currently supports B1/B2/B4/B8/B16.
+
+The CUDA runtime shares the existing ordered projection-segment graph route,
+checks the object hash/ABI and tensor extents/alignment/aliasing, and selects
+from the measured Gemma 12B shapes. Unknown shapes are rejected. Plans share
+one scratch allocation across serialized rung graphs. The native route does
+not load cuBLASLt. Projection fusion is disabled to expose individual GEMVs;
+residual/normalization fusion is retained. Serving validation is required
+before treating that tradeoff as a win.
 
 Build from the repository root, under `nix develop`:
 
@@ -42,9 +55,9 @@ Contract:
 - Caller validates allocation extents and integer products. Completion of
   the reduction precedes consumers. These kernels do not publish packet
   counters; an ordered graph/segment route must establish that dependency.
-- Object hashes, scratch ownership and graph lifetime must be bound by the
-  runtime before enabling a packet route. The standalone probe is not a
-  substitute for that validation.
+- Object hashes, scratch ownership and graph lifetime are bound by the
+  runtime's native projection route. The standalone probe is not a
+  substitute for its packet and serving validation.
 
 Pass a cubin as the fifth probe argument after `gemma4` to test actual driver
 entry points, e.g. `decode_tc_driver_probe 11 0 -1 gemma4 OBJECT.cubin`.

@@ -13,7 +13,7 @@ predates that field and must be audited from its packet instead.
 | Emitted family | Instructions per prefill / decode rung | Existing specialization; remaining qualification |
 |---|---:|---|
 | Gemm | 329 / 0 | Native SM90 WGMMA/TMA tile variants. Measured projection cases exist; all rung selections are not qualified. |
-| Gemv, GemvQkv, GemvGlu | 0 / 113 + 40 + 48 | Fused decode bodies. Faster native tensor-core probe exists but is not integrated. |
+| Gemv, GemvQkv, GemvGlu | 0 / 113 + 40 + 48 | Fused decode bodies. Opt-in native tensor-core routing now covers 328 unfused layer projections at B1/2/4/8/16; LM head remains in the interpreter. |
 | FlashPrefill | 48 / 0 | HD256 ×40, HD512 ×8. Packed descriptor support; dedicated HD512 Q64/KV32 role. Ragged correctness and selected hardware counters measured, not every rung/history. |
 | FlashDecode, FlashMerge | 0 / 48 + 48 | HD256/512 templates; full per-batch/history tuning remains open. |
 | HeadNormRope | 144 / 144 | HD256 ×120, HD512 ×24; dimension-specific templates fuse norm, rotary and cache writes. Per-rung timing and resource qualification remain open. |
@@ -74,3 +74,30 @@ Do not promote this configuration: the earlier B16/2K-budget screen reached
 [Results](gemma4-12b-h100-data/bf16-lean-throughput8k-output128.json) include the
 raw measurement file hash. Serving consistency, cancellation, slot reuse and
 context rejection [passed](gemma4-12b-h100-data/bf16-lean-throughput8k-verify.log).
+
+## Native projection packet and all-op cases
+
+The final native BF16 packet has prefill rungs 128/512/1024/2048 and decode
+rungs 1/2/4/8/16. Each decode rung contains 718 instructions: 328 layer GEMVs
+bind native role 8, with an object hash and ABI checked at load. The LM head
+remains an interpreter GEMV. Unfusing projections also exposes 48 GLU ops and
+additional RMSNorm ops; residual/normalization fusion remains intact.
+
+The audit now rejects unknown opcodes, invalid queue bounds, and instructions
+without queue coverage. It groups every instruction into per-rung cases using
+opcode, launch blocks, immediate bits, operand extents, and declared roles.
+Cases retain all PCs, so repeated layer sites cannot disappear from the audit.
+They identify specialization work; they do not certify a selected runtime
+kernel or infer dtype from byte counts.
+
+Four packet configurations passed: 36 programs and 25,256 instructions, with
+exact case-to-instruction parameter/role coverage. The
+[all-op snapshot](gemma4-12b-h100-data/all-op-ladder-coverage.json) records each
+packet hash, rung, case count and op counts. The
+[native route snapshot](gemma4-12b-h100-data/native-tc-final-coverage.json)
+records 1,640 native projection sites across its five decode rungs.
+
+Still unqualified: per-rung LM-head selection, RMSNorm, residual norms, GLU,
+embedding, softcap, argmax, and the full attention/history matrix. BF16 native
+projection evidence does not qualify FP8, AMD or CPU. All-op specialization
+is incomplete; no blanket fast-path claim is made.

@@ -61,7 +61,10 @@ pub(super) fn validate_cublaslt_ladder(blob: &DevBlob, metadata: &SegmentRoles) 
                 )
             })?
             .roles;
-        if !roles.contains(&plow_asset::segment_roles::CUBLASLT)
+        if !roles
+            .iter()
+            .copied()
+            .any(plow_asset::segment_roles::is_projection)
             || previous_roles.is_some_and(|previous| previous != roles)
         {
             return Err(RuntimeError::Rejected(
