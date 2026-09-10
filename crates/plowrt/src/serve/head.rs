@@ -128,6 +128,31 @@ impl HeadPool {
                     .into(),
             ));
         }
+        // REFUSE ON THE PACKET BEFORE PAYING FOR THE WEIGHTS. Whether a model's
+        // caches are addressable as row ranges is a property of the packet
+        // alone, and a twin that cannot hand over should say so in
+        // milliseconds — not after a 22 GiB checkpoint load, which is what the
+        // first cut of this did and what a Gemma-4-12B bundle actually costs.
+        //
+        // Every prefill program is checked, not just one: a packet can reach
+        // the caches through more than one program.
+        let bytes = std::fs::read(twin).map_err(|e| {
+            RuntimeError::Device(format!("CPU twin {}: {e}", twin.display()))
+        })?;
+        let blob = crate::asset::devblob::DevBlob::parse(&bytes)?;
+        let names: Vec<String> = blob.tensors.iter().map(|t| t.name.clone()).collect();
+        let mut pools = Vec::new();
+        for p in &blob.progs {
+            kv_handoff::check_seq_major(&p.insts, &names)?;
+            for entry in kv_handoff::pooled_caches(&p.insts, &names) {
+                if !pools.contains(&entry) {
+                    pools.push(entry);
+                }
+            }
+        }
+        drop(blob);
+        drop(bytes);
+
         let mut opts = opts.clone();
         opts.topology = Some(restrict(&Topology::detect(), cores));
         let eng = CpuEngine::load(twin, checkpoint, &opts)?;
@@ -141,20 +166,6 @@ impl HeadPool {
             ));
         }
         let digest = kvrow::kv_contract_digest(&contract);
-
-        // Every prefill program the head may run has to be addressable as row
-        // ranges, and the check is per program because a packet can reach the
-        // caches through more than one.
-        let names: Vec<String> = blob.tensors.iter().map(|t| t.name.clone()).collect();
-        let mut pools = Vec::new();
-        for p in &blob.progs {
-            kv_handoff::check_seq_major(&p.insts, &names)?;
-            for entry in kv_handoff::pooled_caches(&p.insts, &names) {
-                if !pools.contains(&entry) {
-                    pools.push(entry);
-                }
-            }
-        }
 
         let buckets = eng.prefill_buckets();
         if buckets.is_empty() {
