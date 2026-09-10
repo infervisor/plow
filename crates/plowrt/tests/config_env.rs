@@ -77,7 +77,7 @@ fn env_zero_and_one_mean_false_and_true() {
         .unwrap();
     let resolved = RuntimeConfig::from_arg_matches(&matches).unwrap();
     let replay = plowrt::config::serve_replay(&matches);
-    assert_eq!(resolved.nv.pf_interleave, 0);
+    assert_eq!(resolved.pf_interleave, 0);
     assert_eq!(replay["PLOW_PF_INTERLEAVE"], "0");
     assert_eq!(replay["PLOW_PF_CHUNK"], "4096");
     assert_eq!(replay["PLOW_HSACO_LOWRUNG"], "");
