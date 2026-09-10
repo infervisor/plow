@@ -5414,29 +5414,25 @@ pub struct AmdEngine {
     seg_window: bool,
 }
 
-/// Batch-width-matched decode tiers sitting next to the primary object directory, as the
-/// `dir:width[,dir:width]` spec `PLOW_HSACO_LOWRUNG` takes.
-///
-/// `scripts/build_gfx942.sh PLOW_DECODE_TIERS=1,2` writes `<objdir>/lowrung<w>/`. Only widths
-/// that actually carry a decode object are returned, so a half-finished build contributes
-/// nothing rather than a path that fails to open later. Returns `None` when there are none,
-/// which keeps `PLOW_HSACO_LOWRUNG` unset and the load byte-identical to before.
-fn discover_lowrung_tiers(hsaco_dir: &Path) -> Option<String> {
-    // The widths the ladder can express. Ordered, because the spec is parsed as an ordered
-    // rung table and an unordered one would put a wider tier in front of a narrower rung.
-    let spec = [1u32, 2, 4, 8]
-        .iter()
-        .filter_map(|w| {
-            let d = hsaco_dir.join(format!("lowrung{w}"));
-            // Probe the same object name the gq decode load asks for. Any decode object in
-            // the directory would do as an existence check, but probing the one that is
-            // actually opened means a directory that would fail at load fails here instead.
-            d.join("interp_decode_gq.elf")
-                .is_file()
-                .then(|| format!("{}:{}", d.display(), w))
+fn discover_lowrung_tiers(hsaco_dir: &Path, object: &str) -> Option<String> {
+    let mut tiers = std::fs::read_dir(hsaco_dir)
+        .ok()?
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let name = entry.file_name();
+            let width = name.to_str()?.strip_prefix("lowrung")?.parse::<u32>().ok()?;
+            let dir = entry.path();
+            (width > 0 && dir.join(object).is_file()).then_some((width, dir))
         })
         .collect::<Vec<_>>();
-    (!spec.is_empty()).then(|| spec.join(","))
+    tiers.sort_by_key(|(width, _)| *width);
+    (!tiers.is_empty()).then(|| {
+        tiers
+            .iter()
+            .map(|(width, dir)| format!("{}:{width}", dir.display()))
+            .collect::<Vec<_>>()
+            .join(",")
+    })
 }
 
 impl AmdEngine {
@@ -6118,7 +6114,8 @@ impl AmdEngine {
             // An explicit setting still wins, and an empty one still means "off" — this
             // only fills in the value the directory layout already implies.
             .or_else(|| {
-                let found = discover_lowrung_tiers(hsaco_dir);
+                let name = object_name(Phase::Decode, variant, prefill_arm, sched_decode);
+                let found = discover_lowrung_tiers(hsaco_dir, &name);
                 // LOGGED, because a derived decision is the one thing an env dump cannot show.
                 // `serve_replay` records what the operator set; this is what the layout decided
                 // for them, and the difference between the two is 24.9% output tok/s.
@@ -6129,7 +6126,7 @@ impl AmdEngine {
                     ),
                     None => tracing::info!(
                         dir = %hsaco_dir.display(),
-                        "no decode tiers: no lowrung<w>/ beside the object dir. A packet whose \
+                        "no decode tiers: no matching {name} in lowrung<w>/ beside the object dir. A packet whose \
                          decode ladder is wider than 1 runs the wide object's body at every rung \
                          — build them with scripts/build_gfx942.sh PLOW_DECODE_TIERS=…"
                     ),
@@ -6167,7 +6164,7 @@ impl AmdEngine {
             // the same", which was taken as evidence for a protocol floor that does not exist.
             // Rebuilt into the object this line names, the same ablation moves the token by
             // 11.8% (perf-data/plow-gfx942/glm52-packet-protocol-xcd.md).
-            tracing::info!(object = %name, ?phase, ?variant, ?prefill_arm, ?sched,
+            tracing::info!(object = %name, path = %path.display(), ?phase, ?variant, ?prefill_arm, ?sched,
                            "code object");
             let image = std::fs::read(&path).map_err(|e| {
                 if phase == Phase::Prefill && prefill_arm != PrefillArm::None {

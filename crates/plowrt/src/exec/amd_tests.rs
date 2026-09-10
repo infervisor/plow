@@ -4462,3 +4462,47 @@ fn only_append_only_kv_caches_skip_zeroing() {
         assert!(!kv_skips_zeroing(n));
     }
 }
+
+#[test]
+fn decode_tier_discovery_matches_variant_scheduler_and_orders_all_widths() {
+    let root = std::env::temp_dir().join(format!(
+        "plow-decode-tier-discovery-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    for (dir, file) in [
+        ("lowrung20", "interp_decode_fp8kv_gq.elf"),
+        ("lowrung16", "interp_decode_fp8kv_gq.elf"),
+        ("lowrung1", "interp_decode_fp8kv_gq.elf"),
+        ("lowrung2", "interp_decode_gq.elf"),
+        ("lowrung4", "interp_decode_fp8kv.elf"),
+        ("lowrung0", "interp_decode_fp8kv_gq.elf"),
+        ("lowrungbad", "interp_decode_fp8kv_gq.elf"),
+        ("lowrung8", "unfinished.tmp"),
+    ] {
+        std::fs::create_dir_all(root.join(dir)).unwrap();
+        std::fs::write(root.join(dir).join(file), []).unwrap();
+    }
+    for (variant, sched, widths) in [
+        (Variant::Fp8Kv, Sched::GlobalQueue, vec![1, 16, 20]),
+        (Variant::Fp8Kv, Sched::Static, vec![4]),
+        (Variant::Bf16, Sched::GlobalQueue, vec![2]),
+        (Variant::Fp8, Sched::GlobalQueue, vec![]),
+    ] {
+        let name = object_name(Phase::Decode, variant, PrefillArm::MlaMoe, sched);
+        let want = (!widths.is_empty()).then(|| {
+            widths
+                .iter()
+                .map(|w| format!("{}:{w}", root.join(format!("lowrung{w}")).display()))
+                .collect::<Vec<_>>()
+                .join(",")
+        });
+        assert_eq!(discover_lowrung_tiers(&root, &name), want);
+    }
+    std::fs::remove_dir_all(&root).unwrap();
+    assert_eq!(discover_lowrung_tiers(&root, "interp_decode_gq.elf"), None);
+}

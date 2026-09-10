@@ -194,6 +194,30 @@ to the prefill command. The capture must contain the six files described by
 the existing sparse MLA benchmark. Reproducing the old defect requires building
 against `op_attention.h` at `f5f15dd2` and adding `--record-failure`.
 
+## Batch capacity with FP8 held constant
+
+A matched 20-request, 70k/700-token, concurrency-20 screen compared batch 20
+against batch 16 using the same FP8 KV format, runtime and code objects.
+Both completed 20/20 requests and passed 18/18 retrieval cases at concurrency 20.
+
+| Metric | Batch 16 | Batch 20 | Change |
+|---|---:|---:|---:|
+| Output tok/s | 31.283 | 37.116 | +18.65% |
+| Mean TTFT, ms | 132735.60 | 115702.83 | -12.83% |
+| Mean TPOT, ms | 296.94 | 335.94 | +13.13% |
+| P99 TPOT, ms | 411.27 | 476.36 | +15.83% |
+
+All eight ranks in both arms skipped the staged FP8 narrow-batch objects:
+automatic discovery only recognized the BF16 GQ filename. Both arms therefore
+used the same main MM16/WALK1 object at every rung. The capacity comparison
+does not include narrow-tier gains. The loader fix needs a separate serving
+comparison.
+
+Only 5/20 generated texts match exactly. This single pair included CPU compiler
+activity and is not the 100-request H200 comparison. Throughput improved while
+decode latency worsened; no default changes follow from this screen. See
+[results and provenance](mi300x-capacity.json).
+
 ## External compatibility references
 
 [vLLM's KV quantization documentation](https://github.com/vllm-project/vllm/blob/main/docs/features/quantization/quantized_kvcache.md)
