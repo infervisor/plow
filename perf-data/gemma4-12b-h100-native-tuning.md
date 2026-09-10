@@ -103,8 +103,15 @@ pairing hash remain identical. All 45 manifest tests pass.
 
 The next HD256 candidate uses BKV64. Eight standalone cases pass the independent
 FP64 oracle and CUDA memcheck (zero errors). In the mapped ragged case, BKV32
-takes 81.581 us versus 60.778 us for BKV64. This candidate still needs serving
-validation; the checked-in recipe retains the serving-tested BKV32 selection.
+takes 81.581 us versus 60.778 us for BKV64. The combined interpreter increases
+static spill loads from 192 to 532 bytes ordinary and 600 to 1,048 bytes packed.
+These are compiler reports, not measured executed spill traffic.
+
+The BKV64 serving candidate passes the same correctness checks. Three-repeat
+diagnostic median TTFT is 80.00/931.80 ms at 1K C1/C16 and 1,239.10/21,151.79 ms
+at 16K C1/C16. The standalone gain does not establish a clear serving win versus
+the previous candidate. The checked-in recipe retains BKV32; isolating the
+attention bodies deserves measurement before increasing resource coupling.
 
 ## References and reproduction
 
