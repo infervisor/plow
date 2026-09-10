@@ -42,6 +42,10 @@ fn pf_chunk_cost_rows() -> usize {
 use crate::asset::devblob::DevBlob;
 use crate::device::cuda::{CudaBackend, CudaEvent, CudaStream, KernelFn, PinnedHost};
 use crate::device::{Backend, DeviceMem, Module};
+use super::kv_layout::{kv_tensor_name, RingWindow};
+use crate::memory::slab_pad;
+#[cfg(test)]
+use crate::memory::SLAB_ALIGN;
 use crate::{Result, RuntimeError};
 use plow_asset::cubin::{self, Role};
 
@@ -367,24 +371,6 @@ fn load_profile() -> bool {
     RuntimeConfig::get().load_profile
 }
 
-/// Stride between tensors carved out of the weight slab.
-///
-/// This is the STRIDE, not a claim about the resulting addresses: a tensor lands
-/// at `slab.base + k*SLAB_ALIGN`, so its true alignment is whatever `cuMemAlloc`
-/// gave the base — 256 B by contract, in practice the allocation granularity for
-/// a request this size. That floor already clears everything the kernels ask of a
-/// global address (TMA on sm_90a wants 128 B, `cp.async` 16 B), so the stride is
-/// chosen for padding waste — a few MiB across a blob — and not to raise it.
-const SLAB_ALIGN: u64 = 4096;
-
-/// Bytes a tensor of `bytes` occupies in the slab, trailing pad included.
-///
-/// The sizing pass sums this and the carve advances by it, over the same list —
-/// they must agree exactly or the carve runs past the allocation.
-fn slab_pad(bytes: u64) -> u64 {
-    bytes.div_ceil(SLAB_ALIGN) * SLAB_ALIGN
-}
-
 /// The shared storage-source enum (`Vmm` is the CUDA default —
 /// `PLOW_WEIGHT_VMM=0` drops to `Flat`, `PLOW_WEIGHT_SLAB=0` to `PerTensor`;
 /// see the `_weight_slab` field doc for the measurements) and its commit
@@ -452,18 +438,6 @@ struct VmmServe {
     /// Sliding ring rows (`min(max_ctx, KV_RING)`), a power of two.
     ring: u64,
     snap_row_bytes: u64,
-}
-
-/// `kv.{l}.k` / `kv.{l}.v` → `(layer, 0|1)`.
-fn kv_tensor_name(name: &str) -> Option<(u32, u32)> {
-    let rest = name.strip_prefix("kv.")?;
-    let (l, t) = rest.split_once('.')?;
-    let layer = l.parse().ok()?;
-    match t {
-        "k" => Some((layer, 0)),
-        "v" => Some((layer, 1)),
-        _ => None,
-    }
 }
 
 use crate::asset::checkpoint::Checkpoint;
@@ -4947,18 +4921,20 @@ impl GpuEngine {
     /// two runs (ring wrap).
     fn vmm_slide_copy(&self, b: usize, p_a: u32, buf: u64, to_snap: bool) -> Result<()> {
         let v = self.vmm.as_ref().expect("vmm_slide_copy without vmm");
+        if v.slide.is_empty() {
+            return Ok(());
+        }
         let g = v.kv.geometry();
-        let w = g.window.min(p_a) as u64;
+        let span = RingWindow::new(p_a.into(), g.window.into(), v.ring);
+        let w = span.rows;
         let hd_b = (g.hd_slide * g.elem_slide) as u64;
-        let start = (p_a as u64 - w) & (v.ring - 1);
-        let run1 = w.min(v.ring - start);
         let mut off = buf;
         for &(ik, iv, stride) in &v.slide {
             for idx in [ik, iv] {
                 let base = self.devp[idx].base + b as u64 * stride;
                 for (dev, snap, rows) in [
-                    (base + start * hd_b, off, run1),
-                    (base, off + run1 * hd_b, w - run1),
+                    (base + span.start * hd_b, off, span.first),
+                    (base, off + span.first * hd_b, w - span.first),
                 ] {
                     let ring = (dev, v.ring * hd_b);
                     let snapshot = (snap, w * hd_b);
@@ -4990,7 +4966,6 @@ impl GpuEngine {
     fn vmm_scale_copy(&self, b: usize, p_a: u32, buf: u64, to_snap: bool) -> Result<()> {
         let v = self.vmm.as_ref().expect("vmm_scale_copy without vmm");
         let g = v.kv.geometry();
-        let w = g.window.min(p_a) as u64;
         let ring = v.ring;
         let mut off = buf;
         let mut blit = |dev: u64, snap: u64, bytes: u64| -> Result<()> {
@@ -5001,15 +4976,15 @@ impl GpuEngine {
             }
         };
         for &(sk, sv) in &v.slide_scale {
+            let span = RingWindow::new(p_a.into(), g.window.into(), ring);
+            let w = span.rows;
             for idx in [sk, sv] {
                 let base = self.devp[idx].base + b as u64 * g.kvh_slide as u64 * ring * 4;
                 for h in 0..g.kvh_slide as u64 {
                     let hb = base + h * ring * 4;
-                    let start = (p_a as u64 - w) & (ring - 1);
-                    let run1 = w.min(ring - start);
-                    blit(hb + start * 4, off, run1 * 4)?;
-                    if run1 < w {
-                        blit(hb, off + run1 * 4, (w - run1) * 4)?;
+                    blit(hb + span.start * 4, off, span.first * 4)?;
+                    if span.first < w {
+                        blit(hb, off + span.first * 4, (w - span.first) * 4)?;
                     }
                     off += w * 4;
                 }

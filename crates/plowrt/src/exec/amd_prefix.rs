@@ -1,4 +1,5 @@
 use crate::asset::devblob::DevTensor;
+use crate::exec::kv_layout::RingWindow;
 use packet::dev::{DevInst64, DevOp};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -30,20 +31,18 @@ impl Region {
             copy(0, 0, self.slot_bytes);
             return;
         }
-        let take = rows.min(self.window);
-        let start = rows.saturating_sub(self.window) % self.ring;
-        let first = take.min(self.ring - start);
+        let span = RingWindow::new(rows.into(), self.window.into(), self.ring.into());
         for head in 0..self.heads as u64 {
             let dst = head * self.window as u64 * self.row_bytes;
-            let src = (head * self.ring as u64 + start as u64) * self.row_bytes;
-            if first > 0 {
-                copy(dst, src, first as u64 * self.row_bytes);
+            let src = (head * self.ring as u64 + span.start) * self.row_bytes;
+            if span.first > 0 {
+                copy(dst, src, span.first * self.row_bytes);
             }
-            if take > first {
+            if span.rows > span.first {
                 copy(
-                    dst + first as u64 * self.row_bytes,
+                    dst + span.first * self.row_bytes,
                     head * self.ring as u64 * self.row_bytes,
-                    (take - first) as u64 * self.row_bytes,
+                    (span.rows - span.first) * self.row_bytes,
                 );
             }
         }

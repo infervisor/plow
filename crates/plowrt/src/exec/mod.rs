@@ -4,6 +4,9 @@
 //! out-of-band channel, and brings the persistent kernels up once. The hot path
 //! (enqueue packet, poll counter) touches only lock-free structures here.
 
+#[cfg(any(feature = "hsa", feature = "cuda"))]
+mod kv_layout;
+
 /// The AMD/gfx950 serving engine — a port of the proven `gemma4_chat.c` driver,
 /// deliberately separate from the CUDA engine because the two differ in kind
 /// (segmented dispatch, three kernels, per-phase scheduler, static LDS).

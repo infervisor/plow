@@ -141,20 +141,11 @@ use crate::exec::kvrow::{
 };
 use crate::exec::{amd_gemm_lt, amd_index_tp, amd_moe_aiter, amd_sparse_mla};
 use crate::memory::vmm::{VmmGeometry, VmmKv, VmmOps, WeightSlab};
+use super::kv_layout::kv_tensor_name;
+use crate::memory::slab_pad;
+#[cfg(test)]
+use crate::memory::SLAB_ALIGN;
 use crate::{Result, RuntimeError};
-
-/// `kv.{l}.k` / `kv.{l}.v` → `(layer, 0|1)`. Scales and every other `kv.*`
-/// spelling return `None` and stay on the ordinary allocator.
-fn kv_tensor_name(name: &str) -> Option<(u32, u32)> {
-    let rest = name.strip_prefix("kv.")?;
-    let (l, t) = rest.split_once('.')?;
-    let layer = l.parse().ok()?;
-    match t {
-        "k" => Some((layer, 0)),
-        "v" => Some((layer, 1)),
-        _ => None,
-    }
-}
 
 /// u32 slots per counter (`PLOW_CTR_STRIDE`), i.e. one 128 B cache line.
 const CTR_STRIDE_U32: usize = 32;
@@ -6172,26 +6163,6 @@ fn prefault_ns(src: &[u8]) -> u64 {
 }
 
 use crate::asset::checkpoint::{prefetch_depth, prefetch_threads};
-
-/// Stride between tensors carved out of the weight slab. Mirrors `exec::gpu`.
-///
-/// The STRIDE, not a claim about the resulting addresses: a tensor lands at
-/// `slab.base + k*SLAB_ALIGN`, so its true alignment is whatever the pool gave
-/// the base. ROCr reports `RUNTIME_ALLOC_GRANULE` = 4 KiB and allocates on it,
-/// and for a request the size of a model's weights it hands back far more (the
-/// measured rounding is to 2 MiB). Either floor already clears what the kernels
-/// ask of a global address — `global_load_dwordx4` wants 16 B, the MFMA tile
-/// loads no more — so the stride is chosen for padding waste, a few MiB across a
-/// blob, and not to raise alignment.
-const SLAB_ALIGN: u64 = 4096;
-
-/// Bytes a tensor of `bytes` occupies in the slab, trailing pad included.
-///
-/// The sizing pass sums this and the carve advances by it, over the same list —
-/// they must agree exactly or the carve runs past the allocation.
-fn slab_pad(bytes: u64) -> u64 {
-    bytes.div_ceil(SLAB_ALIGN) * SLAB_ALIGN
-}
 
 /// The bytes rank `rank` will actually TOUCH for `name`, as a queueable span.
 ///
