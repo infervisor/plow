@@ -814,3 +814,54 @@ profiling replaces graph execution, so these are diagnostic attribution
 times rather than normal serving latency.
 [Raw results, hashes, packet inventory and limits](gemma4-12b-h100-data/attention-kv64-summary.json),
 [actual-role rung checks](gemma4-12b-h100-data/attention-kv64-rungs.jsonl).
+
+## HD512 fixed head geometry
+
+The dedicated role specializes 16 query heads, one KV head, no sliding window
+and one split, passing those constants into the existing native body. Other
+head geometries keep the generic path. Query length, history, request slots,
+stride, mask and scale remain dynamic. This preserves the KV32 softmax tile
+and its TMA pipeline. The object uses 224 registers and zero stack/spills.
+Enable with `PLOW_BUILD_MASKED_PADDING=1 PLOW_BUILD_PFATTN_FIXED_HEADS=1` in
+the segment build script; copy the role object into the asset directory
+before compilation. Default remains off because serving results are mixed.
+This screen uses KV32; combining fixed heads with KV64 is not qualified here.
+
+| Query rows | Control TMA µs | Fixed geometry TMA µs |
+|---:|---:|---:|
+| 128 | 1437.824 | 1280.480 |
+| 512 | 1437.952 | 1271.808 |
+| 1024 | 2794.304 | 2527.520 |
+| 2048 | 5447.680 | 4841.376 |
+| 4096 | 10042.752 | 9035.937 |
+| 8192 | 16972.863 | 15568.032 |
+
+Actual-role runs alternate object order across rungs. All 24 mapped/unmapped
+cases pass sampled FP64 checks at history ending at 16K; every output byte
+matches the control at each rung. Ragged memcheck reports zero errors.
+These are isolated warm-cache timings, not full-model throughput.
+
+A preceding experiment computed QK/softmax only in warpgroup0 and shared row
+statistics through the drained K slot. It passed the sampled oracle but
+slowed the 1024-row mapped case to 4074.432 µs versus a fresh 2813.920 µs
+control. The compiler warned of WGMMA serialization around the divergent
+path. That implementation was rejected and is absent from production code.
+
+Fresh sequential serving keeps the B32 native-head packet settings and SMEPI
+GEMM objects fixed: context20480, request chunk1024, aggregate8192, output128,
+two repeats after one warmup per cell. Both variants pass serving verification;
+all 264 requests return 128 tokens/cache0 and all 132 paired texts match.
+
+| Input / concurrency | Control tok/s | Fixed geometry tok/s |
+|---|---:|---:|
+| 1K / C1 | 75.123 | 75.184 |
+| 1K / C32 | 795.742 | 797.126 |
+| 16K / C1 | 45.844 | 46.086 |
+| 16K / C32 | 113.832 | 110.117 |
+
+16K/C1 median TTFT improves 1062.827→1053.988 ms. C32 throughput declines
+in this screen despite faster isolated attention. This does not establish
+the cause of the serving difference or a throughput win. No fresh C128 or
+vLLM comparison was run for this candidate. The goal remains unmet.
+[Evidence and artifact hashes](gemma4-12b-h100-data/attention-exactshape-summary.json),
+[full-output rung checks](gemma4-12b-h100-data/attention-exactshape-rungs.jsonl).

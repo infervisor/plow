@@ -1,0 +1,26 @@
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 8120 by compiler to allow use of registers in GMMA in function 'plow_sm90a_pfattn_hd512'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 8153 by compiler to allow use of registers in GMMA in function 'plow_sm90a_pfattn_hd512'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 8186 by compiler to allow use of registers in GMMA in function 'plow_sm90a_pfattn_hd512'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 8219 by compiler to allow use of registers in GMMA in function 'plow_sm90a_pfattn_hd512'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 8229 by compiler to allow use of registers in GMMA in function 'plow_sm90a_pfattn_hd512'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 16579 by compiler to allow use of registers in GMMA in function 'plow_sm90a_pfattn_hd512'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 16612 by compiler to allow use of registers in GMMA in function 'plow_sm90a_pfattn_hd512'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 16645 by compiler to allow use of registers in GMMA in function 'plow_sm90a_pfattn_hd512'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 16678 by compiler to allow use of registers in GMMA in function 'plow_sm90a_pfattn_hd512'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 16689 by compiler to allow use of registers in GMMA in function 'plow_sm90a_pfattn_hd512'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 3234 by compiler to allow use of registers in GMMA in function 'plow_sm90a_pfattn_hd512'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 3267 by compiler to allow use of registers in GMMA in function 'plow_sm90a_pfattn_hd512'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 3300 by compiler to allow use of registers in GMMA in function 'plow_sm90a_pfattn_hd512'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 3333 by compiler to allow use of registers in GMMA in function 'plow_sm90a_pfattn_hd512'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 3343 by compiler to allow use of registers in GMMA in function 'plow_sm90a_pfattn_hd512'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 12250 by compiler to allow use of registers in GMMA in function 'plow_sm90a_pfattn_hd512'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 12283 by compiler to allow use of registers in GMMA in function 'plow_sm90a_pfattn_hd512'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 12316 by compiler to allow use of registers in GMMA in function 'plow_sm90a_pfattn_hd512'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 12349 by compiler to allow use of registers in GMMA in function 'plow_sm90a_pfattn_hd512'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 12360 by compiler to allow use of registers in GMMA in function 'plow_sm90a_pfattn_hd512'
+ptxas info    : 28 bytes gmem
+ptxas info    : Compiling entry function 'plow_sm90a_pfattn_hd512' for 'sm_90a'
+ptxas info    : Function properties for plow_sm90a_pfattn_hd512
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 224 registers, used 1 barriers, 16 bytes smem
+ptxas info    : Compile time = 979.216 ms

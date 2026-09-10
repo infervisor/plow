@@ -12,6 +12,9 @@
 #error "HD512 KV64 requires the WGMMA body"
 #endif
 constexpr int FA512_KV_TILE = PLOW_NV_FA512_KV64 ? 64 : 32;
+#ifndef PLOW_NV_FA512_FIXED_HEADS
+#define PLOW_NV_FA512_FIXED_HEADS 0
+#endif
 
 #if PLOW_NV_PACKED_REQUEST && PLOW_NV_FA512_WG
 extern "C" __device__ __constant__ unsigned plow_pf_request_abi = 2;
@@ -50,6 +53,7 @@ __device__ __forceinline__ PlowStreamEnt attention_stream_ent(const PlowStreamEn
     return entry;
 }
 
+template <bool GEMMA = false>
 __device__ __forceinline__ void attention_body(const PlowDevInst* in, void* const* tensors,
                                              unsigned slice, unsigned nblk, float* arena) {
     const unsigned t0 = in->t[0], t1 = in->t[1], t2 = in->t[2], t3 = in->t[3];
@@ -73,8 +77,9 @@ __device__ __forceinline__ void attention_body(const PlowDevInst* in, void* cons
         static_cast<const __nv_bfloat16*>(tensors[t2]),
         static_cast<const __nv_bfloat16*>(tensors[t3]),
         static_cast<const __nv_bfloat16*>(tensors[t4]),
-        output, in->i[0], in->i[1], in->i[2], in->i[3],
-        in->i[4], in->i[5], in->i[7], in->fj[1].u, in->fj[2].u, in->fj[0].f, slice, nblk,
+        output, in->i[0], in->i[1], GEMMA ? 16 : in->i[2], GEMMA ? 1 : in->i[3],
+        in->i[4], GEMMA ? 0 : in->i[5], GEMMA ? 1 : in->i[7], in->fj[1].u,
+        in->fj[2].u, in->fj[0].f, slice, nblk,
 #if PLOW_NV_FA512_WG
         arena, t7 == PLOW_TENSOR_NONE ? nullptr : tensors[t7]);
 #else
@@ -102,7 +107,11 @@ void plow_sm90a_pfattn_hd512(PlowProgram prog) {
         __syncthreads();
 
         const PlowDevInst* const in = prog.insts + entry.inst;
-        attention_body(in, prog.tensors, entry.slice, in->blocks, arena);
+        if (PLOW_NV_FA512_FIXED_HEADS && PLOW_NV_FA512_WG && in->i[2] == 16 && in->i[3] == 1 &&
+            in->i[7] == 1 && in->i[5] == 0)
+            attention_body<true>(in, prog.tensors, entry.slice, in->blocks, arena);
+        else
+            attention_body(in, prog.tensors, entry.slice, in->blocks, arena);
     }
 
     __syncthreads();
