@@ -96,12 +96,19 @@ pub fn parse(s: &str) -> Result<Reference, String> {
         ));
     }
 
-    let (path, label) = match rest.split_once(':') {
-        Some((p, l)) => {
+    // A label is separated by `:`, but so is a URL scheme and a port. Only a
+    // colon AFTER the last `/` can introduce a label — which makes
+    // `file:///mirror/ns/name` and `host:8080/ns/name` parse, and those are the
+    // forms a local mirror and a private registry actually take.
+    let last_slash = rest.rfind('/').map_or(0, |i| i + 1);
+    let (path, label) = match rest[last_slash..].find(':') {
+        Some(off) => {
+            let at = last_slash + off;
+            let l = &rest[at + 1..];
             if !segment_ok(l) {
                 return Err(format!("{s}: `{l}` is not a valid variant label"));
             }
-            (p, Some(l.to_string()))
+            (&rest[..at], Some(l.to_string()))
         }
         None => (rest, None),
     };
@@ -111,29 +118,49 @@ pub fn parse(s: &str) -> Result<Reference, String> {
         ));
     }
 
-    let parts: Vec<&str> = path.split('/').collect();
+    // Peel a URL scheme so its `//` does not read as empty path segments; a
+    // `file://` registry's own path then keeps every slash it needs.
+    let (scheme, body) = match path.find("://") {
+        Some(i) => (&path[..i + 3], &path[i + 3..]),
+        None => ("", path),
+    };
+
+    // The LAST two segments are always the namespace and name; everything
+    // before them is the registry, however many slashes it contains. That is
+    // what lets `file:///tmp/store/infervisor/kimi-k3` round-trip.
+    // A registry may span several segments — `file:///tmp/store`, or a host
+    // with a path prefix — but only when it is unambiguous: a scheme, or an
+    // absolute path. A bare reference stays at three segments, so a typo like
+    // `a/b/c/d` is still refused rather than read as a two-segment registry.
+    let rooted = !scheme.is_empty() || body.starts_with('/');
+    let parts: Vec<&str> = body.split('/').collect();
     let (registry, namespace, name) = match parts.as_slice() {
-        [name] => (DEFAULT_REGISTRY, DEFAULT_NAMESPACE, *name),
-        [ns, name] => (DEFAULT_REGISTRY, *ns, *name),
-        [reg, ns, name] => (*reg, *ns, *name),
+        [name] if !rooted => (DEFAULT_REGISTRY.to_string(), DEFAULT_NAMESPACE, *name),
+        [ns, name] if !rooted => (DEFAULT_REGISTRY.to_string(), *ns, *name),
+        [reg, ns, name] if !rooted => (reg.to_string(), *ns, *name),
+        [.., ns, name] if rooted && parts.len() >= 3 => {
+            let reg_body = &parts[..parts.len() - 2];
+            (format!("{scheme}{}", reg_body.join("/")), *ns, *name)
+        }
         _ => {
             return Err(format!(
-                "{s}: expected [<registry>/]<namespace>/<name>, got {} segments",
+                "{s}: expected [<registry>/]<namespace>/<name>, got {} segment(s)",
                 parts.len()
             ))
         }
     };
-    for (what, seg) in [
-        ("registry", registry),
-        ("namespace", namespace),
-        ("name", name),
-    ] {
+    // The registry may legitimately contain `/`, `:` and `.`; the namespace and
+    // name may not.
+    if registry.is_empty() || registry.ends_with('/') {
+        return Err(format!("{s}: `{registry}` is not a valid registry"));
+    }
+    for (what, seg) in [("namespace", namespace), ("name", name)] {
         if !segment_ok(seg) {
             return Err(format!("{s}: `{seg}` is not a valid {what}"));
         }
     }
     Ok(Reference {
-        registry: registry.to_string(),
+        registry,
         namespace: namespace.to_string(),
         name: name.to_string(),
         label,
@@ -239,6 +266,41 @@ mod tests {
         ] {
             assert!(parse(bad).is_err(), "accepted {bad:?}");
         }
+    }
+
+    // `ls --upgradable` and `upgrade --all` re-parse the pin they wrote. A
+    // `file://` registry is the air-gapped path and the one every test uses, so
+    // failing to round-trip it broke exactly the case that matters most.
+    #[test]
+    fn a_file_registry_round_trips_through_its_own_pin() {
+        let r = parse("file:///tmp/gpuval/store/infervisor/gemma-4-31b").unwrap();
+        assert_eq!(r.registry, "file:///tmp/gpuval/store");
+        assert_eq!(r.namespace, "infervisor");
+        assert_eq!(r.name, "gemma-4-31b");
+        assert_eq!(r.label, None);
+
+        // The pin key must parse back to the same reference.
+        let again = parse(&r.pin_key()).unwrap();
+        assert_eq!(again, r);
+
+        // And a label still works on top of one.
+        let r = parse("file:///tmp/store/ns/name:gfx942-mi300x-tp1@g2").unwrap();
+        assert_eq!(r.registry, "file:///tmp/store");
+        assert_eq!(r.label.as_deref(), Some("gfx942-mi300x-tp1"));
+        assert_eq!(r.generation, Some(2));
+    }
+
+    // A colon before the last slash is a scheme or a port, never a label.
+    #[test]
+    fn a_registry_port_is_not_a_label() {
+        let r = parse("mirror.internal:8080/infervisor/kimi-k3").unwrap();
+        assert_eq!(r.registry, "mirror.internal:8080");
+        assert_eq!(r.name, "kimi-k3");
+        assert_eq!(r.label, None);
+
+        let r = parse("https://mirror.internal:8443/ns/n:label").unwrap();
+        assert_eq!(r.registry, "https://mirror.internal:8443");
+        assert_eq!(r.label.as_deref(), Some("label"));
     }
 
     #[test]

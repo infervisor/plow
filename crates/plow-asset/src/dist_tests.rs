@@ -524,10 +524,12 @@ fn bundle() -> Bundle {
                 LowRung {
                     max: 1,
                     objset_id: "obj1".into(),
+                    sha256: "1".repeat(64),
                 },
                 LowRung {
                     max: 2,
                     objset_id: "obj2".into(),
+                    sha256: "2".repeat(64),
                 },
             ],
         },
@@ -618,9 +620,17 @@ fn bundle_rejects_structural_damage() {
     b.objset.lowrung[1].max = 1;
     assert!(b.validate().is_err(), "duplicate lowrung width");
 
-    let mut b = base;
+    let mut b = base.clone();
     b.objset.lowrung[0].max = 0;
     assert!(b.validate().is_err());
+
+    // A rung override with no manifest digest is fetched unverified, and its
+    // objects are checked against digests that manifest itself names — so an
+    // unpinned rung can serve arbitrary decode objects.
+    let mut b = base;
+    b.objset.lowrung[0].sha256 = String::new();
+    let err = b.validate().unwrap_err();
+    assert!(err.contains("unverified"), "{err}");
 }
 
 #[test]

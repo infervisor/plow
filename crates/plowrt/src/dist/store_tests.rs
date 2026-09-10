@@ -231,6 +231,48 @@ fn gc_removes_exactly_what_no_bundle_references() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+// Objects live under `bundles/<id>/hsaco/`, so reachability that only looks at
+// the bundle's top level marks every object dead while a bundle still uses it.
+#[test]
+fn gc_sees_objects_nested_under_hsaco() {
+    let (s, root) = store("gc-nested");
+    let pkt = b"packet".to_vec();
+    let obj = b"an object under hsaco".to_vec();
+    let (dp, dobj) = (Digest::of(&pkt), Digest::of(&obj));
+    s.put(&dp, &pkt).unwrap();
+    s.put(&dobj, &obj).unwrap();
+    s.materialize(
+        "v",
+        &[
+            ("model.pkt".into(), dp.clone()),
+            ("hsaco/interp_decode.elf".into(), dobj.clone()),
+        ],
+    )
+    .unwrap();
+
+    let (n, _) = s.gc().unwrap();
+    assert_eq!(n, 0, "both blobs are referenced");
+    assert!(s.has(&dp));
+    assert!(s.has(&dobj), "a nested object must not be collected");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+// A bundle whose record is missing is opaque. Collecting anyway could delete a
+// blob it still needs, so refusing is the only safe answer.
+#[test]
+fn gc_refuses_rather_than_guess_at_an_unrecorded_bundle() {
+    let (s, root) = store("gc-opaque");
+    let bytes = b"orphan".to_vec();
+    let d = Digest::of(&bytes);
+    s.put(&d, &bytes).unwrap();
+    std::fs::create_dir_all(s.root().join("bundles/hand-made")).unwrap();
+
+    let err = s.gc().unwrap_err().to_string();
+    assert!(err.contains("nothing can be collected safely"), "{err}");
+    assert!(s.has(&d), "nothing was collected");
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[test]
 fn open_is_idempotent_and_creates_the_layout() {
     let root = tmp("layout");

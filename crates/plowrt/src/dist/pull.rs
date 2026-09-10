@@ -169,14 +169,19 @@ pub fn resolve(
         want.push((
             Some(l.max),
             format!("v1/objsets/{}.json", l.objset_id),
-            String::new(),
+            l.sha256.clone(),
         ));
     }
+    // Every objset manifest is verified, rung overrides included. Skipping the
+    // rungs would leave a hole in the chain of custody exactly where the decode
+    // objects live: their contents are checked against digests the manifest
+    // itself names, so an unverified manifest can name anything.
     for (rung, path, sha) in want {
         let raw = require(f, &path)?;
-        if !sha.is_empty() && Digest::of(&raw).as_str() != sha {
+        let got = Digest::of(&raw);
+        if got.as_str() != sha {
             return Err(RuntimeError::Dist(format!(
-                "{path}: objset manifest does not match the digest the bundle records"
+                "{path}: objset manifest hashes to {got}, the bundle records {sha}"
             )));
         }
         let set: ObjSet = parse_json(&path, &raw)?;

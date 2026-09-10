@@ -86,8 +86,22 @@ def build(args) -> dict:
 
     target = parse_target(args.target)
     defines_digest = pd.sha256_bytes(pd.canonical_json(defines))
+    # The CONTENT is part of the identity, not just the build inputs. Keying on
+    # inputs alone collides whenever they do not fully determine the output —
+    # a `PLOW_ROWS_ONLY` partial directory and a full build share their defines,
+    # and a directory with no `build_defines.json` shares them with every other
+    # such directory. Two objsets with one id would overwrite each other at
+    # `v1/objsets/<id>.json`.
+    content_digest = pd.sha256_bytes(
+        pd.canonical_json([[o["name"], o["sha256"]] for o in objects])
+    )
     objset_id = pd.short_id(
-        target["isa"], target["sku"], args.toolchain, defines_digest, args.plow_git
+        target["isa"],
+        target["sku"],
+        args.toolchain,
+        defines_digest,
+        content_digest,
+        args.plow_git,
     )
 
     env = {}
@@ -182,6 +196,19 @@ def self_test() -> None:
             (d / "build_defines.json").write_text(json.dumps({"a": "-DX=2"}))
             three = build(args)
             assert three["objset_id"] != one["objset_id"], "a changed -D must change the id"
+
+            # Two directories with the SAME inputs but DIFFERENT objects must not
+            # share an id: they would overwrite each other in the store. This is
+            # the `PLOW_ROWS_ONLY` shape — a rung override compiled from the same
+            # defines as the full set.
+            (d / "build_defines.json").write_text(json.dumps({"a": "-DX=1"}))
+            (d / "a.elf").write_bytes(b"\x7fELF-different")
+            four = build(args)
+            assert four["objset_id"] != one["objset_id"], (
+                "different objects must not collide on one id"
+            )
+            (d / "a.elf").write_bytes(b"\x7fELF-a")
+            assert build(args)["objset_id"] == one["objset_id"], "identity must be stable"
 
             # A half-stamped object is a broken build, not a general one.
             pd.elf_symbols = lambda p: ["plow_packet_hash_lo_0000dead"]

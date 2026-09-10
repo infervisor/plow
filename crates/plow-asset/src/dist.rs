@@ -238,6 +238,13 @@ pub struct BundleObjset {
 pub struct LowRung {
     pub max: u32,
     pub objset_id: String,
+    /// Digest of this rung's objset MANIFEST.
+    ///
+    /// Required, not optional. Without it a rung override is fetched
+    /// unverified, and since its objects are checked against the digests that
+    /// manifest itself names, a tampered one can serve arbitrary code objects —
+    /// on the decode hot path, which is where the rung overrides live.
+    pub sha256: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -736,6 +743,13 @@ impl Bundle {
         for l in &self.objset.lowrung {
             if l.max == 0 || !rungs.insert(l.max) {
                 return Err(format!("bundle: bad or duplicate lowrung max {}", l.max));
+            }
+            if !is_sha256(&l.sha256) {
+                return Err(format!(
+                    "bundle: lowrung {} has no manifest digest — a rung override fetched \
+                     unverified can serve arbitrary decode objects",
+                    l.max
+                ));
             }
         }
         Ok(())

@@ -53,6 +53,10 @@ impl std::fmt::Display for Digest {
     }
 }
 
+/// Written into each materialized bundle: the digests it links, one per line.
+/// `gc` reads this instead of re-hashing the bundle.
+const BUNDLE_BLOBS: &str = ".plow-blobs";
+
 pub struct Store {
     root: PathBuf,
 }
@@ -195,6 +199,16 @@ impl Store {
                 })?;
             }
         }
+        // What this bundle references, so `gc` can compute reachability without
+        // re-reading the bundle. Re-hashing every file would be O(total bytes) —
+        // tens of GB for a K3 bundle — and walking the directory would have to
+        // recurse into `hsaco/` to see the objects at all.
+        let manifest: String = files.iter().map(|(_, d)| format!("{d}\n")).collect();
+        let mpath = dir.join(BUNDLE_BLOBS);
+        std::fs::write(&mpath, manifest).map_err(|source| RuntimeError::Io {
+            path: mpath,
+            source,
+        })?;
         Ok(dir)
     }
 
@@ -280,14 +294,27 @@ impl Store {
         let bundles = self.root.join("bundles");
         if let Ok(rd) = std::fs::read_dir(&bundles) {
             for bundle in rd.flatten() {
-                let Ok(files) = std::fs::read_dir(bundle.path()) else {
+                if !bundle.path().is_dir() {
                     continue;
-                };
-                for f in files.flatten() {
-                    if let Ok(bytes) = std::fs::read(f.path()) {
-                        live.insert(Digest::of(&bytes).0);
-                    }
                 }
+                let record = bundle.path().join(BUNDLE_BLOBS);
+                let Ok(list) = std::fs::read_to_string(&record) else {
+                    // A bundle whose record is missing is opaque: refusing to
+                    // collect at all is the only safe answer, because deleting a
+                    // blob it still needs would leave it unservable.
+                    return Err(RuntimeError::Dist(format!(
+                        "{}: no {BUNDLE_BLOBS} record, so what it references is unknown and \
+                         nothing can be collected safely. Re-materialize it with `plowrt pull`, \
+                         or remove the directory.",
+                        bundle.path().display()
+                    )));
+                };
+                live.extend(
+                    list.lines()
+                        .map(str::trim)
+                        .filter(|l| !l.is_empty())
+                        .map(String::from),
+                );
             }
         }
         let (mut n, mut freed) = (0usize, 0u64);

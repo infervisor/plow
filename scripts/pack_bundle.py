@@ -118,6 +118,8 @@ def build(args) -> dict:
     else:
         tokenizer = {"source": "checkpoint", "file": "tokenizer.json", "verified": False}
 
+    lowrung = build_lowrung(args.lowrung)
+
     weights = pd.load_json(assets / "weights.json") if (assets / "weights.json").exists() else {}
     network = args.network or weights.get("network")
     if not network:
@@ -154,7 +156,7 @@ def build(args) -> dict:
             "objset_id": objset["objset_id"],
             "manifest": f"v1/objsets/{objset['objset_id']}.json",
             "sha256": pd.sha256_bytes(pd.canonical_json(objset)),
-            "lowrung": [],
+            "lowrung": lowrung,
         },
         "runtime_env": parse_env(args.serve_env),
     }
@@ -163,6 +165,37 @@ def build(args) -> dict:
     if args.recipe:
         doc["recipe"] = args.recipe
     return doc
+
+
+def build_lowrung(specs) -> list:
+    """Narrow-rung decode overrides, each pinned by its manifest DIGEST.
+
+    Not just an id: the objects inside a rung manifest are verified against
+    digests that manifest itself names, so an unverified one could serve
+    arbitrary decode objects — and the rungs are the decode hot path.
+    """
+    out, seen = [], set()
+    for spec in specs or []:
+        if ":" not in spec:
+            pd.die(f"--lowrung expects <max>:<objset.json>, got {spec!r}")
+        max_s, path = spec.split(":", 1)
+        try:
+            max_n = int(max_s)
+        except ValueError:
+            pd.die(f"--lowrung: {max_s!r} is not a rung width")
+        if max_n <= 0 or max_n in seen:
+            pd.die(f"--lowrung: bad or duplicate rung width {max_s!r}")
+        seen.add(max_n)
+        rung = pd.load_json(Path(path))
+        out.append(
+            {
+                "max": max_n,
+                "objset_id": rung["objset_id"],
+                "sha256": pd.sha256_bytes(pd.canonical_json(rung)),
+            }
+        )
+    out.sort(key=lambda r: r["max"])
+    return out
 
 
 def parse_env(items) -> dict:
@@ -208,6 +241,11 @@ def run() -> None:
     ap.add_argument("--tokenizer-generator")
     ap.add_argument("--tokenizer-verified", action="store_true")
     ap.add_argument("--serve-env", action="append", help="KEY=VALUE validated with this bundle")
+    ap.add_argument(
+        "--lowrung",
+        action="append",
+        help="<max>:<objset.json> — a narrow-rung decode override, repeatable",
+    )
     ap.add_argument("--recipe", help="path of the recipe that produced this")
     ap.add_argument("--plow-git", dest="plow_git", default=None)
     ap.add_argument("--out")
@@ -287,6 +325,7 @@ def self_test() -> None:
             tokenizer_generator=None,
             tokenizer_verified=False,
             serve_env=["PLOW_CTR_DBUF=1"],
+            lowrung=None,
             recipe=None,
             plow_git="a" * 40,
         )
