@@ -1,4 +1,5 @@
 use packet::dev::DevOp;
+use plow_asset::segment_roles::{self, SegmentRoles};
 use plowrt::asset::devblob::DevBlob;
 use serde_json::json;
 use std::{
@@ -10,13 +11,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args_os().skip(1);
     let path = PathBuf::from(args.next().ok_or("missing model.pkt")?);
     let output = PathBuf::from(args.next().ok_or("missing output.json")?);
-    let blob = DevBlob::parse(&std::fs::read(&path)?)?;
+    let raw = std::fs::read(&path)?;
+    let blob = DevBlob::parse(&raw)?;
+    let roles = blob
+        .reserved_metadata(&raw, segment_roles::SECTION)?
+        .map(SegmentRoles::from_bytes)
+        .transpose()?;
+    if let Some(roles) = &roles {
+        for program in &roles.programs {
+            let p = blob
+                .progs
+                .get(program.index)
+                .ok_or("role program out of range")?;
+            if program.roles.len() + 1 != p.gq_seg_ofs.len() {
+                return Err("role count does not match packet queue windows".into());
+            }
+        }
+    }
     let decode = blob.decode_rung_lo();
     let programs: Vec<_> = blob
         .progs
         .iter()
         .enumerate()
         .map(|(index, p)| {
+            let program_roles = roles
+                .as_ref()
+                .and_then(|r| r.programs.iter().find(|program| program.index == index));
+            let mut pc_windows = vec![BTreeSet::new(); p.insts.len()];
+            for (window, bounds) in p.gq_seg_ofs.windows(2).enumerate() {
+                for entry in &p.gq_stream[bounds[0] as usize..bounds[1] as usize] {
+                    pc_windows[entry.inst as usize].insert(window);
+                }
+            }
             let mut counts = BTreeMap::<String, usize>::new();
             let insts: Vec<_> = p
                 .insts
@@ -39,7 +65,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .collect();
                     json!({"pc": pc, "op": op, "blocks": inst.blocks,
                    "i": inst.i, "fj_bits": inst.fj, "t": inst.t,
-                   "tensors": tensors, "tensor_bytes": tensor_bytes})
+                   "tensors": tensors, "tensor_bytes": tensor_bytes,
+                   "queue_windows": pc_windows[pc]})
                 })
                 .collect();
             let segments: Vec<_> = p
@@ -49,8 +76,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map(|(window, bounds)| {
                     let entries = &p.gq_stream[bounds[0] as usize..bounds[1] as usize];
                     let pcs: BTreeSet<_> = entries.iter().map(|entry| entry.inst).collect();
+                    let role = program_roles.map(|program| program.roles[window]);
+                    let object = role.and_then(|id| roles.as_ref()?.objects.get(&id));
                     json!({"window": window, "pcs": pcs, "entries": entries.len(),
-                   "segment": entries.first().map(|entry| entry.seg)})
+                    "segment": entries.first().map(|entry| entry.seg),
+                    "declared_role": role, "declared_object": object,
+                    "route": match role {
+                        None => "runtime_selected",
+                        Some(segment_roles::INTERPRETER) => "interpreter",
+                        Some(segment_roles::CUBLASLT) => "cublaslt",
+                        Some(_) => "native_object",
+                    }})
                 })
                 .collect();
             json!({"index": index, "phase": if index < decode {"prefill"} else {"decode"},
@@ -64,7 +100,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         output,
         serde_json::to_vec_pretty(&json!({
             "packet": path, "n_cu": blob.n_cu, "programs": programs,
-            "note": "Emitted instructions only; runtime object and library overrides require separate verification."
+            "note": "Emitted instructions and declared packet roles only. A missing role means runtime-selected routing; an interpreter role can contain specialized or fused bodies. Object loading, runtime overrides, correctness and performance require separate verification."
         }))?,
     )?;
     Ok(())

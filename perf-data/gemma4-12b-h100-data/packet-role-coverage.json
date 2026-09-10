@@ -1,0 +1,677 @@
+[
+  {
+    "asset": "bf16-lean-attention-bits",
+    "packet_sha256": "864f622d88278b93863fa21b9196ec12634e80b5f2a6215f25a7eb27cc2aa083",
+    "arch": "sm_90a",
+    "precision": {
+      "weight_enc": "bf16",
+      "act_enc": "bf16",
+      "kv_enc": "bf16",
+      "expert_enc": "none"
+    },
+    "manifest_cases_checked": true,
+    "all_instructions_have_queue_windows": true,
+    "programs": [
+      {
+        "index": 0,
+        "phase": "prefill",
+        "rows": 128,
+        "instructions": 766,
+        "op_counts": {
+          "Argmax": 1,
+          "ArgmaxFin": 1,
+          "Embed": 1,
+          "FlashPrefill": 48,
+          "Gemm": 329,
+          "Glu": 48,
+          "HeadNormRope": 144,
+          "NormResidual": 96,
+          "RmsNorm": 97,
+          "SoftCap": 1
+        },
+        "declared_window_routes": {
+          "interpreter": 427,
+          "native_object": 8
+        }
+      },
+      {
+        "index": 1,
+        "phase": "prefill",
+        "rows": 512,
+        "instructions": 766,
+        "op_counts": {
+          "Argmax": 1,
+          "ArgmaxFin": 1,
+          "Embed": 1,
+          "FlashPrefill": 48,
+          "Gemm": 329,
+          "Glu": 48,
+          "HeadNormRope": 144,
+          "NormResidual": 96,
+          "RmsNorm": 97,
+          "SoftCap": 1
+        },
+        "declared_window_routes": {
+          "interpreter": 427,
+          "native_object": 8
+        }
+      },
+      {
+        "index": 2,
+        "phase": "prefill",
+        "rows": 1024,
+        "instructions": 766,
+        "op_counts": {
+          "Argmax": 1,
+          "ArgmaxFin": 1,
+          "Embed": 1,
+          "FlashPrefill": 48,
+          "Gemm": 329,
+          "Glu": 48,
+          "HeadNormRope": 144,
+          "NormResidual": 96,
+          "RmsNorm": 97,
+          "SoftCap": 1
+        },
+        "declared_window_routes": {
+          "interpreter": 427,
+          "native_object": 8
+        }
+      },
+      {
+        "index": 3,
+        "phase": "prefill",
+        "rows": 2048,
+        "instructions": 766,
+        "op_counts": {
+          "Argmax": 1,
+          "ArgmaxFin": 1,
+          "Embed": 1,
+          "FlashPrefill": 48,
+          "Gemm": 329,
+          "Glu": 48,
+          "HeadNormRope": 144,
+          "NormResidual": 96,
+          "RmsNorm": 97,
+          "SoftCap": 1
+        },
+        "declared_window_routes": {
+          "interpreter": 427,
+          "native_object": 8
+        }
+      },
+      {
+        "index": 4,
+        "phase": "decode",
+        "rows": 1,
+        "instructions": 542,
+        "op_counts": {
+          "Argmax": 1,
+          "ArgmaxFin": 1,
+          "Embed": 1,
+          "FlashDecode": 48,
+          "FlashMerge": 48,
+          "Gemv": 113,
+          "GemvGlu": 48,
+          "GemvQkv": 40,
+          "HeadNormRope": 144,
+          "NormResidualNorm": 96,
+          "RmsNorm": 1,
+          "SoftCap": 1
+        },
+        "declared_window_routes": {
+          "runtime_selected": 1
+        }
+      },
+      {
+        "index": 5,
+        "phase": "decode",
+        "rows": 2,
+        "instructions": 542,
+        "op_counts": {
+          "Argmax": 1,
+          "ArgmaxFin": 1,
+          "Embed": 1,
+          "FlashDecode": 48,
+          "FlashMerge": 48,
+          "Gemv": 113,
+          "GemvGlu": 48,
+          "GemvQkv": 40,
+          "HeadNormRope": 144,
+          "NormResidualNorm": 96,
+          "RmsNorm": 1,
+          "SoftCap": 1
+        },
+        "declared_window_routes": {
+          "runtime_selected": 1
+        }
+      },
+      {
+        "index": 6,
+        "phase": "decode",
+        "rows": 4,
+        "instructions": 542,
+        "op_counts": {
+          "Argmax": 1,
+          "ArgmaxFin": 1,
+          "Embed": 1,
+          "FlashDecode": 48,
+          "FlashMerge": 48,
+          "Gemv": 113,
+          "GemvGlu": 48,
+          "GemvQkv": 40,
+          "HeadNormRope": 144,
+          "NormResidualNorm": 96,
+          "RmsNorm": 1,
+          "SoftCap": 1
+        },
+        "declared_window_routes": {
+          "runtime_selected": 1
+        }
+      },
+      {
+        "index": 7,
+        "phase": "decode",
+        "rows": 8,
+        "instructions": 542,
+        "op_counts": {
+          "Argmax": 1,
+          "ArgmaxFin": 1,
+          "Embed": 1,
+          "FlashDecode": 48,
+          "FlashMerge": 48,
+          "Gemv": 113,
+          "GemvGlu": 48,
+          "GemvQkv": 40,
+          "HeadNormRope": 144,
+          "NormResidualNorm": 96,
+          "RmsNorm": 1,
+          "SoftCap": 1
+        },
+        "declared_window_routes": {
+          "runtime_selected": 1
+        }
+      },
+      {
+        "index": 8,
+        "phase": "decode",
+        "rows": 16,
+        "instructions": 542,
+        "op_counts": {
+          "Argmax": 1,
+          "ArgmaxFin": 1,
+          "Embed": 1,
+          "FlashDecode": 48,
+          "FlashMerge": 48,
+          "Gemv": 113,
+          "GemvGlu": 48,
+          "GemvQkv": 40,
+          "HeadNormRope": 144,
+          "NormResidualNorm": 96,
+          "RmsNorm": 1,
+          "SoftCap": 1
+        },
+        "declared_window_routes": {
+          "runtime_selected": 1
+        }
+      }
+    ]
+  },
+  {
+    "asset": "bf16-lean-bits-throughput8k",
+    "packet_sha256": "85ec7edd11056d2421ccfe5d6f514bbd487a2271a9305d600965d3e641312af6",
+    "arch": "sm_90a",
+    "precision": {
+      "weight_enc": "bf16",
+      "act_enc": "bf16",
+      "kv_enc": "bf16",
+      "expert_enc": "none"
+    },
+    "manifest_cases_checked": true,
+    "all_instructions_have_queue_windows": true,
+    "programs": [
+      {
+        "index": 0,
+        "phase": "prefill",
+        "rows": 128,
+        "instructions": 766,
+        "op_counts": {
+          "Argmax": 1,
+          "ArgmaxFin": 1,
+          "Embed": 1,
+          "FlashPrefill": 48,
+          "Gemm": 329,
+          "Glu": 48,
+          "HeadNormRope": 144,
+          "NormResidual": 96,
+          "RmsNorm": 97,
+          "SoftCap": 1
+        },
+        "declared_window_routes": {
+          "interpreter": 427,
+          "native_object": 8
+        }
+      },
+      {
+        "index": 1,
+        "phase": "prefill",
+        "rows": 512,
+        "instructions": 766,
+        "op_counts": {
+          "Argmax": 1,
+          "ArgmaxFin": 1,
+          "Embed": 1,
+          "FlashPrefill": 48,
+          "Gemm": 329,
+          "Glu": 48,
+          "HeadNormRope": 144,
+          "NormResidual": 96,
+          "RmsNorm": 97,
+          "SoftCap": 1
+        },
+        "declared_window_routes": {
+          "interpreter": 427,
+          "native_object": 8
+        }
+      },
+      {
+        "index": 2,
+        "phase": "prefill",
+        "rows": 1024,
+        "instructions": 766,
+        "op_counts": {
+          "Argmax": 1,
+          "ArgmaxFin": 1,
+          "Embed": 1,
+          "FlashPrefill": 48,
+          "Gemm": 329,
+          "Glu": 48,
+          "HeadNormRope": 144,
+          "NormResidual": 96,
+          "RmsNorm": 97,
+          "SoftCap": 1
+        },
+        "declared_window_routes": {
+          "interpreter": 427,
+          "native_object": 8
+        }
+      },
+      {
+        "index": 3,
+        "phase": "prefill",
+        "rows": 2048,
+        "instructions": 766,
+        "op_counts": {
+          "Argmax": 1,
+          "ArgmaxFin": 1,
+          "Embed": 1,
+          "FlashPrefill": 48,
+          "Gemm": 329,
+          "Glu": 48,
+          "HeadNormRope": 144,
+          "NormResidual": 96,
+          "RmsNorm": 97,
+          "SoftCap": 1
+        },
+        "declared_window_routes": {
+          "interpreter": 427,
+          "native_object": 8
+        }
+      },
+      {
+        "index": 4,
+        "phase": "prefill",
+        "rows": 4096,
+        "instructions": 766,
+        "op_counts": {
+          "Argmax": 1,
+          "ArgmaxFin": 1,
+          "Embed": 1,
+          "FlashPrefill": 48,
+          "Gemm": 329,
+          "Glu": 48,
+          "HeadNormRope": 144,
+          "NormResidual": 96,
+          "RmsNorm": 97,
+          "SoftCap": 1
+        },
+        "declared_window_routes": {
+          "interpreter": 427,
+          "native_object": 8
+        }
+      },
+      {
+        "index": 5,
+        "phase": "prefill",
+        "rows": 8192,
+        "instructions": 766,
+        "op_counts": {
+          "Argmax": 1,
+          "ArgmaxFin": 1,
+          "Embed": 1,
+          "FlashPrefill": 48,
+          "Gemm": 329,
+          "Glu": 48,
+          "HeadNormRope": 144,
+          "NormResidual": 96,
+          "RmsNorm": 97,
+          "SoftCap": 1
+        },
+        "declared_window_routes": {
+          "interpreter": 427,
+          "native_object": 8
+        }
+      },
+      {
+        "index": 6,
+        "phase": "decode",
+        "rows": 1,
+        "instructions": 542,
+        "op_counts": {
+          "Argmax": 1,
+          "ArgmaxFin": 1,
+          "Embed": 1,
+          "FlashDecode": 48,
+          "FlashMerge": 48,
+          "Gemv": 113,
+          "GemvGlu": 48,
+          "GemvQkv": 40,
+          "HeadNormRope": 144,
+          "NormResidualNorm": 96,
+          "RmsNorm": 1,
+          "SoftCap": 1
+        },
+        "declared_window_routes": {
+          "runtime_selected": 1
+        }
+      },
+      {
+        "index": 7,
+        "phase": "decode",
+        "rows": 2,
+        "instructions": 542,
+        "op_counts": {
+          "Argmax": 1,
+          "ArgmaxFin": 1,
+          "Embed": 1,
+          "FlashDecode": 48,
+          "FlashMerge": 48,
+          "Gemv": 113,
+          "GemvGlu": 48,
+          "GemvQkv": 40,
+          "HeadNormRope": 144,
+          "NormResidualNorm": 96,
+          "RmsNorm": 1,
+          "SoftCap": 1
+        },
+        "declared_window_routes": {
+          "runtime_selected": 1
+        }
+      },
+      {
+        "index": 8,
+        "phase": "decode",
+        "rows": 4,
+        "instructions": 542,
+        "op_counts": {
+          "Argmax": 1,
+          "ArgmaxFin": 1,
+          "Embed": 1,
+          "FlashDecode": 48,
+          "FlashMerge": 48,
+          "Gemv": 113,
+          "GemvGlu": 48,
+          "GemvQkv": 40,
+          "HeadNormRope": 144,
+          "NormResidualNorm": 96,
+          "RmsNorm": 1,
+          "SoftCap": 1
+        },
+        "declared_window_routes": {
+          "runtime_selected": 1
+        }
+      },
+      {
+        "index": 9,
+        "phase": "decode",
+        "rows": 8,
+        "instructions": 542,
+        "op_counts": {
+          "Argmax": 1,
+          "ArgmaxFin": 1,
+          "Embed": 1,
+          "FlashDecode": 48,
+          "FlashMerge": 48,
+          "Gemv": 113,
+          "GemvGlu": 48,
+          "GemvQkv": 40,
+          "HeadNormRope": 144,
+          "NormResidualNorm": 96,
+          "RmsNorm": 1,
+          "SoftCap": 1
+        },
+        "declared_window_routes": {
+          "runtime_selected": 1
+        }
+      }
+    ]
+  },
+  {
+    "asset": "fp8-native",
+    "packet_sha256": "26d504a11dd9a66773e28e2f483271455577c4871ef45309ee9fb67b0c4e8072",
+    "arch": "sm_90a",
+    "precision": {
+      "weight_enc": "fp8",
+      "act_enc": "bf16",
+      "kv_enc": "bf16",
+      "expert_enc": "none"
+    },
+    "manifest_cases_checked": false,
+    "all_instructions_have_queue_windows": true,
+    "programs": [
+      {
+        "index": 0,
+        "phase": "prefill",
+        "rows": 128,
+        "instructions": 766,
+        "op_counts": {
+          "Argmax": 1,
+          "ArgmaxFin": 1,
+          "Embed": 1,
+          "FlashPrefill": 48,
+          "Gemm": 1,
+          "GemmFp8": 328,
+          "Glu": 48,
+          "HeadNormRope": 144,
+          "NormResidual": 96,
+          "RmsNorm": 97,
+          "SoftCap": 1
+        },
+        "declared_window_routes": {
+          "runtime_selected": 435
+        }
+      },
+      {
+        "index": 1,
+        "phase": "prefill",
+        "rows": 512,
+        "instructions": 766,
+        "op_counts": {
+          "Argmax": 1,
+          "ArgmaxFin": 1,
+          "Embed": 1,
+          "FlashPrefill": 48,
+          "Gemm": 1,
+          "GemmFp8": 328,
+          "Glu": 48,
+          "HeadNormRope": 144,
+          "NormResidual": 96,
+          "RmsNorm": 97,
+          "SoftCap": 1
+        },
+        "declared_window_routes": {
+          "runtime_selected": 435
+        }
+      },
+      {
+        "index": 2,
+        "phase": "prefill",
+        "rows": 1024,
+        "instructions": 766,
+        "op_counts": {
+          "Argmax": 1,
+          "ArgmaxFin": 1,
+          "Embed": 1,
+          "FlashPrefill": 48,
+          "Gemm": 1,
+          "GemmFp8": 328,
+          "Glu": 48,
+          "HeadNormRope": 144,
+          "NormResidual": 96,
+          "RmsNorm": 97,
+          "SoftCap": 1
+        },
+        "declared_window_routes": {
+          "runtime_selected": 435
+        }
+      },
+      {
+        "index": 3,
+        "phase": "prefill",
+        "rows": 2048,
+        "instructions": 766,
+        "op_counts": {
+          "Argmax": 1,
+          "ArgmaxFin": 1,
+          "Embed": 1,
+          "FlashPrefill": 48,
+          "Gemm": 1,
+          "GemmFp8": 328,
+          "Glu": 48,
+          "HeadNormRope": 144,
+          "NormResidual": 96,
+          "RmsNorm": 97,
+          "SoftCap": 1
+        },
+        "declared_window_routes": {
+          "runtime_selected": 435
+        }
+      },
+      {
+        "index": 4,
+        "phase": "decode",
+        "rows": 1,
+        "instructions": 622,
+        "op_counts": {
+          "Argmax": 1,
+          "ArgmaxFin": 1,
+          "Embed": 1,
+          "FlashDecode": 48,
+          "FlashMerge": 48,
+          "Gemv": 1,
+          "GemvFp8": 232,
+          "GemvGluFp8": 48,
+          "HeadNormRope": 144,
+          "NormResidualNorm": 96,
+          "RmsNorm": 1,
+          "SoftCap": 1
+        },
+        "declared_window_routes": {
+          "runtime_selected": 1
+        }
+      },
+      {
+        "index": 5,
+        "phase": "decode",
+        "rows": 2,
+        "instructions": 622,
+        "op_counts": {
+          "Argmax": 1,
+          "ArgmaxFin": 1,
+          "Embed": 1,
+          "FlashDecode": 48,
+          "FlashMerge": 48,
+          "Gemv": 1,
+          "GemvFp8": 232,
+          "GemvGluFp8": 48,
+          "HeadNormRope": 144,
+          "NormResidualNorm": 96,
+          "RmsNorm": 1,
+          "SoftCap": 1
+        },
+        "declared_window_routes": {
+          "runtime_selected": 1
+        }
+      },
+      {
+        "index": 6,
+        "phase": "decode",
+        "rows": 4,
+        "instructions": 622,
+        "op_counts": {
+          "Argmax": 1,
+          "ArgmaxFin": 1,
+          "Embed": 1,
+          "FlashDecode": 48,
+          "FlashMerge": 48,
+          "Gemv": 1,
+          "GemvFp8": 232,
+          "GemvGluFp8": 48,
+          "HeadNormRope": 144,
+          "NormResidualNorm": 96,
+          "RmsNorm": 1,
+          "SoftCap": 1
+        },
+        "declared_window_routes": {
+          "runtime_selected": 1
+        }
+      },
+      {
+        "index": 7,
+        "phase": "decode",
+        "rows": 8,
+        "instructions": 622,
+        "op_counts": {
+          "Argmax": 1,
+          "ArgmaxFin": 1,
+          "Embed": 1,
+          "FlashDecode": 48,
+          "FlashMerge": 48,
+          "Gemv": 1,
+          "GemvFp8": 232,
+          "GemvGluFp8": 48,
+          "HeadNormRope": 144,
+          "NormResidualNorm": 96,
+          "RmsNorm": 1,
+          "SoftCap": 1
+        },
+        "declared_window_routes": {
+          "runtime_selected": 1
+        }
+      },
+      {
+        "index": 8,
+        "phase": "decode",
+        "rows": 16,
+        "instructions": 622,
+        "op_counts": {
+          "Argmax": 1,
+          "ArgmaxFin": 1,
+          "Embed": 1,
+          "FlashDecode": 48,
+          "FlashMerge": 48,
+          "Gemv": 1,
+          "GemvFp8": 232,
+          "GemvGluFp8": 48,
+          "HeadNormRope": 144,
+          "NormResidualNorm": 96,
+          "RmsNorm": 1,
+          "SoftCap": 1
+        },
+        "declared_window_routes": {
+          "runtime_selected": 1
+        }
+      }
+    ]
+  }
+]
