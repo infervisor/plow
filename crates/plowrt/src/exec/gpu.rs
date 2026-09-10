@@ -2490,6 +2490,7 @@ impl GpuEngine {
                     d.op == DevOp::MoeAiterFp8Pf as u16
                         || d.op == DevOp::IndexTpPf as u16
                         || d.op == DevOp::GemmLtPf as u16
+                        || (d.op == DevOp::MlaMergeFold as u16 && d.i[5] != 0)
                 }) {
                     return Err(RuntimeError::Device(
                         "native AITER MoE, TP indexer and hipBLASLt projections are supported only on gfx942".into(),

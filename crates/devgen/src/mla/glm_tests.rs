@@ -1879,3 +1879,103 @@ fn glm_native_decode_gemm_preserves_xcd_boundaries() {
     );
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn glm_native_prefill_fold_preserves_xcd_boundaries() {
+    let _guard = crate::test_env::env_guard();
+    let _target = crate::EmitAmdGuard::set(true);
+    let _env = crate::test_env::EnvScope::set(&[
+        ("PLOW_MLA_PREFILL", "full:128,2048"),
+        ("PLOW_GLM_PLACE_PF", "1"),
+        ("PLOW_GLM_MOE_AITER", "0"),
+        ("PLOW_GLM_MOE_FLAT_DECODE", "0"),
+        ("PLOW_GLM_GEMM_LT_DECODE", "0"),
+        ("PLOW_GLM_FOLD_LT", "1"),
+        ("PLOW_GLM_GEMM_LT", "0"),
+        ("PLOW_DECODE_BATCH_LADDER", "1"),
+        ("PLOW_EMIT_PACKED_PREFILL", "0"),
+        ("PLOW_UNISEG", "1"),
+    ]);
+    let dir = std::env::temp_dir().join(format!("plow-glm-native-fold-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = serde_json::json!({
+        "model_type": "glm_moe_dsa", "num_hidden_layers": 4,
+        "hidden_size": 6144, "num_attention_heads": 64,
+        "kv_lora_rank": 512, "q_lora_rank": 2048,
+        "qk_nope_head_dim": 192, "qk_rope_head_dim": 64, "v_head_dim": 256,
+        "vocab_size": 128, "rms_norm_eps": 1e-5,
+        "n_routed_experts": 256, "num_experts_per_tok": 8,
+        "moe_intermediate_size": 2048, "intermediate_size": 12288,
+        "first_k_dense_replace": 3, "routed_scaling_factor": 2.5,
+        "rope_theta": 8000000.0
+    });
+    std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+    let verify: crate::VerifyHook = Box::new(|model| {
+        let mut checked = 0;
+        for (prog, &rows) in model.progs.iter().zip(&model.prog_t) {
+            let native = prog
+                .insts
+                .iter()
+                .enumerate()
+                .filter(|(_, d)| d.op == DevOp::MlaMergeFold as u16 && d.i[5] != 0)
+                .collect::<Vec<_>>();
+            if rows != 2048 {
+                assert!(native.is_empty());
+                continue;
+            }
+            checked += 1;
+            assert_eq!(prog.l2_domains, 8);
+            assert_eq!(native.len(), 4);
+            for (ix, inst) in native {
+                assert_eq!(inst.i[0], rows);
+                assert_eq!(inst.i[5], 1);
+                assert_eq!((inst.i[1], inst.i[2]), (8, 256));
+                let segment = prog
+                    .stream
+                    .iter()
+                    .find(|e| e.inst as usize == ix)
+                    .unwrap()
+                    .seg;
+                assert!(segment > 0);
+                for entries in [&prog.stream, &prog.gq_stream] {
+                    for e in entries.iter().filter(|e| e.seg == segment) {
+                        assert_eq!(e.inst as usize, ix);
+                        assert_eq!(
+                            (e.wait_len, e.succ_len, e.flags & packet::dev::SE_XCTR),
+                            (0, 0, 0)
+                        );
+                    }
+                    assert!(entries.iter().any(|e| e.seg > segment));
+                }
+            }
+            let segments = prog
+                .stream
+                .iter()
+                .map(|e| usize::from(e.seg) + 1)
+                .max()
+                .unwrap();
+            assert_eq!(prog.gq_seg_ofs.len(), segments * 8 + 1);
+        }
+        assert_eq!(checked, 1);
+        Ok(crate::LeanReport::skipped(
+            "native prefill fold segment regression test",
+        ))
+    });
+    glm_emit_full(
+        &dir,
+        4096,
+        dir.join("model.pkt").to_str().unwrap(),
+        304,
+        8,
+        true,
+        true,
+        "gfx942",
+        Some(packet::devbuild::L2Layout {
+            sms: 38,
+            domains: 8,
+            map: packet::devbuild::L2Map::RoundRobin,
+        }),
+        Some(&verify),
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}

@@ -3401,5 +3401,503 @@
       "nix develop -c bash -c 'cc -O2 -Iruntime/amd -I\"$ROCM_PATH/include\" /tmp/tp-glm53-fold-gemm/hsa.c runtime/amd/hsa_backend.c -L\"$ROCM_PATH/lib\" -Wl,-rpath,\"$ROCM_PATH/lib\" -lhsa-runtime64 -o /tmp/tp-glm53-fold-gemm/hsa'",
       "Inside nix develop and an exclusive one-GPU lease, run export.py with ROCm PyTorch, then hsa.py with Python. Use the pinned unbundled object at artifact_root/k.elf."
     ]
+  },
+  "adapter_qualification": {
+    "option": "--glm-fold-lt=true / PLOW_GLM_FOLD_LT=1 at packet emission; default false",
+    "scope": "gfx942 TP8 prefill buckets2048/8192,8heads,latent512,value256,1<=splits<8; not OFOLD; dynamic live rows1..8192; decode unchanged",
+    "host_checks": {
+      "amd_runtime_passed": 179,
+      "amd_runtime_ignored": 6,
+      "glm_emitter_passed": 36,
+      "packet_passed": 120
+    },
+    "rust_hsa_pipeline": {
+      "shape_cases": 22,
+      "poisoned_reuses_per_case": 3,
+      "oracle": "Complete outputs against independent FP64 two-diagonal per-head weight/softmax-merge oracle; relL2<.003, includes dead/all-masked rows",
+      "splits1_rows": [
+        1,
+        7,
+        127,
+        128,
+        129,
+        511,
+        512,
+        513,
+        2047,
+        2048,
+        2049,
+        4463,
+        4464,
+        4465,
+        8191,
+        8192
+      ],
+      "splits2_and7_rows": [
+        128,
+        2048,
+        8191
+      ],
+      "output_tail_guards": true,
+      "log_sha256": "2486e2a2b28bcf777693a565866b941b7a8ec0405af7cf27906eb89dc6aca105"
+    },
+    "abi": {
+      "normalize_explicit_bytes": 36,
+      "convert_explicit_bytes": 24,
+      "weight_convert_explicit_bytes": 16,
+      "gemm_bytes": 144,
+      "note": "Initial helper size check expected Rust padded size40; corrected to actualHIP36 and launch excludes trailing padding."
+    },
+    "memory_per_rank": {
+      "weight_bytes": 327155712,
+      "scratch_bytes": 201326592,
+      "allocation": "Once at load; weights are converted once on GPU."
+    },
+    "packet_checks": {
+      "off": {
+        "packet_sha256": "7e757d76a41d5c9a6feb7103f50ee520ce5c307ebe1f673f6626bdc816aec451",
+        "programs": [
+          {
+            "rows": 128,
+            "native_prefill_folds": 0
+          },
+          {
+            "rows": 512,
+            "native_prefill_folds": 0
+          },
+          {
+            "rows": 2048,
+            "native_prefill_folds": 0
+          },
+          {
+            "rows": 8192,
+            "native_prefill_folds": 0
+          },
+          {
+            "rows": 1,
+            "native_prefill_folds": 0
+          },
+          {
+            "rows": 2,
+            "native_prefill_folds": 0
+          },
+          {
+            "rows": 4,
+            "native_prefill_folds": 0
+          },
+          {
+            "rows": 8,
+            "native_prefill_folds": 0
+          },
+          {
+            "rows": 16,
+            "native_prefill_folds": 0
+          },
+          {
+            "rows": 20,
+            "native_prefill_folds": 0
+          }
+        ]
+      },
+      "on": {
+        "packet_sha256": "9c8e4b2bff1710bcd21b95641c3f19355226aeafb14d7390353fd91184032946",
+        "programs": [
+          {
+            "rows": 128,
+            "native_prefill_folds": 0
+          },
+          {
+            "rows": 512,
+            "native_prefill_folds": 0
+          },
+          {
+            "rows": 2048,
+            "native_prefill_folds": 78
+          },
+          {
+            "rows": 8192,
+            "native_prefill_folds": 78
+          },
+          {
+            "rows": 1,
+            "native_prefill_folds": 0
+          },
+          {
+            "rows": 2,
+            "native_prefill_folds": 0
+          },
+          {
+            "rows": 4,
+            "native_prefill_folds": 0
+          },
+          {
+            "rows": 8,
+            "native_prefill_folds": 0
+          },
+          {
+            "rows": 16,
+            "native_prefill_folds": 0
+          },
+          {
+            "rows": 20,
+            "native_prefill_folds": 0
+          }
+        ]
+      },
+      "runtime_sha256": "f92e317e925642c41a1462b0966fa99bbf96623ec0296a85dc7b54b59b3fd7b4",
+      "compiler_sha256": "b91216d17406d476586ff6a15d9f02fbe73f7c5f66f7611f628bb75d558c0563",
+      "unchanged_program_rows": [
+        128,
+        512,
+        1,
+        2,
+        4,
+        8,
+        16,
+        20
+      ],
+      "off_packet_byte_identical": true
+    },
+    "campaign_source": {
+      "packet_check": {
+        "off": {
+          "packet_sha256": "7e757d76a41d5c9a6feb7103f50ee520ce5c307ebe1f673f6626bdc816aec451",
+          "programs": [
+            {
+              "rows": 128,
+              "native_prefill_folds": 0
+            },
+            {
+              "rows": 512,
+              "native_prefill_folds": 0
+            },
+            {
+              "rows": 2048,
+              "native_prefill_folds": 0
+            },
+            {
+              "rows": 8192,
+              "native_prefill_folds": 0
+            },
+            {
+              "rows": 1,
+              "native_prefill_folds": 0
+            },
+            {
+              "rows": 2,
+              "native_prefill_folds": 0
+            },
+            {
+              "rows": 4,
+              "native_prefill_folds": 0
+            },
+            {
+              "rows": 8,
+              "native_prefill_folds": 0
+            },
+            {
+              "rows": 16,
+              "native_prefill_folds": 0
+            },
+            {
+              "rows": 20,
+              "native_prefill_folds": 0
+            }
+          ]
+        },
+        "on": {
+          "packet_sha256": "9c8e4b2bff1710bcd21b95641c3f19355226aeafb14d7390353fd91184032946",
+          "programs": [
+            {
+              "rows": 128,
+              "native_prefill_folds": 0
+            },
+            {
+              "rows": 512,
+              "native_prefill_folds": 0
+            },
+            {
+              "rows": 2048,
+              "native_prefill_folds": 78
+            },
+            {
+              "rows": 8192,
+              "native_prefill_folds": 78
+            },
+            {
+              "rows": 1,
+              "native_prefill_folds": 0
+            },
+            {
+              "rows": 2,
+              "native_prefill_folds": 0
+            },
+            {
+              "rows": 4,
+              "native_prefill_folds": 0
+            },
+            {
+              "rows": 8,
+              "native_prefill_folds": 0
+            },
+            {
+              "rows": 16,
+              "native_prefill_folds": 0
+            },
+            {
+              "rows": 20,
+              "native_prefill_folds": 0
+            }
+          ]
+        },
+        "runtime_sha256": "f92e317e925642c41a1462b0966fa99bbf96623ec0296a85dc7b54b59b3fd7b4",
+        "compiler_sha256": "b91216d17406d476586ff6a15d9f02fbe73f7c5f66f7611f628bb75d558c0563",
+        "unchanged_program_rows": [
+          128,
+          512,
+          1,
+          2,
+          4,
+          8,
+          16,
+          20
+        ],
+        "off_packet_byte_identical": true
+      },
+      "source_sha256": {
+        "crates/devgen/src/emit_config.rs": "e2f1406d79976d8897976c9f071bfc932db94b57849699556f0250313832e821",
+        "crates/devgen/src/mla.rs": "0050cd77b70d529249a24edbff6ea67d8948993200c4e61efb91b36d7d00ee1f",
+        "crates/devgen/src/mla/glm_tests.rs": "b5ba36b54f2a5ad9f40156a34431e6dcc7cc01d88b20e65ae4e27c4ff234ac78",
+        "crates/packet/src/dev.rs": "d8efda54b8e32dc1a33303bc64837e79a2f44c6529f7cf33b3d3d42db6cb2b20",
+        "crates/packet/src/devbuild.rs": "eb7d141e0a3cdabad980a9aff24722717681444a61f0a006e352506f9e7fa861",
+        "crates/packet/src/slots.rs": "60637762a1677d4d004eb48b10cee091a801bca628913d7522e64005d08efeae",
+        "crates/plowrt/src/exec/amd.rs": "2022ecdbbcbc476b049f4ec8905d1e9c17b8d2116f0906127cc131e44a419de3",
+        "crates/plowrt/src/exec/amd_gemm_lt.rs": "f58b656f7cbc525d24051505660f426271e419f6ac0b4f11047f9b57a44bd86b",
+        "crates/plowrt/src/exec/gpu.rs": "a93af1cdeee1f3a7fd3f02f7a78f27fa792ff0bef7ac351316e73e333c109a58",
+        "crates/plowrt/src/exec/mod.rs": "8a1326f63e9552b3a7f20fea479fe95bf846c05de3e5d1950c2787bb707060b3",
+        "runtime/bench/amd/glm_fold_tail/gemm_kernels.hip": "a9d109452927acba370f1b3f1b610da4b51e006faff8309639c7f6ad234493d2",
+        "runtime/common/dev_isa.h": "a8d0d262d533d067a2562d5dd0db94205a95103948f53c7fc133a24521c59ddf",
+        "crates/plowrt/src/exec/amd_mla_fold.rs": "952a343d3d3f70ccd118eba83b7c9d28ff286a6e7e94f9d4d0967ea4ca7d7d3e",
+        "runtime/amd/glm_fold_adapter.hip": "c607810aa0ef2bcf6e5734b57995232ae2fd15683a8f971db8de5991c54b233a",
+        "runtime/amd/glm_fold_lt_gfx942.json": "dc4ddaa6aeafc8e629a61fd7f4dc63b627b22578d6e6a62acb437acc8dc90cd2",
+        "scripts/build_glm_fold_lt.sh": "eb2b2c6d546119df5c2c6e7b051c005ed0ccbf09cabff6ceae4bd954163c6239"
+      },
+      "runtime_sha256": "f92e317e925642c41a1462b0966fa99bbf96623ec0296a85dc7b54b59b3fd7b4",
+      "compiler_sha256": "b91216d17406d476586ff6a15d9f02fbe73f7c5f66f7611f628bb75d558c0563",
+      "script_sha256": "46d7457e5d4e6cdd60397824888f00bdd244a88624b4a7870e8826328e2dc34b",
+      "objects_sha256": {
+        "glm_fold_adapter.elf": "48a67c38bf13b8ce489bbba602ec5ee843a948bd7748968c606853f81cf46190",
+        "glm_fold_lt_gfx942.elf": "209f4165a46672d5289816f0df6b41cf5a3f44d78452ff2a28c8cd7a0e1b77d1"
+      },
+      "scope": "On then off,18 retrievalC20+20random70k/700/.14/C20seed0 each, same FP8KV B20 model. Native decode GEMM enabled both; only native prefill fold differs. No speculation. No other GPU work or builds during pair."
+    },
+    "quality_and_serving": {
+      "artifact_root": "/tmp/tp-glm53-fold-native",
+      "scope": "One on/off pair, 20 random70k/700/.14/C20 seed0 requests per arm, no speculation. Native decode GEMM enabled in both arms; only native prefill fold differs. Exclusive eight-GPU lease; no concurrent GPU work or builds.",
+      "arms": {
+        "on": {
+          "metrics": {
+            "date": "20260910-110653",
+            "endpoint_type": "vllm",
+            "backend": "vllm",
+            "label": null,
+            "model_id": "glm-5.3-plow-lite",
+            "tokenizer_id": "zai-org/GLM-5.3",
+            "num_prompts": 20,
+            "request_rate": "inf",
+            "burstiness": 1.0,
+            "max_concurrency": 20,
+            "duration": 357.0379713480361,
+            "completed": 20,
+            "failed": 0,
+            "total_input_tokens": 1414538,
+            "total_output_tokens": 13795,
+            "request_throughput": 0.056016450923939,
+            "request_goodput": null,
+            "output_throughput": 38.63734702478692,
+            "total_token_throughput": 4000.507269877128,
+            "max_output_tokens_per_s": 120.0,
+            "max_concurrent_requests": 20,
+            "rtfx": 0.0,
+            "mean_ttft_ms": 111935.70519645582,
+            "median_ttft_ms": 112315.34606200876,
+            "std_ttft_ms": 62970.205268219404,
+            "p99_ttft_ms": 215987.3733378714,
+            "mean_tpot_ms": 315.25174720504543,
+            "median_tpot_ms": 307.0343487080439,
+            "std_tpot_ms": 82.49626235459091,
+            "p99_tpot_ms": 466.91251450174445,
+            "mean_itl_ms": 312.0904886704497,
+            "median_itl_ms": 183.92546300310642,
+            "std_itl_ms": 324.0727462446606,
+            "p99_itl_ms": 1189.8052883485798
+          },
+          "input_lens": [
+            76873,
+            72685,
+            70219,
+            65488,
+            66234,
+            61003,
+            61674,
+            60523,
+            63635,
+            76141,
+            72929,
+            78091,
+            70072,
+            72091,
+            79228,
+            74499,
+            72593,
+            70856,
+            71175,
+            78529
+          ],
+          "output_lens": [
+            656,
+            763,
+            734,
+            602,
+            680,
+            771,
+            711,
+            608,
+            753,
+            746,
+            769,
+            636,
+            619,
+            772,
+            606,
+            709,
+            617,
+            661,
+            697,
+            685
+          ],
+          "result_sha256": "c1eeddde6e2b0540efdc6efe567f8ab30c455c29f0b068e62746d4f745fffe80",
+          "server_log_sha256": "f50b0ca04ca54565e02a2378651e5e4871ca5f74097b49d895f514976740e10a",
+          "benchmark_log_sha256": "5068a79f16f86e83b8183994043e199b8679c27e2f911bb915cb39076c07e752"
+        },
+        "off": {
+          "metrics": {
+            "date": "20260910-111623",
+            "endpoint_type": "vllm",
+            "backend": "vllm",
+            "label": null,
+            "model_id": "glm-5.3-plow-lite",
+            "tokenizer_id": "zai-org/GLM-5.3",
+            "num_prompts": 20,
+            "request_rate": "inf",
+            "burstiness": 1.0,
+            "max_concurrency": 20,
+            "duration": 358.7989748590044,
+            "completed": 20,
+            "failed": 0,
+            "total_input_tokens": 1414538,
+            "total_output_tokens": 13795,
+            "request_throughput": 0.05574151935038084,
+            "request_goodput": null,
+            "output_throughput": 38.447712971925185,
+            "total_token_throughput": 3980.8725779143756,
+            "max_output_tokens_per_s": 120.0,
+            "max_concurrent_requests": 20,
+            "rtfx": 0.0,
+            "mean_ttft_ms": 111899.37849470589,
+            "median_ttft_ms": 110877.56744050421,
+            "std_ttft_ms": 64400.76133658265,
+            "p99_ttft_ms": 219485.4653256241,
+            "mean_tpot_ms": 319.6283499090847,
+            "median_tpot_ms": 335.7846195116017,
+            "std_tpot_ms": 81.6277730945199,
+            "p99_tpot_ms": 450.6352260171499,
+            "mean_itl_ms": 316.66170809952655,
+            "median_itl_ms": 183.85181203484535,
+            "std_itl_ms": 333.63985101741883,
+            "p99_itl_ms": 1203.77982837148
+          },
+          "input_lens": [
+            76873,
+            72685,
+            70219,
+            65488,
+            66234,
+            61003,
+            61674,
+            60523,
+            63635,
+            76141,
+            72929,
+            78091,
+            70072,
+            72091,
+            79228,
+            74499,
+            72593,
+            70856,
+            71175,
+            78529
+          ],
+          "output_lens": [
+            656,
+            763,
+            734,
+            602,
+            680,
+            771,
+            711,
+            608,
+            753,
+            746,
+            769,
+            636,
+            619,
+            772,
+            606,
+            709,
+            617,
+            661,
+            697,
+            685
+          ],
+          "result_sha256": "ee25f61bc75e176255069e8b089139c5ef8408fb2426b377a79c7043f48032b7",
+          "server_log_sha256": "fcff85fd1fad11b110d292ef16c69446f2e9ac54d45edbd7e6578d8bf6b7571e",
+          "benchmark_log_sha256": "45070c485f36b4b2f3d98a1f653ca64e59efef932e4e4f9dfd51b7f78d8ef2bb"
+        }
+      },
+      "change_percent_on_vs_off": {
+        "output_throughput": 0.49322583374518114,
+        "mean_ttft_ms": 0.032463720745012914,
+        "p99_ttft_ms": -1.5937693106753192,
+        "mean_tpot_ms": -1.3692786341650054,
+        "p99_tpot_ms": 3.612076363505401,
+        "median_itl_ms": 0.04005996320943783,
+        "p99_itl_ms": -1.1608883695788164
+      },
+      "same_input_and_output_lengths": true,
+      "exact_generated_text_matches": 5,
+      "total_generated_texts": 20,
+      "reproduction_sources": {
+        "emit.sh": "#!/usr/bin/env bash\nset -euo pipefail\nroot=/tmp/tp-glm53-fold-native\ncp target/release/plowrt \"$root/plowrt\"\ncp target/release/plowc \"$root/plowc\"\nexport PLOW_UNISEG=0 PLOW_GLM_DSA_PF_SPAN=3 PLOW_MLA_PF_V2=1 PLOW_MLA_PF_AITER=1\nexport PLOW_VERIFY_BIN=/app/plow/lean-plow/.lake/build/bin/plow_verify\nfor arm in off on; do\n enabled=false\n if [ \"$arm\" = on ]; then enabled=true; fi\n \"$root/plowc\" --hf-dir /workspace/models/GLM-5.3-plow-lite --gpu MI300X --num-gpus 8 --batch 1,4,8,16,20 --emit-decode-batch-ladder 1,2,4,8,16,20 --glm-fp8-kv=true --seq 512,2048,8192 --max-ctx 81920 --arch gfx942 --emit devblob --replay-knobs /tmp/tp-glm53-lt-native/assets/build.json --glm-gemm-lt=true --emit-packed-prefill=false --glm-select-local=false --glm-place-pf=false --glm-moe-flat-decode=false --glm-gemm-lt-decode=true --glm-fold-lt=\"$enabled\" --out \"$root/assets-$arm\" > \"$root/emit-$arm.log\" 2>&1\ndone\ncmp \"$root/assets-off/model.pkt\" /tmp/tp-glm53-b20-gemm/assets-on/model.pkt\n",
+        "campaign.sh": "#!/usr/bin/env bash\nset -euo pipefail\nexport PLOW_MLA_PF_V2=1 PLOW_MLA_PF_AITER=1 PLOW_PF_CHUNK=8192 PLOW_PF_INTERLEAVE=0\nexport LD_LIBRARY_PATH=\"$ROCM_PATH/lib:${LD_LIBRARY_PATH:-}\"\nroot=/tmp/tp-glm53-fold-native\nif [ \"$#\" = 0 ]; then set -- on off; fi\nfor arm in \"$@\"; do\n    export PLOW_HSACO=/tmp/tp-glm53-fold-native/overlay\n    \"$root/plowrt\" serve --assets \"$root/assets-$arm\" --port 18991 > \"$root/server-$arm.log\" 2>&1 &\n    server=$!\n    trap 'kill -TERM \"$server\" 2>/dev/null || true; wait \"$server\" 2>/dev/null || true' EXIT\n    ready=0\n    for attempt in $(seq 1 180); do\n        if curl -fsS http://127.0.0.1:18991/v1/models > \"$root/models-$arm.json\" 2>/dev/null; then ready=1; break; fi\n        kill -0 \"$server\" || exit 1\n        sleep 1\n    done\n    [ \"$ready\" = 1 ]\n    python3 runtime/bench/amd/mla_sparse_aiter/quality.py http://127.0.0.1:18991 \"native-fold-$arm\" \"$root/quality-$arm.json\" --concurrency 20 > \"$root/quality-$arm.log\" 2>&1\n    env VLLM_ROCM_LIB=/opt/rocm/core-7.14/lib /app/plow/build-gemma31/vllm-python -m vllm.entrypoints.cli.main bench serve --backend vllm --host 127.0.0.1 --port 18991 --model glm-5.3-plow-lite --tokenizer zai-org/GLM-5.3 --trust-remote-code --dataset-name random --num-prompts 20 --random-input-len 70000 --random-output-len 700 --random-range-ratio 0.14 --max-concurrency 20 --save-result --save-detailed --result-dir \"$root\" --result-filename \"serve-$arm.json\" > \"$root/bench-$arm.log\" 2>&1\n    kill -TERM \"$server\"\n    wait \"$server\" || [ \"$?\" = 143 ]\n    trap - EXIT\ndone\n"
+      },
+      "limitations": "Single pair; no repeatability estimate or broad quality qualification. This 20-request screen does not establish parity with the H200 100-request reference. Native fold remains opt-in false."
+    },
+    "full_model_retrieval": {
+      "on": {
+        "passed": 18,
+        "total": 18,
+        "concurrency": 20,
+        "sha256": "5c9c9b9c66d19bee5c508b09d73ec86b4f68fe2e4b452733c064264747196e95"
+      },
+      "off": {
+        "passed": 18,
+        "total": 18,
+        "concurrency": 20,
+        "sha256": "007a12a2f87e2638b4f5e4c6499613789ca529277d5309041fe147d67c598bb9"
+      },
+      "scope": "Limited retrieval, not broad model quality."
+    }
   }
 }

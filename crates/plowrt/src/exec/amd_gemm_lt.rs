@@ -60,15 +60,11 @@ fn decode_choice(rows: u32, n: u32, k: u32) -> Option<(usize, u32)> {
     })
 }
 
-pub(super) fn routes(
+pub(super) fn segment_owners(
     prog: &DevProg,
-    tensors: &[DevTensor],
     segments: usize,
-) -> Result<Vec<Option<Route>>> {
-    let mut routes = vec![None; segments];
-    if !prog.insts.iter().any(|i| i.op == DevOp::GemmLtPf as u16) {
-        return Ok(routes);
-    }
+    native: fn(&DevInst64) -> bool,
+) -> Result<Vec<Option<usize>>> {
     let mut owners = vec![None; prog.insts.len()];
     let mut segment_first = vec![None; segments];
     let mut mixed = vec![false; segments];
@@ -81,14 +77,10 @@ pub(super) fn routes(
             }
             first.get_or_insert(ix);
         }
-        if prog
-            .insts
-            .get(ix)
-            .is_none_or(|i| i.op != DevOp::GemmLtPf as u16)
-        {
+        if prog.insts.get(ix).is_none_or(|i| !native(i)) {
             continue;
         }
-        let err = |s: &str| RuntimeError::Device(format!("hipBLASLt instruction {ix}: {s}"));
+        let err = |s: &str| RuntimeError::Device(format!("native GEMM instruction {ix}: {s}"));
         if seg >= segments {
             return Err(err("segment is outside program"));
         }
@@ -102,6 +94,31 @@ pub(super) fn routes(
         }
         owners[ix] = Some(seg);
     }
+    for (ix, inst) in prog.insts.iter().enumerate() {
+        if native(inst) {
+            let seg = owners[ix].ok_or_else(|| {
+                RuntimeError::Device(format!("native GEMM instruction {ix} has no segment"))
+            })?;
+            if mixed[seg] {
+                return Err(RuntimeError::Device(
+                    "native GEMM segment contains other interpreter work".into(),
+                ));
+            }
+        }
+    }
+    Ok(owners)
+}
+
+pub(super) fn routes(
+    prog: &DevProg,
+    tensors: &[DevTensor],
+    segments: usize,
+) -> Result<Vec<Option<Route>>> {
+    let mut routes = vec![None; segments];
+    if !prog.insts.iter().any(|i| i.op == DevOp::GemmLtPf as u16) {
+        return Ok(routes);
+    }
+    let owners = segment_owners(prog, segments, |i| i.op == DevOp::GemmLtPf as u16)?;
     for (ix, inst) in prog.insts.iter().enumerate() {
         if inst.op != DevOp::GemmLtPf as u16 {
             continue;
@@ -143,9 +160,6 @@ pub(super) fn routes(
             }
         }
         let seg = owners[ix].ok_or_else(|| err("requires exactly one segment owner"))?;
-        if mixed[seg] {
-            return Err(err("segment contains other interpreter work"));
-        }
         routes[seg] = Some(Route {
             inst: *inst,
             rows: prog.t,
@@ -155,12 +169,12 @@ pub(super) fn routes(
 }
 
 #[derive(Deserialize)]
-struct KernelSpec {
-    name: String,
-    kernarg_offset: usize,
-    lds: u32,
-    mt_i: u32,
-    mt_j: u32,
+pub(super) struct KernelSpec {
+    pub name: String,
+    pub kernarg_offset: usize,
+    pub lds: u32,
+    pub mt_i: u32,
+    pub mt_j: u32,
 }
 
 #[repr(C)]
@@ -193,6 +207,53 @@ fn arguments(route: Route, tensors: [u64; 3], spec: &KernelSpec, info1: u32) -> 
     }
 }
 
+pub(super) fn load_kernels(
+    be: &HsaBackend,
+    dir: &Path,
+    file: &str,
+    hash: &str,
+    specs: &[KernelSpec],
+    args_bytes: u32,
+    modules: &mut Vec<Module>,
+) -> Result<Vec<HsaKernel>> {
+    let path = dir.join(file);
+    let mut image = std::fs::read(&path)
+        .map_err(|e| RuntimeError::Device(format!("{}: {e}", path.display())))?;
+    if plow_asset::decode_objects::image_sha256(&image) != hash {
+        return Err(RuntimeError::Device(
+            "hipBLASLt object hash does not match qualified ABI".into(),
+        ));
+    }
+    for spec in specs {
+        // The pinned descriptors omit KERNARG_SIZE; normalize to the inspected metadata.
+        let field = image
+            .get_mut(spec.kernarg_offset..spec.kernarg_offset + 4)
+            .ok_or_else(|| RuntimeError::Device("hipBLASLt descriptor is outside object".into()))?;
+        if field != [0; 4] {
+            return Err(RuntimeError::Device(
+                "hipBLASLt descriptor differs from qualified ABI".into(),
+            ));
+        }
+        field.copy_from_slice(&args_bytes.to_le_bytes());
+    }
+    let module = EngineDevice::module_load(be, &image)?;
+    let mut kernels = Vec::new();
+    for spec in specs {
+        let kernel = EngineDevice::get_function(be, &module, &spec.name)?;
+        if kernel.kernarg_size() != args_bytes
+            || kernel.private_segment_size() != 0
+            || HsaBackend::kernel_lds_bytes(&kernel) != spec.lds
+        {
+            return Err(RuntimeError::Device(
+                "hipBLASLt resource ABI mismatch".into(),
+            ));
+        }
+        kernels.push(kernel);
+    }
+    modules.push(module);
+    Ok(kernels)
+}
+
 pub(super) struct GemmLt {
     kernels: Vec<HsaKernel>,
     specs: Vec<KernelSpec>,
@@ -210,43 +271,15 @@ impl GemmLt {
         ))
         .map_err(|e| RuntimeError::Device(format!("hipBLASLt decode specification: {e}")))?;
         specs.extend(decode_specs);
-        let path = dir.join("glm_lt_gfx942.elf");
-        let mut image = std::fs::read(&path)
-            .map_err(|e| RuntimeError::Device(format!("{}: {e}", path.display())))?;
-        if plow_asset::decode_objects::image_sha256(&image) != OBJECT_HASH {
-            return Err(RuntimeError::Device(
-                "hipBLASLt object hash does not match qualified ABI".into(),
-            ));
-        }
-        for spec in &specs {
-            // The pinned descriptors omit KERNARG_SIZE; the inspected notes declare 160 bytes.
-            let field = image
-                .get_mut(spec.kernarg_offset..spec.kernarg_offset + 4)
-                .ok_or_else(|| {
-                    RuntimeError::Device("hipBLASLt descriptor is outside object".into())
-                })?;
-            if field != [0; 4] {
-                return Err(RuntimeError::Device(
-                    "hipBLASLt descriptor differs from qualified ABI".into(),
-                ));
-            }
-            field.copy_from_slice(&160u32.to_le_bytes());
-        }
-        let module = EngineDevice::module_load(be, &image)?;
-        let mut kernels = Vec::new();
-        for spec in &specs {
-            let kernel = EngineDevice::get_function(be, &module, &spec.name)?;
-            if kernel.kernarg_size() != 160
-                || kernel.private_segment_size() != 0
-                || HsaBackend::kernel_lds_bytes(&kernel) != spec.lds
-            {
-                return Err(RuntimeError::Device(
-                    "hipBLASLt resource ABI mismatch".into(),
-                ));
-            }
-            kernels.push(kernel);
-        }
-        modules.push(module);
+        let kernels = load_kernels(
+            be,
+            dir,
+            "glm_lt_gfx942.elf",
+            OBJECT_HASH,
+            &specs,
+            160,
+            modules,
+        )?;
         Ok(Self { kernels, specs })
     }
 
@@ -414,5 +447,4 @@ mod tests {
             }
         }
     }
-
 }

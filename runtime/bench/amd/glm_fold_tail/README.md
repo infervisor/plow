@@ -126,7 +126,8 @@ runs retain default prefix caching; unified batching still declines TP support.
 The [matrix-fold record](mi300x-gemm.json) compares the current ragged TB8 fold
 with a three-kernel FP32 pipeline: normalize/transposition, per-head GEMM, and
 BF16 output conversion. It also records two slower fused MFMA alternatives.
-This is an isolated candidate; the full-model runtime still uses the TB8 fold.
+The default remains the TB8 fold. Native integration is opt-in; its runtime
+qualification and matched serving comparison are described below.
 
 | Rows, splits=1 | TB8 cold, µs | Direct FP32 pipeline cold, µs |
 |---|---:|---:|
@@ -136,7 +137,7 @@ This is an isolated candidate; the full-model runtime still uses the TB8 fold.
 
 Timings include all three pipeline kernels. Cold runs flush 512 MiB before
 one GPU-graph replay. The 2 MiB BF16 weight tensor is converted to 4 MiB FP32
-once outside timing; native integration would also need FP32 scratch.
+once outside timing; native integration also allocates FP32 scratch.
 Small rows 1/7/9 lose against the existing fold and are not deployment candidates.
 
 All 72 cells pass a complete CPU FP64 merge/product oracle (relative L2 < .003),
@@ -145,15 +146,15 @@ Rows cover 1/7/9/128/512/2048/4463/4464/8191; split counts 2/7 additionally cove
 128/2048/8191 with dead splits and fully masked rows. Direct assembly outputs
 match the library FP32 products exactly in all 12 direct-pipeline cases. The
 BF16 outputs are not bit-identical to the current fold because the reductions
-are reassociated; full-model quality and serving performance remain unqualified.
+are reassociated. Limited retrieval checks pass; broad model quality remains
+unqualified.
 
 Five selected hipBLASLt kernels already exist in the installed gfx942 FP32
 object. The library logs supply their grid, mapping and inline argument bytes.
 The unbundled kernels declare 144-byte arguments, zero private bytes and zero
 spills. Six separate tests through Plow's C HSA backend match complete FP32
-matrix outputs on three poisoned reuses, preserving 512-byte guards. This checks
-the matrix kernel boundary only; normalization/conversion and a Rust native route
-still need HSA integration. The record embeds the executed HSA sources/recipe.
+matrix outputs on three poisoned reuses, preserving 512-byte guards. These six checks cover the matrix kernel boundary only. The record embeds the
+executed HSA sources/recipe; the full Rust pipeline checks are described below.
 
 Build and run inside `nix develop`, using a ROCm PyTorch Python environment:
 
@@ -181,3 +182,49 @@ The capture contains `weight`, `opart`, `mlpart`, and `oat` with suffix
 loading assembly. An earlier graph attempt used a cached HIP stream and was
 excluded; the final runner obtains the current stream inside every call and
 checks that poisoned outputs are restored by graph replay itself.
+
+
+`--glm-fold-lt=true` / `PLOW_GLM_FOLD_LT=1` at packet emission selects the native
+path for gfx942 TP8 prefill buckets 2048/8192. It remains false by default. The
+existing `MlaMergeFold` opcode uses `i5=1`, with isolated, counter-free segments;
+decode and smaller prefill programs retain their previous implementation.
+Build the required FP32 object and shared helper with:
+
+```sh
+scripts/build_glm_fold_lt.sh /path/to/objects "$co"
+```
+
+The Rust adapter reuses the GEMM image loader and native segment validation.
+It allocates 312 MiB for converted weights and 192 MiB of scratch per rank once
+at startup. Each fold enqueues normalization, GEMM and conversion in order.
+The benchmark and runtime use the same normalization/conversion kernel source.
+
+The complete Rust/HSA path passes 22 live-row/split geometries, three poisoned
+reuses per case, full-output checks against an independent FP64 analytical oracle,
+and output tail guards. This adds live rows on both sides of kernel-selection
+boundaries, row8192, and dead/fully masked splits to the original captured cases.
+179 runtime tests (6 ignored), 36 GLM emitter tests, 120 packet tests and the
+release build pass. Full-model Lean ordering/LDS checks pass for all 10 programs;
+the disabled packet is byte-identical to the preceding native-decode-GEMM packet.
+Both native and control configurations pass all 18 retrieval cases at C20.
+This is limited retrieval coverage, not broad model quality qualification.
+
+The matched FP8-KV B20 serving screen uses 20 random70k/700/.14/C20 seed0
+requests per arm, with native decode GEMM enabled in both configurations and
+no speculation. One exclusive eight-GPU lease covers both arms; no other GPU
+work or builds ran during the comparison.
+
+| Metric | Control | Native fold | Change |
+|---|---:|---:|---:|
+| Output tokens/s | 38.448 | 38.637 | +0.49% |
+| Mean TTFT, ms | 111899.38 | 111935.71 | +0.03% |
+| Mean TPOT, ms | 319.628 | 315.252 | -1.37% |
+| P99 TPOT, ms | 450.635 | 466.913 | +3.61% |
+
+Both arms complete 20 requests with zero failures, identical input/output
+length arrays, 1,414,538 input tokens and 13,795 output tokens. Five of 20
+generated texts match exactly. This single pair has no repeatability estimate;
+the small throughput difference and worse P99 TPOT do not establish a serving
+win. The native fold stays opt-in. This screen is also shorter than the H200
+100-request reference and does not establish parity. The matrix-fold record
+includes scalar results, hashes and the emission/serving recipes.

@@ -595,6 +595,10 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_GEMM_LT_DECODE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_gemm_lt_decode: bool,
 
+    /// Use native gfx942 FP32 MLA fold GEMMs during prefill.
+    #[arg(long, env = "PLOW_GLM_FOLD_LT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_fold_lt: bool,
+
     /// Cap the dispatch width of every blocked GEMV. Unset ⇒ byte-identical.
     #[arg(long, env = "PLOW_GLM_GEMV_WG")]
     pub glm_gemv_wg: Option<u32>,
@@ -1063,6 +1067,7 @@ impl EmitConfig {
             glm_select_local: env_bool("PLOW_GLM_SELECT_LOCAL"),
             glm_gemm_lt: env_bool("PLOW_GLM_GEMM_LT"),
             glm_gemm_lt_decode: env_bool("PLOW_GLM_GEMM_LT_DECODE"),
+            glm_fold_lt: env_bool("PLOW_GLM_FOLD_LT"),
             glm_gemv_wg: env_u32("PLOW_GLM_GEMV_WG"),
             glm_ofold: env_bool("PLOW_GLM_OFOLD"),
             glm_pf_ns: env_u32("PLOW_GLM_PF_NS"),

@@ -5118,12 +5118,18 @@ pub(crate) fn emit_glm_mla_prefill(
     //    on this emitter the way `emit_xreduce`'s sizing had to be (knob-contract §7c).
     // Under OFOLD the merge packet does not exist: the flash's normalized bf16 partials ARE
     // the fused GEMM's A operand, so the o-GEMM deps straight on the flash.
+    let native_fold = emit_config::active().glm_fold_lt && t >= 2048;
+    if native_fold {
+        assert!(crate::emit_is_amd() && b.n_cu() == 304 && c.tp == 8
+            && nh_l == 8 && dk == 512 && vd == 256 && (1..8).contains(&pf_ns) && !ofold,
+            "native MLA fold requires gfx942 TP8 latent512/value256, splits<8, and no ofold fusion");
+    }
     let c_uv = if ofold {
         c_fl
     } else {
-        b.emit(
+        let counter = b.emit(
             DevOp::MlaMergeFold,
-            mla_fold_cus(&all, t * nh_l, vd),
+            if native_fold { vec![0] } else { mla_fold_cus(&all, t * nh_l, vd) },
             &[c_fl],
             |d| {
                 d.t[0] = n.oat;
@@ -5137,8 +5143,11 @@ pub(crate) fn emit_glm_mla_prefill(
                 // m=-inf/l=0, which this merge weighs 0 branch-free (the "empty split"
                 // precondition the old comment described predates that merge rewrite).
                 d.i[4] = pf_ns;
+                d.i[5] = u32::from(native_fold);
             },
-        )
+        );
+        if native_fold { b.isolate(counter); }
+        counter
     };
     // 12 o_proj, row-parallel over this rank's head shard. Under TP the [T,hidden] partial goes
     //    through the TWO-SHOT all-reduce (reduce-scatter + all-gather), not decode's one-shot: the
@@ -7448,6 +7457,10 @@ fn glm_emit_full(
             }
             pb.set_l2_placement(l2_layout);
         }
+        if emit_config::active().glm_fold_lt && t >= 2048 {
+            assert!(crate::emit_is_amd() && target == "gfx942", "native MLA fold requires gfx942");
+            pb.deny_uniseg();
+        }
         pb.adopt_tensors(tensors.clone());
         let pall = pb.all();
         // PLOW_XR_CUS caps the PREFILL two-shots too — see `xr_cus_capped`. This used to be
@@ -8038,6 +8051,10 @@ pub(crate) fn glm_build_block_pf(
         pb.set_moe_prefill_ep_degree(
             (crate::emit_is_amd() && emit_config::active().moe_prefill_ep).then_some(c.tp),
         );
+        if emit_config::active().glm_fold_lt && t >= 2048 {
+            assert!(crate::emit_is_amd() && n_cu == 304, "native MLA fold requires gfx942");
+            pb.deny_uniseg();
+        }
         pb.adopt_tensors(tensors.clone());
         let pall = pb.all();
         let mut pxgate = 0u32;

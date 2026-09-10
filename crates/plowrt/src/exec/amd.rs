@@ -24,7 +24,7 @@ use crate::exec::kvrow::{
     derive_kvrow, derive_mla_nsplit, is_lm_head_matmul, kvrow_span, mla_live_nsplit,
     prefill_row_field, rebase_chunk_rows, RowField,
 };
-use crate::exec::{amd_gemm_lt, amd_index_tp, amd_moe_aiter, amd_sparse_mla};
+use crate::exec::{amd_gemm_lt, amd_index_tp, amd_mla_fold, amd_moe_aiter, amd_sparse_mla};
 use crate::memory::slab_pad;
 use crate::memory::vmm::{VmmGeometry, VmmKv, VmmOps, WeightSlab};
 #[cfg(test)]
@@ -964,6 +964,7 @@ enum PrefillSegmentRoute {
     MoeAiter(amd_moe_aiter::Route),
     IndexTp(amd_index_tp::Route),
     GemmLt(amd_gemm_lt::Route),
+    MlaFold(amd_mla_fold::Route),
     XReduceWaveRs,
     GraphPhaseXReduceWaveRs,
     XReduceAttnRes {
@@ -3225,6 +3226,7 @@ fn packed_mla_compatible(prog: &DevProg) -> bool {
             || d.op == DevOp::MoeAiterFp8Pf as u16
             || d.op == DevOp::IndexTpPf as u16
             || d.op == DevOp::GemmLtPf as u16
+            || amd_mla_fold::native(d)
             || d.op == DevOp::FlashGatherPrefill as u16
             || ((d.op == DevOp::FlashMlaPrefill as u16 || d.op == DevOp::FlashMlaPrefillFp8 as u16)
                 && (d.i[3] & 0x8000_0000 != 0
@@ -5325,6 +5327,7 @@ pub struct AmdEngine {
     moe_aiter: Option<amd_moe_aiter::MoeAiter>,
     index_tp: Option<amd_index_tp::IndexTp>,
     gemm_lt: Option<amd_gemm_lt::GemmLt>,
+    mla_fold: Option<amd_mla_fold::MlaFold>,
     k_xaudit: Option<HsaKernel>,
     k_state_clear: Option<HsaKernel>,
     k_token_capture: Option<HsaKernel>,
@@ -6073,6 +6076,16 @@ impl AmdEngine {
             return Err(RuntimeError::Device(format!(
                 "materialized MLA prefill requires gfx950, but this device is {arch}"
             )));
+        }
+        let has_mla_fold = |p: &DevProg| p.insts.iter().any(amd_mla_fold::native);
+        let use_mla_fold = blob.progs.iter().any(has_mla_fold);
+        if use_mla_fold
+            && (arch != "gfx942" || tp.is_none_or(|t| t.n_gpu != 8)
+                || blob.progs[dec_ix..].iter().any(has_mla_fold))
+        {
+            return Err(RuntimeError::Device(
+                "native MLA fold requires gfx942 TP8 prefill".into(),
+            ));
         }
         let has_gemm_lt = |p: &DevProg| p.insts.iter().any(|d| d.op == DevOp::GemmLtPf as u16);
         let use_gemm_lt = blob.progs.iter().any(has_gemm_lt);
@@ -8461,6 +8474,14 @@ impl AmdEngine {
             .as_ref()
             .map(|m| (m.base, m.base + stage1_a4_payload));
 
+        let mla_fold = if use_mla_fold {
+            Some(amd_mla_fold::MlaFold::load(
+                &be, hsaco_dir, &blob.progs[..dec_ix], &blob.tensors, &devp, &mut modules,
+            )?)
+        } else {
+            None
+        };
+
         // OPTIONAL, because a BLOCK asset is not a model. A block takes
         // `act.x` in and gives `act.x` out — it has no embedding, no lm_head,
         // no argmax, and therefore none of `in.ids`/`in.pos`/`in.kvlen`/
@@ -8512,6 +8533,21 @@ impl AmdEngine {
                                 ));
                             }
                             prefill_routes[seg] = PrefillSegmentRoute::SparseMla(route);
+                        }
+                    }
+                }
+                if use_mla_fold {
+                    for (seg, route) in amd_mla_fold::routes(p, &blob.tensors, seg_class.len())?
+                        .into_iter()
+                        .enumerate()
+                    {
+                        if let Some(route) = route {
+                            if !matches!(prefill_routes[seg], PrefillSegmentRoute::Interpreter) {
+                                return Err(RuntimeError::Device(
+                                    "native MLA fold overlaps another route".into(),
+                                ));
+                            }
+                            prefill_routes[seg] = PrefillSegmentRoute::MlaFold(route);
                         }
                     }
                 }
@@ -8626,7 +8662,7 @@ impl AmdEngine {
                         p.t
                     )));
                 }
-                if (use_sparse_mla || use_moe_aiter || use_index_tp || use_gemm_lt)
+                if (use_sparse_mla || use_moe_aiter || use_index_tp || use_gemm_lt || use_mla_fold)
                     && !prefill_segment_specialization_allowed(dispatch)
                 {
                     return Err(RuntimeError::Device(
@@ -9301,6 +9337,7 @@ impl AmdEngine {
             moe_aiter,
             index_tp,
             gemm_lt,
+            mla_fold,
             k_xaudit,
             k_state_clear,
             k_token_capture,
@@ -9950,6 +9987,7 @@ impl AmdEngine {
                 PrefillSegmentRoute::MoeAiter(_) => return "moe_aiter_fp8",
                 PrefillSegmentRoute::IndexTp(_) => return "index_tp",
                 PrefillSegmentRoute::GemmLt(_) => return "gemm_lt",
+                PrefillSegmentRoute::MlaFold(_) => return "mla_fold",
                 PrefillSegmentRoute::MlaMaterializePack { .. } => return "mla_materialize_pack",
                 PrefillSegmentRoute::MlaMaterializedPrefill { .. } => {
                     return "mla_materialized_prefill";
@@ -10109,6 +10147,16 @@ impl AmdEngine {
         }
         let active = self.packed_prefill.is_some_and(|b| b.prog == p);
         if !active {
+            if let Some(PrefillSegmentRoute::MlaFold(route)) =
+                self.progs[p].prefill_routes.get(seg).copied()
+            {
+                let kernel = self.mla_fold.as_ref().ok_or_else(|| {
+                    RuntimeError::Device("native MLA fold has no loaded kernels".into())
+                })?;
+                kernel.enqueue(&self.be, route, &self.tens_table)?;
+                self.seg_launches += 3;
+                return Ok(());
+            }
             if let Some(PrefillSegmentRoute::GemmLt(route)) =
                 self.progs[p].prefill_routes.get(seg).copied()
             {
@@ -10638,6 +10686,7 @@ impl AmdEngine {
         match self.progs[p].prefill_routes.get(seg) {
             Some(PrefillSegmentRoute::SparseMla(route)) if route.active => 3,
             Some(PrefillSegmentRoute::GemmLt(_)) => 1,
+            Some(PrefillSegmentRoute::MlaFold(_)) => 3,
             Some(PrefillSegmentRoute::MoeAiter(route)) => route.launches() as usize,
             Some(PrefillSegmentRoute::IndexTp(_)) => 4,
             Some(PrefillSegmentRoute::MoeEpAlign(_)) if self.k_moe_ep_align.is_some() => 4,
@@ -11356,6 +11405,9 @@ impl AmdEngine {
                 route.rebase(rows)?;
             }
             if let PrefillSegmentRoute::GemmLt(route) = route {
+                route.rebase(rows)?;
+            }
+            if let PrefillSegmentRoute::MlaFold(route) = route {
                 route.rebase(rows)?;
             }
         }
