@@ -68,3 +68,26 @@ The oracle does not reject cycles or out-of-range edges before its bounded relax
 For these GLM assets the oracle uses unit instruction durations, zero FLOPs, only the final decode rung, deduplicated non-KV tensor declarations, and no indirect expert traffic model. Its reported 2.778 ms bandwidth floor cannot identify the real 106.742 ms trace bottleneck or predict 70k/C20 performance. Use the measured instruction/shape table above to select experiments; improve oracle input validation and cost extraction before using it to stop an optimization campaign.
 
 The H200 target remains unmet. These are prioritized experiments and verification gaps, not new serving performance claims.
+
+## Follow-up: disabled batched matrix-core GEMV
+
+The existing `gemv_rows_mfma4` implementation in
+[`op_gemm.h`](../../runtime/amd/op_gemm.h) is another concrete decode experiment.
+[`build_gfx942.sh`](../../scripts/build_gfx942.sh) enables it with
+`PLOW_GEMV_MFMA4=1`; it defaults off. It uses
+`v_mfma_f32_4x4x4bf16_1k` for ordinary BF16 GEMV (`norm != 1`) at compiled batch widths ≥2,
+including the global-activation path used when the batch exceeds staged LDS.
+It changes reduction order and cannot promise VALU-reference bit identity.
+
+Inspection of the qualified B1/2/4/8 `interp_decode_gq.elf` objects finds **zero**
+instances of that instruction in each. Their recorded build defines omit
+`GV_MFMA4`, consistent with the default-off source. This establishes a path
+absent from the loaded assets; it does not establish its performance or model
+quality on GLM. The [earlier Gemma measurements](../amd/gemma4-31b-mi300x.md)
+also show that the best standalone unroll/column tile can lose inside the full
+interpreter. Qualify real GLM operands, reduction error, routing, inactive rows,
+object resources and serving behavior before adoption.
+
+The ordinary-GEMV width experiment and pinned MFMA4 inspection are recorded in
+[`mi300x-gemv-width.json`](../../runtime/bench/amd/glm_projection/mi300x-gemv-width.json).
+That experiment uses unchanged GPU objects and does not enable MFMA4.

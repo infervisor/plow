@@ -1262,6 +1262,81 @@ fn blocked_gemv_drops_only_the_empty_ceiling_tail() {
     assert_eq!(blocked_gemv_cus(&all, 16 * 512 + 16 * 64).len(), 256);
 }
 
+#[test]
+fn glm_decode_gemv_tuning_preserves_live_column_ownership() {
+    let _guard = crate::test_env::env_guard();
+    let _env = crate::test_env::EnvScope::set(&[
+        ("PLOW_GLM_WGFIT", "1"),
+        ("PLOW_GEMV_WG_TUNING", ""),
+        ("PLOW_GLM_DSA", "1"),
+        ("PLOW_GLM_FUSE_ROPE", "0"),
+    ]);
+    let mut c = glm_ref_cfg();
+    c.tp = 8;
+    let all: Vec<u32> = (0..304).collect();
+    let mut declarations = Builder::new(304);
+    let n = declare_glm_rows_batched(&mut declarations, &c, 81920, &[3], 8192, 8, MoeEnc::Fp8Blk);
+    let tensors = declarations.tensors();
+    for rows in [1, 2, 4, 8] {
+        let emit = || {
+            let mut b = Builder::new(304);
+            b.adopt_tensors(tensors.clone());
+            emit_glm_block(
+                &mut b,
+                &c,
+                &n,
+                0,
+                81920,
+                rows,
+                8,
+                MoeEnc::Fp8Blk,
+                n.x,
+                n.xnext,
+                &[],
+                &mut 0,
+                &all,
+            );
+            b.finish()
+        };
+        let baseline = emit();
+        let _tuning =
+            crate::test_env::EnvScope::set(&[("PLOW_GEMV_WG_TUNING", "64x6144=304,256x6144=304")]);
+        let tuned = emit();
+        assert_eq!(baseline.insts.len(), tuned.insts.len());
+        let mut changed = 0;
+        for (before, after) in baseline.insts.iter().zip(&tuned.insts) {
+            assert_eq!(
+                (before.op, before.t, before.i, before.j, before.f),
+                (after.op, after.t, after.i, after.j, after.f)
+            );
+            if before.blocks != after.blocks {
+                changed += 1;
+                assert_eq!(after.op, DevOp::Gemv as u16);
+                assert!(matches!(after.i[1], 64 | 256));
+                assert_eq!(after.i[2], 6144);
+                let n = after.i[1];
+                let per = n.div_ceil(u32::from(before.blocks));
+                assert_eq!(n.div_ceil(u32::from(after.blocks)), per);
+                for column in 0..n {
+                    assert!(column / per < u32::from(after.blocks));
+                }
+            }
+        }
+        if rows > 1 {
+            assert!(changed > 0, "B{rows} tuning was ignored");
+        }
+    }
+    let all: Vec<_> = (0..304).rev().collect();
+    let _tuning = crate::test_env::EnvScope::set(&[("PLOW_GEMV_WG_TUNING", "64x6144=304")]);
+    assert_eq!(glm_decode_gemv_cus(&all, DevOp::Gemv, 64, 6144), all[..64]);
+    for op in [DevOp::GemvMxfp4, DevOp::GemvFp8Blk, DevOp::GemvQkv] {
+        assert_eq!(glm_decode_gemv_cus(&all, op, 64, 6144), all);
+    }
+    assert_eq!(glm_decode_gemv_cus(&all, DevOp::Gemv, 64, 2048), all);
+    let _disabled = crate::test_env::EnvScope::set(&[("PLOW_GLM_WGFIT", "0")]);
+    assert_eq!(glm_decode_gemv_cus(&all, DevOp::Gemv, 64, 6144), all);
+}
+
 /// The MLA flash-decode split factor is the ctx-scaled cost optimum, capped by the ACTUAL
 /// per-rank chip-fill `fill = ceil(n_cu / (nh_l/GF))` and the KV-tile count. `glm_nsplit` takes
 /// nh_l (= n_head/tp) so the cap is correct under TP/EP — the pre-fix bug sized it from the

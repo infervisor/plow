@@ -3098,6 +3098,14 @@ pub(crate) fn blocked_gemv_cus_tuned(cus: &[u32], n: u32, k: u32) -> Vec<u32> {
     scoped
 }
 
+fn glm_decode_gemv_cus(cus: &[u32], op: DevOp, n: u32, k: u32) -> Vec<u32> {
+    if op == DevOp::Gemv && emit_config::active().gemv_wg_for(n, k).is_some() {
+        blocked_gemv_cus_tuned(cus, n, k)
+    } else {
+        cus.to_vec()
+    }
+}
+
 /// Emit the shared MLA attention sub-block (input norm -> q/kv down + absorbed folds -> dynamic
 /// interleaved RoPE on the 64 rope dims -> FLASH_MLA_DECODE -> merge -> O_UV_FOLD -> o_proj ->
 /// residual -> post-attention norm). Writes `n.xn2` (the FFN input) and returns the post-attn-norm
@@ -3153,7 +3161,7 @@ pub(crate) fn emit_glm_mla(
         } else {
             DevOp::Gemv
         };
-        b.emit(op, all.clone(), deps, |d| {
+        b.emit(op, glm_decode_gemv_cus(&all, op, nn, k), deps, |d| {
             d.t[0] = out;
             d.t[1] = x;
             d.t[2] = wt;
@@ -6212,18 +6220,23 @@ fn emit_glm_moe_ffn_rows(
     } else {
         DevOp::Gemv
     };
-    let c_score = b.emit(score_op, all.clone(), &[c_rn2], |d| {
-        d.t[0] = n.rlogit;
-        d.t[1] = n.xn2;
-        d.t[2] = w.wr;
-        if enc == MoeEnc::Mxfp4 {
-            d.t[3] = w.wr_s;
-        }
-        d.i[0] = rows;
-        d.i[1] = e;
-        d.i[2] = h;
-        d.f[0] = 1.0;
-    });
+    let c_score = b.emit(
+        score_op,
+        glm_decode_gemv_cus(&all, score_op, e, h),
+        &[c_rn2],
+        |d| {
+            d.t[0] = n.rlogit;
+            d.t[1] = n.xn2;
+            d.t[2] = w.wr;
+            if enc == MoeEnc::Mxfp4 {
+                d.t[3] = w.wr_s;
+            }
+            d.i[0] = rows;
+            d.i[1] = e;
+            d.i[2] = h;
+            d.f[0] = 1.0;
+        },
+    );
     let det = moe_pf_fuse(tk) == MoePfFuse::Det;
     let c_router = b.emit(DevOp::MoeRouterTopkPf, all.clone(), &[c_score], |d| {
         d.t[0] = n.tab;
@@ -6289,14 +6302,19 @@ fn emit_glm_moe_ffn_rows(
              no split form exists for the mxfp4 shared expert — cap the decode ladder"
         );
         let gemv_half = |b: &mut Builder, out: u32, wt: u32| {
-            b.emit(DevOp::Gemv, all.clone(), &[c_rn2], |d| {
-                d.t[0] = out;
-                d.t[1] = n.xn2;
-                d.t[2] = wt;
-                d.i[0] = rows;
-                d.i[1] = imoe_l;
-                d.i[2] = h;
-            })
+            b.emit(
+                DevOp::Gemv,
+                glm_decode_gemv_cus(&all, DevOp::Gemv, imoe_l, h),
+                &[c_rn2],
+                |d| {
+                    d.t[0] = out;
+                    d.t[1] = n.xn2;
+                    d.t[2] = wt;
+                    d.i[0] = rows;
+                    d.i[1] = imoe_l;
+                    d.i[2] = h;
+                },
+            )
         };
         let c_g = gemv_half(b, n.shfu, w.shg);
         let c_u = gemv_half(b, n.shfu_up, w.shu);

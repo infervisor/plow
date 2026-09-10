@@ -227,3 +227,58 @@ continuations match the indexer baseline, 15/18 the earlier native run).
 Atomic selection ordering does not promise repeated text identity. The
 [serving record](mi300x-serving.json) distinguishes both runtime hashes and
 includes metrics, quality cells, resolved knobs, object/source hashes and logs.
+
+## Ordinary decode GEMV workgroup tuning
+
+`PLOW_GEMV_WG_TUNING` now reaches GLM's plain BF16 MLA decode projections and
+batched MoE router/shared gate-up projections. Unset preserves the previous
+packet bytes. Untargeted shapes and MXFP4/FP8-block operators retain their
+existing workgroup selection. This does not change the DSA indexer or the
+single-row MoE path.
+
+The first MI300X experiment uses:
+
+```sh
+--gemv-wg-tuning '64x6144=304,256x6144=304'
+```
+
+The existing blocked-GEMV helper applies that cap, then removes empty trailing
+groups. For these two shapes, `ceil(N/304) = 1`; narrowing to 64 or 256 groups
+keeps every surviving logical slice's output columns and dot-product order.
+This is an emitter change using the existing GPU objects, with no assembly or
+runtime changes. Smaller caps are separate experiments and are not qualified
+by the ownership argument for this setting.
+
+The paired packets have identical instruction operands. B2 removes 3,600
+stream entries; B4/B8 each remove 29,520 (B8: 400,819 → 371,299). Prefill and B1
+are unchanged. All 31 GLM emitter tests pass, including a new TP8 B1/2/4/8
+ownership check. Both emitted blobs pass Lean ordering checks for all eight
+programs. These checks establish structural properties, not a serving speedup.
+
+One exclusive TP8 control/candidate pair, C20 with 20 random requests at
+70k/700 and range ratio 0.14, produced:
+
+| Metric | Control | Trim | Change |
+|---|---:|---:|---:|
+| Output tokens/s | 31.534 | 31.987 | +1.4% |
+| Duration, s | 437.463 | 431.264 | -1.4% |
+| Mean TTFT, ms | 166526.542 | 162174.073 | -2.6% |
+| Median TTFT, ms | 180470.308 | 170197.152 | -5.7% |
+| P99 TTFT, ms | 349253.168 | 349280.813 | +0.01% |
+| Mean TPOT, ms | 193.818 | 193.301 | -0.3% |
+| Median TPOT, ms | 197.927 | 200.715 | +1.4% |
+| P99 ITL, ms | 1133.218 | 1130.932 | -0.2% |
+
+Both complete 20/20 with zero failures and identical per-request lengths:
+1,414,538 input and 13,795 output tokens. Both pass 18/18 retrieval cases;
+12/18 continuations match exactly. This uses the same frozen merged runtime
+and 75 GPU images for both arms. The control's normal SIGTERM shutdown caused
+the first wrapper to stop; the candidate ran after correcting that wrapper,
+under a fresh exclusive eight-GPU lease. Neither benchmark was interrupted.
+
+The small throughput difference and mixed latency results do not establish a
+repeatable improvement. The knob stays opt-in. This screen is also below the
+earlier runtime's 33.400 tokens/s screen; it does not replace that result or
+establish parity with the supplied 100-request H200 result. The
+[record](mi300x-gemv-width.json) includes raw metric summaries, quality outputs,
+source/object hashes, recipes and the disabled MFMA4 path inspection.
