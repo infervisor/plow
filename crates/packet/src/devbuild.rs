@@ -2270,7 +2270,9 @@ impl Builder {
         // before every later one, so cross-segment counter edges are redundant. Keep all
         // same-segment edges unchanged; this applies only to programs carrying the raw boundary.
         let raw_segmented = self.ops.iter().any(|op| {
-            op.inst.op == DevOp::KdaDecodeFused as u16 || op.inst.op == DevOp::MoeAiterFp8Pf as u16
+            op.inst.op == DevOp::KdaDecodeFused as u16
+                || op.inst.op == DevOp::MoeAiterFp8Pf as u16
+                || op.inst.op == DevOp::IndexTpPf as u16
         }) || lean_moe_stage2
             || lean_moe_stage1
             || lean_moe_combine

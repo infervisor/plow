@@ -347,6 +347,7 @@ pub struct AmdTpGroup {
     audit: bool,
     audit_direct: bool,
     audit_compact: bool,
+    index_tp_status: bool,
     /// Read EVERY rank's sampled id, rather than just rank 0's, once every this
     /// many decode tokens — see [`AmdTpGroup::audit_cadence`].
     agree_every: u32,
@@ -434,6 +435,11 @@ impl AmdTpGroup {
         }
         let max_tokens = (tp.slot_bytes / msg) as u32;
         let n_xctr = count_xgates(&blob);
+        let index_tp_status = blob
+            .progs
+            .iter()
+            .flat_map(|p| &p.insts)
+            .any(|d| d.op == packet::dev::DevOp::IndexTpPf as u16);
         let audit_compact_requested = crate::config::RuntimeConfig::get().amd.tp_audit_compact;
         let has_fine_xctr = blob
             .progs
@@ -663,6 +669,7 @@ impl AmdTpGroup {
             audit: !crate::config::RuntimeConfig::get().amd.tp_no_audit,
             audit_direct: crate::config::RuntimeConfig::get().amd.tp_audit_direct,
             audit_compact,
+            index_tp_status,
             agree_every,
             agree_tick: agree_every,
             // Overwritten by the first submit; the widest rung is the safe pre-first-step value.
@@ -1471,6 +1478,9 @@ impl AmdTpGroup {
                     step.clen as f64 / (ns as f64 / 1e9),
                 );
             }
+            if self.index_tp_status {
+                self.group.audit_xstatus_direct()?;
+            }
             if self.audit {
                 self.group.audit_xctr(&self.gate_expect[step.prog])?;
             }
@@ -1544,6 +1554,9 @@ impl AmdTpGroup {
                     step.clen as f64 / (drain_ns as f64 / 1e9),
                 );
             }
+        }
+        if self.index_tp_status {
+            self.group.audit_xstatus_direct()?;
         }
         if self.audit {
             self.group.audit_xctr(&self.gate_expect[step.prog])?;
@@ -1816,6 +1829,8 @@ fn count_xgates(blob: &DevBlob) -> u32 {
             } else if d.op == DevOp::XReduceTwoShot as u16 {
                 // two-shot: reduce-scatter (i3) and all-gather (i4)
                 top = top.max(d.i[3] + 1).max(d.i[4] + 1);
+            } else if d.op == DevOp::IndexTpPf as u16 {
+                top = top.max(d.i[5] + 1).max(d.i[6] + 1);
             } else if d.op == DevOp::XReduceScatter as u16 || d.op == DevOp::XAllGather as u16 {
                 // split seams: one gate each (i3)
                 top = top.max(d.i[3] + 1);
@@ -1883,6 +1898,10 @@ fn gate_expectations(blob: &DevBlob, n_gpu: u32, n_xctr: u32) -> Vec<Vec<Option<
                 } else if d.op == DevOp::XReduceTwoShot as u16 {
                     set(d.i[3], Some(n_gpu));
                     set(d.i[4], Some(n_gpu * d.blocks as u32));
+                } else if d.op == DevOp::IndexTpPf as u16 {
+                    set(d.i[5], Some(n_gpu));
+                    set(d.i[5] + 1, Some(n_gpu));
+                    set(d.i[6], Some(n_gpu));
                 } else if d.op == DevOp::XReduceScatter as u16 || d.op == DevOp::XAllGather as u16 {
                     // Both announce with ONE workgroup per rank: their producers are earlier
                     // packets, the gate_rs argument.
@@ -2174,5 +2193,12 @@ mod tests {
         let e = gate_expectations(&blob, 4, 11);
         assert_eq!(e[0][2], Some(4));
         assert!(e[0][3..11].iter().all(Option::is_none));
+        let mut index = inst(DevOp::IndexTpPf, 0, 0, 1);
+        index.i[5] = 11;
+        index.i[6] = 13;
+        blob.progs[0].insts.push(index);
+        assert_eq!(count_xgates(&blob), 14);
+        let e = gate_expectations(&blob, 8, 14);
+        assert_eq!(&e[0][11..14], &[Some(8), Some(8), Some(8)]);
     }
 }

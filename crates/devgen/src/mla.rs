@@ -4370,6 +4370,7 @@ fn emit_glm_dsa_prefill_select(
     t: u32,
     all: &[u32],
     pre: &[u32],
+    xgate: &mut u32,
 ) -> u32 {
     let (hi, di, h, ql) = (c.index_heads, c.index_dim, c.hidden, c.q_lora);
     let itk = c.index_topk.min(ctx);
@@ -4617,33 +4618,62 @@ fn emit_glm_dsa_prefill_select(
             d.f[0] = c.eps;
         },
     );
-    let c_sc = b.emit(DevOp::IndexScorePf, all.to_vec(), &[c_qi, c_ki, c_w], |d| {
-        d.t[0] = n.iscore_pf;
-        d.t[1] = n.qidx_pf;
-        d.t[2] = n.kidx[slot];
-        d.t[3] = n.widx_pf;
-        d.t[4] = n.kvlen;
-        d.i[0] = t;
-        d.i[1] = hi;
-        d.i[2] = ctx;
-        d.i[3] = di;
-        d.f[0] = (di as f32).powf(-0.5) * (hi as f32).powf(-0.5);
-    });
-    // One workgroup per query row; grid-strided, so any width is correct and `min(t, n_cu)` is
-    // the point where extra workgroups would idle.
-    let c_se = b.emit(
-        DevOp::IndexSelectPf,
-        (0..n_cu.min(t)).collect::<Vec<_>>(),
-        &[c_sc],
-        |d| {
-            d.t[0] = n.iidx_pf;
-            d.t[1] = n.iscore_pf;
-            d.t[2] = n.kvlen;
-            d.i[0] = t;
-            d.i[1] = itk;
-            d.i[2] = ctx;
-        },
-    );
+    let c_se =
+        if emit_config::active().glm_index_tp && t >= 2048 {
+            assert!(
+            !emit_config::active().packed_prefill_on()
+                && c.tp == 8 && n_cu == 304 && h == 6144
+                && hi == 32 && di == 128 && itk == 2048 && t <= 8192,
+            "PLOW_GLM_INDEX_TP requires unpacked gfx942 TP8 GLM H6144/HI32/DI128/top2048 prefill"
+        );
+            let enter = *xgate;
+            *xgate = enter.checked_add(3).expect("indexer TP gate overflow");
+            let counter = b.emit(DevOp::IndexTpPf, vec![0], &[c_qi, c_ki, c_w], |d| {
+                d.t = [
+                    n.iidx_pf,
+                    n.iscore_pf,
+                    n.qidx_pf,
+                    n.kidx[slot],
+                    n.widx_pf,
+                    n.kvlen,
+                    n.dg_tp,
+                    TENSOR_NONE,
+                ];
+                d.i = [t, ctx, itk, c.tp, n.slot_b, enter, enter + 2, 0];
+                d.f[0] = (di as f32).powf(-0.5) * (hi as f32).powf(-0.5);
+            });
+            b.isolate(counter);
+            counter
+        } else {
+            let c_sc = b.emit(DevOp::IndexScorePf, all.to_vec(), &[c_qi, c_ki, c_w], |d| {
+                d.t[0] = n.iscore_pf;
+                d.t[1] = n.qidx_pf;
+                d.t[2] = n.kidx[slot];
+                d.t[3] = n.widx_pf;
+                d.t[4] = n.kvlen;
+                d.i[0] = t;
+                d.i[1] = hi;
+                d.i[2] = ctx;
+                d.i[3] = di;
+                d.f[0] = (di as f32).powf(-0.5) * (hi as f32).powf(-0.5);
+            });
+            // One workgroup per query row; grid-strided, so any width is correct and `min(t, n_cu)` is
+            // the point where extra workgroups would idle.
+            let c_se = b.emit(
+                DevOp::IndexSelectPf,
+                (0..n_cu.min(t)).collect::<Vec<_>>(),
+                &[c_sc],
+                |d| {
+                    d.t[0] = n.iidx_pf;
+                    d.t[1] = n.iscore_pf;
+                    d.t[2] = n.kvlen;
+                    d.i[0] = t;
+                    d.i[1] = itk;
+                    d.i[2] = ctx;
+                },
+            );
+            c_se
+        };
     // One workgroup per query PACK (B2: 8 queries share a union; all 8 heads share the walk).
     let n_qt = t.div_ceil(GLM_DSA_PF_PACK);
     b.emit(
@@ -4894,6 +4924,7 @@ pub(crate) fn emit_glm_mla_prefill(
             t,
             &all,
             &[c_rn1, c_rnq],
+            xgate,
         ))
     } else {
         None

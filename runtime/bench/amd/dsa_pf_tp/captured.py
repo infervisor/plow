@@ -19,6 +19,7 @@ def main():
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--capture-rows", type=int, default=8192)
     parser.add_argument("--reps", type=int, default=15)
+    parser.add_argument("--protocol", action="store_true")
     args = parser.parse_args()
     assert torch.cuda.device_count() == 8
     assert all("gfx942" in torch.cuda.get_device_properties(r).gcnArchName for r in range(8))
@@ -32,6 +33,10 @@ def main():
     peer_gather.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint,
                            ctypes.c_uint, ctypes.c_void_p]
     peer_gather.restype = ctypes.c_int
+    if args.protocol:
+        protocol = lib.plow_index_protocol
+        protocol.argtypes = [ctypes.c_void_p] * 9 + [ctypes.c_uint] * 4 + [ctypes.c_uint64, ctypes.c_void_p]
+        protocol.restype = ctypes.c_int
     assert lib.plow_enable_peers() == 0
 
     def read(name, dtype):
@@ -65,6 +70,14 @@ def main():
             lengths.append(torch.tensor([length], dtype=torch.int32, device=r))
         peers = [torch.tensor([t.data_ptr() for t in indices], dtype=torch.uint64, device=r)
                  for r in range(8)]
+        if args.protocol:
+            counter_offset = rows * 2048 * 4
+            staging = [torch.zeros(counter_offset + 4096 * 128, dtype=torch.uint8, device=r)
+                       for r in range(8)]
+            counter_peers = [torch.tensor([t.data_ptr() for t in staging], dtype=torch.uint64, device=r)
+                             for r in range(8)]
+            status = [torch.zeros(1, dtype=torch.int32, device=r) for r in range(8)]
+            next_gate = 0
 
         def launch(r, ranged):
             with torch.cuda.device(r):
@@ -86,6 +99,20 @@ def main():
                                      dst, torch.cuda.current_stream().cuda_stream)
                     assert rc == 0, rc
             sync()
+
+        def device_protocol(wait=True):
+            nonlocal next_gate
+            assert next_gate + 2 < 4096
+            for r in range(8):
+                with torch.cuda.device(r):
+                    tensors = [indices[r], staging[r], scores[r], *inputs[r], lengths[r],
+                               counter_peers[r], status[r]]
+                    rc = protocol(*(t.data_ptr() for t in tensors), rows, stride, r,
+                                  next_gate, counter_offset, torch.cuda.current_stream().cuda_stream)
+                    assert rc == 0, rc
+            next_gate += 3
+            if wait:
+                sync()
 
         compute(False)
         reference_score = scores[0].clone()
@@ -116,6 +143,31 @@ def main():
             assert torch.equal(indices[r][:rows].sort(dim=1).values.to(0), reference_idx), (rows, r)
             assert torch.equal(indices[r].to(0), indices[0]), (rows, r, "gather differs by rank")
             assert bool((indices[r][rows:] == -1).all()), (rows, r, "padding overwritten")
+        if args.protocol:
+            for r in range(8):
+                scores[r].fill_(-float("inf"))
+                indices[r].fill_(-1)
+            device_protocol()
+            for r in range(8):
+                lo, hi = min(r * band, rows), min((r + 1) * band, rows)
+                assert torch.equal(scores[r][lo:hi].to(0), reference_score[lo:hi]), (rows, r)
+                assert torch.equal(indices[r][:rows].sort(dim=1).values.to(0), reference_idx), (rows, r)
+            history = [[torch.empty_like(indices[r]) for r in range(8)] for _ in range(16)]
+            sync()
+            for step in range(16):
+                device_protocol(wait=False)
+                for r in range(8):
+                    with torch.cuda.device(r):
+                        history[step][r].copy_(indices[r], non_blocking=True)
+                        staging[r][:counter_offset].fill_(0xA5)
+            sync()
+            for step in range(16):
+                for r in range(8):
+                    got = history[step][r]
+                    assert torch.equal(got[:rows].sort(dim=1).values.to(0), reference_idx), (step, rows, r)
+                    assert torch.equal(got.to(0), history[step][0]), (step, rows, r, "protocol gather")
+                    assert bool((got[rows:] == -1).all()), (step, rows, r, "protocol padding")
+            del history
         del reference_score, reference_idx
 
         def measure(fn):
@@ -139,6 +191,17 @@ def main():
                   "replicated": measure(lambda: compute(False)),
                   "partitioned_compute": measure(lambda: compute(True)),
                   "gather": measure(gather), "partitioned_total": measure(partitioned)}
+        if args.protocol:
+            record["device_protocol"] = measure(device_protocol)
+            for r in range(8):
+                assert int(status[r][0]) == 0, (rows, r, "protocol timeout")
+                counters = staging[r][counter_offset:].view(torch.int32)[::32]
+                assert bool((counters[:next_gate] == 8).all()), (rows, r, "gate arrivals")
+                assert bool((counters[next_gate:] == 0).all()), (rows, r, "unused gates")
+            record["protocol_reuse_iterations"] = 16
+            record["audited_gates"] = next_gate
+            record["protocol_status_zero_all_ranks"] = True
+            del staging, counter_peers, status
         results.append(record)
         print(json.dumps(record), flush=True)
         del scores, indices, lengths, peers
@@ -147,7 +210,10 @@ def main():
     metadata = {"torch": torch.__version__, "hip": torch.version.hip,
                 "device": torch.cuda.get_device_name(0), "ranks": 8,
                 "capture_rows": args.capture_rows,
-                "scope": "Captured layer38 index score+select; host barriers and peer copies; no model serving claim",
+                "protocol_gates_per_layer": 3 if args.protocol else None,
+                "scope": ("Captured layer38 index score+select; native device protocol with three gates"
+                          if args.protocol else "Captured layer38 index score+select; host barriers and peer copies")
+                         + "; no model serving claim",
                 "capture_sha256": {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
                                    for p in sorted(args.capture.glob("*.bin"))},
                 "library_sha256": hashlib.sha256(args.library.read_bytes()).hexdigest(),

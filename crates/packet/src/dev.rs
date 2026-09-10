@@ -1838,6 +1838,11 @@ pub enum DevOp {
     /// `t0=out t1=x t2=weights t3=scales t4=meta t5=row_token t6=row_part t7=row_gate` ·
     /// `i0=T i1=H i2=I i3=E i4=topk i5=align_tile`. Requires an isolated native segment.
     MoeAiterFp8Pf = 156,
+    /// Native gfx942 TP8 query-partitioned DSA score, top-k and raw index gather.
+    /// `t0=idx t1=score t2=q t3=k t4=w t5=kv_len t6=peer_slot` ·
+    /// `i0=T i1=ctx i2=topk i3=tp i4=slot_bytes i5=enter_gate i6=complete_gate` · `f0=scale`.
+    /// Requires an isolated native segment and three consecutive system-scope arrival gates.
+    IndexTpPf = 157,
 }
 
 /// GLU-family `act` code for GPT-OSS's `swiglu_oai` (pair form, `f0 = alpha`, `f1 = limit`).
@@ -2010,6 +2015,7 @@ impl DevOp {
         DevOp::RowGather,
         DevOp::PerLayerInput,
         DevOp::MoeAiterFp8Pf,
+        DevOp::IndexTpPf,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -2187,6 +2193,7 @@ impl DevOp {
             DevOp::RowGather => "PLOW_DOP_ROW_GATHER",
             DevOp::PerLayerInput => "PLOW_DOP_PER_LAYER_INPUT",
             DevOp::MoeAiterFp8Pf => "PLOW_DOP_MOE_AITER_FP8_PF",
+            DevOp::IndexTpPf => "PLOW_DOP_INDEX_TP_PF",
         }
     }
 
@@ -2228,7 +2235,7 @@ impl DevOp {
     /// collision-at-merge as 111 -> 113, resolved the same way (renumber the later merge).
     /// 154 -> 155 for `RowGather = 154` (the unified token batch's terminal row selection).
     /// 155 -> 156 for `PerLayerInput = 155` (Gemma-4 E-series per-layer inputs).
-    pub const COUNT: u16 = 157;
+    pub const COUNT: u16 = 158;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///

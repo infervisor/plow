@@ -274,6 +274,7 @@ const DOC: &[S] = &[
     S { op: DevOp::MoeDownMxPf, t: &["part", "fu_g", "W_d", "S_d", "meta", "bias_d?", "row_partidx", "row_gate"], i: &["H", "I", "n_exp"], f: &[], j: &[] },
     S { op: DevOp::PerLayerInput, t: &["x", "Wg", "Wp", "gamma_post", "ple", "hn_out?", "gamma_next?"], i: &["T", "H", "P", "col0", "stride"], f: &["eps", "layer_scalar"], j: &[] },
     S { op: DevOp::MoeAiterFp8Pf, t: &["out", "x", "weights", "scales", "meta", "row_token", "row_part", "row_gate"], i: &["T", "H", "I", "E", "topk", "align_tile"], f: &[], j: &[] },
+    S { op: DevOp::IndexTpPf, t: &["idx", "score", "q", "k", "w", "kv_len", "peer_slot"], i: &["T", "ctx", "topk", "tp", "slot_bytes", "enter_gate", "complete_gate"], f: &["scale"], j: &[] },
 ];
 
 /// Ops that say "As [`DevOp::X`]" / "twin of [`DevOp::X`]" / "Same operands as

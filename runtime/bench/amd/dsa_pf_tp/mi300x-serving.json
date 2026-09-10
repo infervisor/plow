@@ -1,0 +1,1639 @@
+{
+  "schema": "plow.glm53.native-index-tp.v1",
+  "date": "2026-09-10",
+  "source_base_commit": "b0f55beac0842478606769b93bffa79a0723c553",
+  "gpu": "MI300X gfx942",
+  "gpu_lease_count": 8,
+  "tp": 8,
+  "decode_batch_capacity": 8,
+  "kv_format": "bf16",
+  "speculative_decoding": false,
+  "benchmark_runtime_sha256": "681b9cba2cce524f59cb7d6bb4002500da8ce5abe40fb99a219ac3342ce8acc5",
+  "runtime_source_note": "After freezing the runtime, only unrelated formatting was reverted; the emitter gate variable was renamed and benchmark metadata/docs updated. Dispatch and arithmetic are unchanged.",
+  "native_packet_sha256": "831f99b2da3375f7392cdd5178f1eb89219cc33a763a8d9e043ad6a8cfdaead5",
+  "baseline_packet_sha256": "0b86073279396a0d1377eba3e76b6e1709fbd9e9ca5f62332650cdcec280983e",
+  "adapter_sha256": "3eb9d32d2b14a8e2ac23548ff279cacca1ea2aee2922de8eb921a8f244bf4ace",
+  "protocol": {
+    "launches_per_layer": 4,
+    "gates_per_layer": 3,
+    "additional_activation_workspace_bytes": 0,
+    "records": [
+      "mi300x-protocol-full.json",
+      "mi300x-protocol-tail.json"
+    ],
+    "score_bits_exact": true,
+    "captured_topk_sets_exact": true,
+    "gather_bytes_exact_all_ranks": true,
+    "scratch_poison_reuse_iterations_per_case": 16
+  },
+  "emit_config": {
+    "note": "every knob EmitConfig declares, its resolved value, and where that value came from (clap's own ValueSource, not inferred). `replay` is the env assignments that reproduce this configuration; defaults are omitted so a replayed build follows the tree's defaults rather than pinning today's.",
+    "covers": "knobs declared by EmitConfig; env vars read outside it are named under `unrecorded_env`, which reports their value but cannot describe them",
+    "knob_count": 153,
+    "replay": {
+      "GLM_MOE_CORESIDENT": "2",
+      "GLM_SHARD_HEAD": "1",
+      "GLM_SHARED_CUS": "48",
+      "PLOW_DECODE_BATCH_LADDER": "1,2,4,8",
+      "PLOW_EMIT_PACKED_PREFILL": "false",
+      "PLOW_FP8": "1",
+      "PLOW_GLM_DSA": "1",
+      "PLOW_GLM_DSA_PF": "1",
+      "PLOW_GLM_FUSE_B1": "1",
+      "PLOW_GLM_FUSE_ROPE": "false",
+      "PLOW_GLM_FUSE_SEAM": "1",
+      "PLOW_GLM_INDEX_TP": "true",
+      "PLOW_GLM_MOE_AITER": "true",
+      "PLOW_MLA_PREFILL": "full:128,512,2048,8192",
+      "PLOW_MOE_PF_DET": "1"
+    },
+    "unrecorded_env": {
+      "PLOW_UNISEG": "0",
+      "PLOW_GLM_DSA_PF_SPAN": "3",
+      "PLOW_MLA_PF_V2": "1",
+      "PLOW_MLA_PF_AITER": "1"
+    },
+    "knobs": [
+      {
+        "id": "ane_mlp_channels",
+        "env": "PLOW_ANE_MLP_CHANNELS",
+        "value": "",
+        "source": "default"
+      },
+      {
+        "id": "attention_decode_balance_gf",
+        "env": "PLOW_ATTENTION_DECODE_BALANCE_GF",
+        "value": "",
+        "source": "default"
+      },
+      {
+        "id": "attention_pf_isolate",
+        "env": "PLOW_ATTENTION_PF_ISOLATE",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "attention_pf_role",
+        "env": "PLOW_ATTENTION_PF_ROLE",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "attnres_decode_mwg",
+        "env": "PLOW_ATTNRES_DECODE_MWG",
+        "value": "",
+        "source": "default"
+      },
+      {
+        "id": "attnres_f32mix",
+        "env": "PLOW_ATTNRES_F32MIX",
+        "value": "true",
+        "source": "default"
+      },
+      {
+        "id": "audit_gemv_waste_max",
+        "env": "PLOW_AUDIT_GEMV_WASTE_MAX",
+        "value": "",
+        "source": "default"
+      },
+      {
+        "id": "audit_occ_floor",
+        "env": "PLOW_AUDIT_OCC_FLOOR",
+        "value": "",
+        "source": "default"
+      },
+      {
+        "id": "audit_strict",
+        "env": "PLOW_AUDIT_STRICT",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "dec_stage_halves",
+        "env": "PLOW_DEC_STAGE_HALVES",
+        "value": "",
+        "source": "default"
+      },
+      {
+        "id": "decode_batch",
+        "env": "PLOW_DECODE_BATCH",
+        "value": "1",
+        "source": "default"
+      },
+      {
+        "id": "decode_cublaslt",
+        "env": "PLOW_EMIT_DECODE_CUBLASLT",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "decode_grouped_moe_segments",
+        "env": "PLOW_SEG_DECODE_GROUPED_MOE",
+        "value": "",
+        "source": "default"
+      },
+      {
+        "id": "decode_ladder",
+        "env": "PLOW_DECODE_BATCH_LADDER",
+        "value": "1,2,4,8",
+        "source": "env"
+      },
+      {
+        "id": "decode_mla_segments",
+        "env": "PLOW_SEG_DECODE_MLA",
+        "value": "true",
+        "source": "default"
+      },
+      {
+        "id": "decode_objects",
+        "env": null,
+        "value": "",
+        "source": "default"
+      },
+      {
+        "id": "decode_projection_tuning",
+        "env": null,
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "decode_tiled",
+        "env": "PLOW_DECODE_TILED",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "dense_pf_ns",
+        "env": "PLOW_DENSE_PF_NS",
+        "value": "",
+        "source": "default"
+      },
+      {
+        "id": "emit_packed_prefill",
+        "env": "PLOW_EMIT_PACKED_PREFILL",
+        "value": "false",
+        "source": "env"
+      },
+      {
+        "id": "fa_gf_full",
+        "env": "PLOW_FA_GF_FULL",
+        "value": "",
+        "source": "default"
+      },
+      {
+        "id": "flash_merge_dsplit",
+        "env": "PLOW_FLASH_MERGE_DSPLIT",
+        "value": "",
+        "source": "default"
+      },
+      {
+        "id": "fp8",
+        "env": "PLOW_FP8",
+        "value": "1",
+        "source": "env"
+      },
+      {
+        "id": "fp8_head",
+        "env": "PLOW_FP8_HEAD",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "fp8_kv",
+        "env": "PLOW_FP8_KV",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "fp8_kv_full",
+        "env": "PLOW_FP8_KV_FULL",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "fp8_pf_gemm_role",
+        "env": "PLOW_FP8_PF_GEMM_ROLE",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "fp8_pf_isolate",
+        "env": "PLOW_QWEN_FP8_PF_ISOLATE",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "fuse_argmax",
+        "env": "PLOW_FUSE_ARGMAX",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "fuse_hnr",
+        "env": "PLOW_FUSE_HNR",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "fuse_merge",
+        "env": "PLOW_FUSE_MERGE",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "fuse_qkv_fp8",
+        "env": "PLOW_FUSE_QKV_FP8",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "fuse_quant",
+        "env": "PLOW_FUSE_QUANT",
+        "value": "true",
+        "source": "default"
+      },
+      {
+        "id": "fuse_residual_input",
+        "env": "PLOW_FUSE_RESIDUAL_INPUT",
+        "value": "true",
+        "source": "default"
+      },
+      {
+        "id": "gemm_wide_c8",
+        "env": "PLOW_GEMM_WIDE_C8",
+        "value": "true",
+        "source": "default"
+      },
+      {
+        "id": "gemma_moe_router_blocks",
+        "env": "PLOW_GEMMA_MOE_ROUTER_BLOCKS",
+        "value": "",
+        "source": "default"
+      },
+      {
+        "id": "gemma_moe_router_exact",
+        "env": "PLOW_GEMMA_MOE_ROUTER_EXACT",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "gemma_moe_router_fused",
+        "env": "PLOW_GEMMA_MOE_ROUTER_FUSED",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "gemma_moe_tail_fuse",
+        "env": "PLOW_GEMMA_MOE_TAIL_FUSE",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "gemv_decode_role",
+        "env": "PLOW_GEMV_DECODE_ROLE",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "gemv_mm",
+        "env": "PLOW_GEMV_MM",
+        "value": "",
+        "source": "default"
+      },
+      {
+        "id": "gemv_prefetch",
+        "env": "PLOW_GEMV_PREFETCH",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "gemv_split",
+        "env": "PLOW_GEMV_SPLIT",
+        "value": "1",
+        "source": "default"
+      },
+      {
+        "id": "gemv_walk",
+        "env": "PLOW_GEMV_WALK",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "gemv_wg",
+        "env": "PLOW_GEMV_WG",
+        "value": "",
+        "source": "default"
+      },
+      {
+        "id": "gemv_wg_tuning",
+        "env": "PLOW_GEMV_WG_TUNING",
+        "value": "",
+        "source": "default"
+      },
+      {
+        "id": "glm_dsa",
+        "env": "PLOW_GLM_DSA",
+        "value": "1",
+        "source": "env"
+      },
+      {
+        "id": "glm_dsa_pf",
+        "env": "PLOW_GLM_DSA_PF",
+        "value": "1",
+        "source": "env"
+      },
+      {
+        "id": "glm_ep",
+        "env": "GLM_EP",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "glm_fp8_kv",
+        "env": "PLOW_GLM_FP8_KV",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "glm_fuse_b1",
+        "env": "PLOW_GLM_FUSE_B1",
+        "value": "1",
+        "source": "env"
+      },
+      {
+        "id": "glm_fuse_qnorm",
+        "env": "PLOW_GLM_FUSE_QNORM",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "glm_fuse_rope",
+        "env": "PLOW_GLM_FUSE_ROPE",
+        "value": "false",
+        "source": "env"
+      },
+      {
+        "id": "glm_fuse_seam",
+        "env": "PLOW_GLM_FUSE_SEAM",
+        "value": "1",
+        "source": "env"
+      },
+      {
+        "id": "glm_fuse_xrn",
+        "env": "GLM_FUSE_XRN",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "glm_gemv_wg",
+        "env": "PLOW_GLM_GEMV_WG",
+        "value": "",
+        "source": "default"
+      },
+      {
+        "id": "glm_gf",
+        "env": "PLOW_GLM_GF",
+        "value": "",
+        "source": "default"
+      },
+      {
+        "id": "glm_group",
+        "env": "GLM_GROUP",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "glm_index_tp",
+        "env": "PLOW_GLM_INDEX_TP",
+        "value": "true",
+        "source": "cli"
+      },
+      {
+        "id": "glm_linear_fp8",
+        "env": "GLM_LINEAR_FP8",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "glm_moe_aiter",
+        "env": "PLOW_GLM_MOE_AITER",
+        "value": "true",
+        "source": "env"
+      },
+      {
+        "id": "glm_moe_coresident",
+        "env": "GLM_MOE_CORESIDENT",
+        "value": "2",
+        "source": "env"
+      },
+      {
+        "id": "glm_ofold",
+        "env": "PLOW_GLM_OFOLD",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "glm_pf_ns",
+        "env": "PLOW_GLM_PF_NS",
+        "value": "",
+        "source": "default"
+      },
+      {
+        "id": "glm_pf_wide",
+        "env": "PLOW_GLM_PF_WIDE",
+        "value": "true",
+        "source": "default"
+      },
+      {
+        "id": "glm_place_pf",
+        "env": "PLOW_GLM_PLACE_PF",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "glm_router_off_shared",
+        "env": "GLM_ROUTER_OFF_SHARED",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "glm_router_old",
+        "env": "GLM_ROUTER_OLD",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "glm_shard_head",
+        "env": "GLM_SHARD_HEAD",
+        "value": "1",
+        "source": "env"
+      },
+      {
+        "id": "glm_shared_cus",
+        "env": "GLM_SHARED_CUS",
+        "value": "48",
+        "source": "env"
+      },
+      {
+        "id": "glm_shared_glu_split",
+        "env": "GLM_SHARED_GLU_SPLIT",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "glm_spine_cus",
+        "env": "GLM_SPINE_CUS",
+        "value": "",
+        "source": "default"
+      },
+      {
+        "id": "glm_wgfit",
+        "env": "PLOW_GLM_WGFIT",
+        "value": "true",
+        "source": "default"
+      },
+      {
+        "id": "glm_xr_band",
+        "env": "PLOW_GLM_XR_BAND",
+        "value": "",
+        "source": "default"
+      },
+      {
+        "id": "glm_xr_band_cus",
+        "env": "PLOW_GLM_XR_BAND_CUS",
+        "value": "",
+        "source": "default"
+      },
+      {
+        "id": "glm_xr_band_seam",
+        "env": "PLOW_GLM_XR_BAND_SEAM",
+        "value": "",
+        "source": "default"
+      },
+      {
+        "id": "glm_xr_res",
+        "env": "PLOW_GLM_XR_RES",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "hn_split",
+        "env": "PLOW_HN_SPLIT",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "k3_ablate",
+        "env": "PLOW_K3_ABLATE",
+        "value": "",
+        "source": "default"
+      },
+      {
+        "id": "k3_full",
+        "env": "K3_FULL",
+        "value": "true",
+        "source": "default"
+      },
+      {
+        "id": "k3_fuse_a",
+        "env": "PLOW_K3_FUSE_A",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "k3_fuse_arnorm",
+        "env": "PLOW_K3_FUSE_ARNORM",
+        "value": "true",
+        "source": "default"
+      },
+      {
+        "id": "k3_fuse_ngemv",
+        "env": "PLOW_K3_FUSE_NGEMV",
+        "value": "",
+        "source": "default"
+      },
+      {
+        "id": "k3_kda_conv_step_db",
+        "env": "PLOW_K3_KDA_CONV_STEP_DB",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "k3_prefill",
+        "env": "K3_PREFILL",
+        "value": "",
+        "source": "default"
+      },
+      {
+        "id": "k3_seq_rows",
+        "env": "PLOW_K3_SEQ_ROWS",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "k3_shard_head",
+        "env": "PLOW_K3_SHARD_HEAD",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "kda_carry_keyfeed",
+        "env": "PLOW_KDA_CARRY_KEYFEED",
+        "value": "true",
+        "source": "default"
+      },
+      {
+        "id": "kda_carry_regstate",
+        "env": "PLOW_KDA_CARRY_REGSTATE",
+        "value": "true",
+        "source": "default"
+      },
+      {
+        "id": "kda_chunk",
+        "env": "PLOW_KDA_CHUNK",
+        "value": "",
+        "source": "default"
+      },
+      {
+        "id": "kda_chunk_qpre",
+        "env": "PLOW_KDA_CHUNK_QPRE",
+        "value": "true",
+        "source": "default"
+      },
+      {
+        "id": "kda_decode_fused",
+        "env": "PLOW_KDA_DECODE_FUSED",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "kda_decode_fused_arm",
+        "env": "PLOW_KDA_DECODE_FUSED_ARM",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "kda_fb_fold",
+        "env": "PLOW_KDA_FB_FOLD",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "kda_intra_wave_items",
+        "env": "PLOW_KDA_INTRA_WAVE_ITEMS",
+        "value": "true",
+        "source": "default"
+      },
+      {
+        "id": "kda_key_factor",
+        "env": "PLOW_KDA_KEY_FACTOR",
+        "value": "true",
+        "source": "default"
+      },
+      {
+        "id": "kda_wu_lean",
+        "env": "PLOW_KDA_WU_LEAN",
+        "value": "true",
+        "source": "default"
+      },
+      {
+        "id": "l2_place_prefill",
+        "env": "PLOW_L2_PLACE_PREFILL",
+        "value": "true",
+        "source": "default"
+      },
+      {
+        "id": "layers",
+        "env": "PLOW_LAYERS",
+        "value": "",
+        "source": "default"
+      },
+      {
+        "id": "legacy_glm_layers",
+        "env": "PLOW_GLM_LAYERS",
+        "value": "",
+        "source": "default"
+      },
+      {
+        "id": "legacy_glm_ns",
+        "env": "PLOW_GLM_NS",
+        "value": "",
+        "source": "default"
+      },
+      {
+        "id": "legacy_k3_layers",
+        "env": "PLOW_K3_LAYERS",
+        "value": "",
+        "source": "default"
+      },
+      {
+        "id": "legacy_k3_ns",
+        "env": "PLOW_K3_NS",
+        "value": "",
+        "source": "default"
+      },
+      {
+        "id": "max_chunk",
+        "env": "PLOW_MAX_CHUNK",
+        "value": "",
+        "source": "default"
+      },
+      {
+        "id": "mla_materialized_prefill",
+        "env": "PLOW_MLA_MATERIALIZED_PREFILL",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "mla_ns",
+        "env": "PLOW_MLA_NS",
+        "value": "",
+        "source": "default"
+      },
+      {
+        "id": "mla_prefill",
+        "env": "PLOW_MLA_PREFILL",
+        "value": "full:128,512,2048,8192",
+        "source": "env"
+      },
+      {
+        "id": "moe_align_par",
+        "env": "PLOW_MOE_ALIGN_PAR",
+        "value": "true",
+        "source": "default"
+      },
+      {
+        "id": "moe_combine_lean",
+        "env": "PLOW_MOE_COMBINE_LEAN",
+        "value": "true",
+        "source": "default"
+      },
+      {
+        "id": "moe_pf_det",
+        "env": "PLOW_MOE_PF_DET",
+        "value": "1",
+        "source": "env"
+      },
+      {
+        "id": "moe_prefill",
+        "env": "PLOW_MOE_PREFILL",
+        "value": "",
+        "source": "default"
+      },
+      {
+        "id": "moe_prefill_ep",
+        "env": "PLOW_MOE_PREFILL_EP",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "moe_stage1_body",
+        "env": "PLOW_MOE_STAGE1_BODY",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "moe_stage1_lean",
+        "env": "PLOW_MOE_STAGE1_LEAN",
+        "value": "true",
+        "source": "default"
+      },
+      {
+        "id": "moe_stage2_body",
+        "env": "PLOW_MOE_STAGE2_BODY",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "moe_stage2_lean",
+        "env": "PLOW_MOE_STAGE2_LEAN",
+        "value": "true",
+        "source": "default"
+      },
+      {
+        "id": "mx4_head",
+        "env": "PLOW_MX4_HEAD",
+        "value": "",
+        "source": "default"
+      },
+      {
+        "id": "mx4_prefill",
+        "env": "PLOW_MX4_PREFILL",
+        "value": "",
+        "source": "default"
+      },
+      {
+        "id": "mxfp4",
+        "env": "PLOW_MXFP4",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "no_fuse_nrn",
+        "env": "PLOW_NO_FUSE_NRN",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "no_fuse_qkv",
+        "env": "PLOW_NO_FUSE_QKV",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "no_glu_fuse",
+        "env": "PLOW_NO_GLU_FUSE",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "no_xreduce",
+        "env": "PLOW_NO_XREDUCE",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "ns_abs",
+        "env": "PLOW_NS_ABS",
+        "value": "",
+        "source": "default"
+      },
+      {
+        "id": "ns_full_abs",
+        "env": "PLOW_NS_FULL_ABS",
+        "value": "",
+        "source": "default"
+      },
+      {
+        "id": "ns_mul",
+        "env": "PLOW_NS_MUL",
+        "value": "",
+        "source": "default"
+      },
+      {
+        "id": "pf_floor",
+        "env": "PLOW_PF_FLOOR",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "pf_gemv_head",
+        "env": "PLOW_PF_GEMV_HEAD",
+        "value": "",
+        "source": "default"
+      },
+      {
+        "id": "pf_gfuse",
+        "env": "PLOW_PF_GFUSE",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "pf_ladder",
+        "env": "PLOW_PF_LADDER",
+        "value": "",
+        "source": "default"
+      },
+      {
+        "id": "pf_ladder_append",
+        "env": "PLOW_PF_LADDER_APPEND",
+        "value": "",
+        "source": "default"
+      },
+      {
+        "id": "qnorm_fuse",
+        "env": "PLOW_QNORM_FUSE",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "qwen_ab_blocks",
+        "env": "PLOW_QWEN_AB_BLOCKS",
+        "value": "",
+        "source": "default"
+      },
+      {
+        "id": "qwen_fp8_m1_tma",
+        "env": "PLOW_QWEN_FP8_M1_TMA",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "qwen_fuse_ab",
+        "env": "PLOW_QWEN_FUSE_AB",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "qwen_fuse_mlp",
+        "env": "PLOW_QWEN_FUSE_MLP",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "qwen_prefill",
+        "env": "PLOW_QWEN_PREFILL",
+        "value": "",
+        "source": "default"
+      },
+      {
+        "id": "qwen_projection_dag",
+        "env": "PLOW_QWEN_PROJECTION_DAG",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "qwen_share_quant",
+        "env": "PLOW_QWEN_SHARE_QUANT",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "qwen_w8a8_prefill",
+        "env": "PLOW_QWEN_W8A8_PREFILL",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "row_split",
+        "env": "PLOW_ROW_SPLIT",
+        "value": "",
+        "source": "default"
+      },
+      {
+        "id": "seq_par_seams",
+        "env": "PLOW_SEQ_PAR_SEAMS",
+        "value": "true",
+        "source": "default"
+      },
+      {
+        "id": "skip_coverage",
+        "env": "PLOW_SKIP_COVERAGE",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "tma_gemm",
+        "env": "PLOW_TMA_GEMM",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "tune_dump",
+        "env": "PLOW_TUNE_DUMP",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "tunedb",
+        "env": "PLOW_TUNEDB",
+        "value": "",
+        "source": "default"
+      },
+      {
+        "id": "uniseg",
+        "env": "PLOW_UNISEG",
+        "value": "false",
+        "source": "production_default"
+      },
+      {
+        "id": "uniseg_max_t",
+        "env": "PLOW_UNISEG_MAX_T",
+        "value": "",
+        "source": "default"
+      },
+      {
+        "id": "w8a16",
+        "env": "PLOW_W8A16",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "w8a8",
+        "env": "PLOW_W8A8",
+        "value": "false",
+        "source": "default"
+      },
+      {
+        "id": "xr2_gather",
+        "env": "PLOW_XR2_GATHER",
+        "value": "true",
+        "source": "default"
+      },
+      {
+        "id": "xr_combine_fold",
+        "env": "PLOW_XR_COMBINE_FOLD",
+        "value": "true",
+        "source": "default"
+      },
+      {
+        "id": "xr_cus",
+        "env": "PLOW_XR_CUS",
+        "value": "",
+        "source": "default"
+      }
+    ]
+  },
+  "lean": {
+    "verified": true,
+    "oracle": true,
+    "reason": null,
+    "note": "`verified` = a Lean ordering certificate (plow_verify checkpoint D) was obtained for EVERY program in this blob; `oracle` = the Lean decode lower-bound query ran. false means NOT CHECKED (see `reason`), never `checked and rejected` \u2014 a rejection aborts emission, so a blob with a rejected program never reaches disk and has no manifest."
+  },
+  "runtime_env": {
+    "PLOW_MLA_PF_V2": "1",
+    "PLOW_MLA_PF_AITER": "1",
+    "PLOW_PF_CHUNK": "8192",
+    "PLOW_PF_INTERLEAVE": "0"
+  },
+  "workload": {
+    "client": "vllm bench serve",
+    "backend": "vllm",
+    "dataset": "random",
+    "seed": 0,
+    "input_length": 70000,
+    "output_length": 700,
+    "range_ratio": 0.14,
+    "num_prompts": 20,
+    "max_concurrency": 20,
+    "temperature": null,
+    "ignore_eos": false
+  },
+  "quality": {
+    "arm": "index-tp-b8",
+    "concurrency": 8,
+    "cells": [
+      {
+        "length_label": 8000,
+        "depth": 0.1,
+        "needle": "city",
+        "expected": "Trondheim",
+        "text": " Trondheim. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream, so a token",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 5438,
+          "completion_tokens": 24,
+          "total_tokens": 5462,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "seconds": 8.625579738989472
+      },
+      {
+        "length_label": 8000,
+        "depth": 0.1,
+        "needle": "code",
+        "expected": "7429",
+        "text": " 7429-BLUE. The code is 7429-BLUE. The code is 7",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 5437,
+          "completion_tokens": 24,
+          "total_tokens": 5461,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "seconds": 8.73926121799741
+      },
+      {
+        "length_label": 8000,
+        "depth": 0.9,
+        "needle": "code",
+        "expected": "7429",
+        "text": " 7429-BLUE. The code is 7429-BLUE. The code is 7",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 5437,
+          "completion_tokens": 24,
+          "total_tokens": 5461,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "seconds": 9.621965757978614
+      },
+      {
+        "length_label": 8000,
+        "depth": 0.1,
+        "needle": "mass",
+        "expected": "312",
+        "text": " exactly 312 grams. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream,",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 5433,
+          "completion_tokens": 24,
+          "total_tokens": 5457,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "seconds": 10.749532710004132
+      },
+      {
+        "length_label": 8000,
+        "depth": 0.5,
+        "needle": "code",
+        "expected": "7429",
+        "text": " 7429-BLUE. The code is 7429-BLUE. The code is 7",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 5437,
+          "completion_tokens": 24,
+          "total_tokens": 5461,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "seconds": 11.841889926989097
+      },
+      {
+        "length_label": 8000,
+        "depth": 0.9,
+        "needle": "city",
+        "expected": "Trondheim",
+        "text": " Trondheim. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream, so a token",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 5438,
+          "completion_tokens": 24,
+          "total_tokens": 5462,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "seconds": 12.942207398999017
+      },
+      {
+        "length_label": 8000,
+        "depth": 0.5,
+        "needle": "city",
+        "expected": "Trondheim",
+        "text": " Trondheim. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream, so a token",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 5438,
+          "completion_tokens": 24,
+          "total_tokens": 5462,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "seconds": 14.055933798023034
+      },
+      {
+        "length_label": 8000,
+        "depth": 0.5,
+        "needle": "mass",
+        "expected": "312",
+        "text": " exactly 312 grams. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream,",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 5433,
+          "completion_tokens": 24,
+          "total_tokens": 5457,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "seconds": 15.17355393100297
+      },
+      {
+        "length_label": 8000,
+        "depth": 0.9,
+        "needle": "mass",
+        "expected": "312",
+        "text": " exactly 312 grams. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream,",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 5433,
+          "completion_tokens": 24,
+          "total_tokens": 5457,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "seconds": 24.130175544007216
+      },
+      {
+        "length_label": 100000,
+        "depth": 0.1,
+        "needle": "code",
+        "expected": "7429",
+        "text": " 7429-BLUE. The maintenance access code for the Kestrel substation is 7429",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 68801,
+          "completion_tokens": 24,
+          "total_tokens": 68825,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "seconds": 33.51775705098407
+      },
+      {
+        "length_label": 100000,
+        "depth": 0.1,
+        "needle": "city",
+        "expected": "Trondheim",
+        "text": " Trondheim. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream, so a token",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 68802,
+          "completion_tokens": 24,
+          "total_tokens": 68826,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "seconds": 42.33738442102913
+      },
+      {
+        "length_label": 100000,
+        "depth": 0.5,
+        "needle": "code",
+        "expected": "7429",
+        "text": " 7429-BLUE.",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 68801,
+          "completion_tokens": 9,
+          "total_tokens": 68810,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "seconds": 43.545772274024785
+      },
+      {
+        "length_label": 100000,
+        "depth": 0.1,
+        "needle": "mass",
+        "expected": "312",
+        "text": " exactly 312 grams. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream,",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 68797,
+          "completion_tokens": 24,
+          "total_tokens": 68821,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "seconds": 50.91844951198436
+      },
+      {
+        "length_label": 100000,
+        "depth": 0.5,
+        "needle": "city",
+        "expected": "Trondheim",
+        "text": " Trondheim. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream, so a token",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 68802,
+          "completion_tokens": 24,
+          "total_tokens": 68826,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "seconds": 68.20236521400511
+      },
+      {
+        "length_label": 100000,
+        "depth": 0.5,
+        "needle": "mass",
+        "expected": "312",
+        "text": " exactly 312 grams. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream,",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 68797,
+          "completion_tokens": 24,
+          "total_tokens": 68821,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "seconds": 76.85337865300244
+      },
+      {
+        "length_label": 100000,
+        "depth": 0.9,
+        "needle": "code",
+        "expected": "7429",
+        "text": " 7429-BLUE. The code is 7429-BLUE. The code is 7",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 68801,
+          "completion_tokens": 24,
+          "total_tokens": 68825,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "seconds": 81.45521810598439
+      },
+      {
+        "length_label": 100000,
+        "depth": 0.9,
+        "needle": "city",
+        "expected": "Trondheim",
+        "text": " Trondheim. She relocated it to Trondheim. She relocated it to Trondheim. She relocated it to Trondheim.",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 68802,
+          "completion_tokens": 24,
+          "total_tokens": 68826,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "seconds": 64.59473897702992
+      },
+      {
+        "length_label": 100000,
+        "depth": 0.9,
+        "needle": "mass",
+        "expected": "312",
+        "text": " exactly 312 grams. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream,",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 68797,
+          "completion_tokens": 24,
+          "total_tokens": 68821,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "seconds": 55.810916771006305
+      }
+    ],
+    "passed": 18,
+    "text_identical": 15,
+    "baseline": "MoE-only TP8 B8 BF16-KV",
+    "raw_sha256": "0bd1d9ee777383b6d4f411ab4577a2662a6ce75da00ae3ca55ffb01bcbffbaac"
+  },
+  "verification": {
+    "packet_lib_tests": 120,
+    "manifest_tests": 47,
+    "native_route_test": true,
+    "tp_gate_count_test": true,
+    "cuda_hsa_compile": true,
+    "lean_verified_programs": 8,
+    "option_off_packet_byte_identical": true,
+    "final_native_reemit_byte_identical": true
+  },
+  "serving_native": {
+    "date": "20260910-000228",
+    "endpoint_type": "vllm",
+    "backend": "vllm",
+    "label": null,
+    "model_id": "glm-5.3-plow-lite",
+    "tokenizer_id": "zai-org/GLM-5.3",
+    "num_prompts": 20,
+    "request_rate": "inf",
+    "burstiness": 1.0,
+    "max_concurrency": 20,
+    "duration": 424.74590420903405,
+    "completed": 20,
+    "failed": 0,
+    "total_input_tokens": 1414538,
+    "total_output_tokens": 13795,
+    "request_throughput": 0.047086975534806376,
+    "request_goodput": null,
+    "output_throughput": 32.4782413751327,
+    "total_token_throughput": 3362.79405132783,
+    "input_lens": [
+      76873,
+      72685,
+      70219,
+      65488,
+      66234,
+      61003,
+      61674,
+      60523,
+      63635,
+      76141,
+      72929,
+      78091,
+      70072,
+      72091,
+      79228,
+      74499,
+      72593,
+      70856,
+      71175,
+      78529
+    ],
+    "output_lens": [
+      656,
+      763,
+      734,
+      602,
+      680,
+      771,
+      711,
+      608,
+      753,
+      746,
+      769,
+      636,
+      619,
+      772,
+      606,
+      709,
+      617,
+      661,
+      697,
+      685
+    ],
+    "ttfts": [
+      224.60908862098586,
+      9.270702535053715,
+      234.53786841098918,
+      213.29784456500784,
+      202.43733537197113,
+      17.47129135101568,
+      77.62073651800165,
+      179.53508204600075,
+      154.41664740699343,
+      341.2167373030097,
+      315.339001387998,
+      68.86439828400034,
+      192.32920296798693,
+      329.6997853249777,
+      170.9570704100188,
+      305.0827289589797,
+      27.22446185798617,
+      36.72518020198913,
+      46.680129700980615,
+      57.76429104001727
+    ],
+    "max_output_tokens_per_s": 72.0,
+    "max_concurrent_requests": 20,
+    "rtfx": 0.0,
+    "mean_ttft_ms": 160253.97921319818,
+    "median_ttft_ms": 175246.07622800977,
+    "std_ttft_ms": 108860.14723419766,
+    "p99_ttft_ms": 339028.5164271836,
+    "mean_tpot_ms": 188.56048717623284,
+    "median_tpot_ms": 191.8932568786861,
+    "std_tpot_ms": 39.88132840470383,
+    "p99_tpot_ms": 261.05163018282906,
+    "mean_itl_ms": 188.03636540101633,
+    "median_itl_ms": 117.13377496926114,
+    "std_itl_ms": 258.79245062526996,
+    "p99_itl_ms": 1163.3191580174025,
+    "raw_sha256": "324b9cf110ccada769ecba91a5286c15a2d315ce4f9c2d758f411f3671f59269"
+  },
+  "serving_adjacent_baseline": {
+    "date": "20260910-001148",
+    "endpoint_type": "vllm",
+    "backend": "vllm",
+    "label": null,
+    "model_id": "glm-5.3-plow-lite",
+    "tokenizer_id": "zai-org/GLM-5.3",
+    "num_prompts": 20,
+    "request_rate": "inf",
+    "burstiness": 1.0,
+    "max_concurrency": 20,
+    "duration": 459.683825037966,
+    "completed": 20,
+    "failed": 0,
+    "total_input_tokens": 1414538,
+    "total_output_tokens": 13795,
+    "request_throughput": 0.04350816563612646,
+    "request_goodput": null,
+    "output_throughput": 30.009757247518223,
+    "total_token_throughput": 3107.2074373772707,
+    "input_lens": [
+      76873,
+      72685,
+      70219,
+      65488,
+      66234,
+      61003,
+      61674,
+      60523,
+      63635,
+      76141,
+      72929,
+      78091,
+      70072,
+      72091,
+      79228,
+      74499,
+      72593,
+      70856,
+      71175,
+      78529
+    ],
+    "output_lens": [
+      656,
+      763,
+      734,
+      602,
+      680,
+      771,
+      711,
+      608,
+      753,
+      746,
+      769,
+      636,
+      619,
+      772,
+      606,
+      709,
+      617,
+      661,
+      697,
+      685
+    ],
+    "ttfts": [
+      195.75324308802374,
+      362.11725510499673,
+      324.64915849798126,
+      19.211184737971053,
+      236.91695144498954,
+      9.051110867992975,
+      75.28748801798793,
+      41.40581685403595,
+      176.15644153399626,
+      347.6657691739965,
+      53.41130274703028,
+      88.50419971504016,
+      164.0041558680241,
+      248.88813329400728,
+      378.07243366900366,
+      223.89028811996104,
+      207.81301779003115,
+      263.291452074016,
+      65.20681572001195,
+      31.924037350981962
+    ],
+    "max_output_tokens_per_s": 73.0,
+    "max_concurrent_requests": 20,
+    "rtfx": 0.0,
+    "mean_ttft_ms": 175661.01278350397,
+    "median_ttft_ms": 185954.84231101,
+    "std_ttft_ms": 119153.076340884,
+    "p99_ttft_ms": 375040.94974184234,
+    "mean_tpot_ms": 203.9226041400374,
+    "median_tpot_ms": 210.28494892844336,
+    "std_tpot_ms": 45.087878334483555,
+    "p99_tpot_ms": 287.8357795095459,
+    "mean_itl_ms": 204.25264108750525,
+    "median_itl_ms": 117.24778497591615,
+    "std_itl_ms": 314.7398248073291,
+    "p99_itl_ms": 1475.3131512668915,
+    "raw_sha256": "b4bd79a31b26e4e157f8667a304327c4be08e41a46e116a15f2a7c81a83d1268"
+  },
+  "serving_comparison": {
+    "matched_per_request_token_lengths": true,
+    "same_runtime_binary": true,
+    "same_gpu_object_directory": true,
+    "native_measured_before_baseline": true,
+    "both_native_moe_enabled": true,
+    "both_packed_prefill": false,
+    "delta_percent": {
+      "duration": -7.600424232035219,
+      "output_throughput": 8.2256051165446,
+      "mean_ttft_ms": -8.770889639179313,
+      "median_ttft_ms": -5.758799260032054,
+      "p99_ttft_ms": -9.602266989630802,
+      "mean_tpot_ms": -7.533307564695047,
+      "median_tpot_ms": -8.746081040738519,
+      "p99_tpot_ms": -9.305357857996432,
+      "mean_itl_ms": -7.939322400018122,
+      "median_itl_ms": -0.09723851642777781,
+      "p99_itl_ms": -21.14764536475332
+    },
+    "note": "One 20-request screen per arm. The supplied H200 reference uses 100 requests and includes speculative decoding; its non-speculative contribution cannot be inferred from aggregates. H200 parity remains unmet."
+  },
+  "objects_sha256": {
+    "dsa_tp_adapter_gfx942.elf": "3eb9d32d2b14a8e2ac23548ff279cacca1ea2aee2922de8eb921a8f244bf4ace",
+    "fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256.co": "65b4c0a0b290dd83039047c18e0bb86f4253790e926dce324ddb6b45a7b28650",
+    "interp_decode.elf": "862fe2719f287b08f0bfea46721e574d5179b48187e6efb9690d512b65c7a85c",
+    "interp_decode_fp8.elf": "e8253bcbeca2f4f2f24482ce8fb3373043ad1b53dd0370544a4c517b36ca4676",
+    "interp_decode_fp8_gq.elf": "ae87cdf7a25ddb51ee596c8e818a2722a2bf51a3be6b167228bc75ef986c1720",
+    "interp_decode_fp8kv.elf": "f1ca3da6296518db2f80e7e895d43500c7cc4d9a3f3860fcd705eec6c476ceaf",
+    "interp_decode_fp8kv_gq.elf": "df46970c52dae8ce76984c1a1549e045513c9cc49b70764b42423bd61f62be9e",
+    "interp_decode_fp8kv_k3.elf": "f00056eb6c6d702689a93bf79e9a7841bcb786120ee56dc03f3fb66357e28517",
+    "interp_decode_fp8kv_k3_gq.elf": "9a8aa8553d0942c5e8e8667c280713e990e325f812a7ab639825adcd70344f33",
+    "interp_decode_gq.elf": "bacb869f9ac3333dd3211336944f901498cd4206774b27831838f9060c696e13",
+    "interp_decode_k3.elf": "a9d0574099f7380255cc2a737e07a3e9eb7c2988399013bf50402db812e2b7f3",
+    "interp_decode_k3_gq.elf": "b4f587bcbc040f89f030746f009d46aed1d8e9109c6543f90f6e8553829014db",
+    "interp_flash.elf": "861e032541a3ebee101fbaac31134cb288d188c8d5556681114ee7e77a009eb4",
+    "interp_flash_fp8kv.elf": "98fb4e1e311bff0bd0a9dcb52132eee25849b02e2dad3fed342189deffc9b10b",
+    "interp_flash_fp8kv_gq.elf": "6f750e306085a7e62751d2e9a958aa418bdd9a1a64ac0d7c412a28ed1f5d2bf6",
+    "interp_flash_gq.elf": "54d7c08558e89c96624822e3755dde56cb4d58ab2a1e8fc284eae15c226554ce",
+    "interp_mixed.elf": "b6d07c80dc2b3e0e210a11b724f4109588567a3ec7c8da92f4cf1b1fb5280849",
+    "interp_mixed_gq.elf": "b4ef16c9e835a98264ed063399433fe768f4037f8fb6fa57fd99be5cf4cd9a12",
+    "interp_packed_kda.elf": "5782544abbf8644191990875d68afb05ab8614a966af75b13bc51cbd23b50615",
+    "interp_packed_kda_gq.elf": "a1ae8acb28ecef647bb976cbe954d548e028717e7bda5e2453e63f9c056e979e",
+    "interp_packed_mla_flash.elf": "3af096e2f92d6b03d123d6b1b8c3a93c09c08d12a1aabafda940b11208ad69b6",
+    "interp_packed_mla_flash_gq.elf": "2e6abb164d6619f6cd5c69cef85406464574aad00a3c711e1c4b83fb57273ced",
+    "interp_packed_mla_norm.elf": "acd572e019cbab221ca9f00d0c55dffcbfcce99fb5e43981e908dd2fc4d2ca3b",
+    "interp_packed_mla_norm_gq.elf": "de9173ee6cce272a0cdf231f8c5b47332b00f40c13bbf21cd619ea191e10c024",
+    "interp_prefill.elf": "327e3ce53379c7ca059c94ebabecc7c68d92fe5b59e26a60cd8ac92aca35820c",
+    "interp_prefill_fp8.elf": "7ab6f44c06c6b63497def48f655bf4aff26f2a40ebd83d03daf0322150558a57",
+    "interp_prefill_fp8_gq.elf": "7c92d035f4707b5747dca68bc5bb428e078d153564df28056d43270e2fda518b",
+    "interp_prefill_fp8_mla.elf": "38942d29b816fd5a73f15736d45d56440303516ebb73783a1de1fc77e0baa35d",
+    "interp_prefill_fp8_mla_gq.elf": "0b1c49b7960ad3f0635c99c132f82f93aaff92f10cc11a3985e0544172d5de3b",
+    "interp_prefill_fp8_mla_moe.elf": "be9d0d6e3c5c659ec7679d1c3b206e131c3065817191dc9360fac666476dc467",
+    "interp_prefill_fp8_mla_moe_gq.elf": "d52e5ba0ae0d56a411447b099f5106eb828baf5862f360dcc3ab44a2d5ef01cf",
+    "interp_prefill_fp8kv.elf": "1670b047b0949cb94d36e019f0305a987482ef8dd1f0aeb4e0883c1a48be44ee",
+    "interp_prefill_fp8kv_gq.elf": "5fac6e98c7b8a8f3441626ada5fe0b43490fe8371eda24aab3273b9cf67ea657",
+    "interp_prefill_fp8kv_k3.elf": "ce243085320dd6130f9393ee2c58fbe74a74b8edb4f115adedc2001baf8c8489",
+    "interp_prefill_fp8kv_k3_gq.elf": "bc81665f1a55e736b66a0773f286a4e8f01cade7e3dcbd197c8375dadc8f9c78",
+    "interp_prefill_fp8kv_k3_moe_a4w4.elf": "55d26d5e69fd0fb3366ccc29061d87f9f5ebd2d88b73f8bf4e1d5ac9db8ace20",
+    "interp_prefill_fp8kv_k3_moe_a4w4_gq.elf": "bffce184a1155588bdc25f6ed004241f093cc35ec560953378511a2e894e12ce",
+    "interp_prefill_fp8kv_mla.elf": "0f3bfa048876cc460da2cdde0135ea7a10168739edd623fea07e6e669772b745",
+    "interp_prefill_fp8kv_mla_gq.elf": "5183277a68f846d63811fc8531b50f45401df9fd24114e98b5e4aa7f3a72a023",
+    "interp_prefill_fp8kv_mla_moe.elf": "5bc13aba7cd6ba6122c61950f0149f448ff14ac21708895ba530cb93f8284ba0",
+    "interp_prefill_fp8kv_mla_moe_gq.elf": "24ab844d96925705128558ec997e710aeb63379e6b343360a6f1585a0de50661",
+    "interp_prefill_gq.elf": "94679944ddb712a8c959d9b606513b6076f38f5261116c02dbe49b5e98a5b0e2",
+    "interp_prefill_k3.elf": "2306223b17f9853e356da9d22b9d80651793a5aae4b77db57e3a558e9348b41f",
+    "interp_prefill_k3_gq.elf": "9e3d8e2099e078f7162c58ddf2245cba27538ca1e298e4c53dbef8d488687267",
+    "interp_prefill_k3_moe.elf": "b52785d058902fd88feba60fc1d4833df85bda87506e322c96de79e4d3bd5668",
+    "interp_prefill_k3_moe_a4w4.elf": "10d5994e4de4faaee02e321dd6993a071337197fea95193d7c0352ff2d7f18b6",
+    "interp_prefill_k3_moe_a4w4_gq.elf": "a2e3219f81743b32984a798eff9cd69e13dfc95b12288dfe55cb7263b956aa46",
+    "interp_prefill_k3_moe_gq.elf": "92c78ce732118ace85b415d44edda72d7413d7ef78518db25343432114e34c43",
+    "interp_prefill_mla.elf": "1d2ef79cce71a2a05e81f2446ea68e68a56c95ebb4297ed6234121593b6d4120",
+    "interp_prefill_mla_gq.elf": "771cebb619b37fc70f002543dc300d43828ed939e12af93cb8671b925d7226cb",
+    "interp_prefill_mla_moe.elf": "ee442839a257f7d5cd88a042b5977d6d045c87a84d7652e6d65289c42fadadbd",
+    "interp_prefill_mla_moe_gq.elf": "3a21ac052261d8156aa1f42ec5d635829e3b9635f8bcad22926639f4a861e272",
+    "interp_tokbatch.elf": "8ff0283af5033fed0b56afea52620542bcbb44300351ffe8c00da59602cf5a3f",
+    "interp_tokbatch_gq.elf": "52b5a7a59435712fc2c6c0aa921aa5cb79c0fdc69a4d2e3a6c5d7a34d791fea9",
+    "mla_a16w16_qh8_qseqlen1_gqaratio8_v3.co": "cd8fa62e18abada15beeeedd49357bcc1e9e2eee7353d038533f30cac93c3607",
+    "mla_sparse_adapter_gfx942.elf": "a77f08c610bcda50a535e9a86caa601517e5f55368d17f4a47cc72679128774c",
+    "moe_aiter_adapter_gfx942.elf": "0a0f5e210387df98289678c00c5c732408a38a71aced63ff6dc5e4833b42b093",
+    "test_kernels.elf": "dec11ad6a64292d39ef4a5c5f202b52b5f658c7eb0fe6729534bff9ccae18362"
+  },
+  "source_sha256": {
+    "runtime/amd/dsa_tp_adapter.hip": "547b89e66b2c29020ab4b78d1ff6a5a3cf5701cdc199a0075173d842ad5c1438",
+    "crates/plowrt/src/exec/amd_index_tp.rs": "1d3abf1279b8391f9c8aae5fa08d409de040d897c012246fe7aad29a8e461ead",
+    "runtime/bench/amd/dsa_pf_tp/captured.py": "4c48fa862c903845681379dc8f5bdc162e6f1cdbab4171e3f4db93eb5cc3c43d",
+    "runtime/bench/amd/dsa_pf_tp/kernels.hip": "3e9f1880479e6d2bab14bfd53b378d05b02782611fb6283b0d89b265ce77e43f",
+    "scripts/build_dsa_tp.sh": "51ba655526a8086daba8de74d6f752328a472af3647c5f2a65af395a32d8b24d"
+  },
+  "validation_log_sha256": {
+    "packet-tests-final.log": "3f40dc37082b331a459d1a58260411eaf63337dad27b0b1dc938ef90aa536c58",
+    "route-tests-final.log": "5a18279f4e377771f9ce9f4f96cf45fe3e68de070a31fa22315a225c7ca03dba",
+    "gate-tests3.log": "d5dbe163810c63046481973c631dbe551c231a4490bc29404e7adfcf0200aed6",
+    "manifest-tests.log": "db08fea7acafe449946d7b9542922cf6afe5677018b292f10048250b67986052",
+    "check-cuda-hsa.log": "51a2fd18dafd68a6c8577b08344c807433b27d27f82f4396113ece100c043579",
+    "build-final.log": "3b4891adadb2de0138bf934763e7fe5bd9967b1198c2e96533eb463bb3ddcbd7",
+    "emit-final.log": "f93267307269bcbabcd10d05e6277e0a8518a1e3c558dabeed60808bde8ddf4e",
+    "emit-off.log": "fb30c86091b36e02754c36c1271a6b64070526a10d06c814d96563ee7e4376eb"
+  },
+  "serving_log_sha256": {
+    "bench20.log": "ffb61dc0f935397c5d5e5668f43d0092607b5168523e80b235f8854b528b6a87",
+    "server-perf.log": "7283d033e2c460d9e24a347e166f0fa602f99afb8f01ca77bf57670e0cd6a6fd",
+    "baseline-current/bench20.log": "eb202d6961998fe4f1d1df84ebcfbf11648b078cb9f9dbeee1a8771c5de2189a",
+    "baseline-current/server-perf.log": "73f4d1b66b25232a6b39d6992aef92b1f658a1e940a074864233237442f60c1e"
+  }
+}

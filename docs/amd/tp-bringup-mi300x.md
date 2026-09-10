@@ -2405,10 +2405,53 @@ Assembly inspection caught LLVM splitting some contracted head-reduction FMAs
 after inlining. Explicit GLM FMAs preserve the interpreter's fused rounding,
 and the benchmark uses the exact emitted scale bits `0x3c7fffff`.
 
-This prototype is not wired into serving. Device-side ready/completion
-rendezvous and audited scratch reuse are required before integration: normal
-segment-major dispatch queues later work without a host barrier per segment.
-The next gates are native HSA integration, retrieval quality and a C20 A/B.
-The latest measured serving rate remains **29.960 output tokens/s** (§16).
+These prototype measurements preceded native integration. Normal segment-major
+dispatch queues later work without a host barrier per segment, so the serving
+route needs device rendezvous and audited scratch reuse. Section 18 records
+that integration and its separate quality and serving checks.
 
 See [reproduction and raw records](../../runtime/bench/amd/dsa_pf_tp/README.md).
+
+## 18. Native TP8 prefill indexer (2026-09-10)
+
+Opt-in `--glm-index-tp=true` replaces replicated score/top-k work with four
+ordered HSA launches for prefill buckets of 2048–8192 rows. It keeps global
+causal positions, partitions query rows across eight ranks and gathers live
+int32 indices. Smaller buckets retain the existing route. The qualified
+configuration uses TP8, B8, BF16 KV, native AITER MLA/MoE and unpacked prefill.
+
+Three system-scope gates protect entry to reused TP scratch, readiness of
+selected bands and completion of all peer reads. A separate completion kernel
+ensures every gather workgroup has finished. The route allocates no additional
+activation workspace, validates gate collisions and segment isolation, and
+checks timeout status after each chunk even when general auditing is disabled.
+
+The native device protocol measures **4.021 ms** at 8192 rows/65536 context
+and **2.433 ms** for the actual 4464-row/70000-context tail. Captured top-k sets
+and partitioned score bits match the all-row reference. Sixteen queued
+scratch-poison reuse iterations per case preserve every gathered output;
+all used gates receive eight arrivals and all timeout statuses stay zero.
+
+Retrieval passes **18/18**, with **15/18** continuations text-identical to the
+MoE-only baseline. Atomic top-k ordering and downstream floating-point
+accumulation do not guarantee identical continuations. Keep this limited
+quality qualification and the route's opt-in status explicit. Packet tests
+(120), manifest tests (47), route/gate checks and CUDA+HSA compilation pass.
+Lean verifies all eight programs; option-off emission reproduces the prior
+MoE packet byte-for-byte.
+
+An adjacent C20 screen confirms **30.010 → 32.478 output tokens/s (+8.2%)**.
+Mean TTFT falls **175.661 → 160.254 s (−8.8%)**, mean TPOT
+**203.923 → 188.560 ms (−7.5%)**, and P99 ITL
+**1475.313 → 1163.319 ms (−21.1%)**. Median ITL is effectively unchanged
+at 117.248 → 117.134 ms. Both arms use the same frozen runtime and GPU object
+directory; only the indexer option differs. Both complete 20/20 without failure,
+with identical per-request lengths totaling 1,414,538 input and 13,795 output
+tokens. Native ran first; this is one screen per arm, not the H200 100-request
+benchmark. No speculative decoding was added; H200 parity remains unmet.
+
+See [native reproduction](../../runtime/bench/amd/dsa_pf_tp/README.md#native-hsa-serving),
+[full protocol records](../../runtime/bench/amd/dsa_pf_tp/mi300x-protocol-full.json)
+and [tail protocol records](../../runtime/bench/amd/dsa_pf_tp/mi300x-protocol-tail.json).
+The [serving record](../../runtime/bench/amd/dsa_pf_tp/mi300x-serving.json)
+contains metrics, quality cells and artifact hashes.

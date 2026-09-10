@@ -2530,10 +2530,10 @@ impl GpuEngine {
                     .progs
                     .iter()
                     .flat_map(|p| &p.insts)
-                    .any(|d| d.op == DevOp::MoeAiterFp8Pf as u16)
+                    .any(|d| d.op == DevOp::MoeAiterFp8Pf as u16 || d.op == DevOp::IndexTpPf as u16)
                 {
                     return Err(RuntimeError::Device(
-                        "AITER MoE is supported only on gfx942".into(),
+                        "native AITER MoE and TP indexer are supported only on gfx942".into(),
                     ));
                 }
                 if blob.progs.iter().flat_map(|p| &p.insts).any(|d| {

@@ -191,7 +191,7 @@ pub fn class_of(op: DevOp) -> RowClass {
         // wrong for every row outside the last span, with no trap — and DSA already needs its
         // own capability marker because a legal packet otherwise runs dense and ignores `t7`.
         IndexScore | IndexScorePf | IndexScoreKpool | IndexSelect | IndexSelectPf
-        | IndexUnionPf | DsaPoolExpand | DsaPoolCompress => RowClass::C,
+        | IndexUnionPf | IndexTpPf | DsaPoolExpand | DsaPoolCompress => RowClass::C,
 
         // ---- D: per-sequence carried state -------------------------------------------------
         // Operand shapes with no request axis at all: `state`/`outstate` `[1, HV, V, K]`,

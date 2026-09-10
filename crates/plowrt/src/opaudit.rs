@@ -431,6 +431,7 @@ pub fn classify(op: DevOp) -> OpClass {
         DevOp::IndexSelect => a_one("i0=len_max, one cooperative launch, one query row"),
         DevOp::IndexScorePf => cls_c("q_pos0 = kv_len[0] - n_tok (op_attention.h:5173)"),
         DevOp::IndexSelectPf => cls_c("q_pos0 = kv_len[0] - n_tok; row bound q_pos0 + t + 1"),
+        DevOp::IndexTpPf => cls_c("native TP query ranges retain kv_len[0] - global T"),
         DevOp::IndexUnionPf => cls_c("q_pos0 = kv_len[0] - n_tok (op_attention.h:5474)"),
         DevOp::DsaQQuant => a_rows("i0=n_rows (flattened token x index-head)"),
         DevOp::DsaPoolCompress => {

@@ -88,3 +88,23 @@ extern "C" int plow_enable_peers() {
     }
     return hipSetDevice(original);
 }
+
+#include "dsa_tp_adapter.hip"
+
+extern "C" int plow_index_protocol(void* idx, void* scratch, void* score,
+    void* q, void* k, void* w, void* len, void* peers, void* status,
+    unsigned rows, unsigned stride, unsigned rank, unsigned gate,
+    unsigned long long counter_offset, void* stream) {
+    const auto s = (hipStream_t)stream;
+    plow_dsa_tp_score<<<304, 512, 0, s>>>((float*)score, (unsigned short*)q,
+        (unsigned short*)k, (unsigned short*)w, (int*)len, rows, stride, rank);
+    const DsaTpSelectArgs select = {(int*)scratch, (float*)score, (int*)len,
+        (const void* const*)peers, counter_offset, (unsigned*)status, 1000000000ull,
+        rows, stride, rank, gate};
+    plow_dsa_tp_select<<<304, 512, 0, s>>>(select);
+    const DsaTpGatherArgs a = {(uint4*)idx, (const void* const*)peers,
+        counter_offset, 0, (unsigned*)status, 1000000000ull, rows, rank, gate + 1, 0};
+    plow_dsa_tp_gather<<<304, 256, 0, s>>>(a);
+    plow_dsa_tp_complete<<<1, 64, 0, s>>>(a);
+    return hipGetLastError();
+}
