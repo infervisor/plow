@@ -29,7 +29,13 @@ using bf16 = __nv_bfloat16;
 static const char* interpreter_path = nullptr;
 static bool lean_hd512 = false;
 
-constexpr unsigned heads = 16, capacity = 128, real_rows = 98;
+#ifndef PLOW_TEST_FA_ROWS
+#define PLOW_TEST_FA_ROWS 0
+#endif
+static_assert(PLOW_TEST_FA_ROWS == 0 ||
+              (PLOW_TEST_FA_ROWS >= 64 && PLOW_TEST_FA_ROWS <= 16384 && PLOW_TEST_FA_ROWS % 64 == 0));
+constexpr unsigned heads = 16, capacity = PLOW_TEST_FA_ROWS ? PLOW_TEST_FA_ROWS : 128;
+constexpr unsigned real_rows = PLOW_TEST_FA_ROWS ? PLOW_TEST_FA_ROWS : 98;
 static unsigned blocks = 132;
 
 template<int HD, int BKV>
@@ -65,7 +71,9 @@ template<int HD, int BKV> static bool check(unsigned kv_heads, unsigned stride,
     const auto k = values(size_t(3) * kv_heads * stride * HD, 456);
     const auto v = values(k.size(), 789);
     // Two ragged requests use reversed, noncontiguous slots; the last 30 rows are padding.
-    const std::vector<int> req{2, 0, 65, 2, 97, 65, 33, 0, 16384};
+    const std::vector<int> req = PLOW_TEST_FA_ROWS
+        ? std::vector<int>{1, 0, int(real_rows), 0, 16384}
+        : std::vector<int>{2, 0, 65, 2, 97, 65, 33, 0, 16384};
     bf16* dq = upload(q), *dk = upload(k), *dv = upload(v), *out;
     int* dr = upload(req);
     std::vector<CUtensorMap> maps(6);
@@ -189,7 +197,7 @@ template<int HD, int BKV> static bool check(unsigned kv_heads, unsigned stride,
     }
     double worst = 0, max_error = 0;
     unsigned checked = 0;
-    for (unsigned r = 0; r < 2; ++r) {
+    for (unsigned r = 0; r < unsigned(req[0]); ++r) {
         const unsigned row0=req[1+4*r], len=req[2+4*r], slot=req[3+4*r], kvlen=req[4+4*r];
         for (unsigned row : {0u, len/2, len-1}) for (unsigned h : {0u, 7u, 15u}) {
             const unsigned end = kvlen-len+row+1;
@@ -250,6 +258,7 @@ int main(int argc, char** argv) {
         else return 2;
     }
     if (lean_hd512 && !interpreter_path) return 2;
+    if (PLOW_TEST_FA_ROWS && !lean_hd512) return 2;
     bool ok = true;
     for (bool tma : {false, true}) {
         if (!lean_hd512) ok &= check<256,32>(8,2048,2047,1024,tma,profile);

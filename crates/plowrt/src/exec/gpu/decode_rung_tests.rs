@@ -551,6 +551,137 @@ fn gpu_cublaslt_rungs_match_widest_logits() {
 }
 
 #[test]
+#[ignore = "H100 packed-schedule diagnostic; set TEST_DECODE_RUNG_ASSETS and TEST_PACKED_LOGITS_OUT"]
+fn gpu_packed_prefill_schedule_logits() {
+    let assets = std::path::PathBuf::from(std::env::var("TEST_DECODE_RUNG_ASSETS").unwrap());
+    let output = std::env::var("TEST_PACKED_LOGITS_OUT").unwrap();
+    let mut e = GpuEngine::load(
+        Arc::new(CudaBackend::new(0).unwrap()),
+        &assets,
+        &assets.join("checkpoint"),
+    )
+    .unwrap();
+    assert!(e.batch() >= 16 && e.pf_max_rows() >= 4096);
+    let prompt = vec![29104u32; 16384]; // Gemma 4 tokenizer: repeated " hello".
+    let prompts: Vec<_> = [29104, 1902, 1594, 1262]
+        .map(|token| vec![token; prompt.len()])
+        .into();
+    let mut reference: Vec<Vec<f32>> = Vec::new();
+    let mut feeds = Vec::new();
+    let mut report = Vec::new();
+    for (pass, (slots, chunk)) in [
+        (vec![0], 4096),
+        (vec![0, 4, 8, 12], 1024),
+        (vec![0], 1024),
+        (vec![12, 8, 4, 0], 1024),
+        ((0..16).collect(), 256),
+        ((0..16).rev().collect(), 256),
+        (vec![0, 4, 8, 12], 1024),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for &slot in &slots {
+            e.begin_slot(slot, prompt.len() + 128).unwrap();
+        }
+        for c0 in (0..prompt.len() - 1).step_by(chunk) {
+            let requests: Vec<_> = slots
+                .iter()
+                .map(|&slot| PfBatchReq {
+                    slot,
+                    prompt: &prompts[slot % 4],
+                    c0,
+                    len: chunk.min(prompt.len() - 1 - c0),
+                })
+                .collect();
+            e.prefill_batched(&requests).unwrap();
+        }
+        let mut next = *prompt.last().unwrap();
+        for step in 0..128 {
+            let requests: Vec<_> = slots
+                .iter()
+                .map(|&slot| {
+                    (
+                        slot,
+                        if step == 0 {
+                            *prompts[slot % 4].last().unwrap()
+                        } else {
+                            next
+                        },
+                    )
+                })
+                .collect();
+            let mut ids = Vec::new();
+            let unified = pass == 6;
+            if unified {
+                use plow_asset::token_batch::{Phase, Request, Selection};
+                let rows: Vec<_> = requests
+                    .iter()
+                    .map(|&(slot, ref token)| Request {
+                        id: slot as u32,
+                        slot: slot as u32,
+                        state_slot: slot as u32,
+                        generation: e.slot_generation(slot).unwrap(),
+                        phase: if step == 0 {
+                            Phase::Prefill
+                        } else {
+                            Phase::Decode
+                        },
+                        tokens: std::slice::from_ref(token),
+                        prompt_len: prompt.len() as u32,
+                        selection: Selection::default(),
+                    })
+                    .collect();
+                let mut selected = Vec::new();
+                e.token_batch_step(&rows, &mut selected).unwrap();
+                ids = selected.iter().map(|&(_, token)| token).collect();
+            } else {
+                e.step_slots(&requests, &mut ids).unwrap();
+            }
+            for (i, &slot) in slots.iter().enumerate() {
+                if slot % 4 != 0 {
+                    continue;
+                }
+                let mut logits = Vec::new();
+                e.logits_row(if unified { i } else { slot }, &mut logits)
+                    .unwrap();
+                assert!(logits.len() == e.vocab && logits.iter().all(|v| v.is_finite()));
+                if pass == 0 {
+                    reference.push(logits.clone());
+                    feeds.push(ids[i]);
+                }
+                let expected = &reference[step];
+                let changed = logits
+                    .iter()
+                    .zip(expected)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                let max_abs = logits
+                    .iter()
+                    .zip(expected)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, f32::max);
+                report.push(serde_json::json!({
+                    "pass": pass, "slots": slots, "chunk": chunk, "step": step, "unified": unified,
+                    "slot": slot, "changed_logits": changed, "max_abs": max_abs,
+                    "token": ids[i], "reference_token": feeds[step],
+                    "reference_token_logit": logits[feeds[step] as usize],
+                    "selected_token_logit": logits[ids[i] as usize],
+                }));
+            }
+            next = feeds[step];
+        }
+        for &slot in &slots {
+            e.retire_slot(slot, false);
+        }
+        eprintln!(
+            "packed schedule pass={pass} slots={slots:?} chunk={chunk}: 128 teacher-forced frames"
+        );
+    }
+    std::fs::write(output, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+}
+
+#[test]
 #[ignore = "H100 FP8-KV prefix gate; set TEST_FP8_KV_ASSETS and PLOW_VMM_PREFIX=1, PLOW_MULTISTEP=0"]
 fn gpu_fp8_kv_cached_rungs_match_uncached_suffix_logits() {
     let assets = std::path::PathBuf::from(std::env::var("TEST_FP8_KV_ASSETS").unwrap());

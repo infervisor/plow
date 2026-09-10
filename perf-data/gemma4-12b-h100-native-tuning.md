@@ -376,3 +376,55 @@ Evidence: [B8 latency](gemma4-12b-h100-data/native-8k-latency.json),
 [C128](gemma4-12b-h100-data/native-4k-c128.json),
 [serving checks](gemma4-12b-h100-data/native-4k-verify.log),
 [segment timings](gemma4-12b-h100-data/native-4k-segment-profile.log).
+
+## Packed schedules and attention stall investigation (2026-09-10)
+
+The ignored `gpu_packed_prefill_schedule_logits` diagnostic compares 128
+teacher-forced decode steps after 16K prompts. It varies chunks (4096/1024/256),
+sparse and reversed slots, and homogeneous versus mixed prompts. Across six
+native-decode configurations, all 2,304 checked full-vocabulary frames are
+bit-exact. This narrows the serving variation beyond those packing cases.
+
+A seventh pass uses `token_batch_step`, which computes decode rows through the
+prefill body and compact terminal. All 512 checked frames differ from native
+decode: first-frame maximum absolute logit difference 0.46484375, maximum
+across the run 9.0771484375. The selected greedy tokens remain identical in
+this teacher-forced run. This establishes a route-dependent numerical
+difference, not the cause of the exact serving hyphen variation or independent
+model accuracy. Do not label the diagnostic's successful execution an accuracy
+gate. Run it with `TEST_DECODE_RUNG_ASSETS` and `TEST_PACKED_LOGITS_OUT` plus
+the same CUDA/packed runtime flags as the serving recipe.
+[Summary and packet hash](gemma4-12b-h100-data/packed-schedule-logits-summary.json),
+[execution log](gemma4-12b-h100-data/packed-schedule-logits.log).
+
+The packet attention oracle now accepts compile-time `PLOW_TEST_FA_ROWS` for
+a single full-context request; zero preserves the existing ragged cases.
+Build with `-gencode arch=compute_90a,code=sm_90a -DPLOW_TEST_FA_ROWS=4096`
+and run `--interpreter OBJECT --lean-hd512`. This reproduces the 4096-query,
+16384-KV, HD512, Q16/KV1 shape seen in the final prefill chunk. Both mapped
+and unmapped cases pass 4,608 sampled FP64 reference outputs, with worst
+relative L2 0.00239514 and maximum absolute error 0.0000610031.
+
+Two native attention experiments were rejected. Skipping unit output-rescale
+factors showed no clear gain on the ragged workload. Computing scores and
+softmax only in WG0, then sharing row corrections/normalizers with WG1,
+regressed mapped actual-shape timing from 13.301 to 15.732 ms. The latter uses
+243 registers/528 static shared bytes vs 240/16, with zero stack/spills for
+both. It also regresses the ragged case. No production kernel change is
+retained. The default rebuild was byte-identical to the deployed object.
+The conditional WGMMA experiment used a condition uniform within each
+warpgroup, and retained proxy ordering, consistent with the
+[PTX WGMMA requirements](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#asynchronous-warpgroup-level-matrix-instructions-wgmma-mma).
+[Experiment hashes and decision](gemma4-12b-h100-data/attention-single-score-experiment.json),
+[baseline oracle](gemma4-12b-h100-data/attention-4k-0-oracle.log),
+[candidate oracle](gemma4-12b-h100-data/attention-4k-1-oracle.log).
+
+For the deployed mapped kernel on this actual shape, Nsight Compute reports
+13.599 ms, tensor-pipe active 22.65%, DRAM throughput 0.81%, and active-warp
+stall proportions: fixed-latency wait 34.07%, GMMA 11.41%, barrier 11.11%,
+math-pipe throttle 2.42%, long scoreboard 2.02%, short scoreboard 1.81%.
+These are one profiled launch and distinct metric denominators; do not add
+them or extrapolate them to every ladder. They favor investigating dependent
+instruction chains and pipeline overlap over assuming HBM saturation.
+[Hardware counters](gemma4-12b-h100-data/attention-4k-stalls.csv),
+[profile correctness](gemma4-12b-h100-data/attention-4k-stalls.log).

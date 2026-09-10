@@ -1,0 +1,158 @@
+{
+  "raw_sha256": "10c5eaf40ee09434df94896745ac37db5c5ed943c962f16d20666513154a0f90",
+  "packet_sha256": "69a4ab8925425e593c724f3e550b0931b5afc639df79630f94aa711d8f186a6e",
+  "prompt_rows": 16384,
+  "hello_token": 29104,
+  "steps": 128,
+  "note": "Teacher-forced native reference. Other prompt token IDs 1902/1594/1262 in mixed cases; all subsequent inputs use the hello reference tokens. This diagnostic measures path differences, not independent model accuracy.",
+  "passes": [
+    {
+      "pass": 0,
+      "chunk": 4096,
+      "slots": [
+        0
+      ],
+      "unified": false,
+      "frames": 128,
+      "changed_frames": 0,
+      "max_abs": 0.0,
+      "changed_greedy_tokens": 0,
+      "first_changed": null
+    },
+    {
+      "pass": 1,
+      "chunk": 1024,
+      "slots": [
+        0,
+        4,
+        8,
+        12
+      ],
+      "unified": false,
+      "frames": 512,
+      "changed_frames": 0,
+      "max_abs": 0.0,
+      "changed_greedy_tokens": 0,
+      "first_changed": null
+    },
+    {
+      "pass": 2,
+      "chunk": 1024,
+      "slots": [
+        0
+      ],
+      "unified": false,
+      "frames": 128,
+      "changed_frames": 0,
+      "max_abs": 0.0,
+      "changed_greedy_tokens": 0,
+      "first_changed": null
+    },
+    {
+      "pass": 3,
+      "chunk": 1024,
+      "slots": [
+        12,
+        8,
+        4,
+        0
+      ],
+      "unified": false,
+      "frames": 512,
+      "changed_frames": 0,
+      "max_abs": 0.0,
+      "changed_greedy_tokens": 0,
+      "first_changed": null
+    },
+    {
+      "pass": 4,
+      "chunk": 256,
+      "slots": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15
+      ],
+      "unified": false,
+      "frames": 512,
+      "changed_frames": 0,
+      "max_abs": 0.0,
+      "changed_greedy_tokens": 0,
+      "first_changed": null
+    },
+    {
+      "pass": 5,
+      "chunk": 256,
+      "slots": [
+        15,
+        14,
+        13,
+        12,
+        11,
+        10,
+        9,
+        8,
+        7,
+        6,
+        5,
+        4,
+        3,
+        2,
+        1,
+        0
+      ],
+      "unified": false,
+      "frames": 512,
+      "changed_frames": 0,
+      "max_abs": 0.0,
+      "changed_greedy_tokens": 0,
+      "first_changed": null
+    },
+    {
+      "pass": 6,
+      "chunk": 1024,
+      "slots": [
+        0,
+        4,
+        8,
+        12
+      ],
+      "unified": true,
+      "frames": 512,
+      "changed_frames": 512,
+      "max_abs": 9.0771484375,
+      "changed_greedy_tokens": 0,
+      "first_changed": {
+        "changed_logits": 192086,
+        "chunk": 1024,
+        "max_abs": 0.46484375,
+        "pass": 6,
+        "reference_token": 236761,
+        "reference_token_logit": 17.75,
+        "selected_token_logit": 17.75,
+        "slot": 0,
+        "slots": [
+          0,
+          4,
+          8,
+          12
+        ],
+        "step": 0,
+        "token": 236761,
+        "unified": true
+      }
+    }
+  ]
+}
