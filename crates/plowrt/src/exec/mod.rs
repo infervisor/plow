@@ -16,6 +16,11 @@ mod amd_packed;
 /// all-ranks, with a host barrier — see the module note for why the two differ.
 #[cfg(feature = "hsa")]
 pub mod amd_tp;
+/// Core reservation and thread priority for the CPU prefill-head pool. Gated on
+/// `cpu` because a head runs on `exec::cpu`, so a build without it has no head
+/// to place — and that is also where `libc` enters the dependency set.
+#[cfg(feature = "cpu")]
+pub mod affinity;
 /// Apple Neural Engine executor: CoreML programs built from plow weights, run at segment
 /// boundaries of the Metal walk. See `plans/apple-silicon-backend.md` §4.5.
 #[cfg(all(feature = "ane", target_os = "macos"))]
