@@ -19,19 +19,83 @@ pub(super) struct CublasLtDecodeRoute {
     output: u64,
 }
 
+pub(super) fn ordered_waits(
+    g: &DevProg,
+    segments: &[Option<DecodeSegment>],
+) -> Result<Vec<packet::dev::Wait>> {
+    validate_segment_windows(g)?;
+    let reject = || RuntimeError::Rejected("cuBLASLt requires ordered coarse dependencies".into());
+    if g.n_counter as usize != g.insts.len() || segments.len() + 1 != g.gq_seg_ofs.len() {
+        return Err(reject());
+    }
+    let mut placement = vec![None; g.insts.len()];
+    for e in &g.stream {
+        let slot = placement.get_mut(e.inst as usize).ok_or_else(reject)?;
+        if slot.is_some_and(|seg| seg != e.seg)
+            || e.flags != 0
+            || g.succs
+                .get(e.succ_ofs as usize..e.succ_ofs as usize + e.succ_len as usize)
+                != Some(&[e.inst][..])
+        {
+            return Err(reject());
+        }
+        *slot = Some(e.seg);
+    }
+    if placement.iter().any(Option::is_none) {
+        return Err(reject());
+    }
+    for e in &g.stream {
+        let waits = g
+            .waits
+            .get(e.wait_ofs as usize..e.wait_ofs as usize + e.wait_len as usize)
+            .ok_or_else(reject)?;
+        for w in waits {
+            if w.id >= e.inst
+                || g.insts
+                    .get(w.id as usize)
+                    .is_none_or(|d| w.threshold != u32::from(d.blocks))
+                || placement
+                    .get(w.id as usize)
+                    .copied()
+                    .flatten()
+                    .is_none_or(|seg| seg > e.seg)
+            {
+                return Err(reject());
+            }
+        }
+    }
+    let mut library = vec![false; g.insts.len()];
+    for (seg, route) in segments.iter().enumerate() {
+        if let Some(route) = route {
+            if placement.get(route.instruction) != Some(&Some(seg as u16)) {
+                return Err(reject());
+            }
+            library[route.instruction] = true;
+        }
+    }
+    let mut waits = g.waits.clone();
+    for w in &mut waits {
+        if library.get(w.id as usize).copied().ok_or_else(reject)? {
+            // The consumer's launch follows the complete library call on the same stream.
+            w.threshold = 0;
+        }
+    }
+    Ok(waits)
+}
+
 pub(super) fn prepare_routes(
-    be: &Arc<CudaBackend>,
+    lt: &Arc<crate::device::cuda::lt::Lt>,
     segments: Vec<Option<DecodeSegment>>,
     insts: &mut [DevInst64],
     devp: &[DeviceMem],
+    templates: Option<&[Option<CublasLtDecodeRoute>]>,
 ) -> Result<Vec<Option<CublasLtDecodeRoute>>> {
     let mut routes = Vec::new();
     if segments.is_empty() {
         return Ok(routes);
     }
-    let lt = crate::device::cuda::lt::Lt::load(be)?;
     let mut plans = std::collections::HashMap::new();
-    for segment in segments {
+    for (index, segment) in segments.into_iter().enumerate() {
         let route = if let Some(segment) = segment {
             let d = &mut insts[segment.instruction];
             let key = (segment.m, segment.n, segment.k);
@@ -58,7 +122,22 @@ pub(super) fn prepare_routes(
             let plan = match plans.entry(key) {
                 std::collections::hash_map::Entry::Occupied(e) => Arc::clone(e.get()),
                 std::collections::hash_map::Entry::Vacant(e) => {
-                    Arc::clone(e.insert(lt.plan(key.0, key.1, key.2, weight)?))
+                    let template = templates
+                        .map(|routes| {
+                            routes.get(index).and_then(Option::as_ref).ok_or_else(|| {
+                                RuntimeError::Rejected(
+                                    "cuBLASLt rung template route missing".into(),
+                                )
+                            })
+                        })
+                        .transpose()?;
+                    Arc::clone(e.insert(lt.plan(
+                        key.0,
+                        key.1,
+                        key.2,
+                        weight,
+                        template.map(|r| r.plan.as_ref()),
+                    )?))
                 }
             };
             d.op = DevOp::Nop as u16;
@@ -82,7 +161,88 @@ pub(super) fn prepare_routes(
     Ok(routes)
 }
 
+pub(super) struct CublasLtDecodeGraph {
+    be: Arc<CudaBackend>,
+    graph: Option<crate::device::cuda::GraphExec>,
+    _routes: Vec<Option<CublasLtDecodeRoute>>,
+}
+
+impl CublasLtDecodeGraph {
+    pub(super) fn capture(
+        be: &Arc<CudaBackend>,
+        stream: &CudaStream,
+        base: DevProgram,
+        function: KernelFn,
+        grid: u32,
+        smem: u32,
+        routes: Vec<Option<CublasLtDecodeRoute>>,
+    ) -> Result<Self> {
+        let graph = be.graph_capture(stream, || {
+            for (seg, route) in routes.iter().enumerate() {
+                if let Some(route) = route {
+                    route
+                        .plan
+                        .run(route.input, route.weight, route.output, stream)?;
+                    continue;
+                }
+                let mut arg = base;
+                segment_window(&mut arg, &base, seg, false);
+                let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
+                be.launch_cooperative(function, grid, BLOCK, smem, &mut params, Some(stream))?;
+            }
+            Ok(())
+        })?;
+        Ok(Self {
+            be: Arc::clone(be),
+            graph: Some(graph),
+            _routes: routes,
+        })
+    }
+
+    pub(super) fn launch(&self, stream: &CudaStream) -> Result<()> {
+        self.be
+            .graph_launch(self.graph.as_ref().expect("captured decode graph"), stream)
+    }
+}
+
+impl Drop for CublasLtDecodeGraph {
+    fn drop(&mut self) {
+        if let Some(graph) = self.graph.take() {
+            self.be.graph_destroy(graph);
+        }
+    }
+}
+
 impl GpuEngine {
+    #[cfg(test)]
+    pub(super) fn capture_library_reference_graph(
+        &self,
+        waits: u64,
+    ) -> Result<crate::device::cuda::GraphExec> {
+        self.be.graph_capture(&self.stream, || {
+            for (seg, route) in self.cublaslt_decode.iter().enumerate() {
+                if let Some(route) = route {
+                    route
+                        .plan
+                        .run(route.input, route.weight, route.output, &self.stream)?;
+                }
+                let mut arg = self.kernarg;
+                arg.waits = waits;
+                segment_window(&mut arg, &self.kernarg, seg, false);
+                let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
+                self.be.launch_cooperative(
+                    self.f,
+                    self.grid,
+                    BLOCK,
+                    self.smem,
+                    &mut params,
+                    Some(&self.stream),
+                )?;
+            }
+            Ok(())
+        })
+    }
+
     pub(super) fn capture_decode_graph(&mut self) -> Result<()> {
         let be = Arc::clone(&self.be);
         self.cublaslt_decode_graph =
@@ -101,6 +261,7 @@ impl GpuEngine {
                 route
                     .plan
                     .run(route.input, route.weight, route.output, &self.stream)?;
+                continue;
             }
             let mut arg = self.kernarg;
             let role = self
@@ -292,6 +453,57 @@ mod tests {
             plow_asset::segment_roles::CUBLASLT,
             plow_asset::segment_roles::INTERPRETER,
         ]
+    }
+
+    #[test]
+    fn stream_order_replaces_only_library_counter_waits() {
+        let (mut g, tensors) = fixture(4);
+        g.n_counter = 3;
+        g.succs = vec![0, 1, 2];
+        g.waits = vec![
+            packet::dev::Wait {
+                id: 0,
+                threshold: 1,
+            },
+            packet::dev::Wait {
+                id: 1,
+                threshold: 1,
+            },
+        ];
+        for e in &mut g.stream {
+            e.succ_ofs = e.inst;
+            e.succ_len = 1;
+            e.wait_ofs = e.inst.saturating_sub(1);
+            e.wait_len = u16::from(e.inst != 0);
+        }
+        g.gq_stream = g.stream.clone();
+        let routes = decode_segments(&g, &tensors, &roles()).unwrap();
+        let waits = ordered_waits(&g, &routes).unwrap();
+        assert_eq!(waits[0], g.waits[0]);
+        assert_eq!(
+            waits[1],
+            packet::dev::Wait {
+                id: 1,
+                threshold: 0
+            }
+        );
+        assert_eq!(g.waits[1].threshold, 1);
+
+        g.succs[0] = 1;
+        assert!(ordered_waits(&g, &routes).is_err());
+        g.succs[0] = 0;
+        g.waits[0].id = 2;
+        assert!(ordered_waits(&g, &routes).is_err());
+        g.waits[0].id = 0;
+        g.waits[1].id = 3;
+        assert!(ordered_waits(&g, &routes).is_err());
+        g.waits[1].id = 1;
+        g.waits[1].threshold = 2;
+        assert!(ordered_waits(&g, &routes).is_err());
+        g.waits[1].threshold = 1;
+        g.stream[1].flags = packet::dev::SE_FINE;
+        g.gq_stream = g.stream.clone();
+        assert!(ordered_waits(&g, &routes).is_err());
     }
 
     #[test]

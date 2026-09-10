@@ -339,7 +339,7 @@ fn run_tail(x: &[u16], m: u32, sample_rows: &[u32], gamma: &[u16], head: &[u16])
         ctx: std::sync::Mutex::new(vec![ctx]),
     });
     let topo = Topology::detect();
-    let pool = WorkerPool::spawn(&topo, 1, &NumaMode::Off, 20, 1, exec);
+    let pool = WorkerPool::spawn(&topo, 1, &NumaMode::Off, 20, 1, None, exec);
     let cp = Arc::new(CounterPool::from_counters(&counters));
     let prog = Arc::new(prog);
     cp.reset_all();

@@ -66,6 +66,7 @@ mod qwen35;
 mod test_env;
 use mla::{glm_emit_block, glm_main, kimi_emit_block, nemotron_emit_block, MlaArch};
 mod decode_objects;
+mod dense_cublaslt;
 pub mod dispatch_audit;
 mod gemv_decode_role;
 pub mod manifest;
@@ -4060,6 +4061,7 @@ fn emit_phase(
             && !shared
             && !fp8
             && !mx4
+            && !emit_config::active().decode_cublaslt
             && gemv_fused_input_fits(amd, t, c.hidden)
             && !emit_config::active().no_fuse_qkv;
         // FUSED Q|K|V, per-channel fp8 (DevOp::GemvQkvFp8, op 115) — the arm the comment above
@@ -5206,7 +5208,9 @@ fn emit_phase(
         // gate/up are COLUMN-parallel (inter_l lanes on this rank); the GLU is elementwise on the
         // rank's own lanes, so no communication. `c_gl` is the dependency feeding down_proj.
         // Same backend-specific bound as `fuse_qkv` above.
-        let glu_fused = gemv_family && gemv_fused_input_fits(amd, t, c.hidden);
+        let glu_fused = gemv_family
+            && gemv_fused_input_fits(amd, t, c.hidden)
+            && !emit_config::active().decode_cublaslt;
         let gemm_glu = !gemv_family && glu_fusion_wins(tg, inter_l, c.hidden, n_cu);
         // w8a8: quant the (hidden-width) pre-FF norm output feeding gate/up. Reuses xqh/ash (q/k/v
         // already consumed them; the c_pf→o_proj→flash→qkv chain serializes the reuse). Inert
@@ -6909,7 +6913,11 @@ fn emit_capabilities(model_type: &str) -> EmitCapabilities {
     EmitCapabilities {
         dense_packet_contracts: dense,
         decode_objects: dense || model_type == "qwen3_5",
-        cublaslt_decode: model_type == "qwen3_5",
+        cublaslt_decode: model_type == "qwen3_5"
+            || matches!(
+                model_type,
+                "gemma4" | "gemma4_text" | "gemma4_unified" | "gemma4_unified_text"
+            ),
         decode_ladder: dense || model_type == "gpt_oss",
     }
 }
@@ -6939,8 +6947,10 @@ fn apply_production_defaults(
         // parsed. This is the only place in the tree where the two differ.
         emit_config::note_production_default("decode_ladder", ladder.into());
     }
-    cfg.packed_prefill_default =
-        capabilities.dense_packet_contracts && arch == "sm_90a" && tp == 1 && !cfg.fp8_kv;
+    cfg.packed_prefill_default = capabilities.dense_packet_contracts
+        && tp == 1
+        && !cfg.fp8_kv
+        && (arch == "sm_90a" || (arch == "gfx942" && !cfg.any_fp8_weights()));
 }
 
 fn cublaslt_emit_supported(
@@ -7053,7 +7063,7 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
         // ONE FLAG, TWO THINGS, and asserting one contract for both made the second
         // unreachable. On NVIDIA `PLOW_EMIT_PACKED_PREFILL` emits the packed-REQUEST ABI — a
         // metadata section plus `pf.request.*` tensors — which really is a Hopper / TP1 /
-        // BF16-KV contract. On AMD it emits the family-segmented sibling TOPOLOGY: the same
+        // direct-KV contract. On AMD it emits the family-segmented sibling TOPOLOGY: the same
         // buckets a second time with `set_packed_prefill_segments`, which the runtime
         // resolves to only while it is staging a packed binding. That has no Hopper, no TP1
         // and no KV-encoding requirement, and it is what `PLOW_PACKED_PREFILL_ROUTE=1` needs
@@ -7062,8 +7072,8 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
         // `mla/kimi_k3.rs` has asked for the sibling topology since it was written and this
         // assertion is why it could never be given one; a GLM-5.3 gfx942 TP4 emit died here.
         assert!(
-            emit_is_amd() || (arch == "sm_90a" && tp == 1 && !emit_config::active().fp8_kv),
-            "packed request emission requires Hopper single-GPU BF16 KV"
+            emit_is_amd() || (arch == "sm_90a" && tp == 1),
+            "packed request emission requires Hopper single-GPU direct KV"
         );
         assert!(
             emit_is_amd() || capabilities.dense_packet_contracts,
@@ -8467,6 +8477,13 @@ fn emit_dense_gqa(
             .unwrap_or_else(|error| panic!("decode projection tuning: {error}"));
     // Emit v6 with sections when --embed-cubin/--embed-hsaco given, else v5.
     let mut sections = Vec::new();
+    if ecfg.decode_cublaslt {
+        assert!(
+            !fp8 && !c.moe && !amd,
+            "Gemma cuBLASLt decode requires dense BF16 CUDA"
+        );
+        sections.push(dense_cublaslt::apply(&mut m).expect("Gemma cuBLASLt decode segments"));
+    }
     if ecfg.gemv_decode_role {
         assert!(
             !amd && arch == "sm_90a" && !fp8 && !c.moe && rungs == [1],
@@ -8563,11 +8580,7 @@ fn emit_dense_gqa(
     // skip reason. Anything that reaches this `Err` is the verifier saying the
     // program is wrong, i.e. a real bug caught, and must be loud.
     let mut packed_prefill_emitted = false;
-    if ecfg.packed_prefill_on() {
-        assert!(
-            !emit_is_amd() && !fp8_kv,
-            "packed prefill requires dense BF16 KV NVIDIA packet"
-        );
+    if !emit_is_amd() && ecfg.packed_prefill_metadata_on() {
         let packed_tensor_base = m.tensors.len();
         let max_rows = m.prog_t[..packet::devbuild::decode_rung_lo(&m.prog_t)]
             .iter()
@@ -8607,7 +8620,7 @@ fn emit_dense_gqa(
         let manifest = plow_asset::program::with_model(&m, |p| -> Result<_, String> {
             let live = plow_asset::live_kv::emit(p)?;
             let request = plow_asset::packed_prefill::Manifest {
-                version: 1,
+                version: live.version,
                 slot,
                 request,
                 maps,

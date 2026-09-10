@@ -140,10 +140,18 @@ impl BlobPlan {
     /// once (header + tensor decls; the init section ride-along is the cost of
     /// the shared parser — startup-only, never on the request path).
     pub fn from_dir(dir: &Path) -> Result<BlobPlan> {
-        Self::from_dir_with_granularity(dir, None)
+        Self::from_dir_with_device(dir, None, None)
     }
 
     pub fn from_dir_with_granularity(dir: &Path, granularity: Option<u64>) -> Result<BlobPlan> {
+        Self::from_dir_with_device(dir, granularity.map(|g| (g, (0, 0))), None)
+    }
+
+    pub fn from_dir_with_device(
+        dir: &Path,
+        device_vmm: Option<(u64, (u32, u32))>,
+        checkpoint: Option<&Path>,
+    ) -> Result<BlobPlan> {
         let pkt = DevBlob::find_in_dir(dir)?
             .ok_or_else(|| RuntimeError::Device(format!("no PLOWDEV blob in {}", dir.display())))?;
         let raw = std::fs::read(&pkt).map_err(|source| RuntimeError::Io {
@@ -163,7 +171,7 @@ impl BlobPlan {
         for t in &blob.tensors {
             plan.add(&t.name, t.bytes);
         }
-        if let Some(granularity) = granularity {
+        if let Some((granularity, capability)) = device_vmm {
             let config = crate::config::RuntimeConfig::get();
             let manifest = crate::memory::vmm::LiveKvLayout::manifest(&blob, &raw)?;
             let packed = blob
@@ -172,7 +180,17 @@ impl BlobPlan {
             let full = manifest
                 .as_ref()
                 .is_some_and(|m| m.caches.iter().any(|c| c.window == 0));
-            if config.nv_live_kv_enabled(packed, full) {
+            let prefix_layout = checkpoint.and_then(|path| {
+                crate::exec::gpu::GpuEngine::select_vmm_prefix_layout(
+                    &blob,
+                    path,
+                    config,
+                    capability,
+                    granularity,
+                )
+            });
+            let prefix_requested = config.nv_vmm_prefix() == Some(true) || prefix_layout.is_some();
+            if config.nv_live_kv_enabled(packed, full, prefix_requested) {
                 let layout = match manifest.as_ref() {
                     Some(m) => crate::memory::vmm::LiveKvLayout::from_manifest(&blob, m)?,
                     None => crate::memory::vmm::LiveKvLayout::from_blob(&blob)?,
@@ -194,6 +212,17 @@ impl BlobPlan {
                     * 2;
                 plan.kv_bytes = plan.kv_bytes.checked_sub(virtual_bytes).ok_or_else(|| {
                     RuntimeError::Rejected("live KV plan tensor classification".into())
+                })? + resident
+                    + crate::memory::vmm::kv_pool_cap();
+            } else if let Some(layout) = prefix_layout {
+                let geo = &layout.geo;
+                let block = geo
+                    .block_bytes(granularity, u64::from(config.nv_vmm_block_mib()) << 20)?;
+                let tracks = geo.full_layers.len() as u64 * 2;
+                let virtual_bytes = geo.full_tensor_bytes() * tracks;
+                let resident = block * u64::from(geo.batch) * u64::from(geo.kvh_full) * tracks;
+                plan.kv_bytes = plan.kv_bytes.checked_sub(virtual_bytes).ok_or_else(|| {
+                    RuntimeError::Rejected("prefix KV plan tensor classification".into())
                 })? + resident
                     + crate::memory::vmm::kv_pool_cap();
             }
@@ -320,7 +349,11 @@ impl ModelManager {
         let mut managed = Vec::with_capacity(models.len());
         for (slug, dir, ckpt) in models {
             check_single_device(&slug, &dir)?;
-            let plan = BlobPlan::from_dir_with_granularity(&dir, Some(be.granularity()?))?;
+            let plan = BlobPlan::from_dir_with_device(
+                &dir,
+                Some((be.granularity()?, be.compute_capability())),
+                Some(&ckpt),
+            )?;
             tracing::info!(
                 %slug,
                 weights_gib = gib(plan.weights_bytes),
@@ -393,7 +426,11 @@ impl ModelManager {
             )));
         }
         check_single_device(slug, &dir)?;
-        let plan = BlobPlan::from_dir_with_granularity(&dir, Some(self.be.granularity()?))?;
+        let plan = BlobPlan::from_dir_with_device(
+            &dir,
+            Some((self.be.granularity()?, self.be.compute_capability())),
+            Some(&ckpt),
+        )?;
         tracing::info!(
             %slug,
             dir = %dir.display(),

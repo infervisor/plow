@@ -20,7 +20,7 @@ fn packet_capabilities_are_explicit() {
         let capabilities = emit_capabilities(model_type);
         assert!(capabilities.dense_packet_contracts);
         assert!(capabilities.decode_objects);
-        assert!(!capabilities.cublaslt_decode);
+        assert_eq!(capabilities.cublaslt_decode, model_type.starts_with("gemma4"));
         assert!(capabilities.decode_ladder);
     }
     let qwen = emit_capabilities("qwen3_5");
@@ -71,13 +71,58 @@ fn production_defaults_are_capability_and_target_driven() {
     apply_production_defaults(&mut amd, emit_capabilities("gemma4"), "gfx942", 1);
     assert_eq!(amd.decode_rungs(), [1, 2, 4, 8]);
     assert!(amd.decode_ladder_default);
-    // Packed prefill stays sm_90a-only; the decode ladder moving does not move it.
+    assert!(amd.packed_prefill_on());
+    amd.emit_packed_prefill = Some(false);
     assert!(!amd.packed_prefill_on());
 
     let mut other_target = EmitArgsForTest::try_parse_from(["test"]).unwrap().emit;
     apply_production_defaults(&mut other_target, emit_capabilities("gemma4"), "gfx950", 1);
     assert_eq!(other_target.decode_rungs(), [1]);
     assert!(!other_target.packed_prefill_on());
+}
+
+#[test]
+fn amd_packed_defaults_require_dense_bf16_single_gpu() {
+    for flag in ["--fp8", "--w8a8", "--w8a16", "--fp8-kv"] {
+        let mut cfg = EmitArgsForTest::try_parse_from(["test", flag])
+            .unwrap()
+            .emit;
+        apply_production_defaults(&mut cfg, emit_capabilities("gemma4"), "gfx942", 1);
+        assert!(!cfg.packed_prefill_on(), "{flag}");
+    }
+    for (model, tp) in [("gemma4", 2), ("qwen3_5", 1), ("kimi_k3", 1)] {
+        let mut cfg = EmitArgsForTest::try_parse_from(["test"]).unwrap().emit;
+        apply_production_defaults(&mut cfg, emit_capabilities(model), "gfx942", tp);
+        assert!(!cfg.packed_prefill_on(), "{model} tp={tp}");
+    }
+}
+
+#[test]
+fn qualified_fp8_weight_metadata_follows_production_defaults() {
+    for flag in ["--fp8", "--w8a16"] {
+        let mut cfg = EmitArgsForTest::try_parse_from(["test", flag]).unwrap().emit;
+        apply_production_defaults(&mut cfg, emit_capabilities("gemma4"), "sm_90a", 1);
+        assert!(cfg.packed_prefill_on());
+        assert!(cfg.packed_prefill_metadata_on());
+        cfg.emit_packed_prefill = Some(true);
+        assert!(cfg.packed_prefill_metadata_on());
+        cfg.emit_packed_prefill = Some(false);
+        assert!(!cfg.packed_prefill_on());
+        assert!(!cfg.packed_prefill_metadata_on());
+    }
+    let mut cfg = EmitArgsForTest::try_parse_from(["test"]).unwrap().emit;
+    apply_production_defaults(&mut cfg, emit_capabilities("gemma4"), "sm_90a", 1);
+    assert!(cfg.packed_prefill_metadata_on());
+}
+
+#[test]
+fn activation_fp8_packing_still_requires_explicit_selection() {
+    let mut cfg = EmitArgsForTest::try_parse_from(["test", "--w8a8"]).unwrap().emit;
+    apply_production_defaults(&mut cfg, emit_capabilities("gemma4"), "sm_90a", 1);
+    assert!(cfg.packed_prefill_on());
+    assert!(!cfg.packed_prefill_metadata_on());
+    cfg.emit_packed_prefill = Some(true);
+    assert!(cfg.packed_prefill_metadata_on());
 }
 
 #[test]
@@ -88,7 +133,7 @@ fn cublaslt_emission_rejects_unloadable_combinations() {
     assert!(!cublaslt_emit_supported(qwen, "gfx950", 1, false));
     assert!(!cublaslt_emit_supported(qwen, "sm_90a", 2, false));
     assert!(!cublaslt_emit_supported(qwen, "sm_90a", 1, true));
-    assert!(!cublaslt_emit_supported(
+    assert!(cublaslt_emit_supported(
         emit_capabilities("gemma4"),
         "sm_90a",
         1,

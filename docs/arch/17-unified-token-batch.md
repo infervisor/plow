@@ -11,6 +11,16 @@ now code and tests. Where the two disagree, the disagreement is called out here.
 
 ## Contents
 
+Runtime selection defaults on. `--token-batch=false` or `PLOW_TOKEN_BATCH=0` disables it;
+explicit `--fusion` takes precedence. Selection still requires a gfx942 dense BF16 program,
+matching object markers, multiple slots, unsplit attention and a fused attention epilogue.
+Tensor parallelism, prefix-cache mode and unsupported programs use ordinary execution.
+CUDA has no token-batch executor yet, so the default does not enable token batching on H100.
+
+Startup logs distinguish object `armed` from executor `ready` and always report `fires=false`.
+The first successful device dispatch reports `fires=true`. These capability and lifecycle
+checks do not establish end-to-end performance or production qualification on an untested GPU.
+
 Three documents, folded into one on 2026-09-08 because they were always read together and
 their cross-references were the only thing tying them.
 

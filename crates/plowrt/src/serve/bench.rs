@@ -448,17 +448,6 @@ pub async fn run_prefill_sweep(
     for input in &cfg.inputs {
         validate_input(input, vocab)?;
     }
-    let runtime = crate::config::RuntimeConfig::get();
-    let prefix_cache = match state.execset.backend().vendor() {
-        Some(hwspec::Vendor::Nvidia) => runtime.nv.vmm_prefix,
-        Some(hwspec::Vendor::Amd) => runtime.nv.prefix_cache,
-        _ => false,
-    };
-    if prefix_cache {
-        return Err(RuntimeError::Msg(
-            "bench prefill sweep requires cold prompts; disable --prefix-cache/--vmm-prefix".into(),
-        ));
-    }
     let mux = state
         .mux(&cfg.model)
         .ok_or_else(|| RuntimeError::Msg(format!("no model mux for '{}'", cfg.model)))?;
@@ -468,6 +457,11 @@ pub async fn run_prefill_sweep(
             .gpu_engine(&cfg.model)
             .ok_or_else(|| RuntimeError::Msg(format!("no GPU engine for '{}'", cfg.model)))?;
         let engine = engine.lock();
+        if engine.prefix_cache_enabled() {
+            return Err(RuntimeError::Msg(
+                "bench prefill sweep requires cold prompts; disable --prefix-cache/--vmm-prefix".into(),
+            ));
+        }
         Some(EngineReport {
             batch_capacity: engine.batch(),
             decode_rungs: engine.decode_rungs(),

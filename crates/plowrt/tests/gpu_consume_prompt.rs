@@ -103,6 +103,121 @@ fn compare_snapshot(actual: LogitSnapshot, expected: &LogitSnapshot, case: &str)
 }
 
 #[test]
+#[ignore = "requires free H100, PLOW_GPU_TEST=1 and B16 FP8-KV PLOW_GPU_ASSETS"]
+fn fp8_live_allocations_match_prefix_reference_across_rungs_and_slot_reuse() {
+    let _env = common::env_guard();
+    assert_eq!(std::env::var("PLOW_GPU_TEST").as_deref(), Ok("1"));
+    let _config = common::EnvScope::set(&[
+        ("PLOW_VMM_LIVE", "0"),
+        ("PLOW_VMM_LIVE_RINGS", "0"),
+        ("PLOW_VMM_PREFIX", "1"),
+        ("PLOW_PREFIX_CACHE", "1"),
+        ("PLOW_TOKEN_BATCH", "0"),
+        ("PLOW_PF_BATCH", "0"),
+        ("PLOW_MULTISTEP", "0"),
+        ("PLOW_KV_POOL_MIB", "0"),
+    ]);
+    let assets = PathBuf::from(std::env::var("PLOW_GPU_ASSETS").expect("PLOW_GPU_ASSETS"));
+    let packet = plowrt::asset::devblob::DevBlob::find_in_dir(&assets)
+        .unwrap()
+        .unwrap();
+    let blob = plowrt::asset::devblob::DevBlob::parse(&std::fs::read(packet).unwrap()).unwrap();
+    let manifest = blob.with_packet_view(plow_asset::live_kv::emit).unwrap();
+    assert!(manifest.caches.iter().all(|c| c.scales.is_some()));
+    plowrt::memory::vmm::LiveKvLayout::from_manifest(&blob, &manifest).unwrap();
+    let be = Arc::new(CudaBackend::new(0).unwrap());
+    let mut e = GpuEngine::load(be.clone(), &assets, &assets.join("checkpoint")).unwrap();
+    assert_eq!(e.batch(), 16);
+    assert_eq!(&*e.effective_decode_rungs(), [1, 2, 4, 8, 16]);
+    assert!(e.vmm_stats().is_some());
+    let prompts: Vec<Vec<u32>> = (0..16)
+        .map(|slot| {
+            let len = match slot {
+                0 => 1025,
+                15 => 2051,
+                _ => 129 + 17 * (slot % 3),
+            };
+            (0..len)
+                .map(|i| 100 + ((i * (2 * slot + 1) + slot * 173) % 1000) as u32)
+                .collect()
+        })
+        .collect();
+    let mut reference = Vec::new();
+    let mut decoded = Vec::new();
+    for prompt in &prompts {
+        e.begin_slot(0, prompt.len() + 7).unwrap();
+        let mut token = e.prefill_slot(0, prompt).unwrap();
+        let mut trajectory = vec![snapshot(&mut e, 0, token)];
+        for _ in 0..6 {
+            e.step_slots(&[(0, token)], &mut decoded).unwrap();
+            token = decoded[0];
+            trajectory.push(snapshot(&mut e, 0, token));
+        }
+        reference.push(trajectory);
+    }
+    drop(e);
+    for lazy_scales in [false, true] {
+        std::env::set_var("PLOW_VMM_LIVE", "1");
+        std::env::set_var("PLOW_VMM_LIVE_RINGS", if lazy_scales { "1" } else { "0" });
+        std::env::set_var("PLOW_VMM_PREFIX", "0");
+        std::env::set_var("PLOW_PREFIX_CACHE", "0");
+        let mut e = GpuEngine::load(be.clone(), &assets, &assets.join("checkpoint")).unwrap();
+        assert_eq!(&*e.effective_decode_rungs(), [1, 2, 4, 8, 16]);
+        assert!(e.vmm_stats().is_some());
+        assert_eq!(e.live_ring_stats().is_some(), lazy_scales);
+        let mut tokens = [0; 16];
+        let mut steps = [0; 16];
+        let mut active = 0;
+        for width in [1, 2, 4, 8, 16] {
+            for slot in active..width {
+                e.begin_slot(slot, prompts[slot].len() + 7).unwrap();
+                tokens[slot] = e.prefill_slot(slot, &prompts[slot]).unwrap();
+                compare_snapshot(
+                    snapshot(&mut e, 0, tokens[slot]),
+                    &reference[slot][0],
+                    &format!("lazy={lazy_scales} slot={slot} prefill"),
+                );
+            }
+            active = width;
+            let inputs: Vec<_> = tokens[..width].iter().copied().enumerate().collect();
+            e.step_slots(&inputs, &mut decoded).unwrap();
+            for slot in 0..width {
+                tokens[slot] = decoded[slot];
+                steps[slot] += 1;
+                compare_snapshot(
+                    snapshot(&mut e, slot, tokens[slot]),
+                    &reference[slot][steps[slot]],
+                    &format!("lazy={lazy_scales} rung={width} slot={slot}"),
+                );
+            }
+        }
+        e.begin_slot(15, prompts[0].len() + 7).unwrap();
+        tokens[15] = e.prefill_slot(15, &prompts[0]).unwrap();
+        compare_snapshot(
+            snapshot(&mut e, 0, tokens[15]),
+            &reference[0][0],
+            "reused slot prefill",
+        );
+        let inputs: Vec<_> = tokens.iter().copied().enumerate().collect();
+        e.step_slots(&inputs, &mut decoded).unwrap();
+        for slot in 0..16 {
+            let (case, step) = if slot == 15 {
+                (0, 1)
+            } else {
+                (slot, steps[slot] + 1)
+            };
+            compare_snapshot(
+                snapshot(&mut e, slot, decoded[slot]),
+                &reference[case][step],
+                "reused slot decode",
+            );
+        }
+        assert_eq!(e.vmm_stats().unwrap().attach_hits, 0);
+        eprintln!("FP8 LIVE lazy_scales={lazy_scales}: 64 exact full-vocabulary frames, all rungs and reused slot passed");
+    }
+}
+
+#[test]
 fn serialized_tma_slots_match_isolated_full_logits() {
     serialized_tma_slot_parity(false, false);
 }

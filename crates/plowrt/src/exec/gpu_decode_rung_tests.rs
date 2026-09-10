@@ -110,6 +110,103 @@ fn selects_by_highest_physical_slot_and_preserves_sparse_slots() {
     assert_eq!(decode_rung_index(std::iter::empty(), 0), None);
 }
 
+fn cublaslt_fixture() -> (DevBlob, SegmentRoles) {
+    let mut blob = fixture();
+    for name in ["projection.out", "projection.in", "model.layers.0.weight"] {
+        blob.tensors.push(DevTensor {
+            name: name.into(),
+            bytes: 16 * 16 * 2,
+            init: None,
+        });
+    }
+    for g in &mut blob.progs {
+        let mut projection = DevInst64 {
+            op: DevOp::Gemv as u16,
+            blocks: 1,
+            t: [TENSOR_NONE16; 8],
+            ..Default::default()
+        };
+        projection.t[..3].copy_from_slice(&[8, 9, 10]);
+        projection.i[..3].copy_from_slice(&[g.t, 16, 16]);
+        g.insts.push(projection);
+        g.n_counter = 5;
+        g.succs = (0..5).collect();
+        g.waits = (0..4)
+            .map(|id| packet::dev::Wait { id, threshold: 1 })
+            .collect();
+        g.stream = (0..5)
+            .map(|pc| StreamEnt {
+                inst: pc,
+                seg: u16::from(pc == 4),
+                succ_ofs: pc,
+                succ_len: 1,
+                wait_ofs: pc.saturating_sub(1),
+                wait_len: u16::from(pc != 0),
+                ..Default::default()
+            })
+            .collect();
+        g.gq_stream = g.stream.clone();
+        g.stream_len = vec![5];
+        g.gq_seg_ofs = vec![0, 4, 5];
+    }
+    let metadata = SegmentRoles {
+        version: 1,
+        objects: Default::default(),
+        programs: (0..blob.progs.len())
+            .map(|index| plow_asset::segment_roles::ProgramRoles {
+                index,
+                roles: vec![
+                    plow_asset::segment_roles::INTERPRETER,
+                    plow_asset::segment_roles::CUBLASLT,
+                ],
+            })
+            .collect(),
+    };
+    (blob, metadata)
+}
+
+#[test]
+fn cublaslt_ladder_requires_complete_equivalent_roles_and_dependencies() {
+    let (blob, mut metadata) = cublaslt_fixture();
+    assert!(validate_cublaslt_ladder(&blob, &metadata).unwrap());
+    assert!(!validate_decode_ladder(&blob).unwrap());
+    let removed = metadata.programs.remove(1);
+    assert!(validate_cublaslt_ladder(&blob, &metadata)
+        .unwrap_err()
+        .to_string()
+        .contains("every decode width"));
+    metadata.programs.insert(1, removed);
+    metadata.programs[1].roles[1] = plow_asset::segment_roles::INTERPRETER;
+    assert!(validate_cublaslt_ladder(&blob, &metadata)
+        .unwrap_err()
+        .to_string()
+        .contains("roles differ"));
+
+    let (mut blob, metadata) = cublaslt_fixture();
+    blob.progs[1].waits[3].id = 0;
+    assert!(validate_cublaslt_ladder(&blob, &metadata)
+        .unwrap_err()
+        .to_string()
+        .contains("dependencies differ"));
+    blob.progs[1].waits[3].id = 3;
+    blob.progs[1].waits[3].threshold = 0;
+    assert!(validate_cublaslt_ladder(&blob, &metadata).is_err());
+}
+
+#[test]
+fn cublaslt_ladder_rejects_stale_kv_addressing_and_invalid_projection_storage() {
+    let (mut blob, metadata) = cublaslt_fixture();
+    blob.progs[1].insts[0].i[6] = 16;
+    assert!(validate_cublaslt_ladder(&blob, &metadata).is_err());
+    blob.progs[1].insts[0].i[6] = 2;
+    blob.progs[1].insts[2].i[3] = 512;
+    assert!(validate_cublaslt_ladder(&blob, &metadata).is_err());
+    blob.progs[1].insts[2].i[3] = 1024;
+    assert!(validate_cublaslt_ladder(&blob, &metadata).unwrap());
+    blob.tensors[8].bytes -= 2;
+    assert!(validate_cublaslt_ladder(&blob, &metadata).is_err());
+}
+
 #[test]
 fn effective_widths_include_main_and_preserve_widest_only_fallbacks() {
     assert_eq!(
@@ -151,6 +248,53 @@ fn validates_direct_kv_ladder_and_rejects_stale_slot_addressing() {
         let mut blob = fixture();
         mutate(&mut blob);
         assert!(validate_decode_ladder(&blob).is_err(), "case={case}");
+    }
+}
+
+#[test]
+fn validates_channel_fp8_rows_and_preserves_projection_and_kv_checks() {
+    for op in [DevOp::GemvFp8, DevOp::GemvGluFp8] {
+        let mut blob = fixture();
+        for (name, bytes) in [("x", 256), ("wg", 128), ("sg", 64), ("wu", 128), ("su", 64)] {
+            blob.tensors.push(DevTensor {
+                name: name.into(),
+                bytes,
+                init: None,
+            });
+        }
+        for g in &mut blob.progs {
+            let mut d = DevInst64 {
+                op: op as u16,
+                blocks: 1,
+                t: [TENSOR_NONE16; 8],
+                ..Default::default()
+            };
+            d.t[..3].copy_from_slice(&[7, 8, 9]);
+            if op == DevOp::GemvFp8 {
+                d.t[5] = 10;
+            } else {
+                d.t[3..6].copy_from_slice(&[10, 12, 11]);
+            }
+            d.i[..3].copy_from_slice(&[g.t, 16, 8]);
+            let entry = StreamEnt {
+                inst: g.insts.len() as u32,
+                ..Default::default()
+            };
+            g.insts.push(d);
+            g.stream.push(entry);
+            g.gq_stream.push(entry);
+            g.stream_len[0] += 1;
+            g.gq_seg_ofs[1] += 1;
+        }
+        assert!(validate_decode_ladder(&blob).unwrap());
+        blob.progs[0].insts[4].i[0] = 2;
+        assert!(validate_decode_ladder(&blob).is_err());
+        blob.progs[0].insts[4].i[0] = 1;
+        blob.progs[0].insts[4].t[5] = 12;
+        assert!(!validate_decode_ladder(&blob).unwrap());
+        blob.progs[0].insts[4].t[5] = if op == DevOp::GemvFp8 { 10 } else { 11 };
+        blob.progs[0].insts[0].i[6] = 0;
+        assert!(validate_decode_ladder(&blob).is_err());
     }
 }
 
@@ -262,11 +406,113 @@ fn decode_ladder_accepts_runtime_input_capacity_beyond_widest_rung() {
     assert!(validate_decode_ladder(&blob).unwrap());
 }
 
+fn fp8_kv_fixture() -> DevBlob {
+    let mut blob = fixture();
+    for index in [3, 4] {
+        blob.tensors[index].bytes /= 2;
+    }
+    for name in ["key.scale", "value.scale"] {
+        blob.tensors.push(DevTensor {
+            name: name.into(),
+            bytes: 16 * 1024 * 4,
+            init: None,
+        });
+    }
+    for g in &mut blob.progs {
+        for index in 0..2 {
+            g.insts[index].op = DevOp::HeadNormRopeFp8 as u16;
+            g.insts[index].t[6] = 8 + index as u16;
+        }
+        g.insts[2].op = DevOp::FlashDecodeFp8 as u16;
+        g.insts[2].t[6..8].copy_from_slice(&[8, 9]);
+    }
+    blob
+}
+
+#[test]
+fn fp8_kv_ladder_validates_full_and_sliding_cache_geometry() {
+    for hd in [256, 512] {
+        for window in [0, 512] {
+            let mut blob = fp8_kv_fixture();
+            for index in [3, 4, 5, 7] {
+                blob.tensors[index].bytes *= u64::from(hd / 256);
+            }
+            for g in &mut blob.progs {
+                for index in 0..2 {
+                    g.insts[index].i[2] = hd;
+                    g.insts[index].fj[2] = if window == 0 { u32::MAX } else { 1023 };
+                }
+                g.insts[2].i[4] = window;
+                g.insts[2].i[6] = hd;
+                g.insts[2].i[7] = if window == 0 { u32::MAX } else { 1023 };
+                g.insts[3].i[3] = hd;
+            }
+            assert!(
+                validate_decode_ladder(&blob).unwrap(),
+                "hd={hd} window={window}"
+            );
+        }
+    }
+}
+
+#[test]
+fn fp8_kv_ladder_rejects_invalid_scale_storage_and_aliases() {
+    for mutation in 0..6 {
+        let mut blob = fp8_kv_fixture();
+        match mutation {
+            0 => blob.tensors[8].bytes -= 4,
+            1 => blob.tensors[9].bytes *= 2,
+            2 => blob.tensors[8].init = Some(0..4),
+            3 => {
+                for g in &mut blob.progs {
+                    g.insts[2].t[7] = 8;
+                }
+            }
+            4 => {
+                for g in &mut blob.progs {
+                    g.insts[2].t[6] = TENSOR_NONE16;
+                }
+            }
+            5 => {
+                for g in &mut blob.progs {
+                    g.insts[2].t[6] = 3;
+                }
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            validate_decode_ladder(&blob).is_err(),
+            "mutation={mutation}"
+        );
+    }
+}
+
+#[test]
+fn fp8_kv_ladder_rejects_changed_reader_writer_and_scale_addressing() {
+    for mutation in 0..6 {
+        let mut blob = fp8_kv_fixture();
+        let g = &mut blob.progs[0];
+        match mutation {
+            0 => g.insts[0].t[6] = 9,
+            1 => g.insts[2].t[6..8].swap(0, 1),
+            2 => g.insts[0].i[6] = 0,
+            3 => g.insts[0].op = DevOp::HeadNormRope as u16,
+            4 => g.insts[2].op = DevOp::FlashDecode as u16,
+            5 => g.insts[3].t[0] = 8,
+            _ => unreachable!(),
+        }
+        assert!(
+            validate_decode_ladder(&blob).is_err(),
+            "mutation={mutation}"
+        );
+    }
+}
+
 #[test]
 fn unsupported_families_and_single_rung_keep_widest_execution() {
     let mut blob = fixture();
     for g in &mut blob.progs {
-        g.insts[2].op = DevOp::FlashDecodeFp8 as u16;
+        g.insts[2].op = DevOp::FlashPrefillFp8 as u16;
     }
     assert!(!validate_decode_ladder(&blob).unwrap());
     let mut blob = fixture();
@@ -295,6 +541,92 @@ fn actual_packet_decode_ladder() {
 #[test]
 #[ignore = "GPU full-logit gate; set TEST_DECODE_RUNG_GPU, TEST_DECODE_RUNG_ASSETS, TEST_DECODE_RUNG_BASELINE"]
 fn gpu_decode_rungs_match_widest_full_logits() {
+    check_gpu_decode_rungs(false);
+}
+
+#[test]
+#[ignore = "GPU cuBLASLt gate; set TEST_DECODE_RUNG_GPU, TEST_DECODE_RUNG_ASSETS, TEST_DECODE_RUNG_BASELINE"]
+fn gpu_cublaslt_rungs_match_widest_logits() {
+    check_gpu_decode_rungs(true);
+}
+
+#[test]
+#[ignore = "H100 FP8-KV prefix gate; set TEST_FP8_KV_ASSETS and PLOW_VMM_PREFIX=1, PLOW_MULTISTEP=0"]
+fn gpu_fp8_kv_cached_rungs_match_uncached_suffix_logits() {
+    let assets = std::path::PathBuf::from(std::env::var("TEST_FP8_KV_ASSETS").unwrap());
+    let mut e = GpuEngine::load(
+        Arc::new(CudaBackend::new(0).unwrap()),
+        &assets,
+        &assets.join("checkpoint"),
+    )
+    .unwrap();
+    assert!(e.vmm_prefix_enabled() && e.multistep.is_none());
+    assert_eq!(e.batch(), 16);
+    assert!(e.prefill.iter().all(|p| p.fp8_kv));
+    assert_eq!(
+        e.decode_rungs.iter().map(|r| r.rows).collect::<Vec<_>>(),
+        [1, 2, 4, 8]
+    );
+    for length in [127, 129, 513, 1057, 2113, 16417] {
+        let prompt: Vec<_> = (0..length)
+            .map(|i| 100 + ((i * 13 + length * 17) % 2000) as u32)
+            .collect();
+        let mut reference = Vec::new();
+        for (pass, slot) in [15, 0, 1, 3, 7, 15].into_iter().enumerate() {
+            e.begin_slot(slot, length + 8).unwrap();
+            assert_eq!(e.vmm.as_ref().unwrap().kv.mapped_rows(slot), 0);
+            let cached = e.attach_prompt(slot, &prompt).unwrap();
+            assert_eq!(cached, if pass == 0 { 0 } else { (length - 1) / 32 * 32 });
+            let mut next = e.prefill_slot(slot, &prompt).unwrap();
+            if pass == 0 {
+                // Recompute the suffix with the warm path's bucket while keeping
+                // the independently computed prefix resident in its original slot.
+                let mut cold = Vec::new();
+                e.logits_row(0, &mut cold).unwrap();
+                e.pos[slot] = ((length - 1) / 32 * 32) as u32;
+                next = e.prefill_slot(slot, &prompt).unwrap();
+                let mut suffix = Vec::new();
+                e.logits_row(0, &mut suffix).unwrap();
+                let max_abs = cold
+                    .iter()
+                    .zip(&suffix)
+                    .map(|(a, b)| (*a - *b).abs())
+                    .fold(0.0f32, f32::max);
+                eprintln!("FP8 KV length={length}: cold vs suffix-bucket max_abs={max_abs}");
+            }
+            for step in 0..8 {
+                let mut logits = Vec::new();
+                e.logits_row(if step == 0 { 0 } else { slot }, &mut logits)
+                    .unwrap();
+                assert_eq!(logits.len(), e.vocab);
+                assert!(logits.iter().all(|v| v.is_finite()));
+                let bits: Vec<_> = logits.iter().map(|v| v.to_bits()).collect();
+                if pass == 0 {
+                    reference.push(bits);
+                } else {
+                    let max_abs = logits
+                        .iter()
+                        .zip(&reference[step])
+                        .map(|(a, b)| (*a - f32::from_bits(*b)).abs())
+                        .fold(0.0f32, f32::max);
+                    assert!(
+                        bits == reference[step],
+                        "length={length} slot={slot} step={step} max_abs={max_abs}"
+                    );
+                }
+                if step < 7 {
+                    let mut ids = Vec::new();
+                    e.step_slots(&[(slot, next)], &mut ids).unwrap();
+                    next = ids[0];
+                }
+            }
+            e.retire_slot(slot, false);
+            eprintln!("FP8 KV prefix length={length} slot={slot} cached={cached}: 8 full-logit frames exact");
+        }
+    }
+}
+
+fn check_gpu_decode_rungs(library: bool) {
     assert_eq!(std::env::var("TEST_DECODE_RUNG_GPU").as_deref(), Ok("1"));
     let ladder = std::path::PathBuf::from(std::env::var("TEST_DECODE_RUNG_ASSETS").unwrap());
     let baseline = std::path::PathBuf::from(std::env::var("TEST_DECODE_RUNG_BASELINE").unwrap());
@@ -313,7 +645,13 @@ fn gpu_decode_rungs_match_widest_full_logits() {
     assert!(batch >= 2 && widths.len() > 1);
     assert_eq!(base_blob.decode_rungs(), [batch as u32]);
     assert_eq!(widths.last(), Some(&batch));
-    assert!(validate_decode_ladder(&ladder_blob).unwrap());
+    if library {
+        let raw = std::fs::read(DevBlob::find_in_dir(&ladder).unwrap().unwrap()).unwrap();
+        let roles = segment_role_metadata(&ladder_blob, &raw).unwrap().unwrap();
+        assert!(validate_cublaslt_ladder(&ladder_blob, &roles).unwrap());
+    } else {
+        assert!(validate_decode_ladder(&ladder_blob).unwrap());
+    }
     assert_eq!(
         base_blob.decode_prog().unwrap().insts,
         ladder_blob.decode_prog().unwrap().insts,
@@ -327,21 +665,50 @@ fn gpu_decode_rungs_match_widest_full_logits() {
             .eq(ladder_blob.tensors.iter().map(|t| (&t.name, t.bytes))),
         "baseline tensor geometry differs"
     );
+    let original_waits = library.then(|| ladder_blob.decode_prog().unwrap().waits.clone());
     drop((base_blob, ladder_blob));
     let be = Arc::new(CudaBackend::new(0).unwrap());
     let mut references: Vec<(String, u32, Vec<u32>)> = Vec::new();
+    // Reuse Lt plans: load-time tuning can select different math on separate loads.
+    let mut library_engine = library
+        .then(|| GpuEngine::load(Arc::clone(&be), &ladder, &ladder.join("checkpoint")).unwrap());
+    let mut library_rungs = library_engine
+        .as_mut()
+        .map(|e| std::mem::take(&mut e.decode_rungs));
+    let mut library_control = library_engine.as_mut().map(|e| {
+        let bytes = pod_bytes(original_waits.as_ref().unwrap());
+        let waits = be.alloc(0, bytes.len().max(4) as u64).unwrap();
+        be.upload(&waits, 0, bytes).unwrap();
+        let reference = e.capture_library_reference_graph(waits.base).unwrap();
+        let elided = e.cublaslt_decode_graph.replace(reference).unwrap();
+        (waits, Some(elided))
+    });
     for (candidate, assets) in [(false, &baseline), (true, &ladder)] {
-        let mut e = GpuEngine::load(Arc::clone(&be), assets, &assets.join("checkpoint")).unwrap();
+        let mut native_engine = (!library)
+            .then(|| GpuEngine::load(Arc::clone(&be), assets, &assets.join("checkpoint")).unwrap());
+        let mut e = if let Some(e) = library_engine.as_mut() {
+            if candidate {
+                e.decode_rungs = library_rungs.take().unwrap();
+                let elided = library_control.as_mut().unwrap().1.take().unwrap();
+                let reference = e.cublaslt_decode_graph.replace(elided).unwrap();
+                be.graph_destroy(reference);
+            }
+            e
+        } else {
+            native_engine.as_mut().unwrap()
+        };
         assert_eq!(e.batch(), batch);
-        assert!(
-            e.cublaslt_decode.is_empty() && e.multistep.is_none(),
-            "disable Lt and multistep for this gate"
-        );
+        assert_eq!(!e.cublaslt_decode.is_empty(), library);
+        assert!(e.multistep.is_none(), "disable multistep for this gate");
         if candidate {
             assert_eq!(
                 e.decode_rungs.iter().map(|r| r.rows).collect::<Vec<_>>(),
                 widths[..widths.len() - 1]
             );
+            assert!(e
+                .decode_rungs
+                .iter()
+                .all(|r| r.library.is_some() == library));
         } else {
             assert!(e.decode_rungs.is_empty());
         }
@@ -457,8 +824,28 @@ fn gpu_decode_rungs_match_widest_full_logits() {
                         format!("phase={phase} step={step} slot={slot}"),
                     );
                 }
-                eprintln!("candidate={candidate} phase={phase} step={step} slots={slots:?} rung={selected}: full logits exact");
+                eprintln!("candidate={candidate} library={library} phase={phase} step={step} slots={slots:?} rung={selected}: full logits exact");
             }
+        }
+        if candidate {
+            for slot in 0..batch - 1 {
+                e.retire_slot(slot, true);
+                if let Some(vmm) = &e.vmm {
+                    assert_eq!(e.pos[slot], 0);
+                    assert_eq!(vmm.kv.mapped_rows(slot), 0);
+                }
+            }
+        }
+        let slot = batch - 1;
+        for step in 0..4 {
+            e.step_slots(&[(slot, tokens[slot])], &mut decoded).unwrap();
+            tokens[slot] = decoded[0];
+            compare(
+                &mut e,
+                slot,
+                tokens[slot],
+                format!("retired lower slots step={step}"),
+            );
         }
         eprintln!("candidate={candidate}: {checked} full-logit snapshots");
     }

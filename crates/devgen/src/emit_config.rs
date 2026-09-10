@@ -1221,6 +1221,11 @@ impl EmitConfig {
             .unwrap_or(self.packed_prefill_default)
     }
 
+    pub fn packed_prefill_metadata_on(&self) -> bool {
+        // Activation-FP8 packing remains opt-in pending execution qualification.
+        self.packed_prefill_on() && (!self.w8a8 || self.emit_packed_prefill == Some(true))
+    }
+
     /// The decode widths this emit builds programs for, ASCENDING.
     ///
     /// Without `PLOW_DECODE_BATCH_LADDER` this is exactly `[decode_batch]`.

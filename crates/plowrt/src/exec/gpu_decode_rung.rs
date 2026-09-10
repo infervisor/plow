@@ -2,6 +2,7 @@ use super::*;
 use packet::dev::ROPE_PAIR_HALF;
 
 pub(super) struct DecodeRung {
+    pub(super) library: Option<super::gpu_cublaslt::CublasLtDecodeGraph>,
     pub(super) rows: usize,
     pub(super) object: Option<Arc<BoundDecodeObject>>,
     pub(super) kernarg: DevProgram,
@@ -42,6 +43,62 @@ pub(super) fn effective_decode_widths(
 }
 
 pub(super) fn validate_decode_ladder(blob: &DevBlob) -> Result<bool> {
+    validate_decode_ladder_impl(blob, false)
+}
+
+pub(super) fn validate_cublaslt_ladder(blob: &DevBlob, metadata: &SegmentRoles) -> Result<bool> {
+    if blob.decode_progs().len() < 2 {
+        return Ok(false);
+    }
+    let start = blob.progs.len() - blob.decode_progs().len();
+    let mut previous_roles = None;
+    for (index, program) in blob.progs.iter().enumerate().skip(start) {
+        let roles = &metadata
+            .program(index)
+            .ok_or_else(|| {
+                RuntimeError::Rejected(
+                    "cuBLASLt ladder requires roles for every decode width".into(),
+                )
+            })?
+            .roles;
+        if !roles.contains(&plow_asset::segment_roles::CUBLASLT)
+            || previous_roles.is_some_and(|previous| previous != roles)
+        {
+            return Err(RuntimeError::Rejected(
+                "cuBLASLt ladder projection roles differ".into(),
+            ));
+        }
+        packet_role_segments(program, roles, &blob.tensors)?;
+        previous_roles = Some(roles);
+    }
+    blob.with_packet_view(|packet| {
+        let mut previous = None;
+        for program in &packet.programs[start..] {
+            let mut stream = program.stream.to_vec();
+            let mut queue = program.gq_stream.to_vec();
+            for entry in stream.iter_mut().chain(&mut queue) {
+                entry.seg = 0;
+            }
+            let window = [0, queue.len() as u32];
+            let normalized = plow_asset::program::Program {
+                stream: &stream,
+                gq_stream: &queue,
+                gq_seg_ofs: &window,
+                ..*program
+            };
+            let dependencies = plow_asset::splitk::dependencies(&normalized)?;
+            if previous.as_ref().is_some_and(|old| old != &dependencies) {
+                return Err("cuBLASLt ladder dependencies differ".to_string());
+            }
+            previous = Some(dependencies);
+        }
+        Ok(())
+    })
+    .map_err(RuntimeError::Rejected)?;
+    validate_decode_ladder_impl(blob, true)
+}
+
+fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool) -> Result<bool> {
     let splitk = blob
         .with_packet_view(plow_asset::splitk::validate)
         .map_err(RuntimeError::Rejected)?;
@@ -89,7 +146,8 @@ pub(super) fn validate_decode_ladder(blob: &DevBlob) -> Result<bool> {
     }
     // Optional placed, segmented and opaque programs retain the existing widest path.
     if programs.iter().any(|g| {
-        g.l2_domains != 0 || g.gq_seg_ofs.len() != 2 || g.check_coarse_single_segment().is_err()
+        g.l2_domains != 0
+            || (!segmented && (g.gq_seg_ofs.len() != 2 || g.check_coarse_single_segment().is_err()))
     }) {
         return Ok(false);
     }
@@ -146,30 +204,41 @@ pub(super) fn validate_decode_ladder(blob: &DevBlob) -> Result<bool> {
                     DevOp::RmsNorm
                     | DevOp::RowRms
                     | DevOp::HeadNormRope
+                    | DevOp::HeadNormRopeFp8
                     | DevOp::Gemm
                     | DevOp::GemmNorm
                     | DevOp::Gemv
+                    | DevOp::GemvFp8
                     | DevOp::GemvQkv
                     | DevOp::GemvGlu
+                    | DevOp::GemvGluFp8
                     | DevOp::GemmGlu
                     | DevOp::NormResidual
                     | DevOp::NormResidualNorm
                     | DevOp::AddNorm
                     | DevOp::Embed
                     | DevOp::FlashDecode
+                    | DevOp::FlashDecodeFp8
                     | DevOp::FlashMerge,
                 ) => {
                     if d.i[0] != g.t {
                         return Err(reject("instruction rows disagree with rung width"));
                     }
                     d.i[0] = 1;
-                    if d.op == DevOp::HeadNormRope as u16 && d.i[6] != 0 {
+                    if matches!(
+                        DevOp::from_u16(d.op),
+                        Some(DevOp::HeadNormRope | DevOp::HeadNormRopeFp8)
+                    ) && d.i[6] != 0
+                    {
                         if d.i[6] != g.t {
                             return Err(reject("KV writer uses a different slot count"));
                         }
                         d.i[6] = 1;
                     }
-                    if d.op == DevOp::FlashDecode as u16 {
+                    if matches!(
+                        DevOp::from_u16(d.op),
+                        Some(DevOp::FlashDecode | DevOp::FlashDecodeFp8)
+                    ) {
                         d.i[5] = 0;
                         d.fj[1] = 0;
                     } else if d.op == DevOp::FlashMerge as u16 {
@@ -202,11 +271,19 @@ pub(super) fn validate_decode_ladder(blob: &DevBlob) -> Result<bool> {
         return Err(reject("runtime inputs do not cover physical slots"));
     }
     let mut caches = std::collections::BTreeMap::new();
+    let mut scales = std::collections::BTreeMap::new();
     for d in &widest.insts {
-        if d.op != DevOp::FlashDecode as u16 {
+        if !matches!(
+            DevOp::from_u16(d.op),
+            Some(DevOp::FlashDecode | DevOp::FlashDecodeFp8)
+        ) {
             continue;
         }
-        if d.t[6] != TENSOR_NONE16 || d.t[7] != TENSOR_NONE16 || !matches!(d.i[6], 64 | 256 | 512) {
+        let fp8 = d.op == DevOp::FlashDecodeFp8 as u16;
+        if !matches!(d.i[6], 64 | 256 | 512)
+            || (fp8 && d.i[6] == 64)
+            || (!fp8 && (d.t[6] != TENSOR_NONE16 || d.t[7] != TENSOR_NONE16))
+        {
             return Ok(false);
         }
         let (heads, hd, stride, window, mask) = (d.i[2], d.i[6], d.i[3], d.i[4], d.i[7]);
@@ -224,9 +301,22 @@ pub(super) fn validate_decode_ladder(blob: &DevBlob) -> Result<bool> {
         let bytes = u64::from(widest.t)
             .checked_mul(u64::from(heads))
             .and_then(|n| n.checked_mul(u64::from(stride)))
-            .and_then(|n| n.checked_mul(u64::from(hd) * 2))
+            .and_then(|n| n.checked_mul(u64::from(hd) * if fp8 { 1 } else { 2 }))
             .ok_or_else(|| reject("KV extent overflow"))?;
         for (kind, &id) in d.t[3..5].iter().enumerate() {
+            let scale = fp8.then_some(d.t[6 + kind]);
+            if let Some(scale) = scale {
+                let scale_bytes = u64::from(widest.t) * u64::from(heads) * u64::from(stride) * 4;
+                if blob
+                    .tensors
+                    .get(scale as usize)
+                    .is_none_or(|t| t.bytes != scale_bytes || t.init.is_some())
+                    || [pos, kvlen, ids].contains(&(scale as usize))
+                    || scales.insert(scale, id).is_some()
+                {
+                    return Err(reject("invalid or aliased FP8 KV scale tensor"));
+                }
+            }
             let pair_mode = if hd == 64 && kind == 0 {
                 ROPE_PAIR_HALF
             } else {
@@ -237,13 +327,16 @@ pub(super) fn validate_decode_ladder(blob: &DevBlob) -> Result<bool> {
                 .get(id as usize)
                 .is_none_or(|t| t.bytes != bytes || t.init.is_some())
                 || caches
-                    .insert(id, (heads, hd, stride, mask, pair_mode))
+                    .insert(id, (heads, hd, stride, mask, pair_mode, scale))
                     .is_some()
                 || [pos, kvlen, ids].contains(&(id as usize))
             {
-                return Err(reject("invalid or aliased BF16 KV tensor extent"));
+                return Err(reject("invalid or aliased KV tensor extent"));
             }
         }
+    }
+    if scales.keys().any(|id| caches.contains_key(id)) {
+        return Err(reject("FP8 KV scale aliases cache data"));
     }
     if caches.is_empty() {
         return Ok(false);
@@ -251,7 +344,10 @@ pub(super) fn validate_decode_ladder(blob: &DevBlob) -> Result<bool> {
     for g in programs {
         let mut writes = std::collections::BTreeSet::new();
         for (ix, d) in g.insts.iter().enumerate() {
-            if d.op == DevOp::FlashDecode as u16 {
+            if matches!(
+                DevOp::from_u16(d.op),
+                Some(DevOp::FlashDecode | DevOp::FlashDecodeFp8)
+            ) {
                 if d.t[5] as usize != kvlen
                     || d.i[5] == 0
                     || d.t[3] == d.t[4]
@@ -294,7 +390,11 @@ pub(super) fn validate_decode_ladder(blob: &DevBlob) -> Result<bool> {
                     .iter()
                     .rev()
                     .find(|a| {
-                        a.op == DevOp::FlashDecode as u16 && a.t[0] == d.t[1] && a.t[1] == d.t[2]
+                        matches!(
+                            DevOp::from_u16(a.op),
+                            Some(DevOp::FlashDecode | DevOp::FlashDecodeFp8)
+                        ) && a.t[0] == d.t[1]
+                            && a.t[1] == d.t[2]
                     })
                     .ok_or_else(|| reject("merge has no matching attention producer"))?;
                 if [d.i[1], d.i[2], d.i[3]] != [producer.i[1], producer.i[5], producer.i[6]] {
@@ -313,16 +413,40 @@ pub(super) fn validate_decode_ladder(blob: &DevBlob) -> Result<bool> {
                 }
             }
             for (operand, &id) in d.t.iter().enumerate() {
-                let Some(&(heads, hd, stride, mask, pair_mode)) = caches.get(&id) else {
+                if let Some(&cache) = scales.get(&id) {
+                    let valid = match DevOp::from_u16(d.op) {
+                        Some(DevOp::HeadNormRopeFp8) => operand == 6 && d.t[0] == cache,
+                        Some(DevOp::FlashDecodeFp8) => {
+                            (operand == 6 || operand == 7) && d.t[operand - 3] == cache
+                        }
+                        _ => false,
+                    };
+                    if !valid {
+                        return Err(reject("FP8 KV scale has an incompatible reader or writer"));
+                    }
+                }
+                let Some(&(heads, hd, stride, mask, pair_mode, scale)) = caches.get(&id) else {
                     continue;
                 };
                 match DevOp::from_u16(d.op) {
-                    Some(DevOp::FlashDecode) if operand == 3 || operand == 4 => {
+                    Some(DevOp::FlashDecode | DevOp::FlashDecodeFp8)
+                        if operand == 3 || operand == 4 =>
+                    {
+                        if (d.op == DevOp::FlashDecodeFp8 as u16) != scale.is_some()
+                            || scale.is_some_and(|scale| d.t[operand + 3] != scale)
+                        {
+                            return Err(reject("KV reader encoding or scale changes across rungs"));
+                        }
                         if (d.i[2], d.i[6], d.i[3], d.i[7]) != (heads, hd, stride, mask) {
                             return Err(reject("KV reader addressing changes across rungs"));
                         }
                     }
-                    Some(DevOp::HeadNormRope) if operand == 0 => {
+                    Some(DevOp::HeadNormRope | DevOp::HeadNormRopeFp8) if operand == 0 => {
+                        if (d.op == DevOp::HeadNormRopeFp8 as u16) != scale.is_some()
+                            || scale.is_some_and(|scale| d.t[6] != scale || d.t[7] != TENSOR_NONE16)
+                        {
+                            return Err(reject("KV writer encoding or scale changes across rungs"));
+                        }
                         if d.i[6] != g.t
                             || d.i[3] != 0
                             || d.t[5] as usize != pos
@@ -333,7 +457,7 @@ pub(super) fn validate_decode_ladder(blob: &DevBlob) -> Result<bool> {
                                 "KV writer requires physical-slot position addressing",
                             ));
                         }
-                        if d.t[6] != TENSOR_NONE16 || d.t[7] != TENSOR_NONE16 {
+                        if scale.is_none() && (d.t[6] != TENSOR_NONE16 || d.t[7] != TENSOR_NONE16) {
                             return Ok(false);
                         }
                         if !writes.insert(id) {
@@ -357,6 +481,16 @@ impl DecodeRung {
         g: &crate::asset::devblob::DevProg,
         base: DevProgram,
     ) -> Result<Self> {
+        Self::upload_with_insts(be, g, base, &g.insts, &g.waits)
+    }
+
+    pub(super) fn upload_with_insts(
+        be: &CudaBackend,
+        g: &crate::asset::devblob::DevProg,
+        base: DevProgram,
+        insts: &[DevInst64],
+        waits: &[packet::dev::Wait],
+    ) -> Result<Self> {
         let upload = |bytes: &[u8]| -> Result<DeviceMem> {
             let mem = be.alloc(0, bytes.len().max(4) as u64)?;
             if !bytes.is_empty() {
@@ -365,17 +499,17 @@ impl DecodeRung {
             Ok(mem)
         };
         let tables = vec![
-            upload(pod_bytes(&g.insts))?,
+            upload(pod_bytes(insts))?,
             upload(pod_bytes(&g.stream))?,
             upload(pod_bytes(&g.stream_ofs))?,
             upload(pod_bytes(&g.stream_len))?,
-            upload(pod_bytes(&g.waits))?,
+            upload(pod_bytes(waits))?,
             upload(pod_bytes(&g.succs))?,
             upload(pod_bytes(&g.gq_stream))?,
             upload(pod_bytes(&g.gq_seg_ofs))?,
         ];
         let cursor_offset = (g.n_counter as usize * CTR_STRIDE as usize * 4).max(4);
-        let counter_bytes = cursor_offset + CTR_STRIDE as usize * 4;
+        let counter_bytes = cursor_offset + (g.gq_seg_ofs.len() - 1) * CTR_STRIDE as usize * 4;
         let counters = be.alloc(0, counter_bytes as u64)?;
         let kernarg = DevProgram {
             insts: tables[0].base,
@@ -391,6 +525,7 @@ impl DecodeRung {
             ..base
         };
         Ok(Self {
+            library: None,
             rows: g.t as usize,
             object: None,
             kernarg,

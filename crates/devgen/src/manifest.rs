@@ -1530,7 +1530,7 @@ fn object_inventory(progs: &[ProgramArms], arch: &str, packed_metadata: bool) ->
     let key_factor_wu = singleton_arm("KdaChunkWu");
     let key_factor_carry = singleton_arm("KdaChunkCarry");
     let key_factor_pair = !key_factor_wu.is_empty() && !key_factor_carry.is_empty();
-    json!({
+    let mut objects = json!({
         "packed_prefill": {
             "required": !packed_prefill.is_empty(),
             "topology": "packed",
@@ -1577,7 +1577,14 @@ fn object_inventory(progs: &[ProgramArms], arch: &str, packed_metadata: bool) ->
                 "carry_arms": keys(&key_factor_carry),
             },
         },
-    })
+    });
+    if packed_prefill.iter().any(|a| a.op == "FlashPrefillFp8") {
+        objects["packed_prefill"]["fp8_capability"] = json!({
+            "symbol": plow_asset::packed_prefill::FP8_CAPABILITY,
+            "value": plow_asset::packed_prefill::FP8_CAPABILITY_VALUE,
+        });
+    }
+    objects
 }
 
 /// Stable, model-neutral family labels for object partitioning and reports.

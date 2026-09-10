@@ -650,6 +650,11 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN)
             list(APPEND _cubin_rows
                 "${_vstem}_pfpackedseg|${_ksym_pfpackedseg}|_ax_packed_seg_fat|"
                 "${_vstem}_pfpackedgemm|${_ksym_pfpackedgemm}|_ax_packed_seg_gemm|")
+            if(PLOW_SM120_CUBIN_FP8KV)
+                list(APPEND _cubin_rows
+                    "${_vstem}_pfpackedseg_fp8kv|${_ksym_pfpackedseg}|_ax_packed_seg_fat|_ax_fp8kv_pf"
+                    "${_vstem}_pfpackedgemm_fp8kv|${_ksym_pfpackedgemm}|_ax_packed_seg_gemm|_ax_fp8kv_pf")
+            endif()
         endif()
 
         foreach(_row ${_cubin_rows})
@@ -659,6 +664,13 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN)
             list(GET _f 2 _a1)
             list(GET _f 3 _a2)
             set(_defs ${_cubin_base} ${${_vdefs_var}} ${${_a1}})
+            if(_varch STREQUAL "sm_90a" AND PLOW_CUBIN_GEMMA AND
+               ((PLOW_NV_W8A8 AND _a1 STREQUAL "_ax_seg_gemm") OR
+                (NOT PLOW_NV_W8A8 AND NOT PLOW_FP8_KV AND
+                 _a1 STREQUAL "_ax_packed_seg_gemm")))
+                # The 128-register cap spills Hopper GEMM accumulators.
+                list(APPEND _defs -DPLOW_NV_SEG_OCC1=1)
+            endif()
             if(_a2)
                 list(APPEND _defs ${${_a2}})
             endif()
@@ -1356,8 +1368,12 @@ if(PLOW_GFX950_HSACO)
         set(_hs_ax_mixed -DPLOW_MIXED_STEP=1 -DPLOW_BUCKET_DECODE=0
             -DPLOW_WG_WAVES=4 -DPLOW_GEMV_MM=4 -DGM_BM=64 -DGM_BN=128
             -DFA_DC=256 -DFA_DBUF=1)
+        set(_hs_ax_tokbatch -DPLOW_TOKEN_BATCH=1 -DPLOW_MIXED_STEP=1
+            -DPLOW_BUCKET_DECODE=0 -DPLOW_WG_WAVES=4 -DPLOW_GEMV_MM=4
+            -DGM_BM=256 -DGM_BN=128 -DFA_DC=256 -DFA_DBUF=1)
         list(APPEND _hs_rows
-            "interp_mixed|plow_interp_mixed_gfx942|_hs_ax_mixed|_hs_ax_none|512|1")
+            "interp_mixed|plow_interp_mixed_gfx942|_hs_ax_mixed|_hs_ax_none|512|1"
+            "interp_tokbatch|plow_interp_tokbatch_gfx942|_hs_ax_tokbatch|_hs_ax_none|512|1")
     endif()
     if(PLOW_HSACO_FP8)
         # MIXED-PRECISION OBJECTS, and the names do not say so. `interp_*_fp8` carries the fp8
@@ -1512,7 +1528,7 @@ if(PLOW_GFX950_HSACO)
             set(_gq "")
             set(_row_kind_extra "")
             set(_row_extra ${_hs_extra})
-            if(_a1 STREQUAL "_hs_ax_mixed")
+            if(_a1 STREQUAL "_hs_ax_mixed" OR _a1 STREQUAL "_hs_ax_tokbatch")
                 # Runtime-built schedules require the universal qualified object.
                 set(_row_extra "")
             endif()

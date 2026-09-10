@@ -52,6 +52,36 @@ type CUfunction = *mut c_void;
 type CUstream = *mut c_void;
 type CUevent = *mut c_void;
 
+#[repr(C)]
+#[derive(Default)]
+struct CUDA_MEMCPY3D {
+    src_x_in_bytes: usize,
+    src_y: usize,
+    src_z: usize,
+    src_lod: usize,
+    src_memory_type: i32,
+    src_host: *const c_void,
+    src_device: CUdeviceptr,
+    src_array: *mut c_void,
+    reserved0: *mut c_void,
+    src_pitch: usize,
+    src_height: usize,
+    dst_x_in_bytes: usize,
+    dst_y: usize,
+    dst_z: usize,
+    dst_lod: usize,
+    dst_memory_type: i32,
+    dst_host: *mut c_void,
+    dst_device: CUdeviceptr,
+    dst_array: *mut c_void,
+    reserved1: *mut c_void,
+    dst_pitch: usize,
+    dst_height: usize,
+    width_in_bytes: usize,
+    height: usize,
+    depth: usize,
+}
+
 /// `CUDA_ERROR_NOT_READY` — the query result meaning "still running".
 const ERROR_NOT_READY: CUresult = 600;
 
@@ -220,6 +250,8 @@ driver_api! {
     cuStreamSynchronize: fn(CUstream) -> CUresult,
     cuMemcpyHtoDAsync_v2: fn(CUdeviceptr, *const c_void, usize, CUstream) -> CUresult,
     cuMemcpyDtoHAsync_v2: fn(*mut c_void, CUdeviceptr, usize, CUstream) -> CUresult,
+    cuMemcpyDtoDAsync_v2: fn(CUdeviceptr, CUdeviceptr, usize, CUstream) -> CUresult,
+    cuMemcpy3DAsync_v2: fn(*const CUDA_MEMCPY3D, CUstream) -> CUresult,
     cuMemsetD8Async: fn(CUdeviceptr, u8, usize, CUstream) -> CUresult,
     cuEventCreate: fn(*mut CUevent, u32) -> CUresult,
     cuEventDestroy_v2: fn(CUevent) -> CUresult,
@@ -1397,6 +1429,59 @@ impl CudaBackend {
         )
     }
 
+    /// Both device ranges must remain mapped until `stream` completes the copy.
+    pub fn memcpy_dtod_async(
+        &self,
+        dst: u64,
+        src: u64,
+        bytes: u64,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        self.bind()?;
+        self.check(
+            // SAFETY: caller keeps both device ranges live through stream completion.
+            unsafe {
+                (self.api.cuMemcpyDtoDAsync_v2)(dst, src, bytes as usize, stream.raw as CUstream)
+            },
+            "cuMemcpyDtoDAsync",
+        )
+    }
+
+    /// Each `(base, pitch)` range must stay mapped through stream completion.
+    pub fn memcpy_dtod_pitched_async(
+        &self,
+        dst: (u64, u64),
+        src: (u64, u64),
+        row_bytes: u64,
+        rows: u32,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if row_bytes == 0 || rows == 0 {
+            return Ok(());
+        }
+        self.bind()?;
+        // Depth one avoids cuMemcpy2DAsync's cuMemAllocPitch restriction.
+        let copy = CUDA_MEMCPY3D {
+            src_memory_type: 2,
+            src_device: src.0,
+            src_pitch: src.1 as usize,
+            src_height: rows as usize,
+            dst_memory_type: 2,
+            dst_device: dst.0,
+            dst_pitch: dst.1 as usize,
+            dst_height: rows as usize,
+            width_in_bytes: row_bytes as usize,
+            height: rows as usize,
+            depth: 1,
+            ..Default::default()
+        };
+        self.check(
+            // SAFETY: the descriptor has the driver ABI; callers retain both ranges.
+            unsafe { (self.api.cuMemcpy3DAsync_v2)(&copy, stream.raw as CUstream) },
+            "cuMemcpy3DAsync",
+        )
+    }
+
     /// Async fill of `n` bytes on `stream` (counter/cursor re-arm without a
     /// synchronous submission stall). `dptr..dptr+n` inside a live allocation
     /// (caller contract, as [`Self::memset_d8`]).
@@ -1927,6 +2012,90 @@ impl Backend for CudaBackend {
 #[cfg(test)]
 mod tests {
     use super::is_cuda_fatal;
+
+    #[test]
+    #[ignore = "requires a CUDA GPU and real driver"]
+    fn pitched_snapshot_wrap_roundtrip_preserves_padding() -> crate::Result<()> {
+        use super::CudaBackend;
+        use crate::device::Backend;
+
+        let be = CudaBackend::new(0)?;
+        let stream = be.stream_create()?;
+        let (ring, window, heads, guard) = (2048usize, 1024usize, 16usize, 37usize);
+        for row_bytes in [4, 256, 512] {
+            let pitch = ring * row_bytes + guard;
+            let source: Vec<u8> = (0..guard + heads * pitch)
+                .map(|i| (i.wrapping_mul(31) ^ (i >> 9) ^ (i >> 17)) as u8)
+                .collect();
+            let src = be.alloc(0, source.len() as u64)?;
+            let dst = be.alloc(0, source.len() as u64)?;
+            be.upload(&src, 0, &source)?;
+            for boundary in [0usize, 32, 1024, 1056, 2048, 2080, 3072, 4096, 4128] {
+                let width = window.min(boundary);
+                let snap_pitch = width * row_bytes;
+                let mut expected = vec![0xa5; guard * 2 + heads * snap_pitch];
+                let mut restored = vec![0x5a; source.len()];
+                for head in 0..heads {
+                    for row in 0..width {
+                        let physical = (boundary - width + row) % ring;
+                        let s = guard + head * pitch + physical * row_bytes;
+                        let d = guard + head * snap_pitch + row * row_bytes;
+                        expected[d..d + row_bytes].copy_from_slice(&source[s..s + row_bytes]);
+                        restored[s..s + row_bytes].copy_from_slice(&source[s..s + row_bytes]);
+                    }
+                }
+                let snapshot = be.alloc(0, expected.len() as u64)?;
+                be.upload(&snapshot, 0, &vec![0xa5; expected.len()])?;
+                be.upload(&dst, 0, &vec![0x5a; source.len()])?;
+                // Pageable uploads may still be queued on the default stream.
+                be.synchronize()?;
+                let start = (boundary - width) % ring;
+                let first = width.min(ring - start);
+                for (physical, logical, rows) in [(start, 0, first), (0, first, width - first)] {
+                    let snapshot_range = (
+                        snapshot.base + (guard + logical * row_bytes) as u64,
+                        snap_pitch as u64,
+                    );
+                    be.memcpy_dtod_pitched_async(
+                        snapshot_range,
+                        (
+                            src.base + (guard + physical * row_bytes) as u64,
+                            pitch as u64,
+                        ),
+                        (rows * row_bytes) as u64,
+                        heads as u32,
+                        &stream,
+                    )?;
+                    be.memcpy_dtod_pitched_async(
+                        (
+                            dst.base + (guard + physical * row_bytes) as u64,
+                            pitch as u64,
+                        ),
+                        snapshot_range,
+                        (rows * row_bytes) as u64,
+                        heads as u32,
+                        &stream,
+                    )?;
+                }
+                be.stream_synchronize(&stream)?;
+                let mut actual = vec![0; expected.len()];
+                be.download(&snapshot, 0, &mut actual)?;
+                assert_eq!(
+                    actual.iter().zip(&expected).position(|(a, b)| a != b),
+                    None,
+                    "snapshot row_bytes={row_bytes} boundary={boundary}"
+                );
+                actual.resize(source.len(), 0);
+                be.download(&dst, 0, &mut actual)?;
+                assert_eq!(
+                    actual.iter().zip(&restored).position(|(a, b)| a != b),
+                    None,
+                    "restore row_bytes={row_bytes} boundary={boundary}"
+                );
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn fatal_classification_matches_the_driver_contract() {
