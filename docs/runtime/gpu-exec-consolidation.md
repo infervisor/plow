@@ -52,3 +52,33 @@ Its standalone result does not establish a serving gain; its production path
 was removed after both global-queue and static serving stalled. The previous
 GLM serving screen remains 33.40 output tokens/s versus the supplied H200
 reference of 273.67; the workloads differ in request count and parity is unmet.
+
+## Execution-module organization
+
+A follow-up extraction separates cold validation and cache ownership from the
+engine entry points:
+
+| Module | Responsibility |
+|---|---|
+| `exec/amd.rs` | HSA engine ownership, loading and dispatch |
+| `exec/amd_object.rs` | Object naming, opcode capabilities, geometry and packet pairing |
+| `exec/gpu.rs` | CUDA engine ownership, loading and dispatch |
+| `exec/gpu_prefix.rs` | KV mappings, prefix snapshots, attachment and publication |
+| Backend `*_tests.rs` files | Existing test suites, preserving module/test names |
+
+The existing public AMD object-selection functions/types remain re-exported.
+CUDA prefix methods remain direct `GpuEngine` methods. No forwarding traits,
+new allocation or locking were introduced. Stale module introductions claiming
+single-sequence/decode-only support were replaced with current responsibilities.
+
+AMD's engine file falls from 19,855 to 12,590 lines; CUDA's from 9,038 to 7,564.
+These are organizational changes, not measured inference speedups.
+
+Verification: 666 runtime tests passed, 29 ignored; the complete 695-entry test
+inventory is identical. CUDA/HSA compile checks pass. An offline Rust AST
+comparison covers all 602 original function/method definitions: signatures and
+bodies match after normalizing formatting and string literal spelling. Module
+visibility, imports and documentation are deliberately outside that comparison.
+
+The [Lean/compiled-asset audit](glm53-lean-kernel-audit.md) identifies the next
+performance experiments and the limits of the current verifier.
