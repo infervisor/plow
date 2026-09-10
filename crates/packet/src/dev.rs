@@ -635,7 +635,9 @@ pub enum DevOp {
     /// divides the live `kv_len` down to whatever granularity `len_max`/`Score` were emitted in
     /// (pool-granular under kpool). `t0=idx(i32) t1=Score(f32) t2=gHist(u32[7*256]) t3=gCtl(u32[3])
     /// t4=kv_len(i32)` · `i0=len_max i1=top_k i2=pool_size`. Host zeroes gHist/gCtl once; the kernel
-    /// leaves them clean for relaunch.
+    /// leaves them clean for relaunch. `i3=batch_row`; `i4=1` selects independent rows,
+    /// one workgroup per row (`row=i3+slice`), using LDS-only selection. This unpooled
+    /// mode leaves t2/t3 unused and pads short rows with -1; i4=0 keeps cooperative selection.
     IndexSelect = 59,
 
     /// LayerNorm WITH bias + mean-subtract over `feat` (`d_layernorm_bias`) — the DSA indexer key-norm

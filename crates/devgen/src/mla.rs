@@ -4067,6 +4067,20 @@ fn emit_glm_dsa_decode_select(
                 d.i[2] = ctx;
                 d.f[0] = (di as f32).powf(-0.5) * (hi as f32).powf(-0.5);
             });
+            if emit_config::active().glm_select_local && rows > 1 {
+                assert!(
+                    c.tp == 8 && b.n_cu() == 304 && matches!(rows, 2 | 4 | 8 | 16),
+                    "local GLM decode selection requires gfx942 TP8 with 2/4/8/16 rows"
+                );
+                return b.emit(DevOp::IndexSelect, (0..rows).collect(), &[c_sc], |d| {
+                    d.t[0] = n.iidx;
+                    d.t[1] = n.iscore;
+                    d.t[4] = n.kvlen;
+                    d.i[0] = ctx;
+                    d.i[1] = itk;
+                    d.i[4] = 1;
+                });
+            }
             // top-k SELECT -> n.iidx (ONE cooperative launch: grid-sync radix). Perf floor 2: emit on a
             // 32-CU slice, NOT all 256. The selector is grid-barrier CONTENTION-bound, not bandwidth-bound
             // (the score array is only ctx*4 B); cutting the co-resident WG count 256->32 drops the atomic
@@ -7366,14 +7380,12 @@ fn glm_emit_full(
         pb.set_moe_prefill_ep_degree(
             (crate::emit_is_amd() && emit_config::active().moe_prefill_ep).then_some(c.tp),
         );
-        // PLOW_L2_PLACE reaches the DECODE builder unconditionally (below). GLM's prefill
-        // program is uni-segment, so `Builder::finish` WOULD place it too — but the
-        // shipped prefill objects are built without -DPLOW_L2_PLACE_DISPATCH
-        // (build_gfx942.sh adds it to decode objects by default, to prefill objects only
-        // under PLOW_L2HIER_PF=1) and the loader refuses a placed program on an unbuilt
-        // object. PLOW_GLM_PLACE_PF=1 opts prefill placement in; pair it with objects
-        // from a PLOW_L2HIER_PF=1 build.
+        // Placed AMD prefill must retain the native-kernel segment boundaries and
+        // pair with objects built under PLOW_L2HIER_PF=1.
         if emit_config::active().glm_place_pf {
+            if crate::emit_is_amd() {
+                pb.deny_uniseg();
+            }
             pb.set_l2_placement(l2_layout);
         }
         pb.adopt_tensors(tensors.clone());

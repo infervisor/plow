@@ -729,6 +729,9 @@ extern "C" __device__ unsigned plow_gate_hier_1 = 1;
 #endif
 #if PLOW_GQ_BATCH == 1 && (!PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_INDEX_SELECT)
 extern "C" __device__ unsigned plow_dsa_decode_batch_arm = 1;
+#if defined(__gfx942__)
+extern "C" __device__ unsigned plow_dsa_select_local_arm = 1;
+#endif
 #endif
 /* Hoist the instruction fetch above the gate poll (see the probe at the poll). Default OFF. */
 #ifndef PLOW_INST_PF
@@ -4333,6 +4336,17 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_INDEX_SELECT
         case PLOW_DOP_INDEX_SELECT: {
             unsigned* lh = (unsigned*)sm->raw;
+#if defined(__gfx942__)
+            if (in->i[4] == 1u) {
+                const unsigned row = in->i[3] + slice;
+                d_index_select_pf<PLOW_DSA_IDX_ROW != 0>(
+                    (int*)TEN(0) + (size_t)row * in->i[1],
+                    (const float*)TEN(1) + (size_t)row * in->i[0],
+                    (const int*)TEN(4) + row, 1, in->i[1], in->i[0], 0, 1,
+                    lh, lh + 256);
+                break;
+            }
+#endif
             /* i[2]=pool_size: zero-means-1 guard, NOT a plain pass-through. Every emitter this
              * tree ships today writes i[2]==0 (the field didn't exist when those blobs were
              * built) — dividing by that directly would be a divide-by-zero fault on every

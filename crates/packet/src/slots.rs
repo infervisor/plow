@@ -194,7 +194,7 @@ const DOC: &[S] = &[
     S { op: DevOp::MoeRouterTopk, t: &["table", "logit", "", "bias"], i: &["", "n_exp", "k", "flags"], f: &["route_scale"], j: &[] },
     S { op: DevOp::MlaMergeFold, t: &["O", "Opart", "mlpart", "Wuv"], i: &["n_batch", "n_head", "V", "", "nsplit"], f: &[], j: &[] },
     S { op: DevOp::IndexScore, t: &["Score", "Qidx", "Kidx", "W", "kv_len"], i: &["n_batch", "index_heads", "kv_stride", "index_head_dim"], f: &["scale"], j: &[] },
-    S { op: DevOp::IndexSelect, t: &["idx", "Score", "gHist", "gCtl", "kv_len"], i: &["len_max", "top_k", "pool_size"], f: &[], j: &[] },
+    S { op: DevOp::IndexSelect, t: &["idx", "Score", "gHist", "gCtl", "kv_len"], i: &["len_max", "top_k", "pool_size", "batch_row", "local_rows"], f: &[], j: &[] },
     S { op: DevOp::IndexScorePf, t: &["Score", "Qidx", "Kidx", "W", "kv_len"], i: &["n_tok", "index_heads", "kv_stride", "index_head_dim"], f: &["scale"], j: &[] },
     S { op: DevOp::IndexSelectPf, t: &["idx", "Score", "kv_len"], i: &["n_tok", "top_k", "kv_stride", "pool_size"], f: &[], j: &[] },
     S { op: DevOp::IndexUnionPf, t: &["union", "umask", "idx", "kv_len"], i: &["n_tok", "top_k", "kv_stride", "cap"], f: &[], j: &[] },

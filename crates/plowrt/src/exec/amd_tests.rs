@@ -3054,6 +3054,80 @@ fn sparse_fp8_rejects_stale_objects_and_invalid_handles() {
 }
 
 #[test]
+fn local_dsa_selection_checks_rows_operands_and_object() {
+    let mut prog = segmented_prog(&[DevOp::IndexSelect], &[0]);
+    prog.t = 8;
+    let inst = &mut prog.insts[0];
+    inst.blocks = 8;
+    inst.t = [0, 1, 65535, 65535, 2, 65535, 65535, 65535];
+    inst.i = [81920, 2048, 0, 0, 1, 0, 0, 0];
+    let mut tensors: Vec<_> = [8 * 2048 * 4, 8 * 81920 * 4, 8 * 4]
+        .into_iter()
+        .enumerate()
+        .map(|(i, bytes)| crate::asset::devblob::DevTensor {
+            name: format!("act.{i}"),
+            bytes,
+            init: None,
+        })
+        .collect();
+    for (arch, tp8, dec_ix) in [
+        ("gfx942", true, 0),
+        ("gfx950", true, 0),
+        ("gfx942", false, 0),
+        ("gfx942", true, 1),
+    ] {
+        assert_eq!(
+            check_dsa_select_local(std::slice::from_ref(&prog), &tensors, dec_ix, arch, tp8)
+                .is_ok(),
+            arch == "gfx942" && tp8 && dec_ix == 0
+        );
+    }
+    for rows in [1, 2, 4, 8, 16, 32] {
+        prog.t = rows;
+        prog.insts[0].blocks = rows as u16;
+        assert_eq!(
+            check_dsa_select_local(std::slice::from_ref(&prog), &tensors, 0, "gfx942", true)
+                .is_ok(),
+            matches!(rows, 2 | 4 | 8)
+        );
+    }
+    prog.t = 8;
+    prog.insts[0].blocks = 8;
+    tensors[2].bytes -= 1;
+    assert!(
+        check_dsa_select_local(std::slice::from_ref(&prog), &tensors, 0, "gfx942", true).is_err()
+    );
+    tensors[2].bytes += 1;
+    for (slot, bad) in [(0, 2047), (1, 1024), (2, 2), (3, 1), (4, 2)] {
+        let good = prog.insts[0].i[slot];
+        prog.insts[0].i[slot] = bad;
+        assert!(
+            check_dsa_select_local(std::slice::from_ref(&prog), &tensors, 0, "gfx942", true)
+                .is_err()
+        );
+        prog.insts[0].i[slot] = good;
+    }
+    let requires = packet_decode_arm_requirements(&[prog]);
+    assert_eq!(requires, ["PLOW_DSA_SELECT_LOCAL=1"]);
+    assert!(check_decode_object(
+        &["plow_dsa_decode_batch_arm"],
+        Path::new("old"),
+        &requires,
+        false,
+        false
+    )
+    .is_err());
+    assert!(check_decode_object(
+        &["plow_dsa_select_local_arm"],
+        Path::new("new"),
+        &requires,
+        false,
+        false
+    )
+    .is_ok());
+}
+
+#[test]
 fn dsa_decode_batch_refuses_an_object_without_row_offsets() {
     let mut prog = segmented_prog(&[DevOp::IndexSelect], &[0]);
     assert!(

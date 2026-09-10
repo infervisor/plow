@@ -2496,7 +2496,7 @@ impl GpuEngine {
                     ));
                 }
                 if blob.progs.iter().flat_map(|p| &p.insts).any(|d| {
-                    (d.op == DevOp::IndexSelect as u16 && d.i[3] != 0)
+                    (d.op == DevOp::IndexSelect as u16 && (d.i[3] != 0 || d.i[4] != 0))
                         || (matches!(
                             DevOp::from_u16(d.op),
                             Some(DevOp::FlashMlaDecodeFp8 | DevOp::FlashMlaPrefillFp8)

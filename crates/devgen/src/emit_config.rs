@@ -579,6 +579,10 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_INDEX_TP", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_index_tp: bool,
 
+    /// Select GLM decode rows with independent single-workgroup radix selection.
+    #[arg(long, env = "PLOW_GLM_SELECT_LOCAL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_select_local: bool,
+
     /// Use qualified gfx942 hipBLASLt assembly for large GLM prefill projections.
     #[arg(long, env = "PLOW_GLM_GEMM_LT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_gemm_lt: bool,
@@ -1047,6 +1051,7 @@ impl EmitConfig {
             glm_fp8_kv: env_bool("PLOW_GLM_FP8_KV"),
             glm_moe_aiter: env_bool("PLOW_GLM_MOE_AITER"),
             glm_index_tp: env_bool("PLOW_GLM_INDEX_TP"),
+            glm_select_local: env_bool("PLOW_GLM_SELECT_LOCAL"),
             glm_gemm_lt: env_bool("PLOW_GLM_GEMM_LT"),
             glm_gemv_wg: env_u32("PLOW_GLM_GEMV_WG"),
             glm_ofold: env_bool("PLOW_GLM_OFOLD"),

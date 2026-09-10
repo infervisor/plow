@@ -479,7 +479,46 @@ fn glm_sparse_fp8_cache_writer_and_attention_operands() {
 }
 
 #[test]
+fn glm_dsa_local_selection_keeps_one_completion_for_independent_rows() {
+    let _g = crate::test_env::env_guard();
+    let _env = crate::test_env::EnvScope::set(&[("PLOW_GLM_SELECT_LOCAL", "1")]);
+    let mut c = glm_ref_cfg();
+    c.tp = 8;
+    c.indexer_full[3] = true;
+    let ctx = 81920;
+    let mut declarations = Builder::new(304);
+    let n = declare_glm_rows_batched(&mut declarations, &c, ctx, &[3], 8192, 16, MoeEnc::Fp8Blk);
+    let tensors = declarations.tensors();
+    for rows in [1, 2, 4, 8, 16] {
+        let mut b = Builder::new(304);
+        b.adopt_tensors(tensors.clone());
+        let ready = b.emit(DevOp::Nop, vec![0], &[], |_| {});
+        let complete = emit_glm_dsa_decode_select(
+            &mut b, &c, &n, &n.lw[0], 0, ctx, rows, 16, MoeEnc::Fp8Blk,
+            &(0..304).collect::<Vec<_>>(), c.eps as f32, c.q_lora, c.hidden,
+            ready, ready, &(0..32).collect::<Vec<_>>(), &[0],
+        );
+        let p = b.finish();
+        let selects: Vec<_> = p.insts.iter().enumerate()
+            .filter(|(_, d)| d.op == DevOp::IndexSelect as u16).collect();
+        assert_eq!(selects.len(), 1);
+        let (ix, d) = selects[0];
+        assert_eq!(complete as usize, ix);
+        assert_eq!((d.i[3], d.i[4]), (0, u32::from(rows > 1)));
+        assert_eq!(u32::from(d.blocks), if rows == 1 { 32 } else { rows });
+        if rows > 1 {
+            assert_eq!([d.t[2], d.t[3]], [TENSOR_NONE; 2]);
+        }
+        let mut slices: Vec<_> = p.stream.iter().filter(|e| e.inst as usize == ix)
+            .map(|e| e.slice).collect();
+        slices.sort_unstable();
+        assert_eq!(slices, (0..u32::from(d.blocks)).collect::<Vec<_>>());
+    }
+}
+
+#[test]
 fn glm_dsa_decode_batch_strides_producers_and_serializes_selection() {
+    let _g = crate::test_env::env_guard();
     let mut c = glm_ref_cfg();
     c.indexer_full[3] = true;
     let ctx = 81920;
@@ -1566,4 +1605,79 @@ fn glm53_program_assembly_keeps_every_tensor_handle_in_the_final_table() {
             );
         }
     }
+}
+
+#[test]
+fn glm_placed_prefill_preserves_native_segment_boundaries() {
+    let _guard = crate::test_env::env_guard();
+    let _target = crate::EmitAmdGuard::set(true);
+    let _env = crate::test_env::EnvScope::set(&[
+        ("PLOW_MLA_PREFILL", "full:128"),
+        ("PLOW_GLM_PLACE_PF", "1"),
+        ("PLOW_GLM_MOE_AITER", "1"),
+        ("PLOW_EMIT_PACKED_PREFILL", "0"),
+        ("PLOW_UNISEG", "0"),
+    ]);
+    let dir = std::env::temp_dir().join(format!("plow-glm-placed-prefill-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = serde_json::json!({
+        "model_type": "glm_moe_dsa", "num_hidden_layers": 4,
+        "hidden_size": 6144, "num_attention_heads": 64,
+        "kv_lora_rank": 512, "q_lora_rank": 2048,
+        "qk_nope_head_dim": 192, "qk_rope_head_dim": 64, "v_head_dim": 256,
+        "vocab_size": 128, "rms_norm_eps": 1e-5,
+        "n_routed_experts": 256, "num_experts_per_tok": 8,
+        "moe_intermediate_size": 2048, "intermediate_size": 12288,
+        "first_k_dense_replace": 3, "routed_scaling_factor": 2.5,
+        "rope_theta": 8000000.0
+    });
+    std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+    let verify: crate::VerifyHook = Box::new(|model| {
+        let prefill = &model.progs[0];
+        assert_eq!(prefill.l2_domains, 8);
+        let native = prefill
+            .insts
+            .iter()
+            .position(|d| d.op == DevOp::MoeAiterFp8Pf as u16)
+            .unwrap();
+        let segment = prefill
+            .stream
+            .iter()
+            .find(|e| e.inst as usize == native)
+            .unwrap()
+            .seg;
+        assert!(segment > 0);
+        for entries in [&prefill.stream, &prefill.gq_stream] {
+            assert!(entries
+                .iter()
+                .filter(|e| e.seg == segment)
+                .all(|e| e.inst as usize == native));
+            assert!(entries.iter().any(|e| e.seg > segment));
+        }
+        let segments = prefill
+            .stream
+            .iter()
+            .map(|e| usize::from(e.seg) + 1)
+            .max()
+            .unwrap();
+        assert_eq!(prefill.gq_seg_ofs.len(), segments * 8 + 1);
+        Ok(crate::LeanReport::skipped("structural regression test"))
+    });
+    glm_emit_full(
+        &dir,
+        512,
+        dir.join("model.pkt").to_str().unwrap(),
+        304,
+        8,
+        true,
+        true,
+        "gfx942",
+        Some(packet::devbuild::L2Layout {
+            sms: 38,
+            domains: 8,
+            map: packet::devbuild::L2Map::RoundRobin,
+        }),
+        Some(&verify),
+    );
+    std::fs::remove_dir_all(dir).unwrap();
 }

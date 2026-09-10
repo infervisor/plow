@@ -37,7 +37,7 @@ pub(super) use object::elf_symbol_names;
 use object::{
     build_requires, check_attn_res_f32mix_symbols, check_compiled_opcode_marker_set,
     check_compiled_opcode_markers, check_dec_stage_capacity, check_decode_object,
-    check_dsa_decode_batch, check_dsa_pf_arm, check_gate_hier_object, check_gemv_capacity,
+    check_dsa_decode_batch, check_dsa_select_local, check_dsa_pf_arm, check_gate_hier_object, check_gemv_capacity,
     check_k3_arms, check_kda_carry_regstate_symbols, check_kda_chunk, check_kda_conv_step_db,
     check_kda_intra_wave_items_symbols, check_kv_encoding, check_materialized_residual_input,
     check_mla_nope_arm, check_mla_v2_sv_raw_symbols, check_moe_ep_symbols, check_moe_gemma_arms,
@@ -6063,6 +6063,8 @@ impl AmdEngine {
         }
         let use_sparse_mla = crate::config::RuntimeConfig::get().amd.mla_pf_aiter;
         check_sparse_fp8_packet(&blob.progs, &blob.tensors, &arch)?;
+        check_dsa_select_local(&blob.progs, &blob.tensors, dec_ix, &arch,
+                               tp.is_some_and(|t| t.n_gpu == 8))?;
         if use_sparse_mla && arch != "gfx942" {
             return Err(RuntimeError::Device(
                 "sparse AITER MLA requires gfx942".into(),

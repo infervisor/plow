@@ -478,6 +478,7 @@ pub(super) fn check_materialized_residual_input(
 pub(super) const XR_TAGGED_SYM: &str = "plow_xr_tagged_1";
 
 pub(super) const DECODE_ARM_MARKERS: &[(&str, &[&str])] = &[
+    ("PLOW_DSA_SELECT_LOCAL", &["plow_dsa_select_local_arm"]),
     ("PLOW_KDA_CONV_STEP_DB", &["plow_kda_conv_step_db_arm"]),
     ("PLOW_MOE_PF_ATOMIC", &["plow_moe_pf_atomic_arm"]),
     ("PLOW_MOE_PF_DET", &["plow_moe_pf_det_arm"]),
@@ -837,6 +838,9 @@ pub(super) fn build_requires(blob_path: &Path) -> Result<Option<Vec<String>>> {
 pub(super) fn packet_decode_arm_requirements(progs: &[DevProg]) -> Vec<String> {
     let insts = || progs.iter().flat_map(|p| &p.insts);
     let mut requires = Vec::new();
+    if insts().any(|inst| inst.op == DevOp::IndexSelect as u16 && inst.i[4] == 1) {
+        requires.push("PLOW_DSA_SELECT_LOCAL=1".to_owned());
+    }
     if insts().any(|inst| inst.op == DevOp::KdaConvStateStepG as u16) {
         requires.push("PLOW_KDA_CONV_STEP_DB=1".to_owned());
     }
@@ -1783,7 +1787,7 @@ pub(super) fn check_dsa_decode_batch(
     cdna3: bool,
 ) -> Result<()> {
     if progs.iter().flat_map(|p| &p.insts).any(|d| {
-        (d.op == DevOp::IndexSelect as u16 && d.i[3] != 0)
+        (d.op == DevOp::IndexSelect as u16 && (d.i[3] != 0 || d.i[4] != 0))
             || (cdna3 && d.op == DevOp::IndexScore as u16)
     }) && !syms.contains(&"plow_dsa_decode_batch_arm")
     {
@@ -1791,6 +1795,56 @@ pub(super) fn check_dsa_decode_batch(
             "{} lacks qualified DSA score/selection with PLOW_GQ_BATCH=1; rebuild the decode object",
             path.display()
         )));
+    }
+    Ok(())
+}
+
+pub(super) fn check_dsa_select_local(
+    progs: &[DevProg],
+    tensors: &[crate::asset::devblob::DevTensor],
+    dec_ix: usize,
+    arch: &str,
+    tp8: bool,
+) -> Result<()> {
+    for (program, p) in progs.iter().enumerate() {
+        for d in p
+            .insts
+            .iter()
+            .filter(|d| d.op == DevOp::IndexSelect as u16 && d.i[4] != 0)
+        {
+            let err = || {
+                RuntimeError::Device(
+                "local DSA selection requires unpacked gfx942 TP8 decode rows 2/4/8/16, unpooled top2048 and row-sized operands".into())
+            };
+            if arch != "gfx942"
+                || !tp8
+                || program < dec_ix
+                || p.packed_prefill_only
+                || !matches!(p.t, 2 | 4 | 8 | 16)
+                || u32::from(d.blocks) != p.t
+                || !(2048..=131072).contains(&d.i[0])
+                || d.i[1..] != [2048, 0, 0, 1, 0, 0, 0]
+                || d.fj != [0; 3]
+                || [2, 3, 5, 6, 7]
+                    .iter()
+                    .any(|&i| d.t[i] != packet::dev::TENSOR_NONE16)
+            {
+                return Err(err());
+            }
+            let handles = [d.t[0], d.t[1], d.t[4]];
+            if handles.iter().collect::<BTreeSet<_>>().len() != 3 {
+                return Err(err());
+            }
+            for (handle, bytes) in handles.into_iter().zip([
+                u64::from(p.t) * 2048 * 4,
+                u64::from(p.t) * u64::from(d.i[0]) * 4,
+                u64::from(p.t) * 4,
+            ]) {
+                if tensors.get(handle as usize).is_none_or(|t| t.bytes < bytes) {
+                    return Err(err());
+                }
+            }
+        }
     }
     Ok(())
 }

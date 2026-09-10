@@ -79,3 +79,50 @@ the failure to the candidate integration; the exact cause is unresolved.
 The experimental emitter, ISA and interpreter changes were removed. Only this
 benchmark and its evidence are retained. No parallel-selection serving speedup
 is claimed, and no assembly change is justified by these measurements.
+
+## Local workgroup selection
+
+`--glm-select-local=true` (`PLOW_GLM_SELECT_LOCAL=1`) opts gfx942 TP8 decode
+rows 2/4/8/16 into the existing prefill radix selector, rebased to one sequence
+per workgroup. Row 1 and pooled selection retain the cooperative path. The
+selector stays inside the interpreter, preserves per-XCD placement, and adds
+no raw launches or cross-workgroup barriers. Every loaded decode tier must
+advertise `plow_dsa_select_local_arm`; incompatible packets and objects are
+rejected before execution.
+
+Benchmark mode 3 passes all 132 synthetic and seven captured cases, including
+short rows padded with -1, scratch reuse and permuted logical slices. Captured
+B8 median time falls from 325.459 to 184.848 microseconds (43.2%). This compares
+complete batches outside the interpreter; it does not establish a serving gain.
+See [local selection evidence](mi300x-local.json).
+
+The full model completed 18/18 retrieval cases at concurrency 8, including
+partially occupied decode rungs. The matched on-then-off 20-request serving screen
+completed without failures and with identical input/output lengths:
+
+| Metric | Cooperative | Local workgroup | Change |
+|---|---:|---:|---:|
+| Output throughput, tok/s | 31.346 | 33.013 | +5.32% |
+| Mean TPOT, ms | 195.677 | 180.850 | -7.58% |
+| P99 TPOT, ms | 248.822 | 232.547 | -6.54% |
+| Median ITL, ms | 117.715 | 107.200 | -8.93% |
+
+Both arms passed all 18 retrieval cases. Only 3/20 random generated texts match
+exactly; selected-index ordering can change downstream accumulation, so broader
+quality equivalence remains unqualified. This is one matched pair, without a
+repeat or confidence interval; it is not the 100-request H200 comparison. The
+option remains off by default.
+
+## Per-XCD defaults and prefill pairing
+
+Per-XCD packet queues already default on for gfx942/gfx950 decode. The GLM TP8
+run confirms eight domains and an active hierarchical gate on every rank.
+These device-side queues are distinct from separate HSA submission queues.
+
+GLM prefill placement remains opt-in (`--glm-place-pf=true`), paired with
+`PLOW_L2HIER_PF=1` gfx942 prefill objects. Its emitter now preserves ordered
+native-kernel segments when placement is enabled. Previously placement collapsed
+those segments, making the native routes invalid. A full-emitter regression test
+checks native MoE isolation; the full GLM packet preserves all 1,784 segment
+descriptors and instruction operands, with decode unchanged. GPU qualification
+of placed prefill is pending before changing that default.

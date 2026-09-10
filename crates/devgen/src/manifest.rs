@@ -309,6 +309,7 @@ struct Shapes {
     /// was trained sparse: no trap, no NaN, a fluent answer to a different question.
     glm_dsa_pf: bool,
     dsa_decode_batch: bool,
+    dsa_select_local: bool,
     mla_sparse_fp8: bool,
     /// Any `FlashMlaPrefill` (op 51) with `i[3]` bit 31 — a NoPE (zero-rope) MLA, which the
     /// four-wave V2 kernel can only run if it carries the `<512, 0>` instantiation
@@ -513,7 +514,8 @@ fn shapes(m: &Model) -> Shapes {
                     }
                 }
                 DevOp::IndexSelect => {
-                    s.dsa_decode_batch |= inst.i[3] != 0;
+                    s.dsa_decode_batch |= inst.i[3] != 0 || inst.i[4] != 0;
+                    s.dsa_select_local |= inst.i[4] == 1;
                 }
                 DevOp::FlashMlaPrefillFp8 => {
                     s.mla_sparse_fp8 |= inst.j[0] != 0;
@@ -824,6 +826,7 @@ fn encoding_features(f: &mut Map<String, Value>, s: &Shapes) {
     f.insert("glm_ofold".into(), json!(s.glm_ofold));
     f.insert("glm_dsa_pf".into(), json!(s.glm_dsa_pf));
     f.insert("dsa_decode_batch".into(), json!(s.dsa_decode_batch));
+    f.insert("dsa_select_local".into(), json!(s.dsa_select_local));
     f.insert("mla_sparse_fp8".into(), json!(s.mla_sparse_fp8));
     f.insert("mla_pf_nope".into(), json!(s.mla_pf_nope));
     f.insert("glm_fuse_rope".into(), json!(s.glm_fuse_rope));
@@ -1213,6 +1216,9 @@ fn backend_amd(
     // enforces both.
     if on("glm_ofold") {
         req.push("PLOW_GLM_OFOLD=1".into());
+    }
+    if on("dsa_select_local") {
+        req.push("PLOW_DSA_SELECT_LOCAL=1".into());
     }
     if on("dsa_decode_batch") {
         req.push("PLOW_DSA_DECODE_BATCH=1".into());
@@ -3020,9 +3026,10 @@ mod tests {
 
     #[test]
     fn dsa_decode_batch_requires_a_row_aware_object() {
-        for row in [0, 1, 7] {
+        for (row, local) in [(0, 0), (1, 0), (7, 0), (0, 1)] {
             let mut d = inst(DevOp::IndexSelect, [0; 8]);
             d.i[3] = row;
+            d.i[4] = local;
             let m = Model {
                 n_cu: 256,
                 target: 0,
@@ -3036,7 +3043,8 @@ mod tests {
             let req = manifest["backends"]["gfx942"]["requires"]
                 .as_array()
                 .unwrap();
-            assert_eq!(req.iter().any(|r| r == "PLOW_DSA_DECODE_BATCH=1"), row != 0);
+            assert_eq!(req.iter().any(|r| r == "PLOW_DSA_DECODE_BATCH=1"), row != 0 || local != 0);
+            assert_eq!(req.iter().any(|r| r == "PLOW_DSA_SELECT_LOCAL=1"), local != 0);
         }
     }
 

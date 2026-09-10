@@ -27,9 +27,13 @@ void select_rows(int* idx, const float* scores, const int* lengths,
                  unsigned* hist, unsigned* ctl, unsigned rows, unsigned groups,
                  unsigned mode, unsigned selected_row, bool permute) {
 #if defined(__HIP_DEVICE_COMPILE__)
-    __shared__ unsigned scratch[259];
+    __shared__ unsigned scratch[260];
     const unsigned logical = permute ? (blockIdx.x * 13u) % gridDim.x : blockIdx.x;
-    if (mode == 2) {
+    if (mode == 3) {
+        d_index_select_pf<true>(idx + size_t(logical) * TOPK,
+            scores + size_t(logical) * CTX, lengths + logical, 1, TOPK, CTX,
+            0, 1, scratch, scratch + 256);
+    } else if (mode == 2) {
         const unsigned row = logical / groups;
         d_index_select_coop(idx, scores, CTX, TOPK, hist + row * HIST, ctl + row * CTL,
                             logical % groups, groups, scratch, scratch + 256, lengths, 1, row);
@@ -73,7 +77,7 @@ struct Buffers {
             for (unsigned row = 0; row < rows; ++row)
                 select_rows<<<groups, 512>>>(idx, scores, lengths, hist, ctl, rows, groups, mode, row, permute);
         } else {
-            select_rows<<<mode == 2 ? groups * rows : groups, 512>>>(
+            select_rows<<<mode >= 2 ? groups * rows : groups, 512>>>(
                 idx, scores, lengths, hist, ctl, rows, groups, mode, 0, permute);
         }
         check(hipGetLastError());
@@ -110,7 +114,8 @@ static void verify(Buffers& b, const std::vector<std::vector<int>>& expected,
             std::vector<int> selected(at, at + expected[row].size());
             std::sort(selected.begin(), selected.end());
             if (selected != expected[row] ||
-                !std::all_of(at + expected[row].size(), at + TOPK, [](int x) { return x == POISON; })) {
+                !std::all_of(at + expected[row].size(), at + TOPK,
+                             [mode](int x) { return x == (mode == 3 ? -1 : POISON); })) {
                 std::fprintf(stderr, "selection mismatch mode=%u groups=%u row=%u repeat=%u\n", mode, groups, row, repeat);
                 std::exit(1);
             }
@@ -131,7 +136,7 @@ static void timing(Buffers& b, unsigned mode, unsigned groups) {
                 select_rows<<<groups, 512, 0, stream>>>(b.idx, b.scores, b.lengths,
                     b.hist, b.ctl, b.rows, groups, mode, row, false);
         } else {
-            select_rows<<<mode == 2 ? b.rows * groups : groups, 512, 0, stream>>>(
+            select_rows<<<mode >= 2 ? b.rows * groups : groups, 512, 0, stream>>>(
                 b.idx, b.scores, b.lengths, b.hist, b.ctl, b.rows, groups, mode, 0, false);
         }
     }
@@ -188,9 +193,11 @@ static void run(unsigned rows, unsigned pattern, const char* capture = nullptr, 
         }
     }
     Buffers b(scores, lengths);
-    for (unsigned mode = 0; mode < 3; ++mode) {
-        for (unsigned groups : {4u, 8u, 16u, 32u}) {
-            if ((mode != 2 && groups != 32) || (mode == 2 && groups * rows > 304)) continue;
+    for (unsigned mode = 0; mode < 4; ++mode) {
+        for (unsigned groups : {1u, 4u, 8u, 16u, 32u}) {
+            if ((mode < 2 && groups != 32) ||
+                (mode == 2 && (groups == 1 || groups * rows > 304)) ||
+                (mode == 3 && groups != 1)) continue;
             verify(b, expected, mode, groups);
             std::printf("%s{\"rows\":%u,\"pattern\":%u,\"capture\":%s,\"mode\":%u,\"groups_per_row\":%u,\"passed\":true,\"us\":",
                         first ? "" : ",\n", rows, pattern, capture ? "true" : "false", mode, groups);
