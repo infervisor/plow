@@ -1,0 +1,76 @@
+{
+  "packet_sha256": "8b3fd226e0500ff159f8a3249ea691e0b4824b91faee5594ec8cb7a8170c0751",
+  "raw_sha256": "8e582b9d86ad6839d7224ab5453f0c67f6d68ad1f76dc344dd6622de4e087464",
+  "settings": {
+    "batch": 16,
+    "chunk": 4096,
+    "budget": 4096,
+    "context": 20480,
+    "cache": false,
+    "qk_unroll": 32
+  },
+  "results": [
+    {
+      "schema_version": 2,
+      "label": "plow-native-b16-pf4k-qku32",
+      "model": "checkpoint",
+      "manifest": null,
+      "warmups_per_case": 0,
+      "input": 1024,
+      "requested_cached_prefix_tokens": 0,
+      "cached_tokens": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0
+      },
+      "output": 128,
+      "concurrency": 128,
+      "repeat": 0,
+      "elapsed_s": 30.538013452001906,
+      "output_tok_s": 536.5116504959151,
+      "request_s": 4.191497269499337,
+      "ttft_ms": 13762.586013501277,
+      "latency_ms": {
+        "p50": 17045.437647000654,
+        "p95": 30503.98479685282,
+        "p99": 30511.180798432833
+      },
+      "tpot_ms": {
+        "p50": 23.76659433462833,
+        "p95": 27.739430440528025,
+        "p99": 27.96665100496621
+      }
+    },
+    {
+      "schema_version": 2,
+      "label": "plow-native-b16-pf4k-qku32",
+      "model": "checkpoint",
+      "manifest": null,
+      "warmups_per_case": 0,
+      "input": 16384,
+      "requested_cached_prefix_tokens": 0,
+      "cached_tokens": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0
+      },
+      "output": 128,
+      "concurrency": 128,
+      "repeat": 0,
+      "elapsed_s": 168.9129908360046,
+      "output_tok_s": 96.99668402596109,
+      "request_s": 0.757786593952821,
+      "ttft_ms": 82729.42898200199,
+      "latency_ms": {
+        "p50": 86807.70636200032,
+        "p95": 168735.09659655247,
+        "p99": 168770.12537377115
+      },
+      "tpot_ms": {
+        "p50": 31.446242724437823,
+        "p95": 39.64477487440211,
+        "p99": 124.8442190928281
+      }
+    }
+  ]
+}

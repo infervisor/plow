@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include "dev_isa.h"
@@ -27,6 +28,7 @@ using bf16 = __nv_bfloat16;
     std::fprintf(stderr, "%s: %s\n", #call, text); std::exit(2); } } while (0)
 
 static const char* interpreter_path = nullptr;
+static const char* snapshot_path = nullptr;
 static bool lean_hd512 = false;
 
 #ifndef PLOW_TEST_FA_ROWS
@@ -169,6 +171,14 @@ template<int HD, int BKV> static bool check(unsigned kv_heads, unsigned stride,
     CK(cudaDeviceSynchronize());
     std::vector<bf16> got(q.size());
     CK(cudaMemcpy(got.data(), out, got.size() * sizeof(bf16), cudaMemcpyDeviceToHost));
+    if (snapshot_path) {
+        const std::string path = std::string(snapshot_path) + "." + std::to_string(HD) +
+                                 "." + std::to_string(tma) + ".bf16";
+        FILE* file = std::fopen(path.c_str(), "wb");
+        if (!file || std::fwrite(got.data(), sizeof(bf16), got.size(), file) != got.size())
+            std::exit(2);
+        if (std::fclose(file)) std::exit(2);
+    }
     cudaEvent_t start, stop;
     CK(cudaEventCreate(&start)); CK(cudaEventCreate(&stop));
     std::vector<float> samples;
@@ -255,6 +265,7 @@ int main(int argc, char** argv) {
             blocks = unsigned(value);
         }
         else if (std::strcmp(argv[i], "--interpreter") == 0 && i + 1 < argc) interpreter_path = argv[++i];
+        else if (std::strcmp(argv[i], "--snapshot") == 0 && i + 1 < argc) snapshot_path = argv[++i];
         else return 2;
     }
     if (lean_hd512 && !interpreter_path) return 2;

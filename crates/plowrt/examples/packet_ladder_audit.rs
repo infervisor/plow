@@ -1,4 +1,4 @@
-use packet::dev::DevOp;
+use packet::dev::{DevInst64, DevOp, StreamEnt};
 use plow_asset::segment_roles::{self, SegmentRoles};
 use plowrt::asset::devblob::DevBlob;
 use serde_json::json;
@@ -6,6 +6,81 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,
 };
+
+fn validate_queue_work(
+    insts: &[DevInst64],
+    stream: &[StreamEnt],
+    queue: &[StreamEnt],
+) -> Result<(), String> {
+    let key = |e: &StreamEnt| {
+        (
+            e.inst, e.slice, e.wait_ofs, e.succ_ofs, e.wait_len, e.succ_len, e.flags, e.seg,
+        )
+    };
+    let mut scheduled: Vec<_> = stream.iter().map(key).collect();
+    let mut queued: Vec<_> = queue.iter().map(key).collect();
+    scheduled.sort_unstable();
+    queued.sort_unstable();
+    if scheduled != queued {
+        return Err("queue differs from scheduled work or dependencies".into());
+    }
+    let mut slices = vec![BTreeSet::new(); insts.len()];
+    for entry in queue {
+        let inst = insts
+            .get(entry.inst as usize)
+            .ok_or("queue instruction out of range")?;
+        if entry.slice >= u32::from(inst.blocks) {
+            return Err(format!("PC {}: queue slice out of range", entry.inst));
+        }
+        if !slices[entry.inst as usize].insert(entry.slice) {
+            return Err(format!("PC {}: duplicate queue slice", entry.inst));
+        }
+    }
+    for (pc, inst) in insts.iter().enumerate() {
+        if inst.blocks == 0 || slices[pc].len() != usize::from(inst.blocks) {
+            return Err(format!("PC {pc}: incomplete queue slice coverage"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn queue_requires_all_slices_and_preserves_dependencies() {
+        let insts = [DevInst64 {
+            blocks: 2,
+            ..Default::default()
+        }];
+        let stream = [
+            StreamEnt::default(),
+            StreamEnt {
+                slice: 1,
+                ..Default::default()
+            },
+        ];
+        assert!(validate_queue_work(&insts, &stream, &[stream[1], stream[0]]).is_ok());
+        assert!(validate_queue_work(&insts, &stream[..1], &stream[..1])
+            .unwrap_err()
+            .contains("incomplete"));
+        let duplicate = [stream[0], stream[0]];
+        assert!(validate_queue_work(&insts, &duplicate, &duplicate)
+            .unwrap_err()
+            .contains("duplicate"));
+        let mut changed = stream;
+        changed[1].slice = 2;
+        assert!(validate_queue_work(&insts, &changed, &changed)
+            .unwrap_err()
+            .contains("out of range"));
+        changed = stream;
+        changed[1].wait_len = 1;
+        assert!(validate_queue_work(&insts, &stream, &changed)
+            .unwrap_err()
+            .contains("dependencies"));
+    }
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args_os().skip(1);
@@ -35,19 +110,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             return Err(format!("program {index}: invalid queue window bounds").into());
         }
-        let mut covered = vec![false; p.insts.len()];
-        for entry in &p.gq_stream {
-            let slot = covered
-                .get_mut(entry.inst as usize)
-                .ok_or_else(|| format!("program {index}: queue instruction out of range"))?;
-            *slot = true;
-        }
+        validate_queue_work(&p.insts, &p.stream, &p.gq_stream)
+            .map_err(|e| format!("program {index}: {e}"))?;
         for (pc, inst) in p.insts.iter().enumerate() {
             if DevOp::from_u16(inst.op).is_none() {
                 return Err(format!("program {index} PC {pc}: unknown opcode {}", inst.op).into());
-            }
-            if !covered[pc] {
-                return Err(format!("program {index} PC {pc}: no queue coverage").into());
             }
         }
     }
@@ -146,7 +213,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::write(
         output,
         serde_json::to_vec_pretty(&json!({
-            "packet": path, "n_cu": blob.n_cu, "programs": programs,
+            "packet": path, "target_fingerprint": blob.target,
+            "n_cu": blob.n_cu, "programs": programs,
             "note": "Emitted instructions and declared packet roles only. A missing role means runtime-selected routing; an interpreter role can contain specialized or fused bodies. Object loading, runtime overrides, correctness and performance require separate verification."
         }))?,
     )?;

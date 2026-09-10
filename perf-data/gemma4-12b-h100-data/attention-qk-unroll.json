@@ -1,0 +1,87 @@
+{
+  "shape": {
+    "q": 4096,
+    "kv": 16384,
+    "hd": 512,
+    "heads": 16,
+    "kv_heads": 1,
+    "dtype": "BF16",
+    "arch": "sm90a"
+  },
+  "variants": [
+    {
+      "unroll": 1,
+      "object_sha256": "b9502422b9aba6373686041996782a3325a9a41449690e1c9c955373aa958f0d",
+      "registers": 240,
+      "zero_stack_spills": true,
+      "oracle": [
+        "mode=interpreter HD=512 BKV=0 KV=1 window=0 maps=0 checked=4608 worst_relL2=0.00239514 max_abs=6.10031e-05 warm_us=12832.320 PASS",
+        "mode=interpreter HD=512 BKV=0 KV=1 window=0 maps=1 checked=4608 worst_relL2=0.00239514 max_abs=6.10031e-05 warm_us=13221.248 PASS"
+      ]
+    },
+    {
+      "unroll": 4,
+      "object_sha256": "5f1c747bf0ebeb0285d533f66c9cb41dff9337a4c5ac7020b8f4b883a7eae97f",
+      "registers": 240,
+      "zero_stack_spills": true,
+      "oracle": [
+        "mode=interpreter HD=512 BKV=0 KV=1 window=0 maps=0 checked=4608 worst_relL2=0.00239514 max_abs=6.10031e-05 warm_us=10593.248 PASS",
+        "mode=interpreter HD=512 BKV=0 KV=1 window=0 maps=1 checked=4608 worst_relL2=0.00239514 max_abs=6.10031e-05 warm_us=10538.048 PASS"
+      ]
+    },
+    {
+      "unroll": 8,
+      "object_sha256": "5c085bdfad381b0e058e5a4d45747df7cd61b1605e2585de6607f6c8668d33c3",
+      "registers": 240,
+      "zero_stack_spills": true,
+      "oracle": [
+        "mode=interpreter HD=512 BKV=0 KV=1 window=0 maps=0 checked=4608 worst_relL2=0.00239514 max_abs=6.10031e-05 warm_us=10592.160 PASS",
+        "mode=interpreter HD=512 BKV=0 KV=1 window=0 maps=1 checked=4608 worst_relL2=0.00239514 max_abs=6.10031e-05 warm_us=10138.943 PASS"
+      ]
+    },
+    {
+      "unroll": 32,
+      "object_sha256": "9f31e80093e259d028323f1a2ba38b621d9b680eb6b8799b87ddb9472618084a",
+      "registers": 224,
+      "zero_stack_spills": true,
+      "oracle": [
+        "mode=interpreter HD=512 BKV=0 KV=1 window=0 maps=0 checked=4608 worst_relL2=0.00239514 max_abs=6.10031e-05 warm_us=10291.199 PASS",
+        "mode=interpreter HD=512 BKV=0 KV=1 window=0 maps=1 checked=4608 worst_relL2=0.00239514 max_abs=6.10031e-05 warm_us=10119.104 PASS"
+      ]
+    }
+  ],
+  "snapshots": [
+    {
+      "rows": 128,
+      "ragged": true,
+      "maps": 0,
+      "elements": 1048576,
+      "sha256": "486a0018e43f49cfc7450c2943e2643feed669543b8f41b073354c185a99f728",
+      "bit_exact": true
+    },
+    {
+      "rows": 128,
+      "ragged": true,
+      "maps": 1,
+      "elements": 1048576,
+      "sha256": "486a0018e43f49cfc7450c2943e2643feed669543b8f41b073354c185a99f728",
+      "bit_exact": true
+    },
+    {
+      "rows": 4096,
+      "ragged": false,
+      "maps": 0,
+      "elements": 33554432,
+      "sha256": "58a89d1ae0a53cc515ed6366a6df6e828fcfb1875ec40700f051f9ab7643cff4",
+      "bit_exact": true
+    },
+    {
+      "rows": 4096,
+      "ragged": false,
+      "maps": 1,
+      "elements": 33554432,
+      "sha256": "58a89d1ae0a53cc515ed6366a6df6e828fcfb1875ec40700f051f9ab7643cff4",
+      "bit_exact": true
+    }
+  ]
+}

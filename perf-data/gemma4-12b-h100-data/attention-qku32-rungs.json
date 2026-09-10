@@ -1,0 +1,226 @@
+{
+  "arch": "sm90a",
+  "dtype": "bf16",
+  "head_dim": 512,
+  "query_heads": 16,
+  "kv_heads": 1,
+  "history_end": 16384,
+  "objects": {
+    "1": "b9502422b9aba6373686041996782a3325a9a41449690e1c9c955373aa958f0d",
+    "32": "9f31e80093e259d028323f1a2ba38b621d9b680eb6b8799b87ddb9472618084a"
+  },
+  "test_source_sha256": "d37b5eecea23ba3f10da642d716c6da359ecdd8e2ecf1db7dd12cbc3b996f61d",
+  "rungs": [
+    {
+      "rows": 128,
+      "variants": [
+        {
+          "unroll": 1,
+          "oracle": [
+            "mode=interpreter HD=512 BKV=0 KV=1 window=0 maps=0 checked=4608 worst_relL2=0.0023737 max_abs=6.0043e-05 warm_us=1878.816 PASS",
+            "mode=interpreter HD=512 BKV=0 KV=1 window=0 maps=1 checked=4608 worst_relL2=0.0023737 max_abs=6.0043e-05 warm_us=1943.648 PASS"
+          ],
+          "log_sha256": "7c2ae40e0490239c2efe31cb6bfc241472c1bec1f6b5c7a3d9dd4194936e185d"
+        },
+        {
+          "unroll": 32,
+          "oracle": [
+            "mode=interpreter HD=512 BKV=0 KV=1 window=0 maps=0 checked=4608 worst_relL2=0.0023737 max_abs=6.0043e-05 warm_us=1563.168 PASS",
+            "mode=interpreter HD=512 BKV=0 KV=1 window=0 maps=1 checked=4608 worst_relL2=0.0023737 max_abs=6.0043e-05 warm_us=1450.784 PASS"
+          ],
+          "log_sha256": "a74135b30bb9d192e039871be7e7fdcc205eb4ea99ca4c858a43d773e743b0aa"
+        }
+      ],
+      "snapshots": [
+        {
+          "maps": 0,
+          "elements": 1048576,
+          "bit_exact": true,
+          "sha256": "31cf3921b4f8e4585e2925657be80a24be576d738a4abbfa1a053046243e656f"
+        },
+        {
+          "maps": 1,
+          "elements": 1048576,
+          "bit_exact": true,
+          "sha256": "31cf3921b4f8e4585e2925657be80a24be576d738a4abbfa1a053046243e656f"
+        }
+      ]
+    },
+    {
+      "rows": 512,
+      "variants": [
+        {
+          "unroll": 1,
+          "oracle": [
+            "mode=interpreter HD=512 BKV=0 KV=1 window=0 maps=0 checked=4608 worst_relL2=0.00237721 max_abs=4.69662e-05 warm_us=1864.928 PASS",
+            "mode=interpreter HD=512 BKV=0 KV=1 window=0 maps=1 checked=4608 worst_relL2=0.00237721 max_abs=4.69662e-05 warm_us=1947.648 PASS"
+          ],
+          "log_sha256": "a334ad789d6e7b8489b5b246901366ae985bd21acd3fd2e9301662f36cb1063d"
+        },
+        {
+          "unroll": 32,
+          "oracle": [
+            "mode=interpreter HD=512 BKV=0 KV=1 window=0 maps=0 checked=4608 worst_relL2=0.00237721 max_abs=4.69662e-05 warm_us=1549.760 PASS",
+            "mode=interpreter HD=512 BKV=0 KV=1 window=0 maps=1 checked=4608 worst_relL2=0.00237721 max_abs=4.69662e-05 warm_us=1449.504 PASS"
+          ],
+          "log_sha256": "6e5d1682190c709b5279a94dd4eec05e868186a33d8ee45f46658b0d1e482648"
+        }
+      ],
+      "snapshots": [
+        {
+          "maps": 0,
+          "elements": 4194304,
+          "bit_exact": true,
+          "sha256": "10e05bc6154601b3470c2a1500203018ce11f4dab192e4178aaf9d16eec2a95f"
+        },
+        {
+          "maps": 1,
+          "elements": 4194304,
+          "bit_exact": true,
+          "sha256": "10e05bc6154601b3470c2a1500203018ce11f4dab192e4178aaf9d16eec2a95f"
+        }
+      ]
+    },
+    {
+      "rows": 1024,
+      "variants": [
+        {
+          "unroll": 1,
+          "oracle": [
+            "mode=interpreter HD=512 BKV=0 KV=1 window=0 maps=0 checked=4608 worst_relL2=0.00234859 max_abs=5.44855e-05 warm_us=3661.696 PASS",
+            "mode=interpreter HD=512 BKV=0 KV=1 window=0 maps=1 checked=4608 worst_relL2=0.00234859 max_abs=5.44855e-05 warm_us=3772.448 PASS"
+          ],
+          "log_sha256": "31788cbfd0a53d346dcb08bbafd78dce3462bd8ab2b035565bff32bb0725f54f"
+        },
+        {
+          "unroll": 32,
+          "oracle": [
+            "mode=interpreter HD=512 BKV=0 KV=1 window=0 maps=0 checked=4608 worst_relL2=0.00234859 max_abs=5.44855e-05 warm_us=2984.896 PASS",
+            "mode=interpreter HD=512 BKV=0 KV=1 window=0 maps=1 checked=4608 worst_relL2=0.00234859 max_abs=5.44855e-05 warm_us=2837.568 PASS"
+          ],
+          "log_sha256": "79b2798439be68483d842ddecffb581a804fd26bb0098cab5cdd2338ddf5f54c"
+        }
+      ],
+      "snapshots": [
+        {
+          "maps": 0,
+          "elements": 8388608,
+          "bit_exact": true,
+          "sha256": "0550a3fcb50e3f06b622c98430d2800426ed811a172c2386c722f667b3873c57"
+        },
+        {
+          "maps": 1,
+          "elements": 8388608,
+          "bit_exact": true,
+          "sha256": "0550a3fcb50e3f06b622c98430d2800426ed811a172c2386c722f667b3873c57"
+        }
+      ]
+    },
+    {
+      "rows": 2048,
+      "variants": [
+        {
+          "unroll": 1,
+          "oracle": [
+            "mode=interpreter HD=512 BKV=0 KV=1 window=0 maps=0 checked=4608 worst_relL2=0.00236381 max_abs=5.68344e-05 warm_us=6994.688 PASS",
+            "mode=interpreter HD=512 BKV=0 KV=1 window=0 maps=1 checked=4608 worst_relL2=0.00236381 max_abs=5.68344e-05 warm_us=7248.352 PASS"
+          ],
+          "log_sha256": "9ecac0843fb7e4326456f5431bf6b6f5f149300977333683b9b20f93700825c6"
+        },
+        {
+          "unroll": 32,
+          "oracle": [
+            "mode=interpreter HD=512 BKV=0 KV=1 window=0 maps=0 checked=4608 worst_relL2=0.00236381 max_abs=5.68344e-05 warm_us=5667.840 PASS",
+            "mode=interpreter HD=512 BKV=0 KV=1 window=0 maps=1 checked=4608 worst_relL2=0.00236381 max_abs=5.68344e-05 warm_us=5479.616 PASS"
+          ],
+          "log_sha256": "b428ba5b829351965716412425f46d1bdabd0a6a1ff9805271c7c589ceb2b8ba"
+        }
+      ],
+      "snapshots": [
+        {
+          "maps": 0,
+          "elements": 16777216,
+          "bit_exact": true,
+          "sha256": "2f5eb6df1059bc7714cf5407b453cf404b6e240429a8d1612ea310799730cb13"
+        },
+        {
+          "maps": 1,
+          "elements": 16777216,
+          "bit_exact": true,
+          "sha256": "2f5eb6df1059bc7714cf5407b453cf404b6e240429a8d1612ea310799730cb13"
+        }
+      ]
+    },
+    {
+      "rows": 4096,
+      "variants": [
+        {
+          "unroll": 1,
+          "oracle": [
+            "mode=interpreter HD=512 BKV=0 KV=1 window=0 maps=0 checked=4608 worst_relL2=0.00239514 max_abs=6.10031e-05 warm_us=12944.256 PASS",
+            "mode=interpreter HD=512 BKV=0 KV=1 window=0 maps=1 checked=4608 worst_relL2=0.00239514 max_abs=6.10031e-05 warm_us=13273.536 PASS"
+          ],
+          "log_sha256": "834ac51e5bb7ada95ef1a1f01890ad55866c31136d15db60f41c12972b128594"
+        },
+        {
+          "unroll": 32,
+          "oracle": [
+            "mode=interpreter HD=512 BKV=0 KV=1 window=0 maps=0 checked=4608 worst_relL2=0.00239514 max_abs=6.10031e-05 warm_us=10258.815 PASS",
+            "mode=interpreter HD=512 BKV=0 KV=1 window=0 maps=1 checked=4608 worst_relL2=0.00239514 max_abs=6.10031e-05 warm_us=10119.775 PASS"
+          ],
+          "log_sha256": "f900f2ff47f274e4afaaa7c5bd1054de76a40ac018203c4276c65207e698ca4e"
+        }
+      ],
+      "snapshots": [
+        {
+          "maps": 0,
+          "elements": 33554432,
+          "bit_exact": true,
+          "sha256": "58a89d1ae0a53cc515ed6366a6df6e828fcfb1875ec40700f051f9ab7643cff4"
+        },
+        {
+          "maps": 1,
+          "elements": 33554432,
+          "bit_exact": true,
+          "sha256": "58a89d1ae0a53cc515ed6366a6df6e828fcfb1875ec40700f051f9ab7643cff4"
+        }
+      ]
+    },
+    {
+      "rows": 8192,
+      "variants": [
+        {
+          "unroll": 1,
+          "oracle": [
+            "mode=interpreter HD=512 BKV=0 KV=1 window=0 maps=0 checked=4608 worst_relL2=0.00240046 max_abs=6.21536e-05 warm_us=21936.416 PASS",
+            "mode=interpreter HD=512 BKV=0 KV=1 window=0 maps=1 checked=4608 worst_relL2=0.00240046 max_abs=6.21536e-05 warm_us=22707.359 PASS"
+          ],
+          "log_sha256": "6be8c74cee6d4631b398fac2e6b830a604105586697775ff7f9bbcb4b17b9915"
+        },
+        {
+          "unroll": 32,
+          "oracle": [
+            "mode=interpreter HD=512 BKV=0 KV=1 window=0 maps=0 checked=4608 worst_relL2=0.00240046 max_abs=6.21536e-05 warm_us=17373.279 PASS",
+            "mode=interpreter HD=512 BKV=0 KV=1 window=0 maps=1 checked=4608 worst_relL2=0.00240046 max_abs=6.21536e-05 warm_us=16954.848 PASS"
+          ],
+          "log_sha256": "13b2766e6ac9a2bac787e87759c3e05e454f3ebfcd75b0d230726a4884362c53"
+        }
+      ],
+      "snapshots": [
+        {
+          "maps": 0,
+          "elements": 67108864,
+          "bit_exact": true,
+          "sha256": "20017cdf07471105d33dfad89fdcd51f22e4e734498f19ce5d10553cc7e7cf13"
+        },
+        {
+          "maps": 1,
+          "elements": 67108864,
+          "bit_exact": true,
+          "sha256": "20017cdf07471105d33dfad89fdcd51f22e4e734498f19ce5d10553cc7e7cf13"
+        }
+      ]
+    }
+  ],
+  "note": "Direct interpreter-body oracle at each query size, both mapped/unmapped staging. Timings are sequential screens, not randomized performance qualification or all attention histories."
+}

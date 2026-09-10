@@ -428,3 +428,53 @@ them or extrapolate them to every ladder. They favor investigating dependent
 instruction chains and pipeline overlap over assuming HBM saturation.
 [Hardware counters](gemma4-12b-h100-data/attention-4k-stalls.csv),
 [profile correctness](gemma4-12b-h100-data/attention-4k-stalls.log).
+
+## HD512 QK instruction unrolling
+
+The cooperative native HD512 WGMMA body now accepts `PLOW_NV_FA_QK_UNROLL`.
+The shared header defaults to 1; the dedicated SM90 HD512 WGMMA build selects
+32, overridable with `PLOW_BUILD_PFATTN_QK_UNROLL`. This exposes constant
+descriptor offsets across the 32 QK k16 steps. Tile geometry, arithmetic order,
+barriers, shared-memory layout and interpreter integration are unchanged.
+No external kernel library is linked. The selected object uses 224 registers
+versus 240, with zero stack/spills in both variants.
+
+Sequential warm screens at KV history ending at 16384, Q16/KV1, BF16, mapped
+staging, direct interpreter body:
+
+| Query rows | Unroll 1 (us) | Unroll 32 (us) |
+|---:|---:|---:|
+| 128 | 1943.648 | 1450.784 |
+| 512 | 1947.648 | 1449.504 |
+| 1024 | 3772.448 | 2837.568 |
+| 2048 | 7248.352 | 5479.616 |
+| 4096 | 13273.536 | 10119.775 |
+| 8192 | 22707.359 | 16954.848 |
+
+Every size passes sampled FP64 checks, and all output bytes match baseline
+for both mapped and unmapped staging. Ragged multi-request checks also pass;
+the one-block multi-item memory check reports zero errors. The probe's new
+`--snapshot PREFIX` option was used with `--lean-hd512` for full-output
+comparisons. These are kernel screens, not randomized serving A/B results or
+qualification of every attention history.
+[Unroll/resource evidence](gemma4-12b-h100-data/attention-qk-unroll.json),
+[rung checks](gemma4-12b-h100-data/attention-qku32-rungs.json),
+[memory check](gemma4-12b-h100-data/attention-qku32-memcheck.log).
+
+The candidate packet retains the baseline 4K packet's instructions and queue
+windows, with the new HD512 object hash. Serving verification passes. Two-repeat
+16K/C16 throughput is 96.238 tokens/s; a warmed single-repeat C128 screen is
+96.997 tokens/s. C128 remains queue concurrency with physical B16.
+[Serving screen](gemma4-12b-h100-data/native-qku32-screen.json),
+[C128](gemma4-12b-h100-data/native-qku32-c128.json),
+[verification](gemma4-12b-h100-data/native-qku32-verify.log).
+
+C1 results are confounded by an active-batch `Admit::Defer` sleep in the
+scheduler: a baseline run after burst conditioning measured about 22.50 ms
+TPOT, while baseline with `--max-hold-ms 0` measured about 13.38 ms. Do not
+attribute that entire difference to this kernel. The scheduler fix and fresh
+serving qualification remain open, as do all-op specialization and the vLLM
+performance objective.
+
+[Conditioned C1 screens](gemma4-12b-h100-data/active-hold-latency-screen.json)
+retain the raw-file hashes and measured repeat summaries.

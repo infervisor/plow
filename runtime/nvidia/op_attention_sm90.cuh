@@ -77,6 +77,9 @@
 #ifndef PLOW_NV_FA512_WG
 #define PLOW_NV_FA512_WG 0
 #endif
+#ifndef PLOW_NV_FA_QK_UNROLL
+#define PLOW_NV_FA_QK_UNROLL 1
+#endif
 /* BKV=16 is the hd512 arm (PLOW_NV_FA512_WG, design (a) of the 32k memo): same HD-split /
  * redundant-S structure, score tile m64n16k16, Ps width 16. Smem at <512,64,16> is ~131 KiB
  * (Qs 64 + K/V ring 32 + Ps 2 + align), inside the arena; O acc = 4 n64 tiles = 128 f32. */
@@ -566,6 +569,7 @@ __device__ void d_flash_prefill_sm90(float* __restrict__ Opart, float* __restric
     constexpr int NSUB = HD / 64;      /* 128B-swizzle sub-tiles per [rows][HD] operand */
     constexpr int NTW = HD / 128;      /* n64 O tiles per warpgroup                     */
     constexpr int KS0 = HD / 16;       /* GEMM0 k16 steps (contract over HD)            */
+    constexpr int QK_UNROLL = PLOW_NV_FA_QK_UNROLL;
     constexpr int KS1 = BKV / 16;      /* GEMM1 k16 steps (contract over BKV)           */
     constexpr int NB0 = BKV / 8;       /* n8 blocks in the score accumulator            */
     constexpr int QT = BQ * 64;        /* elements per Q sub-tile                       */
@@ -779,7 +783,7 @@ __device__ void d_flash_prefill_sm90(float* __restrict__ Opart, float* __restric
             const __nv_bfloat16* kbuf = Ks + (size_t)sb * NSUB * KT;
             float S[BKV / 2];
             sm90_wg_fence();
-#pragma unroll 1
+#pragma unroll QK_UNROLL
             for (int ks = 0; ks < KS0; ks++) {
                 const int sub = ks >> 2, ko = (ks & 3) * 16; /* +32 B per k16 substep */
                 fa90_wgmma_score<BKV>(S, sm90_desc(Qs + sub * QT + ko),

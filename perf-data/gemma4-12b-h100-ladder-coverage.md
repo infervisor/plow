@@ -101,3 +101,32 @@ Still unqualified: per-rung LM-head selection, RMSNorm, residual norms, GLU,
 embedding, softcap, argmax, and the full attention/history matrix. BF16 native
 projection evidence does not qualify FP8, AMD or CPU. All-op specialization
 is incomplete; no blanket fast-path claim is made.
+
+## Complete work-slice audit and HD512 rung checks
+
+The audit now requires each instruction's slices `0..blocks` exactly once,
+and compares queue entries against the scheduled stream, including wait,
+successor, flags and segment fields. A present opcode with missing or duplicate
+slices no longer passes. The output also retains the packet target fingerprint.
+This is an offline check and adds no runtime dispatch overhead.
+
+All 16 local Gemma 4 packet artifacts pass: **147 programs, 101,674
+instructions**. The [snapshot](gemma4-12b-h100-data/all-packet-slice-coverage.json)
+records each packet hash and every rung's op counts. Mutation tests reject
+missing, duplicate and out-of-range slices and changed dependency metadata;
+permuted valid work passes.
+
+The native HD512 QK-unroll specialization passes direct interpreter-body
+FP64 checks at query rows 128/512/1024/2048/4096/8192, with history ending at
+16384, BF16, 16 query heads and one KV head. For both mapped and unmapped
+staging, all output bytes match the unroll-1 baseline at every tested size.
+[Rung evidence](gemma4-12b-h100-data/attention-qku32-rungs.json) contains object
+hashes, oracle results and full-output hashes. This qualifies the tested
+HD512 cases; it does not qualify HD256, decode attention or every history.
+
+The current candidate uses prefill rungs 128/512/1024/2048/4096 and decode
+rungs 1/2/4/8/16. Each prefill rung contains 766 instructions; each decode rung
+contains 718. Every emitted family remains in the audit, including the shared
+norm/pointwise/sampling bodies and fused HeadNormRope/NormResidualNorm bodies.
+Their presence and successful execution do not establish exact-shape tuning.
+The remaining all-op qualification list above is still open.
