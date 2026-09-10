@@ -71,7 +71,10 @@ static CUtensorMap make_map(void* base, unsigned rows, unsigned k, bool fp8) {
 }
 
 int main(int argc, char** argv) {
-    if (argc != 6) { std::fprintf(stderr,"usage: probe M N K bf16|fp8 interpreter.cubin\n"); return 2; }
+    if (argc != 6 && (argc != 7 || std::strcmp(argv[6],"--exact-body"))) {
+        std::fprintf(stderr,"usage: probe M N K bf16|fp8 interpreter.cubin [--exact-body]\n"); return 2;
+    }
+    const bool exact_body=argc==7;
     const unsigned m=std::strtoul(argv[1],nullptr,10), n=std::strtoul(argv[2],nullptr,10), k=std::strtoul(argv[3],nullptr,10);
     const bool fp8=std::strcmp(argv[4],"fp8")==0;
     if (!m || !n || !k || n%2 || k%128 || (!fp8 && std::strcmp(argv[4],"bf16"))) return 2;
@@ -137,6 +140,7 @@ int main(int argc, char** argv) {
         else CK(cudaLaunchKernel(plain,dim3(grid),dim3(threads),args,smem,nullptr));
     };
     bool ok=true;
+    std::vector<bf16> reference;
     for (unsigned mode=0;mode<3;++mode) {
         const bool packet=mode!=0;
         if (mode==2) {
@@ -148,6 +152,13 @@ int main(int argc, char** argv) {
         launch(packet); CK(cudaDeviceSynchronize());
         std::vector<bf16> got(size_t(m)*n);
         CK(cudaMemcpy(got.data(),out,got.size()*2,cudaMemcpyDeviceToHost));
+        if (exact_body) {
+            if (!packet) reference=got;
+            else if (std::memcmp(reference.data(),got.data(),got.size()*sizeof(bf16))) {
+                std::fprintf(stderr,"mode %u: full output differs from standalone body\n",mode);
+                ok=false;
+            }
+        }
         double err2=0,ref2=0,maxerr=0;
         for (unsigned i=0;i<257;++i) {
             unsigned r=(uint64_t(i)*7919)%m, c=(uint64_t(i)*104729)%n;

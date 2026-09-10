@@ -32,6 +32,7 @@ for gemma_packed in 0 1; do
         -DPLOW_NV_SEG_WS384=1 -DPGM90_UNI_BN256=1 -DPLOW_NV_SEG_GEMM=1
         -DPLOW_NV_GEMM_ONLY=1 -DPGM90_TMA_STAGES=3
         -DPGM90_WS384_PREFETCH=1 -DPGM90_WS384_ISSUE_CURSOR=1
+        -DPGM90_WS384_SMEPI="${PLOW_BUILD_GEMM_SMEPI:-0}"
       )
     else
       gemma_role_flags=(

@@ -232,3 +232,12 @@ The [B32 evidence](gemma4-12b-h100-data/b32-native-screen.json) records tested
 objects and numerical/serving limits. Per-op specialized high performance
 for **every** emitted case is still incomplete. These H100 BF16 checks do not
 qualify FP8, AMD or CPU.
+
+The subsequent [GEMM epilogue screen](gemma4-12b-h100-native-tuning.md#shared-memory-gemm-epilogue-screen)
+covers all 49 emitted BF16 GEMM shapes through the actual ordinary interpreter
+object. Segment and queue execution match every output byte of the unchanged
+standalone body, and all cases pass sampled FP64 checks. Per-rung weighted
+GEMM speedups range from 1.021× to 1.152×; the packed serving screen improves
+16K/C32 throughput from 104.374 to 108.485 tokens/s with all paired texts equal.
+This narrows the GEMM qualification gap. It does not qualify all other ops,
+all packed histories, FP8, or arbitrary shapes.

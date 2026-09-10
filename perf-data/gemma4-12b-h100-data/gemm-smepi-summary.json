@@ -1,0 +1,213 @@
+{
+  "object_sha256": {
+    "plans/gemma4-12b-roofline/pfgemm-smepi.cubin": "f4dafa8289f9075471c190c70c704a6e575b54481e68da392424ff6dc95b2648",
+    "plans/gemma4-12b-roofline/cubin-bf16-b32/interp_sm90a_pfgemm.cubin": "6927a37260dfb5f570aa158fb0a99c6609bc74dd7d03be3e4216dc10d6ad3e1a",
+    "plans/gemma4-12b-roofline/cubin-bf16-b32-smepi/interp_sm90a_pfpackedgemm.cubin": "6275c56dd3d534e2867edd4a3fac7a4d5ba739c50e544b3b1e0096d8f7348663"
+  },
+  "rungs": [
+    {
+      "rows": 128,
+      "weighted_segment_us": {
+        "control": 24703.072,
+        "smepi": 24183.808
+      },
+      "speedup": 1.0214715565059067,
+      "weighted_queue_without_edges_us": {
+        "control": 24259.968000000004,
+        "smepi": 23820.448
+      }
+    },
+    {
+      "rows": 512,
+      "weighted_segment_us": {
+        "control": 29103.968,
+        "smepi": 27742.464
+      },
+      "speedup": 1.0490765348023883,
+      "weighted_queue_without_edges_us": {
+        "control": 28605.312,
+        "smepi": 27057.823999999997
+      }
+    },
+    {
+      "rows": 1024,
+      "weighted_segment_us": {
+        "control": 39790.688,
+        "smepi": 36295.42399999999
+      },
+      "speedup": 1.0963004041501212,
+      "weighted_queue_without_edges_us": {
+        "control": 39534.72,
+        "smepi": 36050.08
+      }
+    },
+    {
+      "rows": 2048,
+      "weighted_segment_us": {
+        "control": 71859.552,
+        "smepi": 64867.83999999999
+      },
+      "speedup": 1.1077839496428432,
+      "weighted_queue_without_edges_us": {
+        "control": 71596.416,
+        "smepi": 64361.119999999995
+      }
+    },
+    {
+      "rows": 4096,
+      "weighted_segment_us": {
+        "control": 139274.592,
+        "smepi": 122460.16
+      },
+      "speedup": 1.137305324441843,
+      "weighted_queue_without_edges_us": {
+        "control": 140149.376,
+        "smepi": 121919.64799999999
+      }
+    },
+    {
+      "rows": 8192,
+      "weighted_segment_us": {
+        "control": 279293.53599999996,
+        "smepi": 242400.51200000002
+      },
+      "speedup": 1.152198622418751,
+      "weighted_queue_without_edges_us": {
+        "control": 279163.26399999997,
+        "smepi": 242032.54400000002
+      }
+    }
+  ],
+  "numerical": "257 FP64 sample dots, relative L2<0.004, all outputs finite; queue completion checked. Separate full bytewise body/segment/queue gate passes all49 emitted shapes.",
+  "limits": "Warm-cache single campaign with alternating object order. Body executable is unchanged control; compare segment/queue rows for epilogue impact. Sums of isolated shapes do not establish graph or serving speedup.",
+  "serving": [
+    {
+      "variant": "control",
+      "input": 1024,
+      "concurrency": 1,
+      "repeats": 2,
+      "output_tok_s": 75.56403058602737,
+      "ttft_ms": 84.18459449967486,
+      "tpot_ms": 12.672587834644878
+    },
+    {
+      "variant": "control",
+      "input": 1024,
+      "concurrency": 32,
+      "repeats": 2,
+      "output_tok_s": 781.460600169951,
+      "ttft_ms": 1739.2635344986047,
+      "tpot_ms": 27.52867849410432
+    },
+    {
+      "variant": "control",
+      "input": 16384,
+      "concurrency": 1,
+      "repeats": 2,
+      "output_tok_s": 45.24701432929857,
+      "ttft_ms": 1112.4500110017834,
+      "tpot_ms": 13.50898903936783
+    },
+    {
+      "variant": "control",
+      "input": 16384,
+      "concurrency": 32,
+      "repeats": 2,
+      "output_tok_s": 104.37449392334509,
+      "ttft_ms": 26694.449631500902,
+      "tpot_ms": 95.14758993306506
+    },
+    {
+      "variant": "smepi",
+      "input": 1024,
+      "concurrency": 1,
+      "repeats": 2,
+      "output_tok_s": 75.86846812956597,
+      "ttft_ms": 79.22068349944311,
+      "tpot_ms": 12.658073358257452
+    },
+    {
+      "variant": "smepi",
+      "input": 1024,
+      "concurrency": 32,
+      "repeats": 2,
+      "output_tok_s": 792.1031249584914,
+      "ttft_ms": 1668.574389501373,
+      "tpot_ms": 27.515559088589196
+    },
+    {
+      "variant": "smepi",
+      "input": 16384,
+      "concurrency": 1,
+      "repeats": 2,
+      "output_tok_s": 46.03758944903239,
+      "ttft_ms": 1070.7358309991832,
+      "tpot_ms": 13.455010936987371
+    },
+    {
+      "variant": "smepi",
+      "input": 16384,
+      "concurrency": 32,
+      "repeats": 2,
+      "output_tok_s": 108.48527539421148,
+      "ttft_ms": 24955.250696000803,
+      "tpot_ms": 96.94360470472938
+    }
+  ],
+  "paired_text": {
+    "matched": 132,
+    "total": 132
+  },
+  "serving_limits": "Two sequential repeats after one warmup per cell, physical B32, queue128, maxctx20480, request1024, aggregate8192, 128 outputs, prefix cache disabled. All264 requests complete with cache0. Serving checks pass both variants. No independent model quality equivalence or vLLM A/B.",
+  "exact_body": {
+    "shape_count": 49,
+    "scope": "Every output byte of actual interpreter segment and queue modes matches the unchanged standalone WGMMA body for these BF16 operands. Each mode also passes sampled FP64 checks. Ordinary object only; packed behavior additionally covered by serving tests."
+  },
+  "evidence_sha256": {
+    "gemm-smepi-screen.jsonl": "c46c102ef3967ac42e09633024a1a9fb38349b2b2c5c3b43e3d7988fe6fa6b49",
+    "gemm-smepi-exact.jsonl": "7633e08db3ae65c1b17fe7e8d59b945ffd8c77ea38ed153c6e2dc31d0cac4c44",
+    "gemm-smepi-exact-build.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gemm-smepi-memcheck.log": "104013232ae868aad3a701ea5d6a97264c45f4eeba577a6cde4925f5e793c76b",
+    "pfgemm-smepi-build.log": "a0505dfab0c92d83bba20227873a1fc77ca784e5cc739aafb35e5c5841086f1b",
+    "pfpackedgemm-smepi-build.log": "9efdb07fd20c4dc39f1c9a8b410660ae58894c9feddec93e173c2a846796a5f0",
+    "gemm-smepi-serving-control.json": "86b4a24b0c84f6a8a8c19b8e8f51f633a56297d4634b4911623e4790e345e00a",
+    "gemm-smepi-serving-control-verify.log": "f6e91190b360d5c897d0dc8996002ea78e93b0375e9476ce5ef68721fedefd91",
+    "gemm-smepi-serving-smepi.json": "c7daf112a5fa21ba36f7ce4afb9eadc9ff95f8bc3b96ac5e0a49160ae555dc6b",
+    "gemm-smepi-serving-smepi-verify.log": "f6e91190b360d5c897d0dc8996002ea78e93b0375e9476ce5ef68721fedefd91",
+    "gemm-smepi-head-c128.json": "7022d79813c2eaeadac6ffc60482fa47466260abe99e42ee982464e118e24050",
+    "gemm-smepi-head-c128-verify.log": "f6e91190b360d5c897d0dc8996002ea78e93b0375e9476ce5ef68721fedefd91"
+  },
+  "packet_sha256": "401d0858eb1d5cf8776289fc0fb645c38249366dc3fec2b503d1980f021f0a4f",
+  "probe_sha256": "9e78b42fd5ecd76eb1a720512443130091d128cc3313db25cd2f14198ff3ab8d",
+  "c128": {
+    "requests": 256,
+    "repeats": 1,
+    "warmups_per_case": 0,
+    "verification_first": true,
+    "cells": [
+      {
+        "input": 1024,
+        "concurrency": 128,
+        "output_tok_s": 784.9669068184954,
+        "ttft_ms": 8660.171538496797,
+        "tpot_ms": {
+          "p50": 30.264729791334382,
+          "p95": 38.51357942837104,
+          "p99": 38.96006420477742
+        }
+      },
+      {
+        "input": 16384,
+        "concurrency": 128,
+        "output_tok_s": 105.39568855474644,
+        "ttft_ms": 74832.57705699725,
+        "tpot_ms": {
+          "p50": 71.35680244099368,
+          "p95": 71.49150158980689,
+          "p99": 264.7995544215742
+        }
+      }
+    ],
+    "limits": "Single-repeat sequential screen, compare historical B32 native-head 763.294/101.940 tokens/s at1K/16K. Not an interleaved A/B."
+  }
+}

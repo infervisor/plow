@@ -683,3 +683,72 @@ Historical vLLM BF16 C128 results are 2,131.578/196.035 tokens/s; the objective
 remains unmet. These are historical sequential comparisons, not a fresh
 interleaved vLLM A/B. [C128 raw results](gemma4-12b-h100-data/b32-screen-head-c128.json),
 [serving checks](gemma4-12b-h100-data/b32-screen-head-c128-verify.log).
+
+## Shared-memory GEMM epilogue screen
+
+`PLOW_BUILD_GEMM_SMEPI=1` in `scripts/build_sm90a_gemma4_segments.sh` enables
+the existing native `PGM90_WS384_SMEPI` epilogue in ordinary and packed GEMM
+objects. Default remains off. The consumers stage BF16 results in the drained
+shared-memory ring before coalesced 16-byte global stores; consumer barriers
+and delayed empty-slot arrivals protect the reused storage. TMA loading,
+WGMMA math, packet dependencies and segment routing remain the same. The
+candidate uses 160 registers with zero stack/spills, like the control.
+
+An actual-interpreter BF16 screen covers all 49 emitted GEMM M/N/K shapes:
+eight projection shapes at M128/512/1024/2048/4096/8192 and the M1 LM head.
+Each object/shape runs standalone-body, segment-with-dependencies and
+queue-without-dependencies modes. All 294 mode checks pass 257 sampled FP64
+dots, full-output finiteness and expected counter completion. The body
+executable is unchanged control code; only segment/queue measurements compare
+the two epilogues. This is one warm-cache campaign with alternating object
+order, not held-out tuning or a serving measurement.
+
+| Prefill rung | Weighted control GEMM ms | Staged epilogue ms | Speedup |
+|---:|---:|---:|---:|
+| 128 | 24.703 | 24.184 | 1.021× |
+| 512 | 29.104 | 27.742 | 1.049× |
+| 1024 | 39.791 | 36.295 | 1.096× |
+| 2048 | 71.860 | 64.868 | 1.108× |
+| 4096 | 139.275 | 122.460 | 1.137× |
+| 8192 | 279.294 | 242.401 | 1.152× |
+
+Weights are emitted instruction counts, not measured graph execution. Removing
+dependency edges changes weighted large-rung GEMM timing by roughly 0–1% in
+this isolated independent-tile test. It does not establish counter cost for
+the complete interpreter or every op. M128/N3840/K15360 passes Compute
+Sanitizer memcheck with zero errors. This does not qualify FP8 or arbitrary
+tail shapes for the staged epilogue.
+
+Fresh sequential serving screens keep the B32 native-head packet, attention,
+light objects and scheduler fixed. Both variants pass serving verification;
+all 264 measured requests return 128 tokens/cache0, and all 132 paired output
+texts match. Two repeats follow one warmup per cell. Physical batch32,
+queue128, context20480, request chunk1024 and aggregate budget8192.
+
+| Input / concurrency | Control tok/s | Staged epilogue tok/s |
+|---|---:|---:|
+| 1K / C1 | 75.564 | 75.868 |
+| 1K / C32 | 781.461 | 792.103 |
+| 16K / C1 | 45.247 | 46.038 |
+| 16K / C32 | 104.374 | 108.485 |
+
+16K/C1 median TTFT improves from 1112.450 to 1070.736 ms. These are modest
+serving gains; no fresh vLLM comparison was run for this candidate. The vLLM
+goal and all-op performance qualification remain open.
+[Screen, artifacts and limits](gemma4-12b-h100-data/gemm-smepi-summary.json),
+[raw shape runs](gemma4-12b-h100-data/gemm-smepi-screen.jsonl),
+[memcheck](gemma4-12b-h100-data/gemm-smepi-memcheck.log).
+
+The probe's optional trailing `--exact-body` argument additionally compares
+every output byte of segment and queue modes against its unchanged standalone
+body. All 49 candidate shapes pass this full-output gate as well as sampled
+FP64 checks. This covers the ordinary GEMM object; packed execution is covered
+by the serving checks above. [Full-output evidence](gemma4-12b-h100-data/gemm-smepi-exact.jsonl).
+
+C128 follow-up passes serving verification and completes all 256 requests
+with 128 tokens/cache0: **784.967 tokens/s at 1K and 105.396 at 16K**, versus
+the previous native-head screen's 763.294/101.940. This is one repeat after
+verification with no extra per-case warmup, not an interleaved A/B. Historical
+vLLM BF16 C128 results remain substantially ahead at 2,131.578/196.035 tokens/s.
+[C128 raw results](gemma4-12b-h100-data/gemm-smepi-head-c128.json),
+[serving checks](gemma4-12b-h100-data/gemm-smepi-head-c128-verify.log).
