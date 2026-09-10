@@ -912,6 +912,32 @@ impl CpuModel {
         self.kv_slot
     }
 
+    /// Read-only view of `len` bytes at `off` inside tensor `handle`.
+    ///
+    /// The head prefill's KV rows are already host memory, so a handoff reads
+    /// its source straight out of the tensor rather than staging a copy of it.
+    /// Bounds-checked because the caller's offsets come from a plan derived
+    /// from the OTHER packet's declarations, and the whole point of the KV
+    /// contract is that the two agreeing is checked rather than assumed.
+    pub fn tensor_range(&self, handle: usize, off: u64, len: u64) -> Result<&[u8]> {
+        let t = self
+            .tensors
+            .get(handle)
+            .ok_or_else(|| RuntimeError::Rejected(format!("tensor handle {handle} out of range")))?;
+        let end = off.checked_add(len).ok_or_else(|| {
+            RuntimeError::Rejected(format!("tensor {handle} range {off}+{len} overflows"))
+        })?;
+        if end > t.bytes as u64 {
+            return Err(RuntimeError::Rejected(format!(
+                "tensor {handle} range {off}+{len} past its {} bytes",
+                t.bytes
+            )));
+        }
+        // SAFETY: `handle` indexes this model's own allocation, the range is
+        // inside it, and `&self` keeps it alive and unwritten for the borrow.
+        Ok(unsafe { std::slice::from_raw_parts(t.as_ptr().add(off as usize), len as usize) })
+    }
+
     /// Decode rungs (sequence widths), ascending, one per decode program.
     pub fn decode_rungs(&self) -> Vec<u32> {
         self.blob.progs[self.dec_ix..].iter().map(|p| p.t).collect()
@@ -1566,6 +1592,12 @@ pub struct CpuEngineOpts {
     pub numa: NumaMode,
     pub isa: Isa,
     pub spin_us: u32,
+    /// Cores this engine's workers may use. `None` = the live topology.
+    ///
+    /// Set by the prefill-head pool to its reservation, so `WorkerPool` places
+    /// heads inside it with the machinery it already has and the serving path's
+    /// cores are simply not in the set it can see.
+    pub topology: Option<Topology>,
 }
 
 impl Default for CpuEngineOpts {
@@ -1575,6 +1607,7 @@ impl Default for CpuEngineOpts {
             numa: NumaMode::Auto,
             isa: Isa::Amx,
             spin_us: 2000,
+            topology: None,
         }
     }
 }
@@ -1647,7 +1680,7 @@ pub struct CpuEngine {
 impl CpuEngine {
     pub fn load(blob: &Path, checkpoint: &Path, opts: &CpuEngineOpts) -> Result<CpuEngine> {
         let isa = ffi::init(opts.isa)?;
-        let topo = Topology::detect();
+        let topo = opts.topology.clone().unwrap_or_else(Topology::detect);
         if let NumaMode::Nodes(requested) = &opts.numa {
             if requested.is_empty() || requested.iter().any(|n| !topo.nodes.contains(n)) {
                 return Err(RuntimeError::Device(format!(

@@ -2697,6 +2697,9 @@ async fn bringup_runtime(
                     }
                 },
                 spin_us: cpu.spin_us,
+                // The served model takes the live topology; only a head pool
+                // narrows it to a reservation.
+                topology: None,
             };
             tracing::info!(
                 %slug, blob = %blob.display(), checkpoint = %ckpt.display(), ?opts,
