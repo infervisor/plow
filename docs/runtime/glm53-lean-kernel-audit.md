@@ -101,3 +101,29 @@ path to K≤2048 avoids primitive regressions at narrow K=6144 sites. One paired
 serving screen improves throughput 1.82% and mean TPOT 1.49%, but worsens mean
 TTFT 1.12% and P99 TPOT 5.81%. It remains opt-in; Lean ordering certificates do
 not qualify its changed floating-point reduction order.
+
+## Follow-up: ragged prefill loses token-blocked folding
+
+The refreshed native-Lt profile finds a second missing fast path in actual
+execution: `exec_mla_merge_fold` required all token rows to be divisible by
+`PLOW_MLA_FOLD_TB`. A final 8,191-row chunk therefore sent every row through the
+scalar fold. The [ragged-fold experiment](../../runtime/bench/amd/glm_fold_tail/README.md)
+keeps complete eight-token groups on the existing blocked body and sends only
+the remainder through the scalar body. This requires no new packet or Lean
+ordering certificate. Numerical identity and compiled resource checks are the
+relevant gates; the first implementation failed the scratch budget despite
+passing primitive correctness.
+
+The same trace exposes an attribution trap: native sparse attention bypasses
+interpreter trace writes, leaving first-chunk `FlashMlaPrefill` records in the
+buffer. Restricting timestamps to the final chunk removes 23,712 stale entries.
+Only then does the trace describe that chunk's work. Two-shot all-reduce remains
+a larger body aggregate than folding; these overlapping spans are priorities
+for measurement, not additive performance forecasts.
+
+For further library adaptation, AMD's [vLLM optimization guide](https://rocm.docs.amd.com/en/docs-7.2.4/how-to/rocm-for-ai/inference-optimization/vllm-optimization.html)
+describes AITER FP8 batched matmul for MLA and RCCL channel tuning. Those settings
+are not controls for Plow's native HSA/custom-collective paths. Compare the actual
+kernel/data-movement boundary before adopting them. In particular, the local
+`PLOW_XR_MLP` record already rejects peer-batched scalar loads on MI300X; its
+source-level appearance of extra parallelism is not evidence of a win.

@@ -102,3 +102,9 @@ broad model quality or routing identity.
 pin sources, capture inputs, executable sections, all 65 loaded images per arm,
 build recipes, quality checks and measurements. Default-off executable sections
 remain unchanged at B1/B2/B4/B8.
+
+The follow-up ragged-fold build found that publishing the new cap marker in
+MFMA-disabled prefill objects conflicts with their baseline geometry profile.
+Current builds emit the marker only when MFMA is enabled; disabled dispatch
+remains unchanged. The original records above describe the objects actually
+measured at that revision.
