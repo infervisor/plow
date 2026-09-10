@@ -3,12 +3,19 @@
 #define PLOW_NV_HOPPER 1
 #define PLOW_NV_FA_PIPE 1
 #define PLOW_NV_FA_TMA 1
+#ifndef PLOW_NV_FA512_WG
+#define PLOW_NV_FA512_WG 0
+#endif
 #include "op_attention.cuh"
+
+#if PLOW_NV_PACKED_REQUEST && PLOW_NV_FA512_WG
+extern "C" __device__ __constant__ unsigned plow_pf_request_abi = 2;
+#endif
 
 extern "C" __device__ unsigned plow_attention_sm90_hd512_wg32_abi = 1;
 extern "C" __device__ unsigned plow_attention_head_dim = 512;
-extern "C" __device__ unsigned plow_attention_query_tile = 32;
-extern "C" __device__ unsigned plow_attention_kv_tile = 16;
+extern "C" __device__ unsigned plow_attention_query_tile = PLOW_NV_FA512_WG ? 64 : 32;
+extern "C" __device__ unsigned plow_attention_kv_tile = PLOW_NV_FA512_WG ? 32 : 16;
 extern "C" __device__ unsigned plow_attention_warps = 8;
 extern "C" __device__ unsigned plow_block_pfattn_hd512 = 256;
 extern "C" __device__ unsigned plow_arena_bytes_pfattn_hd512 =
@@ -41,14 +48,30 @@ __device__ __forceinline__ void attention_body(const PlowDevInst* in, void* cons
     const unsigned t4 = in->t[4], t5 = in->t[5], t7 = in->t[7];
     __nv_bfloat16* const output =
         t5 == PLOW_TENSOR_NONE ? nullptr : static_cast<__nv_bfloat16*>(tensors[t5]);
+#if PLOW_NV_FA512_WG
+    if (in->op != PLOW_DOP_FLASH_PREFILL || in->i[6] != 512 || !output || in->i[7] != 1) {
+        __trap();
+        return;
+    }
+    const int* requests = nullptr;
+#if PLOW_NV_PACKED_REQUEST
+    if (in->t[6] != PLOW_TENSOR_NONE) requests = static_cast<const int*>(tensors[in->t[6]]);
+#endif
+    d_flash_prefill_mux<512, 64, 32>(requests,
+#else
     d_flash_prefill<512, 32, 16>(
+#endif
         static_cast<float*>(tensors[t0]), static_cast<float*>(tensors[t1]),
         static_cast<const __nv_bfloat16*>(tensors[t2]),
         static_cast<const __nv_bfloat16*>(tensors[t3]),
         static_cast<const __nv_bfloat16*>(tensors[t4]),
         output, in->i[0], in->i[1], in->i[2], in->i[3],
         in->i[4], in->i[5], in->i[7], in->fj[1].u, in->fj[2].u, in->fj[0].f, slice, nblk,
+#if PLOW_NV_FA512_WG
+        arena, t7 == PLOW_TENSOR_NONE ? nullptr : tensors[t7]);
+#else
         arena, nullptr, tensors[t7]);
+#endif
 }
 
 extern "C" __global__

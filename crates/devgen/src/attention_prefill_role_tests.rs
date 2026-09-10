@@ -46,7 +46,34 @@ fn fixture(hd: u32, with_map: bool, fused: bool) -> Model {
 }
 
 fn selection() -> Selection {
-    Selection::from_image("attention.cubin".into(), b"cubin")
+    Selection::from_image("attention.cubin".into(), b"cubin", false)
+}
+
+#[test]
+fn wgmma_object_selects_its_tile_and_rejects_partial_output() {
+    let directory = output_dir("wgmma");
+    let output = directory.join("model.pkt");
+    let mut globals = OBJECT_GLOBALS;
+    globals[2].1 = 64;
+    globals[3].1 = 32;
+    std::fs::write(directory.join(OBJECT_FILE), object_image(&globals)).unwrap();
+    let mut model = fixture(512, true, true);
+    let mut sections = Vec::new();
+    assert!(apply_output_object(&mut model, &mut sections, "sm90a", &output).unwrap());
+    let roles = SegmentRoles::from_bytes(&sections[0].data).unwrap();
+    assert_eq!(roles.objects[&PREFILL_ATTENTION_HD512_WG32].attention, Some(capability(true)));
+
+    let mut partial = fixture(512, true, false);
+    let before = partial.to_blob();
+    let mut sections = Vec::new();
+    assert!(apply_output_object(&mut partial, &mut sections, "sm90a", &output).is_err());
+    assert_eq!(partial.to_blob(), before);
+    assert!(sections.is_empty());
+
+    globals[3].1 = 16;
+    std::fs::write(directory.join(OBJECT_FILE), object_image(&globals)).unwrap();
+    assert!(apply_output_object(&mut partial, &mut sections, "sm90a", &output).is_err());
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 fn output_dir(label: &str) -> std::path::PathBuf {
@@ -80,7 +107,7 @@ fn isolates_only_compatible_hd512_instructions_and_binds_hash() {
         object.sha256.as_deref(),
         Some(plow_asset::decode_objects::image_sha256(b"cubin").as_str())
     );
-    assert_eq!(object.attention.as_ref(), Some(&capability()));
+    assert_eq!(object.attention.as_ref(), Some(&capability(false)));
 }
 
 #[test]

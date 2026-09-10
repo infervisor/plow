@@ -113,6 +113,59 @@ at 16K C1/C16. The standalone gain does not establish a clear serving win versus
 the previous candidate. The checked-in recipe retains BKV32; isolating the
 attention bodies deserves measurement before increasing resource coupling.
 
+## Lean HD512 packet role
+
+The existing HD512 executor now has an opt-in native WGMMA Q64/KV32 body with
+packed-request TMA support. It reuses the attention implementation and the
+existing packet-role loader, dependency counters and graph execution. The
+compiler reads the object's tile metadata, pins its SHA256, and restricts this
+variant to fused output with one KV split. The default Q32/KV16 object remains
+byte-identical to the prior source's build.
+
+All nine Gemma programs retain exactly the same instructions and segment
+windows. Each prefill ladder still has 435 launches; eight HD512 segments select
+the lean object. Runtime logs confirm those selections and the unified token
+batch route firing. No runtime launch-path changes were needed.
+
+The actual-interpreter oracle now accepts `--interpreter CUBIN`; add
+`--lean-hd512` for the dedicated role. Its ragged, reversed-slot, 16K-history
+cases compare against the same independent FP64 reference and check completion
+counters. The combined interpreter takes 2,499.04 us with maps versus
+1,951.71 us for the final lean candidate. Both pass numerical checks. The lean
+candidate passes CUDA memcheck and compiles with 238 registers, zero spill
+loads/stores, and a 16-byte stack frame. This is one synthetic packet workload,
+not complete ladder tuning.
+
+Hardware profiling nevertheless observes 530,944 local-load sectors and 808,832
+local-store sectors in the mapped case. Dynamically indexed stage-state arrays
+use local memory even though the compiler reports zero register spills. Both
+cases have zero measured LSU shared-memory bank conflicts.
+
+Serving parity within the candidate, cancellation, slot reuse and context
+rejection checks pass. The output-128 screen has one measured repeat after one
+warmup, prefix caching disabled, physical batch 16 and queue capacity 128:
+
+| Input | Concurrency | TTFT ms | Output tokens/s | TPOT ms |
+|---:|---:|---:|---:|---:|
+| 1,024 | 1 | 96.94 | 69.08 | 13.82 |
+| 1,024 | 16 | 973.75 | 263.49 | 53.48 |
+| 16,384 | 1 | 1,202.50 | 41.84 | 14.62 |
+| 16,384 | 16 | 20,858.33 | 72.07 | 59.22 |
+
+These are screening results, not an interleaved serving A/B or a vLLM win.
+Model-quality qualification against an independent full-model reference remains
+separate. Batched decode and the aggregate-prefill/per-request KV-ring coupling
+remain major work items.
+
+Build the opt-in role through `scripts/build_sm90a_cubin.sh` with
+`PLOW_BUILD_SEG=1 PLOW_BUILD_FA512=1 PLOW_BUILD_PFATTN_WGMMA=1` inside
+`nix develop`. Place `interp_sm90a_pfattn_hd512.cubin` beside the intended output
+packet **before** running `plowc`; object presence triggers validated selection.
+Keep the measured ordinary/packed GEMM and light-object set from the earlier
+recipe. Exact role build defines, object hash, unchanged-window checks and
+runtime route evidence are in `gemma4-12b-h100-data/lean-attention-route-check.json`
+and `lean-attention-route.log`. Six compiler role tests pass.
+
 ## References and reproduction
 
 Reference implementation inspected at DeepGEMM revision

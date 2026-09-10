@@ -1,0 +1,53 @@
+   Compiling devgen v0.1.0 (/home/lava/plow/crates/devgen)
+warning: unused import: `super::*`
+   --> crates/devgen/src/checkpoint.rs:438:9
+    |
+438 |     use super::*;
+    |         ^^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `RopeScale`
+ --> crates/devgen/src/mla.rs:8:31
+  |
+8 | use packet::rope::{GenTensor, RopeScale};
+  |                               ^^^^^^^^^
+
+warning: function `amd_analytical_inventory` is never used
+    --> crates/devgen/src/lib.rs:1609:4
+     |
+1609 | fn amd_analytical_inventory(isa: hwspec::IsaLevel) -> kernelcaps::Inventory {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `silu` is never used
+ --> crates/devgen/src/mla/nemotron_tests.rs:5:4
+  |
+5 | fn silu(x: f32) -> f32 {
+  |    ^^^^
+
+warning: variant `Ignored` is never constructed
+   --> crates/devgen/src/lib_tests/gfx950_coverage.rs:422:5
+    |
+415 | enum Knob {
+    |      ---- variant in this enum
+...
+422 |     Ignored(&'static str),
+    |     ^^^^^^^
+    |
+    = note: `Knob` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: `devgen` (lib test) generated 5 warnings (run `cargo fix --lib -p devgen --tests` to apply 2 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.96s
+     Running unittests src/lib.rs (target/debug/deps/devgen-ce02750766e53432)
+
+running 6 tests
+test attention_prefill_role::tests::composes_with_existing_role_objects_and_preserves_their_segments ... ok
+test attention_prefill_role::tests::isolates_only_compatible_hd512_instructions_and_binds_hash ... ok
+test attention_prefill_role::tests::accepts_fused_output_and_rejects_unsafe_fused_contracts ... ok
+test attention_prefill_role::tests::stays_inert_without_apply_and_rejects_incompatible_geometry ... ok
+test attention_prefill_role::tests::wgmma_object_selects_its_tile_and_rejects_partial_output ... ok
+test attention_prefill_role::tests::output_object_is_explicit_inert_and_validated_before_mutation ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 409 filtered out; finished in 0.00s

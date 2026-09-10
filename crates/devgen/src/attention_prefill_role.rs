@@ -22,24 +22,26 @@ const OBJECT_GLOBALS: [(&str, u32); 7] = [
 pub struct Selection {
     pub file: String,
     pub sha256: String,
+    wgmma: bool,
 }
 
 impl Selection {
-    pub fn from_image(file: String, image: &[u8]) -> Self {
+    pub fn from_image(file: String, image: &[u8], wgmma: bool) -> Self {
         Self {
             file,
             sha256: plow_asset::decode_objects::image_sha256(image),
+            wgmma,
         }
     }
 }
 
-fn capability() -> AttentionCapability {
+fn capability(wgmma: bool) -> AttentionCapability {
     AttentionCapability {
         profile: "sm90a".into(),
         dtype: "bf16".into(),
         head_dim: 512,
-        query_tile: 32,
-        kv_tile: 16,
+        query_tile: if wgmma { 64 } else { 32 },
+        kv_tile: if wgmma { 32 } else { 16 },
         warps: 8,
     }
 }
@@ -102,10 +104,16 @@ pub(crate) fn apply_output_object(
     };
     let info = plow_asset::cubin::inspect(&image)
         .ok_or_else(|| format!("{} is not a valid cubin", path.display()))?;
+    let wgmma = plow_asset::cubin::global_u32(&image, "plow_attention_query_tile") == Some(64);
+    let mut expected = OBJECT_GLOBALS;
+    if wgmma {
+        expected[2].1 = 64;
+        expected[3].1 = 32;
+    }
     if profile != "sm90a"
         || info.sm != 90
         || !info.entries.iter().any(|entry| entry == OBJECT_ENTRY)
-        || OBJECT_GLOBALS
+        || expected
             .iter()
             .any(|&(name, value)| plow_asset::cubin::global_u32(&image, name) != Some(value))
     {
@@ -117,7 +125,7 @@ pub(crate) fn apply_output_object(
     apply(
         model,
         sections,
-        &Selection::from_image(OBJECT_FILE.into(), &image),
+        &Selection::from_image(OBJECT_FILE.into(), &image, wgmma),
         profile,
     )?;
     Ok(true)
@@ -137,7 +145,7 @@ fn apply(
         file: selection.file.clone(),
         sha256: Some(selection.sha256.clone()),
         promote_k512: None,
-        attention: Some(capability()),
+        attention: Some(capability(selection.wgmma)),
     };
     let mut metadata = SegmentRoles {
         version: 1,
@@ -182,6 +190,7 @@ fn apply(
             .iter()
             .map(|op| {
                 eligible(op, n_cu)
+                    && (!selection.wgmma || (op.t[5] != TENSOR_NONE && op.i[7] == 1))
                     && tensor_bytes
                         .get(op.t[7] as usize)
                         .is_some_and(|&bytes| bytes == 256)

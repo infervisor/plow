@@ -1,0 +1,4 @@
+mode=interpreter HD=256 BKV=0 KV=8 window=1024 maps=0 checked=4608 worst_relL2=0.00267912 max_abs=0.00110828 warm_us=121.152 PASS
+mode=interpreter HD=512 BKV=0 KV=1 window=0 maps=0 checked=9216 worst_relL2=0.00252794 max_abs=0.00117694 warm_us=2579.584 PASS
+mode=interpreter HD=256 BKV=0 KV=8 window=1024 maps=1 checked=4608 worst_relL2=0.00267912 max_abs=0.00110828 warm_us=120.288 PASS
+mode=interpreter HD=512 BKV=0 KV=1 window=0 maps=1 checked=9216 worst_relL2=0.00252794 max_abs=0.00117694 warm_us=2499.040 PASS

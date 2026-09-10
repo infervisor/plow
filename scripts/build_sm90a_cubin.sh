@@ -322,9 +322,15 @@ if [ "${PLOW_BUILD_SEG:-0}" = "1" ]; then
     echo "built $OUT_PFFA ($(stat -c%s "$OUT_PFFA") B)"
 
     OUT_PFATTN="${OUT%.cubin}_pfattn_hd512.cubin"
+    PFATTN_WGMMA_FLAGS=()
+    if [ "${PLOW_BUILD_PFATTN_WGMMA:-0}" = 1 ]; then
+      PFATTN_WGMMA_FLAGS=(-DPLOW_NV_FA512_WG=1 -DPLOW_NV_FA_GF=2 -DPLOW_NV_FA_WPR=1
+        -DPLOW_NV_PACKED_REQUEST=1 -DPLOW_NV_PACKED_FA_WGMMA=1 -DPLOW_NV_PACKED_FA_TMA=1)
+    fi
     "${NVENV[@]}" \
       "$NVCC" -std=c++17 -arch=sm_90a -O3 -cubin \
       -I "$HERE/runtime/common" -I "$HERE/runtime/nvidia" \
+      "${PFATTN_WGMMA_FLAGS[@]}" \
       -o "$OUT_PFATTN" "$HERE/runtime/nvidia/interp_sm90a_pfattn_hd512.cu"
     "${NVENV[@]}" \
       cuobjdump -symbols "$OUT_PFATTN" | grep -q "plow_sm90a_pfattn_hd512" || { echo "FATAL: pfattn hd512 symbol missing" >&2; exit 1; }
