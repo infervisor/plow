@@ -1963,7 +1963,7 @@ fn lean_moe_stage2_companion_layout_matches_the_declared_permutations() {
     let rows = 32usize;
     let kbytes = 64usize;
     let weight: Vec<u8> = (0..rows * kbytes).map(|i| (i % 251) as u8).collect();
-    let shuffled = shuffle_mxfp4_moe2_weight(&weight, rows, kbytes).unwrap();
+    let shuffled = shuffle_moe_weight_16x32(&weight, rows, kbytes).unwrap();
     for nb in 0..rows / 16 {
         for kb in 0..kbytes / 32 {
             for kh in 0..2 {
@@ -4595,5 +4595,26 @@ fn native_gemm_decode_keeps_ordered_xcd_boundaries() {
             _ => p.stream[0].seg = 1,
         }
         assert!(decode_segment_kinds(&p).is_err(), "case {bad}");
+    }
+}
+
+#[test]
+fn resident_moe_weight_layout_matches_gpu_vector_packing() {
+    for (rows, k) in [(256usize, 6144usize), (6144, 256)] {
+        let src: Vec<u8> = (0..rows * k).map(|i| ((i * 31 + i / 251) % 256) as u8).collect();
+        let actual = shuffle_moe_weight_16x32(&src, rows, k).unwrap();
+        for v in 0..rows * k / 16 {
+            let row = (v / (32 * (k / 32))) * 16 + v % 16;
+            let col = (v / 32) % (k / 32) * 2 + (v / 16) % 2;
+            let from = row * k + col * 16;
+            assert_eq!(actual[v * 16..v * 16 + 16], src[from..from + 16]);
+        }
+    }
+    let scales: Vec<f32> = (0..96).map(|i| (i as f32 - 48.0) * 0.0125).collect();
+    let actual = resident_moe_scales(bytemuck::cast_slice(&scales)).unwrap();
+    let expected: Vec<f32> = scales.iter().map(|s| s * 2.0).collect();
+    assert_eq!(actual, bytemuck::cast_slice::<f32, u8>(&expected));
+    for value in [f32::NAN, f32::INFINITY, f32::MAX] {
+        assert!(resident_moe_scales(bytemuck::cast_slice(&vec![value; 96])).is_err());
     }
 }

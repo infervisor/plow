@@ -31,7 +31,13 @@ pub(super) struct Route {
 impl Route {
     pub fn launches(self) -> u64 {
         match self.mode {
-            Mode::Sorted => 4,
+            Mode::Sorted => {
+                if self.inst.i[7] == 1 {
+                    3
+                } else {
+                    4
+                }
+            }
             Mode::Flat => 2,
         }
     }
@@ -64,21 +70,22 @@ pub(super) fn routes(
             Mode::Sorted
         };
         let flat = mode == Mode::Flat;
+        let resident = inst.i[7] == 1;
         let geometry = if flat {
-            [prog.t, 6144, 256, 256, 8, 0, 1, 0]
+            [prog.t, 6144, 256, 256, 8, 0, 1, u32::from(resident)]
         } else {
-            [prog.t, 6144, 256, 256, 8, 64, 0, 0]
+            [prog.t, 6144, 256, 256, 8, 64, 0, u32::from(resident)]
         };
         if prog.packed_prefill_only
             || !(if flat {
-                matches!(prog.t, 2 | 4 | 8)
+                matches!(prog.t, 2 | 4 | 8) || (resident && matches!(prog.t, 1 | 16 | 20))
             } else {
                 (128..=8192).contains(&prog.t)
             })
             || inst.i != geometry
             || inst.fj != [0; 3]
         {
-            return Err(err("requires H6144/I256/E256/top8; sorted prefill rows128..8192 or flat decode rows2/4/8"));
+            return Err(err("requires H6144/I256/E256/top8; sorted prefill rows128..8192 or flat decode rows2/4/8 (resident:1/2/4/8/16/20)"));
         }
         if flat {
             let router = prog.insts[..ix]
@@ -181,6 +188,130 @@ pub(super) fn routes(
     Ok(routes)
 }
 
+pub(super) fn resident_tables(
+    progs: &[DevProg],
+    tensors: &[DevTensor],
+) -> Result<Vec<Option<u16>>> {
+    let mut tables = vec![None; tensors.len()];
+    let mut staged = false;
+    for inst in progs
+        .iter()
+        .flat_map(|p| &p.insts)
+        .filter(|d| d.op == DevOp::MoeAiterFp8Pf as u16)
+    {
+        match inst.i[7] {
+            0 => {
+                staged = true;
+                continue;
+            }
+            1 => {}
+            _ => {
+                return Err(RuntimeError::Device(
+                    "unknown native MoE weight layout".into(),
+                ))
+            }
+        }
+        let invalid = || {
+            RuntimeError::Device("resident MoE requires matching H6144/I256/E256/top8 expert tables without companions".into())
+        };
+        let wt = tensors.get(inst.t[2] as usize).ok_or_else(invalid)?;
+        let st = tensors.get(inst.t[3] as usize).ok_or_else(invalid)?;
+        let prefix = wt
+            .name
+            .strip_suffix("expert_weight_table")
+            .ok_or_else(invalid)?;
+        if inst.i[1..5] != [6144, 256, 256, 8]
+            || wt.bytes != 256 * 24
+            || st.bytes != 256 * 24
+            || st.name != format!("{prefix}expert_scale_table")
+            || tensors.iter().any(|t| {
+                t.name.starts_with(&format!("{prefix}expert_weight_table_"))
+                    || t.name.starts_with(&format!("{prefix}expert_scale_table_"))
+            })
+        {
+            return Err(invalid());
+        }
+        if tables[inst.t[2] as usize]
+            .replace(inst.t[3])
+            .is_some_and(|old| old != inst.t[3])
+        {
+            return Err(invalid());
+        }
+    }
+    if tables.iter().all(Option::is_none) {
+        return Ok(tables);
+    }
+    if staged {
+        return Err(RuntimeError::Device(
+            "resident MoE cannot mix staged native weights".into(),
+        ));
+    }
+    for (weight, scale) in tables
+        .iter()
+        .enumerate()
+        .filter_map(|(w, s)| s.map(|s| (w as u16, s)))
+    {
+        for inst in progs.iter().flat_map(|p| &p.insts) {
+            if inst.t.contains(&weight) || inst.t.contains(&scale) {
+                if inst.op != DevOp::MoeAiterFp8Pf as u16
+                    || inst.i[7] != 1
+                    || inst.t[2..4] != [weight, scale]
+                    || inst
+                        .t
+                        .iter()
+                        .enumerate()
+                        .any(|(slot, &t)| (t == weight || t == scale) && slot != 2 && slot != 3)
+                {
+                    return Err(RuntimeError::Device(
+                        "resident MoE table has an incompatible consumer".into(),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(tables)
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ResidentWeights {
+    pub gu: u64,
+    pub down: u64,
+    pub gs: u64,
+    pub ds: u64,
+}
+
+impl ResidentWeights {
+    pub fn new(weights: u64, scales: u64) -> Self {
+        Self {
+            gu: weights,
+            down: weights + 512 * 256 * 6144,
+            gs: scales,
+            ds: scales + 512 * 96 * 4,
+        }
+    }
+}
+
+pub(super) fn resident_expert_table(base: u64, stride: u64) -> Vec<u64> {
+    (0..256u64)
+        .flat_map(|e| {
+            [
+                base + 2 * e * stride,
+                base + (2 * e + 1) * stride,
+                base + (512 + e) * stride,
+            ]
+        })
+        .collect()
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct FlatRouteArgs {
+    pointers: [u64; 3],
+    rows: u32,
+    pad: u32,
+}
+const _: () = assert!(std::mem::size_of::<FlatRouteArgs>() == 32);
+
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct PrepareArgs {
@@ -219,6 +350,8 @@ pub(super) struct MoeAiter {
     store: HsaKernel,
     _scratch: DeviceMem,
     buffers: [u64; 11],
+    resident: bool,
+    resident_weights: Vec<Option<ResidentWeights>>,
 }
 
 impl MoeAiter {
@@ -227,6 +360,7 @@ impl MoeAiter {
         dir: &Path,
         rows: u32,
         flat_decode: bool,
+        resident: bool,
         modules: &mut Vec<Module>,
     ) -> Result<Self> {
         if !(128..=8192).contains(&rows) {
@@ -268,6 +402,13 @@ impl MoeAiter {
                 "AITER MoE adapter lacks ABI marker".into(),
             ));
         }
+        if resident
+            && !super::amd::elf_symbol_names(&image).contains(&"plow_moe_resident_fp8_abi_1")
+        {
+            return Err(RuntimeError::Device(
+                "resident MoE adapter lacks ABI marker".into(),
+            ));
+        }
         let flat = if flat_decode {
             if !super::amd::elf_symbol_names(&image).contains(&"plow_moe_flat_fp8_abi_1") {
                 return Err(RuntimeError::Device(
@@ -307,8 +448,16 @@ impl MoeAiter {
         let module = EngineDevice::module_load(be, &image)?;
         let flat = flat
             .map(|moe| -> Result<_> {
-                let pack = EngineDevice::get_function(be, &module, "plow_moe_aiter_flat_pack")?;
-                if ![80, 336].contains(&pack.kernarg_size()) || pack.private_segment_size() != 0 {
+                let name = if resident {
+                    "plow_moe_aiter_flat_route"
+                } else {
+                    "plow_moe_aiter_flat_pack"
+                };
+                let size = if resident { 32 } else { 80 };
+                let pack = EngineDevice::get_function(be, &module, name)?;
+                if ![size, size + 256].contains(&pack.kernarg_size())
+                    || pack.private_segment_size() != 0
+                {
                     return Err(RuntimeError::Device("flat MoE packing ABI mismatch".into()));
                 }
                 Ok((pack, moe))
@@ -328,7 +477,7 @@ impl MoeAiter {
         modules.push(module);
         let rows = u64::from(rows);
         let capacity = rows * 8 + 256 * 63;
-        let sizes = [
+        let mut sizes = [
             256 * 512 * 6144,
             256 * 6144 * 256,
             256 * 192 * 4,
@@ -341,6 +490,9 @@ impl MoeAiter {
             capacity.div_ceil(32) * 4,
             8,
         ];
+        if resident {
+            sizes[..4].fill(0);
+        }
         let bytes = sizes.iter().map(|s| s.div_ceil(256) * 256).sum();
         let scratch = EngineDevice::alloc(be, bytes)?;
         let mut ptr = scratch.base;
@@ -358,7 +510,19 @@ impl MoeAiter {
             store,
             _scratch: scratch,
             buffers,
+            resident,
+            resident_weights: Vec::new(),
         })
+    }
+
+    pub fn bind_resident(&mut self, tables: Vec<(u16, ResidentWeights)>) {
+        for (handle, weights) in tables {
+            self.resident_weights.resize(
+                self.resident_weights.len().max(usize::from(handle) + 1),
+                None,
+            );
+            self.resident_weights[usize::from(handle)] = Some(weights);
+        }
     }
 
     pub fn enqueue(&self, be: &HsaBackend, route: Route, tensor_table: &[u8]) -> Result<()> {
@@ -370,27 +534,54 @@ impl MoeAiter {
             .inst
             .t
             .map(|h| if h == TENSOR_NONE16 { 0 } else { addr(h) });
-        let [gu, down, gs, ds, q, qs, out, ids, weights, experts, valid] = self.buffers;
+        let [mut gu, mut down, mut gs, mut ds, q, qs, out, ids, weights, experts, valid] =
+            self.buffers;
+        if (route.inst.i[7] == 1) != self.resident {
+            return Err(RuntimeError::Device(
+                "MoE route and workspace weight layouts differ".into(),
+            ));
+        }
+        if self.resident {
+            let w = self
+                .resident_weights
+                .get(route.inst.t[2] as usize)
+                .and_then(|w| *w)
+                .ok_or_else(|| {
+                    RuntimeError::Device("resident MoE weights were not bound".into())
+                })?;
+            (gu, down, gs, ds) = (w.gu, w.down, w.gs, w.ds);
+        }
         if route.mode == Mode::Flat {
             let (pack, moe) = self.flat.ok_or_else(|| {
                 RuntimeError::Device("flat MoE route has no loaded kernels".into())
             })?;
-            let pack_args = FlatPackArgs {
-                pointers: [gu, down, gs, ds, t[2], t[3], t[4], ids, weights],
-                rows: route.rows,
-                pad: 0,
-            };
-            be.launch(pack, 2048, 256, 0, bytemuck::bytes_of(&pack_args))?;
+            if self.resident {
+                let args = FlatRouteArgs {
+                    pointers: [ids, weights, t[4]],
+                    rows: route.rows,
+                    pad: 0,
+                };
+                be.launch(pack, 1, 256, 0, bytemuck::bytes_of(&args))?;
+            } else {
+                let pack_args = FlatPackArgs {
+                    pointers: [gu, down, gs, ds, t[2], t[3], t[4], ids, weights],
+                    rows: route.rows,
+                    pad: 0,
+                };
+                be.launch(pack, 2048, 256, 0, bytemuck::bytes_of(&pack_args))?;
+            }
             let args = flat_moe_args(t[0], t[1], gu, down, gs, ds, ids, weights, route.rows);
             return be.launch_3d(moe, [2, 8, route.rows], 256, bytemuck::cast_slice(&args));
         }
-        be.launch(
-            self.pack,
-            2048,
-            256,
-            0,
-            bytemuck::cast_slice(&[gu, down, gs, ds, t[2], t[3]]),
-        )?;
+        if !self.resident {
+            be.launch(
+                self.pack,
+                2048,
+                256,
+                0,
+                bytemuck::cast_slice(&[gu, down, gs, ds, t[2], t[3]]),
+            )?;
+        }
         let prepare = PrepareArgs {
             pointers: [
                 q, qs, out, ids, weights, experts, valid, t[1], t[4], t[5], t[6], t[7],
@@ -646,12 +837,190 @@ mod tests {
     }
 
     #[test]
+    fn resident_tables_reject_incompatible_consumers_across_programs() {
+        let (mut prog, mut tensors) = flat_fixture();
+        prog.insts[1].i[7] = 1;
+        tensors[2].name = "layer.3.expert_weight_table".into();
+        tensors[3].name = "layer.3.expert_scale_table".into();
+        tensors[2].bytes = 256 * 24;
+        tensors[3].bytes = 256 * 24;
+        let (mut other, _) = flat_fixture();
+        other.insts.clear();
+        let mut progs = vec![prog, other];
+        assert_eq!(resident_tables(&progs, &tensors).unwrap()[2], Some(3));
+        let compatible = progs[0].insts[1];
+        progs[0].insts.push(compatible);
+        assert!(resident_tables(&progs, &tensors).is_ok());
+        for bad in 0..5 {
+            let mut inst = compatible;
+            match bad {
+                0 => inst.i[7] = 0,
+                1 => inst.op = DevOp::MoeGroupGluPf as u16,
+                2 => inst.t[3] = 4,
+                3 => inst.t[0] = 2,
+                _ => inst.i[7] = 2,
+            }
+            progs[1].insts.push(inst);
+            assert!(resident_tables(&progs, &tensors).is_err(), "case {bad}");
+            progs[1].insts.pop();
+        }
+        tensors[4].name = "layer.3.expert_weight_table_pf".into();
+        assert!(resident_tables(&progs, &tensors).is_err());
+    }
+
+    #[test]
+    fn resident_routes_cover_all_decode_rungs() {
+        for rows in [1, 2, 4, 8, 16, 20] {
+            let (mut p, mut t) = flat_fixture();
+            p.t = rows;
+            p.insts[0].i[4] = rows;
+            p.insts[1].i[0] = rows;
+            p.insts[1].i[7] = 1;
+            p.insts[2].i[2] = rows;
+            t[0].bytes = u64::from(rows) * 6144 * 2 + 8;
+            t[1].bytes = u64::from(rows) * 6144 * 2;
+            t[4].bytes = u64::from(rows) * 8 * 8;
+            assert_eq!(routes(&p, &t, 2).unwrap()[1].unwrap().launches(), 2);
+        }
+        let (mut p, t) = fixture();
+        p.insts[1].i[7] = 1;
+        assert_eq!(routes(&p, &t, 2).unwrap()[1].unwrap().launches(), 3);
+    }
+
+    #[test]
+    fn resident_table_addresses_fill_one_allocation() {
+        let base = 4096;
+        let stride = 256 * 6144;
+        let table = resident_expert_table(base, stride);
+        let mut offsets = table
+            .iter()
+            .map(|p| (*p - base) / stride)
+            .collect::<Vec<_>>();
+        offsets.sort_unstable();
+        assert_eq!(offsets, (0..768).collect::<Vec<_>>());
+        let w = ResidentWeights::new(base, 8192);
+        assert_eq!(table[0], w.gu);
+        assert_eq!(table[2], w.down);
+        for e in 0..256 {
+            assert_eq!(table[e * 3], w.gu + e as u64 * 2 * stride);
+            assert_eq!(table[e * 3 + 1], table[e * 3] + stride);
+            assert_eq!(table[e * 3 + 2], w.down + e as u64 * stride);
+        }
+        assert_eq!(resident_expert_table(8192, 384)[2], w.ds);
+    }
+
+    #[test]
     #[ignore = "requires a gfx942 GPU lease and PLOW_TEST_AITER_DIR with flat objects"]
     fn moe_aiter_flat_hsa_dispatch() {
+        check_flat_hsa(false);
+    }
+
+    #[test]
+    #[ignore = "requires a gfx942 GPU lease and PLOW_TEST_AITER_DIR with resident adapter"]
+    fn moe_aiter_resident_flat_hsa_dispatch() {
+        check_flat_hsa(true);
+    }
+
+    #[test]
+    #[ignore = "requires a gfx942 GPU lease and PLOW_TEST_AITER_DIR"]
+    fn moe_aiter_resident_packing_matches_gpu() {
         let be = HsaBackend::new(0).unwrap();
         let mut modules = Vec::new();
         let dir = std::env::var("PLOW_TEST_AITER_DIR").unwrap();
-        let kernel = MoeAiter::load(&be, Path::new(&dir), 128, true, &mut modules).unwrap();
+        let kernel = MoeAiter::load(&be, Path::new(&dir), 128, false, false, &mut modules).unwrap();
+        let upload = |bytes: &[u8]| {
+            let m = EngineDevice::alloc(&be, bytes.len() as u64).unwrap();
+            EngineDevice::upload(&be, &m, 0, bytes).unwrap();
+            m
+        };
+        let mut projections = Vec::new();
+        let mut expected = Vec::new();
+        let mut scale_buffers = Vec::new();
+        let mut scale_expected = Vec::new();
+        for (j, (rows, k)) in [(256usize, 6144usize), (256, 6144), (6144, 256)]
+            .into_iter()
+            .enumerate()
+        {
+            let src: Vec<u8> = (0..rows * k)
+                .map(|i| {
+                    let b = ((i * 31 + i / 251 + j * 71) % 256) as u8;
+                    if b == 0x80 {
+                        0
+                    } else {
+                        b
+                    }
+                })
+                .collect();
+            expected.push(super::super::amd::shuffle_moe_weight_16x32(&src, rows, k).unwrap());
+            projections.push(upload(&src));
+            let scales: Vec<f32> = (0..96).map(|i| (i + j * 96 + 1) as f32 * 0.001).collect();
+            scale_expected.push(
+                super::super::amd::resident_moe_scales(bytemuck::cast_slice(&scales)).unwrap(),
+            );
+            scale_buffers.push(upload(bytemuck::cast_slice(&scales)));
+        }
+        let wt: Vec<u64> = (0..768).map(|i| projections[i % 3].base).collect();
+        let st: Vec<u64> = (0..768).map(|i| scale_buffers[i % 3].base).collect();
+        let wt = upload(bytemuck::cast_slice(&wt));
+        let st = upload(bytemuck::cast_slice(&st));
+        let [gu, down, gs, ds, ..] = kernel.buffers;
+        be.launch(
+            kernel.pack,
+            2048,
+            256,
+            0,
+            bytemuck::cast_slice(&[gu, down, gs, ds, wt.base, st.base]),
+        )
+        .unwrap();
+        be.synchronize().unwrap();
+        let wtab = resident_expert_table(gu, 256 * 6144);
+        let stab = resident_expert_table(gs, 96 * 4);
+        assert_eq!(wtab[2], down);
+        assert_eq!(stab[2], ds);
+        let mut actual = vec![0u8; 256 * 6144];
+        for e in 0..256 {
+            for j in 0..3 {
+                let offset = wtab[e * 3 + j] - kernel._scratch.base;
+                EngineDevice::download(&be, &kernel._scratch, offset, &mut actual).unwrap();
+                assert!(
+                    actual == expected[j],
+                    "expert {e} projection {j} weight mismatch"
+                );
+                let mut scales = vec![0u8; 96 * 4];
+                let offset = stab[e * 3 + j] - kernel._scratch.base;
+                EngineDevice::download(&be, &kernel._scratch, offset, &mut scales).unwrap();
+                assert!(
+                    scales == scale_expected[j],
+                    "expert {e} projection {j} scale mismatch"
+                );
+            }
+        }
+    }
+
+    fn bind_uniform_resident(be: &HsaBackend, kernel: &mut MoeAiter) -> Vec<DeviceMem> {
+        let upload = |bytes: &[u8]| {
+            let m = EngineDevice::alloc(be, bytes.len() as u64).unwrap();
+            EngineDevice::upload(be, &m, 0, bytes).unwrap();
+            m
+        };
+        let weights = upload(&vec![0x38; 256 * 3 * 256 * 6144]);
+        let mut native_scales = vec![0f32; 256 * 3 * 96];
+        for e in 0..256 {
+            let scale = 2.0 * (e % 8 + 1) as f32 * 0.001;
+            native_scales[e * 192..(e + 1) * 192].fill(scale);
+            native_scales[256 * 192 + e * 96..256 * 192 + (e + 1) * 96].fill(scale);
+        }
+        let scales = upload(bytemuck::cast_slice(&native_scales));
+        kernel.bind_resident(vec![(2, ResidentWeights::new(weights.base, scales.base))]);
+        vec![weights, scales]
+    }
+
+    fn check_flat_hsa(resident: bool) {
+        let be = HsaBackend::new(0).unwrap();
+        let mut modules = Vec::new();
+        let dir = std::env::var("PLOW_TEST_AITER_DIR").unwrap();
+        let mut kernel =
+            MoeAiter::load(&be, Path::new(&dir), 128, true, resident, &mut modules).unwrap();
         let upload = |bytes: &[u8]| {
             let m = EngineDevice::alloc(&be, bytes.len() as u64).unwrap();
             EngineDevice::upload(&be, &m, 0, bytes).unwrap();
@@ -667,8 +1036,18 @@ mod tests {
             .map(|i| scale.base + (i / 3 * 96 * 4) as u64)
             .collect();
         let st = upload(bytemuck::cast_slice(&scale_ptrs));
-        let out = upload(&vec![0xa5; 8 * 6144 * 2 + 8 + 512]);
-        for (iteration, rows) in [8u32, 3, 2, 1, 4, 8].into_iter().enumerate() {
+        let _resident_buffers = if resident {
+            bind_uniform_resident(&be, &mut kernel)
+        } else {
+            vec![]
+        };
+        let out = upload(&vec![0xa5; 20 * 6144 * 2 + 8 + 512]);
+        let rungs: &[u32] = if resident {
+            &[20, 16, 8, 4, 2, 1, 20, 3]
+        } else {
+            &[8, 3, 2, 1, 4, 8]
+        };
+        for (iteration, &rows) in rungs.iter().enumerate() {
             let x: Vec<u16> = (0..rows as usize * 6144)
                 .map(|i| [0x3f80, 0x3f00, 0x3e80][i / 6144 % 3])
                 .collect();
@@ -695,6 +1074,7 @@ mod tests {
             let route = Route {
                 inst: DevInst64 {
                     t: [0, 1, 2, 3, 4, TENSOR_NONE16, TENSOR_NONE16, TENSOR_NONE16],
+                    i: [rows, 6144, 256, 256, 8, 0, 1, u32::from(resident)],
                     ..Default::default()
                 },
                 rows,
@@ -722,10 +1102,21 @@ mod tests {
     #[test]
     #[ignore = "requires a gfx942 GPU lease and PLOW_TEST_AITER_DIR"]
     fn moe_aiter_hsa_dispatch() {
+        check_sorted_hsa(false);
+    }
+
+    #[test]
+    #[ignore = "requires a gfx942 GPU lease and PLOW_TEST_AITER_DIR with resident adapter"]
+    fn moe_aiter_resident_sorted_hsa_dispatch() {
+        check_sorted_hsa(true);
+    }
+
+    fn check_sorted_hsa(resident: bool) {
         let be = HsaBackend::new(0).unwrap();
         let mut modules = Vec::new();
         let dir = std::env::var("PLOW_TEST_AITER_DIR").unwrap();
-        let kernel = MoeAiter::load(&be, Path::new(&dir), 129, false, &mut modules).unwrap();
+        let mut kernel =
+            MoeAiter::load(&be, Path::new(&dir), 129, false, resident, &mut modules).unwrap();
         let upload = |bytes: &[u8]| {
             let m = EngineDevice::alloc(&be, bytes.len() as u64).unwrap();
             EngineDevice::upload(&be, &m, 0, bytes).unwrap();
@@ -741,6 +1132,11 @@ mod tests {
             .map(|i| scale.base + (i / 3 * 96 * 4) as u64)
             .collect();
         let st = upload(bytemuck::cast_slice(&scale_ptrs));
+        let _resident_buffers = if resident {
+            bind_uniform_resident(&be, &mut kernel)
+        } else {
+            vec![]
+        };
         for rows in [1u32, 129, 1] {
             let stride = rows.div_ceil(64) * 64;
             let mut meta = vec![0u32; 769];
@@ -773,6 +1169,7 @@ mod tests {
             let route = Route {
                 inst: DevInst64 {
                     t: [0, 1, 2, 3, 4, 5, 6, 7],
+                    i: [rows, 6144, 256, 256, 8, 64, 0, u32::from(resident)],
                     ..Default::default()
                 },
                 rows,

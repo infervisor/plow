@@ -475,3 +475,53 @@ This is one paired 20-request screen, without a repeatability estimate. It does
 not reproduce the supplied 100-request H200 run or establish its 273.67 output
 tokens/s target. Prefix caching and unified batching selectors remain on by
 default; unified batching still falls back for TP8.
+
+## Resident expert weights (gfx942 TP8)
+
+`--glm-moe-resident=true` / `PLOW_GLM_MOE_RESIDENT=1` packs primary expert
+weights once during loading. It implies native sorted prefill and flat decode
+at batches 1, 2, 4, 8, 16 and 20. It requires block-FP8 GLM geometry
+H6144/I256/E256/top8, without EP or packed prefill. The option defaults to false.
+
+The existing weight allocation holds native 16x32 tiles: gate/up interleaved
+by expert, followed by down. Scales are doubled for FNUZ, as in GPU packing.
+The loader rejects incompatible consumers or companion tables across all
+programs. Opcode 156's `i7=1` declares this layout; the adapter requires
+`plow_moe_resident_fp8_abi_1`. Build it with `scripts/build_moe_aiter.sh` and the
+same pinned sorted and flat objects used above.
+
+Sorted prefill skips weight packing (three launches instead of four). Flat
+decode copies routing in one workgroup before the native kernel. Primary
+expert storage remains 84.40 GiB per rank. Reusable MoE workspace falls from
+1,361,486,080 to 153,231,616 bytes per rank, saving 1,208,254,464 bytes.
+The native segments retain their ordered per-XCD packet queues.
+
+[mi300x-resident-serving.json](mi300x-resident-serving.json) records a matched
+20-request, 70k/700, range-ratio 0.14, C20, seed-0 comparison without speculation.
+Both arms use the same runtime and refreshed FP8 prefill image, 633 native
+decode GEMMs, and local selection; decode tiers and native fold are disabled.
+The control uses staged native prefill and interpreter MoE decode.
+
+| Metric | Control | Resident | Change |
+| --- | ---: | ---: | ---: |
+| Output throughput (tok/s) | 43.387 | 49.198 | +13.39% |
+| Mean TTFT (ms) | 110874.87 | 102836.43 | -7.25% |
+| Mean TPOT (ms) | 270.67 | 241.21 | -10.89% |
+| P99 TPOT (ms) | 406.76 | 382.78 | -5.90% |
+| Median ITL (ms) | 133.44 | 109.99 | -17.57% |
+
+Both arms complete 20/20 requests without failures, with identical input and
+output length arrays, and pass 18/18 retrieval checks. Twelve short tasks
+produce the expected first answer in both arms; generated continuations often
+repeat or add text, so this is not a strict instruction-following test. Only
+5/20 random-serving texts match exactly. These checks do not establish broad
+quality equivalence. One paired run supplies no repeatability estimate and
+does not meet the 100-request H200 target.
+
+Validation: 183 AMD runtime, 37 GLM emitter and 120 packet tests pass. Five HSA
+checks cover legacy/resident sorted and flat dispatch, poisoned output reuse
+with guards across all decode rungs, and exact CPU/GPU weight and scale packing
+for all 256 experts. Both full 78-layer packets pass Lean ordering and LDS
+checks for all ten programs. Disabling the option reproduces the previous
+packet byte-for-byte. The record contains source, binary, packet, object and
+result hashes plus reproduction scripts.

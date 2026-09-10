@@ -1839,9 +1839,11 @@ pub enum DevOp {
     /// groups and combines routed experts in BF16; writes the result as FP32.
     /// This is a separate numerical contract from the FP64 grouped-down path.
     /// `t0=out t1=x t2=weights t3=scales t4=meta_or_raw_routes t5=row_token t6=row_part t7=row_gate` ·
-    /// `i0=T i1=H i2=I i3=E i4=topk i5=align_tile i6=flat_decode`. Requires an isolated native segment.
+    /// `i0=T i1=H i2=I i3=E i4=topk i5=align_tile i6=flat_decode i7=resident_weights`. Requires an isolated native segment.
     /// `i6=1`: flat A16 decode, BF16 output plus eight scratch bytes, raw routing in t4,
     /// t5..t7 absent and i5=0. Combine as one BF16 partial (MoeCombinePf.i7=1).
+    /// `i7=1`: resident 16x32 weights, gate/up interleaved by expert followed by down;
+    /// scales are doubled for FNUZ. All consumers of these tables must use this layout.
     MoeAiterFp8Pf = 156,
     /// Native gfx942 TP8 query-partitioned DSA score, top-k and raw index gather.
     /// `t0=idx t1=score t2=q t3=k t4=w t5=kv_len t6=peer_slot` ·

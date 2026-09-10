@@ -3913,15 +3913,15 @@ struct GatheredExpert<'a> {
     fault_ns: u64,
 }
 
-fn shuffle_mxfp4_moe2_weight(src: &[u8], rows: usize, kbytes: usize) -> Result<Vec<u8>> {
+pub(super) fn shuffle_moe_weight_16x32(src: &[u8], rows: usize, kbytes: usize) -> Result<Vec<u8>> {
     if rows == 0 || !rows.is_multiple_of(16) || kbytes == 0 || !kbytes.is_multiple_of(32) {
         return Err(RuntimeError::Device(format!(
-            "lean MoE stage-2 weight layout requires rows%16=0 and Kbytes%32=0, got {rows}x{kbytes}"
+            "MoE 16x32 weight layout requires rows%16=0 and Kbytes%32=0, got {rows}x{kbytes}"
         )));
     }
     if src.len() != rows.saturating_mul(kbytes) {
         return Err(RuntimeError::Device(format!(
-            "lean MoE stage-2 weight layout got {} B for {rows}x{kbytes}",
+            "MoE 16x32 weight layout got {} B for {rows}x{kbytes}",
             src.len()
         )));
     }
@@ -3939,6 +3939,21 @@ fn shuffle_mxfp4_moe2_weight(src: &[u8], rows: usize, kbytes: usize) -> Result<V
         }
     }
     Ok(dst)
+}
+
+pub(super) fn resident_moe_scales(src: &[u8]) -> Result<Vec<u8>> {
+    if src.len() != 96 * 4 {
+        return Err(RuntimeError::Device("resident MoE requires 96 f32 scales per projection".into()));
+    }
+    let mut out = Vec::with_capacity(src.len());
+    for chunk in src.chunks_exact(4) {
+        let scaled = 2.0 * f32::from_le_bytes(chunk.try_into().unwrap());
+        if !scaled.is_finite() {
+            return Err(RuntimeError::Device("resident MoE scale overflows or is not finite".into()));
+        }
+        out.extend_from_slice(&scaled.to_le_bytes());
+    }
+    Ok(out)
 }
 
 fn shuffle_mxfp4_moe2_scale(src: &[u8], rows: usize, groups: usize) -> Result<Vec<u8>> {
@@ -3994,6 +4009,7 @@ fn gather_expert_entry<'a>(
     shard_n: u32,
     populate: bool,
     do_prefault: bool,
+    resident: bool,
 ) -> Result<GatheredExpert<'a>> {
     let (name, dst, want, scrub, pf_dst, pf_rows, pf_k, moe2_dst, moe2_rows, moe2_k, moe2_scale) =
         entry;
@@ -4019,7 +4035,14 @@ fn gather_expert_entry<'a>(
     // which is exactly the C reference's hand-rolled
     // `j < 2 ? offset : gather_row` split.
     let t = Instant::now();
-    let data = crate::asset::shard::slice_for(name, src, shape, *want, shard_rank, shard_n)?;
+    let mut data = crate::asset::shard::slice_for(name, src, shape, *want, shard_rank, shard_n)?;
+    if resident {
+        data = std::borrow::Cow::Owned(if *pf_rows == 0 {
+            resident_moe_scales(&data)?
+        } else {
+            shuffle_moe_weight_16x32(&data, *pf_rows as usize, *pf_k as usize)?
+        });
+    }
     let mut gather_ns = t.elapsed().as_nanos() as u64;
     let pf = if *pf_dst != 0 {
         // Preshuffled copy: out[((kt*R)+r)*64 + b] = in[r*K + kt*64 + b]. A pure
@@ -4050,7 +4073,7 @@ fn gather_expert_entry<'a>(
         let shuffled = if *moe2_scale {
             shuffle_mxfp4_moe2_scale(&data, *moe2_rows as usize, *moe2_k as usize)?
         } else {
-            shuffle_mxfp4_moe2_weight(&data, *moe2_rows as usize, *moe2_k as usize)?
+            shuffle_moe_weight_16x32(&data, *moe2_rows as usize, *moe2_k as usize)?
         };
         gather_ns += t.elapsed().as_nanos() as u64;
         Some((*moe2_dst, shuffled))
@@ -4079,7 +4102,8 @@ fn bind_packed_experts(
     prof: &LoadProf,
     do_prefault: bool,
     populate: bool,
-) -> Result<(Vec<DeviceMem>, u64)> {
+    resident_tables: &[Option<u16>],
+) -> Result<(Vec<DeviceMem>, u64, Vec<(u16, amd_moe_aiter::ResidentWeights)>)> {
     let layers: Vec<(usize, String, bool)> = blob
         .tensors
         .iter()
@@ -4095,7 +4119,7 @@ fn bind_packed_experts(
         })
         .collect();
     if layers.is_empty() {
-        return Ok((Vec::new(), 0));
+        return Ok((Vec::new(), 0, Vec::new()));
     }
     let t0 = std::time::Instant::now();
     // `I_moe` is not inferred: it is read off the very instruction that will
@@ -4156,6 +4180,7 @@ fn bind_packed_experts(
     };
 
     let mut bufs = Vec::with_capacity(layers.len() * 2);
+    let mut resident_weights = Vec::new();
     let mut i_moe = 0u64;
     // Which spelling the checkpoint turned out to have, for the one log line
     // that says so. A load that binds the wrong layout is silent by nature, so
@@ -4163,6 +4188,7 @@ fn bind_packed_experts(
     let mut layout = String::from("none");
     let mut wbytes = 0u64;
     for (i_ewt, pfx, ep_table) in &layers {
+        let resident = resident_tables[*i_ewt].is_some();
         let table_suffix = if *ep_table {
             "expert_scale_table_ep"
         } else {
@@ -4232,12 +4258,25 @@ fn bind_packed_experts(
             .len() as u64
             / if whole { 1 } else { n_gpu as u64 };
 
+        if resident && (*ep_table || whole || n_gpu != 8 || n_exp != 256
+            || i_moe != 256 || en.microscaled() || shape0 != [2048, 6144]
+            || w_stride != 256 * 6144 || s_stride != 96 * 4
+            || resident_tables[*i_ewt] != Some(i_est as u16))
+        {
+            return Err(RuntimeError::Device(format!("{pfx}: resident MoE requires TP8 block-FP8 H6144/I256/E256 weights")));
+        }
         let t_alloc = Instant::now();
         let d_w = EngineDevice::alloc(be, (n_local * 3 * w_stride).max(1))?;
         let d_s = EngineDevice::alloc(be, (n_local * 3 * s_stride).max(1))?;
         LoadProf::add(&prof.alloc_ns, t_alloc);
-        let wtab = crate::orch::moe::packed_expert_table(d_w.base, w_stride, n_exp, owned.clone());
-        let stab = crate::orch::moe::packed_expert_table(d_s.base, s_stride, n_exp, owned.clone());
+        let (wtab, stab) = if resident {
+            resident_weights.push((*i_ewt as u16, amd_moe_aiter::ResidentWeights::new(d_w.base, d_s.base)));
+            (amd_moe_aiter::resident_expert_table(d_w.base, w_stride),
+             amd_moe_aiter::resident_expert_table(d_s.base, s_stride))
+        } else {
+            (crate::orch::moe::packed_expert_table(d_w.base, w_stride, n_exp, owned.clone()),
+             crate::orch::moe::packed_expert_table(d_s.base, s_stride, n_exp, owned.clone()))
+        };
         // PRESHUFFLED PREFILL SLAB (PLOW_MOE_PF_SHUF): the blob declaring
         // `{pfx}expert_weight_table_pf` is the emit-time opt-in. A SECOND slab holds every
         // projection permuted to B'[K/64][R][64] so the grouped prefill GEMM's per-k-tile B
@@ -4466,6 +4505,7 @@ fn bind_packed_experts(
                         shard_n,
                         populate,
                         do_prefault,
+                        resident,
                     );
                     if tx.send(r).is_err() {
                         return;
@@ -4520,7 +4560,7 @@ fn bind_packed_experts(
         secs = format!("{:.1}", t0.elapsed().as_secs_f64()).as_str(),
         "routed experts packed; expert pointer tables filled"
     );
-    Ok((bufs, wbytes))
+    Ok((bufs, wbytes, resident_weights))
 }
 
 /// Contiguous instruction span covering every KV-row patch site, or `None` when
@@ -6118,6 +6158,8 @@ impl AmdEngine {
         let has_moe_aiter =
             |p: &DevProg| p.insts.iter().any(|d| d.op == DevOp::MoeAiterFp8Pf as u16);
         let use_moe_aiter = blob.progs.iter().any(has_moe_aiter);
+        let resident_tables = amd_moe_aiter::resident_tables(&blob.progs, &blob.tensors)?;
+        let use_resident_moe = resident_tables.iter().any(Option::is_some);
         if use_moe_aiter && (arch != "gfx942" || tp.is_none_or(|b| b.n_gpu != 8)) {
             return Err(RuntimeError::Device("AITER MoE requires gfx942 TP8".into()));
         }
@@ -7813,7 +7855,7 @@ impl AmdEngine {
         } else {
             None
         };
-        let moe_aiter = if use_moe_aiter {
+        let mut moe_aiter = if use_moe_aiter {
             let rows = blob
                 .progs
                 .iter()
@@ -7826,6 +7868,7 @@ impl AmdEngine {
                 hsaco_dir,
                 rows.max(128),
                 blob.progs[dec_ix..].iter().any(has_moe_aiter),
+                use_resident_moe,
                 &mut modules,
             )?)
         } else {
@@ -8368,7 +8411,7 @@ impl AmdEngine {
         if let Some(c) = ckpt.as_ref() {
             let eprof = LoadProf::default();
             let t_exp = Instant::now();
-            let (bufs, bytes) = bind_packed_experts(
+            let (bufs, bytes, resident_weights) = bind_packed_experts(
                 &be,
                 &blob,
                 c,
@@ -8382,7 +8425,11 @@ impl AmdEngine {
                 // Workers populate their own spans; `prefetch_threads() == 0`
                 // (the pool disabled) also turns that readahead off.
                 prefetch.is_some(),
+                &resident_tables,
             )?;
+            if let Some(moe) = moe_aiter.as_mut() {
+                moe.bind_resident(resident_weights);
+            }
             eprof.report("packed experts", t_exp.elapsed(), bytes);
             expert_bufs = bufs;
             wbytes += bytes;

@@ -146,3 +146,22 @@ extern "C" __global__ void plow_moe_aiter_flat_pack(MoeFlatPackArgs a) {
 }
 
 extern "C" __device__ unsigned plow_moe_flat_fp8_abi_1 = 1;
+
+struct MoeFlatRouteArgs {
+    unsigned* ids;
+    float* weights;
+    const uint2* table;
+    unsigned rows;
+    unsigned pad;
+};
+static_assert(sizeof(MoeFlatRouteArgs) == 32);
+
+extern "C" __global__ void plow_moe_aiter_flat_route(MoeFlatRouteArgs a) {
+    if (threadIdx.x < a.rows * 8u) {
+        const uint2 route = a.table[threadIdx.x];
+        a.ids[threadIdx.x] = route.x;
+        a.weights[threadIdx.x] = __uint_as_float(route.y);
+    }
+}
+
+extern "C" __device__ unsigned plow_moe_resident_fp8_abi_1 = 1;

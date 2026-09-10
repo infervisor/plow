@@ -1,0 +1,1472 @@
+{
+  "schema": "plow.glm.moe-resident.v1",
+  "date": "2026-09-10",
+  "artifact_root": "/tmp/tp-glm53-moe-resident",
+  "option": "glm_moe_resident / PLOW_GLM_MOE_RESIDENT, default false",
+  "scope": "Resident native MoE weights for sorted prefill and flat decode1/2/4/8/16/20 vs staged native prefill and interpreter MoE decode. Same runtime, refreshed FP8 prefill image, native633 decode GEMMs, local selection enabled, native fold and decode tiers disabled. No speculation.",
+  "campaign_source": {
+    "base_commit": "0616bb9edbe807c4c9cd497876ddc97a23c22a1a",
+    "source_sha256": {
+      "crates/devgen/src/emit_config.rs": "8ec5050be4cad7c15ffdddd5681c2ec6361d596b1e8e1fdf2cb52180b0a7e307",
+      "crates/devgen/src/mla.rs": "db3cd29a3f3752301379a25ceb09f2736a0511caa2bf7e08ef44f9ded737d5c1",
+      "crates/devgen/src/mla/glm_tests.rs": "8758ba5a7f332667e675ff2e017f7d7e9e90678c5660c4051653ebeb3adbda78",
+      "crates/packet/src/dev.rs": "82af40724540ed3dbef01d79b039cbad8039cf54a3b8c7c90790dd8f34ae4b0f",
+      "crates/packet/src/slots.rs": "46a95bf8bc70e39988411c4b6dd1d0c66dc3a255ede1197788edaa98b7f42aaf",
+      "crates/plowrt/src/exec/amd.rs": "c72b1e656edb69bed98a8bccdb8eb68f1d2b2bb72fd9bb5f14bae660d76026b2",
+      "crates/plowrt/src/exec/amd_moe_aiter.rs": "dff5d47b6f98d02c20f1729ba643a43a9ef06d4adbfa39f1573b88f7bf79e5d4",
+      "crates/plowrt/src/exec/amd_tests.rs": "3c48e67e12ee4ad9929ade97487c8d79d326181177e0e0a862af25a867d7dd71",
+      "runtime/amd/moe_aiter_adapter.hip": "fa4f9771d250b5efb8a9e44b0d5879c28749e274fcf38ed8b3e340fd9f796a00"
+    },
+    "runtime_sha256": "91f7bc889baaf2e4adc1c1bf6d56182b49f4bb8bf0c311226accce23b5cc60df",
+    "compiler_sha256": "40b6abe725e37505d72c4562c57e3344ac6b584068405a97d0ecbce9d88ac820",
+    "packets": {
+      "on": {
+        "sha256": "e1aa619ffd2d72ecff2f2c646d04e3a7023061759c98f5988650903276e473bd",
+        "programs": [
+          {
+            "rows": 128,
+            "native_moe": 75
+          },
+          {
+            "rows": 512,
+            "native_moe": 75
+          },
+          {
+            "rows": 2048,
+            "native_moe": 75
+          },
+          {
+            "rows": 8192,
+            "native_moe": 75
+          },
+          {
+            "rows": 1,
+            "native_moe": 75
+          },
+          {
+            "rows": 2,
+            "native_moe": 75
+          },
+          {
+            "rows": 4,
+            "native_moe": 75
+          },
+          {
+            "rows": 8,
+            "native_moe": 75
+          },
+          {
+            "rows": 16,
+            "native_moe": 75
+          },
+          {
+            "rows": 20,
+            "native_moe": 75
+          }
+        ],
+        "lean_ordering_programs": 10,
+        "lean_lds_programs": 10
+      },
+      "off": {
+        "sha256": "ab50d61f5b07103a5d89199668c1d0c7c6f86e72061648f2d21a0c1151e7c841",
+        "programs": [
+          {
+            "rows": 128,
+            "native_moe": 75
+          },
+          {
+            "rows": 512,
+            "native_moe": 75
+          },
+          {
+            "rows": 2048,
+            "native_moe": 75
+          },
+          {
+            "rows": 8192,
+            "native_moe": 75
+          },
+          {
+            "rows": 1,
+            "native_moe": 0
+          },
+          {
+            "rows": 2,
+            "native_moe": 0
+          },
+          {
+            "rows": 4,
+            "native_moe": 0
+          },
+          {
+            "rows": 8,
+            "native_moe": 0
+          },
+          {
+            "rows": 16,
+            "native_moe": 0
+          },
+          {
+            "rows": 20,
+            "native_moe": 0
+          }
+        ],
+        "lean_ordering_programs": 10,
+        "lean_lds_programs": 10
+      }
+    },
+    "objects": {
+      "interp_prefill_fp8kv_k3_moe_a4w4.elf": "55d26d5e69fd0fb3366ccc29061d87f9f5ebd2d88b73f8bf4e1d5ac9db8ace20",
+      "interp_prefill_mla_moe_gq.elf": "125e3dedf1b52a19fc312fff259b30aa856982c40ff70a0f0f30429c5298d133",
+      "interp_prefill_fp8_mla_gq.elf": "0b1c49b7960ad3f0635c99c132f82f93aaff92f10cc11a3985e0544172d5de3b",
+      "interp_packed_kda.elf": "5782544abbf8644191990875d68afb05ab8614a966af75b13bc51cbd23b50615",
+      "mla_a16w16_qh8_qseqlen1_gqaratio8_v3.co": "cd8fa62e18abada15beeeedd49357bcc1e9e2eee7353d038533f30cac93c3607",
+      "interp_mixed.elf": "b6d07c80dc2b3e0e210a11b724f4109588567a3ec7c8da92f4cf1b1fb5280849",
+      "interp_prefill.elf": "327e3ce53379c7ca059c94ebabecc7c68d92fe5b59e26a60cd8ac92aca35820c",
+      "dsa_tp_adapter_gfx942.elf": "3eb9d32d2b14a8e2ac23548ff279cacca1ea2aee2922de8eb921a8f244bf4ace",
+      "interp_prefill_fp8kv.elf": "1670b047b0949cb94d36e019f0305a987482ef8dd1f0aeb4e0883c1a48be44ee",
+      "interp_prefill_fp8kv_mla_gq.elf": "5183277a68f846d63811fc8531b50f45401df9fd24114e98b5e4aa7f3a72a023",
+      "interp_packed_mla_norm.elf": "acd572e019cbab221ca9f00d0c55dffcbfcce99fb5e43981e908dd2fc4d2ca3b",
+      "interp_prefill_fp8.elf": "7ab6f44c06c6b63497def48f655bf4aff26f2a40ebd83d03daf0322150558a57",
+      "interp_prefill_fp8kv_k3.elf": "ce243085320dd6130f9393ee2c58fbe74a74b8edb4f115adedc2001baf8c8489",
+      "interp_decode.elf": "bba60a24dbceb03ff9961d864c550d6d031839becf5ed86f7b931e438cfdf5be",
+      "interp_prefill_mla.elf": "1d2ef79cce71a2a05e81f2446ea68e68a56c95ebb4297ed6234121593b6d4120",
+      "interp_prefill_fp8_mla.elf": "38942d29b816fd5a73f15736d45d56440303516ebb73783a1de1fc77e0baa35d",
+      "interp_prefill_k3_moe.elf": "b52785d058902fd88feba60fc1d4833df85bda87506e322c96de79e4d3bd5668",
+      "interp_prefill_fp8_mla_moe.elf": "be9d0d6e3c5c659ec7679d1c3b206e131c3065817191dc9360fac666476dc467",
+      "interp_mixed_gq.elf": "b4ef16c9e835a98264ed063399433fe768f4037f8fb6fa57fd99be5cf4cd9a12",
+      "glm_lt_gfx942.elf": "efa5b0365bedc2effa52265c85eded14fb63febd9c067bab37138d99db607db5",
+      "interp_packed_mla_flash_gq.elf": "2e6abb164d6619f6cd5c69cef85406464574aad00a3c711e1c4b83fb57273ced",
+      "interp_prefill_fp8_gq.elf": "7c92d035f4707b5747dca68bc5bb428e078d153564df28056d43270e2fda518b",
+      "interp_decode_fp8_gq.elf": "ae87cdf7a25ddb51ee596c8e818a2722a2bf51a3be6b167228bc75ef986c1720",
+      "interp_prefill_fp8kv_k3_gq.elf": "bc81665f1a55e736b66a0773f286a4e8f01cade7e3dcbd197c8375dadc8f9c78",
+      "interp_tokbatch_gq.elf": "52b5a7a59435712fc2c6c0aa921aa5cb79c0fdc69a4d2e3a6c5d7a34d791fea9",
+      "interp_prefill_gq.elf": "94679944ddb712a8c959d9b606513b6076f38f5261116c02dbe49b5e98a5b0e2",
+      "interp_decode_fp8kv.elf": "5ae9fd5c4fe95305a74f4e17dcb67716c586cca758859d465483f9bfab91034b",
+      "interp_prefill_fp8_mla_moe_gq.elf": "d52e5ba0ae0d56a411447b099f5106eb828baf5862f360dcc3ab44a2d5ef01cf",
+      "interp_flash_fp8kv.elf": "98fb4e1e311bff0bd0a9dcb52132eee25849b02e2dad3fed342189deffc9b10b",
+      "interp_packed_kda_gq.elf": "a1ae8acb28ecef647bb976cbe954d548e028717e7bda5e2453e63f9c056e979e",
+      "interp_prefill_fp8kv_mla_moe_gq.elf": "3ad1f6571c698420a385f5738da93d5fd1bdcb1ab05c16602d8d3296da37f23c",
+      "interp_prefill_k3_moe_a4w4_gq.elf": "a2e3219f81743b32984a798eff9cd69e13dfc95b12288dfe55cb7263b956aa46",
+      "interp_decode_fp8kv_gq.elf": "f7292084bcedcb42d7df6a89d2c7959f1b20d3c99ff46d4af99d9d618f0970d5",
+      "interp_decode_k3_gq.elf": "b4f587bcbc040f89f030746f009d46aed1d8e9109c6543f90f6e8553829014db",
+      "interp_flash_gq.elf": "54d7c08558e89c96624822e3755dde56cb4d58ab2a1e8fc284eae15c226554ce",
+      "interp_prefill_k3_gq.elf": "9e3d8e2099e078f7162c58ddf2245cba27538ca1e298e4c53dbef8d488687267",
+      "moe_aiter_adapter_gfx942.elf": "ff0d86d22aadcb6391b8195517347eab54cc550a42b8ebea46fa96beb2d65d67",
+      "interp_prefill_mla_moe.elf": "3aef8ff0cdd1f9e2472e99fc7ea53e8063cda7e6dc778dbd143932609a64e818",
+      "interp_decode_fp8kv_k3.elf": "f00056eb6c6d702689a93bf79e9a7841bcb786120ee56dc03f3fb66357e28517",
+      "interp_tokbatch.elf": "8ff0283af5033fed0b56afea52620542bcbb44300351ffe8c00da59602cf5a3f",
+      "interp_prefill_fp8kv_gq.elf": "5fac6e98c7b8a8f3441626ada5fe0b43490fe8371eda24aab3273b9cf67ea657",
+      "fmoe_bf16_a16_blockscaleFp8_g1u1_vs_silu_1tg_16x128_flat_pf3.co": "be7052284094e7cedeb266afb24d4d6723bdf4234ac391b2e5b29473d8ee8f06",
+      "interp_prefill_k3_moe_a4w4.elf": "10d5994e4de4faaee02e321dd6993a071337197fea95193d7c0352ff2d7f18b6",
+      "interp_prefill_fp8kv_k3_moe_a4w4_gq.elf": "bffce184a1155588bdc25f6ed004241f093cc35ec560953378511a2e894e12ce",
+      "interp_decode_fp8.elf": "e8253bcbeca2f4f2f24482ce8fb3373043ad1b53dd0370544a4c517b36ca4676",
+      "interp_prefill_fp8kv_mla_moe.elf": "5bc13aba7cd6ba6122c61950f0149f448ff14ac21708895ba530cb93f8284ba0",
+      "fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256.co": "65b4c0a0b290dd83039047c18e0bb86f4253790e926dce324ddb6b45a7b28650",
+      "interp_packed_mla_flash.elf": "3af096e2f92d6b03d123d6b1b8c3a93c09c08d12a1aabafda940b11208ad69b6",
+      "interp_prefill_fp8kv_mla.elf": "0f3bfa048876cc460da2cdde0135ea7a10168739edd623fea07e6e669772b745",
+      "test_kernels.elf": "dec11ad6a64292d39ef4a5c5f202b52b5f658c7eb0fe6729534bff9ccae18362",
+      "interp_decode_fp8kv_k3_gq.elf": "9a8aa8553d0942c5e8e8667c280713e990e325f812a7ab639825adcd70344f33",
+      "mla_sparse_adapter_gfx942.elf": "a77f08c610bcda50a535e9a86caa601517e5f55368d17f4a47cc72679128774c",
+      "interp_prefill_k3_moe_gq.elf": "92c78ce732118ace85b415d44edda72d7413d7ef78518db25343432114e34c43",
+      "interp_prefill_mla_gq.elf": "771cebb619b37fc70f002543dc300d43828ed939e12af93cb8671b925d7226cb",
+      "interp_flash.elf": "861e032541a3ebee101fbaac31134cb288d188c8d5556681114ee7e77a009eb4",
+      "interp_packed_mla_norm_gq.elf": "de9173ee6cce272a0cdf231f8c5b47332b00f40c13bbf21cd619ea191e10c024",
+      "interp_decode_gq.elf": "c45ecb5cb092e44638c7673a4e9e7eb821ff3b58501382b64ca91155b71f2dc2",
+      "interp_flash_fp8kv_gq.elf": "6f750e306085a7e62751d2e9a958aa418bdd9a1a64ac0d7c412a28ed1f5d2bf6",
+      "interp_prefill_k3.elf": "2306223b17f9853e356da9d22b9d80651793a5aae4b77db57e3a558e9348b41f",
+      "interp_decode_k3.elf": "a9d0574099f7380255cc2a737e07a3e9eb7c2988399013bf50402db812e2b7f3"
+    },
+    "script_sha256": {
+      "verify-emit.sh": "0f09dafada196efd96ec366b9d527468b2bdc7e2d83f4662b41c5df292f761ad",
+      "build-adapter.sh": "218284b7a7bc27854bf6e677ee115348a4c34840765f0bb852e5cc023c493d26",
+      "campaign.sh": "546cf49b99b3c60af141fd80524abd9df9c77b7ddb74f3174500065455f9e827",
+      "short-quality.py": "e9dc5bd8527c59274888685c012481999b3d89c6bc958cd41bdf9cd06886e756"
+    },
+    "tests": {
+      "hsa_packing_flat_sorted": 5,
+      "amd_host": 183,
+      "glm_emitter": 37,
+      "packet": 120
+    },
+    "scope": "Resident native sorted prefill and flat decode1/2/4/8/16/20 vs prior633-native-GEMM/local-selector packet with staged native sorted prefill and interpreter MoE decode. Same runtime and refreshed prefill image both. No speculation. Default false.",
+    "patch": "diff --git a/crates/devgen/src/emit_config.rs b/crates/devgen/src/emit_config.rs\nindex ff56ab8d..3e19fd00 100644\n--- a/crates/devgen/src/emit_config.rs\n+++ b/crates/devgen/src/emit_config.rs\n@@ -579,6 +579,10 @@ pub struct EmitConfig {\n     #[arg(long, env = \"PLOW_GLM_MOE_FLAT_DECODE\", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = \"true\")]\n     pub glm_moe_flat_decode: bool,\n \n+    /// Pack GLM expert weights once for native gfx942 TP8 prefill and decode.\n+    #[arg(long, env = \"PLOW_GLM_MOE_RESIDENT\", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = \"true\")]\n+    pub glm_moe_resident: bool,\n+\n     /// Partition large GLM prefill index queries across eight gfx942 ranks.\n     #[arg(long, env = \"PLOW_GLM_INDEX_TP\", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = \"true\")]\n     pub glm_index_tp: bool,\n@@ -1063,6 +1067,7 @@ impl EmitConfig {\n             glm_fp8_kv: env_bool(\"PLOW_GLM_FP8_KV\"),\n             glm_moe_aiter: env_bool(\"PLOW_GLM_MOE_AITER\"),\n             glm_moe_flat_decode: env_bool(\"PLOW_GLM_MOE_FLAT_DECODE\"),\n+            glm_moe_resident: env_bool(\"PLOW_GLM_MOE_RESIDENT\"),\n             glm_index_tp: env_bool(\"PLOW_GLM_INDEX_TP\"),\n             glm_select_local: env_bool(\"PLOW_GLM_SELECT_LOCAL\"),\n             glm_gemm_lt: env_bool(\"PLOW_GLM_GEMM_LT\"),\ndiff --git a/crates/devgen/src/mla.rs b/crates/devgen/src/mla.rs\nindex b5930eda..ff683e3f 100644\n--- a/crates/devgen/src/mla.rs\n+++ b/crates/devgen/src/mla.rs\n@@ -1915,7 +1915,7 @@ pub(crate) fn declare_glm_rows_batched(\n     // gathered-row bound: the align op pads each expert's row range up to a whole MPF_BM tile, so\n     // every expert can waste at most MPF_BM-1 rows. Sizing this from T*k alone is an out-of-bounds\n     // device write with no symptom at low expert counts and a guaranteed one at 384.\n-    let (meta, row_token, row_partidx, row_gate, fu_g, fu_scale) = if rows > 1 {\n+    let (meta, row_token, row_partidx, row_gate, fu_g, fu_scale) = if rows > 1 || emit_config::active().glm_moe_resident {\n         let pad_rows = rows * tk as u64 + (e * (MPF_BM - 1)) as u64;\n         // The gathered GLU output is bf16 on the bf16/block-fp8 arms and PACKED fp4 under A4W4 \u2014\n         // half a byte per value plus one E8M0 byte per 32. The buffer is sized for whichever the\n@@ -5435,7 +5435,8 @@ fn emit_glm_moe_ffn_prefill(\n     // It is the earliest packet of the MoE chain (router -> align -> GLU -> DOWN), so the\n     // existing edges already order the zero before every writer \u2014 no new packet, no new gate.\n     // `tk.is_power_of_two()` is what makes `tok = pidx >> log2(k)` exact.\n-    let native_moe = emit_config::active().glm_moe_aiter;\n+    let resident = emit_config::active().glm_moe_resident;\n+    let native_moe = emit_config::active().glm_moe_aiter || resident;\n     if native_moe {\n         assert!(\n             !emit_config::active().packed_prefill_on(),\n@@ -5612,7 +5613,7 @@ fn emit_glm_moe_ffn_prefill(\n                 n.row_partidx,\n                 n.row_gate,\n             ];\n-            d.i = [t, h, imoe_e, e, tk, 64, 0, 0];\n+            d.i = [t, h, imoe_e, e, tk, 64, 0, u32::from(resident)];\n         });\n         b.isolate(counter);\n         counter\n@@ -6307,7 +6308,12 @@ fn emit_glm_moe_ffn_rows(\n                     },\n                 )\n             });\n-    let flat = emit_config::active().glm_moe_flat_decode && matches!(rows, 2 | 4 | 8);\n+    let resident = emit_config::active().glm_moe_resident;\n+    assert!(\n+        !resident || matches!(rows, 1 | 2 | 4 | 8 | 16 | 20),\n+        \"resident GLM MoE decode requires rows 1/2/4/8/16/20\"\n+    );\n+    let flat = resident || (emit_config::active().glm_moe_flat_decode && matches!(rows, 2 | 4 | 8));\n     if flat {\n         assert!(\n             enc == MoeEnc::Fp8Blk\n@@ -6489,7 +6495,7 @@ fn emit_glm_moe_ffn_rows(\n                 TENSOR_NONE,\n                 TENSOR_NONE,\n             ];\n-            d.i = [rows, h, imoe_e, e, tk, 0, 1, 0];\n+            d.i = [rows, h, imoe_e, e, tk, 0, 1, u32::from(resident)];\n         });\n         b.isolate(counter);\n         counter\n@@ -6640,7 +6646,7 @@ pub(crate) fn emit_glm_moe_ffn(\n     let use_fp8 = enc != MoeEnc::Bf16;\n     let lin_fp8 = glm_linear_fp8(enc);\n     let glu_split = glm_shared_glu_split(enc);\n-    if rows > 1 {\n+    if rows > 1 || emit_config::active().glm_moe_resident {\n         // BATCHED DECODE FFN: the decode MoE op family carries no token dimension\n         // (`MoeRouterTopk`/`MoeGroupGluFp8Blk`/`MoeGroupDownFp8Blk`/`MoeCombine` are all\n         // single-row), so at rows > 1 the seam is emitted with the PREFILL family at T = rows \u2014\n@@ -7416,6 +7422,16 @@ fn glm_emit_full(\n     let nl = cap.unwrap_or(c.layers).min(c.layers);\n     let layers: Vec<u32> = (0..nl).collect();\n     let enc = MoeEnc::from_flags(use_fp8, false);\n+    if emit_config::active().glm_moe_resident {\n+        assert!(\n+            crate::emit_is_amd() && target == \"gfx942\" && tp == 8\n+                && enc == MoeEnc::Fp8Blk && !c.ep\n+                && !emit_config::active().packed_prefill_on()\n+                && !emit_config::active().moe_prefill_ep,\n+            \"resident GLM MoE requires gfx942 TP8 block-FP8 without EP or packed prefill\"\n+        );\n+    }\n+\n \n     // PREFILL BUCKETS. `PLOW_MLA_PREFILL=full` turns the serving blob from decode-only (n_prog = 1)\n     // into a bucket ladder + decode. Decode-only is what made GLM's TTFT 20x vLLM's: with no\n@@ -7492,10 +7508,12 @@ fn glm_emit_full(\n             }\n             pb.set_l2_placement(l2_layout);\n         }\n-        if emit_config::active().glm_fold_lt && t >= 2048 {\n+        if (emit_config::active().glm_fold_lt && t >= 2048)\n+            || emit_config::active().glm_moe_resident\n+        {\n             assert!(\n                 crate::emit_is_amd() && target == \"gfx942\",\n-                \"native MLA fold requires gfx942\"\n+                \"native GLM prefill requires gfx942\"\n             );\n             pb.deny_uniseg();\n         }\n@@ -7578,7 +7596,9 @@ fn glm_emit_full(\n     let mut n_ops = 0;\n     for &rb in &rungs {\n         let mut b = Builder::new(n_cu);\n-        if emit_config::active().glm_moe_flat_decode && matches!(rb, 2 | 4 | 8) {\n+        if (emit_config::active().glm_moe_flat_decode && matches!(rb, 2 | 4 | 8))\n+            || emit_config::active().glm_moe_resident\n+        {\n             assert!(\n                 crate::emit_is_amd() && target == \"gfx942\",\n                 \"flat GLM MoE requires gfx942\"\ndiff --git a/crates/devgen/src/mla/glm_tests.rs b/crates/devgen/src/mla/glm_tests.rs\nindex c2de04be..5b0b43e3 100644\n--- a/crates/devgen/src/mla/glm_tests.rs\n+++ b/crates/devgen/src/mla/glm_tests.rs\n@@ -1684,14 +1684,24 @@ fn glm_placed_prefill_preserves_native_segment_boundaries() {\n \n #[test]\n fn glm_flat_decode_preserves_xcd_native_segment_boundaries() {\n+    check_glm_flat_segments(false);\n+}\n+\n+#[test]\n+fn glm_resident_moe_preserves_all_native_segment_boundaries() {\n+    check_glm_flat_segments(true);\n+}\n+\n+fn check_glm_flat_segments(resident: bool) {\n     let _guard = crate::test_env::env_guard();\n     let _target = crate::EmitAmdGuard::set(true);\n     let _env = crate::test_env::EnvScope::set(&[\n         (\"PLOW_MLA_PREFILL\", \"full:128\"),\n         (\"PLOW_GLM_PLACE_PF\", \"0\"),\n         (\"PLOW_GLM_MOE_AITER\", \"0\"),\n-        (\"PLOW_GLM_MOE_FLAT_DECODE\", \"1\"),\n-        (\"PLOW_DECODE_BATCH_LADDER\", \"1,2,4,8\"),\n+        (\"PLOW_GLM_MOE_FLAT_DECODE\", if resident { \"0\" } else { \"1\" }),\n+        (\"PLOW_GLM_MOE_RESIDENT\", if resident { \"1\" } else { \"0\" }),\n+        (\"PLOW_DECODE_BATCH_LADDER\", if resident { \"1,2,4,8,16,20\" } else { \"1,2,4,8\" }),\n         (\"PLOW_EMIT_PACKED_PREFILL\", \"0\"),\n         (\"PLOW_UNISEG\", \"0\"),\n     ]);\n@@ -1709,7 +1719,7 @@ fn glm_flat_decode_preserves_xcd_native_segment_boundaries() {\n         \"rope_theta\": 8000000.0\n     });\n     std::fs::write(dir.join(\"config.json\"), config.to_string()).unwrap();\n-    let verify: crate::VerifyHook = Box::new(|model| {\n+    let verify: crate::VerifyHook = Box::new(move |model| {\n         let mut checked = 0;\n         for (prog, &rows) in model.progs.iter().zip(&model.prog_t) {\n             let native = prog\n@@ -1718,15 +1728,18 @@ fn glm_flat_decode_preserves_xcd_native_segment_boundaries() {\n                 .enumerate()\n                 .filter(|(_, d)| d.op == DevOp::MoeAiterFp8Pf as u16)\n                 .collect::<Vec<_>>();\n-            if !matches!(rows, 2 | 4 | 8) {\n+            if !resident && !matches!(rows, 2 | 4 | 8) {\n                 assert!(native.is_empty());\n                 continue;\n             }\n             checked += 1;\n-            assert_eq!(prog.l2_domains, 8);\n+            if rows <= 20 { assert_eq!(prog.l2_domains, 8); }\n             assert_eq!(native.len(), 1);\n             let (ix, inst) = native[0];\n-            assert_eq!(inst.i, [rows, 6144, 256, 256, 8, 0, 1, 0]);\n+            if rows > 20 {\n+                assert_eq!(inst.i, [rows, 6144, 256, 256, 8, 64, 0, 1]);\n+            } else {\n+            assert_eq!(inst.i, [rows, 6144, 256, 256, 8, 0, 1, u32::from(resident)]);\n             assert_eq!(&inst.t[5..], &[TENSOR_NONE; 3]);\n             let router = prog.insts[..ix]\n                 .iter()\n@@ -1740,6 +1753,7 @@ fn glm_flat_decode_preserves_xcd_native_segment_boundaries() {\n                 .find(|d| d.op == DevOp::MoeCombinePf as u16 && d.t[3] == inst.t[0])\n                 .unwrap();\n             assert_eq!(combine.i, [6144, 1, rows, 0, 0, 0, 0, 1]);\n+            }\n             let segment = prog\n                 .stream\n                 .iter()\n@@ -1763,9 +1777,9 @@ fn glm_flat_decode_preserves_xcd_native_segment_boundaries() {\n                 .map(|e| usize::from(e.seg) + 1)\n                 .max()\n                 .unwrap();\n-            assert_eq!(prog.gq_seg_ofs.len(), segments * 8 + 1);\n+            if rows <= 20 { assert_eq!(prog.gq_seg_ofs.len(), segments * 8 + 1); }\n         }\n-        assert_eq!(checked, 3);\n+        assert_eq!(checked, if resident { 7 } else { 3 });\n         Ok(crate::LeanReport::skipped(\n             \"flat decode segment regression test\",\n         ))\ndiff --git a/crates/packet/src/dev.rs b/crates/packet/src/dev.rs\nindex 01627fbd..e3bd4a54 100644\n--- a/crates/packet/src/dev.rs\n+++ b/crates/packet/src/dev.rs\n@@ -1839,9 +1839,11 @@ pub enum DevOp {\n     /// groups and combines routed experts in BF16; writes the result as FP32.\n     /// This is a separate numerical contract from the FP64 grouped-down path.\n     /// `t0=out t1=x t2=weights t3=scales t4=meta_or_raw_routes t5=row_token t6=row_part t7=row_gate` \u00b7\n-    /// `i0=T i1=H i2=I i3=E i4=topk i5=align_tile i6=flat_decode`. Requires an isolated native segment.\n+    /// `i0=T i1=H i2=I i3=E i4=topk i5=align_tile i6=flat_decode i7=resident_weights`. Requires an isolated native segment.\n     /// `i6=1`: flat A16 decode, BF16 output plus eight scratch bytes, raw routing in t4,\n     /// t5..t7 absent and i5=0. Combine as one BF16 partial (MoeCombinePf.i7=1).\n+    /// `i7=1`: resident 16x32 weights, gate/up interleaved by expert followed by down;\n+    /// scales are doubled for FNUZ. All consumers of these tables must use this layout.\n     MoeAiterFp8Pf = 156,\n     /// Native gfx942 TP8 query-partitioned DSA score, top-k and raw index gather.\n     /// `t0=idx t1=score t2=q t3=k t4=w t5=kv_len t6=peer_slot` \u00b7\ndiff --git a/crates/packet/src/slots.rs b/crates/packet/src/slots.rs\nindex 4a348d09..ac1b639a 100644\n--- a/crates/packet/src/slots.rs\n+++ b/crates/packet/src/slots.rs\n@@ -273,7 +273,7 @@ const DOC: &[S] = &[\n     S { op: DevOp::MoeGluMxPf, t: &[\"fu_g\", \"xn2\", \"W_gu\", \"S_gu\", \"meta\", \"row_token\", \"bias_gu?\"], i: &[\"I\", \"K\", \"n_exp\", \"layout\", \"\", \"act\"], f: &[\"alpha\", \"limit\"], j: &[] },\n     S { op: DevOp::MoeDownMxPf, t: &[\"part\", \"fu_g\", \"W_d\", \"S_d\", \"meta\", \"bias_d?\", \"row_partidx\", \"row_gate\"], i: &[\"H\", \"I\", \"n_exp\"], f: &[], j: &[] },\n     S { op: DevOp::PerLayerInput, t: &[\"x\", \"Wg\", \"Wp\", \"gamma_post\", \"ple\", \"hn_out?\", \"gamma_next?\"], i: &[\"T\", \"H\", \"P\", \"col0\", \"stride\"], f: &[\"eps\", \"layer_scalar\"], j: &[] },\n-    S { op: DevOp::MoeAiterFp8Pf, t: &[\"out\", \"x\", \"weights\", \"scales\", \"meta_or_raw_routes\", \"row_token\", \"row_part\", \"row_gate\"], i: &[\"T\", \"H\", \"I\", \"E\", \"topk\", \"align_tile\", \"flat_decode\"], f: &[], j: &[] },\n+    S { op: DevOp::MoeAiterFp8Pf, t: &[\"out\", \"x\", \"weights\", \"scales\", \"meta_or_raw_routes\", \"row_token\", \"row_part\", \"row_gate\"], i: &[\"T\", \"H\", \"I\", \"E\", \"topk\", \"align_tile\", \"flat_decode\", \"resident_weights\"], f: &[], j: &[] },\n     S { op: DevOp::IndexTpPf, t: &[\"idx\", \"score\", \"q\", \"k\", \"w\", \"kv_len\", \"peer_slot\"], i: &[\"T\", \"ctx\", \"topk\", \"tp\", \"slot_bytes\", \"enter_gate\", \"complete_gate\"], f: &[\"scale\"], j: &[] },\n     S { op: DevOp::GemmLtPf, t: &[\"out\", \"x\", \"weight\"], i: &[\"T\", \"N\", \"K\", \"decode\"], f: &[], j: &[] },\n ];\ndiff --git a/crates/plowrt/src/exec/amd.rs b/crates/plowrt/src/exec/amd.rs\nindex 06c88076..d170f2f3 100644\n--- a/crates/plowrt/src/exec/amd.rs\n+++ b/crates/plowrt/src/exec/amd.rs\n@@ -3913,15 +3913,15 @@ struct GatheredExpert<'a> {\n     fault_ns: u64,\n }\n \n-fn shuffle_mxfp4_moe2_weight(src: &[u8], rows: usize, kbytes: usize) -> Result<Vec<u8>> {\n+pub(super) fn shuffle_moe_weight_16x32(src: &[u8], rows: usize, kbytes: usize) -> Result<Vec<u8>> {\n     if rows == 0 || !rows.is_multiple_of(16) || kbytes == 0 || !kbytes.is_multiple_of(32) {\n         return Err(RuntimeError::Device(format!(\n-            \"lean MoE stage-2 weight layout requires rows%16=0 and Kbytes%32=0, got {rows}x{kbytes}\"\n+            \"MoE 16x32 weight layout requires rows%16=0 and Kbytes%32=0, got {rows}x{kbytes}\"\n         )));\n     }\n     if src.len() != rows.saturating_mul(kbytes) {\n         return Err(RuntimeError::Device(format!(\n-            \"lean MoE stage-2 weight layout got {} B for {rows}x{kbytes}\",\n+            \"MoE 16x32 weight layout got {} B for {rows}x{kbytes}\",\n             src.len()\n         )));\n     }\n@@ -3941,6 +3941,21 @@ fn shuffle_mxfp4_moe2_weight(src: &[u8], rows: usize, kbytes: usize) -> Result<V\n     Ok(dst)\n }\n \n+pub(super) fn resident_moe_scales(src: &[u8]) -> Result<Vec<u8>> {\n+    if src.len() != 96 * 4 {\n+        return Err(RuntimeError::Device(\"resident MoE requires 96 f32 scales per projection\".into()));\n+    }\n+    let mut out = Vec::with_capacity(src.len());\n+    for chunk in src.chunks_exact(4) {\n+        let scaled = 2.0 * f32::from_le_bytes(chunk.try_into().unwrap());\n+        if !scaled.is_finite() {\n+            return Err(RuntimeError::Device(\"resident MoE scale overflows or is not finite\".into()));\n+        }\n+        out.extend_from_slice(&scaled.to_le_bytes());\n+    }\n+    Ok(out)\n+}\n+\n fn shuffle_mxfp4_moe2_scale(src: &[u8], rows: usize, groups: usize) -> Result<Vec<u8>> {\n     if rows == 0 || groups == 0 || src.len() != rows.saturating_mul(groups) {\n         return Err(RuntimeError::Device(format!(\n@@ -3994,6 +4009,7 @@ fn gather_expert_entry<'a>(\n     shard_n: u32,\n     populate: bool,\n     do_prefault: bool,\n+    resident: bool,\n ) -> Result<GatheredExpert<'a>> {\n     let (name, dst, want, scrub, pf_dst, pf_rows, pf_k, moe2_dst, moe2_rows, moe2_k, moe2_scale) =\n         entry;\n@@ -4019,7 +4035,14 @@ fn gather_expert_entry<'a>(\n     // which is exactly the C reference's hand-rolled\n     // `j < 2 ? offset : gather_row` split.\n     let t = Instant::now();\n-    let data = crate::asset::shard::slice_for(name, src, shape, *want, shard_rank, shard_n)?;\n+    let mut data = crate::asset::shard::slice_for(name, src, shape, *want, shard_rank, shard_n)?;\n+    if resident {\n+        data = std::borrow::Cow::Owned(if *pf_rows == 0 {\n+            resident_moe_scales(&data)?\n+        } else {\n+            shuffle_moe_weight_16x32(&data, *pf_rows as usize, *pf_k as usize)?\n+        });\n+    }\n     let mut gather_ns = t.elapsed().as_nanos() as u64;\n     let pf = if *pf_dst != 0 {\n         // Preshuffled copy: out[((kt*R)+r)*64 + b] = in[r*K + kt*64 + b]. A pure\n@@ -4050,7 +4073,7 @@ fn gather_expert_entry<'a>(\n         let shuffled = if *moe2_scale {\n             shuffle_mxfp4_moe2_scale(&data, *moe2_rows as usize, *moe2_k as usize)?\n         } else {\n-            shuffle_mxfp4_moe2_weight(&data, *moe2_rows as usize, *moe2_k as usize)?\n+            shuffle_moe_weight_16x32(&data, *moe2_rows as usize, *moe2_k as usize)?\n         };\n         gather_ns += t.elapsed().as_nanos() as u64;\n         Some((*moe2_dst, shuffled))\n@@ -4079,7 +4102,8 @@ fn bind_packed_experts(\n     prof: &LoadProf,\n     do_prefault: bool,\n     populate: bool,\n-) -> Result<(Vec<DeviceMem>, u64)> {\n+    resident_tables: &[Option<u16>],\n+) -> Result<(Vec<DeviceMem>, u64, Vec<(u16, amd_moe_aiter::ResidentWeights)>)> {\n     let layers: Vec<(usize, String, bool)> = blob\n         .tensors\n         .iter()\n@@ -4095,7 +4119,7 @@ fn bind_packed_experts(\n         })\n         .collect();\n     if layers.is_empty() {\n-        return Ok((Vec::new(), 0));\n+        return Ok((Vec::new(), 0, Vec::new()));\n     }\n     let t0 = std::time::Instant::now();\n     // `I_moe` is not inferred: it is read off the very instruction that will\n@@ -4156,6 +4180,7 @@ fn bind_packed_experts(\n     };\n \n     let mut bufs = Vec::with_capacity(layers.len() * 2);\n+    let mut resident_weights = Vec::new();\n     let mut i_moe = 0u64;\n     // Which spelling the checkpoint turned out to have, for the one log line\n     // that says so. A load that binds the wrong layout is silent by nature, so\n@@ -4163,6 +4188,7 @@ fn bind_packed_experts(\n     let mut layout = String::from(\"none\");\n     let mut wbytes = 0u64;\n     for (i_ewt, pfx, ep_table) in &layers {\n+        let resident = resident_tables[*i_ewt].is_some();\n         let table_suffix = if *ep_table {\n             \"expert_scale_table_ep\"\n         } else {\n@@ -4232,12 +4258,25 @@ fn bind_packed_experts(\n             .len() as u64\n             / if whole { 1 } else { n_gpu as u64 };\n \n+        if resident && (*ep_table || whole || n_gpu != 8 || n_exp != 256\n+            || i_moe != 256 || en.microscaled() || shape0 != [2048, 6144]\n+            || w_stride != 256 * 6144 || s_stride != 96 * 4\n+            || resident_tables[*i_ewt] != Some(i_est as u16))\n+        {\n+            return Err(RuntimeError::Device(format!(\"{pfx}: resident MoE requires TP8 block-FP8 H6144/I256/E256 weights\")));\n+        }\n         let t_alloc = Instant::now();\n         let d_w = EngineDevice::alloc(be, (n_local * 3 * w_stride).max(1))?;\n         let d_s = EngineDevice::alloc(be, (n_local * 3 * s_stride).max(1))?;\n         LoadProf::add(&prof.alloc_ns, t_alloc);\n-        let wtab = crate::orch::moe::packed_expert_table(d_w.base, w_stride, n_exp, owned.clone());\n-        let stab = crate::orch::moe::packed_expert_table(d_s.base, s_stride, n_exp, owned.clone());\n+        let (wtab, stab) = if resident {\n+            resident_weights.push((*i_ewt as u16, amd_moe_aiter::ResidentWeights::new(d_w.base, d_s.base)));\n+            (amd_moe_aiter::resident_expert_table(d_w.base, w_stride),\n+             amd_moe_aiter::resident_expert_table(d_s.base, s_stride))\n+        } else {\n+            (crate::orch::moe::packed_expert_table(d_w.base, w_stride, n_exp, owned.clone()),\n+             crate::orch::moe::packed_expert_table(d_s.base, s_stride, n_exp, owned.clone()))\n+        };\n         // PRESHUFFLED PREFILL SLAB (PLOW_MOE_PF_SHUF): the blob declaring\n         // `{pfx}expert_weight_table_pf` is the emit-time opt-in. A SECOND slab holds every\n         // projection permuted to B'[K/64][R][64] so the grouped prefill GEMM's per-k-tile B\n@@ -4466,6 +4505,7 @@ fn bind_packed_experts(\n                         shard_n,\n                         populate,\n                         do_prefault,\n+                        resident,\n                     );\n                     if tx.send(r).is_err() {\n                         return;\n@@ -4520,7 +4560,7 @@ fn bind_packed_experts(\n         secs = format!(\"{:.1}\", t0.elapsed().as_secs_f64()).as_str(),\n         \"routed experts packed; expert pointer tables filled\"\n     );\n-    Ok((bufs, wbytes))\n+    Ok((bufs, wbytes, resident_weights))\n }\n \n /// Contiguous instruction span covering every KV-row patch site, or `None` when\n@@ -6118,6 +6158,8 @@ impl AmdEngine {\n         let has_moe_aiter =\n             |p: &DevProg| p.insts.iter().any(|d| d.op == DevOp::MoeAiterFp8Pf as u16);\n         let use_moe_aiter = blob.progs.iter().any(has_moe_aiter);\n+        let resident_tables = amd_moe_aiter::resident_tables(&blob.progs, &blob.tensors)?;\n+        let use_resident_moe = resident_tables.iter().any(Option::is_some);\n         if use_moe_aiter && (arch != \"gfx942\" || tp.is_none_or(|b| b.n_gpu != 8)) {\n             return Err(RuntimeError::Device(\"AITER MoE requires gfx942 TP8\".into()));\n         }\n@@ -7813,7 +7855,7 @@ impl AmdEngine {\n         } else {\n             None\n         };\n-        let moe_aiter = if use_moe_aiter {\n+        let mut moe_aiter = if use_moe_aiter {\n             let rows = blob\n                 .progs\n                 .iter()\n@@ -7826,6 +7868,7 @@ impl AmdEngine {\n                 hsaco_dir,\n                 rows.max(128),\n                 blob.progs[dec_ix..].iter().any(has_moe_aiter),\n+                use_resident_moe,\n                 &mut modules,\n             )?)\n         } else {\n@@ -8368,7 +8411,7 @@ impl AmdEngine {\n         if let Some(c) = ckpt.as_ref() {\n             let eprof = LoadProf::default();\n             let t_exp = Instant::now();\n-            let (bufs, bytes) = bind_packed_experts(\n+            let (bufs, bytes, resident_weights) = bind_packed_experts(\n                 &be,\n                 &blob,\n                 c,\n@@ -8382,7 +8425,11 @@ impl AmdEngine {\n                 // Workers populate their own spans; `prefetch_threads() == 0`\n                 // (the pool disabled) also turns that readahead off.\n                 prefetch.is_some(),\n+                &resident_tables,\n             )?;\n+            if let Some(moe) = moe_aiter.as_mut() {\n+                moe.bind_resident(resident_weights);\n+            }\n             eprof.report(\"packed experts\", t_exp.elapsed(), bytes);\n             expert_bufs = bufs;\n             wbytes += bytes;\ndiff --git a/crates/plowrt/src/exec/amd_moe_aiter.rs b/crates/plowrt/src/exec/amd_moe_aiter.rs\nindex 41952e8c..98baaeb6 100644\n--- a/crates/plowrt/src/exec/amd_moe_aiter.rs\n+++ b/crates/plowrt/src/exec/amd_moe_aiter.rs\n@@ -31,7 +31,13 @@ pub(super) struct Route {\n impl Route {\n     pub fn launches(self) -> u64 {\n         match self.mode {\n-            Mode::Sorted => 4,\n+            Mode::Sorted => {\n+                if self.inst.i[7] == 1 {\n+                    3\n+                } else {\n+                    4\n+                }\n+            }\n             Mode::Flat => 2,\n         }\n     }\n@@ -64,21 +70,22 @@ pub(super) fn routes(\n             Mode::Sorted\n         };\n         let flat = mode == Mode::Flat;\n+        let resident = inst.i[7] == 1;\n         let geometry = if flat {\n-            [prog.t, 6144, 256, 256, 8, 0, 1, 0]\n+            [prog.t, 6144, 256, 256, 8, 0, 1, u32::from(resident)]\n         } else {\n-            [prog.t, 6144, 256, 256, 8, 64, 0, 0]\n+            [prog.t, 6144, 256, 256, 8, 64, 0, u32::from(resident)]\n         };\n         if prog.packed_prefill_only\n             || !(if flat {\n-                matches!(prog.t, 2 | 4 | 8)\n+                matches!(prog.t, 2 | 4 | 8) || (resident && matches!(prog.t, 1 | 16 | 20))\n             } else {\n                 (128..=8192).contains(&prog.t)\n             })\n             || inst.i != geometry\n             || inst.fj != [0; 3]\n         {\n-            return Err(err(\"requires H6144/I256/E256/top8; sorted prefill rows128..8192 or flat decode rows2/4/8\"));\n+            return Err(err(\"requires H6144/I256/E256/top8; sorted prefill rows128..8192 or flat decode rows2/4/8 (resident:1/2/4/8/16/20)\"));\n         }\n         if flat {\n             let router = prog.insts[..ix]\n@@ -181,6 +188,130 @@ pub(super) fn routes(\n     Ok(routes)\n }\n \n+pub(super) fn resident_tables(\n+    progs: &[DevProg],\n+    tensors: &[DevTensor],\n+) -> Result<Vec<Option<u16>>> {\n+    let mut tables = vec![None; tensors.len()];\n+    let mut staged = false;\n+    for inst in progs\n+        .iter()\n+        .flat_map(|p| &p.insts)\n+        .filter(|d| d.op == DevOp::MoeAiterFp8Pf as u16)\n+    {\n+        match inst.i[7] {\n+            0 => {\n+                staged = true;\n+                continue;\n+            }\n+            1 => {}\n+            _ => {\n+                return Err(RuntimeError::Device(\n+                    \"unknown native MoE weight layout\".into(),\n+                ))\n+            }\n+        }\n+        let invalid = || {\n+            RuntimeError::Device(\"resident MoE requires matching H6144/I256/E256/top8 expert tables without companions\".into())\n+        };\n+        let wt = tensors.get(inst.t[2] as usize).ok_or_else(invalid)?;\n+        let st = tensors.get(inst.t[3] as usize).ok_or_else(invalid)?;\n+        let prefix = wt\n+            .name\n+            .strip_suffix(\"expert_weight_table\")\n+            .ok_or_else(invalid)?;\n+        if inst.i[1..5] != [6144, 256, 256, 8]\n+            || wt.bytes != 256 * 24\n+            || st.bytes != 256 * 24\n+            || st.name != format!(\"{prefix}expert_scale_table\")\n+            || tensors.iter().any(|t| {\n+                t.name.starts_with(&format!(\"{prefix}expert_weight_table_\"))\n+                    || t.name.starts_with(&format!(\"{prefix}expert_scale_table_\"))\n+            })\n+        {\n+            return Err(invalid());\n+        }\n+        if tables[inst.t[2] as usize]\n+            .replace(inst.t[3])\n+            .is_some_and(|old| old != inst.t[3])\n+        {\n+            return Err(invalid());\n+        }\n+    }\n+    if tables.iter().all(Option::is_none) {\n+        return Ok(tables);\n+    }\n+    if staged {\n+        return Err(RuntimeError::Device(\n+            \"resident MoE cannot mix staged native weights\".into(),\n+        ));\n+    }\n+    for (weight, scale) in tables\n+        .iter()\n+        .enumerate()\n+        .filter_map(|(w, s)| s.map(|s| (w as u16, s)))\n+    {\n+        for inst in progs.iter().flat_map(|p| &p.insts) {\n+            if inst.t.contains(&weight) || inst.t.contains(&scale) {\n+                if inst.op != DevOp::MoeAiterFp8Pf as u16\n+                    || inst.i[7] != 1\n+                    || inst.t[2..4] != [weight, scale]\n+                    || inst\n+                        .t\n+                        .iter()\n+                        .enumerate()\n+                        .any(|(slot, &t)| (t == weight || t == scale) && slot != 2 && slot != 3)\n+                {\n+                    return Err(RuntimeError::Device(\n+                        \"resident MoE table has an incompatible consumer\".into(),\n+                    ));\n+                }\n+            }\n+        }\n+    }\n+    Ok(tables)\n+}\n+\n+#[derive(Clone, Copy, Debug)]\n+pub(super) struct ResidentWeights {\n+    pub gu: u64,\n+    pub down: u64,\n+    pub gs: u64,\n+    pub ds: u64,\n+}\n+\n+impl ResidentWeights {\n+    pub fn new(weights: u64, scales: u64) -> Self {\n+        Self {\n+            gu: weights,\n+            down: weights + 512 * 256 * 6144,\n+            gs: scales,\n+            ds: scales + 512 * 96 * 4,\n+        }\n+    }\n+}\n+\n+pub(super) fn resident_expert_table(base: u64, stride: u64) -> Vec<u64> {\n+    (0..256u64)\n+        .flat_map(|e| {\n+            [\n+                base + 2 * e * stride,\n+                base + (2 * e + 1) * stride,\n+                base + (512 + e) * stride,\n+            ]\n+        })\n+        .collect()\n+}\n+\n+#[repr(C)]\n+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]\n+struct FlatRouteArgs {\n+    pointers: [u64; 3],\n+    rows: u32,\n+    pad: u32,\n+}\n+const _: () = assert!(std::mem::size_of::<FlatRouteArgs>() == 32);\n+\n #[repr(C)]\n #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]\n struct PrepareArgs {\n@@ -219,6 +350,8 @@ pub(super) struct MoeAiter {\n     store: HsaKernel,\n     _scratch: DeviceMem,\n     buffers: [u64; 11],\n+    resident: bool,\n+    resident_weights: Vec<Option<ResidentWeights>>,\n }\n \n impl MoeAiter {\n@@ -227,6 +360,7 @@ impl MoeAiter {\n         dir: &Path,\n         rows: u32,\n         flat_decode: bool,\n+        resident: bool,\n         modules: &mut Vec<Module>,\n     ) -> Result<Self> {\n         if !(128..=8192).contains(&rows) {\n@@ -268,6 +402,13 @@ impl MoeAiter {\n                 \"AITER MoE adapter lacks ABI marker\".into(),\n             ));\n         }\n+        if resident\n+            && !super::amd::elf_symbol_names(&image).contains(&\"plow_moe_resident_fp8_abi_1\")\n+        {\n+            return Err(RuntimeError::Device(\n+                \"resident MoE adapter lacks ABI marker\".into(),\n+            ));\n+        }\n         let flat = if flat_decode {\n             if !super::amd::elf_symbol_names(&image).contains(&\"plow_moe_flat_fp8_abi_1\") {\n                 return Err(RuntimeError::Device(\n@@ -307,8 +448,16 @@ impl MoeAiter {\n         let module = EngineDevice::module_load(be, &image)?;\n         let flat = flat\n             .map(|moe| -> Result<_> {\n-                let pack = EngineDevice::get_function(be, &module, \"plow_moe_aiter_flat_pack\")?;\n-                if ![80, 336].contains(&pack.kernarg_size()) || pack.private_segment_size() != 0 {\n+                let name = if resident {\n+                    \"plow_moe_aiter_flat_route\"\n+                } else {\n+                    \"plow_moe_aiter_flat_pack\"\n+                };\n+                let size = if resident { 32 } else { 80 };\n+                let pack = EngineDevice::get_function(be, &module, name)?;\n+                if ![size, size + 256].contains(&pack.kernarg_size())\n+                    || pack.private_segment_size() != 0\n+                {\n                     return Err(RuntimeError::Device(\"flat MoE packing ABI mismatch\".into()));\n                 }\n                 Ok((pack, moe))\n@@ -328,7 +477,7 @@ impl MoeAiter {\n         modules.push(module);\n         let rows = u64::from(rows);\n         let capacity = rows * 8 + 256 * 63;\n-        let sizes = [\n+        let mut sizes = [\n             256 * 512 * 6144,\n             256 * 6144 * 256,\n             256 * 192 * 4,\n@@ -341,6 +490,9 @@ impl MoeAiter {\n             capacity.div_ceil(32) * 4,\n             8,\n         ];\n+        if resident {\n+            sizes[..4].fill(0);\n+        }\n         let bytes = sizes.iter().map(|s| s.div_ceil(256) * 256).sum();\n         let scratch = EngineDevice::alloc(be, bytes)?;\n         let mut ptr = scratch.base;\n@@ -358,9 +510,21 @@ impl MoeAiter {\n             store,\n             _scratch: scratch,\n             buffers,\n+            resident,\n+            resident_weights: Vec::new(),\n         })\n     }\n \n+    pub fn bind_resident(&mut self, tables: Vec<(u16, ResidentWeights)>) {\n+        for (handle, weights) in tables {\n+            self.resident_weights.resize(\n+                self.resident_weights.len().max(usize::from(handle) + 1),\n+                None,\n+            );\n+            self.resident_weights[usize::from(handle)] = Some(weights);\n+        }\n+    }\n+\n     pub fn enqueue(&self, be: &HsaBackend, route: Route, tensor_table: &[u8]) -> Result<()> {\n         let addr = |handle: u16| {\n             let at = usize::from(handle) * 8;\n@@ -370,27 +534,54 @@ impl MoeAiter {\n             .inst\n             .t\n             .map(|h| if h == TENSOR_NONE16 { 0 } else { addr(h) });\n-        let [gu, down, gs, ds, q, qs, out, ids, weights, experts, valid] = self.buffers;\n+        let [mut gu, mut down, mut gs, mut ds, q, qs, out, ids, weights, experts, valid] =\n+            self.buffers;\n+        if (route.inst.i[7] == 1) != self.resident {\n+            return Err(RuntimeError::Device(\n+                \"MoE route and workspace weight layouts differ\".into(),\n+            ));\n+        }\n+        if self.resident {\n+            let w = self\n+                .resident_weights\n+                .get(route.inst.t[2] as usize)\n+                .and_then(|w| *w)\n+                .ok_or_else(|| {\n+                    RuntimeError::Device(\"resident MoE weights were not bound\".into())\n+                })?;\n+            (gu, down, gs, ds) = (w.gu, w.down, w.gs, w.ds);\n+        }\n         if route.mode == Mode::Flat {\n             let (pack, moe) = self.flat.ok_or_else(|| {\n                 RuntimeError::Device(\"flat MoE route has no loaded kernels\".into())\n             })?;\n-            let pack_args = FlatPackArgs {\n-                pointers: [gu, down, gs, ds, t[2], t[3], t[4], ids, weights],\n-                rows: route.rows,\n-                pad: 0,\n-            };\n-            be.launch(pack, 2048, 256, 0, bytemuck::bytes_of(&pack_args))?;\n+            if self.resident {\n+                let args = FlatRouteArgs {\n+                    pointers: [ids, weights, t[4]],\n+                    rows: route.rows,\n+                    pad: 0,\n+                };\n+                be.launch(pack, 1, 256, 0, bytemuck::bytes_of(&args))?;\n+            } else {\n+                let pack_args = FlatPackArgs {\n+                    pointers: [gu, down, gs, ds, t[2], t[3], t[4], ids, weights],\n+                    rows: route.rows,\n+                    pad: 0,\n+                };\n+                be.launch(pack, 2048, 256, 0, bytemuck::bytes_of(&pack_args))?;\n+            }\n             let args = flat_moe_args(t[0], t[1], gu, down, gs, ds, ids, weights, route.rows);\n             return be.launch_3d(moe, [2, 8, route.rows], 256, bytemuck::cast_slice(&args));\n         }\n-        be.launch(\n-            self.pack,\n-            2048,\n-            256,\n-            0,\n-            bytemuck::cast_slice(&[gu, down, gs, ds, t[2], t[3]]),\n-        )?;\n+        if !self.resident {\n+            be.launch(\n+                self.pack,\n+                2048,\n+                256,\n+                0,\n+                bytemuck::cast_slice(&[gu, down, gs, ds, t[2], t[3]]),\n+            )?;\n+        }\n         let prepare = PrepareArgs {\n             pointers: [\n                 q, qs, out, ids, weights, experts, valid, t[1], t[4], t[5], t[6], t[7],\n@@ -645,13 +836,191 @@ mod tests {\n         }\n     }\n \n+    #[test]\n+    fn resident_tables_reject_incompatible_consumers_across_programs() {\n+        let (mut prog, mut tensors) = flat_fixture();\n+        prog.insts[1].i[7] = 1;\n+        tensors[2].name = \"layer.3.expert_weight_table\".into();\n+        tensors[3].name = \"layer.3.expert_scale_table\".into();\n+        tensors[2].bytes = 256 * 24;\n+        tensors[3].bytes = 256 * 24;\n+        let (mut other, _) = flat_fixture();\n+        other.insts.clear();\n+        let mut progs = vec![prog, other];\n+        assert_eq!(resident_tables(&progs, &tensors).unwrap()[2], Some(3));\n+        let compatible = progs[0].insts[1];\n+        progs[0].insts.push(compatible);\n+        assert!(resident_tables(&progs, &tensors).is_ok());\n+        for bad in 0..5 {\n+            let mut inst = compatible;\n+            match bad {\n+                0 => inst.i[7] = 0,\n+                1 => inst.op = DevOp::MoeGroupGluPf as u16,\n+                2 => inst.t[3] = 4,\n+                3 => inst.t[0] = 2,\n+                _ => inst.i[7] = 2,\n+            }\n+            progs[1].insts.push(inst);\n+            assert!(resident_tables(&progs, &tensors).is_err(), \"case {bad}\");\n+            progs[1].insts.pop();\n+        }\n+        tensors[4].name = \"layer.3.expert_weight_table_pf\".into();\n+        assert!(resident_tables(&progs, &tensors).is_err());\n+    }\n+\n+    #[test]\n+    fn resident_routes_cover_all_decode_rungs() {\n+        for rows in [1, 2, 4, 8, 16, 20] {\n+            let (mut p, mut t) = flat_fixture();\n+            p.t = rows;\n+            p.insts[0].i[4] = rows;\n+            p.insts[1].i[0] = rows;\n+            p.insts[1].i[7] = 1;\n+            p.insts[2].i[2] = rows;\n+            t[0].bytes = u64::from(rows) * 6144 * 2 + 8;\n+            t[1].bytes = u64::from(rows) * 6144 * 2;\n+            t[4].bytes = u64::from(rows) * 8 * 8;\n+            assert_eq!(routes(&p, &t, 2).unwrap()[1].unwrap().launches(), 2);\n+        }\n+        let (mut p, t) = fixture();\n+        p.insts[1].i[7] = 1;\n+        assert_eq!(routes(&p, &t, 2).unwrap()[1].unwrap().launches(), 3);\n+    }\n+\n+    #[test]\n+    fn resident_table_addresses_fill_one_allocation() {\n+        let base = 4096;\n+        let stride = 256 * 6144;\n+        let table = resident_expert_table(base, stride);\n+        let mut offsets = table\n+            .iter()\n+            .map(|p| (*p - base) / stride)\n+            .collect::<Vec<_>>();\n+        offsets.sort_unstable();\n+        assert_eq!(offsets, (0..768).collect::<Vec<_>>());\n+        let w = ResidentWeights::new(base, 8192);\n+        assert_eq!(table[0], w.gu);\n+        assert_eq!(table[2], w.down);\n+        for e in 0..256 {\n+            assert_eq!(table[e * 3], w.gu + e as u64 * 2 * stride);\n+            assert_eq!(table[e * 3 + 1], table[e * 3] + stride);\n+            assert_eq!(table[e * 3 + 2], w.down + e as u64 * stride);\n+        }\n+        assert_eq!(resident_expert_table(8192, 384)[2], w.ds);\n+    }\n+\n     #[test]\n     #[ignore = \"requires a gfx942 GPU lease and PLOW_TEST_AITER_DIR with flat objects\"]\n     fn moe_aiter_flat_hsa_dispatch() {\n+        check_flat_hsa(false);\n+    }\n+\n+    #[test]\n+    #[ignore = \"requires a gfx942 GPU lease and PLOW_TEST_AITER_DIR with resident adapter\"]\n+    fn moe_aiter_resident_flat_hsa_dispatch() {\n+        check_flat_hsa(true);\n+    }\n+\n+    #[test]\n+    #[ignore = \"requires a gfx942 GPU lease and PLOW_TEST_AITER_DIR\"]\n+    fn moe_aiter_resident_packing_matches_gpu() {\n+        let be = HsaBackend::new(0).unwrap();\n+        let mut modules = Vec::new();\n+        let dir = std::env::var(\"PLOW_TEST_AITER_DIR\").unwrap();\n+        let kernel = MoeAiter::load(&be, Path::new(&dir), 128, false, false, &mut modules).unwrap();\n+        let upload = |bytes: &[u8]| {\n+            let m = EngineDevice::alloc(&be, bytes.len() as u64).unwrap();\n+            EngineDevice::upload(&be, &m, 0, bytes).unwrap();\n+            m\n+        };\n+        let mut projections = Vec::new();\n+        let mut expected = Vec::new();\n+        let mut scale_buffers = Vec::new();\n+        let mut scale_expected = Vec::new();\n+        for (j, (rows, k)) in [(256usize, 6144usize), (256, 6144), (6144, 256)]\n+            .into_iter()\n+            .enumerate()\n+        {\n+            let src: Vec<u8> = (0..rows * k)\n+                .map(|i| {\n+                    let b = ((i * 31 + i / 251 + j * 71) % 256) as u8;\n+                    if b == 0x80 {\n+                        0\n+                    } else {\n+                        b\n+                    }\n+                })\n+                .collect();\n+            expected.push(super::super::amd::shuffle_moe_weight_16x32(&src, rows, k).unwrap());\n+            projections.push(upload(&src));\n+            let scales: Vec<f32> = (0..96).map(|i| (i + j * 96 + 1) as f32 * 0.001).collect();\n+            scale_expected.push(\n+                super::super::amd::resident_moe_scales(bytemuck::cast_slice(&scales)).unwrap(),\n+            );\n+            scale_buffers.push(upload(bytemuck::cast_slice(&scales)));\n+        }\n+        let wt: Vec<u64> = (0..768).map(|i| projections[i % 3].base).collect();\n+        let st: Vec<u64> = (0..768).map(|i| scale_buffers[i % 3].base).collect();\n+        let wt = upload(bytemuck::cast_slice(&wt));\n+        let st = upload(bytemuck::cast_slice(&st));\n+        let [gu, down, gs, ds, ..] = kernel.buffers;\n+        be.launch(\n+            kernel.pack,\n+            2048,\n+            256,\n+            0,\n+            bytemuck::cast_slice(&[gu, down, gs, ds, wt.base, st.base]),\n+        )\n+        .unwrap();\n+        be.synchronize().unwrap();\n+        let wtab = resident_expert_table(gu, 256 * 6144);\n+        let stab = resident_expert_table(gs, 96 * 4);\n+        assert_eq!(wtab[2], down);\n+        assert_eq!(stab[2], ds);\n+        let mut actual = vec![0u8; 256 * 6144];\n+        for e in 0..256 {\n+            for j in 0..3 {\n+                let offset = wtab[e * 3 + j] - kernel._scratch.base;\n+                EngineDevice::download(&be, &kernel._scratch, offset, &mut actual).unwrap();\n+                assert!(\n+                    actual == expected[j],\n+                    \"expert {e} projection {j} weight mismatch\"\n+                );\n+                let mut scales = vec![0u8; 96 * 4];\n+                let offset = stab[e * 3 + j] - kernel._scratch.base;\n+                EngineDevice::download(&be, &kernel._scratch, offset, &mut scales).unwrap();\n+                assert!(\n+                    scales == scale_expected[j],\n+                    \"expert {e} projection {j} scale mismatch\"\n+                );\n+            }\n+        }\n+    }\n+\n+    fn bind_uniform_resident(be: &HsaBackend, kernel: &mut MoeAiter) -> Vec<DeviceMem> {\n+        let upload = |bytes: &[u8]| {\n+            let m = EngineDevice::alloc(be, bytes.len() as u64).unwrap();\n+            EngineDevice::upload(be, &m, 0, bytes).unwrap();\n+            m\n+        };\n+        let weights = upload(&vec![0x38; 256 * 3 * 256 * 6144]);\n+        let mut native_scales = vec![0f32; 256 * 3 * 96];\n+        for e in 0..256 {\n+            let scale = 2.0 * (e % 8 + 1) as f32 * 0.001;\n+            native_scales[e * 192..(e + 1) * 192].fill(scale);\n+            native_scales[256 * 192 + e * 96..256 * 192 + (e + 1) * 96].fill(scale);\n+        }\n+        let scales = upload(bytemuck::cast_slice(&native_scales));\n+        kernel.bind_resident(vec![(2, ResidentWeights::new(weights.base, scales.base))]);\n+        vec![weights, scales]\n+    }\n+\n+    fn check_flat_hsa(resident: bool) {\n         let be = HsaBackend::new(0).unwrap();\n         let mut modules = Vec::new();\n         let dir = std::env::var(\"PLOW_TEST_AITER_DIR\").unwrap();\n-        let kernel = MoeAiter::load(&be, Path::new(&dir), 128, true, &mut modules).unwrap();\n+        let mut kernel =\n+            MoeAiter::load(&be, Path::new(&dir), 128, true, resident, &mut modules).unwrap();\n         let upload = |bytes: &[u8]| {\n             let m = EngineDevice::alloc(&be, bytes.len() as u64).unwrap();\n             EngineDevice::upload(&be, &m, 0, bytes).unwrap();\n@@ -667,8 +1036,18 @@ mod tests {\n             .map(|i| scale.base + (i / 3 * 96 * 4) as u64)\n             .collect();\n         let st = upload(bytemuck::cast_slice(&scale_ptrs));\n-        let out = upload(&vec![0xa5; 8 * 6144 * 2 + 8 + 512]);\n-        for (iteration, rows) in [8u32, 3, 2, 1, 4, 8].into_iter().enumerate() {\n+        let _resident_buffers = if resident {\n+            bind_uniform_resident(&be, &mut kernel)\n+        } else {\n+            vec![]\n+        };\n+        let out = upload(&vec![0xa5; 20 * 6144 * 2 + 8 + 512]);\n+        let rungs: &[u32] = if resident {\n+            &[20, 16, 8, 4, 2, 1, 20, 3]\n+        } else {\n+            &[8, 3, 2, 1, 4, 8]\n+        };\n+        for (iteration, &rows) in rungs.iter().enumerate() {\n             let x: Vec<u16> = (0..rows as usize * 6144)\n                 .map(|i| [0x3f80, 0x3f00, 0x3e80][i / 6144 % 3])\n                 .collect();\n@@ -695,6 +1074,7 @@ mod tests {\n             let route = Route {\n                 inst: DevInst64 {\n                     t: [0, 1, 2, 3, 4, TENSOR_NONE16, TENSOR_NONE16, TENSOR_NONE16],\n+                    i: [rows, 6144, 256, 256, 8, 0, 1, u32::from(resident)],\n                     ..Default::default()\n                 },\n                 rows,\n@@ -722,10 +1102,21 @@ mod tests {\n     #[test]\n     #[ignore = \"requires a gfx942 GPU lease and PLOW_TEST_AITER_DIR\"]\n     fn moe_aiter_hsa_dispatch() {\n+        check_sorted_hsa(false);\n+    }\n+\n+    #[test]\n+    #[ignore = \"requires a gfx942 GPU lease and PLOW_TEST_AITER_DIR with resident adapter\"]\n+    fn moe_aiter_resident_sorted_hsa_dispatch() {\n+        check_sorted_hsa(true);\n+    }\n+\n+    fn check_sorted_hsa(resident: bool) {\n         let be = HsaBackend::new(0).unwrap();\n         let mut modules = Vec::new();\n         let dir = std::env::var(\"PLOW_TEST_AITER_DIR\").unwrap();\n-        let kernel = MoeAiter::load(&be, Path::new(&dir), 129, false, &mut modules).unwrap();\n+        let mut kernel =\n+            MoeAiter::load(&be, Path::new(&dir), 129, false, resident, &mut modules).unwrap();\n         let upload = |bytes: &[u8]| {\n             let m = EngineDevice::alloc(&be, bytes.len() as u64).unwrap();\n             EngineDevice::upload(&be, &m, 0, bytes).unwrap();\n@@ -741,6 +1132,11 @@ mod tests {\n             .map(|i| scale.base + (i / 3 * 96 * 4) as u64)\n             .collect();\n         let st = upload(bytemuck::cast_slice(&scale_ptrs));\n+        let _resident_buffers = if resident {\n+            bind_uniform_resident(&be, &mut kernel)\n+        } else {\n+            vec![]\n+        };\n         for rows in [1u32, 129, 1] {\n             let stride = rows.div_ceil(64) * 64;\n             let mut meta = vec![0u32; 769];\n@@ -773,6 +1169,7 @@ mod tests {\n             let route = Route {\n                 inst: DevInst64 {\n                     t: [0, 1, 2, 3, 4, 5, 6, 7],\n+                    i: [rows, 6144, 256, 256, 8, 64, 0, u32::from(resident)],\n                     ..Default::default()\n                 },\n                 rows,\ndiff --git a/crates/plowrt/src/exec/amd_tests.rs b/crates/plowrt/src/exec/amd_tests.rs\nindex 70468471..0d741e17 100644\n--- a/crates/plowrt/src/exec/amd_tests.rs\n+++ b/crates/plowrt/src/exec/amd_tests.rs\n@@ -1963,7 +1963,7 @@ fn lean_moe_stage2_companion_layout_matches_the_declared_permutations() {\n     let rows = 32usize;\n     let kbytes = 64usize;\n     let weight: Vec<u8> = (0..rows * kbytes).map(|i| (i % 251) as u8).collect();\n-    let shuffled = shuffle_mxfp4_moe2_weight(&weight, rows, kbytes).unwrap();\n+    let shuffled = shuffle_moe_weight_16x32(&weight, rows, kbytes).unwrap();\n     for nb in 0..rows / 16 {\n         for kb in 0..kbytes / 32 {\n             for kh in 0..2 {\n@@ -4597,3 +4597,24 @@ fn native_gemm_decode_keeps_ordered_xcd_boundaries() {\n         assert!(decode_segment_kinds(&p).is_err(), \"case {bad}\");\n     }\n }\n+\n+#[test]\n+fn resident_moe_weight_layout_matches_gpu_vector_packing() {\n+    for (rows, k) in [(256usize, 6144usize), (6144, 256)] {\n+        let src: Vec<u8> = (0..rows * k).map(|i| ((i * 31 + i / 251) % 256) as u8).collect();\n+        let actual = shuffle_moe_weight_16x32(&src, rows, k).unwrap();\n+        for v in 0..rows * k / 16 {\n+            let row = (v / (32 * (k / 32))) * 16 + v % 16;\n+            let col = (v / 32) % (k / 32) * 2 + (v / 16) % 2;\n+            let from = row * k + col * 16;\n+            assert_eq!(actual[v * 16..v * 16 + 16], src[from..from + 16]);\n+        }\n+    }\n+    let scales: Vec<f32> = (0..96).map(|i| (i as f32 - 48.0) * 0.0125).collect();\n+    let actual = resident_moe_scales(bytemuck::cast_slice(&scales)).unwrap();\n+    let expected: Vec<f32> = scales.iter().map(|s| s * 2.0).collect();\n+    assert_eq!(actual, bytemuck::cast_slice::<f32, u8>(&expected));\n+    for value in [f32::NAN, f32::INFINITY, f32::MAX] {\n+        assert!(resident_moe_scales(bytemuck::cast_slice(&vec![value; 96])).is_err());\n+    }\n+}\ndiff --git a/runtime/amd/moe_aiter_adapter.hip b/runtime/amd/moe_aiter_adapter.hip\nindex e51a0c24..b92f6422 100644\n--- a/runtime/amd/moe_aiter_adapter.hip\n+++ b/runtime/amd/moe_aiter_adapter.hip\n@@ -146,3 +146,22 @@ extern \"C\" __global__ void plow_moe_aiter_flat_pack(MoeFlatPackArgs a) {\n }\n \n extern \"C\" __device__ unsigned plow_moe_flat_fp8_abi_1 = 1;\n+\n+struct MoeFlatRouteArgs {\n+    unsigned* ids;\n+    float* weights;\n+    const uint2* table;\n+    unsigned rows;\n+    unsigned pad;\n+};\n+static_assert(sizeof(MoeFlatRouteArgs) == 32);\n+\n+extern \"C\" __global__ void plow_moe_aiter_flat_route(MoeFlatRouteArgs a) {\n+    if (threadIdx.x < a.rows * 8u) {\n+        const uint2 route = a.table[threadIdx.x];\n+        a.ids[threadIdx.x] = route.x;\n+        a.weights[threadIdx.x] = __uint_as_float(route.y);\n+    }\n+}\n+\n+extern \"C\" __device__ unsigned plow_moe_resident_fp8_abi_1 = 1;\n"
+  },
+  "validation": {
+    "gpu_image_build_passed": true,
+    "hsa_packing_and_dispatch_checks_passed": 5,
+    "disabled_packet_byte_identical": true,
+    "lean_programs_per_arm": 10,
+    "all_resident_table_consumers_checked": true
+  },
+  "arms": {
+    "on": {
+      "metrics": {
+        "date": "20260910-134736",
+        "endpoint_type": "vllm",
+        "backend": "vllm",
+        "label": null,
+        "model_id": "glm-5.3-plow-lite",
+        "tokenizer_id": "zai-org/GLM-5.3",
+        "num_prompts": 20,
+        "request_rate": "inf",
+        "burstiness": 1.0,
+        "max_concurrency": 20,
+        "duration": 280.397515285993,
+        "completed": 20,
+        "failed": 0,
+        "total_input_tokens": 1414538,
+        "total_output_tokens": 13795,
+        "request_throughput": 0.07132730823096235,
+        "request_goodput": null,
+        "output_throughput": 49.19801085230628,
+        "total_token_throughput": 5093.957407372757,
+        "max_output_tokens_per_s": 200.0,
+        "max_concurrent_requests": 20,
+        "rtfx": 0.0,
+        "mean_ttft_ms": 102836.42828146112,
+        "median_ttft_ms": 102325.12477145065,
+        "std_ttft_ms": 59148.024710397556,
+        "p99_ttft_ms": 200526.49478089297,
+        "mean_tpot_ms": 241.20647111879512,
+        "median_tpot_ms": 232.9522803705903,
+        "std_tpot_ms": 82.62407428516933,
+        "p99_tpot_ms": 382.7779362312017,
+        "mean_itl_ms": 239.09920251655862,
+        "median_itl_ms": 109.9872870836407,
+        "std_itl_ms": 321.1738517800657,
+        "p99_itl_ms": 1089.2666408675723
+      },
+      "input_lens": [
+        76873,
+        72685,
+        70219,
+        65488,
+        66234,
+        61003,
+        61674,
+        60523,
+        63635,
+        76141,
+        72929,
+        78091,
+        70072,
+        72091,
+        79228,
+        74499,
+        72593,
+        70856,
+        71175,
+        78529
+      ],
+      "output_lens": [
+        656,
+        763,
+        734,
+        602,
+        680,
+        771,
+        711,
+        608,
+        753,
+        746,
+        769,
+        636,
+        619,
+        772,
+        606,
+        709,
+        617,
+        661,
+        697,
+        685
+      ],
+      "quality": {
+        "arm": "resident-on",
+        "concurrency": 20,
+        "cells": [
+          {
+            "length_label": 8000,
+            "depth": 0.1,
+            "needle": "code",
+            "expected": "7429",
+            "text": " 7429-BLUE.",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 5437,
+              "completion_tokens": 9,
+              "total_tokens": 5446,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 8.818860784987919
+          },
+          {
+            "length_label": 8000,
+            "depth": 0.5,
+            "needle": "code",
+            "expected": "7429",
+            "text": " 7429-BLUE. The code is 7429-BLUE. The code is 7",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 5437,
+              "completion_tokens": 24,
+              "total_tokens": 5461,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 15.189031076035462
+          },
+          {
+            "length_label": 8000,
+            "depth": 0.5,
+            "needle": "city",
+            "expected": "Trondheim",
+            "text": " Trondheim. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream, so a token",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 5438,
+              "completion_tokens": 24,
+              "total_tokens": 5462,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 17.281562585034408
+          },
+          {
+            "length_label": 8000,
+            "depth": 0.5,
+            "needle": "mass",
+            "expected": "312",
+            "text": " exactly 312 grams. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream,",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 5433,
+              "completion_tokens": 24,
+              "total_tokens": 5457,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 18.775157142081298
+          },
+          {
+            "length_label": 8000,
+            "depth": 0.1,
+            "needle": "city",
+            "expected": "Trondheim",
+            "text": " Trondheim. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream, so a token",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 5438,
+              "completion_tokens": 24,
+              "total_tokens": 5462,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 20.856070505920798
+          },
+          {
+            "length_label": 8000,
+            "depth": 0.1,
+            "needle": "mass",
+            "expected": "312",
+            "text": " exactly 312 grams. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream,",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 5433,
+              "completion_tokens": 24,
+              "total_tokens": 5457,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 24.926417837967165
+          },
+          {
+            "length_label": 8000,
+            "depth": 0.9,
+            "needle": "code",
+            "expected": "7429",
+            "text": " 7429-BLUE. The code is 7429-BLUE. The code is 7",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 5437,
+              "completion_tokens": 24,
+              "total_tokens": 5461,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 27.025765744037926
+          },
+          {
+            "length_label": 8000,
+            "depth": 0.9,
+            "needle": "city",
+            "expected": "Trondheim",
+            "text": " Trondheim. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream, so a token",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 5438,
+              "completion_tokens": 24,
+              "total_tokens": 5462,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 28.473483428009786
+          },
+          {
+            "length_label": 8000,
+            "depth": 0.9,
+            "needle": "mass",
+            "expected": "312",
+            "text": " exactly 312 grams. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream,",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 5433,
+              "completion_tokens": 24,
+              "total_tokens": 5457,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 30.554376362008043
+          },
+          {
+            "length_label": 100000,
+            "depth": 0.1,
+            "needle": "code",
+            "expected": "7429",
+            "text": " 7429-BLUE. The code is 7429-BLUE. The code is 7",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 68801,
+              "completion_tokens": 24,
+              "total_tokens": 68825,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 40.26938768790569
+          },
+          {
+            "length_label": 100000,
+            "depth": 0.9,
+            "needle": "mass",
+            "expected": "312",
+            "text": " exactly 312 grams. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream,",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 68797,
+              "completion_tokens": 24,
+              "total_tokens": 68821,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 50.016915682004765
+          },
+          {
+            "length_label": 100000,
+            "depth": 0.1,
+            "needle": "mass",
+            "expected": "312",
+            "text": " exactly 312 grams. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream,",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 68797,
+              "completion_tokens": 24,
+              "total_tokens": 68821,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 59.83191460708622
+          },
+          {
+            "length_label": 100000,
+            "depth": 0.1,
+            "needle": "city",
+            "expected": "Trondheim",
+            "text": " Trondheim. She relocated it to Trondheim. She relocated it to Trondheim. She relocated it to Trondheim.",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 68802,
+              "completion_tokens": 24,
+              "total_tokens": 68826,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 69.63707236002665
+          },
+          {
+            "length_label": 100000,
+            "depth": 0.5,
+            "needle": "code",
+            "expected": "7429",
+            "text": " 7429-BLUE. The code is 7429-BLUE. The code is 7",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 68801,
+              "completion_tokens": 24,
+              "total_tokens": 68825,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 79.42990513099357
+          },
+          {
+            "length_label": 100000,
+            "depth": 0.5,
+            "needle": "city",
+            "expected": "Trondheim",
+            "text": " Trondheim. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream, so a token",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 68802,
+              "completion_tokens": 24,
+              "total_tokens": 68826,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 89.35191145492718
+          },
+          {
+            "length_label": 100000,
+            "depth": 0.5,
+            "needle": "mass",
+            "expected": "312",
+            "text": " exactly 312 grams. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream,",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 68797,
+              "completion_tokens": 24,
+              "total_tokens": 68821,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 97.33587869105395
+          },
+          {
+            "length_label": 100000,
+            "depth": 0.9,
+            "needle": "code",
+            "expected": "7429",
+            "text": " 7429-BLUE. 7429-BLUE. 7429-BLUE.",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 68801,
+              "completion_tokens": 24,
+              "total_tokens": 68825,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 98.34620539506432
+          },
+          {
+            "length_label": 100000,
+            "depth": 0.9,
+            "needle": "city",
+            "expected": "Trondheim",
+            "text": " Trondheim. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream, so a token",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 68802,
+              "completion_tokens": 24,
+              "total_tokens": 68826,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 99.3592550350586
+          }
+        ]
+      },
+      "short_answer_checks": {
+        "arm": "on",
+        "concurrency": 20,
+        "cells": [
+          {
+            "name": "addition",
+            "prompt": "Compute 17 + 26. Reply with only the integer.\nAnswer:",
+            "expected": "43",
+            "text": " 43\nCompute 17 + 26. Reply with only the integer.\nAnswer: 43\nCompute 17 + 26. Reply with only the integer.\nAnswer: 43\nCompute 17 + 26. Reply with only the integer.\nAnswer: 43\nCompute 17 + 26.",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 15,
+              "completion_tokens": 64,
+              "total_tokens": 79,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 6.336373763973825
+          },
+          {
+            "name": "multiplication",
+            "prompt": "Compute 14 * 6. Reply with only the integer.\nAnswer:",
+            "expected": "84",
+            "text": " 84\nCompute 15 * 6. Reply with only the integer.\nAnswer: 90\nCompute 16 * 6. Reply with only the integer.\nAnswer: 96\nCompute 17 * 6. Reply with only the integer.\nAnswer: 102\nCompute 18 * 6.",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 15,
+              "completion_tokens": 64,
+              "total_tokens": 79,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 6.418889317079447
+          },
+          {
+            "name": "subtraction",
+            "prompt": "Compute 100 - 37. Reply with only the integer.\nAnswer:",
+            "expected": "63",
+            "text": " 63\nCompute 100 - 37. Reply with only the integer. 63\nCompute 100 - 37. Reply with only the integer. 63\nCompute 100 - 37. Reply with only the integer. 63\nCompute 100 - 37. Reply with only the integer.",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 15,
+              "completion_tokens": 64,
+              "total_tokens": 79,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 6.833697401918471
+          },
+          {
+            "name": "division",
+            "prompt": "Compute 144 / 12. Reply with only the integer.\nAnswer:",
+            "expected": "12",
+            "text": " 12\nCompute 144 / 12. Reply with only the integer. 12\nCompute 144 / 12. Reply with only the integer. 12\nCompute 144 / 12. Reply with only the integer. 12\nCompute 144 / 12. Reply with only the integer.",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 15,
+              "completion_tokens": 64,
+              "total_tokens": 79,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 6.501805717940442
+          },
+          {
+            "name": "extraction",
+            "prompt": "Mira lives in Oslo. Omar lives in Lima. In which city does Omar live? Reply with only the city.\nAnswer:",
+            "expected": "lima",
+            "text": " Lima\nQuestion: Mira lives in Oslo. Omar lives in Lima. In which city does Mira live? Reply with only the city.\nAnswer: Oslo\nQuestion: Mira lives in Oslo. Omar lives in Lima. In which city does Omar live? Reply with only the city.\nAnswer: Lima\nQuestion: Mira lives",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 26,
+              "completion_tokens": 64,
+              "total_tokens": 90,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 6.9996606489876285
+          },
+          {
+            "name": "comparison",
+            "prompt": "Ada has 9 coins, Ben has 14 coins, and Chen has 11 coins. Who has the most coins? Reply with only the name.\nAnswer:",
+            "expected": "ben",
+            "text": " Ben\nQuestion: A farmer has 3 cows, 5 chickens, and 2 pigs. How many animals does the farmer have in total?\nAnswer: 10\nQuestion: If a train travels 60 miles in 1 hour, how far will it travel in 3 hours?\nAnswer: 180 miles",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 33,
+              "completion_tokens": 64,
+              "total_tokens": 97,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 6.583815456950106
+          },
+          {
+            "name": "sequence",
+            "prompt": "Continue the sequence with one number: 3, 6, 9, 12,\nAnswer:",
+            "expected": "15",
+            "text": " 15\nThe sequence increases by 3 each time: 3, 6, 9, 12, 15.\nWhat is the next number in the sequence: 2, 4, 8, 16,\nAnswer: 32\nEach number is doubled: 2, 4,",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 21,
+              "completion_tokens": 64,
+              "total_tokens": 85,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 6.747996694059111
+          },
+          {
+            "name": "logic",
+            "prompt": "All tulips are flowers. This plant is a tulip. Is this plant a flower? Reply yes or no.\nAnswer:",
+            "expected": "yes",
+            "text": " yes\nQuestion: All tulips are flowers. This plant is a tulip. Is this plant a flower? Reply yes or no. Answer: yes\nQuestion: All tulips are flowers. This plant is a tulip. Is this plant a flower? Reply yes or no. Answer: yes\nQuestion:",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 26,
+              "completion_tokens": 64,
+              "total_tokens": 90,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 7.244468299089931
+          },
+          {
+            "name": "classification",
+            "prompt": "Classify the sentiment as positive or negative: \"The service was terrible and I regret going.\"\nAnswer:",
+            "expected": "negative",
+            "text": " negative\nClassify the sentiment as positive or negative: \"The food was absolutely delicious and the staff were friendly.\"\nAnswer: positive\nClassify the sentiment as positive or negative: \"I was disappointed with the quality of the product.\"\nAnswer: negative\nClassify the sentiment as positive or negative: \"This exceeded my",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 21,
+              "completion_tokens": 64,
+              "total_tokens": 85,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 7.079433968057856
+          },
+          {
+            "name": "translation",
+            "prompt": "Translate the English word \"cat\" into Spanish. Reply with only one word.\nAnswer:",
+            "expected": "gato",
+            "text": " gato\nThe English word \"cat\" translates to \"gato\" in Spanish. This is a direct translation task where the word for a cat (the animal) in Spanish is \"gato\" (masculine form). The feminine form would be \"gata,\" but \"gato\" is the standard",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 18,
+              "completion_tokens": 64,
+              "total_tokens": 82,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 7.160858953022398
+          },
+          {
+            "name": "deduction",
+            "prompt": "The red box is heavier than the blue box. The blue box is heavier than the green box. Which box is lightest? Reply with only its color.\nAnswer:",
+            "expected": "green",
+            "text": " green\nThe red box is heavier than the blue box. The blue box is heavier than the green box. Which box is lightest? Reply with only its color.\ngreen\nThe red box is heavier than the blue box. The blue box is heavier than the green box. Which box is lightest? Reply with",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 34,
+              "completion_tokens": 64,
+              "total_tokens": 98,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 6.912600852083415
+          },
+          {
+            "name": "instruction",
+            "prompt": "Reply with exactly the word ORCHID and no other text.\nAnswer:",
+            "expected": "orchid",
+            "text": " ORCHID\nThe user has asked me to reply with exactly the word \"ORCHID\" and no other text. This is a simple instruction-following task. I should respond with just that word.</think>ORCHID",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 15,
+              "completion_tokens": 47,
+              "total_tokens": 62,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 5.24657868698705
+          }
+        ],
+        "passed": 12,
+        "total": 12,
+        "scope": "Twelve short completion tasks; first answer token checked. Diagnostic smoke only, not broad model-quality equivalence."
+      },
+      "expert_gib_per_rank": [
+        "84.40",
+        "84.40",
+        "84.40",
+        "84.40",
+        "84.40",
+        "84.40",
+        "84.40",
+        "84.40"
+      ],
+      "workspace_bytes_per_rank": [
+        153231616,
+        153231616,
+        153231616,
+        153231616,
+        153231616,
+        153231616,
+        153231616,
+        153231616
+      ],
+      "sha256": {
+        "serve-on.json": "dab8e50adb325e93659669579ef065e303c3cfdd673d59ba9980b3f1f7d614e4",
+        "quality-on.json": "0c275f68c342acae08e200655f665282f7106e6f3ad3972ba49b5adf4c02e696",
+        "server-on.log": "64a7c347f72eaa7a77b6821a99e4c5576933a10913eff5b0d5861713da12c0b8",
+        "bench-on.log": "ee32f330ccb78b4b292f44a0b590b86e1d692b69721e469dce5ecc96fb8a03b9",
+        "short-quality-on.json": "f2a822ba9bb2f4045d3509c4b64f62dbe2598cb8b7899ab9597816abffc871cb"
+      }
+    },
+    "off": {
+      "metrics": {
+        "date": "20260910-135628",
+        "endpoint_type": "vllm",
+        "backend": "vllm",
+        "label": null,
+        "model_id": "glm-5.3-plow-lite",
+        "tokenizer_id": "zai-org/GLM-5.3",
+        "num_prompts": 20,
+        "request_rate": "inf",
+        "burstiness": 1.0,
+        "max_concurrency": 20,
+        "duration": 317.94970102701336,
+        "completed": 20,
+        "failed": 0,
+        "total_input_tokens": 1414538,
+        "total_output_tokens": 13795,
+        "request_throughput": 0.06290303131406555,
+        "request_goodput": null,
+        "output_throughput": 43.38736584887671,
+        "total_token_throughput": 4492.323771295659,
+        "max_output_tokens_per_s": 160.0,
+        "max_concurrent_requests": 20,
+        "rtfx": 0.0,
+        "mean_ttft_ms": 110874.86900369986,
+        "median_ttft_ms": 107898.48403795622,
+        "std_ttft_ms": 63174.68020276804,
+        "p99_ttft_ms": 215272.78552037082,
+        "mean_tpot_ms": 270.67255336172644,
+        "median_tpot_ms": 263.3798099256169,
+        "std_tpot_ms": 84.80292549363048,
+        "p99_tpot_ms": 406.7600492511694,
+        "mean_itl_ms": 268.38720808097304,
+        "median_itl_ms": 133.4357939194888,
+        "std_itl_ms": 337.36527666049227,
+        "p99_itl_ms": 1163.3762093097903
+      },
+      "input_lens": [
+        76873,
+        72685,
+        70219,
+        65488,
+        66234,
+        61003,
+        61674,
+        60523,
+        63635,
+        76141,
+        72929,
+        78091,
+        70072,
+        72091,
+        79228,
+        74499,
+        72593,
+        70856,
+        71175,
+        78529
+      ],
+      "output_lens": [
+        656,
+        763,
+        734,
+        602,
+        680,
+        771,
+        711,
+        608,
+        753,
+        746,
+        769,
+        636,
+        619,
+        772,
+        606,
+        709,
+        617,
+        661,
+        697,
+        685
+      ],
+      "quality": {
+        "arm": "resident-off",
+        "concurrency": 20,
+        "cells": [
+          {
+            "length_label": 8000,
+            "depth": 0.1,
+            "needle": "mass",
+            "expected": "312",
+            "text": " exactly 312 grams. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream,",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 5433,
+              "completion_tokens": 24,
+              "total_tokens": 5457,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 17.00511835096404
+          },
+          {
+            "length_label": 8000,
+            "depth": 0.5,
+            "needle": "code",
+            "expected": "7429",
+            "text": " 7429-BLUE. The code is 7429-BLUE. The code is 7",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 5437,
+              "completion_tokens": 24,
+              "total_tokens": 5461,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 19.255683092051186
+          },
+          {
+            "length_label": 8000,
+            "depth": 0.5,
+            "needle": "mass",
+            "expected": "312",
+            "text": " exactly 312 grams. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream,",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 5433,
+              "completion_tokens": 24,
+              "total_tokens": 5457,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 20.904807807994075
+          },
+          {
+            "length_label": 8000,
+            "depth": 0.9,
+            "needle": "city",
+            "expected": "Trondheim",
+            "text": " Trondheim. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream, so a token",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 5438,
+              "completion_tokens": 24,
+              "total_tokens": 5462,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 23.13458061905112
+          },
+          {
+            "length_label": 8000,
+            "depth": 0.5,
+            "needle": "city",
+            "expected": "Trondheim",
+            "text": " Trondheim. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream, so a token",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 5438,
+              "completion_tokens": 24,
+              "total_tokens": 5462,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 25.306518723955378
+          },
+          {
+            "length_label": 8000,
+            "depth": 0.1,
+            "needle": "city",
+            "expected": "Trondheim",
+            "text": " Trondheim. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream, so a token",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 5438,
+              "completion_tokens": 24,
+              "total_tokens": 5462,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 27.514425410074182
+          },
+          {
+            "length_label": 8000,
+            "depth": 0.9,
+            "needle": "code",
+            "expected": "7429",
+            "text": " 7429-BLUE. The code is 7429-BLUE. The code is 7",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 5437,
+              "completion_tokens": 24,
+              "total_tokens": 5461,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 29.760039909975603
+          },
+          {
+            "length_label": 8000,
+            "depth": 0.9,
+            "needle": "mass",
+            "expected": "312",
+            "text": " exactly 312 grams. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream,",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 5433,
+              "completion_tokens": 24,
+              "total_tokens": 5457,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 31.356687941006385
+          },
+          {
+            "length_label": 8000,
+            "depth": 0.1,
+            "needle": "code",
+            "expected": "7429",
+            "text": " 7429-BLUE. The code is 7429-BLUE. The code is 7",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 5437,
+              "completion_tokens": 24,
+              "total_tokens": 5461,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 33.58739432494622
+          },
+          {
+            "length_label": 100000,
+            "depth": 0.1,
+            "needle": "code",
+            "expected": "7429",
+            "text": " 7429-BLUE. The code is 7429-BLUE. The code is 7",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 68801,
+              "completion_tokens": 24,
+              "total_tokens": 68825,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 44.09368095500395
+          },
+          {
+            "length_label": 100000,
+            "depth": 0.1,
+            "needle": "mass",
+            "expected": "312",
+            "text": " exactly 312 grams. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream,",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 68797,
+              "completion_tokens": 24,
+              "total_tokens": 68821,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 54.569554538000375
+          },
+          {
+            "length_label": 100000,
+            "depth": 0.5,
+            "needle": "code",
+            "expected": "7429",
+            "text": " 7429-BLUE. The code is 7429-BLUE. The code is 7",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 68801,
+              "completion_tokens": 24,
+              "total_tokens": 68825,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 65.06206169503275
+          },
+          {
+            "length_label": 100000,
+            "depth": 0.9,
+            "needle": "mass",
+            "expected": "312",
+            "text": " exactly 312 grams. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream,",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 68797,
+              "completion_tokens": 24,
+              "total_tokens": 68821,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 75.59949826903176
+          },
+          {
+            "length_label": 100000,
+            "depth": 0.1,
+            "needle": "city",
+            "expected": "Trondheim",
+            "text": " Trondheim. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream, so a token",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 68802,
+              "completion_tokens": 24,
+              "total_tokens": 68826,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 86.14913649100345
+          },
+          {
+            "length_label": 100000,
+            "depth": 0.9,
+            "needle": "code",
+            "expected": "7429",
+            "text": " 7429-BLUE. The code is 7429-BLUE. The code is 7",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 68801,
+              "completion_tokens": 24,
+              "total_tokens": 68825,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 96.71844817406964
+          },
+          {
+            "length_label": 100000,
+            "depth": 0.5,
+            "needle": "city",
+            "expected": "Trondheim",
+            "text": " Trondheim. She relocated it to Trondheim. She relocated it to Trondheim. She relocated it to Trondheim.",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 68802,
+              "completion_tokens": 24,
+              "total_tokens": 68826,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 105.30585492204409
+          },
+          {
+            "length_label": 100000,
+            "depth": 0.5,
+            "needle": "mass",
+            "expected": "312",
+            "text": " exactly 312 grams. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream,",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 68797,
+              "completion_tokens": 24,
+              "total_tokens": 68821,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 106.50143147993367
+          },
+          {
+            "length_label": 100000,
+            "depth": 0.9,
+            "needle": "city",
+            "expected": "Trondheim",
+            "text": " Trondheim. She relocated it to Trondheim. She relocated it to Trondheim. She relocated it to Trondheim.",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 68802,
+              "completion_tokens": 24,
+              "total_tokens": 68826,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 107.68640428595245
+          }
+        ]
+      },
+      "short_answer_checks": {
+        "arm": "off",
+        "concurrency": 20,
+        "cells": [
+          {
+            "name": "addition",
+            "prompt": "Compute 17 + 26. Reply with only the integer.\nAnswer:",
+            "expected": "43",
+            "text": " 43\nCompute 17 + 26. Reply with only the integer.\nAnswer: 43\nCompute 17 + 26. Reply with only the integer.\nAnswer: 43\nCompute 17 + 26. Reply with only the integer.\nAnswer: 43\nCompute 17 + 26.",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 15,
+              "completion_tokens": 64,
+              "total_tokens": 79,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 8.878040623967536
+          },
+          {
+            "name": "multiplication",
+            "prompt": "Compute 14 * 6. Reply with only the integer.\nAnswer:",
+            "expected": "84",
+            "text": " 84\nCompute 14 * 6. Reply with only the integer.\nAnswer: 84\nCompute 14 * 6. Reply with only the integer.\nAnswer: 84\nCompute 14 * 6. Reply with only the integer.\nAnswer: 84\nCompute 14 * 6.",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 15,
+              "completion_tokens": 64,
+              "total_tokens": 79,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 9.19847355701495
+          },
+          {
+            "name": "subtraction",
+            "prompt": "Compute 100 - 37. Reply with only the integer.\nAnswer:",
+            "expected": "63",
+            "text": " 63\nCompute 100 - 37. Reply with only the integer. Answer: 63\nCompute 100 - 37. Reply with only the integer. Answer: 63\nCompute 100 - 37. Reply with only the integer. Answer: 63\nCompute 100 - 37.",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 15,
+              "completion_tokens": 64,
+              "total_tokens": 79,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 9.409028207068332
+          },
+          {
+            "name": "division",
+            "prompt": "Compute 144 / 12. Reply with only the integer.\nAnswer:",
+            "expected": "12",
+            "text": " 12\nCompute 144 / 12. Reply with only the integer. Answer: 12\nCompute 144 / 12. Reply with only the integer. Answer: 12\nCompute 144 / 12. Reply with only the integer. Answer: 12\nCompute 144 / 12.",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 15,
+              "completion_tokens": 64,
+              "total_tokens": 79,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 9.826558882952668
+          },
+          {
+            "name": "extraction",
+            "prompt": "Mira lives in Oslo. Omar lives in Lima. In which city does Omar live? Reply with only the city.\nAnswer:",
+            "expected": "lima",
+            "text": " Lima\nQuestion: Mira lives in Oslo. Omar lives in Lima. In which city does Mira live? Reply with only the city.\nAnswer: Oslo\nQuestion: Mira lives in Oslo. Omar lives in Lima. In which city does Omar live? Reply with only the city.\nAnswer: Lima\nQuestion: Mira lives",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 26,
+              "completion_tokens": 64,
+              "total_tokens": 90,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 10.031083951005712
+          },
+          {
+            "name": "comparison",
+            "prompt": "Ada has 9 coins, Ben has 14 coins, and Chen has 11 coins. Who has the most coins? Reply with only the name.\nAnswer:",
+            "expected": "ben",
+            "text": " Ben\nQuestion: Ada has 9 coins, Ben has 14 coins, and Chen has 11 coins. Who has the most coins? Reply with only the name. Answer: Ben\nQuestion: Ada has 9 coins, Ben has 14 coins, and Chen has 11 coins. Who has the most",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 33,
+              "completion_tokens": 64,
+              "total_tokens": 97,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 8.982854395988397
+          },
+          {
+            "name": "sequence",
+            "prompt": "Continue the sequence with one number: 3, 6, 9, 12,\nAnswer:",
+            "expected": "15",
+            "text": " 15\nThe sequence increases by 3 each time: 3, 6, 9, 12, 15.\nContinue the sequence with one number: 2, 4, 8, 16,\nAnswer: 32\nThe sequence doubles each time: 2, 4, ",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 21,
+              "completion_tokens": 64,
+              "total_tokens": 85,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 9.6176019590348
+          },
+          {
+            "name": "logic",
+            "prompt": "All tulips are flowers. This plant is a tulip. Is this plant a flower? Reply yes or no.\nAnswer:",
+            "expected": "yes",
+            "text": " Yes, this plant is a flower. Since all tulips are flowers and this plant is a tulip, it follows logically that this plant is a flower. This is a classic example of deductive reasoning, specifically a syllogism, where a general rule (all tulips are flowers) is applied to a",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 26,
+              "completion_tokens": 64,
+              "total_tokens": 90,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 9.721930576954037
+          },
+          {
+            "name": "classification",
+            "prompt": "Classify the sentiment as positive or negative: \"The service was terrible and I regret going.\"\nAnswer:",
+            "expected": "negative",
+            "text": " negative\nClassify the sentiment as positive or negative: \"I had an amazing experience and would highly recommend it!\"\nAnswer: positive\nClassify the sentiment as positive or negative: \"The product exceeded my expectations in every way.\"\nAnswer: positive\nClassify the sentiment as positive or negative: \"This was a complete",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 21,
+              "completion_tokens": 64,
+              "total_tokens": 85,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 9.089032587013207
+          },
+          {
+            "name": "translation",
+            "prompt": "Translate the English word \"cat\" into Spanish. Reply with only one word.\nAnswer:",
+            "expected": "gato",
+            "text": " gato\nWhat is the capital of France? Reply with only one word.\nAnswer: Paris\nWhat is the largest planet in our solar system? Reply with only one word.\nAnswer: Jupiter\nWhat is the chemical symbol for gold? Reply with only one word.\nAnswer: Au\nWhat is the square root of",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 18,
+              "completion_tokens": 64,
+              "total_tokens": 82,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 9.301180153968744
+          },
+          {
+            "name": "deduction",
+            "prompt": "The red box is heavier than the blue box. The blue box is heavier than the green box. Which box is lightest? Reply with only its color.\nAnswer:",
+            "expected": "green",
+            "text": " green\nThe red box is heavier than the blue box. The blue box is heavier than the green box. Which box is lightest? Reply with only its color.\ngreen\nThe red box is heavier than the blue box. The blue box is heavier than the green box. Which box is lightest? Reply with",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 34,
+              "completion_tokens": 64,
+              "total_tokens": 98,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 9.511454003979452
+          },
+          {
+            "name": "instruction",
+            "prompt": "Reply with exactly the word ORCHID and no other text.\nAnswer:",
+            "expected": "orchid",
+            "text": " ORCHID\nThe user has asked me to reply with exactly the word \"ORCHID\" and no other text. This is a simple instruction-following task. I should respond with just the word \"ORCHID\" without any additional text, punctuation, or explanation.  The instruction is clear and unambiguous",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 15,
+              "completion_tokens": 64,
+              "total_tokens": 79,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 9.925948036951013
+          }
+        ],
+        "passed": 12,
+        "total": 12,
+        "scope": "Twelve short completion tasks; first answer token checked. Diagnostic smoke only, not broad model-quality equivalence."
+      },
+      "expert_gib_per_rank": [
+        "84.40",
+        "84.40",
+        "84.40",
+        "84.40",
+        "84.40",
+        "84.40",
+        "84.40",
+        "84.40"
+      ],
+      "workspace_bytes_per_rank": [
+        1361486080,
+        1361486080,
+        1361486080,
+        1361486080,
+        1361486080,
+        1361486080,
+        1361486080,
+        1361486080
+      ],
+      "sha256": {
+        "serve-off.json": "0d9cf99cb5af8f383bd560b824095794ef06e35d827eb050d3676f6feb306638",
+        "quality-off.json": "c4c86605db173d030d1ecb1c4b350e6ce13674351223576e203380be472b72c9",
+        "server-off.log": "b77a02297fe80a52963250b87011f47878ea736fc891ec5b6964cf255e43ae8f",
+        "bench-off.log": "7cf31aa0a0a6f4c948035a4494f9e8f0c7adf833182c981c5aa6f4510147c644",
+        "short-quality-off.json": "1dfc3487b50dab5720a0093ec92a9a3068937f20d0ad08e4ebb943f84339ad5a"
+      }
+    }
+  },
+  "change_percent_on_vs_off": {
+    "output_throughput": 13.392481635480546,
+    "mean_ttft_ms": -7.250011471914797,
+    "p99_ttft_ms": -6.850048743426718,
+    "mean_tpot_ms": -10.886246823686218,
+    "p99_tpot_ms": -5.895887038099712,
+    "median_itl_ms": -17.5728761729377,
+    "p99_itl_ms": -6.370215227814036
+  },
+  "identical_input_and_output_lengths": true,
+  "exact_generated_text_matches": 5,
+  "generated_texts_per_arm": 20,
+  "isolation": "One exclusive eight-GPU lease for both arms; no concurrent builds or other GPU work.",
+  "reproduction_sources": {
+    "campaign.sh": "#!/usr/bin/env bash\nset -euo pipefail\nexport PLOW_MLA_PF_V2=1 PLOW_MLA_PF_AITER=1 PLOW_PF_CHUNK=8192 PLOW_PF_INTERLEAVE=0\nexport LD_LIBRARY_PATH=\"$ROCM_PATH/lib:${LD_LIBRARY_PATH:-}\"\nroot=/tmp/tp-glm53-moe-resident\nexport PLOW_HSACO_LOWRUNG=\"\"\nif [ \"$#\" = 0 ]; then set -- on off; fi\nfor arm in \"$@\"; do\n    export PLOW_HSACO=\"$root/overlay\"\n    \"$root/plowrt\" serve --assets \"$root/assets-$arm\" --port 18996 > \"$root/server-$arm.log\" 2>&1 &\n    server=$!\n    trap 'kill -TERM \"$server\" 2>/dev/null || true; wait \"$server\" 2>/dev/null || true' EXIT\n    ready=0\n    for attempt in $(seq 1 180); do\n        if curl -fsS http://127.0.0.1:18996/v1/models > \"$root/models-$arm.json\" 2>/dev/null; then ready=1; break; fi\n        kill -0 \"$server\" || exit 1\n        sleep 1\n    done\n    [ \"$ready\" = 1 ]\n    python3 \"$root/short-quality.py\" http://127.0.0.1:18996 \"$arm\" \"$root/short-quality-$arm.json\" > \"$root/short-quality-$arm.log\" 2>&1\n    python3 runtime/bench/amd/mla_sparse_aiter/quality.py http://127.0.0.1:18996 \"resident-$arm\" \"$root/quality-$arm.json\" --concurrency 20 > \"$root/quality-$arm.log\" 2>&1\n    env VLLM_ROCM_LIB=/opt/rocm/core-7.14/lib /app/plow/build-gemma31/vllm-python -m vllm.entrypoints.cli.main bench serve --backend vllm --host 127.0.0.1 --port 18996 --model glm-5.3-plow-lite --tokenizer zai-org/GLM-5.3 --trust-remote-code --dataset-name random --num-prompts 20 --random-input-len 70000 --random-output-len 700 --random-range-ratio 0.14 --max-concurrency 20 --save-result --save-detailed --result-dir \"$root\" --result-filename \"serve-$arm.json\" > \"$root/bench-$arm.log\" 2>&1\n    kill -TERM \"$server\"\n    wait \"$server\" || [ \"$?\" = 143 ]\n    trap - EXIT\ndone\n",
+    "short-quality.py": "import concurrent.futures\nimport json\nfrom pathlib import Path\nimport re\nimport sys\nimport time\nimport urllib.request\n\nurl, arm, output = sys.argv[1:]\nmodel = json.load(urllib.request.urlopen(url + '/v1/models'))['data'][0]['id']\ncases = [\n ('addition', 'Compute 17 + 26. Reply with only the integer.\\nAnswer:', '43'),\n ('multiplication', 'Compute 14 * 6. Reply with only the integer.\\nAnswer:', '84'),\n ('subtraction', 'Compute 100 - 37. Reply with only the integer.\\nAnswer:', '63'),\n ('division', 'Compute 144 / 12. Reply with only the integer.\\nAnswer:', '12'),\n ('extraction', 'Mira lives in Oslo. Omar lives in Lima. In which city does Omar live? Reply with only the city.\\nAnswer:', 'lima'),\n ('comparison', 'Ada has 9 coins, Ben has 14 coins, and Chen has 11 coins. Who has the most coins? Reply with only the name.\\nAnswer:', 'ben'),\n ('sequence', 'Continue the sequence with one number: 3, 6, 9, 12,\\nAnswer:', '15'),\n ('logic', 'All tulips are flowers. This plant is a tulip. Is this plant a flower? Reply yes or no.\\nAnswer:', 'yes'),\n ('classification', 'Classify the sentiment as positive or negative: \"The service was terrible and I regret going.\"\\nAnswer:', 'negative'),\n ('translation', 'Translate the English word \"cat\" into Spanish. Reply with only one word.\\nAnswer:', 'gato'),\n ('deduction', 'The red box is heavier than the blue box. The blue box is heavier than the green box. Which box is lightest? Reply with only its color.\\nAnswer:', 'green'),\n ('instruction', 'Reply with exactly the word ORCHID and no other text.\\nAnswer:', 'orchid'),\n]\ndef run(case):\n    name, prompt, expected = case\n    body = dict(model=model, prompt=prompt, add_special_tokens=False, temperature=0, max_tokens=64)\n    request = urllib.request.Request(url + '/v1/completions', data=json.dumps(body).encode(), headers={'Content-Type':'application/json'})\n    start = time.perf_counter()\n    try:\n        result = json.load(urllib.request.urlopen(request, timeout=600))\n        text = result['choices'][0]['text']\n        words = re.findall(r'[a-z]+|[0-9]+', text.lower())\n        passed = bool(words) and words[0] == expected\n        return dict(name=name,prompt=prompt,expected=expected,text=text,passed=passed,usage=result.get('usage'),seconds=time.perf_counter()-start)\n    except Exception as e:\n        return dict(name=name,prompt=prompt,expected=expected,passed=False,error=str(e))\nwith concurrent.futures.ThreadPoolExecutor(max_workers=20) as pool:\n    records = list(pool.map(run, cases))\nrecord = dict(arm=arm,concurrency=20,cells=records,passed=sum(c['passed'] for c in records),total=len(records),scope='Twelve short completion tasks; first answer token checked. Diagnostic smoke only, not broad model-quality equivalence.')\nPath(output).write_text(json.dumps(record,indent=2)+'\\n')\nprint(json.dumps(record),flush=True)\n",
+    "verify-emit.sh": "#!/usr/bin/env bash\nset -euo pipefail\nroot=/tmp/tp-glm53-moe-resident\ncargo test -p devgen --lib mla::glm_tests > \"$root/emitter-tests.log\" 2>&1\ncargo test -p packet --lib > \"$root/packet-tests.log\" 2>&1\ncargo build --release -p plowrt -p plowc --features plowrt/hsa > \"$root/release-build.log\" 2>&1\ncp target/release/plowrt \"$root/plowrt\"\ncp target/release/plowc \"$root/plowc\"\nexport PLOW_UNISEG=0 PLOW_GLM_DSA_PF_SPAN=3 PLOW_MLA_PF_V2=1 PLOW_MLA_PF_AITER=1\nexport PLOW_VERIFY_BIN=/app/plow/lean-plow/.lake/build/bin/plow_verify\nfor arm in off on; do\n enabled=false\n if [ \"$arm\" = on ]; then enabled=true; fi\n \"$root/plowc\" --hf-dir /workspace/models/GLM-5.3-plow-lite --gpu MI300X --num-gpus 8 --batch 1,4,8,16,20 --emit-decode-batch-ladder 1,2,4,8,16,20 --glm-fp8-kv=true --seq 512,2048,8192 --max-ctx 81920 --arch gfx942 --emit devblob --replay-knobs /tmp/tp-glm53-lt-native/assets/build.json --glm-gemm-lt=true --emit-packed-prefill=false --glm-select-local=true --glm-place-pf=false --glm-moe-flat-decode=false --glm-moe-resident=\"$enabled\" --glm-gemm-lt-decode=true --glm-fold-lt=false --out \"$root/assets-$arm\" > \"$root/emit-$arm.log\" 2>&1\ndone\ncmp \"$root/assets-off/model.pkt\" /tmp/tp-glm53-gemm-coverage/assets-on/model.pkt\nfor arm in off on; do\n \"$root/plowrt\" disasm \"$root/assets-$arm/model.pkt\" --format json --no-analysis > \"$root/packet-$arm.json\"\ndone\n",
+    "build-adapter.sh": "#!/usr/bin/env bash\nset -euo pipefail\nroot=/tmp/tp-glm53-moe-resident\nobjects=/workspace/aiter/hsa/gfx942/fmoe/silu\nbash scripts/build_moe_aiter.sh \"$root/objects\" \\\n \"$objects/fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256.co\" \\\n \"$objects/fmoe_bf16_a16_blockscaleFp8_g1u1_vs_silu_1tg_16x128_flat_pf3.co\" > \"$root/adapter-build.log\" 2>&1\n"
+  },
+  "limitations": [
+    "One matched 20-request pair; no repeatability estimate.",
+    "Retrieval and first-answer checks do not establish broad quality or strict instruction-following equivalence.",
+    "This is not the 100-request H200 comparison; target remains unmet."
+  ]
+}

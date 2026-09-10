@@ -1915,7 +1915,7 @@ pub(crate) fn declare_glm_rows_batched(
     // gathered-row bound: the align op pads each expert's row range up to a whole MPF_BM tile, so
     // every expert can waste at most MPF_BM-1 rows. Sizing this from T*k alone is an out-of-bounds
     // device write with no symptom at low expert counts and a guaranteed one at 384.
-    let (meta, row_token, row_partidx, row_gate, fu_g, fu_scale) = if rows > 1 {
+    let (meta, row_token, row_partidx, row_gate, fu_g, fu_scale) = if rows > 1 || emit_config::active().glm_moe_resident {
         let pad_rows = rows * tk as u64 + (e * (MPF_BM - 1)) as u64;
         // The gathered GLU output is bf16 on the bf16/block-fp8 arms and PACKED fp4 under A4W4 —
         // half a byte per value plus one E8M0 byte per 32. The buffer is sized for whichever the
@@ -5435,7 +5435,8 @@ fn emit_glm_moe_ffn_prefill(
     // It is the earliest packet of the MoE chain (router -> align -> GLU -> DOWN), so the
     // existing edges already order the zero before every writer — no new packet, no new gate.
     // `tk.is_power_of_two()` is what makes `tok = pidx >> log2(k)` exact.
-    let native_moe = emit_config::active().glm_moe_aiter;
+    let resident = emit_config::active().glm_moe_resident;
+    let native_moe = emit_config::active().glm_moe_aiter || resident;
     if native_moe {
         assert!(
             !emit_config::active().packed_prefill_on(),
@@ -5612,7 +5613,7 @@ fn emit_glm_moe_ffn_prefill(
                 n.row_partidx,
                 n.row_gate,
             ];
-            d.i = [t, h, imoe_e, e, tk, 64, 0, 0];
+            d.i = [t, h, imoe_e, e, tk, 64, 0, u32::from(resident)];
         });
         b.isolate(counter);
         counter
@@ -6307,7 +6308,12 @@ fn emit_glm_moe_ffn_rows(
                     },
                 )
             });
-    let flat = emit_config::active().glm_moe_flat_decode && matches!(rows, 2 | 4 | 8);
+    let resident = emit_config::active().glm_moe_resident;
+    assert!(
+        !resident || matches!(rows, 1 | 2 | 4 | 8 | 16 | 20),
+        "resident GLM MoE decode requires rows 1/2/4/8/16/20"
+    );
+    let flat = resident || (emit_config::active().glm_moe_flat_decode && matches!(rows, 2 | 4 | 8));
     if flat {
         assert!(
             enc == MoeEnc::Fp8Blk
@@ -6489,7 +6495,7 @@ fn emit_glm_moe_ffn_rows(
                 TENSOR_NONE,
                 TENSOR_NONE,
             ];
-            d.i = [rows, h, imoe_e, e, tk, 0, 1, 0];
+            d.i = [rows, h, imoe_e, e, tk, 0, 1, u32::from(resident)];
         });
         b.isolate(counter);
         counter
@@ -6640,7 +6646,7 @@ pub(crate) fn emit_glm_moe_ffn(
     let use_fp8 = enc != MoeEnc::Bf16;
     let lin_fp8 = glm_linear_fp8(enc);
     let glu_split = glm_shared_glu_split(enc);
-    if rows > 1 {
+    if rows > 1 || emit_config::active().glm_moe_resident {
         // BATCHED DECODE FFN: the decode MoE op family carries no token dimension
         // (`MoeRouterTopk`/`MoeGroupGluFp8Blk`/`MoeGroupDownFp8Blk`/`MoeCombine` are all
         // single-row), so at rows > 1 the seam is emitted with the PREFILL family at T = rows —
@@ -7416,6 +7422,16 @@ fn glm_emit_full(
     let nl = cap.unwrap_or(c.layers).min(c.layers);
     let layers: Vec<u32> = (0..nl).collect();
     let enc = MoeEnc::from_flags(use_fp8, false);
+    if emit_config::active().glm_moe_resident {
+        assert!(
+            crate::emit_is_amd() && target == "gfx942" && tp == 8
+                && enc == MoeEnc::Fp8Blk && !c.ep
+                && !emit_config::active().packed_prefill_on()
+                && !emit_config::active().moe_prefill_ep,
+            "resident GLM MoE requires gfx942 TP8 block-FP8 without EP or packed prefill"
+        );
+    }
+
 
     // PREFILL BUCKETS. `PLOW_MLA_PREFILL=full` turns the serving blob from decode-only (n_prog = 1)
     // into a bucket ladder + decode. Decode-only is what made GLM's TTFT 20x vLLM's: with no
@@ -7492,10 +7508,12 @@ fn glm_emit_full(
             }
             pb.set_l2_placement(l2_layout);
         }
-        if emit_config::active().glm_fold_lt && t >= 2048 {
+        if (emit_config::active().glm_fold_lt && t >= 2048)
+            || emit_config::active().glm_moe_resident
+        {
             assert!(
                 crate::emit_is_amd() && target == "gfx942",
-                "native MLA fold requires gfx942"
+                "native GLM prefill requires gfx942"
             );
             pb.deny_uniseg();
         }
@@ -7578,7 +7596,9 @@ fn glm_emit_full(
     let mut n_ops = 0;
     for &rb in &rungs {
         let mut b = Builder::new(n_cu);
-        if emit_config::active().glm_moe_flat_decode && matches!(rb, 2 | 4 | 8) {
+        if (emit_config::active().glm_moe_flat_decode && matches!(rb, 2 | 4 | 8))
+            || emit_config::active().glm_moe_resident
+        {
             assert!(
                 crate::emit_is_amd() && target == "gfx942",
                 "flat GLM MoE requires gfx942"

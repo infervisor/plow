@@ -1684,14 +1684,24 @@ fn glm_placed_prefill_preserves_native_segment_boundaries() {
 
 #[test]
 fn glm_flat_decode_preserves_xcd_native_segment_boundaries() {
+    check_glm_flat_segments(false);
+}
+
+#[test]
+fn glm_resident_moe_preserves_all_native_segment_boundaries() {
+    check_glm_flat_segments(true);
+}
+
+fn check_glm_flat_segments(resident: bool) {
     let _guard = crate::test_env::env_guard();
     let _target = crate::EmitAmdGuard::set(true);
     let _env = crate::test_env::EnvScope::set(&[
         ("PLOW_MLA_PREFILL", "full:128"),
         ("PLOW_GLM_PLACE_PF", "0"),
         ("PLOW_GLM_MOE_AITER", "0"),
-        ("PLOW_GLM_MOE_FLAT_DECODE", "1"),
-        ("PLOW_DECODE_BATCH_LADDER", "1,2,4,8"),
+        ("PLOW_GLM_MOE_FLAT_DECODE", if resident { "0" } else { "1" }),
+        ("PLOW_GLM_MOE_RESIDENT", if resident { "1" } else { "0" }),
+        ("PLOW_DECODE_BATCH_LADDER", if resident { "1,2,4,8,16,20" } else { "1,2,4,8" }),
         ("PLOW_EMIT_PACKED_PREFILL", "0"),
         ("PLOW_UNISEG", "0"),
     ]);
@@ -1709,7 +1719,7 @@ fn glm_flat_decode_preserves_xcd_native_segment_boundaries() {
         "rope_theta": 8000000.0
     });
     std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
-    let verify: crate::VerifyHook = Box::new(|model| {
+    let verify: crate::VerifyHook = Box::new(move |model| {
         let mut checked = 0;
         for (prog, &rows) in model.progs.iter().zip(&model.prog_t) {
             let native = prog
@@ -1718,15 +1728,18 @@ fn glm_flat_decode_preserves_xcd_native_segment_boundaries() {
                 .enumerate()
                 .filter(|(_, d)| d.op == DevOp::MoeAiterFp8Pf as u16)
                 .collect::<Vec<_>>();
-            if !matches!(rows, 2 | 4 | 8) {
+            if !resident && !matches!(rows, 2 | 4 | 8) {
                 assert!(native.is_empty());
                 continue;
             }
             checked += 1;
-            assert_eq!(prog.l2_domains, 8);
+            if rows <= 20 { assert_eq!(prog.l2_domains, 8); }
             assert_eq!(native.len(), 1);
             let (ix, inst) = native[0];
-            assert_eq!(inst.i, [rows, 6144, 256, 256, 8, 0, 1, 0]);
+            if rows > 20 {
+                assert_eq!(inst.i, [rows, 6144, 256, 256, 8, 64, 0, 1]);
+            } else {
+            assert_eq!(inst.i, [rows, 6144, 256, 256, 8, 0, 1, u32::from(resident)]);
             assert_eq!(&inst.t[5..], &[TENSOR_NONE; 3]);
             let router = prog.insts[..ix]
                 .iter()
@@ -1740,6 +1753,7 @@ fn glm_flat_decode_preserves_xcd_native_segment_boundaries() {
                 .find(|d| d.op == DevOp::MoeCombinePf as u16 && d.t[3] == inst.t[0])
                 .unwrap();
             assert_eq!(combine.i, [6144, 1, rows, 0, 0, 0, 0, 1]);
+            }
             let segment = prog
                 .stream
                 .iter()
@@ -1763,9 +1777,9 @@ fn glm_flat_decode_preserves_xcd_native_segment_boundaries() {
                 .map(|e| usize::from(e.seg) + 1)
                 .max()
                 .unwrap();
-            assert_eq!(prog.gq_seg_ofs.len(), segments * 8 + 1);
+            if rows <= 20 { assert_eq!(prog.gq_seg_ofs.len(), segments * 8 + 1); }
         }
-        assert_eq!(checked, 3);
+        assert_eq!(checked, if resident { 7 } else { 3 });
         Ok(crate::LeanReport::skipped(
             "flat decode segment regression test",
         ))
