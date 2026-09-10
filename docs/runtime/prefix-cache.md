@@ -30,6 +30,11 @@ require all ranks; AMD unified batching still requires its single-GPU packet
 and code-object capabilities. All compiled decode and prefill rungs remain
 available to ordinary execution.
 
+The GLM-5.3 MI300X TP8 screen selects prefix caching with the default settings.
+Unified batching is requested by default but declines with
+`token batching does not support tensor parallelism`; that run uses ordinary
+execution. Enabling the selector does not remove this implementation limit.
+
 Fresh single-GPU Hopper builds emit packed-request metadata by default for
 BF16 weights and BF16-activation FP8 weights (`--fp8` or `--w8a16`) with BF16 KV.
 `--emit-packed-prefill=false` disables that emission. Activation-FP8 packing

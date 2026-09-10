@@ -2830,6 +2830,10 @@ __device__ __forceinline__ void gemv_rows_mfma(bf16* __restrict__ C_, const bf16
 #ifndef GV_MFMA4
 #define GV_MFMA4 0
 #endif
+/* Zero leaves the MFMA probe unrestricted. */
+#ifndef GV_MFMA4_MAXK
+#define GV_MFMA4_MAXK 0
+#endif
 
 typedef bf16_t gv_bf16x4 __attribute__((ext_vector_type(4)));
 union gv_mfma4_frag {
@@ -4618,9 +4622,11 @@ __device__ void d_gemv_t(bf16* __restrict__ C, const bf16* __restrict__ x,
              * is bit-identical to every golden in the tree, so a concurrency-1 tier must keep
              * it. Turning GV_MFMA4 on therefore cannot perturb a batch-1 sequence. */
             if constexpr (MM >= 2) {
-                gemv_rows_mfma4<MM, true, gv_mfma4_un(MM), gv_mfma4_yt(MM)>(C, x, W, M, N, K,
-                                                                            slice, nblk, lds);
-                return;
+                if (GV_MFMA4_MAXK == 0 || K <= GV_MFMA4_MAXK) {
+                    gemv_rows_mfma4<MM, true, gv_mfma4_un(MM), gv_mfma4_yt(MM)>(
+                        C, x, W, M, N, K, slice, nblk, lds);
+                    return;
+                }
             }
 #endif
 #if GV_DMA
@@ -4715,9 +4721,11 @@ __device__ void d_gemv_t(bf16* __restrict__ C, const bf16* __restrict__ x,
              * carry a third of the decode weight bytes, so the unstaged path must take the arm
              * too or most of the win is left behind. */
             if constexpr (MM >= 2) {
-                gemv_rows_mfma4<MM, false, gv_mfma4_un(MM), gv_mfma4_yt(MM)>(C, x, W, M, N, K,
-                                                                             slice, nblk, lds);
-                return;
+                if (GV_MFMA4_MAXK == 0 || K <= GV_MFMA4_MAXK) {
+                    gemv_rows_mfma4<MM, false, gv_mfma4_un(MM), gv_mfma4_yt(MM)>(
+                        C, x, W, M, N, K, slice, nblk, lds);
+                    return;
+                }
             }
 #endif
             gemv_rows<MM, false, false, UN>(C, x, W, rms, gamma, M, N, K, slice, nblk, lds);
