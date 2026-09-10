@@ -551,3 +551,32 @@ length arrays, and 12/12 expected first answers. The loader selects the intended
 GQ decode image on all eight ranks. One run per width, in order 16/8/4, supplies
 no repeatability estimate or broad quality qualification. No production
 defaults change.
+
+### Host phases after resident MoE
+
+[mi300x-resident-host-phases.json](mi300x-resident-host-phases.json) records
+`PLOW_DSTEP_LOG=1` with 32-step windows on the qualified generic resident image.
+The short-input workload completes 40/40 requests without failures. The parser
+checks all 18 complete windows (576 decode steps); 16 windows (512 steps) have
+no reported execution-rung change away from batch 20.
+
+| Host wall-clock phase | Mean per step in those 16 windows (ms) |
+| --- | ---: |
+| Enqueue all ranks | 6.255 |
+| Rearm inactive local-counter banks | 3.488 |
+| Wait for remaining GPU work | 96.415 |
+| TP safety audit | 1.077 |
+| Between-step idle, including prefill interruptions | 20.907 |
+| Total including idle | 128.654 |
+
+These are batched decode steps, despite the logger's `µs/token` label. Enqueue
+overlaps GPU execution and may include queue backpressure. Counter double
+buffering is enabled, so inactive-bank rearming also overlaps GPU execution.
+The drain is the residual host wait, not total GPU duration. The logger's
+`HOST TOTAL` therefore cannot be treated as removable CPU computation.
+
+This current multi-segment path has material submission cost, but eliminating
+the measured enqueue time alone cannot close the H200 gap. Retain the existing
+queue implementation pending a measured benefit; prioritize GPU execution and
+prefill throughput. This instrumented short-input run does not establish
+100-request long-context performance.
