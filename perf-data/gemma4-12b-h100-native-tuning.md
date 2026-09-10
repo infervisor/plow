@@ -575,3 +575,51 @@ replaces only the packed light object in addition to the script's existing
 GEMM/attention builds. Its default is off. The measurements here retained all
 other qualified objects and the packet-pinned QK32 object. C128 has not yet
 been screened with this candidate, and no all-op optimality claim is made.
+
+## C128 follow-up and further light-object limits
+
+The paired FATLITE/doubled-slice configuration now completes the C128 screen:
+569.525 tokens/s at 1K input and 101.845 at 16K, versus the earlier unsliced
+fixed-scheduler screens of 562.404/99.759. These are sequential single-repeat
+screens, not a statistical A/B. The fresh server ran serving verification
+first, with no additional per-case warmup. All 256 requests completed 128
+tokens with zero cached tokens; physical batch remains 16.
+[C128 evidence](gemma4-12b-h100-data/fatlite-c128.json),
+[serving verification](gemma4-12b-h100-data/fatlite-c128-verify.log).
+
+A further experimental packed light-only object retained the native op bodies
+and queue/counter protocol, restricted supported opcodes, and reduced dynamic
+scratch to 64 bytes. Its initial allow-list omitted `Nop` and trapped during
+serving verification even with the original scratch size restored. The runtime
+rewrites terminal instructions to `Nop`; adding that opcode restored serving
+checks with the small scratch allocation. Static emitted-op coverage alone
+therefore does not establish the complete runtime kernel contract.
+
+Restricting the dispatch without explicitly removing heavy cases retained
+128 registers and a 2360-byte stack. Explicitly compiling out unused GEMM,
+MoE and extra normalization cases reduced this to 107 registers, zero stack
+and 64 bytes of dynamic scratch. A build-only `RN_REG=16` variant instead used
+113 registers and was not benchmarked. No larger occupancy was gained.
+
+| Object | 16K/C1 tok/s | 16K/C1 TTFT ms | 16K/C16 tok/s |
+|---|---:|---:|---:|
+| Retained FATLITE + doubled slices | 46.644 | 1047.097 | 98.551 |
+| Dispatch restriction + small scratch | 46.476 | 1055.910 | 96.445 |
+| Explicitly stripped light object | 46.802 | 1037.441 | 98.598 |
+
+Both working prototypes passed serving checks; their 136 measured requests
+completed 128 tokens/cache0. These are two-repeat screens after one warmup per
+cell, and full-logit equivalence was not qualified for the new prototypes.
+The stripped object's C16 repeats varied from 99.954 to 97.243 tokens/s.
+There is no clear C16 improvement over the retained configuration in this
+screen, despite the smaller footprint. Experimental production-source changes
+were removed, with the patch and cubins retained in ignored plans.
+[Experiment evidence](gemma4-12b-h100-data/lightonly-experiment.json).
+
+A fresh event-profile comparison gives FATLITE vs stripped summed light time
+95.5 vs 79.1 ms, GEMM 532.7 vs 537.7 ms, and attention 348.8 vs 351.7 ms.
+This demonstrates a smaller light-body cost, not an end-to-end throughput win.
+GEMM and attention dominate the remaining prefill work; further optimization
+should prioritize them and batching capacity. The vLLM objective remains unmet.
+[Control profile](gemma4-12b-h100-data/lightonly-profile-control.log),
+[stripped profile](gemma4-12b-h100-data/lightonly-profile-slices.log).
