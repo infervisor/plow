@@ -1,0 +1,347 @@
+{
+  "schema": "plow.dsa.parallel-selection-serving-rejection.v1",
+  "date": "2026-09-10",
+  "source_base_commit": "ef0eeeeff40e5fb7a720361c90f14476f37b66e3",
+  "runtime_sha256": "95a6900d7089378b862e5dbbeded7995b8150c5fbb1d4f266e8b227535d85d90",
+  "experimental_patch_sha256": "0967b53e8b274e0ecf023ec2a9a83b529753764a1e19b3fbf95948b9e445f158",
+  "parallel_packet_sha256": "528ab1a2b8b746c1f7f2924ffb113c02ff3b08ba7a3fb6f14dd189eebba268b8",
+  "serial_packet_sha256": "b62cdf60c1d65cf79465f69f85d135c67d27e8063db9bf017c9b0654e0180686",
+  "parallel": {
+    "global_queue": "stalled at rung 4 with 3 occupied slots; stopped with SIGTERM",
+    "static": "stalled at rung 4 with 3 occupied slots; stopped with SIGTERM",
+    "completed_quality_cases": 0
+  },
+  "control": {
+    "arm": "select-serial-new-objects-b8",
+    "concurrency": 8,
+    "cells": [
+      {
+        "length_label": 8000,
+        "depth": 0.1,
+        "needle": "code",
+        "expected": "7429",
+        "text": " 7429-BLUE.",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 5437,
+          "completion_tokens": 9,
+          "total_tokens": 5446,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "seconds": 7.012403764994815
+      },
+      {
+        "length_label": 8000,
+        "depth": 0.5,
+        "needle": "city",
+        "expected": "Trondheim",
+        "text": " Trondheim. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream, so a token",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 5438,
+          "completion_tokens": 24,
+          "total_tokens": 5462,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "seconds": 9.251794850977603
+      },
+      {
+        "length_label": 8000,
+        "depth": 0.1,
+        "needle": "mass",
+        "expected": "312",
+        "text": " exactly 312 grams. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream,",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 5433,
+          "completion_tokens": 24,
+          "total_tokens": 5457,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "seconds": 9.366664363013115
+      },
+      {
+        "length_label": 8000,
+        "depth": 0.9,
+        "needle": "code",
+        "expected": "7429",
+        "text": " 7429-BLUE. The code is 7429-BLUE. The code is 7",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 5437,
+          "completion_tokens": 24,
+          "total_tokens": 5461,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "seconds": 11.530058671021834
+      },
+      {
+        "length_label": 8000,
+        "depth": 0.5,
+        "needle": "code",
+        "expected": "7429",
+        "text": " 7429-BLUE. The code is 7429-BLUE. The code is 7",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 5437,
+          "completion_tokens": 24,
+          "total_tokens": 5461,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "seconds": 12.608981633966323
+      },
+      {
+        "length_label": 8000,
+        "depth": 0.1,
+        "needle": "city",
+        "expected": "Trondheim",
+        "text": " Trondheim. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream, so a token",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 5438,
+          "completion_tokens": 24,
+          "total_tokens": 5462,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "seconds": 13.694680691987742
+      },
+      {
+        "length_label": 8000,
+        "depth": 0.5,
+        "needle": "mass",
+        "expected": "312",
+        "text": " exactly 312 grams. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream,",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 5433,
+          "completion_tokens": 24,
+          "total_tokens": 5457,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "seconds": 14.784613021009136
+      },
+      {
+        "length_label": 8000,
+        "depth": 0.9,
+        "needle": "city",
+        "expected": "Trondheim",
+        "text": " Trondheim. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream, so a token",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 5438,
+          "completion_tokens": 24,
+          "total_tokens": 5462,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "seconds": 15.885887581040151
+      },
+      {
+        "length_label": 8000,
+        "depth": 0.9,
+        "needle": "mass",
+        "expected": "312",
+        "text": " exactly 312 grams. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream,",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 5433,
+          "completion_tokens": 24,
+          "total_tokens": 5457,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "seconds": 12.72240965400124
+      },
+      {
+        "length_label": 100000,
+        "depth": 0.1,
+        "needle": "city",
+        "expected": "Trondheim",
+        "text": " Trondheim.",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 68802,
+          "completion_tokens": 4,
+          "total_tokens": 68806,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "seconds": 20.57280390500091
+      },
+      {
+        "length_label": 100000,
+        "depth": 0.1,
+        "needle": "code",
+        "expected": "7429",
+        "text": " 7429-BLUE. 7429-BLUE. 7429-BLUE.",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 68801,
+          "completion_tokens": 24,
+          "total_tokens": 68825,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "seconds": 32.062736109946854
+      },
+      {
+        "length_label": 100000,
+        "depth": 0.1,
+        "needle": "mass",
+        "expected": "312",
+        "text": " exactly 312 grams. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream,",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 68797,
+          "completion_tokens": 24,
+          "total_tokens": 68821,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "seconds": 48.79226491297595
+      },
+      {
+        "length_label": 100000,
+        "depth": 0.5,
+        "needle": "code",
+        "expected": "7429",
+        "text": " 7429-BLUE. The code is 7429-BLUE. The code is 7",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 68801,
+          "completion_tokens": 24,
+          "total_tokens": 68825,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "seconds": 57.25830473098904
+      },
+      {
+        "length_label": 100000,
+        "depth": 0.5,
+        "needle": "city",
+        "expected": "Trondheim",
+        "text": " Trondheim. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream, so a token",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 68802,
+          "completion_tokens": 24,
+          "total_tokens": 68826,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "seconds": 65.73310218303232
+      },
+      {
+        "length_label": 100000,
+        "depth": 0.9,
+        "needle": "city",
+        "expected": "Trondheim",
+        "text": " Trondheim.",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 68802,
+          "completion_tokens": 4,
+          "total_tokens": 68806,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "seconds": 67.0625261880341
+      },
+      {
+        "length_label": 100000,
+        "depth": 0.5,
+        "needle": "mass",
+        "expected": "312",
+        "text": " exactly 312 grams. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream,",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 68797,
+          "completion_tokens": 24,
+          "total_tokens": 68821,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "seconds": 74.19950449297903
+      },
+      {
+        "length_label": 100000,
+        "depth": 0.9,
+        "needle": "code",
+        "expected": "7429",
+        "text": " 7429-BLUE. The code is 7429-BLUE. The code is 7",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 68801,
+          "completion_tokens": 24,
+          "total_tokens": 68825,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "seconds": 78.69397728302283
+      },
+      {
+        "length_label": 100000,
+        "depth": 0.9,
+        "needle": "mass",
+        "expected": "312",
+        "text": " exactly 312 grams.",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 68797,
+          "completion_tokens": 7,
+          "total_tokens": 68804,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "seconds": 64.72422741999617
+      }
+    ]
+  },
+  "retained_production_changes": false,
+  "cause": "Unresolved; serial packet passes with the same rebuilt objects/runtime.",
+  "logs_sha256": {
+    "server.log": "c5dc734b8e0d7a5daa8a1cbb1b18a7df7b818e7e04e42177ffd6620cfb598013",
+    "server-static.log": "f2b42709c34d1dbd96d33df06c3e4e1606d273c3ef92b9840ee9b81b1cd3ee06",
+    "server-control.log": "097893eded20e95a5cf6b8f38663c32f01f9c869550932b14e3927d073e88cd9",
+    "quality8-control.log": "46ad3d1e5c5e1dc40fec323768a67114fd6624aaea7be161278b6bea93e06609",
+    "quality8-control.json": "da4282f68d42e98ccd7a64412373acecf45c32c04580efe2d94dc6cde93e6569"
+  },
+  "objects_sha256": {
+    "interp_decode.elf": "28dd5d75ae088f3b983c56fb1bb4b16788d2520cba302ccc78f7c4253c49484c",
+    "interp_decode_gq.elf": "5c05a286a89cad9fd84d386ba1f427097593a60ab307eb887867421d907b9ed3",
+    "lowrung1/interp_decode.elf": "676b3daed1b849805f6339dc678d1dfe031899246c3ac556799b0c7650c3fed0",
+    "lowrung1/interp_decode_gq.elf": "267e0eb4b16cb37fdf2791dea60f237b792eb797afc20a5247a0d8202242b145",
+    "lowrung2/interp_decode.elf": "3a22f6c2adf30abe422b8d8290138597d7be2de148d67206440c6748b3aecd5f",
+    "lowrung2/interp_decode_gq.elf": "a11129229bf8c2faa429a1f26e116f37d8d87a7440725339d7034ea5aa3c7cdb",
+    "lowrung4/interp_decode.elf": "5b0fe24ac19b9c7cf77b54a7e572dfa7ca3185121adb3bbf0fadb3375b76b7b7",
+    "lowrung4/interp_decode_gq.elf": "b10dccc5e48b0fa9a997d0215e66d3b2507d665902b1f9ae4737ecf64e905118",
+    "lowrung8/interp_decode.elf": "573c2b449f7323f575d5f0075c4c201a05541e32decfd6b3a1f44b97fa042ba5",
+    "lowrung8/interp_decode_gq.elf": "ddc1c742bbe4bcf3d32991c285a1de38feccd22fd9cd06bb889d9c035473454e"
+  }
+}

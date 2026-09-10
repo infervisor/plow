@@ -1,0 +1,61 @@
+{
+  "schema": "plow.dsa.parallel-selection-qualification.v1",
+  "date": "2026-09-10",
+  "source_base_commit": "ef0eeeeff40e5fb7a720361c90f14476f37b66e3",
+  "gpu": "MI300X gfx942",
+  "lease_count": 8,
+  "execution_gpu_count": 1,
+  "ctx_capacity": 81920,
+  "topk": 2048,
+  "histogram_words_per_row": 1792,
+  "control_words_per_row": 64,
+  "threads": 512,
+  "synthetic_cases": 111,
+  "captured_cases": 6,
+  "oracle": "CPU descending float score, lowest-index tie-break; compare complete sorted selected sets",
+  "scratch_reuses_per_case": 12,
+  "permuted_logical_slices": true,
+  "inactive_output_and_512_byte_guard_preserved": true,
+  "timing": "10 GPU-event samples of 10 graph-captured operations, after 2 graph warmups; microseconds per operation",
+  "modes": {
+    "0": "serial chain of one 32-WG kernel per row",
+    "1": "single 32-WG kernel iterates rows with completion barrier",
+    "2": "independent rows, per-row scratch and groups_per_row WGs"
+  },
+  "capture": {
+    "input": "65000 repeats of token ID 1, same prompt in each of 8 slots",
+    "tp": 8,
+    "decode_step": 2,
+    "live_kv_rows": 65003,
+    "score_capacity_per_row": 81920,
+    "score_min": 1.7736618518829346,
+    "score_max": 5.500545024871826,
+    "all_live_scores_finite": true,
+    "captured_topk_exact_against_cpu_oracle": true,
+    "runtime_sha256": "0e48201f364064ba91f347ad0d87939ab24f6e8d3eb976e09ee23a613b420d2c",
+    "packet_sha256": "b62cdf60c1d65cf79465f69f85d135c67d27e8063db9bf017c9b0654e0180686",
+    "score_sha256": "dc82ffa0215a013a409fa9c7db11fc80654b74239ebe2b76aa87bd675015eee9",
+    "index_sha256": "243b9c509481a42bc8ee34c62f912aef5399f63a939661232ccf95ffa6e89fb5",
+    "note": "Repeated-token diagnostic, not the serving workload or a general quality check."
+  },
+  "trace": {
+    "wall_ms": 106.742,
+    "index_select_body_sum_ms": 14.87,
+    "index_select_instructions": 168,
+    "gemv_body_sum_ms": 36.548,
+    "moe_glu_body_sum_ms": 20.52,
+    "diagnostic_two_step_mean_ms": 107.552,
+    "attribution": "=== /tmp/tp-glm53-select-parallel/decode.bin\n    2331 packets, 400819 trace slots, clock 100 MHz\n\nop                          n  wg/pkt  stall ms   body ms   span ms   %span\nGemv                      832     304    39.644    36.548    76.193    27.0\nIndexSelect               168      32    56.421    14.870    71.291    25.3\nMoeGroupDownPf             78     304    18.943     6.715    25.658     9.1\nFlashGatherDecode          78     256    17.877     6.503    24.380     8.6\nMoeGroupGluPf              78     304     3.024    20.520    23.544     8.3\nMlaMergeFold               78      64    10.218     1.998    12.216     4.3\nHeadNormRope              276       5     5.689     4.975    10.665     3.8\nAddNorm                   155       1     4.007     4.011     8.019     2.8\nXReduce                   156      96     3.347     3.116     6.463     2.3\nMoeCombinePf               78     304     3.585     2.595     6.180     2.2\nMoeRouterTopkPf            75     304     4.637     0.817     5.454     1.9\nMoeAlignPf                 78       1     1.636     2.545     4.181     1.5\nRmsNorm                    80       1     0.194     2.608     2.802     1.0\nIndexScore                 21     304     0.803     1.795     2.598     0.9\nGlu                        75       1     0.975     0.665     1.640     0.6\nLayerNorm                  21       1     0.162     0.533     0.695     0.2\nArgmax                      1      64     0.181     0.024     0.205     0.1\nXArgmaxFin                  1       1     0.029     0.024     0.053     0.0\nEmbed                       1     304     0.016     0.027     0.043     0.0\nResidual                    1       1     0.022     0.018     0.040     0.0\n\nTOTAL (serialized)       2331           171.411   110.907   282.319   100.0\n    stall share of the chain : 60.7%\n    wall span of the trace   : 106.742 ms\n",
+    "sha256": "0d1244b0c45c520066e8764483d19df4f1c4ad66ceccf14da044a7849df01ca3",
+    "note": "Instrumented final B8 decode step. Per-instruction stalls/spans overlap and cannot be added as recoverable wall time."
+  },
+  "source_sha256": {
+    "bench.hip": "1918eb77579f88bd5ecb8a782a7aced6c4b3ed3b8c97b74d608cbbcf963ae1ed",
+    "runtime/amd/op_attention.h": "693a54595d61955d8d54cec2a0fd319246a33d5e67c0b0ed4fdbb3f62d8140fc"
+  },
+  "logs_sha256": {
+    "profile.log": "0e0ceae9518e15231b6019e100c78d724595764e256d8d5f6d4a23f1a96b7d24",
+    "build.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "capture_command_script": "import os, subprocess\nroot='/tmp/tp-glm53-select-parallel'\nos.environ.update(PLOW_TRACE_RAW=root+'/decode.bin',PLOW_DUMP_ACT='act.iscore:'+root+'/score,act.iidx:'+root+'/idx',PLOW_MLA_PF_V2='1',PLOW_MLA_PF_AITER='1',PLOW_PF_CHUNK='8192',PLOW_PF_INTERLEAVE='0')\ncmd=['/tmp/tp-glm53-lt-native/plowrt-final','amd-bench','--blob','/tmp/tp-glm53-lt-native/assets/model.pkt','--hsaco','/tmp/tp-glm53-lt-native/objects','--checkpoint','/workspace/models/GLM-5.3-plow-lite','--prompt',','.join(['1']*65000),'--batched','--tp','8','--steps','3']\nwith open(root+'/profile.log','w') as log:subprocess.run(cmd,stdout=log,stderr=subprocess.STDOUT,check=True)\n"
+}
