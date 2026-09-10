@@ -166,6 +166,36 @@ recipe. Exact role build defines, object hash, unchanged-window checks and
 runtime route evidence are in `gemma4-12b-h100-data/lean-attention-route-check.json`
 and `lean-attention-route.log`. Six compiler role tests pass.
 
+### TMA stage state in registers
+
+The cooperative WGMMA body now uses two bitmasks for the double buffer's barrier
+parities and pending-copy flags. This preserves phase continuity across work
+items and avoids addressable local arrays. In the lean role, compilation reports
+240 registers, zero stack bytes and zero spills. Both profiled cases report zero
+local-memory sectors and zero LSU shared-memory bank conflicts. The mapped
+packet's event time is 1,921.73 us; this small improvement over the preceding
+lean role does not explain the entire model-level gap.
+
+Eight attention cases pass the independent oracle at the production grid size
+and at eight blocks, where each block processes multiple work items and requests.
+The eight-block HD512 packet run also passes CUDA memcheck. This checks phase
+reuse across items as well as full-TMA/partial-copy transitions.
+
+The final serving candidate passes the same parity, cancellation, slot-reuse and
+context checks. With 128 output tokens and the same one-repeat screen:
+
+| Input | Concurrency | TTFT ms | Output tokens/s | TPOT ms |
+|---:|---:|---:|---:|---:|
+| 1,024 | 1 | 86.93 | 69.34 | 13.85 |
+| 1,024 | 16 | 965.31 | 263.81 | 53.47 |
+| 16,384 | 1 | 1,198.33 | 41.81 | 14.66 |
+| 16,384 | 16 | 19,741.80 | 74.54 | 60.52 |
+
+These results remain below the goal. The hardware traffic removal is verified;
+the serving difference needs repeated, interleaved measurement before attributing
+its full size to the bitmask change. Raw before/after counters and checks are in
+`attention-stage-state-check.json` and the `attention-bits-*` files.
+
 ## References and reproduction
 
 Reference implementation inspected at DeepGEMM revision

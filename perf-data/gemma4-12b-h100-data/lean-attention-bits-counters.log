@@ -1,0 +1,2 @@
+mode=interpreter HD=512 BKV=0 KV=1 window=0 maps=0 checked=9216 worst_relL2=0.00252794 max_abs=0.00117694 warm_us=nan PASS
+mode=interpreter HD=512 BKV=0 KV=1 window=0 maps=1 checked=9216 worst_relL2=0.00252794 max_abs=0.00117694 warm_us=nan PASS

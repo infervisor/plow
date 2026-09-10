@@ -594,8 +594,9 @@ __device__ void d_flash_prefill_sm90(float* __restrict__ Opart, float* __restric
      * continuously across tiles and work items; static smem, so no arena claim and no inval
      * (the barriers are never reused as plain data). */
     __shared__ uint64_t fa90_bar[FA_SM90_NS];
-    unsigned fa90_ph[FA_SM90_NS] = {0, 0};
-    bool fa90_tma[FA_SM90_NS] = {false, false};
+    // Dynamic stage arrays become local memory; two bits retain each parity and pending state.
+    unsigned fa90_ph = 0;
+    unsigned fa90_tma = 0;
     if (mapkv && tid == 0) {
         sm90_mbar_init(&fa90_bar[0], 1);
         sm90_mbar_init(&fa90_bar[1], 1);
@@ -699,7 +700,7 @@ __device__ void d_flash_prefill_sm90(float* __restrict__ Opart, float* __restric
             __nv_bfloat16* kd = Ks + (size_t)buf * NSUB * KT;
             __nv_bfloat16* vd = Vs + (size_t)buf * NSUB * KT;
             const bool full = use_tma && (kv0 + (unsigned)BKV <= hi);
-            fa90_tma[buf] = full;
+            fa90_tma = (fa90_tma & ~(1u << buf)) | (unsigned(full) << buf);
             if (full) {
                 if (tid == 0) {
                     sm90_mbar_expect(&fa90_bar[buf], 2 * NSUB * KT * 2);
@@ -735,10 +736,10 @@ __device__ void d_flash_prefill_sm90(float* __restrict__ Opart, float* __restric
          * cp.async group drain otherwise (Q rides the cp path in both cases). */
         auto waitKV = [&](int buf) {
             sm90_cp_wait<0>();
-            if (fa90_tma[buf]) {
-                sm90_mbar_wait(&fa90_bar[buf], (int)(fa90_ph[buf] & 1u));
-                fa90_ph[buf]++;
-                fa90_tma[buf] = false; /* consumed — a skipped restage must not re-wait */
+            if (fa90_tma & (1u << buf)) {
+                sm90_mbar_wait(&fa90_bar[buf], (int)((fa90_ph >> buf) & 1u));
+                fa90_ph ^= 1u << buf;
+                fa90_tma &= ~(1u << buf); /* consumed — a skipped restage must not re-wait */
             }
         };
 

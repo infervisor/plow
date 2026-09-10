@@ -1,0 +1,20 @@
+{
+  "baseline_commit": "c904de4a",
+  "candidate_sha256": "b9502422b9aba6373686041996782a3325a9a41449690e1c9c955373aa958f0d",
+  "default_role_byte_identical": true,
+  "production_grid": 132,
+  "multi_item_oracle_grid": 8,
+  "multi_item_memcheck_grid": 8,
+  "multi_item_oracle_cases": 8,
+  "multi_item_memcheck_cases": 2,
+  "serving_output_tokens": 128,
+  "serving_cells": 4,
+  "warmups_per_cell": 1,
+  "repeats_per_cell": 1,
+  "physical_batch": 16,
+  "ingress_capacity": 128,
+  "prefill_chunk": 1024,
+  "prefill_budget": 2048,
+  "prefix_cache": false,
+  "goal_achieved": false
+}
