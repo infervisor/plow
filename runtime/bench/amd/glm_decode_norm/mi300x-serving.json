@@ -1,0 +1,1666 @@
+{
+  "schema": "plow.glm.decode-row-norm.v1",
+  "date": "2026-09-10",
+  "artifact_root": "/tmp/tp-glm53-row-norm",
+  "campaign_source": {
+    "source_commit": "5f631cc975bdb392fad38728f711e7fd2f4962f4",
+    "source_patch": "diff --git a/crates/devgen/src/emit_config.rs b/crates/devgen/src/emit_config.rs\nindex 3e19fd00..be10ada7 100644\n--- a/crates/devgen/src/emit_config.rs\n+++ b/crates/devgen/src/emit_config.rs\n@@ -591,6 +591,10 @@ pub struct EmitConfig {\n     #[arg(long, env = \"PLOW_GLM_SELECT_LOCAL\", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = \"true\")]\n     pub glm_select_local: bool,\n \n+    /// Give each batched GLM RMSNorm and AddNorm row its own workgroup.\n+    #[arg(long, env = \"PLOW_GLM_DECODE_NORM_ROWS\", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = \"true\")]\n+    pub glm_decode_norm_rows: bool,\n+\n     /// Use qualified gfx942 hipBLASLt assembly for large GLM prefill projections.\n     #[arg(long, env = \"PLOW_GLM_GEMM_LT\", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = \"true\")]\n     pub glm_gemm_lt: bool,\n@@ -1070,6 +1074,7 @@ impl EmitConfig {\n             glm_moe_resident: env_bool(\"PLOW_GLM_MOE_RESIDENT\"),\n             glm_index_tp: env_bool(\"PLOW_GLM_INDEX_TP\"),\n             glm_select_local: env_bool(\"PLOW_GLM_SELECT_LOCAL\"),\n+            glm_decode_norm_rows: env_bool(\"PLOW_GLM_DECODE_NORM_ROWS\"),\n             glm_gemm_lt: env_bool(\"PLOW_GLM_GEMM_LT\"),\n             glm_gemm_lt_decode: env_bool(\"PLOW_GLM_GEMM_LT_DECODE\"),\n             glm_fold_lt: env_bool(\"PLOW_GLM_FOLD_LT\"),\ndiff --git a/crates/devgen/src/mla.rs b/crates/devgen/src/mla.rs\nindex ff683e3f..36f3f292 100644\n--- a/crates/devgen/src/mla.rs\n+++ b/crates/devgen/src/mla.rs\n@@ -2875,6 +2875,14 @@ fn spine_cus(n_cu: u32) -> Vec<u32> {\n     }\n }\n \n+fn decode_norm_cus(n_cu: u32, rows: u32) -> Vec<u32> {\n+    if emit_config::active().glm_decode_norm_rows {\n+        (0..rows.min(n_cu)).collect()\n+    } else {\n+        vec![0]\n+    }\n+}\n+\n /// The workgroups a `HeadNormRope` packet can actually use, as a slice of `cus` starting at\n /// `start`.\n ///\n@@ -3263,7 +3271,7 @@ pub(crate) fn emit_glm_mla(\n         );\n         pre[0]\n     } else {\n-        b.emit(DevOp::RmsNorm, one.clone(), pre, |d| {\n+        b.emit(DevOp::RmsNorm, decode_norm_cus(b.n_cu(), rows), pre, |d| {\n             d.t[0] = n.xn;\n             d.t[1] = x_in;\n             d.t[2] = w.gin;\n@@ -3359,7 +3367,7 @@ pub(crate) fn emit_glm_mla(\n     let c_rnq = if fuse_qnorm {\n         c_qad\n     } else {\n-        b.emit(DevOp::RmsNorm, one.clone(), &[c_qad], |d| {\n+        b.emit(DevOp::RmsNorm, decode_norm_cus(b.n_cu(), rows), &[c_qad], |d| {\n             d.t[0] = n.qlat;\n             d.t[1] = n.qlr;\n             d.t[2] = w.gqa;\n@@ -3792,7 +3800,7 @@ pub(crate) fn emit_glm_mla(\n     //   whereas the split path norms the bf16-rounded xmid, so this is algebraically exact but NOT\n     //   guaranteed byte-identical to the split \u2014 the decode stream is verified before it is kept.\n     if fuse_b1 {\n-        b.emit(DevOp::AddNorm, one.clone(), &[c_op], |d| {\n+        b.emit(DevOp::AddNorm, decode_norm_cus(b.n_cu(), rows), &[c_op], |d| {\n             d.t[0] = n.xn2;\n             d.t[1] = n.xmid;\n             d.t[2] = x_in;\n@@ -6568,7 +6576,7 @@ fn emit_glm_moe_ffn_rows(\n         if raw_output {\n             c_xr\n         } else if let Some(gin_next) = seam_next_gin(n, slot, tp) {\n-            b.emit(DevOp::AddNorm, one.clone(), &[c_xr], |d| {\n+            b.emit(DevOp::AddNorm, decode_norm_cus(b.n_cu(), rows), &[c_xr], |d| {\n                 d.t[0] = n.xn;\n                 d.t[1] = x_out;\n                 d.t[2] = n.xmid;\n@@ -7353,7 +7361,7 @@ fn emit_glm_dense_ffn_rows(\n         if raw_output {\n             c_xr\n         } else if let Some(gin_next) = seam_next_gin(n, slot, tp) {\n-            b.emit(DevOp::AddNorm, one.clone(), &[c_xr], |d| {\n+            b.emit(DevOp::AddNorm, decode_norm_cus(b.n_cu(), rows), &[c_xr], |d| {\n                 d.t[0] = n.xn;\n                 d.t[1] = x_out;\n                 d.t[2] = n.xmid;\ndiff --git a/crates/devgen/src/mla/glm_tests.rs b/crates/devgen/src/mla/glm_tests.rs\nindex 5b0b43e3..1eb84115 100644\n--- a/crates/devgen/src/mla/glm_tests.rs\n+++ b/crates/devgen/src/mla/glm_tests.rs\n@@ -1376,6 +1376,73 @@ fn glm_decode_gemv_tuning_preserves_live_column_ownership() {\n     assert_eq!(glm_decode_gemv_cus(&all, DevOp::Gemv, 64, 6144), all);\n }\n \n+#[test]\n+fn glm_decode_norm_rows_preserves_arithmetic_and_completion() {\n+    let _guard = crate::test_env::env_guard();\n+    let _target = crate::EmitAmdGuard::set(true);\n+    let _env = crate::test_env::EnvScope::set(&[\n+        (\"PLOW_GLM_DECODE_NORM_ROWS\", \"0\"),\n+        (\"PLOW_GLM_FUSE_B1\", \"1\"),\n+        (\"PLOW_GLM_FUSE_SEAM\", \"1\"),\n+        (\"PLOW_GLM_FUSE_QNORM\", \"0\"),\n+        (\"GLM_FUSE_XRN\", \"0\"),\n+        (\"PLOW_GLM_MOE_RESIDENT\", \"0\"),\n+    ]);\n+    let mut c = glm_ref_cfg();\n+    c.tp = 8;\n+    c.layers = 5;\n+    c.indexer_full.push(false);\n+    let layers: Vec<_> = (0..c.layers).collect();\n+    let mut declarations = Builder::new(304);\n+    let n = declare_glm_rows_batched(&mut declarations, &c, 64, &layers, 128, 20, MoeEnc::Fp8Blk);\n+    let tensors = declarations.tensors();\n+    for rows in [1, 2, 3, 4, 8, 16, 20] {\n+        let emit = || {\n+            let mut b = Builder::new(304);\n+            b.adopt_tensors(tensors.clone());\n+            let all = b.all();\n+            let mut dep = Vec::new();\n+            let mut xgate = 0;\n+            let mut cur = n.x;\n+            for (slot, &layer) in layers.iter().enumerate() {\n+                let next = if cur == n.x { n.xnext } else { n.x };\n+                let emit_block = if c.is_dense(layer) { emit_glm_dense_block } else { emit_glm_block };\n+                dep = vec![emit_block(\n+                    &mut b, &c, &n, slot, 64, rows, 20, MoeEnc::Fp8Blk,\n+                    cur, next, &dep, &mut xgate, &all,\n+                )];\n+                cur = next;\n+            }\n+            b.finish()\n+        };\n+        let baseline = emit();\n+        let _wide = crate::test_env::EnvScope::set(&[(\"PLOW_GLM_DECODE_NORM_ROWS\", \"1\")]);\n+        let wide = emit();\n+        assert_eq!(baseline.insts.len(), wide.insts.len());\n+        let mut changed = 0;\n+        for (ix, (before, after)) in baseline.insts.iter().zip(&wide.insts).enumerate() {\n+            assert_eq!((before.op, before.t, before.i, before.j, before.f),\n+                       (after.op, after.t, after.i, after.j, after.f));\n+            if before.blocks != after.blocks {\n+                changed += 1;\n+                assert!(matches!(DevOp::from_u16(after.op), Some(DevOp::RmsNorm | DevOp::AddNorm)));\n+                assert_eq!(after.blocks as u32, rows);\n+                let slices: std::collections::BTreeSet<_> = wide.stream.iter()\n+                    .filter(|e| e.inst as usize == ix).map(|e| e.slice).collect();\n+                assert_eq!(slices, (0..rows).collect());\n+                for wait in wide.waits.iter().filter(|w| w.id as usize == ix) {\n+                    assert_eq!(wait.threshold, rows);\n+                }\n+            }\n+        }\n+        if rows == 1 {\n+            assert_eq!(baseline.to_blob(), wide.to_blob());\n+        } else {\n+            assert_eq!(changed, 15);\n+        }\n+    }\n+}\n+\n /// The MLA flash-decode split factor is the ctx-scaled cost optimum, capped by the ACTUAL\n /// per-rank chip-fill `fill = ceil(n_cu / (nh_l/GF))` and the KV-tile count. `glm_nsplit` takes\n /// nh_l (= n_head/tp) so the cap is correct under TP/EP \u2014 the pre-fix bug sized it from the\n",
+    "source_sha256": {
+      "crates/devgen/src/emit_config.rs": "bfc906668ccf42929a2c3c1098bcfb52fd5aec816f4c4607912dc336df866401",
+      "crates/devgen/src/mla.rs": "e79711e11a5b584c3da898e85cfe949714fde30934c4b30519563f77387d4d95",
+      "crates/devgen/src/mla/glm_tests.rs": "25f82d69cc01522c96753fb1680d0111b8e1348c6f96fe1f3e6febcfcb42f7c1",
+      "runtime/bench/amd/glm_decode_norm/kernels.hip": "24f13466ade5982138a24a49dfbf42135237f40fe129eef241f379512a5e8de6",
+      "runtime/bench/amd/glm_decode_norm/check.py": "118b5f8bd4c879235f4b28f0e24c3e931b2f7b5915c89623333c6b2d8af86229",
+      "runtime/amd/op_norm.h": "31a502ebc91140983c72eeff88fd6fdf9da4045b8bf5bb19a22088e404ef86be",
+      "runtime/amd/amd_common.h": "b7961fcabd9825a446ef8792ea51d02244e840d9c7b7061650068c461ed7f99a"
+    },
+    "compiler_sha256": "92a5b24581f6748880a9b70722f9e6376173ad044d0853f6e3198ea318aad649",
+    "runtime_sha256": "91f7bc889baaf2e4adc1c1bf6d56182b49f4bb8bf0c311226accce23b5cc60df",
+    "packet_sha256": {
+      "on": "6cbdd1f4e1dc7275cb0514b050454251c9d5ad74d2425ca23b932eecd24dc083",
+      "off": "e1aa619ffd2d72ecff2f2c646d04e3a7023061759c98f5988650903276e473bd"
+    },
+    "objects": {
+      "interp_prefill_fp8kv_k3_moe_a4w4.elf": "55d26d5e69fd0fb3366ccc29061d87f9f5ebd2d88b73f8bf4e1d5ac9db8ace20",
+      "interp_prefill_mla_moe_gq.elf": "125e3dedf1b52a19fc312fff259b30aa856982c40ff70a0f0f30429c5298d133",
+      "interp_prefill_fp8_mla_gq.elf": "0b1c49b7960ad3f0635c99c132f82f93aaff92f10cc11a3985e0544172d5de3b",
+      "interp_packed_kda.elf": "5782544abbf8644191990875d68afb05ab8614a966af75b13bc51cbd23b50615",
+      "mla_a16w16_qh8_qseqlen1_gqaratio8_v3.co": "cd8fa62e18abada15beeeedd49357bcc1e9e2eee7353d038533f30cac93c3607",
+      "interp_mixed.elf": "b6d07c80dc2b3e0e210a11b724f4109588567a3ec7c8da92f4cf1b1fb5280849",
+      "interp_prefill.elf": "327e3ce53379c7ca059c94ebabecc7c68d92fe5b59e26a60cd8ac92aca35820c",
+      "dsa_tp_adapter_gfx942.elf": "3eb9d32d2b14a8e2ac23548ff279cacca1ea2aee2922de8eb921a8f244bf4ace",
+      "interp_prefill_fp8kv.elf": "1670b047b0949cb94d36e019f0305a987482ef8dd1f0aeb4e0883c1a48be44ee",
+      "interp_prefill_fp8kv_mla_gq.elf": "5183277a68f846d63811fc8531b50f45401df9fd24114e98b5e4aa7f3a72a023",
+      "interp_packed_mla_norm.elf": "acd572e019cbab221ca9f00d0c55dffcbfcce99fb5e43981e908dd2fc4d2ca3b",
+      "interp_prefill_fp8.elf": "7ab6f44c06c6b63497def48f655bf4aff26f2a40ebd83d03daf0322150558a57",
+      "interp_prefill_fp8kv_k3.elf": "ce243085320dd6130f9393ee2c58fbe74a74b8edb4f115adedc2001baf8c8489",
+      "interp_decode.elf": "bba60a24dbceb03ff9961d864c550d6d031839becf5ed86f7b931e438cfdf5be",
+      "interp_prefill_mla.elf": "1d2ef79cce71a2a05e81f2446ea68e68a56c95ebb4297ed6234121593b6d4120",
+      "interp_prefill_fp8_mla.elf": "38942d29b816fd5a73f15736d45d56440303516ebb73783a1de1fc77e0baa35d",
+      "interp_prefill_k3_moe.elf": "b52785d058902fd88feba60fc1d4833df85bda87506e322c96de79e4d3bd5668",
+      "interp_prefill_fp8_mla_moe.elf": "be9d0d6e3c5c659ec7679d1c3b206e131c3065817191dc9360fac666476dc467",
+      "interp_mixed_gq.elf": "b4ef16c9e835a98264ed063399433fe768f4037f8fb6fa57fd99be5cf4cd9a12",
+      "glm_lt_gfx942.elf": "efa5b0365bedc2effa52265c85eded14fb63febd9c067bab37138d99db607db5",
+      "interp_packed_mla_flash_gq.elf": "2e6abb164d6619f6cd5c69cef85406464574aad00a3c711e1c4b83fb57273ced",
+      "interp_prefill_fp8_gq.elf": "7c92d035f4707b5747dca68bc5bb428e078d153564df28056d43270e2fda518b",
+      "interp_decode_fp8_gq.elf": "ae87cdf7a25ddb51ee596c8e818a2722a2bf51a3be6b167228bc75ef986c1720",
+      "interp_prefill_fp8kv_k3_gq.elf": "bc81665f1a55e736b66a0773f286a4e8f01cade7e3dcbd197c8375dadc8f9c78",
+      "interp_tokbatch_gq.elf": "52b5a7a59435712fc2c6c0aa921aa5cb79c0fdc69a4d2e3a6c5d7a34d791fea9",
+      "interp_prefill_gq.elf": "94679944ddb712a8c959d9b606513b6076f38f5261116c02dbe49b5e98a5b0e2",
+      "interp_decode_fp8kv.elf": "5ae9fd5c4fe95305a74f4e17dcb67716c586cca758859d465483f9bfab91034b",
+      "interp_prefill_fp8_mla_moe_gq.elf": "d52e5ba0ae0d56a411447b099f5106eb828baf5862f360dcc3ab44a2d5ef01cf",
+      "interp_flash_fp8kv.elf": "98fb4e1e311bff0bd0a9dcb52132eee25849b02e2dad3fed342189deffc9b10b",
+      "interp_packed_kda_gq.elf": "a1ae8acb28ecef647bb976cbe954d548e028717e7bda5e2453e63f9c056e979e",
+      "interp_prefill_fp8kv_mla_moe_gq.elf": "3ad1f6571c698420a385f5738da93d5fd1bdcb1ab05c16602d8d3296da37f23c",
+      "interp_prefill_k3_moe_a4w4_gq.elf": "a2e3219f81743b32984a798eff9cd69e13dfc95b12288dfe55cb7263b956aa46",
+      "interp_decode_fp8kv_gq.elf": "f7292084bcedcb42d7df6a89d2c7959f1b20d3c99ff46d4af99d9d618f0970d5",
+      "interp_decode_k3_gq.elf": "b4f587bcbc040f89f030746f009d46aed1d8e9109c6543f90f6e8553829014db",
+      "interp_flash_gq.elf": "54d7c08558e89c96624822e3755dde56cb4d58ab2a1e8fc284eae15c226554ce",
+      "interp_prefill_k3_gq.elf": "9e3d8e2099e078f7162c58ddf2245cba27538ca1e298e4c53dbef8d488687267",
+      "moe_aiter_adapter_gfx942.elf": "ff0d86d22aadcb6391b8195517347eab54cc550a42b8ebea46fa96beb2d65d67",
+      "interp_prefill_mla_moe.elf": "3aef8ff0cdd1f9e2472e99fc7ea53e8063cda7e6dc778dbd143932609a64e818",
+      "interp_decode_fp8kv_k3.elf": "f00056eb6c6d702689a93bf79e9a7841bcb786120ee56dc03f3fb66357e28517",
+      "interp_tokbatch.elf": "8ff0283af5033fed0b56afea52620542bcbb44300351ffe8c00da59602cf5a3f",
+      "interp_prefill_fp8kv_gq.elf": "5fac6e98c7b8a8f3441626ada5fe0b43490fe8371eda24aab3273b9cf67ea657",
+      "fmoe_bf16_a16_blockscaleFp8_g1u1_vs_silu_1tg_16x128_flat_pf3.co": "be7052284094e7cedeb266afb24d4d6723bdf4234ac391b2e5b29473d8ee8f06",
+      "interp_prefill_k3_moe_a4w4.elf": "10d5994e4de4faaee02e321dd6993a071337197fea95193d7c0352ff2d7f18b6",
+      "interp_prefill_fp8kv_k3_moe_a4w4_gq.elf": "bffce184a1155588bdc25f6ed004241f093cc35ec560953378511a2e894e12ce",
+      "interp_decode_fp8.elf": "e8253bcbeca2f4f2f24482ce8fb3373043ad1b53dd0370544a4c517b36ca4676",
+      "interp_prefill_fp8kv_mla_moe.elf": "5bc13aba7cd6ba6122c61950f0149f448ff14ac21708895ba530cb93f8284ba0",
+      "fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256.co": "65b4c0a0b290dd83039047c18e0bb86f4253790e926dce324ddb6b45a7b28650",
+      "interp_packed_mla_flash.elf": "3af096e2f92d6b03d123d6b1b8c3a93c09c08d12a1aabafda940b11208ad69b6",
+      "interp_prefill_fp8kv_mla.elf": "0f3bfa048876cc460da2cdde0135ea7a10168739edd623fea07e6e669772b745",
+      "test_kernels.elf": "dec11ad6a64292d39ef4a5c5f202b52b5f658c7eb0fe6729534bff9ccae18362",
+      "interp_decode_fp8kv_k3_gq.elf": "9a8aa8553d0942c5e8e8667c280713e990e325f812a7ab639825adcd70344f33",
+      "mla_sparse_adapter_gfx942.elf": "a77f08c610bcda50a535e9a86caa601517e5f55368d17f4a47cc72679128774c",
+      "interp_prefill_k3_moe_gq.elf": "92c78ce732118ace85b415d44edda72d7413d7ef78518db25343432114e34c43",
+      "interp_prefill_mla_gq.elf": "771cebb619b37fc70f002543dc300d43828ed939e12af93cb8671b925d7226cb",
+      "interp_flash.elf": "861e032541a3ebee101fbaac31134cb288d188c8d5556681114ee7e77a009eb4",
+      "interp_packed_mla_norm_gq.elf": "de9173ee6cce272a0cdf231f8c5b47332b00f40c13bbf21cd619ea191e10c024",
+      "interp_decode_gq.elf": "c45ecb5cb092e44638c7673a4e9e7eb821ff3b58501382b64ca91155b71f2dc2",
+      "interp_flash_fp8kv_gq.elf": "6f750e306085a7e62751d2e9a958aa418bdd9a1a64ac0d7c412a28ed1f5d2bf6",
+      "interp_prefill_k3.elf": "2306223b17f9853e356da9d22b9d80651793a5aae4b77db57e3a558e9348b41f",
+      "interp_decode_k3.elf": "a9d0574099f7380255cc2a737e07a3e9eb7c2988399013bf50402db812e2b7f3"
+    },
+    "changed_workgroups": {
+      "2": {
+        "RmsNorm": 79,
+        "AddNorm": 155
+      },
+      "4": {
+        "RmsNorm": 79,
+        "AddNorm": 155
+      },
+      "8": {
+        "RmsNorm": 79,
+        "AddNorm": 155
+      },
+      "16": {
+        "RmsNorm": 79,
+        "AddNorm": 155
+      },
+      "20": {
+        "RmsNorm": 79,
+        "AddNorm": 155
+      }
+    },
+    "all_ten_programs_lean_checked_both": true,
+    "numerical_checks": {
+      "cases": [
+        {
+          "rows": 1,
+          "feat": 2048,
+          "add": false,
+          "residual_alias": false,
+          "weighted": true,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.001656212960369885
+        },
+        {
+          "rows": 1,
+          "feat": 2048,
+          "add": false,
+          "residual_alias": false,
+          "weighted": false,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.001801542122848332
+        },
+        {
+          "rows": 1,
+          "feat": 2048,
+          "add": true,
+          "residual_alias": false,
+          "weighted": true,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0016765157924965024
+        },
+        {
+          "rows": 1,
+          "feat": 2048,
+          "add": true,
+          "residual_alias": true,
+          "weighted": true,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0016765157924965024
+        },
+        {
+          "rows": 1,
+          "feat": 2048,
+          "add": true,
+          "residual_alias": true,
+          "weighted": false,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0016501011559739709
+        },
+        {
+          "rows": 1,
+          "feat": 6144,
+          "add": false,
+          "residual_alias": false,
+          "weighted": true,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0016372703248634934
+        },
+        {
+          "rows": 1,
+          "feat": 6144,
+          "add": false,
+          "residual_alias": false,
+          "weighted": false,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.00214160094037652
+        },
+        {
+          "rows": 1,
+          "feat": 6144,
+          "add": true,
+          "residual_alias": false,
+          "weighted": true,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0016419418388977647
+        },
+        {
+          "rows": 1,
+          "feat": 6144,
+          "add": true,
+          "residual_alias": true,
+          "weighted": true,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0016419418388977647
+        },
+        {
+          "rows": 1,
+          "feat": 6144,
+          "add": true,
+          "residual_alias": true,
+          "weighted": false,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0016961228102445602
+        },
+        {
+          "rows": 2,
+          "feat": 2048,
+          "add": false,
+          "residual_alias": false,
+          "weighted": true,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0016506898682564497
+        },
+        {
+          "rows": 2,
+          "feat": 2048,
+          "add": false,
+          "residual_alias": false,
+          "weighted": false,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0017943104030564427
+        },
+        {
+          "rows": 2,
+          "feat": 2048,
+          "add": true,
+          "residual_alias": false,
+          "weighted": true,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0016841314500197768
+        },
+        {
+          "rows": 2,
+          "feat": 2048,
+          "add": true,
+          "residual_alias": true,
+          "weighted": true,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0016841314500197768
+        },
+        {
+          "rows": 2,
+          "feat": 2048,
+          "add": true,
+          "residual_alias": true,
+          "weighted": false,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0016609496669843793
+        },
+        {
+          "rows": 2,
+          "feat": 6144,
+          "add": false,
+          "residual_alias": false,
+          "weighted": true,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0016335382824763656
+        },
+        {
+          "rows": 2,
+          "feat": 6144,
+          "add": false,
+          "residual_alias": false,
+          "weighted": false,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0019749708008021116
+        },
+        {
+          "rows": 2,
+          "feat": 6144,
+          "add": true,
+          "residual_alias": false,
+          "weighted": true,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0016742716543376446
+        },
+        {
+          "rows": 2,
+          "feat": 6144,
+          "add": true,
+          "residual_alias": true,
+          "weighted": true,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0016742716543376446
+        },
+        {
+          "rows": 2,
+          "feat": 6144,
+          "add": true,
+          "residual_alias": true,
+          "weighted": false,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.001656025997363031
+        },
+        {
+          "rows": 3,
+          "feat": 2048,
+          "add": false,
+          "residual_alias": false,
+          "weighted": true,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0016262715216726065
+        },
+        {
+          "rows": 3,
+          "feat": 2048,
+          "add": false,
+          "residual_alias": false,
+          "weighted": false,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0019217012450098991
+        },
+        {
+          "rows": 3,
+          "feat": 2048,
+          "add": true,
+          "residual_alias": false,
+          "weighted": true,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0016294980887323618
+        },
+        {
+          "rows": 3,
+          "feat": 2048,
+          "add": true,
+          "residual_alias": true,
+          "weighted": true,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0016294980887323618
+        },
+        {
+          "rows": 3,
+          "feat": 2048,
+          "add": true,
+          "residual_alias": true,
+          "weighted": false,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0017053596675395966
+        },
+        {
+          "rows": 3,
+          "feat": 6144,
+          "add": false,
+          "residual_alias": false,
+          "weighted": true,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0016470070695504546
+        },
+        {
+          "rows": 3,
+          "feat": 6144,
+          "add": false,
+          "residual_alias": false,
+          "weighted": false,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0019365428015589714
+        },
+        {
+          "rows": 3,
+          "feat": 6144,
+          "add": true,
+          "residual_alias": false,
+          "weighted": true,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.001655183034017682
+        },
+        {
+          "rows": 3,
+          "feat": 6144,
+          "add": true,
+          "residual_alias": true,
+          "weighted": true,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.001655183034017682
+        },
+        {
+          "rows": 3,
+          "feat": 6144,
+          "add": true,
+          "residual_alias": true,
+          "weighted": false,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0016553765162825584
+        },
+        {
+          "rows": 4,
+          "feat": 2048,
+          "add": false,
+          "residual_alias": false,
+          "weighted": true,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.001632419298402965
+        },
+        {
+          "rows": 4,
+          "feat": 2048,
+          "add": false,
+          "residual_alias": false,
+          "weighted": false,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0016872205305844545
+        },
+        {
+          "rows": 4,
+          "feat": 2048,
+          "add": true,
+          "residual_alias": false,
+          "weighted": true,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0016301064752042294
+        },
+        {
+          "rows": 4,
+          "feat": 2048,
+          "add": true,
+          "residual_alias": true,
+          "weighted": true,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0016301064752042294
+        },
+        {
+          "rows": 4,
+          "feat": 2048,
+          "add": true,
+          "residual_alias": true,
+          "weighted": false,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.001677350839599967
+        },
+        {
+          "rows": 4,
+          "feat": 6144,
+          "add": false,
+          "residual_alias": false,
+          "weighted": true,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.001676346524618566
+        },
+        {
+          "rows": 4,
+          "feat": 6144,
+          "add": false,
+          "residual_alias": false,
+          "weighted": false,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0017007329734042287
+        },
+        {
+          "rows": 4,
+          "feat": 6144,
+          "add": true,
+          "residual_alias": false,
+          "weighted": true,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.00163745426107198
+        },
+        {
+          "rows": 4,
+          "feat": 6144,
+          "add": true,
+          "residual_alias": true,
+          "weighted": true,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.00163745426107198
+        },
+        {
+          "rows": 4,
+          "feat": 6144,
+          "add": true,
+          "residual_alias": true,
+          "weighted": false,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0016485039377585053
+        },
+        {
+          "rows": 7,
+          "feat": 2048,
+          "add": false,
+          "residual_alias": false,
+          "weighted": true,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0016609341837465763
+        },
+        {
+          "rows": 7,
+          "feat": 2048,
+          "add": false,
+          "residual_alias": false,
+          "weighted": false,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0015912408707663417
+        },
+        {
+          "rows": 7,
+          "feat": 2048,
+          "add": true,
+          "residual_alias": false,
+          "weighted": true,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0016165123088285327
+        },
+        {
+          "rows": 7,
+          "feat": 2048,
+          "add": true,
+          "residual_alias": true,
+          "weighted": true,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0016165123088285327
+        },
+        {
+          "rows": 7,
+          "feat": 2048,
+          "add": true,
+          "residual_alias": true,
+          "weighted": false,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0016605964628979564
+        },
+        {
+          "rows": 7,
+          "feat": 6144,
+          "add": false,
+          "residual_alias": false,
+          "weighted": true,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0016535327304154634
+        },
+        {
+          "rows": 7,
+          "feat": 6144,
+          "add": false,
+          "residual_alias": false,
+          "weighted": false,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0017955951625481248
+        },
+        {
+          "rows": 7,
+          "feat": 6144,
+          "add": true,
+          "residual_alias": false,
+          "weighted": true,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.001636764034628868
+        },
+        {
+          "rows": 7,
+          "feat": 6144,
+          "add": true,
+          "residual_alias": true,
+          "weighted": true,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.001636764034628868
+        },
+        {
+          "rows": 7,
+          "feat": 6144,
+          "add": true,
+          "residual_alias": true,
+          "weighted": false,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0016639439854770899
+        },
+        {
+          "rows": 8,
+          "feat": 2048,
+          "add": false,
+          "residual_alias": false,
+          "weighted": true,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.00166112941224128
+        },
+        {
+          "rows": 8,
+          "feat": 2048,
+          "add": false,
+          "residual_alias": false,
+          "weighted": false,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0016895988956093788
+        },
+        {
+          "rows": 8,
+          "feat": 2048,
+          "add": true,
+          "residual_alias": false,
+          "weighted": true,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0016353036044165492
+        },
+        {
+          "rows": 8,
+          "feat": 2048,
+          "add": true,
+          "residual_alias": true,
+          "weighted": true,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0016353036044165492
+        },
+        {
+          "rows": 8,
+          "feat": 2048,
+          "add": true,
+          "residual_alias": true,
+          "weighted": false,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0016468028770759702
+        },
+        {
+          "rows": 8,
+          "feat": 6144,
+          "add": false,
+          "residual_alias": false,
+          "weighted": true,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.001658811466768384
+        },
+        {
+          "rows": 8,
+          "feat": 6144,
+          "add": false,
+          "residual_alias": false,
+          "weighted": false,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.001649703597649932
+        },
+        {
+          "rows": 8,
+          "feat": 6144,
+          "add": true,
+          "residual_alias": false,
+          "weighted": true,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0016667648451402783
+        },
+        {
+          "rows": 8,
+          "feat": 6144,
+          "add": true,
+          "residual_alias": true,
+          "weighted": true,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0016667648451402783
+        },
+        {
+          "rows": 8,
+          "feat": 6144,
+          "add": true,
+          "residual_alias": true,
+          "weighted": false,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0016515227034687996
+        },
+        {
+          "rows": 16,
+          "feat": 2048,
+          "add": false,
+          "residual_alias": false,
+          "weighted": true,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0016417009755969048
+        },
+        {
+          "rows": 16,
+          "feat": 2048,
+          "add": false,
+          "residual_alias": false,
+          "weighted": false,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.001530031906440854
+        },
+        {
+          "rows": 16,
+          "feat": 2048,
+          "add": true,
+          "residual_alias": false,
+          "weighted": true,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0016541570657864213
+        },
+        {
+          "rows": 16,
+          "feat": 2048,
+          "add": true,
+          "residual_alias": true,
+          "weighted": true,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0016541570657864213
+        },
+        {
+          "rows": 16,
+          "feat": 2048,
+          "add": true,
+          "residual_alias": true,
+          "weighted": false,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0016581658273935318
+        },
+        {
+          "rows": 16,
+          "feat": 6144,
+          "add": false,
+          "residual_alias": false,
+          "weighted": true,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.001660291338339448
+        },
+        {
+          "rows": 16,
+          "feat": 6144,
+          "add": false,
+          "residual_alias": false,
+          "weighted": false,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0018139039166271687
+        },
+        {
+          "rows": 16,
+          "feat": 6144,
+          "add": true,
+          "residual_alias": false,
+          "weighted": true,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0016687087481841445
+        },
+        {
+          "rows": 16,
+          "feat": 6144,
+          "add": true,
+          "residual_alias": true,
+          "weighted": true,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0016687087481841445
+        },
+        {
+          "rows": 16,
+          "feat": 6144,
+          "add": true,
+          "residual_alias": true,
+          "weighted": false,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0016588843427598476
+        },
+        {
+          "rows": 20,
+          "feat": 2048,
+          "add": false,
+          "residual_alias": false,
+          "weighted": true,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0016549170250073075
+        },
+        {
+          "rows": 20,
+          "feat": 2048,
+          "add": false,
+          "residual_alias": false,
+          "weighted": false,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.00173654081299901
+        },
+        {
+          "rows": 20,
+          "feat": 2048,
+          "add": true,
+          "residual_alias": false,
+          "weighted": true,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0016403356567025185
+        },
+        {
+          "rows": 20,
+          "feat": 2048,
+          "add": true,
+          "residual_alias": true,
+          "weighted": true,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0016403356567025185
+        },
+        {
+          "rows": 20,
+          "feat": 2048,
+          "add": true,
+          "residual_alias": true,
+          "weighted": false,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0016701146960258484
+        },
+        {
+          "rows": 20,
+          "feat": 6144,
+          "add": false,
+          "residual_alias": false,
+          "weighted": true,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0016605891287326813
+        },
+        {
+          "rows": 20,
+          "feat": 6144,
+          "add": false,
+          "residual_alias": false,
+          "weighted": false,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0018079141154885292
+        },
+        {
+          "rows": 20,
+          "feat": 6144,
+          "add": true,
+          "residual_alias": false,
+          "weighted": true,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0016542797675356269
+        },
+        {
+          "rows": 20,
+          "feat": 6144,
+          "add": true,
+          "residual_alias": true,
+          "weighted": true,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0016542797675356269
+        },
+        {
+          "rows": 20,
+          "feat": 6144,
+          "add": true,
+          "residual_alias": true,
+          "weighted": false,
+          "exact_serial_parallel": true,
+          "relative_l2": 0.0016621778486296535
+        }
+      ],
+      "passed": 80,
+      "gpu": "AMD Instinct MI300X",
+      "library_sha256": "bba61703c04191844cff136f12dc9d13489fd2c66c54d255e023564e9b4dae0e",
+      "script_sha256": "118b5f8bd4c879235f4b28f0e24c3e931b2f7b5915c89623333c6b2d8af86229",
+      "scope": "Existing RMSNorm/AddNorm bodies: one workgroup versus one per row. Exact BF16 outputs, in-place residual, optional gamma, ragged row counts and 512-byte guards. Numerical check only; no timing."
+    },
+    "campaign": "#!/usr/bin/env bash\nset -euo pipefail\nexport PLOW_MLA_PF_V2=1 PLOW_MLA_PF_AITER=1 PLOW_PF_CHUNK=8192 PLOW_PF_INTERLEAVE=0\nexport LD_LIBRARY_PATH=\"$ROCM_PATH/lib:${LD_LIBRARY_PATH:-}\"\nroot=/tmp/tp-glm53-row-norm\nexport PLOW_HSACO_LOWRUNG=\"\"\nexport PLOW_DSTEP_LOG=0\nif [ \"$#\" = 0 ]; then set -- on off; fi\nfor arm in \"$@\"; do\n    export PLOW_HSACO=\"$root/overlay\"\n    \"$root/plowrt\" serve --assets \"$root/assets-$arm\" --port 19000 > \"$root/server-$arm.log\" 2>&1 &\n    server=$!\n    trap 'kill -TERM \"$server\" 2>/dev/null || true; wait \"$server\" 2>/dev/null || true' EXIT\n    ready=0\n    for attempt in $(seq 1 180); do\n        if curl -fsS http://127.0.0.1:19000/v1/models > \"$root/models-$arm.json\" 2>/dev/null; then ready=1; break; fi\n        kill -0 \"$server\" || exit 1\n        sleep 1\n    done\n    [ \"$ready\" = 1 ]\n    python3 runtime/bench/amd/mla_sparse_aiter/quality.py http://127.0.0.1:19000 \"row-norm-$arm\" \"$root/quality-$arm.json\" --concurrency 20 > \"$root/quality-$arm.log\" 2>&1\n    env VLLM_ROCM_LIB=/opt/rocm/core-7.14/lib /app/plow/build-gemma31/vllm-python -m vllm.entrypoints.cli.main bench serve --backend vllm --host 127.0.0.1 --port 19000 --model glm-5.3-plow-lite --tokenizer zai-org/GLM-5.3 --trust-remote-code --dataset-name random --num-prompts 20 --random-input-len 70000 --random-output-len 700 --random-range-ratio 0.14 --max-concurrency 20 --save-result --save-detailed --result-dir \"$root\" --result-filename \"serve-$arm.json\" > \"$root/bench-$arm.log\" 2>&1\n    kill -TERM \"$server\"\n    wait \"$server\" || [ \"$?\" = 143 ]\n    trap - EXIT\ndone\n",
+    "campaign_sha256": "c7783968a23657c18ae3345e5389bbb1e3532675c5f60fada7bde7d8b18fda84",
+    "scope": "Only 79 RMSNorm and 155 AddNorm workgroup counts per decode rung2/4/8/16/20 change. Identical arithmetic, prefill and B1 programs, runtime and objects. One 20-request70k/700/.14/C20 pair, no speculation."
+  },
+  "arms": {
+    "on": {
+      "metrics": {
+        "date": "20260910-163651",
+        "endpoint_type": "vllm",
+        "backend": "vllm",
+        "label": null,
+        "model_id": "glm-5.3-plow-lite",
+        "tokenizer_id": "zai-org/GLM-5.3",
+        "num_prompts": 20,
+        "request_rate": "inf",
+        "burstiness": 1.0,
+        "max_concurrency": 20,
+        "duration": 282.17196235305164,
+        "completed": 20,
+        "failed": 0,
+        "total_input_tokens": 1414538,
+        "total_output_tokens": 13795,
+        "request_throughput": 0.07087876425856987,
+        "request_goodput": null,
+        "output_throughput": 48.88862764734857,
+        "total_token_throughput": 5061.923899486794,
+        "max_output_tokens_per_s": 200.0,
+        "max_concurrent_requests": 20,
+        "rtfx": 0.0,
+        "mean_ttft_ms": 102841.98611874017,
+        "median_ttft_ms": 101363.01787948469,
+        "std_ttft_ms": 58439.489276474924,
+        "p99_ttft_ms": 200384.61760336065,
+        "mean_tpot_ms": 240.41053237398722,
+        "median_tpot_ms": 244.0464957057641,
+        "std_tpot_ms": 77.92174951098673,
+        "p99_tpot_ms": 350.1703672280572,
+        "mean_itl_ms": 238.34430313932103,
+        "median_itl_ms": 109.48743100743741,
+        "std_itl_ms": 321.19763226674974,
+        "p99_itl_ms": 1087.3087285505608
+      },
+      "quality": {
+        "arm": "row-norm-on",
+        "concurrency": 20,
+        "cells": [
+          {
+            "length_label": 8000,
+            "depth": 0.1,
+            "needle": "mass",
+            "expected": "312",
+            "text": " exactly 312 grams. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream,",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 5433,
+              "completion_tokens": 24,
+              "total_tokens": 5457,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 15.296558685950004
+          },
+          {
+            "length_label": 8000,
+            "depth": 0.1,
+            "needle": "code",
+            "expected": "7429",
+            "text": " 7429-BLUE. The code is 7429-BLUE. The code is 7",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 5437,
+              "completion_tokens": 24,
+              "total_tokens": 5461,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 17.394252647063695
+          },
+          {
+            "length_label": 8000,
+            "depth": 0.5,
+            "needle": "city",
+            "expected": "Trondheim",
+            "text": " Trondheim. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream, so a token",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 5438,
+              "completion_tokens": 24,
+              "total_tokens": 5462,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 18.839991830987856
+          },
+          {
+            "length_label": 8000,
+            "depth": 0.1,
+            "needle": "city",
+            "expected": "Trondheim",
+            "text": " Trondheim. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream, so a token",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 5438,
+              "completion_tokens": 24,
+              "total_tokens": 5462,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 20.92488136398606
+          },
+          {
+            "length_label": 8000,
+            "depth": 0.9,
+            "needle": "mass",
+            "expected": "312",
+            "text": " exactly 312 grams. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream,",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 5433,
+              "completion_tokens": 24,
+              "total_tokens": 5457,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 22.93428209598642
+          },
+          {
+            "length_label": 8000,
+            "depth": 0.9,
+            "needle": "code",
+            "expected": "7429",
+            "text": " 7429-BLUE. The code is 7429-BLUE. The code is 7",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 5437,
+              "completion_tokens": 24,
+              "total_tokens": 5461,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 24.991336912033148
+          },
+          {
+            "length_label": 8000,
+            "depth": 0.9,
+            "needle": "city",
+            "expected": "Trondheim",
+            "text": " Trondheim. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream, so a token",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 5438,
+              "completion_tokens": 24,
+              "total_tokens": 5462,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 27.091499578091316
+          },
+          {
+            "length_label": 8000,
+            "depth": 0.5,
+            "needle": "code",
+            "expected": "7429",
+            "text": " 7429-BLUE. The code is 7429-BLUE. The code is 7",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 5437,
+              "completion_tokens": 24,
+              "total_tokens": 5461,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 28.59337316895835
+          },
+          {
+            "length_label": 8000,
+            "depth": 0.5,
+            "needle": "mass",
+            "expected": "312",
+            "text": " exactly 312 grams. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream,",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 5433,
+              "completion_tokens": 24,
+              "total_tokens": 5457,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 30.674348248983733
+          },
+          {
+            "length_label": 100000,
+            "depth": 0.1,
+            "needle": "mass",
+            "expected": "312",
+            "text": " exactly 312 grams. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream,",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 68797,
+              "completion_tokens": 24,
+              "total_tokens": 68821,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 40.41517266992014
+          },
+          {
+            "length_label": 100000,
+            "depth": 0.1,
+            "needle": "code",
+            "expected": "7429",
+            "text": " 7429-BLUE. The code is 7429-BLUE. The code is 7",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 68801,
+              "completion_tokens": 24,
+              "total_tokens": 68825,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 50.21793969802093
+          },
+          {
+            "length_label": 100000,
+            "depth": 0.1,
+            "needle": "city",
+            "expected": "Trondheim",
+            "text": " Trondheim.  The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream, so a",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 68802,
+              "completion_tokens": 24,
+              "total_tokens": 68826,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 60.03274218598381
+          },
+          {
+            "length_label": 100000,
+            "depth": 0.5,
+            "needle": "code",
+            "expected": "7429",
+            "text": " 7429-BLUE. The code is 7429-BLUE. The code is 7",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 68801,
+              "completion_tokens": 24,
+              "total_tokens": 68825,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 69.80969198001549
+          },
+          {
+            "length_label": 100000,
+            "depth": 0.9,
+            "needle": "code",
+            "expected": "7429",
+            "text": " 7429-BLUE. The code is 7429-BLUE. The code is 7",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 68801,
+              "completion_tokens": 24,
+              "total_tokens": 68825,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 79.64390186197124
+          },
+          {
+            "length_label": 100000,
+            "depth": 0.5,
+            "needle": "mass",
+            "expected": "312",
+            "text": " exactly 312 grams. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream,",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 68797,
+              "completion_tokens": 24,
+              "total_tokens": 68821,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 89.5452279059682
+          },
+          {
+            "length_label": 100000,
+            "depth": 0.5,
+            "needle": "city",
+            "expected": "Trondheim",
+            "text": " Trondheim. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream, so a token",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 68802,
+              "completion_tokens": 24,
+              "total_tokens": 68826,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 97.50878618401475
+          },
+          {
+            "length_label": 100000,
+            "depth": 0.9,
+            "needle": "city",
+            "expected": "Trondheim",
+            "text": " Trondheim. She relocated it to Trondheim. She relocated it to Trondheim. She relocated it to Trondheim.",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 68802,
+              "completion_tokens": 24,
+              "total_tokens": 68826,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 98.53418774099555
+          },
+          {
+            "length_label": 100000,
+            "depth": 0.9,
+            "needle": "mass",
+            "expected": "312",
+            "text": " exactly 312 grams. The calibration weight used by the Halloran team masses exactly 312 grams. The engine",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 68797,
+              "completion_tokens": 24,
+              "total_tokens": 68821,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 99.56514572305605
+          }
+        ]
+      },
+      "input_lens": [
+        76873,
+        72685,
+        70219,
+        65488,
+        66234,
+        61003,
+        61674,
+        60523,
+        63635,
+        76141,
+        72929,
+        78091,
+        70072,
+        72091,
+        79228,
+        74499,
+        72593,
+        70856,
+        71175,
+        78529
+      ],
+      "output_lens": [
+        656,
+        763,
+        734,
+        602,
+        680,
+        771,
+        711,
+        608,
+        753,
+        746,
+        769,
+        636,
+        619,
+        772,
+        606,
+        709,
+        617,
+        661,
+        697,
+        685
+      ],
+      "sha256": {
+        "serve-on.json": "29eb2b28b9d112707b8cec2296b9dee2fee9da44194871edc3db807c606a337a",
+        "quality-on.json": "9b5c1ef439e1fbd2aec74d881a02a0f5fe318a524f7f305df04819abebe0ab1c",
+        "server-on.log": "256962fee563a2bc9fa8bfa4039e2c066a032af97dee344def396d939fa5abd1",
+        "bench-on.log": "2c7e92470628535895eaea9dbaf55ca27a0a1ded03fe1663b02365be39076d9d"
+      }
+    },
+    "off": {
+      "metrics": {
+        "date": "20260910-164506",
+        "endpoint_type": "vllm",
+        "backend": "vllm",
+        "label": null,
+        "model_id": "glm-5.3-plow-lite",
+        "tokenizer_id": "zai-org/GLM-5.3",
+        "num_prompts": 20,
+        "request_rate": "inf",
+        "burstiness": 1.0,
+        "max_concurrency": 20,
+        "duration": 289.8985976880649,
+        "completed": 20,
+        "failed": 0,
+        "total_input_tokens": 1414538,
+        "total_output_tokens": 13795,
+        "request_throughput": 0.06898964037597825,
+        "request_goodput": null,
+        "output_throughput": 47.585604449331,
+        "total_token_throughput": 4927.009000357108,
+        "max_output_tokens_per_s": 180.0,
+        "max_concurrent_requests": 20,
+        "rtfx": 0.0,
+        "mean_ttft_ms": 103795.41512492578,
+        "median_ttft_ms": 101517.25548604736,
+        "std_ttft_ms": 59167.073512476796,
+        "p99_ttft_ms": 200654.87158875444,
+        "mean_tpot_ms": 243.64030600904846,
+        "median_tpot_ms": 253.37439216389757,
+        "std_tpot_ms": 78.4280354901418,
+        "p99_tpot_ms": 393.5411273240894,
+        "mean_itl_ms": 242.05989188567983,
+        "median_itl_ms": 115.03685405477881,
+        "std_itl_ms": 317.538338471864,
+        "p99_itl_ms": 1089.5822806470096
+      },
+      "quality": {
+        "arm": "row-norm-off",
+        "concurrency": 20,
+        "cells": [
+          {
+            "length_label": 8000,
+            "depth": 0.1,
+            "needle": "code",
+            "expected": "7429",
+            "text": " 7429-BLUE. The code is 7429-BLUE. The code is 7",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 5437,
+              "completion_tokens": 24,
+              "total_tokens": 5461,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 15.352928493986838
+          },
+          {
+            "length_label": 8000,
+            "depth": 0.5,
+            "needle": "mass",
+            "expected": "312",
+            "text": " exactly 312 grams. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream,",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 5433,
+              "completion_tokens": 24,
+              "total_tokens": 5457,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 17.449269965058193
+          },
+          {
+            "length_label": 8000,
+            "depth": 0.5,
+            "needle": "city",
+            "expected": "Trondheim",
+            "text": " Trondheim. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream, so a token",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 5438,
+              "completion_tokens": 24,
+              "total_tokens": 5462,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 18.937138768960722
+          },
+          {
+            "length_label": 8000,
+            "depth": 0.9,
+            "needle": "city",
+            "expected": "Trondheim",
+            "text": " Trondheim. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream, so a token",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 5438,
+              "completion_tokens": 24,
+              "total_tokens": 5462,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 21.02051995904185
+          },
+          {
+            "length_label": 8000,
+            "depth": 0.1,
+            "needle": "mass",
+            "expected": "312",
+            "text": " exactly 312 grams. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream,",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 5433,
+              "completion_tokens": 24,
+              "total_tokens": 5457,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 23.045266721048392
+          },
+          {
+            "length_label": 8000,
+            "depth": 0.5,
+            "needle": "code",
+            "expected": "7429",
+            "text": " 7429-BLUE. The code is 7429-BLUE. The code is 7",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 5437,
+              "completion_tokens": 24,
+              "total_tokens": 5461,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 25.113938292022794
+          },
+          {
+            "length_label": 8000,
+            "depth": 0.1,
+            "needle": "city",
+            "expected": "Trondheim",
+            "text": " Trondheim.  The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream, so a",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 5438,
+              "completion_tokens": 24,
+              "total_tokens": 5462,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 27.21978174895048
+          },
+          {
+            "length_label": 8000,
+            "depth": 0.9,
+            "needle": "mass",
+            "expected": "312",
+            "text": " exactly 312 grams. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream,",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 5433,
+              "completion_tokens": 24,
+              "total_tokens": 5457,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 28.70533358200919
+          },
+          {
+            "length_label": 8000,
+            "depth": 0.9,
+            "needle": "code",
+            "expected": "7429",
+            "text": " 7429-BLUE. The code is 7429-BLUE. The code is 7",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 5437,
+              "completion_tokens": 24,
+              "total_tokens": 5461,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 30.796954045072198
+          },
+          {
+            "length_label": 100000,
+            "depth": 0.1,
+            "needle": "city",
+            "expected": "Trondheim",
+            "text": " Trondheim. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream, so a token",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 68802,
+              "completion_tokens": 24,
+              "total_tokens": 68826,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 40.60778371093329
+          },
+          {
+            "length_label": 100000,
+            "depth": 0.5,
+            "needle": "city",
+            "expected": "Trondheim",
+            "text": " Trondheim. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream, so a token",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 68802,
+              "completion_tokens": 24,
+              "total_tokens": 68826,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 50.41695522097871
+          },
+          {
+            "length_label": 100000,
+            "depth": 0.5,
+            "needle": "code",
+            "expected": "7429",
+            "text": " 7429-BLUE. The code is 7429-BLUE. The code is 7",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 68801,
+              "completion_tokens": 24,
+              "total_tokens": 68825,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 60.21475674607791
+          },
+          {
+            "length_label": 100000,
+            "depth": 0.1,
+            "needle": "code",
+            "expected": "7429",
+            "text": " 7429-BLUE. The code is 7429-BLUE. The code is 7",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 68801,
+              "completion_tokens": 24,
+              "total_tokens": 68825,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 70.0195578429848
+          },
+          {
+            "length_label": 100000,
+            "depth": 0.5,
+            "needle": "mass",
+            "expected": "312",
+            "text": " exactly 312 grams. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream,",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 68797,
+              "completion_tokens": 24,
+              "total_tokens": 68821,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 79.88255727605429
+          },
+          {
+            "length_label": 100000,
+            "depth": 0.1,
+            "needle": "mass",
+            "expected": "312",
+            "text": " exactly 312 grams. The calibration weight used by the Halloran team masses exactly 312 grams. The calibration",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 68797,
+              "completion_tokens": 24,
+              "total_tokens": 68821,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 89.8462542979978
+          },
+          {
+            "length_label": 100000,
+            "depth": 0.9,
+            "needle": "city",
+            "expected": "Trondheim",
+            "text": " Trondheim. The engine keeps one persistent dispatch per rank and advances every sequence through the same instruction stream, so a token",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 68802,
+              "completion_tokens": 24,
+              "total_tokens": 68826,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 97.85153721889947
+          },
+          {
+            "length_label": 100000,
+            "depth": 0.9,
+            "needle": "code",
+            "expected": "7429",
+            "text": " 7429-BLUE. The code is 7429-BLUE. The code is 7",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 68801,
+              "completion_tokens": 24,
+              "total_tokens": 68825,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 98.94075918698218
+          },
+          {
+            "length_label": 100000,
+            "depth": 0.9,
+            "needle": "mass",
+            "expected": "312",
+            "text": " exactly 312 grams. The calibration weight used by the Halloran team masses exactly 312 grams. The calibration",
+            "passed": true,
+            "usage": {
+              "prompt_tokens": 68797,
+              "completion_tokens": 24,
+              "total_tokens": 68821,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "seconds": 100.02199964900501
+          }
+        ]
+      },
+      "input_lens": [
+        76873,
+        72685,
+        70219,
+        65488,
+        66234,
+        61003,
+        61674,
+        60523,
+        63635,
+        76141,
+        72929,
+        78091,
+        70072,
+        72091,
+        79228,
+        74499,
+        72593,
+        70856,
+        71175,
+        78529
+      ],
+      "output_lens": [
+        656,
+        763,
+        734,
+        602,
+        680,
+        771,
+        711,
+        608,
+        753,
+        746,
+        769,
+        636,
+        619,
+        772,
+        606,
+        709,
+        617,
+        661,
+        697,
+        685
+      ],
+      "sha256": {
+        "serve-off.json": "53f6061099fab5ef4d1902c1815d8ba17583fdb2efac1411b9d753117ea33c9c",
+        "quality-off.json": "153e630797ad3e9971a1c412e32a0c2b059717b719273c98c67d775f90156e39",
+        "server-off.log": "e2c94dc9823f0293e89f7f1dc3c493225d46685211654d5981635f229e65a00e",
+        "bench-off.log": "22ec47556d3572a90c218489ba1e77a99f77bd06aaa5fd1d42dbd6e9b3a16421"
+      }
+    }
+  },
+  "change_percent": {
+    "output_throughput": 2.7382718221117264,
+    "mean_ttft_ms": -0.9185656274297793,
+    "mean_tpot_ms": -1.325631907120195,
+    "p99_tpot_ms": -11.020642338180696,
+    "median_itl_ms": -4.824039298483296
+  },
+  "exact_generated_text_matches": 4,
+  "recorder_source": "import hashlib\nimport json\nfrom pathlib import Path\n\nroot = Path(__file__).parent\nsha = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()\nsource = json.loads((root / 'campaign-source.json').read_text())\nassert sha(root / 'plowrt') == source['runtime_sha256']\nassert sha(root / 'plowc') == source['compiler_sha256']\nassert sha(root / 'campaign.sh') == source['campaign_sha256']\nfor path, expected in source['source_sha256'].items():\n    assert sha(Path(path)) == expected, path\nfor name, expected in source['objects'].items():\n    assert sha(root / 'overlay' / name) == expected, name\narms = {}\nresults = {}\nfor arm in ('on', 'off'):\n    assert sha(root / f'assets-{arm}/model.pkt') == source['packet_sha256'][arm]\n    result = json.loads((root / f'serve-{arm}.json').read_text())\n    quality = json.loads((root / f'quality-{arm}.json').read_text())\n    assert (result['completed'], result['failed']) == (20, 0)\n    assert len(quality['cells']) == 18 and all(c['passed'] for c in quality['cells'])\n    results[arm] = result\n    arms[arm] = dict(metrics={k: v for k, v in result.items() if not isinstance(v, (list, dict))},\n                     quality=quality, input_lens=result['input_lens'], output_lens=result['output_lens'],\n                     sha256={p.name: sha(p) for p in (root / f'serve-{arm}.json', root / f'quality-{arm}.json',\n                                                       root / f'server-{arm}.log', root / f'bench-{arm}.log')})\nfor field in ('input_lens', 'output_lens'):\n    assert results['on'][field] == results['off'][field]\nchange = {k: 100 * (results['on'][k] / results['off'][k] - 1)\n          for k in ('output_throughput', 'mean_ttft_ms', 'mean_tpot_ms', 'p99_tpot_ms', 'median_itl_ms')}\nrecord = dict(schema='plow.glm.decode-row-norm.v1', date='2026-09-10', artifact_root=str(root),\n              campaign_source=source, arms=arms, change_percent=change,\n              exact_generated_text_matches=sum(a == b for a, b in zip(results['on']['generated_texts'], results['off']['generated_texts'])),\n              recorder_source=Path(__file__).read_text(), recorder_sha256=sha(Path(__file__)),\n              validation=dict(glm_emitter_tests_passed=38, emit_config_tests_passed=23, packet_tests_passed=123,\n                              numerical_cases_passed=80, lean_programs_per_arm=10),\n              limitations=[\n                  'One ordered on/off 20-request pair; no repeatability estimate and not the full 100-request H200 workload.',\n                  'Numerical checks prove the tested norm-body equivalence; retrieval checks do not establish broad model quality.',\n                  'The existing no_raw_env_reads configuration lint fails on PLOW_GLM_DSA_PF_SPAN and PLOW_GLM_DSA_PF_DEXACT, both present in the base commit. It was excluded from the subsequent 23-test configuration run.',\n                  'Frozen resident runtime and objects; only packet workgroup counts change.',\n              ])\nPath('runtime/bench/amd/glm_decode_norm/mi300x-serving.json').write_text(json.dumps(record, indent=2) + '\\n')\nprint(json.dumps(dict(changes=change, metrics={k: v['metrics'] for k, v in arms.items()}), indent=2))\n",
+  "recorder_sha256": "e072301ea7d495946a3c5455ea785b90ae29c614fdc0e7bca9e472fae2989efc",
+  "validation": {
+    "glm_emitter_tests_passed": 38,
+    "emit_config_tests_passed": 23,
+    "packet_tests_passed": 123,
+    "numerical_cases_passed": 80,
+    "lean_programs_per_arm": 10
+  },
+  "limitations": [
+    "One ordered on/off 20-request pair; no repeatability estimate and not the full 100-request H200 workload.",
+    "Numerical checks prove the tested norm-body equivalence; retrieval checks do not establish broad model quality.",
+    "The existing no_raw_env_reads configuration lint fails on PLOW_GLM_DSA_PF_SPAN and PLOW_GLM_DSA_PF_DEXACT, both present in the base commit. It was excluded from the subsequent 23-test configuration run.",
+    "Frozen resident runtime and objects; only packet workgroup counts change."
+  ]
+}

@@ -2875,6 +2875,14 @@ fn spine_cus(n_cu: u32) -> Vec<u32> {
     }
 }
 
+fn decode_norm_cus(n_cu: u32, rows: u32) -> Vec<u32> {
+    if emit_config::active().glm_decode_norm_rows {
+        (0..rows.min(n_cu)).collect()
+    } else {
+        vec![0]
+    }
+}
+
 /// The workgroups a `HeadNormRope` packet can actually use, as a slice of `cus` starting at
 /// `start`.
 ///
@@ -3263,7 +3271,7 @@ pub(crate) fn emit_glm_mla(
         );
         pre[0]
     } else {
-        b.emit(DevOp::RmsNorm, one.clone(), pre, |d| {
+        b.emit(DevOp::RmsNorm, decode_norm_cus(b.n_cu(), rows), pre, |d| {
             d.t[0] = n.xn;
             d.t[1] = x_in;
             d.t[2] = w.gin;
@@ -3359,7 +3367,7 @@ pub(crate) fn emit_glm_mla(
     let c_rnq = if fuse_qnorm {
         c_qad
     } else {
-        b.emit(DevOp::RmsNorm, one.clone(), &[c_qad], |d| {
+        b.emit(DevOp::RmsNorm, decode_norm_cus(b.n_cu(), rows), &[c_qad], |d| {
             d.t[0] = n.qlat;
             d.t[1] = n.qlr;
             d.t[2] = w.gqa;
@@ -3792,7 +3800,7 @@ pub(crate) fn emit_glm_mla(
     //   whereas the split path norms the bf16-rounded xmid, so this is algebraically exact but NOT
     //   guaranteed byte-identical to the split — the decode stream is verified before it is kept.
     if fuse_b1 {
-        b.emit(DevOp::AddNorm, one.clone(), &[c_op], |d| {
+        b.emit(DevOp::AddNorm, decode_norm_cus(b.n_cu(), rows), &[c_op], |d| {
             d.t[0] = n.xn2;
             d.t[1] = n.xmid;
             d.t[2] = x_in;
@@ -6568,7 +6576,7 @@ fn emit_glm_moe_ffn_rows(
         if raw_output {
             c_xr
         } else if let Some(gin_next) = seam_next_gin(n, slot, tp) {
-            b.emit(DevOp::AddNorm, one.clone(), &[c_xr], |d| {
+            b.emit(DevOp::AddNorm, decode_norm_cus(b.n_cu(), rows), &[c_xr], |d| {
                 d.t[0] = n.xn;
                 d.t[1] = x_out;
                 d.t[2] = n.xmid;
@@ -7353,7 +7361,7 @@ fn emit_glm_dense_ffn_rows(
         if raw_output {
             c_xr
         } else if let Some(gin_next) = seam_next_gin(n, slot, tp) {
-            b.emit(DevOp::AddNorm, one.clone(), &[c_xr], |d| {
+            b.emit(DevOp::AddNorm, decode_norm_cus(b.n_cu(), rows), &[c_xr], |d| {
                 d.t[0] = n.xn;
                 d.t[1] = x_out;
                 d.t[2] = n.xmid;

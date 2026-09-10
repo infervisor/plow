@@ -1376,6 +1376,73 @@ fn glm_decode_gemv_tuning_preserves_live_column_ownership() {
     assert_eq!(glm_decode_gemv_cus(&all, DevOp::Gemv, 64, 6144), all);
 }
 
+#[test]
+fn glm_decode_norm_rows_preserves_arithmetic_and_completion() {
+    let _guard = crate::test_env::env_guard();
+    let _target = crate::EmitAmdGuard::set(true);
+    let _env = crate::test_env::EnvScope::set(&[
+        ("PLOW_GLM_DECODE_NORM_ROWS", "0"),
+        ("PLOW_GLM_FUSE_B1", "1"),
+        ("PLOW_GLM_FUSE_SEAM", "1"),
+        ("PLOW_GLM_FUSE_QNORM", "0"),
+        ("GLM_FUSE_XRN", "0"),
+        ("PLOW_GLM_MOE_RESIDENT", "0"),
+    ]);
+    let mut c = glm_ref_cfg();
+    c.tp = 8;
+    c.layers = 5;
+    c.indexer_full.push(false);
+    let layers: Vec<_> = (0..c.layers).collect();
+    let mut declarations = Builder::new(304);
+    let n = declare_glm_rows_batched(&mut declarations, &c, 64, &layers, 128, 20, MoeEnc::Fp8Blk);
+    let tensors = declarations.tensors();
+    for rows in [1, 2, 3, 4, 8, 16, 20] {
+        let emit = || {
+            let mut b = Builder::new(304);
+            b.adopt_tensors(tensors.clone());
+            let all = b.all();
+            let mut dep = Vec::new();
+            let mut xgate = 0;
+            let mut cur = n.x;
+            for (slot, &layer) in layers.iter().enumerate() {
+                let next = if cur == n.x { n.xnext } else { n.x };
+                let emit_block = if c.is_dense(layer) { emit_glm_dense_block } else { emit_glm_block };
+                dep = vec![emit_block(
+                    &mut b, &c, &n, slot, 64, rows, 20, MoeEnc::Fp8Blk,
+                    cur, next, &dep, &mut xgate, &all,
+                )];
+                cur = next;
+            }
+            b.finish()
+        };
+        let baseline = emit();
+        let _wide = crate::test_env::EnvScope::set(&[("PLOW_GLM_DECODE_NORM_ROWS", "1")]);
+        let wide = emit();
+        assert_eq!(baseline.insts.len(), wide.insts.len());
+        let mut changed = 0;
+        for (ix, (before, after)) in baseline.insts.iter().zip(&wide.insts).enumerate() {
+            assert_eq!((before.op, before.t, before.i, before.j, before.f),
+                       (after.op, after.t, after.i, after.j, after.f));
+            if before.blocks != after.blocks {
+                changed += 1;
+                assert!(matches!(DevOp::from_u16(after.op), Some(DevOp::RmsNorm | DevOp::AddNorm)));
+                assert_eq!(after.blocks as u32, rows);
+                let slices: std::collections::BTreeSet<_> = wide.stream.iter()
+                    .filter(|e| e.inst as usize == ix).map(|e| e.slice).collect();
+                assert_eq!(slices, (0..rows).collect());
+                for wait in wide.waits.iter().filter(|w| w.id as usize == ix) {
+                    assert_eq!(wait.threshold, rows);
+                }
+            }
+        }
+        if rows == 1 {
+            assert_eq!(baseline.to_blob(), wide.to_blob());
+        } else {
+            assert_eq!(changed, 15);
+        }
+    }
+}
+
 /// The MLA flash-decode split factor is the ctx-scaled cost optimum, capped by the ACTUAL
 /// per-rank chip-fill `fill = ceil(n_cu / (nh_l/GF))` and the KV-tile count. `glm_nsplit` takes
 /// nh_l (= n_head/tp) so the cap is correct under TP/EP — the pre-fix bug sized it from the

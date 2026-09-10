@@ -591,6 +591,10 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_SELECT_LOCAL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_select_local: bool,
 
+    /// Give each batched GLM RMSNorm and AddNorm row its own workgroup.
+    #[arg(long, env = "PLOW_GLM_DECODE_NORM_ROWS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_decode_norm_rows: bool,
+
     /// Use qualified gfx942 hipBLASLt assembly for large GLM prefill projections.
     #[arg(long, env = "PLOW_GLM_GEMM_LT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_gemm_lt: bool,
@@ -1070,6 +1074,7 @@ impl EmitConfig {
             glm_moe_resident: env_bool("PLOW_GLM_MOE_RESIDENT"),
             glm_index_tp: env_bool("PLOW_GLM_INDEX_TP"),
             glm_select_local: env_bool("PLOW_GLM_SELECT_LOCAL"),
+            glm_decode_norm_rows: env_bool("PLOW_GLM_DECODE_NORM_ROWS"),
             glm_gemm_lt: env_bool("PLOW_GLM_GEMM_LT"),
             glm_gemm_lt_decode: env_bool("PLOW_GLM_GEMM_LT_DECODE"),
             glm_fold_lt: env_bool("PLOW_GLM_FOLD_LT"),

@@ -1,0 +1,729 @@
+{
+  "cases": [
+    {
+      "rows": 1,
+      "feat": 2048,
+      "add": false,
+      "residual_alias": false,
+      "weighted": true,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.001656212960369885
+    },
+    {
+      "rows": 1,
+      "feat": 2048,
+      "add": false,
+      "residual_alias": false,
+      "weighted": false,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.001801542122848332
+    },
+    {
+      "rows": 1,
+      "feat": 2048,
+      "add": true,
+      "residual_alias": false,
+      "weighted": true,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0016765157924965024
+    },
+    {
+      "rows": 1,
+      "feat": 2048,
+      "add": true,
+      "residual_alias": true,
+      "weighted": true,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0016765157924965024
+    },
+    {
+      "rows": 1,
+      "feat": 2048,
+      "add": true,
+      "residual_alias": true,
+      "weighted": false,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0016501011559739709
+    },
+    {
+      "rows": 1,
+      "feat": 6144,
+      "add": false,
+      "residual_alias": false,
+      "weighted": true,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0016372703248634934
+    },
+    {
+      "rows": 1,
+      "feat": 6144,
+      "add": false,
+      "residual_alias": false,
+      "weighted": false,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.00214160094037652
+    },
+    {
+      "rows": 1,
+      "feat": 6144,
+      "add": true,
+      "residual_alias": false,
+      "weighted": true,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0016419418388977647
+    },
+    {
+      "rows": 1,
+      "feat": 6144,
+      "add": true,
+      "residual_alias": true,
+      "weighted": true,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0016419418388977647
+    },
+    {
+      "rows": 1,
+      "feat": 6144,
+      "add": true,
+      "residual_alias": true,
+      "weighted": false,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0016961228102445602
+    },
+    {
+      "rows": 2,
+      "feat": 2048,
+      "add": false,
+      "residual_alias": false,
+      "weighted": true,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0016506898682564497
+    },
+    {
+      "rows": 2,
+      "feat": 2048,
+      "add": false,
+      "residual_alias": false,
+      "weighted": false,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0017943104030564427
+    },
+    {
+      "rows": 2,
+      "feat": 2048,
+      "add": true,
+      "residual_alias": false,
+      "weighted": true,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0016841314500197768
+    },
+    {
+      "rows": 2,
+      "feat": 2048,
+      "add": true,
+      "residual_alias": true,
+      "weighted": true,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0016841314500197768
+    },
+    {
+      "rows": 2,
+      "feat": 2048,
+      "add": true,
+      "residual_alias": true,
+      "weighted": false,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0016609496669843793
+    },
+    {
+      "rows": 2,
+      "feat": 6144,
+      "add": false,
+      "residual_alias": false,
+      "weighted": true,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0016335382824763656
+    },
+    {
+      "rows": 2,
+      "feat": 6144,
+      "add": false,
+      "residual_alias": false,
+      "weighted": false,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0019749708008021116
+    },
+    {
+      "rows": 2,
+      "feat": 6144,
+      "add": true,
+      "residual_alias": false,
+      "weighted": true,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0016742716543376446
+    },
+    {
+      "rows": 2,
+      "feat": 6144,
+      "add": true,
+      "residual_alias": true,
+      "weighted": true,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0016742716543376446
+    },
+    {
+      "rows": 2,
+      "feat": 6144,
+      "add": true,
+      "residual_alias": true,
+      "weighted": false,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.001656025997363031
+    },
+    {
+      "rows": 3,
+      "feat": 2048,
+      "add": false,
+      "residual_alias": false,
+      "weighted": true,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0016262715216726065
+    },
+    {
+      "rows": 3,
+      "feat": 2048,
+      "add": false,
+      "residual_alias": false,
+      "weighted": false,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0019217012450098991
+    },
+    {
+      "rows": 3,
+      "feat": 2048,
+      "add": true,
+      "residual_alias": false,
+      "weighted": true,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0016294980887323618
+    },
+    {
+      "rows": 3,
+      "feat": 2048,
+      "add": true,
+      "residual_alias": true,
+      "weighted": true,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0016294980887323618
+    },
+    {
+      "rows": 3,
+      "feat": 2048,
+      "add": true,
+      "residual_alias": true,
+      "weighted": false,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0017053596675395966
+    },
+    {
+      "rows": 3,
+      "feat": 6144,
+      "add": false,
+      "residual_alias": false,
+      "weighted": true,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0016470070695504546
+    },
+    {
+      "rows": 3,
+      "feat": 6144,
+      "add": false,
+      "residual_alias": false,
+      "weighted": false,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0019365428015589714
+    },
+    {
+      "rows": 3,
+      "feat": 6144,
+      "add": true,
+      "residual_alias": false,
+      "weighted": true,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.001655183034017682
+    },
+    {
+      "rows": 3,
+      "feat": 6144,
+      "add": true,
+      "residual_alias": true,
+      "weighted": true,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.001655183034017682
+    },
+    {
+      "rows": 3,
+      "feat": 6144,
+      "add": true,
+      "residual_alias": true,
+      "weighted": false,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0016553765162825584
+    },
+    {
+      "rows": 4,
+      "feat": 2048,
+      "add": false,
+      "residual_alias": false,
+      "weighted": true,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.001632419298402965
+    },
+    {
+      "rows": 4,
+      "feat": 2048,
+      "add": false,
+      "residual_alias": false,
+      "weighted": false,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0016872205305844545
+    },
+    {
+      "rows": 4,
+      "feat": 2048,
+      "add": true,
+      "residual_alias": false,
+      "weighted": true,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0016301064752042294
+    },
+    {
+      "rows": 4,
+      "feat": 2048,
+      "add": true,
+      "residual_alias": true,
+      "weighted": true,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0016301064752042294
+    },
+    {
+      "rows": 4,
+      "feat": 2048,
+      "add": true,
+      "residual_alias": true,
+      "weighted": false,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.001677350839599967
+    },
+    {
+      "rows": 4,
+      "feat": 6144,
+      "add": false,
+      "residual_alias": false,
+      "weighted": true,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.001676346524618566
+    },
+    {
+      "rows": 4,
+      "feat": 6144,
+      "add": false,
+      "residual_alias": false,
+      "weighted": false,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0017007329734042287
+    },
+    {
+      "rows": 4,
+      "feat": 6144,
+      "add": true,
+      "residual_alias": false,
+      "weighted": true,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.00163745426107198
+    },
+    {
+      "rows": 4,
+      "feat": 6144,
+      "add": true,
+      "residual_alias": true,
+      "weighted": true,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.00163745426107198
+    },
+    {
+      "rows": 4,
+      "feat": 6144,
+      "add": true,
+      "residual_alias": true,
+      "weighted": false,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0016485039377585053
+    },
+    {
+      "rows": 7,
+      "feat": 2048,
+      "add": false,
+      "residual_alias": false,
+      "weighted": true,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0016609341837465763
+    },
+    {
+      "rows": 7,
+      "feat": 2048,
+      "add": false,
+      "residual_alias": false,
+      "weighted": false,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0015912408707663417
+    },
+    {
+      "rows": 7,
+      "feat": 2048,
+      "add": true,
+      "residual_alias": false,
+      "weighted": true,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0016165123088285327
+    },
+    {
+      "rows": 7,
+      "feat": 2048,
+      "add": true,
+      "residual_alias": true,
+      "weighted": true,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0016165123088285327
+    },
+    {
+      "rows": 7,
+      "feat": 2048,
+      "add": true,
+      "residual_alias": true,
+      "weighted": false,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0016605964628979564
+    },
+    {
+      "rows": 7,
+      "feat": 6144,
+      "add": false,
+      "residual_alias": false,
+      "weighted": true,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0016535327304154634
+    },
+    {
+      "rows": 7,
+      "feat": 6144,
+      "add": false,
+      "residual_alias": false,
+      "weighted": false,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0017955951625481248
+    },
+    {
+      "rows": 7,
+      "feat": 6144,
+      "add": true,
+      "residual_alias": false,
+      "weighted": true,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.001636764034628868
+    },
+    {
+      "rows": 7,
+      "feat": 6144,
+      "add": true,
+      "residual_alias": true,
+      "weighted": true,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.001636764034628868
+    },
+    {
+      "rows": 7,
+      "feat": 6144,
+      "add": true,
+      "residual_alias": true,
+      "weighted": false,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0016639439854770899
+    },
+    {
+      "rows": 8,
+      "feat": 2048,
+      "add": false,
+      "residual_alias": false,
+      "weighted": true,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.00166112941224128
+    },
+    {
+      "rows": 8,
+      "feat": 2048,
+      "add": false,
+      "residual_alias": false,
+      "weighted": false,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0016895988956093788
+    },
+    {
+      "rows": 8,
+      "feat": 2048,
+      "add": true,
+      "residual_alias": false,
+      "weighted": true,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0016353036044165492
+    },
+    {
+      "rows": 8,
+      "feat": 2048,
+      "add": true,
+      "residual_alias": true,
+      "weighted": true,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0016353036044165492
+    },
+    {
+      "rows": 8,
+      "feat": 2048,
+      "add": true,
+      "residual_alias": true,
+      "weighted": false,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0016468028770759702
+    },
+    {
+      "rows": 8,
+      "feat": 6144,
+      "add": false,
+      "residual_alias": false,
+      "weighted": true,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.001658811466768384
+    },
+    {
+      "rows": 8,
+      "feat": 6144,
+      "add": false,
+      "residual_alias": false,
+      "weighted": false,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.001649703597649932
+    },
+    {
+      "rows": 8,
+      "feat": 6144,
+      "add": true,
+      "residual_alias": false,
+      "weighted": true,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0016667648451402783
+    },
+    {
+      "rows": 8,
+      "feat": 6144,
+      "add": true,
+      "residual_alias": true,
+      "weighted": true,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0016667648451402783
+    },
+    {
+      "rows": 8,
+      "feat": 6144,
+      "add": true,
+      "residual_alias": true,
+      "weighted": false,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0016515227034687996
+    },
+    {
+      "rows": 16,
+      "feat": 2048,
+      "add": false,
+      "residual_alias": false,
+      "weighted": true,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0016417009755969048
+    },
+    {
+      "rows": 16,
+      "feat": 2048,
+      "add": false,
+      "residual_alias": false,
+      "weighted": false,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.001530031906440854
+    },
+    {
+      "rows": 16,
+      "feat": 2048,
+      "add": true,
+      "residual_alias": false,
+      "weighted": true,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0016541570657864213
+    },
+    {
+      "rows": 16,
+      "feat": 2048,
+      "add": true,
+      "residual_alias": true,
+      "weighted": true,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0016541570657864213
+    },
+    {
+      "rows": 16,
+      "feat": 2048,
+      "add": true,
+      "residual_alias": true,
+      "weighted": false,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0016581658273935318
+    },
+    {
+      "rows": 16,
+      "feat": 6144,
+      "add": false,
+      "residual_alias": false,
+      "weighted": true,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.001660291338339448
+    },
+    {
+      "rows": 16,
+      "feat": 6144,
+      "add": false,
+      "residual_alias": false,
+      "weighted": false,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0018139039166271687
+    },
+    {
+      "rows": 16,
+      "feat": 6144,
+      "add": true,
+      "residual_alias": false,
+      "weighted": true,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0016687087481841445
+    },
+    {
+      "rows": 16,
+      "feat": 6144,
+      "add": true,
+      "residual_alias": true,
+      "weighted": true,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0016687087481841445
+    },
+    {
+      "rows": 16,
+      "feat": 6144,
+      "add": true,
+      "residual_alias": true,
+      "weighted": false,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0016588843427598476
+    },
+    {
+      "rows": 20,
+      "feat": 2048,
+      "add": false,
+      "residual_alias": false,
+      "weighted": true,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0016549170250073075
+    },
+    {
+      "rows": 20,
+      "feat": 2048,
+      "add": false,
+      "residual_alias": false,
+      "weighted": false,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.00173654081299901
+    },
+    {
+      "rows": 20,
+      "feat": 2048,
+      "add": true,
+      "residual_alias": false,
+      "weighted": true,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0016403356567025185
+    },
+    {
+      "rows": 20,
+      "feat": 2048,
+      "add": true,
+      "residual_alias": true,
+      "weighted": true,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0016403356567025185
+    },
+    {
+      "rows": 20,
+      "feat": 2048,
+      "add": true,
+      "residual_alias": true,
+      "weighted": false,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0016701146960258484
+    },
+    {
+      "rows": 20,
+      "feat": 6144,
+      "add": false,
+      "residual_alias": false,
+      "weighted": true,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0016605891287326813
+    },
+    {
+      "rows": 20,
+      "feat": 6144,
+      "add": false,
+      "residual_alias": false,
+      "weighted": false,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0018079141154885292
+    },
+    {
+      "rows": 20,
+      "feat": 6144,
+      "add": true,
+      "residual_alias": false,
+      "weighted": true,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0016542797675356269
+    },
+    {
+      "rows": 20,
+      "feat": 6144,
+      "add": true,
+      "residual_alias": true,
+      "weighted": true,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0016542797675356269
+    },
+    {
+      "rows": 20,
+      "feat": 6144,
+      "add": true,
+      "residual_alias": true,
+      "weighted": false,
+      "exact_serial_parallel": true,
+      "relative_l2": 0.0016621778486296535
+    }
+  ],
+  "passed": 80,
+  "gpu": "AMD Instinct MI300X",
+  "library_sha256": "bba61703c04191844cff136f12dc9d13489fd2c66c54d255e023564e9b4dae0e",
+  "script_sha256": "118b5f8bd4c879235f4b28f0e24c3e931b2f7b5915c89623333c6b2d8af86229",
+  "scope": "Existing RMSNorm/AddNorm bodies: one workgroup versus one per row. Exact BF16 outputs, in-place residual, optional gamma, ragged row counts and 512-byte guards. Numerical check only; no timing."
+}
