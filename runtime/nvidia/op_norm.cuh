@@ -892,6 +892,9 @@ static __device__ void d_headnorm_rope_fp8(uint8_t* __restrict__ out, float* __r
             const unsigned nsh = 31u - (unsigned)__clz((int)nhead);
             t = w >> nsh; hh = w & (nhead - 1u);
         } else { t = w / nhead; hh = w % nhead; }
+#if defined(PLOW_NV_MASKED_PADDING) && PLOW_NV_MASKED_PADDING
+        if (pfslot && pfslot[t] < 0) continue;
+#endif
         const size_t ibase = ((size_t)t * nhead + hh) * hd;
         /* KV write (out_stride!=0 always here): per-row slot map (batched prefill), per-batch ring
          * when n_batch_kv!=0 (pos[t]-derived row; ==1 is the patch-free B=1 decode ring), else

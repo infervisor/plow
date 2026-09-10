@@ -1,0 +1,59 @@
+{
+  "scope": "Masked-padding FP8 KV writer only; no compiler admission or FP8 request-limit enablement",
+  "before": {
+    "exit_code": 9,
+    "sanitizer_errors": 897
+  },
+  "after": {
+    "exit_code": 0,
+    "sanitizer_errors": 0,
+    "bf16_cases": 12,
+    "fp8_cases": 12,
+    "rungs": [
+      128,
+      512,
+      1024,
+      2048,
+      4096,
+      8192
+    ],
+    "head_geometries": [
+      {
+        "head_dim": 256,
+        "kv_heads": 8
+      },
+      {
+        "head_dim": 512,
+        "kv_heads": 1
+      }
+    ]
+  },
+  "files": {
+    "packed-kv-fp8-padding-before.log": {
+      "original_sha256": "8fce0044ea654a0d89589c9fae77de4dba4565e0f239ca2e5dacc2d6145691cb",
+      "archive_sha256": "bba1ef2122fcee6a4d12d5d68a1c3966abff7e151dd75f08bbe39b4a8aeddf5e"
+    },
+    "packed-kv-fp8-padding-before-build.log": {
+      "original_sha256": "a012e4d5ac6e6887308d3b3619ff6dddf48ccd18e4804aecb0eada938ab28992",
+      "archive_sha256": "e129e6b9f1317197db6f69b30a05f94614c0a66c95bf591fa51781e082e307e6"
+    },
+    "packed-kv-fp8-padding-after-build.log": {
+      "original_sha256": "c2b40ab1461bd930e69ca85d6799fbda25c1d2e8d94808d01361cac29a8463c6",
+      "archive_sha256": "7ccfb15f5a9d7d6ddd424bdcfa6dca68c1f4e27ca5ad6c12c9dd8e5118ba8f08"
+    },
+    "packed-kv-fp8-padding-after.log": {
+      "original_sha256": "37dc939b52e65107b87d04c6271eda7c130d5903ece1a545c72fb522377fa4c5",
+      "archive_sha256": "37dc939b52e65107b87d04c6271eda7c130d5903ece1a545c72fb522377fa4c5"
+    }
+  },
+  "executables": {
+    "packed-kv-fp8-padding-before": "b3ecff5a38899c654551e2073b2e7520331b9910dfc16f883d15ee05c0204bc1",
+    "packed-kv-fp8-padding-after": "ad906cdefd495b5257d64bb82368cf8c265b57fd8370c97877b21d17998f4635"
+  },
+  "limits": [
+    "FP8 real rows match an unpadded invocation byte-for-byte, including row scales; not independent quantization or model-quality validation.",
+    "Three slots with noncontiguous live slots0/2,16real rows,wrapped positions,padded slot-1; all other KV bytes/scales retain sentinels.",
+    "Compiler still rejects request limits with FP8 KV. Packed attention, dtype/object contracts, full-model correctness and native B64 projections remain unqualified."
+  ],
+  "archive_note": "Trailing whitespace stripped from logs; original source hashes retained."
+}

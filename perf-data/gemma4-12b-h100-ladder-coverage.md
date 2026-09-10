@@ -259,3 +259,22 @@ records the speedups and mixed serving results. This remains opt-in: changing
 the softmax tile is not output-identical to KV32. Full-model rung consistency
 passes, but three of 132 paired serving texts differ. This adds qualification
 for one attention geometry; the all-op gaps above remain open.
+
+## FP8 KV padding prerequisite
+
+The FP8 HeadNormRope cache writer now skips negative slot IDs when
+`PLOW_NV_MASKED_PADDING=1`, matching the BF16 writer. Previously, padding
+slot `-1` became an unsigned cache offset: the regression reproduced 897
+Compute Sanitizer errors before the fix.
+
+The extended padding probe passes 24 cases with zero memcheck errors:
+BF16 and FP8 at every prefill rung128/512/1024/2048/4096/8192, with
+HD256/KV8 and HD512/KV1. FP8 real rows and scales match an unpadded invocation
+byte-for-byte; all other cache bytes and scales retain their sentinels.
+The cases exercise noncontiguous slots, ring wrapping and padded rows.
+[Evidence](gemma4-12b-h100-data/packed-kv-fp8-padding-summary.json).
+
+This fixes one prerequisite for larger batches. The compiler still rejects
+FP8 KV with request chunk limits. Packed FP8 attention, object contracts,
+full-model correctness and native B64 projections need qualification before
+that restriction can be lifted. No throughput gain is claimed by this fix.

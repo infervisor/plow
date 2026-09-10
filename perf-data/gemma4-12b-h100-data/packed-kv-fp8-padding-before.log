@@ -1,0 +1,34 @@
+========= COMPUTE-SANITIZER
+========= Invalid __global__ write of size 4 bytes
+=========     at void write_fp8_rows<(int)256>(unsigned char *, float *, const __nv_bfloat16 *, const __nv_bfloat16 *, const float *, const float *, const int *, const int *, unsigned int, unsigned int, unsigned int)+0x10b0
+=========     by thread (32,0,0) in block (16,0,0)
+=========     Access to 0x9ffdc0872600 is out of bounds
+=========     and is 35184133481473 bytes after the nearest allocation at 0x7ffdcec00000 of size 512 bytes
+=========     Saved host backtrace up to driver entry point at kernel launch time
+=========         Host Frame: void check_fp8<256>(unsigned int, unsigned int) [clone .constprop.0] [0xc450] in packed-kv-fp8-padding-before
+=========         Host Frame: main [0x907a] in packed-kv-fp8-padding-before
+=========
+========= Invalid __global__ write of size 4 bytes
+=========     at void write_fp8_rows<(int)256>(unsigned char *, float *, const __nv_bfloat16 *, const __nv_bfloat16 *, const float *, const float *, const int *, const int *, unsigned int, unsigned int, unsigned int)+0x10b0
+=========     by thread (64,0,0) in block (16,0,0)
+=========     Access to 0x9ffdc0874600 is out of bounds
+=========     and is 35184133489665 bytes after the nearest allocation at 0x7ffdcec00000 of size 512 bytes
+=========     Saved host backtrace up to driver entry point at kernel launch time
+=========         Host Frame: void check_fp8<256>(unsigned int, unsigned int) [clone .constprop.0] [0xc450] in packed-kv-fp8-padding-before
+=========         Host Frame: main [0x907a] in packed-kv-fp8-padding-before
+=========
+========= Invalid __global__ write of size 4 bytes
+=========     at void write_fp8_rows<(int)256>(unsigned char *, float *, const __nv_bfloat16 *, const __nv_bfloat16 *, const float *, const float *, const int *, const int *, unsigned int, unsigned int, unsigned int)+0x10b0
+=========     by thread (96,0,0) in block (16,0,0)
+=========     Access to 0x9ffdc0876600 is out of bounds
+=========     and is 35184133497857 bytes after the nearest allocation at 0x7ffdcec00000 of size 512 bytes
+=========     Saved host backtrace up to driver entry point at kernel launch time
+=========         Host Frame: void check_fp8<256>(unsigned int, unsigned int) [clone .constprop.0] [0xc450] in packed-kv-fp8-padding-before
+=========         Host Frame: main [0x907a] in packed-kv-fp8-padding-before
+=========
+cudaDeviceSynchronize(): unspecified launch failure
+PASS rows=128 HD=256 heads=8: ragged slots, ring wrap, untouched KV, query padding
+PASS rows=128 HD=512 heads=1: ragged slots, ring wrap, untouched KV, query padding
+========= Target application returned an error
+========= ERROR SUMMARY: 897 errors
+========= ERROR SUMMARY: 894 errors were not printed. Use --print-limit option to adjust the number of printed errors
