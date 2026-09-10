@@ -1,0 +1,459 @@
+   Compiling packet v0.1.0 (/home/lava/plow/crates/packet)
+   Compiling plow-asset v0.1.0 (/home/lava/plow/crates/plow-asset)
+   Compiling kernelcaps v0.1.0 (/home/lava/plow/crates/kernelcaps)
+   Compiling tunedb v0.1.0 (/home/lava/plow/crates/tunedb)
+   Compiling devgen v0.1.0 (/home/lava/plow/crates/devgen)
+warning: unused import: `RopeScale`
+ --> crates/devgen/src/mla.rs:8:31
+  |
+8 | use packet::rope::{GenTensor, RopeScale};
+  |                               ^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `MLA_DK` is never used
+    --> crates/devgen/src/lib.rs:7466:18
+     |
+7466 | pub(crate) const MLA_DK: u32 = 512;
+     |                  ^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `MLA_FOLD_VEC` is never used
+    --> crates/devgen/src/lib.rs:7470:18
+     |
+7470 | pub(crate) const MLA_FOLD_VEC: u32 = 4;
+     |                  ^^^^^^^^^^^^
+
+warning: function `require_mla_geometry` is never used
+    --> crates/devgen/src/lib.rs:7504:15
+     |
+7504 | pub(crate) fn require_mla_geometry(kv_lora: u32, qk_rope: u32, v_head:...
+     |               ^^^^^^^^^^^^^^^^^^^^
+
+warning: `devgen` (lib) generated 4 warnings (run `cargo fix --lib -p devgen` to apply 1 suggestion)
+   Compiling plowrt v0.1.0 (/home/lava/plow/crates/plowrt)
+warning: use of deprecated associated function `minijinja::Environment::<'source>::new`: Attempted to instantiate an environment with serde.  Future versions of MiniJinja will require enabling the 'serde' feature to use serde types.  To silence this warning add 'serde' to the list of features of minijinja.
+  --> crates/plowrt/src/serve/template.rs:95:36
+   |
+95 |         let mut env = Environment::new();
+   |                                    ^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+warning: variable does not need to be mutable
+   --> crates/plowrt/src/exec/gpu/prefix.rs:400:13
+    |
+400 |         let mut blit = |dev: u64, snap: u64, bytes: u64| -> Result<()> {
+    |             ----^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `api` is never read
+   --> crates/plowrt/src/device/cuda.rs:344:5
+    |
+342 | pub struct GraphExec {
+    |            --------- field in this struct
+343 |     exec: CUgraphExec,
+344 |     api: *const c_void, // not used for drop safety; freed via CudaBack...
+    |     ^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `hsa_shut_down` is never read
+   --> crates/plowrt/src/device/hsa.rs:364:5
+    |
+353 |         struct HsaDriver {
+    |                --------- field in this struct
+...
+364 |     hsa_shut_down: unsafe extern "C" fn() -> HsaStatus,
+    |     ^^^^^^^^^^^^^
+    |
+    = note: this warning originates in the macro `hsa_fns` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: field `kernarg_pool` is never read
+   --> crates/plowrt/src/device/hsa.rs:676:5
+    |
+656 | pub struct HsaBackend {
+    |            ---------- field in this struct
+...
+676 |     kernarg_pool: HsaMemoryPool,
+    |     ^^^^^^^^^^^^
+
+warning: associated function `split` is never used
+    --> crates/plowrt/src/exec/amd.rs:3534:8
+     |
+3528 | impl LoadProf {
+     | ------------- associated function in this implementation
+...
+3534 |     fn split(c: &Cell<u64>, t: Instant) -> Instant {
+     |        ^^^^^
+
+warning: field `route` is never read
+  --> crates/plowrt/src/exec/amd/mixed_step.rs:64:16
+   |
+63 | pub(super) struct MixedAmdStep {
+   |                   ------------ field in this struct
+64 |     pub(super) route: StepRoute,
+   |                ^^^^^
+
+warning: `plowrt` (lib test) generated 7 warnings (run `cargo fix --lib -p plowrt --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 49.00s
+     Running unittests src/lib.rs (target/debug/deps/plowrt-1073975d9d3900c5)
+
+running 351 tests
+test exec::amd::packed::tests::a_gap_an_overlap_and_a_third_span_on_one_slot_all_refuse ... ok
+test exec::amd::packed::tests::a_single_sequence_recurrent_arm_is_capped_at_one_span ... ok
+test exec::amd::packed::tests::a_program_with_no_recurrent_operator_is_unbounded ... ok
+test exec::amd::packed::tests::a_length_one_body_behind_the_leading_run_is_refused_by_name ... ok
+test exec::amd::packed::tests::recurrent_operators_with_no_per_span_arm_are_refused_by_name ... ok
+test exec::amd::packed::tests::a_terminal_and_body_pair_on_one_slot_is_the_legal_prefix_free_shape ... ok
+test exec::amd::packed::tests::accepts_prefill_after_leading_decode_rows ... ok
+test exec::amd::packed::tests::decode_shaped_recurrent_operators_are_refused_as_a_category_error ... ok
+test exec::amd::packed::tests::rejects_a_prefill_span_that_overwrites_decode_rows ... ok
+test exec::amd::packed::tests::the_packed_kda_operator_group_carries_as_many_spans_as_fit ... ok
+test exec::amd::packed::tests::the_parked_mask_must_be_exactly_the_padded_suffix ... ok
+test exec::amd::packed::tests::the_decode_band_validator_still_refuses_a_prefix_free_table ... ok
+test exec::amd::packed::tests::accepts_the_backend_neutral_mixed_plan_directly ... ok
+test exec::amd::slab_tests::pad_rounds_up_and_leaves_exact_multiples_alone ... ok
+test exec::amd::slab_tests::carve_cursor_lands_exactly_on_the_sized_total ... ok
+test exec::amd::prefix::tests::folded_decode_fields_keep_the_same_snapshot_geometry ... ok
+test exec::amd::tests::b128_argmax_requires_an_object_capacity_marker ... ok
+test exec::amd::prefix::tests::sliding_snapshot_includes_fp8_scales_and_deduplicates_aliases ... ok
+test exec::amd::prefix::tests::unknown_kv_fractional_state_and_inconsistent_ring_refuse_reuse ... ok
+test exec::amd::prefix::tests::window_copy_restores_exact_history_across_ring_wrap_without_other_rows ... ok
+test exec::amd::tests::batched_mxfp4_moe_requires_a4w4_in_the_decode_object ... ok
+test exec::amd::slab_tests::zero_byte_tensors_still_advance_the_cursor ... ok
+test exec::amd::tests::a_shipped_object_without_the_marker_reads_as_unknown ... ok
+test exec::amd::tests::an_object_that_advertises_nothing_is_refused_only_above_one_row ... ok
+test exec::amd::tests::a_sparse_mla_prefill_blob_needs_both_the_v2_routing_and_the_gathered_arm ... ok
+test exec::amd::tests::a_kv_encoding_mismatch_is_refused_in_both_directions ... ok
+test exec::amd::tests::a_k3_packet_against_an_object_without_the_arms_is_refused ... ok
+test exec::amd::tests::a_gemma_moe_packet_against_an_object_without_the_arms_is_refused ... ok
+test exec::amd::tests::dsa_decode_batch_refuses_an_object_without_row_offsets ... ok
+test exec::amd::tests::a_qwen_gdn_packet_against_an_object_without_the_arms_is_refused ... ok
+test exec::amd::tests::compact_audit_patches_only_tp_collectives ... ok
+test exec::amd::tests::dsa_decode_score_requires_the_cdna3_lds_fix ... ok
+test exec::amd::tests::carried_state_is_never_skippable_and_the_kv_cache_always_is ... ok
+test exec::amd::tests::dsa_pool_tail_seed_is_a_full_nop_on_an_aligned_chunk ... ok
+test exec::amd::tests::chunk_kda_requires_its_exact_object_marker ... ok
+test exec::amd::tests::a_gemv_wider_than_the_objects_bucket_is_refused ... ok
+test exec::amd::tests::expert_parallel_loader_requires_every_abi_and_resource_marker ... ok
+test exec::amd::tests::chunk_plan_mixes_the_ladder_and_puts_the_ragged_chunk_last ... ok
+test exec::amd::tests::dsa_pool_tail_seed_shrinks_compress_and_rebases_exactly_the_real_remainder ... ok
+test exec::amd::tests::f32mix_attn_res_object_gates_markers_and_pairing ... ok
+test exec::amd::tests::fp8_mla_v2_routes_only_a_pure_segment_to_four_waves ... ok
+test exec::amd::tests::elf_reader_is_bounded_on_junk ... ok
+test exec::amd::tests::gate_hier_status_separates_armed_from_firing ... ok
+test exec::amd::tests::hierarchical_gate_marker_requires_decode_gq_and_l2_capability ... ok
+test exec::amd::expert_name_tests::mxfp4_under_the_standard_projection_names_resolves_on_the_scale_alone ... ok
+test exec::amd::expert_name_tests::a_payload_without_any_scale_names_both_spellings ... ok
+test exec::amd::expert_name_tests::no_experts_at_all_reports_every_name_it_probed ... ok
+test exec::amd::expert_name_tests::mixtral_mxfp4_resolves_namespace_projections_and_payload_together ... ok
+test exec::amd::expert_name_tests::a_scale_that_covers_the_wrong_k_is_refused_and_named ... ok
+test exec::amd::tests::grouped_decode_requires_its_accumulation_arm ... ok
+test exec::amd::tests::kda_conv_step_db_requires_exact_packet_object_pairing ... ok
+test exec::amd::tests::kda_carry_regstate_routes_only_a_marked_exact_singleton ... ok
+test exec::amd::tests::l2_pairing_refusal_names_both_halves_and_the_fix ... ok
+test exec::amd::tests::kda_wave_items_routes_only_a_marked_pure_segment ... ok
+test exec::amd::tests::cached_kda_intra_route_requires_a_pure_bt64_d128_segment ... ok
+test exec::amd::tests::kda_wu_lean_routes_the_marked_pair_and_feeds_the_regstate_carry ... ok
+test exec::amd::tests::kvrow_span_covers_every_site ... ok
+test exec::amd::tests::lean_moe_combine_route_is_generic_and_exact_contract_only ... ok
+test exec::amd::tests::kda_key_factor_pair_routes_share_one_scratch_pair ... ok
+test exec::amd::tests::live_nsplit_walks_the_measured_ladder_and_never_grows ... ok
+test exec::amd::tests::lean_moe_stage2_companion_layout_matches_the_declared_permutations ... ok
+test exec::amd::tests::lean_moe_combine_route_rejects_mixed_segments ... ok
+test exec::amd::tests::legacy_l2_prefill_forces_primary_interpreter ... ok
+test exec::amd::tests::lean_moe_stage2_route_requires_the_exact_pure_down_segment ... ok
+test exec::amd::tests::marked_kda_wave_items_requires_its_object ... ok
+test exec::amd::tests::marked_kda_wave_items_rejects_missing_markers_and_pairing ... ok
+test exec::amd::tests::materialized_mla_flat_grid_covers_every_qblock_head_and_batch_once ... ok
+test exec::amd::tests::marked_kda_carry_regstate_requires_its_object ... ok
+test exec::amd::tests::materialized_mla_raw_route_rejects_mixed_or_counter_segments ... ok
+test exec::amd::tests::local_dsa_selection_checks_rows_operands_and_object ... ok
+test exec::amd::tests::materialized_mla_raw_routes_use_exact_abi_and_flat_grid ... ok
+test exec::amd::tests::materialized_mla_routes_follow_the_chunk ... ok
+test exec::amd::tests::mla_nsplit_sites_pair_the_flash_with_its_merge ... ok
+test exec::amd::tests::object_names_match_the_shipped_set ... ok
+test exec::amd::tests::only_append_only_kv_caches_skip_zeroing ... ok
+test exec::amd::tests::nope_mla_prefill_routes_to_four_waves_and_is_gated_at_load ... ok
+test exec::amd::tests::only_the_bucketed_ops_set_the_requirement ... ok
+test exec::amd::tests::overlap_capability_fails_closed_for_shared_or_missing_evidence ... ok
+test exec::amd::tests::overlap_capability_requires_both_disjoint_intervals_and_queues ... ok
+test exec::amd::tests::packed_chunk_kda_requires_a_complete_operator_group ... ok
+test exec::amd::tests::packed_dense_contract_accepts_split_attention_and_refuses_other_state ... ok
+test exec::amd::tests::packed_dispatch_selects_tagged_sibling_without_changing_ordinary_rung ... ok
+test exec::amd::tests::packed_family_route_never_falls_back_for_a_consumer_segment ... ok
+test exec::amd::tests::packed_prefill_accepts_dense_ragged_rows_and_parked_padding ... ok
+test exec::amd::tests::packed_prefill_kernarg_is_legacy_null_or_exact_program_only ... ok
+test exec::amd::tests::packed_operator_families_require_pure_segments ... ok
+test exec::amd::tests::packed_prefill_patches_generic_work_to_dense_total_rows ... ok
+test exec::amd::tests::packed_prefill_prompt_slices_must_match_spans_exactly ... ok
+test exec::amd::tests::packed_prefill_rejects_malformed_spans_and_masks ... ok
+test exec::amd::tests::packed_prefill_requires_abi_on_every_routed_object ... ok
+test exec::amd::tests::packed_prefill_stages_concatenated_ids_and_absolute_positions ... ok
+test exec::amd::tests::pairing_stamp_is_read_from_elf_data ... ok
+test exec::amd::tests::prefill_arm_detect_selects_the_right_variant ... ok
+test exec::amd::tests::prefill_object_without_mla_arms_is_refused ... ok
+test exec::amd::tests::prefill_only_accumulation_does_not_require_a_decode_arm ... ok
+test exec::amd::tests::ragged_rows_are_a_no_op_when_the_chunk_is_full ... ok
+test exec::amd::tests::prefill_sandwich_norm_requires_dispatch_marker ... ok
+test exec::amd::tests::ragged_rows_shrink_only_the_fields_that_hold_the_bucket_width ... ok
+test exec::amd::tests::ragged_sparse_prefill_keeps_selection_and_flash_layouts_equal ... ok
+test exec::amd::tests::raw_mla_v2_object_requires_exact_capabilities ... ok
+test exec::amd::tests::raw_mla_v2_route_is_dense_bf16_pure_and_machine_filling ... ok
+test exec::amd::tests::rebase_chunk_moves_only_the_kv_write_rows ... ok
+test exec::amd::tests::rebase_chunk_shortens_every_kda_arm_to_the_real_row_count ... ok
+test exec::amd::tests::rebase_chunk_still_patches_the_dense_gqa_families ... ok
+test exec::amd::tests::required_flash_object_load_errors_are_not_swallowed ... ok
+test exec::amd::tests::required_compiled_opcode_markers_are_fail_closed ... ok
+test exec::amd::tests::replicated_prefill_ep_routes_full_i_and_balanced_whole_experts ... ok
+test exec::amd::tests::sparse_fp8_rejects_stale_objects_and_invalid_handles ... ok
+test exec::amd::tests::specialised_decode_arms_require_a_build_manifest ... ok
+test exec::amd::tests::specialised_amd_object_pairing_is_fail_closed ... ok
+test exec::amd::tests::specialised_amd_manifest_hash_must_be_valid ... ok
+test exec::amd::tests::state_clear_ranges_cover_each_slot_stride_once ... ok
+test exec::amd::tests::specialised_prefill_arms_are_derived_without_a_manifest ... ok
+test exec::amd::tests::symbols_carry_the_isa_and_the_scheduler ... ok
+test exec::amd::tests::the_attn_res_score_weight_folds_from_the_pair_the_checkpoint_ships ... ok
+test exec::amd::tests::the_kernarg_slice_is_the_whole_struct ... ok
+test exec::amd::expert_name_tests::block_fp8_resolves_to_exactly_the_names_it_always_did ... ok
+test exec::amd::tests::the_walk_marker_lifts_the_capacity_refusal ... ok
+test exec::amd::tests::tp_counter_bank_refuses_stale_inactive_bank ... ok
+test exec::amd::tests::tp_counter_bank_state_is_per_program ... ok
+test exec::amd::tests::the_ragged_cover_takes_the_fewest_launches ... ok
+test exec::amd::tests::tp_counter_banks_are_clean_on_first_use_and_alternate ... ok
+test exec::amd::tests::tp_counter_single_bank_mode_requires_synchronous_rearm ... ok
+test exec::amd::tests::xreduce_wave_rs_routes_only_a_marked_pure_segment ... ok
+test exec::amd::tests::xreduce_attnres_route_requires_the_exact_row_partition_contract ... ok
+test exec::amd::token_batch::tests::a_complete_object_is_armed ... ok
+test exec::amd::token_batch::tests::a_decode_prefix_is_refused_not_silently_packed ... ok
+test exec::amd::token_batch::tests::a_missing_fused_epilogue_is_refused ... ok
+test exec::amd::token_batch::tests::a_missing_object_is_refused_by_capability_name ... ok
+test exec::amd::token_batch::tests::a_partially_built_object_names_the_arms_it_lacks ... ok
+test exec::amd::token_batch::tests::a_prefix_free_unsplit_fused_plan_is_admitted ... ok
+test exec::amd::token_batch::tests::compiled_objects_advertise_token_batch_and_reject_mixed_control ... ignored, CPU ELF inspection; set TEST_AMD_TOKEN_BATCH_OBJECTS to the compiled object directory
+test exec::amd::token_batch::tests::fresh_gemma_packet_preserves_rungs_and_passes_unified_contracts ... ignored, CPU packet inspection; set TEST_AMD_TOKEN_BATCH_ASSETS to a fresh BF16 Gemma31 packet
+test exec::amd::token_batch::tests::a_split_attention_packet_is_refused ... ok
+test exec::amd::token_batch::tests::the_kernel_symbol_is_not_the_mixed_objects ... ok
+test exec::amd_gemm_lt::tests::lt_route_rejects_invalid_shapes_bindings_and_segments ... ok
+test exec::amd_moe_aiter::tests::moe_aiter_hsa_dispatch ... ignored, requires a gfx942 GPU lease and PLOW_TEST_AITER_DIR
+test exec::amd_gemm_lt::tests::lt_arguments_preserve_live_rows_and_inline_abi ... ok
+test exec::amd_index_tp::tests::index_tp_routes_reject_invalid_geometry_bindings_and_segments ... ok
+test exec::amd_sparse_mla::tests::sparse_mla_hsa_dispatch ... ignored, requires a gfx942 GPU lease and PLOW_TEST_AITER_DIR
+test exec::amd_moe_aiter::tests::moe_aiter_routes_require_geometry_capacity_and_isolation ... ok
+test exec::amd_sparse_mla::tests::sparse_mla_fp8_routes_require_scales_and_selected_union ... ok
+test exec::amd_sparse_mla::tests::sparse_mla_rebases_ragged_rows_and_restores_early_fallback ... ok
+test exec::amd_sparse_mla::tests::sparse_mla_rejects_counter_obligations_in_both_streams ... ok
+test exec::amd_tp::tests::cross_rank_agreement_is_not_sampled_by_default ... ok
+test exec::amd_sparse_mla::tests::sparse_mla_rejects_mixed_segments_and_wrong_geometry ... ok
+test exec::amd_tp::tests::decode_segments_enqueue_segment_major_across_tp_ranks ... ok
+test exec::amd_tp::tests::disagreement_names_the_rank_and_both_ids ... ok
+test exec::amd_tp::tests::l2_domains_are_one_tp_launch_not_wave_segments ... ok
+test exec::amd_tp::tests::prefill_capture_is_exact_one_shot_selection ... ok
+test exec::amd_tp::tests::prefill_segment_major_submits_every_rank_before_the_next_segment ... ok
+test exec::amd_tp::tests::tagged_xreduce_contract_is_enforced ... ok
+test exec::amd_tp::tests::the_cadence_is_armed_on_the_first_token ... ok
+test exec::amd_tp::tests::prefill_capture_parser_rejects_ambiguous_targets ... ok
+test exec::amd_tp::tests::the_sharded_head_fold_is_sized_and_audited ... ok
+test exec::cpu::engine::allocation_tests::live_numa_policy ... ignored, requires Linux mbind permission; validates actual NUMA VMA policy
+test exec::cpu::control::tests::broadcast_ring_delivers_to_every_worker_in_order ... ok
+test exec::cpu::control::tests::fault_packing_roundtrips_and_keeps_first ... ok
+test exec::cpu::engine::placement_tests::a_program_cannot_hide_its_imbalance_behind_another ... ok
+test exec::cpu::engine::placement_tests::cu_domains_declines_a_stream_window_past_the_end ... ok
+test exec::cpu::engine::placement_tests::an_amd_map_matching_the_node_count_reproduces_the_round_robin ... ok
+test exec::cpu::engine::placement_tests::cu_work_is_per_program ... ok
+test exec::amd::tests::k3_arm_ops_match_the_interpreter ... ok
+test exec::cpu::engine::placement_tests::domain_beyond_the_declared_count_is_rejected ... ok
+test exec::cpu::engine::placement_tests::disagreeing_programs_have_no_plan ... ok
+test exec::cpu::engine::placement_tests::node_plan_declines_a_plan_that_makes_the_busiest_node_worse ... ok
+test exec::cpu::engine::placement_tests::node_plan_declines_when_it_cannot_stay_balanced ... ok
+test exec::cpu::engine::placement_tests::node_plan_declines_with_no_work_to_judge ... ok
+test exec::cpu::engine::placement_tests::node_plan_groups_domains_onto_nodes ... ok
+test exec::amd::tests::gemma_moe_arm_ops_match_the_interpreter ... ok
+test exec::cpu::engine::placement_tests::recovers_either_hardware_domain_map ... ok
+test exec::cpu::engine::placement_tests::worker_width_never_exceeds_the_packet ... ok
+test exec::cpu::engine::placement_tests::unplaced_or_single_domain_blob_has_no_plan ... ok
+test exec::cpu::topology::tests::cpulist_parses_ranges_and_singles ... ok
+test exec::cpu::topology::tests::numa_mode_parses ... ok
+test exec::cpu::topology::tests::restricted_siblings_keep_allowed_representative ... ok
+test exec::cpu::topology::tests::placement_spreads_cores_before_smt ... ok
+test exec::cpu::topology::tests::smt_siblings_collapse_to_one_core ... ok
+test exec::cpu::workers::placement_tests::a_plan_groups_domains_without_costing_balance ... ok
+test exec::cpu::workers::placement_tests::a_plan_survives_a_node_with_no_active_worker ... ok
+test exec::cpu::workers::placement_tests::without_a_plan_placement_is_the_old_round_robin ... ok
+test exec::amd::tests::fused_decode_rejects_one_raw_instruction_in_multiple_segments ... ok
+test exec::amd::tests::ordinary_l2_decode_allows_cross_domain_counters ... ok
+test exec::amd::tests::lean_moe_stage1_a4_reuse_is_geometry_gated_and_scratch_bounded ... ok
+test exec::amd::tests::mixed_decode_mla_ops_remain_on_the_ordinary_interpreter ... ok
+test exec::amd::tests::fused_decode_segment_is_a_pure_ordered_single_rank_route ... ok
+test exec::amd::tests::decode_mla_pair_routes_as_one_specialist_segment ... ok
+test exec::amd::tests::graph_phase_selector_rejects_topology_and_resource_drift ... ok
+test exec::amd::expert_name_tests::a_block_fp8_grid_of_the_wrong_shape_is_refused ... ok
+test exec::amd::tests::lean_moe_stage1_route_requires_exact_shape_and_align ... ok
+test exec::amd::tests::f32mix_attn_res_route_requires_marker_geometry_and_a_pure_segment ... ok
+test exec::amd::tests::fused_decode_descriptor_builds_the_exact_raw_kernarg ... ok
+test exec::amd::tests::decode_dispatch_rejects_multiple_wave_launches ... ok
+test exec::amd::tests::the_ladder_is_its_own_cap ... ok
+test exec::amd::tests::fused_decode_v1_descriptor_fails_closed ... ok
+test exec::amd::tests::graph_phase_selector_requires_matching_contiguous_packet_inventory ... ok
+test exec::amd::tests::fused_decode_refuses_mixed_countered_and_l2_segments ... ok
+test exec::amd::tests::grouped_moe_decode_pair_routes_with_exact_mxfp4_abi ... ok
+test exec::amd::tests::op_gemm_h_emits_the_capacity_marker ... ok
+test exec::gpu::attention_role_tests::actual_packet_attention_roles ... ignored, requires TEST_ATTENTION_ROLE_PACKET pointing to an attention-role packet
+test exec::gpu::attention_role_tests::accepts_exact_hd512_wg32_contract_and_rejects_drift ... ok
+test exec::gpu::attention_role_tests::accepts_hd512_fused_output_and_rejects_unsafe_contracts ... ok
+test exec::gpu::attention_role_tests::packet_role_overrides_only_its_legacy_prefill_segment ... ok
+test exec::gpu::attention_role_tests::rejects_mixed_split_missing_and_duplicate_attention_work ... ok
+test exec::gpu::cublaslt::tests::accepts_packet_selected_bf16_projections ... ok
+test exec::gpu::decode_context::tests::actual_frozen_auxiliary_packets ... ignored, CPU actual packet proof; set TEST_CONTEXT_BASE and TEST_CONTEXT_AUX
+test exec::gpu::attention_role_tests::accepts_combined_roles_and_preserves_packet_split_counts ... ok
+test exec::gpu::cublaslt::tests::rejects_invalid_precision_geometry_and_extents ... ok
+test exec::gpu::cublaslt::tests::rejects_invalid_roles_and_queue_windows ... ok
+test exec::gpu::attention_role_tests::rejects_missing_unused_and_mismatched_role_objects ... ok
+test exec::cpu::topology::tests::detected_cpus_respect_thread_affinity ... ok
+test exec::gpu::attention_role_tests::rejects_unsupported_attention_operands_and_partial_extents ... ok
+test exec::gpu::cublaslt::tests::stream_order_replaces_only_library_counter_waits ... ok
+test exec::engine_thread::tests::runs_in_order_on_one_thread ... ok
+test exec::gpu::decode_object::tests::incompatible_launch_modes_are_rejected ... ok
+test exec::engine_thread::tests::panic_is_reported_and_thread_survives ... ok
+test exec::gpu::decode_rung_tests::actual_packet_decode_ladder ... ignored, CPU-only actual packet check; set TEST_DECODE_RUNG_PACKET
+test exec::gpu::decode_object::tests::resources_and_derived_cooperative_capacity_must_match ... ok
+test exec::gpu::decode_rung_tests::actual_seven_program_packet_selects_segment_pair ... ignored, CPU-only actual packet check; set TEST_SEGMENTED_PREFILL_PACKET
+test exec::gpu::decode_object::tests::validates_every_assigned_program_against_compiled_coverage ... ok
+test exec::gpu::decode_context::tests::dynamic_b1_does_not_patch_immutable_auxiliary_instructions ... ok
+test exec::gpu::decode_object::tests::image_identity_isa_and_entry_are_checked_without_external_files ... ok
+test exec::gpu::decode_context::tests::dispatch_context_routes_and_fallbacks_use_live_physical_slots ... ok
+test exec::gpu::decode_context::tests::sliding_cache_uses_position_capacity_instead_of_batch_or_ring_rows ... ok
+test exec::gpu::decode_context::tests::matching_tables_cannot_hide_partial_lifetime_errors ... ok
+test exec::gpu::decode_object::tests::initial_module_selection_uses_packet_grid_with_spare_capacity ... ok
+test exec::gpu::decode_context::tests::full_prefix_context_selection_rechecks_mixed_lengths_and_reset ... ok
+test exec::gpu::decode_context::tests::bounded_reads_and_absent_metadata_do_not_allocate_unbounded_files ... ok
+test exec::gpu::decode_object::tests::one_decode_program_can_bind_one_object ... ok
+test exec::gpu::decode_rung_tests::gpu_cublaslt_rungs_match_widest_logits ... ignored, GPU cuBLASLt gate; set TEST_DECODE_RUNG_GPU, TEST_DECODE_RUNG_ASSETS, TEST_DECODE_RUNG_BASELINE
+test exec::gpu::decode_rung_tests::gpu_decode_rungs_match_widest_full_logits ... ignored, GPU full-logit gate; set TEST_DECODE_RUNG_GPU, TEST_DECODE_RUNG_ASSETS, TEST_DECODE_RUNG_BASELINE
+test exec::gpu::decode_object::tests::context_metadata_cannot_be_silently_ignored_before_materialization ... ok
+test exec::gpu::decode_rung_tests::effective_widths_include_main_and_preserve_widest_only_fallbacks ... ok
+test exec::gpu::decode_rung_tests::decode_ladder_accepts_runtime_input_capacity_beyond_widest_rung ... ok
+test exec::gpu::decode_rung_tests::cublaslt_ladder_requires_complete_equivalent_roles_and_dependencies ... ok
+test exec::gpu::decode_rung_tests::cublaslt_ladder_rejects_stale_kv_addressing_and_invalid_projection_storage ... ok
+test exec::gpu::decode_rung_tests::gpu_fp8_kv_cached_rungs_match_uncached_suffix_logits ... ignored, H100 FP8-KV prefix gate; set TEST_FP8_KV_ASSETS and PLOW_VMM_PREFIX=1, PLOW_MULTISTEP=0
+test exec::gpu::decode_rung_tests::selects_by_highest_physical_slot_and_preserves_sparse_slots ... ok
+test exec::gpu::fp8_m1_role::tests::actual_frozen_role_image_and_packet ... ignored, CPU frozen actual object/packet proof: TEST_FP8_ROLE_IMAGE and TEST_FP8_ROLE_PACKET
+test exec::gpu::decode_rung_tests::unsupported_families_and_single_rung_keep_widest_execution ... ok
+test exec::gpu::fp8_m1_role::tests::checkpoint_dtype_shape_contract ... ok
+test exec::gpu::decode_rung_tests::validates_hd64_half_split_attention_ladder ... ok
+test exec::gpu::gemv_role_tests::gemv_role_actual_packet_preserves_work ... ignored, CPU actual pair gate; set TEST_GEMV_ROLE_ASSETS and TEST_GEMV_ROLE_BASELINE
+test exec::gpu::fp8_m1_role::tests::image_hash_and_isa_reject_without_device ... ok
+test exec::gpu::decode_context::tests::reserved_section_kind_count_range_and_old_absence ... ok
+test exec::gpu::gemv_role_tests::gpu_gemv_role_graph_matches_coarse_full_logits ... ignored, GPU full-logit and graph gate; set TEST_GEMV_ROLE_GPU=1 plus pair paths
+test exec::gpu::kv_tmap_tests::actual_packet_slot_descriptors ... ignored, requires TEST_KV_TMAP_PACKET pointing to a real packet
+test exec::gpu::kv_tmap_tests::rejects_invalid_or_conflicting_geometry ... ok
+test exec::gpu::decode_rung_tests::fp8_kv_ladder_rejects_changed_reader_writer_and_scale_addressing ... ok
+test exec::gpu::decode_rung_tests::validates_flat_mxfp4_moe_decode_ladder_rows ... ok
+test exec::gpu::decode_rung_tests::fine_gated_prefill_selects_segment_pair_from_packet_topology ... ok
+test exec::gpu::kv_tmap_tests::rejects_invalid_pair_handles_and_extents ... ok
+test exec::gpu::kv_tmap_tests::rejects_misaligned_and_overflowing_slot_addresses ... ok
+test exec::gpu::decode_rung_tests::validates_direct_kv_ladder_and_rejects_stale_slot_addressing ... ok
+test exec::gpu::decode_rung_tests::validates_channel_fp8_rows_and_preserves_projection_and_kv_checks ... ok
+test exec::gpu::decode_context::tests::permits_only_compatible_full_attention_split_change ... ok
+test exec::gpu::decode_rung_tests::bound_projection_requires_capability_only_on_assigned_e3_rungs ... ok
+test exec::gpu::kv_tmap_tests::slot_tables_bind_matching_cache_addresses_and_immutable_descriptors ... ok
+test exec::gpu::decode_rung_tests::fp8_kv_ladder_rejects_invalid_scale_storage_and_aliases ... ok
+test exec::gpu::mixed_step::tests::mixed_row_capacity_requires_sampled_matching_decode_width ... ok
+test exec::gpu::mixed_step::tests::host_layout_is_fixed_disjoint_and_exact ... ok
+test exec::gpu::mixed_step::tests::mixed_row_capacity_prefers_a_cover_then_the_largest_partial ... ok
+test exec::gpu::decode_object::tests::absent_metadata_preserves_legacy_and_present_requires_full_coverage ... ok
+test exec::gpu::packed_terminal::tests::packed_terminal_sparse_slots_match_full_ordinary_logits ... ignored, requires H100 packed-prefix assets and ordinary prefix_logits reference outputs
+test exec::gpu::prefill_patch_tests::packed_admission_retries_after_retirement_and_preserves_waiter_priority ... ignored, requires packed-prefix assets whose full-context slots exceed available HBM
+test exec::gpu::prefill_patch_tests::packed_segmented_block_matches_serialized ... ignored, GPU Gemma direct-KV block qualification; root-owned launch only
+test exec::gpu::profile_tests::fp8_packed_assets_match_packet_and_reject_bf16_objects ... ignored, CPU asset inspection; set TEST_PACKED_FP8_ASSETS to compiled H100 assets
+test exec::gpu::decode_rung_tests::fp8_kv_ladder_validates_full_and_sliding_cache_geometry ... ok
+test exec::gpu::mixed_step::tests::row_images_reuse_the_same_bounded_storage ... ok
+test exec::gpu::fp8_m1_role::tests::complete_role4_metadata_and_duplicate_rejection ... ok
+test exec::gpu::decode_rung_tests::canonical_splitk_ladder_preserves_shapes_and_rejects_changed_dependency ... ok
+test exec::gpu::fp8_m1_role::tests::reserved_role_section_kind_count_range_and_absence ... ok
+test exec::gpu::decode_context::tests::rejects_tensor_generated_state_or_semantic_mutations ... ok
+test exec::gpu::packed_terminal::tests::compact_tail_refuses_changed_math_and_broken_dependencies ... ok
+test exec::gpu::prefill_patch_tests::no_patch_sites_produce_an_empty_upload_range ... ok
+test exec::gpu::prefill_patch_tests::packed_runtime_tables_are_excluded_from_both_weight_consumers ... ok
+test exec::gpu::prefill_patch_tests::patch_upload_covers_only_the_first_through_last_site ... ok
+test exec::gpu::profile_tests::auxiliary_mixed_object_cannot_win_ordinary_prefill_discovery ... ok
+test exec::gpu::profile_tests::auxiliary_packed_object_cannot_win_ordinary_prefill_discovery ... ok
+test exec::gpu::profile_tests::embedded_mixed_object_is_skipped_for_ordinary_prefill ... ok
+test exec::gpu::profile_tests::preserves_sm120_profile_and_rejects_unknown_arches ... ok
+test exec::gpu::profile_tests::segmented_grid_requires_no_ordinary_prefill_fallback ... ok
+test exec::gpu::profile_tests::selects_native_hopper_for_h100_and_h200 ... ok
+test exec::gpu::qwen_prefill_state_views_select_exact_batch_slots ... ok
+test exec::gpu::qwen_tests::rejects_invalid_gq_window_bounds ... ok
+test exec::gpu::qwen_tests::rejects_mixed_missing_or_split_external_segments ... ok
+test exec::gpu::profile_tests::filesystem_mixed_object_is_skipped_for_ordinary_prefill ... ok
+test exec::gpu::recurrent_tests::active_only_block_uses_lifecycle_without_fake_state ... ok
+test exec::gpu::qwen_tests::rejects_gq_window_labels_and_external_membership ... ok
+test exec::gpu::qwen_tests::rejects_unsupported_bucket_topology ... ok
+test exec::gpu::qwen_tests::rejects_incorrect_geometry_and_operand_extent ... ok
+test exec::gpu::qwen_tests::recognizes_one_isolated_external_segment ... ok
+test exec::gpu::decode_context::tests::prepares_immutable_hash_bound_files_without_cuda ... ok
+test exec::gpu::recurrent_tests::fp8_role_preserves_distinct_window_conventions ... ok
+test exec::gpu::recurrent_tests::invalid_state_or_missing_mask_is_rejected ... ok
+test exec::gpu::recurrent_tests::dense_models_need_no_recurrent_mask ... ok
+test exec::gpu::packed_terminal::tests::terminal_chain_covers_each_slice_and_waits_for_all_producer_slices ... ok
+test exec::gpu::recurrent_tests::fp8_role_rejects_mixed_missing_and_duplicate_work ... ok
+test exec::gpu::recurrent_tests::state_regions_preserve_physical_slots ... ok
+test exec::gpu::prefix_selection_tests::automatic_prefix_selection_requires_compatible_execution_and_valid_kv_layout ... ok
+test exec::gpu::slab_tests::all_empty_tensors_size_to_zero ... ok
+test exec::gpu::slab_tests::carve_cursor_lands_exactly_on_the_sized_total ... ok
+test exec::gpu::token_batch::tests::unified_cuda_aligned_prompts_reuse_prefixes ... ignored, requires H100 packed-prefix assets and natural prompt reference metadata
+test exec::gpu::recurrent_tests::qwen_w8a8_decode_and_prefill_require_separate_capabilities ... ok
+test exec::gpu::seg_gemm::tests::leaves_large_fp8_unmapped_and_fine_packets_on_default ... ok
+test exec::gpu::slab_tests::pad_rounds_up_and_leaves_exact_multiples_alone ... ok
+test exec::gpu::seg_gemm::tests::m64n128_requires_isolated_gemma31_o_down ... ok
+test exec::gpu::seg_gemm::tests::m64n64_requires_isolated_gemma12_o_down_shape ... ok
+test exec::gpu::seg_gemm::tests::mixed_segment_keeps_one_compatible_object_for_all_instructions ... ok
+test exec::gpu::seg_gemm::tests::rejects_duplicate_or_partial_slice_ownership ... ok
+test exec::gpu::seg_gemm::tests::rejects_malformed_queue_windows ... ok
+test exec::gpu::token_batch::tests::unified_cuda_fp8_kv_rows_and_prefixes_match_isolated ... ignored, requires H100 FP8-KV packed-prefix assets and natural prompt reference metadata
+test exec::gpu::token_batch::tests::unified_cuda_rows_match_isolated_suffixes_and_commit_once ... ignored, requires H100 packed-prefix assets and natural prompt reference metadata
+test exec::gpu::recurrent_tests::generic_segment_metadata_roundtrips_without_model_ops ... ok
+test exec::gpu::seg_gemm::tests::selects_complete_mapped_bf16_packet ... ok
+test exec::kv_layout::tests::kv_names_exclude_scales_and_non_kv_state ... ok
+test exec::mixed_program::tests::ordinary_asset_synthesis ... ignored, requires an ordinary dense BF16 model asset
+test exec::mixed_program::tests::sandwich_norm_assets_synthesize_identical_mixed_programs ... ignored, requires paired ordinary PF_GFUSE off/on assets; no GPU
+test exec::mixed_packet::tests::stock_packet_without_metadata_is_ignored ... ok
+test exec::mixed_program::tests::sandwich_norm_split_preserves_operands_and_rounding_boundary ... ok
+test exec::mixed_step_staging::tests::completion_scatter_is_failure_atomic_and_reuses_storage ... ok
+test exec::mixed_packet::tests::auxiliary_parser_enforces_packet_tensor_count ... ok
+test exec::gpu::gemv_role_tests::gemv_role_rejects_larger_rungs_and_prefill_routing ... ok
+test exec::mixed_packet::tests::devblob_adapter_rejects_bad_ranges_and_duplicate_metadata ... ok
+test exec::mixed_step_staging::tests::frontiers_change_only_after_explicit_success_commit ... ok
+test exec::mixed_step_staging::tests::planning_failure_clears_state_without_losing_capacity ... ok
+test exec::mixed_step_staging::tests::pending_submission_cannot_be_overwritten ... ok
+test exec::mixed_packet::tests::devblob_adapter_propagates_capability_reader_errors ... ok
+test exec::mixed_packet::tests::devblob_adapter_ignores_stock_packets_and_selects_exact_variant ... ok
+test exec::mixed_step_staging::tests::stale_frontier_rejects_the_whole_commit ... ok
+test exec::mixed_step_staging::tests::reuses_all_storage_across_successful_steps ... ok
+test exec::mixed_packet::tests::binds_exact_variant_and_selects_without_revalidation ... ok
+test exec::mixed_step_staging::tests::token::commit_publishes_every_frontier_or_none ... ok
+test exec::mixed_step_staging::tests::token::a_recycled_slot_is_refused_and_no_frontier_moves ... ok
+test exec::mixed_packet::tests::metadata_and_exact_payload_sections_are_unique_and_typed ... ok
+test exec::mixed_packet::tests::payload_identity_includes_kind_when_section_names_match ... ok
+test exec::mixed_step_staging::tests::token::delivery_maps_compact_ids_to_their_logical_requests ... ok
+test exec::mixed_step_staging::tests::token::a_discarded_submission_publishes_nothing ... ok
+test exec::mixed_packet::tests::selected_backend_requires_one_declared_object ... ok
+test exec::mixed_packet::tests::digest_capability_and_grid_are_bound_to_actual_payloads ... ok
+test exec::tp::tests::prefill_scales_with_the_chunk_and_doubles_the_gates ... ok
+test exec::mixed_step_staging::tests::token::the_filler_writes_the_whole_compiled_extent ... ok
+test exec::mixed_packet::tests::shared_payloads_are_bound_once_across_variants ... ok
+test exec::tp::tests::twelve_b_decode_peer_footprint_stays_tiny ... ok
+test exec::tp::tests::unaligned_widths_are_rejected_not_rounded ... ok
+test exec::tp::tests::tagged_slot_matches_dev_isa ... ok
+test exec::gpu::mxfp4_moe_role_tests::mxfp4_moe_role_accepts_only_complete_m1_projection_segments ... ok
+test exec::gpu::gemv_role_tests::gemv_role_rejects_unsafe_geometry_and_counter_windows ... ok
+test exec::cpu::engine::allocation_tests::tensor_allocation_checks_overflow_and_zeroes_padding ... ok
+test exec::kv_layout::tests::ring_windows_cover_the_latest_rows_in_order ... ok
+test exec::amd::prefix::tests::emitted_gemma_bf16_and_fp8_kv_keep_window_sized_snapshots_and_all_rungs ... ok
+
+test result: ok. 326 passed; 0 failed; 25 ignored; 0 measured; 361 filtered out; finished in 0.51s

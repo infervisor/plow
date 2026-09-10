@@ -10,6 +10,8 @@ struct EmitArgsForTest {
 #[test]
 fn packet_capabilities_are_explicit() {
     for model_type in [
+        "gemma3",
+        "gemma3_text",
         "gemma4",
         "gemma4_text",
         "gemma4_unified",
@@ -20,7 +22,7 @@ fn packet_capabilities_are_explicit() {
         let capabilities = emit_capabilities(model_type);
         assert!(capabilities.dense_packet_contracts);
         assert!(capabilities.decode_objects);
-        assert_eq!(capabilities.cublaslt_decode, model_type.starts_with("gemma4"));
+        assert_eq!(capabilities.cublaslt_decode, model_type.starts_with("gemma"));
         assert!(capabilities.decode_ladder);
     }
     let qwen = emit_capabilities("qwen3_5");
@@ -40,23 +42,25 @@ fn packet_capabilities_are_explicit() {
 
 #[test]
 fn production_defaults_are_capability_and_target_driven() {
-    let mut cfg = EmitArgsForTest::try_parse_from(["test"]).unwrap().emit;
-    apply_production_defaults(&mut cfg, emit_capabilities("gemma4"), "sm_90a", 1);
-    assert_eq!(cfg.decode_rungs(), [1, 2, 4, 8, 16]);
-    assert!(cfg.decode_ladder_default);
-    assert!(cfg.packed_prefill_on());
+    for model_type in ["gemma3", "gemma3_text", "gemma4"] {
+        let mut cfg = EmitArgsForTest::try_parse_from(["test"]).unwrap().emit;
+        apply_production_defaults(&mut cfg, emit_capabilities(model_type), "sm_90a", 1);
+        assert_eq!(cfg.decode_rungs(), [1, 2, 4, 8, 16]);
+        assert!(cfg.decode_ladder_default);
+        assert!(cfg.packed_prefill_on());
 
-    let mut disabled = EmitArgsForTest::try_parse_from([
-        "test",
-        "--emit-decode-batch-ladder=1",
-        "--emit-packed-prefill=false",
-    ])
-    .unwrap()
-    .emit;
-    apply_production_defaults(&mut disabled, emit_capabilities("gemma4"), "sm_90a", 1);
-    assert_eq!(disabled.decode_rungs(), [1]);
-    assert!(!disabled.decode_ladder_default);
-    assert!(!disabled.packed_prefill_on());
+        let mut disabled = EmitArgsForTest::try_parse_from([
+            "test",
+            "--emit-decode-batch-ladder=1",
+            "--emit-packed-prefill=false",
+        ])
+        .unwrap()
+        .emit;
+        apply_production_defaults(&mut disabled, emit_capabilities(model_type), "sm_90a", 1);
+        assert_eq!(disabled.decode_rungs(), [1]);
+        assert!(!disabled.decode_ladder_default);
+        assert!(!disabled.packed_prefill_on());
+    }
 
     let mut unsupported = EmitArgsForTest::try_parse_from(["test"]).unwrap().emit;
     apply_production_defaults(&mut unsupported, emit_capabilities("qwen3_5"), "sm_90a", 1);
@@ -133,10 +137,12 @@ fn cublaslt_emission_rejects_unloadable_combinations() {
     assert!(!cublaslt_emit_supported(qwen, "gfx950", 1, false));
     assert!(!cublaslt_emit_supported(qwen, "sm_90a", 2, false));
     assert!(!cublaslt_emit_supported(qwen, "sm_90a", 1, true));
-    assert!(cublaslt_emit_supported(
-        emit_capabilities("gemma4"),
-        "sm_90a",
-        1,
-        false,
-    ));
+    for model_type in ["gemma3", "gemma3_text", "gemma4"] {
+        assert!(cublaslt_emit_supported(
+            emit_capabilities(model_type),
+            "sm_90a",
+            1,
+            false,
+        ));
+    }
 }

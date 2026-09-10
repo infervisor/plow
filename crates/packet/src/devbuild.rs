@@ -2043,18 +2043,19 @@ impl Builder {
         // "fp8" = ONLY TMA-mapped fp8 GEMMs are class-8 (pairs with the ws-entry object,
         // whose sole arm is the warp-specialized w8a8 body — a bf16 or mapless packet
         // landing there would __trap()).
+        // "w8a16" adds validated mapless W8A16 GEMMs and requires the matching object ABI.
         let pure_env = std::env::var("PLOW_SEG_PURE_GEMM").ok();
         let pure_mode = match pure_env.as_deref() {
             Some("1") => 1u8,
             Some("fp8") => 2u8,
+            Some("w8a16") => 3u8,
             _ => 0u8,
         };
-        let pure_gemm = !uniseg
-            && pure_mode != 0
-            && self.ops.iter().any(|o| {
-                o.inst.op == DevOp::FlashPrefill as u16
-                    || o.inst.op == DevOp::FlashPrefillFp8 as u16
-            });
+        let has_flash_prefill = self.ops.iter().any(|o| {
+            o.inst.op == DevOp::FlashPrefill as u16
+                || o.inst.op == DevOp::FlashPrefillFp8 as u16
+        });
+        let pure_gemm = !uniseg && pure_mode != 0 && has_flash_prefill;
         // PLOW_SEG_FA512=1 (T12): hd512 (full-attention) FlashPrefill packets get their OWN
         // class (2) so the host can launch them on the dedicated *_pffa flash object. hd is
         // carried in inst.i[6]. Requires the serve-side mirror PLOW_PF_SEG_FA512=1.
@@ -2195,11 +2196,12 @@ impl Builder {
                 let fp8 = FP8_OPS.iter().any(|g| *g as u16 == op);
                 let bf16 = BF16_OPS.iter().any(|g| *g as u16 == op);
                 let mapped = self.ops[i].inst.i[6] != 0 && self.ops[i].inst.i[7] != 0;
-                // T37 GENERALITY: BOTH modes require the TMA maps — the ws384/uni256 lean
+                // T37 GENERALITY: modes 1/fp8 require the TMA maps — the ws384/uni256 lean
                 // objects trap on a mapless class-8 packet, and another model/emitter may
                 // legitimately skip a mint. Unmapped GEMMs go to the fat object's cp.async
                 // fallback instead (correct, just slower).
                 let claimed = match pure_mode {
+                    3 => (bf16 && mapped) || self.ops[i].inst.pack().is_mapless_w8a16_gemm(),
                     // T24: mapped bf16 GEMMs (lm_head) also class 8 — the uni256 lean object
                     // carries both precisions' n256 bodies, and the fat 128-reg object runs
                     // the bf16 tile spilled (measured 4.45 ms on the lm_head segment).
@@ -2369,7 +2371,8 @@ impl Builder {
             Some("light") => 2u8,
             _ => 0u8,
         };
-        let seg_class_slice = !uniseg && slice_mode != 0;
+        // Decode runs one persistent grid; prefill occupancy must not change its slices.
+        let seg_class_slice = !uniseg && slice_mode != 0 && has_flash_prefill;
         // PLOW_SEG_SLICE_ALL=1 (T14): also double the machine-filling FLASH-class (light) ops
         // — the FATLITE object runs them at occ-2, so both resident blocks need slices.
         // Class-2 (dedicated flash) ops keep n_cu: the FA object is occ-1.
@@ -4401,6 +4404,15 @@ mod l2_placement_tests {
 #[cfg(test)]
 mod granularity_tests {
     use super::*;
+
+    #[test]
+    fn prefill_slice_option_preserves_decode_work() {
+        let mut b = Builder::new(4);
+        let p = b.emit(DevOp::Gemv, vec![0, 1, 2, 3], &[], |_| {});
+        b.emit(DevOp::Gemv, vec![0, 1, 2, 3], &[p], |_| {});
+        let p = b.finish();
+        assert!(p.insts.iter().all(|inst| inst.blocks == 4));
+    }
 
     /// Build `producer -> consumer` with a fine dep, and report how many fine edges survive
     /// `select_granularity`. `work` is the consumer's per-slice cost.

@@ -2365,7 +2365,7 @@ fn declare(
             }
         };
         let keqv = full && c.k_eq_v;
-        let gemma = c.arch == Arch::Gemma4;
+        let gemma = c.arch.is_gemma();
         // MoE fused expert weights: declared so the loader binds them by name and the harness
         // derives per-expert ewt bases from their device addresses. Not referenced as op operands
         // (the SM indexes them through the ewt pointer table), so the handles are discarded here.
@@ -3976,7 +3976,7 @@ fn emit_phase(
     // Qwen/Llama PRE-NORM decode fuses each (residual add, RMSNorm) pair into ONE AddNorm packet
     // (see the AddNorm emits in the loop). Deletes 72 packets/token and, more importantly, 72
     // global gates off the critical path — decode here is fixed per-gate tax, not weight streaming.
-    let fuse_norm = c.arch != Arch::Gemma4 && gemv_family;
+    let fuse_norm = !c.arch.is_gemma() && gemv_family;
     // Gemma SANDWICH decode fuses each (NormResidual, following RMSNorm) pair into ONE
     // NormResidualNorm packet (Experiment N1) — the narrow→narrow successor to AddNorm. Same two
     // sites as fuse_norm (post-attn→pre-ffn, and end-of-layer→next input norm), but the residual is
@@ -3986,7 +3986,7 @@ fn emit_phase(
     // norm" rationale addressed serialization, but the GH200 per-op trace showed the real
     // cost is the extra HBM round trip + packet per pair, which holds at any T (norms ~9%
     // of a 4k chunk). Opt-in until token-gated on hardware.
-    let gfuse = c.arch == Arch::Gemma4 && (gemv_family || emit_config::active().pf_gfuse);
+    let gfuse = c.arch.is_gemma() && (gemv_family || emit_config::active().pf_gfuse);
     // NRN2 -> q/k/v FOLD (Experiment N2, the item "norm fusion capped at 0.43 ms by t[8]"):
     // delete the END-OF-LAYER NormResidualNorm packet by computing it inside the NEXT layer's
     // q/k/v GemvFp8 staging (op 30 i3; gemv_nrn_lds in op_gemm.h — bit-exact replication of
@@ -4641,7 +4641,7 @@ fn emit_phase(
             // read — require the split3 emission the fold was designed against.
             && fp8
             && !fuse_qkv_fp8
-            && c.arch == Arch::Gemma4
+            && c.arch.is_gemma()
             && qk_skip == 0
             && v_skip == 0
             && c.attn_scale == 1.0
@@ -5103,7 +5103,7 @@ fn emit_phase(
         //   Llama/Qwen PRE-NORM: x = x + o (plain); then hn = post_attention_layernorm(x).
         // Gemma applies its post-attn norm to the ATTENTION OUTPUT before the add; Llama/Qwen add
         // the raw output and normalize the residual stream going INTO the MLP.
-        let gemma = c.arch == Arch::Gemma4;
+        let gemma = c.arch.is_gemma();
         // Pre-MLP norm. Gemma: sandwich (NormResidual) then a separate pre-FF norm. Qwen/Llama
         // decode: x += o, then post_attention_layernorm(x) — fused into ONE AddNorm. Qwen/Llama
         // prefill keeps the split (T rows already parallelise the norm; a parallel agent owns it).
@@ -6695,7 +6695,7 @@ impl<'a> DenseGqaEmitter<'a> {
             // emission until the fold is measured there and a marker check lands.
             && amd_target::active().1 == hwspec::IsaLevel::Gfx942
             && fp8
-            && c.arch == Arch::Gemma4
+            && c.arch.is_gemma()
             && !c.moe
             && !emit_config::active().no_fuse_nrn
             && !emit_config::active().fuse_qkv_fp8;
@@ -6705,7 +6705,7 @@ impl<'a> DenseGqaEmitter<'a> {
         let merge_fold = amd
             && amd_target::active().1 == hwspec::IsaLevel::Gfx942
             && fp8
-            && c.arch == Arch::Gemma4
+            && c.arch.is_gemma()
             && !c.moe
             && emit_config::active().fuse_hnr
             && emit_config::active().fuse_merge;
@@ -6906,18 +6906,20 @@ struct EmitCapabilities {
 }
 
 fn emit_capabilities(model_type: &str) -> EmitCapabilities {
-    let dense = matches!(
+    let gemma = matches!(
         model_type,
-        "gemma4" | "gemma4_text" | "gemma4_unified" | "gemma4_unified_text" | "llama" | "qwen3"
+        "gemma3"
+            | "gemma3_text"
+            | "gemma4"
+            | "gemma4_text"
+            | "gemma4_unified"
+            | "gemma4_unified_text"
     );
+    let dense = gemma || matches!(model_type, "llama" | "qwen3");
     EmitCapabilities {
         dense_packet_contracts: dense,
         decode_objects: dense || model_type == "qwen3_5",
-        cublaslt_decode: model_type == "qwen3_5"
-            || matches!(
-                model_type,
-                "gemma4" | "gemma4_text" | "gemma4_unified" | "gemma4_unified_text"
-            ),
+        cublaslt_decode: gemma || model_type == "qwen3_5",
         decode_ladder: dense || model_type == "gpt_oss",
     }
 }
@@ -8016,6 +8018,9 @@ fn emit_dense_gqa(
         set_amd_target_for(&arch, &gpu);
     }
     let mut c = cfg_from(&dir);
+    if c.arch == Arch::Gemma3 {
+        assert_eq!(arch, "sm_90a", "Gemma 3 norm-offset objects currently require sm_90a");
+    }
     assert!(tp >= 1, "--tp must be >= 1");
     c.tp = tp;
     // Resolve the block range now that layer count is known. `l` -> l..l+1;
@@ -8471,6 +8476,23 @@ fn emit_dense_gqa(
         prog_t: tlist,
         gen,
     };
+
+    if c.arch == Arch::Gemma3 {
+        for inst in m.progs.iter_mut().flat_map(|p| &mut p.insts) {
+            if matches!(
+                DevOp::from_u16(inst.op),
+                Some(
+                    DevOp::RmsNorm
+                        | DevOp::HeadNormRope
+                        | DevOp::HeadNormRopeFp8
+                        | DevOp::NormResidual
+                        | DevOp::NormResidualNorm
+                )
+            ) {
+                inst.i[7] = 1;
+            }
+        }
+    }
 
     let projection_bindings =
         projection_rewrite::apply(&mut m, &ecfg, &gpu, &arch, std::path::Path::new(&out))

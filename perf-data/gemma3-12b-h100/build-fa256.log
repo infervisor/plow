@@ -1,0 +1,46 @@
+runtime/nvidia/op_moe.cuh(1282): warning #177-D: label "down_scalar" was declared but never referenced
+  down_scalar:
+  ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+runtime/nvidia/op_attention.cuh(1917): warning #177-D: variable "Kb8" was declared but never referenced
+          const unsigned char* Kb8 = (const unsigned char*)K + (size_t)hkv * kv_stride * HD;
+                               ^
+          detected during:
+            instantiation of "void d_flash_prefill<HD,BQ,BKV>(float *, float *, const __nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *, __nv_bfloat16 *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, float, unsigned int, unsigned int, float *, const int *, const void *) [with HD=512, BQ=32, BKV=16]" at line 3715
+            instantiation of "void d_flash_prefill_mux<HD,BQ,BKV>(const int *, float *, float *, const __nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *, __nv_bfloat16 *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, float, unsigned int, unsigned int, float *, const void *) [with HD=512, BQ=32, BKV=16]" at line 1426 of runtime/nvidia/interp_sm120.cu
+
+runtime/nvidia/op_attention.cuh(1918): warning #177-D: variable "Vb8" was declared but never referenced
+          const unsigned char* Vb8 = (const unsigned char*)V + (size_t)hkv * kv_stride * HD;
+                               ^
+          detected during:
+            instantiation of "void d_flash_prefill<HD,BQ,BKV>(float *, float *, const __nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *, __nv_bfloat16 *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, float, unsigned int, unsigned int, float *, const int *, const void *) [with HD=512, BQ=32, BKV=16]" at line 3715
+            instantiation of "void d_flash_prefill_mux<HD,BQ,BKV>(const int *, float *, float *, const __nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *, __nv_bfloat16 *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, float, unsigned int, unsigned int, float *, const void *) [with HD=512, BQ=32, BKV=16]" at line 1426 of runtime/nvidia/interp_sm120.cu
+
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 8884 by compiler to allow use of registers in GMMA in function '_Z17interp_sm90a_pffa11PlowProgram'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 8893 by compiler to allow use of registers in GMMA in function '_Z17interp_sm90a_pffa11PlowProgram'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 9579 by compiler to allow use of registers in GMMA in function '_Z17interp_sm90a_pffa11PlowProgram'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 9617 by compiler to allow use of registers in GMMA in function '_Z17interp_sm90a_pffa11PlowProgram'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 9628 by compiler to allow use of registers in GMMA in function '_Z17interp_sm90a_pffa11PlowProgram'
+ptxas info    : 76 bytes gmem
+ptxas info    : Compiling entry function '_Z17interp_sm90a_pffa11PlowProgram' for 'sm_90a'
+ptxas info    : Function properties for _Z17interp_sm90a_pffa11PlowProgram
+    16 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 240 registers, used 1 barriers, 16 bytes cumulative stack size, 32 bytes smem
+ptxas info    : Compile time = 688.225 ms
+ptxas info    : Compiling entry function '_Z25plow_moe_slot_glu_fp8_blkP13__nv_bfloat16PKS_PKhPKyS6_jjjjj' for 'sm_90a'
+ptxas info    : Function properties for _Z25plow_moe_slot_glu_fp8_blkP13__nv_bfloat16PKS_PKhPKyS6_jjjjj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 0 barriers
+ptxas info    : Compile time = 11.567 ms
+ptxas info    : Compiling entry function '_Z27plow_moe_group_down_fp8_blkPfPK13__nv_bfloat16PKhPKyS6_jjjj' for 'sm_90a'
+ptxas info    : Function properties for _Z27plow_moe_group_down_fp8_blkPfPK13__nv_bfloat16PKhPKyS6_jjjj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 46 registers, used 0 barriers
+ptxas info    : Compile time = 8.245 ms
+ptxas info    : Compiling entry function '_Z26plow_moe_group_glu_fp8_blkP13__nv_bfloat16PKS_PKhPKyS6_jjjjjj' for 'sm_90a'
+ptxas info    : Function properties for _Z26plow_moe_group_glu_fp8_blkP13__nv_bfloat16PKS_PKhPKyS6_jjjjjj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 48 registers, used 0 barriers
+ptxas info    : Compile time = 12.122 ms

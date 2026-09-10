@@ -2388,6 +2388,49 @@ pub struct DevInst64 {
     pub i: [u32; 8],
 }
 
+impl DevInst64 {
+    pub fn is_mapless_w8a16_gemm(&self) -> bool {
+        [DevOp::GemmFp8, DevOp::GemmMedFp8, DevOp::GemmSmallFp8]
+            .iter()
+            .any(|op| self.op == *op as u16)
+            && self.t[..3].iter().all(|&t| t != TENSOR_NONE16)
+            && self.t[3] == TENSOR_NONE16
+            && self.t[4] != TENSOR_NONE16
+            && self.i[0] > 0
+            && self.i[1] > 0
+            && self.i[2] > 0
+            && self.i[2] % 8 == 0
+            && self.i[6] == 0
+            && self.i[7] == 0
+    }
+}
+
+#[cfg(test)]
+mod w8a16_tests {
+    use super::*;
+
+    #[test]
+    fn mapless_w8a16_requires_bf16_activation_and_channel_scale() {
+        let mut inst = DevInst64::default();
+        inst.op = DevOp::GemmFp8 as u16;
+        inst.t = [0, 1, 2, TENSOR_NONE16, 3, TENSOR_NONE16, TENSOR_NONE16, TENSOR_NONE16];
+        inst.i = [128, 2048, 3840, 0, 0, 0, 0, 0];
+        assert!(inst.is_mapless_w8a16_gemm());
+        for (slot, value) in [(3, 4), (4, TENSOR_NONE16), (1, TENSOR_NONE16)] {
+            let mut invalid = inst;
+            invalid.t[slot] = value;
+            assert!(!invalid.is_mapless_w8a16_gemm());
+        }
+        for (slot, value) in [(0, 0), (1, 0), (2, 0), (2, 3850), (6, 4), (7, 5)] {
+            let mut invalid = inst;
+            invalid.i[slot] = value;
+            assert!(!invalid.is_mapless_w8a16_gemm());
+        }
+        inst.op = DevOp::Gemm as u16;
+        assert!(!inst.is_mapless_w8a16_gemm());
+    }
+}
+
 impl DevInst {
     /// Pack to the 64-byte wire format. Panics on a tensor handle that overflows
     /// the u16 wire slot or an op that populates both members of the `fj[1]`

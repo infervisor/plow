@@ -1,0 +1,32 @@
+   Compiling plowrt v0.1.0 (/home/lava/plow/crates/plowrt)
+warning: use of deprecated associated function `minijinja::Environment::<'source>::new`: Attempted to instantiate an environment with serde.  Future versions of MiniJinja will require enabling the 'serde' feature to use serde types.  To silence this warning add 'serde' to the list of features of minijinja.
+  --> crates/plowrt/src/serve/template.rs:95:36
+   |
+95 |         let mut env = Environment::new();
+   |                                    ^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+warning: variable does not need to be mutable
+   --> crates/plowrt/src/exec/gpu/prefix.rs:400:13
+    |
+400 |         let mut blit = |dev: u64, snap: u64, bytes: u64| -> Result<()> {
+    |             ----^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `api` is never read
+   --> crates/plowrt/src/device/cuda.rs:344:5
+    |
+342 | pub struct GraphExec {
+    |            --------- field in this struct
+343 |     exec: CUgraphExec,
+344 |     api: *const c_void, // not used for drop safety; freed via CudaBack...
+    |     ^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `plowrt` (lib) generated 3 warnings (run `cargo fix --lib -p plowrt` to apply 1 suggestion)
+    Finished `release` profile [optimized] target(s) in 3m 03s

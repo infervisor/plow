@@ -45,6 +45,7 @@
 #define PLOW_OP_GEMM_SM90_CUH
 
 #include "sm90_wgmma.cuh"
+#include <type_traits>
 
 #ifndef PLOW_NV_FP8_PF_SCALE_WFIRST
 #define PLOW_NV_FP8_PF_SCALE_WFIRST 0
@@ -167,15 +168,42 @@ __device__ __forceinline__ void pgm90_stage_fp8(uint8_t* dst, const uint8_t* __r
     }
 }
 
+#if defined(PLOW_NV_W8A16_WGMMA) && PLOW_NV_W8A16_WGMMA
+__device__ __forceinline__ void pgm90_stage_bf16(__nv_bfloat16* dst,
+                                                 const uint8_t* __restrict__ src, int tid,
+                                                 int rows, int row0, int kbase, int R, int K) {
+    for (int L = tid; L < rows * PGM90_CH; L += (int)PLOW_NV_THREADS) {
+        const int row = L / PGM90_CH, c = L % PGM90_CH;
+        const int gr = row0 + row, gk = kbase + c * 8;
+        uint2 packed = {0, 0};
+        if (gr < R && gk + 8 <= K)
+            packed = *(const uint2*)(src + (size_t)gr * K + gk);
+        const uint16_t* w = (const uint16_t*)&packed;
+        alignas(16) __nv_bfloat16 values[8];
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            __half2_raw h = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)w[j], __NV_E4M3);
+            float2 v = __half22float2(*reinterpret_cast<__half2*>(&h));
+            values[2 * j] = __float2bfloat16(v.x);
+            values[2 * j + 1] = __float2bfloat16(v.y);
+        }
+        *(uint4*)(dst + sm90_swz_off<PGM90_BK, 8>(row, c)) = *(const uint4*)values;
+    }
+    // Generic shared stores must be visible to WGMMA's async proxy.
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+}
+#endif
+
 /* ================================ bf16 plain GEMM =========================================== */
 /* C[m,n] = A[m,k] . B[n,k]^T. Drop-in for d_gemm. */
-template <bool BIAS = false>
+template <bool BIAS = false, class Weight = __nv_bfloat16>
 static __device__ void d_gemm_sm90_impl(__nv_bfloat16* __restrict__ C,
                                    const __nv_bfloat16* __restrict__ A,
-                                   const __nv_bfloat16* __restrict__ B, unsigned m, unsigned n,
+                                   const Weight* __restrict__ B, unsigned m, unsigned n,
                                    unsigned k, unsigned a_row0, unsigned slice, unsigned nblk,
                                    __nv_bfloat16* arena,
-                                   const __nv_bfloat16* __restrict__ bias = nullptr) {
+                                   const __nv_bfloat16* __restrict__ bias = nullptr,
+                                   const float* __restrict__ scale = nullptr) {
     if (sm90_bad_k(k, 8u)) return; /* swizzle staging needs K%8==0, k>0 (bf16 chunk = 8 elems) */
     __nv_bfloat16* base = (__nv_bfloat16*)sm90_align1024(arena);
     __nv_bfloat16* As = base;                                /* [STAGES][128][64] swizzled */
@@ -250,6 +278,7 @@ static __device__ void d_gemm_sm90_impl(__nv_bfloat16* __restrict__ C,
                     const int cc = c0 + 8 * g + lo;
                     if (cc < (int)n) {
                         float v = acc[4 * g + 2 * hi + lo];
+                        if constexpr (std::is_same_v<Weight, uint8_t>) v *= scale[cc];
                         if constexpr (BIAS) v += __bfloat162float(bias[cc]);
                         C[(size_t)rr * n + cc] = __float2bfloat16(v);
                     }

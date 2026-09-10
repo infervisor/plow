@@ -25,6 +25,9 @@
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum RopeScale {
     None,
+    Linear {
+        factor: f64,
+    },
     Llama3 {
         factor: f64,
         low: f64,
@@ -123,6 +126,7 @@ fn inv_freq(j: usize, hd: u32, theta: f64, scale: RopeScale) -> f64 {
     let inv = 1.0 / theta.powf(2.0 * j as f64 / hd as f64);
     match scale.freq_form() {
         RopeScale::None => inv,
+        RopeScale::Linear { factor } => inv / factor,
         RopeScale::Llama3 {
             factor,
             low,
@@ -273,6 +277,7 @@ pub const ROPE_SCALE_YARN: u32 = 2;
 /// on purpose: a reader that predates it falls into `GenTensor::generate`'s refuse arm rather
 /// than materialising the generic-YaRN table for a DeepSeek/Kimi checkpoint.
 pub const ROPE_SCALE_YARN_DS: u32 = 3;
+pub const ROPE_SCALE_LINEAR: u32 = 4;
 
 /// A recipe for one tensor the runtime materialises at bind time instead of
 /// reading from the blob's init section. Mirrors `PlowGenTensor` in
@@ -337,6 +342,11 @@ impl GenTensor {
             return Some(vec![0u8; 256]);
         }
         let scale = match self.scale {
+            ROPE_SCALE_LINEAR if self.factor.is_finite() && self.factor > 0.0 => {
+                RopeScale::Linear {
+                    factor: self.factor,
+                }
+            }
             ROPE_SCALE_LLAMA3 => RopeScale::Llama3 {
                 factor: self.factor,
                 low: self.low,
@@ -381,6 +391,13 @@ impl GenTensor {
     pub fn rope_pair(ctx: u32, hd: u32, theta: f64, frac: f64, scale: RopeScale) -> [GenTensor; 2] {
         let (skind, factor, low, high, orig, aux) = match scale {
             RopeScale::None => (ROPE_SCALE_NONE, 0.0, 0.0, 0.0, 0.0, 0),
+            RopeScale::Linear { factor } => {
+                assert!(
+                    factor.is_finite() && factor > 0.0,
+                    "invalid linear RoPE factor"
+                );
+                (ROPE_SCALE_LINEAR, factor, 0.0, 0.0, 0.0, 0)
+            }
             RopeScale::Llama3 {
                 factor,
                 low,
@@ -521,6 +538,36 @@ impl GenTensor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn linear_scaling_matches_fractional_positions_and_recipe() {
+        let factor = 8.0;
+        let hd = 256;
+        let theta = 1_000_000.0;
+        let scale = RopeScale::Linear { factor };
+        let (cos, sin) = rope_tables(1025, hd, theta, 1.0, scale);
+        for pos in [0, 1, 7, 8, 1024] {
+            for j in [0, 1, 63, 127] {
+                let angle = (pos as f64 / factor) / theta.powf(2.0 * j as f64 / hd as f64);
+                let offset = (pos * (hd as usize / 2) + j) * 4;
+                assert_eq!(
+                    &cos[offset..offset + 4],
+                    &(angle.cos() as f32).to_le_bytes()
+                );
+                assert_eq!(
+                    &sin[offset..offset + 4],
+                    &(angle.sin() as f32).to_le_bytes()
+                );
+            }
+        }
+        let [gc, gs] = GenTensor::rope_pair(1025, hd, theta, 1.0, scale);
+        assert_eq!(gc.scale, ROPE_SCALE_LINEAR);
+        assert_eq!(gc.generate().unwrap(), cos);
+        assert_eq!(gs.generate().unwrap(), sin);
+        for factor in [0.0, -1.0, f64::INFINITY, f64::NAN] {
+            assert!(GenTensor { factor, ..gc }.generate().is_none());
+        }
+    }
 
     /// A recipe must reproduce `rope_tables` byte-for-byte — that equality is the
     /// entire safety argument for not shipping the expanded table.

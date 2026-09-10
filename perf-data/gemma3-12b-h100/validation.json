@@ -1,0 +1,49 @@
+{
+  "request_checks": [
+    {
+      "run": "baseline-bf16",
+      "validated_requests": 15,
+      "exact_tokens": true,
+      "prefix_cache_hits": 0
+    },
+    {
+      "run": "baseline-fp8",
+      "validated_requests": 15,
+      "exact_tokens": true,
+      "prefix_cache_hits": 0
+    },
+    {
+      "run": "candidate-bf16-pure-fixed-graph",
+      "validated_requests": 15,
+      "exact_tokens": true,
+      "prefix_cache_hits": 0
+    },
+    {
+      "run": "candidate-fp8-w8a16-pure-fixed-graph",
+      "validated_requests": 15,
+      "exact_tokens": true,
+      "prefix_cache_hits": 0
+    }
+  ],
+  "decode_object_identical": true,
+  "exec_tests": {
+    "passed": 325,
+    "ignored": 25
+  },
+  "backend_all_target_check": [
+    "cpu",
+    "hsa",
+    "cuda"
+  ],
+  "known_upstream_test_failures": [
+    "packet::slots::tests::table_matches_doc_comments",
+    "devgen::emit_config::tests::no_raw_env_reads"
+  ],
+  "wrong_norm_object_rejected": true,
+  "queued_c4_validated_requests": 48,
+  "long_prompt_tokens": 5909,
+  "long_smoke": {
+    "bf16": "LEMON-482",
+    "fp8_w8a16": "LEMON-482"
+  }
+}

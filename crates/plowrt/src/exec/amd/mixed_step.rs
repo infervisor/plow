@@ -21,14 +21,14 @@ impl StepRoute {
     fn object(self) -> &'static str {
         match self {
             StepRoute::Mixed => "interp_mixed_gq.elf",
-            StepRoute::TokenBatch => super::amd_token_batch::TOKEN_BATCH_OBJECT,
+            StepRoute::TokenBatch => super::token_batch::TOKEN_BATCH_OBJECT,
         }
     }
 
     fn kernel(self, arch: &str) -> String {
         match self {
             StepRoute::Mixed => format!("plow_interp_mixed_{arch}_gq"),
-            StepRoute::TokenBatch => super::amd_token_batch::token_batch_kernel_symbol(arch),
+            StepRoute::TokenBatch => super::token_batch::token_batch_kernel_symbol(arch),
         }
     }
 
@@ -138,7 +138,7 @@ impl MixedAmdStep {
                     .iter()
                     .filter(|i| i.op == DevOp::FlashPrefill as u16)
                     .all(|i| {
-                        super::amd_token_batch::admit_token_batch(
+                        super::token_batch::admit_token_batch(
                             0,
                             i.i[7],
                             i.t[5] != packet::dev::TENSOR_NONE16,
@@ -148,7 +148,7 @@ impl MixedAmdStep {
             });
             if synthesized.programs.is_empty() {
                 return Err(RuntimeError::Rejected(
-                    super::amd_token_batch::TokenBatchRefusal::NoLegalBucket.to_string(),
+                    super::token_batch::TokenBatchRefusal::NoLegalBucket.to_string(),
                 ));
             }
         }
@@ -631,7 +631,7 @@ impl AmdEngine {
                 )));
             }
             if token_batch {
-                crate::exec::amd_packed::validate_token_batch_rows(
+                crate::exec::amd::packed::validate_token_batch_rows(
                     program.program_index,
                     rows,
                     self.batch,
@@ -641,7 +641,7 @@ impl AmdEngine {
                 )
                 .map_err(RuntimeError::Rejected)?;
             } else {
-                crate::exec::amd_packed::validate_rows(
+                crate::exec::amd::packed::validate_rows(
                     program.program_index,
                     plan.decode_rows,
                     rows,

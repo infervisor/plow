@@ -613,10 +613,12 @@ impl DevProg {
         // at serve time, the emit one at plowc time.
         // Must match the emit-side classing in devbuild.rs: "1" = every plain tiled GEMM,
         // "fp8" = only TMA-mapped fp8 GEMMs (the ws-entry object's sole arm).
+        // "w8a16" pairs mapless W8A16 plus mapped BF16 with a capability-checked object.
         let rt = crate::config::RuntimeConfig::get();
         let pure_mode = match rt.nv.pf_seg_pure.as_deref() {
             Some("1") => 1u8,
             Some("fp8") => 2u8,
+            Some("w8a16") => 3u8,
             _ => 0u8,
         };
         use packet::dev::DevOp;
@@ -666,6 +668,12 @@ impl DevProg {
                 continue;
             }
             let flashy = match pure_mode {
+                3 => {
+                    !(inst.is_mapless_w8a16_gemm()
+                        || (BF16_OPS.iter().any(|g| *g as u16 == op)
+                            && inst.i[6] != 0
+                            && inst.i[7] != 0))
+                }
                 1 => {
                     // T37 mirror: maps required in mode 1 too (see devbuild.rs).
                     !((FP8_OPS.iter().any(|g| *g as u16 == op)

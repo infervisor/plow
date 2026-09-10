@@ -103,7 +103,6 @@ pub(super) fn validate_fp8_role_checkpoint(
 }
 
 #[cfg(test)]
-#[path = "gpu_fp8_m1_role_tests.rs"]
 mod tests;
 
 fn checkpoint_fields(

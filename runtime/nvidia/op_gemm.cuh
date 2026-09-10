@@ -1193,6 +1193,12 @@ static __device__ void d_gemm_fp8(__nv_bfloat16* __restrict__ C, const __nv_bflo
                        const uint8_t* __restrict__ B, const float* __restrict__ scale, unsigned m,
                        unsigned n, unsigned k, unsigned a_row0, unsigned slice, unsigned nblk,
                        __nv_bfloat16* arena) {
+#if defined(PLOW_NV_HOPPER) && defined(PLOW_NV_W8A16_WGMMA) && PLOW_NV_W8A16_WGMMA
+    if (k != 0 && k % 8 == 0) {
+        d_gemm_sm90_impl<false>(C, A, B, m, n, k, a_row0, slice, nblk, arena, nullptr, scale);
+        return;
+    }
+#endif
     __nv_bfloat16* As = arena;                                 /* [STAGES][BM][ASTRIDE] bf16 */
     uint8_t* Bs8 = (uint8_t*)(As + PGM_STAGES * PGM_ABUF);     /* [STAGES][BN][BK] e4m3 ring */
     __nv_bfloat16* Bbf = (__nv_bfloat16*)(((size_t)(Bs8 + PGM_STAGES * PGM_B8BUF) + 15) & ~(size_t)15);

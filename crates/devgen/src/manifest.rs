@@ -1002,6 +1002,9 @@ fn backend_nvcc(f: &Map<String, Value>, t: &Map<String, Value>, s: &Shapes) -> V
     // hd256/512). A Qwen-only (hd=128) packet must NOT carry this flag — the
     // Gemma build drops the hd=128 arm entirely.
     let mut req = Vec::new();
+    if on("norm_weight_offset") {
+        req.push("PLOW_NV_GEMMA3=1".into());
+    }
     if s.hd.iter().any(|&h| h > 128) {
         req.push("PLOW_NV_GEMMA=1".to_string());
     }
@@ -1825,6 +1828,13 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport, packed_prefill: 
             json!({ "required": true, "define": "PLOW_MOE2_BODY" });
     }
     let mut f = features(&union);
+    if m.progs
+        .iter()
+        .flat_map(|p| &p.insts)
+        .any(|d| d.op == DevOp::RmsNorm as u16 && d.i[7] == 1)
+    {
+        f.insert("norm_weight_offset".into(), json!(true));
+    }
     let materialized_residual_input = m.progs.iter().flat_map(|p| &p.insts).any(|inst| {
         inst.op == DevOp::AttnRes as u16
             && (inst.t[6] != packet::TENSOR_NONE

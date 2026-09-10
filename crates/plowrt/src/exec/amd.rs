@@ -1,6 +1,6 @@
 //! AMD HSA execution: model loading, per-phase dispatch and slot state.
 //!
-//! Object qualification lives in `amd_object`; prefix and token-batch adapters
+//! Object qualification lives in `object`; prefix and token-batch adapters
 //! own their feature state. Counter resets precede the whole dispatch group,
 //! and AQL barriers order its segments before the final drain.
 
@@ -18,7 +18,7 @@ use super::kv_layout::kv_tensor_name;
 use crate::asset::devblob::{DevBlob, DevProg};
 use crate::device::hsa::{HsaBackend, HsaKernel, HsaPinned};
 use crate::device::{DeviceMem, Module};
-use crate::exec::amd_packed::validate_rows as validate_amd_packed_rows;
+use crate::exec::amd::packed::validate_rows as validate_amd_packed_rows;
 use crate::exec::device_api::EngineDevice;
 use crate::exec::kvrow::{
     derive_kvrow, derive_mla_nsplit, is_lm_head_matmul, kvrow_span, mla_live_nsplit,
@@ -31,8 +31,8 @@ use crate::memory::vmm::{VmmGeometry, VmmKv, VmmOps, WeightSlab};
 use crate::memory::SLAB_ALIGN;
 use crate::{Result, RuntimeError};
 
-#[path = "amd_object.rs"]
 mod object;
+mod packed;
 pub(super) use object::elf_symbol_names;
 use object::{
     build_requires, check_attn_res_f32mix_symbols, check_compiled_opcode_marker_set,
@@ -5181,7 +5181,7 @@ struct AmdProg {
     packed_kda_compatible: bool,
     packed_kda_segmented: bool,
     /// §3/§5.4 of `plans/unified-token-batch.md`, from
-    /// [`crate::exec::amd_packed::recurrent_span_limit`]: `Ok(n)` = at most `n` request spans in
+    /// [`crate::exec::amd::packed::recurrent_span_limit`]: `Ok(n)` = at most `n` request spans in
     /// one packed launch, `Err(msg)` = this program's recurrent operators have no packed form at
     /// all and `msg` names which one. Computed once at load, not per tick.
     packed_recurrent_spans: std::result::Result<u32, String>,
@@ -5242,21 +5242,18 @@ struct AmdGq {
     cur_span: u64,
 }
 
-#[path = "amd_mixed_step.rs"]
-mod amd_mixed_step;
-#[path = "amd_token_batch.rs"]
-mod amd_token_batch;
-#[path = "amd_prefix.rs"]
-mod amd_prefix;
+mod mixed_step;
+mod prefix;
+mod token_batch;
 
 /// The AMD serving engine.
 pub struct AmdEngine {
-    mixed_step: Option<amd_mixed_step::MixedAmdStep>,
+    mixed_step: Option<mixed_step::MixedAmdStep>,
     /// The unified token-batch route. A SECOND instance of the same type on a different code
     /// object: `interp_tokbatch_gq.elf`, spans covering `[0, M)`, no decode prefix. Never
     /// loaded beside `mixed_step` — they are alternatives for one (backend, family) pair, and
     /// a build that armed both would double the resident executables to measure neither.
-    token_batch_step: Option<amd_mixed_step::MixedAmdStep>,
+    token_batch_step: Option<mixed_step::MixedAmdStep>,
     be: Arc<HsaBackend>,
     arch: String,
     n_cu: u32,
@@ -5462,7 +5459,7 @@ pub struct AmdEngine {
     carried_slot: Vec<(usize, u64)>,
     /// Per-slot snapshot of recurrent state and sliding KV at a prefix boundary.
     prefix_snap: Vec<Option<DeviceMem>>,
-    prefix_regions: Option<Vec<amd_prefix::Region>>,
+    prefix_regions: Option<Vec<prefix::Region>>,
     prefix_rows: Vec<u32>,
     prefix_used: Vec<u64>,
     prefix_tick: u64,
@@ -8857,7 +8854,7 @@ impl AmdEngine {
                 }),
                 packed_kda_compatible: packed_kda_compatible(p),
                 packed_kda_segmented,
-                packed_recurrent_spans: crate::exec::amd_packed::recurrent_span_limit(
+                packed_recurrent_spans: crate::exec::amd::packed::recurrent_span_limit(
                     p.insts.iter().map(|d| d.op),
                 ),
                 decode_routes,
@@ -9263,13 +9260,13 @@ impl AmdEngine {
 
         let mixed_step = if crate::config::RuntimeConfig::get().fusion && tp.is_none() && batch > 1
         {
-            match amd_mixed_step::MixedAmdStep::load(
+            match mixed_step::MixedAmdStep::load(
                 &be,
                 &blob,
                 &devp,
                 hsaco_dir,
                 batch,
-                amd_mixed_step::StepRoute::Mixed,
+                mixed_step::StepRoute::Mixed,
             ) {
                 Ok(mixed) => {
                     tracing::info!("runtime prefill/decode fusion enabled");
@@ -9290,7 +9287,7 @@ impl AmdEngine {
         // nothing and does not trap.
         let cfg = crate::config::RuntimeConfig::get();
         let mut token_batch_refusal = if !cfg.token_batch {
-            Some(amd_token_batch::TokenBatchRefusal::NotRequested.to_string())
+            Some(token_batch::TokenBatchRefusal::NotRequested.to_string())
         } else if cfg.fusion {
             Some("explicit fusion takes precedence".to_owned())
         } else if tp.is_some() {
@@ -9303,13 +9300,13 @@ impl AmdEngine {
             None
         };
         let token_batch_step = if token_batch_refusal.is_none() {
-            match amd_mixed_step::MixedAmdStep::load(
+            match mixed_step::MixedAmdStep::load(
                 &be,
                 &blob,
                 &devp,
                 hsaco_dir,
                 batch,
-                amd_mixed_step::StepRoute::TokenBatch,
+                mixed_step::StepRoute::TokenBatch,
             ) {
                 Ok(step) => Some(step),
                 Err(error) => {
@@ -9322,13 +9319,13 @@ impl AmdEngine {
         };
         // Loading an executor does not establish that the scheduler ever dispatched it.
         {
-            let cap = amd_token_batch::probe_token_batch(
+            let cap = token_batch::probe_token_batch(
                 hsaco_dir,
                 &arch,
                 |p| std::fs::read(p),
                 elf_symbol_u32,
             );
-            amd_token_batch::log_route(
+            token_batch::log_route(
                 &cap,
                 token_batch_step.is_some(),
                 token_batch_refusal.as_deref(),
@@ -9431,7 +9428,7 @@ impl AmdEngine {
             kv_slot: 0,
             carried_slot,
             prefix_snap: (0..batch).map(|_| None).collect(),
-            prefix_regions: amd_prefix::snapshot_regions(&blob.tensors,
+            prefix_regions: prefix::snapshot_regions(&blob.tensors,
                 blob.progs.iter().flat_map(|p| &p.insts), batch, max_ctx),
             prefix_used: vec![0; batch],
             prefix_rows: vec![0; batch],
@@ -12155,7 +12152,7 @@ impl AmdEngine {
         let cap = (crate::config::RuntimeConfig::get().prefix_cache_mib() as u64) << 20;
         self.vmm.is_none()
             && self.prefix_regions.as_ref().is_some_and(|regions| {
-                cap == 0 || regions.iter().map(amd_prefix::Region::bytes).sum::<u64>() <= cap
+                cap == 0 || regions.iter().map(prefix::Region::bytes).sum::<u64>() <= cap
             })
     }
 
@@ -12192,7 +12189,7 @@ impl AmdEngine {
         }
         self.sync_kda_conv_alt(slot)?;
         let total = self.prefix_regions.as_ref().map_or_else(|| self.carried_bytes(),
-            |regions| regions.iter().map(amd_prefix::Region::bytes).sum());
+            |regions| regions.iter().map(prefix::Region::bytes).sum());
         if total == 0 {
             self.prefix_rows[slot] = rows;
             return Ok(());
@@ -12230,7 +12227,7 @@ impl AmdEngine {
 
     fn prefix_copy_pairs(&self, slot: usize, rows: u32, buffer: u64, restore: bool) -> Vec<(u64, u64, u64)> {
         let capacity = self.prefix_regions.as_ref().map_or(self.carried_slot.len(),
-            |regions| regions.iter().map(amd_prefix::Region::max_copies).sum());
+            |regions| regions.iter().map(prefix::Region::max_copies).sum());
         let mut pairs = Vec::with_capacity(capacity);
         let mut offset = 0;
         if let Some(regions) = &self.prefix_regions {
@@ -12736,7 +12733,6 @@ fn kernarg_bytes(p: &DevProgram) -> &[u8] {
 }
 
 #[cfg(test)]
-#[path = "amd_tests.rs"]
 mod tests;
 
 /// The routed-expert NAME RESOLUTION, against synthetic checkpoints.
@@ -12747,9 +12743,7 @@ mod tests;
 /// spelling is pinned as the bytes a checkpoint would actually have — the tensor
 /// names, the dtypes, and the shapes, all three taken from the real artifacts.
 #[cfg(test)]
-#[path = "amd_expert_name_tests.rs"]
 mod expert_name_tests;
 
 #[cfg(test)]
-#[path = "amd_slab_tests.rs"]
 mod slab_tests;

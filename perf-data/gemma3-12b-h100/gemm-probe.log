@@ -1,0 +1,21 @@
+== TMA + warp-spec + 128B swizzle + wgmma bf16 prefill GEMM (sm_90a) ==
+GPU NVIDIA H100 80GB HBM3  SMs=132  cc 9.0  regs/SM=65536  smem/SM=228 KiB
+tile: BM=128 BN=128 BK=64  CWG=2 MS=1 NSLB=1 NS=4  accs/thr=64  TMA tx/stage=32768 B
+regs: entry=128 prod=32 cons=176   (uniform baseline tile BM=64)
+
+variant      threads    BM  smem KiB regs/thr spill B/thr  blk/SM  mathWG/SM
+uniform_cp       128    64      97.0      140          0       2          2
+ws_cpasync       384   128     129.1       90          0       1          2
+ws_tma           384   128     129.1       90          0       1          2
+ws_tma_clmp      384   128     129.1       90          0       1          2
+ws_tma_smr       384   128     129.1      128          0       1          2
+
+CORRECTNESS (relL2 < 3e-3 vs f32 CPU oracle over the same bf16 inputs):
+  (  64,   128,   16):  uniform_cp=2.75e-08 OK  ws_cpasync=2.75e-08 OK  ws_tma=2.75e-08 OK  ws_tma_clmp=2.75e-08 OK  ws_tma_smr=2.75e-08 OK
+  ( 200,  4096, 3840):  uniform_cp=3.79e-06 OK  ws_cpasync=3.79e-06 OK  ws_tma=3.79e-06 OK  ws_tma_clmp=3.79e-06 OK  ws_tma_smr=3.79e-06 OK
+RESULT: PASS
+
+BENCHMARK (100 iters + 10 warmup, TF/s; H100 bf16 dense peak 989 TF/s):
+  BENCH ( 512,  4096, 3840):  uniform_cp=200.5(g256)  ws_cpasync=212.4(g128)  ws_tma=432.5(g128)  ws_tma_clmp=431.8(g128)  ws_tma_smr=439.4(g128)   [peak%  20.3 21.5 43.7 43.7 44.4]
+  BENCH ( 512, 15360, 3840):  uniform_cp=197.1(g264)  ws_cpasync=214.8(g132)  ws_tma=318.0(g132)  ws_tma_clmp=317.9(g132)  ws_tma_smr=320.3(g132)   [peak%  19.9 21.7 32.2 32.1 32.4]
+  BENCH ( 200,  4096, 3840):  uniform_cp=99.1(g128)  ws_cpasync=89.2(g64)  ws_tma=203.0(g64)  ws_tma_clmp=202.3(g64)  ws_tma_smr=208.5(g64)   [peak%  10.0 9.0 20.5 20.5 21.1]

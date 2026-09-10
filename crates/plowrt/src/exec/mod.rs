@@ -21,8 +21,6 @@ mod amd_index_tp;
 #[cfg(feature = "hsa")]
 mod amd_moe_aiter;
 #[cfg(feature = "hsa")]
-mod amd_packed;
-#[cfg(feature = "hsa")]
 mod amd_sparse_mla;
 /// N [`amd::AmdEngine`] ranks stepped as one: the host half of the inline
 /// collective. Decode is launch-all-then-drain-all; prefill is per-segment,

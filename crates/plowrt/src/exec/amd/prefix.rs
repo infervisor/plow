@@ -177,7 +177,7 @@ mod tests {
     fn emitted_gemma_bf16_and_fp8_kv_keep_window_sized_snapshots_and_all_rungs() {
         if std::env::var_os("PLOW_PREFIX_EMIT_CHILD").is_none() {
             let out = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["exec::amd::amd_prefix::tests::emitted_gemma_bf16_and_fp8_kv_keep_window_sized_snapshots_and_all_rungs",
+                .args(["exec::amd::prefix::tests::emitted_gemma_bf16_and_fp8_kv_keep_window_sized_snapshots_and_all_rungs",
                     "--exact", "--nocapture"])
                 .env("PLOW_PREFIX_EMIT_CHILD", "1").output().unwrap();
             assert!(

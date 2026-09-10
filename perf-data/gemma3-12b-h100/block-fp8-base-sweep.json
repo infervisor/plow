@@ -1,0 +1,34 @@
+{
+  "sweep": [
+    {
+      "batch": 1,
+      "ctx": 128,
+      "latency_us_median": 205.61,
+      "latency_us_p95": 209.04,
+      "prefill_ms_median": 6.875,
+      "prefill_ms_p95": 6.953,
+      "prefill_tok_s": 18617.8,
+      "tok_s": 4863.5
+    },
+    {
+      "batch": 1,
+      "ctx": 512,
+      "latency_us_median": 206.83,
+      "latency_us_p95": 209.73,
+      "prefill_ms_median": 13.894,
+      "prefill_ms_p95": 14.169,
+      "prefill_tok_s": 36849.2,
+      "tok_s": 4834.8
+    },
+    {
+      "batch": 1,
+      "ctx": 1024,
+      "latency_us_median": 214.92,
+      "latency_us_p95": 217.07,
+      "prefill_ms_median": 27.296,
+      "prefill_ms_p95": 27.84,
+      "prefill_tok_s": 37514.5,
+      "tok_s": 4652.9
+    }
+  ]
+}

@@ -53,7 +53,7 @@ pub trait SeqEngine {
     fn prefill_prog_t(&self, prog: usize) -> Option<u32>;
     /// The most request spans one packed-prefill launch of `prog` may carry, bounded by its
     /// recurrent (D-class) operators. `u32::MAX` = unbounded. See
-    /// `plans/unified-token-batch.md` §5.4 and `exec::amd_packed::recurrent_span_limit`.
+    /// `plans/unified-token-batch.md` §5.4 and `exec::amd::packed::recurrent_span_limit`.
     /// The default is for backends with no packed-prefill route of their own.
     fn packed_prefill_span_limit(&self, _prog: usize) -> u32 {
         u32::MAX

@@ -1,0 +1,80 @@
+runtime/nvidia/op_moe.cuh(1282): warning #177-D: label "down_scalar" was declared but never referenced
+  down_scalar:
+  ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+runtime/nvidia/op_norm.cuh(806): warning #128-D: loop is not reachable
+          for (unsigned e = 0; e < E; e++) {
+          ^
+          detected during instantiation of "void d_headnorm_rope<HD,INTERLEAVE>(__nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *, const float *, const float *, const int *, unsigned int, unsigned int, float, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, const int *) [with HD=256, INTERLEAVE=false]" at line 1592 of runtime/nvidia/interp_sm120.cu
+
+runtime/nvidia/op_norm.cuh(806): warning #128-D: loop is not reachable
+          for (unsigned e = 0; e < E; e++) {
+          ^
+          detected during instantiation of "void d_headnorm_rope<HD,INTERLEAVE>(__nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *, const float *, const float *, const int *, unsigned int, unsigned int, float, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, const int *) [with HD=512, INTERLEAVE=false]" at line 1598 of runtime/nvidia/interp_sm120.cu
+
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 3904 by compiler to allow use of registers in GMMA in function '_Z18interp_sm90a_pfseg11PlowProgram'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 24046 by compiler to allow use of registers in GMMA in function '_Z18interp_sm90a_pfseg11PlowProgram'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_Z18interp_sm90a_pfseg11PlowProgram'
+ptxas info    : 76 bytes gmem
+ptxas info    : Compiling entry function '_Z18interp_sm90a_pfseg11PlowProgram' for 'sm_90a'
+ptxas info    : Function properties for _Z18interp_sm90a_pfseg11PlowProgram
+    2464 bytes stack frame, 9340 bytes spill stores, 13520 bytes spill loads
+ptxas info    : Used 128 registers, used 1 barriers, 2464 bytes cumulative stack size, 2320 bytes smem
+ptxas info    : Compile time = 5309.300 ms
+ptxas info    : Compiling entry function '_Z25plow_moe_slot_glu_fp8_blkP13__nv_bfloat16PKS_PKhPKyS6_jjjjj' for 'sm_90a'
+ptxas info    : Function properties for _Z25plow_moe_slot_glu_fp8_blkP13__nv_bfloat16PKS_PKhPKyS6_jjjjj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 0 barriers
+ptxas info    : Compile time = 13.174 ms
+ptxas info    : Compiling entry function '_Z27plow_moe_group_down_fp8_blkPfPK13__nv_bfloat16PKhPKyS6_jjjj' for 'sm_90a'
+ptxas info    : Function properties for _Z27plow_moe_group_down_fp8_blkPfPK13__nv_bfloat16PKhPKyS6_jjjj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 46 registers, used 0 barriers
+ptxas info    : Compile time = 9.247 ms
+ptxas info    : Compiling entry function '_Z26plow_moe_group_glu_fp8_blkP13__nv_bfloat16PKS_PKhPKyS6_jjjjjj' for 'sm_90a'
+ptxas info    : Function properties for _Z26plow_moe_group_glu_fp8_blkP13__nv_bfloat16PKS_PKhPKyS6_jjjjjj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 48 registers, used 0 barriers
+ptxas info    : Compile time = 12.242 ms
+runtime/nvidia/op_moe.cuh(1282): warning #177-D: label "down_scalar" was declared but never referenced
+  down_scalar:
+  ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+runtime/nvidia/op_norm.cuh(806): warning #128-D: loop is not reachable
+          for (unsigned e = 0; e < E; e++) {
+          ^
+          detected during instantiation of "void d_headnorm_rope<HD,INTERLEAVE>(__nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *, const float *, const float *, const int *, unsigned int, unsigned int, float, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, const int *) [with HD=256, INTERLEAVE=false]" at line 1592 of runtime/nvidia/interp_sm120.cu
+
+runtime/nvidia/op_norm.cuh(806): warning #128-D: loop is not reachable
+          for (unsigned e = 0; e < E; e++) {
+          ^
+          detected during instantiation of "void d_headnorm_rope<HD,INTERLEAVE>(__nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *, const float *, const float *, const int *, unsigned int, unsigned int, float, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, const int *) [with HD=512, INTERLEAVE=false]" at line 1598 of runtime/nvidia/interp_sm120.cu
+
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 3905 by compiler to allow use of registers in GMMA in function '_Z24interp_sm90a_pfpackedseg11PlowProgram'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 24176 by compiler to allow use of registers in GMMA in function '_Z24interp_sm90a_pfpackedseg11PlowProgram'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_Z24interp_sm90a_pfpackedseg11PlowProgram'
+ptxas info    : 76 bytes gmem
+ptxas info    : Compiling entry function '_Z24interp_sm90a_pfpackedseg11PlowProgram' for 'sm_90a'
+ptxas info    : Function properties for _Z24interp_sm90a_pfpackedseg11PlowProgram
+    2464 bytes stack frame, 9340 bytes spill stores, 13536 bytes spill loads
+ptxas info    : Used 128 registers, used 1 barriers, 2464 bytes cumulative stack size, 2320 bytes smem
+ptxas info    : Compile time = 5237.442 ms
+ptxas info    : Compiling entry function '_Z25plow_moe_slot_glu_fp8_blkP13__nv_bfloat16PKS_PKhPKyS6_jjjjj' for 'sm_90a'
+ptxas info    : Function properties for _Z25plow_moe_slot_glu_fp8_blkP13__nv_bfloat16PKS_PKhPKyS6_jjjjj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 0 barriers
+ptxas info    : Compile time = 13.017 ms
+ptxas info    : Compiling entry function '_Z27plow_moe_group_down_fp8_blkPfPK13__nv_bfloat16PKhPKyS6_jjjj' for 'sm_90a'
+ptxas info    : Function properties for _Z27plow_moe_group_down_fp8_blkPfPK13__nv_bfloat16PKhPKyS6_jjjj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 46 registers, used 0 barriers
+ptxas info    : Compile time = 8.611 ms
+ptxas info    : Compiling entry function '_Z26plow_moe_group_glu_fp8_blkP13__nv_bfloat16PKS_PKhPKyS6_jjjjjj' for 'sm_90a'
+ptxas info    : Function properties for _Z26plow_moe_group_glu_fp8_blkP13__nv_bfloat16PKS_PKhPKyS6_jjjjjj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 48 registers, used 0 barriers
+ptxas info    : Compile time = 12.462 ms

@@ -1,6 +1,18 @@
 use super::*;
 
 #[test]
+fn segmented_grid_requires_no_ordinary_prefill_fallback() {
+    use plow_asset::segment_roles::{GEMV_CTA512, INTERPRETER};
+
+    assert!(uses_segmented_prefill(true, false, 2, &[]));
+    assert!(uses_segmented_prefill(true, false, 1, &[GEMV_CTA512]));
+    assert!(!uses_segmented_prefill(true, false, 1, &[INTERPRETER]));
+    assert!(!uses_segmented_prefill(true, false, 1, &[]));
+    assert!(!uses_segmented_prefill(false, false, 2, &[]));
+    assert!(!uses_segmented_prefill(true, true, 2, &[GEMV_CTA512]));
+}
+
+#[test]
 #[ignore = "CPU asset inspection; set TEST_PACKED_FP8_ASSETS to compiled H100 assets"]
 fn fp8_packed_assets_match_packet_and_reject_bf16_objects() {
     let assets = PathBuf::from(std::env::var_os("TEST_PACKED_FP8_ASSETS").unwrap());

@@ -1,0 +1,135 @@
+runtime/nvidia/op_moe.cuh(1282): warning #177-D: label "down_scalar" was declared but never referenced
+  down_scalar:
+  ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+runtime/nvidia/op_attention.cuh(1917): warning #177-D: variable "Kb8" was declared but never referenced
+          const unsigned char* Kb8 = (const unsigned char*)K + (size_t)hkv * kv_stride * HD;
+                               ^
+          detected during:
+            instantiation of "void d_flash_prefill<HD,BQ,BKV>(float *, float *, const __nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *, __nv_bfloat16 *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, float, unsigned int, unsigned int, float *, const int *, const void *) [with HD=512, BQ=32, BKV=16]" at line 3715
+            instantiation of "void d_flash_prefill_mux<HD,BQ,BKV>(const int *, float *, float *, const __nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *, __nv_bfloat16 *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, float, unsigned int, unsigned int, float *, const void *) [with HD=512, BQ=32, BKV=16]" at line 1428 of runtime/nvidia/interp_sm120.cu
+
+runtime/nvidia/op_attention.cuh(1918): warning #177-D: variable "Vb8" was declared but never referenced
+          const unsigned char* Vb8 = (const unsigned char*)V + (size_t)hkv * kv_stride * HD;
+                               ^
+          detected during:
+            instantiation of "void d_flash_prefill<HD,BQ,BKV>(float *, float *, const __nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *, __nv_bfloat16 *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, float, unsigned int, unsigned int, float *, const int *, const void *) [with HD=512, BQ=32, BKV=16]" at line 3715
+            instantiation of "void d_flash_prefill_mux<HD,BQ,BKV>(const int *, float *, float *, const __nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *, __nv_bfloat16 *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, float, unsigned int, unsigned int, float *, const void *) [with HD=512, BQ=32, BKV=16]" at line 1428 of runtime/nvidia/interp_sm120.cu
+
+runtime/nvidia/op_norm.cuh(806): warning #128-D: loop is not reachable
+          for (unsigned e = 0; e < E; e++) {
+          ^
+          detected during instantiation of "void d_headnorm_rope<HD,INTERLEAVE>(__nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *, const float *, const float *, const int *, unsigned int, unsigned int, float, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, const int *) [with HD=256, INTERLEAVE=false]" at line 1592 of runtime/nvidia/interp_sm120.cu
+
+runtime/nvidia/op_norm.cuh(806): warning #128-D: loop is not reachable
+          for (unsigned e = 0; e < E; e++) {
+          ^
+          detected during instantiation of "void d_headnorm_rope<HD,INTERLEAVE>(__nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *, const float *, const float *, const int *, unsigned int, unsigned int, float, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, const int *) [with HD=512, INTERLEAVE=false]" at line 1598 of runtime/nvidia/interp_sm120.cu
+
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 63200 by compiler to allow use of registers in GMMA in function '_Z18interp_sm90a_pfseg11PlowProgram'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 63209 by compiler to allow use of registers in GMMA in function '_Z18interp_sm90a_pfseg11PlowProgram'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 63878 by compiler to allow use of registers in GMMA in function '_Z18interp_sm90a_pfseg11PlowProgram'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 63911 by compiler to allow use of registers in GMMA in function '_Z18interp_sm90a_pfseg11PlowProgram'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 63921 by compiler to allow use of registers in GMMA in function '_Z18interp_sm90a_pfseg11PlowProgram'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 58865 by compiler to allow use of registers in GMMA in function '_Z18interp_sm90a_pfseg11PlowProgram'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 58874 by compiler to allow use of registers in GMMA in function '_Z18interp_sm90a_pfseg11PlowProgram'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 60007 by compiler to allow use of registers in GMMA in function '_Z18interp_sm90a_pfseg11PlowProgram'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 60018 by compiler to allow use of registers in GMMA in function '_Z18interp_sm90a_pfseg11PlowProgram'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 9330 by compiler to allow use of registers in GMMA in function '_Z18interp_sm90a_pfseg11PlowProgram'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 26187 by compiler to allow use of registers in GMMA in function '_Z18interp_sm90a_pfseg11PlowProgram'
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_Z18interp_sm90a_pfseg11PlowProgram'
+ptxas info    : 76 bytes gmem
+ptxas info    : Compiling entry function '_Z18interp_sm90a_pfseg11PlowProgram' for 'sm_90a'
+ptxas info    : Function properties for _Z18interp_sm90a_pfseg11PlowProgram
+    1736 bytes stack frame, 4272 bytes spill stores, 9388 bytes spill loads
+ptxas info    : Used 255 registers, used 1 barriers, 1736 bytes cumulative stack size, 2352 bytes smem
+ptxas info    : Compile time = 9779.860 ms
+ptxas info    : Compiling entry function '_Z25plow_moe_slot_glu_fp8_blkP13__nv_bfloat16PKS_PKhPKyS6_jjjjj' for 'sm_90a'
+ptxas info    : Function properties for _Z25plow_moe_slot_glu_fp8_blkP13__nv_bfloat16PKS_PKhPKyS6_jjjjj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 0 barriers
+ptxas info    : Compile time = 12.684 ms
+ptxas info    : Compiling entry function '_Z27plow_moe_group_down_fp8_blkPfPK13__nv_bfloat16PKhPKyS6_jjjj' for 'sm_90a'
+ptxas info    : Function properties for _Z27plow_moe_group_down_fp8_blkPfPK13__nv_bfloat16PKhPKyS6_jjjj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 46 registers, used 0 barriers
+ptxas info    : Compile time = 8.928 ms
+ptxas info    : Compiling entry function '_Z26plow_moe_group_glu_fp8_blkP13__nv_bfloat16PKS_PKhPKyS6_jjjjjj' for 'sm_90a'
+ptxas info    : Function properties for _Z26plow_moe_group_glu_fp8_blkP13__nv_bfloat16PKS_PKhPKyS6_jjjjjj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 48 registers, used 0 barriers
+ptxas info    : Compile time = 12.992 ms
+runtime/nvidia/op_moe.cuh(1282): warning #177-D: label "down_scalar" was declared but never referenced
+  down_scalar:
+  ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+runtime/nvidia/op_attention.cuh(1917): warning #177-D: variable "Kb8" was declared but never referenced
+          const unsigned char* Kb8 = (const unsigned char*)K + (size_t)hkv * kv_stride * HD;
+                               ^
+          detected during:
+            instantiation of "void d_flash_prefill<HD,BQ,BKV>(float *, float *, const __nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *, __nv_bfloat16 *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, float, unsigned int, unsigned int, float *, const int *, const void *) [with HD=512, BQ=32, BKV=16]" at line 3672
+            instantiation of "void d_flash_prefill_mux<HD,BQ,BKV>(const int *, float *, float *, const __nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *, __nv_bfloat16 *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, float, unsigned int, unsigned int, float *, const void *) [with HD=512, BQ=32, BKV=16]" at line 1428 of runtime/nvidia/interp_sm120.cu
+
+runtime/nvidia/op_attention.cuh(1918): warning #177-D: variable "Vb8" was declared but never referenced
+          const unsigned char* Vb8 = (const unsigned char*)V + (size_t)hkv * kv_stride * HD;
+                               ^
+          detected during:
+            instantiation of "void d_flash_prefill<HD,BQ,BKV>(float *, float *, const __nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *, __nv_bfloat16 *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, float, unsigned int, unsigned int, float *, const int *, const void *) [with HD=512, BQ=32, BKV=16]" at line 3672
+            instantiation of "void d_flash_prefill_mux<HD,BQ,BKV>(const int *, float *, float *, const __nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *, __nv_bfloat16 *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, float, unsigned int, unsigned int, float *, const void *) [with HD=512, BQ=32, BKV=16]" at line 1428 of runtime/nvidia/interp_sm120.cu
+
+runtime/nvidia/op_norm.cuh(806): warning #128-D: loop is not reachable
+          for (unsigned e = 0; e < E; e++) {
+          ^
+          detected during instantiation of "void d_headnorm_rope<HD,INTERLEAVE>(__nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *, const float *, const float *, const int *, unsigned int, unsigned int, float, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, const int *) [with HD=256, INTERLEAVE=false]" at line 1592 of runtime/nvidia/interp_sm120.cu
+
+runtime/nvidia/op_norm.cuh(806): warning #128-D: loop is not reachable
+          for (unsigned e = 0; e < E; e++) {
+          ^
+          detected during instantiation of "void d_headnorm_rope<HD,INTERLEAVE>(__nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *, const float *, const float *, const int *, unsigned int, unsigned int, float, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, const int *) [with HD=512, INTERLEAVE=false]" at line 1598 of runtime/nvidia/interp_sm120.cu
+
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 57986 by compiler to allow use of registers in GMMA in function '_Z24interp_sm90a_pfpackedseg11PlowProgram'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 57995 by compiler to allow use of registers in GMMA in function '_Z24interp_sm90a_pfpackedseg11PlowProgram'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 58662 by compiler to allow use of registers in GMMA in function '_Z24interp_sm90a_pfpackedseg11PlowProgram'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 58695 by compiler to allow use of registers in GMMA in function '_Z24interp_sm90a_pfpackedseg11PlowProgram'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 58705 by compiler to allow use of registers in GMMA in function '_Z24interp_sm90a_pfpackedseg11PlowProgram'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 70761 by compiler to allow use of registers in GMMA in function '_Z24interp_sm90a_pfpackedseg11PlowProgram'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 70770 by compiler to allow use of registers in GMMA in function '_Z24interp_sm90a_pfpackedseg11PlowProgram'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 71437 by compiler to allow use of registers in GMMA in function '_Z24interp_sm90a_pfpackedseg11PlowProgram'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 71470 by compiler to allow use of registers in GMMA in function '_Z24interp_sm90a_pfpackedseg11PlowProgram'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 71480 by compiler to allow use of registers in GMMA in function '_Z24interp_sm90a_pfpackedseg11PlowProgram'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 36591 by compiler to allow use of registers in GMMA in function '_Z24interp_sm90a_pfpackedseg11PlowProgram'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 36600 by compiler to allow use of registers in GMMA in function '_Z24interp_sm90a_pfpackedseg11PlowProgram'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 37731 by compiler to allow use of registers in GMMA in function '_Z24interp_sm90a_pfpackedseg11PlowProgram'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 37742 by compiler to allow use of registers in GMMA in function '_Z24interp_sm90a_pfpackedseg11PlowProgram'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 65564 by compiler to allow use of registers in GMMA in function '_Z24interp_sm90a_pfpackedseg11PlowProgram'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 65573 by compiler to allow use of registers in GMMA in function '_Z24interp_sm90a_pfpackedseg11PlowProgram'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 66704 by compiler to allow use of registers in GMMA in function '_Z24interp_sm90a_pfpackedseg11PlowProgram'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 66715 by compiler to allow use of registers in GMMA in function '_Z24interp_sm90a_pfpackedseg11PlowProgram'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 9347 by compiler to allow use of registers in GMMA in function '_Z24interp_sm90a_pfpackedseg11PlowProgram'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 26321 by compiler to allow use of registers in GMMA in function '_Z24interp_sm90a_pfpackedseg11PlowProgram'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_Z24interp_sm90a_pfpackedseg11PlowProgram'
+ptxas info    : 76 bytes gmem
+ptxas info    : Compiling entry function '_Z24interp_sm90a_pfpackedseg11PlowProgram' for 'sm_90a'
+ptxas info    : Function properties for _Z24interp_sm90a_pfpackedseg11PlowProgram
+    1944 bytes stack frame, 5632 bytes spill stores, 11892 bytes spill loads
+ptxas info    : Used 255 registers, used 1 barriers, 1944 bytes cumulative stack size, 2352 bytes smem
+ptxas info    : Compile time = 11374.446 ms
+ptxas info    : Compiling entry function '_Z25plow_moe_slot_glu_fp8_blkP13__nv_bfloat16PKS_PKhPKyS6_jjjjj' for 'sm_90a'
+ptxas info    : Function properties for _Z25plow_moe_slot_glu_fp8_blkP13__nv_bfloat16PKS_PKhPKyS6_jjjjj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 0 barriers
+ptxas info    : Compile time = 12.839 ms
+ptxas info    : Compiling entry function '_Z27plow_moe_group_down_fp8_blkPfPK13__nv_bfloat16PKhPKyS6_jjjj' for 'sm_90a'
+ptxas info    : Function properties for _Z27plow_moe_group_down_fp8_blkPfPK13__nv_bfloat16PKhPKyS6_jjjj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 46 registers, used 0 barriers
+ptxas info    : Compile time = 9.265 ms
+ptxas info    : Compiling entry function '_Z26plow_moe_group_glu_fp8_blkP13__nv_bfloat16PKS_PKhPKyS6_jjjjjj' for 'sm_90a'
+ptxas info    : Function properties for _Z26plow_moe_group_glu_fp8_blkP13__nv_bfloat16PKS_PKhPKyS6_jjjjjj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 48 registers, used 0 barriers
+ptxas info    : Compile time = 13.293 ms

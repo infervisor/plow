@@ -1,0 +1,46 @@
+{
+  "source": "https://raw.githubusercontent.com/google/gemma_pytorch/main/gemma/config.py",
+  "scope": "Text decode bandwidth lower bounds using actual checkpoint config; not serving measurements. Norms, scales, activation traffic and launch overhead excluded.",
+  "projection_parameters": 10758389760,
+  "head_parameters": 1006878720,
+  "hbm_read_GBps_measured": 3162,
+  "cases": [
+    {
+      "weights": "BF16",
+      "context": 1024,
+      "minimum_bytes_per_token": 23933190144,
+      "bandwidth_floor_ms": 7.569003840607211
+    },
+    {
+      "weights": "BF16",
+      "context": 4096,
+      "minimum_bytes_per_token": 24134516736,
+      "bandwidth_floor_ms": 7.632674489563567
+    },
+    {
+      "weights": "BF16",
+      "context": 8192,
+      "minimum_bytes_per_token": 24402952192,
+      "bandwidth_floor_ms": 7.717568688172043
+    },
+    {
+      "weights": "FP8 projections, BF16 head",
+      "context": 1024,
+      "minimum_bytes_per_token": 13174800384,
+      "bandwidth_floor_ms": 4.1666035370018975
+    },
+    {
+      "weights": "FP8 projections, BF16 head",
+      "context": 4096,
+      "minimum_bytes_per_token": 13376126976,
+      "bandwidth_floor_ms": 4.230274185958254
+    },
+    {
+      "weights": "FP8 projections, BF16 head",
+      "context": 8192,
+      "minimum_bytes_per_token": 13644562432,
+      "bandwidth_floor_ms": 4.31516838456673
+    }
+  ],
+  "vocab_size": 262208
+}

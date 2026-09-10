@@ -1,0 +1,116 @@
+[
+  {
+    "request": {
+      "model": "checkpoint",
+      "messages": [
+        {
+          "role": "user",
+          "content": "What is the capital of France? Answer in one short sentence."
+        }
+      ],
+      "temperature": 0,
+      "max_tokens": 80
+    },
+    "response": {
+      "id": "chatcmpl-c4806ed99e5ef698",
+      "object": "chat.completion",
+      "created": 1789027647,
+      "model": "checkpoint",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "The capital of France is Paris."
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 22,
+        "completion_tokens": 8,
+        "total_tokens": 30,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      }
+    },
+    "seconds": 0.15493798599891306
+  },
+  {
+    "request": {
+      "model": "checkpoint",
+      "messages": [
+        {
+          "role": "user",
+          "content": "What is 7 plus 8? Answer with the number only."
+        }
+      ],
+      "temperature": 0,
+      "max_tokens": 80
+    },
+    "response": {
+      "id": "chatcmpl-c4806ed99e5ef699",
+      "object": "chat.completion",
+      "created": 1789027647,
+      "model": "checkpoint",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "15"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 23,
+        "completion_tokens": 3,
+        "total_tokens": 26,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      }
+    },
+    "seconds": 0.09865065799931472
+  },
+  {
+    "request": {
+      "model": "checkpoint",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Explain why leaves look green in two sentences."
+        }
+      ],
+      "temperature": 0,
+      "max_tokens": 80
+    },
+    "response": {
+      "id": "chatcmpl-c4806ed99e5ef69a",
+      "object": "chat.completion",
+      "created": 1789027647,
+      "model": "checkpoint",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "Leaves appear green because they contain chlorophyll, a pigment that absorbs most colors of light except green, which it reflects. This reflected green light is what our eyes perceive, making the leaves look green to us."
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 18,
+        "completion_tokens": 42,
+        "total_tokens": 60,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      }
+    },
+    "seconds": 0.4348806340003648
+  }
+]

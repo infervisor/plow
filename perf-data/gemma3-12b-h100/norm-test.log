@@ -1,0 +1,9 @@
+rmsnorm rows=1 relative_l2=0
+rmsnorm rows=4 relative_l2=0
+rmsnorm rows=129 relative_l2=1.7766933e-05
+headnorm_rope rows=1 relative_l2=0
+headnorm_rope rows=4 relative_l2=0
+headnorm_rope rows=129 relative_l2=0
+sandwich rows=1 relative_l2=0
+sandwich rows=4 relative_l2=0
+sandwich rows=129 relative_l2=2.5605447e-05

@@ -140,6 +140,7 @@ PLOW_SASSERT(sizeof(PlowProgHeader) == 24, "PlowProgHeader size");
  * high = beta_slow, aux bit0 = truncate; cos AND sin are multiplied by
  * mscale = 0.1*ln(factor)+1. Math in crates/packet/src/rope.rs (RopeScale::Yarn). */
 #define PLOW_ROPE_SCALE_YARN   2u
+#define PLOW_ROPE_SCALE_LINEAR 4u
 
 /* Mirrors `packet::rope::GenTensor`; locked by crates/packet/tests/dev_abi.rs.
  * Flat union across every kind — slots a kind does not use are zero. */

@@ -17,14 +17,29 @@ pub(super) struct PackedTerminal {
 }
 
 fn layout(insts: &[DevInst64], rows: u32, logits: usize, ids: usize) -> Option<[DevInst64; 5]> {
-    let tail: [DevInst64; 5] = insts.get(insts.len().checked_sub(5)?..)?.try_into().ok()?;
+    let last = insts.get(insts.len().checked_sub(4)?..)?;
+    let tail: [DevInst64; 5] = if last[0].op == DevOp::RmsNorm as u16 {
+        let nop = DevInst64 {
+            op: DevOp::Nop as u16,
+            blocks: 1,
+            ..Default::default()
+        };
+        [last[0], last[1], nop, last[2], last[3]]
+    } else {
+        insts.get(insts.len().checked_sub(5)?..)?.try_into().ok()?
+    };
     let [norm, head, cap, max, fin] = tail;
+    let softcap = cap.op == DevOp::SoftCap as u16;
     if rows == 0
         || [norm.op, head.op, cap.op, max.op, fin.op]
             != [
                 DevOp::RmsNorm,
                 DevOp::Gemm,
-                DevOp::SoftCap,
+                if softcap {
+                    DevOp::SoftCap
+                } else {
+                    DevOp::Nop
+                },
                 DevOp::Argmax,
                 DevOp::ArgmaxFin,
             ]
@@ -35,13 +50,11 @@ fn layout(insts: &[DevInst64], rows: u32, logits: usize, ids: usize) -> Option<[
         || head.i[1] == 0
         || head.i[2] != norm.i[1]
         || head.i[4] != rows - 1
-        || head.i[6] != 0
-        || head.i[7] != 0
+        || (head.i[6] == 0) != (head.i[7] == 0)
         || head.t[1] != norm.t[0]
         || head.t[0] as usize != logits
-        || cap.t[0] != head.t[0]
-        || cap.t[1] != head.t[0]
-        || cap.i[0] != head.i[1]
+        || (softcap
+            && (cap.t[0] != head.t[0] || cap.t[1] != head.t[0] || cap.i[0] != head.i[1]))
         || max.t[1] != head.t[0]
         || max.i[0] != head.i[1]
         || max.i[1] > 1
@@ -112,9 +125,14 @@ fn chain(insts: Vec<DevInst64>, grid: u32, rows: u32) -> plow_asset::aux_program
 impl PackedTerminal {
     pub(super) fn patch_discarded_tail(&self, bucket: &mut PrefillBucket, discard: bool) {
         let end = bucket.h_inst.len();
-        for (inst, original) in bucket.h_inst[end - self.template.len()..]
+        let len = if self.template[2].op == DevOp::Nop as u16 {
+            4
+        } else {
+            5
+        };
+        for (inst, original) in bucket.h_inst[end - len..]
             .iter_mut()
-            .zip(&self.template)
+            .zip(self.template.iter().filter(|inst| inst.op != DevOp::Nop as u16))
         {
             inst.op = if discard {
                 DevOp::Nop as u16
@@ -126,7 +144,7 @@ impl PackedTerminal {
     }
 
     pub(super) fn load(e: &GpuEngine) -> Result<Option<Self>> {
-        if !e.vmm_prefix_enabled() || e.packed_prefill.is_none() || e.pf_batch.is_none() {
+        if e.packed_prefill.is_none() || e.pf_batch.is_none() {
             return Ok(None);
         }
         let Some(first) = e
@@ -143,6 +161,8 @@ impl PackedTerminal {
             tail[0].i[0] = first[0].i[0];
             tail[0].blocks = first[0].blocks;
             tail[1].i[4] = first[1].i[4];
+            tail[1].i[6] = first[1].i[6];
+            tail[1].i[7] = first[1].i[7];
             if tail != first {
                 return Ok(None);
             }
@@ -218,6 +238,9 @@ impl PackedTerminal {
         insts[2].t[1] = handle + 1;
         insts[2].i[0] = capacity as u32;
         insts[2].i[4] = 0;
+        // The gathered activation buffer does not match the packet's tensor map.
+        insts[2].i[6] = 0;
+        insts[2].i[7] = 0;
         insts[3].i[0] = elements;
         insts[4].i[1] = capacity as u32;
         insts[5].i[1] = capacity as u32;
@@ -229,7 +252,7 @@ impl PackedTerminal {
         .validate(pointers.len())
         .map_err(RuntimeError::Rejected)?;
         let (arg, _, counter_bytes, tables) =
-            super::gpu_mixed_step::upload_program(&e.be, &program, tensors.base, 0, 0)?;
+            super::mixed_step::upload_program(&e.be, &program, tensors.base, 0, 0)?;
         Ok(Some(Self {
             template: first,
             capacity,
@@ -394,6 +417,29 @@ mod tests {
         ops[4].t[..2].copy_from_slice(&[0, 6]);
         ops[4].i[0] = 4;
         ops
+    }
+
+    #[test]
+    fn compact_tail_preserves_uncapped_norm_and_accepts_paired_maps() {
+        let mut ops = tail();
+        ops.remove(2);
+        ops[0].i[7] = 1;
+        ops[1].i[6] = 12;
+        ops[1].i[7] = 13;
+        let parsed = layout(&ops, 128, 4, 0).unwrap();
+        assert_eq!(parsed[0], ops[0]);
+        assert_eq!(parsed[1], ops[1]);
+        assert_eq!(parsed[2].op, DevOp::Nop as u16);
+        assert_eq!(parsed[3..], ops[2..]);
+        let program = chain(parsed.to_vec(), 8, 1);
+        plow_asset::aux_program::Section {
+            n_cu: 8,
+            programs: vec![program],
+        }
+        .validate(7)
+        .unwrap();
+        ops[1].i[7] = 0;
+        assert!(layout(&ops, 128, 4, 0).is_none());
     }
 
     #[test]

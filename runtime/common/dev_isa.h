@@ -56,7 +56,10 @@ enum {
     PLOW_DOP_NOP = 0,
 
     /* t0=out t1=x t2=gamma?            i0=rows i1=feat          f0=eps
-     * gamma==NONE is the weightless RMSNorm (Gemma's v_norm). */
+     * gamma==NONE is the weightless RMSNorm (Gemma's v_norm).
+     * i7=1 marks Gemma3's FP32 (1+gamma) weight semantics, also on HEADNORM_ROPE,
+     * HEADNORM_ROPE_FP8, NORM_RESIDUAL and NORM_RESIDUAL_NORM. Requires a matching
+     * interpreter object; zero retains plain gamma. */
     PLOW_DOP_RMSNORM = 1,
 
     /* t0=rms(f32) t1=x                 i0=rows i1=feat          f0=eps

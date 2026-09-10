@@ -36,25 +36,36 @@ use crate::memory::SLAB_ALIGN;
 use crate::{Result, RuntimeError};
 use plow_asset::cubin::{self, Role};
 
-#[path = "gpu_prefix.rs"]
+fn check_norm_weight_offset(be: &CudaBackend, module: &Module, blob: &DevBlob) -> Result<()> {
+    let expected = u32::from(
+        blob.progs
+            .iter()
+            .flat_map(|p| &p.insts)
+            .any(|d| d.op == DevOp::RmsNorm as u16 && d.i[7] == 1),
+    );
+    let actual = be
+        .module_global_u32(module, "plow_norm_weight_offset")?
+        .unwrap_or(0);
+    if actual != expected {
+        return Err(RuntimeError::Rejected(format!(
+            "norm weight offset mismatch: packet requires {expected}, object provides {actual}"
+        )));
+    }
+    Ok(())
+}
+
 mod prefix;
 use prefix::VmmServe;
 
-#[path = "gpu_decode_context.rs"]
 mod decode_context;
-#[path = "gpu_decode_object.rs"]
 mod decode_object;
 use decode_object::{BoundDecodeObject, DecodeModule};
-#[path = "gpu_decode_rung.rs"]
-mod gpu_decode_rung;
-#[path = "gpu_mixed_step.rs"]
-mod gpu_mixed_step;
-#[path = "gpu_packed_terminal.rs"]
-mod gpu_packed_terminal;
-#[path = "gpu_token_batch.rs"]
-mod gpu_token_batch;
-use gpu_cublaslt::CublasLtDecodeRoute;
-use gpu_decode_rung::{
+mod decode_rung;
+mod mixed_step;
+mod packed_terminal;
+mod token_batch;
+use cublaslt::CublasLtDecodeRoute;
+use decode_rung::{
     decode_rung_index, decode_selection, effective_decode_widths, validate_cublaslt_ladder,
     validate_decode_ladder, DecodeRung, DecodeSelection,
 };
@@ -943,7 +954,7 @@ fn packet_role_segments(
         ));
     }
     if roles.contains(&plow_asset::segment_roles::CUBLASLT) {
-        gpu_cublaslt::decode_segments(g, tensors, roles)?;
+        cublaslt::decode_segments(g, tensors, roles)?;
     }
     let mut selected = Vec::new();
     for (seg, bounds) in g.gq_seg_ofs.windows(2).enumerate() {
@@ -1077,7 +1088,6 @@ impl SegPf {
     }
 }
 
-#[path = "gpu_seg_gemm.rs"]
 mod seg_gemm;
 use seg_gemm::small_gemm_segments;
 
@@ -1197,6 +1207,20 @@ impl KvTensorMap {
         }
         Ok(bindings)
     }
+}
+
+fn uses_segmented_prefill(
+    segmented_objects: bool,
+    qwen_chain: bool,
+    segments: usize,
+    roles: &[u8],
+) -> bool {
+    segmented_objects
+        && !qwen_chain
+        && (segments > 1
+            || roles
+                .iter()
+                .any(|&role| role != plow_asset::segment_roles::INTERPRETER))
 }
 
 struct PrefillBucket {
@@ -1633,9 +1657,9 @@ pub struct GpuEngine {
     /// Next physical slot considered first by cross-request prefill admission.
     prefill_turn: usize,
     packed_prefill: Option<plow_asset::packed_prefill::Manifest>,
-    packed_terminal: Option<gpu_packed_terminal::PackedTerminal>,
-    mixed_step: Option<gpu_mixed_step::MixedCudaStep>,
-    token_batch: Option<gpu_token_batch::CudaTokenBatch>,
+    packed_terminal: Option<packed_terminal::PackedTerminal>,
+    mixed_step: Option<mixed_step::MixedCudaStep>,
+    token_batch: Option<token_batch::CudaTokenBatch>,
     slot_generations: Vec<u32>,
 }
 
@@ -2743,6 +2767,7 @@ impl GpuEngine {
                 let image_len = image.len();
                 let dec_source = dec.source.clone();
                 let module = DecodeModule::load(&be, &image)?;
+                check_norm_weight_offset(&be, &module, &blob)?;
                 let kname = crate::config::RuntimeConfig::get()
                     .nv
                     .kernel
@@ -3537,7 +3562,7 @@ impl GpuEngine {
                     "cuBLASLt decode requires a paired GQ interpreter".into(),
                 ));
             }
-            gpu_cublaslt::decode_segments(g, &blob.tensors, &decode_roles)?
+            cublaslt::decode_segments(g, &blob.tensors, &decode_roles)?
         } else {
             if decode_packet_roles.is_empty() {
                 g.check_coarse_single_segment()?;
@@ -3596,12 +3621,12 @@ impl GpuEngine {
             .then(|| crate::device::cuda::lt::Lt::load(&be))
             .transpose()?;
         let ordered_waits = if cublaslt_enabled {
-            Some(gpu_cublaslt::ordered_waits(g, &cublaslt_segments)?)
+            Some(cublaslt::ordered_waits(g, &cublaslt_segments)?)
         } else {
             None
         };
         let cublaslt_decode = if let Some(lt) = &cublaslt {
-            gpu_cublaslt::prepare_routes(lt, cublaslt_segments, &mut insts, &devp, None)?
+            cublaslt::prepare_routes(lt, cublaslt_segments, &mut insts, &devp, None)?
         } else {
             Vec::new()
         };
@@ -3673,14 +3698,14 @@ impl GpuEngine {
                             .program(blob.progs.len() - blob.decode_progs().len() + index)
                             .unwrap()
                             .roles;
-                        let segments = gpu_cublaslt::decode_segments(g, &blob.tensors, roles)?;
-                        let waits = gpu_cublaslt::ordered_waits(g, &segments)?;
+                        let segments = cublaslt::decode_segments(g, &blob.tensors, roles)?;
+                        let waits = cublaslt::ordered_waits(g, &segments)?;
                         let mut insts = g.insts.clone();
-                        let routes = gpu_cublaslt::prepare_routes(
+                        let routes = cublaslt::prepare_routes(
                             lt, segments, &mut insts, &devp, Some(&cublaslt_decode),
                         )?;
                         let mut rung = DecodeRung::upload_with_insts(&be, g, kernarg, &insts, &waits)?;
-                        rung.library = Some(gpu_cublaslt::CublasLtDecodeGraph::capture(
+                        rung.library = Some(cublaslt::CublasLtDecodeGraph::capture(
                             &be, &stream, rung.kernarg, f, grid, smem, routes,
                         )?);
                         rung
@@ -4210,7 +4235,7 @@ impl GpuEngine {
                         "mixed dense step does not support recurrent state".into(),
                     ));
                 }
-                gpu_mixed_step::MixedCudaStep::load(&be, packet, &blob, &devp, d_tens.base, batch)
+                mixed_step::MixedCudaStep::load(&be, packet, &blob, &devp, d_tens.base, batch)
             })
             .transpose()?;
 
@@ -4326,8 +4351,8 @@ impl GpuEngine {
             token_batch: None,
             slot_generations: vec![0; batch],
         };
-        engine.packed_terminal = gpu_packed_terminal::PackedTerminal::load(&engine)?;
-        engine.token_batch = gpu_token_batch::CudaTokenBatch::load(&engine);
+        engine.packed_terminal = packed_terminal::PackedTerminal::load(&engine)?;
+        engine.token_batch = token_batch::CudaTokenBatch::load(&engine);
         if config.token_batch {
             tracing::info!(
                 route = "unified-token-batch",
@@ -5565,6 +5590,7 @@ impl GpuEngine {
     ) -> Result<(KernelFn, u32, Module, Vec<PrefillBucket>, Option<SegPf>)> {
         let packed_requests = packed.is_some();
         let module = be.module_load(&pf.image)?;
+        check_norm_weight_offset(be, &module, blob)?;
         Self::check_packet_pairing_suffix(be, &module, assets_dir, "_pf")?;
         let kname = crate::config::RuntimeConfig::get()
             .nv
@@ -5629,6 +5655,7 @@ impl GpuEngine {
                             .map_err(|e| RuntimeError::Rejected(format!("{file}: {e}")))?;
                     }
                     let m = be.module_load(&img)?;
+                    check_norm_weight_offset(be, &m, blob)?;
                     Self::check_packet_pairing_suffix(be, &m, assets_dir, suffix)?;
                     let f = be.get_function(&m, sym)?;
                     let sm = be.module_global_u32(&m, arena)?.unwrap_or(smem_pf);
@@ -5655,6 +5682,16 @@ impl GpuEngine {
                 let (m1, f1, s1, g1) = load(&seg_file, &seg_sym, &seg_global_suffix, &seg_arena)?;
                 let (m2, f2, s2, _g2unused) =
                     load(&gemm_file, &gemm_sym, &gemm_global_suffix, &gemm_arena)?;
+                if crate::config::RuntimeConfig::get().nv.pf_seg_pure.as_deref() == Some("w8a16")
+                    && be.module_global_u32(
+                        &m2,
+                        &format!("plow_w8a16_gemm_abi{gemm_global_suffix}"),
+                    )? != Some(1)
+                {
+                    return Err(RuntimeError::Rejected(format!(
+                        "w8a16 segments require a compatible W8A16 GEMM object: {gemm_file}"
+                    )));
+                }
                 // T31: the GEMM object may declare its own launch block size (384-thread ws).
                 let gemm_block = format!("plow_block{gemm_global_suffix}");
                 let blk2 = be.module_global_u32(&m2, &gemm_block)?.unwrap_or(BLOCK);
@@ -5716,12 +5753,14 @@ impl GpuEngine {
                 // Optional third object (T12): dedicated hd512 flash. Only loaded when the
                 // file exists — the classing env (PLOW_PF_SEG_FA512) decides whether class-2
                 // segments are emitted at all.
-                let fa_file = format!("interp_{interp_tag}_pffa.cubin");
-                let fa = if !packed_requests && dir.join(&fa_file).exists() {
-                    let fa_sym_name = format!("interp_{interp_tag}_pffa");
+                let fa_file = format!("interp_{interp_tag}_{suffix}fa{kv_suffix}.cubin");
+                let fa = if dir.join(&fa_file).exists() {
+                    let fa_sym_name = format!("interp_{interp_tag}_{suffix}fa");
                     let fa_sym = format!("_Z{}{}11PlowProgram", fa_sym_name.len(), fa_sym_name);
+                    let fa_global_suffix = format!("_{suffix}fa");
+                    let fa_arena = format!("plow_arena_bytes{fa_global_suffix}");
                     let (m3, f3, s3, g3) =
-                        load(&fa_file, &fa_sym, "_pffa", "plow_arena_bytes_pffa")?;
+                        load(&fa_file, &fa_sym, &fa_global_suffix, &fa_arena)?;
                     // PLOW_PF_SEG_FA512=all classes hd256 FlashPrefill onto this object too,
                     // but its hd256 arm exists only when built PLOW_BUILD_FA_HD256=1 —
                     // without it the dispatch hits a bare __trap(): LAUNCH_FAILED, poisoned
@@ -5733,7 +5772,7 @@ impl GpuEngine {
                         .pf_seg_fa512
                         .as_deref()
                         == Some("all")
-                        && be.module_global_u32(&m3, "plow_fa_hd256_pffa")? == Some(0)
+                        && be.module_global_u32(&m3, &format!("plow_fa_hd256{fa_global_suffix}"))? == Some(0)
                     {
                         return Err(RuntimeError::Device(format!(
                             "PLOW_PF_SEG_FA512=all classes hd256 flash onto {fa_file}, but that \
@@ -5821,19 +5860,8 @@ impl GpuEngine {
         };
         let seg_mode = seg_pf.is_some();
 
-        // Same fatal grid gate as decode: the prefill kernel's occupancy must
-        // yield exactly n_cu blocks or the cooperative launch reads off the
-        // per-block stream tables / deadlocks.
         let occ = be.occupancy_blocks_per_sm(f_pf, BLOCK, smem_pf as usize)?;
         let grid_pf = occ * be.sm_count();
-        if grid_pf != grid {
-            return Err(RuntimeError::Device(format!(
-                "prefill grid {grid_pf} ({occ}/SM × {} SMs) != decode grid {grid} (n_cu {}) — \
-                 the two objects must share the cooperative grid",
-                be.sm_count(),
-                blob.n_cu
-            )));
-        }
 
         let upload_pod = |bytes: &[u8]| -> Result<DeviceMem> {
             let mem = be.alloc(0, bytes.len().max(4) as u64)?;
@@ -6071,6 +6099,24 @@ impl GpuEngine {
             return Err(RuntimeError::Device(
                 "blob has no prefill buckets (only the T=1 decode program)".into(),
             ));
+        }
+        // Only complete segmented chains avoid launching f_pf at the decode grid.
+        if grid_pf != grid
+            && !buckets.iter().all(|b| {
+                uses_segmented_prefill(
+                    seg_mode,
+                    !b.qwen_segments.is_empty(),
+                    b.seg_class.len(),
+                    &b.packet_segment_roles,
+                )
+            })
+        {
+            return Err(RuntimeError::Device(format!(
+                "prefill grid {grid_pf} ({occ}/SM × {} SMs) != decode grid {grid} (n_cu {}) — \
+                 ordinary prefill launches must share the decode grid",
+                be.sm_count(),
+                blob.n_cu
+            )));
         }
         buckets.sort_by_key(|b| b.t);
         Ok((f_pf, smem_pf, module, buckets, seg_pf))
@@ -6486,13 +6532,12 @@ impl GpuEngine {
                     Some(&self.stream),
                 )?;
             }
-        } else if self.seg_pf.is_some()
-            && (seg_class.len() > 1
-                || self.prefill[bi]
-                    .packet_segment_roles
-                    .iter()
-                    .any(|&role| role != plow_asset::segment_roles::INTERPRETER))
-        {
+        } else if uses_segmented_prefill(
+            self.seg_pf.is_some(),
+            false,
+            seg_class.len(),
+            &self.prefill[bi].packet_segment_roles,
+        ) {
             let sp = self.seg_pf.as_ref().expect("checked");
             // T35 (PLOW_PF_SEG_GRAPH=1): submit the whole per-chunk segment chain as ONE
             // CUDA graph. Per-node kernargs (cur_seg baked per node) are copied at build;
@@ -7493,36 +7538,28 @@ impl Drop for GpuEngine {
 }
 
 #[cfg(test)]
-#[path = "gpu_kv_tmap_tests.rs"]
 mod kv_tmap_tests;
 
 #[cfg(test)]
-#[path = "gpu_attention_role_tests.rs"]
 mod attention_role_tests;
 
 #[cfg(test)]
-#[path = "gpu_prefill_patch_tests.rs"]
 mod prefill_patch_tests;
 
 #[cfg(test)]
-#[path = "gpu_slab_tests.rs"]
 mod slab_tests;
 
 #[cfg(test)]
-#[path = "gpu_profile_tests.rs"]
 mod profile_tests;
 
 #[cfg(test)]
-#[path = "gpu_prefix_selection_tests.rs"]
 mod prefix_selection_tests;
 
 #[cfg(test)]
-#[path = "gpu_recurrent_tests.rs"]
 mod recurrent_tests;
 
 #[cfg(test)]
-#[path = "gpu_qwen_tests.rs"]
-mod gpu_qwen_tests;
+mod qwen_tests;
 
 #[cfg(test)]
 #[test]
@@ -7546,20 +7583,15 @@ fn qwen_prefill_state_views_select_exact_batch_slots() {
 }
 
 #[cfg(test)]
-#[path = "gpu_decode_rung_tests.rs"]
 mod decode_rung_tests;
 
 #[cfg(test)]
-#[path = "gpu_gemv_role_tests.rs"]
 mod gemv_role_tests;
 
 #[cfg(test)]
-#[path = "gpu_mxfp4_moe_role_tests.rs"]
 mod mxfp4_moe_role_tests;
 
-#[path = "gpu_fp8_m1_role.rs"]
 mod fp8_m1_role;
 use fp8_m1_role::{load_fp8_m1_role, validate_fp8_role_checkpoint};
 
-#[path = "gpu_cublaslt.rs"]
-mod gpu_cublaslt;
+mod cublaslt;

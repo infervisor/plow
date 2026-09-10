@@ -1,0 +1,5 @@
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 1423 by compiler to allow use of registers in GMMA in function '_Z3runP13__nv_bfloat16PKS_S2_S2_jjj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 1433 by compiler to allow use of registers in GMMA in function '_Z3runP13__nv_bfloat16PKS_S2_S2_jjj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 2362 by compiler to allow use of registers in GMMA in function '_Z3runP13__nv_bfloat16PKS_S2_S2_jjj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 2399 by compiler to allow use of registers in GMMA in function '_Z3runP13__nv_bfloat16PKS_S2_S2_jjj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 2409 by compiler to allow use of registers in GMMA in function '_Z3runP13__nv_bfloat16PKS_S2_S2_jjj'

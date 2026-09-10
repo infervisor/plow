@@ -1,0 +1,12 @@
+========= COMPUTE-SANITIZER
+M=8 N=64 K=256 split=0 blocks=132 median_us=144.992 min_us=144.992 max_us=144.992 differing=0 relL2=0 max_abs=0 reference_samples=512 PASS
+M=8 N=64 K=256 split=1 blocks=132 median_us=166.656 min_us=166.656 max_us=166.656 differing=0 relL2=0 max_abs=0 reference_samples=512 PASS
+M=17 N=71 K=256 split=0 blocks=132 median_us=187.104 min_us=187.104 max_us=187.104 differing=0 relL2=0 max_abs=0 reference_samples=1207 PASS
+M=17 N=71 K=256 split=1 blocks=132 median_us=218.464 min_us=218.464 max_us=218.464 differing=0 relL2=0 max_abs=0 reference_samples=1207 PASS
+M=17 N=71 K=264 split=0 blocks=132 median_us=221.504 min_us=221.504 max_us=221.504 differing=0 relL2=0 max_abs=0 reference_samples=1207 PASS
+M=17 N=71 K=264 split=1 blocks=132 median_us=233.952 min_us=233.952 max_us=233.952 differing=0 relL2=0 max_abs=0 reference_samples=1207 PASS
+M=17 N=71 K=8 split=0 blocks=132 median_us=118.528 min_us=118.528 max_us=118.528 differing=0 relL2=0 max_abs=0 reference_samples=1207 PASS
+M=17 N=71 K=8 split=1 blocks=132 median_us=148.256 min_us=148.256 max_us=148.256 differing=0 relL2=0 max_abs=0 reference_samples=1207 PASS
+M=128 N=2048 K=3840 split=0 blocks=132 median_us=1955.040 min_us=1945.280 max_us=2244.096 differing=0 relL2=0 max_abs=0 reference_samples=257 PASS
+M=128 N=2048 K=3840 split=1 blocks=132 median_us=1942.976 min_us=1934.144 max_us=2218.912 differing=0 relL2=0 max_abs=0 reference_samples=257 PASS
+========= ERROR SUMMARY: 0 errors

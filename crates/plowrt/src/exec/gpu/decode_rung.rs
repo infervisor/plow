@@ -2,7 +2,7 @@ use super::*;
 use packet::dev::ROPE_PAIR_HALF;
 
 pub(super) struct DecodeRung {
-    pub(super) library: Option<super::gpu_cublaslt::CublasLtDecodeGraph>,
+    pub(super) library: Option<super::cublaslt::CublasLtDecodeGraph>,
     pub(super) rows: usize,
     pub(super) object: Option<Arc<BoundDecodeObject>>,
     pub(super) kernarg: DevProgram,

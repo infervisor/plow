@@ -10,6 +10,7 @@ use serde_json::Value;
 /// activation, attention geometry, RoPE differ per arch).
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum Arch {
+    Gemma3,
     Gemma4,
     Llama,
     Qwen3,
@@ -18,6 +19,12 @@ pub(crate) enum Arch {
     /// emitter (`gptoss.rs`); never reaches the dense-GQA `Cfg` path.
     #[allow(dead_code)]
     GptOss,
+}
+
+impl Arch {
+    pub(crate) fn is_gemma(self) -> bool {
+        matches!(self, Self::Gemma3 | Self::Gemma4)
+    }
 }
 
 /// GPT-OSS geometry, parsed from `config.json` with every field verified present. Weight names
@@ -235,6 +242,10 @@ pub(crate) fn cfg_from(dir: &Path) -> Cfg {
     let v: Value =
         serde_json::from_slice(&std::fs::read(dir.join("config.json")).expect("config.json"))
             .unwrap();
+    let mt = v["model_type"].as_str().unwrap_or("");
+    if matches!(mt, "gemma3" | "gemma3_text") {
+        return cfg_gemma3(&v);
+    }
     // Gemma-4 multimodal nests everything under `text_config` (prefix
     // "model.language_model."); the text-only "-it-text" re-export is FLAT with
     // model_type "gemma4_text" (prefix "model."). Same weights, two namings.
@@ -333,6 +344,95 @@ fn cfg_gemma(v: &Value, flat: bool) -> Cfg {
     c
 }
 
+fn cfg_gemma3(v: &Value) -> Cfg {
+    let nested = v.get("text_config").is_some();
+    let t = if nested { &v["text_config"] } else { v };
+    let g = |k: &str| {
+        t[k].as_u64()
+            .unwrap_or_else(|| panic!("gemma3: missing {k}")) as u32
+    };
+    let layers = g("num_hidden_layers");
+    let pattern = g("sliding_window_pattern");
+    assert!(
+        pattern > 0,
+        "gemma3: sliding_window_pattern must be positive"
+    );
+    assert!(
+        !t["attention_bias"].as_bool().unwrap_or(false),
+        "gemma3: attention bias unsupported"
+    );
+    assert_eq!(t["hidden_activation"].as_str(), Some("gelu_pytorch_tanh"));
+    assert!(
+        t["attn_logit_softcapping"].is_null(),
+        "gemma3: attention softcap unsupported"
+    );
+    let rs = &t["rope_scaling"];
+    let rope_scale = if rs.is_null() {
+        RopeScale::None
+    } else {
+        assert_eq!(
+            rs["rope_type"].as_str(),
+            Some("linear"),
+            "gemma3: unsupported RoPE scaling"
+        );
+        let factor = rs["factor"].as_f64().expect("gemma3: rope_scaling.factor");
+        assert!(
+            factor.is_finite() && factor > 0.0,
+            "gemma3: invalid RoPE factor"
+        );
+        RopeScale::Linear { factor }
+    };
+    Cfg {
+        arch: Arch::Gemma3,
+        hidden: g("hidden_size"),
+        inter: g("intermediate_size"),
+        layers,
+        heads: g("num_attention_heads"),
+        hd_slide: g("head_dim"),
+        hd_full: g("head_dim"),
+        kvh_slide: g("num_key_value_heads"),
+        kvh_full: g("num_key_value_heads"),
+        window: g("sliding_window"),
+        eps: t["rms_norm_eps"].as_f64().expect("gemma3: rms_norm_eps") as f32,
+        vocab: g("vocab_size"),
+        softcap: t["final_logit_softcapping"].as_f64().unwrap_or(0.0) as f32,
+        is_full: (0..layers).map(|l| (l + 1) % pattern == 0).collect(),
+        theta_slide: t["rope_local_base_freq"]
+            .as_f64()
+            .expect("gemma3: rope_local_base_freq"),
+        theta_full: t["rope_theta"].as_f64().expect("gemma3: rope_theta"),
+        rope_frac_full: 1.0,
+        rope_scale,
+        attn_scale: (t["query_pre_attn_scalar"]
+            .as_f64()
+            .expect("gemma3: query_pre_attn_scalar") as f32)
+            .sqrt()
+            .recip(),
+        emb_scale: bf16_round((g("hidden_size") as f32).sqrt()),
+        mlp_act: 0,
+        has_qk_norm: true,
+        has_v_norm: false,
+        k_eq_v: false,
+        tied: t["tie_word_embeddings"]
+            .as_bool()
+            .or_else(|| v["tie_word_embeddings"].as_bool())
+            .unwrap_or(true),
+        prefix: if nested {
+            "language_model.model."
+        } else {
+            "model."
+        }
+        .into(),
+        tp: 1,
+        moe: false,
+        n_exp: 0,
+        top_k: 0,
+        moe_inter: 0,
+        ple: 0,
+        kv_shared: 0,
+    }
+}
+
 /// Llama-3.1 / Qwen3: flat config, all-global attention, simple pre-norm, SwiGLU.
 fn cfg_llama_qwen(v: &Value, arch: Arch) -> Cfg {
     let g = |k: &str| v[k].as_u64().unwrap() as u32;
@@ -414,4 +514,51 @@ pub(crate) fn bf16_round(f: f32) -> f32 {
     let u = f.to_bits();
     let r = u.wrapping_add(0x7fff).wrapping_add((u >> 16) & 1);
     f32::from_bits(r & 0xffff_0000)
+}
+
+#[cfg(test)]
+mod gemma3_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn text_config() -> Value {
+        json!({
+            "model_type": "gemma3_text", "hidden_size": 3840,
+            "intermediate_size": 15360, "num_hidden_layers": 48,
+            "num_attention_heads": 16, "num_key_value_heads": 8, "head_dim": 256,
+            "sliding_window": 1024, "sliding_window_pattern": 6,
+            "rms_norm_eps": 1e-6, "vocab_size": 262208,
+            "hidden_activation": "gelu_pytorch_tanh", "query_pre_attn_scalar": 256,
+            "rope_local_base_freq": 10000.0, "rope_theta": 1000000.0,
+            "rope_scaling": {"rope_type": "linear", "factor": 8.0}
+        })
+    }
+
+    #[test]
+    fn gemma3_preserves_attention_geometry_and_norm_topology() {
+        let c = cfg_gemma3(&json!({"model_type": "gemma3", "text_config": text_config()}));
+        assert_eq!(c.arch, Arch::Gemma3);
+        assert!(c.arch.is_gemma() && c.has_qk_norm && c.tied);
+        assert!(!c.has_v_norm && !c.k_eq_v && !c.moe);
+        assert_eq!(
+            (c.hd_slide, c.hd_full, c.kvh_slide, c.kvh_full),
+            (256, 256, 8, 8)
+        );
+        assert_eq!(c.is_full.iter().filter(|&&x| x).count(), 8);
+        assert_eq!(&c.is_full[..6], &[false, false, false, false, false, true]);
+        assert_eq!(c.attn_scale, 1.0 / 16.0);
+        assert_eq!(c.softcap, 0.0);
+        assert_eq!(c.rope_scale, RopeScale::Linear { factor: 8.0 });
+        assert_eq!((c.theta_slide, c.theta_full), (10000.0, 1000000.0));
+        assert_eq!(c.prefix, "language_model.model.");
+        assert_eq!(cfg_gemma3(&text_config()).prefix, "model.");
+    }
+
+    #[test]
+    #[should_panic(expected = "unsupported RoPE scaling")]
+    fn gemma3_refuses_unknown_rope_scaling() {
+        let mut t = text_config();
+        t["rope_scaling"]["rope_type"] = json!("dynamic");
+        cfg_gemma3(&t);
+    }
 }

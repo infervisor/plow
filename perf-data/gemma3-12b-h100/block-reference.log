@@ -1,0 +1,4 @@
+{"candidate": "block-output-bf16-base.npy", "relative_l2": 0.012761227786540985, "max_abs": 48.0, "finite": true}
+{"candidate": "block-output-bf16-pure.npy", "relative_l2": 0.012314030900597572, "max_abs": 48.0, "finite": true}
+{"candidate": "block-output-fp8-base.npy", "relative_l2": 0.045620180666446686, "max_abs": 228.0, "finite": true}
+{"candidate": "block-output-fp8-pure.npy", "relative_l2": 0.08165064454078674, "max_abs": 472.0, "finite": true}

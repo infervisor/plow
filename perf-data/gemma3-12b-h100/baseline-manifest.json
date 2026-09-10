@@ -1,0 +1,15 @@
+{
+  "checkpoint": "unsloth/gemma-3-12b-it",
+  "revision": "9478e665381f42974aa06177b019352fb6291876",
+  "official_weight_hashes_match": true,
+  "gpu": "H100 80GB HBM3",
+  "kv_dtype": "BF16",
+  "prefix_cache": false,
+  "decode_capacity": 1,
+  "prefill_rungs": [
+    128,
+    512,
+    1024
+  ],
+  "max_context": 16384
+}

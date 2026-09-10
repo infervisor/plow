@@ -653,6 +653,8 @@ __device__ __forceinline__ PlowStreamEnt ld_stream_ent(const PlowStreamEnt* p) {
 #define PLOW_SYM(n) PLOW_NV_CAT(n, _gemv512)
 #elif PLOW_NV_PREFILL && PLOW_NV_PACKED_REQUEST && PLOW_NV_SEG_GEMM
 #define PLOW_SYM(n) PLOW_NV_CAT(n, _pfpackedgemm)
+#elif PLOW_NV_PREFILL && PLOW_NV_PACKED_REQUEST && PLOW_NV_FA_ONLY
+#define PLOW_SYM(n) PLOW_NV_CAT(n, _pfpackedfa)
 #elif PLOW_NV_PREFILL && PLOW_NV_PACKED_REQUEST && PLOW_NV_SEGMENTS
 #define PLOW_SYM(n) PLOW_NV_CAT(n, _pfpackedseg)
 #elif PLOW_NV_PREFILL && PLOW_NV_SEG_GEMM
@@ -1269,6 +1271,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                    (__nv_bfloat16*)arena);
         break;
 
+#if !(PLOW_NV_GEMM_ONLY && defined(PLOW_NV_W8A16_WGMMA) && PLOW_NV_W8A16_WGMMA)
     /* fp8 w8a16 prefill GEMM+GLU (T6 L2). t0=fu t1=A(bf16) t2=Wg(e4m3) t5=Wu(e4m3)
      * t4=g_scale t6=u_scale  i0=M i1=N i2=K i5=act. */
     case PLOW_DOP_GEMM_GLU_FP8:
@@ -1276,6 +1279,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                        (const uint8_t*)TEN(5), (const float*)TEN(4), (const float*)TEN(6), in->i[0],
                        in->i[1], in->i[2], in->i[5], slice, nblk, (__nv_bfloat16*)arena);
         break;
+#endif
 #endif /* !PLOW_NV_FA_ONLY (w8a16 arms) */
 #endif
 
@@ -2612,6 +2616,11 @@ extern "C" __device__ unsigned plow_qwen_w8a8_prefill_arm = 0;
 extern "C" __device__ unsigned plow_fp8_gemm_tma128_abi = 1;
 #else
 extern "C" __device__ unsigned plow_fp8_gemm_tma128_abi = 0;
+#endif
+#if defined(PLOW_NV_HOPPER) && defined(PLOW_NV_W8A16_WGMMA) && PLOW_NV_W8A16_WGMMA && PLOW_NV_PREFILL && PLOW_NV_SEGMENTS && PLOW_NV_SEG_GEMM && PLOW_NV_GEMM_ONLY && PLOW_NV_SEG_OCC1 && PLOW_NV_THREADS == 256 && PLOW_NV_SCHED == 1 && !PLOW_NV_PLACE_DISPATCH && !PLOW_NV_SKELETON && !PLOW_NV_FA_ONLY && !PLOW_NV_FATLITE && PLOW_NV_TMA_GEMM && !PLOW_NV_W8A8 && !PGM90_UNI_BN256 && !PLOW_NV_SEG_WS && !PLOW_NV_SEG_WS_ENTRY && !PLOW_NV_SEG_WS384 && !PLOW_NV_SEG_SMALL_BF16 && !PLOW_NV_SEG_M64N64 && !PLOW_NV_SEG_M64N128
+extern "C" __device__ unsigned PLOW_SYM(plow_w8a16_gemm_abi) = 1;
+#else
+extern "C" __device__ unsigned PLOW_SYM(plow_w8a16_gemm_abi) = 0;
 #endif
 #if defined(PLOW_NV_HOPPER) && PLOW_NV_PREFILL && PLOW_NV_SEGMENTS && PLOW_NV_FA_ONLY && PLOW_NV_FA_ONLY_HD256 && PLOW_NV_GEMMA && PLOW_NV_MINBLK == 1 && PLOW_NV_THREADS == 256 && PLOW_NV_SCHED == 1 && !PLOW_NV_PLACE_DISPATCH && !PLOW_NV_SKELETON && !PLOW_NV_GEMM_ONLY && !PLOW_NV_SEG_GEMM && !PLOW_NV_FATLITE && !PLOW_FP8_KV && PLOW_NV_FA_PIPE == 1 && PLOW_NV_FA256_BKV == 32 && !PLOW_NV_FA_WGITEM && !PLOW_NV_FA512_WG && !PLOW_NV_FA_ROPE && PLOW_NV_FA_TMA == 1 && !defined(FA_NV_WAVE64_NEGCTRL) && !defined(PLOW_NV_ABLATE_LO) && !defined(PLOW_NV_ABLATE_HI)
 extern "C" __device__ unsigned plow_attention_sm90_hd256_abi = 1;
