@@ -1,0 +1,614 @@
+{
+  "schema": 1,
+  "date": "2026-09-10",
+  "gpu": "AMD Instinct MI300X",
+  "gpu_count": 1,
+  "tp_weight_slice": 8,
+  "shape": {
+    "layer": 77,
+    "rank": 0,
+    "hidden": 6144,
+    "intermediate": 256,
+    "experts": 256,
+    "topk": 8
+  },
+  "torch": "2.12.0+git6bbd260",
+  "hip": "7.2.53211",
+  "aiter": "0.1.19",
+  "kernel_name": "_ZN5aiter60fmoe_bf16_a16_blockscaleFp8_g1u1_vs_silu_1tg_16x128_flat_pf3E",
+  "loaded_object_sha256": "be7052284094e7cedeb266afb24d4d6723bdf4234ac391b2e5b29473d8ee8f06",
+  "loaded_object_path": "/app/plow/.venv-vllm028/lib/python3.12/site-packages/aiter_meta/hsa/gfx942/fmoe/silu/fmoe_bf16_a16_blockscaleFp8_g1u1_vs_silu_1tg_16x128_flat_pf3.co",
+  "upstream": "https://github.com/ROCm/aiter/pull/4040",
+  "capture_sha256": {
+    "fu.bin": "7f960b9ff69c8e340069dd85ef6c1df6b7cf328dce6b72556fa2510afb329285",
+    "meta.bin": "3832df9925ddab711c9e2b71394fd95a7f793475a3f6869aab4f100e464cc568",
+    "part.bin": "4f3c2ddcb727834d26898858ed91857f5ec80b138ae6a67679140e8b7daf0fb2",
+    "rg.bin": "147d474e170119380678a8371286b1a6f6b52f1b2e6a375d71404d5e0d17d618",
+    "rp.bin": "e2f4da7ad07f7523260c3fd4a2c87bfe2a71f6af1b11cbaf8849418636681975",
+    "rt.bin": "d4c15acb6153a46d3cfcf09d175e9e1629a6d03c0a6f3268660dccc86fafe40a",
+    "tab.bin": "b95867d76f67162d9e790ec0aa0bdb17f1a96f3566c11c1b8fb133866a05772b",
+    "x.bin": "7296dd4280ea3023c332fde9f650ef8e5889b59f896d9d111e43fd66704051b7"
+  },
+  "checkpoint": {
+    "header_sha256": {
+      "model-00134-of-00141.safetensors": "d58e564f85d0c841e1eb0cffa3aa57e98a80f5caffaba49a7d5040541498a519",
+      "model-00135-of-00141.safetensors": "bfa80869958b0d82087892ddc72a0add9d3d78effe9096078097e3af2d5f2388",
+      "model-00136-of-00141.safetensors": "d78221b25975fa6c510a2eb9aaa9d19754c83368ae7a80d2fa9fea0c4ad18926"
+    },
+    "selected_tp_weight_sha256": "b9c452cc839d3fb048bd52d507115b18219154b45ed9f9219c109cc12d1f9764",
+    "negative_zeros_canonicalized": 4999
+  },
+  "measured_source": {
+    "status": "completed: session6330 terminal0, 12 cells passed",
+    "upstream": "https://github.com/ROCm/aiter/pull/4040",
+    "object": "/workspace/aiter/hsa/gfx942/fmoe/silu/fmoe_bf16_a16_blockscaleFp8_g1u1_vs_silu_1tg_16x128_flat_pf3.co",
+    "object_sha256": "be7052284094e7cedeb266afb24d4d6723bdf4234ac391b2e5b29473d8ee8f06",
+    "source_sha256": "fdb40f3b3fdc44dda126aeba8d39fb278e37f9146e94e722569bb24e560fa282",
+    "scope": "isolated resident and packing-inclusive flat MoE; no production edits or serving claim",
+    "flat_pack_sha256": {
+      "/tmp/tp-glm53-moe-flat/flat-pack.hip": "4a86c75bb83a1e181aad0df3d5d9d6e0359c34431a4f3a64184c24455a68f336",
+      "/tmp/tp-glm53-moe-flat/flat-pack.so": "7e4f84e29cc4ddb7b0cb94ef60b7ea0b7a0e16422d550b8ed1ac8832148f045f",
+      "runtime/bench/amd/moe_aiter/kernels.hip": "70baa7fc78516b10c8a7043df94b47744cdb7bf338f402d3a1d6670a5476debe",
+      "runtime/amd/moe_aiter_adapter.hip": "e8432ff9661bb758d43be49ca9949e40f06a1d9fc917ddd610f93e51993f2971"
+    }
+  },
+  "cells": {
+    "flat-resident-b1": {
+      "arm": "flat-resident",
+      "rows": 1,
+      "oracle_rows": [
+        0
+      ],
+      "ms": 0.04667000100016594,
+      "cold_ms": 0.05956900119781494,
+      "cold_samples_ms": [
+        0.05972899869084358,
+        0.05948900058865547,
+        0.05852700024843216,
+        0.05956900119781494,
+        0.06024999916553497,
+        0.06001000106334686,
+        0.06101100146770477,
+        0.05936799943447113,
+        0.05896800011396408
+      ],
+      "relative_l2": 0.031214633956551552,
+      "weight_pack_ms": null,
+      "native_check": null,
+      "repeat_check": {
+        "poisoned_workspace_reuses": 12,
+        "output_guard_bytes": 512,
+        "oracle_relative_l2": [
+          0.03126780316233635,
+          0.031223991885781288,
+          0.031259819865226746,
+          0.03127165511250496,
+          0.03122401237487793,
+          0.031165581196546555,
+          0.03124857135117054,
+          0.03124970756471157,
+          0.031143244355916977,
+          0.031339019536972046,
+          0.031245877966284752,
+          0.031199870631098747
+        ]
+      },
+      "source_sha256": "fdb40f3b3fdc44dda126aeba8d39fb278e37f9146e94e722569bb24e560fa282",
+      "library_sha256": "3abde925e84ce12af8112a4f0bc279190120260d7be537c3cdedf81ae36d8d34",
+      "flat_library_sha256": "7e4f84e29cc4ddb7b0cb94ef60b7ea0b7a0e16422d550b8ed1ac8832148f045f",
+      "raw_result_sha256": "ba2ce1e894e8d3485ebc81f2fe0f3be1e8caa142e86920e483848ee8b5cc328c"
+    },
+    "flat-active-b1": {
+      "arm": "flat-active",
+      "rows": 1,
+      "oracle_rows": [
+        0
+      ],
+      "ms": 0.11272799968719482,
+      "cold_ms": 0.1550309956073761,
+      "cold_samples_ms": [
+        0.1535090059041977,
+        0.15911699831485748,
+        0.15431000292301178,
+        0.1545110046863556,
+        0.15791599452495575,
+        0.15731500089168549,
+        0.15563300251960754,
+        0.1550309956073761,
+        0.15491099655628204
+      ],
+      "relative_l2": 0.03128626570105553,
+      "weight_pack_ms": 0.07154600322246552,
+      "native_check": {
+        "active_pack_exact": true,
+        "routing_unpack_exact": true,
+        "inactive_experts_untouched": true,
+        "routing_and_layer_reuses": 3
+      },
+      "repeat_check": {
+        "poisoned_workspace_reuses": 12,
+        "output_guard_bytes": 512,
+        "oracle_relative_l2": [
+          0.03135431930422783,
+          0.031210342422127724,
+          0.03115280345082283,
+          0.031155848875641823,
+          0.03136811777949333,
+          0.031049015000462532,
+          0.03135424107313156,
+          0.031438134610652924,
+          0.03137163072824478,
+          0.03133437782526016,
+          0.0313592255115509,
+          0.031417615711688995
+        ]
+      },
+      "source_sha256": "fdb40f3b3fdc44dda126aeba8d39fb278e37f9146e94e722569bb24e560fa282",
+      "library_sha256": "3abde925e84ce12af8112a4f0bc279190120260d7be537c3cdedf81ae36d8d34",
+      "flat_library_sha256": "7e4f84e29cc4ddb7b0cb94ef60b7ea0b7a0e16422d550b8ed1ac8832148f045f",
+      "raw_result_sha256": "c58678b21424eabe2cf38bf574f4a5429cd9059e40c751147ea050fef29e32ce"
+    },
+    "plow-b1": {
+      "arm": "plow",
+      "rows": 1,
+      "oracle_rows": [
+        0
+      ],
+      "ms": 0.2217710018157959,
+      "cold_ms": 0.2503339946269989,
+      "cold_samples_ms": [
+        0.2513749897480011,
+        0.2506139874458313,
+        0.2483700066804886,
+        0.2495729923248291,
+        0.2502939999103546,
+        0.24897199869155884,
+        0.25121501088142395,
+        0.2503339946269989,
+        0.25045400857925415
+      ],
+      "relative_l2": 0.00216095382347703,
+      "weight_pack_ms": null,
+      "native_check": null,
+      "repeat_check": null,
+      "source_sha256": "fdb40f3b3fdc44dda126aeba8d39fb278e37f9146e94e722569bb24e560fa282",
+      "library_sha256": "3abde925e84ce12af8112a4f0bc279190120260d7be537c3cdedf81ae36d8d34",
+      "flat_library_sha256": "7e4f84e29cc4ddb7b0cb94ef60b7ea0b7a0e16422d550b8ed1ac8832148f045f",
+      "raw_result_sha256": "a4400068bc956de45c78e9d15881ba723c9e0cce8f70dff702cd42cc90cb997b"
+    },
+    "flat-resident-b2": {
+      "arm": "flat-resident",
+      "rows": 2,
+      "oracle_rows": [
+        0,
+        1
+      ],
+      "ms": 0.046509999781847,
+      "cold_ms": 0.060088999569416046,
+      "cold_samples_ms": [
+        0.060088999569416046,
+        0.06309399753808975,
+        0.060169998556375504,
+        0.05952899903059006,
+        0.05936900153756142,
+        0.05948900058865547,
+        0.06153099983930588,
+        0.06052999943494797,
+        0.059769000858068466
+      ],
+      "relative_l2": 0.030274730175733566,
+      "weight_pack_ms": null,
+      "native_check": null,
+      "repeat_check": {
+        "poisoned_workspace_reuses": 12,
+        "output_guard_bytes": 512,
+        "oracle_relative_l2": [
+          0.030031375586986542,
+          0.0303136445581913,
+          0.03004651702940464,
+          0.030376436188817024,
+          0.030111121013760567,
+          0.030246013775467873,
+          0.030156990513205528,
+          0.03023512102663517,
+          0.030317852273583412,
+          0.030060023069381714,
+          0.030045311897993088,
+          0.03027951531112194
+        ]
+      },
+      "source_sha256": "fdb40f3b3fdc44dda126aeba8d39fb278e37f9146e94e722569bb24e560fa282",
+      "library_sha256": "3abde925e84ce12af8112a4f0bc279190120260d7be537c3cdedf81ae36d8d34",
+      "flat_library_sha256": "7e4f84e29cc4ddb7b0cb94ef60b7ea0b7a0e16422d550b8ed1ac8832148f045f",
+      "raw_result_sha256": "6e196bc7b8bf73f78ed88f714bfb64894b9539ee4d438e465d04639bba5b0105"
+    },
+    "flat-active-b2": {
+      "arm": "flat-active",
+      "rows": 2,
+      "oracle_rows": [
+        0,
+        1
+      ],
+      "ms": 0.11320900171995163,
+      "cold_ms": 0.156032994389534,
+      "cold_samples_ms": [
+        0.15455099940299988,
+        0.1542699933052063,
+        0.15691399574279785,
+        0.15767499804496765,
+        0.1559929996728897,
+        0.15695400536060333,
+        0.15767599642276764,
+        0.15467099845409393,
+        0.156032994389534
+      ],
+      "relative_l2": 0.030084656551480293,
+      "weight_pack_ms": 0.07294899970293045,
+      "native_check": {
+        "active_pack_exact": true,
+        "routing_unpack_exact": true,
+        "inactive_experts_untouched": true,
+        "routing_and_layer_reuses": 3
+      },
+      "repeat_check": {
+        "poisoned_workspace_reuses": 12,
+        "output_guard_bytes": 512,
+        "oracle_relative_l2": [
+          0.030209723860025406,
+          0.030087264254689217,
+          0.030328424647450447,
+          0.030170897021889687,
+          0.030150223523378372,
+          0.030207762494683266,
+          0.03024199977517128,
+          0.030377943068742752,
+          0.030209846794605255,
+          0.03019770421087742,
+          0.030203761532902718,
+          0.030185934156179428
+        ]
+      },
+      "source_sha256": "fdb40f3b3fdc44dda126aeba8d39fb278e37f9146e94e722569bb24e560fa282",
+      "library_sha256": "3abde925e84ce12af8112a4f0bc279190120260d7be537c3cdedf81ae36d8d34",
+      "flat_library_sha256": "7e4f84e29cc4ddb7b0cb94ef60b7ea0b7a0e16422d550b8ed1ac8832148f045f",
+      "raw_result_sha256": "18ad05b7f5a3bdf2875f9922930e214b915a4f18d1464058bc02f36498fa36b1"
+    },
+    "plow-b2": {
+      "arm": "plow",
+      "rows": 2,
+      "oracle_rows": [
+        0,
+        1
+      ],
+      "ms": 0.22585800290107727,
+      "cold_ms": 0.25453999638557434,
+      "cold_samples_ms": [
+        0.2551000118255615,
+        0.25381898880004883,
+        0.2547000050544739,
+        0.2530980110168457,
+        0.25453999638557434,
+        0.2554610073566437,
+        0.25578200817108154,
+        0.25422000885009766,
+        0.25353801250457764
+      ],
+      "relative_l2": 0.0023557026870548725,
+      "weight_pack_ms": null,
+      "native_check": null,
+      "repeat_check": null,
+      "source_sha256": "fdb40f3b3fdc44dda126aeba8d39fb278e37f9146e94e722569bb24e560fa282",
+      "library_sha256": "3abde925e84ce12af8112a4f0bc279190120260d7be537c3cdedf81ae36d8d34",
+      "flat_library_sha256": "7e4f84e29cc4ddb7b0cb94ef60b7ea0b7a0e16422d550b8ed1ac8832148f045f",
+      "raw_result_sha256": "470efe2e430619ff071d4c998a64ebd5f3ec9d1e1b22af0109888afc443ee5d1"
+    },
+    "flat-resident-b4": {
+      "arm": "flat-resident",
+      "rows": 4,
+      "oracle_rows": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "ms": 0.0472709983587265,
+      "cold_ms": 0.06233400106430054,
+      "cold_samples_ms": [
+        0.06177299842238426,
+        0.06181199848651886,
+        0.06245400011539459,
+        0.06165200099349022,
+        0.062293000519275665,
+        0.06361500173807144,
+        0.06233400106430054,
+        0.06329400092363358,
+        0.06377600133419037
+      ],
+      "relative_l2": 0.031019898131489754,
+      "weight_pack_ms": null,
+      "native_check": null,
+      "repeat_check": {
+        "poisoned_workspace_reuses": 12,
+        "output_guard_bytes": 512,
+        "oracle_relative_l2": [
+          0.03083714470267296,
+          0.03083934262394905,
+          0.030915671959519386,
+          0.03098389506340027,
+          0.030901893973350525,
+          0.03096427395939827,
+          0.03100263513624668,
+          0.030940009281039238,
+          0.030870653688907623,
+          0.030924495309591293,
+          0.030941130593419075,
+          0.0309307761490345
+        ]
+      },
+      "source_sha256": "fdb40f3b3fdc44dda126aeba8d39fb278e37f9146e94e722569bb24e560fa282",
+      "library_sha256": "3abde925e84ce12af8112a4f0bc279190120260d7be537c3cdedf81ae36d8d34",
+      "flat_library_sha256": "7e4f84e29cc4ddb7b0cb94ef60b7ea0b7a0e16422d550b8ed1ac8832148f045f",
+      "raw_result_sha256": "fdd63cb50744dc05922693e392f474dfb768ca5ec5fb3cbd8b06401fba2bb050"
+    },
+    "flat-active-b4": {
+      "arm": "flat-active",
+      "rows": 4,
+      "oracle_rows": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "ms": 0.11465100198984146,
+      "cold_ms": 0.1646450012922287,
+      "cold_samples_ms": [
+        0.16264300048351288,
+        0.16176100075244904,
+        0.1646450012922287,
+        0.16468599438667297,
+        0.16304299235343933,
+        0.1658879965543747,
+        0.16344399750232697,
+        0.16468599438667297,
+        0.1648859977722168
+      ],
+      "relative_l2": 0.03079577162861824,
+      "weight_pack_ms": 0.07254800200462341,
+      "native_check": {
+        "active_pack_exact": true,
+        "routing_unpack_exact": true,
+        "inactive_experts_untouched": true,
+        "routing_and_layer_reuses": 3
+      },
+      "repeat_check": {
+        "poisoned_workspace_reuses": 12,
+        "output_guard_bytes": 512,
+        "oracle_relative_l2": [
+          0.030929839238524437,
+          0.030934428796172142,
+          0.030991461127996445,
+          0.030772436410188675,
+          0.030793456360697746,
+          0.0309134628623724,
+          0.030960703268647194,
+          0.030785975977778435,
+          0.030797822400927544,
+          0.030811473727226257,
+          0.030934255570173264,
+          0.030831994488835335
+        ]
+      },
+      "source_sha256": "fdb40f3b3fdc44dda126aeba8d39fb278e37f9146e94e722569bb24e560fa282",
+      "library_sha256": "3abde925e84ce12af8112a4f0bc279190120260d7be537c3cdedf81ae36d8d34",
+      "flat_library_sha256": "7e4f84e29cc4ddb7b0cb94ef60b7ea0b7a0e16422d550b8ed1ac8832148f045f",
+      "raw_result_sha256": "ac4b49c3b8aef55daa58b600e619bd04567ada9d384f039ef76572525ef567ba"
+    },
+    "plow-b4": {
+      "arm": "plow",
+      "rows": 4,
+      "oracle_rows": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "ms": 0.22878099977970123,
+      "cold_ms": 0.259907990694046,
+      "cold_samples_ms": [
+        0.25830599665641785,
+        0.26002800464630127,
+        0.2584660053253174,
+        0.25826600193977356,
+        0.2599479854106903,
+        0.259907990694046,
+        0.26082900166511536,
+        0.25854501128196716,
+        0.26006901264190674
+      ],
+      "relative_l2": 0.00236848508939147,
+      "weight_pack_ms": null,
+      "native_check": null,
+      "repeat_check": null,
+      "source_sha256": "fdb40f3b3fdc44dda126aeba8d39fb278e37f9146e94e722569bb24e560fa282",
+      "library_sha256": "3abde925e84ce12af8112a4f0bc279190120260d7be537c3cdedf81ae36d8d34",
+      "flat_library_sha256": "7e4f84e29cc4ddb7b0cb94ef60b7ea0b7a0e16422d550b8ed1ac8832148f045f",
+      "raw_result_sha256": "a2754137aa3f1fc60ea5e04eaea70ac822f7f434e6e47358fd8052d7bd917cbb"
+    },
+    "flat-resident-b8": {
+      "arm": "flat-resident",
+      "rows": 8,
+      "oracle_rows": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "ms": 0.05215799808502197,
+      "cold_ms": 0.07038500159978867,
+      "cold_samples_ms": [
+        0.06874299794435501,
+        0.0703049972653389,
+        0.07082600146532059,
+        0.07138700038194656,
+        0.07010500133037567,
+        0.07082600146532059,
+        0.07094500213861465,
+        0.07038500159978867,
+        0.07038500159978867
+      ],
+      "relative_l2": 0.03075265698134899,
+      "weight_pack_ms": null,
+      "native_check": null,
+      "repeat_check": {
+        "poisoned_workspace_reuses": 12,
+        "output_guard_bytes": 512,
+        "oracle_relative_l2": [
+          0.0307325292378664,
+          0.030742285773158073,
+          0.030823716893792152,
+          0.030842583626508713,
+          0.030789248645305634,
+          0.030831269919872284,
+          0.030817003920674324,
+          0.030831236392259598,
+          0.030766678974032402,
+          0.03082004375755787,
+          0.030669761821627617,
+          0.030780132859945297
+        ]
+      },
+      "source_sha256": "fdb40f3b3fdc44dda126aeba8d39fb278e37f9146e94e722569bb24e560fa282",
+      "library_sha256": "3abde925e84ce12af8112a4f0bc279190120260d7be537c3cdedf81ae36d8d34",
+      "flat_library_sha256": "7e4f84e29cc4ddb7b0cb94ef60b7ea0b7a0e16422d550b8ed1ac8832148f045f",
+      "raw_result_sha256": "bbdacb8c8b3874a0c465ea2f47684907fc68cc8088ef1b2db569ef04d6e05c76"
+    },
+    "flat-active-b8": {
+      "arm": "flat-active",
+      "rows": 8,
+      "oracle_rows": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "ms": 0.1269499957561493,
+      "cold_ms": 0.199537992477417,
+      "cold_samples_ms": [
+        0.19677400588989258,
+        0.20134000480175018,
+        0.19893699884414673,
+        0.199537992477417,
+        0.2025029957294464,
+        0.19889700412750244,
+        0.19889700412750244,
+        0.20414499938488007,
+        0.2000190019607544
+      ],
+      "relative_l2": 0.030862893909215927,
+      "weight_pack_ms": 0.07983899861574173,
+      "native_check": {
+        "active_pack_exact": true,
+        "routing_unpack_exact": true,
+        "inactive_experts_untouched": true,
+        "routing_and_layer_reuses": 3
+      },
+      "repeat_check": {
+        "poisoned_workspace_reuses": 12,
+        "output_guard_bytes": 512,
+        "oracle_relative_l2": [
+          0.030773717910051346,
+          0.030808430165052414,
+          0.030761398375034332,
+          0.030836166813969612,
+          0.030771223828196526,
+          0.030907899141311646,
+          0.030811289325356483,
+          0.030825234949588776,
+          0.030843913555145264,
+          0.0307770986109972,
+          0.03074442595243454,
+          0.030781099572777748
+        ]
+      },
+      "source_sha256": "fdb40f3b3fdc44dda126aeba8d39fb278e37f9146e94e722569bb24e560fa282",
+      "library_sha256": "3abde925e84ce12af8112a4f0bc279190120260d7be537c3cdedf81ae36d8d34",
+      "flat_library_sha256": "7e4f84e29cc4ddb7b0cb94ef60b7ea0b7a0e16422d550b8ed1ac8832148f045f",
+      "raw_result_sha256": "41089fcc4d99dc13b7f29bffefabbcd1805d3697d4eb2c8bfa936f68add56bb9"
+    },
+    "plow-b8": {
+      "arm": "plow",
+      "rows": 8,
+      "oracle_rows": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "ms": 0.24344299733638763,
+      "cold_ms": 0.2788560092449188,
+      "cold_samples_ms": [
+        0.2788560092449188,
+        0.2787359952926636,
+        0.27725300192832947,
+        0.2788960039615631,
+        0.2794570028781891,
+        0.2774539887905121,
+        0.2821410000324249,
+        0.2783760130405426,
+        0.2819409966468811
+      ],
+      "relative_l2": 0.002322140382602811,
+      "weight_pack_ms": null,
+      "native_check": null,
+      "repeat_check": null,
+      "source_sha256": "fdb40f3b3fdc44dda126aeba8d39fb278e37f9146e94e722569bb24e560fa282",
+      "library_sha256": "3abde925e84ce12af8112a4f0bc279190120260d7be537c3cdedf81ae36d8d34",
+      "flat_library_sha256": "7e4f84e29cc4ddb7b0cb94ef60b7ea0b7a0e16422d550b8ed1ac8832148f045f",
+      "raw_result_sha256": "82eeab0b415cc1db9ab0080d7c84ea976d3208323679ff57b12305e6e1825e7c"
+    }
+  },
+  "boundary": {
+    "plow": "Grouped align/GLU/down/combine and accumulator clear; frozen decode-align adapter, BF16 output.",
+    "flat-resident": "One flat A16 assembly kernel with resident shuffled weights; excludes weight packing.",
+    "flat-active": "Active-expert weight packing and raw-routing unpack in one kernel, then flat assembly; BF16 output.",
+    "common_exclusions": [
+      "Router top-k",
+      "Shared expert",
+      "Residual",
+      "TP communication",
+      "Interpreter scheduling",
+      "Checkpoint loading",
+      "JIT",
+      "Allocations"
+    ],
+    "timing": "Warm GPU graph/event medians; nine separately flushed samples with 512 MiB cache flush."
+  },
+  "verification": {
+    "all_rows_fp32_oracle": true,
+    "flat_output_guard_bytes": 512,
+    "coordination_bytes": 8,
+    "poisoned_oracle_reuses": 12,
+    "active_weight_and_routing_reuses": 3,
+    "inactive_weights_untouched": true
+  },
+  "limitations": [
+    "One captured layer77/rank0/step0 batch8; smaller rows are prefixes of that capture.",
+    "Batch1 is a grouped-adapter experiment, not qualification of the production batch1 route.",
+    "Flat relative L2 error is about3% vs about0.23% for Plow; thresholds are screening gates, not model-quality approval.",
+    "No full-model serving integration or quality result.",
+    "Tracked runner differs only in portable import/object lookup and also verifies the actually loaded AITER object hash; measured temporary sources remain pinned."
+  ],
+  "artifact_root": "/tmp/tp-glm53-moe-flat"
+}

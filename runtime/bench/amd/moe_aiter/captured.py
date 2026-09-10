@@ -88,8 +88,9 @@ def checkpoint_weights(directory, layer, rank):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--arm", choices=["plow", "aiter", "ck", "aiter-repack", "aiter-slots", "native", "native-active", "native-resident"], required=True)
+    parser.add_argument("--arm", choices=["plow", "aiter", "ck", "aiter-repack", "aiter-slots", "native", "native-active", "native-resident", "flat-resident", "flat-active"], required=True)
     parser.add_argument("--library", type=Path, required=True)
+    parser.add_argument("--flat-library", type=Path)
     parser.add_argument("--object", type=Path)
     parser.add_argument("--capture", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
@@ -103,6 +104,7 @@ def main():
     args = parser.parse_args()
     assert 0 <= args.cache_flush_mib <= 16384
     native = args.arm.startswith("native")
+    flat = args.arm.startswith("flat-")
     assert "gfx942" in torch.cuda.get_device_properties(0).gcnArchName
     assert 0 <= args.rank < 8 and 0 < args.rows <= 8192
     rows, hidden, intermediate, experts, topk = args.rows, 6144, 256, 256, 8
@@ -287,8 +289,74 @@ def main():
             combined = torch.empty_like(x)
             latest_parts = None
 
+        if flat:
+            assert rows in [1, 2, 4, 8, 16, 20, 32]
+            from aiter.jit.core import AITER_ASM_DIR
+            object_name = "fmoe_bf16_a16_blockscaleFp8_g1u1_vs_silu_1tg_16x128_flat_pf3.co"
+            object_sha = "be7052284094e7cedeb266afb24d4d6723bdf4234ac391b2e5b29473d8ee8f06"
+            installed_object = Path(AITER_ASM_DIR) / "gfx942" / "fmoe" / "silu" / object_name
+            assert args.object and sha(args.object) == object_sha
+            assert sha(installed_object) == object_sha
+            row_bytes = rows * hidden * 2
+            flat_storage = torch.empty(row_bytes + 8 + 512, device="cuda", dtype=torch.uint8)
+            flat_storage.fill_(0xA5)
+            flat_out = flat_storage[:row_bytes].view(torch.bfloat16).reshape(rows, hidden)
+            flat_scales = torch.empty(0, device="cuda")
+            flat_ids, flat_weights = ids, weights
+            if args.arm == "flat-active":
+                assert args.flat_library
+                flat_lib = ctypes.CDLL(str(args.flat_library.resolve()))
+                flat_lib.plow_moe_flat_pack.argtypes = [ctypes.c_void_p] * 9 + [ctypes.c_uint, ctypes.c_void_p]
+                flat_lib.plow_moe_flat_pack.restype = ctypes.c_int
+                flat_ids, flat_weights = torch.empty_like(ids), torch.empty_like(weights)
+
+                def flat_pack():
+                    rc = flat_lib.plow_moe_flat_pack(*(t.data_ptr() for t in
+                        [wp1, wp2, sp1, sp2, wt, st, table, flat_ids, flat_weights]),
+                        rows, torch.cuda.current_stream().cuda_stream)
+                    assert rc == 0, rc
+
+                expected = [t.view(torch.uint8).clone() for t in (wp1, wp2, sp1, sp2)]
+                saved_table, saved_wt, saved_st = table.clone(), wt.clone(), st.clone()
+                for reuse in range(3):
+                    if reuse == 1:
+                        table[:, :, 0].copy_((saved_table[:, :, 0] + 1) % experts)
+                        wt.copy_(saved_wt.flip(0))
+                        st.copy_(saved_st.flip(0))
+                    else:
+                        table.copy_(saved_table)
+                        wt.copy_(saved_wt)
+                        st.copy_(saved_st)
+                    active = table[:, :, 0].long().unique()
+                    inactive = torch.ones(experts, device="cuda", dtype=torch.bool)
+                    inactive[active] = False
+                    for t in (wp1, wp2, sp1, sp2):
+                        t.view(torch.uint8).fill_(0xff)
+                    flat_ids.fill_(-1)
+                    flat_weights.fill_(float("nan"))
+                    flat_pack()
+                    assert torch.equal(flat_ids, table[:, :, 0])
+                    assert torch.equal(flat_weights.view(torch.int32), table[:, :, 1])
+                    for t, ref in zip((wp1, wp2, sp1, sp2), expected):
+                        want = ref.flip(0) if reuse == 1 else ref
+                        assert torch.equal(t.view(torch.uint8)[active], want[active])
+                        assert (t.view(torch.uint8)[inactive] == 0xff).all()
+                del expected
+                native_check = {"active_pack_exact": True, "routing_unpack_exact": True,
+                                "inactive_experts_untouched": True, "routing_and_layer_reuses": 3}
+                pack_ms = timing.bench(flat_pack)
+
         def run():
             nonlocal latest_parts
+            if flat:
+                if args.arm == "flat-active":
+                    flat_pack()
+                aiter.fmoe_fp8_blockscale_g1u1(
+                    flat_out, x, wp1, wp2, flat_ids, flat_weights, flat_ids, flat_ids, topk,
+                    flat_scales, sp1, sp2,
+                    kernelName="_ZN5aiter60fmoe_bf16_a16_blockscaleFp8_g1u1_vs_silu_1tg_16x128_flat_pf3E",
+                    block_size_M=16)
+                return flat_out
             if args.arm in ["aiter-repack", "aiter-slots", "native"]:
                 pack()
             if native:
@@ -321,6 +389,14 @@ def main():
     out = run()
     torch.cuda.synchronize()
     assert torch.isfinite(out).all()
+    if flat:
+        for repeat in range(12):
+            flat_storage.fill_(0xA5 ^ repeat)
+            out = run()
+            torch.cuda.synchronize()
+            assert torch.isfinite(out).all()
+            assert torch.all(flat_storage[row_bytes+8:] == (0xA5 ^ repeat))
+
     if args.arm == "aiter-slots":
         first = out.clone()
         golden_acc = latest_parts.reshape(rows, topk, hidden).double().sum(dim=1)
@@ -367,6 +443,17 @@ def main():
             gold[j] += (b @ (torch.nn.functional.silu(gate) * up)) * weights[row, slot]
     rel = ((out[picks].float()-gold).square().sum() / gold.square().sum()).sqrt().item()
     assert rel < (0.01 if args.arm == "plow" else 0.1), rel
+    if flat:
+        reuse_errors = []
+        for repeat in range(12):
+            flat_storage.fill_(0xA5 ^ repeat)
+            out = run()
+            torch.cuda.synchronize()
+            error = ((out[picks].float()-gold).square().sum() / gold.square().sum()).sqrt().item()
+            assert error < 0.1 and torch.isfinite(out).all(), error
+            assert torch.all(flat_storage[row_bytes+8:] == (0xA5 ^ repeat))
+            reuse_errors.append(error)
+        repeat_check = {"poisoned_workspace_reuses": 12, "output_guard_bytes": 512, "oracle_relative_l2": reuse_errors}
     warm_ms = timing.bench(run)
     cold_samples = []
     if args.cache_flush_mib:
@@ -401,7 +488,9 @@ def main():
         "library_sha256": sha(args.library), "source_sha256": sha(Path(__file__)),
         "capture_sha256": {p.name: sha(p) for p in sorted(args.capture.glob("*.bin"))},
         "checkpoint": checkpoint_meta,
-        "boundary": "native-active packs only routed experts; native-resident excludes weight packing (requires resident shuffled weights); align, activation quantization if applicable, expert GLU/down and routing-weight combine; aiter-repack, aiter-slots and native include weight packing on every dispatch; native also stores FP32 output; excludes checkpoint loading, router top-k, shared expert, residual and TP communication",
+        "flat_library_sha256": sha(args.flat_library) if args.flat_library else None,
+        "flat_resident_only": args.arm == "flat-resident",
+        "boundary": "flat-active includes routed weight packing and table unpack; flat-resident excludes all weight packing and returns BF16; native-active packs only routed experts; native-resident excludes weight packing (requires resident shuffled weights); align, activation quantization if applicable, expert GLU/down and routing-weight combine; aiter-repack, aiter-slots and native include weight packing on every dispatch; native also stores FP32 output; excludes checkpoint loading, router top-k, shared expert, residual and TP communication",
     }
     torch.save(out.cpu(), args.out.with_suffix(".pt"))
     args.out.write_text(json.dumps(record, indent=2) + "\n")

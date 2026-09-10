@@ -5,6 +5,46 @@ It calls plow's actual grouped align/GLU/down/combine bodies and AITER's fused
 MoE entry point on synthetic and captured inputs. The native adapter also has
 an opt-in serving route, described below.
 
+## Flat A16 decode candidate
+
+The gfx942 flat A16 object performs activation quantization, routing and output
+initialization internally. The local high-level AITER dispatcher still rejects
+flat kernels on gfx942; the isolated harness calls the low-level entry point
+with the pinned gfx942 object. `flat-active` adds one kernel that packs only
+routed experts and unpacks the raw routing table. It does not sort tokens.
+
+Layer-77, rank-0 decode activations and TP8 checkpoint weights give these
+packing-inclusive results. Smaller batches use prefixes of the batch-8 capture.
+
+| Rows | Plow warm, µs | Flat + pack warm, µs | Plow cold, µs | Flat + pack cold, µs |
+|---:|---:|---:|---:|---:|
+| 2 | 225.86 | 113.21 | 254.54 | 156.03 |
+| 4 | 228.78 | 114.65 | 259.91 | 164.65 |
+| 8 | 243.44 | 126.95 | 278.86 | 199.54 |
+
+Warm savings are 48–50%; cache-flushed savings are 28–39%. The resident-weight
+flat kernel alone takes 52.16 µs at batch 8. All twelve cells, including a
+batch-1 grouped-adapter experiment, passed the complete FP32 oracle screening.
+Flat relative L2 error is about 3%, versus 0.23% for Plow. This does not establish
+model-quality equivalence or a serving speedup.
+
+Each flat arm checks twelve poisoned output reuses and a 512-byte guard after
+the eight-byte coordination region. Packing checks exact active weights and
+routing, untouched inactive experts, and changed routing/layer pointer tables.
+See [samples and provenance](mi300x-flat.json).
+
+Build `flat_pack.hip` using the same compiler flags and includes as `kernels.hip`
+below, then link it as a separate shared library. Build the Plow control with
+`-DPLOW_MOE_BENCH_DECODE=1`. Run `captured.py` with `--arm flat-resident` or
+`--arm flat-active`, `--flat-library /path/to/flat-pack.so`, the pinned `--object`,
+`--rows 8 --oracle-all-rows --cache-flush-mib 512`, and the existing capture,
+checkpoint and library arguments. The runner verifies both the supplied and
+actually loaded AITER object against the recorded SHA-256.
+
+Router top-k, shared expert, residual, TP communication and interpreter
+scheduling remain outside timing. Production integration must preserve ordered
+segments and XCD placement, then pass full-model quality and serving tests.
+
 Inside `nix develop`, with ROCm PyTorch and `amd-aiter==0.1.19` available:
 
 ```sh
