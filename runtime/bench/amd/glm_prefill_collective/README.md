@@ -29,6 +29,33 @@ instrumentation cost.
 
 This check also found that the frozen serving prefill image predates the
 ragged-fold fix in `9a3a7763`. A build from current source is not an identical
-control. Qualifying the refreshed FP8 prefill asset is a separate next step.
+control. The refreshed asset is qualified separately below.
 The record includes exact build/trace recipes, source and image hashes,
 per-collective phase rows, and raw trace hashes. No production defaults change.
+
+## Refreshed prefill image
+
+[mi300x-refresh.json](mi300x-refresh.json) compares the current-source default
+FP8 prefill GQ image against the original image. This includes the ragged-fold
+fix and local-selector helper/marker; it does not isolate either change.
+Phase instrumentation is disabled. Only this interpreter image differs;
+both arms use the same runtime and 633-native-GEMM packet, with local selection
+enabled, native fold disabled, and decode tiers disabled.
+
+Each arm passes 18/18 retrieval checks at concurrency 20 and completes all 20
+random serving requests without failures. Input/output length arrays match
+exactly: 1,414,538 input tokens and 13,795 generated tokens, without speculation.
+
+| Metric | Refreshed | Original | Change |
+| --- | ---: | ---: | ---: |
+| Output throughput (tok/s) | 44.003 | 42.747 | +2.94% |
+| Mean TTFT (ms) | 111116.34 | 112266.90 | -1.02% |
+| Mean TPOT (ms) | 271.57 | 274.23 | -0.97% |
+| P99 TPOT (ms) | 405.41 | 406.63 | -0.30% |
+| Median ITL (ms) | 134.39 | 138.67 | -3.08% |
+
+One exclusive eight-MI300X lease covers both arms, with no concurrent builds
+or other GPU work. This is one matched pair without a repeatability estimate.
+Only 4/20 generated texts match exactly; retrieval checks do not establish
+broad model-quality equivalence. The 100-request H200 target remains unmet.
+The record includes build provenance, artifact hashes, and the campaign recipe.
