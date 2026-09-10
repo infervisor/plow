@@ -1,0 +1,1065 @@
+{
+  "schema": "plow.glm53.prefill-segment-profile.v1",
+  "date": "2026-09-10",
+  "source_commit": "7bfdb63ec3c6badebdbd0f5a08150d182f5f63d9",
+  "runtime_sha256": "681b9cba2cce524f59cb7d6bb4002500da8ce5abe40fb99a219ac3342ce8acc5",
+  "packet_sha256": "831f99b2da3375f7392cdd5178f1eb89219cc33a763a8d9e043ad6a8cfdaead5",
+  "raw_log_sha256": "8696cef21447b656a01e19286a8ffdeb244828ec47c40c53d3e78c5cffc150de",
+  "gpu": "MI300X gfx942",
+  "tp": 8,
+  "gpu_lease_count": 8,
+  "prompt_tokens": 70000,
+  "repetitions": 1,
+  "warmups": 0,
+  "additional_env": {
+    "PLOW_PREFILL_SEG_TIMING": "1"
+  },
+  "boundary": "All-rank host drain after each segment; diagnostic attribution, not normal serving latency",
+  "families": {
+    "interpreter": {
+      "segments": 1575,
+      "critical_ms": 4688.86423,
+      "enqueue_ms": 6.3851130000000005
+    },
+    "index_tp": {
+      "segments": 189,
+      "critical_ms": 487.85094300000003,
+      "enqueue_ms": 3.437943
+    },
+    "flash_interpreter": {
+      "segments": 78,
+      "critical_ms": 223.289976,
+      "enqueue_ms": 0.336932
+    },
+    "moe_aiter_fp8": {
+      "segments": 675,
+      "critical_ms": 2075.900627,
+      "enqueue_ms": 13.163207
+    },
+    "mla_sparse_aiter": {
+      "segments": 624,
+      "critical_ms": 1584.9891380000001,
+      "enqueue_ms": 6.062069
+    }
+  },
+  "chunks": {
+    "0": {
+      "interpreter": {
+        "segments": 175,
+        "critical_ms": 536.2607539999999,
+        "enqueue_ms": 0.7229289999999999
+      },
+      "index_tp": {
+        "segments": 21,
+        "critical_ms": 33.882523,
+        "enqueue_ms": 0.364304
+      },
+      "flash_interpreter": {
+        "segments": 78,
+        "critical_ms": 223.289976,
+        "enqueue_ms": 0.336932
+      },
+      "moe_aiter_fp8": {
+        "segments": 75,
+        "critical_ms": 237.694095,
+        "enqueue_ms": 1.573528
+      }
+    },
+    "8192": {
+      "interpreter": {
+        "segments": 175,
+        "critical_ms": 536.629979,
+        "enqueue_ms": 0.699055
+      },
+      "index_tp": {
+        "segments": 21,
+        "critical_ms": 38.282715,
+        "enqueue_ms": 0.43412
+      },
+      "mla_sparse_aiter": {
+        "segments": 78,
+        "critical_ms": 200.77408400000002,
+        "enqueue_ms": 0.82963
+      },
+      "moe_aiter_fp8": {
+        "segments": 75,
+        "critical_ms": 237.604843,
+        "enqueue_ms": 1.412089
+      }
+    },
+    "16384": {
+      "interpreter": {
+        "segments": 175,
+        "critical_ms": 540.15067,
+        "enqueue_ms": 0.726425
+      },
+      "index_tp": {
+        "segments": 21,
+        "critical_ms": 44.544294,
+        "enqueue_ms": 0.359089
+      },
+      "mla_sparse_aiter": {
+        "segments": 78,
+        "critical_ms": 204.086283,
+        "enqueue_ms": 0.77756
+      },
+      "moe_aiter_fp8": {
+        "segments": 75,
+        "critical_ms": 237.270468,
+        "enqueue_ms": 1.3555679999999999
+      }
+    },
+    "24576": {
+      "interpreter": {
+        "segments": 175,
+        "critical_ms": 543.6878959999999,
+        "enqueue_ms": 0.707302
+      },
+      "index_tp": {
+        "segments": 21,
+        "critical_ms": 50.978008,
+        "enqueue_ms": 0.344792
+      },
+      "mla_sparse_aiter": {
+        "segments": 78,
+        "critical_ms": 206.371274,
+        "enqueue_ms": 0.7501209999999999
+      },
+      "moe_aiter_fp8": {
+        "segments": 75,
+        "critical_ms": 237.77490400000002,
+        "enqueue_ms": 1.552702
+      }
+    },
+    "32768": {
+      "interpreter": {
+        "segments": 175,
+        "critical_ms": 547.235429,
+        "enqueue_ms": 0.7053780000000001
+      },
+      "index_tp": {
+        "segments": 21,
+        "critical_ms": 57.857716,
+        "enqueue_ms": 0.370019
+      },
+      "mla_sparse_aiter": {
+        "segments": 78,
+        "critical_ms": 208.306854,
+        "enqueue_ms": 0.762542
+      },
+      "moe_aiter_fp8": {
+        "segments": 75,
+        "critical_ms": 237.858149,
+        "enqueue_ms": 1.32955
+      }
+    },
+    "40960": {
+      "interpreter": {
+        "segments": 175,
+        "critical_ms": 547.311328,
+        "enqueue_ms": 0.7116359999999999
+      },
+      "index_tp": {
+        "segments": 21,
+        "critical_ms": 65.53635700000001,
+        "enqueue_ms": 0.389633
+      },
+      "mla_sparse_aiter": {
+        "segments": 78,
+        "critical_ms": 209.93965599999999,
+        "enqueue_ms": 0.729383
+      },
+      "moe_aiter_fp8": {
+        "segments": 75,
+        "critical_ms": 238.35531,
+        "enqueue_ms": 1.4422840000000001
+      }
+    },
+    "49152": {
+      "interpreter": {
+        "segments": 175,
+        "critical_ms": 549.550596,
+        "enqueue_ms": 0.7095929999999999
+      },
+      "index_tp": {
+        "segments": 21,
+        "critical_ms": 72.024256,
+        "enqueue_ms": 0.367017
+      },
+      "mla_sparse_aiter": {
+        "segments": 78,
+        "critical_ms": 211.352186,
+        "enqueue_ms": 0.73175
+      },
+      "moe_aiter_fp8": {
+        "segments": 75,
+        "critical_ms": 238.348575,
+        "enqueue_ms": 1.420082
+      }
+    },
+    "57344": {
+      "interpreter": {
+        "segments": 175,
+        "critical_ms": 552.527608,
+        "enqueue_ms": 0.720842
+      },
+      "index_tp": {
+        "segments": 21,
+        "critical_ms": 78.188909,
+        "enqueue_ms": 0.39210500000000004
+      },
+      "mla_sparse_aiter": {
+        "segments": 78,
+        "critical_ms": 213.270128,
+        "enqueue_ms": 0.7266900000000001
+      },
+      "moe_aiter_fp8": {
+        "segments": 75,
+        "critical_ms": 238.774386,
+        "enqueue_ms": 1.455196
+      }
+    },
+    "65536": {
+      "interpreter": {
+        "segments": 175,
+        "critical_ms": 335.50996999999995,
+        "enqueue_ms": 0.6819529999999999
+      },
+      "index_tp": {
+        "segments": 21,
+        "critical_ms": 46.556165,
+        "enqueue_ms": 0.41686399999999996
+      },
+      "mla_sparse_aiter": {
+        "segments": 78,
+        "critical_ms": 130.88867299999998,
+        "enqueue_ms": 0.754393
+      },
+      "moe_aiter_fp8": {
+        "segments": 75,
+        "critical_ms": 172.219897,
+        "enqueue_ms": 1.622208
+      }
+    }
+  },
+  "layer38_full_chunk": [
+    {
+      "program": 3,
+      "bucket": 8192,
+      "c0": 57344,
+      "rows": 8192,
+      "segment": 168,
+      "family": "interpreter",
+      "enqueue_us": 4.066,
+      "critical_us": 4048.615,
+      "ops": [
+        {
+          "index": 1132,
+          "op": "MoeCombinePf",
+          "tensors": [
+            "act.dg_tp",
+            null,
+            "act.shared",
+            "act.part"
+          ],
+          "ints": [
+            6144,
+            1,
+            8192,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "index": 1133,
+          "op": "XReduceTwoShot",
+          "tensors": [
+            "act.attn",
+            null,
+            null,
+            null,
+            null,
+            null,
+            null
+          ],
+          "ints": [
+            50331648,
+            8,
+            100663296,
+            183,
+            184,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "index": 1134,
+          "op": "Residual",
+          "tensors": [
+            "act.x",
+            "act.xmid",
+            "act.attn",
+            null
+          ],
+          "ints": [
+            50331648,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "index": 1135,
+          "op": "RmsNorm",
+          "tensors": [
+            "act.xn",
+            "act.x",
+            "model.layers.38.input_layernorm.weight",
+            null,
+            null
+          ],
+          "ints": [
+            8192,
+            6144,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "index": 1136,
+          "op": "GemmWide",
+          "tensors": [
+            "act.qlr",
+            "act.xn",
+            "model.layers.38.self_attn.q_a_proj.weight",
+            null
+          ],
+          "ints": [
+            8192,
+            2048,
+            6144,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "index": 1137,
+          "op": "GemmMed",
+          "tensors": [
+            "act.ckvraw",
+            "act.xn",
+            "model.layers.38.self_attn.derived.kv_a_latent.weight",
+            null
+          ],
+          "ints": [
+            8192,
+            512,
+            6144,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "index": 1138,
+          "op": "GemmSmall",
+          "tensors": [
+            "act.krr",
+            "act.xn",
+            "model.layers.38.self_attn.derived.k_rope.weight",
+            null
+          ],
+          "ints": [
+            8192,
+            64,
+            6144,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "index": 1139,
+          "op": "RmsNorm",
+          "tensors": [
+            "act.qlat",
+            "act.qlr",
+            "model.layers.38.self_attn.q_a_layernorm.weight",
+            null,
+            null
+          ],
+          "ints": [
+            8192,
+            2048,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "index": 1140,
+          "op": "Gemm",
+          "tensors": [
+            "act.qa",
+            "act.qlat",
+            "model.layers.38.self_attn.derived.q_absorb.weight",
+            null
+          ],
+          "ints": [
+            8192,
+            4096,
+            2048,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "index": 1141,
+          "op": "GemmMed",
+          "tensors": [
+            "act.qrr",
+            "act.qlat",
+            "model.layers.38.self_attn.derived.q_rope.weight",
+            null
+          ],
+          "ints": [
+            8192,
+            512,
+            2048,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "index": 1142,
+          "op": "HeadNormRope",
+          "tensors": [
+            "act.qr",
+            "act.qrr",
+            null,
+            "in.cos",
+            "in.sin",
+            "in.pos"
+          ],
+          "ints": [
+            8192,
+            8,
+            64,
+            0,
+            1,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "index": 1143,
+          "op": "RmsNorm",
+          "tensors": [
+            "kv.38.ckv",
+            "act.ckvraw",
+            "model.layers.38.self_attn.kv_a_layernorm.weight",
+            null,
+            null
+          ],
+          "ints": [
+            8192,
+            512,
+            0,
+            0,
+            0,
+            0,
+            0,
+            81920
+          ]
+        },
+        {
+          "index": 1144,
+          "op": "HeadNormRope",
+          "tensors": [
+            "kv.38.krot",
+            "act.krr",
+            null,
+            "in.cos",
+            "in.sin",
+            "in.pos"
+          ],
+          "ints": [
+            8192,
+            1,
+            64,
+            0,
+            1,
+            0,
+            0,
+            81920
+          ]
+        },
+        {
+          "index": 1145,
+          "op": "Gemm",
+          "tensors": [
+            "act.qidx_pf",
+            "act.qlat",
+            "model.layers.38.self_attn.indexer.wq_b.weight",
+            null
+          ],
+          "ints": [
+            8192,
+            4096,
+            2048,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "index": 1146,
+          "op": "HeadNormRope",
+          "tensors": [
+            "act.qidx_pf",
+            "act.qidx_pf",
+            null,
+            "in.icos",
+            "in.isin",
+            "in.pos"
+          ],
+          "ints": [
+            8192,
+            32,
+            128,
+            0,
+            1,
+            1,
+            0,
+            0
+          ]
+        },
+        {
+          "index": 1147,
+          "op": "GemmSmall",
+          "tensors": [
+            "act.kidx_pf",
+            "act.xn",
+            "model.layers.38.self_attn.indexer.wk.weight",
+            null
+          ],
+          "ints": [
+            8192,
+            128,
+            6144,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "index": 1148,
+          "op": "LayerNorm",
+          "tensors": [
+            "act.kidx_pf",
+            "act.kidx_pf",
+            "model.layers.38.self_attn.indexer.k_norm.weight",
+            "model.layers.38.self_attn.indexer.k_norm.bias"
+          ],
+          "ints": [
+            8192,
+            128,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "index": 1149,
+          "op": "HeadNormRope",
+          "tensors": [
+            "kv.38.kidx",
+            "act.kidx_pf",
+            null,
+            "in.icos",
+            "in.isin",
+            "in.pos"
+          ],
+          "ints": [
+            8192,
+            1,
+            128,
+            0,
+            1,
+            1,
+            0,
+            0
+          ]
+        },
+        {
+          "index": 1150,
+          "op": "GemmSmall",
+          "tensors": [
+            "act.widx_pf",
+            "act.xn",
+            "model.layers.38.self_attn.indexer.weights_proj.weight",
+            null
+          ],
+          "ints": [
+            8192,
+            32,
+            6144,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "program": 3,
+      "bucket": 8192,
+      "c0": 57344,
+      "rows": 8192,
+      "segment": 169,
+      "family": "index_tp",
+      "enqueue_us": 13.53,
+      "critical_us": 3788.265,
+      "ops": [
+        {
+          "index": 1151,
+          "op": "IndexTpPf",
+          "tensors": [
+            "act.iidx_pf",
+            "act.iscore_pf",
+            "act.qidx_pf",
+            "kv.38.kidx",
+            "act.widx_pf",
+            "in.kvlen",
+            "act.dg_tp"
+          ],
+          "ints": [
+            8192,
+            81920,
+            2048,
+            8,
+            100663296,
+            185,
+            187,
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "program": 3,
+      "bucket": 8192,
+      "c0": 57344,
+      "rows": 8192,
+      "segment": 170,
+      "family": "interpreter",
+      "enqueue_us": 3.946,
+      "critical_us": 914.816,
+      "ops": [
+        {
+          "index": 1152,
+          "op": "IndexUnionPf",
+          "tensors": [
+            "act.iuni",
+            "act.iumask",
+            "act.iidx_pf",
+            "in.kvlen"
+          ],
+          "ints": [
+            8192,
+            2048,
+            81920,
+            16384,
+            8,
+            0,
+            0,
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "program": 3,
+      "bucket": 8192,
+      "c0": 57344,
+      "rows": 8192,
+      "segment": 171,
+      "family": "mla_sparse_aiter",
+      "enqueue_us": 8.974,
+      "critical_us": 3098.206,
+      "ops": [
+        {
+          "index": 1153,
+          "op": "FlashMlaPrefill",
+          "tensors": [],
+          "ints": [
+            1,
+            8,
+            81920,
+            0,
+            8192,
+            4294967295,
+            16384,
+            4
+          ]
+        }
+      ]
+    },
+    {
+      "program": 3,
+      "bucket": 8192,
+      "c0": 57344,
+      "rows": 8192,
+      "segment": 172,
+      "family": "interpreter",
+      "enqueue_us": 4.116,
+      "critical_us": 3343.121,
+      "ops": [
+        {
+          "index": 1154,
+          "op": "MlaMergeFold",
+          "tensors": [
+            "act.oat",
+            "act.opart",
+            "act.mlpart",
+            "model.layers.38.self_attn.derived.v_absorb.weight"
+          ],
+          "ints": [
+            8192,
+            8,
+            256,
+            0,
+            1,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "index": 1155,
+          "op": "Gemm",
+          "tensors": [
+            "act.og_tp",
+            "act.oat",
+            "model.layers.38.self_attn.o_proj.weight",
+            null
+          ],
+          "ints": [
+            8192,
+            6144,
+            2048,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "index": 1156,
+          "op": "XReduceTwoShot",
+          "tensors": [
+            "act.attn",
+            null,
+            null,
+            null,
+            null,
+            null,
+            null
+          ],
+          "ints": [
+            50331648,
+            8,
+            0,
+            188,
+            189,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "index": 1157,
+          "op": "Residual",
+          "tensors": [
+            "act.xmid",
+            "act.x",
+            "act.attn",
+            null
+          ],
+          "ints": [
+            50331648,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "index": 1158,
+          "op": "RmsNorm",
+          "tensors": [
+            "act.xn2",
+            "act.xmid",
+            "model.layers.38.post_attention_layernorm.weight",
+            null,
+            null
+          ],
+          "ints": [
+            8192,
+            6144,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "index": 1159,
+          "op": "GemmSmall",
+          "tensors": [
+            "act.rlogit",
+            "act.xn2",
+            "model.layers.38.mlp.gate.weight",
+            null
+          ],
+          "ints": [
+            8192,
+            256,
+            6144,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "index": 1160,
+          "op": "MoeRouterTopkPf",
+          "tensors": [
+            "act.tab",
+            "act.rlogit",
+            null,
+            "model.layers.38.mlp.gate.e_score_correction_bias"
+          ],
+          "ints": [
+            0,
+            256,
+            8,
+            7,
+            8192,
+            0,
+            1,
+            1
+          ]
+        },
+        {
+          "index": 1161,
+          "op": "MoeAlignPf",
+          "tensors": [
+            "act.moe_meta",
+            "act.tab",
+            "act.moe_rowtok",
+            "act.moe_rowpart",
+            "act.moe_rowgate"
+          ],
+          "ints": [
+            8192,
+            256,
+            8,
+            1,
+            64,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "index": 1162,
+          "op": "MoeAlignPf",
+          "tensors": [
+            "act.moe_meta",
+            "act.tab",
+            "act.moe_rowtok",
+            "act.moe_rowpart",
+            "act.moe_rowgate"
+          ],
+          "ints": [
+            8192,
+            256,
+            8,
+            2,
+            64,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "index": 1163,
+          "op": "MoeAlignPf",
+          "tensors": [
+            "act.moe_meta",
+            "act.tab",
+            "act.moe_rowtok",
+            "act.moe_rowpart",
+            "act.moe_rowgate"
+          ],
+          "ints": [
+            8192,
+            256,
+            8,
+            3,
+            64,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "index": 1164,
+          "op": "MoeAlignPf",
+          "tensors": [
+            "act.moe_meta",
+            "act.tab",
+            "act.moe_rowtok",
+            "act.moe_rowpart",
+            "act.moe_rowgate"
+          ],
+          "ints": [
+            8192,
+            256,
+            8,
+            4,
+            64,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "index": 1165,
+          "op": "GemmGlu",
+          "tensors": [
+            "act.shfu",
+            "act.xn2",
+            "model.layers.38.mlp.shared_experts.gate_proj.weight",
+            "model.layers.38.mlp.shared_experts.up_proj.weight",
+            null,
+            null
+          ],
+          "ints": [
+            8192,
+            256,
+            6144,
+            0,
+            0,
+            1,
+            0,
+            0
+          ]
+        },
+        {
+          "index": 1166,
+          "op": "Gemm",
+          "tensors": [
+            "act.shared",
+            "act.shfu",
+            "model.layers.38.mlp.shared_experts.down_proj.weight",
+            null
+          ],
+          "ints": [
+            8192,
+            6144,
+            256,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "program": 3,
+      "bucket": 8192,
+      "c0": 57344,
+      "rows": 8192,
+      "segment": 173,
+      "family": "moe_aiter_fp8",
+      "enqueue_us": 11.868,
+      "critical_us": 3244.514,
+      "ops": [
+        {
+          "index": 1167,
+          "op": "MoeAiterFp8Pf",
+          "tensors": [
+            "act.part",
+            "act.xn2",
+            "model.layers.38.mlp.expert_weight_table",
+            "model.layers.38.mlp.expert_scale_table",
+            "act.moe_meta",
+            "act.moe_rowtok",
+            "act.moe_rowpart",
+            "act.moe_rowgate"
+          ],
+          "ints": [
+            8192,
+            6144,
+            256,
+            256,
+            8,
+            64,
+            0,
+            0
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -2455,3 +2455,38 @@ See [native reproduction](../../runtime/bench/amd/dsa_pf_tp/README.md#native-hsa
 and [tail protocol records](../../runtime/bench/amd/dsa_pf_tp/mi300x-protocol-tail.json).
 The [serving record](../../runtime/bench/amd/dsa_pf_tp/mi300x-serving.json)
 contains metrics, quality cells and artifact hashes.
+
+## 19. hipBLASLt projection assembly qualification (2026-09-10)
+
+With native indexer and MoE enabled, a 70k-token diagnostic profile attributes
+**4.689 / 9.061 s** to ordinary interpreter segments, **2.076 s** to MoE,
+**1.585 s** to sparse MLA and **0.488 s** to the indexer. Interpreter segments
+combine dense projections, normalization, shared experts and TP collectives.
+The profile drains every segment; it does not measure normal serving latency.
+
+An isolated comparison covers ten emitted BF16 projection shapes at 8192 and
+4464 rows. Q-A, KV-latent and absorbed-Q use actual layer-38 inputs/weights;
+other shapes use seeded random inputs. Plow's Q-A and KV outputs reproduce
+the model captures bit-for-bit. All 20 cases pass sampled FP32-oracle checks.
+The hipBLASLt preference measures **1.3–2.0× faster at 8192 rows**. Q-A takes
+**495.00 → 318.76 µs**, absorbed-Q **363.89 → 227.90 µs**, KV-latent
+**152.64 → 104.63 µs**. These exclude interpreter and TP overhead.
+
+Library tracing identifies the selected gfx942 Tensile kernels. Four unique
+assembly kernels cover the large-row choices for those three captured
+projections. Direct HIP module launches pass 24 cases per workgroup mapping,
+including 1/129-row inputs and both large-row choices. The selected XCC mapping
+measures Q-A at **315.29 µs**. Sixteen of 24 outputs are bit-identical to the
+library; the largest all-output relative L2 difference is below 0.000047.
+
+Direct plow C HSA launches pass **12/12** cases, with complete outputs exact
+against HIP exports over three repeats and 512-byte guards intact. This exposed
+a 128-byte symbol-name limit in that C loader; it now allocates the full name
+at lookup. The kernels' notes declare a 160-byte inline ABI and no private
+scratch; their descriptors leave argument size zero, requiring an explicit
+size in the native host binding.
+
+These qualify a native assembly candidate, not a serving route. The next gates
+are opt-in isolated HSA dispatch, full-model quality and paired serving tests.
+The qualified serving rate remains **32.478 output tokens/s**; H200 parity is
+unmet. See [reproduction, source references and raw records](../../runtime/bench/amd/glm_projection/README.md).
