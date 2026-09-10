@@ -49,6 +49,12 @@ pub mod indirection;
 // Prefill-chunk helpers are only exercised by an engine with a prefill path (AMD today).
 #[cfg_attr(not(feature = "hsa"), allow(dead_code))]
 pub mod kvrow;
+/// Byte-copy planning for a CPU-prefilled head's KV rows.
+// Allowed dead until the head pool calls it. The planning rules are tested on
+// their own and land with the KV contract they depend on, rather than arriving
+// in the same commit as the pool that drives them.
+#[allow(dead_code)]
+pub mod kv_handoff;
 pub mod mixed_packet;
 #[cfg(feature = "hsa")]
 pub(crate) mod mixed_program;
