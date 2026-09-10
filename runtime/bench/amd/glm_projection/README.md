@@ -337,9 +337,9 @@ breakdown. `glm53_trace_attrib.py` now labels the arrival-to-last-ready envelope
 and completion tail explicitly and no longer calls their sum a serialized chain.
 
 
-The opt-in `--glm-gemm-lt-decode` / `PLOW_GLM_GEMM_LT_DECODE` path uses the
+The initial opt-in `--glm-gemm-lt-decode` / `PLOW_GLM_GEMM_LT_DECODE` path used the
 shared native GEMM adapter for q_a, kv_latent, q_absorb and o_proj at decode
-rungs 16/20 on gfx942 TP8. Router and shared_down are benchmarked only. The
+rungs 16/20 on gfx942 TP8. Router and shared_down were benchmarked only. The
 312 projections in each qualified rung retain ordered segment boundaries and
 all eight XCD domains. Prefill and rungs 1/2/4/8 have unchanged disassembly;
 the disabled packet is byte-identical to the preceding FP8-KV batch-20 packet.
@@ -357,3 +357,40 @@ remains false by default pending repeatability and broader quality checks.
 Validation: 177 AMD runtime tests (5 ignored), 35 GLM emitter tests, 120 packet
 tests, release build, and Lean ordering/LDS checks for all 10 full-model programs.
 The record contains both metric summaries, result hashes and the serving recipe.
+
+
+## Wider native decode coverage
+
+[mi300x-decode-coverage.json](mi300x-decode-coverage.json) records the extension
+of the same opt-in path to BF16 router, shared gate/up/down, and indexer wq_b
+projections. It reuses the existing assembly objects and loaded kernel specs.
+Native projections increase from 312 to 633 per decode program at rows 16/20;
+199 GEMVs remain. FP8 linear projections keep their existing kernels.
+
+The shared emitter helper retains isolated, ordered native segments. All 12
+shape/rung choices match the previously measured kernel names and XCD mappings.
+Prefill and rows 1/2/4/8 have identical disassembly; the feature-off packet is
+byte-identical when emitted by the old and new compilers. Validation passed
+36 GLM emitter tests, 179 AMD runtime tests (6 ignored), the release build,
+and Lean ordering/LDS checks for all 10 full-model programs.
+
+The matched serving pair uses the previous 312-projection packet as control.
+Both arms enable local selection, disable narrow tiers and native fold, and
+use the same runtime and unpruned FP8-KV decode object. An exclusive eight-GPU
+lease ran 18 retrieval checks at concurrency 20 and then 20 random requests
+per arm (70k/700 tokens, ratio .14, seed 0, concurrency 20, no speculation),
+without concurrent builds or other GPU work.
+
+| Metric | 633 projections | 312 projections | Change |
+| --- | ---: | ---: | ---: |
+| Output tokens/s | 43.360 | 42.332 | +2.43% |
+| Mean TPOT (ms) | 273.520 | 284.211 | −3.76% |
+| P99 TPOT (ms) | 422.151 | 405.788 | +4.03% |
+| Median ITL (ms) | 135.149 | 148.113 | −8.75% |
+
+Both arms passed 18/18 retrieval checks and completed 20/20 requests without
+failures. Input and output length arrays match exactly (1,414,538 input and
+13,795 output tokens); 5/20 generated texts match exactly. This single pair
+shows a modest throughput improvement with a worse TPOT tail. The flag stays
+false by default pending repeatability and broader quality checks. This is
+not the 100-request H200 comparison; the 273.67 tokens/s target remains unmet.

@@ -591,7 +591,7 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_GEMM_LT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_gemm_lt: bool,
 
-    /// Use native gfx942 hipBLASLt attention projections at decode rungs 16 and 20.
+    /// Use native gfx942 hipBLASLt BF16 projections at decode rungs 16 and 20.
     #[arg(long, env = "PLOW_GLM_GEMM_LT_DECODE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_gemm_lt_decode: bool,
 

@@ -1833,11 +1833,13 @@ fn glm_native_decode_gemm_preserves_xcd_boundaries() {
             }
             checked += 1;
             assert_eq!(prog.l2_domains, 8);
-            assert!(native.len() >= 12);
+            assert_eq!(native.len(), 16);
+            assert_eq!(native.iter().filter(|(_, d)| (d.i[1], d.i[2]) == (256, 6144)).count(), 3);
+            assert_eq!(native.iter().filter(|(_, d)| (d.i[1], d.i[2]) == (6144, 256)).count(), 1);
             for (ix, inst) in native {
                 assert_eq!(inst.i[0], rows);
                 assert_eq!(inst.i[3], 1);
-                assert!(matches!((inst.i[1], inst.i[2]), (2048, 6144) | (512, 6144) | (4096, 2048) | (6144, 2048)));
+                assert!(matches!((inst.i[1], inst.i[2]), (2048, 6144) | (512, 6144) | (4096, 2048) | (6144, 2048) | (256, 6144) | (6144, 256)));
                 let segment = prog.stream.iter().find(|e| e.inst as usize == ix).unwrap().seg;
                 assert!(segment > 0);
                 for entries in [&prog.stream, &prog.gq_stream] {

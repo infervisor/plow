@@ -3106,6 +3106,40 @@ fn glm_decode_gemv_cus(cus: &[u32], op: DevOp, n: u32, k: u32) -> Vec<u32> {
     }
 }
 
+fn emit_glm_decode_gemm_lt(
+    b: &mut Builder,
+    c: &GlmCfg,
+    enc: MoeEnc,
+    rows: u32,
+    operands: [u32; 3],
+    shape: [u32; 2],
+    deps: &[u32],
+) -> Option<u32> {
+    if !emit_config::active().glm_gemm_lt_decode
+        || !matches!(rows, 16 | 20)
+        || !matches!(
+            shape,
+            [2048, 6144] | [512, 6144] | [4096, 2048] | [6144, 2048] | [256, 6144] | [6144, 256]
+        )
+    {
+        return None;
+    }
+    assert!(
+        crate::emit_is_amd()
+            && c.tp == 8
+            && c.hidden == 6144
+            && b.n_cu() == 304
+            && enc != MoeEnc::Mxfp4,
+        "native GLM decode GEMM requires gfx942 TP8 BF16 projections"
+    );
+    let counter = b.emit(DevOp::GemmLtPf, vec![0], deps, |d| {
+        d.t[..3].copy_from_slice(&operands);
+        d.i[..4].copy_from_slice(&[rows, shape[0], shape[1], 1]);
+    });
+    b.isolate(counter);
+    Some(counter)
+}
+
 /// Emit the shared MLA attention sub-block (input norm -> q/kv down + absorbed folds -> dynamic
 /// interleaved RoPE on the 64 rope dims -> FLASH_MLA_DECODE -> merge -> O_UV_FOLD -> o_proj ->
 /// residual -> post-attention norm). Writes `n.xn2` (the FFN input) and returns the post-attn-norm
@@ -3161,31 +3195,8 @@ pub(crate) fn emit_glm_mla(
         } else {
             DevOp::Gemv
         };
-        if emit_config::active().glm_gemm_lt_decode
-            && matches!(rows, 16 | 20)
-            && matches!(
-                (nn, k),
-                (2048, 6144) | (512, 6144) | (4096, 2048) | (6144, 2048)
-            )
+        if let Some(counter) = emit_glm_decode_gemm_lt(b, c, enc, rows, [out, x, wt], [nn, k], deps)
         {
-            assert!(
-                crate::emit_is_amd()
-                    && c.tp == 8
-                    && c.hidden == 6144
-                    && b.n_cu() == 304
-                    && enc != MoeEnc::Mxfp4,
-                "native GLM decode GEMM requires gfx942 TP8 BF16 projections"
-            );
-            let counter = b.emit(DevOp::GemmLtPf, vec![0], deps, |d| {
-                d.t[0] = out;
-                d.t[1] = x;
-                d.t[2] = wt;
-                d.i[0] = rows;
-                d.i[1] = nn;
-                d.i[2] = k;
-                d.i[3] = 1;
-            });
-            b.isolate(counter);
             return counter;
         }
         b.emit(op, glm_decode_gemv_cus(&all, op, nn, k), deps, |d| {
@@ -3867,6 +3878,11 @@ fn emit_glm_dsa_decode_select(
     // block-fp8 checkpoint stores them quantized and that combination is refused at binding.
     let gemv_blk =
         |b: &mut Builder, out: u32, x: u32, wt: u32, nn: u32, k: u32, deps: &[u32]| -> u32 {
+            if let Some(counter) =
+                emit_glm_decode_gemm_lt(b, c, enc, rows, [out, x, wt], [nn, k], deps)
+            {
+                return counter;
+            }
             b.emit(DevOp::Gemv, all.to_vec(), deps, |d| {
                 d.t[0] = out;
                 d.t[1] = x;
@@ -6228,8 +6244,8 @@ pub(crate) fn glm_prefill_buckets_env(ctx: u32) -> (Vec<u32>, PrefillScope) {
 /// `n_exp = 1, top_k = 1` dense FFN.
 ///
 /// Differences from the prefill seam, each deliberate:
-///   * projections stay GEMV-family at `M = rows` (a 16-row GEMM tile would pad 8x; the GEMV
-///     rung ladder is the object's decode shape and `check_gemv_capacity` gates the pairing);
+///   * projections use GEMV-family at `M = rows`, with optional native BF16 GEMMs at
+///     qualified decode rungs; `check_gemv_capacity` gates the interpreter pairing;
 ///   * the TP fold is the decode ONE-SHOT `XReduce` over `rows*h` elements, not the row-banded
 ///     two-shot — banding exists to overlap an 8k-row chunk's fabric time, and at 16 rows the
 ///     band bookkeeping costs more than it hides;
@@ -6270,23 +6286,27 @@ fn emit_glm_moe_ffn_rows(
     } else {
         DevOp::Gemv
     };
-    let c_score = b.emit(
-        score_op,
-        glm_decode_gemv_cus(&all, score_op, e, h),
-        &[c_rn2],
-        |d| {
-            d.t[0] = n.rlogit;
-            d.t[1] = n.xn2;
-            d.t[2] = w.wr;
-            if enc == MoeEnc::Mxfp4 {
-                d.t[3] = w.wr_s;
-            }
-            d.i[0] = rows;
-            d.i[1] = e;
-            d.i[2] = h;
-            d.f[0] = 1.0;
-        },
-    );
+    let c_score =
+        emit_glm_decode_gemm_lt(b, c, enc, rows, [n.rlogit, n.xn2, w.wr], [e, h], &[c_rn2])
+            .unwrap_or_else(|| {
+                b.emit(
+                    score_op,
+                    glm_decode_gemv_cus(&all, score_op, e, h),
+                    &[c_rn2],
+                    |d| {
+                        d.t[0] = n.rlogit;
+                        d.t[1] = n.xn2;
+                        d.t[2] = w.wr;
+                        if enc == MoeEnc::Mxfp4 {
+                            d.t[3] = w.wr_s;
+                        }
+                        d.i[0] = rows;
+                        d.i[1] = e;
+                        d.i[2] = h;
+                        d.f[0] = 1.0;
+                    },
+                )
+            });
     let flat = emit_config::active().glm_moe_flat_decode && matches!(rows, 2 | 4 | 8);
     if flat {
         assert!(
@@ -6367,6 +6387,11 @@ fn emit_glm_moe_ffn_rows(
              no split form exists for the mxfp4 shared expert — cap the decode ladder"
         );
         let gemv_half = |b: &mut Builder, out: u32, wt: u32| {
+            if let Some(counter) =
+                emit_glm_decode_gemm_lt(b, c, enc, rows, [out, n.xn2, wt], [imoe_l, h], &[c_rn2])
+            {
+                return counter;
+            }
             b.emit(
                 DevOp::Gemv,
                 glm_decode_gemv_cus(&all, DevOp::Gemv, imoe_l, h),
@@ -6422,6 +6447,16 @@ fn emit_glm_moe_ffn_rows(
             d.i[2] = imoe_l;
             d.i[4] = 0;
         })
+    } else if let Some(counter) = emit_glm_decode_gemm_lt(
+        b,
+        c,
+        enc,
+        rows,
+        [n.shared, n.shfu, w.shd],
+        [h, imoe_l],
+        &[c_shglu],
+    ) {
+        counter
     } else {
         let shd_op = if enc == MoeEnc::Mxfp4 {
             DevOp::GemvMxfp4
@@ -7458,7 +7493,10 @@ fn glm_emit_full(
             pb.set_l2_placement(l2_layout);
         }
         if emit_config::active().glm_fold_lt && t >= 2048 {
-            assert!(crate::emit_is_amd() && target == "gfx942", "native MLA fold requires gfx942");
+            assert!(
+                crate::emit_is_amd() && target == "gfx942",
+                "native MLA fold requires gfx942"
+            );
             pb.deny_uniseg();
         }
         pb.adopt_tensors(tensors.clone());
@@ -8052,7 +8090,10 @@ pub(crate) fn glm_build_block_pf(
             (crate::emit_is_amd() && emit_config::active().moe_prefill_ep).then_some(c.tp),
         );
         if emit_config::active().glm_fold_lt && t >= 2048 {
-            assert!(crate::emit_is_amd() && n_cu == 304, "native MLA fold requires gfx942");
+            assert!(
+                crate::emit_is_amd() && n_cu == 304,
+                "native MLA fold requires gfx942"
+            );
             pb.deny_uniseg();
         }
         pb.adopt_tensors(tensors.clone());
