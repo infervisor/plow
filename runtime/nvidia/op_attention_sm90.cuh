@@ -62,9 +62,17 @@
 
 #include "sm90_wgmma.cuh"
 
-/* K/V pipeline depth: tile t+1 streams gmem->smem under tile t's GEMM0+softmax+GEMM1. FIXED at 2
- * (the buffer index is a parity flip, not a modulo ring) — this is a layout constant, not a knob. */
+/* Default K/V pipeline uses two slots, with tile t+1 loading under tile t's math. */
 #define FA_SM90_NS 2
+#ifndef PLOW_NV_FA512_KV64
+#define PLOW_NV_FA512_KV64 0
+#endif
+#if PLOW_NV_FA512_KV64 && defined(PLOW_FP8_KV)
+#error "HD512 KV64 single staging is BF16-only"
+#endif
+/* HD512/KV64 fits shared memory by reusing one slot after both consumers drain. */
+#define FA_SM90_STAGES(HD, BKV) \
+    ((PLOW_NV_FA512_KV64 && (HD) == 512 && (BKV) == 64) ? 1 : FA_SM90_NS)
 
 #ifndef PLOW_NV_FA_SPLIT_OUTER
 #define PLOW_NV_FA_SPLIT_OUTER 0
@@ -90,7 +98,7 @@
 /* smem floats claimed by the wgmma arm: Qs[HD/64][BQ][64] + NS x (Ks,Vs)[HD/64][BKV][64] bf16 +
  * Ps[BQ][BKV] bf16, plus the 1024 B the swizzle alignment may burn off the arena base. */
 #define FA_SM90_PRE_FLOATS(HD, BQ, BKV)                                                             \
-    ((2 * ((BQ) * (HD) + 2 * FA_SM90_NS * (BKV) * (HD) + (BQ) * (BKV)) + 1024 + 3) / 4)
+    ((2 * ((BQ) * (HD) + 2 * FA_SM90_STAGES(HD, BKV) * (BKV) * (HD) + (BQ) * (BKV)) + 1024 + 3) / 4)
 /* T30 wgitem: two independent per-warpgroup partitions (each the full single-item claim). */
 #define FA_SM90_WGI_FLOATS(HD, BQ, BKV)                                                             \
     ((2 * 2 * ((BQ) * (HD) + 2 * FA_SM90_NS * (BKV) * (HD) + (BQ) * (BKV) + 512) + 2048 + 3) / 4)
@@ -570,6 +578,8 @@ __device__ void d_flash_prefill_sm90(float* __restrict__ Opart, float* __restric
     constexpr int NTW = HD / 128;      /* n64 O tiles per warpgroup                     */
     constexpr int KS0 = HD / 16;       /* GEMM0 k16 steps (contract over HD)            */
     constexpr int QK_UNROLL = PLOW_NV_FA_QK_UNROLL;
+    constexpr int NSTAGE = FA_SM90_STAGES(HD, BKV);
+    constexpr int PV_UNROLL = NSTAGE == 1 ? 4 : 1;
     constexpr int KS1 = BKV / 16;      /* GEMM1 k16 steps (contract over BKV)           */
     constexpr int NB0 = BKV / 8;       /* n8 blocks in the score accumulator            */
     constexpr int QT = BQ * 64;        /* elements per Q sub-tile                       */
@@ -580,8 +590,8 @@ __device__ void d_flash_prefill_sm90(float* __restrict__ Opart, float* __restric
      * Sub-tiles are 8 KiB (Q) / 4 KiB (K,V), so aligning the base aligns all of them. --- */
     __nv_bfloat16* const Qs = (__nv_bfloat16*)sm90_align1024(lds);
     __nv_bfloat16* const Ks = Qs + NSUB * QT;                       /* [NS][NSUB][BKV][64] */
-    __nv_bfloat16* const Vs = Ks + FA_SM90_NS * NSUB * KT;          /* [NS][NSUB][BKV][64] */
-    __nv_bfloat16* const Ps = Vs + FA_SM90_NS * NSUB * KT;          /* [BQ][BKV] swizzle-0 */
+    __nv_bfloat16* const Vs = Ks + NSTAGE * NSUB * KT;              /* [NS][NSUB][BKV][64] */
+    __nv_bfloat16* const Ps = Vs + NSTAGE * NSUB * KT;              /* [BQ][BKV] swizzle-0 */
 
     const int tid = threadIdx.x;
     const int wg = tid >> 7;               /* warpgroup 0/1: owns hd [wg*HD/2, +HD/2)      */
@@ -597,13 +607,12 @@ __device__ void d_flash_prefill_sm90(float* __restrict__ Opart, float* __restric
      * 0*NaN != 0 in the mma — the same rule the px4 TMA arm documents). mbarrier phases run
      * continuously across tiles and work items; static smem, so no arena claim and no inval
      * (the barriers are never reused as plain data). */
-    __shared__ uint64_t fa90_bar[FA_SM90_NS];
+    __shared__ uint64_t fa90_bar[NSTAGE];
     // Dynamic stage arrays become local memory; two bits retain each parity and pending state.
     unsigned fa90_ph = 0;
     unsigned fa90_tma = 0;
     if (mapkv && tid == 0) {
-        sm90_mbar_init(&fa90_bar[0], 1);
-        sm90_mbar_init(&fa90_bar[1], 1);
+        for (int s = 0; s < NSTAGE; s++) sm90_mbar_init(&fa90_bar[s], 1);
     }
     if (mapkv) __syncthreads();
 
@@ -776,7 +785,9 @@ __device__ void d_flash_prefill_sm90(float* __restrict__ Opart, float* __restric
             const unsigned kv0 = eff_lo + (unsigned)t * BKV;
             __syncthreads(); /* (A) tile t visible block-wide; tile t-1's buffer + Ps now free */
             fa90_async_proxy_fence();
-            if (t + 1 < ntile) stageKV(kv0 + BKV, sb ^ 1);
+            if constexpr (NSTAGE == 2) {
+                if (t + 1 < ntile) stageKV(kv0 + BKV, sb ^ 1);
+            }
 
             /* --- GEMM0: S[64][BKV] = Q . K^T. scale-d = 0 on the first k-step seeds the
              * accumulator, so no zeroing pass. --- */
@@ -885,7 +896,7 @@ __device__ void d_flash_prefill_sm90(float* __restrict__ Opart, float* __restric
 #pragma unroll
             for (int nt = 0; nt < NTW; nt++) {
                 const int g = wg * NTW + nt;
-#pragma unroll 1
+#pragma unroll PV_UNROLL
                 for (int ks = 0; ks < KS1; ks++)
                     fa90_wgmma_m64n64k16_tb1(Oacc[nt],
                                              fa90_desc_ns(Ps + ks * 128, 128, 16 * BKV),
@@ -893,8 +904,15 @@ __device__ void d_flash_prefill_sm90(float* __restrict__ Opart, float* __restric
             }
             sm90_wg_commit();
             sm90_wg_wait<0>();
-            waitKV(sb ^ 1); /* tile t+1 has landed for this thread */
-            sb ^= 1;
+            if constexpr (NSTAGE == 1) {
+                // Both warpgroups must finish reading K/V before the shared slot is reused.
+                __syncthreads();
+                if (t + 1 < ntile) stageKV(kv0 + BKV, 0);
+                waitKV(0);
+            } else {
+                waitKV(sb ^ 1); /* tile t+1 has landed for this thread */
+                sb ^= 1;
+            }
         }
 
         /* --- epilogue. nsplit>1: UNNORMALISED partials + (m,l) for d_flash_merge. Otherwise

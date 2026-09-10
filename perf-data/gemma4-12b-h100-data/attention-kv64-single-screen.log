@@ -1,0 +1,5 @@
+cudaFuncSetAttribute(run_attention<HD,BKV>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem): invalid argument
+mode=body HD=256 BKV=32 KV=8 window=1024 maps=0 checked=4608 worst_relL2=0.00267912 max_abs=0.00110828 warm_us=75.021 PASS
+mode=body HD=256 BKV=64 KV=8 window=1024 maps=0 checked=4608 worst_relL2=0.00267076 max_abs=0.00113624 warm_us=60.349 PASS
+mode=body HD=512 BKV=16 KV=1 window=0 maps=0 checked=9216 worst_relL2=0.00252794 max_abs=0.00117296 warm_us=1844.742 PASS
+mode=body HD=512 BKV=32 KV=1 window=0 maps=0 checked=9216 worst_relL2=0.00252794 max_abs=0.00117694 warm_us=1430.093 PASS

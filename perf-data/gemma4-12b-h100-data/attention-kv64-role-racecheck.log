@@ -1,0 +1,6 @@
+========= COMPUTE-SANITIZER
+HD=512 BKV=32 smem=201728
+HD=512 BKV=32 smem=201728
+mode=interpreter HD=512 BKV=0 KV=1 window=0 maps=0 checked=9216 worst_relL2=0.00253994 max_abs=0.00117694 warm_us=nan PASS
+mode=interpreter HD=512 BKV=0 KV=1 window=0 maps=1 checked=9216 worst_relL2=0.00253994 max_abs=0.00117694 warm_us=nan PASS
+========= RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings)

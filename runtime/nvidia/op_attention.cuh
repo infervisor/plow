@@ -1481,9 +1481,11 @@ __device__ void d_flash_merge(__nv_bfloat16* __restrict__ O, const float* __rest
  * fp8-KV arm, and every sm_120a build — is untouched and byte-identical. */
 #if defined(PLOW_NV_HOPPER)
 #include "op_attention_sm90.cuh"
+/* Single-stage BF16 WGMMA never dispatches the legacy layout. */
 #define FA_PRE_SMEM_FLOATS(HD, BQ, BKV)                                                             \
     (FA_SM90_WG_ELIGIBLE(HD, BQ, BKV) && PLOW_NV_FA_PIPE                                            \
-         ? (FA_SM90_PRE_FLOATS(HD, BQ, BKV) > FA_PRE_SMEM_BASE(HD, BQ, BKV)                         \
+         ? ((FA_SM90_STAGES(HD, BKV) == 1 ||                                                      \
+             FA_SM90_PRE_FLOATS(HD, BQ, BKV) > FA_PRE_SMEM_BASE(HD, BQ, BKV))                       \
                 ? FA_SM90_PRE_FLOATS(HD, BQ, BKV)                                                   \
                 : FA_PRE_SMEM_BASE(HD, BQ, BKV))                                                    \
          : FA_PRE_SMEM_BASE(HD, BQ, BKV))

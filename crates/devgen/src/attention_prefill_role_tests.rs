@@ -61,7 +61,10 @@ fn wgmma_object_selects_its_tile_and_rejects_partial_output() {
     let mut sections = Vec::new();
     assert!(apply_output_object(&mut model, &mut sections, "sm90a", &output).unwrap());
     let roles = SegmentRoles::from_bytes(&sections[0].data).unwrap();
-    assert_eq!(roles.objects[&PREFILL_ATTENTION_HD512_WG32].attention, Some(capability(true)));
+    assert_eq!(
+        roles.objects[&PREFILL_ATTENTION_HD512_WG32].attention,
+        Some(capability(true))
+    );
 
     let mut partial = fixture(512, true, false);
     let before = partial.to_blob();
@@ -69,6 +72,22 @@ fn wgmma_object_selects_its_tile_and_rejects_partial_output() {
     assert!(apply_output_object(&mut partial, &mut sections, "sm90a", &output).is_err());
     assert_eq!(partial.to_blob(), before);
     assert!(sections.is_empty());
+
+    globals[3].1 = 64;
+    std::fs::write(directory.join(OBJECT_FILE), object_image(&globals)).unwrap();
+    let mut wide = fixture(512, true, true);
+    assert!(apply_output_object(&mut wide, &mut Vec::new(), "sm90a", &output).is_err());
+    globals[6].1 = 205_824;
+    std::fs::write(directory.join(OBJECT_FILE), object_image(&globals)).unwrap();
+    let mut sections = Vec::new();
+    assert!(apply_output_object(&mut wide, &mut sections, "sm90a", &output).unwrap());
+    let roles = SegmentRoles::from_bytes(&sections[0].data).unwrap();
+    let mut expected = capability(true);
+    expected.kv_tile = 64;
+    assert_eq!(
+        roles.objects[&PREFILL_ATTENTION_HD512_WG32].attention,
+        Some(expected)
+    );
 
     globals[3].1 = 16;
     std::fs::write(directory.join(OBJECT_FILE), object_image(&globals)).unwrap();

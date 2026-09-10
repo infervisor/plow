@@ -269,15 +269,25 @@ int main(int argc, char** argv) {
         else return 2;
     }
     if (lean_hd512 && !interpreter_path) return 2;
-    if (PLOW_TEST_FA_ROWS && !lean_hd512) return 2;
+    if (PLOW_TEST_FA_ROWS && !lean_hd512 && !PLOW_NV_FA512_KV64) return 2;
     bool ok = true;
     for (bool tma : {false, true}) {
+#if PLOW_NV_FA512_KV64 && PLOW_TEST_FA_ROWS
+        if (!interpreter_path) {
+            ok &= check<512,32>(1,16384,0xffffffffu,0,tma,profile);
+            ok &= check<512,64>(1,16384,0xffffffffu,0,tma,profile);
+            continue;
+        }
+#endif
         if (!lean_hd512) ok &= check<256,32>(8,2048,2047,1024,tma,profile);
         if (!interpreter_path) {
             ok &= check<256,64>(8,2048,2047,1024,tma,profile);
             ok &= check<512,16>(1,16384,0xffffffffu,0,tma,profile);
         }
         ok &= check<512,32>(1,16384,0xffffffffu,0,tma,profile);
+#if PLOW_NV_FA512_KV64
+        if (!interpreter_path) ok &= check<512,64>(1,16384,0xffffffffu,0,tma,profile);
+#endif
     }
     return ok ? 0 : 1;
 }

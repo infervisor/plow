@@ -274,6 +274,24 @@ fn accepts_exact_hd512_wg32_contract_and_rejects_drift() {
         [Some(512), Some(64), Some(32), Some(8)],
     )
     .unwrap();
+    let mut wide = hd512_object();
+    wide.attention.as_mut().unwrap().kv_tile = 64;
+    check_attention_hd512_role(
+        "sm90a",
+        &wide,
+        Some(1),
+        Some(256),
+        [Some(512), Some(64), Some(64), Some(8)],
+    )
+    .unwrap();
+    assert!(check_attention_hd512_role(
+        "sm90a",
+        &wide,
+        Some(1),
+        Some(256),
+        [Some(512), Some(64), Some(32), Some(8)],
+    )
+    .is_err());
     for geometry in [
         [Some(256), Some(64), Some(32), Some(8)],
         [Some(512), Some(32), Some(32), Some(8)],

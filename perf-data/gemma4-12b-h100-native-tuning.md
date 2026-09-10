@@ -752,3 +752,65 @@ verification with no extra per-case warmup, not an interleaved A/B. Historical
 vLLM BF16 C128 results remain substantially ahead at 2,131.578/196.035 tokens/s.
 [C128 raw results](gemma4-12b-h100-data/gemm-smepi-head-c128.json),
 [serving checks](gemma4-12b-h100-data/gemm-smepi-head-c128-verify.log).
+
+## HD512 KV64 single-stage screen
+
+The native BF16 SM90 HD512 role now supports Q64/KV64 with one K/V staging
+slot. Both warpgroups finish their asynchronous matrix reads before a CTA
+barrier permits overwriting the slot. It retains TMA and 128-byte swizzles,
+and unrolls the four P×V steps. This trades load/compute overlap for half as
+many online-softmax tiles. The dedicated object uses 255 registers, no stack
+or spills, and 205,824 bytes of dynamic shared memory. No CUTLASS or DeepGEMM
+kernel is linked.
+
+Build opt-in with `PLOW_BUILD_MASKED_PADDING=1 PLOW_BUILD_PFATTN_KV64=1`
+using `scripts/build_sm90a_gemma4_segments.sh`. Copy the resulting HD512
+object into the asset directory before compiling so the packet pins its
+hash and geometry. `PLOW_BUILD_GEMM_SMEPI=1` selects the GEMM epilogue used
+by both serving variants below. KV32 remains the default.
+
+| Query rows | KV32 TMA µs | KV64 TMA µs |
+|---:|---:|---:|
+| 128 | 1438.464 | 1365.760 |
+| 512 | 1439.360 | 1379.520 |
+| 1024 | 2835.648 | 2645.984 |
+| 2048 | 5432.288 | 5046.016 |
+| 4096 | 9888.544 | 9154.145 |
+| 8192 | 17166.113 | 15521.248 |
+
+These load the actual dedicated role, at 16K history, 16 query heads and one
+KV head. All 24 mapped/unmapped object/rung cases pass sampled FP64 checks.
+Ragged role execution passes memcheck and racecheck with zero errors or
+hazards. These checks do not measure bank conflicts. Full-model narrow vs
+widest KV64 execution passes 170 logit snapshots at each of 128 and 16,384
+prompt rows; this is rung consistency, not an independent model-quality test.
+
+Fresh sequential serving uses physical B32, queue128, context20480,
+request chunk1024, aggregate8192 and 128 outputs. C1/C32 have two repeats
+after one warmup. Both variants pass serving verification, and all 264
+measured requests return 128 tokens/cache0.
+
+| Input / concurrency | KV32 tok/s | KV64 tok/s |
+|---|---:|---:|
+| 1K / C1 | 75.712 | 76.130 |
+| 1K / C32 | 789.934 | 793.581 |
+| 16K / C1 | 45.799 | 46.087 |
+| 16K / C32 | 109.692 | 108.906 |
+
+16K/C1 median TTFT is 1069.116→1056.092 ms. Only 129/132 paired output texts
+match: three 16K/C32 requests differ in repeated digit or punctuation output.
+The cause is not established; the changed softmax grouping can alter BF16
+rounding. Keep KV64 opt-in pending broader numerical and serving qualification.
+
+The C128 follow-up returns 128 tokens/cache0 for all 256 requests, at
+782.164/109.078 tokens/s for 1K/16K. The preceding KV32 screen measured
+784.967/105.396. These are single sequential screens, not an interleaved A/B.
+Historical vLLM C128 remains ahead at 2131.578/196.035 tokens/s.
+
+A separate 16K/C1 event profile attributes total attention time to
+349.4→335.9 ms, GEMM to 527.1→528.0 ms and light ops to 137.1→137.3 ms.
+Attention includes all 40 HD256 and eight HD512 layers per chunk. Event
+profiling replaces graph execution, so these are diagnostic attribution
+times rather than normal serving latency.
+[Raw results, hashes, packet inventory and limits](gemma4-12b-h100-data/attention-kv64-summary.json),
+[actual-role rung checks](gemma4-12b-h100-data/attention-kv64-rungs.jsonl).

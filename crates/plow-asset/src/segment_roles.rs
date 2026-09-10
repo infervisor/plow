@@ -52,7 +52,7 @@ pub struct SegmentObject {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attention: Option<AttentionCapability>,
 }
-#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AttentionCapability {
     pub profile: String,
@@ -141,6 +141,10 @@ impl SegmentRoles {
                 kv_tile: 16,
                 warps: 8,
             };
+            let hd512_wg64 = AttentionCapability {
+                kv_tile: 64,
+                ..hd512_wg.clone()
+            };
             if object.abi != abi
                 || object.file.is_empty()
                 || std::path::Path::new(&object.file)
@@ -156,7 +160,7 @@ impl SegmentRoles {
                         || object
                             .attention
                             .as_ref()
-                            .is_none_or(|a| a != &hd512_wg && a != &hd512_px4)))
+                            .is_none_or(|a| a != &hd512_wg && a != &hd512_wg64 && a != &hd512_px4)))
                 || (matches!(id, MXFP4_MOE | NATIVE_DECODE_TC)
                     && (!valid_hash(object.sha256.as_deref())
                         || object.promote_k512.is_some()
@@ -245,6 +249,8 @@ mod tests {
             "a".repeat(64)
         );
         SegmentRoles::from_bytes(raw.as_bytes()).unwrap();
+        SegmentRoles::from_bytes(raw.replace("\"kv_tile\":32", "\"kv_tile\":64").as_bytes())
+            .unwrap();
         SegmentRoles::from_bytes(
             raw.replace(
                 "\"query_tile\":64,\"kv_tile\":32",
@@ -258,6 +264,7 @@ mod tests {
             raw.replace("\"head_dim\":512", "\"head_dim\":256"),
             raw.replace("\"query_tile\":64", "\"query_tile\":32"),
             raw.replace("\"kv_tile\":32", "\"kv_tile\":16"),
+            raw.replace("\"kv_tile\":32", "\"kv_tile\":128"),
             raw.replace("\"warps\":8", "\"warps\":4"),
             raw.replace("\"profile\":\"sm90a\"", "\"profile\":\"sm120\""),
             raw.replace("\"dtype\":\"bf16\"", "\"dtype\":\"fp8\""),

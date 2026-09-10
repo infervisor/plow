@@ -241,3 +241,21 @@ GEMM speedups range from 1.021× to 1.152×; the packed serving screen improves
 16K/C32 throughput from 104.374 to 108.485 tokens/s with all paired texts equal.
 This narrows the GEMM qualification gap. It does not qualify all other ops,
 all packed histories, FP8, or arbitrary shapes.
+
+## Opt-in HD512 KV64 packet
+
+The BF16 H100 KV64 candidate passes the strict packet/build audit at all six
+prefill and six decode rungs: **8,904 instructions, 2,736 exact cases**.
+Its [case inventory](gemma4-12b-h100-data/attention-kv64-ladder-cases.json)
+retains every PC and declared role. All eight HD512 attention sites per
+prefill rung bind the hash-pinned Q64/KV64 object. Compiler and runtime checks
+reject mismatched geometry; the compiler also checks the 205,824-byte arena.
+Other op routes and fusion remain as in the B32 native-head packet.
+
+Actual-role sampled FP64 checks pass at rows128/512/1024/2048/4096/8192 with
+16K history, with and without TMA descriptors. Ragged memcheck and racecheck
+pass. The [tuning report](gemma4-12b-h100-native-tuning.md#hd512-kv64-single-stage-screen)
+records the speedups and mixed serving results. This remains opt-in: changing
+the softmax tile is not output-identical to KV32. Full-model rung consistency
+passes, but three of 132 paired serving texts differ. This adds qualification
+for one attention geometry; the all-op gaps above remain open.

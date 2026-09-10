@@ -23,6 +23,7 @@ pub struct Selection {
     pub file: String,
     pub sha256: String,
     wgmma: bool,
+    kv64: bool,
 }
 
 impl Selection {
@@ -31,6 +32,8 @@ impl Selection {
             file,
             sha256: plow_asset::decode_objects::image_sha256(image),
             wgmma,
+            kv64: wgmma
+                && plow_asset::cubin::global_u32(image, "plow_attention_kv_tile") == Some(64),
         }
     }
 }
@@ -109,6 +112,10 @@ pub(crate) fn apply_output_object(
     if wgmma {
         expected[2].1 = 64;
         expected[3].1 = 32;
+        if plow_asset::cubin::global_u32(&image, "plow_attention_kv_tile") == Some(64) {
+            expected[3].1 = 64;
+            expected[6].1 = 205_824;
+        }
     }
     if profile != "sm90a"
         || info.sm != 90
@@ -140,12 +147,16 @@ fn apply(
     if profile != "sm90a" {
         return Err("HD512 WG32 prefill attention role requires sm90a".into());
     }
+    let mut attention = capability(selection.wgmma);
+    if selection.kv64 {
+        attention.kv_tile = 64;
+    }
     let object = SegmentObject {
         abi: PREFILL_ATTENTION_HD512_WG32_ABI.into(),
         file: selection.file.clone(),
         sha256: Some(selection.sha256.clone()),
         promote_k512: None,
-        attention: Some(capability(selection.wgmma)),
+        attention: Some(attention),
     };
     let mut metadata = SegmentRoles {
         version: 1,

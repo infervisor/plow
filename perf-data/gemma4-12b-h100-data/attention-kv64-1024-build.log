@@ -1,0 +1,86 @@
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 56179 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi512ELi16EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 56224 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi512ELi16EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 56269 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi512ELi16EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 56314 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi512ELi16EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 64193 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi512ELi16EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 64238 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi512ELi16EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 64283 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi512ELi16EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 64328 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi512ELi16EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 60195 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi512ELi16EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 60240 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi512ELi16EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 60285 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi512ELi16EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 60330 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi512ELi16EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 44370 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi256ELi64EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 44402 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi256ELi64EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 44411 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi256ELi64EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 52659 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi256ELi64EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 52691 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi256ELi64EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 52700 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi256ELi64EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 48453 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi256ELi64EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 48485 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi256ELi64EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 48494 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi256ELi64EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 32937 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi256ELi32EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 32970 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi256ELi32EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 32980 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi256ELi32EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 39926 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi256ELi32EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 39959 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi256ELi32EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 39969 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi256ELi32EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 36475 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi256ELi32EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 36508 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi256ELi32EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 36518 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi256ELi32EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 17623 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi512ELi64EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 17654 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi512ELi64EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 17685 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi512ELi64EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 17716 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi512ELi64EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 17725 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi512ELi64EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 27967 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi512ELi64EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 27998 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi512ELi64EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 28029 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi512ELi64EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 28060 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi512ELi64EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 28069 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi512ELi64EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 22757 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi512ELi64EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 22788 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi512ELi64EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 22819 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi512ELi64EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 22850 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi512ELi64EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 22859 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi512ELi64EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 3522 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi512ELi32EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 3555 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi512ELi32EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 3588 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi512ELi32EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 3621 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi512ELi32EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 3631 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi512ELi32EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 12551 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi512ELi32EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 12584 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi512ELi32EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 12617 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi512ELi32EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 12650 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi512ELi32EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 12660 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi512ELi32EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 7856 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi512ELi32EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 7889 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi512ELi32EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 7922 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi512ELi32EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 7955 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi512ELi32EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 7966 by compiler to allow use of registers in GMMA in function '_Z13run_attentionILi512ELi32EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj'
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_Z13run_attentionILi512ELi16EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj' for 'sm_90a'
+ptxas info    : Function properties for _Z13run_attentionILi512ELi16EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 196 registers, used 1 barriers, 16 bytes smem
+ptxas info    : Compile time = 498.185 ms
+ptxas info    : Compiling entry function '_Z13run_attentionILi256ELi64EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj' for 'sm_90a'
+ptxas info    : Function properties for _Z13run_attentionILi256ELi64EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 159 registers, used 1 barriers, 16 bytes smem
+ptxas info    : Compile time = 544.817 ms
+ptxas info    : Compiling entry function '_Z13run_attentionILi256ELi32EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj' for 'sm_90a'
+ptxas info    : Function properties for _Z13run_attentionILi256ELi32EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 122 registers, used 1 barriers, 16 bytes smem
+ptxas info    : Compile time = 418.360 ms
+ptxas info    : Compiling entry function '_Z13run_attentionILi512ELi64EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj' for 'sm_90a'
+ptxas info    : Function properties for _Z13run_attentionILi512ELi64EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 249 registers, used 1 barriers, 16 bytes smem
+ptxas info    : Compile time = 801.760 ms
+ptxas info    : Compiling entry function '_Z13run_attentionILi512ELi32EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj' for 'sm_90a'
+ptxas info    : Function properties for _Z13run_attentionILi512ELi32EEvPK13__nv_bfloat16S2_S2_PS0_PfS4_PKijjjjPKvj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 221 registers, used 1 barriers, 16 bytes smem
+ptxas info    : Compile time = 615.289 ms

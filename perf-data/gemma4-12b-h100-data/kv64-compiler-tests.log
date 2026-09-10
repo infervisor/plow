@@ -1,0 +1,126 @@
+   Compiling plow-asset v0.1.0 (/home/lava/plow/crates/plow-asset)
+   Compiling tunedb v0.1.0 (/home/lava/plow/crates/tunedb)
+   Compiling devgen v0.1.0 (/home/lava/plow/crates/devgen)
+warning: unused import: `RopeScale`
+ --> crates/devgen/src/mla.rs:8:31
+  |
+8 | use packet::rope::{GenTensor, RopeScale};
+  |                               ^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `super::*`
+   --> crates/devgen/src/checkpoint.rs:438:9
+    |
+438 |     use super::*;
+    |         ^^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `RopeScale`
+ --> crates/devgen/src/mla.rs:8:31
+  |
+8 | use packet::rope::{GenTensor, RopeScale};
+  |                               ^^^^^^^^^
+
+warning: constant `MLA_DK` is never used
+    --> crates/devgen/src/lib.rs:7497:18
+     |
+7497 | pub(crate) const MLA_DK: u32 = 512;
+     |                  ^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `MLA_FOLD_VEC` is never used
+    --> crates/devgen/src/lib.rs:7501:18
+     |
+7501 | pub(crate) const MLA_FOLD_VEC: u32 = 4;
+     |                  ^^^^^^^^^^^^
+
+warning: function `require_mla_geometry` is never used
+    --> crates/devgen/src/lib.rs:7535:15
+     |
+7535 | pub(crate) fn require_mla_geometry(kv_lora: u32, qk_rope: u32, v_head: u32, model: &str) {
+     |               ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `amd_analytical_inventory` is never used
+    --> crates/devgen/src/lib.rs:1609:4
+     |
+1609 | fn amd_analytical_inventory(isa: hwspec::IsaLevel) -> kernelcaps::Inventory {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `silu` is never used
+ --> crates/devgen/src/mla/nemotron_tests.rs:5:4
+  |
+5 | fn silu(x: f32) -> f32 {
+  |    ^^^^
+
+warning: variant `Ignored` is never constructed
+   --> crates/devgen/src/lib_tests/gfx950_coverage.rs:422:5
+    |
+415 | enum Knob {
+    |      ---- variant in this enum
+...
+422 |     Ignored(&'static str),
+    |     ^^^^^^^
+    |
+    = note: `Knob` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: `devgen` (lib) generated 4 warnings (run `cargo fix --lib -p devgen` to apply 1 suggestion)
+warning: `devgen` (lib test) generated 5 warnings (run `cargo fix --lib -p devgen --tests` to apply 2 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 12.74s
+     Running unittests src/lib.rs (target/debug/deps/devgen-ce02750766e53432)
+
+running 6 tests
+test attention_prefill_role::tests::composes_with_existing_role_objects_and_preserves_their_segments ... ok
+test attention_prefill_role::tests::isolates_only_compatible_hd512_instructions_and_binds_hash ... ok
+test attention_prefill_role::tests::accepts_fused_output_and_rejects_unsafe_fused_contracts ... ok
+test attention_prefill_role::tests::stays_inert_without_apply_and_rejects_incompatible_geometry ... ok
+test attention_prefill_role::tests::output_object_is_explicit_inert_and_validated_before_mutation ... ok
+test attention_prefill_role::tests::wgmma_object_selects_its_tile_and_rejects_partial_output ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 411 filtered out; finished in 0.00s
+
+     Running tests/decode_ladder.rs (target/debug/deps/decode_ladder-1a33611dbde72fb3)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/golden_blob.rs (target/debug/deps/golden_blob-4bcba3f88bc3db06)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 0.00s
+
+     Running tests/live_kv_fp8.rs (target/debug/deps/live_kv_fp8-b2f5fd5fd297c4c8)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/mxfp4_glu_fusion.rs (target/debug/deps/mxfp4_glu_fusion-b6d072059e24867e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/packed_defaults.rs (target/debug/deps/packed_defaults-9a1e1d2412d54e9d)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/request_chunk_limit.rs (target/debug/deps/request_chunk_limit-1454638668932880)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/tuned_tile_selection.rs (target/debug/deps/tuned_tile_selection-0f0508c8c9dfacb2)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.00s

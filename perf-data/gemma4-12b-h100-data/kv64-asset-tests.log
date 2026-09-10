@@ -1,0 +1,18 @@
+   Compiling plow-asset v0.1.0 (/home/lava/plow/crates/plow-asset)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.83s
+     Running unittests src/lib.rs (target/debug/deps/plow_asset-f803e31e805d29ee)
+
+running 5 tests
+test segment_roles::tests::cublaslt_role_is_packet_only ... ok
+test segment_roles::tests::native_decode_requires_hash_and_one_projection_backend ... ok
+test segment_roles::tests::mxfp4_moe_role_requires_exact_hash ... ok
+test segment_roles::tests::schema_rejects_duplicate_alias_ids_and_unknown_fields ... ok
+test segment_roles::tests::hd512_attention_role_requires_exact_hash_and_capability ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 93 filtered out; finished in 0.00s
+
+     Running tests/roundtrip.rs (target/debug/deps/roundtrip-7b982db0bf176286)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s

@@ -8,6 +8,11 @@
 #endif
 #include "op_attention.cuh"
 
+#if PLOW_NV_FA512_KV64 && !PLOW_NV_FA512_WG
+#error "HD512 KV64 requires the WGMMA body"
+#endif
+constexpr int FA512_KV_TILE = PLOW_NV_FA512_KV64 ? 64 : 32;
+
 #if PLOW_NV_PACKED_REQUEST && PLOW_NV_FA512_WG
 extern "C" __device__ __constant__ unsigned plow_pf_request_abi = 2;
 #if defined(PLOW_NV_MASKED_PADDING) && PLOW_NV_MASKED_PADDING
@@ -18,11 +23,11 @@ extern "C" __device__ __constant__ unsigned plow_pf_masked_padding_abi = 1;
 extern "C" __device__ unsigned plow_attention_sm90_hd512_wg32_abi = 1;
 extern "C" __device__ unsigned plow_attention_head_dim = 512;
 extern "C" __device__ unsigned plow_attention_query_tile = PLOW_NV_FA512_WG ? 64 : 32;
-extern "C" __device__ unsigned plow_attention_kv_tile = PLOW_NV_FA512_WG ? 32 : 16;
+extern "C" __device__ unsigned plow_attention_kv_tile = PLOW_NV_FA512_WG ? FA512_KV_TILE : 16;
 extern "C" __device__ unsigned plow_attention_warps = 8;
 extern "C" __device__ unsigned plow_block_pfattn_hd512 = 256;
 extern "C" __device__ unsigned plow_arena_bytes_pfattn_hd512 =
-    FA_PRE_SMEM_FLOATS(512, 64, 32) * sizeof(float);
+    FA_PRE_SMEM_FLOATS(512, 64, FA512_KV_TILE) * sizeof(float);
 
 __device__ __forceinline__ unsigned attention_ctr_poll(const unsigned* p) {
     unsigned value;
@@ -60,7 +65,7 @@ __device__ __forceinline__ void attention_body(const PlowDevInst* in, void* cons
 #if PLOW_NV_PACKED_REQUEST
     if (in->t[6] != PLOW_TENSOR_NONE) requests = static_cast<const int*>(tensors[in->t[6]]);
 #endif
-    d_flash_prefill_mux<512, 64, 32>(requests,
+    d_flash_prefill_mux<512, 64, FA512_KV_TILE>(requests,
 #else
     d_flash_prefill<512, 32, 16>(
 #endif

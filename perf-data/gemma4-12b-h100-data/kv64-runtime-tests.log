@@ -1,0 +1,336 @@
+   Compiling plow-asset v0.1.0 (/home/lava/plow/crates/plow-asset)
+   Compiling plowrt v0.1.0 (/home/lava/plow/crates/plowrt)
+   Compiling tunedb v0.1.0 (/home/lava/plow/crates/tunedb)
+   Compiling devgen v0.1.0 (/home/lava/plow/crates/devgen)
+warning: unused import: `RopeScale`
+ --> crates/devgen/src/mla.rs:8:31
+  |
+8 | use packet::rope::{GenTensor, RopeScale};
+  |                               ^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `MLA_DK` is never used
+    --> crates/devgen/src/lib.rs:7497:18
+     |
+7497 | pub(crate) const MLA_DK: u32 = 512;
+     |                  ^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `MLA_FOLD_VEC` is never used
+    --> crates/devgen/src/lib.rs:7501:18
+     |
+7501 | pub(crate) const MLA_FOLD_VEC: u32 = 4;
+     |                  ^^^^^^^^^^^^
+
+warning: function `require_mla_geometry` is never used
+    --> crates/devgen/src/lib.rs:7535:15
+     |
+7535 | pub(crate) fn require_mla_geometry(kv_lora: u32, qk_rope: u32, v_head: u32, model: &str) {
+     |               ^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated associated function `minijinja::Environment::<'source>::new`: Attempted to instantiate an environment with serde.  Future versions of MiniJinja will require enabling the 'serde' feature to use serde types.  To silence this warning add 'serde' to the list of features of minijinja.
+  --> crates/plowrt/src/serve/template.rs:95:36
+   |
+95 |         let mut env = Environment::new();
+   |                                    ^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+warning: variable does not need to be mutable
+   --> crates/plowrt/src/exec/gpu/prefix.rs:400:13
+    |
+400 |         let mut blit = |dev: u64, snap: u64, bytes: u64| -> Result<()> {
+    |             ----^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `api` is never read
+   --> crates/plowrt/src/device/cuda.rs:344:5
+    |
+342 | pub struct GraphExec {
+    |            --------- field in this struct
+343 |     exec: CUgraphExec,
+344 |     api: *const c_void, // not used for drop safety; freed via CudaBackend::graph_destroy
+    |     ^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `devgen` (lib) generated 4 warnings (run `cargo fix --lib -p devgen` to apply 1 suggestion)
+warning: `plowrt` (lib) generated 3 warnings (run `cargo fix --lib -p plowrt` to apply 1 suggestion)
+warning: `plowrt` (lib test) generated 3 warnings (3 duplicates)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 26.16s
+     Running unittests src/lib.rs (target/debug/deps/plowrt-9ff13b1b7f17f061)
+
+running 8 tests
+test exec::gpu::attention_role_tests::actual_packet_attention_roles ... ignored, requires TEST_ATTENTION_ROLE_PACKET pointing to an attention-role packet
+test exec::gpu::attention_role_tests::rejects_mixed_split_missing_and_duplicate_attention_work ... ok
+test exec::gpu::attention_role_tests::accepts_hd512_fused_output_and_rejects_unsafe_contracts ... ok
+test exec::gpu::attention_role_tests::packet_role_overrides_only_its_legacy_prefill_segment ... ok
+test exec::gpu::attention_role_tests::accepts_exact_hd512_wg32_contract_and_rejects_drift ... ok
+test exec::gpu::attention_role_tests::rejects_unsupported_attention_operands_and_partial_extents ... ok
+test exec::gpu::attention_role_tests::rejects_missing_unused_and_mismatched_role_objects ... ok
+test exec::gpu::attention_role_tests::accepts_combined_roles_and_preserves_packet_split_counts ... ok
+
+test result: ok. 7 passed; 0 failed; 1 ignored; 0 measured; 484 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/plowrt-7ca98646768201fd)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.00s
+
+     Running unittests src/bin/qsim.rs (target/debug/deps/qsim-a53fd0968632ca1c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/admin.rs (target/debug/deps/admin-5d9ae6f4dc444f53)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
+     Running tests/api.rs (target/debug/deps/api-358f15c55738c37a)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
+
+     Running tests/bundle.rs (target/debug/deps/bundle-ae1460e7ee328e47)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/co_serving.rs (target/debug/deps/co_serving-8be5f5ea0f26d525)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+     Running tests/config_env.rs (target/debug/deps/config_env-7ec6b0e9a23425a3)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/cpu_abi.rs (target/debug/deps/cpu_abi-54216b887ba78023)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/cpu_batch.rs (target/debug/deps/cpu_batch-4410174a74c42db8)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/cpu_interp.rs (target/debug/deps/cpu_interp-1945d268678cc6fc)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.00s
+
+     Running tests/cpu_serve_live.rs (target/debug/deps/cpu_serve_live-75a075a132f92172)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/cuda_context.rs (target/debug/deps/cuda_context-b5beac45a3121ecd)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/cuda_gpu.rs (target/debug/deps/cuda_gpu-8e839cb2683a382b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/error_propagation.rs (target/debug/deps/error_propagation-daaab192b73d1f6c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/glm_pf_shape.rs (target/debug/deps/glm_pf_shape-0246cfdbccd57b82)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/gpu_consume_prompt.rs (target/debug/deps/gpu_consume_prompt-67d2420c7eb78f80)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+     Running tests/gpu_fault.rs (target/debug/deps/gpu_fault-ff6ceeff0329f0f5)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/gpu_fault_serve.rs (target/debug/deps/gpu_fault_serve-e794639910380449)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/gpu_lifecycle.rs (target/debug/deps/gpu_lifecycle-38957cc1934b27ff)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/gpu_multimodel.rs (target/debug/deps/gpu_multimodel-8e97dc8dce2ee20b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/gpu_multistep.rs (target/debug/deps/gpu_multistep-bf3cfbcf43d7c7bb)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/gpu_multistep_serve.rs (target/debug/deps/gpu_multistep_serve-76df19df8671ad0d)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/gpu_sample.rs (target/debug/deps/gpu_sample-a990693b0aa8f283)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/gpu_sample_serve.rs (target/debug/deps/gpu_sample_serve-3dd37bfb8ef09672)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/gpu_vmm_prefix.rs (target/debug/deps/gpu_vmm_prefix-87f46a13a98e99b2)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+
+     Running tests/host_ops.rs (target/debug/deps/host_ops-6147f62f2431fa07)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/hsa_engine.rs (target/debug/deps/hsa_engine-b1ac1a5f70ac4994)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/hsa_mixed_step.rs (target/debug/deps/hsa_mixed_step-f8b505f707a2b72b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/hsa_multistep.rs (target/debug/deps/hsa_multistep-555e5cdbfa52b3e7)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/hsa_primitives.rs (target/debug/deps/hsa_primitives-825f771512bd51e0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/hsa_terminal_prefill.rs (target/debug/deps/hsa_terminal_prefill-30c86d8f6f7886d1)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/hsa_vmm.rs (target/debug/deps/hsa_vmm-9351f3de5bebe389)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/interpret.rs (target/debug/deps/interpret-0ffe98cbc5583f63)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/multi_gpu.rs (target/debug/deps/multi_gpu-668980f8d71bce04)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/mux.rs (target/debug/deps/mux-0373ccafa6a81ecd)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.00s
+
+     Running tests/op_audit_families.rs (target/debug/deps/op_audit_families-4078fc2f8d9f6f00)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+     Running tests/preempt.rs (target/debug/deps/preempt-643d6d4d9c373214)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/simulate.rs (target/debug/deps/simulate-30800d0921b18f1f)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+
+     Running tests/sweep.rs (target/debug/deps/sweep-9c7ec6fd774860b5)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/token_batch_resolver.rs (target/debug/deps/token_batch_resolver-63ff5d7b61cf45ca)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/token_batch_tail.rs (target/debug/deps/token_batch_tail-93515b39967209c2)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/tokenizer.rs (target/debug/deps/tokenizer-942b262838893d40)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/vmm_packet_geometry.rs (target/debug/deps/vmm_packet_geometry-db325cdf65ea3da3)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s

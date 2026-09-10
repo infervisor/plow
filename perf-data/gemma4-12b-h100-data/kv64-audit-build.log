@@ -1,0 +1,61 @@
+warning: unused import: `RopeScale`
+ --> crates/devgen/src/mla.rs:8:31
+  |
+8 | use packet::rope::{GenTensor, RopeScale};
+  |                               ^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `MLA_DK` is never used
+    --> crates/devgen/src/lib.rs:7497:18
+     |
+7497 | pub(crate) const MLA_DK: u32 = 512;
+     |                  ^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `MLA_FOLD_VEC` is never used
+    --> crates/devgen/src/lib.rs:7501:18
+     |
+7501 | pub(crate) const MLA_FOLD_VEC: u32 = 4;
+     |                  ^^^^^^^^^^^^
+
+warning: function `require_mla_geometry` is never used
+    --> crates/devgen/src/lib.rs:7535:15
+     |
+7535 | pub(crate) fn require_mla_geometry(kv_lora: u32, qk_rope: u32, v_head: u32, model: &str) {
+     |               ^^^^^^^^^^^^^^^^^^^^
+
+warning: `devgen` (lib) generated 4 warnings (run `cargo fix --lib -p devgen` to apply 1 suggestion)
+warning: use of deprecated associated function `minijinja::Environment::<'source>::new`: Attempted to instantiate an environment with serde.  Future versions of MiniJinja will require enabling the 'serde' feature to use serde types.  To silence this warning add 'serde' to the list of features of minijinja.
+  --> crates/plowrt/src/serve/template.rs:95:36
+   |
+95 |         let mut env = Environment::new();
+   |                                    ^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+warning: variable does not need to be mutable
+   --> crates/plowrt/src/exec/gpu/prefix.rs:400:13
+    |
+400 |         let mut blit = |dev: u64, snap: u64, bytes: u64| -> Result<()> {
+    |             ----^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `api` is never read
+   --> crates/plowrt/src/device/cuda.rs:344:5
+    |
+342 | pub struct GraphExec {
+    |            --------- field in this struct
+343 |     exec: CUgraphExec,
+344 |     api: *const c_void, // not used for drop safety; freed via CudaBackend::graph_destroy
+    |     ^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `plowrt` (lib) generated 3 warnings (run `cargo fix --lib -p plowrt` to apply 1 suggestion)
+   Compiling plowrt v0.1.0 (/home/lava/plow/crates/plowrt)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.92s
