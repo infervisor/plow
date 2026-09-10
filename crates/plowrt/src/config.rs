@@ -67,11 +67,61 @@ pub struct RuntimeConfig {
     #[arg(long = "fusion", env = "PLOW_FUSION", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub fusion: bool,
 
-    /// Serve every scheduled token of a step from one unified token batch
-    /// (`plans/unified-token-batch.md`). Opt-in per (backend, family) pair until that pair is
-    /// measured; mutually exclusive with `--fusion`, which is the route it replaces.
-    #[arg(long = "token-batch", env = "PLOW_TOKEN_BATCH", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    /// Select unified token batching when the backend, model and object support it.
+    /// Unsupported configurations use ordinary execution; --fusion takes precedence.
+    /// Disable with --token-batch=false or PLOW_TOKEN_BATCH=0.
+    #[arg(long = "token-batch", env = "PLOW_TOKEN_BATCH", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub token_batch: bool,
+
+    /// Prefix reuse on compatible AMD and NVIDIA assets.
+    #[arg(long = "prefix-cache", env = "PLOW_PREFIX_CACHE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub prefix_cache: bool,
+
+    /// Soft cap on prefix blocks and boundary snapshots in MiB. 0 = OOM-driven eviction only.
+    #[arg(
+        long = "vmm-cache-mib",
+        env = "PLOW_VMM_CACHE_MIB",
+        default_value_t = 4096,
+        global = true
+    )]
+    pub vmm_cache_mib: u32,
+
+    /// Cross-request prefill scheduling. CUDA packs chunks into one launch. AMD packs only
+    /// exact-capability programs; unsupported programs retain fair isolated scheduling.
+    #[arg(long = "pf-batch", env = "PLOW_PF_BATCH", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub pf_batch: bool,
+
+    /// Chunked prefill quantum — rows admitted per tick before decode runs.
+    /// 0 = uncapped.
+    #[arg(
+        long = "pf-interleave",
+        env = "PLOW_PF_INTERLEAVE",
+        default_value_t = 2048,
+        global = true
+    )]
+    pub pf_interleave: u32,
+
+    /// Per-request prefill chunk-row cap. 0 = off.
+    #[arg(
+        long = "pf-chunk",
+        env = "PLOW_PF_CHUNK",
+        default_value_t = 0,
+        global = true
+    )]
+    pub pf_chunk: u32,
+
+    /// Disable chunked prefill (whole-prompt-per-tick).
+    #[arg(long = "pf-no-chunk", env = "PLOW_PF_NO_CHUNK", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub pf_no_chunk: bool,
+
+    /// Disable prefill/decode interleave (prefill-only tick).
+    #[arg(long = "pf-no-interleave", env = "PLOW_PF_NO_INTERLEAVE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub pf_no_interleave: bool,
+
+    /// Throughput mode: run prefill chains to completion, skip decode until all
+    /// prompts are resident. Trades streaming latency for aggregate tok/s.
+    #[arg(long = "pf-defer-decode", env = "PLOW_PF_DEFER_DECODE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub pf_defer_decode: bool,
 
     /// Override whether freed slabs remain in the process reuse pool.
     #[arg(long = "rt-slab-keep", env = "PLOW_SLAB_KEEP", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
@@ -391,9 +441,9 @@ pub struct NvidiaRuntimeConfig {
     )]
     pub multistep: u32,
 
-    /// VMM-backed KV prefix cache. Warm TTFT 3.6×(4k)→23.8×(128k).
-    #[arg(long = "vmm-prefix", env = "PLOW_VMM_PREFIX", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub vmm_prefix: bool,
+    /// VMM prefix reuse. Automatically enabled for eligible Hopper hybrid BF16-KV packets.
+    #[arg(long = "vmm-prefix", env = "PLOW_VMM_PREFIX", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub vmm_prefix: Option<bool>,
 
     /// Grow packet-described full KV backing with the live frontier, without prefix reuse.
     #[arg(long = "vmm-live", env = "PLOW_VMM_LIVE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
@@ -412,15 +462,6 @@ pub struct NvidiaRuntimeConfig {
     )]
     pub vmm_block_mib: u32,
 
-    /// Cap on retained (unreferenced) VMM blocks. 0 = no cache.
-    #[arg(
-        long = "vmm-cache-mib",
-        env = "PLOW_VMM_CACHE_MIB",
-        default_value_t = 0,
-        global = true
-    )]
-    pub vmm_cache_mib: u32,
-
     /// VMM lazy-commit weight slab (CUDA default ON). --no-nv-weight-vmm to disable.
     #[arg(long = "nv-weight-vmm", env = "PLOW_WEIGHT_VMM", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub weight_vmm: bool,
@@ -428,47 +469,6 @@ pub struct NvidiaRuntimeConfig {
     /// Direct upload path (CUDA). --no-nv-upload-direct to disable.
     #[arg(long = "nv-upload-direct", env = "PLOW_UPLOAD_DIRECT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub upload_direct: bool,
-
-    /// Cross-request prefill scheduling. CUDA packs chunks into one launch. AMD packs only
-    /// exact-capability programs; unsupported programs retain fair isolated scheduling.
-    #[arg(long = "pf-batch", env = "PLOW_PF_BATCH", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub pf_batch: bool,
-
-    /// Chunked prefill quantum — rows admitted per tick before decode runs.
-    /// 0 = uncapped.
-    #[arg(
-        long = "pf-interleave",
-        env = "PLOW_PF_INTERLEAVE",
-        default_value_t = 2048,
-        global = true
-    )]
-    pub pf_interleave: u32,
-
-    /// Per-request prefill chunk-row cap. 0 = off.
-    #[arg(
-        long = "pf-chunk",
-        env = "PLOW_PF_CHUNK",
-        default_value_t = 0,
-        global = true
-    )]
-    pub pf_chunk: u32,
-
-    /// Disable chunked prefill (whole-prompt-per-tick).
-    #[arg(long = "pf-no-chunk", env = "PLOW_PF_NO_CHUNK", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub pf_no_chunk: bool,
-
-    /// Disable prefill/decode interleave (prefill-only tick).
-    #[arg(long = "pf-no-interleave", env = "PLOW_PF_NO_INTERLEAVE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub pf_no_interleave: bool,
-
-    /// Throughput mode: run prefill chains to completion, skip decode until all
-    /// prompts are resident. Trades streaming latency for aggregate tok/s.
-    #[arg(long = "pf-defer-decode", env = "PLOW_PF_DEFER_DECODE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub pf_defer_decode: bool,
-
-    /// TP-only prefix cache.
-    #[arg(long = "prefix-cache", env = "PLOW_PREFIX_CACHE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub prefix_cache: bool,
 
     /// Force decode cubin path (bypass discovery).
     #[arg(long = "nv-cubin", env = "PLOW_NV_CUBIN", global = true)]
@@ -608,7 +608,7 @@ pub struct NvidiaRuntimeConfig {
     pub pf_seg_eqsmem: bool,
 }
 
-impl NvidiaRuntimeConfig {
+impl RuntimeConfig {
     /// Prefill interleave rows with "zero = unbounded" semantics.
     /// 0 → `usize::MAX` (no bound), else the configured value.
     pub fn pf_interleave_rows(&self) -> usize {
@@ -1018,9 +1018,14 @@ impl RuntimeConfig {
     }
 
     #[cfg(feature = "cuda")]
-    pub(crate) fn nv_live_kv_enabled(&self, packed_prefill: bool, full_cache: bool) -> bool {
+    pub(crate) fn nv_live_kv_enabled(
+        &self,
+        packed_prefill: bool,
+        full_cache: bool,
+        prefix: bool,
+    ) -> bool {
         self.nv_vmm_live()
-            || (packed_prefill && full_cache && !self.nv_vmm_prefix() && !self.nv.prefix_cache)
+            || (packed_prefill && full_cache && !prefix)
     }
 
     #[cfg(feature = "cuda")]
@@ -1033,12 +1038,15 @@ impl RuntimeConfig {
     }
 
     #[cfg(feature = "cuda")]
-    pub(crate) fn nv_vmm_prefix(&self) -> bool {
-        select_compat(
-            self.nv.vmm_prefix,
-            Self::env_bool("PLOW_VMM_PREFIX"),
-            !Self::is_initialized(),
-        )
+    pub(crate) fn nv_vmm_prefix(&self) -> Option<bool> {
+        if !self.prefix_cache {
+            return Some(false);
+        }
+        if Self::is_initialized() {
+            self.nv.vmm_prefix
+        } else {
+            Self::env_bool("PLOW_VMM_PREFIX").or(self.nv.vmm_prefix)
+        }
     }
 
     #[cfg(feature = "cuda")]
@@ -1050,10 +1058,9 @@ impl RuntimeConfig {
         )
     }
 
-    #[cfg(feature = "cuda")]
-    pub(crate) fn nv_vmm_cache_mib(&self) -> u32 {
+    pub(crate) fn prefix_cache_mib(&self) -> u32 {
         select_compat(
-            self.nv.vmm_cache_mib,
+            self.vmm_cache_mib,
             Self::env_parse("PLOW_VMM_CACHE_MIB"),
             !Self::is_initialized(),
         )
@@ -1198,6 +1205,24 @@ pub fn serve_replay(m: &clap::ArgMatches) -> std::collections::BTreeMap<String, 
 #[cfg(test)]
 mod tests {
     #[test]
+    fn token_batch_defaults_on_with_explicit_rollback() {
+        use clap::{Args, FromArgMatches};
+        let command = super::RuntimeConfig::augment_args(clap::Command::new("test"));
+        let arg = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "token_batch")
+            .unwrap();
+        assert_eq!(arg.get_default_values(), ["true"]);
+        for (flag, enabled) in [("--token-batch", true), ("--token-batch=false", false)] {
+            let matches = command.clone().try_get_matches_from(["test", flag]).unwrap();
+            assert_eq!(
+                super::RuntimeConfig::from_arg_matches(&matches).unwrap().token_batch,
+                enabled
+            );
+        }
+    }
+
+    #[test]
     fn fusion_is_an_opt_in_runtime_flag() {
         use clap::{Args, FromArgMatches};
         let command = super::RuntimeConfig::augment_args(clap::Command::new("test"));
@@ -1229,6 +1254,53 @@ mod tests {
             Some(7)
         );
         assert_eq!(super::select_compat(Some(7_u64), None, true), Some(7));
+    }
+
+    #[test]
+    fn shared_prefix_and_token_batch_defaults_allow_independent_rollback() {
+        use clap::{Args, FromArgMatches};
+        let command = super::RuntimeConfig::augment_args(clap::Command::new("test"));
+        for field in ["prefix_cache", "token_batch"] {
+            assert_eq!(command.get_arguments().find(|arg| arg.get_id() == field)
+                .unwrap().get_default_values(), ["true"]);
+        }
+        let matches = command.try_get_matches_from([
+            "test", "--prefix-cache=false", "--vmm-prefix=true", "--vmm-cache-mib=512",
+        ]).unwrap();
+        let config = super::RuntimeConfig::from_arg_matches(&matches).unwrap();
+        assert!(!config.prefix_cache);
+        assert!(config.token_batch);
+        assert_eq!(config.vmm_cache_mib, 512);
+        #[cfg(feature = "cuda")]
+        assert_eq!(config.nv_vmm_prefix(), Some(false));
+    }
+
+    #[test]
+    fn prefix_cache_defaults_to_auto_with_a_bounded_budget_and_explicit_overrides() {
+        use clap::{Args, FromArgMatches};
+        let command = super::RuntimeConfig::augment_args(clap::Command::new("test"));
+        let prefix = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "vmm_prefix")
+            .unwrap();
+        assert!(prefix.get_default_values().is_empty());
+        let budget = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "vmm_cache_mib")
+            .unwrap();
+        assert_eq!(budget.get_default_values(), ["4096"]);
+        for (flag, expected) in [("--vmm-prefix", true), ("--vmm-prefix=false", false)] {
+            let matches = command
+                .clone()
+                .try_get_matches_from(["test", flag])
+                .unwrap();
+            assert_eq!(
+                super::RuntimeConfig::from_arg_matches(&matches)
+                    .unwrap()
+                    .nv.vmm_prefix,
+                Some(expected)
+            );
+        }
     }
 
     #[test]
@@ -1276,12 +1348,11 @@ mod tests {
                 "test",
                 "--vmm-live=true",
                 "--vmm-prefix=false",
-                "--prefix-cache=false",
             ])
             .unwrap();
         let config = super::NvidiaRuntimeConfig::from_arg_matches(&matches).unwrap();
         assert!(config.vmm_live);
-        assert!(!config.vmm_prefix && !config.prefix_cache);
+        assert_eq!(config.vmm_prefix, Some(false));
         assert!(!config.vmm_live_rings);
         let command = super::NvidiaRuntimeConfig::augment_args(clap::Command::new("test"));
         let arg = command
@@ -1371,10 +1442,10 @@ mod tests {
             .expect("KDA family route argument");
         assert_eq!(arg.get_default_values(), ["true"]);
 
-        // `--pf-batch` is the mux half and lives on the other config struct; it is off by
+        // `--pf-batch` is the shared mux half; it is off by
         // default too, so neither flag alone can start a co-packed dispatch.
-        let nv = super::NvidiaRuntimeConfig::augment_args(clap::Command::new("test"));
-        let arg = nv
+        let shared = super::RuntimeConfig::augment_args(clap::Command::new("test"));
+        let arg = shared
             .get_arguments()
             .find(|arg| arg.get_id() == "pf_batch")
             .expect("pf-batch argument");

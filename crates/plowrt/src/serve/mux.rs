@@ -1356,6 +1356,7 @@ fn run_one_tick(
         #[cfg(feature = "cuda")]
         #[allow(irrefutable_let_patterns)]
         if let crate::serve::engine::ServeEngine::Cuda(e) = &mut *guard {
+            let result = (|| {
             let stop = Arc::clone(e.stop_ids());
             let cap = e.batch();
 
@@ -1600,24 +1601,34 @@ fn run_one_tick(
 
             let pack_t = packlog::on().then(Instant::now);
             if e.pf_batch_enabled() {
-                // PX-1 cross-request batched prefill: pack every waiting request's
-                // next chunk (up to `n-1` prompt rows each) into shared launches
-                // under a token budget, then feed each finished request's LAST
-                // prompt token through the batched decode step below — which both
-                // writes its final KV row and produces its first token, batched
-                // with every live decode stream.
+                let compact = e.has_packed_terminal();
+                let mut completed = std::mem::take(&mut obs.host.prefill_tokens);
+                completed.clear();
                 if let Some(f) = gpu_prefill_batched_pass(
-                    &mut *e,
-                    &mut slots,
-                    cap,
-                    &arena,
-                    feeds.is_empty(),
-                    co_scheduled,
+                    &mut *e, &mut slots, cap, &arena, feeds.is_empty(), co_scheduled, &mut completed,
+                    &mut feeds, &mut obs.host.token_batch_tokens,
                 ) {
                     if tick_fault.is_none() {
                         tick_fault = Some(f);
                     }
                 }
+                for (row, &(i, token)) in completed.iter().enumerate() {
+                    let Some(slot) = slots[i].as_mut() else { continue };
+                    match gpu_finish_token(&mut *e, row, slot, token) {
+                        Ok(token) => handle_produced_token(
+                            &mut slots[i], &arena, bundle, token, 1,
+                            &mut tokens_this_tick, Some(stop.as_slice()),
+                        ),
+                        Err(err) => {
+                            note_fault(&mut tick_fault, &err);
+                            if let Some(taken) = slots[i].take() {
+                                release_kv(&arena, taken.kv);
+                                let _ = taken.respond.try_send(StreamChunk::Err(err));
+                            }
+                        }
+                    }
+                }
+                obs.host.prefill_tokens = completed;
                 for i in 0..slots.len().min(cap) {
                     let Some(s) = slots[i].as_ref() else { continue };
                     if s.step != 0 {
@@ -1633,7 +1644,7 @@ fn run_one_tick(
                         }
                         continue;
                     }
-                    if s.pf_pos + 1 != n {
+                    if compact || !e.packed_slot_ready(i) || s.pf_pos + 1 != n {
                         continue; // still mid-prefill
                     }
                     if s.respond.is_closed() {
@@ -1641,18 +1652,6 @@ fn run_one_tick(
                             release_kv(&arena, taken.kv);
                         }
                         continue;
-                    }
-                    // A 1-token prompt never enters the batched pass — its slot is
-                    // ready at pf_pos 0 but still needs its sequence begun.
-                    if n == 1 && s.pf_pos == 0 {
-                        if let Err(err) = e.begin_slot(i, n + s.gen.max_tokens.max(1)) {
-                            note_fault(&mut tick_fault, &err);
-                            if let Some(taken) = slots[i].take() {
-                                release_kv(&arena, taken.kv);
-                                let _ = taken.respond.try_send(StreamChunk::Err(err));
-                            }
-                            continue;
-                        }
                     }
                     let last = *slots[i]
                         .as_ref()
@@ -1985,6 +1984,13 @@ fn run_one_tick(
                 tick_fault,
                 decode_progress,
             );
+            })();
+            for (slot, request) in result.0.iter().enumerate().take(e.batch()) {
+                if request.is_none() {
+                    e.retire_slot(slot, result.5.is_none());
+                }
+            }
+            return result;
         }
 
         // gfx950: B independent sequence slots, one decode dispatch for all of
@@ -2088,8 +2094,8 @@ fn run_one_tick(
             // `--pf-no-interleave` / `PLOW_PF_NO_INTERLEAVE=1` restores the old
             // prefill-only tick.
             let mut did_prefill = false;
-            let nv = &crate::config::RuntimeConfig::get().nv;
-            let no_interleave = nv.pf_no_interleave;
+            let rt = crate::config::RuntimeConfig::get();
+            let no_interleave = rt.pf_no_interleave;
             let decode_rows = slots[..b.min(slots.len())]
                 .iter()
                 .filter(|slot| slot.as_ref().is_some_and(|slot| slot.step > 0))
@@ -2098,10 +2104,10 @@ fn run_one_tick(
             let tick_max = amd_prefill_tick_cap(
                 has_decode || co_scheduled,
                 no_interleave && !co_scheduled,
-                nv.pf_defer_decode && !co_scheduled,
-                nv.pf_interleave,
+                rt.pf_defer_decode && !co_scheduled,
+                rt.pf_interleave,
             );
-            if nv.pf_batch
+            if rt.pf_batch
                 && slots[..b.min(slots.len())]
                     .iter()
                     .flatten()
@@ -2139,7 +2145,7 @@ fn run_one_tick(
                     .enumerate()
                     .take(b)
                     .filter_map(|(i, slot)| {
-                        if no_interleave || nv.pf_defer_decode {
+                        if no_interleave || rt.pf_defer_decode {
                             return None;
                         }
                         let slot = slot.as_ref()?;
@@ -2219,7 +2225,7 @@ fn run_one_tick(
             //  * A member may consume its prompt to the end. `token_batch_prefill_rows` does
             //    not hold the last token back, and the sampled ids for prompts that finish
             //    here follow the decode feeds in `output`.
-            if !no_interleave && !nv.pf_defer_decode && e.token_batch_rows(1, 1).is_some() {
+            if !no_interleave && !rt.pf_defer_decode && e.token_batch_rows(1, 1).is_some() {
                 let feeds: Vec<(usize, u32)> = slots
                     .iter()
                     .enumerate()
@@ -2267,7 +2273,7 @@ fn run_one_tick(
                         continue;
                     }
                     let pack =
-                        amd_mixed_prefill_pack(list, capacity, nv.pf_batch, e.prefill_turn(), b);
+                        amd_mixed_prefill_pack(list, capacity, rt.pf_batch, e.prefill_turn(), b);
                     if pack.len() != take {
                         continue;
                     }
@@ -2368,6 +2374,7 @@ fn run_one_tick(
                                 decode = feeds.len(),
                                 prefill = pack.len(),
                                 completed = finished.len(),
+                                fires = true,
                                 "AMD token batch"
                             );
                             // Delivery is by LOGICAL REQUEST, in sample order: the decode
@@ -2385,6 +2392,7 @@ fn run_one_tick(
                                     if let Some(s) = slots[slot].as_mut() {
                                         if s.step == 0 {
                                             s.pf_pos = s.prompt_ids.len();
+                                        s.cached_tokens = e.cached_rows(slot);
                                         }
                                     }
                                 }
@@ -2437,7 +2445,7 @@ fn run_one_tick(
             }
             if has_decode
                 && !no_interleave
-                && !nv.pf_defer_decode
+                && !rt.pf_defer_decode
                 && e.mixed_step_rows(decode_rows, 1).is_some()
             {
                 let mut candidates: Vec<_> = slots
@@ -2464,7 +2472,7 @@ fn run_one_tick(
                     let pack = amd_mixed_prefill_pack(
                         candidates,
                         capacity,
-                        nv.pf_batch,
+                        rt.pf_batch,
                         e.prefill_turn(),
                         b,
                     );
@@ -2572,11 +2580,11 @@ fn run_one_tick(
                     let slot = slots[i].as_ref()?;
                     (slot.step == 0 && !slot.respond.is_closed()).then_some((i, slot.arrived))
                 }),
-                nv.pf_batch,
+                rt.pf_batch,
                 e.prefill_turn(),
                 b.min(slots.len()),
             );
-            if nv.pf_batch {
+            if rt.pf_batch {
                 let packed = amd_prefill_pack(
                     (0..b.min(slots.len())).filter_map(|i| {
                         slots[i]
@@ -2691,14 +2699,14 @@ fn run_one_tick(
                 let prefill_remains = slots[..b.min(slots.len())]
                     .iter()
                     .any(|s| s.as_ref().is_some_and(|s| s.step == 0));
-                if amd_defer_decode(nv.pf_defer_decode, prefill_remains) {
+                if amd_defer_decode(rt.pf_defer_decode, prefill_remains) {
                     tracing::debug!("amd: decode deferred while prefill remains");
                     return (slots, bufs, obs, tokens_this_tick, true, tick_fault, None);
                 }
             }
             let pending = amd_prefill_isolated_fallback(isolated, did_prefill);
             if let Some(i) = pending {
-                if nv.pf_batch {
+                if rt.pf_batch {
                     e.advance_prefill_turn(i);
                 }
                 // AMD prefill and decode share scratch and run sequentially.
@@ -2715,6 +2723,7 @@ fn run_one_tick(
                 // active, while `PLOW_PF_BATCH=1` rotates fairly across pending AMD slots.
                 let pf = e.prefill_chunked_at_most(i, &slot_ref.prompt_ids, tick_max);
                 let frontier = e.prefill_frontier(i).unwrap_or(slot_ref.prompt_ids.len());
+                if let Some(s) = slots[i].as_mut() { s.cached_tokens = e.cached_rows(i); }
                 crate::obs::ttft::PREFILL.add(t_pf.elapsed().as_nanos() as u64);
                 match pf {
                     Ok(None) => {
@@ -2769,7 +2778,7 @@ fn run_one_tick(
                 let prefill_remains = slots[..b.min(slots.len())]
                     .iter()
                     .any(|s| s.as_ref().is_some_and(|s| s.step == 0));
-                if amd_defer_decode(nv.pf_defer_decode, prefill_remains) {
+                if amd_defer_decode(rt.pf_defer_decode, prefill_remains) {
                     tracing::debug!("amd: decode deferred while prefill remains");
                     return (slots, bufs, obs, tokens_this_tick, true, tick_fault, None);
                 }
@@ -3141,10 +3150,10 @@ fn predicted_wait_ms(live: usize, capacity: usize, service_ms: f64) -> f64 {
 /// The serve-layer interleave bound: max prefill-chunk rows per tick while
 /// other slots are mid-decode. `PLOW_PF_INTERLEAVE` overrides (rows; `0` =
 /// whole prompt in one tick, the pre-interleave behavior). Read once.
-/// Reads `RuntimeConfig::get().nv.pf_interleave_rows()`.
+/// Reads `RuntimeConfig::get().pf_interleave_rows()`.
 #[cfg(feature = "cuda")]
 fn pf_interleave_rows() -> usize {
-    crate::config::RuntimeConfig::get().nv.pf_interleave_rows()
+    crate::config::RuntimeConfig::get().pf_interleave_rows()
 }
 
 /// Prompt rows one model may consume while holding its device turn, when there
@@ -3193,7 +3202,7 @@ fn co_sched_prefill_rows(bucket: usize, interleave: usize) -> usize {
 /// serving default.
 #[cfg(feature = "cuda")]
 fn pf_defer_decode() -> bool {
-    crate::config::RuntimeConfig::get().nv.pf_defer_decode
+    crate::config::RuntimeConfig::get().pf_defer_decode
 }
 
 #[cfg(feature = "cuda")]
@@ -3335,24 +3344,17 @@ fn amd_prefill_isolated_fallback(isolated: Option<usize>, packed: bool) -> Optio
 /// a launch, never any request's tokens). Read once. Default `0` (off) — this
 /// is opt-in alongside `PLOW_PF_BATCH=1`, matching the rest of the PX-1 knobs.
 /// Unset and `0` both mean uncapped, so the default IS the zero sentinel.
-/// Reads `RuntimeConfig::get().nv.pf_chunk_rows()`.
+/// Reads `RuntimeConfig::get().pf_chunk_rows()`.
 #[cfg(feature = "cuda")]
 fn pf_chunk_rows() -> usize {
-    crate::config::RuntimeConfig::get().nv.pf_chunk_rows()
+    crate::config::RuntimeConfig::get().pf_chunk_rows()
 }
 
-/// PX-1: pack every mid-prefill slot's next chunk into shared batched-prefill
-/// launches. Per launch, each waiting request contributes up to its remaining
-/// `n-1` prompt rows (the last prompt token is fed through the batched decode
-/// step instead — that step writes its KV row AND yields the first generated
-/// token, so no per-request lm_head is needed in the shared launch). The row
-/// budget per launch is the largest prefill bucket when no decode stream is
-/// live (fastest cold TTFT), else `PLOW_PF_INTERLEAVE` rows — the same bounded
-/// stall as the serialized path, now shared by N requests instead of one.
-/// Chunk boundaries are bit-invariant for the fused (nsplit=1) flash — masked
-/// tiles are exact no-ops and the KV tile grid is absolutely aligned — so
-/// packing decisions cannot change any request's tokens.
+/// Pack prompt rows and optional decode feeds under the prefill quantum. Compact outputs
+/// stop the pass before another launch can overwrite their logits. The legacy
+/// route leaves the last prompt row for decode.
 #[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
 fn gpu_prefill_batched_pass(
     e: &mut crate::exec::gpu::GpuEngine,
     slots: &mut [Option<Slot>],
@@ -3360,56 +3362,94 @@ fn gpu_prefill_batched_pass(
     arena: &Option<SharedKvState>,
     cold: bool,
     bounded_tick: bool,
+    completed: &mut Vec<(usize, u32)>,
+    feeds: &mut Vec<(usize, u32)>,
+    unified_output: &mut Vec<(u32, u32)>,
 ) -> Option<crate::DeviceErrorInfo> {
     use crate::exec::gpu::PfBatchReq;
 
+    completed.clear();
+    let compact = e.has_packed_terminal();
+    let unified =
+        e.token_batch_enabled() && !crate::config::RuntimeConfig::get().pf_no_interleave;
+    let decode_rows = if unified { feeds.len() } else { 0 };
+    let withheld = usize::from(!compact);
     let mut tick_fault: Option<crate::DeviceErrorInfo> = None;
     let budget_max = e.pf_max_rows();
     if budget_max == 0 {
         return tick_fault;
     }
-    let per_launch = if cold && !bounded_tick {
+    let per_launch = (if cold && !bounded_tick {
         budget_max
     } else {
         pf_interleave_rows().min(budget_max)
-    };
+    })
+    .min(budget_max.saturating_sub(decode_rows));
     // Bound each candidate before fair sharing. Short requests return unused
     // rows to later candidates in the same launch.
     let chunk_cap = pf_chunk_rows();
     loop {
-        // Minimal-padding budget: cap this pack at the largest bucket the
-        // waiting rows can FILL (else the smallest covering bucket), so a
-        // cold 4.5k-row pack runs [4096, tail] instead of an 8192 at ~45% pad.
+        for (i, slot) in slots.iter_mut().enumerate().take(cap) {
+            let Some(request) = slot.as_mut().filter(|s| s.step == 0) else {
+                continue;
+            };
+            if request.respond.is_closed() {
+                if let Some(taken) = slot.take() {
+                    release_kv(arena, taken.kv);
+                }
+                e.retire_slot(i, false);
+                continue;
+            }
+            if request.prompt_ids.is_empty() {
+                continue;
+            }
+            match e.admit_packed_slot(
+                i,
+                &request.prompt_ids,
+                request.prompt_ids.len() + request.gen.max_tokens.max(1),
+            ) {
+                Ok(Some(frontier)) => {
+                    request.pf_pos = frontier;
+                    request.cached_tokens = e.attached_rows(i) as usize;
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        slot = i,
+                        error = %err,
+                        error_code = ?err.device_code(),
+                        fatal = err.is_fatal(),
+                        "gpu: packed KV admission failed"
+                    );
+                    note_fault(&mut tick_fault, &err);
+                    if let Some(taken) = slot.take() {
+                        release_kv(arena, taken.kv);
+                        let _ = taken.respond.try_send(StreamChunk::Err(err));
+                    }
+                }
+            }
+        }
+        // Count only admitted rows so waiting requests cannot enlarge a pack.
         let avail: usize = slots
             .iter()
+            .enumerate()
             .take(cap)
-            .filter_map(|s| s.as_ref())
-            .filter(|s| s.step == 0 && !s.respond.is_closed())
-            .map(|s| (s.prompt_ids.len().max(1) - 1).saturating_sub(s.pf_pos))
+            .filter(|(i, _)| e.packed_slot_ready(*i))
+            .filter_map(|(_, s)| s.as_ref())
+            .filter(|s| s.step == 0)
+            .map(|s| s.prompt_ids.len().saturating_sub(withheld).saturating_sub(s.pf_pos))
             .sum();
         if avail == 0 {
             return tick_fault;
         }
         let per_launch = e.pf_pack_budget(avail.min(per_launch)).min(per_launch);
-        // Form one fair, rotating pack. The packet bucket supplies the row
-        // budget; request-local positions remain absolute in every span.
-        for slot in slots.iter_mut().take(cap) {
-            if slot
-                .as_ref()
-                .is_some_and(|request| request.step == 0 && request.respond.is_closed())
-            {
-                if let Some(taken) = slot.take() {
-                    release_kv(arena, taken.kv);
-                }
-            }
-        }
         let candidates = slots.iter().enumerate().take(cap).filter_map(|(i, slot)| {
             let s = slot.as_ref()?;
             let n = s.prompt_ids.len();
-            if s.step != 0 || n == 0 || s.pf_pos + 1 >= n {
+            if !e.packed_slot_ready(i) || s.step != 0 || n == 0 || s.pf_pos + withheld >= n {
                 return None;
             }
-            let remaining = (n - 1 - s.pf_pos).min(chunk_cap);
+            let remaining = (n - withheld - s.pf_pos).min(chunk_cap);
             let n_rows = u32::try_from(remaining).ok()?;
             let slot = u32::try_from(i).ok()?;
             let kv_row0 = u32::try_from(s.pf_pos).ok()?;
@@ -3432,48 +3472,71 @@ fn gpu_prefill_batched_pass(
             crate::sched::prefill::SpanPolicy::FairSplit,
             |_| u32::try_from(per_launch).ok(),
         );
-        let mut pack = Vec::with_capacity(admission.spans().len());
-        for span in admission.spans().iter().copied() {
-            let i = span.slot as usize;
-            let c0 = span.kv_row0 as usize;
-            let len = span.n_rows as usize;
-            if c0 == 0 {
-                let s = slots[i].as_ref().expect("admitted slot is Some");
-                let n = s.prompt_ids.len();
-                if let Err(err) = e.begin_slot(i, n + s.gen.max_tokens.max(1)) {
-                    tracing::warn!(
-                        slot = i,
-                        error = %err,
-                        error_code = ?err.device_code(),
-                        fatal = err.is_fatal(),
-                        "gpu: pf-batch begin failed"
-                    );
-                    note_fault(&mut tick_fault, &err);
-                    if let Some(taken) = slots[i].take() {
-                        release_kv(arena, taken.kv);
-                        let _ = taken.respond.try_send(StreamChunk::Err(err));
-                    }
-                    continue;
-                }
-            }
-            pack.push((i, c0, len));
-        }
+        let pack: Vec<_> = admission
+            .spans()
+            .iter()
+            .map(|span| (span.slot as usize, span.kv_row0 as usize, span.n_rows as usize))
+            .collect();
         if pack.is_empty() {
             return tick_fault;
         }
-        let reqs: Vec<PfBatchReq> = pack
-            .iter()
-            .map(|&(i, c0, len)| PfBatchReq {
-                slot: i,
-                prompt: &slots[i].as_ref().expect("packed slot is Some").prompt_ids,
-                c0,
-                len,
-            })
-            .collect();
-        let res = e.prefill_batched(&reqs);
-        drop(reqs);
+        let res = if unified {
+            use plow_asset::token_batch::{Phase, Request, Selection};
+            let decode = feeds.iter().map(|&(i, ref token)| {
+                let slot = slots[i].as_ref().expect("decode slot is Some");
+                Request {
+                    id: i as u32,
+                    slot: i as u32,
+                    state_slot: i as u32,
+                    generation: e.slot_generation(i).expect("valid slot"),
+                    phase: Phase::Decode,
+                    tokens: std::slice::from_ref(token),
+                    prompt_len: slot.prompt_ids.len() as u32,
+                    selection: Selection::default(),
+                }
+            });
+            let prefill = pack.iter().map(|&(i, c0, len)| {
+                let slot = slots[i].as_ref().expect("prefill slot is Some");
+                Request {
+                    id: i as u32,
+                    slot: i as u32,
+                    state_slot: i as u32,
+                    generation: e.slot_generation(i).expect("valid slot"),
+                    phase: Phase::Prefill,
+                    tokens: &slot.prompt_ids[c0..c0 + len],
+                    prompt_len: slot.prompt_ids.len() as u32,
+                    selection: Selection::default(),
+                }
+            });
+            let requests: smallvec::SmallVec<[_; 16]> = decode.chain(prefill).collect();
+            let result = e.token_batch_step(&requests, unified_output);
+            if result.is_ok() {
+                completed.extend(
+                    unified_output.iter().map(|&(slot, token)| (slot as usize, token)),
+                );
+            }
+            result
+        } else {
+            let reqs: Vec<PfBatchReq> = pack
+                .iter()
+                .map(|&(i, c0, len)| PfBatchReq {
+                    slot: i,
+                    prompt: &slots[i].as_ref().expect("packed slot is Some").prompt_ids,
+                    c0,
+                    len,
+                })
+                .collect();
+            if compact {
+                e.prefill_batched_complete(&reqs, completed)
+            } else {
+                e.prefill_batched(&reqs)
+            }
+        };
         match res {
             Ok(()) => {
+                if unified {
+                    feeds.clear();
+                }
                 for &(i, c0, len) in &pack {
                     slots[i].as_mut().expect("packed slot is Some").pf_pos = c0 + len;
                 }
@@ -3490,6 +3553,17 @@ fn gpu_prefill_batched_pass(
                 );
                 note_fault(&mut tick_fault, &err);
                 let msg = err.to_string();
+                if unified {
+                    for (i, _) in feeds.drain(..) {
+                        if let Some(taken) = slots[i].take() {
+                            release_kv(arena, taken.kv);
+                            let _ = taken
+                                .respond
+                                .try_send(StreamChunk::Err(fanout_err(&err, &msg)));
+                        }
+                        e.retire_slot(i, false);
+                    }
+                }
                 for &(i, _, _) in &pack {
                     if let Some(taken) = slots[i].take() {
                         release_kv(arena, taken.kv);
@@ -3497,19 +3571,25 @@ fn gpu_prefill_batched_pass(
                             .respond
                             .try_send(StreamChunk::Err(fanout_err(&err, &msg)));
                     }
+                    if unified {
+                        e.retire_slot(i, false);
+                    }
                 }
                 return tick_fault;
             }
         }
-        if !cold || bounded_tick {
+        if !completed.is_empty() || !cold || bounded_tick {
             return tick_fault; // bounded stall: decode now, next pack next tick
         }
         // Cold path: stop as soon as any request is ready so its first token
         // fires this tick; the rest continue next tick (with decoders live).
-        let any_ready = slots.iter().take(cap).any(|s| {
+        let any_ready = slots.iter().enumerate().take(cap).any(|(i, s)| {
             s.as_ref()
                 .map(|s| {
-                    s.step == 0 && !s.prompt_ids.is_empty() && s.pf_pos + 1 == s.prompt_ids.len()
+                    e.packed_slot_ready(i)
+                        && s.step == 0
+                        && !s.prompt_ids.is_empty()
+                        && s.pf_pos + withheld == s.prompt_ids.len()
                 })
                 .unwrap_or(false)
         });

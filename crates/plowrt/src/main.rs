@@ -2684,10 +2684,11 @@ async fn bringup_runtime(
             // Per-model footprint and TP degree, both from the blob header.
             let granularity = cuda.granularity()?;
             let mut specs: Vec<ModelSpec> = Vec::with_capacity(models.len());
-            for (slug, dir, _) in &models {
-                let plan = plowrt::serve::manager::BlobPlan::from_dir_with_granularity(
+            for (slug, dir, checkpoint) in &models {
+                let plan = plowrt::serve::manager::BlobPlan::from_dir_with_device(
                     dir,
-                    Some(granularity),
+                    Some((granularity, cuda.compute_capability())),
+                    Some(checkpoint),
                 )?;
                 specs.push(ModelSpec {
                     slug: slug.clone(),

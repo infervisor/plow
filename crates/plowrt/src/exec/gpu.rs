@@ -54,10 +54,14 @@ use decode_object::{BoundDecodeObject, DecodeModule};
 mod gpu_decode_rung;
 #[path = "gpu_mixed_step.rs"]
 mod gpu_mixed_step;
+#[path = "gpu_packed_terminal.rs"]
+mod gpu_packed_terminal;
+#[path = "gpu_token_batch.rs"]
+mod gpu_token_batch;
 use gpu_cublaslt::CublasLtDecodeRoute;
 use gpu_decode_rung::{
-    decode_rung_index, decode_selection, effective_decode_widths, validate_decode_ladder,
-    DecodeRung, DecodeSelection,
+    decode_rung_index, decode_selection, effective_decode_widths, validate_cublaslt_ladder,
+    validate_decode_ladder, DecodeRung, DecodeSelection,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -413,6 +417,15 @@ const STAGE: usize = 64 << 20;
 /// the launch loudly (never silent), so a stale value here cannot corrupt.
 const SMEM_PF: u32 = 21312 * 4;
 
+pub(crate) struct VmmPrefixLayout {
+    pub(crate) geo: crate::memory::vmm::VmmGeometry,
+    slide: Vec<(usize, usize, u64)>,
+    slide_scale: Vec<(usize, usize)>,
+    full_scale: Vec<(usize, usize)>,
+    ring: u64,
+    snap_row_bytes: u64,
+}
+
 /// VMM live allocation or prefix-sharing state: the pool
 /// backing every FULL layer's `kv.{l}.k/v` tensor with per-sequence VA
 /// windows. Live mode can retain demand-mapped whole-slot rings; prefix
@@ -438,11 +451,7 @@ struct VmmServe {
     full_scale: Vec<(usize, usize)>,
     /// Sliding ring rows (`min(max_ctx, KV_RING)`), a power of two.
     ring: u64,
-    /// Fixed snapshot region: rings (`n_slide × 2 × kvh_slide × window × hd ×
-    /// elem_slide`) plus, for fp8 rings, their scale rows (`n_slide × 2 ×
-    /// kvh_slide × window × 4`). The variable full-scale region
-    /// (`vmm_full_scale_bytes`) is appended past this.
-    snap_bytes: u64,
+    snap_row_bytes: u64,
 }
 
 /// `kv.{l}.k` / `kv.{l}.v` → `(layer, 0|1)`.
@@ -630,8 +639,9 @@ impl SegmentRoleValidation for SegmentRoles {
                     && p.roles.contains(&plow_asset::segment_roles::GEMV_CTA512))
                 || (object_decode && library_decode)
                 || (decode
-                    && (p.index + 1 != programs.len()
-                        || programs.len() != prefill.len() + 1
+                    && ((!library_decode
+                        && (p.index + 1 != programs.len()
+                            || programs.len() != prefill.len() + 1))
                         || (!object_decode && !library_decode)
                         || (object_decode && g.t != 1)
                         || p.roles.iter().any(|&role| {
@@ -1452,6 +1462,13 @@ struct RecurrentState {
     tensors: Vec<(usize, u64)>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PackedAdmission {
+    Pending,
+    Waiting(u64),
+    Ready,
+}
+
 fn recurrent_state_layout(
     tensors: &[crate::asset::devblob::DevTensor],
     batch: usize,
@@ -1648,6 +1665,9 @@ pub struct GpuEngine {
     /// Per-slot rows served from the prefix cache by the current sequence's
     /// attach (0 = cold). Feeds per-request `usage.cached_tokens`.
     vmm_attached: Vec<u32>,
+    vmm_active: Vec<bool>,
+    packed_admission: Vec<PackedAdmission>,
+    kv_admission_epoch: u64,
     /// Per-slot token ids whose KV rows the slot currently holds (prompt,
     /// then every decode-fed token) — `seq_tokens[b].len() == pos[b]` when
     /// consistent. Lets `begin_slot` publish the finished sequence's
@@ -1683,7 +1703,10 @@ pub struct GpuEngine {
     /// Next physical slot considered first by cross-request prefill admission.
     prefill_turn: usize,
     packed_prefill: Option<plow_asset::packed_prefill::Manifest>,
+    packed_terminal: Option<gpu_packed_terminal::PackedTerminal>,
     mixed_step: Option<gpu_mixed_step::MixedCudaStep>,
+    token_batch: Option<gpu_token_batch::CudaTokenBatch>,
+    slot_generations: Vec<u32>,
 }
 
 /// Full model-load wall timeline (`PLOW_LOAD_PROFILE=1`).
@@ -2407,6 +2430,13 @@ pub struct PfBatchReq<'a> {
     pub len: usize,
 }
 
+struct PackedTokenReq<'a> {
+    slot: usize,
+    tokens: &'a [u32],
+    c0: usize,
+    prompt_len: usize,
+}
+
 /// Per-row device sampling request (plan stage 4). `temp <= 0` is greedy
 /// (the device sampler writes the argmax, identical to `ARGMAX_FIN`), so a
 /// spec array can carry greedy and stochastic rows together. `rng01` is the
@@ -2594,7 +2624,35 @@ impl GpuEngine {
                 .map_err(RuntimeError::Rejected)?;
         }
         let config = RuntimeConfig::get();
-        let packed_prefill = if config.nv_vmm_prefix() || config.nv.prefix_cache {
+        let prefix_layout = crate::memory::vmm::VmmOps::granularity(be.as_ref())
+            .ok()
+            .and_then(|granularity| {
+                Self::select_vmm_prefix_layout(
+                    &blob,
+                    checkpoint_dir,
+                    config,
+                    be.compute_capability(),
+                    granularity,
+                )
+            });
+        let prefix_requested = config.nv_vmm_prefix() == Some(true) || prefix_layout.is_some();
+        let unified_packed = config.token_batch
+            && !config.fusion
+            && prefix_layout.is_some()
+            && packed_prefill_metadata.is_some();
+        let packed_prefix = prefix_requested && (config.pf_batch || unified_packed);
+        if packed_prefix && (prefix_layout.is_none() || packed_prefill_metadata.is_none()) {
+            return Err(RuntimeError::Rejected(
+                "packed prefix reuse requires compiled packed-prefill metadata and a valid VMM layout"
+                    .into(),
+            ));
+        }
+        tracing::info!(
+            requested = ?config.nv_vmm_prefix(),
+            selected = prefix_layout.is_some(),
+            "VMM prefix cache selection"
+        );
+        let packed_prefill = if prefix_requested && !packed_prefix {
             if packed_prefill_metadata.is_some() {
                 tracing::info!("packed prefill disabled because prefix reuse is active");
             }
@@ -2671,10 +2729,18 @@ impl GpuEngine {
             )?;
         }
         let single_bound_decode = decode_objects.is_some() && blob.decode_progs().len() == 1;
-        let mut select_decode_rungs = single_bound_decode || validate_decode_ladder(&blob)?;
+        let mut select_decode_rungs = if cublaslt_enabled {
+            if decode_objects.is_some() || prepared_contexts.is_some() {
+                return Err(RuntimeError::Rejected(
+                    "cuBLASLt decode cannot use decode objects or context variants".into(),
+                ));
+            }
+            validate_cublaslt_ladder(&blob, segment_roles.as_ref().expect("library roles"))?
+        } else {
+            single_bound_decode || validate_decode_ladder(&blob)?
+        };
         if recurrent.is_some() {
-            let config = RuntimeConfig::get();
-            if config.nv_vmm_prefix() || config.nv.prefix_cache {
+            if prefix_requested {
                 return Err(RuntimeError::Rejected(
                     "recurrent state does not support prefix caching".into(),
                 ));
@@ -2869,7 +2935,7 @@ impl GpuEngine {
             );
         }
 
-        // ---- VMM prefix sharing (PLOW_VMM_PREFIX=1; default off) ----
+        // ---- VMM allocation and prefix sharing ----
         let vmm = {
             let run = || {
                 let config = RuntimeConfig::get();
@@ -2878,6 +2944,7 @@ impl GpuEngine {
                     live_kv_manifest.as_ref().is_some_and(|manifest| {
                         manifest.caches.iter().any(|cache| cache.window == 0)
                     }),
+                    prefix_requested,
                 );
                 if live && !config.nv_vmm_live() {
                     tracing::info!("live KV allocation enabled by packet metadata");
@@ -2889,14 +2956,14 @@ impl GpuEngine {
                     ));
                 }
                 if live {
-                    if config.nv_vmm_prefix() || config.nv.prefix_cache {
+                    if prefix_requested {
                         return Err(RuntimeError::Rejected(
                             "live KV allocation requires prefix caching off".into(),
                         ));
                     }
                     Self::vmm_live_bringup(&be, &blob, rings, live_kv_manifest.as_ref()).map(Some)
                 } else {
-                    Ok(Self::vmm_bringup(&be, &blob, checkpoint_dir))
+                    Ok(Self::vmm_bringup(&be, &blob, prefix_layout))
                 }
             };
             if let Some(tm) = load_tim.as_mut() {
@@ -3416,7 +3483,7 @@ impl GpuEngine {
         let t_decode = std::time::Instant::now();
         let decode_t0 = load_tim.as_ref().map(|t| t.ms_since_t0()).unwrap_or(0.0);
         let sys_decode = std::time::SystemTime::now();
-        let pf_batch_env = crate::config::RuntimeConfig::get().nv.pf_batch;
+        let pf_batch_env = crate::config::RuntimeConfig::get().pf_batch;
         let pf_max_t_blob = blob
             .prefill_progs()
             .iter()
@@ -3593,13 +3660,25 @@ impl GpuEngine {
             kvrow.clear();
             tracing::info!("decode: dynamic B=1 KV row — immutable instruction stream");
         }
-        let cublaslt_decode =
-            gpu_cublaslt::prepare_routes(&be, cublaslt_segments, &mut insts, &devp)?;
+        // Rung graphs run serially on the engine stream and share one Lt workspace.
+        let cublaslt = cublaslt_enabled
+            .then(|| crate::device::cuda::lt::Lt::load(&be))
+            .transpose()?;
+        let ordered_waits = if cublaslt_enabled {
+            Some(gpu_cublaslt::ordered_waits(g, &cublaslt_segments)?)
+        } else {
+            None
+        };
+        let cublaslt_decode = if let Some(lt) = &cublaslt {
+            gpu_cublaslt::prepare_routes(lt, cublaslt_segments, &mut insts, &devp, None)?
+        } else {
+            Vec::new()
+        };
         let d_inst = upload_pod(pod_bytes(&insts))?;
         let d_stream = upload_pod(pod_bytes(&g.stream))?;
         let d_sofs = upload_pod(pod_bytes(&g.stream_ofs))?;
         let d_slen = upload_pod(pod_bytes(&g.stream_len))?;
-        let d_waits = upload_pod(pod_bytes(&g.waits))?;
+        let d_waits = upload_pod(pod_bytes(ordered_waits.as_deref().unwrap_or(&g.waits)))?;
         let d_succs = upload_pod(pod_bytes(&g.succs))?;
         let d_gq_stream = upload_pod(pod_bytes(&g.gq_stream))?;
         let d_gq_seg = upload_pod(pod_bytes(&g.gq_seg_ofs))?;
@@ -3650,12 +3729,33 @@ impl GpuEngine {
             token_batch: 0,
         };
 
-        let decode_rungs = if select_decode_rungs && !cublaslt_enabled {
+        let stream = be.stream_create()?;
+        let decode_rungs = if select_decode_rungs {
             blob.decode_progs()[..blob.decode_progs().len() - 1]
                 .iter()
                 .enumerate()
                 .map(|(index, g)| {
-                    let mut rung = DecodeRung::upload(&be, g, kernarg)?;
+                    let mut rung = if let Some(lt) = &cublaslt {
+                        let roles = &segment_roles
+                            .as_ref()
+                            .unwrap()
+                            .program(blob.progs.len() - blob.decode_progs().len() + index)
+                            .unwrap()
+                            .roles;
+                        let segments = gpu_cublaslt::decode_segments(g, &blob.tensors, roles)?;
+                        let waits = gpu_cublaslt::ordered_waits(g, &segments)?;
+                        let mut insts = g.insts.clone();
+                        let routes = gpu_cublaslt::prepare_routes(
+                            lt, segments, &mut insts, &devp, Some(&cublaslt_decode),
+                        )?;
+                        let mut rung = DecodeRung::upload_with_insts(&be, g, kernarg, &insts, &waits)?;
+                        rung.library = Some(gpu_cublaslt::CublasLtDecodeGraph::capture(
+                            &be, &stream, rung.kernarg, f, grid, smem, routes,
+                        )?);
+                        rung
+                    } else {
+                        DecodeRung::upload(&be, g, kernarg)?
+                    };
                     if let (Some(metadata), Some(objects)) = (&decode_objects, &bound_objects) {
                         rung.object = Some(Arc::clone(&objects[&metadata.programs[index].object]));
                         tracing::info!(
@@ -3817,7 +3917,7 @@ impl GpuEngine {
                 grid,
                 profile.tag,
                 segment_roles.as_ref(),
-                packed_prefill.is_some(),
+                packed_prefill.as_ref(),
             ) {
                 Ok((f_pf, smem_pf, module_pf, buckets, seg_pf)) => {
                     tracing::info!(
@@ -3943,16 +4043,11 @@ impl GpuEngine {
                     "MXFP4 MoE role object hash mismatch".into(),
                 ));
             }
-            let module = DecodeModule::load(&be, &image)?;
-            if packed_prefill.is_some()
-                && be.module_global_u32(&module, plow_asset::packed_prefill::CAPABILITY)?
-                    != Some(plow_asset::packed_prefill::CAPABILITY_VALUE)
-            {
-                return Err(RuntimeError::Rejected(format!(
-                    "packet role lacks packed request ABI{}",
-                    plow_asset::packed_prefill::CAPABILITY_VALUE
-                )));
+            if let Some(pack) = &packed_prefill {
+                pack.validate_object(|name| cubin::global_u32(&image, name))
+                    .map_err(RuntimeError::Rejected)?;
             }
+            let module = DecodeModule::load(&be, &image)?;
             let capability = be.module_global_u32(&module, marker)?;
             let block = be.module_global_u32(&module, block)?;
             match id {
@@ -4054,14 +4149,13 @@ impl GpuEngine {
                 if f_pf.is_some() && !prefill.is_empty() =>
             {
                 if packed_prefill.is_some() {
-                    if vmm.as_ref().is_some_and(|v| v.kv.prefix_reuse())
+                    if (vmm.as_ref().is_some_and(|v| v.kv.prefix_reuse()) && !packed_prefix)
                         || recurrent.is_some()
-                        || prefill.iter().any(|b| b.fp8_kv)
                         || prefill.iter().any(|b| {
                             b.seg_class.len() < 2 || b.qwen_segments.iter().any(Option::is_some)
                         })
                     {
-                        return Err(RuntimeError::Rejected("packed requests require complete direct-KV segmented chains without prefix reuse".into()));
+                        return Err(RuntimeError::Rejected("packed requests require complete direct-KV segmented chains and a compatible prefix layout".into()));
                     }
                     Some(PfBatch {
                         d_slot,
@@ -4172,7 +4266,6 @@ impl GpuEngine {
         // The engine's ordered device queue + pinned per-step staging + the
         // flag-gated (`--step-time` / PLOW_STEP_TIME=1) CUDA-event timing
         // (plan stage 1: async submission path).
-        let stream = be.stream_create()?;
         let stage = StepStage::new(&be, batch, recurrent.is_some())?;
         let h2d_ev = be.event_create(false)?;
         let timing = match crate::config::RuntimeConfig::get().nv.step_time {
@@ -4281,6 +4374,9 @@ impl GpuEngine {
             batch,
             pos: vec![0; batch],
             vmm_attached: vec![0; batch],
+            vmm_active: vec![false; batch],
+            packed_admission: vec![PackedAdmission::Pending; batch],
+            kv_admission_epoch: 0,
             seq_tokens: vec![Vec::new(); batch],
             stop_ids: std::sync::Arc::new(stop_ids),
             logits_raw: Vec::new(),
@@ -4294,8 +4390,27 @@ impl GpuEngine {
             pf_batch,
             prefill_turn: 0,
             packed_prefill,
+            packed_terminal: None,
             mixed_step,
+            token_batch: None,
+            slot_generations: vec![0; batch],
         };
+        engine.packed_terminal = gpu_packed_terminal::PackedTerminal::load(&engine)?;
+        engine.token_batch = gpu_token_batch::CudaTokenBatch::load(&engine);
+        if config.token_batch {
+            tracing::info!(
+                route = "unified-token-batch",
+                backend = "cuda",
+                ready = engine.token_batch_enabled(),
+                fires = false,
+                reason = if engine.token_batch_enabled() {
+                    "packed-prefill and compact-output capabilities loaded"
+                } else {
+                    "unsupported device, model, object or execution mode; using ordinary execution"
+                },
+                "token-batch route status"
+            );
+        }
         if engine.cublaslt_decode_capture {
             engine.capture_decode_graph()?;
         }
@@ -4442,27 +4557,65 @@ impl GpuEngine {
             slide_scale: Vec::new(),
             full_scale: Vec::new(),
             ring: 0,
-            snap_bytes: 0,
+            snap_row_bytes: 0,
         })
     }
 
-    fn vmm_prefix_enabled(&self) -> bool {
+    pub(crate) fn vmm_prefix_enabled(&self) -> bool {
         self.vmm.as_ref().is_some_and(|v| v.kv.prefix_reuse())
     }
 
-    /// Bring up VMM prefix sharing when `--vmm-prefix` / `PLOW_VMM_PREFIX=1`
-    /// and the model's KV geometry (from the checkpoint's `config.json`)
-    /// validates against the blob's declared tensor sizes. Any mismatch logs
-    /// and falls back to the cudaMalloc path — never fails the load.
-    fn vmm_bringup(
-        be: &Arc<CudaBackend>,
+    pub(crate) fn select_vmm_prefix_layout(
         blob: &DevBlob,
         checkpoint_dir: &Path,
-    ) -> Option<VmmServe> {
-        let on = crate::config::RuntimeConfig::get().nv_vmm_prefix();
-        if !on {
+        config: &RuntimeConfig,
+        capability: (u32, u32),
+        granularity: u64,
+    ) -> Option<VmmPrefixLayout> {
+        let requested = config.nv_vmm_prefix();
+        if requested == Some(false)
+            || (requested.is_none()
+                && (capability != (9, 0)
+                    || config.pf_batch
+                    || config.nv_vmm_live()
+                    || config.nv_vmm_live_rings()
+                    || blob.tp.is_some()
+                    || blob.sections.iter().any(|section| {
+                        matches!(
+                            section.name.as_str(),
+                            plow_asset::mixed_step::SECTION
+                                | plow_asset::decode_objects::SECTION
+                                | plow_asset::decode_context::SECTION
+                        )
+                    })))
+        {
             return None;
         }
+        let layout = Self::vmm_prefix_layout(blob, checkpoint_dir)?;
+        if requested.is_none()
+            && (layout.geo.elem != 2
+                || layout.geo.elem_slide != 2
+                || layout.geo.hd_full != 512
+                || layout.geo.hd_slide != 256
+                || layout.geo.window != 1024
+                || layout.slide.is_empty()
+                || recurrent_state_layout(&blob.tensors, layout.geo.batch as usize)
+                    .ok()?
+                    .is_some())
+        {
+            return None;
+        }
+        layout
+            .geo
+            .block_bytes(granularity, u64::from(config.nv_vmm_block_mib()) << 20)
+            .ok()?;
+        Some(layout)
+    }
+
+    pub(crate) fn vmm_prefix_layout(
+        blob: &DevBlob,
+        checkpoint_dir: &Path,
+    ) -> Option<VmmPrefixLayout> {
         let batch = blob.decode_prog().ok()?.t;
         let max_ctx = blob
             .tensors
@@ -4575,15 +4728,38 @@ impl GpuEngine {
                 }
             }
         }
-        // Fixed snapshot region: ring rows, then (fp8 rings) their scale rows.
-        let slide_rows = slide.len() as u64 * 2 * geo.kvh_slide as u64 * geo.window as u64;
-        let snap_bytes = (slide_rows * hd_b
+        // Per-row snapshot cost of sliding KV and optional fp8 scales.
+        let slide_rows = slide.len() as u64 * 2 * geo.kvh_slide as u64;
+        let snap_row_bytes = slide_rows * hd_b
             + if geo.elem_slide == 1 {
                 slide_rows * 4
             } else {
                 0
-            })
-        .max(4);
+            };
+
+        Some(VmmPrefixLayout {
+            geo,
+            slide,
+            slide_scale,
+            full_scale,
+            ring,
+            snap_row_bytes,
+        })
+    }
+
+    fn vmm_bringup(
+        be: &Arc<CudaBackend>,
+        blob: &DevBlob,
+        layout: Option<VmmPrefixLayout>,
+    ) -> Option<VmmServe> {
+        let VmmPrefixLayout {
+            geo,
+            slide,
+            slide_scale,
+            full_scale,
+            ring,
+            snap_row_bytes,
+        } = layout?;
 
         // Default sharing block = the driver granularity (2 MiB measured):
         // the finest match unit VMM can map, e.g. 4096 tokens at hd256 bf16 —
@@ -4593,7 +4769,7 @@ impl GpuEngine {
         // 128k-dedup campaign can still raise it via PLOW_VMM_BLOCK_MIB=64.
         let rt = crate::config::RuntimeConfig::get();
         let block_hint = (rt.nv_vmm_block_mib() as u64) << 20;
-        let cache_cap = (rt.nv_vmm_cache_mib() as u64) << 20;
+        let cache_cap = (rt.prefix_cache_mib() as u64) << 20;
         match crate::memory::vmm::VmmKv::new(
             Arc::clone(be) as Arc<dyn crate::memory::vmm::VmmOps>,
             geo,
@@ -4620,7 +4796,7 @@ impl GpuEngine {
                 slide_scale,
                 full_scale,
                 ring,
-                snap_bytes,
+                snap_row_bytes,
             }),
             Err(e) => {
                 tracing::warn!(error = %e, "vmm off: pool bringup failed");
@@ -4772,33 +4948,34 @@ impl GpuEngine {
     fn vmm_slide_copy(&self, b: usize, p_a: u32, buf: u64, to_snap: bool) -> Result<()> {
         let v = self.vmm.as_ref().expect("vmm_slide_copy without vmm");
         let g = v.kv.geometry();
-        let w = g.window as u64;
+        let w = g.window.min(p_a) as u64;
         let hd_b = (g.hd_slide * g.elem_slide) as u64;
-        let ring = v.ring;
-        debug_assert!(p_a as u64 >= w, "boundary below the sliding window");
+        let start = (p_a as u64 - w) & (v.ring - 1);
+        let run1 = w.min(v.ring - start);
         let mut off = buf;
         for &(ik, iv, stride) in &v.slide {
             for idx in [ik, iv] {
                 let base = self.devp[idx].base + b as u64 * stride;
-                for h in 0..g.kvh_slide as u64 {
-                    let hb = base + h * ring * hd_b;
-                    let start = (p_a as u64 - w) & (ring - 1);
-                    let run1 = w.min(ring - start);
-                    let (r1, s1) = (hb + start * hd_b, off);
-                    let (r2, s2) = (hb, off + run1 * hd_b);
-                    if to_snap {
-                        self.be.memcpy_dtod(s1, r1, run1 * hd_b)?;
-                        if run1 < w {
-                            self.be.memcpy_dtod(s2, r2, (w - run1) * hd_b)?;
-                        }
+                for (dev, snap, rows) in [
+                    (base + start * hd_b, off, run1),
+                    (base, off + run1 * hd_b, w - run1),
+                ] {
+                    let ring = (dev, v.ring * hd_b);
+                    let snapshot = (snap, w * hd_b);
+                    let (dst, src) = if to_snap {
+                        (snapshot, ring)
                     } else {
-                        self.be.memcpy_dtod(r1, s1, run1 * hd_b)?;
-                        if run1 < w {
-                            self.be.memcpy_dtod(r2, s2, (w - run1) * hd_b)?;
-                        }
-                    }
-                    off += w * hd_b;
+                        (ring, snapshot)
+                    };
+                    self.be.memcpy_dtod_pitched_async(
+                        dst,
+                        src,
+                        rows * hd_b,
+                        g.kvh_slide,
+                        &self.stream,
+                    )?;
                 }
+                off += u64::from(g.kvh_slide) * w * hd_b;
             }
         }
         Ok(())
@@ -4813,14 +4990,14 @@ impl GpuEngine {
     fn vmm_scale_copy(&self, b: usize, p_a: u32, buf: u64, to_snap: bool) -> Result<()> {
         let v = self.vmm.as_ref().expect("vmm_scale_copy without vmm");
         let g = v.kv.geometry();
-        let w = g.window as u64;
+        let w = g.window.min(p_a) as u64;
         let ring = v.ring;
         let mut off = buf;
         let mut blit = |dev: u64, snap: u64, bytes: u64| -> Result<()> {
             if to_snap {
-                self.be.memcpy_dtod(snap, dev, bytes)
+                self.be.memcpy_dtod_async(snap, dev, bytes, &self.stream)
             } else {
-                self.be.memcpy_dtod(dev, snap, bytes)
+                self.be.memcpy_dtod_async(dev, snap, bytes, &self.stream)
             }
         };
         for &(sk, sv) in &v.slide_scale {
@@ -4859,28 +5036,66 @@ impl GpuEngine {
         v.full_scale.len() as u64 * 2 * g.kvh_full as u64 * p_a as u64 * 4
     }
 
-    /// Copy the whole boundary snapshot for slot `b` at boundary `p_a`:
-    /// rings, then fp8 ring scales, then fp8 full-layer scale prefixes.
-    /// `to_snap` picks the direction (publish writes, attach restores).
-    fn vmm_snap_copy(&self, b: usize, p_a: u32, buf: u64, to_snap: bool) -> Result<()> {
-        self.vmm_slide_copy(b, p_a, buf, to_snap)?;
-        let v = self.vmm.as_ref().expect("vmm_snap_copy without vmm");
-        if !v.slide_scale.is_empty() || !v.full_scale.is_empty() {
-            let g = v.kv.geometry();
-            let rings = v.slide.len() as u64
-                * 2
-                * g.kvh_slide as u64
-                * g.window as u64
-                * (g.hd_slide * g.elem_slide) as u64;
-            self.vmm_scale_copy(b, p_a, buf + rings, to_snap)?;
+    fn vmm_snap_bytes(&self, rows: u32) -> u64 {
+        let v = self.vmm.as_ref().expect("prefix snapshot without VMM");
+        let g = v.kv.geometry();
+        let partial = u64::from(rows % v.kv.block_rows());
+        (v.snap_row_bytes * u64::from(g.window.min(rows))
+            + self.vmm_full_scale_bytes(rows)
+            + v.tensor_tracks.len() as u64 * u64::from(g.kvh_full)
+                * partial * u64::from(g.hd_full * g.elem)).max(4)
+    }
+
+    fn vmm_partial_copy(&self, b: usize, rows: u32, mut buf: u64, to_snap: bool) -> Result<()> {
+        let v = self.vmm.as_ref().unwrap();
+        let g = v.kv.geometry();
+        let partial = rows % v.kv.block_rows();
+        if partial == 0 { return Ok(()); }
+        let row_bytes = u64::from(g.hd_full * g.elem);
+        let bytes = u64::from(partial) * row_bytes;
+        let row0 = u64::from(rows - partial);
+        for &(index, _, _) in &v.tensor_tracks {
+            for h in 0..u64::from(g.kvh_full) {
+                let dev = self.devp[index].base
+                    + ((b as u64 * u64::from(g.kvh_full) + h) * u64::from(g.max_ctx) + row0)
+                        * row_bytes;
+                if to_snap { self.be.memcpy_dtod_async(buf, dev, bytes, &self.stream)?; }
+                else { self.be.memcpy_dtod_async(dev, buf, bytes, &self.stream)?; }
+                buf += bytes;
+            }
         }
         Ok(())
     }
 
+    /// Copy the whole boundary snapshot for slot `b` at boundary `p_a`:
+    /// rings, fp8 ring scales, fp8 full-layer scale prefixes, partial full-KV.
+    /// `to_snap` picks the direction (publish writes, attach restores).
+    fn vmm_snap_copy(&self, b: usize, p_a: u32, buf: u64, to_snap: bool) -> Result<()> {
+        let copied = (|| {
+            self.vmm_slide_copy(b, p_a, buf, to_snap)?;
+            let v = self.vmm.as_ref().expect("vmm_snap_copy without vmm");
+            if !v.slide_scale.is_empty() || !v.full_scale.is_empty() {
+                let g = v.kv.geometry();
+                let rings = v.slide.len() as u64
+                    * 2
+                    * g.kvh_slide as u64
+                    * g.window.min(p_a) as u64
+                    * (g.hd_slide * g.elem_slide) as u64;
+                self.vmm_scale_copy(b, p_a, buf + rings, to_snap)?;
+            }
+            let partial = buf
+                + v.snap_row_bytes * u64::from(v.kv.geometry().window.min(p_a))
+                + self.vmm_full_scale_bytes(p_a);
+            self.vmm_partial_copy(b, p_a, partial, to_snap)
+        })();
+        // Drain even a partially submitted copy before VMM remapping or snapshot release.
+        let completed = self.be.stream_synchronize(&self.stream);
+        copied.and(completed)
+    }
+
     /// Consult the prefix cache for slot `b`'s prompt and attach a published
     /// prefix: multi-map the shared full-layer blocks, restore the sliding
-    /// windows from the boundary snapshot, and advance the prefill frontier
-    /// so the tail (< one sharing block) is recomputed by normal prefill.
+    /// windows and private partial block, then advance the prefill frontier.
     fn vmm_attach(&mut self, b: usize, prompt: &[u32]) -> Result<()> {
         let Some(v) = self.vmm.as_ref().filter(|v| v.kv.prefix_reuse()) else {
             return Ok(());
@@ -4890,10 +5105,14 @@ impl GpuEngine {
         };
         debug_assert_eq!(
             a.snap_bytes,
-            self.vmm.as_ref().unwrap().snap_bytes + self.vmm_full_scale_bytes(a.rows),
+            self.vmm_snap_bytes(a.rows),
             "boundary snapshot layout drift"
         );
+        if a.rows % v.kv.block_rows() != 0 {
+            v.kv.ensure_rows(b, a.rows + 1)?;
+        }
         self.vmm_snap_copy(b, a.rows, a.snap_va, false)?;
+        self.vmm.as_ref().unwrap().kv.finish_attach(b);
         self.pos[b] = a.rows;
         self.vmm_attached[b] = a.rows;
         // Seed the row-token record with the attached prefix — the tail is
@@ -4904,7 +5123,7 @@ impl GpuEngine {
             slot = b,
             rows = a.rows,
             prompt = prompt.len(),
-            "vmm: prefix attached (full-layer KV shared, zero copy)"
+            "vmm: prefix attached (whole KV blocks shared, boundary restored)"
         );
         Ok(())
     }
@@ -5003,6 +5222,8 @@ impl GpuEngine {
                 self.max_ctx
             )));
         }
+        self.reset_packed_admission(b);
+        self.slot_generations[b] = self.slot_generations[b].wrapping_add(1);
         if let Some(state) = &self.recurrent {
             for &(index, stride) in &state.tensors {
                 self.be.memset_d8_async(
@@ -5019,27 +5240,119 @@ impl GpuEngine {
         // VMM: publish the finished sequence's generated whole blocks first —
         // a follow-up turn embedding this turn's output then attaches instead
         // of re-prefilling it — then drop the previous sequence's mappings/
-        // cache references and re-map row 0 (idle-row garbage writes land
-        // there).
-        self.vmm_tail_publish(b);
+        // cache references. Prefix admission maps after lookup; every execution
+        // path maps the rows it writes, including inactive decode rows.
+        self.vmm_publish(b, self.pos[b]);
         self.pos[b] = 0;
         self.vmm_attached[b] = 0;
         if let Some(v) = &self.vmm {
+            self.vmm_active[b] = true;
             self.seq_tokens[b].clear();
             self.seq_tokens[b].reserve(total);
             v.kv.begin_seq(b);
-            v.kv.ensure_rows(b, 1)?;
+            if !v.kv.prefix_reuse() {
+                v.kv.ensure_rows(b, 1)?;
+            }
         }
         Ok(())
     }
 
-    /// Publish slot `b`'s current sequence up to its last whole block —
-    /// prompt AND generated rows — into the prefix cache. Skips (never
-    /// fails serving) when the row-token record is inconsistent, the
-    /// sequence is shorter than a block, or the sliding rings no longer
+    pub fn retire_slot(&mut self, b: usize, cache_output: bool) {
+        self.slot_generations[b] = self.slot_generations[b].wrapping_add(1);
+        self.reset_packed_admission(b);
+        if !self.vmm_active[b] {
+            return;
+        }
+        if cache_output {
+            self.vmm_publish(b, self.pos[b]);
+        }
+        self.pos[b] = 0;
+        self.vmm_attached[b] = 0;
+        // Decode's backstop maps row zero before any inactive-row write.
+        self.vmm.as_ref().unwrap().kv.begin_seq(b);
+        self.seq_tokens[b].clear();
+        self.vmm_active[b] = false;
+    }
+
+    fn reset_packed_admission(&mut self, b: usize) {
+        if self.packed_admission[b] == PackedAdmission::Ready {
+            self.kv_admission_epoch = self.kv_admission_epoch.wrapping_add(1);
+        }
+        self.packed_admission[b] = PackedAdmission::Pending;
+    }
+
+    pub(crate) fn packed_slot_ready(&self, b: usize) -> bool {
+        self.packed_admission[b] == PackedAdmission::Ready
+    }
+
+    pub(crate) fn admit_packed_slot(
+        &mut self,
+        b: usize,
+        prompt: &[u32],
+        total: usize,
+    ) -> Result<Option<usize>> {
+        match self.packed_admission.get(b) {
+            Some(PackedAdmission::Ready) => return Ok(Some(self.pos[b] as usize)),
+            Some(PackedAdmission::Waiting(epoch)) if *epoch == self.kv_admission_epoch => {
+                return Ok(None);
+            }
+            Some(PackedAdmission::Pending)
+                if self.packed_admission.iter().any(|state| {
+                    matches!(state, PackedAdmission::Waiting(epoch) if *epoch != self.kv_admission_epoch)
+                }) =>
+            {
+                // Retry older waiters before a new arrival takes released pages.
+                return Ok(None);
+            }
+            None => return Err(RuntimeError::Rejected(format!("slot {b} out of range"))),
+            _ => {}
+        }
+        let started = (|| {
+            self.begin_slot(b, total)?;
+            let frontier = self.attach_prompt(b, prompt)?;
+            if let Some(v) = self.vmm.as_ref().filter(|v| v.kv.prefix_reuse()) {
+                // Wider decode rungs write idle rows too. Reserve those before
+                // one request can consume their remaining physical pages.
+                for slot in 0..self.batch {
+                    v.kv.ensure_rows(slot, 1)?;
+                }
+                let margin = (v.kv.block_rows() as usize).max(self.pf_max_rows());
+                let rows = total.saturating_add(margin).min(self.max_ctx);
+                v.kv.ensure_rows(b, rows as u32)?;
+            }
+            Ok(frontier)
+        })();
+        match started {
+            Ok(frontier) => {
+                self.packed_admission[b] = PackedAdmission::Ready;
+                Ok(Some(frontier))
+            }
+            Err(error) => {
+                self.retire_slot(b, false);
+                let oom = matches!(error, RuntimeError::Oom(_)) || error.device_code() == Some(2);
+                if self.vmm_prefix_enabled()
+                    && oom
+                    && !error.is_fatal()
+                    && self.packed_admission.contains(&PackedAdmission::Ready)
+                {
+                    self.vmm.as_ref().unwrap().kv.ensure_rows(b, 1)?;
+                    self.packed_admission[b] = PackedAdmission::Waiting(self.kv_admission_epoch);
+                    tracing::info!(slot = b, total, "gpu: packed KV admission waiting");
+                    Ok(None)
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    /// Publish slot `b` up to a computed 32-token boundary. Prompt publication
+    /// limits rows to prompt_len - 1 so an identical prompt can replay its tail.
+    /// Skips without failing serving when the row-token record is inconsistent, the
+    /// sequence is shorter than 32 tokens, or the sliding rings no longer
     /// hold the boundary's window rows (`rows - p_a > ring - window`:
     /// wrapped past, unrecoverable).
-    fn vmm_tail_publish(&self, b: usize) {
+    fn vmm_publish(&self, b: usize, max_rows: u32) {
         let Some(v) = self.vmm.as_ref().filter(|v| v.kv.prefix_reuse()) else {
             return;
         };
@@ -5049,16 +5362,15 @@ impl GpuEngine {
             return;
         }
         let g = v.kv.geometry();
-        let bt = v.kv.block_rows();
-        let p_a = (rows / bt) * bt;
-        if p_a < g.window.max(bt) {
+        let p_a = (rows.min(max_rows) / 32) * 32;
+        if p_a == 0 {
             return;
         }
         if !v.slide.is_empty() && rows - p_a > v.ring as u32 - g.window {
             return;
         }
-        let snap_bytes = v.snap_bytes + self.vmm_full_scale_bytes(p_a);
-        if let Err(e) = v.kv.publish(b, toks, snap_bytes, |dst| {
+        let snap_bytes = self.vmm_snap_bytes(p_a);
+        if let Err(e) = v.kv.publish_at(b, toks, p_a, snap_bytes, |dst| {
             self.vmm_snap_copy(b, p_a, dst, true)
         }) {
             tracing::debug!(error = %e, slot = b, "vmm: tail publish skipped");
@@ -5536,6 +5848,9 @@ impl GpuEngine {
 
     fn launch_selected_decode(&mut self, selection: DecodeSelection) -> Result<()> {
         if let Some(r) = self.selected_decode(selection) {
+            if let Some(library) = &r.library {
+                return library.launch(&self.stream);
+            }
             let mut arg = r.kernarg;
             let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
             let object = r.object.as_deref();
@@ -5844,8 +6159,9 @@ impl GpuEngine {
         grid: u32,
         interp_tag: &str,
         segment_roles: Option<&SegmentRoles>,
-        packed_requests: bool,
+        packed: Option<&plow_asset::packed_prefill::Manifest>,
     ) -> Result<(KernelFn, u32, Module, Vec<PrefillBucket>, Option<SegPf>)> {
+        let packed_requests = packed.is_some();
         let module = be.module_load(&pf.image)?;
         Self::check_packet_pairing_suffix(be, &module, assets_dir, "_pf")?;
         let kname = crate::config::RuntimeConfig::get()
@@ -5887,16 +6203,14 @@ impl GpuEngine {
         }
         let seg_pf = match segment_dir {
             Some(dir) => {
-                // Segmented objects currently have only bf16-KV variants. Loading one for an
-                // fp8-KV packet would resolve valid symbols and then reinterpret the cache with
-                // the wrong element width, so reject the requested pairing before loading it.
-                if blob.progs.iter().flat_map(|p| &p.insts).any(|inst| {
-                    inst.op == DevOp::HeadNormRopeFp8 as u16
-                        || inst.op == DevOp::FlashPrefillFp8 as u16
-                }) {
+                if !packed_requests
+                    && blob.progs.iter().flat_map(|p| &p.insts).any(|inst| {
+                        inst.op == DevOp::HeadNormRopeFp8 as u16
+                            || inst.op == DevOp::FlashPrefillFp8 as u16
+                    })
+                {
                     return Err(RuntimeError::Device(
-                        "segmented NVIDIA prefill objects cannot be used with fp8-KV packets: \
-                         no fp8-KV variant is available"
+                        "FP8-KV segmented prefill requires a compiled packed request contract"
                             .into(),
                     ));
                 }
@@ -5908,17 +6222,12 @@ impl GpuEngine {
                     let img = std::fs::read(dir.join(file)).map_err(|e| {
                         RuntimeError::Device(format!("segmented prefill object: read {file}: {e}"))
                     })?;
+                    if let Some(pack) = packed {
+                        pack.validate_object(|name| cubin::global_u32(&img, name))
+                            .map_err(|e| RuntimeError::Rejected(format!("{file}: {e}")))?;
+                    }
                     let m = be.module_load(&img)?;
                     Self::check_packet_pairing_suffix(be, &m, assets_dir, suffix)?;
-                    if packed_requests
-                        && be.module_global_u32(&m, plow_asset::packed_prefill::CAPABILITY)?
-                            != Some(plow_asset::packed_prefill::CAPABILITY_VALUE)
-                    {
-                        return Err(RuntimeError::Rejected(format!(
-                            "{file} lacks packed request ABI{}",
-                            plow_asset::packed_prefill::CAPABILITY_VALUE
-                        )));
-                    }
                     let f = be.get_function(&m, sym)?;
                     let sm = be.module_global_u32(&m, arena)?.unwrap_or(smem_pf);
                     be.set_max_dynamic_smem(f, sm)?;
@@ -5926,8 +6235,13 @@ impl GpuEngine {
                     Ok((m, f, sm, occ * be.sm_count()))
                 };
                 let suffix = if packed_requests { "pfpacked" } else { "pf" };
-                let seg_file = format!("interp_{interp_tag}_{suffix}seg.cubin");
-                let gemm_file = format!("interp_{interp_tag}_{suffix}gemm.cubin");
+                let kv_suffix = if packed.is_some_and(|p| p.version == 2) {
+                    "_fp8kv"
+                } else {
+                    ""
+                };
+                let seg_file = format!("interp_{interp_tag}_{suffix}seg{kv_suffix}.cubin");
+                let gemm_file = format!("interp_{interp_tag}_{suffix}gemm{kv_suffix}.cubin");
                 let seg_sym_name = format!("interp_{interp_tag}_{suffix}seg");
                 let gemm_sym_name = format!("interp_{interp_tag}_{suffix}gemm");
                 let seg_sym = format!("_Z{}{}11PlowProgram", seg_sym_name.len(), seg_sym_name);
@@ -5952,16 +6266,11 @@ impl GpuEngine {
                     let img = std::fs::read(path).map_err(|e| {
                         RuntimeError::Device(format!("PLOW_PF_SEG_GEMM_SMALL: read {path}: {e}"))
                     })?;
-                    let module = be.module_load(&img)?;
-                    if packed_requests
-                        && be.module_global_u32(&module, plow_asset::packed_prefill::CAPABILITY)?
-                            != Some(plow_asset::packed_prefill::CAPABILITY_VALUE)
-                    {
-                        return Err(RuntimeError::Rejected(format!(
-                            "small GEMM object lacks packed request ABI{}",
-                            plow_asset::packed_prefill::CAPABILITY_VALUE
-                        )));
+                    if let Some(pack) = packed {
+                        pack.validate_object(|name| cubin::global_u32(&img, name))
+                            .map_err(RuntimeError::Rejected)?;
                     }
+                    let module = be.module_load(&img)?;
                     let abi = be
                         .module_global_u32(&module, "plow_gemm_shape_abi_pfgemm")?
                         .unwrap_or(0);
@@ -6470,11 +6779,10 @@ impl GpuEngine {
             self.seq_tokens[b].extend_from_slice(prompt);
         }
         if let Some(v) = self.vmm.as_ref().filter(|v| v.kv.prefix_reuse()) {
-            let bt = v.kv.block_rows();
-            let p_a = (n as u32 / bt) * bt;
-            if p_a >= v.kv.geometry().window.max(bt) {
-                let snap_bytes = v.snap_bytes + self.vmm_full_scale_bytes(p_a);
-                if let Err(e) = v.kv.publish(b, prompt, snap_bytes, |dst| {
+            let p_a = (n.saturating_sub(1) as u32 / 32) * 32;
+            if p_a > 0 {
+                let snap_bytes = self.vmm_snap_bytes(p_a);
+                if let Err(e) = v.kv.publish_at(b, prompt, p_a, snap_bytes, |dst| {
                     self.vmm_snap_copy(b, p_a, dst, true)
                 }) {
                     tracing::warn!(error = %e, slot = b, "vmm: publish failed (serving continues)");
@@ -6630,18 +6938,17 @@ impl GpuEngine {
         if self.packed_prefill.is_some() && self.prefill[bi].batch_patched {
             let pack = self.packed_prefill.as_ref().unwrap();
             let bucket = &mut self.prefill[bi];
+            if let Some(terminal) = &self.packed_terminal {
+                terminal.patch_discarded_tail(bucket, false);
+            }
             for &pc in &bucket.rope_sites {
-                bucket.h_inst[pc].t[6] = TENSOR_NONE16;
+                pack.bind_request(&mut bucket.h_inst[pc], false);
             }
             for &pc in &bucket.flash_sites {
-                let d = &mut bucket.h_inst[pc];
-                d.t[6] = TENSOR_NONE16;
-                if let Some(m) = pack.maps.iter().find(|m| m.slots == d.t[7]) {
-                    d.t[7] = m.original;
-                }
+                pack.bind_request(&mut bucket.h_inst[pc], false);
             }
             for &pc in &bucket.merge_sites {
-                bucket.h_inst[pc].t[3] = TENSOR_NONE16;
+                pack.bind_request(&mut bucket.h_inst[pc], false);
             }
             bucket.batch_patched = false;
         }
@@ -7023,18 +7330,17 @@ impl GpuEngine {
         }
         if let Some(pack) = &self.packed_prefill {
             let b = &mut self.prefill[bi];
+            if let Some(terminal) = &self.packed_terminal {
+                terminal.patch_discarded_tail(b, true);
+            }
             for &pc in &b.rope_sites {
-                b.h_inst[pc].t[6] = pack.slot;
+                pack.bind_request(&mut b.h_inst[pc], true);
             }
             for &pc in &b.flash_sites {
-                let d = &mut b.h_inst[pc];
-                d.t[6] = pack.request;
-                if let Some(m) = pack.maps.iter().find(|m| m.original == d.t[7]) {
-                    d.t[7] = m.slots;
-                }
+                pack.bind_request(&mut b.h_inst[pc], true);
             }
             for &pc in &b.merge_sites {
-                b.h_inst[pc].t[7] = pack.request;
+                pack.bind_request(&mut b.h_inst[pc], true);
             }
             for &pc in &b.lmhead_sites {
                 b.h_inst[pc].i[4] = 0;
@@ -7106,6 +7412,37 @@ impl GpuEngine {
     /// decode step of the last prompt token (`step_slots`), so no lm_head
     /// readback happens here.
     pub fn prefill_batched(&mut self, reqs: &[PfBatchReq]) -> Result<()> {
+        let chunks = reqs
+            .iter()
+            .map(|r| {
+                let end = r.c0.checked_add(r.len).ok_or_else(|| {
+                    RuntimeError::Rejected("packed chunk end overflow".into())
+                })?;
+                let tokens = r.prompt.get(r.c0..end).ok_or_else(|| {
+                    RuntimeError::Rejected("packed chunk outside prompt".into())
+                })?;
+                Ok(PackedTokenReq {
+                    slot: r.slot,
+                    tokens,
+                    c0: r.c0,
+                    prompt_len: r.prompt.len(),
+                })
+            })
+            .collect::<Result<smallvec::SmallVec<[_; 16]>>>()?;
+        self.packed_token_body(&chunks)?;
+        for r in reqs {
+            self.pos[r.slot] = (r.c0 + r.len) as u32;
+            if self.vmm_prefix_enabled() && r.c0 + r.len + 1 >= r.prompt.len() {
+                let end = r.c0 + r.len;
+                self.seq_tokens[r.slot].clear();
+                self.seq_tokens[r.slot].extend_from_slice(&r.prompt[..end]);
+                self.vmm_publish(r.slot, r.prompt.len().saturating_sub(1) as u32);
+            }
+        }
+        Ok(())
+    }
+
+    fn packed_token_body(&mut self, reqs: &[PackedTokenReq<'_>]) -> Result<()> {
         let Some(f_pf) = self.f_pf else {
             return Err(RuntimeError::Rejected("prefill object not loaded".into()));
         };
@@ -7118,7 +7455,7 @@ impl GpuEngine {
         let request_plan = if self.packed_prefill.is_some() {
             let total = reqs
                 .iter()
-                .try_fold(0usize, |n, r| n.checked_add(r.len))
+                .try_fold(0usize, |n, r| n.checked_add(r.tokens.len()))
                 .ok_or_else(|| RuntimeError::Rejected("packed row overflow".into()))?;
             let bucket = self
                 .prefill
@@ -7130,8 +7467,8 @@ impl GpuEngine {
                 .map(|r| plow_asset::packed_prefill::Request {
                     slot: r.slot,
                     start: r.c0,
-                    len: r.len,
-                    prompt: r.prompt.len(),
+                    len: r.tokens.len(),
+                    prompt: r.prompt_len,
                 })
                 .collect();
             Some(
@@ -7154,12 +7491,15 @@ impl GpuEngine {
                     r.slot, self.batch
                 )));
             }
-            if r.len == 0 || r.c0 + r.len > r.prompt.len() {
+            let end = r.c0.checked_add(r.tokens.len()).ok_or_else(|| {
+                RuntimeError::Rejected("packed chunk end overflow".into())
+            })?;
+            if r.tokens.is_empty() || end > r.prompt_len {
                 return Err(RuntimeError::Rejected(format!(
                     "pf-batch: bad chunk c0={} len={} prompt={}",
                     r.c0,
-                    r.len,
-                    r.prompt.len()
+                    r.tokens.len(),
+                    r.prompt_len
                 )));
             }
             if r.c0 != self.pos[r.slot] as usize {
@@ -7168,14 +7508,16 @@ impl GpuEngine {
                     r.slot, self.pos[r.slot], r.c0
                 )));
             }
-            if r.c0 + r.len > self.max_ctx {
+            if end > self.max_ctx {
                 return Err(RuntimeError::Rejected(format!(
                     "pf-batch: chunk end {} exceeds compiled context {}",
-                    r.c0 + r.len,
+                    end,
                     self.max_ctx
                 )));
             }
-            total += r.len;
+            total = total.checked_add(r.tokens.len()).ok_or_else(|| {
+                RuntimeError::Rejected("packed row overflow".into())
+            })?;
         }
         // Covering bucket for the pack: smallest T >= Σ len (minimal padding).
         let bi = self
@@ -7219,7 +7561,7 @@ impl GpuEngine {
         // an async H2D of these bytes (memcpy_htod_async src-lifetime contract).
         let kvlen_bytes = reqs
             .iter()
-            .map(|r| (r.c0 + r.len) as i32)
+            .map(|r| (r.c0 + r.tokens.len()) as i32)
             .max()
             .unwrap_or(0)
             .to_le_bytes();
@@ -7231,24 +7573,24 @@ impl GpuEngine {
             pb.req_buf.push(reqs.len() as i32);
             let mut cur = 0usize;
             for r in reqs {
-                for k in 0..r.len {
-                    self.pf_ids[cur + k] = r.prompt[r.c0 + k] as i32;
+                for (k, &token) in r.tokens.iter().enumerate() {
+                    self.pf_ids[cur + k] = token as i32;
                     self.pf_pos[cur + k] = (r.c0 + k) as i32;
                     pb.slot_buf[cur + k] = r.slot as i32;
                 }
                 pb.req_buf.extend_from_slice(&[
                     cur as i32,
-                    r.len as i32,
+                    r.tokens.len() as i32,
                     r.slot as i32,
-                    (r.c0 + r.len) as i32,
+                    (r.c0 + r.tokens.len()) as i32,
                 ]);
-                cur += r.len;
+                cur += r.tokens.len();
             }
             // Trailing pad rows continue the LAST request's positions (legacy
             // pad semantics: garbage KV past a frontier lands in rows that
             // slot's own next writes overwrite before they become readable).
             let last = reqs.last().expect("non-empty");
-            let (mut p, s) = (last.c0 + last.len, last.slot as i32);
+            let (mut p, s) = (last.c0 + last.tokens.len(), last.slot as i32);
             for k in cur..tc {
                 self.pf_ids[k] = 0;
                 self.pf_pos[k] = p.min(self.max_ctx - 1) as i32;
@@ -7354,7 +7696,7 @@ impl GpuEngine {
             use std::fmt::Write as _;
             let mut chunks = String::new();
             for (i, r) in reqs.iter().enumerate() {
-                let _ = write!(chunks, "{}{}", if i == 0 { "" } else { "," }, r.len);
+                let _ = write!(chunks, "{}{}", if i == 0 { "" } else { "," }, r.tokens.len());
             }
             eprintln!(
                 "PACKLOG R={} rows={} bucket={} chunks=[{}]",
@@ -7363,9 +7705,6 @@ impl GpuEngine {
                 tc,
                 chunks
             );
-        }
-        for r in reqs {
-            self.pos[r.slot] = (r.c0 + r.len) as u32;
         }
         Ok(())
     }
@@ -7698,6 +8037,7 @@ impl Drop for GpuEngine {
             report(&e, "synchronize at engine unload");
         }
         drop(self.decode_contexts.take());
+        self.decode_rungs.clear();
         drop(self.qwen_prefill.take());
         if let Some(m) = self.module_pf.take() {
             if let Err(e) = self.be.module_unload(&m) {
@@ -7763,6 +8103,56 @@ mod prefill_patch_tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires packed-prefix assets whose full-context slots exceed available HBM"]
+    fn packed_admission_retries_after_retirement_and_preserves_waiter_priority() {
+        let assets = PathBuf::from(std::env::var("PACKED_ADMISSION_TEST_ASSETS").unwrap());
+        let be = Arc::new(CudaBackend::new(0).unwrap());
+        let mut e = GpuEngine::load(be, &assets, &assets.join("checkpoint")).unwrap();
+        assert!(e.pf_batch_enabled() && e.vmm_prefix_enabled() && e.batch >= 3);
+        let total = e.max_ctx;
+        let mut ready = Vec::new();
+        let mut waiting = Vec::new();
+        for slot in 0..e.batch {
+            if e.admit_packed_slot(slot, &[1, 2], total).unwrap().is_some() {
+                ready.push(slot);
+            } else {
+                waiting.push(slot);
+            }
+        }
+        assert!(!ready.is_empty() && !waiting.is_empty());
+        let epoch = e.kv_admission_epoch;
+        let created = e.vmm.as_ref().unwrap().kv.stats().blocks_created;
+        for _ in 0..16 {
+            for &slot in &waiting {
+                assert!(e.admit_packed_slot(slot, &[1, 2], total).unwrap().is_none());
+            }
+        }
+        assert_eq!(e.kv_admission_epoch, epoch);
+        assert_eq!(e.vmm.as_ref().unwrap().kv.stats().blocks_created, created);
+        let freed = ready[0];
+        e.retire_slot(freed, false);
+        assert!(e.admit_packed_slot(freed, &[1, 2], total).unwrap().is_none());
+        assert!(
+            e.admit_packed_slot(waiting[0], &[1, 2], total)
+                .unwrap()
+                .is_some()
+        );
+
+        // Cancel admitted and waiting requests, then execute a one-token prompt
+        // in the highest slot to exercise every inactive-row mapping backstop.
+        for slot in 0..e.batch {
+            e.retire_slot(slot, false);
+        }
+        let slot = e.batch - 1;
+        assert_eq!(e.admit_packed_slot(slot, &[1], 2).unwrap(), Some(0));
+        let mut tokens = Vec::new();
+        e.step_slots(&[(slot, 1)], &mut tokens).unwrap();
+        assert_eq!(tokens.len(), 1);
+        assert!((tokens[0] as usize) < e.vocab);
+        eprintln!("PASS packed admission: {} admitted, {} waiting, retirement, priority, cancellation, widest-rung recovery", ready.len(), waiting.len());
+    }
+
+    #[test]
     fn packed_runtime_tables_are_excluded_from_both_weight_consumers() {
         let m = plow_asset::packed_prefill::Manifest {
             version: 1,
@@ -7809,8 +8199,8 @@ mod prefill_patch_tests {
     fn packed_segmented_block_matches_serialized() -> Result<()> {
         assert_eq!(std::env::var("TEST_PACKED_PREFILL_GPU").as_deref(), Ok("1"));
         let config = crate::config::RuntimeConfig::get();
-        assert!(!config.nv.pf_batch);
-        assert!(!config.nv_vmm_prefix());
+        assert!(!config.pf_batch);
+        assert_ne!(config.nv_vmm_prefix(), Some(true));
         let assets = std::path::PathBuf::from(std::env::var("TEST_PACKED_PREFILL_ASSETS").unwrap());
         let bytes = std::fs::read(assets.join("model.pkt")).unwrap();
         let blob = DevBlob::parse(&bytes).unwrap();
@@ -7863,15 +8253,18 @@ mod prefill_patch_tests {
         let kv = |e: &GpuEngine, spans: &[(usize, usize)]| {
             let mut all = Vec::new();
             for c in &live.caches {
-                for &handle in &c.pair {
+                let elem = if c.scales.is_some() { 1 } else { 2 };
+                let tensors = c.pair.into_iter()
+                    .map(|h| (h, c.hd as usize * elem))
+                    .chain(c.scales.into_iter().flatten().map(|h| (h, 4)));
+                for (handle, row_bytes) in tensors {
                     for &(slot, len) in spans {
                         for head in 0..c.heads as usize {
                             assert!(len <= c.stride as usize);
                             let offset = ((slot * c.heads as usize + head)
                                 * c.stride as usize
-                                * c.hd as usize
-                                * 2) as u64;
-                            let mut raw = vec![0; len * c.hd as usize * 2];
+                                * row_bytes) as u64;
+                            let mut raw = vec![0; len * row_bytes];
                             e.be.download(&e.devp[handle as usize], offset, &mut raw)
                                 .unwrap();
                             all.extend(raw);
@@ -8051,6 +8444,58 @@ mod slab_tests {
 mod profile_tests {
     use super::*;
 
+    #[test]
+    #[ignore = "CPU asset inspection; set TEST_PACKED_FP8_ASSETS to compiled H100 assets"]
+    fn fp8_packed_assets_match_packet_and_reject_bf16_objects() {
+        let assets = PathBuf::from(std::env::var_os("TEST_PACKED_FP8_ASSETS").unwrap());
+        let raw = std::fs::read(assets.join("model.pkt")).unwrap();
+        let blob = DevBlob::parse(&raw).unwrap();
+        let live = crate::memory::vmm::LiveKvLayout::manifest(&blob, &raw)
+            .unwrap()
+            .unwrap();
+        let pack: plow_asset::packed_prefill::Manifest = serde_json::from_slice(
+            blob.reserved_metadata(&raw, plow_asset::packed_prefill::SECTION)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(live.version, 2);
+        assert_eq!(pack.version, 2);
+        assert!(!live.caches.is_empty());
+        assert!(live.caches.iter().all(|c| c.scales.is_some()));
+        blob.with_packet_view(|p| pack.validate(p, &live)).unwrap();
+        assert_eq!(
+            blob.decode_progs().iter().map(|p| p.t).collect::<Vec<_>>(),
+            [1, 2, 4, 8, 16]
+        );
+        assert_eq!(
+            blob.prefill_progs().iter().map(|p| p.t).collect::<Vec<_>>(),
+            [128, 512, 1024]
+        );
+        let build: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(assets.join("build.json")).unwrap()).unwrap();
+        let hash = build["pairing"]["hash"].as_str().unwrap();
+        let hash = u64::from_str_radix(hash.trim_start_matches("0x"), 16).unwrap();
+        for role in ["pfpackedseg", "pfpackedgemm"] {
+            let name = format!("interp_sm90a_{role}");
+            let image = std::fs::read(assets.join(format!("{name}_fp8kv.cubin"))).unwrap();
+            pack.validate_object(|n| cubin::global_u32(&image, n))
+                .unwrap();
+            let info = cubin::inspect(&image).unwrap();
+            assert_eq!(info.sm, 90);
+            assert!(info
+                .entries
+                .contains(&format!("_Z{}{name}11PlowProgram", name.len())));
+            let lo = cubin::global_u32(&image, &format!("plow_packet_hash_lo_{role}")).unwrap();
+            let hi = cubin::global_u32(&image, &format!("plow_packet_hash_hi_{role}")).unwrap();
+            assert_eq!((u64::from(hi) << 32) | u64::from(lo), hash);
+            let bf16 = std::fs::read(assets.join(format!("{name}.cubin"))).unwrap();
+            assert!(pack
+                .validate_object(|n| cubin::global_u32(&bf16, n))
+                .is_err());
+        }
+    }
+
     fn prefill_images() -> (InterpreterProfile, Vec<u8>, Vec<u8>) {
         let profile = interpreter_profile((9, 0)).unwrap();
         let ordinary = plow_asset::cubin::synthetic_elf(profile.prefill_symbol, &[], 90);
@@ -8176,6 +8621,124 @@ mod profile_tests {
         assert_eq!(selected.image, ordinary);
         assert_eq!(selected.source, "ordinary.cubin");
         assert!(rejected[0].contains("mixed-step auxiliary object"));
+    }
+}
+
+#[cfg(test)]
+mod prefix_selection_tests {
+    use super::*;
+    use crate::asset::devblob::{DevProg, DevSection, DevTensor};
+
+    #[test]
+    fn automatic_prefix_selection_requires_compatible_execution_and_valid_kv_layout() {
+        let dir =
+            std::env::temp_dir().join(format!("plow-prefix-selection-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "layer_types": ["sliding_attention", "full_attention"],
+                "num_key_value_heads": 2, "num_global_key_value_heads": 1,
+                "head_dim": 256, "global_head_dim": 512, "sliding_window": 1024,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let tensor = |name: &str, bytes| DevTensor {
+            name: name.into(),
+            bytes,
+            init: None,
+        };
+        let mut blob = DevBlob {
+            n_cu: 132,
+            flags: 0,
+            target: 0,
+            tensors: vec![
+                tensor("in.pos", 4096 * 4),
+                tensor("kv.0.k", 2 << 20),
+                tensor("kv.0.v", 2 << 20),
+                tensor("kv.1.k", 4 << 20),
+                tensor("kv.1.v", 4 << 20),
+            ],
+            init: Vec::new(),
+            kvrow: Vec::new(),
+            sections: Vec::new(),
+            gen: Vec::new(),
+            tp: None,
+            progs: vec![DevProg {
+                t: 1,
+                packed_prefill_only: false,
+                n_counter: 0,
+                insts: Vec::new(),
+                stream: Vec::new(),
+                stream_ofs: Vec::new(),
+                stream_len: Vec::new(),
+                waits: Vec::new(),
+                succs: Vec::new(),
+                gq_stream: Vec::new(),
+                gq_seg_ofs: vec![0, 0],
+                l2_domains: 0,
+            }],
+        };
+        let mut cfg = RuntimeConfig::get().clone();
+        cfg.nv.vmm_prefix = None;
+        cfg.nv.vmm_live = false;
+        cfg.nv.vmm_live_rings = false;
+        cfg.prefix_cache = true;
+        cfg.pf_batch = false;
+        let selected = |blob: &DevBlob, cfg: &RuntimeConfig, cc, gran| {
+            GpuEngine::select_vmm_prefix_layout(blob, &dir, cfg, cc, gran).is_some()
+        };
+        assert!(selected(&blob, &cfg, (9, 0), 2 << 20));
+        assert!(!selected(&blob, &cfg, (12, 0), 2 << 20));
+        assert!(!selected(&blob, &cfg, (9, 0), 16 << 20));
+        cfg.pf_batch = true;
+        assert!(!selected(&blob, &cfg, (9, 0), 2 << 20));
+        cfg.pf_batch = false;
+        cfg.nv.vmm_live = true;
+        assert!(!selected(&blob, &cfg, (9, 0), 2 << 20));
+        assert!(cfg.nv_live_kv_enabled(true, true, false));
+        cfg.nv.vmm_live = false;
+        cfg.nv.vmm_prefix = Some(false);
+        assert!(!selected(&blob, &cfg, (9, 0), 2 << 20));
+        cfg.nv.vmm_prefix = Some(true);
+        assert!(selected(&blob, &cfg, (12, 0), 2 << 20));
+        cfg.nv.vmm_prefix = None;
+        for name in [
+            plow_asset::mixed_step::SECTION,
+            plow_asset::decode_objects::SECTION,
+            plow_asset::decode_context::SECTION,
+        ] {
+            blob.sections.push(DevSection {
+                kind: packet::devbuild::SECT_METADATA,
+                name: name.into(),
+                offset: 0,
+                size: 0,
+            });
+            assert!(!selected(&blob, &cfg, (9, 0), 2 << 20));
+            blob.sections.pop();
+        }
+        blob.tensors.push(tensor("state.qwen.0.gdn", 64));
+        assert!(!selected(&blob, &cfg, (9, 0), 2 << 20));
+        blob.tensors.pop();
+        blob.tensors[3].bytes /= 2;
+        assert!(!selected(&blob, &cfg, (9, 0), 2 << 20));
+        blob.tensors[4].bytes /= 2;
+        blob.tensors.push(tensor("kv.1.k_scale", 4096 * 4));
+        blob.tensors.push(tensor("kv.1.v_scale", 4096 * 4));
+        assert!(!selected(&blob, &cfg, (9, 0), 2 << 20));
+        cfg.nv.vmm_prefix = Some(true);
+        assert!(selected(&blob, &cfg, (9, 0), 2 << 20));
+        let mut geometry: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
+        geometry["num_key_value_heads"] = 0.into();
+        std::fs::write(
+            dir.join("config.json"),
+            serde_json::to_vec(&geometry).unwrap(),
+        )
+        .unwrap();
+        assert!(!selected(&blob, &cfg, (9, 0), 2 << 20));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
 

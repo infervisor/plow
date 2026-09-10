@@ -11,7 +11,6 @@
 //! separate fields of one log line rather than one word that flatters both.
 
 use std::path::{Path, PathBuf};
-use std::sync::Once;
 
 /// The `extern "C" __device__` markers `runtime/amd/interp.hip` emits under
 /// `PLOW_TOKEN_BATCH=1`. Each says a different thing on purpose, so a partially built object is
@@ -104,8 +103,7 @@ impl std::fmt::Display for TokenBatchRefusal {
             ),
             Self::NotRequested => write!(
                 f,
-                "not requested: the route is opt-in per (backend, family) pair until that pair \
-                 is measured — pass --token-batch or PLOW_TOKEN_BATCH=1"
+                "disabled by --token-batch=false or PLOW_TOKEN_BATCH=0"
             ),
             Self::NoLegalBucket => write!(
                 f,
@@ -193,33 +191,140 @@ pub(super) fn admit_token_batch(
     Ok(())
 }
 
-static LOG_ONCE: Once = Once::new();
-
-/// One line, once, at load. `armed` and `fires` are separate claims and are logged as such —
-/// "three campaigns here measured no effect from something that never fired", and a route that
-/// reports only `enabled` is exactly how that happens again.
-pub(super) fn log_route_once(cap: &TokenBatchCapability, fires: Result<(), TokenBatchRefusal>) {
-    LOG_ONCE.call_once(|| {
-        let reason = cap
-            .refusal
-            .as_ref()
-            .map(|r| r.to_string())
-            .or_else(|| fires.as_ref().err().map(|r| r.to_string()));
-        tracing::info!(
-            route = "unified-token-batch/dense-gqa",
-            object = %cap.object.display(),
-            kernel = %cap.kernel,
-            armed = cap.armed,
-            fires = cap.armed && fires.is_ok(),
-            reason = reason.as_deref().unwrap_or("-"),
-            "amd: token-batch route status"
-        );
-    });
+pub(super) fn log_route(cap: &TokenBatchCapability, ready: bool, reason: Option<&str>) {
+    let refusal = cap.refusal.as_ref().map(|r| r.to_string());
+    tracing::info!(
+        route = "unified-token-batch/dense-gqa",
+        object = %cap.object.display(),
+        kernel = %cap.kernel,
+        armed = cap.armed,
+        ready,
+        fires = false,
+        reason = reason.or(refusal.as_deref()).unwrap_or("-"),
+        "amd: token-batch route status"
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "CPU packet inspection; set TEST_AMD_TOKEN_BATCH_ASSETS to a fresh BF16 Gemma31 packet"]
+    fn fresh_gemma_packet_preserves_rungs_and_passes_unified_contracts() {
+        use crate::asset::devblob::DevBlob;
+        use packet::dev::{DevOp, TENSOR_NONE16};
+        use plow_asset::mixed_step::TensorContract;
+
+        let directory = PathBuf::from(std::env::var_os("TEST_AMD_TOKEN_BATCH_ASSETS").unwrap());
+        let raw = std::fs::read(directory.join("model.pkt")).unwrap();
+        let blob = DevBlob::parse_l2(&raw, true).unwrap();
+        assert_eq!(
+            blob.decode_progs().iter().map(|p| p.t).collect::<Vec<_>>(),
+            [1, 2, 4, 8]
+        );
+        let batch = blob.decode_progs().last().unwrap().t as usize;
+        let synthesized = crate::exec::mixed_program::synthesize(&blob, batch, false).unwrap();
+        assert_eq!(
+            synthesized
+                .programs
+                .iter()
+                .map(|p| p.program.rows)
+                .collect::<Vec<_>>(),
+            [128, 512, 1024]
+        );
+        let mut tensors: Vec<_> = blob
+            .tensors
+            .iter()
+            .map(|t| TensorContract {
+                name: &t.name,
+                bytes: t.bytes,
+                initialized: t.init.is_some(),
+            })
+            .collect();
+        for tensor in &synthesized.tensors {
+            tensors.resize(
+                tensors.len().max(tensor.handle as usize + 1),
+                TensorContract {
+                    name: "",
+                    bytes: 0,
+                    initialized: false,
+                },
+            );
+            tensors[tensor.handle as usize] = TensorContract {
+                name: &tensor.name,
+                bytes: tensor.bytes,
+                initialized: false,
+            };
+        }
+        for spec in &synthesized.programs {
+            let program = &spec.program;
+            assert!(program
+                .insts
+                .iter()
+                .any(|i| i.op == DevOp::FlashPrefill as u16));
+            for inst in program
+                .insts
+                .iter()
+                .filter(|i| i.op == DevOp::FlashPrefill as u16)
+            {
+                admit_token_batch(0, inst.i[7], inst.t[5] != TENSOR_NONE16)
+                    .unwrap_or_else(|e| panic!("bucket {}: {e}", program.rows));
+            }
+            plow_asset::mixed_step::dense_amd_capacity_consumer_contract(
+                program,
+                spec.decode_rows,
+                &tensors,
+            )
+            .unwrap();
+            plow_asset::token_batch::Capabilities::amd_dense_gqa(
+                "gfx942",
+                program.rows,
+                spec.decode_rows,
+            )
+            .refuse_program(program.insts.iter().map(|i| i.op))
+            .unwrap();
+        }
+    }
+
+    #[test]
+    #[ignore = "CPU ELF inspection; set TEST_AMD_TOKEN_BATCH_OBJECTS to the compiled object directory"]
+    fn compiled_objects_advertise_token_batch_and_reject_mixed_control() {
+        use super::super::{elf_symbol_names, elf_symbol_u32};
+
+        let directory = PathBuf::from(std::env::var_os("TEST_AMD_TOKEN_BATCH_OBJECTS").unwrap());
+        let cap = probe_token_batch(&directory, "gfx942", |p| std::fs::read(p), elf_symbol_u32);
+        assert!(cap.armed, "{:?}", cap.refusal);
+        for (name, suffix) in [("interp_tokbatch.elf", ""), (TOKEN_BATCH_OBJECT, "_gq")] {
+            let image = std::fs::read(directory.join(name)).unwrap();
+            let symbol = format!("plow_interp_tokbatch_gfx942{suffix}");
+            assert!(elf_symbol_names(&image).contains(&symbol.as_str()));
+            for marker in TOKEN_BATCH_MARKERS.into_iter().chain([
+                "plow_mixed_dynamic_rows_1",
+                "plow_mixed_step_bf16_1",
+                "plow_mixed_gemm_glu_1",
+                "plow_mixed_prefill_split_1",
+            ]) {
+                assert_eq!(elf_symbol_u32(&image, marker), Some(1), "{name}: {marker}");
+            }
+            assert_eq!(elf_symbol_u32(&image, "plow_mixed_block"), Some(256));
+            assert_eq!(elf_symbol_u32(&image, "plow_packet_hash_lo"), None);
+            let resources: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(directory.join(format!("{name}.resources.json"))).unwrap(),
+            )
+            .unwrap();
+            let total = resources["total_registers"].as_u64().unwrap();
+            assert_eq!(total, resources["vgpr"].as_u64().unwrap());
+            assert!(total <= resources["contract"]["max_total_registers"].as_u64().unwrap());
+        }
+        let mixed = std::fs::read(directory.join("interp_mixed_gq.elf")).unwrap();
+        let cap = probe_token_batch(&directory, "gfx942", |_| Ok(mixed.clone()), elf_symbol_u32);
+        assert!(!cap.armed);
+        assert!(matches!(
+            cap.refusal,
+            Some(TokenBatchRefusal::MarkersMissing { .. })
+        ));
+    }
 
     fn syms(present: &[&str]) -> impl Fn(&[u8], &str) -> Option<u32> {
         let owned: Vec<String> = present.iter().map(|s| s.to_string()).collect();

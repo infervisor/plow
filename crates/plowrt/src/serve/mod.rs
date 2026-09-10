@@ -852,7 +852,10 @@ async fn metrics_handler(
              plowrt_prefix_blocks_shared_mapped_total{{model=\"{slug}\"}} {}\n\
              plowrt_prefix_nodes_evicted_total{{model=\"{slug}\"}} {}\n\
              plowrt_prefix_blocks_live{{model=\"{slug}\"}} {}\n\
-             plowrt_prefix_cache_blocks{{model=\"{slug}\"}} {}\n",
+             plowrt_prefix_cache_blocks{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_cache_bytes{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_snapshot_bytes{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_snapshots_evicted_total{{model=\"{slug}\"}} {}\n",
             s.attach_hits,
             s.attach_misses,
             s.tokens_attached,
@@ -861,6 +864,9 @@ async fn metrics_handler(
             s.nodes_evicted,
             s.blocks_live,
             s.cache_blocks,
+            s.cache_bytes,
+            s.snapshot_bytes,
+            s.snapshots_evicted,
         );
     }
     out

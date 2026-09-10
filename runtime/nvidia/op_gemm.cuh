@@ -2647,11 +2647,34 @@ __device__ __forceinline__ void gemv_rows_fp8(__nv_bfloat16* __restrict__ C,
     }
 }
 
+#ifndef PLOW_NV_FP8_DECODE_MMA
+#define PLOW_NV_FP8_DECODE_MMA 0
+#endif
+#if PLOW_NV_FP8_DECODE_MMA && defined(PLOW_NV_HOPPER) && PLOW_NV_HOPPER
+#include "op_gemv_fp8_mma.cuh"
+#endif
+
+#ifndef PLOW_NV_FP8_DECODE_WGMMA
+#define PLOW_NV_FP8_DECODE_WGMMA 0
+#endif
+#if PLOW_NV_FP8_DECODE_WGMMA && defined(PLOW_NV_HOPPER) && PLOW_NV_HOPPER && !PLOW_NV_PREFILL
+#define PLOW_NV_FP8_DECODE_WGMMA_ACTIVE 1
+#include "op_gemv_fp8_wgmma.cuh"
+#else
+#define PLOW_NV_FP8_DECODE_WGMMA_ACTIVE 0
+#endif
+
 /* Non-arena overload: standalone test kernels that don't run in the persistent interpreter.
  * MM ladder {1,2,4,8} + block-walk for M>8, identical shape to d_gemv. */
 static __device__ void d_gemv_fp8(__nv_bfloat16* __restrict__ C, const __nv_bfloat16* __restrict__ x,
                            const uint8_t* __restrict__ W, const float* __restrict__ scale,
                            unsigned M, unsigned N, unsigned K, unsigned slice, unsigned nblk) {
+#if PLOW_NV_FP8_DECODE_MMA && defined(PLOW_NV_HOPPER) && PLOW_NV_HOPPER
+    if (M >= 8 && K && !(K % 256) && blockDim.x == 256) {
+        d_gemv_fp8_mma<false>(C, x, W, nullptr, scale, nullptr, M, N, K, 0, slice, nblk);
+        return;
+    }
+#endif
     gemv_walk(M, [&](auto mm, unsigned m0, unsigned rows) {
         gemv_rows_fp8<decltype(mm)::v>(C + (size_t)m0 * N, x + (size_t)m0 * K, W, scale, rows, N,
                                        K, slice, nblk);
@@ -2663,6 +2686,13 @@ static __device__ void d_gemv_fp8(__nv_bfloat16* __restrict__ C, const __nv_bflo
                            const uint8_t* __restrict__ W, const float* __restrict__ scale,
                            unsigned M, unsigned N, unsigned K, unsigned slice, unsigned nblk,
                            __nv_bfloat16* __restrict__ arena) {
+#if PLOW_NV_FP8_DECODE_WGMMA_ACTIVE
+    if (gemv_fp8_wgmma_supported(M, K)) {
+        if (M == 8) d_gemv_fp8_wgmma<8, false>(C, x, W, nullptr, scale, nullptr, M, N, K, slice, nblk, arena);
+        else d_gemv_fp8_wgmma<16, false>(C, x, W, nullptr, scale, nullptr, M, N, K, slice, nblk, arena);
+        return;
+    }
+#endif
     /* The arena stages ONE x row; B>1 decode has M rows, so fall back to the batched global
      * path (same rule as bf16 d_gemv). Without this the fp8 arms silently computed row 0 only. */
     if (M > 1) { d_gemv_fp8(C, x, W, scale, M, N, K, slice, nblk); return; }
@@ -2811,6 +2841,12 @@ static __device__ void d_gemv_glu_fp8(__nv_bfloat16* __restrict__ C, const __nv_
                                const float* __restrict__ sg, const float* __restrict__ su,
                                unsigned M, unsigned N, unsigned K, unsigned act, unsigned slice,
                                unsigned nblk) {
+#if PLOW_NV_FP8_DECODE_MMA && defined(PLOW_NV_HOPPER) && PLOW_NV_HOPPER
+    if (M >= 16 && K && !(K % 256) && blockDim.x == 256) {
+        d_gemv_fp8_mma<true>(C, x, Wg, Wu, sg, su, M, N, K, act, slice, nblk);
+        return;
+    }
+#endif
     gemv_walk(M, [&](auto mm, unsigned m0, unsigned rows) {
         gemv_glu_rows_fp8<decltype(mm)::v>(C + (size_t)m0 * N, x + (size_t)m0 * K, Wg, Wu, sg, su,
                                            rows, N, K, act, slice, nblk);
@@ -2904,6 +2940,13 @@ static __device__ void d_gemv_glu_fp8(__nv_bfloat16* __restrict__ C, const __nv_
                                const float* __restrict__ sg, const float* __restrict__ su,
                                unsigned M, unsigned N, unsigned K, unsigned act, unsigned slice,
                                unsigned nblk, __nv_bfloat16* __restrict__ arena) {
+#if PLOW_NV_FP8_DECODE_WGMMA_ACTIVE
+    if (gemv_fp8_wgmma_supported(M, K) && act == PLOW_ACT_GELU_TANH_) {
+        if (M == 8) d_gemv_fp8_wgmma<8, true>(C, x, Wg, Wu, sg, su, M, N, K, slice, nblk, arena);
+        else d_gemv_fp8_wgmma<16, true>(C, x, Wg, Wu, sg, su, M, N, K, slice, nblk, arena);
+        return;
+    }
+#endif
     /* B>1: the arena holds one x row only — fall back to the batched global path. */
     if (M > 1) { d_gemv_glu_fp8(C, x, Wg, Wu, sg, su, M, N, K, act, slice, nblk); return; }
     __nv_bfloat16* xs = arena;

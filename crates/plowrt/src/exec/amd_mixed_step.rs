@@ -62,6 +62,7 @@ struct MixedProgram {
 
 pub(super) struct MixedAmdStep {
     pub(super) route: StepRoute,
+    fired: bool,
     programs: Vec<MixedProgram>,
     staging: MixedStepStaging,
     layout: HostLayout,
@@ -136,13 +137,18 @@ impl MixedAmdStep {
                     .insts
                     .iter()
                     .filter(|i| i.op == DevOp::FlashPrefill as u16)
-                    .all(|i| i.i[7] == 1 && i.t[5] != packet::dev::TENSOR_NONE16)
+                    .all(|i| {
+                        super::amd_token_batch::admit_token_batch(
+                            0,
+                            i.i[7],
+                            i.t[5] != packet::dev::TENSOR_NONE16,
+                        )
+                        .is_ok()
+                    })
             });
             if synthesized.programs.is_empty() {
                 return Err(RuntimeError::Rejected(
-                    "capability `token_batch_unsplit_attention`: no prefill bucket in this blob \
-                     has nsplit=1 with a fused flash epilogue"
-                        .into(),
+                    super::amd_token_batch::TokenBatchRefusal::NoLegalBucket.to_string(),
                 ));
             }
         }
@@ -200,17 +206,13 @@ impl MixedAmdStep {
             ));
         }
         let module = EngineDevice::module_load(&**be, &object)?;
-        let symbol = route.kernel(&EngineDevice::arch(&**be).to_string());
-        let kernel = EngineDevice::get_function(&**be, &module, &symbol)?;
-        let abi = std::mem::size_of::<DevProgram>() as u32;
-        // From here to the `Ok(Self { .. })` below the module is loaded and owned by nobody,
-        // and NINETEEN error exits follow — mostly `?`, which no closure or explicit call can
-        // cover. `guard` unloads on drop unless the constructor reaches the end and disarms
-        // it, so a refusal added later cannot reintroduce the leak by forgetting to.
         let mut guard = ModuleGuard {
             be,
             module: Some(module),
         };
+        let symbol = route.kernel(&EngineDevice::arch(&**be).to_string());
+        let kernel = EngineDevice::get_function(&**be, guard.module.as_ref().unwrap(), &symbol)?;
+        let abi = std::mem::size_of::<DevProgram>() as u32;
         if ![abi, abi + 256].contains(&kernel.kernarg_size()) || kernel.group_segment_size() > 65536
         {
             return Err(RuntimeError::Rejected(
@@ -397,6 +399,7 @@ impl MixedAmdStep {
         zero.as_mut_slice().fill(0);
         Ok(Self {
             route,
+            fired: false,
             programs,
             staging: MixedStepStaging::with_capacity(rows, span_capacity, batch),
             layout,
@@ -711,10 +714,29 @@ impl AmdEngine {
                 mixed.ids_base,
             )?;
             let tokens = bytemuck::cast_slice(&mixed.host.as_slice()[start..start + leading * 4]);
+            if tokens.iter().any(|&token| token >= mixed.vocab) {
+                return Err(RuntimeError::Device(format!(
+                    "{} returned a token outside vocabulary",
+                    route.label()
+                )));
+            }
             mixed
                 .staging
                 .finish_after_device_success(frontiers, tokens, output)
-                .map_err(|e| RuntimeError::Rejected(e.to_string()))
+                .map_err(|e| RuntimeError::Device(e.to_string()))?;
+            if token_batch && !mixed.fired {
+                tracing::info!(
+                    route = "unified-token-batch/dense-gqa",
+                    fires = true,
+                    rows,
+                    decode = decode.len(),
+                    prefill = prefill.len(),
+                    samples = leading,
+                    "amd: first successful token-batch dispatch"
+                );
+                mixed.fired = true;
+            }
+            Ok(())
         })();
         if result.is_err() {
             let _ = self.drain();
