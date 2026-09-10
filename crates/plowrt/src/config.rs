@@ -333,6 +333,16 @@ pub struct HetRuntimeConfig {
         global = true
     )]
     pub reserve_cores: u32,
+
+    /// The CPU-executable packet a prefill head runs. Defaults to
+    /// `<assets>/cpu-twin/model.pkt` when that exists.
+    ///
+    /// A twin is not a new artifact class: it is another VARIANT of the same
+    /// model — same `--max-ctx`, a target the CPU interpreter accepts — so a
+    /// distribution selects and pulls it the way it selects any variant, and
+    /// this names the bundle that selection materialised.
+    #[arg(long = "het-twin", env = "PLOW_HET_TWIN", global = true)]
+    pub twin: Option<String>,
 }
 
 /// Kernel-tier ceiling for the CPU engine (`--cpu-isa`).
