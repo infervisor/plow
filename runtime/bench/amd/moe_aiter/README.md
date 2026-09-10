@@ -49,8 +49,10 @@ runtime route for gfx942 TP8 decode rungs 2/4/8 at this geometry. It defaults
 off. The route preserves ordered segments and XCD placement, skips alignment,
 and launches active-expert packing followed by the flat assembly kernel. The
 existing combine reads its BF16 output directly. Other decode rungs retain
-their existing kernels. Full-model quality and serving gains remain unqualified;
-the isolated timings above used the earlier benchmark adapter.
+their existing kernels. Both enabled and disabled full-model BF16-KV batch-8
+packets now pass 18/18 retrieval cases at concurrency 8. Broader quality and
+serving gains remain unqualified; the isolated timings above used the earlier
+benchmark adapter.
 
 Build the adapter with `scripts/build_moe_aiter.sh OBJECT_DIR
 AITER_MOE_CODE_OBJECT AITER_FLAT_CODE_OBJECT`. Both assembly objects are pinned
@@ -64,6 +66,30 @@ and routing checks, and twelve poisoned output reuses with guards. The
 Both full-model TP8 packets pass Lean ordering verification for all eight
 programs. With flat decode disabled, the packet is byte-identical to the
 existing baseline.
+
+### Wider batches and routing stress
+
+The [wide-batch record](mi300x-flat-wide.json) includes complete FP32 oracle
+checks at rows 16/20, using the shared production packing kernel. Captured
+routing shows packing-inclusive warm gains, but distinct expert IDs across
+all token/top-k pairs remove that advantage:
+
+| Rows / active experts | Plow warm, µs | Flat + pack warm, µs | Resident flat warm, µs | Plow cold, µs | Flat + pack cold, µs |
+|---:|---:|---:|---:|---:|---:|
+| 16 / 128 | 458.36 | 614.08 | 175.22 | 488.37 | 653.29 |
+| 20 / 160 | 709.38 | 706.90 | 242.00 | 735.98 | 755.97 |
+
+Resident timing excludes packing. These results identify repeated weight
+packing as a bottleneck and do not justify extending the runtime route to
+rows 16/20. Flat relative L2 error is 4.05–4.33% for these spread-routing cells;
+all flat cells pass twelve poisoned reuses and output guards.
+
+Reproduce with `--rows 16` or `--rows 20`, `--routing spread`,
+`--oracle-all-rows --cache-flush-mib 512`, and the corresponding wide capture.
+Spread routing retains captured activations and gates but replaces expert IDs;
+it is a stress case, not a measured serving routing distribution. Omit
+`--verify-part`, since the captured partials belong to the original routing.
+The default `--routing capture` preserves the original benchmark behavior.
 
 Inside `nix develop`, with ROCm PyTorch and `amd-aiter==0.1.19` available:
 

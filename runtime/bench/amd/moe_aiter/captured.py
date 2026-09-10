@@ -97,12 +97,15 @@ def main():
     parser.add_argument("--layer", type=int, required=True)
     parser.add_argument("--rank", type=int, default=0)
     parser.add_argument("--rows", type=int, default=4464)
+    parser.add_argument("--routing", choices=["capture", "spread"], default="capture",
+                        help="spread replaces expert IDs to test packing with more active experts")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--oracle-all-rows", action="store_true")
     parser.add_argument("--cache-flush-mib", type=int, default=0)
     parser.add_argument("--verify-part", action="store_true")
     args = parser.parse_args()
     assert 0 <= args.cache_flush_mib <= 16384
+    assert not args.verify_part or args.routing == "capture"
     native = args.arm.startswith("native")
     flat = args.arm.startswith("flat-")
     assert "gfx942" in torch.cuda.get_device_properties(0).gcnArchName
@@ -114,6 +117,10 @@ def main():
 
     x = read("x.bin", torch.bfloat16).reshape(-1, hidden)[:rows].contiguous()
     table = read("tab.bin", torch.int32).reshape(-1, topk, 2)[:rows].contiguous()
+    if args.routing == "spread":
+        assert rows * topk <= experts and args.oracle_all_rows
+        table[:, :, 0] = ((torch.arange(rows * topk, device="cuda") * 73 + 19)
+                         % experts).reshape(rows, topk)
     ids = table[:, :, 0].contiguous()
     weights = table[:, :, 1].contiguous().view(torch.float32)
     assert torch.isfinite(x).all() and torch.isfinite(weights).all()
@@ -405,7 +412,7 @@ def main():
         repeats = [torch.equal(run(), first) for _ in range(3)]
         repeat_check = {"bit_identical_repeats": repeats, "fp64_combine_exact": True}
         assert all(repeats), repeat_check
-    if args.arm == "plow":
+    if args.arm == "plow" and args.routing == "capture":
         old_fu = read("fu.bin", torch.bfloat16).reshape(-1, intermediate)
         old_rp = read("rp.bin", torch.int32)
         old_meta = read("meta.bin", torch.int32)
@@ -472,6 +479,7 @@ def main():
         del retained_output
     record = {
         "arm": args.arm, "layer": args.layer, "rank": args.rank, "tp": 8, "rows": rows,
+        "routing": args.routing, "active_experts": ids.unique().numel(),
         "hidden": hidden, "intermediate": intermediate, "experts": experts, "topk": topk,
         "torch": torch.__version__, "hip": torch.version.hip, "gpu": torch.cuda.get_device_name(0),
         "aiter": importlib.metadata.version("amd-aiter"), "oracle_rows": picks,
