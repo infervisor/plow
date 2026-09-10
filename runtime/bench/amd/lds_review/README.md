@@ -98,6 +98,14 @@ Coverage is at implementation-family level. CPU GEMM has no GPU LDS, and
 non-attention recurrent KDA/GDN kernels are outside this review. Golden kernels,
 experimental files, and unused library symbols are not certified by this audit.
 
+Concurrent commit `61796f7c` was merged and reviewed before publication. It
+adds opt-in per-slot packed-attention TMA descriptor resolution. Its separate
+[H100 audit](../../../../perf-data/gemma4-12b-h100-kernel-audit.md) records four
+oracle cases and clean memcheck, but Nsight Compute returned
+`ERR_NVGPUCTRPERM`; no NVIDIA bank-conflict counts were obtained. HD512/BKV16
+keeps its copy fallback because the descriptor box has 32 rows. This evidence
+does not qualify GLM on CUDA or prove a serving improvement.
+
 ## CK techniques to adapt
 
 Use CK's approach of checking the **producer and consumer lane distributions

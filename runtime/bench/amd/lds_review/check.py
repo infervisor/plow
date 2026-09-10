@@ -18,12 +18,15 @@ SOURCES = [
     'runtime/amd/amd_common.h', 'runtime/amd/interp.hip',
     'runtime/amd/dsa_tp_adapter.hip', 'runtime/amd/mla_sparse_adapter.hip',
     'runtime/amd/moe_aiter_adapter.hip', 'runtime/amd/mla_materialized_opus.hip',
+    'runtime/amd/glm_lt_gfx942.json', 'runtime/amd/glm_lt_decode_gfx942.json',
     'runtime/nvidia/op_gemm.cuh', 'runtime/nvidia/op_gemm_sm90.cuh',
     'runtime/nvidia/op_gemm_splitk.cuh', 'runtime/nvidia/op_attention.cuh',
     'runtime/nvidia/op_attention_sm90.cuh', 'runtime/nvidia/op_mla.cuh',
     'crates/plowrt/src/exec/amd_gemm_lt.rs',
     'crates/plowrt/src/exec/amd_sparse_mla.rs',
     'runtime/CMakeLists.txt', 'scripts/build_gfx942.sh',
+    'perf-data/gemma4-12b-h100-kernel-audit.md',
+    'perf-data/gemma4-12b-h100-data/packed-flash-bank-conflicts.log',
 ]
 
 

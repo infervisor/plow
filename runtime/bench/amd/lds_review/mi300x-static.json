@@ -1,7 +1,7 @@
 {
   "schema": "plow.lds-address-review.v1",
   "scope": "gfx942 ds_read_b128/ds_write_b128 address model; no GPU performance measurement",
-  "source_commit": "e9a75178ded87125277e23c1c7e99d10aba15984",
+  "source_commit": "a765faf2a7601d13e475dcfa1d90c4f2ce8df3c7",
   "source_sha256": {
     "runtime/amd/op_gemm.h": "a36c327c634d2e049732c801323f8e365defb2c8046c82f67af9288479520208",
     "runtime/amd/op_moe.h": "4aaeeff4d98525eb7ceb60ca2b4a1da6d0a62cdc7b94f956a3eff782ae936761",
@@ -12,18 +12,22 @@
     "runtime/amd/mla_sparse_adapter.hip": "68dd1065468486c3216cb5254b8bd564fe22bfb8e3a9b5be0b713e0488d28d09",
     "runtime/amd/moe_aiter_adapter.hip": "fa4f9771d250b5efb8a9e44b0d5879c28749e274fcf38ed8b3e340fd9f796a00",
     "runtime/amd/mla_materialized_opus.hip": "c7c6fb2b66f2cf33f5a7b0101a56623dfe28944c87baf56063dc58dfb1c864a1",
+    "runtime/amd/glm_lt_gfx942.json": "ec5af8ed394bb47eff7383a4da9d90b3c7f5549d998694a41179cd44d34e32f5",
+    "runtime/amd/glm_lt_decode_gfx942.json": "1af889d4bad8d47fb485a617b4194768c161c40057f82ea91ec063e7f8be78fb",
     "runtime/nvidia/op_gemm.cuh": "c1b8dd9321d3f6cbeb1e4bc73aab0f02a9e4418fa80e5ca9dd525b8aa099e533",
     "runtime/nvidia/op_gemm_sm90.cuh": "8beb90d8f6bf45a79d40c53fb1380a4944b377287016fa1b86baf94595f6e959",
     "runtime/nvidia/op_gemm_splitk.cuh": "6d44992617cb711a949ee540bdd1400cdeb33b519cfe79180d1eb853ee145083",
-    "runtime/nvidia/op_attention.cuh": "41e110f58d716db90d8a8c6a824f0f699a664d2ae4e07ffaedaa96a0286733f9",
-    "runtime/nvidia/op_attention_sm90.cuh": "82d13d8aad180c81c3b0fa2cf3e8ea6d008d08da47ad1ee9b3dc2e9258f96bca",
+    "runtime/nvidia/op_attention.cuh": "d8c0b5ad701206e2776e1bf43bbd7fbc775a0d52562b01ee8bf7b277d2740437",
+    "runtime/nvidia/op_attention_sm90.cuh": "baceba62dd56f76edc2c1179ec77aa38b0c749ecc866d20941c464c7312a5840",
     "runtime/nvidia/op_mla.cuh": "fde05716b1cc47912f4fd38f56cfe6e0441f916cdde90b6accb21efabd446e8e",
     "crates/plowrt/src/exec/amd_gemm_lt.rs": "5d22215b756f359e97fe16def27b2adf32948199e76941ce74918956261372c4",
     "crates/plowrt/src/exec/amd_sparse_mla.rs": "0a181319ca24a2d858bb2f8a8a2527cb94e11e3b336160b8ac3094a1dc6d40b6",
     "runtime/CMakeLists.txt": "4762bdcd6e0a32a3c091b7d4db2d60fbf2eee1086c2f2eb225b424935089ba79",
-    "scripts/build_gfx942.sh": "ff651ca674a608c738485c1ffd9da825f93e5b6bcbc54da1a1ca76b4dfd514a7"
+    "scripts/build_gfx942.sh": "ff651ca674a608c738485c1ffd9da825f93e5b6bcbc54da1a1ca76b4dfd514a7",
+    "perf-data/gemma4-12b-h100-kernel-audit.md": "dfd282907a8dd1ec2588ec5f131f2ab0ed04c370cc33b11a715cf3b2d713217d",
+    "perf-data/gemma4-12b-h100-data/packed-flash-bank-conflicts.log": "13e93b61d5206bdea8497d68ccd1b36a9c62e7c2c33783f118aba68764934195"
   },
-  "checker_sha256": "c849d2889496df1babbdc664c715a694bbbe89a8f4daf384fcb43399b9411def",
+  "checker_sha256": "0fd8e2e7fb55e38da218ef9825fe4cfc92668205bcb844fd4df12ab0547d2b38",
   "address_cases": {
     "gemm_read_bk32_k0": {
       "max_distinct_dwords_per_bank_per_phase": 2,
