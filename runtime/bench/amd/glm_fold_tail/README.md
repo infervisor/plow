@@ -119,3 +119,65 @@ does not establish parity with its 100-request workload.
 [Serving and profile evidence](mi300x-serving.json) pins the sources, runtime,
 packet, complete image set, recipes, quality outputs and measurements. Both
 runs retain default prefix caching; unified batching still declines TP support.
+
+
+## FP32 matrix pipeline candidate
+
+The [matrix-fold record](mi300x-gemm.json) compares the current ragged TB8 fold
+with a three-kernel FP32 pipeline: normalize/transposition, per-head GEMM, and
+BF16 output conversion. It also records two slower fused MFMA alternatives.
+This is an isolated candidate; the full-model runtime still uses the TB8 fold.
+
+| Rows, splits=1 | TB8 cold, µs | Direct FP32 pipeline cold, µs |
+|---|---:|---:|
+| 2048 | 144.01 | 97.79 |
+| 4463 | 292.00 | 196.45 |
+| 8191 | 504.11 | 343.03 |
+
+Timings include all three pipeline kernels. Cold runs flush 512 MiB before
+one GPU-graph replay. The 2 MiB BF16 weight tensor is converted to 4 MiB FP32
+once outside timing; native integration would also need FP32 scratch.
+Small rows 1/7/9 lose against the existing fold and are not deployment candidates.
+
+All 72 cells pass a complete CPU FP64 merge/product oracle (relative L2 < .003),
+output guards, three poisoned direct reuses and three poisoned graph replays.
+Rows cover 1/7/9/128/512/2048/4463/4464/8191; split counts 2/7 additionally cover
+128/2048/8191 with dead splits and fully masked rows. Direct assembly outputs
+match the library FP32 products exactly in all 12 direct-pipeline cases. The
+BF16 outputs are not bit-identical to the current fold because the reductions
+are reassociated; full-model quality and serving performance remain unqualified.
+
+Five selected hipBLASLt kernels already exist in the installed gfx942 FP32
+object. The library logs supply their grid, mapping and inline argument bytes.
+The unbundled kernels declare 144-byte arguments, zero private bytes and zero
+spills. Six separate tests through Plow's C HSA backend match complete FP32
+matrix outputs on three poisoned reuses, preserving 512-byte guards. This checks
+the matrix kernel boundary only; normalization/conversion and a Rust native route
+still need HSA integration. The record embeds the executed HSA sources/recipe.
+
+Build and run inside `nix develop`, using a ROCm PyTorch Python environment:
+
+```sh
+bench=runtime/bench/amd/glm_fold_tail
+root=/tmp/fold-gemm
+capture=/path/to/captured-fold
+mkdir -p "$root"
+"$PLOW_HIPCC" --offload-arch=gfx942 -O3 -w -std=c++17 -fPIC \
+  -Iruntime/amd -Iruntime/common -c "$bench/gemm_kernels.hip" -o "$root/helpers.o"
+c++ -shared "$root/helpers.o" -L"$ROCM_PATH/lib" \
+  -Wl,-rpath,"$ROCM_PATH/lib" -lamdhip64 -o "$root/helpers.so"
+"$PLOW_HIPCC" --offload-arch=gfx942 -O3 -w -std=c++17 -fPIC -DFOLD_TAIL=1 \
+  -Iruntime/amd -Iruntime/common -c "$bench/kernels.hip" -o "$root/fold.o"
+c++ -shared "$root/fold.o" -L"$ROCM_PATH/lib" \
+  -Wl,-rpath,"$ROCM_PATH/lib" -lamdhip64 -o "$capture/fold-candidate.so"
+co=/opt/rocm/core-7.14/lib/hipblaslt/library/gfx942/TensileLibrary_SS_SS_HA_Bias_SAV_UA_Type_SS_Contraction_l_Ailk_Bljk_Cijk_Dijk_gfx942.co
+perf-data/tools/gpulease -n 1 fold-gemm python "$bench/gemm.py" \
+  --root "$root" --capture "$capture" --out "$root/results.json" \
+  --selected "$bench/gemm-selected.json" --object "$co"
+```
+
+The capture contains `weight`, `opart`, `mlpart`, and `oat` with suffix
+`.prefill.bin`; it has 8191 live rows. The runner pins the object SHA before
+loading assembly. An earlier graph attempt used a cached HIP stream and was
+excluded; the final runner obtains the current stream inside every call and
+checks that poisoned outputs are restored by graph replay itself.
