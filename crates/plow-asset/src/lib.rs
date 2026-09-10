@@ -680,6 +680,7 @@ pub mod aux_program;
 pub mod program;
 pub mod splitk;
 
+pub mod kv_contract;
 pub mod live_kv;
 pub mod mixed_step;
 

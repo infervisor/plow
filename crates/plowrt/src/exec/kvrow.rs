@@ -499,3 +499,72 @@ pub(crate) fn derive_mla_nsplit(insts: &[DevInst64]) -> Option<(Vec<u32>, u32)> 
     }
     (n_flash > 0 && n_flash == n_merge).then_some((sites, baked?))
 }
+
+// The KV contract has no caller until the head handoff lands. Keep it here
+// rather than deferring it: the transferable-set rule belongs beside the other
+// KV-row rules this module exists to hold in one place, and splitting it across
+// commits is how the two engines' notions of "which tensors carry a sequence"
+// drifted apart before.
+/// One transferable KV cache in a loaded packet: where the engine's tensor
+/// table holds it, and the geometry the twin must match.
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct KvSlotTensor {
+    /// Index into the packet's tensor table.
+    pub handle: usize,
+    pub name: String,
+    pub per_slot_bytes: u64,
+}
+
+/// The transferable KV set for a packet whose `kv.*` caches are `[batch]` slot
+/// blocks, sorted by name.
+///
+/// Sorted because the digest is a set comparison across two INDEPENDENT emits:
+/// the device packet and its CPU twin need not declare tensors in the same
+/// order, and a digest that depended on that order would refuse every valid
+/// pair.
+///
+/// This is deliberately NOT `AmdEngine`'s `kv_slot_stride`, which keeps the
+/// carried recurrent state when the blob's `PLOW_KDA_F_SEQ_ROWS` carrier says
+/// it is per-slot. A row range does not reconstruct a recurrence, so the head
+/// path excludes it here and refuses the model at admission instead.
+#[allow(dead_code)]
+pub(crate) fn kv_slot_tensors(
+    blob: &crate::asset::devblob::DevBlob,
+    batch: u32,
+) -> crate::Result<Vec<KvSlotTensor>> {
+    let batch = u64::from(batch.max(1));
+    let mut out = Vec::new();
+    for (handle, t) in blob.tensors.iter().enumerate() {
+        if !plow_asset::kv_contract::is_cache_tensor(&t.name) {
+            continue;
+        }
+        if !t.bytes.is_multiple_of(batch) {
+            return Err(crate::RuntimeError::Device(format!(
+                "KV cache tensor `{}` has {} bytes, not divisible by batch {batch}",
+                t.name, t.bytes
+            )));
+        }
+        out.push(KvSlotTensor {
+            handle,
+            name: t.name.clone(),
+            per_slot_bytes: t.bytes / batch,
+        });
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
+/// The digest a device packet and its CPU twin must agree on before a head's KV
+/// rows may be copied between them.
+#[allow(dead_code)]
+pub(crate) fn kv_contract_digest(tensors: &[KvSlotTensor]) -> String {
+    let set: Vec<_> = tensors
+        .iter()
+        .map(|t| plow_asset::kv_contract::CacheTensor {
+            name: t.name.clone(),
+            per_slot_bytes: t.per_slot_bytes,
+        })
+        .collect();
+    plow_asset::kv_contract::digest(&set)
+}

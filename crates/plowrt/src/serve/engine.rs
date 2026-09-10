@@ -587,6 +587,14 @@ mod amd_serve {
         prefill_chunk_rows: u32,
         /// Next slot considered first by opt-in cross-request prefill fairness.
         prefill_turn: usize,
+        /// Rows of this slot's prompt a CPU prefill head already wrote and
+        /// transferred into its KV, consumed once by the next cursor as the
+        /// resume point. 0 = no head.
+        ///
+        /// A head is another source of RESIDENT PREFIX ROWS, which is the thing
+        /// the prefix cache already produces, so it joins at the same seam
+        /// rather than adding a second notion of "already prefilled".
+        head_rows: Vec<u32>,
         /// Width of the decode rung the last dispatch ran, so a rung CHANGE can be logged
         /// once instead of every step. It is the only externally visible evidence that the
         /// ladder is engaging, and a measurement that cannot show that is not a measurement.
@@ -905,6 +913,7 @@ mod amd_serve {
                     rows => rows,
                 },
                 prefill_turn: 0,
+                head_rows: vec![0; batch],
                 last_rung: 0,
                 diagnostics: None,
                 counter_snapshot_dir,
@@ -1233,10 +1242,24 @@ mod amd_serve {
                 if resume == 0 {
                     self.invalidate_prefix(slot);
                 }
+                // A CPU head's rows are resident like a cache hit's, and are
+                // consumed exactly once. Taken only when it beats what the
+                // prefix cache found, so the two never fight over the resume
+                // point; `begin_slot` above has already cleared the slot, which
+                // is why the head is transferred AFTER that call, not before.
+                let head = std::mem::take(&mut self.head_rows[slot]).min(n.saturating_sub(1));
+                let resume = resume.max(head);
                 let max_bucket = self.prefill_chunk_rows.min(tick_max_bucket);
                 let g = &mut self.ranks;
                 let (steps, snap_after) = {
-                    if resume > 0 {
+                    if head > 0 && head >= resume {
+                        // NO `restore_carried`: a head writes append-only KV and
+                        // there is no prefix snapshot behind it. A model with
+                        // carried recurrent state cannot take a head at all —
+                        // `serve::head` refuses it at load — so there is nothing
+                        // to restore rather than something being skipped.
+                        (g.plan_span_at_most(head, n, max_bucket)?, None)
+                    } else if resume > 0 {
                         g.restore_carried(slot)?;
                         (g.plan_span_at_most(resume, n, max_bucket)?, None)
                     } else if arm > 0 {
@@ -1758,6 +1781,29 @@ mod amd_serve {
                 }
             }
             Ok(finishing)
+        }
+
+        /// Hand a CPU prefill head's rows to `slot`: their KV is already in the
+        /// slot's caches, so the next cursor starts at `rows` instead of 0.
+        ///
+        /// Call AFTER writing the rows and BEFORE the slot's next prefill, and
+        /// only on a slot with no cursor in flight — a head is a fresh
+        /// request's prefix, never a splice into a prefill already running.
+        pub fn attach_head(&mut self, slot: usize, rows: u32) -> Result<()> {
+            self.check_slot(slot)?;
+            if self.pf[slot].is_some() || self.live[slot] {
+                return Err(RuntimeError::Rejected(format!(
+                    "slot {slot} is mid-prefill or live; a head attaches to a fresh slot"
+                )));
+            }
+            if rows as usize >= self.max_ctx {
+                return Err(RuntimeError::ContextLength(format!(
+                    "head of {rows} rows against a compiled context of {}",
+                    self.max_ctx
+                )));
+            }
+            self.head_rows[slot] = rows;
+            Ok(())
         }
 
         /// Rows completed by a request whose chunked prefill is still active.
