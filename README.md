@@ -181,6 +181,25 @@ Measured campaigns and their protocols live in
 The full Kimi-K3 TP8/MI325X build and serving recipe is
 [`docs/amd/kimi-k3-mi325x.md`](docs/amd/kimi-k3-mi325x.md).
 
+## Getting a model without building one
+
+The quickstart above compiles from source. A released `plowrt` can instead fetch
+a build that already exists — it probes the machine, picks the variant that fits,
+and fetches only what is missing:
+
+```bash
+plowrt load  kimi-k3 --checkpoint "$HOME/models/Kimi-K3"
+plowrt serve --model kimi-k3 --port 8080
+```
+
+`plowrt show <model>` lists every published variant with the reason each one does
+or does not fit this box. Weights are never distributed: they come from your
+HuggingFace snapshot or a local directory. `serve` performs no network I/O — the
+CLI fetches, in a separate process.
+
+Full contract, including how assets are produced and released:
+[`docs/DISTRIBUTION.md`](docs/DISTRIBUTION.md).
+
 ## Asset layout (what `serve` expects)
 
 After the quickstart, `$ASSETS` contains at least:

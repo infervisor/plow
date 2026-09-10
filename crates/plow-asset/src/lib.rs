@@ -669,6 +669,10 @@ pub struct BlockDescriptor {
 pub mod decode_context;
 pub mod decode_objects;
 
+/// Distribution manifests (model index, bundle, objset) and the rule that picks
+/// a variant for a live machine.
+pub mod dist;
+
 pub mod cubin;
 pub mod decode_coverage;
 

@@ -33,6 +33,19 @@ jobs:
           python3 perf-data/tools/fusion_ladder_run.py --self-test
       - name: Check bench/serve parity validator
         run: python3 perf-data/tools/check_bench_serve_parity.py --self-test
+      - name: Check distribution producers
+        run: |
+          python3 scripts/pack_objset.py --self-test
+          python3 scripts/pack_bundle.py --self-test
+          python3 scripts/publish_dist.py --self-test
+          python3 scripts/release_runtime.py --self-test
+          python3 scripts/release_dist.py --self-test
+          python3 scripts/check_recipe.py --self-test
+          python3 scripts/render_recipe.py --self-test
+      - name: Check recipes describe their builds
+        run: |
+          python3 scripts/check_recipe.py recipes/*/*/*.toml
+          python3 scripts/render_recipe.py recipes/*/*/*.toml --check
       - name: Enter Nix shell
         run: nix develop --command true
       - name: Build default package
@@ -58,6 +71,19 @@ jobs:
           python3 perf-data/tools/fusion_ladder_run.py --self-test
       - name: Check bench/serve parity validator
         run: python3 perf-data/tools/check_bench_serve_parity.py --self-test
+      - name: Check distribution producers
+        run: |
+          python3 scripts/pack_objset.py --self-test
+          python3 scripts/pack_bundle.py --self-test
+          python3 scripts/publish_dist.py --self-test
+          python3 scripts/release_runtime.py --self-test
+          python3 scripts/release_dist.py --self-test
+          python3 scripts/check_recipe.py --self-test
+          python3 scripts/render_recipe.py --self-test
+      - name: Check recipes describe their builds
+        run: |
+          python3 scripts/check_recipe.py recipes/*/*/*.toml
+          python3 scripts/render_recipe.py recipes/*/*/*.toml --check
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -67,6 +93,26 @@ jobs:
         run: cargo check --workspace --all-targets
       - name: CPU runtime
         run: cargo test -p plowrt --no-default-features --features cpu
+      # `serve` performs no network I/O, and that is the property the whole
+      # producer/consumer split rests on: the CLI fetches, in a separate
+      # process, and the serving binary needs no egress. A dependency edge is
+      # how it would silently stop being true, so the serve-only feature set is
+      # asserted to contain no HTTP or TLS crate. `dist` is the feature that
+      # legitimately adds them, and it is not in this set.
+      # The store, the reference grammar, the selector and the pull pipeline all
+      # run against a `file://` fixture, so this needs no network and no GPU.
+      - name: Distribution
+        run: cargo test -p plowrt --no-default-features --features cpu,dist --lib dist::
+      - name: serve is offline
+        run: |
+          tree=$(cargo tree -p plowrt --no-default-features --features cuda,hsa,cpu -e normal)
+          for crate in ureq rustls hyper-tls native-tls reqwest openssl; do
+            if grep -qE "^[^a-z]*${crate} v" <<<"$tree"; then
+              echo "FAIL: ${crate} is reachable from a serve-only plowrt build"
+              exit 1
+            fi
+          done
+          echo "serve-only build links no HTTP/TLS crate"
       # The feature set the README's quickstart tells people to build, and the
       # only step that compiles the CUDA and HSA backends at all. `cargo check
       # --workspace --all-targets` above runs on DEFAULT features (`default =

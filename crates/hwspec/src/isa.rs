@@ -66,6 +66,31 @@ impl IsaLevel {
         }
     }
 
+    /// The inverse of [`Self::arch_flag`], for identifying a *live* device.
+    ///
+    /// On AMD the agent name IS the ISA key: `HSA_AGENT_INFO_NAME` returns
+    /// `gfx942`, and that same string is spliced into the kernel symbol the
+    /// loader resolves (`plow_interp_dec_gfx942_gq`). NVIDIA reports a compute
+    /// capability instead, so a caller there synthesises `sm_{major}{minor}`.
+    ///
+    /// A bare `gfx942:sramecc+:xnack-` target-id is accepted: ROCr appends
+    /// feature suffixes that do not change the code-object arch.
+    pub fn from_arch_flag(s: &str) -> Option<Self> {
+        let base = s.split(':').next().unwrap_or(s);
+        [
+            IsaLevel::Sm89,
+            IsaLevel::Sm90a,
+            IsaLevel::Sm100a,
+            IsaLevel::Sm120a,
+            IsaLevel::Gfx942,
+            IsaLevel::Gfx950,
+            IsaLevel::Metal3,
+            IsaLevel::CpuRef,
+        ]
+        .into_iter()
+        .find(|l| l.arch_flag().eq_ignore_ascii_case(base))
+    }
+
     pub fn vendor(self) -> Vendor {
         match self {
             IsaLevel::Sm89 | IsaLevel::Sm90a | IsaLevel::Sm100a | IsaLevel::Sm120a => {
@@ -492,6 +517,39 @@ impl HardwareFingerprint {
         })
     }
 
+    /// Build from what a live device reports, rather than from a static spec.
+    ///
+    /// This is the direction the serving runtime needs and did not have: nothing
+    /// under `crates/plowrt` constructs a `HardwareFingerprint` today, so
+    /// [`Self::tuning_path`] and [`Self::satisfies`] are compile-time-only. A
+    /// probe gives an ISA string, a unit count and a memory size; the SKU and
+    /// the per-SM resources come from the registry entry that matches.
+    ///
+    /// `None` when no known part matches — an unrecognised device must not be
+    /// silently described as a neighbouring one.
+    pub fn from_live(
+        arch: &str,
+        units: u32,
+        mem_bytes: u64,
+        driver: Option<String>,
+    ) -> Option<Self> {
+        let isa = IsaLevel::from_arch_flag(arch)?;
+        let spec = crate::registry::from_probe(isa, units, mem_bytes)?;
+        Some(HardwareFingerprint {
+            isa,
+            sku: spec.name.to_string(),
+            units,
+            shared_mem_bytes: spec.sm.shared_mem.0,
+            regs_32bit: spec.sm.regs_32bit,
+            // The PROBED capacity, not the spec sheet: a bundle's requirement is
+            // checked against what this machine actually has.
+            mem_bytes,
+            driver,
+            toolchain: None,
+            clock_policy: None,
+        })
+    }
+
     pub fn caps(&self) -> IsaCaps {
         self.isa.caps()
     }
@@ -745,5 +803,58 @@ mod tests {
         assert_eq!(nvl.isa, sxm.isa);
         // Same ISA, different memory capacity class — they are not one population.
         assert_ne!(nvl.mem_bytes, sxm.mem_bytes);
+    }
+
+    #[test]
+    fn arch_flag_round_trips_through_from_arch_flag() {
+        for level in [
+            IsaLevel::Sm89,
+            IsaLevel::Sm90a,
+            IsaLevel::Sm100a,
+            IsaLevel::Sm120a,
+            IsaLevel::Gfx942,
+            IsaLevel::Gfx950,
+            IsaLevel::Metal3,
+            IsaLevel::CpuRef,
+        ] {
+            assert_eq!(IsaLevel::from_arch_flag(level.arch_flag()), Some(level));
+        }
+        assert!(IsaLevel::from_arch_flag("gfx90a").is_none());
+        assert!(IsaLevel::from_arch_flag("").is_none());
+    }
+
+    // ROCr appends feature suffixes to the target id; they do not change the
+    // code-object arch, and a fallback agent name must not resolve to a real part.
+    #[test]
+    fn a_target_id_with_feature_suffixes_resolves_to_its_base_arch() {
+        assert_eq!(
+            IsaLevel::from_arch_flag("gfx942:sramecc+:xnack-"),
+            Some(IsaLevel::Gfx942)
+        );
+        assert!(IsaLevel::from_arch_flag("amd_gpu_0").is_none());
+    }
+
+    // The direction the serving runtime needs. `from_live` keeps the PROBED
+    // capacity so a bundle's requirement is checked against real memory, while
+    // the SKU and per-SM resources come from the matched registry entry.
+    #[test]
+    fn from_live_identifies_a_probed_device() {
+        let probed = (192u64 << 30) - (2u64 << 30);
+        let fp =
+            HardwareFingerprint::from_live("gfx942", 304, probed, Some("1.14".into())).unwrap();
+        assert_eq!(fp.sku, "MI300X");
+        assert_eq!(fp.isa, IsaLevel::Gfx942);
+        assert_eq!(fp.units, 304);
+        assert_eq!(fp.mem_bytes, probed);
+        assert_eq!(fp.driver.as_deref(), Some("1.14"));
+        assert_eq!(fp.tuning_path(), "amd/gfx942/mi300x");
+
+        // The bigger sibling at the same ISA and unit count.
+        let fp = HardwareFingerprint::from_live("gfx942", 304, 256 << 30, None).unwrap();
+        assert_eq!(fp.sku, "MI325X");
+
+        // An unrecognised part is None, never a plausible neighbour.
+        assert!(HardwareFingerprint::from_live("gfx942", 999, 256 << 30, None).is_none());
+        assert!(HardwareFingerprint::from_live("gfx1100", 304, 256 << 30, None).is_none());
     }
 }
