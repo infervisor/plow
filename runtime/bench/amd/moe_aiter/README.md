@@ -580,3 +580,34 @@ the measured enqueue time alone cannot close the H200 gap. Retain the existing
 queue implementation pending a measured benefit; prioritize GPU execution and
 prefill throughput. This instrumented short-input run does not establish
 100-request long-context performance.
+
+### Full reference workload after resident MoE
+
+[mi300x-resident-full100.json](mi300x-resident-full100.json) runs all 100 random
+70k/700 requests, range ratio 0.14, seed 0, concurrency 20, without speculation.
+The frozen resident runtime, packet and all 60 objects match the preceding
+qualification. All requests complete without failures; input/output length
+arrays match the earlier full workload exactly: 7,018,227 / 71,149 tokens.
+The preceding retrieval screen passes 18/18.
+
+| Metric | Earlier Plow run, tiers off | Resident configuration | Supplied H200 reference |
+| --- | ---: | ---: | ---: |
+| Duration (s) | 1785.46 | 1371.95 | 259.98 |
+| Output throughput (tok/s) | 39.849 | 51.860 | 273.67 |
+| Mean TTFT (ms) | 36311.23 | 33315.83 | 1431.42 |
+| Mean TPOT (ms) | 436.60 | 331.14 | 65.92 |
+| P99 TPOT (ms) | 536.84 | 400.41 | 85.77 |
+| Median ITL (ms) | 204.34 | 113.29 | 76.31 |
+
+Throughput improves 30.14% against the historical run, which predates several
+kernel and packet changes. This is not an isolated resident-MoE comparison or
+a repeatability estimate. Throughput remains 5.28 times below the supplied
+H200 result. Its GPU count, TP configuration, launch options and cache state
+are unknown, and it includes speculative decoding. H200 parity is not achieved.
+
+Mean ITL of 331.28 ms versus median 113.29 ms shows substantial interruptions
+between faster decode intervals. Prefill timing needs investigation alongside
+decode kernel cost; these aggregate latencies do not attribute the interruptions
+to a particular cause. The frozen runtime predates the subsequent exec/Gemma
+consolidation commit. Retrieval screening does not establish broad quality
+equivalence.
