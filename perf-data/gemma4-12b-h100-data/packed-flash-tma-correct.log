@@ -1,0 +1,4 @@
+HD=256 KV=8 window=1024 maps=0 checked=4608 worst_relL2=0.00267912 max_abs=0.00110828 warm_us=84.854 PASS
+HD=512 KV=1 window=0 maps=0 checked=9216 worst_relL2=0.00252794 max_abs=0.00117296 warm_us=2767.254 PASS
+HD=256 KV=8 window=1024 maps=1 checked=4608 worst_relL2=0.00267912 max_abs=0.00110828 warm_us=81.536 PASS
+HD=512 KV=1 window=0 maps=1 checked=9216 worst_relL2=0.00252794 max_abs=0.00117296 warm_us=2780.502 PASS

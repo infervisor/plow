@@ -1,0 +1,6 @@
+==WARNING== Could not determine user home directory for section deployment.
+==WARNING== Using "/opt/nvidia/nsight-compute/2026.1.0/target/linux-desktop-glibc_2_11_3-x64/../../sections" instead.
+==WARNING== See https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html#faq.
+==PROF== Connected to process 98244 (/home/lava/plow/plans/gemma4-12b-roofline/packed_flash_sm90_correct)
+==ERROR== ERR_NVGPUCTRPERM - The user does not have permission to access NVIDIA GPU Performance Counters on the target device 0. For instructions on enabling permissions and to get more information see https://developer.nvidia.com/ERR_NVGPUCTRPERM
+==PROF== Disconnected from process 98244
