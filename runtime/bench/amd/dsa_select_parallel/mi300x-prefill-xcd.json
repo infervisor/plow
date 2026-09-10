@@ -1,0 +1,178 @@
+{
+  "schema": 1,
+  "date": "2026-09-10",
+  "source_base_commit": "f339b16123234dee289fbf6dcacc578109cf1e3a",
+  "hardware": {
+    "gpu": "MI300X",
+    "arch": "gfx942",
+    "gpu_count": 8,
+    "cu_per_gpu": 304
+  },
+  "workload": {
+    "num_prompts": 20,
+    "random_input_len": 70000,
+    "random_output_len": 700,
+    "random_range_ratio": 0.14,
+    "max_concurrency": 20,
+    "seed": 0,
+    "speculative_decoding": false,
+    "decode_batch": 8,
+    "kv_dtype": "bf16",
+    "glm_select_local": false
+  },
+  "order": [
+    "on",
+    "off"
+  ],
+  "arm_difference": "GLM prefill L2 placement only; same runtime and paired code objects, decode packets identical",
+  "packet_check": {
+    "programs": [
+      {
+        "rows": 128,
+        "instructions": 1946,
+        "instruction_operands_identical": true,
+        "stream_entries": 476394,
+        "decode_identical": false
+      },
+      {
+        "rows": 512,
+        "instructions": 1946,
+        "instruction_operands_identical": true,
+        "stream_entries": 544682,
+        "decode_identical": false
+      },
+      {
+        "rows": 2048,
+        "instructions": 2171,
+        "instruction_operands_identical": true,
+        "stream_entries": 488180,
+        "decode_identical": false
+      },
+      {
+        "rows": 8192,
+        "instructions": 2339,
+        "instruction_operands_identical": true,
+        "stream_entries": 526526,
+        "decode_identical": false
+      },
+      {
+        "rows": 1,
+        "instructions": 2769,
+        "instruction_operands_identical": true,
+        "stream_entries": 176988,
+        "decode_identical": true
+      },
+      {
+        "rows": 2,
+        "instructions": 1821,
+        "instruction_operands_identical": true,
+        "stream_entries": 278398,
+        "decode_identical": true
+      },
+      {
+        "rows": 4,
+        "instructions": 2169,
+        "instruction_operands_identical": true,
+        "stream_entries": 370023,
+        "decode_identical": true
+      },
+      {
+        "rows": 8,
+        "instructions": 2331,
+        "instruction_operands_identical": true,
+        "stream_entries": 400819,
+        "decode_identical": true
+      }
+    ],
+    "all_segment_descriptors_identical": true,
+    "off_packet_sha256": "b62cdf60c1d65cf79465f69f85d135c67d27e8063db9bf017c9b0654e0180686",
+    "on_packet_sha256": "255ee1b6a6a673f92a29aac1d9387c20fbacd85435f3ba9005cd5861da627748",
+    "compiler_sha256": "b2e08b32f0b673f6208aa48a8315612ee93241badeabdf564c5556824f58c21a"
+  },
+  "runtime_sha256": "131b220500f1336ab62f017b8ec05254628d49d96847f87dae51e44380d9de68",
+  "objects_sha256": {
+    "interp_prefill_mla_moe.elf": "28be2d592ea2b0125f6993230a513ce0c0b08232f9dd94ed82f8af53ef0a6b78",
+    "interp_prefill_mla_moe_gq.elf": "8a4cd1ac1b84be7f8b2a00c8a856e2345ec3b1081ade2f967b4b0d08ff0824e0"
+  },
+  "campaign_script": "#!/usr/bin/env bash\nset -euo pipefail\nexport PLOW_MLA_PF_V2=1 PLOW_MLA_PF_AITER=1 PLOW_PF_CHUNK=8192 PLOW_PF_INTERLEAVE=0\nexport LD_LIBRARY_PATH=\"$ROCM_PATH/lib:${LD_LIBRARY_PATH:-}\"\nroot=/tmp/tp-glm53-xcd-prefill\nif [ \"$#\" = 0 ]; then set -- off on; fi\nfor arm in \"$@\"; do\n    export PLOW_HSACO=\"$root/overlay\"\n    \"$root/plowrt\" serve --assets \"$root/assets-fixed-$arm\" --port 18986 > \"$root/server-$arm.log\" 2>&1 &\n    server=$!\n    trap 'kill -TERM \"$server\" 2>/dev/null || true; wait \"$server\" 2>/dev/null || true' EXIT\n    ready=0\n    for attempt in $(seq 1 180); do\n        if curl -fsS http://127.0.0.1:18986/v1/models > \"$root/models-$arm.json\" 2>/dev/null; then ready=1; break; fi\n        kill -0 \"$server\" || exit 1\n        sleep 1\n    done\n    [ \"$ready\" = 1 ]\n    python3 runtime/bench/amd/mla_sparse_aiter/quality.py http://127.0.0.1:18986 \"xcd-prefill-$arm\" \"$root/quality-$arm.json\" --concurrency 8 > \"$root/quality-$arm.log\" 2>&1\n    env VLLM_ROCM_LIB=/opt/rocm/core-7.14/lib /app/plow/build-gemma31/vllm-python -m vllm.entrypoints.cli.main bench serve --backend vllm --host 127.0.0.1 --port 18986 --model glm-5.3-plow-lite --tokenizer zai-org/GLM-5.3 --trust-remote-code --dataset-name random --num-prompts 20 --random-input-len 70000 --random-output-len 700 --random-range-ratio 0.14 --max-concurrency 20 --save-result --save-detailed --result-dir \"$root\" --result-filename \"serve-$arm.json\" > \"$root/bench-$arm.log\" 2>&1\n    kill -TERM \"$server\"\n    wait \"$server\" || [ \"$?\" = 143 ]\n    trap - EXIT\ndone\n",
+  "arms": {
+    "on": {
+      "metrics": {
+        "duration": 437.29358208499616,
+        "completed": 20,
+        "failed": 0,
+        "total_input_tokens": 1414538,
+        "total_output_tokens": 13795,
+        "output_throughput": 31.546312512125287,
+        "mean_ttft_ms": 166537.42695568944,
+        "median_ttft_ms": 180141.75788199645,
+        "p99_ttft_ms": 354706.7590124008,
+        "mean_tpot_ms": 192.32365895002656,
+        "median_tpot_ms": 198.385677854514,
+        "p99_tpot_ms": 259.3350269742696,
+        "mean_itl_ms": 192.8666503895658,
+        "median_itl_ms": 118.0884680361487,
+        "p99_itl_ms": 1128.7367246218491
+      },
+      "retrieval_passed": 18,
+      "retrieval_total": 18,
+      "retrieval_concurrency": 8,
+      "raw_result_sha256": "b852a5ea81266119601034eaa09ff810942a3c7ddfa7395df659cc43327c94c2",
+      "quality_result_sha256": "5a08e4f5287f21b1f5a5ab907c2db22735a0fab630e2dfba5db3c05d6092fac2"
+    },
+    "off": {
+      "metrics": {
+        "duration": 447.0073669049889,
+        "completed": 20,
+        "failed": 0,
+        "total_input_tokens": 1414538,
+        "total_output_tokens": 13795,
+        "output_throughput": 30.86078892953037,
+        "mean_ttft_ms": 165449.58103014797,
+        "median_ttft_ms": 174527.15411252575,
+        "p99_ttft_ms": 359453.45542894845,
+        "mean_tpot_ms": 195.05579644138308,
+        "median_tpot_ms": 206.271987899894,
+        "p99_tpot_ms": 234.6307503904751,
+        "mean_itl_ms": 194.55434496137025,
+        "median_itl_ms": 118.36612300248817,
+        "p99_itl_ms": 1134.5033973932732
+      },
+      "retrieval_passed": 18,
+      "retrieval_total": 18,
+      "retrieval_concurrency": 8,
+      "raw_result_sha256": "ff64ffec129f23d0d50f83aa2f41b32881a89f8f07d53f4ef88d474c031fadc4",
+      "quality_result_sha256": "3c78616c5b58192ce9d4eb2bf0b2af892f7be36de048e65c3716e14493e64675"
+    }
+  },
+  "comparison": {
+    "identical_input_lengths": true,
+    "identical_output_lengths": true,
+    "identical_generated_texts": 4,
+    "change_percent": {
+      "duration": -2.173070409834521,
+      "completed": 0.0,
+      "total_input_tokens": 0.0,
+      "total_output_tokens": 0.0,
+      "output_throughput": 2.221341729663129,
+      "mean_ttft_ms": 0.6575090240592774,
+      "median_ttft_ms": 3.217037370500364,
+      "p99_ttft_ms": -1.320531586178031,
+      "mean_tpot_ms": -1.4006953606106043,
+      "median_tpot_ms": -3.8232578866730593,
+      "p99_tpot_ms": 10.529002077810091,
+      "mean_itl_ms": -0.8674669137507807,
+      "median_itl_ms": -0.2345730005312685,
+      "p99_itl_ms": -0.50829929506373
+    }
+  },
+  "decision": "Keep GLM prefill placement opt-in: throughput improved but P99 TPOT regressed in this pair. Decode per-XCD default remains enabled.",
+  "limitations": [
+    "One ordered pair; no repeat or confidence interval.",
+    "20-request screening workload, not the 100-request H200 comparison.",
+    "Retrieval checks do not establish broad numerical or quality equivalence.",
+    "Object contract checks used different baseline axes and do not prove unchanged resources.",
+    "Only 4/20 random generated texts were identical; scheduling changes can affect floating-point accumulation order."
+  ],
+  "artifact_root": "/tmp/tp-glm53-xcd-prefill"
+}

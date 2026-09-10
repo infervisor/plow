@@ -124,5 +124,12 @@ GLM prefill placement remains opt-in (`--glm-place-pf=true`), paired with
 native-kernel segments when placement is enabled. Previously placement collapsed
 those segments, making the native routes invalid. A full-emitter regression test
 checks native MoE isolation; the full GLM packet preserves all 1,784 segment
-descriptors and instruction operands, with decode unchanged. GPU qualification
-of placed prefill is pending before changing that default.
+descriptors and instruction operands, with decode unchanged.
+
+The matched 20-request serving pair completed with zero failures and 18/18
+retrieval checks in each arm. Placement increased output throughput from
+30.861 to 31.546 tok/s (+2.22%) and reduced mean TPOT from 195.056 to
+192.324 ms (-1.40%). P99 TPOT increased from 234.631 to 259.335 ms (+10.53%).
+This mixed result leaves prefill placement opt-in. See the
+[paired results and provenance](mi300x-prefill-xcd.json). One pair does not
+establish a repeatable improvement or the 100-request H200 target.
