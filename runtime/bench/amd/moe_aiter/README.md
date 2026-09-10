@@ -349,3 +349,43 @@ python runtime/bench/amd/moe_aiter/captured.py --arm plow \
 The capture helper reproduces the executed capture command; the original
 capture-script hash is retained separately. Upstream dispatch reference:
 [ROCm AITER fused MoE](https://github.com/ROCm/aiter/blob/main/aiter/fused_moe.py).
+
+### Decode integration rejected after serving measurement
+
+The [full-model record](mi300x-decode-serving.json) tests selective packing in
+TP8 decode rungs 2/4/8. The experimental emitter isolated 75 native MoE
+segments per rung and selected FP32 combination of the native BF16 output.
+Prefill programs and decode rung 1 were unchanged; disabling the experiment
+reproduced the qualified packet byte-for-byte.
+
+Both adjacent runs used the same frozen runtime and 75 GPU images, with the
+candidate first. Each completed 20/20 requests, zero failures, and identical
+per-request lengths: 1,414,538 input / 13,795 output tokens. The workload was
+70k/700, ratio 0.14, C20, seed 0, without speculation.
+
+| Metric | Existing decode | Native selective packing | Change |
+|---|---:|---:|---:|
+| Output tokens/s | 31.771 | 30.396 | −4.33% |
+| Duration, s | 434.206 | 453.837 | +4.52% |
+| Mean TTFT, s | 164.013 | 166.369 | +1.44% |
+| Mean TPOT, ms | 195.462 | 201.313 | +2.99% |
+| P99 TPOT, ms | 229.911 | 266.115 | +15.75% |
+| Median ITL, ms | 118.009 | 123.376 | +4.55% |
+
+Both passed 18/18 retrieval cases; 16 texts matched exactly. The experimental
+path also passed 173 AMD host tests, 33 emitter tests, a direct HSA adapter
+test, and a 64-step TP8 smoke with all ranks agreeing. These checks establish
+limited correctness coverage, not a performance benefit or broad accuracy.
+
+The production integration was removed. Selective packing remains a benchmark
+experiment, and native serving MoE remains prefill-only. The patch is preserved
+locally under the record's artifact root, with source, runtime, packet, and
+object hashes. The primitive speedup above did not survive full-model serving;
+the added dispatch boundaries and changed schedule need separate attribution.
+A subsequent `rocprofv3` diagnostic stalled in its first prefill with repeated
+completion-signal waits and was stopped; it supplies no usable timings.
+
+This is one paired 20-request screen, without a repeatability estimate. It does
+not reproduce the supplied 100-request H200 run or establish its 273.67 output
+tokens/s target. Prefix caching and unified batching selectors remain on by
+default; unified batching still falls back for TP8.
