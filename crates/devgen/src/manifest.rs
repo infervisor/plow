@@ -289,6 +289,7 @@ struct Shapes {
     /// and additionally op 87 would read f64 bytes as f32 without the arm.
     moe_pf_det: bool,
     moe_aiter_fp8: bool,
+    moe_aiter_flat: bool,
     /// Compiler-declared replicated-input expert-parallel boundaries as
     /// `(degree, experts, full_intermediate_width)` tuples.
     moe_prefill_ep: BTreeSet<(u32, u32, u32)>,
@@ -445,6 +446,7 @@ fn shapes(m: &Model) -> Shapes {
                 }
                 DevOp::MoeAiterFp8Pf => {
                     s.moe_aiter_fp8 = true;
+                    s.moe_aiter_flat |= inst.i[6] == 1;
                     s.moe_enc.insert(crate::mla::MoeEnc::Fp8Blk as u32);
                 }
                 DevOp::QuantFp8 => {
@@ -803,6 +805,7 @@ fn encoding_features(f: &mut Map<String, Value>, s: &Shapes) {
     f.insert("moe_pf_atomic".into(), json!(s.moe_pf_atomic));
     f.insert("moe_pf_det".into(), json!(s.moe_pf_det));
     f.insert("moe_aiter_fp8".into(), json!(s.moe_aiter_fp8));
+    f.insert("moe_aiter_flat".into(), json!(s.moe_aiter_flat));
     f.insert("moe_pf_a8".into(), json!(s.moe_pf_a8));
     f.insert("xr_combine_fold".into(), json!(s.xr_combine_fold));
     f.insert("kda_fb_fold".into(), json!(s.kda_fb_fold));

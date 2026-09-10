@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# != 2 ]]; then
-    echo "usage: $0 OBJECT_DIR AITER_MOE_CODE_OBJECT (inside nix develop)" >&2
+if [[ $# != 2 && $# != 3 ]]; then
+    echo "usage: $0 OBJECT_DIR AITER_MOE_CODE_OBJECT [AITER_FLAT_CODE_OBJECT] (inside nix develop)" >&2
     exit 2
 fi
 out=$1
@@ -12,6 +12,14 @@ actual=$(sha256sum "$object")
 if [[ ${actual%% *} != "$expected" ]]; then
     echo "AITER object does not match the qualified gfx942 MoE ABI" >&2
     exit 1
+fi
+flat_object=${3:-}
+if [[ -n "$flat_object" ]]; then
+    actual=$(sha256sum "$flat_object")
+    if [[ ${actual%% *} != be7052284094e7cedeb266afb24d4d6723bdf4234ac391b2e5b29473d8ee8f06 ]]; then
+        echo "AITER flat object does not match the qualified gfx942 MoE ABI" >&2
+        exit 1
+    fi
 fi
 root=$(cd "$(dirname "$0")/.." && pwd)
 mkdir -p "$out"
@@ -26,4 +34,11 @@ mv "$stem.elf" "$out/moe_aiter_adapter_gfx942.elf"
 target="$out/fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256.co"
 if ! cmp -s "$object" "$target"; then
     cp "$object" "$target"
+fi
+
+if [[ -n "$flat_object" ]]; then
+    target="$out/fmoe_bf16_a16_blockscaleFp8_g1u1_vs_silu_1tg_16x128_flat_pf3.co"
+    if ! cmp -s "$flat_object" "$target"; then
+        cp "$flat_object" "$target"
+    fi
 fi

@@ -634,8 +634,8 @@ pub enum DevOp {
     /// unset/zero, and the dispatch site treats zero as 1, so no existing blob's behavior changes)
     /// divides the live `kv_len` down to whatever granularity `len_max`/`Score` were emitted in
     /// (pool-granular under kpool). `t0=idx(i32) t1=Score(f32) t2=gHist(u32[7*256]) t3=gCtl(u32[3])
-    /// t4=kv_len(i32)` · `i0=len_max i1=top_k i2=pool_size`. Host zeroes gHist/gCtl once; the kernel
-    /// leaves them clean for relaunch. `i3=batch_row`; `i4=1` selects independent rows,
+    /// t4=kv_len(i32)` · `i0=len_max i1=top_k i2=pool_size i3=batch_row i4=local_rows`.
+    /// Host zeroes gHist/gCtl once; the kernel leaves them clean for relaunch. `i4=1` selects independent rows,
     /// one workgroup per row (`row=i3+slice`), using LDS-only selection. This unpooled
     /// mode leaves t2/t3 unused and pads short rows with -1; i4=0 keeps cooperative selection.
     IndexSelect = 59,
@@ -1837,8 +1837,10 @@ pub enum DevOp {
     /// Native gfx942 A8 block-FP8 MoE prefill. Quantizes BF16 input in 128-element
     /// groups and combines routed experts in BF16; writes the result as FP32.
     /// This is a separate numerical contract from the FP64 grouped-down path.
-    /// `t0=out t1=x t2=weights t3=scales t4=meta t5=row_token t6=row_part t7=row_gate` ·
-    /// `i0=T i1=H i2=I i3=E i4=topk i5=align_tile`. Requires an isolated native segment.
+    /// `t0=out t1=x t2=weights t3=scales t4=meta_or_raw_routes t5=row_token t6=row_part t7=row_gate` ·
+    /// `i0=T i1=H i2=I i3=E i4=topk i5=align_tile i6=flat_decode`. Requires an isolated native segment.
+    /// `i6=1`: flat A16 decode, BF16 output plus eight scratch bytes, raw routing in t4,
+    /// t5..t7 absent and i5=0. Combine as one BF16 partial (MoeCombinePf.i7=1).
     MoeAiterFp8Pf = 156,
     /// Native gfx942 TP8 query-partitioned DSA score, top-k and raw index gather.
     /// `t0=idx t1=score t2=q t3=k t4=w t5=kv_len t6=peer_slot` ·

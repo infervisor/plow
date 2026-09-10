@@ -575,6 +575,10 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_MOE_AITER", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_moe_aiter: bool,
 
+    /// Use flat A16 MoE for gfx942 TP8 decode rungs 2, 4 and 8.
+    #[arg(long, env = "PLOW_GLM_MOE_FLAT_DECODE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_moe_flat_decode: bool,
+
     /// Partition large GLM prefill index queries across eight gfx942 ranks.
     #[arg(long, env = "PLOW_GLM_INDEX_TP", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_index_tp: bool,
@@ -1050,6 +1054,7 @@ impl EmitConfig {
             glm_dsa_pf: env_bool("PLOW_GLM_DSA_PF"),
             glm_fp8_kv: env_bool("PLOW_GLM_FP8_KV"),
             glm_moe_aiter: env_bool("PLOW_GLM_MOE_AITER"),
+            glm_moe_flat_decode: env_bool("PLOW_GLM_MOE_FLAT_DECODE"),
             glm_index_tp: env_bool("PLOW_GLM_INDEX_TP"),
             glm_select_local: env_bool("PLOW_GLM_SELECT_LOCAL"),
             glm_gemm_lt: env_bool("PLOW_GLM_GEMM_LT"),

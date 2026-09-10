@@ -610,5 +610,168 @@
     "No full-model serving integration or quality result.",
     "Tracked runner differs only in portable import/object lookup and also verifies the actually loaded AITER object hash; measured temporary sources remain pinned."
   ],
-  "artifact_root": "/tmp/tp-glm53-moe-flat"
+  "artifact_root": "/tmp/tp-glm53-moe-flat",
+  "adapter_qualification": {
+    "date": "2026-09-10",
+    "source_sha256": {
+      "runtime/amd/moe_aiter_adapter.hip": "437d3a903f8493baf884c4bb0509bc39b3a82ec0f1002286b2e3930db1b001e1",
+      "runtime/bench/amd/moe_aiter/flat_pack.hip": "7fadfbb9b9b66cee791cd5591b53ffc84f34b14f77e3b12ea5481e7154ce9fc9",
+      "crates/plowrt/src/exec/amd_moe_aiter.rs": "97ee55b378bf6c79efd4539e1c8ca052107bee21b793abf592ee95c5b8dc9b2a"
+    },
+    "adapter_elf_sha256": "d08d8485118953188ebf1362799f9d2af3924ee9f05d1c3080f179b8a63c94d0",
+    "hsa_tests": {
+      "passed": 2,
+      "flat_rows": [
+        8,
+        3,
+        2,
+        1,
+        4,
+        8
+      ],
+      "sorted_rows": [
+        1,
+        129,
+        1
+      ],
+      "flat_output": "BF16 written directly into the partial buffer",
+      "flat_guard_bytes": 512,
+      "flat_protocol_bytes": 8,
+      "flat_oracle": "All output elements within 4% of the analytical FP32 result; routes and activation rows vary across six poisoned output reuses.",
+      "log_sha256": "bef3f7106d3ce2889cc550a64a7472690e1de3de320b99691bfc1709e4bb1284"
+    },
+    "shared_packing_captured_b8": {
+      "arm": "flat-active",
+      "layer": 77,
+      "rank": 0,
+      "tp": 8,
+      "rows": 8,
+      "hidden": 6144,
+      "intermediate": 256,
+      "experts": 256,
+      "topk": 8,
+      "torch": "2.12.0+git6bbd260",
+      "hip": "7.2.53211",
+      "gpu": "AMD Instinct MI300X",
+      "aiter": "0.1.19",
+      "oracle_rows": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "relative_l2": 0.03076738491654396,
+      "ms": 0.12102100253105164,
+      "capture_check": null,
+      "cache_flush_mib": 512,
+      "cold_samples_ms": [
+        0.1851159930229187,
+        0.18996299803256989,
+        0.18860100209712982,
+        0.19024400413036346,
+        0.18904200196266174,
+        0.19180600345134735,
+        0.19256800413131714,
+        0.18936200439929962,
+        0.1886409968137741
+      ],
+      "cold_ms": 0.18936200439929962,
+      "weight_pack_ms": 0.07651399821043015,
+      "repeat_check": {
+        "poisoned_workspace_reuses": 12,
+        "output_guard_bytes": 512,
+        "oracle_relative_l2": [
+          0.030832460150122643,
+          0.03073706291615963,
+          0.03066195361316204,
+          0.03078487142920494,
+          0.03082963265478611,
+          0.03079272247850895,
+          0.030711907893419266,
+          0.03081575408577919,
+          0.030838776379823685,
+          0.030775319784879684,
+          0.030728142708539963,
+          0.030784359201788902
+        ]
+      },
+      "native_check": {
+        "active_pack_exact": true,
+        "routing_unpack_exact": true,
+        "inactive_experts_untouched": true,
+        "routing_and_layer_reuses": 3
+      },
+      "object_sha256": "be7052284094e7cedeb266afb24d4d6723bdf4234ac391b2e5b29473d8ee8f06",
+      "slot_input_strategy": null,
+      "reusable_weight_pack_bytes": 1208254464,
+      "library_sha256": "3abde925e84ce12af8112a4f0bc279190120260d7be537c3cdedf81ae36d8d34",
+      "source_sha256": "c2240f7bf2247cc7bbad280b60e9ddd0b0e59bde485db044de6648aa90a0450f",
+      "capture_sha256": {
+        "fu.bin": "7f960b9ff69c8e340069dd85ef6c1df6b7cf328dce6b72556fa2510afb329285",
+        "meta.bin": "3832df9925ddab711c9e2b71394fd95a7f793475a3f6869aab4f100e464cc568",
+        "part.bin": "4f3c2ddcb727834d26898858ed91857f5ec80b138ae6a67679140e8b7daf0fb2",
+        "rg.bin": "147d474e170119380678a8371286b1a6f6b52f1b2e6a375d71404d5e0d17d618",
+        "rp.bin": "e2f4da7ad07f7523260c3fd4a2c87bfe2a71f6af1b11cbaf8849418636681975",
+        "rt.bin": "d4c15acb6153a46d3cfcf09d175e9e1629a6d03c0a6f3268660dccc86fafe40a",
+        "tab.bin": "b95867d76f67162d9e790ec0aa0bdb17f1a96f3566c11c1b8fb133866a05772b",
+        "x.bin": "7296dd4280ea3023c332fde9f650ef8e5889b59f896d9d111e43fd66704051b7"
+      },
+      "checkpoint": {
+        "header_sha256": {
+          "model-00134-of-00141.safetensors": "d58e564f85d0c841e1eb0cffa3aa57e98a80f5caffaba49a7d5040541498a519",
+          "model-00135-of-00141.safetensors": "bfa80869958b0d82087892ddc72a0add9d3d78effe9096078097e3af2d5f2388",
+          "model-00136-of-00141.safetensors": "d78221b25975fa6c510a2eb9aaa9d19754c83368ae7a80d2fa9fea0c4ad18926"
+        },
+        "selected_tp_weight_sha256": "b9c452cc839d3fb048bd52d507115b18219154b45ed9f9219c109cc12d1f9764",
+        "negative_zeros_canonicalized": 4999
+      },
+      "flat_library_sha256": "03249c637fdc37525a642b87e6eef93de441c79b3737211438bfec58bd4cca0f",
+      "flat_resident_only": false,
+      "boundary": "flat-active includes routed weight packing and table unpack; flat-resident excludes all weight packing and returns BF16; native-active packs only routed experts; native-resident excludes weight packing (requires resident shuffled weights); align, activation quantization if applicable, expert GLU/down and routing-weight combine; aiter-repack, aiter-slots and native include weight packing on every dispatch; native also stores FP32 output; excludes checkpoint loading, router top-k, shared expert, residual and TP communication"
+    },
+    "limitations": [
+      "No full-model quality or serving qualification for the flat runtime route.",
+      "Captured packing timing is a qualification run without a new paired control; the original comparison above remains separate."
+    ],
+    "emitter": {
+      "tp": 8,
+      "compiler_sha256": "fb232b7b8b49a3163f91f8f77df3b6b0b5aa608ff285111506518228cc00f26c",
+      "runtime_sha256": "1fbdb0dc7abcd7860fbcf7c88643310d53be1fb364a6baee1ba68debce926208",
+      "arms": {
+        "off": {
+          "packet_sha256": "b62cdf60c1d65cf79465f69f85d135c67d27e8063db9bf017c9b0654e0180686",
+          "lean_verified_program_rows": [
+            128,
+            512,
+            2048,
+            8192,
+            1,
+            2,
+            4,
+            8
+          ],
+          "log_sha256": "94584fdde21a8edbdc6074716bfc342a44525be3c0131db0b66c43fac5dadb8a"
+        },
+        "on": {
+          "packet_sha256": "b69f9278390fde2278ccb50373c48a71be563557550c4a51a5c657c17ef48cfc",
+          "lean_verified_program_rows": [
+            128,
+            512,
+            2048,
+            8192,
+            1,
+            2,
+            4,
+            8
+          ],
+          "log_sha256": "e67d5ea9429dd6b3e4572bb9f303566bab0417ede3ec55cabbe36951b36d6271"
+        }
+      },
+      "disabled_packet_matches_existing_baseline": true
+    }
+  }
 }

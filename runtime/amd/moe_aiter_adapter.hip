@@ -104,3 +104,45 @@ extern "C" __global__ void plow_moe_aiter_store(float* out, const unsigned short
 }
 
 extern "C" __device__ unsigned plow_moe_aiter_fp8_abi_1 = 1;
+
+struct MoeFlatPackArgs {
+    uint4* gu;
+    uint4* down;
+    float* gs;
+    float* ds;
+    const unsigned long long* wt;
+    const unsigned long long* st;
+    const uint2* table;
+    unsigned* ids;
+    float* weights;
+    unsigned rows;
+    unsigned pad;
+};
+static_assert(sizeof(MoeFlatPackArgs) == 80);
+
+extern "C" __global__ void plow_moe_aiter_flat_pack(MoeFlatPackArgs a) {
+    __shared__ unsigned active;
+    if (threadIdx.x == 0) active = 0;
+    __syncthreads();
+    const unsigned e = blockIdx.x / 8u;
+    if (threadIdx.x < a.rows * 8u) {
+        const uint2 route = a.table[threadIdx.x];
+        if (blockIdx.x == 0) {
+            a.ids[threadIdx.x] = route.x;
+            a.weights[threadIdx.x] = __uint_as_float(route.y);
+        }
+        if (route.x == e) atomicExch(&active, 1u);
+    }
+    __syncthreads();
+    if (!active) return;
+    pack_weight<512, 6144, true>(a.gu, a.wt);
+    pack_weight<6144, 256, false>(a.down, a.wt);
+    if (blockIdx.x % 8u == 0 && threadIdx.x < 96u) {
+        const unsigned j = threadIdx.x;
+        a.gs[e * 192u + j] = 2.0f * ((const float*)a.st[e * 3u])[j];
+        a.gs[e * 192u + 96u + j] = 2.0f * ((const float*)a.st[e * 3u + 1u])[j];
+        a.ds[e * 96u + j] = 2.0f * ((const float*)a.st[e * 3u + 2u])[j];
+    }
+}
+
+extern "C" __device__ unsigned plow_moe_flat_fp8_abi_1 = 1;

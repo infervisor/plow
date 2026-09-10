@@ -18,12 +18,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("runtime", "blob", "objects", "checkpoint", "out"):
         parser.add_argument("--" + name, type=Path, required=True)
+    parser.add_argument("--rows", type=int, choices=[2, 4, 8, 16, 20], default=8)
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     names = {"act.xn2": "x", "act.tab": "tab", "act.moe_fug": "fu",
              "act.moe_meta": "meta", "act.moe_rowtok": "rt", "act.moe_rowpart": "rp",
              "act.moe_rowgate": "rg", "act.part": "part"}
-    lengths = [512] * 7 + [32768]
+    lengths = [512] * (args.rows - 1) + [32768]
     prompts = [",".join([str(i + 1)] * length) for i, length in enumerate(lengths)]
     options = {
         "PLOW_DUMP_ACT": ",".join(f"{name}:{args.out / file}" for name, file in names.items()),
@@ -47,7 +48,8 @@ def main():
         "object_sha256": {p.name: sha(p) for p in sorted(args.objects.iterdir())
                           if p.is_file() and p.suffix in (".elf", ".co")},
         "environment": options, "prompt_lengths": lengths,
-        "prompt_tokens": list(range(1, 9)), "steps": 2, "tp": 8, "rank": 0,
+        "prompt_tokens": list(range(1, args.rows + 1)), "rows": args.rows,
+        "steps": 2, "tp": 8, "rank": 0,
         "checkpoint": str(args.checkpoint),
         "captures_sha256": {p.name: sha(p) for p in sorted(args.out.glob("*.bin"))},
     }

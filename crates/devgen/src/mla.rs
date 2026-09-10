@@ -6251,7 +6251,18 @@ fn emit_glm_moe_ffn_rows(
             d.f[0] = 1.0;
         },
     );
-    let det = moe_pf_fuse(tk) == MoePfFuse::Det;
+    let flat = emit_config::active().glm_moe_flat_decode && matches!(rows, 2 | 4 | 8);
+    if flat {
+        assert!(
+            enc == MoeEnc::Fp8Blk
+                && tp == 8
+                && !c.ep
+                && b.n_cu() == 304
+                && (h, imoe_e, e, tk) == (6144, 256, 256, 8),
+            "flat GLM MoE requires gfx942 TP8 H6144/I256/E256/top8"
+        );
+    }
+    let det = !flat && moe_pf_fuse(tk) == MoePfFuse::Det;
     let c_router = b.emit(DevOp::MoeRouterTopkPf, all.clone(), &[c_score], |d| {
         d.t[0] = n.tab;
         d.t[1] = n.rlogit;
@@ -6268,16 +6279,20 @@ fn emit_glm_moe_ffn_rows(
         d.i[7] = c.topk_group;
         d.f[0] = c.route_scale;
     });
-    let c_align = b.emit(DevOp::MoeAlignPf, one.clone(), &[c_router], |d| {
-        d.t[0] = n.meta;
-        d.t[1] = n.tab;
-        d.t[2] = n.row_token;
-        d.t[3] = n.row_partidx;
-        d.t[4] = n.row_gate;
-        d.i[0] = rows;
-        d.i[1] = e;
-        d.i[2] = tk;
-    });
+    let c_routes = if flat {
+        c_router
+    } else {
+        b.emit(DevOp::MoeAlignPf, one.clone(), &[c_router], |d| {
+            d.t[0] = n.meta;
+            d.t[1] = n.tab;
+            d.t[2] = n.row_token;
+            d.t[3] = n.row_partidx;
+            d.t[4] = n.row_gate;
+            d.i[0] = rows;
+            d.i[1] = e;
+            d.i[2] = tk;
+        })
+    };
 
     // Shared expert at M = rows. The decode fused ops that cannot carry M (`DenseGluFp8Blk` is
     // i0=N) unfuse into their GEMV halves; the plain arm is `GemvGlu`, which takes M directly.
@@ -6391,44 +6406,60 @@ fn emit_glm_moe_ffn_rows(
         })
     };
 
-    // Grouped gate/up + down over the sorted (row, expert) slots — the prefill pair verbatim
-    // at T = rows.
-    let c_g = b.emit(DevOp::MoeGroupGluPf, all.clone(), &[c_align, c_rn2], |d| {
-        d.t[0] = n.fu_g;
-        d.t[1] = n.xn2;
-        d.t[2] = w.ewt;
-        d.t[3] = w.est;
-        d.t[4] = n.meta;
-        d.t[5] = n.row_token;
-        if enc == MoeEnc::Mxfp4 {
+    let c_d = if flat {
+        let counter = b.emit(DevOp::MoeAiterFp8Pf, one.clone(), &[c_routes, c_rn2], |d| {
+            d.t = [
+                n.part,
+                n.xn2,
+                w.ewt,
+                w.est,
+                n.tab,
+                TENSOR_NONE,
+                TENSOR_NONE,
+                TENSOR_NONE,
+            ];
+            d.i = [rows, h, imoe_e, e, tk, 0, 1, 0];
+        });
+        b.isolate(counter);
+        counter
+    } else {
+        let c_g = b.emit(DevOp::MoeGroupGluPf, all.clone(), &[c_routes, c_rn2], |d| {
+            d.t[0] = n.fu_g;
+            d.t[1] = n.xn2;
+            d.t[2] = w.ewt;
+            d.t[3] = w.est;
+            d.t[4] = n.meta;
+            d.t[5] = n.row_token;
+            if enc == MoeEnc::Mxfp4 {
+                d.t[6] = n.row_partidx;
+                d.t[7] = n.fu_scale;
+            }
+            d.i[0] = imoe_e;
+            d.i[1] = h;
+            d.i[2] = e;
+            d.i[MoeEnc::PREFILL_SLOT] = enc.code();
+            d.i[5] = GLM_ACT_SILU;
+        });
+        b.emit(DevOp::MoeGroupDownPf, all.clone(), &[c_g], |d| {
+            d.t[0] = n.part;
+            d.t[1] = n.fu_g;
+            d.t[2] = w.ewt;
+            d.t[3] = w.est;
+            d.t[4] = n.meta;
+            if enc == MoeEnc::Mxfp4 {
+                d.t[5] = n.fu_scale;
+            }
             d.t[6] = n.row_partidx;
-            d.t[7] = n.fu_scale;
-        }
-        d.i[0] = imoe_e;
-        d.i[1] = h;
-        d.i[2] = e;
-        d.i[MoeEnc::PREFILL_SLOT] = enc.code();
-        d.i[5] = GLM_ACT_SILU;
-    });
-    let c_d = b.emit(DevOp::MoeGroupDownPf, all.clone(), &[c_g], |d| {
-        d.t[0] = n.part;
-        d.t[1] = n.fu_g;
-        d.t[2] = w.ewt;
-        d.t[3] = w.est;
-        d.t[4] = n.meta;
-        if enc == MoeEnc::Mxfp4 {
-            d.t[5] = n.fu_scale;
-        }
-        d.t[6] = n.row_partidx;
-        d.t[7] = n.row_gate;
-        d.i[0] = h;
-        d.i[1] = imoe_e;
-        d.i[2] = e;
-        d.i[MoeEnc::PREFILL_SLOT] = enc.code();
-        if det {
-            d.i[5] = tk.trailing_zeros() + 1;
-        }
-    });
+            d.t[7] = n.row_gate;
+            d.i[0] = h;
+            d.i[1] = imoe_e;
+            d.i[2] = e;
+            d.i[MoeEnc::PREFILL_SLOT] = enc.code();
+            if det {
+                d.i[5] = tk.trailing_zeros() + 1;
+            }
+        })
+    };
 
     // Combine + the decode-shaped TP seam: one-shot XReduce over rows*h, then the layer-seam
     // AddNorm (or Residual), exactly as the single-row decode block ends.
@@ -6440,10 +6471,11 @@ fn emit_glm_moe_ffn_rows(
             d.t[2] = if raw_output { n.attn } else { n.shared };
             d.t[3] = n.part;
             d.i[0] = h;
-            d.i[1] = if det { 1 } else { tk };
+            d.i[1] = if det || flat { 1 } else { tk };
             d.i[2] = rows;
             d.i[3] = 0;
             d.i[4] = u32::from(det);
+            d.i[7] = u32::from(flat);
         });
         let c_xr = emit_xreduce(
             b,
@@ -6485,10 +6517,11 @@ fn emit_glm_moe_ffn_rows(
             d.t[2] = n.shared;
             d.t[3] = n.part;
             d.i[0] = h;
-            d.i[1] = if det { 1 } else { tk };
+            d.i[1] = if det || flat { 1 } else { tk };
             d.i[2] = rows;
             d.i[3] = 0;
             d.i[4] = u32::from(det);
+            d.i[7] = u32::from(flat);
         })
     }
 }
@@ -7467,6 +7500,13 @@ fn glm_emit_full(
     let mut n_ops = 0;
     for &rb in &rungs {
         let mut b = Builder::new(n_cu);
+        if emit_config::active().glm_moe_flat_decode && matches!(rb, 2 | 4 | 8) {
+            assert!(
+                crate::emit_is_amd() && target == "gfx942",
+                "flat GLM MoE requires gfx942"
+            );
+            b.deny_uniseg();
+        }
         b.set_l2_placement(l2_layout); // PLOW_L2_PLACE: None ⇒ byte-identical
         b.adopt_tensors(tensors.clone());
         let all = b.all();

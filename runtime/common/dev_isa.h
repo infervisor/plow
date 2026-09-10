@@ -1350,7 +1350,9 @@ enum {
     PLOW_DOP_PER_LAYER_INPUT = 155,
     /* Native gfx942 A8 block-FP8 MoE, BF16 routed accumulation -> FP32 output.
      * t0=out t1=x t2=weights t3=scales t4=meta t5=row_token t6=row_part t7=row_gate
-     * i0=T i1=H i2=I i3=E i4=topk i5=align_tile. Isolated native segment only. */
+     * i0=T i1=H i2=I i3=E i4=topk i5=align_tile. Isolated native segment only.
+     * i6=1: flat A16 decode writes BF16 plus 8 protocol bytes, t4=raw routes,
+     * t5..t7 absent and i5=0; consume one partial with MoeCombinePf.i7=1. */
     PLOW_DOP_MOE_AITER_FP8_PF = 156,
     /* Native gfx942 TP8 DSA score, top-k and raw index gather.
      * t0=idx t1=score t2=q t3=k t4=w t5=kv_len t6=peer_slot

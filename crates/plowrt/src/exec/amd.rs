@@ -203,6 +203,7 @@ enum DecodeSegmentKind {
     Interpreter,
     MlaAttention,
     KdaDecodeFused(usize),
+    MoeAiter,
     GroupedMoeMxfp4 { glu: usize, down: usize },
 }
 
@@ -241,13 +242,20 @@ fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
                     Some(i) if i == e.inst as usize => {}
                     Some(_) => multiple_mla_merge = true,
                 }
-            } else if inst.op == DevOp::KdaDecodeFused as u16 {
+            } else if inst.op == DevOp::KdaDecodeFused as u16
+                || inst.op == DevOp::MoeAiterFp8Pf as u16
+            {
+                let name = if inst.op == DevOp::MoeAiterFp8Pf as u16 {
+                    "MoeAiterFp8Pf"
+                } else {
+                    "KdaDecodeFused"
+                };
                 match fused_inst {
                     None => fused_inst = Some(e.inst as usize),
                     Some(i) if i == e.inst as usize => {}
                     Some(i) => {
                         return Err(RuntimeError::Device(format!(
-                            "decode segment {seg} mixes fused KDA instructions {i} and {}",
+                            "decode segment {seg} mixes {name} instructions {i} and {}",
                             e.inst
                         )))
                     }
@@ -264,7 +272,7 @@ fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
                 }
                 if e.wait_len != 0 || e.succ_len != 0 || e.flags & SE_XCTR != 0 {
                     return Err(RuntimeError::Device(format!(
-                        "fused KDA instruction {} has counter obligations in segment {seg} (waits={}, succs={}, flags={:#x}); a raw kernel cannot service interpreter counters",
+                        "{name} instruction {} has counter obligations in segment {seg} (waits={}, succs={}, flags={:#x}); a raw kernel cannot service interpreter counters",
                         e.inst, e.wait_len, e.succ_len, e.flags
                     )));
                 }
@@ -286,12 +294,26 @@ fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
             }
         }
         if let Some(inst) = fused_inst {
-            if has_other || mla_flash_inst.is_some() || mla_merge_inst.is_some() {
+            let name = if prog.insts[inst].op == DevOp::MoeAiterFp8Pf as u16 {
+                "MoeAiterFp8Pf"
+            } else {
+                "KdaDecodeFused"
+            };
+            if has_other
+                || mla_flash_inst.is_some()
+                || mla_merge_inst.is_some()
+                || moe_glu_inst.is_some()
+                || moe_down_inst.is_some()
+            {
                 return Err(RuntimeError::Device(format!(
-                    "decode segment {seg} mixes KdaDecodeFused with interpreter opcodes; standalone dispatch requires a pure segment"
+                    "decode segment {seg} mixes {name} with interpreter opcodes; standalone dispatch requires a pure segment"
                 )));
             }
-            kinds[seg] = DecodeSegmentKind::KdaDecodeFused(inst);
+            kinds[seg] = if prog.insts[inst].op == DevOp::MoeAiterFp8Pf as u16 {
+                DecodeSegmentKind::MoeAiter
+            } else {
+                DecodeSegmentKind::KdaDecodeFused(inst)
+            };
         } else if !has_other && moe_glu_inst.is_some() && moe_down_inst.is_some() {
             let (Some(glu), Some(down)) = (moe_glu_inst, moe_down_inst) else {
                 unreachable!()
@@ -337,9 +359,13 @@ fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
         }
     }
     for (i, inst) in prog.insts.iter().enumerate() {
-        if inst.op == DevOp::KdaDecodeFused as u16 && raw_segment_owner[i].is_none() {
+        if matches!(
+            DevOp::from_u16(inst.op),
+            Some(DevOp::KdaDecodeFused | DevOp::MoeAiterFp8Pf)
+        ) && raw_segment_owner[i].is_none()
+        {
             return Err(RuntimeError::Device(format!(
-                "fused KDA instruction {i} is absent from every stream segment"
+                "raw instruction {i} is absent from every stream segment"
             )));
         }
     }
@@ -414,7 +440,7 @@ fn validate_decode_dispatch(progs: &[DevProg], dec_ix: usize) -> Result<()> {
                 .any(|k| !matches!(k, DecodeSegmentKind::Interpreter))
         {
             return Err(RuntimeError::Device(format!(
-                "decode program {} (rung {rung}, t={}) mixes raw KDA and interpreter segments                  with L2-domain placement; raw boundaries require ordered wave segments",
+                "decode program {} (rung {rung}, t={}) mixes raw kernels and interpreter segments                  with L2-domain placement; raw boundaries require ordered wave segments",
                 dec_ix + rung,
                 prog.t,
             )));
@@ -426,7 +452,7 @@ fn validate_decode_dispatch(progs: &[DevProg], dec_ix: usize) -> Result<()> {
                 .any(|k| !matches!(k, DecodeSegmentKind::Interpreter))
         {
             return Err(RuntimeError::Device(format!(
-                "decode program {} (rung {rung}, t={}) has {n_segments} wave segments but no                  standalone KDA boundary; ordinary AMD decode remains single-launch",
+                "decode program {} (rung {rung}, t={}) has {n_segments} wave segments but no                  standalone raw boundary; ordinary AMD decode remains single-launch",
                 dec_ix + rung,
                 prog.t
             )));
@@ -2627,6 +2653,7 @@ enum DecodeSegmentRoute {
     Interpreter,
     MlaAttention,
     KdaDecodeFused(KdaDecodeFusedArgs),
+    MoeAiter(amd_moe_aiter::Route),
     GroupedMoeMxfp4 {
         glu: GroupedMoeGluArgs,
         down: GroupedMoeDownArgs,
@@ -2647,8 +2674,9 @@ fn decode_segment_routes(
     devp: &[DeviceMem],
 ) -> Result<Vec<DecodeSegmentRoute>> {
     let kinds = decode_segment_kinds(prog)?;
+    let aiter = amd_moe_aiter::routes(prog, tensors, kinds.len())?;
     let mut routes = Vec::with_capacity(kinds.len());
-    for kind in kinds {
+    for (seg, kind) in kinds.into_iter().enumerate() {
         let inst_ix = match kind {
             DecodeSegmentKind::Interpreter => {
                 routes.push(DecodeSegmentRoute::Interpreter);
@@ -2656,6 +2684,12 @@ fn decode_segment_routes(
             }
             DecodeSegmentKind::MlaAttention => {
                 routes.push(DecodeSegmentRoute::MlaAttention);
+                continue;
+            }
+            DecodeSegmentKind::MoeAiter => {
+                routes.push(DecodeSegmentRoute::MoeAiter(aiter[seg].ok_or_else(
+                    || RuntimeError::Device("native MoE segment has no validated route".into()),
+                )?));
                 continue;
             }
             DecodeSegmentKind::KdaDecodeFused(inst_ix) => inst_ix,
@@ -4095,6 +4129,8 @@ fn bind_packed_experts(
                 Some(d.i[1] as u64)
             } else if d.t[2] as usize == i_ewt && d.op == DevOp::MoeGroupGluPf as u16 {
                 Some(d.i[0] as u64)
+            } else if d.t[2] as usize == i_ewt && d.op == DevOp::MoeAiterFp8Pf as u16 {
+                Some(d.i[2] as u64)
             } else {
                 None
             }
@@ -6048,14 +6084,8 @@ impl AmdEngine {
         let has_moe_aiter =
             |p: &DevProg| p.insts.iter().any(|d| d.op == DevOp::MoeAiterFp8Pf as u16);
         let use_moe_aiter = blob.progs.iter().any(has_moe_aiter);
-        if use_moe_aiter
-            && (arch != "gfx942"
-                || tp.is_none_or(|b| b.n_gpu != 8)
-                || blob.progs[dec_ix..].iter().any(has_moe_aiter))
-        {
-            return Err(RuntimeError::Device(
-                "AITER MoE requires gfx942 TP8 prefill".into(),
-            ));
+        if use_moe_aiter && (arch != "gfx942" || tp.is_none_or(|b| b.n_gpu != 8)) {
+            return Err(RuntimeError::Device("AITER MoE requires gfx942 TP8".into()));
         }
         let use_sparse_mla = crate::config::RuntimeConfig::get().amd.mla_pf_aiter;
         check_sparse_fp8_packet(&blob.progs, &blob.tensors, &arch)?;
@@ -6205,7 +6235,7 @@ impl AmdEngine {
             let syms = elf_symbol_names(&image);
             if phase == Phase::Prefill {
                 prefill_moe_align_bm64 = syms.contains(&"plow_moe_align_bm64_1");
-                if use_moe_aiter && !prefill_moe_align_bm64 {
+                if blob.progs[..dec_ix].iter().any(has_moe_aiter) && !prefill_moe_align_bm64 {
                     return Err(RuntimeError::Device(
                         "AITER MoE requires an MPF_BM=64 align object".into(),
                     ));
@@ -7750,7 +7780,8 @@ impl AmdEngine {
             None
         };
         let moe_aiter = if use_moe_aiter {
-            let rows = blob.progs[..dec_ix]
+            let rows = blob
+                .progs
                 .iter()
                 .filter(|p| has_moe_aiter(p))
                 .map(|p| p.t)
@@ -7759,7 +7790,8 @@ impl AmdEngine {
             Some(amd_moe_aiter::MoeAiter::load(
                 &be,
                 hsaco_dir,
-                rows,
+                rows.max(128),
+                blob.progs[dec_ix..].iter().any(has_moe_aiter),
                 &mut modules,
             )?)
         } else {
@@ -10083,7 +10115,7 @@ impl AmdEngine {
                     RuntimeError::Device("AITER MoE route has no loaded kernels".into())
                 })?;
                 kernel.enqueue(&self.be, route, &self.tens_table)?;
-                self.seg_launches += 4;
+                self.seg_launches += route.launches();
                 return Ok(());
             }
             if let Some(PrefillSegmentRoute::SparseMla(route)) =
@@ -10585,7 +10617,8 @@ impl AmdEngine {
         match self.progs[p].prefill_routes.get(seg) {
             Some(PrefillSegmentRoute::SparseMla(route)) if route.active => 3,
             Some(PrefillSegmentRoute::GemmLt(_)) => 1,
-            Some(PrefillSegmentRoute::MoeAiter(_) | PrefillSegmentRoute::IndexTp(_)) => 4,
+            Some(PrefillSegmentRoute::MoeAiter(route)) => route.launches() as usize,
+            Some(PrefillSegmentRoute::IndexTp(_)) => 4,
             Some(PrefillSegmentRoute::MoeEpAlign(_)) if self.k_moe_ep_align.is_some() => 4,
             Some(PrefillSegmentRoute::MoeStage1A4Reuse(_))
                 if self.k_moe_stage1_a4_quant.is_some() && self.k_moe_stage1_a4_reuse.is_some() =>
@@ -10644,6 +10677,13 @@ impl AmdEngine {
                     kernarg_bytes(&arg),
                     None,
                 )?;
+            }
+            DecodeSegmentRoute::MoeAiter(route) => {
+                let kernel = self.moe_aiter.as_ref().ok_or_else(|| {
+                    RuntimeError::Device("AITER decode route has no loaded kernels".into())
+                })?;
+                kernel.enqueue(&self.be, route, &self.tens_table)?;
+                self.seg_launches += route.launches() - 1;
             }
             DecodeSegmentRoute::KdaDecodeFused(args) => {
                 let kernel = self.k_kda_decode_fused.ok_or_else(|| {

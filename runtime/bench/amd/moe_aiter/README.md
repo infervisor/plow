@@ -42,8 +42,28 @@ checkpoint and library arguments. The runner verifies both the supplied and
 actually loaded AITER object against the recorded SHA-256.
 
 Router top-k, shared expert, residual, TP communication and interpreter
-scheduling remain outside timing. Production integration must preserve ordered
-segments and XCD placement, then pass full-model quality and serving tests.
+scheduling remain outside timing.
+
+`--glm-moe-flat-decode` / `PLOW_GLM_MOE_FLAT_DECODE=1` enables an experimental
+runtime route for gfx942 TP8 decode rungs 2/4/8 at this geometry. It defaults
+off. The route preserves ordered segments and XCD placement, skips alignment,
+and launches active-expert packing followed by the flat assembly kernel. The
+existing combine reads its BF16 output directly. Other decode rungs retain
+their existing kernels. Full-model quality and serving gains remain unqualified;
+the isolated timings above used the earlier benchmark adapter.
+
+Build the adapter with `scripts/build_moe_aiter.sh OBJECT_DIR
+AITER_MOE_CODE_OBJECT AITER_FLAT_CODE_OBJECT`. Both assembly objects are pinned
+by SHA-256. Under a gfx942 GPU lease, set `PLOW_TEST_AITER_DIR=OBJECT_DIR` and run
+`cargo test -p plowrt --lib --features hsa moe_aiter_flat_hsa_dispatch -- --ignored`
+to check raw HSA dispatch, changed routes, poisoned output reuse and buffer guards.
+Both flat and sorted HSA dispatch tests pass. The shared packing implementation
+also passes the captured batch-8 FP32 screen (3.08% relative L2), exact packing
+and routing checks, and twelve poisoned output reuses with guards. The
+`adapter_qualification` entry in the record contains these results and hashes.
+Both full-model TP8 packets pass Lean ordering verification for all eight
+programs. With flat decode disabled, the packet is byte-identical to the
+existing baseline.
 
 Inside `nix develop`, with ROCm PyTorch and `amd-aiter==0.1.19` available:
 
