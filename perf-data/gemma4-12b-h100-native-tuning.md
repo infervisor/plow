@@ -512,3 +512,66 @@ unit tests pass; the CUDA release build succeeds.
 [unit tests](gemma4-12b-h100-data/active-hold-tests.log).
 This removes a scheduler latency defect; it does not close the vLLM gap.
 Recorded vLLM 16K C1/C128 throughput remains 64.692/196.035 tokens/s.
+
+## Packed light-object occupancy experiment
+
+The current packed light-op interpreter uses 255 registers and a 1952-byte
+stack frame. Rebuilding its original flags from current source gives 255
+registers and an 1880-byte frame; the binaries are not identical. The comparison
+below therefore uses the fresh rebuild as its control. All other cubins,
+including native projections and the selected HD512 object, remain fixed.
+
+The existing `PLOW_NV_FATLITE=1` with `PGM90_TMA_STAGES=3` strips prefill
+attention and allows two resident blocks/SM. It uses 128 registers, but its
+stack frame increases to 2360 bytes. Only the packed light object is replaced;
+ordinary prefill and decode objects are unchanged.
+
+The paired packet uses existing `PLOW_SEG_SLICE_ALL=1`, doubling eligible
+light-op slices from 132 to 264. The 128-row rung changes HeadNormRope and GLU;
+512/1024/2048/4096 additionally change embedding, RMSNorm and NormResidual.
+Other instruction fields and all decode instructions are unchanged. All queue
+slices and dependencies pass the packet audit.
+
+Sequential serving screens, two measured repeats after one warmup per cell,
+BF16, physical B16, cache disabled, output128:
+
+| Variant | 1K/C1 tok/s | 1K/C16 tok/s | 16K/C1 tok/s | 16K/C16 tok/s | 16K/C1 TTFT ms |
+|---|---:|---:|---:|---:|---:|
+| Fresh control | 77.212 | 566.621 | 46.166 | 96.105 | 1076.828 |
+| Lean object only | 76.745 | 566.874 | 46.101 | 94.449 | 1080.080 |
+| Lean object + doubled slices | 77.064 | 574.601 | 46.644 | 98.551 | 1047.097 |
+
+All 204 measured requests complete128/cache0, and serving cancellation,
+ragged prompts, slot reuse and context rejection checks pass. Both candidates
+match 66/68 control outputs; the two differences occur on the previously
+unstable repeated-hyphen prompt at 16K/C16. This is not independent model-quality
+qualification. The object-only variant offers no clear gain.
+[Screens and object hashes](gemma4-12b-h100-data/fatlite-screens.json).
+
+For one diagnostic 16K request, summed light-segment time falls from
+146.3 to 95.5 ms with doubled slices. GEMM is 530.5 vs 533.3 ms; attention is
+342.2 vs 347.1 ms. Event profiling replaces graphs, so use these measurements
+for attribution rather than serving latency. The reduction is real in this
+diagnostic, but is only about a 2.5% C16 serving throughput gain in the screen.
+[Control profile](gemma4-12b-h100-data/fatlite-profile-control.log),
+[candidate profile](gemma4-12b-h100-data/fatlite-profile-slices.log).
+
+The ignored packed-schedule diagnostic now records a SHA256 of every full
+logit frame. This permits comparisons between separately loaded objects in
+addition to its existing comparisons between schedules within one object.
+
+The control and sliced candidate match all **2816 full-logit frame hashes**
+across seven diagnostic passes, including the unified route. Each frame covers
+262144 logits. This isolates the tested object/slice changes from the known
+ordinary-vs-unified numerical difference; it does not explain every serving
+interleaving or qualify the two text differences above.
+[Full-logit comparison](gemma4-12b-h100-data/fatlite-logits-comparison.json).
+
+Reproduce the packed object with
+`PLOW_BUILD_FATLITE=1 scripts/build_sm90a_gemma4_segments.sh BASE OUTPUT` inside
+`nix develop`; compile the paired packet with `PLOW_SEG_SLICE_ALL=1` alongside
+the existing pure-GEMM/all-attention segmentation options. The new option
+replaces only the packed light object in addition to the script's existing
+GEMM/attention builds. Its default is off. The measurements here retained all
+other qualified objects and the packet-pinned QK32 object. C128 has not yet
+been screened with this candidate, and no all-op optimality claim is made.

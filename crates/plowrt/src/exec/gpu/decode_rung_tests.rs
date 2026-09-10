@@ -664,6 +664,7 @@ fn gpu_packed_prefill_schedule_logits() {
                 report.push(serde_json::json!({
                     "pass": pass, "slots": slots, "chunk": chunk, "step": step, "unified": unified,
                     "slot": slot, "changed_logits": changed, "max_abs": max_abs,
+                    "logits_sha256": plow_asset::decode_objects::image_sha256(bytemuck::cast_slice(&logits)),
                     "token": ids[i], "reference_token": feeds[step],
                     "reference_token_logit": logits[feeds[step] as usize],
                     "selected_token_logit": logits[ids[i] as usize],

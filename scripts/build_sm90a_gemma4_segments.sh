@@ -40,4 +40,11 @@ for gemma_packed in 0 1; do
       "${gemma_flags[@]}" "${gemma_role_flags[@]}" -DPLOW_NV_PACKED_REQUEST="$gemma_packed" \
       -o "$gemma_out/interp_sm90a_$gemma_prefix$gemma_role.cubin" runtime/nvidia/interp_sm90a.cu
   done
+  # Packed light occupancy needs matching PLOW_SEG_SLICE_ALL=1 packets.
+  if [ "$gemma_packed" = 1 ] && [ "${PLOW_BUILD_FATLITE:-0}" = 1 ]; then
+    env -i PATH=/usr/local/cuda/bin:/usr/bin:/bin /usr/local/cuda/bin/nvcc \
+      "${gemma_flags[@]}" -DPLOW_NV_PACKED_REQUEST=1 \
+      -DPLOW_NV_FATLITE=1 -DPGM90_TMA_STAGES=3 \
+      -o "$gemma_out/interp_sm90a_pfpackedseg.cubin" runtime/nvidia/interp_sm90a.cu
+  fi
 done
