@@ -189,6 +189,13 @@ pub fn build(
         }
     }
 
+    // The engines resolve weights as `<assets>/checkpoint` unless
+    // `--rt-checkpoint` overrides it (`main.rs`, `serve/manager.rs`), so the
+    // farm has to be reachable under that name from inside the bundle.
+    // Without this link `load` reports success and `serve` then fails with a
+    // bare NotFound on a path the operator never chose.
+    link(&dir, &bundle_dir.join("checkpoint"))?;
+
     Ok(Farm {
         dir,
         shards,

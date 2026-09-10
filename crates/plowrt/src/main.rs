@@ -39,9 +39,14 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Load compiled assets and serve the OpenAI-compatible API.
+    // A serve needs a source, and there are two: a directory on disk or a
+    // reference in the local store. Grouping them means the error names BOTH,
+    // rather than telling a `--model` user that `--assets` is required.
+    #[command(group(clap::ArgGroup::new("model_source").required(true).multiple(true)
+        .args(["assets", "model"])))]
     Serve {
         /// One or more compiled-model directories.
-        #[arg(long = "assets", required_unless_present = "model")]
+        #[arg(long = "assets")]
         assets: Vec<PathBuf>,
         /// One or more model references, resolved from the LOCAL store.
         ///

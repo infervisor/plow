@@ -114,6 +114,19 @@ fn the_farm_links_shards_sidecars_and_the_tokenizer() {
     assert!(farm.dir.join("config.json").exists());
     // The runtime reads the tokenizer from the ASSETS dir, so it must be there too.
     assert!(bdir.join("tokenizer.json").exists());
+    // And it resolves weights as `<assets>/checkpoint` unless --rt-checkpoint
+    // overrides. Without this link `load` succeeds and `serve` then dies with a
+    // bare NotFound on a path the operator never chose.
+    let ckpt = bdir.join("checkpoint");
+    assert!(
+        ckpt.exists(),
+        "the bundle must reach the farm as `checkpoint`"
+    );
+    assert_eq!(
+        std::fs::canonicalize(&ckpt).unwrap(),
+        std::fs::canonicalize(&farm.dir).unwrap()
+    );
+    assert!(ckpt.join("model-00001-of-00002.safetensors").exists());
 
     for p in [store, snap, bdir] {
         let _ = std::fs::remove_dir_all(p);
