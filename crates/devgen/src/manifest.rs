@@ -1454,11 +1454,24 @@ pub fn build_for_packet(
     lean: &crate::LeanReport,
     sections: &[packet::devbuild::SectionData],
 ) -> Value {
-    let packed_prefill = sections.iter().any(|section| {
+    let packed_prefill = sections.iter().find(|section| {
         section.kind == packet::devbuild::SECT_METADATA
             && section.name == plow_asset::packed_prefill::SECTION
     });
-    build_with_packed_prefill(m, arch, lean, packed_prefill)
+    let mut manifest = build_with_packed_prefill(m, arch, lean, packed_prefill.is_some());
+    if let Some(section) = packed_prefill {
+        let packed: plow_asset::packed_prefill::Manifest =
+            serde_json::from_slice(&section.data).expect("emitted packed request manifest");
+        if let Some(rows) = packed.max_request_rows {
+            manifest["objects"]["packed_prefill"]["max_request_rows"] = json!(rows);
+            manifest["objects"]["packed_prefill"]["masked_padding_capability"] = json!({
+                "symbol": plow_asset::packed_prefill::MASKED_PADDING_CAPABILITY,
+                "value": 1,
+            });
+            manifest["pairing"]["hash"] = json!(format!("0x{:016x}", pairing_hash(&manifest)));
+        }
+    }
+    manifest
 }
 
 fn build_with_packed_prefill(
@@ -2222,6 +2235,9 @@ pub fn config_header(manifest: &Value) -> String {
         .iter()
         .any(|arm| arm.starts_with("KdaChunk") && arm.ends_with("_qpre"));
     out.push_str("/* --- packet and per-object opcode inventory --- */\n");
+    if manifest.pointer("/objects/packed_prefill/max_request_rows").is_some() {
+        out.push_str("#ifndef PLOW_NV_MASKED_PADDING\n#define PLOW_NV_MASKED_PADDING 1\n#endif\n");
+    }
     out.push_str(&format!(
         "#define PLOW_PACKET_HAS_DECODE_MLA_SEGMENTS {}\n",
         if decode_mla_required { 1 } else { 0 }
@@ -2818,7 +2834,7 @@ mod tests {
         let section = packet::devbuild::SectionData {
             kind: packet::devbuild::SECT_METADATA,
             name: plow_asset::packed_prefill::SECTION.into(),
-            data: vec![],
+            data: br#"{"version":1,"slot":0,"request":1,"maps":[],"programs":[]}"#.to_vec(),
         };
         let dense = build_for_packet(
             &model(),

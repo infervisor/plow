@@ -6,6 +6,7 @@ use std::collections::BTreeSet;
 pub const SECTION: &str = "packed_prefill";
 pub const CAPABILITY: &str = "plow_pf_request_abi";
 pub const CAPABILITY_VALUE: u32 = 2;
+pub const MASKED_PADDING_CAPABILITY: &str = "plow_pf_masked_padding_abi";
 pub const FP8_CAPABILITY: &str = "plow_pf_fp8_request_abi";
 pub const FP8_CAPABILITY_VALUE: u32 = 1;
 // FP8 attention uses t6/t7 for scales; tagged i4 carries the request handle.
@@ -47,6 +48,8 @@ pub struct Map {
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_request_rows: Option<u32>,
     pub slot: u16,
     pub request: u16,
     pub maps: Vec<Map>,
@@ -58,6 +61,12 @@ impl Manifest {
         mut read_capability: impl FnMut(&str) -> Option<u32>,
     ) -> Result<()> {
         need(matches!(self.version, 1 | 2), "object manifest version")?;
+        if self.max_request_rows.is_some() {
+            need(
+                self.version == 1 && read_capability(MASKED_PADDING_CAPABILITY) == Some(1),
+                "object requires BF16 masked padding ABI1",
+            )?;
+        }
         need(
             read_capability(CAPABILITY) == Some(CAPABILITY_VALUE),
             "object requires packed request ABI2",
@@ -115,10 +124,23 @@ impl Manifest {
             .max()
             .unwrap();
         need(rows <= i32::MAX as u32, "row index width")?;
+        let write_rows = self.max_request_rows.unwrap_or(rows);
+        if self.max_request_rows.is_some() {
+            need(
+                self.version == 1
+                    && write_rows > 0
+                    && write_rows <= rows
+                    && p.programs[..p.prefill_count]
+                        .iter()
+                        .any(|g| g.rows == write_rows),
+                "request limit must match a BF16 prefill rung",
+            )?;
+        }
         for cache in &live.caches {
             need(
                 cache.window == 0
-                    || u64::from(cache.stride) >= u64::from(cache.window) + u64::from(rows) - 1,
+                    || u64::from(cache.stride)
+                        >= u64::from(cache.window) + u64::from(write_rows) - 1,
                 "ring must retain the attention window across all padded KV writes",
             )?;
         }
@@ -325,6 +347,16 @@ pub fn plan(
     bucket: usize,
     max_ctx: usize,
 ) -> Result<Plan> {
+    plan_with_limit(requests, frontiers, bucket, max_ctx, None)
+}
+
+pub fn plan_with_limit(
+    requests: &[Request],
+    frontiers: &[u32],
+    bucket: usize,
+    max_ctx: usize,
+    max_request_rows: Option<u32>,
+) -> Result<Plan> {
     need(
         !requests.is_empty()
             && requests.len() <= frontiers.len()
@@ -342,6 +374,10 @@ pub fn plan(
         mapped_ends: Vec::with_capacity(requests.len()),
     };
     for r in requests {
+        need(
+            max_request_rows.is_none_or(|limit| r.len <= limit as usize),
+            "request exceeds compiled chunk limit",
+        )?;
         need(
             r.slot < frontiers.len() && seen.insert(r.slot) && r.slot <= i32::MAX as usize,
             "physical slot or duplicate",
@@ -364,6 +400,11 @@ pub fn plan(
         total = next;
     }
     let padding = bucket - total;
+    if max_request_rows.is_some() {
+        out.slots.resize(bucket, -1);
+        out.positions.resize(bucket, 0);
+        return Ok(out);
+    }
     let (padding_index, padding_request, padded) = requests
         .iter()
         .enumerate()
@@ -385,6 +426,69 @@ pub fn plan(
 mod tests {
     use super::*;
     #[test]
+    fn masked_padding_requires_an_explicit_bf16_object_capability() {
+        for version in [1, 2] {
+            for masked in [None, Some(0), Some(1), Some(2)] {
+                let manifest = Manifest {
+                    version,
+                    max_request_rows: Some(1024),
+                    slot: 0,
+                    request: 1,
+                    maps: vec![],
+                    programs: vec![],
+                };
+                assert_eq!(
+                    manifest
+                        .validate_object(|name| match name {
+                            CAPABILITY => Some(CAPABILITY_VALUE),
+                            FP8_CAPABILITY => Some(FP8_CAPABILITY_VALUE),
+                            MASKED_PADDING_CAPABILITY => masked,
+                            _ => None,
+                        })
+                        .is_ok(),
+                    version == 1 && masked == Some(1),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn masked_padding_never_extends_a_real_requests_kv_writes() {
+        let request = Request {
+            slot: 1,
+            start: 15360,
+            len: 1024,
+            prompt: 16384,
+        };
+        let p = plan_with_limit(&[request], &[0, 15360], 8192, 16384, Some(1024)).unwrap();
+        assert_eq!(p.table, [1, 0, 1024, 1, 16384]);
+        assert_eq!(p.mapped_ends, [(1, 16384)]);
+        assert!(p.slots[..1024].iter().all(|&slot| slot == 1));
+        assert_eq!(p.positions[..1024], (15360..16384).collect::<Vec<_>>());
+        assert!(p.slots[1024..].iter().all(|&slot| slot == -1));
+        assert!(p.positions[1024..].iter().all(|&pos| pos == 0));
+        assert!(plan(&[request], &[0, 15360], 8192, 16384).is_err());
+        assert!(
+            plan_with_limit(&[request], &[0, 15360], 8192, 16384, Some(512))
+                .unwrap_err()
+                .contains("compiled chunk limit")
+        );
+        assert!(
+            plan_with_limit(&[request, request], &[0, 15360], 8192, 16384, Some(1024))
+                .unwrap_err()
+                .contains("duplicate")
+        );
+    }
+
+    #[test]
+    fn legacy_manifest_does_not_emit_a_request_limit() {
+        let bytes = br#"{"version":1,"slot":0,"request":1,"maps":[],"programs":[]}"#;
+        let manifest: Manifest = serde_json::from_slice(bytes).unwrap();
+        assert_eq!(manifest.max_request_rows, None);
+        assert_eq!(serde_json::to_vec(&manifest).unwrap(), bytes);
+    }
+
+    #[test]
     fn object_contract_refuses_missing_or_incompatible_fp8_bindings() {
         for (version, base, fp8, valid) in [
             (1, Some(2), None, true),
@@ -398,6 +502,7 @@ mod tests {
             (3, Some(2), Some(1), false),
         ] {
             let m = Manifest {
+                max_request_rows: None,
                 version,
                 slot: 0,
                 request: 1,

@@ -2272,7 +2272,7 @@ fn declare(
         // 2x on full layers only (a minority), the design's chosen tradeoff. Sliding layers (16 kv)
         // still split cleanly at tp=8. Requires kvh|tp OR tp|kvh; anything else fails loudly.
         let kvh_local = kvh_local(kvh, tp, l);
-        let (kvr, _) = kv_ring(full, ctx, c.window, max_chunk(c.window));
+        let (kvr, _) = kv_ring(full, ctx, c.window, request_chunk(c.window));
         let qd = (c.heads / tp) * hd; // column-parallel q output shard
         let kd = kvh_local * hd; // column-parallel k/v output shard (KV head-sharded/replicated)
                                  // fp8-KV: the cache is uint8 e4m3 (1 byte/elem, HALF the bf16 footprint) plus a per-row
@@ -2904,6 +2904,16 @@ fn max_chunk(window: u32) -> u32 {
         "PLOW_MAX_CHUNK {v} must be a power of two <= {MAX_CHUNK_MAX}"
     );
     v
+}
+
+fn request_chunk(window: u32) -> u32 {
+    let aggregate = max_chunk(window);
+    let rows = emit_config::active().max_request_chunk.unwrap_or(aggregate);
+    assert!(
+        rows.is_power_of_two() && rows <= aggregate,
+        "PLOW_MAX_REQUEST_CHUNK must be a power of two <= PLOW_MAX_CHUNK"
+    );
+    rows
 }
 
 /// SLIDING-WINDOW KV RING. Mirrors `PLOW_KV_RING` / `PLOW_KV_MASK_NONE` in `dev_isa.h`.
@@ -4102,7 +4112,7 @@ fn emit_phase(
         // (GQA 8). A single nsplit for both would leave the full layers on 4 of 256 CUs.
         // The sliding layers' cache is a RING; the full layers' is linear. `kvm` is 0xFFFFFFFF
         // for a full layer, so the AND in the kernels is a no-op there. See kv_rows().
-        let (kvr, kvm) = kv_ring(full, ctx, c.window, max_chunk(c.window));
+        let (kvr, kvm) = kv_ring(full, ctx, c.window, request_chunk(c.window));
         // GF is the flash-decode GQA fusion factor: query heads carried by ONE work item, and it is
         // the KERNEL constant PLOW_FA_GF(hd) = PLOW_FA_GF_FULL (default 2) — NOT 8. The compiler and
         // kernel must agree (dev_isa.h). GF=2 fuses sliding layers fully (GQA 2) and full layers
@@ -7024,6 +7034,17 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
     // be added that skips it.
     install_gfx950_gemv_cases();
 
+    if emit_config::active().max_request_chunk.is_some() {
+        assert!(
+            model_type.starts_with("gemma4") && arch == "sm_90a" && tp == 1
+                && !emit_config::active().any_fp8_weights()
+                && !emit_config::active().mxfp4
+                && !emit_config::active().fp8_kv
+                && emit_config::active().packed_prefill_metadata_on(),
+            "request chunk limits require packed Gemma 4 BF16 SM90 TP1"
+        );
+    }
+
     // GLM-5.2 (GlmMoeDsa) — MLA + DSA + block-fp8 MoE — is a wholly separate emit path (glm_main).
     // Dispatch on model_type before the dense-GQA cfg parse, which would panic on GLM's config.
     // GPT-OSS: its own emitter (gptoss.rs) over the CPU-tier contracts; `cfg_from` would panic
@@ -8220,7 +8241,7 @@ fn emit_dense_gqa(
     };
     // The invariant that ties MAX_CHUNK to KV_RING (see dev_isa.h). Break it and a chunk's own
     // rows wrap onto their history: a silent wrong answer, not a crash.
-    let chunk = max_chunk(c.window);
+    let chunk = request_chunk(c.window);
     let ring = kv_ring_rows(c.window, chunk);
     assert!(
         ring >= c.window + chunk - 1,
@@ -8660,6 +8681,7 @@ fn emit_dense_gqa(
             let live = plow_asset::live_kv::emit(p)?;
             let request = plow_asset::packed_prefill::Manifest {
                 version: live.version,
+                max_request_rows: ecfg.max_request_chunk,
                 slot,
                 request,
                 maps,
@@ -8680,7 +8702,7 @@ fn emit_dense_gqa(
                 });
                 packed_prefill_emitted = true;
             }
-            Err(error) if ecfg.emit_packed_prefill.is_none() => {
+            Err(error) if ecfg.emit_packed_prefill.is_none() && ecfg.max_request_chunk.is_none() => {
                 m.tensors.truncate(packed_tensor_base);
                 eprintln!("  packed prefill not selected: {error}");
             }

@@ -5589,6 +5589,13 @@ impl GpuEngine {
         self.prefill.last().map_or(0, |b| b.t as usize)
     }
 
+    pub fn pf_request_max_rows(&self) -> usize {
+        self.packed_prefill
+            .as_ref()
+            .and_then(|p| p.max_request_rows)
+            .map_or_else(|| self.pf_max_rows(), |rows| rows as usize)
+    }
+
     /// Pack budget for `avail` waiting prefill rows (PX-1 batched path), in
     /// rows. Delegates to [`Self::pick_prefill_bucket`] so the batched and
     /// serialized paths share ONE policy — the cost-aware pick that charges
@@ -6189,6 +6196,7 @@ impl GpuEngine {
     /// the first generated token is read back (`PrefillStep::Done`), the exact
     /// postcondition of the whole-prompt [`Self::prefill_slot`].
     pub fn prefill_chunk(&mut self, b: usize, prompt: &[u32], cap: usize) -> Result<PrefillStep> {
+        let cap = cap.min(self.pf_request_max_rows());
         let Some(f_pf) = self.f_pf else {
             return Err(RuntimeError::Rejected("prefill object not loaded".into()));
         };
@@ -6953,11 +6961,12 @@ impl GpuEngine {
                 })
                 .collect();
             Some(
-                plow_asset::packed_prefill::plan(
+                plow_asset::packed_prefill::plan_with_limit(
                     &requests,
                     &self.pos,
                     bucket.t as usize,
                     self.max_ctx,
+                    self.packed_prefill.as_ref().and_then(|p| p.max_request_rows),
                 )
                 .map_err(RuntimeError::Rejected)?,
             )

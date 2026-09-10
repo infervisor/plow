@@ -188,6 +188,10 @@ pub struct EmitConfig {
     #[arg(long = "emit-max-chunk", env = "PLOW_MAX_CHUNK")]
     pub max_chunk: Option<u32>,
 
+    /// Maximum real rows per request in a packed prefill launch.
+    #[arg(long = "emit-max-request-chunk", env = "PLOW_MAX_REQUEST_CHUNK")]
+    pub max_request_chunk: Option<u32>,
+
     /// Emit S·n_cu decode slices for Gemv packets (finer work-stealing).
     #[arg(long, env = "PLOW_GEMV_SPLIT", default_value_t = 1)]
     pub gemv_split: u32,
@@ -975,6 +979,7 @@ impl EmitConfig {
             decode_ladder: env_str("PLOW_DECODE_BATCH_LADDER"),
             decode_ladder_default: false,
             max_chunk: env_u32("PLOW_MAX_CHUNK"),
+            max_request_chunk: env_u32("PLOW_MAX_REQUEST_CHUNK"),
             gemv_split: env_u32("PLOW_GEMV_SPLIT").unwrap_or(1),
             decode_tiled: env_bool("PLOW_DECODE_TILED"),
             l2_place_prefill: env_bool_opt("PLOW_L2_PLACE_PREFILL").unwrap_or(true),

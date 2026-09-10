@@ -1,0 +1,2114 @@
+{
+  "note": "Exact packet vs compiler all-op case coverage; not runtime kernel selection or performance qualification.",
+  "packets": [
+    {
+      "packet": "plans/gemma4-12b-roofline/bf16-cases-native/model.pkt",
+      "build_sha256": "0d6c587cd13e5e889e379a6d9753fd31dc692618d7b5e7756e6b6549049b4be5",
+      "passed": true,
+      "packet_sha256": "4b511b1cfe2ba67a762b5492491d8c3d1eaac52fe4efcbe5f33691ab2d6e1adf",
+      "programs": [
+        {
+          "phase": "prefill",
+          "rows": 128,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "prefill",
+          "rows": 512,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "prefill",
+          "rows": 1024,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "prefill",
+          "rows": 2048,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 1,
+          "instructions": 542,
+          "cases": 67,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 113,
+            "GemvGlu": 48,
+            "GemvQkv": 40,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 2,
+          "instructions": 542,
+          "cases": 67,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 113,
+            "GemvGlu": 48,
+            "GemvQkv": 40,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 4,
+          "instructions": 542,
+          "cases": 67,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 113,
+            "GemvGlu": 48,
+            "GemvQkv": 40,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 8,
+          "instructions": 542,
+          "cases": 67,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 113,
+            "GemvGlu": 48,
+            "GemvQkv": 40,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 16,
+          "instructions": 542,
+          "cases": 67,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 113,
+            "GemvGlu": 48,
+            "GemvQkv": 40,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        }
+      ]
+    },
+    {
+      "packet": "plans/gemma4-12b-roofline/bf16-lean-attention/model.pkt",
+      "build_sha256": "4a7f8559463b07c145355cf9f73e8b2aeada579e179eed8a794ef57f16885c65",
+      "passed": true,
+      "packet_sha256": "611dcfa237c265f02ef1cdbd40174a9b8c8f56517c481e2c002d2b172f90e99b",
+      "programs": [
+        {
+          "phase": "prefill",
+          "rows": 128,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "prefill",
+          "rows": 512,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "prefill",
+          "rows": 1024,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "prefill",
+          "rows": 2048,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 1,
+          "instructions": 542,
+          "cases": 67,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 113,
+            "GemvGlu": 48,
+            "GemvQkv": 40,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 2,
+          "instructions": 542,
+          "cases": 67,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 113,
+            "GemvGlu": 48,
+            "GemvQkv": 40,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 4,
+          "instructions": 542,
+          "cases": 67,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 113,
+            "GemvGlu": 48,
+            "GemvQkv": 40,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 8,
+          "instructions": 542,
+          "cases": 67,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 113,
+            "GemvGlu": 48,
+            "GemvQkv": 40,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 16,
+          "instructions": 542,
+          "cases": 67,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 113,
+            "GemvGlu": 48,
+            "GemvQkv": 40,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        }
+      ]
+    },
+    {
+      "packet": "plans/gemma4-12b-roofline/bf16-lean-attention-bits/model.pkt",
+      "build_sha256": "4a7f8559463b07c145355cf9f73e8b2aeada579e179eed8a794ef57f16885c65",
+      "passed": true,
+      "packet_sha256": "864f622d88278b93863fa21b9196ec12634e80b5f2a6215f25a7eb27cc2aa083",
+      "programs": [
+        {
+          "phase": "prefill",
+          "rows": 128,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "prefill",
+          "rows": 512,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "prefill",
+          "rows": 1024,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "prefill",
+          "rows": 2048,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 1,
+          "instructions": 542,
+          "cases": 67,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 113,
+            "GemvGlu": 48,
+            "GemvQkv": 40,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 2,
+          "instructions": 542,
+          "cases": 67,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 113,
+            "GemvGlu": 48,
+            "GemvQkv": 40,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 4,
+          "instructions": 542,
+          "cases": 67,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 113,
+            "GemvGlu": 48,
+            "GemvQkv": 40,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 8,
+          "instructions": 542,
+          "cases": 67,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 113,
+            "GemvGlu": 48,
+            "GemvQkv": 40,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 16,
+          "instructions": 542,
+          "cases": 67,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 113,
+            "GemvGlu": 48,
+            "GemvQkv": 40,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        }
+      ]
+    },
+    {
+      "packet": "plans/gemma4-12b-roofline/bf16-lean-bits-throughput8k/model.pkt",
+      "build_sha256": "f893508440a45a752d09a31bce1c71ea4c843ba2e2a5c65029fa1294b1fa835c",
+      "passed": true,
+      "packet_sha256": "85ec7edd11056d2421ccfe5d6f514bbd487a2271a9305d600965d3e641312af6",
+      "programs": [
+        {
+          "phase": "prefill",
+          "rows": 128,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "prefill",
+          "rows": 512,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "prefill",
+          "rows": 1024,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "prefill",
+          "rows": 2048,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "prefill",
+          "rows": 4096,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "prefill",
+          "rows": 8192,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 1,
+          "instructions": 542,
+          "cases": 67,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 113,
+            "GemvGlu": 48,
+            "GemvQkv": 40,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 2,
+          "instructions": 542,
+          "cases": 67,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 113,
+            "GemvGlu": 48,
+            "GemvQkv": 40,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 4,
+          "instructions": 542,
+          "cases": 67,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 113,
+            "GemvGlu": 48,
+            "GemvQkv": 40,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 8,
+          "instructions": 542,
+          "cases": 67,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 113,
+            "GemvGlu": 48,
+            "GemvQkv": 40,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        }
+      ]
+    },
+    {
+      "packet": "plans/gemma4-12b-roofline/bf16-native-tc/model.pkt",
+      "build_sha256": "9ef18d27039fa68746fdcb58c47fa2358f05e6a8b002e606ef78c2c00ddf9d64",
+      "passed": true,
+      "packet_sha256": "8255b384d8333724d35e6546e2dc36e564816be45e115aa32d3147e99022744c",
+      "programs": [
+        {
+          "phase": "prefill",
+          "rows": 128,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "prefill",
+          "rows": 512,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "prefill",
+          "rows": 1024,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "prefill",
+          "rows": 2048,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 1,
+          "instructions": 718,
+          "cases": 69,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 2,
+          "instructions": 718,
+          "cases": 69,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 4,
+          "instructions": 718,
+          "cases": 69,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 8,
+          "instructions": 718,
+          "cases": 69,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 16,
+          "instructions": 718,
+          "cases": 69,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        }
+      ]
+    },
+    {
+      "packet": "plans/gemma4-12b-roofline/bf16-native-tc-4k/model.pkt",
+      "build_sha256": "8633922d5f678482436734e2414d04893567689187ac9b13c555bbac491ac920",
+      "passed": true,
+      "packet_sha256": "69a4ab8925425e593c724f3e550b0931b5afc639df79630f94aa711d8f186a6e",
+      "programs": [
+        {
+          "phase": "prefill",
+          "rows": 128,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "prefill",
+          "rows": 512,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "prefill",
+          "rows": 1024,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "prefill",
+          "rows": 2048,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "prefill",
+          "rows": 4096,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 1,
+          "instructions": 718,
+          "cases": 69,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 2,
+          "instructions": 718,
+          "cases": 69,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 4,
+          "instructions": 718,
+          "cases": 69,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 8,
+          "instructions": 718,
+          "cases": 69,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 16,
+          "instructions": 718,
+          "cases": 69,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        }
+      ]
+    },
+    {
+      "packet": "plans/gemma4-12b-roofline/bf16-native-tc-4k-wide/model.pkt",
+      "build_sha256": "0505bade22d2252ebdfd1ae80c6b36bde925bb1a2a6919251ef4db79543b06b9",
+      "passed": true,
+      "packet_sha256": "25b695eafba55e952a611238786b17eb86f1e577a03d59f2c5fd6518ba7cd8a5",
+      "programs": [
+        {
+          "phase": "prefill",
+          "rows": 128,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "prefill",
+          "rows": 512,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "prefill",
+          "rows": 1024,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "prefill",
+          "rows": 2048,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "prefill",
+          "rows": 4096,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 16,
+          "instructions": 718,
+          "cases": 69,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        }
+      ]
+    },
+    {
+      "packet": "plans/gemma4-12b-roofline/bf16-native-tc-8k/model.pkt",
+      "build_sha256": "4e3e1775d38c31307a3f93ac0037d0b12392f19a3b17053dfa9da3bffdea1d3e",
+      "passed": true,
+      "packet_sha256": "a57c0a5bd8a5c9a3e74679b52573c2eb90b760351ee1c50cf84e95f294c4616a",
+      "programs": [
+        {
+          "phase": "prefill",
+          "rows": 128,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "prefill",
+          "rows": 512,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "prefill",
+          "rows": 1024,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "prefill",
+          "rows": 2048,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "prefill",
+          "rows": 4096,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "prefill",
+          "rows": 8192,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 1,
+          "instructions": 718,
+          "cases": 69,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 2,
+          "instructions": 718,
+          "cases": 69,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 4,
+          "instructions": 718,
+          "cases": 69,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 8,
+          "instructions": 718,
+          "cases": 69,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        }
+      ]
+    },
+    {
+      "packet": "plans/gemma4-12b-roofline/bf16-native-tc-fatlite-slices/model.pkt",
+      "build_sha256": "a8c301ee73a81dbc934e30b85be152bf4cfb38ad529fd5c185e4c07808696f20",
+      "passed": true,
+      "packet_sha256": "717d3cf63b714aac477c878c9e7ce5b00f9d1cb5d3393a8b7e5c8c818dac5603",
+      "programs": [
+        {
+          "phase": "prefill",
+          "rows": 128,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "prefill",
+          "rows": 512,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "prefill",
+          "rows": 1024,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "prefill",
+          "rows": 2048,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "prefill",
+          "rows": 4096,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 1,
+          "instructions": 718,
+          "cases": 69,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 2,
+          "instructions": 718,
+          "cases": 69,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 4,
+          "instructions": 718,
+          "cases": 69,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 8,
+          "instructions": 718,
+          "cases": 69,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 16,
+          "instructions": 718,
+          "cases": 69,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        }
+      ]
+    },
+    {
+      "packet": "plans/gemma4-12b-roofline/bf16-native-tc-qku32/model.pkt",
+      "build_sha256": "8633922d5f678482436734e2414d04893567689187ac9b13c555bbac491ac920",
+      "passed": true,
+      "packet_sha256": "8b3fd226e0500ff159f8a3249ea691e0b4824b91faee5594ec8cb7a8170c0751",
+      "programs": [
+        {
+          "phase": "prefill",
+          "rows": 128,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "prefill",
+          "rows": 512,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "prefill",
+          "rows": 1024,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "prefill",
+          "rows": 2048,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "prefill",
+          "rows": 4096,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 1,
+          "instructions": 718,
+          "cases": 69,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 2,
+          "instructions": 718,
+          "cases": 69,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 4,
+          "instructions": 718,
+          "cases": 69,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 8,
+          "instructions": 718,
+          "cases": 69,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 16,
+          "instructions": 718,
+          "cases": 69,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        }
+      ]
+    },
+    {
+      "packet": "plans/gemma4-12b-roofline/bf16-native-tc-wide/model.pkt",
+      "build_sha256": "b1ee5f8cc6d8c22d4b3ea8190e8c2e7893ba2bac39fcfeac8434b828edae7e7f",
+      "passed": true,
+      "packet_sha256": "e9b7fbae30160ba6a1eaecf4f9e594bbd074a7de26bf239f8827c104bb6a9394",
+      "programs": [
+        {
+          "phase": "prefill",
+          "rows": 128,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "prefill",
+          "rows": 512,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "prefill",
+          "rows": 1024,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "prefill",
+          "rows": 2048,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 16,
+          "instructions": 718,
+          "cases": 69,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        }
+      ]
+    },
+    {
+      "packet": "plans/gemma4-12b-roofline/bf16-native-tc-requestlimit/model.pkt",
+      "packet_sha256": "f3bcb30d088f849d247e971c3756de81cf00c99e72ea55fa8578355ad3a04e69",
+      "build_sha256": "8589ec0969413c3af96eae746cd087d3e833a603d5318814b5a6c39f9fd1baaf",
+      "passed": true,
+      "programs": [
+        {
+          "phase": "prefill",
+          "rows": 128,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "prefill",
+          "rows": 512,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "prefill",
+          "rows": 1024,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "prefill",
+          "rows": 2048,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "prefill",
+          "rows": 4096,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "prefill",
+          "rows": 8192,
+          "instructions": 766,
+          "cases": 387,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 1,
+          "instructions": 718,
+          "cases": 69,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 2,
+          "instructions": 718,
+          "cases": 69,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 4,
+          "instructions": 718,
+          "cases": 69,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 8,
+          "instructions": 718,
+          "cases": 69,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 16,
+          "instructions": 718,
+          "cases": 69,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 329,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        }
+      ]
+    }
+  ]
+}

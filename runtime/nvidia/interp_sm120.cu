@@ -159,6 +159,9 @@ extern "C" __device__ unsigned plow_row_gather_1 = 1;
 #error "packed request ABI requires Hopper prefill"
 #endif
 extern "C" __device__ __constant__ unsigned plow_pf_request_abi = 2;
+#if defined(PLOW_NV_MASKED_PADDING) && PLOW_NV_MASKED_PADDING
+extern "C" __device__ __constant__ unsigned plow_pf_masked_padding_abi = 1;
+#endif
 #if PLOW_FP8_KV
 extern "C" __device__ __constant__ unsigned plow_pf_fp8_request_abi = 1;
 #endif

@@ -158,6 +158,7 @@ fn packed_contract(p: &plow_asset::program::Packet<'_>, live: &plow_asset::live_
     };
     let manifest = Manifest {
         version: live.version,
+        max_request_rows: None,
         slot,
         request,
         maps,

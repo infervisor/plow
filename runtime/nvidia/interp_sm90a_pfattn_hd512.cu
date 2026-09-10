@@ -10,6 +10,9 @@
 
 #if PLOW_NV_PACKED_REQUEST && PLOW_NV_FA512_WG
 extern "C" __device__ __constant__ unsigned plow_pf_request_abi = 2;
+#if defined(PLOW_NV_MASKED_PADDING) && PLOW_NV_MASKED_PADDING
+extern "C" __device__ __constant__ unsigned plow_pf_masked_padding_abi = 1;
+#endif
 #endif
 
 extern "C" __device__ unsigned plow_attention_sm90_hd512_wg32_abi = 1;

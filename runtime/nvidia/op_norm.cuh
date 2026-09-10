@@ -689,6 +689,9 @@ static __device__ void d_headnorm_rope(__nv_bfloat16* __restrict__ out,
             const unsigned nsh = 31u - (unsigned)__clz((int)nhead);
             t = w >> nsh; hh = w & (nhead - 1u);
         } else { t = w / nhead; hh = w % nhead; }
+#if defined(PLOW_NV_MASKED_PADDING) && PLOW_NV_MASKED_PADDING
+        if (out_stride && pfslot && pfslot[t] < 0) continue;
+#endif
 #if PLOW_MIXED_STEP
         PlowMixedRow mixed_row = {nullptr, 0u, 0u, 0u, 0u};
         if (out_stride && mixed) {

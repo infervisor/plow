@@ -1479,7 +1479,10 @@ fn run_one_tick(
                         if available == 0 {
                             continue;
                         }
-                        let take = available.min(remaining).min(pf_chunk_rows());
+                        let take = available
+                            .min(remaining)
+                            .min(pf_chunk_rows())
+                            .min(e.pf_request_max_rows());
                         pack.push((i, start, take));
                         remaining -= take;
                     }
@@ -3381,7 +3384,7 @@ fn gpu_prefill_batched_pass(
     .min(budget_max.saturating_sub(decode_rows));
     // Bound each candidate before fair sharing. Short requests return unused
     // rows to later candidates in the same launch.
-    let chunk_cap = pf_chunk_rows();
+    let chunk_cap = pf_chunk_rows().min(e.pf_request_max_rows());
     loop {
         for (i, slot) in slots.iter_mut().enumerate().take(cap) {
             let Some(request) = slot.as_mut().filter(|s| s.step == 0) else {

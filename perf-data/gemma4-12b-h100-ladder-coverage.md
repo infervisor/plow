@@ -130,3 +130,69 @@ contains 718. Every emitted family remains in the audit, including the shared
 norm/pointwise/sampling bodies and fused HeadNormRope/NormResidualNorm bodies.
 Their presence and successful execution do not establish exact-shape tuning.
 The remaining all-op qualification list above is still open.
+
+## Packet versus compiler case checks
+
+Pass the matching `build.json` as the audit's third argument to require exact
+all-op inventory coverage:
+
+```sh
+nix develop -c cargo run -p plowrt --example packet_ladder_audit -- model.pkt audit.json build.json
+```
+
+The check compares every rung, instruction count, PC, opcode, block count,
+immediate, packed float/integer bits, operand presence and operand extent.
+Missing, duplicate, out-of-range or mismatched cases fail. Float and integer
+immediates are compared using the packet's shared wire fields. The report
+records the packet SHA256 and the checked manifest path.
+
+Twelve Gemma 4 artifacts with compiler case inventories pass:
+**108 programs, 76,984 instructions**. The
+[case coverage snapshot](gemma4-12b-h100-data/packet-build-case-coverage.json)
+records packet and build-manifest hashes plus each rung's op counts. Older
+artifacts without this inventory require the packet-only queue/slice audit.
+
+This verifies what the compiler emitted. It does not certify that all ops have
+qualified specializations: runtime-selected objects, attention history,
+performance counters and end-to-end timing still need independent evidence.
+
+## Request-limited aggregate ladder
+
+The opt-in BF16 Gemma 4 SM90 TP1 contract separates `PLOW_MAX_CHUNK=8192`
+aggregate rows from `PLOW_MAX_REQUEST_CHUNK=1024` real rows per request. The
+full B16 packet has six prefill rungs (128/512/1024/2048/4096/8192), five decode
+rungs (1/2/4/8/16), 766 instructions per prefill rung and 718 per decode rung.
+At context 20480 it allocates 15 GiB KV, versus 45 GiB for the retained B16/4K
+packet. Its activations occupy 1.63 GiB; weights remain 22.2 GiB.
+
+Packed padding uses slot `-1`; fused BF16 HeadNormRope skips its KV writes but
+still computes padded query rows. The compiler, planner, ordinary prefill and
+mux enforce the per-request limit. Objects must export masked-padding ABI1;
+the build manifest and generated header carry this requirement. Unsupported
+architectures/precisions and limits without a matching rung are rejected.
+Absent request limits preserve the existing contract.
+
+Build matching segments with `PLOW_BUILD_MASKED_PADDING=1` and optionally
+`PLOW_BUILD_FATLITE=1` using `scripts/build_sm90a_gemma4_segments.sh`. Copy its
+HD512 role object into the asset directory before compiling the packet, so
+the packet pins that object's hash. Larger physical decode batches require
+separate native projection qualification; this change does not add B32.
+
+`runtime/tests/packed_kv_padding_sm90.cu` verifies all six prefill rungs at
+HD256/KV8 and HD512/KV1. All twelve cases pass with zero Compute Sanitizer
+memcheck errors: wrapped real writes match query-body outputs byte-for-byte,
+all other KV bytes stay untouched, and padded query rows are computed.
+Full-packet serving checks pass ragged isolated/concurrent consistency,
+cancellation, slot reuse, output counts and context rejection. These tests
+do not replace independent model-quality or performance qualification.
+
+The [screen](gemma4-12b-h100-data/request-limit-screen.json) ran one repeat
+after one warmup per cell, 128 output tokens, cache disabled. Output throughput
+at input 1K/16K was 77.29/45.54 tokens/s at C1 and 570.10/99.33 at C16.
+All 34 measured requests returned 128 tokens. The retained configuration's
+16K/C16 result is 98.55 tokens/s; this screen establishes no clear speedup.
+The contract remains opt-in. [Artifact hashes and checks](gemma4-12b-h100-data/request-limit-contract.json),
+[GPU memcheck](gemma4-12b-h100-data/request-limit-gpu-memcheck.log) and
+[serving checks](gemma4-12b-h100-data/request-limit-serve-verify.log) record the
+tested scope. No C128 screen or independent full-model logit comparison was
+run for this candidate.
