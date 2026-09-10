@@ -5,6 +5,29 @@ decode and native AITER prefill. TP8 batch 16 passes the retrieval screen.
 The serving screen gains 4.7% throughput but regresses mean TPOT by 49.6%;
 this is a capacity option, not a new default. No speculative decoding is involved.
 
+## Full reference-sized decode-tier comparison
+
+The [100-request record](mi300x-decode-tiers.json) compares automatic decode-tier
+loading with an explicit empty override on the same FP8 batch-20 packet and
+objects. Tiers 1/2/4/8/16 loaded on all eight ranks. Both arms passed 18/18
+retrieval cases and completed 100/100 random requests at concurrency 20, with
+exactly 7,018,227 input and 71,149 output tokens—the H200 reference totals.
+
+| Metric | Automatic tiers | Main object at every width |
+|---|---:|---:|
+| Output tokens/s | 39.88 | 39.85 |
+| Duration, s | 1784.19 | 1785.46 |
+| Mean TTFT, ms | 35767.99 | 36311.23 |
+| Mean TPOT, ms | 436.40 | 436.60 |
+| P99 TPOT, ms | 519.38 | 536.84 |
+
+The 0.07% throughput difference does not establish a serving speedup. This was
+one ordered pair, with no CPU compilation or other GPU experiments during
+timing. The tier-discovery fix repairs dispatch, but the H200 reference remains
+far ahead at 273.67 output tokens/s. Its GPU count, server launch command and
+cache state are unknown; it also used speculation. Neither Plow arm used
+speculation or the experimental flat MoE route.
+
 ## Correctness finding
 
 The V2 `GATHER=true, FP8=true` body gathered latent/rope rows through the union
