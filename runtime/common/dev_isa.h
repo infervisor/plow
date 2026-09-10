@@ -1350,6 +1350,14 @@ enum {
      * t0=out t1=x t2=weights t3=scales t4=meta t5=row_token t6=row_part t7=row_gate
      * i0=T i1=H i2=I i3=E i4=topk i5=align_tile. Isolated native segment only. */
     PLOW_DOP_MOE_AITER_FP8_PF = 156,
+    /* Native gfx942 TP8 DSA score, top-k and raw index gather.
+     * t0=idx t1=score t2=q t3=k t4=w t5=kv_len t6=peer_slot
+     * i0=T i1=ctx i2=topk i3=tp i4=slot_bytes i5=enter_gate i6=complete_gate f0=scale.
+     * Isolated native segment with three consecutive system-scope arrival gates. */
+    PLOW_DOP_INDEX_TP_PF = 157,
+    /* Native gfx942 BF16 prefill projection using qualified hipBLASLt assembly.
+     * t0=out t1=x t2=weight i0=T i1=N i2=K. Isolated native segment only. */
+    PLOW_DOP_GEMM_LT_PF = 158,
 
     PLOW_DOP__COUNT
 };
