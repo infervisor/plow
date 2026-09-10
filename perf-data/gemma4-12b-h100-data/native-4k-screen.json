@@ -1,0 +1,265 @@
+{
+  "raw_sha256": "1a2051328f4a1783933166434cae3049333861a24667634b0b74378a20de8734",
+  "runtime_sha256": "cfd137414b90b3cc42605ef516c354dcb42c1227c8e2948689ae320f0dd051c9",
+  "packet_sha256": "69a4ab8925425e593c724f3e550b0931b5afc639df79630f94aa711d8f186a6e",
+  "settings": {
+    "physical_batch": 16,
+    "pf_chunk": 4096,
+    "pf_budget": 4096,
+    "ctx": 20480,
+    "prefix_cache": false,
+    "native_projection": true,
+    "precision": "BF16",
+    "arch": "sm90a"
+  },
+  "results": [
+    {
+      "schema_version": 2,
+      "label": "plow-native-b16-pf4k-chunk4k",
+      "model": "checkpoint",
+      "manifest": null,
+      "warmups_per_case": 1,
+      "input": 1024,
+      "requested_cached_prefix_tokens": 0,
+      "cached_tokens": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0
+      },
+      "output": 128,
+      "concurrency": 1,
+      "repeat": 0,
+      "elapsed_s": 1.6632841909959097,
+      "output_tok_s": 76.95618144687505,
+      "request_s": 0.6012201675537113,
+      "ttft_ms": 100.6090199953178,
+      "latency_ms": {
+        "p50": 1662.8337889997056,
+        "p95": 1662.8337889997056,
+        "p99": 1662.8337889997056
+      },
+      "tpot_ms": {
+        "p50": 12.300982433105416,
+        "p95": 12.300982433105416,
+        "p99": 12.300982433105416
+      }
+    },
+    {
+      "schema_version": 2,
+      "label": "plow-native-b16-pf4k-chunk4k",
+      "model": "checkpoint",
+      "manifest": null,
+      "warmups_per_case": 1,
+      "input": 1024,
+      "requested_cached_prefix_tokens": 0,
+      "cached_tokens": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0
+      },
+      "output": 128,
+      "concurrency": 1,
+      "repeat": 1,
+      "elapsed_s": 1.6460023960025865,
+      "output_tok_s": 77.76416383770493,
+      "request_s": 0.6075325299820697,
+      "ttft_ms": 85.32580300379777,
+      "latency_ms": {
+        "p50": 1645.6068370025605,
+        "p95": 1645.6068370025605,
+        "p99": 1645.6068370025605
+      },
+      "tpot_ms": {
+        "p50": 12.285677433061124,
+        "p95": 12.285677433061124,
+        "p99": 12.285677433061124
+      }
+    },
+    {
+      "schema_version": 2,
+      "label": "plow-native-b16-pf4k-chunk4k",
+      "model": "checkpoint",
+      "manifest": null,
+      "warmups_per_case": 1,
+      "input": 1024,
+      "requested_cached_prefix_tokens": 0,
+      "cached_tokens": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0
+      },
+      "output": 128,
+      "concurrency": 16,
+      "repeat": 0,
+      "elapsed_s": 3.7718113719965913,
+      "output_tok_s": 542.9751909666417,
+      "request_s": 4.241993679426888,
+      "ttft_ms": 932.7177430022857,
+      "latency_ms": {
+        "p50": 3763.7332505000813,
+        "p95": 3769.6966367493587,
+        "p99": 3770.3210585485067
+      },
+      "tpot_ms": {
+        "p50": 22.287726192884094,
+        "p95": 23.776532590556425,
+        "p99": 27.32084043938783
+      }
+    },
+    {
+      "schema_version": 2,
+      "label": "plow-native-b16-pf4k-chunk4k",
+      "model": "checkpoint",
+      "manifest": null,
+      "warmups_per_case": 1,
+      "input": 1024,
+      "requested_cached_prefix_tokens": 0,
+      "cached_tokens": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0
+      },
+      "output": 128,
+      "concurrency": 16,
+      "repeat": 1,
+      "elapsed_s": 3.7929671259989846,
+      "output_tok_s": 539.946678145965,
+      "request_s": 4.218333423015352,
+      "ttft_ms": 917.0127239995054,
+      "latency_ms": {
+        "p50": 3773.0517244963266,
+        "p95": 3792.031745251734,
+        "p99": 3792.30448185117
+      },
+      "tpot_ms": {
+        "p50": 22.48939268112707,
+        "p95": 27.439441326809117,
+        "p99": 27.442239282708766
+      }
+    },
+    {
+      "schema_version": 2,
+      "label": "plow-native-b16-pf4k-chunk4k",
+      "model": "checkpoint",
+      "manifest": null,
+      "warmups_per_case": 1,
+      "input": 16384,
+      "requested_cached_prefix_tokens": 0,
+      "cached_tokens": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0
+      },
+      "output": 128,
+      "concurrency": 1,
+      "repeat": 0,
+      "elapsed_s": 3.029652076002094,
+      "output_tok_s": 42.24907573179421,
+      "request_s": 0.33007090415464224,
+      "ttft_ms": 1137.5030139970477,
+      "latency_ms": {
+        "p50": 3028.7351520019,
+        "p95": 3028.7351520019,
+        "p99": 3028.7351520019
+      },
+      "tpot_ms": {
+        "p50": 14.891591637833484,
+        "p95": 14.891591637833484,
+        "p99": 14.891591637833484
+      }
+    },
+    {
+      "schema_version": 2,
+      "label": "plow-native-b16-pf4k-chunk4k",
+      "model": "checkpoint",
+      "manifest": null,
+      "warmups_per_case": 1,
+      "input": 16384,
+      "requested_cached_prefix_tokens": 0,
+      "cached_tokens": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0
+      },
+      "output": 128,
+      "concurrency": 1,
+      "repeat": 1,
+      "elapsed_s": 3.0509321330027888,
+      "output_tok_s": 41.954391123744806,
+      "request_s": 0.3277686806542563,
+      "ttft_ms": 1136.2013520047185,
+      "latency_ms": {
+        "p50": 3050.0670699984767,
+        "p95": 3050.0670699984767,
+        "p99": 3050.0670699984767
+      },
+      "tpot_ms": {
+        "p50": 15.069808803100457,
+        "p95": 15.069808803100457,
+        "p99": 15.069808803100457
+      }
+    },
+    {
+      "schema_version": 2,
+      "label": "plow-native-b16-pf4k-chunk4k",
+      "model": "checkpoint",
+      "manifest": null,
+      "warmups_per_case": 1,
+      "input": 16384,
+      "requested_cached_prefix_tokens": 0,
+      "cached_tokens": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0
+      },
+      "output": 128,
+      "concurrency": 16,
+      "repeat": 0,
+      "elapsed_s": 22.618899594999675,
+      "output_tok_s": 90.5437504330559,
+      "request_s": 0.7073730502582493,
+      "ttft_ms": 18629.993359500077,
+      "latency_ms": {
+        "p50": 22567.119126502803,
+        "p95": 22595.209586997953,
+        "p99": 22595.78672219868
+      },
+      "tpot_ms": {
+        "p50": 30.999660649608206,
+        "p95": 146.82922627758586,
+        "p99": 146.8298342570968
+      }
+    },
+    {
+      "schema_version": 2,
+      "label": "plow-native-b16-pf4k-chunk4k",
+      "model": "checkpoint",
+      "manifest": null,
+      "warmups_per_case": 1,
+      "input": 16384,
+      "requested_cached_prefix_tokens": 0,
+      "cached_tokens": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0
+      },
+      "output": 128,
+      "concurrency": 16,
+      "repeat": 1,
+      "elapsed_s": 22.08934615400358,
+      "output_tok_s": 92.71437849367084,
+      "request_s": 0.7243310819818034,
+      "ttft_ms": 13497.867371999746,
+      "latency_ms": {
+        "p50": 21645.622854000976,
+        "p95": 22087.59160175032,
+        "p99": 22087.63670914559
+      },
+      "tpot_ms": {
+        "p50": 64.15726855117302,
+        "p95": 98.1585942913303,
+        "p99": 98.15926653698008
+      }
+    }
+  ]
+}

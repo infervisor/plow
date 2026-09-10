@@ -312,3 +312,67 @@ Evidence: [C1/C16](gemma4-12b-h100-data/native-tc-final-output128.json),
 [serving verification](gemma4-12b-h100-data/native-tc-final-verify.log),
 [rung logits](gemma4-12b-h100-data/native-tc-rung-gpu.log),
 [corrupted-object rejection](gemma4-12b-h100-data/native-tc-badhash.log).
+
+## Larger prefill chunks (2026-09-10)
+
+The previous 8K-budget experiment still used 1K per-request chunks. New native
+BF16 packets test actual 4K chunks at B16 and 8K chunks at B8. Both retain the
+compiled KV-ring contract, context 20480, identical kernel objects and disabled
+prefix caching. Every emitted rung passed the packet coverage audit.
+
+Median across measured repeats; 128 output tokens per request:
+
+| Packet / chunk | Input | Concurrency | Repeats | TTFT ms | Output tokens/s |
+|---|---:|---:|---:|---:|---:|
+| B8 / 8192 | 1024 | 1 | 3 | 80.95 | 77.39 |
+| B8 / 8192 | 4096 | 1 | 3 | 263.23 | 68.88 |
+| B8 / 8192 | 16384 | 1 | 3 | 1147.09 | 45.07 |
+| B16 / 4096 | 1024 | 1 | 2 | 92.97 | 77.36 |
+| B16 / 4096 | 1024 | 16 | 2 | 924.87 | 541.46 |
+| B16 / 4096 | 16384 | 1 | 2 | 1136.85 | 42.10 |
+| B16 / 4096 | 16384 | 16 | 2 | 16063.93 | 91.63 |
+| B16 / 4096 | 1024 | 128 | 1 | 13737.43 | 537.66 |
+| B16 / 4096 | 16384 | 128 | 1 | 87884.65 | 92.81 |
+
+C1/C16 use one warmup per cell. C128 follows on the warmed B16 server with no
+additional warmup. All measured requests have the requested output count and
+zero cached tokens. These are sequential screens, not interleaved comparisons.
+The two long C16 TTFTs vary substantially (18.63 and 13.50 seconds). Against
+the prior native 2K-budget/1K-chunk screen, long C16 throughput improves from
+80.60 to 91.63, and C128 from 82.50 to 92.81 tokens/s. The recorded vLLM long
+C16 result is still 176.84 tokens/s; no performance-goal completion is claimed.
+
+The B16 candidate passes serving consistency, cancellation, slot reuse and
+context rejection. One repeated 16K/C16 synthetic prompt produces two hyphen
+sequences across slots/repeats, matching the previously observed variation.
+This remains unresolved and prevents treating the screen as model-quality
+qualification. Larger chunks are not promoted to defaults.
+
+The GPU rung gate now accepts `TEST_DECODE_RUNG_PROMPT_ROWS`. With 16384 and
+the matching B16/4K widest-only reference packet, all 122 full-logit snapshots
+pass bit-exact comparison across B1/2/4/8/16, holes, slot reuse and continuation.
+This tests sequentially populated KV histories and decode-rung transitions;
+it does not compare different packed-prefill schedules or independent HF logits.
+[Long-context gate](gemma4-12b-h100-data/native-4k-long-rung-gpu.log).
+
+Diagnostic CUDA event timing on the B16/4K packed route attributes one 16K,
+one-output request to 530.9 ms GEMM, 405.0 ms attention, and 144.6 ms in the
+combined light-op object. Each chunk has 193/48/194 segments respectively.
+The eight HD512 attention segments each reach about 13.8 ms in the last chunk.
+Event instrumentation replaces graph replay, so these numbers locate costs
+but are not serving latency measurements. Attention and light-op specialization
+remain necessary alongside GEMM tuning; chunk launch overhead is insufficient
+to explain the gap.
+
+Reproduce compilation with `PLOW_MAX_CHUNK=4096`,
+`PLOW_DECODE_BATCH_LADDER=1,2,4,8,16`, `PLOW_EMIT_DECODE_NATIVE_TC=true`,
+`PLOW_TMA_GEMM=true`, `PLOW_NO_GLU_FUSE=true`, `PLOW_UNISEG=0`,
+`PLOW_SEG_CLASS_SLICE=1`, `PLOW_SEG_FA512=all`, `PLOW_SEG_PURE_GEMM=1`,
+and the native object recipe above. Serve with `--pf-chunk 4096
+--pf-interleave 4096`. For B8/8K, use chunk/budget 8192 and ladder 1,2,4,8.
+
+Evidence: [B8 latency](gemma4-12b-h100-data/native-8k-latency.json),
+[B16 screen](gemma4-12b-h100-data/native-4k-screen.json),
+[C128](gemma4-12b-h100-data/native-4k-c128.json),
+[serving checks](gemma4-12b-h100-data/native-4k-verify.log),
+[segment timings](gemma4-12b-h100-data/native-4k-segment-profile.log).

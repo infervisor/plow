@@ -1,0 +1,79 @@
+{
+  "raw_sha256": "dcbd3b8506e094a5bacea83d7438968b7f9b3fb9a704d439cf50fb6cb9111c7b",
+  "runtime_sha256": "cfd137414b90b3cc42605ef516c354dcb42c1227c8e2948689ae320f0dd051c9",
+  "packet_sha256": "69a4ab8925425e593c724f3e550b0931b5afc639df79630f94aa711d8f186a6e",
+  "settings": {
+    "physical_batch": 16,
+    "pf_chunk": 4096,
+    "pf_budget": 4096,
+    "ctx": 20480,
+    "prefix_cache": false,
+    "native_projection": true,
+    "precision": "BF16",
+    "arch": "sm90a"
+  },
+  "results": [
+    {
+      "schema_version": 2,
+      "label": "plow-native-b16-pf4k-chunk4k",
+      "model": "checkpoint",
+      "manifest": null,
+      "warmups_per_case": 0,
+      "input": 1024,
+      "requested_cached_prefix_tokens": 0,
+      "cached_tokens": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0
+      },
+      "output": 128,
+      "concurrency": 128,
+      "repeat": 0,
+      "elapsed_s": 30.472957307996694,
+      "output_tok_s": 537.6570391381254,
+      "request_s": 4.200445618266604,
+      "ttft_ms": 13737.42723399846,
+      "latency_ms": {
+        "p50": 17037.622468000336,
+        "p95": 30438.797560901367,
+        "p99": 30445.738518280705
+      },
+      "tpot_ms": {
+        "p50": 23.16009418112611,
+        "p95": 28.287296400786566,
+        "p99": 28.73262828721951
+      }
+    },
+    {
+      "schema_version": 2,
+      "label": "plow-native-b16-pf4k-chunk4k",
+      "model": "checkpoint",
+      "manifest": null,
+      "warmups_per_case": 0,
+      "input": 16384,
+      "requested_cached_prefix_tokens": 0,
+      "cached_tokens": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0
+      },
+      "output": 128,
+      "concurrency": 128,
+      "repeat": 0,
+      "elapsed_s": 176.5233955779986,
+      "output_tok_s": 92.81489258890088,
+      "request_s": 0.7251163483507881,
+      "ttft_ms": 87884.65375049782,
+      "latency_ms": {
+        "p50": 92871.01559099756,
+        "p95": 176326.73428805065,
+        "p99": 176437.17542572995
+      },
+      "tpot_ms": {
+        "p50": 41.688799503948914,
+        "p95": 52.955621183455364,
+        "p99": 147.44760860764552
+      }
+    }
+  ]
+}

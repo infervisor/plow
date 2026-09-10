@@ -712,12 +712,17 @@ fn check_gpu_decode_rungs(library: bool) {
         } else {
             assert!(e.decode_rungs.is_empty());
         }
-        let rows = e
+        let minimum_rows = e
             .prefill
             .iter()
             .map(|p| p.t)
             .min()
             .expect("prefill required") as usize;
+        let rows = std::env::var("TEST_DECODE_RUNG_PROMPT_ROWS")
+            .map(|s| s.parse::<usize>().expect("positive prompt row count"))
+            .unwrap_or(minimum_rows);
+        assert!(rows >= minimum_rows);
+        eprintln!("candidate={candidate}: checking {rows}-token prompts");
         let mut checked = 0;
         let mut compare = |e: &mut GpuEngine, row: usize, token: u32, tag: String| {
             let mut logits = Vec::new();
