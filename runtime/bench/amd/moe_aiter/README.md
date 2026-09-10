@@ -525,3 +525,29 @@ for all 256 experts. Both full 78-layer packets pass Lean ordering and LDS
 checks for all ten programs. Disabling the option reproduces the previous
 packet byte-for-byte. The record contains source, binary, packet, object and
 result hashes plus reproduction scripts.
+
+### Interpreter GEMV width after resident MoE
+
+[mi300x-resident-gemv-width.json](mi300x-resident-gemv-width.json) tests compiled
+GEMV row widths 16, 8 and 4 with the existing row walk enabled. All three images
+use the resident packet's operation inventory; only the main decode image
+differs. This is a short-input screen: 40 random requests at 2048/256 tokens,
+range ratio 0.14, concurrency 20. It is not the H200 workload.
+
+| GEMV width | Private scratch (bytes) | VGPR spills | Output tok/s | Mean TPOT (ms) | P99 TPOT (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 16 | 6384 | 8 | 132.053 | 126.61 | 142.14 |
+| 8 | 3152 | 7 | 132.666 | 126.63 | 142.78 |
+| 4 | 1824 | 2 | 126.070 | 133.74 | 148.83 |
+
+All retain 256 VGPRs, 108 SGPRs, 87 SGPR spills and 64,568 bytes LDS. Pruning
+alone leaves these resource limits unchanged. Width 8 changes throughput by
+only +0.46% with slightly worse TPOT; width 4 loses 4.53% throughput. Lower
+private scratch does not establish a speedup: narrower tiles require more
+weight passes. Keep width 16 pending stronger evidence.
+
+Each arm completes 40/40 requests with zero failures, identical input/output
+length arrays, and 12/12 expected first answers. The loader selects the intended
+GQ decode image on all eight ranks. One run per width, in order 16/8/4, supplies
+no repeatability estimate or broad quality qualification. No production
+defaults change.
