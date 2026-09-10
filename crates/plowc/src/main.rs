@@ -125,6 +125,17 @@ struct Cli {
     #[arg(long, default_value = "sm_120a")]
     arch: String,
 
+    /// devblob bundle only: also emit a CPU-executable twin packet for this GPU
+    /// spec into `<out>/cpu-twin/`, for queue-driven CPU prefill heads.
+    ///
+    /// Pick an NVIDIA spec (`rtx6000pro`): a gfx942/gfx950 packet carries
+    /// AMD-specific fusion the CPU kernels do not implement and is rejected at
+    /// load. The twin emits at TP 1 — a head runs on one host — and at the same
+    /// `--max-ctx`, because the KV geometry is what the two have to share.
+    /// The compile FAILS if their KV contracts disagree.
+    #[arg(long, value_name = "GPU")]
+    cpu_twin: Option<String>,
+
     /// devblob only: max context tokens the program is compiled for.
     #[arg(long, default_value_t = 131072)]
     max_ctx: u32,
@@ -1356,7 +1367,7 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
             out: pkt.to_str().ok_or("non-UTF8 output path")?.to_string(),
             n_cu,
             tp,
-            block_spec,
+            block_spec: block_spec.clone(),
             embed_cubin: cli.embed_cubin.clone(),
             embed_hsaco: cli.embed_hsaco.clone(),
             rope_gen: !cli.no_rope_gen,
@@ -1364,10 +1375,14 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
             gpu: cli.gpu.clone(),
             arch: cli.arch.clone(),
             emit_cfg: Some(cli.emit_cfg.clone()),
-            whole_graph_fusions,
+            whole_graph_fusions: whole_graph_fusions.clone(),
         },
         verify,
     );
+
+    if let Some(twin_gpu) = cli.cpu_twin.clone() {
+        emit_cpu_twin(cli, &dir, &out_dir, out_is_pkt, n_cu, block_spec, whole_graph_fusions, &twin_gpu)?;
+    }
 
     // `--emit devblob+cubin`: build the object the packet we just wrote needs.
     // Runs AFTER emission, from the manifest that emission produced — never from
@@ -2451,4 +2466,81 @@ mod cli_tests {
         assert!(rep.reason.is_some_and(|r| !r.is_empty()));
         std::env::remove_var("PLOW_VERIFY_BIN");
     }
+}
+
+/// `--cpu-twin`: emit a second, CPU-executable packet for the same model and
+/// refuse the pair if their KV geometries differ.
+///
+/// The twin goes in its own directory rather than beside the device packet
+/// because an emit writes `build.json` and `plow_config.h` with
+/// `with_file_name`, so a second emit into the same directory would clobber the
+/// first's object contract.
+///
+/// TP 1: a head runs on one host. The same `--max-ctx`, because a head's rows
+/// reach the device as a byte copy into a slot and the two sides must cut a
+/// slot the same way. The digest is what checks that they actually did — TP
+/// sharding, a KV encoding the twin's target does not share, or any other
+/// divergence shows up here as a failed compile rather than as fluent wrong
+/// output at serving time.
+#[allow(clippy::too_many_arguments)]
+fn emit_cpu_twin(
+    cli: &Cli,
+    dir: &Path,
+    out_dir: &Path,
+    out_is_pkt: bool,
+    n_cu: u32,
+    block_spec: Option<String>,
+    whole_graph_fusions: devgen::WholeGraphFusionDecisions,
+    twin_gpu: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if out_is_pkt {
+        return Err("--cpu-twin needs a bundle directory; --out <dir>, not --out <file>.pkt".into());
+    }
+    let device = devgen::kv_contract::last()
+        .ok_or("device emit recorded no KV contract; cannot check the twin against it")?;
+
+    let twin_dir = out_dir.join("cpu-twin");
+    std::fs::create_dir_all(&twin_dir)?;
+    let twin_pkt = twin_dir.join("model.pkt");
+
+    devgen::run_verified(
+        devgen::EmitArgs {
+            dir: dir.to_path_buf(),
+            ctx: cli.max_ctx,
+            out: twin_pkt.to_str().ok_or("non-UTF8 twin path")?.to_string(),
+            n_cu,
+            tp: 1,
+            block_spec,
+            // No interpreter object: the CPU engine interprets the packet.
+            embed_cubin: None,
+            embed_hsaco: None,
+            rope_gen: !cli.no_rope_gen,
+            // `--cpu-l2-place` measured 1.5x slower and is off, so the twin
+            // carries no locality domains for it to key on.
+            l2_layout: None,
+            gpu: twin_gpu.to_string(),
+            arch: "sm_120a".to_string(),
+            emit_cfg: Some(cli.emit_cfg.clone()),
+            whole_graph_fusions,
+        },
+        Some(devgen::skip_hook(
+            "CPU twin: the device packet's verification covers the graph",
+        )),
+    );
+
+    let twin = devgen::kv_contract::last()
+        .ok_or("twin emit recorded no KV contract")?;
+    if twin != device {
+        return Err(format!(
+            "CPU twin KV contract does not match the device packet.\n  device ({}): {device}\n  \
+             twin   ({twin_gpu}): {twin}\nA head prefilled against the twin reaches the device as \
+             a byte copy of a row range, so the two must cut a sequence slot identically. Common \
+             causes: a TP degree that shards the caches, a KV encoding only one target emits \
+             (fp8 KV has no CPU kernels), or a different --max-ctx.",
+            cli.gpu
+        )
+        .into());
+    }
+    info!(twin = %twin_pkt.display(), kv_contract = %twin, "cpu twin written");
+    Ok(())
 }
