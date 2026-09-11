@@ -8803,11 +8803,16 @@ fn emit_dense_gqa(
         )
         .unwrap_or_else(|error| panic!("native W8A16 M1 object: {error}"));
     }
+    let tunedb_root = ecfg.tunedb_root();
     attention_prefill_role::apply_output_object(
         &mut m,
         &mut sections,
         &arch,
         std::path::Path::new(&out),
+        &gpu,
+        ctx,
+        packed_prefill_emitted,
+        tunedb_root.as_deref(),
     )
     .unwrap_or_else(|error| panic!("prefill attention object: {error}"));
     let blob = if sections.is_empty() {

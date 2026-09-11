@@ -2473,7 +2473,9 @@ mod tests {
     #[derive(Default)]
     struct MockVmm {
         next: AtomicU64,
+        granularity: AtomicU64,
         reserves: AtomicU64,
+        reserved_bytes: AtomicU64,
         address_frees: AtomicU64,
         creates: AtomicU64,
         releases: AtomicU64,
@@ -2490,15 +2492,16 @@ mod tests {
 
     impl VmmOps for MockVmm {
         fn granularity(&self) -> Result<u64> {
-            Ok(16)
+            Ok(self.granularity.load(Ordering::SeqCst).max(16))
         }
-        fn reserve(&self, _bytes: u64) -> Result<u64> {
+        fn reserve(&self, bytes: u64) -> Result<u64> {
             if self.fail_reserves.load(Ordering::SeqCst) > 0
                 && self.fail_reserves.fetch_sub(1, Ordering::SeqCst) == 1
             {
                 return Err(RuntimeError::Oom("mock VA reservation failure".into()));
             }
             self.reserves.fetch_add(1, Ordering::SeqCst);
+            self.reserved_bytes.fetch_add(bytes, Ordering::SeqCst);
             Ok(self.next.fetch_add(1 << 32, Ordering::SeqCst) + (1 << 32))
         }
         fn address_free(&self, _va: u64, _bytes: u64) {
@@ -2576,6 +2579,57 @@ mod tests {
             batch: 2,
         };
         VmmKv::new(ops, geo, 64, cache_cap).expect("pool")
+    }
+
+    #[test]
+    fn gemma_128k_live_kv_reserves_logical_windows_and_commits_on_demand() {
+        const GRAN: u64 = 2 << 20;
+        let ops = Arc::new(MockVmm::default());
+        ops.granularity.store(GRAN, Ordering::SeqCst);
+        let geometry = VmmGeometry {
+            full_layers: (0..8).collect(),
+            kvh_full: 1,
+            hd_full: 512,
+            slide_layers: (0..40).collect(),
+            kvh_slide: 8,
+            hd_slide: 256,
+            window: 1024,
+            elem: 2,
+            elem_slide: 2,
+            max_ctx: 131_072,
+            batch: 16,
+        };
+        let full = VmmKv::new_live(ops.clone(), geometry, GRAN).unwrap();
+        assert_eq!(ops.reserves.load(Ordering::SeqCst), 16);
+        assert_eq!(ops.reserved_bytes.load(Ordering::SeqCst), 32 << 30);
+        assert_eq!(ops.creates.load(Ordering::SeqCst), 0);
+        assert_eq!(full.stats().blocks_live, 0);
+
+        full.ensure_rows(0, 1).unwrap();
+        assert_eq!(full.stats().blocks_live * GRAN, 32 << 20);
+        full.ensure_rows(0, 4096).unwrap();
+        assert_eq!(full.stats().blocks_live * GRAN, 64 << 20);
+
+        let ring_slot_bytes = 8 * 2048 * 256 * 2;
+        let tensors: Vec<_> = (0..80)
+            .map(|tensor| LiveRingTensor {
+                tensor,
+                slot_bytes: ring_slot_bytes,
+            })
+            .collect();
+        let ring_ops = Arc::new(MockVmm::default());
+        ring_ops.granularity.store(GRAN, Ordering::SeqCst);
+        let mut rings = VmmRings::new(ring_ops.clone(), &tensors, 16).unwrap();
+        assert_eq!(rings.stats().reserved_bytes, 10 << 30);
+        assert_eq!(ring_ops.reserved_bytes.load(Ordering::SeqCst), 10 << 30);
+        assert_eq!(rings.stats().resident_bytes, 0);
+        assert_eq!(ring_ops.creates.load(Ordering::SeqCst), 0);
+        rings.ensure_slot(0).unwrap();
+        assert_eq!(rings.stats().resident_bytes, 640 << 20);
+        assert_eq!(
+            ring_ops.creates.load(Ordering::SeqCst) * ring_slot_bytes,
+            640 << 20
+        );
     }
 
     fn prompt(n: usize) -> Vec<u32> {

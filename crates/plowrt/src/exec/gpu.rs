@@ -88,6 +88,10 @@ use decode_rung::{
     validate_decode_ladder, DecodeRung, DecodeSelection,
 };
 
+fn live_rings_for_context(configured: bool, live: bool, max_ctx: Option<u32>) -> bool {
+    configured || (live && max_ctx.is_some_and(|ctx| ctx >= 131_072))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct InterpreterProfile {
     tag: &'static str,
@@ -567,12 +571,16 @@ impl SegmentRoleValidation for SegmentRoles {
                 .map_err(RuntimeError::Rejected)?;
             }
             for (seg, &role) in program.roles.iter().enumerate() {
-                if role == plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32 {
+                if matches!(
+                    role,
+                    plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32
+                        | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_BKV64
+                ) {
                     let g = &blob.progs[program.index];
                     let pc = g.gq_stream[g.gq_seg_ofs[seg] as usize].inst as usize;
                     if u32::from(g.insts[pc].blocks) != blob.n_cu {
                         return Err(RuntimeError::Rejected(
-                            "HD512 WG32 role requires one slice per packet block".into(),
+                            "dedicated attention role requires one slice per packet block".into(),
                         ));
                     }
                 }
@@ -729,6 +737,36 @@ fn check_attention_hd512_role(
     {
         return Err(RuntimeError::Rejected(
             "incompatible HD512 WG32 attention role".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn check_attention_hd256_bkv64_role(
+    arch: &str,
+    object: &plow_asset::segment_roles::SegmentObject,
+    capability: Option<u32>,
+    block: Option<u32>,
+    geometry: [Option<u32>; 4],
+) -> Result<()> {
+    let expected = object.attention.as_ref();
+    if arch != "sm90a"
+        || capability != Some(1)
+        || block != Some(BLOCK)
+        || expected.is_none_or(|a| {
+            a.profile != arch
+                || a.dtype != "bf16"
+                || geometry
+                    != [
+                        Some(a.head_dim),
+                        Some(a.query_tile),
+                        Some(a.kv_tile),
+                        Some(a.warps),
+                    ]
+        })
+    {
+        return Err(RuntimeError::Rejected(
+            "incompatible HD256 BKV64 attention role".into(),
         ));
     }
     Ok(())
@@ -1029,6 +1067,7 @@ fn packet_role_segments(
                     role,
                     plow_asset::segment_roles::PREFILL_ATTENTION
                         | plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32
+                        | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_BKV64
                 )
             }))
     {
@@ -1138,6 +1177,13 @@ fn packet_role_segments(
                     ));
                 }
                 validate_attention_role_inst(d, g.t, tensors, 512, true, true)?;
+            } else if role == plow_asset::segment_roles::PREFILL_ATTENTION_HD256_BKV64 {
+                if !d.is_hd256_gqa2_sliding_prefill() {
+                    return Err(RuntimeError::Rejected(
+                        "HD256 BKV64 role requires exact Gemma sliding attention".into(),
+                    ));
+                }
+                validate_attention_role_inst(d, g.t, tensors, 256, true, true)?;
             } else if role == plow_asset::segment_roles::GEMV_CTA512 {
                 validate_gemv_decode_role_inst(d, g.t, g.stream_ofs.len(), tensors)?;
             } else if role == plow_asset::segment_roles::MXFP4_MOE {
@@ -3063,7 +3109,18 @@ impl GpuEngine {
                 if live && !config.nv_vmm_live() {
                     tracing::info!("live KV allocation enabled by packet metadata");
                 }
-                let rings = config.nv_vmm_live_rings();
+                let configured_rings = config.nv_vmm_live_rings();
+                let rings = live_rings_for_context(
+                    configured_rings,
+                    live,
+                    live_kv_manifest.as_ref().map(|manifest| manifest.max_ctx),
+                );
+                if rings && !configured_rings {
+                    tracing::info!(
+                        max_ctx = live_kv_manifest.as_ref().map(|manifest| manifest.max_ctx),
+                        "live ring allocation enabled for long-context KV"
+                    );
+                }
                 if rings && !live {
                     return Err(RuntimeError::Rejected(
                         "live rings require PLOW_VMM_LIVE=1".into(),
@@ -4142,6 +4199,7 @@ impl GpuEngine {
                 id,
                 plow_asset::segment_roles::PREFILL_ATTENTION
                     | plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32
+                    | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_BKV64
                     | plow_asset::segment_roles::GEMV_CTA512
                     | plow_asset::segment_roles::W8A16_PREFILL_M1
             ) && profile.tag != "sm90a"
@@ -4166,6 +4224,12 @@ impl GpuEngine {
                     "plow_block_pfattn_hd512",
                     "plow_sm90a_pfattn_hd512",
                     "plow_arena_bytes_pfattn_hd512",
+                ),
+                plow_asset::segment_roles::PREFILL_ATTENTION_HD256_BKV64 => (
+                    "plow_attention_sm90_hd256_bkv64_abi",
+                    "plow_block_pfattn_hd256_bkv64",
+                    "plow_sm90a_pfattn_hd256_bkv64",
+                    "plow_arena_bytes_pfattn_hd256_bkv64",
                 ),
                 plow_asset::segment_roles::GEMV_CTA512 => (
                     "plow_gemv_sm90_cta512_abi",
@@ -4197,9 +4261,10 @@ impl GpuEngine {
             if matches!(
                 id,
                 plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32
+                    | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_BKV64
                     | plow_asset::segment_roles::W8A16_PREFILL_M1
             ) && object.sha256.as_deref()
-                    != Some(plow_asset::decode_objects::image_sha256(&image).as_str())
+                != Some(plow_asset::decode_objects::image_sha256(&image).as_str())
             {
                 return Err(RuntimeError::Rejected(
                     "packet role object hash mismatch".into(),
@@ -4229,6 +4294,20 @@ impl GpuEngine {
                 }
                 plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32 => {
                     check_attention_hd512_role(
+                        profile.tag,
+                        object,
+                        capability,
+                        block,
+                        [
+                            be.module_global_u32(&module, "plow_attention_head_dim")?,
+                            be.module_global_u32(&module, "plow_attention_query_tile")?,
+                            be.module_global_u32(&module, "plow_attention_kv_tile")?,
+                            be.module_global_u32(&module, "plow_attention_warps")?,
+                        ],
+                    )?
+                }
+                plow_asset::segment_roles::PREFILL_ATTENTION_HD256_BKV64 => {
+                    check_attention_hd256_bkv64_role(
                         profile.tag,
                         object,
                         capability,
@@ -6210,6 +6289,7 @@ impl GpuEngine {
                                 role,
                                 plow_asset::segment_roles::PREFILL_ATTENTION
                                     | plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32
+                                    | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_BKV64
                             )
                         })
                         .count(),

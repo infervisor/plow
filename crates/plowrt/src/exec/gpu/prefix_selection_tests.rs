@@ -2,6 +2,14 @@ use super::*;
 use crate::asset::devblob::{DevProg, DevSection, DevTensor};
 
 #[test]
+fn long_context_live_kv_uses_reserved_ring_windows() {
+    assert!(!live_rings_for_context(false, true, Some(65_536)));
+    assert!(live_rings_for_context(false, true, Some(131_072)));
+    assert!(!live_rings_for_context(false, false, Some(131_072)));
+    assert!(live_rings_for_context(true, true, Some(1)));
+}
+
+#[test]
 fn automatic_prefix_selection_requires_compatible_execution_and_valid_kv_layout() {
     let dir = std::env::temp_dir().join(format!("plow-prefix-selection-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
