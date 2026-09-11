@@ -14,11 +14,22 @@ its build). `nix develop` gives you the same toolchain for plain `cargo`.
 
 ## The nn-graph dependency
 
-`nn-graph` (`github:infervisor/nn-graph`) is a separate repo. The workspace
-declares it as a cargo `git` dependency pointing at
-`https://github.com/infervisor/nn-graph.git`.
+`nn-graph` is **vendored into the workspace** at `crates/nn-graph` — see that
+crate's own `Cargo.toml` for why the bare `git = …` with no rev had to go. No
+network fetch, no flake input.
 
-Cargo fetches it directly; no vendor directory or flake input is needed.
+## Releases
+
+`nix build .#plowrt-release` produces the distributable asset for this platform:
+a deterministic tarball, its sha256, and a `release.json` recording version,
+commit, triple and feature set. The version is `<semver>+<git12>`, derived from
+`[workspace.package]` rather than written out per derivation. A build from a
+modified checkout carries `-dirty` and the publisher refuses it, because it names
+a commit it does not correspond to.
+
+`scripts/release_runtime.py` publishes those binaries;
+`scripts/release_dist.py` releases model assets, which advance on their own
+cadence. Full contract: [`DISTRIBUTION.md`](DISTRIBUTION.md).
 
 ## One binary for CPU and GPU
 

@@ -1932,6 +1932,30 @@ impl Backend for CudaBackend {
     fn vendor(&self) -> Option<hwspec::Vendor> {
         Some(hwspec::Vendor::Nvidia)
     }
+    /// NVIDIA reports a compute capability, not an arch string, so the ISA key
+    /// is synthesised: `(9,0) -> sm_90a`. `cuDeviceGetName` gives a marketing
+    /// name ("NVIDIA H100 80GB HBM3") that does not match a registry key, so the
+    /// SKU comes from the capability + SM count + capacity, as on AMD.
+    fn fingerprint(&self) -> Option<hwspec::isa::HardwareFingerprint> {
+        let (major, minor) = self.compute_capability();
+        let arch = format!("sm_{major}{minor}");
+        let total = self.mem_info().ok().map(|(_, total)| total).unwrap_or(0);
+        let driver = format!(
+            "cuda-{}.{}",
+            self.driver_version / 1000,
+            (self.driver_version % 1000) / 10
+        );
+        // `sm_90` is spelled `sm_90a` as an ISA level; likewise 12.0 -> sm_120a.
+        hwspec::isa::HardwareFingerprint::from_live(&arch, self.sm_count, total, Some(driver))
+            .or_else(|| {
+                hwspec::isa::HardwareFingerprint::from_live(
+                    &format!("{arch}a"),
+                    self.sm_count,
+                    total,
+                    None,
+                )
+            })
+    }
     fn enumerate(&self) -> Vec<ExecutorTarget> {
         // One executor per SM: the persistent interpreter runs one 256-thread
         // block per SM (8 worker warps), and the compiler partitions packets

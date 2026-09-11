@@ -16,6 +16,9 @@ use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
 use plowrt::config::RuntimeConfig;
 use plowrt::device::{self, Backend};
+
+#[path = "bin_dist.rs"]
+mod dist_cmd;
 use plowrt::exec::ExecutorSet;
 use plowrt::orch::Registry;
 use plowrt::serve::mux::{self, MuxConfig};
@@ -36,10 +39,22 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Load compiled assets and serve the OpenAI-compatible API.
+    // A serve needs a source, and there are two: a directory on disk or a
+    // reference in the local store. Grouping them means the error names BOTH,
+    // rather than telling a `--model` user that `--assets` is required.
+    #[command(group(clap::ArgGroup::new("model_source").required(true).multiple(true)
+        .args(["assets", "model"])))]
     Serve {
         /// One or more compiled-model directories.
-        #[arg(long = "assets", required = true)]
+        #[arg(long = "assets")]
         assets: Vec<PathBuf>,
+        /// One or more model references, resolved from the LOCAL store.
+        ///
+        /// `serve` performs no network I/O: an unpulled model is an error
+        /// naming the `plowrt load` that would fix it. Repeatable, and it
+        /// composes with `--assets`.
+        #[arg(long = "model")]
+        model: Vec<String>,
         #[arg(long, default_value_t = 8080)]
         port: u16,
         /// Optional Unix domain socket to also listen on (opt-in). Serves the
@@ -428,6 +443,140 @@ enum Cmd {
         #[arg(long, default_value = "text")]
         format: String,
     },
+
+    // ── asset distribution ────────────────────────────────────────────────
+    /// Fetch a model's assets into the local store. Contacts no server.
+    Pull {
+        /// The model to act on.
+        ///
+        /// `[<registry>/]<namespace>/<name>[:<label>][@g<n>]`. A bare name takes
+        /// the default namespace and `--registry`, so `kimi-k3` means
+        /// `infervisor/kimi-k3`. Omit the label to let the probe choose the
+        /// variant this machine can run; give one to pin it, and `@g<n>` to pin
+        /// a specific generation.
+        model: String,
+        #[command(flatten)]
+        pick: SelectArgs,
+        /// Report what would be fetched, and fetch nothing.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
+
+    /// Resolve, pull, and prepare a model so `serve` can load it.
+    ///
+    /// Picks the variant this machine can run, fetches what is missing, joins
+    /// it to the checkpoint, and prints the `serve` line.
+    Load {
+        /// The model to act on.
+        ///
+        /// `[<registry>/]<namespace>/<name>[:<label>][@g<n>]`. A bare name takes
+        /// the default namespace and `--registry`, so `kimi-k3` means
+        /// `infervisor/kimi-k3`. Omit the label to let the probe choose the
+        /// variant this machine can run; give one to pin it, and `@g<n>` to pin
+        /// a specific generation.
+        model: String,
+        #[command(flatten)]
+        pick: SelectArgs,
+        /// The HuggingFace snapshot. Defaults to `--rt-checkpoint`, then to a
+        /// previously prepared farm in the store.
+        #[arg(long)]
+        checkpoint: Option<PathBuf>,
+        /// Consent to downloading the checkpoint. Never implicit: a checkpoint
+        /// can be 1.59 TB.
+        #[arg(long, default_value_t = false)]
+        fetch_weights: bool,
+    },
+
+    /// Every published variant of a model, and which ones this machine can run.
+    Show {
+        /// The model to act on.
+        ///
+        /// `[<registry>/]<namespace>/<name>[:<label>][@g<n>]`. A bare name takes
+        /// the default namespace and `--registry`, so `kimi-k3` means
+        /// `infervisor/kimi-k3`. Omit the label to let the probe choose the
+        /// variant this machine can run; give one to pin it, and `@g<n>` to pin
+        /// a specific generation.
+        model: String,
+    },
+
+    /// What is in the local store.
+    Ls {
+        /// Check the registry for a newer generation of each pinned model.
+        #[arg(long, default_value_t = false)]
+        upgradable: bool,
+    },
+
+    /// Move a pin to the newest compatible generation.
+    Upgrade {
+        /// The model to upgrade. Omit with `--all`.
+        ///
+        /// Same grammar as `load`; a label or generation here would defeat the
+        /// point, since upgrading means moving to the newest compatible build.
+        model: Option<String>,
+        #[arg(long, default_value_t = false)]
+        all: bool,
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
+
+    /// Build the checkpoint farm for an already-pulled model.
+    Prepare {
+        /// The model to act on.
+        ///
+        /// `[<registry>/]<namespace>/<name>[:<label>][@g<n>]`. A bare name takes
+        /// the default namespace and `--registry`, so `kimi-k3` means
+        /// `infervisor/kimi-k3`. Omit the label to let the probe choose the
+        /// variant this machine can run; give one to pin it, and `@g<n>` to pin
+        /// a specific generation.
+        model: String,
+        #[arg(long)]
+        checkpoint: Option<PathBuf>,
+    },
+
+    /// Drop a pin, and optionally collect blobs nothing references any more.
+    Rm {
+        /// The model to act on.
+        ///
+        /// `[<registry>/]<namespace>/<name>[:<label>][@g<n>]`. A bare name takes
+        /// the default namespace and `--registry`, so `kimi-k3` means
+        /// `infervisor/kimi-k3`. Omit the label to let the probe choose the
+        /// variant this machine can run; give one to pin it, and `@g<n>` to pin
+        /// a specific generation.
+        model: String,
+        #[arg(long, default_value_t = false)]
+        gc: bool,
+    },
+}
+
+/// Narrowing shared by `pull` and `load`. Everything not constrained here is
+/// decided by probing the machine.
+#[derive(clap::Args, Debug, Clone, Default)]
+pub struct SelectArgs {
+    /// Require this many GPUs of tensor parallelism.
+    #[arg(long)]
+    tp: Option<u32>,
+    /// Require at least this context length.
+    #[arg(long)]
+    max_ctx: Option<u32>,
+    /// Require these feature flags, comma-separated (e.g. `fp8_kv,mxfp4_weights`).
+    #[arg(long)]
+    features: Option<String>,
+}
+
+impl SelectArgs {
+    fn constraints(&self) -> plow_asset::dist::Constraints {
+        plow_asset::dist::Constraints {
+            parallel_n: self.tp,
+            max_ctx: self.max_ctx,
+            features: self
+                .features
+                .as_deref()
+                .map(|s| s.split(',').map(str::trim).map(String::from).collect())
+                .unwrap_or_default(),
+            oversub: RuntimeConfig::get().amd.oversub,
+            ..Default::default()
+        }
+    }
 }
 
 #[tokio::main]
@@ -461,6 +610,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match cli.cmd {
         Cmd::Serve {
             assets,
+            model,
             port,
             socket,
             executors,
@@ -469,6 +619,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             slo_ms,
             max_queued_requests,
         } => {
+            let mut assets = assets;
+            for m in &model {
+                assets.push(dist_cmd::resolve_local(m)?);
+            }
             tracing::info!(
                 assets = ?assets,
                 port,
@@ -599,6 +753,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             layers,
             prefill,
         } => devices(tp, hidden, max_tokens, layers, prefill),
+        Cmd::Pull {
+            model,
+            pick,
+            dry_run,
+        } => dist_cmd::report(dist_cmd::cmd_pull(&model, pick.constraints(), dry_run)),
+        Cmd::Load {
+            model,
+            pick,
+            checkpoint,
+            fetch_weights,
+        } => dist_cmd::report(dist_cmd::cmd_load(
+            &model,
+            pick.constraints(),
+            checkpoint,
+            fetch_weights,
+        )),
+        Cmd::Show { model } => dist_cmd::report(dist_cmd::cmd_show(&model)),
+        Cmd::Ls { upgradable } => dist_cmd::report(dist_cmd::cmd_ls(upgradable)),
+        Cmd::Upgrade {
+            model,
+            all,
+            dry_run,
+        } => dist_cmd::report(dist_cmd::cmd_upgrade(model.as_deref(), all, dry_run)),
+        Cmd::Prepare { model, checkpoint } => {
+            dist_cmd::report(dist_cmd::cmd_prepare(&model, checkpoint))
+        }
+        Cmd::Rm { model, gc } => dist_cmd::report(dist_cmd::cmd_rm(&model, gc)),
         #[cfg(feature = "hsa")]
         Cmd::AmdBench {
             blob,
@@ -2060,6 +2241,26 @@ fn devices(
                 None => "no".into(),
             }
         );
+        // The identity an asset is selected against. Printed here because this
+        // is the report an operator pastes when a bundle refuses to load, and
+        // because a wrong SKU is otherwise invisible until a much later failure.
+        match be.fingerprint() {
+            Some(fp) => println!(
+                "       isa={} sku={} units={} mem={:.1} GiB lds={} KiB regs={} driver={} tuning={}",
+                fp.isa.arch_flag(),
+                fp.sku,
+                fp.units,
+                fp.mem_bytes as f64 / (1u64 << 30) as f64,
+                fp.shared_mem_bytes / 1024,
+                fp.regs_32bit,
+                fp.driver.as_deref().unwrap_or("-"),
+                fp.tuning_path(),
+            ),
+            None => println!(
+                "       no fingerprint — this device is not in the hwspec registry, so no \
+                 compiled asset can be selected for it"
+            ),
+        }
     }
 
     let Some(n) = tp else {

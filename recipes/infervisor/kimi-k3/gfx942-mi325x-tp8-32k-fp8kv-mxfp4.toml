@@ -1,0 +1,133 @@
+# Kimi-K3 on 8x MI325X — the reproduction record for one variant label.
+#
+# ONE FILE PER LABEL, NOT PER GENERATION. The label is what we build; the
+# generation is which build. A new generation is a commit to THIS file moving
+# `plow_git`, possibly `[objects].env`, the `[artifacts]` digests and
+# `[measured]` — so the git history of this file is the generation ledger, and a
+# regression is a line in a diff that has to be explained in a commit message.
+#
+# Transcribed from docs/amd/kimi-k3-mi325x.md, which stays as the narrative
+# record. `scripts/check_recipe.py` asserts this file against the artifacts a
+# build actually produced, so the two cannot drift.
+
+schema = "plow.recipe.v1"
+namespace = "infervisor"
+name = "kimi-k3"
+label = "gfx942-mi325x-tp8-32k-fp8kv-mxfp4"
+network = "kimi-k3"
+status = "validated"
+plow_git = "468674e985adf62c32b2178fbde29f0c5325c02e"
+doc = "docs/amd/kimi-k3-mi325x.md"
+
+[target]
+vendor = "amd"
+isa = "gfx942"
+sku = "MI325X"
+units = 304
+num_gpus = 8
+parallel = "tp"
+max_ctx = 32768
+toolchain = "rocm-7.14.0-nix"
+
+[checkpoint]
+source = "hf:moonshotai/Kimi-K3"
+shards = 96
+layout = "native-mxfp4"
+
+# K3 ships `tiktoken.model` and a Python tokenizer, and NO `tokenizer.json`, so
+# plow reconstructs one — 163,584 tiktoken ranks recovered into HF BPE merges,
+# with `--verify` requiring exact id-sequence equality against real tiktoken.
+# That makes it a compiled artifact, and the one tokenizer the distribution
+# carries.
+[tokenizer]
+source = "derived"
+generator = "scripts/kimi_k3_tokenizer.py"
+verified = true
+
+[[prepare]]
+tool = "scripts/kimi_k3_tokenizer.py"
+shell = "nix develop .#quantize"
+args = ["--model", "$CKPT", "--out", "$WORK/k3_tokz", "--verify"]
+produces = ["tokenizer.json"]
+
+# The derived sidecar: five tensors per MLA layer that exist nowhere in the
+# checkpoint. ~4.5 GB. It must sort AFTER the base shards, because the loader's
+# last-writer-wins glob is what makes it an override.
+[[prepare]]
+tool = "scripts/kimi_k3_prep.py"
+shell = "nix develop .#quantize"
+args = ["--model", "$CKPT", "--out", "$WORK/k3_derived", "--derived", "--farm", "$WORK/k3_farm"]
+produces = ["model-idx-derived-00001.safetensors"]
+
+[objects]
+script = "scripts/build_gfx942.sh"
+env = { PLOW_DECODE_BATCH = "32", PLOW_GEMV_MM = "16", PLOW_GEMV_WALK = "1", PLOW_K3_DECODE_MXFP4_PROJ = "0", JOBS = "8" }
+
+# The ladder's narrow rungs. Each is a PARTIAL object directory, valid only as a
+# rung override: `PLOW_ROWS_ONLY` builds one stem, and the grouped override is
+# required because ladder B1 uses grouped MXFP4 expert packets even at one row.
+[[objects.lowrung]]
+max = 1
+env = { PLOW_DECODE_BATCH = "1", PLOW_K3_DECODE_GROUPED = "1", PLOW_K3_DECODE_MXFP4_PROJ = "0", PLOW_ROWS_ONLY = "interp_decode_fp8kv_k3", JOBS = "2" }
+
+[[objects.lowrung]]
+max = 2
+env = { PLOW_DECODE_BATCH = "2", PLOW_K3_DECODE_MXFP4_PROJ = "0", PLOW_ROWS_ONLY = "interp_decode_fp8kv_k3", JOBS = "2" }
+
+[[objects.lowrung]]
+max = 4
+env = { PLOW_DECODE_BATCH = "4", PLOW_K3_DECODE_MXFP4_PROJ = "0", PLOW_ROWS_ONLY = "interp_decode_fp8kv_k3", JOBS = "2" }
+
+[[objects.lowrung]]
+max = 8
+env = { PLOW_DECODE_BATCH = "8", PLOW_K3_DECODE_MXFP4_PROJ = "0", PLOW_ROWS_ONLY = "interp_decode_fp8kv_k3", JOBS = "2" }
+
+# The packet and the object settings are a pair. `PLOW_L2_PLACE` is the
+# compiler half of the runtime's XCD-local dispatch; `PLOW_GLM_GEMV_WG` is
+# historical naming that caps ordinary GEMV-family packet ownership while
+# leaving the sharded vocabulary head at 304 CUs.
+[emit]
+env = { K3_FULL = "1", PLOW_FP8_KV = "1", PLOW_MXFP4 = "1", PLOW_L2_PLACE = "1", PLOW_MLA_PF_V2 = "1", PLOW_DECODE_BATCH = "32", PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32", PLOW_GEMV_MM = "16", PLOW_GEMV_WALK = "1", PLOW_GLM_GEMV_WG = "128" }
+args = [
+  "--emit", "devblob",
+  "--arch", "gfx942",
+  "--gpu", "MI325X",
+  "--num-gpus", "8",
+  "--parallel", "tp",
+  "--max-ctx", "32768",
+  "--n-cu", "304",
+]
+
+# These become `bundle.json`'s `runtime_env`, so the settings this variant was
+# validated with travel WITH it instead of living in a shell history. `serve`
+# applies them as defaults and logs any operator override.
+[serve]
+env = { PLOW_L2_PLACE_DISPATCH = "1", PLOW_MLA_PF_V2 = "1", PLOW_TP_AUDIT_COMPACT = "1", PLOW_CTR_DBUF = "1", PLOW_STATE_CLEAR_DEVICE = "1" }
+lowrung_from_objects = true
+
+# Depth 2 is mandatory: depth 1 has no latent MoE layer, so a depth-1 pass
+# proves nothing about the path that matters.
+[[gates]]
+name = "tp-logit-equivalence"
+cmd = "scripts/k3_tp_equivalence.sh"
+env = { PLOW_K3_LAYERS = "1,2" }
+
+[[gates]]
+name = "gsm8k"
+expect = "197/200"
+
+[measured]
+tok_s = 131.162
+p50_tpot_ms = 238.49
+concurrency = 32
+input_len = 32
+output_len = 2048
+client = "vllm 0.27.0 bench serve"
+
+# Reproduction gates at THIS commit, checkpoint and nix lock. They are not a
+# promise that another revision reproduces them.
+[artifacts]
+"plowrt" = "1ebb5ee5d7ee8a11cfc352c8cf28d684d457ac0b5a6a7e90530822cd76f45ad2"
+"model.pkt" = "f1f260d69105dffab3a7bd7f256d5fcbc215609f44c033c2cbb025949d14c709"
+"interp_decode_fp8kv_k3.elf" = "4c0d2ef95a2bef839965c977d53c873b74c1a1c50c92e0655e132e1bcfa16393"
+"interp_decode_fp8kv_k3_gq.elf" = "cc1c82c5d109150c6f29ae8c47cfc9b7fdcec6e4ead023a779dc60aaddeb999c"

@@ -1,0 +1,31 @@
+# Qwen3.5 Gated DeltaNet on MI300X — REFUSED.
+#
+# 10 of the 11 GDN opcodes have AMD arms; op 146 `QWEN_GDN_PREFILL` does not,
+# and on AMD a missing arm does not trap — it silently writes nothing. The emit
+# refusal is therefore the thing standing between this model and fluent wrong
+# output, which is why it is recorded rather than worked around.
+
+schema = "plow.recipe.v1"
+namespace = "infervisor"
+name = "qwen3.5-gdn"
+label = "gfx942-mi300x-tp1"
+network = "qwen3.5"
+status = "refused"
+plow_git = "c7a6a0b782d3db58bc0e281dea54e16632c4d1dd"
+doc = "docs/amd/qwen35-gdn-mi300x.md"
+
+refusal = "crates/devgen/src/qwen35.rs:1071 — plowc refuses Qwen3.5 for any AMD target"
+unblocked_by = "an AMD arm for op 146 QWEN_GDN_PREFILL; see docs/amd/qwen35-gdn-mi300x.md §'What still refuses'"
+
+[target]
+vendor = "amd"
+isa = "gfx942"
+sku = "MI300X"
+units = 304
+num_gpus = 1
+parallel = "tp"
+
+[checkpoint]
+source = "hf:Qwen/Qwen3.5"
+shards = 0
+layout = "hf-safetensors"

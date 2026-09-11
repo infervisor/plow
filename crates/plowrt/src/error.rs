@@ -84,6 +84,13 @@ pub enum RuntimeError {
     #[error("context length exceeded: {0}")]
     ContextLength(String),
 
+    /// Asset distribution: the registry, the local store, a manifest, or the
+    /// checkpoint farm. SEPARATE from [`Device`](Self::Device) because none of
+    /// these involve a driver — reporting "device error: this model has not been
+    /// pulled" sends a reader to the GPU when the fault is a missing download.
+    #[error("distribution error: {0}")]
+    Dist(String),
+
     #[error("{0}")]
     Msg(String),
 }

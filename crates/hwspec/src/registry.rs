@@ -92,10 +92,45 @@ pub fn lookup(name: &str) -> Option<&'static GpuSpec> {
         .find(|s| s.name.eq_ignore_ascii_case(canonical))
 }
 
+/// Resolve a *probed* device to its spec: the reverse of [`lookup`], which only
+/// answers to a human SKU string.
+///
+/// A live agent reports an ISA and a unit count, not a marketing name — ROCr's
+/// `HSA_AGENT_INFO_NAME` is literally `gfx942`, and `lookup("gfx942")` is
+/// `None`. This closes that direction so a runtime can identify itself.
+///
+/// `units` is an exact match: it is a selection key everywhere else (a packet's
+/// `stream_ofs`/`stream_len` are `[n_cu]` tables indexed by workgroup), so a
+/// near miss is a different machine, not a close one.
+///
+/// `mem_bytes` is matched by proximity rather than equality, and it is what
+/// separates parts that are otherwise identical: **MI300X and MI325X are both
+/// gfx942 with 304 CUs** and differ only in capacity (192 vs 256 GiB). A live
+/// probe reports usable pool bytes, always somewhat under the spec sheet, so
+/// requiring equality here would match nothing.
+pub fn from_probe(
+    isa: crate::isa::IsaLevel,
+    units: u32,
+    mem_bytes: u64,
+) -> Option<&'static GpuSpec> {
+    let mut best: Option<(&'static GpuSpec, u64)> = None;
+    for spec in ALL.iter().copied() {
+        if crate::isa::IsaLevel::from_spec(spec) != Some(isa) || spec.sm_count != units {
+            continue;
+        }
+        let delta = spec.mem.capacity.0.abs_diff(mem_bytes);
+        if best.is_none_or(|(_, b)| delta < b) {
+            best = Some((spec, delta));
+        }
+    }
+    best.map(|(s, _)| s)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::spec::InterconnectKind;
+    use crate::units::Bytes;
 
     #[test]
     fn every_spec_has_copy_engines() {
@@ -218,5 +253,57 @@ mod tests {
     fn unknown_name_returns_none() {
         assert!(lookup("totally fake gpu").is_none());
         assert!(lookup("").is_none());
+    }
+
+    // The direction a live runtime needs: an agent reports `gfx942`, never
+    // "MI325X". `lookup` cannot answer this and is not expected to.
+    #[test]
+    fn a_probed_isa_string_is_not_a_model_name() {
+        assert!(lookup("gfx942").is_none());
+        assert!(lookup("sm_90a").is_none());
+    }
+
+    // MI300X and MI325X are the same die at gfx942/304 CUs. Capacity is the only
+    // thing that separates them, which is why the HSA memory probe is
+    // load-bearing rather than a nicety.
+    #[test]
+    fn capacity_separates_two_parts_that_are_otherwise_identical() {
+        use crate::isa::IsaLevel;
+        let mi300 = from_probe(IsaLevel::Gfx942, 304, Bytes::gib(192).0).unwrap();
+        let mi325 = from_probe(IsaLevel::Gfx942, 304, Bytes::gib(256).0).unwrap();
+        assert_eq!(mi300.name, "MI300X");
+        assert_eq!(mi325.name, "MI325X");
+        assert_eq!(mi300.sm_count, mi325.sm_count);
+        assert_eq!(
+            IsaLevel::from_spec(mi300),
+            IsaLevel::from_spec(mi325),
+            "same ISA, so only capacity can tell them apart"
+        );
+    }
+
+    // A live pool reports less than the spec sheet (carve-outs, ECC, the
+    // runtime's own reservations), so proximity is the rule, not equality.
+    #[test]
+    fn a_probe_under_the_spec_sheet_still_resolves() {
+        use crate::isa::IsaLevel;
+        let probed = Bytes::gib(256).0 - (4u64 << 30);
+        assert_eq!(
+            from_probe(IsaLevel::Gfx942, 304, probed).unwrap().name,
+            "MI325X"
+        );
+        let probed = Bytes::gib(192).0 - (3u64 << 30);
+        assert_eq!(
+            from_probe(IsaLevel::Gfx942, 304, probed).unwrap().name,
+            "MI300X"
+        );
+    }
+
+    // Unit count is a hard key everywhere else in the stack; a near miss is a
+    // different machine, not a close one.
+    #[test]
+    fn unit_count_must_match_exactly_and_an_unknown_part_is_none() {
+        use crate::isa::IsaLevel;
+        assert!(from_probe(IsaLevel::Gfx942, 303, Bytes::gib(192).0).is_none());
+        assert!(from_probe(IsaLevel::Gfx950, 304, Bytes::gib(192).0).is_none());
     }
 }

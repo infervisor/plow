@@ -1214,6 +1214,12 @@ fi
 
 # Both scheduler twins: which one a packet needs is decided by the packet
 # (gq_seg_ofs), not by this build, and plowrt opens the twin by literal name.
+# PLOW_DEFINES_ONLY=1 resolves every axis and writes build_defines.json without
+# compiling anything. `scripts/check_recipe.py` uses it to verify that a recipe's
+# `[objects].env` produces the `-D` set it claims — seconds instead of the ~25
+# minutes a full build takes. The defines block below is the SAME code either
+# way, so what this mode reports is what a real build would compile.
+if [ "${PLOW_DEFINES_ONLY:-0}" = 0 ]; then
 printf '%s\n' "${ROWS[@]}" | while IFS='|' read -r stem axes; do
   echo "$stem|$axes"
   case "$stem" in
@@ -1221,6 +1227,7 @@ printf '%s\n' "${ROWS[@]}" | while IFS='|' read -r stem axes; do
     *) echo "${stem}_gq|$axes $AX_GQ" ;;
   esac
 done | xargs -P "$JOBS" -I{} bash -c 'IFS="|" read -r s a <<< "{}"; one "$s" $a'
+fi
 
 # THE `-D` SET EACH OBJECT WAS ACTUALLY COMPILED WITH, written next to the objects.
 #
@@ -1252,6 +1259,11 @@ done | xargs -P "$JOBS" -I{} bash -c 'IFS="|" read -r s a <<< "{}"; one "$s" $a'
   printf '%s "test_kernels": "-DPLOW_ARCH_SUFFIX=%s"' "$sep" "$ARCH"
   printf '\n}\n'
 } > build_defines.json
+
+if [ "${PLOW_DEFINES_ONLY:-0}" != 0 ]; then
+  echo ">>> $OUT/build_defines.json written (PLOW_DEFINES_ONLY: nothing compiled)"
+  exit 0
+fi
 
 # test_kernels.elf -- the golden __device__ wrappers, which call the SAME op_*.h bodies the
 # interpreter runs, so they must be rebuilt WITH it or a test passes against a stale kernel.
