@@ -226,9 +226,17 @@ template <int W> __device__ __forceinline__ int fa90_cm_off(int r, int c) {
 #ifndef PLOW_NV_FA_WGITEM
 #define PLOW_NV_FA_WGITEM 0
 #endif
+#ifndef PLOW_NV_FA_WGITEM_ONE
+#define PLOW_NV_FA_WGITEM_ONE 0
+#endif
 #ifndef PLOW_NV_FA_GQA2_PAIR
 #define PLOW_NV_FA_GQA2_PAIR 0
 #endif
+#if PLOW_NV_FA_WGITEM_ONE && (!PLOW_NV_FA_WGITEM || PLOW_NV_FA_GQA2_PAIR)
+#error "one-warpgroup attention experiment requires unpaired PLOW_NV_FA_WGITEM"
+#endif
+#define FA_SM90_WGI_ONE_FLOATS(HD, BQ, BKV)                                                       \
+    ((2 * ((BQ) * (HD) + 2 * FA_SM90_NS * (BKV) * (HD) + (BQ) * (BKV) + 512) + 1024 + 3) / 4)
 
 __device__ __forceinline__ void fa90_wg_bar(int wg) {
     asm volatile("bar.sync %0, %1;" ::"r"(wg + 1), "r"(128) : "memory");
@@ -311,8 +319,9 @@ __device__ void d_flash_prefill_sm90_wgitem(
                  (GQA2_PAIR ? n_kv_head : n_head) * nsplit;
     }
 
-    for (unsigned witem = GQA2_PAIR ? slice : slice * 2u + (unsigned)wg;
-         witem < n_work; witem += GQA2_PAIR ? nblk : nblk * 2u) {
+    constexpr bool ONE_WG = PLOW_NV_FA_WGITEM_ONE != 0;
+    for (unsigned witem = GQA2_PAIR || ONE_WG ? slice : slice * 2u + (unsigned)wg;
+         witem < n_work; witem += GQA2_PAIR || ONE_WG ? nblk : nblk * 2u) {
         unsigned sp, h, hkv, q0, sq = seq_q, skv = seq_kv, qp0 = q_pos0, ns = nsplit;
         size_t qoff = 0, kvoff = 0;
         const void* item_mapkv = mapkv;

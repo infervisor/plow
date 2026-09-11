@@ -383,7 +383,7 @@ fn projection_segments(
     let rows = packet::devbuild::program_rows(program.t);
     if match phase {
         ProjectionPhase::Decode => !(1..=32).contains(&rows),
-        ProjectionPhase::Prefill(_) => !(1..=128).contains(&rows),
+        ProjectionPhase::Prefill(_) => rows > plow_asset::segment_roles::CUBLASLT_PREFILL_MAX_ROWS,
     } || program.l2_domains != 0
         || program.gq_stream.is_empty()
     {
@@ -636,7 +636,7 @@ mod tests {
 
     #[test]
     fn accepts_only_measured_sm90_bf16_prefill_cells() {
-        for rows in [1, 2, 4, 8, 16, 32, 64, 128] {
+        for rows in plow_asset::segment_roles::CUBLASLT_PREFILL_ROWS {
             for k in [8192, 15360] {
                 let (program, tensors) = prefill_fixture(rows, k);
                 let routes = prefill_segments(&program, &tensors, &roles(), "sm90a").unwrap();
@@ -647,7 +647,8 @@ mod tests {
 
         for (profile, rows, n, k) in [
             ("sm120", 128, 3840, 15360),
-            ("sm90a", 129, 3840, 15360),
+            ("sm90a", 64, 3840, 15360),
+            ("sm90a", 1024, 3840, 15360),
             ("sm90a", 128, 4096, 3840),
             ("sm90a", 128, 3840, 4096),
         ] {

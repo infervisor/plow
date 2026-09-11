@@ -17,11 +17,12 @@ pub fn is_projection(role: u8) -> bool {
     matches!(role, CUBLASLT | NATIVE_DECODE_TC)
 }
 
-pub const CUBLASLT_PREFILL_MAX_ROWS: u32 = 128;
+pub const CUBLASLT_PREFILL_MAX_ROWS: u32 = 512;
+pub const CUBLASLT_PREFILL_ROWS: [u32; 3] = [128, 256, 512];
 
 pub fn cublaslt_prefill_bf16(profile: &str, m: u32, n: u32, k: u32) -> bool {
     matches!(profile, "sm90a" | "sm_90a")
-        && (1..=CUBLASLT_PREFILL_MAX_ROWS).contains(&m)
+        && CUBLASLT_PREFILL_ROWS.contains(&m)
         && matches!((n, k), (3840, 15360) | (3840, 8192))
 }
 
@@ -222,7 +223,7 @@ mod tests {
     #[test]
     fn cublaslt_prefill_policy_is_exactly_the_measured_sm90_bf16_cells() {
         for profile in ["sm90a", "sm_90a"] {
-            for m in [1, 2, 4, 8, 16, 32, 64, 128] {
+            for m in CUBLASLT_PREFILL_ROWS {
                 assert!(cublaslt_prefill_bf16(profile, m, 3840, 15360));
                 assert!(cublaslt_prefill_bf16(profile, m, 3840, 8192));
             }
@@ -231,7 +232,8 @@ mod tests {
             ("sm120", 128, 3840, 15360),
             ("gfx942", 128, 3840, 8192),
             ("sm90a", 0, 3840, 15360),
-            ("sm90a", 129, 3840, 15360),
+            ("sm90a", 64, 3840, 15360),
+            ("sm90a", 1024, 3840, 15360),
             ("sm90a", 128, 15360, 3840),
             ("sm90a", 128, 3840, 4096),
         ] {

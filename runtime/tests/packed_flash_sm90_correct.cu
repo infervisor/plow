@@ -7,7 +7,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <chrono>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "dev_isa.h"
@@ -31,6 +33,9 @@ static const char* interpreter_path = nullptr;
 static const char* snapshot_path = nullptr;
 static bool lean_hd512 = false;
 static float attention_scale = 0.0f;
+static unsigned test_kv_length = 16384;
+static bool campaign_timing = false;
+static unsigned test_seed = 0;
 
 #ifndef PLOW_TEST_FA_ROWS
 #define PLOW_TEST_FA_ROWS 0
@@ -40,7 +45,7 @@ static float attention_scale = 0.0f;
 #endif
 static_assert(PLOW_TEST_FA_ROWS >= 0 && PLOW_TEST_FA_ROWS <= 16384);
 constexpr unsigned heads = 16, capacity = PLOW_TEST_FA_ROWS ? PLOW_TEST_FA_ROWS : 128;
-constexpr unsigned real_rows = PLOW_TEST_FA_ROWS ? PLOW_TEST_FA_ROWS : 98;
+static unsigned test_rows = PLOW_TEST_FA_ROWS ? PLOW_TEST_FA_ROWS : 98;
 static unsigned blocks = 132;
 
 template<int HD, int BKV>
@@ -52,6 +57,12 @@ __global__ void run_attention(const bf16* q, const bf16* k, const bf16* v,
     d_flash_prefill_mux<HD,64,BKV>(req, partial, stats, q, k, v, out,
         capacity, 16384, heads, kv_heads, 0, window, 1, stride, mask,
         scale, blockIdx.x, nblk, arena, maps);
+}
+
+__global__ void evict_attention_cache(unsigned* data, size_t count) {
+    for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < count;
+         i += size_t(gridDim.x) * blockDim.x)
+        data[i] += 1;
 }
 
 static std::vector<bf16> values(size_t n, uint32_t seed) {
@@ -73,14 +84,20 @@ template<class T> static T* upload(const std::vector<T>& host) {
 template<int HD, int BKV> static bool check(unsigned kv_heads, unsigned stride,
                                           unsigned mask, unsigned window, bool tma, bool profile) {
     const float scale = attention_scale > 0.0f ? attention_scale : 1.0f / std::sqrt(float(HD));
-    const auto q = values(size_t(capacity) * heads * HD, 123);
-    const auto k = values(size_t(3) * kv_heads * stride * HD, 456);
-    const auto v = values(k.size(), 789);
+    const auto q = values(size_t(capacity) * heads * HD, 123u ^ (test_seed * 0x9e3779b9u));
+    const auto k = values(size_t(3) * kv_heads * stride * HD, 456u ^ (test_seed * 0x85ebca6bu));
+    const auto v = values(k.size(), 789u ^ (test_seed * 0xc2b2ae35u));
     // Two ragged requests use reversed, noncontiguous slots; the last 30 rows are padding.
     const std::vector<int> req = PLOW_TEST_FA_ROWS
-        ? std::vector<int>{1, 0, int(real_rows), 0, 16384}
+        ? std::vector<int>{1, 0, int(test_rows), 0, int(test_kv_length)}
         : std::vector<int>{2, 0, 65, 2, 97, 65, 33, 0, 16384};
     bf16* dq = upload(q), *dk = upload(k), *dv = upload(v), *out;
+    unsigned* trash = nullptr;
+    constexpr size_t eviction_bytes = 256ull << 20;
+    if (campaign_timing) {
+        CK(cudaMalloc(&trash, eviction_bytes));
+        CK(cudaMemset(trash, 0, eviction_bytes));
+    }
     int* dr = upload(req);
     std::vector<CUtensorMap> maps(6);
     CUtensorMap* dm = nullptr;
@@ -198,7 +215,11 @@ template<int HD, int BKV> static bool check(unsigned kv_heads, unsigned stride,
     CK(cudaEventCreate(&start)); CK(cudaEventCreate(&stop));
     std::vector<float> samples;
     const unsigned repeats = interpreter ? 1 : 10;
-    for (unsigned sample = 0; sample < (profile ? 0u : interpreter ? 21u : 7u); ++sample) {
+    const unsigned sample_count = campaign_timing ? 15u : interpreter ? 21u : 7u;
+    for (unsigned sample = 0; sample < (profile ? 0u : sample_count); ++sample) {
+        if (campaign_timing) std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        if (campaign_timing)
+            evict_attention_cache<<<blocks,256>>>(trash, eviction_bytes / sizeof(unsigned));
         reset_packet();
         CK(cudaEventRecord(start));
         for (unsigned repeat = 0; repeat < repeats; ++repeat) launch();
@@ -218,7 +239,7 @@ template<int HD, int BKV> static bool check(unsigned kv_heads, unsigned stride,
     for (size_t i = 0; i < got.size(); ++i) {
         const float value = __bfloat162float(got[i]);
         ok &= std::isfinite(value);
-        if (i >= size_t(real_rows) * heads * HD) ok &= value == 0.0f;
+        if (i >= size_t(test_rows) * heads * HD) ok &= value == 0.0f;
     }
     double worst = 0, max_error = 0;
     unsigned checked = 0;
@@ -257,11 +278,15 @@ template<int HD, int BKV> static bool check(unsigned kv_heads, unsigned stride,
         }
     }
     ok &= worst < 0.004 && max_error < 0.01;
-    std::printf("mode=%s HD=%d BKV=%d KV=%u window=%u maps=%d checked=%u worst_relL2=%.6g max_abs=%.6g warm_us=%.3f %s\n",
-                interpreter ? "interpreter" : "body",HD,interpreter ? 0 : BKV,kv_heads,window,int(tma),checked,worst,max_error,
+    std::printf("mode=%s seed=%u HD=%d BKV=%d KV=%u rows=%u kv_length=%u window=%u maps=%d checked=%u "
+                "worst_relL2=%.6g max_abs=%.6g best_us=%.3f median_us=%.3f %s\n",
+                interpreter ? "interpreter" : "body",test_seed,HD,interpreter ? 0 : BKV,kv_heads,
+                test_rows,test_kv_length,window,int(tma),checked,worst,max_error,
+                samples.empty() ? NAN : samples.front(),
                 samples.empty() ? NAN : samples[samples.size()/2],ok?"PASS":"FAIL");
     CK(cudaFree(dq)); CK(cudaFree(dk)); CK(cudaFree(dv)); CK(cudaFree(out));
     CK(cudaFree(partial)); CK(cudaFree(stats)); CK(cudaFree(dr));
+    if (trash) CK(cudaFree(trash));
     if (tma) { CK(cudaFree(table)); CK(cudaFree(dm)); }
     for (void* allocation : packet_allocations) CK(cudaFree(allocation));
     if (module) CD(cuModuleUnload(module));
@@ -272,6 +297,7 @@ int main(int argc, char** argv) {
     bool profile = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--profile") == 0) profile = true;
+        else if (std::strcmp(argv[i], "--campaign-timing") == 0) campaign_timing = true;
         else if (std::strcmp(argv[i], "--lean-hd512") == 0) lean_hd512 = true;
         else if (std::strcmp(argv[i], "--blocks") == 0 && i + 1 < argc) {
             char* end;
@@ -286,11 +312,32 @@ int main(int argc, char** argv) {
             attention_scale = std::strtof(argv[++i], &end);
             if (*end || !std::isfinite(attention_scale) || attention_scale <= 0.0f) return 2;
         }
+        else if (std::strcmp(argv[i], "--kv-length") == 0 && i + 1 < argc) {
+            char* end;
+            const auto value = std::strtoul(argv[++i], &end, 10);
+            if (*end || value == 0 || value > 16384) return 2;
+            test_kv_length = unsigned(value);
+        }
+        else if (std::strcmp(argv[i], "--rows") == 0 && i + 1 < argc) {
+            char* end;
+            const auto value = std::strtoul(argv[++i], &end, 10);
+            if (*end || value == 0 || value > capacity) return 2;
+            test_rows = unsigned(value);
+        }
+        else if (std::strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
+            char* end;
+            const auto value = std::strtoul(argv[++i], &end, 10);
+            if (*end || value > 1000000) return 2;
+            test_seed = unsigned(value);
+        }
         else return 2;
     }
     if (lean_hd512 && !interpreter_path) return 2;
     if (PLOW_TEST_FA_ROWS && !lean_hd512 && !PLOW_NV_FA512_KV64 &&
         !PLOW_TEST_FA_HD256_ONLY) return 2;
+    if (!PLOW_TEST_FA_ROWS && test_kv_length != 16384) return 2;
+    if (!PLOW_TEST_FA_ROWS && test_rows != 98) return 2;
+    if (test_kv_length < test_rows) return 2;
     bool ok = true;
     for (bool tma : {false, true}) {
 #if PLOW_TEST_FA_HD256_ONLY

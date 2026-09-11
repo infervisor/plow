@@ -7,9 +7,35 @@
 cmake_minimum_required(VERSION 3.18)
 
 option(PLOW_BENCH "Build the system-level benchmark suite" OFF)
+option(PLOW_BENCH_NV_BF16_SPLITK "Build the isolated Hopper BF16 split-K experiment" OFF)
+option(PLOW_BENCH_NV_BF16_DECODE_EXACT "Build the exact-shape Hopper BF16 decode experiment" OFF)
 
 if(NOT PLOW_BENCH)
     return()
+endif()
+
+if(PLOW_BENCH_NV_BF16_DECODE_EXACT)
+    if(NOT PLOW_CUDA)
+        message(FATAL_ERROR "PLOW_BENCH_NV_BF16_DECODE_EXACT requires PLOW_CUDA=ON")
+    endif()
+    add_executable(bf16_decode_exact_sm90_bench nvidia/bf16_decode_exact_sm90_bench.cu)
+    target_link_libraries(bf16_decode_exact_sm90_bench PRIVATE cublasLt cuda)
+    set_target_properties(bf16_decode_exact_sm90_bench PROPERTIES
+        CUDA_ARCHITECTURES "90a" CUDA_STANDARD 17)
+endif()
+
+if(PLOW_BENCH_NV_BF16_SPLITK)
+    if(NOT PLOW_CUDA)
+        message(FATAL_ERROR "PLOW_BENCH_NV_BF16_SPLITK requires PLOW_CUDA=ON")
+    endif()
+    add_executable(bf16_splitk_sm90_bench nvidia/bf16_splitk_sm90_bench.cu)
+    target_include_directories(bf16_splitk_sm90_bench PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../nvidia
+        ${CMAKE_CURRENT_SOURCE_DIR}/../common
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+    target_link_libraries(bf16_splitk_sm90_bench PRIVATE cublasLt cuda)
+    set_target_properties(bf16_splitk_sm90_bench PROPERTIES
+        CUDA_ARCHITECTURES "90a" CUDA_STANDARD 17)
 endif()
 
 add_executable(control_queue_probe_test dispatch/control_queue_probe_test.c)

@@ -625,6 +625,73 @@ fn full_logit_record(
     })
 }
 
+fn qualified_full_logit_record(
+    rung: usize,
+    packet_sha256: &str,
+    reference_sha256: &str,
+    actual: &FullLogitReference,
+    expected: &FullLogitReference,
+    require_bitwise: bool,
+) -> serde_json::Value {
+    assert_eq!(actual.bits.len(), expected.bits.len());
+    let mut squared_error = 0.0f64;
+    let mut squared_reference = 0.0f64;
+    let mut max_abs = 0.0f64;
+    for (&got, &want) in actual.bits.iter().zip(&expected.bits) {
+        let got = f64::from(f32::from_bits(got));
+        let want = f64::from(f32::from_bits(want));
+        let error = got - want;
+        squared_error += error * error;
+        squared_reference += want * want;
+        max_abs = max_abs.max(error.abs());
+    }
+    let rel_l2 = if squared_reference == 0.0 {
+        squared_error.sqrt()
+    } else {
+        (squared_error / squared_reference).sqrt()
+    };
+    let bitwise_equal = actual.bits == expected.bits;
+    let greedy_equal = actual.token == expected.token;
+    let all_finite = actual.all_finite && expected.all_finite;
+    let correct =
+        all_finite && greedy_equal && rel_l2 <= 1.0e-2 && (!require_bitwise || bitwise_equal);
+    serde_json::json!({
+        "profile_key": format!("full-logit/prefill-role/r{rung}"),
+        "phase": "prefill-role",
+        "rung": rung,
+        "packet_sha256": packet_sha256,
+        "reference_sha256": reference_sha256,
+        "isolated": true,
+        "snapshots": 1,
+        "vocab": GEMMA4_VOCAB,
+        "correct": correct,
+        "bitwise_equal": bitwise_equal,
+        "require_bitwise": require_bitwise,
+        "greedy_equal": greedy_equal,
+        "candidate_token": actual.token,
+        "reference_token": expected.token,
+        "all_finite": all_finite,
+        "rel_l2": rel_l2,
+        "max_abs": max_abs,
+        "max_rel_l2": 1.0e-2,
+    })
+}
+
+fn assert_program_layout_equal(actual: &DevProg, expected: &DevProg) {
+    assert_eq!(actual.t, expected.t);
+    assert_eq!(actual.packed_prefill_only, expected.packed_prefill_only);
+    assert_eq!(actual.n_counter, expected.n_counter);
+    assert_eq!(actual.insts, expected.insts);
+    assert_eq!(actual.stream, expected.stream);
+    assert_eq!(actual.stream_ofs, expected.stream_ofs);
+    assert_eq!(actual.stream_len, expected.stream_len);
+    assert_eq!(actual.waits, expected.waits);
+    assert_eq!(actual.succs, expected.succs);
+    assert_eq!(actual.gq_stream, expected.gq_stream);
+    assert_eq!(actual.gq_seg_ofs, expected.gq_seg_ofs);
+    assert_eq!(actual.l2_domains, expected.l2_domains);
+}
+
 fn write_full_logit_records(env_name: &str, expected: usize, records: &[serde_json::Value]) {
     assert_eq!(records.len(), expected);
     let output = std::path::PathBuf::from(std::env::var(env_name).unwrap());
@@ -712,6 +779,113 @@ fn gpu_isolated_prefill_rungs_match_widest_logits() {
         e.retire_slot(0, false);
     }
     write_full_logit_records("TEST_PREFILL_RUNG_LOGITS_OUT", GEMMA4_PREFILL_RUNGS.len(), &records);
+    assert!(records.iter().all(|r| r["correct"] == true));
+}
+
+#[test]
+#[ignore = "Gemma-4 prefill-role full-logit gate; run via scripts/gemma4_prefill_role_full_logits.sh"]
+fn gpu_prefill_roles_match_control_logits() {
+    assert_eq!(std::env::var("TEST_PREFILL_RUNG_GPU").as_deref(), Ok("1"));
+    let assets = std::path::PathBuf::from(std::env::var("TEST_PREFILL_RUNG_ASSETS").unwrap());
+    let baseline = std::path::PathBuf::from(std::env::var("TEST_PREFILL_RUNG_BASELINE").unwrap());
+    let expected_sha256 = std::env::var("TEST_RUNG_PACKET_SHA256").unwrap();
+    let role_rungs: std::collections::BTreeSet<usize> = std::env::var("TEST_PREFILL_ROLE_RUNGS")
+        .unwrap()
+        .split(',')
+        .map(|value| value.parse().unwrap())
+        .collect();
+    assert!(!role_rungs.is_empty());
+    let (candidate_blob, candidate_sha256) = diagnostic_packet(&assets);
+    let (reference_blob, reference_sha256) = diagnostic_packet(&baseline);
+    assert_diagnostic_packet(&expected_sha256, &candidate_sha256);
+    assert_ne!(
+        candidate_sha256, reference_sha256,
+        "candidate and control packets are identical"
+    );
+    assert_eq!(candidate_blob.progs.len(), reference_blob.progs.len());
+    for (actual, expected) in candidate_blob.progs.iter().zip(&reference_blob.progs) {
+        assert_program_layout_equal(actual, expected);
+    }
+    assert!(
+        candidate_blob
+            .tensors
+            .iter()
+            .map(|t| (&t.name, t.bytes))
+            .eq(reference_blob.tensors.iter().map(|t| (&t.name, t.bytes))),
+        "candidate tensor geometry differs from control"
+    );
+    assert_eq!(
+        candidate_blob
+            .prefill_progs()
+            .iter()
+            .map(|p| p.t as usize)
+            .collect::<Vec<_>>(),
+        GEMMA4_PREFILL_RUNGS
+    );
+    drop((candidate_blob, reference_blob));
+
+    let be = Arc::new(CudaBackend::new(0).unwrap());
+    let mut references = Vec::with_capacity(GEMMA4_PREFILL_RUNGS.len());
+    {
+        let mut e = diagnostic_engine(&be, &baseline);
+        assert_eq!(
+            e.prefill.iter().map(|p| p.t as usize).collect::<Vec<_>>(),
+            GEMMA4_PREFILL_RUNGS
+        );
+        assert!(e.prefill.iter().all(|p| !p
+            .packet_segment_roles
+            .contains(&plow_asset::segment_roles::CUBLASLT)));
+        for &rows in &GEMMA4_PREFILL_RUNGS {
+            let selected = e.pick_prefill_bucket(rows, usize::MAX);
+            assert_eq!(e.prefill[selected].t as usize, rows);
+            let prompt = diagnostic_prompt(rows, rows);
+            e.begin_slot(0, rows + 1).unwrap();
+            let token = e.prefill_slot(0, &prompt).unwrap();
+            references.push(diagnostic_logits(&mut e, 0, token));
+            e.retire_slot(0, false);
+        }
+    }
+
+    let mut e = diagnostic_engine(&be, &assets);
+    let mut role_segments = 0usize;
+    for bucket in &e.prefill {
+        let count = bucket
+            .packet_segment_roles
+            .iter()
+            .filter(|&&role| role == plow_asset::segment_roles::CUBLASLT)
+            .count();
+        if role_rungs.contains(&(bucket.t as usize)) {
+            assert!(count > 0, "M={} has no cuBLASLt role", bucket.t);
+        } else {
+            assert_eq!(count, 0, "M={} unexpectedly has a cuBLASLt role", bucket.t);
+        }
+        role_segments += count;
+    }
+    assert!(role_segments > 0);
+
+    let mut records = Vec::with_capacity(GEMMA4_PREFILL_RUNGS.len());
+    for (index, &rows) in GEMMA4_PREFILL_RUNGS.iter().enumerate() {
+        let selected = e.pick_prefill_bucket(rows, usize::MAX);
+        assert_eq!(e.prefill[selected].t as usize, rows);
+        let prompt = diagnostic_prompt(rows, rows);
+        e.begin_slot(0, rows + 1).unwrap();
+        let token = e.prefill_slot(0, &prompt).unwrap();
+        let actual = diagnostic_logits(&mut e, 0, token);
+        records.push(qualified_full_logit_record(
+            rows,
+            &candidate_sha256,
+            &reference_sha256,
+            &actual,
+            &references[index],
+            !role_rungs.contains(&rows),
+        ));
+        e.retire_slot(0, false);
+    }
+    write_full_logit_records(
+        "TEST_PREFILL_RUNG_LOGITS_OUT",
+        GEMMA4_PREFILL_RUNGS.len(),
+        &records,
+    );
     assert!(records.iter().all(|r| r["correct"] == true));
 }
 
