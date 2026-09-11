@@ -326,7 +326,9 @@ impl SharedPrefix {
                 (cache_cap / total_row_bytes * row_bytes * tensors.len() as u64).max(1)
             };
             let mut pool = VmmKv::new_tensors(ops.clone(), geometry, granularity, cap, &keys)?;
-            pool.enable_block_pool(pool_cap / total_row_bytes * row_bytes * tensors.len() as u64);
+            pool.enable_block_recycling(
+                pool_cap / total_row_bytes * row_bytes * tensors.len() as u64,
+            );
             groups.push(Group { pool, tensors });
         }
         Ok(Self {
@@ -899,23 +901,15 @@ mod tests {
     }
 
     #[test]
-    fn block_pool_recycles_all_cache_groups_within_one_budget() {
+    fn block_pool_grows_on_demand_and_recycles_all_groups_within_one_budget() {
         let ops = Arc::new(Driver::default());
         let layout = Layout::from_tensors(&tensors(), 3, 256).unwrap();
         let budget = (512 + 128 + 256) * 256;
         let mut cache = SharedPrefix::new(ops.clone(), layout, 0, budget).unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while cache
-            .groups
-            .iter()
-            .any(|g| g.pool.stats().blocks_pooled < 2)
-        {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "block precreation did not finish"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
+        assert!(cache.groups.iter().all(|g| {
+            let stats = g.pool.stats();
+            stats.blocks_created == 0 && stats.blocks_live == 0 && stats.blocks_pooled == 0
+        }));
         cache.ensure_rows(0, 256).unwrap();
         let created: u64 = cache
             .groups
@@ -941,10 +935,14 @@ mod tests {
                 .sum::<u64>(),
             created
         );
-        assert!(cache
-            .groups
-            .iter()
-            .all(|g| g.pool.stats().blocks_reused > 2));
+        assert_eq!(
+            cache
+                .groups
+                .iter()
+                .map(|g| g.pool.stats().blocks_reused)
+                .sum::<u64>(),
+            created
+        );
         drop(cache);
         let memory = ops.0.lock().unwrap();
         assert!(memory.blocks.is_empty());
