@@ -3254,7 +3254,9 @@ fn packed_mla_compatible(prog: &DevProg) -> bool {
 /// cannot serve is the same for a body as for a packed program: gathered/sparse or NoPE flash.
 fn token_batch_body_compatible(prog: &DevProg) -> bool {
     !prog.insts.iter().any(|d| {
-        sparse_fp8(d)
+        // The band's SPARSE DECODE flash is the decode program's own packet and runs on the
+        // decode object (family 27); only sparse PREFILL flash has no packed arm.
+        (d.op == DevOp::FlashMlaPrefillFp8 as u16 && sparse_fp8(d))
             || d.op == DevOp::FlashGatherPrefill as u16
             || d.op == DevOp::IndexTpPf as u16
             || ((d.op == DevOp::FlashMlaPrefill as u16 || d.op == DevOp::FlashMlaPrefillFp8 as u16)
@@ -10076,6 +10078,18 @@ impl AmdEngine {
             .iter()
             .enumerate()
             .filter(|(_, p)| p.token_batch_body)
+            .filter(|&(i, _)| {
+                // Armed is not fires: a body the packed route would refuse at dispatch is left
+                // out HERE, by name, so the serve layer never plans a step onto it.
+                match self.check_packed_prefill_program(i) {
+                    Ok(_) => true,
+                    Err(e) => {
+                        tracing::warn!(program = i, rows = self.progs[i].t, error = %e,
+                            "token-batch body refused; not offered to the route");
+                        false
+                    }
+                }
+            })
             .filter_map(|(i, p)| token_batch_band(&self.pf_src[i]).map(|band| (i, p.t, band)))
             .collect()
     }
