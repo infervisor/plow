@@ -46,7 +46,9 @@ struct MoePrepareArgs {
     const unsigned* row_part;
     const float* row_weight;
     unsigned rows;
-    unsigned pad;
+    // Rows per sorted expert block: 32 for the 32x256 objects, 64 for the 64x256 tile.
+    // Plow aligns at 64, so a 64-row block maps 1:1 onto one meta group.
+    unsigned block_m;
 };
 static_assert(sizeof(MoePrepareArgs) == 104);
 
@@ -75,11 +77,12 @@ extern "C" __global__ void plow_moe_aiter_prepare(MoePrepareArgs a) {
         a.ids[i] = live ? token | ((part % 8u) << 24) : a.rows;
         a.weights[i] = live ? a.row_weight[i] : 0.0f;
     }
-    for (unsigned i = first; i < padded / 32u; i += stride) {
+    const unsigned per_group = 64u / a.block_m;
+    for (unsigned i = first; i < padded / a.block_m; i += stride) {
         unsigned lo = 0, hi = 256;
         while (lo < hi) {
             const unsigned mid = (lo + hi) / 2u;
-            if (a.meta[512u + mid + 1u] <= i / 2u) lo = mid + 1u;
+            if (a.meta[512u + mid + 1u] <= i / per_group) lo = mid + 1u;
             else hi = mid;
         }
         a.experts[i] = lo;
@@ -104,6 +107,7 @@ extern "C" __global__ void plow_moe_aiter_store(float* out, const unsigned short
 }
 
 extern "C" __device__ unsigned plow_moe_aiter_fp8_abi_1 = 1;
+extern "C" __device__ unsigned plow_moe_aiter_tile64_abi_1 = 1;
 
 struct MoeFlatPackArgs {
     uint4* gu;

@@ -7918,6 +7918,7 @@ impl AmdEngine {
                 rows.max(128),
                 blob.progs[dec_ix..].iter().any(has_moe_aiter),
                 use_resident_moe,
+                crate::config::RuntimeConfig::get().amd.moe_aiter_tile64,
                 &mut modules,
             )?)
         } else {

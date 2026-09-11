@@ -15,6 +15,13 @@ const OBJECT_HASH: &str = "65b4c0a0b290dd83039047c18e0bb86f4253790e926dce324ddb6
 const FLAT_OBJECT: &str = "fmoe_bf16_a16_blockscaleFp8_g1u1_vs_silu_1tg_16x128_flat_pf3.co";
 const FLAT_OBJECT_HASH: &str = "be7052284094e7cedeb266afb24d4d6723bdf4234ac391b2e5b29473d8ee8f06";
 
+// AITER's GLM-5 gfx942/304-CU tuning (a8w8_blockscale_tuned_fmoe_glm5_1.csv) selects this
+// 64-row persistent tile for the 6144/256/256/8 shape from 2048 tokens up; 1024 takes the
+// same tile non-persistent, below that the 32x256 objects. Same 448-byte ABI and kd layout.
+const TILE64_OBJECT: &str = "fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_psx_64x256.co";
+const TILE64_OBJECT_HASH: &str = "f8efb79a4ecfd80c7c4d6e20c797c7bdcdac26f1c22c825c640b239e07e88779";
+const TILE64_MIN_ROWS: u32 = 1024;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mode {
     Sorted,
@@ -354,7 +361,7 @@ const _: () = assert!(std::mem::size_of::<FlatRouteArgs>() == 32);
 struct PrepareArgs {
     pointers: [u64; 12],
     rows: u32,
-    pad: u32,
+    block_m: u32,
 }
 
 #[repr(C)]
@@ -384,6 +391,7 @@ pub(super) struct MoeAiter {
     flat: Option<(HsaKernel, HsaKernel)>,
     prepare: HsaKernel,
     moe: HsaKernel,
+    tile64: Option<HsaKernel>,
     store: HsaKernel,
     _scratch: DeviceMem,
     buffers: [u64; 11],
@@ -398,6 +406,7 @@ impl MoeAiter {
         rows: u32,
         flat_decode: bool,
         resident: bool,
+        tile64: bool,
         modules: &mut Vec<Module>,
     ) -> Result<Self> {
         if !(128..=8192).contains(&rows) {
@@ -431,12 +440,50 @@ impl MoeAiter {
             ));
         }
         modules.push(module);
+        let tile64 = if tile64 {
+            let path = dir.join(TILE64_OBJECT);
+            let mut image = std::fs::read(&path)
+                .map_err(|e| RuntimeError::Device(format!("{}: {e}", path.display())))?;
+            if plow_asset::decode_objects::image_sha256(&image) != TILE64_OBJECT_HASH {
+                return Err(RuntimeError::Device(
+                    "AITER 64-row MoE object hash does not match qualified ABI".into(),
+                ));
+            }
+            // Same descriptor layout as the 32x256 object: KERNARG_SIZE is left zero at 0x1d08.
+            image[0x1d08..0x1d0c].copy_from_slice(&448u32.to_le_bytes());
+            let module = EngineDevice::module_load(be, &image)?;
+            let moe = EngineDevice::get_function(
+                be,
+                &module,
+                "_ZN5aiter46fmoe_bf16_blockscaleFp8_g1u1_vs_ps_silu_64x256E",
+            )?;
+            if moe.kernarg_size() != 448
+                || moe.private_segment_size() != 0
+                || HsaBackend::kernel_lds_bytes(&moe) != 65536
+            {
+                return Err(RuntimeError::Device(
+                    "AITER 64-row MoE resource ABI mismatch".into(),
+                ));
+            }
+            modules.push(module);
+            tracing::info!(object = %path.display(), sha256 = TILE64_OBJECT_HASH, "64-row MoE prefill kernel loaded");
+            Some(moe)
+        } else {
+            None
+        };
         let path = dir.join("moe_aiter_adapter_gfx942.elf");
         let image = std::fs::read(&path)
             .map_err(|e| RuntimeError::Device(format!("{}: {e}", path.display())))?;
         if !super::amd::elf_symbol_names(&image).contains(&"plow_moe_aiter_fp8_abi_1") {
             return Err(RuntimeError::Device(
                 "AITER MoE adapter lacks ABI marker".into(),
+            ));
+        }
+        if tile64.is_some()
+            && !super::amd::elf_symbol_names(&image).contains(&"plow_moe_aiter_tile64_abi_1")
+        {
+            return Err(RuntimeError::Device(
+                "AITER MoE adapter lacks 64-row block ABI marker".into(),
             ));
         }
         if resident
@@ -544,6 +591,7 @@ impl MoeAiter {
             flat,
             prepare,
             moe,
+            tile64,
             store,
             _scratch: scratch,
             buffers,
@@ -624,12 +672,13 @@ impl MoeAiter {
         } else {
             workspace_out
         };
+        let tile64 = self.tile64.filter(|_| route.rows >= TILE64_MIN_ROWS);
         let prepare = PrepareArgs {
             pointers: [
                 q, qs, out, ids, weights, experts, valid, t[1], t[4], t[5], t[6], t[7],
             ],
             rows: route.rows,
-            pad: 0,
+            block_m: if tile64.is_some() { 64 } else { 32 },
         };
         be.launch(self.prepare, 304 * 4, 256, 0, bytemuck::bytes_of(&prepare))?;
         let mut args = [0u64; 56];
@@ -668,7 +717,13 @@ impl MoeAiter {
         {
             args[i * 2] = value;
         }
-        be.launch(self.moe, 304, 256, 0, bytemuck::cast_slice(&args))?;
+        be.launch(
+            tile64.unwrap_or(self.moe),
+            304,
+            256,
+            0,
+            bytemuck::cast_slice(&args),
+        )?;
         if route.mode == Mode::SortedBf16 {
             return Ok(());
         }
@@ -1062,7 +1117,7 @@ mod tests {
         let be = HsaBackend::new(0).unwrap();
         let mut modules = Vec::new();
         let dir = std::env::var("PLOW_TEST_AITER_DIR").unwrap();
-        let kernel = MoeAiter::load(&be, Path::new(&dir), 128, false, false, &mut modules).unwrap();
+        let kernel = MoeAiter::load(&be, Path::new(&dir), 128, false, false, false, &mut modules).unwrap();
         let upload = |bytes: &[u8]| {
             let m = EngineDevice::alloc(&be, bytes.len() as u64).unwrap();
             EngineDevice::upload(&be, &m, 0, bytes).unwrap();
@@ -1155,7 +1210,7 @@ mod tests {
         let mut modules = Vec::new();
         let dir = std::env::var("PLOW_TEST_AITER_DIR").unwrap();
         let mut kernel =
-            MoeAiter::load(&be, Path::new(&dir), 128, true, resident, &mut modules).unwrap();
+            MoeAiter::load(&be, Path::new(&dir), 128, true, resident, false, &mut modules).unwrap();
         let upload = |bytes: &[u8]| {
             let m = EngineDevice::alloc(&be, bytes.len() as u64).unwrap();
             EngineDevice::upload(&be, &m, 0, bytes).unwrap();
@@ -1237,33 +1292,302 @@ mod tests {
     #[test]
     #[ignore = "requires a gfx942 GPU lease and PLOW_TEST_AITER_DIR"]
     fn moe_aiter_hsa_dispatch() {
-        check_sorted_hsa(false, false);
+        check_sorted_hsa(false, false, false);
     }
 
     #[test]
     #[ignore = "requires a gfx942 GPU lease and PLOW_TEST_AITER_DIR with resident adapter"]
     fn moe_aiter_resident_sorted_hsa_dispatch() {
-        check_sorted_hsa(true, false);
+        check_sorted_hsa(true, false, false);
     }
 
     #[test]
     #[ignore = "requires a gfx942 GPU lease and PLOW_TEST_AITER_DIR"]
     fn moe_aiter_sorted_bf16_hsa_dispatch() {
-        check_sorted_hsa(false, true);
+        check_sorted_hsa(false, true, false);
     }
 
     #[test]
     #[ignore = "requires a gfx942 GPU lease and PLOW_TEST_AITER_DIR with resident adapter"]
     fn moe_aiter_resident_sorted_bf16_hsa_dispatch() {
-        check_sorted_hsa(true, true);
+        check_sorted_hsa(true, true, false);
     }
 
-    fn check_sorted_hsa(resident: bool, part16: bool) {
+    #[test]
+    #[ignore = "requires a gfx942 GPU lease and PLOW_TEST_AITER_DIR with the 64-row object"]
+    fn moe_aiter_tile64_hsa_dispatch() {
+        check_sorted_hsa(false, false, true);
+    }
+
+    #[test]
+    #[ignore = "requires a gfx942 GPU lease and PLOW_TEST_AITER_DIR with the 64-row object"]
+    fn moe_aiter_tile64_bf16_hsa_dispatch() {
+        check_sorted_hsa(false, true, true);
+    }
+
+    /// Same sorted inputs through the 32x256 and the 64x256 objects: both consume the identical
+    /// A8 quantization from `plow_moe_aiter_prepare`, so they may differ only by accumulation
+    /// order. Also prints warm medians for the single-GPU A/B; not a serving measurement.
+    #[test]
+    #[ignore = "requires a gfx942 GPU lease and PLOW_TEST_AITER_DIR with the 64-row object"]
+    fn moe_aiter_tile64_matches_tile32() {
         let be = HsaBackend::new(0).unwrap();
         let mut modules = Vec::new();
         let dir = std::env::var("PLOW_TEST_AITER_DIR").unwrap();
-        let mut kernel =
-            MoeAiter::load(&be, Path::new(&dir), 129, false, resident, &mut modules).unwrap();
+        let dir = Path::new(&dir);
+        let k32 = MoeAiter::load(&be, dir, 8192, false, false, false, &mut modules).unwrap();
+        let k64 = MoeAiter::load(&be, dir, 8192, false, false, true, &mut modules).unwrap();
+        let upload = |bytes: &[u8]| {
+            let m = EngineDevice::alloc(&be, bytes.len() as u64).unwrap();
+            EngineDevice::upload(&be, &m, 0, bytes).unwrap();
+            m
+        };
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // Signed FP8 integers in [-8, 8] (exact in e4m3) and per-block scales that differ.
+        let fp8 = |v: i32| -> u8 {
+            let magnitude: u8 = match v.unsigned_abs() {
+                0 => 0,
+                1 => 0x38,
+                2 => 0x40,
+                3 => 0x44,
+                4 => 0x48,
+                5 => 0x4a,
+                6 => 0x4c,
+                7 => 0x4e,
+                _ => 0x50,
+            };
+            magnitude | if v < 0 { 0x80 } else { 0 }
+        };
+        let weight_bytes: Vec<u8> = (0..3 * 256 * 256 * 6144usize)
+            .map(|_| fp8((next() % 17) as i32 - 8))
+            .collect();
+        let weight = upload(&weight_bytes);
+        let scales: Vec<f32> = (0..3 * 256 * 96)
+            .map(|_| 0.002 * (1.0 + (next() % 1000) as f32 / 1000.0))
+            .collect();
+        let scale = upload(bytemuck::cast_slice(&scales));
+        let wt_ptrs: Vec<u64> = (0..256 * 3)
+            .map(|i| weight.base + (i * 256 * 6144) as u64)
+            .collect();
+        let wt = upload(bytemuck::cast_slice(&wt_ptrs));
+        let scale_ptrs: Vec<u64> = (0..256 * 3)
+            .map(|i| scale.base + (i * 96 * 4) as u64)
+            .collect();
+        let st = upload(bytemuck::cast_slice(&scale_ptrs));
+        for rows in [1024u32, 2048, 4464, 8192] {
+            // Every row picks 8 distinct experts spread over all 256; group counts vary.
+            let mut per_expert: Vec<Vec<(u32, u32, f32)>> = vec![Vec::new(); 256];
+            let mut row_experts: Vec<Vec<(usize, f32)>> = vec![Vec::new(); rows as usize];
+            for row in 0..rows {
+                let base = (next() % 256) as u32;
+                for k in 0..8u32 {
+                    let e = (base + k * 37 + (next() % 5) as u32 * 3) % 256;
+                    let e = (0..256u32)
+                        .map(|d| (e + d) % 256)
+                        .find(|c| !per_expert[*c as usize].iter().any(|(r, _, _)| *r == row))
+                        .unwrap();
+                    let gate = 0.05 + (k as f32) * 0.02;
+                    per_expert[e as usize].push((row, row * 8 + k, gate));
+                    row_experts[row as usize].push((e as usize, gate));
+                }
+            }
+            let mut meta = vec![0u32; 769];
+            let mut rt = Vec::new();
+            let mut rp = Vec::new();
+            let mut rg = Vec::new();
+            let mut groups = 0u32;
+            for e in 0..256 {
+                meta[e] = rt.len() as u32;
+                meta[e + 256] = per_expert[e].len() as u32;
+                meta[e + 512] = groups;
+                let padded = (per_expert[e].len() as u32).div_ceil(64) * 64;
+                groups += padded / 64;
+                for i in 0..padded as usize {
+                    let (t, p, g) =
+                        per_expert[e]
+                            .get(i)
+                            .copied()
+                            .unwrap_or((u32::MAX, u32::MAX, 0.0));
+                    rt.push(t);
+                    rp.push(p);
+                    rg.push(g);
+                }
+            }
+            meta[768] = groups;
+            let x_bits: Vec<u16> = (0..rows as usize * 6144)
+                .map(|_| {
+                    let v = (next() % 2001) as f32 / 1000.0 - 1.0;
+                    (v.to_bits() >> 16) as u16
+                })
+                .collect();
+            let x = upload(bytemuck::cast_slice(&x_bits));
+            let output_bytes = rows as usize * 6144 * 4;
+            let out = upload(&vec![0xa5; output_bytes + 512]);
+            let meta = upload(bytemuck::cast_slice(&meta));
+            let rt = upload(bytemuck::cast_slice(&rt));
+            let rp = upload(bytemuck::cast_slice(&rp));
+            let rg = upload(bytemuck::cast_slice(&rg));
+            let table = [
+                out.base + 256,
+                x.base,
+                wt.base,
+                st.base,
+                meta.base,
+                rt.base,
+                rp.base,
+                rg.base,
+            ];
+            let route = Route {
+                inst: DevInst64 {
+                    t: [0, 1, 2, 3, 4, 5, 6, 7],
+                    i: [rows, 6144, 256, 256, 8, 64, 0, 0],
+                    ..Default::default()
+                },
+                rows,
+                mode: Mode::Sorted,
+            };
+            let mut results = Vec::new();
+            for (kernel, tile) in [(&k32, 32u32), (&k64, 64)] {
+                EngineDevice::upload(&be, &out, 0, &vec![0xa5; output_bytes + 512]).unwrap();
+                kernel
+                    .enqueue(&be, route, bytemuck::cast_slice(&table))
+                    .unwrap();
+                be.synchronize().unwrap();
+                let mut bytes = vec![0u8; output_bytes + 512];
+                EngineDevice::download(&be, &out, 0, &mut bytes).unwrap();
+                assert!(
+                    bytes[..256]
+                        .iter()
+                        .chain(&bytes[256 + output_bytes..])
+                        .all(|&x| x == 0xa5),
+                    "tile{tile} rows={rows}: guard bytes overwritten"
+                );
+                let values: Vec<f32> =
+                    bytemuck::cast_slice(&bytes[256..256 + output_bytes]).to_vec();
+                assert!(
+                    values.iter().all(|v| v.is_finite()),
+                    "tile{tile} rows={rows}: non-finite"
+                );
+                let mut samples = Vec::new();
+                for _ in 0..3 {
+                    kernel
+                        .enqueue(&be, route, bytemuck::cast_slice(&table))
+                        .unwrap();
+                }
+                be.synchronize().unwrap();
+                for _ in 0..15 {
+                    let start = std::time::Instant::now();
+                    kernel
+                        .enqueue(&be, route, bytemuck::cast_slice(&table))
+                        .unwrap();
+                    be.synchronize().unwrap();
+                    samples.push(start.elapsed().as_secs_f64() * 1e6);
+                }
+                samples.sort_by(|a, b| a.total_cmp(b));
+                results.push((tile, values, samples[samples.len() / 2]));
+            }
+            // FP64 reference on sampled rows from the dequantized weights and the BF16 input;
+            // the A8 activation quantization inside both objects is the only unmodelled term.
+            let decode = |byte: u8| -> f64 {
+                let sign = if byte & 0x80 != 0 { -1.0 } else { 1.0 };
+                let exp = i32::from((byte >> 3) & 0xf);
+                let man = f64::from(byte & 7) / 8.0;
+                if exp == 0 {
+                    sign * man * 2f64.powi(-6)
+                } else {
+                    sign * (1.0 + man) * 2f64.powi(exp - 7)
+                }
+            };
+            let picks = [0usize, rows as usize / 2, rows as usize - 1];
+            let mut reference = vec![0f64; picks.len() * 6144];
+            for (j, &row) in picks.iter().enumerate() {
+                let xr: Vec<f64> = x_bits[row * 6144..(row + 1) * 6144]
+                    .iter()
+                    .map(|b| f64::from(f32::from_bits(u32::from(*b) << 16)))
+                    .collect();
+                for &(e, gate_w) in &row_experts[row] {
+                    let mut act = [0f64; 256];
+                    for n in 0..256 {
+                        let mut gate = 0f64;
+                        let mut up = 0f64;
+                        for k in 0..6144 {
+                            let sg = f64::from(scales[(e * 3) * 96 + (n / 128) * 48 + k / 128]);
+                            let su = f64::from(scales[(e * 3 + 1) * 96 + (n / 128) * 48 + k / 128]);
+                            gate += decode(weight_bytes[(e * 3) * 256 * 6144 + n * 6144 + k])
+                                * sg
+                                * xr[k];
+                            up += decode(weight_bytes[(e * 3 + 1) * 256 * 6144 + n * 6144 + k])
+                                * su
+                                * xr[k];
+                        }
+                        act[n] = gate / (1.0 + (-gate).exp()) * up;
+                    }
+                    for n in 0..6144 {
+                        let mut acc = 0f64;
+                        for k in 0..256 {
+                            let sd = f64::from(scales[(e * 3 + 2) * 96 + (n / 128) * 2 + k / 128]);
+                            acc += decode(weight_bytes[(e * 3 + 2) * 256 * 6144 + n * 256 + k])
+                                * sd
+                                * act[k];
+                        }
+                        reference[j * 6144 + n] += acc * f64::from(gate_w);
+                    }
+                }
+            }
+            let rel = |values: &[f32]| -> f64 {
+                let (mut num, mut den) = (0f64, 0f64);
+                for (j, &row) in picks.iter().enumerate() {
+                    for n in 0..6144 {
+                        let r = reference[j * 6144 + n];
+                        num += (f64::from(values[row * 6144 + n]) - r).powi(2);
+                        den += r.powi(2);
+                    }
+                }
+                (num / den).sqrt()
+            };
+            let (a, b) = (&results[0].1, &results[1].1);
+            let (mut num, mut den) = (0f64, 0f64);
+            for (x, y) in a.iter().zip(b) {
+                num += (f64::from(*x) - f64::from(*y)).powi(2);
+                den += f64::from(*x).powi(2);
+            }
+            let (rel32, rel64, rel_pair) = (rel(a), rel(b), (num / den).sqrt());
+            eprintln!(
+                "rows={rows} tile32={:.1}us tile64={:.1}us rel_l2 vs fp64: tile32={rel32:.3e} tile64={rel64:.3e}; tile64 vs tile32={rel_pair:.3e}",
+                results[0].2, results[1].2
+            );
+            assert!(
+                rel32 < 0.1 && rel64 < 0.1,
+                "rows={rows}: A8 screening threshold exceeded"
+            );
+            assert!(
+                rel64 <= rel32 * 1.25 + 1e-3,
+                "rows={rows}: tile64 is less accurate than tile32"
+            );
+        }
+    }
+
+    fn check_sorted_hsa(resident: bool, part16: bool, tile64: bool) {
+        let be = HsaBackend::new(0).unwrap();
+        let mut modules = Vec::new();
+        let dir = std::env::var("PLOW_TEST_AITER_DIR").unwrap();
+        let capacity = if tile64 { 2048 } else { 129 };
+        let mut kernel = MoeAiter::load(
+            &be,
+            Path::new(&dir),
+            capacity,
+            false,
+            resident,
+            tile64,
+            &mut modules,
+        )
+        .unwrap();
         let upload = |bytes: &[u8]| {
             let m = EngineDevice::alloc(&be, bytes.len() as u64).unwrap();
             EngineDevice::upload(&be, &m, 0, bytes).unwrap();
@@ -1284,7 +1608,12 @@ mod tests {
         } else {
             vec![]
         };
-        for rows in [1u32, 129, 1] {
+        let cases: &[u32] = if tile64 {
+            &[1024, 1025, 2048, 129]
+        } else {
+            &[1, 129, 1]
+        };
+        for &rows in cases {
             let stride = rows.div_ceil(64) * 64;
             let mut meta = vec![0u32; 769];
             let mut rt = vec![u32::MAX; 8 * stride as usize];
