@@ -195,6 +195,12 @@ struct SelectArgs2 {
     pad: u32,
 }
 
+/// Workgroups the selection all-gather is launched with. `plow_dsa_tp_gather` splits them into
+/// eight peer groups (one per source rank), so a multiple of eight keeps every group the same
+/// width and all seven xGMI links busy at once.
+const GATHER_GRID: u32 = 304;
+const _: () = assert!(GATHER_GRID % 8 == 0 && GATHER_GRID >= 8);
+
 /// A device-resident `PlowKvSpan` table: `(address, entries)`.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct KvSpanTable {
@@ -372,14 +378,22 @@ impl IndexTp {
             pad: 0,
         };
         let [ks, ki, kg, kc] = self.kernels;
+        // Only the score pass can be drained here: select/gather/complete open with an all-rank
+        // rendezvous, and this rank's queue would be drained before the peers have even been
+        // enqueued, so a lap around them deadlocks until the bail deadline. The rest of the
+        // segment is `critical_us - score_us` in the PLOW_PREFILL_SEG_TIMING line.
+        let mut timer = super::amd_sparse_mla::SplitTimer::start(be)?;
         if self.abi >= 2 {
             be.launch(ks, 304, 512, 0, bytemuck::bytes_of(&score2))?;
+            timer.lap(be, "score")?;
             be.launch(ki, 304, 512, 0, bytemuck::bytes_of(&select2))?;
         } else {
             be.launch(ks, 304, 512, 0, bytemuck::bytes_of(&score))?;
+            timer.lap(be, "score")?;
             be.launch(ki, 304, 512, 0, bytemuck::bytes_of(&select))?;
         }
-        be.launch(kg, 304, 256, 0, bytemuck::bytes_of(&gather))?;
+        timer.report("index_tp", route.rows);
+        be.launch(kg, GATHER_GRID, 256, 0, bytemuck::bytes_of(&gather))?;
         be.launch(kc, 1, 64, 0, bytemuck::bytes_of(&gather))?;
         Ok(())
     }
@@ -437,6 +451,20 @@ mod tests {
             slot_b: 96 << 20,
         };
         (prog, tensors, tp)
+    }
+
+    /// `plow_dsa_tp_gather` gives workgroup `w` the band of peer `rank + 1 + w % 7` (and the
+    /// local band every eighth workgroup), so the launch width must divide into eight equal peer
+    /// groups; a narrower grid leaves `lanes == 0` and takes the kernel's serial fallback.
+    #[test]
+    fn gather_grid_covers_every_peer_group() {
+        assert_eq!(GATHER_GRID % 8, 0);
+        assert!(GATHER_GRID >= 8);
+        let mut served = [0u32; 8];
+        for wg in 0..GATHER_GRID {
+            served[(wg % 8) as usize] += 1;
+        }
+        assert!(served.iter().all(|&n| n == GATHER_GRID / 8));
     }
 
     #[test]

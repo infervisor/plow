@@ -741,6 +741,11 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-prefill-seg-timing", env = "PLOW_PREFILL_SEG_TIMING", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub prefill_seg_timing: bool,
 
+    /// Drain after every launch of the native sparse prefill routes (AITER sparse MLA, TP
+    /// indexer) and print the per-kernel host time (diagnostic; serialises those segments).
+    #[arg(long = "amd-native-launch-timing", env = "PLOW_NATIVE_LAUNCH_TIMING", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub native_launch_timing: bool,
+
     /// Write `--trace-raw` output for every TP rank (`<path>.rk<N>`), not only rank 0.
     #[arg(long = "amd-trace-allranks", env = "PLOW_TRACE_ALLRANKS", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub trace_allranks: bool,

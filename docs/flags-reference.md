@@ -906,6 +906,7 @@ checkpoint location, because the weights a bundle needs are the same weights
 | `PLOW_LOAD_PROFILE=1` | off | split upload wall time into alloc / stage+DMA profiling. |
 | `PLOW_STEP_TIME=1`, `PLOW_TTFT_LOG=1` | off | per-decode-step host-op timing / TTFT breakdown logging (diagnostics). |
 | `PLOW_TICK_LOG=1` | off | AMD serve: one `TICK` line per mux tick (prefill launches/rows/ms, decode rows/ms, host remainder, idle before), one `PFCHUNK` line per prefill chunk (cursor / rebase / `prefill_chunk` / restore / snapshot / prefix publish ms) and one `PFSEG` line per TP `prefill_chunk` (prepare / rearm / xctr / enqueue / map_ahead / drain / audit ms, `prepare_maps` / `map_ahead_maps` VMM block mappings, cumulative per-rank drain); the `TICK` line also carries `dec_vmm` (ms the decode spent mapping KV blocks) and `dec_maps`. Diagnostics; stderr. |
+| `PLOW_NATIVE_LAUNCH_TIMING=1` | off | AMD prefill: drain after every launch inside the native sparse routes and print one `PLOW_NATIVE_LAUNCH_TIMING route=sparse_mla[_single]\|index_tp rows=… pack_us=… attention_us=… reduce_us=…` / `score_us=… select_us=… gather_us=… complete_us=…` line per segment (host-timed; the select/gather/complete laps include the all-rank rendezvous wait). Serialises those segments — pair with `PLOW_PREFILL_SEG_TIMING=1` on a `plowrt bench` run, never in serving. |
 
 ## Visible devices: `CUDA_VISIBLE_DEVICES`, `ROCR_VISIBLE_DEVICES`, `HIP_VISIBLE_DEVICES`
 

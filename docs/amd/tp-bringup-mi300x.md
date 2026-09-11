@@ -2643,3 +2643,35 @@ configured. That, plus the identity screen's degenerate outputs, keeps `PLOW_PAC
 **off** by default: `--packed-sparse-pf=false` is the rollback and leaves the blob byte-identical.
 What would change the verdict is several spans per launch (whole-chunk planning gives the body one
 span at a time) or a body cheap enough that its launch does not cost 5 s of TTFT per prompt.
+
+## 23. Where the sparse attention time goes at 8192 rows (2026-09-11)
+
+Rooflines and measured splits for the two native sparse routes of the steady 8192-row chunk at
+~65k prior, one rank. Full write-up (campaign logs, harnesses, A/B) in the sparse-MLA prefill
+report; the harnesses are `runtime/bench/amd/mla_sparse_aiter/` plus the scratch probes the report
+names.
+
+**Sparse MLA (AITER QH8 v3), 2.60 ms/layer in flow.** The kernel is a per-query walk: 8192 query
+items on 304 CUs, each reading its own 2048 keys of 1152 B. That is **19.3 GB of gathered traffic
+per layer** — every key is taken by ~228 of the 8192 queries, and the 85 MB packed KV buffer fits
+no XCD's 4 MB L2 — so the bound is Infinity Cache at ~10 TB/s = 1.9 ms, not the MFMA floor
+(0.22 ms) and not HBM (0.07 ms). Measured standalone at the served shape: **2732 us at one KV
+split**, 3460 + 117 us at the shipped two. At 8192 rows the second split cannot add parallelism
+(the chip is already full) and costs a second Q pass, 134 MB of extra FP32 partials and the reduce
+kernel — which is what the single-pass pack (`--single-pass` adapter build, tracker #22) removes.
+The selection's structure is invisible to this kernel: a pack-structured selection (mean 8-query
+union 3753 keys), a hot-key selection and independent draws (union 14788) all land within 12%.
+
+**TP indexer, 4.10 ms/layer in flow.** Split: score 1.55 ms (358-373 TF/s = 27-29% of bf16 peak,
+already the best piece), select 0.62-0.71 ms (floor 0.35), and **~1.9 ms of selection all-gather
+plus its two rendezvous** — 59 MB pulled from seven peers, which the old `plow_dsa_tp_gather`
+walked one peer at a time, leaving six xGMI links idle at every step. Two object-gated fixes:
+the score slab widens from 64 to 128 keys (`PLOW_DSA_TP_TILE_N`, 1549 -> 1376 us and 1646 ->
+1492 us at the two extreme rank bands), and the gather splits its workgroups into eight peer
+groups so all seven links carry a band at once.
+
+**`MlaMergeFold`, 0.59 ms/layer.** At nsplit 1 this is not a copy and not a merge: it is the
+`W_uv` fold, a `[65536, 512] x [512, 256]` per-head GEMM of 17 GFLOP. The interpreter map gives
+one work item per (row, head) and each streams all 256 KB of `W_uv[h]`: **17 GB of L2 traffic per
+layer** for 170 MB of real data. The fix is the existing `PLOW_GLM_FOLD_LT` route (a re-emit: the
+op needs `i[5] = 1`), not a new kernel.

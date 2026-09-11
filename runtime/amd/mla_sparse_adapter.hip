@@ -12,27 +12,59 @@ struct SparsePackArgs {
 static_assert(sizeof(SparsePackArgs) == 88);
 
 template <bool FP8>
-__device__ void sparse_pack(SparsePackArgs a, const float* scales) {
+__device__ void sparse_pack(SparsePackArgs a, const float* __restrict__ scales) {
     const unsigned first = blockIdx.x * blockDim.x + threadIdx.x;
     const unsigned stride = blockDim.x * gridDim.x;
-    for (unsigned i = first; i < a.rows * 8u * 72u; i += stride) {
-        const unsigned row = i / 72u, col = i % 72u;
-        a.q[i] = col < 64u ? a.qa[row * 64u + col] : a.qr[row * 8u + col - 64u];
+    uint4* __restrict__ q = a.q;
+    uint4* __restrict__ kv = a.kv;
+    const uint4* __restrict__ qa = a.qa;
+    const uint4* __restrict__ qr = a.qr;
+    const uint4* __restrict__ kr = a.kr;
+    for (unsigned i = first; i < a.rows * 8u * 64u; i += stride) {
+        q[(i >> 6) * 72u + (i & 63u)] = qa[i];
     }
-    for (unsigned i = first; i < a.ctx * 72u; i += stride) {
-        const unsigned row = i / 72u, col = i % 72u;
-        if (col >= 64u) {
-            a.kv[i] = a.kr[row * 8u + col - 64u];
-        } else if constexpr (FP8) {
+    for (unsigned i = first; i < a.rows * 8u * 8u; i += stride) {
+        q[(i >> 3) * 72u + 64u + (i & 7u)] = qr[i];
+    }
+    for (unsigned i = first; i < a.ctx * 8u; i += stride) {
+        kv[(i >> 3) * 72u + 64u + (i & 7u)] = kr[i];
+    }
+    if constexpr (FP8) {
 #if defined(__HIP_DEVICE_COMPILE__)
-            bf16v8 v = fp8v8_to_bf16v8(ld_glob_fp8v8(
-                (const unsigned char*)a.ck + (size_t)row * 512u + col * 8u));
+        const unsigned char* __restrict__ ck = (const unsigned char*)a.ck;
+        const unsigned n = a.ctx * 64u;
+        unsigned i = first;
+        // Four 8-byte FP8 loads and their scales issued before any store: the stride loop
+        // with one load per store could not overlap iterations (kv may alias ck).
+        for (; i + 3u * stride < n; i += 4u * stride) {
+            bf16v8 v[4];
+            float s[4];
 #pragma unroll
-            for (unsigned j = 0; j < 8; ++j) v[j] = f2bf(bf2f(v[j]) * scales[row]);
-            __builtin_memcpy(&a.kv[i], &v, 16);
+            for (unsigned u = 0; u < 4; ++u) {
+                const unsigned j = i + u * stride, row = j >> 6;
+                v[u] = fp8v8_to_bf16v8(ld_glob_fp8v8(ck + (size_t)row * 512u + (j & 63u) * 8u));
+                s[u] = scales[row];
+            }
+#pragma unroll
+            for (unsigned u = 0; u < 4; ++u) {
+                const unsigned j = i + u * stride;
+#pragma unroll
+                for (unsigned e = 0; e < 8; ++e) v[u][e] = f2bf(bf2f(v[u][e]) * s[u]);
+                __builtin_memcpy(&kv[(j >> 6) * 72u + (j & 63u)], &v[u], 16);
+            }
+        }
+        for (; i < n; i += stride) {
+            const unsigned row = i >> 6;
+            bf16v8 v = fp8v8_to_bf16v8(ld_glob_fp8v8(ck + (size_t)row * 512u + (i & 63u) * 8u));
+#pragma unroll
+            for (unsigned e = 0; e < 8; ++e) v[e] = f2bf(bf2f(v[e]) * scales[row]);
+            __builtin_memcpy(&kv[row * 72u + (i & 63u)], &v, 16);
+        }
 #endif
-        } else {
-            a.kv[i] = a.ck[row * 64u + col];
+    } else {
+        const uint4* __restrict__ ck = a.ck;
+        for (unsigned i = first; i < a.ctx * 64u; i += stride) {
+            kv[(i >> 6) * 72u + (i & 63u)] = ck[i];
         }
     }
     for (unsigned row = first; row <= a.rows; row += stride) {

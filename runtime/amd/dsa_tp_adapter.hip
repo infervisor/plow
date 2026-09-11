@@ -30,13 +30,22 @@ static_assert(sizeof(DsaTpScoreArgs) == 64);
  * `n_tok = row0 + n_rows` make its `q_pos0 = len - n_tok` equal `kv_row0 - row0` (mod 2^32),
  * so row t resolves to position kv_row0 + (t - row0); the key base is the span's `kv_base`.
  * Every argument is workgroup-uniform, so the body's barriers stay uniform. */
+/* Slab width of the score pass, the occupancy knob `d_index_score_pf_row` documents: 64 keys is
+ * 17,408 B of LDS (3 workgroups per CU), 128 keys is 34,816 B (1 workgroup). At the served
+ * prefill shape the wider slab wins — half as many re-reads of the key rows per 8-query pack —
+ * measured 1549 -> 1376 us (rank 0 band) and 1646 -> 1492 us (rank 7 band) for one layer of the
+ * 8192-row chunk at 65k prior. -DPLOW_DSA_TP_TILE_N=64 rebuilds the previous object. */
+#ifndef PLOW_DSA_TP_TILE_N
+#define PLOW_DSA_TP_TILE_N 128u
+#endif
+
 extern "C" __global__ __launch_bounds__(512, 1) void plow_dsa_tp_score(DsaTpScoreArgs a) {
 #if defined(__HIP_DEVICE_COMPILE__)
-    __shared__ bf16 tile[64 * (128 + FA_PAD)];
+    __shared__ bf16 tile[PLOW_DSA_TP_TILE_N * (128 + FA_PAD)];
     const unsigned band = (a.rows + 7u) / 8u;
     const unsigned lo = a.rank * band, hi = (a.rank + 1u) * band;
     if (!a.spans) {
-        d_index_score_pf_row<128, 32, 64>(a.score, a.q, a.k, a.w, a.len, a.rows, a.stride,
+        d_index_score_pf_row<128, 32, PLOW_DSA_TP_TILE_N>(a.score, a.q, a.k, a.w, a.len, a.rows, a.stride,
             0x1.fffffep-7f, blockIdx.x, gridDim.x, tile, lo, hi);
         return;
     }
@@ -47,7 +56,7 @@ extern "C" __global__ __launch_bounds__(512, 1) void plow_dsa_tp_score(DsaTpScor
         const unsigned re = sp.row0 + sp.n_rows;
         const unsigned rl = hi < re ? hi : re;
         if (rb >= rl) continue;
-        d_index_score_pf_row<128, 32, 64>(a.score, a.q, a.k + (size_t)sp.kv_base * 128u, a.w,
+        d_index_score_pf_row<128, 32, PLOW_DSA_TP_TILE_N>(a.score, a.q, a.k + (size_t)sp.kv_base * 128u, a.w,
             (const int*)&spans[s].kv_len, re, a.stride, 0x1.fffffep-7f, blockIdx.x,
             gridDim.x, tile, rb, rl);
     }
@@ -121,15 +130,37 @@ extern "C" __global__ void plow_dsa_tp_gather(DsaTpGatherArgs a) {
                               a.deadline, a.status, blockIdx.x, &bailed))
         return;
     const unsigned band_vectors = ((a.rows + 7u) / 8u) * 512u;
-    for (unsigned step = 0; step < 8; ++step) {
-        const unsigned src = (a.rank + step) & 7u;
-        const unsigned lo = src * band_vectors;
-        const unsigned hi = min(lo + band_vectors, a.rows * 512u);
-        const auto* source = (const uint4*)((const char*)a.peers[src] + a.slot_offset);
-        for (unsigned i = lo + blockIdx.x * blockDim.x + threadIdx.x;
-             i < hi; i += gridDim.x * blockDim.x)
-            a.out[i] = source[i];
+    // Workgroup w serves peer (rank + 1 + w % 7) and, every eighth workgroup, the local band:
+    // all seven xGMI links carry a band at the same time instead of the whole grid walking one
+    // peer after another (the old loop left ~8 MB per peer on one link at a time). Four 16 B
+    // loads in flight per lane. plowrt launches PLOW_DSA_TP_GATHER_GRID (304) workgroups; the
+    // serial loop stays as the path for a grid too narrow to cover the eight peer groups,
+    // where `lanes` would be zero and the stride loop could not advance.
+    const unsigned lanes = (gridDim.x / 8u) * blockDim.x;
+    if (lanes == 0u) {
+        for (unsigned step = 0; step < 8; ++step) {
+            const unsigned src = (a.rank + step) & 7u;
+            const unsigned lo = src * band_vectors;
+            const unsigned hi = min(lo + band_vectors, a.rows * 512u);
+            const auto* source = (const uint4*)((const char*)a.peers[src] + a.slot_offset);
+            for (unsigned i = lo + blockIdx.x * blockDim.x + threadIdx.x;
+                 i < hi; i += gridDim.x * blockDim.x)
+                a.out[i] = source[i];
+        }
+        return;
     }
+    const unsigned group = blockIdx.x % 8u, sub = blockIdx.x / 8u;
+    if (sub * 8u + group >= (gridDim.x / 8u) * 8u) return;
+    const unsigned src = group == 7u ? a.rank : ((a.rank + 1u + group) & 7u);
+    const unsigned lo = src * band_vectors;
+    const unsigned hi = min(lo + band_vectors, a.rows * 512u);
+    const auto* source = (const uint4*)((const char*)a.peers[src] + a.slot_offset);
+    unsigned i = lo + sub * blockDim.x + threadIdx.x;
+    for (; i + 3u * lanes < hi; i += 4u * lanes) {
+        uint4 v0 = source[i], v1 = source[i + lanes], v2 = source[i + 2u * lanes], v3 = source[i + 3u * lanes];
+        a.out[i] = v0; a.out[i + lanes] = v1; a.out[i + 2u * lanes] = v2; a.out[i + 3u * lanes] = v3;
+    }
+    for (; i < hi; i += lanes) a.out[i] = source[i];
 #endif
 }
 

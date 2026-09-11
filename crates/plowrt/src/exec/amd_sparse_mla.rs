@@ -16,6 +16,39 @@ use crate::{Result, RuntimeError};
 /// scheduler applies before it packs a span onto a sparse rung (`AmdEngine::packed_span_admissible`).
 pub(crate) const SPAN_MIN_PRIOR: u32 = 2047;
 
+/// `PLOW_NATIVE_LAUNCH_TIMING`: drain after each launch of a native route and report the split.
+pub(super) struct SplitTimer {
+    laps: Option<(std::time::Instant, Vec<(&'static str, f64)>)>,
+}
+
+impl SplitTimer {
+    pub fn start(be: &HsaBackend) -> Result<Self> {
+        let on = crate::config::RuntimeConfig::get().amd.native_launch_timing;
+        if on {
+            be.synchronize()?;
+        }
+        Ok(Self {
+            laps: on.then(|| (std::time::Instant::now(), Vec::new())),
+        })
+    }
+
+    pub fn lap(&mut self, be: &HsaBackend, name: &'static str) -> Result<()> {
+        if let Some((t, laps)) = &mut self.laps {
+            be.synchronize()?;
+            laps.push((name, t.elapsed().as_secs_f64() * 1e6));
+            *t = std::time::Instant::now();
+        }
+        Ok(())
+    }
+
+    pub fn report(&self, route: &str, rows: u32) {
+        if let Some((_, laps)) = &self.laps {
+            let parts: Vec<String> = laps.iter().map(|(n, us)| format!("{n}_us={us:.1}")).collect();
+            eprintln!("PLOW_NATIVE_LAUNCH_TIMING route={route} rows={rows} {}", parts.join(" "));
+        }
+    }
+}
+
 const OBJECT_HASH: &str = "cd8fa62e18abada15beeeedd49357bcc1e9e2eee7353d038533f30cac93c3607";
 const OBJECT: &str = "mla_a16w16_qh8_qseqlen1_gqaratio8_v3.co";
 
@@ -788,6 +821,7 @@ impl SparseMla {
         let t = route.inst.t;
         let fp8 = route.scale.is_some();
         let row0 = u64::from(w.row0);
+        let mut timer = SplitTimer::start(be)?;
         let single = w.rows >= 512 && fp8 && self.pack_fp8_single.is_some();
         let splits = if single { 1 } else { 2 };
         let pack = PackArgs {
@@ -831,6 +865,7 @@ impl SparseMla {
         } else {
             be.launch(self.pack, 304, 256, 0, bytemuck::bytes_of(&pack))?;
         }
+        timer.lap(be, "pack")?;
         let mut args = [0u64; 40];
         args[0] = if single { addr(t[0]) + row0 * 8 * 512 * 4 } else { self.part };
         args[2] = self.lse;
@@ -853,7 +888,9 @@ impl SparseMla {
             256,
             bytemuck::cast_slice(&args),
         )?;
+        timer.lap(be, "attention")?;
         if single {
+            timer.report("sparse_mla_single", w.rows);
             return Ok(2);
         }
         let reduce = ReduceArgs {
@@ -865,6 +902,8 @@ impl SparseMla {
             pad: 0,
         };
         be.launch(self.reduce, 304, 256, 0, bytemuck::bytes_of(&reduce))?;
+        timer.lap(be, "reduce")?;
+        timer.report("sparse_mla", w.rows);
         Ok(3)
     }
 }
