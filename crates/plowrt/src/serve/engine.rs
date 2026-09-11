@@ -374,14 +374,22 @@ mod amd_serve {
             }
         }
 
-        fn publish_shared_prefix(&self, slot: usize, prompt: &[u32], frontier: u32) -> Result<()> {
+        /// `defer` (`--amd-publish-defer`) stashes a TP publish for the next GPU drain window.
+        fn publish_shared_prefix(
+            &mut self,
+            slot: usize,
+            prompt: &[u32],
+            frontier: u32,
+            defer: bool,
+        ) -> Result<()> {
             match self {
                 Self::One(e) => e.publish_shared_prefix(slot, prompt, frontier),
+                Self::Tp(g) if defer => g.defer_publish_shared_prefix(slot, prompt, frontier),
                 Self::Tp(g) => g.publish_shared_prefix(slot, prompt, frontier),
             }
         }
 
-        fn release_shared_prefix(&self, slot: usize) {
+        fn release_shared_prefix(&mut self, slot: usize) {
             match self {
                 Self::One(e) => e.release_shared_prefix(slot),
                 Self::Tp(g) => g.release_shared_prefix(slot),
@@ -1680,7 +1688,8 @@ mod amd_serve {
             // correct. A snapshot OOM after eviction, a radix hash collision or a rejected
             // boundary must not fail the request — the CUDA route warns and continues the same
             // way. Only a fatal device error still propagates.
-            if let Err(err) = g.publish_shared_prefix(slot, prompt, cur.frontier) {
+            let defer = crate::config::RuntimeConfig::get().amd.publish_defer;
+            if let Err(err) = g.publish_shared_prefix(slot, prompt, cur.frontier, defer) {
                 if err.is_fatal() {
                     return Err(err);
                 }

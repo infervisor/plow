@@ -799,6 +799,11 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-kv-map-next-chunk", env = "PLOW_KV_MAP_NEXT_CHUNK", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub kv_map_next_chunk: bool,
 
+    /// Run a completed chunk's shared-prefix publish (snapshot allocation and copy) in the next
+    /// GPU drain window, the following chunk's or decode's, instead of before the decode.
+    #[arg(long = "amd-publish-defer", env = "PLOW_AMD_PUBLISH_DEFER", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub publish_defer: bool,
+
     /// Share completed MLA prefixes through ROCr VMM (auto on supported gfx942 packets).
     #[arg(long = "amd-shared-prefix", env = "PLOW_AMD_SHARED_PREFIX", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub shared_prefix: Option<bool>,

@@ -28,6 +28,7 @@ thread_local! {
     static PREP_VMM_NS: Cell<u64> = const { Cell::new(0) };
     static PREP_PATCH_NS: Cell<u64> = const { Cell::new(0) };
     static PUB_FILL_NS: Cell<u64> = const { Cell::new(0) };
+    static PUB_DEFERRED_NS: Cell<u64> = const { Cell::new(0) };
 }
 
 pub struct TickGuard {
@@ -55,6 +56,7 @@ pub fn begin() -> Option<TickGuard> {
     DEC_SEGS.with(|c| c.set(0));
     DEC_INFLIGHT_ENQ.with(|c| c.set(-1));
     DEC_INFLIGHT_SUB.with(|c| c.set(-1));
+    PUB_DEFERRED_NS.with(|c| c.set(0));
     Some(TickGuard { started, idle_ns })
 }
 
@@ -132,6 +134,14 @@ pub fn publish_fill(ns: u64) {
     }
 }
 
+/// A deferred prefix publish ran for `ns` under a GPU drain window (all ranks).
+#[inline]
+pub fn deferred_publish(ns: u64) {
+    if on() {
+        PUB_DEFERRED_NS.with(|c| c.set(c.get() + ns));
+    }
+}
+
 /// Snapshot-copy time accumulated since the last call; resets it.
 pub fn take_publish_fill() -> u64 {
     PUB_FILL_NS.with(|c| c.replace(0))
@@ -150,7 +160,7 @@ impl Drop for TickGuard {
         let dec_ns = DEC_NS.with(Cell::get);
         let ms = |ns: u64| ns as f64 / 1e6;
         eprintln!(
-            "TICK n={seq} total={:.3} pf_launches={} pf_rows={} pf={:.3} dec_rows={} dec={:.3} dec_vmm={:.3} dec_maps={} dec_segs={} dec_inflight_enq={} dec_inflight_sub={} other={:.3} idle_before={:.3}",
+            "TICK n={seq} total={:.3} pf_launches={} pf_rows={} pf={:.3} dec_rows={} dec={:.3} dec_vmm={:.3} dec_maps={} dec_segs={} dec_inflight_enq={} dec_inflight_sub={} pub_deferred={:.3} other={:.3} idle_before={:.3}",
             ms(total),
             PF_LAUNCHES.with(Cell::get),
             PF_ROWS.with(Cell::get),
@@ -162,6 +172,7 @@ impl Drop for TickGuard {
             DEC_SEGS.with(Cell::get),
             DEC_INFLIGHT_ENQ.with(Cell::get),
             DEC_INFLIGHT_SUB.with(Cell::get),
+            ms(PUB_DEFERRED_NS.with(Cell::get)),
             ms(total.saturating_sub(pf_ns + dec_ns)),
             ms(self.idle_ns),
         );

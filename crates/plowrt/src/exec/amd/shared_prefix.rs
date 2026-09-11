@@ -232,6 +232,13 @@ pub(super) struct SharedPrefix {
     scales: Vec<CacheTensor>,
     pending: Vec<Vec<Attach>>,
     ops: Arc<dyn VmmOps>,
+    deferred: Option<DeferredPublish>,
+}
+
+struct DeferredPublish {
+    slot: usize,
+    prompt: Arc<[u32]>,
+    frontier: u32,
 }
 
 // Admission resets every rank's slot first; a clean miss already has private backing.
@@ -339,6 +346,7 @@ impl SharedPrefix {
             scales: layout.scales,
             pending: (0..layout.batch).map(|_| Vec::new()).collect(),
             ops,
+            deferred: None,
         })
     }
 
@@ -367,7 +375,9 @@ impl SharedPrefix {
         Ok(())
     }
 
-    pub fn release(&self, slot: usize) {
+    pub fn release(&mut self, slot: usize) {
+        // Fatal errors are logged by the flush; release itself cannot fail.
+        let _ = self.flush_publish();
         for group in &self.groups {
             group.pool.release_prefix(slot);
         }
@@ -399,6 +409,7 @@ impl SharedPrefix {
     }
 
     pub fn begin_slot(&mut self, slot: usize) -> Result<()> {
+        self.flush_publish()?;
         self.pending[slot].clear();
         let t0 = std::time::Instant::now();
         for group in &self.groups {
@@ -416,6 +427,7 @@ impl SharedPrefix {
     }
 
     pub fn stage_attach(&mut self, slot: usize, prompt: &[u32]) -> Result<u32> {
+        self.flush_publish()?;
         self.pending[slot].clear();
         let result = (|| {
             let mut rows = None;
@@ -495,6 +507,7 @@ impl SharedPrefix {
     }
 
     pub fn commit_attach(&mut self, slot: usize, rows: u32) -> Result<()> {
+        self.flush_publish()?;
         if rows == 0
             || self.pending[slot].len() != self.groups.len()
             || self.pending[slot].iter().any(|a| a.rows != rows)
@@ -519,7 +532,12 @@ impl SharedPrefix {
         Ok(())
     }
 
-    pub fn publish(&self, slot: usize, prompt: &[u32], frontier: u32) -> Result<()> {
+    pub fn publish(&mut self, slot: usize, prompt: &[u32], frontier: u32) -> Result<()> {
+        self.flush_publish()?;
+        self.publish_rows(slot, prompt, frontier)
+    }
+
+    fn publish_rows(&self, slot: usize, prompt: &[u32], frontier: u32) -> Result<()> {
         let rows = frontier.min(prompt.len().saturating_sub(1) as u32) / 32 * 32;
         if rows == 0 {
             return Ok(());
@@ -537,20 +555,57 @@ impl SharedPrefix {
     }
 
     pub fn publish_completed_chunk(
-        &self,
+        &mut self,
         slot: usize,
         prompt: &[u32],
         frontier: u32,
     ) -> Result<()> {
-        if frontier as usize >= prompt.len()
-            || self
-                .groups
-                .iter()
-                .all(|g| frontier % g.pool.block_rows() == 0)
-        {
-            self.publish(slot, prompt, frontier)?;
+        self.flush_publish()?;
+        if self.publishes_at(prompt.len(), frontier) {
+            self.publish_rows(slot, prompt, frontier)?;
         }
         Ok(())
+    }
+
+    /// Whether a chunk ending at `frontier` of a `prompt_len`-token prompt publishes: at the
+    /// prompt's end, or where every cache group ends on a whole block.
+    pub fn publishes_at(&self, prompt_len: usize, frontier: u32) -> bool {
+        frontier as usize >= prompt_len
+            || self.groups.iter().all(|g| frontier % g.pool.block_rows() == 0)
+    }
+
+    /// [`Self::publish_completed_chunk`], run at the next [`Self::flush_publish`] instead of now,
+    /// so the snapshot allocation and copy overlap GPU work rather than delay the next dispatch.
+    ///
+    /// Invariant: the snapshot reads only `slot`'s rows below `min(frontier, len - 1)`, and
+    /// nothing writes them before the flush. The slot's next chunk writes from `frontier` up;
+    /// its decode row is `frontier` while it prefills and `len` once it decodes; every other
+    /// slot writes its own window. Every call that could hand the window to a new occupant or
+    /// let a request see the cache (`begin_slot`, `stage_attach`, `commit_attach`, `publish`,
+    /// `release`) flushes first. So the published bytes are the ones an immediate publish
+    /// copies, and no attacher can observe the cache without them.
+    pub fn defer_publish(&mut self, slot: usize, prompt: Arc<[u32]>, frontier: u32) -> Result<()> {
+        self.flush_publish()?;
+        if self.publishes_at(prompt.len(), frontier) {
+            self.deferred = Some(DeferredPublish { slot, prompt, frontier });
+        }
+        Ok(())
+    }
+
+    /// Run a deferred publish now. A failed publish only costs later requests a cache hit, so
+    /// it is logged, as the immediate path does; a fatal device error still propagates.
+    pub fn flush_publish(&mut self) -> Result<()> {
+        let Some(d) = self.deferred.take() else {
+            return Ok(());
+        };
+        match self.publish_rows(d.slot, &d.prompt, d.frontier) {
+            Err(err) if err.is_fatal() => Err(err),
+            Err(err) => {
+                tracing::warn!(slot = d.slot, frontier = d.frontier, error = %err, "amd: deferred shared prefix publish skipped");
+                Ok(())
+            }
+            Ok(()) => Ok(()),
+        }
     }
 }
 
@@ -1084,6 +1139,67 @@ mod tests {
         let m = ops.0.lock().unwrap();
         assert!(m.blocks.is_empty());
         assert!(m.mappings.is_empty());
+    }
+
+    fn assert_rows(ops: &Driver, bases: &[u64], slot: u64, rows: u64, value: u8) {
+        let m = ops.0.lock().unwrap();
+        for (&base, row_bytes) in bases.iter().zip([512, 128, 256, 4]) {
+            assert_eq!(
+                m.read(base + slot * 256 * row_bytes, rows * row_bytes),
+                vec![value; (rows * row_bytes) as usize]
+            );
+        }
+    }
+
+    /// `defer_publish`: the snapshot is taken at the flush, rows at or past the frontier may
+    /// change before it without reaching the cache, and a new admission flushes first.
+    #[test]
+    fn deferred_publish_lands_before_an_attach_and_ignores_rows_past_the_frontier() {
+        let ops = Arc::new(Driver::default());
+        let (mut cache, bases) = cache(ops.clone());
+        let prompt: Arc<[u32]> = (0..200).collect();
+        cache.begin_slot(0).unwrap();
+        cache.ensure_rows(0, 200).unwrap();
+        fill(&ops, &bases, 0, 128, 17);
+        cache.defer_publish(0, prompt.clone(), 100).unwrap();
+        assert!(cache.deferred.is_none(), "a chunk that publishes nothing stashes nothing");
+        cache.defer_publish(0, prompt.clone(), 128).unwrap();
+        assert!(cache.deferred.is_some());
+        {
+            // The next chunk writes rows [128, 200) before the flush.
+            let mut m = ops.0.lock().unwrap();
+            for (&base, row_bytes) in bases.iter().zip([512u64, 128, 256, 4]) {
+                m.write(base + 128 * row_bytes, &vec![99; (72 * row_bytes) as usize]);
+            }
+        }
+        cache.begin_slot(1).unwrap();
+        assert!(cache.deferred.is_none(), "admission flushes the deferred publish");
+        assert_eq!(cache.stage_attach(1, &prompt).unwrap(), 128);
+        cache.commit_attach(1, 128).unwrap();
+        assert_rows(&ops, &bases, 1, 128, 17);
+    }
+
+    /// A deferred publish of slot 0 lands before slot 0 is handed to a new occupant, so the
+    /// cache holds the old prompt's rows, not the new occupant's.
+    #[test]
+    fn deferred_publish_runs_before_its_slot_changes_hands() {
+        let ops = Arc::new(Driver::default());
+        let (mut cache, bases) = cache(ops.clone());
+        let prompt: Arc<[u32]> = (0..200).collect();
+        cache.begin_slot(0).unwrap();
+        cache.ensure_rows(0, 200).unwrap();
+        fill(&ops, &bases, 0, 200, 17);
+        cache.defer_publish(0, prompt.clone(), 200).unwrap();
+        cache.begin_slot(0).unwrap();
+        cache.ensure_rows(0, 200).unwrap();
+        fill(&ops, &bases, 0, 200, 29);
+        cache.begin_slot(1).unwrap();
+        let rows = cache.stage_attach(1, &prompt).unwrap();
+        assert!(rows >= 128, "the old prompt's publish is in the cache ({rows} rows)");
+        cache.commit_attach(1, rows).unwrap();
+        assert_rows(&ops, &bases, 1, u64::from(rows), 17);
+        cache.release(1);
+        assert!(cache.deferred.is_none());
     }
 
     #[test]

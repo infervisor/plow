@@ -1040,6 +1040,8 @@ impl AmdTpGroup {
 
     fn drain_and_audit(&mut self) -> Result<()> {
         use crate::obs::dstep;
+        // The decode is on the GPU: a prefix publish deferred from this tick's chunk runs here.
+        let published = self.flush_deferred_publish();
         dstep::timed(&dstep::DRAIN, || -> Result<()> {
             for e in &self.ranks {
                 e.drain()?;
@@ -1079,7 +1081,7 @@ impl AmdTpGroup {
                 }
             })?;
         }
-        Ok(())
+        published.map(drop)
     }
 
     /// Prefill `prompt` on every rank. Returns each rank's first sampled id.
@@ -1234,15 +1236,53 @@ impl AmdTpGroup {
         AmdEngine::attach_shared_prefixes(&mut self.ranks, slot, prompt)
     }
 
-    pub fn publish_shared_prefix(&self, slot: usize, prompt: &[u32], frontier: u32) -> Result<()> {
-        for rank in &self.ranks {
+    pub fn publish_shared_prefix(&mut self, slot: usize, prompt: &[u32], frontier: u32) -> Result<()> {
+        for rank in &mut self.ranks {
             rank.publish_shared_prefix(slot, prompt, frontier)?;
         }
         Ok(())
     }
 
-    pub fn release_shared_prefix(&self, slot: usize) {
-        for rank in &self.ranks {
+    /// Stash this chunk's prefix publish on every rank. It runs at the next flush point, each
+    /// of which sits under GPU work: [`Self::prefill_chunk`] between its enqueue and its drain,
+    /// or the decode's [`Self::drain_and_audit`]. `SharedPrefix::defer_publish` states why
+    /// the bytes are unchanged and when a flush is forced earlier.
+    pub fn defer_publish_shared_prefix(
+        &mut self,
+        slot: usize,
+        prompt: &[u32],
+        frontier: u32,
+    ) -> Result<()> {
+        if !self
+            .ranks
+            .first()
+            .is_some_and(|e| e.shared_prefix_publishes_at(prompt.len(), frontier))
+        {
+            return Ok(());
+        }
+        let prompt: Arc<[u32]> = Arc::from(prompt);
+        for rank in &mut self.ranks {
+            rank.defer_shared_prefix_publish(slot, &prompt, frontier)?;
+        }
+        Ok(())
+    }
+
+    /// Run any deferred prefix publish on every rank; returns its wall time.
+    fn flush_deferred_publish(&mut self) -> Result<u64> {
+        let t = std::time::Instant::now();
+        let mut result = Ok(());
+        for rank in &mut self.ranks {
+            if let Err(err) = rank.flush_shared_prefix_publish() {
+                result = Err(err);
+            }
+        }
+        let ns = t.elapsed().as_nanos() as u64;
+        crate::obs::tick::deferred_publish(ns);
+        result.map(|()| ns)
+    }
+
+    pub fn release_shared_prefix(&mut self, slot: usize) {
+        for rank in &mut self.ranks {
             rank.release_shared_prefix(slot);
         }
     }
@@ -1618,6 +1658,7 @@ impl AmdTpGroup {
             }
             let map_ahead_ns = t.elapsed().as_nanos() as u64;
             let maps_after = if tick_log { maps(&self.ranks) } else { 0 };
+            let published = self.flush_deferred_publish();
 
             let t = std::time::Instant::now();
             let mut rank_drain_ns = Vec::with_capacity(if tick_log { self.ranks.len() } else { 0 });
@@ -1652,13 +1693,14 @@ impl AmdTpGroup {
                 self.group.audit_xstatus_direct()?;
             }
             self.audit_prefill_counters(step.prog)?;
+            let publish_ns = published?;
             if tick_log {
                 let (prep_vmm, prep_patch) = crate::obs::tick::take_prepare();
                 let ms = |ns: u64| ns as f64 / 1e6;
                 let ranks: Vec<String> =
                     rank_drain_ns.iter().map(|&d| format!("{:.1}", ms(d))).collect();
                 eprintln!(
-                    "PFSEG bucket={} c0={} clen={} launches={launches} prepare={:.3} prepare_maps={} prepare_vmm={:.3} prepare_patch={:.3} rearm={:.3} xctr={:.3} enqueue={:.3} map_ahead={:.3} map_ahead_maps={} drain={:.3} audit={:.3} rank_drain_cum=[{}]",
+                    "PFSEG bucket={} c0={} clen={} launches={launches} prepare={:.3} prepare_maps={} prepare_vmm={:.3} prepare_patch={:.3} rearm={:.3} xctr={:.3} enqueue={:.3} map_ahead={:.3} map_ahead_maps={} publish_deferred={:.3} drain={:.3} audit={:.3} rank_drain_cum=[{}]",
                     self.ranks[0].prog_t(step.prog),
                     step.c0,
                     step.clen,
@@ -1671,6 +1713,7 @@ impl AmdTpGroup {
                     ms(enqueue_ns),
                     ms(map_ahead_ns),
                     maps_after - maps_prepared,
+                    ms(publish_ns),
                     ms(ns),
                     ms(t.elapsed().as_nanos() as u64),
                     ranks.join(","),

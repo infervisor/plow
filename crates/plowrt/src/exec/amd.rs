@@ -13166,15 +13166,41 @@ impl AmdEngine {
         Ok(())
     }
 
-    pub fn publish_shared_prefix(&self, slot: usize, prompt: &[u32], frontier: u32) -> Result<()> {
-        if let Some(cache) = &self.shared_prefix {
+    pub fn publish_shared_prefix(&mut self, slot: usize, prompt: &[u32], frontier: u32) -> Result<()> {
+        if let Some(cache) = &mut self.shared_prefix {
             cache.publish_completed_chunk(slot, prompt, frontier)?;
         }
         Ok(())
     }
 
-    pub fn release_shared_prefix(&self, slot: usize) {
-        if let Some(cache) = &self.shared_prefix {
+    pub fn shared_prefix_publishes_at(&self, prompt_len: usize, frontier: u32) -> bool {
+        self.shared_prefix
+            .as_ref()
+            .is_some_and(|cache| cache.publishes_at(prompt_len, frontier))
+    }
+
+    /// Stash a completed chunk's publish; `SharedPrefix::defer_publish` states the invariant.
+    pub fn defer_shared_prefix_publish(
+        &mut self,
+        slot: usize,
+        prompt: &Arc<[u32]>,
+        frontier: u32,
+    ) -> Result<()> {
+        if let Some(cache) = &mut self.shared_prefix {
+            cache.defer_publish(slot, Arc::clone(prompt), frontier)?;
+        }
+        Ok(())
+    }
+
+    pub fn flush_shared_prefix_publish(&mut self) -> Result<()> {
+        if let Some(cache) = &mut self.shared_prefix {
+            cache.flush_publish()?;
+        }
+        Ok(())
+    }
+
+    pub fn release_shared_prefix(&mut self, slot: usize) {
+        if let Some(cache) = &mut self.shared_prefix {
             cache.release(slot);
         }
     }
