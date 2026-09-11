@@ -258,6 +258,32 @@ Where the MoE time is (single MI300X, `moe_aiter_xcd_swizzle_matches_and_splits`
 
 No faster AITER object exists for 8192/6144/256/256/top-8 on gfx942: AITER's own tuner picks the 1-stage `vs_ps_64x256` asm (1314 µs kernel-only) over CK 2-stage and everything else from 2048 tokens up; the blockscale family has no tile wider than 64 rows. EP over the 8 ranks (32 experts at I = 2048 each) is a loss for this kernel family: same memory, collective bytes within ±20 % (input already replicated by the attention all-reduce), but 8× the weight re-streaming (38.6 GB/layer at a 64-row tile) plus expert-popularity imbalance — design note in the report, not implemented. What ≤ 90 ms/chunk (1.2 ms/layer; today 1.36) still needs: a plow-owned grouped GEMM with a ≥ 256-row expert tile (weights read once: 2.4 GB → 0.46 ms floor) or fewer BF16 output atomics (805 MB/layer) — kernel work, ranked in the report.
 
+## Phase 2 (per-rung routes already built): what paid (2026-09-11, `rung-flips`)
+
+One GPU-queue job, one pinned plowrt, one frozen object set (79 real files + sha256 manifest), the
+20-prompt bench, the 18-case retrieval screen and `PLOW_TICK_LOG` on every arm, each arm a HEAD
+re-emit differing from its own control by one flag. Report: `rung-flips.md`.
+
+| route | out tok/s vs control 50.68 | decode tick | retrieval | decision |
+|---|---:|---:|---|---|
+| `PLOW_GLM_GEMM_LT_DECODE_EXT` | **51.65 (+1.9 %)** | 96.8 → 90.3 ms | 18/18 | **ON** for GLM gfx942 TP8 (joins the qualified recipe) |
+| DSA decode split ns16 → ns8/ns4 (ed09509c, merged) | ns16 arm 49.19 (**−2.9 %**) | 106.3 vs 96.8 ms | control 18/18 | already default in a HEAD emit; **the frozen production packet predates it — re-emit it** |
+| `PLOW_GLM_MLA_DEC_AITER` | does not load | — | — | off: emit isolates `FlashMlaDecodeFp8` alone, runtime needs the flash+merge pair in one segment; ceiling ≈ 1.8 ms/step |
+| `PLOW_GLM_GEMM_LT` | not re-priced | — | recipe 18/18 | stays on (8b125bb3); an off arm needs a packet-matched object build and informs no decision |
+| `PLOW_MOE_AITER_TILE64` | — | — | — | handed to the MoE agent |
+
+Projected on the 1511 s / 100-prompt run: EXT ≈ 20 s, the split policy ≈ 30 s once production
+re-emits its packet (tick model; the run-level ratios say 28 s / 46 s). The decode tick is flat in
+live rows (≈ 97 ms from 2 to 20 rows), so every decode route is really a rung-16/20 route on this
+workload; EXT's rung-8 half is idle here.
+
+Found on the way (tracker #39, #41): a HEAD-emitted GLM packet does not load against the frozen
+`serving-safe` set (small/split MLA objects missing, d60bdeb2); `freeze_serving_set.sh` /
+`pack_objset.py` dropped every pinned `.co` (95ecee21 fixes both and adds
+`scripts/build_glm53_gfx942_serving_objects.sh`); and `serving-safe`'s decode objects are
+symlinks into directories other agents rebuild in place, now packet-stamped `0xfb31…`, so any
+campaign must `cp -rL` its set before its hold.
+
 ## What the research says is actually available (2026-09-11, two research agents)
 
 Reports: `research-kernels-parallelism.md`, `research-serving-techniques.md` (both under `/root/.claude/jobs/c08d1232/tmp/reports/`, provenance-tagged measured / fetched / estimated).
