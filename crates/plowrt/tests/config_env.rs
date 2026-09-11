@@ -43,9 +43,9 @@ fn env_zero_and_one_mean_false_and_true() {
     assert_eq!(c.nv.pf_seg_pure.as_deref(), Some("fp8"));
     assert_eq!(c.pf_chunk, 4096);
     assert_eq!(c.pf_chunk_rows(), 4096);
-    assert_eq!(c.pf_interleave, 1024);
+    assert_eq!(c.pf_interleave, Some(1024));
     assert!(c.pf_defer_decode);
-    assert!(c.pf_batch);
+    assert_eq!(c.pf_batch, Some(true));
     assert!(!c.prefix_cache);
     assert_eq!(c.vmm_cache_mib, Some(512));
     assert!(!c.amd.tp_prefill_segment_major);
@@ -77,7 +77,7 @@ fn env_zero_and_one_mean_false_and_true() {
         .unwrap();
     let resolved = RuntimeConfig::from_arg_matches(&matches).unwrap();
     let replay = plowrt::config::serve_replay(&matches);
-    assert_eq!(resolved.pf_interleave, 0);
+    assert_eq!(resolved.pf_interleave, Some(0));
     assert_eq!(replay["PLOW_PF_INTERLEAVE"], "0");
     assert_eq!(replay["PLOW_PF_CHUNK"], "4096");
     assert_eq!(replay["PLOW_HSACO_LOWRUNG"], "");
