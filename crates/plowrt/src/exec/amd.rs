@@ -5456,16 +5456,14 @@ struct AmdProg {
     packed_prefill_only: bool,
     token_batch_body: bool,
     /// Runs the gathered (DSA) attention arm — indexer plus sparse flash — whose cost is set by
-    /// the selection width, not the prior context. Decides long-context tail placement.
+    /// the selection width, not the prior context. Decides long-context tail placement, and a
+    /// span packed onto it needs `kv_row0 >= amd_sparse_mla::SPAN_MIN_PRIOR` (fixed-width CSR).
     sparse_prefill: bool,
     packed_dense: bool,
     packed_dense_error: Option<String>,
     packed_needs_mla: bool,
     packed_mla_compatible: bool,
     packed_mla_segmented: bool,
-    /// Carries the sparse (DSA) prefill chain: a span packed onto it needs
-    /// `kv_row0 >= amd_sparse_mla::SPAN_MIN_PRIOR` (the fixed-width CSR).
-    sparse_prefill: bool,
     /// A packed sibling / body with the sparse chain that the loaded objects cannot run per
     /// span, by name (`packed_sparse_refusal`). `check_packed_prefill_program` refuses it.
     packed_sparse_error: Option<String>,
@@ -9356,7 +9354,6 @@ impl AmdEngine {
                     packed_mla_compatible(p, packed_sparse_error.is_none())
                 },
                 packed_mla_segmented,
-                sparse_prefill: sparse_prefill_chain(p),
                 packed_sparse_error,
                 packed_needs_kda: p.insts.iter().any(|d| {
                     d.op == DevOp::KdaConv3 as u16
