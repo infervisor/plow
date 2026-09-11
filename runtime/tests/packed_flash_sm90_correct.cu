@@ -37,6 +37,7 @@ static float attention_scale = 0.0f;
 static unsigned test_kv_length = 16384;
 static bool campaign_timing = false;
 static unsigned test_seed = 0;
+static unsigned test_requests = 1;
 
 #ifndef PLOW_TEST_FA_ROWS
 #define PLOW_TEST_FA_ROWS 0
@@ -86,12 +87,26 @@ template<int HD, int BKV> static bool check(unsigned kv_heads, unsigned stride,
                                           unsigned mask, unsigned window, bool tma, bool profile) {
     const float scale = attention_scale > 0.0f ? attention_scale : 1.0f / std::sqrt(float(HD));
     const auto q = values(size_t(capacity) * heads * HD, 123u ^ (test_seed * 0x9e3779b9u));
-    const auto k = values(size_t(3) * kv_heads * stride * HD, 456u ^ (test_seed * 0x85ebca6bu));
+    const unsigned slots = PLOW_TEST_FA_ROWS ? test_requests : 3;
+    const auto k = values(size_t(slots) * kv_heads * stride * HD,
+                          456u ^ (test_seed * 0x85ebca6bu));
     const auto v = values(k.size(), 789u ^ (test_seed * 0xc2b2ae35u));
     // Two ragged requests use reversed, noncontiguous slots; the last 30 rows are padding.
-    const std::vector<int> req = PLOW_TEST_FA_ROWS
-        ? std::vector<int>{1, 0, int(test_rows), 0, int(test_kv_length)}
+    std::vector<int> req = PLOW_TEST_FA_ROWS
+        ? std::vector<int>(1 + 4 * test_requests)
         : std::vector<int>{2, 0, 65, 2, 97, 65, 33, 0, 16384};
+    if (PLOW_TEST_FA_ROWS) {
+        req[0] = int(test_requests);
+        unsigned row0 = 0;
+        for (unsigned r = 0; r < test_requests; ++r) {
+            const unsigned qlen = test_rows / test_requests + (r < test_rows % test_requests);
+            req[1 + 4 * r] = int(row0);
+            req[2 + 4 * r] = int(qlen);
+            req[3 + 4 * r] = int(r);
+            req[4 + 4 * r] = int(test_kv_length);
+            row0 += qlen;
+        }
+    }
     bf16* dq = upload(q), *dk = upload(k), *dv = upload(v), *out;
     unsigned* trash = nullptr;
     constexpr size_t eviction_bytes = 256ull << 20;
@@ -100,11 +115,11 @@ template<int HD, int BKV> static bool check(unsigned kv_heads, unsigned stride,
         CK(cudaMemset(trash, 0, eviction_bytes));
     }
     int* dr = upload(req);
-    std::vector<CUtensorMap> maps(6);
+    std::vector<CUtensorMap> maps(size_t(slots) * 2);
     CUtensorMap* dm = nullptr;
     uint64_t* table = nullptr;
     if (tma) {
-        for (unsigned slot = 0; slot < 3; ++slot) for (unsigned operand = 0; operand < 2; ++operand) {
+        for (unsigned slot = 0; slot < slots; ++slot) for (unsigned operand = 0; operand < 2; ++operand) {
             uint64_t dims[]{HD, stride, kv_heads};
             uint64_t strides[]{HD * 2, uint64_t(HD) * stride * 2};
             uint32_t box[]{64, 32, 1}, steps[]{1, 1, 1};
@@ -116,7 +131,10 @@ template<int HD, int BKV> static bool check(unsigned kv_heads, unsigned stride,
             if (result != CUDA_SUCCESS) { std::fprintf(stderr, "tensor map: %d\n", int(result)); std::exit(2); }
         }
         dm = upload(maps);
-        table = upload(std::vector<uint64_t>{uint64_t(dm), 0, uint64_t(dm + 4)});
+        std::vector<uint64_t> map_table(slots);
+        for (unsigned slot = 0; slot < slots; ++slot)
+            map_table[slot] = uint64_t(dm + 2 * slot);
+        table = upload(map_table);
     }
     float *partial, *stats;
     CK(cudaMalloc(&out, q.size() * sizeof(bf16)));
@@ -283,10 +301,10 @@ template<int HD, int BKV> static bool check(unsigned kv_heads, unsigned stride,
         }
     }
     ok &= worst < 0.004 && max_error < 0.01;
-    std::printf("mode=%s seed=%u HD=%d BKV=%d KV=%u rows=%u kv_length=%u window=%u maps=%d checked=%u "
+    std::printf("mode=%s seed=%u HD=%d BKV=%d KV=%u requests=%u rows=%u kv_length=%u window=%u maps=%d checked=%u "
                 "worst_relL2=%.6g max_abs=%.6g best_us=%.3f median_us=%.3f %s\n",
                 interpreter ? "interpreter" : "body",test_seed,HD,interpreter ? 0 : BKV,kv_heads,
-                test_rows,test_kv_length,window,int(tma),checked,worst,max_error,
+                unsigned(req[0]),test_rows,test_kv_length,window,int(tma),checked,worst,max_error,
                 samples.empty() ? NAN : samples.front(),
                 samples.empty() ? NAN : samples[samples.size()/2],ok?"PASS":"FAIL");
     CK(cudaFree(dq)); CK(cudaFree(dk)); CK(cudaFree(dv)); CK(cudaFree(out));
@@ -330,6 +348,12 @@ int main(int argc, char** argv) {
             if (*end || value == 0 || value > capacity) return 2;
             test_rows = unsigned(value);
         }
+        else if (std::strcmp(argv[i], "--requests") == 0 && i + 1 < argc) {
+            char* end;
+            const auto value = std::strtoul(argv[++i], &end, 10);
+            if (*end || value == 0 || value > 16) return 2;
+            test_requests = unsigned(value);
+        }
         else if (std::strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
             char* end;
             const auto value = std::strtoul(argv[++i], &end, 10);
@@ -344,7 +368,10 @@ int main(int argc, char** argv) {
         !PLOW_TEST_FA_HD256_ONLY) return 2;
     if (!PLOW_TEST_FA_ROWS && test_kv_length != 16384) return 2;
     if (!PLOW_TEST_FA_ROWS && test_rows != 98) return 2;
-    if (test_kv_length < test_rows) return 2;
+    if (!PLOW_TEST_FA_ROWS && test_requests != 1) return 2;
+    if (test_requests > test_rows || test_kv_length < (test_rows + test_requests - 1) / test_requests)
+        return 2;
+    if (test_requests == 1 && test_kv_length < test_rows) return 2;
     bool ok = true;
     for (bool tma : {false, true}) {
         if (lean_hd256_bkv64) {
