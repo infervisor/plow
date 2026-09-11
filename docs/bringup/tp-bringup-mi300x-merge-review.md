@@ -139,6 +139,21 @@ artefact is the isolated A/B (MI300X here, H100 when a host is available), not a
 | 12 dangling `perf-data` links | reworded (reports are kept out of source control per d5f320df) |
 | 27 undocumented knobs | rows added for the emit knobs, `PLOW_TOKEN_BATCH`, `PLOW_PREFIX_CACHE` (corrected), `PLOW_MLA_PF_AITER`, `PLOW_DECODE_TIERS`, `PLOW_MAX_REQUEST_CHUNK`, `PLOW_EMIT_DECODE_NATIVE_TC` |
 
+### Upstream commits merged after the review (2026-09-11)
+
+| Commit | What | Review |
+|---|---|---|
+| d5f320df, 0e52a559 | gitignore for removed perf reports; opt-in W8A16 M1 prefill role (sm90a) | no default change; role validated by exact ABI + hash (`segment_roles.rs`) |
+| c1d34e53 | **Cross-request AMD MLA prefix sharing** through ROCr VMM (`exec/amd/shared_prefix.rs`, 1.1k lines; `VmmKv::new_tensors` for ckv/krot/kidx tracks; `PLOW_AMD_SHARED_PREFIX` auto-on for gfx942 packets with VMM, no legacy fusion, complete MLA cache writes) | Resolves review §4 "prefix cache ×2": geometry is packet-derived (writers/consumers checked per program), publish boundary is `rows/32*32` like CUDA (the `MIN_PREFIX=128` asymmetry is gone on this route), attach is staged on every rank and committed only on a common row count with `begin_slot` rollback. It is a **new default-on serving route for GLM on MI300X**; qualification on record is the 18/18 retrieval suite at C20 — a throughput A/B is still owed. Per-attach `Vec` for the copy pairs is per request, not per step. |
+| cc46cad6 | Paired GQA2 sm90a prefill attention segment (`PLOW_NV_FA_GQA2_PAIR`, `PLOW_NV_FA_ONLY_HD256_EXACT`, runtime `PLOW_PF_SEG_FA256_GQA2`) | all defaults 0/false; `GQA2_PAIR` is a `constexpr` so the default object is unchanged; H100 measurement later |
+
+Reuse landed on this branch: `impl EngineDevice for CudaBackend` (dd8f9fdd); one token-batch request +
+delivery contract for both backends (58699e9f) — device row layouts deliberately kept per object.
+Not unified, by evidence: the two token-batch planners emit different row layouts because the AMD
+object samples the leading band and the CUDA terminal gathers via a table (device ABI, not host
+duplication); `runtime/amd/token_batch.h` vs `runtime/common/token_batch.h` differ in API and the
+`PLOW_TOKEN_BATCH_DESC` mode (kernel-side change; re-digests the gfx942 object contract).
+
 Deferred (needs a GPU host or is a Phase 3/4 item): the A/Bs; tunedb gfx942 re-campaign;
 `retire_slot` publish-on-disconnect policy (needs a per-tick disconnect record); the two `.hip`
 harnesses stay script-driven (see runtime/bench/amd/dsa_decode/README.md); Phase 4 reuse beyond
