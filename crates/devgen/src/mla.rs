@@ -4416,6 +4416,32 @@ fn glm_gf_prefill(ctx: u32, nh_l: u32) -> u32 {
     gf
 }
 
+fn glm_prefill_projection_op(
+    c: &GlmCfg,
+    rows: u32,
+    n: u32,
+    k: u32,
+    n_cu: u32,
+    quant: kernelcaps::QuantScheme,
+) -> DevOp {
+    // Prefill objects already carry MM1 GEMV; larger rows need a different compiled width.
+    if crate::emit_is_amd()
+        && c.tp == 8
+        && c.hidden == 6144
+        && n_cu == 304
+        && rows == 1
+        && quant == kernelcaps::QuantScheme::None
+        && matches!(
+            (n, k),
+            (2048, 6144) | (512, 6144) | (64, 6144) | (4096, 2048)
+                | (512, 2048) | (6144, 2048) | (256, 6144)
+        )
+    {
+        return DevOp::Gemv;
+    }
+    pick_tile(rows, n, k, n_cu, quant)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_glm_lt_gemm(
     b: &mut Builder,
@@ -4910,7 +4936,7 @@ pub(crate) fn emit_glm_mla_prefill(
                 return counter;
             }
         }
-        let op = pick_tile(t, nn, k, n_cu, mxfp4_quant(enc));
+        let op = glm_prefill_projection_op(c, t, nn, k, n_cu, mxfp4_quant(enc));
         b.emit(op, all.clone(), deps, |d| {
             d.t[0] = out;
             d.t[1] = x;
@@ -5482,7 +5508,7 @@ fn emit_glm_moe_ffn_prefill(
      -> u32 {
         // Same fix as the sibling emitter above: the fp4 prefill GEMM goes through `pick_tile`
         // like every other encoding, instead of being pinned to the object's default tile.
-        let op = pick_tile(t, nn, k, n_cu, mxfp4_quant(enc));
+        let op = glm_prefill_projection_op(c, t, nn, k, n_cu, mxfp4_quant(enc));
         b.emit(op, all.clone(), deps, |d| {
             d.t[0] = out;
             d.t[1] = x;

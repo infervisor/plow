@@ -8,6 +8,49 @@
 use super::*;
 
 #[test]
+fn single_row_prefill_gemv_preserves_bf16_projection_layout() {
+    let _guard = crate::test_env::env_guard();
+    let _env = crate::test_env::EnvScope::set(&[
+        ("PLOW_GLM_FP8_KV", "1"), ("PLOW_UNISEG", "0"),
+    ]);
+    let mut c = glm_ref_cfg();
+    c.tp = 8;
+    for rows in [1, 2, 8, 128] {
+        let mut decl = Builder::new(304);
+        let n = declare_glm_rows_batched(&mut decl, &c, 81920, &[0], rows, 20, MoeEnc::Fp8Blk);
+        let mut b = Builder::new(304);
+        b.adopt_tensors(decl.tensors());
+        let all = b.all();
+        emit_glm_mla_prefill(&mut b, &c, &n, 0, 81920, rows, MoeEnc::Fp8Blk,
+            n.x, &[], false, &mut 0, &all);
+        let p = b.finish();
+        let projections: Vec<_> = p.insts.iter().filter(|d|
+            d.t[0] == n.qlr && d.t[1] == n.xn && d.t[2] == n.lw[0].qad
+        ).collect();
+        assert_eq!(projections.len(), 1);
+        let d = projections[0];
+        assert_eq!(d.op, if rows == 1 { DevOp::Gemv } else { DevOp::GemmSmall } as u16);
+        assert_eq!(d.i[..4], [rows, 2048, 6144, 0]);
+        assert_eq!(d.t[3..], [TENSOR_NONE; 5]);
+    }
+    let quant = kernelcaps::QuantScheme::None;
+    crate::with_emit_target_amd(false, || {
+        assert_eq!(glm_prefill_projection_op(&c, 1, 2048, 6144, 304, quant),
+            pick_tile(1, 2048, 6144, 304, quant));
+    });
+    assert_eq!(glm_prefill_projection_op(&c, 1, 6144, 256, 304, quant),
+        pick_tile(1, 6144, 256, 304, quant));
+    assert_eq!(glm_prefill_projection_op(&c, 1, 2048, 6144, 256, quant),
+        pick_tile(1, 2048, 6144, 256, quant));
+    let fp4 = mxfp4_quant(MoeEnc::Mxfp4);
+    assert_eq!(glm_prefill_projection_op(&c, 1, 2048, 6144, 304, fp4),
+        pick_tile(1, 2048, 6144, 304, fp4));
+    c.tp = 4;
+    assert_eq!(glm_prefill_projection_op(&c, 1, 2048, 6144, 304, quant),
+        pick_tile(1, 2048, 6144, 304, quant));
+}
+
+#[test]
 fn small_prefill_splits_allocate_and_emit_matching_partial_layouts() {
     let _guard = crate::test_env::env_guard();
     let _env = crate::test_env::EnvScope::set(&[
