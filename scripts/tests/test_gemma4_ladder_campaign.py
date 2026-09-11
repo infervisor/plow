@@ -140,6 +140,36 @@ class Gemma4LadderCampaignTests(unittest.TestCase):
                               "latency_ms": latency, "tpot_ms": latency})
         self.assertFalse(campaign.gate_serving(cells, 128, {}, "vllm")["pass"])
 
+    def test_throughput_win_cannot_hide_concurrent_latency_regression(self):
+        cells = [
+            {"arm": arm, "context": 16384, "concurrency": concurrency,
+             "output_tok_s": 110.0 if arm == "candidate" else 100.0,
+             "ttft_ms": 20.0 if arm == "candidate" and concurrency == 128 else 10.0,
+             "latency_ms": 30.0, "tpot_ms": 1.0}
+            for arm in ("candidate", "control") for concurrency in (1, 128)
+        ]
+        gate = campaign.gate_serving(cells, 128, {}, "control")
+        self.assertFalse(gate["pass"])
+        self.assertIn("C128 ttft_ms", gate["failures"][0])
+
+    def test_serving_comparison_requires_matching_workloads(self):
+        records = [
+            {"input": 16384, "concurrency": concurrency, "output": 128,
+             "output_tok_s": 100.0, "ttft_ms": 10.0, "latency_ms": 30.0,
+             "tpot_ms": 1.0}
+            for concurrency in (1, 128)
+        ]
+        control = campaign.reduce_serving(records, "control", 128, [16384])
+        for axis, value in (("output", 256), ("requested_cached_prefix_tokens", 8192),
+                            ("repeats", 2)):
+            candidate = [dict(cell, arm="candidate") for cell in control]
+            candidate[0][axis] = value
+            with self.assertRaisesRegex(campaign.CampaignError, axis):
+                campaign.gate_serving(control + candidate, 128, {}, "control")
+        with self.assertRaisesRegex(campaign.CampaignError, "mixed output"):
+            campaign.reduce_serving(records + [dict(records[0], output=256)],
+                                    "control", 128, [16384])
+
     def test_kernel_runner_is_control_then_candidate_and_requires_compile_axes(self):
         profile = {
             "arch": "sm90a", "dtype": "bf16", "phase": "prefill",

@@ -489,12 +489,22 @@ def reduce_serving(records, arm, max_concurrency, contexts):
         raise CampaignError(f"{arm}: serving cells differ: missing={sorted(expected-set(groups))}, extra={sorted(set(groups)-expected)}")
     cells = []
     for (context, concurrency), group in sorted(groups.items()):
+        workloads = {(x.get("output"), x.get("requested_cached_prefix_tokens", 0)) for x in group}
+        if len(workloads) != 1:
+            raise CampaignError(f"{arm}: mixed output lengths or cache targets in one serving cell")
+        output, cached_prefix = workloads.pop()
+        if type(output) is not int or output <= 1:
+            raise CampaignError(f"{arm}: serving output length must exceed one for TPOT")
+        if type(cached_prefix) is not int or not 0 <= cached_prefix < context:
+            raise CampaignError(f"{arm}: invalid cached prefix target")
         cells.append(
             {
                 "arm": arm,
                 "context": context,
                 "concurrency": concurrency,
                 "repeats": len(group),
+                "output": output,
+                "requested_cached_prefix_tokens": cached_prefix,
                 "output_tok_s": statistics.median(_metric(x, "output_tok_s") for x in group),
                 "ttft_ms": statistics.median(_metric(x, "ttft_ms") for x in group),
                 "latency_ms": statistics.median(_metric(x, "latency_ms") for x in group),
@@ -587,14 +597,16 @@ def gate_serving(cells, max_concurrency, gates, baseline):
         for concurrency in (1, max_concurrency):
             candidate = indexed[("candidate", context, concurrency)]
             reference = indexed[(baseline, context, concurrency)]
+            for axis in ("output", "requested_cached_prefix_tokens", "repeats"):
+                if candidate.get(axis) != reference.get(axis):
+                    raise CampaignError(f"{context} C{concurrency}: {axis} differs from {baseline}")
             row = {"context": context, "concurrency": concurrency, "baseline": baseline}
             for metric in ("output_tok_s", "ttft_ms", "latency_ms", "tpot_ms"):
                 row[metric + "_ratio"] = candidate[metric] / reference[metric]
             comparisons.append(row)
-            if concurrency == 1:
-                for metric in ("ttft_ms", "latency_ms", "tpot_ms"):
-                    if candidate[metric] > reference[metric] * tolerance:
-                        failures.append(f"{context} C1 {metric} is {candidate[metric]/reference[metric]:.4f}x {baseline}")
+            for metric in ("ttft_ms", "latency_ms", "tpot_ms"):
+                if candidate[metric] > reference[metric] * tolerance:
+                    failures.append(f"{context} C{concurrency} {metric} is {candidate[metric]/reference[metric]:.4f}x {baseline}")
             if concurrency == max_concurrency and candidate["output_tok_s"] < reference["output_tok_s"] * throughput_min:
                 failures.append(f"{context} C{concurrency} throughput is {candidate['output_tok_s']/reference['output_tok_s']:.4f}x {baseline}")
     return {"pass": not failures, "baseline": baseline, "failures": failures, "comparisons": comparisons}
