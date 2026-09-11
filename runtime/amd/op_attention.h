@@ -3681,6 +3681,9 @@ __device__ __forceinline__ bf16 mla_pf2_f2bf(float f) {
 #ifndef PLOW_MLA_PF_SV
 #define PLOW_MLA_PF_SV 0
 #endif
+#ifndef PLOW_MLA_PF_PSWZ
+#define PLOW_MLA_PF_PSWZ 0
+#endif
 /* gfx950-only PV transpose loads. The existing scalar path reconstructs one bf16x8
  * fragment with eight LDS reads and four packs; ds_read_b64_tr_b16 produces four
  * transposed bf16 values directly, so two instructions form the same fragment. */
@@ -3769,6 +3772,13 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
     const unsigned fr = lane & 15u;        /* A-row / B-col selector             */
     const unsigned kg = lane >> 4;         /* k-group: this lane's 8*kg slice    */
     bf16* Pw = Pw0 + wave * RW * BKV;
+    auto pindex = [](unsigned row, unsigned col) -> unsigned {
+#if PLOW_MLA_PF_PSWZ
+        return row * BKV + (col ^ ((row & 3u) << 3));
+#else
+        return row * BKV + col;
+#endif
+    };
     /* kv row base in HALVES. FA_MLA_PF2_SWZ=0 is the shipped identity map; =16 is the
      * PLOW_MLA_PF_SV block swizzle that de-conflicts the PV transpose read (see the
      * header note). Both are multiples of 8 halves, so every ds_read_b128 stays 16-byte
@@ -3856,7 +3866,7 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
         auto scale_row = [&](unsigned kv) -> unsigned {
             if constexpr (GATHER)
                 return kv < ucount ? ((unsigned)as_glob(upos)[kv] & kv_mask) : 0u;
-            return kv & kv_mask;
+            return kv < kv_end ? (kv & kv_mask) : 0u;
         };
 
         /* Q -> REGISTERS, once: lane's A-fragment row is my_q0+fr, k-slice kt*32 + kg*8. */
@@ -4235,8 +4245,8 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
                  * the score already loaded. */
                 const bf16 b0 = mla_pf2_f2bf(FP8 ? p0 * csv[0] : p0);
                 const bf16 b1 = mla_pf2_f2bf(FP8 ? p1 * csv[1] : p1);
-                Pw[(kg * 4 + (unsigned)i) * BKV + fr] = b0;
-                Pw[(kg * 4 + (unsigned)i) * BKV + 16 + fr] = b1;
+                Pw[pindex(kg * 4 + (unsigned)i, fr)] = b0;
+                Pw[pindex(kg * 4 + (unsigned)i, 16 + fr)] = b1;
                 if constexpr (!FP8) {
                     p0 = bf2f(b0);
                     p1 = bf2f(b1);
@@ -4308,13 +4318,13 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
                     float p = pe[nt][i];
                     if constexpr (FP8)
                         p *= csc[scale_row(kv0 + (unsigned)nt * 16 + fr)];
-                    Pw[(kg * 4 + i) * BKV + (unsigned)nt * 16 + fr] = f2bf(p);
+                    Pw[pindex(kg * 4 + (unsigned)i, (unsigned)nt * 16 + fr)] = f2bf(p);
                 }
 #endif
 
             /* ---- O += P·V, V = the latent columns of the SAME slab ---- */
             bf16x8 pf;
-            __builtin_memcpy(&pf, &Pw[fr * BKV + kg * 8], 16);
+            __builtin_memcpy(&pf, &Pw[pindex(fr, kg * 8)], 16);
 #if PLOW_MLA_PF_TR16
             /* The instruction transposes four adjacent LDS rows into four bf16 values
              * per lane. Lane decomposition matches the 16x16 MFMA B fragment. */
