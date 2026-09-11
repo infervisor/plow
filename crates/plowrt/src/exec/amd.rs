@@ -8386,7 +8386,10 @@ impl AmdEngine {
                 rows.max(128),
                 blob.decode_phase().any(has_moe_aiter),
                 use_resident_moe,
-                crate::config::RuntimeConfig::get().amd.moe_aiter_tile64,
+                crate::config::RuntimeConfig::get()
+                    .amd
+                    .moe_aiter_tile64
+                    .unwrap_or_else(|| amd_moe_aiter::tile64_available(hsaco_dir)),
                 &mut modules,
             )?)
         } else {

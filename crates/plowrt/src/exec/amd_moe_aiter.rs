@@ -22,6 +22,25 @@ const TILE64_OBJECT: &str = "fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_psx_64x256
 const TILE64_OBJECT_HASH: &str = "f8efb79a4ecfd80c7c4d6e20c797c7bdcdac26f1c22c825c640b239e07e88779";
 const TILE64_MIN_ROWS: u32 = 1024;
 
+/// The unset-flag default: the 64-row tile runs when the object dir carries the pinned object
+/// and a tile64-marked adapter (both from `scripts/build_moe_aiter.sh` with its 4th argument).
+/// Qualified on GLM-5.3 TP8 gfx942: 18/18 retrieval, 49.79 -> 50.57 tok/s at C20/70k.
+pub(super) fn tile64_available(dir: &Path) -> bool {
+    let object = std::fs::read(dir.join(TILE64_OBJECT))
+        .is_ok_and(|image| plow_asset::decode_objects::image_sha256(&image) == TILE64_OBJECT_HASH);
+    let adapter = std::fs::read(dir.join("moe_aiter_adapter_gfx942.elf")).is_ok_and(|image| {
+        super::amd::elf_symbol_names(&image).contains(&"plow_moe_aiter_tile64_abi_1")
+    });
+    if !(object && adapter) {
+        tracing::info!(
+            object,
+            adapter,
+            "64-row MoE prefill tile off: object dir lacks the pinned object or a tile64 adapter"
+        );
+    }
+    object && adapter
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mode {
     Sorted,
@@ -794,6 +813,16 @@ fn flat_moe_args(
 mod tests {
     use super::*;
     use packet::dev::StreamEnt;
+
+    #[test]
+    fn tile64_auto_requires_pinned_object_and_marked_adapter() {
+        let dir = std::env::temp_dir().join(format!("plow-tile64-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!tile64_available(&dir));
+        std::fs::write(dir.join(TILE64_OBJECT), b"not the pinned object").unwrap();
+        assert!(!tile64_available(&dir));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn sorted_prefill_routes_cover_the_full_append_ladder() {
