@@ -102,7 +102,9 @@ jobs:
       # The store, the reference grammar, the selector and the pull pipeline all
       # run against a `file://` fixture, so this needs no network and no GPU.
       - name: Distribution
-        run: cargo test -p plowrt --no-default-features --features cpu,dist --lib dist::
+        # Quoted: a plain scalar ending in `::` is a YAML mapping indicator, and
+        # GitHub then refuses the whole workflow before any job starts.
+        run: "cargo test -p plowrt --no-default-features --features cpu,dist --lib dist::"
       - name: serve is offline
         run: |
           tree=$(cargo tree -p plowrt --no-default-features --features cuda,hsa,cpu -e normal)
