@@ -329,6 +329,9 @@ impl SharedPrefix {
             pool.enable_block_recycling(
                 pool_cap / total_row_bytes * row_bytes * tensors.len() as u64,
             );
+            if crate::config::RuntimeConfig::get().vmm_deferred_reclaim() {
+                pool.enable_deferred_reclaim();
+            }
             groups.push(Group { pool, tensors });
         }
         Ok(Self {
@@ -388,12 +391,28 @@ impl SharedPrefix {
             .sum()
     }
 
+    #[cfg(test)]
+    fn sync_reclaim(&self) {
+        for group in &self.groups {
+            group.pool.sync_reclaim();
+        }
+    }
+
     pub fn begin_slot(&mut self, slot: usize) -> Result<()> {
         self.pending[slot].clear();
+        let t0 = std::time::Instant::now();
         for group in &self.groups {
             group.pool.begin_seq(slot);
         }
-        self.ensure_rows(slot, 1)
+        let t1 = std::time::Instant::now();
+        let result = self.ensure_rows(slot, 1);
+        tracing::debug!(
+            slot,
+            begin_us = (t1 - t0).as_micros() as u64,
+            ensure_us = t1.elapsed().as_micros() as u64,
+            "shared prefix begin_slot"
+        );
+        result
     }
 
     pub fn stage_attach(&mut self, slot: usize, prompt: &[u32]) -> Result<u32> {
@@ -930,30 +949,24 @@ mod tests {
         for group in &cache.groups {
             group.pool.begin_seq(0);
         }
-        let pooled: u64 = cache
-            .groups
-            .iter()
-            .map(|g| g.pool.stats().blocks_pooled)
-            .sum();
-        assert_eq!(pooled * ops.granularity().unwrap(), budget);
+        // Deferred reclaim (the AMD default): each group's private row-0 block
+        // stays in place for the next occupant; the rest park once the pool
+        // thread has unmapped them.
+        cache.sync_reclaim();
+        fn stat(cache: &SharedPrefix, f: fn(&crate::memory::vmm::VmmStats) -> u64) -> u64 {
+            cache.groups.iter().map(|g| f(&g.pool.stats())).sum()
+        }
+        let kept = cache.groups.len() as u64;
+        assert_eq!(stat(&cache, |s| s.blocks_kept), kept);
+        assert_eq!(stat(&cache, |s| s.blocks_stale), 0);
+        assert_eq!(
+            (stat(&cache, |s| s.blocks_pooled) + kept) * ops.granularity().unwrap(),
+            budget
+        );
         cache.begin_slot(0).unwrap();
         cache.ensure_rows(0, 256).unwrap();
-        assert_eq!(
-            cache
-                .groups
-                .iter()
-                .map(|g| g.pool.stats().blocks_created)
-                .sum::<u64>(),
-            created
-        );
-        assert_eq!(
-            cache
-                .groups
-                .iter()
-                .map(|g| g.pool.stats().blocks_reused)
-                .sum::<u64>(),
-            created
-        );
+        assert_eq!(stat(&cache, |s| s.blocks_created), created);
+        assert_eq!(stat(&cache, |s| s.blocks_reused), created - kept);
         drop(cache);
         let memory = ops.0.lock().unwrap();
         assert!(memory.blocks.is_empty());
