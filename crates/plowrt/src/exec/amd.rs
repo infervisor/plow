@@ -5339,6 +5339,9 @@ struct AmdProg {
     t: u32,
     packed_prefill_only: bool,
     token_batch_body: bool,
+    /// Runs the gathered (DSA) attention arm — indexer plus sparse flash — whose cost is set by
+    /// the selection width, not the prior context. Decides long-context tail placement.
+    sparse_prefill: bool,
     packed_dense: bool,
     packed_dense_error: Option<String>,
     packed_needs_mla: bool,
@@ -9191,6 +9194,11 @@ impl AmdEngine {
                 t: p.t,
                 packed_prefill_only: p.packed_prefill_only,
                 token_batch_body: p.token_batch_body,
+                sparse_prefill: p.insts.iter().any(|d| {
+                    d.op == DevOp::IndexTpPf as u16
+                        || d.op == DevOp::FlashGatherPrefill as u16
+                        || (d.op == DevOp::FlashMlaPrefillFp8 as u16 && sparse_fp8(d))
+                }),
                 packed_dense_error: check_packed_dense_program(&p.insts)
                     .err()
                     .map(|e| e.to_string()),
@@ -13105,6 +13113,12 @@ impl AmdEngine {
     /// and no prefill is five programs and still decode-only.
     pub fn has_prefill(&self) -> bool {
         self.dec_lo > 0
+    }
+
+    /// Whether prefill program `prog` runs the gathered (DSA) attention arm: the indexer plus the
+    /// sparse flash, whose cost is set by the selection width and not by the prior context.
+    pub fn prefill_prog_sparse(&self, prog: usize) -> bool {
+        prog < self.dec_lo && self.progs[prog].sparse_prefill
     }
 
     /// Compiled row count for a prefill program. Decode program indices are rejected.

@@ -2294,7 +2294,40 @@ fn run_one_tick(
                         (slot.step > 0).then(|| (i, *slot.out_ids.last().expect("decode output")))
                     })
                     .collect();
-                let candidates: Vec<(usize, Instant, u32)> = slots
+                // A body can only pack a slot that already has a cursor, and a fresh request
+                // acquires one otherwise only through the isolated path below — which a
+                // prefix-cache hit would then run alone at the smallest rung that holds its
+                // suffix. Seed every waiting slot first so the suffix is a candidate here.
+                for (i, slot_opt) in slots.iter_mut().enumerate().take(b) {
+                    let Some(slot) = slot_opt
+                        .as_ref()
+                        .filter(|slot| slot.step == 0 && !slot.respond.is_closed())
+                    else {
+                        continue;
+                    };
+                    if e.next_prefill_rows(i).is_some() {
+                        continue;
+                    }
+                    if let Err(err) = e.prepare_packed_prefill_slot(i, &slot.prompt_ids, tick_max) {
+                        note_fault(&mut tick_fault, &err);
+                        if let Some(taken) = slot_opt.take() {
+                            release_kv(&arena, taken.kv);
+                            let _ = taken.respond.try_send(StreamChunk::Err(err));
+                        }
+                        e.release(i);
+                    }
+                }
+                // WHOLE CHUNKS ONLY, oldest first. A member's next chunk is taken as planned or
+                // not at all: cutting a chunk to fit the body would run a slice of a sparse
+                // 8192 step through a dense body, which at long context costs several times the
+                // sparse launch it displaces. Chunks no body can hold stay with the planner arm
+                // below (one isolated launch each), and never block the ones that fit.
+                let capacity_for = |members: usize, rows: u32| {
+                    let leading = feeds.len() + members;
+                    e.token_batch_rows(leading, rows as usize)
+                        .map(|t| t.saturating_sub(leading as u32).min(tick_max))
+                };
+                let mut candidates: Vec<(usize, Instant, u32)> = slots
                     .iter()
                     .enumerate()
                     .take(b)
@@ -2303,46 +2336,45 @@ fn run_one_tick(
                         if slot.step != 0 || slot.respond.is_closed() {
                             return None;
                         }
-                        let rows = e.token_batch_prefill_rows(i, &slot.prompt_ids, tick_max);
-                        (rows > 0).then_some((i, slot.arrived, rows))
+                        let rows = e.token_batch_prefill_rows(i, &slot.prompt_ids, u32::MAX);
+                        let fits = rows > 0
+                            && rows <= tick_max
+                            && capacity_for(1, rows).is_some_and(|capacity| {
+                                rows <= capacity && e.token_batch_prefill_fits(i, capacity)
+                            });
+                        fits.then_some((i, slot.arrived, rows))
                     })
                     .collect();
+                let (rotate, turn) = (rt.pf_rotate(), e.prefill_turn());
+                candidates.sort_by_key(|&(slot, arrived, _)| {
+                    let cap = b.max(1);
+                    let distance = if rotate { (slot + cap - turn % cap) % cap } else { 0 };
+                    (distance, arrived, slot)
+                });
                 // `leading` bounds the selection stage and is not known until the pack is
                 // formed, so try the widest pack first and shrink. Assuming every member
                 // completes over-counts `leading`, which under-counts the prefill capacity —
                 // the safe direction: a plan that fits the assumed bucket also fits the real
-                // one.
+                // one. The pool is the `take` oldest candidates, so shrinking drops the
+                // youngest and every accepted pack is a prefix of the arrival order.
                 let mut chosen: Option<(u32, Vec<(usize, u32)>)> = None;
                 for take in (1..=candidates.len()).rev() {
                     let leading = feeds.len() + take;
                     let want: u32 = candidates[..take]
                         .iter()
-                        .fold(0u32, |sum, c| sum.saturating_add(c.2))
-                        .min(tick_max);
+                        .fold(0u32, |sum, c| sum.saturating_add(c.2));
                     let Some(rows) = e.token_batch_rows(leading, want as usize) else {
                         continue;
                     };
                     let capacity = rows.saturating_sub(leading as u32).min(tick_max);
-                    let list: Vec<_> = candidates[..take]
-                        .iter()
-                        .copied()
-                        .filter(|&(slot, _, _)| e.token_batch_prefill_fits(slot, capacity))
-                        .collect();
-                    if list.len() != take {
-                        continue;
-                    }
-                    let pack =
-                        amd_mixed_prefill_pack(list, capacity, rt.pf_rotate(), e.prefill_turn(), b);
+                    let pack = amd_token_batch_pack(&candidates[..take], capacity);
                     if pack.len() != take {
                         continue;
                     }
-                    // `amd_mixed_prefill_pack` may cut a member's take to fit the budget, so
-                    // which prompts actually FINISH here is only known now. `S = 0` means no
-                    // output segment, and this route has no way to run a body without one:
-                    // skip such a pack rather than stage a step the engine must refuse. The
-                    // common shape is an 8192-token prompt against an 8192-row bucket, where
-                    // one row is spent on the selection stage and the body cannot reach the
-                    // prompt's end.
+                    // Which prompts FINISH here decides whether the step has an output segment
+                    // at all: `S = 0` means none, and this route has no way to run a body
+                    // without one, so such a pack is skipped rather than staged for the engine
+                    // to refuse.
                     let completing = pack
                         .iter()
                         .filter(|&&(slot, take)| {
@@ -3349,6 +3381,22 @@ fn amd_prefill_pick(
             }
         })
         .map(|(slot, _)| slot)
+}
+
+/// Members of one token-batch body from an ordered candidate pool: every candidate whose whole
+/// next chunk fits what is left of `capacity`, in pool order, none of them cut. A chunk that
+/// does not fit is skipped, not sliced — the planner's whole-span rule.
+#[cfg(any(feature = "hsa", feature = "cpu"))]
+fn amd_token_batch_pack(candidates: &[(usize, Instant, u32)], capacity: u32) -> Vec<(usize, u32)> {
+    let mut budget = capacity;
+    let mut selected = Vec::new();
+    for &(slot, _, rows) in candidates {
+        if rows > 0 && rows <= budget {
+            selected.push((slot, rows));
+            budget -= rows;
+        }
+    }
+    selected
 }
 
 #[cfg(any(feature = "hsa", feature = "cpu"))]
@@ -4487,6 +4535,20 @@ mod tests {
             [(2, 127)]
         );
         assert!(amd_mixed_prefill_pack(candidates, 0, true, 0, 4).is_empty());
+    }
+
+    #[cfg(any(feature = "hsa", feature = "cpu"))]
+    #[test]
+    fn amd_token_batch_pack_takes_whole_chunks_in_pool_order_and_never_cuts() {
+        let now = Instant::now();
+        let pool = vec![(4, now, 700), (1, now, 300), (7, now, 2048), (2, now, 0), (9, now, 900)];
+        // 700 + 300 fit; 2048 does not and is skipped, not sliced; 900 fits what is left.
+        assert_eq!(amd_token_batch_pack(&pool, 2028), [(4, 700), (1, 300), (9, 900)]);
+        // Exactly full.
+        assert_eq!(amd_token_batch_pack(&pool, 1000), [(4, 700), (1, 300)]);
+        // Nothing fits: no member is cut to fit.
+        assert!(amd_token_batch_pack(&pool, 299).is_empty());
+        assert!(amd_token_batch_pack(&[], 4096).is_empty());
     }
 
     #[cfg(any(feature = "hsa", feature = "cpu"))]

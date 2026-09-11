@@ -844,6 +844,12 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-token-batch-solo", env = "PLOW_TOKEN_BATCH_SOLO", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub token_batch_solo: bool,
 
+    /// Prior-context floor (rows) above which a request's DENSE final chunk is planned into
+    /// the sparse (DSA) prefill bucket instead of the smallest bucket that holds it. Unset =
+    /// off (the tail stays in the smallest bucket). See `serve::engine::retarget_dense_tail`.
+    #[arg(long = "amd-tail-sparse-ctx", env = "PLOW_AMD_TAIL_SPARSE_CTX", global = true)]
+    pub tail_sparse_ctx: Option<u32>,
+
     /// Unified token batch: keep the WIDE dense-GEMM rungs plowc chose per shape.
     ///
     /// The token-batch object is the mixed object's shape, and at four waves the fused-GLU
