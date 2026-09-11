@@ -701,6 +701,49 @@ fn check_attention_hd512_role(
     Ok(())
 }
 
+fn validate_w8a16_prefill_m1_role_inst(
+    d: &DevInst64,
+    rows: u32,
+    slices: usize,
+    tensors: &[crate::asset::devblob::DevTensor],
+) -> Result<()> {
+    let reject = || RuntimeError::Rejected("invalid native SM90 W8A16 prefill GEMM role".into());
+    if d.op != DevOp::GemmFp8 as u16
+        || !d.is_mapless_w8a16_gemm()
+        || d.i[0] != rows
+        || rows != 1
+        || d.i[2] % 16 != 0
+        || d.i[3] != 0
+        || d.i[4] != 0
+        || d.i[5] != 0
+        || d.fj != [0; 3]
+        || d.blocks == 0
+        || usize::from(d.blocks) != slices
+        || [d.t[0], d.t[1], d.t[2], d.t[4]]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            != 4
+        || d.t[5..].iter().any(|&t| t != TENSOR_NONE16)
+    {
+        return Err(reject());
+    }
+    let extents = [
+        (d.t[0], u64::from(rows) * u64::from(d.i[1]) * 2),
+        (d.t[1], u64::from(rows) * u64::from(d.i[2]) * 2),
+        (d.t[2], u64::from(d.i[1]) * u64::from(d.i[2])),
+        (d.t[4], u64::from(d.i[1]) * 4),
+    ];
+    if extents.into_iter().any(|(handle, bytes)| {
+        tensors
+            .get(handle as usize)
+            .is_none_or(|tensor| tensor.bytes < bytes)
+    }) {
+        return Err(reject());
+    }
+    Ok(())
+}
+
 fn validate_gemv_decode_role_inst(
     d: &DevInst64,
     rows: u32,
@@ -984,6 +1027,64 @@ fn packet_role_segments(
         }
         let role = roles[seg];
         if role != plow_asset::segment_roles::INTERPRETER {
+            if role == plow_asset::segment_roles::W8A16_PREFILL_M1 {
+                let pcs: std::collections::BTreeSet<_> = entries.iter().map(|e| e.inst).collect();
+                for &pc in &pcs {
+                    if g.gq_stream
+                        .iter()
+                        .any(|e| e.inst == pc && e.seg as usize != seg)
+                        || g.stream
+                            .iter()
+                            .any(|e| e.inst == pc && e.seg as usize != seg)
+                    {
+                        return Err(RuntimeError::Rejected(
+                            "native W8A16 segment requires complete instructions".into(),
+                        ));
+                    }
+                    let slices = entries.iter().filter(|e| e.inst == pc).count();
+                    validate_w8a16_prefill_m1_role_inst(
+                        &g.insts[pc as usize],
+                        g.t,
+                        slices,
+                        tensors,
+                    )?;
+                    let mut actual: Vec<_> = entries
+                        .iter()
+                        .filter(|e| e.inst == pc)
+                        .map(|e| e.slice)
+                        .collect();
+                    actual.sort_unstable();
+                    if actual
+                        != (0..u32::from(g.insts[pc as usize].blocks)).collect::<Vec<_>>()
+                    {
+                        return Err(RuntimeError::Rejected(
+                            "native W8A16 segment omits or duplicates packet work".into(),
+                        ));
+                    }
+                }
+                let fields = |e: &packet::dev::StreamEnt| {
+                    (
+                        e.inst, e.slice, e.wait_ofs, e.succ_ofs, e.wait_len, e.succ_len, e.flags,
+                        e.seg,
+                    )
+                };
+                let mut queue: Vec<_> = entries.iter().map(fields).collect();
+                let mut stream: Vec<_> = g
+                    .stream
+                    .iter()
+                    .filter(|e| e.seg as usize == seg)
+                    .map(fields)
+                    .collect();
+                queue.sort_unstable();
+                stream.sort_unstable();
+                if queue != stream {
+                    return Err(RuntimeError::Rejected(
+                        "native W8A16 segment queue does not match packet stream".into(),
+                    ));
+                }
+                selected.push(role);
+                continue;
+            }
             let ix = entries[0].inst;
             let d = &g.insts[ix as usize];
             if entries.iter().any(|e| e.inst != ix)
@@ -3981,6 +4082,7 @@ impl GpuEngine {
                 plow_asset::segment_roles::PREFILL_ATTENTION
                     | plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32
                     | plow_asset::segment_roles::GEMV_CTA512
+                    | plow_asset::segment_roles::W8A16_PREFILL_M1
             ) && profile.tag != "sm90a"
             {
                 return Err(RuntimeError::Rejected("packet role requires SM90".into()));
@@ -4016,6 +4118,12 @@ impl GpuEngine {
                     "plow_sm90a_mxfp4_moe",
                     "plow_arena_bytes_mxfp4_moe",
                 ),
+                plow_asset::segment_roles::W8A16_PREFILL_M1 => (
+                    "plow_w8a16_prefill_m1_abi",
+                    "plow_block_pfgemm_w8a16_m1",
+                    "plow_sm90a_pfgemm_w8a16_m1",
+                    "plow_arena_bytes_pfgemm_w8a16_m1",
+                ),
                 _ => {
                     return Err(RuntimeError::Rejected(
                         "unsupported packet object role".into(),
@@ -4025,12 +4133,16 @@ impl GpuEngine {
             let path = assets_dir.join(&object.file);
             let image = std::fs::read(&path)
                 .map_err(|e| RuntimeError::Device(format!("{}: {e}", path.display())))?;
-            if id == plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32
+            if matches!(
+                id,
+                plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32
+                    | plow_asset::segment_roles::W8A16_PREFILL_M1
+            )
                 && object.sha256.as_deref()
                     != Some(plow_asset::decode_objects::image_sha256(&image).as_str())
             {
                 return Err(RuntimeError::Rejected(
-                    "HD512 attention role object hash mismatch".into(),
+                    "packet role object hash mismatch".into(),
                 ));
             }
             if id == plow_asset::segment_roles::MXFP4_MOE
@@ -4079,6 +4191,19 @@ impl GpuEngine {
                         return Err(RuntimeError::Rejected("incompatible MXFP4 MoE role".into()));
                     }
                 }
+                plow_asset::segment_roles::W8A16_PREFILL_M1 => {
+                    if capability != Some(1)
+                        || block != Some(BLOCK)
+                        || be.module_global_u32(&module, "plow_w8a16_prefill_m1_max_rows")?
+                            != Some(1)
+                        || be.module_global_u32(&module, "plow_w8a16_prefill_m1_k_multiple")?
+                            != Some(16)
+                    {
+                        return Err(RuntimeError::Rejected(
+                            "incompatible native SM90 W8A16 prefill GEMM role".into(),
+                        ));
+                    }
+                }
                 _ => unreachable!("object role validated above"),
             }
             let block = block.expect("validated role block");
@@ -4111,8 +4236,11 @@ impl GpuEngine {
                 || (id == plow_asset::segment_roles::MXFP4_MOE && capacity < role_grid)
                 || (!matches!(
                     id,
-                    plow_asset::segment_roles::GEMV_CTA512 | plow_asset::segment_roles::MXFP4_MOE
+                    plow_asset::segment_roles::GEMV_CTA512
+                        | plow_asset::segment_roles::MXFP4_MOE
+                        | plow_asset::segment_roles::W8A16_PREFILL_M1
                 ) && capacity != grid)
+                || (id == plow_asset::segment_roles::W8A16_PREFILL_M1 && capacity < grid)
             {
                 return Err(RuntimeError::Rejected(
                     "packet role occupancy must equal packet grid".into(),
@@ -7641,6 +7769,49 @@ mod gemv_role_tests;
 
 #[cfg(test)]
 mod mxfp4_moe_role_tests;
+
+#[cfg(test)]
+#[test]
+fn native_w8a16_m1_role_validates_exact_operands_and_extents() {
+    let tensors = [
+        ("out", 4096 * 2),
+        ("x", 3840 * 2),
+        ("weight", 4096 * 3840),
+        ("scale", 4096 * 4),
+    ]
+    .into_iter()
+    .map(|(name, bytes)| crate::asset::devblob::DevTensor {
+        name: name.into(),
+        bytes,
+        init: None,
+    })
+    .collect::<Vec<_>>();
+    let mut d = DevInst64::default();
+    d.op = DevOp::GemmFp8 as u16;
+    d.blocks = 66;
+    d.t = [0, 1, 2, TENSOR_NONE16, 3, TENSOR_NONE16, TENSOR_NONE16, TENSOR_NONE16];
+    d.i[..3].copy_from_slice(&[1, 4096, 3840]);
+    validate_w8a16_prefill_m1_role_inst(&d, 1, 66, &tensors).unwrap();
+    for bad in [
+        {
+            let mut x = d;
+            x.i[0] = 2;
+            x
+        },
+        {
+            let mut x = d;
+            x.t[4] = TENSOR_NONE16;
+            x
+        },
+        {
+            let mut x = d;
+            x.fj[0] = 1;
+            x
+        },
+    ] {
+        assert!(validate_w8a16_prefill_m1_role_inst(&bad, bad.i[0], 66, &tensors).is_err());
+    }
+}
 
 mod fp8_m1_role;
 use fp8_m1_role::{load_fp8_m1_role, validate_fp8_role_checkpoint};
