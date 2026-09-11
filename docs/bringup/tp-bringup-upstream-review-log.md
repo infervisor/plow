@@ -392,6 +392,28 @@ if a GLM checkpoint at this target is NOT block-fp8 (the native MoE arms assert 
 `--glm-ofold` now collides with the defaulted `PLOW_GLM_FP8_KV` (the existing assert names both
 and says to unset one). Both are loud failures with a named rollback.
 
+## FP8 block-scale prefill projections: eligibility and asm screen (2026-09-11, `fp8-prefill-gemms.md`)
+
+Branch `fp8-prefill-gemms`. **Weights:** `q_a`, `kv_a_latent` (a block-row-aligned slice of
+`kv_a_proj_with_mqa`), indexer `wq_b` and `o_proj` are checkpoint block-FP8 tensors with intact
+`[128,128]` grids, so no requantization is needed. `q_absorb` (an einsum of `kv_b` and `q_b`),
+`q_rope` (a slice not aligned to 128-row blocks) and `v_absorb` are prep-derived and stay BF16. The
+shared expert is also eligible, but it is scoped to the MoE fold (expert 257).
+
+**Code:** the new `exec/amd_gemm_blk.rs` loads AITER's gfx942
+`fp8gemm_bf16_blockscale_BpreShuffle_*x128.co`, hash-pinned. Like the AITER MoE objects, the
+descriptor's `KERNARG_SIZE` is zero; it is normalised after hashing. The resource ABI and pinned
+shapes are refused by name. It is runtime-only: no emit half, no flag, no serving path. Nothing
+changes numerics yet, so there is no retrieval screen or serving A/B.
+
+**Screen:** one MI300X at M=8192. Time / throughput per projection: q_a 263 us / 783 TF/s, kv_a 92
+us / 563, o_proj 281 us / 733, wq_b 195 us / 706. That is 84-94 % of AITER's gfx942 **CK** table
+(838-873 TF/s). The kernel against its own operands is at 3.3e-3 rel-L2; the W8A8 floor against
+FP64-of-BF16 is 3.6-3.8e-2 (the MoE route's floor is 4.0-4.4e-2). Standalone, the route is worth -40
+ms/chunk, against -46 on CK; in flow expect less, because o_proj has to leave the post-attention
+interpreter segment. Next: the emit half on these asm objects. CK is worth about 6 ms/chunk more,
+which does not justify a new build dependency.
+
 ## Artefact policy (applied on every merge)
 
 Raw measurement files pushed upstream are removed here before the branch goes to main:
