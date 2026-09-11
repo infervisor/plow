@@ -2223,6 +2223,132 @@ fn glm_native_decode_gemm_preserves_xcd_boundaries() {
 }
 
 #[test]
+fn glm_native_decode_gemm_ext_covers_rung8_and_narrow_projections() {
+    let _guard = crate::test_env::env_guard();
+    let _target = crate::EmitAmdGuard::set(true);
+    let _env = crate::test_env::EnvScope::set(&[
+        ("PLOW_MLA_PREFILL", "full:128"),
+        ("PLOW_GLM_PLACE_PF", "0"),
+        ("PLOW_GLM_MOE_AITER", "0"),
+        ("PLOW_GLM_MOE_FLAT_DECODE", "0"),
+        ("PLOW_GLM_GEMM_LT_DECODE", "1"),
+        ("PLOW_GLM_GEMM_LT_DECODE_EXT", "1"),
+        ("PLOW_GLM_GEMM_LT", "0"),
+        ("GLM_SHARD_HEAD", "1"),
+        ("PLOW_DECODE_BATCH_LADDER", "1,4,8,16,20"),
+        ("PLOW_EMIT_PACKED_PREFILL", "0"),
+        ("PLOW_UNISEG", "0"),
+    ]);
+    let dir =
+        std::env::temp_dir().join(format!("plow-glm-native-gemm-ext-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // GLM-5.3 geometry with the real vocab: the lm_head shard is the whitelisted [19360, 6144].
+    let config = serde_json::json!({
+        "model_type": "glm_moe_dsa", "num_hidden_layers": 4,
+        "hidden_size": 6144, "num_attention_heads": 64,
+        "kv_lora_rank": 512, "q_lora_rank": 2048,
+        "qk_nope_head_dim": 192, "qk_rope_head_dim": 64, "v_head_dim": 256,
+        "vocab_size": 154880, "rms_norm_eps": 1e-5,
+        "n_routed_experts": 256, "num_experts_per_tok": 8,
+        "moe_intermediate_size": 2048, "intermediate_size": 12288,
+        "first_k_dense_replace": 3, "routed_scaling_factor": 2.5,
+        "rope_theta": 8000000.0
+    });
+    std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+    let verify: crate::VerifyHook = Box::new(|model| {
+        let mut checked = 0;
+        for (prog, &rows) in model.progs.iter().zip(&model.prog_t) {
+            let native = prog
+                .insts
+                .iter()
+                .enumerate()
+                .filter(|(_, d)| d.op == DevOp::GemmLtPf as u16)
+                .collect::<Vec<_>>();
+            // Prefill buckets and rungs 1/4 stay on the interpreter GEMV.
+            if !matches!(rows, 8 | 16 | 20) {
+                assert!(native.is_empty(), "rows={rows}");
+                continue;
+            }
+            checked += 1;
+            let count = |shape: (u32, u32)| {
+                native
+                    .iter()
+                    .filter(|(_, d)| (d.i[1], d.i[2]) == shape)
+                    .count()
+            };
+            // The EXT shapes: k_rope and q_rope once per layer wherever the rung emits them
+            // unfused (fusions A/G fold them into a GemvQkv below their LDS fit), lm_head once.
+            let fused = |nq: u32, k: u32| {
+                prog.insts
+                    .iter()
+                    .filter(|d| d.op == DevOp::GemvQkv as u16 && (d.i[1], d.i[2]) == (nq, k))
+                    .count()
+            };
+            assert_eq!(count((64, 6144)) + fused(2048, 6144), 4, "k_rope rows={rows}");
+            assert_eq!(count((512, 2048)) + fused(4096, 2048), 4, "q_rope rows={rows}");
+            assert_eq!(count((19360, 6144)), 1, "lm_head rows={rows}");
+            // The base set the plain knob already routes is still routed where it is unfused
+            // (rung 8 folds q_a|kv_a into fusion A in this 4-layer model).
+            for shape in [
+                (2048, 6144),
+                (512, 6144),
+                (4096, 2048),
+                (6144, 2048),
+                (256, 6144),
+                (6144, 256),
+            ] {
+                let fused_form = match shape {
+                    (2048, 6144) | (512, 6144) => fused(2048, 6144),
+                    (4096, 2048) => fused(4096, 2048),
+                    _ => 0,
+                };
+                assert!(count(shape) + fused_form > 0, "{shape:?} rows={rows}");
+            }
+            assert!(
+                prog.insts.iter().all(|d| d.op != DevOp::Gemv as u16
+                    || !matches!((d.i[1], d.i[2]), (64, 6144) | (512, 2048) | (19360, 6144))),
+                "an EXT shape stayed on the interpreter GEMV at rows={rows}"
+            );
+            for (ix, inst) in native {
+                assert_eq!(inst.i[0], rows);
+                assert_eq!(inst.i[3], 1);
+                assert_eq!(inst.i[4..], [0; 4]);
+                let segment = prog
+                    .stream
+                    .iter()
+                    .find(|e| e.inst as usize == ix)
+                    .unwrap()
+                    .seg;
+                for e in prog.stream.iter().filter(|e| e.seg == segment) {
+                    assert_eq!(e.inst as usize, ix);
+                    assert_eq!(
+                        (e.wait_len, e.succ_len, e.flags & packet::dev::SE_XCTR),
+                        (0, 0, 0)
+                    );
+                }
+            }
+        }
+        assert_eq!(checked, 3);
+        Ok(crate::LeanReport::skipped(
+            "native decode GEMM EXT regression test",
+        ))
+    });
+    glm_emit_full(
+        &dir,
+        512,
+        dir.join("model.pkt").to_str().unwrap(),
+        304,
+        8,
+        true,
+        true,
+        "gfx942",
+        None,
+        Some(&verify),
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn glm_native_prefill_fold_preserves_xcd_boundaries() {
     let _guard = crate::test_env::env_guard();
     let _target = crate::EmitAmdGuard::set(true);

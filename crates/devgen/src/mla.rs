@@ -3146,13 +3146,21 @@ fn emit_glm_decode_gemm_lt(
     shape: [u32; 2],
     deps: &[u32],
 ) -> Option<u32> {
-    if !emit_config::active().glm_gemm_lt_decode
-        || !matches!(rows, 16 | 20)
-        || !matches!(
+    let cfg = emit_config::active();
+    // The EXT set: rung 8, and the narrow projections whose MM16 GEMV moves 14-65 GB/s
+    // (k_rope, q_rope, indexer k/weights, lm_head). Measured against the pinned kernels on one
+    // MI300X; see docs/flags-reference.md `PLOW_GLM_GEMM_LT_DECODE_EXT`.
+    let ext = cfg.glm_gemm_lt_decode_ext;
+    let rows_ok = matches!(rows, 16 | 20) || (ext && rows == 8);
+    let shape_ok = matches!(
+        shape,
+        [2048, 6144] | [512, 6144] | [4096, 2048] | [6144, 2048] | [256, 6144] | [6144, 256]
+    ) || (ext
+        && matches!(
             shape,
-            [2048, 6144] | [512, 6144] | [4096, 2048] | [6144, 2048] | [256, 6144] | [6144, 256]
-        )
-    {
+            [64, 6144] | [512, 2048] | [128, 6144] | [32, 6144] | [19360, 6144]
+        ));
+    if !cfg.glm_gemm_lt_decode || !rows_ok || !shape_ok {
         return None;
     }
     assert!(
@@ -4129,14 +4137,25 @@ fn emit_glm_dsa_decode_select(
             // Plain bf16 GEMV, explicitly — NOT the encoding-aware helper. Under MXFP4 that helper
             // would emit GEMV_MXFP4 against a bf16 weight with a null scale; the assert above makes the
             // combination unreachable, and this keeps it that way if the assert is ever relaxed.
-            let c_w = b.emit(DevOp::Gemv, all.to_vec(), &[c_rn1], |d| {
-                d.t[0] = n.widx;
-                d.t[1] = n.xn;
-                d.t[2] = w.iwp;
-                d.i[0] = rows;
-                d.i[1] = hi;
-                d.i[2] = h;
-                d.f[0] = 1.0;
+            let c_w = emit_glm_decode_gemm_lt(
+                b,
+                c,
+                enc,
+                rows,
+                [n.widx, n.xn, w.iwp],
+                [hi, h],
+                &[c_rn1],
+            )
+            .unwrap_or_else(|| {
+                b.emit(DevOp::Gemv, all.to_vec(), &[c_rn1], |d| {
+                    d.t[0] = n.widx;
+                    d.t[1] = n.xn;
+                    d.t[2] = w.iwp;
+                    d.i[0] = rows;
+                    d.i[1] = hi;
+                    d.i[2] = h;
+                    d.f[0] = 1.0;
+                })
             });
             // score[t] = Σ_h w[h]·ReLU(q_idx[h]·k_idx[t]) · scale  (scale = 1/√DI · 1/√HI; selection is
             // scale-invariant, this reproduces HF numerically).
@@ -7710,7 +7729,9 @@ fn glm_emit_full(
             );
             b.deny_uniseg();
         }
-        if emit_config::active().glm_gemm_lt_decode && matches!(rb, 16 | 20) {
+        if emit_config::active().glm_gemm_lt_decode
+            && (matches!(rb, 16 | 20) || (emit_config::active().glm_gemm_lt_decode_ext && rb == 8))
+        {
             assert!(
                 crate::emit_is_amd() && target == "gfx942",
                 "native GLM decode GEMM requires gfx942"
@@ -7900,16 +7921,33 @@ fn emit_glm_tail(
     // `lib.rs`' `nb_argmax` (`if decode && t > 1 { t } else { 0 }`) — 0 at one row keeps the
     // packet byte-identical to the pre-batch emit.
     let nb = if dec_batch && rows > 1 { rows } else { 0 };
-    let c_lm = b.emit(DevOp::Gemv, all, &[c_f], |d| {
-        d.t[0] = n.logits;
-        d.t[1] = n.xn;
-        d.t[2] = n.head;
-        d.i[0] = if nb > 0 { rows } else { 1 };
-        d.i[1] = vocab_l;
-        d.i[2] = c.hidden;
-        // a_row0: the last real row (host re-patches per chunk); 0 on the batched decode tail —
-        // every row samples.
-        d.i[4] = if nb > 0 { 0 } else { rows - 1 };
+    // Batched decode only: the prefill tail's `a_row0 = rows - 1` has no native form, and the
+    // helper's shape whitelist (GLM-5.3 vocab/8) is what keeps every other model byte-identical.
+    let lt = if nb > 0 {
+        emit_glm_decode_gemm_lt(
+            b,
+            c,
+            MoeEnc::Bf16,
+            rows,
+            [n.logits, n.xn, n.head],
+            [vocab_l, c.hidden],
+            &[c_f],
+        )
+    } else {
+        None
+    };
+    let c_lm = lt.unwrap_or_else(|| {
+        b.emit(DevOp::Gemv, all, &[c_f], |d| {
+            d.t[0] = n.logits;
+            d.t[1] = n.xn;
+            d.t[2] = n.head;
+            d.i[0] = if nb > 0 { rows } else { 1 };
+            d.i[1] = vocab_l;
+            d.i[2] = c.hidden;
+            // a_row0: the last real row (host re-patches per chunk); 0 on the batched decode tail —
+            // every row samples.
+            d.i[4] = if nb > 0 { 0 } else { rows - 1 };
+        })
     });
     let c_am = b.emit(DevOp::Argmax, (0..AMAX_BLOCKS).collect(), &[c_lm], |d| {
         d.t[0] = n.amax;

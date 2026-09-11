@@ -607,6 +607,11 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_GEMM_LT_DECODE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_gemm_lt_decode: bool,
 
+    /// Extend `--glm-gemm-lt-decode` to rung 8 and to the narrow BF16 decode projections
+    /// (k_rope, q_rope, indexer k/weights, lm_head) the MM16 GEMV serves at 14-65 GB/s.
+    #[arg(long, env = "PLOW_GLM_GEMM_LT_DECODE_EXT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_gemm_lt_decode_ext: bool,
+
     /// Use native gfx942 FP32 MLA fold GEMMs during prefill.
     #[arg(long, env = "PLOW_GLM_FOLD_LT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_fold_lt: bool,
@@ -1102,6 +1107,7 @@ impl EmitConfig {
             glm_decode_norm_rows: env_bool("PLOW_GLM_DECODE_NORM_ROWS"),
             glm_gemm_lt: env_bool("PLOW_GLM_GEMM_LT"),
             glm_gemm_lt_decode: env_bool("PLOW_GLM_GEMM_LT_DECODE"),
+            glm_gemm_lt_decode_ext: env_bool("PLOW_GLM_GEMM_LT_DECODE_EXT"),
             glm_fold_lt: env_bool("PLOW_GLM_FOLD_LT"),
             glm_gemv_wg: env_u32("PLOW_GLM_GEMV_WG"),
             glm_ofold: env_bool("PLOW_GLM_OFOLD"),

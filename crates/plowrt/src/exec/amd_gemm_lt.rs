@@ -46,8 +46,33 @@ impl Route {
     }
 }
 
+/// Pinned kernel per decode shape. The rung-8 rows and the narrow (64/512x2048/128/32/19360)
+/// shapes are the `PLOW_GLM_GEMM_LT_DECODE_EXT` set, chosen by a sweep of all twelve pinned
+/// kernels on one MI300X (cold-cache medians, FP64 oracle); the rung-8 entries reuse the rung-16
+/// kernels, whose 16-row tiles cover eight live rows through the kernel's own M edge.
 fn decode_choice(rows: u32, n: u32, k: u32) -> Option<(usize, u32)> {
     Some(match (rows, n, k) {
+        (8, 256, 6144) => (5, 524289),
+        (8, 6144, 256) => (4, 524289),
+        (8, 512, 6144) => (5, 524289),
+        (8, 2048, 6144) => (6, 524289),
+        (8, 4096, 2048) => (8, 524289),
+        (8, 6144, 2048) => (11, 524289),
+        (8, 64, 6144) => (6, 524289),
+        (8, 512, 2048) => (6, 524289),
+        (8, 128, 6144) => (6, 524289),
+        (8, 32, 6144) => (6, 524289),
+        (8, 19360, 6144) => (6, 524289),
+        (16, 64, 6144) => (6, 524289),
+        (16, 512, 2048) => (6, 524289),
+        (16, 128, 6144) => (6, 524289),
+        (16, 32, 6144) => (6, 524289),
+        (16, 19360, 6144) => (6, 524289),
+        (20, 64, 6144) => (5, 524289),
+        (20, 512, 2048) => (5, 524289),
+        (20, 128, 6144) => (5, 524289),
+        (20, 32, 6144) => (6, 524289),
+        (20, 19360, 6144) => (10, 524289),
         (16, 256, 6144) => (5, 524289),
         (16, 6144, 256) => (4, 524289),
         (16, 512, 6144) => (5, 524289),
@@ -430,17 +455,24 @@ mod tests {
             assert!(route.rebase(8193).is_err());
         }
     }
+    const DECODE_SHAPES: [(u32, u32); 11] = [
+        (2048, 6144),
+        (512, 6144),
+        (4096, 2048),
+        (6144, 2048),
+        (256, 6144),
+        (6144, 256),
+        (64, 6144),
+        (512, 2048),
+        (128, 6144),
+        (32, 6144),
+        (19360, 6144),
+    ];
+
     #[test]
     fn decode_routes_check_mode_geometry_and_rebasing() {
-        for rows in [16, 20] {
-            for (n, k) in [
-                (2048, 6144),
-                (512, 6144),
-                (4096, 2048),
-                (6144, 2048),
-                (256, 6144),
-                (6144, 256),
-            ] {
+        for rows in [8, 16, 20] {
+            for (n, k) in DECODE_SHAPES {
                 let (mut p, t) = fixture();
                 p.t = rows;
                 p.insts[0].i = [rows, n, k, 1, 0, 0, 0, 0];
@@ -452,10 +484,47 @@ mod tests {
                 p.insts[0].i[3] = 0;
                 assert!(routes(&p, &t, 1).is_err());
                 p.insts[0].i[3] = 1;
-                p.t = 8;
-                p.insts[0].i[0] = 8;
+                p.t = 4;
+                p.insts[0].i[0] = 4;
                 assert!(routes(&p, &t, 1).is_err());
             }
+        }
+    }
+
+    #[test]
+    fn decode_choice_grids_cover_every_pinned_shape_and_reject_unpinned() {
+        let specs: Vec<KernelSpec> = serde_json::from_str(include_str!(
+            "../../../../runtime/amd/glm_lt_decode_gfx942.json"
+        ))
+        .unwrap();
+        for rows in [8, 16, 20] {
+            for (n, k) in DECODE_SHAPES {
+                let (index, info1) = decode_choice(rows, n, k).unwrap();
+                // decode kernels follow the four prefill kernels in the pinned object
+                let spec = &specs[index - 4];
+                assert_eq!(info1 >> 16, 8, "XCC=8 mapping for every decode shape");
+                assert!(matches!(info1 & 0xffff, 1 | 6 | 8), "{rows}x{n}x{k}: WGM");
+                assert!(
+                    n.is_multiple_of(spec.mt_i),
+                    "{rows}x{n}x{k}: N must tile {}",
+                    spec.mt_i
+                );
+                let (mut p, t) = fixture();
+                p.t = rows;
+                p.insts[0].i = [rows, n, k, 1, 0, 0, 0, 0];
+                let route = routes(&p, &t, 1).unwrap()[0].unwrap();
+                let args = arguments(route, [0x100000000000, 32, 64], spec, info1);
+                assert_eq!(args.dims[3], n.div_ceil(spec.mt_i) * rows.div_ceil(spec.mt_j));
+                assert_eq!(args.dims[4..6], [n, rows]);
+            }
+        }
+        for (rows, n, k) in [
+            (4, 2048, 6144),
+            (8, 1024, 6144),
+            (16, 6144, 512),
+            (32, 2048, 6144),
+        ] {
+            assert!(decode_choice(rows, n, k).is_none(), "{rows}x{n}x{k}");
         }
     }
 }
