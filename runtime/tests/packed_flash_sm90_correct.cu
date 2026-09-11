@@ -30,12 +30,15 @@ using bf16 = __nv_bfloat16;
 static const char* interpreter_path = nullptr;
 static const char* snapshot_path = nullptr;
 static bool lean_hd512 = false;
+static float attention_scale = 0.0f;
 
 #ifndef PLOW_TEST_FA_ROWS
 #define PLOW_TEST_FA_ROWS 0
 #endif
-static_assert(PLOW_TEST_FA_ROWS == 0 ||
-              (PLOW_TEST_FA_ROWS >= 64 && PLOW_TEST_FA_ROWS <= 16384 && PLOW_TEST_FA_ROWS % 64 == 0));
+#ifndef PLOW_TEST_FA_HD256_ONLY
+#define PLOW_TEST_FA_HD256_ONLY 0
+#endif
+static_assert(PLOW_TEST_FA_ROWS >= 0 && PLOW_TEST_FA_ROWS <= 16384);
 constexpr unsigned heads = 16, capacity = PLOW_TEST_FA_ROWS ? PLOW_TEST_FA_ROWS : 128;
 constexpr unsigned real_rows = PLOW_TEST_FA_ROWS ? PLOW_TEST_FA_ROWS : 98;
 static unsigned blocks = 132;
@@ -44,11 +47,11 @@ template<int HD, int BKV>
 __global__ void run_attention(const bf16* q, const bf16* k, const bf16* v,
                              bf16* out, float* partial, float* stats, const int* req,
                              unsigned kv_heads, unsigned stride, unsigned mask,
-                             unsigned window, const void* maps, unsigned nblk) {
+                             unsigned window, const void* maps, unsigned nblk, float scale) {
     extern __shared__ float arena[];
     d_flash_prefill_mux<HD,64,BKV>(req, partial, stats, q, k, v, out,
         capacity, 16384, heads, kv_heads, 0, window, 1, stride, mask,
-        1.0f / sqrtf(float(HD)), blockIdx.x, nblk, arena, maps);
+        scale, blockIdx.x, nblk, arena, maps);
 }
 
 static std::vector<bf16> values(size_t n, uint32_t seed) {
@@ -69,6 +72,7 @@ template<class T> static T* upload(const std::vector<T>& host) {
 
 template<int HD, int BKV> static bool check(unsigned kv_heads, unsigned stride,
                                           unsigned mask, unsigned window, bool tma, bool profile) {
+    const float scale = attention_scale > 0.0f ? attention_scale : 1.0f / std::sqrt(float(HD));
     const auto q = values(size_t(capacity) * heads * HD, 123);
     const auto k = values(size_t(3) * kv_heads * stride * HD, 456);
     const auto v = values(k.size(), 789);
@@ -102,6 +106,10 @@ template<int HD, int BKV> static bool check(unsigned kv_heads, unsigned stride,
     CK(cudaMalloc(&stats, size_t(capacity) * heads * 2 * sizeof(float)));
     CK(cudaMemset(out, 0xff, q.size() * sizeof(bf16)));
     unsigned smem = FA_PRE_SMEM_FLOATS(HD,64,BKV) * sizeof(float);
+#if PLOW_NV_FA_WGITEM
+    if constexpr (HD == 256 && BKV == 32)
+        smem = FA_SM90_WGI_FLOATS(HD,64,BKV) * sizeof(float);
+#endif
     CUmodule module = nullptr;
     CUfunction interpreter = nullptr;
     PlowProgram packet{};
@@ -131,7 +139,7 @@ template<int HD, int BKV> static bool check(unsigned kv_heads, unsigned stride,
         inst.i[0] = capacity; inst.i[1] = 16384;
         inst.i[2] = heads; inst.i[3] = kv_heads;
         inst.i[5] = window; inst.i[6] = HD; inst.i[7] = 1;
-        inst.fj[0].f = 1.0f / sqrtf(float(HD));
+        inst.fj[0].f = scale;
         inst.fj[1].u = stride; inst.fj[2].u = mask;
         std::vector<PlowStreamEnt> entries(blocks);
         for (unsigned i = 0; i < blocks; ++i) {
@@ -162,7 +170,8 @@ template<int HD, int BKV> static bool check(unsigned kv_heads, unsigned stride,
             void* args[]{&packet};
             CD(cuLaunchKernel(interpreter, blocks, 1, 1, 256, 1, 1, smem, nullptr, args, nullptr));
         } else {
-            run_attention<HD,BKV><<<blocks,256,smem>>>(dq,dk,dv,out,partial,stats,dr,kv_heads,stride,mask,window,table,blocks);
+            run_attention<HD,BKV><<<blocks,256,smem>>>(dq,dk,dv,out,partial,stats,dr,kv_heads,
+                stride,mask,window,table,blocks,scale);
         }
     };
     reset_packet();
@@ -221,7 +230,7 @@ template<int HD, int BKV> static bool check(unsigned kv_heads, unsigned stride,
                 double score=0;
                 for (unsigned d=0; d<HD; ++d)
                     score += double(__bfloat162float(q[qi+d])) * __bfloat162float(k[ki+d]);
-                score /= std::sqrt(double(HD));
+                score *= scale;
                 scores[pos-begin]=score;
                 maximum=std::max(maximum,score);
             }
@@ -266,12 +275,22 @@ int main(int argc, char** argv) {
         }
         else if (std::strcmp(argv[i], "--interpreter") == 0 && i + 1 < argc) interpreter_path = argv[++i];
         else if (std::strcmp(argv[i], "--snapshot") == 0 && i + 1 < argc) snapshot_path = argv[++i];
+        else if (std::strcmp(argv[i], "--scale") == 0 && i + 1 < argc) {
+            char* end;
+            attention_scale = std::strtof(argv[++i], &end);
+            if (*end || !std::isfinite(attention_scale) || attention_scale <= 0.0f) return 2;
+        }
         else return 2;
     }
     if (lean_hd512 && !interpreter_path) return 2;
-    if (PLOW_TEST_FA_ROWS && !lean_hd512 && !PLOW_NV_FA512_KV64) return 2;
+    if (PLOW_TEST_FA_ROWS && !lean_hd512 && !PLOW_NV_FA512_KV64 &&
+        !PLOW_TEST_FA_HD256_ONLY) return 2;
     bool ok = true;
     for (bool tma : {false, true}) {
+#if PLOW_TEST_FA_HD256_ONLY
+        ok &= check<256,32>(8,2048,2047,1024,tma,profile);
+        continue;
+#endif
 #if PLOW_NV_FA512_KV64 && PLOW_TEST_FA_ROWS
         if (!interpreter_path) {
             ok &= check<512,32>(1,16384,0xffffffffu,0,tma,profile);

@@ -578,6 +578,10 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "pf-seg-fa512", env = "PLOW_PF_SEG_FA512", global = true)]
     pub pf_seg_fa512: Option<String>,
 
+    /// Route exact packed Gemma HD256/GQA2 BF16 attention to its isolated object.
+    #[arg(long = "pf-seg-fa256-gqa2", env = "PLOW_PF_SEG_FA256_GQA2", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub pf_seg_fa256_gqa2: bool,
+
     /// T35: submit each prefill chunk's segment chain as ONE CUDA graph.
     #[arg(long = "pf-seg-graph", env = "PLOW_PF_SEG_GRAPH", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pf_seg_graph: bool,

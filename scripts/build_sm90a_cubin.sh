@@ -194,6 +194,14 @@ if [ "${PLOW_BUILD_W8A8:-0}" = "1" ]; then
   PF_EXTRA="$PF_EXTRA -DPLOW_NV_W8A8=1 -DPGM90_FP8_PROMOTE=${PLOW_W8A8_PROMOTE:-1}"
 fi
 
+if [ "${PLOW_BUILD_FA_GQA2_PAIR:-0}" = "1" ] &&
+   { [ "${PLOW_BUILD_SEG:-0}" != "1" ] || [ "${PLOW_BUILD_FA512:-0}" != "1" ] ||
+     [ "${PLOW_BUILD_FA_WGITEM:-0}" != "1" ] ||
+     [ "${PLOW_BUILD_FA_HD256:-0}" != "1" ]; }; then
+  echo "FATAL: PLOW_BUILD_FA_GQA2_PAIR requires SEG=1, FA512=1, FA_WGITEM=1 and FA_HD256=1" >&2
+  exit 1
+fi
+
 # PLOW_BUILD_SEG=1: ALSO build the segmented-prefill object pair (T9c/T10 design,
 # first wired on Hopper by the gh200 prefill campaign):
 #   <out>_pfseg.cubin   — the FAT segmented object (every prefill arm, occ-1); runs the
@@ -336,6 +344,30 @@ if [ "${PLOW_BUILD_SEG:-0}" = "1" ]; then
     "${NVENV[@]}" \
       cuobjdump -symbols "$OUT_PFATTN" | grep -q "plow_sm90a_pfattn_hd512" || { echo "FATAL: pfattn hd512 symbol missing" >&2; exit 1; }
     echo "built $OUT_PFATTN ($(stat -c%s "$OUT_PFATTN") B)"
+
+    if [ "${PLOW_BUILD_FA_GQA2_PAIR:-0}" = "1" ]; then
+      OUT_PFGQA2="${OUT%.cubin}_pfpackedfa256_gqa2.cubin"
+      GQA2_PADDING=""
+      if [ "${PLOW_BUILD_MASKED_PADDING:-0}" = "1" ]; then
+        GQA2_PADDING="-DPLOW_NV_MASKED_PADDING=1"
+      fi
+      "${NVENV[@]}" \
+        "$NVCC" -std=c++17 -arch=sm_90a -O3 -cubin \
+        -I "$HERE/runtime/common" -I "$HERE/runtime/nvidia" \
+        -DPLOW_NV_PREFILL=1 -DPLOW_NV_SEGMENTS=1 -DPLOW_NV_FA_ONLY=1 \
+        -DPLOW_NV_FA_ONLY_HD256=1 -DPLOW_NV_FA_ONLY_HD256_EXACT=1 \
+        -DPLOW_NV_FA_WGITEM=1 -DPLOW_NV_FA_GQA2_PAIR=1 \
+        -DPLOW_NV_PACKED_REQUEST=1 -DPLOW_NV_PACKED_FA_WGMMA=1 \
+        -DPLOW_NV_PACKED_FA_TMA=1 -DPLOW_NV_GEMMA=1 -DPLOW_NV_FA_GF=2 \
+        -DPLOW_NV_EMBED_SMEM=1 $GQA2_PADDING $GEMMA_GATE $FLASH_EXTRA $PF_EXTRA \
+        -o "$OUT_PFGQA2" "$SRC"
+      "${NVENV[@]}" cuobjdump -symbols "$OUT_PFGQA2" | \
+        grep -q "_Z23interp_sm90a_pfpackedfa11PlowProgram" || {
+          echo "FATAL: packed HD256 GQA2 attention kernel missing" >&2
+          exit 1
+        }
+      echo "built $OUT_PFGQA2 ($(stat -c%s "$OUT_PFGQA2") B)"
+    fi
   fi
 fi
 

@@ -102,6 +102,8 @@
 /* T30 wgitem: two independent per-warpgroup partitions (each the full single-item claim). */
 #define FA_SM90_WGI_FLOATS(HD, BQ, BKV)                                                             \
     ((2 * 2 * ((BQ) * (HD) + 2 * FA_SM90_NS * (BKV) * (HD) + (BQ) * (BKV) + 512) + 2048 + 3) / 4)
+#define FA_SM90_GQA2_PAIR_FLOATS(HD, BQ, BKV)                                                       \
+    ((2 * (2 * (BQ) * (HD) + 2 * FA_SM90_NS * (BKV) * (HD) + 2 * (BQ) * (BKV)) + 2048 + 3) / 4)
 
 /* ---- local wgmma shapes ------------------------------------------------------------------
  * sm90_wgmma.cuh exposes m64n128k16 (64 f32/lane); flash needs n32 for the score tile and n64
@@ -224,6 +226,9 @@ template <int W> __device__ __forceinline__ int fa90_cm_off(int r, int c) {
 #ifndef PLOW_NV_FA_WGITEM
 #define PLOW_NV_FA_WGITEM 0
 #endif
+#ifndef PLOW_NV_FA_GQA2_PAIR
+#define PLOW_NV_FA_GQA2_PAIR 0
+#endif
 
 __device__ __forceinline__ void fa90_wg_bar(int wg) {
     asm volatile("bar.sync %0, %1;" ::"r"(wg + 1), "r"(128) : "memory");
@@ -245,6 +250,7 @@ __device__ void d_flash_prefill_sm90_wgitem(
     constexpr int NB0 = BKV / 8;
     constexpr int QT = BQ * 64;
     constexpr int KT = BKV * 64;
+    constexpr bool GQA2_PAIR = PLOW_NV_FA_GQA2_PAIR != 0;
     /* per-wg smem partition (elements), 1024B-aligned per wg */
     constexpr int PERWG =
         NSUB * QT + 2 * FA_SM90_NS * NSUB * KT + BQ * BKV + 512 /* align slack */;
@@ -258,36 +264,56 @@ __device__ void d_flash_prefill_sm90_wgitem(
     const int rB = rA + 8;
 
     __nv_bfloat16* const base0 = (__nv_bfloat16*)sm90_align1024(lds);
-    __nv_bfloat16* const Qs = (__nv_bfloat16*)sm90_align1024(base0 + (size_t)wg * PERWG);
-    __nv_bfloat16* const Ks = Qs + NSUB * QT;
+    __nv_bfloat16* const Qs = GQA2_PAIR
+        ? base0 + (size_t)wg * NSUB * QT
+        : (__nv_bfloat16*)sm90_align1024(base0 + (size_t)wg * PERWG);
+    __nv_bfloat16* const Ks = GQA2_PAIR ? base0 + 2 * NSUB * QT : Qs + NSUB * QT;
     __nv_bfloat16* const Vs = Ks + FA_SM90_NS * NSUB * KT;
-    __nv_bfloat16* const Ps = Vs + FA_SM90_NS * NSUB * KT;
+    __nv_bfloat16* const Ps = GQA2_PAIR
+        ? Vs + FA_SM90_NS * NSUB * KT + (size_t)wg * BQ * BKV
+        : Vs + FA_SM90_NS * NSUB * KT;
 
     __shared__ uint64_t fa90w_bar[2][FA_SM90_NS];
     unsigned fa90_ph[FA_SM90_NS] = {0, 0};
     bool fa90_tma[FA_SM90_NS] = {false, false};
-    if (mapkv && lt == 0) {
-        sm90_mbar_init(&fa90w_bar[wg][0], 1);
-        sm90_mbar_init(&fa90w_bar[wg][1], 1);
+    if (mapkv && (GQA2_PAIR ? tid == 0 : lt == 0)) {
+        const int owner = GQA2_PAIR ? 0 : wg;
+        sm90_mbar_init(&fa90w_bar[owner][0], 1);
+        sm90_mbar_init(&fa90w_bar[owner][1], 1);
     }
-    if (mapkv) fa90_wg_bar(wg);
+    if (mapkv) {
+        if constexpr (GQA2_PAIR)
+            __syncthreads();
+        else
+            fa90_wg_bar(wg);
+    }
 
     const unsigned gqa = n_head / n_kv_head;
     const float lscale = FA_SCALE(scale);
+    if constexpr (GQA2_PAIR) {
+        if (gqa != 2) {
+            if (tid == 0) __trap();
+            return;
+        }
+    }
 
     unsigned n_work;
     if (req) {
         n_work = 0;
         for (int r = 0; r < req[0]; r++) {
             const int qlen = req[2 + 4 * r];
-            if (qlen > 0) n_work += (unsigned)((qlen + BQ - 1) / BQ) * n_head;
+            if (qlen > 0)
+                n_work += (unsigned)((qlen + BQ - 1) / BQ) *
+                          (GQA2_PAIR ? n_kv_head : n_head);
         }
     } else {
-        n_work = ((seq_q + BQ - 1) / BQ) * n_head * nsplit;
+        n_work = ((seq_q + BQ - 1) / BQ) *
+                 (GQA2_PAIR ? n_kv_head : n_head) * nsplit;
     }
 
-    for (unsigned witem = slice * 2u + (unsigned)wg; witem < n_work; witem += nblk * 2u) {
-        unsigned sp, h, q0, sq = seq_q, skv = seq_kv, qp0 = q_pos0, ns = nsplit;
+    for (unsigned witem = GQA2_PAIR ? slice : slice * 2u + (unsigned)wg;
+         witem < n_work; witem += GQA2_PAIR ? nblk : nblk * 2u) {
+        unsigned sp, h, hkv, q0, sq = seq_q, skv = seq_kv, qp0 = q_pos0, ns = nsplit;
         size_t qoff = 0, kvoff = 0;
         const void* item_mapkv = mapkv;
         if (req) {
@@ -295,7 +321,11 @@ __device__ void d_flash_prefill_sm90_wgitem(
             int r = 0, qlen;
             for (;;) {
                 qlen = req[2 + 4 * r];
-                const unsigned nw_r = (qlen > 0) ? (unsigned)((qlen + BQ - 1) / BQ) * n_head : 0u;
+                const unsigned nw_r =
+                    (qlen > 0)
+                        ? (unsigned)((qlen + BQ - 1) / BQ) *
+                              (GQA2_PAIR ? n_kv_head : n_head)
+                        : 0u;
                 if (rem < nw_r) break;
                 rem -= nw_r;
                 r++;
@@ -303,8 +333,11 @@ __device__ void d_flash_prefill_sm90_wgitem(
             const int rq0 = req[1 + 4 * r], slot = req[3 + 4 * r], kvlen = req[4 + 4 * r];
             sp = 0;
             ns = 1;
-            h = rem % n_head;
-            q0 = (rem / n_head) * BQ;
+            const unsigned head_count = GQA2_PAIR ? n_kv_head : n_head;
+            const unsigned head_index = rem % head_count;
+            hkv = GQA2_PAIR ? head_index : head_index / gqa;
+            h = GQA2_PAIR ? hkv * gqa + (unsigned)wg : head_index;
+            q0 = (rem / head_count) * BQ;
             sq = (unsigned)qlen;
             skv = (unsigned)kvlen;
             qp0 = (unsigned)(kvlen - qlen);
@@ -317,10 +350,12 @@ __device__ void d_flash_prefill_sm90_wgitem(
 #endif
         } else {
             sp = witem % nsplit;
-            h = (witem / nsplit) % n_head;
-            q0 = (witem / (nsplit * n_head)) * BQ;
+            const unsigned head_count = GQA2_PAIR ? n_kv_head : n_head;
+            const unsigned head_index = (witem / nsplit) % head_count;
+            hkv = GQA2_PAIR ? head_index : head_index / gqa;
+            h = GQA2_PAIR ? hkv * gqa + (unsigned)wg : head_index;
+            q0 = (witem / (nsplit * head_count)) * BQ;
         }
-        const unsigned hkv = h / gqa;
 
         const unsigned per = (skv + ns - 1) / ns;
         const unsigned lo = sp * per;
@@ -347,9 +382,10 @@ __device__ void d_flash_prefill_sm90_wgitem(
             const bool full = use_tma && (kv0 + (unsigned)BKV <= hi);
             fa90_tma[buf] = full;
             if (full) {
-                if (lt == 0) {
-                    sm90_mbar_expect(&fa90w_bar[wg][buf], 2 * NSUB * KT * 2);
-                    const uint32_t bar = sm90_su32(&fa90w_bar[wg][buf]);
+                if (GQA2_PAIR ? tid == 0 : lt == 0) {
+                    const int owner = GQA2_PAIR ? 0 : wg;
+                    sm90_mbar_expect(&fa90w_bar[owner][buf], 2 * NSUB * KT * 2);
+                    const uint32_t bar = sm90_su32(&fa90w_bar[owner][buf]);
                     const int kvrow = (int)(kv0 & kv_mask);
 #pragma unroll
                     for (int sub = 0; sub < NSUB; sub++) {
@@ -361,7 +397,9 @@ __device__ void d_flash_prefill_sm90_wgitem(
                 }
                 return;
             }
-            for (int i = lt; i < BKV * NSUB * 8; i += 128) {
+            const int worker = GQA2_PAIR ? tid : lt;
+            const int workers = GQA2_PAIR ? 256 : 128;
+            for (int i = worker; i < BKV * NSUB * 8; i += workers) {
                 const int c = i & 7, sub = (i >> 3) % NSUB, r = i / (8 * NSUB);
                 const unsigned kv = kv0 + (unsigned)r;
                 const bool in = (kv < hi);
@@ -376,13 +414,17 @@ __device__ void d_flash_prefill_sm90_wgitem(
         auto waitKV = [&](int buf) {
             sm90_cp_wait<0>();
             if (fa90_tma[buf]) {
-                sm90_mbar_wait(&fa90w_bar[wg][buf], (int)(fa90_ph[buf] & 1u));
+                const int owner = GQA2_PAIR ? 0 : wg;
+                sm90_mbar_wait(&fa90w_bar[owner][buf], (int)(fa90_ph[buf] & 1u));
                 fa90_ph[buf]++;
                 fa90_tma[buf] = false;
             }
         };
 
-        fa90_wg_bar(wg); /* previous item's Qs/Ks/Vs/Ps reads complete before restaging */
+        if constexpr (GQA2_PAIR)
+            __syncthreads();
+        else
+            fa90_wg_bar(wg); /* previous item's Qs/Ks/Vs/Ps reads complete before restaging */
 
         for (int i = lt; i < BQ * NSUB * 8; i += 128) {
             const int c = i & 7, sub = (i >> 3) % NSUB, r = i / (8 * NSUB);
@@ -407,7 +449,10 @@ __device__ void d_flash_prefill_sm90_wgitem(
 
         for (int t = 0; t < ntile; t++) {
             const unsigned kv0 = eff_lo + (unsigned)t * BKV;
-            fa90_wg_bar(wg); /* (A) tile t visible wg-wide; tile t-1's buffer + Ps free */
+            if constexpr (GQA2_PAIR)
+                __syncthreads();
+            else
+                fa90_wg_bar(wg); /* (A) tile t visible wg-wide; tile t-1's buffer + Ps free */
             fa90_async_proxy_fence();
             if (t + 1 < ntile) stageKV(kv0 + BKV, sb ^ 1);
 

@@ -629,12 +629,15 @@ impl DevProg {
             Some("all") => 2u8,
             _ => 0u8,
         };
+        let fa256_gqa2 = rt.nv.pf_seg_fa256_gqa2;
         let v2_env = rt.nv.pf_seg_v2.as_deref();
         let seg_v2 = v2_env == Some("1");
         let seg_q8 = seg_v2 || v2_env == Some("q8");
         const FP8_OPS: [DevOp; 3] = [DevOp::GemmFp8, DevOp::GemmMedFp8, DevOp::GemmSmallFp8];
         const BF16_OPS: [DevOp; 3] = [DevOp::Gemm, DevOp::GemmSmall, DevOp::GemmMed];
         let mut class = vec![8u8; n_seg as usize];
+        let mut exact_fa256 = vec![false; n_seg as usize];
+        let mut other_in_exact_segment = vec![false; n_seg as usize];
         for e in &self.stream {
             let inst = self.insts.get(e.inst as usize).ok_or_else(|| {
                 RuntimeError::Device(format!(
@@ -644,6 +647,11 @@ impl DevProg {
                 ))
             })?;
             let op = inst.op;
+            if fa256_gqa2 && inst.is_hd256_gqa2_sliding_prefill() {
+                exact_fa256[e.seg as usize] = true;
+            } else {
+                other_in_exact_segment[e.seg as usize] = true;
+            }
             let flash_op = op == DevOp::FlashPrefill as u16 || op == DevOp::FlashPrefillFp8 as u16;
             if flash_op
                 && ((fa512_mode == 2 && (inst.i[6] == 256 || inst.i[6] == 512))
@@ -692,6 +700,17 @@ impl DevProg {
             };
             if flashy {
                 class[e.seg as usize] = 4;
+            }
+        }
+        for seg in 0..class.len() {
+            if exact_fa256[seg] {
+                if other_in_exact_segment[seg] {
+                    return Err(RuntimeError::Rejected(format!(
+                        "segment {seg} mixes exact HD256/GQA2 attention with another operator; \
+                         recompile with PLOW_SEG_FA256_GQA2=1"
+                    )));
+                }
+                class[seg] = 3;
             }
         }
         Ok(class)

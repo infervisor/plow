@@ -2403,6 +2403,16 @@ impl DevInst64 {
             && self.i[6] == 0
             && self.i[7] == 0
     }
+
+    pub fn is_hd256_gqa2_sliding_prefill(&self) -> bool {
+        self.op == DevOp::FlashPrefill as u16
+            && self.i[2] == 16
+            && self.i[3] == 8
+            && self.i[5] == 1024
+            && self.i[6] == 256
+            && self.i[7] == 1
+            && self.t[5] != TENSOR_NONE16
+    }
 }
 
 #[cfg(test)]
@@ -2429,9 +2439,37 @@ mod w8a16_tests {
         inst.op = DevOp::Gemm as u16;
         assert!(!inst.is_mapless_w8a16_gemm());
     }
+
+    #[test]
+    fn hd256_gqa2_sliding_prefill_requires_exact_geometry() {
+        let mut inst = DevInst::default();
+        inst.op = DevOp::FlashPrefill as u16;
+        inst.i = [0, 0, 16, 8, 0, 1024, 256, 1];
+        inst.t[5] = 1;
+        assert!(inst.is_hd256_gqa2_sliding_prefill());
+        assert!(inst.pack().is_hd256_gqa2_sliding_prefill());
+
+        for (slot, value) in [(3, 1), (5, 0), (6, 512), (7, 2)] {
+            let mut invalid = inst;
+            invalid.i[slot] = value;
+            assert!(!invalid.is_hd256_gqa2_sliding_prefill());
+        }
+        inst.op = DevOp::FlashPrefillFp8 as u16;
+        assert!(!inst.is_hd256_gqa2_sliding_prefill());
+    }
 }
 
 impl DevInst {
+    pub fn is_hd256_gqa2_sliding_prefill(&self) -> bool {
+        self.op == DevOp::FlashPrefill as u16
+            && self.i[2] == 16
+            && self.i[3] == 8
+            && self.i[5] == 1024
+            && self.i[6] == 256
+            && self.i[7] == 1
+            && self.t[5] != TENSOR_NONE
+    }
+
     /// Pack to the 64-byte wire format. Panics on a tensor handle that overflows
     /// the u16 wire slot or an op that populates both members of the `fj[1]`
     /// overlay — both are compiler bugs, not runtime conditions.

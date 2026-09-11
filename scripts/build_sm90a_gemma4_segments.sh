@@ -53,6 +53,23 @@ for gemma_packed in 0 1; do
       -o "$gemma_out/interp_sm90a_pfpackedseg.cubin" runtime/nvidia/interp_sm90a.cu
   fi
 done
+if [ "${PLOW_BUILD_FA_GQA2_PAIR:-0}" = 1 ]; then
+  gemma_gqa2_padding_flags=()
+  if [ "${PLOW_BUILD_MASKED_PADDING:-0}" = 1 ]; then
+    gemma_gqa2_padding_flags=(-DPLOW_NV_MASKED_PADDING=1)
+  fi
+  env -i PATH=/usr/local/cuda/bin:/usr/bin:/bin /usr/local/cuda/bin/nvcc \
+    "${gemma_flags[@]}" "${gemma_gqa2_padding_flags[@]}" -DPLOW_NV_PACKED_REQUEST=1 \
+    -DPLOW_NV_FA_ONLY=1 -DPLOW_NV_FA_ONLY_HD256=1 \
+    -DPLOW_NV_FA_ONLY_HD256_EXACT=1 -DPLOW_NV_FA_WGITEM=1 \
+    -DPLOW_NV_FA_GQA2_PAIR=1 -DPLOW_NV_PACKED_FA_WGMMA=1 \
+    -DPLOW_NV_PACKED_FA_TMA=1 \
+    -o "$gemma_out/interp_sm90a_pfpackedfa256_gqa2.cubin" \
+    runtime/nvidia/interp_sm90a.cu
+  /usr/local/cuda/bin/cuobjdump -symbols \
+    "$gemma_out/interp_sm90a_pfpackedfa256_gqa2.cubin" | \
+    grep -q plow_attention_sm90_hd256_gqa2_abi
+fi
 env -i PATH=/usr/local/cuda/bin:/usr/bin:/bin /usr/local/cuda/bin/nvcc \
   -std=c++17 -arch=sm_90a -O3 -cubin -Xptxas=-v \
   -I runtime/common -I runtime/nvidia \

@@ -629,6 +629,14 @@ __device__ __forceinline__ PlowStreamEnt ld_stream_ent(const PlowStreamEnt* p) {
 #ifndef PLOW_NV_FA_ONLY_HD256
 #define PLOW_NV_FA_ONLY_HD256 0
 #endif
+#ifndef PLOW_NV_FA_ONLY_HD256_EXACT
+#define PLOW_NV_FA_ONLY_HD256_EXACT 0
+#endif
+#if PLOW_NV_FA_ONLY_HD256_EXACT &&                                                               \
+    (!PLOW_NV_FA_ONLY || !PLOW_NV_FA_ONLY_HD256 || !PLOW_NV_FA_WGITEM ||                        \
+     !PLOW_NV_FA_GQA2_PAIR || !PLOW_NV_PACKED_REQUEST)
+#error "exact HD256 GQA2 attention requires the packed FA-only paired-WG body"
+#endif
 /* PLOW_NV_FA_ROPE=1 (T16): the FA object also carries HeadNormRope, so rope packets can
  * class 2 and the [rope, flash, merge] chain becomes one launch. */
 #ifndef PLOW_NV_FA_ROPE
@@ -737,7 +745,9 @@ __device__ __forceinline__ PlowStreamEnt ld_stream_ent(const PlowStreamEnt* p) {
 #define PLOW_NV_PRE_A512 FA_PRE_SMEM_FLOATS(512, 32, 16)
 #endif
 /* T30: the wgitem body doubles the hd256 claim (two per-wg partitions). */
-#if defined(PLOW_NV_FA_WGITEM) && PLOW_NV_FA_WGITEM
+#if PLOW_NV_FA_ONLY_HD256_EXACT
+#define PLOW_NV_PRE_A256 FA_SM90_GQA2_PAIR_FLOATS(256, 64, PLOW_NV_FA256_BKV)
+#elif defined(PLOW_NV_FA_WGITEM) && PLOW_NV_FA_WGITEM
 #define PLOW_NV_PRE_A256 FA_SM90_WGI_FLOATS(256, 64, PLOW_NV_FA256_BKV)
 #else
 #define PLOW_NV_PRE_A256 FA_PRE_SMEM_FLOATS(256, 64, PLOW_NV_FA256_BKV)
@@ -1376,6 +1386,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                 in->fj[1].u, in->fj[2].u, in->fj[0].f, slice, nblk, arena, TEN(7));
         else
 #endif
+#if !PLOW_NV_FA_ONLY_HD256_EXACT
         if (in->i[6] == 512)
 #if defined(PLOW_NV_HOPPER) && PLOW_NV_FA512_WG
             d_flash_prefill_mixed<512, 64, PLOW_NV_FA512_BKV>(
@@ -1388,6 +1399,9 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                 in->fj[1].u, in->fj[2].u, in->fj[0].f, slice, nblk, arena, TEN(7));
         else
             __trap();
+#else
+        __trap();
+#endif
 #else
         __trap();
 #endif
@@ -1424,6 +1438,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                 in->fj[2].u, in->fj[0].f, slice, nblk, arena, TEN(7));
         else
 #endif
+#if !PLOW_NV_FA_ONLY_HD256_EXACT
         if (in->i[6] == 512)
 #if defined(PLOW_NV_HOPPER) && PLOW_NV_FA512_WG
             /* wgmma hd512 arm (32k memo design (a)): BQ=64 q-tiles; the work enumeration
@@ -1444,6 +1459,9 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 #endif
         else
             __trap();
+#else
+        __trap();
+#endif
 #else
         __trap();
 #endif
@@ -2187,7 +2205,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 #endif
 
     case PLOW_DOP_FLASH_MERGE:
-#if PLOW_NV_LEAN_DECODE
+#if PLOW_NV_LEAN_DECODE || PLOW_NV_FA_ONLY_HD256_EXACT
         __trap();
 #else
 #if PLOW_HAS_FLASH_HD64
@@ -2221,7 +2239,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 #endif
         else
             __trap();
-#endif /* PLOW_NV_LEAN_DECODE */
+#endif /* PLOW_NV_LEAN_DECODE || PLOW_NV_FA_ONLY_HD256_EXACT */
         break;
 
 #if PLOW_NV_GEMMA && !PLOW_NV_PREFILL && PLOW_HAS_MOE_GEMMA
@@ -2635,6 +2653,11 @@ extern "C" __device__ unsigned PLOW_SYM(plow_w8a16_gemm_abi) = 0;
 extern "C" __device__ unsigned plow_attention_sm90_hd256_abi = 1;
 #else
 extern "C" __device__ unsigned plow_attention_sm90_hd256_abi = 0;
+#endif
+#if PLOW_NV_FA_ONLY_HD256_EXACT
+extern "C" __device__ unsigned plow_attention_sm90_hd256_gqa2_abi = 1;
+#else
+extern "C" __device__ unsigned plow_attention_sm90_hd256_gqa2_abi = 0;
 #endif
 #if !PLOW_NV_PREFILL && PLOW_NV_SCHED == 1 && !PLOW_NV_PLACE_DISPATCH && !PLOW_NV_GEMM_ONLY && !PLOW_NV_FA_ONLY && !PLOW_NV_SKELETON
 extern "C" __device__ unsigned plow_cublaslt_decode_abi = 1;
