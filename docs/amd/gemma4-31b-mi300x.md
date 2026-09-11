@@ -3770,6 +3770,279 @@ first divergence sits at token 16-32 across lengths.
   vLLM control and does not start plow, so the 0.520 quoted above is the
   previously published figure carried forward, not a same-session number.
 
+## Decode concurrency 16 and 32, and the HBM frontier underneath them (2026-09-08)
+
+Three questions, answered on one MI300X, TP1, BF16, Gemma-4-31B: does the
+`PLOW_GEMV_WALK` row loop recover B=16; what does B=32 actually cost; and how
+much concurrency fits in 192 GiB alongside 57.2 GiB of weights. The third one
+turns out to bind last, not first.
+
+### The `PLOW_GEMV_WALK` prediction is falsified, and so is the pair it was built against
+
+The walk study left a falsifiable claim in `devgen::gemv_staged_rows` and in
+`scripts/walk_b16_ab.sh`: *"at MM=8 serving t=16, B=16 should recover from 142.4
+back toward 202.3, because it restores both fusions and the non-spilling rung.
+If it does not, §5 is wrong."* Both halves of that sentence are wrong on gfx942.
+
+**The fusion half cannot be true here.** `gemv_fused_input_fits` compares the
+staged rows against `hwspec`'s gfx942 `decode_gemm_tile` — 15,360 halves, not
+the 73,728 the comment cites, which is gfx950's. At `hidden = 5376` that admits
+t=2 and refuses t=3, so the 4 and 8 rungs this blob already ships have no
+`fuse_qkv` and no `glu_fused` either, and `min(MM, t) * 5376 > 15360` for every
+MM the walk can be built at. Measured, not argued: the B=16 blob emitted with
+`PLOW_GEMV_WALK=1` is **byte-identical** to the one emitted without it
+(md5 `665eeb9f…` both ways), and the decode programs are 676 packets at t=1/2
+against 896 at t=4, t=8 and t=16 — the fused opcodes are present only on the two
+narrowest rungs. The walk on gfx942 is an OBJECT change and nothing else.
+
+**The latency half is measurable, and it goes the other way.** `amd-bench
+--batched`, the same instrument the 202.3/142.4 pair came from, n_cu 304, blob
+and object matched at each width, two reps agreeing to better than 0.5%:
+
+| blob | decode object | ctx 1024 | ctx 4096 | ms/step (ctx 1024) |
+|---|---|---:|---:|---:|
+| B=8  | MM=8, walk off  | 130.7 tok/s | 127.1 | 61.2 |
+| B=16 | MM=16, walk off | **163.3**   | 158.5 | 98.0 |
+| B=16 | MM=8, walk on   | 143.8       | 140.4 | 111.3 |
+| B=16 | MM=16, walk on  | 159.4       | —     | 100.4 |
+| B=32 | MM=16, walk on  | **174.4**   | 168.7 | 183.5 |
+| B=32 | MM=8, walk on   | 153.5       | 149.4 | 208.5 |
+
+The walk at MM=8 does not recover B=16 toward B=8's rate — it lands **12% below**
+the plain MM=16 object at the same batch. The pattern is the cost model
+`op_gemm.h` already states and nothing else: each halving of MM doubles the
+weight passes and costs ~12%, at B=16 and at B=32 alike. Walk-on at MM=16 costs
+1.8% against walk-off at the same bucket, which is the loop's own overhead.
+
+**And the pair itself does not reproduce.** B=16 is not a 30% regression on this
+tree; it is a **25% throughput win** over B=8. The most likely reason the old
+pair looked the way it did is that it was taken while `gm_lds_halves` still
+returned the CDNA4 arena on every part — the bug `gm_lds_halves`'s own doc
+comment records — so its B=8 blob fused and its B=16 blob did not, and the two
+arms differed in composition rather than width. With that bug fixed both are
+unfused and the comparison is monotone.
+
+### What the walk IS worth: it decouples the object from the rung
+
+Two facts that survive:
+
+* One MM=8 walking object serves B=16, B=24 and B=32 — the three
+  `PLOW_DECODE_BATCH` values produce a byte-identical `interp_decode.elf`. A
+  walking object has no capacity to exceed, which is what `check_gemv_capacity`
+  already says.
+* It is the cheapest object. Scratch ops in the persistent decode kernel
+  (ISA count, which the tree treats as the authority over `.vgpr_spill_count`):
+
+  | object | scratch ops | `interp_decode.elf` |
+  |---|---:|---:|
+  | MM=8, walk off  | 537 | 1.42 MB |
+  | MM=8, walk on   | **322** | 1.42 MB |
+  | MM=16, walk off | 777 | 1.95 MB |
+  | MM=16, walk on  | 868 | 1.97 MB |
+  | MM=32, walk on  | 1813 | 2.34 MB |
+
+  Fewer registers did not buy throughput here. This step is bandwidth-bound on
+  57 GiB of weights, and the walk spends exactly what it saves by re-reading them.
+
+Token identity holds at every width: `--batched` with two distinct prompts, 32
+slots, every even slot bit-identical to slot 0 and every odd slot to slot 1,
+on both walking objects.
+
+### B=32 needs no kernel work, and buys almost nothing
+
+`PLOW_GEMV_MAXM` is not the ceiling. A walking object serves any M in
+`ceil(M/MM)` passes, `check_gemv_capacity` accepts it on the
+`plow_gemv_walk_1` marker, and the runtime's real bound is
+`XARGMAX_MAX_BATCH = 128`. The only thing that refused a 32 rung was the
+emitter's decode/prefill rung-width separation colliding with the sub-128
+prefill floor, now withdrawn to `PLOW_PF_FLOOR` (default off). With that gone,
+`PLOW_DECODE_BATCH_LADDER=1,2,4,8,16,32` emits cleanly and serves.
+
+What it buys is 174.4 tok/s against B=16's 163.3 — **+6.8% throughput for +87%
+per-token latency**. The knee is at 16. Getting more would need MM=32 so the
+walk makes one pass instead of two, and that is measured below: it is 2.9x
+SLOWER, not faster.
+
+### The HBM frontier, which is not where it was thought to be
+
+The claim this section was opened to check — *"a Gemma-4-31B emit at
+max_ctx=131072 reports weights 57.2 GiB and KV cache 180.00 GiB, so the shipped
+configuration cannot be concurrency-scaled at full context at all"* — is an
+artifact of a non-default prefill chunk, not of the shipped emit.
+
+180.00 GiB reproduces exactly, and only, with `PLOW_MAX_CHUNK=8192`. That chunk
+sizes the sliding-layer ring at `next_pow2(1024 + 8192 - 1) = 16384` rows, and 50
+of this model's 60 layers are sliding, so it inflates their cache 8x for nothing
+— the ring is window-bounded and never reads past 1024. The **shipped**
+window-derived default (`default_chunk(1024) = 1024`, ring 2048) reports
+**92.50 GiB** at the same `max_ctx=131072` and `PLOW_DECODE_BATCH=8`. Weights
+57.2 + activations 0.47 + KV 92.50 = 150.2 GiB, which fits 192 with 40 GiB to
+spare. (`PLOW_MAX_CHUNK` also silently narrows the default ladder through the
+memory-sizing loop, which is how a chunk-8192 emit at ctx 131072 ends up on
+1,2,4 rather than 1,2,4,8.)
+
+The KV cache is exactly linear in the decode width — slot `s`'s block is
+`s * kv_head * ring * hd`, invariant in the rung — so the whole frontier follows
+from one per-slot number. Per slot, GiB, chunk 1024:
+
+| max_ctx | BF16 KV | FP8 KV | FP8 on full-attention layers only |
+|---:|---:|---:|---:|
+| 8192 | 2.188 | 1.108 | 1.877 |
+| 16384 | 2.812 | 1.423 | 2.192 |
+| 32768 | 4.062 | 2.053 | 2.822 |
+| 65536 | 6.562 | 3.313 | 4.082 |
+| 131072 | 11.562 | 5.833 | 6.602 |
+
+The sliding half is constant in context (1.5625 GiB/slot, all of it ring); the
+full-attention half is `10 layers * 2 * ctx * 4 kv-heads * 512 hd * elt` and is
+the only term that grows. Against the emitter's own budget rule
+(`capacity - 2 GiB` = 190 GiB) minus 57.2 GiB of weights and 0.47 GiB of
+activations, 132.3 GiB of KV is available, and the maximum concurrency is:
+
+| max_ctx | BF16 | FP8 | FP8 full-layers-only |
+|---:|---:|---:|---:|
+| 8192 | 60 | 119 | 70 |
+| 16384 | 47 | 92 | 60 |
+| 32768 | 32 | 64 | 46 |
+| 65536 | 20 | 39 | 32 |
+| 131072 | **11** | 22 | 20 |
+
+So the frontier, stated as the question was asked:
+
+* **c=8 fits at every context up to 131072 in BF16** (150.2 GiB resident).
+* **c=16 fits in BF16 to 65536** (162.7 GiB). At 131072 it needs 242.7 GiB and
+  does not fit; FP8 KV would fit it at 151.0 GiB.
+* **c=32 fits in BF16 to 32768** (187.7 GiB, and that is 2.3 GiB under the
+  emitter's own budget — too close to serve without checking free HBM on the
+  actual card). FP8 KV moves it to 65536 (163.7 GiB).
+* Nothing reaches c=32 at 131072 in any encoding.
+
+Every cell of the per-slot table is the emitter's own reported footprint, which
+is the number the runtime then allocates — `plowrt` carves one slab and the log
+line reports it (75.2 GiB resident for the ctx 8192 / B=8 blob, matching
+57.2 + 0.47 + 17.50 exactly). The largest configuration actually made resident
+on a card here is **ctx 8192 / B=32, 127.7 GiB**, which loaded and served. The
+rows above that were computed from the closed form and checked against emits,
+not loaded.
+
+The FP8 columns are arithmetic, not a qualification: `PLOW_FP8_KV` is recorded
+lossy (greedy diverges after ~21 tokens), and a BF16-weight/FP8-KV pairing was
+not served here. The FP8-full-layers-only column is the interesting one for this
+model, because it halves precisely the term that grows with context and leaves
+the window-bounded rings alone.
+
+### Served, and the reason the ladder still stops at 8
+
+`plowrt bench` through the production mux, 128-token random prompts, 128 output
+tokens, `requests = 6 * concurrency`, warmup = concurrency, one leased MI300X:
+
+| blob | decode object | c | tok/s | TTFT p50 ms | TPOT p50 ms | TPOT p99 ms |
+|---|---|---:|---:|---:|---:|---:|
+| B=8  | MM=8, walk off  | 1  | 24.67 | 88.46 | 40.16 | 40.24 |
+| B=8  | MM=8, walk off  | 4  | 74.91 | 260.05 | 51.54 | 52.43 |
+| B=8  | MM=8, walk off  | 8  | **117.31** | 281.93 | 64.97 | 69.41 |
+| B=16 | MM=16, walk off | 8  | 85.02 | 333.15 | 90.19 | 94.55 |
+| B=16 | MM=16, walk off | 16 | **146.04** | 257.13 | 105.49 | 114.06 |
+| B=16 | MM=8, walk on   | 8  | 114.24 | 285.44 | 66.74 | 71.19 |
+| B=16 | MM=8, walk on   | 16 | 129.65 | 271.50 | 119.42 | 128.15 |
+| B=32 | MM=16, walk on  | 8  | 81.38 | 341.93 | 94.23 | 98.60 |
+| B=32 | MM=16, walk on  | 16 | 143.32 | 259.37 | 107.42 | 116.12 |
+| B=32 | MM=16, walk on  | 32 | **156.46** | 339.60 | 197.64 | 201.11 |
+| B=32 | MM=8, walk on   | 16 | 129.41 | 271.70 | 119.74 | 128.47 |
+| B=32 | MM=8, walk on   | 32 | 140.08 | 362.73 | 221.26 | 225.08 |
+
+The best cell at each concurrency is 117.3 tok/s at c=8, 146.0 at c=16 and 156.5
+at c=32, and the per-token latency that buys them is 65.0, 105.5 and 197.6 ms.
+**c=16 is +24.5% throughput for +62% TPOT; c=32 is a further +7.1% for a further
++87% TPOT.** Whether the first trade is worth taking is an SLO question; the
+second one is not close.
+
+What is not an SLO question is the third and fourth columns of that table: a
+blob whose widest rung is 16 or 32 must be paired with an MM=16 object, and that
+object takes **c=8 from 117.3 to 85.0 tok/s, -27.5%** — arithmetic computed for
+eight dead rows and discarded, exactly as the `PLOW_DECODE_TIER` note in
+`scripts/build_gfx942.sh` predicts for a bucket wider than the packet. A single
+gfx942 production ladder cannot have both. `PLOW_DECODE_TIERS`, which builds one
+object per rung and which `plowrt` already co-loads through
+`PLOW_HSACO_LOWRUNG`, is the mechanism that would let a 16 rung be added without
+paying for it below 8; it is not part of the shipped gfx942 recipe and was not
+measured here. **Until it is, the production ladder should stay at `1,2,4,8`** —
+not because the 16 rung is slow, but because the object it requires is.
+
+### MM=32 is not the way out
+
+The walk buys capacity, not amortisation: `ceil(M/MM)` passes over the weights
+is `ceil(M/MM)` times the traffic. Cutting the passes needs a wider bucket, and
+that is where registers bind. `PLOW_GEMV_MAXM` is `#ifndef`-guarded precisely so
+this could be priced, and it now has been — `-DPLOW_GEMV_MAXM=32
+-DPLOW_GEMV_MM=32 -DPLOW_GEMV_WALK=1`, B=32 blob, same instrument:
+
+| decode object | B=32 tok/s, ctx 1024 | ms/step | ISA scratch ops |
+|---|---:|---:|---:|
+| MM=16, walk | **174.1** | 183.9 | 868 |
+| MM=32, walk | 60.6 | 528.3 | 1813 |
+
+**2.9x slower.** `d_gemv_t<MM>` carries `float acc[MM]` per lane and MM=32
+doubles the spill; the step is bandwidth-bound, and spilling turns it into a
+scratch-bound one. Raising `PLOW_GEMV_MAXM` on this part is not a capacity lift
+waiting for someone to take it. (MM=64 builds too, at 4.08 MB and an
+implausibly low main-kernel scratch count that almost certainly reflects
+outlining rather than a fix; it was not measured.)
+
+### Correctness
+
+`amd-bench --batched` with two distinct prompts, 32 slots: all 16 even slots
+produce a chain bit-identical to slot 0 and all 16 odd slots one bit-identical to
+slot 1, on the MM=8 and the MM=16 walking objects alike. That is the gate the
+§6g-BATCH silent-corruption bug (slots 13/14/15 fluent-but-wrong) exists for, and
+it is clean at both widths.
+
+### What this changes, and what it does not
+
+* **Not changed: the gfx942 production ladder stays `1,2,4,8`.** The reason in
+  `apply_production_defaults` is corrected, not the value.
+* **Not changed: `PLOW_GEMV_MAXM` stays 16**, and the static assert and build-script
+  clamp with it. 32 does not need them raised — a walking object serves any M in
+  `ceil(M/MM)` passes and `check_gemv_capacity` accepts it on `plow_gemv_walk_1`
+  — and raising them is a 2.9x loss.
+* **Corrected in the tree**: the fusion/`73728` argument in
+  `devgen::gemv_staged_rows`, `apply_production_defaults` and
+  `scripts/walk_b16_ab.sh`, all of which cite the gfx950 arena on a gfx942 path,
+  and the 202.3/142.4 pair, which does not reproduce.
+* **Open, and the highest-value next step**: a `PLOW_DECODE_TIERS` gfx942 recipe.
+  It is the only thing that makes concurrency 16 free below 8, and it is
+  ~25-40 s of serial build wall per rung.
+
+### Reproduction
+
+```bash
+# objects: one full base set, then one decode row per arm over a copy of it
+PLOW_ROWS_ONLY==interp_decode PLOW_DECODE_BATCH=16 \
+  scripts/build_gfx942.sh <dir>                                  # MM=16, walk off
+PLOW_ROWS_ONLY==interp_decode PLOW_DECODE_BATCH=32 \
+  PLOW_GEMV_MM=16 PLOW_GEMV_WALK=1 scripts/build_gfx942.sh <dir> # MM=16, walk on
+
+# blobs (PLOW_PF_FLOOR unset: prefill buckets [128,512,1024], so a 32 rung fits)
+PLOW_DECODE_BATCH_LADDER=1,2,4,8,16,32 target/release/plowc \
+  --hf-dir build-gemma31/checkpoint --gpu MI300X --arch gfx942 --num-gpus 1 \
+  --max-ctx 8192 --out <assets>
+
+# device ceiling, and the token gate
+plowrt amd-bench --blob <assets>/model.pkt --hsaco <dir> \
+  --checkpoint build-gemma31/checkpoint --batched --ctx 1024 --steps 65
+plowrt amd-bench ... --batched --prompt "<idsA>;<idsB>" --steps 8
+
+# served
+plowrt --rt-hsaco <dir> bench --assets <assets> --random-input-len 128 \
+  --output-len 128 --concurrency 16 --requests 96 --warmup-requests 16
+```
+
+Every GPU process under `perf-data/tools/gpulease -n 1`. `plowrt` must be built
+`--features plowrt/hsa` or none of this code is in the binary. Numbers above are
+one MI300X, TP1, BF16, clocks and power unpinned, with other agents' workloads on
+other cards of the same host; device-ceiling cells repeated twice agreed to
+better than 0.5%.
+
 ---
 
 # Appendix A: The unified token batch, serving: gfx942 / MI300X, Gemma-4 31B
