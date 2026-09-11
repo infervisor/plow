@@ -99,7 +99,90 @@ extern "C" __global__ void plow_mla_sparse_reduce(SparseReduceArgs a) {
     }
 }
 
+struct SparseDecodePackArgs {
+    uint4 *q, *kv;
+    unsigned* kvi;
+    const uint4 *qa, *qr;
+    const unsigned char* ck;
+    const uint4* kr;
+    const int* idx;
+    const int* kvlen;
+    const float* scales;
+    unsigned *qp, *kp, *last, *splits;
+    unsigned rows, ctx, nsplit, pad;
+};
+static_assert(sizeof(SparseDecodePackArgs) == 128);
+
+// Decode: each row's selected FP8 latent rows (per-row scales) and BF16 rope keys are gathered
+// into one packed BF16 CSR with identity kv_indices; rows are ragged at min(kv_len, 2048).
+extern "C" __global__ void plow_mla_sparse_decode_pack(SparseDecodePackArgs a) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    const unsigned first = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned stride = blockDim.x * gridDim.x;
+    unsigned kp[21];
+    kp[0] = 0;
+    for (unsigned b = 0; b < a.rows; ++b) {
+        const int len = a.kvlen[b];
+        const unsigned live = len < 0 ? 0u : (len > 2048 ? 2048u : (unsigned)len);
+        kp[b + 1] = kp[b] + live;
+    }
+    for (unsigned i = first; i < a.rows * 8u * 72u; i += stride) {
+        const unsigned row = i / 72u, col = i % 72u;
+        a.q[i] = col < 64u ? a.qa[row * 64u + col] : a.qr[row * 8u + col - 64u];
+    }
+    const unsigned total = kp[a.rows];
+    for (unsigned i = first; i < total * 72u; i += stride) {
+        const unsigned slot = i / 72u, col = i % 72u;
+        unsigned b = 0;
+        while (kp[b + 1] <= slot) ++b;
+        const unsigned key = (unsigned)a.idx[b * 2048u + (slot - kp[b])];
+        const size_t src = (size_t)b * a.ctx + key;
+        if (col >= 64u) {
+            a.kv[i] = a.kr[src * 8u + col - 64u];
+        } else {
+            bf16v8 v = fp8v8_to_bf16v8(ld_glob_fp8v8(a.ck + src * 512u + col * 8u));
+            const float s = a.scales[src];
+#pragma unroll
+            for (unsigned j = 0; j < 8; ++j) v[j] = f2bf(bf2f(v[j]) * s);
+            __builtin_memcpy(&a.kv[i], &v, 16);
+            if (col == 0) a.kvi[slot] = slot;
+        }
+    }
+    for (unsigned b = first; b <= a.rows; b += stride) {
+        a.qp[b] = b;
+        a.kp[b] = kp[b];
+        a.splits[b] = b * a.nsplit;
+        if (b < a.rows) a.last[b] = 1;
+    }
+#endif
+}
+
+struct SparseDecodeRelayoutArgs {
+    float *opart, *ml;
+    const float *part, *lse;
+    unsigned rows, nsplit;
+};
+static_assert(sizeof(SparseDecodeRelayoutArgs) == 40);
+
+// AITER writes [row][split][head][512] normalized partials with one LSE each; the merge reads
+// [row][head][split] with (m, l). (m, l) = (lse, 1) makes l*exp(m - M) the exact LSE weight.
+extern "C" __global__ void plow_mla_sparse_decode_relayout(SparseDecodeRelayoutArgs a) {
+    const unsigned ns = a.nsplit;
+    for (unsigned i = blockIdx.x * blockDim.x + threadIdx.x; i < a.rows * 8u * ns * 128u;
+         i += blockDim.x * gridDim.x) {
+        const unsigned col = i % 128u, unit = i / 128u;
+        const unsigned s = unit % ns, hrow = unit / ns;
+        const unsigned src = (hrow / 8u * ns + s) * 8u + hrow % 8u;
+        ((float4*)a.opart)[unit * 128u + col] = ((const float4*)a.part)[src * 128u + col];
+        if (col == 0) {
+            a.ml[unit * 2u] = a.lse[src];
+            a.ml[unit * 2u + 1u] = 1.0f;
+        }
+    }
+}
+
 extern "C" __device__ unsigned plow_mla_sparse_adapter_abi_1 = 1;
+extern "C" __device__ unsigned plow_mla_sparse_decode_abi_1 = 1;
 extern "C" __device__ unsigned plow_mla_sparse_adapter_fp8_abi_1 = 1;
 #if defined(PLOW_MLA_SPARSE_SINGLE_PASS)
 extern "C" __device__ unsigned plow_mla_sparse_single_abi_1 = 1;

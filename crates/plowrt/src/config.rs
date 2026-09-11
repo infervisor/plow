@@ -983,6 +983,11 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-mla-pf-aiter", env = "PLOW_MLA_PF_AITER", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub mla_pf_aiter: bool,
 
+    /// Run native GLM MoE prefill rows >= 1024 on AITER's 64-row persistent tile
+    /// (`..._psx_64x256.co`), the object its GLM-5 gfx942 tuning selects there.
+    #[arg(long = "amd-moe-aiter-tile64", env = "PLOW_MOE_AITER_TILE64", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub moe_aiter_tile64: bool,
+
     /// Prequantize sorted MXFP4 MoE stage-1 activations once and reuse them across N tiles.
     #[arg(long = "amd-moe-stage1-a4-reuse", env = "PLOW_MOE_STAGE1_A4_REUSE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub moe_stage1_a4_reuse: bool,

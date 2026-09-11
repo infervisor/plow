@@ -209,6 +209,7 @@ enum DecodeSegmentKind {
     MoeAiter,
     GemmLt,
     GroupedMoeMxfp4 { glu: usize, down: usize },
+    SparseMlaDecode(usize),
 }
 
 fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
@@ -225,6 +226,8 @@ fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
         let mut moe_down_inst = None;
         let mut multiple_moe_glu = false;
         let mut multiple_moe_down = false;
+        let mut sparse_mla_inst = None;
+        let mut sparse_mla_pure = true;
         let mut has_other = false;
         for e in prog.stream.iter().filter(|e| e.seg as usize == seg) {
             let inst = prog.insts.get(e.inst as usize).ok_or_else(|| {
@@ -296,6 +299,15 @@ fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
                     Some(i) if i == e.inst as usize => {}
                     Some(_) => *multiple = true,
                 }
+            } else if amd_sparse_mla::sparse_decode_inst(inst) {
+                // A native boundary only when isolated and counter-free; the ordinary emit
+                // leaves this op inside an interpreter segment.
+                match sparse_mla_inst {
+                    None => sparse_mla_inst = Some(e.inst as usize),
+                    Some(i) if i == e.inst as usize => {}
+                    Some(_) => sparse_mla_pure = false,
+                }
+                sparse_mla_pure &= e.wait_len == 0 && e.succ_len == 0 && e.flags & SE_XCTR == 0;
             } else {
                 has_other = true;
             }
@@ -313,6 +325,7 @@ fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
                 || mla_merge_inst.is_some()
                 || moe_glu_inst.is_some()
                 || moe_down_inst.is_some()
+                || sparse_mla_inst.is_some()
             {
                 return Err(RuntimeError::Device(format!(
                     "decode segment {seg} mixes {name} with interpreter opcodes; standalone dispatch requires a pure segment"
@@ -325,7 +338,11 @@ fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
             } else {
                 DecodeSegmentKind::KdaDecodeFused(inst)
             };
-        } else if !has_other && moe_glu_inst.is_some() && moe_down_inst.is_some() {
+        } else if !has_other
+            && sparse_mla_inst.is_none()
+            && moe_glu_inst.is_some()
+            && moe_down_inst.is_some()
+        {
             let (Some(glu), Some(down)) = (moe_glu_inst, moe_down_inst) else {
                 unreachable!()
             };
@@ -355,7 +372,10 @@ fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
                 }
             }
             kinds[seg] = DecodeSegmentKind::GroupedMoeMxfp4 { glu, down };
-        } else if !has_other && (mla_flash_inst.is_some() || mla_merge_inst.is_some()) {
+        } else if !has_other
+            && sparse_mla_inst.is_none()
+            && (mla_flash_inst.is_some() || mla_merge_inst.is_some())
+        {
             let (Some(flash), Some(merge)) = (mla_flash_inst, mla_merge_inst) else {
                 return Err(RuntimeError::Device(format!(
                     "decode segment {seg} contains only half of the FlashMlaDecode+MlaMergeFold pair"
@@ -367,6 +387,15 @@ fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
                 )));
             }
             kinds[seg] = DecodeSegmentKind::MlaAttention;
+        } else if !has_other
+            && moe_glu_inst.is_none()
+            && moe_down_inst.is_none()
+            && mla_flash_inst.is_none()
+            && mla_merge_inst.is_none()
+        {
+            if let (Some(ix), true) = (sparse_mla_inst, sparse_mla_pure) {
+                kinds[seg] = DecodeSegmentKind::SparseMlaDecode(ix);
+            }
         }
     }
     for (i, inst) in prog.insts.iter().enumerate() {
@@ -2667,6 +2696,7 @@ enum DecodeSegmentRoute {
     KdaDecodeFused(KdaDecodeFusedArgs),
     MoeAiter(amd_moe_aiter::Route),
     GemmLt(amd_gemm_lt::Route),
+    SparseMlaDecode(amd_sparse_mla::DecodeRoute),
     GroupedMoeMxfp4 {
         glu: GroupedMoeGluArgs,
         down: GroupedMoeDownArgs,
@@ -2689,6 +2719,7 @@ fn decode_segment_routes(
     let kinds = decode_segment_kinds(prog)?;
     let aiter = amd_moe_aiter::routes(prog, tensors, kinds.len())?;
     let gemm_lt = amd_gemm_lt::routes(prog, tensors, kinds.len())?;
+    let sparse_mla = amd_sparse_mla::decode_routes(prog, tensors, kinds.len())?;
     let mut routes = Vec::with_capacity(kinds.len());
     for (seg, kind) in kinds.into_iter().enumerate() {
         let inst_ix = match kind {
@@ -2710,6 +2741,16 @@ fn decode_segment_routes(
                 routes.push(DecodeSegmentRoute::GemmLt(gemm_lt[seg].ok_or_else(
                     || RuntimeError::Device("native GEMM segment has no validated route".into()),
                 )?));
+                continue;
+            }
+            DecodeSegmentKind::SparseMlaDecode(_) => {
+                routes.push(DecodeSegmentRoute::SparseMlaDecode(
+                    sparse_mla[seg].ok_or_else(|| {
+                        RuntimeError::Device(
+                            "native sparse MLA decode segment has no validated route".into(),
+                        )
+                    })?,
+                ));
                 continue;
             }
             DecodeSegmentKind::KdaDecodeFused(inst_ix) => inst_ix,
@@ -5487,6 +5528,7 @@ pub struct AmdEngine {
     k_mla_materialize_pack: Option<HsaKernel>,
     k_mla_materialized_prefill: Option<HsaKernel>,
     sparse_mla: Option<amd_sparse_mla::SparseMla>,
+    sparse_mla_decode: Option<amd_sparse_mla::SparseMlaDecode>,
     moe_aiter: Option<amd_moe_aiter::MoeAiter>,
     index_tp: Option<amd_index_tp::IndexTp>,
     gemm_lt: Option<amd_gemm_lt::GemmLt>,
@@ -8046,6 +8088,34 @@ impl AmdEngine {
             None
         };
 
+        let sparse_mla_decode = match blob.progs[dec_ix..]
+            .iter()
+            .filter(|p| {
+                decode_segment_kinds(p).is_ok_and(|kinds| {
+                    kinds
+                        .iter()
+                        .any(|k| matches!(k, DecodeSegmentKind::SparseMlaDecode(_)))
+                })
+            })
+            .map(|p| p.t)
+            .max()
+        {
+            Some(rows) => {
+                // The relayout reads the baked split count; live re-pointing would desync it.
+                if crate::config::RuntimeConfig::get().amd.mla_ns_live {
+                    return Err(RuntimeError::Device(
+                        "native sparse MLA decode is incompatible with PLOW_MLA_NS_LIVE".into(),
+                    ));
+                }
+                Some(amd_sparse_mla::SparseMlaDecode::load(
+                    &be,
+                    hsaco_dir,
+                    rows,
+                    &mut modules,
+                )?)
+            }
+            None => None,
+        };
         let gemm_lt = if use_gemm_lt {
             Some(amd_gemm_lt::GemmLt::load(&be, &hsaco_dir, &mut modules)?)
         } else {
@@ -8070,6 +8140,7 @@ impl AmdEngine {
                 rows.max(128),
                 blob.progs[dec_ix..].iter().any(has_moe_aiter),
                 use_resident_moe,
+                crate::config::RuntimeConfig::get().amd.moe_aiter_tile64,
                 &mut modules,
             )?)
         } else {
@@ -9625,6 +9696,7 @@ impl AmdEngine {
             k_mla_materialize_pack,
             k_mla_materialized_prefill,
             sparse_mla,
+            sparse_mla_decode,
             moe_aiter,
             index_tp,
             gemm_lt,
@@ -11075,7 +11147,14 @@ impl AmdEngine {
             ))
         })?;
         match route {
-            DecodeSegmentRoute::Interpreter => {
+            DecodeSegmentRoute::SparseMlaDecode(route) if route.active => {
+                let kernel = self.sparse_mla_decode.as_ref().ok_or_else(|| {
+                    RuntimeError::Device("sparse MLA decode route has no loaded kernels".into())
+                })?;
+                kernel.enqueue(&self.be, route, &self.tens_table)?;
+                self.seg_launches += 2;
+            }
+            DecodeSegmentRoute::Interpreter | DecodeSegmentRoute::SparseMlaDecode(_) => {
                 let arg = self.kernarg(p, seg as u32);
                 EngineDevice::launch_cooperative(
                     &*self.be,
@@ -11510,6 +11589,21 @@ impl AmdEngine {
     /// EVERY decode rung is written, not just the dispatched one: which rung the
     /// mux picks is a per-step decision this function does not see, and a rung left
     /// on its baked count would be a silent no-op. See [`MlaNsplitProg`].
+    /// Native sparse decode attention runs only when every row of a rung holds all 2048
+    /// selected keys; otherwise that rung's segment runs the interpreter arm this step.
+    fn arm_sparse_mla_decode(&mut self, kvlen: &[u32]) {
+        if self.sparse_mla_decode.is_none() {
+            return;
+        }
+        for prog in &mut self.progs {
+            for route in &mut prog.decode_routes {
+                if let DecodeSegmentRoute::SparseMlaDecode(route) = route {
+                    route.arm(kvlen);
+                }
+            }
+        }
+    }
+
     fn patch_mla_nsplit(&mut self, kvlen: u32) -> Result<()> {
         let Some(ns) = &mut self.mla_nsplit else {
             return Ok(());
@@ -11618,6 +11712,7 @@ impl AmdEngine {
         let dp = self.decode;
         self.patch_mla_nsplit(kvlen)?;
         self.patch_kvrow(dp, pos)?;
+        self.arm_sparse_mla_decode(&[kvlen]);
 
         // Stage both scalars in pinned memory for the same reason.
         {
@@ -12711,6 +12806,7 @@ impl AmdEngine {
         if b == 1 {
             self.patch_kvrow(self.decode, pos[0])?;
         }
+        self.arm_sparse_mla_decode(kvlen);
         {
             let s = self.h_scalar.as_mut_slice();
             for (i, p) in pos.iter().enumerate() {

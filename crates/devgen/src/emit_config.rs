@@ -583,6 +583,10 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_MOE_FLAT_DECODE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_moe_flat_decode: bool,
 
+    /// Isolate GLM sparse FP8 decode attention for the native gfx942 AITER MLA route.
+    #[arg(long, env = "PLOW_GLM_MLA_DEC_AITER", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_mla_dec_aiter: bool,
+
     /// Pack GLM expert weights once for native gfx942 TP8 prefill and decode.
     #[arg(long, env = "PLOW_GLM_MOE_RESIDENT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_moe_resident: bool,
@@ -1108,6 +1112,7 @@ impl EmitConfig {
             glm_fp8_kv: env_bool("PLOW_GLM_FP8_KV"),
             glm_moe_aiter: env_bool("PLOW_GLM_MOE_AITER"),
             glm_moe_flat_decode: env_bool("PLOW_GLM_MOE_FLAT_DECODE"),
+            glm_mla_dec_aiter: env_bool("PLOW_GLM_MLA_DEC_AITER"),
             glm_moe_resident: env_bool("PLOW_GLM_MOE_RESIDENT"),
             token_batch_tp: env_bool("PLOW_TOKEN_BATCH_TP"),
             glm_index_tp: env_bool("PLOW_GLM_INDEX_TP"),

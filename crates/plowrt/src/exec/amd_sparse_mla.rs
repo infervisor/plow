@@ -512,6 +512,40 @@ pub(super) struct SparseMla {
     splits: u64,
 }
 
+fn load_attention(be: &HsaBackend, dir: &Path, modules: &mut Vec<Module>) -> Result<HsaKernel> {
+    let path = dir.join(OBJECT);
+    let mut image = std::fs::read(&path)
+        .map_err(|e| RuntimeError::Device(format!("{}: {e}", path.display())))?;
+    if plow_asset::decode_objects::image_sha256(&image) != OBJECT_HASH {
+        return Err(RuntimeError::Device(
+            "sparse AITER MLA object hash does not match qualified ABI".into(),
+        ));
+    }
+    // This exact object declares 320 bytes in metadata but leaves KERNARG_SIZE
+    // unspecified in its descriptor. ROCr reports the descriptor's zero, unlike HIP.
+    // The hash fixes the descriptor at file offset 0x1000; only its size is normalized.
+    image[0x1008..0x100c].copy_from_slice(&320u32.to_le_bytes());
+    let module = EngineDevice::module_load(be, &image)?;
+    let attention = EngineDevice::get_function(
+        be,
+        &module,
+        "_ZN5aiter36mla_a16w16_qh8_qseqlen1_gqaratio8_v3E",
+    )?;
+    if attention.kernarg_size() != 320
+        || attention.private_segment_size() != 0
+        || HsaBackend::kernel_lds_bytes(&attention) != 65536
+    {
+        return Err(RuntimeError::Device(format!(
+            "sparse AITER MLA resource ABI mismatch: kernarg={}, private={}, LDS={}",
+            attention.kernarg_size(),
+            attention.private_segment_size(),
+            HsaBackend::kernel_lds_bytes(&attention)
+        )));
+    }
+    modules.push(module);
+    Ok(attention)
+}
+
 impl SparseMla {
     pub fn load(
         be: &HsaBackend,
@@ -521,36 +555,7 @@ impl SparseMla {
         fp8: bool,
         modules: &mut Vec<Module>,
     ) -> Result<Self> {
-        let path = dir.join(OBJECT);
-        let mut image = std::fs::read(&path)
-            .map_err(|e| RuntimeError::Device(format!("{}: {e}", path.display())))?;
-        if plow_asset::decode_objects::image_sha256(&image) != OBJECT_HASH {
-            return Err(RuntimeError::Device(
-                "sparse AITER MLA object hash does not match qualified ABI".into(),
-            ));
-        }
-        // This exact object declares 320 bytes in metadata but leaves KERNARG_SIZE
-        // unspecified in its descriptor. ROCr reports the descriptor's zero, unlike HIP.
-        // The hash fixes the descriptor at file offset 0x1000; only its size is normalized.
-        image[0x1008..0x100c].copy_from_slice(&320u32.to_le_bytes());
-        let module = EngineDevice::module_load(be, &image)?;
-        let attention = EngineDevice::get_function(
-            be,
-            &module,
-            "_ZN5aiter36mla_a16w16_qh8_qseqlen1_gqaratio8_v3E",
-        )?;
-        if attention.kernarg_size() != 320
-            || attention.private_segment_size() != 0
-            || HsaBackend::kernel_lds_bytes(&attention) != 65536
-        {
-            return Err(RuntimeError::Device(format!(
-                "sparse AITER MLA resource ABI mismatch: kernarg={}, private={}, LDS={}",
-                attention.kernarg_size(),
-                attention.private_segment_size(),
-                HsaBackend::kernel_lds_bytes(&attention)
-            )));
-        }
-        modules.push(module);
+        let attention = load_attention(be, dir, modules)?;
         let path = dir.join("mla_sparse_adapter_gfx942.elf");
         let image = std::fs::read(&path)
             .map_err(|e| RuntimeError::Device(format!("{}: {e}", path.display())))?;
@@ -729,5 +734,600 @@ impl SparseMla {
             pad: 0,
         };
         be.launch(self.reduce, 304, 256, 0, bytemuck::bytes_of(&reduce))
+    }
+}
+
+/// Decode twin of [`Route`]: one isolated sparse FP8 `FlashMlaDecodeFp8` per segment, every
+/// row with its own 2048-key selection, `nsplit` partials per (row, head) for the merge.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct DecodeRoute {
+    inst: DevInst64,
+    index: u16,
+    rows: u32,
+    pub active: bool,
+}
+
+impl DecodeRoute {
+    /// The fixed-width CSR needs every row to hold all 2048 keys; shorter rows run the
+    /// interpreter arm for the whole step.
+    pub fn arm(&mut self, kvlen: &[u32]) {
+        let rows = self.rows as usize;
+        self.active = kvlen.len() >= rows && kvlen[..rows].iter().all(|&k| k >= 2048);
+    }
+}
+
+pub(super) fn sparse_decode_inst(inst: &DevInst64) -> bool {
+    inst.op == DevOp::FlashMlaDecodeFp8 as u16 && inst.fj[1] != 0
+}
+
+pub(super) fn decode_routes(
+    prog: &DevProg,
+    tensors: &[DevTensor],
+    segments: usize,
+) -> Result<Vec<Option<DecodeRoute>>> {
+    let mut routes = vec![None; segments];
+    for (ix, inst) in prog.insts.iter().enumerate() {
+        if !sparse_decode_inst(inst) {
+            continue;
+        }
+        // Only a pure, counter-free segment is a native boundary; the ordinary emit keeps the
+        // op inside an interpreter segment and is not this route's business.
+        let mut owner = BTreeSet::new();
+        let mut obligations = false;
+        for entry in prog
+            .stream
+            .iter()
+            .chain(&prog.gq_stream)
+            .filter(|e| e.inst as usize == ix)
+        {
+            obligations |= entry.wait_len != 0 || entry.succ_len != 0 || entry.flags & SE_XCTR != 0;
+            owner.insert(entry.seg as usize);
+        }
+        let Some(&seg) = owner.first().filter(|_| owner.len() == 1 && !obligations) else {
+            continue;
+        };
+        if seg >= segments
+            || prog
+                .stream
+                .iter()
+                .chain(&prog.gq_stream)
+                .any(|e| e.seg as usize == seg && e.inst as usize != ix)
+        {
+            continue;
+        }
+        let err = |s: &str| {
+            RuntimeError::Device(format!("sparse AITER MLA decode instruction {ix}: {s}"))
+        };
+        let ns = inst.i[4];
+        if inst.i[0] != prog.t
+            || prog.t > 20
+            || inst.i[1] != 8
+            || !(2048..=81920).contains(&inst.i[2])
+            || inst.i[3] != 0
+            || !(1..=16).contains(&ns)
+            || inst.i[5] != u32::MAX
+            || inst.i[6] != 2048
+            || inst.i[7] != 4
+            || inst.fj[2] != 0
+            || inst.fj[1] > u32::from(TENSOR_NONE16)
+            || !f32::from_bits(inst.fj[0]).is_finite()
+            || f32::from_bits(inst.fj[0]) <= 0.0
+        {
+            return Err(err(
+                "requires QH8 latent512/rope64 GF4 top-2048 rows<=20, nsplit<=16, ctx 2048..81920",
+            ));
+        }
+        let index = (inst.fj[1] - 1) as u16;
+        let rows = u64::from(prog.t);
+        let ctx = u64::from(inst.i[2]);
+        let ns = u64::from(ns);
+        for (handle, bytes) in [
+            (inst.t[0], rows * 8 * ns * 512 * 4),
+            (inst.t[1], rows * 8 * ns * 2 * 4),
+            (inst.t[2], rows * 8 * 512 * 2),
+            (inst.t[3], rows * 8 * 64 * 2),
+            (inst.t[4], rows * ctx * 512),
+            (inst.t[5], rows * ctx * 64 * 2),
+            (inst.t[6], rows * 4),
+            (inst.t[7], rows * ctx * 4),
+            (index, rows * 2048 * 4),
+        ] {
+            if handle == TENSOR_NONE16
+                || tensors.get(handle as usize).is_none_or(|t| t.bytes < bytes)
+            {
+                return Err(err("operand capacity is insufficient"));
+            }
+        }
+        if inst.t[1] == inst.t[0] {
+            return Err(err("partial outputs alias"));
+        }
+        routes[seg] = Some(DecodeRoute {
+            inst: *inst,
+            index,
+            rows: prog.t,
+            active: false,
+        });
+    }
+    Ok(routes)
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct DecodePackArgs {
+    q: u64,
+    kv: u64,
+    kvi: u64,
+    qa: u64,
+    qr: u64,
+    ck: u64,
+    kr: u64,
+    idx: u64,
+    kvlen: u64,
+    scale: u64,
+    qp: u64,
+    kp: u64,
+    last: u64,
+    splits: u64,
+    rows: u32,
+    ctx: u32,
+    nsplit: u32,
+    pad: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct RelayoutArgs {
+    opart: u64,
+    ml: u64,
+    part: u64,
+    lse: u64,
+    rows: u32,
+    nsplit: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<DecodePackArgs>() == 128);
+const _: () = assert!(std::mem::size_of::<RelayoutArgs>() == 40);
+
+pub(super) struct SparseMlaDecode {
+    pack: HsaKernel,
+    attention: HsaKernel,
+    relayout: HsaKernel,
+    _scratch: DeviceMem,
+    q: u64,
+    kv: u64,
+    kvi: u64,
+    part: u64,
+    lse: u64,
+    qp: u64,
+    kp: u64,
+    last: u64,
+    splits: u64,
+}
+
+impl SparseMlaDecode {
+    pub fn load(be: &HsaBackend, dir: &Path, rows: u32, modules: &mut Vec<Module>) -> Result<Self> {
+        if !(1..=20).contains(&rows) {
+            return Err(RuntimeError::Device(
+                "sparse AITER MLA decode requires 1..20 rows".into(),
+            ));
+        }
+        let attention = load_attention(be, dir, modules)?;
+        let path = dir.join("mla_sparse_adapter_gfx942.elf");
+        let image = std::fs::read(&path)
+            .map_err(|e| RuntimeError::Device(format!("{}: {e}", path.display())))?;
+        let syms = super::amd::elf_symbol_names(&image);
+        if !syms.contains(&"plow_mla_sparse_adapter_abi_1")
+            || !syms.contains(&"plow_mla_sparse_decode_abi_1")
+        {
+            return Err(RuntimeError::Device(
+                "sparse MLA adapter lacks decode ABI marker".into(),
+            ));
+        }
+        let module = EngineDevice::module_load(be, &image)?;
+        let pack = EngineDevice::get_function(be, &module, "plow_mla_sparse_decode_pack")?;
+        let relayout = EngineDevice::get_function(be, &module, "plow_mla_sparse_decode_relayout")?;
+        for (kernel, size) in [(pack, 128), (relayout, 40)] {
+            if ![size, size + 256].contains(&kernel.kernarg_size())
+                || kernel.private_segment_size() != 0
+            {
+                return Err(RuntimeError::Device(
+                    "sparse MLA decode adapter resource ABI mismatch".into(),
+                ));
+            }
+        }
+        modules.push(module);
+        let rows = u64::from(rows);
+        let sizes = [
+            rows * 8 * 576 * 2,
+            rows * 2048 * 576 * 2,
+            rows * 2048 * 4,
+            rows * 16 * 8 * 512 * 4,
+            rows * 16 * 8 * 4,
+            (rows + 1) * 4,
+            (rows + 1) * 4,
+            (rows + 1) * 4,
+            (rows + 1) * 4,
+        ];
+        let bytes = sizes.iter().map(|s| s.div_ceil(256) * 256).sum();
+        let scratch = EngineDevice::alloc(be, bytes)?;
+        let mut ptr = scratch.base;
+        let offsets = sizes.map(|size| {
+            let p = ptr;
+            ptr += size.div_ceil(256) * 256;
+            p
+        });
+        let [q, kv, kvi, part, lse, qp, kp, last, splits] = offsets;
+        tracing::info!(bytes, rows, "allocated sparse AITER MLA decode workspace");
+        Ok(Self {
+            pack,
+            attention,
+            relayout,
+            _scratch: scratch,
+            q,
+            kv,
+            kvi,
+            part,
+            lse,
+            qp,
+            kp,
+            last,
+            splits,
+        })
+    }
+
+    pub fn enqueue(&self, be: &HsaBackend, route: DecodeRoute, tensor_table: &[u8]) -> Result<()> {
+        let addr = |handle: u16| {
+            let at = usize::from(handle) * 8;
+            u64::from_le_bytes(tensor_table[at..at + 8].try_into().unwrap())
+        };
+        let t = route.inst.t;
+        let ns = route.inst.i[4];
+        let pack = DecodePackArgs {
+            q: self.q,
+            kv: self.kv,
+            kvi: self.kvi,
+            qa: addr(t[2]),
+            qr: addr(t[3]),
+            ck: addr(t[4]),
+            kr: addr(t[5]),
+            idx: addr(route.index),
+            kvlen: addr(t[6]),
+            scale: addr(t[7]),
+            qp: self.qp,
+            kp: self.kp,
+            last: self.last,
+            splits: self.splits,
+            rows: route.rows,
+            ctx: route.inst.i[2],
+            nsplit: ns,
+            pad: 0,
+        };
+        be.launch(self.pack, 304, 256, 0, bytemuck::bytes_of(&pack))?;
+        let mut args = [0u64; 40];
+        args[0] = self.part;
+        args[2] = self.lse;
+        args[4] = self.q;
+        args[6] = self.kv;
+        args[8] = self.kp;
+        args[10] = self.kvi;
+        args[12] = self.last;
+        args[14] = u64::from(route.inst.fj[0]);
+        args[16] = 8;
+        args[18] = u64::from(ns);
+        args[20] = 8 * 576 * 2;
+        args[22] = 576 * 2;
+        args[26] = self.qp;
+        args[28] = self.splits;
+        be.launch_3d(
+            self.attention,
+            [1, route.rows, ns],
+            256,
+            bytemuck::cast_slice(&args),
+        )?;
+        let relayout = RelayoutArgs {
+            opart: addr(t[0]),
+            ml: addr(t[1]),
+            part: self.part,
+            lse: self.lse,
+            rows: route.rows,
+            nsplit: ns,
+        };
+        be.launch(self.relayout, 304, 256, 0, bytemuck::bytes_of(&relayout))
+    }
+}
+
+#[cfg(test)]
+mod decode_tests {
+    use super::*;
+    use packet::dev::StreamEnt;
+
+    fn fixture(rows: u32) -> (DevProg, Vec<DevTensor>) {
+        let flash = DevInst64 {
+            op: DevOp::FlashMlaDecodeFp8 as u16,
+            t: [0, 1, 2, 3, 4, 5, 6, 7],
+            i: [rows, 8, 4096, 0, 16, u32::MAX, 2048, 4],
+            fj: [0.0625f32.to_bits(), 9, 0],
+            ..Default::default()
+        };
+        let prog = DevProg {
+            t: rows,
+            packed_prefill_only: false,
+            n_counter: 0,
+            insts: vec![
+                DevInst64 {
+                    op: DevOp::Nop as u16,
+                    ..Default::default()
+                },
+                flash,
+            ],
+            stream: vec![
+                StreamEnt {
+                    inst: 0,
+                    seg: 0,
+                    ..Default::default()
+                },
+                StreamEnt {
+                    inst: 1,
+                    seg: 1,
+                    ..Default::default()
+                },
+            ],
+            stream_ofs: vec![],
+            stream_len: vec![],
+            waits: vec![],
+            succs: vec![],
+            gq_stream: vec![],
+            gq_seg_ofs: vec![],
+            l2_domains: 0,
+        };
+        let tensors = (0..9)
+            .map(|i| DevTensor {
+                name: i.to_string(),
+                bytes: 64 << 20,
+                init: None,
+            })
+            .collect();
+        (prog, tensors)
+    }
+
+    #[test]
+    fn sparse_decode_routes_require_pure_segments_geometry_and_capacity() {
+        let (prog, tensors) = fixture(20);
+        let routes = decode_routes(&prog, &tensors, 2).unwrap();
+        assert!(routes[0].is_none());
+        let mut route = routes[1].unwrap();
+        assert_eq!(route.index, 8);
+        assert!(!route.active);
+        route.arm(&[2048; 20]);
+        assert!(route.active);
+        route.arm(&[2048; 19]);
+        assert!(!route.active);
+        let mut short = [4096u32; 20];
+        short[7] = 2047;
+        route.arm(&short);
+        assert!(!route.active);
+        // Mixed or counter-bearing segments are the ordinary emit: no route, no error.
+        let (mut mixed, tensors) = fixture(20);
+        mixed.stream[1].seg = 0;
+        assert!(decode_routes(&mixed, &tensors, 1).unwrap()[0].is_none());
+        let (mut waits, tensors) = fixture(20);
+        waits.stream[1].wait_len = 1;
+        assert!(decode_routes(&waits, &tensors, 2).unwrap()[1].is_none());
+        for bad in 0..9 {
+            let (mut prog, mut tensors) = fixture(20);
+            match bad {
+                0 => prog.insts[1].i[0] = 8,
+                1 => prog.insts[1].i[1] = 16,
+                2 => prog.insts[1].i[4] = 17,
+                3 => prog.insts[1].i[6] = 1024,
+                4 => prog.insts[1].i[7] = 2,
+                5 => prog.insts[1].fj[2] = 1,
+                6 => tensors[8].bytes = 20 * 2048 * 4 - 1,
+                7 => tensors[7].bytes = 20 * 4096 * 4 - 1,
+                _ => prog.insts[1].t[7] = TENSOR_NONE16,
+            }
+            assert!(decode_routes(&prog, &tensors, 2).is_err(), "case {bad}");
+        }
+        let (mut wide, tensors) = fixture(21);
+        wide.insts[1].i[0] = 21;
+        assert!(decode_routes(&wide, &tensors, 2).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires a gfx942 GPU lease and PLOW_TEST_AITER_DIR with the decode adapter"]
+    fn sparse_mla_decode_hsa_dispatch() {
+        const CTX: usize = 4096;
+        const NS: usize = 16;
+        let dir = std::env::var("PLOW_TEST_AITER_DIR").unwrap();
+        let be = HsaBackend::new(0).unwrap();
+        let mut modules = Vec::new();
+        let kernel = SparseMlaDecode::load(&be, Path::new(&dir), 20, &mut modules).unwrap();
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let bf16 = |v: f32| {
+            let b = v.to_bits();
+            ((b + 0x7fff + ((b >> 16) & 1)) >> 16) as u16
+        };
+        let unbf16 = |b: u16| f64::from(f32::from_bits(u32::from(b) << 16));
+        let decode = |byte: u8| -> f64 {
+            let sign = if byte & 0x80 != 0 { -1.0 } else { 1.0 };
+            let exp = i32::from((byte >> 3) & 0xf);
+            let man = f64::from(byte & 7) / 8.0;
+            if exp == 0 {
+                sign * man * 2f64.powi(-6)
+            } else {
+                sign * (1.0 + man) * 2f64.powi(exp - 7)
+            }
+        };
+        for rows in [1usize, 8, 20] {
+            // Random FP8 latent (magnitudes below 2, no NaN pattern), per-row scales, BF16 rope,
+            // BF16 queries, and a distinct random 2048-key selection per row.
+            let ck: Vec<u8> = (0..rows * CTX * 512)
+                .map(|_| {
+                    let r = next();
+                    (((r >> 8) & 1) << 7) as u8 | (((r >> 4) % 8) << 3) as u8 | (r % 8) as u8
+                })
+                .collect();
+            let scales: Vec<f32> = (0..rows * CTX)
+                .map(|_| 0.5 + (next() % 1000) as f32 / 1000.0)
+                .collect();
+            let kr: Vec<u16> = (0..rows * CTX * 64)
+                .map(|_| bf16((next() % 2001) as f32 / 1000.0 - 1.0))
+                .collect();
+            let qa: Vec<u16> = (0..rows * 8 * 512)
+                .map(|_| bf16((next() % 2001) as f32 / 2000.0 - 0.5))
+                .collect();
+            let qr: Vec<u16> = (0..rows * 8 * 64)
+                .map(|_| bf16((next() % 2001) as f32 / 2000.0 - 0.5))
+                .collect();
+            let kvlen: Vec<i32> = (0..rows).map(|b| (2048 + b * 97).min(CTX) as i32).collect();
+            let mut idx = vec![0i32; rows * 2048];
+            for b in 0..rows {
+                let len = kvlen[b] as usize;
+                let mut keys: Vec<i32> = (0..len as i32).collect();
+                for i in (1..len).rev() {
+                    keys.swap(i, (next() % (i as u64 + 1)) as usize);
+                }
+                idx[b * 2048..(b + 1) * 2048].copy_from_slice(&keys[..2048]);
+            }
+            let upload = |bytes: &[u8]| {
+                let m = EngineDevice::alloc(&be, bytes.len() as u64 + 1024).unwrap();
+                EngineDevice::upload(&be, &m, 0, bytes).unwrap();
+                m
+            };
+            let opart_bytes = rows * 8 * NS * 512 * 4;
+            let ml_bytes = rows * 8 * NS * 2 * 4;
+            let opart = upload(&vec![0xa5u8; opart_bytes + 512]);
+            let mlpart = upload(&vec![0xa5u8; ml_bytes + 512]);
+            let d_qa = upload(bytemuck::cast_slice(&qa));
+            let d_qr = upload(bytemuck::cast_slice(&qr));
+            let d_ck = upload(&ck);
+            let d_kr = upload(bytemuck::cast_slice(&kr));
+            let d_kvlen = upload(bytemuck::cast_slice(&kvlen));
+            let d_scale = upload(bytemuck::cast_slice(&scales));
+            let d_idx = upload(bytemuck::cast_slice(&idx));
+            let table = [
+                opart.base + 256,
+                mlpart.base + 256,
+                d_qa.base,
+                d_qr.base,
+                d_ck.base,
+                d_kr.base,
+                d_kvlen.base,
+                d_scale.base,
+                d_idx.base,
+            ];
+            let (prog, tensors) = fixture(rows as u32);
+            let mut route = decode_routes(&prog, &tensors, 2).unwrap()[1].unwrap();
+            route.arm(&kvlen.iter().map(|&k| k as u32).collect::<Vec<_>>());
+            assert!(route.active);
+            kernel
+                .enqueue(&be, route, bytemuck::cast_slice(&table))
+                .unwrap();
+            be.synchronize().unwrap();
+            let mut ob = vec![0u8; opart_bytes + 512];
+            let mut mb = vec![0u8; ml_bytes + 512];
+            EngineDevice::download(&be, &opart, 0, &mut ob).unwrap();
+            EngineDevice::download(&be, &mlpart, 0, &mut mb).unwrap();
+            for (bytes, len) in [(&ob, opart_bytes), (&mb, ml_bytes)] {
+                assert!(bytes[..256]
+                    .iter()
+                    .chain(&bytes[256 + len..])
+                    .all(|&x| x == 0xa5));
+            }
+            let op: &[f32] = bytemuck::cast_slice(&ob[256..256 + opart_bytes]);
+            let ml: &[f32] = bytemuck::cast_slice(&mb[256..256 + ml_bytes]);
+            let (mut num, mut den) = (0f64, 0f64);
+            for b in 0..rows {
+                for h in 0..8 {
+                    // Host copy of d_mla_merge_fold's combine over the NS partials.
+                    let base = (b * 8 + h) * NS;
+                    let gm = (0..NS)
+                        .map(|s| ml[(base + s) * 2])
+                        .fold(f32::NEG_INFINITY, f32::max);
+                    let mut merged = vec![0f64; 512];
+                    let mut gl = 0f64;
+                    for s in 0..NS {
+                        let (m, l) = (ml[(base + s) * 2], ml[(base + s) * 2 + 1]);
+                        assert!(
+                            m.is_finite() && l == 1.0,
+                            "rows={rows} b={b} h={h} s={s}: ml=({m},{l})"
+                        );
+                        let w = f64::from(l) * f64::from((m - gm).exp());
+                        gl += w;
+                        for d in 0..512 {
+                            merged[d] += f64::from(op[(base + s) * 512 + d]) * w;
+                        }
+                    }
+                    for v in &mut merged {
+                        *v /= gl;
+                    }
+                    // FP64 reference over the row's selected keys on the BF16-packed values.
+                    let q: Vec<f64> = (0..576)
+                        .map(|d| {
+                            if d < 512 {
+                                unbf16(qa[(b * 8 + h) * 512 + d])
+                            } else {
+                                unbf16(qr[(b * 8 + h) * 64 + d - 512])
+                            }
+                        })
+                        .collect();
+                    let mut scores = Vec::with_capacity(2048);
+                    let mut keys = Vec::with_capacity(2048);
+                    for j in 0..2048 {
+                        let key = idx[b * 2048 + j] as usize;
+                        let src = b * CTX + key;
+                        let scale = f64::from(scales[src]);
+                        let mut k: Vec<f64> = (0..512)
+                            .map(|d| {
+                                let v = (decode(ck[src * 512 + d]) * scale) as f32;
+                                unbf16(bf16(v))
+                            })
+                            .collect();
+                        k.extend((0..64).map(|d| unbf16(kr[src * 64 + d])));
+                        scores.push(0.0625 * q.iter().zip(&k).map(|(a, b)| a * b).sum::<f64>());
+                        keys.push(k);
+                    }
+                    let mx = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                    let ws: Vec<f64> = scores.iter().map(|s| (s - mx).exp()).collect();
+                    let total: f64 = ws.iter().sum();
+                    for d in 0..512 {
+                        let r: f64 =
+                            ws.iter().zip(&keys).map(|(w, k)| w * k[d]).sum::<f64>() / total;
+                        num += (merged[d] - r).powi(2);
+                        den += r.powi(2);
+                    }
+                }
+            }
+            let rel = (num / den).sqrt();
+            // Warm route latency (pack + attention + relayout, host-timed through a drain).
+            for _ in 0..3 {
+                kernel
+                    .enqueue(&be, route, bytemuck::cast_slice(&table))
+                    .unwrap();
+            }
+            be.synchronize().unwrap();
+            let mut samples: Vec<f64> = (0..15)
+                .map(|_| {
+                    let start = std::time::Instant::now();
+                    kernel
+                        .enqueue(&be, route, bytemuck::cast_slice(&table))
+                        .unwrap();
+                    be.synchronize().unwrap();
+                    start.elapsed().as_secs_f64() * 1e6
+                })
+                .collect();
+            samples.sort_by(|a, b| a.total_cmp(b));
+            eprintln!(
+                "rows={rows} rel_l2 vs fp64 = {rel:.3e}; route warm median {:.1}us",
+                samples[samples.len() / 2]
+            );
+            assert!(rel < 5e-3, "rows={rows}: rel L2 {rel}");
+        }
     }
 }
