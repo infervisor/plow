@@ -5032,14 +5032,10 @@ pub(crate) fn emit_glm_mla_prefill(
     // positions and the union header from it (see plowrt::exec::kvrow).
     // SPAN: 0 = indexer layers only, 1 = one successor, 3 = every GLM-5.3 layer.
     // Keep the default at 1 while qualifying all-layer reuse after the row-count fix.
-    let span = std::env::var("PLOW_GLM_DSA_PF_SPAN")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(1);
+    let cfg = emit_config::active();
+    let span = cfg.glm_dsa_pf_span as usize;
     // Exact-distance selection holds the sparse layer count constant for a reuse bisect.
-    let dexact = std::env::var("PLOW_GLM_DSA_PF_DEXACT")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok());
+    let dexact = cfg.glm_dsa_pf_dexact.map(|d| d as usize);
     let reuses = match dexact {
         Some(d) => slot >= d && c.indexer_is_full((slot - d) as u32),
         None => (1..=span).any(|d| slot >= d && c.indexer_is_full((slot - d) as u32)),

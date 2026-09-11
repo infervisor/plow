@@ -281,10 +281,12 @@ static_assert(PGM_BK8 == 64, "the mainloop reads two k32 subgroups per K-tile");
         // The only free toggle: the two-level fp8 shadow accumulator (0/1), not
         // named by any static_assert.
         assert_eq!(classify(&h, "PGM90_FP8_PROMOTE"), Sweepable::Overridable);
-        // Fixed: the tile is pinned to the wgmma m64n128 / 128 B swizzle shape.
+        // Fixed: the tile is pinned to the wgmma m64n128 / 128 B swizzle shape. BN and BK are
+        // additionally named by the W8A16 in-place staging static_assert (`PLOW_NV_W8A16_ASYNC`),
+        // so the classifier reports Asserted for them; neither class is sweepable.
         assert_eq!(classify(&h, "PGM90_BM"), Sweepable::Fixed);
-        assert_eq!(classify(&h, "PGM90_BN"), Sweepable::Fixed);
-        assert_eq!(classify(&h, "PGM90_BK"), Sweepable::Fixed);
+        assert_eq!(classify(&h, "PGM90_BN"), Sweepable::Asserted);
+        assert_eq!(classify(&h, "PGM90_BK"), Sweepable::Asserted);
         assert_eq!(classify(&h, "PGM90_BK8"), Sweepable::Fixed);
     }
 

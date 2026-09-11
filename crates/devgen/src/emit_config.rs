@@ -623,6 +623,15 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_PF_NS")]
     pub glm_pf_ns: Option<u32>,
 
+    /// Sparse-prefill selection reuse span: layers after an indexer layer that gather against
+    /// its union (0 = indexer layers only, 3 = every GLM-5.3 layer).
+    #[arg(long, env = "PLOW_GLM_DSA_PF_SPAN", default_value_t = 1)]
+    pub glm_dsa_pf_span: u32,
+
+    /// Reuse only at exactly this distance from an indexer layer (bisect aid; unset = 1..=span).
+    #[arg(long, env = "PLOW_GLM_DSA_PF_DEXACT")]
+    pub glm_dsa_pf_dexact: Option<u32>,
+
     /// Add the sub-128 prefill rungs (32, 64) on AMD. DEFAULT OFF, and it earned that.
     ///
     /// It shipped on by default and was withdrawn on measurement. What it buys is a 29.5% /
@@ -1092,6 +1101,8 @@ impl EmitConfig {
             glm_gemv_wg: env_u32("PLOW_GLM_GEMV_WG"),
             glm_ofold: env_bool("PLOW_GLM_OFOLD"),
             glm_pf_ns: env_u32("PLOW_GLM_PF_NS"),
+            glm_dsa_pf_span: env_u32("PLOW_GLM_DSA_PF_SPAN").unwrap_or(1),
+            glm_dsa_pf_dexact: env_u32("PLOW_GLM_DSA_PF_DEXACT"),
             dense_pf_ns: env_u32("PLOW_DENSE_PF_NS"),
             pf_floor: env_bool("PLOW_PF_FLOOR"),
             glm_pf_wide: env_opt_out("PLOW_GLM_PF_WIDE"),

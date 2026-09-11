@@ -380,6 +380,8 @@ the 2026-09-04 audit that removed the rejected experiment knobs are in
 | `PLOW_GLM_GEMV_WG` | `--glm-gemv-wg` | unset | Cap the dispatch width of every blocked GEMV. Unset ⇒ byte-identical. |
 | `PLOW_GLM_OFOLD` | `--glm-ofold` | false | Fold W_o into the MLA prefill flash epilogue. Reassociated, logit-gate class. |
 | `PLOW_GLM_PF_NS` | `--glm-pf-ns` | unset | Causal KV-split factor for the V2 MLA prefill flash (2..=8; unset/1 = unsplit). |
+| `PLOW_GLM_DSA_PF_SPAN` | `--glm-dsa-pf-span` | 1 | Sparse-prefill selection reuse span: layers after an indexer layer that gather against its union (0 = indexer layers only, 3 = every GLM-5.3 layer). |
+| `PLOW_GLM_DSA_PF_DEXACT` | `--glm-dsa-pf-dexact` | unset | Reuse only at exactly this distance from an indexer layer (bisect aid; unset = 1..=span). |
 | `PLOW_GLM_PF_WIDE` | `--glm-pf-wide` | true | Widen prefill norm/residual dispatch across CUs. DEFAULT ON (`=0` restores the single-workgroup emit for A/B). Bit-identical either way. |
 | `PLOW_GLM_PLACE_PF` | `--glm-place-pf` | false | Per-XCD CU placement for the GLM prefill chain. |
 | `PLOW_GLM_XR_BAND` | `--glm-xr-band` | unset | Band count for a prefill TP seam (2..=8; unset/1 = the unbanded emit). |
