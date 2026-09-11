@@ -186,6 +186,25 @@ and the cumulative column assumes the phase lands at the low end of its range.
 | 6. Glue-op fusion | Merge fold into the attention epilogue or o_proj prologue; router → top-k → align as one kernel; combine + residual + norm | 35–55 s | 796 s | **90** | medium — e-graph rules exist, the win is measured per-op |
 | 7. Remainder | Whatever of the above lands at the top of its range, plus the ragged-tail arm on short-suffix traffic | 60–85 s | 711 s | **100** | this is the slack the ranges above already contain |
 
+**Phase 1 measured, and its composition is not what the estimate assumed.** KV map-ahead
+(#18) is done and measured: at the tick level it moves 792 of 1416 driver mappings into the chunk's
+shadow, `dec_vmm` 35.2 → 0.01 ms, decode-after-a-chunk 129.8 → 94.4 ms median (at the common
+dec_rows 4–7, 136.9 → 95.5), and the prefill-carrying tick 1127.2 → 1081.7 ms. Total driver maps
+over the run are IDENTICAL in both arms (276,480) — the work moved into the GPU's shadow rather than
+disappearing, which is exactly the design. On the 100-prompt run that is ≈ 45 ms × 857 ≈ **39 s**.
+
+The 20-prompt bench cannot resolve it: same binary, control 49.86 vs arm 49.86 out tok/s, duration
+276.66 vs 276.65 s. Expected effect there is ~6 s of 276 (2 %), and today's same-binary controls have
+drifted 48.8–50.6 tok/s, so a 2 % effect is below the noise floor of one run. What the bench DOES
+show is the latency half: median TPOT 253.5 → 243.3 ms (−4.0 %), mean ITL 238.4 → 234.3 (−1.7 %).
+**Treat tick-level instrumentation, not the 20-prompt bench, as the measurement instrument for
+anything worth less than ~5 % here.**
+
+Consequence for the phase-1 estimate (210–280 s): map-ahead is ~39 s of it, not the ~40–50 s
+assumed *per lever*; the bulk must come from slot recycling (~1.5–1.9 s × ~80 recycles ≈ 120–150 s),
+which a 20-prompt bench structurally CANNOT show because 20 requests over 20 slots recycle nothing —
+that arm must run at 40+ prompts. Revised phase 1: **≈ 180 s**, dominated by slot recycling.
+
 **Sequencing rules.** Phases 1 and 2 are independent of everything else and change no numerics
 (phase 2 changes kernels, so each flip carries a retrieval screen). Phase 3 and phase 4 both touch
 the same per-layer seam and must not be measured concurrently on one packet. Phase 5's body work is
