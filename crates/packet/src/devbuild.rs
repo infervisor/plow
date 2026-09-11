@@ -806,6 +806,12 @@ impl Builder {
         self.packed_prefill_segments = enabled;
     }
 
+    /// Whether this program is being emitted as a packed-prefill topology (sibling or
+    /// token-batch body), i.e. its cache writers will resolve rows through span metadata.
+    pub fn packed_prefill_segments(&self) -> bool {
+        self.packed_prefill_segments
+    }
+
     /// Mark this program as a token-batch BODY with a slot band of `band` rows.
     pub fn set_token_batch_band(&mut self, band: u32) {
         assert!(band > 0, "token-batch band must have at least one row");

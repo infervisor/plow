@@ -5008,6 +5008,14 @@ fn emit_glm_dsa_prefill_select(
         );
     }
     // ...into the SHARED key cache at the chunk base (out_row0), like krot.
+    //
+    // PACKED TOPOLOGY: `i7 = ctx` is the per-slot cache row stride the packed norm arm uses to
+    // place span (and slot-band) rows at `slot * ctx + position`, exactly as the latent and rope
+    // writers above carry it. Without it every span's index keys landed in slot 0's cache at
+    // DENSE-ROW offsets and sparse decode ranked garbage keys (found on the first fired
+    // token-batch step). Ordinary programs keep 0 so their packet bytes are unchanged; the
+    // ordinary object never reads the field.
+    let packed_stride = if b.packed_prefill_segments() { ctx } else { 0 };
     let c_ki = b.emit(DevOp::HeadNormRope, all.to_vec(), &[c_kn], |d| {
         d.t[0] = n.kidx[slot];
         d.t[1] = n.kidx_pf;
@@ -5021,6 +5029,7 @@ fn emit_glm_dsa_prefill_select(
         d.i[3] = 0;
         d.i[4] = 1;
         d.i[5] = 1;
+        d.i[7] = packed_stride;
         d.f[0] = c.eps;
         d.j[0] = 0;
         d.j[1] = KV_MASK_NONE;

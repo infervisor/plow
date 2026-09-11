@@ -1938,7 +1938,7 @@ __device__ __forceinline__ void exec_flash_mla_prefill_fp8(CInst in, CTens T, un
 #if PLOW_MLA_PF_MFMA
             if (mla_pf_tiled_fills(1u, s->n_rows, in->i[1], nblk)) {
                 d_flash_mla_prefill_mfma<512, 64, /*FP8=*/true>(
-                    op, ml, qa, qr, (const bf16*)ck, kr, (const int*)TEN(6) + s->slot, 1u,
+                    op, ml, qa, qr, (const bf16*)ck, kr, plow_packed_span_kv_len(prog, s, (const int*)TEN(6)), 1u,
                     s->n_rows, in->i[1], in->i[2], in->i[3], in->fj[0].f, in->i[5], slice,
                     nblk, lds, ks, in->i[6]);
                 continue;
@@ -1946,12 +1946,12 @@ __device__ __forceinline__ void exec_flash_mla_prefill_fp8(CInst in, CTens T, un
 #endif
             if (gf == 2)
                 d_flash_mla_prefill_fp8<512, 64, 2>(
-                    op, ml, qa, qr, (const bf16*)ck, kr, (const int*)TEN(6) + s->slot, 1u,
+                    op, ml, qa, qr, (const bf16*)ck, kr, plow_packed_span_kv_len(prog, s, (const int*)TEN(6)), 1u,
                     s->n_rows, in->i[1], in->i[2], in->i[3], in->fj[0].f, in->i[5], slice,
                     nblk, lds, ks, in->i[6]);
             else
                 d_flash_mla_prefill_fp8<512, 64, 4>(
-                    op, ml, qa, qr, (const bf16*)ck, kr, (const int*)TEN(6) + s->slot, 1u,
+                    op, ml, qa, qr, (const bf16*)ck, kr, plow_packed_span_kv_len(prog, s, (const int*)TEN(6)), 1u,
                     s->n_rows, in->i[1], in->i[2], in->i[3], in->fj[0].f, in->i[5], slice,
                     nblk, lds, ks, in->i[6]);
         }
@@ -2025,7 +2025,7 @@ __device__ __forceinline__ void exec_flash_mla_prefill(CInst in, CTens T, unsign
 #if PLOW_MLA_PF_MFMA
             if (mla_pf_tiled_fills(1u, s->n_rows, in->i[1], nblk)) {
                 d_flash_mla_prefill_mfma<512, 64, /*FP8=*/false>(
-                    op, ml, qa, qr, ck, kr, (const int*)TEN(6) + s->slot, 1u, s->n_rows,
+                    op, ml, qa, qr, ck, kr, plow_packed_span_kv_len(prog, s, (const int*)TEN(6)), 1u, s->n_rows,
                     in->i[1], in->i[2], in->i[3], in->fj[0].f, in->i[5], slice, nblk, lds,
                     nullptr, 0u);
                 continue;
@@ -2033,11 +2033,11 @@ __device__ __forceinline__ void exec_flash_mla_prefill(CInst in, CTens T, unsign
 #endif
             if (gf == 2)
                 d_flash_mla_prefill<512, 64, 2>(
-                    op, ml, qa, qr, ck, kr, (const int*)TEN(6) + s->slot, 1u, s->n_rows,
+                    op, ml, qa, qr, ck, kr, plow_packed_span_kv_len(prog, s, (const int*)TEN(6)), 1u, s->n_rows,
                     in->i[1], in->i[2], in->i[3], in->fj[0].f, in->i[5], slice, nblk, lds);
             else
                 d_flash_mla_prefill<512, 64, 4>(
-                    op, ml, qa, qr, ck, kr, (const int*)TEN(6) + s->slot, 1u, s->n_rows,
+                    op, ml, qa, qr, ck, kr, plow_packed_span_kv_len(prog, s, (const int*)TEN(6)), 1u, s->n_rows,
                     in->i[1], in->i[2], in->i[3], in->fj[0].f, in->i[5], slice, nblk, lds);
         }
         return;
@@ -2688,7 +2688,7 @@ __device__ __forceinline__ void exec_flash_mla_prefill_v2_packed(
         const bf16* kr = (const bf16*)TEN(5) + (size_t)s->slot * in->i[2] * 64u;
         const float* ks = FP8 ? (const float*)TEN(7) + (size_t)s->slot * in->i[2] : nullptr;
         d_flash_mla_prefill_v2<512, 64, /*GATHER=*/false, FP8>(
-            op, ml, qa, qr, (const bf16*)ck, kr, (const int*)TEN(6) + s->slot, 1u,
+            op, ml, qa, qr, (const bf16*)ck, kr, plow_packed_span_kv_len(prog, s, (const int*)TEN(6)), 1u,
             s->n_rows, in->i[1], in->i[2], in->i[3], in->fj[0].f, in->i[5], slice, nblk,
             lds, nullptr, 0u, FP8 ? 1u : ((in->i[6] & 0xffu) ? (in->i[6] & 0xffu) : 1u),
             FP8 ? false : ((in->i[6] >> 8) & 1u) != 0u, ks, FP8 ? in->i[6] : 0u);

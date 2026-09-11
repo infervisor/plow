@@ -170,6 +170,22 @@ __device__ __forceinline__ size_t plow_packed_prefill_cache_row(const PlowPacked
                     : fallback;
 }
 
+/* The `kv_len` pointer a per-span attention body derives its query base from
+ * (`qpos = kv_len - n_rows + t`). Ordinary packed programs read the per-slot `in.kvlen`, which
+ * the host set to the span's own end. Under the slot band that slot's entry is the BAND row's
+ * end (one past the span for a completing prompt), so the span's own `kv_len` field is used —
+ * the same value for every other span, and the one the resolver checks rows against. */
+__device__ __forceinline__ const int* plow_packed_span_kv_len(const PlowProgram* prog,
+                                                             const PlowPrefillSpan* s,
+                                                             const int* kv_len) {
+#if PLOW_PACKED_PREFILL_BAND
+    if (plow_packed_prefill_band(prog)) return (const int*)&s->kv_len;
+#else
+    (void)prog;
+#endif
+    return kv_len + s->slot;
+}
+
 __device__ __forceinline__ const PlowPrefillSpan* plow_packed_prefill_span(
     const PlowProgram* prog, uint32_t index) {
     if (!plow_packed_prefill_enabled(prog) || index >= prog->n_prefill_spans) __builtin_trap();
