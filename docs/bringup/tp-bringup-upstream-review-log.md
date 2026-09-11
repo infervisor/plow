@@ -134,6 +134,25 @@ Ranked levers: slot-recycle unmap off the engine thread (−1.5..1.7 s/request �
 
 Body arm (5ee91ece, host-side, needs the collapse fix + a bodies packet to fire): cursors seeded for waiting slots when the route is armed, whole next chunks oldest-first, chunks no body holds skipped instead of blocking the pack, no cutting (a sparse 8192 step sliced into a dense body costs several times the launch it displaces). Unit tests `amd_token_batch_pack_*`, `dense_tail_moves_to_the_sparse_bucket_*`.
 
+## What the research says is actually available (2026-09-11, two research agents)
+
+Reports: `research-kernels-parallelism.md`, `research-serving-techniques.md` (both under `/root/.claude/jobs/c08d1232/tmp/reports/`, provenance-tagged measured / fetched / estimated).
+
+Findings that CHANGE the plan:
+
+* **Two chunks per tick is worth ~24 s of 1511 (1.6 %), not the ~70 s assumed.** Tick conservation: the sum of live decoders' remaining tokens fixes the tick count at ~3548 however the prefill rows are arranged. Rearranging chunks only doubles ITL during prefill ticks. Deprioritized.
+* **Host shadowing is the highest-confidence prefill lever, ~110 s (7 %).** ~100 ms of host work per prefill-carrying tick runs with the GPU idle (VMM map 40, prepare 26, prefix publish ~20, enqueue/rearm 9, audit 5.6) plus 9.3 ms per decode-only tick. Pre-map from `prefill_prepare`, double-buffer the patched program, append decode packets behind the chunk on the barrier-ordered queue. This is what vLLM's async scheduling and SGLang's overlap scheduler do. Open items #17/#18 are the first two pieces.
+* **No faster sparse-MLA kernel exists for gfx942.** FlashMLA sparse is SM90/SM100; AITER's DSA prefill is gfx950-only; its `mla_v4` sparse objects are gfx1250-only; SGLang/vLLM on MI300X use TileLang or the same AITER QH8 decode-kernel trick plow already uses (vLLM pads 8 heads to 16). The gather is Infinity-Cache-bound and today's BF16 pack runs at ~45 % of last-level-cache peak; a native-FP8 gather would be ~1.2 ms/layer vs 2.60 (−100..−125 ms/chunk) but must be written from scratch (5–8 weeks).
+* **The MoE kernel is already at AITER's own tuned ceiling** for this shard (their GLM-5 gfx942 table: 1314 µs at 8192 tokens with the 64-row tile plow pins, 530 TF/s = 20 % of FP8 peak). New lever instead: fold the shared expert into the fused MoE call as an extra expert, as AITER and vLLM do, removing ~54 ms of 105 TF/s interpreter GEMMs (−35..−40 ms/chunk).
+* **FP8 block-scale GEMMs are available and sized**: AITER's gfx942 CK table has our exact shapes at M=8192 (839/838/873 TF/s), −70..−95 ms/chunk plus −3..−6 ms/decode step. hipBLASLt cannot do block scales on gfx942 — use CK or AITER's pre-shuffled asm. The checkpoint is `activation_scheme: dynamic`, so W8A8 is the reference serving numerics.
+* **Collectives**: two-shot moves 176 MB/rank in 1.12 ms (157 GB/s); RCCL does ~165 GB/s at this size, the xGMI floor is 0.53 ms, and MORI-class dispatch reaches ~300 GB/s (−72 s). Sequence-parallel seams (reduce-scatter → shard-local residual/norm/router/q_a/kv_a → all-gather of projection outputs) are worth ~150 ms/chunk on top. Skip quantized all-reduce: vLLM disables it at TP8 BF16.
+* **DP attention + EP8 is the wrong shape for this workload.** It fits memory (~111 GB weights + ~15 GB KV per GPU) and would lift the concurrency cap, but only ~2.4 requests are mid-prefill on average, so one GPU would run a chunk's 64 heads for ~1.8–2 s while the others pad. The useful half is **expert-sliced MoE inside TP8** (no dispatch needed — every rank already holds all rows after the attention all-reduce): per-rank MoE fixed costs shrink ~8× and the GEMMs get N=2048, worth 30–60 s.
+* **hipGraph buys nothing here** (plow already enqueues raw AQL at ~0.6 µs/packet; the vLLM/SGLang graph wins on MI300X are Python-overhead wins). **MXFP4 on gfx942 is dequant-only** (no FP4 matrix core) — no prefill gain.
+* **Constraint worth recording**: MLA latent KV is replicated on every TP rank (~50 KB/token/rank FP8 ⇒ ~70 GB/rank at C20 × 70k). That, not compute, is the concurrency ceiling under TP8.
+* **MTP is real but last**: layer 78 ships complete in the checkpoint (shards 136–138: `eh_proj`, `enorm`, `hnorm`, full MLA + indexer, 256-expert MoE, sharing `lm_head`), ~9.9 GB FP8, skipped by the emitter today. DeepSeek-V3 reports 85–90 % acceptance and 1.8× at low batch; estimated −125..−180 s here with low confidence at batch 20, 3–5 weeks.
+
+**Honest arithmetic**: host shadowing + a 300 GB/s collective + tile64 + the glue and GEMM levers + the slot/tail fixes land the run near 700–980 s, i.e. **71–105 out tok/s**. The 150 tok/s target additionally requires the sparse attention (203 ms) and MoE (164 ms) roughly halved, which means writing two kernels that do not exist for this architecture today.
+
 ## Knob organization (2026-09-11)
 
 Inventory: 138 runtime knobs (`RuntimeConfig` 33 shared / NVIDIA 34 / AMD 48 / Apple 14 / CPU 9)
