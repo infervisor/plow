@@ -36,6 +36,25 @@ Severity: **blocker** (must fix before main), **should-fix** (correctness/robust
 | F10 | (branch) | config.rs | 4 GiB fixed prefix-cache cap regardless of device | 48e71585 (`--vmm-cache-memory-utilization`) |
 | F11 | c1d34e53 | exec/amd.rs bring-up | still called removed `prefix_cache_mib()` after merge | 34376b3c |
 
+## Artefact policy (applied on every merge)
+
+Raw measurement files pushed upstream are removed here before the branch goes to main:
+`runtime/bench/**/*.{json,jsonl,csv}`, `perf-data/**/*.csv`, and per-probe write-ups
+(`runtime/nvidia/experiments/*.md`, `RESULTS.md`, oracle notes). Kept: inputs the code reads
+(`glm_fold_tail/gemm-selected.json` ← `amd_mla_fold.rs`; `tuning/**/*.jsonl` ← tunedb;
+`runtime/ubench/mfma_shape_results/summary.csv` ← `collect_occ1.sh`; `*.example.json`
+templates), `scripts/*.json` build contracts, `runtime/amd/glm_*_gfx942.json` pinned kernel
+specs, `docs/schemas`. `.gitignore` now blocks re-adding them locally; tracked files arriving
+through a merge still need the sweep (gitignore does not apply to tracked paths).
+
+| Sweep | Removed | Kept (code-read) |
+|---|---|---|
+| 2026-09-11 (initial) | 23 `perf-data/*.csv` (H100 campaign tables), 48 `runtime/bench/amd/*/mi300x-*.json` + `decode-selected/lean-compiled-audit/validation.json`, 6 `runtime/nvidia/experiments/*.md`, `d6_xreduce_attnres_oracle.md`, `lean_moe_combine_ref/RESULTS.md` | `gemm-selected.json`, `vllm_capture.example.json`, `summary.csv` |
+
+Decision still open for you: the 29 `runtime/bench/amd/*/README.md` campaign write-ups (measured
+tables + how-to-run in one file, 25–660 lines each). They are the only description of each bench
+tool, so they were kept; say the word and they go too, or get trimmed to the how-to.
+
 ## Batches merged
 
 | Merged at | Upstream range | Merge commit | Conflicts | Checks |

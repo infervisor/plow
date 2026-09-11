@@ -155,3 +155,12 @@ cmake --build build
 ```
 
 Individual targets are listed in `CMakeLists.txt`.
+
+## Results are not in source control
+
+Per-campaign READMEs under `amd/` and `nvidia/` cite the measurement files they were written
+from (`mi300x-*.json`, `perf-data/*.csv`). Those raw results are kept out of the repository
+(see `.gitignore` and `docs/bringup/tp-bringup-upstream-review-log.md`); regenerate them with
+the campaign's own `compare.py` / `record.py` / `serve.py`. Only inputs the code reads stay
+tracked: `amd/glm_fold_tail/gemm-selected.json`, `tuning/**/*.jsonl`,
+`../ubench/mfma_shape_results/summary.csv`.
