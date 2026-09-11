@@ -3104,8 +3104,7 @@ fn local_dsa_selection_checks_rows_operands_and_object() {
         prog.t = rows;
         prog.insts[0].blocks = rows as u16;
         assert_eq!(
-            check_dsa_select_local(std::slice::from_ref(&prog), &wide, 0, "gfx942", true)
-                .is_ok(),
+            check_dsa_select_local(std::slice::from_ref(&prog), &wide, 0, "gfx942", true).is_ok(),
             matches!(rows, 16 | 20)
         );
     }
@@ -3113,7 +3112,9 @@ fn local_dsa_selection_checks_rows_operands_and_object() {
     prog.insts[0].blocks = 20;
     for operand in 0..3 {
         wide[operand].bytes -= 1;
-        assert!(check_dsa_select_local(std::slice::from_ref(&prog), &wide, 0, "gfx942", true).is_err());
+        assert!(
+            check_dsa_select_local(std::slice::from_ref(&prog), &wide, 0, "gfx942", true).is_err()
+        );
         wide[operand].bytes += 1;
     }
     prog.t = 8;
@@ -4601,7 +4602,9 @@ fn native_gemm_decode_keeps_ordered_xcd_boundaries() {
 #[test]
 fn resident_moe_weight_layout_matches_gpu_vector_packing() {
     for (rows, k) in [(256usize, 6144usize), (6144, 256)] {
-        let src: Vec<u8> = (0..rows * k).map(|i| ((i * 31 + i / 251) % 256) as u8).collect();
+        let src: Vec<u8> = (0..rows * k)
+            .map(|i| ((i * 31 + i / 251) % 256) as u8)
+            .collect();
         let actual = shuffle_moe_weight_16x32(&src, rows, k).unwrap();
         for v in 0..rows * k / 16 {
             let row = (v / (32 * (k / 32))) * 16 + v % 16;

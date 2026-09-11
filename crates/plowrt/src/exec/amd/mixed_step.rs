@@ -122,7 +122,9 @@ impl MixedAmdStep {
         route: StepRoute,
     ) -> Result<Self> {
         let wide_tiles = route == StepRoute::TokenBatch
-            && crate::config::RuntimeConfig::get().amd.token_batch_wide_tiles;
+            && crate::config::RuntimeConfig::get()
+                .amd
+                .token_batch_wide_tiles;
         let mut synthesized = crate::exec::mixed_program::synthesize(blob, batch, wide_tiles)?;
         if route == StepRoute::TokenBatch {
             // The route is qualified at `nsplit == 1` with a fused flash epilogue, and
@@ -688,7 +690,10 @@ impl AmdEngine {
                     mixed.metadata.base,
                     slice(&mixed.layout.prefill_spans, n_spans * SPAN_WORDS),
                 ),
-                (mixed.parked_base, slice(&mixed.layout.parked, rows as usize)),
+                (
+                    mixed.parked_base,
+                    slice(&mixed.layout.parked, rows as usize),
+                ),
                 (
                     program.arg.counters,
                     &mixed.zero.as_slice()[..program.counter_bytes],

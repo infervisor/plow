@@ -101,10 +101,9 @@ impl std::fmt::Display for TokenBatchRefusal {
                 "capability `token_batch_fused_epilogue`: FlashPrefill has no O_final operand; \
                  the split-merge row map is not defined on this route"
             ),
-            Self::NotRequested => write!(
-                f,
-                "disabled by --token-batch=false or PLOW_TOKEN_BATCH=0"
-            ),
+            Self::NotRequested => {
+                write!(f, "disabled by --token-batch=false or PLOW_TOKEN_BATCH=0")
+            }
             Self::NoLegalBucket => write!(
                 f,
                 "capability `token_batch_unsplit_attention`: no prefill bucket in this blob has \
@@ -315,7 +314,12 @@ mod tests {
             .unwrap();
             let total = resources["total_registers"].as_u64().unwrap();
             assert_eq!(total, resources["vgpr"].as_u64().unwrap());
-            assert!(total <= resources["contract"]["max_total_registers"].as_u64().unwrap());
+            assert!(
+                total
+                    <= resources["contract"]["max_total_registers"]
+                        .as_u64()
+                        .unwrap()
+            );
         }
         let mixed = std::fs::read(directory.join("interp_mixed_gq.elf")).unwrap();
         let cap = probe_token_batch(&directory, "gfx942", |_| Ok(mixed.clone()), elf_symbol_u32);
@@ -386,7 +390,10 @@ mod tests {
     #[test]
     fn a_decode_prefix_is_refused_not_silently_packed() {
         let err = admit_token_batch(3, 1, true).unwrap_err();
-        assert_eq!(err, TokenBatchRefusal::SpansNotPrefixFree { decode_rows: 3 });
+        assert_eq!(
+            err,
+            TokenBatchRefusal::SpansNotPrefixFree { decode_rows: 3 }
+        );
         assert!(err.to_string().contains("token_batch_prefix_free_spans"));
     }
 

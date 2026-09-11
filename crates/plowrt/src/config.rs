@@ -1039,8 +1039,7 @@ impl RuntimeConfig {
         full_cache: bool,
         prefix: bool,
     ) -> bool {
-        self.nv_vmm_live()
-            || (packed_prefill && full_cache && !prefix)
+        self.nv_vmm_live() || (packed_prefill && full_cache && !prefix)
     }
 
     #[cfg(feature = "cuda")]
@@ -1229,9 +1228,14 @@ mod tests {
             .unwrap();
         assert_eq!(arg.get_default_values(), ["true"]);
         for (flag, enabled) in [("--token-batch", true), ("--token-batch=false", false)] {
-            let matches = command.clone().try_get_matches_from(["test", flag]).unwrap();
+            let matches = command
+                .clone()
+                .try_get_matches_from(["test", flag])
+                .unwrap();
             assert_eq!(
-                super::RuntimeConfig::from_arg_matches(&matches).unwrap().token_batch,
+                super::RuntimeConfig::from_arg_matches(&matches)
+                    .unwrap()
+                    .token_batch,
                 enabled
             );
         }
@@ -1276,12 +1280,23 @@ mod tests {
         use clap::{Args, FromArgMatches};
         let command = super::RuntimeConfig::augment_args(clap::Command::new("test"));
         for field in ["prefix_cache", "token_batch"] {
-            assert_eq!(command.get_arguments().find(|arg| arg.get_id() == field)
-                .unwrap().get_default_values(), ["true"]);
+            assert_eq!(
+                command
+                    .get_arguments()
+                    .find(|arg| arg.get_id() == field)
+                    .unwrap()
+                    .get_default_values(),
+                ["true"]
+            );
         }
-        let matches = command.try_get_matches_from([
-            "test", "--prefix-cache=false", "--vmm-prefix=true", "--vmm-cache-mib=512",
-        ]).unwrap();
+        let matches = command
+            .try_get_matches_from([
+                "test",
+                "--prefix-cache=false",
+                "--vmm-prefix=true",
+                "--vmm-cache-mib=512",
+            ])
+            .unwrap();
         let config = super::RuntimeConfig::from_arg_matches(&matches).unwrap();
         assert!(!config.prefix_cache);
         assert!(config.token_batch);
@@ -1312,7 +1327,8 @@ mod tests {
             assert_eq!(
                 super::RuntimeConfig::from_arg_matches(&matches)
                     .unwrap()
-                    .nv.vmm_prefix,
+                    .nv
+                    .vmm_prefix,
                 Some(expected)
             );
         }
@@ -1359,11 +1375,7 @@ mod tests {
             .unwrap();
         assert_eq!(arg.get_default_values(), ["false"]);
         let matches = command
-            .try_get_matches_from([
-                "test",
-                "--vmm-live=true",
-                "--vmm-prefix=false",
-            ])
+            .try_get_matches_from(["test", "--vmm-live=true", "--vmm-prefix=false"])
             .unwrap();
         let config = super::NvidiaRuntimeConfig::from_arg_matches(&matches).unwrap();
         assert!(config.vmm_live);

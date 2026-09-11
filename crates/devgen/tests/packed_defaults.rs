@@ -79,7 +79,7 @@ fn packed_defaults_preserve_backend_contracts_and_ladders() {
                             assert_eq!(
                                 flash
                                     .iter()
-                                .all(|i| i.i[7] == 1 && i.t[5] != packet::dev::TENSOR_NONE),
+                                    .all(|i| i.i[7] == 1 && i.t[5] != packet::dev::TENSOR_NONE),
                                 selection != Some(false)
                             );
                         }

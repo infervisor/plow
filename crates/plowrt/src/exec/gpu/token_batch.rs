@@ -157,7 +157,10 @@ impl GpuEngine {
             }
             tracing::debug!(
                 decode = requests.iter().filter(|r| r.phase == Phase::Decode).count(),
-                prefill = requests.iter().filter(|r| r.phase == Phase::Prefill).count(),
+                prefill = requests
+                    .iter()
+                    .filter(|r| r.phase == Phase::Prefill)
+                    .count(),
                 rows,
                 samples = output.len(),
                 "unified token batch committed"

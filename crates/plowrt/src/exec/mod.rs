@@ -15,9 +15,9 @@ pub mod amd;
 #[cfg(feature = "hsa")]
 mod amd_gemm_lt;
 #[cfg(feature = "hsa")]
-mod amd_mla_fold;
-#[cfg(feature = "hsa")]
 mod amd_index_tp;
+#[cfg(feature = "hsa")]
+mod amd_mla_fold;
 #[cfg(feature = "hsa")]
 mod amd_moe_aiter;
 #[cfg(feature = "hsa")]

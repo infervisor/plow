@@ -2052,8 +2052,7 @@ impl Builder {
             _ => 0u8,
         };
         let has_flash_prefill = self.ops.iter().any(|o| {
-            o.inst.op == DevOp::FlashPrefill as u16
-                || o.inst.op == DevOp::FlashPrefillFp8 as u16
+            o.inst.op == DevOp::FlashPrefill as u16 || o.inst.op == DevOp::FlashPrefillFp8 as u16
         });
         let pure_gemm = !uniseg && pure_mode != 0 && has_flash_prefill;
         // PLOW_SEG_FA512=1 (T12): hd512 (full-attention) FlashPrefill packets get their OWN
@@ -5706,7 +5705,9 @@ mod v6_tests {
 
     #[test]
     fn decode_rung_lo_preserves_overlapping_prefill_widths() {
-        let prefill = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192];
+        let prefill = [
+            1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192,
+        ];
         let decode = [1, 2, 4, 8, 16, 32, 64, 128];
         for n in 1..=decode.len() {
             let widths: Vec<_> = prefill.iter().chain(&decode[..n]).copied().collect();
@@ -5748,7 +5749,10 @@ mod isolated_segment_tests {
             for entry in stream {
                 if entry.inst == raw {
                     assert_eq!(entry.seg, 1);
-                    assert_eq!((entry.wait_len, entry.succ_len, entry.flags & SE_XCTR), (0, 0, 0));
+                    assert_eq!(
+                        (entry.wait_len, entry.succ_len, entry.flags & SE_XCTR),
+                        (0, 0, 0)
+                    );
                 }
                 if entry.inst == raw + 1 {
                     assert_eq!(entry.seg, 2);

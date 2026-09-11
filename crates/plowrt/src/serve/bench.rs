@@ -459,7 +459,8 @@ pub async fn run_prefill_sweep(
         let engine = engine.lock();
         if engine.prefix_cache_enabled() {
             return Err(RuntimeError::Msg(
-                "bench prefill sweep requires cold prompts; disable --prefix-cache/--vmm-prefix".into(),
+                "bench prefill sweep requires cold prompts; disable --prefix-cache/--vmm-prefix"
+                    .into(),
             ));
         }
         Some(EngineReport {

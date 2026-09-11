@@ -1915,45 +1915,46 @@ pub(crate) fn declare_glm_rows_batched(
     // gathered-row bound: the align op pads each expert's row range up to a whole MPF_BM tile, so
     // every expert can waste at most MPF_BM-1 rows. Sizing this from T*k alone is an out-of-bounds
     // device write with no symptom at low expert counts and a guaranteed one at 384.
-    let (meta, row_token, row_partidx, row_gate, fu_g, fu_scale) = if rows > 1 || emit_config::active().glm_moe_resident {
-        let pad_rows = rows * tk as u64 + (e * (MPF_BM - 1)) as u64;
-        // The gathered GLU output is bf16 on the bf16/block-fp8 arms and PACKED fp4 under A4W4 —
-        // half a byte per value plus one E8M0 byte per 32. The buffer is sized for whichever the
-        // packet asks for; the fp4 form is SMALLER, so a bf16-sized allocation would merely waste,
-        // but the E8M0 rows have no bf16 counterpart and must be declared or the bridge writes to a
-        // null handle.
-        let fug_bytes = match enc {
-            MoeEnc::Mxfp4 => pad_rows * (imoe_e / 2) as u64,
-            _ => pad_rows * imoe_e as u64 * BF16,
-        };
-        const ALIGN_BLOCKS: u64 = 64;
-        let align_extra = if emit_config::active().moe_align_par && rows >= 1024 {
-            ALIGN_BLOCKS * e as u64
-        } else {
-            0
-        };
-        (
-            ac(b, "moe_meta", ((3 * e + 1) as u64 + align_extra) * I32),
-            ac(b, "moe_rowtok", pad_rows * I32),
-            ac(b, "moe_rowpart", pad_rows * I32),
-            ac(b, "moe_rowgate", pad_rows * F32),
-            ac(b, "moe_fug", fug_bytes),
-            if enc == MoeEnc::Mxfp4 {
-                ac(b, "moe_fuscale", pad_rows * (imoe_e / MX_BLOCK) as u64)
+    let (meta, row_token, row_partidx, row_gate, fu_g, fu_scale) =
+        if rows > 1 || emit_config::active().glm_moe_resident {
+            let pad_rows = rows * tk as u64 + (e * (MPF_BM - 1)) as u64;
+            // The gathered GLU output is bf16 on the bf16/block-fp8 arms and PACKED fp4 under A4W4 —
+            // half a byte per value plus one E8M0 byte per 32. The buffer is sized for whichever the
+            // packet asks for; the fp4 form is SMALLER, so a bf16-sized allocation would merely waste,
+            // but the E8M0 rows have no bf16 counterpart and must be declared or the bridge writes to a
+            // null handle.
+            let fug_bytes = match enc {
+                MoeEnc::Mxfp4 => pad_rows * (imoe_e / 2) as u64,
+                _ => pad_rows * imoe_e as u64 * BF16,
+            };
+            const ALIGN_BLOCKS: u64 = 64;
+            let align_extra = if emit_config::active().moe_align_par && rows >= 1024 {
+                ALIGN_BLOCKS * e as u64
             } else {
-                TENSOR_NONE
-            },
-        )
-    } else {
-        (
-            TENSOR_NONE,
-            TENSOR_NONE,
-            TENSOR_NONE,
-            TENSOR_NONE,
-            TENSOR_NONE,
-            TENSOR_NONE,
-        )
-    };
+                0
+            };
+            (
+                ac(b, "moe_meta", ((3 * e + 1) as u64 + align_extra) * I32),
+                ac(b, "moe_rowtok", pad_rows * I32),
+                ac(b, "moe_rowpart", pad_rows * I32),
+                ac(b, "moe_rowgate", pad_rows * F32),
+                ac(b, "moe_fug", fug_bytes),
+                if enc == MoeEnc::Mxfp4 {
+                    ac(b, "moe_fuscale", pad_rows * (imoe_e / MX_BLOCK) as u64)
+                } else {
+                    TENSOR_NONE
+                },
+            )
+        } else {
+            (
+                TENSOR_NONE,
+                TENSOR_NONE,
+                TENSOR_NONE,
+                TENSOR_NONE,
+                TENSOR_NONE,
+                TENSOR_NONE,
+            )
+        };
     let xnext = ac(b, "xnext", rows * h as u64 * BF16);
     let logits = ac(b, "logits", dbatch as u64 * glm_vocab_l(c) as u64 * BF16);
     let amax = ac(b, "amax.part", dbatch as u64 * AMAX_BLOCKS as u64 * 8);
@@ -3372,14 +3373,19 @@ pub(crate) fn emit_glm_mla(
     let c_rnq = if fuse_qnorm {
         c_qad
     } else {
-        b.emit(DevOp::RmsNorm, decode_norm_cus(b.n_cu(), rows), &[c_qad], |d| {
-            d.t[0] = n.qlat;
-            d.t[1] = n.qlr;
-            d.t[2] = w.gqa;
-            d.i[0] = rows;
-            d.i[1] = ql;
-            d.f[0] = eps;
-        })
+        b.emit(
+            DevOp::RmsNorm,
+            decode_norm_cus(b.n_cu(), rows),
+            &[c_qad],
+            |d| {
+                d.t[0] = n.qlat;
+                d.t[1] = n.qlr;
+                d.t[2] = w.gqa;
+                d.i[0] = rows;
+                d.i[1] = ql;
+                d.f[0] = eps;
+            },
+        )
     };
     // 4/5 absorbed q_nope (Wqa: QL -> NH_l*DK) and q_rope raw down (Wqr: QL -> NH_l*DR). FUSION G
     //   (audit §G): both read n.qlat with K=ql, so fuse into ONE GemvQkv with Nv=0 (q half + k half).
@@ -3805,16 +3811,21 @@ pub(crate) fn emit_glm_mla(
     //   whereas the split path norms the bf16-rounded xmid, so this is algebraically exact but NOT
     //   guaranteed byte-identical to the split — the decode stream is verified before it is kept.
     if fuse_b1 {
-        b.emit(DevOp::AddNorm, decode_norm_cus(b.n_cu(), rows), &[c_op], |d| {
-            d.t[0] = n.xn2;
-            d.t[1] = n.xmid;
-            d.t[2] = x_in;
-            d.t[3] = n.attn;
-            d.t[4] = w.gpost;
-            d.i[0] = rows;
-            d.i[1] = h;
-            d.f[0] = eps;
-        })
+        b.emit(
+            DevOp::AddNorm,
+            decode_norm_cus(b.n_cu(), rows),
+            &[c_op],
+            |d| {
+                d.t[0] = n.xn2;
+                d.t[1] = n.xmid;
+                d.t[2] = x_in;
+                d.t[3] = n.attn;
+                d.t[4] = w.gpost;
+                d.i[0] = rows;
+                d.i[1] = h;
+                d.f[0] = eps;
+            },
+        )
     } else {
         let c_rs = b.emit(DevOp::Residual, spine_cus(b.n_cu()), &[c_op], |d| {
             d.t[0] = n.xmid;
@@ -5042,9 +5053,7 @@ pub(crate) fn emit_glm_mla_prefill(
     };
     let sparse = glm_dsa_pf_bucket(c, t) && (w.iwqb != TENSOR_NONE || reuses) && nh_l == 8;
     // Dense prefill still feeds sparse decode's key cache, including short tail buckets.
-    let c_sel_pf = if w.iwqb != TENSOR_NONE
-        && (sparse || (c.dsa(ctx) && c.index_kpool == 1))
-    {
+    let c_sel_pf = if w.iwqb != TENSOR_NONE && (sparse || (c.dsa(ctx) && c.index_kpool == 1)) {
         Some(emit_glm_dsa_prefill_select(
             b,
             c,
@@ -5157,16 +5166,28 @@ pub(crate) fn emit_glm_mla_prefill(
     // the fused GEMM's A operand, so the o-GEMM deps straight on the flash.
     let native_fold = emit_config::active().glm_fold_lt && t >= 2048;
     if native_fold {
-        assert!(crate::emit_is_amd() && b.n_cu() == 304 && c.tp == 8
-            && nh_l == 8 && dk == 512 && vd == 256 && (1..8).contains(&pf_ns) && !ofold,
-            "native MLA fold requires gfx942 TP8 latent512/value256, splits<8, and no ofold fusion");
+        assert!(
+            crate::emit_is_amd()
+                && b.n_cu() == 304
+                && c.tp == 8
+                && nh_l == 8
+                && dk == 512
+                && vd == 256
+                && (1..8).contains(&pf_ns)
+                && !ofold,
+            "native MLA fold requires gfx942 TP8 latent512/value256, splits<8, and no ofold fusion"
+        );
     }
     let c_uv = if ofold {
         c_fl
     } else {
         let counter = b.emit(
             DevOp::MlaMergeFold,
-            if native_fold { vec![0] } else { mla_fold_cus(&all, t * nh_l, vd) },
+            if native_fold {
+                vec![0]
+            } else {
+                mla_fold_cus(&all, t * nh_l, vd)
+            },
             &[c_fl],
             |d| {
                 d.t[0] = n.oat;
@@ -5183,7 +5204,9 @@ pub(crate) fn emit_glm_mla_prefill(
                 d.i[5] = u32::from(native_fold);
             },
         );
-        if native_fold { b.isolate(counter); }
+        if native_fold {
+            b.isolate(counter);
+        }
         counter
     };
     // 12 o_proj, row-parallel over this rank's head shard. Under TP the [T,hidden] partial goes
@@ -6589,16 +6612,21 @@ fn emit_glm_moe_ffn_rows(
         if raw_output {
             c_xr
         } else if let Some(gin_next) = seam_next_gin(n, slot, tp) {
-            b.emit(DevOp::AddNorm, decode_norm_cus(b.n_cu(), rows), &[c_xr], |d| {
-                d.t[0] = n.xn;
-                d.t[1] = x_out;
-                d.t[2] = n.xmid;
-                d.t[3] = n.attn;
-                d.t[4] = gin_next;
-                d.i[0] = rows;
-                d.i[1] = h;
-                d.f[0] = c.eps;
-            })
+            b.emit(
+                DevOp::AddNorm,
+                decode_norm_cus(b.n_cu(), rows),
+                &[c_xr],
+                |d| {
+                    d.t[0] = n.xn;
+                    d.t[1] = x_out;
+                    d.t[2] = n.xmid;
+                    d.t[3] = n.attn;
+                    d.t[4] = gin_next;
+                    d.i[0] = rows;
+                    d.i[1] = h;
+                    d.f[0] = c.eps;
+                },
+            )
         } else {
             b.emit(DevOp::Residual, spine_cus(b.n_cu()), &[c_xr], |d| {
                 d.t[0] = x_out;
@@ -7374,16 +7402,21 @@ fn emit_glm_dense_ffn_rows(
         if raw_output {
             c_xr
         } else if let Some(gin_next) = seam_next_gin(n, slot, tp) {
-            b.emit(DevOp::AddNorm, decode_norm_cus(b.n_cu(), rows), &[c_xr], |d| {
-                d.t[0] = n.xn;
-                d.t[1] = x_out;
-                d.t[2] = n.xmid;
-                d.t[3] = n.attn;
-                d.t[4] = gin_next;
-                d.i[0] = rows;
-                d.i[1] = h;
-                d.f[0] = c.eps;
-            })
+            b.emit(
+                DevOp::AddNorm,
+                decode_norm_cus(b.n_cu(), rows),
+                &[c_xr],
+                |d| {
+                    d.t[0] = n.xn;
+                    d.t[1] = x_out;
+                    d.t[2] = n.xmid;
+                    d.t[3] = n.attn;
+                    d.t[4] = gin_next;
+                    d.i[0] = rows;
+                    d.i[1] = h;
+                    d.f[0] = c.eps;
+                },
+            )
         } else {
             b.emit(DevOp::Residual, spine_cus(b.n_cu()), &[c_xr], |d| {
                 d.t[0] = x_out;
@@ -7445,14 +7478,16 @@ fn glm_emit_full(
     let enc = MoeEnc::from_flags(use_fp8, false);
     if emit_config::active().glm_moe_resident {
         assert!(
-            crate::emit_is_amd() && target == "gfx942" && tp == 8
-                && enc == MoeEnc::Fp8Blk && !c.ep
+            crate::emit_is_amd()
+                && target == "gfx942"
+                && tp == 8
+                && enc == MoeEnc::Fp8Blk
+                && !c.ep
                 && !emit_config::active().packed_prefill_on()
                 && !emit_config::active().moe_prefill_ep,
             "resident GLM MoE requires gfx942 TP8 block-FP8 without EP or packed prefill"
         );
     }
-
 
     // PREFILL BUCKETS. `PLOW_MLA_PREFILL=full` turns the serving blob from decode-only (n_prog = 1)
     // into a bucket ladder + decode. Decode-only is what made GLM's TTFT 20x vLLM's: with no

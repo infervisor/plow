@@ -2413,7 +2413,16 @@ mod w8a16_tests {
     fn mapless_w8a16_requires_bf16_activation_and_channel_scale() {
         let mut inst = DevInst64::default();
         inst.op = DevOp::GemmFp8 as u16;
-        inst.t = [0, 1, 2, TENSOR_NONE16, 3, TENSOR_NONE16, TENSOR_NONE16, TENSOR_NONE16];
+        inst.t = [
+            0,
+            1,
+            2,
+            TENSOR_NONE16,
+            3,
+            TENSOR_NONE16,
+            TENSOR_NONE16,
+            TENSOR_NONE16,
+        ];
         inst.i = [128, 2048, 3840, 0, 0, 0, 0, 0];
         assert!(inst.is_mapless_w8a16_gemm());
         for (slot, value) in [(3, 4), (4, TENSOR_NONE16), (1, TENSOR_NONE16)] {

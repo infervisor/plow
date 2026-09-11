@@ -22,7 +22,10 @@ fn packet_capabilities_are_explicit() {
         let capabilities = emit_capabilities(model_type);
         assert!(capabilities.dense_packet_contracts);
         assert!(capabilities.decode_objects);
-        assert_eq!(capabilities.cublaslt_decode, model_type.starts_with("gemma"));
+        assert_eq!(
+            capabilities.cublaslt_decode,
+            model_type.starts_with("gemma")
+        );
         assert!(capabilities.decode_ladder);
     }
     let qwen = emit_capabilities("qwen3_5");
@@ -104,7 +107,9 @@ fn amd_packed_defaults_require_dense_bf16_single_gpu() {
 #[test]
 fn qualified_fp8_weight_metadata_follows_production_defaults() {
     for flag in ["--fp8", "--w8a16"] {
-        let mut cfg = EmitArgsForTest::try_parse_from(["test", flag]).unwrap().emit;
+        let mut cfg = EmitArgsForTest::try_parse_from(["test", flag])
+            .unwrap()
+            .emit;
         apply_production_defaults(&mut cfg, emit_capabilities("gemma4"), "sm_90a", 1);
         assert!(cfg.packed_prefill_on());
         assert!(cfg.packed_prefill_metadata_on());
@@ -121,7 +126,9 @@ fn qualified_fp8_weight_metadata_follows_production_defaults() {
 
 #[test]
 fn activation_fp8_packing_still_requires_explicit_selection() {
-    let mut cfg = EmitArgsForTest::try_parse_from(["test", "--w8a8"]).unwrap().emit;
+    let mut cfg = EmitArgsForTest::try_parse_from(["test", "--w8a8"])
+        .unwrap()
+        .emit;
     apply_production_defaults(&mut cfg, emit_capabilities("gemma4"), "sm_90a", 1);
     assert!(cfg.packed_prefill_on());
     assert!(!cfg.packed_prefill_metadata_on());

@@ -15,7 +15,8 @@ fn dense_prefill_rungs_populate_keys_for_sparse_decode() {
     let ctx = 81920;
     for sparse_prefill in ["0", "1"] {
         let _env = crate::test_env::EnvScope::set(&[
-            ("PLOW_GLM_DSA", "1"), ("PLOW_GLM_DSA_PF", sparse_prefill),
+            ("PLOW_GLM_DSA", "1"),
+            ("PLOW_GLM_DSA_PF", sparse_prefill),
             ("PLOW_GLM_FP8_KV", "1"),
         ]);
         for t in [128, 512, 2048, 8192] {
@@ -25,22 +26,47 @@ fn dense_prefill_rungs_populate_keys_for_sparse_decode() {
             let mut b = Builder::new(304);
             b.adopt_tensors(decl.tensors());
             let all = b.all();
-            emit_glm_mla_prefill(&mut b, &c, &n, 0, ctx, t, MoeEnc::Fp8Blk,
-                n.x, &[], false, &mut 0, &all);
+            emit_glm_mla_prefill(
+                &mut b,
+                &c,
+                &n,
+                0,
+                ctx,
+                t,
+                MoeEnc::Fp8Blk,
+                n.x,
+                &[],
+                false,
+                &mut 0,
+                &all,
+            );
             let p = b.finish();
             let writers: Vec<_> = p.insts.iter().filter(|d| d.t[0] == n.kidx[0]).collect();
-            assert_eq!(writers.len(), 1, "DSA key rows missing or duplicated at T={t}");
+            assert_eq!(
+                writers.len(),
+                1,
+                "DSA key rows missing or duplicated at T={t}"
+            );
             let writer = writers[0];
             assert_eq!(writer.op, DevOp::HeadNormRope as u16);
-            assert_eq!((writer.t[1], writer.i[0], writer.i[1], writer.i[2]), (n.kidx_pf, t, 1, 128));
+            assert_eq!(
+                (writer.t[1], writer.i[0], writer.i[1], writer.i[2]),
+                (n.kidx_pf, t, 1, 128)
+            );
             assert_eq!(writer.j[1], KV_MASK_NONE);
-            assert!(p.insts.iter().any(|d| d.t[0] == n.kidx_pf
-                && d.t[1] == n.xn && d.t[2] == n.lw[0].iwk));
+            assert!(p
+                .insts
+                .iter()
+                .any(|d| d.t[0] == n.kidx_pf && d.t[1] == n.xn && d.t[2] == n.lw[0].iwk));
             assert!(p.insts.iter().any(|d| d.op == DevOp::LayerNorm as u16
-                && d.t[0] == n.kidx_pf && d.t[2] == n.lw[0].iknw && d.t[3] == n.lw[0].iknb));
+                && d.t[0] == n.kidx_pf
+                && d.t[2] == n.lw[0].iknw
+                && d.t[3] == n.lw[0].iknb));
             if sparse_prefill == "0" || t <= 2048 {
-                assert!(!p.insts.iter().any(|d| matches!(DevOp::from_u16(d.op),
-                    Some(DevOp::IndexScorePf | DevOp::IndexTpPf | DevOp::IndexSelectPf))));
+                assert!(!p.insts.iter().any(|d| matches!(
+                    DevOp::from_u16(d.op),
+                    Some(DevOp::IndexScorePf | DevOp::IndexTpPf | DevOp::IndexSelectPf)
+                )));
                 assert!(!p.insts.iter().any(|d| d.t[2] == n.lw[0].iwqb));
             }
         }
@@ -534,13 +560,31 @@ fn glm_dsa_local_selection_keeps_one_completion_for_independent_rows() {
         b.adopt_tensors(tensors.clone());
         let ready = b.emit(DevOp::Nop, vec![0], &[], |_| {});
         let complete = emit_glm_dsa_decode_select(
-            &mut b, &c, &n, &n.lw[0], 0, ctx, rows, 20, MoeEnc::Fp8Blk,
-            &(0..304).collect::<Vec<_>>(), c.eps as f32, c.q_lora, c.hidden,
-            ready, ready, &(0..32).collect::<Vec<_>>(), &[0],
+            &mut b,
+            &c,
+            &n,
+            &n.lw[0],
+            0,
+            ctx,
+            rows,
+            20,
+            MoeEnc::Fp8Blk,
+            &(0..304).collect::<Vec<_>>(),
+            c.eps as f32,
+            c.q_lora,
+            c.hidden,
+            ready,
+            ready,
+            &(0..32).collect::<Vec<_>>(),
+            &[0],
         );
         let p = b.finish();
-        let selects: Vec<_> = p.insts.iter().enumerate()
-            .filter(|(_, d)| d.op == DevOp::IndexSelect as u16).collect();
+        let selects: Vec<_> = p
+            .insts
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.op == DevOp::IndexSelect as u16)
+            .collect();
         assert_eq!(selects.len(), 1);
         let (ix, d) = selects[0];
         assert_eq!(complete as usize, ix);
@@ -549,8 +593,12 @@ fn glm_dsa_local_selection_keeps_one_completion_for_independent_rows() {
         if rows > 1 {
             assert_eq!([d.t[2], d.t[3]], [TENSOR_NONE; 2]);
         }
-        let mut slices: Vec<_> = p.stream.iter().filter(|e| e.inst as usize == ix)
-            .map(|e| e.slice).collect();
+        let mut slices: Vec<_> = p
+            .stream
+            .iter()
+            .filter(|e| e.inst as usize == ix)
+            .map(|e| e.slice)
+            .collect();
         slices.sort_unstable();
         assert_eq!(slices, (0..u32::from(d.blocks)).collect::<Vec<_>>());
     }
@@ -1446,10 +1494,25 @@ fn glm_decode_norm_rows_preserves_arithmetic_and_completion() {
             let mut cur = n.x;
             for (slot, &layer) in layers.iter().enumerate() {
                 let next = if cur == n.x { n.xnext } else { n.x };
-                let emit_block = if c.is_dense(layer) { emit_glm_dense_block } else { emit_glm_block };
+                let emit_block = if c.is_dense(layer) {
+                    emit_glm_dense_block
+                } else {
+                    emit_glm_block
+                };
                 dep = vec![emit_block(
-                    &mut b, &c, &n, slot, 64, rows, 20, MoeEnc::Fp8Blk,
-                    cur, next, &dep, &mut xgate, &all,
+                    &mut b,
+                    &c,
+                    &n,
+                    slot,
+                    64,
+                    rows,
+                    20,
+                    MoeEnc::Fp8Blk,
+                    cur,
+                    next,
+                    &dep,
+                    &mut xgate,
+                    &all,
                 )];
                 cur = next;
             }
@@ -1461,14 +1524,23 @@ fn glm_decode_norm_rows_preserves_arithmetic_and_completion() {
         assert_eq!(baseline.insts.len(), wide.insts.len());
         let mut changed = 0;
         for (ix, (before, after)) in baseline.insts.iter().zip(&wide.insts).enumerate() {
-            assert_eq!((before.op, before.t, before.i, before.j, before.f),
-                       (after.op, after.t, after.i, after.j, after.f));
+            assert_eq!(
+                (before.op, before.t, before.i, before.j, before.f),
+                (after.op, after.t, after.i, after.j, after.f)
+            );
             if before.blocks != after.blocks {
                 changed += 1;
-                assert!(matches!(DevOp::from_u16(after.op), Some(DevOp::RmsNorm | DevOp::AddNorm)));
+                assert!(matches!(
+                    DevOp::from_u16(after.op),
+                    Some(DevOp::RmsNorm | DevOp::AddNorm)
+                ));
                 assert_eq!(after.blocks as u32, rows);
-                let slices: std::collections::BTreeSet<_> = wide.stream.iter()
-                    .filter(|e| e.inst as usize == ix).map(|e| e.slice).collect();
+                let slices: std::collections::BTreeSet<_> = wide
+                    .stream
+                    .iter()
+                    .filter(|e| e.inst as usize == ix)
+                    .map(|e| e.slice)
+                    .collect();
                 assert_eq!(slices, (0..rows).collect());
                 for wait in wide.waits.iter().filter(|w| w.id as usize == ix) {
                     assert_eq!(wait.threshold, rows);
@@ -1808,7 +1880,10 @@ fn check_glm_flat_segments(resident: bool) {
         ("PLOW_GLM_MOE_AITER", "0"),
         ("PLOW_GLM_MOE_FLAT_DECODE", if resident { "0" } else { "1" }),
         ("PLOW_GLM_MOE_RESIDENT", if resident { "1" } else { "0" }),
-        ("PLOW_DECODE_BATCH_LADDER", if resident { "1,2,4,8,16,20" } else { "1,2,4,8" }),
+        (
+            "PLOW_DECODE_BATCH_LADDER",
+            if resident { "1,2,4,8,16,20" } else { "1,2,4,8" },
+        ),
         ("PLOW_EMIT_PACKED_PREFILL", "0"),
         ("PLOW_UNISEG", "0"),
     ]);
@@ -1840,26 +1915,28 @@ fn check_glm_flat_segments(resident: bool) {
                 continue;
             }
             checked += 1;
-            if rows <= 20 { assert_eq!(prog.l2_domains, 8); }
+            if rows <= 20 {
+                assert_eq!(prog.l2_domains, 8);
+            }
             assert_eq!(native.len(), 1);
             let (ix, inst) = native[0];
             if rows > 20 {
                 assert_eq!(inst.i, [rows, 6144, 256, 256, 8, 64, 0, 1]);
             } else {
-            assert_eq!(inst.i, [rows, 6144, 256, 256, 8, 0, 1, u32::from(resident)]);
-            assert_eq!(&inst.t[5..], &[TENSOR_NONE; 3]);
-            let router = prog.insts[..ix]
-                .iter()
-                .rposition(|d| d.op == DevOp::MoeRouterTopkPf as u16 && d.t[0] == inst.t[4])
-                .unwrap();
-            assert!(!prog.insts[router..ix]
-                .iter()
-                .any(|d| d.op == DevOp::MoeAlignPf as u16));
-            let combine = prog.insts[ix + 1..]
-                .iter()
-                .find(|d| d.op == DevOp::MoeCombinePf as u16 && d.t[3] == inst.t[0])
-                .unwrap();
-            assert_eq!(combine.i, [6144, 1, rows, 0, 0, 0, 0, 1]);
+                assert_eq!(inst.i, [rows, 6144, 256, 256, 8, 0, 1, u32::from(resident)]);
+                assert_eq!(&inst.t[5..], &[TENSOR_NONE; 3]);
+                let router = prog.insts[..ix]
+                    .iter()
+                    .rposition(|d| d.op == DevOp::MoeRouterTopkPf as u16 && d.t[0] == inst.t[4])
+                    .unwrap();
+                assert!(!prog.insts[router..ix]
+                    .iter()
+                    .any(|d| d.op == DevOp::MoeAlignPf as u16));
+                let combine = prog.insts[ix + 1..]
+                    .iter()
+                    .find(|d| d.op == DevOp::MoeCombinePf as u16 && d.t[3] == inst.t[0])
+                    .unwrap();
+                assert_eq!(combine.i, [6144, 1, rows, 0, 0, 0, 0, 1]);
             }
             let segment = prog
                 .stream
@@ -1884,7 +1961,9 @@ fn check_glm_flat_segments(resident: bool) {
                 .map(|e| usize::from(e.seg) + 1)
                 .max()
                 .unwrap();
-            if rows <= 20 { assert_eq!(prog.gq_seg_ofs.len(), segments * 8 + 1); }
+            if rows <= 20 {
+                assert_eq!(prog.gq_seg_ofs.len(), segments * 8 + 1);
+            }
         }
         assert_eq!(checked, if resident { 7 } else { 3 });
         Ok(crate::LeanReport::skipped(
@@ -1955,18 +2034,46 @@ fn glm_native_decode_gemm_preserves_xcd_boundaries() {
             checked += 1;
             assert_eq!(prog.l2_domains, 8);
             assert_eq!(native.len(), 16);
-            assert_eq!(native.iter().filter(|(_, d)| (d.i[1], d.i[2]) == (256, 6144)).count(), 3);
-            assert_eq!(native.iter().filter(|(_, d)| (d.i[1], d.i[2]) == (6144, 256)).count(), 1);
+            assert_eq!(
+                native
+                    .iter()
+                    .filter(|(_, d)| (d.i[1], d.i[2]) == (256, 6144))
+                    .count(),
+                3
+            );
+            assert_eq!(
+                native
+                    .iter()
+                    .filter(|(_, d)| (d.i[1], d.i[2]) == (6144, 256))
+                    .count(),
+                1
+            );
             for (ix, inst) in native {
                 assert_eq!(inst.i[0], rows);
                 assert_eq!(inst.i[3], 1);
-                assert!(matches!((inst.i[1], inst.i[2]), (2048, 6144) | (512, 6144) | (4096, 2048) | (6144, 2048) | (256, 6144) | (6144, 256)));
-                let segment = prog.stream.iter().find(|e| e.inst as usize == ix).unwrap().seg;
+                assert!(matches!(
+                    (inst.i[1], inst.i[2]),
+                    (2048, 6144)
+                        | (512, 6144)
+                        | (4096, 2048)
+                        | (6144, 2048)
+                        | (256, 6144)
+                        | (6144, 256)
+                ));
+                let segment = prog
+                    .stream
+                    .iter()
+                    .find(|e| e.inst as usize == ix)
+                    .unwrap()
+                    .seg;
                 assert!(segment > 0);
                 for entries in [&prog.stream, &prog.gq_stream] {
                     for e in entries.iter().filter(|e| e.seg == segment) {
                         assert_eq!(e.inst as usize, ix);
-                        assert_eq!((e.wait_len, e.succ_len, e.flags & packet::dev::SE_XCTR), (0, 0, 0));
+                        assert_eq!(
+                            (e.wait_len, e.succ_len, e.flags & packet::dev::SE_XCTR),
+                            (0, 0, 0)
+                        );
                     }
                     assert!(entries.iter().any(|e| e.seg > segment));
                 }

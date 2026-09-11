@@ -216,8 +216,8 @@ impl BlobPlan {
                     + crate::memory::vmm::kv_pool_cap();
             } else if let Some(layout) = prefix_layout {
                 let geo = &layout.geo;
-                let block = geo
-                    .block_bytes(granularity, u64::from(config.nv_vmm_block_mib()) << 20)?;
+                let block =
+                    geo.block_bytes(granularity, u64::from(config.nv_vmm_block_mib()) << 20)?;
                 let tracks = geo.full_layers.len() as u64 * 2;
                 let virtual_bytes = geo.full_tensor_bytes() * tracks;
                 let resident = block * u64::from(geo.batch) * u64::from(geo.kvh_full) * tracks;

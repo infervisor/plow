@@ -375,7 +375,11 @@ mod tests {
     /// a table that has no decode prefix.
     #[test]
     fn the_decode_band_validator_still_refuses_a_prefix_free_table() {
-        let spans = [tb_span(0, 1, 0, 100), tb_span(1, 1, 2, 119), tb_span(2, 49, 2, 70)];
+        let spans = [
+            tb_span(0, 1, 0, 100),
+            tb_span(1, 1, 2, 119),
+            tb_span(2, 49, 2, 70),
+        ];
         let err = validate_rows(3, 0, 256, 4, &spans, &parked(51, 256)).unwrap_err();
         assert!(err.contains("more than one span"), "{err}");
     }
@@ -400,7 +404,11 @@ mod tests {
         bad.kv_len = 9;
         assert!(validate_token_batch_rows(3, 64, 4, 0, &[bad], &parked(4, 64)).is_err());
         // Three spans on one slot is never a terminal/body pair.
-        let three = [tb_span(0, 1, 1, 9), tb_span(1, 1, 1, 8), tb_span(2, 1, 1, 7)];
+        let three = [
+            tb_span(0, 1, 1, 9),
+            tb_span(1, 1, 1, 8),
+            tb_span(2, 1, 1, 7),
+        ];
         assert!(validate_token_batch_rows(3, 64, 4, 3, &three, &parked(3, 64)).is_err());
     }
 

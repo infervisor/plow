@@ -35,11 +35,7 @@ fn layout(insts: &[DevInst64], rows: u32, logits: usize, ids: usize) -> Option<[
             != [
                 DevOp::RmsNorm,
                 DevOp::Gemm,
-                if softcap {
-                    DevOp::SoftCap
-                } else {
-                    DevOp::Nop
-                },
+                if softcap { DevOp::SoftCap } else { DevOp::Nop },
                 DevOp::Argmax,
                 DevOp::ArgmaxFin,
             ]
@@ -53,8 +49,7 @@ fn layout(insts: &[DevInst64], rows: u32, logits: usize, ids: usize) -> Option<[
         || (head.i[6] == 0) != (head.i[7] == 0)
         || head.t[1] != norm.t[0]
         || head.t[0] as usize != logits
-        || (softcap
-            && (cap.t[0] != head.t[0] || cap.t[1] != head.t[0] || cap.i[0] != head.i[1]))
+        || (softcap && (cap.t[0] != head.t[0] || cap.t[1] != head.t[0] || cap.i[0] != head.i[1]))
         || max.t[1] != head.t[0]
         || max.i[0] != head.i[1]
         || max.i[1] > 1
@@ -130,10 +125,11 @@ impl PackedTerminal {
         } else {
             5
         };
-        for (inst, original) in bucket.h_inst[end - len..]
-            .iter_mut()
-            .zip(self.template.iter().filter(|inst| inst.op != DevOp::Nop as u16))
-        {
+        for (inst, original) in bucket.h_inst[end - len..].iter_mut().zip(
+            self.template
+                .iter()
+                .filter(|inst| inst.op != DevOp::Nop as u16),
+        ) {
             inst.op = if discard {
                 DevOp::Nop as u16
             } else {
@@ -327,12 +323,7 @@ impl PackedTerminal {
         Ok(())
     }
 
-    pub(super) fn run_rows(
-        &mut self,
-        e: &GpuEngine,
-        rows: &[u32],
-        live: usize,
-    ) -> Result<&[u32]> {
+    pub(super) fn run_rows(&mut self, e: &GpuEngine, rows: &[u32], live: usize) -> Result<&[u32]> {
         self.host_rows.clear();
         self.host_rows.extend_from_slice(rows);
         self.run(e, live)?;
