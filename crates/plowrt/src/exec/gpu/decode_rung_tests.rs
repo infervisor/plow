@@ -48,6 +48,7 @@ pub(super) fn fixture() -> DevBlob {
             DevProg {
                 t: rows,
                 packed_prefill_only: false,
+                token_batch_body: false,
                 n_counter: 0,
                 insts,
                 stream: stream.clone(),

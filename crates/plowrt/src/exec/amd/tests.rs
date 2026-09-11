@@ -60,6 +60,7 @@ fn materialized_mla_route_probe(t: u32, heads: u32) -> (DevProg, Vec<DeviceMem>)
     let prog = DevProg {
         t,
         packed_prefill_only: false,
+        token_batch_body: false,
         n_counter: 0,
         insts: vec![pack, attention],
         stream,
@@ -214,6 +215,7 @@ fn grouped_moe_decode_pair_routes_with_exact_mxfp4_abi() {
     let prog = DevProg {
         t: 1,
         packed_prefill_only: false,
+        token_batch_body: false,
         n_counter: 0,
         insts: vec![glu, down],
         stream: vec![
@@ -595,6 +597,7 @@ fn segmented_decode_probe() -> DevProg {
     DevProg {
         t: 1,
         packed_prefill_only: false,
+        token_batch_body: false,
         n_counter: 0,
         insts,
         stream: (0..3)
@@ -1136,6 +1139,7 @@ fn gate_hier_probe(l2_domains: u32, nper: u16) -> DevProg {
     DevProg {
         t: 1,
         packed_prefill_only: false,
+        token_batch_body: false,
         n_counter: 0,
         insts: vec![DevInst64 {
             op: DevOp::Nop as u16,
@@ -1263,6 +1267,7 @@ fn segmented_prog(ops: &[DevOp], segs: &[u16]) -> DevProg {
     DevProg {
         t: 2048,
         packed_prefill_only: false,
+        token_batch_body: false,
         n_counter: 0,
         insts: ops
             .iter()
@@ -2867,6 +2872,7 @@ fn prefill_arm_detect_selects_the_right_variant() {
         DevProg {
             t: 1,
             packed_prefill_only: false,
+            token_batch_body: false,
             n_counter: 0,
             insts,
             stream: Vec::new(),
@@ -3005,6 +3011,7 @@ fn prog_gemv(ops: &[DevOp], m: u32) -> DevProg {
     DevProg {
         t: m,
         packed_prefill_only: false,
+        token_batch_body: false,
         n_counter: 0,
         insts,
         stream: Vec::new(),

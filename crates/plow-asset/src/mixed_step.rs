@@ -93,6 +93,28 @@ pub enum SpanCover {
     ///   `split_terminal_prefill`/`finish_prefill_batch` replay of that token through a second,
     ///   decode-shaped transformer pass (§1, §6.5).
     PrefixFree,
+    /// AMD TP lowering for the MLA/MoE families (`plans/unified-token-batch.md`, "AMD TP8
+    /// lowering decision"). Rows `[0, band)` are indexed by PHYSICAL KV SLOT — row `t` is slot
+    /// `t`, exactly the batched-decode convention every GLM decode-chain op already implements
+    /// (`HeadNormRope i6=n_batch_kv`, `FlashMlaDecode*`, `IndexScore`/`IndexSelect` per-row
+    /// `kv_len[t]`), so the decode kernels need no per-row slot indirection. The spans cover
+    /// `[band, real_rows)` contiguously, as under [`SpanCover::DecodeBand`].
+    ///
+    /// * A decode request occupies its slot's band row.
+    /// * A prompt that COMPLETES this step puts its final token on its slot's band row and the
+    ///   rest of its chunk in a body span, so the step samples the prompt's first generated
+    ///   token without a replay pass — the same property as [`SpanCover::PrefixFree`], expressed
+    ///   in the band instead of a leading length-one span.
+    /// * Every other band row is PARKED: `kv_len` 1, no KV write, not sampled. A mid-prefill
+    ///   slot's band row is parked while its span is live in the same step; the device's
+    ///   parked check is what keeps that row from clobbering the span's frontier KV row.
+    ///
+    /// The sampled rows are the active band rows in slot order (`Plan::decode_slots` lists
+    /// them); `Plan::decode_rows` is the band width, not the sample count. `S = 0` is legal.
+    SlotBand {
+        /// Band width: the decode ladder's widest rung, compiled into the body program.
+        band: u32,
+    },
 }
 
 /// One request's KV frontier transition, checked and applied as a unit after the device
@@ -250,6 +272,18 @@ fn plan_into_inner(
         decode.len().saturating_add(prefill.len()) <= frontiers.len(),
         "active request capacity",
     )?;
+    if let SpanCover::SlotBand { band } = cover {
+        return plan_slot_band_inner(
+            decode,
+            prefill,
+            frontiers,
+            rows,
+            max_ctx,
+            auxiliary_program,
+            band,
+            out,
+        );
+    }
 
     let capacity = usize::try_from(rows).map_err(|_| "mixed step: row capacity")?;
     let active = decode
@@ -493,6 +527,330 @@ fn plan_into_inner(
     Ok(())
 }
 
+/// The [`SpanCover::SlotBand`] planner: a slot-indexed band of `band` rows, then the spans.
+///
+/// Refusals are by name and leave `out` cleared (the caller does that). The band is filled
+/// with parked rows first and the requests claim their slots, so a slot with no request this
+/// step is parked by construction rather than by a second pass.
+#[allow(clippy::too_many_arguments)]
+fn plan_slot_band_inner(
+    decode: &[DecodeRequest],
+    prefill: &[PrefillRequest<'_>],
+    frontiers: &[u32],
+    rows: u32,
+    max_ctx: u32,
+    auxiliary_program: u32,
+    band: u32,
+    out: &mut Plan,
+) -> Result<()> {
+    require(band > 0 && band <= rows, "slot band width outside the row capacity")?;
+    let capacity = usize::try_from(rows).map_err(|_| "mixed step: row capacity")?;
+    let band_rows = band as usize;
+    let active = decode
+        .len()
+        .checked_add(prefill.len())
+        .ok_or("mixed step: active request overflow")?;
+    require(
+        out.rows.capacity() >= capacity
+            && out.prefill_spans.capacity() >= prefill.len()
+            && out.decode_slots.capacity() >= band_rows.min(active)
+            && out.parked.capacity() >= capacity
+            && out.commits.capacity() >= active
+            && out.mapped_ends.capacity() >= active,
+        "output buffer capacity",
+    )?;
+
+    // Every band row starts parked on its own slot; the requests below claim theirs.
+    out.parked.resize(capacity, 1);
+    for slot in 0..band {
+        out.rows.push(Row {
+            token: 0,
+            slot,
+            state_slot: slot,
+            position: 0,
+            kv_len: 1,
+            phase: RowPhase::Parked,
+        });
+    }
+
+    for (index, request) in decode.iter().enumerate() {
+        let slot = request.slot as usize;
+        require(
+            slot < frontiers.len()
+                && request.slot < band
+                && request.state_slot == request.slot
+                && !decode[..index]
+                    .iter()
+                    .any(|prior| prior.slot == request.slot),
+            "physical/state slot or duplicate",
+        )?;
+        let position = frontiers[slot];
+        let kv_len = position
+            .checked_add(1)
+            .ok_or("mixed step: decode position overflow")?;
+        require(kv_len <= max_ctx, "decode extent")?;
+        out.rows[slot] = Row {
+            token: request.token,
+            slot: request.slot,
+            state_slot: request.state_slot,
+            position,
+            kv_len,
+            phase: RowPhase::Decode,
+        };
+        out.parked[slot] = 0;
+        out.commits.push(Commit {
+            slot: request.slot,
+            expect: position,
+            after: kv_len,
+        });
+        out.mapped_ends.push((request.slot, kv_len));
+    }
+
+    for (index, request) in prefill.iter().enumerate() {
+        let slot = request.slot as usize;
+        let duplicate = decode.iter().any(|prior| prior.slot == request.slot)
+            || prefill[..index]
+                .iter()
+                .any(|prior| prior.slot == request.slot);
+        require(
+            slot < frontiers.len() && request.state_slot == request.slot && !duplicate,
+            "physical/state slot or duplicate",
+        )?;
+        let n_rows =
+            u32::try_from(request.tokens.len()).map_err(|_| "mixed step: prefill row count")?;
+        let end = request
+            .start
+            .checked_add(n_rows)
+            .ok_or("mixed step: prefill extent overflow")?;
+        require(
+            n_rows > 0
+                && request.start == frontiers[slot]
+                && end <= request.prompt_len
+                && end <= max_ctx,
+            "prefill frontier or extent",
+        )?;
+        let completes = end == request.prompt_len;
+        // The completing prompt's final token takes its slot's band row, which needs the slot
+        // to HAVE a band row. A slot past the band can still prefill here; it cannot complete.
+        require(
+            !completes || request.slot < band,
+            "completing prompt's slot is outside the band",
+        )?;
+        let body = if completes {
+            &request.tokens[..request.tokens.len() - 1]
+        } else {
+            request.tokens
+        };
+        if completes {
+            out.rows[slot] = Row {
+                token: request.tokens[request.tokens.len() - 1],
+                slot: request.slot,
+                state_slot: request.state_slot,
+                position: end - 1,
+                kv_len: end,
+                phase: RowPhase::Decode,
+            };
+            out.parked[slot] = 0;
+        }
+        if !body.is_empty() {
+            require(
+                out.rows.len().saturating_add(body.len()) <= capacity,
+                "prefill extent",
+            )?;
+            let row0 =
+                u32::try_from(out.rows.len()).map_err(|_| "mixed step: prefill row offset")?;
+            let body_rows = u32::try_from(body.len()).map_err(|_| "mixed step: body row count")?;
+            out.prefill_spans.push(PrefillSpan {
+                row0,
+                n_rows: body_rows,
+                slot: request.slot,
+                flags: u32::from(request.start == 0) * PREFILL_SPAN_RESET_STATE,
+                kv_row0: request.start,
+                kv_len: request.start + body_rows,
+                state_slot: request.state_slot,
+                program: auxiliary_program,
+            });
+            for (offset, &token) in body.iter().enumerate() {
+                let position = request.start + offset as u32;
+                out.rows.push(Row {
+                    token,
+                    slot: request.slot,
+                    state_slot: request.state_slot,
+                    position,
+                    kv_len: position + 1,
+                    phase: RowPhase::Prefill,
+                });
+            }
+        }
+        out.commits.push(Commit {
+            slot: request.slot,
+            expect: request.start,
+            after: end,
+        });
+        out.mapped_ends.push((request.slot, end));
+    }
+
+    // The sampled rows, in row (= slot) order.
+    for slot in 0..band_rows {
+        if out.parked[slot] == 0 {
+            out.decode_slots.push(slot as i32);
+        }
+    }
+    let real_rows = u32::try_from(out.rows.len()).map_err(|_| "mixed step: real rows")?;
+    out.parked[band_rows..real_rows as usize].fill(0);
+
+    // Padding: parked, and addressed after the last span row so a fixed-width kernel that still
+    // touches it stays inside that slot's mapped KV. A band-only step has no span to extend
+    // and parks the suffix on slot 0 at position 0, which nothing maps or reads.
+    let pad = capacity - out.rows.len();
+    if pad > 0 {
+        let owner = out
+            .prefill_spans
+            .last()
+            .map(|span| (span.slot, span.state_slot, span.kv_len - 1));
+        if let Some((slot, state_slot, position)) = owner {
+            let padded_end = position
+                .checked_add(1)
+                .and_then(|end| end.checked_add(pad as u32))
+                .ok_or("mixed step: padding extent overflow")?;
+            require(padded_end <= max_ctx, "padding exceeds physical context")?;
+            for offset in 0..pad {
+                let position = position + 1 + offset as u32;
+                out.rows.push(Row {
+                    token: 0,
+                    slot,
+                    state_slot,
+                    position,
+                    kv_len: position + 1,
+                    phase: RowPhase::Parked,
+                });
+            }
+            let end = out
+                .mapped_ends
+                .iter_mut()
+                .find(|(s, _)| *s == slot)
+                .ok_or("mixed step: padding owner mapping")?;
+            end.1 = padded_end;
+        } else {
+            for _ in 0..pad {
+                out.rows.push(Row {
+                    token: 0,
+                    slot: 0,
+                    state_slot: 0,
+                    position: 0,
+                    kv_len: 1,
+                    phase: RowPhase::Parked,
+                });
+            }
+        }
+    }
+    out.decode_rows = band;
+    out.real_rows = real_rows;
+    Ok(())
+}
+
+/// Check a [`SpanCover::SlotBand`] plan against the contract a token-batch body program
+/// executes: row `t` of the band is slot `t`; a completing prompt's terminal row sits exactly
+/// where its body span ends; spans are dense from the band; padding is parked. Backend-neutral
+/// so the AMD and CUDA adapters refuse the same plans by the same names before any upload.
+pub fn validate_slot_band(plan: &Plan, slot_capacity: usize, max_ctx: u32) -> Result<()> {
+    let SpanCover::SlotBand { band } = plan.cover else {
+        return Err("mixed step: plan is not a slot-band plan".into());
+    };
+    let band_rows = band as usize;
+    let capacity = plan.rows.len();
+    require(
+        band_rows > 0 && band_rows <= slot_capacity && band_rows <= capacity,
+        "slot band wider than the slot or row capacity",
+    )?;
+    require(
+        plan.parked.len() == capacity && plan.parked.iter().all(|&v| v <= 1),
+        "parked mask is not a binary mask over every row",
+    )?;
+    let real = plan.real_rows as usize;
+    require(
+        real >= band_rows && real <= capacity && plan.decode_rows == band,
+        "real rows or decode_rows disagree with the band",
+    )?;
+    let mut sampled = Vec::with_capacity(band_rows);
+    for t in 0..band_rows {
+        let row = &plan.rows[t];
+        require(
+            row.slot as usize == t && row.state_slot as usize == t,
+            "band row is not on its own slot",
+        )?;
+        match (plan.parked[t], row.phase) {
+            (1, RowPhase::Parked) => {}
+            (0, RowPhase::Decode) => {
+                require(
+                    row.kv_len == row.position.wrapping_add(1) && row.kv_len <= max_ctx,
+                    "active band row extent",
+                )?;
+                sampled.push(t as i32);
+            }
+            _ => return Err("mixed step: band row phase disagrees with its parked bit".into()),
+        }
+    }
+    require(
+        plan.decode_slots == sampled,
+        "sampled slots disagree with the active band rows",
+    )?;
+    let mut row = band;
+    for (index, span) in plan.prefill_spans.iter().enumerate() {
+        require(span.row0 == row && span.n_rows > 0, "span is not dense after the band")?;
+        require(
+            span.flags & !PREFILL_SPAN_RESET_STATE == 0
+                && (span.flags & PREFILL_SPAN_RESET_STATE != 0) == (span.kv_row0 == 0),
+            "span flags",
+        )?;
+        let kv_end = span
+            .kv_row0
+            .checked_add(span.n_rows)
+            .ok_or("mixed step: span KV range overflow")?;
+        require(
+            kv_end == span.kv_len && kv_end <= max_ctx,
+            "span kv_row0 + n_rows != kv_len or past context",
+        )?;
+        require(
+            (span.slot as usize) < slot_capacity && span.slot == span.state_slot,
+            "span slot outside capacity or split from its state slot",
+        )?;
+        require(
+            !plan.prefill_spans[..index]
+                .iter()
+                .any(|prior| prior.slot == span.slot),
+            "slot appears in more than one span",
+        )?;
+        if (span.slot as usize) < band_rows && plan.parked[span.slot as usize] == 0 {
+            // The terminal/body pair: the band row is the token right after the body.
+            require(
+                plan.rows[span.slot as usize].position == span.kv_len,
+                "band row and body span on one slot are not a terminal/body pair",
+            )?;
+        }
+        for local in 0..span.n_rows {
+            let r = &plan.rows[(span.row0 + local) as usize];
+            require(
+                r.slot == span.slot
+                    && r.position == span.kv_row0 + local
+                    && r.phase == RowPhase::Prefill
+                    && plan.parked[(span.row0 + local) as usize] == 0,
+                "span row disagrees with its span",
+            )?;
+        }
+        row = row
+            .checked_add(span.n_rows)
+            .ok_or("mixed step: span rows overflow")?;
+    }
+    require(row as usize == real, "spans do not end at real_rows")?;
+    require(
+        plan.parked[real..].iter().all(|&v| v == 1)
+            && plan.rows[real..].iter().all(|r| r.phase == RowPhase::Parked),
+        "padding is not parked",
+    )?;
+    Ok(())
+}
+
 /// Plan a unified token batch from the backend-neutral request contract.
 ///
 /// [`crate::token_batch::Request`] is what the CUDA route plans from. Taking it here too means
@@ -520,7 +878,43 @@ pub fn plan_requests_into(
     out: &mut Plan,
     owners: &mut Vec<u32>,
 ) -> Result<()> {
+    plan_requests_into_cover(
+        requests,
+        frontiers,
+        generations,
+        rows,
+        max_ctx,
+        auxiliary_program,
+        SpanCover::PrefixFree,
+        out,
+        owners,
+    )
+}
+
+/// [`plan_requests_into`] under an explicit physical cover.
+///
+/// The logical contract is the same for every cover; what changes is the row layout and hence
+/// the ORDER of `owners`: [`SpanCover::PrefixFree`] samples decode requests then completing
+/// prompts in request order, [`SpanCover::SlotBand`] samples the active band rows in slot
+/// order. Either way `owners[i]` owns the plan's `decode_slots[i]`, and that is cross-checked.
+/// [`SpanCover::DecodeBand`] is refused: it cannot sample a completing prompt.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_requests_into_cover(
+    requests: &[crate::token_batch::Request<'_>],
+    frontiers: &[u32],
+    generations: &[u32],
+    rows: u32,
+    max_ctx: u32,
+    auxiliary_program: u32,
+    cover: SpanCover,
+    out: &mut Plan,
+    owners: &mut Vec<u32>,
+) -> Result<()> {
     use crate::token_batch::Phase;
+    require(
+        cover != SpanCover::DecodeBand,
+        "the decode band cannot sample a completing prompt",
+    )?;
     // A refusal before the planner runs must not leave the previous plan looking stageable.
     out.clear();
     owners.clear();
@@ -584,25 +978,39 @@ pub fn plan_requests_into(
         rows,
         max_ctx,
         auxiliary_program,
-        SpanCover::PrefixFree,
+        cover,
         out,
     )?;
-    owners.extend(
-        requests
-            .iter()
-            .filter(|r| r.phase == Phase::Decode)
-            .map(|r| r.id),
-    );
-    owners.extend(
-        requests
-            .iter()
-            .filter(|r| {
-                r.phase == Phase::Prefill
-                    && frontiers[r.slot as usize] + r.tokens.len() as u32 == r.prompt_len
-            })
-            .map(|r| r.id),
-    );
-    let consistent = owners.len() == out.decode_rows as usize
+    let sampled = |r: &&crate::token_batch::Request<'_>| {
+        r.phase == Phase::Decode
+            || frontiers[r.slot as usize] + r.tokens.len() as u32 == r.prompt_len
+    };
+    match cover {
+        SpanCover::SlotBand { .. } => {
+            let mut by_slot: Vec<(u32, u32)> = requests
+                .iter()
+                .filter(sampled)
+                .map(|r| (r.slot, r.id))
+                .collect();
+            by_slot.sort_unstable();
+            owners.extend(by_slot.into_iter().map(|(_, id)| id));
+        }
+        _ => {
+            owners.extend(
+                requests
+                    .iter()
+                    .filter(|r| r.phase == Phase::Decode)
+                    .map(|r| r.id),
+            );
+            owners.extend(
+                requests
+                    .iter()
+                    .filter(|r| r.phase == Phase::Prefill && sampled(r))
+                    .map(|r| r.id),
+            );
+        }
+    }
+    let consistent = owners.len() == out.decode_slots.len()
         && owners.iter().zip(&out.decode_slots).all(|(id, &slot)| {
             requests
                 .iter()

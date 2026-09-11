@@ -2157,6 +2157,7 @@ mod tests {
         let prog = |insts: Vec<DevInst64>| DevProg {
             t: 1,
             packed_prefill_only: false,
+            token_batch_body: false,
             n_counter: 0,
             insts,
             stream: Vec::new(),

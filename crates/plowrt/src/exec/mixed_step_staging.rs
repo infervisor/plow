@@ -83,22 +83,55 @@ impl MixedStepStaging {
         max_ctx: u32,
         auxiliary_program: u32,
     ) -> Result<&'a Plan, StageError> {
-        if self.pending {
-            return Err(StageError::PendingPlan);
-        }
-        mixed_step::plan_requests_into(
+        self.stage_requests_cover(
             requests,
             frontiers,
             generations,
             rows,
             max_ctx,
             auxiliary_program,
+            mixed_step::SpanCover::PrefixFree,
+        )
+    }
+
+    /// [`Self::stage_requests`] under an explicit physical cover
+    /// ([`mixed_step::plan_requests_into_cover`]). The delivery contract is unchanged: one
+    /// `(request, id)` per sampled row, in the plan's sample order.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stage_requests_cover<'a>(
+        &'a mut self,
+        requests: &[token_batch::Request<'_>],
+        frontiers: &[u32],
+        generations: &[u32],
+        rows: u32,
+        max_ctx: u32,
+        auxiliary_program: u32,
+        cover: mixed_step::SpanCover,
+    ) -> Result<&'a Plan, StageError> {
+        if self.pending {
+            return Err(StageError::PendingPlan);
+        }
+        mixed_step::plan_requests_into_cover(
+            requests,
+            frontiers,
+            generations,
+            rows,
+            max_ctx,
+            auxiliary_program,
+            cover,
             &mut self.plan,
             &mut self.owners,
         )
         .map_err(StageError::Plan)?;
         self.pending = true;
         Ok(&self.plan)
+    }
+
+    /// The physical slots of the sampled rows, in sample order. Under
+    /// [`mixed_step::SpanCover::SlotBand`] these are also the BAND ROW INDICES the device wrote
+    /// ids for, which is how an adapter compacts a band-wide readback into the delivery order.
+    pub fn sampled_slots(&self) -> Option<&[i32]> {
+        self.pending.then_some(self.plan.decode_slots.as_slice())
     }
 
     /// [`Self::finish_after_device_success`] delivering by LOGICAL REQUEST: one
@@ -113,7 +146,9 @@ impl MixedStepStaging {
         if !self.pending {
             return Err(StageError::NoPendingPlan);
         }
-        let expected = self.plan.decode_rows as usize;
+        // The SAMPLED rows: equal to `decode_rows` under the band-free covers, and the active
+        // band rows under `SlotBand`, where `decode_rows` is the band width.
+        let expected = self.plan.decode_slots.len();
         if device_tokens.len() != expected || self.owners.len() != expected {
             return Err(StageError::OutputRows {
                 expected,

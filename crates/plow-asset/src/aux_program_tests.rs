@@ -160,6 +160,7 @@ fn work_and_wait_thresholds_may_exceed_resident_grid() {
     let input = crate::program::Program {
         rows: 1,
         packed_prefill_only: false,
+        token_batch_body: false,
         n_counter: 1,
         insts: &[inst],
         stream: &stream,

@@ -12,6 +12,8 @@ pub struct Tensor<'a> {
 pub struct Program<'a> {
     pub rows: u32,
     pub packed_prefill_only: bool,
+    /// A token-batch body (`packet::devbuild::TOKEN_BATCH_PROG`): never an ordinary rung.
+    pub token_batch_body: bool,
     pub n_counter: u32,
     pub insts: &'a [DevInst64],
     pub stream: &'a [StreamEnt],
@@ -57,6 +59,7 @@ pub fn with_model<T>(model: &packet::devbuild::Model, f: impl FnOnce(&Packet<'_>
         .map(|((p, &rows), insts)| Program {
             rows,
             packed_prefill_only: false,
+            token_batch_body: false,
             n_counter: p.n_counter,
             insts,
             stream: &p.stream,

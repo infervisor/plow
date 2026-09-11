@@ -991,3 +991,186 @@ fn prefix_free_padding_is_parked_and_outside_every_span() {
     let covered: u32 = plan.prefill_spans.iter().map(|s| s.n_rows).sum();
     assert_eq!(covered, plan.real_rows);
 }
+
+// ================================================================================================
+// AMD TP lowering: SpanCover::SlotBand
+// ================================================================================================
+
+fn sb_plan(
+    decode: &[DecodeRequest],
+    prefill: &[PrefillRequest<'_>],
+    frontiers: &[u32],
+    rows: u32,
+    band: u32,
+    max_ctx: u32,
+) -> Result<Plan> {
+    let active = decode.len() + prefill.len();
+    let mut out = Plan::with_capacity(rows as usize, prefill.len(), active);
+    plan_into_cover(
+        decode,
+        prefill,
+        frontiers,
+        rows,
+        max_ctx,
+        7,
+        SpanCover::SlotBand { band },
+        &mut out,
+    )?;
+    Ok(out)
+}
+
+/// The band is indexed by slot: a decode request and a completing prompt each land on THEIR
+/// slot's row, every other band row is parked, and the spans start at the band's end.
+#[test]
+fn slot_band_places_decode_and_terminal_rows_at_their_slots() {
+    let decode = [
+        DecodeRequest { slot: 0, state_slot: 0, token: 11 },
+        DecodeRequest { slot: 5, state_slot: 5, token: 22 },
+    ];
+    let c: Vec<u32> = (0..50).collect();
+    let d: Vec<u32> = (0..80).collect();
+    let prefill = [
+        PrefillRequest { slot: 2, state_slot: 2, start: 70, tokens: &c, prompt_len: 120 },
+        PrefillRequest { slot: 3, state_slot: 3, start: 0, tokens: &d, prompt_len: 400 },
+    ];
+    let frontiers = [100, 0, 70, 0, 0, 900, 0, 0];
+    let plan = sb_plan(&decode, &prefill, &frontiers, 256, 8, 4096).unwrap();
+
+    assert_eq!(plan.cover, SpanCover::SlotBand { band: 8 });
+    assert_eq!(plan.decode_rows, 8, "the band width, not the sample count");
+    assert_eq!(plan.real_rows, 8 + 49 + 80);
+    // Row t is slot t.
+    assert_eq!(plan.rows[0], Row { token: 11, slot: 0, state_slot: 0, position: 100, kv_len: 101, phase: RowPhase::Decode });
+    assert_eq!(plan.rows[5], Row { token: 22, slot: 5, state_slot: 5, position: 900, kv_len: 901, phase: RowPhase::Decode });
+    // The completing prompt's LAST token sits on slot 2's band row; its body is a span.
+    assert_eq!(plan.rows[2], Row { token: 49, slot: 2, state_slot: 2, position: 119, kv_len: 120, phase: RowPhase::Decode });
+    for slot in [1, 3, 4, 6, 7] {
+        assert_eq!(plan.rows[slot].phase, RowPhase::Parked, "slot {slot}");
+        assert_eq!(plan.rows[slot].kv_len, 1);
+        assert_eq!(plan.parked[slot], 1);
+    }
+    for slot in [0, 2, 5] {
+        assert_eq!(plan.parked[slot], 0);
+    }
+    // Sampled rows in slot order.
+    assert_eq!(plan.decode_slots, vec![0, 2, 5]);
+    // Spans tile [band, real_rows) and never touch the band.
+    assert_eq!(plan.prefill_spans.len(), 2);
+    assert_eq!(plan.prefill_spans[0], PrefillSpan { row0: 8, n_rows: 49, slot: 2, flags: 0, kv_row0: 70, kv_len: 119, state_slot: 2, program: 7 });
+    assert_eq!(plan.prefill_spans[1], PrefillSpan { row0: 57, n_rows: 80, slot: 3, flags: PREFILL_SPAN_RESET_STATE, kv_row0: 0, kv_len: 80, state_slot: 3, program: 7 });
+    assert!(plan.parked[8..137].iter().all(|&v| v == 0));
+    assert!(plan.parked[137..].iter().all(|&v| v == 1));
+    assert_eq!(plan.parked.len(), 256);
+    // The terminal token's KV position is exactly where the body span ends.
+    assert_eq!(plan.rows[2].position, plan.prefill_spans[0].kv_len);
+    // Commits are per request and count the terminal token as consumed input.
+    assert_eq!(plan.commits.len(), 4);
+    assert!(plan.commits.contains(&Commit { slot: 0, expect: 100, after: 101 }));
+    assert!(plan.commits.contains(&Commit { slot: 5, expect: 900, after: 901 }));
+    assert!(plan.commits.contains(&Commit { slot: 2, expect: 70, after: 120 }));
+    assert!(plan.commits.contains(&Commit { slot: 3, expect: 0, after: 80 }));
+    // Padding extends the LAST span's slot, as under the other covers.
+    assert!(plan.mapped_ends.contains(&(3, 80 + (256 - 137))));
+}
+
+/// A one-token completing prompt is a band row and no span; a step with only an intermediate
+/// chunk samples nothing (S = 0) and is still legal; a slot past the band may prefill but not
+/// complete.
+#[test]
+fn slot_band_edge_shapes() {
+    let one = [7u32];
+    let frontiers = [0, 3, 0, 0];
+    let prefill = [PrefillRequest { slot: 1, state_slot: 1, start: 3, tokens: &one, prompt_len: 4 }];
+    let plan = sb_plan(&[], &prefill, &frontiers, 32, 4, 4096).unwrap();
+    assert!(plan.prefill_spans.is_empty());
+    assert_eq!(plan.rows[1], Row { token: 7, slot: 1, state_slot: 1, position: 3, kv_len: 4, phase: RowPhase::Decode });
+    assert_eq!(plan.decode_slots, vec![1]);
+    assert_eq!(plan.real_rows, 4);
+    // Band-only step: the padding is parked and maps nothing.
+    assert!(plan.parked[4..].iter().all(|&v| v == 1));
+    assert_eq!(plan.mapped_ends, vec![(1, 4)]);
+
+    let chunk: Vec<u32> = (0..10).collect();
+    let mid = [PrefillRequest { slot: 2, state_slot: 2, start: 0, tokens: &chunk, prompt_len: 100 }];
+    let plan = sb_plan(&[], &mid, &frontiers, 32, 4, 4096).unwrap();
+    assert!(plan.decode_slots.is_empty(), "S = 0");
+    assert_eq!(plan.prefill_spans[0].row0, 4);
+    assert!(plan.parked[..4].iter().all(|&v| v == 1));
+    assert!(plan.parked[4..14].iter().all(|&v| v == 0));
+
+    // Slot 3 is outside a band of 2: prefilling is fine, completing is refused by name.
+    let wide = [PrefillRequest { slot: 3, state_slot: 3, start: 0, tokens: &chunk, prompt_len: 100 }];
+    sb_plan(&[], &wide, &frontiers, 32, 2, 4096).unwrap();
+    let done = [PrefillRequest { slot: 3, state_slot: 3, start: 0, tokens: &chunk, prompt_len: 10 }];
+    let err = sb_plan(&[], &done, &frontiers, 32, 2, 4096).unwrap_err();
+    assert!(err.contains("outside the band"), "{err}");
+    let dec = [DecodeRequest { slot: 3, state_slot: 3, token: 1 }];
+    assert!(sb_plan(&dec, &[], &frontiers, 32, 2, 4096).is_err());
+    // A decode row and a span on the same slot are a duplicate, not a terminal/body pair.
+    let dup_dec = [DecodeRequest { slot: 2, state_slot: 2, token: 1 }];
+    assert!(sb_plan(&dup_dec, &mid, &frontiers, 32, 4, 4096).is_err());
+}
+
+/// The request contract under the slot band: owners come out in SLOT order and match the
+/// plan's sampled rows; the same requests under PrefixFree keep their request-order owners.
+#[test]
+fn slot_band_request_owners_follow_slot_order() {
+    use crate::token_batch::{Phase, Request, Selection};
+    let one = [5u32];
+    let c: Vec<u32> = (0..50).collect();
+    let requests = [
+        Request { id: 900, slot: 6, state_slot: 6, generation: 1, phase: Phase::Decode, tokens: &one, prompt_len: 4, selection: Selection::default() },
+        Request { id: 901, slot: 2, state_slot: 2, generation: 3, phase: Phase::Prefill, tokens: &c, prompt_len: 120, selection: Selection::default() },
+        Request { id: 902, slot: 0, state_slot: 0, generation: 1, phase: Phase::Decode, tokens: &one, prompt_len: 4, selection: Selection::default() },
+    ];
+    let frontiers = [10, 0, 70, 0, 0, 0, 40, 0];
+    let generations = [1, 0, 3, 0, 0, 0, 1, 0];
+    let mut plan = Plan::with_capacity(256, 3, 3);
+    let mut owners = Vec::new();
+    plan_requests_into_cover(&requests, &frontiers, &generations, 256, 4096, 7, SpanCover::SlotBand { band: 8 }, &mut plan, &mut owners)
+        .unwrap();
+    assert_eq!(plan.decode_slots, vec![0, 2, 6]);
+    assert_eq!(owners, vec![902, 901, 900]);
+
+    let mut plan = Plan::with_capacity(256, 6, 3);
+    plan.decode_slots = Vec::with_capacity(3);
+    let mut owners = Vec::new();
+    plan_requests_into(&requests, &frontiers, &generations, 256, 4096, 7, &mut plan, &mut owners).unwrap();
+    assert_eq!(owners, vec![900, 902, 901]);
+
+    let mut plan = Plan::with_capacity(256, 3, 3);
+    let err = plan_requests_into_cover(&requests, &frontiers, &generations, 256, 4096, 7, SpanCover::DecodeBand, &mut plan, &mut owners)
+        .unwrap_err();
+    assert!(err.contains("decode band"), "{err}");
+}
+
+/// The validator accepts what the planner produces and refuses the device hazards by name.
+#[test]
+fn slot_band_validator_matches_the_planner_and_names_violations() {
+    let decode = [DecodeRequest { slot: 0, state_slot: 0, token: 11 }];
+    let c: Vec<u32> = (0..50).collect();
+    let d: Vec<u32> = (0..80).collect();
+    let prefill = [
+        PrefillRequest { slot: 2, state_slot: 2, start: 70, tokens: &c, prompt_len: 120 },
+        PrefillRequest { slot: 3, state_slot: 3, start: 0, tokens: &d, prompt_len: 400 },
+    ];
+    let frontiers = [100, 0, 70, 0];
+    let plan = sb_plan(&decode, &prefill, &frontiers, 256, 4, 4096).unwrap();
+    validate_slot_band(&plan, 4, 4096).unwrap();
+    // Slot capacity narrower than the band, or a plan under another cover, is refused.
+    assert!(validate_slot_band(&plan, 3, 4096).is_err());
+    let other = tb_plan(&decode, &prefill, &frontiers, 256, 4096).unwrap();
+    assert!(validate_slot_band(&other, 4, 4096).unwrap_err().contains("not a slot-band"));
+    // A parked band row that carries a live phase, or a terminal row that is not adjacent to
+    // its body span, would let the device write KV where it must not.
+    let mut bad = sb_plan(&decode, &prefill, &frontiers, 256, 4, 4096).unwrap();
+    bad.parked[1] = 0;
+    assert!(validate_slot_band(&bad, 4, 4096).unwrap_err().contains("phase disagrees"));
+    let mut bad = sb_plan(&decode, &prefill, &frontiers, 256, 4, 4096).unwrap();
+    bad.rows[2].position += 1;
+    bad.rows[2].kv_len += 1;
+    assert!(validate_slot_band(&bad, 4, 4096).unwrap_err().contains("terminal/body"));
+    let mut bad = sb_plan(&decode, &prefill, &frontiers, 256, 4, 4096).unwrap();
+    bad.parked[255] = 0;
+    assert!(validate_slot_band(&bad, 4, 4096).unwrap_err().contains("padding"));
+}

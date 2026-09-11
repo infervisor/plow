@@ -93,6 +93,7 @@ mod tests {
         DevProg {
             t: 128,
             packed_prefill_only: false,
+            token_batch_body: false,
             n_counter: 1,
             insts: vec![inst],
             stream: stream.clone(),

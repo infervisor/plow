@@ -5177,6 +5177,7 @@ impl CounterBankState {
 struct AmdProg {
     t: u32,
     packed_prefill_only: bool,
+    token_batch_body: false,
     packed_dense: bool,
     packed_dense_error: Option<String>,
     packed_needs_mla: bool,
@@ -8895,6 +8896,7 @@ impl AmdEngine {
             progs.push(AmdProg {
                 t: p.t,
                 packed_prefill_only: p.packed_prefill_only,
+                token_batch_body: false,
                 packed_dense_error: check_packed_dense_program(&p.insts)
                     .err()
                     .map(|e| e.to_string()),

@@ -22,7 +22,7 @@ fn single_row_prefill_gemv_preserves_bf16_projection_layout() {
         b.adopt_tensors(decl.tensors());
         let all = b.all();
         emit_glm_mla_prefill(&mut b, &c, &n, 0, 81920, rows, MoeEnc::Fp8Blk,
-            n.x, &[], false, &mut 0, &all);
+            n.x, &[], false, &mut 0, &all, None);
         let p = b.finish();
         let projections: Vec<_> = p.insts.iter().filter(|d|
             d.t[0] == n.qlr && d.t[1] == n.xn && d.t[2] == n.lw[0].qad
@@ -70,7 +70,7 @@ fn small_prefill_splits_allocate_and_emit_matching_partial_layouts() {
         b.adopt_tensors(decl.tensors());
         let all = b.all();
         emit_glm_mla_prefill(&mut b, &c, &n, 0, 81920, rows, MoeEnc::Fp8Blk,
-            n.x, &[], false, &mut 0, &all);
+            n.x, &[], false, &mut 0, &all, None);
         let prog = b.finish();
         let ix = prog.insts.iter().position(|d| d.op == DevOp::FlashMlaPrefillFp8 as u16).unwrap();
         let flash = &prog.insts[ix];
@@ -119,6 +119,7 @@ fn dense_prefill_rungs_populate_keys_for_sparse_decode() {
                 false,
                 &mut 0,
                 &all,
+                None,
             );
             let p = b.finish();
             let writers: Vec<_> = p.insts.iter().filter(|d| d.t[0] == n.kidx[0]).collect();
@@ -615,6 +616,7 @@ fn glm_sparse_fp8_cache_writer_and_attention_operands() {
         false,
         &mut 0,
         &[],
+        None,
     );
     let p = b.finish();
     let flash = p
@@ -2320,4 +2322,65 @@ fn glm_native_prefill_fold_preserves_xcd_boundaries() {
         Some(&verify),
     );
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Token-batch body (`plans/unified-token-batch.md`, "AMD TP8 lowering decision"): the band rows
+/// take the batched decode attention chain BEHIND the prefill fold, on the prefill projections;
+/// the tail samples the whole band through a tiled GEMM; the band packets sit in their own
+/// segment class. The plain emit (`band = None`) is what every other test in this module pins.
+#[test]
+fn token_batch_body_band_rides_the_prefill_program() {
+    let _guard = crate::test_env::env_guard();
+    let _env = crate::test_env::EnvScope::set(&[("PLOW_GLM_FP8_KV", "1"), ("PLOW_UNISEG", "0")]);
+    let mut c = glm_ref_cfg();
+    c.tp = 8;
+    let (ctx, rows, band) = (81920u32, 128u32, 20u32);
+    let mut decl = Builder::new(304);
+    let n = declare_glm_rows_batched(&mut decl, &c, ctx, &[0], rows, band, MoeEnc::Fp8Blk);
+    let mut b = Builder::new(304);
+    b.adopt_tensors(decl.tensors());
+    b.set_packed_prefill_segments(true);
+    b.set_token_batch_band(band);
+    let all = b.all();
+    emit_glm_mla_prefill(&mut b, &c, &n, 0, ctx, rows, MoeEnc::Fp8Blk, n.x, &[], false, &mut 0, &all,
+        Some(band));
+    emit_glm_tail(&mut b, &c, &n, n.x, &[], rows, false, &mut 0, Some(band));
+    let p = b.finish();
+    let ops: Vec<u16> = p.insts.iter().map(|d| d.op).collect();
+    let pf = ops.iter().position(|&o| o == DevOp::FlashMlaPrefillFp8 as u16).unwrap();
+    let dec = ops.iter().position(|&o| o == DevOp::FlashMlaDecodeFp8 as u16).unwrap();
+    let folds: Vec<usize> = ops.iter().enumerate()
+        .filter(|(_, &o)| o == DevOp::MlaMergeFold as u16).map(|(i, _)| i).collect();
+    assert_eq!(folds.len(), 2, "one prefill fold over T, one band fold over the band");
+    assert!(pf < folds[0] && folds[0] < dec && dec < folds[1],
+        "order: prefill flash {pf}, prefill fold {}, band flash {dec}, band fold {}", folds[0], folds[1]);
+    assert_eq!(p.insts[folds[0]].i[0], rows);
+    assert_eq!(p.insts[folds[1]].i[0], band);
+    let fl = &p.insts[dec];
+    assert_eq!((fl.i[0], fl.i[1], fl.t[6], fl.t[4]), (band, c.heads / c.tp, n.kvlen, n.ckv[0]));
+    // The prefill flash still covers every row: band rows are ordinary rows of the T-row packets.
+    assert_eq!(p.insts[pf].i[4], rows);
+    if c.dsa(ctx) && n.lw[0].iwqb != TENSOR_NONE {
+        let sc = p.insts.iter().find(|d| d.op == DevOp::IndexScore as u16).unwrap();
+        assert_eq!((sc.i[0], sc.t[1], sc.t[3]), (band, n.qidx, n.widx));
+        assert!(p.insts.iter().any(|d| d.op == DevOp::IndexSelect as u16));
+        assert_eq!(fl.j[0], n.iidx + 1, "sparse gather over the band's own selection");
+        // The band's indexer query projection is a tiled GEMM over the band, not a Gemv.
+        let qi = p.insts.iter().find(|d| d.t[0] == n.qidx && d.t[1] == n.qlat).unwrap();
+        assert_ne!(qi.op, DevOp::Gemv as u16);
+        assert_eq!(qi.i[0], band);
+    }
+    // Tail: the head is a tiled GEMM over the band and every band row samples.
+    let am = p.insts.iter().find(|d| d.op == DevOp::Argmax as u16).unwrap();
+    assert_eq!(am.i[1], band);
+    let head = p.insts.iter().find(|d| d.t[0] == n.logits).unwrap();
+    assert_ne!(head.op, DevOp::Gemv as u16);
+    assert_eq!((head.i[0], head.i[1]), (band, glm_vocab_l(&c)));
+    let fin = p.insts.iter().find(|d| d.op == DevOp::XArgmaxFin as u16 || d.op == DevOp::ArgmaxFin as u16).unwrap();
+    assert_eq!(fin.i[1], band);
+    // Segment isolation: the band attention is not in the prefill flash's or fold's segment.
+    let seg_of = |ix: usize| p.stream.iter().find(|e| e.inst as usize == ix).unwrap().seg;
+    assert_ne!(seg_of(dec), seg_of(pf));
+    assert_ne!(seg_of(folds[1]), seg_of(folds[0]));
+    assert_eq!(seg_of(dec), seg_of(folds[1]), "the band flash and its fold share one segment");
 }

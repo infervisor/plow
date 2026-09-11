@@ -35,6 +35,9 @@ pub struct DevProg {
     pub t: u32,
     /// This topology is selected only for a genuinely packed prefill dispatch.
     pub packed_prefill_only: bool,
+    /// A token-batch BODY (`packet::devbuild::TOKEN_BATCH_PROG`): prefill width `t` with a
+    /// slot-indexed decode band; selected only by the token-batch route, never as a rung.
+    pub token_batch_body: bool,
     pub n_counter: u32,
     pub insts: Vec<DevInst64>,
     pub stream: Vec<StreamEnt>,
@@ -252,6 +255,7 @@ impl DevBlob {
             progs.push(DevProg {
                 t: packet::devbuild::program_rows(ph.t),
                 packed_prefill_only: packet::devbuild::is_packed_prefill_program(ph.t),
+                token_batch_body: packet::devbuild::is_token_batch_program(ph.t),
                 n_counter: ph.n_counter,
                 insts: take(buf, &mut off, ph.n_inst as usize, &what("insts"))?,
                 stream: take(buf, &mut off, ph.n_stream as usize, &what("stream"))?,
@@ -490,6 +494,7 @@ impl DevBlob {
             .map(|p| Program {
                 rows: p.t,
                 packed_prefill_only: p.packed_prefill_only,
+                token_batch_body: p.token_batch_body,
                 n_counter: p.n_counter,
                 insts: &p.insts,
                 stream: &p.stream,
@@ -893,6 +898,7 @@ mod tests {
         let program = DevProg {
             t: 128,
             packed_prefill_only: false,
+            token_batch_body: false,
             n_counter: 0,
             insts,
             stream,
@@ -943,6 +949,7 @@ mod tests {
         let program = DevProg {
             t: 128,
             packed_prefill_only: false,
+            token_batch_body: false,
             n_counter: 0,
             insts,
             stream,
@@ -979,6 +986,7 @@ mod tests {
         let prog = |t: u32, insts: Vec<DevInst64>| DevProg {
             t,
             packed_prefill_only: false,
+            token_batch_body: false,
             n_counter: 0,
             insts,
             stream: Vec::new(),

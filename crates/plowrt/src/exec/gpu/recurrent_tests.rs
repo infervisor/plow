@@ -130,6 +130,7 @@ fn fp8_role_rejects_mixed_missing_and_duplicate_work() {
     let mut g = DevProg {
         t: 1024,
         packed_prefill_only: false,
+        token_batch_body: false,
         n_counter: 2,
         insts: vec![norm, gemm],
         stream: stream.clone(),

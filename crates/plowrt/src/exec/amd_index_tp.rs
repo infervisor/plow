@@ -294,6 +294,7 @@ mod tests {
         let prog = DevProg {
             t: 8192,
             packed_prefill_only: false,
+            token_batch_body: false,
             n_counter: 0,
             insts: vec![DevInst64 {
                 op: DevOp::IndexTpPf as u16,

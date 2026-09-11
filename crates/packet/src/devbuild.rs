@@ -432,6 +432,9 @@ pub struct Builder {
     /// Split descriptor-consuming prefill families into independent wave classes.
     /// Callers must enable this only for prefill programs.
     packed_prefill_segments: bool,
+    /// Token-batch body: the slot band's width. The band's decode-attention packets get their
+    /// own segment class so the runtime can route them to an object that carries those arms.
+    token_batch_band: Option<u32>,
     /// Isolate structurally compatible MXFP4 grouped-MoE stage-2 boundaries.
     lean_moe_stage2_segments: bool,
     /// Isolate structurally compatible MXFP4 grouped-MoE stage-1 packets.
@@ -473,6 +476,23 @@ pub struct Builder {
 fn mla_prefill_segment_class(op: u16, n_tok: u32) -> Option<u8> {
     (op == DevOp::FlashMlaPrefill as u16 || op == DevOp::FlashMlaPrefillFp8 as u16)
         .then_some(if n_tok >= 2048 { 4 } else { 26 })
+}
+
+/// Segment class of a token-batch body's BAND attention packets: the batched-decode chain
+/// (`IndexScore`/`IndexSelect`, the MLA decode flash, its fold) run over the band rows inside a
+/// prefill-width program. They are isolated so the runtime can route the segment to the decode
+/// object, whose inventory carries those arms; the prefill fold (`i0 = T`) stays where it is.
+pub const TOKEN_BATCH_BAND_SEGMENT_CLASS: u8 = 27;
+
+fn token_batch_band_segment_class(inst: &DevInst, band: u32) -> Option<u8> {
+    let op = inst.op;
+    let band_op = op == DevOp::FlashMlaDecode as u16
+        || op == DevOp::FlashMlaDecodeFp8 as u16
+        || op == DevOp::FlashGatherDecode as u16
+        || op == DevOp::IndexScore as u16
+        || op == DevOp::IndexSelect as u16
+        || (op == DevOp::MlaMergeFold as u16 && inst.i[0] == band);
+    band_op.then_some(TOKEN_BATCH_BAND_SEGMENT_CLASS)
 }
 
 // Experimental packed-prefill segment classes. These values describe an operator
@@ -668,6 +688,7 @@ impl Builder {
             gq_order_asap: knobs.gq_order.as_deref() != Some("emit"),
             gq_order_seg: !matches!(knobs.gq_order.as_deref(), Some("emit") | Some("asap")),
             packed_prefill_segments: false,
+            token_batch_band: None,
             lean_moe_stage2_segments: false,
             lean_moe_stage1_segments: false,
             lean_moe_combine_segments: false,
@@ -783,6 +804,16 @@ impl Builder {
 
     pub fn set_packed_prefill_segments(&mut self, enabled: bool) {
         self.packed_prefill_segments = enabled;
+    }
+
+    /// Mark this program as a token-batch BODY with a slot band of `band` rows.
+    pub fn set_token_batch_band(&mut self, band: u32) {
+        assert!(band > 0, "token-batch band must have at least one row");
+        self.token_batch_band = Some(band);
+    }
+
+    pub fn token_batch_band(&self) -> Option<u32> {
+        self.token_batch_band
     }
 
     pub fn set_lean_moe_stage2_segments(&mut self, enabled: bool) {
@@ -2252,6 +2283,11 @@ impl Builder {
                 19
             } else if uniseg {
                 8
+            } else if let Some(class) = self
+                .token_batch_band
+                .and_then(|band| token_batch_band_segment_class(&self.ops[i].inst, band))
+            {
+                class
             } else if packed_prefill_segments && packed_prefill_segment_class(op).is_some() {
                 packed_prefill_segment_class(op).unwrap()
             } else if fa256_gqa2 && self.ops[i].inst.is_hd256_gqa2_sliding_prefill() {
@@ -3072,19 +3108,41 @@ pub const DECODE_RUNG_MAX: u32 = 128;
 /// wire layout while allowing an ordinary and segmented program for one rung.
 pub const PACKED_PREFILL_PROG: u32 = 1 << 31;
 
+/// [`BlobProgHeader::t`] bit marking a TOKEN-BATCH BODY: a prefill-width program that carries a
+/// slot-indexed decode band ahead of its prefill spans and samples that band
+/// (`plans/unified-token-batch.md`, "AMD TP8 lowering decision"). It is neither an ordinary
+/// prefill rung nor a decode rung, so every ladder scan skips it; only the token-batch route
+/// selects it, by rows.
+pub const TOKEN_BATCH_PROG: u32 = 1 << 30;
+
+const PROGRAM_ROLE_BITS: u32 = PACKED_PREFILL_PROG | TOKEN_BATCH_PROG;
+
 pub fn program_rows(t: u32) -> u32 {
-    t & !PACKED_PREFILL_PROG
+    t & !PROGRAM_ROLE_BITS
 }
 
 pub fn is_packed_prefill_program(t: u32) -> bool {
     t & PACKED_PREFILL_PROG != 0
 }
 
+pub fn is_token_batch_program(t: u32) -> bool {
+    t & TOKEN_BATCH_PROG != 0
+}
+
+pub fn token_batch_program_t(rows: u32) -> u32 {
+    assert_eq!(
+        rows & PROGRAM_ROLE_BITS,
+        0,
+        "program row count exceeds 30 bits"
+    );
+    rows | TOKEN_BATCH_PROG
+}
+
 pub fn packed_prefill_program_t(rows: u32) -> u32 {
     assert_eq!(
-        rows & PACKED_PREFILL_PROG,
+        rows & PROGRAM_ROLE_BITS,
         0,
-        "program row count exceeds 31 bits"
+        "program row count exceeds 30 bits"
     );
     rows | PACKED_PREFILL_PROG
 }
@@ -5797,6 +5855,24 @@ mod v6_tests {
         );
         assert_eq!(program_rows(packed_prefill_program_t(1024)), 1024);
         assert!(is_packed_prefill_program(packed_prefill_program_t(1024)));
+        // A token-batch body per prefill rung sits in the same place and is neither role.
+        assert_eq!(
+            decode_rung_lo(&[
+                128,
+                1024,
+                packed_prefill_program_t(128),
+                token_batch_program_t(128),
+                token_batch_program_t(1024),
+                1,
+                4,
+                8,
+            ]),
+            5
+        );
+        assert_eq!(program_rows(token_batch_program_t(1024)), 1024);
+        assert!(is_token_batch_program(token_batch_program_t(1024)));
+        assert!(!is_packed_prefill_program(token_batch_program_t(1024)));
+        assert!(!is_token_batch_program(packed_prefill_program_t(1024)));
     }
 
     #[test]

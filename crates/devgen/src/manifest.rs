@@ -163,8 +163,14 @@ fn program_arms(m: &Model) -> Vec<ProgramArms> {
     // prefill object absorb every lower decode rung.
     let dec_lo = packet::devbuild::decode_rung_lo(&m.prog_t);
     for (pi, p) in m.progs.iter().enumerate() {
-        let kind = if pi >= dec_lo { "decode" } else { "prefill" };
         let encoded_t = m.prog_t.get(pi).copied().unwrap_or(0);
+        let kind = if pi >= dec_lo {
+            "decode"
+        } else if packet::devbuild::is_token_batch_program(encoded_t) {
+            "token_batch"
+        } else {
+            "prefill"
+        };
         let t = packet::devbuild::program_rows(encoded_t);
         for (seg, arms) in segment_arms(p) {
             out.push(ProgramArms {
@@ -228,9 +234,16 @@ fn kernel_cases(m: &Model) -> Value {
             let encoded = m.prog_t.get(index).copied().unwrap_or(0);
             json!({
                 "program": index,
-                "kind": if index < decode { "prefill" } else { "decode" },
+                "kind": if index >= decode {
+                    "decode"
+                } else if packet::devbuild::is_token_batch_program(encoded) {
+                    "token_batch"
+                } else {
+                    "prefill"
+                },
                 "rows": packet::devbuild::program_rows(encoded),
                 "packed_only": packet::devbuild::is_packed_prefill_program(encoded),
+                "token_batch_body": packet::devbuild::is_token_batch_program(encoded),
                 "instruction_count": p.insts.len(), "cases": cases,
             })
         })
@@ -421,8 +434,10 @@ fn shapes(m: &Model) -> Shapes {
     let dec_lo = packet::devbuild::decode_rung_lo(&m.prog_t);
     for (pi, p) in m.progs.iter().enumerate() {
         let decode = pi >= dec_lo;
+        let encoded = m.prog_t.get(pi).copied().unwrap_or(0);
         if !decode
-            && !packet::devbuild::is_packed_prefill_program(m.prog_t.get(pi).copied().unwrap_or(0))
+            && !packet::devbuild::is_packed_prefill_program(encoded)
+            && !packet::devbuild::is_token_batch_program(encoded)
         {
             s.prefill_buckets.push(packet::devbuild::program_rows(
                 m.prog_t.get(pi).copied().unwrap_or(0),

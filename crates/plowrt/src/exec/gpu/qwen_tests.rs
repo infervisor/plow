@@ -55,6 +55,7 @@ fn fixture() -> (DevProg, Vec<DevTensor>) {
         DevProg {
             t: rows,
             packed_prefill_only: false,
+            token_batch_body: false,
             n_counter: 0,
             insts: vec![ordinary, native, ordinary],
             stream: stream.clone(),

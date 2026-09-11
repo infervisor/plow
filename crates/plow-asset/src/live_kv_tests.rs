@@ -212,6 +212,7 @@ fn validate_generated(
     let program = Program {
         rows: 2,
         packed_prefill_only: false,
+        token_batch_body: false,
         n_counter: 1,
         insts: &insts,
         stream: &[],

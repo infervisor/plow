@@ -587,6 +587,13 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_MOE_RESIDENT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_moe_resident: bool,
 
+    /// Emit one token-batch BODY program per prefill bucket wider than the decode band: the
+    /// bucket's packed-prefill topology plus the batched decode attention chain and tail over a
+    /// slot-indexed band of `decode_rungs().last()` rows (`plans/unified-token-batch.md`, "AMD
+    /// TP8 lowering decision"). Requires `PLOW_EMIT_PACKED_PREFILL=1`. Off until GPU-qualified.
+    #[arg(long, env = "PLOW_TOKEN_BATCH_TP", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub token_batch_tp: bool,
+
     /// Partition large GLM prefill index queries across eight gfx942 ranks.
     #[arg(long, env = "PLOW_GLM_INDEX_TP", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_index_tp: bool,
@@ -1097,6 +1104,7 @@ impl EmitConfig {
             glm_moe_aiter: env_bool("PLOW_GLM_MOE_AITER"),
             glm_moe_flat_decode: env_bool("PLOW_GLM_MOE_FLAT_DECODE"),
             glm_moe_resident: env_bool("PLOW_GLM_MOE_RESIDENT"),
+            token_batch_tp: env_bool("PLOW_TOKEN_BATCH_TP"),
             glm_index_tp: env_bool("PLOW_GLM_INDEX_TP"),
             glm_select_local: env_bool("PLOW_GLM_SELECT_LOCAL"),
             glm_decode_norm_rows: env_bool("PLOW_GLM_DECODE_NORM_ROWS"),

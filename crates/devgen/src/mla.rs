@@ -696,6 +696,7 @@ fn emit_glm53_program(
                     true,
                     &mut xgate,
                     &xr,
+                    None,
                 )
             } else {
                 emit_glm_mla(
@@ -797,7 +798,7 @@ fn emit_glm53_program(
             d.i[3] = 2;
         },
     );
-    emit_glm_tail(b, c, n, n.x, &[contract], rows, !prefill, &mut xgate);
+    emit_glm_tail(b, c, n, n.x, &[contract], rows, !prefill, &mut xgate, None);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4156,54 +4157,238 @@ fn emit_glm_dsa_decode_select(
                 d.i[2] = ctx;
                 d.f[0] = (di as f32).powf(-0.5) * (hi as f32).powf(-0.5);
             });
-            if emit_config::active().glm_select_local && rows > 1 {
-                assert!(
-                    c.tp == 8 && b.n_cu() == 304 && matches!(rows, 2 | 4 | 8 | 16 | 20),
-                    "local GLM decode selection requires gfx942 TP8 with 2/4/8/16/20 rows"
-                );
-                return b.emit(DevOp::IndexSelect, (0..rows).collect(), &[c_sc], |d| {
-                    d.t[0] = n.iidx;
-                    d.t[1] = n.iscore;
-                    d.t[4] = n.kvlen;
-                    d.i[0] = ctx;
-                    d.i[1] = itk;
-                    d.i[4] = 1;
-                });
-            }
-            // top-k SELECT -> n.iidx (ONE cooperative launch: grid-sync radix). Perf floor 2: emit on a
-            // 32-CU slice, NOT all 256. The selector is grid-barrier CONTENTION-bound, not bandwidth-bound
-            // (the score array is only ctx*4 B); cutting the co-resident WG count 256->32 drops the atomic
-            // contention on the grid-sync counter and the shared histogram bins (~204->144us @128k, STILL
-            // set-EXACT). The kernel reads nwg from in->blocks (=32) and partitions the score array by the
-            // entry's LOGICAL SLICE (0..31) — not by blockIdx.x, which under the global-queue decode
-            // scheduler is whichever workgroup claimed the entry (that confusion is the end-to-end DSA bug;
-            // see d_index_select_coop). All 32 are co-resident under the persistent interp (256 CUs
-            // resident, this op gates on INDEX_SCORE, so its 32 WGs run together).
-            let sel_wgs: Vec<u32> = (0..32.min(b.n_cu())).collect();
-            let mut selected = c_sc;
-            // Each row owns the shared radix histogram/control until its successor starts.
-            for row in 0..rows {
-                selected = b.emit(DevOp::IndexSelect, sel_wgs.clone(), &[selected], |d| {
-                    d.t[0] = n.iidx;
-                    d.t[1] = n.iscore;
-                    d.t[2] = n.ighist;
-                    d.t[3] = n.igctl;
-                    // The LIVE kv occupancy. `i[0]` below is only the packet's max ctx, and INDEX_SCORE
-                    // writes `iscore[pos]` for `pos < kvlen` ONLY — so without this operand the radix
-                    // ranked `ctx - kvlen` never-written words and selected rows past the end of the
-                    // latent cache, which the gather then read unmasked. DSA arms only above a 64k
-                    // crossover, so that gap was the overwhelming majority of every scan.
-                    d.t[4] = n.kvlen;
-                    d.i[0] = ctx;
-                    d.i[1] = itk;
-                    d.i[3] = row;
-                });
-            }
-            selected
+            emit_glm_dsa_select_rows(b, c, n, ctx, rows, itk, c_sc)
         }
     } else {
         0
     }
+}
+
+/// The DSA top-k SELECT over `rows` scored rows -> `n.iidx`, shared by the decode chain and the
+/// token-batch band. Byte-identical to the decode emit it was lifted from.
+fn emit_glm_dsa_select_rows(
+    b: &mut Builder,
+    c: &GlmCfg,
+    n: &GlmTn,
+    ctx: u32,
+    rows: u32,
+    itk: u32,
+    c_sc: u32,
+) -> u32 {
+    if emit_config::active().glm_select_local && rows > 1 {
+        assert!(
+            c.tp == 8 && b.n_cu() == 304 && matches!(rows, 2 | 4 | 8 | 16 | 20),
+            "local GLM decode selection requires gfx942 TP8 with 2/4/8/16/20 rows"
+        );
+        return b.emit(DevOp::IndexSelect, (0..rows).collect(), &[c_sc], |d| {
+            d.t[0] = n.iidx;
+            d.t[1] = n.iscore;
+            d.t[4] = n.kvlen;
+            d.i[0] = ctx;
+            d.i[1] = itk;
+            d.i[4] = 1;
+        });
+    }
+    // top-k SELECT -> n.iidx (ONE cooperative launch: grid-sync radix). Perf floor 2: emit on a
+    // 32-CU slice, NOT all 256. The selector is grid-barrier CONTENTION-bound, not bandwidth-bound
+    // (the score array is only ctx*4 B); cutting the co-resident WG count 256->32 drops the atomic
+    // contention on the grid-sync counter and the shared histogram bins (~204->144us @128k, STILL
+    // set-EXACT). The kernel reads nwg from in->blocks (=32) and partitions the score array by the
+    // entry's LOGICAL SLICE (0..31) — not by blockIdx.x, which under the global-queue decode
+    // scheduler is whichever workgroup claimed the entry (that confusion is the end-to-end DSA bug;
+    // see d_index_select_coop). All 32 are co-resident under the persistent interp (256 CUs
+    // resident, this op gates on INDEX_SCORE, so its 32 WGs run together).
+    let sel_wgs: Vec<u32> = (0..32.min(b.n_cu())).collect();
+    let mut selected = c_sc;
+    // Each row owns the shared radix histogram/control until its successor starts.
+    for row in 0..rows {
+        selected = b.emit(DevOp::IndexSelect, sel_wgs.clone(), &[selected], |d| {
+            d.t[0] = n.iidx;
+            d.t[1] = n.iscore;
+            d.t[2] = n.ighist;
+            d.t[3] = n.igctl;
+            // The LIVE kv occupancy. `i[0]` below is only the packet's max ctx, and INDEX_SCORE
+            // writes `iscore[pos]` for `pos < kvlen` ONLY — so without this operand the radix
+            // ranked `ctx - kvlen` never-written words and selected rows past the end of the
+            // latent cache, which the gather then read unmasked. DSA arms only above a 64k
+            // crossover, so that gap was the overwhelming majority of every scan.
+            d.t[4] = n.kvlen;
+            d.i[0] = ctx;
+            d.i[1] = itk;
+            d.i[3] = row;
+        });
+    }
+    selected
+}
+
+/// The token-batch band's attention: the batched DECODE chain over rows `[0, band)` of a
+/// prefill-width program, on the projections that program already computed for every row.
+///
+/// What is reused and what is not, deliberately:
+/// * `q_a`/`q_nope`/`q_rope` and the KV cache writes are the T-row prefill packets — band rows
+///   are ordinary rows of them (the packed cache-write arms resolve a band row by slot).
+/// * The indexer's key cache is written by the prefill chain's key writer (`c_kidx`), so only
+///   the QUERY side is projected here, over the band rows alone, as a tiled GEMM: the body runs
+///   on prefill objects whose `Gemv` bucket is one row.
+/// * Score, select, flash and fold are the decode packets at `rows = band`, unchanged — that
+///   is what "row t is slot t" buys, and why the band cannot be compacted.
+/// * The band's flash writes `opart`/`mlpart` in the decode layout over the same allocation the
+///   prefill flash used, so it waits for the prefill fold (`c_uv_prefill`); its own fold then
+///   rewrites O rows `[0, band)`, which the prefill fold had filled with garbage.
+#[allow(clippy::too_many_arguments)]
+fn emit_glm_band_attention(
+    b: &mut Builder,
+    c: &GlmCfg,
+    n: &GlmTn,
+    w: &GlmLW,
+    slot: usize,
+    ctx: u32,
+    band: u32,
+    all: &[u32],
+    eps: f32,
+    ql: u32,
+    h: u32,
+    c_rn1: u32,
+    c_rnq: u32,
+    c_kidx: Option<u32>,
+    q_deps: &[u32],
+    c_uv_prefill: u32,
+) -> u32 {
+    let (nh, dk, dr, vd) = (c.heads, c.kv_lora, c.qk_rope, c.v_head);
+    let nh_l = nh / c.tp;
+    let n_cu = b.n_cu();
+    let dsa = c.dsa(ctx);
+    let fp8kv = glm_fp8_kv();
+    let full = dsa && w.iwqb != TENSOR_NONE;
+    let itk = c.index_topk.min(ctx);
+    let (hi, di) = (c.index_heads, c.index_dim);
+    assert!(
+        !(dsa && c.index_kpool > 1),
+        "token-batch band: the pooled DSA indexer (index_kpool={}) has no batched decode path",
+        c.index_kpool
+    );
+    if dsa && fp8kv {
+        assert!(
+            nh_l == 8
+                && dk == 512
+                && dr == 64
+                && band <= 20
+                && glm_gf(ctx, nh_l) == 4
+                && glm_dsa_select_width(c, ctx) == 2048,
+            "sparse FP8 decode requires qualified QH8 latent512/rope64 GF4 geometry"
+        );
+    }
+    let small = |b: &mut Builder, out: u32, x: u32, wt: u32, nn: u32, k: u32, deps: &[u32]| {
+        let op = pick_tile(band, nn, k, n_cu, kernelcaps::QuantScheme::None);
+        b.emit(op, all.to_vec(), deps, |d| {
+            d.t[0] = out;
+            d.t[1] = x;
+            d.t[2] = wt;
+            d.i[0] = band;
+            d.i[1] = nn;
+            d.i[2] = k;
+        })
+    };
+    let mut fl_deps: Vec<u32> = q_deps.to_vec();
+    if full {
+        let c_kidx = c_kidx.expect("a full indexer layer's prefill chain writes its key cache");
+        // q_idx for the band rows: rows [0, band) of the T-row q-latent norm, roped per row.
+        let c_q0 = small(b, n.qidx, n.qlat, w.iwqb, hi * di, ql, &[c_rnq]);
+        let c_qi = b.emit(DevOp::HeadNormRope, rope_cus(all, 0, band, hi), &[c_q0], |d| {
+            d.t[0] = n.qidx;
+            d.t[1] = n.qidx;
+            d.t[2] = TENSOR_NONE;
+            d.t[3] = n.icos;
+            d.t[4] = n.isin;
+            d.t[5] = n.pos;
+            d.i[0] = band;
+            d.i[1] = hi;
+            d.i[2] = di;
+            d.i[3] = 0;
+            d.i[4] = 1;
+            d.i[5] = 1;
+            d.f[0] = eps;
+            d.j[0] = 0;
+            d.j[1] = KV_MASK_NONE;
+        });
+        let c_w = small(b, n.widx, n.xn, w.iwp, hi, h, &[c_rn1]);
+        let c_sc = b.emit(DevOp::IndexScore, all.to_vec(), &[c_qi, c_kidx, c_w], |d| {
+            d.t[0] = n.iscore;
+            d.t[1] = n.qidx;
+            d.t[2] = n.kidx[slot];
+            d.t[3] = n.widx;
+            d.t[4] = n.kvlen;
+            d.i[0] = band;
+            d.i[1] = hi;
+            d.i[2] = ctx;
+            d.i[3] = di;
+            d.f[0] = (di as f32).powf(-0.5) * (hi as f32).powf(-0.5);
+        });
+        fl_deps.push(emit_glm_dsa_select_rows(b, c, n, ctx, band, itk, c_sc));
+    }
+    // The prefill fold must have consumed the T-row partials before the band's flash rewrites
+    // the same allocation in the decode layout.
+    fl_deps.push(c_uv_prefill);
+    fl_deps.dedup();
+    let ns_attn = if dsa {
+        glm_nsplit(itk, nh_l)
+    } else {
+        glm_nsplit(ctx, nh_l)
+    };
+    let gf = glm_gf(ctx, nh_l);
+    let c_fl = b.emit(
+        match (dsa, fp8kv) {
+            (_, true) => DevOp::FlashMlaDecodeFp8,
+            (true, false) => DevOp::FlashGatherDecode,
+            (false, false) => DevOp::FlashMlaDecode,
+        },
+        flash_mla_cus(all, band, 1, nh_l, gf, ns_attn),
+        &fl_deps,
+        |d| {
+            d.t[0] = n.opart;
+            d.t[1] = n.mlpart;
+            d.t[2] = n.qa;
+            d.t[3] = if dr > 0 { n.qr } else { n.qa };
+            d.t[4] = n.ckv[slot];
+            d.t[5] = if dr > 0 { n.krot[slot] } else { n.ckv[slot] };
+            d.t[6] = n.kvlen;
+            d.i[0] = band;
+            d.i[1] = nh_l;
+            d.i[2] = ctx;
+            d.i[3] = if dr == 0 { 1u32 << 31 } else { 0 };
+            d.i[4] = ns_attn;
+            d.i[5] = KV_MASK_NONE;
+            d.i[7] = gf;
+            d.f[0] = c.attn_scale;
+            if fp8kv {
+                d.t[7] = n.kv_scale[slot];
+                d.i[6] = 0;
+            }
+            if dsa {
+                if fp8kv {
+                    d.j[0] = n.iidx + 1;
+                } else {
+                    d.t[7] = n.iidx;
+                }
+                d.i[6] = glm_dsa_select_width(c, ctx);
+            }
+        },
+    );
+    b.emit(
+        DevOp::MlaMergeFold,
+        mla_fold_cus(all, band * nh_l, vd),
+        &[c_fl],
+        |d| {
+            d.t[0] = n.oat;
+            d.t[1] = n.opart;
+            d.t[2] = n.mlpart;
+            d.t[3] = w.wuv;
+            d.i[0] = band;
+            d.i[1] = nh_l;
+            d.i[2] = vd;
+            d.i[4] = ns_attn;
+        },
+    )
 }
 
 /// MLA head-fusion factor for a PREFILL packet. The decode `glm_gf` returns 8 above its crossover
@@ -4893,8 +5078,17 @@ pub(crate) fn emit_glm_mla_prefill(
     raw_output: bool,
     xgate: &mut u32,
     xr_cus: &[u32],
+    band: Option<u32>,
 ) -> u32 {
     assert!(t > 0, "prefill bucket must carry at least one row");
+    // TOKEN-BATCH BODY: rows `[0, band)` are a slot-indexed decode band. Every T-row packet
+    // below covers them too (projections, norms, cache writes — the packed cache-write arms
+    // resolve band rows by slot); the attention over them is the batched DECODE chain emitted
+    // by `emit_glm_band_attention` behind the prefill fold.
+    assert!(
+        band.is_none_or(|bw| bw > 0 && bw < t),
+        "token-batch band must be narrower than the bucket (band={band:?}, t={t})"
+    );
     let all = b.all();
     let n_cu = b.n_cu();
     let (h, nh, dk, dr, vd, ql) = (c.hidden, c.heads, c.kv_lora, c.qk_rope, c.v_head, c.q_lora);
@@ -5139,6 +5333,14 @@ pub(crate) fn emit_glm_mla_prefill(
         "PLOW_GLM_OFOLD=1 cannot combine with PLOW_GLM_DSA_PF or PLOW_GLM_FP8_KV: the ofold \
          epilogue is the dense V2 arm's i[6], and the fused GEMM reads bf16 partials. Unset one."
     );
+    // The band's decode fold rewrites O rows [0, band) behind the prefill fold; under ofold
+    // there is no prefill fold to order behind, and the sparse prefill selection is class C
+    // (`IndexUnionPf`/`IndexTpPf` derive positions from one scalar) — `glm_emit_full` skips
+    // those buckets, this is the backstop.
+    assert!(
+        band.is_none() || (!ofold && !sparse),
+        "token-batch body cannot carry the ofold epilogue or sparse prefill selection (t={t})"
+    );
     let mut fl_deps = vec![c_qa, c_qr, c_rnkv, c_krd];
     if let Some(d) = c_sel_pf {
         fl_deps.push(d);
@@ -5261,6 +5463,30 @@ pub(crate) fn emit_glm_mla_prefill(
             b.isolate(counter);
         }
         counter
+    };
+    // TOKEN-BATCH BODY: the band rows take the batched decode attention chain over the same
+    // projections. Its fold writes O rows [0, band) AFTER the prefill fold has written all T
+    // rows (the two chains share `opart`/`mlpart`), so o_proj below depends on the band fold.
+    let c_uv = match band {
+        Some(bw) => emit_glm_band_attention(
+            b,
+            c,
+            n,
+            w,
+            slot,
+            ctx,
+            bw,
+            &all,
+            eps,
+            ql,
+            h,
+            c_rn1,
+            c_rnq,
+            c_sel_pf,
+            &[c_qa, c_qr, c_rnkv, c_krd],
+            c_uv,
+        ),
+        None => c_uv,
     };
     // 12 o_proj, row-parallel over this rank's head shard. Under TP the [T,hidden] partial goes
     //    through the TWO-SHOT all-reduce (reduce-scatter + all-gather), not decode's one-shot: the
@@ -5434,8 +5660,10 @@ fn emit_glm_block_prefill(
     pre: &[u32],
     xgate: &mut u32,
     xr_cus: &[u32],
+    band: Option<u32>,
 ) -> u32 {
-    let c_rn2 = emit_glm_mla_prefill(b, c, n, slot, ctx, t, enc, x_in, pre, false, xgate, xr_cus);
+    let c_rn2 =
+        emit_glm_mla_prefill(b, c, n, slot, ctx, t, enc, x_in, pre, false, xgate, xr_cus, band);
     emit_glm_moe_ffn_prefill(b, c, n, slot, t, enc, x_out, c_rn2, xgate, xr_cus, false)
 }
 
@@ -5938,8 +6166,10 @@ fn emit_glm_dense_block_prefill(
     pre: &[u32],
     xgate: &mut u32,
     xr_cus: &[u32],
+    band: Option<u32>,
 ) -> u32 {
-    let c_rn2 = emit_glm_mla_prefill(b, c, n, slot, ctx, t, enc, x_in, pre, false, xgate, xr_cus);
+    let c_rn2 =
+        emit_glm_mla_prefill(b, c, n, slot, ctx, t, enc, x_in, pre, false, xgate, xr_cus, band);
     let all = b.all();
     let one = vec![0u32];
     let n_cu = b.n_cu();
@@ -7587,20 +7817,53 @@ fn glm_emit_full(
     // This mirrors what `mla/kimi_k3.rs` already does for K3; GLM simply never had it, which is
     // why `PLOW_PACKED_PREFILL_ROUTE=1` on a GLM blob loaded three family objects and then
     // refused every rung with "MLA consumer is in a mixed segment".
-    let pf_plan: Vec<(u32, bool)> = pf
+    // TOKEN-BATCH BODIES (`PLOW_TOKEN_BATCH_TP=1`, third pass): the packed sibling of each
+    // bucket wider than the decode band, plus the batched decode attention chain and a
+    // band-sampling tail over rows `[0, dbatch)` — `plans/unified-token-batch.md`, "AMD TP8
+    // lowering decision". Sparse-prefill buckets are skipped: `IndexUnionPf`/`IndexTpPf` derive
+    // every row's position from one scalar (class C) and have no per-span form yet. Flag unset
+    // ⇒ byte-identical blob.
+    let token_batch_tp = emit_config::active().token_batch_tp;
+    if token_batch_tp {
+        assert!(
+            crate::emit_is_amd() && emit_config::active().packed_prefill_on() && dbatch > 1,
+            "PLOW_TOKEN_BATCH_TP=1 needs an AMD emit with PLOW_EMIT_PACKED_PREFILL=1 (the body \
+             is the packed-segment topology) and a decode ladder wider than one row"
+        );
+    }
+    #[derive(Clone, Copy, PartialEq)]
+    enum PfKind {
+        Plain,
+        Packed,
+        TokenBatch,
+    }
+    let pf_plan: Vec<(u32, PfKind)> = pf
         .iter()
-        .map(|&t| (t, false))
+        .map(|&t| (t, PfKind::Plain))
         .chain(
             (crate::emit_is_amd() && emit_config::active().packed_prefill_on())
                 .then_some(&pf)
                 .into_iter()
                 .flatten()
-                .map(|&t| (t, true)),
+                .map(|&t| (t, PfKind::Packed)),
+        )
+        .chain(
+            token_batch_tp
+                .then_some(&pf)
+                .into_iter()
+                .flatten()
+                .filter(|&&t| t > dbatch && !glm_dsa_pf_bucket(&c, t))
+                .map(|&t| (t, PfKind::TokenBatch)),
         )
         .collect();
-    for &(t, packed_segments) in &pf_plan {
+    for &(t, kind) in &pf_plan {
+        let packed_segments = kind != PfKind::Plain;
+        let band = (kind == PfKind::TokenBatch).then_some(dbatch);
         let mut pb = Builder::new(n_cu);
         pb.set_packed_prefill_segments(packed_segments);
+        if let Some(bw) = band {
+            pb.set_token_batch_band(bw);
+        }
         pb.set_lean_moe_stage2_segments(
             crate::emit_is_amd() && emit_config::active().moe_stage2_lean,
         );
@@ -7660,6 +7923,7 @@ fn glm_emit_full(
                     &dep,
                     &mut pxgate,
                     &pxr,
+                    band,
                 )
             } else {
                 emit_glm_block_prefill(
@@ -7675,17 +7939,18 @@ fn glm_emit_full(
                     &dep,
                     &mut pxgate,
                     &pxr,
+                    band,
                 )
             };
             dep = vec![d];
             cur = nxt;
         }
-        emit_glm_tail(&mut pb, &c, &tn, cur, &dep, t, false, &mut pxgate);
+        emit_glm_tail(&mut pb, &c, &tn, cur, &dep, t, false, &mut pxgate, band);
         progs.push(pb.finish());
-        prog_t.push(if packed_segments {
-            packet::devbuild::packed_prefill_program_t(t)
-        } else {
-            t
+        prog_t.push(match kind {
+            PfKind::Plain => t,
+            PfKind::Packed => packet::devbuild::packed_prefill_program_t(t),
+            PfKind::TokenBatch => packet::devbuild::token_batch_program_t(t),
         });
     }
 
@@ -7772,7 +8037,7 @@ fn glm_emit_full(
             cur = nxt;
         }
         // final RMSNorm (model.norm) -> xn, then lm_head GEMV -> logits, greedy argmax -> in.ids.
-        emit_glm_tail(&mut b, &c, &tn, cur, &[dep], rb, true, &mut xgate);
+        emit_glm_tail(&mut b, &c, &tn, cur, &[dep], rb, true, &mut xgate, None);
         let prog = b.finish();
         n_ops = prog.insts.len();
         progs.push(prog);
@@ -7880,37 +8145,61 @@ fn emit_glm_tail(
     rows: u32,
     dec_batch: bool,
     xgate: &mut u32,
+    band: Option<u32>,
 ) {
     let all = b.all();
+    // TOKEN-BATCH BODY (`band = Some(B)`): the sampled rows are the slot band `[0, B)` of a
+    // `rows`-wide prefill program. The norm and the head run over the band only, and the head
+    // is a TILED GEMM rather than `Gemv`: this program runs on PREFILL objects, whose GEMV row
+    // bucket is compiled at one row (`PLOW_GEMV_MM=1`), so a `Gemv` at `i0 = B` would be
+    // refused at load by `check_gemv_capacity`. Every row of the band samples (`nb = B`),
+    // parked rows included — the host reads only the rows it planned.
+    let norm_rows = band.unwrap_or(rows);
     // `vocab_l` is the full vocab when replicated and vocab/tp under GLM_SHARD_HEAD. The GEMV, the
     // argmax and the tensor declarations all read this same helper, so the arms cannot drift.
     let vocab_l = glm_vocab_l(c);
     // At prefill (`rows` = the bucket's T) this norms every row of the chunk even though the head
     // GEMV reads only the last — d_rmsnorm has no input row offset — so at least spread the rows
     // across the machine; decode (rows=1) keeps the single workgroup.
-    let c_f = b.emit(DevOp::RmsNorm, pf_wide_cus(b.n_cu(), rows), dep, |d| {
+    let c_f = b.emit(DevOp::RmsNorm, pf_wide_cus(b.n_cu(), norm_rows), dep, |d| {
         d.t[0] = n.xn;
         d.t[1] = x_final;
         d.t[2] = n.fin;
-        d.i[0] = rows;
+        d.i[0] = norm_rows;
         d.i[1] = c.hidden;
         d.f[0] = c.eps;
     });
     // Batched decode: per-sequence logits. The Gemma reference for the argmax batching is
     // `lib.rs`' `nb_argmax` (`if decode && t > 1 { t } else { 0 }`) — 0 at one row keeps the
     // packet byte-identical to the pre-batch emit.
-    let nb = if dec_batch && rows > 1 { rows } else { 0 };
-    let c_lm = b.emit(DevOp::Gemv, all, &[c_f], |d| {
-        d.t[0] = n.logits;
-        d.t[1] = n.xn;
-        d.t[2] = n.head;
-        d.i[0] = if nb > 0 { rows } else { 1 };
-        d.i[1] = vocab_l;
-        d.i[2] = c.hidden;
-        // a_row0: the last real row (host re-patches per chunk); 0 on the batched decode tail —
-        // every row samples.
-        d.i[4] = if nb > 0 { 0 } else { rows - 1 };
-    });
+    let nb = match band {
+        Some(bw) => bw,
+        None if dec_batch && rows > 1 => rows,
+        None => 0,
+    };
+    let c_lm = if let Some(bw) = band {
+        let op = pick_tile(bw, vocab_l, c.hidden, b.n_cu(), kernelcaps::QuantScheme::None);
+        b.emit(op, all, &[c_f], |d| {
+            d.t[0] = n.logits;
+            d.t[1] = n.xn;
+            d.t[2] = n.head;
+            d.i[0] = bw;
+            d.i[1] = vocab_l;
+            d.i[2] = c.hidden;
+        })
+    } else {
+        b.emit(DevOp::Gemv, all, &[c_f], |d| {
+            d.t[0] = n.logits;
+            d.t[1] = n.xn;
+            d.t[2] = n.head;
+            d.i[0] = if nb > 0 { rows } else { 1 };
+            d.i[1] = vocab_l;
+            d.i[2] = c.hidden;
+            // a_row0: the last real row (host re-patches per chunk); 0 on the batched decode
+            // tail — every row samples.
+            d.i[4] = if nb > 0 { 0 } else { rows - 1 };
+        })
+    };
     let c_am = b.emit(DevOp::Argmax, (0..AMAX_BLOCKS).collect(), &[c_lm], |d| {
         d.t[0] = n.amax;
         d.t[1] = n.logits;
@@ -8239,6 +8528,7 @@ pub(crate) fn glm_build_block_pf(
                     false,
                     &mut pxgate,
                     &pall,
+                    None,
                 );
             }
             PrefillScope::Full => {
@@ -8262,6 +8552,7 @@ pub(crate) fn glm_build_block_pf(
                             &dep,
                             &mut pxgate,
                             &pall,
+                            None,
                         )
                     } else {
                         emit_glm_block_prefill(
@@ -8277,6 +8568,7 @@ pub(crate) fn glm_build_block_pf(
                             &dep,
                             &mut pxgate,
                             &pall,
+                            None,
                         )
                     };
                     dep = vec![d];
