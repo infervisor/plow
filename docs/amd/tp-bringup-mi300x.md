@@ -2570,14 +2570,18 @@ request set (1,414,538 in / 13,795 out), one exclusive-lease run per arm:
 |---|---|---:|---:|---|---|---|
 | control (old defaults) | `pf_interleave=2048 pf_batch=0 route=0` | **16.81** | 820.8 s | 352.9 / 361.3 / 737.6 s | 646.8 / 614.1 ms | 109 / 1832 ms |
 | new defaults | `pf_interleave=widest pf_batch=1 route=auto` | **49.68 (+196 %)** | 277.7 s | **100.3 / 102.6 / 198.7 s** | **234.9 / 232.7 ms** | 101 / 1348 ms |
+| new defaults, re-emitted packet WITH siblings | route armed on 128/512/2048 | 49.83 | 276.8 s | 101.2 / 102.7 / 197.3 s | 233.6 / 233.6 ms | 103 / 1357 ms |
 
 The gain is the tick cap: the steady-state prefill launch went from a 2048-row dense chunk to an
 8192-row sparse chunk — 4× fewer launches and ~30× fewer attention FLOPs per row at 60–70k keys —
 and the decode step between prefill launches got closer, not further apart, because one sparse 8192
 launch is shorter than four dense 2048 ones. Co-packing fired in neither arm, as argued above. The
-re-emitted packet with siblings is emitted and unit-pinned but its device qualification (identity,
-18-case retrieval, bench) is pending: its first load refused at the native AITER MoE route, fixed
-since; the frozen packet is unaffected and `--emit-packed-prefill=false` is the rollback.
+re-emitted packet with siblings loads with every rung armed (its first load refused at the native
+AITER MoE route, whose own `packed_prefill_only` refusal is lifted), passes the 18-case retrieval
+screen 18/18 at C20 and matches the frozen packet's throughput; the C1-vs-C8 identity screen diverges
+on greedy near-ties exactly as the token-batch baseline does (decode rung 1 vs 8). Its sibling programs
+have not EXECUTED here — no pack forms at default planning — so `--emit-packed-prefill=false` remains
+the rollback for that half.
 
 Rollbacks: `PLOW_PF_INTERLEAVE=2048`, `PLOW_PF_BATCH=0`, `PLOW_PACKED_PREFILL_ROUTE=0`,
 `--emit-packed-prefill=false`. Flag rows in `docs/flags-reference.md`.
