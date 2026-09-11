@@ -158,6 +158,7 @@ fn embedded_mixed_object_is_skipped_for_ordinary_prefill() {
         ],
         gen: Vec::new(),
         tp: None,
+        parent: None,
     };
     let mut rejected = Vec::new();
     let selected =

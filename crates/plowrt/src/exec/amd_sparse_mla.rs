@@ -278,6 +278,7 @@ mod tests {
             t: 8192,
             packed_prefill_only: false,
             token_batch_body: false,
+            decode_rung: false,
             n_counter: 0,
             insts: vec![union, flash],
             stream: vec![StreamEnt {
@@ -1234,6 +1235,7 @@ mod decode_tests {
             t: rows,
             packed_prefill_only: false,
             token_batch_body: false,
+            decode_rung: false,
             n_counter: 0,
             insts: vec![
                 DevInst64 {

@@ -38,6 +38,10 @@ pub struct DevProg {
     /// A token-batch BODY (`packet::devbuild::TOKEN_BATCH_PROG`): prefill width `t` with a
     /// slot-indexed decode band; selected only by the token-batch route, never as a rung.
     pub token_batch_body: bool,
+    /// An EXPLICIT decode rung (`packet::devbuild::DECODE_RUNG_PROG`). Always `false` in a
+    /// parent packet, where the ladder is positional; an extension states it, because a lone
+    /// program has no position to read the role out of.
+    pub decode_rung: bool,
     pub n_counter: u32,
     pub insts: Vec<DevInst64>,
     pub stream: Vec<StreamEnt>,
@@ -125,6 +129,19 @@ pub struct DevBlob {
     /// TP sharding recovered from the decode program's collectives, or `None`
     /// for a single-GPU blob. See [`DevTp`].
     pub tp: Option<DevTp>,
+    /// The parent this container references INSTEAD of declaring a tensor table — `Some` iff
+    /// this is an `extension.pkt` (docs/arch/19, phase 2). A parent packet is always `None`,
+    /// and the two are told apart by container magic before anything else is read.
+    pub parent: Option<plow_asset::extension::ParentRef>,
+}
+
+/// Which container [`DevBlob::parse_inner`] was asked for. The two are distinct files with
+/// distinct magics, and reading one as the other is the silent failure the extension magic
+/// exists to prevent — so the caller says which it wants and gets a named refusal otherwise.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Container {
+    Model,
+    Extension,
 }
 
 /// Copy `n` `T` records out of `buf` at `*off` (unaligned-safe — the blob's
@@ -200,20 +217,49 @@ impl DevBlob {
     /// Backends that cannot check keep the old behaviour through [`DevBlob::parse`], which is
     /// this with `false` -- placement is then refused unless runtime configuration opts in.
     pub fn parse_l2(buf: &[u8], l2_dispatch_ok: bool) -> Result<DevBlob> {
-        Self::parse_inner(buf, l2_dispatch_ok)
+        Self::parse_inner(buf, l2_dispatch_ok, Container::Model)
     }
 
     pub fn parse(buf: &[u8]) -> Result<DevBlob> {
-        Self::parse_inner(buf, false)
+        Self::parse_inner(buf, false, Container::Model)
     }
 
-    fn parse_inner(buf: &[u8], l2_dispatch_ok: bool) -> Result<DevBlob> {
+    /// Parse an `extension.pkt` (docs/arch/19, phase 2): the same container with the tensor
+    /// table replaced by a reference to the parent's.
+    ///
+    /// This only decodes the container. Whether the extension may be MERGED is the six-rule
+    /// contract in `plow_asset::extension`, applied by [`crate::asset::extension`].
+    pub fn parse_extension(buf: &[u8], l2_dispatch_ok: bool) -> Result<DevBlob> {
+        Self::parse_inner(buf, l2_dispatch_ok, Container::Extension)
+    }
+
+    fn parse_inner(buf: &[u8], l2_dispatch_ok: bool, want: Container) -> Result<DevBlob> {
         let mut off = 0usize;
         let hdr: BlobHeader = take::<BlobHeader>(buf, &mut off, 1, "header")?[0];
-        if !is_blob_magic(&hdr.magic) {
-            return Err(RuntimeError::Device(
-                "devblob: bad magic — recompile with plowc (format changed)".into(),
-            ));
+        let is_ext = packet::ext::is_ext_magic(&hdr.magic);
+        match (want, is_ext, is_blob_magic(&hdr.magic)) {
+            (Container::Model, false, true) | (Container::Extension, true, _) => {}
+            (Container::Model, true, _) => {
+                return Err(RuntimeError::Device(
+                    "devblob: this is an extension.pkt, not a model packet — an extension \
+                     carries programs and a reference to its parent's tensor table, and binding \
+                     it as a model would leave every tensor handle unresolved. Load the parent \
+                     and merge this as an extension."
+                        .into(),
+                ))
+            }
+            (Container::Extension, false, true) => {
+                return Err(RuntimeError::Device(
+                    "devblob: this is a model.pkt, not an extension — it declares its own \
+                     tensor table and cannot be merged onto a parent."
+                        .into(),
+                ))
+            }
+            _ => {
+                return Err(RuntimeError::Device(
+                    "devblob: bad magic — recompile with plowc (format changed)".into(),
+                ))
+            }
         }
         let is_v7 = &hdr.magic == BLOB_MAGIC_V7 || &hdr.magic == BLOB_MAGIC_V7_L2SEG;
 
@@ -256,6 +302,7 @@ impl DevBlob {
                 t: packet::devbuild::program_rows(ph.t),
                 packed_prefill_only: packet::devbuild::is_packed_prefill_program(ph.t),
                 token_batch_body: packet::devbuild::is_token_batch_program(ph.t),
+                decode_rung: packet::devbuild::is_decode_rung_program(ph.t),
                 n_counter: ph.n_counter,
                 insts: take(buf, &mut off, ph.n_inst as usize, &what("insts"))?,
                 stream: take(buf, &mut off, ph.n_stream as usize, &what("stream"))?,
@@ -396,6 +443,53 @@ impl DevBlob {
             Vec::new()
         };
 
+        // An extension references its parent's tensor table instead of declaring one. Both
+        // halves are checked here rather than at merge time: a container that declares tensors
+        // OR has no parent reference is not an extension at all, whatever its magic says, and
+        // the merge contract would have nothing to check it against.
+        let parent = if is_ext {
+            if hdr.n_tensor != 0 || hdr.init_bytes != 0 {
+                return Err(RuntimeError::Device(format!(
+                    "devblob: extension declares {} tensors and {} B of init data — an \
+                     extension carries programs only",
+                    hdr.n_tensor, hdr.init_bytes
+                )));
+            }
+            let mut refs = sections
+                .iter()
+                .filter(|s| s.kind == packet::ext::SECT_PARENT_REF);
+            let s = refs.next().ok_or_else(|| {
+                RuntimeError::Device(
+                    "devblob: extension has no parent-ref section — nothing says which packet \
+                     it extends"
+                        .into(),
+                )
+            })?;
+            if refs.next().is_some() {
+                return Err(RuntimeError::Device(
+                    "devblob: extension carries two parent-ref sections".into(),
+                ));
+            }
+            let raw = buf.get(s.offset..s.offset + s.size).ok_or_else(|| {
+                RuntimeError::Device("devblob: parent-ref section outside the container".into())
+            })?;
+            let wire = packet::ext::BlobParentRef::from_bytes(raw)
+                .map_err(|e| RuntimeError::Device(format!("devblob: {e}")))?;
+            Some(plow_asset::extension::ParentRef::from(&wire))
+        } else {
+            if sections
+                .iter()
+                .any(|s| s.kind == packet::ext::SECT_PARENT_REF)
+            {
+                return Err(RuntimeError::Device(
+                    "devblob: model packet carries a parent-ref section — a packet cannot \
+                     extend another packet"
+                        .into(),
+                ));
+            }
+            None
+        };
+
         // PLOW_L2_PLACE guard: a placed blob requires physical-domain queue dispatch.
         //
         if hdr.flags & packet::devbuild::PLOW_BLOB_F_L2DOM != 0
@@ -440,7 +534,86 @@ impl DevBlob {
             sections,
             gen,
             tp,
+            parent,
         })
+    }
+
+    /// The tensor table as the extension contract digests it — see
+    /// `plow_asset::extension::tensor_table_digest`.
+    pub fn tensor_identities(&self) -> Vec<plow_asset::extension::TensorIdentity> {
+        self.tensors
+            .iter()
+            .map(|t| plow_asset::extension::TensorIdentity {
+                name: t.name.clone(),
+                bytes: t.bytes,
+                initialized: t.init.is_some(),
+            })
+            .collect()
+    }
+
+    /// TP degree the container was compiled for. `1` when there is no collective — a tp=1 blob
+    /// emits none, so "no collective" and "not sharded" are the same fact.
+    pub fn tp_degree(&self) -> u32 {
+        self.tp.map_or(1, |t| t.n_gpu)
+    }
+
+    /// This container's tensor-table digest (rule 2). On a parent this is what an extension
+    /// must match; on an extension it is meaningless (the table is empty) and the extension's
+    /// CLAIM lives in [`DevBlob::parent`].
+    pub fn tensor_table_digest(&self) -> plow_asset::extension::Digest {
+        plow_asset::extension::tensor_table_digest(&self.tensor_identities(), self.tp_degree())
+    }
+
+    /// The programs' roles, derived the way the positional code does today.
+    ///
+    /// **Phase 1 adapter.** Once `ProgramRole` lands on `plow_asset::program::Program`, this
+    /// reads `p.role` instead of re-deriving it, and the derivation and its `decode_rung_lo`
+    /// call go away. Callers see the same `Vec<ProgramRole>` either way.
+    pub fn program_roles(&self) -> Vec<plow_asset::extension::ProgramRole> {
+        let bits: Vec<plow_asset::extension::RoleBits> = self
+            .progs
+            .iter()
+            .map(|p| (p.t, p.packed_prefill_only, p.token_batch_body, p.decode_rung))
+            .collect();
+        // An extension has no positional boundary to derive from — see `roles_from_flags`.
+        if self.parent.is_some() {
+            plow_asset::extension::roles_from_flags(&bits)
+        } else {
+            plow_asset::extension::roles_from_positional(&bits, self.decode_rung_lo())
+        }
+    }
+
+    /// What one program costs the arenas (rule 6). Instruction-stream bytes are the records
+    /// the loader uploads per program — the same four arrays `AmdEngine::load` sends — plus
+    /// the GQ appendix when the program carries one.
+    pub fn program_budget(&self, p: &DevProg) -> plow_asset::extension::Budget {
+        let bytes = |n: usize, sz: usize| (n * sz) as u64;
+        plow_asset::extension::Budget {
+            inst_stream_bytes: bytes(p.insts.len(), std::mem::size_of::<DevInst64>())
+                + bytes(p.stream.len(), std::mem::size_of::<StreamEnt>())
+                + bytes(p.stream_ofs.len() + p.stream_len.len() + p.succs.len(), 4)
+                + bytes(p.waits.len(), std::mem::size_of::<Wait>())
+                + bytes(p.gq_stream.len(), std::mem::size_of::<StreamEnt>())
+                + bytes(p.gq_seg_ofs.len(), 4),
+            counters: p.n_counter,
+            segments: p.stream.iter().map(|e| e.seg as u32 + 1).max().unwrap_or(1),
+            workspace_bytes: 0,
+        }
+    }
+
+    /// The largest demand over every program in this container.
+    pub fn budget(&self) -> plow_asset::extension::Budget {
+        self.progs
+            .iter()
+            .map(|p| self.program_budget(p))
+            .fold(plow_asset::extension::Budget::default(), |a, b| {
+                plow_asset::extension::Budget {
+                    inst_stream_bytes: a.inst_stream_bytes.max(b.inst_stream_bytes),
+                    counters: a.counters.max(b.counters),
+                    segments: a.segments.max(b.segments),
+                    workspace_bytes: a.workspace_bytes.max(b.workspace_bytes),
+                }
+            })
     }
 
     /// Get a section by kind and architecture-specific name.
@@ -899,6 +1072,7 @@ mod tests {
             t: 128,
             packed_prefill_only: false,
             token_batch_body: false,
+            decode_rung: false,
             n_counter: 0,
             insts,
             stream,
@@ -950,6 +1124,7 @@ mod tests {
             t: 128,
             packed_prefill_only: false,
             token_batch_body: false,
+            decode_rung: false,
             n_counter: 0,
             insts,
             stream,
@@ -987,6 +1162,7 @@ mod tests {
             t,
             packed_prefill_only: false,
             token_batch_body: false,
+            decode_rung: false,
             n_counter: 0,
             insts,
             stream: Vec::new(),

@@ -306,7 +306,7 @@ impl IndexTp {
         route: Route,
         tensor_table: &[u8],
         tp: TpBind,
-        spans: Option<KvSpanTable>,
+            spans: Option<KvSpanTable>,
     ) -> Result<()> {
         let addr = |handle: u16| {
             let at = usize::from(handle) * 8;
@@ -409,6 +409,7 @@ mod tests {
             t: 8192,
             packed_prefill_only: false,
             token_batch_body: false,
+            decode_rung: false,
             n_counter: 0,
             insts: vec![DevInst64 {
                 op: DevOp::IndexTpPf as u16,

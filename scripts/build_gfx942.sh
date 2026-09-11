@@ -41,6 +41,9 @@
 # build from before this knob existed. `build_defines.json` records the -DPLOW_CONFIG on
 # every row, so `asm_audit.py --contract` sees a config build as a different axis set.
 #
+# PLOW_HSACO_EXTENSION=<extension dir> -- build only the rows ONE packet extension declares,
+# stamped with the extension's own packet hash. See the block below for the two rules it applies.
+#
 # THE RESOURCE TABLE IS NO LONGER A COMMENT HERE. It used to be four hand-maintained lines
 # claiming interp_prefill "spill 6", and it was stale by two orders of magnitude: the note says
 # 126 and the ISA says 1799 scratch ops across the object, 1588 of them in outlined bodies that
@@ -92,6 +95,70 @@ if [ -n "${PLOW_NORM_RANGE_CHECK:-}" ]; then
   INC="$INC -DPLOW_NORM_RANGE_CHECK=$PLOW_NORM_RANGE_CHECK"
   [ -n "${PLOW_NORM_SS_MAX:-}" ] && INC="$INC -DPLOW_NORM_SS_MAX=$PLOW_NORM_SS_MAX"
   echo "   !! NORM RANGE CHECK ARMED (debug build, not shippable): ${INC#*-I$R/common }"
+fi
+
+# PLOW_HSACO_EXTENSION=<extension dir> -- EXTENSION MODE (docs/arch/19, phase 3). An extension
+# adds programs to a frozen packet; its objects must be built for the EXTENSION, not the parent.
+# This mode is the two facts that follow from that, and nothing else:
+#
+#   1. PLOW_HSACO_CONFIG points at the extension's own plow_config.h, so every row stamps
+#      plow_packet_hash_{lo,hi} with the EXTENSION's PLOW_PACKET_HASH. An object stamped with
+#      the parent's hash is refused by name at load (plow_asset::extension::check_object_stamp):
+#      it was compiled against the parent's arm set and has none of this bucket's arms, and on
+#      AMD a missing arm does not trap, it writes nothing.
+#   2. PLOW_ROWS_ONLY is derived from requires.json's object stems, so only the rows the
+#      extension declares are built. That is the whole economy of the mechanism -- one more rung
+#      costs one object, not twenty-eight.
+#
+# The resulting directory is PARTIAL by construction. Copy it over the parent's object set, or
+# point PLOW_HSACO at a directory holding both.
+if [ -n "${PLOW_HSACO_EXTENSION:-}" ]; then
+  EXTD="$PLOW_HSACO_EXTENSION"
+  [ -d "$EXTD" ] || { echo "FAIL: PLOW_HSACO_EXTENSION=$EXTD is not a directory" >&2; exit 2; }
+  REQ="$EXTD/requires.json"
+  ECFG="$EXTD/plow_config.h"
+  [ -f "$REQ" ]  || { echo "FAIL: $REQ: an extension must declare its objects" >&2; exit 2; }
+  [ -f "$ECFG" ] || { echo "FAIL: $ECFG: no plow_config.h in the extension" >&2; exit 2; }
+  [ -f "$EXTD/extension.pkt" ] || { echo "FAIL: $EXTD holds no extension.pkt" >&2; exit 2; }
+
+  # requires.json is machine-written (serde_json pretty), so one `"key": value` per line is the
+  # grammar -- the same assumption `cfg_get` makes about plow_config.h.
+  jstr() { sed -n "s/.*\"$1\": *\"\([^\"]*\)\".*/\1/p" "$REQ"; }
+  ext_arch="$(jstr arch | head -1)"
+  [ "$ext_arch" = "$ARCH" ] || {
+    echo "FAIL: $REQ declares arch '$ext_arch'; this script builds $ARCH" >&2; exit 2; }
+
+  # The hash the extension's objects will be stamped with must be the one requires.json pins, or
+  # this build produces objects the loader it is building them for will refuse.
+  ext_pin="$(jstr pairing_hash | head -1 | tr 'A-F' 'a-f')"
+  ext_pin="${ext_pin#0x}"
+  ext_own="$(sed -n 's/^#define PLOW_PACKET_HASH 0x\([0-9a-fA-F]*\)ull$/\1/p' "$ECFG" | head -1 | tr 'A-F' 'a-f')"
+  [ -n "$ext_own" ] || { echo "FAIL: $ECFG carries no PLOW_PACKET_HASH" >&2; exit 2; }
+  [ -n "$ext_pin" ] || { echo "FAIL: $REQ carries no pairing_hash" >&2; exit 2; }
+  # Compare as numbers, so 0x0000dead and 0xdead are the same pin.
+  if [ "$((16#$ext_pin))" != "$((16#$ext_own))" ]; then
+    echo "FAIL: $REQ pins packet 0x$ext_pin but $ECFG is 0x$ext_own;" >&2
+    echo "      plowrt refuses objects stamped for a different artifact." >&2
+    exit 1
+  fi
+
+  ext_stems="$(jstr stem | sed 's/^/=/' | paste -sd, -)"
+  [ -n "$ext_stems" ] || { echo "FAIL: $REQ lists no object stems" >&2; exit 2; }
+  if [ -n "${PLOW_ROWS_ONLY:-}" ] && [ "$PLOW_ROWS_ONLY" != "$ext_stems" ]; then
+    echo "FAIL: PLOW_ROWS_ONLY='$PLOW_ROWS_ONLY' is set, but the extension declares '$ext_stems';" >&2
+    echo "      an extension builds exactly the rows it declares. Unset PLOW_ROWS_ONLY." >&2
+    exit 1
+  fi
+  PLOW_ROWS_ONLY="$ext_stems"
+  if [ -n "${PLOW_HSACO_CONFIG:-}" ] && [ "$PLOW_HSACO_CONFIG" != "$EXTD" ] \
+     && [ "$PLOW_HSACO_CONFIG" != "$ECFG" ]; then
+    echo "FAIL: PLOW_HSACO_CONFIG=$PLOW_HSACO_CONFIG disagrees with the extension at $EXTD;" >&2
+    echo "      an extension's objects are stamped with the EXTENSION's packet hash." >&2
+    exit 1
+  fi
+  PLOW_HSACO_CONFIG="$ECFG"
+  echo ">>> EXTENSION MODE: $EXTD"
+  echo "    stamping packet 0x$ext_own, building rows: $(jstr stem | paste -sd' ' -)"
 fi
 
 # PLOW_HSACO_CONFIG (see the header): resolve the packet's plow_config.h, stamp every row
@@ -1292,11 +1359,16 @@ fi
 if [ -n "${PLOW_ROWS_ONLY:-}" ]; then
   FILTERED=()
   for row in "${ROWS[@]}"; do
-    if [[ "$PLOW_ROWS_ONLY" == =* ]]; then
-      if [ "${row%%|*}" = "${PLOW_ROWS_ONLY#=}" ]; then FILTERED+=("$row"); fi
-    else
-      case "${row%%|*}" in *"${PLOW_ROWS_ONLY}"*) FILTERED+=("$row");; esac
-    fi
+    # COMMA-SEPARATED: a list of filters, each `=exact-stem` or a substring, matching if ANY
+    # does. Extension mode (PLOW_HSACO_EXTENSION) builds a set of named rows, and one substring
+    # cannot name a set.
+    for filt in ${PLOW_ROWS_ONLY//,/ }; do
+      if [[ "$filt" == =* ]]; then
+        if [ "${row%%|*}" = "${filt#=}" ]; then FILTERED+=("$row"); break; fi
+      else
+        case "${row%%|*}" in *"${filt}"*) FILTERED+=("$row"); break;; esac
+      fi
+    done
   done
   # A mistyped filter matching NOTHING must refuse, not print "ready (0 objects)" — that state
   # has already invalidated performance work once (see LESSONS).

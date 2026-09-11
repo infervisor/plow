@@ -49,6 +49,7 @@ pub(super) fn fixture() -> DevBlob {
                 t: rows,
                 packed_prefill_only: false,
                 token_batch_body: false,
+                decode_rung: false,
                 n_counter: 0,
                 insts,
                 stream: stream.clone(),
@@ -90,6 +91,7 @@ pub(super) fn fixture() -> DevBlob {
         sections: vec![],
         gen: vec![],
         tp: None,
+        parent: None,
     }
 }
 
