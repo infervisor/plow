@@ -278,3 +278,30 @@ This fixes one prerequisite for larger batches. The compiler still rejects
 FP8 KV with request chunk limits. Packed FP8 attention, object contracts,
 full-model correctness and native B64 projections need qualification before
 that restriction can be lifted. No throughput gain is claimed by this fix.
+
+## Packed FP8 attention body checks
+
+`runtime/tests/packed_flash_fp8_sm90_correct.cu` exercises the existing native
+FP8 packed mux at all six prefill rungs, HD256/KV8 with a 1024-token local
+window and HD512/KV1 with full attention. Two ragged requests use physical
+slots2/0, histories ending at16384/8193, per-row K/V scales and up to1024
+real rows per request. Every output is checked for finiteness, and every
+padded output must be zero.
+
+An FP64 reference reads the stored FP8 K/V values and row scales directly,
+with BF16 queries, causal masking and the local ring mask. It checks first,
+middle and last rows at three query heads per request. This separates
+attention execution error from the upstream KV quantizer's approximation;
+it is not an independent full-model quality check. All12 cases pass memcheck
+with zero errors; worst sampled relative L2 is0.005879 and absolute error
+is0.000283 (limits0.015/0.002).
+
+Racecheck instruments the first two launches only: 128-row HD256/KV8 and
+HD512/KV1. Both pass with zero hazards, errors or warnings. The full-ladder
+racecheck attempt was deliberately stopped because of instrumentation cost;
+it is not counted as a pass. [Raw results and scope](gemma4-12b-h100-data/packed-flash-fp8-summary.json).
+
+This is body validation, not loaded-interpreter or serving qualification.
+The compiler and packet validator retain their BF16-only request-limit
+guards. Extending the contract must distinguish FP8 objects built after the
+writer fix: the old general padding marker alone cannot establish that fix.
