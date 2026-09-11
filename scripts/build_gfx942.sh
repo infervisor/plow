@@ -1086,6 +1086,18 @@ if [ "${PLOW_MLA_FOLD_TB:-8}" != 0 ]; then
   # schedule) — every new shape needs its own character-identical gate. This is a new shape only
   # in the sense of a different object; the map (V=256, TB=8, gfx942) is the one already gated on
   # AX_PREFILL. Flip the default only after the 18-case retrieval screen on this object.
+  #
+  # >>> MEASURED ON THE GLM-5.3 TP8 SPARSE CHUNK, AND IT IS A NULL. <<< (2026-09-11, packet trace
+  # of the last chunk of a 73,728-token prompt, 8 GPUs, rank 0: MlaMergeFold body 46.59 ms/chunk
+  # without the arm and 46.59 ms with it; chunk 963.65 -> 964.21 ms, inside run-to-run spread.)
+  # The reachability half of the finding is real — segment 11 of the 8192 program is
+  # `object_class: flash`, so the arm on AX_PREFILL alone never ran for this recipe — but the
+  # PRIZE is not: at nsplit=1 (the sparse arm) the merge phase is a pass-through and the fold is
+  # VALU-bound, 17.2 GFLOP in 597 us = 29 TFLOP/s against a ~163 TFLOP/s f32 VALU peak, while the
+  # W_uv panel (8 heads x 256 KiB = 2 MiB) is L2-resident. TB=8 divides an L2 stream that was not
+  # the constraint. The 1626 -> 616 us standalone number was ns=2 on a cold cache; in situ the
+  # scalar arm already runs at 597 us. What is left is the arithmetic itself: the fold is a
+  # batched GEMM and wants MFMA, not a better stream.
   [ "${PLOW_MLA_FOLD_TB_FLASH:-0}" = 0 ] ||
     AX_FLASH="$AX_FLASH -DPLOW_MLA_FOLD_TB=${PLOW_MLA_FOLD_TB:-8}"
 fi
