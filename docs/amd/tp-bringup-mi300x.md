@@ -2571,6 +2571,16 @@ request set (1,414,538 in / 13,795 out), one exclusive-lease run per arm:
 | control (old defaults) | `pf_interleave=2048 pf_batch=0 route=0` | **16.81** | 820.8 s | 352.9 / 361.3 / 737.6 s | 646.8 / 614.1 ms | 109 / 1832 ms |
 | new defaults | `pf_interleave=widest pf_batch=1 route=auto` | **49.68 (+196 %)** | 277.7 s | **100.3 / 102.6 / 198.7 s** | **234.9 / 232.7 ms** | 101 / 1348 ms |
 | new defaults, re-emitted packet WITH siblings | route armed on 128/512/2048 | 49.83 | 276.8 s | 101.2 / 102.7 / 197.3 s | 233.6 / 233.6 ms | 103 / 1357 ms |
+| **new defaults, the user's 100-prompt command** (frozen packet; 7,018,227 in / 71,149 out) | unset | **47.09** | 1511.0 s | 15.97 / 35.6 / 191.2 s | 395.8 / 366.6 ms | 108 / 3333 ms |
+| reference recipe before this merge, same 100-prompt command (`PLOW_PF_INTERLEAVE=0`, i.e. the 2048 cap switched off by hand) | env | 47.80 | 1489 s | 16.0 / 34.6 s | 385 / 362 ms | 102 / 3361 ms |
+
+Read together: the +196 % is against the shipped *default* (2048 cap once anything decodes), which
+nobody used for the production numbers — the serving recipe already switched the cap off. On the
+user's 100-prompt workload the new defaults reproduce that recipe with no env (47.09 vs 47.80,
+within run noise) and do not add to it: ≈ 857 full 8192 chunks + 100 ragged tails ≈ 957 prefill
+launches at ~1.3 s ≈ 1240 s, plus ≈ 2600 decode-only ticks at 108 ms (the median ITL) ≈ 280 s,
+sums to the measured 1511 s. The remaining 3.2× to 150 tok/s is per-tick kernel time on the 8192
+sparse rung (and the rung-20 decode step), not scheduling.
 
 The gain is the tick cap: the steady-state prefill launch went from a 2048-row dense chunk to an
 8192-row sparse chunk — 4× fewer launches and ~30× fewer attention FLOPs per row at 60–70k keys —
