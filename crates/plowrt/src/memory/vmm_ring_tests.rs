@@ -149,6 +149,68 @@ fn sub_granularity_slots_share_aligned_backing() {
     ops.empty();
 }
 
+#[test]
+fn releasing_shared_granules_waits_for_the_last_slot_and_remaps_cleanly() {
+    let granularity = 2 << 20;
+    let ops = Arc::new(Mock::with_granularity(granularity));
+    let tensors = [LiveRingTensor {
+        tensor: 3,
+        slot_bytes: 1 << 20,
+    }];
+    let mut rings = VmmRings::new(ops.clone(), &tensors, 3).unwrap();
+    for slot in 0..3 {
+        rings.ensure_slot(slot).unwrap();
+    }
+    assert_eq!(rings.stats().resident_bytes, 2 * granularity);
+
+    rings.release_slot(0);
+    assert_eq!(rings.stats().resident_bytes, 2 * granularity);
+    assert_eq!(ops.0.lock().unwrap().mapped.len(), 2);
+    rings.release_slot(1);
+    assert_eq!(rings.stats().resident_bytes, granularity);
+    assert_eq!(ops.0.lock().unwrap().mapped.len(), 1);
+    rings.release_slot(2);
+    assert_eq!(rings.stats().resident_bytes, 0);
+    assert_eq!(rings.stats().mapped_slots, 0);
+    assert!(ops.0.lock().unwrap().mapped.is_empty());
+
+    rings.ensure_slot(1).unwrap();
+    assert_eq!(rings.stats().resident_bytes, granularity);
+    assert_eq!(rings.stats().mapped_slots, 1);
+    rings.release_slot(1);
+    assert_eq!(rings.stats().resident_bytes, 0);
+    drop(rings);
+    ops.empty();
+}
+
+#[test]
+fn failed_slot_mapping_rolls_back_shared_granule_references() {
+    let granularity = 2 << 20;
+    let ops = Arc::new(Mock::with_granularity(granularity));
+    let tensors = [
+        LiveRingTensor {
+            tensor: 3,
+            slot_bytes: 1 << 20,
+        },
+        LiveRingTensor {
+            tensor: 8,
+            slot_bytes: granularity,
+        },
+    ];
+    let mut rings = VmmRings::new(ops.clone(), &tensors, 2).unwrap();
+    rings.ensure_slot(0).unwrap();
+    let stats = rings.stats();
+    ops.fail(Call::Create, 1);
+    assert!(rings.ensure_slot(1).is_err());
+    assert_eq!(rings.stats(), stats);
+
+    rings.release_slot(0);
+    assert_eq!(rings.stats().resident_bytes, 0);
+    assert!(ops.0.lock().unwrap().mapped.is_empty());
+    drop(rings);
+    ops.empty();
+}
+
 fn tensors() -> [LiveRingTensor; 2] {
     [
         LiveRingTensor {
@@ -160,6 +222,34 @@ fn tensors() -> [LiveRingTensor; 2] {
             slot_bytes: 256,
         },
     ]
+}
+
+#[test]
+fn release_reclaims_exclusive_slots_and_repairs_prefix_tracking() {
+    let ops = Arc::new(Mock::default());
+    let mut rings = VmmRings::new(ops.clone(), &tensors(), 4).unwrap();
+    rings.ensure_prefix(4).unwrap();
+    assert_eq!(rings.stats().resident_bytes, 4 * 384);
+
+    rings.release_slot(1);
+    assert_eq!(rings.stats().resident_bytes, 3 * 384);
+    assert_eq!(rings.stats().mapped_slots, 3);
+    assert_eq!(rings.stats().mapped_prefix, 1);
+    rings.release_slot(1);
+    assert_eq!(rings.stats().resident_bytes, 3 * 384);
+
+    rings.ensure_prefix(4).unwrap();
+    assert_eq!(rings.stats().resident_bytes, 4 * 384);
+    assert_eq!(rings.stats().mapped_slots, 4);
+    assert_eq!(rings.stats().mapped_prefix, 4);
+    for slot in 0..4 {
+        rings.release_slot(slot);
+    }
+    assert_eq!(rings.stats().resident_bytes, 0);
+    assert_eq!(rings.stats().mapped_slots, 0);
+    assert_eq!(rings.stats().mapped_prefix, 0);
+    drop(rings);
+    ops.empty();
 }
 
 #[test]

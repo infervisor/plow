@@ -88,8 +88,17 @@ use decode_rung::{
     validate_decode_ladder, DecodeRung, DecodeSelection,
 };
 
-fn live_rings_for_context(configured: bool, live: bool, max_ctx: Option<u32>) -> bool {
-    configured || (live && max_ctx.is_some_and(|ctx| ctx >= 131_072))
+fn live_rings_for_capacity(
+    configured: bool,
+    live: bool,
+    max_ctx: Option<u32>,
+    batch: Option<u32>,
+) -> bool {
+    // Gemma's flat sliding rings reach 40 GiB at B64; 128K B16 reaches 42 GiB total KV.
+    configured
+        || (live
+            && (max_ctx.is_some_and(|ctx| ctx >= 131_072)
+                || batch.is_some_and(|batch| batch >= 64)))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1415,6 +1424,8 @@ struct PrefillBucket {
     /// Per-segment wave class (8 = GEMM-class, 4 = flash-class) when the program is
     /// wave-class segmented AND the SegPf pair is loaded; empty = single launch.
     seg_class: Vec<u8>,
+    /// Unique instruction sites in each segment for the opt-in timing diagnostic.
+    segment_sites: Vec<Vec<(usize, u16)>>,
     small_gemm_segments: Vec<bool>,
     qwen_segments: Vec<Option<DevInst64>>,
     packet_segment_roles: Vec<u8>,
@@ -3110,15 +3121,17 @@ impl GpuEngine {
                     tracing::info!("live KV allocation enabled by packet metadata");
                 }
                 let configured_rings = config.nv_vmm_live_rings();
-                let rings = live_rings_for_context(
+                let rings = live_rings_for_capacity(
                     configured_rings,
                     live,
                     live_kv_manifest.as_ref().map(|manifest| manifest.max_ctx),
+                    live_kv_manifest.as_ref().map(|manifest| manifest.batch),
                 );
                 if rings && !configured_rings {
                     tracing::info!(
                         max_ctx = live_kv_manifest.as_ref().map(|manifest| manifest.max_ctx),
-                        "live ring allocation enabled for long-context KV"
+                        batch = live_kv_manifest.as_ref().map(|manifest| manifest.batch),
+                        "live ring allocation enabled for capacity-tier KV"
                     );
                 }
                 if rings && !live {
@@ -4069,15 +4082,6 @@ impl GpuEngine {
             be.synchronize()?;
         }
 
-        // Every slot's row 0 must be mapped before any batched decode: unfed
-        // rows write garbage KV at their own pos (mux contract), and pos
-        // starts at 0.
-        if let Some(v) = &vmm {
-            for b in 0..batch {
-                v.kv.ensure_rows(b, 1)?;
-            }
-        }
-
         // Stop set from the checkpoint's generation_config (fallback config).
         // BOTH sources, matching the AMD and CPU engines. This read only
         // `read_eos_ids`, so a family whose turn actually ends at a token that
@@ -5012,6 +5016,9 @@ impl GpuEngine {
         self.slot_generations[b] = self.slot_generations[b].wrapping_add(1);
         self.reset_packed_admission(b);
         if !self.vmm_active[b] {
+            if let Some(rings) = self.vmm.as_mut().and_then(|v| v.rings.as_mut()) {
+                rings.release_slot(b);
+            }
             return;
         }
         if cache_output {
@@ -5021,6 +5028,9 @@ impl GpuEngine {
         self.vmm_attached[b] = 0;
         // Decode's backstop maps row zero before any inactive-row write.
         self.vmm.as_ref().unwrap().kv.begin_seq(b);
+        if let Some(rings) = self.vmm.as_mut().and_then(|v| v.rings.as_mut()) {
+            rings.release_slot(b);
+        }
         self.seq_tokens[b].clear();
         self.vmm_active[b] = false;
     }
@@ -6334,6 +6344,18 @@ impl GpuEngine {
                 g.check_coarse_single_segment()?;
                 Vec::new()
             };
+            let mut segment_sites = vec![Vec::new(); seg_class.len()];
+            for entry in &g.stream {
+                if let Some(sites) = segment_sites.get_mut(entry.seg as usize) {
+                    let site = (entry.inst as usize, g.insts[entry.inst as usize].op);
+                    if !sites.contains(&site) {
+                        sites.push(site);
+                    }
+                }
+            }
+            for sites in &mut segment_sites {
+                sites.sort_unstable();
+            }
             let small_gemm_segments = if seg_pf.as_ref().is_some_and(|s| s.small_gemm.is_some()) {
                 let abi = seg_pf
                     .as_ref()
@@ -6492,6 +6514,7 @@ impl GpuEngine {
             buckets.push(PrefillBucket {
                 t: g.t,
                 seg_class: seg_class.clone(),
+                segment_sites,
                 small_gemm_segments,
                 qwen_segments,
                 packet_segment_roles,
@@ -7116,7 +7139,7 @@ impl GpuEngine {
             // otherwise idle, so all blocks schedule together. Diagnostic-grade knob to
             // price the cooperative-launch overhead (241 fat launches/chunk).
             let noncoop = rt.nv.pf_seg_noncoop;
-            let mut evs: Vec<(u8, CudaEvent, CudaEvent)> = Vec::new();
+            let mut evs: Vec<(usize, u8, CudaEvent, CudaEvent)> = Vec::new();
             for (seg, &cls) in seg_class.iter().enumerate() {
                 if let Some(Some(route)) = self.prefill[bi].cublaslt_segments.get(seg) {
                     route.run(&self.stream)?;
@@ -7155,7 +7178,7 @@ impl GpuEngine {
                     self.be.event_record(&e0, &self.stream)?;
                     go(&mut params)?;
                     self.be.event_record(&e1, &self.stream)?;
-                    evs.push((cls, e0, e1));
+                    evs.push((seg, cls, e0, e1));
                 } else {
                     go(&mut params)?;
                 }
@@ -7164,7 +7187,7 @@ impl GpuEngine {
                 self.be.stream_synchronize(&self.stream)?;
                 let mut by_class = [0f64; 3]; // [gemm(8), flash-fat(4), fa512(2)]
                 let mut n_by = [0u32; 3];
-                for (cls, e0, e1) in &evs {
+                for (_, cls, e0, e1) in &evs {
                     let ix = match cls {
                         8 => 0,
                         4 => 1,
@@ -7184,8 +7207,8 @@ impl GpuEngine {
                 );
                 // Top-10 slowest segments, to attribute inside a class.
                 let mut per: Vec<(usize, u8, f32)> = Vec::with_capacity(evs.len());
-                for (i, (cls, e0, e1)) in evs.iter().enumerate() {
-                    per.push((i, *cls, self.be.event_elapsed_ms(e0, e1)?));
+                for (seg, cls, e0, e1) in &evs {
+                    per.push((*seg, *cls, self.be.event_elapsed_ms(e0, e1)?));
                 }
                 per.sort_by(|a, b| b.2.total_cmp(&a.2));
                 let top: Vec<String> = per
@@ -7194,6 +7217,27 @@ impl GpuEngine {
                     .map(|(i, c, ms)| format!("seg{i}(c{c})={ms:.2}ms"))
                     .collect();
                 tracing::info!(top = top.join(" ").as_str(), "slowest segments");
+                let mut by_sites: std::collections::BTreeMap<Vec<(usize, u16)>, (u32, f64)> =
+                    std::collections::BTreeMap::new();
+                for (seg, _, e0, e1) in &evs {
+                    let sites = self.prefill[bi].segment_sites[*seg].clone();
+                    let summary = by_sites.entry(sites).or_default();
+                    summary.0 += 1;
+                    summary.1 += self.be.event_elapsed_ms(e0, e1)? as f64;
+                }
+                for (sites, (count, elapsed_ms)) in by_sites {
+                    let sites = sites
+                        .iter()
+                        .map(|(pc, op)| format!("pc{pc}:{}", devop_name(*op as u32)))
+                        .collect::<Vec<_>>()
+                        .join("+");
+                    tracing::info!(
+                        sites,
+                        count,
+                        elapsed_ms = format!("{elapsed_ms:.3}"),
+                        "segment-site wall time (chunk)"
+                    );
+                }
             }
         } else {
             let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];

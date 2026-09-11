@@ -262,9 +262,10 @@ struct RingWindow {
     slot_bytes: u64,
     map_bytes: u64,
     handles: Vec<Option<u64>>,
+    refs: Vec<usize>,
 }
 
-/// Whole-slot ring backing is retained until teardown; absolute token frontiers do not apply.
+/// Whole-slot ring backing is committed while at least one logical slot uses each mapping unit.
 pub struct VmmRings {
     ops: Arc<dyn VmmOps>,
     windows: Vec<RingWindow>,
@@ -336,6 +337,7 @@ impl VmmRings {
                 slot_bytes: t.slot_bytes,
                 map_bytes,
                 handles: vec![None; (bytes / map_bytes) as usize],
+                refs: vec![0; (bytes / map_bytes) as usize],
             });
         }
         Ok(rings)
@@ -361,7 +363,7 @@ impl VmmRings {
         if self.mapped[slot] {
             return Ok(());
         }
-        let mut added = Vec::new();
+        let mut touched = Vec::new();
         for i in 0..self.windows.len() {
             let va_base = self.windows[i].va;
             let slot_bytes = self.windows[i].slot_bytes;
@@ -370,39 +372,38 @@ impl VmmRings {
             let end = (slot as u64 + 1) * slot_bytes;
             let last = (end + map_bytes - 1) / map_bytes;
             for unit in first..last {
-                if self.windows[i].handles[unit as usize].is_some() {
-                    continue;
-                }
-                let va = va_base + unit * map_bytes;
-                let result = (|| {
-                    let handle = self.ops.create(map_bytes)?;
-                    if let Err(e) = self.ops.map(va, map_bytes, handle) {
-                        self.ops.release(handle);
-                        return Err(e);
-                    }
-                    if let Err(e) = self.ops.set_access(va, map_bytes) {
-                        self.ops.unmap(va, map_bytes);
-                        self.ops.release(handle);
-                        return Err(e);
-                    }
-                    Ok(handle)
-                })();
-                match result {
-                    Ok(handle) => {
-                        self.windows[i].handles[unit as usize] = Some(handle);
-                        added.push((i, unit as usize));
-                    }
-                    Err(e) => {
-                        for &(window, unit) in added.iter().rev() {
-                            let w = &mut self.windows[window];
-                            let handle = w.handles[unit].take().unwrap();
-                            self.ops
-                                .unmap(w.va + unit as u64 * w.map_bytes, w.map_bytes);
+                let unit = unit as usize;
+                if self.windows[i].refs[unit] == 0 {
+                    debug_assert!(self.windows[i].handles[unit].is_none());
+                    let va = va_base + unit as u64 * map_bytes;
+                    let result = (|| {
+                        let handle = self.ops.create(map_bytes)?;
+                        if let Err(e) = self.ops.map(va, map_bytes, handle) {
                             self.ops.release(handle);
+                            return Err(e);
                         }
-                        return Err(e);
+                        if let Err(e) = self.ops.set_access(va, map_bytes) {
+                            self.ops.unmap(va, map_bytes);
+                            self.ops.release(handle);
+                            return Err(e);
+                        }
+                        Ok(handle)
+                    })();
+                    match result {
+                        Ok(handle) => {
+                            self.windows[i].handles[unit] = Some(handle);
+                            self.stats.resident_bytes += map_bytes;
+                        }
+                        Err(e) => {
+                            for &(window, unit) in touched.iter().rev() {
+                                self.release_unit(window, unit);
+                            }
+                            return Err(e);
+                        }
                     }
                 }
+                self.windows[i].refs[unit] += 1;
+                touched.push((i, unit));
             }
         }
         self.mapped[slot] = true;
@@ -411,11 +412,41 @@ impl VmmRings {
         }
         self.stats.mapped_slots += 1;
         self.stats.mapped_prefix = self.prefix;
-        self.stats.resident_bytes += added
-            .iter()
-            .map(|&(window, _)| self.windows[window].map_bytes)
-            .sum::<u64>();
         Ok(())
+    }
+
+    pub fn release_slot(&mut self, slot: usize) {
+        if slot >= self.mapped.len() || !self.mapped[slot] {
+            return;
+        }
+        for i in 0..self.windows.len() {
+            let slot_bytes = self.windows[i].slot_bytes;
+            let map_bytes = self.windows[i].map_bytes;
+            let first = slot as u64 * slot_bytes / map_bytes;
+            let end = (slot as u64 + 1) * slot_bytes;
+            let last = end.div_ceil(map_bytes);
+            for unit in first..last {
+                self.release_unit(i, unit as usize);
+            }
+        }
+        self.mapped[slot] = false;
+        self.prefix = self.prefix.min(slot);
+        self.stats.mapped_slots -= 1;
+        self.stats.mapped_prefix = self.prefix;
+    }
+
+    fn release_unit(&mut self, window: usize, unit: usize) {
+        let w = &mut self.windows[window];
+        debug_assert!(w.refs[unit] > 0);
+        w.refs[unit] -= 1;
+        if w.refs[unit] != 0 {
+            return;
+        }
+        let handle = w.handles[unit].take().expect("referenced ring mapping");
+        self.ops
+            .unmap(w.va + unit as u64 * w.map_bytes, w.map_bytes);
+        self.ops.release(handle);
+        self.stats.resident_bytes -= w.map_bytes;
     }
 
     pub fn ensure_prefix(&mut self, rows: usize) -> Result<()> {
@@ -927,6 +958,12 @@ impl VmmKv {
         if let Ok(j) = join {
             self.precreate = Some((stop, j));
         }
+    }
+
+    /// Recycle retired blocks up to `cap_bytes` without committing HBM before demand.
+    pub fn enable_block_recycling(&mut self, cap_bytes: u64) {
+        let cap_blocks = (cap_bytes / self.shared.block_bytes).min(u32::MAX as u64) as u32;
+        self.shared.pool_cap.store(cap_blocks, Ordering::Relaxed);
     }
 
     /// VA base of the (layer, tensor) full-layer KV tensor — what the engine
@@ -2630,6 +2667,12 @@ mod tests {
             ring_ops.creates.load(Ordering::SeqCst) * ring_slot_bytes,
             640 << 20
         );
+        rings.release_slot(0);
+        assert_eq!(rings.stats().resident_bytes, 0);
+        assert_eq!(ring_ops.releases.load(Ordering::SeqCst), 80);
+        rings.ensure_slot(0).unwrap();
+        assert_eq!(rings.stats().resident_bytes, 640 << 20);
+        assert_eq!(ring_ops.creates.load(Ordering::SeqCst), 160);
     }
 
     fn prompt(n: usize) -> Vec<u32> {
@@ -3570,6 +3613,29 @@ mod tests {
             8,
             "every parked handle released at drop"
         );
+    }
+
+    #[test]
+    fn live_kv_recycles_blocks_without_load_time_commit() {
+        let ops = Arc::new(MockVmm::default());
+        let geo = uniform_pool(ops.clone()).geometry().clone();
+        let mut p = VmmKv::new_live(ops.clone(), geo, 64).unwrap();
+        p.enable_block_recycling(8 * 64);
+        assert_eq!(ops.creates.load(Ordering::SeqCst), 0);
+        assert_eq!(p.stats().blocks_pooled, 0);
+        assert_eq!(p.stats().blocks_live, 0);
+
+        p.ensure_rows(0, 8).unwrap();
+        assert_eq!(ops.creates.load(Ordering::SeqCst), 4);
+        p.begin_seq(0);
+        assert_eq!(p.stats().blocks_pooled, 4);
+        p.ensure_rows(0, 8).unwrap();
+        assert_eq!(ops.creates.load(Ordering::SeqCst), 4);
+        assert_eq!(p.stats().blocks_reused, 4);
+
+        p.begin_seq(0);
+        drop(p);
+        assert_eq!(ops.releases.load(Ordering::SeqCst), 4);
     }
 
     #[test]

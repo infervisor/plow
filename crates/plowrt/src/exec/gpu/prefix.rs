@@ -75,7 +75,7 @@ impl GpuEngine {
             layout.geometry,
             block_hint,
         )?;
-        kv.enable_block_pool(crate::memory::vmm::kv_pool_cap());
+        kv.enable_block_recycling(crate::memory::vmm::kv_pool_cap());
         let tensor_tracks = layout
             .full_tensors
             .iter()
