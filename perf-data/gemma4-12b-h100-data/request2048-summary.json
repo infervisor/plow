@@ -1,0 +1,205 @@
+{
+  "model": "google/gemma-4-12B-it",
+  "arch": "sm_90a",
+  "weights": "bf16",
+  "kv": "bf16",
+  "physical_batch": 32,
+  "context": 20480,
+  "aggregate_rows": 8192,
+  "candidate_request_rows": 2048,
+  "control_request_rows": 1024,
+  "kv_gib": {
+    "candidate": 50,
+    "control": 30
+  },
+  "screen": "Candidate then control, one repeat after serving verification, no additional per-cell warmup; 128 outputs, cache disabled. No C128 or fresh vLLM comparison; no independent quality oracle.",
+  "audit": {
+    "programs": 12,
+    "instructions": 8904,
+    "cases": 2736
+  },
+  "results": {
+    "request2048": [
+      {
+        "input": 1024,
+        "concurrency": 1,
+        "output_tok_s": 75.64850548597596,
+        "ttft_ms": 81.28373300132807
+      },
+      {
+        "input": 1024,
+        "concurrency": 32,
+        "output_tok_s": 799.4106828747495,
+        "ttft_ms": 1611.4221494935919
+      },
+      {
+        "input": 16384,
+        "concurrency": 1,
+        "output_tok_s": 46.89293889607629,
+        "ttft_ms": 1002.6730719982879
+      },
+      {
+        "input": 16384,
+        "concurrency": 32,
+        "output_tok_s": 107.55999748372105,
+        "ttft_ms": 32480.573657499917
+      }
+    ],
+    "control1024": [
+      {
+        "input": 1024,
+        "concurrency": 1,
+        "output_tok_s": 75.8484503351054,
+        "ttft_ms": 77.17377098742872
+      },
+      {
+        "input": 1024,
+        "concurrency": 32,
+        "output_tok_s": 799.302640293608,
+        "ttft_ms": 1593.371582996042
+      },
+      {
+        "input": 16384,
+        "concurrency": 1,
+        "output_tok_s": 45.44881795122584,
+        "ttft_ms": 1081.3850639970042
+      },
+      {
+        "input": 16384,
+        "concurrency": 32,
+        "output_tok_s": 107.5556862348279,
+        "ttft_ms": 32470.389096000872
+      }
+    ]
+  },
+  "paired_text_comparison": [
+    {
+      "input": 1024,
+      "concurrency": 1,
+      "different_texts": 0,
+      "requests": 1
+    },
+    {
+      "input": 1024,
+      "concurrency": 32,
+      "different_texts": 0,
+      "requests": 32
+    },
+    {
+      "input": 16384,
+      "concurrency": 1,
+      "different_texts": 0,
+      "requests": 1
+    },
+    {
+      "input": 16384,
+      "concurrency": 32,
+      "different_texts": 0,
+      "requests": 32
+    }
+  ],
+  "decision": "C32 throughput unchanged; candidate has lower 16K/C1 TTFT in one screen, insufficient for default promotion.",
+  "files": {
+    "plans/gemma4-12b-roofline/bf16-chunk-serving-request2048.json": {
+      "sha256": "a3636dac1e6a5cebd690f53657595af367351c6524cae879d16ebcd4939e00f5"
+    },
+    "plans/gemma4-12b-roofline/bf16-chunk-serving-request2048-verify.log": {
+      "sha256": "f6e91190b360d5c897d0dc8996002ea78e93b0375e9476ce5ef68721fedefd91"
+    },
+    "plans/gemma4-12b-roofline/bf16-chunk-serving-request2048-server.log": {
+      "sha256": "4b39143c82cd8ac3c85e2ed26b2c09429084b553688b9049d1cf12c549403bdf"
+    },
+    "plans/gemma4-12b-roofline/bf16-chunk-serving-request2048.log": {
+      "sha256": "ac956905e7542175c08bee1624b08026ecacf1b0565a02ed09002df2bebc6e77"
+    },
+    "plans/gemma4-12b-roofline/bf16-chunk-serving-control1024.json": {
+      "sha256": "449c1a93807a198f6be6943bf93ab412c75317f99ec618e50ea7f3bf8d3e158f"
+    },
+    "plans/gemma4-12b-roofline/bf16-chunk-serving-control1024-verify.log": {
+      "sha256": "f6e91190b360d5c897d0dc8996002ea78e93b0375e9476ce5ef68721fedefd91"
+    },
+    "plans/gemma4-12b-roofline/bf16-chunk-serving-control1024-server.log": {
+      "sha256": "993ea2f45648d58db06363d610f5f3135dd7d6fdc4e43f4abdf9ecc64435db5a"
+    },
+    "plans/gemma4-12b-roofline/bf16-chunk-serving-control1024.log": {
+      "sha256": "4394d34e8cee02cbbec47436fa38805df8bbd6a3e1cbf74bb6c2714be143eacc"
+    },
+    "plans/gemma4-12b-roofline/request2048-compile.log": {
+      "sha256": "a09f391c05db517a564b74efbe162e53cd40379b045a6e9822d5912805916901"
+    },
+    "plans/gemma4-12b-roofline/check_request2048.py": {
+      "sha256": "c4df714d30919a152df0285efc28a6d47b40edbfef7cc7d0531ce3d726471fe2"
+    },
+    "plans/gemma4-12b-roofline/check_chunk_control.py": {
+      "sha256": "b989834eca0b44e933ddcf540be5aeeac4924915dccb4c7eb7b506add27af24b"
+    },
+    "plans/gemma4-12b-roofline/bf16-b32-request2048/model.pkt": {
+      "sha256": "8ff310cad6264313f788515f971884e03c8d58b1ffe9e786bef5a2e7d610246d",
+      "bytes": 53948877
+    },
+    "plans/gemma4-12b-roofline/bf16-b32-request2048/build.json": {
+      "sha256": "129a6a390212877654fc5be4816f4754a0621d74a932dfc126479fc37fad86ce",
+      "bytes": 6781622
+    },
+    "plans/gemma4-12b-roofline/bf16-native-tc-b32-head/model.pkt": {
+      "sha256": "401d0858eb1d5cf8776289fc0fb645c38249366dc3fec2b503d1980f021f0a4f",
+      "bytes": 53948877
+    },
+    "plans/gemma4-12b-roofline/bf16-native-tc-b32-head/build.json": {
+      "sha256": "f2653f2938d7865e37b4186f74c2ed2399e12087500ea66f28a5e8ba7c8c71bd",
+      "bytes": 6781620
+    },
+    "plans/gemma4-12b-roofline/cubin-bf16-b32-smepi/interp_sm90a_pffa.cubin": {
+      "sha256": "29cfda37a3bb2840c05df4886d1c7f7a139727433f7cffb6988698d7599c3738",
+      "bytes": 161768
+    },
+    "plans/gemma4-12b-roofline/cubin-bf16-b32-smepi/interp_sm90a_pfseg.cubin": {
+      "sha256": "f0b4e2253e7217875c533f37d00858cb54e117052a113cad7cbe60d82902d88f",
+      "bytes": 852712
+    },
+    "plans/gemma4-12b-roofline/cubin-bf16-b32-smepi/interp_sm90a_pfpackedgemm.cubin": {
+      "sha256": "6275c56dd3d534e2867edd4a3fac7a4d5ba739c50e544b3b1e0096d8f7348663",
+      "bytes": 105128
+    },
+    "plans/gemma4-12b-roofline/cubin-bf16-b32-smepi/interp_sm90a_pfpackedfa.cubin": {
+      "sha256": "695850e0cad51ba0218184db7b7314774e2100d6ce25014dcf947320937d7268",
+      "bytes": 333096
+    },
+    "plans/gemma4-12b-roofline/cubin-bf16-b32-smepi/interp_sm90a_pfattn_hd512.cubin": {
+      "sha256": "4f2d3189a380aeab2261cab6020bdfaff2eac770b143deabf16810d274615411",
+      "bytes": 101232
+    },
+    "plans/gemma4-12b-roofline/cubin-bf16-b32-smepi/interp_sm90a_pfpackedseg.cubin": {
+      "sha256": "0c0379f600cac7ced1b5afc4ce2fc0363e6046704f0750eec54fb585d599ae32",
+      "bytes": 726952
+    },
+    "plans/gemma4-12b-roofline/cubin-bf16-b32-smepi/interp_sm90a_pfgemm.cubin": {
+      "sha256": "f4dafa8289f9075471c190c70c704a6e575b54481e68da392424ff6dc95b2648",
+      "bytes": 104808
+    },
+    "plans/gemma4-12b-roofline/cubin-bf16-b32-smepi/interp_sm90a_pf.cubin": {
+      "sha256": "45394e8cb0724ddb2d39b9a8decf8b7cb348b9ae181b741a724ba774fbdf26ae",
+      "bytes": 852456
+    },
+    "plans/gemma4-12b-roofline/cubin-bf16-b32-smepi/interp_sm90a.cubin": {
+      "sha256": "e381cea75ac55de64fe1cdb84ea19ad8b9b1de3f6a5af2134e4189326fffe0e8",
+      "bytes": 1431928
+    }
+  },
+  "compiler_replay": {
+    "PLOW_DECODE_BATCH_LADDER": "1,2,4,8,16,32",
+    "PLOW_EMIT_DECODE_CUBLASLT": "false",
+    "PLOW_EMIT_DECODE_NATIVE_TC": "true",
+    "PLOW_MAX_CHUNK": "8192",
+    "PLOW_MAX_REQUEST_CHUNK": "2048",
+    "PLOW_NO_GLU_FUSE": "true",
+    "PLOW_TMA_GEMM": "true"
+  },
+  "compiler_unrecorded_env": {
+    "PLOW_UNISEG": "0",
+    "PLOW_SEG_CLASS_SLICE": "1",
+    "PLOW_SEG_FA512": "all",
+    "PLOW_SEG_PURE_GEMM": "1",
+    "PLOW_SEG_SLICE_ALL": "1"
+  }
+}

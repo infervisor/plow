@@ -1,0 +1,4 @@
+TIMING rows=128 HD=256 median_us=255.072
+PASS FP8 rows=128 HD=256 KV=8 real=117 checked=4608 relL2=0.00456436 max_abs=0.00028288
+TIMING rows=128 HD=512 median_us=8436.608
+FAIL FP8 rows=128 HD=512 KV=1 real=117 checked=9216 relL2=0.0154525 max_abs=6.52491e-05

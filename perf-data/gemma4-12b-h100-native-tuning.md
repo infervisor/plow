@@ -898,3 +898,43 @@ for subsequent native candidates. [Evidence and hashes](gemma4-12b-h100-data/fp8
 include numerical/timing logs, compiler resource reports and the rejected
 residual patches. Whole-entry register/spill reports include other dispatch
 arms and must not be attributed entirely to the executed FP8 path.
+
+## Rejected FP8 KV staging through WGMMA
+
+Two native Q64/KV32 WGMMA prototypes reused the BF16 swizzled shared tiles
+with vector FP8 global loads. Applying row scales before BF16 conversion
+failed HD512/rows128 at relative L2 0.0161752; moving K scales to scores and
+V scales to probabilities failed at 0.0154525. The gate remains 0.015.
+Both passed the preceding HD256/rows128 case, then stopped at the failure.
+Nine-event HD512 medians were 7219.808 and 8436.608 µs, versus the earlier
+3527.392 µs control. This is a sequential screen, not an interleaved comparison.
+The test has 117 real rows with history endpoints 16384/8193.
+
+Both kernel patches were reverted. Neither candidate received full-ladder,
+sanitizer or serving qualification. These prototypes used ordinary FP8 loads,
+not TMA. [Logs, patches and object hashes](gemma4-12b-h100-data/fp8kv-wgmma-summary.json)
+retain the failed experiments. Reusing WGMMA alone did not improve this path.
+
+## B32 per-request chunk 2048 screen
+
+Recompiled the retained BF16 native-head B32 packet with
+`PLOW_MAX_REQUEST_CHUNK=2048`, keeping aggregate rows8192 and context20480.
+KV grows from30 to50GiB; the packet loads on H100 and its strict audit passes
+12programs/8904instructions/2736cases. Existing BF16 SMEPI objects are reused.
+Both candidate and fresh request1024 control pass serving consistency,
+cancellation, reuse, context rejection and output-count checks.
+
+| Input / concurrency | Control1024 tok/s | Candidate2048 tok/s | Control / candidate TTFT ms |
+|---|---:|---:|---:|
+| 1K / C1 | 75.85 | 75.65 | 77.17 / 81.28 |
+| 1K / C32 | 799.30 | 799.41 | 1593.37 / 1611.42 |
+| 16K / C1 | 45.45 | 46.89 | 1081.39 / 1002.67 |
+| 16K / C32 | 107.56 | 107.56 | 32470.39 / 32480.57 |
+
+Candidate then control, one repeat per cell after serving verification, no
+additional per-cell warmup,128 output tokens and cache disabled. All66 paired
+requests return identical text. This does not establish independent model
+quality. C32 throughput is unchanged; the lower16K/C1 TTFT needs repeated
+measurement before promotion. No C128 or fresh vLLM comparison was run.
+[Results, recipes, logs and hashes](gemma4-12b-h100-data/request2048-summary.json)
+retain the screen. The default remains unchanged.

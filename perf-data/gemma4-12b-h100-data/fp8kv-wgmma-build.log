@@ -1,0 +1,39 @@
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 4304 by compiler to allow use of registers in GMMA in function '_Z23interp_sm90a_pfpackedfa11PlowProgram'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 4313 by compiler to allow use of registers in GMMA in function '_Z23interp_sm90a_pfpackedfa11PlowProgram'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 4986 by compiler to allow use of registers in GMMA in function '_Z23interp_sm90a_pfpackedfa11PlowProgram'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 5019 by compiler to allow use of registers in GMMA in function '_Z23interp_sm90a_pfpackedfa11PlowProgram'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 5029 by compiler to allow use of registers in GMMA in function '_Z23interp_sm90a_pfpackedfa11PlowProgram'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 22969 by compiler to allow use of registers in GMMA in function '_Z23interp_sm90a_pfpackedfa11PlowProgram'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 22978 by compiler to allow use of registers in GMMA in function '_Z23interp_sm90a_pfpackedfa11PlowProgram'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 23651 by compiler to allow use of registers in GMMA in function '_Z23interp_sm90a_pfpackedfa11PlowProgram'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 23684 by compiler to allow use of registers in GMMA in function '_Z23interp_sm90a_pfpackedfa11PlowProgram'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 23694 by compiler to allow use of registers in GMMA in function '_Z23interp_sm90a_pfpackedfa11PlowProgram'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 18137 by compiler to allow use of registers in GMMA in function '_Z23interp_sm90a_pfpackedfa11PlowProgram'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 18146 by compiler to allow use of registers in GMMA in function '_Z23interp_sm90a_pfpackedfa11PlowProgram'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 18896 by compiler to allow use of registers in GMMA in function '_Z23interp_sm90a_pfpackedfa11PlowProgram'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 18932 by compiler to allow use of registers in GMMA in function '_Z23interp_sm90a_pfpackedfa11PlowProgram'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 18968 by compiler to allow use of registers in GMMA in function '_Z23interp_sm90a_pfpackedfa11PlowProgram'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 19004 by compiler to allow use of registers in GMMA in function '_Z23interp_sm90a_pfpackedfa11PlowProgram'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 19015 by compiler to allow use of registers in GMMA in function '_Z23interp_sm90a_pfpackedfa11PlowProgram'
+ptxas info    : (C7511) Potential Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register resources for the wgmma pipeline in the function '_Z23interp_sm90a_pfpackedfa11PlowProgram'
+ptxas info    : 80 bytes gmem
+ptxas info    : Compiling entry function '_Z23interp_sm90a_pfpackedfa11PlowProgram' for 'sm_90a'
+ptxas info    : Function properties for _Z23interp_sm90a_pfpackedfa11PlowProgram
+    440 bytes stack frame, 548 bytes spill stores, 1376 bytes spill loads
+ptxas info    : Used 255 registers, used 1 barriers, 440 bytes cumulative stack size, 32 bytes smem
+ptxas info    : Compile time = 2822.922 ms
+ptxas info    : Compiling entry function '_Z25plow_moe_slot_glu_fp8_blkP13__nv_bfloat16PKS_PKhPKyS6_jjjjj' for 'sm_90a'
+ptxas info    : Function properties for _Z25plow_moe_slot_glu_fp8_blkP13__nv_bfloat16PKS_PKhPKyS6_jjjjj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 0 barriers
+ptxas info    : Compile time = 12.560 ms
+ptxas info    : Compiling entry function '_Z27plow_moe_group_down_fp8_blkPfPK13__nv_bfloat16PKhPKyS6_jjjj' for 'sm_90a'
+ptxas info    : Function properties for _Z27plow_moe_group_down_fp8_blkPfPK13__nv_bfloat16PKhPKyS6_jjjj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 46 registers, used 0 barriers
+ptxas info    : Compile time = 8.680 ms
+ptxas info    : Compiling entry function '_Z26plow_moe_group_glu_fp8_blkP13__nv_bfloat16PKS_PKhPKyS6_jjjjjj' for 'sm_90a'
+ptxas info    : Function properties for _Z26plow_moe_group_glu_fp8_blkP13__nv_bfloat16PKS_PKhPKyS6_jjjjjj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 48 registers, used 0 barriers
+ptxas info    : Compile time = 12.788 ms
