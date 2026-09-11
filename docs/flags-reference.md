@@ -399,6 +399,7 @@ the 2026-09-04 audit that removed the rejected experiment knobs are in
 | `PLOW_GLM_XR_BAND` | `--glm-xr-band` | unset | Band count for a prefill TP seam (2..=8; unset/1 = the unbanded emit). |
 | `PLOW_GLM_XR_BAND_CUS` | `--glm-xr-band-cus` | unset | Restrict the banded seam to the first N of the seam's CU list. |
 | `PLOW_GLM_XR_RES` | `--glm-xr-res` | false | Fold the post-collective Residual into the two-shot all-gather. Bit-identical. |
+| `PLOW_GLM_DECODE_GLUE_CUS` | `--glm-decode-glue-cus` | false | Size the batched-decode glue packets to their work: the FP8 latent KV writer at one wave per row (was one workgroup for the whole rung), the router top-k at one workgroup per token, the MoE combine at one thread per element (were all 304 workgroups). Pure width changes, bit-identical; opt-in pending the C20 A/B. |
 | `GLM_FUSE_XRN` | `--glm-fuse-xrn` | false | Fuse the seam Residual+Norm into XReduceAddNorm (requires fuse_b1, tp>1). |
 | `PLOW_GLM_WGFIT` | `--glm-wgfit` | true | Narrow GLM dispatch to the workgroups that own work. DEFAULT ON (`=0` for the A/B control arm); the emitted arithmetic is unchanged either way. |
 
@@ -752,6 +753,9 @@ packet carries packed-prefill metadata.
 | `PLOW_MOE_DOWN_LANESPLIT`, `PLOW_MOE_DOWN_STAGE_FU` | 0 | `down` lane-split / staged fixups. |
 | `PLOW_MOE_ROUTER_WIDE` | 0 | wide router arm. |
 | `PLOW_MOE_COMBINE_ALLBLK` | 0 | all-block combine. |
+| `PLOW_COMBINE_VEC` / `PLOW_COMBINE_VEC_U` | 0 / 2 | AMD `d_moe_combine_pf` 8-wide arm (16 B loads, `_U` iterations in flight) for the `k == 1` combine every native-MoE / `PLOW_MOE_PF_DET` blob emits. Bit-identical (same operands, same order, one rounding). Opt-in build axis (`PLOW_HSACO_EXTRA_DEFINES`), pending the 8-GPU A/B. |
+| `PLOW_RN_ROWS` | 1 | AMD `d_rmsnorm` multi-row arm: R rows' loads issued before any row is reduced (prefill norms hand each workgroup ~27 rows and paid one HBM round trip per row). Same per-thread element map and reduction tree — bit-identical. Opt-in build axis. |
+| `PLOW_RESID_U` | 1 | AMD `d_residual` unroll: U iterations of loads in flight. Bit-identical. Opt-in build axis. |
 
 ### Scheduling, sync, occupancy
 

@@ -3579,8 +3579,16 @@ pub(crate) fn emit_glm_mla(
         !(fp8kv && dbatch > 1 && !c.dsa(ctx)),
         "batched GLM FP8 KV requires the qualified sparse AMD decode path"
     );
+    // PLOW_GLM_DECODE_GLUE_CUS: the fp8 writer is one WAVE per row (`d_headnorm_rope_fp8`
+    // strides `w` by `nblk*PLOW_WAVES`), so at rows > 8 one workgroup serialises rows; size it
+    // like the k-rope beside it. Bit-identical: only the row->wave partition moves.
+    let kvw_cus = if emit_config::active().glm_decode_glue_cus {
+        rope_cus(&all, 0, rows, 1)
+    } else {
+        one.clone()
+    };
     let c_rnkv = if fp8kv {
-        b.emit(DevOp::HeadNormRopeFp8, one.clone(), &[c_ckvd], |d| {
+        b.emit(DevOp::HeadNormRopeFp8, kvw_cus, &[c_ckvd], |d| {
             d.t[0] = n.ckv[slot];
             d.t[1] = n.ckvraw;
             d.t[2] = w.gkva;
@@ -6761,7 +6769,21 @@ fn emit_glm_moe_ffn_rows(
         );
     }
     let det = !flat && moe_pf_fuse(tk) == MoePfFuse::Det;
-    let c_router = b.emit(DevOp::MoeRouterTopkPf, all.clone(), &[c_score], |d| {
+    // PLOW_GLM_DECODE_GLUE_CUS: the top-k tail is block-per-token, so `rows` workgroups is
+    // its saturation point (the prefill twin already sizes it so); the combine saturates at
+    // one thread per element (`elem_cus`). Both are pure narrowings, bit-identical.
+    let glue_cus = emit_config::active().glm_decode_glue_cus;
+    let router_cus: Vec<u32> = if glue_cus {
+        (0..rows.min(b.n_cu())).collect()
+    } else {
+        all.clone()
+    };
+    let combine_cus = if glue_cus {
+        elem_cus(&all, rows * h)
+    } else {
+        all.clone()
+    };
+    let c_router = b.emit(DevOp::MoeRouterTopkPf, router_cus, &[c_score], |d| {
         d.t[0] = n.tab;
         d.t[1] = n.rlogit;
         d.t[3] = w.bias;
@@ -6978,7 +7000,7 @@ fn emit_glm_moe_ffn_rows(
     // AddNorm (or Residual), exactly as the single-row decode block ends.
     let no_xr = tp > 1 && emit_config::active().no_xreduce;
     if tp > 1 && !no_xr {
-        let c_cmb = b.emit(DevOp::MoeCombinePf, all.clone(), &[c_shd, c_d], |d| {
+        let c_cmb = b.emit(DevOp::MoeCombinePf, combine_cus, &[c_shd, c_d], |d| {
             d.t[0] = n.dg_tp;
             d.t[1] = TENSOR_NONE; // residual rides AFTER the all-reduce (else summed tp times)
             d.t[2] = if raw_output { n.attn } else { n.shared };

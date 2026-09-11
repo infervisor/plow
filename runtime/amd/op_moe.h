@@ -4827,6 +4827,15 @@ extern "C" __device__ unsigned plow_moe_pf_atomic_arm = 1;
 extern "C" __device__ unsigned plow_moe_pf_det_arm = 1;
 #endif
 
+/* -DPLOW_COMBINE_VEC=1: the 8-wide arm of d_moe_combine_pf below; PLOW_COMBINE_VEC_U rows of
+ * 16 B loads in flight per thread. Default off: the shipped object is byte-identical. */
+#ifndef PLOW_COMBINE_VEC
+#define PLOW_COMBINE_VEC 0
+#endif
+#ifndef PLOW_COMBINE_VEC_U
+#define PLOW_COMBINE_VEC_U 2
+#endif
+
 /* --- op 87: T-TOKEN COMBINE (PLOW_DOP_MOE_COMBINE_PF) --------------------------------------
  * out[t] = residual[t] + shared[t] + Σ_slot part[t*k + slot], f32 accumulate in FIXED slot
  * order — the same expression and the same order as the decode d_moe_combine, so at T=1 this
@@ -4847,6 +4856,76 @@ __device__ void d_moe_combine_pf(bf16* out, const bf16* residual, const bf16* sh
     const size_t gid = (size_t)slice * PLOW_THREADS + threadIdx.x;
     const size_t stride = (size_t)nblk * PLOW_THREADS;
     const bf16* part_h = (const bf16*)part; /* part16: DOWN scattered bf16, same slot layout */
+#if PLOW_COMBINE_VEC
+    /* 8-WIDE ARM (-DPLOW_COMBINE_VEC=1, k == 1 only, so `part` is one contiguous [T*H] stream —
+     * every native-MoE and PLOW_MOE_PF_DET blob). The scalar loop below issues ONE 2 B or 4 B load
+     * per operand per iteration and waits on it: at T=8192/H=6144 that is 323 dependent HBM
+     * round trips per thread, 0.44 ms for 300-400 MB (0.9 TB/s). This arm loads 16 B per operand,
+     * U iterations ahead. Per element the f32 sum is the SAME operands in the SAME order
+     * (residual, shared, part) rounded once, so it is bit-identical to the scalar loop. */
+    if (k == 1u && (H & 7u) == 0u
+#if PLOW_MOE_PF_DET
+        && !det
+#endif
+    ) {
+        constexpr unsigned U = PLOW_COMBINE_VEC_U;
+        const size_t vt = total >> 3;
+        const auto* rg = as_glob(residual);
+        const auto* sg = as_glob(shared);
+        const auto* ph = as_glob(part_h);
+        const float4* pf = (const float4*)part;
+        auto* og = as_glob(out);
+        auto body = [&](size_t v, const bf16v8& vr, const bf16v8& vs, const bf16v8& vp,
+                        const float4& f0, const float4& f1) {
+            const float pfv[8] = {f0.x, f0.y, f0.z, f0.w, f1.x, f1.y, f1.z, f1.w};
+            bf16v8 o;
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                float acc = residual ? bf2f(vr[j]) : 0.0f;
+                if (shared) acc += bf2f(vs[j]);
+                acc += part16 ? bf2f(vp[j]) : pfv[j];
+                o[j] = f2bf(acc);
+            }
+            st_glob8(og + v * 8, o);
+        };
+        size_t v = gid;
+        for (; v + (U - 1) * stride < vt; v += U * stride) {
+            bf16v8 vr[U], vs[U], vp[U];
+            float4 f0[U], f1[U];
+#pragma unroll
+            for (unsigned u = 0; u < U; u++) {
+                const size_t e = (v + u * stride) * 8;
+                vr[u] = residual ? ld_glob8(rg + e) : bf16v8_zero();
+                vs[u] = shared ? ld_glob8(sg + e) : bf16v8_zero();
+                if (part16) {
+                    vp[u] = ld_glob8(ph + e);
+                    f0[u] = f1[u] = make_float4(0.f, 0.f, 0.f, 0.f);
+                } else {
+                    vp[u] = bf16v8_zero();
+                    f0[u] = pf[(v + u * stride) * 2];
+                    f1[u] = pf[(v + u * stride) * 2 + 1];
+                }
+            }
+#pragma unroll
+            for (unsigned u = 0; u < U; u++) body(v + u * stride, vr[u], vs[u], vp[u], f0[u], f1[u]);
+        }
+        for (; v < vt; v += stride) {
+            const size_t e = v * 8;
+            const bf16v8 vr = residual ? ld_glob8(rg + e) : bf16v8_zero();
+            const bf16v8 vs = shared ? ld_glob8(sg + e) : bf16v8_zero();
+            bf16v8 vp = bf16v8_zero();
+            float4 f0 = make_float4(0.f, 0.f, 0.f, 0.f), f1 = f0;
+            if (part16) {
+                vp = ld_glob8(ph + e);
+            } else {
+                f0 = pf[v * 2];
+                f1 = pf[v * 2 + 1];
+            }
+            body(v, vr, vs, vp, f0, f1);
+        }
+        return;
+    }
+#endif
     for (size_t i = gid; i < total; i += stride) {
         const unsigned tok = (unsigned)(i / H), h = (unsigned)(i - (size_t)tok * H);
         float acc = residual ? bf2f(residual[i]) : 0.0f; /* optional — see d_moe_combine */

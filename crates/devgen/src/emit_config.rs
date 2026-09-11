@@ -752,6 +752,12 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_XR_RES", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_xr_res: bool,
 
+    /// Size the batched-decode glue packets to their work items: the FP8 latent KV writer at one
+    /// wave per row instead of one workgroup, the router top-k at one workgroup per token, the
+    /// MoE combine at one thread per element. Pure width changes, bit-identical.
+    #[arg(long, env = "PLOW_GLM_DECODE_GLUE_CUS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_decode_glue_cus: bool,
+
     /// Fuse the seam Residual+Norm into XReduceAddNorm (requires fuse_b1, tp>1).
     #[arg(long, env = "GLM_FUSE_XRN", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_fuse_xrn: bool,
@@ -1169,6 +1175,7 @@ impl EmitConfig {
             attnres_decode_mwg: env_u32("PLOW_ATTNRES_DECODE_MWG"),
             glm_xr_band_seam: env_str("PLOW_GLM_XR_BAND_SEAM"),
             glm_xr_res: env_bool("PLOW_GLM_XR_RES"),
+            glm_decode_glue_cus: env_bool("PLOW_GLM_DECODE_GLUE_CUS"),
             glm_fuse_xrn: env_bool("GLM_FUSE_XRN"),
             xr_combine_fold: env_opt_out("PLOW_XR_COMBINE_FOLD"),
             kda_fb_fold: env_bool("PLOW_KDA_FB_FOLD"),

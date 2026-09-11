@@ -166,6 +166,10 @@ fi
 # read the knobs this block fills. `cfg_get` reads one `#define NAME value` line; the header
 # is machine-written (devgen::manifest::config_header), so the grammar is exactly that.
 CFG=""; AX_CONFIG=""; AX_CONFIG_JSON=""
+# PLOW_HSACO_EXTRA_DEFINES="-DX=1 ...": raw -D appended to EVERY row, for an opt-in kernel-arm
+# A/B whose header default is the shipped body (e.g. -DPLOW_COMBINE_VEC=1 -DPLOW_RN_ROWS=2).
+# Recorded in build_defines.json beside AX_CONFIG so the contract audit sees the axis.
+AX_EXTRA="${PLOW_HSACO_EXTRA_DEFINES:-}"
 if [ -n "${PLOW_HSACO_CONFIG:-}" ]; then
   CFG="$PLOW_HSACO_CONFIG"
   [ -d "$CFG" ] && CFG="$CFG/plow_config.h"
@@ -1388,7 +1392,7 @@ for row in "${ROWS[@]}"; do rm -f "${row%%|*}.elf" "${row%%|*}.co"; done
 one() {  # <stem> <axes...>
   local stem="$1"; shift
   if ! "$HIPCC" --offload-arch="$ARCH" -O3 -w -DPLOW_ARCH_SUFFIX="$ARCH" \
-        $* $AX_CONFIG --genco "$R/amd/interp.hip" -o "$stem.co" $INC > "$stem.log" 2>&1; then
+        $* $AX_CONFIG $AX_EXTRA --genco "$R/amd/interp.hip" -o "$stem.co" $INC > "$stem.log" 2>&1; then
     echo "FAIL  $stem"; tail -20 "$stem.log"; return 1
   fi
   "$BUN" --unbundle --type=o --targets="hipv4-amdgcn-amd-amdhsa--$ARCH" \
@@ -1396,7 +1400,7 @@ one() {  # <stem> <axes...>
   rm -f "$stem.co" "$stem.log"
   echo "ok    $stem"
 }
-export -f one; export HIPCC ARCH R INC BUN AX_CONFIG
+export -f one; export HIPCC ARCH R INC BUN AX_CONFIG AX_EXTRA
 
 # test_kernels.elf is STARTED HERE, alongside the row batch, and waited on after it.
 # It shares no input with the rows and nothing between here and the wait consumes it, so
@@ -1455,7 +1459,7 @@ fi
       *) gq_axes="$axes $AX_GQ" ;;
     esac
     for pair in "$stem|$axes" "${stem}_gq|$gq_axes"; do
-      printf '%s "%s": "-DPLOW_ARCH_SUFFIX=%s%s %s"' "$sep" "${pair%%|*}" "$ARCH" "$AX_CONFIG_JSON" "$(echo ${pair#*|})"
+      printf '%s "%s": "-DPLOW_ARCH_SUFFIX=%s%s %s%s"' "$sep" "${pair%%|*}" "$ARCH" "$AX_CONFIG_JSON" "$(echo ${pair#*|})" "${AX_EXTRA:+ $AX_EXTRA}"
       sep=$',\n'
     done
   done
