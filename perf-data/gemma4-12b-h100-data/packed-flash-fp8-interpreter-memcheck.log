@@ -1,0 +1,10 @@
+========= COMPUTE-SANITIZER
+========= Program hit CUDA_ERROR_NOT_FOUND (error 500) due to "named symbol not found" on CUDA API call to cuModuleGetGlobal_v2.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: run_interpreter(std::vector<void*, std::allocator<void*> > const&, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int) [0x9c8f] in packed-flash-fp8-interpreter
+=========         Host Frame: void check<256>(unsigned int, unsigned int, unsigned int) [clone .constprop.0] [0xb17f] in packed-flash-fp8-interpreter
+=========         Host Frame: main [0x8f64] in packed-flash-fp8-interpreter
+=========
+cuModuleGetGlobal(&ptr, &bytes, module, name) failed
+========= Target application returned an error
+========= ERROR SUMMARY: 1 error

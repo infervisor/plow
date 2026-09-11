@@ -325,3 +325,26 @@ are whole-entry compiler totals, not executed writer-path measurements.
 Compiler and packet-level BF16-only request-limit guards remain in place.
 This prepares stale-object rejection; it does not enable FP8 request limits,
 qualify loaded GPU execution or demonstrate a throughput improvement.
+
+## Loaded FP8 writer and attention checks
+
+Both probes now accept an optional cubin path. Build with `-lcuda` to enable
+driver loading. The writer probe targets the packed light interpreter; the
+attention probe targets the packed FA interpreter. They read the exported
+arena size and four request/padding capabilities, then execute a synthetic
+single-op packet with 132 work slices, a satisfied dependency and a completion
+counter. Each test requires all 132 completions.
+
+The loaded FP8 writer passes 12 cases across six rungs and both head
+geometries, matching every real byte and scale against the unpadded standalone
+body and preserving all inactive sentinels. The loaded FP8 attention passes
+all 12 numerical cases against the FP64 reference, exercising its tagged
+request handle and separate scale operands. All outputs are finite and
+padding is zero. Both loaded-object runs pass memcheck with zero errors.
+
+The first FA build lacked exported arena metadata and was rejected before
+launch; rebuilding with `PLOW_NV_EMBED_SMEM=1` fixed the setup. Its entry uses
+255 registers, 256 stack bytes and 352/584 spill-store/load bytes. These are
+compiler totals, not measured performance. The tests use synthetic single-op
+packets; full-model FP8 request-limit compilation, serving and B64 remain
+unqualified. [Logs, object hashes and scope](gemma4-12b-h100-data/fp8-loaded-ops-summary.json).

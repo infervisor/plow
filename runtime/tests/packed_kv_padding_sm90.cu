@@ -1,3 +1,4 @@
+#include <cuda.h>
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cmath>
@@ -5,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#include "dev_isa.h"
 
 #define PLOW_NV_HOPPER 1
 #define PLOW_NV_GEMMA 1
@@ -16,12 +18,64 @@
 using bf16 = __nv_bfloat16;
 #define CK(call) do { const auto e = (call); if (e != cudaSuccess) { \
     std::fprintf(stderr, "%s: %s\n", #call, cudaGetErrorString(e)); std::exit(2); } } while (0)
+#define CD(call) do { if ((call) != CUDA_SUCCESS) { \
+    std::fprintf(stderr, "%s failed\n", #call); std::exit(2); } } while (0)
+static const char* writer_image = nullptr;
 
 template<class T> static T* upload(const std::vector<T>& host) {
     T* device;
     CK(cudaMalloc(&device, host.size() * sizeof(T)));
     CK(cudaMemcpy(device, host.data(), host.size() * sizeof(T), cudaMemcpyHostToDevice));
     return device;
+}
+
+static void run_writer(const std::vector<void*>& tensors, unsigned rows, unsigned heads,
+                       unsigned hd, unsigned stride) {
+    CUmodule module; CUfunction function;
+    CD(cuModuleLoad(&module, writer_image));
+    CD(cuModuleGetFunction(&function, module, "_Z24interp_sm90a_pfpackedseg11PlowProgram"));
+    auto global = [&](const char* name) {
+        CUdeviceptr ptr; size_t bytes; unsigned value;
+        CD(cuModuleGetGlobal(&ptr, &bytes, module, name));
+        if (bytes != sizeof(value)) std::exit(2);
+        CD(cuMemcpyDtoH(&value, ptr, bytes)); return value;
+    };
+    if (global("plow_pf_request_abi") != 2 || global("plow_pf_fp8_request_abi") != 1 ||
+        global("plow_pf_masked_padding_abi") != 1 || global("plow_pf_fp8_masked_padding_abi") != 1)
+        std::exit(2);
+    const unsigned smem = global("plow_arena_bytes_pfpackedseg");
+    CD(cuFuncSetAttribute(function, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem));
+    std::vector<void*> allocations;
+    auto put = [&](const auto& host) {
+        auto* p = upload(host); allocations.push_back(p); return p;
+    };
+    constexpr unsigned blocks = 132;
+    PlowDevInst inst{};
+    inst.op = PLOW_DOP_HEADNORM_ROPE_FP8; inst.blocks = blocks;
+    for (unsigned t = 0; t < 8; ++t) inst.t[t] = t;
+    inst.i[0] = rows; inst.i[1] = heads; inst.i[2] = hd;
+    inst.fj[0].f = 1e-6f; inst.fj[1].u = stride; inst.fj[2].u = 2047;
+    std::vector<PlowStreamEnt> stream(blocks);
+    for (unsigned i = 0; i < blocks; ++i) {
+        stream[i].slice = i; stream[i].wait_len = 1; stream[i].succ_len = 1;
+    }
+    PlowProgram prog{};
+    prog.insts = put(std::vector<PlowDevInst>{inst});
+    prog.tensors = put(tensors); prog.gq_stream = put(stream);
+    prog.gq_seg_ofs = put(std::vector<unsigned>{0, blocks});
+    prog.gq_cursor = put(std::vector<unsigned>(PLOW_CTR_STRIDE));
+    prog.waits = put(std::vector<PlowWait>{{0, blocks}});
+    prog.succs = put(std::vector<unsigned>{1});
+    std::vector<unsigned> counters(2 * PLOW_CTR_STRIDE); counters[0] = blocks;
+    prog.counters = put(counters);
+    void* args[]{&prog};
+    CD(cuLaunchKernel(function, blocks, 1, 1, 256, 1, 1, smem, nullptr, args, nullptr));
+    CK(cudaDeviceSynchronize());
+    unsigned completed;
+    CK(cudaMemcpy(&completed, PLOW_CTR(prog.counters, 1), sizeof(completed), cudaMemcpyDeviceToHost));
+    if (completed != blocks) { std::fprintf(stderr, "incomplete writer counter\n"); std::exit(1); }
+    for (void* p : allocations) CK(cudaFree(p));
+    CD(cuModuleUnload(module));
 }
 
 template<int HD>
@@ -104,8 +158,11 @@ template<int HD> static void check_fp8(unsigned rows, unsigned heads) {
     write_fp8_rows<HD><<<132, PLOW_NV_THREADS>>>(dref, drscale, dx, dg, dc, dn, dp, ds,
                                                real_rows, heads, stride);
     CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
-    write_fp8_rows<HD><<<132, PLOW_NV_THREADS>>>(dout, dscale, dx, dg, dc, dn, dp, ds,
-                                               rows, heads, stride);
+    if (writer_image)
+        run_writer({dout, dx, dg, dc, dn, dp, dscale, ds}, rows, heads, HD, stride);
+    else
+        write_fp8_rows<HD><<<132, PLOW_NV_THREADS>>>(dout, dscale, dx, dg, dc, dn, dp, ds,
+                                                  rows, heads, stride);
     CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
     CK(cudaMemcpy(got.data(), dout, got.size(), cudaMemcpyDeviceToHost));
     CK(cudaMemcpy(expected.data(), dref, expected.size(), cudaMemcpyDeviceToHost));
@@ -131,7 +188,9 @@ template<int HD> static void check_fp8(unsigned rows, unsigned heads) {
                 rows, HD, heads);
 }
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc > 2) return 2;
+    if (argc == 2) writer_image = argv[1];
     for (unsigned rows : {128, 512, 1024, 2048, 4096, 8192}) {
         check<256>(rows, 8);
         check<512>(rows, 1);

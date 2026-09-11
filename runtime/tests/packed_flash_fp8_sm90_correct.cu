@@ -1,3 +1,4 @@
+#include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -6,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
+#include "dev_isa.h"
 
 #define PLOW_NV_HOPPER 1
 #define PLOW_FP8_KV 1
@@ -19,11 +21,64 @@
 using bf16 = __nv_bfloat16;
 #define CK(call) do { auto e = (call); if (e != cudaSuccess) { \
     std::fprintf(stderr, "%s: %s\n", #call, cudaGetErrorString(e)); std::exit(2); } } while (0)
+#define CD(call) do { if ((call) != CUDA_SUCCESS) { \
+    std::fprintf(stderr, "%s failed\n", #call); std::exit(2); } } while (0)
+static const char* interpreter_image = nullptr;
 template<class T> static T* upload(const std::vector<T>& v) {
     T* p; CK(cudaMalloc(&p, v.size() * sizeof(T)));
     CK(cudaMemcpy(p, v.data(), v.size() * sizeof(T), cudaMemcpyHostToDevice)); return p;
 }
 static float decode(uint8_t v) { __nv_fp8_e4m3 f; f.__x = v; return float(f); }
+
+static void run_interpreter(const std::vector<void*>& tensors, unsigned rows, unsigned hd,
+                            unsigned kvheads, unsigned stride, unsigned mask, unsigned window) {
+    CUmodule module; CUfunction function;
+    CD(cuModuleLoad(&module, interpreter_image));
+    CD(cuModuleGetFunction(&function, module, "_Z23interp_sm90a_pfpackedfa11PlowProgram"));
+    auto global = [&](const char* name) {
+        CUdeviceptr ptr; size_t bytes; unsigned value;
+        CD(cuModuleGetGlobal(&ptr, &bytes, module, name));
+        if (bytes != sizeof(value)) std::exit(2);
+        CD(cuMemcpyDtoH(&value, ptr, bytes)); return value;
+    };
+    if (global("plow_pf_request_abi") != 2 || global("plow_pf_fp8_request_abi") != 1 ||
+        global("plow_pf_masked_padding_abi") != 1 || global("plow_pf_fp8_masked_padding_abi") != 1)
+        std::exit(2);
+    const unsigned smem = global("plow_arena_bytes_pfpackedfa");
+    CD(cuFuncSetAttribute(function, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem));
+    std::vector<void*> allocations;
+    auto put = [&](const auto& host) {
+        auto* p = upload(host); allocations.push_back(p); return p;
+    };
+    constexpr unsigned blocks = 132;
+    PlowDevInst inst{};
+    inst.op = PLOW_DOP_FLASH_PREFILL_FP8; inst.blocks = blocks;
+    for (unsigned t = 0; t < 8; ++t) inst.t[t] = t;
+    inst.i[0] = rows; inst.i[1] = 16384; inst.i[2] = 16; inst.i[3] = kvheads;
+    inst.i[4] = (1u << 31) | 8u; inst.i[5] = window; inst.i[6] = hd; inst.i[7] = 1;
+    inst.fj[0].f = 1.0f / sqrtf(float(hd)); inst.fj[1].u = stride; inst.fj[2].u = mask;
+    std::vector<PlowStreamEnt> stream(blocks);
+    for (unsigned i = 0; i < blocks; ++i) {
+        stream[i].slice = i; stream[i].wait_len = 1; stream[i].succ_len = 1;
+    }
+    PlowProgram prog{};
+    prog.insts = put(std::vector<PlowDevInst>{inst});
+    prog.tensors = put(tensors); prog.gq_stream = put(stream);
+    prog.gq_seg_ofs = put(std::vector<unsigned>{0, blocks});
+    prog.gq_cursor = put(std::vector<unsigned>(PLOW_CTR_STRIDE));
+    prog.waits = put(std::vector<PlowWait>{{0, blocks}});
+    prog.succs = put(std::vector<unsigned>{1});
+    std::vector<unsigned> counters(2 * PLOW_CTR_STRIDE); counters[0] = blocks;
+    prog.counters = put(counters);
+    void* args[]{&prog};
+    CD(cuLaunchKernel(function, blocks, 1, 1, 256, 1, 1, smem, nullptr, args, nullptr));
+    CK(cudaDeviceSynchronize());
+    unsigned completed;
+    CK(cudaMemcpy(&completed, PLOW_CTR(prog.counters, 1), sizeof(completed), cudaMemcpyDeviceToHost));
+    if (completed != blocks) { std::fprintf(stderr, "incomplete attention counter\n"); std::exit(1); }
+    for (void* p : allocations) CK(cudaFree(p));
+    CD(cuModuleUnload(module));
+}
 
 template<int HD>
 __global__ void attention(const int* req, float* partial, float* stats, const bf16* q,
@@ -63,8 +118,12 @@ template<int HD> static void check(unsigned rows, unsigned kvheads, unsigned win
     CK(cudaMemset(out, 0xff, got.size() * sizeof(bf16)));
     constexpr unsigned smem = FA_PRE_SMEM_FLOATS(HD, HD == 256 ? 64 : 32, HD == 256 ? 32 : 16) * sizeof(float);
     CK(cudaFuncSetAttribute(attention<HD>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
-    attention<HD><<<132,256,smem>>>(dr, partial, stats, dq, dk, dv, out, dks, dvs,
-                                  rows, kvheads, stride, mask, window);
+    if (interpreter_image)
+        run_interpreter({partial, stats, dq, dk, dv, out, dks, dvs, dr},
+                        rows, HD, kvheads, stride, mask, window);
+    else
+        attention<HD><<<132,256,smem>>>(dr, partial, stats, dq, dk, dv, out, dks, dvs,
+                                      rows, kvheads, stride, mask, window);
     CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
     CK(cudaMemcpy(got.data(), out, got.size() * sizeof(bf16), cudaMemcpyDeviceToHost));
     bool ok = true;
@@ -113,7 +172,9 @@ template<int HD> static void check(unsigned rows, unsigned kvheads, unsigned win
                    static_cast<void*>(out), static_cast<void*>(partial), static_cast<void*>(stats)}) CK(cudaFree(p));
     if (!ok) std::exit(1);
 }
-int main() {
+int main(int argc, char** argv) {
+    if (argc > 2) return 2;
+    if (argc == 2) interpreter_image = argv[1];
     for (unsigned rows : {128,512,1024,2048,4096,8192}) {
         check<256>(rows,8,1024);
         check<512>(rows,1,0);

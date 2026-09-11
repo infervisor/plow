@@ -1,0 +1,66 @@
+{
+  "model": "google/gemma-4-12B-it",
+  "architecture": "sm_90a",
+  "scope": "Loaded packed FP8 writer and attention, synthetic single-op packets",
+  "checks": {
+    "loaded_writer_cases": 12,
+    "loaded_attention_cases": 12,
+    "writer_memcheck_errors": 0,
+    "attention_memcheck_errors": 0,
+    "completion_count_per_case": 132,
+    "standalone_writer_bf16_fp8_cases": 24,
+    "standalone_attention_cases": 12
+  },
+  "objects": {
+    "interp-sm90a-fp8kv-masked-light.cubin": "1a89233259f101e6799f003f99e879dbac955914b9c9e63f16db90188f30fecf",
+    "interp-sm90a-fp8kv-masked-fa.cubin": "3fdd6d5052992b29e0585c5c1bfda9239afd6df2763bb924494236332e8a08e4",
+    "packed-kv-fp8-interpreter": "c2dba9c149db1cf0c8820862072f85d68d3ef3a93a80ec1f44df7dd14e88f449",
+    "packed-flash-fp8-interpreter": "f2a83325d49150583ff42ab1075d89e285d6c056c0d54f390e7162c5b802fdae"
+  },
+  "sources": {
+    "runtime/tests/packed_kv_padding_sm90.cu": "f8a583601989371f54d89f27c4241c3baac8d380bdc4d60421d67b009990828d",
+    "runtime/tests/packed_flash_fp8_sm90_correct.cu": "0d65829fc78ac95d14c6b4c54c26591a0fd865bbccccc0cc7e4340adf327f794"
+  },
+  "files": {
+    "packed-kv-fp8-interpreter-memcheck.log": {
+      "source_sha256": "37dc939b52e65107b87d04c6271eda7c130d5903ece1a545c72fb522377fa4c5",
+      "archive_sha256": "37dc939b52e65107b87d04c6271eda7c130d5903ece1a545c72fb522377fa4c5"
+    },
+    "packed-kv-fp8-interpreter-body.log": {
+      "source_sha256": "2521313b32f25f8b7f1f89c558400f868353719d02d726e806750abcb4cc8877",
+      "archive_sha256": "2521313b32f25f8b7f1f89c558400f868353719d02d726e806750abcb4cc8877"
+    },
+    "packed-kv-fp8-interpreter-build.log": {
+      "source_sha256": "cc1b70791214e2a21f8df05316890f9a6e733cef103f38ca70fec9b65815de31",
+      "archive_sha256": "d7a6b3f14185714cc4deb2695b71606dad18c2f1c89d3dd5553984c7cbf91c08"
+    },
+    "packed-flash-fp8-interpreter-body.log": {
+      "source_sha256": "44815938ee7a7f6cb79d75e3f8f2b2050c8362b21b5948487e3cef63d3afbcb5",
+      "archive_sha256": "44815938ee7a7f6cb79d75e3f8f2b2050c8362b21b5948487e3cef63d3afbcb5"
+    },
+    "packed-flash-fp8-interpreter-build.log": {
+      "source_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "archive_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "packed-flash-fp8-interpreter-memcheck-final.log": {
+      "source_sha256": "852143e2b80ae809672942b3a2dc5bbfa3bf68205b5b2f1a466506dbf59c39e8",
+      "archive_sha256": "852143e2b80ae809672942b3a2dc5bbfa3bf68205b5b2f1a466506dbf59c39e8"
+    },
+    "packed-flash-fp8-interpreter-memcheck.log": {
+      "source_sha256": "1c2b653f9dd856efb74afc51a1c6ef74383dba69a338bce5e899868e6a72f9c3",
+      "archive_sha256": "d88edfb4e850bc0212dbc85f8f00d6ec4e1e8645bced3bb1a4ff613f64b4a90f"
+    },
+    "fp8-masked-fa-build.log": {
+      "source_sha256": "ac768396c3965b9d3d1c84cfb1f2c309f95eb89c44cc4d7a4009a617f8b600a6",
+      "archive_sha256": "ac768396c3965b9d3d1c84cfb1f2c309f95eb89c44cc4d7a4009a617f8b600a6"
+    }
+  },
+  "limits": [
+    "Writer real KV bytes/scales match standalone unpadded reference exactly; all other bytes/scales retain sentinels.",
+    "Attention compares sampled outputs to FP64 on stored FP8KV*FP32scales and BF16Q; all outputs finite and padding zero.",
+    "Packet uses132slices with one satisfied dependency and one successor; not whole-model scheduling or performance measurement.",
+    "First FA build missed PLOW_NV_EMBED_SMEM=1, loader rejected missing arena symbol before kernel launch; final build/check passes.",
+    "No new racecheck or serving benchmark; compiler and packet FP8 request-limit guards remain.",
+    "Log trailing whitespace removed; original hashes retained."
+  ]
+}
