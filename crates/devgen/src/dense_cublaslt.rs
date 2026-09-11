@@ -44,7 +44,9 @@ pub(crate) fn apply_native(
     {
         return Err("native decode object requires transposed ABI1".into());
     }
-    if model.prog_t.iter().any(|&m| m == 32)
+    if model.prog_t[packet::devbuild::decode_rung_lo(&model.prog_t)..]
+        .iter()
+        .any(|&m| m == 32)
         && plow_asset::cubin::global_u32(&image, "plow_gemv_transposed_max_rows") != Some(32)
     {
         return Err("native decode object has no B32 capability".into());
@@ -274,6 +276,8 @@ mod tests {
             .err()
             .expect("missing B32 capability")
             .contains("B32 capability"));
+        let mut prefill_32 = model_rows(&[32, 128, 1, 16]);
+        assert!(apply_native(&mut prefill_32, &directory.join("model.pkt")).is_ok());
         let wide_image = plow_asset::cubin::synthetic_elf(
             "plow_gemv_bf16_m32_bk128_s3",
             &[
