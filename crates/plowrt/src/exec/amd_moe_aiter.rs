@@ -85,8 +85,10 @@ pub(super) fn routes(
         } else {
             [prog.t, 6144, 256, 256, 8, 64, inst.i[6], u32::from(resident)]
         };
-        if prog.packed_prefill_only
-            || !(if flat {
+        // A packed-prefill sibling carries this instruction unchanged: the kernel is
+        // row-agnostic over the dense live rows (the align maps sort real tokens; parked rows
+        // route to nothing a live row reads), which is what lets the packet pack requests.
+        if !(if flat {
                 matches!(prog.t, 2 | 4 | 8) || (resident && matches!(prog.t, 1 | 16 | 20))
             } else {
                 (1..=8192).contains(&prog.t)
@@ -881,7 +883,7 @@ mod tests {
         for bad in 0..10 {
             let (mut p, mut t) = fixture();
             match bad {
-                0 => p.packed_prefill_only = true,
+                0 => p.t = 0,
                 1 => p.insts[1].i[2] = 512,
                 2 => p.insts[0].t[2] = 6,
                 3 => p.insts[0].i[3] = 1,

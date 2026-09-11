@@ -6,6 +6,7 @@ pub mod mdq;
 pub mod multistep;
 pub mod prefill;
 pub mod rungs;
+pub mod step;
 
 use crate::asset::{Bucket, ModelBundle, Phase};
 use crate::exec::counters::CounterPool;

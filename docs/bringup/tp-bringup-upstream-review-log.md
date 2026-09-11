@@ -89,6 +89,17 @@ Baseline for the target workload, HEAD runtime + frozen TP8 packet + serving-saf
 Merged agent work (opt-in, shipped defaults byte-identical): `PLOW_GLM_GEMM_LT_DECODE_EXT` (decode rung 8 + five narrow shapes to the pinned Tensile kernels; −7.5 ms/step standalone at rows 20, −9 ms at rung 8); DSA select load batching (rows 20: 268 → 146 µs at 65k) and sparse decode split policy (rows 20 ns16 → ns4: 169 → 108 µs) — the latter two need a re-emit / decode object rebuild and the 8-GPU A/B before any default changes. Reports: `/root/.claude/jobs/c08d1232/tmp/reports/{gemm-gemv-ladder,attention-ladder,emit-object-contract}.md`.
 
 
+## Continuous batching by default (2026-09-11, `worktree-agent-a182a4b057a0ad61d`)
+
+| Piece | Where | State |
+|---|---|---|
+| Emit: packed siblings beside native AITER MoE / hipBLASLt / resident MoE; index-TP assert on the builder topology; sparse buckets skipped; `glm_small_pf_split_cap` per builder so ordinary programs stay byte-identical; GLM gfx942 emits siblings by default (`production_default`) | `devgen/mla.rs`, `devgen/lib.rs`, `packet/devbuild.rs`, `glm_tests.rs` | landed, unit-pinned (two-emit comparison) |
+| Runtime: `packed_mla_compatible` mirrors the body predicate; native AITER MoE / hipBLASLt / MLA-fold routes accept `packed_prefill_only`; route follows the packet, missing family object = load error by name; `_fp8kv` packed objects in `build_gfx942.sh` | `exec/amd.rs`, `exec/amd_{moe_aiter,gemm_lt,mla_fold}.rs`, `scripts/build_gfx942.sh` | landed; sibling-packet device qual pending (first load refused at the AITER route, fixed) |
+| Scheduler: backend-neutral step planner (`plan(backend, tick, decodes, candidates)`), `ServeEngine::step_backend` per backend, the `SeqEngine` arm and the CUDA pass lower its plan; `PLOW_PF_INTERLEAVE` unset = widest rung on AMD, `PLOW_PF_BATCH` unset = on (oldest-first), `PLOW_PACKED_PREFILL_ROUTE` unset = follows the packet | `sched/step.rs`, `serve/{mux,engine,step_lowering_tests}.rs`, `config.rs`, `exec/gpu.rs` | landed; 12 planner + 3 lowering tests; CUDA lowering unmeasured (no device here) |
+| A/B (20 × 70k/700/.14, C20, frozen packet, same runtime/objects) | `docs/amd/tp-bringup-mi300x.md` §21 | old defaults **16.81** out tok/s, TTFT med 352.9 s, TPOT med 646.8 ms → new defaults **49.68** (+196 %), TTFT med 100.3 s, TPOT med 234.9 ms; packing fired in neither arm (DSA 8192 rung is class C, nothing packable at default planning) |
+
+Report: `/root/.claude/jobs/c08d1232/tmp/reports/continuous-batching.md`.
+
 ## Knob organization (2026-09-11)
 
 Inventory: 138 runtime knobs (`RuntimeConfig` 33 shared / NVIDIA 34 / AMD 48 / Apple 14 / CPU 9)

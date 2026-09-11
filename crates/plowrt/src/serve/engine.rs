@@ -63,7 +63,11 @@ pub trait SeqEngine {
     fn advance_packed_prefill(&mut self, members: &[(usize, &[u32])]) -> crate::Result<()>;
     fn prefill_frontier(&self, slot: usize) -> Option<usize>;
     fn next_prefill_rows(&self, _slot: usize) -> Option<u32> { None }
-    fn prefill_step_budget(&self) -> u32 { u32::MAX }
+    /// What this backend declares to the backend-neutral step planner
+    /// (`crate::sched::step`). The default is a whole-prompt engine with no packing.
+    fn step_backend(&self) -> crate::sched::step::Backend {
+        crate::sched::step::Backend::default()
+    }
     fn cached_rows(&self, _slot: usize) -> usize { 0 }
     fn prefill_chunked_at_most(
         &mut self,
@@ -159,6 +163,18 @@ pub trait SeqEngine {
 }
 
 impl ServeEngine {
+    /// What the engine declares to the backend-neutral step planner (`crate::sched::step`):
+    /// every backend describes itself here and consumes the same plan.
+    pub fn step_backend(&self) -> crate::sched::step::Backend {
+        match self {
+            #[cfg(feature = "cuda")]
+            ServeEngine::Cuda(e) => e.step_backend(),
+            #[cfg(feature = "hsa")]
+            ServeEngine::Amd(e) => e.step_backend(),
+            #[cfg(feature = "cpu")]
+            ServeEngine::Cpu(e) => SeqEngine::step_backend(e),
+        }
+    }
     /// The single-sequence tick surface, for the gfx950 and CPU engines.
     #[cfg(any(feature = "hsa", feature = "cpu"))]
     pub fn seq_engine_mut(&mut self) -> Option<&mut dyn SeqEngine> {
@@ -2085,15 +2101,23 @@ mod amd_serve {
             cur.steps.get(cur.next).map(|step| step.clen)
         }
 
-        /// The per-tick prefill row budget: the widest compiled prefill rung, i.e. one
-        /// launch of the widest chunk the plan can hold (`PLOW_PF_INTERLEAVE` clamps it).
-        pub fn prefill_step_budget(&self) -> u32 {
-            self.ranks
-                .rank0()
-                .prefill_rungs()
-                .map(|(_, width)| width)
-                .max()
-                .unwrap_or(u32::MAX)
+        /// The AMD arm as the step planner sees it: the budget is the widest compiled prefill
+        /// rung (one launch of the widest chunk a plan can hold; `PLOW_PF_INTERLEAVE` clamps
+        /// it), spans run whole (a cursor's chunks are planned against the compiled rungs and
+        /// are never cut to a remainder), packs are available, and decode is its own dispatch.
+        pub fn step_backend(&self) -> crate::sched::step::Backend {
+            crate::sched::step::Backend {
+                step_budget: self
+                    .ranks
+                    .rank0()
+                    .prefill_rungs()
+                    .map(|(_, width)| width)
+                    .max()
+                    .unwrap_or(u32::MAX),
+                packing: true,
+                split_spans: false,
+                decode_rows_join_prefill: false,
+            }
         }
 
         /// Rows completed by a request whose chunked prefill is still active.
@@ -3215,8 +3239,8 @@ impl SeqEngine for AmdServe {
     fn next_prefill_rows(&self, slot: usize) -> Option<u32> {
         AmdServe::next_prefill_rows(self, slot)
     }
-    fn prefill_step_budget(&self) -> u32 {
-        AmdServe::prefill_step_budget(self)
+    fn step_backend(&self) -> crate::sched::step::Backend {
+        AmdServe::step_backend(self)
     }
     fn cached_rows(&self, slot: usize) -> usize { AmdServe::cached_rows(self, slot) }
     fn prefill_chunked_at_most(
