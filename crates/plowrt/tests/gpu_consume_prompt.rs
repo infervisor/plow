@@ -564,3 +564,218 @@ fn packed_prefill_chunk_sizes_preserve_full_logits() {
         eprintln!("packed full model: case={case} slots={slots:?}, 9 teacher-forced full-logit rows and {} KV samples exact", live.caches.len());
     }
 }
+
+#[test]
+#[ignore = "requires free H100 and paired Gemma-4 FP8 role/interpreter assets"]
+fn w8a16_m1_role_matches_interpreter_on_real_prompts() {
+    const GENERATION_STEPS: usize = 8;
+    const MAX_PREFILL_REL_L2: f64 = 1.0e-2;
+    let _env = common::env_guard();
+    assert_eq!(std::env::var("PLOW_GPU_TEST").as_deref(), Ok("1"));
+    let _config = common::EnvScope::set(&[
+        ("PLOW_VMM_LIVE", "0"),
+        ("PLOW_VMM_PREFIX", "0"),
+        ("PLOW_PREFIX_CACHE", "0"),
+        ("PLOW_PF_BATCH", "0"),
+        ("PLOW_TOKEN_BATCH", "0"),
+        ("PLOW_MULTISTEP", "0"),
+        ("PLOW_KV_POOL_MIB", "0"),
+    ]);
+    let baseline = PathBuf::from(std::env::var("TEST_W8A16_M1_BASELINE").unwrap());
+    let candidate = PathBuf::from(std::env::var("TEST_W8A16_M1_ASSETS").unwrap());
+    let output = PathBuf::from(std::env::var("TEST_W8A16_M1_LOGITS_OUT").unwrap());
+    assert!(output.is_absolute() && output.starts_with("/tmp"));
+
+    let load_packet = |dir: &std::path::Path| {
+        let path = plowrt::asset::devblob::DevBlob::find_in_dir(dir)
+            .unwrap()
+            .unwrap();
+        let raw = std::fs::read(path).unwrap();
+        let blob = plowrt::asset::devblob::DevBlob::parse(&raw).unwrap();
+        (blob, raw)
+    };
+    let (reference_blob, reference_raw) = load_packet(&baseline);
+    let (candidate_blob, candidate_raw) = load_packet(&candidate);
+    assert!(reference_blob
+        .reserved_metadata(&reference_raw, plow_asset::segment_roles::SECTION)
+        .unwrap()
+        .is_none());
+    let role_bytes = candidate_blob
+        .reserved_metadata(&candidate_raw, plow_asset::segment_roles::SECTION)
+        .unwrap()
+        .expect("candidate role metadata");
+    let roles = plow_asset::segment_roles::SegmentRoles::from_bytes(role_bytes).unwrap();
+    assert_eq!(
+        roles.objects.keys().copied().collect::<Vec<_>>(),
+        [plow_asset::segment_roles::W8A16_PREFILL_M1]
+    );
+    let role_segments = roles
+        .programs
+        .iter()
+        .flat_map(|program| &program.roles)
+        .filter(|&&role| role == plow_asset::segment_roles::W8A16_PREFILL_M1)
+        .count();
+    assert!(role_segments > 0);
+    assert!(roles.programs.iter().all(|program| {
+        candidate_blob.progs[program.index].t == 1
+            && program
+                .roles
+                .contains(&plow_asset::segment_roles::W8A16_PREFILL_M1)
+    }));
+    assert!(reference_blob
+        .tensors
+        .iter()
+        .map(|tensor| (&tensor.name, tensor.bytes))
+        .eq(candidate_blob
+            .tensors
+            .iter()
+            .map(|tensor| (&tensor.name, tensor.bytes))));
+    assert_eq!(reference_blob.progs.len(), candidate_blob.progs.len());
+    for (reference, actual) in reference_blob.progs.iter().zip(&candidate_blob.progs) {
+        assert_eq!(reference.t, actual.t);
+        assert_eq!(reference.insts, actual.insts);
+        assert_eq!(reference.n_counter, actual.n_counter);
+        assert_eq!(reference.stream, actual.stream);
+        assert_eq!(reference.stream_ofs, actual.stream_ofs);
+        assert_eq!(reference.stream_len, actual.stream_len);
+        assert_eq!(reference.waits, actual.waits);
+        assert_eq!(reference.succs, actual.succs);
+        assert_eq!(reference.gq_stream, actual.gq_stream);
+        assert_eq!(reference.gq_seg_ofs, actual.gq_seg_ofs);
+    }
+    drop((reference_blob, reference_raw, candidate_blob, candidate_raw));
+
+    let tokenizer = plowrt::text::tokenizer::load_tokenizer(&candidate);
+    let texts = [
+        "Paris",
+        "Explain why the sky appears blue during the day in two clear sentences.",
+        "A compiler maps a model graph into packets while preserving every dependency and tensor extent. Describe how to test the resulting GPU program for numerical correctness.",
+        "Modern language model serving combines matrix multiplication, attention, cache management, and scheduling. A useful benchmark keeps the prompt natural, compares every vocabulary logit, and follows the same greedy trajectory for several decode steps. This catches small numerical changes that a synthetic projection test can miss.",
+    ];
+    let lengths = [1usize, 17, 65, 257];
+    let prompts: Vec<Vec<u32>> = texts
+        .iter()
+        .zip(lengths)
+        .map(|(text, length)| {
+            let seed = tokenizer.encode(text);
+            assert!(!seed.is_empty());
+            seed.iter().copied().cycle().take(length).collect()
+        })
+        .collect();
+
+    struct Frame {
+        token: u32,
+        logits: Vec<f32>,
+    }
+    let run = |dir: &std::path::Path, be: &Arc<CudaBackend>, teacher: Option<&Vec<Vec<Frame>>>| {
+        let mut engine = GpuEngine::load(Arc::clone(be), dir, &dir.join("checkpoint")).unwrap();
+        assert!(engine.has_prefill());
+        let mut trajectories = Vec::with_capacity(prompts.len());
+        let mut decoded = Vec::new();
+        for (case, prompt) in prompts.iter().enumerate() {
+            engine
+                .begin_slot(0, prompt.len() + GENERATION_STEPS)
+                .unwrap();
+            let cap = prompt.len().saturating_sub(1).max(1);
+            let mut token = loop {
+                match engine.prefill_chunk(0, prompt, cap).unwrap() {
+                    plowrt::exec::gpu::PrefillStep::Progress(_) => {}
+                    plowrt::exec::gpu::PrefillStep::Done(token) => break token,
+                }
+            };
+            let mut frames = Vec::with_capacity(GENERATION_STEPS);
+            for step in 0..GENERATION_STEPS {
+                let mut logits = Vec::new();
+                engine.logits_row(0, &mut logits).unwrap();
+                assert_eq!(logits.len(), 262_144);
+                assert!(logits.iter().all(|value| value.is_finite()));
+                frames.push(Frame { token, logits });
+                if step + 1 != GENERATION_STEPS {
+                    let input = teacher.map_or(token, |frames| frames[case][step].token);
+                    engine.step_slots(&[(0, input)], &mut decoded).unwrap();
+                    token = decoded[0];
+                }
+            }
+            trajectories.push(frames);
+            engine.retire_slot(0, false);
+        }
+        trajectories
+    };
+
+    let be = Arc::new(CudaBackend::new(0).unwrap());
+    let reference = run(&baseline, &be, None);
+    let actual = run(&candidate, &be, Some(&reference));
+    let mut records = Vec::new();
+    let mut max_rel_l2 = 0.0f64;
+    let mut max_first_frame_rel_l2 = 0.0f64;
+    let mut rel_l2_sum = 0.0f64;
+    let mut greedy_matches = 0usize;
+    let mut first_frame_greedy_matches = 0usize;
+    for (case, (actual_frames, reference_frames)) in actual.iter().zip(&reference).enumerate() {
+        for (step, (actual, reference)) in actual_frames.iter().zip(reference_frames).enumerate() {
+            let mut squared_error = 0.0f64;
+            let mut squared_reference = 0.0f64;
+            let mut max_abs = 0.0f64;
+            for (&got, &want) in actual.logits.iter().zip(&reference.logits) {
+                let error = f64::from(got) - f64::from(want);
+                squared_error += error * error;
+                squared_reference += f64::from(want) * f64::from(want);
+                max_abs = max_abs.max(error.abs());
+            }
+            let rel_l2 = (squared_error / squared_reference).sqrt();
+            max_rel_l2 = max_rel_l2.max(rel_l2);
+            if step == 0 {
+                max_first_frame_rel_l2 = max_first_frame_rel_l2.max(rel_l2);
+            }
+            rel_l2_sum += rel_l2;
+            let greedy_equal = actual.token == reference.token;
+            greedy_matches += usize::from(greedy_equal);
+            if step == 0 {
+                first_frame_greedy_matches += usize::from(greedy_equal);
+            }
+            records.push(serde_json::json!({
+                "case": case,
+                "prompt_tokens": prompts[case].len(),
+                "step": step,
+                "rel_l2": rel_l2,
+                "max_abs": max_abs,
+                "candidate_token": actual.token,
+                "reference_token": reference.token,
+                "greedy_equal": greedy_equal,
+            }));
+        }
+    }
+    let frames = records.len();
+    let report = serde_json::json!({
+        "model": "google/gemma-4-12B-it",
+        "precision": "W8A16 FP8 weights / BF16 activations",
+        "candidate_packet_sha256": plow_asset::decode_objects::image_sha256(&std::fs::read(candidate.join("model.pkt")).unwrap()),
+        "reference_packet_sha256": plow_asset::decode_objects::image_sha256(&std::fs::read(baseline.join("model.pkt")).unwrap()),
+        "role_segments": role_segments,
+        "prompt_lengths": lengths,
+        "frames": frames,
+        "greedy_matches": greedy_matches,
+        "first_frame_greedy_matches": first_frame_greedy_matches,
+        "max_rel_l2": max_rel_l2,
+        "max_first_frame_rel_l2": max_first_frame_rel_l2,
+        "mean_rel_l2": rel_l2_sum / frames as f64,
+        "criteria": {
+            "max_first_frame_rel_l2": MAX_PREFILL_REL_L2,
+            "required_first_frame_greedy_matches": prompts.len(),
+            "required_teacher_forced_greedy_matches": frames,
+        },
+        "snapshots": records,
+    });
+    std::fs::write(&output, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+    assert!(
+        first_frame_greedy_matches == prompts.len()
+            && max_first_frame_rel_l2 <= MAX_PREFILL_REL_L2
+            && greedy_matches == frames,
+        "qualification failed: prefill greedy {first_frame_greedy_matches}/{}, teacher-forced greedy {greedy_matches}/{frames}, max prefill rel-L2={max_first_frame_rel_l2:e} (limit {MAX_PREFILL_REL_L2:e})",
+        prompts.len(),
+    );
+    eprintln!(
+        "W8A16 M1 role: {role_segments} segments, {greedy_matches}/{frames} teacher-forced greedy frames, max prefill rel-L2={max_first_frame_rel_l2:e}, max propagated rel-L2={max_rel_l2:e}, mean rel-L2={:e}",
+        rel_l2_sum / frames as f64
+    );
+}
