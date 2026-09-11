@@ -2623,5 +2623,23 @@ every native route while a binding was staged and hand the segment to the primar
 which has no `MoeAiterFp8Pf`/`GemmLtPf`/`IndexTpPf` arm; that gate is what every dense body launch
 ran through before this change.
 
-Measured (this section is completed by the qualification below): identity C2/C3/C8, 18-case
-retrieval, the 20-prompt 70k/700/.14/C20 A/B against §21's 49.68 tok/s, packs and body fires.
+**Measured** — packet re-emitted from the frozen recipe with `--emit-packed-prefill=true
+--token-batch-tp=true --packed-sparse-pf=true` (18 programs: 4 prefill, 4 siblings, 4 bodies with a
+20-row band, 6 decode rungs), objects = serving-safe set + the packed MLA family and `_tb` twins +
+the ABI-2 adapter, new scheduler defaults, one exclusive-lease run per arm:
+
+| screen | result |
+|---|---|
+| load | every rung armed; `AMD TP token batch route="unified-token-batch/slot-band" armed=true bodies=[128, 512, 2048, 8192]`; the 8192 sibling and body accepted with `IndexTpPf` on the ABI-2 adapter and the sparse flash on the AITER route |
+| 18-case retrieval, C20 | **18/18** with bodies firing during the run (34 body steps: 10 at the 8192 body with 2–7 decode rows riding, 9 at 2048, 8 at 128) |
+| identity C2/C3/C8 (mixed lengths 700–45k, 2 rounds) | not a clean discriminator on this packet: the CONTROL arm (frozen packet, no bodies, same runtime/objects) also diverges at every concurrency (C8: 3/8 identical both rounds, one answer naming the wrong person), so the screen measures decode-rung near-ties. The span-aware arm diverges at the same rate (C8 3/8, 2/8) but some of its packed outputs are degenerate repetitions (`Lena, Lena, Lena`, `Ronan Ronan Ronan`) that the control never shows — an open correctness risk for body steps (dense bodies fired in the same run; the dense-body "token-0 collapse" is under separate investigation) |
+| A/B 20 × 70k/700/.14 at C20, one run per arm back to back, same runtime and objects | control (frozen packet) **50.17 out tok/s**, 275.0 s, TTFT median 103.0 s, TPOT median 239.5 ms, ITL median 102.7 / p99 1358 ms, 0 body fires — span-aware **48.85 (−2.6 %)**, 282.4 s, TTFT median 108.3 s (+5.2 %), TPOT median **222.1 ms (−7.3 %)**, ITL median **98.2** / p99 1348 ms, 0 packs, **18 body fires** (9 at the 8192 body, each 1 decode row + 1 span), 0 error lines |
+
+Reading: the sparse rung is now routable and correct enough to pass retrieval, and the body fired
+at 8192 for the first time. But with `members >= 2` mostly satisfied by ONE decode row, the step
+buys the decode dispatch it absorbs (TPOT −7.3 %, ITL median −4.4 %) and pays a body-shaped launch
+on the prefill path (TTFT +5.2 %), netting −2.6 % output throughput — not a win on this workload as
+configured. That, plus the identity screen's degenerate outputs, keeps `PLOW_PACKED_SPARSE_PF`
+**off** by default: `--packed-sparse-pf=false` is the rollback and leaves the blob byte-identical.
+What would change the verdict is several spans per launch (whole-chunk planning gives the body one
+span at a time) or a body cheap enough that its launch does not cost 5 s of TTFT per prompt.

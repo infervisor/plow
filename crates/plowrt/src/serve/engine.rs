@@ -1996,13 +1996,16 @@ mod amd_serve {
                 Some(cur) => token_batch_cursor_rows(cur, prompt.len() as u32, cap),
                 None => (prompt.len() as u32).min(cap),
             };
-            // A member may only take what some body admissible at its frontier can carry: a
+            // A member's whole planned chunk must fit some body admissible at its frontier: a
             // sparse (DSA) body needs the span to start 2048 keys deep, so a request's first
-            // rows ride the widest dense body instead (or none, when no body admits them).
+            // 8192-row chunk rides no body (it runs isolated; a shorter first chunk may ride a
+            // dense body). Never cut to fit — the mux takes whole chunks.
             match (&self.ranks, &self.token_batch_tp) {
                 (Ranks::Tp(g), Some(tb)) => {
                     let frontier = self.token_batch_frontier(slot);
-                    rows.min(tb.admissible_capacity(|prog| g.packed_span_admissible(prog, frontier)))
+                    let widest =
+                        tb.admissible_capacity(|prog| g.packed_span_admissible(prog, frontier));
+                    if rows <= widest { rows } else { 0 }
                 }
                 _ => rows,
             }
