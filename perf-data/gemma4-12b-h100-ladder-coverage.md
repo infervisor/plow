@@ -348,3 +348,41 @@ launch; rebuilding with `PLOW_NV_EMBED_SMEM=1` fixed the setup. Its entry uses
 compiler totals, not measured performance. The tests use synthetic single-op
 packets; full-model FP8 request-limit compilation, serving and B64 remain
 unqualified. [Logs, object hashes and scope](gemma4-12b-h100-data/fp8-loaded-ops-summary.json).
+
+## FP8 request-limited compilation and first screen
+
+Request limits now support FP8 KV with BF16 weights on packed Gemma 4 SM90
+TP1. This supersedes the earlier compiler/packet restriction above. Existing
+FP8 flags remain opt-in; FP8 weights, other backends and invalid request
+limits remain rejected. Both all-layer FP8 KV and full-attention-only FP8 KV
+pass structural compilation tests. The manifest records the new FP8 padding
+capability and includes it in the pairing hash; stale objects remain rejected.
+
+The real all-layer FP8-KV B32 model passes the strict packet/build audit:
+12 programs, 8,904 instructions and 2,736 cases. KV allocation is
+15.1953125 GiB versus 30 GiB for BF16 KV, at context20480 and request
+chunk1024/aggregate8192. Weights remain BF16, with native decode projections.
+Serving consistency, cancellation, slot reuse and context rejection pass.
+
+One screening repeat after verification, without additional warmups, returns
+128 tokens/cache0 for all 66 requests:
+
+| Input / concurrency | Output tok/s | Median TTFT ms |
+|---|---:|---:|
+| 1K / C1 | 70.900 | 85.828 |
+| 1K / C32 | 620.301 | 1481.448 |
+| 16K / C1 | 39.330 | 1482.029 |
+| 16K / C32 | 57.398 | 65382.882 |
+
+This is slower than recent BF16-KV screens; it is a capacity option, not a
+recommended throughput configuration. No fresh BF16/vLLM A/B or independent
+full-model quality test was run. FP8 KV changes numerical precision.
+
+A separate 16K/C1 event profile attributes 531.0 ms to GEMM, 138.8 ms to
+light ops and 758.7 ms to attention. Earlier BF16-KV profiles were about
+527/137/349 ms. All eight HD512 segment IDs appear in every chunk's top list;
+their rounded times sum to 588.58 ms across 16 chunks. The packet audit maps
+those IDs to HD512 FlashPrefillFp8. This makes global FP8 attention the main
+next tuning target. Event profiling replaces graph execution and is not
+normal serving latency. B64 and the vLLM objective remain unqualified.
+[Evidence, objects and build recipe](gemma4-12b-h100-data/fp8-request-limit-summary.json).

@@ -134,13 +134,12 @@ impl Manifest {
         let write_rows = self.max_request_rows.unwrap_or(rows);
         if self.max_request_rows.is_some() {
             need(
-                self.version == 1
-                    && write_rows > 0
+                write_rows > 0
                     && write_rows <= rows
                     && p.programs[..p.prefill_count]
                         .iter()
                         .any(|g| g.rows == write_rows),
-                "request limit must match a BF16 prefill rung",
+                "request limit must match a prefill rung",
             )?;
         }
         for cache in &live.caches {

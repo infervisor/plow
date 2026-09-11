@@ -7039,9 +7039,8 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
             model_type.starts_with("gemma4") && arch == "sm_90a" && tp == 1
                 && !emit_config::active().any_fp8_weights()
                 && !emit_config::active().mxfp4
-                && !emit_config::active().fp8_kv
                 && emit_config::active().packed_prefill_metadata_on(),
-            "request chunk limits require packed Gemma 4 BF16 SM90 TP1"
+            "request chunk limits require packed Gemma 4 BF16 weights on SM90 TP1"
         );
     }
 

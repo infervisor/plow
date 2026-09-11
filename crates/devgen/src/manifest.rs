@@ -1468,6 +1468,12 @@ pub fn build_for_packet(
                 "symbol": plow_asset::packed_prefill::MASKED_PADDING_CAPABILITY,
                 "value": 1,
             });
+            if packed.version == 2 {
+                manifest["objects"]["packed_prefill"]["fp8_masked_padding_capability"] = json!({
+                    "symbol": plow_asset::packed_prefill::FP8_MASKED_PADDING_CAPABILITY,
+                    "value": 1,
+                });
+            }
             manifest["pairing"]["hash"] = json!(format!("0x{:016x}", pairing_hash(&manifest)));
         }
     }

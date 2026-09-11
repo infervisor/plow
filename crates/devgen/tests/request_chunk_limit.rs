@@ -24,18 +24,21 @@ fn aggregate_ladders_keep_request_sized_rings_and_require_masked_objects() {
     }"#,
     )
     .unwrap();
-    for (arch, limit, precision, valid) in [
-        ("sm_90a", "1024", None, true),
-        ("sm_90a", "256", None, false),
-        ("sm_90a", "16384", None, false),
-        ("gfx942", "1024", None, false),
-        ("sm_90a", "1024", Some("--fp8-kv"), false),
-        ("sm_90a", "1024", Some("--fp8"), false),
+    for (arch, limit, precision, full, valid) in [
+        ("sm_90a", "1024", None, false, true),
+        ("sm_90a", "256", None, false, false),
+        ("sm_90a", "16384", None, false, false),
+        ("gfx942", "1024", None, false, false),
+        ("sm_90a", "1024", Some("--fp8-kv"), false, true),
+        ("sm_90a", "1024", Some("--fp8-kv"), true, true),
+        ("sm_90a", "1024", Some("--fp8"), false, false),
     ] {
         let mut argv = vec!["test", "--emit-max-request-chunk", limit];
         argv.extend(precision);
         let mut cfg = Args::try_parse_from(argv).unwrap().emit;
         cfg.max_chunk = Some(8192);
+        cfg.fp8_kv_full = full;
+        cfg.emit_packed_prefill = Some(true);
         let out = root.join("model.pkt");
         let result = std::panic::catch_unwind(|| {
             devgen::run_verified(
@@ -59,6 +62,14 @@ fn aggregate_ladders_keep_request_sized_rings_and_require_masked_objects() {
                     if valid {
                         plow_asset::program::with_model(model, |p| {
                             let live = plow_asset::live_kv::emit(p).unwrap();
+                            let fp8 = precision == Some("--fp8-kv");
+                            assert_eq!(live.version, if fp8 { 2 } else { 1 });
+                            for cache in &live.caches {
+                                assert_eq!(
+                                    cache.scales.is_some(),
+                                    fp8 && (!full || cache.window == 0)
+                                );
+                            }
                             assert_eq!(
                                 live.caches
                                     .iter()
@@ -86,6 +97,14 @@ fn aggregate_ladders_keep_request_sized_rings_and_require_masked_objects() {
                 serde_json::from_slice(&std::fs::read(root.join("build.json")).unwrap()).unwrap();
             let packed = &manifest["objects"]["packed_prefill"];
             assert_eq!(packed["max_request_rows"], 1024);
+            if precision == Some("--fp8-kv") {
+                assert_eq!(
+                    packed["fp8_masked_padding_capability"]["symbol"],
+                    plow_asset::packed_prefill::FP8_MASKED_PADDING_CAPABILITY
+                );
+            } else {
+                assert!(packed.get("fp8_masked_padding_capability").is_none());
+            }
             assert_eq!(
                 packed["masked_padding_capability"]["symbol"],
                 plow_asset::packed_prefill::MASKED_PADDING_CAPABILITY
