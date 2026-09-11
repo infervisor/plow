@@ -102,11 +102,29 @@ Merged agent work (opt-in, shipped defaults byte-identical): AITER match for GLM
 | A/B (20 × 70k/700/.14, C20, frozen packet, same runtime/objects) | `docs/amd/tp-bringup-mi300x.md` §21 | old defaults **16.81** out tok/s, TTFT med 352.9 s, TPOT med 646.8 ms → new defaults **49.68** (+196 %), TTFT med 100.3 s, TPOT med 234.9 ms; packing fired in neither arm (DSA 8192 rung is class C, nothing packable at default planning) |
 | Sibling packet (GLM gfx942 `production_default` emits packed siblings) on device, same defaults | `cb-qual/campaign-{qual,bench}-packed-v2.log` | retrieval 18/18, identity clean; **49.83** out tok/s vs 49.68 frozen (parity), TTFT med 101.2 s, TPOT med 233.6 ms, 0 packs fired — the emit flip is safe and neutral until the sparse 8192 rung is span-aware (task #15) |
 | **User's 100-prompt command, new defaults, frozen packet** | `tb-qual/campaign-default-100.log` | **47.09** out tok/s, 1511 s, TTFT med 15.97 s, TPOT med 395.8 ms, ITL med 108 ms, 100/100 — parity with the 47.80 reference recipe (`PLOW_PF_INTERLEAVE=0`); the +196 % at 20 prompts was against the old shipped default that the recipe already overrode. Scheduling is at its structural limit here; the 3.2× is in the 8192-tick kernels (task #14 → #13) |
+| `PLOW_MOE_AITER_TILE64=1` vs control, same binary, 20 prompts, frozen packet | `tb-qual/campaign-ab-tile64.log`, `campaign-tile64-b.log` | control **49.79**, tile64 **50.57** (+1.6 %), TTFT med 100.9 → 94.1 s, TPOT med 237.6 → 248.5 ms, ITL med 101.5 → 107.1 — object loaded on 8 ranks; adapter rebuilt (`scripts/build_moe_aiter.sh` with the 64-row object). Retrieval screen on this arm still owed before a default flip |
 | Merge into this branch | 6b9b25ec (2d72ba7d) + merge of 842b6171 (planner, native routes accept packed siblings) + d6496f9e (`tests/config_env.rs` Option fields) | pushed; check ws, plowrt cuda,hsa lib 787/787, devgen GLM+packed_siblings 45/45 |
 
 Where the target workload's time goes (100 × 70k/700/.14, C20; 7.07 M input tokens): ≈ 963 prefill launches of the 8192 sparse rung at ~1.3 s ≈ 1250 s, plus ≈ 2540 decode-only ticks at rung 20 (108.6 ms) ≈ 275 s — consistent with the 47.8 tok/s baseline. 150 tok/s = 467 s total ⇒ the 8192 tick must reach ≤ ~0.45 s even with free decode. The kernel reports attribute only ~0.72 s of that tick (sparse attention 78 × 3.7 ms = 0.29, AITER MoE 75 × 3.48 = 0.26, GEMM 0.17), so ~0.5–0.7 s per tick is unattributed → task #14 (rocprofv3 attribution on 8 ranks). Cross-request packing and decode-band fusion are worth ~5–10 % here and both need the sparse 8192 rung span-aware (class C today) → task #15.
 
 Report: `/root/.claude/jobs/c08d1232/tmp/reports/continuous-batching.md`.
+
+## Where the 8192 tick goes (2026-09-11, profiler agent, `prefill-tick-attribution.md`)
+
+Production serve, frozen packet, new default planner, C20 × 66k; `rocprofv3` hangs plow's inline collectives, so GPU attribution is the interpreter packet trace + per-segment drains. Instrument merged: `PLOW_TICK_LOG=1` (7e19dbb0; `TICK` / `PFCHUNK` / `PFSEG` lines, off by default).
+
+| tick kind | total | of which GPU drain | notes |
+|---|---:|---:|---|
+| steady 8192 sparse chunk + rung-20 decode | 1.13 s | 0.93–0.97 s | host around the drain 26 + 5.6 + 3.8 ms; decode after a chunk 163 ms (vs 107 alone: `decode_prepare` maps the next VMM block per layer, 38–41 ms) |
+| first chunk of a request | 1.37 s | 0.99 s | + `begin_slot` 219 ms on a fresh slot, **1.9 s** on a slot that held a 66k prompt (VMM `release_window` unmaps ~400 blocks serially) |
+| ragged tail 464 rows → dense 512 bucket at 65k prior | **2.04 s** | **1.89 s** | twice a full sparse chunk — the small buckets are dense attention over every prior key |
+| decode-only, rung 20, 65k | 107 ms | 95 ms | flat in live rows: a lone straggler pays rung 20 |
+
+Inside the 969 ms chunk drain: native sparse MLA 203 ms (2.60 ms/layer), AITER MoE 164 (2.19), indexer 86, hipBLASLt 71, interpreter segments 448 — of which `XReduceTwoShot` ×2/layer **174 ms** (~160 GB/s xGMI), o_proj 49, `MlaMergeFold` 46, router+top-k 42, align 51, residual 38, shared GLU 35, combine 35, norms 29. Reconciles the 100-prompt run to +1.4 %.
+
+Ranked levers: slot-recycle unmap off the engine thread (−1.5..1.7 s/request ≈ −9 % wall); tails to the sparse arm (−1.0 s/request; `PLOW_AMD_TAIL_SPARSE_CTX`, 5ee91ece, A/B queued); two-shot collective 174 → ~90 ms (RCCL-class bandwidth or fused reduce+norm; glue-ops agent); post-prefill block mapping (−40 ms/prefill tick); MoE tile64 (−60 ms/chunk: **measured 49.79 → 50.57 tok/s, +1.6 %, TTFT med 100.9 → 94.1 s** on 20 prompts, same binary, `tb-qual/campaign-tile64-b.log`; adapter must carry `plow_moe_aiter_tile64_abi_1`); GEMM choice (−28); `prefill_prepare` (−15..20); async prefix publish (−10); decode enqueue+rearm (−9 ms/decode tick). Contradicts the kernel reports: sparse MLA in-flow 2.60 ms/layer not 3.7, MoE 2.19 not 3.48, tail cost 3–6× the attention report's estimate, collective data movement 18 % of the chunk not 1.3 %.
+
+Body arm (5ee91ece, host-side, needs the collapse fix + a bodies packet to fire): cursors seeded for waiting slots when the route is armed, whole next chunks oldest-first, chunks no body holds skipped instead of blocking the pack, no cutting (a sparse 8192 step sliced into a dense body costs several times the launch it displaces). Unit tests `amd_token_batch_pack_*`, `dense_tail_moves_to_the_sparse_bucket_*`.
 
 ## Knob organization (2026-09-11)
 
