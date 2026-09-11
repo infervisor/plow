@@ -661,6 +661,8 @@ mod amd_serve {
         band: u32,
         /// `(program, rows)`, ascending by rows.
         bodies: Vec<(usize, u32)>,
+        /// Armed is not fires: set on the first successful step, logged once.
+        fired: bool,
     }
 
     impl TokenBatchTp {
@@ -727,6 +729,18 @@ mod amd_serve {
                 .iter()
                 .map(|&slot| ids[slot as usize])
                 .collect();
+            if !self.fired {
+                tracing::info!(
+                    route = "unified-token-batch/slot-band",
+                    fires = true,
+                    rows,
+                    body = prog,
+                    samples = tokens.len(),
+                    requests = requests.len(),
+                    "amd: first successful TP token-batch step"
+                );
+                self.fired = true;
+            }
             self.staging
                 .finish_requests_after_device_success(frontiers, &tokens, output)
                 .map_err(|e| {
@@ -1076,6 +1090,7 @@ mod amd_serve {
                         ),
                         band: band.unwrap_or(0),
                         bodies: bodies.iter().map(|b| (b.0, b.1)).collect(),
+                        fired: false,
                     })
                 }
                 _ => None,

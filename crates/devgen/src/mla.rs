@@ -5351,7 +5351,13 @@ pub(crate) fn emit_glm_mla_prefill(
     // packet, 8k trace). i[6] carries it on the DENSE arm only; the sparse arm owns i[6]=cap.
     // Small dense FP8 rungs use a separate four-wave object; fj[2] carries its
     // split capacity and the runtime rebases it together with the matching merge.
-    let small_pf_ns = glm_small_pf_split_cap(c, n_cu, t);
+    // A body's flash runs the packed per-span arm, which has no KV-split axis; the fold must
+    // expect ONE partial per row, as under the global packed emit (`glm_small_pf_split_cap`).
+    let small_pf_ns = if band.is_some() {
+        1
+    } else {
+        glm_small_pf_split_cap(c, n_cu, t)
+    };
     let pf_ns = if fp8kv && !sparse {
         small_pf_ns
     } else if fp8kv || sparse || t < 2048 || ofold {
@@ -7823,12 +7829,13 @@ fn glm_emit_full(
     // lowering decision". Sparse-prefill buckets are skipped: `IndexUnionPf`/`IndexTpPf` derive
     // every row's position from one scalar (class C) and have no per-span form yet. Flag unset
     // ⇒ byte-identical blob.
+    // The body sets the packed-segment topology on ITS OWN builder; it does not need (and the
+    // native MoE / index-TP arms forbid) the global `PLOW_EMIT_PACKED_PREFILL` siblings.
     let token_batch_tp = emit_config::active().token_batch_tp;
     if token_batch_tp {
         assert!(
-            crate::emit_is_amd() && emit_config::active().packed_prefill_on() && dbatch > 1,
-            "PLOW_TOKEN_BATCH_TP=1 needs an AMD emit with PLOW_EMIT_PACKED_PREFILL=1 (the body \
-             is the packed-segment topology) and a decode ladder wider than one row"
+            crate::emit_is_amd() && dbatch > 1,
+            "PLOW_TOKEN_BATCH_TP=1 needs an AMD emit with a decode ladder wider than one row"
         );
     }
     #[derive(Clone, Copy, PartialEq)]
