@@ -54,8 +54,18 @@ venv-sglang/
 .venv-sglang/
 sglang-pkgs/
 
-# Performance measurements are summarized in Markdown.
+# Keep removed performance reports and campaign directories local.
 /perf-data/**/*.json
+/perf-data/**/*.jsonl
+/perf-data/**/*.md
+/perf-data/gemma3-12b-h100/
+/perf-data/gemma4-12b-h100-data/
+/runtime/bench/amd/dsa_pf_tp/*.md
+/runtime/bench/amd/dsa_pf_tp/*.json
+/runtime/bench/amd/dsa_pf_tp/*.jsonl
+/runtime/bench/amd/dsa_select_parallel/*.md
+/runtime/bench/amd/dsa_select_parallel/*.json
+/runtime/bench/amd/dsa_select_parallel/*.jsonl
 
 # Sibling checkouts used for cross-branch comparison
 .worktrees/

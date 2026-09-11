@@ -49,6 +49,7 @@ use serde_json::Value;
 mod checkpoint;
 use checkpoint::{layer_scalars, validate_coverage};
 mod attention_prefill_role;
+mod w8a16_prefill_role;
 mod block;
 use block::{parse_block, write_block_descriptor};
 mod config;
@@ -8737,6 +8738,15 @@ fn emit_dense_gqa(
         )
     }
     .unwrap_or_else(|error| panic!("decode objects: {error}"));
+    if fp8 && !ecfg.w8a8 && c.arch == Arch::Gemma4 {
+        w8a16_prefill_role::apply_output_object(
+            &m,
+            &mut sections,
+            &arch,
+            std::path::Path::new(&out),
+        )
+        .unwrap_or_else(|error| panic!("native W8A16 M1 object: {error}"));
+    }
     attention_prefill_role::apply_output_object(
         &mut m,
         &mut sections,
