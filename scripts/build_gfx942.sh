@@ -20,6 +20,27 @@
 # .elf stems carry no arch and a shared directory lets a gfx950 object be handed
 # to an MI300X. Point plowrt at it with PLOW_HSACO=<dir>.
 #
+# PLOW_HSACO_CONFIG=<assets dir | plow_config.h> -- BUILD FOR ONE PACKET. plowc writes
+# `plow_config.h` beside `model.pkt`; this is the gfx942 twin of the cmake path's
+# PLOW_HSACO_CONFIG (runtime/CMakeLists.txt). Two things happen, and the second is why it
+# exists at all:
+#   1. every row compiles with -DPLOW_CONFIG="plow_config.h", so the object carries the
+#      packet's PLOW_PACKET_HASH as plow_packet_hash_{lo,hi} and plowrt REFUSES it against
+#      any other packet (an unstamped object is accepted with a warning -- that is the
+#      shipped state, not the goal);
+#   2. the object set is DERIVED from the packet instead of hand-set env: the decode batch
+#      (PLOW_DECODE_BATCH, and PLOW_GEMV_WALK=1 above 16 rows), the low-rung tiers from the
+#      packet's decode ladder (PLOW_DECODE_TIERS), the packed operator-family rows
+#      (PLOW_PACKED_PREFILL_CONSUMERS), the token-batch `_tb` twins for a packet with body
+#      programs (PLOW_TOKEN_BATCH_TP_OBJECTS), and the opt-in arms the packet's `requires`
+#      names (PLOW_DSA_PF, PLOW_MLA_PF_NOPE, PLOW_KDA_CHUNK, PLOW_MOE_PF_ATOMIC/DET, ...).
+# An explicit env var still wins -- the header is #ifndef-guarded and this script only fills
+# what nothing else set -- EXCEPT where it would build an object the loader refuses by name
+# (a GM_BM/GM_BN/GM_DBUF that disagrees with the packet, a narrower decode batch): those
+# fail here instead of at load. Without PLOW_HSACO_CONFIG every row is BYTE-IDENTICAL to a
+# build from before this knob existed. `build_defines.json` records the -DPLOW_CONFIG on
+# every row, so `asm_audit.py --contract` sees a config build as a different axis set.
+#
 # THE RESOURCE TABLE IS NO LONGER A COMMENT HERE. It used to be four hand-maintained lines
 # claiming interp_prefill "spill 6", and it was stale by two orders of magnitude: the note says
 # 126 and the ISA says 1799 scratch ops across the object, 1588 of them in outlined bodies that
@@ -71,6 +92,96 @@ if [ -n "${PLOW_NORM_RANGE_CHECK:-}" ]; then
   INC="$INC -DPLOW_NORM_RANGE_CHECK=$PLOW_NORM_RANGE_CHECK"
   [ -n "${PLOW_NORM_SS_MAX:-}" ] && INC="$INC -DPLOW_NORM_SS_MAX=$PLOW_NORM_SS_MAX"
   echo "   !! NORM RANGE CHECK ARMED (debug build, not shippable): ${INC#*-I$R/common }"
+fi
+
+# PLOW_HSACO_CONFIG (see the header): resolve the packet's plow_config.h, stamp every row
+# with it, and derive the object set from what it says. Resolved BEFORE the axes below, which
+# read the knobs this block fills. `cfg_get` reads one `#define NAME value` line; the header
+# is machine-written (devgen::manifest::config_header), so the grammar is exactly that.
+CFG=""; AX_CONFIG=""; AX_CONFIG_JSON=""
+if [ -n "${PLOW_HSACO_CONFIG:-}" ]; then
+  CFG="$PLOW_HSACO_CONFIG"
+  [ -d "$CFG" ] && CFG="$CFG/plow_config.h"
+  [ -f "$CFG" ] || { echo "FAIL: PLOW_HSACO_CONFIG=$PLOW_HSACO_CONFIG: no plow_config.h there" >&2; exit 2; }
+  CFG="$(cd "$(dirname "$CFG")" && pwd)/$(basename "$CFG")"
+  cfg_get() { sed -n "s/^#define $1 //p" "$CFG" | head -1; }
+  cfg_str() { cfg_get "$1" | sed 's/^"//; s/"$//'; }
+  CFG_HASH="$(cfg_get PLOW_PACKET_HASH)"
+  case "$CFG_HASH" in
+    0x*ull) ;;
+    *) echo "FAIL: $CFG carries no PLOW_PACKET_HASH -- not a plowc plow_config.h" >&2; exit 2 ;;
+  esac
+  CFG_ARCH="$(cfg_str PLOW_PACKET_OBJECT_ARCH)"
+  if [ -n "$CFG_ARCH" ] && [ "$CFG_ARCH" != "$ARCH" ]; then
+    echo "FAIL: $CFG describes a $CFG_ARCH packet; this script builds $ARCH" >&2; exit 2
+  fi
+  INC="$INC -I$(dirname "$CFG")"
+  AX_CONFIG="-DPLOW_CONFIG=\"$(basename "$CFG")\""
+  AX_CONFIG_JSON=" -DPLOW_CONFIG=\\\"$(basename "$CFG")\\\""
+  # Decode batch and ladder. The packet's batch is a FLOOR for the object's bucket (the bucket
+  # is a ceiling, so a wider object serves it); a narrower explicit batch is the object the
+  # loader refuses (`check_gemv_capacity`), so refuse it here by name.
+  cfg_batch="$(cfg_get PLOW_PACKET_DECODE_BATCH)"
+  [ -n "$cfg_batch" ] || cfg_batch="$(cfg_get GV_MM_MAX)"
+  if [ -n "$cfg_batch" ]; then
+    if [ -n "${PLOW_DECODE_BATCH:-}" ] && [ "$PLOW_DECODE_BATCH" -lt "$cfg_batch" ]; then
+      echo "FAIL: packet decodes at batch $cfg_batch but PLOW_DECODE_BATCH=$PLOW_DECODE_BATCH is set;" >&2
+      echo "      an object narrower than the packet's widest GEMV is refused at load." >&2; exit 1
+    fi
+    PLOW_DECODE_BATCH="${PLOW_DECODE_BATCH:-$cfg_batch}"
+    [ "$PLOW_DECODE_BATCH" -gt 16 ] && : "${PLOW_GEMV_WALK:=1}"
+  fi
+  # The ladder's rungs below the batch become the tiers; an unset PLOW_DECODE_TIERS would
+  # otherwise fall to the script's own 1/2/4/8 default below.
+  cfg_ladder="$(cfg_str PLOW_PACKET_DECODE_LADDER)"
+  if [ -n "$cfg_ladder" ] && [ -z "${PLOW_DECODE_TIER:-}" ] && [ -z "${PLOW_DECODE_TIERS+x}" ]; then
+    tiers=""
+    for w in ${cfg_ladder//,/ }; do
+      [ "$w" -lt "${PLOW_DECODE_BATCH:-1}" ] && tiers="$tiers${tiers:+,}$w"
+    done
+    PLOW_DECODE_TIERS="$tiers"
+  fi
+  # The packed operator-family objects, opened by literal name under PLOW_PACKED_PREFILL_ROUTE,
+  # and their `_tb` twins for a packet that carries token-batch BODY programs (exec/amd.rs
+  # opens `interp_packed_mla_{norm,flash}_tb*` for those and nothing else).
+  if grep -q '^#define PLOW_PACKET_HAS_PACKED_PREFILL_TOPOLOGY 1$' "$CFG"; then
+    : "${PLOW_PACKED_PREFILL_CONSUMERS:=1}"
+  fi
+  if grep -q '^#define PLOW_PACKET_HAS_TOKEN_BATCH_BODIES 1$' "$CFG"; then
+    : "${PLOW_TOKEN_BATCH_TP_OBJECTS:=1}"
+  fi
+  # `backends.<arch>.requires`, verbatim. Three kinds of entry: row-selecting axes (every
+  # variant row is built anyway -- the small-rung MLA and split objects included -- and plowrt
+  # picks by filename and refuses by marker), the tile geometry (op_gemm.h's CDNA3 defaults ARE
+  # the requirement -- an A/B override that disagrees is refused here rather than at load), and
+  # the opt-in arms this script has a knob for. Anything else is either an unconditional arm, a
+  # runtime branch, or #ifndef-defaulted from the header itself; it is listed in the summary
+  # line so nothing is silently dropped.
+  cfg_unmapped=""
+  for tok in $(cfg_str PLOW_PACKET_OBJECT_REQUIRES); do
+    key="${tok%%=*}"; val="${tok#*=}"; [ "$tok" = "$key" ] && val=1
+    case "$key" in
+      GM_BM|GM_BN|GM_DBUF)
+        cur="${!key:-}"
+        if [ -n "$cur" ] && [ "$cur" != "$val" ]; then
+          echo "FAIL: packet requires $key=$val but $key=$cur is set in the environment;" >&2
+          echo "      plowrt refuses a prefill object whose plow_geom_$key disagrees with the packet." >&2
+          exit 1
+        fi ;;
+      PLOW_DSA_PF_ARM)       [ "$val" = 1 ] && : "${PLOW_DSA_PF:=1}" ;;
+      PLOW_MLA_PF2_NOPE_ARM) [ "$val" = 1 ] && : "${PLOW_MLA_PF_NOPE:=1}" ;;
+      PLOW_KDA_CHUNK)        [ "$val" = 1 ] && : "${PLOW_KDA_CHUNK:=1}" ;;
+      PLOW_KDA_CONV_STEP_DB) [ "$val" = 1 ] && : "${PLOW_K3_KDA_CONV_STEP_DB:=1}" ;;
+      PLOW_MOE_PF_ATOMIC)    [ "$val" = 1 ] && : "${PLOW_MOE_PF_ATOMIC:=1}" ;;
+      PLOW_MOE_PF_DET)       [ "$val" = 1 ] && : "${PLOW_MOE_PF_DET:=1}" ;;
+      PLOW_GLM_FUSE_QNORM)   [ "$val" = 1 ] && : "${PLOW_GLM_FUSE_QNORM:=1}" ;;
+      PLOW_WG_WAVES|PLOW_BUCKET_DECODE|PLOW_FP8|PLOW_FP8_KV|PLOW_MXFP4|PLOW_W8A8|PLOW_MLA_PREFILL|PLOW_MOE_PREFILL|PLOW_MOE_PF_A4W4|PLOW_K3|PLOW_MLA_PREFILL_FP8_SPLIT) ;;
+      *) cfg_unmapped="$cfg_unmapped $tok" ;;
+    esac
+  done
+  echo "   packet config: $CFG"
+  echo "   packet config: hash=${CFG_HASH%ull} batch=${PLOW_DECODE_BATCH:-1} walk=${PLOW_GEMV_WALK:-0} tiers=${PLOW_DECODE_TIERS:-none} packed=${PLOW_PACKED_PREFILL_CONSUMERS:-0} tb=${PLOW_TOKEN_BATCH_TP_OBJECTS:-0} dsa_pf=${PLOW_DSA_PF:-0} moe_pf_atomic=${PLOW_MOE_PF_ATOMIC:-0} moe_pf_det=${PLOW_MOE_PF_DET:-1} kda_chunk=${PLOW_KDA_CHUNK:-0}"
+  [ -z "$cfg_unmapped" ] || echo "   packet config: requires with no build knob here (marker-checked at load):$cfg_unmapped"
 fi
 JOBS="${JOBS:-8}"
 mkdir -p "$OUT"; cd "$OUT"
@@ -1201,7 +1312,7 @@ for row in "${ROWS[@]}"; do rm -f "${row%%|*}.elf" "${row%%|*}.co"; done
 one() {  # <stem> <axes...>
   local stem="$1"; shift
   if ! "$HIPCC" --offload-arch="$ARCH" -O3 -w -DPLOW_ARCH_SUFFIX="$ARCH" \
-        $* --genco "$R/amd/interp.hip" -o "$stem.co" $INC > "$stem.log" 2>&1; then
+        $* $AX_CONFIG --genco "$R/amd/interp.hip" -o "$stem.co" $INC > "$stem.log" 2>&1; then
     echo "FAIL  $stem"; tail -20 "$stem.log"; return 1
   fi
   "$BUN" --unbundle --type=o --targets="hipv4-amdgcn-amd-amdhsa--$ARCH" \
@@ -1209,7 +1320,7 @@ one() {  # <stem> <axes...>
   rm -f "$stem.co" "$stem.log"
   echo "ok    $stem"
 }
-export -f one; export HIPCC ARCH R INC BUN
+export -f one; export HIPCC ARCH R INC BUN AX_CONFIG
 
 # test_kernels.elf is STARTED HERE, alongside the row batch, and waited on after it.
 # It shares no input with the rows and nothing between here and the wait consumes it, so
@@ -1268,7 +1379,7 @@ fi
       *) gq_axes="$axes $AX_GQ" ;;
     esac
     for pair in "$stem|$axes" "${stem}_gq|$gq_axes"; do
-      printf '%s "%s": "-DPLOW_ARCH_SUFFIX=%s %s"' "$sep" "${pair%%|*}" "$ARCH" "$(echo ${pair#*|})"
+      printf '%s "%s": "-DPLOW_ARCH_SUFFIX=%s%s %s"' "$sep" "${pair%%|*}" "$ARCH" "$AX_CONFIG_JSON" "$(echo ${pair#*|})"
       sep=$',\n'
     done
   done
@@ -1325,6 +1436,15 @@ for row in "${ROWS[@]}"; do
       echo "  MISSING PACKED-PREFILL ABI: expected plow_packed_prefill_abi_1"
       fail=1
     }
+    # A config build's whole point: every object names the packet it was built for.
+    if [ -n "$CFG" ]; then
+      for m in plow_packet_hash_lo plow_packet_hash_hi; do
+        grep -qE "OBJECT .* $m\$" <<<"$symbols" || {
+          echo "  MISSING PACKET STAMP: expected $m (PLOW_HSACO_CONFIG=$CFG)"
+          fail=1
+        }
+      done
+    fi
     case "$stem" in
       # The family objects EXIST to carry these markers, and exec/amd.rs refuses one that does
       # not advertise them. Assert them positively here instead: a family object that silently
@@ -1573,6 +1693,7 @@ if [ -n "${PLOW_DECODE_TIERS:-}" ] && [ "$TIER" = 0 ]; then
     echo ""
     echo ">>> low-rung decode tier: width $w -> $OUT/lowrung$w"
     ( unset PLOW_DECODE_TIERS PLOW_GEMV_MM
+      [ -z "$CFG" ] || export PLOW_HSACO_CONFIG="$CFG"
       PLOW_DECODE_TIER="$w" PLOW_ROWS_ONLY="$tier_rows" \
         "$REPO/scripts/build_gfx942.sh" "$OUT/lowrung$w" ) || exit 1
   done

@@ -39,20 +39,23 @@ pub(super) use object::elf_symbol_names;
 use object::{
     build_requires, check_attn_res_f32mix_symbols, check_compiled_opcode_marker_set,
     check_compiled_opcode_markers, check_dec_stage_capacity, check_decode_object,
-    check_dsa_decode_batch, check_dsa_select_local, check_dsa_pf_arm, check_gate_hier_object, check_gemv_capacity,
+    check_dsa_decode_batch, check_dsa_select_local, check_dsa_pf_arm, check_fp8_weight_arms,
+    check_gate_hier_object, check_gemv_capacity,
     check_interpreter_waves,
     check_k3_arms, check_kda_carry_regstate_symbols, check_kda_chunk, check_kda_conv_step_db,
     check_kda_intra_wave_items_symbols, check_kv_encoding, check_materialized_residual_input,
     check_mla_nope_arm, check_mla_v2_sv_raw_symbols, check_moe_ep_symbols, check_moe_gemma_arms,
     check_moe_pf_a4w4, check_packed_family_kv_encoding, check_packed_prefill_abi,
-    check_packet_pairing_stamp, check_prefill_object, check_qwen_gdn_arms, check_sparse_fp8_object,
+    check_packet_pairing_stamp, check_prefill_geometry, check_prefill_object, check_qwen_gdn_arms,
+    check_sparse_fp8_object,
     check_sparse_fp8_packet, check_xargmax_capacity, elf_symbol_u32, first_op_in,
     graph_phase_xreduce_segments, l2_pairing_refusal, log_gate_hier_status,
     packet_decode_arm_requirements, packet_prefill_arm_requirements, read_attn_res_f32mix_object,
     read_kda_carry_regstate_object, read_kda_intra_wave_items_object, required_gemv_m,
     required_k3_op, required_kda_chunk, required_kda_conv_step_db, required_kv_op,
     required_moe_pf_a4w4, required_moe_pf_accum, required_qwen_gdn_op, resolve_flash_object_load,
-    sparse_fp8, BF16_KV_OPS, FP8_KV_OPS, FP8_KV_SYM, GATE_HIER_SYM, KDA_CARRY_KEYFEED_MARKERS,
+    sparse_fp8, BF16_KV_OPS, FP8_KV_OPS, FP8_KV_SYM, FP8_WEIGHT_OPS, GATE_HIER_SYM,
+    KDA_CARRY_KEYFEED_MARKERS,
     KDA_CARRY_REGSTATE_LDS, KDA_CHUNK_QPRE_SYM, KDA_CONV_STEP_DB_REPLACED_OPS, KDA_FAMILY_SEG_SYM,
     KDA_WU_LEAN_LDS, KDA_WU_LEAN_MARKERS, L2_DISPATCH_SYM, MLA_PF_V2_FP8_SYM, MLA_PF_V2_SYM,
     MOE_ENC_MXFP4, MOE_GEMMA_OPS, MOE_GEMMA_PF_OPS, PACKED_PREFILL_ABI_SYM, PACKED_PREFILL_BAND_SYM,
@@ -6212,6 +6215,10 @@ impl AmdEngine {
         let need_fp8kv_prefill = required_kv_op(&blob.progs[..dec_ix], FP8_KV_OPS);
         let need_bf16kv_decode = required_kv_op(&blob.progs[dec_ix..], BF16_KV_OPS);
         let need_bf16kv_prefill = required_kv_op(&blob.progs[..dec_ix], BF16_KV_OPS);
+        // The fp8 WEIGHT axis, per phase for the same reason; the flash object dispatches
+        // none of these arms.
+        let need_fp8w_decode = first_op_in(&blob.progs[dec_ix..], FP8_WEIGHT_OPS);
+        let need_fp8w_prefill = first_op_in(&blob.progs[..dec_ix], FP8_WEIGHT_OPS);
         // Will derive_segments route any FlashMlaPrefill segment to the flash object?
         // Then that object MUST carry the V2 arm — the dispatch default is a silent skip.
         let need_mla_v2 = mla_pf_v2_enabled()
@@ -6701,6 +6708,15 @@ impl AmdEngine {
                 Phase::Prefill | Phase::Flash => (need_fp8kv_prefill, need_bf16kv_prefill),
             };
             check_kv_encoding(&syms, &path, need_fp8, need_bf16)?;
+            let need_fp8_weights = match phase {
+                Phase::Decode => need_fp8w_decode,
+                Phase::Prefill => need_fp8w_prefill,
+                Phase::Flash => None,
+            };
+            check_fp8_weight_arms(&syms, &path, need_fp8_weights)?;
+            if let (Phase::Prefill, Some(req)) = (phase, requires.as_ref()) {
+                check_prefill_geometry(&image, &path, req)?;
+            }
             check_packet_pairing_stamp(&image, blob_path, &path)?;
             let m = EngineDevice::module_load(&*be, &image).map_err(|e| {
                 RuntimeError::Device(format!(

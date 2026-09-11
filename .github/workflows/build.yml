@@ -48,6 +48,15 @@ jobs:
           python3 scripts/render_recipe.py recipes/*/*/*.toml --check
       - name: Enter Nix shell
         run: nix develop --command true
+      # Both need the flake's ROCm toolchain (build_gfx942.sh refuses to run without it), and
+      # neither compiles a kernel: PLOW_DEFINES_ONLY resolves the axes in seconds. The first
+      # asserts the PLOW_HSACO_CONFIG path derives the object set from a packet and refuses a
+      # disagreeing environment by name; the second asserts every checked-in recipe's
+      # `[objects].env` produces the -D set `check_recipe.py` would later compare against.
+      - name: Check build_gfx942.sh packet-config path
+        run: nix develop --command scripts/build_gfx942_config_selftest.sh
+      - name: Check recipes' object env against build_gfx942.sh
+        run: nix develop --command python3 scripts/tests/test_recipe_objects_env.py
       - name: Build default package
         run: nix build
       - name: Test workspace

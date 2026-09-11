@@ -4630,6 +4630,248 @@ fn prefill_object_without_mla_arms_is_refused() {
     .is_ok());
 }
 
+/// A minimal ELF64 with one `.data` word per `(name, value)`, laid out the way
+/// `pairing_stamp_is_read_from_elf_data` does it, so both [`elf_symbol_u32`] and
+/// [`elf_symbol_names`] read it. Section 1 `.symtab`, 2 `.strtab`, 3 `.data`.
+fn synthetic_object(symbols: &[(&str, u32)]) -> Vec<u8> {
+    let n = symbols.len();
+    let shoff = 0x40usize;
+    let symtab_off = shoff + 4 * 64;
+    let symtab_size = 24 * (n + 1);
+    let strtab_off = symtab_off + symtab_size;
+    let mut strtab = vec![0u8];
+    let mut name_ofs = Vec::new();
+    for (name, _) in symbols {
+        name_ofs.push(strtab.len());
+        strtab.extend_from_slice(name.as_bytes());
+        strtab.push(0);
+    }
+    let data_off = (strtab_off + strtab.len() + 15) & !15;
+    let data_size = 4 * n;
+    let mut elf = vec![0u8; data_off + data_size];
+    elf[..6].copy_from_slice(b"\x7fELF\x02\x01");
+    elf[0x28..0x30].copy_from_slice(&(shoff as u64).to_le_bytes());
+    elf[0x3a..0x3c].copy_from_slice(&64u16.to_le_bytes());
+    elf[0x3c..0x3e].copy_from_slice(&4u16.to_le_bytes());
+    let s1 = shoff + 64;
+    elf[s1 + 4..s1 + 8].copy_from_slice(&2u32.to_le_bytes());
+    elf[s1 + 24..s1 + 32].copy_from_slice(&(symtab_off as u64).to_le_bytes());
+    elf[s1 + 32..s1 + 40].copy_from_slice(&(symtab_size as u64).to_le_bytes());
+    elf[s1 + 40..s1 + 44].copy_from_slice(&2u32.to_le_bytes());
+    elf[s1 + 56..s1 + 64].copy_from_slice(&24u64.to_le_bytes());
+    let s2 = shoff + 2 * 64;
+    elf[s2 + 4..s2 + 8].copy_from_slice(&3u32.to_le_bytes());
+    elf[s2 + 24..s2 + 32].copy_from_slice(&(strtab_off as u64).to_le_bytes());
+    elf[s2 + 32..s2 + 40].copy_from_slice(&(strtab.len() as u64).to_le_bytes());
+    let s3 = shoff + 3 * 64;
+    elf[s3 + 4..s3 + 8].copy_from_slice(&1u32.to_le_bytes());
+    elf[s3 + 16..s3 + 24].copy_from_slice(&0x1000u64.to_le_bytes());
+    elf[s3 + 24..s3 + 32].copy_from_slice(&(data_off as u64).to_le_bytes());
+    elf[s3 + 32..s3 + 40].copy_from_slice(&(data_size as u64).to_le_bytes());
+    elf[strtab_off..strtab_off + strtab.len()].copy_from_slice(&strtab);
+    for (k, (_, value)) in symbols.iter().enumerate() {
+        let sym = symtab_off + 24 * (k + 1);
+        elf[sym..sym + 4].copy_from_slice(&(name_ofs[k] as u32).to_le_bytes());
+        elf[sym + 6..sym + 8].copy_from_slice(&3u16.to_le_bytes());
+        elf[sym + 8..sym + 16].copy_from_slice(&(0x1000 + 4 * k as u64).to_le_bytes());
+        elf[sym + 16..sym + 24].copy_from_slice(&4u64.to_le_bytes());
+        let d = data_off + 4 * k;
+        elf[d..d + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    elf
+}
+
+#[test]
+fn synthetic_object_is_read_by_both_elf_readers() {
+    let elf = synthetic_object(&[("plow_geom_GM_BM", 192), ("plow_fp8_weights_1", 1)]);
+    assert_eq!(elf_symbol_u32(&elf, "plow_geom_GM_BM"), Some(192));
+    assert_eq!(elf_symbol_u32(&elf, "plow_fp8_weights_1"), Some(1));
+    assert_eq!(elf_symbol_u32(&elf, "plow_geom_GM_BN"), None);
+    let names = elf_symbol_names(&elf);
+    assert!(names.contains(&"plow_geom_GM_BM") && names.contains(&FP8_WEIGHT_SYM));
+}
+
+/// The fp8 WEIGHT axis is refused on the OPCODE the phase dispatches, never on the
+/// blob-wide `requires` entry: block-fp8 (`*Fp8Blk`) is outside `PLOW_FP8`.
+#[test]
+fn fp8_weight_object_is_refused_by_dispatched_opcode() {
+    let path = Path::new("interp_prefill_mla_moe.elf");
+    let bf16 = ["plow_interp_gfx942", FP8_KV_SYM];
+    assert!(check_fp8_weight_arms(&bf16, path, None).is_ok());
+    let err = check_fp8_weight_arms(&bf16, path, Some(DevOp::GemmFp8))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("packet/object FP8-WEIGHT MISMATCH"), "{err}");
+    assert!(err.contains(FP8_WEIGHT_SYM), "{err}");
+    assert!(
+        err.contains("GemmFp8") && err.contains("interp_prefill_mla_moe.elf"),
+        "{err}"
+    );
+    let fp8 = ["plow_interp_gfx942", FP8_WEIGHT_SYM];
+    assert!(check_fp8_weight_arms(&fp8, path, Some(DevOp::GemmFp8)).is_ok());
+
+    let glm = segmented_prog(&[DevOp::GemvFp8Blk, DevOp::DenseGluFp8Blk], &[0, 0]);
+    assert_eq!(
+        first_op_in(std::slice::from_ref(&glm), FP8_WEIGHT_OPS),
+        None
+    );
+    let gemma = segmented_prog(&[DevOp::RmsNorm, DevOp::GemvFp8], &[0, 0]);
+    assert_eq!(
+        first_op_in(std::slice::from_ref(&gemma), FP8_WEIGHT_OPS),
+        Some(DevOp::GemvFp8)
+    );
+    // Every op in the set has a `case` inside an `#if PLOW_FP8` block of interp.hip, and
+    // the marker is emitted under the same guard.
+    let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/amd/interp.hip");
+    let src = std::fs::read_to_string(&p).expect("runtime/amd/interp.hip");
+    assert!(src.contains(&format!(
+        "#if PLOW_FP8\nextern \"C\" __device__ unsigned {FP8_WEIGHT_SYM} = 1;"
+    )));
+    for op in FP8_WEIGHT_OPS {
+        assert!(
+            src.contains(&format!("case {}:", op.c_name())),
+            "{op:?} has no dispatch case"
+        );
+    }
+}
+
+/// The prefill GEMM tile is checked BY VALUE from the `geom_contract.h` markers.
+#[test]
+fn prefill_geometry_is_checked_by_value() {
+    let path = Path::new("interp_prefill_fp8kv_mla_moe.elf");
+    let requires: Vec<String> = [
+        "PLOW_WG_WAVES=8",
+        "GM_DBUF=1",
+        "GM_BM=192",
+        "GM_BN=256",
+        "PLOW_BUCKET_DECODE=0",
+        "PLOW_FP8=1",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let cdna3 = synthetic_object(&[
+        ("plow_geom_PLOW_WG_WAVES", 8),
+        ("plow_geom_GM_BM", 192),
+        ("plow_geom_GM_BN", 256),
+        ("plow_geom_GM_DBUF", 1),
+    ]);
+    assert!(check_prefill_geometry(&cdna3, path, &requires).is_ok());
+
+    let recut = synthetic_object(&[
+        ("plow_geom_PLOW_WG_WAVES", 8),
+        ("plow_geom_GM_BM", 64),
+        ("plow_geom_GM_BN", 256),
+        ("plow_geom_GM_DBUF", 1),
+    ]);
+    let err = check_prefill_geometry(&recut, path, &requires)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("packet/object GEOMETRY MISMATCH"), "{err}");
+    assert!(
+        err.contains("GM_BM=192") && err.contains("GM_BM=64"),
+        "{err}"
+    );
+    assert!(
+        err.contains("plow_geom_GM_BM") && err.contains(&path.display().to_string()),
+        "{err}"
+    );
+
+    // The 4-wave flash tile handed in as the prefill object.
+    let flash = synthetic_object(&[
+        ("plow_geom_PLOW_WG_WAVES", 4),
+        ("plow_geom_GM_BM", 64),
+        ("plow_geom_GM_BN", 128),
+        ("plow_geom_GM_DBUF", 1),
+    ]);
+    let err = check_prefill_geometry(&flash, path, &requires)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("PLOW_WG_WAVES=8") && err.contains("PLOW_WG_WAVES=4"),
+        "{err}"
+    );
+
+    // An object from before geom_contract.h: nothing to compare, refused by name.
+    let unmarked = synthetic_object(&[("plow_geom_PLOW_WG_WAVES", 8)]);
+    let err = check_prefill_geometry(&unmarked, path, &requires)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("packet/object GEOMETRY UNVERIFIABLE"), "{err}");
+    assert!(err.contains("plow_geom_GM_DBUF"), "{err}");
+
+    // No geometry named: nothing to check, whatever the image is.
+    let arms_only = vec!["PLOW_MLA_PREFILL=1".to_string()];
+    assert!(check_prefill_geometry(&[0u8; 64], path, &arms_only).is_ok());
+    assert!(check_prefill_geometry(&unmarked, path, &[]).is_ok());
+
+    // The geometry keys are owned here, so `check_prefill_object` neither refuses
+    // nor warns about them; the same holds for the opcode-checked encodings.
+    for (key, _) in PREFILL_GEOMETRY_MARKERS {
+        assert!(VERIFIED_BY_OTHER_CHECKS.contains(key), "{key}");
+        assert!(PREFILL_ARM_MARKERS.iter().all(|(f, _)| f != key));
+    }
+    for flag in VERIFIED_BY_OTHER_CHECKS {
+        assert!(PREFILL_ARM_MARKERS.iter().all(|(f, _)| f != flag), "{flag}");
+        assert!(DECODE_ARM_MARKERS.iter().all(|(f, _)| f != flag), "{flag}");
+    }
+    assert!(check_prefill_object(&["plow_interp_gfx942"], path, &requires).is_ok());
+}
+
+/// The pairing stamp end to end: read from the ELF, compared with the `build.json` beside
+/// the packet. Unstamped objects stay accepted (the shipped state); a stamped object whose
+/// hash disagrees, or that has no manifest to agree with, is refused.
+#[test]
+fn pairing_stamp_is_checked_against_the_manifest_beside_the_packet() {
+    let dir = std::env::temp_dir().join(format!(
+        "plow-pairing-stamp-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let blob = dir.join("model.pkt");
+    let object = Path::new("interp_prefill_fp8kv_mla_moe.elf");
+    let stamped = synthetic_object(&[
+        ("plow_packet_hash_lo", 0x01fe_d7ac),
+        ("plow_packet_hash_hi", 0x7843_2b97),
+    ]);
+    std::fs::write(
+        dir.join("build.json"),
+        br#"{"pairing":{"hash":"0x78432b9701fed7ac"}}"#,
+    )
+    .unwrap();
+    assert!(check_packet_pairing_stamp(&stamped, &blob, object).is_ok());
+
+    std::fs::write(
+        dir.join("build.json"),
+        br#"{"pairing":{"hash":"0x78432b9701fed7ad"}}"#,
+    )
+    .unwrap();
+    let err = check_packet_pairing_stamp(&stamped, &blob, object)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("packet/object MISMATCH"), "{err}");
+    assert!(
+        err.contains("0x78432b9701fed7ac") && err.contains("0x78432b9701fed7ad"),
+        "{err}"
+    );
+
+    // General (unstamped) object: accepted against any manifest, and with none.
+    let general = synthetic_object(&[("plow_geom_GM_BM", 192)]);
+    assert!(check_packet_pairing_stamp(&general, &blob, object).is_ok());
+    std::fs::remove_file(dir.join("build.json")).unwrap();
+    assert!(check_packet_pairing_stamp(&general, &blob, object).is_ok());
+    // A stamped object with no manifest to agree with is not a general object.
+    let err = check_packet_pairing_stamp(&stamped, &blob, object)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("0x78432b9701fed7ac") && err.contains("build.json"),
+        "{err}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Junk stays bounded and cannot establish a required prefill capability.
 #[test]
 fn elf_reader_is_bounded_on_junk() {

@@ -66,6 +66,16 @@ VLLM_ROCM_LIB=/opt/rocm/core-7.14/lib build-gemma31/vllm-python \
 # objects (no GPU)
 nix develop --command bash -c 'PLOW_DECODE_BATCH=4 JOBS=24 \
   bash scripts/build_gfx942.sh /app/plow/build-glm53/hsaco'
+# ...or, once the packet exists, FROM the packet: `PLOW_HSACO_CONFIG=<assets dir>` reads the
+# `plow_config.h` plowc writes beside model.pkt, stamps every object with the packet's pairing
+# hash (plowrt refuses a stamped object against any other packet), and derives the decode
+# batch/walk, the low-rung tiers from the decode ladder, the packed-family rows and their `_tb`
+# twins (for a packet with token-batch body programs), and the opt-in arms
+# `backends.gfx942.requires` names (PLOW_DSA_PF, PLOW_MOE_PF_*, ...) instead of taking them
+# from the environment. An env var that would build an object the loader refuses by name (a
+# GM_BM that disagrees with the packet, a narrower decode batch) fails the build instead.
+nix develop --command bash -c 'PLOW_HSACO_CONFIG=/app/plow/build-glm53/tp4 JOBS=24 \
+  bash scripts/build_gfx942.sh /app/plow/build-glm53/hsaco'
 
 # emit, serve, smoke, bench — every GPU process takes a gpulease
 MAXCTX=10240 scripts/glm53_mi300x.sh emit 4
