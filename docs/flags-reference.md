@@ -756,9 +756,9 @@ packet carries packed-prefill metadata.
 | `PLOW_MOE_ROUTER_WIDE` | 0 | wide router arm. |
 | `PLOW_MOE_COMBINE_ALLBLK` | 0 | all-block combine. |
 | `PLOW_HSACO_EXTRA_DEFINES` | unset | `scripts/build_gfx942.sh`: raw `-D` appended to every row and recorded in `build_defines.json` (so `asm_audit.py --contract` sees the axis). For opt-in kernel arms whose header default is the shipped body. Refuses the tile / wave / decode-batch axes, which have their own variables and are cross-checked against the packet. |
-| `PLOW_COMBINE_VEC` / `PLOW_COMBINE_VEC_U` | 0 / 2 | AMD `d_moe_combine_pf` 8-wide arm (16 B loads, `_U` iterations in flight) for the `k == 1` combine every native-MoE / `PLOW_MOE_PF_DET` blob emits. Written to keep the scalar loop's operands, order and single rounding, but the serving screens show different tokens than the control objects: treat as numerics-changing unless proven otherwise. −25 ms per GLM-5.3 8192 chunk (31.7 → 6.7 ms). Opt-in build axis (`PLOW_HSACO_EXTRA_DEFINES`); default flip needs a positive same-binary A/B plus retrieval 18/18. |
-| `PLOW_RN_ROWS` | 1 | AMD `d_rmsnorm` multi-row arm: R rows' loads issued before any row is reduced (prefill norms hand each workgroup ~27 rows and paid one HBM round trip per row). Same per-thread element map and reduction tree by construction; numerics-changing unless proven otherwise (see `PLOW_COMBINE_VEC`). Opt-in build axis. |
-| `PLOW_RESID_U` | 1 | AMD `d_residual` unroll: U iterations of loads in flight. Same arithmetic by construction; numerics-changing unless proven otherwise (see `PLOW_COMBINE_VEC`). Opt-in build axis. |
+| `PLOW_COMBINE_VEC` / `PLOW_COMBINE_VEC_U` | 0 / 2 | AMD `d_moe_combine_pf` 8-wide arm (16 B loads, `_U` iterations in flight) for the `k == 1` combine every native-MoE / `PLOW_MOE_PF_DET` blob emits. Bit-identical to the scalar loop (standalone harness, production `-D` sets, 8- and 4-wave geometries, ragged cases included); −25 ms per GLM-5.3 8192 chunk (31.7 → 6.7 ms), served +1.9%. Opt-in build axis (`PLOW_HSACO_EXTRA_DEFINES`); recommended for the gfx942 default. |
+| `PLOW_RN_ROWS` | 1 | AMD `d_rmsnorm` multi-row arm: R rows' loads issued before any row is reduced (prefill norms hand each workgroup ~27 rows and paid one HBM round trip per row). Same per-thread element map and reduction tree; bit-identical by the standalone harness. Opt-in build axis. |
+| `PLOW_RESID_U` | 1 | AMD `d_residual` unroll: U iterations of loads in flight. Bit-identical by the standalone harness. Opt-in build axis. |
 
 ### Scheduling, sync, occupancy
 
