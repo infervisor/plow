@@ -100,7 +100,7 @@ fn packed_runtime_tables_are_excluded_from_both_weight_consumers() {
 fn packed_segmented_block_matches_serialized() -> Result<()> {
     assert_eq!(std::env::var("TEST_PACKED_PREFILL_GPU").as_deref(), Ok("1"));
     let config = crate::config::RuntimeConfig::get();
-    assert!(!config.pf_batch);
+    assert!(!config.pf_batch_cuda());
     assert_ne!(config.nv_vmm_prefix(), Some(true));
     let assets = std::path::PathBuf::from(std::env::var("TEST_PACKED_PREFILL_ASSETS").unwrap());
     let bytes = std::fs::read(assets.join("model.pkt")).unwrap();

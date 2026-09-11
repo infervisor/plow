@@ -6944,6 +6944,10 @@ struct EmitCapabilities {
     decode_objects: bool,
     cublaslt_decode: bool,
     decode_ladder: bool,
+    /// The emitter carries the AMD packed-prefill SIBLING topology (`mla::glm_emit_full`'s
+    /// second pass): every dense prefill bucket a second time with family-pure norm/flash
+    /// segments, which is what lets the serve mux pack several requests' spans into one rung.
+    packed_prefill_siblings: bool,
 }
 
 fn emit_capabilities(model_type: &str) -> EmitCapabilities {
@@ -6962,6 +6966,7 @@ fn emit_capabilities(model_type: &str) -> EmitCapabilities {
         decode_objects: dense || model_type == "qwen3_5",
         cublaslt_decode: gemma || model_type == "qwen3_5",
         decode_ladder: dense || model_type == "gpt_oss",
+        packed_prefill_siblings: matches!(model_type, "glm_moe_dsa" | "glm5_next"),
     }
 }
 
@@ -7006,6 +7011,16 @@ fn apply_production_defaults(
         && tp == 1
         && !cfg.fp8_kv
         && (arch == "sm_90a" || (arch == "gfx942" && !cfg.any_fp8_weights()));
+    // GLM on gfx942: the packed siblings are a SECOND copy of the dense prefill buckets, and the
+    // ordinary programs are byte-identical with or without them (`glm_tests`), so the packet
+    // can carry them by default. The serve side arms its packed route from their presence.
+    // `--emit-packed-prefill=false` is the rollback and a replayed recipe keeps its own value.
+    if capabilities.packed_prefill_siblings && arch == "gfx942" {
+        cfg.packed_prefill_default = true;
+        if cfg.emit_packed_prefill.is_none() {
+            emit_config::note_production_default("emit_packed_prefill", "true".into());
+        }
+    }
 }
 
 fn cublaslt_emit_supported(

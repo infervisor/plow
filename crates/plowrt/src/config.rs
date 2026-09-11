@@ -128,20 +128,17 @@ pub struct RuntimeConfig {
     #[arg(long = "weight-vmm", env = "PLOW_WEIGHT_VMM", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub weight_vmm: Option<bool>,
 
-    /// Cross-request prefill scheduling. CUDA packs chunks into one launch. AMD packs only
-    /// exact-capability programs; unsupported programs retain fair isolated scheduling.
-    #[arg(long = "pf-batch", env = "PLOW_PF_BATCH", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub pf_batch: bool,
+    /// Cross-request prefill scheduling. CUDA packs chunks into one launch (unset = off). AMD
+    /// co-packs compatible mid-prefill spans into one compiled rung (unset = on; programs the
+    /// packed route refuses stay isolated). An explicit `=1` also rotates isolated admission
+    /// across slots instead of oldest-first.
+    #[arg(long = "pf-batch", env = "PLOW_PF_BATCH", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub pf_batch: Option<bool>,
 
-    /// Chunked prefill quantum — rows admitted per tick before decode runs.
-    /// 0 = uncapped.
-    #[arg(
-        long = "pf-interleave",
-        env = "PLOW_PF_INTERLEAVE",
-        default_value_t = 2048,
-        global = true
-    )]
-    pub pf_interleave: u32,
+    /// Step token budget — prefill rows admitted per tick before decode runs.
+    /// Unset: CUDA 2048; AMD the widest compiled prefill rung. 0 = uncapped.
+    #[arg(long = "pf-interleave", env = "PLOW_PF_INTERLEAVE", global = true)]
+    pub pf_interleave: Option<u32>,
 
     /// Per-request prefill chunk-row cap. 0 = off.
     #[arg(
@@ -642,14 +639,35 @@ pub struct NvidiaRuntimeConfig {
 }
 
 impl RuntimeConfig {
-    /// Prefill interleave rows with "zero = unbounded" semantics.
-    /// 0 → `usize::MAX` (no bound), else the configured value.
+    /// CUDA prefill interleave rows with "zero = unbounded" semantics.
+    /// Unset → 2048; 0 → `usize::MAX` (no bound), else the configured value.
     pub fn pf_interleave_rows(&self) -> usize {
-        if self.pf_interleave == 0 {
-            usize::MAX
-        } else {
-            self.pf_interleave as usize
+        match self.pf_interleave.unwrap_or(2048) {
+            0 => usize::MAX,
+            rows => rows as usize,
         }
+    }
+
+    /// AMD per-tick prefill row cap. Unset → 0, which `serve::mux::amd_prefill_tick_cap`
+    /// reads as uncapped: one tick may admit up to the widest compiled prefill rung.
+    pub fn pf_interleave_amd(&self) -> u32 {
+        self.pf_interleave.unwrap_or(0)
+    }
+
+    /// Cross-request prefill packing on CUDA: off unless asked.
+    pub fn pf_batch_cuda(&self) -> bool {
+        self.pf_batch.unwrap_or(false)
+    }
+
+    /// Cross-request prefill packing on AMD: on unless `PLOW_PF_BATCH=0`.
+    pub fn pf_batch_amd(&self) -> bool {
+        self.pf_batch.unwrap_or(true)
+    }
+
+    /// Rotate AMD isolated admission across slots instead of serving the oldest request
+    /// first. Only an explicit `PLOW_PF_BATCH=1` asks for it; the default is FCFS.
+    pub fn pf_rotate(&self) -> bool {
+        self.pf_batch == Some(true)
     }
 
     /// Per-request prefill chunk-row cap with "zero = unbounded" semantics.
@@ -677,6 +695,11 @@ pub struct AmdRuntimeConfig {
 
     /// Load the exact-capability MLA and KDA packed-prefill operator-family objects.
     ///
+    /// Unset = automatic: on when the packet carries packed-prefill sibling or token-batch
+    /// body programs, off otherwise. When on, a missing family object is a load error naming
+    /// the file (never a silent fallback); `=0` is the rollback, `=1` forces the load on a
+    /// packet without siblings.
+    ///
     /// This flag does NOT gate dense/GQA co-packing, which needs no family object: the dense
     /// consumers are compiled into the ordinary prefill and flash objects
     /// (`PLOW_PACKED_PREFILL_DENSE_CONSUMERS=1` in `scripts/build_gfx942.sh`) and route through
@@ -685,8 +708,8 @@ pub struct AmdRuntimeConfig {
     /// of them fit in one compiled prefill rung. It works at TP1 and under TP alike; the TP
     /// engine has its own all-rank `prefill_packed_chunk`. See
     /// `docs/amd/gemma4-31b-mi300x.md`, "Dense packed prefill is unreachable at chunk 8192".
-    #[arg(long = "amd-packed-prefill-route", env = "PLOW_PACKED_PREFILL_ROUTE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub packed_prefill_route: bool,
+    #[arg(long = "amd-packed-prefill-route", env = "PLOW_PACKED_PREFILL_ROUTE", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub packed_prefill_route: Option<bool>,
 
     /// Spill-isolated KDA-family object for ordinary prefill segments. Set false to disable.
     #[arg(long = "amd-kda-family-route", env = "PLOW_KDA_FAMILY_ROUTE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
@@ -1478,31 +1501,43 @@ mod tests {
     }
 
     #[test]
-    fn packed_prefill_route_stays_opt_in_and_pf_batch_does_not_imply_it() {
+    fn packed_prefill_route_and_pf_batch_default_to_auto_with_explicit_rollback() {
         use clap::{Args, FromArgMatches};
 
-        // THE DEFAULT IS FALSE AND THIS TEST IS WHY IT SHOULD STAY THAT WAY. The route is one
-        // of THREE independent things a co-packed MLA prefill needs, and the other two are
-        // build-time: family objects from a `PLOW_PACKED_PREFILL_CONSUMERS=1` gfx942 build, and
-        // a blob emitted `PLOW_EMIT_PACKED_PREFILL=1` so its norm/MLA segments are family-pure.
-        // Defaulting the runtime half on would arm a warning on every ordinary AMD serve
-        // (`report_packed_prefill_route`) and buy nothing, because neither build-time half is a
-        // default. Flip this only together with those.
+        // UNSET IS AUTOMATIC, NOT OFF. The route follows the packet: `exec/amd.rs` arms it when
+        // the blob carries packed-prefill siblings or token-batch bodies and refuses by object
+        // name when a family object is missing. `=false` is the rollback; `=true` forces the
+        // load on a packet without siblings (the legacy opt-in).
         let command = super::AmdRuntimeConfig::augment_args(clap::Command::new("test"));
         let arg = command
             .get_arguments()
             .find(|arg| arg.get_id() == "packed_prefill_route")
             .expect("packed-prefill route argument");
-        assert_eq!(arg.get_default_values(), ["false"]);
-
+        assert!(arg.get_default_values().is_empty());
+        for (flag, want) in [
+            ("--amd-packed-prefill-route=true", Some(true)),
+            ("--amd-packed-prefill-route=false", Some(false)),
+        ] {
+            let matches = command
+                .clone()
+                .try_get_matches_from(["test", flag])
+                .expect("explicit packed-prefill route");
+            assert_eq!(
+                super::AmdRuntimeConfig::from_arg_matches(&matches)
+                    .expect("AMD config")
+                    .packed_prefill_route,
+                want
+            );
+        }
         let matches = command
             .clone()
-            .try_get_matches_from(["test", "--amd-packed-prefill-route=true"])
-            .expect("explicit packed-prefill route opt-in");
-        assert!(
+            .try_get_matches_from(["test"])
+            .expect("unset packed-prefill route");
+        assert_eq!(
             super::AmdRuntimeConfig::from_arg_matches(&matches)
                 .expect("AMD config")
-                .packed_prefill_route
+                .packed_prefill_route,
+            None
         );
 
         // The KDA family object is a SEPARATE axis and defaults ON: it doubles as the
@@ -1513,14 +1548,36 @@ mod tests {
             .expect("KDA family route argument");
         assert_eq!(arg.get_default_values(), ["true"]);
 
-        // `--pf-batch` is the shared mux half; it is off by
-        // default too, so neither flag alone can start a co-packed dispatch.
+        // `--pf-batch` is the shared mux half: unset resolves per vendor (AMD on, CUDA off),
+        // an explicit `=1` additionally rotates isolated admission, `=0` is the rollback.
         let shared = super::RuntimeConfig::augment_args(clap::Command::new("test"));
         let arg = shared
             .get_arguments()
             .find(|arg| arg.get_id() == "pf_batch")
             .expect("pf-batch argument");
-        assert_eq!(arg.get_default_values(), ["false"]);
+        assert!(arg.get_default_values().is_empty());
+        let cfg = |args: &[&str]| {
+            let matches = shared
+                .clone()
+                .try_get_matches_from(args)
+                .expect("pf-batch args");
+            super::RuntimeConfig::from_arg_matches(&matches).expect("runtime config")
+        };
+        let unset = cfg(&["test"]);
+        assert!(unset.pf_batch_amd() && !unset.pf_batch_cuda() && !unset.pf_rotate());
+        let on = cfg(&["test", "--pf-batch=true"]);
+        assert!(on.pf_batch_amd() && on.pf_batch_cuda() && on.pf_rotate());
+        let off = cfg(&["test", "--pf-batch=false"]);
+        assert!(!off.pf_batch_amd() && !off.pf_batch_cuda() && !off.pf_rotate());
+
+        // The step budget: unset is the vendor default (CUDA 2048 rows, AMD uncapped = the
+        // widest compiled rung); an explicit value clamps both.
+        assert_eq!(unset.pf_interleave_rows(), 2048);
+        assert_eq!(unset.pf_interleave_amd(), 0);
+        let capped = cfg(&["test", "--pf-interleave=512"]);
+        assert_eq!(capped.pf_interleave_rows(), 512);
+        assert_eq!(capped.pf_interleave_amd(), 512);
+        assert_eq!(cfg(&["test", "--pf-interleave=0"]).pf_interleave_rows(), usize::MAX);
     }
 
     #[test]

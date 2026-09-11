@@ -3233,13 +3233,16 @@ fn check_packed_dense_program(insts: &[DevInst64]) -> Result<()> {
     Ok(())
 }
 
+/// A packed-prefill program runs its class-A native segments (AITER MoE, hipBLASLt
+/// projections, the native fold) over the dense live rows exactly as an ordinary program does —
+/// the span table changes only how the MLA family segments address KV. What the packed flash
+/// arm cannot serve is gathered/sparse or NoPE flash, and the sparse selectors (`IndexTpPf`,
+/// class C: every row's position from one scalar), which is why the emitter gives sparse
+/// buckets no packed sibling.
 fn packed_mla_compatible(prog: &DevProg) -> bool {
     !prog.insts.iter().any(|d| {
         sparse_fp8(d)
-            || d.op == DevOp::MoeAiterFp8Pf as u16
             || d.op == DevOp::IndexTpPf as u16
-            || d.op == DevOp::GemmLtPf as u16
-            || amd_mla_fold::native(d)
             || d.op == DevOp::FlashGatherPrefill as u16
             || ((d.op == DevOp::FlashMlaPrefill as u16 || d.op == DevOp::FlashMlaPrefillFp8 as u16)
                 && (d.i[3] & 0x8000_0000 != 0
@@ -3248,10 +3251,8 @@ fn packed_mla_compatible(prog: &DevProg) -> bool {
     })
 }
 
-/// A token-batch body runs its class-A native segments (AITER MoE, hipBLASLt projections, the
-/// native fold) over the dense live rows exactly as an ordinary program does — the slot-band
-/// descriptor changes only how the MLA family segments address KV. What the packed flash arm
-/// cannot serve is the same for a body as for a packed program: gathered/sparse or NoPE flash.
+/// A token-batch body has the same admissible operator set as a packed program: the slot-band
+/// descriptor changes only how the MLA family segments address KV.
 fn token_batch_body_compatible(prog: &DevProg) -> bool {
     !prog.insts.iter().any(|d| {
         sparse_fp8(d)
@@ -7049,11 +7050,20 @@ impl AmdEngine {
         } else {
             ""
         };
-        let packed_route = crate::config::RuntimeConfig::get().amd.packed_prefill_route;
         let kda_family_route = crate::config::RuntimeConfig::get().amd.kda_family_route;
         // Token-batch body programs (`TOKEN_BATCH_PROG`): they need the `_tb` family objects
         // and the shared descriptor storage below.
         let has_bodies = blob.progs[..dec_ix].iter().any(|g| g.token_batch_body);
+        // THE PACKED ROUTE FOLLOWS THE PACKET. Unset, it is on exactly when the blob carries
+        // packed-prefill siblings or token-batch bodies — the emitter's half of the contract —
+        // and a family object those programs need is then a load error by name, not a
+        // `None` the mux discovers as "co-packing never fires". `PLOW_PACKED_PREFILL_ROUTE=0`
+        // is the rollback.
+        let has_siblings = blob.progs[..dec_ix].iter().any(|g| g.packed_prefill_only);
+        let packed_route = crate::config::RuntimeConfig::get()
+            .amd
+            .packed_prefill_route
+            .unwrap_or(has_siblings || has_bodies);
         let k_packed_mla_norm = if packed_route {
             load_packed_family(
                 &format!("interp_packed_mla_norm{packed_kv_infix}"),
@@ -7103,6 +7113,52 @@ impl AmdEngine {
         } else {
             (None, None)
         };
+        if packed_route {
+            let packed_programs = || {
+                blob.progs[..dec_ix]
+                    .iter()
+                    .filter(|g| g.packed_prefill_only || g.token_batch_body)
+            };
+            let needs_mla = packed_programs().any(|g| {
+                g.insts.iter().any(|d| {
+                    d.op == DevOp::RmsNorm as u16
+                        || d.op == DevOp::HeadNormRope as u16
+                        || d.op == DevOp::HeadNormRopeFp8 as u16
+                        || d.op == DevOp::FlashMlaPrefill as u16
+                        || d.op == DevOp::FlashMlaPrefillFp8 as u16
+                })
+            });
+            let suffix = sched_prefill.suffix();
+            let missing: Vec<String> = [
+                ("interp_packed_mla_norm", needs_mla, k_packed_mla_norm.is_some()),
+                ("interp_packed_mla_flash", needs_mla, k_packed_mla_flash.is_some()),
+                (
+                    "interp_packed_mla_norm_tb",
+                    needs_mla && has_bodies,
+                    k_packed_mla_norm_tb.is_some(),
+                ),
+                (
+                    "interp_packed_mla_flash_tb",
+                    needs_mla && has_bodies,
+                    k_packed_mla_flash_tb.is_some(),
+                ),
+            ]
+            .into_iter()
+            .filter(|&(_, needed, loaded)| needed && !loaded)
+            .map(|(stem, _, _)| format!("{stem}{packed_kv_infix}{suffix}.elf"))
+            .collect();
+            if !missing.is_empty() {
+                return Err(RuntimeError::Device(format!(
+                    "packed-prefill family object(s) {missing:?} are missing from {}: this packet \
+                     carries packed-prefill programs and the route is on (auto-selected from the \
+                     packet unless PLOW_PACKED_PREFILL_ROUTE is set). Build them with \
+                     PLOW_PACKED_PREFILL_CONSUMERS=1 (and PLOW_TOKEN_BATCH_TP_OBJECTS=1 for the \
+                     _tb twins) in scripts/build_gfx942.sh, or set PLOW_PACKED_PREFILL_ROUTE=0 to \
+                     serve every prefill isolated",
+                    hsaco_dir.display()
+                )));
+            }
+        }
         let kda_qpre_required = requires.as_ref().is_some_and(|requires| {
             requires
                 .iter()
@@ -9710,11 +9766,25 @@ impl AmdEngine {
     /// the route being off on a blob that needs it: a dense packet packs on the ordinary
     /// span-aware objects, but an MLA one is refused by `check_packed_prefill_program`
     /// wherever the family objects are not loaded, so `--pf-batch` alone reads as a null.
+    /// The packed route as resolved at load: the explicit knob, else the packet's own answer.
+    fn packed_prefill_route_armed(&self) -> bool {
+        crate::config::RuntimeConfig::get()
+            .amd
+            .packed_prefill_route
+            .unwrap_or_else(|| {
+                self.progs[..self.dec_lo]
+                    .iter()
+                    .any(|p| p.packed_prefill_only || p.token_batch_body)
+            })
+    }
+
     fn report_packed_prefill_route(&self, hsaco_dir: &Path) {
         let cfg = crate::config::RuntimeConfig::get();
-        let route = cfg.amd.packed_prefill_route;
-        let pf_batch = cfg.pf_batch;
-        if !route && !pf_batch {
+        let route = self.packed_prefill_route_armed();
+        let route_auto = cfg.amd.packed_prefill_route.is_none();
+        let pf_batch = cfg.pf_batch_amd();
+        if !route && cfg.pf_batch.is_none() {
+            // No siblings, no explicit opt-in: an ordinary packet on the default mux.
             return;
         }
         let suffix = self.sched_prefill.suffix();
@@ -9751,6 +9821,7 @@ impl AmdEngine {
         if capable.is_empty() {
             tracing::warn!(
                 route,
+                route_auto,
                 pf_batch,
                 dense_consumers = self.packed_prefill_dense,
                 packet_abi = self.packed_prefill_prefill_abi,
@@ -9764,12 +9835,14 @@ impl AmdEngine {
         } else if !pf_batch {
             tracing::warn!(
                 route,
+                route_auto,
                 rungs = ?capable,
                 "packed prefill is capable but --pf-batch is off — co-packing will never be attempted"
             );
         } else {
             tracing::info!(
                 route,
+                route_auto,
                 rungs = ?capable,
                 dense_consumers = self.packed_prefill_dense,
                 packet_abi = self.packed_prefill_prefill_abi,

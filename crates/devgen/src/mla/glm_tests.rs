@@ -61,9 +61,11 @@ fn small_prefill_splits_allocate_and_emit_matching_partial_layouts() {
     for (rows, expected) in [(1,32), (2,32), (4,32), (8,32), (16,32), (20,32),
         (32,32), (64,32), (128,16), (256,8), (512,4), (1024,2),
         (2048,1), (4096,1), (8192,1)] {
-        assert_eq!(glm_small_pf_split_cap(&c, 304, rows), expected);
-        assert_eq!(crate::with_emit_target_amd(false, || glm_small_pf_split_cap(&c, 304, rows)), 1);
-        assert_eq!(glm_small_pf_split_cap(&c, 256, rows), 1);
+        assert_eq!(glm_small_pf_split_cap(&c, 304, rows, false), expected);
+        // A packed-topology program has no KV-split axis in its flash arm: one partial per row.
+        assert_eq!(glm_small_pf_split_cap(&c, 304, rows, true), 1);
+        assert_eq!(crate::with_emit_target_amd(false, || glm_small_pf_split_cap(&c, 304, rows, false)), 1);
+        assert_eq!(glm_small_pf_split_cap(&c, 256, rows, false), 1);
         let mut decl = Builder::new(304);
         let n = declare_glm_rows_batched(&mut decl, &c, 81920, &[0], rows, 20, MoeEnc::Fp8Blk);
         let mut b = Builder::new(304);
@@ -2525,4 +2527,117 @@ fn dsa_decode_nsplit_fills_one_item_per_cu() {
     // The pin wins, as it does for the dense rule.
     let _pin = crate::test_env::EnvScope::set(&[("PLOW_MLA_NS", "8")]);
     assert_eq!(glm_dsa_decode_nsplit(20, 8, 4, 304), 8);
+}
+
+/// The packed siblings ride next to the native AITER MoE and hipBLASLt segments — the production
+/// gfx942 TP8 recipe — and emitting them leaves every ordinary program byte-identical. This is
+/// the emit half of what lets the serve mux pack several requests' spans into one rung on that
+/// recipe; the runtime half is `exec/amd.rs`'s `packed_mla_compatible`.
+#[test]
+fn packed_siblings_carry_native_moe_and_leave_the_plain_programs_byte_identical() {
+    use std::sync::{Arc, Mutex};
+    let _guard = crate::test_env::env_guard();
+    let _target = crate::EmitAmdGuard::set(true);
+    let dir = std::env::temp_dir().join(format!("plow-glm-packed-native-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = serde_json::json!({
+        "model_type": "glm_moe_dsa", "num_hidden_layers": 4,
+        "hidden_size": 6144, "num_attention_heads": 64,
+        "kv_lora_rank": 512, "q_lora_rank": 2048,
+        "qk_nope_head_dim": 192, "qk_rope_head_dim": 64, "v_head_dim": 256,
+        "vocab_size": 128, "rms_norm_eps": 1e-5,
+        "n_routed_experts": 256, "num_experts_per_tok": 8,
+        "moe_intermediate_size": 2048, "intermediate_size": 12288,
+        "first_k_dense_replace": 3, "routed_scaling_factor": 2.5,
+        "rope_theta": 8000000.0
+    });
+    std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+    type Snapshot = Vec<(u32, Vec<packet::dev::DevInst>, Vec<packet::dev::StreamEnt>, Vec<packet::dev::StreamEnt>)>;
+    let emit = |packed: &str| -> Snapshot {
+        let _env = crate::test_env::EnvScope::set(&[
+            ("PLOW_MLA_PREFILL", "full:128,2048"),
+            ("PLOW_GLM_MOE_AITER", "1"),
+            ("PLOW_GLM_GEMM_LT", "1"),
+            ("PLOW_EMIT_PACKED_PREFILL", packed),
+            ("PLOW_UNISEG", "0"),
+        ]);
+        let seen: Arc<Mutex<Snapshot>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let verify: crate::VerifyHook = Box::new(move |model| {
+            *sink.lock().unwrap() = model
+                .progs
+                .iter()
+                .zip(&model.prog_t)
+                .map(|(p, &t)| (t, p.insts.clone(), p.stream.clone(), p.gq_stream.clone()))
+                .collect();
+            Ok(crate::LeanReport::skipped("structural regression test"))
+        });
+        glm_emit_full(
+            &dir,
+            4096,
+            dir.join("model.pkt").to_str().unwrap(),
+            304,
+            8,
+            true,
+            true,
+            "gfx942",
+            None,
+            Some(&verify),
+        );
+        let out = seen.lock().unwrap().clone();
+        out
+    };
+    let plain = emit("0");
+    let with_siblings = emit("1");
+    std::fs::remove_dir_all(dir).unwrap();
+
+    assert!(plain.iter().all(|(t, ..)| !packet::devbuild::is_packed_prefill_program(*t)));
+    // Every ordinary program — both prefill buckets and the decode rung — is byte-identical.
+    for entry in &plain {
+        let twin = with_siblings
+            .iter()
+            .find(|e| e.0 == entry.0)
+            .unwrap_or_else(|| panic!("program t={} vanished under the packed emit", entry.0));
+        assert!(entry == twin, "program t={} changed under the packed emit", entry.0);
+    }
+    // Each dense bucket gained exactly one sibling, and the sibling carries the native segments.
+    for rows in [128u32, 2048] {
+        let siblings: Vec<_> = with_siblings
+            .iter()
+            .filter(|e| e.0 == packet::devbuild::packed_prefill_program_t(rows))
+            .collect();
+        assert_eq!(siblings.len(), 1, "rows={rows}");
+        let (_, insts, stream, _) = siblings[0];
+        let has = |op: DevOp| insts.iter().any(|d| d.op == op as u16);
+        assert!(has(DevOp::MoeAiterFp8Pf), "rows={rows}: native MoE");
+        assert_eq!(has(DevOp::GemmLtPf), rows >= 2048, "rows={rows}: hipBLASLt");
+        assert!(!has(DevOp::IndexTpPf) && !has(DevOp::FlashGatherPrefill));
+        // The MLA family segments are pure: a norm/flash op never shares its segment with a
+        // Gemm or the MoE chain, which is what `check_packed_prefill_program` routes on.
+        let family = |op: u16| -> u8 {
+            if op == DevOp::RmsNorm as u16
+                || op == DevOp::HeadNormRope as u16
+                || op == DevOp::HeadNormRopeFp8 as u16
+            {
+                5
+            } else if op == DevOp::FlashMlaPrefill as u16 || op == DevOp::FlashMlaPrefillFp8 as u16 {
+                6
+            } else {
+                0
+            }
+        };
+        let seg_family = |seg: u16| -> Vec<u8> {
+            stream
+                .iter()
+                .filter(|e| e.seg == seg)
+                .map(|e| family(insts[e.inst as usize].op))
+                .collect()
+        };
+        for e in stream {
+            let f = family(insts[e.inst as usize].op);
+            if f != 0 {
+                assert!(seg_family(e.seg).iter().all(|&g| g == f), "rows={rows} seg={}", e.seg);
+            }
+        }
+    }
 }

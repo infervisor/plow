@@ -4761,3 +4761,45 @@ fn resident_moe_weight_layout_matches_gpu_vector_packing() {
         assert!(resident_moe_scales(bytemuck::cast_slice(&vec![value; 96])).is_err());
     }
 }
+
+/// The packed-prefill predicate admits the class-A native segments (AITER MoE, hipBLASLt
+/// projections) exactly as the token-batch body predicate does — they run over the dense live
+/// rows and read no per-row position — and still refuses the class-C sparse selectors.
+#[test]
+fn packed_prefill_predicate_admits_native_moe_and_gemm_lt_and_refuses_sparse_selectors() {
+    let prog = |ops: &[DevOp]| DevProg {
+        t: 2048,
+        packed_prefill_only: true,
+        token_batch_body: false,
+        n_counter: 0,
+        insts: ops
+            .iter()
+            .map(|&op| DevInst64 {
+                op: op as u16,
+                ..Default::default()
+            })
+            .collect(),
+        stream: Vec::new(),
+        stream_ofs: Vec::new(),
+        stream_len: Vec::new(),
+        waits: Vec::new(),
+        succs: Vec::new(),
+        gq_stream: Vec::new(),
+        gq_seg_ofs: Vec::new(),
+        l2_domains: 0,
+    };
+    let native = prog(&[
+        DevOp::RmsNorm,
+        DevOp::GemmLtPf,
+        DevOp::HeadNormRopeFp8,
+        DevOp::FlashMlaPrefillFp8,
+        DevOp::MoeAiterFp8Pf,
+    ]);
+    assert!(packed_mla_compatible(&native));
+    assert!(token_batch_body_compatible(&native));
+    for refused in [DevOp::IndexTpPf, DevOp::FlashGatherPrefill] {
+        let sparse = prog(&[DevOp::RmsNorm, refused]);
+        assert!(!packed_mla_compatible(&sparse), "{refused:?}");
+        assert!(!token_batch_body_compatible(&sparse), "{refused:?}");
+    }
+}
