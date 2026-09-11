@@ -240,7 +240,7 @@ pub fn dense_gemm_inventory(root: &Path, isa: IsaLevel) -> Result<Inventory, Pro
         program: format!("no interpreter recipe for {}", isa.arch_flag()),
     })?;
     let target = recipe.target(root);
-    let toolchain = toolchain_label(&recipe);
+    let toolchain = toolchain_label(recipe.isa);
     let obj = probe(&target, isa, &toolchain)?;
 
     let gemm_ops = [DevOp::Gemm, DevOp::GemmMed, DevOp::GemmSmall];
@@ -337,7 +337,7 @@ pub fn dense_gemm_tuning_build(root: &Path, isa: IsaLevel) -> Result<crate::Buil
         program: format!("no interpreter recipe for {}", isa.arch_flag()),
     })?;
     let target = recipe.target(root);
-    let toolchain = toolchain_label(&recipe);
+    let toolchain = toolchain_label(recipe.isa);
 
     if isa != IsaLevel::Gfx950 {
         let text = target.preprocess()?;
@@ -370,11 +370,11 @@ pub fn dense_gemm_tuning_build(root: &Path, isa: IsaLevel) -> Result<crate::Buil
     ))
 }
 
-fn toolchain_label(recipe: &ObjectRecipe) -> String {
+pub fn toolchain_label(isa: IsaLevel) -> String {
     if let Ok(label) = std::env::var("PLOW_TOOLCHAIN_LABEL") {
         return label;
     }
-    match recipe.isa {
+    match isa {
         IsaLevel::Gfx942 | IsaLevel::Gfx950 => "rocm".into(),
         _ => "cuda".into(),
     }

@@ -11,7 +11,8 @@ pub const PREFILL_ATTENTION_HD512_WG32: u8 = 6;
 pub const MXFP4_MOE: u8 = 7;
 pub const NATIVE_DECODE_TC: u8 = 8;
 pub const W8A16_PREFILL_M1: u8 = 9;
-pub const MAX_ROLE: u8 = W8A16_PREFILL_M1;
+pub const PREFILL_ATTENTION_HD256_BKV64: u8 = 10;
+pub const MAX_ROLE: u8 = PREFILL_ATTENTION_HD256_BKV64;
 
 pub fn is_projection(role: u8) -> bool {
     matches!(role, CUBLASLT | NATIVE_DECODE_TC)
@@ -27,6 +28,7 @@ pub fn cublaslt_prefill_bf16(profile: &str, m: u32, n: u32, k: u32) -> bool {
 }
 
 pub const PREFILL_ATTENTION_HD512_WG32_ABI: &str = "attention_sm90_hd512_wg32_v1";
+pub const PREFILL_ATTENTION_HD256_BKV64_ABI: &str = "attention_sm90_hd256_bkv64_v1";
 pub const MXFP4_MOE_ABI: &str = "mxfp4_moe_sm90_v1";
 pub const W8A16_PREFILL_M1_ABI: &str = "w8a16_prefill_m1_sm90_v1";
 
@@ -41,6 +43,7 @@ pub fn requires_object(role: u8) -> bool {
             | MXFP4_MOE
             | NATIVE_DECODE_TC
             | W8A16_PREFILL_M1
+            | PREFILL_ATTENTION_HD256_BKV64
     )
 }
 
@@ -129,6 +132,7 @@ impl SegmentRoles {
                 MXFP4_MOE => MXFP4_MOE_ABI,
                 NATIVE_DECODE_TC => "gemv_transposed_sm90_bf16_v1",
                 W8A16_PREFILL_M1 => W8A16_PREFILL_M1_ABI,
+                PREFILL_ATTENTION_HD256_BKV64 => PREFILL_ATTENTION_HD256_BKV64_ABI,
                 _ => return Err("invalid packet segment object role".into()),
             };
             let valid_hash = |hash: Option<&str>| {
@@ -158,6 +162,14 @@ impl SegmentRoles {
                 kv_tile: 64,
                 ..hd512_wg.clone()
             };
+            let hd256_bkv64 = AttentionCapability {
+                profile: "sm90a".into(),
+                dtype: "bf16".into(),
+                head_dim: 256,
+                query_tile: 64,
+                kv_tile: 64,
+                warps: 8,
+            };
             if object.abi != abi
                 || object.file.is_empty()
                 || std::path::Path::new(&object.file)
@@ -174,6 +186,10 @@ impl SegmentRoles {
                             .attention
                             .as_ref()
                             .is_none_or(|a| a != &hd512_wg && a != &hd512_wg64 && a != &hd512_px4)))
+                || (id == PREFILL_ATTENTION_HD256_BKV64
+                    && (!valid_hash(object.sha256.as_deref())
+                        || object.promote_k512.is_some()
+                        || object.attention.as_ref() != Some(&hd256_bkv64)))
                 || (matches!(id, MXFP4_MOE | NATIVE_DECODE_TC | W8A16_PREFILL_M1)
                     && (!valid_hash(object.sha256.as_deref())
                         || object.promote_k512.is_some()
@@ -185,6 +201,7 @@ impl SegmentRoles {
                         | MXFP4_MOE
                         | NATIVE_DECODE_TC
                         | W8A16_PREFILL_M1
+                        | PREFILL_ATTENTION_HD256_BKV64
                 ) && (object.sha256.is_some()
                     || object.promote_k512.is_some()
                     || object.attention.is_some()))
@@ -306,6 +323,24 @@ mod tests {
             raw.replace("\"warps\":8", "\"warps\":4"),
             raw.replace("\"profile\":\"sm90a\"", "\"profile\":\"sm120\""),
             raw.replace("\"dtype\":\"bf16\"", "\"dtype\":\"fp8\""),
+        ] {
+            assert!(SegmentRoles::from_bytes(bad.as_bytes()).is_err());
+        }
+    }
+
+    #[test]
+    fn hd256_bkv64_attention_role_requires_exact_hash_and_capability() {
+        let raw = format!(
+            r#"{{"version":1,"objects":{{"10":{{"abi":"attention_sm90_hd256_bkv64_v1","file":"attention.cubin","sha256":"{}","attention":{{"profile":"sm90a","dtype":"bf16","head_dim":256,"query_tile":64,"kv_tile":64,"warps":8}}}}}},"programs":[{{"index":0,"roles":[0,10,0]}}]}}"#,
+            "a".repeat(64)
+        );
+        SegmentRoles::from_bytes(raw.as_bytes()).unwrap();
+        for bad in [
+            raw.replace(&"a".repeat(64), "bad"),
+            raw.replace("\"head_dim\":256", "\"head_dim\":512"),
+            raw.replace("\"query_tile\":64", "\"query_tile\":32"),
+            raw.replace("\"kv_tile\":64", "\"kv_tile\":32"),
+            raw.replace("\"warps\":8", "\"warps\":4"),
         ] {
             assert!(SegmentRoles::from_bytes(bad.as_bytes()).is_err());
         }

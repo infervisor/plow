@@ -62,9 +62,9 @@ class Gemma4LadderCampaignTests(unittest.TestCase):
         )
         self.assertEqual([x["rung"] for x in rungs], list(campaign.RUNGS))
         self.assertEqual([x["rung"] for x in decode_rungs], list(campaign.DECODE_RUNGS))
-        self.assertEqual(len(profiles), 3456)
+        self.assertEqual(len(profiles), 3612)
         self.assertEqual(sum(x["phase"] == "prefill" for x in profiles), 2753)
-        self.assertEqual(sum(x["phase"] == "decode" for x in profiles), 703)
+        self.assertEqual(sum(x["phase"] == "decode" for x in profiles), 859)
         self.assertEqual(len({x["profile_key"] for x in profiles}), len(profiles))
         local = next(
             x for x in profiles
@@ -78,7 +78,7 @@ class Gemma4LadderCampaignTests(unittest.TestCase):
 
     def test_full_logit_plan_marks_every_rung_pending(self):
         cells = campaign.full_logit_plan()
-        self.assertEqual(len(cells), 19)
+        self.assertEqual(len(cells), 20)
         self.assertEqual(
             [(x["phase"], x["rung"]) for x in cells],
             [("prefill", rung) for rung in campaign.RUNGS]
@@ -241,7 +241,7 @@ class Gemma4LadderCampaignTests(unittest.TestCase):
                 root,
             )
             self.assertTrue(result["pass"])
-            self.assertEqual(len(result["cells"]), 19)
+            self.assertEqual(len(result["cells"]), 20)
             self.assertEqual(order.read_text().splitlines(), ["prefill", "decode"])
             self.assertTrue(all(x["status"] == "pass" for x in result["cells"]))
 

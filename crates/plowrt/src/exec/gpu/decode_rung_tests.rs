@@ -530,11 +530,24 @@ fn unsupported_families_and_single_rung_keep_widest_execution() {
 #[ignore = "CPU-only actual packet check; set TEST_DECODE_RUNG_PACKET"]
 fn actual_packet_decode_ladder() {
     let path = std::env::var("TEST_DECODE_RUNG_PACKET").unwrap();
-    let blob = DevBlob::parse(&std::fs::read(&path).unwrap()).unwrap();
-    assert!(
-        validate_decode_ladder(&blob).unwrap(),
-        "ladder did not qualify: {path}"
-    );
+    let raw = std::fs::read(&path).unwrap();
+    let blob = DevBlob::parse(&raw).unwrap();
+    let roles = segment_role_metadata(&blob, &raw).unwrap();
+    let projection = roles.as_ref().is_some_and(|roles| {
+        roles.program(blob.progs.len() - 1).is_some_and(|program| {
+            program
+                .roles
+                .iter()
+                .copied()
+                .any(plow_asset::segment_roles::is_projection)
+        })
+    });
+    let qualified = if projection {
+        validate_cublaslt_ladder(&blob, roles.as_ref().unwrap()).unwrap()
+    } else {
+        validate_decode_ladder(&blob).unwrap()
+    };
+    assert!(qualified, "ladder did not qualify: {path}");
     eprintln!("{path}: qualified widths {:?}", blob.decode_rungs());
 }
 

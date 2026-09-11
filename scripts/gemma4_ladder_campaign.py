@@ -35,7 +35,7 @@ import tempfile
 
 
 RUNGS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
-DECODE_RUNGS = (1, 2, 4, 8, 16)
+DECODE_RUNGS = (1, 2, 4, 8, 16, 32)
 CONTEXTS = RUNGS + (16384,)
 GLOBAL_KV_LENGTHS = tuple(sorted({
     boundary + offset
