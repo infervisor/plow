@@ -46,6 +46,7 @@ use crate::exec::indirection::slots as ind_slots;
 use crate::exec::oob::{OobChannel, OobMsg};
 use crate::memory::streamer::{KvArena, SlotHandle};
 use crate::memory::AddressSpace;
+use crate::obs::serving::RequestMetrics;
 use crate::obs::Metrics;
 use crate::sched::admission::{admit, Admit, LoadEstimator};
 use crate::sched::batching::{formation_window_ms, select_bucket};
@@ -192,7 +193,7 @@ pub struct ModelMux {
 
 /// Internal messages to the dispatcher: jobs or control signals.
 enum MuxMsg {
-    Job(Job),
+    Job(Job, Instant),
     /// Graceful drain: stop admitting new requests, finish in-flight slots,
     /// then signal completion through the oneshot.
     Drain(tokio::sync::oneshot::Sender<()>),
@@ -281,15 +282,28 @@ fn completed_decode(feeds: &[(usize, u32)], steps: usize) -> Option<DecodeProgre
 impl ModelMux {
     /// Submit a job. Returns immediately; the caller awaits the stream.
     pub fn submit(&self, job: Job) -> std::result::Result<(), SubmitError> {
+        let arrived = job.arrived;
+        self.submit_arrived(job, arrived)
+    }
+
+    pub(crate) fn submit_arrived(
+        &self,
+        job: Job,
+        arrived: Instant,
+    ) -> std::result::Result<(), SubmitError> {
+        Metrics::inc(&self.metrics.requests);
+        self.metrics.serving.max_tokens.tokens(job.gen.max_tokens);
         Metrics::inc(&self.metrics.queued_requests);
-        match self.tx.try_send(MuxMsg::Job(job)) {
+        match self.tx.try_send(MuxMsg::Job(job, arrived)) {
             Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Full(MuxMsg::Job(job))) => {
+            Err(mpsc::error::TrySendError::Full(MuxMsg::Job(job, _))) => {
                 self.metrics.queued_requests.fetch_sub(1, Ordering::Relaxed);
+                Metrics::inc(&self.metrics.rejected);
                 Err(SubmitError::Full(job))
             }
-            Err(mpsc::error::TrySendError::Closed(MuxMsg::Job(job))) => {
+            Err(mpsc::error::TrySendError::Closed(MuxMsg::Job(job, _))) => {
                 self.metrics.queued_requests.fetch_sub(1, Ordering::Relaxed);
+                Metrics::inc(&self.metrics.rejected);
                 Err(SubmitError::Closed(job))
             }
             Err(_) => unreachable!(),
@@ -325,6 +339,7 @@ impl ModelMux {
 
 /// One live request occupying a slot in the engine.
 struct Slot {
+    telemetry: Option<RequestMetrics>,
     prompt_ids: Vec<u32>,
     out_ids: Vec<u32>,
     gen: GenParams,
@@ -397,7 +412,7 @@ pub fn spawn(
     let preempt_seen = Arc::clone(&preempt_flag);
     let preempt_notify = Arc::new(tokio::sync::Notify::new());
     let preempt_wake = Arc::clone(&preempt_notify);
-    let metrics = Arc::clone(&state.metrics);
+    let metrics = state.model_metrics(&slug);
     let handle_metrics = Arc::clone(&metrics);
 
     // Slot capacity from the compiler-emitted ladder — the largest decode
@@ -567,7 +582,8 @@ pub fn spawn(
                         MuxMsg::Drain(done) => {
                             let _ = done.send(());
                         }
-                        MuxMsg::Job(job) => {
+                        MuxMsg::Job(job, _) => {
+                            Metrics::inc(&metrics.rejected);
                             let _ = job.respond.try_send(StreamChunk::Err(
                                 crate::RuntimeError::Rejected(
                                     "model preempted for an S1 switch — retry".into(),
@@ -582,16 +598,19 @@ pub fn spawn(
             // Cold start: no live slots — block until an arrival (or exit
             // when every ModelMux clone has dropped and the channel closes).
             if live == 0 {
+                metrics.decode_occupied_extent.store(0, Ordering::Relaxed);
+                metrics.decode_rung_actual.store(0, Ordering::Relaxed);
                 // Parking with the turn held would starve a co-tenant for as
                 // long as this model has nothing to do, which is unbounded.
                 turn.release();
                 let Some(msg) = rx.recv().await else { break };
                 note_dequeued(&msg, &metrics);
                 match msg {
-                    MuxMsg::Job(job) => {
+                    MuxMsg::Job(job, arrived) => {
                         admit_into(
                             &mut slots,
                             job,
+                            arrived,
                             &mut load,
                             &mut last_arrival,
                             arena.as_ref(),
@@ -617,8 +636,7 @@ pub fn spawn(
                     .rposition(Option::is_some)
                     .map(|i| i + 1)
                     .unwrap_or(1);
-                // This receiver belongs to one model. The exported metric is
-                // process-wide and cannot drive a per-model rung controller.
+                // Read the receiver directly for an exact local admission snapshot.
                 let queued = rx.len();
                 let (sum, n) = slots
                     .iter()
@@ -698,9 +716,10 @@ pub fn spawn(
                             Ok(Some(msg)) => {
                                 note_dequeued(&msg, &metrics);
                                 match msg {
-                                    MuxMsg::Job(job) => admit_into(
+                                    MuxMsg::Job(job, arrived) => admit_into(
                                         &mut slots[..admission_limit],
                                         job,
+                                        arrived,
                                         &mut load,
                                         &mut last_arrival,
                                         arena.as_ref(),
@@ -725,9 +744,10 @@ pub fn spawn(
                         Ok(msg) => {
                             note_dequeued(&msg, &metrics);
                             match msg {
-                                MuxMsg::Job(job) => admit_into(
+                                MuxMsg::Job(job, arrived) => admit_into(
                                     &mut slots[..admission_limit],
                                     job,
+                                    arrived,
                                     &mut load,
                                     &mut last_arrival,
                                     arena.as_ref(),
@@ -912,6 +932,7 @@ pub fn spawn(
             let arena_ref = arena.clone();
             let kv_pages_for_tick = kv_pages_range.clone();
 
+            metrics.serving.tick_batch.tokens(live);
             let t_service_start = Instant::now();
             let tick = move || {
                 run_one_tick(
@@ -953,6 +974,16 @@ pub fn spawn(
                     // Decode-service EWMA: prefill ticks are excluded — see
                     // `service_sample`. Updating on them poisons the admission
                     // predictor and sheds live decode streams.
+                    let phase = match (did_prefill, decode_progress.is_some()) {
+                        (true, true) => 2,
+                        (true, false) => 0,
+                        _ => 1,
+                    };
+                    metrics.serving.ticks[phase].duration(t_service_start.elapsed());
+                    metrics.serving.tick_tokens.tokens(tokens_produced);
+                    if tick_fault.is_some() {
+                        Metrics::inc(&metrics.serving.tick_errors);
+                    }
                     let sample = service_sample(ms, did_prefill);
                     if let Some(sample) = sample {
                         load.service_ms.update(sample);
@@ -1002,6 +1033,7 @@ pub fn spawn(
                     }
                 }
                 Err(e) => {
+                    Metrics::inc(&metrics.serving.tick_errors);
                     tracing::error!(%slug, error = %e, "mux tick task panicked");
                     // Reinitialize; every in-flight slot is lost. Bufs cache
                     // and observer rebuild lazily — the panic is per-tick.
@@ -1037,6 +1069,9 @@ pub fn spawn(
                 }
             }
         }
+        metrics.decode_rung_actual.store(0, Ordering::Relaxed);
+        metrics.decode_rung_admission.store(0, Ordering::Relaxed);
+        metrics.decode_occupied_extent.store(0, Ordering::Relaxed);
     });
 
     ModelMux {
@@ -1048,7 +1083,7 @@ pub fn spawn(
 }
 
 fn note_dequeued(msg: &MuxMsg, metrics: &Metrics) {
-    if matches!(msg, MuxMsg::Job(_)) {
+    if matches!(msg, MuxMsg::Job(_, _)) {
         metrics.queued_requests.fetch_sub(1, Ordering::Relaxed);
     }
 }
@@ -1060,10 +1095,11 @@ fn note_dequeued(msg: &MuxMsg, metrics: &Metrics) {
 fn admit_into(
     slots: &mut [Option<Slot>],
     job: Job,
+    arrived: Instant,
     load: &mut LoadEstimator,
     last_arrival: &mut Option<Instant>,
     arena: Option<&SharedKvState>,
-    metrics: &Metrics,
+    metrics: &Arc<Metrics>,
     health: &EngineHealth,
 ) {
     // A dead engine cannot serve anyone — reject up front with the fault that
@@ -1125,6 +1161,7 @@ fn admit_into(
         match arena.lock().arena.allocate_slot(seq_upper) {
             Ok(h) => Some(h),
             Err(e) => {
+                Metrics::inc(&metrics.rejected);
                 tracing::warn!(error = %e, seq_upper, "mux: kv arena OOM — request shed");
                 let _ = job
                     .respond
@@ -1138,7 +1175,14 @@ fn admit_into(
         None
     };
 
+    let telemetry = Some(RequestMetrics::new(
+        Arc::clone(metrics),
+        arrived,
+        job.arrived,
+        job.prompt_ids.len(),
+    ));
     slots[idx] = Some(Slot {
+        telemetry,
         prompt_ids: job.prompt_ids,
         out_ids: Vec::new(),
         gen: job.gen,
@@ -1170,9 +1214,12 @@ fn release_kv(arena: &Option<SharedKvState>, handle: Option<SlotHandle>) {
 /// is reclaimed on the next admit).
 async fn preempt_slots(slots: &mut [Option<Slot>], arena: &Option<SharedKvState>) {
     for slot_opt in slots.iter_mut() {
-        let Some(slot) = slot_opt.take() else {
+        let Some(mut slot) = slot_opt.take() else {
             continue;
         };
+        if let Some(telemetry) = slot.telemetry.as_mut() {
+            telemetry.finish(FinishReason::Preempted, slot.executed);
+        }
         let done = StreamChunk::Done {
             executed: slot.executed,
             reason: FinishReason::Preempted,
@@ -3768,6 +3815,9 @@ fn handle_produced_token(
     let Some(slot) = slot_opt.as_mut() else {
         return;
     };
+    if let Some(telemetry) = slot.telemetry.as_mut() {
+        telemetry.token(slot.cached_tokens);
+    }
     slot.out_ids.push(token);
     slot.executed += exec;
     slot.step += 1;
@@ -3899,6 +3949,9 @@ fn handle_produced_token(
         } else {
             FinishReason::Stop
         };
+        if let Some(telemetry) = slot.telemetry.as_mut() {
+            telemetry.finish(reason, slot.executed);
+        }
         let _ = slot.respond.try_send(StreamChunk::Done {
             executed: slot.executed,
             reason,
@@ -4231,6 +4284,7 @@ mod tests {
         let (respond, rx) = crate::serve::stream::channel();
         (
             Some(Slot {
+                telemetry: None,
                 prompt_ids: vec![1, 2, 3],
                 out_ids: Vec::new(),
                 gen: GenParams::default(),

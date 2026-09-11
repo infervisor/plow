@@ -476,7 +476,6 @@ pub async fn run_prefill_sweep(
     let mut request_offset = 0usize;
     for input in &cfg.inputs {
         if cfg.warmup_requests > 0 {
-            crate::obs::Metrics::add(&state.metrics.requests, cfg.warmup_requests as u64);
             let warmup = drive(
                 &mux,
                 input,
@@ -492,7 +491,6 @@ pub async fn run_prefill_sweep(
             request_offset += cfg.warmup_requests;
         }
 
-        crate::obs::Metrics::add(&state.metrics.requests, cfg.repetitions as u64);
         let measured_offset = request_offset;
         let started = Instant::now();
         let results = drive(&mux, input, vocab, 1, cfg.repetitions, 1, measured_offset).await?;
@@ -597,7 +595,6 @@ pub async fn run(state: &AppState, cfg: Config) -> Result<Report> {
     let engine = None;
 
     if cfg.warmup_requests > 0 {
-        crate::obs::Metrics::add(&state.metrics.requests, cfg.warmup_requests as u64);
         let warmup = drive(
             &mux,
             &cfg.input,
@@ -611,13 +608,12 @@ pub async fn run(state: &AppState, cfg: Config) -> Result<Report> {
         validate(&warmup, cfg.output_tokens)?;
     }
 
-    let metrics = &state.metrics;
+    let metrics = state.model_metrics(&cfg.model);
     let batch_count_before = metrics.batch_count.load(Ordering::Relaxed);
     let batch_sum_before = metrics.batch_size_sum.load(Ordering::Relaxed);
     let rejected_before = metrics.rejected.load(Ordering::Relaxed);
     let admit_shed_before = metrics.admit_shed.load(Ordering::Relaxed);
     let rung_switches_before = metrics.decode_rung_switches.load(Ordering::Relaxed);
-    crate::obs::Metrics::add(&state.metrics.requests, cfg.requests as u64);
     let started = Instant::now();
     let results = drive(
         &mux,
