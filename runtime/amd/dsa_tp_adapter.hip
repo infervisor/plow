@@ -130,15 +130,31 @@ extern "C" __global__ void plow_dsa_tp_gather(DsaTpGatherArgs a) {
                               a.deadline, a.status, blockIdx.x, &bailed))
         return;
     const unsigned band_vectors = ((a.rows + 7u) / 8u) * 512u;
-    for (unsigned step = 0; step < 8; ++step) {
-        const unsigned src = (a.rank + step) & 7u;
-        const unsigned lo = src * band_vectors;
-        const unsigned hi = min(lo + band_vectors, a.rows * 512u);
-        const auto* source = (const uint4*)((const char*)a.peers[src] + a.slot_offset);
-        for (unsigned i = lo + blockIdx.x * blockDim.x + threadIdx.x;
-             i < hi; i += gridDim.x * blockDim.x)
-            a.out[i] = source[i];
+    // Workgroup group w % 8 < 7 copies the band of peer rank + 1 + w % 8, group 7 the local
+    // band, so all seven xGMI links carry a band at once; the serial loop below walked the peers
+    // one after another with the whole grid on one link. One 16 B load per lane: holding four per
+    // lane made the compiler promote them to an alloca (16400 B LDS, 48 B/lane scratch), and
+    // IndexTp::load refuses a private segment.
+    const unsigned lanes = (gridDim.x / 8u) * blockDim.x;
+    if (lanes == 0u) {  // grid narrower than the eight peer groups; plowrt launches GATHER_GRID = 304
+        for (unsigned step = 0; step < 8; ++step) {
+            const unsigned src = (a.rank + step) & 7u;
+            const unsigned lo = src * band_vectors;
+            const unsigned hi = min(lo + band_vectors, a.rows * 512u);
+            const auto* source = (const uint4*)((const char*)a.peers[src] + a.slot_offset);
+            for (unsigned i = lo + blockIdx.x * blockDim.x + threadIdx.x;
+                 i < hi; i += gridDim.x * blockDim.x)
+                a.out[i] = source[i];
+        }
+        return;
     }
+    if (blockIdx.x >= (gridDim.x / 8u) * 8u) return;
+    const unsigned group = blockIdx.x % 8u, sub = blockIdx.x / 8u;
+    const unsigned src = group == 7u ? a.rank : ((a.rank + 1u + group) & 7u);
+    const unsigned lo = src * band_vectors;
+    const unsigned hi = min(lo + band_vectors, a.rows * 512u);
+    const auto* source = (const uint4*)((const char*)a.peers[src] + a.slot_offset);
+    for (unsigned i = lo + sub * blockDim.x + threadIdx.x; i < hi; i += lanes) a.out[i] = source[i];
 #endif
 }
 

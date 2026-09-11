@@ -452,6 +452,19 @@ mod tests {
         (prog, tensors, tp)
     }
 
+    /// A freshly built `dsa_tp_adapter_gfx942.elf` must pass the loader's resource ABI checks
+    /// (kernarg sizes, no private segment): a kernel edit can break them with every CPU test
+    /// still green, and the failure only surfaces when a server starts.
+    #[test]
+    #[ignore = "requires a gfx942 GPU lease and PLOW_TEST_DSA_DIR"]
+    fn index_tp_adapter_loads_hsa() {
+        let dir = std::env::var("PLOW_TEST_DSA_DIR").unwrap();
+        let be = HsaBackend::new(0).unwrap();
+        let mut modules = Vec::new();
+        let kernel = IndexTp::load(&be, Path::new(&dir), &mut modules).unwrap();
+        assert!(kernel.span_aware());
+    }
+
     /// `plow_dsa_tp_gather` gives workgroup `w` the band of peer `rank + 1 + w % 7` (and the
     /// local band every eighth workgroup), so the launch width must divide into eight equal peer
     /// groups; a narrower grid leaves `lanes == 0` and takes the kernel's serial fallback.
