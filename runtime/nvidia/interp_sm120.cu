@@ -610,6 +610,9 @@ __device__ __forceinline__ PlowStreamEnt ld_stream_ent(const PlowStreamEnt* p) {
 #ifndef PLOW_NV_DSA
 #define PLOW_NV_DSA 1
 #endif
+#ifndef PLOW_DSA_DECODE_BATCH
+#define PLOW_DSA_DECODE_BATCH 1
+#endif
 
 /* Two-level paste is intentional: interp_sm90a.cu aliases the public SM120
  * identifiers before including this shared implementation. A one-level
@@ -2124,11 +2127,13 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 
     /* V5 SELECT: top-k radix threshold, ONE cooperative launch over the packet's `blocks` co-
      *   resident CUs (nblk here == in->blocks == 32; slice == 0..blocks-1); fenceless L2-atomic
-     *   grid barrier. t0=idx(i32) t1=Score(f32) t2=gHist(u32) t3=gCtl(u32); i0=len i1=top_k. No
-     *   n_sel tensor (gather reads top_k directly; ctx>65536 => len>top_k) -> nullptr. */
+     *   grid barrier. t0=idx(i32) t1=Score(f32) t2=gHist(u32) t3=gCtl(u32) t4=kv_len(i32);
+     *   i0=len_max i1=top_k_max i3=batch_row. No n_sel tensor (gather derives the same live
+     *   count from kv_len) -> nullptr. */
     case PLOW_DOP_INDEX_SELECT:
         d_index_select_sm120((int*)TEN(0), /*n_sel*/ nullptr, (const float*)TEN(1), in->i[0],
-                             in->i[1], (unsigned*)TEN(2), (unsigned*)TEN(3), slice, nblk);
+                             in->i[1], (unsigned*)TEN(2), (unsigned*)TEN(3),
+                             (const int*)TEN(4), in->i[3], slice, nblk);
         break;
 
     /* V6 LAYERNORM+bias: indexer k_norm. t0=out t1=x t2=gamma t3=beta; i0=rows i1=feat i3=out_row0;
@@ -2622,6 +2627,9 @@ extern "C" __device__ unsigned plow_fp8_gemm_m1_tma_abi = 1;
 extern "C" __device__ unsigned plow_fp8_m1_promote_k512 = PLOW_NV_FP8_M1_PROMOTE_K512;
 extern "C" __device__ unsigned plow_fp8_m1_max_k = 17408;
 extern "C" __device__ unsigned plow_fp8_m1_k_multiple = 16;
+#endif
+#if PLOW_NV_DSA && PLOW_DSA_DECODE_BATCH && !PLOW_NV_PREFILL && !PLOW_NV_SKELETON
+extern "C" __device__ unsigned plow_dsa_decode_batch_arm = 1;
 #endif
 #if PLOW_NV_GEMV512_ROLE
 #if PLOW_NV_SCHED != 1 || PLOW_NV_PLACE_DISPATCH || PLOW_NV_SKELETON || !PLOW_NV_SEGMENTS

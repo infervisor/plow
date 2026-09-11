@@ -328,8 +328,10 @@ pub(super) fn upload_program(
     let d_gq_seg = upload(pod_bytes(&program.gq_seg_ofs))?;
     let counter_only = program.n_counter as usize * CTR_STRIDE as usize * 4;
     let cursor_offset = counter_only.max(4);
-    let counter_bytes = cursor_offset + CTR_STRIDE as usize * 4;
-    let d_counter = be.alloc(0, counter_bytes as u64)?;
+    let cursor_bytes = CTR_STRIDE as usize * 4;
+    let counter_bytes = cursor_offset + cursor_bytes;
+    let (d_counter, [counter_view, cursor_view]) =
+        slab_carve(be, [cursor_offset, cursor_bytes])?;
     let kernarg = DevProgram {
         insts: d_inst.base,
         stream: d_stream.base,
@@ -337,7 +339,7 @@ pub(super) fn upload_program(
         stream_len: d_slen.base,
         waits: d_waits.base,
         succs: d_succs.base,
-        counters: d_counter.base,
+        counters: counter_view.base,
         tensors: tensor_table,
         trace: 0,
         cur_seg: 0,
@@ -346,7 +348,7 @@ pub(super) fn upload_program(
         n_seg: 1,
         gq_stream: d_gq_stream.base,
         gq_seg_ofs: d_gq_seg.base,
-        gq_cursor: d_counter.base + cursor_offset as u64,
+        gq_cursor: cursor_view.base,
         xctr: 0,
         peer_scratch: 0,
         rank: 0,

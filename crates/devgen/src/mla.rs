@@ -3891,12 +3891,14 @@ fn emit_glm_dsa_decode_select(
 ) -> u32 {
     let one = vec![0u32];
     let dsa = c.dsa(ctx);
-    // Batched DSA decode hands `IndexSelect` a per-row offset in `i[3]`. Only the gfx942
-    // object honours it (`PLOW_DSA_DECODE_BATCH` arm, required by the AMD manifest);
-    // `d_index_select_sm120` ignores `i[3]`, so every CUDA row would read row 0's scores.
+    // Batched DSA decode hands `IndexSelect` a per-row offset in `i[3]`. Both objects honour
+    // it behind `PLOW_DSA_DECODE_BATCH` (`d_index_select_sm120` takes `batch_row`/`kv_len`;
+    // the gfx942 arm likewise), and the manifest requires that arm on BOTH backends
+    // (`manifest.rs` `backend_amd`/`backend_nvcc`), so an object without it is refused at load
+    // rather than reading row 0's scores for every row.
     assert!(
-        !(dsa && rows > 1 && (c.index_kpool > 1 || !crate::emit_is_amd())),
-        "batched DSA decode is qualified only unpooled on gfx942; emit a single-row ladder or disable DSA"
+        !(dsa && rows > 1 && c.index_kpool > 1),
+        "batched pooled DSA decode is not qualified; emit a single-row ladder or disable DSA"
     );
     // The DSA lightning indexer has NO MXFP4 path: plow reads `wq_b`/`wk`/`weights_proj` as bf16
     // and none of the three ops takes an encoding. (A block-fp8 checkpoint does quantize wq_b and

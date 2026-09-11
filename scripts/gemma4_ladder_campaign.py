@@ -7,6 +7,10 @@ commands. Kernel commands print one JSON object with ``profile_key``,
 ``correct``, ``samples_us`` and, for candidates, ``compiled_profile``.
 Serving commands write bench_packed_serve.py JSONL to ``{output}``;
 ``{contexts}`` and ``{concurrencies}`` expand to individual arguments.
+Full-logit commands run once per phase and write one JSON record per rung to
+``{output}``. Records must identify the packet and reference artifacts, assert
+isolated execution, and report bitwise equality for full-vocabulary snapshots.
+Raw command output stays in a temporary directory under ``/tmp``.
 
 Attention profiles expand the packet rung over live runtime KV lengths, including
 boundary-adjacent global histories through 16K and local-window/ring histories.
@@ -75,6 +79,7 @@ DECODE_ATTENTION_COUNTS = {
     ("bf16_kv", 16, 1, 20480, 0, 17, 512, 0xffffffff): 8,
 }
 SHA256 = re.compile(r"[0-9a-f]{64}")
+GEMMA4_VOCAB = 262144
 
 
 class CampaignError(ValueError):
@@ -103,6 +108,23 @@ def canonical_key(profile):
         f"h{profile['q_heads']}x{profile['kv_heads']}d{profile['head_dim']}"
         f"w{profile['window']}s{profile['splits']}/hist-{profile['history_layout']}"
     )
+
+
+def full_logit_key(phase, rung):
+    return f"full-logit/{phase}/r{rung}"
+
+
+def full_logit_plan():
+    return [
+        {
+            "profile_key": full_logit_key(phase, rung),
+            "phase": phase,
+            "rung": rung,
+            "status": "pending",
+        }
+        for phase, rungs in (("prefill", RUNGS), ("decode", DECODE_RUNGS))
+        for rung in rungs
+    ]
 
 
 def _kernel_counts(program):
@@ -544,6 +566,84 @@ def run_serving(spec, cwd, env, temporary):
     return cells
 
 
+def validate_full_logit_record(record, cell, packet_sha256):
+    for name in ("profile_key", "phase", "rung"):
+        if record.get(name) != cell[name]:
+            raise CampaignError(
+                f"{cell['profile_key']}: full-logit result has wrong {name}"
+            )
+    if record.get("packet_sha256") != packet_sha256:
+        raise CampaignError(f"{cell['profile_key']}: full-logit packet hash differs")
+    if not SHA256.fullmatch(str(record.get("reference_sha256", ""))):
+        raise CampaignError(f"{cell['profile_key']}: invalid full-logit reference hash")
+    if record.get("isolated") is not True:
+        raise CampaignError(f"{cell['profile_key']}: full-logit run was not isolated")
+    expected_snapshots = 1 if cell["phase"] == "prefill" else cell["rung"]
+    if record.get("snapshots") != expected_snapshots:
+        raise CampaignError(
+            f"{cell['profile_key']}: expected {expected_snapshots} full-logit "
+            f"snapshots, got {record.get('snapshots')}"
+        )
+    if record.get("vocab") != GEMMA4_VOCAB:
+        raise CampaignError(f"{cell['profile_key']}: full vocabulary was not checked")
+    passed = (
+        record.get("correct") is True
+        and record.get("bitwise_equal") is True
+        and record.get("all_finite") is True
+    )
+    return {
+        **cell,
+        "status": "pass" if passed else "fail",
+        "packet_sha256": packet_sha256,
+        "reference_sha256": record["reference_sha256"],
+        "snapshots": record["snapshots"],
+        "vocab": record["vocab"],
+        "bitwise_equal": record.get("bitwise_equal") is True,
+        "all_finite": record.get("all_finite") is True,
+    }
+
+
+def run_full_logits(spec, cells, packet_sha256, cwd, env, temporary):
+    commands = spec.get("full_logit_commands") or {}
+    timeout = int(spec.get("full_logit_timeout_s", 7200))
+    results = []
+    for phase, phase_cells in _group(cells, lambda cell: cell["phase"]).items():
+        template = commands.get(phase)
+        if template is None:
+            raise CampaignError(f"missing {phase} full-logit command")
+        output = temporary / f"full-logit-{phase}.jsonl"
+        fields = {
+            "phase": phase,
+            "rungs": [cell["rung"] for cell in phase_cells],
+            "profile_keys": [cell["profile_key"] for cell in phase_cells],
+            "packet_sha256": packet_sha256,
+            "output": str(output),
+        }
+        stdout = invoke(
+            expand_command(template, fields), cwd, env, timeout, f"full-logit/{phase}"
+        )
+        records = parse_json_lines(
+            output.read_text() if output.exists() else stdout,
+            f"full-logit/{phase}",
+        )
+        expected = {cell["profile_key"]: cell for cell in phase_cells}
+        actual = [record.get("profile_key") for record in records]
+        if len(actual) != len(set(actual)):
+            raise CampaignError(f"full-logit/{phase}: duplicate result profile key")
+        if set(actual) != set(expected):
+            raise CampaignError(
+                f"full-logit/{phase}: cells differ: "
+                f"missing={sorted(set(expected) - set(actual))}, "
+                f"extra={sorted(set(actual) - set(expected))}"
+            )
+        results.extend(
+            validate_full_logit_record(record, expected[record["profile_key"]], packet_sha256)
+            for record in records
+        )
+    failures = [x["profile_key"] for x in results if x["status"] != "pass"]
+    return {"pass": not failures, "failures": failures, "cells": results}
+
+
 def gate_kernels(rows, gates):
     regression = float(gates.get("kernel_regression_tolerance", 1.02))
     minimum = float(gates.get("minimum_weighted_speedup", 1.01))
@@ -635,6 +735,7 @@ def campaign_plan(spec):
         "packet_sha256": audit.get("packet_sha256"),
         "rungs": rungs,
         "decode_rungs": decode_rungs,
+        "full_logits": full_logit_plan(),
         "kv_lengths": {
             "global": list(GLOBAL_KV_LENGTHS),
             "local": list(LOCAL_KV_LENGTHS),
@@ -649,9 +750,13 @@ def run_campaign(spec, output):
     cwd = str(Path(spec.get("cwd", ".")).resolve())
     env = os.environ.copy()
     env.update({str(k): str(v) for k, v in (spec.get("env") or {}).items()})
-    with tempfile.TemporaryDirectory(prefix="plow-gemma4-campaign-") as directory:
+    with tempfile.TemporaryDirectory(prefix="plow-gemma4-campaign-", dir="/tmp") as directory:
         kernel_rows = run_kernels(spec, plan["profiles"], cwd, env)
-        serving_cells = run_serving(spec, cwd, env, Path(directory))
+        temporary = Path(directory)
+        full_logits = run_full_logits(
+            spec, plan["full_logits"], plan["packet_sha256"], cwd, env, temporary
+        )
+        serving_cells = run_serving(spec, cwd, env, temporary)
     gates = spec.get("gates") or {}
     kernel_gate, ranked = gate_kernels(kernel_rows, gates)
     control_gate = gate_serving(serving_cells, spec["max_concurrency"], gates, "control")
@@ -660,10 +765,12 @@ def run_campaign(spec, output):
         **{k: v for k, v in plan.items() if k != "profiles"},
         "spec_sha256": hashlib.sha256(json.dumps(spec, sort_keys=True).encode()).hexdigest(),
         "kernel_profiles": ranked,
+        "full_logits": full_logits,
         "serving_cells": serving_cells,
         "promotion": {
-            "pass": kernel_gate["pass"] and control_gate["pass"],
+            "pass": kernel_gate["pass"] and full_logits["pass"] and control_gate["pass"],
             "kernel": kernel_gate,
+            "full_logits": full_logits,
             "serving_vs_control": control_gate,
         },
         "vllm_goal": vllm_gate,

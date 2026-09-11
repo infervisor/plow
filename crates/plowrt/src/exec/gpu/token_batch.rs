@@ -41,6 +41,7 @@ impl GpuEngine {
         let mut state = self.token_batch.take().ok_or_else(|| {
             RuntimeError::Rejected("CUDA unified token-batch capability unavailable".into())
         })?;
+        let mut body_enqueued = false;
         let result = (|| {
             if requests.iter().any(|request| {
                 request.state_slot != request.slot
@@ -116,7 +117,8 @@ impl GpuEngine {
                     "CUDA token-batch prefix history frontier mismatch".into(),
                 ));
             }
-            self.packed_token_body(&chunks)?;
+            self.packed_token_body_enqueue(&chunks)?;
+            body_enqueued = true;
             let mut terminal = self
                 .packed_terminal
                 .take()
@@ -168,6 +170,9 @@ impl GpuEngine {
             Ok(())
         })();
         if result.is_err() {
+            if body_enqueued {
+                let _ = self.be.stream_synchronize(&self.stream);
+            }
             state.staging.discard();
             output.clear();
         }

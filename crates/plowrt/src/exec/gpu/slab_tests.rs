@@ -1,5 +1,7 @@
 use super::*;
-use crate::memory::slab_pad;
+// `gpu.rs` has its own `slab_carve` (section carving); the per-tensor rule under test is the
+// shared one in `memory`.
+use crate::memory::{slab_carve, slab_pad};
 
 #[test]
 fn pad_rounds_up_and_leaves_exact_multiples_alone() {

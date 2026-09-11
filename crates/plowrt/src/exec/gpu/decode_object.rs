@@ -281,6 +281,17 @@ pub(super) fn bind(
                 )?;
             }
         }
+        let requires_dsa_batch = metadata
+            .programs
+            .iter()
+            .filter(|p| p.object == id)
+            .any(|p| {
+                super::dsa_decode_batch_required(std::slice::from_ref(&blob.progs[p.index]))
+            });
+        super::check_dsa_decode_batch_arm(
+            requires_dsa_batch,
+            be.module_global_u32(&module, "plow_dsa_decode_batch_arm")?,
+        )?;
         tracing::info!(object=id,file=%spec.file,threads=spec.threads,smem=spec.arena_bytes,grid=spec.grid,"packet decode object bound");
         loaded.insert(
             id,

@@ -585,7 +585,83 @@ impl DevBlob {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SegmentClassPolicy {
+    pub pure_mode: u8,
+    pub fa512_mode: u8,
+    pub fa256_gqa2: bool,
+}
+
 impl DevProg {
+    pub(crate) fn inferred_segment_policy(&self) -> SegmentClassPolicy {
+        let mut n_seg = 1usize;
+        for entry in &self.stream {
+            n_seg = n_seg.max(entry.seg as usize + 1);
+        }
+        let mut mapped_gemm = vec![false; n_seg];
+        let mut mapless_w8a16 = vec![false; n_seg];
+        let mut hd512 = vec![false; n_seg];
+        let mut hd256_gqa2 = vec![false; n_seg];
+        let mut other_for_gemm = vec![false; n_seg];
+        let mut other_for_hd512 = vec![false; n_seg];
+        let mut other_for_gqa2 = vec![false; n_seg];
+        for entry in &self.stream {
+            let Some(inst) = self.insts.get(entry.inst as usize) else {
+                continue;
+            };
+            let seg = entry.seg as usize;
+            let plain_gemm = matches!(
+                DevOp::from_u16(inst.op),
+                Some(
+                    DevOp::Gemm
+                        | DevOp::GemmMed
+                        | DevOp::GemmSmall
+                        | DevOp::GemmFp8
+                        | DevOp::GemmMedFp8
+                        | DevOp::GemmSmallFp8
+                )
+            );
+            let mapped = plain_gemm && inst.i[6] != 0 && inst.i[7] != 0;
+            let w8a16 = inst.is_mapless_w8a16_gemm();
+            mapped_gemm[seg] |= mapped;
+            mapless_w8a16[seg] |= w8a16;
+            other_for_gemm[seg] |= !mapped && !w8a16;
+
+            let is_hd512 = inst.op == DevOp::FlashPrefill as u16 && inst.i[6] == 512;
+            hd512[seg] |= is_hd512;
+            other_for_hd512[seg] |= !is_hd512;
+
+            let is_gqa2 = inst.is_hd256_gqa2_sliding_prefill();
+            hd256_gqa2[seg] |= is_gqa2;
+            other_for_gqa2[seg] |= !is_gqa2;
+        }
+        let pure = mapped_gemm
+            .iter()
+            .zip(&mapless_w8a16)
+            .zip(&other_for_gemm)
+            .any(|((&mapped, &w8a16), &other)| (mapped || w8a16) && !other);
+        let w8a16 = mapless_w8a16
+            .iter()
+            .zip(&other_for_gemm)
+            .any(|(&present, &other)| present && !other);
+        SegmentClassPolicy {
+            pure_mode: if w8a16 { 3 } else if pure { 1 } else { 0 },
+            fa512_mode: if hd512
+                .iter()
+                .zip(&other_for_hd512)
+                .any(|(&present, &other)| present && !other)
+            {
+                1
+            } else {
+                0
+            },
+            fa256_gqa2: hd256_gqa2
+                .iter()
+                .zip(&other_for_gqa2)
+                .any(|(&present, &other)| present && !other),
+        }
+    }
+
     /// The coarse single-segment gate the sm_120 interpreter implements: every
     /// stream entry must be unsegmented (`seg == 0`) with no per-slice or
     /// cross-GPU counters. Mirrors the harness's fatal check.
@@ -594,6 +670,26 @@ impl DevProg {
     /// `derive_segments`, hoisted here so the CUDA engine (which builds without
     /// the `hsa` module) can classify segments for the SegPf launcher.
     pub fn seg_classes(&self) -> Result<Vec<u8>> {
+        let rt = crate::config::RuntimeConfig::get();
+        let pure_mode = match rt.nv.pf_seg_pure.as_deref() {
+            Some("1") => 1u8,
+            Some("fp8") => 2u8,
+            Some("w8a16") => 3u8,
+            _ => 0u8,
+        };
+        let fa512_mode = match rt.nv.pf_seg_fa512.as_deref() {
+            Some("1") => 1u8,
+            Some("all") => 2u8,
+            _ => 0u8,
+        };
+        self.seg_classes_with(SegmentClassPolicy {
+            pure_mode,
+            fa512_mode,
+            fa256_gqa2: rt.nv.pf_seg_fa256_gqa2,
+        })
+    }
+
+    pub(crate) fn seg_classes_with(&self, policy: SegmentClassPolicy) -> Result<Vec<u8>> {
         let mut n_seg: u32 = 1;
         for e in &self.stream {
             n_seg = n_seg.max(e.seg as u32 + 1);
@@ -605,31 +701,22 @@ impl DevProg {
                 "program declares {n_seg} segments (max 2048) — corrupt stream?"
             )));
         }
-        // PLOW_PF_SEG_PURE=1: mirror of the emit-side PLOW_SEG_PURE_GEMM classing — a segment
+        // Pure mode mirrors the emit-side PLOW_SEG_PURE_GEMM classing — a segment
         // is GEMM-class (8) only if EVERY op in it is a GEMM-family op; anything else (norms,
         // rope, quant, glu, flash) makes it flash-class (4). Required when the lean object is
         // built PLOW_NV_GEMM_ONLY: its dispatch traps on any non-GEMM opcode, so a light-op
-        // segment classified 8 would land there. The two envs must be set together — this one
-        // at serve time, the emit one at plowc time.
+        // segment classified 8 would land there. The CUDA loader recovers this mode from the
+        // packet's isolated segments; PLOW_PF_SEG_PURE remains an explicit override.
         // Must match the emit-side classing in devbuild.rs: "1" = every plain tiled GEMM,
         // "fp8" = only TMA-mapped fp8 GEMMs (the ws-entry object's sole arm).
         // "w8a16" pairs mapless W8A16 plus mapped BF16 with a capability-checked object.
-        let rt = crate::config::RuntimeConfig::get();
-        let pure_mode = match rt.nv.pf_seg_pure.as_deref() {
-            Some("1") => 1u8,
-            Some("fp8") => 2u8,
-            Some("w8a16") => 3u8,
-            _ => 0u8,
-        };
+        let pure_mode = policy.pure_mode;
         use packet::dev::DevOp;
         // PLOW_PF_SEG_FA512=1 (T12): hd512 FlashPrefill segments class 2 — launched on the
         // dedicated *_pffa object. Mirror of the emit-side PLOW_SEG_FA512.
-        let fa512_mode = match rt.nv.pf_seg_fa512.as_deref() {
-            Some("1") => 1u8,
-            Some("all") => 2u8,
-            _ => 0u8,
-        };
-        let fa256_gqa2 = rt.nv.pf_seg_fa256_gqa2;
+        let fa512_mode = policy.fa512_mode;
+        let fa256_gqa2 = policy.fa256_gqa2;
+        let rt = crate::config::RuntimeConfig::get();
         let v2_env = rt.nv.pf_seg_v2.as_deref();
         let seg_v2 = v2_env == Some("1");
         let seg_q8 = seg_v2 || v2_env == Some("q8");
@@ -778,6 +865,100 @@ mod tests {
     use super::*;
     use packet::dev::DevInst;
     use packet::devbuild::{Model, Program, TensorDecl};
+
+    #[test]
+    fn packet_segments_recover_safe_cuda_object_routing() {
+        let mut insts = vec![DevInst64 {
+            op: DevOp::Embed as u16,
+            blocks: 1,
+            fj: [0; 3],
+            t: [0; 8],
+            i: [0; 8],
+        }; 4];
+        insts[1].op = DevOp::Gemm as u16;
+        insts[1].i[6] = 1;
+        insts[1].i[7] = 2;
+        insts[2].op = DevOp::FlashPrefill as u16;
+        insts[2].i[6] = 512;
+        insts[3].op = DevOp::FlashPrefill as u16;
+        insts[3].i = [128, 128, 16, 8, 0, 1024, 256, 1];
+        insts[3].t[5] = 1;
+        let stream = (0..4)
+            .map(|index| StreamEnt {
+                inst: index,
+                seg: index as u16,
+                ..StreamEnt::default()
+            })
+            .collect();
+        let program = DevProg {
+            t: 128,
+            packed_prefill_only: false,
+            n_counter: 0,
+            insts,
+            stream,
+            stream_ofs: Vec::new(),
+            stream_len: Vec::new(),
+            waits: Vec::new(),
+            succs: Vec::new(),
+            gq_stream: Vec::new(),
+            gq_seg_ofs: Vec::new(),
+            l2_domains: 0,
+        };
+        let policy = program.inferred_segment_policy();
+        assert_eq!(
+            policy,
+            SegmentClassPolicy {
+                pure_mode: 1,
+                fa512_mode: 1,
+                fa256_gqa2: true,
+            }
+        );
+        assert_eq!(program.seg_classes_with(policy).unwrap(), [4, 8, 2, 3]);
+    }
+
+    #[test]
+    fn mixed_light_and_gemm_segment_does_not_claim_a_gemm_only_object() {
+        let insts = vec![
+            DevInst64 {
+                op: DevOp::Gemm as u16,
+                blocks: 1,
+                fj: [0; 3],
+                t: [0; 8],
+                i: [0, 0, 0, 0, 0, 0, 1, 2],
+            },
+            DevInst64 {
+                op: DevOp::RmsNorm as u16,
+                blocks: 1,
+                fj: [0; 3],
+                t: [0; 8],
+                i: [0; 8],
+            },
+        ];
+        let stream = (0..2)
+            .map(|inst| StreamEnt {
+                inst,
+                ..StreamEnt::default()
+            })
+            .collect();
+        let program = DevProg {
+            t: 128,
+            packed_prefill_only: false,
+            n_counter: 0,
+            insts,
+            stream,
+            stream_ofs: Vec::new(),
+            stream_len: Vec::new(),
+            waits: Vec::new(),
+            succs: Vec::new(),
+            gq_stream: Vec::new(),
+            gq_seg_ofs: Vec::new(),
+            l2_domains: 0,
+        };
+        assert_eq!(
+            program.inferred_segment_policy(),
+            SegmentClassPolicy::default()
+        );
+    }
 
     /// `hidden` is a ROW width, and a one-shot collective in a PREFILL program says
     /// `t * hidden`. This used to read `i[0]` outright, which was right only while the

@@ -544,6 +544,277 @@ fn gpu_decode_rungs_match_widest_full_logits() {
     check_gpu_decode_rungs(false);
 }
 
+const GEMMA4_PREFILL_RUNGS: [usize; 14] =
+    [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192];
+const GEMMA4_DECODE_RUNGS: [usize; 5] = [1, 2, 4, 8, 16];
+const GEMMA4_VOCAB: usize = 262_144;
+
+struct FullLogitReference {
+    token: u32,
+    bits: Vec<u32>,
+    all_finite: bool,
+}
+
+fn diagnostic_packet(assets: &std::path::Path) -> (DevBlob, String) {
+    let path = DevBlob::find_in_dir(assets).unwrap().unwrap();
+    let raw = std::fs::read(path).unwrap();
+    let sha256 = plow_asset::decode_objects::image_sha256(&raw);
+    (DevBlob::parse(&raw).unwrap(), sha256)
+}
+
+fn diagnostic_engine(be: &Arc<CudaBackend>, assets: &std::path::Path) -> GpuEngine {
+    let e = GpuEngine::load(Arc::clone(be), assets, &assets.join("checkpoint")).unwrap();
+    assert_eq!(e.vocab(), GEMMA4_VOCAB);
+    assert!(e.multistep.is_none(), "disable multistep for this gate");
+    assert!(!e.vmm_prefix_enabled(), "disable VMM prefix reuse for this gate");
+    e
+}
+
+fn diagnostic_prompt(rows: usize, salt: usize) -> Vec<u32> {
+    (0..rows)
+        .map(|i| 100 + ((i * (2 * salt + 1) + 173 * salt) % 32_000) as u32)
+        .collect()
+}
+
+fn diagnostic_logits(e: &mut GpuEngine, row: usize, token: u32) -> FullLogitReference {
+    let mut logits = Vec::new();
+    e.logits_row(row, &mut logits).unwrap();
+    assert_eq!(logits.len(), GEMMA4_VOCAB);
+    FullLogitReference {
+        token,
+        all_finite: logits.iter().all(|v| v.is_finite()),
+        bits: logits.iter().map(|v| v.to_bits()).collect(),
+    }
+}
+
+fn full_logit_record(
+    phase: &str,
+    rung: usize,
+    packet_sha256: &str,
+    reference_sha256: &str,
+    snapshots: usize,
+    actual: &[FullLogitReference],
+    expected: &[FullLogitReference],
+) -> serde_json::Value {
+    assert_eq!(actual.len(), snapshots);
+    assert_eq!(expected.len(), snapshots);
+    let bitwise_equal = actual
+        .iter()
+        .zip(expected)
+        .all(|(a, b)| a.bits == b.bits);
+    let token_equal = actual
+        .iter()
+        .zip(expected)
+        .all(|(a, b)| a.token == b.token);
+    let all_finite = actual
+        .iter()
+        .chain(expected)
+        .all(|frame| frame.all_finite);
+    serde_json::json!({
+        "profile_key": format!("full-logit/{phase}/r{rung}"),
+        "phase": phase,
+        "rung": rung,
+        "packet_sha256": packet_sha256,
+        "reference_sha256": reference_sha256,
+        "isolated": true,
+        "snapshots": snapshots,
+        "vocab": GEMMA4_VOCAB,
+        "correct": bitwise_equal && token_equal && all_finite,
+        "bitwise_equal": bitwise_equal,
+        "all_finite": all_finite,
+    })
+}
+
+fn write_full_logit_records(env_name: &str, expected: usize, records: &[serde_json::Value]) {
+    assert_eq!(records.len(), expected);
+    let output = std::path::PathBuf::from(std::env::var(env_name).unwrap());
+    assert!(
+        output.is_absolute() && output.starts_with("/tmp"),
+        "{env_name} must be an absolute path under /tmp"
+    );
+    let mut jsonl = Vec::new();
+    for record in records {
+        serde_json::to_writer(&mut jsonl, record).unwrap();
+        jsonl.push(b'\n');
+    }
+    std::fs::write(output, jsonl).unwrap();
+}
+
+fn assert_diagnostic_packet(expected: &str, actual: &str) {
+    assert_eq!(expected.len(), 64, "invalid expected packet SHA256");
+    assert_eq!(actual, expected, "candidate packet SHA256 differs");
+}
+
+#[test]
+#[ignore = "Gemma-4 full-logit prefill sweep; run via scripts/gemma4_prefill_rung_full_logits.sh"]
+fn gpu_isolated_prefill_rungs_match_widest_logits() {
+    assert_eq!(std::env::var("TEST_PREFILL_RUNG_GPU").as_deref(), Ok("1"));
+    let assets = std::path::PathBuf::from(std::env::var("TEST_PREFILL_RUNG_ASSETS").unwrap());
+    let baseline =
+        std::path::PathBuf::from(std::env::var("TEST_PREFILL_RUNG_BASELINE").unwrap());
+    let expected_sha256 = std::env::var("TEST_RUNG_PACKET_SHA256").unwrap();
+    let (candidate_blob, candidate_sha256) = diagnostic_packet(&assets);
+    let (reference_blob, reference_sha256) = diagnostic_packet(&baseline);
+    assert_diagnostic_packet(&expected_sha256, &candidate_sha256);
+    assert_eq!(
+        candidate_blob
+            .prefill_progs()
+            .iter()
+            .map(|p| p.t as usize)
+            .collect::<Vec<_>>(),
+        GEMMA4_PREFILL_RUNGS
+    );
+    let widest_reference = reference_blob
+        .prefill_progs()
+        .iter()
+        .map(|p| p.t as usize)
+        .max()
+        .expect("reference prefill program");
+    drop((candidate_blob, reference_blob));
+
+    let be = Arc::new(CudaBackend::new(0).unwrap());
+    let mut references = Vec::with_capacity(GEMMA4_PREFILL_RUNGS.len());
+    {
+        let mut e = diagnostic_engine(&be, &baseline);
+        e.prefill.retain(|p| p.t as usize == widest_reference);
+        assert_eq!(e.prefill.len(), 1);
+        for &rows in &GEMMA4_PREFILL_RUNGS {
+            let prompt = diagnostic_prompt(rows, rows);
+            e.begin_slot(0, rows + 1).unwrap();
+            let token = e.prefill_slot(0, &prompt).unwrap();
+            references.push(diagnostic_logits(&mut e, 0, token));
+            e.retire_slot(0, false);
+        }
+    }
+
+    let mut e = diagnostic_engine(&be, &assets);
+    assert_eq!(
+        e.prefill.iter().map(|p| p.t as usize).collect::<Vec<_>>(),
+        GEMMA4_PREFILL_RUNGS
+    );
+    let mut records = Vec::with_capacity(GEMMA4_PREFILL_RUNGS.len());
+    for (index, &rows) in GEMMA4_PREFILL_RUNGS.iter().enumerate() {
+        let selected = e.pick_prefill_bucket(rows, usize::MAX);
+        assert_eq!(e.prefill[selected].t as usize, rows, "M={rows} did not select its exact rung");
+        let prompt = diagnostic_prompt(rows, rows);
+        e.begin_slot(0, rows + 1).unwrap();
+        let token = e.prefill_slot(0, &prompt).unwrap();
+        let actual = diagnostic_logits(&mut e, 0, token);
+        records.push(full_logit_record(
+            "prefill",
+            rows,
+            &candidate_sha256,
+            &reference_sha256,
+            1,
+            std::slice::from_ref(&actual),
+            std::slice::from_ref(&references[index]),
+        ));
+        e.retire_slot(0, false);
+    }
+    write_full_logit_records("TEST_PREFILL_RUNG_LOGITS_OUT", GEMMA4_PREFILL_RUNGS.len(), &records);
+    assert!(records.iter().all(|r| r["correct"] == true));
+}
+
+#[test]
+#[ignore = "Gemma-4 full-logit decode sweep; run via scripts/gemma4_decode_rung_full_logits.sh"]
+fn gpu_isolated_decode_rungs_match_widest_logits() {
+    assert_eq!(std::env::var("TEST_DECODE_RUNG_GPU").as_deref(), Ok("1"));
+    let assets = std::path::PathBuf::from(std::env::var("TEST_DECODE_RUNG_ASSETS").unwrap());
+    let baseline =
+        std::path::PathBuf::from(std::env::var("TEST_DECODE_RUNG_BASELINE").unwrap());
+    let expected_sha256 = std::env::var("TEST_RUNG_PACKET_SHA256").unwrap();
+    let (candidate_blob, candidate_sha256) = diagnostic_packet(&assets);
+    let (reference_blob, reference_sha256) = diagnostic_packet(&baseline);
+    assert_diagnostic_packet(&expected_sha256, &candidate_sha256);
+    assert_eq!(
+        candidate_blob.decode_rungs(),
+        GEMMA4_DECODE_RUNGS.map(|r| r as u32)
+    );
+    assert_eq!(reference_blob.decode_rungs(), [16]);
+    assert_eq!(
+        reference_blob.decode_prog().unwrap().insts,
+        candidate_blob.decode_prog().unwrap().insts,
+        "reference widest decode instructions differ"
+    );
+    assert!(
+        reference_blob
+            .tensors
+            .iter()
+            .map(|t| (&t.name, t.bytes))
+            .eq(candidate_blob.tensors.iter().map(|t| (&t.name, t.bytes))),
+        "reference tensor geometry differs"
+    );
+    let common_prefill = reference_blob
+        .prefill_progs()
+        .iter()
+        .map(|p| p.t as usize)
+        .filter(|rows| candidate_blob.prefill_progs().iter().any(|p| p.t as usize == *rows))
+        .max()
+        .expect("candidate and reference need a common prefill rung");
+    drop((candidate_blob, reference_blob));
+
+    let run = |e: &mut GpuEngine, width: usize| {
+        let mut frames = Vec::with_capacity(width);
+        let mut feeds = Vec::with_capacity(width);
+        for slot in 0..width {
+            let prompt = diagnostic_prompt(common_prefill, slot + 1);
+            e.begin_slot(slot, common_prefill + 2).unwrap();
+            feeds.push((slot, e.prefill_slot(slot, &prompt).unwrap()));
+        }
+        let mut tokens = Vec::new();
+        e.step_slots(&feeds, &mut tokens).unwrap();
+        assert_eq!(tokens.len(), width);
+        for (slot, &token) in tokens.iter().enumerate() {
+            frames.push(diagnostic_logits(e, slot, token));
+        }
+        for slot in 0..width {
+            e.retire_slot(slot, false);
+        }
+        frames
+    };
+
+    let be = Arc::new(CudaBackend::new(0).unwrap());
+    let mut references = Vec::with_capacity(GEMMA4_DECODE_RUNGS.len());
+    {
+        let mut e = diagnostic_engine(&be, &baseline);
+        assert_eq!(e.batch(), 16);
+        assert!(e.decode_rungs.is_empty());
+        e.prefill.retain(|p| p.t as usize == common_prefill);
+        assert_eq!(e.prefill.len(), 1);
+        for &width in &GEMMA4_DECODE_RUNGS {
+            references.push(run(&mut e, width));
+        }
+    }
+
+    let mut e = diagnostic_engine(&be, &assets);
+    assert_eq!(e.batch(), 16);
+    assert_eq!(
+        e.decode_rungs.iter().map(|r| r.rows).collect::<Vec<_>>(),
+        GEMMA4_DECODE_RUNGS[..4]
+    );
+    e.prefill.retain(|p| p.t as usize == common_prefill);
+    assert_eq!(e.prefill.len(), 1);
+    let mut records = Vec::with_capacity(GEMMA4_DECODE_RUNGS.len());
+    for (index, &width) in GEMMA4_DECODE_RUNGS.iter().enumerate() {
+        let selected = e
+            .decode_rung(width - 1)
+            .map_or(e.batch(), |ix| e.decode_rungs[ix].rows);
+        assert_eq!(selected, width, "B={width} did not select its exact rung");
+        let actual = run(&mut e, width);
+        records.push(full_logit_record(
+            "decode",
+            width,
+            &candidate_sha256,
+            &reference_sha256,
+            width,
+            &actual,
+            &references[index],
+        ));
+    }
+    write_full_logit_records("TEST_DECODE_RUNG_LOGITS_OUT", GEMMA4_DECODE_RUNGS.len(), &records);
+    assert!(records.iter().all(|r| r["correct"] == true));
+}
+
 #[test]
 #[ignore = "GPU cuBLASLt gate; set TEST_DECODE_RUNG_GPU, TEST_DECODE_RUNG_ASSETS, TEST_DECODE_RUNG_BASELINE"]
 fn gpu_cublaslt_rungs_match_widest_logits() {

@@ -106,7 +106,13 @@ template<int HD, int BKV> static bool check(unsigned kv_heads, unsigned stride,
     CK(cudaMalloc(&stats, size_t(capacity) * heads * 2 * sizeof(float)));
     CK(cudaMemset(out, 0xff, q.size() * sizeof(bf16)));
     unsigned smem = FA_PRE_SMEM_FLOATS(HD,64,BKV) * sizeof(float);
-#if PLOW_NV_FA_WGITEM
+#if PLOW_NV_FA_GQA2_PAIR
+    if constexpr (HD == 256 && BKV == 32) {
+        constexpr unsigned pair_smem = FA_SM90_GQA2_PAIR_FLOATS(HD,64,BKV) * sizeof(float);
+        static_assert(pair_smem == 141312);
+        smem = pair_smem;
+    }
+#elif PLOW_NV_FA_WGITEM
     if constexpr (HD == 256 && BKV == 32)
         smem = FA_SM90_WGI_FLOATS(HD,64,BKV) * sizeof(float);
 #endif

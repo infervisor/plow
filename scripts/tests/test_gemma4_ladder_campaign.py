@@ -1,6 +1,8 @@
 import importlib.util
 import json
+import os
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 
@@ -73,6 +75,17 @@ class Gemma4LadderCampaignTests(unittest.TestCase):
         self.assertEqual((local["q_heads"], local["kv_heads"], local["gqa"], local["window"]), (16, 8, 2, 1024))
         self.assertEqual(local["kv_dtype"], "bf16_kv")
         self.assertEqual((local["packet_kv_rows"], local["kv_length"], local["effective_kv_rows"]), (8192, 16384, 1024))
+
+    def test_full_logit_plan_marks_every_rung_pending(self):
+        cells = campaign.full_logit_plan()
+        self.assertEqual(len(cells), 19)
+        self.assertEqual(
+            [(x["phase"], x["rung"]) for x in cells],
+            [("prefill", rung) for rung in campaign.RUNGS]
+            + [("decode", rung) for rung in campaign.DECODE_RUNGS],
+        )
+        self.assertEqual({x["status"] for x in cells}, {"pending"})
+        self.assertEqual(len({x["profile_key"] for x in cells}), len(cells))
 
     def test_kv_growth_has_boundary_neighbors_and_request_topologies(self):
         profiles, _, _ = campaign.audit_inventory(
@@ -195,6 +208,62 @@ class Gemma4LadderCampaignTests(unittest.TestCase):
             rows = campaign.run_kernels(spec, [profile], str(root), dict(__import__('os').environ))
             self.assertEqual(order.read_text().splitlines(), ["control", "candidate"])
             self.assertEqual(rows[0]["speedup"], 1.0)
+
+    def test_full_logit_runner_requires_isolated_exact_full_vocab_cells(self):
+        packet = "a" * 64
+        cells = campaign.full_logit_plan()
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            root = Path(directory)
+            helper = root / "full_logits.py"
+            order = root / "order"
+            helper.write_text(
+                "import json,sys\n"
+                "phase,packet,output,order,*rungs=sys.argv[1:]\n"
+                "open(order,'a').write(phase+'\\n')\n"
+                "records=[{'profile_key':f'full-logit/{phase}/r{rung}',"
+                "'phase':phase,'rung':int(rung),'packet_sha256':packet,"
+                "'reference_sha256':'b'*64,'isolated':True,"
+                "'snapshots':1 if phase=='prefill' else int(rung),"
+                "'vocab':262144,'correct':True,'bitwise_equal':True,"
+                "'all_finite':True} for rung in rungs]\n"
+                "open(output,'w').write(''.join(json.dumps(x)+'\\n' for x in records))\n"
+            )
+            template = [
+                sys.executable, str(helper), "{phase}", "{packet_sha256}",
+                "{output}", str(order), "{rungs}",
+            ]
+            result = campaign.run_full_logits(
+                {"full_logit_commands": {"prefill": template, "decode": template}},
+                cells,
+                packet,
+                str(ROOT),
+                dict(os.environ),
+                root,
+            )
+            self.assertTrue(result["pass"])
+            self.assertEqual(len(result["cells"]), 19)
+            self.assertEqual(order.read_text().splitlines(), ["prefill", "decode"])
+            self.assertTrue(all(x["status"] == "pass" for x in result["cells"]))
+
+    def test_full_logit_record_rejects_nonisolated_or_partial_vocab(self):
+        cell = campaign.full_logit_plan()[0]
+        record = {
+            **cell,
+            "packet_sha256": "a" * 64,
+            "reference_sha256": "b" * 64,
+            "isolated": False,
+            "snapshots": 1,
+            "vocab": campaign.GEMMA4_VOCAB,
+            "correct": True,
+            "bitwise_equal": True,
+            "all_finite": True,
+        }
+        with self.assertRaisesRegex(campaign.CampaignError, "not isolated"):
+            campaign.validate_full_logit_record(record, cell, "a" * 64)
+        record["isolated"] = True
+        record["vocab"] -= 1
+        with self.assertRaisesRegex(campaign.CampaignError, "full vocabulary"):
+            campaign.validate_full_logit_record(record, cell, "a" * 64)
 
     def test_tracked_summary_path_is_rejected(self):
         with self.assertRaisesRegex(campaign.CampaignError, "outside"):

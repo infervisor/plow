@@ -1091,6 +1091,9 @@ fn backend_nvcc(f: &Map<String, Value>, t: &Map<String, Value>, s: &Shapes) -> V
             req.push("PLOW_NV_PF_GEMV_HEAD=1".into());
         }
     }
+    if on("dsa_decode_batch") {
+        req.push("PLOW_DSA_DECODE_BATCH=1".into());
+    }
     let mut rec = Vec::new();
     if let Some(v) = t.get("gv_mm_max").and_then(Value::as_u64) {
         rec.push(format!("GV_MM_MAX={v}"));
@@ -2372,6 +2375,14 @@ pub fn config_header(manifest: &Value) -> String {
         "#define PLOW_PACKET_REQUIRES_KDA_DECODE_FUSED_ARM {0}\n#ifndef PLOW_KDA_DECODE_FUSED_ARM\n#define PLOW_KDA_DECODE_FUSED_ARM {0}\n#endif\n",
         if kda_decode_fused_arm { 1 } else { 0 }
     ));
+    let dsa_decode_batch = manifest
+        .pointer("/features/dsa_decode_batch")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    out.push_str(&format!(
+        "#define PLOW_PACKET_REQUIRES_DSA_DECODE_BATCH {0}\n#ifndef PLOW_DSA_DECODE_BATCH\n#define PLOW_DSA_DECODE_BATCH {0}\n#endif\n",
+        if dsa_decode_batch { 1 } else { 0 }
+    ));
     let gemv_prefetch = manifest
         .pointer("/features/gemv_prefetch")
         .and_then(Value::as_bool)
@@ -3180,8 +3191,22 @@ mod tests {
             let req = manifest["backends"]["gfx942"]["requires"]
                 .as_array()
                 .unwrap();
-            assert_eq!(req.iter().any(|r| r == "PLOW_DSA_DECODE_BATCH=1"), row != 0 || local != 0);
+            assert_eq!(
+                req.iter().any(|r| r == "PLOW_DSA_DECODE_BATCH=1"),
+                row != 0 || local != 0
+            );
             assert_eq!(req.iter().any(|r| r == "PLOW_DSA_SELECT_LOCAL=1"), local != 0);
+            let nvcc = manifest["backends"]["nvcc"]["requires"]
+                .as_array()
+                .unwrap();
+            assert_eq!(
+                nvcc.iter().any(|r| r == "PLOW_DSA_DECODE_BATCH=1"),
+                row != 0 || local != 0
+            );
+            assert!(config_header(&manifest).contains(&format!(
+                "#define PLOW_PACKET_REQUIRES_DSA_DECODE_BATCH {}\n",
+                u8::from(row != 0 || local != 0)
+            )));
         }
     }
 

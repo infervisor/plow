@@ -13,7 +13,7 @@ pub(super) struct PackedTerminal {
     counter_bytes: usize,
     _tables: Vec<DeviceMem>,
     host_rows: Vec<u32>,
-    host_ids: Vec<u32>,
+    host_ids: PinnedHost,
 }
 
 fn layout(insts: &[DevInst64], rows: u32, logits: usize, ids: usize) -> Option<[DevInst64; 5]> {
@@ -261,8 +261,12 @@ impl PackedTerminal {
             counter_bytes,
             _tables: tables,
             host_rows: Vec::with_capacity(capacity),
-            host_ids: vec![0; capacity],
+            host_ids: e.be.host_alloc_pinned(capacity * 4)?,
         }))
+    }
+
+    fn ids(&self, count: usize) -> &[u32] {
+        bytemuck::cast_slice(&self.host_ids.as_slice()[..count * 4])
     }
 
     pub(super) fn run(&mut self, e: &GpuEngine, live: usize) -> Result<()> {
@@ -284,6 +288,7 @@ impl PackedTerminal {
         self.program.insts[3].i[0] = count * self.template[1].i[1];
         self.program.insts[4].i[1] = count;
         self.program.insts[5].i[1] = count;
+        let output_bytes = self.host_rows.len() * 4;
         let launched = (|| {
             // Both upload sources are owned here until the stream is drained.
             unsafe {
@@ -301,18 +306,21 @@ impl PackedTerminal {
                 &mut params,
                 Some(&e.stream),
             )?;
+            unsafe {
+                e.be.memcpy_dtoh_async(
+                    &mut self.host_ids.as_mut_slice()[..output_bytes],
+                    e.devp[e.t_ids].base,
+                    &e.stream,
+                )?;
+            }
             e.be.stream_synchronize(&e.stream)
         })();
         if let Err(error) = launched {
             let _ = e.be.stream_synchronize(&e.stream);
             return Err(error);
         }
-        e.be.download(
-            &e.devp[e.t_ids],
-            0,
-            bytemuck::cast_slice_mut(&mut self.host_ids[..self.host_rows.len()]),
-        )?;
-        if self.host_ids[..self.host_rows.len()]
+        if self
+            .ids(self.host_rows.len())
             .iter()
             .any(|&id| id as usize >= e.vocab)
         {
@@ -326,8 +334,13 @@ impl PackedTerminal {
     pub(super) fn run_rows(&mut self, e: &GpuEngine, rows: &[u32], live: usize) -> Result<&[u32]> {
         self.host_rows.clear();
         self.host_rows.extend_from_slice(rows);
+        if rows.is_empty() {
+            // An enqueue-only body still needs retirement when S=0.
+            e.be.stream_synchronize(&e.stream)?;
+            return Ok(self.ids(0));
+        }
         self.run(e, live)?;
-        Ok(&self.host_ids[..rows.len()])
+        Ok(self.ids(rows.len()))
     }
 }
 
@@ -359,11 +372,12 @@ impl GpuEngine {
         }
         let result = terminal.run(self, live);
         if result.is_ok() {
+            let ids = terminal.ids(terminal.host_rows.len());
             out.extend(
                 reqs.iter()
                     .filter(|r| r.c0 + r.len == r.prompt.len())
                     .map(|r| r.slot)
-                    .zip(terminal.host_ids.iter().copied()),
+                    .zip(ids.iter().copied()),
             );
         }
         self.packed_terminal = Some(terminal);

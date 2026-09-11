@@ -173,6 +173,24 @@ if(PLOW_CUDA)
     # PRIVATE: the core is absorbed, not re-exported to whoever dlopens us.
     target_link_libraries(plow_runtime_cuda PRIVATE plow_runtime)
 
+    # Standalone Hopper correctness harnesses. They are build targets rather
+    # than CTest entries because a PLOW_CUDA build may run on a non-Hopper GPU.
+    foreach(target gemma3_norm_sm90 packed_flash_fp8_sm90_correct packed_kv_padding_sm90)
+        add_executable(${target} tests/${target}.cu)
+        target_include_directories(${target} PRIVATE nvidia common ${PLOW_INCLUDE})
+        set_target_properties(${target} PROPERTIES CUDA_ARCHITECTURES "90a" CUDA_STANDARD 17)
+    endforeach()
+    target_link_libraries(packed_flash_fp8_sm90_correct PRIVATE cuda)
+    target_link_libraries(packed_kv_padding_sm90 PRIVATE cuda)
+
+    add_executable(packed_flash_sm90_correct tests/packed_flash_sm90_correct.cu)
+    target_include_directories(packed_flash_sm90_correct PRIVATE nvidia common ${PLOW_INCLUDE})
+    target_compile_definitions(packed_flash_sm90_correct PRIVATE
+        PLOW_NV_FA_WGITEM=1 PLOW_NV_FA_GQA2_PAIR=1 PLOW_TEST_FA_HD256_ONLY=1)
+    target_link_libraries(packed_flash_sm90_correct PRIVATE cuda)
+    set_target_properties(packed_flash_sm90_correct PROPERTIES
+        CUDA_ARCHITECTURES "90a" CUDA_STANDARD 17)
+
     # Numeric validation of the sm_120 kernels against the CPU f32 golden oracle.
     # GUARDED: tests/sm120_numeric_test.cu is authored on a concurrent branch (the
     # gemma_sm120.cu B-tile fix). Configuring without it is a hard CMake error, which

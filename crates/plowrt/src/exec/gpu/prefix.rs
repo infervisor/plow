@@ -7,7 +7,7 @@ use crate::asset::devblob::DevBlob;
 use crate::config::RuntimeConfig;
 use crate::device::cuda::CudaBackend;
 use crate::exec::kv_layout::{kv_tensor_name, RingWindow};
-use crate::Result;
+use crate::{Result, RuntimeError};
 
 use super::{recurrent_state_layout, GpuEngine};
 
@@ -523,18 +523,23 @@ impl GpuEngine {
         let Some(a) = v.kv.try_attach(b, prompt)? else {
             return Ok(());
         };
-        // A snapshot sized by a different layout would be copied past its end in
-        // release; unmap what `try_attach` shared and fall back to a cold prefill.
-        if a.snap_bytes != self.vmm_snap_bytes(a.rows) {
-            v.kv.begin_seq(b);
-            return Err(crate::RuntimeError::Rejected(
-                "vmm: boundary snapshot layout drift".into(),
-            ));
+        let expected_snap_bytes = self.vmm_snap_bytes(a.rows);
+        let restored = (|| {
+            if a.snap_bytes != expected_snap_bytes {
+                return Err(RuntimeError::Rejected(format!(
+                    "boundary snapshot layout drift: cached {} bytes, expected {expected_snap_bytes}",
+                    a.snap_bytes
+                )));
+            }
+            if a.rows % v.kv.block_rows() != 0 {
+                v.kv.ensure_rows(b, a.rows + 1)?;
+            }
+            self.vmm_snap_copy(b, a.rows, a.snap_va, false)
+        })();
+        if let Err(error) = restored {
+            self.vmm.as_ref().unwrap().kv.begin_seq(b);
+            return Err(error);
         }
-        if a.rows % v.kv.block_rows() != 0 {
-            v.kv.ensure_rows(b, a.rows + 1)?;
-        }
-        self.vmm_snap_copy(b, a.rows, a.snap_va, false)?;
         self.vmm.as_ref().unwrap().kv.finish_attach(b);
         self.pos[b] = a.rows;
         self.vmm_attached[b] = a.rows;

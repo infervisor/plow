@@ -1,9 +1,215 @@
 use packet::dev::DevOp;
 use packet::devbuild::{Builder, Model, SectionData, SECT_METADATA};
-use plow_asset::segment_roles::{CUBLASLT, INTERPRETER, SECTION};
+use plow_asset::segment_roles::{ProgramRoles, SegmentRoles, CUBLASLT, INTERPRETER, SECTION};
 
 pub(crate) fn apply(model: &mut Model) -> Result<SectionData, String> {
     apply_projections(model, false)
+}
+
+pub(crate) fn apply_prefill(
+    model: &mut Model,
+    sections: &mut Vec<SectionData>,
+    profile: &str,
+) -> Result<usize, String> {
+    let positions: Vec<_> = sections
+        .iter()
+        .enumerate()
+        .filter(|(_, section)| section.name == SECTION)
+        .map(|(index, _)| index)
+        .collect();
+    if positions.len() > 1
+        || positions
+            .first()
+            .is_some_and(|&index| sections[index].kind != SECT_METADATA)
+    {
+        return Err("duplicate segment role metadata".into());
+    }
+    let mut metadata = if let Some(&index) = positions.first() {
+        SegmentRoles::from_bytes(&sections[index].data)?
+    } else {
+        SegmentRoles {
+            version: 1,
+            objects: Default::default(),
+            programs: Vec::new(),
+        }
+    };
+
+    struct Update {
+        index: usize,
+        roles: Vec<u8>,
+        inst_segment: Vec<Option<u16>>,
+        bounds: Vec<u32>,
+        prior_position: Option<usize>,
+    }
+    let mut updates = Vec::new();
+    let mut selected = 0usize;
+    let prefill_count = packet::devbuild::decode_rung_lo(&model.prog_t);
+    for index in 0..prefill_count {
+        let rows = model.prog_t[index];
+        let program = &model.progs[index];
+        let eligible: Vec<_> = program
+            .insts
+            .iter()
+            .map(|op| prefill_eligible(model, op, rows, profile))
+            .collect();
+        if !eligible.iter().any(|&yes| yes) {
+            continue;
+        }
+        if program.l2_domains != 0 || program.hier_base != 0 {
+            return Err("cuBLASLt prefill requires coarse single-domain packets".into());
+        }
+        let prior_position = metadata
+            .programs
+            .iter()
+            .position(|program| program.index == index);
+        let prior_roles = if let Some(position) = prior_position {
+            let prior = &metadata.programs[position];
+            if prior.roles.len() + 1 != program.gq_seg_ofs.len() {
+                return Err("existing prefill role window coverage".into());
+            }
+            prior.roles.clone()
+        } else {
+            vec![INTERPRETER; program.gq_seg_ofs.len() - 1]
+        };
+        let mut instruction_roles = vec![None; program.insts.len()];
+        for entry in program.stream.iter().chain(&program.gq_stream) {
+            let role = *prior_roles
+                .get(entry.seg as usize)
+                .ok_or("existing prefill role segment out of bounds")?;
+            let slot = instruction_roles
+                .get_mut(entry.inst as usize)
+                .ok_or("prefill queue instruction out of bounds")?;
+            if slot.is_some_and(|prior| prior != role) {
+                return Err("existing prefill instruction crosses role segments".into());
+            }
+            *slot = Some(role);
+        }
+        if !eligible
+            .iter()
+            .enumerate()
+            .any(|(inst, &yes)| yes && instruction_roles[inst] == Some(INTERPRETER))
+        {
+            continue;
+        }
+
+        let mut roles = Vec::new();
+        let mut inst_segment = vec![None; program.insts.len()];
+        let mut bounds = vec![0u32];
+        let mut last_key = None;
+        for (queue_index, entry) in program.gq_stream.iter().enumerate() {
+            let inst = entry.inst as usize;
+            let prior_role = instruction_roles
+                .get(inst)
+                .and_then(|&role| role)
+                .ok_or("prefill instruction absent from stream")?;
+            let route = eligible[inst] && prior_role == INTERPRETER;
+            let role = if route { CUBLASLT } else { prior_role };
+            let key = if route {
+                (u32::MAX, role, inst)
+            } else {
+                (u32::from(entry.seg), role, usize::MAX)
+            };
+            if last_key != Some(key) {
+                if !roles.is_empty() {
+                    bounds.push(queue_index as u32);
+                }
+                roles.push(role);
+            }
+            let segment =
+                u16::try_from(roles.len() - 1).map_err(|_| "too many cuBLASLt prefill segments")?;
+            if inst_segment[inst].is_some_and(|prior| prior != segment) {
+                return Err("cuBLASLt prefill instruction is not contiguous in the queue".into());
+            }
+            inst_segment[inst] = Some(segment);
+            last_key = Some(key);
+        }
+        bounds.push(program.gq_stream.len() as u32);
+        selected += roles.iter().filter(|&&role| role == CUBLASLT).count();
+        updates.push(Update {
+            index,
+            roles,
+            inst_segment,
+            bounds,
+            prior_position,
+        });
+    }
+    if selected == 0 {
+        return Ok(0);
+    }
+    for update in &updates {
+        let record = ProgramRoles {
+            index: update.index,
+            roles: update.roles.clone(),
+        };
+        if let Some(position) = update.prior_position {
+            metadata.programs[position] = record;
+        } else {
+            metadata.programs.push(record);
+        }
+    }
+    metadata.validate_schema()?;
+    for update in updates {
+        let program = &mut model.progs[update.index];
+        for entry in program.stream.iter_mut().chain(&mut program.gq_stream) {
+            entry.seg = update
+                .inst_segment
+                .get(entry.inst as usize)
+                .and_then(|&segment| segment)
+                .ok_or("prefill instruction absent from global queue")?;
+        }
+        program.gq_seg_ofs = update.bounds;
+    }
+    let section = SectionData {
+        kind: SECT_METADATA,
+        name: SECTION.into(),
+        data: serde_json::to_vec(&metadata).map_err(|error| error.to_string())?,
+    };
+    if let Some(&index) = positions.first() {
+        sections[index] = section;
+    } else {
+        sections.push(section);
+    }
+    Ok(selected)
+}
+
+fn prefill_eligible(model: &Model, op: &packet::dev::DevInst, rows: u32, profile: &str) -> bool {
+    if !matches!(
+        DevOp::from_u16(op.op),
+        Some(DevOp::Gemm | DevOp::GemmMed | DevOp::GemmSmall)
+    ) || op.blocks == 0
+        || op.i[0] != rows
+        || !plow_asset::segment_roles::cublaslt_prefill_bf16(profile, op.i[0], op.i[1], op.i[2])
+        || op.i[3..6].iter().any(|&value| value != 0)
+        || op.t[3..]
+            .iter()
+            .any(|&tensor| tensor != packet::dev::TENSOR_NONE)
+        || [op.t[0], op.t[1], op.t[2]]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            != 3
+    {
+        return false;
+    }
+    let bytes = |a: u32, b: u32| {
+        u64::from(a)
+            .checked_mul(u64::from(b))
+            .and_then(|elements| elements.checked_mul(2))
+    };
+    [
+        (op.t[0], bytes(op.i[0], op.i[1])),
+        (op.t[1], bytes(op.i[0], op.i[2])),
+        (op.t[2], bytes(op.i[1], op.i[2])),
+    ]
+    .into_iter()
+    .all(|(handle, required)| {
+        required.is_some_and(|bytes| {
+            model
+                .tensors
+                .get(handle as usize)
+                .is_some_and(|tensor| tensor.bytes >= bytes)
+        })
+    })
 }
 
 fn apply_projections(model: &mut Model, head: bool) -> Result<SectionData, String> {
@@ -203,6 +409,23 @@ mod tests {
         }
     }
 
+    fn prefill_model() -> Model {
+        let widths = [1, 2, 4, 8, 16, 32, 64, 128, 1];
+        let mut model = model_rows(&widths);
+        for program in &mut model.progs[..8] {
+            let rows = program.insts[1].i[0];
+            program.insts[1].op = DevOp::Gemm as u16;
+            program.insts[1].i[..].copy_from_slice(&[rows, 3840, 15360, 0, 0, 0, 7, 8]);
+            program.insts[2].op = DevOp::GemmMed as u16;
+            program.insts[2].i[..].copy_from_slice(&[rows, 3840, 8192, 0, 0, 0, 9, 10]);
+        }
+        let extent = 3840u64 * 15360 * 2;
+        for tensor in &mut model.tensors {
+            tensor.bytes = extent;
+        }
+        model
+    }
+
     #[test]
     fn isolates_body_projection_without_changing_math_or_dependencies() {
         let mut m = model();
@@ -317,5 +540,98 @@ mod tests {
         let mut m = model();
         m.progs[1].insts[1].i[4] = 1;
         assert!(apply(&mut m).err().unwrap().contains("ordinary BF16"));
+    }
+
+    #[test]
+    fn prefill_policy_isolates_two_exact_shapes_for_all_eight_small_rungs() {
+        let mut model = prefill_model();
+        let decode = model.progs[8].to_blob();
+        let insts: Vec<_> = model
+            .progs
+            .iter()
+            .map(|program| program.insts.iter().map(|op| op.pack()).collect::<Vec<_>>())
+            .collect();
+        let mut sections = Vec::new();
+        assert_eq!(
+            apply_prefill(&mut model, &mut sections, "sm_90a").unwrap(),
+            16
+        );
+        assert_eq!(model.progs[8].to_blob(), decode);
+        assert_eq!(sections.len(), 1);
+        let metadata = SegmentRoles::from_bytes(&sections[0].data).unwrap();
+        assert_eq!(metadata.programs.len(), 8);
+        for (index, roles) in metadata.programs.iter().enumerate() {
+            assert_eq!(roles.index, index);
+            assert_eq!(
+                roles.roles.iter().filter(|&&role| role == CUBLASLT).count(),
+                2
+            );
+            for (pc, op) in model.progs[index].insts.iter().enumerate() {
+                assert_eq!(op.pack(), insts[index][pc]);
+                let segments: std::collections::BTreeSet<_> = model.progs[index]
+                    .gq_stream
+                    .iter()
+                    .filter(|entry| entry.inst as usize == pc)
+                    .map(|entry| entry.seg as usize)
+                    .collect();
+                assert_eq!(segments.len(), 1);
+                let role = roles.roles[*segments.iter().next().unwrap()];
+                assert_eq!(role == CUBLASLT, pc == 1 || pc == 2);
+            }
+        }
+    }
+
+    #[test]
+    fn prefill_policy_is_opt_in_exact_and_preserves_existing_roles() {
+        let mut model = prefill_model();
+        model.progs[0].insts[1].op = DevOp::GemmFp8 as u16;
+        model.progs[1].insts[1].i[0] = 129;
+        model.progs[2].insts[1].i[1] = 4096;
+        model.progs[3].insts[1].t[7] = 0;
+        let prior = ProgramRoles {
+            index: 4,
+            roles: vec![plow_asset::segment_roles::PREFILL_ATTENTION],
+        };
+        let mut sections = vec![SectionData {
+            kind: SECT_METADATA,
+            name: SECTION.into(),
+            data: serde_json::to_vec(&SegmentRoles {
+                version: 1,
+                objects: [(
+                    plow_asset::segment_roles::PREFILL_ATTENTION,
+                    plow_asset::segment_roles::SegmentObject {
+                        abi: "attention_sm90_hd256_v1".into(),
+                        file: "attention.cubin".into(),
+                        sha256: None,
+                        promote_k512: None,
+                        attention: None,
+                    },
+                )]
+                .into_iter()
+                .collect(),
+                programs: vec![prior],
+            })
+            .unwrap(),
+        }];
+        let selected = apply_prefill(&mut model, &mut sections, "sm90a").unwrap();
+        assert_eq!(selected, 10);
+        let metadata = SegmentRoles::from_bytes(&sections[0].data).unwrap();
+        assert_eq!(
+            metadata
+                .programs
+                .iter()
+                .find(|p| p.index == 4)
+                .unwrap()
+                .roles,
+            [plow_asset::segment_roles::PREFILL_ATTENTION]
+        );
+
+        let mut unsupported = prefill_model();
+        let mut none = Vec::new();
+        assert_eq!(
+            apply_prefill(&mut unsupported, &mut none, "sm120").unwrap(),
+            0
+        );
+        assert!(none.is_empty());
     }
 }
