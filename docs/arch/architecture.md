@@ -34,6 +34,7 @@ duplicate them and is now an index only.
 | [13](13-prefill-chunking.md) | **Prefill Chunking** | Bucket ladder, the ragged tail, ragged-M |
 | [14](14-amd-arch-divergence.md) | **AMD Arch Divergence** | gfx942 vs gfx950: one source tree, what forks, the tripwire |
 | [18](18-serving-metrics.md) | **Serving Metrics** | Model-scoped Prometheus metrics, vLLM compatibility, request/tick accounting and lifecycle |
+| [19](19-packet-extensions.md) | **Packet Extensions** | Adding prefill buckets, decode rungs, packed siblings and token-batch bodies to a packet that is already compiled, without re-emitting it |
 
 ---
 
