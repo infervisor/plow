@@ -59,3 +59,73 @@ or other GPU work. This is one matched pair without a repeatability estimate.
 Only 4/20 generated texts match exactly; retrieval checks do not establish
 broad model-quality equivalence. The 100-request H200 target remains unmet.
 The record includes build provenance, artifact hashes, and the campaign recipe.
+
+## Current full-ladder trace and specialist sweep
+
+The `5c26d90f` production runtime path was traced with the full 21-program
+packet and default two-split sparse adapter. A cold 65,536-token request took
+7489.89 ms without tracing and 7514.64 ms with tracing; prompt and output
+checksums match. The final 8192-row chunk has complete opcode/workgroup
+coverage for 1909 non-native instructions on each of eight ranks. Native
+GEMM, MoE, index selection and sparse MLA do not write these trace records.
+
+Rank 0's span after Embed is 962.79 ms. Summed completion tails are 161.21 ms
+for XReduceTwoShot, 51.79 ms for GEMM, 45.45 ms for MLA merge/fold and 33.56 ms
+for MoE combine. These envelopes overlap and are not wall-time percentages.
+Raw traces, packet disassembly and parser checks are under
+`/tmp/tp-glm53-prefill-instructions`.
+
+`specialist_probe.hip` wraps the production `d_xreduce_twoshot_mega` body in
+a dedicated kernel. The host probe runs all eight GPUs concurrently, varying
+four/eight waves, the experimental wave-RS schedule, and 38/76/152/304
+workgroups. Aggregation is enabled as in the serving prefill object. Each of
+84 cells checks every output against an independent BF16/FP32 rank-order
+oracle on all ranks, three changing input reuses, output/partial guards and
+both rendezvous counts. All pass; all three kernels have zero private storage.
+
+| Rows | Four waves, 304 WGs, us | Best measured choice | Best, us |
+|---|---:|---|---:|
+| 1 | 52.72 | Eight waves, 38 WGs | 43.43 |
+| 128 | 75.47 | Eight waves, 76 WGs | 63.94 |
+| 129 | 77.60 | Wave-RS object, 76 WGs | 62.93 |
+| 512 | 128.63 | Eight waves, 76 WGs | 108.00 |
+| 2048 | 283.26 | Eight waves, 152 WGs | 268.08 |
+| 8191 | 908.48 | Wave-RS object, 152 WGs | 866.73 |
+| 8192 | 902.95 | Eight waves, 152 WGs | 873.10 |
+
+The wave-RS object falls back to its scalar body for the ragged 129/8191
+cases. At 8192 rows, eight waves with 304 workgroups takes 1178.24 us,
+30.5% slower than four waves. Do not enable eight waves globally from these
+results. The large-rung gain is only 3–5% in isolation; no interpreter,
+segment-selection or serving default changes follow from this sweep.
+
+Times are medians of nine samples after five discarded samples, taking the
+maximum within-rank GPU event duration. Input initialization and CPU checks
+are outside timing. Host launches ranks sequentially; arm order is fixed.
+The host baseline always uses 304 workgroups and therefore does not reproduce
+the compiler's small-rung workgroup cap. Raw results and image/header hashes
+are under `/tmp/tp-glm53-collective-specialist`.
+
+Reproduce inside `nix develop`, with no other GPU work or compilation during
+the timed probe:
+
+```sh
+out=$(mktemp -d /tmp/plow-collective.XXXXXX)
+bench=runtime/bench/amd/glm_prefill_collective
+for arm in four eight wave_rs; do
+  flags=(-DPLOW_WG_WAVES=8)
+  if [ "$arm" = four ]; then flags=(-DPLOW_WG_WAVES=4); fi
+  if [ "$arm" = wave_rs ]; then flags+=(-DPLOW_XR_WAVE_RS=1); fi
+  "$PLOW_HIPCC" --genco --offload-arch=gfx942 -O3 -w -std=c++17 \
+    -DPLOW_XR_AGG=1 "${flags[@]}" -Iruntime/amd -Iruntime/common \
+    "$bench/specialist_probe.hip" -o "$out/$arm.co"
+  "$PLOW_BUNDLER" --unbundle --type=o \
+    --targets=hipv4-amdgcn-amd-amdhsa--gfx942 \
+    --input="$out/$arm.co" --output="$out/$arm.elf"
+done
+c++ -std=c++17 -O3 -D__HIP_PLATFORM_AMD__ -I"$ROCM_PATH/include" \
+  "$bench/specialist_probe.cpp" -L"$ROCM_PATH/lib" \
+  -Wl,-rpath,"$ROCM_PATH/lib" -lamdhip64 -o "$out/probe"
+GPU_LEASE_NGPU=8 perf-data/tools/gpulease -n 8 collective-specialist \
+  "$out/probe" "$out/four.elf" "$out/eight.elf" "$out/wave_rs.elf"
+```
