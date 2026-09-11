@@ -26,6 +26,7 @@ static CUfunction interpreter;
 static unsigned arena_bytes;
 static unsigned interpreter_grid = 132;
 static bool prefill_interpreter;
+static bool direct_prefill;
 #define DRIVER(call) do { auto error = (call); if (error != CUDA_SUCCESS) { \
     const char* message; cuGetErrorString(error, &message); \
     std::fprintf(stderr, "%s: %s\n", #call, message); std::exit(1); } } while (0)
@@ -200,16 +201,27 @@ int main(int argc, char** argv) {
         cubin = prefill;
         prefill_interpreter = true;
     }
+    if (const char* direct = std::getenv("PLOW_PROBE_DIRECT_PREFILL_CUBIN")) {
+        if (cubin) return 2;
+        cubin = direct;
+        prefill_interpreter = true;
+        direct_prefill = true;
+    }
     if (cubin) {
         DRIVER(cuModuleLoad(&module, cubin));
-        DRIVER(cuModuleGetFunction(&interpreter, module, prefill_interpreter
-            ? "_Z19interp_sm90a_pfgemm11PlowProgram" : "_Z12interp_sm90a11PlowProgram"));
+        DRIVER(cuModuleGetFunction(&interpreter, module, direct_prefill
+            ? "plow_sm90a_pfgemm_w8a16_m1"
+            : prefill_interpreter ? "_Z19interp_sm90a_pfgemm11PlowProgram"
+                                  : "_Z12interp_sm90a11PlowProgram"));
         CUdeviceptr address; size_t bytes;
         DRIVER(cuModuleGetGlobal(&address, &bytes, module,
-            prefill_interpreter ? "plow_arena_bytes_pfgemm" : "plow_arena_bytes"));
+            direct_prefill ? "plow_arena_bytes_pfgemm_w8a16_m1"
+                           : prefill_interpreter ? "plow_arena_bytes_pfgemm"
+                                                 : "plow_arena_bytes"));
         if (bytes != sizeof(arena_bytes)) return 2;
         DRIVER(cuMemcpyDtoH(&arena_bytes, address, bytes));
-        DRIVER(cuFuncSetAttribute(interpreter, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, arena_bytes));
+        if (arena_bytes)
+            DRIVER(cuFuncSetAttribute(interpreter, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, arena_bytes));
         CHECK(cudaFuncSetAttribute(production, cudaFuncAttributeMaxDynamicSharedMemorySize, arena_bytes));
         if (const char* grid = std::getenv("PLOW_PROBE_GRID"))
             interpreter_grid = std::strtoul(grid, nullptr, 10);

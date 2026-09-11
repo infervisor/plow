@@ -686,6 +686,20 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN)
         endforeach()
     endforeach()
 
+    if(PLOW_SM90A_CUBIN)
+        set(_w8a16_m1_src "${CMAKE_CURRENT_SOURCE_DIR}/nvidia/interp_sm90a_pfgemm_w8a16_m1.cu")
+        set(_w8a16_m1_out "${PLOW_CUBIN_DIR}/interp_sm90a_pfgemm_w8a16_m1.cubin")
+        add_custom_command(OUTPUT "${_w8a16_m1_out}"
+            COMMAND bash "${_cubin_run}" "${PLOW_CUBIN_NVCC}" "${_w8a16_m1_out}"
+                    plow_sm90a_pfgemm_w8a16_m1 required
+                    -arch=sm_90a -O3 -std=c++17 -cubin ${_cubin_inc}
+                    "${_w8a16_m1_src}"
+            DEPENDS "${_w8a16_m1_src}" "${_cubin_run}" ${_cubin_headers}
+            COMMENT "nvcc interp_sm90a_pfgemm_w8a16_m1.cubin"
+            VERBATIM)
+        list(APPEND _cubin_outs "${_w8a16_m1_out}")
+    endif()
+
     # The device stochastic sampler is NOT the megakernel and shares none of its
     # defines, so it is not a row in the table above. A failure here is non-fatal:
     # serving falls back to host sampling (hence `optional`).

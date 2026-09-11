@@ -387,6 +387,18 @@ if ! "${NVENV[@]}" \
 fi
 echo "built $OUT_PF ($(stat -c%s "$OUT_PF") B), kernel $KSYM_PF present"
 
+OUT_W8A16_M1="${OUT%.cubin}_pfgemm_w8a16_m1.cubin"
+"${NVENV[@]}" \
+  "$NVCC" -std=c++17 -arch=sm_90a -O3 -cubin \
+  -I "$HERE/runtime/common" -I "$HERE/runtime/nvidia" \
+  -o "$OUT_W8A16_M1" "$HERE/runtime/nvidia/interp_sm90a_pfgemm_w8a16_m1.cu"
+"${NVENV[@]}" cuobjdump -symbols "$OUT_W8A16_M1" | \
+  grep -q plow_sm90a_pfgemm_w8a16_m1 || {
+    echo "FATAL: native W8A16 M1 role kernel missing in $OUT_W8A16_M1" >&2
+    exit 1
+  }
+echo "built $OUT_W8A16_M1 ($(stat -c%s "$OUT_W8A16_M1") B)"
+
 # fp8-KV variants (rtx-19 E3, PLOW_BUILD_FP8KV=1): same two objects + -DPLOW_FP8_KV=1, which
 # compiles in the e4m3 KV op-arms (HEADNORM_ROPE_FP8 / FLASH_DECODE_FP8). The default objects above
 # stay byte-identical (fp8 arms are behind the flag). fp8-KV composes with fp8 WEIGHTS at runtime:

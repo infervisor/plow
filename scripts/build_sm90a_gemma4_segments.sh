@@ -53,6 +53,13 @@ for gemma_packed in 0 1; do
       -o "$gemma_out/interp_sm90a_pfpackedseg.cubin" runtime/nvidia/interp_sm90a.cu
   fi
 done
+env -i PATH=/usr/local/cuda/bin:/usr/bin:/bin /usr/local/cuda/bin/nvcc \
+  -std=c++17 -arch=sm_90a -O3 -cubin -Xptxas=-v \
+  -I runtime/common -I runtime/nvidia \
+  -o "$gemma_out/interp_sm90a_pfgemm_w8a16_m1.cubin" \
+  runtime/nvidia/interp_sm90a_pfgemm_w8a16_m1.cu
+/usr/local/cuda/bin/cuobjdump -symbols "$gemma_out/interp_sm90a_pfgemm_w8a16_m1.cubin" | \
+  grep -q plow_sm90a_pfgemm_w8a16_m1
 if [ "${PLOW_BUILD_MASKED_PADDING:-0}" = 1 ]; then
   env -i PATH=/usr/local/cuda/bin:/usr/bin:/bin /usr/local/cuda/bin/nvcc \
     -std=c++17 -arch=sm_90a -O3 -cubin -Xptxas=-v -I runtime/common -I runtime/nvidia \

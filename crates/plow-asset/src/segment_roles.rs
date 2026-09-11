@@ -10,7 +10,8 @@ pub const CUBLASLT: u8 = 5;
 pub const PREFILL_ATTENTION_HD512_WG32: u8 = 6;
 pub const MXFP4_MOE: u8 = 7;
 pub const NATIVE_DECODE_TC: u8 = 8;
-pub const MAX_ROLE: u8 = NATIVE_DECODE_TC;
+pub const W8A16_PREFILL_M1: u8 = 9;
+pub const MAX_ROLE: u8 = W8A16_PREFILL_M1;
 
 pub fn is_projection(role: u8) -> bool {
     matches!(role, CUBLASLT | NATIVE_DECODE_TC)
@@ -18,6 +19,7 @@ pub fn is_projection(role: u8) -> bool {
 
 pub const PREFILL_ATTENTION_HD512_WG32_ABI: &str = "attention_sm90_hd512_wg32_v1";
 pub const MXFP4_MOE_ABI: &str = "mxfp4_moe_sm90_v1";
+pub const W8A16_PREFILL_M1_ABI: &str = "w8a16_prefill_m1_sm90_v1";
 
 pub fn requires_object(role: u8) -> bool {
     matches!(
@@ -29,6 +31,7 @@ pub fn requires_object(role: u8) -> bool {
             | PREFILL_ATTENTION_HD512_WG32
             | MXFP4_MOE
             | NATIVE_DECODE_TC
+            | W8A16_PREFILL_M1
     )
 }
 
@@ -116,6 +119,7 @@ impl SegmentRoles {
                 PREFILL_ATTENTION_HD512_WG32 => PREFILL_ATTENTION_HD512_WG32_ABI,
                 MXFP4_MOE => MXFP4_MOE_ABI,
                 NATIVE_DECODE_TC => "gemv_transposed_sm90_bf16_v1",
+                W8A16_PREFILL_M1 => W8A16_PREFILL_M1_ABI,
                 _ => return Err("invalid packet segment object role".into()),
             };
             let valid_hash = |hash: Option<&str>| {
@@ -161,13 +165,17 @@ impl SegmentRoles {
                             .attention
                             .as_ref()
                             .is_none_or(|a| a != &hd512_wg && a != &hd512_wg64 && a != &hd512_px4)))
-                || (matches!(id, MXFP4_MOE | NATIVE_DECODE_TC)
+                || (matches!(id, MXFP4_MOE | NATIVE_DECODE_TC | W8A16_PREFILL_M1)
                     && (!valid_hash(object.sha256.as_deref())
                         || object.promote_k512.is_some()
                         || object.attention.is_some()))
                 || (!matches!(
                     id,
-                    FP8_M1 | PREFILL_ATTENTION_HD512_WG32 | MXFP4_MOE | NATIVE_DECODE_TC
+                    FP8_M1
+                        | PREFILL_ATTENTION_HD512_WG32
+                        | MXFP4_MOE
+                        | NATIVE_DECODE_TC
+                        | W8A16_PREFILL_M1
                 ) && (object.sha256.is_some()
                     || object.promote_k512.is_some()
                     || object.attention.is_some()))
@@ -298,6 +306,21 @@ mod tests {
         for bad in [
             raw.replace(&"a".repeat(64), "bad"),
             raw.replace("[0,8,0]", "[5,8,0]"),
+        ] {
+            assert!(SegmentRoles::from_bytes(bad.as_bytes()).is_err());
+        }
+    }
+
+    #[test]
+    fn native_w8a16_m1_requires_exact_abi_and_hash() {
+        let raw = format!(
+            r#"{{"version":1,"objects":{{"9":{{"abi":"w8a16_prefill_m1_sm90_v1","file":"m1.cubin","sha256":"{}"}}}},"programs":[{{"index":0,"roles":[0,9,0]}}]}}"#,
+            "a".repeat(64)
+        );
+        SegmentRoles::from_bytes(raw.as_bytes()).unwrap();
+        for bad in [
+            raw.replace(&"a".repeat(64), "bad"),
+            raw.replace("w8a16_prefill_m1_sm90_v1", "w8a16_prefill_small_sm90_v1"),
         ] {
             assert!(SegmentRoles::from_bytes(bad.as_bytes()).is_err());
         }
