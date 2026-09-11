@@ -206,6 +206,28 @@ assumed *per lever*; the bulk must come from slot recycling (~1.5–1.9 s × ~80
 which a 20-prompt bench structurally CANNOT show because 20 requests over 20 slots recycle nothing —
 that arm must run at 40+ prompts. Revised phase 1: **≈ 180 s**, dominated by slot recycling.
 
+**Slot recycling measured (#17, merged 50a23464, default on — `PLOW_VMM_DEFERRED_RECLAIM`).**
+Recycling a slot no longer unmaps the previous occupant's window on the engine thread. 40-prompt
+bench (the smallest shape that recycles at all: 40 requests over 20 slots = 20 recycles), same
+binary, one campaign:
+
+| | control | deferred reclaim |
+|---|---:|---:|
+| out tok/s | 48.72 | **52.84 (+8.5 %)** |
+| duration | 582.2 s | **536.8 s (−45.4 s)** |
+| median TPOT | 349.0 ms | **310.6 ms (−11 %)** |
+| P99 ITL | 3226 ms | **1178 ms (−63 %)** |
+| median TTFT | 24.6 s | 23.6 s |
+
+Retrieval 18/18 on the changed arm. Error-line counts are identical in both arms (the known
+`fault_ms="0"` false positives in the loader's phase lines).
+
+The P99 ITL is the signature: the 3.2 s stalls were a recycle blocking every live decode on the
+engine thread, and they are gone. ≈ 2.3 s saved per recycle; the 100-prompt reference run has
+~80 recycles, which suggests ~150–180 s there — to be confirmed on a 100-prompt run rather than
+extrapolated. This makes slot recycling, not map-ahead, the bulk of phase 1, as the revised
+estimate predicted.
+
 **Sequencing rules.** Phases 1 and 2 are independent of everything else and change no numerics
 (phase 2 changes kernels, so each flip carries a retrieval screen). Phase 3 and phase 4 both touch
 the same per-layer seam and must not be measured concurrently on one packet. Phase 5's body work is
