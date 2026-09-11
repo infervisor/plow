@@ -5138,6 +5138,7 @@ fn token_batch_body_probe(t: u32) -> (DevProg, Vec<crate::asset::devblob::DevTen
         t,
         packed_prefill_only: false,
         token_batch_body: true,
+        decode_rung: false,
         n_counter: 0,
         insts: vec![DevInst64 {
             op: DevOp::GemmLtPf as u16,

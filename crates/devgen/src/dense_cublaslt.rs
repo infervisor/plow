@@ -552,17 +552,24 @@ mod tests {
             .map(|program| program.insts.iter().map(|op| op.pack()).collect::<Vec<_>>())
             .collect();
         let mut sections = Vec::new();
+        // 8, not 6, since cb5c0719 ("cuda gemm: route measured wide prefill cells") widened the
+        // policy: CUBLASLT_PREFILL_WIDE_ROWS x CUBLASLT_PREFILL_GEMMA4_SHAPES now qualify on top
+        // of the two original (n, k) pairs, so this fixture isolates two more ops.
         assert_eq!(
             apply_prefill(&mut model, &mut sections, "sm_90a").unwrap(),
-            6
+            8
         );
         assert_eq!(model.progs[6].to_blob(), decode);
         assert_eq!(sections.len(), 1);
         let metadata = SegmentRoles::from_bytes(&sections[0].data).unwrap();
-        assert_eq!(metadata.programs.len(), 3);
+        // Four programs, not three: the fixture's rungs are [1, 64, 128, 256, 512, 1024, 1], and
+        // since cb5c0719 the 1024 rung qualifies through CUBLASLT_PREFILL_WIDE_ROWS as well as
+        // the three narrow ones through CUBLASLT_PREFILL_ROWS. Both of the fixture's shapes,
+        // (3840, 15360) and (3840, 8192), are in CUBLASLT_PREFILL_GEMMA4_SHAPES.
+        assert_eq!(metadata.programs.len(), 4);
         for roles in &metadata.programs {
             let index = roles.index;
-            assert!(matches!(model.prog_t[index], 128 | 256 | 512));
+            assert!(matches!(model.prog_t[index], 128 | 256 | 512 | 1024));
             assert_eq!(
                 roles.roles.iter().filter(|&&role| role == CUBLASLT).count(),
                 2
@@ -614,7 +621,8 @@ mod tests {
             .unwrap(),
         }];
         let selected = apply_prefill(&mut model, &mut sections, "sm90a").unwrap();
-        assert_eq!(selected, 3);
+        // 5, not 3, for the same reason as above (cb5c0719 widened the qualifying cells).
+        assert_eq!(selected, 5);
         let metadata = SegmentRoles::from_bytes(&sections[0].data).unwrap();
         assert_eq!(
             metadata
