@@ -1399,6 +1399,52 @@ fn glm_ofold(enc: MoeEnc) -> bool {
     emit_config::active().glm_ofold && !glm_linear_fp8(enc) && enc != MoeEnc::Mxfp4
 }
 
+/// `PLOW_GLM_GEMM_BLK`: the prefill projections that take the native block-scale FP8 route
+/// (`GemmBlkPf`). Only whole checkpoint block-FP8 tensors, or block-row-aligned slices of one,
+/// are nameable: `q_absorb` and `q_rope` are prep products with no scale grid of their own.
+#[derive(Clone, Copy, Default)]
+struct GlmBlk {
+    q_a: bool,
+    kv_a: bool,
+    wq_b: bool,
+    o_proj: bool,
+}
+
+impl GlmBlk {
+    fn any(self) -> bool {
+        self.q_a || self.kv_a || self.wq_b || self.o_proj
+    }
+}
+
+fn glm_gemm_blk() -> GlmBlk {
+    let spec = emit_config::active()
+        .glm_gemm_blk
+        .clone()
+        .unwrap_or_default();
+    let mut set = GlmBlk::default();
+    for name in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        match name {
+            "1" | "true" => {
+                set = GlmBlk {
+                    q_a: true,
+                    kv_a: true,
+                    wq_b: true,
+                    o_proj: true,
+                }
+            }
+            "0" | "false" => {}
+            "q_a" => set.q_a = true,
+            "kv_a" => set.kv_a = true,
+            "wq_b" => set.wq_b = true,
+            "o_proj" => set.o_proj = true,
+            other => {
+                panic!("PLOW_GLM_GEMM_BLK: unknown projection {other:?} (q_a, kv_a, wq_b, o_proj)")
+            }
+        }
+    }
+    set
+}
+
 /// OPT-IN (PLOW_GLM_FP8_KV=1): store the MLA latent cache (`kv.{l}.ckv`) as e4m3 with a per-row
 /// f32 scale (`kv.{l}.scale`), exactly the K3 form — the latent writer becomes `HeadNormRopeFp8`
 /// (RMSNorm + quantize + scale record in one pass) and the dense flash swaps to the `*Fp8` MLA
@@ -1641,6 +1687,17 @@ struct GlmLW {
     // writes this name twice: bf16 bytes under `iwp` (unused when index_kpool>1) and f32
     // bytes here. `iwp` itself is UNTOUCHED — GLM-5.2 keeps reading it exactly as today.
     iwp_f32: u32, // indexer.weights_proj.weight [HI, H] f32 (index_kpool>1 only)
+    // PLOW_GLM_GEMM_BLK: checkpoint block-FP8 bytes (`.weight_fp8`) and `[N/128][K/128]` scale
+    // grids of the prefill projections the native FP8 route reads. ADDITIONAL to the bf16
+    // handles above, which decode keeps reading. TENSOR_NONE unless selected.
+    blk_qad: u32,
+    blk_qad_s: u32,
+    blk_ckvd: u32,
+    blk_ckvd_s: u32,
+    blk_iwqb: u32,
+    blk_iwqb_s: u32,
+    blk_wo: u32,
+    blk_wo_s: u32,
 }
 
 /// The GLM tensor table. Decode-shaped activations (one row) + per-layer latent/rope caches +
@@ -1757,6 +1814,11 @@ pub(crate) struct GlmTn {
     /// E8M0 scale rows for `fu_g` under A4W4 — WRITTEN by the gate/up epilogue, READ by DOWN.
     /// TENSOR_NONE on the bf16 / block-fp8 arms, which have no per-block scale.
     fu_scale: u32,
+    // PLOW_GLM_GEMM_BLK scratch: the quantized activation [T][K] fp8, its group-major [K/128][T]
+    // f32 scales, and the zero [N] f32 bias the kernel requires. TENSOR_NONE otherwise.
+    blk_xq: u32,
+    blk_xs: u32,
+    blk_bias: u32,
     // per-emitted-layer caches + weights (index i <-> layer_ids[i]); kidx = indexer key cache [ctx][DI]
     // on 'full' layers (TENSOR_NONE otherwise).
     ckv: Vec<u32>,
@@ -2184,6 +2246,16 @@ pub(crate) fn declare_glm_rows_batched(
     };
 
     let lin_fp8 = glm_linear_fp8(enc);
+    // Declared only where a >=2048-row prefill bucket exists; decode never reads them.
+    let blk = if rows >= 2048 {
+        glm_gemm_blk()
+    } else {
+        GlmBlk::default()
+    };
+    assert!(
+        !blk.any() || (enc != MoeEnc::Mxfp4 && !lin_fp8 && !glm_ofold(enc)),
+        "PLOW_GLM_GEMM_BLK excludes MXFP4, GLM_LINEAR_FP8 and PLOW_GLM_OFOLD"
+    );
     // The checkpoint's weight namespace, from the cfg — NOT the literal `model.` these closures
     // used to carry. `kv.*` above stays compiler-owned and is deliberately not prefixed.
     let pfx = c.prefix.as_str();
@@ -2743,9 +2815,64 @@ pub(crate) fn declare_glm_rows_batched(
             } else {
                 TENSOR_NONE
             },
+            blk_qad: if mla && blk.q_a {
+                q8(b, "self_attn.q_a_proj", ql as u64, h as u64)
+            } else {
+                TENSOR_NONE
+            },
+            blk_qad_s: if mla && blk.q_a {
+                q8s(b, "self_attn.q_a_proj", ql as u64, h as u64)
+            } else {
+                TENSOR_NONE
+            },
+            blk_ckvd: if mla && blk.kv_a {
+                q8(b, "self_attn.derived.kv_a_latent", dk as u64, h as u64)
+            } else {
+                TENSOR_NONE
+            },
+            blk_ckvd_s: if mla && blk.kv_a {
+                q8s(b, "self_attn.derived.kv_a_latent", dk as u64, h as u64)
+            } else {
+                TENSOR_NONE
+            },
+            blk_iwqb: if full && blk.wq_b {
+                q8(b, "self_attn.indexer.wq_b", (hi * di) as u64, ql as u64)
+            } else {
+                TENSOR_NONE
+            },
+            blk_iwqb_s: if full && blk.wq_b {
+                q8s(b, "self_attn.indexer.wq_b", (hi * di) as u64, ql as u64)
+            } else {
+                TENSOR_NONE
+            },
+            blk_wo: if mla && blk.o_proj {
+                q8(b, "self_attn.o_proj", h as u64, (nh_l * vd) as u64)
+            } else {
+                TENSOR_NONE
+            },
+            blk_wo_s: if mla && blk.o_proj {
+                q8s(b, "self_attn.o_proj", h as u64, (nh_l * vd) as u64)
+            } else {
+                TENSOR_NONE
+            },
         });
     }
 
+    let blk_xq = if blk.any() {
+        ac(b, "blk_xq", rows * h as u64)
+    } else {
+        TENSOR_NONE
+    };
+    let blk_xs = if blk.any() {
+        ac(b, "blk_xs", rows * (h / 128) as u64 * F32)
+    } else {
+        TENSOR_NONE
+    };
+    let blk_bias = if blk.any() {
+        ac(b, "blk_bias", h as u64 * F32)
+    } else {
+        TENSOR_NONE
+    };
     GlmTn {
         ids,
         pos,
@@ -2794,6 +2921,9 @@ pub(crate) fn declare_glm_rows_batched(
         row_gate,
         fu_g,
         fu_scale,
+        blk_xq,
+        blk_xs,
+        blk_bias,
         qidx_pf,
         kidx_pf,
         widx_pf,
@@ -4738,6 +4868,48 @@ fn emit_glm_lt_gemm(
     Some(counter)
 }
 
+/// `PLOW_GLM_GEMM_BLK`: one projection on the native block-scale FP8 route, alone in its
+/// segment. `quantize` makes this instruction quantize `x` into the shared FP8 scratch first;
+/// without it the instruction reads what the previous quantizing instruction wrote from the
+/// same `x`, so the caller must order the two. `None` (the bf16 arm) when the projection is
+/// not selected or the bucket is outside the route's rows.
+#[allow(clippy::too_many_arguments)]
+fn emit_glm_blk_gemm(
+    b: &mut Builder,
+    c: &GlmCfg,
+    n: &GlmTn,
+    out: u32,
+    x: u32,
+    [weight, scale]: [u32; 2],
+    t: u32,
+    [nn, k]: [u32; 2],
+    quantize: bool,
+    deps: &[u32],
+) -> Option<u32> {
+    if weight == TENSOR_NONE || !(2048..=8192).contains(&t) {
+        return None;
+    }
+    assert!(
+        c.tp == 8 && c.hidden == 6144 && b.n_cu() == 304 && scale != TENSOR_NONE,
+        "PLOW_GLM_GEMM_BLK requires gfx942 TP8 GLM prefill"
+    );
+    let counter = b.emit(DevOp::GemmBlkPf, vec![0], deps, |d| {
+        d.t[0] = out;
+        d.t[1] = x;
+        d.t[2] = weight;
+        d.t[3] = scale;
+        d.t[4] = n.blk_xq;
+        d.t[5] = n.blk_xs;
+        d.t[6] = n.blk_bias;
+        d.i[0] = t;
+        d.i[1] = nn;
+        d.i[2] = k;
+        d.i[3] = u32::from(quantize);
+    });
+    b.isolate(counter);
+    Some(counter)
+}
+
 /// Emit the MLA attention sub-block for a PREFILL bucket of `t` query rows: the T-row twin of
 /// [`emit_glm_mla`]. Writes `n.xn2` (what the FFN would consume) and returns its completion dep.
 ///
@@ -4838,7 +5010,22 @@ fn emit_glm_dsa_prefill_select(
         };
     // q_idx: [T][HI*DI] from the q-latent; k_idx: [T][DI] from the input norm.
     let c_qi = select.then(|| {
-        let c_q0 = bf16_gemm(b, n.qidx_pf, n.qlat, w.iwqb, hi * di, ql, &[pre[1]]);
+        let blk_q0 = emit_glm_blk_gemm(
+            b,
+            c,
+            n,
+            n.qidx_pf,
+            n.qlat,
+            [w.blk_iwqb, w.blk_iwqb_s],
+            t,
+            [hi * di, ql],
+            true,
+            &[pre[1]],
+        );
+        let c_q0 = match blk_q0 {
+            Some(counter) => counter,
+            None => bf16_gemm(b, n.qidx_pf, n.qlat, w.iwqb, hi * di, ql, &[pre[1]]),
+        };
         b.emit(DevOp::HeadNormRope, all.to_vec(), &[c_q0], |d| {
             d.t[0] = n.qidx_pf;
             d.t[1] = n.qidx_pf;
@@ -5263,8 +5450,45 @@ pub(crate) fn emit_glm_mla_prefill(
     // 2/6/8 the three down-projections. Decode fuses these into ONE GemvQkv (fusion A); there is no
     // GemmQkv, so prefill keeps them split — the same call the dense path makes ("prefill keeps the
     // split; T rows already parallelise"). Each is a separate tiled GEMM over the whole machine.
-    let c_qad = gemm(b, n.qlr, n.xn, w.qad, w.qad_s, ql, h, &[c_rn1]);
-    let c_ckvd = gemm(b, n.ckvraw, n.xn, w.ckvd, w.ckvd_s, dk, h, &[c_rn1]);
+    // PLOW_GLM_GEMM_BLK: q_a quantizes `xn` into the shared FP8 scratch and kv_a reads it back,
+    // after q_a by an explicit edge.
+    let blk_qad = emit_glm_blk_gemm(
+        b,
+        c,
+        n,
+        n.qlr,
+        n.xn,
+        [w.blk_qad, w.blk_qad_s],
+        t,
+        [ql, h],
+        true,
+        &[c_rn1],
+    );
+    let c_qad = match blk_qad {
+        Some(counter) => counter,
+        None => gemm(b, n.qlr, n.xn, w.qad, w.qad_s, ql, h, &[c_rn1]),
+    };
+    let kv_deps: &[u32] = if blk_qad.is_some() {
+        &[c_rn1, c_qad]
+    } else {
+        &[c_rn1]
+    };
+    let blk_ckvd = emit_glm_blk_gemm(
+        b,
+        c,
+        n,
+        n.ckvraw,
+        n.xn,
+        [w.blk_ckvd, w.blk_ckvd_s],
+        t,
+        [dk, h],
+        blk_qad.is_none(),
+        kv_deps,
+    );
+    let c_ckvd = match blk_ckvd {
+        Some(counter) => counter,
+        None => gemm(b, n.ckvraw, n.xn, w.ckvd, w.ckvd_s, dk, h, &[c_rn1]),
+    };
     let c_krr = if dr > 0 {
         gemm(b, n.krr, n.xn, w.krotd, w.krotd_s, dr, h, &[c_rn1])
     } else {
@@ -5623,6 +5847,19 @@ pub(crate) fn emit_glm_mla_prefill(
             // Fused W_ofold GEMM: A = the flash's normalized bf16 partials in the opart
             // allocation ([T, nh_l*DK] row-major), K = nh_l*DK. Replaces merge + o_proj.
             gemm(b, out, n.opart, w.wofold, TENSOR_NONE, h, nh_l * dk, deps)
+        } else if let Some(counter) = emit_glm_blk_gemm(
+            b,
+            c,
+            n,
+            out,
+            n.oat,
+            [w.blk_wo, w.blk_wo_s],
+            t,
+            [h, nh_l * vd],
+            true,
+            deps,
+        ) {
+            counter
         } else if lin_fp8 {
             emit_pf_gemm_fp8_blk(b, &all, out, n.oat, w.wo, w.wo_s, t, h, nh_l * vd, deps)
         } else {
@@ -5634,7 +5871,8 @@ pub(crate) fn emit_glm_mla_prefill(
     // block-fp8 and MXFP4 GEMM families do not, and banding them would silently overwrite
     // band 0's rows.
     // (ofold also forces kb=1: the banded arm's inline GEMMs hardcode oat/wo.)
-    let kb = if lin_fp8 || enc == MoeEnc::Mxfp4 || ofold {
+    let blk_oproj = w.blk_wo != TENSOR_NONE && (2048..=8192).contains(&t);
+    let kb = if lin_fp8 || enc == MoeEnc::Mxfp4 || ofold || blk_oproj {
         1
     } else {
         xr_band_k(t, "attn")

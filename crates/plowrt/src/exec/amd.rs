@@ -24,7 +24,9 @@ use crate::exec::kvrow::{
     derive_kvrow, derive_mla_nsplit, is_lm_head_matmul, kvrow_span, mla_live_nsplit,
     prefill_row_field, rebase_chunk_rows, RowField,
 };
-use crate::exec::{amd_gemm_lt, amd_index_tp, amd_mla_fold, amd_moe_aiter, amd_sparse_mla};
+use crate::exec::{
+    amd_gemm_blk, amd_gemm_lt, amd_index_tp, amd_mla_fold, amd_moe_aiter, amd_sparse_mla,
+};
 use crate::memory::slab_carve;
 use crate::memory::vmm::{VmmGeometry, VmmKv, VmmOps, WeightSlab};
 #[cfg(test)]
@@ -1003,6 +1005,7 @@ enum PrefillSegmentRoute {
     MoeAiter(amd_moe_aiter::Route),
     IndexTp(amd_index_tp::Route),
     GemmLt(amd_gemm_lt::Route),
+    GemmBlk(amd_gemm_blk::Route),
     MlaFold(amd_mla_fold::Route),
     XReduceWaveRs,
     GraphPhaseXReduceWaveRs,
@@ -3409,6 +3412,7 @@ fn token_batch_body_native_routes(
         let route = routes.get(e.seg as usize);
         let covered = match DevOp::from_u16(inst.op) {
             Some(DevOp::GemmLtPf) => matches!(route, Some(PrefillSegmentRoute::GemmLt(_))),
+            Some(DevOp::GemmBlkPf) => matches!(route, Some(PrefillSegmentRoute::GemmBlk(_))),
             Some(DevOp::MoeAiterFp8Pf) => matches!(route, Some(PrefillSegmentRoute::MoeAiter(_))),
             _ => true,
         };
@@ -5706,6 +5710,7 @@ pub struct AmdEngine {
     moe_aiter: Option<amd_moe_aiter::MoeAiter>,
     index_tp: Option<amd_index_tp::IndexTp>,
     gemm_lt: Option<amd_gemm_lt::GemmLt>,
+    gemm_blk: Option<amd_gemm_blk::GemmBlk>,
     mla_fold: Option<amd_mla_fold::MlaFold>,
     k_xaudit: Option<HsaKernel>,
     k_state_clear: Option<HsaKernel>,
@@ -6510,6 +6515,23 @@ impl AmdEngine {
                     .into(),
             ));
         }
+        let has_gemm_blk = |p: &DevProg| p.insts.iter().any(|d| d.op == DevOp::GemmBlkPf as u16);
+        let use_gemm_blk = blob.progs.iter().any(has_gemm_blk);
+        if use_gemm_blk
+            && (arch != "gfx942"
+                || tp.is_none_or(|b| b.n_gpu != 8)
+                || blob.decode_phase().any(has_gemm_blk))
+        {
+            return Err(RuntimeError::Device(
+                "block-scale FP8 projection requires gfx942 TP8 prefill".into(),
+            ));
+        }
+        // Weights and scale grids the route binds in its own layout (shuffled, doubled).
+        let gemm_blk_bound = if use_gemm_blk {
+            amd_gemm_blk::bound_weights(&blob.progs)?
+        } else {
+            Default::default()
+        };
         let has_index_tp = |p: &DevProg| p.insts.iter().any(|d| d.op == DevOp::IndexTpPf as u16);
         let use_index_tp = blob.progs.iter().any(has_index_tp);
         if use_index_tp
@@ -8365,6 +8387,11 @@ impl AmdEngine {
         } else {
             None
         };
+        let gemm_blk = if use_gemm_blk {
+            Some(amd_gemm_blk::GemmBlk::load(&be, &hsaco_dir, &mut modules)?)
+        } else {
+            None
+        };
         let index_tp = if use_index_tp {
             Some(amd_index_tp::IndexTp::load(&be, &hsaco_dir, &mut modules)?)
         } else {
@@ -8856,7 +8883,17 @@ impl AmdEngine {
                             stripped, src, shape, td.bytes, rank, n_gpu,
                         )?;
                         LoadProf::add(&prof.gather_ns, t);
-                        push(&mut ring, &slice, c.is_fp8_e4m3(resolved))?;
+                        match gemm_blk_bound.get(&(i as u16)) {
+                            Some(amd_gemm_blk::Bound::Weight { n, k }) => push(
+                                &mut ring,
+                                &amd_gemm_blk::prepare_weight(&slice, *n, *k)?,
+                                false,
+                            )?,
+                            Some(amd_gemm_blk::Bound::Scales) => {
+                                push(&mut ring, &amd_gemm_blk::prepare_scales(&slice)?, false)?
+                            }
+                            None => push(&mut ring, &slice, c.is_fp8_e4m3(resolved))?,
+                        }
                         wbytes += td.bytes;
                         nweights += 1;
                     }
@@ -9155,6 +9192,23 @@ impl AmdEngine {
                         }
                     }
                 }
+                if use_gemm_blk {
+                    for (seg, route) in
+                        amd_gemm_blk::routes(p, &blob.tensors, seg_class.len(), blob.n_cu)?
+                            .into_iter()
+                            .enumerate()
+                    {
+                        if let Some(route) = route {
+                            if !matches!(prefill_routes[seg], PrefillSegmentRoute::Interpreter) {
+                                return Err(RuntimeError::Device(
+                                    "block-scale FP8 projection overlaps another native route"
+                                        .into(),
+                                ));
+                            }
+                            prefill_routes[seg] = PrefillSegmentRoute::GemmBlk(route);
+                        }
+                    }
+                }
                 if use_index_tp {
                     let span_aware = index_tp.as_ref().is_some_and(|k| k.span_aware());
                     for (seg, route) in
@@ -9252,7 +9306,12 @@ impl AmdEngine {
                         p.t
                     )));
                 }
-                if (use_sparse_mla || use_moe_aiter || use_index_tp || use_gemm_lt || use_mla_fold)
+                if (use_sparse_mla
+                    || use_moe_aiter
+                    || use_index_tp
+                    || use_gemm_lt
+                    || use_gemm_blk
+                    || use_mla_fold)
                     && !prefill_segment_specialization_allowed(dispatch)
                 {
                     return Err(RuntimeError::Device(
@@ -9997,6 +10056,7 @@ impl AmdEngine {
             moe_aiter,
             index_tp,
             gemm_lt,
+            gemm_blk,
             mla_fold,
             k_xaudit,
             k_state_clear,
@@ -11096,6 +11156,18 @@ impl AmdEngine {
             self.seg_launches += 1;
             return Ok(());
         }
+        if let Some(PrefillSegmentRoute::GemmBlk(route)) =
+            self.progs[p].prefill_routes.get(seg).copied()
+        {
+            let kernel = self.gemm_blk.as_ref().ok_or_else(|| {
+                RuntimeError::Device("block-scale FP8 projection route has no loaded kernel".into())
+            })?;
+            kernel.enqueue(&self.be, route, &self.tens_table)?;
+            for _ in 0..route.launches() {
+                self.seg_launches += 1;
+            }
+            return Ok(());
+        }
         if let Some(PrefillSegmentRoute::IndexTp(route)) =
             self.progs[p].prefill_routes.get(seg).copied()
         {
@@ -11608,6 +11680,7 @@ impl AmdEngine {
                     .as_ref()
                     .map_or(1, |s| s.span_launches(*route, &self.packed_spans)),
                 Some(PrefillSegmentRoute::GemmLt(_)) => 1,
+                Some(PrefillSegmentRoute::GemmBlk(route)) => route.launches(),
                 Some(PrefillSegmentRoute::MlaFold(_)) => 3,
                 Some(PrefillSegmentRoute::MoeAiter(route)) => route.launches() as usize,
                 Some(PrefillSegmentRoute::IndexTp(_)) => 4,
@@ -11617,6 +11690,7 @@ impl AmdEngine {
         match self.progs[p].prefill_routes.get(seg) {
             Some(PrefillSegmentRoute::SparseMla(route)) if route.active => 3,
             Some(PrefillSegmentRoute::GemmLt(_)) => 1,
+            Some(PrefillSegmentRoute::GemmBlk(route)) => route.launches(),
             Some(PrefillSegmentRoute::MlaFold(_)) => 3,
             Some(PrefillSegmentRoute::MoeAiter(route)) => route.launches() as usize,
             Some(PrefillSegmentRoute::IndexTp(_)) => 4,
@@ -12360,6 +12434,9 @@ impl AmdEngine {
                 route.rebase(rows)?;
             }
             if let PrefillSegmentRoute::GemmLt(route) = route {
+                route.rebase(rows)?;
+            }
+            if let PrefillSegmentRoute::GemmBlk(route) = route {
                 route.rebase(rows)?;
             }
             if let PrefillSegmentRoute::MlaFold(route) = route {

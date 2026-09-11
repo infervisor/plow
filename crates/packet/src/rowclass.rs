@@ -99,7 +99,7 @@ pub fn class_of(op: DevOp) -> RowClass {
         // `Embed` gathers rows of the EMBEDDING TABLE by token id — one id per row, no
         // position, no cross-row coupling. It is not a hidden-row gather; `RowGather` is.
         Embed => RowClass::A,
-        Gemm | GemmSmall | GemmMed | GemmLtPf | GemmWide | GemmC5 | GemmNorm | GemmGlu
+        Gemm | GemmSmall | GemmMed | GemmLtPf | GemmBlkPf | GemmWide | GemmC5 | GemmNorm | GemmGlu
         | GemmSplitK | GemmFp8 | GemmMedFp8 | GemmSmallFp8 | GemmGluFp8 | GemmWideFp8
         | GemmC5Fp8 | GemmFp8Blk | GemmMxfp4 | GemmMedMxfp4 | GemmSmallMxfp4 | GemmWideMxfp4
         | GemmC5Mxfp4 | GemmGluMxfp4 | DenseGluFp8Blk => RowClass::A,

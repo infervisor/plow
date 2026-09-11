@@ -1368,6 +1368,10 @@ enum {
     /* Native gfx942 BF16 projection using qualified hipBLASLt assembly.
      * t0=out t1=x t2=weight i0=T i1=N i2=K i3=decode. Isolated native segment only. */
     PLOW_DOP_GEMM_LT_PF = 158,
+    /* Native gfx942 W8A8 block-scale FP8 projection using AITER pre-shuffled assembly.
+     * t0=out t1=x t2=weight t3=w_scale t4=xq t5=x_scale t6=bias i0=T i1=N i2=K i3=quantize.
+     * Isolated native segment only. */
+    PLOW_DOP_GEMM_BLK_PF = 159,
 
     PLOW_DOP__COUNT
 };

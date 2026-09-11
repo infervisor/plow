@@ -663,6 +663,12 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_FOLD_LT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_fold_lt: bool,
 
+    /// Native gfx942 W8A8 block-scale FP8 prefill projections (AITER pre-shuffled assembly) at
+    /// rows 2048..=8192: `1`/`true` = q_a, kv_a, wq_b and o_proj, or a comma list of those.
+    /// Reads the checkpoint FP8 bytes `scripts/glm53_prep_blk.py` publishes as `.weight_fp8`.
+    #[arg(long, env = "PLOW_GLM_GEMM_BLK")]
+    pub glm_gemm_blk: Option<String>,
+
     /// Cap the dispatch width of every blocked GEMV. Unset ⇒ byte-identical.
     #[arg(long, env = "PLOW_GLM_GEMV_WG")]
     pub glm_gemv_wg: Option<u32>,
@@ -1167,6 +1173,7 @@ impl EmitConfig {
             glm_gemm_lt_decode: env_bool_opt("PLOW_GLM_GEMM_LT_DECODE"),
             glm_gemm_lt_decode_ext: env_bool_opt("PLOW_GLM_GEMM_LT_DECODE_EXT"),
             glm_fold_lt: env_bool("PLOW_GLM_FOLD_LT"),
+            glm_gemm_blk: env_str("PLOW_GLM_GEMM_BLK"),
             glm_gemv_wg: env_u32("PLOW_GLM_GEMV_WG"),
             glm_ofold: env_bool("PLOW_GLM_OFOLD"),
             glm_pf_ns: env_u32("PLOW_GLM_PF_NS"),

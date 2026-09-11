@@ -2410,6 +2410,7 @@ impl Builder {
                 || op.inst.op == DevOp::MoeAiterFp8Pf as u16
                 || op.inst.op == DevOp::IndexTpPf as u16
                 || op.inst.op == DevOp::GemmLtPf as u16
+                || op.inst.op == DevOp::GemmBlkPf as u16
                 || (op.inst.op == DevOp::MlaMergeFold as u16 && op.inst.i[5] == 1)
                 || (op.inst.op == DevOp::FlashMlaDecodeFp8 as u16 && op.isolated)
         }) || lean_moe_stage2

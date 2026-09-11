@@ -331,6 +331,7 @@ pub fn classify(op: DevOp) -> OpClass {
 
         // ---- dense matmul families --------------------------------------
         DevOp::GemmLtPf => a_rows("i0=T; native BF16 projection has no per-sequence state"),
+        DevOp::GemmBlkPf => a_rows("i0=T; native FP8 projection has no per-sequence state"),
         DevOp::Gemm | DevOp::GemmSmall | DevOp::GemmMed | DevOp::GemmWide | DevOp::GemmC5 => {
             a_rows("i0=M")
         }

@@ -276,6 +276,7 @@ const DOC: &[S] = &[
     S { op: DevOp::MoeAiterFp8Pf, t: &["out", "x", "weights", "scales", "meta_or_raw_routes", "row_token", "row_part", "row_gate"], i: &["T", "H", "I", "E", "topk", "align_tile", "mode", "resident_weights"], f: &[], j: &[] },
     S { op: DevOp::IndexTpPf, t: &["idx", "score", "q", "k", "w", "kv_len", "peer_slot"], i: &["T", "ctx", "topk", "tp", "slot_bytes", "enter_gate", "complete_gate"], f: &["scale"], j: &[] },
     S { op: DevOp::GemmLtPf, t: &["out", "x", "weight"], i: &["T", "N", "K", "decode"], f: &[], j: &[] },
+    S { op: DevOp::GemmBlkPf, t: &["out", "x", "weight", "w_scale", "xq", "x_scale", "bias"], i: &["T", "N", "K", "quantize"], f: &[], j: &[] },
 ];
 
 /// Ops that say "As [`DevOp::X`]" / "twin of [`DevOp::X`]" / "Same operands as

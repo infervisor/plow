@@ -1854,6 +1854,12 @@ pub enum DevOp {
     /// Native gfx942 BF16 projection using qualified hipBLASLt assembly.
     /// `t0=out t1=x t2=weight` · `i0=T i1=N i2=K i3=decode`. Requires an isolated native segment.
     GemmLtPf = 158,
+    /// Native gfx942 W8A8 block-scale FP8 projection using AITER's pre-shuffled assembly.
+    /// `t0=out t1=x t2=weight t3=w_scale t4=xq t5=x_scale t6=bias` · `i0=T i1=N i2=K i3=quantize`.
+    /// `i3=1` first quantizes the BF16 `x` into `xq`/`x_scale` (128-element groups, FNUZ);
+    /// `i3=0` reads the `xq`/`x_scale` an earlier instruction quantized from the same `x`.
+    /// Requires an isolated native segment.
+    GemmBlkPf = 159,
 }
 
 /// GLU-family `act` code for GPT-OSS's `swiglu_oai` (pair form, `f0 = alpha`, `f1 = limit`).
@@ -2028,6 +2034,7 @@ impl DevOp {
         DevOp::MoeAiterFp8Pf,
         DevOp::IndexTpPf,
         DevOp::GemmLtPf,
+        DevOp::GemmBlkPf,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -2207,6 +2214,7 @@ impl DevOp {
             DevOp::MoeAiterFp8Pf => "PLOW_DOP_MOE_AITER_FP8_PF",
             DevOp::IndexTpPf => "PLOW_DOP_INDEX_TP_PF",
             DevOp::GemmLtPf => "PLOW_DOP_GEMM_LT_PF",
+            DevOp::GemmBlkPf => "PLOW_DOP_GEMM_BLK_PF",
         }
     }
 
@@ -2248,7 +2256,7 @@ impl DevOp {
     /// collision-at-merge as 111 -> 113, resolved the same way (renumber the later merge).
     /// 154 -> 155 for `RowGather = 154` (the unified token batch's terminal row selection).
     /// 155 -> 156 for `PerLayerInput = 155` (Gemma-4 E-series per-layer inputs).
-    pub const COUNT: u16 = 159;
+    pub const COUNT: u16 = 160;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///

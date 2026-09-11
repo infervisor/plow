@@ -135,6 +135,7 @@ impl AmdEngine {
             PrefillSegmentRoute::IndexTp(_) if active => return "index_tp_spans",
             PrefillSegmentRoute::IndexTp(_) => return "index_tp",
             PrefillSegmentRoute::GemmLt(_) => return "gemm_lt",
+            PrefillSegmentRoute::GemmBlk(_) => return "gemm_blk",
             PrefillSegmentRoute::MlaFold(_) => return "mla_fold",
             _ => {}
         }
