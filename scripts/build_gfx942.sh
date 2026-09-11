@@ -1060,8 +1060,25 @@ fi
 # length alone" — it was condemned by association. Solo gate 2026-08-10 (r4b4 ladder asset):
 # PASSES needle 3000/8000 x2 each; combined with the FIXED XR_AGG it is gated again before
 # every recipe publish. TTFT −3.8/−5.5/−6.2% @4k/8k/16k. Opt out with PLOW_MLA_FOLD_TB=0.
+# THE FLASH OBJECT NEEDS IT TOO, and that is where GLM-5.3 actually runs the op. The note above
+# says "PREFILL objects only" meaning "not decode" — the guard it cites is `n_batch == token
+# count`, which is a property of the PACKET, not of the object file. On the GLM-5.3 sparse TP8
+# recipe the 8192-row chunk's MlaMergeFold is dispatched from `interp_flash_fp8kv*` (the segment
+# after the native AITER attention: fold, o_proj, the two-shot, residual, norm, router), so with
+# the axis on AX_PREFILL alone the arm the measurement above bought was never reached by the
+# shipped recipe: traced at 594 us/packet x 78 = 45.6 ms/chunk on the scalar arm.
+# The arm's own guards still decide per packet (decode's n_batch=1 fails `n_work >= nblk`), so
+# adding it here cannot change a decode dispatch — the flash object serves prefill buckets.
 if [ "${PLOW_MLA_FOLD_TB:-8}" != 0 ]; then
   AX_PREFILL="$AX_PREFILL -DPLOW_MLA_FOLD_TB=${PLOW_MLA_FOLD_TB:-8}"
+  # OPT-IN (PLOW_MLA_FOLD_TB_FLASH=1), default off: the same arm in the FLASH object. Default-off
+  # and not default-on with AX_PREFILL because the header is explicit that "bit-identical" is the
+  # INTENT and the gfx950 V=128 oracle rejected TB>1 (245-1,463 outputs differ, packed-FMA
+  # schedule) — every new shape needs its own character-identical gate. This is a new shape only
+  # in the sense of a different object; the map (V=256, TB=8, gfx942) is the one already gated on
+  # AX_PREFILL. Flip the default only after the 18-case retrieval screen on this object.
+  [ "${PLOW_MLA_FOLD_TB_FLASH:-0}" = 0 ] ||
+    AX_FLASH="$AX_FLASH -DPLOW_MLA_FOLD_TB=${PLOW_MLA_FOLD_TB:-8}"
 fi
 
 # OPT-IN (PLOW_MLA_PF_SV=1): the V2 kernel's V-STAGE arm — kv-block LDS swizzle that makes
