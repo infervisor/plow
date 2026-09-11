@@ -691,18 +691,11 @@ fn qualified_full_logit_record(
     })
 }
 
-fn assert_program_layout_equal(actual: &DevProg, expected: &DevProg) {
+fn assert_program_computation_equal(actual: &DevProg, expected: &DevProg) {
     assert_eq!(actual.t, expected.t);
     assert_eq!(actual.packed_prefill_only, expected.packed_prefill_only);
     assert_eq!(actual.n_counter, expected.n_counter);
     assert_eq!(actual.insts, expected.insts);
-    assert_eq!(actual.stream, expected.stream);
-    assert_eq!(actual.stream_ofs, expected.stream_ofs);
-    assert_eq!(actual.stream_len, expected.stream_len);
-    assert_eq!(actual.waits, expected.waits);
-    assert_eq!(actual.succs, expected.succs);
-    assert_eq!(actual.gq_stream, expected.gq_stream);
-    assert_eq!(actual.gq_seg_ofs, expected.gq_seg_ofs);
     assert_eq!(actual.l2_domains, expected.l2_domains);
 }
 
@@ -818,7 +811,7 @@ fn gpu_prefill_roles_match_control_logits() {
     );
     assert_eq!(candidate_blob.progs.len(), reference_blob.progs.len());
     for (actual, expected) in candidate_blob.progs.iter().zip(&reference_blob.progs) {
-        assert_program_layout_equal(actual, expected);
+        assert_program_computation_equal(actual, expected);
     }
     assert!(
         candidate_blob

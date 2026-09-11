@@ -125,6 +125,7 @@ fn hd256_fixture() -> Model {
     flash.i[2] = 16;
     flash.i[3] = 8;
     flash.i[5] = 1024;
+    model.tensors[flash.t[5] as usize].bytes = 128 * 16 * 256 * 2;
     model
 }
 
@@ -220,6 +221,41 @@ fn exact_hd256_bkv64_object_preserves_existing_packet_segments() {
 }
 
 #[test]
+fn hd256_qualification_can_select_a_subset_of_prefill_rungs() {
+    let directory = output_dir("hd256-rung-subset");
+    let output = directory.join("model.pkt");
+    let image = hd256_image();
+    std::fs::write(directory.join(HD256_OBJECT_FILE), &image).unwrap();
+    let mut model = hd256_fixture();
+    let mut second = hd256_fixture().progs.remove(0);
+    second.insts[1].i[0] = 1024;
+    second.insts[1].i[1] = 1024;
+    model.progs.insert(1, second);
+    model.prog_t.insert(1, 1024);
+    let record = hd256_record(&model, &image);
+    let store_root = directory.join("tuning");
+    tunedb::TuneStore::new(&store_root)
+        .publish_attention_roles(&h100_hardware(), vec![record])
+        .unwrap();
+    let mut sections = Vec::new();
+    assert!(apply_output_object(
+        &mut model,
+        &mut sections,
+        "sm90a",
+        &output,
+        "h100",
+        1024,
+        false,
+        store_root.to_str(),
+    )
+    .unwrap());
+    let roles = SegmentRoles::from_bytes(&sections[0].data).unwrap();
+    assert_eq!(roles.programs.len(), 1);
+    assert_eq!(roles.programs[0].index, 0);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn hd256_object_presence_without_qualified_record_is_byte_identical() {
     let directory = output_dir("hd256-unqualified");
     let output = directory.join("model.pkt");
@@ -308,6 +344,54 @@ fn live_kv_coverage_has_each_reachable_bucket_once() {
             tunedb::KvBucket::K32,
             tunedb::KvBucket::K64,
             tunedb::KvBucket::K128,
+        ]
+    );
+}
+
+#[test]
+fn required_cells_match_scheduler_reachability_through_16k() {
+    use tunedb::{AttentionTopology as Topology, KvBucket};
+
+    let rungs = [
+        1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192,
+    ];
+    let buckets = live_kv_buckets(16384);
+    let mut excluded = Vec::new();
+    let mut required = 0;
+    for m_rung in rungs {
+        let cells = required_cells(16384, true, m_rung);
+        assert_eq!(cells.iter().collect::<BTreeSet<_>>().len(), cells.len());
+        required += cells.len();
+        for &bucket in &buckets {
+            for topology in [Topology::Single, Topology::PackedHomogeneous] {
+                let reachable = match topology {
+                    Topology::Single => KvBucket::of(m_rung) <= bucket,
+                    Topology::PackedHomogeneous => m_rung > 1,
+                    Topology::PackedRagged => unreachable!(),
+                };
+                assert_eq!(cells.contains(&(bucket, topology)), reachable);
+                if !reachable {
+                    excluded.push((m_rung, bucket, topology));
+                }
+            }
+            assert_eq!(
+                cells.contains(&(bucket, Topology::PackedRagged)),
+                m_rung > 1
+            );
+        }
+    }
+    assert_eq!(required, 156);
+    assert_eq!(
+        excluded,
+        vec![
+            (1, KvBucket::K1, Topology::PackedHomogeneous),
+            (1, KvBucket::K4, Topology::PackedHomogeneous),
+            (1, KvBucket::K8, Topology::PackedHomogeneous),
+            (1, KvBucket::K16, Topology::PackedHomogeneous),
+            (2048, KvBucket::K1, Topology::Single),
+            (4096, KvBucket::K1, Topology::Single),
+            (8192, KvBucket::K1, Topology::Single),
+            (8192, KvBucket::K4, Topology::Single),
         ]
     );
 }

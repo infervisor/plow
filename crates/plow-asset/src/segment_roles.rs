@@ -18,13 +18,26 @@ pub fn is_projection(role: u8) -> bool {
     matches!(role, CUBLASLT | NATIVE_DECODE_TC)
 }
 
-pub const CUBLASLT_PREFILL_MAX_ROWS: u32 = 512;
+pub const CUBLASLT_PREFILL_MAX_ROWS: u32 = 8192;
 pub const CUBLASLT_PREFILL_ROWS: [u32; 3] = [128, 256, 512];
+pub const CUBLASLT_PREFILL_WIDE_ROWS: [u32; 4] = [1024, 2048, 4096, 8192];
+pub const CUBLASLT_PREFILL_GEMMA4_SHAPES: [(u32, u32); 8] = [
+    (15360, 3840),
+    (2048, 3840),
+    (3840, 15360),
+    (4096, 3840),
+    (3840, 4096),
+    (8192, 3840),
+    (512, 3840),
+    (3840, 8192),
+];
 
 pub fn cublaslt_prefill_bf16(profile: &str, m: u32, n: u32, k: u32) -> bool {
     matches!(profile, "sm90a" | "sm_90a")
-        && CUBLASLT_PREFILL_ROWS.contains(&m)
-        && matches!((n, k), (3840, 15360) | (3840, 8192))
+        && ((CUBLASLT_PREFILL_ROWS.contains(&m)
+            && matches!((n, k), (3840, 15360) | (3840, 8192)))
+            || (CUBLASLT_PREFILL_WIDE_ROWS.contains(&m)
+                && CUBLASLT_PREFILL_GEMMA4_SHAPES.contains(&(n, k))))
 }
 
 pub const PREFILL_ATTENTION_HD512_WG32_ABI: &str = "attention_sm90_hd512_wg32_v1";
@@ -244,13 +257,20 @@ mod tests {
                 assert!(cublaslt_prefill_bf16(profile, m, 3840, 15360));
                 assert!(cublaslt_prefill_bf16(profile, m, 3840, 8192));
             }
+            for m in CUBLASLT_PREFILL_WIDE_ROWS {
+                for (n, k) in CUBLASLT_PREFILL_GEMMA4_SHAPES {
+                    assert!(cublaslt_prefill_bf16(profile, m, n, k));
+                }
+            }
         }
         for (profile, m, n, k) in [
             ("sm120", 128, 3840, 15360),
             ("gfx942", 128, 3840, 8192),
             ("sm90a", 0, 3840, 15360),
             ("sm90a", 64, 3840, 15360),
-            ("sm90a", 1024, 3840, 15360),
+            ("sm90a", 1024, 3840, 3840),
+            ("sm90a", 1024, 15360, 8192),
+            ("sm90a", 16384, 3840, 15360),
             ("sm90a", 128, 15360, 3840),
             ("sm90a", 128, 3840, 4096),
         ] {

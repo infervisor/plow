@@ -267,8 +267,12 @@ template<int HD, int BKV> static bool check(unsigned kv_heads, unsigned stride,
     }
     for (size_t i = 0; i < got.size(); ++i) {
         const float value = __bfloat162float(got[i]);
-        ok &= std::isfinite(value);
-        if (i >= size_t(test_rows) * heads * HD) ok &= value == 0.0f;
+        if (i < size_t(test_rows) * heads * HD)
+            ok &= std::isfinite(value);
+        else if (PLOW_TEST_FA_ROWS)
+            ok &= std::isnan(value);
+        else
+            ok &= value == 0.0f;
     }
     double worst = 0, max_error = 0;
     unsigned checked = 0;
