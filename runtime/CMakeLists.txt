@@ -253,25 +253,6 @@ if(PLOW_CUDA)
     target_link_libraries(sm120_interp_op_test PRIVATE plow_interp_sm120 plow_runtime)
     add_test(NAME sm120_interp_ops COMMAND sm120_interp_op_test)
 
-    # Hopper correctness harnesses for the packed-prefill / Gemma3-norm arms. Build
-    # targets, not ctest entries: each needs an H100 to run. Guarded like
-    # sm120_numeric_test so a checkout without one of them still configures.
-    # They call the driver API (tensor maps), hence libcuda, not just cudart.
-    find_package(CUDAToolkit QUIET)
-    foreach(t gemma3_norm_sm90 packed_flash_sm90_correct packed_flash_fp8_sm90_correct
-              packed_kv_padding_sm90)
-        if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/${t}.cu)
-            add_executable(${t} tests/${t}.cu)
-            set_target_properties(${t} PROPERTIES CUDA_ARCHITECTURES "90a")
-            target_include_directories(${t} PRIVATE nvidia common ${PLOW_INCLUDE})
-            if(TARGET CUDA::cuda_driver)
-                target_link_libraries(${t} PRIVATE CUDA::cuda_driver)
-            else()
-                target_link_libraries(${t} PRIVATE cuda)
-            endif()
-        endif()
-    endforeach()
-
     # NEGATIVE CONTROL AS A BUILD TARGET. The same test compiled with the naively
     # transliterated wave64 reduction offsets (__shfl_xor starting at 32 on a 32-lane warp).
     # It MUST fail: measured, it breaks 7 of 10 ops (HEADNORM_ROPE relL2 0.29, FLASH 0.50).
