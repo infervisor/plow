@@ -18,6 +18,7 @@ const FLAT_OBJECT_HASH: &str = "be7052284094e7cedeb266afb24d4d6723bdf4234ac391b2
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mode {
     Sorted,
+    SortedBf16,
     Flat,
 }
 
@@ -39,6 +40,13 @@ impl Route {
                 }
             }
             Mode::Flat => 2,
+            Mode::SortedBf16 => {
+                if self.inst.i[7] == 1 {
+                    2
+                } else {
+                    3
+                }
+            }
         }
     }
 
@@ -64,17 +72,18 @@ pub(super) fn routes(
             continue;
         }
         let err = |s: &str| RuntimeError::Device(format!("AITER MoE instruction {ix}: {s}"));
-        let mode = if inst.i[6] == 1 {
-            Mode::Flat
-        } else {
-            Mode::Sorted
+        let mode = match inst.i[6] {
+            0 => Mode::Sorted,
+            1 => Mode::Flat,
+            2 => Mode::SortedBf16,
+            _ => return Err(err("unknown output mode")),
         };
         let flat = mode == Mode::Flat;
         let resident = inst.i[7] == 1;
         let geometry = if flat {
             [prog.t, 6144, 256, 256, 8, 0, 1, u32::from(resident)]
         } else {
-            [prog.t, 6144, 256, 256, 8, 64, 0, u32::from(resident)]
+            [prog.t, 6144, 256, 256, 8, 64, inst.i[6], u32::from(resident)]
         };
         if prog.packed_prefill_only
             || !(if flat {
@@ -116,6 +125,34 @@ pub(super) fn routes(
                 return Err(err("aligned routing geometry does not match"));
             }
         }
+        if mode == Mode::SortedBf16 {
+            if inst.t[1..].contains(&inst.t[0]) {
+                return Err(err("direct BF16 output aliases an input"));
+            }
+            let mut covered = 0;
+            // Stop at the next producer: subsequent layers can reuse this buffer.
+            for combine in prog.insts[ix + 1..]
+                .iter()
+                .take_while(|d| d.t[0] != inst.t[0])
+                .filter(|d| d.op == DevOp::MoeCombinePf as u16 && d.t[3] == inst.t[0])
+            {
+                if combine.i[..2] != [6144, 1]
+                    || combine.i[2] == 0
+                    || combine.i[2] > prog.t - covered
+                    || combine.i[3] != covered
+                    || combine.i[4..7] != [0; 3]
+                    || combine.i[7] != 1
+                {
+                    return Err(err(
+                        "sorted BF16 output requires contiguous BF16 combine bands",
+                    ));
+                }
+                covered += combine.i[2];
+            }
+            if covered != prog.t {
+                return Err(err("sorted BF16 output has incomplete combine coverage"));
+            }
+        }
         let rows = u64::from(prog.t);
         let capacity = rows * 8 + 256 * 63;
         let sizes = if flat {
@@ -131,7 +168,7 @@ pub(super) fn routes(
             ]
         } else {
             [
-                rows * 6144 * 4,
+                rows * 6144 * if mode == Mode::SortedBf16 { 2 } else { 4 },
                 rows * 6144 * 2,
                 256 * 3 * 8,
                 256 * 3 * 8,
@@ -534,7 +571,7 @@ impl MoeAiter {
             .inst
             .t
             .map(|h| if h == TENSOR_NONE16 { 0 } else { addr(h) });
-        let [mut gu, mut down, mut gs, mut ds, q, qs, out, ids, weights, experts, valid] =
+        let [mut gu, mut down, mut gs, mut ds, q, qs, workspace_out, ids, weights, experts, valid] =
             self.buffers;
         if (route.inst.i[7] == 1) != self.resident {
             return Err(RuntimeError::Device(
@@ -582,6 +619,11 @@ impl MoeAiter {
                 bytemuck::cast_slice(&[gu, down, gs, ds, t[2], t[3]]),
             )?;
         }
+        let out = if route.mode == Mode::SortedBf16 {
+            t[0]
+        } else {
+            workspace_out
+        };
         let prepare = PrepareArgs {
             pointers: [
                 q, qs, out, ids, weights, experts, valid, t[1], t[4], t[5], t[6], t[7],
@@ -627,6 +669,9 @@ impl MoeAiter {
             args[i * 2] = value;
         }
         be.launch(self.moe, 304, 256, 0, bytemuck::cast_slice(&args))?;
+        if route.mode == Mode::SortedBf16 {
+            return Ok(());
+        }
         let store = StoreArgs {
             out: t[0],
             src: out,
@@ -746,6 +791,82 @@ mod tests {
             })
             .collect();
         (prog, tensors)
+    }
+
+    fn sorted_bf16_fixture(rows: u32, bands: u32) -> (DevProg, Vec<DevTensor>) {
+        let (mut prog, mut tensors) = fixture();
+        prog.t = rows;
+        prog.insts[0].i[0] = rows;
+        prog.insts[1].i[0] = rows;
+        prog.insts[1].i[6] = 2;
+        tensors[0].bytes = u64::from(rows) * 6144 * 2;
+        for band in 0..bands {
+            prog.insts.push(DevInst64 {
+                op: DevOp::MoeCombinePf as u16,
+                t: [
+                    8,
+                    TENSOR_NONE16,
+                    TENSOR_NONE16,
+                    0,
+                    TENSOR_NONE16,
+                    TENSOR_NONE16,
+                    TENSOR_NONE16,
+                    TENSOR_NONE16,
+                ],
+                i: [6144, 1, rows / bands, band * (rows / bands), 0, 0, 0, 1],
+                ..Default::default()
+            });
+        }
+        (prog, tensors)
+    }
+
+    #[test]
+    fn sorted_bf16_routes_cover_ladder_bands_and_resident_layouts() {
+        for rows in [
+            1, 2, 4, 8, 16, 20, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192,
+        ] {
+            for bands in [1, 2].into_iter().filter(|&b| b <= rows) {
+                for resident in [false, true] {
+                    let (mut prog, tensors) = sorted_bf16_fixture(rows, bands);
+                    prog.insts[1].i[7] = u32::from(resident);
+                    let mut route = routes(&prog, &tensors, 2).unwrap()[1].unwrap();
+                    assert_eq!(route.mode, Mode::SortedBf16);
+                    assert_eq!(route.launches(), if resident { 2 } else { 3 });
+                    route.rebase(1).unwrap();
+                    route.rebase(rows).unwrap();
+                    assert!(route.rebase(rows + 1).is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sorted_bf16_rejects_invalid_consumers_aliases_and_capacity() {
+        for bad in 0..11 {
+            let (mut prog, mut tensors) = sorted_bf16_fixture(128, 2);
+            match bad {
+                0 => prog.insts.truncate(2),
+                1 => prog.insts[2].i[7] = 0,
+                2 => prog.insts[3].i[7] = 0,
+                3 => prog.insts[3].i[3] = 0,
+                4 => prog.insts[3].i[2] = 65,
+                5 => prog.insts[3].i[2] = 0,
+                6 => prog.insts[2].i[4] = 1,
+                7 => prog.insts[2].i[1] = 8,
+                8 => prog.insts[1].t[0] = prog.insts[1].t[1],
+                9 => tensors[0].bytes -= 1,
+                _ => prog.insts[1].i[6] = 3,
+            }
+            assert!(routes(&prog, &tensors, 2).is_err(), "bad={bad}");
+        }
+        let (mut prog, tensors) = sorted_bf16_fixture(128, 1);
+        let mut next_producer = prog.insts[1];
+        next_producer.op = DevOp::MoeGroupDownPf as u16;
+        prog.insts.push(next_producer);
+        let mut next_combine = prog.insts[2];
+        next_combine.i[7] = 0;
+        prog.insts.push(next_combine);
+        assert!(routes(&prog, &tensors, 2).is_ok());
     }
 
     #[test]
@@ -1116,16 +1237,28 @@ mod tests {
     #[test]
     #[ignore = "requires a gfx942 GPU lease and PLOW_TEST_AITER_DIR"]
     fn moe_aiter_hsa_dispatch() {
-        check_sorted_hsa(false);
+        check_sorted_hsa(false, false);
     }
 
     #[test]
     #[ignore = "requires a gfx942 GPU lease and PLOW_TEST_AITER_DIR with resident adapter"]
     fn moe_aiter_resident_sorted_hsa_dispatch() {
-        check_sorted_hsa(true);
+        check_sorted_hsa(true, false);
     }
 
-    fn check_sorted_hsa(resident: bool) {
+    #[test]
+    #[ignore = "requires a gfx942 GPU lease and PLOW_TEST_AITER_DIR"]
+    fn moe_aiter_sorted_bf16_hsa_dispatch() {
+        check_sorted_hsa(false, true);
+    }
+
+    #[test]
+    #[ignore = "requires a gfx942 GPU lease and PLOW_TEST_AITER_DIR with resident adapter"]
+    fn moe_aiter_resident_sorted_bf16_hsa_dispatch() {
+        check_sorted_hsa(true, true);
+    }
+
+    fn check_sorted_hsa(resident: bool, part16: bool) {
         let be = HsaBackend::new(0).unwrap();
         let mut modules = Vec::new();
         let dir = std::env::var("PLOW_TEST_AITER_DIR").unwrap();
@@ -1172,22 +1305,44 @@ mod tests {
             }
             meta[768] = 8 * stride / 64;
             let x = upload(bytemuck::cast_slice(&vec![0x3f80u16; rows as usize * 6144]));
-            let out = upload(bytemuck::cast_slice(&vec![f32::NAN; rows as usize * 6144]));
+            let element_bytes = if part16 { 2 } else { 4 };
+            let output_bytes = rows as usize * 6144 * element_bytes;
+            let out = upload(&vec![0xa5; output_bytes + 512]);
             let meta = upload(bytemuck::cast_slice(&meta));
             let rt = upload(bytemuck::cast_slice(&rt));
             let rp = upload(bytemuck::cast_slice(&rp));
             let rg = upload(bytemuck::cast_slice(&rg));
             let table = [
-                out.base, x.base, wt.base, st.base, meta.base, rt.base, rp.base, rg.base,
+                out.base + 256,
+                x.base,
+                wt.base,
+                st.base,
+                meta.base,
+                rt.base,
+                rp.base,
+                rg.base,
             ];
             let route = Route {
                 inst: DevInst64 {
                     t: [0, 1, 2, 3, 4, 5, 6, 7],
-                    i: [rows, 6144, 256, 256, 8, 64, 0, u32::from(resident)],
+                    i: [
+                        rows,
+                        6144,
+                        256,
+                        256,
+                        8,
+                        64,
+                        if part16 { 2 } else { 0 },
+                        u32::from(resident),
+                    ],
                     ..Default::default()
                 },
                 rows,
-                mode: Mode::Sorted,
+                mode: if part16 {
+                    Mode::SortedBf16
+                } else {
+                    Mode::Sorted
+                },
             };
             kernel
                 .enqueue(&be, route, bytemuck::cast_slice(&table))
@@ -1200,8 +1355,22 @@ mod tests {
                     gu * gu / (1.0 + (-gu).exp()) * 256.0 * scale * e as f32 / 36.0
                 })
                 .sum();
-            let mut actual = vec![0f32; rows as usize * 6144];
-            EngineDevice::download(&be, &out, 0, bytemuck::cast_slice_mut(&mut actual)).unwrap();
+            let mut bytes = vec![0u8; output_bytes + 512];
+            EngineDevice::download(&be, &out, 0, &mut bytes).unwrap();
+            assert!(bytes[..256]
+                .iter()
+                .chain(&bytes[256 + output_bytes..])
+                .all(|&x| x == 0xa5));
+            let actual: Vec<f32> = bytes[256..256 + output_bytes]
+                .chunks_exact(element_bytes)
+                .map(|x| {
+                    if part16 {
+                        f32::from_bits(u32::from(u16::from_le_bytes(x.try_into().unwrap())) << 16)
+                    } else {
+                        f32::from_le_bytes(x.try_into().unwrap())
+                    }
+                })
+                .collect();
             assert!(
                 actual
                     .iter()

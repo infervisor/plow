@@ -1884,7 +1884,12 @@ fn check_glm_flat_segments(resident: bool) {
             assert_eq!(native.len(), 1);
             let (ix, inst) = native[0];
             if !decode {
-                assert_eq!(inst.i, [rows, 6144, 256, 256, 8, 64, 0, 1]);
+                assert_eq!(inst.i, [rows, 6144, 256, 256, 8, 64, 2, 1]);
+                let combine = prog.insts[ix + 1..]
+                    .iter()
+                    .find(|d| d.op == DevOp::MoeCombinePf as u16 && d.t[3] == inst.t[0])
+                    .unwrap();
+                assert_eq!(combine.i, [6144, 1, rows, 0, 0, 0, 0, 1]);
             } else {
             assert_eq!(inst.i, [rows, 6144, 256, 256, 8, 0, 1, u32::from(resident)]);
             assert_eq!(&inst.t[5..], &[TENSOR_NONE; 3]);
