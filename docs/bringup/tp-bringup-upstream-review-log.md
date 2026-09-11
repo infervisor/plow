@@ -134,6 +134,34 @@ Ranked levers: slot-recycle unmap off the engine thread (−1.5..1.7 s/request �
 
 Body arm (5ee91ece, host-side, needs the collapse fix + a bodies packet to fire): cursors seeded for waiting slots when the route is armed, whole next chunks oldest-first, chunks no body holds skipped instead of blocking the pack, no cutting (a sparse 8192 step sliced into a dense body costs several times the launch it displaces). Unit tests `amd_token_batch_pack_*`, `dense_tail_moves_to_the_sparse_bucket_*`.
 
+## Root cause of the token-batch body collapse (2026-09-11)
+
+The symptom chased all day: with the token-batch body route armed, a body step returned token 0 for
+every band row, and the identity screen showed degenerate repetitions the control never produced.
+It was first blamed on multi-member steps, then narrowed to the 512-row body bucket, and neither
+was the cause.
+
+**The cause.** A token-batch body carries the packed-segment topology, which includes segments whose
+only implementation is a NATIVE route — `GemmLtPf` (hipBLASLt) and `MoeAiterFp8Pf` (AITER MoE). The
+dispatch gate withheld every native route while a packed binding was active, so those segments fell
+through to the primary interpreter, whose dispatch `default:` **writes nothing and does not trap**.
+The residual stream therefore went NaN from the first MoE layer, every KV row the body wrote was
+NaN, and every band row sampled token 0. Nothing in the run reported an error, which is why the
+route looked armed and firing while producing garbage.
+
+**Two fixes, both merged or pending merge.**
+1. `8306ac54` (span-aware agent) makes native routes dispatch under an active packed binding — the
+   actual defect. Every dense body launch measured before this commit ran through the broken gate,
+   so every body measurement taken today predates the fix.
+2. `4f5bbec5` (debug agent) adds `token_batch_body_native_routes`: at load, a body program whose
+   stream carries `GemmLtPf` or `MoeAiterFp8Pf` in a segment without the matching route is refused
+   BY NAME, so the silent-no-op path can never be reached again. Plus a per-step `TBSTEP` tick log.
+
+**The lesson worth keeping**: the interpreter's dispatch `default:` is silent. Any opcode that has
+only a native arm must be refused at load when its route is absent, not discovered by reading NaNs
+out of a KV cache. The same class of hole exists wherever a route can be withheld by a binding — the
+packed and band bindings are the two that exist today.
+
 ## Plan of record: 100 output tok/s at C20 / 64K (re-baselined 2026-09-11, user's decision)
 
 The 150 tok/s target required halving both the sparse attention (203 ms/chunk) and the MoE
