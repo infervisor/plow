@@ -1261,10 +1261,14 @@ ROWS=(
   "interp_prefill_k3_moe_a4w4|$AX_PREFILL $AX_MLA_K3 $AX_MOE $AX_A4W4 $AX_K3_A4W4 $AX_K3_A4W4_TUNE $AX_K3_PF_STATE $AX_MXFP4"
   "interp_prefill_fp8kv_k3_moe_a4w4|$AX_PREFILL $AX_MLA_K3 $AX_MOE $AX_A4W4 $AX_K3_A4W4 $AX_K3_A4W4_TUNE $AX_K3_PF_STATE $AX_MXFP4 $AX_FP8KV"
 )
+# The `_fp8kv` twins serve FP8-KV packets (GLM-5.3 TP8 ships `--glm-fp8-kv=true`); exec/amd.rs
+# opens `interp_packed_mla_{norm,flash}_fp8kv` for those and refuses the bf16 object by name.
 if [ "${PLOW_PACKED_PREFILL_CONSUMERS:-0}" = 1 ]; then
   ROWS+=(
     "interp_packed_mla_norm|$AX_PACKED_MLA_NORM"
     "interp_packed_mla_flash|$AX_PACKED_MLA_FLASH"
+    "interp_packed_mla_norm_fp8kv|$AX_PACKED_MLA_NORM $AX_FP8KV"
+    "interp_packed_mla_flash_fp8kv|$AX_PACKED_MLA_FLASH $AX_FP8KV"
     "interp_packed_kda|$AX_PACKED_KDA"
   )
 fi

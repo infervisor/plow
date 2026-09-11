@@ -2794,7 +2794,7 @@ impl GpuEngine {
             && !config.fusion
             && prefix_layout.is_some()
             && packed_prefill_metadata.is_some();
-        let packed_prefix = prefix_requested && (config.pf_batch || unified_packed);
+        let packed_prefix = prefix_requested && (config.pf_batch_cuda() || unified_packed);
         if packed_prefix && (prefix_layout.is_none() || packed_prefill_metadata.is_none()) {
             return Err(RuntimeError::Rejected(
                 "packed prefix reuse requires compiled packed-prefill metadata and a valid VMM layout"
@@ -3667,7 +3667,7 @@ impl GpuEngine {
         let t_decode = std::time::Instant::now();
         let decode_t0 = load_tim.as_ref().map(|t| t.ms_since_t0()).unwrap_or(0.0);
         let sys_decode = std::time::SystemTime::now();
-        let pf_batch_env = crate::config::RuntimeConfig::get().pf_batch;
+        let pf_batch_env = crate::config::RuntimeConfig::get().pf_batch_cuda();
         let pf_max_t_blob = blob
             .prefill_progs()
             .iter()

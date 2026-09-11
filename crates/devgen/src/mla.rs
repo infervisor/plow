@@ -258,10 +258,13 @@ fn glm_dsa_pf_bucket(c: &GlmCfg, t: u32) -> bool {
     c.dsa_pf() && t >= 2048 && t > c.index_topk
 }
 
-fn glm_small_pf_split_cap(c: &GlmCfg, n_cu: u32, rows: u32) -> u32 {
+/// `packed`: the program carries the packed-prefill family topology, whose flash arm has no
+/// KV-split axis (one partial per row). Keyed on the BUILDER, not the global emit flag, so a
+/// packed emit leaves the ordinary sibling's split — and its bytes — exactly as flag-off.
+fn glm_small_pf_split_cap(c: &GlmCfg, n_cu: u32, rows: u32, packed: bool) -> u32 {
     if !crate::emit_is_amd() || n_cu != 304 || c.tp != 8 || c.heads != 64
         || c.kv_lora != 512 || c.qk_rope != 64 || !glm_fp8_kv()
-        || rows == 0 || rows >= 2048 || emit_config::active().packed_prefill_on()
+        || rows == 0 || rows >= 2048 || packed
         // The split capacity must agree with the arm `packet::devbuild` routes the packet
         // to, so both read the builder's own knob snapshot.
         || packet::devbuild::knobs().mla_pf_v2 == Some(false)
@@ -1908,7 +1911,7 @@ pub(crate) fn declare_glm_rows_batched(
     // rows*nh_l*pf_ns partials (each split a ceil-equal share of its tile's causal range;
     // dead splits carry m=-inf/l=0, which d_mla_merge_fold weighs 0 branch-free — the old
     // "empty split divides the merge" objection predates that merge rewrite).
-    let small_cap = glm_small_pf_split_cap(c, b.n_cu(), 128);
+    let small_cap = glm_small_pf_split_cap(c, b.n_cu(), 128, false);
     let small_partials = if small_cap > 1 { 128 * small_cap } else { 0 };
     let osplits = (ns * dbatch).max(rows as u32 * glm_pf_ns()).max(small_partials);
     let opart = ac(b, "opart", (nh_l * osplits * dk) as u64 * F32);
@@ -4700,12 +4703,8 @@ fn emit_glm_lt_gemm(
         return None;
     }
     assert!(
-        c.tp == 8
-            && c.hidden == 6144
-            && b.n_cu() == 304
-            && t <= 8192
-            && !emit_config::active().packed_prefill_on(),
-        "PLOW_GLM_GEMM_LT requires unpacked gfx942 TP8 GLM prefill"
+        c.tp == 8 && c.hidden == 6144 && b.n_cu() == 304 && t <= 8192,
+        "PLOW_GLM_GEMM_LT requires gfx942 TP8 GLM prefill"
     );
     let counter = b.emit(DevOp::GemmLtPf, vec![0], deps, |d| {
         d.t[0] = out;
@@ -5054,11 +5053,13 @@ fn emit_glm_dsa_prefill_select(
     );
     let c_se =
         if emit_config::active().glm_index_tp && t >= 2048 {
+            // Class C (positions from one scalar): a packed sibling never reaches here
+            // because `glm_emit_full` skips sparse buckets in its packed pass.
             assert!(
-            !emit_config::active().packed_prefill_on()
+            !b.packed_prefill_segments()
                 && c.tp == 8 && n_cu == 304 && h == 6144
                 && hi == 32 && di == 128 && itk == 2048 && t <= 8192,
-            "PLOW_GLM_INDEX_TP requires unpacked gfx942 TP8 GLM H6144/HI32/DI128/top2048 prefill"
+            "PLOW_GLM_INDEX_TP requires an unpacked gfx942 TP8 GLM H6144/HI32/DI128/top2048 prefill program"
         );
             let enter = *xgate;
             *xgate = enter.checked_add(3).expect("indexer TP gate overflow");
@@ -5419,7 +5420,7 @@ pub(crate) fn emit_glm_mla_prefill(
     let small_pf_ns = if band.is_some() {
         1
     } else {
-        glm_small_pf_split_cap(c, n_cu, t)
+        glm_small_pf_split_cap(c, n_cu, t, b.packed_prefill_segments())
     };
     let pf_ns = if fp8kv && !sparse {
         small_pf_ns
@@ -5832,10 +5833,6 @@ fn emit_glm_moe_ffn_prefill(
     let resident = emit_config::active().glm_moe_resident;
     let native_moe = emit_config::active().glm_moe_aiter || resident;
     if native_moe {
-        assert!(
-            !emit_config::active().packed_prefill_on(),
-            "PLOW_GLM_MOE_AITER requires --emit-packed-prefill=false"
-        );
         assert!(
             enc == MoeEnc::Fp8Blk
                 && tp == 8
@@ -7836,9 +7833,8 @@ fn glm_emit_full(
                 && tp == 8
                 && enc == MoeEnc::Fp8Blk
                 && !c.ep
-                && !emit_config::active().packed_prefill_on()
                 && !emit_config::active().moe_prefill_ep,
-            "resident GLM MoE requires gfx942 TP8 block-FP8 without EP or packed prefill"
+            "resident GLM MoE requires gfx942 TP8 block-FP8 without EP"
         );
     }
 
@@ -7892,8 +7888,10 @@ fn glm_emit_full(
     // lowering decision". Sparse-prefill buckets are skipped: `IndexUnionPf`/`IndexTpPf` derive
     // every row's position from one scalar (class C) and have no per-span form yet. Flag unset
     // ⇒ byte-identical blob.
-    // The body sets the packed-segment topology on ITS OWN builder; it does not need (and the
-    // native MoE / index-TP arms forbid) the global `PLOW_EMIT_PACKED_PREFILL` siblings.
+    // The body sets the packed-segment topology on ITS OWN builder; it does not need the global
+    // `PLOW_EMIT_PACKED_PREFILL` siblings. Both passes carry the native AITER MoE and hipBLASLt
+    // segments unchanged — they are row-agnostic over the dense live rows (class A); only the
+    // sparse-bucket selectors are class C, and neither pass emits those buckets.
     let token_batch_tp = emit_config::active().token_batch_tp;
     if token_batch_tp {
         assert!(
@@ -7915,6 +7913,7 @@ fn glm_emit_full(
                 .then_some(&pf)
                 .into_iter()
                 .flatten()
+                .filter(|&&t| !glm_dsa_pf_bucket(&c, t))
                 .map(|&t| (t, PfKind::Packed)),
         )
         .chain(

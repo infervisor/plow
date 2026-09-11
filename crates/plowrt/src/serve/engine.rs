@@ -62,6 +62,8 @@ pub trait SeqEngine {
         -> Option<packet::dev::PrefillSpan>;
     fn advance_packed_prefill(&mut self, members: &[(usize, &[u32])]) -> crate::Result<()>;
     fn prefill_frontier(&self, slot: usize) -> Option<usize>;
+    fn next_prefill_rows(&self, _slot: usize) -> Option<u32> { None }
+    fn prefill_step_budget(&self) -> u32 { u32::MAX }
     fn cached_rows(&self, _slot: usize) -> usize { 0 }
     fn prefill_chunked_at_most(
         &mut self,
@@ -1044,9 +1046,10 @@ mod amd_serve {
                 batch,
                 decode_rungs = ?decode_rungs,
                 decode_only = !has_prefill,
-                pf_batch = crate::config::RuntimeConfig::get().pf_batch,
+                pf_batch = crate::config::RuntimeConfig::get().pf_batch_amd(),
+                pf_rotate = crate::config::RuntimeConfig::get().pf_rotate(),
                 pf_chunk = crate::config::RuntimeConfig::get().pf_chunk,
-                pf_interleave = crate::config::RuntimeConfig::get().pf_interleave,
+                pf_interleave = crate::config::RuntimeConfig::get().pf_interleave_amd(),
                 pf_defer_decode = crate::config::RuntimeConfig::get().pf_defer_decode,
                 stop_ids = ?stop_ids,
                 "AMD serve engine ready"
@@ -2076,6 +2079,24 @@ mod amd_serve {
                 }
             }
             Ok(())
+        }
+
+        /// Rows of the next PLANNED chunk of a mid-prefill slot; `None` before its cursor
+        /// exists. The mux's step budget admits an isolated chunk only when this fits.
+        pub fn next_prefill_rows(&self, slot: usize) -> Option<u32> {
+            let cur = self.pf.get(slot)?.as_ref()?;
+            cur.steps.get(cur.next).map(|step| step.clen)
+        }
+
+        /// The per-tick prefill row budget: the widest compiled prefill rung, i.e. one
+        /// launch of the widest chunk the plan can hold (`PLOW_PF_INTERLEAVE` clamps it).
+        pub fn prefill_step_budget(&self) -> u32 {
+            self.ranks
+                .rank0()
+                .prefill_rungs()
+                .map(|(_, width)| width)
+                .max()
+                .unwrap_or(u32::MAX)
         }
 
         /// Rows completed by a request whose chunked prefill is still active.
@@ -3193,6 +3214,12 @@ impl SeqEngine for AmdServe {
     }
     fn prefill_frontier(&self, slot: usize) -> Option<usize> {
         AmdServe::prefill_frontier(self, slot)
+    }
+    fn next_prefill_rows(&self, slot: usize) -> Option<u32> {
+        AmdServe::next_prefill_rows(self, slot)
+    }
+    fn prefill_step_budget(&self) -> u32 {
+        AmdServe::prefill_step_budget(self)
     }
     fn cached_rows(&self, slot: usize) -> usize { AmdServe::cached_rows(self, slot) }
     fn prefill_chunked_at_most(
