@@ -48,6 +48,10 @@ printf '%s\n' "$(readlink -f "$ASSETS/checkpoint" 2>/dev/null || echo '<none>')"
 # Objects, including the low-rung tier subdirectories: plowrt discovers those by layout, so a set
 # that drops them serves the wide object at every rung and silently loses ~25% output tok/s.
 cp -f "$OBJ"/*.elf "$OUT/hsaco/" 2>/dev/null || true
+# The pinned vendor code objects (AITER fmoe/MLA .co) sit beside the .elf adapters that load them
+# and are part of the set: without the 64-row fmoe object the set serves the 32x256 MoE tile, and
+# without the QH8 object the sparse MLA routes refuse at load. Copy them as content, like the rest.
+cp -f "$OBJ"/*.co "$OUT/hsaco/" 2>/dev/null || true
 [ -f "$OBJ/build_defines.json" ] && cp -f "$OBJ/build_defines.json" "$OUT/hsaco/"
 for d in "$OBJ"/lowrung*; do
   [ -d "$d" ] || continue
@@ -71,7 +75,7 @@ fi
   echo "objdir_src:  $OBJ"
   echo "plowrt_src:  $PLOWRT"
   echo "pairing:     $(python3 -c "import json;print(json.load(open('$ASSETS/build.json')).get('pairing',{}).get('hash','?'))" 2>/dev/null || echo '?')"
-  echo "objects:     $(ls "$OUT/hsaco"/*.elf 2>/dev/null | wc -l) (+ $(ls -d "$OUT/hsaco"/lowrung* 2>/dev/null | wc -l) tier dirs)"
+  echo "objects:     $(ls "$OUT/hsaco"/*.elf 2>/dev/null | wc -l) (+ $(ls -d "$OUT/hsaco"/lowrung* 2>/dev/null | wc -l) tier dirs, $(ls "$OUT/hsaco"/*.co 2>/dev/null | wc -l) pinned vendor .co)"
   echo "hsa_linked:  $(grep -ac libhsa-runtime64 "$OUT/plowrt" >/dev/null 2>&1 && echo yes || echo NO)"
 } > "$OUT/FROZEN.txt"
 cat "$OUT/FROZEN.txt"
