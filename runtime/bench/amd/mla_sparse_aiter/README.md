@@ -245,3 +245,63 @@ Primary sources:
 - [AITER MLA dispatch, pinned source](https://github.com/ROCm/aiter/blob/10f8874dc2cd69c07ed84b5f125c27d12baccb10/aiter/mla.py)
 - [vLLM sparse MLA backend](https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/backends/mla/rocm_aiter_mla_sparse.py)
 - [AMD matrix-core instruction and format reference](https://rocm.blogs.amd.com/software-tools-optimization/matrix-cores-cdna/README.html)
+
+## FP32 single-split prefill
+
+The pinned QH8 v3 object can write normalized FP32 directly when KV splits
+is one and `out_16_nosplit` remains zero. This differs from the automatic
+BF16-output wrapper path described above. The FP8 adapter exposes this through
+`plow_mla_sparse_single_abi_1`: native routes with at least 512 actual query
+rows initialize the merge normalizer while packing, then omit the separate
+partial reduction. Build with `scripts/build_mla_sparse_aiter.sh OBJECT_DIR
+AITER_QH8_CODE_OBJECT --single-pass` to expose that marker. The default build,
+smaller queries, BF16 KV and older adapters retain two splits. Native-route
+eligibility and compiler segment boundaries are unchanged.
+
+`replay_splits.cpp` compares one, two and four splits on the pinned object.
+It covers 72 cases: rows 1/8/128/512/2048/8192, contexts 16384/81920, and
+shared or row-shifted causal key sets (`distinct` in the CSV; sets can overlap
+after wrapping). Three poisoned reuses and output guards pass;
+an independent FP64 attention reference samples the first/middle/last query
+and heads 0/7 across all 512 output columns. Maximum absolute error was
+0.00009774 and relative L2 0.001520. Attention-only event medians exclude
+packing, reduction, TP and serving: one split reduced time by 5.96–6.68% at
+8192 rows but increased it by 27–75% below 512 rows.
+
+Build this host-only HIP API probe inside `nix develop`:
+
+```sh
+c++ -std=c++17 -O3 -D__HIP_PLATFORM_AMD__ -I"$ROCM_PATH/include" \
+  runtime/bench/amd/mla_sparse_aiter/replay_splits.cpp \
+  -L"$ROCM_PATH/lib" -Wl,-rpath,"$ROCM_PATH/lib" -lamdhip64 \
+  -o /tmp/mla-splits
+GPU_LEASE_NGPU=8 perf-data/tools/gpulease -n 8 mla-splits \
+  /tmp/mla-splits "$AITER_QH8_CODE_OBJECT"
+```
+
+Runtime qualification covers rows 1/129/511/512/513, two rebased KV slots,
+BF16 and both FP8 dispatch paths, including output/normalizer guards. TP8
+serving with agreement checked every token passes six prefix append cases
+(512/2048/8192 at contexts 16384/65536), ten shared-prefix retrievals and
+18 concurrent fact-retrieval cases. Raw artifacts are under
+`/tmp/tp-glm53-sparse-splits`.
+
+A candidate-then-control serving pair used 20 random requests at 70K input,
+700 output, range ratio 0.14 and concurrency 20. Both completed 20/20 with
+identical input/output length arrays. The runtime, full ladder packet and 77
+objects were identical; only the adapter's capability marker differed. A
+10-second process monitor observed no compilation from API readiness through
+either timed arm. An earlier control overlapped compilation and is excluded.
+
+| Metric | Two splits | Single pass | Change |
+|---|---:|---:|---:|
+| Output tokens/s | 49.65 | 50.41 | +1.52% |
+| Mean TTFT, ms | 103456 | 100742 | -2.62% |
+| Mean TPOT, ms | 230.45 | 234.19 | +1.62% |
+| Median ITL, ms | 101.57 | 107.44 | +5.78% |
+| P99 ITL, ms | 1356.41 | 1349.17 | -0.53% |
+
+Keep this path opt-in: throughput and TTFT improve in this pair, while mean
+TPOT and median ITL worsen. This is one 20-request pair, not a repeatability
+study or the full 100-request H200 comparison. The supplied 273.67 output
+tokens/s target remains unmet.
