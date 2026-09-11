@@ -1351,11 +1351,11 @@ impl AmdTpGroup {
         if self.audit {
             self.group.audit_xctr(&self.gate_expect[prog])?;
         }
-        if let Some(dir) = std::env::var_os("PLOW_TB_DUMP") {
+        if let Some(dir) = crate::config::RuntimeConfig::get().amd.tb_dump.as_ref() {
             static TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let tick = TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.ranks[0].token_batch_dump(
-                std::path::Path::new(&dir),
+                dir.as_path(),
                 &format!("step{tick:04}"),
                 plan,
             )?;
@@ -1658,12 +1658,12 @@ impl AmdTpGroup {
                     ranks.join(","),
                 );
             }
-            if let Some(dir) = std::env::var_os("PLOW_TB_DUMP") {
+            if let Some(dir) = crate::config::RuntimeConfig::get().amd.tb_dump.as_ref() {
                 static TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 let tick = TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let slot = self.ranks[0].kv_slot();
                 self.ranks[0].dump_slot_kv(
-                    std::path::Path::new(&dir),
+                    dir.as_path(),
                     &format!("pf{tick:04}"),
                     slot,
                     step.c0 + step.clen,
