@@ -1,0 +1,7 @@
+PASS concurrent ragged prompts, exact output limits, slot reuse
+Traceback (most recent call last):
+  File "/home/lava/plow/scripts/verify_packed_serve.py", line 96, in <module>
+    main()
+  File "/home/lava/plow/scripts/verify_packed_serve.py", line 81, in main
+    assert actual == expected, "cancellation changed surviving requests"
+AssertionError: cancellation changed surviving requests

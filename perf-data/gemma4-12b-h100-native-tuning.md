@@ -938,3 +938,32 @@ quality. C32 throughput is unchanged; the lower16K/C1 TTFT needs repeated
 measurement before promotion. No C128 or fresh vLLM comparison was run.
 [Results, recipes, logs and hashes](gemma4-12b-h100-data/request2048-summary.json)
 retain the screen. The default remains unchanged.
+
+## Native W8A8 packed B16 screen
+
+The audited E4M3 GEMM map contract permits explicit packed W8A8 compilation.
+BF16 KV,context20480,physical B16,aggregate2048/request1024; weights12GiB,
+KV25GiB,activations0.53GiB. Prefill uses native FP8 TMA/GEMM objects; decode
+uses existing FP8-weight/BF16-activation bodies. The current-source decode
+object passes serving checks. An older reused object failed after cancellation;
+the exact cause of that difference was not isolated.
+
+The base screen reaches98.74/53.34 output tokens/s at1K/16K C1, and
+314.99/71.17 atC16. Corresponding C1 TTFT is78.67/1056.14ms. These are one
+repeat after serving verification, no additional per-cell warmup,128 outputs
+and cache disabled. There is no fresh BF16/vLLM A/B, C128 measurement,
+sanitizer run or independent full-model quality evaluation for this candidate.
+
+The16K/C1 event profile sums419.1ms GEMM,243.0ms light and340.7ms attention
+across16chunks. The earlier BF16 profile was approximately531/139/349ms:
+extra quantization/light work offsets much of the GEMM saving. Event profiling
+replaces graph execution and is diagnostic, not serving timing.
+
+Existing `PLOW_QNORM_FUSE=true` removes144 packets per prefill rung. Its
+profile is419.0/234.6/340.2ms, saving only8.4ms of light work. It reaches
+53.49tok/s at16K/C1 and71.79 atC16, with1041.42ms C1 TTFT. Both configurations
+pass serving consistency/cancellation/reuse/limits, but3 of34 paired texts
+change with fusion. Neither configuration is promoted as the default.
+[Results, recipes and evidence](gemma4-12b-h100-data/w8a8-packed-summary.json)
+include68 measured requests, all with128 outputs and zero cached tokens.
+Native FP8 decode batching remains a substantial throughput gap.

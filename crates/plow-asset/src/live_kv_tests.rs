@@ -145,6 +145,13 @@ fn validate_all(
     slot_map: Option<Tensor<'_>>,
     mutate: impl FnOnce(&mut Vec<DevInst64>, &mut Vec<Tensor<'_>>),
 ) -> Result<()> {
+    validate_generated(slot_map, |insts, tensors, _| mutate(insts, tensors))
+}
+
+fn validate_generated(
+    slot_map: Option<Tensor<'_>>,
+    mutate: impl FnOnce(&mut Vec<DevInst64>, &mut Vec<Tensor<'_>>, &mut Vec<packet::rope::GenTensor>),
+) -> Result<()> {
     let mut tensors = vec![
         Tensor {
             name: "in.pos",
@@ -200,7 +207,8 @@ fn validate_all(
         d
     };
     let mut insts = vec![decode, writer(2), writer(3)];
-    mutate(&mut insts, &mut tensors);
+    let mut generated = Vec::new();
+    mutate(&mut insts, &mut tensors, &mut generated);
     let program = Program {
         rows: 2,
         packed_prefill_only: false,
@@ -221,10 +229,57 @@ fn validate_all(
         prefill_count: 0,
         tensors: &tensors,
         programs: &[program],
-        generated: &[],
+        generated: &generated,
         kv_row_insts: &[],
     })
     .map(|_| ())
+}
+
+#[test]
+fn fp8_gemm_maps_match_sources_and_extents() {
+    for op in [DevOp::GemmFp8, DevOp::GemmMedFp8, DevOp::GemmSmallFp8] {
+        for mutation in 0..12 {
+            let result = validate_generated(None, |insts, tensors, generated| {
+                for _ in 0..2 {
+                    tensors.push(Tensor {
+                        name: "tmap",
+                        bytes: 128,
+                        initialized: false,
+                    });
+                }
+                for (handle, source, rows) in [(7, 4, 2), (8, 5, 4)] {
+                    let mut g = packet::rope::GenTensor::tmap_e4m3(source, rows, 256, 128);
+                    g.tensor = handle;
+                    generated.push(g);
+                }
+                let mut d = inst(op);
+                d.t[1] = 4;
+                d.t[2] = 5;
+                d.i = [2, 4, 256, 0, 0, 0, 7, 8];
+                match mutation {
+                    0 => {}
+                    1 => generated[0].aux = 2,
+                    2 => generated[0].kind = packet::rope::GEN_TMAP_BF16,
+                    3 => generated[0].hd = 128,
+                    4 => generated[0].ctx = 1,
+                    5 => generated.push(generated[0].clone()),
+                    6 => tensors[7].bytes = 64,
+                    7 => tensors[4].bytes = 1,
+                    8 => d.i[7] = 0,
+                    9 => d.i[6] = u32::MAX,
+                    10 => d.i[4] = 1,
+                    11 => generated[1].aux = 4,
+                    _ => unreachable!(),
+                }
+                insts.push(d);
+            });
+            assert_eq!(
+                result.is_ok(),
+                mutation == 0,
+                "{op:?} mutation {mutation}: {result:?}"
+            );
+        }
+    }
 }
 
 #[test]

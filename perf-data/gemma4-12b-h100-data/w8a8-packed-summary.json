@@ -1,0 +1,689 @@
+{
+  "model": "google/gemma-4-12B-it",
+  "context": 20480,
+  "physical_batch": 16,
+  "request_chunk": 1024,
+  "aggregate_rows": 2048,
+  "weights_gib": 12,
+  "kv_gib": 25,
+  "asset_tests": {
+    "passed": 98,
+    "ignored": 2
+  },
+  "packets": {
+    "w8a8": {
+      "arch": "sm_90a",
+      "precision": {
+        "weight_enc": "fp8",
+        "act_enc": "mixed",
+        "kv_enc": "bf16",
+        "expert_enc": "none"
+      },
+      "compiler_replay": {
+        "PLOW_DECODE_BATCH_LADDER": "1,2,4,8,16",
+        "PLOW_EMIT_DECODE_CUBLASLT": "false",
+        "PLOW_EMIT_PACKED_PREFILL": "true",
+        "PLOW_FP8": "true",
+        "PLOW_MAX_CHUNK": "2048",
+        "PLOW_NO_GLU_FUSE": "true",
+        "PLOW_TMA_GEMM": "true",
+        "PLOW_W8A8": "true"
+      },
+      "compiler_unrecorded_env": {
+        "PLOW_UNISEG": "0",
+        "PLOW_SEG_CLASS_SLICE": "1",
+        "PLOW_SEG_FA512": "all",
+        "PLOW_SEG_PURE_GEMM": "1",
+        "PLOW_SEG_SLICE_ALL": "1"
+      },
+      "programs": [
+        {
+          "phase": "prefill",
+          "rows": 128,
+          "instructions": 958,
+          "cases": 391,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 1,
+            "GemmFp8": 328,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "QuantFp8": 192,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "prefill",
+          "rows": 512,
+          "instructions": 958,
+          "cases": 391,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 1,
+            "GemmFp8": 328,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "QuantFp8": 192,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "prefill",
+          "rows": 1024,
+          "instructions": 958,
+          "cases": 391,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 1,
+            "GemmFp8": 328,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "QuantFp8": 192,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "prefill",
+          "rows": 2048,
+          "instructions": 958,
+          "cases": 391,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 1,
+            "GemmFp8": 328,
+            "Glu": 48,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "QuantFp8": 192,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 1,
+          "instructions": 622,
+          "cases": 68,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 1,
+            "GemvFp8": 232,
+            "GemvGluFp8": 48,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 2,
+          "instructions": 622,
+          "cases": 68,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 1,
+            "GemvFp8": 232,
+            "GemvGluFp8": 48,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 4,
+          "instructions": 622,
+          "cases": 68,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 1,
+            "GemvFp8": 232,
+            "GemvGluFp8": 48,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 8,
+          "instructions": 622,
+          "cases": 68,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 1,
+            "GemvFp8": 232,
+            "GemvGluFp8": 48,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 16,
+          "instructions": 622,
+          "cases": 68,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 1,
+            "GemvFp8": 232,
+            "GemvGluFp8": 48,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        }
+      ]
+    },
+    "qnorm": {
+      "arch": "sm_90a",
+      "precision": {
+        "weight_enc": "fp8",
+        "act_enc": "mixed",
+        "kv_enc": "bf16",
+        "expert_enc": "none"
+      },
+      "compiler_replay": {
+        "PLOW_DECODE_BATCH_LADDER": "1,2,4,8,16",
+        "PLOW_EMIT_DECODE_CUBLASLT": "false",
+        "PLOW_EMIT_PACKED_PREFILL": "true",
+        "PLOW_FP8": "true",
+        "PLOW_MAX_CHUNK": "2048",
+        "PLOW_NO_GLU_FUSE": "true",
+        "PLOW_QNORM_FUSE": "true",
+        "PLOW_TMA_GEMM": "true",
+        "PLOW_W8A8": "true"
+      },
+      "compiler_unrecorded_env": {
+        "PLOW_UNISEG": "0",
+        "PLOW_SEG_CLASS_SLICE": "1",
+        "PLOW_SEG_FA512": "all",
+        "PLOW_SEG_PURE_GEMM": "1",
+        "PLOW_SEG_SLICE_ALL": "1"
+      },
+      "programs": [
+        {
+          "phase": "prefill",
+          "rows": 128,
+          "instructions": 814,
+          "cases": 390,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 1,
+            "GemmFp8": 328,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "QuantFp8": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "prefill",
+          "rows": 512,
+          "instructions": 814,
+          "cases": 390,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 1,
+            "GemmFp8": 328,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "QuantFp8": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "prefill",
+          "rows": 1024,
+          "instructions": 814,
+          "cases": 390,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 1,
+            "GemmFp8": 328,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "QuantFp8": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "prefill",
+          "rows": 2048,
+          "instructions": 814,
+          "cases": 390,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashPrefill": 48,
+            "Gemm": 1,
+            "GemmFp8": 328,
+            "HeadNormRope": 144,
+            "NormResidual": 96,
+            "QuantFp8": 96,
+            "RmsNorm": 97,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 1,
+          "instructions": 622,
+          "cases": 68,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 1,
+            "GemvFp8": 232,
+            "GemvGluFp8": 48,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 2,
+          "instructions": 622,
+          "cases": 68,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 1,
+            "GemvFp8": 232,
+            "GemvGluFp8": 48,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 4,
+          "instructions": 622,
+          "cases": 68,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 1,
+            "GemvFp8": 232,
+            "GemvGluFp8": 48,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 8,
+          "instructions": 622,
+          "cases": 68,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 1,
+            "GemvFp8": 232,
+            "GemvGluFp8": 48,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "rows": 16,
+          "instructions": 622,
+          "cases": 68,
+          "ops": {
+            "Argmax": 1,
+            "ArgmaxFin": 1,
+            "Embed": 1,
+            "FlashDecode": 48,
+            "FlashMerge": 48,
+            "Gemv": 1,
+            "GemvFp8": 232,
+            "GemvGluFp8": 48,
+            "HeadNormRope": 144,
+            "NormResidualNorm": 96,
+            "RmsNorm": 1,
+            "SoftCap": 1
+          }
+        }
+      ]
+    }
+  },
+  "serving_screen": "Baseline then qnorm, one repeat after verification, no extra per-cell warmup. All 68 measured requests returned 128 outputs/cache0. No fresh BF16/vLLM comparison, C128, sanitizer or independent model-quality evaluation.",
+  "old_decode_object": "Reused older decode object passed concurrent-ragged test but failed after cancellation. Current-source rebuild passed all serving checks; exact root cause not isolated.",
+  "results": {
+    "w8a8": [
+      {
+        "input": 1024,
+        "concurrency": 1,
+        "output_tok_s": 98.74265797367997,
+        "ttft_ms": 78.66939599625766
+      },
+      {
+        "input": 1024,
+        "concurrency": 16,
+        "output_tok_s": 314.98503564260557,
+        "ttft_ms": 1029.305463503988
+      },
+      {
+        "input": 16384,
+        "concurrency": 1,
+        "output_tok_s": 53.33617537369956,
+        "ttft_ms": 1056.1435269919457
+      },
+      {
+        "input": 16384,
+        "concurrency": 16,
+        "output_tok_s": 71.17142258271615,
+        "ttft_ms": 22286.941432503227
+      }
+    ],
+    "qnorm": [
+      {
+        "input": 1024,
+        "concurrency": 1,
+        "output_tok_s": 99.24206170311498,
+        "ttft_ms": 73.93414799298625
+      },
+      {
+        "input": 1024,
+        "concurrency": 16,
+        "output_tok_s": 315.1031000973451,
+        "ttft_ms": 816.8286774962326
+      },
+      {
+        "input": 16384,
+        "concurrency": 1,
+        "output_tok_s": 53.493026756976995,
+        "ttft_ms": 1041.4233560004504
+      },
+      {
+        "input": 16384,
+        "concurrency": 16,
+        "output_tok_s": 71.78977681314461,
+        "ttft_ms": 22037.693014499382
+      }
+    ]
+  },
+  "profiles": {
+    "w8a8": {
+      "chunks": 16,
+      "gemm_light_attention_ms": [
+        419.1,
+        243.0,
+        340.7
+      ]
+    },
+    "qnorm": {
+      "chunks": 16,
+      "gemm_light_attention_ms": [
+        419.0,
+        234.6,
+        340.2
+      ]
+    }
+  },
+  "profile_scope": "CUDA event segment mode replaces graphs; totals sum rounded per-chunk times. Diagnostic only.",
+  "qnorm_paired_text_differences": [
+    {
+      "input": 1024,
+      "concurrency": 1,
+      "different_texts": 0
+    },
+    {
+      "input": 1024,
+      "concurrency": 16,
+      "different_texts": 2
+    },
+    {
+      "input": 16384,
+      "concurrency": 1,
+      "different_texts": 0
+    },
+    {
+      "input": 16384,
+      "concurrency": 16,
+      "different_texts": 1
+    }
+  ],
+  "decision": "Enable audited mapped GEMM contract only. No performance/default promotion; qnorm changes3/34 texts and has only small timing effect. FP8 decode batching remains a throughput gap.",
+  "files": {
+    "plans/gemma4-12b-roofline/w8a8-b16-build-interp_sm90a_pfpackedgemm.log": {
+      "sha256": "b09397e5a23882d0ef3d2aed71a45de116c9877fbbd806fd37423561f427bfdb"
+    },
+    "plans/gemma4-12b-roofline/w8a8-b16-build-interp_sm90a_pf.log": {
+      "sha256": "b7ffc6b15105eb398fdeccd595f04f8987caa547239b196336eadfcf69e5d4f1"
+    },
+    "plans/gemma4-12b-roofline/w8a8-b16-build-interp_sm90a_pffa.log": {
+      "sha256": "007c4b76ddc960899084de71419054d56eaeebbf48cfce3247b4cb0df1dac5a0"
+    },
+    "plans/gemma4-12b-roofline/w8a8-b16-build-interp_sm90a_pfpackedseg.log": {
+      "sha256": "77ff3c7fe77ecefd6c37c704bfd5271a2fc5a67d9a8353f9f8e3e8e27b121375"
+    },
+    "plans/gemma4-12b-roofline/w8a8-b16-build-interp_sm90a_pfseg.log": {
+      "sha256": "49db30d2e77fc992bb5f1cd6886f7f40d3a04644d7dd4843a261188a97ce34f6"
+    },
+    "plans/gemma4-12b-roofline/w8a8-b16-build-interp_sm90a_pfpackedfa.log": {
+      "sha256": "fdd7bc6da941e6c686be36eee39dc58953e1438b80b0b4accf606100403ea295"
+    },
+    "plans/gemma4-12b-roofline/w8a8-b16-build-interp_sm90a_pfgemm.log": {
+      "sha256": "174e9a61405004bec4f6d7e18ee09e86a246824c455c132b97483302d17c15b4"
+    },
+    "plans/gemma4-12b-roofline/w8a8-b16-main-build.log": {
+      "sha256": "7ab1cd8ff2aff36d1e08b3259e53ea7b87126db3ee820694c7d1a249ba60264e"
+    },
+    "plans/gemma4-12b-roofline/w8a8-asset-tests.log": {
+      "sha256": "aadae29d0fbfed90d0565b67711a585d30efade97fa3ea8db327884ea3b480e4"
+    },
+    "plans/gemma4-12b-roofline/w8a8-live-kv-tests.log": {
+      "sha256": "96d6268494fc55619d19796134f2c0fa2add5907bdd46fc880ee5554b2ee47d6"
+    },
+    "plans/gemma4-12b-roofline/w8a8-cuda-build.log": {
+      "sha256": "3920a6751c1b0fa07da8db48d48a71a28c0af8aa9485759cce048348fd77ab21"
+    },
+    "plans/gemma4-12b-roofline/w8a8-b16-packed-compile.log": {
+      "sha256": "8c6f70db1fcf1f272fa0e45a282951d6b7536141105ac6892e858fc23265f5be"
+    },
+    "plans/gemma4-12b-roofline/w8a8-qnorm-compile.log": {
+      "sha256": "4051bff2718d07032891ac1c83d4f03c87c629df281438cea72001ab9a1b7bbd"
+    },
+    "plans/gemma4-12b-roofline/w8a8-b16-serving-qnorm-server.log": {
+      "sha256": "efd90f50820b51fa086d1d410c9ed3211bf417ffdc9d6063176aab5ca6ef042f"
+    },
+    "plans/gemma4-12b-roofline/w8a8-b16-serving-w8a8-verify.log": {
+      "sha256": "f6e91190b360d5c897d0dc8996002ea78e93b0375e9476ce5ef68721fedefd91"
+    },
+    "plans/gemma4-12b-roofline/w8a8-b16-serving-qnorm-verify.log": {
+      "sha256": "f6e91190b360d5c897d0dc8996002ea78e93b0375e9476ce5ef68721fedefd91"
+    },
+    "plans/gemma4-12b-roofline/w8a8-b16-serving-w8a8-server.log": {
+      "sha256": "dcbc7a1b8bc96b8deaa9876574e7f2b9d4c2ace47ae474ec00f05251bf4bd9ce"
+    },
+    "plans/gemma4-12b-roofline/w8a8-b16-serving-qnorm.log": {
+      "sha256": "27d3c09e1b1b99a3b39316353ae9de79b29efcda1d7d8d926fc111926c6ad308"
+    },
+    "plans/gemma4-12b-roofline/w8a8-b16-serving-w8a8.log": {
+      "sha256": "9827b7ea1f8eb4a3e7f8530a4313f9bc465282f1e96ae013b08f1c28ad09afa8"
+    },
+    "plans/gemma4-12b-roofline/w8a8-profile-qnorm-server.log": {
+      "sha256": "8350384224659b4a50b3667a1d67e9cdbc1d3fbc0afa5587c72e1e5f53fd38db"
+    },
+    "plans/gemma4-12b-roofline/w8a8-profile-w8a8-server.log": {
+      "sha256": "19df12e9cb2c5d46e666a27178815ceee587339d36e5f7b51b3296caec7b35d5"
+    },
+    "plans/gemma4-12b-roofline/w8a8-old-main-failure-verify.log": {
+      "sha256": "1f59cee5619d1f3f72b3460555a412d39a14f67bb3af088fdf668b42b57b8712"
+    },
+    "plans/gemma4-12b-roofline/w8a8-old-main-failure-server.log": {
+      "sha256": "2216d99a6bdb915fc6b366a054d49504a99f4ba245d547c9f0ba63a2d321feef"
+    },
+    "plans/gemma4-12b-roofline/build_w8a8_b16_objects.py": {
+      "sha256": "de2e96fd8b89dba66553422df1677dbbe39180e59033dc40d47226c624cb54a0"
+    },
+    "plans/gemma4-12b-roofline/check_w8a8_b16.py": {
+      "sha256": "231d4d58a65697cf242cd7fe77d37fdb09b654e99ad288529f3b0aaccc2c2686"
+    },
+    "plans/gemma4-12b-roofline/check_w8a8_qnorm.py": {
+      "sha256": "ae14e44def710d609b82510aee912c3e6c0e91e8222075a750c905642684a296"
+    },
+    "plans/gemma4-12b-roofline/profile_w8a8.py": {
+      "sha256": "e09531811a1708a6a692287b9e699d386a9cb482e670a67e4fd51c0030508878"
+    },
+    "plans/gemma4-12b-roofline/profile_w8a8_qnorm.py": {
+      "sha256": "1a9f0b0b19496fdab5c664768863a351e448aedb8a925ebffa5dcaff4d75f3cb"
+    },
+    "plans/gemma4-12b-roofline/verify_w8a8_diagnostic.py": {
+      "sha256": "0278b6a786fac1a33c5d24f40836ccd9a7ed217460a8b82ede64b6df765b46cf"
+    },
+    "plans/gemma4-12b-roofline/w8a8-b16-serving-w8a8.json": {
+      "sha256": "bae401fa3f9b5f357914acf3168801e3a1475e229e0ea48f8f4cb9d4df721a9e"
+    },
+    "plans/gemma4-12b-roofline/w8a8-native-b16/model.pkt": {
+      "sha256": "d692a357d7693194bc6defa1eae180ece7d8f0fb72e69e9b598799f9afb60227",
+      "bytes": 45219967
+    },
+    "plans/gemma4-12b-roofline/w8a8-native-b16/build.json": {
+      "sha256": "ab4eb24b5eb77ee0c45ecc2d1c9480efe29d412aac3461453edfcd202b08528e",
+      "bytes": 3441055
+    },
+    "plans/gemma4-12b-roofline/w8a8-b16-audit.json": {
+      "sha256": "87f4ff0fa57dfdc8dab15224ff8ad61b6ac4edaf88517b4be69e7371f28372d9",
+      "bytes": 9048531
+    },
+    "plans/gemma4-12b-roofline/w8a8-b16-serving-qnorm.json": {
+      "sha256": "7cac0e947a0a5754b90a41195ac6d46c97f7f150cb54e245f7665a5aeab93785"
+    },
+    "plans/gemma4-12b-roofline/w8a8-b16-qnorm/model.pkt": {
+      "sha256": "1da582de72a1b29d74030851c852b2d1e2cfe0765771200fd04a810a41eb4b73",
+      "bytes": 38503807
+    },
+    "plans/gemma4-12b-roofline/w8a8-b16-qnorm/build.json": {
+      "sha256": "d81bf539160c9c11cbb60f00d0c0ec2da2c411c49e68dd1bb7b7e365b5d29d63",
+      "bytes": 3369878
+    },
+    "plans/gemma4-12b-roofline/w8a8-qnorm-audit.json": {
+      "sha256": "fad095aca65ac085d4bcf3ff19ba1a3fdbac2ac4f0f2b87df48954cfdd65b575",
+      "bytes": 8488203
+    },
+    "plans/gemma4-12b-roofline/cubin-w8a8-b16/interp_sm90a.cubin": {
+      "sha256": "e381cea75ac55de64fe1cdb84ea19ad8b9b1de3f6a5af2134e4189326fffe0e8",
+      "bytes": 1431928
+    },
+    "plans/gemma4-12b-roofline/cubin-w8a8-b16/interp_sm90a_pf.cubin": {
+      "sha256": "893877ce68593186fbc4a92c2175ac1606e0fdadd9874c34d2387db8e8a79f8c",
+      "bytes": 1094504
+    },
+    "plans/gemma4-12b-roofline/cubin-w8a8-b16/interp_sm90a_pffa.cubin": {
+      "sha256": "6102610ab161c7cc1d5c60c3991a8fb6e508c46a20e0538fe1fb99779068d030",
+      "bytes": 170728
+    },
+    "plans/gemma4-12b-roofline/cubin-w8a8-b16/interp_sm90a_pfgemm.cubin": {
+      "sha256": "f4dafa8289f9075471c190c70c704a6e575b54481e68da392424ff6dc95b2648",
+      "bytes": 104808
+    },
+    "plans/gemma4-12b-roofline/cubin-w8a8-b16/interp_sm90a_pfpackedfa.cubin": {
+      "sha256": "3962db8b9c118b21e3aeb84bbf1d87548ef24498bb576676d4136cb6dfed2abc",
+      "bytes": 271272
+    },
+    "plans/gemma4-12b-roofline/cubin-w8a8-b16/interp_sm90a_pfpackedgemm.cubin": {
+      "sha256": "6275c56dd3d534e2867edd4a3fac7a4d5ba739c50e544b3b1e0096d8f7348663",
+      "bytes": 105128
+    },
+    "plans/gemma4-12b-roofline/cubin-w8a8-b16/interp_sm90a_pfpackedseg.cubin": {
+      "sha256": "65d6c58ceda8be3ce32de09b349264458e2b33d90025c13e6cd256e6bdc20a74",
+      "bytes": 1020840
+    },
+    "plans/gemma4-12b-roofline/cubin-w8a8-b16/interp_sm90a_pfseg.cubin": {
+      "sha256": "bea5b88c003c46b08558be133a35d9931cd4ec8f9ce725c1ddc5e2a447e0e288",
+      "bytes": 1016552
+    },
+    "plans/gemma4-12b-roofline/w8a8-old-main.cubin": {
+      "sha256": "ec2f5c2989845d616985cf21daf46e2176bb53bd00f0c4fbbdcb1d66ec8519d6",
+      "bytes": 1447272
+    },
+    "crates/plow-asset/src/live_kv.rs": {
+      "sha256": "5863377f82140f98036b965ae5172d80e299de3513ef224aef3a839ffbd25264",
+      "bytes": 23205
+    },
+    "crates/plow-asset/src/live_kv_tests.rs": {
+      "sha256": "c77af3b36a237faa52c3e5521a4350cb565d3ef042666e1108572a84cc5393a3",
+      "bytes": 10206
+    }
+  }
+}

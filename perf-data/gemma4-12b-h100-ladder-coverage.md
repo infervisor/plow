@@ -411,3 +411,26 @@ those IDs to HD512 FlashPrefillFp8. This makes global FP8 attention the main
 next tuning target. Event profiling replaces graph execution and is not
 normal serving latency. B64 and the vLLM objective remain unqualified.
 [Evidence, objects and build recipe](gemma4-12b-h100-data/fp8-request-limit-summary.json).
+
+## Audited W8A8 GEMM maps
+
+Packed live-KV validation now accepts GEMM FP8 tensor maps only when both
+E4M3 generators agree with the instruction source handles, K, row extent and
+buffer sizes. It rejects duplicate generators, missing/invalid handles,
+non-E4M3 descriptors, mismatched sources, truncated buffers and cache aliases.
+The mapless path remains supported; indirect fused FP8 GLU maps remain
+unqualified and rejected. This validation runs during packet compilation/load.
+
+The actual H100 W8A8 B16 packet passes strict packet/build/queue checks at
+prefill128/512/1024/2048 and decode1/2/4/8/16:9programs,6942instructions,
+1904cases. Each prefill rung has328 mapped FP8 GEMMs and192 QuantFp8 ops.
+The existing norm/GLU quantization fusion reduces each rung from958 to814
+instructions. It also passes the audit, but its performance/quality results
+below do not justify promotion.
+
+[Builds, object hashes, all-op counts and tests](gemma4-12b-h100-data/w8a8-packed-summary.json)
+record the tested pairing. Use explicitly matched W8A8 prefill objects and a
+current decode object; the earlier reused decode object failed a cancellation
+check. Full-model independent quality and maximum-concurrency qualification
+remain open. This does not enable FP8-weight request chunk limits or native
+BF16 projection routing for FP8 weights.

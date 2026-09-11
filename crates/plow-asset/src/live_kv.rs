@@ -338,7 +338,7 @@ impl Manifest {
             let mut writes = BTreeSet::new();
             for (pc, d) in p.insts.iter().enumerate() {
                 let op = DevOp::from_u16(d.op).ok_or("unknown opcode access contract")?;
-                direct_operands(op, d).map_err(|e| format!("{e}: {op:?}"))?;
+                direct_operands(op, d, packet).map_err(|e| format!("{e}: {op:?}"))?;
                 if matches!(
                     op,
                     DevOp::FlashDecode
@@ -483,13 +483,45 @@ impl Manifest {
     }
 }
 
-fn direct_operands(op: DevOp, d: &DevInst64) -> Result<()> {
+fn direct_operands(op: DevOp, d: &DevInst64, packet: &Packet<'_>) -> Result<()> {
     match op {
-        DevOp::GemmFp8 => {
-            return require(
-                d.i[6] == 0 && d.i[7] == 0,
-                "unaudited FP8 GEMM tensor-map operands",
-            );
+        DevOp::GemmFp8 | DevOp::GemmMedFp8 | DevOp::GemmSmallFp8 => {
+            if d.i[6] == 0 && d.i[7] == 0 {
+                return Ok(());
+            }
+            for (handle, source, rows) in [
+                (d.i[6], d.t[1], u64::from(d.i[0]) + u64::from(d.i[4])),
+                (d.i[7], d.t[2], u64::from(d.i[1])),
+            ] {
+                let mut generators = packet.generated.iter().filter(|g| g.tensor == handle);
+                let g = generators
+                    .next()
+                    .ok_or("missing FP8 GEMM tensor-map operands")?;
+                require(
+                    handle != 0
+                        && handle < u32::from(TENSOR_NONE16)
+                        && handle != u32::from(source)
+                        && generators.next().is_none()
+                        && g.kind == packet::rope::GEN_TMAP_E4M3
+                        && g.aux == u32::from(source)
+                        && g.hd == d.i[2]
+                        && g.hd > 0
+                        && g.hd % 128 == 0
+                        && rows > 0
+                        && rows <= u64::from(g.ctx)
+                        && g.scale == 128
+                        && packet
+                            .tensors
+                            .get(handle as usize)
+                            .is_some_and(|t| t.bytes == 128)
+                        && packet
+                            .tensors
+                            .get(source as usize)
+                            .is_some_and(|t| t.bytes >= u64::from(g.ctx) * u64::from(g.hd)),
+                    "FP8 GEMM tensor-map operands disagree with direct operands",
+                )?;
+            }
+            return Ok(());
         }
         DevOp::GemmGluFp8 => {
             return require(
