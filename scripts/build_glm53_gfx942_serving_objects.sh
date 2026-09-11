@@ -61,7 +61,11 @@ echo ">>> AITER MoE adapter + the 32x256, flat 16x128 and 64x256 fmoe objects"
     "$vendor/fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_psx_64x256.co"
 
 echo ">>> AITER sparse MLA adapter + the QH8 object"
-"$root/scripts/build_mla_sparse_aiter.sh" "$out" "$vendor/mla_a16w16_qh8_qseqlen1_gqaratio8_v3.co"
+# --single-pass: one AITER attention launch instead of two splits plus a reduce. In flow at the
+# served 8192-row chunk (prior 65536) the route is 2746 -> 2466 us/layer, -22 ms/chunk; bench
+# 49.08 -> 49.91 out tok/s; retrieval 18/18 (tracker #22). The route engages whenever the
+# adapter exports the single-pass kernel, so this flag is what makes it the served default.
+"$root/scripts/build_mla_sparse_aiter.sh" "$out" "$vendor/mla_a16w16_qh8_qseqlen1_gqaratio8_v3.co" --single-pass
 
 # The pinned hipBLASLt projection image is already UNBUNDLED in a serving set, and
 # build_glm_lt.sh asserts exactly this sha256 after unbundling, so copying it is the same
