@@ -55,22 +55,40 @@ mod tests {
     #[test]
     #[ignore = "requires a gfx942 GPU lease and PLOW_TEST_AITER_DIR"]
     fn sparse_mla_hsa_dispatch() {
+        sparse_mla_hsa(true);
+    }
+
+    #[test]
+    #[ignore = "requires a gfx942 GPU lease and a default PLOW_TEST_AITER_DIR adapter"]
+    fn sparse_mla_legacy_hsa_dispatch() {
+        sparse_mla_hsa(false);
+    }
+
+    fn sparse_mla_hsa(single_supported: bool) {
         let dir = std::env::var("PLOW_TEST_AITER_DIR").unwrap();
+        const ROWS: u32 = 513;
         let be = HsaBackend::new(0).unwrap();
         let mut modules = Vec::new();
-        for fp8 in [false, true] {
-            let kernel =
-                SparseMla::load(&be, Path::new(&dir), 129, 4096, fp8, &mut modules).unwrap();
+        for (fp8, single) in [(false, false), (true, false), (true, true)] {
+            if single && !single_supported {
+                continue;
+            }
+            let mut kernel =
+                SparseMla::load(&be, Path::new(&dir), ROWS, 4096, fp8, &mut modules).unwrap();
+            assert_eq!(kernel.pack_fp8_single.is_some(), fp8 && single_supported);
+            if !single {
+                kernel.pack_fp8_single = None;
+            }
             let sizes = [
-                129 * 8 * 512 * 4,
-                129 * 8 * 2 * 4,
-                129 * 8 * 512 * 2,
-                129 * 8 * 64 * 2,
+                u64::from(ROWS) * 8 * 512 * 4 + 1024,
+                u64::from(ROWS) * 8 * 2 * 4 + 1024,
+                u64::from(ROWS) * 8 * 512 * 2,
+                u64::from(ROWS) * 8 * 64 * 2,
                 2 * 4096 * 512 * 2,
                 2 * 4096 * 64 * 2,
                 4,
                 4,
-                129 * 2048 * 4,
+                u64::from(ROWS) * 2048 * 4,
                 2 * 4096 * 4,
             ];
             let mut buffers = Vec::new();
@@ -93,35 +111,47 @@ mod tests {
             } else {
                 EngineDevice::upload(&be, &buffers[4], 0, bytemuck::cast_slice(&ck)).unwrap();
             }
-            let idx: Vec<u32> = (0..129 * 2048).map(|i| i % 2048).collect();
+            let idx: Vec<u32> = (0..ROWS * 2048).map(|i| i % 2048).collect();
             EngineDevice::upload(&be, &buffers[8], 0, bytemuck::cast_slice(&idx)).unwrap();
             let mut route = Route {
                 inst: DevInst64 {
                     t: [0, 1, 2, 3, 4, 5, 6, 7],
-                    i: [1, 8, 4096, 0, 129, u32::MAX, 0, 0],
+                    i: [1, 8, 4096, 0, ROWS, u32::MAX, 0, 0],
                     fj: [0.0625f32.to_bits(), 0, 0],
                     ..Default::default()
                 },
                 index: 8,
                 scale: fp8.then_some(9),
-                rows: 129,
+                rows: ROWS,
                 kv_len: 0,
                 active: false,
             };
             for slot in 0..2u64 {
                 let mut table: Vec<u64> = buffers.iter().map(|m| m.base).collect();
+                table[0] += 512;
+                table[1] += 512;
                 table[4] += slot * 4096 * 512 * if fp8 { 1 } else { 2 };
                 table[9] += slot * 4096 * 4;
                 table[5] += slot * 4096 * 64 * 2;
-                for rows in [1, 129] {
+                for rows in [1, 129, 511, 512, ROWS] {
+                    for b in [0, 1] {
+                        let poison = vec![f32::NAN; buffers[b].len as usize / 4];
+                        EngineDevice::upload(&be, &buffers[b], 0, bytemuck::cast_slice(&poison))
+                            .unwrap();
+                    }
                     route.rebase(rows, 2048).unwrap();
                     kernel
                         .enqueue(&be, route, bytemuck::cast_slice(&table))
                         .unwrap();
                     be.synchronize().unwrap();
                     let mut out = vec![0f32; rows as usize * 8 * 512];
-                    EngineDevice::download(&be, &buffers[0], 0, bytemuck::cast_slice_mut(&mut out))
-                        .unwrap();
+                    EngineDevice::download(
+                        &be,
+                        &buffers[0],
+                        512,
+                        bytemuck::cast_slice_mut(&mut out),
+                    )
+                    .unwrap();
                     assert!(out.iter().enumerate().all(|(i, &x)| {
                         let factor = if fp8 {
                             1.49609375 * (1 + i % 2) as f32
@@ -152,9 +182,30 @@ mod tests {
                         }
                     }
                     let mut ml = vec![0f32; rows as usize * 8 * 2];
-                    EngineDevice::download(&be, &buffers[1], 0, bytemuck::cast_slice_mut(&mut ml))
-                        .unwrap();
+                    EngineDevice::download(
+                        &be,
+                        &buffers[1],
+                        512,
+                        bytemuck::cast_slice_mut(&mut ml),
+                    )
+                    .unwrap();
                     assert!(ml.chunks_exact(2).all(|x| x == [0.0, 1.0]));
+                    for (b, width) in [(0, 512), (1, 2)] {
+                        for offset in [0, 512 + u64::from(rows) * 8 * width * 4] {
+                            let mut guard = vec![0f32; 128];
+                            EngineDevice::download(
+                                &be,
+                                &buffers[b],
+                                offset,
+                                bytemuck::cast_slice_mut(&mut guard),
+                            )
+                            .unwrap();
+                            assert!(
+                                guard.iter().all(|x| x.is_nan()),
+                                "rows={rows} fp8={fp8} buffer={b}"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -422,6 +473,13 @@ struct PackFp8Args {
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct PackSingleArgs {
+    base: PackFp8Args,
+    ml: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct ReduceArgs {
     out: u64,
     ml: u64,
@@ -433,11 +491,13 @@ struct ReduceArgs {
 
 const _: () = assert!(std::mem::size_of::<PackArgs>() == 88);
 const _: () = assert!(std::mem::size_of::<PackFp8Args>() == 96);
+const _: () = assert!(std::mem::size_of::<PackSingleArgs>() == 104);
 const _: () = assert!(std::mem::size_of::<ReduceArgs>() == 40);
 
 pub(super) struct SparseMla {
     pack: HsaKernel,
     pack_fp8: Option<HsaKernel>,
+    pack_fp8_single: Option<HsaKernel>,
     attention: HsaKernel,
     reduce: HsaKernel,
     _scratch: DeviceMem,
@@ -518,6 +578,20 @@ impl SparseMla {
             None
         };
         let reduce = EngineDevice::get_function(be, &module, "plow_mla_sparse_reduce")?;
+        let pack_fp8_single = if fp8
+            && super::amd::elf_symbol_names(&image).contains(&"plow_mla_sparse_single_abi_1")
+        {
+            let kernel =
+                EngineDevice::get_function(be, &module, "plow_mla_sparse_pack_fp8_single")?;
+            if ![104, 360].contains(&kernel.kernarg_size()) || kernel.private_segment_size() != 0 {
+                return Err(RuntimeError::Device(
+                    "sparse MLA single-pass pack resource ABI mismatch".into(),
+                ));
+            }
+            Some(kernel)
+        } else {
+            None
+        };
         for (kernel, size) in [(pack, 88), (reduce, 40)] {
             if ![size, size + 256].contains(&kernel.kernarg_size())
                 || kernel.private_segment_size() != 0
@@ -548,10 +622,15 @@ impl SparseMla {
             p
         });
         let [q, kv, part, lse, qp, kp, last, splits] = offsets;
-        tracing::info!(bytes, "allocated sparse AITER MLA workspace");
+        tracing::info!(
+            bytes,
+            single_pass = pack_fp8_single.is_some(),
+            "allocated sparse AITER MLA workspace"
+        );
         Ok(Self {
             pack,
             pack_fp8,
+            pack_fp8_single,
             attention,
             reduce,
             _scratch: scratch,
@@ -572,6 +651,8 @@ impl SparseMla {
             u64::from_le_bytes(tensor_table[at..at + 8].try_into().unwrap())
         };
         let t = route.inst.t;
+        let single = route.rows >= 512 && route.scale.is_some() && self.pack_fp8_single.is_some();
+        let splits = if single { 1 } else { 2 };
         let pack = PackArgs {
             q: self.q,
             kv: self.kv,
@@ -595,12 +676,26 @@ impl SparseMla {
                 base: pack,
                 scale: addr(scale),
             };
-            be.launch(kernel, 304, 256, 0, bytemuck::bytes_of(&args))?;
+            if single {
+                let args = PackSingleArgs {
+                    base: args,
+                    ml: addr(t[1]),
+                };
+                be.launch(
+                    self.pack_fp8_single.unwrap(),
+                    304,
+                    256,
+                    0,
+                    bytemuck::bytes_of(&args),
+                )?;
+            } else {
+                be.launch(kernel, 304, 256, 0, bytemuck::bytes_of(&args))?;
+            }
         } else {
             be.launch(self.pack, 304, 256, 0, bytemuck::bytes_of(&pack))?;
         }
         let mut args = [0u64; 40];
-        args[0] = self.part;
+        args[0] = if single { addr(t[0]) } else { self.part };
         args[2] = self.lse;
         args[4] = self.q;
         args[6] = self.kv;
@@ -609,17 +704,21 @@ impl SparseMla {
         args[12] = self.last;
         args[14] = u64::from(route.inst.fj[0]);
         args[16] = 8;
-        args[18] = 2;
+        args[18] = splits;
         args[20] = 8 * 576 * 2;
         args[22] = 576 * 2;
         args[26] = self.qp;
-        args[28] = self.splits;
+        args[28] = if single { self.qp } else { self.splits };
+        // The pinned kernel writes normalized FP32 at one split when out_16_nosplit stays zero.
         be.launch_3d(
             self.attention,
-            [1, route.rows, 2],
+            [1, route.rows, splits as u32],
             256,
             bytemuck::cast_slice(&args),
         )?;
+        if single {
+            return Ok(());
+        }
         let reduce = ReduceArgs {
             out: addr(t[0]),
             ml: addr(t[1]),

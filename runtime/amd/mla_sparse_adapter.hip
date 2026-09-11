@@ -57,6 +57,20 @@ extern "C" __global__ void plow_mla_sparse_pack_fp8(SparsePackFp8Args a) {
     sparse_pack<true>(a.base, a.scales);
 }
 
+struct SparsePackSingleArgs {
+    SparsePackFp8Args base;
+    float2* ml;
+};
+static_assert(sizeof(SparsePackSingleArgs) == 104);
+
+extern "C" __global__ void plow_mla_sparse_pack_fp8_single(SparsePackSingleArgs a) {
+    sparse_pack<true>(a.base.base, a.base.scales);
+    for (unsigned row = blockIdx.x * blockDim.x + threadIdx.x;
+         row < a.base.base.rows * 8u; row += blockDim.x * gridDim.x) {
+        a.ml[row] = make_float2(0.0f, 1.0f);
+    }
+}
+
 struct SparseReduceArgs {
     float *out, *ml;
     const float *part, *lse;
@@ -87,3 +101,6 @@ extern "C" __global__ void plow_mla_sparse_reduce(SparseReduceArgs a) {
 
 extern "C" __device__ unsigned plow_mla_sparse_adapter_abi_1 = 1;
 extern "C" __device__ unsigned plow_mla_sparse_adapter_fp8_abi_1 = 1;
+#if defined(PLOW_MLA_SPARSE_SINGLE_PASS)
+extern "C" __device__ unsigned plow_mla_sparse_single_abi_1 = 1;
+#endif
