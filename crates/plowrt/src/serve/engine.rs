@@ -139,16 +139,16 @@ pub trait SeqEngine {
     fn token_batch_prefill_fits(&self, _slot: usize, _prefill_capacity: u32) -> bool {
         false
     }
-    /// Run one token batch. `output` receives one id per leading row: the `feeds` in order,
-    /// then the members whose prompt completes in this step, in order. Returns how many of
-    /// those trailing ids belong to completed prompts.
+    /// Run one token batch. `output` receives `(slot, id)` per leading row — the `feeds` in
+    /// order, then the members whose prompt completes in this step — the same delivery shape
+    /// the CUDA route's `token_batch_step` produces, so one mux arm reads both.
     fn token_batch_step(
         &mut self,
         _rows: u32,
         _feeds: &[(usize, u32)],
         _members: &[(usize, &[u32], u32)],
-        _output: &mut Vec<u32>,
-    ) -> crate::Result<Vec<usize>> {
+        _output: &mut Vec<(u32, u32)>,
+    ) -> crate::Result<()> {
         Err(crate::RuntimeError::Rejected(
             "token batch unavailable".into(),
         ))
@@ -598,6 +598,10 @@ mod amd_serve {
         cached_prompt: Vec<Vec<u32>>,
         snap_at: Vec<u32>,
         cached_rows: Vec<u32>,
+        /// Per-slot generation, bumped on release. Carried on every token-batch request and
+        /// re-checked by the planner and the commit, so a slot recycled mid-step cannot be
+        /// handed another request's output — the guard the CUDA route already has.
+        slot_generation: Vec<u32>,
         /// CHUNKED PREFILL cursor per slot. `Some` means this slot is mid-prefill: the mux has
         /// run some of its chunks and will run one more per tick, letting every other slot decode
         /// in between. `PLOW_PF_NO_CHUNK=1` restores whole-prompt-per-tick.
@@ -942,6 +946,7 @@ mod amd_serve {
                 cached_prompt: vec![Vec::new(); batch],
                 snap_at: vec![0; batch],
                 cached_rows: vec![0; batch],
+                slot_generation: vec![0; batch],
                 pf: (0..batch).map(|_| None).collect(),
                 chunk_prefill: !crate::config::RuntimeConfig::get().pf_no_chunk,
                 prefill_chunk_rows: match crate::config::RuntimeConfig::get().pf_chunk {
@@ -1682,18 +1687,19 @@ mod amd_serve {
 
         /// One unified token-batch step.
         ///
-        /// Returns the slots whose prompt completed here, in the order their sampled ids
-        /// follow the decode feeds in `output`. Delivery is by logical request, never by row
+        /// `output` receives `(slot, id)` per sampled row: the decode feeds first, then the
+        /// members whose prompt completed here. Delivery is by logical request, never by row
         /// number: packed rows, physical slots and compact output rows are three different
-        /// numberings.
+        /// numberings. The requests are the backend-neutral `token_batch::Request` the CUDA
+        /// route plans from, carrying this slot's generation.
         pub fn token_batch_step(
             &mut self,
             rows: u32,
             feeds: &[(usize, u32)],
             members: &[(usize, &[u32], u32)],
-            output: &mut Vec<u32>,
-        ) -> Result<Vec<usize>> {
-            use plow_asset::mixed_step::{DecodeRequest, PrefillRequest};
+            output: &mut Vec<(u32, u32)>,
+        ) -> Result<()> {
+            use plow_asset::token_batch::{Phase, Request, Selection};
             if !self.chunk_prefill
                 || self.decode_only
                 || !matches!(self.ranks, Ranks::One(_))
@@ -1743,39 +1749,71 @@ mod amd_serve {
                     .as_ref()
                     .map_or(self.pos[slot], |cursor| cursor.frontier);
             }
-            let decode: Vec<_> = feeds
-                .iter()
-                .map(|&(slot, token)| DecodeRequest {
+            fn request<'a>(
+                generations: &[u32],
+                slot: usize,
+                phase: Phase,
+                tokens: &'a [u32],
+                prompt_len: u32,
+            ) -> Request<'a> {
+                Request {
+                    id: slot as u32,
                     slot: slot as u32,
                     state_slot: slot as u32,
-                    token,
-                })
-                .collect();
-            let prefill: Vec<_> = members
-                .iter()
-                .zip(&completed)
-                .map(|(&(slot, prompt, _), &(_, take))| {
-                    let start = self.pos_stage[slot];
-                    PrefillRequest {
-                        slot: slot as u32,
-                        state_slot: slot as u32,
-                        start,
-                        tokens: &prompt[start as usize..(start + take) as usize],
-                        prompt_len: prompt.len() as u32,
-                    }
-                })
-                .collect();
-            // Which members finish their prompt here, in span order. That is exactly the set
-            // whose hidden rows the step samples, and it is decided from the plan the device
-            // will see, not from a phase tag.
-            let finishing: Vec<usize> = prefill
-                .iter()
-                .filter(|r| r.start + r.tokens.len() as u32 == r.prompt_len)
-                .map(|r| r.slot as usize)
-                .collect();
-            let leading = feeds.len() + finishing.len();
-            let live: u32 = completed.iter().map(|&(_, take)| take).sum::<u32>()
-                + feeds.len() as u32;
+                    generation: generations[slot],
+                    phase,
+                    tokens,
+                    prompt_len,
+                    selection: Selection::default(),
+                }
+            }
+            // Which members finish their prompt here. That is exactly the set whose hidden
+            // rows the step samples, and it is decided from the plan the device will see.
+            fn finishes(
+                members: &[(usize, &[u32], u32)],
+                completed: &[(usize, u32)],
+                pos_stage: &[u32],
+                slot: usize,
+            ) -> bool {
+                members
+                    .iter()
+                    .zip(completed)
+                    .any(|(&(m, prompt, _), &(_, take))| {
+                        m == slot && pos_stage[slot] + take == prompt.len() as u32
+                    })
+            }
+            let requests: Vec<Request<'_>> =
+                feeds
+                    .iter()
+                    .map(|(slot, token)| {
+                        request(
+                            &self.slot_generation,
+                            *slot,
+                            Phase::Decode,
+                            std::slice::from_ref(token),
+                            self.pos_stage[*slot],
+                        )
+                    })
+                    .chain(members.iter().zip(&completed).map(
+                        |(&(slot, prompt, _), &(_, take))| {
+                            let start = self.pos_stage[slot] as usize;
+                            request(
+                                &self.slot_generation,
+                                slot,
+                                Phase::Prefill,
+                                &prompt[start..start + take as usize],
+                                prompt.len() as u32,
+                            )
+                        },
+                    ))
+                    .collect();
+            let leading = feeds.len()
+                + completed
+                    .iter()
+                    .filter(|&&(slot, _)| finishes(members, &completed, &self.pos_stage, slot))
+                    .count();
+            let live: u32 =
+                completed.iter().map(|&(_, take)| take).sum::<u32>() + feeds.len() as u32;
             if leading == 0 || live > rows {
                 return Err(RuntimeError::Rejected(format!(
                     "token batch admits {live} rows and {leading} sampled rows against a \
@@ -1783,16 +1821,21 @@ mod amd_serve {
                 )));
             }
             output.clear();
-            output.resize(leading, 0);
             let Ranks::One(e) = &mut self.ranks else {
                 unreachable!()
             };
-            e.token_batch_step(rows, &decode, &prefill, &mut self.pos_stage, output)?;
+            e.token_batch_requests_step(
+                rows,
+                &requests,
+                &self.slot_generation,
+                &mut self.pos_stage,
+                output,
+            )?;
             for &(slot, _) in feeds {
                 self.pos[slot] = self.pos_stage[slot];
             }
-            for (slot, take) in completed {
-                if finishing.contains(&slot) {
+            for &(slot, take) in &completed {
+                if finishes(members, &completed, &self.pos_stage, slot) {
                     // The prompt is consumed and its first generated token is in `output`.
                     // Retire the cursor and make the slot live, exactly as the terminal-prefill
                     // path did — except that no second transformer pass produced the token.
@@ -1813,7 +1856,7 @@ mod amd_serve {
                     );
                 }
             }
-            Ok(finishing)
+            Ok(())
         }
 
         /// Rows completed by a request whose chunked prefill is still active.
@@ -2243,6 +2286,7 @@ mod amd_serve {
                     retired_prefix_position(self.pos[slot], self.pf[slot].as_ref(), self.max_ctx)
                 } else { 0 };
                 self.next_id[slot] = 0;
+                self.slot_generation[slot] = self.slot_generation[slot].wrapping_add(1);
                 // Drop any half-finished prefill: the client is gone, and a stale cursor would
                 // resume someone else's prompt into this slot.
                 self.pf[slot] = None;
@@ -2539,11 +2583,11 @@ mod amd_serve {
                 }
                 assert_eq!(e.cached_rows(0), if repeat == 0 { 0 } else { 992 });
                 let rows = e.token_batch_rows(2, 32).unwrap();
-                let mut out = Vec::new();
-                assert_eq!(e.token_batch_step(rows, &[(1, token)], &[(0, &prompt, 32)], &mut out)
-                    .unwrap(), [0]);
-                token = out[0];
-                let actual = (out[1], logits(&e));
+                let mut out: Vec<(u32, u32)> = Vec::new();
+                e.token_batch_step(rows, &[(1, token)], &[(0, &prompt, 32)], &mut out).unwrap();
+                assert_eq!(out.iter().map(|o| o.0).collect::<Vec<_>>(), [1, 0]);
+                token = out[0].1;
+                let actual = (out[1].1, logits(&e));
                 if let Some(expected) = &expected { assert_eq!(&actual, expected); }
                 else { expected = Some(actual); }
                 e.release(0);
@@ -3000,8 +3044,8 @@ impl SeqEngine for AmdServe {
         rows: u32,
         feeds: &[(usize, u32)],
         members: &[(usize, &[u32], u32)],
-        output: &mut Vec<u32>,
-    ) -> crate::Result<Vec<usize>> {
+        output: &mut Vec<(u32, u32)>,
+    ) -> crate::Result<()> {
         AmdServe::token_batch_step(self, rows, feeds, members, output)
     }
     fn step_batch(&mut self, feeds: &[(usize, u32)]) -> crate::Result<Vec<(usize, u32)>> {

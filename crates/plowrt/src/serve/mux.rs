@@ -2346,7 +2346,10 @@ fn run_one_tick(
                 }
                 let mut fell_through = false;
                 if let Some((rows, pack)) = chosen {
-                    let mut tokens = std::mem::take(&mut obs.host.slot_tokens);
+                    // `(slot, id)` pairs — the delivery shape both backends' token-batch
+                    // routes share; the buffer round-trips through `obs.host` so the hot
+                    // path allocates nothing.
+                    let mut tokens = std::mem::take(&mut obs.host.token_batch_tokens);
                     let started = Instant::now();
                     let mut finished: Vec<usize> = Vec::new();
                     let mut result = {
@@ -2365,10 +2368,17 @@ fn run_one_tick(
                             })
                             .collect();
                         e.token_batch_step(rows, &feeds, &members, &mut tokens)
-                            .map(|done| finished = done)
                     };
                     crate::obs::ttft::PREFILL.add(started.elapsed().as_nanos() as u64);
                     if result.is_ok() {
+                        // Sampled ids that are not decode feeds belong to prompts that
+                        // completed in this step.
+                        finished.extend(
+                            tokens
+                                .iter()
+                                .map(|&(slot, _)| slot as usize)
+                                .filter(|slot| !feeds.iter().any(|&(f, _)| f == *slot)),
+                        );
                         // Members that did NOT finish keep a cursor; the ones that did have
                         // consumed their whole prompt.
                         let pending: Vec<usize> = pack
@@ -2404,18 +2414,12 @@ fn run_one_tick(
                                 fires = true,
                                 "AMD token batch"
                             );
-                            // Delivery is by LOGICAL REQUEST, in sample order: the decode
-                            // feeds first, then the prompts that completed here.
-                            let owners: Vec<usize> = feeds
-                                .iter()
-                                .map(|&(slot, _)| slot)
-                                .chain(finished.iter().copied())
-                                .collect();
-                            for (index, &slot) in owners.iter().enumerate() {
-                                if index >= finished.len() + feeds.len() {
-                                    break;
-                                }
-                                if index >= feeds.len() {
+                            // Delivery is by LOGICAL REQUEST: each pair names the slot it
+                            // belongs to, in sample order — the decode feeds first, then the
+                            // prompts that completed here.
+                            for &(id, token) in tokens.iter() {
+                                let slot = id as usize;
+                                if finished.contains(&slot) {
                                     if let Some(s) = slots[slot].as_mut() {
                                         if s.step == 0 {
                                             s.pf_pos = s.prompt_ids.len();
@@ -2427,7 +2431,7 @@ fn run_one_tick(
                                     &mut slots[slot],
                                     &arena,
                                     bundle,
-                                    tokens[index],
+                                    token,
                                     1,
                                     &mut tokens_this_tick,
                                     Some(stop.as_slice()),
@@ -2464,7 +2468,7 @@ fn run_one_tick(
                             }
                         }
                     }
-                    obs.host.slot_tokens = tokens;
+                    obs.host.token_batch_tokens = tokens;
                     if !fell_through {
                         return (slots, bufs, obs, tokens_this_tick, true, tick_fault, None);
                     }

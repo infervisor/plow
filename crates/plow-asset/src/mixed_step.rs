@@ -493,6 +493,129 @@ fn plan_into_inner(
     Ok(())
 }
 
+/// Plan a unified token batch from the backend-neutral request contract.
+///
+/// [`crate::token_batch::Request`] is what the CUDA route plans from. Taking it here too means
+/// both backends admit ONE request shape, apply the same slot-generation and selection checks,
+/// and deliver by logical request id — while the row layout stays the one this planner has
+/// always produced ([`SpanCover::PrefixFree`]). The AMD object samples the leading band and the
+/// CUDA terminal gathers arbitrary rows through a table; that is a device contract each object
+/// carries, not a host choice, so the two layouts are not unified here.
+///
+/// `owners` receives the logical request id of every leading (sampled) row in plan order — the
+/// decode requests, then the prompts that complete in this step, each in request order. It is
+/// derived independently of the planner and then cross-checked against the plan's
+/// `decode_slots`, so the two statements of that order cannot drift apart silently.
+///
+/// The two partition vectors are the per-step allocations the AMD serving layer made itself
+/// before this existed; they are not new cost, and `plan_into_cover` remains allocation-free.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_requests_into(
+    requests: &[crate::token_batch::Request<'_>],
+    frontiers: &[u32],
+    generations: &[u32],
+    rows: u32,
+    max_ctx: u32,
+    auxiliary_program: u32,
+    out: &mut Plan,
+    owners: &mut Vec<u32>,
+) -> Result<()> {
+    use crate::token_batch::Phase;
+    // A refusal before the planner runs must not leave the previous plan looking stageable.
+    out.clear();
+    owners.clear();
+    require(
+        frontiers.len() == generations.len(),
+        "frontier and generation tables disagree on slot capacity",
+    )?;
+    let mut decode = Vec::with_capacity(requests.len());
+    let mut prefill = Vec::with_capacity(requests.len());
+    for (index, request) in requests.iter().enumerate() {
+        request.selection.validate()?;
+        let slot = request.slot as usize;
+        require(slot < frontiers.len(), "physical slot outside capacity")?;
+        require(
+            generations[slot] == request.generation,
+            "slot generation does not match the admitted request",
+        )?;
+        require(
+            !requests[..index].iter().any(|prior| prior.id == request.id),
+            "duplicate request id",
+        )?;
+        let start = frontiers[slot];
+        match request.phase {
+            Phase::Decode => {
+                require(
+                    request.tokens.len() == 1
+                        && start >= request.prompt_len
+                        && request.prompt_len > 0,
+                    "decode span must be one token at or past the prompt end",
+                )?;
+                decode.push(DecodeRequest {
+                    slot: request.slot,
+                    state_slot: request.state_slot,
+                    token: request.tokens[0],
+                });
+            }
+            Phase::Prefill => {
+                let n_rows = u32::try_from(request.tokens.len())
+                    .map_err(|_| "mixed step: prefill row count")?;
+                let end = start
+                    .checked_add(n_rows)
+                    .ok_or("mixed step: prefill extent overflow")?;
+                require(
+                    end <= request.prompt_len,
+                    "prefill span overruns the prompt",
+                )?;
+                prefill.push(PrefillRequest {
+                    slot: request.slot,
+                    state_slot: request.state_slot,
+                    start,
+                    tokens: request.tokens,
+                    prompt_len: request.prompt_len,
+                });
+            }
+        }
+    }
+    plan_into_cover(
+        &decode,
+        &prefill,
+        frontiers,
+        rows,
+        max_ctx,
+        auxiliary_program,
+        SpanCover::PrefixFree,
+        out,
+    )?;
+    owners.extend(
+        requests
+            .iter()
+            .filter(|r| r.phase == Phase::Decode)
+            .map(|r| r.id),
+    );
+    owners.extend(
+        requests
+            .iter()
+            .filter(|r| {
+                r.phase == Phase::Prefill
+                    && frontiers[r.slot as usize] + r.tokens.len() as u32 == r.prompt_len
+            })
+            .map(|r| r.id),
+    );
+    let consistent = owners.len() == out.decode_rows as usize
+        && owners.iter().zip(&out.decode_slots).all(|(id, &slot)| {
+            requests
+                .iter()
+                .any(|r| r.id == *id && i32::try_from(r.slot) == Ok(slot))
+        });
+    if !consistent {
+        out.clear();
+        owners.clear();
+        return Err("mixed step: leading-row owners disagree with the plan".into());
+    }
+    Ok(())
+}
+
 /// Allocate an owned reference plan and delegate to [`plan_into`].
 pub fn plan(
     decode: &[DecodeRequest],

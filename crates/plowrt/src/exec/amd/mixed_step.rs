@@ -539,7 +539,13 @@ impl AmdEngine {
         frontiers: &mut [u32],
         output: &mut [u32],
     ) -> Result<()> {
-        self.packed_step(StepRoute::Mixed, rows, decode, prefill, frontiers, output)
+        self.packed_step(
+            StepRoute::Mixed,
+            rows,
+            StepInput::Pair { decode, prefill },
+            frontiers,
+            StepOutput::Positional(output),
+        )
     }
 
     /// One unified token-batch step. `output` receives one sampled id per LEADING row, in
@@ -555,10 +561,34 @@ impl AmdEngine {
         self.packed_step(
             StepRoute::TokenBatch,
             rows,
-            decode,
-            prefill,
+            StepInput::Pair { decode, prefill },
             frontiers,
-            output,
+            StepOutput::Positional(output),
+        )
+    }
+
+    /// One unified token-batch step from the shared request contract
+    /// (`plow_asset::token_batch::Request`, the CUDA route's input): same bucket, same device
+    /// layout and same dispatch as [`Self::token_batch_step`], but slot generations are
+    /// checked and `output` receives `(request id, token)` per leading row — the CUDA route's
+    /// delivery shape — so one serving arm can drive both backends.
+    pub fn token_batch_requests_step(
+        &mut self,
+        rows: u32,
+        requests: &[plow_asset::token_batch::Request<'_>],
+        generations: &[u32],
+        frontiers: &mut [u32],
+        output: &mut Vec<(u32, u32)>,
+    ) -> Result<()> {
+        self.packed_step(
+            StepRoute::TokenBatch,
+            rows,
+            StepInput::Requests {
+                requests,
+                generations,
+            },
+            frontiers,
+            StepOutput::Requests(output),
         )
     }
 
@@ -566,37 +596,25 @@ impl AmdEngine {
         &mut self,
         route: StepRoute,
         rows: u32,
-        decode: &[DecodeRequest],
-        prefill: &[PrefillRequest<'_>],
+        input: StepInput<'_, '_>,
         frontiers: &mut [u32],
-        output: &mut [u32],
+        output: StepOutput<'_>,
     ) -> Result<()> {
         let token_batch = route == StepRoute::TokenBatch;
         // Sampled rows: decode requests, plus the terminal row of every prompt this step
         // completes. On the mixed route the second group does not exist — its terminal tokens
         // are replayed through a separate decode-shaped pass instead.
-        let leading = decode.len()
-            + if token_batch {
-                prefill
-                    .iter()
-                    .filter(|r| {
-                        !r.tokens.is_empty()
-                            && r.start.saturating_add(r.tokens.len() as u32) == r.prompt_len
-                    })
-                    .count()
-            } else {
-                0
-            };
+        let leading = input.leading(token_batch, frontiers);
         let mut mixed = self.step_slot(route).take().ok_or_else(|| {
             RuntimeError::Rejected(format!("packet has no AMD {} program", route.label()))
         })?;
         let result = (|| -> Result<()> {
             if self.packed_prefill.is_some()
                 || leading == 0
-                || (!token_batch && (decode.is_empty() || prefill.is_empty()))
+                || (!token_batch && !input.has_both())
                 || frontiers.len() != self.batch
-                || output.len() != leading
-                || decode.len().saturating_add(prefill.len()) > self.batch
+                || !output.fits(leading)
+                || input.len() > self.batch
             {
                 return Err(RuntimeError::Rejected(format!(
                     "{} AMD request state mismatch",
@@ -613,9 +631,8 @@ impl AmdEngine {
                         route.label()
                     ))
                 })?;
-            let plan = mixed
-                .staging
-                .stage_cover(
+            let plan = match input {
+                StepInput::Pair { decode, prefill } => mixed.staging.stage_cover(
                     decode,
                     prefill,
                     frontiers,
@@ -623,8 +640,20 @@ impl AmdEngine {
                     self.max_ctx as u32,
                     program.program_index,
                     route.cover(),
-                )
-                .map_err(|e| RuntimeError::Rejected(e.to_string()))?;
+                ),
+                StepInput::Requests {
+                    requests,
+                    generations,
+                } => mixed.staging.stage_requests(
+                    requests,
+                    frontiers,
+                    generations,
+                    rows,
+                    self.max_ctx as u32,
+                    program.program_index,
+                ),
+            }
+            .map_err(|e| RuntimeError::Rejected(e.to_string()))?;
             if plan.decode_rows as usize != leading || plan.prefill_spans.len() > mixed.layout.spans
             {
                 return Err(RuntimeError::Rejected(format!(
@@ -725,17 +754,22 @@ impl AmdEngine {
                     route.label()
                 )));
             }
-            mixed
-                .staging
-                .finish_after_device_success(frontiers, tokens, output)
-                .map_err(|e| RuntimeError::Device(e.to_string()))?;
+            match output {
+                StepOutput::Positional(output) => mixed
+                    .staging
+                    .finish_after_device_success(frontiers, tokens, output),
+                StepOutput::Requests(output) => mixed
+                    .staging
+                    .finish_requests_after_device_success(frontiers, tokens, output),
+            }
+            .map_err(|e| RuntimeError::Device(e.to_string()))?;
             if token_batch && !mixed.fired {
                 tracing::info!(
                     route = "unified-token-batch/dense-gqa",
                     fires = true,
                     rows,
-                    decode = decode.len(),
-                    prefill = prefill.len(),
+                    decode = input.decode_len(),
+                    prefill = input.prefill_len(),
                     samples = leading,
                     "amd: first successful token-batch dispatch"
                 );
@@ -749,6 +783,82 @@ impl AmdEngine {
         }
         *self.step_slot(route) = Some(mixed);
         result
+    }
+}
+
+/// The two request shapes `packed_step` admits: the AMD pair, or the backend-neutral
+/// `token_batch::Request` contract shared with the CUDA route.
+pub(super) enum StepInput<'r, 'a> {
+    Pair {
+        decode: &'r [DecodeRequest],
+        prefill: &'r [PrefillRequest<'a>],
+    },
+    Requests {
+        requests: &'r [plow_asset::token_batch::Request<'a>],
+        generations: &'r [u32],
+    },
+}
+
+impl StepInput<'_, '_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Pair { decode, prefill } => decode.len().saturating_add(prefill.len()),
+            Self::Requests { requests, .. } => requests.len(),
+        }
+    }
+    fn decode_len(&self) -> usize {
+        match self {
+            Self::Pair { decode, .. } => decode.len(),
+            Self::Requests { requests, .. } => requests
+                .iter()
+                .filter(|r| r.phase == plow_asset::token_batch::Phase::Decode)
+                .count(),
+        }
+    }
+    fn prefill_len(&self) -> usize {
+        self.len() - self.decode_len()
+    }
+    fn has_both(&self) -> bool {
+        self.decode_len() > 0 && self.prefill_len() > 0
+    }
+    /// Sampled rows: decode requests plus, on the token-batch route, every prompt completing
+    /// in this step. A request's span starts at its slot's frontier on both shapes.
+    fn leading(&self, token_batch: bool, frontiers: &[u32]) -> usize {
+        let completing = match self {
+            Self::Pair { prefill, .. } => prefill
+                .iter()
+                .filter(|r| {
+                    !r.tokens.is_empty()
+                        && r.start.saturating_add(r.tokens.len() as u32) == r.prompt_len
+                })
+                .count(),
+            Self::Requests { requests, .. } => requests
+                .iter()
+                .filter(|r| {
+                    r.phase == plow_asset::token_batch::Phase::Prefill
+                        && !r.tokens.is_empty()
+                        && frontiers.get(r.slot as usize).is_some_and(|&f| {
+                            f.saturating_add(r.tokens.len() as u32) == r.prompt_len
+                        })
+                })
+                .count(),
+        };
+        self.decode_len() + if token_batch { completing } else { 0 }
+    }
+}
+
+/// Where the sampled ids go: the AMD positional slice, or `(request id, token)` pairs.
+pub(super) enum StepOutput<'o> {
+    Positional(&'o mut [u32]),
+    Requests(&'o mut Vec<(u32, u32)>),
+}
+
+impl StepOutput<'_> {
+    fn fits(&self, leading: usize) -> bool {
+        match self {
+            Self::Positional(output) => output.len() == leading,
+            Self::Requests(_) => true,
+        }
     }
 }
 

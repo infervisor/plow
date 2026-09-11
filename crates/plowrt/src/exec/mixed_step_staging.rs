@@ -44,6 +44,8 @@ pub enum StageError {
 pub struct MixedStepStaging {
     plan: Plan,
     pending: bool,
+    /// Logical request id per leading row, filled only by [`Self::stage_requests`].
+    owners: Vec<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,7 +66,69 @@ impl MixedStepStaging {
         Self {
             plan: Plan::with_capacity(row_capacity, prefill_capacity, active_capacity),
             pending: false,
+            owners: Vec::with_capacity(active_capacity),
         }
+    }
+
+    /// Stage a unified token batch from the shared request contract
+    /// ([`mixed_step::plan_requests_into`]); deliver it with
+    /// [`Self::finish_requests_after_device_success`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn stage_requests<'a>(
+        &'a mut self,
+        requests: &[token_batch::Request<'_>],
+        frontiers: &[u32],
+        generations: &[u32],
+        rows: u32,
+        max_ctx: u32,
+        auxiliary_program: u32,
+    ) -> Result<&'a Plan, StageError> {
+        if self.pending {
+            return Err(StageError::PendingPlan);
+        }
+        mixed_step::plan_requests_into(
+            requests,
+            frontiers,
+            generations,
+            rows,
+            max_ctx,
+            auxiliary_program,
+            &mut self.plan,
+            &mut self.owners,
+        )
+        .map_err(StageError::Plan)?;
+        self.pending = true;
+        Ok(&self.plan)
+    }
+
+    /// [`Self::finish_after_device_success`] delivering by LOGICAL REQUEST: one
+    /// `(request, id)` per leading row, in sample order — the same contract the CUDA route's
+    /// [`TokenBatchStaging::deliver`] uses, so a mux arm reads both backends' output alike.
+    pub fn finish_requests_after_device_success(
+        &mut self,
+        frontiers: &mut [u32],
+        device_tokens: &[u32],
+        out: &mut Vec<(u32, u32)>,
+    ) -> Result<(), StageError> {
+        if !self.pending {
+            return Err(StageError::NoPendingPlan);
+        }
+        let expected = self.plan.decode_rows as usize;
+        if device_tokens.len() != expected || self.owners.len() != expected {
+            return Err(StageError::OutputRows {
+                expected,
+                actual: device_tokens.len(),
+            });
+        }
+        self.commit_after_device_success(frontiers)?;
+        out.clear();
+        out.extend(
+            self.owners
+                .iter()
+                .zip(device_tokens)
+                .map(|(&owner, &id)| (owner, id)),
+        );
+        Ok(())
     }
 
     pub fn stage<'a>(
@@ -103,6 +167,9 @@ impl MixedStepStaging {
         if self.pending {
             return Err(StageError::PendingPlan);
         }
+        // A positional stage has no owners; a later `finish_requests_*` must refuse, not
+        // deliver against a stale table.
+        self.owners.clear();
         mixed_step::plan_into_cover(
             decode,
             prefill,

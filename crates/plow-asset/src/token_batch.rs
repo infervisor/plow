@@ -107,7 +107,7 @@ impl Default for Selection {
 }
 
 impl Selection {
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if self.greedy {
             return require(
                 self.temperature == 0.0,

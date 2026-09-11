@@ -855,6 +855,79 @@ fn prefix_free_spans_tile_the_batch_with_no_decode_prefix() {
     assert!(plan.commits.contains(&Commit { slot: 0, expect: 100, after: 101 }));
 }
 
+/// The shared request contract plans EXACTLY the plan the AMD request pair does — same rows,
+/// same spans, same commits — and names the owner of every leading row. This is the property
+/// that lets one mux arm feed both backends' token-batch routes.
+#[test]
+fn the_request_contract_plans_the_same_leading_band_layout() {
+    use crate::token_batch::{Phase, Request, Selection};
+    let c: Vec<u32> = (0..50).collect();
+    let d: Vec<u32> = (0..80).collect();
+    let frontiers = [100, 900, 70, 0];
+    let generations = [3, 1, 2, 9];
+    let req = |id: u32, slot: u32, phase: Phase, tokens: &'static [u32], prompt_len: u32| Request {
+        id,
+        slot,
+        state_slot: slot,
+        generation: generations[slot as usize],
+        phase,
+        tokens,
+        prompt_len,
+        selection: Selection::default(),
+    };
+    let eleven: &'static [u32] = &[11];
+    let twenty_two: &'static [u32] = &[22];
+    let c_static: &'static [u32] = Box::leak(c.clone().into_boxed_slice());
+    let d_static: &'static [u32] = Box::leak(d.clone().into_boxed_slice());
+    // Ids are deliberately not slot numbers, and the completing prompt is listed BEFORE a
+    // decode: the leading order is decode-then-completing regardless of request order.
+    let requests = [
+        req(40, 2, Phase::Prefill, c_static, 120),
+        req(10, 0, Phase::Decode, eleven, 90),
+        req(30, 3, Phase::Prefill, d_static, 400),
+        req(20, 1, Phase::Decode, twenty_two, 800),
+    ];
+    let mut plan = Plan::with_capacity(256, 6, 4);
+    plan.decode_slots = Vec::with_capacity(4);
+    plan.commits = Vec::with_capacity(4);
+    let mut owners = Vec::new();
+    plan_requests_into(&requests, &frontiers, &generations, 256, 4096, 7, &mut plan, &mut owners)
+        .unwrap();
+
+    let decode = [
+        DecodeRequest { slot: 0, state_slot: 0, token: 11 },
+        DecodeRequest { slot: 1, state_slot: 1, token: 22 },
+    ];
+    let prefill = [
+        PrefillRequest { slot: 2, state_slot: 2, start: 70, tokens: &c, prompt_len: 120 },
+        PrefillRequest { slot: 3, state_slot: 3, start: 0, tokens: &d, prompt_len: 400 },
+    ];
+    let reference = tb_plan(&decode, &prefill, &frontiers, 256, 4096).unwrap();
+    assert_eq!(plan, reference);
+    assert_eq!(owners, [10, 20, 40], "decodes in order, then the completing prompt");
+    assert_eq!(plan.decode_slots, [0, 1, 2]);
+
+    // The shared checks the AMD pair never had: slot generation, request identity, decode shape.
+    let mut stale = generations;
+    stale[0] += 1;
+    let err = plan_requests_into(&requests, &frontiers, &stale, 256, 4096, 7, &mut plan, &mut owners)
+        .unwrap_err();
+    assert!(err.contains("generation"), "{err}");
+    assert_eq!((plan.real_rows, owners.len()), (0, 0), "a refusal leaves no residue");
+
+    let mut dup = requests;
+    dup[3].id = 10;
+    let err = plan_requests_into(&dup, &frontiers, &generations, 256, 4096, 7, &mut plan, &mut owners)
+        .unwrap_err();
+    assert!(err.contains("duplicate request id"), "{err}");
+
+    let mut wide = requests;
+    wide[1].tokens = &[1, 2];
+    let err = plan_requests_into(&wide, &frontiers, &generations, 256, 4096, 7, &mut plan, &mut owners)
+        .unwrap_err();
+    assert!(err.contains("decode span"), "{err}");
+}
+
 /// A one-token prompt is one span with one selected row, and no empty body span — a zero-length
 /// entry would trap in `plow_tb_view`.
 #[test]
