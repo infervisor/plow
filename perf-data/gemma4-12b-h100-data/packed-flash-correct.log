@@ -1,2 +1,0 @@
-HD=256 KV=8 window=1024 checked=4608 worst_relL2=0.00267912 max_abs=0.00110828 PASS
-HD=512 KV=1 window=0 checked=9216 worst_relL2=0.00252794 max_abs=0.00117296 PASS

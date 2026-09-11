@@ -25,8 +25,6 @@ SOURCES = [
     'crates/plowrt/src/exec/amd_gemm_lt.rs',
     'crates/plowrt/src/exec/amd_sparse_mla.rs',
     'runtime/CMakeLists.txt', 'scripts/build_gfx942.sh',
-    'perf-data/gemma4-12b-h100-kernel-audit.md',
-    'perf-data/gemma4-12b-h100-data/packed-flash-bank-conflicts.log',
 ]
 
 

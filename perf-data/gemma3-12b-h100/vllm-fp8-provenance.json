@@ -1,9 +1,0 @@
-{
-  "requantized": false,
-  "projections": 336,
-  "precision": "E4M3 per-output-channel W8A16, BF16 KV/head",
-  "fp8_data_sha256": "c598cf4b151fc298b46feba1926d22a3425d17c4ea9988ccc1d1033693eea6ed",
-  "export": "/home/lava/plow/plans/gemma3-12b-roofline/fp8-twin/model.safetensors",
-  "source": "/home/lava/plow/plans/gemma3-12b-roofline/checkpoint",
-  "builder": "/home/lava/plow/plans/gemma3-12b-roofline/export_vllm_fp8.py"
-}

@@ -1,8 +1,0 @@
-2026-09-10T20:56:38.938611Z  INFO plowrt::exec::gpu: seg-class wall time (chunk) gemm_ms="132.5" fat_ms="37.5" fa_ms="47.8" n_gemm=193 n_fat=194 n_fa=48
-2026-09-10T20:56:38.939773Z  INFO plowrt::exec::gpu: slowest segments top="seg372(c2)=1.84ms seg426(c2)=1.79ms seg156(c2)=1.79ms seg210(c2)=1.79ms seg102(c2)=1.73ms seg48(c2)=1.69ms seg318(c2)=1.69ms seg264(c2)=1.67ms seg204(c8)=1.58ms seg87(c8)=1.54ms"
-2026-09-10T20:56:39.188680Z  INFO plowrt::exec::gpu: seg-class wall time (chunk) gemm_ms="133.0" fat_ms="36.4" fa_ms="75.9" n_gemm=193 n_fat=194 n_fa=48
-2026-09-10T20:56:39.189810Z  INFO plowrt::exec::gpu: slowest segments top="seg48(c2)=4.79ms seg318(c2)=4.79ms seg426(c2)=4.78ms seg156(c2)=4.73ms seg264(c2)=4.73ms seg102(c2)=4.70ms seg372(c2)=4.69ms seg210(c2)=4.65ms seg240(c8)=1.54ms seg87(c8)=1.52ms"
-2026-09-10T20:56:39.460287Z  INFO plowrt::exec::gpu: seg-class wall time (chunk) gemm_ms="132.6" fat_ms="36.3" fa_ms="98.3" n_gemm=193 n_fat=194 n_fa=48
-2026-09-10T20:56:39.461411Z  INFO plowrt::exec::gpu: slowest segments top="seg210(c2)=7.63ms seg372(c2)=7.59ms seg156(c2)=7.58ms seg318(c2)=7.58ms seg102(c2)=7.58ms seg264(c2)=7.57ms seg48(c2)=7.57ms seg426(c2)=7.53ms seg195(c8)=1.53ms seg348(c8)=1.51ms"
-2026-09-10T20:56:39.753343Z  INFO plowrt::exec::gpu: seg-class wall time (chunk) gemm_ms="132.4" fat_ms="36.1" fa_ms="120.2" n_gemm=193 n_fat=194 n_fa=48
-2026-09-10T20:56:39.754470Z  INFO plowrt::exec::gpu: slowest segments top="seg102(c2)=10.49ms seg426(c2)=10.47ms seg156(c2)=10.42ms seg210(c2)=10.41ms seg48(c2)=10.33ms seg372(c2)=10.32ms seg264(c2)=10.30ms seg318(c2)=10.30ms seg60(c8)=1.55ms seg87(c8)=1.52ms"

@@ -1,8 +1,0 @@
-HD=512 BKV=32 smem=201728
-HD=512 BKV=64 smem=205824
-HD=512 BKV=32 smem=201728
-HD=512 BKV=64 smem=205824
-mode=body HD=512 BKV=32 KV=1 window=0 maps=0 checked=4608 worst_relL2=0.00234859 max_abs=5.44855e-05 warm_us=2813.821 PASS
-mode=body HD=512 BKV=64 KV=1 window=0 maps=0 checked=4608 worst_relL2=0.00233771 max_abs=5.44855e-05 warm_us=2480.410 PASS
-mode=body HD=512 BKV=32 KV=1 window=0 maps=1 checked=4608 worst_relL2=0.00234859 max_abs=5.44855e-05 warm_us=2487.824 PASS
-mode=body HD=512 BKV=64 KV=1 window=0 maps=1 checked=4608 worst_relL2=0.00233771 max_abs=5.44855e-05 warm_us=2403.402 PASS

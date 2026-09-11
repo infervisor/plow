@@ -1,8 +1,0 @@
-interp_sm90a PASS
-interp_sm90a_pf PASS
-interp_sm90a_pfseg PASS
-interp_sm90a_pfgemm PASS
-interp_sm90a_pffa PASS
-interp_sm90a_pfpackedseg_fp8kv PASS
-interp_sm90a_pfpackedgemm_fp8kv PASS
-interp_sm90a_pfpackedfa_fp8kv PASS

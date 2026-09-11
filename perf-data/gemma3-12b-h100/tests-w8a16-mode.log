@@ -1,8 +1,0 @@
-   Compiling packet v0.1.0 (/home/lava/plow/crates/packet)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.37s
-     Running unittests src/lib.rs (target/debug/deps/packet-53ab2cd255831620)
-
-running 1 test
-test dev::w8a16_tests::mapless_w8a16_requires_bf16_activation_and_channel_scale ... ok
-
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 122 filtered out; finished in 0.00s

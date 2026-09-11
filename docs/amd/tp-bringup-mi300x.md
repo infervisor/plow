@@ -2410,7 +2410,9 @@ dispatch queues later work without a host barrier per segment, so the serving
 route needs device rendezvous and audited scratch reuse. Section 18 records
 that integration and its separate quality and serving checks.
 
-See [reproduction and raw records](../../runtime/bench/amd/dsa_pf_tp/README.md).
+The retained reproduction sources are
+[`captured.py`](../../runtime/bench/amd/dsa_pf_tp/captured.py) and
+[`kernels.hip`](../../runtime/bench/amd/dsa_pf_tp/kernels.hip).
 
 ## 18. Native TP8 prefill indexer (2026-09-10)
 
@@ -2450,11 +2452,8 @@ with identical per-request lengths totaling 1,414,538 input and 13,795 output
 tokens. Native ran first; this is one screen per arm, not the H200 100-request
 benchmark. No speculative decoding was added; H200 parity remains unmet.
 
-See [native reproduction](../../runtime/bench/amd/dsa_pf_tp/README.md#native-hsa-serving),
-[full protocol records](../../runtime/bench/amd/dsa_pf_tp/mi300x-protocol-full.json)
-and [tail protocol records](../../runtime/bench/amd/dsa_pf_tp/mi300x-protocol-tail.json).
-The [serving record](../../runtime/bench/amd/dsa_pf_tp/mi300x-serving.json)
-contains metrics, quality cells and artifact hashes.
+The benchmark sources remain under `runtime/bench/amd/dsa_pf_tp`; raw protocol
+and serving records were removed from the repository.
 
 ## 19. hipBLASLt projection assembly qualification (2026-09-10)
 

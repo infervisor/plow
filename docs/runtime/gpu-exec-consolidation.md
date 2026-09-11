@@ -46,8 +46,8 @@ their adapters: these have different completion and memory-lifetime rules.
 - H100 GPU tests were not executed on this MI300X host; mock/compile tests are
   not hardware qualification.
 
-The GLM parallel-selection experiment is retained as
-[benchmark and rejected integration evidence](../../runtime/bench/amd/dsa_select_parallel/README.md).
+The GLM parallel-selection benchmark source remains in
+[`bench.hip`](../../runtime/bench/amd/dsa_select_parallel/bench.hip).
 Its standalone result does not establish a serving gain; its production path
 was removed after both global-queue and static serving stalled. The previous
 GLM serving screen remains 33.40 output tokens/s versus the supplied H200

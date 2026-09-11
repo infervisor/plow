@@ -1,7 +1,0 @@
-PASS concurrent ragged prompts, exact output limits, slot reuse
-Traceback (most recent call last):
-  File "/home/lava/plow/plans/gemma4-12b-roofline/verify_w8a8_diagnostic.py", line 96, in <module>
-    main()
-  File "/home/lava/plow/plans/gemma4-12b-roofline/verify_w8a8_diagnostic.py", line 81, in main
-    assert actual == expected, ("cancellation changed surviving requests", during_decode, expected, actual)
-AssertionError: ('cancellation changed surviving requests', True, ['1', '.\n', '1111111', '11111111111111111'], ['1', '.\n.', '1111111', '11111111111111111'])

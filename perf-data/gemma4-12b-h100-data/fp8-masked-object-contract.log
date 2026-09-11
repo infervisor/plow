@@ -1,7 +1,0 @@
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.09s
-     Running unittests src/lib.rs (target/debug/deps/plow_asset-f803e31e805d29ee)
-
-running 1 test
-test packed_prefill::tests::fp8_masked_object_advertises_fixed_writer ... ok
-
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 98 filtered out; finished in 0.00s

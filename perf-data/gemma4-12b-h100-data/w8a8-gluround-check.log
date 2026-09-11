@@ -1,7 +1,0 @@
-promoted-gluround: server PID 228582
-Traceback (most recent call last):
-  File "/home/lava/plow/plans/gemma4-12b-roofline/check_w8a8_gluround.py", line 28, in <module>
-    subprocess.run(["python3", "plans/gemma4-12b-roofline/verify_w8a8_diagnostic.py", "--control",
-  File "/usr/lib/python3.10/subprocess.py", line 526, in run
-    raise CalledProcessError(retcode, process.args,
-subprocess.CalledProcessError: Command '['python3', 'plans/gemma4-12b-roofline/verify_w8a8_diagnostic.py', '--control', 'http://127.0.0.1:8013', '--candidate', 'http://127.0.0.1:8013', '--model', 'checkpoint-fp8', '--max-ctx', '20480']' returned non-zero exit status 1.

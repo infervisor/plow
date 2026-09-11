@@ -1,8 +1,0 @@
-rows=128 ctx=1024 window=0 sampled_vectors=9 rel_l2=0.0025879055 max_abs=0.00017816155
-rows=128 ctx=1024 window=1024 sampled_vectors=9 rel_l2=0.0025879055 max_abs=0.00017816155
-rows=128 ctx=16384 window=0 sampled_vectors=9 rel_l2=0.0026612569 max_abs=4.7350131e-05
-rows=128 ctx=16384 window=1024 sampled_vectors=9 rel_l2=0.0026097889 max_abs=0.00018191452
-rows=1024 ctx=1024 window=0 sampled_vectors=9 rel_l2=0.00044675271 max_abs=0.00095410275
-rows=1024 ctx=1024 window=1024 sampled_vectors=9 rel_l2=0.00044675271 max_abs=0.00095410275
-rows=1024 ctx=16384 window=0 sampled_vectors=9 rel_l2=0.0026347573 max_abs=3.8149722e-05
-rows=1024 ctx=16384 window=1024 sampled_vectors=9 rel_l2=0.0027131065 max_abs=0.00019068605
