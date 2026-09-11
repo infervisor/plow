@@ -1291,17 +1291,25 @@ impl VmmKv {
         let tail = &tokens[n_pub * s.block_rows as usize..rows as usize];
         inner.snapshot_tick += 1;
         let tick = inner.snapshot_tick;
-        if let Some(snap) = inner.published.get_mut(&bkey).and_then(|list| {
-            list.iter_mut()
-                .find(|snap| snap.rows == rows && snap.tail == tail)
-        }) {
+        let same_snap = |snap: &Snap| snap.rows == rows && snap.tail == tail;
+        if let Some(snap) = inner
+            .published
+            .get_mut(&bkey)
+            .and_then(|list| list.iter_mut().find(|snap| same_snap(snap)))
+        {
             snap.last_used = tick;
             snap.reusable_prompt |= reusable_prompt;
         } else {
+            // The device copy and its stream_synchronize run WITHOUT the pool lock:
+            // holding `inner` across them stalls every other slot's attach and
+            // `ensure_rows` for the whole snapshot copy. The lock is retaken only
+            // to evict on OOM and to register the finished snapshot.
+            drop(inner);
             let va = loop {
                 match s.ops.alloc(snap_bytes) {
                     Ok(va) => break va,
                     Err(error) if matches!(&error, RuntimeError::Oom(_)) => {
+                        let mut inner = s.inner.lock();
                         if !evict_one(s, &mut inner, false) {
                             return Err(error);
                         }
@@ -1312,6 +1320,18 @@ impl VmmKv {
             if let Err(e) = fill(va) {
                 s.ops.free(va);
                 return Err(e);
+            }
+            inner = s.inner.lock();
+            // Another publish of the same boundary may have landed while the lock
+            // was released; keep the first, free ours.
+            if inner
+                .published
+                .get(&bkey)
+                .is_some_and(|list| list.iter().any(|snap| same_snap(snap)))
+            {
+                s.ops.free(va);
+                trim_cache(s, &mut inner);
+                return Ok(());
             }
             inner.published.entry(bkey).or_default().push(Snap {
                 va,

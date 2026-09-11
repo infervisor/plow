@@ -69,3 +69,5 @@ sglang-pkgs/
 
 # Sibling checkouts used for cross-branch comparison
 .worktrees/
+/runtime/bench/amd/moe_aiter/mi300x-resident-trace.json
+/runtime/bench/amd/moe_aiter/mi300x-resident-prefill.json

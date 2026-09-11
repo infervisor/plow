@@ -113,8 +113,36 @@ Enabler: `EngineDevice` is implemented only by `HsaBackend`; `CudaBackend` lacks
 
 ## 6. Fix plan
 
-### Phase 0 — done (f6a06e69)
-devgen env reads → EmitConfig; kernelcaps classifier test; `/tokenize` test; `mux.rs` fmt.
+### Phase 0 — done (f6a06e69, b314a719, b1626c5c)
+devgen env reads → EmitConfig; kernelcaps classifier test; `/tokenize` test; `mux.rs` + 17 files
+fmt; `build.yml` parses again.
+
+### Fix pass 2026-09-11 — done on this branch (see the commit after b1626c5c)
+Decision: the three default flips (`token_batch`, `prefix_cache`, `vmm_cache_mib`) **stay on**.
+plans/unified-token-batch.md records default enablement as the production intent; the owed
+artefact is the isolated A/B (MI300X here, H100 when a host is available), not a revert.
+
+| Finding | Fix |
+|---|---|
+| CUDA batched DSA `IndexSelect` without row offset | emit refuses `rows>1 && dsa` unless `emit_is_amd()` (mla.rs) |
+| `PLOW_DECODE_TIERS` unset ⇒ auto vs kimi-k3 explicit lowrung | recipe sets `PLOW_DECODE_TIERS = ""`; `check_recipe.py` reports the collision (+ self-test); recipe doc re-rendered |
+| `publish_at` lock across alloc + D2D + sync | alloc/fill outside `inner`; re-lock, dedupe a racing publish, register (vmm.rs) |
+| Unified path leaves `decode_progress = None` | progress recorded from the feeds the token batch consumed (mux.rs) |
+| `expect()` in the unified request builder | `filter_map`: a vanished slot is skipped, re-fed next tick |
+| `debug_assert` on snapshot layout | release check: `begin_seq` rollback + `Rejected` (gpu/prefix.rs) |
+| Slab carve `.max(1)` mismatch CUDA vs AMD | shared `memory::slab_carve`; both loaders and both slab tests use it |
+| `dev_blob.h` missing `YARN_DS` | `PLOW_ROPE_SCALE_YARN_DS 3u` |
+| `/home/lava` fixtures | `PLOW_TEST_ABI144_DECODE_ELF`, `PLOW_TEST_K3_SNAPSHOTS`, `PLOW_TEST_GLM52_PREFILL_ELF` |
+| exec/{amd,gpu} tests never run in CI | self-hosted step `cargo test -p plowrt --features cuda,hsa --lib exec::` (327 pass / 30 ignored here) |
+| 4 sm90 `.cu` harnesses unregistered | CMake targets under `PLOW_CUDA`, guarded; all four compile with the flake's nvcc (`-gencode arch=compute_90a,code=sm_90a`) |
+| 2 raw traces (5.4 MB) | removed + gitignored; README cites them as local artefacts |
+| 12 dangling `perf-data` links | reworded (reports are kept out of source control per d5f320df) |
+| 27 undocumented knobs | rows added for the emit knobs, `PLOW_TOKEN_BATCH`, `PLOW_PREFIX_CACHE` (corrected), `PLOW_MLA_PF_AITER`, `PLOW_DECODE_TIERS`, `PLOW_MAX_REQUEST_CHUNK`, `PLOW_EMIT_DECODE_NATIVE_TC` |
+
+Deferred (needs a GPU host or is a Phase 3/4 item): the A/Bs; tunedb gfx942 re-campaign;
+`retire_slot` publish-on-disconnect policy (needs a per-tick disconnect record); the two `.hip`
+harnesses stay script-driven (see runtime/bench/amd/dsa_decode/README.md); Phase 4 reuse beyond
+the slab carve.
 
 ### Phase 1 — before merging to main
 1. **Default flips: measure or hold.** Preferred: A/B on both vendors with one variable each.

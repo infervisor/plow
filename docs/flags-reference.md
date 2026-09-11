@@ -245,6 +245,7 @@ the 2026-09-04 audit that removed the rejected experiment knobs are in
 | — | `--emit-decode-objects DIR` | unset | Bind packet-selected CUDA objects from `DIR` to every decode program, including a single-program B1 packet. Packet metadata selects them at load; there is no runtime route flag. |
 | — | `--emit-decode-projection-tuning` | false | Apply measured per-projection bindings. Requires decode objects, SM90a, TP1, and a supported dense emitter. |
 | `PLOW_MAX_CHUNK` | `--emit-max-chunk` | unset | Largest prefill chunk rows (power of two, ≤ 8192). Caps the bucket ladder and the runtime PLOW_PF_INTERLEAVE ceiling. |
+| `PLOW_MAX_REQUEST_CHUNK` | `--emit-max-request-chunk` | unset | Maximum real rows one request contributes to a packed prefill launch. |
 | `PLOW_GEMV_SPLIT` | `--gemv-split` | 1 | Emit S·n_cu decode slices for Gemv packets (finer work-stealing). |
 | `PLOW_GEMV_DECODE_ROLE` | `--gemv-decode-role` | false | Select the isolated BF16 M1 GEMV role with 512 threads. Requires plain BF16 SM90a and one B1 decode rung. |
 | `PLOW_DECODE_TILED` | `--decode-tiled` | false | AMD: emit prefill (tiled) opcodes into the decode bucket. |
@@ -382,6 +383,15 @@ the 2026-09-04 audit that removed the rejected experiment knobs are in
 | `PLOW_GLM_PF_NS` | `--glm-pf-ns` | unset | Causal KV-split factor for the V2 MLA prefill flash (2..=8; unset/1 = unsplit). |
 | `PLOW_GLM_DSA_PF_SPAN` | `--glm-dsa-pf-span` | 1 | Sparse-prefill selection reuse span: layers after an indexer layer that gather against its union (0 = indexer layers only, 3 = every GLM-5.3 layer). |
 | `PLOW_GLM_DSA_PF_DEXACT` | `--glm-dsa-pf-dexact` | unset | Reuse only at exactly this distance from an indexer layer (bisect aid; unset = 1..=span). |
+| `PLOW_GLM_MOE_AITER` | `--glm-moe-aiter` | false | Native gfx942 A8 MoE prefill with BF16 routed accumulation (AITER adapter). Opt-in: A8 activation quant is ~3.5–3.9% rel-L2 vs the DET FP64 path; +6.2% C20 on GLM-5.3 TP8. |
+| `PLOW_GLM_MOE_FLAT_DECODE` | `--glm-moe-flat-decode` | false | Flat A16 MoE for gfx942 TP8 decode rungs 2, 4 and 8. Serving qualification pending. |
+| `PLOW_GLM_MOE_RESIDENT` | `--glm-moe-resident` | false | Pack GLM expert weights once for native gfx942 TP8 prefill and decode. +13.4% C20 / −10.9% TPOT on GLM-5.3; same A8 numerics contract as `PLOW_GLM_MOE_AITER`. |
+| `PLOW_GLM_INDEX_TP` | `--glm-index-tp` | false | Partition large GLM prefill index queries across eight gfx942 ranks instead of replicating them. Exact top-k; +8.2% serving; keep the ≥2048-row gate (small chunks regress). |
+| `PLOW_GLM_SELECT_LOCAL` | `--glm-select-local` | false | One independent single-workgroup radix selection per GLM decode row instead of a serialized shared-histogram chain. Exact top-k; +10.6% C20, −19% median ITL. |
+| `PLOW_GLM_DECODE_NORM_ROWS` | `--glm-decode-norm-rows` | false | Give each batched GLM RMSNorm / AddNorm row its own workgroup. Bit-identical; +2.7%, P99 TPOT −11%. |
+| `PLOW_GLM_GEMM_LT` | `--glm-gemm-lt` | false | Qualified gfx942 hipBLASLt assembly for the large GLM prefill projections (3 shapes). Bit-exact vs capture; +2.1%. |
+| `PLOW_GLM_GEMM_LT_DECODE` | `--glm-gemm-lt-decode` | false | Native gfx942 hipBLASLt BF16 projections at decode rungs 16 and 20 (633 GEMMs). ≤0.17% rel-L2; +5.7% then +2.4% across two screens. |
+| `PLOW_GLM_FOLD_LT` | `--glm-fold-lt` | false | Native gfx942 FP32 MLA fold GEMMs during prefill. Measured +0.49% with P99 +3.6% — not a default candidate. |
 | `PLOW_GLM_PF_WIDE` | `--glm-pf-wide` | true | Widen prefill norm/residual dispatch across CUs. DEFAULT ON (`=0` restores the single-workgroup emit for A/B). Bit-identical either way. |
 | `PLOW_GLM_PLACE_PF` | `--glm-place-pf` | false | Per-XCD CU placement for the GLM prefill chain. |
 | `PLOW_GLM_XR_BAND` | `--glm-xr-band` | unset | Band count for a prefill TP seam (2..=8; unset/1 = the unbanded emit). |
@@ -592,6 +602,7 @@ symbol, CUDA 13.0, and are **per-arch — they do not transfer**.
 | `PLOW_MOE_PREFILL` | off | grouped MoE prefill ops (83–87). Also an emit gate: on for MoE bf16 by default, `=0` opts the bf16 MoE-prefill path out. |
 | `PLOW_MOE_PF_A4W4` | off | A4W4 grouped-expert GEMM body (ops 85/86, MXFP4 on both operands); set for K3 rows in CMake, required by the devgen manifest. |
 | `PLOW_K3_DECODE_GROUPED` | off | Build-only K3 override for a B1 object that must serve grouped ladder packets. Adds the A4W4 expert body and capability marker without changing `PLOW_DECODE_BATCH`; required by the K3 MI325X rung-1 recipe. |
+| `PLOW_DECODE_TIERS` (build_gfx942.sh) | unset = auto | Comma-separated narrow decode widths built as `lowrung<w>/` tier directories next to the wide object. UNSET builds every `w < PLOW_GEMV_MM` of 1/2/4/8 automatically; an explicit empty value builds none (required when a recipe drives its own `[[objects.lowrung]]`); plowrt discovers the tiers by layout. +24.9% tok/s at conc-1 on GLM-5.3 MI300X, neutral at C20. |
 | `PLOW_MOE_ROUTER_SELECT` | =`PLOW_K3` | `1` = k parallel block-max router passes (K3's 896-expert / top-16); `0` = single all-pairs rank pass. |
 | `PLOW_BUCKET_DECODE` / `PLOW_BUCKET_PREFILL` | decode=1 selects | which interp bucket the object serves (`PLOW_BUCKET_PREFILL` is derived as `!DECODE`); emitted into manifest `req` strings. |
 | `PLOW_BUCKET_FLASH` | off | compile the standalone 4-wave flash-decode object. |
@@ -669,10 +680,12 @@ data race; used only to price a protocol cost): `PLOW_GATE_HIER_CEIL`,
 
 Hopper Gemma CMake builds select `PLOW_NV_SEG_OCC1=1` for ordinary W8A8 GEMM
 segments and packed BF16-KV GEMM segments without W8A8. This removes the
-128-register cap. The packed BF16 H100 qualification is recorded in
-`perf-data/token-batch-main-h100-readiness.md`. Rebuild with
+128-register cap. The packed BF16 H100 qualification lives in the campaign's
+`perf-data` readiness report, which is kept out of source control. Rebuild with
 `PLOW_EXTRA_DEFINES="-DPLOW_NV_SEG_OCC1=0"` to restore that cap. This build
-default does not enable packed serving or the CUDA unified token-batch executor.
+default does not by itself enable packed serving; the CUDA unified token-batch
+executor is selected at runtime by `PLOW_TOKEN_BATCH` (default on) when the
+packet carries packed-prefill metadata.
 
 | flag | default | effect |
 |---|---|---|
@@ -812,7 +825,7 @@ bundle in the first place, in [CPU execution](runtime/cpu.md).
 | `--cpu-mxfp4-dir DIR` | `PLOW_MXFP4_DIR` | unset | MXFP4 weight twin (`mxfp4/<name>` + `_scale` E8M0 rows; `perf-data/tools/quantize_mxfp4.py`). |
 | `--fp8-dir DIR` | `PLOW_FP8_DIR` | unset | fp8 weight twin. Runtime-wide, but this is how a CPU bundle gets W8A16/W8A8 weights. |
 | `--cpu-global-queue=B` | `PLOW_CPU_GQ` | off | Global op-major work queue (windowed per segment and L2 domain, with stealing) instead of static per-cu streams. **~2x slower** on the EPYC 9654; kept for A/B. |
-| `--cpu-l2-place=B` | `PLOW_CPU_L2_PLACE` | off | Place executors by the packet's L2 locality domains instead of `cu % nodes`. **1.5x slower**, never faster ([report](../perf-data/cpu-numa-placement/epyc9654-avx512/README.md)). Inert without domains in the blob; a balance guard declines a losing plan even when on. |
+| `--cpu-l2-place=B` | `PLOW_CPU_L2_PLACE` | off | Place executors by the packet's L2 locality domains instead of `cu % nodes`. **1.5x slower**, never faster (placement report in the `perf-data/cpu-numa-placement` campaign, kept out of source control). Inert without domains in the blob; a balance guard declines a losing plan even when on. |
 
 The last two are off because they were *measured* worse, not because they are
 unfinished — neither changes what is computed, so both are safe to flip for an A/B
@@ -858,7 +871,9 @@ checkpoint location, because the weights a bundle needs are the same weights
 | `PLOW_VMM_BLOCK_MIB=M` | 2 | VMM sharing block size. 2 MiB ≈ 4096 tokens at hd256 bf16. Raise (e.g. 64) for 128k-dedup work. |
 | `PLOW_VMM_CACHE_MIB=M` | 4096 | Soft cap on retained VMM prefix blocks plus boundary snapshots; active pins and one recently reused snapshot can temporarily exceed it while radix leases are held. OOM reclamation can still evict that snapshot. `0` uses OOM-driven eviction only. Disable reuse with `PLOW_VMM_PREFIX=0`. |
 | `PLOW_VMM_KV=1` | off | **AMD** — VMM-backed KV on ROCr (`hsa_amd_vmem_*`); warns and falls back if the platform can't support it. |
-| `PLOW_PREFIX_CACHE=1` | off | enable the TP-only prefix cache. |
+| `PLOW_PREFIX_CACHE=0/1` | on | Prefix reuse on compatible AMD and NVIDIA assets: the VMM prefix pool on Hopper, slot-local prompt snapshots on AMD (single-GPU and TP). `0` disables both. Default-on since 3ca64e93; the isolated A/B against `0` on H100 and MI300X is still owed. |
+| `PLOW_TOKEN_BATCH=0/1` | on | Select the unified token-batch executor (decode and prefill rows in one packed launch) when the backend, model and object support it; unsupported configurations use ordinary execution and `--fusion` takes precedence. AMD TP falls back today. Default-on since 33a5b7bf; A/B against `0` pending. |
+| `PLOW_MLA_PF_AITER=0/1` | off | AMD: route isolated GLM sparse MLA prefill boundaries through the qualified gfx942 AITER assembly object (pinned SHA, 320-B ABI). −6.6% prefill time at 70k; 18/18 retrieval cases. |
 | `PLOW_NV_SCHED=1` | **on** | global-queue interpreter scheduler; the static per-block-stream path is the build-time A/B. |
 | `PLOW_GLOBAL_QUEUE=0` | on | force the static per-block-stream scheduler (AMD runtime read; build-time A/B otherwise). |
 | `PLOW_STATIC` / `PLOW_STATIC_DECODE` / `PLOW_STATIC_PREFILL` | off | force the static scheduler for both phases / decode only / prefill only. |
@@ -949,6 +964,7 @@ used to derive the fail-closed result.
 | `PLOW_HSACO_LOWRUNG=dir:max[,dir:max…]` | unset | AMD decode-object tiers. The runtime selects the narrowest tier whose `max` covers the occupied decode rung, pairing-checks each tier at that width, and falls back to the primary HSACO inventory above it. A single legacy `dir` uses `PLOW_LOWRUNG_MAX` (default 2). |
 | `PLOW_STATE_CLEAR_DEVICE=1` | off | AMD admission experiment: clear slot-major recurrent state with one device kernel per rank instead of host-staged SDMA fills. Requires rebuilt decode objects carrying `plow_state_clear`. |
 | `PLOW_EMIT_DECODE_CUBLASLT=1` | off | Compiler option that marks eligible isolated BF16 decode projections with the packet `CUBLASLT` segment role. PlowRT validates and executes the declared roles; there is no runtime enable or opt-out flag. |
+| `PLOW_EMIT_DECODE_NATIVE_TC=1` | off | Compiler option that marks eligible BF16 decode projections with the native sm_90a transposed tensor-core GEMV role (`gemv_sm90_transposed`). Serving qualification pending; 35.4 µs vs cuBLASLt 32.7 µs at B8 in isolation. |
 | `PLOW_EMIT_PACKED_PREFILL` / `--emit-packed-prefill` | on for qualified Hopper TP1 BF16 dense packets | Emit the packed-prefill request ABI and dedicated packet-paired objects. Packed prefill uses one attention split across buckets so packing and chunk length do not change the softmax reduction. This trades short-prompt split parallelism for stable request numerics. The runtime activates it from metadata and uses ordinary prefill with automatic prefix reuse. Explicit `PLOW_PF_BATCH=1 PLOW_VMM_PREFIX=1` selects the experimental combined route with KV admission. `false` is the rollback. On AMD it emits a SECOND, family-segmented copy of every prefill bucket (a `packed_prefill_program_t` sibling the runtime resolves only while staging a packed binding); unset, the packet is byte-identical. Implemented for the Kimi-K3 and GLM emitters. Without it an MLA blob's norm ops share a segment with the Gemms and `PLOW_PACKED_PREFILL_ROUTE=1` refuses every rung. |
 | `PLOW_PACKED_PREFILL_ROUTE=1` | off | Load optional lean packed-family HSACO objects (`interp_packed_mla_norm`, `interp_packed_mla_flash`, `interp_packed_kda`) and permit exact-family routing after metadata is staged. Missing/wrong markers and mixed segments refuse. Dense AMD packing uses the normal span-aware objects with `PLOW_PF_BATCH=1` and needs neither this route nor `PLOW_EMIT_PACKED_PREFILL`; an **MLA** blob needs BOTH, plus objects from a `PLOW_PACKED_PREFILL_CONSUMERS=1` build (gfx942) / `PLOW_HSACO_PACKED_PREFILL_CONSUMERS=ON` (cmake). The runtime says at load which of the three preconditions is missing — see `report_packed_prefill_route`. |
 

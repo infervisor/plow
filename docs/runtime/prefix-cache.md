@@ -46,4 +46,5 @@ Host tests and emitted AMD BF16/FP8-KV packet checks cover the snapshot layout,
 window wrap, configuration and scheduling invariants. H100 tests cover actual
 BF16/FP8-weight dispatch. AMD device correctness/performance and sustained
 production qualification remain pending; build compatibility alone is not that
-evidence. See [the readiness report](../../perf-data/token-batch-main-h100-readiness.md).
+evidence. The H100 readiness report lives with the campaign's raw `perf-data`, which is
+kept out of source control.

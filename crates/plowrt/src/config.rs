@@ -1587,6 +1587,15 @@ mod tests {
             if path.file_name().is_some_and(|n| n == "config.rs") {
                 continue;
             }
+            // Whole-file test modules (`exec/amd/tests.rs`, `*_tests.rs`) are `#[cfg(test)]`
+            // at their `mod` declaration, so the inline marker below never appears in them;
+            // their fixture reads (`PLOW_TEST_*`) are exempt for the same reason as below.
+            if path.file_name().is_some_and(|n| {
+                let n = n.to_string_lossy();
+                n == "tests.rs" || n.ends_with("_tests.rs")
+            }) {
+                continue;
+            }
             // A `#[cfg(test)] mod tests` reads the environment to locate FIXTURES, not to
             // configure the runtime: `PLOW_DSA_VERIFY_CKPT` points an `#[ignore]`d test at a
             // 200 GiB checkpoint and has no business in `--help`. The rule this guard enforces

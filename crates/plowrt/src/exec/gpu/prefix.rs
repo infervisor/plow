@@ -521,11 +521,14 @@ impl GpuEngine {
         let Some(a) = v.kv.try_attach(b, prompt)? else {
             return Ok(());
         };
-        debug_assert_eq!(
-            a.snap_bytes,
-            self.vmm_snap_bytes(a.rows),
-            "boundary snapshot layout drift"
-        );
+        // A snapshot sized by a different layout would be copied past its end in
+        // release; unmap what `try_attach` shared and fall back to a cold prefill.
+        if a.snap_bytes != self.vmm_snap_bytes(a.rows) {
+            v.kv.begin_seq(b);
+            return Err(crate::RuntimeError::Rejected(
+                "vmm: boundary snapshot layout drift".into(),
+            ));
+        }
         if a.rows % v.kv.block_rows() != 0 {
             v.kv.ensure_rows(b, a.rows + 1)?;
         }

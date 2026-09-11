@@ -28,6 +28,15 @@ pub(crate) fn slab_pad(bytes: u64) -> u64 {
     bytes.div_ceil(SLAB_ALIGN) * SLAB_ALIGN
 }
 
+/// Bytes one tensor takes out of the weight slab. `bytes.max(1)`: a zero-byte tensor still gets
+/// an address of its own, or a zero-length carve hands the next tensor the same base. Both the
+/// sizing pass and the carve cursor must use this, on every backend.
+#[cfg(any(feature = "hsa", feature = "cuda"))]
+#[inline]
+pub(crate) fn slab_carve(bytes: u64) -> u64 {
+    slab_pad(bytes.max(1))
+}
+
 /// Physical backing for a compiled address map: one arena per device segment,
 /// plus the slot → physical-address rebase table.
 ///

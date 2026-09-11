@@ -52,6 +52,12 @@ jobs:
         run: nix build
       - name: Test workspace
         run: nix develop --command cargo test --workspace
+      # The engine unit tests under exec/{amd,gpu} are feature-gated, so the
+      # default-feature workspace run never compiles them and the hosted job
+      # only `cargo check`s them. They are host-side (device cases are
+      # #[ignore]d) and run without a GPU.
+      - name: Test engine host paths (cuda,hsa)
+        run: "nix develop --command cargo test -p plowrt --features cuda,hsa --lib exec::"
 
   # Hosted, sandboxed: safe for fork PRs. CPU paths only, no GPU toolchain.
   check:

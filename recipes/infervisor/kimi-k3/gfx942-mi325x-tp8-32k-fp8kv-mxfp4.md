@@ -27,6 +27,7 @@ nix develop .#quantize --command python3 scripts/kimi_k3_prep.py \
 nix develop --command env \
   JOBS=8 \
   PLOW_DECODE_BATCH=32 \
+  PLOW_DECODE_TIERS= \
   PLOW_GEMV_MM=16 \
   PLOW_GEMV_WALK=1 \
   PLOW_K3_DECODE_MXFP4_PROJ=0 \

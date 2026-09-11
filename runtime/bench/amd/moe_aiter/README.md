@@ -614,7 +614,8 @@ equivalence.
 
 ### Current resident decode and prefill diagnostics
 
-[mi300x-resident-trace.json](mi300x-resident-trace.json) populates all 20 KV
+`mi300x-resident-trace.json` (raw per-instruction trace, 3.6 MB; kept out of source control
+like the other raw campaign artifacts — regenerate with `capture_decode.py`) populates all 20 KV
 slots with 65,535 copies of token ID 1, then runs six decode steps with the first
 discarded. The control averages 108.464 ms per step; the traced run averages
 103.153 ms. All eight ranks agree within each run, but the generated chains
@@ -639,7 +640,7 @@ require care. AddNorm uses one workgroup for all 20 rows, despite the body
 supporting independent row workgroups. This motivates a scheduling experiment,
 not a claimed speedup.
 
-[mi300x-resident-prefill.json](mi300x-resident-prefill.json) compares one cold
+`mi300x-resident-prefill.json` (raw 1.8 MB trace, kept out of source control) compares one cold
 70k-token prefill through the production mux with and without per-segment
 instrumentation. Prefix caching is disabled in these two diagnostic processes.
 Normal TTFT is 8.084 s; instrumentation raises it to 9.080 s by adding all-rank

@@ -3683,15 +3683,20 @@ fn only_the_bucketed_ops_set_the_requirement() {
 /// the tree is not on this machine.
 #[test]
 fn a_shipped_object_without_the_marker_reads_as_unknown() {
-    let p = Path::new("/home/lava/plow/build-amd/hsaco-abi144/interp_decode.elf");
-    let Ok(img) = std::fs::read(p) else { return };
+    // Fixture: a decode object built before the marker existed. Skipped unless
+    // `PLOW_TEST_ABI144_DECODE_ELF` points at one.
+    let Some(p) = std::env::var_os("PLOW_TEST_ABI144_DECODE_ELF").map(std::path::PathBuf::from)
+    else {
+        return;
+    };
+    let Ok(img) = std::fs::read(&p) else { return };
     let syms = elf_symbol_names(&img);
     // The reader works on this file (sanity: the interpreter body is there),
     // so `None` below means "no marker", never "no symbol table".
     assert!(syms.iter().any(|s| s.contains("plow_exec")), "{syms:?}");
     assert_eq!(object_gemv_cap(&syms), None);
-    assert!(check_gemv_capacity(&syms, p, 1).is_ok());
-    assert!(check_gemv_capacity(&syms, p, 2).is_err());
+    assert!(check_gemv_capacity(&syms, &p, 1).is_ok());
+    assert!(check_gemv_capacity(&syms, &p, 2).is_err());
 }
 
 /// The marker is a contract between `op_gemm.h` and this file, written in
@@ -4370,9 +4375,8 @@ fn the_attn_res_score_weight_folds_from_the_pair_the_checkpoint_ships() {
 
 /// The K3 snapshot directory, or `None` on a machine without it.
 fn k3_snapshot_dir() -> Option<std::path::PathBuf> {
-    let root = std::path::Path::new(
-        "/home/lava/.cache/huggingface/hub/models--moonshotai--Kimi-K3/snapshots",
-    );
+    // `PLOW_TEST_K3_SNAPSHOTS` names the HF hub `snapshots/` dir of a Kimi-K3 checkout.
+    let root = std::env::var_os("PLOW_TEST_K3_SNAPSHOTS")?;
     std::fs::read_dir(root)
         .ok()?
         .filter_map(|e| e.ok())
@@ -4414,30 +4418,33 @@ fn carried_state_is_never_skippable_and_the_kv_cache_always_is() {
     }
 }
 
-/// The negative fixture is real: `/home/lava/models/glm52_objs` is a GLM-5.2
-/// object set whose prefill object was built WITHOUT `PLOW_MLA_PREFILL`, and
-/// pairing it with a GLM packet is exactly the silent-garbage run this check
-/// exists to refuse. Skipped when the fixture is not on this machine.
+/// The negative fixture is real: a GLM-5.2 object set whose prefill object was
+/// built WITHOUT `PLOW_MLA_PREFILL`, and pairing it with a GLM packet is exactly
+/// the silent-garbage run this check exists to refuse. Skipped unless
+/// `PLOW_TEST_GLM52_PREFILL_ELF` names that object.
 #[test]
 fn prefill_object_without_mla_arms_is_refused() {
-    let p = Path::new("/home/lava/models/glm52_objs/interp_prefill.elf");
-    let Ok(img) = std::fs::read(p) else { return };
+    let Some(p) = std::env::var_os("PLOW_TEST_GLM52_PREFILL_ELF").map(std::path::PathBuf::from)
+    else {
+        return;
+    };
+    let Ok(img) = std::fs::read(&p) else { return };
     let syms = elf_symbol_names(&img);
     // The reader works on this file at all (it is where the rule was
     // derived): the interpreter body and the norms are there.
     assert!(syms.iter().any(|s| s.contains("plow_exec")), "{syms:?}");
     assert!(syms.iter().any(|s| s.contains("d_rmsnorm")), "{syms:?}");
 
-    let e = check_prefill_object(&syms, p, &["PLOW_MLA_PREFILL=1".into()])
+    let e = check_prefill_object(&syms, &p, &["PLOW_MLA_PREFILL=1".into()])
         .expect_err("an object with no MLA-prefill symbol must be refused");
     let msg = e.to_string();
     assert!(msg.contains("PLOW_MLA_PREFILL"), "{msg}");
     assert!(msg.contains("interp_prefill.elf"), "{msg}");
-    assert!(check_prefill_object(&syms, p, &["PLOW_MOE_PREFILL=1".into()]).is_err());
+    assert!(check_prefill_object(&syms, &p, &["PLOW_MOE_PREFILL=1".into()]).is_err());
     // `=0` and the filename-selected flags are not refusals.
     assert!(check_prefill_object(
         &syms,
-        p,
+        &p,
         &["PLOW_BUCKET_DECODE=0".into(), "PLOW_FP8=1".into()]
     )
     .is_ok());

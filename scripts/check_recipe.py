@@ -123,6 +123,26 @@ def check_objects(recipe: dict, defines: dict) -> list[str]:
     return notes
 
 
+def check_lowrung_tiers(recipe: dict) -> list[str]:
+    """Explicit `[[objects.lowrung]]` rungs and an UNSET `PLOW_DECODE_TIERS` collide.
+
+    build_gfx942.sh treats an unset PLOW_DECODE_TIERS as "auto": it builds lowrung{1,2,4,8}
+    from the wide object's -D set, and the recipe's explicit rungs then rebuild the same
+    directories with their own defines — last writer wins, and build_defines.json records
+    whichever ran last. A recipe that drives its own rungs must say so with an empty value.
+    """
+    obj = recipe.get("objects") or {}
+    if not obj.get("lowrung"):
+        return []
+    if "PLOW_DECODE_TIERS" in (obj.get("env") or {}):
+        return []
+    return [
+        "objects: [[objects.lowrung]] entries with PLOW_DECODE_TIERS unset in [objects].env; "
+        "build_gfx942.sh auto-builds lowrung{1,2,4,8} first and the explicit rungs overwrite "
+        'them. Set PLOW_DECODE_TIERS = "" (drive the rungs yourself) or list the tiers.'
+    ]
+
+
 def check_target(recipe: dict, build_json: dict, weights: dict) -> None:
     t = recipe.get("target") or {}
     if not t:
@@ -210,6 +230,7 @@ def check(recipe_path: Path, bundle: Path | None, objects: Path | None, strict: 
         return check_provenance(recipe, strict)
 
     notes += check_provenance(recipe, strict)
+    notes += check_lowrung_tiers(recipe)
 
     if bundle:
         bj = pd.load_json(bundle / "build.json") if (bundle / "build.json").exists() else {}
@@ -330,6 +351,16 @@ def self_test() -> None:
             raise AssertionError("accepted a contradicted emit knob")
         except pd.Fail as e:
             assert "contradictory PLOW_FP8_KV" in str(e), e
+
+        # Explicit rungs with PLOW_DECODE_TIERS unset would be overwritten by the
+        # script's auto-built tiers: reported. Stating the knob (even empty) is fine.
+        rung = json.loads(json.dumps(good))
+        rung["objects"]["lowrung"] = [{"max": 1, "env": {"PLOW_DECODE_BATCH": "1"}}]
+        notes = check(write(rung), bundle, objects, strict=False)
+        assert any("PLOW_DECODE_TIERS unset" in n for n in notes), notes
+        rung["objects"]["env"]["PLOW_DECODE_TIERS"] = ""
+        notes = check(write(rung), bundle, objects, strict=False)
+        assert not any("PLOW_DECODE_TIERS unset" in n for n in notes), notes
 
         # A knob the build never saw.
         bad = json.loads(json.dumps(good))

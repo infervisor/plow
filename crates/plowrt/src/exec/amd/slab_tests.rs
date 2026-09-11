@@ -1,4 +1,5 @@
 use super::*;
+use crate::memory::slab_pad;
 
 #[test]
 fn pad_rounds_up_and_leaves_exact_multiples_alone() {
@@ -37,21 +38,20 @@ fn carve_cursor_lands_exactly_on_the_sized_total() {
     assert_eq!(off, total, "cursor must consume exactly the sized span");
 }
 
-/// The loader carves `bytes.max(1)`, never `bytes`: a zero-byte tensor still
-/// needs an address of its own, and a zero-length carve would hand the next
-/// tensor the same one. This pins that the `.max(1)` is load-bearing.
+/// The loader carves `slab_carve` = `bytes.max(1)`, never `bytes`: a zero-byte
+/// tensor still needs an address of its own, and a zero-length carve would hand
+/// the next tensor the same one. This pins that the `.max(1)` is load-bearing.
 #[test]
 fn zero_byte_tensors_still_advance_the_cursor() {
-    let need = |b: u64| b.max(1);
     let sizes = [0u64, 0, 0];
-    let total: u64 = sizes.iter().copied().map(|b| slab_pad(need(b))).sum();
+    let total: u64 = sizes.iter().copied().map(slab_carve).sum();
     assert_eq!(total, 3 * SLAB_ALIGN);
 
     let mut off = 0u64;
     let mut seen = Vec::new();
     for s in sizes {
         seen.push(off);
-        off += slab_pad(need(s));
+        off += slab_carve(s);
     }
     seen.sort_unstable();
     seen.dedup();

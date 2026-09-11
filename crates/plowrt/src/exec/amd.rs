@@ -25,7 +25,7 @@ use crate::exec::kvrow::{
     prefill_row_field, rebase_chunk_rows, RowField,
 };
 use crate::exec::{amd_gemm_lt, amd_index_tp, amd_mla_fold, amd_moe_aiter, amd_sparse_mla};
-use crate::memory::slab_pad;
+use crate::memory::slab_carve;
 use crate::memory::vmm::{VmmGeometry, VmmKv, VmmOps, WeightSlab};
 #[cfg(test)]
 use crate::memory::SLAB_ALIGN;
@@ -7988,15 +7988,11 @@ impl AmdEngine {
                 })
                 .is_some()
         };
-        // `.max(1)`, exactly as the per-tensor arm does — a zero-byte tensor
-        // still needs a distinct address, and a zero-length carve would hand the
-        // next tensor the same one.
-        let slab_need = |bytes: u64| bytes.max(1);
         let slab_bytes: u64 = blob
             .tensors
             .iter()
             .filter(|td| !is_peer_slot(&td.name) && !is_band_view(&td.name) && !is_vmm(&td.name))
-            .map(|td| slab_pad(slab_need(td.bytes)))
+            .map(|td| slab_carve(td.bytes))
             .sum();
 
         // ---- EVERY checkpoint weight is RESOLVED before a byte is uploaded
@@ -8148,17 +8144,17 @@ impl AmdEngine {
                 // wait point covers them all. The mapper outruns the upload,
                 // so the wait is ~0 after the first chunk.
                 (None, WeightSlab::Vmm(slab)) => {
-                    let m = DeviceMem::view(slab.base() + slab_off, slab_need(td.bytes));
-                    slab_off += slab_pad(slab_need(td.bytes));
+                    let m = DeviceMem::view(slab.base() + slab_off, td.bytes.max(1));
+                    slab_off += slab_carve(td.bytes);
                     slab.wait_mapped(slab_off)?;
                     m
                 }
                 // Carve from the one allocation, in blob order. The sizing pass
                 // walked this same list with the same filter and the same
-                // `slab_need`, so the cursor cannot run past the end.
+                // `slab_carve`, so the cursor cannot run past the end.
                 (None, WeightSlab::Flat(slab)) => {
-                    let m = DeviceMem::view(slab.base + slab_off, slab_need(td.bytes));
-                    slab_off += slab_pad(slab_need(td.bytes));
+                    let m = DeviceMem::view(slab.base + slab_off, td.bytes.max(1));
+                    slab_off += slab_carve(td.bytes);
                     m
                 }
                 (None, WeightSlab::PerTensor) => {

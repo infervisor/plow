@@ -1,4 +1,5 @@
 use super::*;
+use crate::memory::slab_pad;
 
 #[test]
 fn pad_rounds_up_and_leaves_exact_multiples_alone() {
@@ -36,10 +37,22 @@ fn carve_cursor_lands_exactly_on_the_sized_total() {
     assert_eq!(off, total, "cursor must consume exactly the sized span");
 }
 
-/// A blob of nothing but zero-byte tensors sizes to zero, which the loader
-/// treats as "no slab" — the arm that must not divide by or allocate 0.
+/// The carve uses `slab_carve` (`bytes.max(1)`), the same rule as the AMD loader:
+/// a zero-byte tensor still gets an address of its own, so a blob of nothing but
+/// zero-byte tensors sizes to one stride each instead of aliasing them all.
 #[test]
-fn all_empty_tensors_size_to_zero() {
-    let total: u64 = [0u64; 8].iter().copied().map(slab_pad).sum();
-    assert_eq!(total, 0);
+fn zero_byte_tensors_still_advance_the_cursor() {
+    let sizes = [0u64, 0, 0];
+    let total: u64 = sizes.iter().copied().map(slab_carve).sum();
+    assert_eq!(total, 3 * SLAB_ALIGN);
+
+    let mut off = 0u64;
+    let mut seen = Vec::new();
+    for s in sizes {
+        seen.push(off);
+        off += slab_carve(s);
+    }
+    seen.sort_unstable();
+    seen.dedup();
+    assert_eq!(seen.len(), 3, "every tensor must get a distinct address");
 }

@@ -1601,6 +1601,10 @@ fn run_one_tick(
                 }
 
                 let pack_t = packlog::on().then(Instant::now);
+                // The unified token batch decodes `feeds` inside the prefill pass and
+                // clears them; the rung controller still owes that step its progress.
+                let feeds_before = decode_feed_extent(&feeds);
+                let mut unified_progress = None;
                 if e.pf_batch_enabled() {
                     let compact = e.has_packed_terminal();
                     let mut completed = std::mem::take(&mut obs.host.prefill_tokens);
@@ -1619,6 +1623,13 @@ fn run_one_tick(
                         if tick_fault.is_none() {
                             tick_fault = Some(f);
                         }
+                    } else if feeds.is_empty() {
+                        unified_progress = feeds_before.and_then(|extent| {
+                            Some(DecodeProgress {
+                                extent,
+                                steps: std::num::NonZeroUsize::new(1)?,
+                            })
+                        });
                     }
                     for (row, &(i, token)) in completed.iter().enumerate() {
                         let Some(slot) = slots[i].as_mut() else {
@@ -1782,7 +1793,7 @@ fn run_one_tick(
 
                 let pack_prefill_ns = pack_t.map(|t| t.elapsed().as_nanos() as u64).unwrap_or(0);
                 let pack_had_feeds = !feeds.is_empty();
-                let mut decode_progress = None;
+                let mut decode_progress = unified_progress;
                 let dec_t = packlog::on().then(Instant::now);
 
                 // One batched decode launch for every slot already past prefill. The
@@ -3510,31 +3521,34 @@ fn gpu_prefill_batched_pass(
         }
         let res = if unified {
             use plow_asset::token_batch::{Phase, Request, Selection};
-            let decode = feeds.iter().map(|&(i, ref token)| {
-                let slot = slots[i].as_ref().expect("decode slot is Some");
-                Request {
+            // A feed or pack entry whose slot vanished mid-tick is skipped, not a panic:
+            // the tick thread must outlive one inconsistent row, and the slot re-feeds
+            // next tick from live state.
+            let decode = feeds.iter().filter_map(|&(i, ref token)| {
+                let slot = slots[i].as_ref()?;
+                Some(Request {
                     id: i as u32,
                     slot: i as u32,
                     state_slot: i as u32,
-                    generation: e.slot_generation(i).expect("valid slot"),
+                    generation: e.slot_generation(i)?,
                     phase: Phase::Decode,
                     tokens: std::slice::from_ref(token),
                     prompt_len: slot.prompt_ids.len() as u32,
                     selection: Selection::default(),
-                }
+                })
             });
-            let prefill = pack.iter().map(|&(i, c0, len)| {
-                let slot = slots[i].as_ref().expect("prefill slot is Some");
-                Request {
+            let prefill = pack.iter().filter_map(|&(i, c0, len)| {
+                let slot = slots[i].as_ref()?;
+                Some(Request {
                     id: i as u32,
                     slot: i as u32,
                     state_slot: i as u32,
-                    generation: e.slot_generation(i).expect("valid slot"),
+                    generation: e.slot_generation(i)?,
                     phase: Phase::Prefill,
                     tokens: &slot.prompt_ids[c0..c0 + len],
                     prompt_len: slot.prompt_ids.len() as u32,
                     selection: Selection::default(),
-                }
+                })
             });
             let requests: smallvec::SmallVec<[_; 16]> = decode.chain(prefill).collect();
             let result = e.token_batch_step(&requests, unified_output);

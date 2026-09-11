@@ -30,7 +30,7 @@ fn pf_chunk_cost_rows() -> usize {
 use crate::asset::devblob::DevBlob;
 use crate::device::cuda::{CudaBackend, CudaEvent, CudaStream, KernelFn, PinnedHost};
 use crate::device::{Backend, DeviceMem, Module};
-use crate::memory::slab_pad;
+use crate::memory::slab_carve;
 #[cfg(test)]
 use crate::memory::SLAB_ALIGN;
 use crate::{Result, RuntimeError};
@@ -3063,7 +3063,7 @@ impl GpuEngine {
             .iter()
             .enumerate()
             .filter(|(id, _)| vmm_va_of(*id).is_none())
-            .map(|(_, td)| slab_pad(td.bytes))
+            .map(|(_, td)| slab_carve(td.bytes))
             .sum();
         // Brought up BEFORE the checkpoint opens: the VMM reserve returns in
         // µs and its mapper then commits pages concurrently with the open,
@@ -3234,12 +3234,12 @@ impl GpuEngine {
                     (Some(va), _) => DeviceMem::view(va, td.bytes),
                     (None, WeightSlab::Vmm(slab)) => {
                         let m = DeviceMem::view(slab.base() + slab_off, td.bytes);
-                        slab_off += slab_pad(td.bytes);
+                        slab_off += slab_carve(td.bytes);
                         m
                     }
                     (None, WeightSlab::Flat(slab)) => {
                         let m = DeviceMem::view(slab.base + slab_off, td.bytes);
-                        slab_off += slab_pad(td.bytes);
+                        slab_off += slab_carve(td.bytes);
                         m
                     }
                     (None, WeightSlab::PerTensor) => be.alloc(0, td.bytes)?,

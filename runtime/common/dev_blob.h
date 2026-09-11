@@ -140,6 +140,9 @@ PLOW_SASSERT(sizeof(PlowProgHeader) == 24, "PlowProgHeader size");
  * high = beta_slow, aux bit0 = truncate; cos AND sin are multiplied by
  * mscale = 0.1*ln(factor)+1. Math in crates/packet/src/rope.rs (RopeScale::Yarn). */
 #define PLOW_ROPE_SCALE_YARN   2u
+/* DeepSeek/Kimi YaRN: as YARN with attention factor 1.0 (RopeScale::YarnDs). Host-generated
+ * only; a device reader never sees it, the define exists so the enum is complete here. */
+#define PLOW_ROPE_SCALE_YARN_DS 3u
 #define PLOW_ROPE_SCALE_LINEAR 4u
 
 /* Mirrors `packet::rope::GenTensor`; locked by crates/packet/tests/dev_abi.rs.
