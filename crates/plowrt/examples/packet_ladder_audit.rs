@@ -89,10 +89,46 @@ fn validate_queue_work(
     insts: &[DevInst64],
     stream: &[StreamEnt],
     queue: &[StreamEnt],
+    l2_domains: u32,
 ) -> Result<(), String> {
+    if l2_domains != 0 {
+        use packet::dev::{SE_DOMAIN_MASK, SE_DOMAIN_SHIFT, SE_FINE, SE_NPER_MASK, SE_NPER_SHIFT};
+        let mut counts = BTreeMap::<(u32, u16), u32>::new();
+        for entry in queue {
+            let domain = (entry.flags & SE_DOMAIN_MASK) >> SE_DOMAIN_SHIFT;
+            if u32::from(domain) >= l2_domains {
+                return Err("queue L2 domain out of range".into());
+            }
+            if entry.flags & SE_FINE == 0 {
+                *counts.entry((entry.inst, domain)).or_default() += 1;
+            }
+        }
+        for entry in queue {
+            let domain = (entry.flags & SE_DOMAIN_MASK) >> SE_DOMAIN_SHIFT;
+            let count = if entry.flags & SE_FINE == 0 {
+                counts[&(entry.inst, domain)]
+            } else {
+                0
+            };
+            let expected = if count > 1 { count } else { 0 };
+            let actual = u32::from((entry.flags & SE_NPER_MASK) >> SE_NPER_SHIFT);
+            if actual != expected {
+                return Err("queue L2 rendezvous count differs from work slices".into());
+            }
+        }
+        if stream.iter().any(|entry| entry.flags & SE_NPER_MASK != 0) {
+            return Err("static stream contains queue-only L2 rendezvous counts".into());
+        }
+    }
     let key = |e: &StreamEnt| {
+        // The compiler derives the GQ-only count after assigning slices to XCDs.
+        let flags = if l2_domains != 0 {
+            e.flags & !packet::dev::SE_NPER_MASK
+        } else {
+            e.flags
+        };
         (
-            e.inst, e.slice, e.wait_ofs, e.succ_ofs, e.wait_len, e.succ_len, e.flags, e.seg,
+            e.inst, e.slice, e.wait_ofs, e.succ_ofs, e.wait_len, e.succ_len, flags, e.seg,
         )
     };
     let mut scheduled: Vec<_> = stream.iter().map(key).collect();
@@ -221,24 +257,70 @@ mod tests {
                 ..Default::default()
             },
         ];
-        assert!(validate_queue_work(&insts, &stream, &[stream[1], stream[0]]).is_ok());
-        assert!(validate_queue_work(&insts, &stream[..1], &stream[..1])
+        assert!(validate_queue_work(&insts, &stream, &[stream[1], stream[0]], 0).is_ok());
+        assert!(validate_queue_work(&insts, &stream[..1], &stream[..1], 0)
             .unwrap_err()
             .contains("incomplete"));
         let duplicate = [stream[0], stream[0]];
-        assert!(validate_queue_work(&insts, &duplicate, &duplicate)
+        assert!(validate_queue_work(&insts, &duplicate, &duplicate, 0)
             .unwrap_err()
             .contains("duplicate"));
         let mut changed = stream;
         changed[1].slice = 2;
-        assert!(validate_queue_work(&insts, &changed, &changed)
+        assert!(validate_queue_work(&insts, &changed, &changed, 0)
             .unwrap_err()
             .contains("out of range"));
         changed = stream;
         changed[1].wait_len = 1;
-        assert!(validate_queue_work(&insts, &stream, &changed)
+        assert!(validate_queue_work(&insts, &stream, &changed, 0)
             .unwrap_err()
             .contains("dependencies"));
+    }
+
+    #[test]
+    fn l2_queue_counts_are_derived_without_ignoring_dependencies() {
+        use packet::dev::{SE_DOMAIN_SHIFT, SE_FINE, SE_NPER_SHIFT, SE_XCTR};
+        let insts = [DevInst64 {
+            blocks: 4,
+            ..Default::default()
+        }];
+        let stream = std::array::from_fn::<_, 4, _>(|slice| StreamEnt {
+            slice: slice as u32,
+            flags: if slice < 2 { 0 } else { 1 << SE_DOMAIN_SHIFT },
+            ..Default::default()
+        });
+        let queue = stream.map(|mut e| {
+            e.flags |= 2 << SE_NPER_SHIFT;
+            e
+        });
+        assert!(validate_queue_work(&insts, &stream, &queue, 2).is_ok());
+        let mut changed = queue;
+        changed[0].flags ^= 1 << SE_NPER_SHIFT;
+        assert!(validate_queue_work(&insts, &stream, &changed, 2)
+            .unwrap_err()
+            .contains("count"));
+        changed = queue;
+        changed[0].flags ^= SE_XCTR;
+        assert!(validate_queue_work(&insts, &stream, &changed, 2)
+            .unwrap_err()
+            .contains("dependencies"));
+        changed = queue;
+        changed[0].flags |= SE_FINE;
+        assert!(validate_queue_work(&insts, &stream, &changed, 2).is_err());
+        assert!(validate_queue_work(&insts, &stream, &queue, 1)
+            .unwrap_err()
+            .contains("domain"));
+        let fine = stream.map(|mut e| {
+            e.flags |= SE_FINE;
+            e
+        });
+        assert!(validate_queue_work(&insts, &fine, &fine, 2).is_ok());
+        let single = [StreamEnt::default()];
+        let insts = [DevInst64 {
+            blocks: 1,
+            ..Default::default()
+        }];
+        assert!(validate_queue_work(&insts, &single, &single, 2).is_ok());
     }
 }
 
@@ -278,7 +360,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             return Err(format!("program {index}: invalid queue window bounds").into());
         }
-        validate_queue_work(&p.insts, &p.stream, &p.gq_stream)
+        validate_queue_work(&p.insts, &p.stream, &p.gq_stream, p.l2_domains)
             .map_err(|e| format!("program {index}: {e}"))?;
         for (pc, inst) in p.insts.iter().enumerate() {
             if DevOp::from_u16(inst.op).is_none() {

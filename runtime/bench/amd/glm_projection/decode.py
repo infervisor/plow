@@ -9,7 +9,11 @@ parser.add_argument('--object', type=Path)
 parser.add_argument('--selected', type=Path)
 parser.add_argument('--out', type=Path, required=True)
 parser.add_argument('--export', type=Path)
+parser.add_argument('--rows', type=int, nargs='+', default=[16, 20])
+parser.add_argument('--arms', nargs='+', choices=['plow', 'hipblas', 'hipblaslt'])
 args = parser.parse_args()
+assert all(1 <= rows <= 20 for rows in args.rows), 'capture contains 20 rows'
+assert args.mode == 'library' or args.arms is None
 capture = args.capture
 if args.export:
     args.export.mkdir(parents=True, exist_ok=True)
@@ -20,6 +24,11 @@ lib = ctypes.CDLL(str(args.library.resolve()))
 fn = lib.plow_projection
 fn.argtypes = [ctypes.c_void_p] * 3 + [ctypes.c_uint] * 3 + [ctypes.c_void_p]
 fn.restype = ctypes.c_int
+width_fn = getattr(lib, 'plow_projection_width', None)
+if width_fn is not None:
+    width_fn.argtypes = []
+    width_fn.restype = ctypes.c_uint
+compiled_width = width_fn() if width_fn is not None else None
 sha = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
 if args.mode == 'direct':
     assert args.selected and args.object
@@ -71,9 +80,9 @@ for name, xfile, wfile, n, k in shapes:
     assert torch.isfinite(wh).all() and torch.isfinite(xh).all()
     oracle = xh.double() @ wh.double().T
     w = wh.cuda()
-    for rows in [16, 20]:
+    for rows in args.rows:
         x = xh[:rows].cuda()
-        for arm in ['plow', 'hipblas', 'hipblaslt'] if args.mode == 'library' else ['direct-linear', 'direct-xcc']:
+        for arm in (args.arms or ['plow', 'hipblas', 'hipblaslt']) if args.mode == 'library' else ['direct-linear', 'direct-xcc']:
             storage = torch.full((rows * n + 256,), 27499, device='cuda', dtype=torch.int16)
             out = storage[128:-128].view(torch.bfloat16).reshape(rows, n)
             kernel_info = {}
@@ -128,7 +137,7 @@ for name, xfile, wfile, n, k in shapes:
                 call()
                 torch.cuda.synchronize()
                 assert torch.equal(out, expected)
-            record = dict(shape=name, rows=rows, n=n, k=k, arm=arm, relative_l2=relative, guards=True, poison_reuses=3, **kernel_info, **timing(call))
+            record = dict(shape=name, rows=rows, n=n, k=k, arm=arm, compiled_width=compiled_width if arm == 'plow' else None, relative_l2=relative, guards=True, poison_reuses=3, **kernel_info, **timing(call))
             records.append(record)
             print(json.dumps(record), flush=True)
             args.out.with_suffix('.partial.json').write_text(json.dumps(records, indent=2) + '\n')
