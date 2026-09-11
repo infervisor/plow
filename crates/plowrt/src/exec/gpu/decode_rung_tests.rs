@@ -561,28 +561,33 @@ fn gpu_packed_prefill_schedule_logits() {
         &assets.join("checkpoint"),
     )
     .unwrap();
-    assert!(e.batch() >= 16 && e.pf_max_rows() >= 4096);
-    let prompt = vec![29104u32; 16384]; // Gemma 4 tokenizer: repeated " hello".
-    let prompts: Vec<_> = [29104, 1902, 1594, 1262]
+    let parameter = |name, default| std::env::var(name).map_or(default, |v| v.parse().unwrap());
+    let rows = parameter("TEST_PACKED_LOGITS_ROWS", 16384usize);
+    let steps = parameter("TEST_PACKED_LOGITS_STEPS", 128);
+    let token = parameter("TEST_PACKED_LOGITS_TOKEN", 29104) as u32;
+    assert!(e.batch() >= 16 && e.pf_max_rows() >= 128 && rows > 1 && steps > 0);
+    let budget = e.pf_max_rows();
+    let prompt = vec![token; rows];
+    let prompts: Vec<_> = [token, 1902, 1594, 1262]
         .map(|token| vec![token; prompt.len()])
         .into();
     let mut reference: Vec<Vec<f32>> = Vec::new();
     let mut feeds = Vec::new();
     let mut report = Vec::new();
     for (pass, (slots, chunk)) in [
-        (vec![0], 4096),
-        (vec![0, 4, 8, 12], 1024),
-        (vec![0], 1024),
-        (vec![12, 8, 4, 0], 1024),
-        ((0..16).collect(), 256),
-        ((0..16).rev().collect(), 256),
-        (vec![0, 4, 8, 12], 1024),
+        (vec![0], 4096.min(budget)),
+        (vec![0, 4, 8, 12], 1024.min(budget / 4)),
+        (vec![0], 1024.min(budget)),
+        (vec![12, 8, 4, 0], 1024.min(budget / 4)),
+        ((0..16).collect(), 256.min(budget / 16)),
+        ((0..16).rev().collect(), 256.min(budget / 16)),
+        (vec![0, 4, 8, 12], 1024.min(budget / 4)),
     ]
     .into_iter()
     .enumerate()
     {
         for &slot in &slots {
-            e.begin_slot(slot, prompt.len() + 128).unwrap();
+            e.begin_slot(slot, prompt.len() + steps).unwrap();
         }
         for c0 in (0..prompt.len() - 1).step_by(chunk) {
             let requests: Vec<_> = slots
@@ -597,7 +602,7 @@ fn gpu_packed_prefill_schedule_logits() {
             e.prefill_batched(&requests).unwrap();
         }
         let mut next = *prompt.last().unwrap();
-        for step in 0..128 {
+        for step in 0..steps {
             let requests: Vec<_> = slots
                 .iter()
                 .map(|&slot| {
@@ -663,6 +668,7 @@ fn gpu_packed_prefill_schedule_logits() {
                     .fold(0f32, f32::max);
                 report.push(serde_json::json!({
                     "pass": pass, "slots": slots, "chunk": chunk, "step": step, "unified": unified,
+                    "prompt_rows": rows, "prompt_token": token,
                     "slot": slot, "changed_logits": changed, "max_abs": max_abs,
                     "logits_sha256": plow_asset::decode_objects::image_sha256(bytemuck::cast_slice(&logits)),
                     "token": ids[i], "reference_token": feeds[step],
@@ -676,7 +682,7 @@ fn gpu_packed_prefill_schedule_logits() {
             e.retire_slot(slot, false);
         }
         eprintln!(
-            "packed schedule pass={pass} slots={slots:?} chunk={chunk}: 128 teacher-forced frames"
+            "packed schedule pass={pass} slots={slots:?} chunk={chunk}: {steps} teacher-forced frames"
         );
     }
     std::fs::write(output, serde_json::to_vec_pretty(&report).unwrap()).unwrap();

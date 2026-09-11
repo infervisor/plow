@@ -1,0 +1,13 @@
+2026-09-11T01:55:00.741773Z  INFO plowc invoked source=--hf-dir plans/gemma4-12b-roofline/checkpoint-fp8 gpu=h100 num_gpus=1 batch=[1, 4, 8] seq=[512, 2048, 8192] phase=Both emit=Devblob preset=None parallel=Tp page_kib=16 weight_dtype=auto
+2026-09-11T01:55:00.741812Z  INFO devblob emit started gpu=h100
+2026-09-11T01:55:00.743425Z  WARN lean gates skipped — this blob is NOT verified (build.json: lean.verified=false) reason="no `plow_verify` binary (set PLOW_VERIFY_BIN, or `lake build` in lean-plow/)"
+warning: cannot probe gfx950 kernel inventory (cannot run hipcc: an inventory is derived from a built object, so probing needs the toolchain that builds it); using analytical fallback (known tile constants)
+  counter granularity: 0 fine edges kept, 336 downgraded to coarse (homogeneous region — see Plow/CounterGranularity.lean:collapse)
+  counter granularity: 0 fine edges kept, 336 downgraded to coarse (homogeneous region — see Plow/CounterGranularity.lean:collapse)
+  counter granularity: 0 fine edges kept, 336 downgraded to coarse (homogeneous region — see Plow/CounterGranularity.lean:collapse)
+  counter granularity: 0 fine edges kept, 336 downgraded to coarse (homogeneous region — see Plow/CounterGranularity.lean:collapse)
+  counter granularity: 0 fine edges kept, 336 downgraded to coarse (homogeneous region — see Plow/CounterGranularity.lean:collapse)
+
+thread 'main' (230811) panicked at crates/devgen/src/lib.rs:8533:9:
+Gemma cuBLASLt decode requires dense BF16 CUDA
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

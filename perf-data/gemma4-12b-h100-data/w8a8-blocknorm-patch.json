@@ -1,0 +1,3 @@
+{
+  "patch": "diff --git a/runtime/nvidia/op_norm.cuh b/runtime/nvidia/op_norm.cuh\nindex 8b8a5f4c..fdffaebf 100644\n--- a/runtime/nvidia/op_norm.cuh\n+++ b/runtime/nvidia/op_norm.cuh\n@@ -68,11 +68,13 @@ static __device__ __forceinline__ float gemma_postnorm_round(float x) {\n \n /* Decode rungs must use one reduction order even when the batch reaches the\n  * prefill warp-per-row threshold. Standalone probes retain the row heuristic. */\n+#ifndef PLOW_NV_T17_MIN_ROWS\n #if defined(PLOW_NV_PREFILL) && !PLOW_NV_PREFILL\n #define PLOW_NV_T17_MIN_ROWS 0u\n #else\n #define PLOW_NV_T17_MIN_ROWS 32u\n #endif\n+#endif\n \n /* RMSNorm over `feat`. One block per row, strided by nblk.\n  *\n"
+}

@@ -1,0 +1,275 @@
+{
+  "packet_sha256": "d0b8307d53dadd5f09f43b7bddb70d3d99f970c42af6d30b213e431796fb1ee4",
+  "full_audit_sha256": "d3c1cb72786a3f91a050232dfecc7c6ead9414821434273700dcd628075c8ec7",
+  "programs": [
+    {
+      "index": 0,
+      "phase": "prefill",
+      "rows": 128,
+      "op_counts": {
+        "Argmax": 1,
+        "ArgmaxFin": 1,
+        "Embed": 1,
+        "FlashPrefill": 48,
+        "Gemm": 1,
+        "GemmFp8": 328,
+        "Glu": 48,
+        "HeadNormRope": 144,
+        "NormResidual": 96,
+        "QuantFp8": 192,
+        "RmsNorm": 97,
+        "SoftCap": 1
+      },
+      "cases": 391,
+      "native_segments": []
+    },
+    {
+      "index": 1,
+      "phase": "prefill",
+      "rows": 512,
+      "op_counts": {
+        "Argmax": 1,
+        "ArgmaxFin": 1,
+        "Embed": 1,
+        "FlashPrefill": 48,
+        "Gemm": 1,
+        "GemmFp8": 328,
+        "Glu": 48,
+        "HeadNormRope": 144,
+        "NormResidual": 96,
+        "QuantFp8": 192,
+        "RmsNorm": 97,
+        "SoftCap": 1
+      },
+      "cases": 391,
+      "native_segments": []
+    },
+    {
+      "index": 2,
+      "phase": "prefill",
+      "rows": 1024,
+      "op_counts": {
+        "Argmax": 1,
+        "ArgmaxFin": 1,
+        "Embed": 1,
+        "FlashPrefill": 48,
+        "Gemm": 1,
+        "GemmFp8": 328,
+        "Glu": 48,
+        "HeadNormRope": 144,
+        "NormResidual": 96,
+        "QuantFp8": 192,
+        "RmsNorm": 97,
+        "SoftCap": 1
+      },
+      "cases": 391,
+      "native_segments": []
+    },
+    {
+      "index": 3,
+      "phase": "prefill",
+      "rows": 2048,
+      "op_counts": {
+        "Argmax": 1,
+        "ArgmaxFin": 1,
+        "Embed": 1,
+        "FlashPrefill": 48,
+        "Gemm": 1,
+        "GemmFp8": 328,
+        "Glu": 48,
+        "HeadNormRope": 144,
+        "NormResidual": 96,
+        "QuantFp8": 192,
+        "RmsNorm": 97,
+        "SoftCap": 1
+      },
+      "cases": 391,
+      "native_segments": []
+    },
+    {
+      "index": 4,
+      "phase": "decode",
+      "rows": 1,
+      "op_counts": {
+        "Argmax": 1,
+        "ArgmaxFin": 1,
+        "Embed": 1,
+        "FlashDecode": 48,
+        "FlashMerge": 48,
+        "Gemv": 1,
+        "GemvFp8": 232,
+        "GemvGluFp8": 48,
+        "HeadNormRope": 144,
+        "NormResidualNorm": 96,
+        "RmsNorm": 1,
+        "SoftCap": 1
+      },
+      "cases": 68,
+      "native_segments": [
+        {
+          "declared_object": {
+            "abi": "gemv_transposed_sm90_bf16_v1",
+            "file": "gemv_sm90_transposed.cubin",
+            "sha256": "a50228e72d682d34a9137dcb01143a088b2af47dc64a0c51bebe7d617b744d03"
+          },
+          "declared_role": 8,
+          "entries": 132,
+          "pcs": [
+            618
+          ],
+          "route": "native_object",
+          "segment": 1,
+          "window": 1
+        }
+      ]
+    },
+    {
+      "index": 5,
+      "phase": "decode",
+      "rows": 2,
+      "op_counts": {
+        "Argmax": 1,
+        "ArgmaxFin": 1,
+        "Embed": 1,
+        "FlashDecode": 48,
+        "FlashMerge": 48,
+        "Gemv": 1,
+        "GemvFp8": 232,
+        "GemvGluFp8": 48,
+        "HeadNormRope": 144,
+        "NormResidualNorm": 96,
+        "RmsNorm": 1,
+        "SoftCap": 1
+      },
+      "cases": 68,
+      "native_segments": [
+        {
+          "declared_object": {
+            "abi": "gemv_transposed_sm90_bf16_v1",
+            "file": "gemv_sm90_transposed.cubin",
+            "sha256": "a50228e72d682d34a9137dcb01143a088b2af47dc64a0c51bebe7d617b744d03"
+          },
+          "declared_role": 8,
+          "entries": 132,
+          "pcs": [
+            618
+          ],
+          "route": "native_object",
+          "segment": 1,
+          "window": 1
+        }
+      ]
+    },
+    {
+      "index": 6,
+      "phase": "decode",
+      "rows": 4,
+      "op_counts": {
+        "Argmax": 1,
+        "ArgmaxFin": 1,
+        "Embed": 1,
+        "FlashDecode": 48,
+        "FlashMerge": 48,
+        "Gemv": 1,
+        "GemvFp8": 232,
+        "GemvGluFp8": 48,
+        "HeadNormRope": 144,
+        "NormResidualNorm": 96,
+        "RmsNorm": 1,
+        "SoftCap": 1
+      },
+      "cases": 68,
+      "native_segments": [
+        {
+          "declared_object": {
+            "abi": "gemv_transposed_sm90_bf16_v1",
+            "file": "gemv_sm90_transposed.cubin",
+            "sha256": "a50228e72d682d34a9137dcb01143a088b2af47dc64a0c51bebe7d617b744d03"
+          },
+          "declared_role": 8,
+          "entries": 132,
+          "pcs": [
+            618
+          ],
+          "route": "native_object",
+          "segment": 1,
+          "window": 1
+        }
+      ]
+    },
+    {
+      "index": 7,
+      "phase": "decode",
+      "rows": 8,
+      "op_counts": {
+        "Argmax": 1,
+        "ArgmaxFin": 1,
+        "Embed": 1,
+        "FlashDecode": 48,
+        "FlashMerge": 48,
+        "Gemv": 1,
+        "GemvFp8": 232,
+        "GemvGluFp8": 48,
+        "HeadNormRope": 144,
+        "NormResidualNorm": 96,
+        "RmsNorm": 1,
+        "SoftCap": 1
+      },
+      "cases": 68,
+      "native_segments": [
+        {
+          "declared_object": {
+            "abi": "gemv_transposed_sm90_bf16_v1",
+            "file": "gemv_sm90_transposed.cubin",
+            "sha256": "a50228e72d682d34a9137dcb01143a088b2af47dc64a0c51bebe7d617b744d03"
+          },
+          "declared_role": 8,
+          "entries": 132,
+          "pcs": [
+            618
+          ],
+          "route": "native_object",
+          "segment": 1,
+          "window": 1
+        }
+      ]
+    },
+    {
+      "index": 8,
+      "phase": "decode",
+      "rows": 16,
+      "op_counts": {
+        "Argmax": 1,
+        "ArgmaxFin": 1,
+        "Embed": 1,
+        "FlashDecode": 48,
+        "FlashMerge": 48,
+        "Gemv": 1,
+        "GemvFp8": 232,
+        "GemvGluFp8": 48,
+        "HeadNormRope": 144,
+        "NormResidualNorm": 96,
+        "RmsNorm": 1,
+        "SoftCap": 1
+      },
+      "cases": 68,
+      "native_segments": [
+        {
+          "declared_object": {
+            "abi": "gemv_transposed_sm90_bf16_v1",
+            "file": "gemv_sm90_transposed.cubin",
+            "sha256": "a50228e72d682d34a9137dcb01143a088b2af47dc64a0c51bebe7d617b744d03"
+          },
+          "declared_role": 8,
+          "entries": 132,
+          "pcs": [
+            618
+          ],
+          "route": "native_object",
+          "segment": 1,
+          "window": 1
+        }
+      ]
+    }
+  ]
+}

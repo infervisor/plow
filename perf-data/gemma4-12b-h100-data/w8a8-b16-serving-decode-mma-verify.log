@@ -1,0 +1,6 @@
+Traceback (most recent call last):
+  File "/home/lava/plow/plans/gemma4-12b-roofline/verify_w8a8_diagnostic.py", line 96, in <module>
+    main()
+  File "/home/lava/plow/plans/gemma4-12b-roofline/verify_w8a8_diagnostic.py", line 75, in main
+    assert actual == expected, ("concurrent outputs differ from isolated control", expected, actual)
+AssertionError: ('concurrent outputs differ from isolated control', ['1', '.\n', '1111111', '11111111111111111'], ['1', '.\n.', '1111111', '11111111111111111'])

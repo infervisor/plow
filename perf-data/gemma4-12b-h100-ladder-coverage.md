@@ -453,3 +453,45 @@ current decode object; the earlier reused decode object failed a cancellation
 check. Full-model independent quality and maximum-concurrency qualification
 remain open. This does not enable FP8-weight request chunk limits or native
 BF16 projection routing for FP8 weights.
+
+## FP8 decode and unified-path precision screen
+
+The parameterized packed-logit diagnostic now accepts prompt length, repeated
+token ID and decode steps. Its original defaults remain unchanged. A 901-token
+prompt with three teacher-forced steps exercises seven schedules, including
+noncontiguous slots, reversed admission and unified token batching.
+
+All six native schedules are bit-identical for each tested configuration.
+Unified execution uses prefill kernels even for decode rows; its numerical
+policy differs from native decode. The baseline has a maximum logit difference
+of 4.953125 without selected-token changes in the 12 unified snapshots.
+This localizes the diagnostic difference to the execution paths, but does not
+establish one sole cause or independent model accuracy.
+
+Native FP8 WGMMA across all decode rungs, paired with uniformly tiled prefill
+and FP32 accumulator promotion, lowers that difference to 3.0625. It passes
+the serving consistency screen but regresses latency and long-context
+throughput. Matching quantizer or normalization policies does not eliminate
+divergence. BF16 rounding inside the fused GLU further lowers the short
+diagnostic difference to 2.5, yet fails the broader serving consistency test.
+No timing was run for that failed candidate.
+
+The MMA/WGMMA all-rung, block-normalization and GLU-rounding experiments are
+reverted. Their patches, object hashes, diagnostic outputs and serving logs
+are retained in the [precision screen](gemma4-12b-h100-data/w8a8-decode-consistency-summary.json).
+No candidate is promoted. Diagnostic execution passing is not a logit-equality
+gate; these experiments have no independent quality or sanitizer qualification.
+
+A separate native-head prototype leaves all 1,904 instruction cases unchanged
+and assigns only the BF16 262144×3840 vocabulary projection to native role8
+at B1/2/4/8/16. All 48 fused FP8 GLUs remain. Four routing tests and the strict
+packet audit pass. Its 66-frame diagnostic matches the control's result:
+native schedules are bit-identical; unified maximum difference is 4.953125
+with no selected-token changes.
+
+However, a fresh unchanged control fails cancellation consistency, and the
+head candidate fails concurrent ragged consistency. Neither enters timing.
+Earlier passing W8A8 serving screens therefore do not establish stable
+scheduling invariance. The compiler enablement is reverted pending that
+investigation; no native-head speedup or causal attribution of these failures
+is claimed. [Prototype, exact-case audit and failures](gemma4-12b-h100-data/w8a8-native-head-summary.json).

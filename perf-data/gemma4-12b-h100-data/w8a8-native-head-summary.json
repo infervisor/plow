@@ -1,0 +1,113 @@
+{
+  "decision": "Compiler enablement reverted; no serving timing. Fresh unchanged control failed cancellation consistency, candidate failed ragged concurrent consistency. Cannot attribute serving failures solely to native head.",
+  "scope": "Existing native BF16 head with FP8 layers on H100 B1/2/4/8/16. All 9 programs and 1904 instruction cases match original W8A8 packet exactly. Exactly one 262144x3840 BF16 head gets role8 at every decode rung; all48 fused FP8 GLUs remain.",
+  "unit_tests": "4 passed; first build failed due out-of-scope mx4 variable, corrected before passing build. Both attempts archived.",
+  "diagnostic": {
+    "native_max_abs": 0.0,
+    "unified_max_abs": 4.953125,
+    "unified_token_changes": 0,
+    "frames": 66
+  },
+  "archive": [
+    {
+      "file": "check_w8a8_native_head.py",
+      "original_sha256": "1d6de1dc89abdab25d17576c547f06add3d6dcb23e6d5ad2fee387cedf8c86d1",
+      "archived_sha256": "1d6de1dc89abdab25d17576c547f06add3d6dcb23e6d5ad2fee387cedf8c86d1"
+    },
+    {
+      "file": "check_w8a8_native_head_candidate.py",
+      "original_sha256": "c3eb77d0dd443bc07d4d88e0d204511d5ea77bd97c3cac9053946d328ba04b71",
+      "archived_sha256": "c3eb77d0dd443bc07d4d88e0d204511d5ea77bd97c3cac9053946d328ba04b71"
+    },
+    {
+      "file": "fp8-short-native-head-logits.json",
+      "original_sha256": "781504f361b84960f42f509834b8ac1dbbbe1dae9febb330eaae0c80b55f38e3",
+      "archived_sha256": "3b5ee744f0f13babe8f0c6f96eb54464539052f49efaaebd2b20172811a39bd4"
+    },
+    {
+      "file": "fp8-short-native-head-logits.log",
+      "original_sha256": "4302604bda02aec34986a42ac2856a7147e5015b42d34b32702c23fe2113cce3",
+      "archived_sha256": "7944264cf572ec39539ecf069ce24d187741a3fe88477445597b3607c72eb38e"
+    },
+    {
+      "file": "w8a8-b16-serving-head-control-server.log",
+      "original_sha256": "322a49dddd34e326559db1ed732cdd5fc8e8cafb048cdd9dc580ca9798bbd865",
+      "archived_sha256": "322a49dddd34e326559db1ed732cdd5fc8e8cafb048cdd9dc580ca9798bbd865"
+    },
+    {
+      "file": "w8a8-b16-serving-head-control-verify.log",
+      "original_sha256": "540bd17ae5a6f3cbfd325f221d7da3ed7c834f9c8db974aa028641ab17bc2c29",
+      "archived_sha256": "540bd17ae5a6f3cbfd325f221d7da3ed7c834f9c8db974aa028641ab17bc2c29"
+    },
+    {
+      "file": "w8a8-b16-serving-head-native-server.log",
+      "original_sha256": "bc8e4fad099eae32b28b719445bd088a3ee30199fce4608303b9da4fed4e59d3",
+      "archived_sha256": "bc8e4fad099eae32b28b719445bd088a3ee30199fce4608303b9da4fed4e59d3"
+    },
+    {
+      "file": "w8a8-b16-serving-head-native-verify.log",
+      "original_sha256": "47ae9c678a1c575239bf2120633121a87d1c8b36171e5622f26e29434d807264",
+      "archived_sha256": "47ae9c678a1c575239bf2120633121a87d1c8b36171e5622f26e29434d807264"
+    },
+    {
+      "file": "w8a8-native-head-candidate-check.log",
+      "original_sha256": "a5406f4f39633e7faf7cc83d86e40546ebf4f91e6deaf73609c7ed24553a58e3",
+      "archived_sha256": "a5406f4f39633e7faf7cc83d86e40546ebf4f91e6deaf73609c7ed24553a58e3"
+    },
+    {
+      "file": "w8a8-native-head-check.log",
+      "original_sha256": "eac7b2c5382735c72a91685778bf76634588635c3eb396cf9e2e751e4893c9c2",
+      "archived_sha256": "eac7b2c5382735c72a91685778bf76634588635c3eb396cf9e2e751e4893c9c2"
+    },
+    {
+      "file": "w8a8-native-head-compile.log",
+      "original_sha256": "ac913e5a3c79fd09dcd8c1e45d116bc0f5c0a3f72e9bc2b544884b52127a63ea",
+      "archived_sha256": "ac913e5a3c79fd09dcd8c1e45d116bc0f5c0a3f72e9bc2b544884b52127a63ea"
+    },
+    {
+      "file": "w8a8-native-head-recipe.json",
+      "original_sha256": "685d83f9c64f298b39f9265050dd6bcdce7da71025512f375c9a99a1d3bed427",
+      "archived_sha256": "685d83f9c64f298b39f9265050dd6bcdce7da71025512f375c9a99a1d3bed427"
+    },
+    {
+      "file": "w8a8-native-head-tests-fixed.log",
+      "original_sha256": "cedf0fefcad48c0480a6e93bf106a37ee4d559410d884aa5309d01ff5b205f0b",
+      "archived_sha256": "cedf0fefcad48c0480a6e93bf106a37ee4d559410d884aa5309d01ff5b205f0b"
+    },
+    {
+      "file": "w8a8-native-head-tests.log",
+      "original_sha256": "688b7972a1dcc98d7eb78a72718e7de51b2b3756af39ff9ce3b84a3853eb6487",
+      "archived_sha256": "688b7972a1dcc98d7eb78a72718e7de51b2b3756af39ff9ce3b84a3853eb6487"
+    },
+    {
+      "file": "w8a8-native-head-routes.json",
+      "archived_sha256": "f2298becdb8eec9e033b129d92fbe0de2dae6b357a673be8799946ed9ed16c9d"
+    },
+    {
+      "file": "w8a8-restored-compiler-build.log",
+      "original_sha256": "8b4a6c8564d16c22df5ab284f90a0a32829ff32446c539035d8d52b789038747",
+      "archived_sha256": "8b4a6c8564d16c22df5ab284f90a0a32829ff32446c539035d8d52b789038747"
+    },
+    {
+      "file": "w8a8-native-head-restored-reject.log",
+      "original_sha256": "3ba8a4f5e8a4adcddc2043f28efcefa141e7bdbab70e1e87de0d3d8171451cd1",
+      "archived_sha256": "3ba8a4f5e8a4adcddc2043f28efcefa141e7bdbab70e1e87de0d3d8171451cd1"
+    }
+  ],
+  "patch": "w8a8-native-head-patch.json",
+  "asset_files": {
+    "gemv_sm90_transposed.cubin": "a50228e72d682d34a9137dcb01143a088b2af47dc64a0c51bebe7d617b744d03",
+    "build.json": "d7f9277305d9ae90df3f336e6fb553544a2bdbbfc6a0b9330039768b85123016",
+    "model.pkt": "d0b8307d53dadd5f09f43b7bddb70d3d99f970c42af6d30b213e431796fb1ee4"
+  },
+  "limits": [
+    "No performance or sanitizer qualification",
+    "No independent model-quality check",
+    "Native decode and unified precision mismatch remains unresolved"
+  ],
+  "restoration": {
+    "compiler_release_build": "PASS",
+    "fp8_native_enablement_rejected": "PASS",
+    "compiler_sha256": "8d9f896ad9deaecdaef6fde83ba8d5f7d950f6147f3b0a891a50ce17c886dec3"
+  }
+}
