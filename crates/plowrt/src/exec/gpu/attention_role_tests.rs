@@ -67,6 +67,7 @@ fn fixture(rows: u32, splits: u32) -> (DevProg, Vec<DevTensor>) {
             t: rows,
             packed_prefill_only: false,
             token_batch_body: false,
+            decode_rung: false,
             n_counter: 0,
             insts,
             stream: stream.clone(),

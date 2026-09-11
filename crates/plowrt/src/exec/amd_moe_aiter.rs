@@ -826,6 +826,7 @@ mod tests {
             t: 8192,
             packed_prefill_only: false,
             token_batch_body: false,
+            decode_rung: false,
             n_counter: 0,
             insts: vec![align, moe],
             stream: vec![StreamEnt {

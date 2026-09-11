@@ -3122,7 +3122,20 @@ pub const PACKED_PREFILL_PROG: u32 = 1 << 31;
 /// selects it, by rows.
 pub const TOKEN_BATCH_PROG: u32 = 1 << 30;
 
-const PROGRAM_ROLE_BITS: u32 = PACKED_PREFILL_PROG | TOKEN_BATCH_PROG;
+/// [`BlobProgHeader::t`] bit marking a program as a DECODE RUNG explicitly.
+///
+/// A parent packet never sets it: there the decode ladder is a trailing ascending run and
+/// [`decode_rung_lo`] finds the boundary positionally, which every shipped packet depends on
+/// and which stays byte-identical.
+///
+/// An EXTENSION has no such boundary to find. It carries one or two programs, and a lone
+/// program is `prog_t.len() - 1` — the positional rule would read every extension's single
+/// program as a decode rung, which is how a 4096-row prefill bucket gets refused as a rung
+/// outside the decode band. So an extension states the role instead of implying it, which is
+/// what docs/arch/19 phase 1 does for the parent too; the bit is the down payment on it.
+pub const DECODE_RUNG_PROG: u32 = 1 << 29;
+
+const PROGRAM_ROLE_BITS: u32 = PACKED_PREFILL_PROG | TOKEN_BATCH_PROG | DECODE_RUNG_PROG;
 
 pub fn program_rows(t: u32) -> u32 {
     t & !PROGRAM_ROLE_BITS
@@ -3136,11 +3149,24 @@ pub fn is_token_batch_program(t: u32) -> bool {
     t & TOKEN_BATCH_PROG != 0
 }
 
+pub fn is_decode_rung_program(t: u32) -> bool {
+    t & DECODE_RUNG_PROG != 0
+}
+
+pub fn decode_rung_program_t(rows: u32) -> u32 {
+    assert_eq!(
+        rows & PROGRAM_ROLE_BITS,
+        0,
+        "program row count exceeds 29 bits"
+    );
+    rows | DECODE_RUNG_PROG
+}
+
 pub fn token_batch_program_t(rows: u32) -> u32 {
     assert_eq!(
         rows & PROGRAM_ROLE_BITS,
         0,
-        "program row count exceeds 30 bits"
+        "program row count exceeds 29 bits"
     );
     rows | TOKEN_BATCH_PROG
 }
@@ -3149,7 +3175,7 @@ pub fn packed_prefill_program_t(rows: u32) -> u32 {
     assert_eq!(
         rows & PROGRAM_ROLE_BITS,
         0,
-        "program row count exceeds 30 bits"
+        "program row count exceeds 29 bits"
     );
     rows | PACKED_PREFILL_PROG
 }
@@ -3516,6 +3542,43 @@ impl Model {
     /// If [`Self::gen`] is non-empty the recipes are prepended as a
     /// [`SECT_GEN_TENSORS`] section and the container becomes v7.
     pub fn to_blob_v6(&self, sections: &[SectionData]) -> Vec<u8> {
+        self.container(None, sections)
+    }
+
+    /// Serialise as an EXTENSION container (`extension.pkt`) — docs/arch/19, phase 2.
+    ///
+    /// Identical to [`Self::to_blob_v6`] but for the magic and a leading
+    /// [`crate::ext::SECT_PARENT_REF`] section: the tensor table is replaced by `parent`, a
+    /// reference to the parent packet's. Everything a reader walks after the (empty) tensor
+    /// table is the parent format unchanged, so one parser handles both.
+    ///
+    /// An extension carries programs only. Declaring a tensor here would give it an index the
+    /// parent's table does not have, which is precisely what
+    /// [`crate::ext::BlobParentRef::tensor_digest`] exists to make impossible — so it is an
+    /// assertion at build rather than a refusal at load.
+    pub fn to_ext_blob(
+        &self,
+        parent: &crate::ext::BlobParentRef,
+        sections: &[SectionData],
+    ) -> Vec<u8> {
+        assert!(
+            self.tensors.is_empty(),
+            "an extension declares no tensors of its own — it references the parent's table \
+             ({} declared)",
+            self.tensors.len()
+        );
+        assert!(
+            self.gen.is_empty(),
+            "an extension declares no generated tensors — the parent materialises them"
+        );
+        self.container(Some(parent), sections)
+    }
+
+    fn container(
+        &self,
+        ext_parent: Option<&crate::ext::BlobParentRef>,
+        sections: &[SectionData],
+    ) -> Vec<u8> {
         fn pod<T: Copy>(v: &[T], out: &mut Vec<u8>) {
             let n = std::mem::size_of_val(v);
             out.extend_from_slice(unsafe {
@@ -3525,7 +3588,16 @@ impl Model {
 
         // Generated tensors ride in front of the caller's sections so a reader can
         // resolve every tensor before it touches anything optional.
-        let mut all: Vec<SectionData> = Vec::with_capacity(sections.len() + 1);
+        let mut all: Vec<SectionData> = Vec::with_capacity(sections.len() + 2);
+        // The parent reference rides in FRONT of everything: it is the first thing a loader
+        // must resolve, before it has any reason to trust the rest of the container.
+        if let Some(p) = ext_parent {
+            all.push(SectionData {
+                kind: crate::ext::SECT_PARENT_REF,
+                name: "parent".into(),
+                data: p.to_bytes(),
+            });
+        }
         if !self.gen.is_empty() {
             let mut data = Vec::with_capacity(self.gen.len() * size_of::<GenTensor>());
             pod(&self.gen, &mut data);
@@ -3591,11 +3663,14 @@ impl Model {
         };
         // Header placeholder — sect_dir_offset patched after we know the full layout.
         let hdr = BlobHeader {
-            magic: match (self.gen.is_empty(), l2_flag == 0) {
-                (true, true) => *BLOB_MAGIC_V6,
-                (false, true) => *BLOB_MAGIC_V7,
-                (true, false) => *BLOB_MAGIC_L2SEG,
-                (false, false) => *BLOB_MAGIC_V7_L2SEG,
+            magic: match ext_parent {
+                Some(_) => *crate::ext::EXT_MAGIC,
+                None => match (self.gen.is_empty(), l2_flag == 0) {
+                    (true, true) => *BLOB_MAGIC_V6,
+                    (false, true) => *BLOB_MAGIC_V7,
+                    (true, false) => *BLOB_MAGIC_L2SEG,
+                    (false, false) => *BLOB_MAGIC_V7_L2SEG,
+                },
             },
             n_cu: self.n_cu,
             n_tensor: self.tensors.len() as u32,

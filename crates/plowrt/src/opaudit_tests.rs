@@ -15,6 +15,7 @@ fn prog(t: u32, ops: &[DevInst64]) -> DevProg {
         t,
         packed_prefill_only: false,
         token_batch_body: false,
+            decode_rung: false,
         n_counter: 0,
         insts: ops.to_vec(),
         stream: Vec::new(),

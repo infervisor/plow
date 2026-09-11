@@ -2285,6 +2285,7 @@ mod tests {
             t: 1,
             packed_prefill_only: false,
             token_batch_body: false,
+            decode_rung: false,
             n_counter: 0,
             insts,
             stream: Vec::new(),
@@ -2316,6 +2317,7 @@ mod tests {
             sections: Vec::new(),
             gen: Vec::new(),
             tp: None,
+            parent: None,
         };
         assert_eq!(
             count_xgates(&blob),

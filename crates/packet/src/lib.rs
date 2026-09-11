@@ -32,6 +32,7 @@
 pub mod dev;
 pub mod devbuild;
 pub mod disasm;
+pub mod ext;
 pub mod moe;
 pub mod moe_ep;
 pub mod names;

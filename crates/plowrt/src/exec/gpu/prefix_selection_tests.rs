@@ -70,10 +70,12 @@ fn automatic_prefix_selection_requires_compatible_execution_and_valid_kv_layout(
         sections: Vec::new(),
         gen: Vec::new(),
         tp: None,
+        parent: None,
         progs: vec![DevProg {
             t: 1,
             packed_prefill_only: false,
             token_batch_body: false,
+            decode_rung: false,
             n_counter: 0,
             insts: Vec::new(),
             stream: Vec::new(),
