@@ -930,7 +930,7 @@ chunk analysis and the runtime-fusion measurement, both in their own sections ab
 splitting on this part.
 ## Dense flash prefill: half-wave reductions and the interior-tile mask
 
-Two bit-identical changes to `d_flash_prefill` (`runtime/amd/op_attention.h`), the dense
+Two bit-identical changes to `d_flash_prefill` (`runtime/amd/op_attention_common.h`), the dense
 GQA/MHA flash prefill body shared by every dense model Plow ships: Gemma 4's sliding `hd=256`
 and full `hd=512` layers, and Llama/Qwen `hd=128`. Both are on by default in
 `scripts/build_gfx942.sh` and both are compiled into the four-wave flash object only;
@@ -1448,7 +1448,7 @@ schedule (1.3 ms of unallocated gap across 121 dispatches).
 ## MFMA batched decode: the arithmetic wall is real, removing it is not enough
 
 **This documents a candidate that is NOT shipped.** `GV_MFMA4` defaults to 0 in
-`runtime/amd/op_gemm.h` and `PLOW_GEMV_MFMA4` defaults to 0 in `scripts/build_gfx942.sh`. It
+`runtime/amd/op_gemm_common.h` and `PLOW_GEMV_MFMA4` defaults to 0 in `scripts/build_gfx942.sh`. It
 changes the model's arithmetic, so whether it ships is a model-owner decision and not a
 performance one. Everything below is the evidence for that decision.
 

@@ -813,7 +813,7 @@ matrix rate.
 
 plow ALREADY HAS the primitive: `cp_async16` in `runtime/amd/amd_common.h`, over
 `__builtin_amdgcn_global_load_lds`, whose own comment says it "writes straight into LDS with NO
-VGPRs, which is the only reason this is [worth it]". Its call sites are all in `op_gemm.h`. The
+VGPRs, which is the only reason this is [worth it]". Its call sites are all in `op_gemm_common.h`. The
 attention path never uses it. So the GEMMs stream and the flash kernel — 75% of prefill — does not.
 
 ### Ranked, from the AITER comparison
@@ -829,7 +829,7 @@ attention path never uses it. So the GEMMs stream and the flash kernel — 75% o
 
 ### Adapted, and measured: +21.7% prefill
 
-`cp_async4` (`amd_common.h` [LDS-DMA-4B]) + `FA_LDS_DMA` (`op_attention.h`, opt-in via
+`cp_async4` (`amd_common.h` [LDS-DMA-4B]) + `FA_LDS_DMA` (`op_attention_common.h`, opt-in via
 `PLOW_FA_LDS_DMA=1`). Single request, 70k input, TP8, same packet and serve env; the only
 difference is a flash object built with the axis on:
 

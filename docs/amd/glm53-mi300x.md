@@ -584,7 +584,8 @@ the dense GEMMs), and above ~16k it is the attention kernel.
 | `PLOW_MLA_PF_SMX=0 PLOW_MLA_PF_QK1=1` | 12 214 ms | +0.16% |
 
 `PF_NS` is the causal KV-split factor and `QK1` is the alternative softmax dedup — the two are
-mutually exclusive (`op_attention.h` refuses the pair) and `SMX` is the CDNA3 default. Neither
+mutually exclusive (`op_attention_common.h` refuses the pair) and `SMX` is the CDNA3 default
+(`op_attention_gfx942.h`). Neither
 moves the number. **The 17%-of-peak attention kernel is not limited by softmax redundancy or by
 KV-split parallelism**, which is worth knowing because both are the obvious first guesses. The
 QK1 object builds at an identical register cliff (VGPR 256, LDS 64560, spill 126), so this is a
