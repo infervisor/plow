@@ -4776,8 +4776,10 @@ fn emit_glm_lt_gemm(
 ///   q_idx = interleaved_rope(reshape_HIxDI(wq_b @ q_lat))     [T][HI*DI]
 ///   k_idx = interleaved_rope(k_norm(wk @ xn))                 [T][DI], written at the chunk base
 ///   w     = weights_proj @ xn                                 [T][HI]
-/// `wq_b`/`wk`/`weights_proj` are all bf16 (no shipped checkpoint quantizes any of the three —
-/// see the field doc comments on `GlmLW::iwqb`/`iwk`), so all three take the plain tiled GEMM.
+/// `wq_b`/`wk`/`weights_proj` are all DECLARED bf16, so all three take the plain tiled GEMM. A
+/// block-fp8 checkpoint (GLM-5.3-FP8) stores `wq_b` and `wk` as F8_E4M3 with a `weight_scale_inv`
+/// grid, and the loader upcasts them at bind (`plowrt::asset::dsa_indexer`); see the field doc
+/// comments on `GlmLW::iwqb`/`iwk`.
 ///
 /// KEY CACHE. The scorer reads the indexer keys for the WHOLE context `[0, kv_len)`, of which this
 /// chunk contributes rows `[q_pos0, q_pos0 + t)` — the same append discipline `kv.{l}.kidx` already
@@ -4802,9 +4804,10 @@ fn emit_glm_dsa_prefill_select(
     let (hi, di, h, ql) = (c.index_heads, c.index_dim, c.hidden, c.q_lora);
     let itk = c.index_topk.min(ctx);
     let n_cu = b.n_cu();
-    // `wq_b`/`wk` are plain BF16 in every shipped GLM-5.3-Flash checkpoint (no
-    // `.weight_scale_inv` sibling — confirmed against the real checkpoint and against the
-    // reference: `nvidia/attention.py`'s `wk_weights_proj` is built with `quant_config=None`
+    // `wq_b`/`wk` are computed in BF16 whatever the checkpoint holds. GLM-5.3-FP8 stores them as
+    // F8_E4M3 with a `weight_scale_inv` grid and the loader upcasts them at bind, so the declared
+    // bf16 holds either way. This matches the reference: `nvidia/attention.py`'s
+    // `wk_weights_proj` is built with `quant_config=None`
     // unconditionally, and its own comment says "FP8 wk weights are upcasted to BF16 during
     // loading to maintain fusion" — the indexer's q/k projections compute in BF16 regardless
     // of what the rest of the model's `quantization_config` says. `GemmFp8Blk` needs a real
