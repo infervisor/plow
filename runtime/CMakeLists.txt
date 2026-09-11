@@ -894,6 +894,12 @@ set(PLOW_GQ_BATCH "1" CACHE STRING "global-queue claim batch")
 set(PLOW_DECODE_BATCH "1" CACHE STRING "decode batch bucket")
 set(PLOW_GEMV_MM "" CACHE STRING "decode GEMV rows per walk pass (empty = derived)")
 option(PLOW_GEMV_WALK "Walk a <=16-row GEMV object across wider decode batches" OFF)
+set(_plow_decode_tiers_default OFF)
+if(PLOW_HSACO_ARCH STREQUAL "gfx942")
+    set(_plow_decode_tiers_default ON)
+endif()
+option(PLOW_HSACO_DECODE_TIERS "Build matching narrow decode interpreter objects"
+       ${_plow_decode_tiers_default})
 set(_plow_l2_default OFF)
 set(_plow_gate_hier_default OFF)
 if(PLOW_HSACO_ARCH STREQUAL "gfx942" OR PLOW_HSACO_ARCH STREQUAL "gfx950")
@@ -1552,6 +1558,26 @@ if(PLOW_GFX950_HSACO)
                 COMMENT "hipcc ${_stem}${_sfx}.elf"
                 VERBATIM)
             list(APPEND _hs_outs "${_out}")
+            if(PLOW_HSACO_DECODE_TIERS AND _a1 STREQUAL "_hs_ax_decode")
+                foreach(_width 1 2 4 8)
+                    if(_width GREATER_EQUAL _hs_gvmm)
+                        continue()
+                    endif()
+                    set(_tier_decode ${_hs_ax_decode})
+                    list(REMOVE_ITEM _tier_decode -DPLOW_GEMV_MM=${_hs_gvmm})
+                    list(APPEND _tier_decode -DPLOW_GEMV_MM=${_width})
+                    set(_tier_out "${PLOW_HSACO_DIR}/lowrung${_width}/${_stem}${_sfx}.elf")
+                    add_custom_command(OUTPUT "${_tier_out}"
+                        COMMAND bash "${_hs_run}" "${PLOW_HSACO_HIPCC}" "${PLOW_HSACO_BUNDLER}"
+                                "${PLOW_HSACO_ARCH}" "${_tier_out}" "${_sym}${_sfx}" ${_maxreg} ${_minocc}
+                                ${_hs_inc} ${_hs_arch_def} ${_tier_decode} ${${_a2}} ${_gq}
+                                ${_row_kind_extra} ${_row_extra} "${_hs_src}"
+                        DEPENDS "${_hs_src}" "${_hs_run}" ${_hs_hdrs} ${_hs_config_dep}
+                        COMMENT "hipcc lowrung${_width}/${_stem}${_sfx}.elf"
+                        VERBATIM)
+                    list(APPEND _hs_outs "${_tier_out}")
+                endforeach()
+            endif()
         endforeach()
     endforeach()
 

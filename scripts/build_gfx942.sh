@@ -1511,25 +1511,27 @@ fi
 echo ""
 [ "$fail" = 0 ] || { echo "!!! one or more rows are over the cliff or missing"; exit 1; }
 
-# THE LOW-RUNG DECODE TIERS, built as subdirectories of this object set.
-#
-# `PLOW_DECODE_TIERS=1,2` re-enters this script once per width to fill `$OUT/lowrung<w>` with the
-# decode rows compiled for THAT width (see PLOW_DECODE_TIER above for the measurement). plowrt
-# co-loads them with `PLOW_HSACO_LOWRUNG=<dir>:<w>,...` and picks the narrowest tier that fits
-# each dispatch; scripts/glm53_serve_inner.sh does that automatically when the subdirectories are
-# present, so a blob with a 1/2/4 decode ladder gets a matched object per rung by default.
-#
-# Recursive rather than a loop over $ROWS: a tier is exactly this script with one variable moved,
-# and duplicating the row table, the axis composition and the cliff check to build it inside the
-# loop is how the two drift apart.
-if [ -n "${PLOW_DECODE_TIERS:-}" ] && [ -z "${PLOW_DECODE_TIER:-}" ]; then
+# Compile narrow widths separately to avoid paying the widest GEMV's dead-row arithmetic.
+# An explicit empty PLOW_DECODE_TIERS keeps a single-object build for comparisons.
+if [ "${PLOW_DECODE_TIERS+x}" != x ] && [ "$TIER" = 0 ]; then
+  PLOW_DECODE_TIERS=""
+  case "${PLOW_ROWS_ONLY:-}" in
+    ''|*interp_decode*)
+      for w in 1 2 4 8; do
+        if [ "$w" -lt "$GVMM" ]; then PLOW_DECODE_TIERS+="${PLOW_DECODE_TIERS:+,}$w"; fi
+      done ;;
+  esac
+fi
+if [ -n "${PLOW_DECODE_TIERS:-}" ] && [ "$TIER" = 0 ]; then
+  tier_rows=interp_decode
+  case "${PLOW_ROWS_ONLY:-}" in *interp_decode*) tier_rows="$PLOW_ROWS_ONLY" ;; esac
   for w in ${PLOW_DECODE_TIERS//,/ }; do
     case "$w" in ''|*[!0-9]*) echo "PLOW_DECODE_TIERS must be a comma list of widths" >&2; exit 1;; esac
     if [ "$w" -ge "$RAW_BATCH" ]; then continue; fi  # the wide object already serves this rung
     echo ""
     echo ">>> low-rung decode tier: width $w -> $OUT/lowrung$w"
     ( unset PLOW_DECODE_TIERS PLOW_GEMV_MM
-      PLOW_DECODE_TIER="$w" PLOW_ROWS_ONLY==interp_decode \
+      PLOW_DECODE_TIER="$w" PLOW_ROWS_ONLY="$tier_rows" \
         "$REPO/scripts/build_gfx942.sh" "$OUT/lowrung$w" ) || exit 1
   done
 fi

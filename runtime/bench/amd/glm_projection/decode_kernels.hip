@@ -1,5 +1,7 @@
 #define PLOW_WG_WAVES 8
+#ifndef PLOW_GEMV_MM
 #define PLOW_GEMV_MM 16
+#endif
 #define PLOW_GEMV_WALK 1
 #define PLOW_GEMV_LG 1
 #include <hip/hip_runtime.h>
@@ -17,3 +19,4 @@ extern "C" int plow_projection(void* c, void* x, void* w, unsigned m,unsigned n,
  projection<<<304,512,0,(hipStream_t)stream>>>((unsigned short*)c,(unsigned short*)x,(unsigned short*)w,m,n,k);
  return hipGetLastError();
 }
+extern "C" unsigned plow_projection_width() { return PLOW_GEMV_MM; }

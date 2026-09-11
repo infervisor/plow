@@ -1,0 +1,3072 @@
+{
+  "schema": "plow.glm-ladder-coverage.v1",
+  "scope": "Static packet, object-marker and route audit for GLM TP8 gfx942 FP8-KV. Loader pairing and GPU execution are separate checks. Presence does not prove performance optimality.",
+  "packet_json_sha256": "d4c71eebdf65a2d791ef79c7c74bfe64bb70a04374b2ebd4f6c5ae11859c6289",
+  "disable_tiers": false,
+  "source_commit": "abcf7c87b6190054d73d112a95a0716acc5e21aa",
+  "source_sha256": {
+    "scripts/build_gfx942.sh": "8132da8118ec9ed07795f96535d95e53dda74e192a5ca16dcee766433fffc87f",
+    "runtime/CMakeLists.txt": "057b7da0cfed6d44bfc2922be163464d0e8d529fa46733e163a059b04a08854c",
+    "crates/devgen/src/mla.rs": "e79711e11a5b584c3da898e85cfe949714fde30934c4b30519563f77387d4d95",
+    "crates/plowrt/src/exec/amd.rs": "8371ee9c506b19685c406158acbf8e47478d6998ae0d4e8d3de1d975d21849b1",
+    "crates/plowrt/src/exec/amd_tp.rs": "6202029d608c4a8b7daf33ff3f2a7de570715fd3eafd477727378302daeeb2a3",
+    "crates/plowrt/src/exec/amd_gemm_lt.rs": "5d22215b756f359e97fe16def27b2adf32948199e76941ce74918956261372c4",
+    "crates/plowrt/src/exec/amd_sparse_mla.rs": "0a181319ca24a2d858bb2f8a8a2527cb94e11e3b336160b8ac3094a1dc6d40b6",
+    "runtime/amd/op_gemm.h": "a36c327c634d2e049732c801323f8e365defb2c8046c82f67af9288479520208",
+    "runtime/amd/op_attention.h": "057b811c7ac2c7f271ddc3dfc8eeb0454bc0187180ae890d4f62f944b1e710f9",
+    "runtime/amd/glm_lt_gfx942.json": "ec5af8ed394bb47eff7383a4da9d90b3c7f5549d998694a41179cd44d34e32f5",
+    "runtime/amd/glm_lt_decode_gfx942.json": "1af889d4bad8d47fb485a617b4194768c161c40057f82ea91ec063e7f8be78fb"
+  },
+  "checker_sha256": "5305c3f3f3bf838aa37cbabdd006442bfb48972ac01a1377fdaa45761a0ad684",
+  "programs": [
+    {
+      "phase": "prefill",
+      "rung": 128,
+      "interpreter": "interp_prefill_fp8kv_mla_moe_gq.elf",
+      "opcodes": {
+        "Argmax": 1,
+        "Embed": 1,
+        "FlashMlaPrefillFp8": 78,
+        "GemmGlu": 75,
+        "GemmSmall": 618,
+        "Gemv": 1,
+        "HeadNormRope": 156,
+        "HeadNormRopeFp8": 78,
+        "MlaMergeFold": 78,
+        "MoeAiterFp8Pf": 75,
+        "MoeAlignPf": 78,
+        "MoeCombinePf": 78,
+        "MoeGroupDownPf": 3,
+        "MoeGroupGluPf": 3,
+        "MoeRouterTopkPf": 75,
+        "Residual": 156,
+        "RmsNorm": 235,
+        "XArgmaxFin": 1,
+        "XReduceTwoShot": 156
+      },
+      "native_segments": {
+        "MoeAiterFp8Pf": {
+          "instructions": 75,
+          "objects": [
+            "moe_aiter_adapter_gfx942.elf",
+            "fmoe_bf16_a16_blockscaleFp8_g1u1_vs_silu_1tg_16x128_flat_pf3.co",
+            "fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256.co"
+          ]
+        }
+      },
+      "projections": [
+        {
+          "op": "GemmGlu",
+          "shape": [
+            128,
+            256,
+            6144
+          ],
+          "instructions": 75
+        },
+        {
+          "op": "GemmSmall",
+          "shape": [
+            128,
+            64,
+            6144
+          ],
+          "instructions": 78
+        },
+        {
+          "op": "GemmSmall",
+          "shape": [
+            128,
+            256,
+            6144
+          ],
+          "instructions": 75
+        },
+        {
+          "op": "GemmSmall",
+          "shape": [
+            128,
+            512,
+            2048
+          ],
+          "instructions": 78
+        },
+        {
+          "op": "GemmSmall",
+          "shape": [
+            128,
+            512,
+            6144
+          ],
+          "instructions": 78
+        },
+        {
+          "op": "GemmSmall",
+          "shape": [
+            128,
+            2048,
+            6144
+          ],
+          "instructions": 78
+        },
+        {
+          "op": "GemmSmall",
+          "shape": [
+            128,
+            4096,
+            2048
+          ],
+          "instructions": 78
+        },
+        {
+          "op": "GemmSmall",
+          "shape": [
+            128,
+            6144,
+            256
+          ],
+          "instructions": 75
+        },
+        {
+          "op": "GemmSmall",
+          "shape": [
+            128,
+            6144,
+            2048
+          ],
+          "instructions": 78
+        },
+        {
+          "op": "Gemv",
+          "shape": [
+            1,
+            19360,
+            6144
+          ],
+          "instructions": 1
+        }
+      ],
+      "attention_interpreter": "interp_prefill_fp8kv_mla_moe_gq.elf",
+      "native_mla_candidates": 0,
+      "native_mla_condition": "PLOW_MLA_PF_AITER=1; rung >= 2048; selected union; live rows > 0; prior >= 2047. Otherwise the rung attention interpreter."
+    },
+    {
+      "phase": "prefill",
+      "rung": 512,
+      "interpreter": "interp_prefill_fp8kv_mla_moe_gq.elf",
+      "opcodes": {
+        "Argmax": 1,
+        "Embed": 1,
+        "FlashMlaPrefillFp8": 78,
+        "GemmGlu": 75,
+        "GemmMed": 153,
+        "GemmSmall": 465,
+        "Gemv": 1,
+        "HeadNormRope": 156,
+        "HeadNormRopeFp8": 78,
+        "MlaMergeFold": 78,
+        "MoeAiterFp8Pf": 75,
+        "MoeAlignPf": 78,
+        "MoeCombinePf": 78,
+        "MoeGroupDownPf": 3,
+        "MoeGroupGluPf": 3,
+        "MoeRouterTopkPf": 75,
+        "Residual": 156,
+        "RmsNorm": 235,
+        "XArgmaxFin": 1,
+        "XReduceTwoShot": 156
+      },
+      "native_segments": {
+        "MoeAiterFp8Pf": {
+          "instructions": 75,
+          "objects": [
+            "moe_aiter_adapter_gfx942.elf",
+            "fmoe_bf16_a16_blockscaleFp8_g1u1_vs_silu_1tg_16x128_flat_pf3.co",
+            "fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256.co"
+          ]
+        }
+      },
+      "projections": [
+        {
+          "op": "GemmGlu",
+          "shape": [
+            512,
+            256,
+            6144
+          ],
+          "instructions": 75
+        },
+        {
+          "op": "GemmMed",
+          "shape": [
+            512,
+            6144,
+            256
+          ],
+          "instructions": 75
+        },
+        {
+          "op": "GemmMed",
+          "shape": [
+            512,
+            6144,
+            2048
+          ],
+          "instructions": 78
+        },
+        {
+          "op": "GemmSmall",
+          "shape": [
+            512,
+            64,
+            6144
+          ],
+          "instructions": 78
+        },
+        {
+          "op": "GemmSmall",
+          "shape": [
+            512,
+            256,
+            6144
+          ],
+          "instructions": 75
+        },
+        {
+          "op": "GemmSmall",
+          "shape": [
+            512,
+            512,
+            2048
+          ],
+          "instructions": 78
+        },
+        {
+          "op": "GemmSmall",
+          "shape": [
+            512,
+            512,
+            6144
+          ],
+          "instructions": 78
+        },
+        {
+          "op": "GemmSmall",
+          "shape": [
+            512,
+            2048,
+            6144
+          ],
+          "instructions": 78
+        },
+        {
+          "op": "GemmSmall",
+          "shape": [
+            512,
+            4096,
+            2048
+          ],
+          "instructions": 78
+        },
+        {
+          "op": "Gemv",
+          "shape": [
+            1,
+            19360,
+            6144
+          ],
+          "instructions": 1
+        }
+      ],
+      "attention_interpreter": "interp_prefill_fp8kv_mla_moe_gq.elf",
+      "native_mla_candidates": 0,
+      "native_mla_condition": "PLOW_MLA_PF_AITER=1; rung >= 2048; selected union; live rows > 0; prior >= 2047. Otherwise the rung attention interpreter."
+    },
+    {
+      "phase": "prefill",
+      "rung": 2048,
+      "interpreter": "interp_prefill_fp8kv_mla_moe_gq.elf",
+      "opcodes": {
+        "Argmax": 1,
+        "Embed": 1,
+        "FlashMlaPrefillFp8": 78,
+        "Gemm": 153,
+        "GemmGlu": 75,
+        "GemmLtPf": 234,
+        "GemmSmall": 231,
+        "Gemv": 1,
+        "HeadNormRope": 156,
+        "HeadNormRopeFp8": 78,
+        "MlaMergeFold": 78,
+        "MoeAiterFp8Pf": 75,
+        "MoeAlignPf": 303,
+        "MoeCombinePf": 78,
+        "MoeGroupDownPf": 3,
+        "MoeGroupGluPf": 3,
+        "MoeRouterTopkPf": 75,
+        "Residual": 156,
+        "RmsNorm": 235,
+        "XArgmaxFin": 1,
+        "XReduceTwoShot": 156
+      },
+      "native_segments": {
+        "GemmLtPf": {
+          "instructions": 234,
+          "objects": [
+            "glm_lt_gfx942.elf"
+          ]
+        },
+        "MoeAiterFp8Pf": {
+          "instructions": 75,
+          "objects": [
+            "moe_aiter_adapter_gfx942.elf",
+            "fmoe_bf16_a16_blockscaleFp8_g1u1_vs_silu_1tg_16x128_flat_pf3.co",
+            "fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256.co"
+          ]
+        }
+      },
+      "projections": [
+        {
+          "op": "Gemm",
+          "shape": [
+            2048,
+            6144,
+            256
+          ],
+          "instructions": 75
+        },
+        {
+          "op": "Gemm",
+          "shape": [
+            2048,
+            6144,
+            2048
+          ],
+          "instructions": 78
+        },
+        {
+          "op": "GemmGlu",
+          "shape": [
+            2048,
+            256,
+            6144
+          ],
+          "instructions": 75
+        },
+        {
+          "op": "GemmLtPf",
+          "shape": [
+            2048,
+            512,
+            6144
+          ],
+          "instructions": 78
+        },
+        {
+          "op": "GemmLtPf",
+          "shape": [
+            2048,
+            2048,
+            6144
+          ],
+          "instructions": 78
+        },
+        {
+          "op": "GemmLtPf",
+          "shape": [
+            2048,
+            4096,
+            2048
+          ],
+          "instructions": 78
+        },
+        {
+          "op": "GemmSmall",
+          "shape": [
+            2048,
+            64,
+            6144
+          ],
+          "instructions": 78
+        },
+        {
+          "op": "GemmSmall",
+          "shape": [
+            2048,
+            256,
+            6144
+          ],
+          "instructions": 75
+        },
+        {
+          "op": "GemmSmall",
+          "shape": [
+            2048,
+            512,
+            2048
+          ],
+          "instructions": 78
+        },
+        {
+          "op": "Gemv",
+          "shape": [
+            1,
+            19360,
+            6144
+          ],
+          "instructions": 1
+        }
+      ],
+      "attention_interpreter": "interp_flash_fp8kv_gq.elf",
+      "native_mla_candidates": 0,
+      "native_mla_condition": "PLOW_MLA_PF_AITER=1; rung >= 2048; selected union; live rows > 0; prior >= 2047. Otherwise the rung attention interpreter."
+    },
+    {
+      "phase": "prefill",
+      "rung": 8192,
+      "interpreter": "interp_prefill_fp8kv_mla_moe_gq.elf",
+      "opcodes": {
+        "Argmax": 1,
+        "Embed": 1,
+        "FlashMlaPrefillFp8": 78,
+        "Gemm": 153,
+        "GemmGlu": 75,
+        "GemmLtPf": 255,
+        "GemmMed": 78,
+        "GemmSmall": 195,
+        "Gemv": 1,
+        "HeadNormRope": 198,
+        "HeadNormRopeFp8": 78,
+        "IndexTpPf": 21,
+        "IndexUnionPf": 21,
+        "LayerNorm": 21,
+        "MlaMergeFold": 78,
+        "MoeAiterFp8Pf": 75,
+        "MoeAlignPf": 303,
+        "MoeCombinePf": 78,
+        "MoeGroupDownPf": 3,
+        "MoeGroupGluPf": 3,
+        "MoeRouterTopkPf": 75,
+        "Residual": 156,
+        "RmsNorm": 235,
+        "XArgmaxFin": 1,
+        "XReduceTwoShot": 156
+      },
+      "native_segments": {
+        "GemmLtPf": {
+          "instructions": 255,
+          "objects": [
+            "glm_lt_gfx942.elf"
+          ]
+        },
+        "MoeAiterFp8Pf": {
+          "instructions": 75,
+          "objects": [
+            "moe_aiter_adapter_gfx942.elf",
+            "fmoe_bf16_a16_blockscaleFp8_g1u1_vs_silu_1tg_16x128_flat_pf3.co",
+            "fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256.co"
+          ]
+        },
+        "IndexTpPf": {
+          "instructions": 21,
+          "objects": [
+            "dsa_tp_adapter_gfx942.elf"
+          ]
+        }
+      },
+      "projections": [
+        {
+          "op": "Gemm",
+          "shape": [
+            8192,
+            6144,
+            256
+          ],
+          "instructions": 75
+        },
+        {
+          "op": "Gemm",
+          "shape": [
+            8192,
+            6144,
+            2048
+          ],
+          "instructions": 78
+        },
+        {
+          "op": "GemmGlu",
+          "shape": [
+            8192,
+            256,
+            6144
+          ],
+          "instructions": 75
+        },
+        {
+          "op": "GemmLtPf",
+          "shape": [
+            8192,
+            512,
+            6144
+          ],
+          "instructions": 78
+        },
+        {
+          "op": "GemmLtPf",
+          "shape": [
+            8192,
+            2048,
+            6144
+          ],
+          "instructions": 78
+        },
+        {
+          "op": "GemmLtPf",
+          "shape": [
+            8192,
+            4096,
+            2048
+          ],
+          "instructions": 99
+        },
+        {
+          "op": "GemmMed",
+          "shape": [
+            8192,
+            512,
+            2048
+          ],
+          "instructions": 78
+        },
+        {
+          "op": "GemmSmall",
+          "shape": [
+            8192,
+            32,
+            6144
+          ],
+          "instructions": 21
+        },
+        {
+          "op": "GemmSmall",
+          "shape": [
+            8192,
+            64,
+            6144
+          ],
+          "instructions": 78
+        },
+        {
+          "op": "GemmSmall",
+          "shape": [
+            8192,
+            128,
+            6144
+          ],
+          "instructions": 21
+        },
+        {
+          "op": "GemmSmall",
+          "shape": [
+            8192,
+            256,
+            6144
+          ],
+          "instructions": 75
+        },
+        {
+          "op": "Gemv",
+          "shape": [
+            1,
+            19360,
+            6144
+          ],
+          "instructions": 1
+        }
+      ],
+      "attention_interpreter": "interp_flash_fp8kv_gq.elf",
+      "native_mla_candidates": 78,
+      "native_mla_condition": "PLOW_MLA_PF_AITER=1; rung >= 2048; selected union; live rows > 0; prior >= 2047. Otherwise the rung attention interpreter."
+    },
+    {
+      "phase": "decode",
+      "rung": 1,
+      "interpreter": "lowrung1/interp_decode_fp8kv_gq.elf",
+      "opcodes": {
+        "AddNorm": 155,
+        "Argmax": 1,
+        "DenseGluFp8Blk": 3,
+        "Embed": 1,
+        "FlashMlaDecodeFp8": 78,
+        "Gemv": 292,
+        "GemvFp8Blk": 3,
+        "GemvGlu": 75,
+        "GemvQkv": 156,
+        "HeadNormRope": 198,
+        "HeadNormRopeFp8": 78,
+        "IndexScore": 21,
+        "IndexSelect": 21,
+        "LayerNorm": 21,
+        "MlaMergeFold": 78,
+        "MoeAiterFp8Pf": 75,
+        "MoeCombinePf": 75,
+        "MoeRouterTopkPf": 75,
+        "Residual": 1,
+        "RmsNorm": 80,
+        "XArgmaxFin": 1,
+        "XReduce": 156
+      },
+      "native_segments": {
+        "MoeAiterFp8Pf": {
+          "instructions": 75,
+          "objects": [
+            "moe_aiter_adapter_gfx942.elf",
+            "fmoe_bf16_a16_blockscaleFp8_g1u1_vs_silu_1tg_16x128_flat_pf3.co",
+            "fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256.co"
+          ]
+        }
+      },
+      "projections": [
+        {
+          "op": "Gemv",
+          "shape": [
+            1,
+            32,
+            6144
+          ],
+          "instructions": 21
+        },
+        {
+          "op": "Gemv",
+          "shape": [
+            1,
+            128,
+            6144
+          ],
+          "instructions": 21
+        },
+        {
+          "op": "Gemv",
+          "shape": [
+            1,
+            256,
+            6144
+          ],
+          "instructions": 75
+        },
+        {
+          "op": "Gemv",
+          "shape": [
+            1,
+            4096,
+            2048
+          ],
+          "instructions": 21
+        },
+        {
+          "op": "Gemv",
+          "shape": [
+            1,
+            6144,
+            256
+          ],
+          "instructions": 75
+        },
+        {
+          "op": "Gemv",
+          "shape": [
+            1,
+            6144,
+            2048
+          ],
+          "instructions": 78
+        },
+        {
+          "op": "Gemv",
+          "shape": [
+            1,
+            19360,
+            6144
+          ],
+          "instructions": 1
+        },
+        {
+          "op": "GemvFp8Blk",
+          "shape": [
+            1,
+            6144,
+            1536
+          ],
+          "instructions": 3
+        },
+        {
+          "op": "GemvGlu",
+          "shape": [
+            1,
+            256,
+            6144
+          ],
+          "instructions": 75
+        },
+        {
+          "op": "GemvQkv",
+          "shape": [
+            1,
+            2048,
+            6144
+          ],
+          "instructions": 78
+        },
+        {
+          "op": "GemvQkv",
+          "shape": [
+            1,
+            4096,
+            2048
+          ],
+          "instructions": 78
+        }
+      ],
+      "compiled_gemv_width": 1,
+      "matched_width": true,
+      "gemv_passes": 1
+    },
+    {
+      "phase": "decode",
+      "rung": 2,
+      "interpreter": "lowrung2/interp_decode_fp8kv_gq.elf",
+      "opcodes": {
+        "AddNorm": 155,
+        "Argmax": 1,
+        "Embed": 1,
+        "FlashMlaDecodeFp8": 78,
+        "Gemv": 292,
+        "GemvGlu": 75,
+        "GemvQkv": 156,
+        "HeadNormRope": 198,
+        "HeadNormRopeFp8": 78,
+        "IndexScore": 21,
+        "IndexSelect": 21,
+        "LayerNorm": 21,
+        "MlaMergeFold": 78,
+        "MoeAiterFp8Pf": 75,
+        "MoeAlignPf": 3,
+        "MoeCombinePf": 78,
+        "MoeGroupDownPf": 3,
+        "MoeGroupGluPf": 3,
+        "MoeRouterTopkPf": 75,
+        "Residual": 1,
+        "RmsNorm": 80,
+        "XArgmaxFin": 1,
+        "XReduce": 156
+      },
+      "native_segments": {
+        "MoeAiterFp8Pf": {
+          "instructions": 75,
+          "objects": [
+            "moe_aiter_adapter_gfx942.elf",
+            "fmoe_bf16_a16_blockscaleFp8_g1u1_vs_silu_1tg_16x128_flat_pf3.co",
+            "fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256.co"
+          ]
+        }
+      },
+      "projections": [
+        {
+          "op": "Gemv",
+          "shape": [
+            2,
+            32,
+            6144
+          ],
+          "instructions": 21
+        },
+        {
+          "op": "Gemv",
+          "shape": [
+            2,
+            128,
+            6144
+          ],
+          "instructions": 21
+        },
+        {
+          "op": "Gemv",
+          "shape": [
+            2,
+            256,
+            6144
+          ],
+          "instructions": 75
+        },
+        {
+          "op": "Gemv",
+          "shape": [
+            2,
+            4096,
+            2048
+          ],
+          "instructions": 21
+        },
+        {
+          "op": "Gemv",
+          "shape": [
+            2,
+            6144,
+            256
+          ],
+          "instructions": 75
+        },
+        {
+          "op": "Gemv",
+          "shape": [
+            2,
+            6144,
+            2048
+          ],
+          "instructions": 78
+        },
+        {
+          "op": "Gemv",
+          "shape": [
+            2,
+            19360,
+            6144
+          ],
+          "instructions": 1
+        },
+        {
+          "op": "GemvGlu",
+          "shape": [
+            2,
+            256,
+            6144
+          ],
+          "instructions": 75
+        },
+        {
+          "op": "GemvQkv",
+          "shape": [
+            2,
+            2048,
+            6144
+          ],
+          "instructions": 78
+        },
+        {
+          "op": "GemvQkv",
+          "shape": [
+            2,
+            4096,
+            2048
+          ],
+          "instructions": 78
+        }
+      ],
+      "compiled_gemv_width": 2,
+      "matched_width": true,
+      "gemv_passes": 1
+    },
+    {
+      "phase": "decode",
+      "rung": 4,
+      "interpreter": "lowrung4/interp_decode_fp8kv_gq.elf",
+      "opcodes": {
+        "AddNorm": 155,
+        "Argmax": 1,
+        "Embed": 1,
+        "FlashMlaDecodeFp8": 78,
+        "Gemv": 676,
+        "GemvQkv": 78,
+        "Glu": 75,
+        "HeadNormRope": 198,
+        "HeadNormRopeFp8": 78,
+        "IndexScore": 21,
+        "IndexSelect": 21,
+        "LayerNorm": 21,
+        "MlaMergeFold": 78,
+        "MoeAiterFp8Pf": 75,
+        "MoeAlignPf": 3,
+        "MoeCombinePf": 78,
+        "MoeGroupDownPf": 3,
+        "MoeGroupGluPf": 3,
+        "MoeRouterTopkPf": 75,
+        "Residual": 1,
+        "RmsNorm": 80,
+        "XArgmaxFin": 1,
+        "XReduce": 156
+      },
+      "native_segments": {
+        "MoeAiterFp8Pf": {
+          "instructions": 75,
+          "objects": [
+            "moe_aiter_adapter_gfx942.elf",
+            "fmoe_bf16_a16_blockscaleFp8_g1u1_vs_silu_1tg_16x128_flat_pf3.co",
+            "fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256.co"
+          ]
+        }
+      },
+      "projections": [
+        {
+          "op": "Gemv",
+          "shape": [
+            4,
+            32,
+            6144
+          ],
+          "instructions": 21
+        },
+        {
+          "op": "Gemv",
+          "shape": [
+            4,
+            64,
+            6144
+          ],
+          "instructions": 78
+        },
+        {
+          "op": "Gemv",
+          "shape": [
+            4,
+            128,
+            6144
+          ],
+          "instructions": 21
+        },
+        {
+          "op": "Gemv",
+          "shape": [
+            4,
+            256,
+            6144
+          ],
+          "instructions": 225
+        },
+        {
+          "op": "Gemv",
+          "shape": [
+            4,
+            512,
+            6144
+          ],
+          "instructions": 78
+        },
+        {
+          "op": "Gemv",
+          "shape": [
+            4,
+            2048,
+            6144
+          ],
+          "instructions": 78
+        },
+        {
+          "op": "Gemv",
+          "shape": [
+            4,
+            4096,
+            2048
+          ],
+          "instructions": 21
+        },
+        {
+          "op": "Gemv",
+          "shape": [
+            4,
+            6144,
+            256
+          ],
+          "instructions": 75
+        },
+        {
+          "op": "Gemv",
+          "shape": [
+            4,
+            6144,
+            2048
+          ],
+          "instructions": 78
+        },
+        {
+          "op": "Gemv",
+          "shape": [
+            4,
+            19360,
+            6144
+          ],
+          "instructions": 1
+        },
+        {
+          "op": "GemvQkv",
+          "shape": [
+            4,
+            4096,
+            2048
+          ],
+          "instructions": 78
+        }
+      ],
+      "compiled_gemv_width": 4,
+      "matched_width": true,
+      "gemv_passes": 1
+    },
+    {
+      "phase": "decode",
+      "rung": 8,
+      "interpreter": "lowrung8/interp_decode_fp8kv_gq.elf",
+      "opcodes": {
+        "AddNorm": 155,
+        "Argmax": 1,
+        "Embed": 1,
+        "FlashMlaDecodeFp8": 78,
+        "Gemv": 832,
+        "Glu": 75,
+        "HeadNormRope": 198,
+        "HeadNormRopeFp8": 78,
+        "IndexScore": 21,
+        "IndexSelect": 21,
+        "LayerNorm": 21,
+        "MlaMergeFold": 78,
+        "MoeAiterFp8Pf": 75,
+        "MoeAlignPf": 3,
+        "MoeCombinePf": 78,
+        "MoeGroupDownPf": 3,
+        "MoeGroupGluPf": 3,
+        "MoeRouterTopkPf": 75,
+        "Residual": 1,
+        "RmsNorm": 80,
+        "XArgmaxFin": 1,
+        "XReduce": 156
+      },
+      "native_segments": {
+        "MoeAiterFp8Pf": {
+          "instructions": 75,
+          "objects": [
+            "moe_aiter_adapter_gfx942.elf",
+            "fmoe_bf16_a16_blockscaleFp8_g1u1_vs_silu_1tg_16x128_flat_pf3.co",
+            "fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256.co"
+          ]
+        }
+      },
+      "projections": [
+        {
+          "op": "Gemv",
+          "shape": [
+            8,
+            32,
+            6144
+          ],
+          "instructions": 21
+        },
+        {
+          "op": "Gemv",
+          "shape": [
+            8,
+            64,
+            6144
+          ],
+          "instructions": 78
+        },
+        {
+          "op": "Gemv",
+          "shape": [
+            8,
+            128,
+            6144
+          ],
+          "instructions": 21
+        },
+        {
+          "op": "Gemv",
+          "shape": [
+            8,
+            256,
+            6144
+          ],
+          "instructions": 225
+        },
+        {
+          "op": "Gemv",
+          "shape": [
+            8,
+            512,
+            2048
+          ],
+          "instructions": 78
+        },
+        {
+          "op": "Gemv",
+          "shape": [
+            8,
+            512,
+            6144
+          ],
+          "instructions": 78
+        },
+        {
+          "op": "Gemv",
+          "shape": [
+            8,
+            2048,
+            6144
+          ],
+          "instructions": 78
+        },
+        {
+          "op": "Gemv",
+          "shape": [
+            8,
+            4096,
+            2048
+          ],
+          "instructions": 99
+        },
+        {
+          "op": "Gemv",
+          "shape": [
+            8,
+            6144,
+            256
+          ],
+          "instructions": 75
+        },
+        {
+          "op": "Gemv",
+          "shape": [
+            8,
+            6144,
+            2048
+          ],
+          "instructions": 78
+        },
+        {
+          "op": "Gemv",
+          "shape": [
+            8,
+            19360,
+            6144
+          ],
+          "instructions": 1
+        }
+      ],
+      "compiled_gemv_width": 8,
+      "matched_width": true,
+      "gemv_passes": 1
+    },
+    {
+      "phase": "decode",
+      "rung": 16,
+      "interpreter": "interp_decode_fp8kv_gq.elf",
+      "opcodes": {
+        "AddNorm": 155,
+        "Argmax": 1,
+        "Embed": 1,
+        "FlashMlaDecodeFp8": 78,
+        "GemmLtPf": 633,
+        "Gemv": 199,
+        "Glu": 75,
+        "HeadNormRope": 198,
+        "HeadNormRopeFp8": 78,
+        "IndexScore": 21,
+        "IndexSelect": 21,
+        "LayerNorm": 21,
+        "MlaMergeFold": 78,
+        "MoeAiterFp8Pf": 75,
+        "MoeAlignPf": 3,
+        "MoeCombinePf": 78,
+        "MoeGroupDownPf": 3,
+        "MoeGroupGluPf": 3,
+        "MoeRouterTopkPf": 75,
+        "Residual": 1,
+        "RmsNorm": 80,
+        "XArgmaxFin": 1,
+        "XReduce": 156
+      },
+      "native_segments": {
+        "GemmLtPf": {
+          "instructions": 633,
+          "objects": [
+            "glm_lt_gfx942.elf"
+          ]
+        },
+        "MoeAiterFp8Pf": {
+          "instructions": 75,
+          "objects": [
+            "moe_aiter_adapter_gfx942.elf",
+            "fmoe_bf16_a16_blockscaleFp8_g1u1_vs_silu_1tg_16x128_flat_pf3.co",
+            "fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256.co"
+          ]
+        }
+      },
+      "projections": [
+        {
+          "op": "GemmLtPf",
+          "shape": [
+            16,
+            256,
+            6144
+          ],
+          "instructions": 225
+        },
+        {
+          "op": "GemmLtPf",
+          "shape": [
+            16,
+            512,
+            6144
+          ],
+          "instructions": 78
+        },
+        {
+          "op": "GemmLtPf",
+          "shape": [
+            16,
+            2048,
+            6144
+          ],
+          "instructions": 78
+        },
+        {
+          "op": "GemmLtPf",
+          "shape": [
+            16,
+            4096,
+            2048
+          ],
+          "instructions": 99
+        },
+        {
+          "op": "GemmLtPf",
+          "shape": [
+            16,
+            6144,
+            256
+          ],
+          "instructions": 75
+        },
+        {
+          "op": "GemmLtPf",
+          "shape": [
+            16,
+            6144,
+            2048
+          ],
+          "instructions": 78
+        },
+        {
+          "op": "Gemv",
+          "shape": [
+            16,
+            32,
+            6144
+          ],
+          "instructions": 21
+        },
+        {
+          "op": "Gemv",
+          "shape": [
+            16,
+            64,
+            6144
+          ],
+          "instructions": 78
+        },
+        {
+          "op": "Gemv",
+          "shape": [
+            16,
+            128,
+            6144
+          ],
+          "instructions": 21
+        },
+        {
+          "op": "Gemv",
+          "shape": [
+            16,
+            512,
+            2048
+          ],
+          "instructions": 78
+        },
+        {
+          "op": "Gemv",
+          "shape": [
+            16,
+            19360,
+            6144
+          ],
+          "instructions": 1
+        }
+      ],
+      "compiled_gemv_width": 16,
+      "matched_width": true,
+      "gemv_passes": 1
+    },
+    {
+      "phase": "decode",
+      "rung": 20,
+      "interpreter": "interp_decode_fp8kv_gq.elf",
+      "opcodes": {
+        "AddNorm": 155,
+        "Argmax": 1,
+        "Embed": 1,
+        "FlashMlaDecodeFp8": 78,
+        "GemmLtPf": 633,
+        "Gemv": 199,
+        "Glu": 75,
+        "HeadNormRope": 198,
+        "HeadNormRopeFp8": 78,
+        "IndexScore": 21,
+        "IndexSelect": 21,
+        "LayerNorm": 21,
+        "MlaMergeFold": 78,
+        "MoeAiterFp8Pf": 75,
+        "MoeAlignPf": 3,
+        "MoeCombinePf": 78,
+        "MoeGroupDownPf": 3,
+        "MoeGroupGluPf": 3,
+        "MoeRouterTopkPf": 75,
+        "Residual": 1,
+        "RmsNorm": 80,
+        "XArgmaxFin": 1,
+        "XReduce": 156
+      },
+      "native_segments": {
+        "GemmLtPf": {
+          "instructions": 633,
+          "objects": [
+            "glm_lt_gfx942.elf"
+          ]
+        },
+        "MoeAiterFp8Pf": {
+          "instructions": 75,
+          "objects": [
+            "moe_aiter_adapter_gfx942.elf",
+            "fmoe_bf16_a16_blockscaleFp8_g1u1_vs_silu_1tg_16x128_flat_pf3.co",
+            "fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256.co"
+          ]
+        }
+      },
+      "projections": [
+        {
+          "op": "GemmLtPf",
+          "shape": [
+            20,
+            256,
+            6144
+          ],
+          "instructions": 225
+        },
+        {
+          "op": "GemmLtPf",
+          "shape": [
+            20,
+            512,
+            6144
+          ],
+          "instructions": 78
+        },
+        {
+          "op": "GemmLtPf",
+          "shape": [
+            20,
+            2048,
+            6144
+          ],
+          "instructions": 78
+        },
+        {
+          "op": "GemmLtPf",
+          "shape": [
+            20,
+            4096,
+            2048
+          ],
+          "instructions": 99
+        },
+        {
+          "op": "GemmLtPf",
+          "shape": [
+            20,
+            6144,
+            256
+          ],
+          "instructions": 75
+        },
+        {
+          "op": "GemmLtPf",
+          "shape": [
+            20,
+            6144,
+            2048
+          ],
+          "instructions": 78
+        },
+        {
+          "op": "Gemv",
+          "shape": [
+            20,
+            32,
+            6144
+          ],
+          "instructions": 21
+        },
+        {
+          "op": "Gemv",
+          "shape": [
+            20,
+            64,
+            6144
+          ],
+          "instructions": 78
+        },
+        {
+          "op": "Gemv",
+          "shape": [
+            20,
+            128,
+            6144
+          ],
+          "instructions": 21
+        },
+        {
+          "op": "Gemv",
+          "shape": [
+            20,
+            512,
+            2048
+          ],
+          "instructions": 78
+        },
+        {
+          "op": "Gemv",
+          "shape": [
+            20,
+            19360,
+            6144
+          ],
+          "instructions": 1
+        }
+      ],
+      "compiled_gemv_width": 16,
+      "matched_width": true,
+      "gemv_passes": 2
+    }
+  ],
+  "objects": {
+    "interp_prefill_fp8kv_mla_moe_gq.elf": {
+      "sha256": "3ad1f6571c698420a385f5738da93d5fd1bdcb1ab05c16602d8d3296da37f23c",
+      "globals": {
+        "plow_geom_FA_MLA_PF2_BKV": 32,
+        "plow_geom_GM_BN": 256,
+        "plow_geom_GM_SM_BM": 64,
+        "plow_geom_GV_MFMA4_YT_M4": 4,
+        "plow_geom_FA_LAZY_RESCALE": 0,
+        "plow_geom_GM_SM_BN": 128,
+        "plow_geom_GV_KS_MAXRPW": 3,
+        "plow_geom_FA_USE_EXP2": 1,
+        "plow_geom_GV_UN_K8192": 16,
+        "plow_geom_MPF_DBUF": 1,
+        "plow_geom_FA_MLA_KUNROLL": 1,
+        "plow_geom_GV_UNROLL_GLU_FP8": 3,
+        "plow_geom_PLOW_WG_WAVES": 8,
+        "plow_geom_FA_ABL": 0,
+        "plow_geom_GV_MFMA4_YT_M8": 2,
+        "plow_moe_gemma_pf_arms_1": 1,
+        "plow_geom_FA_DEC_ILV": 0,
+        "plow_geom_GV_BLOCKED": 1,
+        "plow_geom_GV_KS": 1,
+        "plow_t11_gluquant_arm": 1,
+        "plow_geom_FA_MLA_PF2_FRAME": 8,
+        "plow_geom_GM_PRIO": 1,
+        "plow_geom_GV_URSRC": 0,
+        "plow_geom_FA_DEC_KUNROLL": 8,
+        "plow_geom_FA_MLA_PF2_DEFER": 1,
+        "plow_moe_pf_part16_arm": 1,
+        "plow_geom_GM_CLBAR": 0,
+        "plow_geom_GV_RS_UN": 7,
+        "plow_geom_GV_UNROLL_GLU": 6,
+        "plow_geom_FA_FAST_RCP": 1,
+        "plow_geom_GV_HACK_NOSUM": 0,
+        "plow_geom_GV_UNROLL_M4": 6,
+        "plow_cap_d_flash_mla_1": 1,
+        "plow_dsa_decode_batch_arm": 1,
+        "plow_geom_FA_DC": 128,
+        "plow_geom_FA_MLA_KDU": 4,
+        "plow_geom_GM_PLR": 1,
+        "plow_geom_GM_SLICE": 16,
+        "plow_dsa_select_local_arm": 1,
+        "plow_flash_merge_hd_256": 1,
+        "plow_mla_sparse_fp8_decode_arm": 1,
+        "plow_moe_pf_a8_arm": 1,
+        "plow_geom_FA_DEC_KL": 8,
+        "plow_geom_GM_HACK_NOFETCH": 0,
+        "plow_geom_GV_KS_UN": 8,
+        "plow_geom_GV_UNROLL_FP8": 3,
+        "plow_fp8_kv_1": 1,
+        "plow_glm_fuse_rope_arm": 1,
+        "plow_geom_FA_FASTMASK": 0,
+        "plow_geom_GM_BLK_BK": 64,
+        "plow_geom_GV_RING": 16,
+        "plow_geom_GV_UNROLL_M8": 3,
+        "plow_xargmax_max_batch_128": 1,
+        "plow_geom_GV_UNROLL_GLU_MXFP4": 2,
+        "plow_dsa_idx_row_arm": 1,
+        "plow_moe_pf_det_arm": 1,
+        "plow_geom_FA_DEC_WPEU": 2,
+        "plow_geom_FA_MLA_PF2_FASTBF": 1,
+        "plow_geom_GM_BLK_BM": 128,
+        "plow_geom_GM_DBUF": 1,
+        "plow_geom_GV_NT": 1,
+        "plow_geom_GV_RS_R": 2,
+        "plow_geom_FA_DBUF": 0,
+        "plow_geom_GM_BLK_BN": 128,
+        "plow_geom_GM_PLR8": 0,
+        "plow_geom_GV_RS_MAXNCH": 8,
+        "plow_geom_GV_RS_WIDE": 1,
+        "plow_geom_GV_USCALAR": 1,
+        "plow_row_gather_1": 1,
+        "plow_geom_GV_BATCH": 8,
+        "plow_geom_GV_DMA": 0,
+        "plow_geom_GV_RS_WIDE_R": 2,
+        "plow_geom_FA_DEC_VPIPE": 0,
+        "plow_geom_GM_CLFENCE": 0,
+        "plow_geom_GM_SWZ": 2,
+        "plow_geom_GM_MD_BK": 64,
+        "plow_geom_GV_HACK_CHEAPDOT": 0,
+        "plow_geom_FA_DEC_LIVE": 0,
+        "plow_xrn_1": 1,
+        "plow_mla_pf_ns_arm": 1,
+        "plow_geom_GM_MD_BM": 128,
+        "plow_moe_align_bm64_1": 1,
+        "plow_flash_merge_hd_512": 1,
+        "plow_geom_FA_BKV_D128": 32,
+        "plow_geom_GM_MD_BN": 128,
+        "plow_geom_GV_MFMA": 0,
+        "plow_geom_GV_MFMA4_UN_M2": 11,
+        "plow_packed_prefill_abi_1": 1,
+        "plow_geom_FA_DEC_V_UNROLL": 8,
+        "plow_geom_GM_WGM": 8,
+        "plow_moe_gemma_arms_1": 1,
+        "plow_geom_GV_MFMA4": 0,
+        "plow_geom_GV_MFMA4_UN_M4": 2,
+        "plow_geom_GV_RS_WIDE_UN": 6,
+        "plow_geom_MPF_BK": 64,
+        "plow_prefill_nrn_consumer_1": 1,
+        "plow_flash_merge_hd_128": 1,
+        "plow_geom_GM_PGR2": 0,
+        "plow_packed_prefill_dense_consumers_1": 1,
+        "plow_geom_MPF_BM": 64,
+        "plow_gemv_mm_cap_1": 1,
+        "plow_geom_FA_HEAD_MAJOR": 0,
+        "plow_geom_GM_BK": 64,
+        "plow_geom_GV_UNROLL": 11,
+        "plow_token_batch_abi_1": 1,
+        "plow_geom_FA_MERGE_UNROLL4": 1,
+        "plow_geom_GM_SM_BK": 128,
+        "plow_geom_GV_MFMA4_UN_M8": 3,
+        "plow_geom_GV_MFMA4_YT_M2": 1,
+        "plow_geom_PLOW_GEMV_MM": 1,
+        "plow_xr_agg_1": 1,
+        "plow_geom_FA_LDS_DMA": 0,
+        "plow_geom_GM_BM": 192,
+        "plow_cap_d_moe_router_topk_pf_1": 1
+      },
+      "kernels": {
+        "plow_interp_gfx942_gq": {
+          "agpr_count": 0,
+          "group_segment_fixed_size": 64560,
+          "kernarg_segment_size": 432,
+          "max_flat_workgroup_size": 512,
+          "name": "plow_interp_gfx942_gq",
+          "private_segment_fixed_size": 1184,
+          "sgpr_count": 108,
+          "sgpr_spill_count": 23,
+          "symbol": "plow_interp_gfx942_gq.kd",
+          "vgpr_count": 256,
+          "vgpr_spill_count": 118
+        },
+        "plow_xctr_audit": {
+          "agpr_count": 0,
+          "group_segment_fixed_size": 0,
+          "kernarg_segment_size": 296,
+          "max_flat_workgroup_size": 1024,
+          "name": "plow_xctr_audit",
+          "private_segment_fixed_size": 0,
+          "sgpr_count": 32,
+          "sgpr_spill_count": 0,
+          "symbol": "plow_xctr_audit.kd",
+          "vgpr_count": 8,
+          "vgpr_spill_count": 0
+        },
+        "plow_state_clear": {
+          "agpr_count": 0,
+          "group_segment_fixed_size": 0,
+          "kernarg_segment_size": 272,
+          "max_flat_workgroup_size": 1024,
+          "name": "plow_state_clear",
+          "private_segment_fixed_size": 0,
+          "sgpr_count": 18,
+          "sgpr_spill_count": 0,
+          "symbol": "plow_state_clear.kd",
+          "vgpr_count": 4,
+          "vgpr_spill_count": 0
+        },
+        "plow_token_capture": {
+          "agpr_count": 0,
+          "group_segment_fixed_size": 0,
+          "kernarg_segment_size": 288,
+          "max_flat_workgroup_size": 1024,
+          "name": "plow_token_capture",
+          "private_segment_fixed_size": 0,
+          "sgpr_count": 14,
+          "sgpr_spill_count": 0,
+          "symbol": "plow_token_capture.kd",
+          "vgpr_count": 7,
+          "vgpr_spill_count": 0
+        }
+      }
+    },
+    "moe_aiter_adapter_gfx942.elf": {
+      "sha256": "ff0d86d22aadcb6391b8195517347eab54cc550a42b8ebea46fa96beb2d65d67",
+      "globals": {
+        "plow_moe_aiter_fp8_abi_1": 1,
+        "plow_moe_flat_fp8_abi_1": 1,
+        "plow_moe_resident_fp8_abi_1": 1
+      },
+      "kernels": {
+        "pack_moe": {
+          "agpr_count": 0,
+          "group_segment_fixed_size": 0,
+          "kernarg_segment_size": 304,
+          "max_flat_workgroup_size": 1024,
+          "name": "pack_moe",
+          "private_segment_fixed_size": 0,
+          "sgpr_count": 34,
+          "sgpr_spill_count": 0,
+          "symbol": "pack_moe.kd",
+          "vgpr_count": 16,
+          "vgpr_spill_count": 0
+        },
+        "plow_moe_aiter_prepare": {
+          "agpr_count": 0,
+          "group_segment_fixed_size": 0,
+          "kernarg_segment_size": 360,
+          "max_flat_workgroup_size": 1024,
+          "name": "plow_moe_aiter_prepare",
+          "private_segment_fixed_size": 0,
+          "sgpr_count": 42,
+          "sgpr_spill_count": 0,
+          "symbol": "plow_moe_aiter_prepare.kd",
+          "vgpr_count": 19,
+          "vgpr_spill_count": 0
+        },
+        "plow_moe_aiter_store": {
+          "agpr_count": 0,
+          "group_segment_fixed_size": 0,
+          "kernarg_segment_size": 280,
+          "max_flat_workgroup_size": 1024,
+          "name": "plow_moe_aiter_store",
+          "private_segment_fixed_size": 0,
+          "sgpr_count": 17,
+          "sgpr_spill_count": 0,
+          "symbol": "plow_moe_aiter_store.kd",
+          "vgpr_count": 18,
+          "vgpr_spill_count": 0
+        },
+        "plow_moe_aiter_flat_pack": {
+          "agpr_count": 0,
+          "group_segment_fixed_size": 4,
+          "kernarg_segment_size": 336,
+          "max_flat_workgroup_size": 1024,
+          "name": "plow_moe_aiter_flat_pack",
+          "private_segment_fixed_size": 0,
+          "sgpr_count": 34,
+          "sgpr_spill_count": 0,
+          "symbol": "plow_moe_aiter_flat_pack.kd",
+          "vgpr_count": 16,
+          "vgpr_spill_count": 0
+        },
+        "plow_moe_aiter_flat_route": {
+          "agpr_count": 0,
+          "group_segment_fixed_size": 0,
+          "kernarg_segment_size": 32,
+          "max_flat_workgroup_size": 1024,
+          "name": "plow_moe_aiter_flat_route",
+          "private_segment_fixed_size": 0,
+          "sgpr_count": 14,
+          "sgpr_spill_count": 0,
+          "symbol": "plow_moe_aiter_flat_route.kd",
+          "vgpr_count": 4,
+          "vgpr_spill_count": 0
+        }
+      }
+    },
+    "fmoe_bf16_a16_blockscaleFp8_g1u1_vs_silu_1tg_16x128_flat_pf3.co": {
+      "sha256": "be7052284094e7cedeb266afb24d4d6723bdf4234ac391b2e5b29473d8ee8f06",
+      "globals": {},
+      "kernels": {
+        "_ZN5aiter60fmoe_bf16_a16_blockscaleFp8_g1u1_vs_silu_1tg_16x128_flat_pf3E": {
+          "name": "_ZN5aiter60fmoe_bf16_a16_blockscaleFp8_g1u1_vs_silu_1tg_16x128_flat_pf3E",
+          "group_segment_fixed_size": 65536,
+          "kernarg_segment_size": 448,
+          "max_flat_workgroup_size": 256,
+          "private_segment_fixed_size": 0,
+          "sgpr_count": 102,
+          "symbol": "_ZN5aiter60fmoe_bf16_a16_blockscaleFp8_g1u1_vs_silu_1tg_16x128_flat_pf3E.kd",
+          "vgpr_count": 368
+        }
+      }
+    },
+    "fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256.co": {
+      "sha256": "65b4c0a0b290dd83039047c18e0bb86f4253790e926dce324ddb6b45a7b28650",
+      "globals": {},
+      "kernels": {
+        "_ZN5aiter50fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256E": {
+          "name": "_ZN5aiter50fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256E",
+          "group_segment_fixed_size": 65536,
+          "kernarg_segment_size": 448,
+          "max_flat_workgroup_size": 256,
+          "private_segment_fixed_size": 0,
+          "sgpr_count": 112,
+          "symbol": "_ZN5aiter50fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256E.kd",
+          "vgpr_count": 512
+        }
+      }
+    },
+    "interp_flash_fp8kv_gq.elf": {
+      "sha256": "6f750e306085a7e62751d2e9a958aa418bdd9a1a64ac0d7c412a28ed1f5d2bf6",
+      "globals": {
+        "plow_geom_FA_DC": 256,
+        "plow_geom_GM_PRIO": 1,
+        "plow_geom_GV_UN_K8192": 16,
+        "plow_flash_merge_hd_256": 1,
+        "plow_mla_sparse_fp8_prefill_arm": 1,
+        "plow_geom_GM_BM": 64,
+        "plow_geom_GV_BATCH": 8,
+        "plow_geom_GV_RING": 16,
+        "plow_t11_gluquant_arm": 1,
+        "plow_geom_GM_BN": 128,
+        "plow_geom_GV_MFMA4_YT_M2": 1,
+        "plow_geom_PLOW_GEMV_MM": 1,
+        "plow_fp8_kv_1": 1,
+        "plow_geom_FA_FASTMASK": 1,
+        "plow_geom_GV_BLOCKED": 1,
+        "plow_geom_GV_RS_WIDE_R": 2,
+        "plow_geom_GV_UNROLL_GLU_FP8": 3,
+        "plow_moe_align_bm64_1": 1,
+        "plow_flash_merge_hd_512": 1,
+        "plow_geom_FA_DBUF": 1,
+        "plow_geom_FA_DEC_LIVE": 0,
+        "plow_geom_FA_MLA_PF2_BKV": 32,
+        "plow_geom_GV_MFMA4_UN_M2": 11,
+        "plow_geom_GV_MFMA4_YT_M4": 4,
+        "plow_flash_merge_hd_128": 1,
+        "plow_geom_GV_RS_R": 2,
+        "plow_xargmax_max_batch_128": 1,
+        "plow_geom_FA_DEC_VPIPE": 0,
+        "plow_geom_FA_MLA_PF2_FRAME": 8,
+        "plow_geom_GV_MFMA4_UN_M4": 2,
+        "plow_packed_prefill_abi_1": 1,
+        "plow_moe_gemma_pf_arms_1": 1,
+        "plow_opcode_attn_res_1": 1,
+        "plow_geom_GV_MFMA4_YT_M8": 2,
+        "plow_gemv_mm_cap_1": 1,
+        "plow_geom_FA_LDS_DMA": 0,
+        "plow_geom_FA_MLA_PF2_DEFER": 1,
+        "plow_geom_GM_DBUF": 1,
+        "plow_geom_GV_MFMA4_UN_M8": 3,
+        "plow_geom_FA_HEAD_MAJOR": 0,
+        "plow_geom_FA_MLA_KUNROLL": 1,
+        "plow_geom_GM_CLBAR": 0,
+        "plow_geom_GM_CLFENCE": 0,
+        "plow_geom_GV_RS_MAXNCH": 8,
+        "plow_geom_GV_RS_WIDE_UN": 6,
+        "plow_geom_MPF_DBUF": 1,
+        "plow_k3_arms_1": 1,
+        "plow_cap_d_attn_res_1": 1,
+        "plow_glm_fuse_rope_arm": 1,
+        "plow_mla_sparse_fp8_decode_arm": 1,
+        "plow_dsa_pf_arm": 1,
+        "plow_packed_prefill_dense_consumers_1": 1,
+        "plow_geom_GM_SM_BK": 128,
+        "plow_row_gather_1": 1,
+        "plow_opcode_kda_gated_norm_1": 1,
+        "plow_geom_FA_DEC_KL": 8,
+        "plow_l2_place_dispatch_1": 1,
+        "plow_geom_GM_PLR": 1,
+        "plow_geom_GM_SM_BM": 64,
+        "plow_geom_GM_SWZ": 2,
+        "plow_geom_GV_MFMA4": 0,
+        "plow_geom_GV_UNROLL_GLU_MXFP4": 2,
+        "plow_geom_GV_URSRC": 0,
+        "plow_geom_FA_LAZY_RESCALE": 0,
+        "plow_geom_GM_MD_BK": 64,
+        "plow_geom_GM_SM_BN": 128,
+        "plow_opcode_kda_gate_1": 1,
+        "plow_opcode_kda_conv3_1": 1,
+        "plow_moe_pf_part16_arm": 1,
+        "plow_geom_FA_BKV_D128": 32,
+        "plow_geom_FA_MERGE_UNROLL4": 1,
+        "plow_geom_GV_USCALAR": 1,
+        "plow_glm_ofold_arm": 1,
+        "plow_geom_FA_DEC_KUNROLL": 8,
+        "plow_geom_GM_MD_BM": 128,
+        "plow_geom_GM_PGR2": 0,
+        "plow_geom_FA_MLA_KDU": 4,
+        "plow_geom_GM_MD_BN": 128,
+        "plow_geom_GM_SLICE": 16,
+        "plow_geom_GV_RS_WIDE": 1,
+        "plow_opcode_kda_chunk_wu_1": 1,
+        "plow_mla_pf_v2_fp8_arm_1": 1,
+        "plow_geom_FA_MLA_PF2_FASTBF": 1,
+        "plow_geom_GM_HACK_NOFETCH": 0,
+        "plow_geom_GV_NT": 1,
+        "plow_geom_GV_UNROLL_M4": 6,
+        "plow_opcode_situ_glu_1": 1,
+        "plow_moe_gemma_arms_1": 1,
+        "plow_geom_FA_USE_EXP2": 1,
+        "plow_geom_MPF_BK": 64,
+        "plow_opcode_kda_state_step_g_1": 1,
+        "plow_geom_FA_FAST_RCP": 1,
+        "plow_geom_GM_WGM": 8,
+        "plow_geom_GV_KS": 1,
+        "plow_geom_PLOW_WG_WAVES": 4,
+        "plow_opcode_kda_chunk_carry_1": 1,
+        "plow_geom_MPF_BM": 64,
+        "plow_opcode_kda_conv_1": 1,
+        "plow_opcode_mla_out_gate_1": 1,
+        "plow_geom_GM_BLK_BK": 64,
+        "plow_geom_GV_KS_MAXRPW": 3,
+        "plow_geom_GV_KS_UN": 8,
+        "plow_geom_GV_UNROLL_M8": 3,
+        "plow_opcode_kda_chunk_prepare_1": 1,
+        "plow_dsa_decode_batch_arm": 1,
+        "plow_opcode_kda_chunk_intra_1": 1,
+        "plow_geom_GM_BLK_BM": 128,
+        "plow_mla_pf_v2_arm_1": 1,
+        "plow_geom_FA_ABL": 0,
+        "plow_geom_GM_BLK_BN": 128,
+        "plow_dsa_idx_row_arm": 1,
+        "plow_moe_pf_a8_arm": 1,
+        "plow_geom_GV_DMA": 0,
+        "plow_geom_GV_HACK_CHEAPDOT": 0,
+        "plow_geom_GM_PLR8": 0,
+        "plow_opcode_kda_state_step_1": 1,
+        "plow_geom_FA_DEC_ILV": 0,
+        "plow_geom_GV_HACK_NOSUM": 0,
+        "plow_geom_GV_UNROLL": 11,
+        "plow_opcode_kda_conv_state_step_g_1": 1,
+        "plow_geom_GV_MFMA": 0,
+        "plow_geom_GV_RS_UN": 7,
+        "plow_geom_GV_UNROLL_FP8": 3,
+        "plow_geom_GV_UNROLL_GLU": 6,
+        "plow_mla_pf_ns_arm": 1,
+        "plow_geom_FA_DEC_V_UNROLL": 8,
+        "plow_geom_FA_DEC_WPEU": 1,
+        "plow_geom_GM_BK": 64,
+        "plow_token_batch_abi_1": 1
+      },
+      "kernels": {
+        "plow_interp_flash_gfx942_gq": {
+          "agpr_count": 256,
+          "group_segment_fixed_size": 58376,
+          "kernarg_segment_size": 432,
+          "max_flat_workgroup_size": 256,
+          "name": "plow_interp_flash_gfx942_gq",
+          "private_segment_fixed_size": 1552,
+          "sgpr_count": 108,
+          "sgpr_spill_count": 114,
+          "symbol": "plow_interp_flash_gfx942_gq.kd",
+          "vgpr_count": 512,
+          "vgpr_spill_count": 0
+        },
+        "plow_xctr_audit": {
+          "agpr_count": 0,
+          "group_segment_fixed_size": 0,
+          "kernarg_segment_size": 296,
+          "max_flat_workgroup_size": 1024,
+          "name": "plow_xctr_audit",
+          "private_segment_fixed_size": 0,
+          "sgpr_count": 32,
+          "sgpr_spill_count": 0,
+          "symbol": "plow_xctr_audit.kd",
+          "vgpr_count": 8,
+          "vgpr_spill_count": 0
+        },
+        "plow_state_clear": {
+          "agpr_count": 0,
+          "group_segment_fixed_size": 0,
+          "kernarg_segment_size": 272,
+          "max_flat_workgroup_size": 1024,
+          "name": "plow_state_clear",
+          "private_segment_fixed_size": 0,
+          "sgpr_count": 18,
+          "sgpr_spill_count": 0,
+          "symbol": "plow_state_clear.kd",
+          "vgpr_count": 4,
+          "vgpr_spill_count": 0
+        },
+        "plow_token_capture": {
+          "agpr_count": 0,
+          "group_segment_fixed_size": 0,
+          "kernarg_segment_size": 288,
+          "max_flat_workgroup_size": 1024,
+          "name": "plow_token_capture",
+          "private_segment_fixed_size": 0,
+          "sgpr_count": 14,
+          "sgpr_spill_count": 0,
+          "symbol": "plow_token_capture.kd",
+          "vgpr_count": 7,
+          "vgpr_spill_count": 0
+        }
+      }
+    },
+    "glm_lt_gfx942.elf": {
+      "sha256": "efa5b0365bedc2effa52265c85eded14fb63febd9c067bab37138d99db607db5",
+      "globals": {},
+      "kernels": {
+        "Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT128x80x128_MI16x16x1_SN_LDSB1_AFC1_AG0_AGGSUA0_AGNTAB0_AFEM1_AFEM1_ASEM1_CD1_1_CLR1_CLS0_CADS0_DTLA0_DTLB0_DTLM0_DTVA0_DTVB0_DTVMXSA0_DTVMXSB0_DTVSM0_DPLB0_EPS0_ELFLR0_EMLLn1_FDSI0_GRPM1_GRVWA8_GRVWB8_GSUAMBSK_GLS0_HPLR0_ISA942_ICIW0_IU1_K1_LDSTI0_LBSPPA2048_LBSPPB256_LBSPPMXSA0_LBSPPMXSB0_LBSPPM0_LPA16_LPB16_LPMXSA0_LPMXSB0_LPM0_LRVW8_LWPMn1_MIAV0_MIWT8_5_MXLIBL_MXSFNS_MO40_MGRIPM1_NTn1_NTA0_NTB0_NTC0_NTD4_NTE0_NTMXSA0_NTMXSB0_NTM0_NTWS0_NVn1_NVA0_NVB0_NVC0_NVD0_NVE0_NVMXSA0_NVMXSB0_NVM0_NVWS0_NEPBS16_NLCA1_NLCB1_ONLL1_PAP0_PGL0_PGR2_PLR1_PKA1_SGROB0_SIA3_SS1_SPO0_SRVW0_SSO0_SVW8_SK0_SKFTR0_SKFDPO0_SKXCCM0_SNLL0_SIP1_SGRO0_TDMI0_TDMIM0_TDMS0_TIN0_THn1_THA0_THB0_THC0_THD0_THE0_THMXSA0_THMXSB0_THM0_THWS0_TLDS1_TLDSM1_ULSGRO1_USL1_USLMX0_UIOFGRO0_UPLRP0_USFGROn1_USI0_VSn1_VWA8_VWB1_WSGRA0_WSGRB0_WS64_WG16_4_4": {
+          "name": "Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT128x80x128_MI16x16x1_SN_LDSB1_AFC1_AG0_AGGSUA0_AGNTAB0_AFEM1_AFEM1_ASEM1_CD1_1_CLR1_CLS0_CADS0_DTLA0_DTLB0_DTLM0_DTVA0_DTVB0_DTVMXSA0_DTVMXSB0_DTVSM0_DPLB0_EPS0_ELFLR0_EMLLn1_FDSI0_GRPM1_GRVWA8_GRVWB8_GSUAMBSK_GLS0_HPLR0_ISA942_ICIW0_IU1_K1_LDSTI0_LBSPPA2048_LBSPPB256_LBSPPMXSA0_LBSPPMXSB0_LBSPPM0_LPA16_LPB16_LPMXSA0_LPMXSB0_LPM0_LRVW8_LWPMn1_MIAV0_MIWT8_5_MXLIBL_MXSFNS_MO40_MGRIPM1_NTn1_NTA0_NTB0_NTC0_NTD4_NTE0_NTMXSA0_NTMXSB0_NTM0_NTWS0_NVn1_NVA0_NVB0_NVC0_NVD0_NVE0_NVMXSA0_NVMXSB0_NVM0_NVWS0_NEPBS16_NLCA1_NLCB1_ONLL1_PAP0_PGL0_PGR2_PLR1_PKA1_SGROB0_SIA3_SS1_SPO0_SRVW0_SSO0_SVW8_SK0_SKFTR0_SKFDPO0_SKXCCM0_SNLL0_SIP1_SGRO0_TDMI0_TDMIM0_TDMS0_TIN0_THn1_THA0_THB0_THC0_THD0_THE0_THMXSA0_THMXSB0_THM0_THWS0_TLDS1_TLDSM1_ULSGRO1_USL1_USLMX0_UIOFGRO0_UPLRP0_USFGROn1_USI0_VSn1_VWA8_VWB1_WSGRA0_WSGRB0_WS64_WG16_4_4",
+          "group_segment_fixed_size": 65536,
+          "kernarg_segment_size": 160,
+          "max_flat_workgroup_size": 256,
+          "private_segment_fixed_size": 0,
+          "sgpr_count": 88,
+          "sgpr_spill_count": 0,
+          "symbol": "Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT128x80x128_MI16x16x1_SN_LDSB1_AFC1_AG0_AGGSUA0_AGNTAB0_AFEM1_AFEM1_ASEM1_CD1_1_CLR1_CLS0_CADS0_DTLA0_DTLB0_DTLM0_DTVA0_DTVB0_DTVMXSA0_DTVMXSB0_DTVSM0_DPLB0_EPS0_ELFLR0_EMLLn1_FDSI0_GRPM1_GRVWA8_GRVWB8_GSUAMBSK_GLS0_HPLR0_ISA942_ICIW0_IU1_K1_LDSTI0_LBSPPA2048_LBSPPB256_LBSPPMXSA0_LBSPPMXSB0_LBSPPM0_LPA16_LPB16_LPMXSA0_LPMXSB0_LPM0_LRVW8_LWPMn1_MIAV0_MIWT8_5_MXLIBL_MXSFNS_MO40_MGRIPM1_NTn1_NTA0_NTB0_NTC0_NTD4_NTE0_NTMXSA0_NTMXSB0_NTM0_NTWS0_NVn1_NVA0_NVB0_NVC0_NVD0_NVE0_NVMXSA0_NVMXSB0_NVM0_NVWS0_NEPBS16_NLCA1_NLCB1_ONLL1_PAP0_PGL0_PGR2_PLR1_PKA1_SGROB0_SIA3_SS1_SPO0_SRVW0_SSO0_SVW8_SK0_SKFTR0_SKFDPO0_SKXCCM0_SNLL0_SIP1_SGRO0_TDMI0_TDMIM0_TDMS0_TIN0_THn1_THA0_THB0_THC0_THD0_THE0_THMXSA0_THMXSB0_THM0_THWS0_TLDS1_TLDSM1_ULSGRO1_USL1_USLMX0_UIOFGRO0_UPLRP0_USFGROn1_USI0_VSn1_VWA8_VWB1_WSGRA0_WSGRB0_WS64_WG16_4_4.kd",
+          "vgpr_count": 140,
+          "vgpr_spill_count": 0
+        },
+        "Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT16x16x512_MI16x16x1_SN_LDSB1_AFC1_AG0_AGGSUA0_AGNTAB0_AFEM1_AFEM1_ASEM1_CD1_1_CLR1_CLS0_CADS0_DTLA0_DTLB0_DTLM0_DTVA0_DTVB0_DTVMXSA0_DTVMXSB0_DTVSM0_DPLB0_EPS0_ELFLR0_EMLLn1_FDSI0_GRPM1_GRVWA8_GRVWB8_GSUAMBSK_GLS0_HPLR0_ISA942_ICIW0_IU1_K1_LDSTI0_LBSPPA1024_LBSPPB1024_LBSPPMXSA0_LBSPPMXSB0_LBSPPM0_LPA16_LPB16_LPMXSA0_LPMXSB0_LPM0_LRVW8_LWPMn1_MIAV0_MIWT1_1_MXLIBL_MXSFNS_MO40_MGRIPM1_NTn1_NTA0_NTB0_NTC0_NTD4_NTE0_NTMXSA0_NTMXSB0_NTM0_NTWS0_NVn1_NVA0_NVB0_NVC0_NVD0_NVE0_NVMXSA0_NVMXSB0_NVM0_NVWS0_NEPBS16_NLCA1_NLCB1_ONLL1_PAP0_PGL0_PGR2_PLR1_PKA1_SGROB0_SIA3_SS1_SPO0_SRVW0_SSO0_SVW1_SK0_SKFTR0_SKFDPO0_SKXCCM0_SNLL0_SIP1_SGRO0_TDMI0_TDMIM0_TDMS0_TIN0_THn1_THA0_THB0_THC0_THD0_THE0_THMXSA0_THMXSB0_THM0_THWS0_TLDS1_TLDSM1_ULSGRO1_USL1_USLMX0_UIOFGRO0_UPLRP0_USFGROn1_USI0_VSn1_VWA1_VWB1_WSGRA0_WSGRB0_WS64_WG16_4_4": {
+          "name": "Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT16x16x512_MI16x16x1_SN_LDSB1_AFC1_AG0_AGGSUA0_AGNTAB0_AFEM1_AFEM1_ASEM1_CD1_1_CLR1_CLS0_CADS0_DTLA0_DTLB0_DTLM0_DTVA0_DTVB0_DTVMXSA0_DTVMXSB0_DTVSM0_DPLB0_EPS0_ELFLR0_EMLLn1_FDSI0_GRPM1_GRVWA8_GRVWB8_GSUAMBSK_GLS0_HPLR0_ISA942_ICIW0_IU1_K1_LDSTI0_LBSPPA1024_LBSPPB1024_LBSPPMXSA0_LBSPPMXSB0_LBSPPM0_LPA16_LPB16_LPMXSA0_LPMXSB0_LPM0_LRVW8_LWPMn1_MIAV0_MIWT1_1_MXLIBL_MXSFNS_MO40_MGRIPM1_NTn1_NTA0_NTB0_NTC0_NTD4_NTE0_NTMXSA0_NTMXSB0_NTM0_NTWS0_NVn1_NVA0_NVB0_NVC0_NVD0_NVE0_NVMXSA0_NVMXSB0_NVM0_NVWS0_NEPBS16_NLCA1_NLCB1_ONLL1_PAP0_PGL0_PGR2_PLR1_PKA1_SGROB0_SIA3_SS1_SPO0_SRVW0_SSO0_SVW1_SK0_SKFTR0_SKFDPO0_SKXCCM0_SNLL0_SIP1_SGRO0_TDMI0_TDMIM0_TDMS0_TIN0_THn1_THA0_THB0_THC0_THD0_THE0_THMXSA0_THMXSB0_THM0_THWS0_TLDS1_TLDSM1_ULSGRO1_USL1_USLMX0_UIOFGRO0_UPLRP0_USFGROn1_USI0_VSn1_VWA1_VWB1_WSGRA0_WSGRB0_WS64_WG16_4_4",
+          "group_segment_fixed_size": 33792,
+          "kernarg_segment_size": 160,
+          "max_flat_workgroup_size": 256,
+          "private_segment_fixed_size": 0,
+          "sgpr_count": 82,
+          "sgpr_spill_count": 0,
+          "symbol": "Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT16x16x512_MI16x16x1_SN_LDSB1_AFC1_AG0_AGGSUA0_AGNTAB0_AFEM1_AFEM1_ASEM1_CD1_1_CLR1_CLS0_CADS0_DTLA0_DTLB0_DTLM0_DTVA0_DTVB0_DTVMXSA0_DTVMXSB0_DTVSM0_DPLB0_EPS0_ELFLR0_EMLLn1_FDSI0_GRPM1_GRVWA8_GRVWB8_GSUAMBSK_GLS0_HPLR0_ISA942_ICIW0_IU1_K1_LDSTI0_LBSPPA1024_LBSPPB1024_LBSPPMXSA0_LBSPPMXSB0_LBSPPM0_LPA16_LPB16_LPMXSA0_LPMXSB0_LPM0_LRVW8_LWPMn1_MIAV0_MIWT1_1_MXLIBL_MXSFNS_MO40_MGRIPM1_NTn1_NTA0_NTB0_NTC0_NTD4_NTE0_NTMXSA0_NTMXSB0_NTM0_NTWS0_NVn1_NVA0_NVB0_NVC0_NVD0_NVE0_NVMXSA0_NVMXSB0_NVM0_NVWS0_NEPBS16_NLCA1_NLCB1_ONLL1_PAP0_PGL0_PGR2_PLR1_PKA1_SGROB0_SIA3_SS1_SPO0_SRVW0_SSO0_SVW1_SK0_SKFTR0_SKFDPO0_SKXCCM0_SNLL0_SIP1_SGRO0_TDMI0_TDMIM0_TDMS0_TIN0_THn1_THA0_THB0_THC0_THD0_THE0_THMXSA0_THMXSB0_THM0_THWS0_TLDS1_TLDSM1_ULSGRO1_USL1_USLMX0_UIOFGRO0_UPLRP0_USFGROn1_USI0_VSn1_VWA1_VWB1_WSGRA0_WSGRB0_WS64_WG16_4_4.kd",
+          "vgpr_count": 71,
+          "vgpr_spill_count": 0
+        },
+        "Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT32x16x256_MI16x16x1_SN_LDSB1_AFC1_AG0_AGGSUA0_AGNTAB0_AFEM1_AFEM1_ASEM1_CD1_1_CLR1_CLS0_CADS0_DTLA0_DTLB0_DTLM0_DTVA0_DTVB0_DTVMXSA0_DTVMXSB0_DTVSM0_DPLB0_EPS0_ELFLR0_EMLLn1_FDSI0_GRPM1_GRVWA8_GRVWB8_GSUAMBSK_GLS0_HPLR0_ISA942_ICIW0_IU1_K1_LDSTI0_LBSPPA1024_LBSPPB512_LBSPPMXSA0_LBSPPMXSB0_LBSPPM0_LPA16_LPB16_LPMXSA0_LPMXSB0_LPM0_LRVW8_LWPMn1_MIAV0_MIWT2_1_MXLIBL_MXSFNS_MO40_MGRIPM1_NTn1_NTA0_NTB0_NTC0_NTD4_NTE0_NTMXSA0_NTMXSB0_NTM0_NTWS0_NVn1_NVA0_NVB0_NVC0_NVD0_NVE0_NVMXSA0_NVMXSB0_NVM0_NVWS0_NEPBS16_NLCA1_NLCB1_ONLL1_PAP0_PGL0_PGR2_PLR1_PKA1_SGROB0_SIA3_SS1_SPO0_SRVW0_SSO0_SVW2_SK0_SKFTR0_SKFDPO0_SKXCCM0_SNLL0_SIP1_SGRO0_TDMI0_TDMIM0_TDMS0_TIN0_THn1_THA0_THB0_THC0_THD0_THE0_THMXSA0_THMXSB0_THM0_THWS0_TLDS1_TLDSM1_ULSGRO1_USL1_USLMX0_UIOFGRO0_UPLRP0_USFGROn1_USI0_VSn1_VWA2_VWB1_WSGRA0_WSGRB0_WS64_WG16_4_4": {
+          "name": "Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT32x16x256_MI16x16x1_SN_LDSB1_AFC1_AG0_AGGSUA0_AGNTAB0_AFEM1_AFEM1_ASEM1_CD1_1_CLR1_CLS0_CADS0_DTLA0_DTLB0_DTLM0_DTVA0_DTVB0_DTVMXSA0_DTVMXSB0_DTVSM0_DPLB0_EPS0_ELFLR0_EMLLn1_FDSI0_GRPM1_GRVWA8_GRVWB8_GSUAMBSK_GLS0_HPLR0_ISA942_ICIW0_IU1_K1_LDSTI0_LBSPPA1024_LBSPPB512_LBSPPMXSA0_LBSPPMXSB0_LBSPPM0_LPA16_LPB16_LPMXSA0_LPMXSB0_LPM0_LRVW8_LWPMn1_MIAV0_MIWT2_1_MXLIBL_MXSFNS_MO40_MGRIPM1_NTn1_NTA0_NTB0_NTC0_NTD4_NTE0_NTMXSA0_NTMXSB0_NTM0_NTWS0_NVn1_NVA0_NVB0_NVC0_NVD0_NVE0_NVMXSA0_NVMXSB0_NVM0_NVWS0_NEPBS16_NLCA1_NLCB1_ONLL1_PAP0_PGL0_PGR2_PLR1_PKA1_SGROB0_SIA3_SS1_SPO0_SRVW0_SSO0_SVW2_SK0_SKFTR0_SKFDPO0_SKXCCM0_SNLL0_SIP1_SGRO0_TDMI0_TDMIM0_TDMS0_TIN0_THn1_THA0_THB0_THC0_THD0_THE0_THMXSA0_THMXSB0_THM0_THWS0_TLDS1_TLDSM1_ULSGRO1_USL1_USLMX0_UIOFGRO0_UPLRP0_USFGROn1_USI0_VSn1_VWA2_VWB1_WSGRA0_WSGRB0_WS64_WG16_4_4",
+          "group_segment_fixed_size": 25600,
+          "kernarg_segment_size": 160,
+          "max_flat_workgroup_size": 256,
+          "private_segment_fixed_size": 0,
+          "sgpr_count": 82,
+          "sgpr_spill_count": 0,
+          "symbol": "Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT32x16x256_MI16x16x1_SN_LDSB1_AFC1_AG0_AGGSUA0_AGNTAB0_AFEM1_AFEM1_ASEM1_CD1_1_CLR1_CLS0_CADS0_DTLA0_DTLB0_DTLM0_DTVA0_DTVB0_DTVMXSA0_DTVMXSB0_DTVSM0_DPLB0_EPS0_ELFLR0_EMLLn1_FDSI0_GRPM1_GRVWA8_GRVWB8_GSUAMBSK_GLS0_HPLR0_ISA942_ICIW0_IU1_K1_LDSTI0_LBSPPA1024_LBSPPB512_LBSPPMXSA0_LBSPPMXSB0_LBSPPM0_LPA16_LPB16_LPMXSA0_LPMXSB0_LPM0_LRVW8_LWPMn1_MIAV0_MIWT2_1_MXLIBL_MXSFNS_MO40_MGRIPM1_NTn1_NTA0_NTB0_NTC0_NTD4_NTE0_NTMXSA0_NTMXSB0_NTM0_NTWS0_NVn1_NVA0_NVB0_NVC0_NVD0_NVE0_NVMXSA0_NVMXSB0_NVM0_NVWS0_NEPBS16_NLCA1_NLCB1_ONLL1_PAP0_PGL0_PGR2_PLR1_PKA1_SGROB0_SIA3_SS1_SPO0_SRVW0_SSO0_SVW2_SK0_SKFTR0_SKFDPO0_SKXCCM0_SNLL0_SIP1_SGRO0_TDMI0_TDMIM0_TDMS0_TIN0_THn1_THA0_THB0_THC0_THD0_THE0_THMXSA0_THMXSB0_THM0_THWS0_TLDS1_TLDSM1_ULSGRO1_USL1_USLMX0_UIOFGRO0_UPLRP0_USFGROn1_USI0_VSn1_VWA2_VWB1_WSGRA0_WSGRB0_WS64_WG16_4_4.kd",
+          "vgpr_count": 55,
+          "vgpr_spill_count": 0
+        },
+        "Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT32x32x256_MI16x16x1_SN_LDSB1_AFC1_AG0_AGGSUA0_AGNTAB0_AFEM1_AFEM1_ASEM1_CD1_1_CLR1_CLS0_CADS0_DTLA0_DTLB0_DTLM0_DTVA0_DTVB0_DTVMXSA0_DTVMXSB0_DTVSM0_DPLB0_EPS0_ELFLR0_EMLLn1_FDSI0_GRPM1_GRVWA8_GRVWB8_GSUAMBSK_GLS0_HPLR0_ISA942_ICIW0_IU1_K1_LDSTI0_LBSPPA1024_LBSPPB1024_LBSPPMXSA0_LBSPPMXSB0_LBSPPM0_LPA16_LPB16_LPMXSA0_LPMXSB0_LPM0_LRVW8_LWPMn1_MIAV0_MIWT2_2_MXLIBL_MXSFNS_MO40_MGRIPM1_NTn1_NTA0_NTB0_NTC0_NTD4_NTE0_NTMXSA0_NTMXSB0_NTM0_NTWS0_NVn1_NVA0_NVB0_NVC0_NVD0_NVE0_NVMXSA0_NVMXSB0_NVM0_NVWS0_NEPBS16_NLCA1_NLCB1_ONLL1_PAP0_PGL0_PGR2_PLR1_PKA1_SGROB0_SIA3_SS1_SPO0_SRVW0_SSO0_SVW2_SK0_SKFTR0_SKFDPO0_SKXCCM0_SNLL0_SIP1_SGRO0_TDMI0_TDMIM0_TDMS0_TIN0_THn1_THA0_THB0_THC0_THD0_THE0_THMXSA0_THMXSB0_THM0_THWS0_TLDS1_TLDSM1_ULSGRO1_USL1_USLMX0_UIOFGRO0_UPLRP0_USFGROn1_USI0_VSn1_VWA2_VWB2_WSGRA0_WSGRB0_WS64_WG16_4_4": {
+          "name": "Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT32x32x256_MI16x16x1_SN_LDSB1_AFC1_AG0_AGGSUA0_AGNTAB0_AFEM1_AFEM1_ASEM1_CD1_1_CLR1_CLS0_CADS0_DTLA0_DTLB0_DTLM0_DTVA0_DTVB0_DTVMXSA0_DTVMXSB0_DTVSM0_DPLB0_EPS0_ELFLR0_EMLLn1_FDSI0_GRPM1_GRVWA8_GRVWB8_GSUAMBSK_GLS0_HPLR0_ISA942_ICIW0_IU1_K1_LDSTI0_LBSPPA1024_LBSPPB1024_LBSPPMXSA0_LBSPPMXSB0_LBSPPM0_LPA16_LPB16_LPMXSA0_LPMXSB0_LPM0_LRVW8_LWPMn1_MIAV0_MIWT2_2_MXLIBL_MXSFNS_MO40_MGRIPM1_NTn1_NTA0_NTB0_NTC0_NTD4_NTE0_NTMXSA0_NTMXSB0_NTM0_NTWS0_NVn1_NVA0_NVB0_NVC0_NVD0_NVE0_NVMXSA0_NVMXSB0_NVM0_NVWS0_NEPBS16_NLCA1_NLCB1_ONLL1_PAP0_PGL0_PGR2_PLR1_PKA1_SGROB0_SIA3_SS1_SPO0_SRVW0_SSO0_SVW2_SK0_SKFTR0_SKFDPO0_SKXCCM0_SNLL0_SIP1_SGRO0_TDMI0_TDMIM0_TDMS0_TIN0_THn1_THA0_THB0_THC0_THD0_THE0_THMXSA0_THMXSB0_THM0_THWS0_TLDS1_TLDSM1_ULSGRO1_USL1_USLMX0_UIOFGRO0_UPLRP0_USFGROn1_USI0_VSn1_VWA2_VWB2_WSGRA0_WSGRB0_WS64_WG16_4_4",
+          "group_segment_fixed_size": 33792,
+          "kernarg_segment_size": 160,
+          "max_flat_workgroup_size": 256,
+          "private_segment_fixed_size": 0,
+          "sgpr_count": 82,
+          "sgpr_spill_count": 0,
+          "symbol": "Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT32x32x256_MI16x16x1_SN_LDSB1_AFC1_AG0_AGGSUA0_AGNTAB0_AFEM1_AFEM1_ASEM1_CD1_1_CLR1_CLS0_CADS0_DTLA0_DTLB0_DTLM0_DTVA0_DTVB0_DTVMXSA0_DTVMXSB0_DTVSM0_DPLB0_EPS0_ELFLR0_EMLLn1_FDSI0_GRPM1_GRVWA8_GRVWB8_GSUAMBSK_GLS0_HPLR0_ISA942_ICIW0_IU1_K1_LDSTI0_LBSPPA1024_LBSPPB1024_LBSPPMXSA0_LBSPPMXSB0_LBSPPM0_LPA16_LPB16_LPMXSA0_LPMXSB0_LPM0_LRVW8_LWPMn1_MIAV0_MIWT2_2_MXLIBL_MXSFNS_MO40_MGRIPM1_NTn1_NTA0_NTB0_NTC0_NTD4_NTE0_NTMXSA0_NTMXSB0_NTM0_NTWS0_NVn1_NVA0_NVB0_NVC0_NVD0_NVE0_NVMXSA0_NVMXSB0_NVM0_NVWS0_NEPBS16_NLCA1_NLCB1_ONLL1_PAP0_PGL0_PGR2_PLR1_PKA1_SGROB0_SIA3_SS1_SPO0_SRVW0_SSO0_SVW2_SK0_SKFTR0_SKFDPO0_SKXCCM0_SNLL0_SIP1_SGRO0_TDMI0_TDMIM0_TDMS0_TIN0_THn1_THA0_THB0_THC0_THD0_THE0_THMXSA0_THMXSB0_THM0_THWS0_TLDS1_TLDSM1_ULSGRO1_USL1_USLMX0_UIOFGRO0_UPLRP0_USFGROn1_USI0_VSn1_VWA2_VWB2_WSGRA0_WSGRB0_WS64_WG16_4_4.kd",
+          "vgpr_count": 71,
+          "vgpr_spill_count": 0
+        },
+        "Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT256x224x64_MI16x16x1_SN_LDSB0_AFC1_AG0_AGGSUA0_AGNTAB0_AFEM1_AFEM1_ASEM1_CD1_1_CLR1_CLS0_CADS0_DTLA0_DTLB0_DTLM0_DTVA1_DTVB0_DTVMXSA0_DTVMXSB0_DTVSM0_DPLB0_EPS0_ELFLR0_EMLLn1_FDSI0_GRPM1_GRVWA8_GRVWB8_GSUAMBSK_GLS0_HPLR0_ISA942_ICIW0_IU1_K1_LDSTI0_LBSPPA0_LBSPPB256_LBSPPMXSA0_LBSPPMXSB0_LBSPPM0_LPA0_LPB16_LPMXSA0_LPMXSB0_LPM0_LRVW8_LWPMn1_MIAV0_MIWT4_14_MXLIBL_MXSFNS_MO40_MGRIPM1_NTn1_NTA0_NTB0_NTC0_NTD4_NTE0_NTMXSA0_NTMXSB0_NTM0_NTWS0_NVn1_NVA0_NVB0_NVC0_NVD0_NVE0_NVMXSA0_NVMXSB0_NVM0_NVWS0_NEPBS16_NLCA2_NLCB1_ONLL1_PAP0_PGL0_PGR2_PLR1_PKA1_SGROB0_SIA3_SS1_SPO0_SRVW0_SSO0_SVW4_SK0_SKFTR0_SKFDPO0_SKXCCM0_SNLL0_SIP1_SGRO0_TDMI0_TDMIM0_TDMS0_TIN0_THn1_THA0_THB0_THC0_THD0_THE0_THMXSA0_THMXSB0_THM0_THWS0_TLDS1_TLDSM1_ULSGRO0_USL1_USLMX0_UIOFGRO0_UPLRP0_USFGROn1_USI0_VSn1_VWA4_VWB2_WSGRA0_WSGRB0_WS64_WG64_4_1": {
+          "name": "Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT256x224x64_MI16x16x1_SN_LDSB0_AFC1_AG0_AGGSUA0_AGNTAB0_AFEM1_AFEM1_ASEM1_CD1_1_CLR1_CLS0_CADS0_DTLA0_DTLB0_DTLM0_DTVA1_DTVB0_DTVMXSA0_DTVMXSB0_DTVSM0_DPLB0_EPS0_ELFLR0_EMLLn1_FDSI0_GRPM1_GRVWA8_GRVWB8_GSUAMBSK_GLS0_HPLR0_ISA942_ICIW0_IU1_K1_LDSTI0_LBSPPA0_LBSPPB256_LBSPPMXSA0_LBSPPMXSB0_LBSPPM0_LPA0_LPB16_LPMXSA0_LPMXSB0_LPM0_LRVW8_LWPMn1_MIAV0_MIWT4_14_MXLIBL_MXSFNS_MO40_MGRIPM1_NTn1_NTA0_NTB0_NTC0_NTD4_NTE0_NTMXSA0_NTMXSB0_NTM0_NTWS0_NVn1_NVA0_NVB0_NVC0_NVD0_NVE0_NVMXSA0_NVMXSB0_NVM0_NVWS0_NEPBS16_NLCA2_NLCB1_ONLL1_PAP0_PGL0_PGR2_PLR1_PKA1_SGROB0_SIA3_SS1_SPO0_SRVW0_SSO0_SVW4_SK0_SKFTR0_SKFDPO0_SKXCCM0_SNLL0_SIP1_SGRO0_TDMI0_TDMIM0_TDMS0_TIN0_THn1_THA0_THB0_THC0_THD0_THE0_THMXSA0_THMXSB0_THM0_THWS0_TLDS1_TLDSM1_ULSGRO0_USL1_USLMX0_UIOFGRO0_UPLRP0_USFGROn1_USI0_VSn1_VWA4_VWB2_WSGRA0_WSGRB0_WS64_WG64_4_1",
+          "group_segment_fixed_size": 65024,
+          "kernarg_segment_size": 160,
+          "max_flat_workgroup_size": 256,
+          "private_segment_fixed_size": 0,
+          "sgpr_count": 90,
+          "sgpr_spill_count": 0,
+          "symbol": "Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT256x224x64_MI16x16x1_SN_LDSB0_AFC1_AG0_AGGSUA0_AGNTAB0_AFEM1_AFEM1_ASEM1_CD1_1_CLR1_CLS0_CADS0_DTLA0_DTLB0_DTLM0_DTVA1_DTVB0_DTVMXSA0_DTVMXSB0_DTVSM0_DPLB0_EPS0_ELFLR0_EMLLn1_FDSI0_GRPM1_GRVWA8_GRVWB8_GSUAMBSK_GLS0_HPLR0_ISA942_ICIW0_IU1_K1_LDSTI0_LBSPPA0_LBSPPB256_LBSPPMXSA0_LBSPPMXSB0_LBSPPM0_LPA0_LPB16_LPMXSA0_LPMXSB0_LPM0_LRVW8_LWPMn1_MIAV0_MIWT4_14_MXLIBL_MXSFNS_MO40_MGRIPM1_NTn1_NTA0_NTB0_NTC0_NTD4_NTE0_NTMXSA0_NTMXSB0_NTM0_NTWS0_NVn1_NVA0_NVB0_NVC0_NVD0_NVE0_NVMXSA0_NVMXSB0_NVM0_NVWS0_NEPBS16_NLCA2_NLCB1_ONLL1_PAP0_PGL0_PGR2_PLR1_PKA1_SGROB0_SIA3_SS1_SPO0_SRVW0_SSO0_SVW4_SK0_SKFTR0_SKFDPO0_SKXCCM0_SNLL0_SIP1_SGRO0_TDMI0_TDMIM0_TDMS0_TIN0_THn1_THA0_THB0_THC0_THD0_THE0_THMXSA0_THMXSB0_THM0_THWS0_TLDS1_TLDSM1_ULSGRO0_USL1_USLMX0_UIOFGRO0_UPLRP0_USFGROn1_USI0_VSn1_VWA4_VWB2_WSGRA0_WSGRB0_WS64_WG64_4_1.kd",
+          "vgpr_count": 209,
+          "vgpr_spill_count": 0
+        },
+        "Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT128x112x128_MI16x16x1_SN_LDSB1_AFC1_AG0_AGGSUA0_AGNTAB0_AFEM1_AFEM1_ASEM1_CD1_1_CLR1_CLS0_CADS0_DTLA0_DTLB0_DTLM0_DTVA0_DTVB0_DTVMXSA0_DTVMXSB0_DTVSM0_DPLB0_EPS0_ELFLR0_EMLLn1_FDSI0_GRPM1_GRVWA8_GRVWB8_GSUAMBSK_GLS0_HPLR0_ISA942_ICIW0_IU1_K1_LDSTI0_LBSPPA2048_LBSPPB256_LBSPPMXSA0_LBSPPMXSB0_LBSPPM0_LPA16_LPB16_LPMXSA0_LPMXSB0_LPM0_LRVW8_LWPMn1_MIAV0_MIWT8_7_MXLIBL_MXSFNS_MO40_MGRIPM1_NTn1_NTA0_NTB0_NTC0_NTD4_NTE0_NTMXSA0_NTMXSB0_NTM0_NTWS0_NVn1_NVA0_NVB0_NVC0_NVD0_NVE0_NVMXSA0_NVMXSB0_NVM0_NVWS0_NEPBS16_NLCA1_NLCB1_ONLL1_PAP0_PGL0_PGR2_PLR1_PKA1_SGROB0_SIA3_SS1_SPO0_SRVW0_SSO0_SVW8_SK0_SKFTR0_SKFDPO0_SKXCCM0_SNLL0_SIP1_SGRO0_TDMI0_TDMIM0_TDMS0_TIN0_THn1_THA0_THB0_THC0_THD0_THE0_THMXSA0_THMXSB0_THM0_THWS0_TLDS1_TLDSM1_ULSGRO0_USL1_USLMX0_UIOFGRO0_UPLRP0_USFGROn1_USI0_VSn1_VWA8_VWB1_WSGRA0_WSGRB0_WS64_WG16_4_4": {
+          "name": "Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT128x112x128_MI16x16x1_SN_LDSB1_AFC1_AG0_AGGSUA0_AGNTAB0_AFEM1_AFEM1_ASEM1_CD1_1_CLR1_CLS0_CADS0_DTLA0_DTLB0_DTLM0_DTVA0_DTVB0_DTVMXSA0_DTVMXSB0_DTVSM0_DPLB0_EPS0_ELFLR0_EMLLn1_FDSI0_GRPM1_GRVWA8_GRVWB8_GSUAMBSK_GLS0_HPLR0_ISA942_ICIW0_IU1_K1_LDSTI0_LBSPPA2048_LBSPPB256_LBSPPMXSA0_LBSPPMXSB0_LBSPPM0_LPA16_LPB16_LPMXSA0_LPMXSB0_LPM0_LRVW8_LWPMn1_MIAV0_MIWT8_7_MXLIBL_MXSFNS_MO40_MGRIPM1_NTn1_NTA0_NTB0_NTC0_NTD4_NTE0_NTMXSA0_NTMXSB0_NTM0_NTWS0_NVn1_NVA0_NVB0_NVC0_NVD0_NVE0_NVMXSA0_NVMXSB0_NVM0_NVWS0_NEPBS16_NLCA1_NLCB1_ONLL1_PAP0_PGL0_PGR2_PLR1_PKA1_SGROB0_SIA3_SS1_SPO0_SRVW0_SSO0_SVW8_SK0_SKFTR0_SKFDPO0_SKXCCM0_SNLL0_SIP1_SGRO0_TDMI0_TDMIM0_TDMS0_TIN0_THn1_THA0_THB0_THC0_THD0_THE0_THMXSA0_THMXSB0_THM0_THWS0_TLDS1_TLDSM1_ULSGRO0_USL1_USLMX0_UIOFGRO0_UPLRP0_USFGROn1_USI0_VSn1_VWA8_VWB1_WSGRA0_WSGRB0_WS64_WG16_4_4",
+          "group_segment_fixed_size": 65536,
+          "kernarg_segment_size": 160,
+          "max_flat_workgroup_size": 256,
+          "private_segment_fixed_size": 0,
+          "sgpr_count": 90,
+          "sgpr_spill_count": 0,
+          "symbol": "Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT128x112x128_MI16x16x1_SN_LDSB1_AFC1_AG0_AGGSUA0_AGNTAB0_AFEM1_AFEM1_ASEM1_CD1_1_CLR1_CLS0_CADS0_DTLA0_DTLB0_DTLM0_DTVA0_DTVB0_DTVMXSA0_DTVMXSB0_DTVSM0_DPLB0_EPS0_ELFLR0_EMLLn1_FDSI0_GRPM1_GRVWA8_GRVWB8_GSUAMBSK_GLS0_HPLR0_ISA942_ICIW0_IU1_K1_LDSTI0_LBSPPA2048_LBSPPB256_LBSPPMXSA0_LBSPPMXSB0_LBSPPM0_LPA16_LPB16_LPMXSA0_LPMXSB0_LPM0_LRVW8_LWPMn1_MIAV0_MIWT8_7_MXLIBL_MXSFNS_MO40_MGRIPM1_NTn1_NTA0_NTB0_NTC0_NTD4_NTE0_NTMXSA0_NTMXSB0_NTM0_NTWS0_NVn1_NVA0_NVB0_NVC0_NVD0_NVE0_NVMXSA0_NVMXSB0_NVM0_NVWS0_NEPBS16_NLCA1_NLCB1_ONLL1_PAP0_PGL0_PGR2_PLR1_PKA1_SGROB0_SIA3_SS1_SPO0_SRVW0_SSO0_SVW8_SK0_SKFTR0_SKFDPO0_SKXCCM0_SNLL0_SIP1_SGRO0_TDMI0_TDMIM0_TDMS0_TIN0_THn1_THA0_THB0_THC0_THD0_THE0_THMXSA0_THMXSB0_THM0_THWS0_TLDS1_TLDSM1_ULSGRO0_USL1_USLMX0_UIOFGRO0_UPLRP0_USFGROn1_USI0_VSn1_VWA8_VWB1_WSGRA0_WSGRB0_WS64_WG16_4_4.kd",
+          "vgpr_count": 155,
+          "vgpr_spill_count": 0
+        },
+        "Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT256x128x64_MI16x16x1_SN_LDSB1_AFC1_AG0_AGGSUA0_AGNTAB0_AFEM1_AFEM1_ASEM1_CD1_1_CLR1_CLS0_CADS0_DTLA0_DTLB0_DTLM0_DTVA0_DTVB0_DTVMXSA0_DTVMXSB0_DTVSM0_DPLB0_EPS0_ELFLR0_EMLLn1_FDSI0_GRPM1_GRVWA8_GRVWB8_GSUAMBSK_GLS0_HPLR0_ISA942_ICIW0_IU1_K1_LDSTI0_LBSPPA1024_LBSPPB512_LBSPPMXSA0_LBSPPMXSB0_LBSPPM0_LPA16_LPB16_LPMXSA0_LPMXSB0_LPM0_LRVW8_LWPMn1_MIAV0_MIWT8_4_MXLIBL_MXSFNS_MO40_MGRIPM1_NTn1_NTA0_NTB0_NTC0_NTD4_NTE0_NTMXSA0_NTMXSB0_NTM0_NTWS0_NVn1_NVA0_NVB0_NVC0_NVD0_NVE0_NVMXSA0_NVMXSB0_NVM0_NVWS0_NEPBS16_NLCA1_NLCB1_ONLL1_PAP0_PGL0_PGR2_PLR1_PKA1_SGROB0_SIA3_SS1_SPO0_SRVW0_SSO0_SVW8_SK0_SKFTR0_SKFDPO0_SKXCCM0_SNLL0_SIP1_SGRO0_TDMI0_TDMIM0_TDMS0_TIN0_THn1_THA0_THB0_THC0_THD0_THE0_THMXSA0_THMXSB0_THM0_THWS0_TLDS1_TLDSM1_ULSGRO1_USL1_USLMX0_UIOFGRO0_UPLRP0_USFGROn1_USI0_VSn1_VWA8_VWB4_WSGRA0_WSGRB0_WS64_WG32_8_1": {
+          "name": "Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT256x128x64_MI16x16x1_SN_LDSB1_AFC1_AG0_AGGSUA0_AGNTAB0_AFEM1_AFEM1_ASEM1_CD1_1_CLR1_CLS0_CADS0_DTLA0_DTLB0_DTLM0_DTVA0_DTVB0_DTVMXSA0_DTVMXSB0_DTVSM0_DPLB0_EPS0_ELFLR0_EMLLn1_FDSI0_GRPM1_GRVWA8_GRVWB8_GSUAMBSK_GLS0_HPLR0_ISA942_ICIW0_IU1_K1_LDSTI0_LBSPPA1024_LBSPPB512_LBSPPMXSA0_LBSPPMXSB0_LBSPPM0_LPA16_LPB16_LPMXSA0_LPMXSB0_LPM0_LRVW8_LWPMn1_MIAV0_MIWT8_4_MXLIBL_MXSFNS_MO40_MGRIPM1_NTn1_NTA0_NTB0_NTC0_NTD4_NTE0_NTMXSA0_NTMXSB0_NTM0_NTWS0_NVn1_NVA0_NVB0_NVC0_NVD0_NVE0_NVMXSA0_NVMXSB0_NVM0_NVWS0_NEPBS16_NLCA1_NLCB1_ONLL1_PAP0_PGL0_PGR2_PLR1_PKA1_SGROB0_SIA3_SS1_SPO0_SRVW0_SSO0_SVW8_SK0_SKFTR0_SKFDPO0_SKXCCM0_SNLL0_SIP1_SGRO0_TDMI0_TDMIM0_TDMS0_TIN0_THn1_THA0_THB0_THC0_THD0_THE0_THMXSA0_THMXSB0_THM0_THWS0_TLDS1_TLDSM1_ULSGRO1_USL1_USLMX0_UIOFGRO0_UPLRP0_USFGROn1_USI0_VSn1_VWA8_VWB4_WSGRA0_WSGRB0_WS64_WG32_8_1",
+          "group_segment_fixed_size": 51200,
+          "kernarg_segment_size": 160,
+          "max_flat_workgroup_size": 256,
+          "private_segment_fixed_size": 0,
+          "sgpr_count": 86,
+          "sgpr_spill_count": 0,
+          "symbol": "Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT256x128x64_MI16x16x1_SN_LDSB1_AFC1_AG0_AGGSUA0_AGNTAB0_AFEM1_AFEM1_ASEM1_CD1_1_CLR1_CLS0_CADS0_DTLA0_DTLB0_DTLM0_DTVA0_DTVB0_DTVMXSA0_DTVMXSB0_DTVSM0_DPLB0_EPS0_ELFLR0_EMLLn1_FDSI0_GRPM1_GRVWA8_GRVWB8_GSUAMBSK_GLS0_HPLR0_ISA942_ICIW0_IU1_K1_LDSTI0_LBSPPA1024_LBSPPB512_LBSPPMXSA0_LBSPPMXSB0_LBSPPM0_LPA16_LPB16_LPMXSA0_LPMXSB0_LPM0_LRVW8_LWPMn1_MIAV0_MIWT8_4_MXLIBL_MXSFNS_MO40_MGRIPM1_NTn1_NTA0_NTB0_NTC0_NTD4_NTE0_NTMXSA0_NTMXSB0_NTM0_NTWS0_NVn1_NVA0_NVB0_NVC0_NVD0_NVE0_NVMXSA0_NVMXSB0_NVM0_NVWS0_NEPBS16_NLCA1_NLCB1_ONLL1_PAP0_PGL0_PGR2_PLR1_PKA1_SGROB0_SIA3_SS1_SPO0_SRVW0_SSO0_SVW8_SK0_SKFTR0_SKFDPO0_SKXCCM0_SNLL0_SIP1_SGRO0_TDMI0_TDMIM0_TDMS0_TIN0_THn1_THA0_THB0_THC0_THD0_THE0_THMXSA0_THMXSB0_THM0_THWS0_TLDS1_TLDSM1_ULSGRO1_USL1_USLMX0_UIOFGRO0_UPLRP0_USFGROn1_USI0_VSn1_VWA8_VWB4_WSGRA0_WSGRB0_WS64_WG32_8_1.kd",
+          "vgpr_count": 151,
+          "vgpr_spill_count": 0
+        },
+        "Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT32x16x512_MI16x16x1_SN_LDSB1_AFC1_AG0_AGGSUA0_AGNTAB0_AFEM1_AFEM1_ASEM1_CD1_1_CLR1_CLS0_CADS0_DTLA0_DTLB0_DTLM0_DTVA0_DTVB0_DTVMXSA0_DTVMXSB0_DTVSM0_DPLB0_EPS0_ELFLR0_EMLLn1_FDSI0_GRPM1_GRVWA8_GRVWB8_GSUAMBSK_GLS0_HPLR0_ISA942_ICIW0_IU1_K1_LDSTI0_LBSPPA2048_LBSPPB1024_LBSPPMXSA0_LBSPPMXSB0_LBSPPM0_LPA16_LPB16_LPMXSA0_LPMXSB0_LPM0_LRVW8_LWPMn1_MIAV0_MIWT2_1_MXLIBL_MXSFNS_MO40_MGRIPM1_NTn1_NTA0_NTB0_NTC0_NTD4_NTE0_NTMXSA0_NTMXSB0_NTM0_NTWS0_NVn1_NVA0_NVB0_NVC0_NVD0_NVE0_NVMXSA0_NVMXSB0_NVM0_NVWS0_NEPBS16_NLCA1_NLCB1_ONLL1_PAP0_PGL0_PGR2_PLR1_PKA1_SGROB0_SIA3_SS1_SPO0_SRVW0_SSO0_SVW2_SK0_SKFTR0_SKFDPO0_SKXCCM0_SNLL0_SIP1_SGRO0_TDMI0_TDMIM0_TDMS0_TIN0_THn1_THA0_THB0_THC0_THD0_THE0_THMXSA0_THMXSB0_THM0_THWS0_TLDS1_TLDSM1_ULSGRO1_USL1_USLMX0_UIOFGRO0_UPLRP0_USFGROn1_USI0_VSn1_VWA2_VWB1_WSGRA0_WSGRB0_WS64_WG16_4_4": {
+          "name": "Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT32x16x512_MI16x16x1_SN_LDSB1_AFC1_AG0_AGGSUA0_AGNTAB0_AFEM1_AFEM1_ASEM1_CD1_1_CLR1_CLS0_CADS0_DTLA0_DTLB0_DTLM0_DTVA0_DTVB0_DTVMXSA0_DTVMXSB0_DTVSM0_DPLB0_EPS0_ELFLR0_EMLLn1_FDSI0_GRPM1_GRVWA8_GRVWB8_GSUAMBSK_GLS0_HPLR0_ISA942_ICIW0_IU1_K1_LDSTI0_LBSPPA2048_LBSPPB1024_LBSPPMXSA0_LBSPPMXSB0_LBSPPM0_LPA16_LPB16_LPMXSA0_LPMXSB0_LPM0_LRVW8_LWPMn1_MIAV0_MIWT2_1_MXLIBL_MXSFNS_MO40_MGRIPM1_NTn1_NTA0_NTB0_NTC0_NTD4_NTE0_NTMXSA0_NTMXSB0_NTM0_NTWS0_NVn1_NVA0_NVB0_NVC0_NVD0_NVE0_NVMXSA0_NVMXSB0_NVM0_NVWS0_NEPBS16_NLCA1_NLCB1_ONLL1_PAP0_PGL0_PGR2_PLR1_PKA1_SGROB0_SIA3_SS1_SPO0_SRVW0_SSO0_SVW2_SK0_SKFTR0_SKFDPO0_SKXCCM0_SNLL0_SIP1_SGRO0_TDMI0_TDMIM0_TDMS0_TIN0_THn1_THA0_THB0_THC0_THD0_THE0_THMXSA0_THMXSB0_THM0_THWS0_TLDS1_TLDSM1_ULSGRO1_USL1_USLMX0_UIOFGRO0_UPLRP0_USFGROn1_USI0_VSn1_VWA2_VWB1_WSGRA0_WSGRB0_WS64_WG16_4_4",
+          "group_segment_fixed_size": 50176,
+          "kernarg_segment_size": 160,
+          "max_flat_workgroup_size": 256,
+          "private_segment_fixed_size": 0,
+          "sgpr_count": 86,
+          "sgpr_spill_count": 0,
+          "symbol": "Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT32x16x512_MI16x16x1_SN_LDSB1_AFC1_AG0_AGGSUA0_AGNTAB0_AFEM1_AFEM1_ASEM1_CD1_1_CLR1_CLS0_CADS0_DTLA0_DTLB0_DTLM0_DTVA0_DTVB0_DTVMXSA0_DTVMXSB0_DTVSM0_DPLB0_EPS0_ELFLR0_EMLLn1_FDSI0_GRPM1_GRVWA8_GRVWB8_GSUAMBSK_GLS0_HPLR0_ISA942_ICIW0_IU1_K1_LDSTI0_LBSPPA2048_LBSPPB1024_LBSPPMXSA0_LBSPPMXSB0_LBSPPM0_LPA16_LPB16_LPMXSA0_LPMXSB0_LPM0_LRVW8_LWPMn1_MIAV0_MIWT2_1_MXLIBL_MXSFNS_MO40_MGRIPM1_NTn1_NTA0_NTB0_NTC0_NTD4_NTE0_NTMXSA0_NTMXSB0_NTM0_NTWS0_NVn1_NVA0_NVB0_NVC0_NVD0_NVE0_NVMXSA0_NVMXSB0_NVM0_NVWS0_NEPBS16_NLCA1_NLCB1_ONLL1_PAP0_PGL0_PGR2_PLR1_PKA1_SGROB0_SIA3_SS1_SPO0_SRVW0_SSO0_SVW2_SK0_SKFTR0_SKFDPO0_SKXCCM0_SNLL0_SIP1_SGRO0_TDMI0_TDMIM0_TDMS0_TIN0_THn1_THA0_THB0_THC0_THD0_THE0_THMXSA0_THMXSB0_THM0_THWS0_TLDS1_TLDSM1_ULSGRO1_USL1_USLMX0_UIOFGRO0_UPLRP0_USFGROn1_USI0_VSn1_VWA2_VWB1_WSGRA0_WSGRB0_WS64_WG16_4_4.kd",
+          "vgpr_count": 103,
+          "vgpr_spill_count": 0
+        },
+        "Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT16x16x256_MI16x16x1_SN_LDSB1_AFC1_AG0_AGGSUA0_AGNTAB0_AFEM1_AFEM1_ASEM1_CD1_1_CLR1_CLS0_CADS0_DTLA0_DTLB0_DTLM0_DTVA0_DTVB0_DTVMXSA0_DTVMXSB0_DTVSM0_DPLB0_EPS0_ELFLR0_EMLLn1_FDSI0_GRPM1_GRVWA8_GRVWB8_GSUAMBSK_GLS0_HPLR0_ISA942_ICIW0_IU1_K1_LDSTI0_LBSPPA512_LBSPPB512_LBSPPMXSA0_LBSPPMXSB0_LBSPPM0_LPA16_LPB16_LPMXSA0_LPMXSB0_LPM0_LRVW8_LWPMn1_MIAV0_MIWT1_1_MXLIBL_MXSFNS_MO40_MGRIPM1_NTn1_NTA0_NTB0_NTC0_NTD4_NTE0_NTMXSA0_NTMXSB0_NTM0_NTWS0_NVn1_NVA0_NVB0_NVC0_NVD0_NVE0_NVMXSA0_NVMXSB0_NVM0_NVWS0_NEPBS16_NLCA1_NLCB1_ONLL1_PAP0_PGL0_PGR2_PLR1_PKA1_SGROB0_SIA3_SS1_SPO0_SRVW0_SSO0_SVW1_SK0_SKFTR0_SKFDPO0_SKXCCM0_SNLL0_SIP1_SGRO0_TDMI0_TDMIM0_TDMS0_TIN0_THn1_THA0_THB0_THC0_THD0_THE0_THMXSA0_THMXSB0_THM0_THWS0_TLDS1_TLDSM1_ULSGRO0_USL1_USLMX0_UIOFGRO0_UPLRP0_USFGROn1_USI0_VSn1_VWA1_VWB1_WSGRA0_WSGRB0_WS64_WG16_4_4": {
+          "name": "Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT16x16x256_MI16x16x1_SN_LDSB1_AFC1_AG0_AGGSUA0_AGNTAB0_AFEM1_AFEM1_ASEM1_CD1_1_CLR1_CLS0_CADS0_DTLA0_DTLB0_DTLM0_DTVA0_DTVB0_DTVMXSA0_DTVMXSB0_DTVSM0_DPLB0_EPS0_ELFLR0_EMLLn1_FDSI0_GRPM1_GRVWA8_GRVWB8_GSUAMBSK_GLS0_HPLR0_ISA942_ICIW0_IU1_K1_LDSTI0_LBSPPA512_LBSPPB512_LBSPPMXSA0_LBSPPMXSB0_LBSPPM0_LPA16_LPB16_LPMXSA0_LPMXSB0_LPM0_LRVW8_LWPMn1_MIAV0_MIWT1_1_MXLIBL_MXSFNS_MO40_MGRIPM1_NTn1_NTA0_NTB0_NTC0_NTD4_NTE0_NTMXSA0_NTMXSB0_NTM0_NTWS0_NVn1_NVA0_NVB0_NVC0_NVD0_NVE0_NVMXSA0_NVMXSB0_NVM0_NVWS0_NEPBS16_NLCA1_NLCB1_ONLL1_PAP0_PGL0_PGR2_PLR1_PKA1_SGROB0_SIA3_SS1_SPO0_SRVW0_SSO0_SVW1_SK0_SKFTR0_SKFDPO0_SKXCCM0_SNLL0_SIP1_SGRO0_TDMI0_TDMIM0_TDMS0_TIN0_THn1_THA0_THB0_THC0_THD0_THE0_THMXSA0_THMXSB0_THM0_THWS0_TLDS1_TLDSM1_ULSGRO0_USL1_USLMX0_UIOFGRO0_UPLRP0_USFGROn1_USI0_VSn1_VWA1_VWB1_WSGRA0_WSGRB0_WS64_WG16_4_4",
+          "group_segment_fixed_size": 17408,
+          "kernarg_segment_size": 160,
+          "max_flat_workgroup_size": 256,
+          "private_segment_fixed_size": 0,
+          "sgpr_count": 82,
+          "sgpr_spill_count": 0,
+          "symbol": "Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT16x16x256_MI16x16x1_SN_LDSB1_AFC1_AG0_AGGSUA0_AGNTAB0_AFEM1_AFEM1_ASEM1_CD1_1_CLR1_CLS0_CADS0_DTLA0_DTLB0_DTLM0_DTVA0_DTVB0_DTVMXSA0_DTVMXSB0_DTVSM0_DPLB0_EPS0_ELFLR0_EMLLn1_FDSI0_GRPM1_GRVWA8_GRVWB8_GSUAMBSK_GLS0_HPLR0_ISA942_ICIW0_IU1_K1_LDSTI0_LBSPPA512_LBSPPB512_LBSPPMXSA0_LBSPPMXSB0_LBSPPM0_LPA16_LPB16_LPMXSA0_LPMXSB0_LPM0_LRVW8_LWPMn1_MIAV0_MIWT1_1_MXLIBL_MXSFNS_MO40_MGRIPM1_NTn1_NTA0_NTB0_NTC0_NTD4_NTE0_NTMXSA0_NTMXSB0_NTM0_NTWS0_NVn1_NVA0_NVB0_NVC0_NVD0_NVE0_NVMXSA0_NVMXSB0_NVM0_NVWS0_NEPBS16_NLCA1_NLCB1_ONLL1_PAP0_PGL0_PGR2_PLR1_PKA1_SGROB0_SIA3_SS1_SPO0_SRVW0_SSO0_SVW1_SK0_SKFTR0_SKFDPO0_SKXCCM0_SNLL0_SIP1_SGRO0_TDMI0_TDMIM0_TDMS0_TIN0_THn1_THA0_THB0_THC0_THD0_THE0_THMXSA0_THMXSB0_THM0_THWS0_TLDS1_TLDSM1_ULSGRO0_USL1_USLMX0_UIOFGRO0_UPLRP0_USFGROn1_USI0_VSn1_VWA1_VWB1_WSGRA0_WSGRB0_WS64_WG16_4_4.kd",
+          "vgpr_count": 39,
+          "vgpr_spill_count": 0
+        },
+        "Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT64x16x256_MI16x16x1_SN_LDSB1_AFC1_AG0_AGGSUA0_AGNTAB0_AFEM1_AFEM1_ASEM1_CD1_1_CLR1_CLS0_CADS0_DTLA0_DTLB0_DTLM0_DTVA0_DTVB0_DTVMXSA0_DTVMXSB0_DTVSM0_DPLB0_EPS0_ELFLR0_EMLLn1_FDSI0_GRPM1_GRVWA8_GRVWB8_GSUAMBSK_GLS0_HPLR0_ISA942_ICIW0_IU1_K1_LDSTI0_LBSPPA2048_LBSPPB512_LBSPPMXSA0_LBSPPMXSB0_LBSPPM0_LPA16_LPB16_LPMXSA0_LPMXSB0_LPM0_LRVW8_LWPMn1_MIAV0_MIWT4_1_MXLIBL_MXSFNS_MO40_MGRIPM1_NTn1_NTA0_NTB0_NTC0_NTD4_NTE0_NTMXSA0_NTMXSB0_NTM0_NTWS0_NVn1_NVA0_NVB0_NVC0_NVD0_NVE0_NVMXSA0_NVMXSB0_NVM0_NVWS0_NEPBS16_NLCA1_NLCB1_ONLL1_PAP0_PGL0_PGR2_PLR1_PKA1_SGROB0_SIA3_SS1_SPO0_SRVW0_SSO0_SVW4_SK0_SKFTR0_SKFDPO0_SKXCCM0_SNLL0_SIP1_SGRO0_TDMI0_TDMIM0_TDMS0_TIN0_THn1_THA0_THB0_THC0_THD0_THE0_THMXSA0_THMXSB0_THM0_THWS0_TLDS1_TLDSM1_ULSGRO1_USL1_USLMX0_UIOFGRO0_UPLRP0_USFGROn1_USI0_VSn1_VWA4_VWB1_WSGRA0_WSGRB0_WS64_WG16_4_4": {
+          "name": "Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT64x16x256_MI16x16x1_SN_LDSB1_AFC1_AG0_AGGSUA0_AGNTAB0_AFEM1_AFEM1_ASEM1_CD1_1_CLR1_CLS0_CADS0_DTLA0_DTLB0_DTLM0_DTVA0_DTVB0_DTVMXSA0_DTVMXSB0_DTVSM0_DPLB0_EPS0_ELFLR0_EMLLn1_FDSI0_GRPM1_GRVWA8_GRVWB8_GSUAMBSK_GLS0_HPLR0_ISA942_ICIW0_IU1_K1_LDSTI0_LBSPPA2048_LBSPPB512_LBSPPMXSA0_LBSPPMXSB0_LBSPPM0_LPA16_LPB16_LPMXSA0_LPMXSB0_LPM0_LRVW8_LWPMn1_MIAV0_MIWT4_1_MXLIBL_MXSFNS_MO40_MGRIPM1_NTn1_NTA0_NTB0_NTC0_NTD4_NTE0_NTMXSA0_NTMXSB0_NTM0_NTWS0_NVn1_NVA0_NVB0_NVC0_NVD0_NVE0_NVMXSA0_NVMXSB0_NVM0_NVWS0_NEPBS16_NLCA1_NLCB1_ONLL1_PAP0_PGL0_PGR2_PLR1_PKA1_SGROB0_SIA3_SS1_SPO0_SRVW0_SSO0_SVW4_SK0_SKFTR0_SKFDPO0_SKXCCM0_SNLL0_SIP1_SGRO0_TDMI0_TDMIM0_TDMS0_TIN0_THn1_THA0_THB0_THC0_THD0_THE0_THMXSA0_THMXSB0_THM0_THWS0_TLDS1_TLDSM1_ULSGRO1_USL1_USLMX0_UIOFGRO0_UPLRP0_USFGROn1_USI0_VSn1_VWA4_VWB1_WSGRA0_WSGRB0_WS64_WG16_4_4",
+          "group_segment_fixed_size": 41984,
+          "kernarg_segment_size": 160,
+          "max_flat_workgroup_size": 256,
+          "private_segment_fixed_size": 0,
+          "sgpr_count": 84,
+          "sgpr_spill_count": 0,
+          "symbol": "Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT64x16x256_MI16x16x1_SN_LDSB1_AFC1_AG0_AGGSUA0_AGNTAB0_AFEM1_AFEM1_ASEM1_CD1_1_CLR1_CLS0_CADS0_DTLA0_DTLB0_DTLM0_DTVA0_DTVB0_DTVMXSA0_DTVMXSB0_DTVSM0_DPLB0_EPS0_ELFLR0_EMLLn1_FDSI0_GRPM1_GRVWA8_GRVWB8_GSUAMBSK_GLS0_HPLR0_ISA942_ICIW0_IU1_K1_LDSTI0_LBSPPA2048_LBSPPB512_LBSPPMXSA0_LBSPPMXSB0_LBSPPM0_LPA16_LPB16_LPMXSA0_LPMXSB0_LPM0_LRVW8_LWPMn1_MIAV0_MIWT4_1_MXLIBL_MXSFNS_MO40_MGRIPM1_NTn1_NTA0_NTB0_NTC0_NTD4_NTE0_NTMXSA0_NTMXSB0_NTM0_NTWS0_NVn1_NVA0_NVB0_NVC0_NVD0_NVE0_NVMXSA0_NVMXSB0_NVM0_NVWS0_NEPBS16_NLCA1_NLCB1_ONLL1_PAP0_PGL0_PGR2_PLR1_PKA1_SGROB0_SIA3_SS1_SPO0_SRVW0_SSO0_SVW4_SK0_SKFTR0_SKFDPO0_SKXCCM0_SNLL0_SIP1_SGRO0_TDMI0_TDMIM0_TDMS0_TIN0_THn1_THA0_THB0_THC0_THD0_THE0_THMXSA0_THMXSB0_THM0_THWS0_TLDS1_TLDSM1_ULSGRO1_USL1_USLMX0_UIOFGRO0_UPLRP0_USFGROn1_USI0_VSn1_VWA4_VWB1_WSGRA0_WSGRB0_WS64_WG16_4_4.kd",
+          "vgpr_count": 100,
+          "vgpr_spill_count": 0
+        },
+        "Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT16x32x256_MI16x16x1_SN_LDSB1_AFC1_AG0_AGGSUA0_AGNTAB0_AFEM1_AFEM1_ASEM1_CD1_1_CLR1_CLS0_CADS0_DTLA0_DTLB0_DTLM0_DTVA0_DTVB0_DTVMXSA0_DTVMXSB0_DTVSM0_DPLB0_EPS0_ELFLR0_EMLLn1_FDSI0_GRPM1_GRVWA8_GRVWB8_GSUAMBSK_GLS0_HPLR0_ISA942_ICIW0_IU1_K1_LDSTI0_LBSPPA512_LBSPPB1024_LBSPPMXSA0_LBSPPMXSB0_LBSPPM0_LPA16_LPB16_LPMXSA0_LPMXSB0_LPM0_LRVW8_LWPMn1_MIAV0_MIWT1_2_MXLIBL_MXSFNS_MO40_MGRIPM1_NTn1_NTA0_NTB0_NTC0_NTD4_NTE0_NTMXSA0_NTMXSB0_NTM0_NTWS0_NVn1_NVA0_NVB0_NVC0_NVD0_NVE0_NVMXSA0_NVMXSB0_NVM0_NVWS0_NEPBS16_NLCA1_NLCB1_ONLL1_PAP0_PGL0_PGR2_PLR1_PKA1_SGROB0_SIA3_SS1_SPO0_SRVW0_SSO0_SVW1_SK0_SKFTR0_SKFDPO0_SKXCCM0_SNLL0_SIP1_SGRO0_TDMI0_TDMIM0_TDMS0_TIN0_THn1_THA0_THB0_THC0_THD0_THE0_THMXSA0_THMXSB0_THM0_THWS0_TLDS1_TLDSM1_ULSGRO1_USL1_USLMX0_UIOFGRO0_UPLRP0_USFGROn1_USI0_VSn1_VWA1_VWB2_WSGRA0_WSGRB0_WS64_WG16_4_4": {
+          "name": "Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT16x32x256_MI16x16x1_SN_LDSB1_AFC1_AG0_AGGSUA0_AGNTAB0_AFEM1_AFEM1_ASEM1_CD1_1_CLR1_CLS0_CADS0_DTLA0_DTLB0_DTLM0_DTVA0_DTVB0_DTVMXSA0_DTVMXSB0_DTVSM0_DPLB0_EPS0_ELFLR0_EMLLn1_FDSI0_GRPM1_GRVWA8_GRVWB8_GSUAMBSK_GLS0_HPLR0_ISA942_ICIW0_IU1_K1_LDSTI0_LBSPPA512_LBSPPB1024_LBSPPMXSA0_LBSPPMXSB0_LBSPPM0_LPA16_LPB16_LPMXSA0_LPMXSB0_LPM0_LRVW8_LWPMn1_MIAV0_MIWT1_2_MXLIBL_MXSFNS_MO40_MGRIPM1_NTn1_NTA0_NTB0_NTC0_NTD4_NTE0_NTMXSA0_NTMXSB0_NTM0_NTWS0_NVn1_NVA0_NVB0_NVC0_NVD0_NVE0_NVMXSA0_NVMXSB0_NVM0_NVWS0_NEPBS16_NLCA1_NLCB1_ONLL1_PAP0_PGL0_PGR2_PLR1_PKA1_SGROB0_SIA3_SS1_SPO0_SRVW0_SSO0_SVW1_SK0_SKFTR0_SKFDPO0_SKXCCM0_SNLL0_SIP1_SGRO0_TDMI0_TDMIM0_TDMS0_TIN0_THn1_THA0_THB0_THC0_THD0_THE0_THMXSA0_THMXSB0_THM0_THWS0_TLDS1_TLDSM1_ULSGRO1_USL1_USLMX0_UIOFGRO0_UPLRP0_USFGROn1_USI0_VSn1_VWA1_VWB2_WSGRA0_WSGRB0_WS64_WG16_4_4",
+          "group_segment_fixed_size": 25600,
+          "kernarg_segment_size": 160,
+          "max_flat_workgroup_size": 256,
+          "private_segment_fixed_size": 0,
+          "sgpr_count": 82,
+          "sgpr_spill_count": 0,
+          "symbol": "Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT16x32x256_MI16x16x1_SN_LDSB1_AFC1_AG0_AGGSUA0_AGNTAB0_AFEM1_AFEM1_ASEM1_CD1_1_CLR1_CLS0_CADS0_DTLA0_DTLB0_DTLM0_DTVA0_DTVB0_DTVMXSA0_DTVMXSB0_DTVSM0_DPLB0_EPS0_ELFLR0_EMLLn1_FDSI0_GRPM1_GRVWA8_GRVWB8_GSUAMBSK_GLS0_HPLR0_ISA942_ICIW0_IU1_K1_LDSTI0_LBSPPA512_LBSPPB1024_LBSPPMXSA0_LBSPPMXSB0_LBSPPM0_LPA16_LPB16_LPMXSA0_LPMXSB0_LPM0_LRVW8_LWPMn1_MIAV0_MIWT1_2_MXLIBL_MXSFNS_MO40_MGRIPM1_NTn1_NTA0_NTB0_NTC0_NTD4_NTE0_NTMXSA0_NTMXSB0_NTM0_NTWS0_NVn1_NVA0_NVB0_NVC0_NVD0_NVE0_NVMXSA0_NVMXSB0_NVM0_NVWS0_NEPBS16_NLCA1_NLCB1_ONLL1_PAP0_PGL0_PGR2_PLR1_PKA1_SGROB0_SIA3_SS1_SPO0_SRVW0_SSO0_SVW1_SK0_SKFTR0_SKFDPO0_SKXCCM0_SNLL0_SIP1_SGRO0_TDMI0_TDMIM0_TDMS0_TIN0_THn1_THA0_THB0_THC0_THD0_THE0_THMXSA0_THMXSB0_THM0_THWS0_TLDS1_TLDSM1_ULSGRO1_USL1_USLMX0_UIOFGRO0_UPLRP0_USFGROn1_USI0_VSn1_VWA1_VWB2_WSGRA0_WSGRB0_WS64_WG16_4_4.kd",
+          "vgpr_count": 55,
+          "vgpr_spill_count": 0
+        },
+        "Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT16x16x512_MI16x16x1_SN_LDSB1_AFC1_AG0_AGGSUA0_AGNTAB0_AFEM1_AFEM1_ASEM1_CD1_1_CLR1_CLS0_CADS0_DTLA0_DTLB0_DTLM0_DTVA0_DTVB0_DTVMXSA0_DTVMXSB0_DTVSM0_DPLB0_EPS0_ELFLR0_EMLLn1_FDSI0_GRPM1_GRVWA8_GRVWB8_GSUAMBSK_GLS0_HPLR0_ISA942_ICIW0_IU1_K1_LDSTI0_LBSPPA1024_LBSPPB1024_LBSPPMXSA0_LBSPPMXSB0_LBSPPM0_LPA16_LPB16_LPMXSA0_LPMXSB0_LPM0_LRVW8_LWPMn1_MIAV0_MIWT1_1_MXLIBL_MXSFNS_MO40_MGRIPM1_NTn1_NTA0_NTB0_NTC0_NTD4_NTE0_NTMXSA0_NTMXSB0_NTM0_NTWS0_NVn1_NVA0_NVB0_NVC0_NVD0_NVE0_NVMXSA0_NVMXSB0_NVM0_NVWS0_NEPBS16_NLCA1_NLCB1_ONLL1_PAP0_PGL0_PGR2_PLR1_PKA1_SGROB0_SIA3_SS1_SPO0_SRVW0_SSO0_SVW1_SK0_SKFTR0_SKFDPO0_SKXCCM0_SNLL0_SIP1_SGRO0_TDMI0_TDMIM0_TDMS0_TIN0_THn1_THA0_THB0_THC0_THD0_THE0_THMXSA0_THMXSB0_THM0_THWS0_TLDS1_TLDSM1_ULSGRO0_USL1_USLMX0_UIOFGRO0_UPLRP0_USFGROn1_USI0_VSn1_VWA1_VWB1_WSGRA0_WSGRB0_WS64_WG16_4_4": {
+          "name": "Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT16x16x512_MI16x16x1_SN_LDSB1_AFC1_AG0_AGGSUA0_AGNTAB0_AFEM1_AFEM1_ASEM1_CD1_1_CLR1_CLS0_CADS0_DTLA0_DTLB0_DTLM0_DTVA0_DTVB0_DTVMXSA0_DTVMXSB0_DTVSM0_DPLB0_EPS0_ELFLR0_EMLLn1_FDSI0_GRPM1_GRVWA8_GRVWB8_GSUAMBSK_GLS0_HPLR0_ISA942_ICIW0_IU1_K1_LDSTI0_LBSPPA1024_LBSPPB1024_LBSPPMXSA0_LBSPPMXSB0_LBSPPM0_LPA16_LPB16_LPMXSA0_LPMXSB0_LPM0_LRVW8_LWPMn1_MIAV0_MIWT1_1_MXLIBL_MXSFNS_MO40_MGRIPM1_NTn1_NTA0_NTB0_NTC0_NTD4_NTE0_NTMXSA0_NTMXSB0_NTM0_NTWS0_NVn1_NVA0_NVB0_NVC0_NVD0_NVE0_NVMXSA0_NVMXSB0_NVM0_NVWS0_NEPBS16_NLCA1_NLCB1_ONLL1_PAP0_PGL0_PGR2_PLR1_PKA1_SGROB0_SIA3_SS1_SPO0_SRVW0_SSO0_SVW1_SK0_SKFTR0_SKFDPO0_SKXCCM0_SNLL0_SIP1_SGRO0_TDMI0_TDMIM0_TDMS0_TIN0_THn1_THA0_THB0_THC0_THD0_THE0_THMXSA0_THMXSB0_THM0_THWS0_TLDS1_TLDSM1_ULSGRO0_USL1_USLMX0_UIOFGRO0_UPLRP0_USFGROn1_USI0_VSn1_VWA1_VWB1_WSGRA0_WSGRB0_WS64_WG16_4_4",
+          "group_segment_fixed_size": 33792,
+          "kernarg_segment_size": 160,
+          "max_flat_workgroup_size": 256,
+          "private_segment_fixed_size": 0,
+          "sgpr_count": 82,
+          "sgpr_spill_count": 0,
+          "symbol": "Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT16x16x512_MI16x16x1_SN_LDSB1_AFC1_AG0_AGGSUA0_AGNTAB0_AFEM1_AFEM1_ASEM1_CD1_1_CLR1_CLS0_CADS0_DTLA0_DTLB0_DTLM0_DTVA0_DTVB0_DTVMXSA0_DTVMXSB0_DTVSM0_DPLB0_EPS0_ELFLR0_EMLLn1_FDSI0_GRPM1_GRVWA8_GRVWB8_GSUAMBSK_GLS0_HPLR0_ISA942_ICIW0_IU1_K1_LDSTI0_LBSPPA1024_LBSPPB1024_LBSPPMXSA0_LBSPPMXSB0_LBSPPM0_LPA16_LPB16_LPMXSA0_LPMXSB0_LPM0_LRVW8_LWPMn1_MIAV0_MIWT1_1_MXLIBL_MXSFNS_MO40_MGRIPM1_NTn1_NTA0_NTB0_NTC0_NTD4_NTE0_NTMXSA0_NTMXSB0_NTM0_NTWS0_NVn1_NVA0_NVB0_NVC0_NVD0_NVE0_NVMXSA0_NVMXSB0_NVM0_NVWS0_NEPBS16_NLCA1_NLCB1_ONLL1_PAP0_PGL0_PGR2_PLR1_PKA1_SGROB0_SIA3_SS1_SPO0_SRVW0_SSO0_SVW1_SK0_SKFTR0_SKFDPO0_SKXCCM0_SNLL0_SIP1_SGRO0_TDMI0_TDMIM0_TDMS0_TIN0_THn1_THA0_THB0_THC0_THD0_THE0_THMXSA0_THMXSB0_THM0_THWS0_TLDS1_TLDSM1_ULSGRO0_USL1_USLMX0_UIOFGRO0_UPLRP0_USFGROn1_USI0_VSn1_VWA1_VWB1_WSGRA0_WSGRB0_WS64_WG16_4_4.kd",
+          "vgpr_count": 71,
+          "vgpr_spill_count": 0
+        }
+      }
+    },
+    "mla_sparse_adapter_gfx942.elf": {
+      "sha256": "a77f08c610bcda50a535e9a86caa601517e5f55368d17f4a47cc72679128774c",
+      "globals": {
+        "plow_mla_sparse_adapter_abi_1": 1,
+        "plow_mla_sparse_adapter_fp8_abi_1": 1
+      },
+      "kernels": {
+        "plow_mla_sparse_pack": {
+          "agpr_count": 0,
+          "group_segment_fixed_size": 0,
+          "kernarg_segment_size": 344,
+          "max_flat_workgroup_size": 1024,
+          "name": "plow_mla_sparse_pack",
+          "private_segment_fixed_size": 0,
+          "sgpr_count": 38,
+          "sgpr_spill_count": 0,
+          "symbol": "plow_mla_sparse_pack.kd",
+          "vgpr_count": 10,
+          "vgpr_spill_count": 0
+        },
+        "plow_mla_sparse_pack_fp8": {
+          "agpr_count": 0,
+          "group_segment_fixed_size": 0,
+          "kernarg_segment_size": 352,
+          "max_flat_workgroup_size": 1024,
+          "name": "plow_mla_sparse_pack_fp8",
+          "private_segment_fixed_size": 0,
+          "sgpr_count": 41,
+          "sgpr_spill_count": 0,
+          "symbol": "plow_mla_sparse_pack_fp8.kd",
+          "vgpr_count": 16,
+          "vgpr_spill_count": 0
+        },
+        "plow_mla_sparse_reduce": {
+          "agpr_count": 0,
+          "group_segment_fixed_size": 0,
+          "kernarg_segment_size": 296,
+          "max_flat_workgroup_size": 1024,
+          "name": "plow_mla_sparse_reduce",
+          "private_segment_fixed_size": 0,
+          "sgpr_count": 28,
+          "sgpr_spill_count": 0,
+          "symbol": "plow_mla_sparse_reduce.kd",
+          "vgpr_count": 33,
+          "vgpr_spill_count": 0
+        }
+      }
+    },
+    "mla_a16w16_qh8_qseqlen1_gqaratio8_v3.co": {
+      "sha256": "cd8fa62e18abada15beeeedd49357bcc1e9e2eee7353d038533f30cac93c3607",
+      "globals": {},
+      "kernels": {
+        "_ZN5aiter36mla_a16w16_qh8_qseqlen1_gqaratio8_v3E": {
+          "name": "_ZN5aiter36mla_a16w16_qh8_qseqlen1_gqaratio8_v3E",
+          "group_segment_fixed_size": 65536,
+          "kernarg_segment_size": 320,
+          "max_flat_workgroup_size": 256,
+          "private_segment_fixed_size": 0,
+          "sgpr_count": 96,
+          "symbol": "_ZN5aiter36mla_a16w16_qh8_qseqlen1_gqaratio8_v3E.kd",
+          "vgpr_count": 512
+        }
+      }
+    },
+    "dsa_tp_adapter_gfx942.elf": {
+      "sha256": "3eb9d32d2b14a8e2ac23548ff279cacca1ea2aee2922de8eb921a8f244bf4ace",
+      "globals": {
+        "plow_xargmax_max_batch_128": 1,
+        "plow_dsa_tp_abi_1": 1
+      },
+      "kernels": {
+        "plow_dsa_tp_score": {
+          "agpr_count": 0,
+          "group_segment_fixed_size": 17408,
+          "kernarg_segment_size": 312,
+          "max_flat_workgroup_size": 512,
+          "name": "plow_dsa_tp_score",
+          "private_segment_fixed_size": 0,
+          "sgpr_count": 42,
+          "sgpr_spill_count": 0,
+          "symbol": "plow_dsa_tp_score.kd",
+          "vgpr_count": 94,
+          "vgpr_spill_count": 0
+        },
+        "plow_dsa_tp_select": {
+          "agpr_count": 0,
+          "group_segment_fixed_size": 1044,
+          "kernarg_segment_size": 328,
+          "max_flat_workgroup_size": 512,
+          "name": "plow_dsa_tp_select",
+          "private_segment_fixed_size": 0,
+          "sgpr_count": 65,
+          "sgpr_spill_count": 0,
+          "symbol": "plow_dsa_tp_select.kd",
+          "vgpr_count": 20,
+          "vgpr_spill_count": 0
+        },
+        "plow_dsa_tp_gather": {
+          "agpr_count": 0,
+          "group_segment_fixed_size": 4,
+          "kernarg_segment_size": 320,
+          "max_flat_workgroup_size": 1024,
+          "name": "plow_dsa_tp_gather",
+          "private_segment_fixed_size": 0,
+          "sgpr_count": 36,
+          "sgpr_spill_count": 0,
+          "symbol": "plow_dsa_tp_gather.kd",
+          "vgpr_count": 12,
+          "vgpr_spill_count": 0
+        },
+        "plow_dsa_tp_complete": {
+          "agpr_count": 0,
+          "group_segment_fixed_size": 4,
+          "kernarg_segment_size": 64,
+          "max_flat_workgroup_size": 1024,
+          "name": "plow_dsa_tp_complete",
+          "private_segment_fixed_size": 0,
+          "sgpr_count": 26,
+          "sgpr_spill_count": 0,
+          "symbol": "plow_dsa_tp_complete.kd",
+          "vgpr_count": 5,
+          "vgpr_spill_count": 0
+        }
+      }
+    },
+    "lowrung1/interp_decode_fp8kv_gq.elf": {
+      "sha256": "114eb1f8a01d07f34b740ee10bc314066a2c369c37eebcaf0fdd123ae047695b",
+      "globals": {
+        "plow_xargmax_max_batch_128": 1,
+        "plow_geom_FA_MERGE_UNROLL4": 1,
+        "plow_geom_GM_CLFENCE": 0,
+        "plow_geom_GM_DBUF": 1,
+        "plow_token_batch_abi_1": 1,
+        "plow_cap_d_moe_router_topk_pf_1": 1,
+        "plow_gemv_walk_1": 1,
+        "plow_geom_GM_WGM": 8,
+        "plow_geom_MPF_BM": 64,
+        "plow_moe_pf_part16_arm": 1,
+        "plow_geom_GM_HACK_NOFETCH": 0,
+        "plow_geom_GV_HACK_NOSUM": 0,
+        "plow_geom_GV_MFMA4": 0,
+        "plow_flash_merge_hd_256": 1,
+        "plow_flash_merge_hd_512": 1,
+        "plow_geom_GV_UNROLL_GLU": 6,
+        "plow_geom_PLOW_WG_WAVES": 8,
+        "plow_geom_GV_MFMA4_UN_M2": 11,
+        "plow_geom_GV_RS_R": 2,
+        "plow_moe_gemma_pf_arms_1": 1,
+        "plow_t11_gluquant_arm": 1,
+        "plow_geom_FA_FAST_RCP": 1,
+        "plow_geom_FA_MLA_PF2_FASTBF": 1,
+        "plow_geom_GV_RS_MAXNCH": 8,
+        "plow_geom_FA_DEC_KUNROLL": 8,
+        "plow_geom_FA_FASTMASK": 0,
+        "plow_geom_GV_MFMA4_UN_M4": 2,
+        "plow_moe_gemma_arms_1": 1,
+        "plow_glm_fuse_rope_arm": 1,
+        "plow_moe_pf_det_arm": 1,
+        "plow_geom_FA_MLA_PF2_FRAME": 8,
+        "plow_geom_GV_DMA": 0,
+        "plow_geom_GV_UNROLL_GLU_FP8": 3,
+        "plow_geom_FA_LAZY_RESCALE": 0,
+        "plow_geom_GV_USCALAR": 1,
+        "plow_geom_FA_DEC_ILV": 1,
+        "plow_geom_GV_UNROLL_FP8": 3,
+        "plow_dsa_select_local_arm": 1,
+        "plow_geom_FA_DEC_V_UNROLL": 8,
+        "plow_geom_GM_BK": 64,
+        "plow_geom_GV_MFMA4_UN_M8": 3,
+        "plow_geom_GV_UN_K8192": 16,
+        "plow_geom_GM_MD_BK": 64,
+        "plow_geom_FA_LDS_DMA": 0,
+        "plow_geom_FA_MLA_KDU": 4,
+        "plow_geom_FA_MLA_KUNROLL": 1,
+        "plow_geom_FA_MLA_PF2_DEFER": 1,
+        "plow_geom_GM_BM": 192,
+        "plow_geom_GV_RING": 16,
+        "plow_geom_GV_RS_WIDE_UN": 6,
+        "plow_geom_MPF_DBUF": 1,
+        "plow_geom_GM_BN": 256,
+        "plow_geom_GM_MD_BM": 128,
+        "plow_geom_GV_HACK_CHEAPDOT": 0,
+        "plow_geom_GV_RS_WIDE_R": 2,
+        "plow_geom_GV_UNROLL_M4": 6,
+        "plow_l2_place_dispatch_1": 1,
+        "plow_geom_GM_MD_BN": 128,
+        "plow_geom_GV_MFMA": 0,
+        "plow_geom_GV_RS_UN": 7,
+        "plow_dec_stage_halves": 32256,
+        "plow_mla_sparse_fp8_decode_arm": 1,
+        "plow_geom_GV_KS": 1,
+        "plow_gemv_mm_cap_1": 1,
+        "plow_geom_FA_USE_EXP2": 1,
+        "plow_geom_GM_SLICE": 16,
+        "plow_geom_GV_UNROLL_M8": 3,
+        "plow_moe_align_bm64_1": 1,
+        "plow_fp8_kv_1": 1,
+        "plow_geom_FA_DC": 128,
+        "plow_geom_FA_DEC_LIVE": 0,
+        "plow_geom_FA_MLA_PF2_BKV": 32,
+        "plow_geom_FA_ABL": 0,
+        "plow_geom_GM_PLR": 1,
+        "plow_geom_GV_UNROLL": 11,
+        "plow_mla_pf_ns_arm": 1,
+        "plow_moe_pf_a8_arm": 1,
+        "plow_geom_GV_URSRC": 0,
+        "plow_dsa_decode_batch_arm": 1,
+        "plow_geom_FA_DBUF": 0,
+        "plow_geom_FA_DEC_VPIPE": 0,
+        "plow_geom_GM_CLBAR": 0,
+        "plow_geom_GM_PRIO": 1,
+        "plow_packed_prefill_abi_1": 1,
+        "plow_gate_hier_1": 1,
+        "plow_geom_GV_NT": 1,
+        "plow_geom_GV_RS_WIDE": 1,
+        "plow_glm_fuse_qnorm_arm": 1,
+        "plow_geom_FA_BKV_D128": 32,
+        "plow_geom_FA_DEC_KL": 8,
+        "plow_geom_FA_DEC_WPEU": 2,
+        "plow_geom_FA_HEAD_MAJOR": 0,
+        "plow_geom_GM_PLR8": 0,
+        "plow_geom_GV_MFMA4_YT_M2": 1,
+        "plow_geom_GM_SM_BK": 128,
+        "plow_geom_GV_BATCH": 8,
+        "plow_geom_GV_MFMA4_YT_M4": 4,
+        "plow_flash_merge_hd_128": 1,
+        "plow_geom_GM_SM_BM": 64,
+        "plow_geom_GV_KS_UN": 8,
+        "plow_row_gather_1": 1,
+        "plow_xrn_1": 1,
+        "plow_dsa_idx_row_arm": 1,
+        "plow_geom_GM_BLK_BK": 64,
+        "plow_geom_GM_SM_BN": 128,
+        "plow_geom_GM_PGR2": 0,
+        "plow_geom_GM_BLK_BM": 128,
+        "plow_geom_GV_KS_MAXRPW": 3,
+        "plow_geom_GV_MFMA4_YT_M8": 2,
+        "plow_geom_GM_BLK_BN": 128,
+        "plow_geom_GM_SWZ": 2,
+        "plow_geom_GV_BLOCKED": 1,
+        "plow_geom_GV_UNROLL_GLU_MXFP4": 2,
+        "plow_geom_MPF_BK": 64,
+        "plow_geom_PLOW_GEMV_MM": 1
+      },
+      "kernels": {
+        "plow_interp_dec_gfx942_gq": {
+          "agpr_count": 0,
+          "group_segment_fixed_size": 64568,
+          "kernarg_segment_size": 432,
+          "max_flat_workgroup_size": 512,
+          "name": "plow_interp_dec_gfx942_gq",
+          "private_segment_fixed_size": 1108,
+          "sgpr_count": 108,
+          "sgpr_spill_count": 87,
+          "symbol": "plow_interp_dec_gfx942_gq.kd",
+          "vgpr_count": 256,
+          "vgpr_spill_count": 4
+        },
+        "plow_xctr_audit": {
+          "agpr_count": 0,
+          "group_segment_fixed_size": 0,
+          "kernarg_segment_size": 296,
+          "max_flat_workgroup_size": 1024,
+          "name": "plow_xctr_audit",
+          "private_segment_fixed_size": 0,
+          "sgpr_count": 32,
+          "sgpr_spill_count": 0,
+          "symbol": "plow_xctr_audit.kd",
+          "vgpr_count": 8,
+          "vgpr_spill_count": 0
+        },
+        "plow_state_clear": {
+          "agpr_count": 0,
+          "group_segment_fixed_size": 0,
+          "kernarg_segment_size": 272,
+          "max_flat_workgroup_size": 1024,
+          "name": "plow_state_clear",
+          "private_segment_fixed_size": 0,
+          "sgpr_count": 18,
+          "sgpr_spill_count": 0,
+          "symbol": "plow_state_clear.kd",
+          "vgpr_count": 4,
+          "vgpr_spill_count": 0
+        },
+        "plow_token_capture": {
+          "agpr_count": 0,
+          "group_segment_fixed_size": 0,
+          "kernarg_segment_size": 288,
+          "max_flat_workgroup_size": 1024,
+          "name": "plow_token_capture",
+          "private_segment_fixed_size": 0,
+          "sgpr_count": 14,
+          "sgpr_spill_count": 0,
+          "symbol": "plow_token_capture.kd",
+          "vgpr_count": 7,
+          "vgpr_spill_count": 0
+        }
+      }
+    },
+    "lowrung2/interp_decode_fp8kv_gq.elf": {
+      "sha256": "af37a8b8503d3f3fe5b0e86f3d69c5081eef11cc0200b202002a9225f5f3ed45",
+      "globals": {
+        "plow_xargmax_max_batch_128": 1,
+        "plow_geom_FA_MERGE_UNROLL4": 1,
+        "plow_geom_GM_CLFENCE": 0,
+        "plow_geom_GM_DBUF": 1,
+        "plow_token_batch_abi_1": 1,
+        "plow_cap_d_moe_router_topk_pf_1": 1,
+        "plow_gemv_walk_1": 1,
+        "plow_geom_GM_WGM": 8,
+        "plow_geom_MPF_BM": 64,
+        "plow_moe_pf_part16_arm": 1,
+        "plow_geom_GM_HACK_NOFETCH": 0,
+        "plow_geom_GV_HACK_NOSUM": 0,
+        "plow_geom_GV_MFMA4": 0,
+        "plow_flash_merge_hd_256": 1,
+        "plow_flash_merge_hd_512": 1,
+        "plow_geom_GV_UNROLL_GLU": 6,
+        "plow_geom_PLOW_WG_WAVES": 8,
+        "plow_geom_GV_MFMA4_UN_M2": 11,
+        "plow_geom_GV_RS_R": 2,
+        "plow_moe_gemma_pf_arms_1": 1,
+        "plow_t11_gluquant_arm": 1,
+        "plow_geom_FA_FAST_RCP": 1,
+        "plow_geom_FA_MLA_PF2_FASTBF": 1,
+        "plow_geom_GV_RS_MAXNCH": 8,
+        "plow_geom_FA_DEC_KUNROLL": 8,
+        "plow_geom_FA_FASTMASK": 0,
+        "plow_geom_GV_MFMA4_UN_M4": 2,
+        "plow_moe_gemma_arms_1": 1,
+        "plow_glm_fuse_rope_arm": 1,
+        "plow_moe_pf_det_arm": 1,
+        "plow_geom_FA_MLA_PF2_FRAME": 8,
+        "plow_geom_GV_DMA": 0,
+        "plow_geom_GV_UNROLL_GLU_FP8": 3,
+        "plow_geom_FA_LAZY_RESCALE": 0,
+        "plow_geom_GV_USCALAR": 1,
+        "plow_geom_FA_DEC_ILV": 1,
+        "plow_geom_GV_UNROLL_FP8": 3,
+        "plow_dsa_select_local_arm": 1,
+        "plow_geom_FA_DEC_V_UNROLL": 8,
+        "plow_geom_GM_BK": 64,
+        "plow_geom_GV_MFMA4_UN_M8": 3,
+        "plow_geom_GV_UN_K8192": 16,
+        "plow_geom_GM_MD_BK": 64,
+        "plow_geom_FA_LDS_DMA": 0,
+        "plow_geom_FA_MLA_KDU": 4,
+        "plow_geom_FA_MLA_KUNROLL": 1,
+        "plow_geom_FA_MLA_PF2_DEFER": 1,
+        "plow_geom_GM_BM": 192,
+        "plow_geom_GV_RING": 16,
+        "plow_geom_GV_RS_WIDE_UN": 6,
+        "plow_geom_MPF_DBUF": 1,
+        "plow_geom_GM_BN": 256,
+        "plow_geom_GM_MD_BM": 128,
+        "plow_geom_GV_HACK_CHEAPDOT": 0,
+        "plow_geom_GV_RS_WIDE_R": 2,
+        "plow_geom_GV_UNROLL_M4": 6,
+        "plow_l2_place_dispatch_1": 1,
+        "plow_geom_GM_MD_BN": 128,
+        "plow_geom_GV_MFMA": 0,
+        "plow_geom_GV_RS_UN": 7,
+        "plow_dec_stage_halves": 32256,
+        "plow_mla_sparse_fp8_decode_arm": 1,
+        "plow_geom_GV_KS": 1,
+        "plow_geom_FA_USE_EXP2": 1,
+        "plow_geom_GM_SLICE": 16,
+        "plow_geom_GV_UNROLL_M8": 3,
+        "plow_moe_align_bm64_1": 1,
+        "plow_fp8_kv_1": 1,
+        "plow_gemv_mm_cap_2": 2,
+        "plow_geom_FA_DC": 128,
+        "plow_geom_FA_DEC_LIVE": 0,
+        "plow_geom_FA_MLA_PF2_BKV": 32,
+        "plow_geom_FA_ABL": 0,
+        "plow_geom_GM_PLR": 1,
+        "plow_geom_GV_UNROLL": 11,
+        "plow_mla_pf_ns_arm": 1,
+        "plow_moe_pf_a8_arm": 1,
+        "plow_geom_GV_URSRC": 0,
+        "plow_dsa_decode_batch_arm": 1,
+        "plow_geom_FA_DBUF": 0,
+        "plow_geom_FA_DEC_VPIPE": 0,
+        "plow_geom_GM_CLBAR": 0,
+        "plow_geom_GM_PRIO": 1,
+        "plow_packed_prefill_abi_1": 1,
+        "plow_gate_hier_1": 1,
+        "plow_geom_GV_NT": 1,
+        "plow_geom_GV_RS_WIDE": 1,
+        "plow_glm_fuse_qnorm_arm": 1,
+        "plow_geom_FA_BKV_D128": 32,
+        "plow_geom_FA_DEC_KL": 8,
+        "plow_geom_FA_DEC_WPEU": 2,
+        "plow_geom_FA_HEAD_MAJOR": 0,
+        "plow_geom_GM_PLR8": 0,
+        "plow_geom_GV_MFMA4_YT_M2": 1,
+        "plow_geom_GM_SM_BK": 128,
+        "plow_geom_GV_BATCH": 8,
+        "plow_geom_GV_MFMA4_YT_M4": 4,
+        "plow_flash_merge_hd_128": 1,
+        "plow_geom_GM_SM_BM": 64,
+        "plow_geom_GV_KS_UN": 8,
+        "plow_row_gather_1": 1,
+        "plow_xrn_1": 1,
+        "plow_dsa_idx_row_arm": 1,
+        "plow_geom_GM_BLK_BK": 64,
+        "plow_geom_GM_SM_BN": 128,
+        "plow_geom_GM_PGR2": 0,
+        "plow_geom_GM_BLK_BM": 128,
+        "plow_geom_GV_KS_MAXRPW": 3,
+        "plow_geom_GV_MFMA4_YT_M8": 2,
+        "plow_geom_GM_BLK_BN": 128,
+        "plow_geom_GM_SWZ": 2,
+        "plow_geom_GV_BLOCKED": 1,
+        "plow_geom_GV_UNROLL_GLU_MXFP4": 2,
+        "plow_geom_MPF_BK": 64,
+        "plow_geom_PLOW_GEMV_MM": 2
+      },
+      "kernels": {
+        "plow_interp_dec_gfx942_gq": {
+          "agpr_count": 0,
+          "group_segment_fixed_size": 64568,
+          "kernarg_segment_size": 432,
+          "max_flat_workgroup_size": 512,
+          "name": "plow_interp_dec_gfx942_gq",
+          "private_segment_fixed_size": 1488,
+          "sgpr_count": 108,
+          "sgpr_spill_count": 87,
+          "symbol": "plow_interp_dec_gfx942_gq.kd",
+          "vgpr_count": 256,
+          "vgpr_spill_count": 2
+        },
+        "plow_xctr_audit": {
+          "agpr_count": 0,
+          "group_segment_fixed_size": 0,
+          "kernarg_segment_size": 296,
+          "max_flat_workgroup_size": 1024,
+          "name": "plow_xctr_audit",
+          "private_segment_fixed_size": 0,
+          "sgpr_count": 32,
+          "sgpr_spill_count": 0,
+          "symbol": "plow_xctr_audit.kd",
+          "vgpr_count": 8,
+          "vgpr_spill_count": 0
+        },
+        "plow_state_clear": {
+          "agpr_count": 0,
+          "group_segment_fixed_size": 0,
+          "kernarg_segment_size": 272,
+          "max_flat_workgroup_size": 1024,
+          "name": "plow_state_clear",
+          "private_segment_fixed_size": 0,
+          "sgpr_count": 18,
+          "sgpr_spill_count": 0,
+          "symbol": "plow_state_clear.kd",
+          "vgpr_count": 4,
+          "vgpr_spill_count": 0
+        },
+        "plow_token_capture": {
+          "agpr_count": 0,
+          "group_segment_fixed_size": 0,
+          "kernarg_segment_size": 288,
+          "max_flat_workgroup_size": 1024,
+          "name": "plow_token_capture",
+          "private_segment_fixed_size": 0,
+          "sgpr_count": 14,
+          "sgpr_spill_count": 0,
+          "symbol": "plow_token_capture.kd",
+          "vgpr_count": 7,
+          "vgpr_spill_count": 0
+        }
+      }
+    },
+    "lowrung4/interp_decode_fp8kv_gq.elf": {
+      "sha256": "ffb12abb2599ac31d4634afde4592f44f97eea895fe3944766e7b32d316ee69c",
+      "globals": {
+        "plow_xargmax_max_batch_128": 1,
+        "plow_geom_FA_MERGE_UNROLL4": 1,
+        "plow_geom_GM_CLFENCE": 0,
+        "plow_geom_GM_DBUF": 1,
+        "plow_token_batch_abi_1": 1,
+        "plow_cap_d_moe_router_topk_pf_1": 1,
+        "plow_gemv_walk_1": 1,
+        "plow_geom_GM_WGM": 8,
+        "plow_geom_MPF_BM": 64,
+        "plow_moe_pf_part16_arm": 1,
+        "plow_geom_GM_HACK_NOFETCH": 0,
+        "plow_geom_GV_HACK_NOSUM": 0,
+        "plow_geom_GV_MFMA4": 0,
+        "plow_flash_merge_hd_256": 1,
+        "plow_flash_merge_hd_512": 1,
+        "plow_geom_GV_UNROLL_GLU": 6,
+        "plow_geom_PLOW_WG_WAVES": 8,
+        "plow_geom_GV_MFMA4_UN_M2": 11,
+        "plow_geom_GV_RS_R": 2,
+        "plow_moe_gemma_pf_arms_1": 1,
+        "plow_t11_gluquant_arm": 1,
+        "plow_geom_FA_FAST_RCP": 1,
+        "plow_geom_FA_MLA_PF2_FASTBF": 1,
+        "plow_geom_GV_RS_MAXNCH": 8,
+        "plow_geom_FA_DEC_KUNROLL": 8,
+        "plow_geom_FA_FASTMASK": 0,
+        "plow_geom_GV_MFMA4_UN_M4": 2,
+        "plow_moe_gemma_arms_1": 1,
+        "plow_glm_fuse_rope_arm": 1,
+        "plow_moe_pf_det_arm": 1,
+        "plow_geom_FA_MLA_PF2_FRAME": 8,
+        "plow_geom_GV_DMA": 0,
+        "plow_geom_GV_UNROLL_GLU_FP8": 3,
+        "plow_geom_FA_LAZY_RESCALE": 0,
+        "plow_geom_GV_USCALAR": 1,
+        "plow_geom_FA_DEC_ILV": 1,
+        "plow_geom_GV_UNROLL_FP8": 3,
+        "plow_dsa_select_local_arm": 1,
+        "plow_geom_FA_DEC_V_UNROLL": 8,
+        "plow_geom_GM_BK": 64,
+        "plow_geom_GV_MFMA4_UN_M8": 3,
+        "plow_geom_GV_UN_K8192": 16,
+        "plow_geom_GM_MD_BK": 64,
+        "plow_geom_FA_LDS_DMA": 0,
+        "plow_geom_FA_MLA_KDU": 4,
+        "plow_geom_FA_MLA_KUNROLL": 1,
+        "plow_geom_FA_MLA_PF2_DEFER": 1,
+        "plow_geom_GM_BM": 192,
+        "plow_geom_GV_RING": 16,
+        "plow_geom_GV_RS_WIDE_UN": 6,
+        "plow_geom_MPF_DBUF": 1,
+        "plow_geom_GM_BN": 256,
+        "plow_geom_GM_MD_BM": 128,
+        "plow_geom_GV_HACK_CHEAPDOT": 0,
+        "plow_geom_GV_RS_WIDE_R": 2,
+        "plow_geom_GV_UNROLL_M4": 6,
+        "plow_l2_place_dispatch_1": 1,
+        "plow_geom_GM_MD_BN": 128,
+        "plow_geom_GV_MFMA": 0,
+        "plow_geom_GV_RS_UN": 7,
+        "plow_dec_stage_halves": 32256,
+        "plow_mla_sparse_fp8_decode_arm": 1,
+        "plow_geom_GV_KS": 1,
+        "plow_geom_FA_USE_EXP2": 1,
+        "plow_geom_GM_SLICE": 16,
+        "plow_geom_GV_UNROLL_M8": 3,
+        "plow_moe_align_bm64_1": 1,
+        "plow_fp8_kv_1": 1,
+        "plow_geom_FA_DC": 128,
+        "plow_geom_FA_DEC_LIVE": 0,
+        "plow_geom_FA_MLA_PF2_BKV": 32,
+        "plow_geom_FA_ABL": 0,
+        "plow_geom_GM_PLR": 1,
+        "plow_geom_GV_UNROLL": 11,
+        "plow_mla_pf_ns_arm": 1,
+        "plow_gemv_mm_cap_4": 4,
+        "plow_moe_pf_a8_arm": 1,
+        "plow_geom_GV_URSRC": 0,
+        "plow_dsa_decode_batch_arm": 1,
+        "plow_geom_FA_DBUF": 0,
+        "plow_geom_FA_DEC_VPIPE": 0,
+        "plow_geom_GM_CLBAR": 0,
+        "plow_geom_GM_PRIO": 1,
+        "plow_packed_prefill_abi_1": 1,
+        "plow_gate_hier_1": 1,
+        "plow_geom_GV_NT": 1,
+        "plow_geom_GV_RS_WIDE": 1,
+        "plow_glm_fuse_qnorm_arm": 1,
+        "plow_geom_FA_BKV_D128": 32,
+        "plow_geom_FA_DEC_KL": 8,
+        "plow_geom_FA_DEC_WPEU": 2,
+        "plow_geom_FA_HEAD_MAJOR": 0,
+        "plow_geom_GM_PLR8": 0,
+        "plow_geom_GV_MFMA4_YT_M2": 1,
+        "plow_geom_GM_SM_BK": 128,
+        "plow_geom_GV_BATCH": 8,
+        "plow_geom_GV_MFMA4_YT_M4": 4,
+        "plow_flash_merge_hd_128": 1,
+        "plow_geom_GM_SM_BM": 64,
+        "plow_geom_GV_KS_UN": 8,
+        "plow_row_gather_1": 1,
+        "plow_xrn_1": 1,
+        "plow_dsa_idx_row_arm": 1,
+        "plow_geom_GM_BLK_BK": 64,
+        "plow_geom_GM_SM_BN": 128,
+        "plow_geom_GM_PGR2": 0,
+        "plow_geom_GM_BLK_BM": 128,
+        "plow_geom_GV_KS_MAXRPW": 3,
+        "plow_geom_GV_MFMA4_YT_M8": 2,
+        "plow_geom_GM_BLK_BN": 128,
+        "plow_geom_GM_SWZ": 2,
+        "plow_geom_GV_BLOCKED": 1,
+        "plow_geom_GV_UNROLL_GLU_MXFP4": 2,
+        "plow_geom_MPF_BK": 64,
+        "plow_geom_PLOW_GEMV_MM": 4
+      },
+      "kernels": {
+        "plow_interp_dec_gfx942_gq": {
+          "agpr_count": 0,
+          "group_segment_fixed_size": 64568,
+          "kernarg_segment_size": 432,
+          "max_flat_workgroup_size": 512,
+          "name": "plow_interp_dec_gfx942_gq",
+          "private_segment_fixed_size": 1904,
+          "sgpr_count": 108,
+          "sgpr_spill_count": 87,
+          "symbol": "plow_interp_dec_gfx942_gq.kd",
+          "vgpr_count": 256,
+          "vgpr_spill_count": 2
+        },
+        "plow_xctr_audit": {
+          "agpr_count": 0,
+          "group_segment_fixed_size": 0,
+          "kernarg_segment_size": 296,
+          "max_flat_workgroup_size": 1024,
+          "name": "plow_xctr_audit",
+          "private_segment_fixed_size": 0,
+          "sgpr_count": 32,
+          "sgpr_spill_count": 0,
+          "symbol": "plow_xctr_audit.kd",
+          "vgpr_count": 8,
+          "vgpr_spill_count": 0
+        },
+        "plow_state_clear": {
+          "agpr_count": 0,
+          "group_segment_fixed_size": 0,
+          "kernarg_segment_size": 272,
+          "max_flat_workgroup_size": 1024,
+          "name": "plow_state_clear",
+          "private_segment_fixed_size": 0,
+          "sgpr_count": 18,
+          "sgpr_spill_count": 0,
+          "symbol": "plow_state_clear.kd",
+          "vgpr_count": 4,
+          "vgpr_spill_count": 0
+        },
+        "plow_token_capture": {
+          "agpr_count": 0,
+          "group_segment_fixed_size": 0,
+          "kernarg_segment_size": 288,
+          "max_flat_workgroup_size": 1024,
+          "name": "plow_token_capture",
+          "private_segment_fixed_size": 0,
+          "sgpr_count": 14,
+          "sgpr_spill_count": 0,
+          "symbol": "plow_token_capture.kd",
+          "vgpr_count": 7,
+          "vgpr_spill_count": 0
+        }
+      }
+    },
+    "lowrung8/interp_decode_fp8kv_gq.elf": {
+      "sha256": "07be2b93ead2270436e905754857048a6f757c64e899c5c9584614828f9a2b66",
+      "globals": {
+        "plow_xargmax_max_batch_128": 1,
+        "plow_geom_FA_MERGE_UNROLL4": 1,
+        "plow_geom_GM_CLFENCE": 0,
+        "plow_geom_GM_DBUF": 1,
+        "plow_token_batch_abi_1": 1,
+        "plow_cap_d_moe_router_topk_pf_1": 1,
+        "plow_gemv_walk_1": 1,
+        "plow_geom_GM_WGM": 8,
+        "plow_geom_MPF_BM": 64,
+        "plow_moe_pf_part16_arm": 1,
+        "plow_geom_GM_HACK_NOFETCH": 0,
+        "plow_geom_GV_HACK_NOSUM": 0,
+        "plow_geom_GV_MFMA4": 0,
+        "plow_flash_merge_hd_256": 1,
+        "plow_flash_merge_hd_512": 1,
+        "plow_geom_GV_UNROLL_GLU": 6,
+        "plow_geom_PLOW_WG_WAVES": 8,
+        "plow_geom_GV_MFMA4_UN_M2": 11,
+        "plow_geom_GV_RS_R": 2,
+        "plow_moe_gemma_pf_arms_1": 1,
+        "plow_t11_gluquant_arm": 1,
+        "plow_geom_FA_FAST_RCP": 1,
+        "plow_geom_FA_MLA_PF2_FASTBF": 1,
+        "plow_geom_GV_RS_MAXNCH": 8,
+        "plow_geom_FA_DEC_KUNROLL": 8,
+        "plow_geom_FA_FASTMASK": 0,
+        "plow_geom_GV_MFMA4_UN_M4": 2,
+        "plow_moe_gemma_arms_1": 1,
+        "plow_glm_fuse_rope_arm": 1,
+        "plow_moe_pf_det_arm": 1,
+        "plow_geom_FA_MLA_PF2_FRAME": 8,
+        "plow_geom_GV_DMA": 0,
+        "plow_geom_GV_UNROLL_GLU_FP8": 3,
+        "plow_geom_FA_LAZY_RESCALE": 0,
+        "plow_geom_GV_USCALAR": 1,
+        "plow_geom_FA_DEC_ILV": 1,
+        "plow_geom_GV_UNROLL_FP8": 3,
+        "plow_dsa_select_local_arm": 1,
+        "plow_geom_FA_DEC_V_UNROLL": 8,
+        "plow_geom_GM_BK": 64,
+        "plow_geom_GV_MFMA4_UN_M8": 3,
+        "plow_geom_GV_UN_K8192": 16,
+        "plow_geom_GM_MD_BK": 64,
+        "plow_geom_FA_LDS_DMA": 0,
+        "plow_geom_FA_MLA_KDU": 4,
+        "plow_geom_FA_MLA_KUNROLL": 1,
+        "plow_geom_FA_MLA_PF2_DEFER": 1,
+        "plow_geom_GM_BM": 192,
+        "plow_geom_GV_RING": 16,
+        "plow_geom_GV_RS_WIDE_UN": 6,
+        "plow_geom_MPF_DBUF": 1,
+        "plow_geom_GM_BN": 256,
+        "plow_geom_GM_MD_BM": 128,
+        "plow_geom_GV_HACK_CHEAPDOT": 0,
+        "plow_geom_GV_RS_WIDE_R": 2,
+        "plow_geom_GV_UNROLL_M4": 6,
+        "plow_l2_place_dispatch_1": 1,
+        "plow_geom_GM_MD_BN": 128,
+        "plow_geom_GV_MFMA": 0,
+        "plow_geom_GV_RS_UN": 7,
+        "plow_dec_stage_halves": 32256,
+        "plow_mla_sparse_fp8_decode_arm": 1,
+        "plow_geom_GV_KS": 1,
+        "plow_geom_FA_USE_EXP2": 1,
+        "plow_geom_GM_SLICE": 16,
+        "plow_geom_GV_UNROLL_M8": 3,
+        "plow_moe_align_bm64_1": 1,
+        "plow_fp8_kv_1": 1,
+        "plow_geom_FA_DC": 128,
+        "plow_geom_FA_DEC_LIVE": 0,
+        "plow_geom_FA_MLA_PF2_BKV": 32,
+        "plow_geom_FA_ABL": 0,
+        "plow_geom_GM_PLR": 1,
+        "plow_geom_GV_UNROLL": 11,
+        "plow_mla_pf_ns_arm": 1,
+        "plow_moe_pf_a8_arm": 1,
+        "plow_geom_GV_URSRC": 0,
+        "plow_dsa_decode_batch_arm": 1,
+        "plow_geom_FA_DBUF": 0,
+        "plow_geom_FA_DEC_VPIPE": 0,
+        "plow_geom_GM_CLBAR": 0,
+        "plow_geom_GM_PRIO": 1,
+        "plow_packed_prefill_abi_1": 1,
+        "plow_gate_hier_1": 1,
+        "plow_geom_GV_NT": 1,
+        "plow_geom_GV_RS_WIDE": 1,
+        "plow_glm_fuse_qnorm_arm": 1,
+        "plow_geom_FA_BKV_D128": 32,
+        "plow_geom_FA_DEC_KL": 8,
+        "plow_geom_FA_DEC_WPEU": 2,
+        "plow_geom_FA_HEAD_MAJOR": 0,
+        "plow_geom_GM_PLR8": 0,
+        "plow_geom_GV_MFMA4_YT_M2": 1,
+        "plow_gemv_mm_cap_8": 8,
+        "plow_geom_GM_SM_BK": 128,
+        "plow_geom_GV_BATCH": 8,
+        "plow_geom_GV_MFMA4_YT_M4": 4,
+        "plow_flash_merge_hd_128": 1,
+        "plow_geom_GM_SM_BM": 64,
+        "plow_geom_GV_KS_UN": 8,
+        "plow_row_gather_1": 1,
+        "plow_xrn_1": 1,
+        "plow_dsa_idx_row_arm": 1,
+        "plow_geom_GM_BLK_BK": 64,
+        "plow_geom_GM_SM_BN": 128,
+        "plow_geom_GM_PGR2": 0,
+        "plow_geom_GM_BLK_BM": 128,
+        "plow_geom_GV_KS_MAXRPW": 3,
+        "plow_geom_GV_MFMA4_YT_M8": 2,
+        "plow_geom_GM_BLK_BN": 128,
+        "plow_geom_GM_SWZ": 2,
+        "plow_geom_GV_BLOCKED": 1,
+        "plow_geom_GV_UNROLL_GLU_MXFP4": 2,
+        "plow_geom_MPF_BK": 64,
+        "plow_geom_PLOW_GEMV_MM": 8
+      },
+      "kernels": {
+        "plow_interp_dec_gfx942_gq": {
+          "agpr_count": 0,
+          "group_segment_fixed_size": 64568,
+          "kernarg_segment_size": 432,
+          "max_flat_workgroup_size": 512,
+          "name": "plow_interp_dec_gfx942_gq",
+          "private_segment_fixed_size": 3232,
+          "sgpr_count": 108,
+          "sgpr_spill_count": 87,
+          "symbol": "plow_interp_dec_gfx942_gq.kd",
+          "vgpr_count": 256,
+          "vgpr_spill_count": 9
+        },
+        "plow_xctr_audit": {
+          "agpr_count": 0,
+          "group_segment_fixed_size": 0,
+          "kernarg_segment_size": 296,
+          "max_flat_workgroup_size": 1024,
+          "name": "plow_xctr_audit",
+          "private_segment_fixed_size": 0,
+          "sgpr_count": 32,
+          "sgpr_spill_count": 0,
+          "symbol": "plow_xctr_audit.kd",
+          "vgpr_count": 8,
+          "vgpr_spill_count": 0
+        },
+        "plow_state_clear": {
+          "agpr_count": 0,
+          "group_segment_fixed_size": 0,
+          "kernarg_segment_size": 272,
+          "max_flat_workgroup_size": 1024,
+          "name": "plow_state_clear",
+          "private_segment_fixed_size": 0,
+          "sgpr_count": 18,
+          "sgpr_spill_count": 0,
+          "symbol": "plow_state_clear.kd",
+          "vgpr_count": 4,
+          "vgpr_spill_count": 0
+        },
+        "plow_token_capture": {
+          "agpr_count": 0,
+          "group_segment_fixed_size": 0,
+          "kernarg_segment_size": 288,
+          "max_flat_workgroup_size": 1024,
+          "name": "plow_token_capture",
+          "private_segment_fixed_size": 0,
+          "sgpr_count": 14,
+          "sgpr_spill_count": 0,
+          "symbol": "plow_token_capture.kd",
+          "vgpr_count": 7,
+          "vgpr_spill_count": 0
+        }
+      }
+    },
+    "interp_decode_fp8kv_gq.elf": {
+      "sha256": "28fbc2269c921d53a92b87bd96dbdaedb31180d00d82f40aa25bf0c036d9d87d",
+      "globals": {
+        "plow_xargmax_max_batch_128": 1,
+        "plow_geom_FA_MERGE_UNROLL4": 1,
+        "plow_geom_GM_CLFENCE": 0,
+        "plow_geom_GM_DBUF": 1,
+        "plow_token_batch_abi_1": 1,
+        "plow_cap_d_moe_router_topk_pf_1": 1,
+        "plow_gemv_walk_1": 1,
+        "plow_geom_GM_WGM": 8,
+        "plow_geom_MPF_BM": 64,
+        "plow_moe_pf_part16_arm": 1,
+        "plow_geom_GM_HACK_NOFETCH": 0,
+        "plow_geom_GV_HACK_NOSUM": 0,
+        "plow_geom_GV_MFMA4": 0,
+        "plow_flash_merge_hd_256": 1,
+        "plow_flash_merge_hd_512": 1,
+        "plow_geom_GV_UNROLL_GLU": 6,
+        "plow_geom_PLOW_WG_WAVES": 8,
+        "plow_geom_GV_MFMA4_UN_M2": 11,
+        "plow_geom_GV_RS_R": 2,
+        "plow_moe_gemma_pf_arms_1": 1,
+        "plow_t11_gluquant_arm": 1,
+        "plow_geom_FA_FAST_RCP": 1,
+        "plow_geom_FA_MLA_PF2_FASTBF": 1,
+        "plow_geom_GV_RS_MAXNCH": 8,
+        "plow_geom_FA_DEC_KUNROLL": 8,
+        "plow_geom_FA_FASTMASK": 0,
+        "plow_geom_GV_MFMA4_UN_M4": 2,
+        "plow_moe_gemma_arms_1": 1,
+        "plow_glm_fuse_rope_arm": 1,
+        "plow_moe_pf_det_arm": 1,
+        "plow_geom_FA_MLA_PF2_FRAME": 8,
+        "plow_geom_GV_DMA": 0,
+        "plow_geom_GV_UNROLL_GLU_FP8": 3,
+        "plow_geom_FA_LAZY_RESCALE": 0,
+        "plow_geom_GV_USCALAR": 1,
+        "plow_geom_FA_DEC_ILV": 1,
+        "plow_geom_GV_UNROLL_FP8": 3,
+        "plow_dsa_select_local_arm": 1,
+        "plow_geom_FA_DEC_V_UNROLL": 8,
+        "plow_geom_GM_BK": 64,
+        "plow_geom_GV_MFMA4_UN_M8": 3,
+        "plow_geom_GV_UN_K8192": 16,
+        "plow_geom_GM_MD_BK": 64,
+        "plow_geom_FA_LDS_DMA": 0,
+        "plow_geom_FA_MLA_KDU": 4,
+        "plow_geom_FA_MLA_KUNROLL": 1,
+        "plow_geom_FA_MLA_PF2_DEFER": 1,
+        "plow_geom_GM_BM": 192,
+        "plow_geom_GV_RING": 16,
+        "plow_geom_GV_RS_WIDE_UN": 6,
+        "plow_geom_MPF_DBUF": 1,
+        "plow_geom_GM_BN": 256,
+        "plow_geom_GM_MD_BM": 128,
+        "plow_geom_GV_HACK_CHEAPDOT": 0,
+        "plow_geom_GV_RS_WIDE_R": 2,
+        "plow_geom_GV_UNROLL_M4": 6,
+        "plow_l2_place_dispatch_1": 1,
+        "plow_geom_GM_MD_BN": 128,
+        "plow_geom_GV_MFMA": 0,
+        "plow_geom_GV_RS_UN": 7,
+        "plow_dec_stage_halves": 32256,
+        "plow_mla_sparse_fp8_decode_arm": 1,
+        "plow_geom_GV_KS": 1,
+        "plow_geom_FA_USE_EXP2": 1,
+        "plow_geom_GM_SLICE": 16,
+        "plow_geom_GV_UNROLL_M8": 3,
+        "plow_moe_align_bm64_1": 1,
+        "plow_fp8_kv_1": 1,
+        "plow_geom_FA_DC": 128,
+        "plow_geom_FA_DEC_LIVE": 0,
+        "plow_geom_FA_MLA_PF2_BKV": 32,
+        "plow_geom_FA_ABL": 0,
+        "plow_geom_GM_PLR": 1,
+        "plow_geom_GV_UNROLL": 11,
+        "plow_mla_pf_ns_arm": 1,
+        "plow_moe_pf_a8_arm": 1,
+        "plow_geom_GV_URSRC": 0,
+        "plow_dsa_decode_batch_arm": 1,
+        "plow_geom_FA_DBUF": 0,
+        "plow_geom_FA_DEC_VPIPE": 0,
+        "plow_geom_GM_CLBAR": 0,
+        "plow_geom_GM_PRIO": 1,
+        "plow_packed_prefill_abi_1": 1,
+        "plow_gate_hier_1": 1,
+        "plow_gemv_mm_cap_16": 16,
+        "plow_geom_GV_NT": 1,
+        "plow_geom_GV_RS_WIDE": 1,
+        "plow_glm_fuse_qnorm_arm": 1,
+        "plow_geom_FA_BKV_D128": 32,
+        "plow_geom_FA_DEC_KL": 8,
+        "plow_geom_FA_DEC_WPEU": 2,
+        "plow_geom_FA_HEAD_MAJOR": 0,
+        "plow_geom_GM_PLR8": 0,
+        "plow_geom_GV_MFMA4_YT_M2": 1,
+        "plow_geom_GM_SM_BK": 128,
+        "plow_geom_GV_BATCH": 8,
+        "plow_geom_GV_MFMA4_YT_M4": 4,
+        "plow_flash_merge_hd_128": 1,
+        "plow_geom_GM_SM_BM": 64,
+        "plow_geom_GV_KS_UN": 8,
+        "plow_row_gather_1": 1,
+        "plow_xrn_1": 1,
+        "plow_dsa_idx_row_arm": 1,
+        "plow_geom_GM_BLK_BK": 64,
+        "plow_geom_GM_SM_BN": 128,
+        "plow_geom_GM_PGR2": 0,
+        "plow_geom_GM_BLK_BM": 128,
+        "plow_geom_GV_KS_MAXRPW": 3,
+        "plow_geom_GV_MFMA4_YT_M8": 2,
+        "plow_geom_GM_BLK_BN": 128,
+        "plow_geom_GM_SWZ": 2,
+        "plow_geom_GV_BLOCKED": 1,
+        "plow_geom_GV_UNROLL_GLU_MXFP4": 2,
+        "plow_geom_MPF_BK": 64,
+        "plow_geom_PLOW_GEMV_MM": 16
+      },
+      "kernels": {
+        "plow_interp_dec_gfx942_gq": {
+          "agpr_count": 0,
+          "group_segment_fixed_size": 64568,
+          "kernarg_segment_size": 432,
+          "max_flat_workgroup_size": 512,
+          "name": "plow_interp_dec_gfx942_gq",
+          "private_segment_fixed_size": 6384,
+          "sgpr_count": 108,
+          "sgpr_spill_count": 87,
+          "symbol": "plow_interp_dec_gfx942_gq.kd",
+          "vgpr_count": 256,
+          "vgpr_spill_count": 8
+        },
+        "plow_xctr_audit": {
+          "agpr_count": 0,
+          "group_segment_fixed_size": 0,
+          "kernarg_segment_size": 296,
+          "max_flat_workgroup_size": 1024,
+          "name": "plow_xctr_audit",
+          "private_segment_fixed_size": 0,
+          "sgpr_count": 32,
+          "sgpr_spill_count": 0,
+          "symbol": "plow_xctr_audit.kd",
+          "vgpr_count": 8,
+          "vgpr_spill_count": 0
+        },
+        "plow_state_clear": {
+          "agpr_count": 0,
+          "group_segment_fixed_size": 0,
+          "kernarg_segment_size": 272,
+          "max_flat_workgroup_size": 1024,
+          "name": "plow_state_clear",
+          "private_segment_fixed_size": 0,
+          "sgpr_count": 18,
+          "sgpr_spill_count": 0,
+          "symbol": "plow_state_clear.kd",
+          "vgpr_count": 4,
+          "vgpr_spill_count": 0
+        },
+        "plow_token_capture": {
+          "agpr_count": 0,
+          "group_segment_fixed_size": 0,
+          "kernarg_segment_size": 288,
+          "max_flat_workgroup_size": 1024,
+          "name": "plow_token_capture",
+          "private_segment_fixed_size": 0,
+          "sgpr_count": 14,
+          "sgpr_spill_count": 0,
+          "symbol": "plow_token_capture.kd",
+          "vgpr_count": 7,
+          "vgpr_spill_count": 0
+        }
+      }
+    }
+  }
+}
