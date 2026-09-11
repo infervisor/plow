@@ -157,7 +157,7 @@ fn cublaslt_emission_rejects_unloadable_combinations() {
 }
 
 
-/// The eight `glm_*` knobs of the qualified gfx942 TP8 recipe are ON by default for GLM on that
+/// The nine `glm_*` knobs of the qualified gfx942 TP8 recipe are ON by default for GLM on that
 /// target and OFF everywhere else.
 ///
 /// The target predicate is not decoration: `glm_gemm_lt`, `glm_index_tp`, `glm_moe_aiter` and
@@ -176,12 +176,13 @@ fn glm_production_recipe_defaults_on_only_for_the_qualified_target() {
             cfg.glm_decode_norm_rows(),
             cfg.glm_gemm_lt(),
             cfg.glm_gemm_lt_decode(),
+            cfg.glm_gemm_lt_decode_ext(),
         ]
     };
     for model in ["glm_moe_dsa", "glm5_next"] {
         let mut cfg = EmitArgsForTest::try_parse_from(["test"]).unwrap().emit;
         apply_production_defaults(&mut cfg, emit_capabilities(model), "gfx942", 8, 304);
-        assert_eq!(resolved(&cfg), [true; 8], "{model}");
+        assert_eq!(resolved(&cfg), [true; 9], "{model}");
         assert!(cfg.packed_prefill_on(), "{model}");
     }
     for (model, arch, tp, n_cu, flag) in [
@@ -202,7 +203,7 @@ fn glm_production_recipe_defaults_on_only_for_the_qualified_target() {
         apply_production_defaults(&mut cfg, emit_capabilities(model), arch, tp, n_cu);
         assert_eq!(
             resolved(&cfg),
-            [false; 8],
+            [false; 9],
             "{model} {arch} tp={tp} n_cu={n_cu} {flag:?}"
         );
     }
@@ -270,6 +271,7 @@ fn glm_recipe_precedence_is_cli_then_env_then_production_default() {
         "glm_index_tp",
         "glm_decode_norm_rows",
         "glm_gemm_lt_decode",
+        "glm_gemm_lt_decode_ext",
     ] {
         assert_eq!(rec[id], ("true".into(), "production_default"), "{id}");
     }
@@ -280,6 +282,7 @@ fn glm_recipe_precedence_is_cli_then_env_then_production_default() {
             && cfg.glm_index_tp()
             && cfg.glm_decode_norm_rows()
             && cfg.glm_gemm_lt_decode()
+            && cfg.glm_gemm_lt_decode_ext()
     );
 }
 

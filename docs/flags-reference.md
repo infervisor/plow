@@ -392,7 +392,7 @@ the 2026-09-04 audit that removed the rejected experiment knobs are in
 | `PLOW_GLM_DECODE_NORM_ROWS` | `--glm-decode-norm-rows` | on for GLM on gfx942 TP8 (production default), off elsewhere | Give each batched GLM RMSNorm / AddNorm row its own workgroup. Bit-identical; +2.7%, P99 TPOT −11%. Rollback: `--glm-decode-norm-rows=false` (recorded as `cli`, and a `--replay-knobs` recipe keeps its own value). |
 | `PLOW_GLM_GEMM_LT` | `--glm-gemm-lt` | on for GLM on gfx942 TP8 (production default), off elsewhere | Qualified gfx942 hipBLASLt assembly for the large GLM prefill projections (3 shapes). Bit-exact vs capture; +2.1%. Rollback: `--glm-gemm-lt=false` (recorded as `cli`, and a `--replay-knobs` recipe keeps its own value). |
 | `PLOW_GLM_GEMM_LT_DECODE` | `--glm-gemm-lt-decode` | on for GLM on gfx942 TP8 (production default), off elsewhere | Native gfx942 hipBLASLt BF16 projections at decode rungs 16 and 20 (633 GEMMs). ≤0.17% rel-L2; +5.7% then +2.4% across two screens. Rollback: `--glm-gemm-lt-decode=false` (recorded as `cli`, and a `--replay-knobs` recipe keeps its own value). |
-| `PLOW_GLM_GEMM_LT_DECODE_EXT` | `--glm-gemm-lt-decode-ext` | false | Extends `PLOW_GLM_GEMM_LT_DECODE` to rung 8 and to the narrow decode projections (k_rope, q_rope, indexer k/weights, lm_head; +199 native GEMMs at rungs 16/20, 11 shapes at rung 8). Same pinned object. Standalone cold medians on one MI300X: those five shapes 13.9-15.6 µs vs 26-60 µs on the MM16 GEMV (rung 20: −7.5 ms of an 11.9 ms traced GEMV body); rung 8: −9 ms/step. Not yet served: needs the 8-GPU C20 A/B before it is a default. |
+| `PLOW_GLM_GEMM_LT_DECODE_EXT` | `--glm-gemm-lt-decode-ext` | on for GLM on gfx942 TP8 (production default), off elsewhere | Extends `PLOW_GLM_GEMM_LT_DECODE` to rung 8 and to the narrow decode projections (k_rope, q_rope, indexer k/weights, lm_head): +199 native GEMMs at rungs 16/20, all 11 shapes at rung 8, so those rungs run no interpreter GEMV. Same pinned object. Served A/B on 8x MI300X, C20 × 70k/700, same job and binary as its control: **50.68 → 51.65 out tok/s (+1.9%)**, median TPOT 220 → 202 ms, decode-only tick 96.8 → 90.3 ms (standalone predicted −7.5 ms at rung 20), 18-case retrieval 18/18. The rung-8 half is idle on that workload (a lone straggler already runs rung 20). Effect only where `PLOW_GLM_GEMM_LT_DECODE` is on. Rollback: `--glm-gemm-lt-decode-ext=false` (recorded as `cli`, and a `--replay-knobs` recipe keeps its own value). |
 | `PLOW_GLM_FOLD_LT` | `--glm-fold-lt` | false | Native gfx942 FP32 MLA fold GEMMs during prefill. Measured +0.49% with P99 +3.6% — not a default candidate. |
 | `PLOW_GLM_PF_WIDE` | `--glm-pf-wide` | true | Widen prefill norm/residual dispatch across CUs. DEFAULT ON (`=0` restores the single-workgroup emit for A/B). Bit-identical either way. |
 | `PLOW_GLM_PLACE_PF` | `--glm-place-pf` | false | Per-XCD CU placement for the GLM prefill chain. |
@@ -404,15 +404,16 @@ the 2026-09-04 audit that removed the rejected experiment knobs are in
 
 ##### The qualified GLM gfx942 TP8 recipe
 
-Eight `glm_*` knobs are ON by default when the model is GLM (`glm_moe_dsa` / `glm5_next`), the
+Nine `glm_*` knobs are ON by default when the model is GLM (`glm_moe_dsa` / `glm5_next`), the
 arch is `gfx942`, `--num-gpus 8` and the part has 304 CUs: `PLOW_GLM_FP8_KV`,
 `PLOW_GLM_MOE_AITER`, `PLOW_GLM_MOE_RESIDENT`, `PLOW_GLM_INDEX_TP`, `PLOW_GLM_SELECT_LOCAL`,
-`PLOW_GLM_DECODE_NORM_ROWS`, `PLOW_GLM_GEMM_LT`, `PLOW_GLM_GEMM_LT_DECODE`. Off on every other
+`PLOW_GLM_DECODE_NORM_ROWS`, `PLOW_GLM_GEMM_LT`, `PLOW_GLM_GEMM_LT_DECODE`,
+`PLOW_GLM_GEMM_LT_DECODE_EXT` (the ninth, added once served: +1.9%, retrieval 18/18). Off on every other
 target, and off under `--mxfp4` (the native MoE arms are block-fp8 only).
 
 That is the configuration serving GLM-5.3 on 8x MI300X — 47-50 out tok/s with the 18-case
 retrieval screen at 18/18 — and each knob's own evidence is in its row above. It was previously
-reachable only by naming all eight, so dropping one emitted a slower packet that still loaded and
+reachable only by naming all of them, so dropping one emitted a slower packet that still loaded and
 still served. An emit with no `glm_*` flags at all now produces that packet byte-for-byte.
 
 Precedence is strictly **explicit flag > env var > `--replay-knobs` > production default > plain

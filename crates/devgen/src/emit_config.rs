@@ -572,7 +572,7 @@ pub struct EmitConfig {
     pub glm_dsa_pf: bool,
 
     /// Set by [`super::apply_production_defaults`] when this emit is the QUALIFIED GLM target —
-    /// gfx942, TP8, 304 CU. The eight knobs whose accessors read it are `Option<bool>` precisely
+    /// gfx942, TP8, 304 CU. The nine knobs whose accessors read it are `Option<bool>` precisely
     /// so that `None` ("nobody said") is distinguishable from `Some(false)` ("do not"): the
     /// qualified recipe is what an unflagged emit gets, and `--glm-…=false` still wins.
     ///
@@ -650,8 +650,9 @@ pub struct EmitConfig {
 
     /// Extend `--glm-gemm-lt-decode` to rung 8 and to the narrow BF16 decode projections
     /// (k_rope, q_rope, indexer k/weights, lm_head) the MM16 GEMV serves at 14-65 GB/s.
-    #[arg(long, env = "PLOW_GLM_GEMM_LT_DECODE_EXT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
-    pub glm_gemm_lt_decode_ext: bool,
+    /// On by default for GLM on gfx942 TP8; `=false` is the rollback.
+    #[arg(long, env = "PLOW_GLM_GEMM_LT_DECODE_EXT", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_gemm_lt_decode_ext: Option<bool>,
 
     /// Use native gfx942 FP32 MLA fold GEMMs during prefill.
     #[arg(long, env = "PLOW_GLM_FOLD_LT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
@@ -1152,7 +1153,7 @@ impl EmitConfig {
             glm_decode_norm_rows: env_bool_opt("PLOW_GLM_DECODE_NORM_ROWS"),
             glm_gemm_lt: env_bool_opt("PLOW_GLM_GEMM_LT"),
             glm_gemm_lt_decode: env_bool_opt("PLOW_GLM_GEMM_LT_DECODE"),
-            glm_gemm_lt_decode_ext: env_bool("PLOW_GLM_GEMM_LT_DECODE_EXT"),
+            glm_gemm_lt_decode_ext: env_bool_opt("PLOW_GLM_GEMM_LT_DECODE_EXT"),
             glm_fold_lt: env_bool("PLOW_GLM_FOLD_LT"),
             glm_gemv_wg: env_u32("PLOW_GLM_GEMV_WG"),
             glm_ofold: env_bool("PLOW_GLM_OFOLD"),
@@ -1336,7 +1337,7 @@ impl EmitConfig {
         self.packed_prefill_on() && (!self.w8a8 || self.emit_packed_prefill == Some(true))
     }
 
-    /// The eight knobs of the qualified GLM gfx942 TP8 recipe, resolved.
+    /// The nine knobs of the qualified GLM gfx942 TP8 recipe, resolved.
     ///
     /// One fallback, written once, rather than `unwrap_or(false)` re-decided at each of the
     /// sixteen read sites — where the next one added would get it wrong silently. `None` means
@@ -1374,10 +1375,15 @@ impl EmitConfig {
         self.glm_gemm_lt_decode.unwrap_or(self.glm_production_defaults)
     }
 
+    /// Only widens [`Self::glm_gemm_lt_decode`]: with that off it changes nothing.
+    pub fn glm_gemm_lt_decode_ext(&self) -> bool {
+        self.glm_gemm_lt_decode_ext.unwrap_or(self.glm_production_defaults)
+    }
+
     /// The `(clap id, still unset)` pairs [`super::apply_production_defaults`] walks to record
-    /// which of the eight it actually decided. Kept beside the accessors so a ninth knob joining
+    /// which of the nine it actually decided. Kept beside the accessors so a tenth knob joining
     /// the recipe cannot be added to one list and forgotten in the other.
-    pub fn glm_recipe_unset(&self) -> [(&'static str, bool); 8] {
+    pub fn glm_recipe_unset(&self) -> [(&'static str, bool); 9] {
         [
             ("glm_fp8_kv", self.glm_fp8_kv.is_none()),
             ("glm_moe_aiter", self.glm_moe_aiter.is_none()),
@@ -1387,6 +1393,7 @@ impl EmitConfig {
             ("glm_decode_norm_rows", self.glm_decode_norm_rows.is_none()),
             ("glm_gemm_lt", self.glm_gemm_lt.is_none()),
             ("glm_gemm_lt_decode", self.glm_gemm_lt_decode.is_none()),
+            ("glm_gemm_lt_decode_ext", self.glm_gemm_lt_decode_ext.is_none()),
         ]
     }
 

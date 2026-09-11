@@ -3195,7 +3195,7 @@ fn emit_glm_decode_gemm_lt(
     // The EXT set: rung 8, and the narrow projections whose MM16 GEMV moves 14-65 GB/s
     // (k_rope, q_rope, indexer k/weights, lm_head). Measured against the pinned kernels on one
     // MI300X; see docs/flags-reference.md `PLOW_GLM_GEMM_LT_DECODE_EXT`.
-    let ext = cfg.glm_gemm_lt_decode_ext;
+    let ext = cfg.glm_gemm_lt_decode_ext();
     let rows_ok = matches!(rows, 16 | 20) || (ext && rows == 8);
     let shape_ok = matches!(
         shape,
@@ -8088,7 +8088,7 @@ fn glm_emit_full(
             b.deny_uniseg();
         }
         if emit_config::active().glm_gemm_lt_decode()
-            && (matches!(rb, 16 | 20) || (emit_config::active().glm_gemm_lt_decode_ext && rb == 8))
+            && (matches!(rb, 16 | 20) || (emit_config::active().glm_gemm_lt_decode_ext() && rb == 8))
         {
             assert!(
                 crate::emit_is_amd() && target == "gfx942",

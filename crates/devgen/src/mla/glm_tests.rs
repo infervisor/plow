@@ -2765,7 +2765,7 @@ fn packed_siblings_carry_native_moe_and_leave_the_plain_programs_byte_identical(
 /// THE QUALIFIED RECIPE IS WHAT AN UNFLAGGED GLM gfx942 TP8 EMIT PRODUCES.
 ///
 /// The packet serving GLM-5.3 on 8x MI300X (47-50 out tok/s, 18/18 on the retrieval screen) was
-/// emitted by naming eight `glm_*` flags. Every one of them used to be `default_value_t = false`,
+/// emitted by naming the `glm_*` recipe flags. Every one of them used to be `default_value_t = false`,
 /// so the qualified configuration was reachable only by typing the whole incantation and dropping
 /// one emitted a slower packet that still loaded and still served. This is the gate on that: the
 /// explicit recipe and the unflagged emit produce the SAME programs, and an arm with the recipe
@@ -2773,8 +2773,8 @@ fn packed_siblings_carry_native_moe_and_leave_the_plain_programs_byte_identical(
 /// something rather than pass vacuously.
 ///
 /// `PLOW_GLM_DSA_PF` is set in every arm: it is part of the frozen recipe but is NOT one of the
-/// eight defaulted knobs (sparse prefill is a separate qualification), so it has to be named on
-/// both sides for the comparison to be about the eight.
+/// defaulted knobs (sparse prefill is a separate qualification), so it has to be named on both
+/// sides for the comparison to be about the recipe.
 #[test]
 fn the_qualified_glm_recipe_is_what_an_unflagged_gfx942_tp8_emit_produces() {
     use std::sync::{Arc, Mutex};
@@ -2796,7 +2796,7 @@ fn the_qualified_glm_recipe_is_what_an_unflagged_gfx942_tp8_emit_produces() {
     });
     std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
     type Snapshot = Vec<(u32, Vec<packet::dev::DevInst>, Vec<packet::dev::StreamEnt>, Vec<packet::dev::StreamEnt>)>;
-    const RECIPE: [&str; 8] = [
+    const RECIPE: [&str; 9] = [
         "PLOW_GLM_FP8_KV",
         "PLOW_GLM_MOE_AITER",
         "PLOW_GLM_MOE_RESIDENT",
@@ -2805,6 +2805,7 @@ fn the_qualified_glm_recipe_is_what_an_unflagged_gfx942_tp8_emit_produces() {
         "PLOW_GLM_DECODE_NORM_ROWS",
         "PLOW_GLM_GEMM_LT",
         "PLOW_GLM_GEMM_LT_DECODE",
+        "PLOW_GLM_GEMM_LT_DECODE_EXT",
     ];
     let emit = |glm: &[(&str, &str)]| -> Snapshot {
         let mut env: Vec<(&str, &str)> = vec![
@@ -2872,15 +2873,24 @@ fn the_qualified_glm_recipe_is_what_an_unflagged_gfx942_tp8_emit_produces() {
     );
 
     // And each knob individually: from the fully rolled-back arm, turning ONE on moves the
-    // packet, so none of the eight is riding along inert.
+    // packet, so none of them is riding along inert.
     //
     // Probed from OFF rather than from ON because two of them overlap: `native_moe` is
     // `glm_moe_aiter || glm_moe_resident`, so dropping AITER out of the full recipe changes
     // nothing while RESIDENT still holds the native arm. Off-plus-one has no such shadow.
+    //
+    // EXT is the one exception to "from OFF": it only widens GEMM_LT_DECODE and is inert without
+    // it by construction, so it is probed on top of its parent, which is the question that matters.
     for knob in RECIPE {
-        let one_on: Vec<(&str, &str)> =
-            RECIPE.iter().map(|k| (*k, if *k == knob { "1" } else { "0" })).collect();
-        assert_ne!(rolled_back, emit(&one_on), "{knob}=1 changed nothing");
+        let parent = (knob == "PLOW_GLM_GEMM_LT_DECODE_EXT").then_some("PLOW_GLM_GEMM_LT_DECODE");
+        let with = |extra: Option<&str>| -> Vec<(&'static str, &'static str)> {
+            RECIPE
+                .iter()
+                .map(|k| (*k, if Some(*k) == parent || Some(*k) == extra { "1" } else { "0" }))
+                .collect()
+        };
+        let base = if parent.is_some() { emit(&with(None)) } else { rolled_back.clone() };
+        assert_ne!(base, emit(&with(Some(knob))), "{knob}=1 changed nothing");
     }
     std::fs::remove_dir_all(dir).unwrap();
 }
