@@ -103,6 +103,38 @@ fn compare_snapshot(actual: LogitSnapshot, expected: &LogitSnapshot, case: &str)
 }
 
 #[test]
+#[ignore = "requires free H100, PLOW_GPU_TEST=1 and live-VMM PLOW_GPU_ASSETS"]
+fn live_vmm_load_reserves_kv_and_commits_only_on_admission() {
+    let _env = common::env_guard();
+    assert_eq!(std::env::var("PLOW_GPU_TEST").as_deref(), Ok("1"));
+    let _config = common::EnvScope::set(&[
+        ("PLOW_VMM_LIVE", "1"),
+        ("PLOW_VMM_PREFIX", "0"),
+        ("PLOW_PREFIX_CACHE", "0"),
+        ("PLOW_KV_POOL_MIB", "512"),
+    ]);
+    let assets = PathBuf::from(std::env::var("PLOW_GPU_ASSETS").expect("PLOW_GPU_ASSETS"));
+    let be = Arc::new(CudaBackend::new(0).unwrap());
+    let mut e = GpuEngine::load(be, &assets, &assets.join("checkpoint")).unwrap();
+
+    let kv = e.vmm_stats().expect("live VMM");
+    assert_eq!((kv.blocks_live, kv.blocks_pooled), (0, 0));
+    let rings = e.live_ring_stats().expect("live VMM rings");
+    assert_eq!((rings.resident_bytes, rings.mapped_slots), (0, 0));
+
+    e.begin_slot(0, 2).unwrap();
+    assert!(e.vmm_stats().unwrap().blocks_live > 0);
+    assert!(e.live_ring_stats().unwrap().resident_bytes > 0);
+    e.retire_slot(0, false);
+
+    let kv = e.vmm_stats().unwrap();
+    assert_eq!(kv.blocks_live, 0);
+    assert!(kv.blocks_pooled > 0);
+    let rings = e.live_ring_stats().unwrap();
+    assert_eq!((rings.resident_bytes, rings.mapped_slots), (0, 0));
+}
+
+#[test]
 #[ignore = "requires free H100, PLOW_GPU_TEST=1 and B16 FP8-KV PLOW_GPU_ASSETS"]
 fn fp8_live_allocations_match_prefix_reference_across_rungs_and_slot_reuse() {
     let _env = common::env_guard();

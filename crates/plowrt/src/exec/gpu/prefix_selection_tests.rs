@@ -3,10 +3,36 @@ use crate::asset::devblob::{DevProg, DevSection, DevTensor};
 
 #[test]
 fn long_context_live_kv_uses_reserved_ring_windows() {
-    assert!(!live_rings_for_context(false, true, Some(65_536)));
-    assert!(live_rings_for_context(false, true, Some(131_072)));
-    assert!(!live_rings_for_context(false, false, Some(131_072)));
-    assert!(live_rings_for_context(true, true, Some(1)));
+    assert!(!live_rings_for_capacity(
+        false,
+        true,
+        Some(65_536),
+        Some(32)
+    ));
+    assert!(live_rings_for_capacity(
+        false,
+        true,
+        Some(131_072),
+        Some(16)
+    ));
+    assert!(!live_rings_for_capacity(
+        false,
+        false,
+        Some(131_072),
+        Some(64)
+    ));
+    assert!(live_rings_for_capacity(true, true, Some(1), Some(1)));
+}
+
+#[test]
+fn wide_live_kv_uses_reserved_ring_windows_without_changing_b32() {
+    assert!(!live_rings_for_capacity(
+        false,
+        true,
+        Some(20_480),
+        Some(32)
+    ));
+    assert!(live_rings_for_capacity(false, true, Some(20_480), Some(64)));
 }
 
 #[test]
