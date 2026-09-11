@@ -88,7 +88,7 @@ use decode_rung::{
     validate_decode_ladder, DecodeRung, DecodeSelection,
 };
 
-fn live_rings_for_capacity(
+pub(crate) fn live_rings_for_capacity(
     configured: bool,
     live: bool,
     max_ctx: Option<u32>,
