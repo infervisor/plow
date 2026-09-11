@@ -172,6 +172,53 @@ __device__ __forceinline__ void pgm90_stage_fp8(uint8_t* dst, const uint8_t* __r
 #ifndef PLOW_NV_W8A16_PREFETCH
 #define PLOW_NV_W8A16_PREFETCH 0
 #endif
+#ifndef PLOW_NV_W8A16_ASYNC
+#define PLOW_NV_W8A16_ASYNC 0
+#endif
+#if PLOW_NV_W8A16_ASYNC
+static_assert(PLOW_NV_THREADS == 256 && PGM90_BN == 128 && PGM90_BK == 64,
+              "In-place FP8 staging requires the 256-thread 128x64 weight tile");
+__device__ __forceinline__ void pgm90_stage_weight_raw(__nv_bfloat16* dst,
+    const uint8_t* src, int tid, int row0, int kbase, int R, int K) {
+    for (int L = tid; L < PGM90_BN * 4; L += PLOW_NV_THREADS) {
+        const int row = L / 4, column = (L % 4) * 16;
+        const int gr = row0 + row, gk = kbase + column;
+        const uint8_t* source = src;
+        int bytes = 0;
+        if (gr < R && gk < K) {
+            source = src + (size_t)gr * K + gk;
+            bytes = min(16, K - gk);
+        }
+        sm90_cp16((uint8_t*)dst + row * PGM90_BK + column, source, bytes);
+    }
+}
+
+__device__ __forceinline__ void pgm90_expand_weight_raw(__nv_bfloat16* stage, int tid) {
+    uint2 packed[4];
+#pragma unroll
+    for (int s = 0; s < 4; ++s)
+        packed[s] = ((const uint2*)stage)[tid + s * PLOW_NV_THREADS];
+    // Expansion overwrites the raw tile, so every thread must finish reading first.
+    __syncthreads();
+#pragma unroll
+    for (int s = 0; s < 4; ++s) {
+        const int L = tid + s * PLOW_NV_THREADS;
+        const uint16_t* w = (const uint16_t*)&packed[s];
+        alignas(16) __nv_bfloat16 values[8];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            __half2_raw h = __nv_cvt_fp8x2_to_halfraw2(w[j], __NV_E4M3);
+            float2 v = __half22float2(*reinterpret_cast<__half2*>(&h));
+            values[2 * j] = __float2bfloat16(v.x);
+            values[2 * j + 1] = __float2bfloat16(v.y);
+        }
+        *(uint4*)(stage + sm90_swz_off<PGM90_BK, 8>(L / PGM90_CH, L % PGM90_CH))
+            = *(const uint4*)values;
+    }
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+    __syncthreads();
+}
+#endif
 __device__ __forceinline__ void pgm90_stage_bf16(__nv_bfloat16* dst,
                                                  const uint8_t* __restrict__ src, int tid,
                                                  int rows, int row0, int kbase, int R, int K) {
@@ -229,6 +276,20 @@ __device__ __forceinline__ void pgm90_stage_bf16(__nv_bfloat16* dst,
 #endif
 
 /* ================================ bf16 plain GEMM =========================================== */
+template <class Weight>
+__device__ __forceinline__ void pgm90_stage_weight(__nv_bfloat16* dst,
+    const Weight* src, int tid, int row0, int kbase, int R, int K) {
+#if PLOW_NV_W8A16_ASYNC && defined(PLOW_NV_W8A16_WGMMA) && PLOW_NV_W8A16_WGMMA
+    if constexpr (std::is_same_v<Weight, uint8_t>) {
+        if (!(K & 15)) {
+            pgm90_stage_weight_raw(dst, src, tid, row0, kbase, R, K);
+            return;
+        }
+    }
+#endif
+    pgm90_stage_bf16(dst, src, tid, PGM90_BN, row0, kbase, R, K);
+}
+
 /* C[m,n] = A[m,k] . B[n,k]^T. Drop-in for d_gemm. */
 template <bool BIAS = false, class Weight = __nv_bfloat16>
 static __device__ void d_gemm_sm90_impl(__nv_bfloat16* __restrict__ C,
@@ -267,7 +328,7 @@ static __device__ void d_gemm_sm90_impl(__nv_bfloat16* __restrict__ C,
             if (s < ksteps) {
                 pgm90_stage_bf16(As + s * PGM90_ABUF, Ab, tid, PGM90_BM, tm, s * PGM90_BK, (int)m,
                                  (int)k);
-                pgm90_stage_bf16(Bs + s * PGM90_BBUF, B, tid, PGM90_BN, tn, s * PGM90_BK, (int)n,
+                pgm90_stage_weight(Bs + s * PGM90_BBUF, B, tid, tn, s * PGM90_BK, (int)n,
                                  (int)k);
             }
             sm90_cp_commit();
@@ -277,6 +338,10 @@ static __device__ void d_gemm_sm90_impl(__nv_bfloat16* __restrict__ C,
             const int cur = ks % PGM90_STAGES;
             sm90_cp_wait<PGM90_STAGES - 2>();
             __syncthreads();
+#if PLOW_NV_W8A16_ASYNC && defined(PLOW_NV_W8A16_WGMMA) && PLOW_NV_W8A16_WGMMA
+            if constexpr (std::is_same_v<Weight, uint8_t>)
+                if (!(k & 15)) pgm90_expand_weight_raw(Bs + cur * PGM90_BBUF, tid);
+#endif
             const __nv_bfloat16* Ac = As + cur * PGM90_ABUF + wg * PGM90_MSLAB * PGM90_BK;
             const __nv_bfloat16* Bc = Bs + cur * PGM90_BBUF;
             sm90_wg_fence();
@@ -292,7 +357,7 @@ static __device__ void d_gemm_sm90_impl(__nv_bfloat16* __restrict__ C,
                 const int nb = nxt % PGM90_STAGES;
                 pgm90_stage_bf16(As + nb * PGM90_ABUF, Ab, tid, PGM90_BM, tm, nxt * PGM90_BK,
                                  (int)m, (int)k);
-                pgm90_stage_bf16(Bs + nb * PGM90_BBUF, B, tid, PGM90_BN, tn, nxt * PGM90_BK,
+                pgm90_stage_weight(Bs + nb * PGM90_BBUF, B, tid, tn, nxt * PGM90_BK,
                                  (int)n, (int)k);
             }
             sm90_cp_commit();

@@ -35,15 +35,20 @@ template<class T> T* device(const std::vector<T>& host) {
 int main(int argc, char** argv) {
     if (argc != 2) return 2;
     const int repeats = std::getenv("PLOW_STAGING_CHECK_ONLY") ? 0 : 7;
+    const bool race_case = std::getenv("PLOW_STAGING_RACE_CASE");
     const unsigned smem = PGM_ARENA_BF16 * sizeof(bf16);
     CHECK(cudaFuncSetAttribute(gemm, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
-    for (unsigned m : {128u, 512u, 1024u, 2048u}) {
+    const std::vector<unsigned> rungs = std::getenv("PLOW_STAGING_ALL_RUNGS")
+        ? std::vector<unsigned>{1,2,4,8,16,32,64,128,256,512,1024,2048,4096,8192}
+        : std::vector<unsigned>{128,512,1024,2048};
+    for (unsigned m : rungs) {
         for (auto shape : {std::pair{15360u,3840u}, std::pair{3840u,15360u},
                            std::pair{4096u,3840u}, std::pair{512u,3840u},
                            std::pair{2048u,3840u}, std::pair{8192u,3840u},
                            std::pair{3840u,4096u}, std::pair{3840u,8192u},
-                           std::pair{513u,3856u}}) {
-            const auto [n,k] = shape;
+                           std::pair{513u,3856u}, std::pair{513u,3848u}}) {
+            if (race_case && (m != 128 || shape != std::pair{513u,3856u})) continue;
+            const auto [n,k] = race_case ? std::pair{129u,208u} : shape;
             std::mt19937 rng(42);
             std::vector<bf16> a(size_t(m)*k), c(size_t(m)*n);
             std::vector<uint8_t> b(size_t(n)*k);

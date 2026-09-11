@@ -1,0 +1,1 @@
+["/usr/local/cuda/bin/nvcc", "-arch=sm_90a", "-cubin", "-std=c++17", "-O3", "-I", "runtime/common", "-I", "runtime/nvidia", "-DPLOW_NV_W8A16_ASYNC=1", "-DPLOW_NV_W8A16_WGMMA=0", "plans/gemma4-12b-roofline/w8a16-async-guard.cu", "-o", "plans/gemma4-12b-roofline/w8a16-async-guard.cubin"]

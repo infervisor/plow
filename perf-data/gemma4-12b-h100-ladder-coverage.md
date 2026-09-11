@@ -567,3 +567,62 @@ The optimization is retained opt-in. W8A16 remains slower than earlier W8A8
 prefill screens overall, and the vLLM objective remains unmet. No new loaded
 interpreter sanitizer, racecheck, fresh vLLM or C128 qualification was run.
 [Probe builds, exact outputs, object hashes and serving evidence](gemma4-12b-h100-data/w8a16-staging-prefetch-summary.json).
+
+## W8A16 asynchronous weight staging
+
+`PLOW_NV_W8A16_ASYNC=1` stages FP8 weights with 16-byte `cp.async` copies
+inside the existing BF16 shared-memory arena. Threads capture raw bytes before
+a CTA barrier protects in-place BF16 expansion. A proxy fence and CTA barrier
+precede WGMMA consumption. K not divisible by16 retains direct staging.
+This uses cp.async, not TMA. Both compared builds enable weight prefetch.
+
+All40 cases pass the exact sampled FP64 oracle and complete byte comparison
+(317,405,696 bytes): eight emitted shapes at128/512/1024/2048 and two tail
+shapes per rung. Memcheck passes all40; racecheck passes only the scoped
+M128/N129/K208 stage-reuse and tail case. No full-ladder racecheck is claimed.
+Frequency-weighted isolated speedups are1.103/1.123/1.168/1.178× respectively;
+several small shapes regress. Packed interpreter resources change from255
+registers/16 spill bytes to254 registers/no spills, with the same arena.
+
+| Input / concurrency | Prefetch control tok/s | Async tok/s |
+|---|---:|---:|
+| 1K / C1 | 92.24 | 93.82 |
+| 1K / C16 | 258.03 | 265.78 |
+| 16K / C1 | 33.23 | 35.63 |
+| 16K / C16 | 41.66 | 43.33 |
+
+This is one sequential serving screen. Verification passes both builds;
+68 timed requests produce128 tokens/cache0. Paired texts match33/34, while
+66 fixed-schedule full-vocabulary logit frames match exactly between builds.
+16K/C1 TTFT changes2501.8→2244.9ms. Default remains0; no new vLLM, C128,
+independent quality or schedule-invariance qualification.
+
+A separate bit-conversion experiment passed exhaustive65,536 byte-pair
+conversion checks, but regressed every dense-weight shape (0.718–0.866×).
+It was reverted. [Raw results, rejected patch and provenance](gemma4-12b-h100-data/w8a16-async-staging-summary.json).
+
+## Explicit rung sweep and decode counter diagnostic
+
+The W8A16 body sweep now covers each requested width individually:
+1/2/4/8/16/32/64/128/256/512/1024/2048/4096/8192. All140 cases
+(eight model shapes plus two tails at every width) pass96 exact sampled FP64
+checks and complete output equality:1,400,877,564 bytes compared. This invokes
+the128x128 WGMMA tile with row bounds; small widths are not dedicated small-M
+kernels. Async staging still regresses some small shapes, so it is not enabled
+globally. At4096 and8192, all eight model shapes improve in this warm-body
+screen, by1.099–1.223× and1.095–1.232× respectively.
+[Per-shape results and build provenance](gemma4-12b-h100-data/w8a16-all-rungs-summary.json).
+
+A separate packet-derived sweep covers all35 plain FP8 decode projection
+shapes at1/2/4/8/16, including actual instruction slice counts8/33/66/124/132.
+The loaded screen matches FP8 row blocking4 and enables standalone activation
+staging according to the loaded object's arena. Loaded outputs match the body
+exactly for both dependency-edge and edge-free one-op programs. Median edge
+cost across shapes is1.376/1.216/0.960/1.312/1.152µs per rung respectively.
+Resets are outside the timed event. This does not measure full-layer counter
+contention, and body vs loaded timing also changes scheduling/register pressure.
+Initial unstaged row-block1 timings are retained separately and are not the
+serving-matched baseline. Split-K candidates pass numerical tolerances but
+change accumulation order; no new candidate is promoted from these isolated
+results. Fused GLU, attention and the BF16 head are outside this decode probe.
+[All variants, packet PCs and limitations](gemma4-12b-h100-data/w8a16-decode-ladder-summary.json).
