@@ -65,6 +65,24 @@ fn live_kv_buckets(ctx: u32) -> Vec<tunedb::KvBucket> {
         .collect()
 }
 
+fn required_cells(
+    ctx: u32,
+    packed: bool,
+    m_rung: u32,
+) -> Vec<(tunedb::KvBucket, tunedb::AttentionTopology)> {
+    let mut cells = Vec::new();
+    for bucket in live_kv_buckets(ctx) {
+        if m_rung <= ctx && tunedb::KvBucket::of(m_rung) <= bucket {
+            cells.push((bucket, tunedb::AttentionTopology::Single));
+        }
+        if packed && m_rung > 1 {
+            cells.push((bucket, tunedb::AttentionTopology::PackedHomogeneous));
+            cells.push((bucket, tunedb::AttentionTopology::PackedRagged));
+        }
+    }
+    cells
+}
+
 fn qualify_hd256_programs(
     model: &Model,
     records: &[tunedb::AttentionRoleMeasurement],
@@ -96,53 +114,44 @@ fn qualify_hd256_programs(
         {
             continue;
         }
-        let mut topologies = vec![tunedb::AttentionTopology::Single];
-        if packed {
-            topologies.push(tunedb::AttentionTopology::PackedHomogeneous);
-            if model.prog_t[index] > 1 {
-                topologies.push(tunedb::AttentionTopology::PackedRagged);
-            }
-        }
         let mut selected = Vec::new();
-        'coverage: for bucket in live_kv_buckets(ctx) {
-            for topology in &topologies {
-                let cell = tunedb::AttentionRoleCell {
-                    hardware: hardware.into(),
-                    n_cu: model.n_cu,
-                    arch: arch.into(),
-                    dtype: "bf16".into(),
-                    kv_dtype: "bf16".into(),
-                    head_dim: 256,
-                    gqa: 2,
-                    window: 1024,
-                    m_rung: model.prog_t[index],
-                    live_kv_bucket: bucket,
-                    topology: *topology,
-                };
-                let Some(record) = tunedb::select_attention_role(
-                    records,
-                    &cell,
-                    PREFILL_ATTENTION_HD256_BKV64,
-                    &digests[index],
-                    &implementation,
-                    toolchain,
-                ) else {
-                    selected.clear();
-                    break 'coverage;
-                };
-                if record.object_file != HD256_OBJECT_FILE
-                    || record.config.query_tile != 64
-                    || record.config.kv_tile != 64
-                    || record.config.warps != 8
-                    || record.config.stages != 2
-                    || record.config.nsplit != 1
-                    || record.config.group_factor != 2
-                {
-                    selected.clear();
-                    break 'coverage;
-                }
-                selected.push(record);
+        for (bucket, topology) in required_cells(ctx, packed, model.prog_t[index]) {
+            let cell = tunedb::AttentionRoleCell {
+                hardware: hardware.into(),
+                n_cu: model.n_cu,
+                arch: arch.into(),
+                dtype: "bf16".into(),
+                kv_dtype: "bf16".into(),
+                head_dim: 256,
+                gqa: 2,
+                window: 1024,
+                m_rung: model.prog_t[index],
+                live_kv_bucket: bucket,
+                topology,
+            };
+            let Some(record) = tunedb::select_attention_role(
+                records,
+                &cell,
+                PREFILL_ATTENTION_HD256_BKV64,
+                &digests[index],
+                &implementation,
+                toolchain,
+            ) else {
+                selected.clear();
+                break;
+            };
+            if record.object_file != HD256_OBJECT_FILE
+                || record.config.query_tile != 64
+                || record.config.kv_tile != 64
+                || record.config.warps != 8
+                || record.config.stages != 2
+                || record.config.nsplit != 1
+                || record.config.group_factor != 2
+            {
+                selected.clear();
+                break;
             }
+            selected.push(record);
         }
         if selected.is_empty() {
             continue;
@@ -464,12 +473,18 @@ fn apply(
     let mut updates = Vec::new();
     let mut selected = 0usize;
     for (index, program) in model.progs[..prefill_count].iter().enumerate() {
+        if allowed_programs.is_some_and(|programs| !programs.contains(&index)) {
+            continue;
+        }
         let eligible: Vec<bool> = program
             .insts
             .iter()
             .map(|op| {
-                allowed_programs.is_none_or(|programs| programs.contains(&index))
-                    && eligible_for(op, n_cu, selection)
+                let output_head_dim = match selection.kind {
+                    Kind::Hd256Bkv64 => 256,
+                    Kind::Hd512 => 512,
+                };
+                eligible_for(op, n_cu, selection)
                     && (!selection.wgmma || (op.t[5] != TENSOR_NONE && op.i[7] == 1))
                     && tensor_bytes
                         .get(op.t[7] as usize)
@@ -478,7 +493,7 @@ fn apply(
                         || (op.t[..5].iter().all(|&tensor| tensor != op.t[5])
                             && u64::from(op.i[0])
                                 .checked_mul(u64::from(op.i[2]))
-                                .and_then(|elements| elements.checked_mul(512 * 2))
+                                .and_then(|elements| elements.checked_mul(output_head_dim * 2))
                                 .is_some_and(|bytes| {
                                     tensor_bytes
                                         .get(op.t[5] as usize)
