@@ -7,6 +7,46 @@
 //! the tile choice offline.
 use super::*;
 
+#[test]
+fn dense_prefill_rungs_populate_keys_for_sparse_decode() {
+    let _guard = crate::test_env::env_guard();
+    let mut c = glm_ref_cfg();
+    c.tp = 8;
+    let ctx = 81920;
+    for sparse_prefill in ["0", "1"] {
+        let _env = crate::test_env::EnvScope::set(&[
+            ("PLOW_GLM_DSA", "1"), ("PLOW_GLM_DSA_PF", sparse_prefill),
+            ("PLOW_GLM_FP8_KV", "1"),
+        ]);
+        for t in [128, 512, 2048, 8192] {
+            let mut decl = Builder::new(304);
+            let n = declare_glm_rows_batched(&mut decl, &c, ctx, &[0], t, 20, MoeEnc::Fp8Blk);
+            assert_ne!(n.kidx_pf, TENSOR_NONE);
+            let mut b = Builder::new(304);
+            b.adopt_tensors(decl.tensors());
+            let all = b.all();
+            emit_glm_mla_prefill(&mut b, &c, &n, 0, ctx, t, MoeEnc::Fp8Blk,
+                n.x, &[], false, &mut 0, &all);
+            let p = b.finish();
+            let writers: Vec<_> = p.insts.iter().filter(|d| d.t[0] == n.kidx[0]).collect();
+            assert_eq!(writers.len(), 1, "DSA key rows missing or duplicated at T={t}");
+            let writer = writers[0];
+            assert_eq!(writer.op, DevOp::HeadNormRope as u16);
+            assert_eq!((writer.t[1], writer.i[0], writer.i[1], writer.i[2]), (n.kidx_pf, t, 1, 128));
+            assert_eq!(writer.j[1], KV_MASK_NONE);
+            assert!(p.insts.iter().any(|d| d.t[0] == n.kidx_pf
+                && d.t[1] == n.xn && d.t[2] == n.lw[0].iwk));
+            assert!(p.insts.iter().any(|d| d.op == DevOp::LayerNorm as u16
+                && d.t[0] == n.kidx_pf && d.t[2] == n.lw[0].iknw && d.t[3] == n.lw[0].iknb));
+            if sparse_prefill == "0" || t <= 2048 {
+                assert!(!p.insts.iter().any(|d| matches!(DevOp::from_u16(d.op),
+                    Some(DevOp::IndexScorePf | DevOp::IndexTpPf | DevOp::IndexSelectPf))));
+                assert!(!p.insts.iter().any(|d| d.t[2] == n.lw[0].iwqb));
+            }
+        }
+    }
+}
+
 /// The real GLM-5.2-FP8 config dims. `layers` is trimmed — the single
 /// block only touches one layer.
 fn glm_ref_cfg() -> GlmCfg {

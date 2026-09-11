@@ -2092,6 +2092,11 @@ pub(crate) fn declare_glm_rows_batched(
             TENSOR_NONE,
         )
     };
+    let kidx_pf = if kidx_pf == TENSOR_NONE && idx_on && c.index_kpool == 1 {
+        ac(b, "kidx_pf", rows64 * di as u64 * BF16)
+    } else {
+        kidx_pf
+    };
     let pool_pf_on = dsa_pf && c.index_kpool > 1;
     let (gate_score_pf, q_fp8_pf, q_scale_pf, widx_f32_pf, iidx_pool_pf) = if pool_pf_on {
         (
@@ -4482,7 +4487,9 @@ fn emit_glm_dsa_prefill_select(
     all: &[u32],
     pre: &[u32],
     xgate: &mut u32,
+    select: bool,
 ) -> u32 {
+    assert!(select || c.index_kpool == 1);
     let (hi, di, h, ql) = (c.index_heads, c.index_dim, c.hidden, c.q_lora);
     let itk = c.index_topk.min(ctx);
     let n_cu = b.n_cu();
@@ -4510,23 +4517,25 @@ fn emit_glm_dsa_prefill_select(
             })
         };
     // q_idx: [T][HI*DI] from the q-latent; k_idx: [T][DI] from the input norm.
-    let c_q0 = bf16_gemm(b, n.qidx_pf, n.qlat, w.iwqb, hi * di, ql, &[pre[1]]);
-    let c_qi = b.emit(DevOp::HeadNormRope, all.to_vec(), &[c_q0], |d| {
-        d.t[0] = n.qidx_pf;
-        d.t[1] = n.qidx_pf;
-        d.t[2] = TENSOR_NONE;
-        d.t[3] = n.icos;
-        d.t[4] = n.isin;
-        d.t[5] = n.pos;
-        d.i[0] = t;
-        d.i[1] = hi;
-        d.i[2] = di;
-        d.i[3] = 0;
-        d.i[4] = 1;
-        d.i[5] = 1;
-        d.f[0] = c.eps;
-        d.j[0] = 0;
-        d.j[1] = KV_MASK_NONE;
+    let c_qi = select.then(|| {
+        let c_q0 = bf16_gemm(b, n.qidx_pf, n.qlat, w.iwqb, hi * di, ql, &[pre[1]]);
+        b.emit(DevOp::HeadNormRope, all.to_vec(), &[c_q0], |d| {
+            d.t[0] = n.qidx_pf;
+            d.t[1] = n.qidx_pf;
+            d.t[2] = TENSOR_NONE;
+            d.t[3] = n.icos;
+            d.t[4] = n.isin;
+            d.t[5] = n.pos;
+            d.i[0] = t;
+            d.i[1] = hi;
+            d.i[2] = di;
+            d.i[3] = 0;
+            d.i[4] = 1;
+            d.i[5] = 1;
+            d.f[0] = c.eps;
+            d.j[0] = 0;
+            d.j[1] = KV_MASK_NONE;
+        })
     });
     let c_k0 = bf16_gemm(b, n.kidx_pf, n.xn, w.iwk, di, h, &[pre[0]]);
     let c_kn = b.emit(DevOp::LayerNorm, pf_wide_cus(n_cu, t), &[c_k0], |d| {
@@ -4630,7 +4639,7 @@ fn emit_glm_dsa_prefill_select(
                 d.i[2] = row;
             });
         }
-        let c_qq = b.emit(DevOp::DsaQQuant, all.to_vec(), &[c_qi], |d| {
+        let c_qq = b.emit(DevOp::DsaQQuant, all.to_vec(), &[c_qi.unwrap()], |d| {
             d.t[0] = n.q_fp8_pf;
             d.t[1] = n.q_scale_pf;
             d.t[2] = n.qidx_pf;
@@ -4718,6 +4727,10 @@ fn emit_glm_dsa_prefill_select(
         d.j[0] = 0;
         d.j[1] = KV_MASK_NONE;
     });
+    if !select {
+        return c_ki;
+    }
+    let c_qi = c_qi.unwrap();
     let c_w = b.emit(
         pick_tile(t, hi, h, n_cu, kernelcaps::QuantScheme::None),
         all.to_vec(),
@@ -5032,7 +5045,10 @@ pub(crate) fn emit_glm_mla_prefill(
         None => (1..=span).any(|d| slot >= d && c.indexer_is_full((slot - d) as u32)),
     };
     let sparse = glm_dsa_pf_bucket(c, t) && (w.iwqb != TENSOR_NONE || reuses) && nh_l == 8;
-    let c_sel_pf = if sparse && w.iwqb != TENSOR_NONE {
+    // Dense prefill still feeds sparse decode's key cache, including short tail buckets.
+    let c_sel_pf = if w.iwqb != TENSOR_NONE
+        && (sparse || (c.dsa(ctx) && c.index_kpool == 1))
+    {
         Some(emit_glm_dsa_prefill_select(
             b,
             c,
@@ -5044,6 +5060,7 @@ pub(crate) fn emit_glm_mla_prefill(
             &all,
             &[c_rn1, c_rnq],
             xgate,
+            sparse,
         ))
     } else {
         None
