@@ -5684,7 +5684,7 @@ fn emit_glm_moe_ffn_prefill(
                 n.row_partidx,
                 n.row_gate,
             ];
-            d.i = [t, h, imoe_e, e, tk, 64, 0, u32::from(resident)];
+            d.i = [t, h, imoe_e, e, tk, 64, 2, u32::from(resident)];
         });
         b.isolate(counter);
         counter
@@ -5781,6 +5781,7 @@ fn emit_glm_moe_ffn_prefill(
                     d.i[2] = rows;
                     d.i[3] = i * rows; // t_row0
                     d.i[4] = u32::from(det); // f64 fixed-point accumulator (PLOW_MOE_PF_DET)
+                    d.i[7] = u32::from(native_moe);
                 });
                 // `n.slot_b`, NOT `t * h * 2`: the offset is a property of the BLOB (where
                 // the host binds `act.dg_tp`), not of this bucket. See GlmTn.
@@ -5832,6 +5833,7 @@ fn emit_glm_moe_ffn_prefill(
             d.i[1] = if det || native_moe { 1 } else { tk }; // see the banded twin
             d.i[2] = t;
             d.i[4] = u32::from(det); // see the banded twin
+            d.i[7] = u32::from(native_moe);
         })
     }
 }

@@ -273,7 +273,7 @@ const DOC: &[S] = &[
     S { op: DevOp::MoeGluMxPf, t: &["fu_g", "xn2", "W_gu", "S_gu", "meta", "row_token", "bias_gu?"], i: &["I", "K", "n_exp", "layout", "", "act"], f: &["alpha", "limit"], j: &[] },
     S { op: DevOp::MoeDownMxPf, t: &["part", "fu_g", "W_d", "S_d", "meta", "bias_d?", "row_partidx", "row_gate"], i: &["H", "I", "n_exp"], f: &[], j: &[] },
     S { op: DevOp::PerLayerInput, t: &["x", "Wg", "Wp", "gamma_post", "ple", "hn_out?", "gamma_next?"], i: &["T", "H", "P", "col0", "stride"], f: &["eps", "layer_scalar"], j: &[] },
-    S { op: DevOp::MoeAiterFp8Pf, t: &["out", "x", "weights", "scales", "meta_or_raw_routes", "row_token", "row_part", "row_gate"], i: &["T", "H", "I", "E", "topk", "align_tile", "flat_decode", "resident_weights"], f: &[], j: &[] },
+    S { op: DevOp::MoeAiterFp8Pf, t: &["out", "x", "weights", "scales", "meta_or_raw_routes", "row_token", "row_part", "row_gate"], i: &["T", "H", "I", "E", "topk", "align_tile", "mode", "resident_weights"], f: &[], j: &[] },
     S { op: DevOp::IndexTpPf, t: &["idx", "score", "q", "k", "w", "kv_len", "peer_slot"], i: &["T", "ctx", "topk", "tp", "slot_bytes", "enter_gate", "complete_gate"], f: &["scale"], j: &[] },
     S { op: DevOp::GemmLtPf, t: &["out", "x", "weight"], i: &["T", "N", "K", "decode"], f: &[], j: &[] },
 ];

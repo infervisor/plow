@@ -1836,12 +1836,13 @@ pub enum DevOp {
     /// `i0=T i1=H i2=P i3=col0 i4=stride` · `f0=eps f1=layer_scalar`.
     PerLayerInput = 155,
     /// Native gfx942 A8 block-FP8 MoE prefill. Quantizes BF16 input in 128-element
-    /// groups and combines routed experts in BF16; writes the result as FP32.
+    /// groups and combines routed experts in BF16. Mode 0 converts the result to FP32.
     /// This is a separate numerical contract from the FP64 grouped-down path.
     /// `t0=out t1=x t2=weights t3=scales t4=meta_or_raw_routes t5=row_token t6=row_part t7=row_gate` ·
-    /// `i0=T i1=H i2=I i3=E i4=topk i5=align_tile i6=flat_decode i7=resident_weights`. Requires an isolated native segment.
+    /// `i0=T i1=H i2=I i3=E i4=topk i5=align_tile i6=mode i7=resident_weights`. Requires an isolated native segment.
     /// `i6=1`: flat A16 decode, BF16 output plus eight scratch bytes, raw routing in t4,
     /// t5..t7 absent and i5=0. Combine as one BF16 partial (MoeCombinePf.i7=1).
+    /// `i6=2`: sorted A8 prefill with direct BF16 output; combine as one BF16 partial.
     /// `i7=1`: resident 16x32 weights, gate/up interleaved by expert followed by down;
     /// scales are doubled for FNUZ. All consumers of these tables must use this layout.
     MoeAiterFp8Pf = 156,
