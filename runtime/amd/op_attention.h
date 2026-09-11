@@ -5623,7 +5623,26 @@ __device__ void d_index_select_pf(int* __restrict__ idx, const float* __restrict
             const unsigned sh = (SEL_NPASS - 1u - pass) * SEL_DIGIT;
             for (unsigned i = tid; i < SEL_NB; i += PLOW_THREADS) lh[i] = 0u;
             __syncthreads();
-            for (unsigned s = tid; s < row_len; s += PLOW_THREADS) {
+            /* Eight scores in flight per thread. The scan is a pure load stream gated on a
+             * register compare, and at one workgroup per row (the batched local form) the
+             * memory-level parallelism inside that workgroup is the only latency hiding there
+             * is: the straight loop issued one load per LDS atomic and measured 268 us for
+             * 20 rows x 65k scores. The histogram is order-free (atomic counts), so the set
+             * selected is identical. */
+            unsigned s = tid;
+            for (; s + 7u * PLOW_THREADS < row_len; s += 8u * PLOW_THREADS) {
+                float v[8];
+#pragma unroll
+                for (int u = 0; u < 8; u++) v[u] = sr[s + (unsigned)u * PLOW_THREADS];
+#pragma unroll
+                for (int u = 0; u < 8; u++) {
+                    const unsigned long long key =
+                        dsa_pack_key_a(v[u], s + (unsigned)u * PLOW_THREADS, row_len);
+                    if ((key & himask) == prefix)
+                        atomicAdd(&lh[(unsigned)((key >> sh) & (SEL_NB - 1u))], 1u);
+                }
+            }
+            for (; s < row_len; s += PLOW_THREADS) {
                 const unsigned long long key = dsa_pack_key_a(sr[s], s, row_len);
                 if ((key & himask) == prefix)
                     atomicAdd(&lh[(unsigned)((key >> sh) & (SEL_NB - 1u))], 1u);
@@ -5657,7 +5676,23 @@ __device__ void d_index_select_pf(int* __restrict__ idx, const float* __restrict
         /* prefix == the exact k-th key; emit all >= it (exactly top_k, keys unique). */
         if (tid == 0) red[2] = 0u;
         __syncthreads();
-        for (unsigned s = tid; s < row_len; s += PLOW_THREADS) {
+        /* Same eight-deep load stream as the passes. Emission order was never ordered (the
+         * slot is an LDS atomic), and every consumer treats the row as a set. */
+        unsigned s = tid;
+        for (; s + 7u * PLOW_THREADS < row_len; s += 8u * PLOW_THREADS) {
+            float v[8];
+#pragma unroll
+            for (int u = 0; u < 8; u++) v[u] = sr[s + (unsigned)u * PLOW_THREADS];
+#pragma unroll
+            for (int u = 0; u < 8; u++) {
+                const unsigned pos = s + (unsigned)u * PLOW_THREADS;
+                if (dsa_pack_key_a(v[u], pos, row_len) >= prefix) {
+                    const unsigned slot = atomicAdd(&red[2], 1u);
+                    if (slot < top_k) st_act<int>(&row[slot], (int)pos);
+                }
+            }
+        }
+        for (; s < row_len; s += PLOW_THREADS) {
             const unsigned long long key = dsa_pack_key_a(sr[s], s, row_len);
             if (key >= prefix) {
                 const unsigned slot = atomicAdd(&red[2], 1u);

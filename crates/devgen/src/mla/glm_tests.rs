@@ -2321,3 +2321,19 @@ fn glm_native_prefill_fold_preserves_xcd_boundaries() {
     );
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn dsa_decode_nsplit_fills_one_item_per_cu() {
+    let _guard = crate::test_env::env_guard();
+    let _env = crate::test_env::EnvScope::set(&[("PLOW_MLA_NS", "")]);
+    // TP8 (nh_l=8, GF=4): 2 head-groups per row on 304 CUs.
+    for (rows, expected) in [(1, 16), (2, 16), (4, 16), (8, 16), (16, 8), (20, 4), (64, 4)] {
+        assert_eq!(glm_dsa_decode_nsplit(rows, 8, 4, 304), expected, "rows {rows}");
+    }
+    // TP4 (nh_l=16): 4 head-groups per row.
+    assert_eq!(glm_dsa_decode_nsplit(1, 16, 4, 304), 16);
+    assert_eq!(glm_dsa_decode_nsplit(20, 16, 4, 304), 4);
+    // The pin wins, as it does for the dense rule.
+    let _pin = crate::test_env::EnvScope::set(&[("PLOW_MLA_NS", "8")]);
+    assert_eq!(glm_dsa_decode_nsplit(20, 8, 4, 304), 8);
+}
