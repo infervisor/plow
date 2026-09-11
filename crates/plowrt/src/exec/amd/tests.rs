@@ -5176,7 +5176,8 @@ fn token_batch_body_refuses_a_native_only_packet_without_its_route() {
     let err = token_batch_body_native_routes(&prog, &[PrefillSegmentRoute::Interpreter])
         .unwrap_err();
     assert!(err.contains("GemmLtPf"), "{err}");
-    // An ordinary packed program is not held to it: the check is keyed on the body flag.
+    // The function ignores the body flag (a plain program is flagged too); `AmdProg` stores
+    // `Ok(())` for non-body programs, which is where the check is scoped to bodies.
     let (mut plain, _) = token_batch_body_probe(2048);
     plain.role = packet::devbuild::ProgramRole::PackedSibling { of_rows: plain.t };
     assert!(token_batch_body_native_routes(&plain, &[PrefillSegmentRoute::Interpreter]).is_err());

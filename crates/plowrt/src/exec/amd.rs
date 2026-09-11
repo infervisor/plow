@@ -7349,33 +7349,21 @@ impl AmdEngine {
             (None, None)
         };
         if packed_route {
-            let packed_programs = || {
-                blob.prefill_phase()
-                    .filter(|g| g.role.is_packed_sibling() || g.role.is_token_batch_body())
-            };
-            let needs_mla = packed_programs().any(|g| {
-                g.insts.iter().any(|d| {
-                    d.op == DevOp::RmsNorm as u16
-                        || d.op == DevOp::HeadNormRope as u16
-                        || d.op == DevOp::HeadNormRopeFp8 as u16
-                        || d.op == DevOp::FlashMlaPrefill as u16
-                        || d.op == DevOp::FlashMlaPrefillFp8 as u16
-                })
-            });
+            let (needs_plain, needs_tb) = crate::exec::amd::packed::packed_mla_families_needed(
+                blob.prefill_phase().map(|g| {
+                    (
+                        g.role.is_packed_sibling(),
+                        g.role.is_token_batch_body(),
+                        g.insts.iter().map(|d| d.op),
+                    )
+                }),
+            );
             let suffix = sched_prefill.suffix();
             let missing: Vec<String> = [
-                ("interp_packed_mla_norm", needs_mla, k_packed_mla_norm.is_some()),
-                ("interp_packed_mla_flash", needs_mla, k_packed_mla_flash.is_some()),
-                (
-                    "interp_packed_mla_norm_tb",
-                    needs_mla && has_bodies,
-                    k_packed_mla_norm_tb.is_some(),
-                ),
-                (
-                    "interp_packed_mla_flash_tb",
-                    needs_mla && has_bodies,
-                    k_packed_mla_flash_tb.is_some(),
-                ),
+                ("interp_packed_mla_norm", needs_plain, k_packed_mla_norm.is_some()),
+                ("interp_packed_mla_flash", needs_plain, k_packed_mla_flash.is_some()),
+                ("interp_packed_mla_norm_tb", needs_tb, k_packed_mla_norm_tb.is_some()),
+                ("interp_packed_mla_flash_tb", needs_tb, k_packed_mla_flash_tb.is_some()),
             ]
             .into_iter()
             .filter(|&(_, needed, loaded)| needed && !loaded)

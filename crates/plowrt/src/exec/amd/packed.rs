@@ -332,9 +332,59 @@ pub(super) fn validate_rows(
     })
 }
 
+/// Which packed MLA family objects a blob's packed programs dispatch to, as `(plain, tb)`, from
+/// each program's `(packed_prefill_only, token_batch_body, ops)`.
+///
+/// Plain packed siblings run their MLA family segments on `interp_packed_mla_{norm,flash}`;
+/// token-batch bodies run theirs on the `_tb` twins and never dispatch to the plain pair. Counting
+/// bodies toward the plain pair made the loader refuse a packet with bodies but no siblings until
+/// it was paired with objects it never runs.
+pub(super) fn packed_mla_families_needed<I, O>(progs: I) -> (bool, bool)
+where
+    I: IntoIterator<Item = (bool, bool, O)>,
+    O: IntoIterator<Item = u16>,
+{
+    const MLA: [DevOp; 5] = [
+        DevOp::RmsNorm,
+        DevOp::HeadNormRope,
+        DevOp::HeadNormRopeFp8,
+        DevOp::FlashMlaPrefill,
+        DevOp::FlashMlaPrefillFp8,
+    ];
+    let (mut plain, mut tb) = (false, false);
+    for (packed_only, body, ops) in progs {
+        if packed_only || body {
+            let mla = ops.into_iter().any(|op| MLA.iter().any(|&m| m as u16 == op));
+            plain |= packed_only && mla;
+            tb |= body && mla;
+        }
+    }
+    (plain, tb)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `_tb` twins are for bodies, the plain pair for siblings. A packet with bodies and no
+    /// siblings was refused at load for want of the plain pair it never dispatches to.
+    #[test]
+    fn packed_mla_families_are_required_only_by_the_programs_that_use_them() {
+        let mla = vec![DevOp::HeadNormRopeFp8 as u16, DevOp::FlashMlaPrefillFp8 as u16];
+        // (packed_prefill_only, token_batch_body, ops)
+        let body = || (false, true, mla.clone());
+        let sibling = || (true, false, mla.clone());
+        let ordinary = || (false, false, mla.clone());
+        assert_eq!(packed_mla_families_needed([ordinary(), body()]), (false, true));
+        assert_eq!(packed_mla_families_needed([ordinary(), sibling()]), (true, false));
+        assert_eq!(packed_mla_families_needed([sibling(), body()]), (true, true));
+        // Only a packed program's MLA ops count, and a body without MLA ops needs neither.
+        assert_eq!(packed_mla_families_needed([ordinary()]), (false, false));
+        assert_eq!(
+            packed_mla_families_needed([(false, true, vec![DevOp::Gemm as u16])]),
+            (false, false)
+        );
+    }
 
     fn tb_span(row0: u32, n_rows: u32, slot: u32, kv_row0: u32) -> PrefillSpan {
         PrefillSpan {
