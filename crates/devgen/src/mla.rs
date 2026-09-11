@@ -1035,6 +1035,35 @@ fn require_gf_divides(gf: u32, nh_l: u32, phase: &str) {
         nh_l - (nh_l / gf) * gf,
     );
 }
+
+/// Split count for the SPARSE (DSA) decode flash. The gathered walk is `index_topk` rows per
+/// (row, head-group) whatever the context, so this is a fill problem, not a stream problem, and
+/// `glm_nsplit(index_topk, ..)` (= 16 for every rung) is the wrong instrument: it was fitted to
+/// a dense latent stream. Measured on the shipped gfx942 decode object (exact-object replay,
+/// FP8 latent, GF=4, top_k 2048, us per packet on one rank; the walk is context-independent):
+///
+///     rows   ns=4   ns=8   ns=16 (shipped)  ns=32
+///       1     85     69     64               62
+///       8    100     82     80              114
+///      16    105     90    125              188
+///      20    108    142    167              226
+///
+/// Past one item per CU the second round costs more than the shorter walk saves (rows 16 and
+/// 20 at ns=16 run 640 items on 304 CUs); below it the per-item fixed cost (Q staging, six
+/// barriers, the epilogue) dominates. So: the largest power of two with
+/// `rows * (nh_l / GF) * ns <= n_cu`, clamped to [4, 16] — 16 is where rows 1..4 already sit and
+/// 32 never beat it by more than noise. `PLOW_MLA_NS` pins it, as it pins the dense rule.
+pub(crate) fn glm_dsa_decode_nsplit(rows: u32, nh_l: u32, gf: u32, n_cu: u32) -> u32 {
+    let n_grp = (nh_l / gf.max(1)).max(1);
+    let items = (rows.max(1) * n_grp).max(1);
+    let fill = (n_cu.max(1) / items).max(1);
+    let ns = (1u32 << fill.ilog2()).clamp(4, 16);
+    emit_config::active()
+        .mla_ns
+        .filter(|&v| v >= 1)
+        .unwrap_or(ns)
+}
+
 /// MLA flash-decode KV-split count, CTX-ADAPTIVE (mirrors Gemma's PLOW_NS_MUL/ABS). The flash
 /// splits its work into `n_grp*nsplit = (heads/GF)*nsplit` items over 256 CUs; nsplit must fill
 /// the machine (n_grp*nsplit >= n_cu) without over-splitting short contexts (FlashMerge crit-path
@@ -3643,7 +3672,7 @@ pub(crate) fn emit_glm_mla(
     //   the same shared latent), so the cache stays full-width on every rank. Under DSA the flash reads
     //   ONLY the top_k rows via n.iidx (constant work ~ top_k regardless of ctx).
     let ns_attn = if dsa {
-        glm_nsplit(itk, nh_l)
+        glm_dsa_decode_nsplit(rows, nh_l, glm_gf(ctx, nh_l), b.n_cu())
     } else {
         glm_nsplit(ctx, nh_l)
     };
