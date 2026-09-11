@@ -2065,6 +2065,8 @@ impl Builder {
             Some("all") if !uniseg => 2u8,
             _ => 0u8,
         };
+        let fa256_gqa2 = !uniseg
+            && std::env::var("PLOW_SEG_FA256_GQA2").ok().as_deref() == Some("1");
         // PLOW_SEG_V2=1 (T16, needs fa512=all + pure=fp8): rope and flash-merge join the FA
         // class (the *_pffa object carries their arms under PLOW_NV_FA_ROPE), and QuantFp8
         // joins the GEMM class (the uni256 object carries the quant arm) — the per-layer
@@ -2163,6 +2165,8 @@ impl Builder {
                 8
             } else if packed_prefill_segments && packed_prefill_segment_class(op).is_some() {
                 packed_prefill_segment_class(op).unwrap()
+            } else if fa256_gqa2 && self.ops[i].inst.is_hd256_gqa2_sliding_prefill() {
+                3
             } else if op == DevOp::FlashPrefill as u16 || op == DevOp::FlashPrefillFp8 as u16 {
                 // T37: the *_pffa object instantiates hd 256/512 only — other head dims
                 // (Qwen/Llama hd128) stay on the fat object rather than trapping there.

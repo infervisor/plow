@@ -1218,6 +1218,27 @@ impl AmdTpGroup {
         Ok(())
     }
 
+    pub fn shared_prefix_enabled(&self) -> bool {
+        self.ranks.iter().any(AmdEngine::shared_prefix_enabled)
+    }
+
+    pub fn attach_shared_prefix(&mut self, slot: usize, prompt: &[u32]) -> Result<u32> {
+        AmdEngine::attach_shared_prefixes(&mut self.ranks, slot, prompt)
+    }
+
+    pub fn publish_shared_prefix(&self, slot: usize, prompt: &[u32], frontier: u32) -> Result<()> {
+        for rank in &self.ranks {
+            rank.publish_shared_prefix(slot, prompt, frontier)?;
+        }
+        Ok(())
+    }
+
+    pub fn release_shared_prefix(&self, slot: usize) {
+        for rank in &self.ranks {
+            rank.release_shared_prefix(slot);
+        }
+    }
+
     /// Publish the per-row parked mask on every rank. See `AmdEngine::upload_parked`.
     pub fn upload_parked(&mut self, parked: &[u32]) -> Result<()> {
         for e in &mut self.ranks {

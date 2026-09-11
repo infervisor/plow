@@ -603,6 +603,10 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "pf-seg-fa512", env = "PLOW_PF_SEG_FA512", global = true)]
     pub pf_seg_fa512: Option<String>,
 
+    /// Route exact packed Gemma HD256/GQA2 BF16 attention to its isolated object.
+    #[arg(long = "pf-seg-fa256-gqa2", env = "PLOW_PF_SEG_FA256_GQA2", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub pf_seg_fa256_gqa2: bool,
+
     /// T35: submit each prefill chunk's segment chain as ONE CUDA graph.
     #[arg(long = "pf-seg-graph", env = "PLOW_PF_SEG_GRAPH", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pf_seg_graph: bool,
@@ -742,6 +746,10 @@ pub struct AmdRuntimeConfig {
     /// VMM-backed KV on ROCr (opt-in, requires hsa_amd_vmem_*).
     #[arg(long = "amd-vmm-kv", env = "PLOW_VMM_KV", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub vmm_kv: bool,
+
+    /// Share completed MLA prefixes through ROCr VMM (auto on supported gfx942 packets).
+    #[arg(long = "amd-shared-prefix", env = "PLOW_AMD_SHARED_PREFIX", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub shared_prefix: Option<bool>,
 
     /// VMM block size for AMD KV (MiB).
     // `id` disambiguates from the NVIDIA twin: clap derive uses the FIELD name
@@ -1383,6 +1391,19 @@ mod tests {
                     .vmm_prefix,
                 Some(expected)
             );
+        }
+    }
+
+    #[test]
+    fn amd_shared_prefix_defaults_to_auto_and_accepts_explicit_overrides() {
+        use clap::{Args, FromArgMatches};
+        let command = super::RuntimeConfig::augment_args(clap::Command::new("test"));
+        assert!(command.get_arguments().find(|arg| arg.get_id() == "shared_prefix")
+            .unwrap().get_default_values().is_empty());
+        for (flag, expected) in [("--amd-shared-prefix", true), ("--amd-shared-prefix=false", false)] {
+            let matches = command.clone().try_get_matches_from(["test", flag]).unwrap();
+            assert_eq!(super::RuntimeConfig::from_arg_matches(&matches).unwrap().amd.shared_prefix,
+                Some(expected));
         }
     }
 

@@ -33,11 +33,13 @@ use crate::{Result, RuntimeError};
 
 mod object;
 mod packed;
+mod segment;
 pub(super) use object::elf_symbol_names;
 use object::{
     build_requires, check_attn_res_f32mix_symbols, check_compiled_opcode_marker_set,
     check_compiled_opcode_markers, check_dec_stage_capacity, check_decode_object,
     check_dsa_decode_batch, check_dsa_select_local, check_dsa_pf_arm, check_gate_hier_object, check_gemv_capacity,
+    check_interpreter_waves,
     check_k3_arms, check_kda_carry_regstate_symbols, check_kda_chunk, check_kda_conv_step_db,
     check_kda_intra_wave_items_symbols, check_kv_encoding, check_materialized_residual_input,
     check_mla_nope_arm, check_mla_v2_sv_raw_symbols, check_moe_ep_symbols, check_moe_gemma_arms,
@@ -88,10 +90,10 @@ fn ctr_dbuf() -> bool {
 const TRACE_REC_BYTES: usize = 40;
 
 /// Wave-class 8 is `PLOW_WG_WAVES` = 8 waves of 64.
-const WG_THREADS_8: u32 = 8 * 64;
+const WG_THREADS_8: u32 = Phase::Prefill.interpreter_threads();
 /// The flash object is built 4-wave. Dispatching it at 512 threads is an
 /// `INVALID_ISA`, not a slowdown.
-const WG_THREADS_4: u32 = 4 * 64;
+const WG_THREADS_4: u32 = Phase::Flash.interpreter_threads();
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct AmdOwnedRange {
@@ -5244,6 +5246,7 @@ struct AmdGq {
 
 mod mixed_step;
 mod prefix;
+mod shared_prefix;
 mod token_batch;
 
 /// The AMD serving engine.
@@ -5476,6 +5479,7 @@ pub struct AmdEngine {
     /// result, and physical granules are mapped at each sequence's decode
     /// frontier. No block table, no per-block indirection, no kernel change.
     vmm: Option<VmmKv>,
+    shared_prefix: Option<shared_prefix::SharedPrefix>,
     /// `(blocks, i[8])` of the last lm_head found — the fields that differ
     /// between two packets whose op and operands are identical.
     lm_detail: std::cell::RefCell<Option<(u16, [u32; 8], usize, Vec<u16>)>>,
@@ -6305,6 +6309,9 @@ impl AmdEngine {
                     RuntimeError::Device(format!("code object {}: {e}", path.display()))
                 }
             })?;
+            check_interpreter_waves(
+                elf_symbol_u32(&image, "plow_geom_PLOW_WG_WAVES"), phase, &path,
+            )?;
             let syms = elf_symbol_names(&image);
             if phase == Phase::Prefill {
                 prefill_moe_align_bm64 = syms.contains(&"plow_moe_align_bm64_1");
@@ -6759,6 +6766,9 @@ impl AmdEngine {
                     })?;
                     let syms = elf_symbol_names(&image);
                     check_mla_v2_sv_raw_symbols(&syms, &path, prefill_l2_placed)?;
+                    check_interpreter_waves(
+                        elf_symbol_u32(&image, "plow_geom_PLOW_WG_WAVES"), Phase::Flash, &path,
+                    )?;
                     check_packet_pairing_stamp(&image, blob_path, &path)?;
                     let module = EngineDevice::module_load(&*be, &image)?;
                     let symbol = symbol_name(Phase::Flash, sched_prefill, &arch);
@@ -6826,6 +6836,7 @@ impl AmdEngine {
         packed_kda_ops.dedup_by_key(|op| *op as u16);
         let mut load_packed_family = |stem: &str,
                                       symbol_base: &str,
+                                      phase: Phase,
                                       markers: &[&str],
                                       fp8_kv: Option<bool>,
                                       required_ops: &[DevOp]|
@@ -6849,6 +6860,9 @@ impl AmdEngine {
                     markers
                 )));
             }
+            check_interpreter_waves(
+                elf_symbol_u32(&image, "plow_geom_PLOW_WG_WAVES"), phase, &path,
+            )?;
             check_compiled_opcode_marker_set(&syms, &path, required_ops.iter().copied())?;
             if let Some(want_fp8) = fp8_kv {
                 let has_fp8 = syms.contains(&FP8_KV_SYM);
@@ -6884,6 +6898,7 @@ impl AmdEngine {
             load_packed_family(
                 &format!("interp_packed_mla_norm{packed_kv_infix}"),
                 "plow_interp_packed_mla_norm",
+                Phase::Prefill,
                 &[PACKED_PREFILL_MLA_NORM_SEG_SYM],
                 Some(variant == Variant::Fp8Kv),
                 &[],
@@ -6895,6 +6910,7 @@ impl AmdEngine {
             load_packed_family(
                 &format!("interp_packed_mla_flash{packed_kv_infix}"),
                 "plow_interp_packed_mla_flash",
+                Phase::Flash,
                 &[PACKED_PREFILL_MLA_FLASH_SEG_SYM],
                 Some(variant == Variant::Fp8Kv),
                 &[],
@@ -6920,6 +6936,7 @@ impl AmdEngine {
             load_packed_family(
                 "interp_packed_kda",
                 "plow_interp_packed_kda",
+                Phase::Prefill,
                 &markers,
                 None,
                 &packed_kda_ops,
@@ -7909,7 +7926,35 @@ impl AmdEngine {
 
         // Must precede the tensor loop: it decides whether each full-layer KV
         // tensor gets an allocation or a view onto the pool's VA reservation.
-        let vmm = Self::vmm_bringup(&be, &blob, checkpoint, max_decode_batch as usize);
+        let config = crate::config::RuntimeConfig::get();
+        let shared_requested = config.prefix_cache && config.amd.shared_prefix != Some(false);
+        let shared_layout = if shared_requested && arch == "gfx942" && be.has_vmm() && !config.fusion {
+            blob.tensors.iter().find(|t| t.name == "in.pos")
+                .and_then(|t| u32::try_from(t.bytes / 4).ok())
+                .and_then(|context| shared_prefix::Layout::from_blob(&blob, max_decode_batch as usize, context))
+        } else {
+            None
+        };
+        if shared_requested && config.amd.shared_prefix == Some(true) && shared_layout.is_none() {
+            return Err(RuntimeError::Rejected(
+                "AMD shared prefixes require gfx942, ROCr VMM, no legacy fusion, and complete MLA cache writes with supported geometry on every rung".into()));
+        }
+        let mut shared_prefix = shared_layout.map(|layout| {
+            shared_prefix::SharedPrefix::new(be.clone(), layout,
+                config.prefix_cache_cap_bytes(be.vram_bytes()),
+                crate::memory::vmm::kv_pool_cap())
+        }).transpose()?;
+        let vmm = if shared_prefix.is_none() {
+            Self::vmm_bringup(&be, &blob, checkpoint, max_decode_batch as usize)
+        } else {
+            None
+        };
+        let cache_va: Vec<_> = blob.tensors.iter().enumerate().map(|(id, tensor)| {
+            shared_prefix.as_ref().and_then(|v| v.tensor_va(id)).or_else(|| {
+                let (layer, role) = kv_tensor_name(&tensor.name)?;
+                vmm.as_ref()?.tensor_va(layer, role)
+            })
+        }).collect();
 
         let prof = LoadProf::default();
         let do_prefault = profile_faults();
@@ -7980,19 +8025,12 @@ impl AmdEngine {
         // `[rank*t/tp, (rank+1)*t/tp)` of an already-bound base, i.e. `base + rank * bytes`.
         // Storage belongs to the base, so they are views like the peer slots.
         let is_band_view = |name: &str| tp.is_some() && name.contains("@band");
-        let is_vmm = |name: &str| {
-            vmm.as_ref()
-                .and_then(|v| {
-                    let (l, t) = kv_tensor_name(name)?;
-                    v.tensor_va(l, t)
-                })
-                .is_some()
-        };
         let slab_bytes: u64 = blob
             .tensors
             .iter()
-            .filter(|td| !is_peer_slot(&td.name) && !is_band_view(&td.name) && !is_vmm(&td.name))
-            .map(|td| slab_carve(td.bytes))
+            .enumerate()
+            .filter(|(id, td)| !is_peer_slot(&td.name) && !is_band_view(&td.name) && cache_va[*id].is_none())
+            .map(|(_, td)| slab_carve(td.bytes))
             .sum();
 
         // ---- EVERY checkpoint weight is RESOLVED before a byte is uploaded
@@ -8128,10 +8166,7 @@ impl AmdEngine {
             // a non-owning view (the pool owns unmap/release). No allocation
             // and no memset — the VA is mapped lazily at each sequence's
             // frontier, and KV is always written before it is read.
-            let vmm_va = vmm.as_ref().and_then(|v| {
-                let (l, t) = kv_tensor_name(&td.name)?;
-                v.tensor_va(l, t)
-            });
+            let vmm_va = cache_va[i];
             let mem = match (vmm_va, &weight_slab) {
                 (Some(va), _) => {
                     n_view += 1;
@@ -8455,6 +8490,9 @@ impl AmdEngine {
             );
         }
         let table: Vec<u8> = devp.iter().flat_map(|m| m.base.to_le_bytes()).collect();
+        if let Some(cache) = &mut shared_prefix {
+            cache.bind(&devp.iter().map(|m| m.base).collect::<Vec<_>>());
+        }
         let d_tens = EngineDevice::alloc(&*be, table.len().max(1) as u64)?;
         EngineDevice::upload(&*be, &d_tens, 0, &table)?;
         let kda_key_factor_half =
@@ -9236,12 +9274,18 @@ impl AmdEngine {
                 v.ensure_rows(b, 1)?;
             }
         }
+        if let Some(v) = &shared_prefix {
+            for b in 0..batch {
+                v.ensure_rows(b, 1)?;
+            }
+        }
 
         tracing::info!(
             arch = %arch, n_cu = blob.n_cu, progs = progs.len(),
             variant = ?variant, prefill = ?sched_prefill, decode = ?sched_decode,
             n_kvrow = kvrow.len() + kvrow_i2.len(), max_ctx,
             vmm = vmm.is_some(),
+            shared_prefix = shared_prefix.is_some(),
             "AMD engine ready"
         );
         // P3 (coalesce the two decode scalar H2Ds into one) is only legal when
@@ -9432,6 +9476,7 @@ impl AmdEngine {
             kda_conv_bank_pairs,
             kda_conv_alt_stale: vec![false; batch],
             vmm,
+            shared_prefix,
             lm_detail: std::cell::RefCell::new(None),
             pf_stream: blob.progs.iter().map(|g| g.stream.clone()).collect(),
             tp,
@@ -10003,115 +10048,6 @@ impl AmdEngine {
         self.progs[p].seg_class[seg]
     }
 
-    /// Diagnostic label for the kernel object that will execute one prefill segment.
-    /// Kept out of the launch path unless segment timing is explicitly enabled.
-    pub(crate) fn prefill_segment_family(&self, p: usize, seg: usize) -> &'static str {
-        let route = self.progs[p]
-            .prefill_routes
-            .get(seg)
-            .copied()
-            .unwrap_or(PrefillSegmentRoute::Interpreter);
-        match route {
-            PrefillSegmentRoute::XReduceAttnRes { .. } => return "xreduce_attnres",
-            PrefillSegmentRoute::XReduceWaveRs => return "xreduce_wave_rs",
-            PrefillSegmentRoute::GraphPhaseXReduceWaveRs => return "graph_phase_xreduce_wave_rs",
-            _ => {}
-        }
-        if !prefill_segment_specialization_allowed(self.prog_dispatch(p)) {
-            return "interpreter";
-        }
-        let active = self.packed_prefill.is_some_and(|b| b.prog == p);
-        if !active {
-            match route {
-                PrefillSegmentRoute::SparseMla(route) if route.active => return "mla_sparse_aiter",
-                PrefillSegmentRoute::MoeAiter(_) => return "moe_aiter_fp8",
-                PrefillSegmentRoute::IndexTp(_) => return "index_tp",
-                PrefillSegmentRoute::GemmLt(_) => return "gemm_lt",
-                PrefillSegmentRoute::MlaFold(_) => return "mla_fold",
-                PrefillSegmentRoute::MlaMaterializePack { .. } => return "mla_materialize_pack",
-                PrefillSegmentRoute::MlaMaterializedPrefill { .. } => {
-                    return "mla_materialized_prefill";
-                }
-                PrefillSegmentRoute::KdaChunkIntraCached { .. }
-                    if self.k_kda_chunk_intra_cached.is_some() =>
-                {
-                    return "kda_intra_cached";
-                }
-                PrefillSegmentRoute::KdaChunkIntraWaveItems { .. } => {
-                    return "kda_intra_wave_items";
-                }
-                PrefillSegmentRoute::AttnResF32Mix { .. } => return "attn_res_f32mix",
-                PrefillSegmentRoute::KdaChunkCarryRegstate { .. } => {
-                    return "kda_carry_regstate";
-                }
-                PrefillSegmentRoute::KdaChunkWuLean { args, .. } => {
-                    return if args.key_hi != 0 {
-                        "kda_wu_lean_keys"
-                    } else {
-                        "kda_wu_lean"
-                    };
-                }
-                PrefillSegmentRoute::KdaChunkCarryKeyfeed { .. } => {
-                    return "kda_carry_keyfeed";
-                }
-                PrefillSegmentRoute::KdaChunkKeyFactorWu { .. }
-                    if self.k_kda_key_factor_wu.is_some() =>
-                {
-                    return "kda_key_factor_wu";
-                }
-                PrefillSegmentRoute::KdaChunkKeyFactorCarry { .. }
-                    if self.k_kda_key_factor_carry.is_some() =>
-                {
-                    return "kda_key_factor_carry";
-                }
-                PrefillSegmentRoute::MoeStage1Mxfp4(_) if self.k_moe_stage1_mxfp4.is_some() => {
-                    return "moe_stage1_mxfp4";
-                }
-                PrefillSegmentRoute::MoeStage1A4Reuse(_)
-                    if self.k_moe_stage1_a4_reuse.is_some() =>
-                {
-                    return "moe_stage1_a4_reuse";
-                }
-                PrefillSegmentRoute::MoeStage2Mxfp4(_) if self.k_moe_stage2_mxfp4.is_some() => {
-                    return "moe_stage2_mxfp4";
-                }
-                PrefillSegmentRoute::MoeCombine(_) if self.k_moe_combine.is_some() => {
-                    return "moe_combine";
-                }
-                PrefillSegmentRoute::MoeEpAlign(_) if self.k_moe_ep_align.is_some() => {
-                    return "moe_ep_align";
-                }
-                PrefillSegmentRoute::MoeEpStage2(_) if self.k_moe_ep_stage2.is_some() => {
-                    return "moe_ep_stage2";
-                }
-                PrefillSegmentRoute::MoeEpCombine(_) if self.k_moe_ep_combine.is_some() => {
-                    return "moe_ep_combine";
-                }
-                _ => {}
-            }
-        }
-        match packed_segment_route(
-            active && !self.progs[p].packed_dense,
-            self.progs[p].packed_seg_family[seg],
-            self.k_packed_mla_norm.is_some(),
-            self.k_packed_mla_flash.is_some(),
-            self.k_packed_kda.is_some(),
-        ) {
-            Ok(PackedSegmentRoute::MlaNorm) => "packed_mla_norm",
-            Ok(PackedSegmentRoute::MlaFlash) => "packed_mla_flash",
-            Ok(PackedSegmentRoute::Kda) => "kda_family_raw",
-            Ok(PackedSegmentRoute::Primary) | Err(_) => {
-                if self.progs[p].raw_mla_v2_segment[seg] && self.k_mla_v2_sv_raw.is_some() {
-                    "mla_v2_raw"
-                } else if self.k_flash.is_some() && self.progs[p].seg_class[seg] == 4 {
-                    "flash_interpreter"
-                } else {
-                    "interpreter"
-                }
-            }
-        }
-    }
-
     /// Enqueue ONE segment of program `p`. No re-arm, no drain.
     ///
     /// The building block of both the single-GPU segmented run and the TP
@@ -10648,32 +10584,7 @@ impl AmdEngine {
                 return Ok(());
             }
         }
-        let family = self.progs[p].packed_seg_family[seg];
-        let route = packed_segment_route(
-            active && !self.progs[p].packed_dense,
-            family,
-            self.k_packed_mla_norm.is_some(),
-            self.k_packed_mla_flash.is_some(),
-            self.k_packed_kda.is_some(),
-        )?;
-        let (k, threads) = match route {
-            PackedSegmentRoute::MlaNorm => (self.k_packed_mla_norm.unwrap(), WG_THREADS_8),
-            PackedSegmentRoute::MlaFlash => (self.k_packed_mla_flash.unwrap(), WG_THREADS_4),
-            PackedSegmentRoute::Kda => (self.k_packed_kda.unwrap(), WG_THREADS_8),
-            PackedSegmentRoute::Primary => {
-                let raw_mla =
-                    self.progs[p].raw_mla_v2_segment[seg] && self.k_mla_v2_sv_raw.is_some();
-                if let (true, Some(k)) = (raw_mla, self.k_mla_v2_sv_raw) {
-                    (k, WG_THREADS_4)
-                } else {
-                    let use4 = self.k_flash.is_some() && self.progs[p].seg_class[seg] == 4;
-                    match (use4, self.k_flash) {
-                        (true, Some(kf)) => (kf, WG_THREADS_4),
-                        _ => (self.k_prefill, WG_THREADS_8),
-                    }
-                }
-            }
-        };
+        let (k, threads, _) = self.prefill_interpreter_kernel(p, seg)?;
         let arg = self.kernarg(p, seg as u32);
         EngineDevice::launch_cooperative(
             &*self.be,
@@ -11276,7 +11187,6 @@ impl AmdEngine {
     /// last step's token twice.
     pub fn decode_step(&mut self, pos: u32, kvlen: u32) -> Result<u32> {
         use crate::obs::dstep;
-        self.vmm_ensure(self.kv_slot, pos + 1)?;
         dstep::timed(&dstep::PREPARE, || self.decode_prepare(pos, kvlen))?;
         self.run(self.decode, self.decode_kernel_for(self.decode))?;
         let id = dstep::timed(&dstep::READ, || self.read_sampled())?;
@@ -11298,6 +11208,7 @@ impl AmdEngine {
                 self.max_ctx
             )));
         }
+        self.vmm_ensure(self.kv_slot, pos + 1)?;
         self.sync_kda_conv_alt(self.kv_slot)?;
         let dp = self.decode;
         self.patch_mla_nsplit(kvlen)?;
@@ -11548,6 +11459,18 @@ impl AmdEngine {
     /// Upload one chunk's `ids`/`pos`/`kvlen` and patch its bucket program. No
     /// dispatch.
     pub fn prefill_prepare(&mut self, prompt: &[u32], step: ChunkStep) -> Result<()> {
+        let rows = if self.ragged_bucket(step.prog).is_some() {
+            step.clen
+        } else {
+            self.progs[step.prog].t
+        };
+        if step.c0 as usize + rows as usize > self.max_ctx {
+            return Err(RuntimeError::Rejected(format!(
+                "prefill chunk at {} writes {rows} rows past max_ctx {}",
+                step.c0, self.max_ctx
+            )));
+        }
+        self.vmm_ensure(self.kv_slot, step.c0 + rows)?;
         if !self.kda_conv_bank_pairs.is_empty() {
             self.kda_conv_alt_stale[self.kv_slot] = true;
         }
@@ -11708,18 +11631,6 @@ impl AmdEngine {
     }
 
     pub(crate) fn prefill_chunk(&mut self, prompt: &[u32], step: ChunkStep) -> Result<()> {
-        let rows = if self.ragged_bucket(step.prog).is_some() {
-            step.clen
-        } else {
-            self.progs[step.prog].t
-        };
-        if step.c0 as usize + rows as usize > self.max_ctx {
-            return Err(RuntimeError::Rejected(format!(
-                "prefill chunk at {} writes {rows} rows past max_ctx {}",
-                step.c0, self.max_ctx
-            )));
-        }
-        self.vmm_ensure(self.kv_slot, step.c0 + rows)?;
         self.prefill_prepare(prompt, step)?;
         self.run_segmented(step.prog)
     }
@@ -11964,10 +11875,13 @@ impl AmdEngine {
 
     /// Map physical backing for `seq` out to `rows`. No-op without VMM.
     fn vmm_ensure(&self, seq: usize, rows: u32) -> Result<()> {
-        match &self.vmm {
-            Some(v) if v.mapped_rows(seq) < rows => v.ensure_rows(seq, rows),
-            _ => Ok(()),
+        if let Some(v) = &self.vmm {
+            v.ensure_rows(seq, rows)?;
         }
+        if let Some(v) = &self.shared_prefix {
+            v.ensure_rows(seq, rows)?;
+        }
+        Ok(())
     }
 
     /// Release slot `seq`'s physical backing, remap its row 0, and CLEAR any
@@ -12046,6 +11960,7 @@ impl AmdEngine {
             v.begin_seq(seq);
             v.ensure_rows(seq, 1)?;
         }
+        self.reset_shared_prefix(seq)?;
         self.kda_conv_alt_stale[seq] = false;
         Ok(())
     }
@@ -12092,6 +12007,7 @@ impl AmdEngine {
             v.begin_seq(seq);
             v.ensure_rows(seq, 1)?;
         }
+        self.reset_shared_prefix(seq)?;
         for (i, name) in self.tensor_names.iter().enumerate() {
             if !is_carried_state(name) {
                 continue;
@@ -12154,10 +12070,43 @@ impl AmdEngine {
 
     pub fn prefix_cache_capable(&self) -> bool {
         let cap = self.prefix_cache_cap();
-        self.vmm.is_none()
+        self.shared_prefix.is_some() || (self.vmm.is_none()
             && self.prefix_regions.as_ref().is_some_and(|regions| {
                 cap == 0 || regions.iter().map(prefix::Region::bytes).sum::<u64>() <= cap
-            })
+            }))
+    }
+
+    pub fn shared_prefix_enabled(&self) -> bool {
+        self.shared_prefix.is_some()
+    }
+
+    pub fn attach_shared_prefixes(ranks: &mut [Self], slot: usize, prompt: &[u32]) -> Result<u32> {
+        if ranks.is_empty() || ranks.iter().any(|e| !e.shared_prefix_enabled() || slot >= e.batch) {
+            return Err(RuntimeError::Device("shared prefix attachment requires every rank and a valid slot".into()));
+        }
+        shared_prefix::attach_ranks(ranks, slot, prompt, |rank| {
+            rank.shared_prefix.as_mut().expect("validated above")
+        })
+    }
+
+    pub fn reset_shared_prefix(&mut self, slot: usize) -> Result<()> {
+        if let Some(cache) = &mut self.shared_prefix {
+            cache.begin_slot(slot)?;
+        }
+        Ok(())
+    }
+
+    pub fn publish_shared_prefix(&self, slot: usize, prompt: &[u32], frontier: u32) -> Result<()> {
+        if let Some(cache) = &self.shared_prefix {
+            cache.publish_completed_chunk(slot, prompt, frontier)?;
+        }
+        Ok(())
+    }
+
+    pub fn release_shared_prefix(&self, slot: usize) {
+        if let Some(cache) = &self.shared_prefix {
+            cache.release(slot);
+        }
     }
 
     fn evict_prefix_snapshot(&mut self, keep: usize) -> bool {
@@ -12337,6 +12286,11 @@ impl AmdEngine {
                 self.max_ctx
             )));
         }
+        if self.vmm.is_some() || self.shared_prefix.is_some() {
+            for (slot, &position) in pos.iter().enumerate() {
+                self.vmm_ensure(slot, position + 1)?;
+            }
+        }
         self.sync_kda_conv_alt(self.kv_slot)?;
         // ONE split count covers every row of the dispatch. Any count is CORRECT
         // for any row (a split is a partition of that row's own KV window), so
@@ -12456,16 +12410,6 @@ impl AmdEngine {
                 self.kv_slot
             )));
         }
-        // Backing must cover the row this step WRITES, for EVERY slot — not
-        // just the fed ones. An idle row writes K/V at its own `pos` too.
-        // `mapped_rows` is a lock-free atomic read, so the common case (nothing
-        // to map) costs one load per slot.
-        if self.vmm.is_some() {
-            for (b, &p) in pos.iter().enumerate() {
-                self.vmm_ensure(b, p + 1)?;
-            }
-        }
-
         self.decode_prepare_batched(pos, kvlen)?;
 
         self.run_with_capture(dp, self.decode_kernel_for(dp), capture)?;

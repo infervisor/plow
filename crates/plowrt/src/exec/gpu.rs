@@ -1181,9 +1181,12 @@ struct SegPf {
     /// T12: dedicated hd512 flash object (`interp_<tag>_pffa.cubin` in the pair dir,
     /// optional). Class-2 segments (PLOW_PF_SEG_FA512) launch here.
     fa512: Option<(KernelFn, u32, u32)>,
+    /// Exact packed BF16 HD256/GQA2 local attention. Class-3 segments launch here.
+    fa256_gqa2: Option<(KernelFn, u32, u32)>,
     _m_flash: Module,
     _m_gemm: Module,
     _m_fa512: Option<Module>,
+    _m_fa256_gqa2: Option<Module>,
 }
 
 impl SegPf {
@@ -5962,6 +5965,36 @@ impl GpuEngine {
                 } else {
                     None
                 };
+                let fa256_gqa2 = if crate::config::RuntimeConfig::get()
+                    .nv
+                    .pf_seg_fa256_gqa2
+                {
+                    if !packed_requests || packed.is_some_and(|p| p.version != 1) {
+                        return Err(RuntimeError::Rejected(
+                            "HD256/GQA2 attention segmentation requires packed BF16 KV metadata"
+                                .into(),
+                        ));
+                    }
+                    let file = format!("interp_{interp_tag}_{suffix}fa256_gqa2.cubin");
+                    let sym_name = format!("interp_{interp_tag}_{suffix}fa");
+                    let sym = format!("_Z{}{}11PlowProgram", sym_name.len(), sym_name);
+                    let global_suffix = format!("_{suffix}fa");
+                    let arena = format!("plow_arena_bytes{global_suffix}");
+                    let (module, function, smem, grid) =
+                        load(&file, &sym, &global_suffix, &arena)?;
+                    if be.module_global_u32(
+                        &module,
+                        "plow_attention_sm90_hd256_gqa2_abi",
+                    )? != Some(1)
+                    {
+                        return Err(RuntimeError::Rejected(format!(
+                            "{file} is missing HD256/GQA2 attention ABI 1"
+                        )));
+                    }
+                    Some((module, function, smem, grid))
+                } else {
+                    None
+                };
                 tracing::info!(
                     grid_flash = g1,
                     grid_gemm = g2,
@@ -5969,10 +6002,17 @@ impl GpuEngine {
                     smem_gemm = s2,
                     block_gemm = blk2,
                     fa512 = fa.is_some(),
+                    fa256_gqa2 = fa256_gqa2.is_some(),
                     "segmented prefill pair loaded"
                 );
                 let (m_fa, fa512) = match fa {
                     Some((m3, f3, s3, g3)) => (Some(m3), Some((f3, s3, g3))),
+                    None => (None, None),
+                };
+                let (m_fa256_gqa2, fa256_gqa2) = match fa256_gqa2 {
+                    Some((module, function, smem, grid)) => {
+                        (Some(module), Some((function, smem, grid)))
+                    }
                     None => (None, None),
                 };
                 let mut sp = SegPf {
@@ -5985,9 +6025,11 @@ impl GpuEngine {
                     block_gemm: blk2,
                     small_gemm,
                     fa512,
+                    fa256_gqa2,
                     _m_flash: m1,
                     _m_gemm: m2,
                     _m_fa512: m_fa,
+                    _m_fa256_gqa2: m_fa256_gqa2,
                 };
                 // PLOW_PF_SEG_EQSMEM=1 (T18): launch every object with the SAME dynamic-smem
                 // request (the max of the three). Alternating smem sizes between back-to-back
@@ -6001,6 +6043,9 @@ impl GpuEngine {
                         mx = mx.max(small.smem);
                     }
                     if let Some((_, s3, _)) = sp.fa512 {
+                        mx = mx.max(s3);
+                    }
+                    if let Some((_, s3, _)) = sp.fa256_gqa2 {
                         mx = mx.max(s3);
                     }
                     // Occupancy is per (function, BLOCK SIZE): the ws384 GEMM object
@@ -6023,6 +6068,10 @@ impl GpuEngine {
                     if let Some((f3, _, _)) = sp.fa512 {
                         let g3 = requery(f3, BLOCK)?;
                         sp.fa512 = Some((f3, mx, g3));
+                    }
+                    if let Some((f3, _, _)) = sp.fa256_gqa2 {
+                        let g3 = requery(f3, BLOCK)?;
+                        sp.fa256_gqa2 = Some((f3, mx, g3));
                     }
                     tracing::info!(
                         smem = mx,
@@ -6756,6 +6805,15 @@ impl GpuEngine {
                                     })?;
                                     (f3, g3, BLOCK, s3)
                                 }
+                                3 => {
+                                    let (f3, s3, g3) = sp.fa256_gqa2.ok_or_else(|| {
+                                        RuntimeError::Device(
+                                            "class-3 segment without the HD256/GQA2 object"
+                                                .into(),
+                                        )
+                                    })?;
+                                    (f3, g3, BLOCK, s3)
+                                }
                                 _ => sp.gemm(
                                     self.prefill[bi].small_gemm_segments.get(seg) == Some(&true),
                                 ),
@@ -6827,6 +6885,15 @@ impl GpuEngine {
                         RuntimeError::Device(
                             "class-2 (hd512 flash) segment but no interp_sm90a_pffa.cubin in \
                              PLOW_PF_SEG_DIR — unset PLOW_PF_SEG_FA512 or add the object"
+                                .into(),
+                        )
+                    })?;
+                    (f3, g3, s3, BLOCK)
+                } else if cls == 3 {
+                    let (f3, s3, g3) = sp.fa256_gqa2.ok_or_else(|| {
+                        RuntimeError::Device(
+                            "class-3 (HD256/GQA2 attention) segment but no matching object in \
+                             PLOW_PF_SEG_DIR"
                                 .into(),
                         )
                     })?;

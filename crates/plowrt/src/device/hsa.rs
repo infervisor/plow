@@ -2861,7 +2861,7 @@ impl HsaBackend {
             (self.shared.drv.hsa_signal_create)(live.len() as i64, 0, std::ptr::null(), &mut sig)
         };
         self.check(rc, "hsa_signal_create (dtod batch)")?;
-        for &&(dst, src, bytes) in &live {
+        for (issued, &&(dst, src, bytes)) in live.iter().enumerate() {
             let rc = unsafe {
                 (self.shared.drv.hsa_amd_memory_async_copy)(
                     dst as *mut c_void,
@@ -2878,6 +2878,8 @@ impl HsaBackend {
                 // Copies already issued still hold references to `sig`; wait them out before
                 // destroying it or the runtime writes into freed memory.
                 unsafe {
+                    // Rejected and unsubmitted copies will never decrement the signal.
+                    (self.shared.drv.hsa_signal_add_screlease)(sig, -((live.len() - issued) as i64));
                     (self.shared.drv.hsa_signal_wait_scacquire)(
                         sig,
                         HSA_SIGNAL_CONDITION_LT,
@@ -3152,8 +3154,7 @@ impl HsaBackend {
     /// never decrement, so the signal can no longer reach zero and a
     /// `wait(LT 1, u64::MAX)` would block the thread forever — a hang, not an
     /// error return. Subtracting the un-issued count restores the invariant the
-    /// wait depends on. (`memcpy_dtod_batch` above has this bug: it waits on a
-    /// signal that a mid-loop failure has left permanently short.)
+    /// wait depends on.
     pub fn memcpy_htod_pinned_batch(&self, pairs: &[(u64, &[u8])]) -> Result<()> {
         let live: Vec<&(u64, &[u8])> = pairs.iter().filter(|p| !p.1.is_empty()).collect();
         if live.is_empty() {
@@ -3598,6 +3599,10 @@ impl crate::memory::vmm::VmmOps for HsaBackend {
 
     fn copy_dtod(&self, dst: u64, src: u64, bytes: u64) -> Result<()> {
         self.memcpy_dtod(dst, src, bytes)
+    }
+
+    fn copy_dtod_batch(&self, pairs: &[(u64, u64, u64)]) -> Result<()> {
+        self.memcpy_dtod_batch(pairs)
     }
 
     fn pool_take(&self) -> Vec<(u64, u64)> {

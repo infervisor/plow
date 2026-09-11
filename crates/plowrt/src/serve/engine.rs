@@ -342,6 +342,34 @@ mod amd_serve {
     }
 
     impl Ranks {
+        fn shared_prefix_enabled(&self) -> bool {
+            match self {
+                Self::One(e) => e.shared_prefix_enabled(),
+                Self::Tp(g) => g.shared_prefix_enabled(),
+            }
+        }
+
+        fn attach_shared_prefix(&mut self, slot: usize, prompt: &[u32]) -> Result<u32> {
+            match self {
+                Self::One(e) => AmdEngine::attach_shared_prefixes(std::slice::from_mut(e), slot, prompt),
+                Self::Tp(g) => g.attach_shared_prefix(slot, prompt),
+            }
+        }
+
+        fn publish_shared_prefix(&self, slot: usize, prompt: &[u32], frontier: u32) -> Result<()> {
+            match self {
+                Self::One(e) => e.publish_shared_prefix(slot, prompt, frontier),
+                Self::Tp(g) => g.publish_shared_prefix(slot, prompt, frontier),
+            }
+        }
+
+        fn release_shared_prefix(&self, slot: usize) {
+            match self {
+                Self::One(e) => e.release_shared_prefix(slot),
+                Self::Tp(g) => g.release_shared_prefix(slot),
+            }
+        }
+
         fn prefix_cache_capable(&self) -> bool {
             match self {
                 Self::One(e) => e.prefix_cache_capable(),
@@ -1081,6 +1109,16 @@ mod amd_serve {
             if let Some(diagnostics) = self.diagnostics.as_mut() {
                 diagnostics.complete = false;
             }
+            if self.ranks.shared_prefix_enabled() && !self.decode_only && prompt.len() > 1 {
+                loop {
+                    if let Some(token) = self.prefill_chunked_at_most(slot, prompt, u32::MAX)? {
+                        if let Some(diagnostics) = self.diagnostics.as_mut() {
+                            if !diagnostics.overflowed { diagnostics.complete = true; }
+                        }
+                        return Ok(token);
+                    }
+                }
+            }
             if prompt.is_empty() {
                 return Err(RuntimeError::Rejected("empty prompt".into()));
             }
@@ -1283,7 +1321,17 @@ mod amd_serve {
                 // to be prefilled; chunking decides how that span is broken into ticks. Building
                 // the cursor from the cached plan is all it takes — they were alternatives only
                 // because the first cut of this function bailed out when the cache was on.
-                let (resume, arm) = self.plan_prefix(slot, prompt);
+                let shared = self.ranks.shared_prefix_enabled();
+                let (resume, arm) = if shared {
+                    (self.ranks.attach_shared_prefix(slot, prompt)?, 0)
+                } else {
+                    self.plan_prefix(slot, prompt)
+                };
+                if shared {
+                    // A later planning error must retire at a private row, not inside the attached prefix.
+                    self.pos[slot] = resume;
+                    self.live[slot] = false;
+                }
                 self.cached_rows[slot] = resume;
                 if resume == 0 {
                     self.invalidate_prefix(slot);
@@ -1292,7 +1340,7 @@ mod amd_serve {
                 let g = &mut self.ranks;
                 let (steps, snap_after) = {
                     if resume > 0 {
-                        g.restore_carried(slot)?;
+                        if !shared { g.restore_carried(slot)?; }
                         (g.plan_span_at_most(resume, n, max_bucket)?, None)
                     } else if arm > 0 {
                         let head = g.plan_span_at_most(0, arm, max_bucket)?;
@@ -1328,7 +1376,8 @@ mod amd_serve {
             prompt: &[u32],
             tick_max_bucket: u32,
         ) -> Result<Option<u32>> {
-            let chunked = self.chunk_prefill && !self.decode_only && prompt.len() > 1;
+            let chunked = (self.chunk_prefill || self.ranks.shared_prefix_enabled())
+                && !self.decode_only && prompt.len() > 1;
             if !chunked {
                 return self.prefill(slot, prompt).map(Some);
             }
@@ -1377,6 +1426,7 @@ mod amd_serve {
             }
             cur.next += 1;
             cur.frontier = step.c0 + step.clen;
+            g.publish_shared_prefix(slot, prompt, cur.frontier)?;
             if cur.next < cur.steps.len() {
                 return Ok(None);
             }
@@ -2281,6 +2331,7 @@ mod amd_serve {
         /// admission reuse it. The next request rewrites every row it reads.
         pub fn release(&mut self, slot: usize) {
             if slot < self.batch {
+                self.ranks.release_shared_prefix(slot);
                 self.live[slot] = false;
                 self.pos[slot] = if self.prefix_cache {
                     retired_prefix_position(self.pos[slot], self.pf[slot].as_ref(), self.max_ctx)
