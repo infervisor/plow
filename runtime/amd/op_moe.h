@@ -2201,7 +2201,24 @@ __device__ void d_moe_router_topk_pf(unsigned char* table, const bf16* logit, co
                                       * to `tid2eid` in a PLOW_MOE_PF_DET build. That is a
                                       * compile error here only because the types differ. */
                                      const int32_t* tid2eid = nullptr,
-                                     const int32_t* token_ids = nullptr
+                                     const int32_t* token_ids = nullptr,
+                                     /* SHARED-EXPERT FOLD (i5, PLOW_GLM_MOE_SHARED_FOLD). 0 on
+                                      * every blob emitted before it and on every decode blob.
+                                      *
+                                      * 1 makes this tail write `k+1` slots per token: the same
+                                      * top-k over the same `n_exp` logits, then a CONSTANT slot
+                                      * `{expert n_exp, gate 1.0f}`. GLM's shared expert is
+                                      * shape-identical to a routed expert and every token passes
+                                      * through it with weight 1, so as a routing SLOT it is
+                                      * exactly that — which is why the align/sort chain below and
+                                      * the fused MoE call need to know nothing about it beyond
+                                      * being told `n_exp+1` and `k+1`.
+                                      *
+                                      * The SELECTION is untouched, deliberately: the callee still
+                                      * sees `n_exp` and `k`, so a folded and an unfolded packet
+                                      * route every token to the same routed experts with the same
+                                      * gates, and differ only by the appended slot. */
+                                     unsigned shared_tail = 0
                                      ) {
 #if PLOW_MOE_PF_ATOMIC
     /* PLOW_MOE_PF_ATOMIC: zero the [T,H] f32 accumulator op 86 will atomically add into. This
@@ -2238,9 +2255,14 @@ __device__ void d_moe_router_topk_pf(unsigned char* table, const bf16* logit, co
         const bf16* lrow = (flags & 8u)
                                ? (const bf16*)((const float*)logit + (size_t)tok * n_exp)
                                : logit + (size_t)tok * n_exp;
-        d_moe_router_topk(table + (size_t)tok * k * 8, lrow, bias, n_exp, k, flags, route_scale,
+        unsigned char* trow = table + (size_t)tok * (k + shared_tail) * 8;
+        d_moe_router_topk(trow, lrow, bias, n_exp, k, flags, route_scale,
                           0, 1, lds, n_group, topk_group, tid2eid,
                           token_ids ? token_ids[tok] : 0);
+        if (shared_tail && threadIdx.x == 0) {
+            *(unsigned*)(trow + (size_t)k * 8) = n_exp;
+            *(float*)(trow + (size_t)k * 8 + 4) = 1.0f;
+        }
         __syncthreads(); /* the callee reuses `lds` for scores/keys on the next token */
     }
 }
@@ -4809,6 +4831,10 @@ __device__ void d_moe_group_down_pf(float* part, const bf16* fu, const unsigned 
  * op_gemm.h's capacity marker: any object built from this source HAS the arms. */
 extern "C" __device__ unsigned plow_moe_pf_part16_arm = 1;
 extern "C" __device__ unsigned plow_moe_pf_a8_arm = 1;
+/* Op 83's `i[5]` shared-expert tail. Same unconditional-marker reasoning, and the same silence
+ * without it: the `k+1`th slot would never be written, so the shared expert would drop out of a
+ * packet whose combine has already given up its `shared` operand. */
+extern "C" __device__ unsigned plow_moe_shared_fold_arm = 1;
 #if PLOW_MOE_PF_A4W4 && !defined(PLOW_MOE_A4W4_STAGE2_BENCH)
 extern "C" __device__ unsigned plow_moe_pf_a4w4_arm = 1;
 #endif

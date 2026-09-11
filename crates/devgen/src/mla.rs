@@ -1381,6 +1381,42 @@ fn glm_linear_fp8(enc: MoeEnc) -> bool {
     enc == MoeEnc::Fp8Blk && emit_config::active().glm_linear_fp8
 }
 
+/// `PLOW_GLM_MOE_SHARED_FOLD=1` — the shared expert becomes routed expert `n_exp` with a
+/// constant gate of 1.0, so the native MoE call runs top-(k+1) over n_exp+1 experts.
+///
+/// GLM's shared expert is shape-identical to one routed expert (`moe_intermediate_size` gate/up
+/// and down, the same `[128,128]` block-fp8 grid), and every token passes through it with weight
+/// 1. AITER and vLLM therefore fold it into the fused call as one extra expert — AITER's own
+/// GLM-5 gfx942 tuning table (`a8w8_blockscale_tuned_fmoe_glm5_1.csv`) is indexed by
+/// **expert 257, topk 9**, not 256/8, so the configuration plow already picks out of that table
+/// was tuned with the shared expert inside the call. plow instead ran it as two interpreter
+/// GEMMs — `GemmGlu` [T,256,6144] + `Gemm` [T,6144,256], 35 + 19 ms per 8192-row chunk at
+/// ~105 TF/s against the fused call's 530 — and the fold buys that back for the cost of one
+/// extra (token, expert) pair per token (+1/k on the fmoe k-loop).
+///
+/// THREE THINGS MOVE, and they have to move together:
+///   * the ROUTER writes a `k+1`th slot per token, `{expert n_exp, gate 1.0}` (`i[5]`), so the
+///     align/sort chain sees a genuine top-(k+1) table it can histogram without knowing why;
+///   * every `n_exp`/`k`-shaped buffer (`tab`, `moe_meta`, the three row maps, the expert
+///     pointer tables) is sized at `n_exp+1` / `k+1`;
+///   * the shared expert's own GLU/down packets are NOT emitted and `MoeCombinePf`'s `shared`
+///     operand becomes `TENSOR_NONE` (`d_moe_combine_pf` already spells "no shared" that way).
+///
+/// NOT bit-identical, and not only by reassociation: the shared expert stops being a bf16 GEMM
+/// pair and becomes block-fp8 W8 against the A8 activation quant the routed experts already use
+/// — the checkpoint's OWN fp8 bytes rather than the lite prep's bf16 dequant of them, which is
+/// what vLLM serves. Requires the native AITER MoE route (nothing else consumes a 257-entry
+/// table) and TP, not EP: under EP the routed experts are distributed whole across ranks while
+/// the shared expert is TP-sliced on every rank, so it has no single owner to be expert 256 of.
+fn glm_shared_fold(c: &GlmCfg, enc: MoeEnc) -> bool {
+    let cfg = emit_config::active();
+    cfg.glm_moe_shared_fold
+        && (cfg.glm_moe_aiter() || cfg.glm_moe_resident())
+        && enc == MoeEnc::Fp8Blk
+        && !c.ep
+        && c.tp > 1
+}
+
 /// OPT-IN (`PLOW_GLM_OFOLD=1`): the MlaMergeFold+o_proj fusion (fusion-audit seam 1).
 ///
 /// At prefill nsplit==1 the merge is exactly `oat = normalize(opart) × W_uv`, so the pair
@@ -1937,7 +1973,14 @@ pub(crate) fn declare_glm_rows_batched(
     // token-sorted, so the routing table, the [T,n_exp] logits, the shared-expert lanes and the
     // per-slot partials all carry T tokens); `fu`/`dfu` are the DECODE per-slot buffers and stay
     // one row — prefill's gathered equivalent is `fu_g` below, sized on the padded row bound.
-    let tab = ac(b, "tab", rows * tk as u64 * 8);
+    // PLOW_GLM_MOE_SHARED_FOLD widens the routing SLOT count (`k+1` per token: the top-k plus the
+    // constant shared slot) and the EXPERT count (`n_exp+1`) — `glm_shared_fold`. The router still
+    // scores only the `n_exp` routed experts, so `rlogit` is untouched. These are arena
+    // allocations shared with the decode programs, which keep routing top-k out of n_exp; a wider
+    // buffer is a superset for them.
+    let fold = glm_shared_fold(c, enc);
+    let (e_all, tk_all) = (e + u32::from(fold), tk + u32::from(fold));
+    let tab = ac(b, "tab", rows * tk_all as u64 * 8);
     let rlogit = ac(b, "rlogit", rows * e as u64 * BF16); // router score output [T][n_exp] bf16
     let shfu = ac(b, "shfu", rows * imoe_l as u64 * BF16);
     // The `up` half of the shared expert's GLU. Needed on the MXFP4 PREFILL arm, where the absence
@@ -1979,7 +2022,7 @@ pub(crate) fn declare_glm_rows_batched(
     // device write with no symptom at low expert counts and a guaranteed one at 384.
     let (meta, row_token, row_partidx, row_gate, fu_g, fu_scale) =
         if rows > 1 || emit_config::active().glm_moe_resident() {
-            let pad_rows = rows * tk as u64 + (e * (MPF_BM - 1)) as u64;
+            let pad_rows = rows * tk_all as u64 + (e_all * (MPF_BM - 1)) as u64;
             // The gathered GLU output is bf16 on the bf16/block-fp8 arms and PACKED fp4 under A4W4 —
             // half a byte per value plus one E8M0 byte per 32. The buffer is sized for whichever the
             // packet asks for; the fp4 form is SMALLER, so a bf16-sized allocation would merely waste,
@@ -1991,12 +2034,12 @@ pub(crate) fn declare_glm_rows_batched(
             };
             const ALIGN_BLOCKS: u64 = 64;
             let align_extra = if emit_config::active().moe_align_par && rows >= 1024 {
-                ALIGN_BLOCKS * e as u64
+                ALIGN_BLOCKS * e_all as u64
             } else {
                 0
             };
             (
-                ac(b, "moe_meta", ((3 * e + 1) as u64 + align_extra) * I32),
+                ac(b, "moe_meta", ((3 * e_all + 1) as u64 + align_extra) * I32),
                 ac(b, "moe_rowtok", pad_rows * I32),
                 ac(b, "moe_rowpart", pad_rows * I32),
                 ac(b, "moe_rowgate", pad_rows * F32),
@@ -2534,13 +2577,22 @@ pub(crate) fn declare_glm_rows_batched(
                     imoe_l as u64,
                 )
             },
+            // `_sf` under PLOW_GLM_MOE_SHARED_FOLD: same [E][3] u64 layout, one entry LONGER, and
+            // its last entry is the SHARED expert. The suffix is the whole signal the loader gets
+            // — `bind_packed_experts` resolves `{gate,up,down}` for entry `n_exp` under
+            // `shared_experts.` instead of `experts.{e}.` — and it follows the `_ep` / `_pf` /
+            // `_moe2` companion-table convention already in this table.
             ewt: if dense {
                 TENSOR_NONE
+            } else if fold {
+                t(b, "mlp.expert_weight_table_sf", (e_all * 3) as u64 * 8)
             } else {
                 t(b, "mlp.expert_weight_table", (e * 3) as u64 * 8)
             },
             est: if dense {
                 TENSOR_NONE
+            } else if fold {
+                t(b, "mlp.expert_scale_table_sf", (e_all * 3) as u64 * 8)
             } else {
                 t(b, "mlp.expert_scale_table", (e * 3) as u64 * 8)
             },
@@ -5891,6 +5943,18 @@ fn emit_glm_moe_ffn_prefill(
             "PLOW_GLM_MOE_AITER requires gfx942 TP8 GLM block-FP8 prefill, rows 1..8192"
         );
     }
+    // PLOW_GLM_MOE_SHARED_FOLD — see `glm_shared_fold`. `e_all`/`tk_all` are what the ROUTING
+    // chain (router tail -> align -> the fused call) is shaped for; `e`/`tk` stay what the router
+    // SCORES, because the [T, n_exp] logit matrix has no column for the shared expert.
+    let fold = glm_shared_fold(c, enc);
+    assert!(
+        !fold || native_moe,
+        "PLOW_GLM_MOE_SHARED_FOLD needs the native MoE route: nothing else reads a {}-entry \
+         expert table or a top-{} routing slot",
+        e + 1,
+        tk + 1
+    );
+    let (e_all, tk_all) = (e + u32::from(fold), tk + u32::from(fold));
     let det = !native_moe && moe_pf_fuse(tk) == MoePfFuse::Det;
     let align_par = emit_config::active().moe_align_par && t >= 1024;
     let router_blocks: Vec<_> = (0..t.min(n_cu)).collect();
@@ -5906,6 +5970,11 @@ fn emit_glm_moe_ffn_prefill(
         d.i[2] = tk;
         d.i[3] = GLM_ROUTER_FLAGS;
         d.i[4] = t;
+        // PLOW_GLM_MOE_SHARED_FOLD: the table stride becomes k+1 slots per token and the tail
+        // slot is written `{expert n_exp, gate 1.0}`. The SELECTION is untouched — the same
+        // top-k over the same n_exp logits, so a folded and an unfolded packet route every token
+        // to the same routed experts and differ only by the appended constant slot.
+        d.i[5] = u32::from(fold);
         // Same group operands as the decode tail — the prefill kernel is that kernel under a token
         // loop, so an emitter that set them on one and not the other would make prefill and decode
         // route the same token to DIFFERENT experts.
@@ -5921,8 +5990,8 @@ fn emit_glm_moe_ffn_prefill(
             d.t[3] = n.row_partidx;
             d.t[4] = n.row_gate;
             d.i[0] = t;
-            d.i[1] = e;
-            d.i[2] = tk;
+            d.i[1] = e_all;
+            d.i[2] = tk_all;
             d.i[3] = phase;
             d.i[4] = u32::from(phase != 0) * 64;
         })
@@ -5954,8 +6023,13 @@ fn emit_glm_moe_ffn_prefill(
     // sets on top of two accumulators and cannot be built at 8 waves (see `d_gemm_fp8_blk`'s note
     // on why that family has one tile rung at all). MXFP4 has no such cost — its E8M0 scale folds
     // into the cvt exactly — which is why the fp4 arm falls out and the block-fp8 one does not.
+    // PLOW_GLM_MOE_SHARED_FOLD: the shared expert is expert `e` of the fused call now, so these
+    // two packets — the 54 ms per 8192-row chunk the fold exists to remove — are not emitted and
+    // the combine's `shared` operand goes away with them.
     let lin_fp8 = glm_linear_fp8(enc);
-    let c_shglu = if enc == MoeEnc::Mxfp4 && glu_fusion_wins_mxfp4(t, imoe_l, h, n_cu) {
+    let c_shglu = if fold {
+        c_rn2
+    } else if enc == MoeEnc::Mxfp4 && glu_fusion_wins_mxfp4(t, imoe_l, h, n_cu) {
         b.emit(DevOp::GemmGluMxfp4, all.clone(), &[c_rn2], |d| {
             d.t[0] = n.shfu;
             d.t[1] = n.xn2;
@@ -6022,7 +6096,9 @@ fn emit_glm_moe_ffn_prefill(
         })
     };
     // 17 shared expert down — row-parallel (imoe_l input): a PARTIAL [T,H] under TP.
-    let c_shd = if lin_fp8 {
+    let c_shd = if fold {
+        c_shglu
+    } else if lin_fp8 {
         emit_pf_gemm_fp8_blk(
             b,
             &all,
@@ -6053,7 +6129,7 @@ fn emit_glm_moe_ffn_prefill(
                 n.row_partidx,
                 n.row_gate,
             ];
-            d.i = [t, h, imoe_e, e, tk, 64, 2, u32::from(resident)];
+            d.i = [t, h, imoe_e, e_all, tk_all, 64, 2, u32::from(resident)];
         });
         b.isolate(counter);
         counter
@@ -6141,7 +6217,9 @@ fn emit_glm_moe_ffn_prefill(
                     // (7.5 GB per 8k chunk over 75 MoE layers) to add 0.0f. Bit-identical by
                     // inspection of that ternary, and it removes one of this op's four streams.
                     d.t[1] = TENSOR_NONE;
-                    d.t[2] = n.shared;
+                    // Under the fold the shared expert is inside `part`; `d_moe_combine_pf`
+                    // already spells "no shared partial" as a null pointer (`if (shared)`).
+                    d.t[2] = if fold { TENSOR_NONE } else { n.shared };
                     d.t[3] = n.part;
                     d.i[0] = h;
                     // PLOW_MOE_PF_DET: op 86 already summed the k slots in place, so this
@@ -6196,7 +6274,7 @@ fn emit_glm_moe_ffn_prefill(
         b.emit(DevOp::MoeCombinePf, all.clone(), &[c_shd, c_d], |d| {
             d.t[0] = if raw_output { n.attn } else { x_out };
             d.t[1] = if raw_output { TENSOR_NONE } else { n.xmid };
-            d.t[2] = n.shared;
+            d.t[2] = if fold { TENSOR_NONE } else { n.shared }; // see the banded twin
             d.t[3] = n.part;
             d.i[0] = h;
             d.i[1] = if det || native_moe { 1 } else { tk }; // see the banded twin
@@ -6768,6 +6846,12 @@ fn emit_glm_moe_ffn_rows(
             "flat GLM MoE requires gfx942 TP8 H6144/I256/E256/top8"
         );
     }
+    // PLOW_GLM_MOE_SHARED_FOLD is a PREFILL fold: decode keeps its own shared-expert GEMV pair
+    // (one row has no reuse to win back), and expert `e` is simply never selected here. What the
+    // decode route must agree on is the TABLE LENGTH — `i[3]` is what `bind_packed_experts` sizes
+    // the packed slab from, and a decode instruction claiming 256 against a 257-entry table would
+    // make the two disagree about which allocation the pointers describe.
+    let e_all = e + u32::from(glm_shared_fold(c, enc));
     let det = !flat && moe_pf_fuse(tk) == MoePfFuse::Det;
     // PLOW_GLM_DECODE_GLUE_CUS: the top-k tail is block-per-token, so `rows` workgroups is
     // its saturation point (the prefill twin already sizes it so); the combine saturates at
@@ -6953,7 +7037,7 @@ fn emit_glm_moe_ffn_rows(
                 TENSOR_NONE,
                 TENSOR_NONE,
             ];
-            d.i = [rows, h, imoe_e, e, tk, 0, 1, u32::from(resident)];
+            d.i = [rows, h, imoe_e, e_all, tk, 0, 1, u32::from(resident)];
         });
         b.isolate(counter);
         counter

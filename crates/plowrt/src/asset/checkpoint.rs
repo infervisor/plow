@@ -38,6 +38,16 @@ pub struct Checkpoint {
     shards: Vec<(memmap2::Mmap, usize)>, // (map, data-section offset)
     /// name → where the bytes are, and what shape they are.
     index: FxHashMap<String, Entry>,
+    /// The entry a later shard SHADOWED, for names that appear twice.
+    ///
+    /// `scripts/glm52_prep_lite.py` is built on the shadowing rule ([`Self::open`] scans in
+    /// sorted order and the last insert wins): it symlinks the raw `model-*` shards and writes
+    /// only the dequantised tensors into `zz-derived-*`, so a name like
+    /// `…shared_experts.gate_proj.weight` resolves to a BF16 dequant while the checkpoint's own
+    /// block-FP8 payload is still mapped underneath it. A consumer that wants the QUANTIZED
+    /// bytes — the shared-expert fold, which puts that projection into the packed expert slab
+    /// the fused FP8 MoE call reads — has no other way to name them. See [`Self::fp8_tensor_ex`].
+    shadowed: FxHashMap<String, Entry>,
 }
 
 /// One tensor's location and shape.
@@ -82,6 +92,7 @@ impl Checkpoint {
         tracing::info!(dir = %dir.display(), "opening safetensors checkpoint...");
         let mut shards = Vec::new();
         let mut index = FxHashMap::default();
+        let mut shadowed = FxHashMap::default();
 
         let t_scan = std::time::Instant::now();
         let mut paths: Vec<_> = std::fs::read_dir(dir)
@@ -141,7 +152,7 @@ impl Checkpoint {
             let t_idx = std::time::Instant::now();
             index.reserve(tensors.len());
             for (name, info) in tensors {
-                index.insert(
+                let previous = index.insert(
                     name.clone(),
                     Entry {
                         shard,
@@ -151,6 +162,9 @@ impl Checkpoint {
                         dtype: info.dtype,
                     },
                 );
+                if let Some(old) = previous {
+                    shadowed.insert(name, old);
+                }
             }
             if let Some(t) = timing.as_mut() {
                 t.index_ms += t_idx.elapsed().as_secs_f64() * 1e3;
@@ -163,7 +177,11 @@ impl Checkpoint {
             ms = format!("{:.0}", t0.elapsed().as_secs_f64() * 1e3).as_str(),
             "checkpoint ready (all shards mmap'd)"
         );
-        Ok(Checkpoint { shards, index })
+        Ok(Checkpoint {
+            shards,
+            index,
+            shadowed,
+        })
     }
 
     /// [`Self::open`] plus an optional weight TWIN directory (e.g. the fp8 e4m3 twins
@@ -177,7 +195,13 @@ impl Checkpoint {
             ck.shards.extend(tw.shards);
             for (name, mut e) in tw.index {
                 e.shard += base;
-                ck.index.insert(name, e);
+                if let Some(old) = ck.index.insert(name.clone(), e) {
+                    ck.shadowed.insert(name, old);
+                }
+            }
+            for (name, mut e) in tw.shadowed {
+                e.shard += base;
+                ck.shadowed.entry(name).or_insert(e);
             }
             tracing::info!(twin = %t.display(), tensors = ck.index.len(), "checkpoint twin merged");
         }
@@ -200,6 +224,23 @@ impl Checkpoint {
     /// staging decode drop its neg-0 mask (runtime/amd/op_moe.h).
     pub fn is_fp8_e4m3(&self, name: &str) -> bool {
         self.index.get(name).is_some_and(|e| e.fp8)
+    }
+
+    /// The **block-FP8** spelling of `name`, whichever shard holds it.
+    ///
+    /// `None` unless some shard stores this exact name as `F8_E4M3`. The lite prep shadows a few
+    /// quantized projections with BF16 dequants of themselves (see [`Self::shadowed`]), so the
+    /// resolved entry can be either the visible one or the one under it; a consumer that needs
+    /// the checkpoint's own quantized bytes — the shared-expert fold, which packs that projection
+    /// into the expert slab the fused FP8 MoE call reads — must ask for them explicitly rather
+    /// than take whatever [`Self::tensor_ex`] happens to resolve to.
+    pub fn fp8_tensor_ex(&self, name: &str) -> Option<(&[u8], &[usize])> {
+        let e = [self.index.get(name), self.shadowed.get(name)]
+            .into_iter()
+            .flatten()
+            .find(|e| e.fp8)?;
+        let (map, off) = &self.shards[e.shard];
+        Some((map.get(off + e.range.start..off + e.range.end)?, &e.shape))
     }
 
     /// Tensor bytes **and** shape — what a row-parallel shard needs.

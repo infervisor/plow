@@ -612,6 +612,14 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_MOE_RESIDENT", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_moe_resident: Option<bool>,
 
+    /// Fold GLM's shared expert into the native MoE call as routed expert `n_exp` with a constant
+    /// gate of 1.0, so the router's top-k becomes an effective top-(k+1). What AITER's own GLM-5
+    /// gfx942 tuning table already assumes (its rows are indexed 257/9, not 256/8). Requires the
+    /// native AITER MoE prefill route; the shared expert then runs in block-FP8 out of the packed
+    /// expert slab instead of as two bf16 interpreter GEMMs, which is NOT bit-identical.
+    #[arg(long, env = "PLOW_GLM_MOE_SHARED_FOLD", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_moe_shared_fold: bool,
+
     /// Emit one token-batch BODY program per prefill bucket wider than the decode band: the
     /// bucket's packed-prefill topology plus the batched decode attention chain and tail over a
     /// slot-indexed band of `decode_rungs().last()` rows (`plans/unified-token-batch.md`, "AMD
@@ -1158,6 +1166,7 @@ impl EmitConfig {
             glm_moe_flat_decode: env_bool("PLOW_GLM_MOE_FLAT_DECODE"),
             glm_mla_dec_aiter: env_bool("PLOW_GLM_MLA_DEC_AITER"),
             glm_moe_resident: env_bool_opt("PLOW_GLM_MOE_RESIDENT"),
+            glm_moe_shared_fold: env_bool("PLOW_GLM_MOE_SHARED_FOLD"),
             token_batch_tp: env_bool("PLOW_TOKEN_BATCH_TP"),
             packed_sparse_pf: env_bool("PLOW_PACKED_SPARSE_PF"),
             glm_index_tp: env_bool_opt("PLOW_GLM_INDEX_TP"),

@@ -371,6 +371,10 @@ pub(super) const PREFILL_ARM_MARKERS: &[(&str, &[&str])] = &[
     // ns packets at the nsplit=1 partial layout while the merge reads ns — refuse.
     ("PLOW_MLA_PF_NS", &["plow_mla_pf_ns_arm"]),
     ("PLOW_MOE_PF_A8", &["plow_moe_pf_a8_arm"]),
+    // Op 83's `i[5]` shared-expert tail (PLOW_GLM_MOE_SHARED_FOLD). Unconditional arm, so the
+    // marker IS the test: no marker means the object predates the fold and would drop the
+    // shared expert entirely. See `packet_prefill_arm_requirements`.
+    ("PLOW_MOE_SHARED_FOLD", &["plow_moe_shared_fold_arm"]),
     // T11 GLU-into-quant fold (QUANT_FP8 t3=gate t4=up i2=act). The emitter DELETES the `Glu`
     // packet when it folds, and the AMD dispatch ignored t3/t4 for its entire life — so a folded
     // packet quantized an `fu` nothing had written, the FFN output was whatever was in the buffer,
@@ -943,6 +947,13 @@ pub(super) fn packet_prefill_arm_requirements<'a>(
     }
     if insts().any(|inst| inst.op == DevOp::MoeGroupGluPf as u16 && inst.i[7] != 0) {
         requires.push("PLOW_MOE_PF_A8=1".to_owned());
+    }
+    // The shared-expert fold's constant `k+1`th routing slot (op 83 i[5]). An object without the
+    // arm writes only the top-k slots, so the shared expert — which every token passes through —
+    // silently VANISHES from the FFN while the packet's `MoeCombinePf` has already given up its
+    // `shared` operand. The model stays fluent and is wrong; refuse instead.
+    if insts().any(|inst| inst.op == DevOp::MoeRouterTopkPf as u16 && inst.i[5] != 0) {
+        requires.push("PLOW_MOE_SHARED_FOLD=1".to_owned());
     }
     if insts().any(|inst| {
         inst.op == DevOp::FlashMlaPrefill as u16

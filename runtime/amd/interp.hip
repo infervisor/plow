@@ -4678,6 +4678,10 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                                  ,
                                  (double*)TEN(2), in->i[0]
 #endif
+                                 /* tid2eid / token_ids are DSV4 hash routing (unread here);
+                                  * i5 = the shared-expert fold's constant `k+1`th slot. */
+                                 ,
+                                 nullptr, nullptr, in->i[5]
             );
             break;
         case PLOW_DOP_MOE_ALIGN_PF:

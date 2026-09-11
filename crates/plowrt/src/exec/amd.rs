@@ -3924,12 +3924,27 @@ struct ExpertNames {
 }
 
 impl ExpertNames {
-    fn weight_of(&self, e: u32, j: usize) -> String {
-        format!("{}{e}.{}{}", self.ns, self.proj[j], self.payload)
+    /// `shared`: name the SHARED expert instead of routed expert `e`.
+    ///
+    /// GLM spells it `…mlp.shared_experts.{gate,up,down}_proj.*` beside
+    /// `…mlp.experts.{e}.{gate,up,down}_proj.*`, so the substitution is exactly `experts.{e}.`
+    /// -> `shared_experts.` and everything after it — projection name, payload suffix, scale
+    /// suffix — is the routed spelling unchanged. Only the shared-expert fold passes `true`,
+    /// and only for the last table entry.
+    fn projection(&self, e: u32, j: usize, shared: bool, suffix: &str) -> String {
+        let ns = match self.ns.strip_suffix("experts.") {
+            Some(base) if shared => format!("{base}shared_experts."),
+            _ => format!("{}{e}.", self.ns),
+        };
+        format!("{ns}{}{suffix}", self.proj[j])
     }
 
-    fn scale_of(&self, e: u32, j: usize) -> String {
-        format!("{}{e}.{}{}", self.ns, self.proj[j], self.scale)
+    fn weight_of(&self, e: u32, j: usize, shared: bool) -> String {
+        self.projection(e, j, shared, self.payload)
+    }
+
+    fn scale_of(&self, e: u32, j: usize, shared: bool) -> String {
+        self.projection(e, j, shared, self.scale)
     }
 
     /// Is the scale an MX microscaling row (one E8M0 byte per 32 elements along
@@ -4024,7 +4039,7 @@ fn check_expert_geometry(
         ))
     };
     for j in 0..3 {
-        let (wn, sn) = (n.weight_of(0, j), n.scale_of(0, j));
+        let (wn, sn) = (n.weight_of(0, j, false), n.scale_of(0, j, false));
         let (w, ws) = ckpt.tensor_ex(&wn).ok_or_else(|| miss(&wn))?;
         let (s, ss) = ckpt.tensor_ex(&sn).ok_or_else(|| miss(&sn))?;
         let bad = |m: String| {
@@ -4083,6 +4098,26 @@ fn check_expert_geometry(
     }
     Ok(())
 }
+
+/// One entry of the per-layer expert gather plan.
+///
+/// `(name, dst, bytes, scrub, pf_dst, pf_rows, pf_kbytes, moe2_dst, moe2_rows, moe2_kbytes,
+/// moe2_scale, fp8_spelling)`. See `bind_packed_experts`, which builds it, and
+/// `gather_expert_entry`, which consumes it.
+type ExpertEntry = (
+    String,
+    u64,
+    u64,
+    bool,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    bool,
+    bool,
+);
 
 /// One expert plan entry gathered on a worker, minus the ring push.
 ///
@@ -4193,25 +4228,50 @@ fn expert_gather_threads(n_gpu: u32) -> usize {
 /// worker — and all device interaction stays with the caller.
 fn gather_expert_entry<'a>(
     ckpt: &'a crate::asset::checkpoint::Checkpoint,
-    entry: &(String, u64, u64, bool, u64, u64, u64, u64, u64, u64, bool),
+    entry: &ExpertEntry,
     shard_rank: u32,
     shard_n: u32,
     populate: bool,
     do_prefault: bool,
     resident: bool,
 ) -> Result<GatheredExpert<'a>> {
-    let (name, dst, want, scrub, pf_dst, pf_rows, pf_k, moe2_dst, moe2_rows, moe2_k, moe2_scale) =
-        entry;
-    let (src, shape) = ckpt
-        .tensor_ex(name)
-        .ok_or_else(|| RuntimeError::Device(format!("MISSING EXPERT WEIGHT: {name}")))?;
-    if populate {
+    let (
+        name,
+        dst,
+        want,
+        scrub,
+        pf_dst,
+        pf_rows,
+        pf_k,
+        moe2_dst,
+        moe2_rows,
+        moe2_k,
+        moe2_scale,
+        fp8_spelling,
+    ) = entry;
+    // `fp8_spelling`: take the checkpoint's OWN block-FP8 bytes for this name even if a later
+    // shard shadows it with a BF16 dequant. Only the shared-expert fold's entries set it — the
+    // lite prep dequantises `shared_experts.*` (it only filters `experts.{e}.*` out of its
+    // derived shards), and packing a BF16 payload into the FP8 expert slab would be a
+    // half-sized-operand read, not a precision question. The prefetch hints below resolve by
+    // name and would fault in the shadow instead, so they are skipped for these.
+    let (src, shape) = if *fp8_spelling {
+        ckpt.fp8_tensor_ex(name).ok_or_else(|| {
+            RuntimeError::Device(format!(
+                "MISSING EXPERT WEIGHT: {name} has no block-FP8 spelling in this checkpoint.                  The shared-expert fold packs it into the FP8 expert slab, so a BF16-only                  checkpoint cannot serve a folded packet."
+            ))
+        })?
+    } else {
+        ckpt.tensor_ex(name)
+            .ok_or_else(|| RuntimeError::Device(format!("MISSING EXPERT WEIGHT: {name}")))?
+    };
+    if populate && !fp8_spelling {
         if let Some(s) = weight_span(ckpt, name, *want, shard_rank, shard_n) {
             ckpt.populate(s);
         }
     }
     let mut fault_ns = 0u64;
-    if do_prefault {
+    if do_prefault && !fp8_spelling {
         if let Some(s) = touched(ckpt, name, *want, shard_rank, shard_n) {
             fault_ns = prefault_ns(s);
         }
@@ -4293,17 +4353,24 @@ fn bind_packed_experts(
     populate: bool,
     resident_tables: &[Option<u16>],
 ) -> Result<(Vec<DeviceMem>, u64, Vec<(u16, amd_moe_aiter::ResidentWeights)>)> {
-    let layers: Vec<(usize, String, bool)> = blob
+    // `_sf` is PLOW_GLM_MOE_SHARED_FOLD's spelling of the same `[E][3]` u64 table, one entry
+    // longer, whose LAST entry is the shared expert rather than a routed one. The suffix is the
+    // whole signal: the packet has already given up its `shared_experts.*` GEMM packets and its
+    // combine's `shared` operand, so this loop is what has to put those weights where the fused
+    // call will look for them.
+    let layers: Vec<(usize, String, bool, bool)> = blob
         .tensors
         .iter()
         .enumerate()
         .filter_map(|(i, td)| {
             if let Some(pfx) = td.name.strip_suffix("expert_weight_table_ep") {
-                Some((i, pfx.to_string(), true))
+                Some((i, pfx.to_string(), true, false))
+            } else if let Some(pfx) = td.name.strip_suffix("expert_weight_table_sf") {
+                Some((i, pfx.to_string(), false, true))
             } else {
                 td.name
                     .strip_suffix("expert_weight_table")
-                    .map(|pfx| (i, pfx.to_string(), false))
+                    .map(|pfx| (i, pfx.to_string(), false, false))
             }
         })
         .collect();
@@ -4376,10 +4443,12 @@ fn bind_packed_experts(
     // the resolved answer belongs in the record rather than in a debug session.
     let mut layout = String::from("none");
     let mut wbytes = 0u64;
-    for (i_ewt, pfx, ep_table) in &layers {
+    for (i_ewt, pfx, ep_table, shared_fold) in &layers {
         let resident = resident_tables[*i_ewt].is_some();
         let table_suffix = if *ep_table {
             "expert_scale_table_ep"
+        } else if *shared_fold {
+            "expert_scale_table_sf"
         } else {
             "expert_scale_table"
         };
@@ -4411,7 +4480,7 @@ fn bind_packed_experts(
         check_expert_geometry(ckpt, &en)?;
         layout = format!("{}{{gate,up,down}}{}+{}", en.ns, en.payload, en.scale);
         // Geometry from expert 0; every expert in a layer is the same shape.
-        let probe = en.weight_of(0, 0);
+        let probe = en.weight_of(0, 0, false);
         let (w0, shape0) = ckpt
             .tensor_ex(&probe)
             .ok_or_else(|| RuntimeError::Device(format!("MISSING EXPERT WEIGHT: {probe}")))?;
@@ -4439,7 +4508,7 @@ fn bind_packed_experts(
         let n_local = owned.len() as u64;
         // Slot strides: what ONE {expert, proj} occupies in the packed buffer.
         let w_stride = w0.len() as u64 / if whole { 1 } else { n_gpu as u64 };
-        let s_probe = en.scale_of(0, 0);
+        let s_probe = en.scale_of(0, 0, false);
         let s_stride = ckpt
             .tensor_ex(&s_probe)
             .ok_or_else(|| RuntimeError::Device(format!("MISSING EXPERT SCALE: {s_probe}")))?
@@ -4447,7 +4516,34 @@ fn bind_packed_experts(
             .len() as u64
             / if whole { 1 } else { n_gpu as u64 };
 
-        if resident && (*ep_table || whole || n_gpu != 8 || n_exp != 256
+        // The fold's own preconditions, checked where the checkpoint is: TP (under EP the routed
+        // experts are whole per rank while the shared expert is sliced on every rank, so there is
+        // no rank that owns it), the routed geometry AITER's 257/9 table is for, and — the one
+        // that actually bites on a lite-prepped dir — a block-FP8 shared expert the slab can hold.
+        if *shared_fold {
+            if whole || n_exp != 257 {
+                return Err(RuntimeError::Device(format!(
+                    "{pfx}: the shared-expert fold is a TP construction over 257 entries, not                      EP over {n_exp}"
+                )));
+            }
+            for j in 0..3 {
+                let (name, want) = (en.weight_of(n_exp - 1, j, true), w0.len());
+                let (bytes, shape) = ckpt.fp8_tensor_ex(&name).ok_or_else(|| {
+                    RuntimeError::Device(format!(
+                        "{pfx}: the shared-expert fold needs `{name}` as block-FP8. This                          checkpoint has no FP8 spelling of it — `glm52_prep_lite.py` filters                          only `experts.{{e}}.*` out of its dequantised shards, so a prep that                          also dropped the shared expert is what a folded packet needs."
+                    ))
+                })?;
+                let routed = ckpt.tensor_ex(&en.weight_of(0, j, false)).map(|(_, s)| s);
+                if bytes.len() != want || Some(shape) != routed {
+                    return Err(RuntimeError::Device(format!(
+                        "{pfx}: `{name}` is {:?} ({} B) but routed expert 0's same projection is                          {routed:?} ({want} B); the fold routes the shared expert AS a routed                          expert and cannot reshape it",
+                        shape,
+                        bytes.len()
+                    )));
+                }
+            }
+        }
+        if resident && (*ep_table || whole || n_gpu != 8 || !(256..=257).contains(&n_exp)
             || i_moe != 256 || en.microscaled() || shape0 != [2048, 6144]
             || w_stride != 256 * 6144 || s_stride != 96 * 4
             || resident_tables[*i_ewt] != Some(i_est as u16))
@@ -4459,9 +4555,9 @@ fn bind_packed_experts(
         let d_s = EngineDevice::alloc(be, (n_local * 3 * s_stride).max(1))?;
         LoadProf::add(&prof.alloc_ns, t_alloc);
         let (wtab, stab) = if resident {
-            resident_weights.push((*i_ewt as u16, amd_moe_aiter::ResidentWeights::new(d_w.base, d_s.base)));
-            (amd_moe_aiter::resident_expert_table(d_w.base, w_stride),
-             amd_moe_aiter::resident_expert_table(d_s.base, s_stride))
+            resident_weights.push((*i_ewt as u16, amd_moe_aiter::ResidentWeights::new(d_w.base, d_s.base, n_local)));
+            (amd_moe_aiter::resident_expert_table(d_w.base, w_stride, n_local),
+             amd_moe_aiter::resident_expert_table(d_s.base, s_stride, n_local))
         } else {
             (crate::orch::moe::packed_expert_table(d_w.base, w_stride, n_exp, owned.clone()),
              crate::orch::moe::packed_expert_table(d_s.base, s_stride, n_exp, owned.clone()))
@@ -4563,9 +4659,14 @@ fn bind_packed_experts(
         // preshuffled copy (scale entries, or the pf table not declared). Geometry per
         // projection: gate/up are [I_moe][K] row-major shards, down is [H][I_moe] — in both
         // cases the shard is [rows][kbytes] with rows*kbytes == w_stride.
-        let mut plan: Vec<(String, u64, u64, bool, u64, u64, u64, u64, u64, u64, bool)> =
+        let mut plan: Vec<ExpertEntry> =
             Vec::with_capacity(owned.len() * 6);
         for e in owned {
+            // The shared-expert fold makes the LAST table entry the shared expert: same three
+            // projections, same [128,128] block-fp8 grid, same TP slice — it is shape-identical
+            // to a routed expert, which is the whole reason it can be routed as one — but under
+            // `shared_experts.` instead of `experts.{e}.`, and taken in its quantized spelling.
+            let shared = *shared_fold && e == n_exp - 1;
             for j in 0..3 {
                 let idx = e as usize * 3 + j;
                 let (pf_rows, pf_k) = if j < 2 {
@@ -4584,7 +4685,7 @@ fn bind_packed_experts(
                 };
                 let down_groups = i_moe / 32;
                 plan.push((
-                    en.weight_of(e, j),
+                    en.weight_of(e, j, shared),
                     wtab[idx],
                     w_stride,
                     scrub_w,
@@ -4595,9 +4696,10 @@ fn bind_packed_experts(
                     down_rows,
                     down_kbytes,
                     false,
+                    shared,
                 ));
                 plan.push((
-                    en.scale_of(e, j),
+                    en.scale_of(e, j, shared),
                     stab[idx],
                     s_stride,
                     false,
@@ -4608,6 +4710,9 @@ fn bind_packed_experts(
                     down_rows,
                     down_groups,
                     true,
+                    // The scale grid is f32 and the lite prep never rewrites it, so the
+                    // ordinary name already resolves to the checkpoint's own.
+                    false,
                 ));
             }
         }
@@ -8368,10 +8473,23 @@ impl AmdEngine {
                 .map(|p| p.t)
                 .max()
                 .unwrap();
+            // The expert TABLE length (i[3]), which is 257 under the shared-expert fold and 256
+            // otherwise. Every native MoE instruction in the blob carries the same one — the
+            // route validator refuses a program where prefill and decode disagree — so taking the
+            // max is taking the only value there is, and the workspace is carved for it.
+            let n_exp = blob
+                .progs
+                .iter()
+                .flat_map(|p| &p.insts)
+                .filter(|d| d.op == DevOp::MoeAiterFp8Pf as u16)
+                .map(|d| d.i[3])
+                .max()
+                .unwrap();
             Some(amd_moe_aiter::MoeAiter::load(
                 &be,
                 hsaco_dir,
                 rows.max(128),
+                n_exp,
                 blob.decode_phase().any(has_moe_aiter),
                 use_resident_moe,
                 crate::config::RuntimeConfig::get()

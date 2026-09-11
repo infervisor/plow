@@ -82,11 +82,11 @@ fn block_fp8_resolves_to_exactly_the_names_it_always_did() {
     assert_eq!(en.scale, ".weight_scale_inv");
     assert!(!en.microscaled());
     assert_eq!(
-        en.weight_of(0, 0),
+        en.weight_of(0, 0, false),
         "model.layers.3.mlp.experts.0.gate_proj.weight"
     );
     assert_eq!(
-        en.scale_of(0, 2),
+        en.scale_of(0, 2, false),
         "model.layers.3.mlp.experts.0.down_proj.weight_scale_inv"
     );
     check_expert_geometry(&c, &en).unwrap();
@@ -147,7 +147,7 @@ fn mixtral_mxfp4_resolves_namespace_projections_and_payload_together() {
     assert_eq!(en.proj, ["w1", "w3", "w2"], "slot order is gate, up, DOWN");
     assert_eq!(en.payload, ".weight_packed");
     assert_eq!(en.scale, ".weight_scale");
-    assert_eq!(en.weight_of(0, 2), format!("{P}w2.weight_packed"));
+    assert_eq!(en.weight_of(0, 2, false), format!("{P}w2.weight_packed"));
     check_expert_geometry(&c, &en).unwrap();
 }
 

@@ -2648,6 +2648,165 @@ fn sparse_rung_joins_the_packed_passes_only_under_packed_sparse_pf() {
     assert_eq!(tagged(&with_sparse, 2048).len(), 2);
 }
 
+/// PLOW_GLM_MOE_SHARED_FOLD: the two-emit comparison. Same config and knobs, fold off vs on.
+///
+/// Off is the default-off contract (the knob's first emit IS the ordinary packet). On, every
+/// native prefill MoE chain moves as one: the router appends its constant slot (i5=1) over the
+/// same 256/8 selection, the align and the fused call both run 257/9, the shared expert's
+/// GLU/down packets disappear, and every combine band gives up its `shared` operand while still
+/// covering all T rows. Decode keeps top-8 over the 257-entry table and its own shared GEMVs.
+#[test]
+fn shared_fold_rewrites_only_the_prefill_moe_chain() {
+    use std::sync::{Arc, Mutex};
+    let _guard = crate::test_env::env_guard();
+    let _target = crate::EmitAmdGuard::set(true);
+    let dir = std::env::temp_dir().join(format!("plow-glm-shared-fold-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = serde_json::json!({
+        "model_type": "glm_moe_dsa", "num_hidden_layers": 4,
+        "hidden_size": 6144, "num_attention_heads": 64,
+        "kv_lora_rank": 512, "q_lora_rank": 2048,
+        "qk_nope_head_dim": 192, "qk_rope_head_dim": 64, "v_head_dim": 256,
+        "vocab_size": 128, "rms_norm_eps": 1e-5,
+        "n_routed_experts": 256, "num_experts_per_tok": 8,
+        "moe_intermediate_size": 2048, "intermediate_size": 12288,
+        "first_k_dense_replace": 3, "routed_scaling_factor": 2.5,
+        "rope_theta": 8000000.0
+    });
+    std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+    type Snapshot = (Vec<(u32, Vec<packet::dev::DevInst>)>, Vec<(String, u64)>);
+    let emit = |fold: &str| -> Snapshot {
+        let _env = crate::test_env::EnvScope::set(&[
+            ("PLOW_MLA_PREFILL", "full:1,2,4,8,16,20,32,64,128,256,512,1024,2048,4096,8192"),
+            ("PLOW_GLM_PLACE_PF", "0"),
+            ("PLOW_GLM_MOE_AITER", "0"),
+            ("PLOW_GLM_MOE_FLAT_DECODE", "0"),
+            ("PLOW_GLM_MOE_RESIDENT", "1"),
+            ("PLOW_GLM_MOE_SHARED_FOLD", fold),
+            ("PLOW_DECODE_BATCH_LADDER", "1,2,4,8,16,20"),
+            ("PLOW_EMIT_PACKED_PREFILL", "0"),
+            ("PLOW_UNISEG", "0"),
+        ]);
+        let seen: Arc<Mutex<Snapshot>> = Arc::new(Mutex::new((Vec::new(), Vec::new())));
+        let sink = Arc::clone(&seen);
+        let verify: crate::VerifyHook = Box::new(move |model| {
+            *sink.lock().unwrap() = (
+                model.progs.iter().zip(&model.prog_t).map(|(p, &t)| (t, p.insts.clone())).collect(),
+                model.tensors.iter().map(|t| (t.name.clone(), t.bytes)).collect(),
+            );
+            Ok(crate::LeanReport::skipped("shared-fold structural test"))
+        });
+        glm_emit_full(
+            &dir,
+            81920,
+            dir.join("model.pkt").to_str().unwrap(),
+            304,
+            8,
+            true,
+            true,
+            "gfx942",
+            Some(packet::devbuild::L2Layout {
+                sms: 38,
+                domains: 8,
+                map: packet::devbuild::L2Map::RoundRobin,
+            }),
+            Some(&verify),
+        );
+        let out = seen.lock().unwrap().clone();
+        out
+    };
+    let (plain, plain_tensors) = emit("0");
+    let (folded, folded_tensors) = emit("1");
+    std::fs::remove_dir_all(dir).unwrap();
+
+    let prefill_count =
+        packet::devbuild::decode_rung_lo(&plain.iter().map(|(t, _)| *t).collect::<Vec<_>>());
+    assert_eq!(plain.len(), folded.len());
+    let mut native_prefill = 0;
+    for (p, ((t, off), (t2, on))) in plain.iter().zip(&folded).enumerate() {
+        assert_eq!(t, t2);
+        let decode = p >= prefill_count;
+        let natives: Vec<usize> = on
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.op == DevOp::MoeAiterFp8Pf as u16)
+            .map(|(i, _)| i)
+            .collect();
+        let plain_natives = off.iter().filter(|d| d.op == DevOp::MoeAiterFp8Pf as u16).count();
+        assert_eq!(natives.len(), plain_natives, "t={t}: a MoE layer gained or lost its call");
+        for &ix in &natives {
+            let call = &on[ix];
+            if decode {
+                assert_eq!(call.i[3..5], [257, 8], "t={t}: decode keeps top-8 over 257 entries");
+                let router = on[..ix]
+                    .iter()
+                    .rev()
+                    .find(|d| d.op == DevOp::MoeRouterTopkPf as u16 && d.t[0] == call.t[4])
+                    .unwrap();
+                assert_eq!((router.i[1], router.i[2], router.i[5]), (256, 8, 0));
+                continue;
+            }
+            native_prefill += 1;
+            assert_eq!(call.i, [*t, 6144, 256, 257, 9, 64, 2, 1], "t={t}");
+            let align = on[..ix]
+                .iter()
+                .rev()
+                .find(|d| d.op == DevOp::MoeAlignPf as u16 && d.t[0] == call.t[4])
+                .unwrap();
+            assert_eq!(align.i[..3], [*t, 257, 9], "t={t}");
+            let router = on[..ix]
+                .iter()
+                .rev()
+                .find(|d| d.op == DevOp::MoeRouterTopkPf as u16 && d.t[0] == align.t[1])
+                .unwrap();
+            assert_eq!((router.i[1], router.i[2], router.i[5]), (256, 8, 1), "t={t}");
+            let mut covered = 0;
+            for c in on[ix + 1..]
+                .iter()
+                .take_while(|d| d.t[0] != call.t[0])
+                .filter(|d| d.op == DevOp::MoeCombinePf as u16 && d.t[3] == call.t[0])
+            {
+                assert_eq!(c.t[2], TENSOR_NONE, "t={t}: the combine still reads `shared`");
+                assert_eq!(c.i[3], covered, "t={t}: combine bands are not contiguous");
+                covered += c.i[2];
+            }
+            assert_eq!(covered, *t, "t={t}: combine bands do not cover every row");
+        }
+        let mut a: Vec<u16> = off.iter().map(|d| d.op).collect();
+        let mut b: Vec<u16> = on.iter().map(|d| d.op).collect();
+        a.sort_unstable();
+        b.sort_unstable();
+        if decode {
+            assert_eq!(a, b, "t={t}: the fold changed a decode program's ops");
+            continue;
+        }
+        // Prefill: what goes away is EXACTLY the packets that touched a `shared_experts.*`
+        // weight in the unfolded program (its gate|up and down, whatever tile op the rung picked),
+        // two per native MoE layer, and nothing is added.
+        for o in &b {
+            let at = a.iter().position(|x| x == o).expect("the fold added an op");
+            a.remove(at);
+        }
+        let shared_weight = |h: u32| {
+            plain_tensors
+                .get(h as usize)
+                .is_some_and(|(n, _)| n.contains("shared_experts."))
+        };
+        let mut shared_ops: Vec<u16> =
+            off.iter().filter(|d| d.t.iter().any(|&h| shared_weight(h))).map(|d| d.op).collect();
+        shared_ops.sort_unstable();
+        assert_eq!(a, shared_ops, "t={t}: the fold removed something other than the shared GEMMs");
+        assert_eq!(a.len(), 2 * natives.len(), "t={t}: removed {a:?}");
+    }
+    assert!(native_prefill > 0, "no prefill program carried a native MoE call");
+    // The pointer tables switch to the `_sf` spelling at 257 entries; nothing else is added or
+    // removed from the tensor table.
+    let sf: Vec<_> = folded_tensors.iter().filter(|(n, _)| n.ends_with("_table_sf")).collect();
+    assert!(!sf.is_empty() && sf.iter().all(|(_, b)| *b == 257 * 3 * 8));
+    assert!(!folded_tensors.iter().any(|(n, _)| n.ends_with("expert_weight_table")));
+    assert_eq!(plain_tensors.len(), folded_tensors.len());
+}
+
 /// The packed siblings ride next to the native AITER MoE and hipBLASLt segments — the production
 /// gfx942 TP8 recipe — and emitting them leaves every ordinary program byte-identical. This is
 /// the emit half of what lets the serve mux pack several requests' spans into one rung on that
