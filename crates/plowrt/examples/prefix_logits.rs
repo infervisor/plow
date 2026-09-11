@@ -26,7 +26,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out = PathBuf::from(args.next().ok_or("output directory required")?);
     let reference = args.next().map(PathBuf::from);
     assert_eq!(reference.is_some(), mode != "ordinary");
-    assert_eq!(plowrt::config::RuntimeConfig::get().pf_batch, packed);
+    // `pf_batch` became `Option<bool>` when the step planner gave it a per-backend default;
+    // this example asserts the resolved CUDA value, which is what it always meant.
+    assert_eq!(plowrt::config::RuntimeConfig::get().pf_batch_cuda(), packed);
     assert!(cfg!(target_endian = "little"));
     fs::create_dir(&out)?;
     let tokenizer = plowrt::text::tokenizer::load_tokenizer(&assets);
