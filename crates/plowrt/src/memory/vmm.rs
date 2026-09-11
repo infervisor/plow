@@ -621,6 +621,14 @@ pub struct VmmStats {
     /// Block requests served from the reuse pool instead of `create` — each
     /// one a driver page-commit skipped on the request path.
     pub blocks_reused: u64,
+    /// Retired blocks still mapped, awaiting the reclaimer thread
+    /// ([`VmmKv::enable_deferred_reclaim`]).
+    pub blocks_stale: u64,
+    /// Retired private blocks handed to the next occupant in place — each
+    /// one an unmap + create/pool + map + set_access skipped.
+    pub blocks_kept: u64,
+    /// Stale blocks the reclaimer thread unmapped (off the caller's thread).
+    pub blocks_reclaimed: u64,
 }
 
 /// One physical sharing block: driver handle + mapping/cache refcount.
@@ -638,7 +646,72 @@ struct Track {
     /// Caller-supplied tensor role; the legacy K/V layout uses 0/1.
     tensor: u32,
     va: u64,
-    slots: Vec<Option<u32>>,
+    slots: Vec<Slot>,
+}
+
+/// One window slot `(seq, head, block k)` of a track.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Slot {
+    /// No mapping at this VA.
+    Empty,
+    /// Mapped and owned by the current occupant of `seq`.
+    Live(u32),
+    /// Still mapped on the device, but retired with the previous occupant
+    /// ([`VmmKv::enable_deferred_reclaim`]): nothing reads or writes it, the
+    /// reclaimer thread unmaps it, and `ensure_rows` may claim it first
+    /// (reusing a private block in place, or clearing a shared one inline).
+    Stale(u32),
+}
+
+/// Threads currently inside a request-path VMM driver section (`begin_seq`,
+/// `ensure_rows`, `try_attach`). Process-wide on purpose: ROCr serializes
+/// every `hsa_amd_vmem_*` call (and the pointer lookups of its copies) behind
+/// one memory lock, so a reclaimer unmap in flight on ANY pool delays the
+/// engine's next driver call by ~140 µs. Measured without this: 24 reclaimer
+/// threads (8 ranks × 3 groups) barging on that lock turned the engine's
+/// 5 µs maps into ~1 ms each and `prefill_prepare` from 26 to 890 ms (p90).
+static ENGINE_SECTIONS: AtomicU32 = AtomicU32::new(0);
+
+/// One reclaimer driver call in flight at a time, process-wide — the driver
+/// would serialize them anyway; queueing them behind its lock only lengthens
+/// the wait of whichever engine call arrives next.
+static RECLAIM_GATE: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+struct EngineSection;
+
+impl EngineSection {
+    fn enter() -> Self {
+        ENGINE_SECTIONS.fetch_add(1, Ordering::AcqRel);
+        Self
+    }
+}
+
+impl Drop for EngineSection {
+    fn drop(&mut self) {
+        ENGINE_SECTIONS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Reclaimer side: wait until no engine section is active, then hold the
+/// gate for one driver call. A section that starts after the check costs the
+/// engine at most that one call.
+fn reclaim_turn() -> parking_lot::MutexGuard<'static, ()> {
+    while ENGINE_SECTIONS.load(Ordering::Acquire) > 0 {
+        std::thread::sleep(std::time::Duration::from_micros(50));
+    }
+    RECLAIM_GATE.lock()
+}
+
+/// Work for the pool's background thread (`vmm-premap`).
+enum Job {
+    /// Decode-growth hint: keep the next block mapped beyond `pos`.
+    Premap { seq: u32, pos: u32, generation: u64 },
+    /// Unmap and dereference every `Slot::Stale` block of `seq`.
+    Retire(u32),
+    /// Hand a zero-ref, unmapped handle back to the driver.
+    Release(u64),
+    /// Reply once every job queued before this one has been processed.
+    Sync(std::sync::mpsc::Sender<()>),
 }
 
 #[derive(Clone, Copy)]
@@ -675,6 +748,10 @@ struct Inner {
     /// Zero-ref physical handles kept for reuse instead of released
     /// ([`VmmKv::enable_block_pool`]); every entry is `block_bytes` long.
     pooled: Vec<u64>,
+    /// Background-thread queue once [`VmmKv::enable_deferred_reclaim`] is on:
+    /// zero-ref handles are released there and retired windows unmapped
+    /// there. `None` = every driver call happens on the caller's thread.
+    jobs: Option<std::sync::mpsc::Sender<Job>>,
     /// Whole blocks mapped per sequence (uniform across tracks/heads).
     seq_blocks: Vec<u32>,
     cache: PrefixCache,
@@ -722,7 +799,7 @@ struct Shared {
 pub struct VmmKv {
     prefix_reuse: bool,
     shared: Arc<Shared>,
-    premap_tx: Option<std::sync::mpsc::Sender<(u32, u32, u64)>>,
+    premap_tx: Option<std::sync::mpsc::Sender<Job>>,
     premap_join: Option<std::thread::JoinHandle<()>>,
     /// Pre-creator thread ([`Self::enable_block_pool`]): stop flag + join.
     precreate: Option<(
@@ -832,6 +909,7 @@ impl VmmKv {
                 blocks: Vec::new(),
                 free_ids: Vec::new(),
                 pooled: Vec::new(),
+                jobs: None,
                 seq_blocks: vec![0; batch],
                 cache,
                 node_blocks: FxHashMap::default(),
@@ -859,7 +937,7 @@ impl VmmKv {
                     layer,
                     tensor,
                     va,
-                    slots: vec![None; nslots],
+                    slots: vec![Slot::Empty; nslots],
                 });
             }
         }
@@ -868,22 +946,36 @@ impl VmmKv {
         // the 2048-token boundary never stalls a step (plan verdict §4 —
         // ~6.8 ms if synchronous, free when overlapped). `advise` feeds it;
         // `ensure_rows` in the step path is the correctness backstop.
-        let (tx, rx) = std::sync::mpsc::channel::<(u32, u32, u64)>();
+        let (tx, rx) = std::sync::mpsc::channel::<Job>();
         pool.premap_tx = Some(tx);
         let premap_shared = Arc::clone(&shared);
         let join = std::thread::Builder::new()
             .name("vmm-premap".into())
             .spawn(move || {
-                while let Ok((seq, pos, generation)) = rx.recv() {
+                while let Ok(job) = rx.recv() {
                     let s = &premap_shared;
-                    let target = ((pos / s.block_rows) + 2)
-                        .saturating_mul(s.block_rows)
-                        .min(s.geo.max_ctx);
-                    if s.frontier[seq as usize].load(Ordering::Acquire) < target {
-                        if let Err(e) = ensure_rows(s, seq as usize, target, Some(generation)) {
-                            // Non-fatal here: the synchronous backstop in the
-                            // step path surfaces the real error.
-                            tracing::warn!(error = %e, seq, target, "vmm pre-map failed");
+                    match job {
+                        Job::Premap { seq, pos, generation } => {
+                            let target = ((pos / s.block_rows) + 2)
+                                .saturating_mul(s.block_rows)
+                                .min(s.geo.max_ctx);
+                            if s.frontier[seq as usize].load(Ordering::Acquire) < target {
+                                if let Err(e) =
+                                    ensure_rows(s, seq as usize, target, Some(generation))
+                                {
+                                    // Non-fatal here: the synchronous backstop in the
+                                    // step path surfaces the real error.
+                                    tracing::warn!(error = %e, seq, target, "vmm pre-map failed");
+                                }
+                            }
+                        }
+                        Job::Retire(seq) => reclaim_stale(s, seq as usize),
+                        Job::Release(handle) => {
+                            let _turn = reclaim_turn();
+                            s.ops.release(handle);
+                        }
+                        Job::Sync(reply) => {
+                            let _ = reply.send(());
                         }
                     }
                 }
@@ -966,6 +1058,36 @@ impl VmmKv {
         self.shared.pool_cap.store(cap_blocks, Ordering::Relaxed);
     }
 
+    /// Take slot recycling off the caller's thread: [`Self::begin_seq`] keeps a
+    /// private row-0 block in place and hands the rest of the window to the
+    /// pool thread (see [`retire_window`]); zero-ref handles past the pool cap
+    /// are released there too. Opt-in — the AMD engines call this; the CUDA
+    /// pool and the exact-driver-call-count tests keep the synchronous path.
+    pub fn enable_deferred_reclaim(&mut self) {
+        if let Some(tx) = &self.premap_tx {
+            self.shared.inner.lock().jobs = Some(tx.clone());
+        }
+    }
+
+    /// Test hook: route retire/release jobs to a queue nobody services, so
+    /// "the reclaimer has not run yet" is a state a test can hold. The
+    /// returned receiver keeps the queue open; jobs in it are dropped with it.
+    #[cfg(test)]
+    fn stall_reclaim(&mut self) -> std::sync::mpsc::Receiver<Job> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.shared.inner.lock().jobs = Some(tx);
+        rx
+    }
+
+    /// Block until every retire/release queued so far has been processed.
+    pub fn sync_reclaim(&self) {
+        let Some(tx) = &self.premap_tx else { return };
+        let (reply, done) = std::sync::mpsc::channel();
+        if tx.send(Job::Sync(reply)).is_ok() {
+            let _ = done.recv();
+        }
+    }
+
     /// VA base of the (layer, tensor) full-layer KV tensor — what the engine
     /// puts in the tensor table instead of a cudaMalloc base. `tensor`: 0 = K,
     /// 1 = V. `None` when `layer` is not a full layer.
@@ -1004,7 +1126,7 @@ impl VmmKv {
     pub fn advise(&self, seq: usize, pos: u32) {
         if let Some(tx) = &self.premap_tx {
             let generation = self.shared.generation[seq].load(Ordering::Acquire);
-            let _ = tx.send((seq as u32, pos, generation));
+            let _ = tx.send(Job::Premap { seq: seq as u32, pos, generation });
         }
     }
 
@@ -1012,12 +1134,34 @@ impl VmmKv {
     /// references and unmap+deref its window (cached blocks survive through
     /// the cache's own references).
     pub fn begin_seq(&self, seq: usize) {
+        let _section = EngineSection::enter();
         let s = &self.shared;
         let mut inner = s.inner.lock();
         s.generation[seq].fetch_add(1, Ordering::Release);
         release_prefix_hold(&mut inner, seq);
-        release_window(s, &mut inner, seq);
+        let before = inner.stats;
+        let t0 = std::time::Instant::now();
+        let unmapped = if inner.jobs.is_some() {
+            retire_window(s, &mut inner, seq)
+        } else {
+            release_window(s, &mut inner, seq)
+        };
+        let t1 = std::time::Instant::now();
         trim_cache(s, &mut inner);
+        let after = inner.stats;
+        let pooled = after.blocks_pooled - before.blocks_pooled;
+        tracing::debug!(
+            seq,
+            unmapped,
+            kept = after.blocks_kept - before.blocks_kept,
+            stale = after.blocks_stale,
+            pooled,
+            released = (before.blocks_live - after.blocks_live).saturating_sub(pooled),
+            nodes_evicted = after.nodes_evicted - before.nodes_evicted,
+            window_us = (t1 - t0).as_micros() as u64,
+            trim_us = t1.elapsed().as_micros() as u64,
+            "vmm begin_seq"
+        );
     }
 
     /// Release a finished request's cache holds while retaining its writable KV mappings.
@@ -1046,6 +1190,7 @@ impl VmmKv {
         if !self.prefix_reuse {
             return Ok(None);
         }
+        let _section = EngineSection::enter();
         let s = &self.shared;
         let hashes = hash_blocks(prompt, s.block_rows);
         let aligned = &prompt[..hashes.len() * s.block_rows as usize];
@@ -1120,23 +1265,23 @@ impl VmmKv {
         // `begin_seq` pre-maps row 0 (idle-row garbage writes land there);
         // that private block occupies window slot 0, which the shared prefix
         // is about to claim — drop the fresh window before multi-mapping.
-        if inner.seq_blocks[seq] > 0 {
-            for t in 0..inner.tracks.len() {
-                for h in 0..s.geo.kvh_full {
-                    for k in 0..s.bph {
-                        let slot = slot_index(s, seq, h, k);
-                        if let Some(id) = inner.tracks[t].slots[slot].take() {
-                            unmaps.push(slot_va(s, &inner.tracks[t], seq, h, k));
-                            if let Some(h) = unref_block(s, &mut inner, id) {
-                                frees.push(h);
-                            }
+        // Stale slots (the previous occupant's blocks awaiting the reclaimer)
+        // are still mapped at these VAs and go the same way.
+        for t in 0..inner.tracks.len() {
+            for h in 0..s.geo.kvh_full {
+                for k in 0..s.bph {
+                    let slot = slot_index(s, seq, h, k);
+                    if let Some(id) = take_slot(&mut inner, t, slot) {
+                        unmaps.push(slot_va(s, &inner.tracks[t], seq, h, k));
+                        if let Some(h) = unref_block(s, &mut inner, id) {
+                            frees.push(h);
                         }
                     }
                 }
             }
-            inner.seq_blocks[seq] = 0;
-            s.frontier[seq].store(0, Ordering::Release);
         }
+        inner.seq_blocks[seq] = 0;
+        s.frontier[seq].store(0, Ordering::Release);
 
         // Multi-map every shared block into this sequence's window slots.
         let kvh = s.geo.kvh_full as usize;
@@ -1155,8 +1300,8 @@ impl VmmKv {
                 maps.push((va, inner.blocks[id as usize].handle));
                 inner.blocks[id as usize].refs += 1;
                 let slot = slot_index(s, seq, h as u32, k as u32);
-                debug_assert!(inner.tracks[t].slots[slot].is_none());
-                inner.tracks[t].slots[slot] = Some(id);
+                debug_assert_eq!(inner.tracks[t].slots[slot], Slot::Empty);
+                inner.tracks[t].slots[slot] = Slot::Live(id);
                 inner.stats.blocks_shared_mapped += 1;
             }
             inner.seq_blocks[seq] = k as u32 + 1;
@@ -1218,7 +1363,7 @@ impl VmmKv {
                 for h in 0..s.geo.kvh_full {
                     for k in 0..s.bph {
                         let slot = slot_index(s, seq, h, k);
-                        if let Some(id) = inner.tracks[t].slots[slot].take() {
+                        if let Some(id) = take_slot(&mut inner, t, slot) {
                             if let Some(h) = unref_block(s, &mut inner, id) {
                                 orphans.push(h);
                             }
@@ -1420,8 +1565,9 @@ fn publish_locked(
         for t in 0..inner.tracks.len() {
             for h in 0..kvh {
                 let slot = slot_index(s, seq, h as u32, idx as u32);
-                let id = inner.tracks[t].slots[slot]
-                    .expect("published block below the mapped frontier");
+                let Slot::Live(id) = inner.tracks[t].slots[slot] else {
+                    panic!("published block below the mapped frontier is not live");
+                };
                 ids.push(id);
             }
         }
@@ -1489,7 +1635,10 @@ impl Drop for VmmKv {
     /// cache reference, release every physical block and snapshot, free the
     /// VA reservations. The engine synchronizes the device before dropping.
     fn drop(&mut self) {
+        // Close BOTH senders so the thread drains every queued retire/release
+        // and exits; after the join, deref/unmap below run inline.
         drop(self.premap_tx.take());
+        drop(self.shared.inner.lock().jobs.take());
         if let Some(j) = self.premap_join.take() {
             let _ = j.join();
         }
@@ -1546,6 +1695,7 @@ fn ensure_rows(s: &Shared, seq: usize, rows: u32, generation: Option<u64>) -> Re
     if s.frontier[seq].load(Ordering::Acquire) >= rows {
         return Ok(());
     }
+    let _section = EngineSection::enter();
     let mut inner = s.inner.lock();
     // A queued hint must not recreate a retired or reused sequence's mappings.
     if generation.is_some_and(|g| g != s.generation[seq].load(Ordering::Acquire)) {
@@ -1557,11 +1707,28 @@ fn ensure_rows(s: &Shared, seq: usize, rows: u32, generation: Option<u64>) -> Re
         for t in 0..inner.tracks.len() {
             for h in 0..kvh {
                 let slot = slot_index(s, seq, h, k);
-                if inner.tracks[t].slots[slot].is_some() {
-                    continue;
+                let va = slot_va(s, &inner.tracks[t], seq, h, k);
+                match inner.tracks[t].slots[slot] {
+                    Slot::Live(_) => continue,
+                    // The reclaimer has not reached this column. A private
+                    // block is reused in place (no driver call — the new
+                    // occupant overwrites every row it reads); a shared one
+                    // is cleared here so the fresh map below has the VA.
+                    Slot::Stale(id) if inner.blocks[id as usize].refs == 1 => {
+                        inner.tracks[t].slots[slot] = Slot::Live(id);
+                        inner.stats.blocks_stale -= 1;
+                        inner.stats.blocks_kept += 1;
+                        continue;
+                    }
+                    Slot::Stale(id) => {
+                        s.ops.unmap(va, s.block_bytes);
+                        inner.tracks[t].slots[slot] = Slot::Empty;
+                        inner.stats.blocks_stale -= 1;
+                        deref_block(s, &mut inner, id);
+                    }
+                    Slot::Empty => {}
                 }
                 let id = create_block(s, &mut inner)?;
-                let va = slot_va(s, &inner.tracks[t], seq, h, k);
                 let handle = inner.blocks[id as usize].handle;
                 if let Err(error) = s.ops.map(va, s.block_bytes, handle) {
                     deref_block(s, &mut inner, id);
@@ -1572,7 +1739,7 @@ fn ensure_rows(s: &Shared, seq: usize, rows: u32, generation: Option<u64>) -> Re
                     deref_block(s, &mut inner, id);
                     return Err(error);
                 }
-                inner.tracks[t].slots[slot] = Some(id);
+                inner.tracks[t].slots[slot] = Slot::Live(id);
             }
         }
         inner.seq_blocks[seq] = k + 1;
@@ -1724,9 +1891,16 @@ fn remove_snapshot(s: &Shared, inner: &mut Inner, node: Option<(u32, u32)>, inde
     free_snapshot(s, inner, snap);
 }
 
+/// Drop one reference; a handle that hits zero refs and misses the pool is
+/// released on the background thread when deferred reclaim is on (a zero-ref
+/// block is mapped nowhere, so the release can run at any later time), else
+/// inline.
 fn deref_block(s: &Shared, inner: &mut Inner, id: u32) {
     if let Some(h) = unref_block(s, inner, id) {
-        s.ops.release(h);
+        match &inner.jobs {
+            Some(tx) if tx.send(Job::Release(h)).is_ok() => {}
+            _ => s.ops.release(h),
+        }
     }
 }
 
@@ -1751,22 +1925,151 @@ fn unref_block(s: &Shared, inner: &mut Inner, id: u32) -> Option<u64> {
     }
 }
 
-/// Unmap and dereference every block mapped in `seq`'s windows.
-fn release_window(s: &Shared, inner: &mut Inner, seq: usize) {
+/// Empty a window slot, returning the block id it held (live or stale).
+fn take_slot(inner: &mut Inner, t: usize, slot: usize) -> Option<u32> {
+    match std::mem::replace(&mut inner.tracks[t].slots[slot], Slot::Empty) {
+        Slot::Empty => None,
+        Slot::Live(id) => Some(id),
+        Slot::Stale(id) => {
+            inner.stats.blocks_stale -= 1;
+            Some(id)
+        }
+    }
+}
+
+/// Unmap and dereference every block mapped in `seq`'s windows; returns the
+/// number of unmaps issued.
+fn release_window(s: &Shared, inner: &mut Inner, seq: usize) -> u32 {
+    let mut unmapped = 0;
     for t in 0..inner.tracks.len() {
         for h in 0..s.geo.kvh_full {
             for k in 0..s.bph {
                 let slot = slot_index(s, seq, h, k);
-                if let Some(id) = inner.tracks[t].slots[slot].take() {
+                if let Some(id) = take_slot(inner, t, slot) {
                     let va = slot_va(s, &inner.tracks[t], seq, h, k);
                     s.ops.unmap(va, s.block_bytes);
                     deref_block(s, inner, id);
+                    unmapped += 1;
                 }
             }
         }
     }
     inner.seq_blocks[seq] = 0;
     s.frontier[seq].store(0, Ordering::Release);
+    unmapped
+}
+
+/// The deferred form of [`release_window`] ([`VmmKv::enable_deferred_reclaim`]).
+///
+/// On ROCr every `hsa_amd_vmem_unmap` is a KFD ioctl with a TLB flush —
+/// hundreds of µs, serialized process-wide — so unmapping a 66k-token GLM
+/// occupant's ~580 blocks per rank here cost ~1.9 s of engine-thread time at
+/// TP8. Nothing about that work has to happen before the next occupant starts
+/// EXCEPT block column 0: prefill writes row 0 at once, and an idle decode
+/// row parks at `pos = 0`, so column 0 must be private and mapped now.
+///
+/// * column 0, private block (`refs == 1`): kept in place, no driver call —
+///   the KV cache is append-only, the new sequence overwrites every row it
+///   reads, so the stale bytes are unreachable (same argument as skipping the
+///   KV memset);
+/// * column 0, shared block (published into the prefix cache, or attached
+///   from it): unmapped here — overwriting it would corrupt every sharer —
+///   and `ensure_rows(seq, 1)` maps a fresh private block;
+/// * columns ≥ 1: left mapped and marked `Slot::Stale`; the reclaimer thread
+///   unmaps them column-major (lowest first, ahead of the new occupant's
+///   frontier), `ensure_rows` reuses a private one in place or clears a
+///   shared one inline if it gets there first, and `try_attach` drops them
+///   with the rest of the window.
+///
+/// Budget: unchanged. A stale block is one the synchronous path would already
+/// have unmapped; it holds no extra HBM (the cache keeps shared blocks either
+/// way, private ones reach the pool/driver as soon as the reclaimer runs), and
+/// the pool cap and cache cap apply as before. Returns the unmaps issued here.
+fn retire_window(s: &Shared, inner: &mut Inner, seq: usize) -> u32 {
+    let kvh = s.geo.kvh_full;
+    let mut unmapped = 0;
+    let mut column0_live = true;
+    for t in 0..inner.tracks.len() {
+        for h in 0..kvh {
+            let slot = slot_index(s, seq, h, 0);
+            match inner.tracks[t].slots[slot] {
+                Slot::Live(id) | Slot::Stale(id) if inner.blocks[id as usize].refs == 1 => {
+                    if inner.tracks[t].slots[slot] != Slot::Live(id) {
+                        inner.stats.blocks_stale -= 1;
+                        inner.tracks[t].slots[slot] = Slot::Live(id);
+                    }
+                    inner.stats.blocks_kept += 1;
+                }
+                Slot::Live(_) | Slot::Stale(_) => {
+                    let id = take_slot(inner, t, slot).unwrap();
+                    s.ops.unmap(slot_va(s, &inner.tracks[t], seq, h, 0), s.block_bytes);
+                    deref_block(s, inner, id);
+                    unmapped += 1;
+                    column0_live = false;
+                }
+                Slot::Empty => column0_live = false,
+            }
+        }
+    }
+    let mut stale = 0u64;
+    for t in 0..inner.tracks.len() {
+        for h in 0..kvh {
+            for k in 1..s.bph {
+                let slot = slot_index(s, seq, h, k);
+                if let Slot::Live(id) = inner.tracks[t].slots[slot] {
+                    inner.tracks[t].slots[slot] = Slot::Stale(id);
+                    stale += 1;
+                }
+            }
+        }
+    }
+    inner.stats.blocks_stale += stale;
+    let blocks = u32::from(column0_live && !inner.tracks.is_empty());
+    inner.seq_blocks[seq] = blocks;
+    s.frontier[seq].store(blocks * s.block_rows, Ordering::Release);
+    if stale > 0 {
+        if let Some(tx) = &inner.jobs {
+            let _ = tx.send(Job::Retire(seq as u32));
+        }
+    }
+    unmapped
+}
+
+/// Reclaimer half of [`retire_window`]: unmap and dereference `seq`'s stale
+/// slots one block per lock hold, lowest column first. The unmap runs UNDER
+/// the pool lock so a slot is atomically either mapped-and-stale or empty —
+/// no in-flight state for `ensure_rows`/`try_attach` to wait on. The engine
+/// thread's lock-free `frontier` fast path is unaffected; a caller that does
+/// take the lock waits for at most one unmap. Idempotent: a repeated retire
+/// of the same sequence finds nothing left.
+fn reclaim_stale(s: &Shared, seq: usize) {
+    let kvh = s.geo.kvh_full;
+    loop {
+        let _turn = reclaim_turn();
+        let mut inner = s.inner.lock();
+        let mut next = None;
+        'scan: for k in 1..s.bph {
+            for t in 0..inner.tracks.len() {
+                for h in 0..kvh {
+                    let slot = slot_index(s, seq, h, k);
+                    if let Slot::Stale(id) = inner.tracks[t].slots[slot] {
+                        next = Some((t, h, k, slot, id));
+                        break 'scan;
+                    }
+                }
+            }
+        }
+        let Some((t, h, k, slot, id)) = next else { return };
+        s.ops.unmap(slot_va(s, &inner.tracks[t], seq, h, k), s.block_bytes);
+        inner.tracks[t].slots[slot] = Slot::Empty;
+        inner.stats.blocks_stale -= 1;
+        inner.stats.blocks_reclaimed += 1;
+        let handle = unref_block(s, &mut inner, id);
+        drop(inner);
+        if let Some(h) = handle {
+            s.ops.release(h);
+        }
+    }
 }
 
 /// `PLOW_SLAB_KEEP=1` keeps a dropped [`VmmSlab`]'s PHYSICAL chunks in the
@@ -3714,6 +4017,170 @@ mod tests {
             p.stats().blocks_reused >= 4,
             "growth must have been served from pooled handles"
         );
+    }
+
+    /// Deferred reclaim: `begin_seq` keeps a private row-0 block in place,
+    /// leaves the rest mapped-but-stale for the pool thread, and the next
+    /// occupant's row-0 pre-map is free. The block budget is the synchronous
+    /// path's: the stale blocks park in the pool and regrowth draws them.
+    #[test]
+    fn deferred_recycle_keeps_private_column_zero_and_retires_the_rest_off_thread() {
+        let ops = Arc::new(MockVmm::default());
+        let mut p = uniform_pool(ops.clone());
+        p.enable_block_recycling(16 * 64);
+        p.enable_deferred_reclaim();
+        // Full window: 4 columns × 4 tracks = 16 private blocks.
+        p.ensure_rows(0, 32).unwrap();
+        assert_eq!(ops.creates.load(Ordering::SeqCst), 16);
+        assert_eq!(ops.maps.load(Ordering::SeqCst), 16);
+
+        p.begin_seq(0);
+        let st = p.stats();
+        assert_eq!(st.blocks_kept, 4, "column 0 handed over in place");
+        assert_eq!(p.mapped_rows(0), 8, "row 0 writable before any ensure_rows");
+        assert_eq!(st.blocks_live, 16, "nothing dereferenced on the caller's thread");
+        p.ensure_rows(0, 1).unwrap();
+        assert_eq!(ops.maps.load(Ordering::SeqCst), 16, "begin_slot's pre-map is free");
+        assert_eq!(ops.creates.load(Ordering::SeqCst), 16);
+
+        p.sync_reclaim();
+        let st = p.stats();
+        assert_eq!(st.blocks_stale, 0);
+        assert_eq!(st.blocks_reclaimed, 12);
+        assert_eq!(ops.unmaps.load(Ordering::SeqCst), 12, "columns 1..3 unmapped by the reclaimer");
+        assert_eq!(st.blocks_pooled, 12);
+        assert_eq!(st.blocks_live, 4);
+        assert_eq!(ops.releases.load(Ordering::SeqCst), 0);
+
+        p.ensure_rows(0, 32).unwrap();
+        assert_eq!(ops.creates.load(Ordering::SeqCst), 16, "regrowth draws the pool, no new HBM");
+        assert_eq!(p.stats().blocks_reused, 12);
+        assert_eq!(p.stats().blocks_live, 16);
+        drop(p);
+        assert_eq!(ops.unmaps.load(Ordering::SeqCst), 12 + 16);
+        assert_eq!(ops.releases.load(Ordering::SeqCst), 16, "no leak at drop");
+    }
+
+    /// A published (cache-shared) column 0 cannot be handed over — the next
+    /// occupant would overwrite every sharer — so it is unmapped inline and
+    /// `ensure_rows(seq, 1)` maps a private block. Shared columns above it are
+    /// dereferenced by the reclaimer; the cache keeps the blocks.
+    #[test]
+    fn deferred_recycle_swaps_a_shared_column_zero_inline() {
+        let ops = Arc::new(MockVmm::default());
+        let mut p = uniform_pool(ops.clone());
+        p.enable_block_recycling(16 * 64);
+        p.enable_deferred_reclaim();
+        let pr = prompt(17); // 2 whole blocks + 1 row → 3 columns mapped
+        p.ensure_rows(0, 17).unwrap();
+        p.publish(0, &pr, 4, |_| Ok(())).unwrap(); // columns 0, 1 shared with the cache
+        assert_eq!(p.stats().cache_blocks, 8);
+        assert_eq!(ops.creates.load(Ordering::SeqCst), 12);
+
+        p.begin_seq(0);
+        assert_eq!(ops.unmaps.load(Ordering::SeqCst), 4, "only column 0 on the caller's thread");
+        assert_eq!(p.stats().blocks_kept, 0);
+        assert_eq!(p.mapped_rows(0), 0);
+        p.ensure_rows(0, 1).unwrap();
+        assert_eq!(ops.creates.load(Ordering::SeqCst), 16, "fresh private column 0");
+        assert_eq!(p.mapped_rows(0), 8);
+
+        p.sync_reclaim();
+        let st = p.stats();
+        assert_eq!(ops.unmaps.load(Ordering::SeqCst), 12);
+        assert_eq!(st.blocks_stale, 0);
+        assert_eq!(st.cache_blocks, 8, "the published prefix survives the recycle");
+        assert_eq!(st.blocks_live, 8 + 4, "cache blocks + the new column 0");
+        assert_eq!(st.blocks_pooled, 4, "the private tail column parked");
+        assert_eq!(ops.releases.load(Ordering::SeqCst), 0);
+    }
+
+    /// If the new occupant grows into a stale column before the reclaimer
+    /// reaches it, `ensure_rows` settles the column itself: a private block is
+    /// reused in place (no driver call), a shared one is unmapped and replaced.
+    #[test]
+    fn ensure_rows_settles_stale_columns_the_reclaimer_has_not_reached() {
+        let ops = Arc::new(MockVmm::default());
+        let mut p = uniform_pool(ops.clone());
+        p.enable_block_recycling(16 * 64);
+        let _stalled = p.stall_reclaim();
+        p.ensure_rows(0, 24).unwrap(); // 3 private columns, 12 blocks
+        p.publish(0, &prompt(9), 4, |_| Ok(())).unwrap(); // column 0 shared
+        assert_eq!(ops.creates.load(Ordering::SeqCst), 12);
+
+        p.begin_seq(0);
+        assert_eq!(ops.unmaps.load(Ordering::SeqCst), 4, "column 0 swapped out");
+        assert_eq!(p.stats().blocks_stale, 8);
+        // Column 0 fresh; columns 1–2 private and stale → reused in place.
+        p.ensure_rows(0, 24).unwrap();
+        assert_eq!(ops.creates.load(Ordering::SeqCst), 16);
+        assert_eq!(ops.maps.load(Ordering::SeqCst), 16);
+        assert_eq!(ops.unmaps.load(Ordering::SeqCst), 4);
+        assert_eq!(p.stats().blocks_kept, 8);
+        assert_eq!(p.stats().blocks_stale, 0);
+        assert_eq!(p.mapped_rows(0), 24);
+
+        // Publish two columns. Column 0 re-matches the node from the first
+        // publish (same first block of tokens), so the window's fresh column-0
+        // block stays private; column 1 becomes shared; column 2 stays private.
+        p.publish(0, &prompt(17), 4, |_| Ok(())).unwrap();
+        p.begin_seq(0);
+        assert_eq!(ops.unmaps.load(Ordering::SeqCst), 4, "private column 0 kept again");
+        assert_eq!(p.stats().blocks_kept, 12);
+        assert_eq!(p.stats().blocks_stale, 8);
+        p.ensure_rows(0, 24).unwrap();
+        // column 1 (shared, stale): 4 unmaps + 4 creates + 4 maps; column 2 (private, stale): kept.
+        assert_eq!(ops.unmaps.load(Ordering::SeqCst), 8);
+        assert_eq!(ops.creates.load(Ordering::SeqCst), 20);
+        assert_eq!(ops.maps.load(Ordering::SeqCst), 20);
+        assert_eq!(p.stats().blocks_kept, 16);
+        assert_eq!(p.stats().blocks_stale, 0);
+    }
+
+    /// An attach hit on a recycled slot drops the stale mappings with the rest
+    /// of the window before multi-mapping the shared prefix over the same VAs.
+    #[test]
+    fn try_attach_drops_stale_mappings_before_multi_mapping() {
+        let ops = Arc::new(MockVmm::default());
+        let mut p = uniform_pool(ops.clone());
+        p.enable_block_recycling(16 * 64);
+        let _stalled = p.stall_reclaim();
+        let pr = prompt(17);
+        p.ensure_rows(0, 17).unwrap();
+        p.publish(0, &pr, 4, |_| Ok(())).unwrap(); // 2 shared columns on seq 0
+
+        p.ensure_rows(1, 24).unwrap(); // seq 1: 3 private columns
+        p.begin_seq(1);
+        assert_eq!(p.stats().blocks_stale, 8);
+        let unmaps = ops.unmaps.load(Ordering::SeqCst);
+        let maps = ops.maps.load(Ordering::SeqCst);
+        let hit = p.try_attach(1, &pr).unwrap().expect("hit");
+        assert_eq!(hit.rows, 16);
+        assert_eq!(p.stats().blocks_stale, 0);
+        assert_eq!(ops.unmaps.load(Ordering::SeqCst), unmaps + 12, "column 0 + stale 1..2");
+        assert_eq!(ops.maps.load(Ordering::SeqCst), maps + 8);
+        assert_eq!(p.mapped_rows(1), 16);
+    }
+
+    /// Zero-ref handles past the pool cap are released on the pool thread —
+    /// here from the cache eviction `begin_seq`'s trim performs.
+    #[test]
+    fn deferred_reclaim_releases_evicted_blocks_off_thread() {
+        let ops = Arc::new(MockVmm::default());
+        let mut p = pool_with_cap(ops.clone(), 64); // cache soft cap: one block
+        p.enable_deferred_reclaim();
+        p.ensure_rows(0, 9).unwrap(); // 2 columns × 2 tracks
+        // Column 0 shared: 128 B of cache over a 64 B cap, pinned by the lease.
+        p.publish(0, &prompt(9), 4, |_| Ok(())).unwrap();
+        assert_eq!(p.stats().cache_blocks, 2);
+
+        p.begin_seq(0); // lease dropped → trim evicts the node; column 1 → stale
+        p.sync_reclaim();
+        let st = p.stats();
+        assert_eq!(st.nodes_evicted, 1);
+        assert_eq!(st.blocks_live, 0);
+        assert_eq!(ops.unmaps.load(Ordering::SeqCst), 4);
+        assert_eq!(ops.releases.load(Ordering::SeqCst), 4);
     }
 
     #[test]

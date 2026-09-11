@@ -5877,6 +5877,9 @@ impl AmdEngine {
         match VmmKv::new(Arc::clone(be) as Arc<dyn VmmOps>, geo, block_hint, 0) {
             Ok(mut kv) => {
                 kv.enable_block_recycling(crate::memory::vmm::kv_pool_cap());
+                if crate::config::RuntimeConfig::get().vmm_deferred_reclaim() {
+                    kv.enable_deferred_reclaim();
+                }
                 Some(kv)
             }
             Err(e) => {

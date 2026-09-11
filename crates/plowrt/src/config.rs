@@ -267,6 +267,13 @@ pub struct RuntimeConfig {
     )]
     pub kv_pool_mib: u64,
 
+    /// AMD VMM KV: recycle a slot by retiring its previous occupant's block
+    /// mappings on the pool's background thread (private row-0 blocks are kept
+    /// in place) instead of unmapping every block synchronously on the engine
+    /// thread. `0` restores the synchronous unmap.
+    #[arg(long = "vmm-deferred-reclaim", env = "PLOW_VMM_DEFERRED_RECLAIM", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub vmm_deferred_reclaim: bool,
+
     // ──────────────────────────────────────────────────────────────────────────
     // Diagnostic / observability (shared, off by default)
     // ──────────────────────────────────────────────────────────────────────────
@@ -1178,6 +1185,14 @@ impl RuntimeConfig {
         select_compat(
             self.kv_pool_mib,
             Self::env_parse("PLOW_KV_POOL_MIB"),
+            !Self::is_initialized(),
+        )
+    }
+
+    pub(crate) fn vmm_deferred_reclaim(&self) -> bool {
+        select_compat(
+            self.vmm_deferred_reclaim,
+            Self::env_bool("PLOW_VMM_DEFERRED_RECLAIM"),
             !Self::is_initialized(),
         )
     }

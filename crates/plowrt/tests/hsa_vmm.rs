@@ -314,3 +314,131 @@ fn slab_chunk_pool_roundtrip_and_reuse() {
         "flag off: drop releases, nothing pooled"
     );
 }
+
+/// The slot-RECYCLE path's driver costs, which `map_and_set_access_cost_per_block`
+/// does not price: `VmmKv::begin_seq` after a long occupant issues one `unmap`
+/// per mapped granule (~580 per rank after a 66k-token GLM prompt at TP8) plus a
+/// `release` per zero-ref block past the reuse pool cap, all on the engine
+/// thread. Prints per-call µs for create / map / set_access / unmap / release
+/// at the granule, whether ONE `hsa_amd_vmem_unmap` may span several adjacent
+/// granule maps (a batched recycle), and whether threads unmapping disjoint
+/// ranges overlap or serialize inside ROCr (a parallel-across-ranks recycle).
+#[test]
+fn unmap_release_cost_range_unmap_and_concurrency() {
+    if !gpu_enabled() {
+        eprintln!("skipped: set PLOW_GPU_TEST=1");
+        return;
+    }
+    let _env = common::env_guard();
+    let be = backend();
+    let gran = VmmOps::granularity(be).expect("granularity");
+    let reps = 64u64;
+    let span = gran * reps;
+    let va = VmmOps::reserve(be, span).expect("reserve");
+
+    let t = Instant::now();
+    let handles: Vec<u64> = (0..reps).map(|_| VmmOps::create(be, gran).expect("create")).collect();
+    let create_us = t.elapsed().as_secs_f64() * 1e6 / reps as f64;
+    let t = Instant::now();
+    for (i, &h) in handles.iter().enumerate() {
+        VmmOps::map(be, va + i as u64 * gran, gran, h).expect("map");
+    }
+    let map_us = t.elapsed().as_secs_f64() * 1e6 / reps as f64;
+    let t = Instant::now();
+    for i in 0..reps {
+        VmmOps::set_access(be, va + i * gran, gran).expect("set_access");
+    }
+    let access_us = t.elapsed().as_secs_f64() * 1e6 / reps as f64;
+    let t = Instant::now();
+    for i in 0..reps {
+        VmmOps::unmap(be, va + i * gran, gran);
+    }
+    let unmap_us = t.elapsed().as_secs_f64() * 1e6 / reps as f64;
+    let t = Instant::now();
+    for &h in &handles {
+        VmmOps::release(be, h);
+    }
+    let release_us = t.elapsed().as_secs_f64() * 1e6 / reps as f64;
+    println!(
+        "\ngranule {} MiB, {reps} reps: create {create_us:.1} us, map {map_us:.1} us, \
+         set_access {access_us:.1} us, unmap {unmap_us:.1} us, release {release_us:.1} us",
+        gran / MIB
+    );
+
+    // Range unmap: eight adjacent granule maps, one unmap call over all of them.
+    // `VmmOps::unmap` swallows the status, so success is judged by re-mapping:
+    // a VA still mapped refuses the second map.
+    let n = 8u64;
+    let first: Vec<u64> = (0..n).map(|_| VmmOps::create(be, gran).expect("create")).collect();
+    for (i, &h) in first.iter().enumerate() {
+        VmmOps::map(be, va + i as u64 * gran, gran, h).expect("map");
+        VmmOps::set_access(be, va + i as u64 * gran, gran).expect("set_access");
+    }
+    let t = Instant::now();
+    VmmOps::unmap(be, va, n * gran);
+    let range_us = t.elapsed().as_secs_f64() * 1e6;
+    let second: Vec<u64> = (0..n).map(|_| VmmOps::create(be, gran).expect("create")).collect();
+    let mut remapped = 0u64;
+    for (i, &h) in second.iter().enumerate() {
+        match VmmOps::map(be, va + i as u64 * gran, gran, h) {
+            Ok(()) => remapped += 1,
+            Err(_) => break,
+        }
+    }
+    println!(
+        "range unmap over {n} granules: {range_us:.1} us; re-mapped {remapped}/{n} -> {}",
+        if remapped == n {
+            "one call unmaps the whole run (batched recycle possible)"
+        } else {
+            "per-granule unmaps required"
+        }
+    );
+    // Whatever is mapped at each granule now (original or re-map), unmap it once.
+    for i in 0..n {
+        VmmOps::unmap(be, va + i * gran, gran);
+    }
+    for h in first.into_iter().chain(second) {
+        VmmOps::release(be, h);
+    }
+
+    // Concurrency: `threads` threads each unmap a disjoint run of `per` granules.
+    for threads in [2u64, 8] {
+        let per = reps / threads;
+        let hs: Vec<u64> = (0..reps).map(|_| VmmOps::create(be, gran).expect("create")).collect();
+        for (i, &h) in hs.iter().enumerate() {
+            VmmOps::map(be, va + i as u64 * gran, gran, h).expect("map");
+            VmmOps::set_access(be, va + i as u64 * gran, gran).expect("set_access");
+        }
+        let t = Instant::now();
+        std::thread::scope(|s| {
+            for th in 0..threads {
+                s.spawn(move || {
+                    for i in 0..per {
+                        VmmOps::unmap(be, va + (th * per + i) * gran, gran);
+                    }
+                });
+            }
+        });
+        let wall_us = t.elapsed().as_secs_f64() * 1e6;
+        let t = Instant::now();
+        std::thread::scope(|s| {
+            for th in 0..threads {
+                let hs = &hs;
+                s.spawn(move || {
+                    for i in 0..per {
+                        VmmOps::release(be, hs[(th * per + i) as usize]);
+                    }
+                });
+            }
+        });
+        let rel_wall_us = t.elapsed().as_secs_f64() * 1e6;
+        println!(
+            "{threads} threads x {per} unmaps: {wall_us:.0} us wall (serial estimate {:.0} us, \
+             speedup {:.2}x); releases {rel_wall_us:.0} us wall (serial estimate {:.0} us)",
+            unmap_us * reps as f64,
+            unmap_us * reps as f64 / wall_us,
+            release_us * reps as f64
+        );
+    }
+    VmmOps::address_free(be, va, span);
+}
