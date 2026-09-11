@@ -41,7 +41,7 @@ pub(super) fn routes(
     span_aware: bool,
 ) -> Result<Vec<Option<Route>>> {
     let mut routes = vec![None; segments];
-    if (prog.packed_prefill_only || prog.token_batch_body) && !span_aware {
+    if (prog.role.is_packed_sibling() || prog.role.is_token_batch_body()) && !span_aware {
         return Ok(routes);
     }
     for (ix, inst) in prog.insts.iter().enumerate() {
@@ -407,9 +407,7 @@ mod tests {
     fn fixture() -> (DevProg, Vec<DevTensor>, TpBind) {
         let prog = DevProg {
             t: 8192,
-            packed_prefill_only: false,
-            token_batch_body: false,
-            decode_rung: false,
+            role: packet::devbuild::ProgramRole::PrefillBucket { rows: 8192 },
             n_counter: 0,
             insts: vec![DevInst64 {
                 op: DevOp::IndexTpPf as u16,
@@ -481,11 +479,10 @@ mod tests {
         // keeps NO route and the packed program check refuses it by name.
         {
             let (mut p, t, tp) = fixture();
-            p.packed_prefill_only = true;
+            p.role = packet::devbuild::ProgramRole::PackedSibling { of_rows: p.t };
             assert!(routes(&p, &t, 1, tp, false).unwrap()[0].is_none());
             assert!(routes(&p, &t, 1, tp, true).unwrap()[0].is_some());
-            p.packed_prefill_only = false;
-            p.token_batch_body = true;
+            p.role = packet::devbuild::ProgramRole::TokenBatchBody { band: 8, rows: p.t };
             assert!(routes(&p, &t, 1, tp, false).unwrap()[0].is_none());
             assert!(routes(&p, &t, 1, tp, true).unwrap()[0].is_some());
         }

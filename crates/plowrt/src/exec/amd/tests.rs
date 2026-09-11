@@ -59,9 +59,7 @@ fn materialized_mla_route_probe(t: u32, heads: u32) -> (DevProg, Vec<DeviceMem>)
     ];
     let prog = DevProg {
         t,
-        packed_prefill_only: false,
-        token_batch_body: false,
-        decode_rung: false,
+        role: packet::devbuild::ProgramRole::PrefillBucket { rows: t },
         n_counter: 0,
         insts: vec![pack, attention],
         stream,
@@ -215,9 +213,7 @@ fn grouped_moe_decode_pair_routes_with_exact_mxfp4_abi() {
     };
     let prog = DevProg {
         t: 1,
-        packed_prefill_only: false,
-        token_batch_body: false,
-        decode_rung: false,
+        role: packet::devbuild::ProgramRole::DecodeRung { rows: 1 },
         n_counter: 0,
         insts: vec![glu, down],
         stream: vec![
@@ -598,9 +594,7 @@ fn segmented_decode_probe() -> DevProg {
     ];
     DevProg {
         t: 1,
-        packed_prefill_only: false,
-        token_batch_body: false,
-        decode_rung: false,
+        role: packet::devbuild::ProgramRole::DecodeRung { rows: 1 },
         n_counter: 0,
         insts,
         stream: (0..3)
@@ -644,7 +638,7 @@ fn isolated_sparse_mla_decode_is_a_native_segment_only_when_pure() {
             DecodeSegmentKind::Interpreter,
         ]
     );
-    validate_decode_dispatch(std::slice::from_ref(&p), 0).unwrap();
+    validate_decode_dispatch([(0, &p)]).unwrap();
     // The ordinary emit: counter obligations or a shared segment keep it on the interpreter.
     let mut waits = make();
     waits.stream[1].wait_len = 1;
@@ -678,7 +672,7 @@ fn fused_decode_segment_is_a_pure_ordered_single_rank_route() {
             DecodeSegmentKind::Interpreter,
         ]
     );
-    validate_decode_dispatch(&[p], 0).unwrap();
+    validate_decode_dispatch([(0, &p)]).unwrap();
 }
 
 #[test]
@@ -879,7 +873,7 @@ fn fused_decode_refuses_mixed_countered_and_l2_segments() {
 
     let mut placed = segmented_decode_probe();
     placed.l2_domains = 8;
-    assert!(validate_decode_dispatch(&[placed], 0)
+    assert!(validate_decode_dispatch([(0, &placed)])
         .unwrap_err()
         .to_string()
         .contains("L2-domain placement"));
@@ -898,7 +892,7 @@ fn ordinary_l2_decode_allows_cross_domain_counters() {
     });
 
     assert!(decode_segment_kinds(&placed).is_ok());
-    assert!(validate_decode_dispatch(&[placed], 0).is_ok());
+    assert!(validate_decode_dispatch([(0, &placed)]).is_ok());
 }
 
 #[test]
@@ -1004,22 +998,25 @@ fn packed_spans() -> [PrefillSpan; 2] {
 
 #[test]
 fn packed_dispatch_selects_tagged_sibling_without_changing_ordinary_rung() {
+    use packet::devbuild::ProgramRole::{DecodeRung, PackedSibling, PrefillBucket};
     let roles = [
-        (128, false),
-        (512, false),
-        (128, true),
-        (512, true),
-        (1, false),
+        PrefillBucket { rows: 128 },
+        PrefillBucket { rows: 512 },
+        PackedSibling { of_rows: 128 },
+        PackedSibling { of_rows: 512 },
+        DecodeRung { rows: 1 },
     ];
-    let select = |requested| packed_prefill_topology_index(requested, 4, |i| roles.get(i).copied());
+    let select = |requested| {
+        packed_prefill_topology_index(requested, roles.len(), |i| roles.get(i).copied())
+    };
     assert_eq!(select(0), Some(2));
     assert_eq!(select(1), Some(3));
     assert_eq!(select(2), Some(2));
     assert_eq!(select(4), None);
 
-    let legacy = [(128, false), (1, false)];
+    let legacy = [PrefillBucket { rows: 128 }, DecodeRung { rows: 1 }];
     assert_eq!(
-        packed_prefill_topology_index(0, 1, |i| legacy.get(i).copied()),
+        packed_prefill_topology_index(0, legacy.len(), |i| legacy.get(i).copied()),
         Some(0)
     );
 }
@@ -1190,9 +1187,7 @@ fn hierarchical_gate_marker_requires_decode_gq_and_l2_capability() {
 fn gate_hier_probe(l2_domains: u32, nper: u16) -> DevProg {
     DevProg {
         t: 1,
-        packed_prefill_only: false,
-        token_batch_body: false,
-        decode_rung: false,
+        role: packet::devbuild::ProgramRole::DecodeRung { rows: 1 },
         n_counter: 0,
         insts: vec![DevInst64 {
             op: DevOp::Nop as u16,
@@ -1224,7 +1219,7 @@ fn gate_hier_status_separates_armed_from_firing() {
     let placed = [gate_hier_probe(8, 38)];
     let unplaced = [gate_hier_probe(0, 0)];
 
-    let firing = GateHierStatus::of(&placed, 0, true);
+    let firing = GateHierStatus::of(&placed, true);
     assert!(firing.armed && firing.firing);
     assert_eq!(
         (firing.domains, firing.rendezvous, firing.entries),
@@ -1233,23 +1228,23 @@ fn gate_hier_status_separates_armed_from_firing() {
     assert!(firing.verdict().contains("FIRING"));
 
     // The shipped-but-inert pairing this whole campaign exists to make visible.
-    let inert = GateHierStatus::of(&unplaced, 0, true);
+    let inert = GateHierStatus::of(&unplaced, true);
     assert!(inert.armed && !inert.firing);
     assert!(inert.verdict().contains("ARMED BUT INERT"));
     assert!(inert.verdict().contains("PLOW_L2_PLACE=1"));
 
     // Placed blob, object without the gate: legal, and the placement half still runs.
-    let no_gate = GateHierStatus::of(&placed, 0, false);
+    let no_gate = GateHierStatus::of(&placed, false);
     assert!(!no_gate.armed && !no_gate.firing);
     assert!(no_gate.verdict().contains("PLOW_L2HIER=1"));
 
     // A single slice per (packet, domain) has nobody to rendezvous with; the emitter
     // leaves `nper` at 0 and the interpreter reads that as "no hierarchy".
-    let alone = GateHierStatus::of(&[gate_hier_probe(8, 0)], 0, true);
+    let alone = GateHierStatus::of(&[gate_hier_probe(8, 0)], true);
     assert!(alone.armed && !alone.firing);
     assert_eq!(alone.rendezvous, 0);
 
-    assert!(!GateHierStatus::of(&unplaced, 0, false).firing);
+    assert!(!GateHierStatus::of(&unplaced, false).firing);
 }
 
 /// The refusal has to name BOTH halves and the two ways out — the emit-side flag and the
@@ -1319,9 +1314,7 @@ fn segmented_prog(ops: &[DevOp], segs: &[u16]) -> DevProg {
     assert_eq!(ops.len(), segs.len());
     DevProg {
         t: 2048,
-        packed_prefill_only: false,
-        token_batch_body: false,
-        decode_rung: false,
+        role: packet::devbuild::ProgramRole::PrefillBucket { rows: 2048 },
         n_counter: 0,
         insts: ops
             .iter()
@@ -1459,7 +1452,6 @@ fn graph_phase_selector_requires_matching_contiguous_packet_inventory() {
     let selected = graph_phase_xreduce_segments_from_manifest(
         &phase_chain_manifest(),
         std::slice::from_ref(&prog),
-        1,
         Path::new("build.json"),
     )
     .unwrap();
@@ -1470,7 +1462,6 @@ fn graph_phase_selector_requires_matching_contiguous_packet_inventory() {
     let err = graph_phase_xreduce_segments_from_manifest(
         &bad,
         std::slice::from_ref(&prog),
-        1,
         Path::new("build.json"),
     )
     .expect_err("phase and segment inventories must agree");
@@ -1497,7 +1488,6 @@ fn graph_phase_selector_rejects_topology_and_resource_drift() {
         let err = graph_phase_xreduce_segments_from_manifest(
             &bad,
             std::slice::from_ref(&prog),
-            1,
             Path::new("build.json"),
         )
         .expect_err("manifest drift must fail closed");
@@ -2084,16 +2074,16 @@ fn lean_moe_stage2_companion_layout_matches_the_declared_permutations() {
 #[test]
 fn decode_dispatch_rejects_multiple_wave_launches() {
     let one = segmented_prog(&[DevOp::Gemv], &[0]);
-    assert!(validate_decode_dispatch(std::slice::from_ref(&one), 0).is_ok());
+    assert!(validate_decode_dispatch([(0, &one)]).is_ok());
 
     let split = segmented_prog(&[DevOp::Gemv, DevOp::RmsNorm], &[0, 1]);
-    let err = validate_decode_dispatch(std::slice::from_ref(&split), 0)
+    let err = validate_decode_dispatch([(0, &split)])
         .expect_err("decode cannot execute multiple host wave launches");
     assert!(err.to_string().contains("has 2 wave segments"));
 
     let mut placed = split;
     placed.l2_domains = 2;
-    assert!(validate_decode_dispatch(std::slice::from_ref(&placed), 0).is_ok());
+    assert!(validate_decode_dispatch([(0, &placed)]).is_ok());
 }
 
 #[test]
@@ -2116,9 +2106,9 @@ fn small_mla_family_requires_pure_dense_ordinary_segments() {
             assert_eq!(segment::small_mla_segments(&prog, 4), [false, true, false, false]);
             assert_eq!(derive_segments_for(&prog, false).unwrap(), [8, 8, 8]);
         }
-        prog.packed_prefill_only = true;
+        prog.role = packet::devbuild::ProgramRole::PackedSibling { of_rows: prog.t };
         assert_eq!(segment::small_mla_segments(&prog, 3), [false; 3]);
-        prog.packed_prefill_only = false;
+        prog.role = packet::devbuild::ProgramRole::PrefillBucket { rows: prog.t };
         prog.t = 2048;
         assert_eq!(segment::small_mla_segments(&prog, 3), [false; 3]);
         prog.t = 128;
@@ -2208,7 +2198,7 @@ fn small_mla_split_layout_refuses_unsafe_pairings() {
             5 => tensors[7].bytes -= 4,
             6 => prog.insts[0].fj[1] = 1,
             7 => prog.insts[0].i[3] = 0x80000000,
-            8 => prog.packed_prefill_only = true,
+            8 => prog.role = packet::devbuild::ProgramRole::PackedSibling { of_rows: prog.t },
             9 => prog.stream[1].seg = 0,
             10 => prog.insts[0].i[6] = 1,
             _ => prog.insts[1].i[5] = 1,
@@ -2925,9 +2915,7 @@ fn prefill_arm_detect_selects_the_right_variant() {
             .collect();
         DevProg {
             t: 1,
-            packed_prefill_only: false,
-            token_batch_body: false,
-            decode_rung: false,
+            role: packet::devbuild::ProgramRole::DecodeRung { rows: 1 },
             n_counter: 0,
             insts,
             stream: Vec::new(),
@@ -3065,9 +3053,7 @@ fn prog_gemv(ops: &[DevOp], m: u32) -> DevProg {
         .collect();
     DevProg {
         t: m,
-        packed_prefill_only: false,
-        token_batch_body: false,
-        decode_rung: false,
+        role: packet::devbuild::ProgramRole::PrefillBucket { rows: m },
         n_counter: 0,
         insts,
         stream: Vec::new(),
@@ -3257,24 +3243,30 @@ fn local_dsa_selection_checks_rows_operands_and_object() {
             init: None,
         })
         .collect();
-    for (arch, tp8, dec_ix) in [
-        ("gfx942", true, 0),
-        ("gfx950", true, 0),
-        ("gfx942", false, 0),
-        ("gfx942", true, 1),
+    // Local DSA selection is a DECODE-side arm: a prefill bucket carrying it is refused.
+    for (arch, tp8, decode) in [
+        ("gfx942", true, true),
+        ("gfx950", true, true),
+        ("gfx942", false, true),
+        ("gfx942", true, false),
     ] {
+        prog.role = if decode {
+            packet::devbuild::ProgramRole::DecodeRung { rows: prog.t }
+        } else {
+            packet::devbuild::ProgramRole::PrefillBucket { rows: prog.t }
+        };
         assert_eq!(
-            check_dsa_select_local(std::slice::from_ref(&prog), &tensors, dec_ix, arch, tp8)
-                .is_ok(),
-            arch == "gfx942" && tp8 && dec_ix == 0
+            check_dsa_select_local(std::slice::from_ref(&prog), &tensors, arch, tp8).is_ok(),
+            arch == "gfx942" && tp8 && decode
         );
     }
+    prog.role = packet::devbuild::ProgramRole::DecodeRung { rows: prog.t };
     for rows in [1, 2, 4, 8, 16, 20, 32] {
         prog.t = rows;
+        prog.role = packet::devbuild::ProgramRole::DecodeRung { rows };
         prog.insts[0].blocks = rows as u16;
         assert_eq!(
-            check_dsa_select_local(std::slice::from_ref(&prog), &tensors, 0, "gfx942", true)
-                .is_ok(),
+            check_dsa_select_local(std::slice::from_ref(&prog), &tensors, "gfx942", true).is_ok(),
             matches!(rows, 2 | 4 | 8)
         );
     }
@@ -3289,9 +3281,10 @@ fn local_dsa_selection_checks_rows_operands_and_object() {
         .collect();
     for rows in [16, 20, 21, 32] {
         prog.t = rows;
+        prog.role = packet::devbuild::ProgramRole::DecodeRung { rows };
         prog.insts[0].blocks = rows as u16;
         assert_eq!(
-            check_dsa_select_local(std::slice::from_ref(&prog), &wide, 0, "gfx942", true).is_ok(),
+            check_dsa_select_local(std::slice::from_ref(&prog), &wide, "gfx942", true).is_ok(),
             matches!(rows, 16 | 20)
         );
     }
@@ -3300,23 +3293,20 @@ fn local_dsa_selection_checks_rows_operands_and_object() {
     for operand in 0..3 {
         wide[operand].bytes -= 1;
         assert!(
-            check_dsa_select_local(std::slice::from_ref(&prog), &wide, 0, "gfx942", true).is_err()
+            check_dsa_select_local(std::slice::from_ref(&prog), &wide, "gfx942", true).is_err()
         );
         wide[operand].bytes += 1;
     }
     prog.t = 8;
     prog.insts[0].blocks = 8;
     tensors[2].bytes -= 1;
-    assert!(
-        check_dsa_select_local(std::slice::from_ref(&prog), &tensors, 0, "gfx942", true).is_err()
-    );
+    assert!(check_dsa_select_local(std::slice::from_ref(&prog), &tensors, "gfx942", true).is_err());
     tensors[2].bytes += 1;
     for (slot, bad) in [(0, 2047), (1, 1024), (2, 2), (3, 1), (4, 2)] {
         let good = prog.insts[0].i[slot];
         prog.insts[0].i[slot] = bad;
         assert!(
-            check_dsa_select_local(std::slice::from_ref(&prog), &tensors, 0, "gfx942", true)
-                .is_err()
+            check_dsa_select_local(std::slice::from_ref(&prog), &tensors, "gfx942", true).is_err()
         );
         prog.insts[0].i[slot] = good;
     }
@@ -4982,14 +4972,14 @@ fn native_moe_decode_keeps_ordered_xcd_boundaries() {
         decode_segment_kinds(&p).unwrap()[1],
         DecodeSegmentKind::MoeAiter
     );
-    validate_decode_dispatch(std::slice::from_ref(&p), 0).unwrap();
+    validate_decode_dispatch([(0, &p)]).unwrap();
     p.l2_domains = 8;
-    assert!(validate_decode_dispatch(std::slice::from_ref(&p), 0).is_err());
+    assert!(validate_decode_dispatch([(0, &p)]).is_err());
     p.gq_stream = p.stream.clone();
     p.gq_seg_ofs = std::iter::once(0)
         .chain((1..=3).flat_map(|n| std::iter::repeat_n(n, 8)))
         .collect();
-    validate_decode_dispatch(std::slice::from_ref(&p), 0).unwrap();
+    validate_decode_dispatch([(0, &p)]).unwrap();
     for bad in 0..4 {
         let mut p = make();
         match bad {
@@ -5015,14 +5005,14 @@ fn native_gemm_decode_keeps_ordered_xcd_boundaries() {
         decode_segment_kinds(&p).unwrap()[1],
         DecodeSegmentKind::GemmLt
     );
-    validate_decode_dispatch(std::slice::from_ref(&p), 0).unwrap();
+    validate_decode_dispatch([(0, &p)]).unwrap();
     p.l2_domains = 8;
-    assert!(validate_decode_dispatch(std::slice::from_ref(&p), 0).is_err());
+    assert!(validate_decode_dispatch([(0, &p)]).is_err());
     p.gq_stream = p.stream.clone();
     p.gq_seg_ofs = std::iter::once(0)
         .chain((1..=3).flat_map(|n| std::iter::repeat_n(n, 8)))
         .collect();
-    validate_decode_dispatch(std::slice::from_ref(&p), 0).unwrap();
+    validate_decode_dispatch([(0, &p)]).unwrap();
     for bad in 0..4 {
         let mut p = make();
         match bad {
@@ -5065,9 +5055,7 @@ fn resident_moe_weight_layout_matches_gpu_vector_packing() {
 fn packed_prefill_predicate_admits_native_moe_and_gemm_lt_and_refuses_sparse_selectors() {
     let prog = |ops: &[DevOp]| DevProg {
         t: 2048,
-        packed_prefill_only: true,
-        token_batch_body: false,
-        decode_rung: false,
+        role: packet::devbuild::ProgramRole::PackedSibling { of_rows: 2048 },
         n_counter: 0,
         insts: ops
             .iter()
@@ -5136,9 +5124,7 @@ fn packed_prefill_predicate_admits_native_moe_and_gemm_lt_and_refuses_sparse_sel
 fn token_batch_body_probe(t: u32) -> (DevProg, Vec<crate::asset::devblob::DevTensor>) {
     let prog = DevProg {
         t,
-        packed_prefill_only: false,
-        token_batch_body: true,
-        decode_rung: false,
+        role: packet::devbuild::ProgramRole::TokenBatchBody { band: 8, rows: t },
         n_counter: 0,
         insts: vec![DevInst64 {
             op: DevOp::GemmLtPf as u16,
@@ -5192,6 +5178,6 @@ fn token_batch_body_refuses_a_native_only_packet_without_its_route() {
     assert!(err.contains("GemmLtPf"), "{err}");
     // An ordinary packed program is not held to it: the check is keyed on the body flag.
     let (mut plain, _) = token_batch_body_probe(2048);
-    plain.token_batch_body = false;
+    plain.role = packet::devbuild::ProgramRole::PackedSibling { of_rows: plain.t };
     assert!(token_batch_body_native_routes(&plain, &[PrefillSegmentRoute::Interpreter]).is_err());
 }

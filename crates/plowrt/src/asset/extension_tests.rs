@@ -336,7 +336,7 @@ fn an_extension_states_its_roles_because_it_has_no_position_to_imply_them() {
         false,
     )
     .unwrap();
-    assert!(!bucket.progs[0].decode_rung);
+    assert!(!bucket.progs[0].role.is_decode_rung());
     assert_eq!(
         bucket.program_roles(),
         vec![ProgramRole::PrefillBucket { rows: 4096 }]
@@ -347,12 +347,29 @@ fn an_extension_states_its_roles_because_it_has_no_position_to_imply_them() {
         false,
     )
     .unwrap();
-    assert!(r.progs[0].decode_rung);
+    assert!(r.progs[0].role.is_decode_rung());
     assert_eq!(r.progs[0].t, 12, "the role bit is masked out of the row count");
     assert_eq!(r.program_roles(), vec![ProgramRole::DecodeRung { rows: 12 }]);
 
-    // A parent never sets it, and its ladder is still positional.
-    assert!(parent.progs.iter().all(|p| !p.decode_rung));
+    // A parent never sets the bit, and its ladder is still the positional one: the same
+    // `prog_t` read as an extension would call every program a bucket.
+    assert_eq!(
+        parent.program_roles(),
+        vec![
+            ProgramRole::PrefillBucket { rows: 512 },
+            ProgramRole::PrefillBucket { rows: 2048 },
+            ProgramRole::PrefillBucket { rows: 8192 },
+            ProgramRole::DecodeRung { rows: 1 },
+            ProgramRole::DecodeRung { rows: 8 },
+        ]
+    );
+    assert!(packet::devbuild::derive_roles(
+        &[512, 2048, 8192, 1, 8],
+        packet::devbuild::RoleSource::Stated,
+        |_| 0
+    )
+    .iter()
+    .all(|r| r.is_prefill_bucket()));
 }
 
 // --- the facts ---------------------------------------------------------------

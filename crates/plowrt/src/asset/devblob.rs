@@ -29,19 +29,25 @@ pub struct DevTensor {
     pub init: Option<std::ops::Range<usize>>,
 }
 
+/// A role predicate as a plain `fn`, so both phases of [`DevBlob::prefill_phase`] /
+/// [`DevBlob::decode_phase`] have the SAME iterator type and unify in an `if`/`else`.
+type PhaseFilter = for<'a, 'b> fn(&'a &'b DevProg) -> bool;
+
+/// One phase of the program table, by role. `Clone`, so a caller may make several passes.
+pub type PhaseProgs<'a> = std::iter::Filter<std::slice::Iter<'a, DevProg>, PhaseFilter>;
+
 /// One compiled program (a prefill bucket, or the T=1 decode program last).
 pub struct DevProg {
     /// The T this program was compiled for (decode = 1).
     pub t: u32,
-    /// This topology is selected only for a genuinely packed prefill dispatch.
-    pub packed_prefill_only: bool,
-    /// A token-batch BODY (`packet::devbuild::TOKEN_BATCH_PROG`): prefill width `t` with a
-    /// slot-indexed decode band; selected only by the token-batch route, never as a rung.
-    pub token_batch_body: bool,
-    /// An EXPLICIT decode rung (`packet::devbuild::DECODE_RUNG_PROG`). Always `false` in a
-    /// parent packet, where the ladder is positional; an extension states it, because a lone
-    /// program has no position to read the role out of.
-    pub decode_rung: bool,
+    /// What this program is FOR (`packet::devbuild::ProgramRole`). Stamped once, by
+    /// [`packet::devbuild::derive_roles`], when the table is parsed; every ladder derivation
+    /// filters on it instead of slicing the table by index.
+    ///
+    /// A PARENT packet's bucket-vs-rung split is positional; an EXTENSION states it with
+    /// `packet::devbuild::DECODE_RUNG_PROG`, because a lone program has no position to read
+    /// the role out of. Which rule applied is settled here and nowhere else.
+    pub role: packet::devbuild::ProgramRole,
     pub n_counter: u32,
     pub insts: Vec<DevInst64>,
     pub stream: Vec<StreamEnt>,
@@ -295,14 +301,16 @@ impl DevBlob {
         let kvrow = take::<u32>(buf, &mut off, hdr.n_kvrow as usize, "kvrow table")?;
 
         let mut progs = Vec::with_capacity(hdr.n_prog as usize);
+        let mut prog_t = Vec::with_capacity(hdr.n_prog as usize);
         for p in 0..hdr.n_prog {
             let ph: BlobProgHeader = take::<BlobProgHeader>(buf, &mut off, 1, "prog header")?[0];
             let what = |s: &str| format!("prog {p} {s}");
+            prog_t.push(ph.t);
             progs.push(DevProg {
                 t: packet::devbuild::program_rows(ph.t),
-                packed_prefill_only: packet::devbuild::is_packed_prefill_program(ph.t),
-                token_batch_body: packet::devbuild::is_token_batch_program(ph.t),
-                decode_rung: packet::devbuild::is_decode_rung_program(ph.t),
+                // Placeholder: a role needs the WHOLE table (the bucket/rung split has no wire
+                // field yet and falls back to `decode_rung_lo`), so it is stamped below.
+                role: packet::devbuild::ProgramRole::PrefillBucket { rows: 0 },
                 n_counter: ph.n_counter,
                 insts: take(buf, &mut off, ph.n_inst as usize, &what("insts"))?,
                 stream: take(buf, &mut off, ph.n_stream as usize, &what("stream"))?,
@@ -314,6 +322,25 @@ impl DevBlob {
                 gq_seg_ofs: Vec::new(),
                 l2_domains: 0,
             });
+        }
+
+        // THE ONE PLACE a loaded table is turned into roles. Everything downstream — both
+        // ladders, the packed-sibling lookup, the token-batch route and the per-phase object
+        // requirements — filters on `DevProg::role` and never on the program's index.
+        //
+        // The CONTAINER picks the rule, and this is the only place that choice is made: a
+        // parent's bucket/rung split is the positional `decode_rung_lo` run, an extension has
+        // no position and states its roles instead (docs/arch/19, phases 1-2).
+        let source = if is_ext {
+            packet::devbuild::RoleSource::Stated
+        } else {
+            packet::devbuild::RoleSource::Positional
+        };
+        let roles = packet::devbuild::derive_roles(&prog_t, source, |i| {
+            packet::devbuild::token_batch_band_of(&progs[i].insts)
+        });
+        for (prog, role) in progs.iter_mut().zip(roles) {
+            prog.role = role;
         }
 
         // Optional GQ01 appendix: per program { n_seg, gq_stream[n_stream],
@@ -564,23 +591,11 @@ impl DevBlob {
         plow_asset::extension::tensor_table_digest(&self.tensor_identities(), self.tp_degree())
     }
 
-    /// The programs' roles, derived the way the positional code does today.
-    ///
-    /// **Phase 1 adapter.** Once `ProgramRole` lands on `plow_asset::program::Program`, this
-    /// reads `p.role` instead of re-deriving it, and the derivation and its `decode_rung_lo`
-    /// call go away. Callers see the same `Vec<ProgramRole>` either way.
-    pub fn program_roles(&self) -> Vec<plow_asset::extension::ProgramRole> {
-        let bits: Vec<plow_asset::extension::RoleBits> = self
-            .progs
-            .iter()
-            .map(|p| (p.t, p.packed_prefill_only, p.token_batch_body, p.decode_rung))
-            .collect();
-        // An extension has no positional boundary to derive from — see `roles_from_flags`.
-        if self.parent.is_some() {
-            plow_asset::extension::roles_from_flags(&bits)
-        } else {
-            plow_asset::extension::roles_from_positional(&bits, self.decode_rung_lo())
-        }
+    /// The programs' roles, in table order. Stamped at parse by
+    /// [`packet::devbuild::derive_roles`] under the rule this container's magic selected, so
+    /// there is nothing to re-derive here and no second definition to disagree with.
+    pub fn program_roles(&self) -> Vec<packet::devbuild::ProgramRole> {
+        self.progs.iter().map(|p| p.role).collect()
     }
 
     /// What one program costs the arenas (rule 6). Instruction-stream bytes are the records
@@ -666,8 +681,7 @@ impl DevBlob {
             .iter()
             .map(|p| Program {
                 rows: p.t,
-                packed_prefill_only: p.packed_prefill_only,
-                token_batch_body: p.token_batch_body,
+                role: p.role,
                 n_counter: p.n_counter,
                 insts: &p.insts,
                 stream: &p.stream,
@@ -691,21 +705,80 @@ impl DevBlob {
         })
     }
 
-    /// Index of the first decode rung. The compiler emits prefill buckets first,
-    /// then a trailing ascending decode ladder whose widths are at most 128.
-    pub fn decode_rung_lo(&self) -> usize {
-        let widths: Vec<u32> = self.progs.iter().map(|p| p.t).collect();
-        packet::devbuild::decode_rung_lo(&widths)
+    /// Re-derive every program's role from the table, for a blob ASSEMBLED IN MEMORY rather
+    /// than parsed. A program already marked as a packed sibling or a token-batch body keeps
+    /// that marker; the rest split into buckets and rungs by the same rule
+    /// [`packet::devbuild::derive_roles`] applies at load.
+    #[cfg(test)]
+    pub(crate) fn stamp_roles(&mut self) {
+        use packet::devbuild::ProgramRole;
+        let prog_t: Vec<u32> = self
+            .progs
+            .iter()
+            .map(|p| match p.role {
+                ProgramRole::PackedSibling { .. } => {
+                    packet::devbuild::packed_prefill_program_t(p.t)
+                }
+                ProgramRole::TokenBatchBody { .. } => packet::devbuild::token_batch_program_t(p.t),
+                ProgramRole::DecodeRung { .. } if self.parent.is_some() => {
+                    packet::devbuild::decode_rung_program_t(p.t)
+                }
+                _ => p.t,
+            })
+            .collect();
+        let source = if self.parent.is_some() {
+            packet::devbuild::RoleSource::Stated
+        } else {
+            packet::devbuild::RoleSource::Positional
+        };
+        let roles = packet::devbuild::derive_roles(&prog_t, source, |i| {
+            packet::devbuild::token_batch_band_of(&self.progs[i].insts)
+        });
+        for (prog, role) in self.progs.iter_mut().zip(roles) {
+            prog.role = role;
+        }
     }
 
-    /// Prefill bucket programs, excluding every decode rung.
-    pub fn prefill_progs(&self) -> &[DevProg] {
-        &self.progs[..self.decode_rung_lo()]
+    /// Number of prefill-side programs, i.e. the index the decode ladder starts at on a table
+    /// the emitter laid out. Role-derived, so it is a COUNT and not a boundary: a caller that
+    /// wants "the decode programs" asks [`Self::decode_phase`].
+    pub fn decode_rung_lo(&self) -> usize {
+        self.progs
+            .iter()
+            .filter(|p| p.role.is_prefill_side())
+            .count()
+    }
+
+    /// Every prefill-side program — bucket, packed sibling or token-batch body — in table
+    /// order. The old `progs[..decode_rung_lo]` slice, by role.
+    pub fn prefill_phase(&self) -> PhaseProgs<'_> {
+        fn prefill_side(p: &&DevProg) -> bool {
+            p.role.is_prefill_side()
+        }
+        self.progs.iter().filter(prefill_side as PhaseFilter)
+    }
+
+    /// Every decode rung, in table order. The old `progs[decode_rung_lo..]` slice, by role.
+    pub fn decode_phase(&self) -> PhaseProgs<'_> {
+        fn decode_rung(p: &&DevProg) -> bool {
+            p.role.is_decode_rung()
+        }
+        self.progs.iter().filter(decode_rung as PhaseFilter)
+    }
+
+    /// Every prefill-side program, in TABLE ORDER — the old `progs[..decode_rung_lo]` slice.
+    /// Callers index this against the packet's own program numbering, so it must not be
+    /// reordered or thinned; the bucket LADDER (buckets only, by width) is
+    /// `exec::amd::AmdEngine::prefill_rungs`.
+    pub fn prefill_progs(&self) -> Vec<&DevProg> {
+        self.prefill_phase().collect()
     }
 
     /// Decode rung programs in ascending width order.
-    pub fn decode_progs(&self) -> &[DevProg] {
-        &self.progs[self.decode_rung_lo()..]
+    pub fn decode_progs(&self) -> Vec<&DevProg> {
+        let mut out: Vec<&DevProg> = self.decode_phase().collect();
+        out.sort_by_key(|p| p.t);
+        out
     }
 
     /// Widths advertised by the decode ladder.
@@ -716,7 +789,7 @@ impl DevBlob {
     /// The widest decode program. This remains the last program for both the
     /// legacy one-rung blob and a decode ladder.
     pub fn decode_prog(&self) -> Result<&DevProg> {
-        let g = self
+        let g = *self
             .decode_progs()
             .last()
             .ok_or_else(|| RuntimeError::Device("devblob: no programs".into()))?;
@@ -1070,9 +1143,7 @@ mod tests {
             .collect();
         let program = DevProg {
             t: 128,
-            packed_prefill_only: false,
-            token_batch_body: false,
-            decode_rung: false,
+            role: packet::devbuild::ProgramRole::PrefillBucket { rows: 0 },
             n_counter: 0,
             insts,
             stream,
@@ -1122,9 +1193,7 @@ mod tests {
             .collect();
         let program = DevProg {
             t: 128,
-            packed_prefill_only: false,
-            token_batch_body: false,
-            decode_rung: false,
+            role: packet::devbuild::ProgramRole::PrefillBucket { rows: 0 },
             n_counter: 0,
             insts,
             stream,
@@ -1160,9 +1229,7 @@ mod tests {
         };
         let prog = |t: u32, insts: Vec<DevInst64>| DevProg {
             t,
-            packed_prefill_only: false,
-            token_batch_body: false,
-            decode_rung: false,
+            role: packet::devbuild::ProgramRole::PrefillBucket { rows: 0 },
             n_counter: 0,
             insts,
             stream: Vec::new(),
@@ -1518,6 +1585,150 @@ mod tests {
         assert_eq!(b.decode_prog().unwrap().t, 16);
     }
 
+    /// The POSITIONAL derivation this branch replaced, kept verbatim as the oracle: program
+    /// `[0, dec_lo)` is prefill-side, `[dec_lo, n)` is a decode rung, and the two booleans
+    /// `PACKED_PREFILL_PROG` / `TOKEN_BATCH_PROG` carve the exceptions out of the first range.
+    fn positional_oracle(blob: &DevBlob, encoded: &[u32]) -> (usize, Vec<u32>, Vec<u32>, Vec<u32>) {
+        let widths: Vec<u32> = blob.progs.iter().map(|p| p.t).collect();
+        let dec_lo = packet::devbuild::decode_rung_lo(&widths);
+        let prefill_side: Vec<u32> = widths[..dec_lo].to_vec();
+        let rungs: Vec<u32> = widths[dec_lo..].to_vec();
+        let buckets: Vec<u32> = (0..dec_lo)
+            .filter(|&i| {
+                !packet::devbuild::is_packed_prefill_program(encoded[i])
+                    && !packet::devbuild::is_token_batch_program(encoded[i])
+            })
+            .map(|i| widths[i])
+            .collect();
+        (dec_lo, prefill_side, rungs, buckets)
+    }
+
+    /// The narrowest rung covering `rows`, saturating at the widest — `AmdEngine::decode_prog_for`
+    /// and `CpuModel::decode_prog_for` are this function over their own ladder.
+    fn rung_for(rungs: &[u32], rows: usize) -> u32 {
+        rungs
+            .iter()
+            .copied()
+            .find(|&t| t as usize >= rows)
+            .unwrap_or_else(|| *rungs.last().unwrap())
+    }
+
+    /// THE PIN for phase 1 of `docs/arch/19-packet-extensions.md`. Both ladders, the
+    /// object-phase split and the per-row-count rung selection come out of the ROLES exactly as
+    /// they came out of the index boundary, for every ladder shape the emitter produces.
+    fn assert_role_ladders_match_positional(blob: &DevBlob, encoded: &[u32]) {
+        let (dec_lo, prefill_side, rungs, buckets) = positional_oracle(blob, encoded);
+
+        assert_eq!(blob.decode_rung_lo(), dec_lo);
+        assert_eq!(
+            blob.prefill_phase().map(|p| p.t).collect::<Vec<_>>(),
+            prefill_side
+        );
+        assert_eq!(blob.decode_phase().map(|p| p.t).collect::<Vec<_>>(), rungs);
+        assert_eq!(blob.decode_rungs(), rungs);
+        assert_eq!(blob.decode_prog().unwrap().t, *rungs.last().unwrap());
+
+        // The bucket ladder the chunk planner walks: roles filtered, width-sorted.
+        let mut by_role: Vec<u32> = blob
+            .progs
+            .iter()
+            .filter(|p| p.role.is_prefill_bucket())
+            .map(|p| p.t)
+            .collect();
+        by_role.sort_unstable();
+        let mut want = buckets.clone();
+        want.sort_unstable();
+        assert_eq!(by_role, want);
+
+        // `decode_rung_lo` selection, for EVERY row count the ladder can be asked about.
+        let ladder: Vec<u32> = {
+            let mut ix: Vec<&DevProg> = blob
+                .progs
+                .iter()
+                .filter(|p| p.role.is_decode_rung())
+                .collect();
+            ix.sort_by_key(|p| p.t);
+            ix.iter().map(|p| p.t).collect()
+        };
+        for rows in 0..=(rungs.last().copied().unwrap_or(1) as usize + 4) {
+            assert_eq!(
+                rung_for(&ladder, rows),
+                rung_for(&rungs, rows),
+                "rows={rows}"
+            );
+        }
+    }
+
+    #[test]
+    fn role_derived_ladders_match_the_positional_ones() {
+        let pf = [128u32, 512, 1024];
+        let dec = [1u32, 2, 4, 8, 16];
+        let mut tables: Vec<Vec<u32>> = vec![vec![128, 1], vec![1], vec![128, 128]];
+        for n in 1..=dec.len() {
+            tables.push(pf.iter().chain(&dec[..n]).copied().collect());
+            let mut with_siblings: Vec<u32> = pf.to_vec();
+            with_siblings.extend(
+                pf.iter()
+                    .copied()
+                    .map(packet::devbuild::packed_prefill_program_t),
+            );
+            with_siblings.extend(
+                pf[1..]
+                    .iter()
+                    .copied()
+                    .map(packet::devbuild::token_batch_program_t),
+            );
+            with_siblings.extend(&dec[..n]);
+            tables.push(with_siblings);
+        }
+
+        for table in tables {
+            let mut m = tiny_model();
+            m.progs = (0..table.len())
+                .map(|_| tiny_model().progs.pop().unwrap())
+                .collect();
+            m.prog_t = table.clone();
+            let blob = DevBlob::parse(&m.to_blob()).unwrap();
+            assert_role_ladders_match_positional(&blob, &table);
+        }
+    }
+
+    /// The same pin against a REAL, already-emitted packet — the property backward
+    /// compatibility rests on. `TEST_ROLE_LADDER_PACKET=/path/to/model.pkt`.
+    #[test]
+    fn actual_packet_ladders_match_the_positional_ones() {
+        let Ok(path) = std::env::var("TEST_ROLE_LADDER_PACKET") else {
+            eprintln!("skipped: set TEST_ROLE_LADDER_PACKET to a model.pkt");
+            return;
+        };
+        let bytes = std::fs::read(&path).unwrap();
+        let blob = DevBlob::parse(&bytes).unwrap();
+        // Re-encode the wire `t` words the packet carried, so the oracle sees what it saw.
+        let encoded: Vec<u32> = blob
+            .progs
+            .iter()
+            .map(|p| match p.role {
+                packet::devbuild::ProgramRole::PackedSibling { .. } => {
+                    packet::devbuild::packed_prefill_program_t(p.t)
+                }
+                packet::devbuild::ProgramRole::TokenBatchBody { .. } => {
+                    packet::devbuild::token_batch_program_t(p.t)
+                }
+                _ => p.t,
+            })
+            .collect();
+        assert_role_ladders_match_positional(&blob, &encoded);
+        eprintln!(
+            "{path}: buckets {:?} rungs {:?}",
+            blob.progs
+                .iter()
+                .filter(|p| p.role.is_prefill_bucket())
+                .map(|p| p.t)
+                .collect::<Vec<_>>(),
+            blob.decode_rungs()
+        );
+    }
+
     #[test]
     fn packed_prefill_program_tag_is_normalized_but_retained_as_a_role() {
         let mut m = tiny_model();
@@ -1527,9 +1738,9 @@ mod tests {
         let b = DevBlob::parse(&m.to_blob()).unwrap();
         assert_eq!(b.decode_rung_lo(), 2);
         assert_eq!(b.progs[0].t, 128);
-        assert!(!b.progs[0].packed_prefill_only);
+        assert!(b.progs[0].role.is_prefill_bucket());
         assert_eq!(b.progs[1].t, 128);
-        assert!(b.progs[1].packed_prefill_only);
+        assert!(b.progs[1].role.is_packed_sibling());
         assert_eq!(b.decode_rungs(), vec![1]);
     }
 

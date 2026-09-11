@@ -3,6 +3,10 @@
 //! pairs ARE the contract: phase 4's emitter is written against them.
 
 use super::*;
+use packet::devbuild::{
+    decode_rung_program_t, derive_roles, packed_prefill_program_t, token_batch_program_t,
+    RoleSource,
+};
 
 // --- fixtures ----------------------------------------------------------------
 
@@ -58,17 +62,10 @@ fn parent() -> ParentFacts {
         tensor_digest: tensor_table_digest(&tensors(), 8),
         config: axes(),
         kv: KvRing::FullCausal,
-        programs: roles_from_positional(
-            &[
-                (512, false, false, false),
-                (2048, false, false, false),
-                (8192, false, false, false),
-                (8192, true, false, false),
-                (1, false, false, false),
-                (8, false, false, false),
-                (32, false, false, false),
-            ],
-            4,
+        programs: derive_roles(
+            &[512, 2048, 8192, packed_prefill_program_t(8192), 1, 8, 32],
+            RoleSource::Positional,
+            |_| 0,
         ),
         decode_batch: 32,
         arenas: Arenas {
@@ -128,11 +125,11 @@ fn a_parent_with_no_extensions_is_the_identity() {
 }
 
 #[test]
-fn the_positional_adapter_reproduces_todays_ladders() {
+fn the_two_role_sources_split_a_parent_and_an_extension_the_way_each_needs() {
     let p = parent();
     // The packed sibling at 8192 sits INSIDE the prefill range and is not a bucket; the three
-    // trailing widths are the decode ladder. This is what `decode_rung_lo` + the two booleans
-    // say today, and it is what phase 1's roles must keep saying.
+    // trailing widths are the decode ladder. This is what `decode_rung_lo` plus the two markers
+    // said before roles existed, and it is what `RoleSource::Positional` keeps saying.
     assert_eq!(
         p.programs,
         vec![
@@ -145,31 +142,33 @@ fn the_positional_adapter_reproduces_todays_ladders() {
             ProgramRole::DecodeRung { rows: 32 },
         ]
     );
-    let tb = roles_from_positional(
-        &[
-            (512, false, false, false),
-            (256, false, true, false),
-            (1, false, false, false),
-        ],
-        2,
+    let tb = derive_roles(
+        &[512, token_batch_program_t(256), 1],
+        RoleSource::Positional,
+        |_| 0,
     );
     assert_eq!(tb[1], ProgramRole::TokenBatchBody { band: 0, rows: 256 });
 
     // An extension has no position to read a role out of, so it states them: an unmarked
     // program is a prefill bucket and a marked one is a rung, whatever its index.
     assert_eq!(
-        roles_from_flags(&[(4096, false, false, false)]),
+        derive_roles(&[4096], RoleSource::Stated, |_| 0),
         vec![ProgramRole::PrefillBucket { rows: 4096 }]
     );
     assert_eq!(
-        roles_from_flags(&[(12, false, false, true)]),
+        derive_roles(&[decode_rung_program_t(12)], RoleSource::Stated, |_| 0),
         vec![ProgramRole::DecodeRung { rows: 12 }]
     );
     assert_eq!(
-        roles_from_positional(&[(4096, false, false, false)], 0),
+        derive_roles(&[4096], RoleSource::Positional, |_| 0),
         vec![ProgramRole::DecodeRung { rows: 4096 }],
-        "the positional rule alone reads a lone program as a rung — the defect roles_from_flags \
-         exists for"
+        "the positional rule alone reads a lone program as a rung — the defect \
+         `RoleSource::Stated` exists for"
+    );
+    // A stated bit wins in either container, so the two sources agree wherever both speak.
+    assert_eq!(
+        derive_roles(&[decode_rung_program_t(12)], RoleSource::Positional, |_| 0),
+        derive_roles(&[decode_rung_program_t(12)], RoleSource::Stated, |_| 0)
     );
 }
 

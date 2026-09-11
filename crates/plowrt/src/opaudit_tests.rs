@@ -13,9 +13,7 @@ fn inst(op: DevOp) -> DevInst64 {
 fn prog(t: u32, ops: &[DevInst64]) -> DevProg {
     DevProg {
         t,
-        packed_prefill_only: false,
-        token_batch_body: false,
-            decode_rung: false,
+        role: packet::devbuild::ProgramRole::PrefillBucket { rows: t },
         n_counter: 0,
         insts: ops.to_vec(),
         stream: Vec::new(),

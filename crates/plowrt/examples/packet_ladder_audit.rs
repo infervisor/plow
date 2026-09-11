@@ -15,7 +15,7 @@ fn validate_kernel_cases(blob: &DevBlob, manifest: &serde_json::Value) -> Result
         return Err("build manifest program count differs from packet".into());
     }
     for (index, (p, declared)) in blob.progs.iter().zip(programs).enumerate() {
-        let phase = if index < blob.decode_rung_lo() {
+        let phase = if p.role.is_prefill_side() {
             "prefill"
         } else {
             "decode"
@@ -23,7 +23,7 @@ fn validate_kernel_cases(blob: &DevBlob, manifest: &serde_json::Value) -> Result
         if declared["program"] != index
             || declared["kind"] != phase
             || declared["rows"] != packet::devbuild::program_rows(p.t)
-            || declared["packed_only"] != p.packed_prefill_only
+            || declared["packed_only"] != p.role.is_packed_sibling()
             || declared["instruction_count"] != p.insts.len()
         {
             return Err(format!(
@@ -455,7 +455,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .collect();
             json!({"index": index, "phase": if index < decode {"prefill"} else {"decode"},
                "rows": packet::devbuild::program_rows(p.t),
-               "packed_only": p.packed_prefill_only, "op_counts": counts,
+               "packed_only": p.role.is_packed_sibling(), "op_counts": counts,
                "counter_count": p.n_counter, "wait_count": p.waits.len(),
                "segment_offsets": p.gq_seg_ofs, "segments": segments, "instructions": insts,
                "kernel_cases": cases})

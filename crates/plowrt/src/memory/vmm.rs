@@ -2083,9 +2083,7 @@ mod tests {
             insts.push(reader);
             DevProg {
                 t: rows,
-                packed_prefill_only: false,
-                token_batch_body: false,
-            decode_rung: false,
+                role: packet::devbuild::ProgramRole::PrefillBucket { rows },
                 n_counter: 0,
                 insts,
                 stream: Vec::new(),
@@ -2098,7 +2096,7 @@ mod tests {
                 l2_domains: 0,
             }
         };
-        DevBlob {
+        let mut blob = DevBlob {
             n_cu: 1,
             flags: 0,
             target: 0,
@@ -2131,7 +2129,9 @@ mod tests {
             gen: Vec::new(),
             tp: None,
             parent: None,
-        }
+        };
+        blob.stamp_roles();
+        blob
     }
 
     #[test]
@@ -2404,7 +2404,11 @@ mod tests {
             |b| {
                 b.progs[1].insts.pop();
             },
-            |b| b.progs[0].packed_prefill_only = true,
+            |b| {
+                b.progs[0].role = packet::devbuild::ProgramRole::PackedSibling {
+                    of_rows: b.progs[0].t,
+                }
+            },
             |b| b.progs[2].insts[2].op = DevOp::FlashDecodeFp8 as u16,
         ];
         for (i, mutate) in mutations.iter().enumerate() {

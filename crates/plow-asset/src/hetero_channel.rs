@@ -210,7 +210,7 @@ impl ChannelPlan {
                 .get(pp.prog as usize)
                 .ok_or("channel MLP: missing program")?;
             need(
-                !prog.packed_prefill_only
+                !prog.role.is_packed_sibling()
                     && prog.rows == pp.rows
                     && pp.rows == 128
                     && pp.min_rows == 64

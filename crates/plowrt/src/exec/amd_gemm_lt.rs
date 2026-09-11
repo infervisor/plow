@@ -339,9 +339,7 @@ mod tests {
     fn fixture() -> (DevProg, Vec<DevTensor>) {
         let prog = DevProg {
             t: 8192,
-            packed_prefill_only: false,
-            token_batch_body: false,
-            decode_rung: false,
+            role: packet::devbuild::ProgramRole::PrefillBucket { rows: 8192 },
             n_counter: 0,
             insts: vec![DevInst64 {
                 op: DevOp::GemmLtPf as u16,

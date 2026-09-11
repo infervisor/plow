@@ -277,95 +277,12 @@ pub enum KvRing {
 
 /// What a program IS, rather than where it sits in the table.
 ///
-/// **Phase 1 adapter.** The design (docs/arch/19) puts this on
-/// `plow_asset::program::Program`, written by the emitter, replacing the positional `dec_lo`
-/// boundary. That phase is landing separately on `program-roles`. Until it does, this is the
-/// same enum with the same spelling, derived from the existing
-/// `(rows, packed_prefill_only, token_batch_body)` triple plus `decode_rung_lo` by
-/// [`roles_from_positional`]. When phase 1 lands, this definition moves to `program.rs`,
-/// `roles_from_positional` is deleted, and nothing else in this module changes: the rules only
-/// ever see `&[ProgramRole]`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum ProgramRole {
-    PrefillBucket { rows: u32 },
-    DecodeRung { rows: u32 },
-    PackedSibling { of_rows: u32 },
-    TokenBatchBody { band: u32, rows: u32 },
-}
-
-impl ProgramRole {
-    /// The width this program is selected at.
-    pub fn rows(self) -> u32 {
-        match self {
-            ProgramRole::PrefillBucket { rows }
-            | ProgramRole::DecodeRung { rows }
-            | ProgramRole::PackedSibling { of_rows: rows }
-            | ProgramRole::TokenBatchBody { rows, .. } => rows,
-        }
-    }
-
-    pub fn kind(self) -> &'static str {
-        match self {
-            ProgramRole::PrefillBucket { .. } => "prefill bucket",
-            ProgramRole::DecodeRung { .. } => "decode rung",
-            ProgramRole::PackedSibling { .. } => "packed sibling",
-            ProgramRole::TokenBatchBody { .. } => "token-batch body",
-        }
-    }
-}
-
-/// One program's role bits as the container carries them: `(rows, packed_prefill, token_batch,
-/// decode_rung)` — `BlobProgHeader::t` decoded.
-pub type RoleBits = (u32, bool, bool, bool);
-
-/// Derive a PARENT's roles the way the positional code does today, so phase 2 can be tested and
-/// shipped against a packet phase 1 has not touched.
-///
-/// `decode_lo` is `packet::devbuild::decode_rung_lo` over the same widths. `band` on a
-/// token-batch body is not recoverable from the positional bits and is reported as `0`; rule 5
-/// does not read it (a body names its bucket by `rows`).
-pub fn roles_from_positional(progs: &[RoleBits], decode_lo: usize) -> Vec<ProgramRole> {
-    progs
-        .iter()
-        .enumerate()
-        .map(|(i, &(rows, packed, token_batch, decode))| {
-            if token_batch {
-                ProgramRole::TokenBatchBody { band: 0, rows }
-            } else if packed {
-                ProgramRole::PackedSibling { of_rows: rows }
-            } else if decode || i >= decode_lo {
-                ProgramRole::DecodeRung { rows }
-            } else {
-                ProgramRole::PrefillBucket { rows }
-            }
-        })
-        .collect()
-}
-
-/// Derive an EXTENSION's roles from its stated bits alone.
-///
-/// An extension has no positional boundary: it carries one or two programs, and
-/// `decode_rung_lo` over a one-element table is `0`, so the positional rule would read every
-/// extension's single program as a decode rung — a 4096-row prefill bucket refused as a rung
-/// outside the decode band. An extension therefore STATES its roles
-/// (`packet::devbuild::DECODE_RUNG_PROG` and friends) and an unmarked program is a prefill
-/// bucket, which is what the emitter must write and what phase 1 generalises to the parent.
-pub fn roles_from_flags(progs: &[RoleBits]) -> Vec<ProgramRole> {
-    progs
-        .iter()
-        .map(|&(rows, packed, token_batch, decode)| {
-            if token_batch {
-                ProgramRole::TokenBatchBody { band: 0, rows }
-            } else if packed {
-                ProgramRole::PackedSibling { of_rows: rows }
-            } else if decode {
-                ProgramRole::DecodeRung { rows }
-            } else {
-                ProgramRole::PrefillBucket { rows }
-            }
-        })
-        .collect()
-}
+/// ONE type, defined where the emitter and every reader already live
+/// (docs/arch/19, phase 1). `packet::devbuild::derive_roles` is the single derivation: a PARENT
+/// falls back to the positional `decode_rung_lo` rule, an EXTENSION reads the role its
+/// `DECODE_RUNG_PROG` bit states. The rules below only ever see `&[ProgramRole]` and do not
+/// care which container produced them.
+pub use packet::devbuild::ProgramRole;
 
 // --- rule 6: budget ----------------------------------------------------------
 

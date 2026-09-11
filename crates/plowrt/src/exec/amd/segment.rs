@@ -11,7 +11,11 @@ pub(super) fn small_mla_segments(prog: &super::DevProg, segments: usize) -> Vec<
     // A packed sibling's or token-batch body's flash runs on the packed family object (the
     // `_tb` twin for a body), never on the small-MLA object; classifying it here would demand
     // that object at load for a segment it can never receive.
-    if prog.packed_prefill_only || prog.token_batch_body || prog.t == 0 || prog.t >= 2048 {
+    if prog.role.is_packed_sibling()
+        || prog.role.is_token_batch_body()
+        || prog.t == 0
+        || prog.t >= 2048
+    {
         return any;
     }
     for entry in &prog.stream {
@@ -212,7 +216,7 @@ impl AmdEngine {
         let family = self.progs[p].packed_seg_family[seg];
         // A token-batch body resolves rows through the slot-band descriptor, which only the
         // `_tb` family twins compile in; an ordinary packed program keeps the shipped objects.
-        let body = self.progs[p].token_batch_body;
+        let body = self.progs[p].role.is_token_batch_body();
         let (norm, flash) = if body {
             (self.k_packed_mla_norm_tb, self.k_packed_mla_flash_tb)
         } else {
