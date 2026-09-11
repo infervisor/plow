@@ -495,6 +495,19 @@ fn required_compiled_opcode_markers_are_fail_closed() {
 }
 
 #[test]
+fn interpreter_wave_geometry_rejects_missing_or_swapped_phase_objects() {
+    for phase in [Phase::Prefill, Phase::Decode, Phase::Flash] {
+        let expected = phase.interpreter_threads() / 64;
+        assert!(check_interpreter_waves(Some(expected), phase, Path::new("phase.elf")).is_ok());
+        for waves in [None, Some(0), Some(2), Some(if expected == 4 { 8 } else { 4 })] {
+            let error = check_interpreter_waves(waves, phase, Path::new("phase.elf"))
+                .expect_err("a filename cannot establish a compatible launch geometry");
+            assert!(error.to_string().contains("plow_geom_PLOW_WG_WAVES"));
+        }
+    }
+}
+
+#[test]
 fn specialised_decode_arms_require_a_build_manifest() {
     let mut plain = segmented_prog(&[DevOp::KdaStateStepG], &[0]);
     assert!(packet_decode_arm_requirements(std::slice::from_ref(&plain)).is_empty());

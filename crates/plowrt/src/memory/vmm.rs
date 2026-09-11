@@ -72,6 +72,12 @@ pub trait VmmOps: Send + Sync {
     fn alloc(&self, bytes: u64) -> Result<u64>;
     fn free(&self, va: u64);
     fn copy_dtod(&self, dst: u64, src: u64, bytes: u64) -> Result<()>;
+    fn copy_dtod_batch(&self, pairs: &[(u64, u64, u64)]) -> Result<()> {
+        for &(dst, src, bytes) in pairs {
+            self.copy_dtod(dst, src, bytes)?;
+        }
+        Ok(())
+    }
 
     /// Take every pooled physical chunk `(handle, bytes)` a previous
     /// [`VmmSlab`] kept via [`Self::pool_put`]. Re-mapping a pooled chunk is
@@ -594,11 +600,11 @@ struct Block {
     refs: u32,
 }
 
-/// Per-(full layer, K|V) VA reservation and its mapping table:
+/// Per-cache-tensor VA reservation and its mapping table:
 /// `slots[(seq·kvh + head)·bph + k]` = the block mapped at that window slot.
 struct Track {
     layer: u32,
-    /// 0 = K, 1 = V.
+    /// Caller-supplied tensor role; the legacy K/V layout uses 0/1.
     tensor: u32,
     va: u64,
     slots: Vec<Option<u32>>,
@@ -703,11 +709,22 @@ impl VmmKv {
         block_hint: u64,
         cache_cap: u64,
     ) -> Result<Self> {
-        Self::new_with_policy(ops, geo, block_hint, cache_cap, true)
+        Self::new_with_policy(ops, geo, block_hint, cache_cap, true, None)
+    }
+
+    /// Share explicitly listed, equally shaped tensors, including unpaired MLA caches.
+    pub fn new_tensors(
+        ops: Arc<dyn VmmOps>,
+        geo: VmmGeometry,
+        block_hint: u64,
+        cache_cap: u64,
+        tensors: &[(u32, u32)],
+    ) -> Result<Self> {
+        Self::new_with_policy(ops, geo, block_hint, cache_cap, true, Some(tensors))
     }
 
     pub fn new_live(ops: Arc<dyn VmmOps>, geo: VmmGeometry, block_hint: u64) -> Result<Self> {
-        Self::new_with_policy(ops, geo, block_hint, 0, false)
+        Self::new_with_policy(ops, geo, block_hint, 0, false, None)
     }
 
     pub fn prefix_reuse(&self) -> bool {
@@ -720,7 +737,20 @@ impl VmmKv {
         block_hint: u64,
         cache_cap: u64,
         prefix_reuse: bool,
+        tensors: Option<&[(u32, u32)]>,
     ) -> Result<Self> {
+        let tensors = tensors.map_or_else(
+            || geo.full_layers.iter().flat_map(|&layer| [(layer, 0), (layer, 1)]).collect(),
+            <[_]>::to_vec,
+        );
+        let mut unique = rustc_hash::FxHashSet::default();
+        if tensors.is_empty()
+            || tensors.iter().any(|&(layer, tensor)| {
+                !geo.full_layers.contains(&layer) || !unique.insert((layer, tensor))
+            })
+        {
+            return Err(RuntimeError::Rejected("vmm: invalid or duplicate cache tensor tracks".into()));
+        }
         let gran = ops.granularity()?;
         let row_bytes = geo.row_bytes();
         let head_span = geo.max_ctx as u64 * row_bytes;
@@ -729,19 +759,9 @@ impl VmmKv {
         let bph = (head_span / block_bytes) as u32;
 
         let span = geo.batch as u64 * geo.kvh_full as u64 * head_span;
-        let mut tracks = Vec::with_capacity(geo.full_layers.len() * 2);
+        let ntracks = tensors.len();
+        let tracks = Vec::with_capacity(ntracks);
         let nslots = (geo.batch * geo.kvh_full * bph) as usize;
-        for &layer in &geo.full_layers {
-            for tensor in 0..2u32 {
-                let va = ops.reserve(span)?;
-                tracks.push(Track {
-                    layer,
-                    tensor,
-                    va,
-                    slots: vec![None; nslots],
-                });
-            }
-        }
 
         // Dummy pool: the radix cache's `runs` are unused here (the payload
         // rides the `placed` side tables), so the geometry only has to be
@@ -788,12 +808,32 @@ impl VmmKv {
             frontier: (0..batch).map(|_| AtomicU32::new(0)).collect(),
             generation: (0..batch).map(|_| AtomicU64::new(0)).collect(),
         });
+        let mut pool = VmmKv {
+            prefix_reuse,
+            shared: Arc::clone(&shared),
+            premap_tx: None,
+            premap_join: None,
+            precreate: None,
+        };
+        {
+            let mut inner = shared.inner.lock();
+            for (layer, tensor) in tensors {
+                let va = shared.ops.reserve(span)?;
+                inner.tracks.push(Track {
+                    layer,
+                    tensor,
+                    va,
+                    slots: vec![None; nslots],
+                });
+            }
+        }
 
         // Pre-mapper: keeps the NEXT block mapped ahead of decode growth so
         // the 2048-token boundary never stalls a step (plan verdict §4 —
         // ~6.8 ms if synchronous, free when overlapped). `advise` feeds it;
         // `ensure_rows` in the step path is the correctness backstop.
         let (tx, rx) = std::sync::mpsc::channel::<(u32, u32, u64)>();
+        pool.premap_tx = Some(tx);
         let premap_shared = Arc::clone(&shared);
         let join = std::thread::Builder::new()
             .name("vmm-premap".into())
@@ -813,6 +853,7 @@ impl VmmKv {
                 }
             })
             .map_err(|e| RuntimeError::Device(format!("vmm premap thread: {e}")))?;
+        pool.premap_join = Some(join);
 
         tracing::info!(
             full_layers = shared.geo.full_layers.len(),
@@ -821,16 +862,10 @@ impl VmmKv {
             block_mib = block_bytes >> 20,
             block_rows,
             bph,
-            va_gib = (span * shared.geo.full_layers.len() as u64 * 2) as f64 / (1u64 << 30) as f64,
+            va_gib = (span * ntracks as u64) as f64 / (1u64 << 30) as f64,
             "vmm kv pool up (full layers VMM-backed, sliding on cudaMalloc)"
         );
-        Ok(VmmKv {
-            prefix_reuse,
-            shared,
-            premap_tx: Some(tx),
-            premap_join: Some(join),
-            precreate: None,
-        })
+        Ok(pool)
     }
 
     /// Turn on physical-block reuse: zero-ref blocks park in a pool (up to
@@ -2368,6 +2403,8 @@ mod tests {
     #[derive(Default)]
     struct MockVmm {
         next: AtomicU64,
+        reserves: AtomicU64,
+        address_frees: AtomicU64,
         creates: AtomicU64,
         releases: AtomicU64,
         maps: AtomicU64,
@@ -2375,6 +2412,7 @@ mod tests {
         allocs: AtomicU64,
         frees: AtomicU64,
         fail_creates: AtomicI64,
+        fail_reserves: AtomicI64,
         fail_maps: AtomicI64,
         fail_access: AtomicI64,
         pool: std::sync::Mutex<Vec<(u64, u64)>>,
@@ -2385,9 +2423,17 @@ mod tests {
             Ok(16)
         }
         fn reserve(&self, _bytes: u64) -> Result<u64> {
+            if self.fail_reserves.load(Ordering::SeqCst) > 0
+                && self.fail_reserves.fetch_sub(1, Ordering::SeqCst) == 1
+            {
+                return Err(RuntimeError::Oom("mock VA reservation failure".into()));
+            }
+            self.reserves.fetch_add(1, Ordering::SeqCst);
             Ok(self.next.fetch_add(1 << 32, Ordering::SeqCst) + (1 << 32))
         }
-        fn address_free(&self, _va: u64, _bytes: u64) {}
+        fn address_free(&self, _va: u64, _bytes: u64) {
+            self.address_frees.fetch_add(1, Ordering::SeqCst);
+        }
         fn create(&self, _bytes: u64) -> Result<u64> {
             if self.fail_creates.fetch_sub(1, Ordering::SeqCst) > 0 {
                 return Err(RuntimeError::Oom("mock OOM".into()));
@@ -2464,6 +2510,67 @@ mod tests {
 
     fn prompt(n: usize) -> Vec<u32> {
         (0..n as u32).map(|i| i * 7 + 3).collect()
+    }
+
+    #[test]
+    fn cache_track_reservation_failure_releases_prior_windows() {
+        let geometry = pool(Arc::new(MockVmm::default())).geometry().clone();
+        for failure in 1..=3 {
+            let ops = Arc::new(MockVmm::default());
+            ops.fail_reserves.store(failure, Ordering::SeqCst);
+            assert!(VmmKv::new_tensors(ops.clone(), geometry.clone(), 64, 0,
+                &[(3, 0), (3, 1), (3, 2)]).is_err());
+            assert_eq!(ops.reserves.load(Ordering::SeqCst), (failure - 1) as u64);
+            assert_eq!(ops.address_frees.load(Ordering::SeqCst), (failure - 1) as u64);
+            assert_eq!(ops.creates.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn unpaired_cache_tracks_share_prefix_and_allocate_private_suffix() {
+        let ops = Arc::new(MockVmm::default());
+        let geometry = VmmGeometry {
+            full_layers: vec![0, 1, 2],
+            kvh_full: 1,
+            hd_full: 4,
+            slide_layers: vec![],
+            kvh_slide: 0,
+            hd_slide: 0,
+            window: 0,
+            elem: 2,
+            elem_slide: 2,
+            max_ctx: 32,
+            batch: 2,
+        };
+        for tensors in [&[][..], &[(0, 0), (0, 0)][..], &[(3, 0)][..]] {
+            assert!(VmmKv::new_tensors(ops.clone(), geometry.clone(), 64, 0, tensors).is_err());
+        }
+        let p = VmmKv::new_tensors(
+            ops.clone(), geometry, 64, 0, &[(0, 0), (1, 0), (2, 0)],
+        ).unwrap();
+        for layer in 0..3 {
+            assert!(p.tensor_va(layer, 0).is_some());
+            assert!(p.tensor_va(layer, 1).is_none());
+        }
+        let tokens = prompt(25);
+        assert!(p.try_attach(0, &tokens).unwrap().is_none());
+        p.ensure_rows(0, 24).unwrap();
+        p.publish_at(0, &tokens, 16, 16, |_| Ok(())).unwrap();
+        assert_eq!(ops.creates.load(Ordering::SeqCst), 9);
+        assert_eq!(p.try_attach(1, &tokens).unwrap().unwrap().rows, 16);
+        assert_eq!(p.stats().blocks_shared_mapped, 6);
+        assert_eq!(ops.creates.load(Ordering::SeqCst), 9);
+        p.finish_attach(1);
+        p.ensure_rows(1, 17).unwrap();
+        assert_eq!(ops.creates.load(Ordering::SeqCst), 12);
+        p.begin_seq(0);
+        assert_eq!(p.mapped_rows(1), 24);
+        p.begin_seq(1);
+        assert_eq!(p.stats().blocks_live, 6);
+        drop(p);
+        assert_eq!(ops.creates.load(Ordering::SeqCst), ops.releases.load(Ordering::SeqCst));
+        assert_eq!(ops.maps.load(Ordering::SeqCst), ops.unmaps.load(Ordering::SeqCst));
+        assert_eq!(ops.allocs.load(Ordering::SeqCst), ops.frees.load(Ordering::SeqCst));
     }
 
     /// Uniform full-attention geometry (Qwen-family): no rings, window 0.

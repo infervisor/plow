@@ -44,6 +44,13 @@ pub enum Phase {
 }
 
 impl Phase {
+    pub(super) const fn interpreter_threads(self) -> u32 {
+        match self {
+            Self::Flash => 4 * 64,
+            Self::Prefill | Self::Decode => 8 * 64,
+        }
+    }
+
     pub(super) fn symbol_base(self) -> &'static str {
         match self {
             Phase::Prefill => "plow_interp",
@@ -59,6 +66,17 @@ impl Phase {
             Phase::Flash => "interp_flash",
         }
     }
+}
+
+pub(super) fn check_interpreter_waves(waves: Option<u32>, phase: Phase, path: &Path) -> Result<()> {
+    let expected = phase.interpreter_threads() / 64;
+    if waves != Some(expected) {
+        return Err(RuntimeError::Device(format!(
+            "{}: {phase:?} segment requires {expected} waves, but plow_geom_PLOW_WG_WAVES is {waves:?}; rebuild the matching interpreter object",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 /// The numeric variants the objects are built for. Selected by scanning the
@@ -1409,8 +1427,8 @@ pub(super) fn check_prefill_object(syms: &[&str], path: &Path, requires: &[Strin
         tracing::warn!(
             object = %path.display(),
             flags = ?unverifiable,
-            "NOT verified against the object: these build flags leave no distinguishing \
-             symbol (they select the object filename instead). The arm-level flags were checked."
+            "These flags are outside the opcode-arm check; phase selection and interpreter \
+             wave geometry are validated separately."
         );
     }
     Ok(())
