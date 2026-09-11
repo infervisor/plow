@@ -383,6 +383,35 @@ struct PrepareArgs {
     pointers: [u64; 12],
     rows: u32,
     block_m: u32,
+    swizzle: u32,
+    pad: u32,
+}
+
+/// Kernarg bytes of `plow_moe_aiter_prepare` before (no `swizzle`) and after the XCD field.
+const PREPARE_ARGS_LEGACY: u32 = 104;
+const PREPARE_ARGS: u32 = 112;
+
+/// Bit i of a sorted-route stage mask (`enqueue_sorted`): weight pack, prepare, fmoe, store.
+pub(super) const STAGE_PACK: u8 = 1;
+pub(super) const STAGE_PREPARE: u8 = 2;
+pub(super) const STAGE_MOE: u8 = 4;
+pub(super) const STAGE_STORE: u8 = 8;
+
+/// Host mirror of the adapter's `swizzled_block`: the sorted block at position `position` of
+/// the launch order. Blocks come expert-major from the align pass; with K = 256 / block_m
+/// (mean rows per expert per rank at top-8 of 256) the K consecutive blocks of one expert are
+/// placed 8 positions apart, so on gfx942 (workgroup w -> XCD w % 8) they run concurrently on
+/// one XCD and its L2 serves the expert's weights once instead of K times. A partial tail
+/// chunk keeps the identity order. Single MI300X, 8192 rows, random top-8: the ps_32x256
+/// fmoe launch 2628 -> 1500 us (2048 rows: 851 -> 547). Only for the ps object — see `enqueue`.
+pub(super) fn xcd_swizzled_block(position: u32, block_m: u32, blocks: u32) -> u32 {
+    let k = 256 / block_m;
+    let chunk = 8 * k;
+    let (c, r) = (position / chunk, position % chunk);
+    if (c + 1) * chunk > blocks {
+        return position;
+    }
+    c * chunk + (r % 8) * k + r / 8
 }
 
 #[repr(C)]
@@ -404,7 +433,7 @@ struct StoreArgs {
     pad: u32,
 }
 
-const _: () = assert!(std::mem::size_of::<PrepareArgs>() == 104);
+const _: () = assert!(std::mem::size_of::<PrepareArgs>() == PREPARE_ARGS as usize);
 const _: () = assert!(std::mem::size_of::<StoreArgs>() == 24);
 
 pub(super) struct MoeAiter {
@@ -418,6 +447,8 @@ pub(super) struct MoeAiter {
     buffers: [u64; 11],
     resident: bool,
     resident_weights: Vec<Option<ResidentWeights>>,
+    prepare_args: u32,
+    xcd_swizzle: bool,
 }
 
 impl MoeAiter {
@@ -571,7 +602,14 @@ impl MoeAiter {
         let pack = EngineDevice::get_function(be, &module, "pack_moe")?;
         let prepare = EngineDevice::get_function(be, &module, "plow_moe_aiter_prepare")?;
         let store = EngineDevice::get_function(be, &module, "plow_moe_aiter_store")?;
-        for (kernel, size) in [(pack, 48), (prepare, 104), (store, 24)] {
+        let prepare_args = if super::amd::elf_symbol_names(&image)
+            .contains(&"plow_moe_aiter_swizzle_abi_1")
+        {
+            PREPARE_ARGS
+        } else {
+            PREPARE_ARGS_LEGACY
+        };
+        for (kernel, size) in [(pack, 48), (prepare, prepare_args), (store, 24)] {
             if ![size, size + 256].contains(&kernel.kernarg_size())
                 || kernel.private_segment_size() != 0
             {
@@ -618,7 +656,32 @@ impl MoeAiter {
             buffers,
             resident,
             resident_weights: Vec::new(),
+            prepare_args,
+            xcd_swizzle: false,
         })
+    }
+
+    /// Launch the sorted blocks of the 32x256 object in XCD-swizzled order
+    /// (`xcd_swizzled_block`). `None` = on when the adapter carries the
+    /// `plow_moe_aiter_swizzle_abi_1` field (qualified: 18/18 retrieval, 49.89 -> 50.54 tok/s
+    /// at C20/70k with the 32-row object); `Some(true)` is refused without it.
+    pub fn set_xcd_swizzle(&mut self, on: Option<bool>) -> Result<()> {
+        let supported = self.prepare_args == PREPARE_ARGS;
+        self.xcd_swizzle = match on {
+            Some(true) if !supported => {
+                return Err(RuntimeError::Device(
+                    "AITER MoE adapter lacks the XCD swizzle ABI marker".into(),
+                ));
+            }
+            Some(on) => on,
+            None => {
+                if !supported {
+                    tracing::info!("XCD-swizzled MoE block order off: adapter lacks plow_moe_aiter_swizzle_abi_1");
+                }
+                supported
+            }
+        };
+        Ok(())
     }
 
     pub fn bind_resident(&mut self, tables: Vec<(u16, ResidentWeights)>) {
@@ -632,6 +695,18 @@ impl MoeAiter {
     }
 
     pub fn enqueue(&self, be: &HsaBackend, route: Route, tensor_table: &[u8]) -> Result<()> {
+        self.enqueue_stages(be, route, tensor_table, !0)
+    }
+
+    /// `stages` masks the sorted route's launches (`STAGE_*`) so a measurement can time one
+    /// stage at a time; the flat route ignores it.
+    pub(super) fn enqueue_stages(
+        &self,
+        be: &HsaBackend,
+        route: Route,
+        tensor_table: &[u8],
+        stages: u8,
+    ) -> Result<()> {
         let addr = |handle: u16| {
             let at = usize::from(handle) * 8;
             u64::from_le_bytes(tensor_table[at..at + 8].try_into().unwrap())
@@ -679,7 +754,7 @@ impl MoeAiter {
             let args = flat_moe_args(t[0], t[1], gu, down, gs, ds, ids, weights, route.rows);
             return be.launch_3d(moe, [2, 8, route.rows], 256, bytemuck::cast_slice(&args));
         }
-        if !self.resident {
+        if !self.resident && stages & STAGE_PACK != 0 {
             be.launch(
                 self.pack,
                 2048,
@@ -700,8 +775,21 @@ impl MoeAiter {
             ],
             rows: route.rows,
             block_m: if tile64.is_some() { 64 } else { 32 },
+            // The psx object remaps workgroup w to tile (w % 8) * 38 + w / 8 itself (its prologue:
+            // s_and_b32 7 / s_lshr_b32 3 on the workgroup id), so consecutive blocks already share
+            // an XCD there; a second permutation on top measured +8%. The ps object has no remap.
+            swizzle: u32::from(self.xcd_swizzle && tile64.is_none()),
+            pad: 0,
         };
-        be.launch(self.prepare, 304 * 4, 256, 0, bytemuck::bytes_of(&prepare))?;
+        if stages & STAGE_PREPARE != 0 {
+            be.launch(
+                self.prepare,
+                304 * 4,
+                256,
+                0,
+                &bytemuck::bytes_of(&prepare)[..self.prepare_args as usize],
+            )?;
+        }
         let mut args = [0u64; 56];
         for (i, value) in [
             out,
@@ -738,14 +826,16 @@ impl MoeAiter {
         {
             args[i * 2] = value;
         }
-        be.launch(
-            tile64.unwrap_or(self.moe),
-            304,
-            256,
-            0,
-            bytemuck::cast_slice(&args),
-        )?;
-        if route.mode == Mode::SortedBf16 {
+        if stages & STAGE_MOE != 0 {
+            be.launch(
+                tile64.unwrap_or(self.moe),
+                304,
+                256,
+                0,
+                bytemuck::cast_slice(&args),
+            )?;
+        }
+        if route.mode == Mode::SortedBf16 || stages & STAGE_STORE == 0 {
             return Ok(());
         }
         let store = StoreArgs {
@@ -1356,6 +1446,251 @@ mod tests {
         check_sorted_hsa(false, true, true);
     }
 
+    /// Random top-8 routing over 256 experts in the align pass's layout: meta (row offset /
+    /// count / 64-row group per expert, total groups at 768), padded row_token / row_part /
+    /// row_weight, and each row's (expert, gate) list. Every row picks 8 distinct experts
+    /// spread over all 256; group counts vary.
+    type Routing = (Vec<u32>, Vec<u32>, Vec<u32>, Vec<f32>, Vec<Vec<(usize, f32)>>);
+    fn random_routing(rows: u32, next: &mut impl FnMut() -> u64) -> Routing {
+        let mut per_expert: Vec<Vec<(u32, u32, f32)>> = vec![Vec::new(); 256];
+        let mut row_experts: Vec<Vec<(usize, f32)>> = vec![Vec::new(); rows as usize];
+        for row in 0..rows {
+            let base = (next() % 256) as u32;
+            for k in 0..8u32 {
+                let e = (base + k * 37 + (next() % 5) as u32 * 3) % 256;
+                let e = (0..256u32)
+                    .map(|d| (e + d) % 256)
+                    .find(|c| !per_expert[*c as usize].iter().any(|(r, _, _)| *r == row))
+                    .unwrap();
+                let gate = 0.05 + (k as f32) * 0.02;
+                per_expert[e as usize].push((row, row * 8 + k, gate));
+                row_experts[row as usize].push((e as usize, gate));
+            }
+        }
+        let mut meta = vec![0u32; 769];
+        let mut rt = Vec::new();
+        let mut rp = Vec::new();
+        let mut rg = Vec::new();
+        let mut groups = 0u32;
+        for e in 0..256 {
+            meta[e] = rt.len() as u32;
+            meta[e + 256] = per_expert[e].len() as u32;
+            meta[e + 512] = groups;
+            let padded = (per_expert[e].len() as u32).div_ceil(64) * 64;
+            groups += padded / 64;
+            for i in 0..padded as usize {
+                let (t, p, g) = per_expert[e]
+                    .get(i)
+                    .copied()
+                    .unwrap_or((u32::MAX, u32::MAX, 0.0));
+                rt.push(t);
+                rp.push(p);
+                rg.push(g);
+            }
+        }
+        meta[768] = groups;
+        (meta, rt, rp, rg, row_experts)
+    }
+
+    #[test]
+    fn xcd_swizzle_is_a_same_xcd_block_permutation() {
+        for (block_m, blocks) in [(64u32, 1024u32), (64, 1030), (32, 2048), (32, 2059), (64, 7)] {
+            let k = 256 / block_m;
+            let mut seen = vec![false; blocks as usize];
+            for p in 0..blocks {
+                let b = xcd_swizzled_block(p, block_m, blocks);
+                assert!(!std::mem::replace(&mut seen[b as usize], true), "{p} -> {b} twice");
+                // The k consecutive blocks starting at a k-aligned block share p % 8 and lie
+                // within one 8k chunk, unless the chunk is the partial tail (identity).
+                let chunk = 8 * k;
+                if (b / chunk + 1) * chunk <= blocks {
+                    let first = (0..blocks)
+                        .find(|q| xcd_swizzled_block(*q, block_m, blocks) == b / k * k)
+                        .unwrap();
+                    assert_eq!(first % 8, p % 8, "block {b} left XCD {}", first % 8);
+                    assert!(p.abs_diff(first) < chunk);
+                } else {
+                    assert_eq!(b, p);
+                }
+            }
+            assert!(seen.iter().all(|s| *s), "not a permutation at {block_m}/{blocks}");
+        }
+    }
+
+    /// The swizzled launch order is the host mirror's permutation of the same blocks (ids and
+    /// expert per position), its output matches the unswizzled order up to accumulation
+    /// order, and the route's stages are timed one at a time (warm host medians; the split
+    /// the serving trace cannot see inside a native segment). Not a serving measurement.
+    #[test]
+    #[ignore = "requires a gfx942 GPU lease and PLOW_TEST_AITER_DIR with the 64-row and swizzle adapter"]
+    fn moe_aiter_xcd_swizzle_matches_and_splits() {
+        let be = HsaBackend::new(0).unwrap();
+        let mut modules = Vec::new();
+        let dir = std::env::var("PLOW_TEST_AITER_DIR").unwrap();
+        let dir = Path::new(&dir);
+        let mut k32 = MoeAiter::load(&be, dir, 8192, false, false, false, &mut modules).unwrap();
+        let mut k64 = MoeAiter::load(&be, dir, 8192, false, false, true, &mut modules).unwrap();
+        let upload = |bytes: &[u8]| {
+            let m = EngineDevice::alloc(&be, bytes.len() as u64).unwrap();
+            EngineDevice::upload(&be, &m, 0, bytes).unwrap();
+            m
+        };
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let weight_bytes: Vec<u8> = (0..3 * 256 * 256 * 6144usize)
+            .map(|_| [0x38u8, 0xb8, 0x40, 0xc0, 0x44, 0xc4, 0x00, 0x48][(next() % 8) as usize])
+            .collect();
+        let weight = upload(&weight_bytes);
+        let scales: Vec<f32> = (0..3 * 256 * 96)
+            .map(|_| 0.002 * (1.0 + (next() % 1000) as f32 / 1000.0))
+            .collect();
+        let scale = upload(bytemuck::cast_slice(&scales));
+        let wt_ptrs: Vec<u64> = (0..256 * 3)
+            .map(|i| weight.base + (i * 256 * 6144) as u64)
+            .collect();
+        let wt = upload(bytemuck::cast_slice(&wt_ptrs));
+        let scale_ptrs: Vec<u64> = (0..256 * 3)
+            .map(|i| scale.base + (i * 96 * 4) as u64)
+            .collect();
+        let st = upload(bytemuck::cast_slice(&scale_ptrs));
+        let rows_list: Vec<u32> = std::env::var("PLOW_TEST_MOE_ROWS")
+            .ok()
+            .map(|s| s.split(',').map(|r| r.parse().unwrap()).collect())
+            .unwrap_or_else(|| vec![2048, 8192]);
+        for rows in rows_list {
+            let (meta, rt, rp, rg, _) = random_routing(rows, &mut next);
+            let x_bits: Vec<u16> = (0..rows as usize * 6144)
+                .map(|_| {
+                    let v = (next() % 2001) as f32 / 1000.0 - 1.0;
+                    (v.to_bits() >> 16) as u16
+                })
+                .collect();
+            let x = upload(bytemuck::cast_slice(&x_bits));
+            let output_bytes = rows as usize * 6144 * 4;
+            let out = upload(&vec![0xa5; output_bytes + 512]);
+            let meta_dev = upload(bytemuck::cast_slice(&meta));
+            let rt_dev = upload(bytemuck::cast_slice(&rt));
+            let rp_dev = upload(bytemuck::cast_slice(&rp));
+            let rg_dev = upload(bytemuck::cast_slice(&rg));
+            let table = [
+                out.base + 256,
+                x.base,
+                wt.base,
+                st.base,
+                meta_dev.base,
+                rt_dev.base,
+                rp_dev.base,
+                rg_dev.base,
+            ];
+            let route = Route {
+                inst: DevInst64 {
+                    t: [0, 1, 2, 3, 4, 5, 6, 7],
+                    i: [rows, 6144, 256, 256, 8, 64, 0, 0],
+                    ..Default::default()
+                },
+                rows,
+                mode: Mode::Sorted,
+            };
+            let padded = meta[768] as usize * 64;
+            for (kernel, block_m) in [(&mut k32, 32u32), (&mut k64, 64)] {
+                let blocks = padded as u32 / block_m;
+                let mut outputs = Vec::new();
+                for swizzle in [false, true] {
+                    kernel.set_xcd_swizzle(Some(swizzle)).unwrap();
+                    EngineDevice::upload(&be, &out, 0, &vec![0xa5; output_bytes + 512]).unwrap();
+                    kernel
+                        .enqueue(&be, route, bytemuck::cast_slice(&table))
+                        .unwrap();
+                    be.synchronize().unwrap();
+                    // Launch order: position p carries block xcd_swizzled_block(p)'s rows and
+                    // expert; the psx (64-row) object is never swizzled.
+                    let swizzled = swizzle && block_m == 32;
+                    let mut ids = vec![0u8; padded * 4];
+                    let mut experts = vec![0u8; blocks as usize * 4];
+                    let scratch = &kernel._scratch;
+                    EngineDevice::download(&be, scratch, kernel.buffers[7] - scratch.base, &mut ids)
+                        .unwrap();
+                    EngineDevice::download(
+                        &be,
+                        scratch,
+                        kernel.buffers[9] - scratch.base,
+                        &mut experts,
+                    )
+                    .unwrap();
+                    let ids: &[u32] = bytemuck::cast_slice(&ids);
+                    let experts: &[u32] = bytemuck::cast_slice(&experts);
+                    for p in 0..blocks {
+                        let b = if swizzled { xcd_swizzled_block(p, block_m, blocks) } else { p };
+                        let group = (b * block_m / 64) as usize;
+                        let expert = (0..256).find(|e| meta[512 + e + 1] as usize > group).unwrap();
+                        assert_eq!(experts[p as usize], expert as u32, "block_m={block_m} p={p}");
+                        for r in 0..block_m as usize {
+                            let (pos, src) = (p as usize * block_m as usize + r, b as usize * block_m as usize + r);
+                            let expect = if rt[src] < rows {
+                                rt[src] | ((rp[src] % 8) << 24)
+                            } else {
+                                rows
+                            };
+                            assert_eq!(ids[pos], expect, "block_m={block_m} p={p} r={r}");
+                        }
+                    }
+                    let mut bytes = vec![0u8; output_bytes + 512];
+                    EngineDevice::download(&be, &out, 0, &mut bytes).unwrap();
+                    assert!(bytes[..256]
+                        .iter()
+                        .chain(&bytes[256 + output_bytes..])
+                        .all(|&x| x == 0xa5));
+                    let values: Vec<f32> =
+                        bytemuck::cast_slice(&bytes[256..256 + output_bytes]).to_vec();
+                    assert!(values.iter().all(|v| v.is_finite()));
+                    let median = |stages: u8| -> f64 {
+                        for _ in 0..3 {
+                            kernel
+                                .enqueue_stages(&be, route, bytemuck::cast_slice(&table), stages)
+                                .unwrap();
+                        }
+                        be.synchronize().unwrap();
+                        let mut samples = Vec::new();
+                        for _ in 0..15 {
+                            let start = std::time::Instant::now();
+                            kernel
+                                .enqueue_stages(&be, route, bytemuck::cast_slice(&table), stages)
+                                .unwrap();
+                            be.synchronize().unwrap();
+                            samples.push(start.elapsed().as_secs_f64() * 1e6);
+                        }
+                        samples.sort_by(|a, b| a.total_cmp(b));
+                        samples[samples.len() / 2]
+                    };
+                    let (all, pack, prepare, moe, store) = (
+                        median(!0),
+                        median(STAGE_PACK),
+                        median(STAGE_PREPARE),
+                        median(STAGE_MOE),
+                        median(STAGE_STORE),
+                    );
+                    eprintln!(
+                        "rows={rows} tile{block_m} swizzle={swizzle}: route={all:.1}us pack={pack:.1} prepare={prepare:.1} fmoe={moe:.1} store={store:.1} (serving route = prepare + fmoe)"
+                    );
+                    outputs.push(values);
+                }
+                let (mut num, mut den) = (0f64, 0f64);
+                for (a, b) in outputs[0].iter().zip(&outputs[1]) {
+                    num += (f64::from(*a) - f64::from(*b)).powi(2);
+                    den += f64::from(*a).powi(2);
+                }
+                let rel = (num / den).sqrt();
+                eprintln!("rows={rows} tile{block_m}: swizzled vs unswizzled rel_l2={rel:.3e}");
+                assert!(rel < 5e-3, "rows={rows} tile{block_m}: swizzle changed the result");
+            }
+        }
+    }
+
     /// Same sorted inputs through the 32x256 and the 64x256 objects: both consume the identical
     /// A8 quantization from `plow_moe_aiter_prepare`, so they may differ only by accumulation
     /// order. Also prints warm medians for the single-GPU A/B; not a serving measurement.
@@ -1412,45 +1747,7 @@ mod tests {
             .collect();
         let st = upload(bytemuck::cast_slice(&scale_ptrs));
         for rows in [1024u32, 2048, 4464, 8192] {
-            // Every row picks 8 distinct experts spread over all 256; group counts vary.
-            let mut per_expert: Vec<Vec<(u32, u32, f32)>> = vec![Vec::new(); 256];
-            let mut row_experts: Vec<Vec<(usize, f32)>> = vec![Vec::new(); rows as usize];
-            for row in 0..rows {
-                let base = (next() % 256) as u32;
-                for k in 0..8u32 {
-                    let e = (base + k * 37 + (next() % 5) as u32 * 3) % 256;
-                    let e = (0..256u32)
-                        .map(|d| (e + d) % 256)
-                        .find(|c| !per_expert[*c as usize].iter().any(|(r, _, _)| *r == row))
-                        .unwrap();
-                    let gate = 0.05 + (k as f32) * 0.02;
-                    per_expert[e as usize].push((row, row * 8 + k, gate));
-                    row_experts[row as usize].push((e as usize, gate));
-                }
-            }
-            let mut meta = vec![0u32; 769];
-            let mut rt = Vec::new();
-            let mut rp = Vec::new();
-            let mut rg = Vec::new();
-            let mut groups = 0u32;
-            for e in 0..256 {
-                meta[e] = rt.len() as u32;
-                meta[e + 256] = per_expert[e].len() as u32;
-                meta[e + 512] = groups;
-                let padded = (per_expert[e].len() as u32).div_ceil(64) * 64;
-                groups += padded / 64;
-                for i in 0..padded as usize {
-                    let (t, p, g) =
-                        per_expert[e]
-                            .get(i)
-                            .copied()
-                            .unwrap_or((u32::MAX, u32::MAX, 0.0));
-                    rt.push(t);
-                    rp.push(p);
-                    rg.push(g);
-                }
-            }
-            meta[768] = groups;
+            let (meta, rt, rp, rg, row_experts) = random_routing(rows, &mut next);
             let x_bits: Vec<u16> = (0..rows as usize * 6144)
                 .map(|_| {
                     let v = (next() % 2001) as f32 / 1000.0 - 1.0;

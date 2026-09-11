@@ -8395,6 +8395,9 @@ impl AmdEngine {
         } else {
             None
         };
+        if let Some(moe) = moe_aiter.as_mut() {
+            moe.set_xcd_swizzle(crate::config::RuntimeConfig::get().amd.moe_aiter_xcd)?;
+        }
 
         // --- tensors + weights ------------------------------------------------
         // Staging is one pinned slab, filled and pushed in `STAGE` chunks. The

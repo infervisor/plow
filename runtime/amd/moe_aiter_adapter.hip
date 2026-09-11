@@ -49,8 +49,20 @@ struct MoePrepareArgs {
     // Rows per sorted expert block: 32 for the 32x256 objects, 64 for the 64x256 tile.
     // Plow aligns at 64, so a 64-row block maps 1:1 onto one meta group.
     unsigned block_m;
+    // Nonzero: permute the block order so that the K = 256 / block_m consecutive blocks of one
+    // expert sit 8 positions apart (same XCD, concurrent workgroups) and share one L2 for the
+    // expert's 4.7 MB of weights. Pure reorder: every block keeps its rows and expert.
+    unsigned swizzle;
+    unsigned pad;
 };
-static_assert(sizeof(MoePrepareArgs) == 104);
+static_assert(sizeof(MoePrepareArgs) == 112);
+
+__device__ __forceinline__ unsigned swizzled_block(unsigned p, unsigned block_m, unsigned blocks) {
+    const unsigned k = 256u / block_m, chunk = 8u * k;
+    const unsigned c = p / chunk, r = p % chunk;
+    if ((c + 1u) * chunk > blocks) return p;
+    return c * chunk + (r % 8u) * k + r / 8u;
+}
 
 extern "C" __global__ void plow_moe_aiter_prepare(MoePrepareArgs a) {
 #if defined(__HIP_DEVICE_COMPILE__)
@@ -71,18 +83,23 @@ extern "C" __global__ void plow_moe_aiter_prepare(MoePrepareArgs a) {
     for (unsigned i = first; i < a.rows * 768u; i += stride)
         a.out[i] = make_uint4(0, 0, 0, 0);
     const unsigned padded = a.meta[3u * 256u] * 64u;
+    const unsigned blocks = padded / a.block_m;
     for (unsigned i = first; i < padded; i += stride) {
-        const unsigned token = a.row_token[i], part = a.row_part[i];
+        const unsigned li = a.swizzle
+            ? swizzled_block(i / a.block_m, a.block_m, blocks) * a.block_m + i % a.block_m
+            : i;
+        const unsigned token = a.row_token[li], part = a.row_part[li];
         const bool live = token < a.rows && part < a.rows * 8u;
         a.ids[i] = live ? token | ((part % 8u) << 24) : a.rows;
-        a.weights[i] = live ? a.row_weight[i] : 0.0f;
+        a.weights[i] = live ? a.row_weight[li] : 0.0f;
     }
     const unsigned per_group = 64u / a.block_m;
-    for (unsigned i = first; i < padded / a.block_m; i += stride) {
+    for (unsigned i = first; i < blocks; i += stride) {
+        const unsigned b = a.swizzle ? swizzled_block(i, a.block_m, blocks) : i;
         unsigned lo = 0, hi = 256;
         while (lo < hi) {
             const unsigned mid = (lo + hi) / 2u;
-            if (a.meta[512u + mid + 1u] <= i / per_group) lo = mid + 1u;
+            if (a.meta[512u + mid + 1u] <= b / per_group) lo = mid + 1u;
             else hi = mid;
         }
         a.experts[i] = lo;
@@ -108,6 +125,7 @@ extern "C" __global__ void plow_moe_aiter_store(float* out, const unsigned short
 
 extern "C" __device__ unsigned plow_moe_aiter_fp8_abi_1 = 1;
 extern "C" __device__ unsigned plow_moe_aiter_tile64_abi_1 = 1;
+extern "C" __device__ unsigned plow_moe_aiter_swizzle_abi_1 = 1;
 
 struct MoeFlatPackArgs {
     uint4* gu;
