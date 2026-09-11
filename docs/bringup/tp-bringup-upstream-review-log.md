@@ -134,6 +134,46 @@ Ranked levers: slot-recycle unmap off the engine thread (−1.5..1.7 s/request �
 
 Body arm (5ee91ece, host-side, needs the collapse fix + a bodies packet to fire): cursors seeded for waiting slots when the route is armed, whole next chunks oldest-first, chunks no body holds skipped instead of blocking the pack, no cutting (a sparse 8192 step sliced into a dense body costs several times the launch it displaces). Unit tests `amd_token_batch_pack_*`, `dense_tail_moves_to_the_sparse_bucket_*`.
 
+## Plan of record: 100 output tok/s at C20 / 64K (re-baselined 2026-09-11, user's decision)
+
+The 150 tok/s target required halving both the sparse attention (203 ms/chunk) and the MoE
+(164 ms/chunk) kernels, and the research established that neither has a faster implementation for
+gfx942 anywhere — both would be written from scratch (5–8 weeks each). The goal is therefore
+re-baselined to **100 out tok/s**, which the measured levers do reach, and the remaining gap to
+150 is recorded as kernel-authoring work rather than integration work.
+
+**The budget.** Today's 100-prompt run (7.02 M in / 71.1 k out) is 1511 s = 47.09 tok/s, and it
+decomposes as: 857 prefill-carrying ticks × (973 ms chunk + 163 ms decode) = 974 s, plus ~2600
+decode-only ticks × 107 ms = 278 s, plus ~250 s of ragged tails and slot recycling. 100 tok/s is
+**711 s**. Every figure below is seconds removed from the 1511 s run; ranges are the honest spread,
+and the cumulative column assumes the phase lands at the low end of its range.
+
+| Phase | Work | Saves | Cumulative | tok/s | Confidence |
+|---|---|---:|---:|---:|---|
+| 1. Host, no numerics change | KV map-ahead (#18, map-ahead proven to fire: 792/1416 maps moved into the chunk window, `prefill_prepare` 54.5 → 25.2 ms); slot-recycle unmap off the engine thread (#17, 1.5–1.9 s per recycled slot × ~80); prepare/publish/audit shadowed behind the drain (#23) | 210–280 s | 1231 s | **58** | high — all three measured |
+| 2. Kernels already built, flags already there | 64-row MoE tile default (measured +1.6 % e2e); decode GEMM routes at rungs 8/16/20 and the narrow shapes; DSA select-load batching (268 → 146 µs at rung 20, needs a re-emit); decode split policy ns16 → ns4 (169 → 108 µs, needs a decode object rebuild) | 60–90 s | 1171 s | **61** | medium — each needs its 8-GPU A/B and a retrieval screen |
+| 3. Collectives (#21, #26) | Raise the two-shot from 157 GB/s toward MORI-class ~300; then sequence-parallel seams: reduce-scatter → shard-local residual/norm/router/q_a/kv_a → all-gather only the projection outputs | 90–130 s | 1081 s | **66** | medium-high — 174 ms/chunk is measured, the bandwidth headroom is published |
+| 4. Dense GEMM + MoE glue (#24, #25) | FP8 block-scale prefill GEMMs via CK/AITER (vendor table has our exact M=8192 shapes at 838–873 TF/s); fold the shared expert into the fused MoE call; expert-sliced MoE inside TP8 (no dispatch needed — every rank already holds all rows after the attention all-reduce) | 130–175 s | 951 s | **75** | medium — W8A8 is the checkpoint's reference numerics, so a quality screen gates it |
+| 5. Token batch + indexer | Token-batch body carrying the decode rows at the 8192 rung, which removes the separate decode dispatch after every chunk (163 → ~20 ms incremental); fused FP8 indexer score + AITER's shape-exact asm top-k (−55..−65 ms/chunk) | 120–160 s | 831 s | **86** | medium — the body needs #15 (span-aware, landed opt-in) and the collapse fix |
+| 6. Glue-op fusion | Merge fold into the attention epilogue or o_proj prologue; router → top-k → align as one kernel; combine + residual + norm | 35–55 s | 796 s | **90** | medium — e-graph rules exist, the win is measured per-op |
+| 7. Remainder | Whatever of the above lands at the top of its range, plus the ragged-tail arm on short-suffix traffic | 60–85 s | 711 s | **100** | this is the slack the ranges above already contain |
+
+**Sequencing rules.** Phases 1 and 2 are independent of everything else and change no numerics
+(phase 2 changes kernels, so each flip carries a retrieval screen). Phase 3 and phase 4 both touch
+the same per-layer seam and must not be measured concurrently on one packet. Phase 5's body work is
+blocked on the token-0 collapse; the native-route-under-packed-binding fix (`8306ac54`) is the
+current lead and re-probing it is the gate. Nothing in phases 3–6 should start a default flip
+without an A/B on the same binary plus the 18-case retrieval screen.
+
+**What is explicitly NOT in the plan**: DP attention + EP8 (wrong shape for C20/70k — only ~2.4
+requests are mid-prefill on average, so one GPU would run a chunk's 64 heads while the others pad);
+two chunks per tick (tick conservation caps it at ~24 s); hipGraph (plow already enqueues raw AQL);
+MXFP4 on gfx942 (dequant-only); MTP speculative decoding (real, ~9.9 GB of shipped weights, but
+3–5 weeks and lowest priority by the user's instruction).
+
+**The 100 → 150 gap**, for the record: native-FP8 sparse gather (−100..−125 ms/chunk, 5–8 weeks) and
+a from-scratch MoE kernel below AITER's tuned ceiling. Both are kernel-authoring projects.
+
 ## What the research says is actually available (2026-09-11, two research agents)
 
 Reports: `research-kernels-parallelism.md`, `research-serving-techniques.md` (both under `/root/.claude/jobs/c08d1232/tmp/reports/`, provenance-tagged measured / fetched / estimated).
