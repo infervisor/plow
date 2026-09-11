@@ -2690,13 +2690,19 @@ impl HsaBackend {
         // counting signal before publication and the device decrements it on
         // completion, so zero is the exact queue-tail completion condition.
         self.guard()?;
+        static BLOCKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let state = if *BLOCKED.get_or_init(|| crate::config::RuntimeConfig::get().amd.hsa_drain_blocked) {
+            HSA_WAIT_STATE_BLOCKED
+        } else {
+            HSA_WAIT_STATE_ACTIVE
+        };
         unsafe {
             (self.shared.drv.hsa_signal_wait_scacquire)(
                 self.done_signal,
                 HSA_SIGNAL_CONDITION_LT,
                 1,
                 u64::MAX,
-                HSA_WAIT_STATE_ACTIVE,
+                state,
             );
         }
         self.guard()

@@ -804,6 +804,12 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-publish-defer", env = "PLOW_AMD_PUBLISH_DEFER", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub publish_defer: bool,
 
+    /// DIAGNOSTIC: drain with a blocked (interrupt-backed) wait on the queue's completion
+    /// signal instead of busy-polling it, so the host core stops contending for the line the
+    /// GPU decrements once per dispatch.
+    #[arg(long = "amd-hsa-drain-blocked", env = "PLOW_HSA_DRAIN_BLOCKED", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub hsa_drain_blocked: bool,
+
     /// Share completed MLA prefixes through ROCr VMM (auto on supported gfx942 packets).
     #[arg(long = "amd-shared-prefix", env = "PLOW_AMD_SHARED_PREFIX", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub shared_prefix: Option<bool>,
