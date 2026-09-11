@@ -354,7 +354,7 @@ pub(crate) fn weight_slab_enabled() -> bool {
 /// triage, not tuning.
 #[cfg(feature = "cuda")]
 pub(crate) fn weight_vmm_enabled() -> bool {
-    crate::config::RuntimeConfig::get().nv.weight_vmm
+    crate::config::RuntimeConfig::get().weight_vmm.unwrap_or(true)
 }
 
 /// `--nv-upload-direct false` / `PLOW_UPLOAD_DIRECT=0` forces the
@@ -370,7 +370,7 @@ pub(crate) fn upload_direct_enabled() -> bool {
 }
 
 /// The AMD loader's gate for the same slab, with the opposite default:
-/// **opt-in** (`--amd-weight-vmm` / `PLOW_WEIGHT_VMM=1`). ROCr's
+/// **opt-in** (`--weight-vmm` / `PLOW_WEIGHT_VMM=1`). ROCr's
 /// `hsa_amd_vmem_*` surface is
 /// resolved and drives VmmKv already, but the lazy-commit weight slab has not
 /// been measured on AMD hardware — and §4b's AMD numbers say the flat slab
@@ -378,7 +378,7 @@ pub(crate) fn upload_direct_enabled() -> bool {
 /// default only with a measurement on a gfx950 box.
 #[cfg(feature = "hsa")]
 pub(crate) fn weight_vmm_amd_enabled() -> bool {
-    crate::config::RuntimeConfig::get().amd.weight_vmm
+    crate::config::RuntimeConfig::get().weight_vmm.unwrap_or(false)
 }
 
 impl Prefetcher {

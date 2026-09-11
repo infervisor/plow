@@ -877,7 +877,7 @@ checkpoint location, because the weights a bundle needs are the same weights
 | `PLOW_MLA_PF_AITER=0/1` | off | AMD: route isolated GLM sparse MLA prefill boundaries through the qualified gfx942 AITER assembly object (pinned SHA, 320-B ABI). −6.6% prefill time at 70k; 18/18 retrieval cases. |
 | `PLOW_NV_SCHED=1` | **on** | global-queue interpreter scheduler; the static per-block-stream path is the build-time A/B. |
 | `PLOW_GLOBAL_QUEUE=0` | on | force the static per-block-stream scheduler (AMD runtime read; build-time A/B otherwise). |
-| `PLOW_STATIC` / `PLOW_STATIC_DECODE` / `PLOW_STATIC_PREFILL` | off | force the static scheduler for both phases / decode only / prefill only. |
+| `PLOW_STATIC=both\|decode\|prefill` (`--amd-static`) | unset | force the static scheduler for both phases (`1`/`true` = `both`), decode only or prefill only; unset keeps the global queue where the blob carries its appendix. |
 | `PLOW_SEG_WINDOW` | on | AMD segment enqueue/drain windowing (A/B; `=0` off). |
 | `PLOW_MULTISTEP=K` / `--multistep K` | 8 (K∈[2,64]) | Bounded multi-step decode. CUDA can execute up to K steps per host synchronization; AMD dispatches and drains each step, captures tokens on device, then reads the capture once per quantum. CUDA device-loop execution needs dynamic KV-row addressing and the sampler object. It uses the packet's smallest eligible decode rung and supports live VMM. Each quantum is capped by remaining output and context budgets and the mux's batch-dependent limit: 4 steps for 1–2 live requests, 2 for 3–8, and 1 above 8. Disabling mux multistep also selects individual steps. Requests with stochastic sampling, repetition penalties, or logit bias use individual steps; unmodified greedy requests stream up to K tokens after each device quantum. `0`/`1` opts out. Decode objects/roles, context packets, recurrent decode, and cuBLASLt segments force single-step and log the decision. |
 | `PLOW_LAUNCH_ROWS=N` | `LAUNCH_ROWS` | override the prefill pad/launch-rows tradeoff. |
@@ -886,7 +886,7 @@ checkpoint location, because the weights a bundle needs are the same weights
 | `PLOW_UPLOAD_SLOTS=N` | 4 | AMD upload-ring pipeline depth; `1` = pre-pipeline one-slab shape. |
 | `PLOW_SHARE_CKPT` | on | shared (vs per-rank) checkpoint mapping across TP ranks; `=0` restores per-rank. |
 | `PLOW_VRAM_BUDGET_MIB=M` | unset | CUDA: cap each device group ModelManager VRAM budget (MiB). |
-| `PLOW_WEIGHT_VMM` | CUDA on, AMD off | VMM (reserve+map) weight slab; `=0` falls back to one flat allocation (`=1` opts AMD in). |
+| `PLOW_WEIGHT_VMM` (`--weight-vmm`) | unset = CUDA on, AMD off | VMM (reserve+map) weight slab on either vendor; `=0` falls back to one flat allocation, `=1` opts AMD in. One knob for both backends. |
 | `PLOW_SLAB_KEEP` | multi-model on | park evicted models' 256 MiB slab chunks in a per-device pool for the next load; `=0` releases them (`=1` forces on for single-model). |
 | `PLOW_KV_POOL_MIB=N` | 512 | per-engine KV physical-block reuse pool cap (MiB); `0` disables pooling. |
 | `PLOW_DRAIN_TIMEOUT_MS=N` | unset (unbounded) | S1 switch drain deadline; past it the victim's live generations are preempted (`Preempted` finish, queued jobs 429). `0` preempts immediately. |

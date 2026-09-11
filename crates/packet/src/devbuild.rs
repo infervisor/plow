@@ -40,6 +40,102 @@ use crate::rope::GenTensor;
 /// closure as the input, so removing every covered edge AT ONCE is safe even
 /// when a justifying path's own edges are also removed: each is in turn covered
 /// by a further path, and acyclicity makes the induction terminate.
+/// Every environment knob the packet builder reads, in ONE place.
+///
+/// These used to be twenty-one `std::env::var` calls scattered through `Builder::new` and
+/// `Builder::finish`, which is why `devgen`'s manifest carries `UNRECORDED_ENV`: a knob read
+/// this way has no CLI flag and no `build.json` record. The builder now reads this struct;
+/// `from_env` is the only place the names appear, and the caller that owns configuration
+/// (`devgen::emit_config::install`) hands the builder its snapshot through [`install_knobs`].
+/// Nothing installed means "read the environment", exactly the old behaviour, so a caller
+/// that never configures anything (the packet crate's own tests) is unchanged.
+///
+/// Field semantics are the old parses verbatim: a `bool` is `== "1"` (`tr_quiet` is
+/// "set at all"); an `Option<String>` is the raw value the site matches on; `mla_pf_v2` is
+/// `Some(true)`/`Some(false)` for `"1"`/`"0"` and `None` otherwise.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct SegKnobs {
+    pub tune_dump: bool,
+    /// `PLOW_GQ_ORDER`: unset or anything else = ASAP gate order within segment order,
+    /// `"asap"` = ASAP program-wide, `"emit"` = emit order.
+    pub gq_order: Option<String>,
+    pub fine_force: bool,
+    pub fuse_xr_attnres: bool,
+    pub chain_bypass: Option<String>,
+    pub tr_quiet: bool,
+    pub uniseg: bool,
+    pub mla_pf_v2: Option<bool>,
+    pub mla_pf_aiter: bool,
+    pub moe_decode_standalone: bool,
+    pub phase_objects: bool,
+    pub xr_wave_rs: bool,
+    pub seg_pure_gemm: Option<String>,
+    pub seg_fa512: Option<String>,
+    pub seg_fa256_gqa2: bool,
+    pub seg_v2: Option<String>,
+    pub seg_per_op: bool,
+    pub seg_dump: bool,
+    pub place_report: bool,
+    pub seg_class_slice: Option<String>,
+    pub seg_slice_all: bool,
+}
+
+impl SegKnobs {
+    /// The one place these names are read. Kept as literal `std::env::var("…")` calls so
+    /// `devgen`'s `unrecorded_env_list_is_complete` keeps auditing them against the source.
+    pub fn from_env() -> Self {
+        SegKnobs {
+            tune_dump: std::env::var("PLOW_TUNE_DUMP").ok().as_deref() == Some("1"),
+            gq_order: std::env::var("PLOW_GQ_ORDER").ok(),
+            fine_force: std::env::var("PLOW_FINE_FORCE").ok().as_deref() == Some("1"),
+            fuse_xr_attnres: std::env::var("PLOW_FUSE_XR_ATTNRES").ok().as_deref() == Some("1"),
+            chain_bypass: std::env::var("PLOW_CHAIN_BYPASS").ok(),
+            tr_quiet: std::env::var_os("PLOW_TR_QUIET").is_some(),
+            uniseg: std::env::var("PLOW_UNISEG").ok().as_deref() == Some("1"),
+            mla_pf_v2: match std::env::var("PLOW_MLA_PF_V2").ok().as_deref() {
+                Some("0") => Some(false),
+                Some("1") => Some(true),
+                _ => None,
+            },
+            mla_pf_aiter: std::env::var("PLOW_MLA_PF_AITER").ok().as_deref() == Some("1"),
+            moe_decode_standalone: std::env::var("PLOW_MOE_DECODE_STANDALONE").ok().as_deref()
+                == Some("1"),
+            phase_objects: std::env::var("PLOW_PHASE_OBJECTS").ok().as_deref() == Some("1"),
+            xr_wave_rs: std::env::var("PLOW_XR_WAVE_RS").ok().as_deref() == Some("1"),
+            seg_pure_gemm: std::env::var("PLOW_SEG_PURE_GEMM").ok(),
+            seg_fa512: std::env::var("PLOW_SEG_FA512").ok(),
+            seg_fa256_gqa2: std::env::var("PLOW_SEG_FA256_GQA2").ok().as_deref() == Some("1"),
+            seg_v2: std::env::var("PLOW_SEG_V2").ok(),
+            seg_per_op: std::env::var("PLOW_SEG_PER_OP").ok().as_deref() == Some("1"),
+            seg_dump: std::env::var("PLOW_SEG_DUMP").ok().as_deref() == Some("1"),
+            place_report: std::env::var("PLOW_PLACE_REPORT").ok().as_deref() == Some("1"),
+            seg_class_slice: std::env::var("PLOW_SEG_CLASS_SLICE").ok(),
+            seg_slice_all: std::env::var("PLOW_SEG_SLICE_ALL").ok().as_deref() == Some("1"),
+        }
+    }
+}
+
+static KNOBS: std::sync::atomic::AtomicPtr<SegKnobs> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// Make `knobs` the builder's configuration. Last install wins, as with
+/// `devgen::emit_config::install`; the previous snapshot is leaked so no `&'static` can dangle.
+pub fn install_knobs(knobs: SegKnobs) {
+    let ptr = Box::into_raw(Box::new(knobs));
+    KNOBS.store(ptr, std::sync::atomic::Ordering::Release);
+}
+
+/// The builder's current knobs: the installed snapshot, else the environment.
+pub fn knobs() -> SegKnobs {
+    let ptr = KNOBS.load(std::sync::atomic::Ordering::Acquire);
+    if ptr.is_null() {
+        SegKnobs::from_env()
+    } else {
+        // SAFETY: `install_knobs` wrote a valid, never-freed Box.
+        unsafe { (*ptr).clone() }
+    }
+}
+
 pub fn transitive_reduction(n: usize, edges: &BTreeSet<(u32, u32)>) -> BTreeSet<(u32, u32)> {
     // Reachability by 2+ hops. The op DAG is emitted in topological order
     // (producer index < consumer index), so a single reverse sweep suffices.
@@ -125,7 +221,7 @@ pub fn set_tuned_gemv_cases(cases: std::collections::HashSet<String>) {
 /// TUNEDUMP_GEMV <m> <n> <k> <quant> <PLOW_DOP_...> <HIT|MISS>
 /// ```
 fn tune_dump_gemv(op: DevOp, inst: &DevInst) {
-    if std::env::var("PLOW_TUNE_DUMP").ok().as_deref() != Some("1") {
+    if !knobs().tune_dump {
         return;
     }
     let Some((fam, m, n, k, quant)) = op.gemv_case(&inst.i) else {
@@ -559,6 +655,7 @@ fn lean_kda_key_factor_pair(ops: &[Op], i: usize) -> bool {
 
 impl Builder {
     pub fn new(n_cu: u32) -> Self {
+        let knobs = knobs();
         Self {
             n_cu,
             ops: Vec::new(),
@@ -568,11 +665,8 @@ impl Builder {
             uniseg_denied: false,
             uniseg_forced: false,
             cur_join: 0,
-            gq_order_asap: std::env::var("PLOW_GQ_ORDER").ok().as_deref() != Some("emit"),
-            gq_order_seg: !matches!(
-                std::env::var("PLOW_GQ_ORDER").ok().as_deref(),
-                Some("emit") | Some("asap")
-            ),
+            gq_order_asap: knobs.gq_order.as_deref() != Some("emit"),
+            gq_order_seg: !matches!(knobs.gq_order.as_deref(), Some("emit") | Some("asap")),
             packed_prefill_segments: false,
             lean_moe_stage2_segments: false,
             lean_moe_stage1_segments: false,
@@ -1064,7 +1158,7 @@ impl Builder {
         // collapses to full fan-in under wave-interleaving) is still downgraded, so the test
         // isolates the recoverable gates (headnorm->flash, flash->merge) and never pays the
         // 256x256-atomic all-to-all cost the Dep doc warns about. Default (unset) = byte-identical.
-        let force = std::env::var("PLOW_FINE_FORCE").ok().as_deref() == Some("1");
+        let force = knobs().fine_force;
         let blocks: Vec<usize> = self.ops.iter().map(|o| o.cus.len()).collect();
         let (mut kept, mut downgraded) = (0, 0);
         for i in 0..n {
@@ -1660,6 +1754,7 @@ impl Builder {
     }
 
     pub fn finish(mut self) -> Program {
+        let knobs = knobs();
         if let Some(degree) = self.moe_prefill_ep_degree {
             let rewritten = self.rewrite_replicated_moe_prefill_ep(degree);
             assert!(
@@ -1674,7 +1769,7 @@ impl Builder {
                 eprintln!("  whole-graph fusion: {fused} materialized residual inputs");
             }
         }
-        if std::env::var("PLOW_FUSE_XR_ATTNRES").ok().as_deref() == Some("1") {
+        if knobs.fuse_xr_attnres {
             let fused = self.fuse_xreduce_attnres();
             if fused != 0 {
                 eprintln!("  whole-graph fusion: {fused} XReduceTwoShot+AttnRes consumers");
@@ -1743,7 +1838,7 @@ impl Builder {
         //
         // Consumers read the op's stale output, so tokens are garbage. That is intended: this
         // measures scheduling, and wrong numerics are a valid instrument for scheduling.
-        if let Ok(spec) = std::env::var("PLOW_CHAIN_BYPASS") {
+        if let Some(spec) = knobs.chain_bypass.clone() {
             let want: Vec<u16> = spec
                 .split(',')
                 .filter_map(|s| s.trim().parse().ok())
@@ -1876,7 +1971,7 @@ impl Builder {
                 dup += before - op.deps.len();
             }
             self.tr_dropped = dropped;
-            if (dropped > 0 || dup > dropped) && std::env::var_os("PLOW_TR_QUIET").is_none() {
+            if (dropped > 0 || dup > dropped) && !knobs.tr_quiet {
                 eprintln!(
                     "  counter-graph reduction: {} of {} distinct coarse edges implied by a path, \
                      {} duplicate waits; {} wait entries removed",
@@ -1927,24 +2022,24 @@ impl Builder {
         // the segment boundary is spurious there and would otherwise force a segmented relaunch path.
         // `deny_uniseg` wins over the environment: a target that cannot express one segment must
         // not be given one because a variable said so. See that method for the failure it prevents.
-        let uniseg = !self.uniseg_denied
-            && (self.uniseg_forced || std::env::var("PLOW_UNISEG").ok().as_deref() == Some("1"));
+        let uniseg = !self.uniseg_denied && (self.uniseg_forced || knobs.uniseg);
         // Isolate MLA at every query rung: a small chunk can still have a long KV cache.
         // Class 26 separates small MLA from GEMM. The host selects four-wave split
         // or eight-wave unsplit objects from the instruction's validated layout.
-        let split_mla = self.ops.iter().any(|op| {
-            op.inst.op == DevOp::FlashMlaPrefillFp8 as u16 && op.inst.j[1] != 0
-        });
+        let split_mla = self
+            .ops
+            .iter()
+            .any(|op| op.inst.op == DevOp::FlashMlaPrefillFp8 as u16 && op.inst.j[1] != 0);
         let mla_v2 = !uniseg
-            && (split_mla || match std::env::var("PLOW_MLA_PF_V2").ok().as_deref() {
-                Some("0") => false,
-                Some("1") => true,
-                // A placed packet is an AMD production artifact. Isolating a pure MLA flash
-                // segment is safe even when its optional lean object is absent: the host then
-                // runs that ordered segment on the ordinary 8-wave interpreter.
-                _ => self.place_l2.is_some(),
-            });
-        let mla_aiter = mla_v2 && std::env::var("PLOW_MLA_PF_AITER").ok().as_deref() == Some("1");
+            && (split_mla
+                || match knobs.mla_pf_v2 {
+                    Some(explicit) => explicit,
+                    // A placed packet is an AMD production artifact. Isolating a pure MLA flash
+                    // segment is safe even when its optional lean object is absent: the host then
+                    // runs that ordered segment on the ordinary 8-wave interpreter.
+                    None => self.place_l2.is_some(),
+                });
+        let mla_aiter = mla_v2 && knobs.mla_pf_aiter;
         // Opt-in only: live packed serving remains disabled. Giving descriptor-consuming
         // families distinct classes lets a future runtime route them to lean objects without
         // putting their branches in the production megakernel. Unset preserves packet bytes.
@@ -1991,17 +2086,15 @@ impl Builder {
                     && pair[1].inst.op == DevOp::MlaMergeFold as u16
             });
         let decode_grouped_moe = !uniseg
-            && (self.decode_grouped_moe_segments
-                || std::env::var("PLOW_MOE_DECODE_STANDALONE").ok().as_deref() == Some("1"))
+            && (self.decode_grouped_moe_segments || knobs.moe_decode_standalone)
             && self.ops.windows(2).any(|pair| {
                 pair[0].inst.op == DevOp::MoeGroupGluFp8Blk as u16
                     && pair[1].inst.op == DevOp::MoeGroupDownFp8Blk as u16
             });
-        let graph_phase_objects = std::env::var("PLOW_PHASE_OBJECTS").ok().as_deref() == Some("1");
+        let graph_phase_objects = knobs.phase_objects;
         let xreduce_wave_rs = !uniseg
             && self.place_l2.is_some()
-            && (self.xreduce_wave_rs_segments
-                || std::env::var("PLOW_XR_WAVE_RS").ok().as_deref() == Some("1"))
+            && (self.xreduce_wave_rs_segments || knobs.xr_wave_rs)
             && self
                 .ops
                 .iter()
@@ -2041,7 +2134,7 @@ impl Builder {
         // whose sole arm is the warp-specialized w8a8 body — a bf16 or mapless packet
         // landing there would __trap()).
         // "w8a16" adds validated mapless W8A16 GEMMs and requires the matching object ABI.
-        let pure_env = std::env::var("PLOW_SEG_PURE_GEMM").ok();
+        let pure_env = knobs.seg_pure_gemm.clone();
         let pure_mode = match pure_env.as_deref() {
             Some("1") => 1u8,
             Some("fp8") => 2u8,
@@ -2056,14 +2149,13 @@ impl Builder {
         // class (2) so the host can launch them on the dedicated *_pffa flash object. hd is
         // carried in inst.i[6]. Requires the serve-side mirror PLOW_PF_SEG_FA512=1.
         // "1" = hd512 only; "all" = every FlashPrefill (needs the PLOW_NV_FA_ONLY_HD256 object).
-        let fa512_env = std::env::var("PLOW_SEG_FA512").ok();
+        let fa512_env = knobs.seg_fa512.clone();
         let fa512_mode = match fa512_env.as_deref() {
             Some("1") if !uniseg => 1u8,
             Some("all") if !uniseg => 2u8,
             _ => 0u8,
         };
-        let fa256_gqa2 = !uniseg
-            && std::env::var("PLOW_SEG_FA256_GQA2").ok().as_deref() == Some("1");
+        let fa256_gqa2 = !uniseg && knobs.seg_fa256_gqa2;
         // PLOW_SEG_V2=1 (T16, needs fa512=all + pure=fp8): rope and flash-merge join the FA
         // class (the *_pffa object carries their arms under PLOW_NV_FA_ROPE), and QuantFp8
         // joins the GEMM class (the uni256 object carries the quant arm) — the per-layer
@@ -2071,7 +2163,7 @@ impl Builder {
         // "1" = full v2 (rope/merge->FA + quant->GEMM; refuted on the 256-thread objects);
         // "q8" (T36) = quant->GEMM only — the ws384 object carries a consumer-warpgroup
         // quant arm, so the [gate/up, glu-quant, down] chain becomes one class-8 run.
-        let v2_env = std::env::var("PLOW_SEG_V2").ok();
+        let v2_env = knobs.seg_v2.clone();
         let seg_v2 = v2_env.as_deref() == Some("1");
         let seg_q8 = seg_v2 || v2_env.as_deref() == Some("q8");
         let wave_class = |i: usize| -> u8 {
@@ -2243,7 +2335,7 @@ impl Builder {
         // Materialized so later passes (SEG_CLASS_SLICE mutates self.ops) can read it.
         let op_class: Vec<u8> = (0..self.ops.len()).map(wave_class).collect();
         let wave_class = |i: usize| -> u8 { op_class[i] };
-        let seg_per_op = std::env::var("PLOW_SEG_PER_OP").ok().as_deref() == Some("1");
+        let seg_per_op = knobs.seg_per_op;
         let mut seg_of = vec![0u16; self.ops.len()];
         let mut cur_seg = 0u16;
         for i in 0..self.ops.len() {
@@ -2318,7 +2410,7 @@ impl Builder {
         // in one's head. It is also the field whose corruption produces the all-zero-logits
         // failure described directly below, which is the strongest argument for being able to
         // print it. Diagnostic only: no packet bytes depend on this.
-        if !seg_per_op && std::env::var("PLOW_SEG_DUMP").ok().as_deref() == Some("1") {
+        if !seg_per_op && knobs.seg_dump {
             let mut counts: Vec<(u8, usize)> = Vec::new();
             for i in 0..self.ops.len() {
                 let cls = wave_class(i); // signature changed to index-based (T24/T37 classing)
@@ -2345,7 +2437,7 @@ impl Builder {
         // Locality census (`PLOW_PLACE_REPORT=1`). Diagnostic only — reads the op DAG, writes
         // nothing. Answers the question a locality-aware placement pass has to answer FIRST:
         // how much of this program's slice-level dataflow could same-domain placement capture?
-        if std::env::var("PLOW_PLACE_REPORT").ok().as_deref() == Some("1") {
+        if knobs.place_report {
             self.locality_census(l2_place);
         }
 
@@ -2365,7 +2457,7 @@ impl Builder {
         // "light" (T25) = double ONLY class-4 light ops — the uni256 GEMM object is occ-1
         // (grid 132), and 264 slices there make every block run the full TMA-ring
         // prologue/drain TWICE per op (measured ~30% in-model loss vs the standalone probe).
-        let slice_env = std::env::var("PLOW_SEG_CLASS_SLICE").ok();
+        let slice_env = knobs.seg_class_slice.clone();
         let slice_mode = match slice_env.as_deref() {
             Some("1") => 1u8,
             Some("light") => 2u8,
@@ -2376,8 +2468,7 @@ impl Builder {
         // PLOW_SEG_SLICE_ALL=1 (T14): also double the machine-filling FLASH-class (light) ops
         // — the FATLITE object runs them at occ-2, so both resident blocks need slices.
         // Class-2 (dedicated flash) ops keep n_cu: the FA object is occ-1.
-        let seg_slice_all =
-            seg_class_slice && std::env::var("PLOW_SEG_SLICE_ALL").ok().as_deref() == Some("1");
+        let seg_slice_all = seg_class_slice && knobs.seg_slice_all;
         if seg_class_slice {
             let n_cu_sz = self.n_cu as usize;
             // Ops that some other op depends on FINELY — skip these (map[] would desync).

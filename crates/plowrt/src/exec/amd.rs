@@ -5696,7 +5696,7 @@ impl AmdEngine {
         // review settled on: the finest quantum the hardware can map costs
         // nothing extra here, and finer means less HBM held per slot.
         // 0 = query the device granularity (2 MiB measured on gfx950).
-        let block_hint = (crate::config::RuntimeConfig::get().amd_vmm_block_mib() as u64) << 20;
+        let block_hint = (crate::config::RuntimeConfig::get().vmm_block_mib() as u64) << 20;
         let block_hint = match block_hint {
             0 => VmmOps::granularity(&**be).ok()?,
             b => b,
@@ -5900,15 +5900,14 @@ impl AmdEngine {
             sched_prefill = s;
             sched_decode = s;
         }
-        if rt.static_both {
-            sched_prefill = Sched::Static;
-            sched_decode = Sched::Static;
-        }
-        if rt.static_prefill {
-            sched_prefill = Sched::Static;
-        }
-        if rt.static_decode {
-            sched_decode = Sched::Static;
+        match rt.static_sched.as_deref() {
+            Some("decode") => sched_decode = Sched::Static,
+            Some("prefill") => sched_prefill = Sched::Static,
+            Some(_) => {
+                sched_prefill = Sched::Static;
+                sched_decode = Sched::Static;
+            }
+            None => {}
         }
         if !has_gq && (sched_prefill == Sched::GlobalQueue || sched_decode == Sched::GlobalQueue) {
             tracing::info!("blob carries no GQ appendix — both phases fall back to static");

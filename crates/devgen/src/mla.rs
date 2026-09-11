@@ -262,9 +262,9 @@ fn glm_small_pf_split_cap(c: &GlmCfg, n_cu: u32, rows: u32) -> u32 {
     if !crate::emit_is_amd() || n_cu != 304 || c.tp != 8 || c.heads != 64
         || c.kv_lora != 512 || c.qk_rope != 64 || !glm_fp8_kv()
         || rows == 0 || rows >= 2048 || emit_config::active().packed_prefill_on()
-        // `PLOW_MLA_PF_V2` is the one knob `packet::devbuild` reads from the environment too
-        // (`UNRECORDED_ENV`); the split capacity must agree with the arm devbuild routes to.
-        || std::env::var("PLOW_MLA_PF_V2").ok().as_deref() == Some("0")
+        // The split capacity must agree with the arm `packet::devbuild` routes the packet
+        // to, so both read the builder's own knob snapshot.
+        || packet::devbuild::knobs().mla_pf_v2 == Some(false)
         || emit_config::active().uniseg
     {
         return 1;

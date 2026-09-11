@@ -111,6 +111,23 @@ pub struct RuntimeConfig {
     #[arg(long = "vmm-cache-mib", env = "PLOW_VMM_CACHE_MIB", global = true)]
     pub vmm_cache_mib: Option<u32>,
 
+    /// VMM sharing block size (MiB) for the prefix pools on either vendor. 2 MiB ≈ 4096 tokens
+    /// at hd256 bf16; raise (e.g. 64) for 128k-dedup work.
+    #[arg(
+        long = "vmm-block-mib",
+        env = "PLOW_VMM_BLOCK_MIB",
+        default_value_t = 2,
+        global = true
+    )]
+    pub vmm_block_mib: u32,
+
+    /// VMM lazy-commit weight slab. Unset = the vendor default: on for CUDA (the slab reserves
+    /// VA in µs and commits pages overlapped with the upload — measured), off for AMD (the flat
+    /// slab already saved 7–8.5 s/rank there; the residual win is unmeasured). `=0`/`=1`
+    /// overrides on either vendor.
+    #[arg(long = "weight-vmm", env = "PLOW_WEIGHT_VMM", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub weight_vmm: Option<bool>,
+
     /// Cross-request prefill scheduling. CUDA packs chunks into one launch. AMD packs only
     /// exact-capability programs; unsupported programs retain fair isolated scheduling.
     #[arg(long = "pf-batch", env = "PLOW_PF_BATCH", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
@@ -478,19 +495,6 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "vmm-live-rings", env = "PLOW_VMM_LIVE_RINGS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub vmm_live_rings: bool,
 
-    /// VMM sharing block size (MiB). 2 MiB ≈ 4096 tokens at hd256 bf16.
-    #[arg(
-        long = "vmm-block-mib",
-        env = "PLOW_VMM_BLOCK_MIB",
-        default_value_t = 2,
-        global = true
-    )]
-    pub vmm_block_mib: u32,
-
-    /// VMM lazy-commit weight slab (CUDA default ON). --no-nv-weight-vmm to disable.
-    #[arg(long = "nv-weight-vmm", env = "PLOW_WEIGHT_VMM", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub weight_vmm: bool,
-
     /// Direct upload path (CUDA). --no-nv-upload-direct to disable.
     #[arg(long = "nv-upload-direct", env = "PLOW_UPLOAD_DIRECT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub upload_direct: bool,
@@ -692,17 +696,10 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-global-queue", env = "PLOW_GLOBAL_QUEUE", global = true)]
     pub global_queue: Option<String>,
 
-    /// Force static scheduler for both phases.
-    #[arg(long = "amd-static", env = "PLOW_STATIC", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub static_both: bool,
-
-    /// Force static scheduler for decode only.
-    #[arg(long = "amd-static-decode", env = "PLOW_STATIC_DECODE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub static_decode: bool,
-
-    /// Force static scheduler for prefill only.
-    #[arg(long = "amd-static-prefill", env = "PLOW_STATIC_PREFILL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub static_prefill: bool,
+    /// Force the static scheduler: `both` (also `1`/`true`), `decode` or `prefill`. Unset
+    /// keeps the global queue wherever the blob carries its appendix.
+    #[arg(long = "amd-static", env = "PLOW_STATIC", value_parser = clap::builder::PossibleValuesParser::new(["both", "1", "true", "decode", "prefill"]), require_equals = true, num_args = 0..=1, default_missing_value = "both", global = true)]
+    pub static_sched: Option<String>,
 
     /// Segment enqueue/drain windowing. --no-amd-seg-window to disable.
     #[arg(long = "amd-seg-window", env = "PLOW_SEG_WINDOW", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
@@ -752,23 +749,6 @@ pub struct AmdRuntimeConfig {
     pub shared_prefix: Option<bool>,
 
     /// VMM block size for AMD KV (MiB).
-    // `id` disambiguates from the NVIDIA twin: clap derive uses the FIELD name
-    // as the arg id, and two flattened structs with the same field name break
-    // every full parse ("required argument was not provided"). Sharing the env
-    // var across backends is intended; sharing the id is not.
-    #[arg(
-        id = "amd_vmm_block_mib",
-        long = "amd-vmm-block-mib",
-        env = "PLOW_VMM_BLOCK_MIB",
-        default_value_t = 2,
-        global = true
-    )]
-    pub vmm_block_mib: u32,
-
-    /// VMM weight slab on AMD (opt-in, unmeasured).
-    #[arg(id = "amd_weight_vmm", long = "amd-weight-vmm", env = "PLOW_WEIGHT_VMM", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub weight_vmm: bool,
-
     /// Upload-ring pipeline depth. Values above one are experimental on ROCm:
     /// concurrent copies into one large allocation fault on current gfx950 drivers.
     #[arg(
@@ -1081,10 +1061,10 @@ impl RuntimeConfig {
         }
     }
 
-    #[cfg(feature = "cuda")]
-    pub(crate) fn nv_vmm_block_mib(&self) -> u32 {
+    #[cfg(any(feature = "cuda", feature = "hsa"))]
+    pub(crate) fn vmm_block_mib(&self) -> u32 {
         select_compat(
-            self.nv.vmm_block_mib,
+            self.vmm_block_mib,
             Self::env_parse("PLOW_VMM_BLOCK_MIB"),
             !Self::is_initialized(),
         )
@@ -1143,15 +1123,6 @@ impl RuntimeConfig {
         select_compat(
             self.nv.cubin_sample.clone(),
             Self::env_nonempty("PLOW_NV_CUBIN_SAMPLE").map(Some),
-            !Self::is_initialized(),
-        )
-    }
-
-    #[cfg(feature = "hsa")]
-    pub(crate) fn amd_vmm_block_mib(&self) -> u32 {
-        select_compat(
-            self.amd.vmm_block_mib,
-            Self::env_parse("PLOW_VMM_BLOCK_MIB"),
             !Self::is_initialized(),
         )
     }

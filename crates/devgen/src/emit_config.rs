@@ -1365,6 +1365,9 @@ pub fn install(mut cfg: EmitConfig) {
     // semantics where `set_var` before `run()` is the intent). We intentionally leak the
     // old allocation to keep `&'static` references valid.
     INSTALLED.store(ptr, std::sync::atomic::Ordering::Release);
+    // The packet builder's knobs are snapshotted at the same moment, from the same
+    // environment, so an `EnvScope` in a test moves both together.
+    packet::devbuild::install_knobs(packet::devbuild::SegKnobs::from_env());
 }
 
 /// The resolved value of one emit knob, and where that value came from.
@@ -2093,10 +2096,6 @@ mod tests {
             // Deliberate dual read: env first, `.or(emit_config::active().glm_gf)` second, so an
             // A/B script can repin it mid-process. The config field IS consumed.
             ("PLOW_GLM_GF", "dual read, config field consumed via .or()"),
-            // Read by `packet::devbuild` from the environment (see `UNRECORDED_ENV`); the GLM
-            // small-rung split capacity in mla.rs must follow the same setting devbuild will
-            // route the packet by, so it reads the variable the same way.
-            ("PLOW_MLA_PF_V2", "mirrors packet::devbuild's raw read"),
         ];
 
         let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");

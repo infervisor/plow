@@ -53,6 +53,42 @@ Severity: **blocker** (must fix before main), **should-fix** (correctness/robust
 | F14 | d60bdeb2 | devgen/mla.rs:265-266 | `glm_small_pf_split_cap` read `PLOW_MLA_PF_V2`/`PLOW_UNISEG` raw → `no_raw_env_reads` red again; `uniseg` now via `EmitConfig`, `PLOW_MLA_PF_V2` on the audit's ALLOWED list (it mirrors devbuild's raw read) | this commit |
 | F15 | d60bdeb2 (exposed) | devgen/mla/glm_tests.rs | 15 of 40 GLM tests failed in parallel runs, 0 single-threaded: 24 tests read the global `EmitConfig` without `env_guard()` while the new test's `EnvScope` resnapshots it. Guard added to every such test (two that call a guarded helper are left alone: non-reentrant mutex) | this commit |
 
+## Knob organization (2026-09-11)
+
+Inventory: 138 runtime knobs (`RuntimeConfig` 33 shared / NVIDIA 34 / AMD 48 / Apple 14 / CPU 9)
+and 162 emit knobs; every field has a code reader (devgen enforces it; the runtime's three
+"unread" ones are consumed inside config.rs), so bloat is duplication and stale opt-ins, not
+dead code. Production defaults are unchanged throughout.
+
+Done:
+- `packet::devbuild` read 21 `PLOW_*` variables straight from the environment (the reason the
+  manifest carries `UNRECORDED_ENV`). They are now one `SegKnobs` struct with a single
+  `from_env`, installed by `devgen::emit_config::install` from the same snapshot; nothing
+  installed = read the environment, as before. `mla.rs` reads the builder's knob instead of
+  the variable. Remaining raw reads outside the config structs are deliberate and documented:
+  `PLOW_GLM_GF` (dual read for mid-process A/B repin), `PLOW_BLOCK`/`PLOW_ROOT`/`PLOW_UNISEG`
+  in plowc (plowc-owned), tool env in kernelcaps/lean_verify/plowc tune (`PLOW_SOURCE_ROOT`,
+  `PLOW_TOOLCHAIN_LABEL`, `PLOW_VERIFY_*`, `ROCM_PATH`…).
+- `PLOW_VMM_BLOCK_MIB` and `PLOW_WEIGHT_VMM` were each declared twice (NVIDIA and AMD twins
+  with `id=` disambiguation). One shared knob each: `--vmm-block-mib` (default 2) and
+  `--weight-vmm` as `Option<bool>` — unset keeps the vendor default (CUDA on, AMD off).
+- `PLOW_STATIC` / `PLOW_STATIC_DECODE` / `PLOW_STATIC_PREFILL` → one `--amd-static
+  <both|decode|prefill>` (`PLOW_STATIC=1` still means both). Set by no script or recipe.
+
+Next step (not done here): promote the non-diagnostic `SegKnobs` fields to `EmitConfig` fields
+so `build.json` records them and `UNRECORDED_ENV` shrinks to the four diagnostics
+(`PLOW_TUNE_DUMP`, `PLOW_TR_QUIET`, `PLOW_SEG_DUMP`, `PLOW_PLACE_REPORT`).
+
+Retirement candidates (default-off, no script/recipe sets them; each deletes a code path, so
+they are the author's call):
+| Knob | Why | Cost of removal |
+|---|---|---|
+| `PLOW_CPU_L2_PLACE` | measured 1.5× slower, never faster (config.rs doc) | `cu_domains`/`cu_work`/`node_plan` + `WorkerPool::spawn` place plumbing + tests (~250 lines) |
+| `PLOW_GLM_PLACE_PF` | +2.2% tput, P99 TPOT +10.5% (review) | emitter placement arm |
+| `PLOW_GLM_FOLD_LT` | +0.49%, P99 +3.6% (review) | `amd_mla_fold.rs` (564 lines), pinned `glm_fold_lt_gfx942.json`, objects |
+| `PLOW_GLM_XR_RES`, `GLM_FUSE_XRN` | unmeasured on GLM-5.3 TP8; +1.8–5% only on TP4 GLM-5.2 blobs | collective fold arms |
+| `PLOW_MLA_PF_PSWZ` | −0.7% vs controls (review) | P-tile swizzle build arm |
+
 ## Artefact policy (applied on every merge)
 
 Raw measurement files pushed upstream are removed here before the branch goes to main:

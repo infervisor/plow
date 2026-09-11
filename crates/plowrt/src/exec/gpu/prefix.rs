@@ -60,7 +60,7 @@ impl GpuEngine {
             None => crate::memory::vmm::LiveKvLayout::from_blob(blob)?,
         };
         let config = RuntimeConfig::get();
-        let block_hint = (config.nv_vmm_block_mib() as u64) << 20;
+        let block_hint = (config.vmm_block_mib() as u64) << 20;
         let rings = if live_rings && !layout.ring_tensors.is_empty() {
             Some(crate::memory::vmm::VmmRings::new(
                 Arc::clone(be) as Arc<dyn crate::memory::vmm::VmmOps>,
@@ -145,7 +145,7 @@ impl GpuEngine {
         }
         layout
             .geo
-            .block_bytes(granularity, u64::from(config.nv_vmm_block_mib()) << 20)
+            .block_bytes(granularity, u64::from(config.vmm_block_mib()) << 20)
             .ok()?;
         Some(layout)
     }
@@ -306,7 +306,7 @@ impl GpuEngine {
         // contiguous granule runs (one call per span, not per block). The
         // 128k-dedup campaign can still raise it via PLOW_VMM_BLOCK_MIB=64.
         let rt = crate::config::RuntimeConfig::get();
-        let block_hint = (rt.nv_vmm_block_mib() as u64) << 20;
+        let block_hint = (rt.vmm_block_mib() as u64) << 20;
         // `mem_info` total = the card's VRAM; 0 (query refused) keeps the fixed fallback.
         let device_bytes = be.mem_info().map(|(_, total)| total).unwrap_or(0);
         let cache_cap = rt.prefix_cache_cap_bytes(device_bytes);

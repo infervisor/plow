@@ -203,7 +203,7 @@ impl BlobPlan {
                     .sum();
                 let geo = &layout.geometry;
                 let block =
-                    geo.block_bytes(granularity, u64::from(config.nv_vmm_block_mib()) << 20)?;
+                    geo.block_bytes(granularity, u64::from(config.vmm_block_mib()) << 20)?;
                 // Load maps row zero for every slot, including idle decode lanes.
                 let resident = block
                     * u64::from(geo.batch)
@@ -217,7 +217,7 @@ impl BlobPlan {
             } else if let Some(layout) = prefix_layout {
                 let geo = &layout.geo;
                 let block =
-                    geo.block_bytes(granularity, u64::from(config.nv_vmm_block_mib()) << 20)?;
+                    geo.block_bytes(granularity, u64::from(config.vmm_block_mib()) << 20)?;
                 let tracks = geo.full_layers.len() as u64 * 2;
                 let virtual_bytes = geo.full_tensor_bytes() * tracks;
                 let resident = block * u64::from(geo.batch) * u64::from(geo.kvh_full) * tracks;
