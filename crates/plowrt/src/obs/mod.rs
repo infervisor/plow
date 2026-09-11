@@ -3,6 +3,7 @@
 pub mod dstep;
 pub mod pfx;
 pub mod serving;
+pub mod tick;
 pub mod trace;
 pub mod ttft;
 

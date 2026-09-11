@@ -903,6 +903,7 @@ checkpoint location, because the weights a bundle needs are the same weights
 | `PLOW_TP_AGREE_EVERY=N` | 1 | TP cross-rank agreement interval. `PLOW_TP_NO_AUDIT=1` disables the redundant-rank audit (timing runs); `PLOW_TP_SERIAL_LOAD=1` restores one-at-a-time per-rank load. |
 | `PLOW_LOAD_PROFILE=1` | off | split upload wall time into alloc / stage+DMA profiling. |
 | `PLOW_STEP_TIME=1`, `PLOW_TTFT_LOG=1` | off | per-decode-step host-op timing / TTFT breakdown logging (diagnostics). |
+| `PLOW_TICK_LOG=1` | off | AMD serve: one `TICK` line per mux tick (prefill launches/rows/ms, decode rows/ms, host remainder, idle before), one `PFCHUNK` line per prefill chunk (cursor / rebase / `prefill_chunk` / restore / snapshot / prefix publish ms) and one `PFSEG` line per TP `prefill_chunk` (prepare / rearm / xctr / enqueue / drain / audit ms, cumulative per-rank drain). Diagnostics; stderr. |
 
 ## Visible devices: `CUDA_VISIBLE_DEVICES`, `ROCR_VISIBLE_DEVICES`, `HIP_VISIBLE_DEVICES`
 
