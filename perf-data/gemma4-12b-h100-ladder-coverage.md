@@ -4,6 +4,25 @@ Target: `google/gemma-4-12B-it`, H100 `sm_90a`. Compilation coverage is not
 performance qualification. Native bodies can remain in a shared interpreter;
 a separate object per opcode is not a requirement.
 
+## Per-case dispatch-arm validation
+
+`packet_ladder_audit` now recomputes each case's dispatch arm from the actual
+packet opcode and immediates, using the compiler's shared arm selector. With
+`build.json` supplied, it rejects missing or mismatched arm declarations,
+including a wrong head dimension. The audit output includes `dispatch_arm`
+beside the exact parameters, PCs and declared segment roles.
+
+The current BF16 B32, BF16-weight/FP8-KV B32, W8A8 B16 and fused-quant W8A8
+B16 assets pass: **42 programs, 31,116 instructions, 9,276 cases**.
+The [per-rung report](gemma4-12b-h100-data/ladder-dispatch-arm-audit.json)
+records packet/build hashes, all arm names and opcode counts.
+
+This closes an audit gap: previously an incorrect `arm` label could pass
+even though the raw instruction fields were checked. It does not add kernel
+specializations. Loaded-object selection, dtype/build flags, numerical checks
+and per-case timing remain separate requirements. In particular, shared light
+ops and FP8 decode still prevent an all-ops-specialized performance claim.
+
 ## Current all-op specialization review
 
 The current BF16-weight B32 packets with BF16 KV and all-layer FP8 KV both

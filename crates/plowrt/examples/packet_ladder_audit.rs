@@ -50,6 +50,12 @@ fn validate_kernel_cases(blob: &DevBlob, manifest: &serde_json::Value) -> Result
                     .and_then(|pc| usize::try_from(pc).ok())
                     .ok_or("invalid case PC")?;
                 let inst = p.insts.get(pc).ok_or("case PC outside packet")?;
+                let op = DevOp::from_u16(inst.op).ok_or("unknown packet opcode")?;
+                if case["arm"] != devgen::manifest::arm_of(op, &inst.i).key() {
+                    return Err(format!(
+                        "program {index} PC {pc}: kernel dispatch arm differs from packet"
+                    ));
+                }
                 if !seen.insert(pc) {
                     return Err(format!("program {index} PC {pc}: duplicate kernel case"));
                 }
@@ -178,6 +184,11 @@ mod tests {
             ("/kernel_cases/programs/0/cases/0/pcs", json!([0, 0])),
             ("/kernel_cases/programs/0/cases/0/pcs", json!([1])),
             ("/kernel_cases/programs/0/cases/0/i/2", json!(512)),
+            (
+                "/kernel_cases/programs/0/cases/0/arm",
+                json!("HeadNormRope/hd512"),
+            ),
+            ("/kernel_cases/programs/0/cases/0/arm", json!(null)),
             ("/kernel_cases/programs/0/cases/0/j/0", json!(4096)),
             ("/kernel_cases/programs/0/cases/0/f_bits/0", json!(0)),
             ("/kernel_cases/programs/0/cases/0/f_bits/1", json!(1)),
@@ -354,6 +365,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .into_iter()
                 .map(|((op, blocks, i, fj, tensor_bytes, roles), pcs)| {
                     json!({"op": format!("{:?}", DevOp::from_u16(op).unwrap()),
+                    "dispatch_arm": devgen::manifest::arm_of(DevOp::from_u16(op).unwrap(), &i).key(),
                     "blocks": blocks, "i": i, "fj_bits": fj,
                     "tensor_bytes": tensor_bytes, "declared_roles": roles, "pcs": pcs,
                     "performance_evidence": null})

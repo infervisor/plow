@@ -101,7 +101,7 @@ impl Arm {
 ///     (`if (in->i[3] == 128) d_flash_merge<128>(...)`), emitters
 ///     `crates/devgen/src/lib.rs` (`d.i[3] = hd`) and `crates/devgen/src/mla.rs:4626`
 ///     (`i.i[3] = c.attn_head_dim`). `i[6]` is never assigned on a `FlashMerge` packet.
-fn arm_of(op: DevOp, i: &[u32; 8]) -> Arm {
+pub fn arm_of(op: DevOp, i: &[u32; 8]) -> Arm {
     let hd = match op {
         DevOp::FlashMerge => Some(i[3]),
         DevOp::HeadNormRope | DevOp::HeadNormRopeFp8 => Some(i[2]),
