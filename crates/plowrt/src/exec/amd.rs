@@ -8386,12 +8386,18 @@ impl AmdEngine {
                 rows.max(128),
                 blob.decode_phase().any(has_moe_aiter),
                 use_resident_moe,
-                crate::config::RuntimeConfig::get().amd.moe_aiter_tile64,
+                crate::config::RuntimeConfig::get()
+                    .amd
+                    .moe_aiter_tile64
+                    .unwrap_or_else(|| amd_moe_aiter::tile64_available(hsaco_dir)),
                 &mut modules,
             )?)
         } else {
             None
         };
+        if let Some(moe) = moe_aiter.as_mut() {
+            moe.set_xcd_swizzle(crate::config::RuntimeConfig::get().amd.moe_aiter_xcd)?;
+        }
 
         // --- tensors + weights ------------------------------------------------
         // Staging is one pinned slab, filled and pushed in `STAGE` chunks. The

@@ -1041,8 +1041,18 @@ pub struct AmdRuntimeConfig {
 
     /// Run native GLM MoE prefill rows >= 1024 on AITER's 64-row persistent tile
     /// (`..._psx_64x256.co`), the object its GLM-5 gfx942 tuning selects there.
-    #[arg(long = "amd-moe-aiter-tile64", env = "PLOW_MOE_AITER_TILE64", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub moe_aiter_tile64: bool,
+    /// Unset = on when the object dir carries the pinned object and a tile64-marked
+    /// adapter; `=1` requires them; `=0` keeps the 32x256 object at every rung.
+    #[arg(long = "amd-moe-aiter-tile64", env = "PLOW_MOE_AITER_TILE64", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub moe_aiter_tile64: Option<bool>,
+
+    /// Launch the sorted AITER MoE blocks of the 32x256 object in XCD-swizzled order: the
+    /// consecutive blocks of one expert sit 8 positions apart so they run concurrently on one
+    /// XCD and share its L2 for the expert's weights (the 64-row psx object remaps workgroups
+    /// itself). Unset = on when the adapter carries `plow_moe_aiter_swizzle_abi_1`; `=1`
+    /// requires it; `=0` keeps the sorted order.
+    #[arg(long = "amd-moe-aiter-xcd", env = "PLOW_MOE_AITER_XCD", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub moe_aiter_xcd: Option<bool>,
 
     /// Prequantize sorted MXFP4 MoE stage-1 activations once and reuse them across N tiles.
     #[arg(long = "amd-moe-stage1-a4-reuse", env = "PLOW_MOE_STAGE1_A4_REUSE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
