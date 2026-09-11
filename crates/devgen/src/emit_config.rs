@@ -2093,6 +2093,10 @@ mod tests {
             // Deliberate dual read: env first, `.or(emit_config::active().glm_gf)` second, so an
             // A/B script can repin it mid-process. The config field IS consumed.
             ("PLOW_GLM_GF", "dual read, config field consumed via .or()"),
+            // Read by `packet::devbuild` from the environment (see `UNRECORDED_ENV`); the GLM
+            // small-rung split capacity in mla.rs must follow the same setting devbuild will
+            // route the packet by, so it reads the variable the same way.
+            ("PLOW_MLA_PF_V2", "mirrors packet::devbuild's raw read"),
         ];
 
         let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");

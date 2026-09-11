@@ -2047,6 +2047,117 @@ fn fp8_mla_v2_routes_only_a_pure_segment_to_four_waves() {
     assert_eq!(derive_segments_for(&mixed, true).unwrap(), [8]);
 }
 
+#[test]
+fn small_mla_family_requires_pure_dense_ordinary_segments() {
+    for op in [DevOp::FlashMlaPrefill, DevOp::FlashMlaPrefillFp8] {
+        let mut prog = segmented_prog(&[DevOp::Gemv, op, DevOp::MlaMergeFold], &[0, 1, 2]);
+        prog.insts[1].t[7] = packet::dev::TENSOR_NONE16;
+        for rows in [1, 4, 8, 16, 20, 128, 512, 1024] {
+            prog.t = rows;
+            assert_eq!(segment::small_mla_segments(&prog, 4), [false, true, false, false]);
+            assert_eq!(derive_segments_for(&prog, false).unwrap(), [8, 8, 8]);
+        }
+        prog.packed_prefill_only = true;
+        assert_eq!(segment::small_mla_segments(&prog, 3), [false; 3]);
+        prog.packed_prefill_only = false;
+        prog.t = 2048;
+        assert_eq!(segment::small_mla_segments(&prog, 3), [false; 3]);
+        prog.t = 128;
+        prog.insts[1].i[3] = 1 << 31;
+        assert_eq!(segment::small_mla_segments(&prog, 3), [false; 3]);
+        prog.insts[1].i[3] = 0;
+        prog.stream[0].seg = 1;
+        assert_eq!(segment::small_mla_segments(&prog, 3), [false; 3]);
+        prog.stream[0].seg = 0;
+        if op == DevOp::FlashMlaPrefill {
+            prog.insts[1].i[6] = 2;
+            assert_eq!(segment::small_mla_segments(&prog, 3), [false; 3]);
+            prog.insts[1].i[6] = 0;
+            prog.insts[1].t[7] = 10;
+        } else {
+            prog.insts[1].fj[1] = 11;
+        }
+        assert_eq!(segment::small_mla_segments(&prog, 3), [false; 3]);
+    }
+}
+
+fn small_mla_split_fixture() -> (DevProg, Vec<crate::asset::devblob::DevTensor>) {
+    let mut prog = segmented_prog(&[DevOp::FlashMlaPrefillFp8, DevOp::MlaMergeFold], &[0, 1]);
+    prog.t = 128;
+    prog.insts[0].t = [0, 1, 2, 3, 4, 5, 6, 7];
+    prog.insts[0].i = [1, 8, 81920, 0, 128, u32::MAX, 0, 4];
+    prog.insts[0].fj[2] = 16;
+    prog.insts[1].t = [8, 0, 1, 9, 0, 0, 0, 0];
+    prog.insts[1].i = [128, 8, 256, 0, 16, 0, 0, 0];
+    let tensors = [128*8*16*512*4, 128*8*16*2*4, 128*8*512*2, 128*8*64*2,
+        81920*512, 81920*64*2, 4, 81920*4].into_iter().enumerate().map(|(i, bytes)| {
+            crate::asset::devblob::DevTensor { name: format!("test.{i}"), bytes, init: None }
+        }).collect();
+    (prog, tensors)
+}
+
+#[test]
+fn small_mla_splits_follow_live_context_and_patch_both_sides() {
+    let (mut prog, tensors) = small_mla_split_fixture();
+    let (sites, segments) = mla_prefill::split_sites(&prog, &tensors).unwrap();
+    assert_eq!(segments, [true, false]);
+    assert_eq!(derive_segments_for(&prog, true).unwrap(), [4, 8]);
+    assert!(derive_segments_for(&prog, false).is_err());
+    assert_eq!(segment::small_mla_segments(&prog, 2), [false, false]);
+    for (rows, ctx, ns) in [(1,1,1), (4,32,1), (20,33,2), (128,128,4),
+        (128,1024,16), (128,70000,16), (4,70000,32), (128,128,4)] {
+        prog.insts[0].i[4] = rows;
+        prog.insts[1].i[0] = rows;
+        mla_prefill::rebase(&sites, &mut prog.insts, ctx).unwrap();
+        assert_eq!((prog.insts[0].fj[2], prog.insts[1].i[4]), (ns, ns));
+    }
+    for (rows, ctx) in [(0,128), (129,70000), (128,127)] {
+        prog.insts[0].i[4] = rows;
+        assert!(mla_prefill::rebase(&sites, &mut prog.insts, ctx).is_err());
+    }
+}
+
+#[test]
+fn small_mla_append_context_matrix_stays_inside_partial_storage() {
+    for capacity in [1u32,2,4,8,16,20,32,64,128,256,512,1024] {
+        let split_cap = (304 / (capacity.div_ceil(64) * 8)).clamp(1,32);
+        let partial_rows = capacity * (1 << split_cap.ilog2());
+        for rows in [1,2,4,8,16,20,31,32,33,63,64,65,127,128,129,256,512,1024] {
+            if rows > capacity { continue; }
+            for ctx in [32,33,128,129,512,1024,4096,16384,32768,65536,70000,81920] {
+                if ctx < rows { continue; }
+                let ns = mla_prefill::live_splits(partial_rows, rows, ctx);
+                assert!(ns.is_power_of_two() && ns <= 32);
+                assert!(rows * ns <= partial_rows, "capacity={capacity} rows={rows} ctx={ctx}");
+                assert!(ns <= ctx.div_ceil(32));
+                assert!(rows.div_ceil(64) * 8 * ns <= 304);
+            }
+        }
+    }
+}
+
+#[test]
+fn small_mla_split_layout_refuses_unsafe_pairings() {
+    for kind in 0..12 {
+        let (mut prog, mut tensors) = small_mla_split_fixture();
+        match kind {
+            0 => prog.insts[0].fj[2] = 3,
+            1 => prog.insts[1].i[4] = 1,
+            2 => prog.insts[1].t[1] = 4,
+            3 => tensors[0].bytes -= 4,
+            4 => tensors[1].bytes -= 4,
+            5 => tensors[7].bytes -= 4,
+            6 => prog.insts[0].fj[1] = 1,
+            7 => prog.insts[0].i[3] = 0x80000000,
+            8 => prog.packed_prefill_only = true,
+            9 => prog.stream[1].seg = 0,
+            10 => prog.insts[0].i[6] = 1,
+            _ => prog.insts[1].i[5] = 1,
+        }
+        assert!(mla_prefill::split_sites(&prog, &tensors).is_err(), "case {kind}");
+    }
+}
+
 /// NoPE MLA prefill now ROUTES to the four-wave object instead of being refused there.
 ///
 /// This test asserted the opposite until the `d_flash_mla_prefill_v2<512, 0>` arm landed,

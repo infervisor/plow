@@ -258,6 +258,21 @@ fn glm_dsa_pf_bucket(c: &GlmCfg, t: u32) -> bool {
     c.dsa_pf() && t >= 2048 && t > c.index_topk
 }
 
+fn glm_small_pf_split_cap(c: &GlmCfg, n_cu: u32, rows: u32) -> u32 {
+    if !crate::emit_is_amd() || n_cu != 304 || c.tp != 8 || c.heads != 64
+        || c.kv_lora != 512 || c.qk_rope != 64 || !glm_fp8_kv()
+        || rows == 0 || rows >= 2048 || emit_config::active().packed_prefill_on()
+        // `PLOW_MLA_PF_V2` is the one knob `packet::devbuild` reads from the environment too
+        // (`UNRECORDED_ENV`); the split capacity must agree with the arm devbuild routes to.
+        || std::env::var("PLOW_MLA_PF_V2").ok().as_deref() == Some("0")
+        || emit_config::active().uniseg
+    {
+        return 1;
+    }
+    let capacity = (n_cu / (rows.div_ceil(64) * 8)).clamp(1, 32);
+    1 << capacity.ilog2()
+}
+
 fn cfg_glm(dir: &Path) -> GlmCfg {
     let root: Value =
         serde_json::from_slice(&std::fs::read(dir.join("config.json")).expect("config.json"))
@@ -1863,7 +1878,9 @@ pub(crate) fn declare_glm_rows_batched(
     // rows*nh_l*pf_ns partials (each split a ceil-equal share of its tile's causal range;
     // dead splits carry m=-inf/l=0, which d_mla_merge_fold weighs 0 branch-free — the old
     // "empty split divides the merge" objection predates that merge rewrite).
-    let osplits = (ns * dbatch).max(rows as u32 * glm_pf_ns());
+    let small_cap = glm_small_pf_split_cap(c, b.n_cu(), 128);
+    let small_partials = if small_cap > 1 { 128 * small_cap } else { 0 };
+    let osplits = (ns * dbatch).max(rows as u32 * glm_pf_ns()).max(small_partials);
     let opart = ac(b, "opart", (nh_l * osplits * dk) as u64 * F32);
     let mlpart = ac(b, "mlpart", (nh_l * osplits * 2) as u64 * F32);
     let olat = ac(b, "olat", (nh_l * dk) as u64 * BF16);
@@ -4849,7 +4866,7 @@ pub(crate) fn emit_glm_mla_prefill(
     xgate: &mut u32,
     xr_cus: &[u32],
 ) -> u32 {
-    assert!(t > 1, "prefill bucket must carry more than one row (t={t})");
+    assert!(t > 0, "prefill bucket must carry at least one row");
     let all = b.all();
     let n_cu = b.n_cu();
     let (h, nh, dk, dr, vd, ql) = (c.hidden, c.heads, c.kv_lora, c.qk_rope, c.v_head, c.q_lora);
@@ -5102,10 +5119,12 @@ pub(crate) fn emit_glm_mla_prefill(
     // each split a ceil-equal share of ITS tile's causal range — what fixes the tail-round
     // quantization (1024 items on 304 CUs = 3.37 rounds, 34% of the machine idle inside the
     // packet, 8k trace). i[6] carries it on the DENSE arm only; the sparse arm owns i[6]=cap.
-    // t >= 2048 mirrors the host's V2 routing threshold (exec/amd.rs): below it the packet
-    // runs on the 8-wave kernel, which does not honor the split — the host refuses that
-    // combination, so the emitter must not produce it for the small rungs.
-    let pf_ns = if fp8kv || sparse || t < 2048 || ofold {
+    // Small dense FP8 rungs use a separate four-wave object; fj[2] carries its
+    // split capacity and the runtime rebases it together with the matching merge.
+    let small_pf_ns = glm_small_pf_split_cap(c, n_cu, t);
+    let pf_ns = if fp8kv && !sparse {
+        small_pf_ns
+    } else if fp8kv || sparse || t < 2048 || ofold {
         1 // ofold owns this bucket: the fold consumes the un-split l (ns==1 premise)
     } else {
         glm_pf_ns()
@@ -5128,6 +5147,9 @@ pub(crate) fn emit_glm_mla_prefill(
             d.t[6] = n.kvlen;
             if fp8kv {
                 d.t[7] = n.kv_scale[slot];
+                if small_pf_ns > 1 && !sparse {
+                    d.j[1] = small_pf_ns;
+                }
                 if sparse {
                     d.j[0] = n.iuni + 1;
                     d.i[6] = glm_dsa_pf_cap(c, ctx);
@@ -5493,9 +5515,9 @@ fn emit_glm_moe_ffn_prefill(
             enc == MoeEnc::Fp8Blk
                 && tp == 8
                 && n_cu == 304
-                && (128..=8192).contains(&t)
+                && (1..=8192).contains(&t)
                 && (h, imoe_e, e, tk) == (6144, 256, 256, 8),
-            "PLOW_GLM_MOE_AITER requires gfx942 TP8 GLM block-FP8 prefill, rows 128..8192"
+            "PLOW_GLM_MOE_AITER requires gfx942 TP8 GLM block-FP8 prefill, rows 1..8192"
         );
     }
     let det = !native_moe && moe_pf_fuse(tk) == MoePfFuse::Det;
@@ -6266,7 +6288,7 @@ pub(crate) fn glm_prefill_buckets_env(ctx: u32) -> (Vec<u32>, PrefillScope) {
     let parse_list = |list: &str| -> Vec<u32> {
         list.split(',')
             .filter_map(|s| s.trim().parse::<u32>().ok())
-            .filter(|&x| x > 1 && x <= ctx)
+            .filter(|&x| x > 0 && x <= ctx)
             .collect()
     };
     match emit_config::active().mla_prefill.as_deref() {
@@ -7464,8 +7486,7 @@ fn glm_emit_full(
     verify: Option<&crate::VerifyHook>,
 ) {
     // The decode-batch ladder: one decode program per rung, ascending, after the prefill
-    // buckets (`decode_rung_lo` separates the two ranges by width alone, so every rung must sit
-    // strictly below the narrowest bucket — 32 < 128 holds by construction). Unset, this is
+    // buckets (a non-increasing boundary separates the two ascending ladders). Unset, this is
     // `[1]` and the emit is byte-identical to the pre-ladder one; that anchor is the gate the
     // batched path is validated against.
     let rungs: Vec<u32> = emit_config::active().decode_rungs();
@@ -7508,7 +7529,7 @@ fn glm_emit_full(
          post_attention_layernorm and never writes act.logits — the runtime would select those \
          programs and sample from a buffer nothing wrote."
     );
-    let max_rows = pf.iter().copied().max().unwrap_or(1);
+    let max_rows = pf.iter().copied().max().map(|rows| rows.max(2)).unwrap_or(1);
 
     let mut tb = Builder::new(n_cu);
     // Row-parameterised declare: activations are sized for the WIDEST bucket, so one tensor table
@@ -7638,16 +7659,11 @@ fn glm_emit_full(
         });
     }
 
-    // The decode-rung separation `decode_rung_lo` depends on: every rung strictly below every
-    // prefill bucket. 32 < 128 by construction, but assert like the Gemma ladder does — a future
-    // bucket table edit must not silently fold a rung into the prefill range.
-    if let Some(&min_bucket) = pf.iter().min() {
-        assert!(
-            dbatch < min_bucket,
-            "decode rung {dbatch} >= narrowest prefill bucket {min_bucket}: \
-             decode_rung_lo separates the ranges by width alone"
-        );
-    }
+    let widths: Vec<_> = prog_t.iter().chain(&rungs).copied().collect();
+    assert_eq!(
+        packet::devbuild::decode_rung_lo(&widths), prog_t.len(),
+        "prefill and decode ladders require a non-increasing phase boundary"
+    );
     // One decode program per rung, ascending. 78 decoder layers each, ping-ponging x <-> xnext so
     // layer l+1 reads layer l's output; each layer's first op waits on the previous layer's
     // completion (`dep`). XReduce collectives (decode one-shot): each o_proj + FFN-down

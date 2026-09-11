@@ -8,6 +8,43 @@
 use super::*;
 
 #[test]
+fn small_prefill_splits_allocate_and_emit_matching_partial_layouts() {
+    let _guard = crate::test_env::env_guard();
+    let _env = crate::test_env::EnvScope::set(&[
+        ("PLOW_GLM_FP8_KV", "1"), ("PLOW_MLA_PF_V2", ""), ("PLOW_UNISEG", "0"),
+    ]);
+    let mut c = glm_ref_cfg();
+    c.tp = 8;
+    for (rows, expected) in [(1,32), (2,32), (4,32), (8,32), (16,32), (20,32),
+        (32,32), (64,32), (128,16), (256,8), (512,4), (1024,2),
+        (2048,1), (4096,1), (8192,1)] {
+        assert_eq!(glm_small_pf_split_cap(&c, 304, rows), expected);
+        assert_eq!(crate::with_emit_target_amd(false, || glm_small_pf_split_cap(&c, 304, rows)), 1);
+        assert_eq!(glm_small_pf_split_cap(&c, 256, rows), 1);
+        let mut decl = Builder::new(304);
+        let n = declare_glm_rows_batched(&mut decl, &c, 81920, &[0], rows, 20, MoeEnc::Fp8Blk);
+        let mut b = Builder::new(304);
+        b.adopt_tensors(decl.tensors());
+        let all = b.all();
+        emit_glm_mla_prefill(&mut b, &c, &n, 0, 81920, rows, MoeEnc::Fp8Blk,
+            n.x, &[], false, &mut 0, &all);
+        let prog = b.finish();
+        let ix = prog.insts.iter().position(|d| d.op == DevOp::FlashMlaPrefillFp8 as u16).unwrap();
+        let flash = &prog.insts[ix];
+        let merge = &prog.insts[ix + 1];
+        assert_eq!(flash.j[1], if expected > 1 { expected } else { 0 });
+        if expected > 1 {
+            let segment = prog.stream.iter().find(|e| e.inst as usize == ix).unwrap().seg;
+            assert!(prog.stream.iter().filter(|e| e.seg == segment).all(|e| e.inst as usize == ix));
+        }
+        assert_eq!(merge.op, DevOp::MlaMergeFold as u16);
+        assert_eq!((merge.t[1], merge.t[2], merge.i[4]), (n.opart, n.mlpart, expected));
+        assert!(decl.tensors()[n.opart as usize].bytes >= u64::from(rows) * 8 * u64::from(expected) * 512 * 4);
+        assert!(decl.tensors()[n.mlpart as usize].bytes >= u64::from(rows) * 8 * u64::from(expected) * 2 * 4);
+    }
+}
+
+#[test]
 fn dense_prefill_rungs_populate_keys_for_sparse_decode() {
     let _guard = crate::test_env::env_guard();
     let mut c = glm_ref_cfg();
@@ -182,6 +219,7 @@ fn ref_sequence(use_fp8: bool) -> Vec<u16> {
 
 #[test]
 fn glm_block_matches_reference_bf16() {
+    let _guard = crate::test_env::env_guard();
     assert_eq!(
         emitted_ops(false),
         ref_sequence(false),
@@ -191,6 +229,7 @@ fn glm_block_matches_reference_bf16() {
 
 #[test]
 fn glm_block_matches_reference_fp8() {
+    let _guard = crate::test_env::env_guard();
     assert_eq!(
         emitted_ops(true),
         ref_sequence(true),
@@ -257,6 +296,7 @@ fn emitted_ops_dsa(ctx: u32, full: bool) -> Vec<u16> {
 
 #[test]
 fn glm_dsa_gate_off_below_cutover() {
+    let _guard = crate::test_env::env_guard();
     use DevOp::*;
     // ctx<=CROSSOVER (65536): NO DSA ops, dense FlashMlaDecode — byte-identical to the non-DSA MoE
     // block. 32768 is in the mid-ctx band, where the measured full-model TP4 winner is dense.
@@ -401,6 +441,7 @@ fn glm_flash_decode_packet_matches_the_arm_the_interpreter_dispatches() {
 ///    drift again without the assert catching it.
 #[test]
 fn glm_dsa_selector_is_bound_to_the_live_kv_length_and_declares_its_geometry() {
+    let _guard = crate::test_env::env_guard();
     let mut c = glm_ref_cfg();
     c.indexer_full = vec![false, false, false, true];
     let ctx = 131072; // above CROSSOVER, so the DSA arm is live
@@ -680,6 +721,7 @@ fn glm_dsa_decode_batch_strides_producers_and_serializes_selection() {
 
 #[test]
 fn glm_dsa_full_layer_emits_indexer() {
+    let _guard = crate::test_env::env_guard();
     use DevOp::*;
     // ctx>CROSSOVER, 'full': indexer (2 fp8 projections + LayerNorm + 2 rope + weights_proj GEMV +
     // score + select) then FLASH_GATHER (not dense).
@@ -705,6 +747,7 @@ fn glm_dsa_full_layer_emits_indexer() {
 
 #[test]
 fn glm_dsa_shared_layer_reuses_idx() {
+    let _guard = crate::test_env::env_guard();
     use DevOp::*;
     // ctx>CROSSOVER, 'shared': NO indexer ops (reuses the last full layer's idx) but still GATHERs.
     let ops = emitted_ops_dsa(131072, false);
@@ -764,6 +807,7 @@ fn emitted_ops_dsa_pooled(ctx: u32, full: bool, index_kpool: u32) -> Vec<u16> {
 
 #[test]
 fn glm_dsa_pool_size_one_is_byte_identical_to_dense() {
+    let _guard = crate::test_env::env_guard();
     // index_kpool=1 is the explicit no-op path — same op multiset as the ordinary
     // (unspecified-index_kpool, defaults to 1 in glm_ref_cfg) dense-indexer test above,
     // for BOTH full and shared layers. This is the hard regression bar for the whole
@@ -790,6 +834,7 @@ fn glm_dsa_pool_size_one_is_byte_identical_to_dense() {
 
 #[test]
 fn glm_dsa_pooled_full_layer_emits_the_kpool_chain_in_order() {
+    let _guard = crate::test_env::env_guard();
     use DevOp::*;
     // ctx>CROSSOVER, 'full', index_kpool=4: the pooled indexer chain, not plain IndexScore/
     // IndexSelect — gate-score Gemv, iwp_f32 GemvF32, DsaPoolStash, DsaPoolCompress,
@@ -853,6 +898,7 @@ fn glm_dsa_pooled_full_layer_emits_the_kpool_chain_in_order() {
 
 #[test]
 fn glm_dsa_pooled_selection_width_matches_decode_and_prefill_geometry() {
+    let _guard = crate::test_env::env_guard();
     const CTX: u32 = 131072;
     const POOL: u32 = 4;
     const WIDTH: u32 = 2051;
@@ -888,6 +934,7 @@ fn glm_dsa_pooled_selection_width_matches_decode_and_prefill_geometry() {
 
 #[test]
 fn glm_dsa_pooled_shared_layer_reuses_the_pool_cache() {
+    let _guard = crate::test_env::env_guard();
     use DevOp::*;
     // 'shared' pooled layers reuse the last full layer's selection — no indexer ops of
     // ANY kind (dense or pooled), same as the dense-indexer shared-layer case.
@@ -913,6 +960,7 @@ fn glm_dsa_pooled_shared_layer_reuses_the_pool_cache() {
 
 #[test]
 fn glm_dense_block_sequence() {
+    let _guard = crate::test_env::env_guard();
     use DevOp::*;
     // Fused MLA (A+G): the 3 input GEMVs (q_a/kv_a/k_rope) -> one GemvQkv, and Wqa+Wqr -> one GemvQkv.
     let mla = vec![
@@ -937,6 +985,7 @@ fn glm_dense_block_sequence() {
 
 #[test]
 fn glm_block_op_count() {
+    let _guard = crate::test_env::env_guard();
     // 16 attention/pre-MoE ops after the A/G fusion (input q_a/kv_a/k_rope -> 1 GemvQkv, Wqa/Wqr
     // -> 1 GemvQkv; 2 dynamic-rope HeadNormRope + the 2-op router split + fused MlaMergeFold)
     // + 8*(glu+down) + 1 combine = 33 (was 36 pre-fusion).
@@ -959,6 +1008,7 @@ fn block_ops(c: &GlmCfg, ctx: u32, block: std::ops::Range<usize>) -> Vec<u16> {
 /// coverage lever: the block inherits glm_block_matches_reference_*'s GPU parity.
 #[test]
 fn glm_block_extract_matches_reference() {
+    let _guard = crate::test_env::env_guard();
     let c = glm_ref_cfg();
     assert_eq!(
         block_ops(&c, 512, 3..4),
@@ -982,6 +1032,7 @@ fn glm_block_extract_matches_reference() {
 /// same byte sizes.
 #[test]
 fn the_weight_prefix_is_cfg_data_and_moves_only_the_weights() {
+    let _guard = crate::test_env::env_guard();
     let decl = |pfx: &str| {
         let mut c = glm_ref_cfg();
         c.prefix = pfx.to_string();
@@ -1046,6 +1097,7 @@ fn the_weight_prefix_is_cfg_data_and_moves_only_the_weights() {
 /// like a weight, lives under the model prefix, and must NOT be demanded of a checkpoint.
 #[test]
 fn the_new_weight_predicate_binds_everything_the_old_one_did() {
+    let _guard = crate::test_env::env_guard();
     let c = glm_ref_cfg();
     let mut b = Builder::new(256);
     let _ = declare_glm(&mut b, &c, 512, &[3]);
@@ -1081,6 +1133,7 @@ fn the_new_weight_predicate_binds_everything_the_old_one_did() {
 /// `act.x` after an even layer count.
 #[test]
 fn glm_block_extract_multi_layer_chains() {
+    let _guard = crate::test_env::env_guard();
     let c = glm_ref_cfg();
     let mut want = emitted_dense_ops(); // layer 2 (dense)
     want.extend(ref_sequence(true)); // layer 3 (MoE)
@@ -1101,6 +1154,7 @@ fn glm_block_extract_multi_layer_chains() {
 /// layer count) + kv carried state, DSA gate OFF at this ctx (no dsa_indices).
 #[test]
 fn glm_block_descriptor_moe() {
+    let _guard = crate::test_env::env_guard();
     let c = glm_ref_cfg(); // indexer_full[3] = false (reuse)
     let (_, d) = glm_build_block(&c, 512, 256, 3..4, true, "glm-ref", MlaArch::Glm);
     assert_eq!(d.arch, "glm_mla_dsa");
@@ -1134,6 +1188,7 @@ fn glm_block_descriptor_moe() {
 /// Descriptor for a DENSE block (`--block 0`): no MoE dims, dense_ffn kind.
 #[test]
 fn glm_block_descriptor_dense() {
+    let _guard = crate::test_env::env_guard();
     let c = glm_ref_cfg();
     let (_, d) = glm_build_block(&c, 512, 256, 0..1, true, "glm-ref", MlaArch::Glm);
     assert_eq!(d.kind, vec!["mla_dsa", "dense_ffn"]);
@@ -1147,6 +1202,7 @@ fn glm_block_descriptor_dense() {
 /// 'indexer' layer computes them in-block (kv carries its kidx cache instead).
 #[test]
 fn glm_block_dsa_indexshare_carried_state() {
+    let _guard = crate::test_env::env_guard();
     // 'reuse' layer 3 (indexer_types[3] = shared).
     let mut c = glm_ref_cfg();
     c.indexer_full = vec![false, false, false, false];
@@ -1562,6 +1618,7 @@ fn glm_decode_norm_rows_preserves_arithmetic_and_completion() {
 /// measured (MI350X mla_perf) chain optima: ns~16 up to 8k, ns~64 at 32k.
 #[test]
 fn glm_nsplit_is_ctx_scaled_and_capped_per_rank() {
+    let _guard = crate::test_env::env_guard();
     let n_cu = 256u32;
     for &(_tp, nh_l) in &[(1u32, 64u32), (2, 32), (4, 16), (8, 8)] {
         let n_grp = (nh_l / GLM_MLA_GF).max(1);
@@ -1631,6 +1688,7 @@ fn glm_nsplit_is_ctx_scaled_and_capped_per_rank() {
 
 #[test]
 fn glm_cfg_qk_scale() {
+    let _guard = crate::test_env::env_guard();
     let c = glm_ref_cfg();
     assert_eq!(c.qk_head(), 256);
     assert!(
@@ -1657,6 +1715,7 @@ fn glm_cfg_qk_scale() {
 /// this test set the var. Test the pure part as a pure function.
 #[test]
 fn glm_linear_fp8_prefill_routes_to_the_block_fp8_gemm() {
+    let _guard = crate::test_env::env_guard();
     let mut b = Builder::new(256);
     let w = b.tensor("w.weight_fp8", 6144 * 4096);
     let s = b.tensor("w.weight_scale_inv", 48 * 32 * F32);
@@ -1682,6 +1741,7 @@ fn glm_linear_fp8_prefill_routes_to_the_block_fp8_gemm() {
 /// The two handles are declared as a pair; refuse rather than emit half of one.
 #[test]
 fn glm_linear_fp8_prefill_refuses_a_weight_with_no_scale_grid() {
+    let _guard = crate::test_env::env_guard();
     let mut b = Builder::new(256);
     let w = b.tensor("w.weight_fp8", 64);
     let x = b.tensor("act.x", 64);
@@ -1759,6 +1819,7 @@ fn glm53_ref_cfg() -> GlmCfg {
 /// references must be within the final table's bounds.
 #[test]
 fn glm53_program_assembly_keeps_every_tensor_handle_in_the_final_table() {
+    let _guard = crate::test_env::env_guard();
     let c = glm53_ref_cfg();
     let layers: Vec<u32> = (0..c.layers).collect();
     let enc = MoeEnc::from_flags(false, false);
@@ -1875,7 +1936,7 @@ fn check_glm_flat_segments(resident: bool) {
     let _guard = crate::test_env::env_guard();
     let _target = crate::EmitAmdGuard::set(true);
     let _env = crate::test_env::EnvScope::set(&[
-        ("PLOW_MLA_PREFILL", "full:128"),
+        ("PLOW_MLA_PREFILL", if resident { "full:1,2,4,8,16,20,32,64,128,256,512,1024,2048,4096,8192" } else { "full:128" }),
         ("PLOW_GLM_PLACE_PF", "0"),
         ("PLOW_GLM_MOE_AITER", "0"),
         ("PLOW_GLM_MOE_FLAT_DECODE", if resident { "0" } else { "1" }),
@@ -1903,7 +1964,10 @@ fn check_glm_flat_segments(resident: bool) {
     std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
     let verify: crate::VerifyHook = Box::new(move |model| {
         let mut checked = 0;
-        for (prog, &rows) in model.progs.iter().zip(&model.prog_t) {
+        let prefill_count = packet::devbuild::decode_rung_lo(&model.prog_t);
+        assert_eq!(prefill_count, if resident { 15 } else { 1 });
+        for (p, (prog, &rows)) in model.progs.iter().zip(&model.prog_t).enumerate() {
+            let decode = p >= prefill_count;
             let native = prog
                 .insts
                 .iter()
@@ -1915,12 +1979,12 @@ fn check_glm_flat_segments(resident: bool) {
                 continue;
             }
             checked += 1;
-            if rows <= 20 {
+            if decode {
                 assert_eq!(prog.l2_domains, 8);
             }
             assert_eq!(native.len(), 1);
             let (ix, inst) = native[0];
-            if rows > 20 {
+            if !decode {
                 assert_eq!(inst.i, [rows, 6144, 256, 256, 8, 64, 0, 1]);
             } else {
                 assert_eq!(inst.i, [rows, 6144, 256, 256, 8, 0, 1, u32::from(resident)]);
@@ -1961,18 +2025,18 @@ fn check_glm_flat_segments(resident: bool) {
                 .map(|e| usize::from(e.seg) + 1)
                 .max()
                 .unwrap();
-            if rows <= 20 {
+            if decode {
                 assert_eq!(prog.gq_seg_ofs.len(), segments * 8 + 1);
             }
         }
-        assert_eq!(checked, if resident { 7 } else { 3 });
+        assert_eq!(checked, if resident { 21 } else { 3 });
         Ok(crate::LeanReport::skipped(
             "flat decode segment regression test",
         ))
     });
     glm_emit_full(
         &dir,
-        512,
+        81920,
         dir.join("model.pkt").to_str().unwrap(),
         304,
         8,

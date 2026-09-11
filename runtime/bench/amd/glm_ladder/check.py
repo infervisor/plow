@@ -13,6 +13,9 @@ import plow_isa
 DECODE = 'interp_decode_fp8kv_gq.elf'
 PREFILL = 'interp_prefill_fp8kv_mla_moe_gq.elf'
 FLASH = 'interp_flash_fp8kv_gq.elf'
+SMALL = 'interp_mla_small_fp8kv_gq.elf'
+SPLIT = 'interp_mla_split_fp8kv_gq.elf'
+APPEND_RUNGS = [1, 2, 4, 8, 16, 20, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
 NATIVE = {
     'GemmLtPf': ['glm_lt_gfx942.elf'],
     'MoeAiterFp8Pf': ['moe_aiter_adapter_gfx942.elf',
@@ -23,6 +26,7 @@ NATIVE = {
 SOURCES = ['scripts/build_gfx942.sh', 'runtime/CMakeLists.txt',
            'crates/devgen/src/mla.rs', 'crates/plowrt/src/exec/amd.rs',
            'crates/plowrt/src/exec/amd_tp.rs', 'crates/plowrt/src/exec/amd_gemm_lt.rs',
+           'crates/plowrt/src/exec/amd/segment.rs', 'crates/plowrt/src/exec/amd/mla_prefill.rs',
            'crates/plowrt/src/exec/amd_sparse_mla.rs', 'runtime/amd/op_gemm.h',
            'runtime/amd/op_attention.h', 'runtime/amd/glm_lt_gfx942.json',
            'runtime/amd/glm_lt_decode_gfx942.json']
@@ -39,6 +43,7 @@ def main():
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--disable-tiers', action='store_true')
     parser.add_argument('--require-specialized', action='store_true')
+    parser.add_argument('--require-full-ladder', action='store_true')
     args = parser.parse_args()
     raw = args.packet_json.read_text()
     packet = json.loads(raw[raw.index('{'):])
@@ -92,9 +97,29 @@ def main():
             if args.require_specialized:
                 assert mm == expected, f'decode rung {rung} uses MM{mm}, expected MM{expected}'
         else:
-            if rung >= 2048:
+            split_caps = []
+            for ix, inst in enumerate(program['insts']):
+                if inst['op_name'] != 'FlashMlaPrefillFp8':
+                    continue
+                cap = int(inst['raw']['fj'][2], 16)
+                if cap:
+                    assert rung < 2048 and cap in (2, 4, 8, 16, 32)
+                    merge = program['insts'][ix + 1]
+                    assert merge['op_name'] == 'MlaMergeFold'
+                    assert merge['raw']['i'][4] == cap
+                    split_caps.append(cap)
+            if split_caps:
+                require(SPLIT, 'plow_mla_prefill_fp8_split_1')
+                record['attention_interpreter'] = SPLIT
+                record['attention_partial_capacity'] = sorted(set(split_caps))
+                record['attention_selection'] = 'Live query rows and KV tiles, bounded by compiled partial storage; paired flash/merge rebasing.'
+            elif rung >= 2048:
                 require(FLASH, 'plow_mla_pf_v2_fp8_arm_1')
                 record['attention_interpreter'] = FLASH
+            elif (args.objects / SMALL).is_file():
+                require(SMALL, 'plow_mla_prefill_small_1')
+                record['attention_interpreter'] = SMALL
+                record['attention_selection'] = 'Dedicated object only for pure dense segments; mixed segments use the primary interpreter.'
             else:
                 require(primary, 'plow_cap_d_flash_mla_1')
                 record['attention_interpreter'] = primary
@@ -117,7 +142,8 @@ def main():
                 if i['op_name'].startswith(('Gemv', 'Gemm'))).items()):
             record['projections'].append(dict(op=op, shape=shape, instructions=count))
         records.append(record)
-    assert [r['rung'] for r in records if r['phase'] == 'prefill'] == [128, 512, 2048, 8192]
+    expected_prefill = APPEND_RUNGS if args.require_full_ladder else [128, 512, 2048, 8192]
+    assert [r['rung'] for r in records if r['phase'] == 'prefill'] == expected_prefill
     assert [r['rung'] for r in records if r['phase'] == 'decode'] == [1, 2, 4, 8, 16, 20]
     report = dict(schema='plow.glm-ladder-coverage.v1',
                   scope='Static packet, object-marker and route audit for GLM TP8 gfx942 FP8-KV. Loader pairing and GPU execution are separate checks. Presence does not prove performance optimality.',

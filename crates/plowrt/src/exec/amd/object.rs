@@ -934,6 +934,9 @@ pub(super) fn packet_prefill_arm_requirements(progs: &[DevProg]) -> Vec<String> 
     }) {
         requires.push("PLOW_MLA_PF_NS=1".to_owned());
     }
+    if insts().any(|inst| inst.op == DevOp::FlashMlaPrefillFp8 as u16 && inst.fj[2] != 0) {
+        requires.push("PLOW_MLA_PREFILL_FP8_SPLIT=1".to_owned());
+    }
     if insts()
         .any(|inst| inst.op == DevOp::QuantFp8 as u16 && inst.t[3] != packet::dev::TENSOR_NONE16)
     {
@@ -1403,6 +1406,10 @@ pub(super) fn check_prefill_object(syms: &[&str], path: &Path, requires: &[Strin
         // decode-bucket build does not export at all.
         let (flag, val) = req.split_once('=').unwrap_or((req.as_str(), "1"));
         if val == "0" {
+            continue;
+        }
+        if flag == "PLOW_MLA_PREFILL_FP8_SPLIT" {
+            // Validated against the dedicated split object by segment::load_small_mla.
             continue;
         }
         let Some((_, markers)) = PREFILL_ARM_MARKERS.iter().find(|(f, _)| *f == flag) else {
