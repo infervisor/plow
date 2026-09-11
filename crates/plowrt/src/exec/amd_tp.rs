@@ -1513,18 +1513,25 @@ impl AmdTpGroup {
     /// prefill already schedules at.
     pub fn prefill_chunk(&mut self, prompt: &[u32], step: ChunkStep) -> Result<()> {
         use crate::obs::ttft;
+        let tick_log = crate::obs::tick::on();
+        let (mut prepare_ns, mut rearm_ns) = (0u64, 0u64);
         for e in &mut self.ranks {
             let t = std::time::Instant::now();
             e.prefill_prepare(prompt, step)?;
-            ttft::PF_PREPARE.add(t.elapsed().as_nanos() as u64);
+            let ns = t.elapsed().as_nanos() as u64;
+            prepare_ns += ns;
+            ttft::PF_PREPARE.add(ns);
             let t = std::time::Instant::now();
             e.rearm_prog(step.prog)?;
-            ttft::PF_REARM.add(t.elapsed().as_nanos() as u64);
+            let ns = t.elapsed().as_nanos() as u64;
+            rearm_ns += ns;
+            ttft::PF_REARM.add(ns);
         }
         // xctr once for the whole chunk, before any rank is dispatched.
         let t = std::time::Instant::now();
         self.group.zero_xctr()?;
-        ttft::PF_XCTR.add(t.elapsed().as_nanos() as u64);
+        let xctr_ns = t.elapsed().as_nanos() as u64;
+        ttft::PF_XCTR.add(xctr_ns);
 
         let dispatch = self.ranks[0].prog_dispatch(step.prog);
         let launches = dispatch.launches();
@@ -1563,11 +1570,16 @@ impl AmdTpGroup {
                     rank.commit_graph_phase_replay()?;
                 }
             }
-            ttft::PF_ENQUEUE.add(t.elapsed().as_nanos() as u64);
+            let enqueue_ns = t.elapsed().as_nanos() as u64;
+            ttft::PF_ENQUEUE.add(enqueue_ns);
 
             let t = std::time::Instant::now();
+            let mut rank_drain_ns = Vec::with_capacity(if tick_log { self.ranks.len() } else { 0 });
             for e in &self.ranks {
                 e.drain()?;
+                if tick_log {
+                    rank_drain_ns.push(t.elapsed().as_nanos() as u64);
+                }
             }
             let ns = t.elapsed().as_nanos() as u64;
             ttft::PF_DRAIN.add(ns);
@@ -1589,11 +1601,30 @@ impl AmdTpGroup {
                     step.clen as f64 / (ns as f64 / 1e9),
                 );
             }
+            let t = std::time::Instant::now();
             if self.index_tp_status {
                 self.group.audit_xstatus_direct()?;
             }
             if self.audit {
                 self.group.audit_xctr(&self.gate_expect[step.prog])?;
+            }
+            if tick_log {
+                let ms = |ns: u64| ns as f64 / 1e6;
+                let ranks: Vec<String> =
+                    rank_drain_ns.iter().map(|&d| format!("{:.1}", ms(d))).collect();
+                eprintln!(
+                    "PFSEG bucket={} c0={} clen={} launches={launches} prepare={:.3} rearm={:.3} xctr={:.3} enqueue={:.3} drain={:.3} audit={:.3} rank_drain_cum=[{}]",
+                    self.ranks[0].prog_t(step.prog),
+                    step.c0,
+                    step.clen,
+                    ms(prepare_ns),
+                    ms(rearm_ns),
+                    ms(xctr_ns),
+                    ms(enqueue_ns),
+                    ms(ns),
+                    ms(t.elapsed().as_nanos() as u64),
+                    ranks.join(","),
+                );
             }
             return Ok(());
         }

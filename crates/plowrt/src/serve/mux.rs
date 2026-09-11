@@ -2153,6 +2153,7 @@ fn run_one_tick(
             // `--pf-no-interleave` / `PLOW_PF_NO_INTERLEAVE=1` restores the old
             // prefill-only tick.
             let mut did_prefill = false;
+            let _tick = crate::obs::tick::begin();
             let rt = crate::config::RuntimeConfig::get();
             let no_interleave = rt.pf_no_interleave;
             let decode_rows = slots[..b.min(slots.len())]
@@ -2762,6 +2763,10 @@ fn run_one_tick(
                             e.advance_packed_prefill(&members)
                         };
                         crate::obs::ttft::PREFILL.add(t_pf.elapsed().as_nanos() as u64);
+                        crate::obs::tick::prefill(
+                            t_pf.elapsed().as_nanos() as u64,
+                            packed.iter().map(|span| span.n_rows).sum(),
+                        );
                         if result.is_ok() {
                             match amd_packed_frontier_updates(
                                 packed.iter().map(|span| span.slot as usize),
@@ -2848,6 +2853,10 @@ fn run_one_tick(
                     // planned chunk that fits.
                     let pf = e.prefill_chunked_at_most(i, &slot_ref.prompt_ids, tick_max);
                     let frontier = e.prefill_frontier(i).unwrap_or(slot_ref.prompt_ids.len());
+                    crate::obs::tick::prefill(
+                        t_pf.elapsed().as_nanos() as u64,
+                        frontier.saturating_sub(slot_ref.pf_pos) as u32,
+                    );
                     if let Some(s) = slots[i].as_mut() { s.cached_tokens = e.cached_rows(i); }
                     crate::obs::ttft::PREFILL.add(t_pf.elapsed().as_nanos() as u64);
                     match pf {
@@ -2960,6 +2969,7 @@ fn run_one_tick(
             );
             let multi = e.multistep_quantum(&feeds, requested);
             let mut deferred = std::mem::take(&mut obs.host.slot_tokens);
+            let t_dec = crate::obs::tick::on().then(Instant::now);
             let step_result = if let Some(quantum) = multi {
                 e.multi_step(&feeds, quantum, &mut deferred)
                     .and_then(|quantum| {
@@ -3011,6 +3021,9 @@ fn run_one_tick(
                 })
             };
             obs.host.slot_tokens = deferred;
+            if let Some(t) = t_dec {
+                crate::obs::tick::decode(t.elapsed().as_nanos() as u64, feeds.len() as u32);
+            }
             match step_result {
                 Ok(quantum) => {
                     decode_progress = completed_decode(&feeds, quantum);

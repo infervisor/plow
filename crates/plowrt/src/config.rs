@@ -278,6 +278,11 @@ pub struct RuntimeConfig {
     #[arg(long = "pfx-log", env = "PLOW_PFX_LOG", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pfx_log: bool,
 
+    /// Per-tick AMD serve breakdown: prefill launches, decode dispatch, host remainder
+    /// (`PLOW_TICK_LOG=1`).
+    #[arg(long = "tick-log", env = "PLOW_TICK_LOG", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub tick_log: bool,
+
     /// Decode-step host-phase breakdown (`PLOW_DSTEP_LOG=1`).
     #[arg(long = "dstep-log", env = "PLOW_DSTEP_LOG", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub dstep_log: bool,

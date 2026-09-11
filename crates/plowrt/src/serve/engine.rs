@@ -1582,7 +1582,10 @@ mod amd_serve {
             if !chunked {
                 return self.prefill(slot, prompt).map(Some);
             }
+            let tick_log = crate::obs::tick::on();
+            let t_all = std::time::Instant::now();
             self.prepare_prefill_cursor(slot, prompt, tick_max_bucket)?;
+            let cursor_ns = t_all.elapsed().as_nanos() as u64;
             let g = &mut self.ranks;
             let max_bucket = self.prefill_chunk_rows.min(tick_max_bucket);
             let pending = {
@@ -1615,18 +1618,27 @@ mod amd_serve {
             );
             // Rebase for this chunk and hand the base back before returning: the decode that runs
             // later in this same tick refuses a non-zero base.
+            let t = std::time::Instant::now();
             g.kv_rebase_all(slot)?;
+            let rebase_ns = t.elapsed().as_nanos() as u64;
+            let t = std::time::Instant::now();
             let r = g.prefill_chunk(prompt, step);
+            let chunk_ns = t.elapsed().as_nanos() as u64;
+            let t = std::time::Instant::now();
             let restore = g.kv_rebase_all(0);
             r?;
             restore?;
+            let restore_ns = t.elapsed().as_nanos() as u64;
             // Snapshot at the arm point, which is a CHUNK BOUNDARY of the head plan — so the
             // recurrence is exactly at `arm` when this fires.
+            let t = std::time::Instant::now();
             if cur.snap_after == Some(cur.next) {
                 g.snapshot_carried(slot, step.c0 + step.clen)?;
             }
+            let snap_ns = t.elapsed().as_nanos() as u64;
             cur.next += 1;
             cur.frontier = step.c0 + step.clen;
+            let t_publish = std::time::Instant::now();
             // Publishing is a cache-side favour to LATER requests; this prompt's KV is already
             // correct. A snapshot OOM after eviction, a radix hash collision or a rejected
             // boundary must not fail the request — the CUDA route warns and continues the same
@@ -1637,7 +1649,25 @@ mod amd_serve {
                 }
                 tracing::warn!(slot, frontier = cur.frontier, error = %err, "amd: shared prefix publish skipped");
             }
-            if cur.next < cur.steps.len() {
+            let publish_ns = t_publish.elapsed().as_nanos() as u64;
+            let last = cur.next >= cur.steps.len();
+            if tick_log {
+                let ms = |ns: u64| ns as f64 / 1e6;
+                eprintln!(
+                    "PFCHUNK slot={slot} c0={} clen={} bucket={} last={last} total={:.3} cursor={:.3} rebase={:.3} chunk={:.3} restore={:.3} snap={:.3} publish={:.3}",
+                    step.c0,
+                    step.clen,
+                    g.rank0().prog_t(step.prog),
+                    ms(t_all.elapsed().as_nanos() as u64),
+                    ms(cursor_ns),
+                    ms(rebase_ns),
+                    ms(chunk_ns),
+                    ms(restore_ns),
+                    ms(snap_ns),
+                    ms(publish_ns),
+                );
+            }
+            if !last {
                 return Ok(None);
             }
             let tok = g.read_prefill_token()?;
