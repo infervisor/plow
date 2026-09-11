@@ -169,9 +169,43 @@ __device__ __forceinline__ void pgm90_stage_fp8(uint8_t* dst, const uint8_t* __r
 }
 
 #if defined(PLOW_NV_W8A16_WGMMA) && PLOW_NV_W8A16_WGMMA
+#ifndef PLOW_NV_W8A16_PREFETCH
+#define PLOW_NV_W8A16_PREFETCH 0
+#endif
 __device__ __forceinline__ void pgm90_stage_bf16(__nv_bfloat16* dst,
                                                  const uint8_t* __restrict__ src, int tid,
                                                  int rows, int row0, int kbase, int R, int K) {
+#if PLOW_NV_W8A16_PREFETCH
+    if (rows == 128) {
+        // Issue independent global loads before waiting on conversion operands.
+        uint2 packed[4];
+#pragma unroll
+        for (int s = 0; s < 4; ++s) {
+            const int L = tid + s * PLOW_NV_THREADS;
+            const int gr = row0 + L / PGM90_CH, gk = kbase + (L % PGM90_CH) * 8;
+            packed[s] = {0, 0};
+            if (gr < R && gk + 8 <= K)
+                packed[s] = *(const uint2*)(src + (size_t)gr * K + gk);
+        }
+#pragma unroll
+        for (int s = 0; s < 4; ++s) {
+            const int L = tid + s * PLOW_NV_THREADS;
+            const uint16_t* w = (const uint16_t*)&packed[s];
+            alignas(16) __nv_bfloat16 values[8];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                __half2_raw h = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)w[j], __NV_E4M3);
+                float2 v = __half22float2(*reinterpret_cast<__half2*>(&h));
+                values[2 * j] = __float2bfloat16(v.x);
+                values[2 * j + 1] = __float2bfloat16(v.y);
+            }
+            *(uint4*)(dst + sm90_swz_off<PGM90_BK, 8>(L / PGM90_CH, L % PGM90_CH))
+                = *(const uint4*)values;
+        }
+        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+        return;
+    }
+#endif
     for (int L = tid; L < rows * PGM90_CH; L += (int)PLOW_NV_THREADS) {
         const int row = L / PGM90_CH, c = L % PGM90_CH;
         const int gr = row0 + row, gk = kbase + c * 8;

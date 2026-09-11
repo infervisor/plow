@@ -529,3 +529,41 @@ Its native diagnostic has maximum difference0.33203125 across schedules, and
 five of34 paired serving texts differ between objects. Neither candidate is
 promoted. No independent model-quality, new sanitizer, fresh vLLM or C128
 qualification was run. [Recipes, hashes, diagnostics and raw results](gemma4-12b-h100-data/w8a16-packed-consistency-summary.json).
+
+## W8A16 weight-staging prefetch
+
+`PLOW_NV_W8A16_PREFETCH=1` issues four independent weight loads per thread
+before converting them to BF16 and storing them in shared memory. It retains
+the existing WGMMA arithmetic, tiles, work ownership and synchronization.
+The default remains0; this is limited to the SM90 W8A16 weight-staging path.
+
+The new standalone probe covers all eight emitted FP8 GEMM N/K shapes at
+prefill128/512/1024/2048, plus four N/K-tail cases. All36 cases pass96 sampled
+FP64 checks per case and complete output equality against the control:
+313,597,184 output bytes compared. Integer operands and power-of-two scales
+make the oracle exact through FP32 accumulation. All36 candidate cases pass
+memcheck with zero errors. Body speedups range1.066–1.282×; weighting by emitted
+GEMM frequency gives1.089–1.113× per rung. These are isolated warm-body timings.
+
+Matched ordinary and packed interpreter builds retain255 registers and16-byte
+spill-store/load totals in both variants. A sequential serving screen, one
+repeat per cell after verification with no additional warmups, reports:
+
+| Input / concurrency | Control tok/s | Prefetch tok/s |
+|---|---:|---:|
+| 1K / C1 | 86.212 | 92.955 |
+| 1K / C16 | 214.866 | 257.449 |
+| 16K / C1 | 23.129 | 33.205 |
+| 16K / C16 | 27.499 | 40.179 |
+
+16K/C1 TTFT improves4186.84→2511.51ms. Both pass serving consistency,
+cancellation and context checks in this screen; all68 timed requests return
+128 tokens/cache0. However, only33/34 paired texts match. A separate comparison
+of66 fixed-schedule full-logit frames is identical between interpreter builds.
+The serving difference remains an unresolved scheduling issue; this is not
+independent model-quality qualification or proof of scheduling invariance.
+
+The optimization is retained opt-in. W8A16 remains slower than earlier W8A8
+prefill screens overall, and the vLLM objective remains unmet. No new loaded
+interpreter sanitizer, racecheck, fresh vLLM or C128 qualification was run.
+[Probe builds, exact outputs, object hashes and serving evidence](gemma4-12b-h100-data/w8a16-staging-prefetch-summary.json).
