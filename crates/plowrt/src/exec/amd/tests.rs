@@ -2234,7 +2234,7 @@ fn nope_mla_prefill_routes_to_four_waves_and_is_gated_at_load() {
         let mut prog = segmented_prog(&[op], &[0]);
         prog.insts[0].i[3] = 0x8000_0040;
         prog.insts[0].t[7] = packet::dev::TENSOR_NONE16;
-        assert!(!packed_mla_compatible(&prog));
+        assert!(!packed_mla_compatible(&prog, false));
         assert_eq!(
             derive_segments_for(&prog, true).unwrap(),
             [4],
@@ -2243,10 +2243,10 @@ fn nope_mla_prefill_routes_to_four_waves_and_is_gated_at_load() {
         );
         prog.insts[0].i[3] = 64;
         assert_eq!(derive_segments_for(&prog, true).unwrap(), [4]);
-        assert!(packed_mla_compatible(&prog));
+        assert!(packed_mla_compatible(&prog, false));
         prog.insts[0].t[7] = 7;
         assert_eq!(
-            packed_mla_compatible(&prog),
+            packed_mla_compatible(&prog, false),
             op == DevOp::FlashMlaPrefillFp8
         );
     }
@@ -5084,11 +5084,41 @@ fn packed_prefill_predicate_admits_native_moe_and_gemm_lt_and_refuses_sparse_sel
         DevOp::FlashMlaPrefillFp8,
         DevOp::MoeAiterFp8Pf,
     ]);
-    assert!(packed_mla_compatible(&native));
-    assert!(token_batch_body_compatible(&native));
-    for refused in [DevOp::IndexTpPf, DevOp::FlashGatherPrefill] {
+    assert!(packed_mla_compatible(&native, false));
+    assert!(token_batch_body_compatible(&native, false));
+    // The span-aware sparse chain (TP indexer + sparse FP8 flash) is admitted only when the
+    // loaded objects resolve rows per span; the interpreter's class-C selectors never are.
+    let mut sparse_flash = DevInst64 {
+        op: DevOp::FlashMlaPrefillFp8 as u16,
+        ..Default::default()
+    };
+    sparse_flash.fj[1] = 7;
+    let mut chain = prog(&[DevOp::RmsNorm, DevOp::IndexTpPf, DevOp::MoeAiterFp8Pf]);
+    chain.insts.push(sparse_flash);
+    assert!(!packed_mla_compatible(&chain, false));
+    assert!(!token_batch_body_compatible(&chain, false));
+    assert!(packed_mla_compatible(&chain, true));
+    assert!(token_batch_body_compatible(&chain, true));
+    for refused in [
+        DevOp::FlashGatherPrefill,
+        DevOp::IndexScorePf,
+        DevOp::IndexSelectPf,
+        DevOp::IndexUnionPf,
+        DevOp::DsaPoolExpand,
+    ] {
         let sparse = prog(&[DevOp::RmsNorm, refused]);
-        assert!(!packed_mla_compatible(&sparse), "{refused:?}");
-        assert!(!token_batch_body_compatible(&sparse), "{refused:?}");
+        assert!(!packed_mla_compatible(&sparse, true), "{refused:?}");
+        assert!(!token_batch_body_compatible(&sparse, true), "{refused:?}");
     }
+    let spans = [
+        PrefillSpan { row0: 20, n_rows: 100, slot: 3, kv_row0: 4096, kv_len: 4196, ..Default::default() },
+        PrefillSpan { row0: 120, n_rows: 8, slot: 0, kv_row0: 2047, kv_len: 2055, ..Default::default() },
+    ];
+    let table = kv_span_table(&spans, 81920).unwrap();
+    assert_eq!(
+        table[0],
+        KvSpan { row0: 20, n_rows: 100, kv_row0: 4096, kv_len: 4196, kv_base: 3 * 81920, _pad: [0; 3] }
+    );
+    assert_eq!((table[1].kv_base, table[1].kv_len), (0, 2055));
+    assert!(kv_span_table(&[PrefillSpan { slot: u32::MAX, ..Default::default() }], 81920).is_err());
 }

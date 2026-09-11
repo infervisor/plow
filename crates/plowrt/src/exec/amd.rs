@@ -3277,17 +3277,45 @@ fn check_packed_dense_program(insts: &[DevInst64]) -> Result<()> {
     Ok(())
 }
 
+/// The class-C prefill selectors with no per-span form: they run on the primary interpreter,
+/// which reads every row's position from `kv_len[0]`, so a packed program may not carry them.
+fn packed_class_c_selector(d: &DevInst64) -> bool {
+    matches!(
+        DevOp::from_u16(d.op),
+        Some(
+            DevOp::IndexScorePf
+                | DevOp::IndexSelectPf
+                | DevOp::IndexUnionPf
+                | DevOp::DsaPoolExpand
+                | DevOp::DsaPoolCompress
+                | DevOp::FlashGatherPrefill
+        )
+    )
+}
+
+/// The span-aware sparse PREFILL chain of a DSA rung: the native TP indexer (`IndexTpPf`, a
+/// `PlowKvSpan` table under packing) and the sparse FP8 flash (the AITER route, one chain per
+/// span). Both are host-launched natives; neither is an interpreter arm.
+fn sparse_prefill_chain(prog: &DevProg) -> bool {
+    prog.insts.iter().any(|d| {
+        d.op == DevOp::IndexTpPf as u16
+            || (d.op == DevOp::FlashMlaPrefillFp8 as u16 && sparse_fp8(d))
+    })
+}
+
 /// A packed-prefill program runs its class-A native segments (AITER MoE, hipBLASLt
 /// projections, the native fold) over the dense live rows exactly as an ordinary program does —
 /// the span table changes only how the MLA family segments address KV. What the packed flash
-/// arm cannot serve is gathered/sparse or NoPE flash, and the sparse selectors (`IndexTpPf`,
-/// class C: every row's position from one scalar), which is why the emitter gives sparse
-/// buckets no packed sibling.
-fn packed_mla_compatible(prog: &DevProg) -> bool {
+/// arm cannot serve is gathered/sparse or NoPE flash, and the interpreter's class-C selectors.
+/// `sparse_spans`: the sparse chain (`IndexTpPf` + sparse FP8 flash) resolves rows through the
+/// staged spans — the ABI-2 TP indexer adapter and the AITER sparse route are loaded and route
+/// every such instruction of this program; otherwise those instructions refuse the program.
+fn packed_mla_compatible(prog: &DevProg, sparse_spans: bool) -> bool {
     !prog.insts.iter().any(|d| {
-        sparse_fp8(d)
-            || d.op == DevOp::IndexTpPf as u16
-            || d.op == DevOp::FlashGatherPrefill as u16
+        packed_class_c_selector(d)
+            || (!sparse_spans
+                && (d.op == DevOp::IndexTpPf as u16
+                    || (d.op == DevOp::FlashMlaPrefillFp8 as u16 && sparse_fp8(d))))
             || ((d.op == DevOp::FlashMlaPrefill as u16 || d.op == DevOp::FlashMlaPrefillFp8 as u16)
                 && (d.i[3] & 0x8000_0000 != 0
                     || (d.t[7] != packet::dev::TENSOR_NONE16
@@ -3296,19 +3324,67 @@ fn packed_mla_compatible(prog: &DevProg) -> bool {
 }
 
 /// A token-batch body has the same admissible operator set as a packed program: the slot-band
-/// descriptor changes only how the MLA family segments address KV.
-fn token_batch_body_compatible(prog: &DevProg) -> bool {
-    !prog.insts.iter().any(|d| {
-        // The band's SPARSE DECODE flash is the decode program's own packet and runs on the
-        // decode object (family 27); only sparse PREFILL flash has no packed arm.
-        (d.op == DevOp::FlashMlaPrefillFp8 as u16 && sparse_fp8(d))
-            || d.op == DevOp::FlashGatherPrefill as u16
-            || d.op == DevOp::IndexTpPf as u16
-            || ((d.op == DevOp::FlashMlaPrefill as u16 || d.op == DevOp::FlashMlaPrefillFp8 as u16)
-                && (d.i[3] & 0x8000_0000 != 0
-                    || (d.t[7] != packet::dev::TENSOR_NONE16
-                        && d.op != DevOp::FlashMlaPrefillFp8 as u16)))
-    })
+/// descriptor changes only how the MLA family segments address KV. The band's SPARSE DECODE
+/// flash is the decode program's own packet and runs on the decode object (family 27).
+fn token_batch_body_compatible(prog: &DevProg, sparse_spans: bool) -> bool {
+    packed_mla_compatible(prog, sparse_spans)
+}
+
+/// Why a packed sibling / body carrying the sparse chain cannot take the packed route, by name;
+/// `None` when every `IndexTpPf` has a TP indexer route on a span-aware adapter and every
+/// sparse flash has an AITER sparse-MLA route.
+fn packed_sparse_refusal(
+    prog: &DevProg,
+    routes: &[PrefillSegmentRoute],
+    index_tp_span_aware: Option<bool>,
+    sparse_mla: bool,
+) -> Option<String> {
+    let seg_of = |ix: usize| {
+        prog.stream
+            .iter()
+            .chain(&prog.gq_stream)
+            .find(|e| e.inst as usize == ix)
+            .map(|e| e.seg as usize)
+    };
+    for (ix, d) in prog.insts.iter().enumerate() {
+        if d.op == DevOp::IndexTpPf as u16 {
+            match index_tp_span_aware {
+                Some(true) => {}
+                Some(false) => {
+                    return Some(
+                        "packed sparse prefill: dsa_tp_adapter_gfx942.elf lacks plow_dsa_tp_abi_2 \
+                         (the span-aware TP indexer); rebuild it with scripts/build_dsa_tp.sh"
+                            .into(),
+                    )
+                }
+                None => return Some("packed sparse prefill: the TP indexer is not loaded".into()),
+            }
+            if !seg_of(ix).is_some_and(|seg| {
+                matches!(routes.get(seg), Some(PrefillSegmentRoute::IndexTp(_)))
+            }) {
+                return Some(format!(
+                    "packed sparse prefill: IndexTpPf instruction {ix} has no TP indexer route"
+                ));
+            }
+        }
+        if d.op == DevOp::FlashMlaPrefillFp8 as u16 && sparse_fp8(d) {
+            if !sparse_mla {
+                return Some(
+                    "packed sparse prefill: the sparse FP8 flash needs the AITER route \
+                     (PLOW_MLA_PF_AITER=1); the packed flash object has no gathered arm"
+                        .into(),
+                );
+            }
+            if !seg_of(ix).is_some_and(|seg| {
+                matches!(routes.get(seg), Some(PrefillSegmentRoute::SparseMla(_)))
+            }) {
+                return Some(format!(
+                    "packed sparse prefill: sparse flash instruction {ix} has no AITER sparse-MLA route"
+                ));
+            }
+        }
+    }
+    None
 }
 
 fn packed_kda_compatible(prog: &DevProg) -> bool {
@@ -5185,6 +5261,46 @@ fn token_batch_band(insts: &[DevInst64]) -> Option<u32> {
         .filter(|&band| band > 0)
 }
 
+/// `PlowKvSpan` (`runtime/common/dev_isa.h`): one request's rows and KV addressing for the
+/// host-launched sparse-prefill kernels. `kv_base` is an explicit cache-row offset, never
+/// recomputed from the slot on the device.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub(crate) struct KvSpan {
+    pub row0: u32,
+    pub n_rows: u32,
+    pub kv_row0: u32,
+    pub kv_len: u32,
+    pub kv_base: u32,
+    pub _pad: [u32; 3],
+}
+
+const _: () = assert!(std::mem::size_of::<KvSpan>() == 32);
+
+/// The `PlowKvSpan` table of a staged packed binding: cache row 0 of slot `s` is `s * kv_rows`
+/// rows into the (slot-0-based) cache tensors, `kv_rows` being the packet's context capacity.
+pub(crate) fn kv_span_table(spans: &[PrefillSpan], kv_rows: u32) -> Result<Vec<KvSpan>> {
+    spans
+        .iter()
+        .map(|s| {
+            let kv_base = s.slot.checked_mul(kv_rows).ok_or_else(|| {
+                RuntimeError::Device(format!(
+                    "packed span slot {} * ctx {kv_rows} overflows the KV span table",
+                    s.slot
+                ))
+            })?;
+            Ok(KvSpan {
+                row0: s.row0,
+                n_rows: s.n_rows,
+                kv_row0: s.kv_row0,
+                kv_len: s.kv_len,
+                kv_base,
+                _pad: [0; 3],
+            })
+        })
+        .collect()
+}
+
 fn check_packed_prefill_dispatch(binding: Option<PackedPrefillBinding>, prog: usize) -> Result<()> {
     if let Some(bound) = binding.filter(|b| b.prog != prog) {
         return Err(RuntimeError::Device(format!(
@@ -5347,6 +5463,12 @@ struct AmdProg {
     packed_needs_mla: bool,
     packed_mla_compatible: bool,
     packed_mla_segmented: bool,
+    /// Carries the sparse (DSA) prefill chain: a span packed onto it needs
+    /// `kv_row0 >= amd_sparse_mla::SPAN_MIN_PRIOR` (the fixed-width CSR).
+    sparse_prefill: bool,
+    /// A packed sibling / body with the sparse chain that the loaded objects cannot run per
+    /// span, by name (`packed_sparse_refusal`). `check_packed_prefill_program` refuses it.
+    packed_sparse_error: Option<String>,
     packed_needs_kda: bool,
     packed_kda_compatible: bool,
     packed_kda_segmented: bool,
@@ -5580,6 +5702,11 @@ pub struct AmdEngine {
     d_prefill_spans: DeviceMem,
     d_prefill_parked: DeviceMem,
     h_prefill_meta: HsaPinned,
+    /// The staged spans' `PlowKvSpan` table for the host-launched sparse chain (TP indexer
+    /// kernargs point at it; the AITER sparse route walks `packed_spans` on the host).
+    d_kv_spans: DeviceMem,
+    h_kv_spans: HsaPinned,
+    packed_spans: Vec<PrefillSpan>,
     /// The shared `PlowTokenBatch` descriptor + arrays for slot-band body steps; allocated only
     /// when the blob carries body programs.
     d_token_batch: Option<DeviceMem>,
@@ -8981,8 +9108,9 @@ impl AmdEngine {
                     }
                 }
                 if use_index_tp {
+                    let span_aware = index_tp.as_ref().is_some_and(|k| k.span_aware());
                     for (seg, route) in
-                        amd_index_tp::routes(p, &blob.tensors, seg_class.len(), tp.unwrap())?
+                        amd_index_tp::routes(p, &blob.tensors, seg_class.len(), tp.unwrap(), span_aware)?
                             .into_iter()
                             .enumerate()
                     {
@@ -9092,6 +9220,18 @@ impl AmdEngine {
             }
             let packed_seg_family = derive_packed_segment_families(p)?;
             let raw_mla_v2_segment = derive_raw_mla_v2_segments(p)?;
+            let packed_sparse_error = if (p.packed_prefill_only || p.token_batch_body)
+                && sparse_prefill_chain(p)
+            {
+                packed_sparse_refusal(
+                    p,
+                    &prefill_routes,
+                    index_tp.as_ref().map(|k| k.span_aware()),
+                    use_sparse_mla,
+                )
+            } else {
+                None
+            };
             let packed_mla_segmented = packed_family_segments_cover(p, &packed_seg_family, &[5, 6]);
             let packed_kda_segmented = packed_family_segments_cover(p, &packed_seg_family, &[7]);
             let up = |bytes: &[u8]| -> Result<DeviceMem> {
@@ -9211,11 +9351,13 @@ impl AmdEngine {
                         || d.op == DevOp::FlashMlaPrefillFp8 as u16
                 }),
                 packed_mla_compatible: if p.token_batch_body {
-                    token_batch_body_compatible(p)
+                    token_batch_body_compatible(p, packed_sparse_error.is_none())
                 } else {
-                    packed_mla_compatible(p)
+                    packed_mla_compatible(p, packed_sparse_error.is_none())
                 },
                 packed_mla_segmented,
+                sparse_prefill: sparse_prefill_chain(p),
+                packed_sparse_error,
                 packed_needs_kda: p.insts.iter().any(|d| {
                     d.op == DevOp::KdaConv3 as u16
                         || d.op == DevOp::KdaStateStep as u16
@@ -9550,6 +9692,9 @@ impl AmdEngine {
         let d_prefill_spans = EngineDevice::alloc(&*be, span_bytes as u64)?;
         let d_prefill_parked = EngineDevice::alloc(&*be, parked_bytes as u64)?;
         let h_prefill_meta = EngineDevice::host_alloc_pinned(&*be, span_bytes + parked_bytes)?;
+        let kv_span_bytes = prefill_span_capacity * std::mem::size_of::<KvSpan>();
+        let d_kv_spans = EngineDevice::alloc(&*be, kv_span_bytes as u64)?;
+        let h_kv_spans = EngineDevice::host_alloc_pinned(&*be, kv_span_bytes)?;
         let (d_token_batch, h_token_batch) = if has_bodies {
             let bytes = TOKEN_BATCH_HEADER_BYTES + (3 * prefill_row_capacity + batch.max(1)) * 4;
             (
@@ -9808,6 +9953,9 @@ impl AmdEngine {
             d_prefill_spans,
             d_prefill_parked,
             h_prefill_meta,
+            d_kv_spans,
+            h_kv_spans,
+            packed_spans: Vec::new(),
             d_token_batch,
             h_token_batch,
             prefill_span_capacity,
@@ -10070,6 +10218,9 @@ impl AmdEngine {
                 return Err(RuntimeError::Device(error.clone()));
             }
         }
+        if let Some(error) = &program.packed_sparse_error {
+            return Err(RuntimeError::Device(error.clone()));
+        }
         if program.packed_needs_mla && !program.packed_dense {
             if !program.packed_mla_compatible {
                 return Err(RuntimeError::Device(
@@ -10228,6 +10379,7 @@ impl AmdEngine {
                 &self.h_prefill_meta.as_slice()[parked_off..parked_off + parked_bytes],
             ),
         ])?;
+        self.stage_kv_spans(prog, spans)?;
         self.packed_prefill = Some(binding);
         Ok(())
     }
@@ -10235,6 +10387,51 @@ impl AmdEngine {
     /// Remove the current packed-prefill binding. Device buffers remain allocated for reuse.
     pub fn clear_packed_prefill(&mut self) {
         self.packed_prefill = None;
+        self.packed_spans.clear();
+    }
+
+    /// Whether a span whose first row sits at absolute position `kv_row0` may be packed onto
+    /// `prog` (an ordinary rung, its sibling, or a body): a sparse (DSA) rung's fixed-width CSR
+    /// needs every row to own 2048 causal keys. Backend-neutral callers ask this before they
+    /// plan; the staging path refuses the same spans by name.
+    pub fn packed_span_admissible(&self, prog: usize, kv_row0: u32) -> bool {
+        self.progs
+            .get(prog)
+            .is_none_or(|p| !p.sparse_prefill || kv_row0 >= amd_sparse_mla::SPAN_MIN_PRIOR)
+    }
+
+    /// Keep the staged spans on the host and upload their `PlowKvSpan` table for the
+    /// host-launched sparse chain. Refuses spans the sparse rung cannot attend.
+    fn stage_kv_spans(&mut self, prog: usize, spans: &[PrefillSpan]) -> Result<()> {
+        if self.progs[prog].sparse_prefill {
+            if let Some(s) = spans
+                .iter()
+                .find(|s| s.kv_row0 < amd_sparse_mla::SPAN_MIN_PRIOR)
+            {
+                return Err(RuntimeError::Rejected(format!(
+                    "packed span slot {} starts at position {} but program {prog} is a sparse \
+                     (DSA) rung whose 2048-key selection needs kv_row0 >= {}; run this chunk isolated",
+                    s.slot,
+                    s.kv_row0,
+                    amd_sparse_mla::SPAN_MIN_PRIOR
+                )));
+            }
+        }
+        let table = kv_span_table(spans, self.max_ctx as u32)?;
+        let bytes = std::mem::size_of_val(table.as_slice());
+        if bytes > self.h_kv_spans.as_slice().len() {
+            return Err(RuntimeError::Device(format!(
+                "KV span table of {} spans exceeds staging capacity {}",
+                spans.len(),
+                self.prefill_span_capacity
+            )));
+        }
+        self.h_kv_spans.as_mut_slice()[..bytes].copy_from_slice(as_bytes(&table));
+        self.be
+            .memcpy_htod_pinned(self.d_kv_spans.base, &self.h_kv_spans.as_slice()[..bytes])?;
+        self.packed_spans.clear();
+        self.packed_spans.extend_from_slice(spans);
+        Ok(())
     }
 
     /// The token-batch BODY programs of this blob as `(program, rows, band)`, ascending by
@@ -10348,6 +10545,7 @@ impl AmdEngine {
                 &self.h_prefill_meta.as_slice()[parked_off..parked_off + parked_bytes],
             ),
         ])?;
+        self.stage_kv_spans(prog, spans)?;
         self.packed_prefill = Some(PackedPrefillBinding {
             prog,
             n_spans: spans.len() as u32,
@@ -10696,59 +10894,76 @@ impl AmdEngine {
             return Ok(());
         }
         let active = self.packed_prefill.is_some_and(|b| b.prog == p);
-        if !active {
-            if let Some(PrefillSegmentRoute::MlaFold(route)) =
-                self.progs[p].prefill_routes.get(seg).copied()
-            {
-                let kernel = self.mla_fold.as_ref().ok_or_else(|| {
-                    RuntimeError::Device("native MLA fold has no loaded kernels".into())
+        // The class-A native routes (fold, hipBLASLt, AITER MoE) run over the dense live rows
+        // whether or not a packed binding is staged; the two sparse routes take the staged
+        // spans (`stage_kv_spans`). An active binding used to skip every native route here and
+        // hand the segment to the primary interpreter, which has no arm for these opcodes.
+        if let Some(PrefillSegmentRoute::MlaFold(route)) =
+            self.progs[p].prefill_routes.get(seg).copied()
+        {
+            let kernel = self.mla_fold.as_ref().ok_or_else(|| {
+                RuntimeError::Device("native MLA fold has no loaded kernels".into())
+            })?;
+            kernel.enqueue(&self.be, route, &self.tens_table)?;
+            self.seg_launches += 3;
+            return Ok(());
+        }
+        if let Some(PrefillSegmentRoute::GemmLt(route)) =
+            self.progs[p].prefill_routes.get(seg).copied()
+        {
+            let kernel = self.gemm_lt.as_ref().ok_or_else(|| {
+                RuntimeError::Device("hipBLASLt projection route has no loaded kernel".into())
+            })?;
+            kernel.enqueue(&self.be, route, &self.tens_table)?;
+            self.seg_launches += 1;
+            return Ok(());
+        }
+        if let Some(PrefillSegmentRoute::IndexTp(route)) =
+            self.progs[p].prefill_routes.get(seg).copied()
+        {
+            let kernel = self.index_tp.as_ref().ok_or_else(|| {
+                RuntimeError::Device("TP indexer route has no loaded kernels".into())
+            })?;
+            let spans = active.then(|| amd_index_tp::KvSpanTable {
+                base: self.d_kv_spans.base,
+                n: self.packed_spans.len() as u32,
+            });
+            kernel.enqueue(&self.be, route, &self.tens_table, self.tp.unwrap(), spans)?;
+            self.seg_launches += 4;
+            return Ok(());
+        }
+        if let Some(PrefillSegmentRoute::MoeAiter(route)) =
+            self.progs[p].prefill_routes.get(seg).copied()
+        {
+            let kernel = self.moe_aiter.as_ref().ok_or_else(|| {
+                RuntimeError::Device("AITER MoE route has no loaded kernels".into())
+            })?;
+            kernel.enqueue(&self.be, route, &self.tens_table)?;
+            self.seg_launches += route.launches();
+            return Ok(());
+        }
+        if let Some(PrefillSegmentRoute::SparseMla(route)) =
+            self.progs[p].prefill_routes.get(seg).copied()
+        {
+            if active {
+                let sparse = self.sparse_mla.as_ref().ok_or_else(|| {
+                    RuntimeError::Device("sparse MLA route has no loaded kernels".into())
                 })?;
-                kernel.enqueue(&self.be, route, &self.tens_table)?;
+                let launches =
+                    sparse.enqueue_spans(&self.be, route, &self.tens_table, &self.packed_spans)?;
+                self.seg_launches += launches as u64;
+                return Ok(());
+            }
+            if route.active {
+                let sparse = self.sparse_mla.as_ref().ok_or_else(|| {
+                    RuntimeError::Device("sparse MLA route has no loaded kernels".into())
+                })?;
+                sparse.enqueue(&self.be, route, &self.tens_table)?;
                 self.seg_launches += 3;
                 return Ok(());
             }
-            if let Some(PrefillSegmentRoute::GemmLt(route)) =
-                self.progs[p].prefill_routes.get(seg).copied()
-            {
-                let kernel = self.gemm_lt.as_ref().ok_or_else(|| {
-                    RuntimeError::Device("hipBLASLt projection route has no loaded kernel".into())
-                })?;
-                kernel.enqueue(&self.be, route, &self.tens_table)?;
-                self.seg_launches += 1;
-                return Ok(());
-            }
-            if let Some(PrefillSegmentRoute::IndexTp(route)) =
-                self.progs[p].prefill_routes.get(seg).copied()
-            {
-                let kernel = self.index_tp.as_ref().ok_or_else(|| {
-                    RuntimeError::Device("TP indexer route has no loaded kernels".into())
-                })?;
-                kernel.enqueue(&self.be, route, &self.tens_table, self.tp.unwrap())?;
-                self.seg_launches += 4;
-                return Ok(());
-            }
-            if let Some(PrefillSegmentRoute::MoeAiter(route)) =
-                self.progs[p].prefill_routes.get(seg).copied()
-            {
-                let kernel = self.moe_aiter.as_ref().ok_or_else(|| {
-                    RuntimeError::Device("AITER MoE route has no loaded kernels".into())
-                })?;
-                kernel.enqueue(&self.be, route, &self.tens_table)?;
-                self.seg_launches += route.launches();
-                return Ok(());
-            }
-            if let Some(PrefillSegmentRoute::SparseMla(route)) =
-                self.progs[p].prefill_routes.get(seg).copied()
-            {
-                if route.active {
-                    let sparse = self.sparse_mla.as_ref().ok_or_else(|| {
-                        RuntimeError::Device("sparse MLA route has no loaded kernels".into())
-                    })?;
-                    sparse.enqueue(&self.be, route, &self.tens_table)?;
-                    self.seg_launches += 3;
-                    return Ok(());
-                }
-            }
+        }
+        if !active {
             if let Some(PrefillSegmentRoute::MlaMaterializePack {
                 args,
                 grid,
@@ -11205,8 +11420,21 @@ impl AmdEngine {
     /// overrunning the queue.
     fn prefill_segment_launches(&self, p: usize, seg: usize) -> usize {
         let active = self.packed_prefill.is_some_and(|b| b.prog == p);
-        if active || !prefill_segment_specialization_allowed(self.prog_dispatch(p)) {
+        if !prefill_segment_specialization_allowed(self.prog_dispatch(p)) {
             return 1;
+        }
+        if active {
+            return match self.progs[p].prefill_routes.get(seg) {
+                Some(PrefillSegmentRoute::SparseMla(route)) => self
+                    .sparse_mla
+                    .as_ref()
+                    .map_or(1, |s| s.span_launches(*route, &self.packed_spans)),
+                Some(PrefillSegmentRoute::GemmLt(_)) => 1,
+                Some(PrefillSegmentRoute::MlaFold(_)) => 3,
+                Some(PrefillSegmentRoute::MoeAiter(route)) => route.launches() as usize,
+                Some(PrefillSegmentRoute::IndexTp(_)) => 4,
+                _ => 1,
+            };
         }
         match self.progs[p].prefill_routes.get(seg) {
             Some(PrefillSegmentRoute::SparseMla(route)) if route.active => 3,

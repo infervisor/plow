@@ -258,6 +258,18 @@ fn glm_dsa_pf_bucket(c: &GlmCfg, t: u32) -> bool {
     c.dsa_pf() && t >= 2048 && t > c.index_topk
 }
 
+/// May a sparse (DSA) prefill bucket be emitted with the packed-segment topology (a packed
+/// sibling or a token-batch body)? Only when its whole selection chain has a per-span form at
+/// the runtime: the native TP indexer (`IndexTpPf`, which takes a `PlowKvSpan` table) feeding
+/// the AITER sparse FP8 flash directly (no per-8-query union, whose tiles could straddle two
+/// requests). The interpreter selectors (`IndexScorePf`/`IndexSelectPf`/`IndexUnionPf`, the
+/// pooled chain) derive every row's position from `kv_len[0]` and stay class C. Gated by
+/// `PLOW_PACKED_SPARSE_PF` so the shipped blob is unchanged until the rung is qualified.
+fn glm_sparse_spans(c: &GlmCfg) -> bool {
+    let cfg = emit_config::active();
+    c.dsa_pf() && cfg.packed_sparse_pf && cfg.glm_index_tp && c.index_kpool == 1 && glm_fp8_kv()
+}
+
 /// `packed`: the program carries the packed-prefill family topology, whose flash arm has no
 /// KV-split axis (one partial per row). Keyed on the BUILDER, not the global emit flag, so a
 /// packed emit leaves the ordinary sibling's split — and its bytes — exactly as flag-off.
@@ -4965,6 +4977,10 @@ fn emit_glm_dsa_prefill_select(
                 d.f[0] = (di as f32).powf(-0.5) * (hi as f32).powf(-0.5);
             },
         );
+        assert!(
+            !b.packed_prefill_segments(),
+            "the pooled DSA prefill selection has no per-span form; packed sparse prefill needs index_kpool == 1"
+        );
         let itk_pool = itk / c.index_kpool;
         let c_se = b.emit(
             DevOp::IndexSelectPf,
@@ -5053,13 +5069,14 @@ fn emit_glm_dsa_prefill_select(
     );
     let c_se =
         if emit_config::active().glm_index_tp && t >= 2048 {
-            // Class C (positions from one scalar): a packed sibling never reaches here
-            // because `glm_emit_full` skips sparse buckets in its packed pass.
+            // Under the packed topology the runtime hands this kernel the launch's PlowKvSpan
+            // table (dsa_tp_adapter ABI 2): every row's position, causal bound and key base
+            // come from its span, so a packed sibling / body may carry it. `t5 = kvlen` is the
+            // isolated form's scalar and is unread under a table.
             assert!(
-            !b.packed_prefill_segments()
-                && c.tp == 8 && n_cu == 304 && h == 6144
+            c.tp == 8 && n_cu == 304 && h == 6144
                 && hi == 32 && di == 128 && itk == 2048 && t <= 8192,
-            "PLOW_GLM_INDEX_TP requires an unpacked gfx942 TP8 GLM H6144/HI32/DI128/top2048 prefill program"
+            "PLOW_GLM_INDEX_TP requires a gfx942 TP8 GLM H6144/HI32/DI128/top2048 prefill program"
         );
             let enter = *xgate;
             *xgate = enter.checked_add(3).expect("indexer TP gate overflow");
@@ -5080,6 +5097,11 @@ fn emit_glm_dsa_prefill_select(
             b.isolate(counter);
             counter
         } else {
+            assert!(
+                !b.packed_prefill_segments(),
+                "packed sparse prefill requires the native TP indexer (PLOW_GLM_INDEX_TP=1): the \
+                 interpreter selectors derive every row's position from kv_len[0]"
+            );
             let c_sc = b.emit(DevOp::IndexScorePf, all.to_vec(), &[c_qi, c_ki, c_w], |d| {
                 d.t[0] = n.iscore_pf;
                 d.t[1] = n.qidx_pf;
@@ -5109,6 +5131,13 @@ fn emit_glm_dsa_prefill_select(
             );
             c_se
         };
+    // PACKED TOPOLOGY: no union. An 8-query tile could straddle two request spans (the band is
+    // 20 rows, spans are ragged), and the AITER sparse route gathers `iidx_pf` per row anyway —
+    // the flash names the per-row selection directly (`fj[1] = iidx_pf + 1`) and the runtime
+    // refuses a packed sparse program whose flash is not AITER-routed.
+    if b.packed_prefill_segments() {
+        return c_se;
+    }
     // One workgroup per query PACK (B2: 8 queries share a union; all 8 heads share the walk).
     let n_qt = t.div_ceil(GLM_DSA_PF_PACK);
     b.emit(
@@ -5398,12 +5427,17 @@ pub(crate) fn emit_glm_mla_prefill(
          epilogue is the dense V2 arm's i[6], and the fused GEMM reads bf16 partials. Unset one."
     );
     // The band's decode fold rewrites O rows [0, band) behind the prefill fold; under ofold
-    // there is no prefill fold to order behind, and the sparse prefill selection is class C
-    // (`IndexUnionPf`/`IndexTpPf` derive positions from one scalar) — `glm_emit_full` skips
-    // those buckets, this is the backstop.
+    // there is no prefill fold to order behind. A sparse bucket takes the packed topology only
+    // with the span-aware chain (`glm_sparse_spans`) — `glm_emit_full` filters, this is the
+    // backstop.
     assert!(
-        band.is_none() || (!ofold && !sparse),
-        "token-batch body cannot carry the ofold epilogue or sparse prefill selection (t={t})"
+        band.is_none() || !ofold,
+        "token-batch body cannot carry the ofold epilogue (t={t})"
+    );
+    assert!(
+        !(sparse && b.packed_prefill_segments()) || glm_sparse_spans(c),
+        "packed sparse prefill (t={t}) requires PLOW_PACKED_SPARSE_PF=1 with PLOW_GLM_INDEX_TP=1, \
+         an unpooled indexer and FP8 KV"
     );
     let mut fl_deps = vec![c_qa, c_qr, c_rnkv, c_krd];
     if let Some(d) = c_sel_pf {
@@ -5422,6 +5456,7 @@ pub(crate) fn emit_glm_mla_prefill(
     } else {
         glm_small_pf_split_cap(c, n_cu, t, b.packed_prefill_segments())
     };
+    let sparse_sel = if b.packed_prefill_segments() { n.iidx_pf } else { n.iuni };
     let pf_ns = if fp8kv && !sparse {
         small_pf_ns
     } else if fp8kv || sparse || t < 2048 || ofold {
@@ -5451,7 +5486,10 @@ pub(crate) fn emit_glm_mla_prefill(
                     d.j[1] = small_pf_ns;
                 }
                 if sparse {
-                    d.j[0] = n.iuni + 1;
+                    // The selection the gather walks: the per-8-query union table, or — under
+                    // the packed topology, which emits no union — the TP indexer's per-row
+                    // selection (`emit_glm_dsa_prefill_select`).
+                    d.j[0] = sparse_sel + 1;
                     d.i[6] = glm_dsa_pf_cap(c, ctx);
                 }
             } else if sparse {
@@ -7885,14 +7923,16 @@ fn glm_emit_full(
     // TOKEN-BATCH BODIES (`PLOW_TOKEN_BATCH_TP=1`, third pass): the packed sibling of each
     // bucket wider than the decode band, plus the batched decode attention chain and a
     // band-sampling tail over rows `[0, dbatch)` — `plans/unified-token-batch.md`, "AMD TP8
-    // lowering decision". Sparse-prefill buckets are skipped: `IndexUnionPf`/`IndexTpPf` derive
-    // every row's position from one scalar (class C) and have no per-span form yet. Flag unset
-    // ⇒ byte-identical blob.
+    // lowering decision". Flag unset ⇒ byte-identical blob.
     // The body sets the packed-segment topology on ITS OWN builder; it does not need the global
     // `PLOW_EMIT_PACKED_PREFILL` siblings. Both passes carry the native AITER MoE and hipBLASLt
-    // segments unchanged — they are row-agnostic over the dense live rows (class A); only the
-    // sparse-bucket selectors are class C, and neither pass emits those buckets.
+    // segments unchanged — they are row-agnostic over the dense live rows (class A).
+    // SPARSE (DSA) BUCKETS join both passes only under `glm_sparse_spans`: the TP indexer takes
+    // a per-span table and the AITER flash runs per span at the runtime; the interpreter
+    // selectors derive every row's position from one scalar (class C) and keep those buckets
+    // out of the packed passes.
     let token_batch_tp = emit_config::active().token_batch_tp;
+    let sparse_spans = glm_sparse_spans(&c);
     if token_batch_tp {
         assert!(
             crate::emit_is_amd() && dbatch > 1,
@@ -7913,7 +7953,7 @@ fn glm_emit_full(
                 .then_some(&pf)
                 .into_iter()
                 .flatten()
-                .filter(|&&t| !glm_dsa_pf_bucket(&c, t))
+                .filter(|&&t| sparse_spans || !glm_dsa_pf_bucket(&c, t))
                 .map(|&t| (t, PfKind::Packed)),
         )
         .chain(
@@ -7921,7 +7961,7 @@ fn glm_emit_full(
                 .then_some(&pf)
                 .into_iter()
                 .flatten()
-                .filter(|&&t| t > dbatch && !glm_dsa_pf_bucket(&c, t))
+                .filter(|&&t| t > dbatch && (sparse_spans || !glm_dsa_pf_bucket(&c, t)))
                 .map(|&t| (t, PfKind::TokenBatch)),
         )
         .collect();

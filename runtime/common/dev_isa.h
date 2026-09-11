@@ -1548,6 +1548,21 @@ typedef struct {
     uint32_t program;    /* compiled prefill program/rung */
 } PlowPrefillSpan;
 
+/* Per-request KV addressing for a native (host-launched) sparse-prefill kernel. Rows
+ * [row0, row0 + n_rows) of the launch belong to one request: local row r sits at absolute
+ * position kv_row0 + r, the request's live KV length is kv_len, and its position 0 is
+ * `kv_base` cache rows into the bound cache tensor — an explicit field, never slot arithmetic
+ * in the kernel (DCP places it). A row no entry covers is inactive: nothing is read or written
+ * for it. A launch with no table (`spans == NULL`) is the legacy single-request form. */
+typedef struct {
+    uint32_t row0;
+    uint32_t n_rows;
+    uint32_t kv_row0;
+    uint32_t kv_len;
+    uint32_t kv_base;
+    uint32_t _pad[3];
+} PlowKvSpan;
+
 /* ===== UNIFIED TOKEN BATCH (docs/arch/17-unified-token-batch.md) =============================
  *
  * One packed activation matrix per step holding every scheduled input token — decode rows and

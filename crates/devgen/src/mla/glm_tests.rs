@@ -2529,6 +2529,125 @@ fn dsa_decode_nsplit_fills_one_item_per_cu() {
     assert_eq!(glm_dsa_decode_nsplit(20, 8, 4, 304), 8);
 }
 
+/// The sparse (DSA) 8192 rung joins the packed-sibling and token-batch-body passes only under
+/// `PLOW_PACKED_SPARSE_PF=1`, and then with the span-aware chain: the TP indexer feeds the
+/// sparse FP8 flash directly (`fj[1] = iidx_pf + 1`), no per-8-query union. Every ordinary
+/// program is byte-identical either way — `PLOW_PACKED_SPARSE_PF=0` is the rollback.
+#[test]
+fn sparse_rung_joins_the_packed_passes_only_under_packed_sparse_pf() {
+    use std::sync::{Arc, Mutex};
+    let _guard = crate::test_env::env_guard();
+    let _target = crate::EmitAmdGuard::set(true);
+    let dir = std::env::temp_dir().join(format!("plow-glm-packed-sparse-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // `indexer_types`: a "full" layer owns the DSA indexer whose prefill selection chain is
+    // the class-C site under test; "shared" layers reuse the last full layer's selection.
+    let config = serde_json::json!({
+        "model_type": "glm_moe_dsa", "num_hidden_layers": 4,
+        "hidden_size": 6144, "num_attention_heads": 64,
+        "kv_lora_rank": 512, "q_lora_rank": 2048,
+        "qk_nope_head_dim": 192, "qk_rope_head_dim": 64, "v_head_dim": 256,
+        "vocab_size": 128, "rms_norm_eps": 1e-5,
+        "n_routed_experts": 256, "num_experts_per_tok": 8,
+        "moe_intermediate_size": 2048, "intermediate_size": 12288,
+        "first_k_dense_replace": 3, "routed_scaling_factor": 2.5,
+        "rope_theta": 8000000.0,
+        "indexer_types": ["full", "shared", "full", "shared"]
+    });
+    std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+    type Snapshot = Vec<(u32, Vec<packet::dev::DevInst>, Vec<packet::dev::StreamEnt>, Vec<packet::dev::StreamEnt>)>;
+    let emit = |sparse_pf: &str| -> Snapshot {
+        let _env = crate::test_env::EnvScope::set(&[
+            ("PLOW_MLA_PREFILL", "full:2048,8192"),
+            ("PLOW_DECODE_BATCH", "20"),
+            ("PLOW_GLM_DSA_PF", "1"),
+            ("PLOW_GLM_INDEX_TP", "1"),
+            ("PLOW_GLM_FP8_KV", "1"),
+            ("PLOW_GLM_MOE_AITER", "1"),
+            ("PLOW_GLM_GEMM_LT", "1"),
+            ("PLOW_MLA_PF_V2", "1"),
+            ("PLOW_MLA_PF_AITER", "1"),
+            ("PLOW_EMIT_PACKED_PREFILL", "1"),
+            ("PLOW_TOKEN_BATCH_TP", "1"),
+            ("PLOW_PACKED_SPARSE_PF", sparse_pf),
+            ("PLOW_UNISEG", "0"),
+        ]);
+        let seen: Arc<Mutex<Snapshot>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let verify: crate::VerifyHook = Box::new(move |model| {
+            *sink.lock().unwrap() = model
+                .progs
+                .iter()
+                .zip(&model.prog_t)
+                .map(|(p, &t)| (t, p.insts.clone(), p.stream.clone(), p.gq_stream.clone()))
+                .collect();
+            Ok(crate::LeanReport::skipped("structural regression test"))
+        });
+        // The production context: a batched FP8-KV decode ladder needs the DSA decode arm,
+        // which arms above the 64K crossover.
+        glm_emit_full(
+            &dir,
+            81920,
+            dir.join("model.pkt").to_str().unwrap(),
+            304,
+            8,
+            true,
+            true,
+            "gfx942",
+            None,
+            Some(&verify),
+        );
+        let out = seen.lock().unwrap().clone();
+        out
+    };
+    let dense_only = emit("0");
+    let with_sparse = emit("1");
+    std::fs::remove_dir_all(dir).unwrap();
+
+    type Entry = (u32, Vec<packet::dev::DevInst>, Vec<packet::dev::StreamEnt>, Vec<packet::dev::StreamEnt>);
+    fn ordinary(s: &[Entry]) -> Vec<&Entry> {
+        s.iter()
+            .filter(|e| !packet::devbuild::is_packed_prefill_program(e.0) && !packet::devbuild::is_token_batch_program(e.0))
+            .collect()
+    }
+    for entry in ordinary(&dense_only) {
+        let twin = with_sparse
+            .iter()
+            .find(|e| e.0 == entry.0)
+            .unwrap_or_else(|| panic!("program t={} vanished under PLOW_PACKED_SPARSE_PF", entry.0));
+        assert!(entry == twin, "ordinary program t={} changed under PLOW_PACKED_SPARSE_PF", entry.0);
+    }
+    let has = |insts: &[packet::dev::DevInst], op: DevOp| insts.iter().any(|d| d.op == op as u16);
+    // The ordinary 8192 rung is sparse and keeps the union: its flash names `iuni`.
+    let plain_8192 = dense_only.iter().find(|e| e.0 == 8192).expect("8192 rung");
+    assert!(has(&plain_8192.1, DevOp::IndexTpPf) && has(&plain_8192.1, DevOp::IndexUnionPf));
+    let plain_flash = plain_8192.1.iter().find(|d| d.op == DevOp::FlashMlaPrefillFp8 as u16 && d.j[0] != 0).unwrap();
+    let plain_union = plain_8192.1.iter().find(|d| d.op == DevOp::IndexUnionPf as u16).unwrap();
+    assert_eq!(plain_flash.j[0], plain_union.t[0] + 1);
+    // Dense-only: the sparse bucket gets neither a sibling nor a body; the dense 2048 gets both.
+    fn tagged(s: &[Entry], t: u32) -> Vec<&Vec<packet::dev::DevInst>> {
+        s.iter()
+            .filter(|e| e.0 == packet::devbuild::packed_prefill_program_t(t) || e.0 == packet::devbuild::token_batch_program_t(t))
+            .map(|e| &e.1)
+            .collect()
+    }
+    assert_eq!(tagged(&dense_only, 8192).len(), 0);
+    assert_eq!(tagged(&dense_only, 2048).len(), 2);
+    // With the knob: one sibling and one body at 8192, carrying the span-aware chain.
+    let sparse_packed = tagged(&with_sparse, 8192);
+    assert_eq!(sparse_packed.len(), 2, "one packed sibling and one token-batch body at 8192");
+    for insts in sparse_packed {
+        assert!(has(insts, DevOp::IndexTpPf), "the TP indexer (PlowKvSpan table at the runtime)");
+        assert!(!has(insts, DevOp::IndexUnionPf), "no per-8-query union under the packed topology");
+        assert!(!has(insts, DevOp::IndexScorePf) && !has(insts, DevOp::IndexSelectPf));
+        let tp = insts.iter().find(|d| d.op == DevOp::IndexTpPf as u16).unwrap();
+        let flash = insts.iter().find(|d| d.op == DevOp::FlashMlaPrefillFp8 as u16 && d.j[0] != 0).unwrap();
+        assert_eq!(flash.j[0], tp.t[0] + 1, "the sparse flash gathers the TP indexer's per-row selection");
+        assert_eq!((flash.i[4], tp.i[0]), (8192, 8192));
+    }
+    assert_eq!(tagged(&with_sparse, 2048).len(), 2);
+}
+
 /// The packed siblings ride next to the native AITER MoE and hipBLASLt segments — the production
 /// gfx942 TP8 recipe — and emitting them leaves every ordinary program byte-identical. This is
 /// the emit half of what lets the serve mux pack several requests' spans into one rung on that

@@ -8,7 +8,10 @@ pub(super) fn small_mla_segments(prog: &super::DevProg, segments: usize) -> Vec<
     use packet::dev::{DevOp, TENSOR_NONE16};
     let mut pure = vec![true; segments];
     let mut any = vec![false; segments];
-    if prog.packed_prefill_only || prog.t == 0 || prog.t >= 2048 {
+    // A packed sibling's or token-batch body's flash runs on the packed family object (the
+    // `_tb` twin for a body), never on the small-MLA object; classifying it here would demand
+    // that object at load for a segment it can never receive.
+    if prog.packed_prefill_only || prog.token_batch_body || prog.t == 0 || prog.t >= 2048 {
         return any;
     }
     for entry in &prog.stream {
@@ -121,13 +124,18 @@ impl AmdEngine {
             return "interpreter";
         }
         let active = self.packed_prefill.is_some_and(|b| b.prog == p);
+        match route {
+            PrefillSegmentRoute::SparseMla(_) if active => return "mla_sparse_aiter_spans",
+            PrefillSegmentRoute::SparseMla(route) if route.active => return "mla_sparse_aiter",
+            PrefillSegmentRoute::MoeAiter(_) => return "moe_aiter_fp8",
+            PrefillSegmentRoute::IndexTp(_) if active => return "index_tp_spans",
+            PrefillSegmentRoute::IndexTp(_) => return "index_tp",
+            PrefillSegmentRoute::GemmLt(_) => return "gemm_lt",
+            PrefillSegmentRoute::MlaFold(_) => return "mla_fold",
+            _ => {}
+        }
         if !active {
             match route {
-                PrefillSegmentRoute::SparseMla(route) if route.active => return "mla_sparse_aiter",
-                PrefillSegmentRoute::MoeAiter(_) => return "moe_aiter_fp8",
-                PrefillSegmentRoute::IndexTp(_) => return "index_tp",
-                PrefillSegmentRoute::GemmLt(_) => return "gemm_lt",
-                PrefillSegmentRoute::MlaFold(_) => return "mla_fold",
                 PrefillSegmentRoute::MlaMaterializePack { .. } => return "mla_materialize_pack",
                 PrefillSegmentRoute::MlaMaterializedPrefill { .. } => {
                     return "mla_materialized_prefill";

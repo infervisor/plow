@@ -5,18 +5,52 @@
 #include "dev_isa.h"
 #include "op_attention.h"
 #include "op_collective.h"
-extern "C" __device__ unsigned plow_dsa_tp_abi_1 = 1;
+/* ABI 2: struct kernargs carrying an optional PlowKvSpan table. `spans == NULL` is the ABI-1
+ * single-request form (kv_len[0] - rows positions). With a table, every row's position, causal
+ * bound and key base come from its span; rows no span covers are skipped. plowrt loads either
+ * marker and refuses to stage a packed sparse launch on an ABI-1 object. */
+extern "C" __device__ unsigned plow_dsa_tp_abi_2 = 1;
 #endif
 
-extern "C" __global__ __launch_bounds__(512, 1) void plow_dsa_tp_score(
-    float* score, const unsigned short* q, const unsigned short* k,
-    const unsigned short* w, const int* len, unsigned rows, unsigned stride,
-    unsigned rank) {
+struct DsaTpScoreArgs {
+    float* score;
+    const unsigned short* q;
+    const unsigned short* k;
+    const unsigned short* w;
+    const int* len;
+    const void* spans; /* PlowKvSpan[n_spans], or NULL (host pass cannot see dev_isa.h) */
+    unsigned rows;
+    unsigned stride;
+    unsigned rank;
+    unsigned n_spans;
+};
+static_assert(sizeof(DsaTpScoreArgs) == 64);
+
+/* Per span, the ABI-1 body runs unchanged on the span's own row window: `len = &kv_len` and
+ * `n_tok = row0 + n_rows` make its `q_pos0 = len - n_tok` equal `kv_row0 - row0` (mod 2^32),
+ * so row t resolves to position kv_row0 + (t - row0); the key base is the span's `kv_base`.
+ * Every argument is workgroup-uniform, so the body's barriers stay uniform. */
+extern "C" __global__ __launch_bounds__(512, 1) void plow_dsa_tp_score(DsaTpScoreArgs a) {
 #if defined(__HIP_DEVICE_COMPILE__)
     __shared__ bf16 tile[64 * (128 + FA_PAD)];
-    const unsigned band = (rows + 7u) / 8u;
-    d_index_score_pf_row<128, 32, 64>(score, q, k, w, len, rows, stride,
-        0x1.fffffep-7f, blockIdx.x, gridDim.x, tile, rank * band, (rank + 1u) * band);
+    const unsigned band = (a.rows + 7u) / 8u;
+    const unsigned lo = a.rank * band, hi = (a.rank + 1u) * band;
+    if (!a.spans) {
+        d_index_score_pf_row<128, 32, 64>(a.score, a.q, a.k, a.w, a.len, a.rows, a.stride,
+            0x1.fffffep-7f, blockIdx.x, gridDim.x, tile, lo, hi);
+        return;
+    }
+    const PlowKvSpan* spans = (const PlowKvSpan*)a.spans;
+    for (unsigned s = 0; s < a.n_spans; ++s) {
+        const PlowKvSpan sp = spans[s];
+        const unsigned rb = lo > sp.row0 ? lo : sp.row0;
+        const unsigned re = sp.row0 + sp.n_rows;
+        const unsigned rl = hi < re ? hi : re;
+        if (rb >= rl) continue;
+        d_index_score_pf_row<128, 32, 64>(a.score, a.q, a.k + (size_t)sp.kv_base * 128u, a.w,
+            (const int*)&spans[s].kv_len, re, a.stride, 0x1.fffffep-7f, blockIdx.x,
+            gridDim.x, tile, rb, rl);
+    }
 #endif
 }
 
@@ -28,12 +62,15 @@ struct DsaTpSelectArgs {
     unsigned long long xctr_offset;
     unsigned* status;
     unsigned long long deadline;
+    const void* spans; /* PlowKvSpan[n_spans], or NULL */
     unsigned rows;
     unsigned stride;
     unsigned rank;
     unsigned gate;
+    unsigned n_spans;
+    unsigned pad;
 };
-static_assert(sizeof(DsaTpSelectArgs) == 72);
+static_assert(sizeof(DsaTpSelectArgs) == 88);
 
 extern "C" __global__ __launch_bounds__(512, 1) void plow_dsa_tp_select(DsaTpSelectArgs a) {
 #if defined(__HIP_DEVICE_COMPILE__)
@@ -44,8 +81,22 @@ extern "C" __global__ __launch_bounds__(512, 1) void plow_dsa_tp_select(DsaTpSel
                               a.deadline, a.status, blockIdx.x, &bailed))
         return;
     const unsigned band = (a.rows + 7u) / 8u;
-    d_index_select_pf<true>(a.idx, a.score, a.len, a.rows, 2048, a.stride,
-        blockIdx.x, gridDim.x, hist, red, 1, a.rank * band, (a.rank + 1u) * band);
+    const unsigned lo = a.rank * band, hi = (a.rank + 1u) * band;
+    if (!a.spans) {
+        d_index_select_pf<true>(a.idx, a.score, a.len, a.rows, 2048, a.stride,
+            blockIdx.x, gridDim.x, hist, red, 1, lo, hi);
+        return;
+    }
+    const PlowKvSpan* spans = (const PlowKvSpan*)a.spans;
+    for (unsigned s = 0; s < a.n_spans; ++s) {
+        const PlowKvSpan sp = spans[s];
+        const unsigned rb = lo > sp.row0 ? lo : sp.row0;
+        const unsigned re = sp.row0 + sp.n_rows;
+        const unsigned rl = hi < re ? hi : re;
+        if (rb >= rl) continue;
+        d_index_select_pf<true>(a.idx, a.score, (const int*)&spans[s].kv_len, re, 2048,
+            a.stride, blockIdx.x, gridDim.x, hist, red, 1, rb, rl);
+    }
 #endif
 }
 

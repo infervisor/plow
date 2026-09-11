@@ -2595,3 +2595,33 @@ the rollback for that half.
 
 Rollbacks: `PLOW_PF_INTERLEAVE=2048`, `PLOW_PF_BATCH=0`, `PLOW_PACKED_PREFILL_ROUTE=0`,
 `--emit-packed-prefill=false`. Flag rows in `docs/flags-reference.md`.
+
+## 22. The sparse 8192 rung goes span-aware: packed siblings and token-batch bodies for DSA prefill (2026-09-11)
+
+§21 left the one rung that matters at 64K context — the sparse (DSA) 8192 bucket — without a
+packed sibling or a body, because its selection chain was class C: `IndexTpPf` scored and selected
+every row against `kv_len[0] - T`, `IndexUnionPf` unioned 8-query tiles under the same scalar, and
+the AITER sparse flash converted ONE slot's cache over `[0, kv_len)`. Each class-C site now reads its
+request span instead; the ordinary programs are byte-identical (`sparse_rung_joins_the_packed_passes_only_under_packed_sparse_pf`).
+
+| site | was (one scalar per launch) | now (per span) |
+|---|---|---|
+| `IndexTpPf` score/select (`runtime/amd/dsa_tp_adapter.hip`, ABI 2 `plow_dsa_tp_abi_2`) | `q_pos0 = kv_len[0] - rows`, key base = the bound cache tensor | the kernargs carry a `PlowKvSpan` table (`dev_isa.h`: `row0, n_rows, kv_row0, kv_len, kv_base`); per span the unchanged `d_index_score_pf_row` / `d_index_select_pf` bodies run on the span's row window with `len = &span.kv_len`, `n_tok = row0 + n_rows` (so `q_pos0 = kv_row0 - row0`, wrapping) and `k += kv_base * 128`. `spans == NULL` is the ABI-1 isolated form. Rows no span covers (the band, parked padding) are skipped. `kv_base` is an explicit host-written field, never slot arithmetic on the device (DCP places it). |
+| `IndexUnionPf` | per-8-query union, `q_pos0 = kv_len[0] - n_tok` | not emitted in packed programs: a tile could straddle two requests, and the AITER route gathers the per-row selection anyway. The sparse flash names `iidx_pf` directly (`fj[1] = iidx_pf + 1`); `amd_sparse_mla::routes` accepts an `IndexTpPf` producer in packed programs only. |
+| sparse `FlashMlaPrefillFp8` (AITER route, `exec/amd_sparse_mla.rs`) | one pack → attention → reduce over `rows`, cache `[0, kv_len)` of the bound slot | `enqueue_spans`: one chain per span with every per-row operand offset by `row0` and the cache/scale operands by `slot * ctx`, converted over `[0, span.kv_len)`. A span must start ≥ 2047 keys deep (fixed-width 2048-key CSR): `packed_span_admissible` gates the scheduler (packs and body members), staging refuses by name. |
+| DSA decode select over the band (`IndexSelect`, `check_dsa_select_local`) | — | unchanged: the body's band chain is the decode form (row t = slot t, class B). |
+| KV / index-key writers (`op_norm.h`, `i7 = ctx`) | — | already span/band-aware (§ token batch); the packed `_tb` norm object writes `kidx` at `slot * ctx + position`. |
+
+Emit: `PLOW_PACKED_SPARSE_PF=1` (`--packed-sparse-pf`) lets sparse buckets join both packed passes
+when `PLOW_GLM_INDEX_TP=1`, the indexer is unpooled and KV is FP8; the `PLOW_GLM_INDEX_TP` assert
+takes the builder's topology (packed allowed), the interpreter selectors assert `!packed`.
+Runtime: `packed_mla_compatible` / `token_batch_body_compatible` admit `IndexTpPf` + the sparse
+FP8 flash when the ABI-2 adapter is loaded and every such instruction got its native route
+(`packed_sparse_refusal` names the missing piece otherwise; the interpreter selectors stay refused).
+Native routes now dispatch under an ACTIVE packed binding too — `enqueue_segment` used to skip
+every native route while a binding was staged and hand the segment to the primary interpreter,
+which has no `MoeAiterFp8Pf`/`GemmLtPf`/`IndexTpPf` arm; that gate is what every dense body launch
+ran through before this change.
+
+Measured (this section is completed by the qualification below): identity C2/C3/C8, 18-case
+retrieval, the 20-prompt 70k/700/.14/C20 A/B against §21's 49.68 tok/s, packs and body fires.

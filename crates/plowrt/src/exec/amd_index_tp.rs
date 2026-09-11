@@ -28,20 +28,28 @@ impl Route {
     }
 }
 
+/// `span_aware`: the loaded adapter carries `plow_dsa_tp_abi_2`, whose score/select kernels take
+/// a `PlowKvSpan` table. A packed sibling or token-batch body resolves every row's position and
+/// key base through that table, so on an ABI-1 adapter such programs get NO route here — the
+/// program-level check (`check_packed_prefill_program`) then refuses them by name rather than
+/// letting the segment reach an interpreter that has no `IndexTpPf` arm.
 pub(super) fn routes(
     prog: &DevProg,
     tensors: &[DevTensor],
     segments: usize,
     tp: TpBind,
+    span_aware: bool,
 ) -> Result<Vec<Option<Route>>> {
     let mut routes = vec![None; segments];
+    if (prog.packed_prefill_only || prog.token_batch_body) && !span_aware {
+        return Ok(routes);
+    }
     for (ix, inst) in prog.insts.iter().enumerate() {
         if inst.op != DevOp::IndexTpPf as u16 {
             continue;
         }
         let err = |s: &str| RuntimeError::Device(format!("TP indexer instruction {ix}: {s}"));
-        if prog.packed_prefill_only
-            || !(2048..=8192).contains(&prog.t)
+        if !(2048..=8192).contains(&prog.t)
             || prog.t % 8 != 0
             || inst.i[0] != prog.t
             || !(2048..=131072).contains(&inst.i[1])
@@ -57,7 +65,7 @@ pub(super) fn routes(
             || inst.t[7] != TENSOR_NONE16
         {
             return Err(err(
-                "requires unpacked TP8 HI32/DI128/top2048 prefill and three valid gates",
+                "requires TP8 HI32/DI128/top2048 prefill of 2048..=8192 rows and three valid gates",
             ));
         }
         for (other_ix, other) in prog.insts.iter().enumerate() {
@@ -146,6 +154,7 @@ pub(super) fn routes(
     Ok(routes)
 }
 
+/// ABI 1 (`plow_dsa_tp_abi_1`): the single-request form.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct ScoreArgs {
@@ -154,6 +163,43 @@ struct ScoreArgs {
     stride: u32,
     rank: u32,
     pad: u32,
+}
+
+/// ABI 2 (`plow_dsa_tp_abi_2`): ABI 1 plus an optional `PlowKvSpan` table (`spans == 0` is the
+/// single-request form; `runtime/amd/dsa_tp_adapter.hip`).
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct ScoreArgs2 {
+    pointers: [u64; 5],
+    spans: u64,
+    rows: u32,
+    stride: u32,
+    rank: u32,
+    n_spans: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct SelectArgs2 {
+    pointers: [u64; 3],
+    peers: u64,
+    xctr_offset: u64,
+    status: u64,
+    deadline: u64,
+    spans: u64,
+    rows: u32,
+    stride: u32,
+    rank: u32,
+    gate: u32,
+    n_spans: u32,
+    pad: u32,
+}
+
+/// A device-resident `PlowKvSpan` table: `(address, entries)`.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct KvSpanTable {
+    pub base: u64,
+    pub n: u32,
 }
 
 #[repr(C)]
@@ -187,10 +233,14 @@ struct GatherArgs {
 
 const _: () = assert!(std::mem::size_of::<ScoreArgs>() == 56);
 const _: () = assert!(std::mem::size_of::<SelectArgs>() == 72);
+const _: () = assert!(std::mem::size_of::<ScoreArgs2>() == 64);
+const _: () = assert!(std::mem::size_of::<SelectArgs2>() == 88);
 const _: () = assert!(std::mem::size_of::<GatherArgs>() == 64);
 
 pub(super) struct IndexTp {
     kernels: [HsaKernel; 4],
+    /// 1 = single-request kernargs; 2 = the span-table form (`plow_dsa_tp_abi_2`).
+    abi: u8,
 }
 
 impl IndexTp {
@@ -198,16 +248,22 @@ impl IndexTp {
         let path = dir.join("dsa_tp_adapter_gfx942.elf");
         let image = std::fs::read(&path)
             .map_err(|e| RuntimeError::Device(format!("{}: {e}", path.display())))?;
-        if !super::amd::elf_symbol_names(&image).contains(&"plow_dsa_tp_abi_1") {
+        let syms = super::amd::elf_symbol_names(&image);
+        let abi = if syms.contains(&"plow_dsa_tp_abi_2") {
+            2
+        } else if syms.contains(&"plow_dsa_tp_abi_1") {
+            1
+        } else {
             return Err(RuntimeError::Device(
                 "TP indexer adapter lacks ABI marker".into(),
             ));
-        }
+        };
+        let (score_bytes, select_bytes) = if abi == 2 { (64, 88) } else { (56, 72) };
         let module = EngineDevice::module_load(be, &image)?;
         let mut kernels = Vec::new();
         for (name, bytes) in [
-            ("plow_dsa_tp_score", 56),
-            ("plow_dsa_tp_select", 72),
+            ("plow_dsa_tp_score", score_bytes),
+            ("plow_dsa_tp_select", select_bytes),
             ("plow_dsa_tp_gather", 64),
             ("plow_dsa_tp_complete", 64),
         ] {
@@ -224,17 +280,27 @@ impl IndexTp {
             kernels.push(kernel);
         }
         modules.push(module);
+        tracing::info!(abi, object = %path.display(), "TP indexer adapter loaded");
         Ok(Self {
             kernels: kernels.try_into().ok().unwrap(),
+            abi,
         })
     }
 
+    /// Whether packed spans (a `PlowKvSpan` table) can be handed to this adapter.
+    pub fn span_aware(&self) -> bool {
+        self.abi >= 2
+    }
+
+    /// `spans`: the staged `PlowKvSpan` table of a packed sibling / token-batch body launch;
+    /// `None` for an isolated chunk (position = `kv_len[0] - rows + t`, as ABI 1).
     pub fn enqueue(
         &self,
         be: &HsaBackend,
         route: Route,
         tensor_table: &[u8],
         tp: TpBind,
+        spans: Option<KvSpanTable>,
     ) -> Result<()> {
         let addr = |handle: u16| {
             let at = usize::from(handle) * 8;
@@ -246,6 +312,13 @@ impl IndexTp {
                 "TP indexer scratch binding changed".into(),
             ));
         }
+        if spans.is_some() && self.abi < 2 {
+            return Err(RuntimeError::Device(
+                "packed sparse prefill needs dsa_tp_adapter_gfx942.elf with plow_dsa_tp_abi_2"
+                    .into(),
+            ));
+        }
+        let (span_base, n_spans) = spans.map_or((0, 0), |s| (s.base, s.n));
         let score = ScoreArgs {
             pointers: [t[1], t[2], t[3], t[4], t[5]],
             rows: route.rows,
@@ -264,6 +337,28 @@ impl IndexTp {
             rank: tp.rank,
             gate: route.inst.i[5],
         };
+        let score2 = ScoreArgs2 {
+            pointers: score.pointers,
+            spans: span_base,
+            rows: score.rows,
+            stride: score.stride,
+            rank: score.rank,
+            n_spans,
+        };
+        let select2 = SelectArgs2 {
+            pointers: select.pointers,
+            peers: select.peers,
+            xctr_offset: select.xctr_offset,
+            status: select.status,
+            deadline: select.deadline,
+            spans: span_base,
+            rows: select.rows,
+            stride: select.stride,
+            rank: select.rank,
+            gate: select.gate,
+            n_spans,
+            pad: 0,
+        };
         let gather = GatherArgs {
             out: t[0],
             peers: tp.peer_table,
@@ -277,8 +372,13 @@ impl IndexTp {
             pad: 0,
         };
         let [ks, ki, kg, kc] = self.kernels;
-        be.launch(ks, 304, 512, 0, bytemuck::bytes_of(&score))?;
-        be.launch(ki, 304, 512, 0, bytemuck::bytes_of(&select))?;
+        if self.abi >= 2 {
+            be.launch(ks, 304, 512, 0, bytemuck::bytes_of(&score2))?;
+            be.launch(ki, 304, 512, 0, bytemuck::bytes_of(&select2))?;
+        } else {
+            be.launch(ks, 304, 512, 0, bytemuck::bytes_of(&score))?;
+            be.launch(ki, 304, 512, 0, bytemuck::bytes_of(&select))?;
+        }
         be.launch(kg, 304, 256, 0, bytemuck::bytes_of(&gather))?;
         be.launch(kc, 1, 64, 0, bytemuck::bytes_of(&gather))?;
         Ok(())
@@ -342,16 +442,27 @@ mod tests {
     #[test]
     fn index_tp_routes_reject_invalid_geometry_bindings_and_segments() {
         let (p, t, tp) = fixture();
-        let mut route = routes(&p, &t, 1, tp).unwrap()[0].unwrap();
+        let mut route = routes(&p, &t, 1, tp, false).unwrap()[0].unwrap();
         for rows in [1, 129, 4464, 8192] {
             route.rebase(rows).unwrap();
         }
         assert!(route.rebase(0).is_err());
         assert!(route.rebase(8193).is_err());
-        for bad in 0..19 {
+        // A packed sibling / body is routed only on a span-aware (ABI 2) adapter; on ABI 1 it
+        // keeps NO route and the packed program check refuses it by name.
+        {
+            let (mut p, t, tp) = fixture();
+            p.packed_prefill_only = true;
+            assert!(routes(&p, &t, 1, tp, false).unwrap()[0].is_none());
+            assert!(routes(&p, &t, 1, tp, true).unwrap()[0].is_some());
+            p.packed_prefill_only = false;
+            p.token_batch_body = true;
+            assert!(routes(&p, &t, 1, tp, false).unwrap()[0].is_none());
+            assert!(routes(&p, &t, 1, tp, true).unwrap()[0].is_some());
+        }
+        for bad in 1..19 {
             let (mut p, mut t, mut tp) = fixture();
             match bad {
-                0 => p.packed_prefill_only = true,
                 1 => p.insts[0].i[0] = 4096,
                 2 => p.insts[0].i[2] = 1024,
                 3 => p.insts[0].fj[0] = 0x3c800000,
@@ -379,7 +490,7 @@ mod tests {
                 17 => t[6].bytes = 16,
                 _ => p.insts[0].t[5] = TENSOR_NONE16,
             }
-            assert!(routes(&p, &t, 1, tp).is_err(), "case {bad}");
+            assert!(routes(&p, &t, 1, tp, true).is_err(), "case {bad}");
         }
         let (mut p, t, tp) = fixture();
         p.insts.push(DevInst64 {
@@ -392,7 +503,7 @@ mod tests {
             seg: 1,
             ..Default::default()
         });
-        assert!(routes(&p, &t, 2, tp)
+        assert!(routes(&p, &t, 2, tp, false)
             .unwrap_err()
             .to_string()
             .contains("overlaps"));

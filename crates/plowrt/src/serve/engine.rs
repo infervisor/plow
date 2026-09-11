@@ -692,6 +692,27 @@ mod amd_serve {
     }
 
     impl TokenBatchTp {
+        /// The body the mux will run for a member offered `capacity` span rows: the narrowest
+        /// body wider than the capacity (capacity = rows - leading, leading in 1..=band, and
+        /// the bodies are further apart than the band).
+        fn body_for_capacity(&self, capacity: u32) -> Option<usize> {
+            self.bodies
+                .iter()
+                .filter(|&&(_, t)| t > capacity)
+                .min_by_key(|&&(_, t)| t)
+                .map(|&(prog, _)| prog)
+        }
+
+        /// The widest span capacity among the bodies `admissible` accepts (0 = none).
+        fn admissible_capacity(&self, admissible: impl Fn(usize) -> bool) -> u32 {
+            self.bodies
+                .iter()
+                .filter(|&&(prog, _)| admissible(prog))
+                .map(|&(_, t)| t - self.band)
+                .max()
+                .unwrap_or(0)
+        }
+
         /// The body width for `leading_rows` sampled rows and `prefill_rows` span rows: the
         /// narrowest body whose span capacity fits, else the one that fits most.
         fn rows_for(&self, leading_rows: usize, prefill_rows: usize) -> Option<u32> {
@@ -1971,14 +1992,40 @@ mod amd_serve {
                 return 0;
             }
             let cap = max_rows.min(self.prefill_chunk_rows);
-            match &self.pf[slot] {
+            let rows = match &self.pf[slot] {
                 Some(cur) => token_batch_cursor_rows(cur, prompt.len() as u32, cap),
                 None => (prompt.len() as u32).min(cap),
+            };
+            // A member may only take what some body admissible at its frontier can carry: a
+            // sparse (DSA) body needs the span to start 2048 keys deep, so a request's first
+            // rows ride the widest dense body instead (or none, when no body admits them).
+            match (&self.ranks, &self.token_batch_tp) {
+                (Ranks::Tp(g), Some(tb)) => {
+                    let frontier = self.token_batch_frontier(slot);
+                    rows.min(tb.admissible_capacity(|prog| g.packed_span_admissible(prog, frontier)))
+                }
+                _ => rows,
             }
+        }
+
+        /// The position a body span for `slot` would start at: its cursor's frontier, else 0.
+        fn token_batch_frontier(&self, slot: usize) -> u32 {
+            self.pf
+                .get(slot)
+                .and_then(Option::as_ref)
+                .map_or(0, |cur| cur.frontier)
         }
 
         pub fn token_batch_prefill_fits(&self, slot: usize, prefill_capacity: u32) -> bool {
             self.mixed_prefill_fits(slot, prefill_capacity)
+                && match (&self.ranks, &self.token_batch_tp) {
+                    (Ranks::Tp(g), Some(tb)) => tb
+                        .body_for_capacity(prefill_capacity)
+                        .is_some_and(|prog| {
+                            g.packed_span_admissible(prog, self.token_batch_frontier(slot))
+                        }),
+                    _ => true,
+                }
         }
 
         /// One unified token-batch step.
@@ -2241,7 +2288,7 @@ mod amd_serve {
         ) -> Option<packet::dev::PrefillSpan> {
             let cur = self.pf.get(slot)?.as_ref()?;
             let step = packable_prefill_step(cur, max_rows)?;
-            let program = self.packed_prefill_program(step.clen, max_rows, true)?;
+            let program = self.packed_prefill_program(step.clen, max_rows, true, Some(step.c0))?;
             let mut span = self.prefill_span(slot, max_rows)?;
             span.program = u32::try_from(program).ok()?;
             Some(span)
@@ -2258,7 +2305,7 @@ mod amd_serve {
             let chunk = self.prefill_chunk_rows.min(max_rows);
             chunk != 0
                 && self
-                    .packed_prefill_program(chunk, max_rows, true)
+                    .packed_prefill_program(chunk, max_rows, true, None)
                     .and_then(|prog| {
                         self.ranks
                             .rank0()
@@ -2269,7 +2316,24 @@ mod amd_serve {
                     .is_some_and(|rung| rung >= chunk.saturating_mul(2))
         }
 
-        fn packed_prefill_program(&self, rows: u32, cap: u32, widest: bool) -> Option<usize> {
+        /// Whether a span whose first row sits at absolute position `kv_row0` may be packed
+        /// onto `prog` (a sparse DSA rung needs every row to own 2048 causal keys).
+        fn packed_span_admissible(&self, prog: usize, kv_row0: u32) -> bool {
+            match &self.ranks {
+                Ranks::One(e) => e.packed_span_admissible(prog, kv_row0),
+                Ranks::Tp(g) => g.packed_span_admissible(prog, kv_row0),
+            }
+        }
+
+        /// `kv_row0`: the lowest first-row position among the spans the rung will carry, when
+        /// known — rungs that cannot attend such a span are not offered.
+        fn packed_prefill_program(
+            &self,
+            rows: u32,
+            cap: u32,
+            widest: bool,
+            kv_row0: Option<u32>,
+        ) -> Option<usize> {
             self.ranks
                 .rank0()
                 .prefill_rungs()
@@ -2280,6 +2344,7 @@ mod amd_serve {
                             Ranks::One(e) => e.packed_prefill_prog_capable(program),
                             Ranks::Tp(g) => g.packed_prefill_prog_capable(program),
                         }
+                        && kv_row0.is_none_or(|c0| self.packed_span_admissible(program, c0))
                 })
                 .min_by_key(|&(_, width)| if widest { u32::MAX - width } else { width })
                 .map(|(program, _)| program)
@@ -2357,8 +2422,9 @@ mod amd_serve {
                 completed.push((slot, step));
             }
 
+            let lowest = spans.iter().map(|s| s.kv_row0).min();
             let prog = self
-                .packed_prefill_program(row0, u32::MAX, false)
+                .packed_prefill_program(row0, u32::MAX, false, lowest)
                 .ok_or_else(|| {
                     RuntimeError::Rejected(format!("no packed prefill rung covers {row0} rows"))
                 })?;

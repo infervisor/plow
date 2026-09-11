@@ -1984,10 +1984,10 @@ pub(super) fn check_sparse_fp8_packet(
     tensors: &[crate::asset::devblob::DevTensor],
     arch: &str,
 ) -> Result<()> {
-    for d in progs
+    for (p, d) in progs
         .iter()
-        .flat_map(|p| &p.insts)
-        .filter(|d| sparse_fp8(d))
+        .flat_map(|p| p.insts.iter().map(move |d| (p, d)))
+        .filter(|(_, d)| sparse_fp8(d))
     {
         let decode = d.op == DevOp::FlashMlaDecodeFp8 as u16;
         let rows = u64::from(if decode { d.i[0] } else { d.i[4] });
@@ -2014,7 +2014,13 @@ pub(super) fn check_sparse_fp8_packet(
             ));
         }
         let slots = u64::from(d.i[0]);
-        let selected = if decode {
+        // A packed sibling / body names the TP indexer's per-row selection (rows x 2048 keys)
+        // instead of the per-8-query union table.
+        let tp_selected = p
+            .insts
+            .iter()
+            .any(|q| q.op == DevOp::IndexTpPf as u16 && u32::from(q.t[0]) == d.fj[1] - 1);
+        let selected = if decode || tp_selected {
             rows * 2048 * 4
         } else {
             (rows.div_ceil(8) * 4).div_ceil(256) * 256 + rows.div_ceil(8) * u64::from(d.i[6]) * 12

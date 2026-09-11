@@ -598,6 +598,15 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_TOKEN_BATCH_TP", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub token_batch_tp: bool,
 
+    /// Let the packed-prefill siblings and token-batch bodies cover the SPARSE (DSA) prefill
+    /// buckets too. Their selection chain resolves rows per request span at the runtime (the
+    /// native TP indexer takes a `PlowKvSpan` table, the AITER sparse flash runs one chain per
+    /// span), so it needs `PLOW_GLM_INDEX_TP=1`, an unpooled indexer and FP8 KV; the
+    /// interpreter selectors stay class C and such buckets are skipped without it. Off until
+    /// the sparse rung is GPU-qualified; unset ⇒ byte-identical blob.
+    #[arg(long, env = "PLOW_PACKED_SPARSE_PF", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub packed_sparse_pf: bool,
+
     /// Partition large GLM prefill index queries across eight gfx942 ranks.
     #[arg(long, env = "PLOW_GLM_INDEX_TP", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_index_tp: bool,
@@ -1115,6 +1124,7 @@ impl EmitConfig {
             glm_mla_dec_aiter: env_bool("PLOW_GLM_MLA_DEC_AITER"),
             glm_moe_resident: env_bool("PLOW_GLM_MOE_RESIDENT"),
             token_batch_tp: env_bool("PLOW_TOKEN_BATCH_TP"),
+            packed_sparse_pf: env_bool("PLOW_PACKED_SPARSE_PF"),
             glm_index_tp: env_bool("PLOW_GLM_INDEX_TP"),
             glm_select_local: env_bool("PLOW_GLM_SELECT_LOCAL"),
             glm_decode_norm_rows: env_bool("PLOW_GLM_DECODE_NORM_ROWS"),

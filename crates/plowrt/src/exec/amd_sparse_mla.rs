@@ -3,11 +3,18 @@ use std::path::Path;
 
 use packet::dev::{DevInst64, DevOp, SE_XCTR, TENSOR_NONE16};
 
+use packet::dev::PrefillSpan;
+
 use crate::asset::devblob::{DevProg, DevTensor};
 use crate::device::hsa::{HsaBackend, HsaKernel};
 use crate::device::{DeviceMem, Module};
 use crate::exec::device_api::EngineDevice;
 use crate::{Result, RuntimeError};
+
+/// Every row of the fixed-width (2048-key) CSR must own all 2048 causal keys: a span's first
+/// row sits at position `kv_row0`, so `kv_row0 >= SPAN_MIN_PRIOR` is the admission rule the
+/// scheduler applies before it packs a span onto a sparse rung (`AmdEngine::packed_span_admissible`).
+pub(crate) const SPAN_MIN_PRIOR: u32 = 2047;
 
 const OBJECT_HASH: &str = "cd8fa62e18abada15beeeedd49357bcc1e9e2eee7353d038533f30cac93c3607";
 const OBJECT: &str = "mla_a16w16_qh8_qseqlen1_gqaratio8_v3.co";
@@ -279,6 +286,38 @@ mod tests {
         assert!(routes(&prog, &tensors, 2).is_err());
     }
 
+    /// A packed sibling / token-batch body carries no union: its sparse flash names the TP
+    /// indexer's per-row selection, which the route gathers directly. An ordinary program may
+    /// not take that form, and the geometry must still agree.
+    #[test]
+    fn sparse_mla_routes_take_the_tp_selection_in_packed_programs_only() {
+        let (mut prog, tensors) = fixture();
+        prog.insts[0] = DevInst64 {
+            op: DevOp::IndexTpPf as u16,
+            t: [8, 9, 2, 3, 4, 6, 7, TENSOR_NONE16],
+            i: [8192, 81920, 2048, 8, 96 << 20, 0, 2, 0],
+            ..Default::default()
+        };
+        prog.insts[1].op = DevOp::FlashMlaPrefillFp8 as u16;
+        prog.insts[1].fj[1] = 9;
+        prog.insts[1].t[7] = 9;
+        for body in [false, true] {
+            prog.packed_prefill_only = !body;
+            prog.token_batch_body = body;
+            let route = routes(&prog, &tensors, 2).unwrap()[1].unwrap();
+            assert_eq!((route.index, route.scale), (8, Some(9)));
+        }
+        prog.packed_prefill_only = false;
+        prog.token_batch_body = false;
+        assert!(routes(&prog, &tensors, 2).is_err(), "ordinary programs keep the union");
+        prog.packed_prefill_only = true;
+        prog.insts[0].i[1] = 65536;
+        assert!(routes(&prog, &tensors, 2).is_err(), "ctx must agree");
+        prog.insts[0].i[1] = 81920;
+        prog.insts[0].t[5] = 5;
+        assert!(routes(&prog, &tensors, 2).is_err(), "kv_len operand must agree");
+    }
+
     #[test]
     fn sparse_mla_rebases_ragged_rows_and_restores_early_fallback() {
         let (prog, tensors) = fixture();
@@ -348,7 +387,7 @@ pub(super) fn routes(
     segments: usize,
 ) -> Result<Vec<Option<Route>>> {
     let mut routes = vec![None; segments];
-    if prog.packed_prefill_only || prog.t < 2048 {
+    if prog.t < 2048 {
         return Ok(routes);
     }
     for (ix, inst) in prog.insts.iter().enumerate() {
@@ -374,16 +413,38 @@ pub(super) fn routes(
                 "requires BF16 QH8 latent512/rope64, rows<=8192, ctx<=81920",
             ));
         }
-        let union = prog.insts[..ix]
+        // The per-row selection this attention gathers: an ordinary program names the union
+        // table (op 119) and the route reads the union's `iidx_pf` operand; a packed sibling /
+        // token-batch body carries no union (its 8-query tiles could straddle request spans)
+        // and names the TP indexer's per-row selection directly.
+        let producer = prog.insts[..ix]
             .iter()
             .rev()
-            .find(|d| d.op == DevOp::IndexUnionPf as u16 && u32::from(d.t[0]) == union_handle)
-            .ok_or_else(|| err("no preceding index union"))?;
-        if union.i[..5] != [prog.t, 2048, inst.i[2], inst.i[6], 8] || union.t[3] != inst.t[6] {
-            return Err(err(
-                "index union does not describe 2048 selected keys per query",
-            ));
-        }
+            .find(|d| {
+                (d.op == DevOp::IndexUnionPf as u16 || d.op == DevOp::IndexTpPf as u16)
+                    && u32::from(d.t[0]) == union_handle
+            })
+            .ok_or_else(|| err("no preceding index union or TP selection"))?;
+        let index = if producer.op == DevOp::IndexUnionPf as u16 {
+            if producer.i[..5] != [prog.t, 2048, inst.i[2], inst.i[6], 8]
+                || producer.t[3] != inst.t[6]
+            {
+                return Err(err(
+                    "index union does not describe 2048 selected keys per query",
+                ));
+            }
+            producer.t[2]
+        } else {
+            if !(prog.packed_prefill_only || prog.token_batch_body)
+                || producer.i[..3] != [prog.t, inst.i[2], 2048]
+                || producer.t[5] != inst.t[6]
+            {
+                return Err(err(
+                    "a direct TP selection feeds the flash only in a packed program with matching rows/ctx/top2048",
+                ));
+            }
+            producer.t[0]
+        };
         let ctx = u64::from(inst.i[2]);
         let rows = u64::from(prog.t);
         for (handle, bytes) in [
@@ -393,7 +454,7 @@ pub(super) fn routes(
             (inst.t[3], rows * 8 * 64 * 2),
             (inst.t[4], ctx * 512 * if fp8 { 1 } else { 2 }),
             (inst.t[5], ctx * 64 * 2),
-            (union.t[2], rows * 2048 * 4),
+            (index, rows * 2048 * 4),
         ] {
             if handle == TENSOR_NONE16
                 || tensors.get(handle as usize).is_none_or(|t| t.bytes < bytes)
@@ -438,7 +499,7 @@ pub(super) fn routes(
         }
         routes[seg] = Some(Route {
             inst: *inst,
-            index: union.t[2],
+            index,
             scale: fp8.then_some(inst.t[7]),
             rows: prog.t,
             kv_len: 0,
@@ -652,27 +713,97 @@ impl SparseMla {
     }
 
     pub fn enqueue(&self, be: &HsaBackend, route: Route, tensor_table: &[u8]) -> Result<()> {
+        let one = SpanWindow {
+            row0: 0,
+            rows: route.rows,
+            kv_len: route.kv_len,
+            kv_base: 0,
+        };
+        self.enqueue_window(be, route, tensor_table, one).map(|_| ())
+    }
+
+    /// The AQL packets [`Self::enqueue_spans`] emits for `spans` (each span is its own
+    /// pack → attention [→ reduce] chain).
+    pub fn span_launches(&self, route: Route, spans: &[PrefillSpan]) -> usize {
+        spans
+            .iter()
+            .map(|s| {
+                let single =
+                    s.n_rows >= 512 && route.scale.is_some() && self.pack_fp8_single.is_some();
+                if single { 2 } else { 3 }
+            })
+            .sum()
+    }
+
+    /// One packed sibling / token-batch body launch: every request span runs the isolated
+    /// chain on its own row window and its own request's cache (`kv_base = slot * ctx` cache
+    /// rows, converted to `[0, span.kv_len)`), so a span never reads another slot's keys and
+    /// rows no span covers (the band, parked padding) are never attended. Returns the packets
+    /// emitted. Refuses a span whose rows would lack the full 2048 causal keys the fixed-width
+    /// CSR assumes — the scheduler admits spans by the same rule (`SPAN_MIN_PRIOR`).
+    pub fn enqueue_spans(
+        &self,
+        be: &HsaBackend,
+        route: Route,
+        tensor_table: &[u8],
+        spans: &[PrefillSpan],
+    ) -> Result<usize> {
+        let ctx = route.inst.i[2];
+        let mut launches = 0;
+        for s in spans {
+            if s.n_rows == 0
+                || s.kv_row0 < SPAN_MIN_PRIOR
+                || s.kv_len != s.kv_row0 + s.n_rows
+                || s.kv_len > ctx
+                || s.row0 + s.n_rows > route.inst.i[4]
+            {
+                return Err(RuntimeError::Device(format!(
+                    "sparse MLA span slot {} rows [{}, +{}) kv [{}, {}) is not admissible on a \
+                     2048-key CSR (needs kv_row0 >= {SPAN_MIN_PRIOR}, kv_len <= ctx {ctx})",
+                    s.slot, s.row0, s.n_rows, s.kv_row0, s.kv_len
+                )));
+            }
+            let window = SpanWindow {
+                row0: s.row0,
+                rows: s.n_rows,
+                kv_len: s.kv_len,
+                kv_base: u64::from(s.slot) * u64::from(ctx),
+            };
+            launches += self.enqueue_window(be, route, tensor_table, window)?;
+        }
+        Ok(launches)
+    }
+
+    fn enqueue_window(
+        &self,
+        be: &HsaBackend,
+        route: Route,
+        tensor_table: &[u8],
+        w: SpanWindow,
+    ) -> Result<usize> {
         let addr = |handle: u16| {
             let at = usize::from(handle) * 8;
             u64::from_le_bytes(tensor_table[at..at + 8].try_into().unwrap())
         };
         let t = route.inst.t;
-        let single = route.rows >= 512 && route.scale.is_some() && self.pack_fp8_single.is_some();
+        let fp8 = route.scale.is_some();
+        let row0 = u64::from(w.row0);
+        let single = w.rows >= 512 && fp8 && self.pack_fp8_single.is_some();
         let splits = if single { 1 } else { 2 };
         let pack = PackArgs {
             q: self.q,
             kv: self.kv,
-            qa: addr(t[2]),
-            qr: addr(t[3]),
-            ck: addr(t[4]),
-            kr: addr(t[5]),
+            qa: addr(t[2]) + row0 * 8 * 512 * 2,
+            qr: addr(t[3]) + row0 * 8 * 64 * 2,
+            ck: addr(t[4]) + w.kv_base * 512 * if fp8 { 1 } else { 2 },
+            kr: addr(t[5]) + w.kv_base * 64 * 2,
             qp: self.qp,
             kp: self.kp,
             last: self.last,
             splits: self.splits,
-            rows: route.rows,
+            rows: w.rows,
             // VMM may leave the capacity beyond the live prefix unmapped.
-            ctx: route.kv_len,
+            ctx: w.kv_len,
         };
         if let Some(scale) = route.scale {
             let kernel = self
@@ -680,12 +811,12 @@ impl SparseMla {
                 .ok_or_else(|| RuntimeError::Device("FP8 sparse MLA pack was not loaded".into()))?;
             let args = PackFp8Args {
                 base: pack,
-                scale: addr(scale),
+                scale: addr(scale) + w.kv_base * 4,
             };
             if single {
                 let args = PackSingleArgs {
                     base: args,
-                    ml: addr(t[1]),
+                    ml: addr(t[1]) + row0 * 8 * 2 * 4,
                 };
                 be.launch(
                     self.pack_fp8_single.unwrap(),
@@ -701,12 +832,12 @@ impl SparseMla {
             be.launch(self.pack, 304, 256, 0, bytemuck::bytes_of(&pack))?;
         }
         let mut args = [0u64; 40];
-        args[0] = if single { addr(t[0]) } else { self.part };
+        args[0] = if single { addr(t[0]) + row0 * 8 * 512 * 4 } else { self.part };
         args[2] = self.lse;
         args[4] = self.q;
         args[6] = self.kv;
         args[8] = self.kp;
-        args[10] = addr(route.index);
+        args[10] = addr(route.index) + row0 * 2048 * 4;
         args[12] = self.last;
         args[14] = u64::from(route.inst.fj[0]);
         args[16] = 8;
@@ -718,23 +849,34 @@ impl SparseMla {
         // The pinned kernel writes normalized FP32 at one split when out_16_nosplit stays zero.
         be.launch_3d(
             self.attention,
-            [1, route.rows, splits as u32],
+            [1, w.rows, splits as u32],
             256,
             bytemuck::cast_slice(&args),
         )?;
         if single {
-            return Ok(());
+            return Ok(2);
         }
         let reduce = ReduceArgs {
-            out: addr(t[0]),
-            ml: addr(t[1]),
+            out: addr(t[0]) + row0 * 8 * 512 * 4,
+            ml: addr(t[1]) + row0 * 8 * 2 * 4,
             part: self.part,
             lse: self.lse,
-            rows: route.rows,
+            rows: w.rows,
             pad: 0,
         };
-        be.launch(self.reduce, 304, 256, 0, bytemuck::bytes_of(&reduce))
+        be.launch(self.reduce, 304, 256, 0, bytemuck::bytes_of(&reduce))?;
+        Ok(3)
     }
+}
+
+/// One request's rows inside a launch: `[row0, row0 + rows)` of the query/output tensors, its
+/// cache converted over `[0, kv_len)` starting `kv_base` cache rows into the bound tensors.
+#[derive(Clone, Copy)]
+struct SpanWindow {
+    row0: u32,
+    rows: u32,
+    kv_len: u32,
+    kv_base: u64,
 }
 
 /// Decode twin of [`Route`]: one isolated sparse FP8 `FlashMlaDecodeFp8` per segment, every

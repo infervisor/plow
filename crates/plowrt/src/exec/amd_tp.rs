@@ -1381,6 +1381,14 @@ impl AmdTpGroup {
             .unwrap_or(0)
     }
 
+    /// Whether a span starting at absolute position `kv_row0` may be packed onto `prog` on
+    /// every rank (`AmdEngine::packed_span_admissible`).
+    pub fn packed_span_admissible(&self, prog: usize, kv_row0: u32) -> bool {
+        self.ranks
+            .iter()
+            .all(|rank| rank.packed_span_admissible(prog, kv_row0))
+    }
+
     /// True only when every rank can route this exact program through packed prefill.
     pub fn packed_prefill_prog_capable(&self, prog: usize) -> bool {
         self.prefill_prog_t(prog).is_some()
