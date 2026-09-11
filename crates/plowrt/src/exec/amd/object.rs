@@ -456,13 +456,13 @@ pub(super) fn check_compiled_opcode_marker_set(
     Ok(())
 }
 
-pub(super) fn check_compiled_opcode_markers(
+pub(super) fn check_compiled_opcode_markers<'a>(
     syms: &[&str],
     path: &Path,
-    progs: &[DevProg],
+    progs: impl IntoIterator<Item = &'a DevProg>,
 ) -> Result<()> {
     let required = progs
-        .iter()
+        .into_iter()
         .flat_map(|prog| &prog.insts)
         .filter_map(|inst| DevOp::ALL.iter().copied().find(|op| *op as u16 == inst.op));
     check_compiled_opcode_marker_set(syms, path, required)
@@ -470,12 +470,12 @@ pub(super) fn check_compiled_opcode_markers(
 
 pub(super) const MATERIALIZED_RESIDUAL_INPUT_SYM: &str = "plow_materialized_residual_input_1";
 
-pub(super) fn check_materialized_residual_input(
+pub(super) fn check_materialized_residual_input<'a>(
     syms: &[&str],
     path: &Path,
-    progs: &[DevProg],
+    progs: impl IntoIterator<Item = &'a DevProg>,
 ) -> Result<()> {
-    let required = progs.iter().flat_map(|prog| &prog.insts).any(|inst| {
+    let required = progs.into_iter().flat_map(|prog| &prog.insts).any(|inst| {
         inst.op == DevOp::AttnRes as u16
             && (inst.t[6] != packet::dev::TENSOR_NONE16
                 || inst.t[7] != packet::dev::TENSOR_NONE16
@@ -533,9 +533,12 @@ pub(super) const DECODE_ARM_MARKERS: &[(&str, &[&str])] = &[
     ("PLOW_DEC_STAGE_HALVES", &[DEC_STAGE_SYM]),
 ];
 
-pub(super) fn required_moe_pf_accum(progs: &[DevProg], field: usize) -> bool {
+pub(super) fn required_moe_pf_accum<'a>(
+    progs: impl IntoIterator<Item = &'a DevProg>,
+    field: usize,
+) -> bool {
     progs
-        .iter()
+        .into_iter()
         .flat_map(|p| &p.insts)
         .any(|inst| inst.op == DevOp::MoeGroupDownPf as u16 && inst.i[field] != 0)
 }
@@ -863,8 +866,10 @@ pub(super) fn build_requires(blob_path: &Path) -> Result<Option<Vec<String>>> {
         }))
 }
 
-pub(super) fn packet_decode_arm_requirements(progs: &[DevProg]) -> Vec<String> {
-    let insts = || progs.iter().flat_map(|p| &p.insts);
+pub(super) fn packet_decode_arm_requirements<'a>(
+    progs: impl IntoIterator<Item = &'a DevProg> + Clone,
+) -> Vec<String> {
+    let insts = || progs.clone().into_iter().flat_map(|p| &p.insts);
     let mut requires = Vec::new();
     if insts().any(|inst| inst.op == DevOp::IndexSelect as u16 && inst.i[4] == 1) {
         requires.push("PLOW_DSA_SELECT_LOCAL=1".to_owned());
@@ -872,10 +877,10 @@ pub(super) fn packet_decode_arm_requirements(progs: &[DevProg]) -> Vec<String> {
     if insts().any(|inst| inst.op == DevOp::KdaConvStateStepG as u16) {
         requires.push("PLOW_KDA_CONV_STEP_DB=1".to_owned());
     }
-    if required_moe_pf_accum(progs, 4) {
+    if required_moe_pf_accum(progs.clone(), 4) {
         requires.push("PLOW_MOE_PF_ATOMIC=1".to_owned());
     }
-    if required_moe_pf_accum(progs, 5) {
+    if required_moe_pf_accum(progs.clone(), 5) {
         requires.push("PLOW_MOE_PF_DET=1".to_owned());
     }
     if insts().any(|inst| {
@@ -900,8 +905,10 @@ pub(super) fn packet_decode_arm_requirements(progs: &[DevProg]) -> Vec<String> {
     requires
 }
 
-pub(super) fn packet_prefill_arm_requirements(progs: &[DevProg]) -> Vec<String> {
-    let insts = || progs.iter().flat_map(|p| &p.insts);
+pub(super) fn packet_prefill_arm_requirements<'a>(
+    progs: impl IntoIterator<Item = &'a DevProg> + Clone,
+) -> Vec<String> {
+    let insts = || progs.clone().into_iter().flat_map(|p| &p.insts);
     let mut requires = Vec::new();
     if insts().any(|inst| inst.op == DevOp::NormResidualNorm as u16) {
         requires.push("PLOW_HAS_NORM_RESIDUAL_NORM=1".to_owned());
@@ -952,10 +959,10 @@ pub(super) fn packet_prefill_arm_requirements(progs: &[DevProg]) -> Vec<String> 
     {
         requires.push("PLOW_T11_GLUQUANT=1".to_owned());
     }
-    if required_moe_pf_accum(progs, 4) {
+    if required_moe_pf_accum(progs.clone(), 4) {
         requires.push("PLOW_MOE_PF_ATOMIC=1".to_owned());
     }
-    if required_moe_pf_accum(progs, 5) {
+    if required_moe_pf_accum(progs.clone(), 5) {
         requires.push("PLOW_MOE_PF_DET=1".to_owned());
     }
     if insts().any(|inst| {
@@ -996,7 +1003,6 @@ pub(super) fn packet_prefill_arm_requirements(progs: &[DevProg]) -> Vec<String> 
 pub(super) fn graph_phase_xreduce_segments(
     blob_path: &Path,
     progs: &[DevProg],
-    dec_ix: usize,
     enabled: bool,
 ) -> Result<Vec<BTreeSet<usize>>> {
     let selected = vec![BTreeSet::new(); progs.len()];
@@ -1010,13 +1016,12 @@ pub(super) fn graph_phase_xreduce_segments(
     })?;
     let man: serde_json::Value = serde_json::from_slice(&raw)
         .map_err(|e| RuntimeError::Device(format!("{}: not valid JSON: {e}", mpath.display())))?;
-    graph_phase_xreduce_segments_from_manifest(&man, progs, dec_ix, &mpath)
+    graph_phase_xreduce_segments_from_manifest(&man, progs, &mpath)
 }
 
 pub(super) fn graph_phase_xreduce_segments_from_manifest(
     man: &serde_json::Value,
     progs: &[DevProg],
-    dec_ix: usize,
     mpath: &Path,
 ) -> Result<Vec<BTreeSet<usize>>> {
     let mut selected = vec![BTreeSet::new(); progs.len()];
@@ -1049,12 +1054,13 @@ pub(super) fn graph_phase_xreduce_segments_from_manifest(
                 "invalid or duplicate dispatch-chain program {program}"
             )));
         }
-        let expected_kind = if program < dec_ix {
+        let role = progs[program].role;
+        let expected_kind = if role.is_prefill_side() {
             "prefill"
         } else {
             "decode"
         };
-        let expected_topology = if progs[program].packed_prefill_only {
+        let expected_topology = if role.is_packed_sibling() {
             "packed"
         } else {
             "ordinary"
@@ -1084,7 +1090,7 @@ pub(super) fn graph_phase_xreduce_segments_from_manifest(
                 )));
             }
         }
-        if program >= dec_ix || progs[program].packed_prefill_only {
+        if role.is_decode_rung() || role.is_packed_sibling() {
             continue;
         }
         let phases = chain
@@ -1633,9 +1639,9 @@ pub(super) const GEMV_BUCKET_OPS: &[DevOp] = &[
 /// sequences the program is shaped for; this says what the kernel will actually
 /// be handed, and the two are not the same statement. A prefill program is `t`
 /// tokens wide and still emits its lm_head GEMV at M=1.
-pub(super) fn required_gemv_m(progs: &[DevProg]) -> u32 {
+pub(super) fn required_gemv_m<'a>(progs: impl IntoIterator<Item = &'a DevProg>) -> u32 {
     progs
-        .iter()
+        .into_iter()
         .flat_map(|p| p.insts.iter())
         .filter(|i| GEMV_BUCKET_OPS.iter().any(|&o| o as u16 == i.op))
         .map(|i| i.i[0])
@@ -1733,35 +1739,46 @@ pub(super) const QWEN_GDN_ARM_OPS: &[DevOp] = &[
 ];
 
 /// The first Qwen GDN opcode in these programs, or `None` if the packet needs no Qwen arm.
-pub(super) fn required_qwen_gdn_op(progs: &[DevProg]) -> Option<DevOp> {
+pub(super) fn required_qwen_gdn_op<'a>(
+    progs: impl IntoIterator<Item = &'a DevProg>,
+) -> Option<DevOp> {
     progs
-        .iter()
+        .into_iter()
         .flat_map(|p| p.insts.iter())
         .find_map(|i| QWEN_GDN_ARM_OPS.iter().copied().find(|&o| o as u16 == i.op))
 }
 
 /// The first K3/KDA opcode in these programs, or `None` if the packet needs no K3 arm.
-pub(super) fn required_k3_op(progs: &[DevProg]) -> Option<DevOp> {
+pub(super) fn required_k3_op<'a>(progs: impl IntoIterator<Item = &'a DevProg>) -> Option<DevOp> {
     progs
-        .iter()
+        .into_iter()
         .flat_map(|p| p.insts.iter())
         .find_map(|i| K3_ARM_OPS.iter().copied().find(|&o| o as u16 == i.op))
 }
 
-pub(super) fn required_moe_pf_a4w4(progs: &[DevProg]) -> Option<DevOp> {
-    progs.iter().flat_map(|p| p.insts.iter()).find_map(|i| {
-        let op = DevOp::from_u16(i.op)?;
-        ((op == DevOp::MoeGroupGluPf || op == DevOp::MoeGroupDownPf)
-            && i.i[MOE_PF_ENC_SLOT] == MOE_ENC_MXFP4)
-            .then_some(op)
-    })
+pub(super) fn required_moe_pf_a4w4<'a>(
+    progs: impl IntoIterator<Item = &'a DevProg>,
+) -> Option<DevOp> {
+    progs
+        .into_iter()
+        .flat_map(|p| p.insts.iter())
+        .find_map(|i| {
+            let op = DevOp::from_u16(i.op)?;
+            ((op == DevOp::MoeGroupGluPf || op == DevOp::MoeGroupDownPf)
+                && i.i[MOE_PF_ENC_SLOT] == MOE_ENC_MXFP4)
+                .then_some(op)
+        })
 }
 
-pub(super) fn required_kda_conv_step_db(progs: &[DevProg]) -> Option<DevOp> {
+pub(super) fn required_kda_conv_step_db<'a>(
+    progs: impl IntoIterator<Item = &'a DevProg>,
+) -> Option<DevOp> {
     first_op_in(progs, &[DevOp::KdaConvStateStepG])
 }
 
-pub(super) fn required_kda_chunk(progs: &[DevProg]) -> Option<DevOp> {
+pub(super) fn required_kda_chunk<'a>(
+    progs: impl IntoIterator<Item = &'a DevProg>,
+) -> Option<DevOp> {
     first_op_in(
         progs,
         &[
@@ -1896,13 +1913,13 @@ pub(super) fn check_k3_arms(syms: &[&str], path: &Path, need: Option<DevOp>) -> 
     )))
 }
 
-pub(super) fn check_dsa_decode_batch(
+pub(super) fn check_dsa_decode_batch<'a>(
     syms: &[&str],
     path: &Path,
-    progs: &[DevProg],
+    progs: impl IntoIterator<Item = &'a DevProg>,
     cdna3: bool,
 ) -> Result<()> {
-    if progs.iter().flat_map(|p| &p.insts).any(|d| {
+    if progs.into_iter().flat_map(|p| &p.insts).any(|d| {
         (d.op == DevOp::IndexSelect as u16 && (d.i[3] != 0 || d.i[4] != 0))
             || (cdna3 && d.op == DevOp::IndexScore as u16)
     }) && !syms.contains(&"plow_dsa_decode_batch_arm")
@@ -1918,11 +1935,10 @@ pub(super) fn check_dsa_decode_batch(
 pub(super) fn check_dsa_select_local(
     progs: &[DevProg],
     tensors: &[crate::asset::devblob::DevTensor],
-    dec_ix: usize,
     arch: &str,
     tp8: bool,
 ) -> Result<()> {
-    for (program, p) in progs.iter().enumerate() {
+    for p in progs {
         for d in p
             .insts
             .iter()
@@ -1934,15 +1950,14 @@ pub(super) fn check_dsa_select_local(
             };
             // A token-batch body runs the decode form over its slot band inside a prefill-width
             // program: the band (the packet's block count) is the row count, not `p.t`.
-            let rows = if p.token_batch_body {
+            let rows = if p.role.is_token_batch_body() {
                 u32::from(d.blocks)
             } else {
                 p.t
             };
             if arch != "gfx942"
                 || !tp8
-                || (program < dec_ix && !p.token_batch_body)
-                || p.packed_prefill_only
+                || !(p.role.is_decode_rung() || p.role.is_token_batch_body())
                 || !matches!(rows, 2 | 4 | 8 | 16 | 20)
                 || u32::from(d.blocks) != rows
                 || !(2048..=131072).contains(&d.i[0])
@@ -2043,10 +2058,10 @@ pub(super) fn check_sparse_fp8_packet(
     Ok(())
 }
 
-pub(super) fn check_sparse_fp8_object(
+pub(super) fn check_sparse_fp8_object<'a>(
     syms: &[&str],
     path: &Path,
-    progs: &[DevProg],
+    progs: impl IntoIterator<Item = &'a DevProg>,
     decode: bool,
 ) -> Result<()> {
     let op = if decode {
@@ -2060,7 +2075,7 @@ pub(super) fn check_sparse_fp8_object(
         "plow_mla_sparse_fp8_prefill_arm"
     };
     if progs
-        .iter()
+        .into_iter()
         .flat_map(|p| &p.insts)
         .any(|d| d.op == op as u16 && sparse_fp8(d))
         && !syms.contains(&marker)
@@ -2248,12 +2263,12 @@ pub(super) struct GateHierStatus {
 impl GateHierStatus {
     /// The interpreter's own precondition, evaluated on the decode programs
     /// (`runtime/amd/interp.hip`, `h_on`).
-    pub(super) fn of(progs: &[DevProg], dec_lo: usize, armed: bool) -> Self {
-        let dec = &progs[dec_lo.min(progs.len())..];
-        let domains = dec.iter().map(|p| p.l2_domains).max().unwrap_or(0);
+    pub(super) fn of(progs: &[DevProg], armed: bool) -> Self {
+        let dec = || progs.iter().filter(|p| p.role.is_decode_rung());
+        let domains = dec().map(|p| p.l2_domains).max().unwrap_or(0);
         let mut rendezvous = 0usize;
         let mut entries = 0usize;
-        for p in dec {
+        for p in dec() {
             for e in &p.gq_stream {
                 entries += 1;
                 let nper = (e.flags & packet::dev::SE_NPER_MASK) >> packet::dev::SE_NPER_SHIFT;
@@ -2295,8 +2310,8 @@ impl GateHierStatus {
 /// Said once per rank, at load, because "compiled in" is not "running": the whole reason this
 /// feature was measurable-but-unmeasured for a release cycle is that nothing printed the
 /// difference.
-pub(super) fn log_gate_hier_status(progs: &[DevProg], dec_lo: usize, armed: bool) {
-    let st = GateHierStatus::of(progs, dec_lo, armed);
+pub(super) fn log_gate_hier_status(progs: &[DevProg], armed: bool) {
+    let st = GateHierStatus::of(progs, armed);
     tracing::info!(
         armed = st.armed,
         firing = st.firing,
@@ -2335,9 +2350,12 @@ pub(super) const MOE_GEMMA_PF_OPS: &[DevOp] = &[
     DevOp::MoeGroupDownGemmaPfW8a8,
 ];
 
-pub(super) fn first_op_in(progs: &[DevProg], set: &[DevOp]) -> Option<DevOp> {
+pub(super) fn first_op_in<'a>(
+    progs: impl IntoIterator<Item = &'a DevProg>,
+    set: &[DevOp],
+) -> Option<DevOp> {
     progs
-        .iter()
+        .into_iter()
         .flat_map(|p| p.insts.iter())
         .find_map(|i| set.iter().copied().find(|&o| o as u16 == i.op))
 }
@@ -2403,7 +2421,11 @@ pub(super) const DEC_STAGED_OPS: &[DevOp] = &[
 /// `M` is `i[0]` and `K` is `i[2]` for every op in [`DEC_STAGED_OPS`] (`packet::slots`). An
 /// object without the marker predates it and is left alone: it can only have been paired with a
 /// blob emitted under the old conservative bound, which every arena satisfies.
-pub(super) fn check_dec_stage_capacity(image: &[u8], path: &Path, progs: &[DevProg]) -> Result<()> {
+pub(super) fn check_dec_stage_capacity<'a>(
+    image: &[u8],
+    path: &Path,
+    progs: impl IntoIterator<Item = &'a DevProg>,
+) -> Result<()> {
     let Some(halves) = elf_symbol_u32(image, DEC_STAGE_SYM) else {
         return Ok(());
     };
@@ -2456,9 +2478,12 @@ pub(super) const BF16_KV_OPS: &[DevOp] = &[
 ];
 
 /// The first opcode in `progs` that reaches an arm on `side`, or `None`.
-pub(super) fn required_kv_op(progs: &[DevProg], side: &[DevOp]) -> Option<DevOp> {
+pub(super) fn required_kv_op<'a>(
+    progs: impl IntoIterator<Item = &'a DevProg>,
+    side: &[DevOp],
+) -> Option<DevOp> {
     progs
-        .iter()
+        .into_iter()
         .flat_map(|p| p.insts.iter())
         .find_map(|i| side.iter().copied().find(|&o| o as u16 == i.op))
 }

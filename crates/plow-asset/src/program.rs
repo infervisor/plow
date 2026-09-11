@@ -1,4 +1,5 @@
 use packet::dev::{DevInst64, StreamEnt, Wait};
+use packet::devbuild::ProgramRole;
 use packet::rope::GenTensor;
 
 #[derive(Clone, Copy)]
@@ -11,9 +12,9 @@ pub struct Tensor<'a> {
 #[derive(Clone, Copy)]
 pub struct Program<'a> {
     pub rows: u32,
-    pub packed_prefill_only: bool,
-    /// A token-batch body (`packet::devbuild::TOKEN_BATCH_PROG`): never an ordinary rung.
-    pub token_batch_body: bool,
+    /// What this program is FOR (`packet::devbuild::derive_roles`). Replaces the pair of
+    /// booleans that used to carve exceptions out of a positional prefill range.
+    pub role: ProgramRole,
     pub n_counter: u32,
     pub insts: &'a [DevInst64],
     pub stream: &'a [StreamEnt],
@@ -51,15 +52,21 @@ pub fn with_model<T>(model: &packet::devbuild::Model, f: impl FnOnce(&Packet<'_>
             initialized: t.init.is_some(),
         })
         .collect();
+    // The emitter's own table is a PARENT's: `plowc extend` writes an extension through
+    // `Model::to_ext_blob`, and its roles are stated (docs/arch/19, phase 4).
+    let roles = packet::devbuild::derive_roles(
+        &model.prog_t,
+        packet::devbuild::RoleSource::Positional,
+        |i| packet::devbuild::token_batch_band_of(&packed[i]),
+    );
     let programs: Vec<_> = model
         .progs
         .iter()
-        .zip(&model.prog_t)
+        .zip(&roles)
         .zip(&packed)
-        .map(|((p, &rows), insts)| Program {
-            rows,
-            packed_prefill_only: false,
-            token_batch_body: false,
+        .map(|((p, &role), insts)| Program {
+            rows: role.rows(),
+            role,
             n_counter: p.n_counter,
             insts,
             stream: &p.stream,

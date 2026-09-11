@@ -3199,6 +3199,152 @@ pub fn decode_rung_lo(prog_t: &[u32]) -> usize {
     lo
 }
 
+// --- program roles -----------------------------------------------------------
+
+/// WHAT A PROGRAM IS FOR, as one value.
+///
+/// The prefill/decode split used to be read off the program's INDEX: `[0, decode_rung_lo)` was
+/// the prefill bucket ladder and the rest the decode rungs, with [`PACKED_PREFILL_PROG`] and
+/// [`TOKEN_BATCH_PROG`] carving exceptions out of the prefill range. A merged program table
+/// (`docs/arch/19-packet-extensions.md`) arrives in whatever order the extensions were found,
+/// so the index says nothing; and even without extensions the boundary was re-derived
+/// independently at a dozen call sites.
+///
+/// The four roles are mutually exclusive by construction — a program cannot be both a packed
+/// sibling and a token-batch body — which is the property the two booleans did not have.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ProgramRole {
+    /// An ordinary prefill bucket: one rung of the chunk ladder, `rows` tokens wide.
+    PrefillBucket { rows: u32 },
+    /// One rung of the decode batch ladder, advancing up to `rows` sequence slots.
+    DecodeRung { rows: u32 },
+    /// A packed-dispatch-only topology for the prefill bucket of the same width
+    /// ([`PACKED_PREFILL_PROG`]). Never selected as a rung of its own.
+    PackedSibling { of_rows: u32 },
+    /// A token-batch body ([`TOKEN_BATCH_PROG`]): `rows` of prefill width carrying a
+    /// slot-indexed decode band of `band` rows ahead of its prefill spans. Neither ladder
+    /// offers it; only the token-batch route selects it, by rows.
+    TokenBatchBody { band: u32, rows: u32 },
+}
+
+impl ProgramRole {
+    /// The compiled row count, whatever the role.
+    pub fn rows(self) -> u32 {
+        match self {
+            Self::PrefillBucket { rows }
+            | Self::DecodeRung { rows }
+            | Self::PackedSibling { of_rows: rows }
+            | Self::TokenBatchBody { rows, .. } => rows,
+        }
+    }
+
+    pub fn is_prefill_bucket(self) -> bool {
+        matches!(self, Self::PrefillBucket { .. })
+    }
+
+    pub fn is_decode_rung(self) -> bool {
+        matches!(self, Self::DecodeRung { .. })
+    }
+
+    pub fn is_packed_sibling(self) -> bool {
+        matches!(self, Self::PackedSibling { .. })
+    }
+
+    pub fn is_token_batch_body(self) -> bool {
+        matches!(self, Self::TokenBatchBody { .. })
+    }
+
+    /// The band a token-batch body samples, or `None` for every other role.
+    pub fn token_batch_band(self) -> Option<u32> {
+        match self {
+            Self::TokenBatchBody { band, .. } => Some(band),
+            _ => None,
+        }
+    }
+
+    /// Prefill-side: exactly the programs the positional code found below `decode_rung_lo` —
+    /// buckets, their packed siblings and the token-batch bodies.
+    pub fn is_prefill_side(self) -> bool {
+        !self.is_decode_rung()
+    }
+
+    /// The role's name, for a refusal message.
+    pub fn kind(self) -> &'static str {
+        match self {
+            Self::PrefillBucket { .. } => "prefill bucket",
+            Self::DecodeRung { .. } => "decode rung",
+            Self::PackedSibling { .. } => "packed sibling",
+            Self::TokenBatchBody { .. } => "token-batch body",
+        }
+    }
+}
+
+/// Where the BUCKET-vs-RUNG distinction comes from. The other two roles are always stated, by
+/// [`PACKED_PREFILL_PROG`] and [`TOKEN_BATCH_PROG`]; this is the pair that has two answers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoleSource {
+    /// A PARENT packet. Its decode ladder is a trailing strictly-ascending run and
+    /// [`decode_rung_lo`] finds the boundary positionally — which is what every already
+    /// emitted packet carries, and why one loads unchanged and byte-identical.
+    Positional,
+    /// An EXTENSION. It carries one or two programs, and a lone program is `prog_t.len() - 1`,
+    /// so the positional rule would read every extension's single program as a decode rung and
+    /// refuse a 4096-row prefill bucket as a rung outside the decode band. An extension states
+    /// its roles with [`DECODE_RUNG_PROG`]; unmarked means prefill bucket.
+    Stated,
+}
+
+/// The band a token-batch body samples: the row count on its `Argmax`, or 0 when the program
+/// carries none. Read from the instruction stream because `PlowProgHeader` is fixed at 24
+/// bytes and has no field to spare.
+pub fn token_batch_band_of(insts: &[crate::dev::DevInst64]) -> u32 {
+    insts
+        .iter()
+        .find(|d| d.op == crate::dev::DevOp::Argmax as u16)
+        .map_or(0, |d| d.i[1])
+}
+
+/// THE ONE PLACE a program table is turned into roles.
+///
+/// `prog_t` is the ENCODED `t` word of every program, in table order — row count in the low
+/// bits plus the [`PACKED_PREFILL_PROG`] / [`TOKEN_BATCH_PROG`] / [`DECODE_RUNG_PROG`] markers.
+/// The first two name their roles outright in either container. The bucket-vs-rung pair is what
+/// [`RoleSource`] decides: a parent falls back to the positional [`decode_rung_lo`] rule, an
+/// extension reads the stated bit. A STATED bit always wins, so `Positional` is a fallback and
+/// not an override — the day the emitter marks a parent's rungs, nothing here changes.
+///
+/// `band` supplies the token-batch band for program `i` (see [`token_batch_band_of`]); it is
+/// only consulted for a [`TOKEN_BATCH_PROG`].
+pub fn derive_roles(
+    prog_t: &[u32],
+    source: RoleSource,
+    band: impl Fn(usize) -> u32,
+) -> Vec<ProgramRole> {
+    let lo = match source {
+        RoleSource::Positional => decode_rung_lo(prog_t),
+        RoleSource::Stated => prog_t.len(),
+    };
+    prog_t
+        .iter()
+        .enumerate()
+        .map(|(i, &t)| {
+            let rows = program_rows(t);
+            if is_token_batch_program(t) {
+                ProgramRole::TokenBatchBody {
+                    band: band(i),
+                    rows,
+                }
+            } else if is_packed_prefill_program(t) {
+                ProgramRole::PackedSibling { of_rows: rows }
+            } else if is_decode_rung_program(t) || i >= lo {
+                ProgramRole::DecodeRung { rows }
+            } else {
+                ProgramRole::PrefillBucket { rows }
+            }
+        })
+        .collect()
+}
+
 // --- v6 section directory ----------------------------------------------------
 
 pub const SECT_MAGIC: &[u8; 4] = b"SECT";
@@ -5955,6 +6101,80 @@ mod v6_tests {
         assert!(is_token_batch_program(token_batch_program_t(1024)));
         assert!(!is_packed_prefill_program(token_batch_program_t(1024)));
         assert!(!is_token_batch_program(packed_prefill_program_t(1024)));
+    }
+
+    /// THE PIN for phase 1 of `docs/arch/19-packet-extensions.md`: the role of every program
+    /// is exactly what the POSITIONAL rule said before roles existed — decode is the trailing
+    /// run `decode_rung_lo` finds, `PACKED_PREFILL_PROG` is a sibling, `TOKEN_BATCH_PROG` is a
+    /// body, everything else is a bucket — for every ladder shape the emitter can produce.
+    #[test]
+    fn roles_reproduce_the_positional_derivation() {
+        let pf = [128u32, 512, 1024, 2048, 8192];
+        let dec = [1u32, 2, 4, 8, 16];
+        let mut tables: Vec<Vec<u32>> = vec![
+            vec![1],
+            vec![128, 1],
+            vec![128, 128],
+            vec![1, 1],
+            vec![128, 512, 1024, 1, 2, 4, 8, 16],
+            vec![128, 1024, 1, 3, 6, 12],
+            vec![128, 512, 1, 16, 32, 64, 128],
+        ];
+        for n in 1..=dec.len() {
+            tables.push(pf.iter().chain(&dec[..n]).copied().collect());
+            // The same ladder with a packed sibling per bucket, then the token-batch bodies:
+            // the order `mla.rs` emits them in.
+            let mut with_siblings: Vec<u32> = pf.to_vec();
+            with_siblings.extend(pf.iter().copied().map(packed_prefill_program_t));
+            with_siblings.extend(pf[2..].iter().copied().map(token_batch_program_t));
+            with_siblings.extend(&dec[..n]);
+            tables.push(with_siblings);
+        }
+
+        for table in &tables {
+            let lo = decode_rung_lo(table);
+            let roles = derive_roles(table, RoleSource::Positional, |i| 8 + i as u32);
+            assert_eq!(roles.len(), table.len(), "{table:?}");
+            for (i, (&t, &role)) in table.iter().zip(&roles).enumerate() {
+                let rows = program_rows(t);
+                assert_eq!(role.rows(), rows, "{table:?} at {i}");
+                // The positional oracle, verbatim.
+                let want = if is_token_batch_program(t) {
+                    ProgramRole::TokenBatchBody {
+                        band: 8 + i as u32,
+                        rows,
+                    }
+                } else if is_packed_prefill_program(t) {
+                    ProgramRole::PackedSibling { of_rows: rows }
+                } else if i >= lo {
+                    ProgramRole::DecodeRung { rows }
+                } else {
+                    ProgramRole::PrefillBucket { rows }
+                };
+                assert_eq!(role, want, "{table:?} at {i}");
+                assert_eq!(role.is_decode_rung(), i >= lo, "{table:?} at {i}");
+                assert_eq!(role.is_prefill_side(), i < lo, "{table:?} at {i}");
+            }
+            // Both ladders, filtered by role and sorted by width, are the two index ranges.
+            let buckets: Vec<u32> = roles
+                .iter()
+                .filter(|r| r.is_prefill_bucket())
+                .map(|r| r.rows())
+                .collect();
+            let mut sorted = buckets.clone();
+            sorted.sort_unstable();
+            assert_eq!(buckets, sorted, "{table:?}");
+            let rungs: Vec<u32> = roles[lo..].iter().map(|r| r.rows()).collect();
+            assert_eq!(
+                roles
+                    .iter()
+                    .filter(|r| r.is_decode_rung())
+                    .map(|r| r.rows())
+                    .collect::<Vec<_>>(),
+                rungs,
+                "{table:?}"
+            );
+        }
     }
 
     #[test]

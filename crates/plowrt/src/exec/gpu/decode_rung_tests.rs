@@ -47,9 +47,7 @@ pub(super) fn fixture() -> DevBlob {
                 .collect();
             DevProg {
                 t: rows,
-                packed_prefill_only: false,
-                token_batch_body: false,
-                decode_rung: false,
+                role: packet::devbuild::ProgramRole::PrefillBucket { rows: rows },
                 n_counter: 0,
                 insts,
                 stream: stream.clone(),
@@ -80,7 +78,7 @@ pub(super) fn fixture() -> DevBlob {
         init: None,
     })
     .collect();
-    DevBlob {
+    let mut blob = DevBlob {
         n_cu: 1,
         flags: 0,
         target: 0,
@@ -92,7 +90,9 @@ pub(super) fn fixture() -> DevBlob {
         gen: vec![],
         tp: None,
         parent: None,
-    }
+    };
+    blob.stamp_roles();
+    blob
 }
 
 #[test]
@@ -387,6 +387,7 @@ fn fine_gated_prefill_selects_segment_pair_from_packet_topology() {
     prefill.t = 256;
     prefill.stream[0].flags |= packet::dev::SE_FINE;
     blob.progs.insert(0, prefill);
+    blob.stamp_roles();
     assert!(prefill_needs_segment_pair(&blob, None));
     blob.progs[0].stream[0].flags &= !packet::dev::SE_FINE;
     assert!(!prefill_needs_segment_pair(&blob, None));
@@ -695,7 +696,7 @@ fn qualified_full_logit_record(
 
 fn assert_program_computation_equal(actual: &DevProg, expected: &DevProg) {
     assert_eq!(actual.t, expected.t);
-    assert_eq!(actual.packed_prefill_only, expected.packed_prefill_only);
+    assert_eq!(actual.role, expected.role);
     assert_eq!(actual.n_counter, expected.n_counter);
     assert_eq!(actual.insts, expected.insts);
     assert_eq!(actual.l2_domains, expected.l2_domains);

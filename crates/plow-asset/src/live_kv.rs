@@ -53,7 +53,7 @@ pub fn program_digest(p: &Program<'_>) -> String {
     h.update(b"plow-live-kv-program-v1");
     for v in [
         p.rows,
-        p.packed_prefill_only as u32,
+        p.role.is_packed_sibling() as u32,
         p.n_counter,
         p.l2_domains,
     ] {
@@ -331,7 +331,7 @@ impl Manifest {
         for (pi, p) in packet.programs.iter().enumerate() {
             let prefill = pi < packet.prefill_count;
             require(
-                !p.packed_prefill_only && p.rows > 0 && p.rows <= self.max_ctx,
+                !p.role.is_packed_sibling() && p.rows > 0 && p.rows <= self.max_ctx,
                 "program row contract",
             )?;
             let mut reads = BTreeSet::new();

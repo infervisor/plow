@@ -65,9 +65,7 @@ fn fixture(rows: u32, splits: u32) -> (DevProg, Vec<DevTensor>) {
     (
         DevProg {
             t: rows,
-            packed_prefill_only: false,
-            token_batch_body: false,
-            decode_rung: false,
+            role: packet::devbuild::ProgramRole::PrefillBucket { rows: rows },
             n_counter: 0,
             insts,
             stream: stream.clone(),
@@ -197,7 +195,7 @@ fn rejects_unsupported_attention_operands_and_partial_extents() {
             14 => g.insts[3].op = DevOp::QwenGdnPrefill as u16,
             15 => tensors[5].bytes -= 1,
             16 => g.insts[3].t[0] = g.insts[3].t[1],
-            17 => g.packed_prefill_only = true,
+            17 => g.role = packet::devbuild::ProgramRole::PackedSibling { of_rows: g.t },
             _ => unreachable!(),
         }
         assert!(

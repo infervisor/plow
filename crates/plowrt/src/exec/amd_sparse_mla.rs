@@ -276,9 +276,7 @@ mod tests {
         };
         let prog = DevProg {
             t: 8192,
-            packed_prefill_only: false,
-            token_batch_body: false,
-            decode_rung: false,
+            role: packet::devbuild::ProgramRole::PrefillBucket { rows: 8192 },
             n_counter: 0,
             insts: vec![union, flash],
             stream: vec![StreamEnt {
@@ -336,15 +334,20 @@ mod tests {
         prog.insts[1].fj[1] = 9;
         prog.insts[1].t[7] = 9;
         for body in [false, true] {
-            prog.packed_prefill_only = !body;
-            prog.token_batch_body = body;
+            prog.role = if body {
+                packet::devbuild::ProgramRole::TokenBatchBody {
+                    band: 8,
+                    rows: prog.t,
+                }
+            } else {
+                packet::devbuild::ProgramRole::PackedSibling { of_rows: prog.t }
+            };
             let route = routes(&prog, &tensors, 2).unwrap()[1].unwrap();
             assert_eq!((route.index, route.scale), (8, Some(9)));
         }
-        prog.packed_prefill_only = false;
-        prog.token_batch_body = false;
+        prog.role = packet::devbuild::ProgramRole::PrefillBucket { rows: prog.t };
         assert!(routes(&prog, &tensors, 2).is_err(), "ordinary programs keep the union");
-        prog.packed_prefill_only = true;
+        prog.role = packet::devbuild::ProgramRole::PackedSibling { of_rows: prog.t };
         prog.insts[0].i[1] = 65536;
         assert!(routes(&prog, &tensors, 2).is_err(), "ctx must agree");
         prog.insts[0].i[1] = 81920;
@@ -469,7 +472,7 @@ pub(super) fn routes(
             }
             producer.t[2]
         } else {
-            if !(prog.packed_prefill_only || prog.token_batch_body)
+            if !(prog.role.is_packed_sibling() || prog.role.is_token_batch_body())
                 || producer.i[..3] != [prog.t, inst.i[2], 2048]
                 || producer.t[5] != inst.t[6]
             {
@@ -1233,9 +1236,7 @@ mod decode_tests {
         };
         let prog = DevProg {
             t: rows,
-            packed_prefill_only: false,
-            token_batch_body: false,
-            decode_rung: false,
+            role: packet::devbuild::ProgramRole::PrefillBucket { rows: rows },
             n_counter: 0,
             insts: vec![
                 DevInst64 {

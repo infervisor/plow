@@ -1967,14 +1967,13 @@ fn check_seq_par_seams(blob: &DevBlob, n_gpu: u32) -> Result<u64> {
             .iter()
             .any(|d| d.op == DevOp::XReduceScatter as u16 || d.op == DevOp::XAllGather as u16)
     };
-    let dec_lo = blob.decode_rung_lo();
     let mut any = false;
     for (pi, p) in blob.progs.iter().enumerate() {
         if !carries(p) {
             continue;
         }
         any = true;
-        if pi >= dec_lo {
+        if p.role.is_decode_rung() {
             return Err(RuntimeError::Device(format!(
                 "program {pi} (T={}) is a decode rung but carries sequence-parallel seam \
                  collectives (XReduceScatter/XAllGather); those are prefill-only",
@@ -2318,9 +2317,7 @@ mod tests {
         };
         let prog = |insts: Vec<DevInst64>| DevProg {
             t: 1,
-            packed_prefill_only: false,
-            token_batch_body: false,
-            decode_rung: false,
+            role: packet::devbuild::ProgramRole::DecodeRung { rows: 1 },
             n_counter: 0,
             insts,
             stream: Vec::new(),

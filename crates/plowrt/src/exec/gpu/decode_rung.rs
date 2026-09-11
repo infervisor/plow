@@ -114,8 +114,8 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool) -> Result<bool> 
     if programs[0].t == 0 || programs.windows(2).any(|w| w[0].t >= w[1].t) {
         return Err(reject("widths must increase strictly"));
     }
-    for g in programs {
-        if g.packed_prefill_only
+    for g in &programs {
+        if g.role.is_packed_sibling()
             || g.insts.is_empty()
             || g.gq_stream.is_empty()
             || g.gq_seg_ofs.len() < 2

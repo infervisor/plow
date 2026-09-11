@@ -140,6 +140,125 @@ and the ladder's gap between 2048 and 8192 is where that tail falls.
 
 ---
 
+## What phase 1 actually landed
+
+### The role type
+
+`packet::devbuild::ProgramRole`, `Copy`, four variants, mutually exclusive by construction — the
+property the two booleans (`packed_prefill_only`, `token_batch_body`) did not have:
+
+```rust
+pub enum ProgramRole {
+    PrefillBucket { rows: u32 },
+    DecodeRung    { rows: u32 },
+    PackedSibling { of_rows: u32 },
+    TokenBatchBody{ band: u32, rows: u32 },
+}
+```
+
+plus `rows()`, `kind()`, `is_prefill_bucket()`, `is_decode_rung()`, `is_packed_sibling()`,
+`is_token_batch_body()`, `token_batch_band()` and `is_prefill_side()` (= not a decode rung: the
+programs the old `[0, dec_lo)` slice held).
+
+It replaces the two booleans on **`plow_asset::program::Program`** and on
+**`plowrt::asset::devblob::DevProg`**, is carried through to `exec::amd::AmdProg`, and is what
+`plow_asset::extension` re-exports — **one type, not two.** The phase-2 adapters
+(`extension::ProgramRole`, `RoleBits`, `roles_from_positional`, `roles_from_flags`) that stood in
+while this phase was in flight are gone; the merge rules only ever saw `&[ProgramRole]`, so they
+did not change.
+
+### Where it is derived
+
+`packet::devbuild::derive_roles(prog_t, source, band)` is the **only** place a program table
+becomes roles. It takes the ENCODED `t` words — row count plus the `PACKED_PREFILL_PROG` /
+`TOKEN_BATCH_PROG` / `DECODE_RUNG_PROG` markers — so the emit side
+(`plow_asset::program::with_model`) and the load side (`DevBlob::parse`) apply one rule to one
+input. `DevBlob::parse` stamps every `DevProg::role` once, immediately after the program table is
+read; nothing downstream re-derives a phase boundary, and `DevBlob::program_roles()` is now a
+`map` over the stamped field.
+
+### The two role sources, and what is on the wire
+
+Three of the four roles are stated on the wire in either container. The fourth — bucket vs rung —
+is the pair with two answers, and `RoleSource` is which one applies:
+
+* **`Positional`** (a parent packet). The decode ladder is the trailing strictly-ascending run at
+  widths `<= DECODE_RUNG_MAX` that `decode_rung_lo` finds, and a marker-bearing program is a wall
+  the backward scan cannot cross.
+* **`Stated`** (an extension). A lone program is `prog_t.len() - 1`, so the positional rule would
+  read every extension's single program as a decode rung and refuse a 4096-row prefill bucket as a
+  rung outside the decode band. An extension marks its rungs with `DECODE_RUNG_PROG`; unmarked
+  means prefill bucket.
+
+The container's magic picks the source, in `DevBlob::parse_inner` and nowhere else. A stated bit
+wins under either source, so `Positional` is a **fallback, not an override**: the day the emitter
+marks a parent's rungs too, `derive_roles` does not change.
+
+**A parent's wire output is unchanged, byte for byte.** `PlowProgHeader` is fixed at 24 bytes and
+mirrored by `runtime/common/dev_blob.h`, and the C harnesses in `runtime/tests/` read `h.t` raw
+and compare it against 1 — so a parent sets no new bit, and `/tmp/tp-glm53-prefix-keys/assets/model.pkt`
+loads with buckets `[128, 512, 2048, 8192]` and rungs `[1, 2, 4, 8, 16, 20]`, identical to what
+the positional code produced. `DECODE_RUNG_PROG` is paid for only by a file that did not exist
+before.
+
+### Call sites converted
+
+| was | now |
+|---|---|
+| `AmdEngine::dec_lo` (index boundary) | `decode_ladder: Vec<usize>` and `prefill_ladder: Vec<usize>`, role-filtered and **width-sorted**, built once at load |
+| `AmdEngine::decode = progs.len() - 1` | the widest `DecodeRung` |
+| `prefill_rungs`, `decode_rungs`, `decode_prog_for`, `prefill_prog_t`, `prefill_prog_sparse`, `has_prefill` | filter by role / index the two ladders |
+| `plan_for_at_most`'s `(0..dec_lo)` bucket list, `chunk_steps`, `chunk_steps_from` | `prefill_rungs()` |
+| `packed_prefill_topology_index(prog, dec_lo, …)` | by role and width, over the whole table |
+| `token_batch_bodies`, `has_token_batch_bodies`, `token_batch_body_prepare`'s band check | `ProgramRole::TokenBatchBody`; the band is read once at load (`token_batch_band_of`) instead of rescanning the instruction stream per call |
+| 74 `blob.progs[..dec_ix]` / `blob.progs[dec_ix..]` object-phase slices | `DevBlob::prefill_phase()` / `decode_phase()`, one concrete `Filter` type so both unify in an `if` |
+| `validate_decode_dispatch`, `GateHierStatus::of`, `log_gate_hier_status`, `check_dsa_select_local`, `graph_phase_xreduce_segments{,_from_manifest}` | take the phase, or the role, instead of a `dec_ix` |
+| `amd_tp::check_seq_par_seams`'s `pi >= dec_lo` | `p.role.is_decode_rung()` |
+| `exec::amd::segment`, `mla_prefill`, `amd_index_tp`, `amd_sparse_mla`, `mixed_program`, `gpu::decode_rung`, `gpu::decode_context` | `role.is_packed_sibling()` / `is_token_batch_body()` |
+
+The per-phase object-requirement helpers (`required_gemv_m`, `first_op_in`, `required_kv_op`, …)
+now take `impl IntoIterator<Item = &DevProg>` rather than `&[DevProg]`, which is why no existing
+call site had to change shape.
+
+`DevBlob::prefill_progs()` deliberately keeps its old meaning — every prefill-side program in
+TABLE order — because CUDA call sites index it against the packet's own program numbering. The
+bucket ladder is `AmdEngine::prefill_rungs()`.
+
+### Still positional, on purpose
+
+* `plow_asset::program::Packet::prefill_count` and its two consumers (`live_kv`,
+  `hetero_channel`), and `fp8_m1_role`'s "decode is the last program".
+* The CUDA and CPU engines (`exec/gpu.rs`, `exec/gpu/decode_context.rs`, `exec/cpu/engine.rs`)
+  still take `decode_rung_lo()` as an index. They were checked and left alone: phase 1 must not
+  change CUDA behaviour, and `decode_rung_lo()` is now itself role-derived (it counts prefill-side
+  programs), so they move with the roles rather than against them.
+* `devgen`'s emit-side `decode_rung_lo(&m.prog_t)` in `manifest.rs`, `dispatch_audit.rs` and the
+  per-family role passes — the same rule `derive_roles` calls, on the same input.
+
+Ladder well-formedness is not enforced by phase 1: it is phase 2 rule 5, on the merged table, and
+phase 1 adds no refusal of its own that an already-qualified packet could trip.
+
+### The pin
+
+Two tests hold the refactor to "no behaviour change", each keeping the positional derivation as
+the oracle:
+
+* `packet::devbuild::v6_tests::roles_reproduce_the_positional_derivation` — every role, for every
+  ladder shape the emitter produces (with and without siblings and bodies).
+* `plowrt::asset::devblob::tests::role_derived_ladders_match_the_positional_ones` — both ladders,
+  the object-phase split, and `decode_prog_for` for **every** row count, against synthetic packets;
+  and `actual_packet_ladders_match_the_positional_ones`, the same assertions against a real
+  emitted packet (`TEST_ROLE_LADDER_PACKET=…/model.pkt`, with `PLOW_L2_PLACE_DISPATCH=1` for an
+  L2-placed one). Verified green on the frozen GLM-5.3 TP8 packets.
+
+The phase-2 suites hold the other direction: `plow_asset::extension` (38 tests) and
+`plowrt::asset::extension` (19) exercise the same `ProgramRole` through the six rules, including
+`the_two_role_sources_split_a_parent_and_an_extension_the_way_each_needs`, which asserts that the
+same `prog_t` read as a parent and as an extension gives the two different — and each correct —
+answers.
+
+---
+
 ## What phases 2 and 3 actually landed
 
 Branch `packet-extensions`. Container, contract and the object rule; no emitter, no reporting.
@@ -299,12 +418,10 @@ behaves exactly as before.
 
 ### Not done here
 
-Phase 1 (`ProgramRole` on `plow_asset::program::Program`) had not landed, so roles are derived
-behind an adapter: `roles_from_positional` reproduces today's `decode_rung_lo` + two-boolean
-split for a parent, `roles_from_flags` reads an extension's stated bits. When phase 1 lands,
-both collapse into reading `p.role`; the rules only ever see `&[ProgramRole]` and do not change.
-`ProgramRole` is defined in `plow_asset::extension` with the design's exact spelling, and moves
-to `program.rs` with phase 1.
+*(Since merged with phase 1: the two adapters and the second `ProgramRole` are gone, replaced by
+`packet::devbuild::derive_roles` under a `RoleSource`, which `plow_asset::extension` re-exports.
+The rules only ever saw `&[ProgramRole]` and did not change — see "What phase 1 actually landed"
+above.)*
 
 Rule 6's `workspace_bytes` is the parent's `weights.json` arena high-water mark; an extension's
 own workspace demand is `0` until `plowc extend` writes a `BucketStat` for the programs it

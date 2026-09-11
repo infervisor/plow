@@ -54,9 +54,9 @@ fn check_norm_weight_offset(be: &CudaBackend, module: &Module, blob: &DevBlob) -
     Ok(())
 }
 
-fn dsa_decode_batch_required(progs: &[DevProg]) -> bool {
+fn dsa_decode_batch_required<'a>(progs: impl IntoIterator<Item = &'a DevProg>) -> bool {
     progs
-        .iter()
+        .into_iter()
         .flat_map(|p| &p.insts)
         .any(|d| d.op == DevOp::IndexSelect as u16 && d.i[3] != 0)
 }
@@ -558,7 +558,7 @@ impl SegmentRoleValidation for SegmentRoles {
             .progs
             .iter()
             .enumerate()
-            .filter(|(_, g)| blob.prefill_progs().iter().any(|p| std::ptr::eq(p, *g)))
+            .filter(|(_, g)| g.role.is_prefill_side())
             .map(|(i, _)| i)
             .collect();
         value.validate(&blob.progs, &indices, &blob.tensors)?;
@@ -1070,7 +1070,7 @@ fn packet_role_segments(
         || roles
             .iter()
             .any(|&role| role > plow_asset::segment_roles::MAX_ROLE)
-        || (g.packed_prefill_only
+        || (g.role.is_packed_sibling()
             && roles.iter().any(|&role| {
                 matches!(
                     role,
@@ -3035,7 +3035,7 @@ impl GpuEngine {
             }
         };
         check_dsa_decode_batch_arm(
-            dsa_decode_batch_required(blob.decode_progs()),
+            dsa_decode_batch_required(blob.decode_phase()),
             be.module_global_u32(&module, "plow_dsa_decode_batch_arm")?,
         )?;
         let bound_objects = decode_objects

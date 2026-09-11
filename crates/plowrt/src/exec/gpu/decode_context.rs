@@ -226,7 +226,10 @@ fn auxiliary_program(
         .get(band.program.index)
         .ok_or_else(|| reject("auxiliary program index outside packet"))?;
     require(
-        a.t == band.rows && b.t == band.rows && !a.packed_prefill_only && !b.packed_prefill_only,
+        a.t == band.rows
+            && b.t == band.rows
+            && !a.role.is_packed_sibling()
+            && !b.role.is_packed_sibling(),
         "context program physical rows differ",
     )?;
     require(

@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use packet::dev::{DevInst64, DevOp, DevProgram, PrefillSpan, SE_XCTR};
-use packet::devbuild::{lean_attn_res_f32mix_inst64, static_seg_ofs};
+use packet::devbuild::{lean_attn_res_f32mix_inst64, static_seg_ofs, ProgramRole};
 use serde::Serialize;
 
 use super::kv_layout::kv_tensor_name;
@@ -468,8 +468,12 @@ fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
     Ok(kinds)
 }
 
-fn validate_decode_dispatch(progs: &[DevProg], dec_ix: usize) -> Result<()> {
-    for (rung, prog) in progs[dec_ix..].iter().enumerate() {
+/// `progs` is the DECODE LADDER as `(program index, program)` — the caller filters by role,
+/// so this never re-derives a phase boundary of its own.
+fn validate_decode_dispatch<'a>(
+    progs: impl IntoIterator<Item = (usize, &'a DevProg)>,
+) -> Result<()> {
+    for (rung, (index, prog)) in progs.into_iter().enumerate() {
         let kinds = decode_segment_kinds(prog)?;
         let n_segments = kinds.len();
         let dispatch = ProgramDispatch::classify(
@@ -484,7 +488,7 @@ fn validate_decode_dispatch(progs: &[DevProg], dec_ix: usize) -> Result<()> {
         {
             return Err(RuntimeError::Device(format!(
                 "decode program {} (rung {rung}, t={}) mixes raw kernels and interpreter segments                  with L2-domain placement; raw boundaries require ordered wave segments",
-                dec_ix + rung,
+                index,
                 prog.t,
             )));
         }
@@ -496,7 +500,7 @@ fn validate_decode_dispatch(progs: &[DevProg], dec_ix: usize) -> Result<()> {
         {
             return Err(RuntimeError::Device(format!(
                 "decode program {} (rung {rung}, t={}) has {n_segments} wave segments but no                  standalone raw boundary; ordinary AMD decode remains single-launch",
-                dec_ix + rung,
+                index,
                 prog.t
             )));
         }
@@ -1483,7 +1487,9 @@ fn kda_key_factor_segment_pairs(prog: &DevProg) -> Vec<(usize, usize, usize, usi
         .collect()
 }
 
-fn kda_key_factor_scratch_half_bytes(progs: &[DevProg]) -> Result<u64> {
+fn kda_key_factor_scratch_half_bytes<'a>(
+    progs: impl IntoIterator<Item = &'a DevProg>,
+) -> Result<u64> {
     let mut max_half = 0u64;
     for prog in progs {
         for (_, _, wu, _) in kda_key_factor_segment_pairs(prog) {
@@ -1792,7 +1798,7 @@ fn kda_wu_lean_grid(t: u32, heads: u32) -> u32 {
 }
 
 /// Widest `[T][H][D]` bf16 half of the reusable key-factor scratch pair the keyfeed Wu writes.
-fn kda_keyfeed_scratch_half_bytes(progs: &[DevProg]) -> Result<u64> {
+fn kda_keyfeed_scratch_half_bytes<'a>(progs: impl IntoIterator<Item = &'a DevProg>) -> Result<u64> {
     let mut max_half = 0u64;
     for prog in progs {
         for d in &prog.insts {
@@ -1976,8 +1982,8 @@ fn has_moe_stage1_mxfp4_segment(prog: &DevProg) -> bool {
         .any(|set| set.len() == 1 && moe_stage1_mxfp4_inst(&prog.insts[*set.first().unwrap()]))
 }
 
-fn moe_stage1_a4_scratch_bytes(
-    progs: &[DevProg],
+fn moe_stage1_a4_scratch_bytes<'a>(
+    progs: impl IntoIterator<Item = &'a DevProg>,
     tensors: &[crate::asset::devblob::DevTensor],
 ) -> Result<(u64, u64)> {
     let mut payload = 0u64;
@@ -2034,14 +2040,14 @@ fn has_moe_prefill_ep(prog: &DevProg) -> bool {
     prog.insts.iter().any(|d| moe_ep_degree(d).is_some())
 }
 
-fn moe_prefill_ep_extra_bytes(
-    progs: &[DevProg],
+fn moe_prefill_ep_extra_bytes<'a>(
+    progs: impl IntoIterator<Item = &'a DevProg>,
     tensors: &[crate::asset::devblob::DevTensor],
     n_gpu: u32,
 ) -> Result<u64> {
     let mut tables = BTreeSet::new();
     let mut total = 0u64;
-    for d in progs.iter().flat_map(|p| &p.insts) {
+    for d in progs.into_iter().flat_map(|p| &p.insts) {
         if !moe_ep_stage1_inst(d) || !tables.insert(d.t[2]) {
             continue;
         }
@@ -3139,7 +3145,7 @@ fn derive_packed_segment_families(prog: &DevProg) -> Result<Vec<u8>> {
             || op == DevOp::KdaChunkCarry as u16
         {
             Some(7)
-        } else if prog.token_batch_body
+        } else if prog.role.is_token_batch_body()
             && (op == DevOp::FlashMlaDecode as u16
                 || op == DevOp::FlashMlaDecodeFp8 as u16
                 || op == DevOp::FlashGatherDecode as u16
@@ -5406,20 +5412,26 @@ fn packed_segment_route(
     Ok(route)
 }
 
+/// Resolve a prefill program to the PACKED topology that serves it: itself when it already is
+/// a packed sibling, else the sibling of the same width, else itself (a legacy single-topology
+/// blob). A decode rung has no packed form and answers `None`.
+///
+/// The search is by ROLE and WIDTH, so it does not care where the sibling sits in the table.
 fn packed_prefill_topology_index(
     requested: usize,
-    dec_lo: usize,
-    mut role: impl FnMut(usize) -> Option<(u32, bool)>,
+    n_prog: usize,
+    role: impl Fn(usize) -> Option<ProgramRole>,
 ) -> Option<usize> {
-    if requested >= dec_lo {
+    let requested_role = role(requested)?;
+    if requested_role.is_decode_rung() {
         return None;
     }
-    let (rows, packed_only) = role(requested)?;
-    if packed_only {
+    if requested_role.is_packed_sibling() {
         return Some(requested);
     }
-    (0..dec_lo)
-        .find(|&candidate| role(candidate) == Some((rows, true)))
+    let rows = requested_role.rows();
+    (0..n_prog)
+        .find(|&candidate| role(candidate) == Some(ProgramRole::PackedSibling { of_rows: rows }))
         .or(Some(requested))
 }
 
@@ -5484,8 +5496,8 @@ impl CounterBankState {
 /// One program's device-resident tables.
 struct AmdProg {
     t: u32,
-    packed_prefill_only: bool,
-    token_batch_body: bool,
+    /// What this program is FOR (`packet::devbuild::ProgramRole`), copied from the blob.
+    role: packet::devbuild::ProgramRole,
     /// Runs the gathered (DSA) attention arm — indexer plus sparse flash — whose cost is set by
     /// the selection width, not the prior context. Decides long-context tail placement, and a
     /// span packed onto it needs `kv_row0 >= amd_sparse_mla::SPAN_MIN_PRIOR` (fixed-width CSR).
@@ -5585,15 +5597,17 @@ pub struct AmdEngine {
     arch: String,
     n_cu: u32,
     progs: Vec<AmdProg>,
-    /// Index of the WIDEST decode program — always last (`n_prog - 1`).
+    /// Index of the WIDEST decode rung.
     decode: usize,
-    /// Index of the FIRST decode program: the bottom of the DECODE BATCH LADDER
-    /// (`PLOW_DECODE_BATCH_LADDER`). Without a ladder this equals [`Self::decode`], so
-    /// `dec_lo..=decode` is a one-element range and every path is what it was.
-    ///
-    /// Programs `[0, dec_lo)` are the prefill bucket ladder; `[dec_lo, n_prog)` are decode
-    /// rungs at ascending sequence widths, all sharing ONE tensor table sized at the widest.
-    dec_lo: usize,
+    /// THE DECODE BATCH LADDER (`PLOW_DECODE_BATCH_LADDER`): the program index of every
+    /// [`packet::devbuild::ProgramRole::DecodeRung`], ascending by width, all sharing ONE
+    /// tensor table sized at the widest. One entry without a ladder.
+    decode_ladder: Vec<usize>,
+    /// THE PREFILL BUCKET LADDER: the program index of every
+    /// [`packet::devbuild::ProgramRole::PrefillBucket`], ascending by width. Packed siblings
+    /// and token-batch bodies are prefill-WIDTH programs but are not rungs, so they are not
+    /// here; they are reached by role from the bucket they serve.
+    prefill_ladder: Vec<usize>,
     devp: Vec<DeviceMem>,
     /// Owner of the one allocation the ordinarily-allocated tensors are carved
     /// out of; `devp` then holds **views** into it. Unlike the CUDA side, this
@@ -6100,26 +6114,27 @@ impl AmdEngine {
         // objects, which correctly do not carry it (the axis is scoped to the decode rows because
         // a set-wide define deadlocks -- see scripts/build_gfx942.sh).
         //
-        // WHICH PROGRAMS ARE DECODE. Everything from `dec_ix` on is a decode rung of the
-        // DECODE BATCH LADDER (`PLOW_DECODE_BATCH_LADDER`); everything before it is a prefill
-        // bucket. Without a ladder this is `progs.len() - 1` and the split is the one every
-        // caller has always used.
-        let dec_ix = {
-            let pt: Vec<u32> = blob.progs.iter().map(|p| p.t).collect();
-            packet::devbuild::decode_rung_lo(&pt)
-        };
-        validate_decode_dispatch(&blob.progs, dec_ix)?;
-        let max_decode_batch = blob.progs[dec_ix..].iter().map(|p| p.t).max().unwrap_or(1);
+        // WHICH PROGRAMS ARE DECODE. Every program whose ROLE is a decode rung
+        // (`packet::devbuild::ProgramRole`, stamped once at blob load); everything else is
+        // prefill-side. This used to be the index boundary `decode_rung_lo`, which a merged
+        // program table cannot carry (`docs/arch/19-packet-extensions.md`).
+        validate_decode_dispatch(
+            blob.progs
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.role.is_decode_rung()),
+        )?;
+        let max_decode_batch = blob.decode_phase().map(|p| p.t).max().unwrap_or(1);
 
         // THIS USED TO ASK `p.t == 1` / `p.t > 1`, WHICH IS A BUG A BATCHED BLOB ALREADY HAD.
         // A decode program emitted at `PLOW_DECODE_BATCH=16` has `t == 16`, so it counted as a
         // PREFILL program: its (correct, default-on) L2 placement was attributed to the prefill
         // object, which is not built with the axis, and every batched gfx942 blob was refused
         // at load unless it was re-emitted with PLOW_L2_PLACE=0 — giving up the -12% placement
-        // win to work around a misclassification. Splitting at `dec_ix` asks each object about
+        // win to work around a misclassification. Splitting by ROLE asks each object about
         // the programs it will actually be handed.
-        let decode_l2_placed = blob.progs[dec_ix..].iter().any(|p| p.l2_domains > 0);
-        let prefill_l2_placed = blob.progs[..dec_ix].iter().any(|p| p.l2_domains > 0);
+        let decode_l2_placed = blob.decode_phase().any(|p| p.l2_domains > 0);
+        let prefill_l2_placed = blob.prefill_phase().any(|p| p.l2_domains > 0);
 
         // The blob's n_cu is the grid the schedule was COMPILED for. A device
         // with a different CU count cannot run it: `stream_ofs`/`stream_len` are
@@ -6263,32 +6278,32 @@ impl AmdEngine {
         // independently: prefill and flash take `op_gemm.h`'s default MM=1 and
         // legitimately serve the M=1 lm_head GEMV, and folding a batched decode's
         // M into their requirement would refuse them for work they never do.
-        // `dec_ix` (defined above) is the split, NOT `progs.len() - 1`: with a DECODE BATCH
+        // The ROLE is the split, NOT `progs.len() - 1`: with a DECODE BATCH
         // LADDER the last four programs are also decode, and putting them in the prefill half
         // asks the prefill object to cover a batched decode's GEMV — which it legitimately was
         // not built for, so a laddered blob refused itself at load with "widest GEMV asks for
         // M=8 ... interp_prefill_fp8_gq.elf was compiled PLOW_GEMV_MM=1". Loudly, which is the
         // guard working; the other shape of that mistake is rows 1..7 left STALE with no fault.
-        let need_m_decode = required_gemv_m(&blob.progs[dec_ix..]);
-        let need_m_prefill = required_gemv_m(&blob.progs[..dec_ix]);
+        let need_m_decode = required_gemv_m(blob.decode_phase());
+        let need_m_prefill = required_gemv_m(blob.prefill_phase());
         // Split the same way as the GEMV bucket, and for the same reason: the K3/KDA arms are in
         // BOTH buckets (a K3 layer runs the same graph at T=1 and T>1), so each object has to be
         // asked about the phase it actually serves rather than about the blob as a whole.
-        let need_k3_decode = required_k3_op(&blob.progs[dec_ix..]);
-        let need_k3_prefill = required_k3_op(&blob.progs[..dec_ix]);
-        let need_qwen_decode = required_qwen_gdn_op(&blob.progs[dec_ix..]);
-        let need_qwen_prefill = required_qwen_gdn_op(&blob.progs[..dec_ix]);
-        let need_kda_chunk_decode = required_kda_chunk(&blob.progs[dec_ix..]);
-        let need_kda_chunk_prefill = required_kda_chunk(&blob.progs[..dec_ix]);
-        let need_kda_decode_fused = first_op_in(&blob.progs[dec_ix..], &[DevOp::KdaDecodeFused]);
-        let need_decode_mla_segments = blob.progs[dec_ix..].iter().try_fold(false, |need, p| {
+        let need_k3_decode = required_k3_op(blob.decode_phase());
+        let need_k3_prefill = required_k3_op(blob.prefill_phase());
+        let need_qwen_decode = required_qwen_gdn_op(blob.decode_phase());
+        let need_qwen_prefill = required_qwen_gdn_op(blob.prefill_phase());
+        let need_kda_chunk_decode = required_kda_chunk(blob.decode_phase());
+        let need_kda_chunk_prefill = required_kda_chunk(blob.prefill_phase());
+        let need_kda_decode_fused = first_op_in(blob.decode_phase(), &[DevOp::KdaDecodeFused]);
+        let need_decode_mla_segments = blob.decode_phase().try_fold(false, |need, p| {
             Ok::<_, RuntimeError>(
                 need || decode_segment_kinds(p)?
                     .iter()
                     .any(|kind| matches!(kind, DecodeSegmentKind::MlaAttention)),
             )
         })?;
-        let need_grouped_moe = blob.progs[dec_ix..].iter().try_fold(false, |need, p| {
+        let need_grouped_moe = blob.decode_phase().try_fold(false, |need, p| {
             Ok::<_, RuntimeError>(
                 need || decode_segment_kinds(p)?
                     .iter()
@@ -6298,12 +6313,11 @@ impl AmdEngine {
         let graph_phase_segments = graph_phase_xreduce_segments(
             blob_path,
             &blob.progs,
-            dec_ix,
             crate::config::RuntimeConfig::get().amd.phase_objects,
         )?;
         let need_graph_phase_xreduce = graph_phase_segments.iter().any(|s| !s.is_empty());
         let need_xreduce_wave_rs = need_graph_phase_xreduce
-            || blob.progs[..dec_ix].iter().any(|p| {
+            || blob.prefill_phase().any(|p| {
                 p.stream
                     .iter()
                     .any(|e| e.flags & packet::dev::SE_XR_WAVE_RS != 0)
@@ -6314,11 +6328,11 @@ impl AmdEngine {
                     && p.insts.get(e.inst as usize).map(|d| d.op) == Some(op as u16)
             })
         };
-        let need_kda_intra_wave_items = blob.progs[..dec_ix]
-            .iter()
+        let need_kda_intra_wave_items = blob
+            .prefill_phase()
             .any(|p| marked_op(p, DevOp::KdaChunkIntra));
-        let need_kda_carry_regstate = blob.progs[..dec_ix]
-            .iter()
+        let need_kda_carry_regstate = blob
+            .prefill_phase()
             .any(|p| marked_op(p, DevOp::KdaChunkCarry));
         let marked_wu = |p: &DevProg, keys: bool| {
             p.stream.iter().any(|e| {
@@ -6328,10 +6342,10 @@ impl AmdEngine {
                         .is_some_and(|d| d.op == DevOp::KdaChunkWu as u16 && (d.i[5] == 1) == keys)
             })
         };
-        let need_kda_wu_lean = blob.progs[..dec_ix].iter().any(|p| marked_wu(p, false));
-        let need_kda_carry_keyfeed = blob.progs[..dec_ix].iter().any(|p| marked_wu(p, true));
-        if let Some(p) = blob.progs[..dec_ix]
-            .iter()
+        let need_kda_wu_lean = blob.prefill_phase().any(|p| marked_wu(p, false));
+        let need_kda_carry_keyfeed = blob.prefill_phase().any(|p| marked_wu(p, true));
+        if let Some(p) = blob
+            .prefill_phase()
             .find(|p| p.insts.iter().any(|i| i.op == DevOp::KdaDecodeFused as u16))
         {
             return Err(RuntimeError::Device(format!(
@@ -6339,12 +6353,12 @@ impl AmdEngine {
                 p.t
             )));
         }
-        let need_a4w4_decode = required_moe_pf_a4w4(&blob.progs[dec_ix..]);
-        let need_moe_pf_atomic_decode = required_moe_pf_accum(&blob.progs[dec_ix..], 4);
-        let need_moe_pf_det_decode = required_moe_pf_accum(&blob.progs[dec_ix..], 5);
-        let need_kda_conv_step_db = required_kda_conv_step_db(&blob.progs[dec_ix..]);
-        let legacy_kda_decode = first_op_in(&blob.progs[dec_ix..], KDA_CONV_STEP_DB_REPLACED_OPS);
-        if let Some(p) = blob.progs[..dec_ix].iter().find(|p| {
+        let need_a4w4_decode = required_moe_pf_a4w4(blob.decode_phase());
+        let need_moe_pf_atomic_decode = required_moe_pf_accum(blob.decode_phase(), 4);
+        let need_moe_pf_det_decode = required_moe_pf_accum(blob.decode_phase(), 5);
+        let need_kda_conv_step_db = required_kda_conv_step_db(blob.decode_phase());
+        let legacy_kda_decode = first_op_in(blob.decode_phase(), KDA_CONV_STEP_DB_REPLACED_OPS);
+        if let Some(p) = blob.prefill_phase().find(|p| {
             p.insts
                 .iter()
                 .any(|i| i.op == DevOp::KdaConvStateStepG as u16)
@@ -6354,7 +6368,7 @@ impl AmdEngine {
                 p.t
             )));
         }
-        if let Some(p) = blob.progs[dec_ix..].iter().find(|p| {
+        if let Some(p) = blob.decode_phase().find(|p| {
             p.t != 1
                 && p.insts
                     .iter()
@@ -6366,48 +6380,44 @@ impl AmdEngine {
             )));
         }
         // Gemma-4 MoE, both halves, per phase. Same silent-NOP argument as K3 above.
-        let need_gm_decode = first_op_in(&blob.progs[dec_ix..], MOE_GEMMA_OPS);
-        let need_gm_prefill = first_op_in(&blob.progs[..dec_ix], MOE_GEMMA_OPS);
-        let need_gmpf_decode = first_op_in(&blob.progs[dec_ix..], MOE_GEMMA_PF_OPS);
-        let need_gmpf_prefill = first_op_in(&blob.progs[..dec_ix], MOE_GEMMA_PF_OPS);
+        let need_gm_decode = first_op_in(blob.decode_phase(), MOE_GEMMA_OPS);
+        let need_gm_prefill = first_op_in(blob.prefill_phase(), MOE_GEMMA_OPS);
+        let need_gmpf_decode = first_op_in(blob.decode_phase(), MOE_GEMMA_PF_OPS);
+        let need_gmpf_prefill = first_op_in(blob.prefill_phase(), MOE_GEMMA_PF_OPS);
         // The KV-encoding SWAP, split per phase for the same reason: the decode object carries
         // FLASH_*_DECODE and the prefill object FLASH_*_PREFILL, so asking each about the blob as
         // a whole would refuse a decode object for a prefill opcode it never runs.
-        let need_fp8kv_decode = required_kv_op(&blob.progs[dec_ix..], FP8_KV_OPS);
-        let need_fp8kv_prefill = required_kv_op(&blob.progs[..dec_ix], FP8_KV_OPS);
-        let need_bf16kv_decode = required_kv_op(&blob.progs[dec_ix..], BF16_KV_OPS);
-        let need_bf16kv_prefill = required_kv_op(&blob.progs[..dec_ix], BF16_KV_OPS);
+        let need_fp8kv_decode = required_kv_op(blob.decode_phase(), FP8_KV_OPS);
+        let need_fp8kv_prefill = required_kv_op(blob.prefill_phase(), FP8_KV_OPS);
+        let need_bf16kv_decode = required_kv_op(blob.decode_phase(), BF16_KV_OPS);
+        let need_bf16kv_prefill = required_kv_op(blob.prefill_phase(), BF16_KV_OPS);
         // The fp8 WEIGHT axis, per phase for the same reason; the flash object dispatches
         // none of these arms.
-        let need_fp8w_decode = first_op_in(&blob.progs[dec_ix..], FP8_WEIGHT_OPS);
-        let need_fp8w_prefill = first_op_in(&blob.progs[..dec_ix], FP8_WEIGHT_OPS);
+        let need_fp8w_decode = first_op_in(blob.decode_phase(), FP8_WEIGHT_OPS);
+        let need_fp8w_prefill = first_op_in(blob.prefill_phase(), FP8_WEIGHT_OPS);
         // Will derive_segments route any FlashMlaPrefill segment to the flash object?
         // Then that object MUST carry the V2 arm — the dispatch default is a silent skip.
         let need_mla_v2 = mla_pf_v2_enabled()
-            && blob.progs[..dec_ix].iter().any(|p| {
+            && blob.prefill_phase().any(|p| {
                 p.t >= 2048
                     && p.insts
                         .iter()
                         .any(|i| i.op == DevOp::FlashMlaPrefill as u16)
             });
         let need_mla_v2_fp8 = mla_pf_v2_enabled()
-            && blob.progs[..dec_ix].iter().any(|p| {
+            && blob.prefill_phase().any(|p| {
                 p.t >= 2048
                     && p.insts
                         .iter()
                         .any(|i| i.op == DevOp::FlashMlaPrefillFp8 as u16)
             });
-        let need_moe_stage2_lean = blob.progs[..dec_ix]
-            .iter()
-            .any(has_moe_stage2_mxfp4_segment);
-        let need_moe_ep = blob.progs[..dec_ix].iter().any(has_moe_prefill_ep);
-        let need_moe_stage1_lean = need_moe_ep
-            || blob.progs[..dec_ix]
-                .iter()
-                .any(has_moe_stage1_mxfp4_segment);
-        let need_moe_combine_lean = blob.progs[..dec_ix].iter().any(has_moe_combine_segment);
-        let need_attn_res_f32mix = blob.progs[..dec_ix]
-            .iter()
+        let need_moe_stage2_lean = blob.prefill_phase().any(has_moe_stage2_mxfp4_segment);
+        let need_moe_ep = blob.prefill_phase().any(has_moe_prefill_ep);
+        let need_moe_stage1_lean =
+            need_moe_ep || blob.prefill_phase().any(has_moe_stage1_mxfp4_segment);
+        let need_moe_combine_lean = blob.prefill_phase().any(has_moe_combine_segment);
+        let need_attn_res_f32mix = blob
+            .prefill_phase()
             .any(|p| p.insts.iter().any(lean_attn_res_f32mix_inst64));
         if need_moe_ep {
             if arch != "gfx950" {
@@ -6420,8 +6430,8 @@ impl AmdEngine {
                     "replicated-input MoE EP packet requires a tensor-parallel binding".into(),
                 )
             })?;
-            if blob.progs[..dec_ix]
-                .iter()
+            if blob
+                .prefill_phase()
                 .flat_map(|p| &p.insts)
                 .filter_map(moe_ep_degree)
                 .any(|degree| degree != bind.n_gpu)
@@ -6432,7 +6442,7 @@ impl AmdEngine {
                 )));
             }
             let extra =
-                moe_prefill_ep_extra_bytes(&blob.progs[..dec_ix], &blob.tensors, bind.n_gpu)?;
+                moe_prefill_ep_extra_bytes(blob.prefill_phase(), &blob.tensors, bind.n_gpu)?;
             let allowed = crate::config::RuntimeConfig::get()
                 .amd
                 .moe_prefill_ep_max_extra_bytes
@@ -6449,7 +6459,7 @@ impl AmdEngine {
                 "accepted decode-safe MoE EP companion-weight budget"
             );
         }
-        let need_mla_materialized = blob.progs[..dec_ix].iter().any(|p| {
+        let need_mla_materialized = blob.prefill_phase().any(|p| {
             p.insts.iter().any(|d| {
                 d.op == DevOp::MlaMaterializePack as u16
                     || d.op == DevOp::FlashMlaMaterializedPrefill as u16
@@ -6464,7 +6474,7 @@ impl AmdEngine {
         let use_mla_fold = blob.progs.iter().any(has_mla_fold);
         if use_mla_fold
             && (arch != "gfx942" || tp.is_none_or(|t| t.n_gpu != 8)
-                || blob.progs[dec_ix..].iter().any(has_mla_fold))
+                || blob.decode_phase().any(has_mla_fold))
         {
             return Err(RuntimeError::Device(
                 "native MLA fold requires gfx942 TP8 prefill".into(),
@@ -6475,9 +6485,10 @@ impl AmdEngine {
         if use_gemm_lt
             && (arch != "gfx942"
                 || tp.is_none_or(|b| b.n_gpu != 8)
-                || blob.progs.iter().enumerate().any(|(ix, p)| {
+                || blob.progs.iter().any(|p| {
                     p.insts.iter().any(|d| {
-                        d.op == DevOp::GemmLtPf as u16 && d.i[3] != u32::from(ix >= dec_ix)
+                        d.op == DevOp::GemmLtPf as u16
+                            && d.i[3] != u32::from(p.role.is_decode_rung())
                     })
                 }))
         {
@@ -6491,7 +6502,7 @@ impl AmdEngine {
         if use_index_tp
             && (arch != "gfx942"
                 || tp.is_none_or(|b| b.n_gpu != 8)
-                || blob.progs[dec_ix..].iter().any(has_index_tp)
+                || blob.decode_phase().any(has_index_tp)
                 || !crate::device::Backend::peer(&*be).is_some_and(|p| p.peer_host_writable()))
         {
             return Err(RuntimeError::Device(
@@ -6508,15 +6519,15 @@ impl AmdEngine {
         }
         let use_sparse_mla = crate::config::RuntimeConfig::get().amd.mla_pf_aiter;
         check_sparse_fp8_packet(&blob.progs, &blob.tensors, &arch)?;
-        check_dsa_select_local(&blob.progs, &blob.tensors, dec_ix, &arch,
+        check_dsa_select_local(&blob.progs, &blob.tensors, &arch,
                                tp.is_some_and(|t| t.n_gpu == 8))?;
         if use_sparse_mla && arch != "gfx942" {
             return Err(RuntimeError::Device(
                 "sparse AITER MLA requires gfx942".into(),
             ));
         }
-        let need_xr_attnres = blob.progs[..dec_ix]
-            .iter()
+        let need_xr_attnres = blob
+            .prefill_phase()
             .any(|p| p.insts.iter().any(xreduce_attnres_inst));
 
         // --- code objects ---------------------------------------------------
@@ -6530,8 +6541,8 @@ impl AmdEngine {
         // Read once, here, so a broken manifest fails before any object is
         // loaded rather than between two of them.
         let requires = build_requires(blob_path)?;
-        let packet_decode_requires = packet_decode_arm_requirements(&blob.progs[dec_ix..]);
-        let packet_prefill_requires = packet_prefill_arm_requirements(&blob.progs[..dec_ix]);
+        let packet_decode_requires = packet_decode_arm_requirements(blob.decode_phase());
+        let packet_prefill_requires = packet_prefill_arm_requirements(blob.prefill_phase());
         let mut modules = Vec::new();
         let mut k_xaudit = None;
         let mut k_state_clear = None;
@@ -6657,7 +6668,7 @@ impl AmdEngine {
             let syms = elf_symbol_names(&image);
             if phase == Phase::Prefill {
                 prefill_moe_align_bm64 = syms.contains(&"plow_moe_align_bm64_1");
-                if blob.progs[..dec_ix].iter().any(has_moe_aiter) && !prefill_moe_align_bm64 {
+                if blob.prefill_phase().any(has_moe_aiter) && !prefill_moe_align_bm64 {
                     return Err(RuntimeError::Device(
                         "AITER MoE requires an MPF_BM=64 align object".into(),
                     ));
@@ -6785,11 +6796,11 @@ impl AmdEngine {
             }
             if phase == Phase::Decode {
                 check_xargmax_capacity(&syms, &path, gemv_need.unwrap_or(max_decode_batch))?;
-                check_dec_stage_capacity(&image, &path, &blob.progs[dec_ix..])?;
-                check_dsa_decode_batch(&syms, &path, &blob.progs[dec_ix..], arch == "gfx942")?;
-                check_sparse_fp8_object(&syms, &path, &blob.progs[dec_ix..], true)?;
+                check_dec_stage_capacity(&image, &path, blob.decode_phase())?;
+                check_dsa_decode_batch(&syms, &path, blob.decode_phase(), arch == "gfx942")?;
+                check_sparse_fp8_object(&syms, &path, blob.decode_phase(), true)?;
             } else if phase == Phase::Flash {
-                check_sparse_fp8_object(&syms, &path, &blob.progs[..dec_ix], false)?;
+                check_sparse_fp8_object(&syms, &path, blob.prefill_phase(), false)?;
             }
             // Whether this object carries the PLOW_K3 arms the packet dispatches. Refused here
             // rather than tolerated, because AMD's dispatch default is a silent NOP: the run
@@ -6811,11 +6822,11 @@ impl AmdEngine {
             )?;
             if phase != Phase::Flash {
                 let phase_progs = if phase == Phase::Decode {
-                    &blob.progs[dec_ix..]
+                    blob.decode_phase()
                 } else {
-                    &blob.progs[..dec_ix]
+                    blob.prefill_phase()
                 };
-                check_compiled_opcode_markers(&syms, &path, phase_progs)?;
+                check_compiled_opcode_markers(&syms, &path, phase_progs.clone())?;
                 check_materialized_residual_input(&syms, &path, phase_progs)?;
             }
             let need_chunk = match phase {
@@ -6996,7 +7007,7 @@ impl AmdEngine {
 
         let mut need_mla_small = false;
         if arch == "gfx942" && mla_pf_v2_enabled() {
-            for p in &blob.progs[..dec_ix] {
+            for p in blob.prefill_phase() {
                 let segments = derive_segments(p)?.len();
                 need_mla_small |= segment::small_mla_segments(p, segments).into_iter().any(|pure| pure);
             }
@@ -7011,7 +7022,7 @@ impl AmdEngine {
         };
 
         let mut need_mla_split = false;
-        for p in &blob.progs[..dec_ix] {
+        for p in blob.prefill_phase() {
             need_mla_split |= !mla_prefill::split_sites(p, &blob.tensors)?.0.is_empty();
         }
         let k_mla_split = if need_mla_split {
@@ -7194,8 +7205,8 @@ impl AmdEngine {
             None
         };
 
-        let mut packed_kda_ops: Vec<DevOp> = blob.progs[..dec_ix]
-            .iter()
+        let mut packed_kda_ops: Vec<DevOp> = blob
+            .prefill_phase()
             .flat_map(|prog| &prog.insts)
             .filter_map(|inst| DevOp::ALL.iter().copied().find(|op| *op as u16 == inst.op))
             .filter(|op| {
@@ -7274,13 +7285,13 @@ impl AmdEngine {
         let kda_family_route = crate::config::RuntimeConfig::get().amd.kda_family_route;
         // Token-batch body programs (`TOKEN_BATCH_PROG`): they need the `_tb` family objects
         // and the shared descriptor storage below.
-        let has_bodies = blob.progs[..dec_ix].iter().any(|g| g.token_batch_body);
+        let has_bodies = blob.prefill_phase().any(|g| g.role.is_token_batch_body());
         // THE PACKED ROUTE FOLLOWS THE PACKET. Unset, it is on exactly when the blob carries
         // packed-prefill siblings or token-batch bodies — the emitter's half of the contract —
         // and a family object those programs need is then a load error by name, not a
         // `None` the mux discovers as "co-packing never fires". `PLOW_PACKED_PREFILL_ROUTE=0`
         // is the rollback.
-        let has_siblings = blob.progs[..dec_ix].iter().any(|g| g.packed_prefill_only);
+        let has_siblings = blob.prefill_phase().any(|g| g.role.is_packed_sibling());
         let packed_route = crate::config::RuntimeConfig::get()
             .amd
             .packed_prefill_route
@@ -7336,9 +7347,8 @@ impl AmdEngine {
         };
         if packed_route {
             let packed_programs = || {
-                blob.progs[..dec_ix]
-                    .iter()
-                    .filter(|g| g.packed_prefill_only || g.token_batch_body)
+                blob.prefill_phase()
+                    .filter(|g| g.role.is_packed_sibling() || g.role.is_token_batch_body())
             };
             let needs_mla = packed_programs().any(|g| {
                 g.insts.iter().any(|d| {
@@ -7793,8 +7803,8 @@ impl AmdEngine {
         };
 
         let need_kda_key_factor = arch == "gfx950"
-            && blob.progs[..dec_ix]
-                .iter()
+            && blob
+                .prefill_phase()
                 .any(|p| !kda_key_factor_segment_pairs(p).is_empty());
         let (k_kda_key_factor_wu, k_kda_key_factor_carry) = if need_kda_key_factor {
             const COMMON: [&str; 7] = [
@@ -8294,9 +8304,9 @@ impl AmdEngine {
             149_760,
         )?;
         let sparse_mla = if use_sparse_mla {
-            let candidates = blob.progs[..dec_ix]
-                .iter()
-                .filter(|p| !p.packed_prefill_only && p.t >= 2048)
+            let candidates = blob
+                .prefill_phase()
+                .filter(|p| !p.role.is_packed_sibling() && p.t >= 2048)
                 .flat_map(|p| {
                     p.insts
                         .iter()
@@ -8321,8 +8331,8 @@ impl AmdEngine {
             None
         };
 
-        let sparse_mla_decode = match blob.progs[dec_ix..]
-            .iter()
+        let sparse_mla_decode = match blob
+            .decode_phase()
             .filter(|p| {
                 decode_segment_kinds(p).is_ok_and(|kinds| {
                     kinds
@@ -8371,7 +8381,7 @@ impl AmdEngine {
                 &be,
                 hsaco_dir,
                 rows.max(128),
-                blob.progs[dec_ix..].iter().any(has_moe_aiter),
+                blob.decode_phase().any(has_moe_aiter),
                 use_resident_moe,
                 crate::config::RuntimeConfig::get().amd.moe_aiter_tile64,
                 &mut modules,
@@ -8988,7 +8998,7 @@ impl AmdEngine {
         EngineDevice::upload(&*be, &d_tens, 0, &table)?;
         let kda_key_factor_half =
             if k_kda_key_factor_wu.is_some() && k_kda_key_factor_carry.is_some() {
-                kda_key_factor_scratch_half_bytes(&blob.progs[..dec_ix])?
+                kda_key_factor_scratch_half_bytes(blob.prefill_phase())?
             } else {
                 0
             };
@@ -9006,7 +9016,7 @@ impl AmdEngine {
             .map(|m| (m.base, kda_key_factor_half));
         let kda_keyfeed_half =
             if k_kda_chunk_wu_lean_keys.is_some() && k_kda_chunk_carry_keyfeed.is_some() {
-                kda_keyfeed_scratch_half_bytes(&blob.progs[..dec_ix])?
+                kda_keyfeed_scratch_half_bytes(blob.prefill_phase())?
             } else {
                 0
             };
@@ -9024,7 +9034,7 @@ impl AmdEngine {
             .map(|m| (m.base, kda_keyfeed_half));
         let (stage1_a4_payload, stage1_a4_scales) =
             if k_moe_stage1_a4_quant.is_some() && k_moe_stage1_a4_reuse.is_some() {
-                moe_stage1_a4_scratch_bytes(&blob.progs[..dec_ix], &blob.tensors)?
+                moe_stage1_a4_scratch_bytes(blob.prefill_phase(), &blob.tensors)?
             } else {
                 (0, 0)
             };
@@ -9045,7 +9055,7 @@ impl AmdEngine {
 
         let mla_fold = if use_mla_fold {
             Some(amd_mla_fold::MlaFold::load(
-                &be, hsaco_dir, &blob.progs[..dec_ix], &blob.tensors, &devp, &mut modules,
+                &be, hsaco_dir, blob.prefill_phase(), &blob.tensors, &devp, &mut modules,
             )?)
         } else {
             None
@@ -9074,12 +9084,12 @@ impl AmdEngine {
             let small_mla_segment = segment::small_mla_segments(p, seg_class.len());
             let (small_mla_split_sites, small_mla_split_segments) =
                 mla_prefill::split_sites(p, &blob.tensors)?;
-            let decode_routes = if prog_ix >= dec_ix {
+            let decode_routes = if p.role.is_decode_rung() {
                 decode_segment_routes(p, &blob.tensors, &blob.init, &devp)?
             } else {
                 vec![DecodeSegmentRoute::Interpreter; seg_class.len()]
             };
-            let mut prefill_routes = if prog_ix < dec_ix {
+            let mut prefill_routes = if p.role.is_prefill_side() {
                 moe_mxfp4_routes_with_scratch(
                     p,
                     &blob.tensors,
@@ -9090,7 +9100,7 @@ impl AmdEngine {
             } else {
                 vec![PrefillSegmentRoute::Interpreter; seg_class.len()]
             };
-            if prog_ix < dec_ix {
+            if p.role.is_prefill_side() {
                 add_kda_key_factor_routes(p, &devp, &mut prefill_routes, kda_key_factor_scratch)?;
                 mla_materialized_routes(p, &devp, &mut prefill_routes)?;
                 if use_sparse_mla {
@@ -9251,7 +9261,8 @@ impl AmdEngine {
             }
             let packed_seg_family = derive_packed_segment_families(p)?;
             let raw_mla_v2_segment = derive_raw_mla_v2_segments(p)?;
-            let packed_sparse_error = if (p.packed_prefill_only || p.token_batch_body)
+            let packed_sparse_error = if (p.role.is_packed_sibling()
+                || p.role.is_token_batch_body())
                 && sparse_prefill_chain(p)
             {
                 packed_sparse_refusal(
@@ -9363,8 +9374,7 @@ impl AmdEngine {
             };
             progs.push(AmdProg {
                 t: p.t,
-                packed_prefill_only: p.packed_prefill_only,
-                token_batch_body: p.token_batch_body,
+                role: p.role,
                 sparse_prefill: p.insts.iter().any(|d| {
                     d.op == DevOp::IndexTpPf as u16
                         || d.op == DevOp::FlashGatherPrefill as u16
@@ -9381,7 +9391,7 @@ impl AmdEngine {
                         || d.op == DevOp::FlashMlaPrefill as u16
                         || d.op == DevOp::FlashMlaPrefillFp8 as u16
                 }),
-                packed_mla_compatible: if p.token_batch_body {
+                packed_mla_compatible: if p.role.is_token_batch_body() {
                     token_batch_body_compatible(p, packed_sparse_error.is_none())
                 } else {
                     packed_mla_compatible(p, packed_sparse_error.is_none())
@@ -9409,7 +9419,7 @@ impl AmdEngine {
                 packed_recurrent_spans: crate::exec::amd::packed::recurrent_span_limit(
                     p.insts.iter().map(|d| d.op),
                 ),
-                token_batch_native_routes: if p.token_batch_body {
+                token_batch_native_routes: if p.role.is_token_batch_body() {
                     token_batch_body_native_routes(p, &prefill_routes)
                 } else {
                     Ok(())
@@ -9453,14 +9463,33 @@ impl AmdEngine {
                 bank: CounterBankState::new(),
             });
         }
-        let decode = progs.len() - 1;
-        // THE DECODE BATCH LADDER: programs `[dec_lo, decode]` are decode rungs at ascending
-        // widths, `[0, dec_lo)` the prefill bucket ladder. Same value the per-phase object
-        // requirements were split at above — one rule, computed once.
-        let dec_lo = dec_ix;
+        // THE TWO LADDERS, derived from the program ROLES and ordered by WIDTH — never by
+        // index (`docs/arch/19-packet-extensions.md`). On a table the emitter laid out this is
+        // the old `[0, dec_lo)` / `[dec_lo, n_prog)` split, program for program.
+        let ladder = |want_decode: bool| {
+            let mut ix: Vec<usize> = blob
+                .progs
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| {
+                    if want_decode {
+                        p.role.is_decode_rung()
+                    } else {
+                        p.role.is_prefill_bucket()
+                    }
+                })
+                .map(|(i, _)| i)
+                .collect();
+            ix.sort_by_key(|&i| blob.progs[i].t);
+            ix
+        };
+        let decode_ladder = ladder(true);
+        let prefill_ladder = ladder(false);
+        let decode = *decode_ladder.last().ok_or_else(|| {
+            RuntimeError::Device("devblob: no decode rung in the program table".into())
+        })?;
         log_gate_hier_status(
             &blob.progs,
-            dec_lo,
             decode_objects != 0 && decode_objects_gate_hier == decode_objects,
         );
         // Packet trace (`PLOW_TRACE_RAW=<path>`). Zeroed once at allocation so
@@ -9636,7 +9665,7 @@ impl AmdEngine {
             // stride below would alias every sequence onto every other's — no
             // fault, no missing weight, just fluent wrong output.
             const KDA_F_SEQ_ROWS: u32 = 2;
-            let unbatched = blob.progs[dec_ix..].iter().find_map(|p| {
+            let unbatched = blob.decode_phase().find_map(|p| {
                 p.insts
                     .iter()
                     .any(|d| {
@@ -9715,8 +9744,8 @@ impl AmdEngine {
             &*be,
             (max_pf_inst * std::mem::size_of::<DevInst64>()).max(64),
         )?;
-        let max_pf_rows = blob.progs[..dec_lo]
-            .iter()
+        let max_pf_rows = blob
+            .prefill_phase()
             .map(|g| g.t as usize)
             .max()
             .unwrap_or(0);
@@ -9779,7 +9808,7 @@ impl AmdEngine {
             .then(|| {
                 let mut baked = None;
                 let mut rungs = Vec::new();
-                for p in dec_lo..=decode {
+                for &p in &decode_ladder {
                     let (sites, b) = derive_mla_nsplit(&blob.progs[p].insts)?;
                     if *baked.get_or_insert(b) != b {
                         return None; // rungs disagree; leave every one of them alone
@@ -9917,7 +9946,8 @@ impl AmdEngine {
             n_cu: blob.n_cu,
             progs,
             decode,
-            dec_lo,
+            decode_ladder,
+            prefill_ladder,
             devp,
             _weight_slab: weight_slab,
             d_tens,
@@ -10053,9 +10083,9 @@ impl AmdEngine {
             .amd
             .packed_prefill_route
             .unwrap_or_else(|| {
-                self.progs[..self.dec_lo]
+                self.progs
                     .iter()
-                    .any(|p| p.packed_prefill_only || p.token_batch_body)
+                    .any(|p| p.role.is_packed_sibling() || p.role.is_token_batch_body())
             })
     }
 
@@ -10081,10 +10111,8 @@ impl AmdEngine {
         let mut capable: Vec<u32> = Vec::new();
         let mut refusal: Option<String> = None;
         for (prog, width) in self.prefill_rungs().collect::<Vec<_>>() {
-            let sibling = packed_prefill_topology_index(prog, self.dec_lo, |candidate| {
-                self.progs
-                    .get(candidate)
-                    .map(|p| (p.t, p.packed_prefill_only))
+            let sibling = packed_prefill_topology_index(prog, self.progs.len(), |candidate| {
+                self.progs.get(candidate).map(|p| p.role)
             });
             match sibling {
                 Some(candidate) => match self.check_packed_prefill_program(candidate) {
@@ -10218,13 +10246,13 @@ impl AmdEngine {
         let program = self.progs.get(prog).ok_or_else(|| {
             RuntimeError::Device(format!("packed-prefill program {prog} is out of range"))
         })?;
-        if prog >= self.dec_lo {
+        if program.role.is_decode_rung() {
             return Err(RuntimeError::Device(format!(
                 "program {prog} is a decode rung, not a packed-prefill program"
             )));
         }
         check_packed_prefill_abi(self.packed_prefill_prefill_abi, false, false)?;
-        if program.token_batch_body {
+        if program.role.is_token_batch_body() {
             program
                 .token_batch_native_routes
                 .as_ref()
@@ -10278,7 +10306,7 @@ impl AmdEngine {
             }
             // A body's MLA family segments run on the `_tb` twins (slot-band resolver); an
             // ordinary packed program on the shipped family objects. Each needs only its own.
-            let (norm, flash, suffix) = if program.token_batch_body {
+            let (norm, flash, suffix) = if program.role.is_token_batch_body() {
                 (
                     self.k_packed_mla_norm_tb.is_some(),
                     self.k_packed_mla_flash_tb.is_some(),
@@ -10346,10 +10374,8 @@ impl AmdEngine {
     /// Resolve an ordinary prefill rung to its packed-only sibling. Legacy
     /// single-topology blobs continue to validate the requested program itself.
     pub fn packed_prefill_prog_for(&self, prog: usize) -> Option<usize> {
-        packed_prefill_topology_index(prog, self.dec_lo, |candidate| {
-            self.progs
-                .get(candidate)
-                .map(|p| (p.t, p.packed_prefill_only))
+        packed_prefill_topology_index(prog, self.progs.len(), |candidate| {
+            self.progs.get(candidate).map(|p| p.role)
         })
         .filter(|&candidate| self.check_packed_prefill_program(candidate).is_ok())
     }
@@ -10360,12 +10386,10 @@ impl AmdEngine {
         self.packed_prefill_prog_for(prog).is_some()
     }
 
+    /// THE PREFILL BUCKET LADDER as `(program, rows)`, ascending by rows. Packed siblings and
+    /// token-batch bodies share those widths but are not rungs, so the ROLE decides.
     pub(crate) fn prefill_rungs(&self) -> impl Iterator<Item = (usize, u32)> + '_ {
-        self.progs[..self.dec_lo]
-            .iter()
-            .enumerate()
-            .filter(|(_, p)| !p.packed_prefill_only && !p.token_batch_body)
-            .map(|(index, p)| (index, p.t))
+        self.prefill_ladder.iter().map(|&i| (i, self.progs[i].t))
     }
 
     /// Validate and upload one ragged packed-prefill descriptor. The binding is program-exact:
@@ -10480,14 +10504,15 @@ impl AmdEngine {
     /// `PLOW_TOKEN_BATCH_TP`.
     /// Whether the blob carries any token-batch body program at all (refused or not).
     pub fn has_token_batch_bodies(&self) -> bool {
-        self.progs[..self.dec_lo].iter().any(|p| p.token_batch_body)
+        self.progs.iter().any(|p| p.role.is_token_batch_body())
     }
 
     pub fn token_batch_bodies(&self) -> Vec<(usize, u32, u32)> {
-        self.progs[..self.dec_lo]
+        let mut out: Vec<(usize, u32, u32)> = self
+            .progs
             .iter()
             .enumerate()
-            .filter(|(_, p)| p.token_batch_body)
+            .filter(|(_, p)| p.role.is_token_batch_body())
             .filter(|&(i, _)| {
                 // Armed is not fires: a body the packed route would refuse at dispatch is left
                 // out HERE, by name, so the serve layer never plans a step onto it.
@@ -10500,8 +10525,11 @@ impl AmdEngine {
                     }
                 }
             })
-            .filter_map(|(i, p)| token_batch_band(&self.pf_src[i]).map(|band| (i, p.t, band)))
-            .collect()
+            // Band 0 is not a band: the body carries no `Argmax` to sample it with.
+            .filter_map(|(i, p)| p.role.token_batch_band().filter(|&b| b > 0).map(|b| (i, p.t, b)))
+            .collect();
+        out.sort_by_key(|&(_, rows, _)| rows);
+        out
     }
 
     /// Stage one token-batch body step (`plans/unified-token-batch.md`, "AMD TP8 lowering
@@ -10521,7 +10549,7 @@ impl AmdEngine {
         let program = self.progs.get(prog).ok_or_else(|| {
             RuntimeError::Device(format!("token-batch body {prog} is out of range"))
         })?;
-        if !program.token_batch_body {
+        if !program.role.is_token_batch_body() {
             return Err(RuntimeError::Device(format!(
                 "program {prog} is not a token-batch body"
             )));
@@ -10532,7 +10560,7 @@ impl AmdEngine {
                 "token-batch body needs a slot-band plan".into(),
             ));
         };
-        let body_band = token_batch_band(&self.pf_src[prog]);
+        let body_band = program.role.token_batch_band().filter(|&b| b > 0);
         if body_band != Some(band) {
             return Err(RuntimeError::Rejected(format!(
                 "plan band {band} does not match token-batch body {prog}'s band {body_band:?}"
@@ -12368,7 +12396,7 @@ impl AmdEngine {
             }
             // A token-batch body samples its whole slot band `[0, band)` through a tiled
             // GEMM; there is no last-row a_row0 to place and `i[4]` is not that field there.
-            (Some(_), _) if self.progs[prog].token_batch_body => {}
+            (Some(_), _) if self.progs[prog].role.is_token_batch_body() => {}
             (Some(lm), _) => insts[lm].i[4] = clen - 1,
             (None, Some(_)) => {
                 // A BLOCK can DECLARE act.logits and never write it — the
@@ -12413,8 +12441,10 @@ impl AmdEngine {
             if c0 >= n_prompt {
                 break;
             }
-            let prog = (0..self.dec_lo)
-                .find(|&p| self.progs[p].t == ch)
+            let prog = self
+                .prefill_rungs()
+                .find(|&(_, rows)| rows == ch)
+                .map(|(prog, _)| prog)
                 .ok_or_else(|| {
                     RuntimeError::Device(format!("no compiled bucket for chunk T={ch}"))
                 })?;
@@ -12572,10 +12602,10 @@ impl AmdEngine {
         // through (`prefill`, `prefill_span`, `AmdTpGroup::plan_for`), so a
         // banded packet cannot reach the row shrink by some other door.
         self.refuse_unraggable()?;
-        // `dec_lo`, not `decode`: with a DECODE BATCH LADDER the trailing programs are decode
-        // rungs, and offering one to `plan_chunks` as a prefill bucket would cover a prompt
-        // with a decode program. Without a ladder the two are the same index.
-        let buckets: Vec<u32> = (0..self.dec_lo).map(|p| self.progs[p].t).collect();
+        // THE BUCKET LADDER BY ROLE, not a leading index range: offering a decode rung to
+        // `plan_chunks` as a prefill bucket would cover a prompt with a decode program, and a
+        // packed sibling or token-batch body is not a rung the planner may pick either.
+        let buckets: Vec<u32> = self.prefill_rungs().map(|(_, rows)| rows).collect();
         // Same reason `refuse_unraggable` announces itself: an A/B whose arms
         // differ only by `PLOW_LAUNCH_ROWS` needs a positive signal that the
         // variable reached the process. "The number moved" is not that signal,
@@ -13253,8 +13283,10 @@ impl AmdEngine {
             if c0 >= n_prompt {
                 break;
             }
-            let prog = (0..self.dec_lo)
-                .find(|&p| self.progs[p].t == ch)
+            let prog = self
+                .prefill_rungs()
+                .find(|&(_, rows)| rows == ch)
+                .map(|(prog, _)| prog)
                 .ok_or_else(|| {
                     RuntimeError::Device(format!("no compiled bucket for chunk T={ch}"))
                 })?;
@@ -13530,27 +13562,28 @@ impl AmdEngine {
     /// Was `n_programs() == 1` at the call site, which a DECODE LADDER breaks: five rungs
     /// and no prefill is five programs and still decode-only.
     pub fn has_prefill(&self) -> bool {
-        self.dec_lo > 0
+        !self.prefill_ladder.is_empty()
     }
 
     /// Whether prefill program `prog` runs the gathered (DSA) attention arm: the indexer plus the
     /// sparse flash, whose cost is set by the selection width and not by the prior context.
     pub fn prefill_prog_sparse(&self, prog: usize) -> bool {
-        prog < self.dec_lo && self.progs[prog].sparse_prefill
+        self.progs[prog].role.is_prefill_side() && self.progs[prog].sparse_prefill
     }
 
     /// Compiled row count for a prefill program. Decode program indices are rejected.
     pub fn prefill_prog_t(&self, prog: usize) -> Option<u32> {
-        (prog < self.dec_lo
-            && !self.progs[prog].packed_prefill_only
-            && !self.progs[prog].token_batch_body)
-            .then(|| self.progs[prog].t)
+        match self.progs.get(prog).map(|p| p.role) {
+            Some(ProgramRole::PrefillBucket { rows }) => Some(rows),
+            _ => None,
+        }
     }
 
     /// The decode rung widths, ascending. One entry without a ladder.
     pub fn decode_rungs(&self) -> Vec<u32> {
-        (self.dec_lo..=self.decode)
-            .map(|p| self.progs[p].t)
+        self.decode_ladder
+            .iter()
+            .map(|&p| self.progs[p].t)
             .collect()
     }
 
@@ -13565,7 +13598,9 @@ impl AmdEngine {
     /// Saturates at the widest rung, so an out-of-range `rows` degrades to today's behaviour
     /// rather than refusing — the slot itself is bounded by `batch` elsewhere.
     pub fn decode_prog_for(&self, rows: usize) -> usize {
-        (self.dec_lo..=self.decode)
+        self.decode_ladder
+            .iter()
+            .copied()
             .find(|&p| self.progs[p].t as usize >= rows)
             .unwrap_or(self.decode)
     }

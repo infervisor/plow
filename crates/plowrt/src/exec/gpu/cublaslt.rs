@@ -525,9 +525,7 @@ mod tests {
         (
             DevProg {
                 t: batch,
-                packed_prefill_only: false,
-                token_batch_body: false,
-                decode_rung: false,
+                role: packet::devbuild::ProgramRole::PrefillBucket { rows: batch },
                 n_counter: 0,
                 insts: vec![ordinary, gemv, ordinary],
                 stream: stream.clone(),

@@ -30,7 +30,7 @@ pub(super) fn split_sites(
         let Some(merge) = prog.insts.get(ix + 1) else {
             return Err(error());
         };
-        if prog.packed_prefill_only
+        if prog.role.is_packed_sibling()
             || prog.t == 0
             || prog.t >= 2048
             || !ns.is_power_of_two()
