@@ -550,14 +550,14 @@ mod tests {
         ]
     }
 
-    fn prefill_fixture(rows: u32, k: u32) -> (DevProg, Vec<DevTensor>) {
+    fn prefill_fixture(rows: u32, n: u32, k: u32) -> (DevProg, Vec<DevTensor>) {
         let (mut program, mut tensors) = fixture(rows);
         let op = &mut program.insts[1];
         op.op = DevOp::Gemm as u16;
-        op.i[..].copy_from_slice(&[rows, 3840, k, 0, 0, 0, 17, 18]);
-        tensors[0].bytes = u64::from(rows) * 3840 * 2;
+        op.i[..].copy_from_slice(&[rows, n, k, 0, 0, 0, 17, 18]);
+        tensors[0].bytes = u64::from(rows) * u64::from(n) * 2;
         tensors[1].bytes = u64::from(rows) * u64::from(k) * 2;
-        tensors[2].bytes = 3840 * u64::from(k) * 2;
+        tensors[2].bytes = u64::from(n) * u64::from(k) * 2;
         (program, tensors)
     }
 
@@ -639,29 +639,37 @@ mod tests {
     fn accepts_only_measured_sm90_bf16_prefill_cells() {
         for rows in plow_asset::segment_roles::CUBLASLT_PREFILL_ROWS {
             for k in [8192, 15360] {
-                let (program, tensors) = prefill_fixture(rows, k);
+                let (program, tensors) = prefill_fixture(rows, 3840, k);
                 let routes = prefill_segments(&program, &tensors, &roles(), "sm90a").unwrap();
                 let route = routes[1].expect("measured projection route");
                 assert_eq!((route.m, route.n, route.k), (rows, 3840, k));
+            }
+        }
+        for rows in plow_asset::segment_roles::CUBLASLT_PREFILL_WIDE_ROWS {
+            for (n, k) in plow_asset::segment_roles::CUBLASLT_PREFILL_GEMMA4_SHAPES {
+                let (program, tensors) = prefill_fixture(rows, n, k);
+                let routes = prefill_segments(&program, &tensors, &roles(), "sm90a").unwrap();
+                let route = routes[1].expect("measured wide projection route");
+                assert_eq!((route.m, route.n, route.k), (rows, n, k));
             }
         }
 
         for (profile, rows, n, k) in [
             ("sm120", 128, 3840, 15360),
             ("sm90a", 64, 3840, 15360),
-            ("sm90a", 1024, 3840, 15360),
+            ("sm90a", 16384, 3840, 15360),
             ("sm90a", 128, 4096, 3840),
             ("sm90a", 128, 3840, 4096),
+            ("sm90a", 1024, 3840, 3840),
         ] {
-            let (mut program, tensors) = prefill_fixture(rows, k);
-            program.insts[1].i[1] = n;
+            let (program, tensors) = prefill_fixture(rows, n, k);
             assert!(prefill_segments(&program, &tensors, &roles(), profile).is_err());
         }
     }
 
     #[test]
     fn prefill_projection_rejects_bias_fp8_and_nonisolated_packets() {
-        let (mut program, tensors) = prefill_fixture(128, 15360);
+        let (mut program, tensors) = prefill_fixture(128, 3840, 15360);
         program.insts[1].t[7] = 0;
         assert!(prefill_segments(&program, &tensors, &roles(), "sm90a").is_err());
         program.insts[1].t[7] = packet::dev::TENSOR_NONE16;
