@@ -1064,6 +1064,7 @@ mod amd_serve {
                         && has_prefill =>
                 {
                     let bodies = g.token_batch_bodies();
+                    let any_body = g.rank(0).has_token_batch_bodies();
                     let band = bodies.first().map(|b| b.2);
                     let armed = band.is_some_and(|band| {
                         bodies.iter().all(|b| b.2 == band) && band as usize == batch
@@ -1073,7 +1074,9 @@ mod amd_serve {
                         armed,
                         ?band,
                         bodies = ?bodies.iter().map(|b| b.1).collect::<Vec<_>>(),
-                        reason = if bodies.is_empty() {
+                        reason = if bodies.is_empty() && any_body {
+                            "every token-batch body was refused (see the warnings above)"
+                        } else if bodies.is_empty() {
                             "the blob carries no token-batch body programs (PLOW_TOKEN_BATCH_TP)"
                         } else if !armed {
                             "the bodies' band differs from the engine batch"

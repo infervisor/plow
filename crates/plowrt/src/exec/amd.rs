@@ -9915,32 +9915,30 @@ impl AmdEngine {
                         .into(),
                 ));
             }
-            if program.packed_seg_family.contains(&5) && self.k_packed_mla_norm.is_none() {
-                return Err(RuntimeError::Device(
-                    "packed-prefill MLA norm/cache segment requires interp_packed_mla_norm".into(),
-                ));
+            // A body's MLA family segments run on the `_tb` twins (slot-band resolver); an
+            // ordinary packed program on the shipped family objects. Each needs only its own.
+            let (norm, flash, suffix) = if program.token_batch_body {
+                (
+                    self.k_packed_mla_norm_tb.is_some(),
+                    self.k_packed_mla_flash_tb.is_some(),
+                    "_tb (PLOW_TOKEN_BATCH_TP_OBJECTS=1)",
+                )
+            } else {
+                (
+                    self.k_packed_mla_norm.is_some(),
+                    self.k_packed_mla_flash.is_some(),
+                    "",
+                )
+            };
+            if program.packed_seg_family.contains(&5) && !norm {
+                return Err(RuntimeError::Device(format!(
+                    "packed-prefill MLA norm/cache segment requires interp_packed_mla_norm{suffix}"
+                )));
             }
-            if program.packed_seg_family.contains(&6) && self.k_packed_mla_flash.is_none() {
-                return Err(RuntimeError::Device(
-                    "packed-prefill MLA flash segment requires interp_packed_mla_flash".into(),
-                ));
-            }
-            if program.token_batch_body {
-                if program.packed_seg_family.contains(&5) && self.k_packed_mla_norm_tb.is_none() {
-                    return Err(RuntimeError::Device(
-                        "token-batch body norm/cache segment requires interp_packed_mla_norm_tb \
-                         (PLOW_TOKEN_BATCH_TP_OBJECTS=1)"
-                            .into(),
-                    ));
-                }
-                if program.packed_seg_family.contains(&6) && self.k_packed_mla_flash_tb.is_none()
-                {
-                    return Err(RuntimeError::Device(
-                        "token-batch body flash segment requires interp_packed_mla_flash_tb \
-                         (PLOW_TOKEN_BATCH_TP_OBJECTS=1)"
-                            .into(),
-                    ));
-                }
+            if program.packed_seg_family.contains(&6) && !flash {
+                return Err(RuntimeError::Device(format!(
+                    "packed-prefill MLA flash segment requires interp_packed_mla_flash{suffix}"
+                )));
             }
         }
         if program.packed_needs_kda {
@@ -10073,6 +10071,11 @@ impl AmdEngine {
     /// The token-batch BODY programs of this blob as `(program, rows, band)`, ascending by
     /// rows (`packet::devbuild::TOKEN_BATCH_PROG`). Empty on a blob emitted without
     /// `PLOW_TOKEN_BATCH_TP`.
+    /// Whether the blob carries any token-batch body program at all (refused or not).
+    pub fn has_token_batch_bodies(&self) -> bool {
+        self.progs[..self.dec_lo].iter().any(|p| p.token_batch_body)
+    }
+
     pub fn token_batch_bodies(&self) -> Vec<(usize, u32, u32)> {
         self.progs[..self.dec_lo]
             .iter()
