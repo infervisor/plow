@@ -2633,11 +2633,13 @@ the ABI-2 adapter, new scheduler defaults, one exclusive-lease run per arm:
 | load | every rung armed; `AMD TP token batch route="unified-token-batch/slot-band" armed=true bodies=[128, 512, 2048, 8192]`; the 8192 sibling and body accepted with `IndexTpPf` on the ABI-2 adapter and the sparse flash on the AITER route |
 | 18-case retrieval, C20 | **18/18** with bodies firing during the run (34 body steps: 10 at the 8192 body with 2–7 decode rows riding, 9 at 2048, 8 at 128) |
 | identity C2/C3/C8 (mixed lengths 700–45k, 2 rounds) | not a clean discriminator on this packet: the CONTROL arm (frozen packet, no bodies, same runtime/objects) also diverges at every concurrency (C8: 3/8 identical both rounds, one answer naming the wrong person), so the screen measures decode-rung near-ties. The span-aware arm diverges at the same rate (C8 3/8, 2/8) but some of its packed outputs are degenerate repetitions (`Lena, Lena, Lena`, `Ronan Ronan Ronan`) that the control never shows — an open correctness risk for body steps (dense bodies fired in the same run; the dense-body "token-0 collapse" is under separate investigation) |
-| A/B 20 × 70k/700/.14 at C20 | span-aware **48.85 out tok/s** vs §21's 49.68 (−1.7 %, one run each); TTFT median 108.3 s vs 100.3 s, TPOT median **222.1 ms vs 234.9 ms**, ITL p99 1348 vs 1348 ms; 0 packs (every middle chunk is a full rung), **18 body fires** (9 at the 8192 body, each 1 decode row + 1 span), 0 error lines |
+| A/B 20 × 70k/700/.14 at C20, one run per arm back to back, same runtime and objects | control (frozen packet) **50.17 out tok/s**, 275.0 s, TTFT median 103.0 s, TPOT median 239.5 ms, ITL median 102.7 / p99 1358 ms, 0 body fires — span-aware **48.85 (−2.6 %)**, 282.4 s, TTFT median 108.3 s (+5.2 %), TPOT median **222.1 ms (−7.3 %)**, ITL median **98.2** / p99 1348 ms, 0 packs, **18 body fires** (9 at the 8192 body, each 1 decode row + 1 span), 0 error lines |
 
 Reading: the sparse rung is now routable and correct enough to pass retrieval, and the body fired
-at 8192 for the first time, but with `members >= 2` mostly satisfied by ONE decode row the step
-gains little (TPOT −5 %) and the TTFT cost of a body launch shows (+8 %). The identity screen's
-degenerate outputs mean `PLOW_PACKED_SPARSE_PF` stays **off** by default until the body path is
-clean on the dense buckets and the screen is re-run against a control that does not itself
-diverge; `--packed-sparse-pf=false` (the default) is the rollback and leaves the blob byte-identical.
+at 8192 for the first time. But with `members >= 2` mostly satisfied by ONE decode row, the step
+buys the decode dispatch it absorbs (TPOT −7.3 %, ITL median −4.4 %) and pays a body-shaped launch
+on the prefill path (TTFT +5.2 %), netting −2.6 % output throughput — not a win on this workload as
+configured. That, plus the identity screen's degenerate outputs, keeps `PLOW_PACKED_SPARSE_PF`
+**off** by default: `--packed-sparse-pf=false` is the rollback and leaves the blob byte-identical.
+What would change the verdict is several spans per launch (whole-chunk planning gives the body one
+span at a time) or a body cheap enough that its launch does not cost 5 s of TTFT per prompt.
