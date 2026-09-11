@@ -542,6 +542,14 @@ __device__ __forceinline__ void d_xreduce_add_norm_mega(
 #if PLOW_FP8_KV
 extern "C" __device__ unsigned plow_fp8_kv_1 = 1;
 #endif
+/* The WEIGHT-encoding twin. `PLOW_FP8` is additive (the fp8 GEMM/GEMV arms join the bf16 ones),
+ * so one direction suffices: a packet dispatching an `#if PLOW_FP8` arm — GEMM*_FP8, QUANT_FP8,
+ * GEMV*_FP8, the Gemma fp8/w8a8 experts — against an object built without it falls to the
+ * dispatch `default:`, which writes nothing. `check_fp8_weight_arms` in exec/amd/object.rs
+ * reads it. */
+#if PLOW_FP8
+extern "C" __device__ unsigned plow_fp8_weights_1 = 1;
+#endif
 
 /* The Gemma-4 MoE arms, made observable the same way and for the same reason. [GEMMA4-MOE-AMD]
  *

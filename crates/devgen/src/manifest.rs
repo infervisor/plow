@@ -2462,6 +2462,60 @@ pub fn config_header(manifest: &Value) -> String {
     if let Some(gqa) = manifest.pointer("/shapes/gqa").and_then(Value::as_u64) {
         out.push_str(&format!("#define PLOW_PACKET_GQA {gqa}\n"));
     }
+
+    // What `scripts/build_gfx942.sh` reads under PLOW_HSACO_CONFIG: the AMD `requires` list,
+    // the decode batch and ladder, and whether token-batch BODY programs (the `_tb` object
+    // twins) are present, so the object set is derived from the packet instead of hand-set
+    // env. Strings and integers no kernel consumes — they move neither the pairing hash nor
+    // the compiled object.
+    out.push_str(
+        "\n/* --- object recipe inputs (scripts/build_gfx942.sh PLOW_HSACO_CONFIG) --- */\n",
+    );
+    let amd_key = manifest
+        .get("backends")
+        .and_then(Value::as_object)
+        .and_then(|b| b.keys().find(|k| k.starts_with("gfx")).cloned());
+    if let Some(k) = &amd_key {
+        out.push_str(&format!("#define PLOW_PACKET_OBJECT_ARCH \"{k}\"\n"));
+        let req: Vec<&str> = manifest
+            .pointer(&format!("/backends/{k}/requires"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        out.push_str(&format!(
+            "#define PLOW_PACKET_OBJECT_REQUIRES \"{}\"\n",
+            req.join(" ")
+        ));
+    }
+    if let Some(b) = manifest
+        .pointer("/shapes/decode_batch")
+        .and_then(Value::as_u64)
+    {
+        out.push_str(&format!("#define PLOW_PACKET_DECODE_BATCH {b}\n"));
+    }
+    let ladder = manifest
+        .pointer("/emit_config/knobs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|k| k.get("id").and_then(Value::as_str) == Some("decode_ladder"))
+        .and_then(|k| k.get("value").and_then(Value::as_str))
+        .filter(|v| !v.is_empty());
+    if let Some(l) = ladder {
+        out.push_str(&format!("#define PLOW_PACKET_DECODE_LADDER \"{l}\"\n"));
+    }
+    let token_batch_bodies = manifest
+        .get("programs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|p| p.get("kind").and_then(Value::as_str) == Some("token_batch"));
+    out.push_str(&format!(
+        "#define PLOW_PACKET_HAS_TOKEN_BATCH_BODIES {}\n",
+        if token_batch_bodies { 1 } else { 0 }
+    ));
     out
 }
 
@@ -3779,6 +3833,64 @@ mod tests {
         assert!(h.contains("#define GV_MM_MAX 8"));
         assert!(h.contains("#ifndef GV_MM_MAX"));
         assert!(h.contains("PLOW_PACKET_HASH"));
+    }
+
+    /// The section `scripts/build_gfx942.sh` consumes under PLOW_HSACO_CONFIG: the AMD
+    /// `requires` list verbatim, the decode batch, the ladder the emit was told, and whether
+    /// token-batch body programs (the `_tb` object twins) exist.
+    #[test]
+    fn header_carries_the_object_recipe_inputs() {
+        let _guard = crate::test_env::env_guard();
+        let _scope = crate::test_env::EnvScope::set(&[("PLOW_DECODE_BATCH_LADDER", "1,2,4")]);
+        let mut man = build(&model(), "gfx942");
+        let h = config_header(&man);
+        assert!(
+            h.contains("#define PLOW_PACKET_OBJECT_ARCH \"gfx942\"\n"),
+            "{h}"
+        );
+        assert!(h.contains("#define PLOW_PACKET_DECODE_BATCH 8\n"), "{h}");
+        assert!(
+            h.contains("#define PLOW_PACKET_DECODE_LADDER \"1,2,4\"\n"),
+            "{h}"
+        );
+        assert!(
+            h.contains("#define PLOW_PACKET_HAS_TOKEN_BATCH_BODIES 0\n"),
+            "{h}"
+        );
+        let line = h
+            .lines()
+            .find(|l| l.starts_with("#define PLOW_PACKET_OBJECT_REQUIRES \""))
+            .expect("requires line");
+        let req: Vec<&str> = man["backends"]["gfx942"]["requires"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(
+            line,
+            format!("#define PLOW_PACKET_OBJECT_REQUIRES \"{}\"", req.join(" "))
+        );
+        for tok in [
+            "PLOW_WG_WAVES=8",
+            "GM_DBUF=1",
+            "GM_BM=192",
+            "GM_BN=256",
+            "PLOW_FP8_KV=1",
+        ] {
+            assert!(req.contains(&tok), "{tok} missing from {req:?}");
+        }
+        // A token-batch body program is what selects the `_tb` twins.
+        man["programs"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"kind": "token_batch", "topology": "ordinary"}));
+        assert!(config_header(&man).contains("#define PLOW_PACKET_HAS_TOKEN_BATCH_BODIES 1\n"));
+        // Recipe inputs are outside the pairing hash: a different ladder is the same pair.
+        let _scope2 = crate::test_env::EnvScope::set(&[("PLOW_DECODE_BATCH_LADDER", "1,2")]);
+        let other = build(&model(), "gfx942");
+        assert_eq!(man["pairing"]["hash"], other["pairing"]["hash"]);
+        assert!(config_header(&other).contains("#define PLOW_PACKET_DECODE_LADDER \"1,2\"\n"));
     }
 
     #[test]

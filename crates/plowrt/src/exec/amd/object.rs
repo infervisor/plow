@@ -632,7 +632,17 @@ pub(super) fn validate_packet_pairing_stamp(
     object: &Path,
 ) -> Result<()> {
     match (lo, hi) {
-        (None, None) => Ok(()),
+        (None, None) => {
+            // The shipped gfx942 state: a GENERAL object, every arm compiled, no stamp. Accepted,
+            // but said out loud — an unstamped object cannot be shown to be THIS packet's.
+            tracing::warn!(
+                object = %object.display(),
+                "code object carries no packet-pairing stamp (plow_packet_hash_{{lo,hi}}); \
+                 accepted as a general object, unverifiable against this packet — build it \
+                 with PLOW_HSACO_CONFIG=<assets dir> (scripts/build_gfx942.sh) to stamp it"
+            );
+            Ok(())
+        }
         (Some(_), None) | (None, Some(_)) => Err(RuntimeError::Device(format!(
             "{} has a partial packet-pairing stamp; refusing an unverifiable specialised object",
             object.display()
@@ -1371,10 +1381,15 @@ pub(super) fn elf_symbol_u32(img: &[u8], wanted: &str) -> Option<u32> {
 /// it has to be refused at load.
 ///
 /// A flag with no marker entry is WARNED about by name, not silently passed and
-/// not faked: `PLOW_FP8`/`PLOW_FP8_KV`/`PLOW_MXFP4` select the object FILENAME
-/// (see [`Variant`]), so the loader already picks by them, and their remaining
-/// content is not separable in the symbol table. Saying so precisely is worth
-/// more than a check that cannot fail.
+/// not faked: `PLOW_MXFP4` selects the object FILENAME (see [`Variant`]), so the
+/// loader already picks by it, and its remaining content is not separable in the
+/// symbol table. Saying so precisely is worth more than a check that cannot fail.
+/// The flags in [`VERIFIED_BY_OTHER_CHECKS`] are not warned about: `PLOW_FP8` and
+/// `PLOW_FP8_KV` are checked against the OPCODES the phase dispatches
+/// ([`check_fp8_weight_arms`], [`check_kv_encoding`]) — `requires` is blob-wide, and
+/// a block-fp8 packet whose prefill dispatches no `#if PLOW_FP8` arm is served by the
+/// bf16 prefill object correctly — and the tile geometry is checked BY VALUE
+/// ([`check_prefill_geometry`]).
 pub(super) fn check_prefill_object(syms: &[&str], path: &Path, requires: &[String]) -> Result<()> {
     if syms.is_empty() {
         let needs_prefill_arm = requires.iter().any(|req| {
@@ -1413,7 +1428,9 @@ pub(super) fn check_prefill_object(syms: &[&str], path: &Path, requires: &[Strin
             continue;
         }
         let Some((_, markers)) = PREFILL_ARM_MARKERS.iter().find(|(f, _)| *f == flag) else {
-            unverifiable.push(req.as_str());
+            if !VERIFIED_BY_OTHER_CHECKS.contains(&flag) {
+                unverifiable.push(req.as_str());
+            }
             continue;
         };
         if !markers.iter().any(|m| syms.iter().any(|s| s.contains(m))) {
@@ -1437,6 +1454,77 @@ pub(super) fn check_prefill_object(syms: &[&str], path: &Path, requires: &[Strin
             "These flags are outside the opcode-arm check; phase selection and interpreter \
              wave geometry are validated separately."
         );
+    }
+    Ok(())
+}
+
+/// `requires` flags [`check_prefill_object`] does not own: verified by opcode
+/// ([`check_fp8_weight_arms`], [`check_kv_encoding`]) or by value
+/// ([`check_prefill_geometry`]), never warned about as unverifiable.
+pub(super) const VERIFIED_BY_OTHER_CHECKS: &[&str] = &[
+    "PLOW_FP8",
+    "PLOW_FP8_KV",
+    "PLOW_WG_WAVES",
+    "GM_BM",
+    "GM_BN",
+    "GM_DBUF",
+];
+
+/// The tile geometry `build.json` `requires` states for the PREFILL object, and the
+/// `runtime/amd/geom_contract.h` marker holding the value that actually compiled.
+///
+/// PREFILL only, like [`PREFILL_ARM_MARKERS`]: the manifest spells the geometry from
+/// `hwspec`'s prefill recipe. The flash object is a 4-wave 64x128 build by design, and the
+/// decode object may legitimately be a validated re-cut (`PLOW_DEC_SQUEEZE`, 128x256).
+pub(super) const PREFILL_GEOMETRY_MARKERS: &[(&str, &str)] = &[
+    ("PLOW_WG_WAVES", "plow_geom_PLOW_WG_WAVES"),
+    ("GM_BM", "plow_geom_GM_BM"),
+    ("GM_BN", "plow_geom_GM_BN"),
+    ("GM_DBUF", "plow_geom_GM_DBUF"),
+];
+
+/// Refuse a PREFILL object whose compiled GEMM tile / wave grid is not the one the packet's
+/// `build.json` `requires` names.
+///
+/// A tile mismatch used to be a warn (`unverifiable`). It is not benign: the stage arena, the
+/// wave grid and the LDS budget are baked into the object, and a packet emitted against one
+/// tile runs its GEMMs on another without any fault. The marker is a `.data` word
+/// (`PLOW_GEOM_MARK`), read the way the pairing stamp is — no device round trip.
+pub(super) fn check_prefill_geometry(image: &[u8], path: &Path, requires: &[String]) -> Result<()> {
+    for req in requires {
+        let Some((key, val)) = req.split_once('=') else {
+            continue;
+        };
+        let Some((_, marker)) = PREFILL_GEOMETRY_MARKERS.iter().find(|(k, _)| *k == key) else {
+            continue;
+        };
+        let Ok(want) = val.parse::<u32>() else {
+            continue;
+        };
+        match elf_symbol_u32(image, marker) {
+            Some(got) if got == want => {}
+            Some(got) => {
+                return Err(RuntimeError::Device(format!(
+                    "packet/object GEOMETRY MISMATCH: this packet requires {key}={want} but the \
+                     PREFILL object {} was compiled {key}={got} (its `{marker}` marker says so). \
+                     The GEMM stage arena and wave grid are baked into the object, so the \
+                     prefill would run on the wrong tile without any fault. Rebuild the prefill \
+                     object at {key}={want} (scripts/build_gfx942.sh with \
+                     PLOW_HSACO_CONFIG=<assets dir>), or serve a packet emitted for this \
+                     geometry.",
+                    path.display()
+                )));
+            }
+            None => {
+                return Err(RuntimeError::Device(format!(
+                    "packet/object GEOMETRY UNVERIFIABLE: this packet requires {key}={want} but \
+                     the PREFILL object {} carries no `{marker}` marker \
+                     (runtime/amd/geom_contract.h), so the tile it compiled cannot be checked. \
+                     Rebuild it from a tree that has the geometry contract.",
+                    path.display()
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -2435,6 +2523,57 @@ pub(super) fn check_kv_encoding(
         } else {
             "with -DPLOW_FP8_KV=1"
         },
+    )))
+}
+
+/// The marker `runtime/amd/interp.hip` emits when it was compiled with `PLOW_FP8=1` — the
+/// fp8 WEIGHT arms, a different axis from [`FP8_KV_SYM`]'s KV swap.
+pub(super) const FP8_WEIGHT_SYM: &str = "plow_fp8_weights_1";
+
+/// Every opcode whose dispatch arm is compiled only under `#if PLOW_FP8` in
+/// `runtime/amd/interp.hip`: the w8a8 prefill GEMMs and their quant, the w8a16 decode GEMVs,
+/// and the Gemma fp8 / w8a8 experts. The `*Fp8Blk` family is deliberately NOT here — block-fp8
+/// runs outside `PLOW_FP8` (a GLM decode object without the flag serves it), which is why the
+/// blob-wide `requires` entry `PLOW_FP8=1` cannot be the test and the dispatched opcode is.
+pub(super) const FP8_WEIGHT_OPS: &[DevOp] = &[
+    DevOp::QuantFp8,
+    DevOp::GemmFp8,
+    DevOp::GemmMedFp8,
+    DevOp::GemmSmallFp8,
+    DevOp::GemmWideFp8,
+    DevOp::GemmC5Fp8,
+    DevOp::GemmGluFp8,
+    DevOp::GemvFp8,
+    DevOp::GemvGluFp8,
+    DevOp::GemvQkvFp8,
+    DevOp::MoeExpertGluGemmaFp8,
+    DevOp::MoeExpertDownGemmaFp8,
+    DevOp::MoeGroupGluGemmaPfW8a8,
+    DevOp::MoeGroupDownGemmaPfW8a8,
+];
+
+/// Refuse a code object without the fp8 WEIGHT arms for a phase that dispatches one.
+///
+/// One direction only, unlike [`check_kv_encoding`]: `PLOW_FP8` is ADDITIVE (its arms join the
+/// bf16 ones), so a bf16 packet on an fp8 object is merely a larger object. The silent case is
+/// the other one — an fp8 GEMM on a bf16 object falls to the dispatch `default:`, which on AMD
+/// writes nothing, and the bf16 arms then read fp8 bytes as bf16 downstream.
+pub(super) fn check_fp8_weight_arms(syms: &[&str], path: &Path, need: Option<DevOp>) -> Result<()> {
+    let Some(op) = need else {
+        return Ok(());
+    };
+    if syms.contains(&FP8_WEIGHT_SYM) {
+        return Ok(());
+    }
+    Err(RuntimeError::Device(format!(
+        "packet/object FP8-WEIGHT MISMATCH: this packet dispatches {op:?} (op {}), an arm \
+         compiled only under PLOW_FP8, but {} was built WITHOUT -DPLOW_FP8=1 (it does not \
+         advertise `{FP8_WEIGHT_SYM}`). AMD's dispatch default writes NOTHING rather than \
+         trapping, so the op would leave its output untouched and the run would complete on \
+         stale memory. Serve the blob against an object built with -DPLOW_FP8=1 (the `_fp8` / \
+         `_fp8kv` rows of scripts/build_gfx942.sh), or emit a packet without fp8 weights.",
+        op as u16,
+        path.display()
     )))
 }
 
