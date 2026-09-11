@@ -1102,6 +1102,28 @@ if [ "${PLOW_MLA_FOLD_TB:-8}" != 0 ]; then
     AX_FLASH="$AX_FLASH -DPLOW_MLA_FOLD_TB=${PLOW_MLA_FOLD_TB:-8}"
 fi
 
+# DEFAULT ON for the gfx942 PREFILL and FLASH objects (2026-09-11): the three glue memory arms —
+# PLOW_COMBINE_VEC (8-wide k==1 MoE combine, op_moe.h), PLOW_RN_ROWS (RMSNorm issues R rows of
+# loads before reducing any, op_norm.h) and PLOW_RESID_U (residual keeps U iterations of loads in
+# flight, op_elementwise.h). Rollback per axis: PLOW_COMBINE_VEC=0, PLOW_RN_ROWS=0, PLOW_RESID_U=0
+# (1 is also the shipped single-row / non-unrolled body for the last two).
+#   BIT-IDENTICAL, measured: the three device bodies built with each object's exact -D set (8-wave
+#   prefill; 4-wave flash with PLOW_WAVE_RED_DPP), with and without the arms, 304 blocks, identical
+#   inputs — 606,699,522 output bytes per build equal in both geometries across 12 cases, ragged
+#   ones included (RMSNorm 1000x6144, residual 6,144,001 elements, combine T=1000, the k=8 path).
+#   FASTER, measured on GLM-5.3 TP8 (packet trace of a steady 8192-row sparse chunk, 8 GPUs):
+#   MoeCombinePf 31.7 -> 6.7 ms/chunk (0.74 -> 3.5 TB/s), RmsNorm 22.2 -> 20.4, Residual 12.2 ->
+#   11.5, chunk 963.7 -> 937.9 ms (-2.7%); served 70k/C20 clean interleaved A/B 50.17 -> 51.15 out
+#   tok/s, candidate ahead in both rounds, retrieval 18/18 both arms.
+# Decode, mixed, token-batch, packed and small/split MLA objects keep the shipped bodies: their
+# end-to-end effect was not measured (the decode megakernel sits at its register limit).
+AX_GLUE=""
+[ "${PLOW_COMBINE_VEC:-1}" = 0 ] || AX_GLUE="$AX_GLUE -DPLOW_COMBINE_VEC=${PLOW_COMBINE_VEC:-1}"
+case "${PLOW_RN_ROWS:-2}" in 0|1) ;; *) AX_GLUE="$AX_GLUE -DPLOW_RN_ROWS=${PLOW_RN_ROWS:-2}" ;; esac
+case "${PLOW_RESID_U:-4}" in 0|1) ;; *) AX_GLUE="$AX_GLUE -DPLOW_RESID_U=${PLOW_RESID_U:-4}" ;; esac
+AX_PREFILL="$AX_PREFILL$AX_GLUE"
+AX_FLASH="$AX_FLASH$AX_GLUE"
+
 # OPT-IN (PLOW_MLA_PF_SV=1): the V2 kernel's V-STAGE arm — kv-block LDS swizzle that makes
 # the PV transpose read bank-conflict-free, plus double-buffered QK/PV LDS fragments (see
 # op_attention.h PLOW_MLA_PF_SV). FLASH OBJECT ONLY (the V2 body lives there);
