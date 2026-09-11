@@ -47,8 +47,9 @@ pub(super) fn routes(
     let owners = segment_owners(prog, segments, native)?;
     for (ix, inst) in prog.insts.iter().enumerate().filter(|(_, d)| native(d)) {
         let err = |s: &str| RuntimeError::Device(format!("native MLA fold {ix}: {s}"));
-        if prog.packed_prefill_only
-            || !(2048..=8192).contains(&prog.t)
+        // Packed-prefill siblings carry the fold unchanged: it consumes per-row partials and
+        // reads no per-row position (class A).
+        if !(2048..=8192).contains(&prog.t)
             || inst.i[0] != prog.t
             || inst.i[1..4] != [8, 256, 0]
             || !(1..8).contains(&inst.i[4])
@@ -57,7 +58,7 @@ pub(super) fn routes(
             || inst.t[4..] != [TENSOR_NONE16; 4]
         {
             return Err(err(
-                "requires unpacked prefill, eight heads, latent512/value256 and splits<8",
+                "requires prefill of 2048..8192 rows, eight heads, latent512/value256 and splits<8",
             ));
         }
         let rows = u64::from(prog.t);
@@ -381,7 +382,7 @@ mod tests {
         for bad in 0..15 {
             let (mut p, mut t) = fixture();
             match bad {
-                0 => p.packed_prefill_only = true,
+                0 => p.insts[0].fj[0] = 1,
                 1 => p.t = 20,
                 2 => p.insts[0].i[0] = 8191,
                 3 => p.insts[0].i[1] = 16,

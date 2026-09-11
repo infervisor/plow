@@ -91,16 +91,16 @@ fn automatic_prefix_selection_requires_compatible_execution_and_valid_kv_layout(
     cfg.nv.vmm_live = false;
     cfg.nv.vmm_live_rings = false;
     cfg.prefix_cache = true;
-    cfg.pf_batch = false;
+    cfg.pf_batch = Some(false);
     let selected = |blob: &DevBlob, cfg: &RuntimeConfig, cc, gran| {
         GpuEngine::select_vmm_prefix_layout(blob, &dir, cfg, cc, gran).is_some()
     };
     assert!(selected(&blob, &cfg, (9, 0), 2 << 20));
     assert!(!selected(&blob, &cfg, (12, 0), 2 << 20));
     assert!(!selected(&blob, &cfg, (9, 0), 16 << 20));
-    cfg.pf_batch = true;
+    cfg.pf_batch = Some(true);
     assert!(!selected(&blob, &cfg, (9, 0), 2 << 20));
-    cfg.pf_batch = false;
+    cfg.pf_batch = Some(false);
     cfg.nv.vmm_live = true;
     assert!(!selected(&blob, &cfg, (9, 0), 2 << 20));
     assert!(cfg.nv_live_kv_enabled(true, true, false));

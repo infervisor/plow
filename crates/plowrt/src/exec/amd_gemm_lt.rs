@@ -164,14 +164,15 @@ pub(super) fn routes(
             1 => decode_choice(prog.t, inst.i[1], inst.i[2]).is_some(),
             _ => false,
         };
-        if prog.packed_prefill_only
-            || !shape_ok
+        // Packed-prefill siblings carry the same projections: a GEMM over the dense live rows
+        // reads no per-row position (class A).
+        if !shape_ok
             || inst.i[0] != prog.t
             || inst.i[4..] != [0; 4]
             || inst.fj != [0; 3]
             || inst.t[3..] != [TENSOR_NONE16; 5]
         {
-            return Err(err("requires an unpacked qualified BF16 projection"));
+            return Err(err("requires a qualified BF16 projection"));
         }
         if inst.t[0] == inst.t[1] || inst.t[0] == inst.t[2] || inst.t[1] == inst.t[2] {
             return Err(err("operands alias"));
@@ -386,7 +387,7 @@ mod tests {
         for bad in 0..16 {
             let (mut p, mut t) = fixture();
             match bad {
-                0 => p.packed_prefill_only = true,
+                0 => p.t = 1024,
                 1 => p.insts[0].i[0] = 4096,
                 2 => p.insts[0].i[1] = 256,
                 3 => p.insts[0].i[4] = 1,

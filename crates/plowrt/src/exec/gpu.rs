@@ -5881,6 +5881,21 @@ impl GpuEngine {
         self.prefill[self.pick_prefill_bucket(avail, usize::MAX)].t as usize
     }
 
+    /// The CUDA arm as the backend-neutral step planner (`crate::sched::step`) sees it: one
+    /// fair-split launch per tick under the widest bucket, every waiting request may join it
+    /// and may be cut to fit, and under the unified token batch the decode rows ride along.
+    /// The per-tick row cap itself (`pf_pack_budget` over the waiting rows, minus decode rows)
+    /// is a bucket-cost decision this engine keeps, so it is handed to the planner as the
+    /// tick cap rather than re-derived there.
+    pub fn step_backend(&self) -> crate::sched::step::Backend {
+        crate::sched::step::Backend {
+            step_budget: u32::try_from(self.pf_max_rows()).unwrap_or(u32::MAX),
+            packing: true,
+            split_spans: true,
+            decode_rows_join_prefill: false,
+        }
+    }
+
     /// Bring up the `_pf` prefill object and upload every prefill bucket program.
     /// Port of the harness `prep_prog` for the prefill objects:
     /// upload tables, verify the single coarse segment, and precompute the

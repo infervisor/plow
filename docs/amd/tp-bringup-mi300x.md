@@ -2529,3 +2529,55 @@ ownership validation was reduced to one stream scan per program; dispatch
 and arithmetic are unchanged. The final loader also passes 18/18 retrieval
 cases; validation and the two runtime hashes are recorded separately. See [reproduction and all metrics](../../runtime/bench/amd/glm_projection/README.md#paired-serving-screen)
 and [serving evidence](../../runtime/bench/amd/glm_projection/mi300x-serving.json).
+
+## 21. Continuous batching by default: step budget, packed siblings beside native MoE, one planner (2026-09-11)
+
+Four things kept cross-request prefill packing off on the production GLM-5.3 TP8 recipe, and
+the fourth — not packing — is what costs throughput on the 70k/C20 workload:
+
+| gate | before | now |
+|---|---|---|
+| emit | `PLOW_EMIT_PACKED_PREFILL` asserted off beside `PLOW_GLM_MOE_AITER/RESIDENT/INDEX_TP/GEMM_LT` | siblings ride beside the native segments (class A, row-agnostic over `T`); index-TP keys on the builder topology; sparse (DSA) buckets get no sibling; GLM gfx942 emits siblings by default with the ordinary programs byte-identical (`glm_tests`) |
+| chunk policy | `admit` packs whole spans, and the widest capable rung ≤ the tick cap is also the chunk size, so one chunk fills it | one backend-neutral step planner (`crates/plowrt/src/sched/step.rs`): decodes, then packs, then oldest-first whole chunks under one budget |
+| route | `PLOW_PACKED_PREFILL_ROUTE`/`PLOW_PF_BATCH` off; a missing family object was a silent `Ok(None)`; no FP8-KV packed objects existed | the route follows the packet; a missing `interp_packed_mla_{norm,flash}[_fp8kv]` is a load error by name; `_fp8kv` rows added to `build_gfx942.sh`; the native AITER MoE / hipBLASLt / MLA-fold routes accept packed siblings (they refused `packed_prefill_only` on their own) |
+| **tick cap** | `PLOW_PF_INTERLEAVE=2048` as soon as any slot decodes → every steady-state chunk a 2048-row **dense** launch (2048 is not a DSA bucket) | AMD default = the widest compiled rung: one 8192-row **sparse** chunk per tick |
+
+**Why packing is not the lever on this packet.** The 8192 rung is a DSA bucket
+(`IndexTpPf`/`IndexUnionPf`/`FlashGatherPrefill` derive every row's position from one scalar —
+class C) and has no packed sibling; the widest packable rung is the dense 2048. Under the default
+ragged plan every non-final chunk of a 70k prompt is 8192 rows and the final chunk must run
+isolated (one sampled token per launch), so at default planning nothing is packable — for 70k and
+for ≤ 8192-token prompts alike. Packing fires only under a `PLOW_PF_CHUNK ≤ 1024` override, and
+there it can only fold N dense 1024-row launches into one dense 2048, never a sparse 8192. It is
+armed by default because it is free when it applies (dense packets, mixed short/long traffic).
+
+**The planner** is vLLM's `schedule()` shape with no device type in it:
+`plan(backend, tick, decodes, candidates) → Plan { decodes, launches }`. A backend declares
+`Backend { step_budget, packing, split_spans, decode_rows_join_prefill }`
+(`ServeEngine::step_backend`); the AMD/CPU tick lowers each launch to `advance_packed_prefill` /
+`prefill_chunked_at_most` and the CUDA pass lowers its single fair-split launch. A chunk wider than
+the remainder waits rather than being re-planned narrower; a plan element a backend cannot run is
+refused by name (`serve/step_lowering_tests.rs`, the CPU declaration as the oracle).
+
+**Decode rung fill** (verified, unchanged): rung = highest live-or-mid-prefill slot + 1, admission
+takes the lowest free slot, no compaction on release (a KV block copy costs more than the rows it
+saves); at C20 with a full slot table the rung tracks 20.
+
+**Measured** — 20 × 70k/700/.14 at C20, the frozen packet, the same runtime and objects, identical
+request set (1,414,538 in / 13,795 out), one exclusive-lease run per arm:
+
+| arm | knobs | out tok/s | duration | TTFT med / mean / p99 | TPOT med / mean | ITL med / p99 |
+|---|---|---:|---:|---|---|---|
+| control (old defaults) | `pf_interleave=2048 pf_batch=0 route=0` | **16.81** | 820.8 s | 352.9 / 361.3 / 737.6 s | 646.8 / 614.1 ms | 109 / 1832 ms |
+| new defaults | `pf_interleave=widest pf_batch=1 route=auto` | **49.68 (+196 %)** | 277.7 s | **100.3 / 102.6 / 198.7 s** | **234.9 / 232.7 ms** | 101 / 1348 ms |
+
+The gain is the tick cap: the steady-state prefill launch went from a 2048-row dense chunk to an
+8192-row sparse chunk — 4× fewer launches and ~30× fewer attention FLOPs per row at 60–70k keys —
+and the decode step between prefill launches got closer, not further apart, because one sparse 8192
+launch is shorter than four dense 2048 ones. Co-packing fired in neither arm, as argued above. The
+re-emitted packet with siblings is emitted and unit-pinned but its device qualification (identity,
+18-case retrieval, bench) is pending: its first load refused at the native AITER MoE route, fixed
+since; the frozen packet is unaffected and `--emit-packed-prefill=false` is the rollback.
+
+Rollbacks: `PLOW_PF_INTERLEAVE=2048`, `PLOW_PF_BATCH=0`, `PLOW_PACKED_PREFILL_ROUTE=0`,
+`--emit-packed-prefill=false`. Flag rows in `docs/flags-reference.md`.
