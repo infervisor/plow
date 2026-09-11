@@ -92,14 +92,24 @@ pub struct RuntimeConfig {
     #[arg(long = "prefix-cache", env = "PLOW_PREFIX_CACHE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub prefix_cache: bool,
 
-    /// Soft cap on prefix blocks and boundary snapshots in MiB. 0 = OOM-driven eviction only.
+    /// Soft cap on prefix blocks and boundary snapshots as a fraction of the device's
+    /// memory, 0..=1 — the unit vLLM's `--gpu-memory-utilization` uses, scoped here to
+    /// the prefix cache. A fixed byte count is the wrong unit: 4 GiB is 5% of an H100
+    /// and 2% of an MI300X, and the model decides what is left over. 0 = OOM-driven
+    /// eviction only. `--vmm-cache-mib` overrides it with an explicit size.
     #[arg(
-        long = "vmm-cache-mib",
-        env = "PLOW_VMM_CACHE_MIB",
-        default_value_t = 4096,
+        long = "vmm-cache-memory-utilization",
+        env = "PLOW_VMM_CACHE_MEMORY_UTILIZATION",
+        default_value_t = 0.05,
+        value_parser = clap::value_parser!(f64),
         global = true
     )]
-    pub vmm_cache_mib: u32,
+    pub vmm_cache_memory_utilization: f64,
+
+    /// Explicit soft cap on prefix blocks and boundary snapshots in MiB; overrides
+    /// `--vmm-cache-memory-utilization`. 0 = OOM-driven eviction only.
+    #[arg(long = "vmm-cache-mib", env = "PLOW_VMM_CACHE_MIB", global = true)]
+    pub vmm_cache_mib: Option<u32>,
 
     /// Cross-request prefill scheduling. CUDA packs chunks into one launch. AMD packs only
     /// exact-capability programs; unsupported programs retain fair isolated scheduling.
@@ -1072,12 +1082,34 @@ impl RuntimeConfig {
         )
     }
 
-    pub(crate) fn prefix_cache_mib(&self) -> u32 {
-        select_compat(
-            self.vmm_cache_mib,
-            Self::env_parse("PLOW_VMM_CACHE_MIB"),
-            !Self::is_initialized(),
+    /// Prefix-cache soft cap in bytes for a device with `device_bytes` of memory.
+    /// An explicit `--vmm-cache-mib` wins; otherwise `--vmm-cache-memory-utilization`
+    /// of the device. `device_bytes == 0` means the backend could not say, and the cap
+    /// falls back to the 4 GiB the H100 campaign qualified rather than to "unbounded".
+    pub(crate) fn prefix_cache_cap_bytes(&self, device_bytes: u64) -> u64 {
+        let allow_env = !Self::is_initialized();
+        let explicit: Option<u32> = if allow_env {
+            Self::env_parse("PLOW_VMM_CACHE_MIB").or(self.vmm_cache_mib)
+        } else {
+            self.vmm_cache_mib
+        };
+        if let Some(mib) = explicit {
+            return (mib as u64) << 20;
+        }
+        let fraction = select_compat(
+            self.vmm_cache_memory_utilization,
+            Self::env_parse("PLOW_VMM_CACHE_MEMORY_UTILIZATION"),
+            allow_env,
         )
+        .clamp(0.0, 1.0);
+        if fraction == 0.0 {
+            return 0;
+        }
+        if device_bytes == 0 {
+            return 4096u64 << 20;
+        }
+        // Whole MiB, so the figure in logs and metrics reads like the knob.
+        ((device_bytes as f64 * fraction) as u64) >> 20 << 20
     }
 
     #[cfg(feature = "cuda")]
@@ -1300,7 +1332,9 @@ mod tests {
         let config = super::RuntimeConfig::from_arg_matches(&matches).unwrap();
         assert!(!config.prefix_cache);
         assert!(config.token_batch);
-        assert_eq!(config.vmm_cache_mib, 512);
+        assert_eq!(config.vmm_cache_mib, Some(512));
+        // Explicit MiB wins over the percentage, whatever the device size.
+        assert_eq!(config.prefix_cache_cap_bytes(192 << 30), 512 << 20);
         #[cfg(feature = "cuda")]
         assert_eq!(config.nv_vmm_prefix(), Some(false));
     }
@@ -1318,7 +1352,25 @@ mod tests {
             .get_arguments()
             .find(|arg| arg.get_id() == "vmm_cache_mib")
             .unwrap();
-        assert_eq!(budget.get_default_values(), ["4096"]);
+        assert!(budget.get_default_values().is_empty());
+        let fraction = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "vmm_cache_memory_utilization")
+            .unwrap();
+        assert_eq!(fraction.get_default_values(), ["0.05"]);
+        // The default scales with the device: 5% of an 80 GiB H100 is the 4 GiB the
+        // campaign qualified; an MI300X gets 9.6 GiB; an unknown size keeps 4 GiB.
+        let matches = command.clone().try_get_matches_from(["test"]).unwrap();
+        let config = super::RuntimeConfig::from_arg_matches(&matches).unwrap();
+        assert_eq!(config.prefix_cache_cap_bytes(80 << 30), 4096 << 20);
+        assert_eq!(config.prefix_cache_cap_bytes(192 << 30), 9830 << 20);
+        assert_eq!(config.prefix_cache_cap_bytes(0), 4096 << 20);
+        let matches = command
+            .clone()
+            .try_get_matches_from(["test", "--vmm-cache-memory-utilization=0"])
+            .unwrap();
+        let config = super::RuntimeConfig::from_arg_matches(&matches).unwrap();
+        assert_eq!(config.prefix_cache_cap_bytes(80 << 30), 0);
         for (flag, expected) in [("--vmm-prefix", true), ("--vmm-prefix=false", false)] {
             let matches = command
                 .clone()

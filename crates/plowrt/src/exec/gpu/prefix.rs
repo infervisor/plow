@@ -307,7 +307,9 @@ impl GpuEngine {
         // 128k-dedup campaign can still raise it via PLOW_VMM_BLOCK_MIB=64.
         let rt = crate::config::RuntimeConfig::get();
         let block_hint = (rt.nv_vmm_block_mib() as u64) << 20;
-        let cache_cap = (rt.prefix_cache_mib() as u64) << 20;
+        // `mem_info` total = the card's VRAM; 0 (query refused) keeps the fixed fallback.
+        let device_bytes = be.mem_info().map(|(_, total)| total).unwrap_or(0);
+        let cache_cap = rt.prefix_cache_cap_bytes(device_bytes);
         match crate::memory::vmm::VmmKv::new(
             Arc::clone(be) as Arc<dyn crate::memory::vmm::VmmOps>,
             geo,

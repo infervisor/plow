@@ -47,7 +47,7 @@ fn env_zero_and_one_mean_false_and_true() {
     assert!(c.pf_defer_decode);
     assert!(c.pf_batch);
     assert!(!c.prefix_cache);
-    assert_eq!(c.vmm_cache_mib, 512);
+    assert_eq!(c.vmm_cache_mib, Some(512));
     assert!(!c.amd.tp_prefill_segment_major);
     assert!(c.apple.ane_mlp);
     assert!(!c.apple.serial);

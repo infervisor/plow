@@ -12144,8 +12144,16 @@ impl AmdEngine {
                 || self.prefix_snap.get(slot).is_some_and(Option::is_some))
     }
 
+    /// Snapshot budget for this rank: a fraction of the card's VRAM
+    /// (`--vmm-cache-memory-utilization`) or an explicit `--vmm-cache-mib`. `vram_bytes`
+    /// is a ROCr pool attribute read, not a device round trip, and this runs per
+    /// admission, not per step.
+    fn prefix_cache_cap(&self) -> u64 {
+        crate::config::RuntimeConfig::get().prefix_cache_cap_bytes(self.be.vram_bytes())
+    }
+
     pub fn prefix_cache_capable(&self) -> bool {
-        let cap = (crate::config::RuntimeConfig::get().prefix_cache_mib() as u64) << 20;
+        let cap = self.prefix_cache_cap();
         self.vmm.is_none()
             && self.prefix_regions.as_ref().is_some_and(|regions| {
                 cap == 0 || regions.iter().map(prefix::Region::bytes).sum::<u64>() <= cap
@@ -12191,7 +12199,7 @@ impl AmdEngine {
             return Ok(());
         }
         if self.prefix_snap[slot].is_none() {
-            let cap = (crate::config::RuntimeConfig::get().prefix_cache_mib() as u64) << 20;
+            let cap = self.prefix_cache_cap();
             while cap > 0 && self.prefix_snap.iter().flatten().map(|m| m.len).sum::<u64>() + total > cap {
                 if !self.evict_prefix_snapshot(slot) { return Ok(()); }
             }

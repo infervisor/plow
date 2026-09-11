@@ -8,7 +8,8 @@ path. Check startup selection messages and actual token-batch dispatch logs.
 |---|---|---|
 | `--prefix-cache` / `PLOW_PREFIX_CACHE` | `true` | Permit prefix reuse on either backend. |
 | `--token-batch` / `PLOW_TOKEN_BATCH` | `true` | Permit unified prefill/decode dispatch. |
-| `--vmm-cache-mib` / `PLOW_VMM_CACHE_MIB` | `4096` | Prefix block/snapshot budget per engine; zero allows OOM-driven eviction. |
+| `--vmm-cache-memory-utilization` / `PLOW_VMM_CACHE_MEMORY_UTILIZATION` | `0.05` | Prefix block/snapshot budget per engine as a fraction of device memory, in the unit of vLLM's `--gpu-memory-utilization` (4 GiB on an 80 GiB H100); zero allows OOM-driven eviction only. |
+| `--vmm-cache-mib` / `PLOW_VMM_CACHE_MIB` | unset | Explicit budget in MiB, overriding the fraction; zero allows OOM-driven eviction only. |
 
 Use `--prefix-cache=false` or `PLOW_PREFIX_CACHE=0` to disable reuse. On NVIDIA,
 this also overrides `PLOW_VMM_PREFIX=1`. `PLOW_VMM_PREFIX=0` remains a
