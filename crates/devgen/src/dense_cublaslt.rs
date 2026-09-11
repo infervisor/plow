@@ -410,9 +410,9 @@ mod tests {
     }
 
     fn prefill_model() -> Model {
-        let widths = [1, 2, 4, 8, 16, 32, 64, 128, 1];
+        let widths = [1, 64, 128, 256, 512, 1024, 1];
         let mut model = model_rows(&widths);
-        for program in &mut model.progs[..8] {
+        for program in &mut model.progs[..6] {
             let rows = program.insts[1].i[0];
             program.insts[1].op = DevOp::Gemm as u16;
             program.insts[1].i[..].copy_from_slice(&[rows, 3840, 15360, 0, 0, 0, 7, 8]);
@@ -543,9 +543,9 @@ mod tests {
     }
 
     #[test]
-    fn prefill_policy_isolates_two_exact_shapes_for_all_eight_small_rungs() {
+    fn prefill_policy_isolates_two_exact_shapes_for_qualified_rungs() {
         let mut model = prefill_model();
-        let decode = model.progs[8].to_blob();
+        let decode = model.progs[6].to_blob();
         let insts: Vec<_> = model
             .progs
             .iter()
@@ -554,14 +554,15 @@ mod tests {
         let mut sections = Vec::new();
         assert_eq!(
             apply_prefill(&mut model, &mut sections, "sm_90a").unwrap(),
-            16
+            6
         );
-        assert_eq!(model.progs[8].to_blob(), decode);
+        assert_eq!(model.progs[6].to_blob(), decode);
         assert_eq!(sections.len(), 1);
         let metadata = SegmentRoles::from_bytes(&sections[0].data).unwrap();
-        assert_eq!(metadata.programs.len(), 8);
-        for (index, roles) in metadata.programs.iter().enumerate() {
-            assert_eq!(roles.index, index);
+        assert_eq!(metadata.programs.len(), 3);
+        for roles in &metadata.programs {
+            let index = roles.index;
+            assert!(matches!(model.prog_t[index], 128 | 256 | 512));
             assert_eq!(
                 roles.roles.iter().filter(|&&role| role == CUBLASLT).count(),
                 2
@@ -584,12 +585,11 @@ mod tests {
     #[test]
     fn prefill_policy_is_opt_in_exact_and_preserves_existing_roles() {
         let mut model = prefill_model();
-        model.progs[0].insts[1].op = DevOp::GemmFp8 as u16;
-        model.progs[1].insts[1].i[0] = 129;
-        model.progs[2].insts[1].i[1] = 4096;
-        model.progs[3].insts[1].t[7] = 0;
+        model.progs[2].insts[1].op = DevOp::GemmFp8 as u16;
+        model.progs[3].insts[1].i[1] = 4096;
+        model.progs[4].insts[1].t[7] = 0;
         let prior = ProgramRoles {
-            index: 4,
+            index: 1,
             roles: vec![plow_asset::segment_roles::PREFILL_ATTENTION],
         };
         let mut sections = vec![SectionData {
@@ -614,13 +614,13 @@ mod tests {
             .unwrap(),
         }];
         let selected = apply_prefill(&mut model, &mut sections, "sm90a").unwrap();
-        assert_eq!(selected, 10);
+        assert_eq!(selected, 3);
         let metadata = SegmentRoles::from_bytes(&sections[0].data).unwrap();
         assert_eq!(
             metadata
                 .programs
                 .iter()
-                .find(|p| p.index == 4)
+                .find(|p| p.index == 1)
                 .unwrap()
                 .roles,
             [plow_asset::segment_roles::PREFILL_ATTENTION]
