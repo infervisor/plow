@@ -3735,6 +3735,12 @@ pub(crate) fn emit_glm_mla(
             }
         },
     );
+    // Native sparse decode boundary (PLOW_GLM_MLA_DEC_AITER): the runtime routes the isolated
+    // segment through the pinned AITER QH8 object and runs this arm on steps where any row
+    // holds fewer than 2048 keys.
+    if dsa && fp8kv && emit_config::active().glm_mla_dec_aiter {
+        b.isolate(c_fl);
+    }
     // 10 FUSED MLA MERGE+FOLD: online-softmax-merge the ns_attn latent partials (Opart/mlpart) in
     //    LDS, then fold olat @ W_uv straight to v_head_dim — replaces FLASH_MERGE<512> + O_UV_FOLD,
     //    killing the Olat[nh_l*DK] HBM round-trip and one dependency gate (validated rms ~0.004;

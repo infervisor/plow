@@ -615,6 +615,53 @@ fn segmented_decode_probe() -> DevProg {
 }
 
 #[test]
+fn isolated_sparse_mla_decode_is_a_native_segment_only_when_pure() {
+    let sparse = DevInst64 {
+        op: DevOp::FlashMlaDecodeFp8 as u16,
+        blocks: 256,
+        t: [0, 1, 2, 3, 4, 5, 6, 7],
+        i: [1, 8, 4096, 0, 16, u32::MAX, 2048, 4],
+        fj: [0.0625f32.to_bits(), 9, 0],
+        ..Default::default()
+    };
+    let make = || {
+        let mut p = segmented_decode_probe();
+        p.insts[1] = sparse;
+        p
+    };
+    let p = make();
+    assert_eq!(
+        decode_segment_kinds(&p).unwrap(),
+        [
+            DecodeSegmentKind::Interpreter,
+            DecodeSegmentKind::SparseMlaDecode(1),
+            DecodeSegmentKind::Interpreter,
+        ]
+    );
+    validate_decode_dispatch(std::slice::from_ref(&p), 0).unwrap();
+    // The ordinary emit: counter obligations or a shared segment keep it on the interpreter.
+    let mut waits = make();
+    waits.stream[1].wait_len = 1;
+    assert!(decode_segment_kinds(&waits)
+        .unwrap()
+        .iter()
+        .all(|k| matches!(k, DecodeSegmentKind::Interpreter)));
+    let mut shared = make();
+    shared.stream[0].seg = 1;
+    assert!(decode_segment_kinds(&shared)
+        .unwrap()
+        .iter()
+        .all(|k| matches!(k, DecodeSegmentKind::Interpreter)));
+    // A dense FP8 decode op (no selection handle) is never a native boundary.
+    let mut dense = make();
+    dense.insts[1].fj[1] = 0;
+    assert!(decode_segment_kinds(&dense)
+        .unwrap()
+        .iter()
+        .all(|k| matches!(k, DecodeSegmentKind::Interpreter)));
+}
+
+#[test]
 fn fused_decode_segment_is_a_pure_ordered_single_rank_route() {
     let p = segmented_decode_probe();
     assert_eq!(
