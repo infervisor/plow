@@ -170,6 +170,15 @@ CFG=""; AX_CONFIG=""; AX_CONFIG_JSON=""
 # A/B whose header default is the shipped body (e.g. -DPLOW_COMBINE_VEC=1 -DPLOW_RN_ROWS=2).
 # Recorded in build_defines.json beside AX_CONFIG so the contract audit sees the axis.
 AX_EXTRA="${PLOW_HSACO_EXTRA_DEFINES:-}"
+# It may NOT carry the axes the loader pairs against the packet (tile geometry, wave count,
+# decode batch): those have dedicated variables that this script cross-checks against the
+# packet's `requires`, and a -D smuggled in here would bypass that check and be refused at load
+# — or, worse, silently redefine a header default (the GM_AX class of defect).
+case " $AX_EXTRA " in
+  *" -DGM_BM"*|*" -DGM_BN"*|*" -DGM_BK"*|*" -DGM_DBUF"*|*" -DPLOW_WG_WAVES"*|*" -DPLOW_DECODE_BATCH"*|*" -DPLOW_GEMV_MM"*)
+    echo "FAIL: PLOW_HSACO_EXTRA_DEFINES must not set tile/wave/decode-batch axes; use their own variables" >&2
+    exit 2 ;;
+esac
 if [ -n "${PLOW_HSACO_CONFIG:-}" ]; then
   CFG="$PLOW_HSACO_CONFIG"
   [ -d "$CFG" ] && CFG="$CFG/plow_config.h"

@@ -692,6 +692,7 @@ the end, not tabled.
 | `PLOW_GATE_HIER` | 0 | gfx950 two-level counter-gate rendezvous. The CMake option is default-off and applies only to decode global-queue objects; it requires `PLOW_HSACO_GQ=ON` and `PLOW_L2_PLACE_DISPATCH=ON`. Passing it through global `PLOW_HSACO_EXTRA_DEFINES` is rejected. The gfx942 shell build's existing default is unchanged. |
 | `PLOW_GATE_SC1` | 0 | device-scope (not system-scope) activation stores so the release fence can be elided; the counter-gate carries the ordering. |
 | `PLOW_MLA_FOLD_MAP` / `_UN` / `_VEC` / `_VT` | 0 | fold the MLA up-projection map / output un-projection / V-cache load / V^T transpose into the adjacent kernel to save a launch + round-trip. |
+| `PLOW_MLA_FOLD_TB_FLASH` | 0 | build `interp_flash_*` with the token-blocked `MlaMergeFold` arm (`PLOW_MLA_FOLD_TB`, default 8 and already on for `interp_prefill_*`). GLM-5.3's sparse 8192 chunk dispatches its fold from the FLASH object, so without this the arm is unreachable on the shipped recipe. Opt-in until the retrieval screen runs on this object. |
 | `PLOW_MLA_PF_MFMA` | 0 | MLA prefill uses MFMA matrix-core instructions for QK/PV instead of the vector-FMA fallback. |
 | `PLOW_MLA_PF_WPM` | numeric | MLA-prefill waves-per-M-tile, clamped by `min(PLOW_WAVES, PLOW_MLA_PF_WPM)`. |
 | `PLOW_XR_CUS` | 32 | **emit** — cap XReduce participant CUs (clamped 1..n_cu); a TP8 NUMA lever cutting L2 invalidates from idle WGs. |
@@ -754,6 +755,7 @@ packet carries packed-prefill metadata.
 | `PLOW_MOE_DOWN_LANESPLIT`, `PLOW_MOE_DOWN_STAGE_FU` | 0 | `down` lane-split / staged fixups. |
 | `PLOW_MOE_ROUTER_WIDE` | 0 | wide router arm. |
 | `PLOW_MOE_COMBINE_ALLBLK` | 0 | all-block combine. |
+| `PLOW_HSACO_EXTRA_DEFINES` | unset | `scripts/build_gfx942.sh`: raw `-D` appended to every row and recorded in `build_defines.json` (so `asm_audit.py --contract` sees the axis). For opt-in kernel arms whose header default is the shipped body. Refuses the tile / wave / decode-batch axes, which have their own variables and are cross-checked against the packet. |
 | `PLOW_COMBINE_VEC` / `PLOW_COMBINE_VEC_U` | 0 / 2 | AMD `d_moe_combine_pf` 8-wide arm (16 B loads, `_U` iterations in flight) for the `k == 1` combine every native-MoE / `PLOW_MOE_PF_DET` blob emits. Bit-identical (same operands, same order, one rounding). Opt-in build axis (`PLOW_HSACO_EXTRA_DEFINES`), pending the 8-GPU A/B. |
 | `PLOW_RN_ROWS` | 1 | AMD `d_rmsnorm` multi-row arm: R rows' loads issued before any row is reduced (prefill norms hand each workgroup ~27 rows and paid one HBM round trip per row). Same per-thread element map and reduction tree — bit-identical. Opt-in build axis. |
 | `PLOW_RESID_U` | 1 | AMD `d_residual` unroll: U iterations of loads in flight. Bit-identical. Opt-in build axis. |
