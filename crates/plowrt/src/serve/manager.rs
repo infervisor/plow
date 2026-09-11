@@ -202,6 +202,21 @@ impl BlobPlan {
                     .map(|&id| blob.tensors[id].bytes)
                     .sum();
                 let geo = &layout.geometry;
+                let live_rings = crate::exec::gpu::live_rings_for_capacity(
+                    config.nv_vmm_live_rings(),
+                    true,
+                    Some(geo.max_ctx),
+                    Some(geo.batch),
+                );
+                let ring_virtual_bytes: u64 = live_rings
+                    .then(|| {
+                        layout
+                            .ring_tensors
+                            .iter()
+                            .map(|ring| blob.tensors[ring.tensor].bytes)
+                            .sum()
+                    })
+                    .unwrap_or(0);
                 let block =
                     geo.block_bytes(granularity, u64::from(config.vmm_block_mib()) << 20)?;
                 // Load maps row zero for every slot, including idle decode lanes.
@@ -210,9 +225,16 @@ impl BlobPlan {
                     * u64::from(geo.kvh_full)
                     * layout.full_tensors.len() as u64
                     * 2;
-                plan.kv_bytes = plan.kv_bytes.checked_sub(virtual_bytes).ok_or_else(|| {
-                    RuntimeError::Rejected("live KV plan tensor classification".into())
-                })? + resident
+                let demand_virtual_bytes = virtual_bytes.checked_add(ring_virtual_bytes).ok_or_else(
+                    || RuntimeError::Rejected("live KV virtual byte overflow".into()),
+                )?;
+                plan.kv_bytes = plan
+                    .kv_bytes
+                    .checked_sub(demand_virtual_bytes)
+                    .ok_or_else(|| {
+                        RuntimeError::Rejected("live KV plan tensor classification".into())
+                    })?
+                    + resident
                     + crate::memory::vmm::kv_pool_cap();
             } else if let Some(layout) = prefix_layout {
                 let geo = &layout.geo;

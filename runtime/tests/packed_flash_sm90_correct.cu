@@ -35,7 +35,10 @@ static bool lean_hd512 = false;
 static bool lean_hd256_bkv64 = false;
 static float attention_scale = 0.0f;
 static unsigned test_kv_length = 16384;
+static unsigned test_kv_length_min = 0;
 static bool campaign_timing = false;
+static bool json_output = false;
+static bool mapped_only = false;
 static unsigned test_seed = 0;
 static unsigned test_requests = 1;
 
@@ -53,11 +56,11 @@ static unsigned blocks = 132;
 template<int HD, int BKV>
 __global__ void run_attention(const bf16* q, const bf16* k, const bf16* v,
                              bf16* out, float* partial, float* stats, const int* req,
-                             unsigned kv_heads, unsigned stride, unsigned mask,
+                             unsigned rows, unsigned kv_heads, unsigned stride, unsigned mask,
                              unsigned window, const void* maps, unsigned nblk, float scale) {
     extern __shared__ float arena[];
     d_flash_prefill_mux<HD,64,BKV>(req, partial, stats, q, k, v, out,
-        capacity, 16384, heads, kv_heads, 0, window, 1, stride, mask,
+        rows, 16384, heads, kv_heads, 0, window, 1, stride, mask,
         scale, blockIdx.x, nblk, arena, maps);
 }
 
@@ -100,10 +103,13 @@ template<int HD, int BKV> static bool check(unsigned kv_heads, unsigned stride,
         unsigned row0 = 0;
         for (unsigned r = 0; r < test_requests; ++r) {
             const unsigned qlen = test_rows / test_requests + (r < test_rows % test_requests);
+            const unsigned kvlen = test_requests == 1 ? test_kv_length
+                : test_kv_length_min + uint64_t(test_kv_length - test_kv_length_min) * r /
+                    (test_requests - 1);
             req[1 + 4 * r] = int(row0);
             req[2 + 4 * r] = int(qlen);
             req[3 + 4 * r] = int(r);
-            req[4 + 4 * r] = int(test_kv_length);
+            req[4 + 4 * r] = int(kvlen);
             row0 += qlen;
         }
     }
@@ -182,7 +188,7 @@ template<int HD, int BKV> static bool check(unsigned kv_heads, unsigned stride,
         inst.blocks = blocks;
         for (unsigned i = 0; i < 8; ++i) inst.t[i] = i;
         if (!tma) inst.t[7] = PLOW_TENSOR_NONE;
-        inst.i[0] = capacity; inst.i[1] = 16384;
+        inst.i[0] = test_rows; inst.i[1] = 16384;
         inst.i[2] = heads; inst.i[3] = kv_heads;
         inst.i[5] = window; inst.i[6] = HD; inst.i[7] = 1;
         inst.fj[0].f = scale;
@@ -216,8 +222,8 @@ template<int HD, int BKV> static bool check(unsigned kv_heads, unsigned stride,
             void* args[]{&packet};
             CD(cuLaunchKernel(interpreter, blocks, 1, 1, 256, 1, 1, smem, nullptr, args, nullptr));
         } else {
-            run_attention<HD,BKV><<<blocks,256,smem>>>(dq,dk,dv,out,partial,stats,dr,kv_heads,
-                stride,mask,window,table,blocks,scale);
+            run_attention<HD,BKV><<<blocks,256,smem>>>(dq,dk,dv,out,partial,stats,dr,test_rows,
+                kv_heads,stride,mask,window,table,blocks,scale);
         }
     };
     reset_packet();
@@ -301,12 +307,35 @@ template<int HD, int BKV> static bool check(unsigned kv_heads, unsigned stride,
         }
     }
     ok &= worst < 0.004 && max_error < 0.01;
-    std::printf("mode=%s seed=%u HD=%d BKV=%d KV=%u requests=%u rows=%u kv_length=%u window=%u maps=%d checked=%u "
-                "worst_relL2=%.6g max_abs=%.6g best_us=%.3f median_us=%.3f %s\n",
-                interpreter ? "interpreter" : "body",test_seed,HD,interpreter ? 0 : BKV,kv_heads,
-                unsigned(req[0]),test_rows,test_kv_length,window,int(tma),checked,worst,max_error,
-                samples.empty() ? NAN : samples.front(),
-                samples.empty() ? NAN : samples[samples.size()/2],ok?"PASS":"FAIL");
+    unsigned kv_length_min = UINT32_MAX, kv_length_max = 0;
+    for (unsigned r = 0; r < unsigned(req[0]); ++r) {
+        kv_length_min = std::min(kv_length_min, unsigned(req[4 + 4 * r]));
+        kv_length_max = std::max(kv_length_max, unsigned(req[4 + 4 * r]));
+    }
+    const char* topology = req[0] == 1 ? "single"
+        : kv_length_min == kv_length_max ? "packed_homogeneous" : "packed_ragged";
+    if (json_output) {
+        std::printf("{\"mode\":\"%s\",\"seed\":%u,\"head_dim\":%d,\"q_heads\":%u,"
+                    "\"kv_heads\":%u,\"gqa\":%u,"
+                    "\"topology\":\"%s\",\"requests\":%u,\"rows\":%u,\"kv_length_min\":%u,"
+                    "\"kv_length_max\":%u,\"window\":%u,\"mapped\":%s,\"checked\":%u,"
+                    "\"worst_rel_l2\":%.9g,\"max_abs\":%.9g,\"correct\":%s,"
+                    "\"samples_us\":[",
+                    interpreter ? "interpreter" : "body", test_seed, HD, heads, kv_heads,
+                    heads / kv_heads,
+                    topology, unsigned(req[0]), test_rows, kv_length_min, kv_length_max, window,
+                    tma ? "true" : "false", checked, worst, max_error, ok ? "true" : "false");
+        for (size_t i = 0; i < samples.size(); ++i)
+            std::printf("%s%.9g", i ? "," : "", samples[i]);
+        std::printf("]}\n");
+    } else {
+        std::printf("mode=%s seed=%u HD=%d BKV=%d KV=%u requests=%u rows=%u kv_length=%u window=%u maps=%d checked=%u "
+                    "worst_relL2=%.6g max_abs=%.6g best_us=%.3f median_us=%.3f %s\n",
+                    interpreter ? "interpreter" : "body",test_seed,HD,interpreter ? 0 : BKV,kv_heads,
+                    unsigned(req[0]),test_rows,test_kv_length,window,int(tma),checked,worst,max_error,
+                    samples.empty() ? NAN : samples.front(),
+                    samples.empty() ? NAN : samples[samples.size()/2],ok?"PASS":"FAIL");
+    }
     CK(cudaFree(dq)); CK(cudaFree(dk)); CK(cudaFree(dv)); CK(cudaFree(out));
     CK(cudaFree(partial)); CK(cudaFree(stats)); CK(cudaFree(dr));
     if (trash) CK(cudaFree(trash));
@@ -321,6 +350,8 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--profile") == 0) profile = true;
         else if (std::strcmp(argv[i], "--campaign-timing") == 0) campaign_timing = true;
+        else if (std::strcmp(argv[i], "--json") == 0) json_output = true;
+        else if (std::strcmp(argv[i], "--mapped-only") == 0) mapped_only = true;
         else if (std::strcmp(argv[i], "--lean-hd512") == 0) lean_hd512 = true;
         else if (std::strcmp(argv[i], "--lean-hd256-bkv64") == 0) lean_hd256_bkv64 = true;
         else if (std::strcmp(argv[i], "--blocks") == 0 && i + 1 < argc) {
@@ -341,6 +372,12 @@ int main(int argc, char** argv) {
             const auto value = std::strtoul(argv[++i], &end, 10);
             if (*end || value == 0 || value > 16384) return 2;
             test_kv_length = unsigned(value);
+        }
+        else if (std::strcmp(argv[i], "--kv-length-min") == 0 && i + 1 < argc) {
+            char* end;
+            const auto value = std::strtoul(argv[++i], &end, 10);
+            if (*end || value == 0 || value > 16384) return 2;
+            test_kv_length_min = unsigned(value);
         }
         else if (std::strcmp(argv[i], "--rows") == 0 && i + 1 < argc) {
             char* end;
@@ -369,11 +406,17 @@ int main(int argc, char** argv) {
     if (!PLOW_TEST_FA_ROWS && test_kv_length != 16384) return 2;
     if (!PLOW_TEST_FA_ROWS && test_rows != 98) return 2;
     if (!PLOW_TEST_FA_ROWS && test_requests != 1) return 2;
-    if (test_requests > test_rows || test_kv_length < (test_rows + test_requests - 1) / test_requests)
+    if (!test_kv_length_min) test_kv_length_min = test_kv_length;
+    if ((!PLOW_TEST_FA_ROWS && test_kv_length_min != test_kv_length)
+        || test_kv_length_min > test_kv_length
+        || (test_requests == 1 && test_kv_length_min != test_kv_length))
+        return 2;
+    if (test_requests > test_rows || test_kv_length_min < (test_rows + test_requests - 1) / test_requests)
         return 2;
     if (test_requests == 1 && test_kv_length < test_rows) return 2;
     bool ok = true;
     for (bool tma : {false, true}) {
+        if (mapped_only && !tma) continue;
         if (lean_hd256_bkv64) {
             if (tma) ok &= check<256,64>(8,2048,2047,1024,true,profile);
             continue;

@@ -5,7 +5,7 @@ repo=$(cd "$(dirname "$0")/.." && pwd)
 build=${PLOW_FA_SWEEP_BUILD:-/tmp/gemma4-attention-h100-build}
 output=${PLOW_FA_SWEEP_OUTPUT:-/tmp/gemma4-attention-h100.jsonl}
 nvcc=${PLOW_FA_NVCC:-/usr/local/cuda-13.0/bin/nvcc}
-nvenv=(env -u NVCC_PREPEND_FLAGS -u LIBRARY_PATH -u NIX_LDFLAGS)
+nvenv=(env -i PATH=/usr/local/cuda-13.0/bin:/usr/bin:/bin)
 
 case $build in /tmp/*) ;; *) echo "build directory must be under /tmp" >&2; exit 2;; esac
 case $output in /tmp/*) ;; *) echo "raw output must be under /tmp" >&2; exit 2;; esac
@@ -48,12 +48,12 @@ build_all() {
     -DPLOW_FA_BENCH_SHORT_BURST=1 \
     "$repo/runtime/nvidia/experiments/fa_gf_full_h100_ab.cu" \
     -o "$build/decode_hd256_local"
-  "${nvenv[@]}" "$nvcc" "${common[@]}" -DPLOW_TEST_FA_ROWS=512 \
+  "${nvenv[@]}" "$nvcc" "${common[@]}" -DPLOW_TEST_FA_ROWS=8192 \
     -DPLOW_TEST_FA_HD256_ONLY=1 -DPLOW_NV_FA_WGITEM=1 \
     -DPLOW_NV_FA_GQA2_PAIR=1 \
     "$repo/runtime/tests/packed_flash_sm90_correct.cu" -lcuda \
     -o "$build/control_hd256_gqa2"
-  "${nvenv[@]}" "$nvcc" "${common[@]}" -DPLOW_TEST_FA_ROWS=512 \
+  "${nvenv[@]}" "$nvcc" "${common[@]}" -DPLOW_TEST_FA_ROWS=8192 \
     "$repo/runtime/tests/packed_flash_sm90_correct.cu" -lcuda \
     -o "$build/control_hd512_role"
   rm -f "$build/sha256.txt"
