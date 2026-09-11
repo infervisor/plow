@@ -643,11 +643,97 @@ mod amd_serve {
         /// once instead of every step. It is the only externally visible evidence that the
         /// ladder is engaging, and a measurement that cannot show that is not a measurement.
         last_rung: u32,
+        /// The TP token-batch route: staging for the slot-band plan plus the body programs the
+        /// group carries. `None` when the blob has no bodies or the route is not requested.
+        token_batch_tp: Option<TokenBatchTp>,
         diagnostics: Option<EngineDiagnostics>,
         counter_snapshot_dir: Option<PathBuf>,
         tensor_snapshot: Option<TensorSnapshotConfig>,
         counter_snapshot_tick: u64,
         tensor_snapshot_tick: u64,
+    }
+
+    /// The AMD TP lowering of the unified token batch (`plans/unified-token-batch.md`, "AMD
+    /// TP8 lowering decision"): one `SpanCover::SlotBand` plan per step, executed by the
+    /// token-batch body program of the chosen width on every rank.
+    struct TokenBatchTp {
+        staging: crate::exec::mixed_step_staging::MixedStepStaging,
+        band: u32,
+        /// `(program, rows)`, ascending by rows.
+        bodies: Vec<(usize, u32)>,
+    }
+
+    impl TokenBatchTp {
+        /// The body width for `leading_rows` sampled rows and `prefill_rows` span rows: the
+        /// narrowest body whose span capacity fits, else the one that fits most.
+        fn rows_for(&self, leading_rows: usize, prefill_rows: usize) -> Option<u32> {
+            if leading_rows == 0 || leading_rows > self.band as usize {
+                return None;
+            }
+            self.bodies
+                .iter()
+                .min_by_key(|&&(_, t)| {
+                    let capacity = (t - self.band) as usize;
+                    (
+                        prefill_rows.saturating_sub(capacity),
+                        capacity.abs_diff(prefill_rows),
+                    )
+                })
+                .map(|&(_, t)| t)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn step(
+            &mut self,
+            group: &mut crate::exec::amd_tp::AmdTpGroup,
+            rows: u32,
+            requests: &[plow_asset::token_batch::Request<'_>],
+            generations: &[u32],
+            frontiers: &mut [u32],
+            max_ctx: usize,
+            output: &mut Vec<(u32, u32)>,
+        ) -> Result<()> {
+            let &(prog, _) = self
+                .bodies
+                .iter()
+                .find(|&&(_, t)| t == rows)
+                .ok_or_else(|| {
+                    RuntimeError::Rejected(format!("no token-batch body of {rows} rows"))
+                })?;
+            let plan = self
+                .staging
+                .stage_requests_cover(
+                    requests,
+                    frontiers,
+                    generations,
+                    rows,
+                    max_ctx as u32,
+                    prog as u32,
+                    plow_asset::mixed_step::SpanCover::SlotBand { band: self.band },
+                )
+                .map_err(|e| RuntimeError::Rejected(e.to_string()))?;
+            let result = group.token_batch_body_step(prog, plan);
+            let ids = match result {
+                Ok(ids) => ids,
+                Err(e) => {
+                    self.staging.discard();
+                    return Err(e);
+                }
+            };
+            let tokens: Vec<u32> = self
+                .staging
+                .sampled_slots()
+                .unwrap_or(&[])
+                .iter()
+                .map(|&slot| ids[slot as usize])
+                .collect();
+            self.staging
+                .finish_requests_after_device_success(frontiers, &tokens, output)
+                .map_err(|e| {
+                    self.staging.discard();
+                    RuntimeError::Device(e.to_string())
+                })
+        }
     }
 
     /// A prompt part-way through its prefill.
@@ -956,6 +1042,44 @@ mod amd_serve {
                 && ranks.prefix_cache_capable() && has_prefill;
             tracing::info!(requested = crate::config::RuntimeConfig::get().prefix_cache,
                 selected = prefix_cache, "AMD prefix cache selection");
+            let chunk_prefill = !crate::config::RuntimeConfig::get().pf_no_chunk;
+            let token_batch_tp = match &ranks {
+                Ranks::Tp(g)
+                    if crate::config::RuntimeConfig::get().token_batch
+                        && chunk_prefill
+                        && has_prefill =>
+                {
+                    let bodies = g.token_batch_bodies();
+                    let band = bodies.first().map(|b| b.2);
+                    let armed = band.is_some_and(|band| {
+                        bodies.iter().all(|b| b.2 == band) && band as usize == batch
+                    });
+                    tracing::info!(
+                        route = "unified-token-batch/slot-band",
+                        armed,
+                        ?band,
+                        bodies = ?bodies.iter().map(|b| b.1).collect::<Vec<_>>(),
+                        reason = if bodies.is_empty() {
+                            "the blob carries no token-batch body programs (PLOW_TOKEN_BATCH_TP)"
+                        } else if !armed {
+                            "the bodies' band differs from the engine batch"
+                        } else {
+                            ""
+                        },
+                        "AMD TP token batch"
+                    );
+                    armed.then(|| TokenBatchTp {
+                        staging: crate::exec::mixed_step_staging::MixedStepStaging::with_capacity(
+                            bodies.iter().map(|b| b.1 as usize).max().unwrap_or(0),
+                            batch,
+                            batch,
+                        ),
+                        band: band.unwrap_or(0),
+                        bodies: bodies.iter().map(|b| (b.0, b.1)).collect(),
+                    })
+                }
+                _ => None,
+            };
             Ok(AmdServe {
                 ranks,
                 stop_ids,
@@ -983,6 +1107,7 @@ mod amd_serve {
                 },
                 prefill_turn: 0,
                 last_rung: 0,
+                token_batch_tp,
                 diagnostics: None,
                 counter_snapshot_dir,
                 tensor_snapshot,
@@ -1725,7 +1850,10 @@ mod amd_serve {
             }
             match &self.ranks {
                 Ranks::One(e) => e.token_batch_rows(leading_rows, prefill_rows),
-                Ranks::Tp(_) => None,
+                Ranks::Tp(_) => self
+                    .token_batch_tp
+                    .as_ref()
+                    .and_then(|tb| tb.rows_for(leading_rows, prefill_rows)),
             }
         }
 
@@ -1761,7 +1889,7 @@ mod amd_serve {
             use plow_asset::token_batch::{Phase, Request, Selection};
             if !self.chunk_prefill
                 || self.decode_only
-                || !matches!(self.ranks, Ranks::One(_))
+                || (matches!(self.ranks, Ranks::Tp(_)) && self.token_batch_tp.is_none())
                 || members.is_empty()
             {
                 return Err(RuntimeError::Rejected("invalid AMD token batch".into()));
@@ -1880,16 +2008,30 @@ mod amd_serve {
                 )));
             }
             output.clear();
-            let Ranks::One(e) = &mut self.ranks else {
-                unreachable!()
-            };
-            e.token_batch_requests_step(
-                rows,
-                &requests,
-                &self.slot_generation,
-                &mut self.pos_stage,
-                output,
-            )?;
+            match &mut self.ranks {
+                Ranks::One(e) => e.token_batch_requests_step(
+                    rows,
+                    &requests,
+                    &self.slot_generation,
+                    &mut self.pos_stage,
+                    output,
+                )?,
+                Ranks::Tp(g) => {
+                    let tb = self
+                        .token_batch_tp
+                        .as_mut()
+                        .expect("the TP token batch was checked above");
+                    tb.step(
+                        g,
+                        rows,
+                        &requests,
+                        &self.slot_generation,
+                        &mut self.pos_stage,
+                        self.max_ctx,
+                        output,
+                    )?;
+                }
+            }
             for &(slot, _) in feeds {
                 self.pos[slot] = self.pos_stage[slot];
             }

@@ -221,6 +221,8 @@ impl AmdEngine {
                 "packed_mla_flash",
             ),
             PackedSegmentRoute::Kda => (self.k_packed_kda.unwrap(), WG_THREADS_8, "kda_family_raw"),
+            // The widest decode rung's object: the band is exactly that wide.
+            PackedSegmentRoute::Band => (self.k_decode, WG_THREADS_8, "token_batch_band"),
             PackedSegmentRoute::Primary => {
                 if self.progs[p].small_mla_split_segments[seg] {
                     if active {

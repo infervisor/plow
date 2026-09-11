@@ -3075,13 +3075,10 @@ fn derive_packed_segment_families(prog: &DevProg) -> Result<Vec<u8>> {
     let mut family = vec![None; n_seg];
     let mut pure = vec![true; n_seg];
     for e in &prog.stream {
-        let op = prog
-            .insts
-            .get(e.inst as usize)
-            .ok_or_else(|| {
-                RuntimeError::Device(format!("stream entry references instruction {}", e.inst))
-            })?
-            .op;
+        let inst = prog.insts.get(e.inst as usize).ok_or_else(|| {
+            RuntimeError::Device(format!("stream entry references instruction {}", e.inst))
+        })?;
+        let op = inst.op;
         let next = if op == DevOp::RmsNorm as u16
             || op == DevOp::HeadNormRope as u16
             || op == DevOp::HeadNormRopeFp8 as u16
@@ -3098,6 +3095,17 @@ fn derive_packed_segment_families(prog: &DevProg) -> Result<Vec<u8>> {
             || op == DevOp::KdaChunkCarry as u16
         {
             Some(7)
+        } else if prog.token_batch_body
+            && (op == DevOp::FlashMlaDecode as u16
+                || op == DevOp::FlashMlaDecodeFp8 as u16
+                || op == DevOp::FlashGatherDecode as u16
+                || op == DevOp::IndexScore as u16
+                || op == DevOp::IndexSelect as u16
+                || (op == DevOp::MlaMergeFold as u16 && inst.i[0] != prog.t))
+        {
+            // The slot band's batched decode attention inside a token-batch body: the
+            // prefill fold (`i0 == T`) stays with the primary segments, the band fold does not.
+            Some(packet::devbuild::TOKEN_BATCH_BAND_SEGMENT_CLASS)
         } else {
             None
         };
@@ -5030,6 +5038,15 @@ fn stage_packed_prompt_rows(
     Ok(rows)
 }
 
+/// The slot-band width a token-batch body samples: its selection stage's `n_batch`.
+fn token_batch_band(insts: &[DevInst64]) -> Option<u32> {
+    insts
+        .iter()
+        .find(|d| d.op == DevOp::Argmax as u16)
+        .map(|d| d.i[1])
+        .filter(|&band| band > 0)
+}
+
 fn check_packed_prefill_dispatch(binding: Option<PackedPrefillBinding>, prog: usize) -> Result<()> {
     if let Some(bound) = binding.filter(|b| b.prog != prog) {
         return Err(RuntimeError::Device(format!(
@@ -5058,6 +5075,9 @@ enum PackedSegmentRoute {
     MlaNorm,
     MlaFlash,
     Kda,
+    /// A token-batch body's slot-band attention segment: the decode object, whose inventory
+    /// carries the batched MLA decode / index arms the band runs.
+    Band,
 }
 
 fn packed_segment_route(
@@ -5083,6 +5103,9 @@ fn packed_segment_route(
         5 => (mla_norm, PackedSegmentRoute::MlaNorm, "MLA norm/cache"),
         6 => (mla_flash, PackedSegmentRoute::MlaFlash, "MLA flash"),
         7 => (kda, PackedSegmentRoute::Kda, "KDA"),
+        packet::devbuild::TOKEN_BATCH_BAND_SEGMENT_CLASS => {
+            (true, PackedSegmentRoute::Band, "token-batch band")
+        }
         _ => {
             return Err(RuntimeError::Device(format!(
                 "packed-prefill segment has unknown operator-family class {class}"
@@ -5177,7 +5200,7 @@ impl CounterBankState {
 struct AmdProg {
     t: u32,
     packed_prefill_only: bool,
-    token_batch_body: false,
+    token_batch_body: bool,
     packed_dense: bool,
     packed_dense_error: Option<String>,
     packed_needs_mla: bool,
@@ -8896,7 +8919,7 @@ impl AmdEngine {
             progs.push(AmdProg {
                 t: p.t,
                 packed_prefill_only: p.packed_prefill_only,
-                token_batch_body: false,
+                token_batch_body: p.token_batch_body,
                 packed_dense_error: check_packed_dense_program(&p.insts)
                     .err()
                     .map(|e| e.to_string()),
@@ -9820,7 +9843,7 @@ impl AmdEngine {
         self.progs[..self.dec_lo]
             .iter()
             .enumerate()
-            .filter(|(_, p)| !p.packed_prefill_only)
+            .filter(|(_, p)| !p.packed_prefill_only && !p.token_batch_body)
             .map(|(index, p)| (index, p.t))
     }
 
@@ -9883,6 +9906,161 @@ impl AmdEngine {
     /// Remove the current packed-prefill binding. Device buffers remain allocated for reuse.
     pub fn clear_packed_prefill(&mut self) {
         self.packed_prefill = None;
+    }
+
+    /// The token-batch BODY programs of this blob as `(program, rows, band)`, ascending by
+    /// rows (`packet::devbuild::TOKEN_BATCH_PROG`). Empty on a blob emitted without
+    /// `PLOW_TOKEN_BATCH_TP`.
+    pub fn token_batch_bodies(&self) -> Vec<(usize, u32, u32)> {
+        self.progs[..self.dec_lo]
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.token_batch_body)
+            .filter_map(|(i, p)| token_batch_band(&self.pf_src[i]).map(|band| (i, p.t, band)))
+            .collect()
+    }
+
+    /// Stage one token-batch body step (`plans/unified-token-batch.md`, "AMD TP8 lowering
+    /// decision"): a [`plow_asset::mixed_step::SpanCover::SlotBand`] plan whose band rows are
+    /// this engine's KV slots. Uploads the span table and parked mask (the packed-prefill
+    /// binding the body's family segments resolve rows through), grows VMM per mapped end,
+    /// stages per-slot `in.kvlen` (band rows and spans share it — row t IS slot t), the
+    /// plan's `in.ids`/`in.pos` for every row, and shrinks the T-row packets to the live row
+    /// count. Dispatch is the caller's: on TP no rank may launch before every rank accepted the
+    /// same plan.
+    pub fn token_batch_body_prepare(
+        &mut self,
+        prog: usize,
+        plan: &plow_asset::mixed_step::Plan,
+    ) -> Result<()> {
+        use plow_asset::mixed_step::SpanCover;
+        let program = self.progs.get(prog).ok_or_else(|| {
+            RuntimeError::Device(format!("token-batch body {prog} is out of range"))
+        })?;
+        if !program.token_batch_body {
+            return Err(RuntimeError::Device(format!(
+                "program {prog} is not a token-batch body"
+            )));
+        }
+        let rung = program.t;
+        let SpanCover::SlotBand { band } = plan.cover else {
+            return Err(RuntimeError::Rejected(
+                "token-batch body needs a slot-band plan".into(),
+            ));
+        };
+        let body_band = token_batch_band(&self.pf_src[prog]);
+        if body_band != Some(band) {
+            return Err(RuntimeError::Rejected(format!(
+                "plan band {band} does not match token-batch body {prog}'s band {body_band:?}"
+            )));
+        }
+        if plan.rows.len() != rung as usize {
+            return Err(RuntimeError::Rejected(format!(
+                "plan has {} rows, token-batch body {prog} is {rung} rows wide",
+                plan.rows.len()
+            )));
+        }
+        if self.kv_slot != 0 {
+            return Err(RuntimeError::Device(format!(
+                "token batch requires the shared KV base, currently rebased to slot {}",
+                self.kv_slot
+            )));
+        }
+        plow_asset::mixed_step::validate_slot_band(plan, self.batch, self.max_ctx as u32)
+            .map_err(RuntimeError::Rejected)?;
+        self.check_packed_prefill_program(prog)?;
+        let spans = plan.prefill_spans.as_slice();
+        let parked = plan.parked.as_slice();
+        if spans.iter().any(|span| span.program as usize != prog) {
+            return Err(RuntimeError::Rejected(
+                "token-batch span names a program other than the staged body".into(),
+            ));
+        }
+        if spans.len() > self.prefill_span_capacity || parked.len() > self.prefill_row_capacity {
+            return Err(RuntimeError::Device(format!(
+                "token-batch metadata exceeds staging capacity: spans {}/{}, rows {}/{}",
+                spans.len(),
+                self.prefill_span_capacity,
+                parked.len(),
+                self.prefill_row_capacity
+            )));
+        }
+        self.packed_prefill = None;
+        let span_bytes = std::mem::size_of_val(spans);
+        let parked_bytes = std::mem::size_of_val(parked);
+        let parked_off = self.prefill_span_capacity * std::mem::size_of::<PrefillSpan>();
+        self.h_prefill_meta.as_mut_slice()[..span_bytes].copy_from_slice(as_bytes(spans));
+        self.h_prefill_meta.as_mut_slice()[parked_off..parked_off + parked_bytes]
+            .copy_from_slice(as_bytes(parked));
+        self.be.memcpy_htod_pinned_batch(&[
+            (
+                self.d_prefill_spans.base,
+                &self.h_prefill_meta.as_slice()[..span_bytes],
+            ),
+            (
+                self.d_prefill_parked.base,
+                &self.h_prefill_meta.as_slice()[parked_off..parked_off + parked_bytes],
+            ),
+        ])?;
+        self.packed_prefill = Some(PackedPrefillBinding {
+            prog,
+            n_spans: spans.len() as u32,
+            n_rows: rung,
+        });
+
+        for &(slot, end) in &plan.mapped_ends {
+            self.vmm_ensure(slot as usize, end)?;
+            if !self.kda_conv_bank_pairs.is_empty() {
+                self.kda_conv_alt_stale[slot as usize] = true;
+            }
+        }
+
+        // Per-slot `in.kvlen`: the band's decode attention reads `kv_len[t]` for row t and the
+        // packed flash reads `kv_len[span.slot]`, so one array serves both. A slot that is both
+        // a parked band row and a live span takes the span's length.
+        if let Some(t) = self.t_kvlen {
+            let stage = self.h_scalar.as_mut_slice();
+            for slot in 0..self.batch {
+                stage[slot * 4..slot * 4 + 4].copy_from_slice(&1u32.to_le_bytes());
+            }
+            for (slot, row) in plan.rows.iter().take(band as usize).enumerate() {
+                if plan.parked[slot] == 0 {
+                    stage[slot * 4..slot * 4 + 4].copy_from_slice(&row.kv_len.to_le_bytes());
+                }
+            }
+            for span in spans {
+                let slot = span.slot as usize;
+                let current = u32::from_le_bytes(stage[slot * 4..slot * 4 + 4].try_into().expect("4"));
+                stage[slot * 4..slot * 4 + 4]
+                    .copy_from_slice(&current.max(span.kv_len).to_le_bytes());
+            }
+            self.be.memcpy_htod_pinned(
+                self.devp[t].base,
+                &self.h_scalar.as_slice()[..self.batch * 4],
+            )?;
+        }
+
+        // `in.ids` / `in.pos` for every compiled row, straight from the plan: band rows carry
+        // their token at their own position, span rows their prompt tokens, parked rows zero.
+        let bytes = rung as usize * 4;
+        {
+            let s = self.h_scalar.as_mut_slice();
+            s[..bytes * 2].fill(0);
+            for (row, r) in plan.rows.iter().enumerate() {
+                s[row * 4..row * 4 + 4].copy_from_slice(&r.token.to_le_bytes());
+                let off = bytes + row * 4;
+                s[off..off + 4].copy_from_slice(&r.position.to_le_bytes());
+            }
+        }
+        let d_ids = self.devp[self.need(self.t_ids, "in.ids")?].base;
+        let d_pos = self.devp[self.need(self.t_pos, "in.pos")?].base;
+        self.be.memcpy_htod_pinned_batch(&[
+            (d_ids, &self.h_scalar.as_slice()[..bytes]),
+            (d_pos, &self.h_scalar.as_slice()[bytes..bytes * 2]),
+        ])?;
+        // Shrink the T-row packets to the live rows (band + spans). Band-width packets
+        // (`i0 == band`) are not bucket-width and are left alone by the rebase.
+        self.patch_prefill_rows(prog, 0, plan.real_rows, Some(rung))
     }
 
     /// Upload bytes into a named tensor (block I/O, and weight loaders).
@@ -11443,6 +11621,9 @@ impl AmdEngine {
                 );
                 insts[lm].i[4] = 0;
             }
+            // A token-batch body samples its whole slot band `[0, band)` through a tiled
+            // GEMM; there is no last-row a_row0 to place and `i[4]` is not that field there.
+            (Some(_), _) if self.progs[prog].token_batch_body => {}
             (Some(lm), _) => insts[lm].i[4] = clen - 1,
             (None, Some(_)) => {
                 // A BLOCK can DECLARE act.logits and never write it — the
@@ -12561,7 +12742,10 @@ impl AmdEngine {
 
     /// Compiled row count for a prefill program. Decode program indices are rejected.
     pub fn prefill_prog_t(&self, prog: usize) -> Option<u32> {
-        (prog < self.dec_lo && !self.progs[prog].packed_prefill_only).then(|| self.progs[prog].t)
+        (prog < self.dec_lo
+            && !self.progs[prog].packed_prefill_only
+            && !self.progs[prog].token_batch_body)
+            .then(|| self.progs[prog].t)
     }
 
     /// The decode rung widths, ascending. One entry without a ladder.

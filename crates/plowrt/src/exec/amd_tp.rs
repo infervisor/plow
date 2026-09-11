@@ -1282,6 +1282,94 @@ impl AmdTpGroup {
             .then_some(t)
     }
 
+    /// The token-batch bodies every rank carries identically, `(program, rows, band)`; empty
+    /// when the ranks disagree, so a disagreeing group offers no body rather than one some
+    /// rank cannot execute.
+    pub fn token_batch_bodies(&self) -> Vec<(usize, u32, u32)> {
+        let Some(first) = self.ranks.first() else {
+            return Vec::new();
+        };
+        let bodies = first.token_batch_bodies();
+        if self.ranks.iter().all(|rank| rank.token_batch_bodies() == bodies) {
+            bodies
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// One token-batch body step on every rank: stage the same slot-band plan on all ranks,
+    /// one `xctr` reset, segment-major enqueue with an all-rank drain per segment (the
+    /// packed-prefill protocol), audit, then the band's sampled ids from rank 0 — every rank's
+    /// copy compared over the sampled rows on the agreement cadence. Returns the ids of ALL
+    /// band rows; the caller reads the ones its plan sampled. Any rank's failure fails the
+    /// step for every request in it, and the packed binding is cleared either way.
+    pub fn token_batch_body_step(
+        &mut self,
+        prog: usize,
+        plan: &plow_asset::mixed_step::Plan,
+    ) -> Result<Vec<u32>> {
+        self.clear_packed_prefill();
+        let result = self.token_batch_body_step_inner(prog, plan);
+        self.clear_packed_prefill();
+        result
+    }
+
+    fn token_batch_body_step_inner(
+        &mut self,
+        prog: usize,
+        plan: &plow_asset::mixed_step::Plan,
+    ) -> Result<Vec<u32>> {
+        let plow_asset::mixed_step::SpanCover::SlotBand { band } = plan.cover else {
+            return Err(RuntimeError::Rejected(
+                "token-batch body needs a slot-band plan".into(),
+            ));
+        };
+        for e in &mut self.ranks {
+            e.token_batch_body_prepare(prog, plan)?;
+            e.rearm_prog(prog)?;
+        }
+        self.group.zero_xctr()?;
+        let launches = self.ranks[0].prog_dispatch(prog).launches();
+        if let Some(rank) = self
+            .ranks
+            .iter()
+            .position(|e| e.prog_dispatch(prog).launches() != launches)
+        {
+            return Err(RuntimeError::Device(format!(
+                "rank {rank} token-batch body {prog} has {} segments, rank 0 has {launches}",
+                self.ranks[rank].prog_dispatch(prog).launches()
+            )));
+        }
+        for seg in 0..launches {
+            for e in &mut self.ranks {
+                e.enqueue_segment(prog, seg)?;
+            }
+            for e in &self.ranks {
+                e.drain()?;
+            }
+        }
+        if self.audit {
+            self.group.audit_xctr(&self.gate_expect[prog])?;
+        }
+        let ids = self.ranks[0].read_sampled_batched(band as usize)?;
+        if agreement_due(&mut self.agree_tick, self.agree_every) {
+            for rank in 1..self.ranks.len() {
+                let other = self.ranks[rank].read_sampled_batched(band as usize)?;
+                for &slot in &plan.decode_slots {
+                    let s = slot as usize;
+                    if other[s] != ids[s] {
+                        return Err(RuntimeError::Device(format!(
+                            "token-batch band row {s}: rank 0 sampled {} but rank {rank} \
+                             sampled {} — a collective did not run or a rank bound the wrong shard",
+                            ids[s], other[s]
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(ids)
+    }
+
     /// §5.4's D-class span limit, agreed across ranks: the MINIMUM, and 0 for a rank that
     /// refuses the program, so a disagreeing group admits no packed span rather than a plan one
     /// rank cannot execute. Every rank carries the same program, so in practice they agree.
