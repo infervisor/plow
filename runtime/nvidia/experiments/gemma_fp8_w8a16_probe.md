@@ -10,19 +10,35 @@ Build from the repository root with the installed CUDA toolkit:
 ```sh
 nix develop -c env -i PATH=/usr/local/cuda/bin:/usr/bin:/bin /usr/local/cuda/bin/nvcc \
   -arch=sm_90a -O3 -std=c++17 -I runtime/common -I runtime/nvidia \
-  runtime/nvidia/experiments/gemma_fp8_w8a16_probe.cu -o /tmp/gemma_fp8_w8a16_probe
+  runtime/nvidia/experiments/gemma_fp8_w8a16_probe.cu -lcuda -o /tmp/gemma_fp8_w8a16_probe
 nix develop -c env -i PATH=/usr/local/cuda/bin:/usr/bin:/bin \
   LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu \
   /tmp/gemma_fp8_w8a16_probe
 ```
 
-Optional arguments select one shape: `M N K`; K must be a positive multiple of
+Optional arguments select one shape: `M N K [packet-blocks]`; K must be a positive multiple of
 256. Exact integer cases always run first, including ragged M=17/N=71. The
 standalone control calls production `d_gemv_fp8` with `GV_MM_MAX=16`, matching
 the campaign's FP8 decode configuration. It measures 132/264/528 control CTAs
 and split-K 1/2/4/8. The candidate's actual grid is
 `ceil(N/64) × ceil(M/16) × splits`; the printed `blocks` field applies only to
 the production control.
+
+For a packet-derived sweep, run `w8a16_decode_ladder.py AUDIT_JSON PROBE OUTPUT_DIR`.
+The output directory must be new. It tests every distinct plain `GemvFp8`
+shape and the emitted instruction's CTA count, preserving program/PC references.
+Fused GLU, BF16 head and attention require separate probes.
+
+`--cubin MAIN_CUBIN` additionally loads the production interpreter. Build the
+probe with matching `PLOW_NV_FP8_RB` and `GV_MM_MAX` settings. The interpreter's
+embedded arena also selects the staged standalone path where K fits. Two extra
+rows use `split=16` for queue plus dependency edges and `split=32` for queue
+without edges; these are diagnostic mode identifiers, not split-K kernels.
+Both launch132 persistent CTAs, while `blocks` records instruction slices.
+The probe checks completed counters and numerical outputs. Resets occur before
+the timing event. Standalone vs interpreter also changes grid, register pressure
+and scheduling, so their difference is not pure counter overhead. Only the two
+loaded modes isolate the dependency-edge change in this one-op program.
 
 H100 80GB, CUDA 13.2, 2026-09-09: median of 15 CUDA-event measurements, 256MiB
 cache flush before each, four warmups, no other GPU jobs or CPU builds during
