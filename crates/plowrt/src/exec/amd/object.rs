@@ -1844,12 +1844,19 @@ pub(super) fn check_dsa_select_local(
                 RuntimeError::Device(
                 "local DSA selection requires unpacked gfx942 TP8 decode rows 2/4/8/16/20, unpooled top2048 and row-sized operands".into())
             };
+            // A token-batch body runs the decode form over its slot band inside a prefill-width
+            // program: the band (the packet's block count) is the row count, not `p.t`.
+            let rows = if p.token_batch_body {
+                u32::from(d.blocks)
+            } else {
+                p.t
+            };
             if arch != "gfx942"
                 || !tp8
-                || program < dec_ix
+                || (program < dec_ix && !p.token_batch_body)
                 || p.packed_prefill_only
-                || !matches!(p.t, 2 | 4 | 8 | 16 | 20)
-                || u32::from(d.blocks) != p.t
+                || !matches!(rows, 2 | 4 | 8 | 16 | 20)
+                || u32::from(d.blocks) != rows
                 || !(2048..=131072).contains(&d.i[0])
                 || d.i[1..] != [2048, 0, 0, 1, 0, 0, 0]
                 || d.fj != [0; 3]
@@ -1864,9 +1871,9 @@ pub(super) fn check_dsa_select_local(
                 return Err(err());
             }
             for (handle, bytes) in handles.into_iter().zip([
-                u64::from(p.t) * 2048 * 4,
-                u64::from(p.t) * u64::from(d.i[0]) * 4,
-                u64::from(p.t) * 4,
+                u64::from(rows) * 2048 * 4,
+                u64::from(rows) * u64::from(d.i[0]) * 4,
+                u64::from(rows) * 4,
             ]) {
                 if tensors.get(handle as usize).is_none_or(|t| t.bytes < bytes) {
                     return Err(err());

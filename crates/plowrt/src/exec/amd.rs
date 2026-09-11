@@ -3248,6 +3248,22 @@ fn packed_mla_compatible(prog: &DevProg) -> bool {
     })
 }
 
+/// A token-batch body runs its class-A native segments (AITER MoE, hipBLASLt projections, the
+/// native fold) over the dense live rows exactly as an ordinary program does — the slot-band
+/// descriptor changes only how the MLA family segments address KV. What the packed flash arm
+/// cannot serve is the same for a body as for a packed program: gathered/sparse or NoPE flash.
+fn token_batch_body_compatible(prog: &DevProg) -> bool {
+    !prog.insts.iter().any(|d| {
+        sparse_fp8(d)
+            || d.op == DevOp::FlashGatherPrefill as u16
+            || d.op == DevOp::IndexTpPf as u16
+            || ((d.op == DevOp::FlashMlaPrefill as u16 || d.op == DevOp::FlashMlaPrefillFp8 as u16)
+                && (d.i[3] & 0x8000_0000 != 0
+                    || (d.t[7] != packet::dev::TENSOR_NONE16
+                        && d.op != DevOp::FlashMlaPrefillFp8 as u16)))
+    })
+}
+
 fn packed_kda_compatible(prog: &DevProg) -> bool {
     if prog.insts.iter().any(|d| {
         matches!(
@@ -9041,7 +9057,11 @@ impl AmdEngine {
                         || d.op == DevOp::FlashMlaPrefill as u16
                         || d.op == DevOp::FlashMlaPrefillFp8 as u16
                 }),
-                packed_mla_compatible: packed_mla_compatible(p),
+                packed_mla_compatible: if p.token_batch_body {
+                    token_batch_body_compatible(p)
+                } else {
+                    packed_mla_compatible(p)
+                },
                 packed_mla_segmented,
                 packed_needs_kda: p.insts.iter().any(|d| {
                     d.op == DevOp::KdaConv3 as u16

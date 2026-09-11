@@ -391,6 +391,7 @@ the 2026-09-04 audit that removed the rejected experiment knobs are in
 | `PLOW_GLM_DECODE_NORM_ROWS` | `--glm-decode-norm-rows` | false | Give each batched GLM RMSNorm / AddNorm row its own workgroup. Bit-identical; +2.7%, P99 TPOT −11%. |
 | `PLOW_GLM_GEMM_LT` | `--glm-gemm-lt` | false | Qualified gfx942 hipBLASLt assembly for the large GLM prefill projections (3 shapes). Bit-exact vs capture; +2.1%. |
 | `PLOW_GLM_GEMM_LT_DECODE` | `--glm-gemm-lt-decode` | false | Native gfx942 hipBLASLt BF16 projections at decode rungs 16 and 20 (633 GEMMs). ≤0.17% rel-L2; +5.7% then +2.4% across two screens. |
+| `PLOW_GLM_GEMM_LT_DECODE_EXT` | `--glm-gemm-lt-decode-ext` | false | Extends `PLOW_GLM_GEMM_LT_DECODE` to rung 8 and to the narrow decode projections (k_rope, q_rope, indexer k/weights, lm_head; +199 native GEMMs at rungs 16/20, 11 shapes at rung 8). Same pinned object. Standalone cold medians on one MI300X: those five shapes 13.9-15.6 µs vs 26-60 µs on the MM16 GEMV (rung 20: −7.5 ms of an 11.9 ms traced GEMV body); rung 8: −9 ms/step. Not yet served: needs the 8-GPU C20 A/B before it is a default. |
 | `PLOW_GLM_FOLD_LT` | `--glm-fold-lt` | false | Native gfx942 FP32 MLA fold GEMMs during prefill. Measured +0.49% with P99 +3.6% — not a default candidate. |
 | `PLOW_GLM_PF_WIDE` | `--glm-pf-wide` | true | Widen prefill norm/residual dispatch across CUs. DEFAULT ON (`=0` restores the single-workgroup emit for A/B). Bit-identical either way. |
 | `PLOW_GLM_PLACE_PF` | `--glm-place-pf` | false | Per-XCD CU placement for the GLM prefill chain. |
