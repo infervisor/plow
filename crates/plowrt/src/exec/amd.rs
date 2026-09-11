@@ -3387,6 +3387,37 @@ fn packed_sparse_refusal(
     None
 }
 
+/// A token-batch body's native-only packets (`GemmLtPf`, `MoeAiterFp8Pf`) must each sit in a
+/// segment that carries their route: the interpreter has no arm for them, and its dispatch
+/// `default:` writes nothing without trapping. Measured on gfx942 TP8 when the dispatch gate
+/// withheld the routes under the packed binding: the residual stream went NaN from the first
+/// MoE layer, every KV row the body wrote was NaN and every band row sampled token 0.
+fn token_batch_body_native_routes(
+    prog: &DevProg,
+    routes: &[PrefillSegmentRoute],
+) -> std::result::Result<(), String> {
+    for e in &prog.stream {
+        let Some(inst) = prog.insts.get(e.inst as usize) else {
+            continue;
+        };
+        let route = routes.get(e.seg as usize);
+        let covered = match DevOp::from_u16(inst.op) {
+            Some(DevOp::GemmLtPf) => matches!(route, Some(PrefillSegmentRoute::GemmLt(_))),
+            Some(DevOp::MoeAiterFp8Pf) => matches!(route, Some(PrefillSegmentRoute::MoeAiter(_))),
+            _ => true,
+        };
+        if !covered {
+            return Err(format!(
+                "token-batch body segment {} carries {:?} without its native route; the \
+                 interpreter has no arm for it",
+                e.seg,
+                DevOp::from_u16(inst.op)
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn packed_kda_compatible(prog: &DevProg) -> bool {
     if prog.insts.iter().any(|d| {
         matches!(
@@ -5475,6 +5506,8 @@ struct AmdProg {
     /// one packed launch, `Err(msg)` = this program's recurrent operators have no packed form at
     /// all and `msg` names which one. Computed once at load, not per tick.
     packed_recurrent_spans: std::result::Result<u32, String>,
+    /// [`token_batch_body_native_routes`] for a token-batch body; `Ok` for every other program.
+    token_batch_native_routes: std::result::Result<(), String>,
     n_inst: u32,
     trace_records: usize,
     n_counter: u32,
@@ -9376,6 +9409,11 @@ impl AmdEngine {
                 packed_recurrent_spans: crate::exec::amd::packed::recurrent_span_limit(
                     p.insts.iter().map(|d| d.op),
                 ),
+                token_batch_native_routes: if p.token_batch_body {
+                    token_batch_body_native_routes(p, &prefill_routes)
+                } else {
+                    Ok(())
+                },
                 decode_routes,
                 prefill_routes,
                 _xreduce_attnres_args: xreduce_attnres_args,
@@ -10186,6 +10224,12 @@ impl AmdEngine {
             )));
         }
         check_packed_prefill_abi(self.packed_prefill_prefill_abi, false, false)?;
+        if program.token_batch_body {
+            program
+                .token_batch_native_routes
+                .as_ref()
+                .map_err(|e| RuntimeError::Device(e.clone()))?;
+        }
         if program.prefill_routes.iter().any(|r| {
             matches!(
                 r,

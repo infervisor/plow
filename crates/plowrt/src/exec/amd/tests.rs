@@ -5122,3 +5122,67 @@ fn packed_prefill_predicate_admits_native_moe_and_gemm_lt_and_refuses_sparse_sel
     assert_eq!((table[1].kv_base, table[1].kv_len), (0, 2055));
     assert!(kv_span_table(&[PrefillSpan { slot: u32::MAX, ..Default::default() }], 81920).is_err());
 }
+
+/// A token-batch body whose one segment is the hipBLASLt projection `emit_glm_lt_gemm` emits at
+/// `t >= 2048` (`GemmLtPf`, an opcode the interpreter cannot execute).
+fn token_batch_body_probe(t: u32) -> (DevProg, Vec<crate::asset::devblob::DevTensor>) {
+    let prog = DevProg {
+        t,
+        packed_prefill_only: false,
+        token_batch_body: true,
+        n_counter: 0,
+        insts: vec![DevInst64 {
+            op: DevOp::GemmLtPf as u16,
+            t: [
+                0,
+                1,
+                2,
+                packet::dev::TENSOR_NONE16,
+                packet::dev::TENSOR_NONE16,
+                packet::dev::TENSOR_NONE16,
+                packet::dev::TENSOR_NONE16,
+                packet::dev::TENSOR_NONE16,
+            ],
+            i: [t, 2048, 6144, 0, 0, 0, 0, 0],
+            ..Default::default()
+        }],
+        stream: vec![packet::dev::StreamEnt {
+            inst: 0,
+            seg: 0,
+            ..Default::default()
+        }],
+        stream_ofs: vec![],
+        stream_len: vec![],
+        waits: vec![],
+        succs: vec![],
+        gq_stream: vec![],
+        gq_seg_ofs: vec![],
+        l2_domains: 0,
+    };
+    let tensors = (0..3)
+        .map(|i| crate::asset::devblob::DevTensor {
+            name: i.to_string(),
+            bytes: 1 << 30,
+            init: None,
+        })
+        .collect();
+    (prog, tensors)
+}
+
+/// A body's native-only packets (`GemmLtPf`, `MoeAiterFp8Pf`) have no interpreter arm: a
+/// segment carrying one without its native route is a silent no-op that left every body step
+/// on gfx942 TP8 sampling token 0 from all-NaN logits. Such a body is refused by name at load.
+#[test]
+fn token_batch_body_refuses_a_native_only_packet_without_its_route() {
+    let (prog, tensors) = token_batch_body_probe(2048);
+    let route = crate::exec::amd_gemm_lt::routes(&prog, &tensors, 1).unwrap()[0]
+        .expect("a GemmLtPf segment derives its hipBLASLt route");
+    assert!(token_batch_body_native_routes(&prog, &[PrefillSegmentRoute::GemmLt(route)]).is_ok());
+    let err = token_batch_body_native_routes(&prog, &[PrefillSegmentRoute::Interpreter])
+        .unwrap_err();
+    assert!(err.contains("GemmLtPf"), "{err}");
+    // An ordinary packed program is not held to it: the check is keyed on the body flag.
+    let (mut plain, _) = token_batch_body_probe(2048);
+    plain.token_batch_body = false;
+    assert!(token_batch_body_native_routes(&plain, &[PrefillSegmentRoute::Interpreter]).is_err());
+}

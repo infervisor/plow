@@ -776,6 +776,18 @@ mod amd_serve {
                 .iter()
                 .map(|&slot| ids[slot as usize])
                 .collect();
+            if crate::obs::tick::on() {
+                let spans = requests
+                    .iter()
+                    .filter(|r| r.phase == plow_asset::token_batch::Phase::Prefill)
+                    .count();
+                eprintln!(
+                    "TBSTEP rows={rows} body={prog} requests={} spans={spans} decode={} samples={}",
+                    requests.len(),
+                    requests.len() - spans,
+                    tokens.len()
+                );
+            }
             if !self.fired {
                 tracing::info!(
                     route = "unified-token-batch/slot-band",
