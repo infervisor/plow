@@ -660,6 +660,11 @@ struct Inner {
     stats: VmmStats,
 }
 
+enum PublishLocked {
+    Done { unused_snapshot: Option<u64> },
+    NeedSnapshot,
+}
+
 struct Shared {
     ops: Arc<dyn VmmOps>,
     geo: VmmGeometry,
@@ -1232,119 +1237,49 @@ impl VmmKv {
             ));
         }
         let s = &self.shared;
-        let mut inner = s.inner.lock();
         if rows == 0 {
             return Ok(());
         }
-        if rows as usize > tokens.len()
-            || rows > s.geo.max_ctx
-            || rows.div_ceil(s.block_rows) > inner.seq_blocks[seq]
-            || snap_bytes == 0
+        let generation = s.generation[seq].load(Ordering::Acquire);
         {
-            return Err(RuntimeError::Rejected("vmm: unpublished rows or empty snapshot".into()));
-        }
-        let prior = &inner.seqs[seq].tokens;
-        let overlap = prior.len().min(tokens.len());
-        if tokens[..overlap] != prior[..overlap] {
-            return Err(RuntimeError::Rejected("vmm: published tokens changed the attached stream".into()));
-        }
-        let hashes = hash_blocks(&tokens[..rows as usize], s.block_rows);
-        let n_pub = hashes.len();
-        let prompt_rows = match inner.seqs[seq].prompt_rows {
-            0 => tokens.len(),
-            rows => rows,
-        };
-        let reusable_prompt = (rows as usize) < prompt_rows;
-
-        let m = inner.cache.lookup(&hashes, tokens);
-        let pid = inner.next_pub;
-        inner.next_pub += 1;
-        let n_ok = inner.cache.insert(&hashes, tokens, pid, m.blocks);
-        // A collision (or stale path) stopped the insert early: blocks past
-        // n_ok have no tree node — referencing them would leak their handles
-        // behind a key no lookup can ever reach.
-        if n_ok != n_pub {
-            inner.cache.release(&hashes, m.blocks);
-            return Err(RuntimeError::Rejected("vmm: prefix publication collided".into()));
-        }
-
-        // Hand the cache a reference on every newly-published block.
-        let kvh = s.geo.kvh_full as usize;
-        for idx in m.blocks..n_pub {
-            let mut ids = Vec::with_capacity(inner.tracks.len() * kvh);
-            for t in 0..inner.tracks.len() {
-                for h in 0..kvh {
-                    let slot = slot_index(s, seq, h as u32, idx as u32);
-                    let id = inner.tracks[t].slots[slot]
-                        .expect("published block below the mapped frontier");
-                    ids.push(id);
-                }
+            let mut inner = s.inner.lock();
+            if let PublishLocked::Done { unused_snapshot } =
+                publish_locked(s, &mut inner, seq, tokens, rows, snap_bytes, None)?
+            {
+                debug_assert!(unused_snapshot.is_none());
+                return Ok(());
             }
-            for &id in &ids {
-                inner.blocks[id as usize].refs += 1;
-            }
-            inner.stats.cache_blocks += ids.len() as u64;
-            inner.stats.cache_bytes += ids.len() as u64 * s.block_bytes;
-            inner.node_blocks.insert((pid, idx as u32), ids);
         }
-        // Path references: replace the admission-time holds with one hold per
-        // published node (released at the next begin_seq), and record the
-        // published stream so a later (longer) publish extends it.
-        release_prefix_hold(&mut inner, seq);
-        inner.seqs[seq] = SlotSeq {
-            tokens: tokens.to_vec(),
-            prompt_rows,
-            hashes,
-            held: n_pub,
-            snapshot: None,
-        };
 
-        // Boundary snapshot, keyed by the boundary node's identity.
-        let bkey = if n_pub == 0 {
-            None
-        } else if n_pub <= m.blocks {
-            Some(m.placed[n_pub - 1])
-        } else {
-            Some((pid, n_pub as u32 - 1))
+        let va = alloc_snapshot(s, snap_bytes)?;
+        if let Err(error) = fill(va) {
+            s.ops.free(va);
+            return Err(error);
+        }
+        if s.generation[seq].load(Ordering::Acquire) != generation {
+            s.ops.free(va);
+            return Err(RuntimeError::Rejected(
+                "vmm: sequence changed during prefix publication".into(),
+            ));
+        }
+
+        let result = {
+            let mut inner = s.inner.lock();
+            publish_locked(s, &mut inner, seq, tokens, rows, snap_bytes, Some(va))
         };
-        let tail = &tokens[n_pub * s.block_rows as usize..rows as usize];
-        inner.snapshot_tick += 1;
-        let tick = inner.snapshot_tick;
-        if let Some(snap) = inner.published.get_mut(&bkey)
-            .and_then(|list| list.iter_mut().find(|snap| snap.rows == rows && snap.tail == tail))
-        {
-            snap.last_used = tick;
-            snap.reusable_prompt |= reusable_prompt;
-        } else {
-            let va = loop {
-                match s.ops.alloc(snap_bytes) {
-                    Ok(va) => break va,
-                    Err(error) if matches!(&error, RuntimeError::Oom(_)) => {
-                        if !evict_one(s, &mut inner, false) { return Err(error); }
-                    }
-                    Err(error) => return Err(error),
+        match result {
+            Ok(PublishLocked::Done { unused_snapshot }) => {
+                if let Some(unused) = unused_snapshot {
+                    s.ops.free(unused);
                 }
-            };
-            if let Err(e) = fill(va) {
+                Ok(())
+            }
+            Ok(PublishLocked::NeedSnapshot) => unreachable!("snapshot was supplied"),
+            Err(error) => {
                 s.ops.free(va);
-                return Err(e);
+                Err(error)
             }
-            inner.published.entry(bkey).or_default().push(Snap {
-                    va,
-                    bytes: snap_bytes,
-                    rows,
-                    tail: tail.to_vec(),
-                    users: 0,
-                    last_used: tick,
-                    referenced: false,
-                    reusable_prompt,
-                });
-            inner.stats.snapshot_bytes += snap_bytes;
-            inner.stats.cache_bytes += snap_bytes;
         }
-
-        trim_cache(s, &mut inner);
-        Ok(())
     }
 
     pub fn stats(&self) -> VmmStats {
@@ -1369,6 +1304,140 @@ impl VmmStatsHandle {
     pub fn stats(&self) -> VmmStats {
         stats_of(&self.0)
     }
+}
+
+fn alloc_snapshot(s: &Shared, bytes: u64) -> Result<u64> {
+    loop {
+        match s.ops.alloc(bytes) {
+            Ok(va) => return Ok(va),
+            Err(error) if matches!(&error, RuntimeError::Oom(_)) => {
+                let mut inner = s.inner.lock();
+                if !evict_one(s, &mut inner, false) {
+                    return Err(error);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn publish_locked(
+    s: &Shared,
+    inner: &mut Inner,
+    seq: usize,
+    tokens: &[u32],
+    rows: u32,
+    snap_bytes: u64,
+    snapshot: Option<u64>,
+) -> Result<PublishLocked> {
+    if rows as usize > tokens.len()
+        || rows > s.geo.max_ctx
+        || rows.div_ceil(s.block_rows) > inner.seq_blocks[seq]
+        || snap_bytes == 0
+    {
+        return Err(RuntimeError::Rejected("vmm: unpublished rows or empty snapshot".into()));
+    }
+    let prior = &inner.seqs[seq].tokens;
+    let overlap = prior.len().min(tokens.len());
+    if tokens[..overlap] != prior[..overlap] {
+        return Err(RuntimeError::Rejected("vmm: published tokens changed the attached stream".into()));
+    }
+    let hashes = hash_blocks(&tokens[..rows as usize], s.block_rows);
+    let n_pub = hashes.len();
+    let prompt_rows = match inner.seqs[seq].prompt_rows {
+        0 => tokens.len(),
+        rows => rows,
+    };
+    let reusable_prompt = (rows as usize) < prompt_rows;
+    let tail = &tokens[n_pub * s.block_rows as usize..rows as usize];
+
+    let m = inner.cache.lookup(&hashes, tokens);
+    let matched_key = if n_pub == 0 {
+        Some(None)
+    } else if n_pub <= m.blocks {
+        Some(Some(m.placed[n_pub - 1]))
+    } else {
+        None
+    };
+    let snapshot_exists = matched_key.is_some_and(|key| {
+        inner.published.get(&key).is_some_and(|list| {
+            list.iter().any(|snap| snap.rows == rows && snap.tail == tail)
+        })
+    });
+    if snapshot.is_none() && !snapshot_exists {
+        inner.cache.release(&hashes, m.blocks);
+        return Ok(PublishLocked::NeedSnapshot);
+    }
+
+    let pid = inner.next_pub;
+    inner.next_pub += 1;
+    let n_ok = inner.cache.insert(&hashes, tokens, pid, m.blocks);
+    if n_ok != n_pub {
+        inner.cache.release(&hashes, m.blocks);
+        return Err(RuntimeError::Rejected("vmm: prefix publication collided".into()));
+    }
+
+    let kvh = s.geo.kvh_full as usize;
+    for idx in m.blocks..n_pub {
+        let mut ids = Vec::with_capacity(inner.tracks.len() * kvh);
+        for t in 0..inner.tracks.len() {
+            for h in 0..kvh {
+                let slot = slot_index(s, seq, h as u32, idx as u32);
+                let id = inner.tracks[t].slots[slot]
+                    .expect("published block below the mapped frontier");
+                ids.push(id);
+            }
+        }
+        for &id in &ids {
+            inner.blocks[id as usize].refs += 1;
+        }
+        inner.stats.cache_blocks += ids.len() as u64;
+        inner.stats.cache_bytes += ids.len() as u64 * s.block_bytes;
+        inner.node_blocks.insert((pid, idx as u32), ids);
+    }
+    release_prefix_hold(inner, seq);
+    inner.seqs[seq] = SlotSeq {
+        tokens: tokens.to_vec(),
+        prompt_rows,
+        hashes,
+        held: n_pub,
+        snapshot: None,
+    };
+
+    let bkey = if n_pub == 0 {
+        None
+    } else if n_pub <= m.blocks {
+        Some(m.placed[n_pub - 1])
+    } else {
+        Some((pid, n_pub as u32 - 1))
+    };
+    inner.snapshot_tick += 1;
+    let tick = inner.snapshot_tick;
+    let unused_snapshot = if let Some(snap) = inner.published.get_mut(&bkey)
+        .and_then(|list| list.iter_mut().find(|snap| snap.rows == rows && snap.tail == tail))
+    {
+        snap.last_used = tick;
+        snap.reusable_prompt |= reusable_prompt;
+        snapshot
+    } else {
+        let va = snapshot.expect("preflight cannot commit a missing snapshot");
+        inner.published.entry(bkey).or_default().push(Snap {
+            va,
+            bytes: snap_bytes,
+            rows,
+            tail: tail.to_vec(),
+            users: 0,
+            last_used: tick,
+            referenced: false,
+            reusable_prompt,
+        });
+        inner.stats.snapshot_bytes += snap_bytes;
+        inner.stats.cache_bytes += snap_bytes;
+        None
+    };
+
+    trim_cache(s, inner);
+    Ok(PublishLocked::Done { unused_snapshot })
 }
 
 fn stats_of(s: &Shared) -> VmmStats {
@@ -3276,6 +3345,41 @@ mod tests {
         assert_eq!(ops.frees.load(Ordering::SeqCst), 1);
         p.begin_seq(0);
         assert!(p.try_attach(1, &tokens).unwrap().is_none());
+    }
+
+    #[test]
+    fn snapshot_fill_runs_without_the_pool_lock() {
+        let p = pool(Arc::new(MockVmm::default()));
+        let tokens = prompt(17);
+        p.try_attach(0, &tokens).unwrap();
+        p.ensure_rows(0, 17).unwrap();
+        p.publish_at(0, &tokens, 15, 48, |_| {
+            assert!(p.shared.inner.try_lock().is_some());
+            Ok(())
+        }).unwrap();
+    }
+
+    #[test]
+    fn concurrent_snapshot_publish_keeps_one_buffer() {
+        let ops = Arc::new(MockVmm::default());
+        let p = pool(ops.clone());
+        let tokens = prompt(17);
+        p.try_attach(0, &tokens).unwrap();
+        p.ensure_rows(0, 17).unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                scope.spawn(|| {
+                    p.publish_at(0, &tokens, 15, 48, |_| {
+                        barrier.wait();
+                        Ok(())
+                    }).unwrap();
+                });
+            }
+        });
+        assert_eq!(p.stats().snapshot_bytes, 48);
+        assert_eq!(ops.allocs.load(Ordering::SeqCst), 2);
+        assert_eq!(ops.frees.load(Ordering::SeqCst), 1);
     }
 
     #[test]

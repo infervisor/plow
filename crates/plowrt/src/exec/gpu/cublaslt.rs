@@ -19,6 +19,12 @@ pub(super) struct CublasLtDecodeRoute {
     output: u64,
 }
 
+impl CublasLtDecodeRoute {
+    pub(super) fn run(&self, stream: &CudaStream) -> Result<()> {
+        self.plan.run(self.input, self.weight, self.output, stream)
+    }
+}
+
 pub(super) enum ProjectionBackend {
     Lt(Arc<crate::device::cuda::lt::Lt>),
     Native(Arc<native_decode::Native>),
@@ -194,7 +200,7 @@ pub(super) fn prepare_routes(
         projections = routes.iter().flatten().count(),
         plans = plans.len(),
         native = matches!(backend, ProjectionBackend::Native(_)),
-        "decode projection routes prepared"
+        "projection routes prepared"
     );
     Ok(routes)
 }
@@ -344,26 +350,52 @@ impl GpuEngine {
     }
 }
 
+#[derive(Clone, Copy)]
+enum ProjectionPhase<'a> {
+    Decode,
+    Prefill(&'a str),
+}
+
 pub(super) fn decode_segments(
     program: &DevProg,
     tensors: &[DevTensor],
     roles: &[u8],
 ) -> Result<Vec<Option<DecodeSegment>>> {
-    let fail = || {
-        RuntimeError::Rejected(
-            "packet-declared cuBLASLt decode requires isolated BF16 GEMV segments".into(),
-        )
-    };
-    if !(1..=32).contains(&program.t) || program.l2_domains != 0 || program.gq_stream.is_empty() {
+    projection_segments(program, tensors, roles, ProjectionPhase::Decode)
+}
+
+pub(super) fn prefill_segments(
+    program: &DevProg,
+    tensors: &[DevTensor],
+    roles: &[u8],
+    profile: &str,
+) -> Result<Vec<Option<DecodeSegment>>> {
+    projection_segments(program, tensors, roles, ProjectionPhase::Prefill(profile))
+}
+
+fn projection_segments(
+    program: &DevProg,
+    tensors: &[DevTensor],
+    roles: &[u8],
+    phase: ProjectionPhase<'_>,
+) -> Result<Vec<Option<DecodeSegment>>> {
+    let fail = || RuntimeError::Rejected("invalid packet-declared projection segments".into());
+    let rows = packet::devbuild::program_rows(program.t);
+    if match phase {
+        ProjectionPhase::Decode => !(1..=32).contains(&rows),
+        ProjectionPhase::Prefill(_) => !(1..=128).contains(&rows),
+    } || program.l2_domains != 0
+        || program.gq_stream.is_empty()
+    {
         return Err(fail());
     }
     let count = program.gq_seg_ofs.len().checked_sub(1).ok_or_else(fail)?;
     if count == 0
         || roles.len() != count
-        || !roles
-            .iter()
-            .copied()
-            .any(plow_asset::segment_roles::is_projection)
+        || !roles.iter().copied().any(|role| match phase {
+            ProjectionPhase::Decode => plow_asset::segment_roles::is_projection(role),
+            ProjectionPhase::Prefill(_) => role == plow_asset::segment_roles::CUBLASLT,
+        })
         || program.gq_seg_ofs.first() != Some(&0)
         || program.gq_seg_ofs.last().copied() != Some(program.gq_stream.len() as u32)
     {
@@ -378,17 +410,36 @@ pub(super) fn decode_segments(
         if entries.is_empty() || entries.iter().any(|entry| entry.seg as usize != segment) {
             return Err(fail());
         }
-        if !plow_asset::segment_roles::is_projection(roles[segment]) {
+        let selected = match phase {
+            ProjectionPhase::Decode => plow_asset::segment_roles::is_projection(roles[segment]),
+            ProjectionPhase::Prefill(_) => roles[segment] == plow_asset::segment_roles::CUBLASLT,
+        };
+        if !selected {
             continue;
         }
         let instruction = entries[0].inst as usize;
         let op = program.insts.get(instruction).ok_or_else(fail)?;
-        if op.op != DevOp::Gemv as u16
+        let valid_op = match phase {
+            ProjectionPhase::Decode => op.op == DevOp::Gemv as u16,
+            ProjectionPhase::Prefill(profile) => {
+                matches!(
+                    DevOp::from_u16(op.op),
+                    Some(DevOp::Gemm | DevOp::GemmMed | DevOp::GemmSmall)
+                ) && plow_asset::segment_roles::cublaslt_prefill_bf16(
+                    profile, op.i[0], op.i[1], op.i[2],
+                )
+            }
+        };
+        let valid_immediates = match phase {
+            ProjectionPhase::Decode => op.i[3..].iter().all(|&value| value == 0),
+            ProjectionPhase::Prefill(_) => op.i[3..6].iter().all(|&value| value == 0),
+        };
+        if !valid_op
             || op.t[3..].iter().any(|&t| t != packet::dev::TENSOR_NONE16)
-            || op.i[0] != program.t
+            || op.i[0] != rows
             || op.i[1] == 0
             || op.i[2] == 0
-            || op.i[3..].iter().any(|&value| value != 0)
+            || !valid_immediates
             || entries
                 .iter()
                 .any(|entry| entry.inst as usize != instruction)
@@ -498,6 +549,17 @@ mod tests {
         ]
     }
 
+    fn prefill_fixture(rows: u32, k: u32) -> (DevProg, Vec<DevTensor>) {
+        let (mut program, mut tensors) = fixture(rows);
+        let op = &mut program.insts[1];
+        op.op = DevOp::Gemm as u16;
+        op.i[..].copy_from_slice(&[rows, 3840, k, 0, 0, 0, 17, 18]);
+        tensors[0].bytes = u64::from(rows) * 3840 * 2;
+        tensors[1].bytes = u64::from(rows) * u64::from(k) * 2;
+        tensors[2].bytes = 3840 * u64::from(k) * 2;
+        (program, tensors)
+    }
+
     #[test]
     fn stream_order_replaces_only_library_counter_waits() {
         let (mut g, tensors) = fixture(4);
@@ -570,6 +632,42 @@ mod tests {
                 ]
             );
         }
+    }
+
+    #[test]
+    fn accepts_only_measured_sm90_bf16_prefill_cells() {
+        for rows in [1, 2, 4, 8, 16, 32, 64, 128] {
+            for k in [8192, 15360] {
+                let (program, tensors) = prefill_fixture(rows, k);
+                let routes = prefill_segments(&program, &tensors, &roles(), "sm90a").unwrap();
+                let route = routes[1].expect("measured projection route");
+                assert_eq!((route.m, route.n, route.k), (rows, 3840, k));
+            }
+        }
+
+        for (profile, rows, n, k) in [
+            ("sm120", 128, 3840, 15360),
+            ("sm90a", 129, 3840, 15360),
+            ("sm90a", 128, 4096, 3840),
+            ("sm90a", 128, 3840, 4096),
+        ] {
+            let (mut program, tensors) = prefill_fixture(rows, k);
+            program.insts[1].i[1] = n;
+            assert!(prefill_segments(&program, &tensors, &roles(), profile).is_err());
+        }
+    }
+
+    #[test]
+    fn prefill_projection_rejects_bias_fp8_and_nonisolated_packets() {
+        let (mut program, tensors) = prefill_fixture(128, 15360);
+        program.insts[1].t[7] = 0;
+        assert!(prefill_segments(&program, &tensors, &roles(), "sm90a").is_err());
+        program.insts[1].t[7] = packet::dev::TENSOR_NONE16;
+        program.insts[1].op = DevOp::GemmFp8 as u16;
+        assert!(prefill_segments(&program, &tensors, &roles(), "sm90a").is_err());
+        program.insts[1].op = DevOp::Gemm as u16;
+        program.gq_stream[0].seg = 1;
+        assert!(prefill_segments(&program, &tensors, &roles(), "sm90a").is_err());
     }
 
     #[test]

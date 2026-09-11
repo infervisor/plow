@@ -17,6 +17,14 @@ pub fn is_projection(role: u8) -> bool {
     matches!(role, CUBLASLT | NATIVE_DECODE_TC)
 }
 
+pub const CUBLASLT_PREFILL_MAX_ROWS: u32 = 128;
+
+pub fn cublaslt_prefill_bf16(profile: &str, m: u32, n: u32, k: u32) -> bool {
+    matches!(profile, "sm90a" | "sm_90a")
+        && (1..=CUBLASLT_PREFILL_MAX_ROWS).contains(&m)
+        && matches!((n, k), (3840, 15360) | (3840, 8192))
+}
+
 pub const PREFILL_ATTENTION_HD512_WG32_ABI: &str = "attention_sm90_hd512_wg32_v1";
 pub const MXFP4_MOE_ABI: &str = "mxfp4_moe_sm90_v1";
 pub const W8A16_PREFILL_M1_ABI: &str = "w8a16_prefill_m1_sm90_v1";
@@ -211,6 +219,26 @@ impl SegmentRoles {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cublaslt_prefill_policy_is_exactly_the_measured_sm90_bf16_cells() {
+        for profile in ["sm90a", "sm_90a"] {
+            for m in [1, 2, 4, 8, 16, 32, 64, 128] {
+                assert!(cublaslt_prefill_bf16(profile, m, 3840, 15360));
+                assert!(cublaslt_prefill_bf16(profile, m, 3840, 8192));
+            }
+        }
+        for (profile, m, n, k) in [
+            ("sm120", 128, 3840, 15360),
+            ("gfx942", 128, 3840, 8192),
+            ("sm90a", 0, 3840, 15360),
+            ("sm90a", 129, 3840, 15360),
+            ("sm90a", 128, 15360, 3840),
+            ("sm90a", 128, 3840, 4096),
+        ] {
+            assert!(!cublaslt_prefill_bf16(profile, m, n, k));
+        }
+    }
+
     #[test]
     fn schema_rejects_duplicate_alias_ids_and_unknown_fields() {
         let object = r#"{"abi":"fp8_gemm_tma128_v1","file":"role.cubin"}"#;

@@ -7088,6 +7088,16 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
             "cuBLASLt decode emission requires a supported single-GPU CUDA emitter without decode objects"
         );
     }
+    if emit_config::active().prefill_cublaslt {
+        assert!(
+            model_type.starts_with("gemma4")
+                && arch == "sm_90a"
+                && tp == 1
+                && !emit_config::active().any_fp8_weights()
+                && !emit_config::active().mxfp4,
+            "cuBLASLt prefill emission requires Gemma 4 BF16 on single-GPU SM90"
+        );
+    }
     assert!(
         !emit_config::active().gemv_decode_role || capabilities.dense_packet_contracts,
         "GEMV decode role currently requires the dense BF16 emitter"
@@ -8551,6 +8561,12 @@ fn emit_dense_gqa(
             "GEMV decode role requires plain BF16 SM90 with one M1 decode program"
         );
         sections.push(gemv_decode_role::apply(&mut m));
+    }
+    if ecfg.prefill_cublaslt {
+        let selected = dense_cublaslt::apply_prefill(&mut m, &mut sections, &arch)
+            .expect("dense prefill projection segments");
+        assert!(selected > 0, "no eligible dense prefill projections");
+        eprintln!("  cuBLASLt prefill: {selected} projection segments");
     }
     // BLOCK MODE: embed the block.json descriptor
     // as SECT_METADATA — this also forces the to_blob_v6 path — and drop a

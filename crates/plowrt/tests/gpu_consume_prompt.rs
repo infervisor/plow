@@ -258,8 +258,15 @@ fn serialized_tma_slot_parity(all_slots_live: bool, lazy_rings: bool) {
     let packet = plowrt::asset::devblob::DevBlob::find_in_dir(&assets)
         .expect("find packet")
         .expect("packet required");
-    let blob = plowrt::asset::devblob::DevBlob::parse(&std::fs::read(packet).unwrap())
-        .expect("parse packet");
+    let raw = std::fs::read(packet).unwrap();
+    let blob = plowrt::asset::devblob::DevBlob::parse(&raw).expect("parse packet");
+    let packet_live = blob
+        .sections
+        .iter()
+        .any(|section| section.name == plow_asset::packed_prefill::SECTION)
+        && plowrt::memory::vmm::LiveKvLayout::manifest(&blob, &raw)
+            .expect("live manifest")
+            .is_some_and(|manifest| manifest.caches.iter().any(|cache| cache.window == 0));
     let referenced_maps = blob
         .prefill_progs()
         .iter()
@@ -290,7 +297,7 @@ fn serialized_tma_slot_parity(all_slots_live: bool, lazy_rings: bool) {
     let mut e =
         GpuEngine::load(Arc::clone(&be), &assets, &assets.join("checkpoint")).expect("engine load");
     assert!(e.batch() >= 2 && e.has_prefill() && e.max_ctx() >= 16400);
-    assert_eq!(e.vmm_stats().is_some(), lazy_rings);
+    assert_eq!(e.vmm_stats().is_some(), lazy_rings || packet_live);
     assert!(
         e.live_ring_stats().is_none(),
         "baseline rings must stay flat"
@@ -334,6 +341,7 @@ fn serialized_tma_slot_parity(all_slots_live: bool, lazy_rings: bool) {
         .into_iter()
         .take(if all_slots_live { 2 } else { 1 })
     {
+        let effective_live = live || packet_live;
         if live {
             drop(e);
             std::env::set_var("PLOW_VMM_LIVE", "1");
@@ -450,7 +458,7 @@ fn serialized_tma_slot_parity(all_slots_live: bool, lazy_rings: bool) {
             for slot in 0..e.batch() {
                 assert_eq!(e.attached_rows(slot), 0);
             }
-            if live || lazy_rings {
+            if effective_live || lazy_rings {
                 let stats = e.vmm_stats().expect("live allocator enabled");
                 assert_eq!(stats.attach_hits + stats.attach_misses, 0);
                 assert_eq!(stats.tokens_attached + stats.blocks_shared_mapped, 0);

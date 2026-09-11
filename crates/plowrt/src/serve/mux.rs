@@ -1397,6 +1397,8 @@ fn run_one_tick(
         #[cfg(feature = "cuda")]
         #[allow(irrefutable_let_patterns)]
         if let crate::serve::engine::ServeEngine::Cuda(e) = &mut *guard {
+            let mut disconnected = smallvec::SmallVec::<[bool; 128]>::new();
+            disconnected.resize(e.batch(), false);
             let result = (|| {
             let stop = Arc::clone(e.stop_ids());
             let cap = e.batch();
@@ -1587,7 +1589,7 @@ fn run_one_tick(
                                         continue;
                                     };
                                     match gpu_finish_token(&mut *e, row, request, toks[row]) {
-                                        Ok(token) => handle_produced_token(
+                                        Ok(token) => disconnected[slot] |= handle_produced_token(
                                             slot_opt,
                                             &arena,
                                             bundle,
@@ -1659,7 +1661,7 @@ fn run_one_tick(
                 for (row, &(i, token)) in completed.iter().enumerate() {
                     let Some(slot) = slots[i].as_mut() else { continue };
                     match gpu_finish_token(&mut *e, row, slot, token) {
-                        Ok(token) => handle_produced_token(
+                        Ok(token) => disconnected[i] |= handle_produced_token(
                             &mut slots[i], &arena, bundle, token, 1,
                             &mut tokens_this_tick, Some(stop.as_slice()),
                         ),
@@ -1692,6 +1694,7 @@ fn run_one_tick(
                         continue; // still mid-prefill
                     }
                     if s.respond.is_closed() {
+                        disconnected[i] = true;
                         if let Some(taken) = slots[i].take() {
                             release_kv(&arena, taken.kv);
                         }
@@ -1732,6 +1735,7 @@ fn run_one_tick(
                         .map(|s| s.respond.is_closed())
                         .unwrap_or(false)
                     {
+                        disconnected[i] = true;
                         if let Some(taken) = slots[i].take() {
                             release_kv(&arena, taken.kv);
                         }
@@ -1763,7 +1767,7 @@ fn run_one_tick(
                             // for this phase and rolled the real cost into
                             // UNACCOUNTED. Gated like the QUEUE site above.
                             let t_tok = crate::obs::ttft::on().then(std::time::Instant::now);
-                            handle_produced_token(
+                            disconnected[i] |= handle_produced_token(
                                 slot_opt,
                                 &arena,
                                 bundle,
@@ -1855,7 +1859,7 @@ fn run_one_tick(
                                     }
                                     let token = toks[ri * k + s];
                                     tracing::debug!(token, slot = i, "gpu: token (multi-step)");
-                                    handle_produced_token(
+                                    disconnected[i] |= handle_produced_token(
                                         &mut slots[i],
                                         &arena,
                                         bundle,
@@ -1958,7 +1962,7 @@ fn run_one_tick(
                                         step = slot.step,
                                         "gpu: token"
                                     );
-                                    handle_produced_token(
+                                    disconnected[i] |= handle_produced_token(
                                         slot_opt,
                                         &arena,
                                         bundle,
@@ -2031,7 +2035,7 @@ fn run_one_tick(
             })();
             for (slot, request) in result.0.iter().enumerate().take(e.batch()) {
                 if request.is_none() {
-                    e.retire_slot(slot, result.5.is_none());
+                    e.retire_slot(slot, result.5.is_none() && !disconnected[slot]);
                 }
             }
             return result;
@@ -3811,9 +3815,9 @@ fn handle_produced_token(
     exec: usize,
     tokens_this_tick: &mut usize,
     stop_ids: Option<&[u32]>,
-) {
+) -> bool {
     let Some(slot) = slot_opt.as_mut() else {
-        return;
+        return false;
     };
     if let Some(telemetry) = slot.telemetry.as_mut() {
         telemetry.token(slot.cached_tokens);
@@ -3926,7 +3930,7 @@ fn handle_produced_token(
         if let Some(taken) = slot_opt.take() {
             release_kv(arena, taken.kv);
         }
-        return;
+        return true;
     }
     if !stop_token
         && slot
@@ -3940,7 +3944,7 @@ fn handle_produced_token(
         if let Some(taken) = slot_opt.take() {
             release_kv(arena, taken.kv);
         }
-        return;
+        return true;
     }
     let stop_max = slot.step >= slot.gen.max_tokens.max(1);
     if stop_token || stop_max || stop_string {
@@ -3952,7 +3956,7 @@ fn handle_produced_token(
         if let Some(telemetry) = slot.telemetry.as_mut() {
             telemetry.finish(reason, slot.executed);
         }
-        let _ = slot.respond.try_send(StreamChunk::Done {
+        let disconnected = slot.respond.try_send(StreamChunk::Done {
             executed: slot.executed,
             reason,
             usage: crate::serve::stream::TokenUsage {
@@ -3960,11 +3964,13 @@ fn handle_produced_token(
                 cached_tokens: slot.cached_tokens,
                 completion_tokens: slot.out_ids.len(),
             },
-        });
+        }).is_err();
         if let Some(taken) = slot_opt.take() {
             release_kv(arena, taken.kv);
         }
+        return disconnected;
     }
+    false
 }
 
 /// Byte offset within THIS delta at which output must stop, or `None` for no match.
@@ -4329,7 +4335,7 @@ mod tests {
         assert!(gpu_prefill_should_yield(true, false, slot.as_ref()));
 
         slot.as_mut().unwrap().pf_pos = 3;
-        handle_produced_token(&mut slot, &None, &bundle, 65, 1, &mut tokens, Some(&[]));
+        assert!(!handle_produced_token(&mut slot, &None, &bundle, 65, 1, &mut tokens, Some(&[])));
         assert!(gpu_prefill_should_yield(
             !feeds.is_empty(),
             false,
@@ -4372,7 +4378,7 @@ mod tests {
                 rx.close();
             }
             let mut tokens = 0;
-            handle_produced_token(
+            let disconnected = handle_produced_token(
                 &mut slot,
                 &None,
                 &bundle,
@@ -4381,6 +4387,7 @@ mod tests {
                 &mut tokens,
                 Some(stop_ids),
             );
+            assert_eq!(disconnected, cancel);
             assert!(slot.is_none());
             assert!(!gpu_prefill_should_yield(false, false, slot.as_ref()));
             assert!(!gpu_prefill_should_yield(false, true, slot.as_ref()));

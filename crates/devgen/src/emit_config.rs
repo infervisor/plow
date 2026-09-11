@@ -828,6 +828,11 @@ pub struct EmitConfig {
     /// Emit packet segments eligible for the optional runtime cuBLASLt decode route.
     #[arg(long = "emit-decode-cublaslt", env = "PLOW_EMIT_DECODE_CUBLASLT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub decode_cublaslt: bool,
+
+    /// Emit the measured SM90 BF16 prefill projections as packet-declared cuBLASLt segments.
+    #[arg(long = "emit-prefill-cublaslt", env = "PLOW_EMIT_PREFILL_CUBLASLT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub prefill_cublaslt: bool,
+
     #[arg(
         long = "emit-decode-native-tc",
         env = "PLOW_EMIT_DECODE_NATIVE_TC",
@@ -1128,6 +1133,7 @@ impl EmitConfig {
             qwen_fp8_m1_tma: env_bool("PLOW_QWEN_FP8_M1_TMA"),
             qwen_w8a8_prefill: env_bool("PLOW_QWEN_W8A8_PREFILL"),
             decode_cublaslt: env_bool("PLOW_EMIT_DECODE_CUBLASLT"),
+            prefill_cublaslt: env_bool("PLOW_EMIT_PREFILL_CUBLASLT"),
             decode_native_tc: env_bool("PLOW_EMIT_DECODE_NATIVE_TC"),
             qwen_fuse_ab: env_bool("PLOW_QWEN_FUSE_AB"),
             qwen_fuse_mlp: env_bool("PLOW_QWEN_FUSE_MLP"),
@@ -1606,6 +1612,21 @@ mod tests {
     struct TestArgs {
         #[command(flatten)]
         emit: EmitConfig,
+    }
+
+    #[test]
+    fn prefill_cublaslt_is_explicit_and_default_off() {
+        let _guard = crate::test_env::env_guard();
+        let _scope = crate::test_env::EnvScope::set(&[("PLOW_EMIT_PREFILL_CUBLASLT", "0")]);
+        assert!(!EmitConfig::from_env().prefill_cublaslt);
+        assert!(!TestArgs::try_parse_from(["test"])
+            .unwrap()
+            .emit
+            .prefill_cublaslt);
+        assert!(TestArgs::try_parse_from(["test", "--emit-prefill-cublaslt"])
+            .unwrap()
+            .emit
+            .prefill_cublaslt);
     }
 
     #[test]

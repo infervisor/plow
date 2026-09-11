@@ -72,6 +72,7 @@ pub(super) fn validate_cublaslt_ladder(blob: &DevBlob, metadata: &SegmentRoles) 
             ));
         }
         packet_role_segments(program, roles, &blob.tensors)?;
+        cublaslt::decode_segments(program, &blob.tensors, roles)?;
         previous_roles = Some(roles);
     }
     blob.with_packet_view(|packet| {
@@ -512,8 +513,12 @@ impl DecodeRung {
             upload(pod_bytes(&g.gq_seg_ofs))?,
         ];
         let cursor_offset = (g.n_counter as usize * CTR_STRIDE as usize * 4).max(4);
-        let counter_bytes = cursor_offset + (g.gq_seg_ofs.len() - 1) * CTR_STRIDE as usize * 4;
-        let counters = be.alloc(0, counter_bytes as u64)?;
+        let cursor_bytes = g.gq_seg_ofs.len().saturating_sub(1).max(1)
+            * CTR_STRIDE as usize
+            * 4;
+        let counter_bytes = cursor_offset + cursor_bytes;
+        let (counters, [counter_view, cursor_view]) =
+            slab_carve(be, [cursor_offset, cursor_bytes])?;
         let kernarg = DevProgram {
             insts: tables[0].base,
             stream: tables[1].base,
@@ -523,8 +528,8 @@ impl DecodeRung {
             succs: tables[5].base,
             gq_stream: tables[6].base,
             gq_seg_ofs: tables[7].base,
-            counters: counters.base,
-            gq_cursor: counters.base + cursor_offset as u64,
+            counters: counter_view.base,
+            gq_cursor: cursor_view.base,
             ..base
         };
         Ok(Self {
