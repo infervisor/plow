@@ -300,6 +300,7 @@ the 2026-09-04 audit that removed the rejected experiment knobs are in
 | env | flag | default | effect |
 |---|---|---|---|
 | `PLOW_XR_CUS` | `--xr-cus` | unset | Cap XReduce participant CUs. |
+| `PLOW_XR_DEC_CUS` | `--xr-dec-cus` | unset | Cap the DECODE one-shot `XReduce` at N workgroups (each thread then loops over `ceil(elems/(512·N))` elements); the prefill two-shot is untouched. At rows 20 the one-shot saturates at 240 workgroups, each polling the gate and taking a system-scope acquire. Bit-identical; opt-in pending the rung-20 A/B. |
 | `PLOW_XR2_GATHER` | `--xr2-gather` | true | Use reduce-scatter/all-gather for complete folded-gather collectives. The second partial is added while the reduced slices are gathered. Default on; `=0` is the rollback to the one-shot collective. |
 | `PLOW_SEQ_PAR_SEAMS` | `--seq-par-seams` | true | Sequence-parallel TP seams for prefill: run AttnRes / router / latent xe / top-k on the reduce-scatter-owned `t/tp` row band and all-gather the results (`XReduceScatter` + `XAllGather`) instead of replicating the row work on every rank. Default on; the manifest requires the paired seams arm. `=0` is the rollback to the replicated-row packet. |
 | `PLOW_XR_COMBINE_FOLD` | `--xr-combine-fold` | true | Fold the decode latent `MoeCombine` into the tagged one-shot `XReduce` publish: the XReduce packet carries `t1 = part`, `i7 = top_k` and no combine packet is emitted. Needs a `PLOW_XR_COMBINE_FOLD=1` decode object. Default on; `=0` is the rollback. |
