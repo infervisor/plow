@@ -305,3 +305,23 @@ This is body validation, not loaded-interpreter or serving qualification.
 The compiler and packet validator retain their BF16-only request-limit
 guards. Extending the contract must distinguish FP8 objects built after the
 writer fix: the old general padding marker alone cannot establish that fix.
+
+## FP8 padding object capability
+
+Packed FP8 objects built with masked padding now export
+`plow_pf_fp8_masked_padding_abi=1`. Object validation for an FP8 manifest with
+request limits requires this marker in addition to general padding ABI1,
+packed request ABI2 and FP8 request ABI1. Objects with only the old general
+padding marker are rejected. BF16 and manifests without request limits keep
+their existing requirements.
+
+Nine contract tests pass. A newly built SM90 FP8 packed light object passes
+actual ELF capability inspection; suppressing its new marker through the
+reader callback makes validation reject it. The object compiles at128
+registers with2368 stack bytes and8880/12292 spill-store/load bytes. These
+are whole-entry compiler totals, not executed writer-path measurements.
+[Checks and object hash](gemma4-12b-h100-data/fp8-masked-contract-summary.json).
+
+Compiler and packet-level BF16-only request-limit guards remain in place.
+This prepares stale-object rejection; it does not enable FP8 request limits,
+qualify loaded GPU execution or demonstrate a throughput improvement.

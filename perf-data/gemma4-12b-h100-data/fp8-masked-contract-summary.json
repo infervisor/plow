@@ -1,0 +1,39 @@
+{
+  "scope": "FP8 masked-padding object capability, not compiler/packet enablement or GPU execution",
+  "new_capability": "plow_pf_fp8_masked_padding_abi=1",
+  "object_sha256": "1a89233259f101e6799f003f99e879dbac955914b9c9e63f16db90188f30fecf",
+  "tests": {
+    "contract_passed": 9,
+    "ignored": 2,
+    "actual_cubin_inspection_passed": 1
+  },
+  "object_resources": {
+    "registers": 128,
+    "stack_bytes": 2368,
+    "spill_store_bytes": 8880,
+    "spill_load_bytes": 12292,
+    "static_smem_bytes": 2320
+  },
+  "files": {
+    "fp8-masked-contract-tests.log": {
+      "original_sha256": "c80c56af57094119539b1e9594ad7abc563f550dc69e773c44b9b72990a0a4d9",
+      "archive_sha256": "e34f8fb4ace30f015dc29e53486b32e48991383043843452958d4ac46a8964c1"
+    },
+    "fp8-masked-object-build.log": {
+      "original_sha256": "aae8ae5b64e7ea27e0ce8ff1c0272a9ff21b2b5634ec5f94936600e96d55528d",
+      "archive_sha256": "aae8ae5b64e7ea27e0ce8ff1c0272a9ff21b2b5634ec5f94936600e96d55528d"
+    },
+    "fp8-masked-object-contract.log": {
+      "original_sha256": "74447a744d4536dd93a30e854ad2e8d5660ba8b5123f64030a0c627c69b73562",
+      "archive_sha256": "082ecbbabefb8437551b4c584c3c06eaa0dce88114d8160a5c5a21834c2edb45"
+    }
+  },
+  "limits": [
+    "Compiler and packet validation still require BF16 for request chunk limits.",
+    "Object is accepted only with packed ABI2, FP8 request ABI1, general masked padding ABI1 and new FP8 masked padding ABI1.",
+    "Actual image inspection removes new marker through reader callback to simulate stale object; rejects it.",
+    "Resource totals describe compilation of the whole entry, not measured executed writer spills or performance.",
+    "No GPU launch, serving, B64 or throughput qualification in this step."
+  ],
+  "archive_note": "Trailing whitespace and blank lines removed; original log hashes retained."
+}

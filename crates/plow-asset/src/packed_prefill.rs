@@ -7,6 +7,7 @@ pub const SECTION: &str = "packed_prefill";
 pub const CAPABILITY: &str = "plow_pf_request_abi";
 pub const CAPABILITY_VALUE: u32 = 2;
 pub const MASKED_PADDING_CAPABILITY: &str = "plow_pf_masked_padding_abi";
+pub const FP8_MASKED_PADDING_CAPABILITY: &str = "plow_pf_fp8_masked_padding_abi";
 pub const FP8_CAPABILITY: &str = "plow_pf_fp8_request_abi";
 pub const FP8_CAPABILITY_VALUE: u32 = 1;
 // FP8 attention uses t6/t7 for scales; tagged i4 carries the request handle.
@@ -63,9 +64,15 @@ impl Manifest {
         need(matches!(self.version, 1 | 2), "object manifest version")?;
         if self.max_request_rows.is_some() {
             need(
-                self.version == 1 && read_capability(MASKED_PADDING_CAPABILITY) == Some(1),
-                "object requires BF16 masked padding ABI1",
+                read_capability(MASKED_PADDING_CAPABILITY) == Some(1),
+                "object requires masked padding ABI1",
             )?;
+            if self.version == 2 {
+                need(
+                    read_capability(FP8_MASKED_PADDING_CAPABILITY) == Some(1),
+                    "object requires FP8 masked padding ABI1",
+                )?;
+            }
         }
         need(
             read_capability(CAPABILITY) == Some(CAPABILITY_VALUE),
@@ -426,28 +433,31 @@ pub fn plan_with_limit(
 mod tests {
     use super::*;
     #[test]
-    fn masked_padding_requires_an_explicit_bf16_object_capability() {
+    fn masked_padding_requires_dtype_specific_object_capabilities() {
         for version in [1, 2] {
             for masked in [None, Some(0), Some(1), Some(2)] {
-                let manifest = Manifest {
-                    version,
-                    max_request_rows: Some(1024),
-                    slot: 0,
-                    request: 1,
-                    maps: vec![],
-                    programs: vec![],
-                };
-                assert_eq!(
-                    manifest
-                        .validate_object(|name| match name {
-                            CAPABILITY => Some(CAPABILITY_VALUE),
-                            FP8_CAPABILITY => Some(FP8_CAPABILITY_VALUE),
-                            MASKED_PADDING_CAPABILITY => masked,
-                            _ => None,
-                        })
-                        .is_ok(),
-                    version == 1 && masked == Some(1),
-                );
+                for fp8_masked in [None, Some(0), Some(1), Some(2)] {
+                    let manifest = Manifest {
+                        version,
+                        max_request_rows: Some(1024),
+                        slot: 0,
+                        request: 1,
+                        maps: vec![],
+                        programs: vec![],
+                    };
+                    assert_eq!(
+                        manifest
+                            .validate_object(|name| match name {
+                                CAPABILITY => Some(CAPABILITY_VALUE),
+                                FP8_CAPABILITY => Some(FP8_CAPABILITY_VALUE),
+                                MASKED_PADDING_CAPABILITY => masked,
+                                FP8_MASKED_PADDING_CAPABILITY => fp8_masked,
+                                _ => None,
+                            })
+                            .is_ok(),
+                        masked == Some(1) && (version == 1 || fp8_masked == Some(1)),
+                    );
+                }
             }
         }
     }
@@ -539,6 +549,33 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    #[test]
+    #[ignore = "CPU cubin inspection; set TEST_PACKED_FP8_MASKED_CUBIN"]
+    fn fp8_masked_object_advertises_fixed_writer() {
+        let path = std::env::var_os("TEST_PACKED_FP8_MASKED_CUBIN").unwrap();
+        let image = std::fs::read(path).unwrap();
+        let manifest = Manifest {
+            version: 2,
+            max_request_rows: Some(1024),
+            slot: 0,
+            request: 1,
+            maps: vec![],
+            programs: vec![],
+        };
+        manifest
+            .validate_object(|n| crate::cubin::global_u32(&image, n))
+            .unwrap();
+        assert!(manifest
+            .validate_object(|n| {
+                if n == FP8_MASKED_PADDING_CAPABILITY {
+                    None
+                } else {
+                    crate::cubin::global_u32(&image, n)
+                }
+            })
+            .is_err());
     }
 
     #[test]
