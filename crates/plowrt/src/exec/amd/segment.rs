@@ -202,23 +202,31 @@ impl AmdEngine {
     ) -> Result<(HsaKernel, u32, &'static str)> {
         let active = self.packed_prefill.is_some_and(|b| b.prog == p);
         let family = self.progs[p].packed_seg_family[seg];
+        // A token-batch body resolves rows through the slot-band descriptor, which only the
+        // `_tb` family twins compile in; an ordinary packed program keeps the shipped objects.
+        let body = self.progs[p].token_batch_body;
+        let (norm, flash) = if body {
+            (self.k_packed_mla_norm_tb, self.k_packed_mla_flash_tb)
+        } else {
+            (self.k_packed_mla_norm, self.k_packed_mla_flash)
+        };
         let route = packed_segment_route(
             active && !self.progs[p].packed_dense,
             family,
-            self.k_packed_mla_norm.is_some(),
-            self.k_packed_mla_flash.is_some(),
+            norm.is_some(),
+            flash.is_some(),
             self.k_packed_kda.is_some(),
         )?;
         Ok(match route {
             PackedSegmentRoute::MlaNorm => (
-                self.k_packed_mla_norm.unwrap(),
+                norm.unwrap(),
                 WG_THREADS_8,
-                "packed_mla_norm",
+                if body { "packed_mla_norm_tb" } else { "packed_mla_norm" },
             ),
             PackedSegmentRoute::MlaFlash => (
-                self.k_packed_mla_flash.unwrap(),
+                flash.unwrap(),
                 WG_THREADS_4,
-                "packed_mla_flash",
+                if body { "packed_mla_flash_tb" } else { "packed_mla_flash" },
             ),
             PackedSegmentRoute::Kda => (self.k_packed_kda.unwrap(), WG_THREADS_8, "kda_family_raw"),
             // The widest decode rung's object: the band is exactly that wide.

@@ -55,7 +55,7 @@ use object::{
     sparse_fp8, BF16_KV_OPS, FP8_KV_OPS, FP8_KV_SYM, GATE_HIER_SYM, KDA_CARRY_KEYFEED_MARKERS,
     KDA_CARRY_REGSTATE_LDS, KDA_CHUNK_QPRE_SYM, KDA_CONV_STEP_DB_REPLACED_OPS, KDA_FAMILY_SEG_SYM,
     KDA_WU_LEAN_LDS, KDA_WU_LEAN_MARKERS, L2_DISPATCH_SYM, MLA_PF_V2_FP8_SYM, MLA_PF_V2_SYM,
-    MOE_ENC_MXFP4, MOE_GEMMA_OPS, MOE_GEMMA_PF_OPS, PACKED_PREFILL_ABI_SYM,
+    MOE_ENC_MXFP4, MOE_GEMMA_OPS, MOE_GEMMA_PF_OPS, PACKED_PREFILL_ABI_SYM, PACKED_PREFILL_BAND_SYM,
     PACKED_PREFILL_KDA_CHUNK_SEG_SYM, PACKED_PREFILL_KDA_SEG_SYM, PACKED_PREFILL_MLA_FLASH_SEG_SYM,
     PACKED_PREFILL_MLA_NORM_SEG_SYM, XR_ATTNRES_RESOURCE_SYM, XR_ATTNRES_SEG_SYM, XR_TAGGED_SYM,
 };
@@ -4952,6 +4952,8 @@ struct PackedPrefillBinding {
     prog: usize,
     n_spans: u32,
     n_rows: u32,
+    /// A token-batch body: the kernarg also carries the `PlowTokenBatch` descriptor pointer.
+    token_batch: bool,
 }
 
 fn validate_packed_prefill(
@@ -4974,6 +4976,7 @@ fn validate_packed_prefill(
         prog,
         n_spans: rows.n_spans,
         n_rows: rung,
+        token_batch: false,
     })
 }
 
@@ -5036,6 +5039,78 @@ fn stage_packed_prompt_rows(
         }
     }
     Ok(rows)
+}
+
+/// Bytes of the `PlowTokenBatch` header (`runtime/common/dev_isa.h`: 8 u32 + 5 pointers).
+const TOKEN_BATCH_HEADER_BYTES: usize = 72;
+
+impl AmdEngine {
+    /// Write the shared `PlowTokenBatch` descriptor for a slot-band body step: header, then
+    /// `input_ids`, `positions`, `active` (`row_capacity` each) and `sample_rows_idx` (the band,
+    /// identity — every band row is sampled on the device, the host reads the rows it planned).
+    /// `spans` points at the packed span table uploaded just before, so the two views agree.
+    fn upload_token_batch_descriptor(
+        &mut self,
+        plan: &plow_asset::mixed_step::Plan,
+        rung: u32,
+        band: u32,
+    ) -> Result<()> {
+        let cap = self.prefill_row_capacity;
+        let (Some(d), Some(h)) = (self.d_token_batch.as_ref(), self.h_token_batch.as_mut()) else {
+            return Err(RuntimeError::Device(
+                "token-batch descriptor storage was not allocated (no body programs at load)"
+                    .into(),
+            ));
+        };
+        let ids_off = TOKEN_BATCH_HEADER_BYTES;
+        let pos_off = ids_off + cap * 4;
+        let act_off = pos_off + cap * 4;
+        let smp_off = act_off + cap * 4;
+        let total = smp_off + band as usize * 4;
+        let s = h.as_mut_slice();
+        if s.len() < total || plan.rows.len() > cap {
+            return Err(RuntimeError::Device(format!(
+                "token-batch descriptor staging has {} bytes, needs {total}",
+                s.len()
+            )));
+        }
+        s[..total].fill(0);
+        let header: [u32; 8] = [
+            packet::dev::TOKEN_BATCH_VERSION,
+            rung,
+            plan.real_rows,
+            band,
+            plan.prefill_spans.len() as u32,
+            0,
+            0,
+            0,
+        ];
+        for (i, w) in header.iter().enumerate() {
+            s[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        let pointers: [u64; 5] = [
+            self.d_prefill_spans.base,
+            d.base + ids_off as u64,
+            d.base + pos_off as u64,
+            d.base + act_off as u64,
+            d.base + smp_off as u64,
+        ];
+        for (i, p) in pointers.iter().enumerate() {
+            let at = 32 + i * 8;
+            s[at..at + 8].copy_from_slice(&p.to_le_bytes());
+        }
+        for (row, r) in plan.rows.iter().enumerate() {
+            s[ids_off + row * 4..ids_off + row * 4 + 4].copy_from_slice(&r.token.to_le_bytes());
+            s[pos_off + row * 4..pos_off + row * 4 + 4]
+                .copy_from_slice(&r.position.to_le_bytes());
+            let active = u32::from(plan.parked[row] == 0);
+            s[act_off + row * 4..act_off + row * 4 + 4].copy_from_slice(&active.to_le_bytes());
+        }
+        for t in 0..band as usize {
+            s[smp_off + t * 4..smp_off + t * 4 + 4].copy_from_slice(&(t as u32).to_le_bytes());
+        }
+        self.be.memcpy_htod_pinned(d.base, &h.as_slice()[..total])
+    }
 }
 
 /// The slot-band width a token-batch body samples: its selection stage's `n_batch`.
@@ -5411,6 +5486,9 @@ pub struct AmdEngine {
     k_mla_v2_sv_raw: Option<HsaKernel>,
     k_packed_mla_norm: Option<HsaKernel>,
     k_packed_mla_flash: Option<HsaKernel>,
+    /// The `_tb` twins with the slot-band resolver, for token-batch body programs.
+    k_packed_mla_norm_tb: Option<HsaKernel>,
+    k_packed_mla_flash_tb: Option<HsaKernel>,
     k_packed_kda: Option<HsaKernel>,
     k_xr_attnres: Option<HsaKernel>,
     packed_prefill_dense: bool,
@@ -5435,6 +5513,10 @@ pub struct AmdEngine {
     d_prefill_spans: DeviceMem,
     d_prefill_parked: DeviceMem,
     h_prefill_meta: HsaPinned,
+    /// The shared `PlowTokenBatch` descriptor + arrays for slot-band body steps; allocated only
+    /// when the blob carries body programs.
+    d_token_batch: Option<DeviceMem>,
+    h_token_batch: Option<HsaPinned>,
     prefill_span_capacity: usize,
     prefill_row_capacity: usize,
     packed_prefill: Option<PackedPrefillBinding>,
@@ -6953,6 +7035,9 @@ impl AmdEngine {
         };
         let packed_route = crate::config::RuntimeConfig::get().amd.packed_prefill_route;
         let kda_family_route = crate::config::RuntimeConfig::get().amd.kda_family_route;
+        // Token-batch body programs (`TOKEN_BATCH_PROG`): they need the `_tb` family objects
+        // and the shared descriptor storage below.
+        let has_bodies = blob.progs[..dec_ix].iter().any(|g| g.token_batch_body);
         let k_packed_mla_norm = if packed_route {
             load_packed_family(
                 &format!("interp_packed_mla_norm{packed_kv_infix}"),
@@ -6976,6 +7061,31 @@ impl AmdEngine {
             )?
         } else {
             None
+        };
+        // Token-batch body programs run their MLA family segments on the `_tb` twins, which
+        // resolve slot-band rows through the shared descriptor. Loaded only when the blob has
+        // bodies; absent objects leave the route refused by name at `check_packed_prefill_program`.
+        let (k_packed_mla_norm_tb, k_packed_mla_flash_tb) = if packed_route && has_bodies {
+            (
+                load_packed_family(
+                    &format!("interp_packed_mla_norm_tb{packed_kv_infix}"),
+                    "plow_interp_packed_mla_norm",
+                    Phase::Prefill,
+                    &[PACKED_PREFILL_MLA_NORM_SEG_SYM, PACKED_PREFILL_BAND_SYM],
+                    Some(variant == Variant::Fp8Kv),
+                    &[],
+                )?,
+                load_packed_family(
+                    &format!("interp_packed_mla_flash_tb{packed_kv_infix}"),
+                    "plow_interp_packed_mla_flash",
+                    Phase::Flash,
+                    &[PACKED_PREFILL_MLA_FLASH_SEG_SYM, PACKED_PREFILL_BAND_SYM],
+                    Some(variant == Variant::Fp8Kv),
+                    &[],
+                )?,
+            )
+        } else {
+            (None, None)
         };
         let kda_qpre_required = requires.as_ref().is_some_and(|requires| {
             requires
@@ -9267,6 +9377,15 @@ impl AmdEngine {
         let d_prefill_spans = EngineDevice::alloc(&*be, span_bytes as u64)?;
         let d_prefill_parked = EngineDevice::alloc(&*be, parked_bytes as u64)?;
         let h_prefill_meta = EngineDevice::host_alloc_pinned(&*be, span_bytes + parked_bytes)?;
+        let (d_token_batch, h_token_batch) = if has_bodies {
+            let bytes = TOKEN_BATCH_HEADER_BYTES + (3 * prefill_row_capacity + batch.max(1)) * 4;
+            (
+                Some(EngineDevice::alloc(&*be, bytes as u64)?),
+                Some(EngineDevice::host_alloc_pinned(&*be, bytes)?),
+            )
+        } else {
+            (None, None)
+        };
         let pf_src: Vec<Vec<DevInst64>> = blob.progs.iter().map(|g| g.insts.clone()).collect();
         let max_ctr = progs
             .iter()
@@ -9499,6 +9618,8 @@ impl AmdEngine {
             k_mla_v2_sv_raw,
             k_packed_mla_norm,
             k_packed_mla_flash,
+            k_packed_mla_norm_tb,
+            k_packed_mla_flash_tb,
             k_packed_kda,
             k_xr_attnres,
             packed_prefill_dense: dense_prefill_object && (k_flash.is_none() || dense_flash_object),
@@ -9513,6 +9634,8 @@ impl AmdEngine {
             d_prefill_spans,
             d_prefill_parked,
             h_prefill_meta,
+            d_token_batch,
+            h_token_batch,
             prefill_span_capacity,
             prefill_row_capacity,
             packed_prefill: None,
@@ -9780,6 +9903,23 @@ impl AmdEngine {
                     "packed-prefill MLA flash segment requires interp_packed_mla_flash".into(),
                 ));
             }
+            if program.token_batch_body {
+                if program.packed_seg_family.contains(&5) && self.k_packed_mla_norm_tb.is_none() {
+                    return Err(RuntimeError::Device(
+                        "token-batch body norm/cache segment requires interp_packed_mla_norm_tb \
+                         (PLOW_TOKEN_BATCH_TP_OBJECTS=1)"
+                            .into(),
+                    ));
+                }
+                if program.packed_seg_family.contains(&6) && self.k_packed_mla_flash_tb.is_none()
+                {
+                    return Err(RuntimeError::Device(
+                        "token-batch body flash segment requires interp_packed_mla_flash_tb \
+                         (PLOW_TOKEN_BATCH_TP_OBJECTS=1)"
+                            .into(),
+                    ));
+                }
+            }
         }
         if program.packed_needs_kda {
             if !program.packed_kda_compatible {
@@ -10006,7 +10146,9 @@ impl AmdEngine {
             prog,
             n_spans: spans.len() as u32,
             n_rows: rung,
+            token_batch: true,
         });
+        self.upload_token_batch_descriptor(plan, rung, band)?;
 
         for &(slot, end) in &plan.mapped_ends {
             self.vmm_ensure(slot as usize, end)?;
@@ -10175,9 +10317,12 @@ impl AmdEngine {
             prefill_parked,
             n_prefill_spans,
             n_prefill_rows,
-            // Unified token batch: this engine does not build one yet, and NULL is the
-            // documented "every existing path, bit for bit" value.
-            token_batch: 0,
+            // Unified token batch: the shared descriptor, only while a slot-band body is staged
+            // for THIS program. NULL is the documented "every existing path, bit for bit" value.
+            token_batch: match (self.packed_prefill, self.d_token_batch.as_ref()) {
+                (Some(b), Some(d)) if b.prog == p && b.token_batch => d.base,
+                _ => 0,
+            },
         }
     }
 

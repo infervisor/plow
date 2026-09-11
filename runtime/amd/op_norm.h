@@ -518,8 +518,8 @@ __device__ void d_headnorm_rope(bf16* __restrict__ out, const bf16* __restrict__
                    (position & kv_mask)) * hd
                 :
 #elif PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS || PLOW_PACKED_PREFILL_DENSE_CONSUMERS
-            packed_slot_stride && prow.span
-                ? (((size_t)prow.span->slot * nhead + hh) * packed_slot_stride +
+            packed_slot_stride && plow_packed_prefill_addressed(prow)
+                ? (((size_t)plow_packed_prefill_slot(prow) * nhead + hh) * packed_slot_stride +
                    (position & kv_mask)) * hd
                 :
 #endif
@@ -638,8 +638,9 @@ __device__ void d_headnorm_rope_fp8(unsigned char* __restrict__ out, float* __re
          * so both follow the same formula. */
         const size_t row =
 #if PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS || PLOW_PACKED_PREFILL_DENSE_CONSUMERS
-                           packed_slot_stride && prow.span
-                               ? ((size_t)prow.span->slot * nhead + hh) * packed_slot_stride +
+                           packed_slot_stride && plow_packed_prefill_addressed(prow)
+                               ? ((size_t)plow_packed_prefill_slot(prow) * nhead + hh) *
+                                         packed_slot_stride +
                                      (position & kv_mask)
                                :
 #endif

@@ -1157,6 +1157,19 @@ if [ "${PLOW_PACKED_PREFILL_CONSUMERS:-0}" = 1 ]; then
     "interp_packed_kda|$AX_PACKED_KDA"
   )
 fi
+# TOKEN-BATCH BODY FAMILY OBJECTS (PLOW_TOKEN_BATCH_TP_OBJECTS=1, default off): the packed MLA
+# norm/flash objects with the slot-band resolver compiled in (`PLOW_PACKED_PREFILL_BAND=1`,
+# marker `plow_packed_prefill_band_1`). Separate rows rather than a define on the rows above so
+# the shipped packed objects stay byte-identical; `exec/amd.rs` opens them by the `_tb` stem for
+# token-batch body programs only. The `_fp8kv` twins serve FP8-KV packets.
+if [ "${PLOW_TOKEN_BATCH_TP_OBJECTS:-0}" = 1 ]; then
+  ROWS+=(
+    "interp_packed_mla_norm_tb|$AX_PACKED_MLA_NORM -DPLOW_PACKED_PREFILL_BAND=1"
+    "interp_packed_mla_flash_tb|$AX_PACKED_MLA_FLASH -DPLOW_PACKED_PREFILL_BAND=1"
+    "interp_packed_mla_norm_tb_fp8kv|$AX_PACKED_MLA_NORM $AX_FP8KV -DPLOW_PACKED_PREFILL_BAND=1"
+    "interp_packed_mla_flash_tb_fp8kv|$AX_PACKED_MLA_FLASH $AX_FP8KV -DPLOW_PACKED_PREFILL_BAND=1"
+  )
+fi
 
 # PLOW_ROWS_ONLY=<substring> (or =<exact-stem>): build only matching rows — for iterating on
 # ONE object family (e.g. interp_flash) without paying the full 28-object build. The
@@ -1320,12 +1333,24 @@ for row in "${ROWS[@]}"; do
         grep -qE "OBJECT .* plow_packed_prefill_mla_norm_segments_1$" <<<"$symbols" || {
           echo "  MISSING PACKED MLA-NORM SEGMENTS: expected plow_packed_prefill_mla_norm_segments_1"
           fail=1
-        } ;;
+        }
+        if [[ "$stem" == *_tb* ]]; then
+          grep -qE "OBJECT .* plow_packed_prefill_band_1$" <<<"$symbols" || {
+            echo "  MISSING SLOT-BAND RESOLVER: expected plow_packed_prefill_band_1"
+            fail=1
+          }
+        fi ;;
       interp_packed_mla_flash*)
         grep -qE "OBJECT .* plow_packed_prefill_mla_flash_segments_1$" <<<"$symbols" || {
           echo "  MISSING PACKED MLA-FLASH SEGMENTS: expected plow_packed_prefill_mla_flash_segments_1"
           fail=1
-        } ;;
+        }
+        if [[ "$stem" == *_tb* ]]; then
+          grep -qE "OBJECT .* plow_packed_prefill_band_1$" <<<"$symbols" || {
+            echo "  MISSING SLOT-BAND RESOLVER: expected plow_packed_prefill_band_1"
+            fail=1
+          }
+        fi ;;
       interp_packed_kda*)
         for m in plow_kda_family_segments_1 plow_packed_prefill_kda_serial_segments_1 \
                  plow_packed_prefill_kda_consumers_1; do

@@ -983,7 +983,8 @@ fn packed_prefill_accepts_dense_ragged_rows_and_parked_padding() {
         PackedPrefillBinding {
             prog: 2,
             n_spans: 2,
-            n_rows: 8
+            n_rows: 8,
+            token_batch: false,
         }
     );
 }
@@ -1074,6 +1075,7 @@ fn packed_prefill_kernarg_is_legacy_null_or_exact_program_only() {
         prog: 2,
         n_spans: 2,
         n_rows: 8,
+        token_batch: false,
     };
     assert_eq!(
         packed_prefill_kernarg(Some(binding), 2, 0x1000, 0x2000),

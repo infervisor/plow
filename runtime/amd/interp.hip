@@ -278,6 +278,13 @@ extern "C" __device__ unsigned plow_packed_prefill_kda_consumers_1 = 1;
 #endif
 extern "C" __device__ unsigned plow_packed_prefill_mla_norm_segments_1 = 1;
 #endif
+#if PLOW_PACKED_PREFILL_BAND
+#if !(PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS || PLOW_PACKED_PREFILL_MLA_FLASH_CONSUMERS)
+#error "the slot-band resolver (PLOW_PACKED_PREFILL_BAND) is a packed-prefill consumer axis"
+#endif
+/* Token-batch body family object: resolves slot-band rows through the shared descriptor. */
+extern "C" __device__ unsigned plow_packed_prefill_band_1 = 1;
+#endif
 #if defined(PLOW_BUCKET_PACKED_KDA)
 #if !PLOW_PACKED_PREFILL_KDA_CONSUMERS || !PLOW_K3
 #error "packed KDA bucket requires PLOW_PACKED_PREFILL_KDA_CONSUMERS and PLOW_K3"

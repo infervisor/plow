@@ -1460,6 +1460,9 @@ pub(super) const GEMV_WALK_SYM: &str = "plow_gemv_walk_1";
 pub(super) const XARGMAX_B128_SYM: &str = "plow_xargmax_max_batch_128";
 pub(super) const PACKED_PREFILL_ABI_SYM: &str = "plow_packed_prefill_abi_1";
 pub(super) const PACKED_PREFILL_MLA_NORM_SEG_SYM: &str = "plow_packed_prefill_mla_norm_segments_1";
+/// The slot-band row resolver (`PLOW_PACKED_PREFILL_BAND=1`), carried by the `_tb` family
+/// objects a token-batch body program is routed to.
+pub(super) const PACKED_PREFILL_BAND_SYM: &str = "plow_packed_prefill_band_1";
 pub(super) const PACKED_PREFILL_MLA_FLASH_SEG_SYM: &str =
     "plow_packed_prefill_mla_flash_segments_1";
 pub(super) const PACKED_PREFILL_KDA_SEG_SYM: &str = "plow_packed_prefill_kda_serial_segments_1";
