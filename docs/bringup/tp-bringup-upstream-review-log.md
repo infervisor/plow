@@ -301,6 +301,63 @@ they are the author's call):
 | `PLOW_GLM_XR_RES`, `GLM_FUSE_XRN` | unmeasured on GLM-5.3 TP8; +1.8–5% only on TP4 GLM-5.2 blobs | collective fold arms |
 | `PLOW_MLA_PF_PSWZ` | −0.7% vs controls (review) | P-tile swizzle build arm |
 
+## The qualified GLM recipe is the default (2026-09-11, `glm-production-defaults`)
+
+The packet serving GLM-5.3 on 8x MI300X was emitted by naming eight `glm_*` flags, every one of
+which was `default_value_t = false`. So the qualified configuration lived as an incantation in a
+shell script, and forgetting one emitted a different, slower packet that still loaded and still
+served — a silent regression with no failing gate.
+
+`PLOW_GLM_FP8_KV`, `PLOW_GLM_MOE_AITER`, `PLOW_GLM_MOE_RESIDENT`, `PLOW_GLM_INDEX_TP`,
+`PLOW_GLM_SELECT_LOCAL`, `PLOW_GLM_DECODE_NORM_ROWS`, `PLOW_GLM_GEMM_LT` and
+`PLOW_GLM_GEMM_LT_DECODE` are now `Option<bool>` (the `emit_packed_prefill` pattern) with a
+resolved accessor each, and `apply_production_defaults` sets the unset ones for
+`capabilities.glm && gfx942 && tp == 8 && n_cu == 304 && !mxfp4`. That predicate is the emit
+sites' own: four of these knobs assert gfx942 / TP8 / 304 CU, so a wider default would turn a
+working TP1 or MI300A GLM emit into a panic. A new `glm` capability rather than reusing
+`packed_prefill_siblings`, which names an emitter capability and not a measured recipe.
+
+Precedence: explicit flag > env > `--replay-knobs` > production default > plain default. The
+replay half needed no change — `apply_replay_knobs` `set_var`s before clap parses, so a replayed
+value (including `false`) arrives as `ValueSource::EnvVariable` and outranks the default.
+`build.json` records the winner per knob and omits production defaults from `replay`.
+
+Byte identity, real emits, GLM-5.3-plow-lite TP8 gfx942 (`plowc` built at `worktree-tp-merge`
+44925e02 vs this branch; `PLOW_UNISEG=0 PLOW_GLM_DSA_PF_SPAN=3 PLOW_MLA_PF_V2=1
+PLOW_MLA_PF_AITER=1` in every arm):
+
+| arm | `model.pkt` |
+|---|---|
+| full explicit flag list, base `plowc` | `a6621d32` |
+| full explicit flag list, this branch | `a6621d32` |
+| **no `glm_*` flags at all**, this branch | `a6621d32` |
+| all eight `=false` | `943f8f7d` (104.0 MB vs 73.2 MB) |
+| replay of the all-`false` `build.json`, no flags | `943f8f7d` |
+| replay of the unflagged `build.json` | `a6621d32` |
+| GLM gfx942 **TP4** (not qualified), base vs branch | `51f800a3` both |
+| GLM **sm_90a** TP8, base vs branch | `809f04e7` both |
+| Gemma-4-12B gfx942 TP1, base vs branch | `bad5030e` both |
+
+Tests: `emit_capabilities.rs` gains the target matrix and two precedence tests reading the knob
+record; `glm_tests.rs` gains a three-arm emit comparison (explicit / unflagged / rolled back)
+plus an off-plus-one probe showing each of the eight still moves the packet. That probe is from
+OFF rather than from ON because `native_moe = glm_moe_aiter || glm_moe_resident`, so dropping
+AITER out of the full recipe changes nothing.
+
+NOT defaulted, and why: `PLOW_GLM_MOE_FLAT_DECODE` and `PLOW_GLM_MLA_DEC_AITER` (serving
+qualification pending; the latter is measured per layer only), `PLOW_GLM_FOLD_LT` (+0.49% with
+P99 +3.6%), `PLOW_GLM_PLACE_PF` (+2.2% with P99 TPOT +10.5% — a retirement candidate above),
+`PLOW_GLM_FUSE_ROPE` (unmeasured on this recipe), `PLOW_TOKEN_BATCH_TP` and
+`PLOW_PACKED_SPARSE_PF` (both unqualified on device; see #22 and the token-batch section).
+`PLOW_GLM_DSA_PF` is also left alone — sparse prefill is its own qualification — and the emits
+above show it makes no difference to this packet either way.
+
+Two things this does not fix, both pre-existing: the emit still panics rather than falling back
+if a GLM checkpoint at this target is NOT block-fp8 (the native MoE arms assert `Fp8Blk`, which
+`apply_production_defaults` cannot see — it reads the checkpoint's `quantization_config`), and
+`--glm-ofold` now collides with the defaulted `PLOW_GLM_FP8_KV` (the existing assert names both
+and says to unset one). Both are loud failures with a named rollback.
+
 ## Artefact policy (applied on every merge)
 
 Raw measurement files pushed upstream are removed here before the branch goes to main:

@@ -571,13 +571,28 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_DSA_PF", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_dsa_pf: bool,
 
+    /// Set by [`super::apply_production_defaults`] when this emit is the QUALIFIED GLM target —
+    /// gfx942, TP8, 304 CU. The eight knobs whose accessors read it are `Option<bool>` precisely
+    /// so that `None` ("nobody said") is distinguishable from `Some(false)` ("do not"): the
+    /// qualified recipe is what an unflagged emit gets, and `--glm-…=false` still wins.
+    ///
+    /// The recipe is the one that serves GLM-5.3 on 8x MI300X (47-50 out tok/s, 18/18 on the
+    /// retrieval screen). Its per-knob evidence is in `docs/flags-reference.md`; the rollback
+    /// for any one of them is `--glm-<knob>=false`, and for all of them at once it is naming
+    /// each `=false` (there is no single kill switch, by design — the knobs were qualified
+    /// individually and are rolled back individually).
+    #[arg(skip)]
+    pub glm_production_defaults: bool,
+
     /// Store the MLA latent cache as e4m3 + per-row f32 scale. NOT bit-identical.
-    #[arg(long, env = "PLOW_GLM_FP8_KV", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
-    pub glm_fp8_kv: bool,
+    /// On by default for GLM on gfx942 TP8; `=false` is the rollback.
+    #[arg(long, env = "PLOW_GLM_FP8_KV", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_fp8_kv: Option<bool>,
 
     /// Use native gfx942 A8 MoE prefill with BF16 routed accumulation.
-    #[arg(long, env = "PLOW_GLM_MOE_AITER", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
-    pub glm_moe_aiter: bool,
+    /// On by default for GLM on gfx942 TP8; `=false` is the rollback.
+    #[arg(long, env = "PLOW_GLM_MOE_AITER", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_moe_aiter: Option<bool>,
 
     /// Use flat A16 MoE for gfx942 TP8 decode rungs 2, 4 and 8.
     #[arg(long, env = "PLOW_GLM_MOE_FLAT_DECODE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
@@ -588,8 +603,9 @@ pub struct EmitConfig {
     pub glm_mla_dec_aiter: bool,
 
     /// Pack GLM expert weights once for native gfx942 TP8 prefill and decode.
-    #[arg(long, env = "PLOW_GLM_MOE_RESIDENT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
-    pub glm_moe_resident: bool,
+    /// On by default for GLM on gfx942 TP8; `=false` is the rollback.
+    #[arg(long, env = "PLOW_GLM_MOE_RESIDENT", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_moe_resident: Option<bool>,
 
     /// Emit one token-batch BODY program per prefill bucket wider than the decode band: the
     /// bucket's packed-prefill topology plus the batched decode attention chain and tail over a
@@ -608,24 +624,29 @@ pub struct EmitConfig {
     pub packed_sparse_pf: bool,
 
     /// Partition large GLM prefill index queries across eight gfx942 ranks.
-    #[arg(long, env = "PLOW_GLM_INDEX_TP", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
-    pub glm_index_tp: bool,
+    /// On by default for GLM on gfx942 TP8; `=false` is the rollback.
+    #[arg(long, env = "PLOW_GLM_INDEX_TP", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_index_tp: Option<bool>,
 
     /// Select GLM decode rows with independent single-workgroup radix selection.
-    #[arg(long, env = "PLOW_GLM_SELECT_LOCAL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
-    pub glm_select_local: bool,
+    /// On by default for GLM on gfx942 TP8; `=false` is the rollback.
+    #[arg(long, env = "PLOW_GLM_SELECT_LOCAL", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_select_local: Option<bool>,
 
     /// Give each batched GLM RMSNorm and AddNorm row its own workgroup.
-    #[arg(long, env = "PLOW_GLM_DECODE_NORM_ROWS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
-    pub glm_decode_norm_rows: bool,
+    /// On by default for GLM on gfx942 TP8; `=false` is the rollback.
+    #[arg(long, env = "PLOW_GLM_DECODE_NORM_ROWS", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_decode_norm_rows: Option<bool>,
 
     /// Use qualified gfx942 hipBLASLt assembly for large GLM prefill projections.
-    #[arg(long, env = "PLOW_GLM_GEMM_LT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
-    pub glm_gemm_lt: bool,
+    /// On by default for GLM on gfx942 TP8; `=false` is the rollback.
+    #[arg(long, env = "PLOW_GLM_GEMM_LT", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_gemm_lt: Option<bool>,
 
     /// Use native gfx942 hipBLASLt BF16 projections at decode rungs 16 and 20.
-    #[arg(long, env = "PLOW_GLM_GEMM_LT_DECODE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
-    pub glm_gemm_lt_decode: bool,
+    /// On by default for GLM on gfx942 TP8; `=false` is the rollback.
+    #[arg(long, env = "PLOW_GLM_GEMM_LT_DECODE", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_gemm_lt_decode: Option<bool>,
 
     /// Extend `--glm-gemm-lt-decode` to rung 8 and to the narrow BF16 decode projections
     /// (k_rope, q_rope, indexer k/weights, lm_head) the MM16 GEMV serves at 14-65 GB/s.
@@ -1118,18 +1139,19 @@ impl EmitConfig {
             gemv_wg: env_u32("PLOW_GEMV_WG"),
             gemv_wg_tuning: env_str("PLOW_GEMV_WG_TUNING"),
             glm_dsa_pf: env_bool("PLOW_GLM_DSA_PF"),
-            glm_fp8_kv: env_bool("PLOW_GLM_FP8_KV"),
-            glm_moe_aiter: env_bool("PLOW_GLM_MOE_AITER"),
+            glm_production_defaults: false,
+            glm_fp8_kv: env_bool_opt("PLOW_GLM_FP8_KV"),
+            glm_moe_aiter: env_bool_opt("PLOW_GLM_MOE_AITER"),
             glm_moe_flat_decode: env_bool("PLOW_GLM_MOE_FLAT_DECODE"),
             glm_mla_dec_aiter: env_bool("PLOW_GLM_MLA_DEC_AITER"),
-            glm_moe_resident: env_bool("PLOW_GLM_MOE_RESIDENT"),
+            glm_moe_resident: env_bool_opt("PLOW_GLM_MOE_RESIDENT"),
             token_batch_tp: env_bool("PLOW_TOKEN_BATCH_TP"),
             packed_sparse_pf: env_bool("PLOW_PACKED_SPARSE_PF"),
-            glm_index_tp: env_bool("PLOW_GLM_INDEX_TP"),
-            glm_select_local: env_bool("PLOW_GLM_SELECT_LOCAL"),
-            glm_decode_norm_rows: env_bool("PLOW_GLM_DECODE_NORM_ROWS"),
-            glm_gemm_lt: env_bool("PLOW_GLM_GEMM_LT"),
-            glm_gemm_lt_decode: env_bool("PLOW_GLM_GEMM_LT_DECODE"),
+            glm_index_tp: env_bool_opt("PLOW_GLM_INDEX_TP"),
+            glm_select_local: env_bool_opt("PLOW_GLM_SELECT_LOCAL"),
+            glm_decode_norm_rows: env_bool_opt("PLOW_GLM_DECODE_NORM_ROWS"),
+            glm_gemm_lt: env_bool_opt("PLOW_GLM_GEMM_LT"),
+            glm_gemm_lt_decode: env_bool_opt("PLOW_GLM_GEMM_LT_DECODE"),
             glm_gemm_lt_decode_ext: env_bool("PLOW_GLM_GEMM_LT_DECODE_EXT"),
             glm_fold_lt: env_bool("PLOW_GLM_FOLD_LT"),
             glm_gemv_wg: env_u32("PLOW_GLM_GEMV_WG"),
@@ -1312,6 +1334,60 @@ impl EmitConfig {
     pub fn packed_prefill_metadata_on(&self) -> bool {
         // Activation-FP8 packing remains opt-in pending execution qualification.
         self.packed_prefill_on() && (!self.w8a8 || self.emit_packed_prefill == Some(true))
+    }
+
+    /// The eight knobs of the qualified GLM gfx942 TP8 recipe, resolved.
+    ///
+    /// One fallback, written once, rather than `unwrap_or(false)` re-decided at each of the
+    /// sixteen read sites — where the next one added would get it wrong silently. `None` means
+    /// no flag, no env var and no replayed value reached this knob, and only then does
+    /// [`Self::glm_production_defaults`] decide.
+    pub fn glm_fp8_kv(&self) -> bool {
+        self.glm_fp8_kv.unwrap_or(self.glm_production_defaults)
+    }
+
+    pub fn glm_moe_aiter(&self) -> bool {
+        self.glm_moe_aiter.unwrap_or(self.glm_production_defaults)
+    }
+
+    pub fn glm_moe_resident(&self) -> bool {
+        self.glm_moe_resident.unwrap_or(self.glm_production_defaults)
+    }
+
+    pub fn glm_index_tp(&self) -> bool {
+        self.glm_index_tp.unwrap_or(self.glm_production_defaults)
+    }
+
+    pub fn glm_select_local(&self) -> bool {
+        self.glm_select_local.unwrap_or(self.glm_production_defaults)
+    }
+
+    pub fn glm_decode_norm_rows(&self) -> bool {
+        self.glm_decode_norm_rows.unwrap_or(self.glm_production_defaults)
+    }
+
+    pub fn glm_gemm_lt(&self) -> bool {
+        self.glm_gemm_lt.unwrap_or(self.glm_production_defaults)
+    }
+
+    pub fn glm_gemm_lt_decode(&self) -> bool {
+        self.glm_gemm_lt_decode.unwrap_or(self.glm_production_defaults)
+    }
+
+    /// The `(clap id, still unset)` pairs [`super::apply_production_defaults`] walks to record
+    /// which of the eight it actually decided. Kept beside the accessors so a ninth knob joining
+    /// the recipe cannot be added to one list and forgotten in the other.
+    pub fn glm_recipe_unset(&self) -> [(&'static str, bool); 8] {
+        [
+            ("glm_fp8_kv", self.glm_fp8_kv.is_none()),
+            ("glm_moe_aiter", self.glm_moe_aiter.is_none()),
+            ("glm_moe_resident", self.glm_moe_resident.is_none()),
+            ("glm_index_tp", self.glm_index_tp.is_none()),
+            ("glm_select_local", self.glm_select_local.is_none()),
+            ("glm_decode_norm_rows", self.glm_decode_norm_rows.is_none()),
+            ("glm_gemm_lt", self.glm_gemm_lt.is_none()),
+            ("glm_gemm_lt_decode", self.glm_gemm_lt_decode.is_none()),
+        ]
     }
 
     /// The decode widths this emit builds programs for, ASCENDING.

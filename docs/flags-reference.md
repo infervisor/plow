@@ -377,21 +377,21 @@ the 2026-09-04 audit that removed the rejected experiment knobs are in
 | `GLM_ROUTER_OFF_SHARED` | `--glm-router-off-shared` | false | GLM router off-shared dispatch (co-resident mode 2 only). |
 | `GLM_ROUTER_OLD` | `--glm-router-old` | false | GLM use legacy (unfused) single-CU router. |
 | `PLOW_GLM_DSA_PF` | `--glm-dsa-pf` | false | Route GLM's DSA indexer through the prefill chain (requires `has_dsa`). |
-| `PLOW_GLM_FP8_KV` | `--glm-fp8-kv` | false | Store the MLA latent cache as e4m3 + per-row f32 scale. NOT bit-identical. |
+| `PLOW_GLM_FP8_KV` | `--glm-fp8-kv` | on for GLM on gfx942 TP8 (production default), off elsewhere | Store the MLA latent cache as e4m3 + per-row f32 scale. NOT bit-identical. Rollback: `--glm-fp8-kv=false` (recorded as `cli`, and a `--replay-knobs` recipe keeps its own value). |
 | `PLOW_GLM_GEMV_WG` | `--glm-gemv-wg` | unset | Cap the dispatch width of every blocked GEMV. Unset ⇒ byte-identical. |
 | `PLOW_GLM_OFOLD` | `--glm-ofold` | false | Fold W_o into the MLA prefill flash epilogue. Reassociated, logit-gate class. |
 | `PLOW_GLM_PF_NS` | `--glm-pf-ns` | unset | Causal KV-split factor for the V2 MLA prefill flash (2..=8; unset/1 = unsplit). |
 | `PLOW_GLM_DSA_PF_SPAN` | `--glm-dsa-pf-span` | 1 | Sparse-prefill selection reuse span: layers after an indexer layer that gather against its union (0 = indexer layers only, 3 = every GLM-5.3 layer). |
 | `PLOW_GLM_DSA_PF_DEXACT` | `--glm-dsa-pf-dexact` | unset | Reuse only at exactly this distance from an indexer layer (bisect aid; unset = 1..=span). |
-| `PLOW_GLM_MOE_AITER` | `--glm-moe-aiter` | false | Native gfx942 A8 MoE prefill with BF16 routed accumulation (AITER adapter). Opt-in: A8 activation quant is ~3.5–3.9% rel-L2 vs the DET FP64 path; +6.2% C20 on GLM-5.3 TP8. |
+| `PLOW_GLM_MOE_AITER` | `--glm-moe-aiter` | on for GLM on gfx942 TP8 (production default), off elsewhere | Native gfx942 A8 MoE prefill with BF16 routed accumulation (AITER adapter). Opt-in: A8 activation quant is ~3.5–3.9% rel-L2 vs the DET FP64 path; +6.2% C20 on GLM-5.3 TP8. Rollback: `--glm-moe-aiter=false` (recorded as `cli`, and a `--replay-knobs` recipe keeps its own value). |
 | `PLOW_GLM_MOE_FLAT_DECODE` | `--glm-moe-flat-decode` | false | Flat A16 MoE for gfx942 TP8 decode rungs 2, 4 and 8. Serving qualification pending. |
 | `PLOW_GLM_MLA_DEC_AITER` | `--glm-mla-dec-aiter` | false | Isolate GLM sparse FP8 decode attention (rungs 1..20) so the runtime dispatches the pinned gfx942 AITER QH8 MLA object (pack → attention → relayout into the existing merge). Falls back to the interpreter on steps where a row holds < 2048 keys. Requires `mla_sparse_adapter_gfx942.elf` with the decode marker. Serving qualification pending. |
-| `PLOW_GLM_MOE_RESIDENT` | `--glm-moe-resident` | false | Pack GLM expert weights once for native gfx942 TP8 prefill and decode. +13.4% C20 / −10.9% TPOT on GLM-5.3; same A8 numerics contract as `PLOW_GLM_MOE_AITER`. |
-| `PLOW_GLM_INDEX_TP` | `--glm-index-tp` | false | Partition large GLM prefill index queries across eight gfx942 ranks instead of replicating them. Exact top-k; +8.2% serving; keep the ≥2048-row gate (small chunks regress). Also the precondition for packing a sparse bucket (`PLOW_PACKED_SPARSE_PF`): the native kernels take a per-request `PlowKvSpan` table (`dsa_tp_adapter_gfx942.elf`, `plow_dsa_tp_abi_2`), which the interpreter selectors cannot. |
-| `PLOW_GLM_SELECT_LOCAL` | `--glm-select-local` | false | One independent single-workgroup radix selection per GLM decode row instead of a serialized shared-histogram chain. Exact top-k; +10.6% C20, −19% median ITL. |
-| `PLOW_GLM_DECODE_NORM_ROWS` | `--glm-decode-norm-rows` | false | Give each batched GLM RMSNorm / AddNorm row its own workgroup. Bit-identical; +2.7%, P99 TPOT −11%. |
-| `PLOW_GLM_GEMM_LT` | `--glm-gemm-lt` | false | Qualified gfx942 hipBLASLt assembly for the large GLM prefill projections (3 shapes). Bit-exact vs capture; +2.1%. |
-| `PLOW_GLM_GEMM_LT_DECODE` | `--glm-gemm-lt-decode` | false | Native gfx942 hipBLASLt BF16 projections at decode rungs 16 and 20 (633 GEMMs). ≤0.17% rel-L2; +5.7% then +2.4% across two screens. |
+| `PLOW_GLM_MOE_RESIDENT` | `--glm-moe-resident` | on for GLM on gfx942 TP8 (production default), off elsewhere | Pack GLM expert weights once for native gfx942 TP8 prefill and decode. +13.4% C20 / −10.9% TPOT on GLM-5.3; same A8 numerics contract as `PLOW_GLM_MOE_AITER`. Rollback: `--glm-moe-resident=false` (recorded as `cli`, and a `--replay-knobs` recipe keeps its own value). |
+| `PLOW_GLM_INDEX_TP` | `--glm-index-tp` | on for GLM on gfx942 TP8 (production default), off elsewhere | Partition large GLM prefill index queries across eight gfx942 ranks instead of replicating them. Exact top-k; +8.2% serving; keep the ≥2048-row gate (small chunks regress). Also the precondition for packing a sparse bucket (`PLOW_PACKED_SPARSE_PF`): the native kernels take a per-request `PlowKvSpan` table (`dsa_tp_adapter_gfx942.elf`, `plow_dsa_tp_abi_2`), which the interpreter selectors cannot. Rollback: `--glm-index-tp=false` (recorded as `cli`, and a `--replay-knobs` recipe keeps its own value). |
+| `PLOW_GLM_SELECT_LOCAL` | `--glm-select-local` | on for GLM on gfx942 TP8 (production default), off elsewhere | One independent single-workgroup radix selection per GLM decode row instead of a serialized shared-histogram chain. Exact top-k; +10.6% C20, −19% median ITL. Rollback: `--glm-select-local=false` (recorded as `cli`, and a `--replay-knobs` recipe keeps its own value). |
+| `PLOW_GLM_DECODE_NORM_ROWS` | `--glm-decode-norm-rows` | on for GLM on gfx942 TP8 (production default), off elsewhere | Give each batched GLM RMSNorm / AddNorm row its own workgroup. Bit-identical; +2.7%, P99 TPOT −11%. Rollback: `--glm-decode-norm-rows=false` (recorded as `cli`, and a `--replay-knobs` recipe keeps its own value). |
+| `PLOW_GLM_GEMM_LT` | `--glm-gemm-lt` | on for GLM on gfx942 TP8 (production default), off elsewhere | Qualified gfx942 hipBLASLt assembly for the large GLM prefill projections (3 shapes). Bit-exact vs capture; +2.1%. Rollback: `--glm-gemm-lt=false` (recorded as `cli`, and a `--replay-knobs` recipe keeps its own value). |
+| `PLOW_GLM_GEMM_LT_DECODE` | `--glm-gemm-lt-decode` | on for GLM on gfx942 TP8 (production default), off elsewhere | Native gfx942 hipBLASLt BF16 projections at decode rungs 16 and 20 (633 GEMMs). ≤0.17% rel-L2; +5.7% then +2.4% across two screens. Rollback: `--glm-gemm-lt-decode=false` (recorded as `cli`, and a `--replay-knobs` recipe keeps its own value). |
 | `PLOW_GLM_GEMM_LT_DECODE_EXT` | `--glm-gemm-lt-decode-ext` | false | Extends `PLOW_GLM_GEMM_LT_DECODE` to rung 8 and to the narrow decode projections (k_rope, q_rope, indexer k/weights, lm_head; +199 native GEMMs at rungs 16/20, 11 shapes at rung 8). Same pinned object. Standalone cold medians on one MI300X: those five shapes 13.9-15.6 µs vs 26-60 µs on the MM16 GEMV (rung 20: −7.5 ms of an 11.9 ms traced GEMV body); rung 8: −9 ms/step. Not yet served: needs the 8-GPU C20 A/B before it is a default. |
 | `PLOW_GLM_FOLD_LT` | `--glm-fold-lt` | false | Native gfx942 FP32 MLA fold GEMMs during prefill. Measured +0.49% with P99 +3.6% — not a default candidate. |
 | `PLOW_GLM_PF_WIDE` | `--glm-pf-wide` | true | Widen prefill norm/residual dispatch across CUs. DEFAULT ON (`=0` restores the single-workgroup emit for A/B). Bit-identical either way. |
@@ -401,6 +401,33 @@ the 2026-09-04 audit that removed the rejected experiment knobs are in
 | `PLOW_GLM_XR_RES` | `--glm-xr-res` | false | Fold the post-collective Residual into the two-shot all-gather. Bit-identical. |
 | `GLM_FUSE_XRN` | `--glm-fuse-xrn` | false | Fuse the seam Residual+Norm into XReduceAddNorm (requires fuse_b1, tp>1). |
 | `PLOW_GLM_WGFIT` | `--glm-wgfit` | true | Narrow GLM dispatch to the workgroups that own work. DEFAULT ON (`=0` for the A/B control arm); the emitted arithmetic is unchanged either way. |
+
+##### The qualified GLM gfx942 TP8 recipe
+
+Eight `glm_*` knobs are ON by default when the model is GLM (`glm_moe_dsa` / `glm5_next`), the
+arch is `gfx942`, `--num-gpus 8` and the part has 304 CUs: `PLOW_GLM_FP8_KV`,
+`PLOW_GLM_MOE_AITER`, `PLOW_GLM_MOE_RESIDENT`, `PLOW_GLM_INDEX_TP`, `PLOW_GLM_SELECT_LOCAL`,
+`PLOW_GLM_DECODE_NORM_ROWS`, `PLOW_GLM_GEMM_LT`, `PLOW_GLM_GEMM_LT_DECODE`. Off on every other
+target, and off under `--mxfp4` (the native MoE arms are block-fp8 only).
+
+That is the configuration serving GLM-5.3 on 8x MI300X — 47-50 out tok/s with the 18-case
+retrieval screen at 18/18 — and each knob's own evidence is in its row above. It was previously
+reachable only by naming all eight, so dropping one emitted a slower packet that still loaded and
+still served. An emit with no `glm_*` flags at all now produces that packet byte-for-byte.
+
+Precedence is strictly **explicit flag > env var > `--replay-knobs` > production default > plain
+default**. A replayed recipe lands as an env assignment before clap parses (`apply_replay_knobs`),
+so it outranks the production default and a recorded `false` survives — re-emitting a frozen
+recipe reproduces it. `build.json` names the winner per knob (`cli` / `env` /
+`production_default`), and production defaults are omitted from `emit_config.replay` so a replay
+re-derives them from the target rather than pinning today's.
+
+Rollback is per knob: `--glm-<knob>=false`. There is deliberately no single kill switch — the
+knobs were qualified individually and are rolled back individually.
+
+Knobs measured on the same target and deliberately NOT defaulted: `PLOW_GLM_MOE_FLAT_DECODE`,
+`PLOW_GLM_MLA_DEC_AITER`, `PLOW_GLM_FOLD_LT`, `PLOW_GLM_PLACE_PF`, `PLOW_GLM_FUSE_ROPE`,
+`PLOW_TOKEN_BATCH_TP` and `PLOW_PACKED_SPARSE_PF`. See each row for why.
 
 #### Tuning
 
