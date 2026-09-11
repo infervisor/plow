@@ -1218,8 +1218,10 @@ impl AmdTpGroup {
         Ok(())
     }
 
+    /// `all`, not `any`: `attach_shared_prefixes` requires every rank to carry the cache, so a
+    /// group predicate that said "enabled" on one rank would fail every admission.
     pub fn shared_prefix_enabled(&self) -> bool {
-        self.ranks.iter().any(AmdEngine::shared_prefix_enabled)
+        self.ranks.iter().all(AmdEngine::shared_prefix_enabled)
     }
 
     pub fn attach_shared_prefix(&mut self, slot: usize, prompt: &[u32]) -> Result<u32> {

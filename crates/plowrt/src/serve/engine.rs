@@ -1426,7 +1426,16 @@ mod amd_serve {
             }
             cur.next += 1;
             cur.frontier = step.c0 + step.clen;
-            g.publish_shared_prefix(slot, prompt, cur.frontier)?;
+            // Publishing is a cache-side favour to LATER requests; this prompt's KV is already
+            // correct. A snapshot OOM after eviction, a radix hash collision or a rejected
+            // boundary must not fail the request — the CUDA route warns and continues the same
+            // way. Only a fatal device error still propagates.
+            if let Err(err) = g.publish_shared_prefix(slot, prompt, cur.frontier) {
+                if err.is_fatal() {
+                    return Err(err);
+                }
+                tracing::warn!(slot, frontier = cur.frontier, error = %err, "amd: shared prefix publish skipped");
+            }
             if cur.next < cur.steps.len() {
                 return Ok(None);
             }
