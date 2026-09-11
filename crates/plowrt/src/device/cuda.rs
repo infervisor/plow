@@ -2145,3 +2145,176 @@ mod tests {
         }
     }
 }
+
+impl crate::exec::device_api::PinnedBuf for PinnedHost {
+    fn as_slice(&self) -> &[u8] {
+        PinnedHost::as_slice(self)
+    }
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        PinnedHost::as_mut_slice(self)
+    }
+    fn len(&self) -> usize {
+        PinnedHost::len(self)
+    }
+}
+
+/// Pure forwarding: the concrete `CudaBackend` methods stay the NVIDIA path
+/// `exec::gpu` calls today, so nothing on it changes shape or cost. This impl is
+/// what lets engine code be written once against `D: EngineDevice` and be
+/// monomorphised for CUDA and HSA alike (the HSA twin is in `device::hsa`).
+impl crate::exec::device_api::EngineDevice for CudaBackend {
+    type Stream = CudaStream;
+    type Event = CudaEvent;
+    type Pinned = PinnedHost;
+    type Function = KernelFn;
+
+    fn device_name(&self) -> &str {
+        CudaBackend::device_name(self)
+    }
+    /// The interpreter profile tag `exec::gpu` keys on (`interpreter_profile`):
+    /// the two shipped objects by name, anything else as `sm<major><minor>`.
+    fn arch(&self) -> String {
+        match self.compute_capability() {
+            (9, 0) => "sm90a".into(),
+            (12, 0) => "sm120".into(),
+            (major, minor) => format!("sm{major}{minor}"),
+        }
+    }
+    fn sm_count(&self) -> u32 {
+        CudaBackend::sm_count(self)
+    }
+
+    fn alloc(&self, bytes: u64) -> Result<DeviceMem> {
+        Backend::alloc(self, 0, bytes)
+    }
+    fn upload(&self, dst: &DeviceMem, off: u64, src: &[u8]) -> Result<()> {
+        Backend::upload(self, dst, off, src)
+    }
+    fn download(&self, src: &DeviceMem, off: u64, dst: &mut [u8]) -> Result<()> {
+        Backend::download(self, src, off, dst)
+    }
+    fn memcpy_htod(&self, dptr: u64, src: &[u8]) -> Result<()> {
+        CudaBackend::memcpy_htod(self, dptr, src)
+    }
+    fn memcpy_dtod(&self, dst: u64, src: u64, bytes: u64) -> Result<()> {
+        CudaBackend::memcpy_dtod(self, dst, src, bytes)
+    }
+    /// `cuMemcpyHtoD` accepts page-locked sources directly; pinning is not a
+    /// separate step on CUDA, so both entry points are the same call.
+    fn memcpy_htod_pinned(&self, dptr: u64, src: &[u8]) -> Result<()> {
+        CudaBackend::memcpy_htod(self, dptr, src)
+    }
+    fn memcpy_dtoh_pinned(&self, dst: &mut [u8], dptr: u64) -> Result<()> {
+        CudaBackend::memcpy_dtoh(self, dst, dptr)
+    }
+    fn host_alloc_pinned(&self, bytes: usize) -> Result<PinnedHost> {
+        CudaBackend::host_alloc_pinned(self, bytes)
+    }
+    fn memset_d8(&self, dptr: u64, value: u8, n: usize) -> Result<()> {
+        CudaBackend::memset_d8(self, dptr, value, n)
+    }
+    fn memset_d8_async(&self, dptr: u64, value: u8, n: usize, stream: &CudaStream) -> Result<()> {
+        CudaBackend::memset_d8_async(self, dptr, value, n, stream)
+    }
+    unsafe fn memcpy_htod_async(&self, dptr: u64, src: &[u8], stream: &CudaStream) -> Result<()> {
+        CudaBackend::memcpy_htod_async(self, dptr, src, stream)
+    }
+    unsafe fn memcpy_dtoh_async(
+        &self,
+        dst: &mut [u8],
+        dptr: u64,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        CudaBackend::memcpy_dtoh_async(self, dst, dptr, stream)
+    }
+
+    fn stream_create(&self) -> Result<CudaStream> {
+        CudaBackend::stream_create(self)
+    }
+    fn stream_synchronize(&self, stream: &CudaStream) -> Result<()> {
+        CudaBackend::stream_synchronize(self, stream)
+    }
+    fn synchronize(&self) -> Result<()> {
+        CudaBackend::synchronize(self)
+    }
+    fn event_create(&self, timing: bool) -> Result<CudaEvent> {
+        CudaBackend::event_create(self, timing)
+    }
+    fn event_record(&self, event: &CudaEvent, stream: &CudaStream) -> Result<()> {
+        CudaBackend::event_record(self, event, stream)
+    }
+    fn event_synchronize(&self, event: &CudaEvent) -> Result<()> {
+        CudaBackend::event_synchronize(self, event)
+    }
+    fn event_elapsed_ms(&self, start: &CudaEvent, end: &CudaEvent) -> Result<f32> {
+        CudaBackend::event_elapsed_ms(self, start, end)
+    }
+
+    fn module_load(&self, image: &[u8]) -> Result<Module> {
+        Backend::module_load(self, image)
+    }
+    fn module_unload(&self, module: &Module) -> Result<()> {
+        CudaBackend::module_unload(self, module)
+    }
+    fn get_function(&self, module: &Module, name: &str) -> Result<KernelFn> {
+        CudaBackend::get_function(self, module, name)
+    }
+    fn module_global_zero(&self, module: &Module, name: &str, n: usize) -> Result<bool> {
+        CudaBackend::module_global_zero(self, module, name, n)
+    }
+    fn module_global_u32(&self, module: &Module, name: &str) -> Result<Option<u32>> {
+        CudaBackend::module_global_u32(self, module, name)
+    }
+    fn module_global_bytes(
+        &self,
+        module: &Module,
+        name: &str,
+        max: usize,
+        out: &mut Vec<u8>,
+    ) -> Result<bool> {
+        CudaBackend::module_global_bytes(self, module, name, max, out)
+    }
+
+    fn set_max_dynamic_smem(&self, f: KernelFn, bytes: u32) -> Result<()> {
+        CudaBackend::set_max_dynamic_smem(self, f, bytes)
+    }
+    fn occupancy_blocks_per_sm(&self, f: KernelFn, block: u32, smem: usize) -> Result<u32> {
+        CudaBackend::occupancy_blocks_per_sm(self, f, block, smem)
+    }
+    /// One POD argument block, exactly the engine's `[&mut arg as *mut _]` form.
+    fn launch_cooperative(
+        &self,
+        f: KernelFn,
+        grid: u32,
+        block: u32,
+        smem_bytes: u32,
+        args: &[u8],
+        stream: Option<&CudaStream>,
+    ) -> Result<()> {
+        let mut params = [args.as_ptr() as *mut c_void];
+        CudaBackend::launch_cooperative(self, f, grid, block, smem_bytes, &mut params, stream)
+    }
+    fn launch_kernel(
+        &self,
+        f: KernelFn,
+        grid: u32,
+        block: u32,
+        smem_bytes: u32,
+        args: &[u8],
+        stream: Option<&CudaStream>,
+    ) -> Result<()> {
+        let mut params = [args.as_ptr() as *mut c_void];
+        CudaBackend::launch_kernel(self, f, grid, block, smem_bytes, &mut params, stream)
+    }
+}
+
+#[cfg(test)]
+mod engine_device_tests {
+    /// Both backends satisfy the same engine surface — the property generic
+    /// engine code relies on. A compile-time check; no driver needed.
+    fn _implements<D: crate::exec::device_api::EngineDevice>() {}
+    #[test]
+    fn cuda_backend_is_an_engine_device() {
+        _implements::<super::CudaBackend>();
+    }
+}
