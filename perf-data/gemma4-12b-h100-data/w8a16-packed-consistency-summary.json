@@ -1,0 +1,439 @@
+{
+  "scope": "H100 Gemma 4 12B FP8 weights, BF16 activations/KV, packed prefill128/512/1024/2048 decode1/2/4/8/16. One sequential serving screen per candidate after verification, no additional cell warmups.",
+  "decision": "Neither candidate promoted. W8A16 greatly reduces short diagnostic native/unified difference but prefill is much slower than earlier W8A8 screen. Batched BF16 MMA with FP8 weights regresses C16 decode time.",
+  "diagnostics": {
+    "w8a16": {
+      "native": {
+        "frames": 54,
+        "max_abs": 0.0,
+        "token_changes": 0
+      },
+      "unified": {
+        "frames": 12,
+        "max_abs": 0.38671875,
+        "token_changes": 0
+      }
+    },
+    "w8a16-mma": {
+      "native": {
+        "frames": 54,
+        "max_abs": 0.33203125,
+        "token_changes": 0
+      },
+      "unified": {
+        "frames": 12,
+        "max_abs": 0.38671875,
+        "token_changes": 0
+      }
+    }
+  },
+  "serving": {
+    "w8a16-packed": [
+      {
+        "input": 1024,
+        "concurrency": 1,
+        "output_tok_s": 87.26166981118399,
+        "ttft_ms": 254.86001900571864,
+        "tpot_ms": {
+          "p50": 9.538053984201044,
+          "p95": 9.538053984201044,
+          "p99": 9.538053984201044
+        }
+      },
+      {
+        "input": 1024,
+        "concurrency": 16,
+        "output_tok_s": 223.84796797934936,
+        "ttft_ms": 3722.3337029936374,
+        "tpot_ms": {
+          "p50": 42.68594333071511,
+          "p95": 65.78201051579384,
+          "p99": 65.7851744055318
+        }
+      },
+      {
+        "input": 16384,
+        "concurrency": 1,
+        "output_tok_s": 24.538285986143944,
+        "ttft_ms": 3868.3432580000954,
+        "tpot_ms": {
+          "p50": 10.607241999974848,
+          "p95": 10.607241999974848,
+          "p99": 10.607241999974848
+        }
+      },
+      {
+        "input": 16384,
+        "concurrency": 16,
+        "output_tok_s": 28.87466420985128,
+        "ttft_ms": 64535.81712250161,
+        "tpot_ms": {
+          "p50": 50.25908679920927,
+          "p95": 457.67738651376544,
+          "p99": 457.67882729334644
+        }
+      }
+    ],
+    "w8a16-mma": [
+      {
+        "input": 1024,
+        "concurrency": 1,
+        "output_tok_s": 87.20028765531299,
+        "ttft_ms": 250.63094600045588,
+        "tpot_ms": {
+          "p50": 9.579031141662757,
+          "p95": 9.579031141662757,
+          "p99": 9.579031141662757
+        }
+      },
+      {
+        "input": 1024,
+        "concurrency": 16,
+        "output_tok_s": 208.78583960036292,
+        "ttft_ms": 3854.903188002936,
+        "tpot_ms": {
+          "p50": 46.84454815745937,
+          "p95": 53.10433988186588,
+          "p99": 68.09952665359495
+        }
+      },
+      {
+        "input": 16384,
+        "concurrency": 1,
+        "output_tok_s": 24.512227512686504,
+        "ttft_ms": 3868.4831770078745,
+        "tpot_ms": {
+          "p50": 10.649286692927218,
+          "p95": 10.649286692927218,
+          "p99": 10.649286692927218
+        }
+      },
+      {
+        "input": 16384,
+        "concurrency": 16,
+        "output_tok_s": 29.298109734732684,
+        "ttft_ms": 63051.385880498856,
+        "tpot_ms": {
+          "p50": 53.64136051176452,
+          "p95": 344.36949919091694,
+          "p99": 344.3695676995693
+        }
+      }
+    ]
+  },
+  "paired_text_equal": 29,
+  "paired_requests": 34,
+  "archive": [
+    {
+      "file": "check_w8a16_mma.py",
+      "original_sha256": "6d614319e0f4ba265fc225fde5a0cd8a7d5c3e4be0eb4e9ba51bd4ccb5e9a5a3",
+      "archived_sha256": "6d614319e0f4ba265fc225fde5a0cd8a7d5c3e4be0eb4e9ba51bd4ccb5e9a5a3"
+    },
+    {
+      "file": "check_w8a16_packed.py",
+      "original_sha256": "6fa3431d9350530f9f9df6fbaa9154c588d0a0e1f71068d68e995c95012d8251",
+      "archived_sha256": "6fa3431d9350530f9f9df6fbaa9154c588d0a0e1f71068d68e995c95012d8251"
+    },
+    {
+      "file": "fp8-short-w8a16-logits.json",
+      "original_sha256": "c75328cbba737a92332533bfe5260500975bac6a65828d3981700193c37b4464",
+      "archived_sha256": "d7ee41ade27dfb3d524fe04731f6084b076202718bc29cfcf3cec3362f6e88e8"
+    },
+    {
+      "file": "fp8-short-w8a16-logits.log",
+      "original_sha256": "03e53d2d6a1f5d64f982ab233b2ad7128342180820a2961dbf89162eb4da3e06",
+      "archived_sha256": "3b5f451051781275883110f9552801c9523881e0b21208d250061e08317ea25b"
+    },
+    {
+      "file": "fp8-short-w8a16-mma-logits.json",
+      "original_sha256": "2fb009be74971fa4823779f2a2e464db92f702f92d06fdce533b7c95036ca6b3",
+      "archived_sha256": "bb38ed420642b293dcda1a34e5a8951e9bb021dbd08a722c80448f256f1d7817"
+    },
+    {
+      "file": "fp8-short-w8a16-mma-logits.log",
+      "original_sha256": "24f19afbd3c0192976fb8c2bc35f42655fad39fb429812e604516f7f77bc1b6a",
+      "archived_sha256": "af2ef49e748916c76fa7a0c4520cc6c49052731a8622fe370542560450e129b7"
+    },
+    {
+      "file": "w8a16-mma-check.log",
+      "original_sha256": "65fd3863574430b1cb928af94c46540fd94adbf87f16321040ed48d17ee4afe2",
+      "archived_sha256": "65fd3863574430b1cb928af94c46540fd94adbf87f16321040ed48d17ee4afe2"
+    },
+    {
+      "file": "w8a16-packed-check.log",
+      "original_sha256": "6c8fa9cd0fa0a20a1efccf04c2dc4ef4fc5b38cf6f6e33e6c8477e70b8b543f6",
+      "archived_sha256": "6c8fa9cd0fa0a20a1efccf04c2dc4ef4fc5b38cf6f6e33e6c8477e70b8b543f6"
+    },
+    {
+      "file": "w8a16-packed-compile.log",
+      "original_sha256": "6641b0cd2649dcd0ad0794f845c99cd810d4dfd02a6276bde1b61f01808c3280",
+      "archived_sha256": "6641b0cd2649dcd0ad0794f845c99cd810d4dfd02a6276bde1b61f01808c3280"
+    },
+    {
+      "file": "w8a16-packed-recipe.json",
+      "original_sha256": "3cb5a6b2194cfcd05e31cca5ab1c0e5758f35b372709407f0eb0b834ae9ad194",
+      "archived_sha256": "3cb5a6b2194cfcd05e31cca5ab1c0e5758f35b372709407f0eb0b834ae9ad194"
+    },
+    {
+      "file": "w8a8-b16-serving-w8a16-mma-server.log",
+      "original_sha256": "e86cc9455b77f9f2c9cec6ab89186b30c7ed69485ef253362a92ff2099688c62",
+      "archived_sha256": "e86cc9455b77f9f2c9cec6ab89186b30c7ed69485ef253362a92ff2099688c62"
+    },
+    {
+      "file": "w8a8-b16-serving-w8a16-mma-verify.log",
+      "original_sha256": "f6e91190b360d5c897d0dc8996002ea78e93b0375e9476ce5ef68721fedefd91",
+      "archived_sha256": "f6e91190b360d5c897d0dc8996002ea78e93b0375e9476ce5ef68721fedefd91"
+    },
+    {
+      "file": "w8a8-b16-serving-w8a16-mma.json",
+      "original_sha256": "e5b95c842af1dca9aa79abb6c385600b65e2550acadba09cf900504304c676f1",
+      "archived_sha256": "e5b95c842af1dca9aa79abb6c385600b65e2550acadba09cf900504304c676f1"
+    },
+    {
+      "file": "w8a8-b16-serving-w8a16-mma.log",
+      "original_sha256": "86492d0459f0c637c93ff1fece642f9c0151f8a7bbf8730fbc99deda7ab386cb",
+      "archived_sha256": "86492d0459f0c637c93ff1fece642f9c0151f8a7bbf8730fbc99deda7ab386cb"
+    },
+    {
+      "file": "w8a8-b16-serving-w8a16-packed-server.log",
+      "original_sha256": "69451bf772c1bd26066ab54562eb6d75ad1fc249bc266cab9aedcbe99d4fe900",
+      "archived_sha256": "69451bf772c1bd26066ab54562eb6d75ad1fc249bc266cab9aedcbe99d4fe900"
+    },
+    {
+      "file": "w8a8-b16-serving-w8a16-packed-verify.log",
+      "original_sha256": "f6e91190b360d5c897d0dc8996002ea78e93b0375e9476ce5ef68721fedefd91",
+      "archived_sha256": "f6e91190b360d5c897d0dc8996002ea78e93b0375e9476ce5ef68721fedefd91"
+    },
+    {
+      "file": "w8a8-b16-serving-w8a16-packed.json",
+      "original_sha256": "b116d582b530cc82ccbcc788176621d5d66f2389af6cab7b502f77f01aa8fcb8",
+      "archived_sha256": "b116d582b530cc82ccbcc788176621d5d66f2389af6cab7b502f77f01aa8fcb8"
+    },
+    {
+      "file": "w8a8-b16-serving-w8a16-packed.log",
+      "original_sha256": "2d91da3dd74bf9e8fe96c7697fbaa1c146499eb2a347d1ffb7cae7db7a509070",
+      "archived_sha256": "2d91da3dd74bf9e8fe96c7697fbaa1c146499eb2a347d1ffb7cae7db7a509070"
+    }
+  ],
+  "packet_sha256": "f38bf563f1b1fcd2910a6f17f486c41524b0141f44ef0cb9201ba4bd274322c7",
+  "build_sha256": "8f7ff64354b6457f2f43b598152925740bfd99ea71dbae9876c3e173b42d9877",
+  "audit_sha256": "79877ddd35979cf034566f4062751a832269bb49c718c2dcef9437011f8db31e",
+  "programs": [
+    {
+      "index": 0,
+      "phase": "prefill",
+      "rows": 128,
+      "instructions": 766,
+      "cases": 67,
+      "ops": {
+        "Argmax": 1,
+        "ArgmaxFin": 1,
+        "Embed": 1,
+        "FlashPrefill": 48,
+        "Gemm": 1,
+        "GemmFp8": 328,
+        "Glu": 48,
+        "HeadNormRope": 144,
+        "NormResidual": 96,
+        "RmsNorm": 97,
+        "SoftCap": 1
+      }
+    },
+    {
+      "index": 1,
+      "phase": "prefill",
+      "rows": 512,
+      "instructions": 766,
+      "cases": 67,
+      "ops": {
+        "Argmax": 1,
+        "ArgmaxFin": 1,
+        "Embed": 1,
+        "FlashPrefill": 48,
+        "Gemm": 1,
+        "GemmFp8": 328,
+        "Glu": 48,
+        "HeadNormRope": 144,
+        "NormResidual": 96,
+        "RmsNorm": 97,
+        "SoftCap": 1
+      }
+    },
+    {
+      "index": 2,
+      "phase": "prefill",
+      "rows": 1024,
+      "instructions": 766,
+      "cases": 67,
+      "ops": {
+        "Argmax": 1,
+        "ArgmaxFin": 1,
+        "Embed": 1,
+        "FlashPrefill": 48,
+        "Gemm": 1,
+        "GemmFp8": 328,
+        "Glu": 48,
+        "HeadNormRope": 144,
+        "NormResidual": 96,
+        "RmsNorm": 97,
+        "SoftCap": 1
+      }
+    },
+    {
+      "index": 3,
+      "phase": "prefill",
+      "rows": 2048,
+      "instructions": 766,
+      "cases": 67,
+      "ops": {
+        "Argmax": 1,
+        "ArgmaxFin": 1,
+        "Embed": 1,
+        "FlashPrefill": 48,
+        "Gemm": 1,
+        "GemmFp8": 328,
+        "Glu": 48,
+        "HeadNormRope": 144,
+        "NormResidual": 96,
+        "RmsNorm": 97,
+        "SoftCap": 1
+      }
+    },
+    {
+      "index": 4,
+      "phase": "decode",
+      "rows": 1,
+      "instructions": 622,
+      "cases": 68,
+      "ops": {
+        "Argmax": 1,
+        "ArgmaxFin": 1,
+        "Embed": 1,
+        "FlashDecode": 48,
+        "FlashMerge": 48,
+        "Gemv": 1,
+        "GemvFp8": 232,
+        "GemvGluFp8": 48,
+        "HeadNormRope": 144,
+        "NormResidualNorm": 96,
+        "RmsNorm": 1,
+        "SoftCap": 1
+      }
+    },
+    {
+      "index": 5,
+      "phase": "decode",
+      "rows": 2,
+      "instructions": 622,
+      "cases": 68,
+      "ops": {
+        "Argmax": 1,
+        "ArgmaxFin": 1,
+        "Embed": 1,
+        "FlashDecode": 48,
+        "FlashMerge": 48,
+        "Gemv": 1,
+        "GemvFp8": 232,
+        "GemvGluFp8": 48,
+        "HeadNormRope": 144,
+        "NormResidualNorm": 96,
+        "RmsNorm": 1,
+        "SoftCap": 1
+      }
+    },
+    {
+      "index": 6,
+      "phase": "decode",
+      "rows": 4,
+      "instructions": 622,
+      "cases": 68,
+      "ops": {
+        "Argmax": 1,
+        "ArgmaxFin": 1,
+        "Embed": 1,
+        "FlashDecode": 48,
+        "FlashMerge": 48,
+        "Gemv": 1,
+        "GemvFp8": 232,
+        "GemvGluFp8": 48,
+        "HeadNormRope": 144,
+        "NormResidualNorm": 96,
+        "RmsNorm": 1,
+        "SoftCap": 1
+      }
+    },
+    {
+      "index": 7,
+      "phase": "decode",
+      "rows": 8,
+      "instructions": 622,
+      "cases": 68,
+      "ops": {
+        "Argmax": 1,
+        "ArgmaxFin": 1,
+        "Embed": 1,
+        "FlashDecode": 48,
+        "FlashMerge": 48,
+        "Gemv": 1,
+        "GemvFp8": 232,
+        "GemvGluFp8": 48,
+        "HeadNormRope": 144,
+        "NormResidualNorm": 96,
+        "RmsNorm": 1,
+        "SoftCap": 1
+      }
+    },
+    {
+      "index": 8,
+      "phase": "decode",
+      "rows": 16,
+      "instructions": 622,
+      "cases": 68,
+      "ops": {
+        "Argmax": 1,
+        "ArgmaxFin": 1,
+        "Embed": 1,
+        "FlashDecode": 48,
+        "FlashMerge": 48,
+        "Gemv": 1,
+        "GemvFp8": 232,
+        "GemvGluFp8": 48,
+        "HeadNormRope": 144,
+        "NormResidualNorm": 96,
+        "RmsNorm": 1,
+        "SoftCap": 1
+      }
+    }
+  ],
+  "objects": {
+    "cubin-w8a16-packed-b16": {
+      "interp_sm90a.cubin": "e381cea75ac55de64fe1cdb84ea19ad8b9b1de3f6a5af2134e4189326fffe0e8",
+      "interp_sm90a_pf.cubin": "45394e8cb0724ddb2d39b9a8decf8b7cb348b9ae181b741a724ba774fbdf26ae",
+      "interp_sm90a_pfattn_hd512.cubin": "e2eca8276535f0ac21a45bbefceb0371c81d14facf36800875a1f2e0d1933050",
+      "interp_sm90a_pffa.cubin": "1028501036100003a601705fd5ef707b5c43d25e01823b2143f473f3a0a86569",
+      "interp_sm90a_pfgemm.cubin": "3341c2598abc5905d2016fa1dde56b68232d23cc59608e05e1518ab0d816159d",
+      "interp_sm90a_pfpackedfa.cubin": "5ebd34c17ee7b889bd4bab2512b4c6a27799a491b968ded4fe330ce9f601c940",
+      "interp_sm90a_pfpackedgemm.cubin": "c039c0d9f8ae685f5b6f0f9eeeb504af6665affbac8924be5abd90b20b588010",
+      "interp_sm90a_pfpackedseg.cubin": "6a363f7e31692e3a6b2c2a95f8fe17008ab4b030bdb5cc9b1765ed675314ffb0",
+      "interp_sm90a_pfseg.cubin": "f0b4e2253e7217875c533f37d00858cb54e117052a113cad7cbe60d82902d88f"
+    },
+    "cubin-w8a16-packed-mma": {
+      "interp_sm90a.cubin": "d43e145bf3f9740d6f35366ae066a45924288e0579147c8503bf291c510590b2",
+      "interp_sm90a_pf.cubin": "45394e8cb0724ddb2d39b9a8decf8b7cb348b9ae181b741a724ba774fbdf26ae",
+      "interp_sm90a_pfattn_hd512.cubin": "e2eca8276535f0ac21a45bbefceb0371c81d14facf36800875a1f2e0d1933050",
+      "interp_sm90a_pffa.cubin": "1028501036100003a601705fd5ef707b5c43d25e01823b2143f473f3a0a86569",
+      "interp_sm90a_pfgemm.cubin": "3341c2598abc5905d2016fa1dde56b68232d23cc59608e05e1518ab0d816159d",
+      "interp_sm90a_pfpackedfa.cubin": "5ebd34c17ee7b889bd4bab2512b4c6a27799a491b968ded4fe330ce9f601c940",
+      "interp_sm90a_pfpackedgemm.cubin": "c039c0d9f8ae685f5b6f0f9eeeb504af6665affbac8924be5abd90b20b588010",
+      "interp_sm90a_pfpackedseg.cubin": "6a363f7e31692e3a6b2c2a95f8fe17008ab4b030bdb5cc9b1765ed675314ffb0",
+      "interp_sm90a_pfseg.cubin": "f0b4e2253e7217875c533f37d00858cb54e117052a113cad7cbe60d82902d88f"
+    }
+  },
+  "limits": [
+    "No independent model-quality or fresh vLLM comparison",
+    "No new sanitizer qualification",
+    "Diagnostic pass means execution, not logit equality",
+    "No C128 campaign for regressing C16 screens",
+    "Prefill objects reused from earlier W8A16 campaign; current main used for control, archived MMA mixed-rung main for candidate"
+  ]
+}

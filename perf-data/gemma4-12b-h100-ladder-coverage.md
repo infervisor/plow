@@ -495,3 +495,37 @@ Earlier passing W8A8 serving screens therefore do not establish stable
 scheduling invariance. The compiler enablement is reverted pending that
 investigation; no native-head speedup or causal attribution of these failures
 is claimed. [Prototype, exact-case audit and failures](gemma4-12b-h100-data/w8a8-native-head-summary.json).
+
+## W8A16 precision-matched screen
+
+The same FP8 weights with BF16 activations in both phases reduce the short
+diagnostic's unified maximum logit difference from 4.953125 to 0.38671875.
+Native schedules remain bit-identical; none of the 12 unified snapshots change
+the selected token. This implicates activation-precision switching as a major
+contributor in that diagnostic, without establishing the cause of every
+serving difference.
+
+The explicitly packed W8A16 asset passes strict packet/build/queue checks:
+9 programs, 6,174 instructions and 608 cases. Each prefill rung removes the
+192 separate activation quantizers present in W8A8. It uses existing W8A16
+objects and a current decode object. The mixed-rung MMA candidate changes
+only the decode object to the existing opt-in BF16-MMA/FP8-weight body.
+
+Both pass the serving consistency, cancellation and context checks in this
+screen. All 68 timed requests return 128 tokens with cache0. One sequential
+repeat per cell after verification, with no additional warmups:
+
+| Input / concurrency | W8A16 tok/s | W8A16 + decode MMA tok/s |
+|---|---:|---:|
+| 1K / C1 | 87.262 | 87.200 |
+| 1K / C16 | 223.848 | 208.786 |
+| 16K / C1 | 24.538 | 24.512 |
+| 16K / C16 | 28.875 | 29.298 |
+
+W8A16 16K/C1 TTFT is 3868 ms versus 1056 ms in the earlier W8A8 screen.
+The current W8A16 prefill implementation is too slow to recommend. Decode MMA
+also raises C16 median TPOT: 42.69→46.84 ms at1K and50.26→53.64 ms at16K.
+Its native diagnostic has maximum difference0.33203125 across schedules, and
+five of34 paired serving texts differ between objects. Neither candidate is
+promoted. No independent model-quality, new sanitizer, fresh vLLM or C128
+qualification was run. [Recipes, hashes, diagnostics and raw results](gemma4-12b-h100-data/w8a16-packed-consistency-summary.json).
