@@ -349,6 +349,9 @@ pub fn dense_gemm_tuning_build(root: &Path, isa: IsaLevel) -> Result<crate::Buil
         "runtime/amd/amd_common.h",
         "runtime/amd/op_elementwise.h",
         "runtime/amd/op_gemm.h",
+        "runtime/amd/op_gemm_common.h",
+        "runtime/amd/op_gemm_gfx942.h",
+        "runtime/amd/op_gemm_gfx950.h",
     ];
     let mut family = String::new();
     for extra in [None, Some("PLOW_FP8=1"), Some("PLOW_MXFP4=1")] {
@@ -519,13 +522,19 @@ mod tests {
     /// so it holds on a machine with no ROCm.
     #[test]
     fn amd_tile_macros_exist_in_the_header() {
-        let hdr = std::fs::read_to_string(root().join("runtime/amd/op_gemm.h"))
-            .expect("runtime/amd/op_gemm.h");
+        // The gfx950 arm plus the shared body: what a gfx950 compile of op_gemm.h sees.
+        let mut hdr = String::new();
+        for f in [
+            "runtime/amd/op_gemm_gfx950.h",
+            "runtime/amd/op_gemm_common.h",
+        ] {
+            hdr.push_str(&std::fs::read_to_string(root().join(f)).expect(f));
+        }
         for names in GFX950_TILE_MACROS {
             for n in names {
                 assert!(
                     hdr.contains(&format!("#define {n} ")),
-                    "a rung names {n}, which op_gemm.h does not define"
+                    "a rung names {n}, which neither op_gemm_gfx950.h nor op_gemm_common.h defines"
                 );
             }
         }

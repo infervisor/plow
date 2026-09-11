@@ -138,6 +138,20 @@ mod tests {
         std::fs::read_to_string(root().join(p)).ok()
     }
 
+    /// The AMD GEMM family as one text: op_gemm.h only selects an arch file, and a knob's
+    /// `#ifndef` guard lives in the arch file (arch-defaulted) or in the shared body.
+    fn read_amd_gemm() -> Option<String> {
+        let mut s = String::new();
+        for p in [
+            "runtime/amd/op_gemm_gfx942.h",
+            "runtime/amd/op_gemm_gfx950.h",
+            "runtime/amd/op_gemm_common.h",
+        ] {
+            s.push_str(&read(p)?);
+        }
+        Some(s)
+    }
+
     const SAMPLE: &str = r#"
 #define PGM_BM 128
 #ifndef PGM_BN
@@ -332,10 +346,7 @@ static_assert(PGM_BK8 == 64, "the mainloop reads two k32 subgroups per K-tile");
     /// This test previously asserted `GM_BM` was Fixed, which was simply wrong.
     #[test]
     fn amd_gemm_tile_is_sweepable_where_nvidia_is_not() {
-        let (Some(amd), Some(nv)) = (
-            read("runtime/amd/op_gemm.h"),
-            read("runtime/nvidia/op_gemm.cuh"),
-        ) else {
+        let (Some(amd), Some(nv)) = (read_amd_gemm(), read("runtime/nvidia/op_gemm.cuh")) else {
             return;
         };
 

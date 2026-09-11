@@ -141,6 +141,9 @@ if(PLOW_ROCM)
         COMMAND ${CMAKE_COMMAND} -E rm -f ${MLA_PREFILL_BENCH_ELF}.co
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../amd/test_kernels.hip
                 ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_attention.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_attention_common.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_attention_gfx942.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_attention_gfx950.h
         VERBATIM)
     add_custom_target(mla_prefill_bench_gfx942_elf DEPENDS ${MLA_PREFILL_BENCH_ELF})
     add_executable(mla_prefill_bench_gfx942
@@ -255,6 +258,9 @@ if(PLOW_ROCM)
                 -o ${K3_GEMV_GRID_CO}
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/amd/k3_gemvbf16_bench.hip
                 ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_gemm.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_gemm_common.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_gemm_gfx942.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_gemm_gfx950.h
                 ${CMAKE_CURRENT_SOURCE_DIR}/../amd/amd_common.h
         VERBATIM)
     add_custom_target(k3_gemv_grid_sweep_gfx942_object DEPENDS ${K3_GEMV_GRID_CO})
@@ -286,6 +292,9 @@ if(PLOW_ROCM)
                 -o ${K3_GEMV_COHORT_CO}
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/amd/k3_gemv_cohort_sweep.hip
                 ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_gemm.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_gemm_common.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_gemm_gfx942.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_gemm_gfx950.h
                 ${CMAKE_CURRENT_SOURCE_DIR}/../amd/amd_common.h
         VERBATIM)
     add_custom_target(k3_gemv_cohort_sweep_gfx942_object DEPENDS ${K3_GEMV_COHORT_CO})
@@ -313,6 +322,9 @@ if(PLOW_ROCM)
                     -o ${CMAKE_CURRENT_BINARY_DIR}/k3_mla_kdu${KDU}_gfx942.co
             DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/amd/k3_mla_kdu_sweep.hip
                     ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_attention.h
+                    ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_attention_common.h
+                    ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_attention_gfx942.h
+                    ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_attention_gfx950.h
                     ${CMAKE_CURRENT_SOURCE_DIR}/../amd/amd_common.h
             VERBATIM)
     endforeach()
@@ -341,6 +353,9 @@ if(PLOW_ROCM)
                 -o ${K3_GEMV_W8_CO}
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/amd/k3_gemv_w8a16_sweep.hip
                 ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_gemm.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_gemm_common.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_gemm_gfx942.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_gemm_gfx950.h
                 ${CMAKE_CURRENT_SOURCE_DIR}/../amd/amd_common.h
         VERBATIM)
     add_custom_target(k3_gemv_w8a16_sweep_gfx942_object DEPENDS ${K3_GEMV_W8_CO})
@@ -364,6 +379,9 @@ if(PLOW_ROCM)
                 -o ${K3_MLA_GF_CO}
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/amd/k3_mla_gf_sweep.hip
                 ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_attention.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_attention_common.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_attention_gfx942.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_attention_gfx950.h
                 ${CMAKE_CURRENT_SOURCE_DIR}/../amd/amd_common.h
         VERBATIM)
     add_custom_target(k3_mla_gf_sweep_gfx942_object DEPENDS ${K3_MLA_GF_CO})
@@ -475,6 +493,9 @@ if(PLOW_ROCM)
                 -o ${K3_QKVG_CONV_CO}
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/amd/k3_qkvg_conv_sweep.hip
                 ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_gemm.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_gemm_common.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_gemm_gfx942.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_gemm_gfx950.h
                 ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_kda.h
         VERBATIM)
     add_custom_target(k3_qkvg_conv_sweep_gfx942_object DEPENDS ${K3_QKVG_CONV_CO})
@@ -497,6 +518,9 @@ if(PLOW_ROCM)
                 -o ${K3_KDA_NORM_GEMV_CO}
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/amd/k3_kda_norm_gemv_sweep.hip
                 ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_gemm.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_gemm_common.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_gemm_gfx942.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_gemm_gfx950.h
                 ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_kda.h
         VERBATIM)
     add_custom_target(k3_kda_norm_gemv_sweep_gfx942_object DEPENDS ${K3_KDA_NORM_GEMV_CO})

@@ -24,8 +24,9 @@
  * initialises it from the same token in one preprocessor pass, so the advertised value cannot
  * disagree with the compiled one.
  *
- * THE LIST IS CHECKED, NOT TRUSTED. asm_audit.py --contract scans amd_arch.h, op_attention.h,
- * op_moe.h and op_gemm.h for `#ifndef (GM_|FA_|GV_|MPF_)*` and fails when one of them has no
+ * THE LIST IS CHECKED, NOT TRUSTED. asm_audit.py --contract scans amd_arch.h, op_moe.h and the
+ * op_attention / op_gemm families (the selector, the _common body and both _gfx942 / _gfx950 arch
+ * files) for `#ifndef (GM_|FA_|GV_|MPF_)*` and fails when one of them has no
  * PLOW_GEOM_MARK line here. A knob added without a marker is therefore a build failure and
  * not a silent hole -- which is the only way this guard does not rot.
  *
@@ -43,9 +44,10 @@
  * preprocessing token" for every expression-valued knob. */
 #define PLOW_GEOM_MARK(m) extern "C" __device__ unsigned plow_geom_##m = (unsigned)(m);
 
-/* The GM_/FA_/GV_/MPF_ knobs `#ifndef`-guarded in amd_arch.h, op_attention.h, op_moe.h and
- * op_gemm.h. asm_audit.py --contract re-derives this list from those headers and fails on a
- * knob that is missing here. */
+/* The GM_/FA_/GV_/MPF_ knobs `#ifndef`-guarded in amd_arch.h, op_moe.h and the op_attention* /
+ * op_gemm* files (arch-defaulted knobs are guarded in op_*_gfx942.h and op_*_gfx950.h, shared
+ * ones in op_*_common.h). asm_audit.py --contract re-derives this list from those headers and
+ * fails on a knob that is missing here. */
 #ifdef FA_ABL
 PLOW_GEOM_MARK(FA_ABL)
 #endif

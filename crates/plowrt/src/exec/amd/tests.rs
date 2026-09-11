@@ -3890,11 +3890,11 @@ fn a_shipped_object_without_the_marker_reads_as_unknown() {
 /// entire failure this check exists to end.
 #[test]
 fn op_gemm_h_emits_the_capacity_marker() {
-    let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/amd/op_gemm.h");
-    let src = std::fs::read_to_string(&p).expect("runtime/amd/op_gemm.h");
+    let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/amd/op_gemm_common.h");
+    let src = std::fs::read_to_string(&p).expect("runtime/amd/op_gemm_common.h");
     assert!(
         src.contains(&format!("{GEMV_CAP_SYM_PREFIX}##n")),
-        "op_gemm.h no longer pastes onto `{GEMV_CAP_SYM_PREFIX}` — the loader's \
+        "op_gemm_common.h no longer pastes onto `{GEMV_CAP_SYM_PREFIX}` — the loader's \
          capacity check would silently stop finding any object's bucket"
     );
     assert!(
@@ -3907,7 +3907,7 @@ fn op_gemm_h_emits_the_capacity_marker() {
     // rejects.
     assert!(
         src.contains(&format!("#define PLOW_GEMV_MAXM {GEMV_MAXM}")),
-        "op_gemm.h's PLOW_GEMV_MAXM is no longer {GEMV_MAXM}"
+        "op_gemm_common.h's PLOW_GEMV_MAXM is no longer {GEMV_MAXM}"
     );
     // The walk marker is the OTHER half of the same contract, and it fails
     // more dangerously than the capacity one: if op_gemm.h stops emitting it,
@@ -3917,7 +3917,7 @@ fn op_gemm_h_emits_the_capacity_marker() {
     // walk and rows 8..15 come back STALE (silent, fluent, wrong).
     assert!(
         src.contains(&format!("unsigned {GEMV_WALK_SYM} = 1")),
-        "op_gemm.h no longer emits `{GEMV_WALK_SYM}` under PLOW_GEMV_WALK — \
+        "op_gemm_common.h no longer emits `{GEMV_WALK_SYM}` under PLOW_GEMV_WALK — \
          `check_gemv_capacity` would refuse every walking object it should serve"
     );
     assert!(
