@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 #include "dev_isa.h"
 
@@ -24,6 +25,7 @@ using bf16 = __nv_bfloat16;
 #define CD(call) do { if ((call) != CUDA_SUCCESS) { \
     std::fprintf(stderr, "%s failed\n", #call); std::exit(2); } } while (0)
 static const char* interpreter_image = nullptr;
+static bool timing = false;
 template<class T> static T* upload(const std::vector<T>& v) {
     T* p; CK(cudaMalloc(&p, v.size() * sizeof(T)));
     CK(cudaMemcpy(p, v.data(), v.size() * sizeof(T), cudaMemcpyHostToDevice)); return p;
@@ -73,6 +75,22 @@ static void run_interpreter(const std::vector<void*>& tensors, unsigned rows, un
     void* args[]{&prog};
     CD(cuLaunchKernel(function, blocks, 1, 1, 256, 1, 1, smem, nullptr, args, nullptr));
     CK(cudaDeviceSynchronize());
+    if (timing) {
+        cudaEvent_t start, stop;
+        CK(cudaEventCreate(&start)); CK(cudaEventCreate(&stop));
+        std::vector<float> samples;
+        for (unsigned repeat = 0; repeat < 9; ++repeat) {
+            CK(cudaMemsetAsync(prog.gq_cursor, 0, PLOW_CTR_STRIDE * sizeof(unsigned)));
+            CK(cudaMemsetAsync(PLOW_CTR(prog.counters, 1), 0, sizeof(unsigned)));
+            CK(cudaEventRecord(start));
+            CD(cuLaunchKernel(function, blocks, 1, 1, 256, 1, 1, smem, nullptr, args, nullptr));
+            CK(cudaEventRecord(stop)); CK(cudaEventSynchronize(stop));
+            float ms; CK(cudaEventElapsedTime(&ms, start, stop)); samples.push_back(ms * 1000.0f);
+        }
+        std::sort(samples.begin(), samples.end());
+        std::printf("TIMING rows=%u HD=%u median_us=%.3f\n", rows, hd, samples[4]);
+        CK(cudaEventDestroy(start)); CK(cudaEventDestroy(stop));
+    }
     unsigned completed;
     CK(cudaMemcpy(&completed, PLOW_CTR(prog.counters, 1), sizeof(completed), cudaMemcpyDeviceToHost));
     if (completed != blocks) { std::fprintf(stderr, "incomplete attention counter\n"); std::exit(1); }
@@ -173,8 +191,12 @@ template<int HD> static void check(unsigned rows, unsigned kvheads, unsigned win
     if (!ok) std::exit(1);
 }
 int main(int argc, char** argv) {
-    if (argc > 2) return 2;
-    if (argc == 2) interpreter_image = argv[1];
+    if (argc > 3) return 2;
+    if (argc >= 2) interpreter_image = argv[1];
+    if (argc == 3) {
+        if (std::strcmp(argv[2], "--timing")) return 2;
+        timing = true;
+    }
     for (unsigned rows : {128,512,1024,2048,4096,8192}) {
         check<256>(rows,8,1024);
         check<512>(rows,1,0);

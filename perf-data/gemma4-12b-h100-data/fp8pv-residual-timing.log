@@ -1,0 +1,24 @@
+TIMING rows=128 HD=256 median_us=250.496
+PASS FP8 rows=128 HD=256 KV=8 real=117 checked=4608 relL2=0.00456436 max_abs=0.00028288
+TIMING rows=128 HD=512 median_us=4451.872
+PASS FP8 rows=128 HD=512 KV=1 real=117 checked=9216 relL2=0.00806007 max_abs=5.56138e-05
+TIMING rows=512 HD=256 median_us=254.784
+PASS FP8 rows=512 HD=256 KV=8 real=501 checked=4608 relL2=0.00353703 max_abs=0.000212616
+TIMING rows=512 HD=512 median_us=4368.960
+PASS FP8 rows=512 HD=512 KV=1 real=501 checked=9216 relL2=0.00619647 max_abs=4.54438e-05
+TIMING rows=1024 HD=256 median_us=263.840
+PASS FP8 rows=1024 HD=256 KV=8 real=1013 checked=4608 relL2=0.00350143 max_abs=0.000250633
+TIMING rows=1024 HD=512 median_us=8630.976
+PASS FP8 rows=1024 HD=512 KV=1 real=1013 checked=9216 relL2=0.00643907 max_abs=3.93784e-05
+TIMING rows=2048 HD=256 median_us=499.840
+PASS FP8 rows=2048 HD=256 KV=8 real=2037 checked=4608 relL2=0.00498111 max_abs=0.000275171
+TIMING rows=2048 HD=512 median_us=16749.088
+PASS FP8 rows=2048 HD=512 KV=1 real=2037 checked=9216 relL2=0.00603242 max_abs=4.47703e-05
+TIMING rows=4096 HD=256 median_us=509.984
+PASS FP8 rows=4096 HD=256 KV=8 real=2043 checked=4608 relL2=0.004191 max_abs=0.000272363
+TIMING rows=4096 HD=512 median_us=16763.328
+PASS FP8 rows=4096 HD=512 KV=1 real=2043 checked=9216 relL2=0.00635335 max_abs=5.19356e-05
+TIMING rows=8192 HD=256 median_us=534.048
+PASS FP8 rows=8192 HD=256 KV=8 real=2043 checked=4608 relL2=0.004191 max_abs=0.000272363
+TIMING rows=8192 HD=512 median_us=16729.695
+PASS FP8 rows=8192 HD=512 KV=1 real=2043 checked=9216 relL2=0.00635335 max_abs=5.19356e-05

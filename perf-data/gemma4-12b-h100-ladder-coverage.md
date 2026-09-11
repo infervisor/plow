@@ -4,6 +4,31 @@ Target: `google/gemma-4-12B-it`, H100 `sm_90a`. Compilation coverage is not
 performance qualification. Native bodies can remain in a shared interpreter;
 a separate object per opcode is not a requirement.
 
+## Current all-op specialization review
+
+The current BF16-weight B32 packets with BF16 KV and all-layer FP8 KV both
+pass the strict packet/build/queue audit: **24 programs, 17,808 instructions,
+5,472 exact cases** combined. Each has prefill rungs
+128/512/1024/2048/4096/8192 and decode rungs 1/2/4/8/16/32.
+The [source review and per-rung inventory](gemma4-12b-h100-data/current-all-op-specialization-review.json)
+records packet/build hashes, declared precision, all 17 emitted families
+across the two configurations, immediate shapes, role IDs, source hashes and
+remaining work. Every emitted family has a review entry; none is omitted
+because it is a light or fused op.
+
+**All-op specialization is still incomplete.** RMSNorm, residual norms, GLU,
+embedding, softcap and argmax use shared bodies with runtime dimensions.
+Projection and attention templates do not establish that every exact case is
+fast. Preserve useful fusion; qualify replacements using loaded segment
+correctness, timing and serving results before promotion. This source review
+does not resolve runtime overrides or qualify AMD/CPU implementations.
+
+FP8 HD512 attention remains a measured performance gap. Two native Hopper
+FP8 P×V residual variants passed the 12-case numerical probe but were slower
+at every tested HD512 rung and were reverted. The single-term variant failed
+the unchanged numerical gate. See the
+[experiment evidence](gemma4-12b-h100-data/fp8pv-hopper-summary.json).
+
 Latest B32 candidate: see [B32 all-op cases](#b32-all-op-cases) below. Earlier
 sections describe retained historical packets, including their then-open gaps.
 

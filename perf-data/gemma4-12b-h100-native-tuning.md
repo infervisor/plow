@@ -865,3 +865,36 @@ the cause of the serving difference or a throughput win. No fresh C128 or
 vLLM comparison was run for this candidate. The goal remains unmet.
 [Evidence and artifact hashes](gemma4-12b-h100-data/attention-exactshape-summary.json),
 [full-output rung checks](gemma4-12b-h100-data/attention-exactshape-rungs.jsonl).
+
+## Rejected Hopper FP8 probability/value variants
+
+Native Hopper adaptations of the FP8 P×V path were screened against the
+current FP8-KV packed attention object. Single-term E4M3 probabilities failed
+HD512/rows128 at relative L2 0.226483 (unchanged gate 0.015). A second E4M3
+residual term recovered accuracy in all 12 HD256/HD512 rung cases. Both a
+scalar shared-byte transpose and a 16-bit ldmatrix/register-byte transpose
+passed, but neither improved HD512 latency.
+
+| Rows | Current FP8 KV (µs) | Scalar residual (µs) | Transpose residual (µs) |
+|---:|---:|---:|---:|
+| 128 | 3527.392 | 4451.872 | 3928.896 |
+| 512 | 3350.336 | 4368.960 | 3943.648 |
+| 1024 | 6622.176 | 8630.976 | 7651.168 |
+| 2048 | 12960.512 | 16749.088 | 14901.439 |
+| 4096 | 12838.016 | 16763.328 | 15032.353 |
+| 8192 | 12945.472 | 16729.695 | 14964.063 |
+
+These are sequential warm-cache screens: median of nine CUDA-event samples
+after an initial launch per case. The loaded packed interpreter executes the
+ready dependency and successor counter path; queue/counter resets are outside
+the timed region. Two ragged requests end at history 16384/8193, with at most
+1024 real rows per request. The 4096/8192 rungs each contain only 2043 real
+rows. These measurements are neither an interleaved tuning run nor serving
+latency. No sanitizer or serving qualification was run for these rejected
+variants.
+
+Kernel edits were reverted. The probe retains optional `CUBIN --timing` mode
+for subsequent native candidates. [Evidence and hashes](gemma4-12b-h100-data/fp8pv-hopper-summary.json)
+include numerical/timing logs, compiler resource reports and the rejected
+residual patches. Whole-entry register/spill reports include other dispatch
+arms and must not be attributed entirely to the executed FP8 path.
