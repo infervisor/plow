@@ -3003,7 +3003,7 @@ pub fn packed_prefill_program_t(rows: u32) -> u32 {
 ///
 /// THE RULE, and why it needs no new blob field. Programs are emitted
 /// prefill-buckets-ascending then decode-rungs-ascending, and the two ranges are
-/// ordered by construction: decode is a trailing strictly ascending run at widths no greater
+/// separated by construction: decode is a trailing strictly ascending run at widths no greater
 /// than [`DECODE_RUNG_MAX`]. A width-128 prefill bucket may equal a width-128 decode rung, but
 /// the strict comparison below cannot cross that equal-width boundary.
 ///
@@ -5702,6 +5702,19 @@ mod v6_tests {
         );
         assert_eq!(program_rows(packed_prefill_program_t(1024)), 1024);
         assert!(is_packed_prefill_program(packed_prefill_program_t(1024)));
+    }
+
+    #[test]
+    fn decode_rung_lo_preserves_overlapping_prefill_widths() {
+        let prefill = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192];
+        let decode = [1, 2, 4, 8, 16, 32, 64, 128];
+        for n in 1..=decode.len() {
+            let widths: Vec<_> = prefill.iter().chain(&decode[..n]).copied().collect();
+            assert_eq!(decode_rung_lo(&widths), prefill.len());
+        }
+        assert_eq!(decode_rung_lo(&[1, 1]), 1);
+        // The same increasing run cannot encode two phases without a boundary.
+        assert_ne!(decode_rung_lo(&[1, 2, 4, 8]), 2);
     }
 
     #[test]

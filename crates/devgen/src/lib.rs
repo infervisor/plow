@@ -8452,12 +8452,13 @@ fn emit_dense_gqa(
     // and `in.kvlen` is sized at the widest rung because that is the slot count the KV cache
     // holds. Putting the narrowest rung last would make the blob refuse itself at load.
     //
-    // The two ranges must not overlap or `decode_rung_lo` cannot separate them — see the assert.
-    assert!(
-        rungs.iter().all(|&r| buckets.iter().all(|&pb| pb > r)),
-        "decode rungs {rungs:?} overlap the prefill bucket ladder {buckets:?}: the blob carries \
-         no field distinguishing the two and `packet::devbuild::decode_rung_lo` separates them \
-         by width. Emit with prefill buckets wider than the widest decode rung."
+    // Widths may overlap if the trailing decode run still has an unambiguous boundary.
+    let program_widths: Vec<u32> = tlist.iter().chain(&rungs).copied().collect();
+    assert_eq!(
+        packet::devbuild::decode_rung_lo(&program_widths),
+        tlist.len(),
+        "decode rungs {rungs:?} are ambiguous after prefill buckets {tlist:?}: \
+         packet::devbuild::decode_rung_lo must preserve the emitted phase boundary"
     );
     for (ri, &rb) in rungs.iter().enumerate() {
         let mut bd = Builder::new(n_cu);

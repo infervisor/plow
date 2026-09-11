@@ -606,7 +606,8 @@ It was reverted. [Raw results, rejected patch and provenance](gemma4-12b-h100-da
 The W8A16 body sweep now covers each requested width individually:
 1/2/4/8/16/32/64/128/256/512/1024/2048/4096/8192. All140 cases
 (eight model shapes plus two tails at every width) pass96 exact sampled FP64
-checks and complete output equality:1,400,877,564 bytes compared. This invokes
+checks and complete output equality:1,400,877,564 bytes compared.
+Memcheck also passes all140 cases with zero errors. The probe invokes
 the128x128 WGMMA tile with row bounds; small widths are not dedicated small-M
 kernels. Async staging still regresses some small shapes, so it is not enabled
 globally. At4096 and8192, all eight model shapes improve in this warm-body

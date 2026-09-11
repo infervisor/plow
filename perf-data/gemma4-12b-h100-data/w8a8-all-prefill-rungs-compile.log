@@ -1,0 +1,47 @@
+2026-09-11T02:51:48.562784Z  INFO plowc invoked source=--hf-dir plans/gemma4-12b-roofline/checkpoint-fp8 gpu=h100 num_gpus=1 batch=[1, 4, 8] seq=[512, 2048, 8192] phase=Both emit=Devblob preset=None parallel=Tp page_kib=16 weight_dtype=auto
+2026-09-11T02:51:48.562841Z  INFO devblob emit started gpu=h100
+2026-09-11T02:51:48.564329Z  WARN lean gates skipped — this blob is NOT verified (build.json: lean.verified=false) reason="no `plow_verify` binary (set PLOW_VERIFY_BIN, or `lake build` in lean-plow/)"
+warning: cannot probe gfx950 kernel inventory (cannot run hipcc: an inventory is derived from a built object, so probing needs the toolchain that builds it); using analytical fallback (known tile constants)
+  counter granularity: 0 fine edges kept, 336 downgraded to coarse (homogeneous region — see Plow/CounterGranularity.lean:collapse)
+  counter granularity: 0 fine edges kept, 336 downgraded to coarse (homogeneous region — see Plow/CounterGranularity.lean:collapse)
+  counter granularity: 0 fine edges kept, 336 downgraded to coarse (homogeneous region — see Plow/CounterGranularity.lean:collapse)
+  counter granularity: 0 fine edges kept, 336 downgraded to coarse (homogeneous region — see Plow/CounterGranularity.lean:collapse)
+  counter granularity: 0 fine edges kept, 336 downgraded to coarse (homogeneous region — see Plow/CounterGranularity.lean:collapse)
+  WARNING: dispatch audit findings (build.json: dispatch_audit.findings). These cost throughput, not correctness — the blob is written and is right.
+  occupancy: GemmFp8 256x3840x15360 @t256 fills 11.4% of its dispatch — 15 tile(s) over 132 CU(s) in 1 round(s), ~2792 MiB moved at that fill.
+  occupancy: GemmFp8 512x3840x15360 @t512 fills 22.7% of its dispatch — 30 tile(s) over 132 CU(s) in 1 round(s), ~2781 MiB moved at that fill.
+  occupancy: GemmFp8 128x3840x15360 @t128 fills 11.4% of its dispatch — 15 tile(s) over 132 CU(s) in 1 round(s), ~2592 MiB moved at that fill.
+  occupancy: GemmFp8 64x3840x15360 @t64 fills 11.4% of its dispatch — 15 tile(s) over 132 CU(s) in 1 round(s), ~2492 MiB moved at that fill.
+  occupancy: GemmFp8 1024x3840x15360 @t1024 fills 45.5% of its dispatch — 60 tile(s) over 132 CU(s) in 1 round(s), ~2454 MiB moved at that fill.
+  occupancy: GemmFp8 32x3840x15360 @t32 fills 11.4% of its dispatch — 15 tile(s) over 132 CU(s) in 1 round(s), ~2443 MiB moved at that fill.
+  occupancy: GemmFp8 16x3840x15360 @t16 fills 11.4% of its dispatch — 15 tile(s) over 132 CU(s) in 1 round(s), ~2418 MiB moved at that fill.
+  occupancy: GemmFp8 8x3840x15360 @t8 fills 11.4% of its dispatch — 15 tile(s) over 132 CU(s) in 1 round(s), ~2405 MiB moved at that fill.
+  ... and 64 more (see build.json dispatch_audit.findings).
+  Retune the floor with PLOW_AUDIT_OCC_FLOOR / PLOW_AUDIT_GEMV_WASTE_MAX, or set PLOW_AUDIT_STRICT=1 to make findings fatal.
+  compile config -> plans/gemma4-12b-roofline/w8a8-all-prefill-rungs/plow_config.h
+  build manifest -> plans/gemma4-12b-roofline/w8a8-all-prefill-rungs/build.json
+gemma4: 48 layers (8 full)  hidden=3840 inter=15360  heads=16  hd=256/512  kvh=8/1  vocab=262144
+  max_ctx=20480  prefill buckets [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192] + decode
+  layer_scalar[0..4] = [0.052978516, 0.16601563, 0.25585938, 0.515625]
+    prog 0 (T=   1):   958 packets,   45611 workgroup-packets
+    prog 1 (T=   2):   958 packets,   46477 workgroup-packets
+    prog 2 (T=   4):   958 packets,   48161 workgroup-packets
+    prog 3 (T=   8):   958 packets,   51577 workgroup-packets
+    prog 4 (T=  16):   958 packets,   58409 workgroup-packets
+    prog 5 (T=  32):   958 packets,   72073 workgroup-packets
+    prog 6 (T=  64):   958 packets,  100553 workgroup-packets
+    prog 7 (T= 128):   958 packets,  144841 workgroup-packets
+    prog 8 (T= 256):   958 packets,  197337 workgroup-packets
+    prog 9 (T= 512):   958 packets,  197337 workgroup-packets
+    prog 10 (T=1024):   958 packets,  197337 workgroup-packets
+    prog 11 (T=2048):   958 packets,  197337 workgroup-packets
+    prog 12 (T=4096):   958 packets,  197337 workgroup-packets
+    prog 13 (T=8192):   958 packets,  197337 workgroup-packets
+    prog 14 (T=   1):   622 packets,   33095 workgroup-packets
+    prog 15 (T=   2):   622 packets,   34313 workgroup-packets
+    prog 16 (T=   4):   622 packets,   36625 workgroup-packets
+    prog 17 (T=   8):   622 packets,   41241 workgroup-packets
+    prog 18 (T=  16):   622 packets,   44521 workgroup-packets
+  weights 12.0 GiB   KV cache 85.00 GiB   activations 1.84 GiB   -> plans/gemma4-12b-roofline/w8a8-all-prefill-rungs/model.pkt
+2026-09-11T02:51:52.335326Z  INFO devblob written slug=checkpoint-fp8 n_cu=132 tp=1 bundle=true out=plans/gemma4-12b-roofline/w8a8-all-prefill-rungs/model.pkt
+2026-09-11T02:51:52.335342Z  INFO devblob emit completed out=plans/gemma4-12b-roofline/w8a8-all-prefill-rungs/model.pkt

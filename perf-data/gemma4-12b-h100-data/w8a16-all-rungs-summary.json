@@ -1728,7 +1728,15 @@
       "file": "w8a16-all-rungs-1-screen.log",
       "original_sha256": "c5756e8071db68c4e4ba8a1f44a95ab9a27d4164b109d6da1e89e5ea55355f8f",
       "archived_sha256": "c5756e8071db68c4e4ba8a1f44a95ab9a27d4164b109d6da1e89e5ea55355f8f"
+    },
+    {
+      "file": "w8a16-all-rungs-memcheck.log",
+      "original_sha256": "b8d07bf3fb9b30790f6f900ca83389f4bb9c407883ca990ff07389588d8cb033",
+      "archived_sha256": "b8d07bf3fb9b30790f6f900ca83389f4bb9c407883ca990ff07389588d8cb033"
     }
   ],
-  "sanitizer": "Earlier40casesmemcheck/scopedrace evidence in asyncstaging summary; no all140sanitizer yet."
+  "sanitizer": {
+    "memcheck": "All140cases PASS,0errors; one numerical launch percase; no timing fromsanitizer",
+    "racecheck": "Only earlier scopedM128N129K208; see asyncstaging summary"
+  }
 }
