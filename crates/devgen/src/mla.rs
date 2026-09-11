@@ -267,7 +267,7 @@ fn glm_dsa_pf_bucket(c: &GlmCfg, t: u32) -> bool {
 /// `PLOW_PACKED_SPARSE_PF` so the shipped blob is unchanged until the rung is qualified.
 fn glm_sparse_spans(c: &GlmCfg) -> bool {
     let cfg = emit_config::active();
-    c.dsa_pf() && cfg.packed_sparse_pf && cfg.glm_index_tp && c.index_kpool == 1 && glm_fp8_kv()
+    c.dsa_pf() && cfg.packed_sparse_pf && cfg.glm_index_tp() && c.index_kpool == 1 && glm_fp8_kv()
 }
 
 /// `packed`: the program carries the packed-prefill family topology, whose flash arm has no
@@ -1409,7 +1409,7 @@ fn glm_ofold(enc: MoeEnc) -> bool {
 /// Sparse FP8 uses the same opcodes with `j[0] = selected-handle + 1`; zero remains dense.
 /// The runtime requires sparse-FP8 object markers before accepting that extension.
 fn glm_fp8_kv() -> bool {
-    emit_config::active().glm_fp8_kv
+    emit_config::active().glm_fp8_kv()
 }
 
 /// One DENSE prefill GEMM against CHECKPOINT block-fp8 weights — [`DevOp::GemmFp8Blk`] (107).
@@ -1978,7 +1978,7 @@ pub(crate) fn declare_glm_rows_batched(
     // every expert can waste at most MPF_BM-1 rows. Sizing this from T*k alone is an out-of-bounds
     // device write with no symptom at low expert counts and a guaranteed one at 384.
     let (meta, row_token, row_partidx, row_gate, fu_g, fu_scale) =
-        if rows > 1 || emit_config::active().glm_moe_resident {
+        if rows > 1 || emit_config::active().glm_moe_resident() {
             let pad_rows = rows * tk as u64 + (e * (MPF_BM - 1)) as u64;
             // The gathered GLU output is bf16 on the bf16/block-fp8 arms and PACKED fp4 under A4W4 —
             // half a byte per value plus one E8M0 byte per 32. The buffer is sized for whichever the
@@ -2944,7 +2944,7 @@ fn spine_cus(n_cu: u32) -> Vec<u32> {
 }
 
 fn decode_norm_cus(n_cu: u32, rows: u32) -> Vec<u32> {
-    if emit_config::active().glm_decode_norm_rows {
+    if emit_config::active().glm_decode_norm_rows() {
         (0..rows.min(n_cu)).collect()
     } else {
         vec![0]
@@ -3205,7 +3205,7 @@ fn emit_glm_decode_gemm_lt(
             shape,
             [64, 6144] | [512, 2048] | [128, 6144] | [32, 6144] | [19360, 6144]
         ));
-    if !cfg.glm_gemm_lt_decode || !rows_ok || !shape_ok {
+    if !cfg.glm_gemm_lt_decode() || !rows_ok || !shape_ok {
         return None;
     }
     assert!(
@@ -4244,7 +4244,7 @@ fn emit_glm_dsa_select_rows(
     itk: u32,
     c_sc: u32,
 ) -> u32 {
-    if emit_config::active().glm_select_local && rows > 1 {
+    if emit_config::active().glm_select_local() && rows > 1 {
         assert!(
             c.tp == 8 && b.n_cu() == 304 && matches!(rows, 2 | 4 | 8 | 16 | 20),
             "local GLM decode selection requires gfx942 TP8 with 2/4/8/16/20 rows"
@@ -4708,7 +4708,7 @@ fn emit_glm_lt_gemm(
     k: u32,
     deps: &[u32],
 ) -> Option<u32> {
-    if !emit_config::active().glm_gemm_lt
+    if !emit_config::active().glm_gemm_lt()
         || t < 2048
         || !matches!((nn, k), (2048, 6144) | (512, 6144) | (4096, 2048))
     {
@@ -5068,7 +5068,7 @@ fn emit_glm_dsa_prefill_select(
         },
     );
     let c_se =
-        if emit_config::active().glm_index_tp && t >= 2048 {
+        if emit_config::active().glm_index_tp() && t >= 2048 {
             // Under the packed topology the runtime hands this kernel the launch's PlowKvSpan
             // table (dsa_tp_adapter ABI 2): every row's position, causal bound and key base
             // come from its span, so a packed sibling / body may carry it. `t5 = kvlen` is the
@@ -5868,8 +5868,8 @@ fn emit_glm_moe_ffn_prefill(
     // It is the earliest packet of the MoE chain (router -> align -> GLU -> DOWN), so the
     // existing edges already order the zero before every writer — no new packet, no new gate.
     // `tk.is_power_of_two()` is what makes `tok = pidx >> log2(k)` exact.
-    let resident = emit_config::active().glm_moe_resident;
-    let native_moe = emit_config::active().glm_moe_aiter || resident;
+    let resident = emit_config::active().glm_moe_resident();
+    let native_moe = emit_config::active().glm_moe_aiter() || resident;
     if native_moe {
         assert!(
             enc == MoeEnc::Fp8Blk
@@ -6741,7 +6741,7 @@ fn emit_glm_moe_ffn_rows(
                     },
                 )
             });
-    let resident = emit_config::active().glm_moe_resident;
+    let resident = emit_config::active().glm_moe_resident();
     assert!(
         !resident || matches!(rows, 1 | 2 | 4 | 8 | 16 | 20),
         "resident GLM MoE decode requires rows 1/2/4/8/16/20"
@@ -7084,7 +7084,7 @@ pub(crate) fn emit_glm_moe_ffn(
     let use_fp8 = enc != MoeEnc::Bf16;
     let lin_fp8 = glm_linear_fp8(enc);
     let glu_split = glm_shared_glu_split(enc);
-    if rows > 1 || emit_config::active().glm_moe_resident {
+    if rows > 1 || emit_config::active().glm_moe_resident() {
         // BATCHED DECODE FFN: the decode MoE op family carries no token dimension
         // (`MoeRouterTopk`/`MoeGroupGluFp8Blk`/`MoeGroupDownFp8Blk`/`MoeCombine` are all
         // single-row), so at rows > 1 the seam is emitted with the PREFILL family at T = rows —
@@ -7864,7 +7864,7 @@ fn glm_emit_full(
     let nl = cap.unwrap_or(c.layers).min(c.layers);
     let layers: Vec<u32> = (0..nl).collect();
     let enc = MoeEnc::from_flags(use_fp8, false);
-    if emit_config::active().glm_moe_resident {
+    if emit_config::active().glm_moe_resident() {
         assert!(
             crate::emit_is_amd()
                 && target == "gfx942"
@@ -7991,7 +7991,7 @@ fn glm_emit_full(
             pb.set_l2_placement(l2_layout);
         }
         if (emit_config::active().glm_fold_lt && t >= 2048)
-            || emit_config::active().glm_moe_resident
+            || emit_config::active().glm_moe_resident()
         {
             assert!(
                 crate::emit_is_amd() && target == "gfx942",
@@ -8076,7 +8076,7 @@ fn glm_emit_full(
     for &rb in &rungs {
         let mut b = Builder::new(n_cu);
         if (emit_config::active().glm_moe_flat_decode && matches!(rb, 2 | 4 | 8))
-            || emit_config::active().glm_moe_resident
+            || emit_config::active().glm_moe_resident()
         {
             assert!(
                 crate::emit_is_amd() && target == "gfx942",
@@ -8084,7 +8084,7 @@ fn glm_emit_full(
             );
             b.deny_uniseg();
         }
-        if emit_config::active().glm_gemm_lt_decode
+        if emit_config::active().glm_gemm_lt_decode()
             && (matches!(rb, 16 | 20) || (emit_config::active().glm_gemm_lt_decode_ext && rb == 8))
         {
             assert!(

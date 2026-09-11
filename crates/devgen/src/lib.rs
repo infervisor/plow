@@ -6948,6 +6948,12 @@ struct EmitCapabilities {
     /// second pass): every dense prefill bucket a second time with family-pure norm/flash
     /// segments, which is what lets the serve mux pack several requests' spans into one rung.
     packed_prefill_siblings: bool,
+    /// The GLM emitter family (`mla::glm_emit_full`), which is what the qualified gfx942 TP8
+    /// `glm_*` recipe was measured on. Deliberately NOT read off `packed_prefill_siblings`: that
+    /// one names an emitter capability — a second pass over the dense prefill buckets — and the
+    /// next family to grow it must not silently inherit a recipe qualified on GLM's weights,
+    /// geometry and kernels.
+    glm: bool,
 }
 
 fn emit_capabilities(model_type: &str) -> EmitCapabilities {
@@ -6967,6 +6973,7 @@ fn emit_capabilities(model_type: &str) -> EmitCapabilities {
         cublaslt_decode: gemma || model_type == "qwen3_5",
         decode_ladder: dense || model_type == "gpt_oss",
         packed_prefill_siblings: matches!(model_type, "glm_moe_dsa" | "glm5_next"),
+        glm: matches!(model_type, "glm_moe_dsa" | "glm5_next"),
     }
 }
 
@@ -6975,6 +6982,7 @@ fn apply_production_defaults(
     capabilities: EmitCapabilities,
     arch: &str,
     tp: u32,
+    n_cu: u32,
 ) {
     // gfx942 STOPS AT 8, sm_90a KEEPS 16 — and the reason is the OBJECT, not the rung.
     //
@@ -7021,6 +7029,34 @@ fn apply_production_defaults(
             emit_config::note_production_default("emit_packed_prefill", "true".into());
         }
     }
+    // THE QUALIFIED GLM RECIPE IS THE DEFAULT, not a thing you have to remember to type.
+    //
+    // Eight `glm_*` knobs were each measured and kept (select-local +10.6% at c=20 and -19%
+    // median ITL, index-tp +8.2% serving, gemm-lt +2.1%, …) and the COMBINATION is what is
+    // qualified end-to-end: 47-50 out tok/s on 8x MI300X with the 18-case retrieval screen at
+    // 18/18. Before this they were eight `default_value_t = false` flags, so the serving
+    // configuration existed only as an incantation in a shell script and dropping one of them
+    // emitted a slower packet that still loaded and still served — a silent regression with no
+    // failing gate anywhere.
+    //
+    // The gate is the target the recipe was measured on and, separately, the target its
+    // emitters will ACCEPT: `glm_gemm_lt`, `glm_index_tp`, `glm_moe_aiter` and
+    // `glm_moe_resident` each assert gfx942 / tp == 8 / n_cu == 304 at their emit site, so a
+    // default that fired more widely would turn a working TP1 or MI300A emit into a panic.
+    // mxfp4 is excluded for the same reason: the native MoE arms are block-fp8 only.
+    //
+    // Only knobs nobody has spoken for are set — `Option<bool>` is what makes "unset" and
+    // "explicitly false" different values — and each is recorded as `production_default` so
+    // `build.json` says who decided, and so `replay` omits it and a replayed recipe follows the
+    // tree's defaults rather than pinning today's.
+    if capabilities.glm && arch == "gfx942" && tp == 8 && n_cu == 304 && !cfg.mxfp4 {
+        cfg.glm_production_defaults = true;
+        for (id, unset) in cfg.glm_recipe_unset() {
+            if unset {
+                emit_config::note_production_default(id, "true".into());
+            }
+        }
+    }
 }
 
 fn cublaslt_emit_supported(
@@ -7063,7 +7099,7 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
             .unwrap_or_default();
     let capabilities = emit_capabilities(&model_type);
     let mut emit_cfg = _emit_cfg.unwrap_or_else(emit_config::EmitConfig::from_env);
-    apply_production_defaults(&mut emit_cfg, capabilities, &arch, tp);
+    apply_production_defaults(&mut emit_cfg, capabilities, &arch, tp, n_cu);
     if emit_cfg.ane_mlp_channels.is_some() {
         assert!(
             arch == "metal3" && tp == 1 && matches!(model_type.as_str(), "llama" | "qwen3"),

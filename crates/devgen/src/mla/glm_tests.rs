@@ -2760,3 +2760,127 @@ fn packed_siblings_carry_native_moe_and_leave_the_plain_programs_byte_identical(
         }
     }
 }
+
+
+/// THE QUALIFIED RECIPE IS WHAT AN UNFLAGGED GLM gfx942 TP8 EMIT PRODUCES.
+///
+/// The packet serving GLM-5.3 on 8x MI300X (47-50 out tok/s, 18/18 on the retrieval screen) was
+/// emitted by naming eight `glm_*` flags. Every one of them used to be `default_value_t = false`,
+/// so the qualified configuration was reachable only by typing the whole incantation and dropping
+/// one emitted a slower packet that still loaded and still served. This is the gate on that: the
+/// explicit recipe and the unflagged emit produce the SAME programs, and an arm with the recipe
+/// explicitly OFF produces different ones — which is what makes the first assertion mean
+/// something rather than pass vacuously.
+///
+/// `PLOW_GLM_DSA_PF` is set in every arm: it is part of the frozen recipe but is NOT one of the
+/// eight defaulted knobs (sparse prefill is a separate qualification), so it has to be named on
+/// both sides for the comparison to be about the eight.
+#[test]
+fn the_qualified_glm_recipe_is_what_an_unflagged_gfx942_tp8_emit_produces() {
+    use std::sync::{Arc, Mutex};
+    let _guard = crate::test_env::env_guard();
+    let _target = crate::EmitAmdGuard::set(true);
+    let dir = std::env::temp_dir().join(format!("plow-glm-defaults-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = serde_json::json!({
+        "model_type": "glm_moe_dsa", "num_hidden_layers": 4,
+        "hidden_size": 6144, "num_attention_heads": 64,
+        "kv_lora_rank": 512, "q_lora_rank": 2048,
+        "qk_nope_head_dim": 192, "qk_rope_head_dim": 64, "v_head_dim": 256,
+        "vocab_size": 128, "rms_norm_eps": 1e-5,
+        "n_routed_experts": 256, "num_experts_per_tok": 8,
+        "moe_intermediate_size": 2048, "intermediate_size": 12288,
+        "first_k_dense_replace": 3, "routed_scaling_factor": 2.5,
+        "rope_theta": 8000000.0,
+        "indexer_types": ["full", "shared", "full", "shared"]
+    });
+    std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+    type Snapshot = Vec<(u32, Vec<packet::dev::DevInst>, Vec<packet::dev::StreamEnt>, Vec<packet::dev::StreamEnt>)>;
+    const RECIPE: [&str; 8] = [
+        "PLOW_GLM_FP8_KV",
+        "PLOW_GLM_MOE_AITER",
+        "PLOW_GLM_MOE_RESIDENT",
+        "PLOW_GLM_INDEX_TP",
+        "PLOW_GLM_SELECT_LOCAL",
+        "PLOW_GLM_DECODE_NORM_ROWS",
+        "PLOW_GLM_GEMM_LT",
+        "PLOW_GLM_GEMM_LT_DECODE",
+    ];
+    let emit = |glm: &[(&str, &str)]| -> Snapshot {
+        let mut env: Vec<(&str, &str)> = vec![
+            ("PLOW_MLA_PREFILL", "full:2048,8192"),
+            ("PLOW_DECODE_BATCH", "20"),
+            ("PLOW_GLM_DSA", "1"),
+            ("PLOW_GLM_DSA_PF", "1"),
+            ("PLOW_MLA_PF_V2", "1"),
+            ("PLOW_MLA_PF_AITER", "1"),
+            ("PLOW_UNISEG", "0"),
+        ];
+        env.extend_from_slice(glm);
+        let _env = crate::test_env::EnvScope::set(&env);
+        // Exactly what `run_verified` does between parsing and emitting. `EnvScope` has already
+        // installed the parsed config; this replaces it with the resolved one.
+        let mut cfg = crate::emit_config::EmitConfig::from_env();
+        crate::apply_production_defaults(
+            &mut cfg,
+            crate::emit_capabilities("glm_moe_dsa"),
+            "gfx942",
+            8,
+            304,
+        );
+        crate::emit_config::install(cfg);
+        let seen: Arc<Mutex<Snapshot>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let verify: crate::VerifyHook = Box::new(move |model| {
+            *sink.lock().unwrap() = model
+                .progs
+                .iter()
+                .zip(&model.prog_t)
+                .map(|(p, &t)| (t, p.insts.clone(), p.stream.clone(), p.gq_stream.clone()))
+                .collect();
+            Ok(crate::LeanReport::skipped("structural regression test"))
+        });
+        glm_emit_full(
+            &dir,
+            81920,
+            dir.join("model.pkt").to_str().unwrap(),
+            304,
+            8,
+            true,
+            true,
+            "gfx942",
+            None,
+            Some(&verify),
+        );
+        let out = seen.lock().unwrap().clone();
+        out
+    };
+
+    let on: Vec<(&str, &str)> = RECIPE.iter().map(|k| (*k, "1")).collect();
+    let off: Vec<(&str, &str)> = RECIPE.iter().map(|k| (*k, "0")).collect();
+    let explicit = emit(&on);
+    let unflagged = emit(&[]);
+    let rolled_back = emit(&off);
+    assert!(!explicit.is_empty());
+    assert_eq!(
+        explicit, unflagged,
+        "an unflagged gfx942 TP8 GLM emit must be the qualified recipe"
+    );
+    assert_ne!(
+        explicit, rolled_back,
+        "the recipe must still be rollable back, and must still change the packet"
+    );
+
+    // And each knob individually: from the fully rolled-back arm, turning ONE on moves the
+    // packet, so none of the eight is riding along inert.
+    //
+    // Probed from OFF rather than from ON because two of them overlap: `native_moe` is
+    // `glm_moe_aiter || glm_moe_resident`, so dropping AITER out of the full recipe changes
+    // nothing while RESIDENT still holds the native arm. Off-plus-one has no such shadow.
+    for knob in RECIPE {
+        let one_on: Vec<(&str, &str)> =
+            RECIPE.iter().map(|k| (*k, if *k == knob { "1" } else { "0" })).collect();
+        assert_ne!(rolled_back, emit(&one_on), "{knob}=1 changed nothing");
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
