@@ -3387,6 +3387,37 @@ fn packed_sparse_refusal(
     None
 }
 
+/// A token-batch body's native-only packets (`GemmLtPf`, `MoeAiterFp8Pf`) must each sit in a
+/// segment that carries their route: the interpreter has no arm for them, and its dispatch
+/// `default:` writes nothing without trapping. Measured on gfx942 TP8 when the dispatch gate
+/// withheld the routes under the packed binding: the residual stream went NaN from the first
+/// MoE layer, every KV row the body wrote was NaN and every band row sampled token 0.
+fn token_batch_body_native_routes(
+    prog: &DevProg,
+    routes: &[PrefillSegmentRoute],
+) -> std::result::Result<(), String> {
+    for e in &prog.stream {
+        let Some(inst) = prog.insts.get(e.inst as usize) else {
+            continue;
+        };
+        let route = routes.get(e.seg as usize);
+        let covered = match DevOp::from_u16(inst.op) {
+            Some(DevOp::GemmLtPf) => matches!(route, Some(PrefillSegmentRoute::GemmLt(_))),
+            Some(DevOp::MoeAiterFp8Pf) => matches!(route, Some(PrefillSegmentRoute::MoeAiter(_))),
+            _ => true,
+        };
+        if !covered {
+            return Err(format!(
+                "token-batch body segment {} carries {:?} without its native route; the \
+                 interpreter has no arm for it",
+                e.seg,
+                DevOp::from_u16(inst.op)
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn packed_kda_compatible(prog: &DevProg) -> bool {
     if prog.insts.iter().any(|d| {
         matches!(
@@ -5475,6 +5506,8 @@ struct AmdProg {
     /// one packed launch, `Err(msg)` = this program's recurrent operators have no packed form at
     /// all and `msg` names which one. Computed once at load, not per tick.
     packed_recurrent_spans: std::result::Result<u32, String>,
+    /// [`token_batch_body_native_routes`] for a token-batch body; `Ok` for every other program.
+    token_batch_native_routes: std::result::Result<(), String>,
     n_inst: u32,
     trace_records: usize,
     n_counter: u32,
@@ -9376,6 +9409,11 @@ impl AmdEngine {
                 packed_recurrent_spans: crate::exec::amd::packed::recurrent_span_limit(
                     p.insts.iter().map(|d| d.op),
                 ),
+                token_batch_native_routes: if p.token_batch_body {
+                    token_batch_body_native_routes(p, &prefill_routes)
+                } else {
+                    Ok(())
+                },
                 decode_routes,
                 prefill_routes,
                 _xreduce_attnres_args: xreduce_attnres_args,
@@ -10186,6 +10224,12 @@ impl AmdEngine {
             )));
         }
         check_packed_prefill_abi(self.packed_prefill_prefill_abi, false, false)?;
+        if program.token_batch_body {
+            program
+                .token_batch_native_routes
+                .as_ref()
+                .map_err(|e| RuntimeError::Device(e.clone()))?;
+        }
         if program.prefill_routes.iter().any(|r| {
             matches!(
                 r,
@@ -10660,6 +10704,108 @@ impl AmdEngine {
             .iter()
             .position(|x| x == name)
             .map(|i| self.devp[i].len)
+    }
+
+    /// DIAGNOSTIC (`PLOW_TB_DUMP=<dir>`): after a token-batch body step, write the plan and the
+    /// per-slot device state the step produced — `in.kvlen`/`in.ids`/`in.pos`, every active band
+    /// slot's KV rows (see [`Self::dump_slot_kv`]) and its logits row — as raw files under
+    /// `dir/<tag>.*`.
+    pub fn token_batch_dump(
+        &self,
+        dir: &Path,
+        tag: &str,
+        plan: &plow_asset::mixed_step::Plan,
+    ) -> Result<()> {
+        use std::fmt::Write as _;
+        let io = |e: std::io::Error| RuntimeError::Device(format!("token-batch dump: {e}"));
+        std::fs::create_dir_all(dir).map_err(io)?;
+        let fetch = |i: usize, off: u64, len: usize| -> Result<Vec<u8>> {
+            let mut buf = vec![0u8; len];
+            EngineDevice::download(&*self.be, &self.devp[i], off, &mut buf)?;
+            Ok(buf)
+        };
+        let write = |name: String, bytes: &[u8]| -> Result<()> {
+            std::fs::write(dir.join(format!("{tag}.{name}")), bytes).map_err(io)
+        };
+        let mut text = String::new();
+        let _ = writeln!(
+            text,
+            "cover={:?} decode_rows={} real_rows={} decode_slots={:?}",
+            plan.cover, plan.decode_rows, plan.real_rows, plan.decode_slots
+        );
+        for (r, row) in plan.rows.iter().enumerate().take(plan.real_rows as usize) {
+            let _ = writeln!(
+                text,
+                "row {r}: token={} slot={} pos={} kv_len={} phase={:?} parked={}",
+                row.token, row.slot, row.position, row.kv_len, row.phase, plan.parked[r]
+            );
+        }
+        for (s, span) in plan.prefill_spans.iter().enumerate() {
+            let _ = writeln!(text, "span {s}: {span:?}");
+        }
+        let _ = writeln!(text, "commits={:?} mapped_ends={:?}", plan.commits, plan.mapped_ends);
+        write("plan.txt".into(), text.as_bytes())?;
+        let band = plan.decode_rows as usize;
+        if let Some(t) = self.t_kvlen {
+            write("in.kvlen.bin".into(), &fetch(t, 0, self.batch * 4)?)?;
+        }
+        if let Some(t) = self.t_ids {
+            write("in.ids.bin".into(), &fetch(t, 0, plan.rows.len() * 4)?)?;
+        }
+        if let Some(t) = self.t_pos {
+            write("in.pos.bin".into(), &fetch(t, 0, plan.rows.len() * 4)?)?;
+        }
+        let logits = self.tensor_names.iter().position(|n| n == "act.logits");
+        for slot in 0..band.min(plan.rows.len()) {
+            if plan.parked[slot] != 0 {
+                continue;
+            }
+            self.dump_slot_kv(dir, tag, slot, plan.rows[slot].kv_len)?;
+            if let Some(i) = logits {
+                let row_bytes = self.devp[i].len / band as u64;
+                let bytes = fetch(i, slot as u64 * row_bytes, row_bytes as usize)?;
+                write(format!("slot{slot}.logits.bin"), &bytes)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// DIAGNOSTIC: one slot's KV rows `[0, kv_len)` on the first and last layer (latent, rope,
+    /// FP8 scale, index keys) as raw files `dir/<tag>.slot<slot>.kv.<layer>.<kind>.bin`.
+    pub fn dump_slot_kv(&self, dir: &Path, tag: &str, slot: usize, kv_len: u32) -> Result<()> {
+        let io = |e: std::io::Error| RuntimeError::Device(format!("kv dump: {e}"));
+        std::fs::create_dir_all(dir).map_err(io)?;
+        let mut layers: Vec<u32> = self
+            .tensor_names
+            .iter()
+            .filter_map(|n| n.strip_prefix("kv.")?.strip_suffix(".ckv")?.parse().ok())
+            .collect();
+        layers.sort_unstable();
+        let layers: Vec<u32> = match (layers.first(), layers.last()) {
+            (Some(&a), Some(&b)) if a != b => vec![a, b],
+            (Some(&a), _) => vec![a],
+            _ => Vec::new(),
+        };
+        for &l in &layers {
+            for kind in ["ckv", "krot", "scale", "kidx"] {
+                let name = format!("kv.{l}.{kind}");
+                let Some(i) = self.tensor_names.iter().position(|n| *n == name) else {
+                    continue;
+                };
+                let slot_bytes = self.devp[i].len / self.batch as u64;
+                let row_bytes = slot_bytes / self.max_ctx as u64;
+                let mut buf = vec![0u8; (row_bytes * kv_len as u64) as usize];
+                EngineDevice::download(&*self.be, &self.devp[i], slot as u64 * slot_bytes, &mut buf)?;
+                std::fs::write(dir.join(format!("{tag}.slot{slot}.kv.{l}.{kind}.bin")), &buf)
+                    .map_err(io)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The KV slot the pointer table is currently rebased to (0 = the shared base).
+    pub fn kv_slot(&self) -> usize {
+        self.kv_slot
     }
 
     /// Build the kernarg block for program `p` at segment `seg`.
