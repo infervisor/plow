@@ -69,10 +69,9 @@ the400-instruction total difference comes from their five decode programs
 (542 vs622 ops each). W8A8 PF programs have958 ops. Total57 programs,43,790 instructions,12,845 cases.
 Packet/build hashes, exact GEMM PCs/block counts and all-op inventories are in
 [the compiler audit evidence](gemma4-12b-h100-data/prefill-all-rungs-compile-summary.json).
-These are inspection packets:85GiB KV each, exceeding H100 capacity.
-No new all-width full-model serving claim. A B1 W8A16 recipe is prepared,
-uncompiled, with unchanged20480 context and8192 request span; it is included
-in the evidence JSON.
+The B16 packets are inspection-only:85GiB KV each exceeds H100 capacity.
+The B1 W8A16 packet is now compiled with unchanged20480 context and8192
+request span. It loads in18.88GiB and serves all14 prefill rungs plus decode1.
 
 ## Exact GEMM shapes required at every prefill rung
 
@@ -140,12 +139,48 @@ Two packet boundary tests PASS. Release plowc build PASS. Regression covers all1
 boundary and ambiguous[1,2]+[4,8]. No packet ABI change needed for this layout.
 GPU execution of newly emitted small prefill programs remains a separate gate.
 
-Prepared w8a16-all-prefill-rungs-recipe.json clones the existing precision and
-segment recipe, sets PLOW_MAX_CHUNK=8192 and appends1,2,4,8,16,32,64,256.
-This is an inspection/tuning packet: current W8A16 B16 sliding-KV sizing at8K
-exceeds H100 capacity. Do not serve it as-is or shrink rings without the
-request-span contract. Individual loaded-op probes can qualify its shapes
-without loading its full KV allocation.
+The B1 recipe clones the existing precision and segment configuration, sets
+PLOW_MAX_CHUNK=8192 and appends1,2,4,8,16,32,64,256 to the default rungs.
+Strict audit passes15 programs,11,346 instructions and1,006 kernel cases.
+The emitted prefill widths are exactly1,2,4,8,16,32,64,128,256,512,1024,
+2048,4096,8192. B16 remains inspection-only because its sliding-KV allocation
+exceeds H100 capacity.
+
+## Loaded small-M and end-to-end ladder result
+
+A native `mma.sync` W8A16 prototype was screened at M1/2/4/8 using natural
+64-column tiles. Across22 retained attention-projection cells, direct launches
+were1.059–1.268x faster than the async generic WGMMA control. Four split
+configurations each produced70/70 byte-equal complete outputs.
+
+The same body loses after integration into a lean persistent packet role.
+Every one of22 loaded cells regresses: control/candidate speedup is0.751–0.975x,
+median0.887x. The candidate uses64 registers, no stack, a128-byte arena and
+264 CTAs; the generic object uses254 registers, no stack, a99,328-byte arena
+and132 CTAs. Removing dependency edges saves about1.2us median in the candidate,
+so counter-edge processing is measurable but does not explain the reversal.
+The queue/interpreter launch path dominates these isolated small-M operations.
+The production integration was rejected and preserved only as an evidence
+patch. The reusable direct and loaded probes remain under `runtime/nvidia/experiments`.
+
+The B1 end-to-end A/B uses the same packet and async WGMMA cubins. Only serving
+chunk/interleave limits change.
+
+| Prompt | Setting | Median TTFT | Median latency | Output tok/s |
+|---:|---|---:|---:|---:|
+| 1024 | chunk1024 / interleave2048 |163.98ms |1373.77ms |93.15 |
+| 1024 | chunk8192 / interleave8192 |162.53ms |1377.56ms |92.90 |
+| 16384 | chunk1024 / interleave2048 |2937.27ms |4278.00ms |29.91 |
+| 16384 | chunk8192 / interleave8192 |2736.16ms |4081.37ms |31.36 |
+
+At16K, the8192 rung reduces TTFT6.8%, total latency4.6%, and raises output
+rate4.8%. The1K result is flat. All six paired benchmark outputs and four
+boundary-oriented generations are text-equal; cancellation recovery and
+context rejection pass. B1 proves single-request latency only. It does not
+qualify max-concurrency throughput or close the recorded vLLM gap.
+
+Full cells, logs, hashes and the rejected production patch are in
+[the all-rung/small-M evidence](gemma4-12b-h100-data/w8a16-all-rung-small-mma-summary.json).
 
 ## CUTLASS and DeepGEMM techniques to adapt
 

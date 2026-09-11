@@ -1,0 +1,673 @@
+{
+  "archive": [
+    {
+      "archived_sha256": "c5756e8071db68c4e4ba8a1f44a95ab9a27d4164b109d6da1e89e5ea55355f8f",
+      "file": "w8a16-all-rungs-1-screen.log",
+      "original_sha256": "c5756e8071db68c4e4ba8a1f44a95ab9a27d4164b109d6da1e89e5ea55355f8f"
+    },
+    {
+      "archived_sha256": "8a6835be08b4a10904481fc07523daecabd18746c43045fcc62d49a44ec45e77",
+      "file": "w8a16-small-mma-optblocks-v2-s1-screen.log",
+      "original_sha256": "8a6835be08b4a10904481fc07523daecabd18746c43045fcc62d49a44ec45e77"
+    },
+    {
+      "archived_sha256": "54a61ef07276910018ad3b7d3655ddb379fac0c02eac0bddc652c73b08d9ec28",
+      "file": "w8a16-small-mma-v2-screen-summary.json",
+      "original_sha256": "54a61ef07276910018ad3b7d3655ddb379fac0c02eac0bddc652c73b08d9ec28"
+    },
+    {
+      "archived_sha256": "1ed14932c5930defacced74488d9ec4af1912e93e464a73100915e1635e39ea9",
+      "file": "w8a16-small-mma-loaded-screen-v2-summary.json",
+      "original_sha256": "1ed14932c5930defacced74488d9ec4af1912e93e464a73100915e1635e39ea9"
+    },
+    {
+      "archived_sha256": "4dcadded924a4488cd5605bfc07487079b5ec7e13e6db853afbc374564216486",
+      "file": "w8a16-small-mma-loaded-probe-build.log",
+      "original_sha256": "4dcadded924a4488cd5605bfc07487079b5ec7e13e6db853afbc374564216486"
+    },
+    {
+      "archived_sha256": "b755281ea42adb290a42e4fceeb2d603d5e644e1f1eaaa35d4ddf618cd10e1d2",
+      "file": "w8a16-small-mma-object-v3-build.log",
+      "original_sha256": "b755281ea42adb290a42e4fceeb2d603d5e644e1f1eaaa35d4ddf618cd10e1d2"
+    },
+    {
+      "archived_sha256": "9673edca26f5e2c3e5d744a7110e553518672989cacc8adef7bed72bb0a2cd28",
+      "file": "w8a16-b1-all-prefill-rungs-compile.log",
+      "original_sha256": "9673edca26f5e2c3e5d744a7110e553518672989cacc8adef7bed72bb0a2cd28"
+    },
+    {
+      "archived_sha256": "e7695067252846438494202a72068e2f070a6b86fad37ba464d0c83f38a14bf4",
+      "file": "w8a16-b1-ladder-chunk1024-server.log",
+      "original_sha256": "e7695067252846438494202a72068e2f070a6b86fad37ba464d0c83f38a14bf4"
+    },
+    {
+      "archived_sha256": "875331b3cc4fa42a785370afdf8e925c60a76cacf653c3cadc0cd993f542c904",
+      "file": "w8a16-b1-ladder-chunk1024.log",
+      "original_sha256": "875331b3cc4fa42a785370afdf8e925c60a76cacf653c3cadc0cd993f542c904"
+    },
+    {
+      "archived_sha256": "3ecc56613161c19fdb6559c8a13e00c6da569fa822343c28a1e1399f4c2c8521",
+      "file": "w8a16-b1-ladder-chunk1024.json",
+      "original_sha256": "3ecc56613161c19fdb6559c8a13e00c6da569fa822343c28a1e1399f4c2c8521"
+    },
+    {
+      "archived_sha256": "96ee13f2d42d9c25a2b706410fe39b4bdc3eafe91c9c1bdcd76c4b78434da9b6",
+      "file": "w8a16-b1-ladder-chunk1024-outputs.json",
+      "original_sha256": "96ee13f2d42d9c25a2b706410fe39b4bdc3eafe91c9c1bdcd76c4b78434da9b6"
+    },
+    {
+      "archived_sha256": "61106ff0e37c987293b11a36a2e7a9a2be082b3f39663ce90a6b21d706cab7a4",
+      "file": "w8a16-b1-ladder-chunk8192-server.log",
+      "original_sha256": "61106ff0e37c987293b11a36a2e7a9a2be082b3f39663ce90a6b21d706cab7a4"
+    },
+    {
+      "archived_sha256": "5056ca7246056dfc67ff99fd59fc17d240d9999011e8b9032e51fca8d639ab06",
+      "file": "w8a16-b1-ladder-chunk8192.log",
+      "original_sha256": "5056ca7246056dfc67ff99fd59fc17d240d9999011e8b9032e51fca8d639ab06"
+    },
+    {
+      "archived_sha256": "0b47199571e528fe1c0e3efccec4f2f55a6147e31196107cdae15f7a1bb2d8eb",
+      "file": "w8a16-b1-ladder-chunk8192.json",
+      "original_sha256": "0b47199571e528fe1c0e3efccec4f2f55a6147e31196107cdae15f7a1bb2d8eb"
+    },
+    {
+      "archived_sha256": "96ee13f2d42d9c25a2b706410fe39b4bdc3eafe91c9c1bdcd76c4b78434da9b6",
+      "file": "w8a16-b1-ladder-chunk8192-outputs.json",
+      "original_sha256": "96ee13f2d42d9c25a2b706410fe39b4bdc3eafe91c9c1bdcd76c4b78434da9b6"
+    },
+    {
+      "archived_sha256": "33b4cfdb18e215e2306bacd2676ec9ccb7096931170d797befecd23f7bb5df5e",
+      "file": "check_w8a16_b1_ladder.py",
+      "original_sha256": "33b4cfdb18e215e2306bacd2676ec9ccb7096931170d797befecd23f7bb5df5e"
+    },
+    {
+      "archived_sha256": "dc8d8363deadda7b2ab7356b93c045b71346a0b4ceee1899c03a06894da82edd",
+      "file": "w8a16-small-mma-rejected-patch.json"
+    }
+  ],
+  "b1_memory": {
+    "batch": 1,
+    "kv_gib": 5.3125,
+    "loaded_total_gib": 18.87890625,
+    "max_ctx": 20480,
+    "weights_gib": 12.036147594451904
+  },
+  "decision": "Use the all-rung packet and 8192 chunk limit for single-request long-context latency. Reject the small-M interpreter role because every loaded cell regresses. Retain only experimental probes; production remains async WGMMA.",
+  "direct_small_mma": {
+    "cases": 22,
+    "cells": [
+      {
+        "async_wgmma_us": 69.472,
+        "direct_mma_us": 59.013,
+        "shape": [
+          1,
+          512,
+          3840
+        ],
+        "speedup": 1.1772321352922237
+      },
+      {
+        "async_wgmma_us": 67.648,
+        "direct_mma_us": 61.307,
+        "shape": [
+          1,
+          2048,
+          3840
+        ],
+        "speedup": 1.1034302771298545
+      },
+      {
+        "async_wgmma_us": 71.547,
+        "direct_mma_us": 67.104,
+        "shape": [
+          1,
+          3840,
+          4096
+        ],
+        "speedup": 1.0662106580829755
+      },
+      {
+        "async_wgmma_us": 67.886,
+        "direct_mma_us": 61.911,
+        "shape": [
+          1,
+          4096,
+          3840
+        ],
+        "speedup": 1.0965095055805913
+      },
+      {
+        "async_wgmma_us": 67.744,
+        "direct_mma_us": 61.563,
+        "shape": [
+          1,
+          8192,
+          3840
+        ],
+        "speedup": 1.1004012150155125
+      },
+      {
+        "async_wgmma_us": 69.381,
+        "direct_mma_us": 60.146,
+        "shape": [
+          2,
+          512,
+          3840
+        ],
+        "speedup": 1.1535430452565425
+      },
+      {
+        "async_wgmma_us": 67.547,
+        "direct_mma_us": 61.76,
+        "shape": [
+          2,
+          2048,
+          3840
+        ],
+        "speedup": 1.0937014248704664
+      },
+      {
+        "async_wgmma_us": 71.607,
+        "direct_mma_us": 67.616,
+        "shape": [
+          2,
+          3840,
+          4096
+        ],
+        "speedup": 1.0590244912446758
+      },
+      {
+        "async_wgmma_us": 67.854,
+        "direct_mma_us": 61.774,
+        "shape": [
+          2,
+          4096,
+          3840
+        ],
+        "speedup": 1.0984232848771327
+      },
+      {
+        "async_wgmma_us": 67.899,
+        "direct_mma_us": 61.495,
+        "shape": [
+          2,
+          8192,
+          3840
+        ],
+        "speedup": 1.1041385478494188
+      },
+      {
+        "async_wgmma_us": 72.041,
+        "direct_mma_us": 56.795,
+        "shape": [
+          4,
+          512,
+          3840
+        ],
+        "speedup": 1.26843912316225
+      },
+      {
+        "async_wgmma_us": 67.515,
+        "direct_mma_us": 58.949,
+        "shape": [
+          4,
+          2048,
+          3840
+        ],
+        "speedup": 1.1453120493986328
+      },
+      {
+        "async_wgmma_us": 71.931,
+        "direct_mma_us": 63.081,
+        "shape": [
+          4,
+          3840,
+          4096
+        ],
+        "speedup": 1.140295810148856
+      },
+      {
+        "async_wgmma_us": 136.485,
+        "direct_mma_us": 121.573,
+        "shape": [
+          4,
+          3840,
+          8192
+        ],
+        "speedup": 1.122658814045882
+      },
+      {
+        "async_wgmma_us": 67.858,
+        "direct_mma_us": 58.807,
+        "shape": [
+          4,
+          4096,
+          3840
+        ],
+        "speedup": 1.153910248779907
+      },
+      {
+        "async_wgmma_us": 67.739,
+        "direct_mma_us": 58.921,
+        "shape": [
+          4,
+          8192,
+          3840
+        ],
+        "speedup": 1.149658016666384
+      },
+      {
+        "async_wgmma_us": 69.303,
+        "direct_mma_us": 58.606,
+        "shape": [
+          8,
+          512,
+          3840
+        ],
+        "speedup": 1.1825239736545745
+      },
+      {
+        "async_wgmma_us": 67.04,
+        "direct_mma_us": 60.695,
+        "shape": [
+          8,
+          2048,
+          3840
+        ],
+        "speedup": 1.1045390888870583
+      },
+      {
+        "async_wgmma_us": 71.31,
+        "direct_mma_us": 64.777,
+        "shape": [
+          8,
+          3840,
+          4096
+        ],
+        "speedup": 1.1008536980718464
+      },
+      {
+        "async_wgmma_us": 137.029,
+        "direct_mma_us": 124.457,
+        "shape": [
+          8,
+          3840,
+          8192
+        ],
+        "speedup": 1.101014808327374
+      },
+      {
+        "async_wgmma_us": 67.255,
+        "direct_mma_us": 60.827,
+        "shape": [
+          8,
+          4096,
+          3840
+        ],
+        "speedup": 1.105676755388232
+      },
+      {
+        "async_wgmma_us": 67.771,
+        "direct_mma_us": 60.759,
+        "shape": [
+          8,
+          8192,
+          3840
+        ],
+        "speedup": 1.1154067710133477
+      }
+    ],
+    "output_equality": "70/70 cases for each split 1,2,4,8; retained split1 cells below use complete-output-equal screen",
+    "speedup_max": 1.26843912316225,
+    "speedup_median": 1.1051079221376452,
+    "speedup_min": 1.0590244912446758
+  },
+  "interpretation": [
+    "Direct launch improves retained M=1/2/4/8 attention projections by 1.059x to 1.268x.",
+    "The persistent packet interpreter reverses every direct gain; dependency edge removal saves only about 1 us median and does not explain the regression.",
+    "A separate direct-launch backend could use this kernel family, but integrating the measured role into the current queue would reduce performance.",
+    "The 8192 rung amortizes whole-segment launches at 16K context and is the only end-to-end promotion from this cycle."
+  ],
+  "limits": [
+    "B1 establishes latency behavior only; it does not measure max-concurrency throughput.",
+    "Serving uses three timed repeats after one warmup in one control/candidate campaign.",
+    "No fresh vLLM run or independent model-quality evaluation in this cycle.",
+    "The direct small-M candidate uses mma.sync and ordinary global loads; it does not use TMA or WGMMA."
+  ],
+  "loaded_small_mma": {
+    "all_regressed": true,
+    "cases": 22,
+    "cells": [
+      {
+        "generic_async_us": 79.936,
+        "shape": [
+          1,
+          4096,
+          3840
+        ],
+        "small_mma_us": 85.312,
+        "speedup": 0.9369842460615155
+      },
+      {
+        "generic_async_us": 81.792,
+        "shape": [
+          1,
+          512,
+          3840
+        ],
+        "small_mma_us": 83.904,
+        "speedup": 0.9748283752860413
+      },
+      {
+        "generic_async_us": 80.608,
+        "shape": [
+          1,
+          2048,
+          3840
+        ],
+        "small_mma_us": 86.016,
+        "speedup": 0.9371279761904762
+      },
+      {
+        "generic_async_us": 76.416,
+        "shape": [
+          1,
+          8192,
+          3840
+        ],
+        "small_mma_us": 87.712,
+        "speedup": 0.8712148850784385
+      },
+      {
+        "generic_async_us": 85.28,
+        "shape": [
+          1,
+          3840,
+          4096
+        ],
+        "small_mma_us": 90.88,
+        "speedup": 0.9383802816901409
+      },
+      {
+        "generic_async_us": 78.208,
+        "shape": [
+          2,
+          4096,
+          3840
+        ],
+        "small_mma_us": 87.968,
+        "speedup": 0.8890505638413968
+      },
+      {
+        "generic_async_us": 81.664,
+        "shape": [
+          2,
+          512,
+          3840
+        ],
+        "small_mma_us": 87.136,
+        "speedup": 0.937201615864855
+      },
+      {
+        "generic_async_us": 80.544,
+        "shape": [
+          2,
+          2048,
+          3840
+        ],
+        "small_mma_us": 85.888,
+        "speedup": 0.937779433681073
+      },
+      {
+        "generic_async_us": 75.424,
+        "shape": [
+          2,
+          8192,
+          3840
+        ],
+        "small_mma_us": 91.936,
+        "speedup": 0.8203967977723634
+      },
+      {
+        "generic_async_us": 83.2,
+        "shape": [
+          2,
+          3840,
+          4096
+        ],
+        "small_mma_us": 93.632,
+        "speedup": 0.8885850991114149
+      },
+      {
+        "generic_async_us": 78.112,
+        "shape": [
+          4,
+          4096,
+          3840
+        ],
+        "small_mma_us": 90.656,
+        "speedup": 0.8616307800917754
+      },
+      {
+        "generic_async_us": 80.064,
+        "shape": [
+          4,
+          512,
+          3840
+        ],
+        "small_mma_us": 90.336,
+        "speedup": 0.8862911795961742
+      },
+      {
+        "generic_async_us": 81.024,
+        "shape": [
+          4,
+          2048,
+          3840
+        ],
+        "small_mma_us": 89.184,
+        "speedup": 0.9085037674919269
+      },
+      {
+        "generic_async_us": 76.992,
+        "shape": [
+          4,
+          8192,
+          3840
+        ],
+        "small_mma_us": 94.72,
+        "speedup": 0.8128378378378379
+      },
+      {
+        "generic_async_us": 86.016,
+        "shape": [
+          4,
+          3840,
+          4096
+        ],
+        "small_mma_us": 96.16,
+        "speedup": 0.8945091514143095
+      },
+      {
+        "generic_async_us": 160.416,
+        "shape": [
+          4,
+          3840,
+          8192
+        ],
+        "small_mma_us": 179.648,
+        "speedup": 0.8929462059137869
+      },
+      {
+        "generic_async_us": 79.936,
+        "shape": [
+          8,
+          4096,
+          3840
+        ],
+        "small_mma_us": 96.064,
+        "speedup": 0.8321119253830781
+      },
+      {
+        "generic_async_us": 80.48,
+        "shape": [
+          8,
+          512,
+          3840
+        ],
+        "small_mma_us": 97.856,
+        "speedup": 0.8224329627207326
+      },
+      {
+        "generic_async_us": 81.92,
+        "shape": [
+          8,
+          2048,
+          3840
+        ],
+        "small_mma_us": 96.512,
+        "speedup": 0.8488063660477454
+      },
+      {
+        "generic_async_us": 76.704,
+        "shape": [
+          8,
+          8192,
+          3840
+        ],
+        "small_mma_us": 102.08,
+        "speedup": 0.75141065830721
+      },
+      {
+        "generic_async_us": 86.56,
+        "shape": [
+          8,
+          3840,
+          4096
+        ],
+        "small_mma_us": 103.232,
+        "speedup": 0.8384996900185989
+      },
+      {
+        "generic_async_us": 157.856,
+        "shape": [
+          8,
+          3840,
+          8192
+        ],
+        "small_mma_us": 195.936,
+        "speedup": 0.805650824759105
+      }
+    ],
+    "edge_protocol_overhead": {
+      "candidate": {
+        "max_us": 1.568000000000012,
+        "median_us": 1.20000000000001,
+        "min_us": 0.8960000000000008
+      },
+      "control": {
+        "max_us": 2.303999999999988,
+        "median_us": 1.039999999999992,
+        "min_us": -0.1599999999999966
+      }
+    },
+    "speedup_max": 0.9748283752860413,
+    "speedup_median": 0.8874381393537946,
+    "speedup_min": 0.75141065830721
+  },
+  "objects": {
+    "generic_async": {
+      "dynamic_arena_bytes": 99328,
+      "grid": 132,
+      "registers": 254,
+      "stack_bytes": 0
+    },
+    "small_mma": {
+      "dynamic_arena_bytes": 128,
+      "grid": 264,
+      "registers": 64,
+      "stack_bytes": 0
+    }
+  },
+  "rung_audit": {
+    "audit_json_sha256": "295c1032451b238553cbdac7bfbc8e3911cb5f495db38f9e8d6d58143d392d52",
+    "decode_rungs": [
+      1
+    ],
+    "instructions": 11346,
+    "kernel_cases": 1006,
+    "n_cu": 132,
+    "packet_sha256": "3f1939eb77b3c2929ae5b1c4293ad9b7ff32b4a8012a5ecbe313de1ec6b7e781",
+    "prefill_rungs": [
+      1,
+      2,
+      4,
+      8,
+      16,
+      32,
+      64,
+      128,
+      256,
+      512,
+      1024,
+      2048,
+      4096,
+      8192
+    ],
+    "programs": 15
+  },
+  "scope": "Gemma 4 12B H100 W8A16: all requested prefill rungs, native small-M MMA screen, loaded interpreter screen, and B1 end-to-end chunk A/B.",
+  "serving": {
+    "1024": {
+      "candidate_vs_control": {
+        "latency_ratio": 1.0027573737597926,
+        "output_tok_s_ratio": 0.9972984115571015,
+        "paired_benchmark_texts_equal": true,
+        "ttft_ratio": 0.9911614424496712
+      },
+      "chunk1024": {
+        "median_latency_ms": 1373.7709669949254,
+        "median_output_tok_s": 93.14717235342724,
+        "median_tpot_ms": 9.534790850355378,
+        "median_ttft_ms": 163.97924500051886,
+        "repeats": 3
+      },
+      "chunk8192": {
+        "median_latency_ms": 1377.5589670112822,
+        "median_output_tok_s": 92.89552702910855,
+        "median_tpot_ms": 9.544025063097632,
+        "median_ttft_ms": 162.5299050065223,
+        "repeats": 3
+      }
+    },
+    "16384": {
+      "candidate_vs_control": {
+        "latency_ratio": 0.9540370866357225,
+        "output_tok_s_ratio": 1.048203341608978,
+        "paired_benchmark_texts_equal": true,
+        "ttft_ratio": 0.9315335559017494
+      },
+      "chunk1024": {
+        "median_latency_ms": 4277.999448007904,
+        "median_output_tok_s": 29.91393214625734,
+        "median_tpot_ms": 10.564280338594543,
+        "median_ttft_ms": 2937.2681560053024,
+        "repeats": 3
+      },
+      "chunk8192": {
+        "median_latency_ms": 4081.3701300066896,
+        "median_output_tok_s": 31.355883636371175,
+        "median_tpot_ms": 10.592175433118864,
+        "median_ttft_ms": 2736.163850000594,
+        "repeats": 3
+      }
+    }
+  },
+  "serving_correctness": {
+    "benchmark_pairs_equal": 6,
+    "boundary_generations_equal": 4,
+    "cancellation_recovery": "PASS",
+    "concurrency_scope": 1,
+    "context_rejection": "PASS"
+  }
+}

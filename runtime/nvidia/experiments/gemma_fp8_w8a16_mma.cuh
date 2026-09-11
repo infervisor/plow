@@ -13,17 +13,18 @@ __device__ __forceinline__ unsigned unpack_pair(unsigned short bytes) {
 
 // E4M3 values convert exactly to BF16. Scale stays outside the K reduction.
 template <bool Partial>
-__global__ __launch_bounds__(256) void w8a16_mma(
+__device__ __forceinline__ void w8a16_mma_tile(
     __nv_bfloat16* output, float* partial, const __nv_bfloat16* x,
     const unsigned char* weights, const float* scales,
-    unsigned M, unsigned N, unsigned K, unsigned splits) {
+    unsigned M, unsigned N, unsigned K, unsigned splits,
+    unsigned tile_x, unsigned tile_y, unsigned tile_z) {
     const unsigned lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const unsigned group = lane >> 2, pair = (lane & 3) * 2;
-    const unsigned row = blockIdx.y * 16 + group;
-    const unsigned col = blockIdx.x * 64 + warp * 8;
+    const unsigned row = tile_y * 16 + group;
+    const unsigned col = tile_x * 64 + warp * 8;
     const unsigned tiles = K / 16;
     const unsigned chunk = (tiles + splits - 1) / splits;
-    const unsigned start = blockIdx.z * chunk;
+    const unsigned start = tile_z * chunk;
     const unsigned end = min(start + chunk, tiles);
     float acc[4] = {};
     for (unsigned tile = start; tile < end; ++tile) {
@@ -56,10 +57,36 @@ __global__ __launch_bounds__(256) void w8a16_mma(
             if (m < M && n < N) {
                 const size_t index = (size_t)m * N + n;
                 if constexpr (Partial)
-                    partial[(size_t)blockIdx.z * M * N + index] = acc[high * 2 + low];
+                    partial[(size_t)tile_z * M * N + index] = acc[high * 2 + low];
                 else
                     output[index] = __float2bfloat16(acc[high * 2 + low] * scales[n]);
             }
+        }
+}
+
+template <bool Partial>
+__global__ __launch_bounds__(256) void w8a16_mma(
+    __nv_bfloat16* output, float* partial, const __nv_bfloat16* x,
+    const unsigned char* weights, const float* scales,
+    unsigned M, unsigned N, unsigned K, unsigned splits) {
+    w8a16_mma_tile<Partial>(output, partial, x, weights, scales, M, N, K, splits,
+                            blockIdx.x, blockIdx.y, blockIdx.z);
+}
+
+__global__ __launch_bounds__(256) void w8a16_mma_sliced(
+    __nv_bfloat16* output, const __nv_bfloat16* x, const unsigned char* weights,
+    const float* scales, unsigned M, unsigned N, unsigned K, unsigned nblk) {
+    const unsigned tiles_n = (N + 63) / 64;
+    for (unsigned slice = blockIdx.x; slice < nblk; slice += gridDim.x)
+        if (M <= 8) {
+            for (unsigned tile = slice; tile < tiles_n; tile += nblk)
+                w8a16_mma_tile<false>(output, nullptr, x, weights, scales, M, N, K, 1,
+                                      tile, 0, 0);
+        } else {
+            const unsigned tiles = tiles_n * ((M + 15) / 16);
+            for (unsigned tile = slice; tile < tiles; tile += nblk)
+                w8a16_mma_tile<false>(output, nullptr, x, weights, scales, M, N, K, 1,
+                                      tile % tiles_n, tile / tiles_n, 0);
         }
 }
 

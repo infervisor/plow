@@ -24,6 +24,8 @@ using bf16 = __nv_bfloat16;
 static CUmodule module;
 static CUfunction interpreter;
 static unsigned arena_bytes;
+static unsigned interpreter_grid = 132;
+static bool prefill_interpreter;
 #define DRIVER(call) do { auto error = (call); if (error != CUDA_SUCCESS) { \
     const char* message; cuGetErrorString(error, &message); \
     std::fprintf(stderr, "%s: %s\n", #call, message); std::exit(1); } } while (0)
@@ -76,9 +78,12 @@ static void run(unsigned M, unsigned N, unsigned K, bool exact, unsigned* flush,
         packet_allocations.push_back(pointer); return pointer;
     };
     if (module && packet_blocks) {
-        PlowDevInst inst{}; inst.op = PLOW_DOP_GEMV_FP8; inst.blocks = packet_blocks;
+        PlowDevInst inst{};
+        inst.op = prefill_interpreter ? PLOW_DOP_GEMM_FP8 : PLOW_DOP_GEMV_FP8;
+        inst.blocks = packet_blocks;
         for (auto& t : inst.t) t = PLOW_TENSOR_NONE;
-        inst.t[0] = 0; inst.t[1] = 1; inst.t[2] = 2; inst.t[5] = 3;
+        inst.t[0] = 0; inst.t[1] = 1; inst.t[2] = 2;
+        inst.t[prefill_interpreter ? 4 : 5] = 3;
         inst.i[0] = M; inst.i[1] = N; inst.i[2] = K;
         for (unsigned i = 0; i < packet_blocks; ++i) {
             entries[i].slice = i; entries[i].wait_len = 1; entries[i].succ_len = 1;
@@ -100,7 +105,8 @@ static void run(unsigned M, unsigned N, unsigned K, bool exact, unsigned* flush,
     auto launch = [&](unsigned split, unsigned blocks) {
         if (split >= 16) {
             void* args[]{&program};
-            DRIVER(cuLaunchKernel(interpreter, 132, 1, 1, 256, 1, 1, arena_bytes, nullptr, args, nullptr));
+            DRIVER(cuLaunchKernel(interpreter, interpreter_grid, 1, 1, 256, 1, 1,
+                                  arena_bytes, nullptr, args, nullptr));
         } else if (!split) production<<<blocks, 256, arena_bytes>>>(dy, dx, dw, ds, M, N, K, arena_bytes);
         else if (split == 1)
             gemma_fp8_probe::w8a16_mma<false><<<dim3((N + 63) / 64, (M + 15) / 16), 256>>>(dy, partial, dx, dw, ds, M, N, K, split);
@@ -117,7 +123,9 @@ static void run(unsigned M, unsigned N, unsigned K, bool exact, unsigned* flush,
     launch(0, 132);
     CHECK(cudaMemcpy(baseline.data(), dy, result.size() * sizeof(bf16), cudaMemcpyDeviceToHost));
     cudaEvent_t start, end; CHECK(cudaEventCreate(&start)); CHECK(cudaEventCreate(&end));
-    for (unsigned variant = 0; variant < (packet_blocks ? (module ? 10u : 8u) : 7u); ++variant) {
+    const unsigned first_variant = module && std::getenv("PLOW_PROBE_LOADED_ONLY") ? 8 : 0;
+    for (unsigned variant = first_variant;
+         variant < (packet_blocks ? (module ? 10u : 8u) : 7u); ++variant) {
         const bool packet_control = variant == 7;
         const bool loaded = variant >= 8;
         const unsigned split = variant < 3 || packet_control ? 0 : 1u << (variant - (loaded ? 4 : 3));
@@ -186,15 +194,26 @@ int main(int argc, char** argv) {
     }
     auto* flush = allocate<unsigned>(64 * 1024 * 1024);
     CHECK(cudaMemset(flush, 0, 256 * 1024 * 1024));
-    if (const char* cubin = std::getenv("PLOW_PROBE_CUBIN")) {
+    const char* cubin = std::getenv("PLOW_PROBE_CUBIN");
+    if (const char* prefill = std::getenv("PLOW_PROBE_PREFILL_CUBIN")) {
+        if (cubin) return 2;
+        cubin = prefill;
+        prefill_interpreter = true;
+    }
+    if (cubin) {
         DRIVER(cuModuleLoad(&module, cubin));
-        DRIVER(cuModuleGetFunction(&interpreter, module, "_Z12interp_sm90a11PlowProgram"));
+        DRIVER(cuModuleGetFunction(&interpreter, module, prefill_interpreter
+            ? "_Z19interp_sm90a_pfgemm11PlowProgram" : "_Z12interp_sm90a11PlowProgram"));
         CUdeviceptr address; size_t bytes;
-        DRIVER(cuModuleGetGlobal(&address, &bytes, module, "plow_arena_bytes"));
+        DRIVER(cuModuleGetGlobal(&address, &bytes, module,
+            prefill_interpreter ? "plow_arena_bytes_pfgemm" : "plow_arena_bytes"));
         if (bytes != sizeof(arena_bytes)) return 2;
         DRIVER(cuMemcpyDtoH(&arena_bytes, address, bytes));
         DRIVER(cuFuncSetAttribute(interpreter, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, arena_bytes));
         CHECK(cudaFuncSetAttribute(production, cudaFuncAttributeMaxDynamicSharedMemorySize, arena_bytes));
+        if (const char* grid = std::getenv("PLOW_PROBE_GRID"))
+            interpreter_grid = std::strtoul(grid, nullptr, 10);
+        if (!interpreter_grid) return 2;
     }
     run(8, 64, 256, true, flush); run(17, 71, 256, true, flush);
     if (argc >= 4) run(std::atoi(argv[1]), std::atoi(argv[2]), std::atoi(argv[3]), false, flush,

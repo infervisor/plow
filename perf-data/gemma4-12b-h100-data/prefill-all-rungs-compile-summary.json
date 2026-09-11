@@ -18464,7 +18464,7 @@
       ]
     }
   },
-  "b1_w8a16_uncompiled_recipe": {
+  "b1_w8a16_recipe": {
     "command": [
       "target/release/plowc",
       "--hf-dir",
@@ -18496,6 +18496,12 @@
       "PLOW_SEG_SLICE_ALL": "1",
       "PLOW_W8A16": "true",
       "PLOW_PF_LADDER_APPEND": "1,2,4,8,16,32,64,256"
+    },
+    "qualification": {
+      "packet_sha256": "3f1939eb77b3c2929ae5b1c4293ad9b7ff32b4a8012a5ecbe313de1ec6b7e781",
+      "strict_audit": "PASS: 15 programs, 11346 instructions, 1006 kernel cases",
+      "loaded_h100_gib": 18.87890625,
+      "serving": "PASS: B1 chunk1024 vs chunk8192 A/B; see w8a16-all-rung-small-mma-summary.json"
     }
   },
   "archive": [
@@ -18550,6 +18556,7 @@
     "packet_boundary_failures": 0,
     "release_plowc_build": "PASS",
     "strict_audit": "all3 packets PASS; build-case fields, dispatch arms and queue coverage checked",
-    "gpu_new_full_model_packets": "not run; B16KV85GiB exceedsH100"
+    "gpu_new_full_model_packets": "not run; B16KV85GiB exceedsH100",
+    "gpu_b1_full_model_packet": "PASS: all14 prefill buckets loaded; sequential correctness and serving A/B passed"
   }
 }

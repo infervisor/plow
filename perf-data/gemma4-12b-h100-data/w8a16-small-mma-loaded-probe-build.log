@@ -1,0 +1,31 @@
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_ZN15gemma_fp8_probe9w8a16_mmaILb1EEEvP13__nv_bfloat16PfPKS1_PKhPKfjjjj' for 'sm_90a'
+ptxas info    : Function properties for _ZN15gemma_fp8_probe9w8a16_mmaILb1EEEvP13__nv_bfloat16PfPKS1_PKhPKfjjjj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 34 registers, used 0 barriers
+ptxas info    : Compile time = 15.169 ms
+ptxas info    : Compiling entry function '_ZN15gemma_fp8_probe9w8a16_mmaILb0EEEvP13__nv_bfloat16PfPKS1_PKhPKfjjjj' for 'sm_90a'
+ptxas info    : Function properties for _ZN15gemma_fp8_probe9w8a16_mmaILb0EEEvP13__nv_bfloat16PfPKS1_PKhPKfjjjj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 34 registers, used 0 barriers
+ptxas info    : Compile time = 13.744 ms
+ptxas info    : Compiling entry function '_ZN15gemma_fp8_probe6reduceEP13__nv_bfloat16PKfS3_jjj' for 'sm_90a'
+ptxas info    : Function properties for _ZN15gemma_fp8_probe6reduceEP13__nv_bfloat16PKfS3_jjj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 32 registers, used 0 barriers
+ptxas info    : Compile time = 10.532 ms
+ptxas info    : Compiling entry function '_ZN15gemma_fp8_probe16w8a16_mma_slicedEP13__nv_bfloat16PKS0_PKhPKfjjjj' for 'sm_90a'
+ptxas info    : Function properties for _ZN15gemma_fp8_probe16w8a16_mma_slicedEP13__nv_bfloat16PKS0_PKhPKfjjjj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 34 registers, used 0 barriers
+ptxas info    : Compile time = 33.995 ms
+ptxas info    : Compiling entry function '_Z11flush_cachePjj' for 'sm_90a'
+ptxas info    : Function properties for _Z11flush_cachePjj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 10 registers, used 0 barriers
+ptxas info    : Compile time = 1.256 ms
+ptxas info    : Compiling entry function '_Z10productionP13__nv_bfloat16PKS_PKhPKfjjjj' for 'sm_90a'
+ptxas info    : Function properties for _Z10productionP13__nv_bfloat16PKS_PKhPKfjjjj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 100 registers, used 1 barriers
+ptxas info    : Compile time = 1460.649 ms
