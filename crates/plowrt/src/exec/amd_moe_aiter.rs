@@ -2168,15 +2168,18 @@ mod tests {
     /// block-FP8 shared expert, one BF16 activation, one top-8 routing — run two ways:
     ///
     ///   * TWO-PATH (what plow runs today): the fused call at 256/8 over the routed experts,
-    ///     plus the shared expert computed on the host from the SAME fp8 bytes in f64 and added;
+    ///     plus the shared expert as the bf16 GEMM pair computes it from the same fp8 bytes;
     ///   * FOLDED: the fused call at 257/9, the shared expert packed as expert 256 and every
     ///     token holding a constant gate-1.0 slot on it — exactly the routing the fold's router
     ///     tail writes.
     ///
-    /// Both are compared per row against an f64 reference of the whole FFN (routed + shared).
-    /// The only unmodelled term is the A8 activation quant both device paths share, so the
-    /// reference bound is the documented A8 screening threshold. A combine that dropped or
-    /// doubled the shared expert would show as a per-row error of order 1, not 1e-2.
+    /// Per row, against an f64 reference of the whole FFN: the fold; the two-path with the shared
+    /// expert exact in f64 (the original bound's reference) and as served today (bf16, as the lite
+    /// prep dequantises it); and the fold's two parts separately (routed call; shared expert alone
+    /// through the 257-entry call). Per 128-column block: fold vs the bf16 two-path, and the shared
+    /// expert alone vs exact — a misindexed scale or weight on the shared slot is block-structured,
+    /// A8 quantisation noise is flat. Every bound (A8 screening, the original 1.5x two-path bound,
+    /// and fold == routed + shared_a8) is evaluated after all row counts are measured.
     #[test]
     #[ignore = "requires a gfx942 GPU lease and PLOW_TEST_AITER_DIR with the n_exp adapter"]
     fn moe_aiter_shared_fold_matches_two_path_per_row() {
@@ -2260,6 +2263,7 @@ mod tests {
                 })
                 .collect()
         };
+        let mut verdicts: Vec<String> = Vec::new();
         for rows in [129u32, 2048, 8192] {
             let mut routing: Vec<Vec<(usize, f32)>> = vec![Vec::new(); rows as usize];
             for slots in routing.iter_mut() {
@@ -2273,15 +2277,13 @@ mod tests {
                     slots.push((e, 0.05 + k as f32 * 0.02));
                 }
             }
-            // The align/sort's output for a (n_exp, topk) routing: plow's meta layout, 64-row
-            // padded groups, `row_partidx = token * topk + slot`.
-            let sort = |n_exp: usize, topk: usize| {
+            // The align/sort's output for one routing: plow's meta layout, 64-row padded groups,
+            // `row_partidx = token * topk + slot`.
+            let sort = |n_exp: usize, topk: usize, slots_of: &dyn Fn(usize) -> Vec<(usize, f32)>| {
                 let mut per_expert = vec![Vec::new(); n_exp];
-                for (row, slots) in routing.iter().enumerate() {
-                    let mut all = slots.clone();
-                    if topk == 9 {
-                        all.push((256, 1.0));
-                    }
+                for row in 0..rows as usize {
+                    let all = slots_of(row);
+                    assert_eq!(all.len(), topk);
                     for (slot, &(e, g)) in all.iter().enumerate() {
                         per_expert[e].push((row as u32, (row * topk + slot) as u32, g));
                     }
@@ -2311,8 +2313,12 @@ mod tests {
                 .collect();
             let x = upload(bytemuck::cast_slice(&x_bits));
             let output_bytes = rows as usize * 6144 * 2;
-            let run = |kernel: &MoeAiter, n_exp: u32, topk: u32| -> Vec<f32> {
-                let (meta, rt, rp, rg) = sort(n_exp as usize, topk as usize);
+            let run = |kernel: &MoeAiter,
+                       n_exp: u32,
+                       topk: u32,
+                       slots_of: &dyn Fn(usize) -> Vec<(usize, f32)>|
+             -> Vec<f32> {
+                let (meta, rt, rp, rg) = sort(n_exp as usize, topk as usize, slots_of);
                 let (meta, rt, rp, rg) = (
                     upload(bytemuck::cast_slice(&meta)),
                     upload(bytemuck::cast_slice(&rt)),
@@ -2337,65 +2343,174 @@ mod tests {
                 EngineDevice::download(&be, &out, 0, &mut bytes).unwrap();
                 assert!(
                     bytes[..256].iter().chain(&bytes[256 + output_bytes..]).all(|&b| b == 0xa5),
-                    "n_exp={n_exp} rows={rows}: guard bytes overwritten"
+                    "n_exp={n_exp} topk={topk} rows={rows}: guard bytes overwritten"
                 );
                 bytes[256..256 + output_bytes]
                     .chunks_exact(2)
                     .map(|b| f32::from_bits(u32::from(u16::from_le_bytes([b[0], b[1]])) << 16))
                     .collect()
             };
-            let routed = run(&k256, 256, 8);
-            let folded = run(&k257, 257, 9);
+            // Three calls on the same input: today's routed call (256/8), the fold (257/9), and the
+            // shared expert ALONE through the 257-entry call (topk 1, gate 1.0) — the fold's two
+            // parts measured separately under the same A8 activation quant.
+            let routed = run(&k256, 256, 8, &|row| routing[row].clone());
+            let folded = run(&k257, 257, 9, &|row| {
+                let mut s = routing[row].clone();
+                s.push((256, 1.0));
+                s
+            });
+            let shared_a8 = run(&k257, 257, 1, &|_| vec![(256usize, 1.0f32)]);
             assert!(folded.iter().all(|v| v.is_finite()), "rows={rows}: non-finite fold output");
-            // Per row: every checked row, both paths, against f64 routed + shared.
+            // bf16 round-to-nearest-even, for the production-like two-path reference.
+            let bf = |v: f64| -> f64 {
+                let b = (v as f32).to_bits();
+                f64::from(f32::from_bits(b.wrapping_add(0x7fff + ((b >> 16) & 1)) & 0xffff_0000))
+            };
+            // The shared expert as the two-path serves it today: the lite prep's bf16 dequant of
+            // the same fp8 bytes, bf16 activations, wide accumulation, bf16 GLU and output.
+            let shared_bf16 = |xr: &[f64]| -> Vec<f64> {
+                let e = 256;
+                let mut act = [0f64; 256];
+                for (n, a) in act.iter_mut().enumerate() {
+                    let (mut gate, mut up) = (0f64, 0f64);
+                    for k in 0..6144 {
+                        let sg = f64::from(scales[(e * 3) * 96 + (n / 128) * 48 + k / 128]);
+                        let su = f64::from(scales[(e * 3 + 1) * 96 + (n / 128) * 48 + k / 128]);
+                        gate += bf(decode(weight_bytes[(e * 3) * per + n * 6144 + k]) * sg) * xr[k];
+                        up += bf(decode(weight_bytes[(e * 3 + 1) * per + n * 6144 + k]) * su) * xr[k];
+                    }
+                    *a = bf(gate / (1.0 + (-gate).exp()) * up);
+                }
+                (0..6144)
+                    .map(|n| {
+                        bf((0..256)
+                            .map(|k| {
+                                let sd = f64::from(scales[(e * 3 + 2) * 96 + (n / 128) * 2 + k / 128]);
+                                bf(decode(weight_bytes[(e * 3 + 2) * per + n * 256 + k]) * sd) * act[k]
+                            })
+                            .sum())
+                    })
+                    .collect()
+            };
             let picks: Vec<usize> = [0, 1, 63, 64, rows as usize / 2, rows as usize - 1]
                 .into_iter()
                 .filter(|&r| r < rows as usize)
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
                 .collect();
-            let (mut worst_two, mut worst_fold, mut worst_pair) = (0f64, 0f64, 0f64);
+            // rel-L2 over a column range.
+            let rel_in = |got: &dyn Fn(usize) -> f64,
+                          want: &dyn Fn(usize) -> f64,
+                          cols: std::ops::Range<usize>| {
+                let (mut num, mut den) = (0f64, 0f64);
+                for n in cols {
+                    num += (got(n) - want(n)).powi(2);
+                    den += want(n).powi(2);
+                }
+                (num / den).sqrt()
+            };
+            let rel = |got: &dyn Fn(usize) -> f64, want: &dyn Fn(usize) -> f64| {
+                rel_in(got, want, 0..6144)
+            };
+            // [fold/f64, v1 two-path (f64 shared)/f64, prod two-path (bf16 shared)/f64,
+            //  fold/prod two-path, fold/(routed + shared_a8), shared_a8/f64, shared_bf16/f64,
+            //  routed/f64]
+            let mut worst = [0f64; 8];
+            // Per-128-column-block rel-L2, over every checked row: fold vs prod two-path, and
+            // the shared expert alone (A8) vs exact. A misindexed scale/weight on the shared slot
+            // is block-structured; A8 quantisation noise is flat across blocks.
+            let (mut blk_pair, mut blk_shared) = (Vec::new(), Vec::new());
             for &row in &picks {
                 let xr: Vec<f64> = x_bits[row * 6144..(row + 1) * 6144]
                     .iter()
                     .map(|b| f64::from(f32::from_bits(u32::from(*b) << 16)))
                     .collect();
-                let shared = expert_ffn(256, &xr);
-                let mut reference = shared.clone();
+                let shared_exact = expert_ffn(256, &xr);
+                let shared_prod = shared_bf16(&xr);
+                let mut routed_exact = vec![0f64; 6144];
                 for &(e, g) in &routing[row] {
-                    for (r, v) in reference.iter_mut().zip(expert_ffn(e, &xr)) {
+                    for (r, v) in routed_exact.iter_mut().zip(expert_ffn(e, &xr)) {
                         *r += v * f64::from(g);
                     }
                 }
-                let rel = |got: &dyn Fn(usize) -> f64, want: &dyn Fn(usize) -> f64| {
-                    let (mut num, mut den) = (0f64, 0f64);
-                    for n in 0..6144 {
-                        num += (got(n) - want(n)).powi(2);
-                        den += want(n).powi(2);
-                    }
-                    (num / den).sqrt()
-                };
-                let two_path = |n: usize| f64::from(routed[row * 6144 + n]) + shared[n];
-                let fold = |n: usize| f64::from(folded[row * 6144 + n]);
-                let exact = |n: usize| reference[n];
-                let (e_two, e_fold, e_pair) =
-                    (rel(&two_path, &exact), rel(&fold, &exact), rel(&fold, &two_path));
+                let at = |v: &[f32], n: usize| f64::from(v[row * 6144 + n]);
+                let exact = |n: usize| routed_exact[n] + shared_exact[n];
+                let two_path_v1 = |n: usize| at(&routed, n) + shared_exact[n];
+                let two_path = |n: usize| at(&routed, n) + shared_prod[n];
+                let fold = |n: usize| at(&folded, n);
+                let parts = |n: usize| at(&routed, n) + at(&shared_a8, n);
+                let sa8 = |n: usize| at(&shared_a8, n);
+                let e = [
+                    rel(&fold, &exact),
+                    rel(&two_path_v1, &exact),
+                    rel(&two_path, &exact),
+                    rel(&fold, &two_path),
+                    rel(&fold, &parts),
+                    rel(&sa8, &|n| shared_exact[n]),
+                    rel(&|n| shared_prod[n], &|n| shared_exact[n]),
+                    rel(&|n| at(&routed, n), &|n| routed_exact[n]),
+                ];
                 eprintln!(
-                    "rows={rows} row={row}: rel_l2 vs f64 two-path={e_two:.3e} fold={e_fold:.3e}; \
-                     fold vs two-path={e_pair:.3e}"
+                    "rows={rows} row={row}: vs f64 fold={:.3e} two-path(f64 shared)={:.3e} \
+                     two-path(bf16 shared)={:.3e} | fold vs two-path(bf16)={:.3e} | fold vs \
+                     routed+shared_a8={:.3e} | shared alone a8={:.3e} bf16={:.3e} | routed a8={:.3e}",
+                    e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7]
                 );
-                worst_two = worst_two.max(e_two);
-                worst_fold = worst_fold.max(e_fold);
-                worst_pair = worst_pair.max(e_pair);
+                for (w, v) in worst.iter_mut().zip(e) {
+                    *w = w.max(v);
+                }
+                for b in 0..48 {
+                    let cols = b * 128..(b + 1) * 128;
+                    blk_pair.push((rel_in(&fold, &two_path, cols.clone()), b));
+                    blk_shared.push((rel_in(&sa8, &|n| shared_exact[n], cols), b));
+                }
             }
+            let dist = |v: &mut Vec<(f64, usize)>| -> String {
+                v.sort_by(|a, b| a.0.total_cmp(&b.0));
+                let q = |p: f64| v[((v.len() - 1) as f64 * p) as usize].0;
+                let (mx, blk) = *v.last().unwrap();
+                format!(
+                    "min={:.2e} median={:.2e} p90={:.2e} max={:.2e} (block {blk}, max/median={:.2})",
+                    v[0].0,
+                    q(0.5),
+                    q(0.9),
+                    mx,
+                    mx / q(0.5)
+                )
+            };
             eprintln!(
-                "rows={rows} tile64={tile64}: WORST rel_l2 two-path={worst_two:.3e} \
-                 fold={worst_fold:.3e} fold-vs-two-path={worst_pair:.3e}"
+                "rows={rows} tile64={tile64}: WORST vs f64 fold={:.3e} two-path(f64 shared)={:.3e} \
+                 two-path(bf16 shared)={:.3e} | fold vs two-path(bf16)={:.3e} | fold vs \
+                 routed+shared_a8={:.3e} | shared alone a8={:.3e} bf16={:.3e} | routed a8={:.3e}",
+                worst[0], worst[1], worst[2], worst[3], worst[4], worst[5], worst[6], worst[7]
             );
-            assert!(worst_fold < 0.1, "rows={rows}: fold exceeds the A8 screening threshold");
-            assert!(
-                worst_fold <= worst_two * 1.5 + 1e-3,
-                "rows={rows}: the fold is materially less accurate than the two-path shape"
+            eprintln!(
+                "rows={rows} tile64={tile64}: COLUMN BLOCKS (48 x 128 cols x {} rows) fold vs \
+                 two-path(bf16): {}",
+                picks.len(),
+                dist(&mut blk_pair)
             );
+            eprintln!(
+                "rows={rows} tile64={tile64}: COLUMN BLOCKS shared alone a8 vs f64: {}",
+                dist(&mut blk_shared)
+            );
+            // Every check is recorded, none is changed, and none stops the data collection: the
+            // bounds are evaluated once, after every row count has been measured.
+            if worst[0] >= 0.1 {
+                verdicts.push(format!("rows={rows}: fold {:.3e} exceeds the A8 screening threshold", worst[0]));
+            }
+            if worst[0] > worst[1] * 1.5 + 1e-3 {
+                verdicts.push(format!(
+                    "rows={rows}: v1 bound (fold <= 1.5 x two-path with an f64 shared expert) not met: \
+                     {:.3e} > 1.5 x {:.3e}",
+                    worst[0], worst[1]
+                ));
+            }
+            if worst[4] >= 1.5e-2 {
+                verdicts.push(format!("rows={rows}: fold != routed + shared_a8 ({:.3e})", worst[4]));
+            }
         }
+        assert!(verdicts.is_empty(), "{}", verdicts.join("\n"));
     }
 
     fn check_sorted_hsa(resident: bool, part16: bool, tile64: bool) {
