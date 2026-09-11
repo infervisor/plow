@@ -772,6 +772,11 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-vmm-kv", env = "PLOW_VMM_KV", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub vmm_kv: bool,
 
+    /// Map the KV block after a prefill chunk's last row while the chunk drains, so the
+    /// decode that follows never maps on the engine thread (`PLOW_KV_MAP_AHEAD=0` disables).
+    #[arg(long = "amd-kv-map-ahead", env = "PLOW_KV_MAP_AHEAD", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub kv_map_ahead: bool,
+
     /// Share completed MLA prefixes through ROCr VMM (auto on supported gfx942 packets).
     #[arg(long = "amd-shared-prefix", env = "PLOW_AMD_SHARED_PREFIX", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub shared_prefix: Option<bool>,

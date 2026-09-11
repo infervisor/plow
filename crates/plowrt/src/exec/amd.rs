@@ -12285,11 +12285,7 @@ impl AmdEngine {
     /// Upload one chunk's `ids`/`pos`/`kvlen` and patch its bucket program. No
     /// dispatch.
     pub fn prefill_prepare(&mut self, prompt: &[u32], step: ChunkStep) -> Result<()> {
-        let rows = if self.ragged_bucket(step.prog).is_some() {
-            step.clen
-        } else {
-            self.progs[step.prog].t
-        };
+        let rows = self.chunk_rows(step);
         if step.c0 as usize + rows as usize > self.max_ctx {
             return Err(RuntimeError::Rejected(format!(
                 "prefill chunk at {} writes {rows} rows past max_ctx {}",
@@ -12710,6 +12706,50 @@ impl AmdEngine {
         Ok(())
     }
 
+    /// KV rows the chunk's kernels write: the whole bucket, or `clen` on a ragged bucket.
+    fn chunk_rows(&self, step: ChunkStep) -> u32 {
+        if self.ragged_bucket(step.prog).is_some() {
+            step.clen
+        } else {
+            self.progs[step.prog].t
+        }
+    }
+
+    /// Driver mappings `ensure_rows` has made on this rank so far (one `map` call each).
+    pub(crate) fn kv_mappings(&self) -> u64 {
+        let vmm = self.vmm.as_ref().map_or(0, |v| {
+            let s = v.stats();
+            s.blocks_created + s.blocks_reused
+        });
+        vmm + self.shared_prefix.as_ref().map_or(0, |v| v.mappings())
+    }
+
+    /// Map the block holding the row after `step`'s last KV row, if it is not mapped yet.
+    ///
+    /// Called between a chunk's enqueue and its drain: the mapping then overlaps the chunk's
+    /// GPU time instead of running inside the next decode's `decode_prepare`, which ensures
+    /// `frontier + 1` for the same slot in the same tick and would otherwise map the block
+    /// synchronously on the engine thread (~40 ms at TP8 for the 99-block MLA boundary). The
+    /// mapped set is exactly what that decode maps, so the memory budget is unchanged; when the
+    /// next chunk covers the row, it is what its `prefill_prepare` would map. `ensure_rows`
+    /// clamps at `max_ctx`, so the last row of the context maps nothing.
+    ///
+    /// Mapping VA the GPU is not touching while it runs is what the pre-mapper thread already
+    /// does; here it stays on the engine thread. Failures are not fatal here: the decode's
+    /// `vmm_ensure` is the correctness backstop and surfaces the real error.
+    pub fn prefill_map_ahead(&self, step: ChunkStep) {
+        if !crate::config::RuntimeConfig::get().amd.kv_map_ahead {
+            return;
+        }
+        let end = step.c0.saturating_add(self.chunk_rows(step));
+        if end as usize >= self.max_ctx {
+            return;
+        }
+        if let Err(e) = self.vmm_ensure(self.kv_slot, end + 1) {
+            tracing::warn!(error = %e, slot = self.kv_slot, end, "kv map-ahead failed");
+        }
+    }
+
     /// Release slot `seq`'s physical backing, remap its row 0, and CLEAR any
     /// carried recurrent state.
     ///
@@ -13113,8 +13153,15 @@ impl AmdEngine {
             )));
         }
         if self.vmm.is_some() || self.shared_prefix.is_some() {
+            let tick = crate::obs::tick::on().then(|| (std::time::Instant::now(), self.kv_mappings()));
             for (slot, &position) in pos.iter().enumerate() {
                 self.vmm_ensure(slot, position + 1)?;
+            }
+            if let Some((t, maps)) = tick {
+                crate::obs::tick::decode_vmm(
+                    t.elapsed().as_nanos() as u64,
+                    self.kv_mappings() - maps,
+                );
             }
         }
         self.sync_kda_conv_alt(self.kv_slot)?;

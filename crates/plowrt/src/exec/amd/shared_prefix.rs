@@ -377,6 +377,17 @@ impl SharedPrefix {
             .sum()
     }
 
+    /// Private block mappings made by `ensure_rows` so far (one driver map each).
+    pub fn mappings(&self) -> u64 {
+        self.groups
+            .iter()
+            .map(|g| {
+                let s = g.pool.stats();
+                s.blocks_created + s.blocks_reused
+            })
+            .sum()
+    }
+
     pub fn begin_slot(&mut self, slot: usize) -> Result<()> {
         self.pending[slot].clear();
         for group in &self.groups {

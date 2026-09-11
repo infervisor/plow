@@ -893,6 +893,7 @@ checkpoint location, because the weights a bundle needs are the same weights
 | `PLOW_WEIGHT_VMM` (`--weight-vmm`) | unset = CUDA on, AMD off | VMM (reserve+map) weight slab on either vendor; `=0` falls back to one flat allocation, `=1` opts AMD in. One knob for both backends. |
 | `PLOW_SLAB_KEEP` | multi-model on | park evicted models' 256 MiB slab chunks in a per-device pool for the next load; `=0` releases them (`=1` forces on for single-model). |
 | `PLOW_KV_POOL_MIB=N` | 512 | per-engine KV physical-block reuse pool cap (MiB); `0` disables pooling. |
+| `PLOW_KV_MAP_AHEAD=0/1` (`--amd-kv-map-ahead`) | on | **AMD TP** — between a prefill chunk's enqueue and its drain, map the VMM KV block holding the row after the chunk's last written row on every rank (`AmdEngine::prefill_map_ahead`), so the decode that follows the chunk in the same tick finds its `frontier + 1` already mapped instead of mapping 99 blocks x 8 ranks synchronously (~40 ms at rung 20, measured). Maps exactly the set that decode would map — no memory beyond the load plan; a failed map-ahead only warns, the decode's `vmm_ensure` remains the backstop. `0` is the rollback. `PLOW_TICK_LOG=1` prints `dec_vmm`/`dec_maps` per tick and `map_ahead`/`map_ahead_maps` per `PFSEG`. |
 | `PLOW_DRAIN_TIMEOUT_MS=N` | unset (unbounded) | S1 switch drain deadline; past it the victim's live generations are preempted (`Preempted` finish, queued jobs 429). `0` preempts immediately. |
 | `PLOW_PRELOAD` | on | speculative next-model preload after an S1 switch; `=0` disables. |
 | `PLOW_DEVICES=0,1` | all visible | CUDA device ordinals to serve on. Indices into the **visible** set, not the physical one. |
@@ -904,7 +905,7 @@ checkpoint location, because the weights a bundle needs are the same weights
 | `PLOW_TP_AGREE_EVERY=N` | 1 | TP cross-rank agreement interval. `PLOW_TP_NO_AUDIT=1` disables the redundant-rank audit (timing runs); `PLOW_TP_SERIAL_LOAD=1` restores one-at-a-time per-rank load. |
 | `PLOW_LOAD_PROFILE=1` | off | split upload wall time into alloc / stage+DMA profiling. |
 | `PLOW_STEP_TIME=1`, `PLOW_TTFT_LOG=1` | off | per-decode-step host-op timing / TTFT breakdown logging (diagnostics). |
-| `PLOW_TICK_LOG=1` | off | AMD serve: one `TICK` line per mux tick (prefill launches/rows/ms, decode rows/ms, host remainder, idle before), one `PFCHUNK` line per prefill chunk (cursor / rebase / `prefill_chunk` / restore / snapshot / prefix publish ms) and one `PFSEG` line per TP `prefill_chunk` (prepare / rearm / xctr / enqueue / drain / audit ms, cumulative per-rank drain). Diagnostics; stderr. |
+| `PLOW_TICK_LOG=1` | off | AMD serve: one `TICK` line per mux tick (prefill launches/rows/ms, decode rows/ms, host remainder, idle before), one `PFCHUNK` line per prefill chunk (cursor / rebase / `prefill_chunk` / restore / snapshot / prefix publish ms) and one `PFSEG` line per TP `prefill_chunk` (prepare / rearm / xctr / enqueue / map_ahead / drain / audit ms, `prepare_maps` / `map_ahead_maps` VMM block mappings, cumulative per-rank drain); the `TICK` line also carries `dec_vmm` (ms the decode spent mapping KV blocks) and `dec_maps`. Diagnostics; stderr. |
 
 ## Visible devices: `CUDA_VISIBLE_DEVICES`, `ROCR_VISIBLE_DEVICES`, `HIP_VISIBLE_DEVICES`
 

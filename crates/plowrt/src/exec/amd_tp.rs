@@ -1523,6 +1523,8 @@ impl AmdTpGroup {
         use crate::obs::ttft;
         let tick_log = crate::obs::tick::on();
         let (mut prepare_ns, mut rearm_ns) = (0u64, 0u64);
+        let maps = |ranks: &[AmdEngine]| ranks.iter().map(AmdEngine::kv_mappings).sum::<u64>();
+        let maps_before = if tick_log { maps(&self.ranks) } else { 0 };
         for e in &mut self.ranks {
             let t = std::time::Instant::now();
             e.prefill_prepare(prompt, step)?;
@@ -1581,6 +1583,16 @@ impl AmdTpGroup {
             let enqueue_ns = t.elapsed().as_nanos() as u64;
             ttft::PF_ENQUEUE.add(enqueue_ns);
 
+            // The GPU is ~1 s behind the host here: map the next KV block on every rank now,
+            // not in the decode that follows the chunk (`AmdEngine::prefill_map_ahead`).
+            let t = std::time::Instant::now();
+            let maps_prepared = if tick_log { maps(&self.ranks) } else { 0 };
+            for e in &self.ranks {
+                e.prefill_map_ahead(step);
+            }
+            let map_ahead_ns = t.elapsed().as_nanos() as u64;
+            let maps_after = if tick_log { maps(&self.ranks) } else { 0 };
+
             let t = std::time::Instant::now();
             let mut rank_drain_ns = Vec::with_capacity(if tick_log { self.ranks.len() } else { 0 });
             for e in &self.ranks {
@@ -1621,14 +1633,17 @@ impl AmdTpGroup {
                 let ranks: Vec<String> =
                     rank_drain_ns.iter().map(|&d| format!("{:.1}", ms(d))).collect();
                 eprintln!(
-                    "PFSEG bucket={} c0={} clen={} launches={launches} prepare={:.3} rearm={:.3} xctr={:.3} enqueue={:.3} drain={:.3} audit={:.3} rank_drain_cum=[{}]",
+                    "PFSEG bucket={} c0={} clen={} launches={launches} prepare={:.3} prepare_maps={} rearm={:.3} xctr={:.3} enqueue={:.3} map_ahead={:.3} map_ahead_maps={} drain={:.3} audit={:.3} rank_drain_cum=[{}]",
                     self.ranks[0].prog_t(step.prog),
                     step.c0,
                     step.clen,
                     ms(prepare_ns),
+                    maps_prepared - maps_before,
                     ms(rearm_ns),
                     ms(xctr_ns),
                     ms(enqueue_ns),
+                    ms(map_ahead_ns),
+                    maps_after - maps_prepared,
                     ms(ns),
                     ms(t.elapsed().as_nanos() as u64),
                     ranks.join(","),

@@ -20,6 +20,8 @@ thread_local! {
     static PF_ROWS: Cell<u32> = const { Cell::new(0) };
     static DEC_NS: Cell<u64> = const { Cell::new(0) };
     static DEC_ROWS: Cell<u32> = const { Cell::new(0) };
+    static DEC_VMM_NS: Cell<u64> = const { Cell::new(0) };
+    static DEC_MAPS: Cell<u64> = const { Cell::new(0) };
 }
 
 pub struct TickGuard {
@@ -42,6 +44,8 @@ pub fn begin() -> Option<TickGuard> {
     PF_ROWS.with(|c| c.set(0));
     DEC_NS.with(|c| c.set(0));
     DEC_ROWS.with(|c| c.set(0));
+    DEC_VMM_NS.with(|c| c.set(0));
+    DEC_MAPS.with(|c| c.set(0));
     Some(TickGuard { started, idle_ns })
 }
 
@@ -66,6 +70,17 @@ pub fn decode(ns: u64, rows: u32) {
     DEC_ROWS.with(|c| c.set(rows));
 }
 
+/// The decode's synchronous KV block mapping (`vmm_ensure`, all ranks) took `ns` and made
+/// `maps` driver mappings.
+#[inline]
+pub fn decode_vmm(ns: u64, maps: u64) {
+    if !on() {
+        return;
+    }
+    DEC_VMM_NS.with(|c| c.set(c.get() + ns));
+    DEC_MAPS.with(|c| c.set(c.get() + maps));
+}
+
 impl Drop for TickGuard {
     fn drop(&mut self) {
         let end = Instant::now();
@@ -79,13 +94,15 @@ impl Drop for TickGuard {
         let dec_ns = DEC_NS.with(Cell::get);
         let ms = |ns: u64| ns as f64 / 1e6;
         eprintln!(
-            "TICK n={seq} total={:.3} pf_launches={} pf_rows={} pf={:.3} dec_rows={} dec={:.3} other={:.3} idle_before={:.3}",
+            "TICK n={seq} total={:.3} pf_launches={} pf_rows={} pf={:.3} dec_rows={} dec={:.3} dec_vmm={:.3} dec_maps={} other={:.3} idle_before={:.3}",
             ms(total),
             PF_LAUNCHES.with(Cell::get),
             PF_ROWS.with(Cell::get),
             ms(pf_ns),
             DEC_ROWS.with(Cell::get),
             ms(dec_ns),
+            ms(DEC_VMM_NS.with(Cell::get)),
+            DEC_MAPS.with(Cell::get),
             ms(total.saturating_sub(pf_ns + dec_ns)),
             ms(self.idle_ns),
         );

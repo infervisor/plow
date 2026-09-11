@@ -240,6 +240,30 @@ Findings that CHANGE the plan:
 
 **Honest arithmetic**: host shadowing + a 300 GB/s collective + tile64 + the glue and GEMM levers + the slot/tail fixes land the run near 700–980 s, i.e. **71–105 out tok/s**. The 150 tok/s target additionally requires the sparse attention (203 ms) and MoE (164 ms) roughly halved, which means writing two kernels that do not exist for this architecture today.
 
+## KV map-ahead shipped (2026-09-11, `kv-map-ahead.md`)
+
+Lever 4 of the 8192-tick attribution, implemented and on by default. `AmdEngine::prefill_map_ahead`
+makes the decode's own `ensure_rows(end + 1)` call on every rank between a chunk's segment-major
+enqueue and its drain, where the host is ~900 ms ahead of the GPU; the decode that follows the chunk
+then maps nothing. `PLOW_KV_MAP_AHEAD=0` is the rollback. `PLOW_TICK_LOG=1` gained `dec_vmm` /
+`dec_maps` per `TICK` and `prepare_maps` / `map_ahead` / `map_ahead_maps` per `PFSEG` — the numbers
+are in the phase-1 paragraph above and in the report.
+
+Why it needs no budget change: map-ahead maps exactly the block the same tick's decode would map, so
+the peak resident set per slot is unchanged (`ensure_rows` still clamps at `geo.max_ctx`), and the
+run-level identity holds — **276,480 driver mappings in both arms**. At the cap it refuses rather
+than exceeds: a failed map-ahead only warns, leaves the frontier where the chunk put it, and the
+decode's `vmm_ensure` retries as the backstop (unit test
+`refused_map_ahead_holds_the_budget_and_the_decode_finishes_it`, plus boundary / mid-block / max_ctx
+cases in `memory::vmm`).
+
+Scope and open items: only the segment-major TP prefill path maps ahead — single-GPU
+`AmdEngine::prefill_chunk`, the `PLOW_PREFILL_SEG_TIMING` diagnostic path and `prefill_packed_chunk`
+(per-span frontiers) keep the old behaviour. The chunk still pays its own 26 ms / 624-map
+`prefill_prepare` boundary cost, which could move into the PREVIOUS chunk's shadow the same way.
+Decode-only ticks read +4.6 ms in the changed arm's tick phase (n=46) although the change does no
+work there; the bench's median ITL moved +0.4 %, so this reads as arm-order drift rather than a cost.
+
 ## Knob organization (2026-09-11)
 
 Inventory: 138 runtime knobs (`RuntimeConfig` 33 shared / NVIDIA 34 / AMD 48 / Apple 14 / CPU 9)

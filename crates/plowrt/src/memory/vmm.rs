@@ -2984,6 +2984,82 @@ mod tests {
         }
     }
 
+    /// The engine's map-ahead is `ensure_rows(end + 1)` between a chunk's enqueue and drain,
+    /// where `end` is the chunk's last written row. On a block boundary that maps one block per
+    /// track — the block the following decode's `ensure_rows(frontier + 1)` would map — and the
+    /// decode then makes no driver call. `uniform_pool`: 4 tracks (2 layers x K/V), block_rows 8,
+    /// max_ctx 32.
+    #[test]
+    fn map_ahead_at_a_block_boundary_maps_the_next_block_once() {
+        let ops = Arc::new(MockVmm::default());
+        let p = uniform_pool(ops.clone());
+        p.ensure_rows(0, 8).unwrap(); // the chunk: rows [0, 8)
+        assert_eq!(ops.creates.load(Ordering::SeqCst), 4);
+        assert_eq!(p.mapped_rows(0), 8);
+
+        p.ensure_rows(0, 9).unwrap(); // map-ahead under the drain
+        assert_eq!(ops.creates.load(Ordering::SeqCst), 8);
+        assert_eq!(ops.maps.load(Ordering::SeqCst), 8);
+        assert_eq!(p.mapped_rows(0), 16);
+        assert_eq!(p.stats().blocks_live, 8, "exactly one block per track ahead of the chunk");
+
+        // The same tick's decode, then the next chunk's prefill_prepare: both free.
+        p.ensure_rows(0, 9).unwrap();
+        p.ensure_rows(0, 16).unwrap();
+        assert_eq!(ops.creates.load(Ordering::SeqCst), 8);
+        assert_eq!(ops.maps.load(Ordering::SeqCst), 8);
+    }
+
+    #[test]
+    fn map_ahead_mid_block_and_at_max_ctx_maps_nothing() {
+        let ops = Arc::new(MockVmm::default());
+        let p = uniform_pool(ops.clone());
+        p.ensure_rows(0, 5).unwrap();
+        p.ensure_rows(0, 6).unwrap();
+        assert_eq!(ops.creates.load(Ordering::SeqCst), 4);
+        assert_eq!(p.mapped_rows(0), 8);
+
+        p.ensure_rows(0, 32).unwrap();
+        assert_eq!(ops.creates.load(Ordering::SeqCst), 16);
+        p.ensure_rows(0, 33).unwrap(); // clamped: nothing past the reservation
+        assert_eq!(ops.creates.load(Ordering::SeqCst), 16);
+        assert_eq!(ops.maps.load(Ordering::SeqCst), 16);
+        assert_eq!(p.mapped_rows(0), 32);
+    }
+
+    /// A refused map-ahead leaves the slot at its budget (no block beyond the frontier held)
+    /// and the decode's backstop `ensure_rows` completes the block without over-mapping.
+    #[test]
+    fn refused_map_ahead_holds_the_budget_and_the_decode_finishes_it() {
+        let ops = Arc::new(MockVmm::default());
+        let mut p = uniform_pool(ops.clone());
+        p.enable_block_recycling(64 * 8);
+        p.ensure_rows(0, 8).unwrap();
+        ops.fail_creates.store(1, Ordering::SeqCst);
+        assert!(p.ensure_rows(0, 9).is_err());
+        assert_eq!(p.mapped_rows(0), 8);
+        assert_eq!(p.stats().blocks_live, 4);
+        assert_eq!(
+            ops.creates.load(Ordering::SeqCst) - ops.releases.load(Ordering::SeqCst),
+            4,
+            "no physical block is held beyond the chunk's rows"
+        );
+
+        p.ensure_rows(0, 9).unwrap();
+        assert_eq!(p.mapped_rows(0), 16);
+        assert_eq!(p.stats().blocks_live, 8);
+        assert_eq!(ops.creates.load(Ordering::SeqCst), 8);
+
+        // A retired slot's blocks recycle into the next slot's map-ahead: no driver create.
+        p.begin_seq(0);
+        assert_eq!(p.stats().blocks_pooled, 8);
+        p.ensure_rows(1, 8).unwrap();
+        p.ensure_rows(1, 9).unwrap();
+        assert_eq!(ops.creates.load(Ordering::SeqCst), 8);
+        assert_eq!(p.stats().blocks_reused, 8);
+        assert_eq!(p.stats().blocks_pooled, 0);
+    }
+
     #[test]
     fn attach_shares_blocks_without_new_creates() {
         let ops = Arc::new(MockVmm::default());
