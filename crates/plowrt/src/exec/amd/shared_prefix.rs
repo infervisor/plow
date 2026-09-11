@@ -486,7 +486,12 @@ impl SharedPrefix {
                 copy(tensor, 0, rows);
             }
         }
-        self.ops.copy_dtod_batch(&pairs)
+        let tick = (to_snapshot && crate::obs::tick::on()).then(std::time::Instant::now);
+        let copied = self.ops.copy_dtod_batch(&pairs);
+        if let Some(t) = tick {
+            crate::obs::tick::publish_fill(t.elapsed().as_nanos() as u64);
+        }
+        copied
     }
 
     pub fn commit_attach(&mut self, slot: usize, rows: u32) -> Result<()> {

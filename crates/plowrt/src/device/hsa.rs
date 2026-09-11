@@ -388,6 +388,7 @@ hsa_fns! {
     hsa_signal_store_screlease: unsafe extern "C" fn(HsaSignal, i64),
     hsa_signal_wait_scacquire: unsafe extern "C" fn(HsaSignal, u32, i64, u64, u32) -> i64,
     hsa_signal_add_screlease: unsafe extern "C" fn(HsaSignal, i64),
+    hsa_signal_load_scacquire: unsafe extern "C" fn(HsaSignal) -> i64,
     hsa_code_object_reader_create_from_memory: unsafe extern "C" fn(*const c_void, usize, *mut HsaCodeObjectReader) -> HsaStatus,
     hsa_code_object_reader_destroy: unsafe extern "C" fn(HsaCodeObjectReader) -> HsaStatus,
     hsa_executable_create_alt: unsafe extern "C" fn(u32, u32, *const c_void, *mut HsaExecutable) -> HsaStatus,
@@ -454,6 +455,7 @@ impl HsaDriver {
             hsa_signal_store_screlease: resolve!(lib, b"hsa_signal_store_screlease\0"),
             hsa_signal_wait_scacquire: resolve!(lib, b"hsa_signal_wait_scacquire\0"),
             hsa_signal_add_screlease: resolve!(lib, b"hsa_signal_add_screlease\0"),
+            hsa_signal_load_scacquire: resolve!(lib, b"hsa_signal_load_scacquire\0"),
             hsa_code_object_reader_create_from_memory: resolve!(
                 lib,
                 b"hsa_code_object_reader_create_from_memory\0"
@@ -2671,6 +2673,12 @@ impl HsaBackend {
     /// orders packets but the AQL read index does not prove kernel completion.
     pub fn stream_synchronize(&self, _stream: &HsaStream) -> Result<()> {
         self.synchronize()
+    }
+
+    /// Dispatches published on this queue that have not completed: the counting signal
+    /// [`Self::synchronize`] waits on. A diagnostic read; it never waits.
+    pub fn in_flight(&self) -> i64 {
+        unsafe { (self.shared.drv.hsa_signal_load_scacquire)(self.done_signal) }
     }
 
     /// Drain the queue (device-wide; there is one queue).

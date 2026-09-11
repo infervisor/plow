@@ -347,6 +347,7 @@ pub struct AmdTpGroup {
     audit: bool,
     audit_direct: bool,
     audit_compact: bool,
+    prefill_audit_direct: bool,
     index_tp_status: bool,
     /// Read EVERY rank's sampled id, rather than just rank 0's, once every this
     /// many decode tokens — see [`AmdTpGroup::audit_cadence`].
@@ -668,6 +669,7 @@ impl AmdTpGroup {
             gate_expect,
             audit: !crate::config::RuntimeConfig::get().amd.tp_no_audit,
             audit_direct: crate::config::RuntimeConfig::get().amd.tp_audit_direct,
+            prefill_audit_direct: crate::config::RuntimeConfig::get().amd.tp_prefill_audit_direct,
             audit_compact,
             index_tp_status,
             agree_every,
@@ -971,6 +973,7 @@ impl AmdTpGroup {
         if let Some(z) = launched_at {
             dstep::ENQUEUE.add(z.elapsed().as_nanos() as u64);
         }
+        let in_flight_enqueued = crate::obs::tick::on().then(|| self.ranks[0].in_flight());
         // Do not put this work inside the launch closure: every rank must be
         // resident before ~1.5 ms of TP8 counter clears can begin. These are
         // rank-local inactive banks, not peer-visible xctr; xctr remains the
@@ -979,6 +982,9 @@ impl AmdTpGroup {
             for e in &self.ranks {
                 dstep::timed(&dstep::REARM, || e.tp_rearm_inactive_counter_bank(dp))?;
             }
+        }
+        if let Some(enqueued) = in_flight_enqueued {
+            crate::obs::tick::decode_in_flight(enqueued, self.ranks[0].in_flight(), n_segments as u32);
         }
         Ok(())
     }
@@ -1125,8 +1131,8 @@ impl AmdTpGroup {
             "TP prefill plan"
         );
 
-        for step in steps {
-            self.prefill_chunk(prompt, step)?;
+        for (i, &step) in steps.iter().enumerate() {
+            self.prefill_chunk(prompt, step, steps.get(i + 1).copied())?;
         }
 
         let t_read = std::time::Instant::now();
@@ -1449,8 +1455,8 @@ impl AmdTpGroup {
         }
         let chunks = self.ranks[0].plan_for(to - from)?;
         let steps = self.ranks[0].chunk_steps_from(&chunks, from, to)?;
-        for step in steps {
-            self.prefill_chunk(prompt, step)?;
+        for (i, &step) in steps.iter().enumerate() {
+            self.prefill_chunk(prompt, step, steps.get(i + 1).copied())?;
         }
         Ok(())
     }
@@ -1528,12 +1534,23 @@ impl AmdTpGroup {
     /// every rank and drained once. A server that wants to overlap prefill with
     /// other work overlaps whole CHUNKS, which is the granularity chunked
     /// prefill already schedules at.
-    pub fn prefill_chunk(&mut self, prompt: &[u32], step: ChunkStep) -> Result<()> {
+    ///
+    /// `next` is the same prompt's following chunk, if the plan has one; see
+    /// [`AmdEngine::prefill_map_ahead`].
+    pub fn prefill_chunk(
+        &mut self,
+        prompt: &[u32],
+        step: ChunkStep,
+        next: Option<ChunkStep>,
+    ) -> Result<()> {
         use crate::obs::ttft;
         let tick_log = crate::obs::tick::on();
         let (mut prepare_ns, mut rearm_ns) = (0u64, 0u64);
         let maps = |ranks: &[AmdEngine]| ranks.iter().map(AmdEngine::kv_mappings).sum::<u64>();
         let maps_before = if tick_log { maps(&self.ranks) } else { 0 };
+        if tick_log {
+            crate::obs::tick::take_prepare();
+        }
         for e in &mut self.ranks {
             let t = std::time::Instant::now();
             e.prefill_prepare(prompt, step)?;
@@ -1597,7 +1614,7 @@ impl AmdTpGroup {
             let t = std::time::Instant::now();
             let maps_prepared = if tick_log { maps(&self.ranks) } else { 0 };
             for e in &self.ranks {
-                e.prefill_map_ahead(step);
+                e.prefill_map_ahead(step, next);
             }
             let map_ahead_ns = t.elapsed().as_nanos() as u64;
             let maps_after = if tick_log { maps(&self.ranks) } else { 0 };
@@ -1634,20 +1651,21 @@ impl AmdTpGroup {
             if self.index_tp_status {
                 self.group.audit_xstatus_direct()?;
             }
-            if self.audit {
-                self.group.audit_xctr(&self.gate_expect[step.prog])?;
-            }
+            self.audit_prefill_counters(step.prog)?;
             if tick_log {
+                let (prep_vmm, prep_patch) = crate::obs::tick::take_prepare();
                 let ms = |ns: u64| ns as f64 / 1e6;
                 let ranks: Vec<String> =
                     rank_drain_ns.iter().map(|&d| format!("{:.1}", ms(d))).collect();
                 eprintln!(
-                    "PFSEG bucket={} c0={} clen={} launches={launches} prepare={:.3} prepare_maps={} rearm={:.3} xctr={:.3} enqueue={:.3} map_ahead={:.3} map_ahead_maps={} drain={:.3} audit={:.3} rank_drain_cum=[{}]",
+                    "PFSEG bucket={} c0={} clen={} launches={launches} prepare={:.3} prepare_maps={} prepare_vmm={:.3} prepare_patch={:.3} rearm={:.3} xctr={:.3} enqueue={:.3} map_ahead={:.3} map_ahead_maps={} drain={:.3} audit={:.3} rank_drain_cum=[{}]",
                     self.ranks[0].prog_t(step.prog),
                     step.c0,
                     step.clen,
                     ms(prepare_ns),
                     maps_prepared - maps_before,
+                    ms(prep_vmm),
+                    ms(prep_patch),
                     ms(rearm_ns),
                     ms(xctr_ns),
                     ms(enqueue_ns),
@@ -1743,10 +1761,26 @@ impl AmdTpGroup {
         if self.index_tp_status {
             self.group.audit_xstatus_direct()?;
         }
-        if self.audit {
-            self.group.audit_xctr(&self.gate_expect[step.prog])?;
-        }
+        self.audit_prefill_counters(step.prog)?;
         Ok(())
+    }
+
+    /// The exact counter audit after a prefill dispatch has drained on every rank.
+    ///
+    /// With `--amd-tp-prefill-audit-direct` the same gates are compared against the same
+    /// expectations through host loads of the large-BAR mapping, the transport the compact
+    /// decode audit already reads its status word through, instead of one D2H copy per rank.
+    /// It cannot move later or be sampled: the next dispatch's `zero_xctr` erases the
+    /// counters, and a collective that timed out corrupts KV every later row reads.
+    fn audit_prefill_counters(&self, prog: usize) -> Result<()> {
+        if !self.audit {
+            return Ok(());
+        }
+        if self.prefill_audit_direct {
+            self.group.audit_xctr_direct(&self.gate_expect[prog])
+        } else {
+            self.group.audit_xctr(&self.gate_expect[prog])
+        }
     }
 
     /// Execute one packed prefill chunk as an all-rank transaction. No rank launches until all

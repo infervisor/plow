@@ -443,10 +443,11 @@ mod amd_serve {
             &mut self,
             prompt: &[u32],
             step: crate::exec::amd::ChunkStep,
+            next: Option<crate::exec::amd::ChunkStep>,
         ) -> Result<()> {
             match self {
                 Self::One(e) => e.prefill_chunk(prompt, step),
-                Self::Tp(g) => g.prefill_chunk(prompt, step),
+                Self::Tp(g) => g.prefill_chunk(prompt, step, next),
             }
         }
 
@@ -1655,7 +1656,7 @@ mod amd_serve {
             g.kv_rebase_all(slot)?;
             let rebase_ns = t.elapsed().as_nanos() as u64;
             let t = std::time::Instant::now();
-            let r = g.prefill_chunk(prompt, step);
+            let r = g.prefill_chunk(prompt, step, cur.steps.get(cur.next + 1).copied());
             let chunk_ns = t.elapsed().as_nanos() as u64;
             let t = std::time::Instant::now();
             let restore = g.kv_rebase_all(0);
@@ -1671,6 +1672,9 @@ mod amd_serve {
             let snap_ns = t.elapsed().as_nanos() as u64;
             cur.next += 1;
             cur.frontier = step.c0 + step.clen;
+            if tick_log {
+                crate::obs::tick::take_publish_fill();
+            }
             let t_publish = std::time::Instant::now();
             // Publishing is a cache-side favour to LATER requests; this prompt's KV is already
             // correct. A snapshot OOM after eviction, a radix hash collision or a rejected
@@ -1687,7 +1691,7 @@ mod amd_serve {
             if tick_log {
                 let ms = |ns: u64| ns as f64 / 1e6;
                 eprintln!(
-                    "PFCHUNK slot={slot} c0={} clen={} bucket={} last={last} total={:.3} cursor={:.3} rebase={:.3} chunk={:.3} restore={:.3} snap={:.3} publish={:.3}",
+                    "PFCHUNK slot={slot} c0={} clen={} bucket={} last={last} total={:.3} cursor={:.3} rebase={:.3} chunk={:.3} restore={:.3} snap={:.3} publish={:.3} publish_fill={:.3}",
                     step.c0,
                     step.clen,
                     g.rank0().prog_t(step.prog),
@@ -1698,6 +1702,7 @@ mod amd_serve {
                     ms(restore_ns),
                     ms(snap_ns),
                     ms(publish_ns),
+                    ms(crate::obs::tick::take_publish_fill()),
                 );
             }
             if !last {
