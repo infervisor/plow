@@ -34,6 +34,7 @@ use crate::{Result, RuntimeError};
 mod object;
 mod packed;
 mod segment;
+mod mla_prefill;
 pub(super) use object::elf_symbol_names;
 use object::{
     build_requires, check_attn_res_f32mix_symbols, check_compiled_opcode_marker_set,
@@ -2918,7 +2919,7 @@ const MAX_SEG: u32 = u16::MAX as u32 + 1;
 /// decomposition (`t >= 2048`: 256+ items over 304 CUs). Smaller buckets keep the 8-wave
 /// kernel, whose BQ=32 fills at half the tokens.
 pub fn derive_segments(prog: &DevProg) -> Result<Vec<u8>> {
-    derive_segments_for(prog, mla_pf_v2_enabled() && prog.t >= 2048)
+    derive_segments_for(prog, mla_pf_v2_enabled())
 }
 
 fn derive_segments_for(prog: &DevProg, v2: bool) -> Result<Vec<u8>> {
@@ -2980,6 +2981,8 @@ fn derive_segments_for(prog: &DevProg, v2: bool) -> Result<Vec<u8>> {
             // fallback kernel writes the nsplit=1 layout — so the env/routing mismatches
             // that DEGRADE for plain V2 blobs must REFUSE here instead of corrupting.
             let d = &prog.insts[e.inst as usize];
+            let small_split = op == DevOp::FlashMlaPrefillFp8 as u16 && d.fj[2] != 0;
+            mla_pure[seg] &= prog.t >= 2048 || small_split;
             mla_nope[seg] |= d.i[3] & 0x8000_0000 != 0;
             // DEFERRED to after the class pass, and that is the whole point. This used to
             // refuse on `!v2` -- the ENV -- which misses the case that actually corrupts:
@@ -2993,9 +2996,9 @@ fn derive_segments_for(prog: &DevProg, v2: bool) -> Result<Vec<u8>> {
             if (op == DevOp::FlashMlaPrefill as u16
                 && d.i[6] > 1
                 && d.t[7] == packet::dev::TENSOR_NONE16)
-                || sparse_fp8(d)
+                || sparse_fp8(d) || small_split
             {
-                needs_v2.push((e.seg as usize, d.i[6]));
+                needs_v2.push((e.seg as usize, if small_split { d.fj[2] } else { d.i[6] }));
             }
             mla_any[e.seg as usize] = true;
         } else {
@@ -5205,6 +5208,9 @@ struct AmdProg {
     d_seg_ofs: DeviceMem,
     /// `[n_seg]` wave classes.
     seg_class: Vec<u8>,
+    small_mla_segment: Vec<bool>,
+    small_mla_split_segments: Vec<bool>,
+    small_mla_split_sites: Vec<mla_prefill::SplitSite>,
     /// Ordered decode route for each segment. Raw KDA entries carry fully resolved rank-local
     /// kernargs, so the hot launch path performs no descriptor parsing or allocation.
     decode_routes: Vec<DecodeSegmentRoute>,
@@ -5375,6 +5381,8 @@ pub struct AmdEngine {
     /// Task-13: low-rung decode tier ladder, ascending (max_rung, kernel).
     decode_tiers: Vec<(u32, HsaKernel)>,
     k_flash: Option<HsaKernel>,
+    k_mla_small: Option<HsaKernel>,
+    k_mla_split: Option<HsaKernel>,
     /// Dedicated scratch-free gfx950 V2+SV interpreter for pure bf16 MLA-flash segments.
     k_mla_v2_sv_raw: Option<HsaKernel>,
     k_packed_mla_norm: Option<HsaKernel>,
@@ -6642,6 +6650,34 @@ impl AmdEngine {
             tracing::info!(%e, "no flash object — flash segments run on the 8-wave interpreter");
         }
         drop(load_one_in);
+
+        let mut need_mla_small = false;
+        if arch == "gfx942" && mla_pf_v2_enabled() {
+            for p in &blob.progs[..dec_ix] {
+                let segments = derive_segments(p)?.len();
+                need_mla_small |= segment::small_mla_segments(p, segments).into_iter().any(|pure| pure);
+            }
+        }
+        let k_mla_small = if need_mla_small {
+            Some(segment::load_small_mla(
+                &be, hsaco_dir, blob_path, &arch, sched_prefill,
+                variant == Variant::Fp8Kv, false, &mut modules,
+            )?)
+        } else {
+            None
+        };
+
+        let mut need_mla_split = false;
+        for p in &blob.progs[..dec_ix] {
+            need_mla_split |= !mla_prefill::split_sites(p, &blob.tensors)?.0.is_empty();
+        }
+        let k_mla_split = if need_mla_split {
+            Some(segment::load_small_mla(
+                &be, hsaco_dir, blob_path, &arch, sched_prefill, true, true, &mut modules,
+            )?)
+        } else {
+            None
+        };
 
         let k_decode_mla = if need_decode_mla_segments {
             const MARKER: &str = "plow_decode_mla_segment_object_1";
@@ -8584,6 +8620,9 @@ impl AmdEngine {
         let mut progs = Vec::with_capacity(blob.progs.len());
         for (prog_ix, p) in blob.progs.iter().enumerate() {
             let seg_class = derive_segments(p)?;
+            let small_mla_segment = segment::small_mla_segments(p, seg_class.len());
+            let (small_mla_split_sites, small_mla_split_segments) =
+                mla_prefill::split_sites(p, &blob.tensors)?;
             let decode_routes = if prog_ix >= dec_ix {
                 decode_segment_routes(p, &blob.tensors, &blob.init, &devp)?
             } else {
@@ -8910,6 +8949,9 @@ impl AmdEngine {
                 d_ctr,
                 d_seg_ofs,
                 seg_class,
+                small_mla_segment,
+                small_mla_split_sites,
+                small_mla_split_segments,
                 packed_seg_family,
                 raw_mla_v2_segment,
                 gq,
@@ -9432,6 +9474,8 @@ impl AmdEngine {
             d_token_ring,
             decode_tiers,
             k_flash,
+            k_mla_small,
+            k_mla_split,
             k_mla_v2_sv_raw,
             k_packed_mla_norm,
             k_packed_mla_flash,
@@ -11349,6 +11393,7 @@ impl AmdEngine {
         } else {
             self.progs[prog].t
         };
+        mla_prefill::rebase(&self.progs[prog].small_mla_split_sites, insts, c0 + rows)?;
         for route in &mut self.progs[prog].prefill_routes {
             if let PrefillSegmentRoute::SparseMla(route) = route {
                 route.rebase(rows, c0)?;

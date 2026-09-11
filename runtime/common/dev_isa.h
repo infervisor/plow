@@ -956,7 +956,8 @@ enum {
      * and i6=capacity. Both sparse forms retain BF16 rope and t7=latent scales.
      * See d_flash_mla_decode<...,FP8=true> in op_attention.h. */
     PLOW_DOP_FLASH_MLA_DECODE_FP8 = 109,
-    PLOW_DOP_FLASH_MLA_PREFILL_FP8 = 110, /* same operands; i4 = n_tok (PLOW_MLA_PREFILL) */
+    PLOW_DOP_FLASH_MLA_PREFILL_FP8 = 110, /* i4=n_tok; dense fj2>1=small-rung split capacity,
+                                          requires the dedicated split object and matching merge */
     /* KDA short conv over all three streams in ONE packet — op 88 merged along its CHANNEL axis.
      *
      * The three convs are independent, which is why they were three packets; at batch 1 that

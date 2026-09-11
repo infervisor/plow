@@ -80,12 +80,12 @@ pub(super) fn routes(
             || !(if flat {
                 matches!(prog.t, 2 | 4 | 8) || (resident && matches!(prog.t, 1 | 16 | 20))
             } else {
-                (128..=8192).contains(&prog.t)
+                (1..=8192).contains(&prog.t)
             })
             || inst.i != geometry
             || inst.fj != [0; 3]
         {
-            return Err(err("requires H6144/I256/E256/top8; sorted prefill rows128..8192 or flat decode rows2/4/8 (resident:1/2/4/8/16/20)"));
+            return Err(err("requires H6144/I256/E256/top8; sorted prefill rows1..8192 or flat decode rows2/4/8 (resident:1/2/4/8/16/20)"));
         }
         if flat {
             let router = prog.insts[..ix]
@@ -692,6 +692,20 @@ fn flat_moe_args(
 mod tests {
     use super::*;
     use packet::dev::StreamEnt;
+
+    #[test]
+    fn sorted_prefill_routes_cover_the_full_append_ladder() {
+        for rows in [1,2,4,8,16,20,32,64,128,256,512,1024,2048,4096,8192] {
+            let (mut prog, tensors) = fixture();
+            prog.t = rows;
+            prog.insts[0].i[0] = rows;
+            prog.insts[1].i[0] = rows;
+            let mut route = routes(&prog, &tensors, 2).unwrap()[1].unwrap();
+            route.rebase(1).unwrap();
+            route.rebase(rows).unwrap();
+            assert!(route.rebase(rows + 1).is_err());
+        }
+    }
 
     fn fixture() -> (DevProg, Vec<DevTensor>) {
         let align = DevInst64 {

@@ -374,8 +374,9 @@ pub struct Builder {
     tr_dropped: usize,
 }
 
-fn mla_v2_segment(op: u16, n_tok: u32) -> bool {
-    n_tok >= 2048 && (op == DevOp::FlashMlaPrefill as u16 || op == DevOp::FlashMlaPrefillFp8 as u16)
+fn mla_prefill_segment_class(op: u16, n_tok: u32) -> Option<u8> {
+    (op == DevOp::FlashMlaPrefill as u16 || op == DevOp::FlashMlaPrefillFp8 as u16)
+        .then_some(if n_tok >= 2048 { 4 } else { 26 })
 }
 
 // Experimental packed-prefill segment classes. These values describe an operator
@@ -1928,25 +1929,21 @@ impl Builder {
         // not be given one because a variable said so. See that method for the failure it prevents.
         let uniseg = !self.uniseg_denied
             && (self.uniseg_forced || std::env::var("PLOW_UNISEG").ok().as_deref() == Some("1"));
-        // AMD L2-placed packets split FlashMlaPrefill (bf16, op 51) and its fp8-KV twin
-        // (op 110) into their own wave-class-4
-        // segments at T>=2048 so the AMD host can route them to the 4-wave flash object's V2
-        // kernel (d_flash_mla_prefill_v2). Smaller buckets remain one 8-wave L2-placed launch.
-        // Emit-time, because segments only form on wave_class
-        // BOUNDARIES: reclassifying host-side would drag whatever ops share the segment onto
-        // an object that silently skips them. PLOW_MLA_PF_V2=0 is the explicit opt-out; non-AMD
-        // packets remain byte-identical. The host applies
-        // its own purity + size guards (exec/amd.rs derive_segments), so an env mismatch in
-        // either direction degrades to the 8-wave kernel rather than corrupting.
+        // Isolate MLA at every query rung: a small chunk can still have a long KV cache.
+        // Class 26 separates small MLA from GEMM. The host selects four-wave split
+        // or eight-wave unsplit objects from the instruction's validated layout.
+        let split_mla = self.ops.iter().any(|op| {
+            op.inst.op == DevOp::FlashMlaPrefillFp8 as u16 && op.inst.j[1] != 0
+        });
         let mla_v2 = !uniseg
-            && match std::env::var("PLOW_MLA_PF_V2").ok().as_deref() {
+            && (split_mla || match std::env::var("PLOW_MLA_PF_V2").ok().as_deref() {
                 Some("0") => false,
                 Some("1") => true,
                 // A placed packet is an AMD production artifact. Isolating a pure MLA flash
                 // segment is safe even when its optional lean object is absent: the host then
                 // runs that ordered segment on the ordinary 8-wave interpreter.
                 _ => self.place_l2.is_some(),
-            };
+            });
         let mla_aiter = mla_v2 && std::env::var("PLOW_MLA_PF_AITER").ok().as_deref() == Some("1");
         // Opt-in only: live packed serving remains disabled. Giving descriptor-consuming
         // families distinct classes lets a future runtime route them to lean objects without
@@ -2177,8 +2174,8 @@ impl Builder {
                 } else {
                     4
                 }
-            } else if mla_v2 && mla_v2_segment(op, self.ops[i].inst.i[4]) {
-                4
+            } else if mla_v2 && mla_prefill_segment_class(op, self.ops[i].inst.i[4]).is_some() {
+                mla_prefill_segment_class(op, self.ops[i].inst.i[4]).unwrap()
             } else if seg_v2
                 && pure_gemm // pure_gemm implies a prefill program — decode stays unsegmented
                 && fa512_mode == 2
@@ -4465,12 +4462,16 @@ mod seg_window_tests {
     use super::*;
 
     #[test]
-    fn mla_v2_segments_only_machine_filling_prefill_buckets() {
-        assert!(!mla_v2_segment(DevOp::FlashMlaPrefill as u16, 1024));
-        assert!(!mla_v2_segment(DevOp::FlashMlaPrefillFp8 as u16, 1024));
-        assert!(mla_v2_segment(DevOp::FlashMlaPrefill as u16, 2048));
-        assert!(mla_v2_segment(DevOp::FlashMlaPrefillFp8 as u16, 2048));
-        assert!(!mla_v2_segment(DevOp::Gemv as u16, 8192));
+    fn mla_prefill_is_isolated_at_every_query_rung() {
+        for op in [DevOp::FlashMlaPrefill, DevOp::FlashMlaPrefillFp8] {
+            for rows in [1, 4, 8, 16, 20, 128, 512, 1024] {
+                assert_eq!(mla_prefill_segment_class(op as u16, rows), Some(26));
+            }
+            for rows in [2048, 8192] {
+                assert_eq!(mla_prefill_segment_class(op as u16, rows), Some(4));
+            }
+        }
+        assert_eq!(mla_prefill_segment_class(DevOp::Gemv as u16, 8192), None);
     }
 
     #[test]

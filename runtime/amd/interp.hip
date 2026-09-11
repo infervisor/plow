@@ -407,7 +407,7 @@ typedef struct {
     uint32_t batch;
 } PlowTokenCaptureArgs;
 
-#if !defined(PLOW_BUCKET_FLASH)
+#if !defined(PLOW_BUCKET_FLASH) && !defined(PLOW_BUCKET_MLA_PREFILL_SMALL)
 /* PLOW_DOP_XREDUCE_ADD_NORM (116): fused TP all-reduce + residual + RMSNorm, one
  * workgroup. Same rendezvous as d_xreduce_mega; then d_add_norm's math with the `b`
  * load replaced by the peer reduction, ROUNDED TO BF16 FIRST so the fold is
@@ -810,7 +810,7 @@ extern "C" __device__ unsigned plow_dsa_idx_row_arm = 1;
 /* The mixed object's small default tile does not bound the other GEMM opcodes. */
 #define PLOW_GM_ARENA GM_LDS_HALVES_T(GM_C5_BM, GM_C5_BN, GM_C5_BK)
 extern "C" __device__ unsigned plow_mixed_glu_lds_halves = PLOW_GM_ARENA;
-#elif defined(PLOW_BUCKET_MLA_V2_RAW)
+#elif defined(PLOW_BUCKET_MLA_V2_RAW) || defined(PLOW_BUCKET_MLA_PREFILL_SMALL)
 /* The raw MLA object dispatches no GEMM. Keeping the production GEMM tile in its union
  * wastes 89 KiB of LDS and obscures the object's actual V2 resource contract. */
 #define PLOW_GM_ARENA 1
@@ -2720,7 +2720,33 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
 #define PLOW_RUNTIME_DECODE_ROWS 0u
 #endif
     const unsigned nblk = in->blocks;
-#if defined(PLOW_BUCKET_FLASH)
+#if defined(PLOW_BUCKET_MLA_PREFILL_SPLIT)
+    static_assert(PLOW_WAVES == 4, "split MLA prefill requires four waves");
+    static_assert(FA_MLA_PF2_LDS_BYTES(512, 64) <= sizeof(((plow_smem*)nullptr)->fa),
+                  "split MLA prefill exceeds the flash arena");
+    if (in->op != PLOW_DOP_FLASH_MLA_PREFILL_FP8 || in->i[0] != 1 || in->i[1] != 8 ||
+        in->i[3] != 0 || in->i[5] != 0xffffffffu || in->i[6] != 0 ||
+        in->fj[1].u != 0 || in->fj[2].u > 32 || in->t[7] == PLOW_TENSOR_NONE)
+        __builtin_trap();
+#define TEN(k) T[in->t[k]]
+    d_flash_mla_prefill_v2<512, 64, /*GATHER=*/false, /*FP8=*/true>(
+        (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
+        (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), 1,
+        in->i[4], 8, in->i[2], 0, in->fj[0].f, in->i[5], slice, nblk,
+        sm->fa, nullptr, 0u, in->fj[2].u, false, (const float*)TEN(7), 0);
+#undef TEN
+#elif defined(PLOW_BUCKET_MLA_PREFILL_SMALL)
+    static_assert(PLOW_WAVES == 8, "small MLA prefill requires eight waves");
+#if PLOW_FP8_KV
+    if (in->op == PLOW_DOP_FLASH_MLA_PREFILL_FP8)
+        exec_flash_mla_prefill_fp8(in, T, slice, nblk, sm->fmpf, prog_meta);
+#else
+    if (in->op == PLOW_DOP_FLASH_MLA_PREFILL)
+        exec_flash_mla_prefill(in, T, slice, nblk, sm->fmpf, prog_meta);
+#endif
+    else
+        __builtin_trap();
+#elif defined(PLOW_BUCKET_FLASH)
     /* Flash-ONLY object (segmented dispatch): this launch runs only the class-4 flash_prefill
      * segment; every other op is a class-8 segment on the 8-wave interpreter and is skipped by the
      * seg filter. Compiling ONLY flash frees it from the GEMM's 256 AGPRs, giving flash the full
@@ -5220,6 +5246,12 @@ __device__ __forceinline__ void ctr_signal(uint32_t* p) {
 #define PLOW_INTERP_BASE PLOW_GQ_CAT(plow_interp_packed_kda_, PLOW_ARCH_SUFFIX)
 #elif defined(PLOW_BUCKET_XREDUCE)
 #define PLOW_INTERP_BASE PLOW_GQ_CAT(plow_interp_xreduce_, PLOW_ARCH_SUFFIX)
+#elif defined(PLOW_BUCKET_MLA_PREFILL_SMALL)
+#define PLOW_INTERP_BASE PLOW_GQ_CAT(plow_interp_mla_small_, PLOW_ARCH_SUFFIX)
+extern "C" __device__ unsigned plow_mla_prefill_small_1 = 1;
+#elif defined(PLOW_BUCKET_MLA_PREFILL_SPLIT)
+#define PLOW_INTERP_BASE PLOW_GQ_CAT(plow_interp_mla_split_, PLOW_ARCH_SUFFIX)
+extern "C" __device__ unsigned plow_mla_prefill_fp8_split_1 = 1;
 #elif defined(PLOW_BUCKET_FLASH)
 /* Segmented-dispatch flash object: prefill op set, but built at 4 waves / FA_DC=256 so the flash
  * segments get the 512-register budget. Distinct symbol; one HSA executable holds all three. */
@@ -5586,7 +5618,7 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
                                    );
         }
 #else
-#if !defined(PLOW_BUCKET_FLASH)  /* collectives in the DECODE and 8-wave PREFILL interpreters —
+#if !defined(PLOW_BUCKET_FLASH) && !defined(PLOW_BUCKET_MLA_PREFILL_SMALL) /* collectives in the DECODE and 8-wave PREFILL interpreters —
          * TP PREFILL needs XReduce in the prefill interpreter too, not just decode
          * Excluded from the 4-wave flash object (class-4 flash segments
          * never contain an XReduce, and it keeps that object's tight register budget untouched).

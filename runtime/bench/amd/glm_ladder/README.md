@@ -15,7 +15,7 @@ For controlled single-object builds, use `PLOW_DECODE_TIERS=''` in the shell
 or `-DPLOW_HSACO_DECODE_TIERS=OFF` in CMake. `PLOW_HSACO_LOWRUNG=''` disables
 runtime tier selection explicitly.
 
-## Actual GLM TP8 ladder
+## Initial GLM TP8 ladder
 
 The [coverage record](mi300x-coverage.json) inventories all ten emitted programs,
 projection shapes, native segment counts, object hashes, and compiled markers.
@@ -93,3 +93,74 @@ nix develop -c env -u LD_LIBRARY_PATH python3 runtime/bench/amd/glm_ladder/check
 the widest object. The checker audits available routes and compiled markers;
 loader pairing and GPU execution remain separate checks. NVIDIA builds and
 gfx950 defaults are outside this MI300X change.
+
+## Full append ladder and context-dependent attention
+
+The compiler accepts prefill rungs
+`1,2,4,8,16,20,32,64,128,256,512,1024,2048,4096,8192` alongside decode
+`1,2,4,8,16,20`. The phase boundary distinguishes overlapping widths.
+Pass these prefill widths explicitly with `--mla-prefill full:...` and `--seq`.
+Add `--require-full-ladder` to `check.py` to require all 21 programs.
+
+MLA segments are isolated from GEMM at every prefill width. On gfx942 TP8,
+ordinary dense FP8 MLA with eight local heads, latent dimension 512 and rope
+dimension 64 uses a dedicated four-wave split object below 2048 rows.
+The runtime selects a power-of-two split count using both the actual query
+rows and live KV length, bounded by compiled partial storage and CU occupancy.
+It patches attention and merge together. Other small dense MLA uses a separate
+eight-wave object; large-rung and native sparse attention retain their existing
+routes. Packed metadata cannot enter the small dense split route.
+
+Both build systems emit static and global-queue small BF16, small FP8 and
+split FP8 objects. The loader checks family, KV precision, wave count, packet
+pairing and kernarg ABI. Split packets require their matching object and reject
+an incompatible runtime setting instead of falling back to unsplit arithmetic.
+GEMM bodies remain shared across compatible rungs; the complete ladder does
+not establish that every shape has its fastest kernel.
+
+Two additional qualification tools cover this path:
+
+- `replay_attention.cpp` compares all outputs against the broad interpreter and
+  checks selected query/head rows against independent FP64 CPU attention,
+  including causal masking, FP8 row scales and all 512 output columns. Output
+  guards cover every GPU result. It excludes device merge/fold, TP and serving.
+- `serve_attention.py URL OUTPUT` checks known-answer retrieval for every
+  append rung at 1024, 16384 and 65536 cached tokens, with exact first-request
+  cache accounting and a repeated request. `--mode exact` retains a separate
+  bitwise greedy-repeat diagnostic. Existing native BF16 atomic MoE reductions
+  can change greedy output; repeat equality alone does not isolate an attention
+  or prefix-cache defect.
+
+The full ladder passed 45 append/context cells, 10 shared-prefix checks and
+18 concurrent retrieval checks on eight MI300X ranks with per-token rank
+agreement enabled. Attention replay passed 736 comparisons over 92 shapes
+(query rows 1–1024, KV lengths 32–81920). Maximum absolute difference was
+0.008972 against the broad GPU interpreter and 0.005092 against the sampled
+independent FP64 CPU reference. The reference self-check covers E4M3FN
+encoding, causal masking and per-row value scales.
+These are correctness results, not a serving speedup or H200 parity claim.
+
+A matched 20-request run at 70K input / 700 output, range ratio 0.14 and
+concurrency 20 produced 49.45 output tokens/s for the old packet and 49.77
+for the full ladder (+0.64%). Both completed 20 requests without failures,
+with identical input/output length arrays and the same runtime and objects.
+Mean TPOT changed from 235.64 to 233.84 ms; P99 ITL from 1361.07 to
+1344.16 ms. One ordered pair does not demonstrate a repeatable serving win.
+It is not the 100-request H200 reference, whose target is 273.67 tokens/s.
+
+Build the replay with the Nix host C++ toolchain; the program loads existing
+GPU objects rather than compiling device kernels:
+
+```sh
+nix develop -c bash -c 'c++ -std=c++17 -O3 -D__HIP_PLATFORM_AMD__ \
+  -I "$ROCM_PATH/include" -I runtime/common \
+  runtime/bench/amd/glm_ladder/replay_attention.cpp \
+  -L "$ROCM_PATH/lib" -Wl,-rpath,"$ROCM_PATH/lib" -lamdhip64 \
+  -o /tmp/glm-attention-replay'
+nix develop -c /tmp/glm-attention-replay --check-reference
+```
+
+The GPU invocation takes four object paths in order: broad FP8 prefill,
+small FP8 prefill, four-wave flash, and four-wave split prefill. Use the
+corresponding global-queue objects. The CPU reference decodes the KV cache
+as OCP E4M3FN; the native MoE object's FNUZ representation does not apply.

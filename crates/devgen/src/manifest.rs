@@ -358,6 +358,7 @@ struct Shapes {
     /// layout (PLOW_MLA_PF_NS). The sparse GATHER arm reuses `i[6]` whole as `cap`,
     /// disambiguated by the union table in `t[7]`.
     mla_pf_ns: bool,
+    mla_prefill_fp8_split: bool,
     /// Any dense `FlashMlaPrefill` with `i[6]` bit 8 set and no t7 — the W_ofold fusion
     /// (PLOW_GLM_OFOLD): normalized-bf16 flash epilogue + fused o-GEMM. Exclusive with the
     /// KV-split on a packet (the fold consumes the un-split l), so the two live in one
@@ -581,6 +582,7 @@ fn shapes(m: &Model) -> Shapes {
                     s.dsa_select_local |= inst.i[4] == 1;
                 }
                 DevOp::FlashMlaPrefillFp8 => {
+                    s.mla_prefill_fp8_split |= inst.j[1] != 0;
                     s.mla_sparse_fp8 |= inst.j[0] != 0;
                     s.glm_dsa_pf |= op == DevOp::FlashMlaPrefillFp8 && inst.j[0] != 0;
                 }
@@ -887,6 +889,7 @@ fn encoding_features(f: &mut Map<String, Value>, s: &Shapes) {
     f.insert("moe_prefill_ep".into(), json!(!s.moe_prefill_ep.is_empty()));
     f.insert("quant_glu_fold".into(), json!(s.quant_glu_fold));
     f.insert("mla_pf_ns".into(), json!(s.mla_pf_ns));
+    f.insert("mla_prefill_fp8_split".into(), json!(s.mla_prefill_fp8_split));
     f.insert("glm_ofold".into(), json!(s.glm_ofold));
     f.insert("glm_dsa_pf".into(), json!(s.glm_dsa_pf));
     f.insert("dsa_decode_batch".into(), json!(s.dsa_decode_batch));
@@ -1277,6 +1280,9 @@ fn backend_amd(
     // writes nsplit=1 partials while the merge reads ns of them — refuse at load.
     if on("mla_pf_ns") {
         req.push("PLOW_MLA_PF_NS=1".into());
+    }
+    if on("mla_prefill_fp8_split") {
+        req.push("PLOW_MLA_PREFILL_FP8_SPLIT=1".into());
     }
     // The W_ofold fusion (op 51 i[6] bit 8): the FLASH object must carry the ofold-aware V2
     // arm AND the serve must route MLA prefill there (PLOW_MLA_PF_V2=1) — the 8-wave kernel

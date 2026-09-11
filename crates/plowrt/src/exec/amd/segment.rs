@@ -2,7 +2,105 @@ use super::{
     packed_segment_route, prefill_segment_specialization_allowed, AmdEngine, HsaKernel,
     PackedSegmentRoute, PrefillSegmentRoute, WG_THREADS_4, WG_THREADS_8,
 };
-use crate::Result;
+use crate::{Result, RuntimeError};
+
+pub(super) fn small_mla_segments(prog: &super::DevProg, segments: usize) -> Vec<bool> {
+    use packet::dev::{DevOp, TENSOR_NONE16};
+    let mut pure = vec![true; segments];
+    let mut any = vec![false; segments];
+    if prog.packed_prefill_only || prog.t == 0 || prog.t >= 2048 {
+        return any;
+    }
+    for entry in &prog.stream {
+        let inst = &prog.insts[entry.inst as usize];
+        let eligible = inst.i[3] & (1 << 31) == 0
+            && if inst.op == DevOp::FlashMlaPrefill as u16 {
+                inst.t[7] == TENSOR_NONE16 && inst.i[6] <= 1
+            } else if inst.op == DevOp::FlashMlaPrefillFp8 as u16 {
+                inst.fj[1] == 0 && inst.fj[2] == 0
+            } else {
+                false
+            };
+        pure[entry.seg as usize] &= eligible;
+        any[entry.seg as usize] = true;
+    }
+    for (pure, any) in pure.iter_mut().zip(any) {
+        *pure &= any;
+    }
+    pure
+}
+
+pub(super) fn load_small_mla(
+    be: &super::HsaBackend,
+    dir: &std::path::Path,
+    blob_path: &std::path::Path,
+    arch: &str,
+    sched: super::Sched,
+    fp8: bool,
+    split: bool,
+    modules: &mut Vec<crate::device::Module>,
+) -> Result<HsaKernel> {
+    use super::object::{
+        check_interpreter_waves, check_packet_pairing_stamp, elf_symbol_names, elf_symbol_u32,
+        FP8_KV_SYM, L2_DISPATCH_SYM,
+    };
+    use crate::exec::device_api::EngineDevice;
+    use crate::RuntimeError;
+    let infix = if fp8 { "_fp8kv" } else { "" };
+    let (family, marker, phase) = if split {
+        ("split", "plow_mla_prefill_fp8_split_1", super::Phase::Flash)
+    } else {
+        ("small", "plow_mla_prefill_small_1", super::Phase::Prefill)
+    };
+    let path = dir.join(format!("interp_mla_{family}{infix}{}.elf", sched.suffix()));
+    let image = std::fs::read(&path).map_err(|e| {
+        RuntimeError::Device(format!(
+            "small MLA segments require {}: {e}",
+            path.display()
+        ))
+    })?;
+    let syms = elf_symbol_names(&image);
+    if !syms.contains(&marker)
+        || !syms.contains(&L2_DISPATCH_SYM)
+        || syms.contains(&FP8_KV_SYM) != fp8
+    {
+        return Err(RuntimeError::Device(format!(
+            "{}: wrong small MLA family, KV encoding or L2 dispatch contract",
+            path.display()
+        )));
+    }
+    check_interpreter_waves(
+        elf_symbol_u32(&image, "plow_geom_PLOW_WG_WAVES"),
+        phase,
+        &path,
+    )?;
+    check_packet_pairing_stamp(&image, blob_path, &path)?;
+    let module = EngineDevice::module_load(be, &image)?;
+    let symbol = format!("plow_interp_mla_{family}_{arch}{}", sched.suffix());
+    let result = (|| {
+        let kernel = EngineDevice::get_function(be, &module, &symbol)?;
+        let want = (std::mem::size_of::<super::DevProgram>() as u32 + 7) & !7;
+        if kernel.kernarg_size() != want && kernel.kernarg_size() != want + 256 {
+            return Err(RuntimeError::Device(format!(
+                "{}: wrong interpreter kernarg size",
+                path.display()
+            )));
+        }
+        Ok(kernel)
+    })();
+    match result {
+        Ok(kernel) => {
+            modules.push(module);
+            Ok(kernel)
+        }
+        Err(error) => {
+            if let Err(unload) = EngineDevice::module_unload(be, &module) {
+                tracing::warn!(%unload, object = %path.display(), "failed to unload rejected small MLA object");
+            }
+            Err(error)
+        }
+    }
+}
 
 impl AmdEngine {
     /// Diagnostic label for the kernel object that will execute one prefill segment.
@@ -124,6 +222,24 @@ impl AmdEngine {
             ),
             PackedSegmentRoute::Kda => (self.k_packed_kda.unwrap(), WG_THREADS_8, "kda_family_raw"),
             PackedSegmentRoute::Primary => {
+                if self.progs[p].small_mla_split_segments[seg] {
+                    if active {
+                        return Err(RuntimeError::Device(
+                            "dense MLA split segment cannot consume packed request metadata".into(),
+                        ));
+                    }
+                    let kernel = self.k_mla_split.ok_or_else(|| {
+                        crate::RuntimeError::Device(
+                            "small MLA split segment has no matching object".into(),
+                        )
+                    })?;
+                    return Ok((kernel, WG_THREADS_4, "mla_split_interpreter"));
+                }
+                if !active && self.progs[p].small_mla_segment[seg] {
+                    if let Some(kernel) = self.k_mla_small {
+                        return Ok((kernel, WG_THREADS_8, "mla_small_interpreter"));
+                    }
+                }
                 let raw_mla =
                     self.progs[p].raw_mla_v2_segment[seg] && self.k_mla_v2_sv_raw.is_some();
                 if let (true, Some(k)) = (raw_mla, self.k_mla_v2_sv_raw) {

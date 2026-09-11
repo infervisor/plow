@@ -8,6 +8,43 @@
 use super::*;
 
 #[test]
+fn small_prefill_splits_allocate_and_emit_matching_partial_layouts() {
+    let _guard = crate::test_env::env_guard();
+    let _env = crate::test_env::EnvScope::set(&[
+        ("PLOW_GLM_FP8_KV", "1"), ("PLOW_MLA_PF_V2", ""), ("PLOW_UNISEG", "0"),
+    ]);
+    let mut c = glm_ref_cfg();
+    c.tp = 8;
+    for (rows, expected) in [(1,32), (2,32), (4,32), (8,32), (16,32), (20,32),
+        (32,32), (64,32), (128,16), (256,8), (512,4), (1024,2),
+        (2048,1), (4096,1), (8192,1)] {
+        assert_eq!(glm_small_pf_split_cap(&c, 304, rows), expected);
+        assert_eq!(crate::with_emit_target_amd(false, || glm_small_pf_split_cap(&c, 304, rows)), 1);
+        assert_eq!(glm_small_pf_split_cap(&c, 256, rows), 1);
+        let mut decl = Builder::new(304);
+        let n = declare_glm_rows_batched(&mut decl, &c, 81920, &[0], rows, 20, MoeEnc::Fp8Blk);
+        let mut b = Builder::new(304);
+        b.adopt_tensors(decl.tensors());
+        let all = b.all();
+        emit_glm_mla_prefill(&mut b, &c, &n, 0, 81920, rows, MoeEnc::Fp8Blk,
+            n.x, &[], false, &mut 0, &all);
+        let prog = b.finish();
+        let ix = prog.insts.iter().position(|d| d.op == DevOp::FlashMlaPrefillFp8 as u16).unwrap();
+        let flash = &prog.insts[ix];
+        let merge = &prog.insts[ix + 1];
+        assert_eq!(flash.j[1], if expected > 1 { expected } else { 0 });
+        if expected > 1 {
+            let segment = prog.stream.iter().find(|e| e.inst as usize == ix).unwrap().seg;
+            assert!(prog.stream.iter().filter(|e| e.seg == segment).all(|e| e.inst as usize == ix));
+        }
+        assert_eq!(merge.op, DevOp::MlaMergeFold as u16);
+        assert_eq!((merge.t[1], merge.t[2], merge.i[4]), (n.opart, n.mlpart, expected));
+        assert!(decl.tensors()[n.opart as usize].bytes >= u64::from(rows) * 8 * u64::from(expected) * 512 * 4);
+        assert!(decl.tensors()[n.mlpart as usize].bytes >= u64::from(rows) * 8 * u64::from(expected) * 2 * 4);
+    }
+}
+
+#[test]
 fn dense_prefill_rungs_populate_keys_for_sparse_decode() {
     let _guard = crate::test_env::env_guard();
     let mut c = glm_ref_cfg();
@@ -1803,7 +1840,7 @@ fn check_glm_flat_segments(resident: bool) {
     let _guard = crate::test_env::env_guard();
     let _target = crate::EmitAmdGuard::set(true);
     let _env = crate::test_env::EnvScope::set(&[
-        ("PLOW_MLA_PREFILL", "full:128"),
+        ("PLOW_MLA_PREFILL", if resident { "full:1,2,4,8,16,20,32,64,128,256,512,1024,2048,4096,8192" } else { "full:128" }),
         ("PLOW_GLM_PLACE_PF", "0"),
         ("PLOW_GLM_MOE_AITER", "0"),
         ("PLOW_GLM_MOE_FLAT_DECODE", if resident { "0" } else { "1" }),
@@ -1828,7 +1865,10 @@ fn check_glm_flat_segments(resident: bool) {
     std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
     let verify: crate::VerifyHook = Box::new(move |model| {
         let mut checked = 0;
-        for (prog, &rows) in model.progs.iter().zip(&model.prog_t) {
+        let prefill_count = packet::devbuild::decode_rung_lo(&model.prog_t);
+        assert_eq!(prefill_count, if resident { 15 } else { 1 });
+        for (p, (prog, &rows)) in model.progs.iter().zip(&model.prog_t).enumerate() {
+            let decode = p >= prefill_count;
             let native = prog
                 .insts
                 .iter()
@@ -1840,10 +1880,10 @@ fn check_glm_flat_segments(resident: bool) {
                 continue;
             }
             checked += 1;
-            if rows <= 20 { assert_eq!(prog.l2_domains, 8); }
+            if decode { assert_eq!(prog.l2_domains, 8); }
             assert_eq!(native.len(), 1);
             let (ix, inst) = native[0];
-            if rows > 20 {
+            if !decode {
                 assert_eq!(inst.i, [rows, 6144, 256, 256, 8, 64, 0, 1]);
             } else {
             assert_eq!(inst.i, [rows, 6144, 256, 256, 8, 0, 1, u32::from(resident)]);
@@ -1884,16 +1924,16 @@ fn check_glm_flat_segments(resident: bool) {
                 .map(|e| usize::from(e.seg) + 1)
                 .max()
                 .unwrap();
-            if rows <= 20 { assert_eq!(prog.gq_seg_ofs.len(), segments * 8 + 1); }
+            if decode { assert_eq!(prog.gq_seg_ofs.len(), segments * 8 + 1); }
         }
-        assert_eq!(checked, if resident { 7 } else { 3 });
+        assert_eq!(checked, if resident { 21 } else { 3 });
         Ok(crate::LeanReport::skipped(
             "flat decode segment regression test",
         ))
     });
     glm_emit_full(
         &dir,
-        512,
+        81920,
         dir.join("model.pkt").to_str().unwrap(),
         304,
         8,

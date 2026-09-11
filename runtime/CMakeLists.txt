@@ -1442,8 +1442,20 @@ if(PLOW_GFX950_HSACO)
             "interp_prefill_mxfp4|${_hs_kpf}|_hs_ax_prefill|_hs_ax_mxfp4|256|2")
     endif()
     if(PLOW_HSACO_MLA)
+        set(_hs_ax_mla_small -DPLOW_BUCKET_DECODE=0 -DPLOW_WG_WAVES=8
+            -DPLOW_MLA_PREFILL=1 -DPLOW_BUCKET_MLA_PREFILL_SMALL=1
+            -DPLOW_L2_PLACE_DISPATCH=1)
         list(APPEND _hs_rows
+            "interp_mla_small|plow_interp_mla_small_${PLOW_HSACO_ARCH}|_hs_ax_mla_small|_hs_ax_none|256|2"
             "interp_prefill_mla|${_hs_kpf}|_hs_ax_prefill|_hs_ax_mla|256|2")
+        if(PLOW_HSACO_FP8KV)
+            set(_hs_ax_mla_split -DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4
+                -DFA_DC=256 -DFA_DBUF=1 -DPLOW_MLA_PF_V2_ARM=1
+                -DPLOW_BUCKET_MLA_PREFILL_SPLIT=1 -DPLOW_L2_PLACE_DISPATCH=1)
+            list(APPEND _hs_rows
+                "interp_mla_split_fp8kv|plow_interp_mla_split_${PLOW_HSACO_ARCH}|_hs_ax_mla_split|_hs_ax_fp8kv|512|1"
+                "interp_mla_small_fp8kv|plow_interp_mla_small_${PLOW_HSACO_ARCH}|_hs_ax_mla_small|_hs_ax_fp8kv|256|2")
+        endif()
         if(PLOW_HSACO_ARCH STREQUAL "gfx950")
             # Build-time gate: V2+SV is 348 architectural registers, occupancy 1,
             # scratch-free in the exact T8192 kernel probe.
