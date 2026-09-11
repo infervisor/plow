@@ -423,6 +423,34 @@ through a merge still need the sweep (gitignore does not apply to tracked paths)
 - `tuned_tile_selection`: the `nvidia/sm_90a/h100-nvl` tunedb cell may be stale against the kernel-source digest as well; re-run the decode campaign + `plowc tune ingest` if `plowc tune status` says so.
 - Run the self-hosted CI job's `cargo test --workspace` there (the hosted job only checks the CUDA features).
 
+### Slot recycling off the engine thread (2026-09-11, branch `slot-recycle-lazy-unmap`)
+
+Measured on GLM-5.3 TP8 (`PLOW_TICK_LOG=1` + `begin_seq` debug lines): recycling a slot whose
+previous occupant held a 66k-token prompt cost 1.9 s on the engine thread (2.1 s under the C20
+workload) — `VmmKv::begin_seq` → `release_window` issuing one `hsa_amd_vmem_unmap` per mapped block,
+1905 per rank across the packet's three cache groups, ~15 k per recycle, at 138 µs each (probe:
+map 5.5 µs, set_access 9.4, create 18, release 10.6, unmap 138; a range unmap over 8 granules costs
+8 × 133 µs; 2/8 threads scale 0.96×/0.90× — ROCr serializes). Even a "fresh" slot paid 182 ms
+unmapping the warm-up's one column per track.
+
+Change (`memory/vmm.rs`, opt-in via `enable_deferred_reclaim`, wired by the AMD shared-prefix groups
+and `PLOW_VMM_KV`; `PLOW_VMM_DEFERRED_RECLAIM=0` restores the synchronous path; CUDA untouched):
+`begin_seq` keeps a private row-0 block in place (no driver call), unmaps a cache-shared row-0 block
+inline (the idle decode row parks at `pos = 0` and prefill writes row 0 at once — the floor with a
+frozen packet), and marks the rest of the window `Slot::Stale` for the pool's existing background
+thread, which unmaps lowest-column-first under the pool lock (one block per hold); `ensure_rows`
+reuses a private stale column in place or clears a shared one inline if it gets there first;
+`try_attach`/`Drop` drop stale slots with the window; zero-ref handle releases go to the thread
+too. A process-wide reclaim gate + engine-priority flag keeps the reclaimers from barging on ROCr's
+memory lock (v1 without it: engine maps 5 µs → 1 ms, `prefill_prepare` p90 26 → 891 ms). Budget
+unchanged (stale blocks reach the pool/driver as soon as the thread runs; pool and cache caps as
+before). Five mock-backend tests; shared-prefix budget test syncs the thread.
+
+Result: recycled-slot first-chunk `cursor` 2151 → 1 ms (private blocks, the user's workload), fresh
+slot 214 → 1 ms; cache-held column 0 still pays the swap. 40 × 70k C20 bench, same packet:
+**48.72 → 52.84 out tok/s (+8.5 %), P99 ITL 3226 → 1178 ms, median TPOT 349 → 311 ms**; retrieval
+screen 18/18. Report: `/root/.claude/jobs/c08d1232/tmp/reports/slot-recycling.md`.
+
 ## Batches merged
 
 | Merged at | Upstream range | Merge commit | Conflicts | Checks |
