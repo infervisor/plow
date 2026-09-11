@@ -570,6 +570,11 @@ fn fuse_glm() {
         fused.contains("FusedResidualNorm"),
         "residual+norm fusion did not fire in GLM-5.2"
     );
+    // MoE block boundary: RmsNorm(add(x, add(routed, shared))) → combine + residual + norm.
+    assert!(
+        fused.contains("FusedResidual3Norm"),
+        "combine+residual+norm fusion did not fire at the GLM-5.2 MoE seam"
+    );
     assert!(
         stats.ops_after < stats.ops_before,
         "fusion did not reduce ops: {} -> {}",

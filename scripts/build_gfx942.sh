@@ -166,6 +166,19 @@ fi
 # read the knobs this block fills. `cfg_get` reads one `#define NAME value` line; the header
 # is machine-written (devgen::manifest::config_header), so the grammar is exactly that.
 CFG=""; AX_CONFIG=""; AX_CONFIG_JSON=""
+# PLOW_HSACO_EXTRA_DEFINES="-DX=1 ...": raw -D appended to EVERY row, for an opt-in kernel-arm
+# A/B whose header default is the shipped body (e.g. -DPLOW_COMBINE_VEC=1 -DPLOW_RN_ROWS=2).
+# Recorded in build_defines.json beside AX_CONFIG so the contract audit sees the axis.
+AX_EXTRA="${PLOW_HSACO_EXTRA_DEFINES:-}"
+# It may NOT carry the axes the loader pairs against the packet (tile geometry, wave count,
+# decode batch): those have dedicated variables that this script cross-checks against the
+# packet's `requires`, and a -D smuggled in here would bypass that check and be refused at load
+# — or, worse, silently redefine a header default (the GM_AX class of defect).
+case " $AX_EXTRA " in
+  *" -DGM_BM"*|*" -DGM_BN"*|*" -DGM_BK"*|*" -DGM_DBUF"*|*" -DPLOW_WG_WAVES"*|*" -DPLOW_DECODE_BATCH"*|*" -DPLOW_GEMV_MM"*)
+    echo "FAIL: PLOW_HSACO_EXTRA_DEFINES must not set tile/wave/decode-batch axes; use their own variables" >&2
+    exit 2 ;;
+esac
 if [ -n "${PLOW_HSACO_CONFIG:-}" ]; then
   CFG="$PLOW_HSACO_CONFIG"
   [ -d "$CFG" ] && CFG="$CFG/plow_config.h"
@@ -1056,8 +1069,37 @@ fi
 # length alone" — it was condemned by association. Solo gate 2026-08-10 (r4b4 ladder asset):
 # PASSES needle 3000/8000 x2 each; combined with the FIXED XR_AGG it is gated again before
 # every recipe publish. TTFT −3.8/−5.5/−6.2% @4k/8k/16k. Opt out with PLOW_MLA_FOLD_TB=0.
+# THE FLASH OBJECT NEEDS IT TOO, and that is where GLM-5.3 actually runs the op. The note above
+# says "PREFILL objects only" meaning "not decode" — the guard it cites is `n_batch == token
+# count`, which is a property of the PACKET, not of the object file. On the GLM-5.3 sparse TP8
+# recipe the 8192-row chunk's MlaMergeFold is dispatched from `interp_flash_fp8kv*` (the segment
+# after the native AITER attention: fold, o_proj, the two-shot, residual, norm, router), so with
+# the axis on AX_PREFILL alone the arm the measurement above bought was never reached by the
+# shipped recipe: traced at 594 us/packet x 78 = 45.6 ms/chunk on the scalar arm.
+# The arm's own guards still decide per packet (decode's n_batch=1 fails `n_work >= nblk`), so
+# adding it here cannot change a decode dispatch — the flash object serves prefill buckets.
 if [ "${PLOW_MLA_FOLD_TB:-8}" != 0 ]; then
   AX_PREFILL="$AX_PREFILL -DPLOW_MLA_FOLD_TB=${PLOW_MLA_FOLD_TB:-8}"
+  # OPT-IN (PLOW_MLA_FOLD_TB_FLASH=1), default off: the same arm in the FLASH object. Default-off
+  # and not default-on with AX_PREFILL because the header is explicit that "bit-identical" is the
+  # INTENT and the gfx950 V=128 oracle rejected TB>1 (245-1,463 outputs differ, packed-FMA
+  # schedule) — every new shape needs its own character-identical gate. This is a new shape only
+  # in the sense of a different object; the map (V=256, TB=8, gfx942) is the one already gated on
+  # AX_PREFILL. Flip the default only after the 18-case retrieval screen on this object.
+  #
+  # >>> MEASURED ON THE GLM-5.3 TP8 SPARSE CHUNK, AND IT IS A NULL. <<< (2026-09-11, packet trace
+  # of the last chunk of a 73,728-token prompt, 8 GPUs, rank 0: MlaMergeFold body 46.59 ms/chunk
+  # without the arm and 46.59 ms with it; chunk 963.65 -> 964.21 ms, inside run-to-run spread.)
+  # The reachability half of the finding is real — segment 11 of the 8192 program is
+  # `object_class: flash`, so the arm on AX_PREFILL alone never ran for this recipe — but the
+  # PRIZE is not: at nsplit=1 (the sparse arm) the merge phase is a pass-through and the fold is
+  # VALU-bound, 17.2 GFLOP in 597 us = 29 TFLOP/s against a ~163 TFLOP/s f32 VALU peak, while the
+  # W_uv panel (8 heads x 256 KiB = 2 MiB) is L2-resident. TB=8 divides an L2 stream that was not
+  # the constraint. The 1626 -> 616 us standalone number was ns=2 on a cold cache; in situ the
+  # scalar arm already runs at 597 us. What is left is the arithmetic itself: the fold is a
+  # batched GEMM and wants MFMA, not a better stream.
+  [ "${PLOW_MLA_FOLD_TB_FLASH:-0}" = 0 ] ||
+    AX_FLASH="$AX_FLASH -DPLOW_MLA_FOLD_TB=${PLOW_MLA_FOLD_TB:-8}"
 fi
 
 # OPT-IN (PLOW_MLA_PF_SV=1): the V2 kernel's V-STAGE arm — kv-block LDS swizzle that makes
@@ -1388,7 +1430,7 @@ for row in "${ROWS[@]}"; do rm -f "${row%%|*}.elf" "${row%%|*}.co"; done
 one() {  # <stem> <axes...>
   local stem="$1"; shift
   if ! "$HIPCC" --offload-arch="$ARCH" -O3 -w -DPLOW_ARCH_SUFFIX="$ARCH" \
-        $* $AX_CONFIG --genco "$R/amd/interp.hip" -o "$stem.co" $INC > "$stem.log" 2>&1; then
+        $* $AX_CONFIG $AX_EXTRA --genco "$R/amd/interp.hip" -o "$stem.co" $INC > "$stem.log" 2>&1; then
     echo "FAIL  $stem"; tail -20 "$stem.log"; return 1
   fi
   "$BUN" --unbundle --type=o --targets="hipv4-amdgcn-amd-amdhsa--$ARCH" \
@@ -1396,7 +1438,7 @@ one() {  # <stem> <axes...>
   rm -f "$stem.co" "$stem.log"
   echo "ok    $stem"
 }
-export -f one; export HIPCC ARCH R INC BUN AX_CONFIG
+export -f one; export HIPCC ARCH R INC BUN AX_CONFIG AX_EXTRA
 
 # test_kernels.elf is STARTED HERE, alongside the row batch, and waited on after it.
 # It shares no input with the rows and nothing between here and the wait consumes it, so
@@ -1455,7 +1497,7 @@ fi
       *) gq_axes="$axes $AX_GQ" ;;
     esac
     for pair in "$stem|$axes" "${stem}_gq|$gq_axes"; do
-      printf '%s "%s": "-DPLOW_ARCH_SUFFIX=%s%s %s"' "$sep" "${pair%%|*}" "$ARCH" "$AX_CONFIG_JSON" "$(echo ${pair#*|})"
+      printf '%s "%s": "-DPLOW_ARCH_SUFFIX=%s%s %s%s"' "$sep" "${pair%%|*}" "$ARCH" "$AX_CONFIG_JSON" "$(echo ${pair#*|})" "${AX_EXTRA:+ $AX_EXTRA}"
       sep=$',\n'
     done
   done

@@ -3378,7 +3378,16 @@ fn emit_xreduce_gather(
     // `ceil(xr_elems/512)` is the saturation point of BOTH bodies: the one-shot grid-strides the
     // full `n` by `nblk*PLOW_THREADS`, and the two-shot's all-gather does the same (its
     // reduce-scatter phase saturates even earlier, at `n/nranks`), so this never over-narrows.
-    let need = (xr_elems.div_ceil(512).max(1) as usize).min(xr_cus.len());
+    let mut need = (xr_elems.div_ceil(512).max(1) as usize).min(xr_cus.len());
+    // PLOW_XR_DEC_CUS: at a batched decode rung the one-shot saturates at rows*hidden/512
+    // workgroups (240 at rows 20, hidden 6144), every one of which polls the arrival gate
+    // and takes a system-scope acquire; a cap trades that for a per-thread element loop.
+    // Decode only — the prefill two-shot has its own width story (`xr_cus_capped`).
+    if decode {
+        if let Some(k) = emit_config::active().xr_dec_cus {
+            need = need.min(k.max(1) as usize);
+        }
+    }
     let xr_cus = &xr_cus[..need];
     let xr2_gather = !decode
         && emit_config::active().xr2_gather

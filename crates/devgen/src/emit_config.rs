@@ -284,6 +284,11 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_XR_CUS")]
     pub xr_cus: Option<u32>,
 
+    /// Cap the DECODE one-shot XReduce at N workgroups (each thread then reduces
+    /// `ceil(elems/(512*N))` elements); prefill collectives are untouched. Bit-identical.
+    #[arg(long, env = "PLOW_XR_DEC_CUS")]
+    pub xr_dec_cus: Option<u32>,
+
     /// Use reduce-scatter/all-gather for complete folded-gather collectives. The second
     /// partial is added while the reduced slices are gathered. Default on; `=0` is the
     /// rollback to the one-shot collective.
@@ -752,6 +757,12 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_XR_RES", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_xr_res: bool,
 
+    /// Size the batched-decode glue packets to their work items: the FP8 latent KV writer at one
+    /// wave per row instead of one workgroup, the router top-k at one workgroup per token, the
+    /// MoE combine at one thread per element. Pure width changes, bit-identical.
+    #[arg(long, env = "PLOW_GLM_DECODE_GLUE_CUS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_decode_glue_cus: bool,
+
     /// Fuse the seam Residual+Norm into XReduceAddNorm (requires fuse_b1, tp>1).
     #[arg(long, env = "GLM_FUSE_XRN", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_fuse_xrn: bool,
@@ -1061,6 +1072,7 @@ impl EmitConfig {
             pf_ladder_append: env_str("PLOW_PF_LADDER_APPEND"),
             pf_gemv_head: env_str("PLOW_PF_GEMV_HEAD"),
             xr_cus: env_u32("PLOW_XR_CUS"),
+            xr_dec_cus: env_u32("PLOW_XR_DEC_CUS"),
             xr2_gather: env_opt_out("PLOW_XR2_GATHER"),
             no_xreduce: env_bool("PLOW_NO_XREDUCE"),
             moe_prefill: env_str("PLOW_MOE_PREFILL"),
@@ -1169,6 +1181,7 @@ impl EmitConfig {
             attnres_decode_mwg: env_u32("PLOW_ATTNRES_DECODE_MWG"),
             glm_xr_band_seam: env_str("PLOW_GLM_XR_BAND_SEAM"),
             glm_xr_res: env_bool("PLOW_GLM_XR_RES"),
+            glm_decode_glue_cus: env_bool("PLOW_GLM_DECODE_GLUE_CUS"),
             glm_fuse_xrn: env_bool("GLM_FUSE_XRN"),
             xr_combine_fold: env_opt_out("PLOW_XR_COMBINE_FOLD"),
             kda_fb_fold: env_bool("PLOW_KDA_FB_FOLD"),

@@ -300,6 +300,7 @@ the 2026-09-04 audit that removed the rejected experiment knobs are in
 | env | flag | default | effect |
 |---|---|---|---|
 | `PLOW_XR_CUS` | `--xr-cus` | unset | Cap XReduce participant CUs. |
+| `PLOW_XR_DEC_CUS` | `--xr-dec-cus` | unset | Cap the DECODE one-shot `XReduce` at N workgroups (each thread then loops over `ceil(elems/(512·N))` elements); the prefill two-shot is untouched. At rows 20 the one-shot saturates at 240 workgroups, each polling the gate and taking a system-scope acquire. Bit-identical; opt-in pending the rung-20 A/B. |
 | `PLOW_XR2_GATHER` | `--xr2-gather` | true | Use reduce-scatter/all-gather for complete folded-gather collectives. The second partial is added while the reduced slices are gathered. Default on; `=0` is the rollback to the one-shot collective. |
 | `PLOW_SEQ_PAR_SEAMS` | `--seq-par-seams` | true | Sequence-parallel TP seams for prefill: run AttnRes / router / latent xe / top-k on the reduce-scatter-owned `t/tp` row band and all-gather the results (`XReduceScatter` + `XAllGather`) instead of replicating the row work on every rank. Default on; the manifest requires the paired seams arm. `=0` is the rollback to the replicated-row packet. |
 | `PLOW_XR_COMBINE_FOLD` | `--xr-combine-fold` | true | Fold the decode latent `MoeCombine` into the tagged one-shot `XReduce` publish: the XReduce packet carries `t1 = part`, `i7 = top_k` and no combine packet is emitted. Needs a `PLOW_XR_COMBINE_FOLD=1` decode object. Default on; `=0` is the rollback. |
@@ -399,6 +400,7 @@ the 2026-09-04 audit that removed the rejected experiment knobs are in
 | `PLOW_GLM_XR_BAND` | `--glm-xr-band` | unset | Band count for a prefill TP seam (2..=8; unset/1 = the unbanded emit). |
 | `PLOW_GLM_XR_BAND_CUS` | `--glm-xr-band-cus` | unset | Restrict the banded seam to the first N of the seam's CU list. |
 | `PLOW_GLM_XR_RES` | `--glm-xr-res` | false | Fold the post-collective Residual into the two-shot all-gather. Bit-identical. |
+| `PLOW_GLM_DECODE_GLUE_CUS` | `--glm-decode-glue-cus` | false | Size the batched-decode glue packets to their work: the FP8 latent KV writer at one wave per row (was one workgroup for the whole rung), the router top-k at one workgroup per token, the MoE combine at one thread per element (were all 304 workgroups). Pure width changes, bit-identical; opt-in pending the C20 A/B. |
 | `GLM_FUSE_XRN` | `--glm-fuse-xrn` | false | Fuse the seam Residual+Norm into XReduceAddNorm (requires fuse_b1, tp>1). |
 | `PLOW_GLM_WGFIT` | `--glm-wgfit` | true | Narrow GLM dispatch to the workgroups that own work. DEFAULT ON (`=0` for the A/B control arm); the emitted arithmetic is unchanged either way. |
 
@@ -690,6 +692,7 @@ the end, not tabled.
 | `PLOW_GATE_HIER` | 0 | gfx950 two-level counter-gate rendezvous. The CMake option is default-off and applies only to decode global-queue objects; it requires `PLOW_HSACO_GQ=ON` and `PLOW_L2_PLACE_DISPATCH=ON`. Passing it through global `PLOW_HSACO_EXTRA_DEFINES` is rejected. The gfx942 shell build's existing default is unchanged. |
 | `PLOW_GATE_SC1` | 0 | device-scope (not system-scope) activation stores so the release fence can be elided; the counter-gate carries the ordering. |
 | `PLOW_MLA_FOLD_MAP` / `_UN` / `_VEC` / `_VT` | 0 | fold the MLA up-projection map / output un-projection / V-cache load / V^T transpose into the adjacent kernel to save a launch + round-trip. |
+| `PLOW_MLA_FOLD_TB_FLASH` | 0 | build `interp_flash_*` with the token-blocked `MlaMergeFold` arm (`PLOW_MLA_FOLD_TB`, default 8 and already on for `interp_prefill_*`). GLM-5.3's sparse 8192 chunk dispatches its fold from the FLASH object, so without this the arm is unreachable on the shipped recipe. Opt-in until the retrieval screen runs on this object. |
 | `PLOW_MLA_PF_MFMA` | 0 | MLA prefill uses MFMA matrix-core instructions for QK/PV instead of the vector-FMA fallback. |
 | `PLOW_MLA_PF_WPM` | numeric | MLA-prefill waves-per-M-tile, clamped by `min(PLOW_WAVES, PLOW_MLA_PF_WPM)`. |
 | `PLOW_XR_CUS` | 32 | **emit** — cap XReduce participant CUs (clamped 1..n_cu); a TP8 NUMA lever cutting L2 invalidates from idle WGs. |
@@ -752,6 +755,10 @@ packet carries packed-prefill metadata.
 | `PLOW_MOE_DOWN_LANESPLIT`, `PLOW_MOE_DOWN_STAGE_FU` | 0 | `down` lane-split / staged fixups. |
 | `PLOW_MOE_ROUTER_WIDE` | 0 | wide router arm. |
 | `PLOW_MOE_COMBINE_ALLBLK` | 0 | all-block combine. |
+| `PLOW_HSACO_EXTRA_DEFINES` | unset | `scripts/build_gfx942.sh`: raw `-D` appended to every row and recorded in `build_defines.json` (so `asm_audit.py --contract` sees the axis). For opt-in kernel arms whose header default is the shipped body. Refuses the tile / wave / decode-batch axes, which have their own variables and are cross-checked against the packet. |
+| `PLOW_COMBINE_VEC` / `PLOW_COMBINE_VEC_U` | 0 / 2 | AMD `d_moe_combine_pf` 8-wide arm (16 B loads, `_U` iterations in flight) for the `k == 1` combine every native-MoE / `PLOW_MOE_PF_DET` blob emits. Written to keep the scalar loop's operands, order and single rounding, but the serving screens show different tokens than the control objects: treat as numerics-changing unless proven otherwise. −25 ms per GLM-5.3 8192 chunk (31.7 → 6.7 ms). Opt-in build axis (`PLOW_HSACO_EXTRA_DEFINES`); default flip needs a positive same-binary A/B plus retrieval 18/18. |
+| `PLOW_RN_ROWS` | 1 | AMD `d_rmsnorm` multi-row arm: R rows' loads issued before any row is reduced (prefill norms hand each workgroup ~27 rows and paid one HBM round trip per row). Same per-thread element map and reduction tree by construction; numerics-changing unless proven otherwise (see `PLOW_COMBINE_VEC`). Opt-in build axis. |
+| `PLOW_RESID_U` | 1 | AMD `d_residual` unroll: U iterations of loads in flight. Same arithmetic by construction; numerics-changing unless proven otherwise (see `PLOW_COMBINE_VEC`). Opt-in build axis. |
 
 ### Scheduling, sync, occupancy
 
