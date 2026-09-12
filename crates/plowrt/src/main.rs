@@ -1501,12 +1501,13 @@ fn amd_bench(
             // dumped nothing and the caller saw an empty range report rather than an error.
             if let Some(spec) = plowrt::config::RuntimeConfig::get().amd.dump_act.as_ref() {
                 for one in spec.split(',').filter(|s| !s.is_empty()) {
-                    if let Some((name, path)) = one.split_once(':') {
+                    if let Some((name, rest)) = one.split_once(':') {
+                        let (path, limit) = dump_act_path(rest);
                         let n = e
                             .tensor_bytes(name)
                             .ok_or_else(|| format!("PLOW_DUMP_ACT: no tensor {name}"))?
                             as usize;
-                        let mut buf = vec![0u8; n];
+                        let mut buf = vec![0u8; limit.map_or(n, |l| l.min(n))];
                         e.read_tensor(name, &mut buf)?;
                         std::fs::write(format!("{path}.{tag}.bin"), &buf)?;
                     }
@@ -1658,6 +1659,15 @@ fn amd_bench(
 /// samples fluent-looking ids from its own shard, so agreement is the only thing
 /// that distinguishes a working all-reduce from a plausible wrong one. It is
 /// therefore asserted on every step rather than at the end.
+/// `PLOW_DUMP_ACT` entry tail `path[:bytes]`: a trailing `:bytes` dumps only the tensor's leading
+/// bytes -- e.g. the KV rows a prompt wrote, where the rest of a demand-mapped ring may be unmapped.
+fn dump_act_path(rest: &str) -> (&str, Option<usize>) {
+    match rest.rsplit_once(':') {
+        Some((path, n)) if !path.is_empty() && n.parse::<usize>().is_ok() => (path, n.parse().ok()),
+        _ => (rest, None),
+    }
+}
+
 /// Write the packet trace, if `PLOW_TRACE_RAW` asked for one.
 ///
 /// A FUNCTION rather than three copies of the same `if let`, because every copy so far has been on
@@ -1756,13 +1766,14 @@ fn amd_bench_tp(
         // dumped once per tag, later tags overwrite-with-suffix like the logits do.
         if let Some(spec) = plowrt::config::RuntimeConfig::get().amd.dump_act.as_ref() {
             for one in spec.split(',').filter(|s| !s.is_empty()) {
-                if let Some((name, path)) = one.split_once(':') {
+                if let Some((name, rest)) = one.split_once(':') {
+                    let (path, limit) = dump_act_path(rest);
                     let n = g
                         .rank(0)
                         .tensor_bytes(name)
                         .ok_or_else(|| format!("PLOW_DUMP_ACT: no tensor {name}"))?
                         as usize;
-                    let mut buf = vec![0u8; n];
+                    let mut buf = vec![0u8; limit.map_or(n, |l| l.min(n))];
                     g.rank(0).read_tensor(name, &mut buf)?;
                     std::fs::write(format!("{path}.{tag}.bin"), &buf)?;
                 }

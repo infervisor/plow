@@ -990,6 +990,13 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-ragged-chunk", env = "PLOW_RAGGED_CHUNK", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub ragged_chunk: bool,
 
+    /// Size a ragged chunk's sequence-parallel seams (`PLOW_GLM_SEQ_PAR`) by its live rows
+    /// instead of the bucket: each rank's band becomes `ceil(live / tp)` rows, the
+    /// reduce-scatter / all-gather move `tp * band` rows, and the band views are rebound per
+    /// chunk. Only acts under `PLOW_RAGGED_CHUNK` on a packet that carries the seams. Opt-in.
+    #[arg(long = "amd-ragged-seams", env = "PLOW_AMD_RAGGED_SEAMS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub ragged_seams: bool,
+
     /// Track the MLA decode's KV-split count from the LIVE `kv_len` instead of
     /// the `max_ctx` the emitter baked it from.
     ///

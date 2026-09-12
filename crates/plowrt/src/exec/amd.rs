@@ -22,7 +22,8 @@ use crate::exec::amd::packed::validate_rows as validate_amd_packed_rows;
 use crate::exec::device_api::EngineDevice;
 use crate::exec::kvrow::{
     derive_kvrow, derive_mla_nsplit, is_lm_head_matmul, kvrow_span, mla_live_nsplit,
-    prefill_row_field, rebase_chunk_rows, RowField,
+    prefill_row_field, ragged_band_rows, ragged_band_views, rebase_band_rows, rebase_chunk_rows,
+    RowField,
 };
 use crate::exec::{
     amd_gemm_blk, amd_gemm_lt, amd_index_tp, amd_mla_fold, amd_moe_aiter, amd_sparse_mla,
@@ -5959,6 +5960,9 @@ pub struct AmdEngine {
     kv_slot_stride: Vec<(usize, u64)>,
     /// Which sequence slot the KV pointers are currently rebased onto.
     kv_slot: usize,
+    /// `PLOW_AMD_RAGGED_SEAMS`: per prefill program, the band rows its `@band` views are
+    /// currently bound for (absent = the load-time `t / tp` binding).
+    band_rows_bound: std::collections::HashMap<usize, u32>,
     /// `(tensor, per-slot bytes)` for the CARRIED recurrent state — KDA `state`
     /// and `conv_state`, per-slot strided, `blkres` excluded for the reason
     /// [`AmdEngine::begin_slot`] gives. This is what a prefix snapshot copies.
@@ -10269,6 +10273,7 @@ impl AmdEngine {
             tens_table: table,
             kv_slot_stride,
             kv_slot: 0,
+            band_rows_bound: std::collections::HashMap::new(),
             carried_slot,
             prefix_snap: (0..batch).map(|_| None).collect(),
             prefix_regions: prefix::snapshot_regions(&blob.tensors,
@@ -12573,6 +12578,17 @@ impl AmdEngine {
             self.progs[prog].t,
             bucket.or_else(|| self.ragged_bucket(prog)),
         );
+        if let (true, Some(tp)) = (crate::config::RuntimeConfig::get().amd.ragged_seams, self.tp) {
+            let t = self.progs[prog].t;
+            let ragged = bucket.or_else(|| self.ragged_bucket(prog)).is_some_and(|b| clen < b);
+            let b = if ragged && t > 1 && t % tp.n_gpu == 0 {
+                rebase_band_rows(insts, &self.tensor_names, clen, t, tp.n_gpu);
+                ragged_band_rows(clen, t, tp.n_gpu)
+            } else {
+                t / tp.n_gpu.max(1)
+            };
+            self.rebind_band_views(prog, b)?;
+        }
         rebase_kda_key_factor_routes(&mut self.progs[prog].prefill_routes, clen);
         // The same `rows`/`kv_len` pair [`AmdEngine::prefill_prepare`] uploads to `in.kvlen`.
         let rows = if bucket.is_some_and(|t| clen < t) {
@@ -12660,6 +12676,36 @@ impl AmdEngine {
             self.progs[prog].d_inst.base,
             &self.h_pf_inst.as_slice()[..n * sz],
         )
+    }
+
+    /// `PLOW_AMD_RAGGED_SEAMS`: bind program `prog`'s `@band` views for bands of `b` rows per
+    /// rank. One table upload when the binding changes; a full chunk after a ragged one
+    /// restores the load-time layout. Runs where `patch_prefill_rows` runs: after the previous
+    /// chunk has drained, and decode programs read no band view.
+    fn rebind_band_views(&mut self, prog: usize, b: u32) -> Result<()> {
+        let Some(tp) = self.tp else {
+            return Ok(());
+        };
+        let t = self.progs[prog].t;
+        let loaded = t / tp.n_gpu.max(1);
+        if self.band_rows_bound.get(&prog).copied().unwrap_or(loaded) == b
+            || t < 2
+            || t % tp.n_gpu != 0
+        {
+            return Ok(());
+        }
+        let bases: Vec<u64> = self.devp.iter().map(|m| m.base).collect();
+        let lens: Vec<u64> = self.devp.iter().map(|m| m.len).collect();
+        let views = ragged_band_views(&self.tensor_names, &bases, &lens, t, tp.n_gpu, tp.rank, b);
+        if views.is_empty() {
+            return Ok(());
+        }
+        for (i, addr) in views {
+            self.tens_table[i * 8..i * 8 + 8].copy_from_slice(&addr.to_le_bytes());
+        }
+        EngineDevice::upload(&*self.be, &self.d_tens, 0, &self.tens_table)?;
+        self.band_rows_bound.insert(prog, b);
+        Ok(())
     }
 
     fn patch_prefill(&mut self, prog: usize, c0: u32, clen: u32) -> Result<()> {

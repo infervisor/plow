@@ -381,6 +381,68 @@ pub(crate) fn rebase_chunk_rows(
     }
 }
 
+/// Rows of each rank's band when a `t`-row sequence-parallel bucket carries `clen` live rows
+/// under `PLOW_AMD_RAGGED_SEAMS`: `ceil(clen / tp)`, at least one, at most the compiled `t / tp`.
+pub(crate) fn ragged_band_rows(clen: u32, t: u32, tp: u32) -> u32 {
+    clen.div_ceil(tp).clamp(1, t / tp)
+}
+
+/// `PLOW_AMD_RAGGED_SEAMS`: size a ragged chunk's sequence-parallel seams by its live rows.
+///
+/// Runs after [`rebase_chunk_rows`], which leaves band packets and the split collectives at the
+/// bucket. With `b = ceil(clen / tp)` band rows per rank, the reduce-scatter / all-gather cover
+/// `tp * b >= clen` rows, so each rank's flat slice `[n*r/tp, n*(r+1)/tp)` is exactly its band's
+/// whole rows `[r*b, (r+1)*b)`, and every band packet (output `<base>@band<t>...`) goes from
+/// `t / tp` rows to `b`. Rows `clen..tp*b` are padding, computed and never read. The band views
+/// must be rebound to match: [`ragged_band_views`].
+pub(crate) fn rebase_band_rows(insts: &mut [DevInst64], names: &[String], clen: u32, t: u32, tp: u32) {
+    let (tb, b) = (t / tp, ragged_band_rows(clen, t, tp));
+    let rescale = |v: u32, per: u32, to: u32| if v > 0 && v % per == 0 { v / per * to } else { v };
+    for d in insts.iter_mut() {
+        if d.op == DevOp::XReduceScatter as u16 {
+            d.i[0] = rescale(d.i[0], t, tp * b);
+        } else if d.op == DevOp::XAllGather as u16 {
+            for k in 0..3 {
+                d.i[k] = rescale(d.i[k], t, tp * b);
+            }
+        } else if names.get(d.t[0] as usize).is_some_and(|n| n.contains("@band")) {
+            match prefill_row_field(d.op) {
+                Some(RowField::Rows(f)) if d.i[f] == tb => d.i[f] = b,
+                Some(RowField::RowsTimes(f)) => d.i[f] = rescale(d.i[f], tb, b),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// `(tensor, address)` for every `<base>@band<t>...` view of a `t`-row program when each rank's
+/// band is `b` rows: `base + rank * b * row_bytes`, where `row_bytes = view_bytes / (t / tp)`.
+/// `b = t / tp` reproduces the load-time binding (`base + rank * view_bytes`).
+pub(crate) fn ragged_band_views(
+    names: &[String],
+    bases: &[u64],
+    lens: &[u64],
+    t: u32,
+    tp: u32,
+    rank: u32,
+    b: u32,
+) -> Vec<(usize, u64)> {
+    let tag = format!("@band{t}");
+    let mut out = Vec::new();
+    for (i, n) in names.iter().enumerate() {
+        let Some(pos) = n.find(&tag) else { continue };
+        if n[pos + tag.len()..].starts_with(|c: char| c.is_ascii_digit()) {
+            continue; // `@band8192` is not `@band81920`
+        }
+        let Some(bi) = names.iter().position(|x| *x == n[..pos]) else {
+            continue;
+        };
+        let row = lens[i] / (t / tp) as u64;
+        out.push((i, bases[bi] + rank as u64 * b as u64 * row));
+    }
+    out
+}
+
 pub(crate) const LM_HEAD_MATMUL_OPS: &[DevOp] = &[
     DevOp::Gemv,
     // bf16
