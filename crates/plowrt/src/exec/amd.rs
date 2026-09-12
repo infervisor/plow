@@ -3140,15 +3140,26 @@ fn derive_packed_segment_families(prog: &DevProg) -> Result<Vec<u8>> {
         .unwrap_or(1);
     let mut family = vec![None; n_seg];
     let mut pure = vec![true; n_seg];
+    // The packed norm twins size a norm packet by the batch (`i0 == T`) or, in a body, by the
+    // decode band; any other width reaches `plow_tb_rows`' decode-span branch and is cut to the
+    // decode-span count. A sequence-parallel seam's rank band (`i0 = T/tp`) is such a width: its
+    // plain row-local norm runs on the primary object, as in the ordinary program.
+    let packed = prog.role.is_packed_sibling() || prog.role.is_token_batch_body();
+    let band = prog.role.token_batch_band().filter(|&b| b > 0);
+    let mut narrow = vec![None; n_seg];
     for e in &prog.stream {
         let inst = prog.insts.get(e.inst as usize).ok_or_else(|| {
             RuntimeError::Device(format!("stream entry references instruction {}", e.inst))
         })?;
         let op = inst.op;
-        let next = if op == DevOp::RmsNorm as u16
+        let norm = op == DevOp::RmsNorm as u16
             || op == DevOp::HeadNormRope as u16
-            || op == DevOp::HeadNormRopeFp8 as u16
-        {
+            || op == DevOp::HeadNormRopeFp8 as u16;
+        if norm && packed && inst.i[0] != prog.t && Some(inst.i[0]) != band {
+            narrow[e.seg as usize] = Some(inst.i[0]);
+            continue;
+        }
+        let next = if norm {
             Some(5)
         } else if op == DevOp::FlashMlaPrefill as u16 || op == DevOp::FlashMlaPrefillFp8 as u16 {
             Some(6)
@@ -3181,6 +3192,20 @@ fn derive_packed_segment_families(prog: &DevProg) -> Result<Vec<u8>> {
             (Some(a), Some(b)) if a == b => {}
             _ => pure[s] = false,
         }
+    }
+    // Routing is per segment: a narrow norm beside packed-family packets would ride the twin
+    // with them, and demoting the segment would move the family's slot-addressed rows to the
+    // primary object.
+    if let Some((s, rows)) = narrow
+        .iter()
+        .enumerate()
+        .find_map(|(s, r)| r.filter(|_| family[s].is_some()).map(|r| (s, r)))
+    {
+        return Err(RuntimeError::Device(format!(
+            "program T={} segment {s} mixes a {rows}-row norm (neither the batch nor the decode \
+             band) with packed-family packets",
+            prog.t
+        )));
     }
     Ok(family
         .into_iter()

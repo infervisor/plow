@@ -5238,3 +5238,55 @@ fn decode_upload_rows_must_cover_the_batch() {
     assert!(check_decode_rows(20, &[5; 20], &[6; 19]).is_err());
     assert!(check_decode_rows(1, &[], &[]).is_err());
 }
+
+/// The packed norm twins size a norm packet by the batch or the decode band; any other width is
+/// cut to the decode-span count (`plow_tb_rows`). A body's sequence-parallel seam norms
+/// (`i0 = T/tp`) therefore run on the primary object, and a segment mixing one with a
+/// packed-family packet is refused. The seams-aware body lost its span rows' normed hidden state
+/// to exactly that cut (tier 4 tb-t6-t4: retrieval 9/18 + 0/21).
+#[test]
+fn a_body_routes_only_batch_and_band_wide_norms_to_the_packed_norm_twin() {
+    use packet::dev::{DevInst64, DevOp, StreamEnt};
+    use packet::devbuild::ProgramRole;
+    let inst = |op: DevOp, rows: u32| DevInst64 {
+        op: op as u16,
+        i: [rows, 0, 0, 0, 0, 0, 0, 0],
+        ..Default::default()
+    };
+    let prog = |role, insts: Vec<DevInst64>, segs: &[u16]| DevProg {
+        t: 8192,
+        role,
+        n_counter: 0,
+        stream: segs
+            .iter()
+            .enumerate()
+            .map(|(i, &seg)| StreamEnt { inst: i as u32, seg, ..Default::default() })
+            .collect(),
+        insts,
+        stream_ofs: vec![],
+        stream_len: vec![],
+        waits: vec![],
+        succs: vec![],
+        gq_stream: vec![],
+        gq_seg_ofs: vec![],
+        l2_domains: 0,
+    };
+    let insts = || {
+        vec![
+            inst(DevOp::RmsNorm, 8192),
+            inst(DevOp::HeadNormRope, 20),
+            inst(DevOp::RmsNorm, 1024),
+            inst(DevOp::FlashMlaPrefillFp8, 8192),
+        ]
+    };
+    let body = ProgramRole::TokenBatchBody { band: 20, rows: 8192 };
+    let fam = derive_packed_segment_families(&prog(body, insts(), &[0, 1, 2, 3])).unwrap();
+    assert_eq!(fam, [5, 5, 0, 6]);
+    // A seam norm sharing a segment with a batch-wide cache writer: refused, not demoted.
+    let mixed = prog(body, vec![inst(DevOp::RmsNorm, 1024), inst(DevOp::HeadNormRope, 8192)], &[0, 0]);
+    assert!(derive_packed_segment_families(&mixed).is_err());
+    // Ordinary programs never run on the packed twins and keep their classification.
+    let plain = ProgramRole::PrefillBucket { rows: 8192 };
+    let fam = derive_packed_segment_families(&prog(plain, insts(), &[0, 1, 2, 3])).unwrap();
+    assert_eq!(fam, [5, 5, 5, 6]);
+}
