@@ -666,6 +666,12 @@ impl RuntimeConfig {
         self.pf_interleave.unwrap_or(0)
     }
 
+    /// AMD per-rank NUMA-local kernarg ring and host staging (`PLOW_AMD_NUMA_HOST_POOLS`). Unset →
+    /// on; `=0` → the single first-CPU-agent placement.
+    pub fn amd_numa_host_pools(&self) -> bool {
+        self.amd.numa_host_pools.unwrap_or(true)
+    }
+
     /// AMD long-context tail placement floor (`PLOW_AMD_TAIL_SPARSE_CTX`). Unset → 16384
     /// rows; `0` → off. Acts only on packets with a sparse (DSA) prefill rung.
     pub fn amd_tail_sparse_ctx(&self) -> Option<u32> {
@@ -1102,9 +1108,10 @@ pub struct AmdRuntimeConfig {
 
     /// Allocate each rank's kernarg ring and fine-grained host staging from the CPU agent nearest
     /// its GPU (`HSA_AMD_AGENT_INFO_NEAREST_CPU`) instead of the first CPU agent, so a GPU on the
-    /// far socket reads its kernargs from local memory. Off = the single-agent placement.
-    #[arg(long = "amd-numa-host-pools", env = "PLOW_AMD_NUMA_HOST_POOLS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub numa_host_pools: bool,
+    /// far socket reads its kernargs from local memory. `=0` = the single-agent placement. Read
+    /// through `RuntimeConfig::amd_numa_host_pools`, which supplies the default (on).
+    #[arg(long = "amd-numa-host-pools", env = "PLOW_AMD_NUMA_HOST_POOLS", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub numa_host_pools: Option<bool>,
 }
 
 /// Global runtime config, initialized once at startup from CLI parse.
@@ -1394,6 +1401,22 @@ mod tests {
                     .fusion,
                 enabled
             );
+        }
+    }
+
+    #[test]
+    fn numa_host_pools_default_on_and_false_turns_them_off() {
+        use clap::{Args, FromArgMatches};
+        let command = super::RuntimeConfig::augment_args(clap::Command::new("test"));
+        for (args, want) in [
+            (&["test"][..], true),
+            (&["test", "--amd-numa-host-pools=false"][..], false),
+            (&["test", "--amd-numa-host-pools=0"][..], false),
+            (&["test", "--amd-numa-host-pools"][..], true),
+        ] {
+            let matches = command.clone().try_get_matches_from(args).unwrap();
+            let cfg = super::RuntimeConfig::from_arg_matches(&matches).unwrap();
+            assert_eq!(cfg.amd_numa_host_pools(), want, "{args:?}");
         }
     }
 
