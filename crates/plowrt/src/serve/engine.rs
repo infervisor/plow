@@ -748,11 +748,11 @@ mod amd_serve {
                 .unwrap_or(0)
         }
 
-        /// Span capacity of the body as wide as `bucket`, if the packet carries one.
-        fn span_capacity_at(&self, bucket: u32) -> Option<u32> {
+        /// Span capacity of a body as wide as `bucket` that `admissible` accepts.
+        fn span_capacity_at(&self, bucket: u32, admissible: impl Fn(usize) -> bool) -> Option<u32> {
             self.bodies
                 .iter()
-                .find(|&&(_, t)| t == bucket)
+                .find(|&&(prog, t)| t == bucket && admissible(prog))
                 .map(|&(_, t)| t - self.band)
         }
 
@@ -1064,40 +1064,44 @@ mod amd_serve {
         Ok(retired)
     }
 
-    /// The chunk plan of `[from, to)` with every step but the last capped at the span capacity
-    /// of the token-batch body as wide as its bucket. Planned whole, a middle chunk on such a
-    /// bucket (8192 rows against a span of 8192 - band) can never ride that body, so it runs
-    /// isolated and its tick's decode rows take a separate pass. A capped step keeps its bucket
-    /// and the rows it gives up start the re-planned remainder; buckets without a same-width
-    /// body, and the final chunk, keep the planner's choice.
+    /// The chunk plan of `[from, to)` with middle chunks capped to the span of a token-batch body
+    /// that can take them. Planned whole, a middle chunk on the 8192 bucket (8192 rows against a
+    /// span of 8192 - band) can never ride the 8192 body, so it runs isolated and its tick's
+    /// decode rows take a separate pass. A cap costs a launch when the rows it gives up do not
+    /// fit the rest of the plan, and at deep context a launch costs about what riding saves, so
+    /// a chunk is capped only when the re-planned remainder keeps the planner's launch count;
+    /// otherwise it runs whole, as before. `capacity(bucket, c0)` is the span capacity of a body
+    /// of that width admissible for a span starting at `c0`.
     fn cap_chunks_to_bodies(
         from: u32,
         to: u32,
         plan: impl Fn(u32, u32) -> Result<Vec<crate::exec::amd::ChunkStep>>,
         bucket: impl Fn(usize) -> u32,
-        capacity: impl Fn(u32) -> Option<u32>,
+        capacity: impl Fn(u32, u32) -> Option<u32>,
     ) -> Result<Vec<crate::exec::amd::ChunkStep>> {
         let mut out = Vec::new();
         let mut c0 = from;
-        while c0 < to {
+        'plan: while c0 < to {
             let steps = plan(c0, to)?;
-            let middle = steps.len().saturating_sub(1);
-            let cap_of = |step: &crate::exec::amd::ChunkStep| {
-                capacity(bucket(step.prog)).filter(|&cap| cap > 0 && step.clen > cap)
-            };
-            match steps[..middle].iter().position(|step| cap_of(step).is_some()) {
-                None => {
-                    out.extend(steps);
-                    break;
-                }
-                Some(i) => {
-                    let mut step = steps[i];
-                    step.clen = cap_of(&step).expect("the cut step exceeds its body");
-                    c0 = step.c0 + step.clen;
+            let middle = &steps[..steps.len().saturating_sub(1)];
+            for (i, &step) in middle.iter().enumerate() {
+                let Some(cap) = capacity(bucket(step.prog), step.c0)
+                    .filter(|&cap| cap > 0 && step.clen > cap)
+                else {
+                    continue;
+                };
+                if i + 1 + plan(step.c0 + cap, to)?.len() <= steps.len() {
                     out.extend_from_slice(&steps[..i]);
-                    out.push(step);
+                    out.push(crate::exec::amd::ChunkStep { clen: cap, ..step });
+                    c0 = step.c0 + cap;
+                } else {
+                    out.extend_from_slice(&steps[..=i]);
+                    c0 = step.c0 + step.clen;
                 }
+                continue 'plan;
             }
+            out.extend(steps);
+            break;
         }
         Ok(out)
     }
@@ -1732,7 +1736,12 @@ mod amd_serve {
                         to,
                         |a, b| g.plan_span_at_most(a, b, max_bucket),
                         |prog| g.rank0().prog_t(prog),
-                        |bucket| tb.and_then(|tb| tb.span_capacity_at(bucket)),
+                        |bucket, c0| match (g, tb) {
+                            (Ranks::Tp(group), Some(tb)) => tb.span_capacity_at(bucket, |prog| {
+                                group.packed_span_admissible(prog, c0)
+                            }),
+                            _ => None,
+                        },
                     )
                 };
                 let (steps, snap_after) = {
@@ -3175,7 +3184,7 @@ mod amd_serve {
         use crate::exec::amd::ChunkStep;
 
         #[test]
-        fn middle_chunks_on_a_bodied_bucket_are_capped_to_the_body_span() {
+        fn middle_chunks_ride_the_body_span_without_an_extra_launch() {
             // The packet's ladder under the planner's own cover rule (ragged), and an 8192-row
             // body whose span is 8192 - 20 band rows.
             let buckets = [128u32, 512, 2048, 8192];
@@ -3199,39 +3208,47 @@ mod amd_serve {
             let shape = |plan: &[ChunkStep]| {
                 plan.iter().map(|s| (buckets[s.prog], s.c0, s.clen)).collect::<Vec<_>>()
             };
-            let capped = |n: u32, body: u32| {
+            // `sparse`: the body admits a span only from 2048 keys deep, as the DSA body does.
+            let capped = |n: u32, sparse: bool| {
                 cap_chunks_to_bodies(
                     0,
                     n,
                     |a, b| steps_of(a, b),
                     |prog| buckets[prog],
-                    |bucket| (bucket == body).then_some(body - 20),
+                    |bucket, c0| (bucket == 8192 && (!sparse || c0 >= 2048)).then_some(8172),
                 )
                 .unwrap()
             };
-            // Uncapped, the middle chunks take 8192 rows and no 8192 body can hold them.
+            // Free: 20000 rows take three launches capped or not.
             assert_eq!(
                 shape(&steps_of(0, 20000).unwrap()),
                 [(8192, 0, 8192), (8192, 8192, 8192), (8192, 16384, 3616)]
             );
             assert_eq!(
-                shape(&capped(20000, 8192)),
+                shape(&capped(20000, false)),
                 [(8192, 0, 8172), (8192, 8172, 8172), (8192, 16344, 3656)]
             );
-            // The cost when the remainder is small: one extra launch, small enough to ride.
+            // A sparse body cannot take the first chunk, so that chunk keeps its rows.
             assert_eq!(
-                shape(&capped(16384, 8192)),
-                [(8192, 0, 8172), (8192, 8172, 8172), (128, 16344, 40)]
+                shape(&capped(20000, true)),
+                [(8192, 0, 8192), (8192, 8192, 8172), (8192, 16364, 3636)]
             );
-            // A bucket without a same-width body keeps the planner's plan.
-            assert_eq!(shape(&capped(20000, 2048)), shape(&steps_of(0, 20000).unwrap()));
-            for n in [1, 8172, 8173, 8192, 8193, 16384, 20000, 40961] {
-                let plan = capped(n, 8192);
-                assert_eq!(plan.first().map(|s| s.c0), Some(0));
-                assert!(plan.windows(2).all(|w| w[0].c0 + w[0].clen == w[1].c0), "{n}");
-                let last = plan.last().unwrap();
-                assert_eq!(last.c0 + last.clen, n);
-                assert!(plan[..plan.len() - 1].iter().all(|s| s.clen <= 8172), "{n}");
+            // Binding: capping either chunk of 16384 rows would add a launch, so both run whole.
+            assert_eq!(shape(&capped(16384, false)), shape(&steps_of(0, 16384).unwrap()));
+            // Partial: 36 spare rows pay for one cap, not two; the second chunk runs whole.
+            assert_eq!(
+                shape(&capped(24540, false)),
+                [(8192, 0, 8172), (8192, 8172, 8192), (8192, 16364, 8176)]
+            );
+            for n in [1, 2048, 8172, 8193, 16364, 16384, 20000, 24540, 24576, 40961, 65000, 79747] {
+                for sparse in [false, true] {
+                    let (plan, whole) = (capped(n, sparse), steps_of(0, n).unwrap());
+                    assert_eq!(plan.len(), whole.len(), "{n} sparse={sparse}: extra launch");
+                    assert_eq!(plan.first().map(|s| s.c0), Some(0));
+                    assert!(plan.windows(2).all(|w| w[0].c0 + w[0].clen == w[1].c0), "{n}");
+                    let last = plan.last().unwrap();
+                    assert_eq!(last.c0 + last.clen, n);
+                }
             }
         }
 
