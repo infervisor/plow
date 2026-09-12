@@ -246,44 +246,100 @@ pub(super) fn attach_ranks<T>(
     ranks: &mut [T],
     slot: usize,
     prompt: &[u32],
-    mut cache: impl for<'a> FnMut(&'a mut T) -> &'a mut SharedPrefix,
+    cache: impl for<'a> FnMut(&'a mut T) -> &'a mut SharedPrefix,
 ) -> Result<u32> {
-    if ranks.is_empty()
-        || ranks
-            .iter_mut()
-            .any(|rank| slot >= cache(rank).pending.len())
-    {
+    let parallel = crate::config::RuntimeConfig::get().amd.attach_parallel;
+    attach_ranks_with(ranks, slot, prompt, cache, parallel)
+}
+
+/// `parallel` (`PLOW_AMD_ATTACH_PARALLEL`): stage every rank on its own thread instead of one
+/// after another up to the first that misses, fails or disagrees with rank 0's rows. The result is
+/// the same; the parallel form also stages (and then rolls back) ranks past that point, which the
+/// serial form never touches.
+fn attach_ranks_with<T>(
+    ranks: &mut [T],
+    slot: usize,
+    prompt: &[u32],
+    mut cache: impl for<'a> FnMut(&'a mut T) -> &'a mut SharedPrefix,
+    parallel: bool,
+) -> Result<u32> {
+    let mut caches: Vec<&mut SharedPrefix> = ranks.iter_mut().map(|rank| cache(rank)).collect();
+    if caches.is_empty() || caches.iter().any(|cache| slot >= cache.pending.len()) {
         return Err(RuntimeError::Rejected(
             "prefix attachment requires ranks and a valid slot".into(),
         ));
     }
-    let mut attempted = 0;
-    let (mut flush_ns, mut stage_ns, mut commit_ns) = (0u64, 0u64, 0u64);
-    let result = (|| {
-        let mut common = None;
-        for rank in ranks.iter_mut() {
-            attempted += 1;
-            // `stage_attach` flushes first anyway; flushing here only separates its time.
-            let t = std::time::Instant::now();
-            cache(rank).flush_publish()?;
-            flush_ns += t.elapsed().as_nanos() as u64;
-            let t = std::time::Instant::now();
-            let rows = cache(rank).stage_attach(slot, prompt)?;
-            stage_ns += t.elapsed().as_nanos() as u64;
-            if rows == 0 {
-                attempted -= 1;
-                return Ok(0);
-            }
-            if common.is_some_and(|common| common != rows) {
-                return Ok(0);
-            }
-            common = Some(rows);
-        }
-        let rows = common.unwrap();
+    let t0 = std::time::Instant::now();
+    let ns = |t: std::time::Instant| t.elapsed().as_nanos() as u64;
+    // Per staged rank: outcome, flush ns, stage ns, and [start, end) ns since `t0`.
+    let stage = |cache: &mut SharedPrefix| -> (Result<u32>, u64, u64, u64, u64) {
+        let start = ns(t0);
+        // `stage_attach` flushes first anyway; flushing here only separates its time.
         let t = std::time::Instant::now();
-        for rank in ranks.iter_mut() {
-            let cache = cache(rank);
-            cache.commit_attach(slot, rows)?;
+        let flushed = cache.flush_publish();
+        let flush = ns(t);
+        let t = std::time::Instant::now();
+        let rows = flushed.and_then(|()| cache.stage_attach(slot, prompt));
+        (rows, flush, ns(t), start, ns(t0))
+    };
+    let mut staged = Vec::with_capacity(caches.len());
+    if parallel {
+        let stage = &stage;
+        std::thread::scope(|scope| {
+            let threads: Vec<_> = caches
+                .iter_mut()
+                .map(|cache| scope.spawn(move || stage(cache)))
+                .collect();
+            staged.extend(
+                threads
+                    .into_iter()
+                    .map(|thread| thread.join().expect("attach stage thread panicked")),
+            );
+        });
+    } else {
+        let mut first = None;
+        for cache in caches.iter_mut() {
+            let outcome = stage(cache);
+            let rows = outcome.0.as_ref().ok().copied().unwrap_or(0);
+            staged.push(outcome);
+            if rows == 0 || *first.get_or_insert(rows) != rows {
+                break;
+            }
+        }
+    }
+    // A rank that staged a hit (or failed) holds attach state to roll back; a clean miss
+    // already cleaned up in `stage_attach`.
+    let rollback: Vec<bool> = staged.iter().map(|r| !matches!(r.0, Ok(0))).collect();
+    let mut result: Result<u32> = Ok(0);
+    let mut common = None;
+    let mut agree = staged.len() == caches.len();
+    for r in &mut staged {
+        match std::mem::replace(&mut r.0, Ok(0)) {
+            Err(error) => {
+                if result.is_ok() {
+                    result = Err(error);
+                }
+                agree = false;
+            }
+            Ok(0) => agree = false,
+            Ok(rows) => {
+                if common.is_some_and(|common| common != rows) {
+                    agree = false;
+                }
+                common = Some(rows);
+            }
+        }
+    }
+    if result.is_ok() && agree {
+        result = Ok(common.unwrap_or(0));
+    }
+    let t = std::time::Instant::now();
+    if let Some(rows) = result.as_ref().ok().copied().filter(|&rows| rows > 0) {
+        for cache in caches.iter_mut() {
+            if let Err(error) = cache.commit_attach(slot, rows) {
+                result = Err(error);
+                break;
+            }
             tracing::debug!(
                 slot,
                 rows,
@@ -291,25 +347,33 @@ pub(super) fn attach_ranks<T>(
                 "AMD shared prefix attached"
             );
         }
-        commit_ns = t.elapsed().as_nanos() as u64;
-        Ok(rows)
-    })();
+    }
+    let commit_ns = ns(t);
     if crate::obs::tick::on() {
         let ms = |ns: u64| ns as f64 / 1e6;
+        let timeline: Vec<String> = staged
+            .iter()
+            .map(|r| format!("{:.1}-{:.1}", ms(r.3), ms(r.4)))
+            .collect();
         eprintln!(
-            "PFATTACH slot={slot} rows={} ranks={} flush={:.3} stage={:.3} commit={:.3}",
+            "PFATTACH slot={slot} rows={} ranks={} flush={:.3} stage={:.3} commit={:.3} parallel={} stage_wall={:.3} timeline={}",
             result.as_ref().map_or(0, |&rows| rows),
-            ranks.len(),
-            ms(flush_ns),
-            ms(stage_ns),
+            caches.len(),
+            ms(staged.iter().map(|r| r.1).sum()),
+            ms(staged.iter().map(|r| r.2).sum()),
             ms(commit_ns),
+            u8::from(parallel),
+            ms(staged.iter().map(|r| r.4).max().unwrap_or(0)),
+            timeline.join(","),
         );
     }
     if !matches!(result, Ok(rows) if rows > 0) {
         let mut rollback_error = None;
-        for rank in &mut ranks[..attempted] {
-            if let Err(error) = cache(rank).begin_slot(slot) {
-                rollback_error = Some(error);
+        for (cache, &roll) in caches.iter_mut().zip(&rollback) {
+            if roll {
+                if let Err(error) = cache.begin_slot(slot) {
+                    rollback_error = Some(error);
+                }
             }
         }
         if let Some(error) = rollback_error {
@@ -1054,6 +1118,17 @@ mod tests {
 
     #[test]
     fn rank_attachment_rolls_back_hits_without_remapping_clean_misses() {
+        rank_attachment_case(false);
+    }
+
+    /// The same cases staged one thread per rank (`PLOW_AMD_ATTACH_PARALLEL`): identical results
+    /// and memory, every hit rolled back when any rank misses, mismatches or fails.
+    #[test]
+    fn parallel_rank_attachment_matches_the_serial_result() {
+        rank_attachment_case(true);
+    }
+
+    fn rank_attachment_case(parallel: bool) {
         for case in 0..5 {
             let ops: Vec<_> = (0..3).map(|_| Arc::new(Driver::default())).collect();
             let (mut ranks, bases): (Vec<_>, Vec<_>) = ops.iter().cloned().map(cache).unzip();
@@ -1075,14 +1150,20 @@ mod tests {
             if case == 3 {
                 ops[1].0.lock().unwrap().fail_copy = 2;
             }
-            let result = attach_ranks(&mut ranks, 1, &prompt, |cache| cache);
+            let result = attach_ranks_with(&mut ranks, 1, &prompt, |cache| cache, parallel);
             if case == 3 {
                 assert!(result.is_err());
             } else {
                 assert_eq!(result.unwrap(), if case == 4 { 96 } else { 0 });
             }
             for rank in 0..3 {
-                let untouched = case == 0 || case == 1 && rank >= 1 || case == 2 && rank == 2;
+                // The serial stage stops at the first rank that does not attach; the parallel one
+                // stages every rank and rolls back the hits, so only the misses stay untouched.
+                let untouched = if parallel {
+                    case == 0 || case == 1 && rank == 1
+                } else {
+                    case == 0 || case == 1 && rank >= 1 || case == 2 && rank == 2
+                };
                 if untouched {
                     assert_eq!(ops[rank].0.lock().unwrap().mappings, mappings[rank]);
                 }
