@@ -616,6 +616,36 @@ That is residual decode-state drift the socket pin reduced but did not remove.
 **Call: stays opt-in.** A flip would need a resolved served gain, which this A/B does not show, and
 the broader accuracy gate (GSM8K plus long retrieval at C20) for ~2e-2 per-projection error.
 
+## FP8 keys for the sparse MLA prefill: measured negative (2026-09-12, `sparse-mla-fp8-keys.md`)
+
+Code on branch `sparse-mla-fp8-keys` (7fbd385a + 104a1ec9), opt-in `PLOW_MLA_PF_FP8_KEYS`, **not merged**.
+It routes the sparse MLA prefill through AITER's gfx942 QH8 a8w8 object (`mla_a8w8_qh8_qseqlen1_gqaratio8_v1.co`)
+with a per-launch requantisation: an amax pass; a pack to e4m3fnuz with one Q scale and one K scale; the
+attention; then a widen ×Sk into the FP32 buffer the fold reads.
+
+* **Why the earlier attempt returned NaNs** (read off the object's disassembly): gfx942 FP8 is e4m3fnuz, so
+  plow's OCP bytes read as half their value and OCP −0 (0x80) is fnuz NaN; at one KV split the kernel writes
+  BF16 (`s_cmp_eq_u32 kv_split, 1 → R_write_out_bf16`), not FP32; and it never applies DSK to its output.
+* **Shape measured:** the steady 8192-row chunk at prior 65,536 (ctx 73,728), real top-2048 selections,
+  layers 0–3 captured from a 76,000-token real-text request on the truncated TP8 packet (`plowc --layers 4`),
+  one GPU (job `0-1789186943-fp8keys-tier2`).
+* **Per-launch split** (drained, medians over 4 layers × 11 launches): BF16 single-pass
+  130.9 + 2101.6 = **2232.5 µs/layer**; FP8 keys 70.1 (amax) + 83.7 (pack) + 1918.8 (attention) + 81.8 (widen)
+  = **2154.4 µs/layer**. Attention −8.7%, route −78 µs/layer: **−6.1 ms per 8192 chunk (×78)**. The ceiling,
+  with free requantisation, is the attention alone at **−14.3 ms**.
+* **Numerics**, attention-output rel-L2 against an f64 reference over the exact dequantised cache (every 16th
+  row × 8 heads): FP8 keys 2.01e-2 / 3.61e-2 / 3.22e-2 / 7.56e-2 for layers 0–3 (worst single head-row 0.046 /
+  0.15 / 0.18 / 0.52), against 1.1e-3 / 6.8e-4 / 5.7e-4 / 1.5e-3 for the BF16 route. The device numbers match
+  an offline model of the same rounding (2.0e-2 / 3.8e-2 / 3.4e-2 / 7.1e-2), so this is the kernel's floor: Q
+  and K each lose ~2.5% to e4m3's 3-bit mantissa, and the one K scale must also cover rope keys 60–215× the
+  latent. Rebalancing the rope between Q and K (exact for the scores) did not help in the model.
+* **Verdict:** no-go. −6 ms per chunk does not buy a 20–50× worse attention error, so no truncated-packet or
+  served run was spent on it.
+* **Why v1 misses the 2× the halved gather bytes suggested:** not established. Both objects run one 256-thread
+  workgroup per CU (64 KB LDS each); the v1 a8w8 kernel is an older design than the v3 BF16 one. A plausible
+  reading is that at that occupancy the per-query 2048-row gather is latency-bound rather than
+  Infinity-Cache-bandwidth-bound, but no counter data was taken.
+
 ## Artefact policy (applied on every merge)
 
 Raw measurement files pushed upstream are removed here before the branch goes to main:
