@@ -234,6 +234,13 @@ extern "C" __device__ unsigned plow_xr_sched_aiter_1 = 1;
 #define PLOW_XR_SCHED_NWG 0
 #endif
 #define PLOW_XR_SCHED_CAP (PLOW_XR_SCHED_ON && PLOW_XR_SCHED_NWG > 0)
+/* The two-shot's reduce-scatter may use its own cap: the RS reads eight peers per lane and is
+ * fastest on fewer workgroups than the all-gather. Defaults to PLOW_XR_SCHED_NWG. */
+#ifndef PLOW_XR_SCHED_NWG_RS
+#define PLOW_XR_SCHED_NWG_RS PLOW_XR_SCHED_NWG
+#endif
+#define PLOW_XR_SCHED_NWG_MAX \
+    (PLOW_XR_SCHED_NWG > PLOW_XR_SCHED_NWG_RS ? PLOW_XR_SCHED_NWG : PLOW_XR_SCHED_NWG_RS)
 #if PLOW_XR_SCHED_CAP
 extern "C" __device__ unsigned plow_xr_sched_nwg = PLOW_XR_SCHED_NWG;
 #if defined(PLOW_XR_ATTNRES) && PLOW_XR_ATTNRES
@@ -1226,7 +1233,7 @@ __device__ __forceinline__ void d_xreduce_twoshot_mega(
 #endif
     const unsigned tid = slice * PLOW_THREADS + threadIdx.x;
 #if PLOW_XR_SCHED_CAP
-    if (slice >= PLOW_XR_SCHED_NWG) {
+    if (slice >= PLOW_XR_SCHED_NWG_MAX) {
         if (threadIdx.x == 0) {
             xr2_arrive_ag(peer_scratch, nranks, rank, xctr_byte_off, gate_ag, nblk);
 #if PLOW_XR_TRACE_PHASES
@@ -1240,8 +1247,12 @@ __device__ __forceinline__ void d_xreduce_twoshot_mega(
         return;
     }
     const unsigned dnblk = nblk < PLOW_XR_SCHED_NWG ? nblk : PLOW_XR_SCHED_NWG;
+    const bool xr_rs_on = slice < PLOW_XR_SCHED_NWG_RS;
+    const unsigned rs_stride =
+        (nblk < PLOW_XR_SCHED_NWG_RS ? nblk : PLOW_XR_SCHED_NWG_RS) * PLOW_THREADS;
 #else
     const unsigned dnblk = nblk;
+    constexpr bool xr_rs_on = true;
 #endif
     const unsigned stride = dnblk * PLOW_THREADS;
 
@@ -1261,7 +1272,7 @@ __device__ __forceinline__ void d_xreduce_twoshot_mega(
         xr_trace->pc = (uint32_t)(d > 0xffffffffull ? 0xffffffffull : d);
     }
 #endif
-    if (threadIdx.x == 0) {
+    if (threadIdx.x == 0 && xr_rs_on) {
 #if !PLOW_XR2_SKIP_RS
         uint32_t* lg = PLOW_CTR((uint32_t*)((char*)peer_scratch[rank] + xctr_byte_off), gate_rs);
         const uint64_t t0 = __builtin_amdgcn_s_memrealtime();
@@ -1293,7 +1304,11 @@ __device__ __forceinline__ void d_xreduce_twoshot_mega(
     const uint32_t my_lo = (uint32_t)(((uint64_t)n * rank) / nranks);
     const uint32_t my_hi = (uint32_t)(((uint64_t)n * (rank + 1)) / nranks);
     bf16* my_part = (bf16*)((char*)peer_scratch[rank] + slot_bytes);
-#if PLOW_XR_SCHED_ON
+#if PLOW_XR_SCHED_CAP
+    if (xr_rs_on)
+        xr_rs_sched(peer_scratch, nranks, slot_bytes, my_part, my_lo, my_hi, tid, rs_stride, 0u,
+                    0u, nullptr);
+#elif PLOW_XR_SCHED_ON
     xr_rs_sched(peer_scratch, nranks, slot_bytes, my_part, my_lo, my_hi, tid, stride, 0u, 0u,
                 nullptr);
 #else

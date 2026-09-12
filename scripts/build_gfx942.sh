@@ -784,10 +784,11 @@ fi
 
 # OPT-IN (PLOW_XR_SCHED=aiter): the 16-byte prefill collective schedule (op_collective.h
 # PLOW_XR_SCHED_AITER) on the first PLOW_XR_SCHED_NWG workgroups of each two-shot / op 25 / op 26
-# packet; the rest only arrive. Objects only, the packet is unchanged. Bit-identical.
+# packet (the two-shot's reduce-scatter on the first PLOW_XR_SCHED_NWG_RS); the rest only arrive.
+# Objects only, the packet is unchanged. Bit-identical.
 case "${PLOW_XR_SCHED:-off}" in
   off) ;;
-  aiter) AX_PREFILL="$AX_PREFILL -DPLOW_XR_SCHED_AITER=1 -DPLOW_XR_SCHED_NWG=${PLOW_XR_SCHED_NWG:-24} -DPLOW_XR_SCHED_AG_U=${PLOW_XR_SCHED_AG_U:-1}" ;;
+  aiter) AX_PREFILL="$AX_PREFILL -DPLOW_XR_SCHED_AITER=1 -DPLOW_XR_SCHED_NWG=${PLOW_XR_SCHED_NWG:-24} -DPLOW_XR_SCHED_NWG_RS=${PLOW_XR_SCHED_NWG_RS:-8} -DPLOW_XR_SCHED_AG_U=${PLOW_XR_SCHED_AG_U:-1}" ;;
   *) echo "FAIL: PLOW_XR_SCHED must be off or aiter" >&2; exit 2 ;;
 esac
 
