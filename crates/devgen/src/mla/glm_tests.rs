@@ -7,6 +7,145 @@
 //! the tile choice offline.
 use super::*;
 
+/// Reads of a tensor whose latest write was one rank's rows (a `<base>@band` view or a
+/// reduce-scatter's in-place slot band) before an all-gather or a full write refilled it.
+/// `IndexTpPf`'s peer slot (t6) is write-first: its select pass overwrites every row its gather
+/// reads, behind the op's own entry rendezvous (`runtime/amd/dsa_tp_adapter.hip`).
+fn band_only_reads(insts: &[crate::DevInst], names: &[&str]) -> Vec<String> {
+    let name = |h: u32| names.get(h as usize).copied().unwrap_or("");
+    let mut banded = std::collections::HashSet::new();
+    let mut bad = Vec::new();
+    for (i, d) in insts.iter().enumerate() {
+        if d.op == DevOp::XAllGather as u16 {
+            for h in &d.t[..3] {
+                banded.remove(h);
+            }
+            continue;
+        }
+        if d.op == DevOp::IndexTpPf as u16 {
+            banded.remove(&d.t[6]);
+        }
+        if d.op != DevOp::XReduceScatter as u16 {
+            let reads = d.t[1..].iter().filter(|h| banded.contains(*h));
+            bad.extend(reads.map(|&h| format!("inst {i} op {} reads {}", d.op, name(h))));
+        }
+        let out = d.t[0];
+        match name(out).split_once("@band") {
+            Some((base, _)) => {
+                banded.extend(names.iter().position(|x| *x == base).map(|h| h as u32));
+            }
+            None if d.op == DevOp::XReduceScatter as u16 => {
+                banded.insert(out);
+            }
+            None => {
+                banded.remove(&out);
+            }
+        }
+    }
+    bad
+}
+
+/// The production recipe (glm53-tp8-90a1b438's recorded knobs; seams, band projections and the
+/// W_uv fold by production default), emitted whole: dense and MoE layers, full and shared
+/// indexers, every bucket with its tail, and the decode rungs. No program reads rows only one
+/// rank holds. The shipped packet 0xa6e7db0b3b83e581, checked instruction by instruction under
+/// the same rule, is clean.
+#[test]
+fn production_programs_read_only_rows_every_rank_holds() {
+    use std::sync::{Arc, Mutex};
+    let _guard = crate::test_env::env_guard();
+    let _target = crate::EmitAmdGuard::set(true);
+    let dir = std::env::temp_dir().join(format!("plow-glm-band-reads-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // Layers 0-2 dense and 3-4 MoE: the seams chain across the dense->MoE boundary, and layer
+    // 4's full indexer selects into the peer slot layer 3's reduce-scatter left banded.
+    let config = serde_json::json!({
+        "model_type": "glm_moe_dsa", "num_hidden_layers": 5,
+        "hidden_size": 6144, "num_attention_heads": 64,
+        "kv_lora_rank": 512, "q_lora_rank": 2048,
+        "qk_nope_head_dim": 192, "qk_rope_head_dim": 64, "v_head_dim": 256,
+        "vocab_size": 128, "rms_norm_eps": 1e-5,
+        "n_routed_experts": 256, "num_experts_per_tok": 8,
+        "moe_intermediate_size": 2048, "intermediate_size": 12288,
+        "first_k_dense_replace": 3, "routed_scaling_factor": 2.5,
+        "rope_theta": 8000000.0,
+        "indexer_types": ["full", "shared", "full", "shared", "full"]
+    });
+    std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+    let _env = crate::test_env::EnvScope::set(&[
+        ("PLOW_FP8", "1"),
+        ("PLOW_GLM_DECODE_NORM_ROWS", "1"),
+        ("PLOW_GLM_DSA", "1"),
+        ("PLOW_GLM_DSA_PF", "1"),
+        ("PLOW_GLM_DSA_PF_SPAN", "3"),
+        ("PLOW_GLM_FP8_KV", "1"),
+        ("PLOW_GLM_FUSE_B1", "1"),
+        ("PLOW_GLM_FUSE_ROPE", "0"),
+        ("PLOW_GLM_FUSE_SEAM", "1"),
+        ("PLOW_GLM_GEMM_LT", "1"),
+        ("PLOW_GLM_GEMM_LT_DECODE", "1"),
+        ("PLOW_GLM_INDEX_TP", "1"),
+        ("PLOW_GLM_MOE_AITER", "1"),
+        ("GLM_MOE_CORESIDENT", "2"),
+        ("PLOW_GLM_MOE_FLAT_DECODE", "0"),
+        ("PLOW_GLM_MOE_RESIDENT", "1"),
+        ("PLOW_GLM_PLACE_PF", "0"),
+        ("PLOW_GLM_SELECT_LOCAL", "1"),
+        ("GLM_SHARD_HEAD", "1"),
+        ("GLM_SHARED_CUS", "48"),
+        ("PLOW_MLA_PREFILL", "full:128,512,2048,8192"),
+        ("PLOW_MOE_PF_DET", "1"),
+        ("PLOW_EMIT_PACKED_PREFILL", "0"),
+        ("PLOW_DECODE_BATCH", "20"),
+        ("PLOW_DECODE_BATCH_LADDER", "1,2,4,8,16,20"),
+        ("PLOW_UNISEG", "0"),
+        ("PLOW_MLA_PF_V2", "1"),
+        ("PLOW_MLA_PF_AITER", "1"),
+        // The recorded production defaults, which `glm_emit_full` does not apply.
+        ("PLOW_GLM_SEQ_PAR", "1"),
+        ("PLOW_GLM_SEQ_PAR_PROJ", "1"),
+        ("PLOW_GLM_FOLD_LT", "1"),
+        ("PLOW_GLM_GEMM_LT_DECODE_EXT", "1"),
+    ]);
+    // Per program: (t, violations, reduce-scatters, TP indexer packets).
+    type Seen = Vec<(u32, Vec<String>, usize, usize)>;
+    let seen: Arc<Mutex<Seen>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    let verify: crate::VerifyHook = Box::new(move |model| {
+        let names: Vec<&str> = model.tensors.iter().map(|x| x.name.as_str()).collect();
+        *sink.lock().unwrap() = model
+            .progs
+            .iter()
+            .zip(&model.prog_t)
+            .map(|(p, &t)| {
+                let count = |op: DevOp| p.insts.iter().filter(|d| d.op == op as u16).count();
+                let bad = band_only_reads(&p.insts, &names);
+                (t, bad, count(DevOp::XReduceScatter), count(DevOp::IndexTpPf))
+            })
+            .collect();
+        Ok(crate::LeanReport::skipped("structural regression test"))
+    });
+    glm_emit_full(
+        &dir,
+        81920,
+        dir.join("model.pkt").to_str().unwrap(),
+        304,
+        8,
+        true,
+        true,
+        "gfx942",
+        None,
+        Some(&verify),
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+    let seen = seen.lock().unwrap();
+    assert!(seen.iter().any(|e| e.2 > 0), "no program carries the seams");
+    assert!(seen.iter().any(|e| e.2 > 0 && e.3 > 0), "no seams program runs the TP indexer");
+    for (t, bad, _, _) in seen.iter() {
+        assert!(bad.is_empty(), "program t={t:#x}: {bad:?}");
+    }
+}
+
 #[test]
 fn single_row_prefill_gemv_preserves_bf16_projection_layout() {
     let _guard = crate::test_env::env_guard();

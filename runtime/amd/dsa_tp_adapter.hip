@@ -123,6 +123,7 @@ struct DsaTpGatherArgs {
 };
 static_assert(sizeof(DsaTpGatherArgs) == 64);
 
+// Copies each peer's WHOLE row band [src*band, min((src+1)*band, rows)) from its slot: plain-form select wrote all of it after the entry gate; in the span form rows outside every span carry stale slot bytes that nothing reads (the packed flash walks spans; a body's band selects into n.iidx).
 extern "C" __global__ void plow_dsa_tp_gather(DsaTpGatherArgs a) {
 #if defined(__HIP_DEVICE_COMPILE__)
     __shared__ int bailed;
