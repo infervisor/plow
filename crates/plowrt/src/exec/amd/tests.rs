@@ -5193,3 +5193,14 @@ fn token_batch_body_refuses_a_native_only_packet_without_its_route() {
     plain.role = packet::devbuild::ProgramRole::PackedSibling { of_rows: plain.t };
     assert!(token_batch_body_native_routes(&plain, &[PrefillSegmentRoute::Interpreter]).is_err());
 }
+
+#[test]
+fn decode_upload_rows_must_cover_the_batch() {
+    assert!(check_decode_rows(20, &[5; 20], &[6; 20]).is_ok());
+    assert!(check_decode_rows(1, &[0], &[1]).is_ok());
+    // The single-sequence TP call used to hand a batch-20 rung one row; the other 19 positions
+    // came from stale staging bytes.
+    assert!(check_decode_rows(20, &[5], &[6]).is_err());
+    assert!(check_decode_rows(20, &[5; 20], &[6; 19]).is_err());
+    assert!(check_decode_rows(1, &[], &[]).is_err());
+}

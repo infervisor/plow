@@ -2716,6 +2716,19 @@ enum DecodeSegmentRoute {
     },
 }
 
+/// Every decode upload is `batch` positions and kv lengths wide; a shorter slice would upload
+/// stale staging bytes as the missing rows' positions.
+fn check_decode_rows(batch: usize, pos: &[u32], kvlen: &[u32]) -> Result<()> {
+    if pos.len() != batch || kvlen.len() != batch {
+        return Err(RuntimeError::Device(format!(
+            "decode wants {batch} positions and {batch} kvlens, got {} and {}",
+            pos.len(),
+            kvlen.len()
+        )));
+    }
+    Ok(())
+}
+
 fn requires_segmented_decode(routes: &[DecodeSegmentRoute]) -> bool {
     routes
         .iter()
@@ -13573,6 +13586,7 @@ impl AmdEngine {
     /// longer owns.
     pub fn decode_prepare_batched(&mut self, pos: &[u32], kvlen: &[u32]) -> Result<()> {
         let b = self.batch;
+        check_decode_rows(b, pos, kvlen)?;
         // The bound lives HERE, not only in `decode_step_batched`: the TP path
         // (`amd_tp::submit_decode_batched`) calls this directly, so a guard one
         // level up left tensor-parallel decode with no refusal at all — an

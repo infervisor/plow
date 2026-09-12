@@ -880,7 +880,18 @@ impl AmdTpGroup {
     /// Scalar convenience over [`Self::submit_decode_batched`] — one sequence, which is every
     /// caller today.
     pub fn submit_decode(&mut self, pos: u32, kvlen: u32) -> Result<()> {
-        self.submit_decode_batched(&[pos], &[kvlen])
+        // One sequence runs on the narrowest rung. The staging upload is batch-wide, so the
+        // other slots park at pos 0 (the serve idle row) instead of carrying stale rows; the
+        // rung never steps them.
+        let dp = self.ranks[0].decode_prog_for(1);
+        let b = self.ranks[0].batch();
+        if b == 1 {
+            return self.submit_decode_batched_at(&[pos], &[kvlen], dp);
+        }
+        let (mut p, mut k) = (vec![0; b], vec![1; b]);
+        p[0] = pos;
+        k[0] = kvlen;
+        self.submit_decode_batched_at(&p, &k, dp)
     }
 
     /// Submit one decode step for `B` sequences across every rank.
