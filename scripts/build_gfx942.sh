@@ -224,12 +224,21 @@ if [ -n "${PLOW_HSACO_CONFIG:-}" ]; then
   # The packed operator-family objects, opened by literal name under PLOW_PACKED_PREFILL_ROUTE,
   # and their `_tb` twins for a packet that carries token-batch BODY programs (exec/amd.rs
   # opens `interp_packed_mla_{norm,flash}_tb*` for those and nothing else).
-  if grep -q '^#define PLOW_PACKET_HAS_PACKED_PREFILL_TOPOLOGY 1$' "$CFG"; then
-    : "${PLOW_PACKED_PREFILL_CONSUMERS:=1}"
-  fi
-  if grep -q '^#define PLOW_PACKET_HAS_TOKEN_BATCH_BODIES 1$' "$CFG"; then
-    : "${PLOW_TOKEN_BATCH_TP_OBJECTS:=1}"
-  fi
+  # Bodies need the packed family rows too. An explicit opt-out the packet contradicts is
+  # refused: the set would load-fail on the first body (or sibling) that opens a missing object.
+  cfg_packed=0; cfg_tb=0
+  grep -q '^#define PLOW_PACKET_HAS_PACKED_PREFILL_TOPOLOGY 1$' "$CFG" && cfg_packed=1
+  grep -q '^#define PLOW_PACKET_HAS_TOKEN_BATCH_BODIES 1$' "$CFG" && { cfg_packed=1; cfg_tb=1; }
+  for pair in "PLOW_PACKED_PREFILL_CONSUMERS:$cfg_packed" "PLOW_TOKEN_BATCH_TP_OBJECTS:$cfg_tb"; do
+    key="${pair%%:*}"; want="${pair#*:}"; cur="${!key:-}"
+    [ "$want" = 1 ] || continue
+    if [ -n "$cur" ] && [ "$cur" != 1 ]; then
+      echo "FAIL: packet carries programs that open the $key objects but $key=$cur is set;" >&2
+      echo "      plowrt refuses to load a packet whose family objects are missing." >&2
+      exit 1
+    fi
+    printf -v "$key" 1
+  done
   # `backends.<arch>.requires`, verbatim. Three kinds of entry: row-selecting axes (every
   # variant row is built anyway -- the small-rung MLA and split objects included -- and plowrt
   # picks by filename and refuses by marker), the tile geometry (op_gemm.h's CDNA3 defaults ARE

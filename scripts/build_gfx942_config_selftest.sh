@@ -132,6 +132,8 @@ refuse() {  # <desc> <needle> <env...>
 refuse "narrower explicit decode batch" "packet decodes at batch 20 but PLOW_DECODE_BATCH=4" PLOW_DECODE_BATCH=4 PLOW_GEMV_WALK=1
 refuse "disagreeing GEMM tile" "packet requires GM_BM=192 but GM_BM=64" GM_BM=64
 refuse "unknown collective schedule" "PLOW_XR_SCHED must be aiter or twoshot" PLOW_XR_SCHED=bogus
+refuse "bodies without their _tb objects" "TOKEN_BATCH_TP_OBJECTS objects but PLOW_TOKEN_BATCH_TP_OBJECTS=0" PLOW_TOKEN_BATCH_TP_OBJECTS=0
+refuse "packed programs without their family objects" "PACKED_PREFILL_CONSUMERS objects but PLOW_PACKED_PREFILL_CONSUMERS=0" PLOW_PACKED_PREFILL_CONSUMERS=0
 sed -i 's/"gfx942"/"gfx950"/' "$TMP/assets/plow_config.h"
 refuse "config for another arch" "describes a gfx950 packet" JOBS=1
 sed -i 's/"gfx950"/"gfx942"/' "$TMP/assets/plow_config.h"
@@ -140,6 +142,19 @@ if PLOW_HSACO_CONFIG="$TMP/nowhere" PLOW_DEFINES_ONLY=1 "$ROOT/scripts/build_gfx
 else
   expect "missing config refused" grep -q "no plow_config.h there" "$TMP/refuse.log"
 fi
+
+echo "--- bodies without siblings still build the packed family"
+sed 's/^#define PLOW_PACKET_HAS_PACKED_PREFILL_TOPOLOGY 1$/#define PLOW_PACKET_HAS_PACKED_PREFILL_TOPOLOGY 0/' \
+    "$TMP/assets/plow_config.h" > "$TMP/bodies.h"
+mkdir -p "$TMP/bodies" && mv "$TMP/bodies.h" "$TMP/bodies/plow_config.h"
+env -u PLOW_PACKED_PREFILL_CONSUMERS -u PLOW_TOKEN_BATCH_TP_OBJECTS \
+    PLOW_HSACO_CONFIG="$TMP/bodies" PLOW_DEFINES_ONLY=1 \
+    "$ROOT/scripts/build_gfx942.sh" "$TMP/bodies-out" >"$TMP/bodies.log" 2>&1 || { cat "$TMP/bodies.log"; exit 1; }
+expect "a bodies-only packet builds the packed and _tb rows" python3 - "$TMP/bodies-out/build_defines.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+sys.exit(0 if all(k in d for k in ("interp_packed_mla_norm_fp8kv", "interp_packed_mla_flash_tb_fp8kv")) else 1)
+PY
 
 echo "--- no config: nothing changes"
 env -u PLOW_HSACO_CONFIG -u PLOW_DECODE_BATCH -u PLOW_GEMV_WALK -u PLOW_DECODE_TIERS -u PLOW_DSA_PF \
