@@ -688,6 +688,8 @@ mod amd_serve {
         /// once instead of every step. It is the only externally visible evidence that the
         /// ladder is engaging, and a measurement that cannot show that is not a measurement.
         last_rung: u32,
+        /// `(begin_slot, prefix attach)` ns of the cursor built last, printed once by PFCHUNK.
+        cursor_split_ns: (u64, u64),
         /// The TP token-batch route: staging for the slot-band plan plus the body programs the
         /// group carries. `None` when the blob has no bodies or the route is not requested.
         token_batch_tp: Option<TokenBatchTp>,
@@ -1283,6 +1285,7 @@ mod amd_serve {
                 },
                 prefill_turn: 0,
                 last_rung: 0,
+                cursor_split_ns: (0, 0),
                 token_batch_tp,
                 diagnostics: None,
                 counter_snapshot_dir,
@@ -1611,23 +1614,27 @@ mod amd_serve {
                         self.max_ctx
                     )));
                 }
+                let t_clear = std::time::Instant::now();
                 crate::obs::ttft::timed(&crate::obs::ttft::PF_STATE_CLEAR, || {
                     match &mut self.ranks {
                         Ranks::One(e) => e.begin_slot(slot),
                         Ranks::Tp(g) => g.begin_slot(slot),
                     }
                 })?;
+                let clear_ns = t_clear.elapsed().as_nanos() as u64;
                 let n = prompt.len() as u32;
                 // CHUNKING AND THE PREFIX CACHE COMPOSE. The cache decides WHICH span still has
                 // to be prefilled; chunking decides how that span is broken into ticks. Building
                 // the cursor from the cached plan is all it takes — they were alternatives only
                 // because the first cut of this function bailed out when the cache was on.
                 let shared = self.ranks.shared_prefix_enabled();
+                let t_attach = std::time::Instant::now();
                 let (resume, arm) = if shared {
                     (self.ranks.attach_shared_prefix(slot, prompt)?, 0)
                 } else {
                     self.plan_prefix(slot, prompt)
                 };
+                self.cursor_split_ns = (clear_ns, t_attach.elapsed().as_nanos() as u64);
                 if shared {
                     // A later planning error must retire at a private row, not inside the attached prefix.
                     self.pos[slot] = resume;
@@ -1757,8 +1764,9 @@ mod amd_serve {
             let last = cur.next >= cur.steps.len();
             if tick_log {
                 let ms = |ns: u64| ns as f64 / 1e6;
+                let split = std::mem::take(&mut self.cursor_split_ns);
                 eprintln!(
-                    "PFCHUNK slot={slot} c0={} clen={} bucket={} last={last} total={:.3} cursor={:.3} rebase={:.3} chunk={:.3} restore={:.3} snap={:.3} publish={:.3} publish_fill={:.3} resume={} sparse={}",
+                    "PFCHUNK slot={slot} c0={} clen={} bucket={} last={last} total={:.3} cursor={:.3} rebase={:.3} chunk={:.3} restore={:.3} snap={:.3} publish={:.3} publish_fill={:.3} resume={} sparse={} clear={:.3} attach={:.3}",
                     step.c0,
                     step.clen,
                     g.rank0().prog_t(step.prog),
@@ -1772,6 +1780,8 @@ mod amd_serve {
                     ms(crate::obs::tick::take_publish_fill()),
                     cur.resume,
                     g.rank0().prefill_prog_sparse(step.prog) as u8,
+                    ms(split.0),
+                    ms(split.1),
                 );
             }
             if !last {

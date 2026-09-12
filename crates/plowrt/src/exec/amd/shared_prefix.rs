@@ -258,11 +258,18 @@ pub(super) fn attach_ranks<T>(
         ));
     }
     let mut attempted = 0;
+    let (mut flush_ns, mut stage_ns, mut commit_ns) = (0u64, 0u64, 0u64);
     let result = (|| {
         let mut common = None;
         for rank in ranks.iter_mut() {
             attempted += 1;
+            // `stage_attach` flushes first anyway; flushing here only separates its time.
+            let t = std::time::Instant::now();
+            cache(rank).flush_publish()?;
+            flush_ns += t.elapsed().as_nanos() as u64;
+            let t = std::time::Instant::now();
             let rows = cache(rank).stage_attach(slot, prompt)?;
+            stage_ns += t.elapsed().as_nanos() as u64;
             if rows == 0 {
                 attempted -= 1;
                 return Ok(0);
@@ -273,6 +280,7 @@ pub(super) fn attach_ranks<T>(
             common = Some(rows);
         }
         let rows = common.unwrap();
+        let t = std::time::Instant::now();
         for rank in ranks.iter_mut() {
             let cache = cache(rank);
             cache.commit_attach(slot, rows)?;
@@ -283,8 +291,20 @@ pub(super) fn attach_ranks<T>(
                 "AMD shared prefix attached"
             );
         }
+        commit_ns = t.elapsed().as_nanos() as u64;
         Ok(rows)
     })();
+    if crate::obs::tick::on() {
+        let ms = |ns: u64| ns as f64 / 1e6;
+        eprintln!(
+            "PFATTACH slot={slot} rows={} ranks={} flush={:.3} stage={:.3} commit={:.3}",
+            result.as_ref().map_or(0, |&rows| rows),
+            ranks.len(),
+            ms(flush_ns),
+            ms(stage_ns),
+            ms(commit_ns),
+        );
+    }
     if !matches!(result, Ok(rows) if rows > 0) {
         let mut rollback_error = None;
         for rank in &mut ranks[..attempted] {
