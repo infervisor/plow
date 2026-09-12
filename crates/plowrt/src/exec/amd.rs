@@ -5182,6 +5182,33 @@ fn state_clear_ranges(
     Ok(out)
 }
 
+/// [`AmdEngine::chunk_steps_from`] over any rung lookup. Each entry of `chunks` is both the bucket
+/// and the row advance, so only a chunk clipped by `n_prompt` runs fewer rows than its bucket.
+pub(crate) fn chunk_steps_over(
+    prog_for: impl Fn(u32) -> Option<usize>,
+    chunks: &[u32],
+    from: u32,
+    n_prompt: u32,
+) -> Result<Vec<ChunkStep>> {
+    let mut out = Vec::with_capacity(chunks.len());
+    let mut c0 = from;
+    for &ch in chunks {
+        if c0 >= n_prompt {
+            break;
+        }
+        let prog = prog_for(ch).ok_or_else(|| {
+            RuntimeError::Device(format!("no compiled bucket for chunk T={ch}"))
+        })?;
+        out.push(ChunkStep {
+            prog,
+            c0,
+            clen: (n_prompt - c0).min(ch),
+        });
+        c0 += ch;
+    }
+    Ok(out)
+}
+
 /// One chunk of a prefill plan: which bucket program runs it, and over which
 /// absolute token range.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -13531,27 +13558,12 @@ impl AmdEngine {
         from: u32,
         n_prompt: u32,
     ) -> Result<Vec<ChunkStep>> {
-        let mut out = Vec::with_capacity(chunks.len());
-        let mut c0 = from;
-        for &ch in chunks {
-            if c0 >= n_prompt {
-                break;
-            }
-            let prog = self
-                .prefill_rungs()
-                .find(|&(_, rows)| rows == ch)
-                .map(|(prog, _)| prog)
-                .ok_or_else(|| {
-                    RuntimeError::Device(format!("no compiled bucket for chunk T={ch}"))
-                })?;
-            out.push(ChunkStep {
-                prog,
-                c0,
-                clen: (n_prompt - c0).min(ch),
-            });
-            c0 += ch;
-        }
-        Ok(out)
+        chunk_steps_over(
+            |ch| self.prefill_rungs().find(|&(_, rows)| rows == ch).map(|(prog, _)| prog),
+            chunks,
+            from,
+            n_prompt,
+        )
     }
 
     /// Pool counters (`blocks_live` is the HBM the KV cache actually holds).
