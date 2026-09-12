@@ -504,6 +504,41 @@ ms/chunk, against -46 on CK; in flow expect less, because o_proj has to leave th
 interpreter segment. Next: the emit half on these asm objects. CK is worth about 6 ms/chunk more,
 which does not justify a new build dependency.
 
+## FP8 block-scale prefill route served (2026-09-12, `fp8-prefill-gemms.md` §7)
+
+Branch `fp8-prefill-gemms`, on `594737d9`: route `bc8849a5`, flags row `85d40176`, then this
+entry. `PLOW_GLM_GEMM_BLK` is opt-in and default off, and the packet is byte-identical when off.
+It runs `q_a_proj`, `kv_a_latent`, indexer `wq_b` and `o_proj` as W8A8 on AITER's gfx942
+pre-shuffled assembly. The weights are the checkpoint's own FP8 bytes (overlay:
+`scripts/glm53_prep_blk.py`), and the activation quant runs inside the GEMM's native segment.
+`q_absorb` stays BF16, and the shared expert is left to the MoE fold.
+
+**Numerics.** On captured layer-77 activations, per-row rel-L2 against the BF16 path is 1.8e-2
+(q_a), 2.0e-2 (kv_a), 1.9e-2 (o_proj) and 2.4e-2 (wq_b), with no row above 3.3e-2. Retrieval is
+18/18 in both treatment arms.
+
+**Served A/B, not decisive.** 20 prompts, C20, two controls, the bench's main run only: the same 161
+steady 8192-row chunks per arm. Out tok/s: 55.00 and 56.08 for the controls; 55.64 with all four
+projections (+0.2 % vs the control mean); 54.71 without o_proj (-1.5 %). Both treatments sit inside
+the controls' 2 % spread. Per-chunk drain: -24.4 ms (-3.0 %) with all four, 0.0 without o_proj; the
+controls agree to 0.6 ms. **o_proj is the whole gain**, matching its standalone prediction, so
+splitting its segment did not cost it; q_a/kv_a/wq_b net zero at the current quant cost. **Not a
+default**, but a qualified opt-in: ~-21 s per 100-prompt run. It holds ~2.4 GB/rank of extra HBM,
+~1.0 GB of it for o_proj.
+
+**Where the saving went.** It reaches the wall clock: prefill-tick wall falls 2.6-3.1 s (-1.5 %),
+and against the control whose decode matches, the whole run is -2.8 s. It is hidden by decode-side
+run-to-run drift. The second control's decode ticks ran 5 % faster (95.6 against 102.3 ms median)
+with the same binary and packet, a 3.8 s swing, larger than the whole saving. Decode-tick variance
+is now the dominant noise in these A/Bs; control it before trying to resolve 1-2 % prefill effects
+end to end. Next here: a vectorized activation quant (14.8 to ~3.5 ms/chunk; built, awaiting GPU
+validation), which should take the route to about -35 ms/chunk.
+
+**Found on the way.** In `amd-bench --prompt`, greedy decode with the production packet and
+objects hits a GPU memory fault after a clean prefill, and it wrote a 97.8 GB coredump into the
+worktree. Scripts now set `ulimit -c 0` and `HSA_DISABLE_COREDUMP_ON_EXCEPTION=1`; ROCr writes
+its own GPU coredump and does not honour the core rlimit.
+
 ## Artefact policy (applied on every merge)
 
 Raw measurement files pushed upstream are removed here before the branch goes to main:
