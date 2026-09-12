@@ -79,6 +79,14 @@ if [[ ${actual%% *} != "$expected" ]]; then
 fi
 cp -f "$vendor/glm_lt_gfx942.elf" "$out/glm_lt_gfx942.elf"
 
+# Only a packet emitted with PLOW_GLM_FOLD_LT routes MlaMergeFold to the FP32 hipBLASLt fold; the
+# loader then needs its pinned GEMM image (from VENDOR_DIR) and the adapter built from this tree.
+if python3 -c 'import json, sys; k = {x["id"]: x["value"] for x in json.load(open(sys.argv[1]))["emit_config"]["knobs"]}; sys.exit(k.get("glm_fold_lt") != "true")' "$assets/build.json"; then
+    echo ">>> native FP32 MLA prefill fold (packet emitted with PLOW_GLM_FOLD_LT)"
+    [ -f "$vendor/glm_fold_lt_gfx942.elf" ] || { echo "no $vendor/glm_fold_lt_gfx942.elf -- the packet carries native MLA folds" >&2; exit 2; }
+    (cd "$root" && scripts/build_glm_fold_lt.sh "$out" "$vendor/glm_fold_lt_gfx942.elf")
+fi
+
 echo ">>> serving object set at $out"
 ls "$out"/*.elf | wc -l | sed 's/^/  interpreter + adapter objects: /'
 ls -d "$out"/lowrung* 2>/dev/null | wc -l | sed 's/^/  low-rung tier dirs: /'
