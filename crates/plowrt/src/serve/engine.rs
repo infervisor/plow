@@ -748,6 +748,14 @@ mod amd_serve {
                 .unwrap_or(0)
         }
 
+        /// Span capacity of the body as wide as `bucket`, if the packet carries one.
+        fn span_capacity_at(&self, bucket: u32) -> Option<u32> {
+            self.bodies
+                .iter()
+                .find(|&&(_, t)| t == bucket)
+                .map(|&(_, t)| t - self.band)
+        }
+
         /// The body width for `leading_rows` sampled rows and `prefill_rows` span rows: the
         /// narrowest body whose span capacity fits, else the one that fits most.
         fn rows_for(&self, leading_rows: usize, prefill_rows: usize) -> Option<u32> {
@@ -1054,6 +1062,44 @@ mod amd_serve {
             }
         }
         Ok(retired)
+    }
+
+    /// The chunk plan of `[from, to)` with every step but the last capped at the span capacity
+    /// of the token-batch body as wide as its bucket. Planned whole, a middle chunk on such a
+    /// bucket (8192 rows against a span of 8192 - band) can never ride that body, so it runs
+    /// isolated and its tick's decode rows take a separate pass. A capped step keeps its bucket
+    /// and the rows it gives up start the re-planned remainder; buckets without a same-width
+    /// body, and the final chunk, keep the planner's choice.
+    fn cap_chunks_to_bodies(
+        from: u32,
+        to: u32,
+        plan: impl Fn(u32, u32) -> Result<Vec<crate::exec::amd::ChunkStep>>,
+        bucket: impl Fn(usize) -> u32,
+        capacity: impl Fn(u32) -> Option<u32>,
+    ) -> Result<Vec<crate::exec::amd::ChunkStep>> {
+        let mut out = Vec::new();
+        let mut c0 = from;
+        while c0 < to {
+            let steps = plan(c0, to)?;
+            let middle = steps.len().saturating_sub(1);
+            let cap_of = |step: &crate::exec::amd::ChunkStep| {
+                capacity(bucket(step.prog)).filter(|&cap| cap > 0 && step.clen > cap)
+            };
+            match steps[..middle].iter().position(|step| cap_of(step).is_some()) {
+                None => {
+                    out.extend(steps);
+                    break;
+                }
+                Some(i) => {
+                    let mut step = steps[i];
+                    step.clen = cap_of(&step).expect("the cut step exceeds its body");
+                    c0 = step.c0 + step.clen;
+                    out.extend_from_slice(&steps[..i]);
+                    out.push(step);
+                }
+            }
+        }
+        Ok(out)
     }
 
     fn split_terminal_prefill(cur: &mut PfCursor) {
@@ -1675,20 +1721,32 @@ mod amd_serve {
                     self.invalidate_prefix(slot);
                 }
                 let max_bucket = self.prefill_chunk_rows.min(tick_max_bucket);
-                let g = &mut self.ranks;
+                if resume > 0 && !shared {
+                    self.ranks.restore_carried(slot)?;
+                }
+                // With bodies armed, a middle chunk must fit its bucket's body to ride it.
+                let (g, tb) = (&self.ranks, self.token_batch_tp.as_ref());
+                let plan = |from: u32, to: u32| {
+                    cap_chunks_to_bodies(
+                        from,
+                        to,
+                        |a, b| g.plan_span_at_most(a, b, max_bucket),
+                        |prog| g.rank0().prog_t(prog),
+                        |bucket| tb.and_then(|tb| tb.span_capacity_at(bucket)),
+                    )
+                };
                 let (steps, snap_after) = {
                     if resume > 0 {
-                        if !shared { g.restore_carried(slot)?; }
-                        (g.plan_span_at_most(resume, n, max_bucket)?, None)
+                        (plan(resume, n)?, None)
                     } else if arm > 0 {
-                        let head = g.plan_span_at_most(0, arm, max_bucket)?;
-                        let tail = g.plan_span_at_most(arm, n, max_bucket)?;
+                        let head = plan(0, arm)?;
+                        let tail = plan(arm, n)?;
                         let cut = head.len();
                         let mut all = head;
                         all.extend(tail);
                         (all, cut.checked_sub(1))
                     } else {
-                        (g.plan_span_at_most(0, n, max_bucket)?, None)
+                        (plan(0, n)?, None)
                     }
                 };
                 self.pos[slot] = 0;
@@ -3111,10 +3169,71 @@ mod amd_serve {
             mixed_cursor_rows, mixed_prefill_continuation_fits, mixed_prefill_padding_fits,
             packable_prefill_step, parse_snapshot_tensors, snapshot_file_component,
             slot_decode_position, split_pending_prefill, split_terminal_prefill, stage_parked,
-            terminal_prefill_cursor, token_batch_host_step,
+            terminal_prefill_cursor, token_batch_host_step, cap_chunks_to_bodies,
             AmdServe, PfCursor, DEFAULT_SNAPSHOT_TENSORS, MAX_SNAPSHOT_TENSORS,
         };
         use crate::exec::amd::ChunkStep;
+
+        #[test]
+        fn middle_chunks_on_a_bodied_bucket_are_capped_to_the_body_span() {
+            // The packet's ladder under the planner's own cover rule (ragged), and an 8192-row
+            // body whose span is 8192 - 20 band rows.
+            let buckets = [128u32, 512, 2048, 8192];
+            let steps_of = |from: u32, to: u32| {
+                crate::exec::amd::plan_chunks_cfg(&buckets, to - from, 416, true).map(|chunks| {
+                    let mut c0 = from;
+                    chunks
+                        .into_iter()
+                        .map(|ch| {
+                            let step = ChunkStep {
+                                prog: buckets.iter().position(|&b| b == ch).unwrap(),
+                                c0,
+                                clen: (to - c0).min(ch),
+                            };
+                            c0 += ch;
+                            step
+                        })
+                        .collect::<Vec<_>>()
+                })
+            };
+            let shape = |plan: &[ChunkStep]| {
+                plan.iter().map(|s| (buckets[s.prog], s.c0, s.clen)).collect::<Vec<_>>()
+            };
+            let capped = |n: u32, body: u32| {
+                cap_chunks_to_bodies(
+                    0,
+                    n,
+                    |a, b| steps_of(a, b),
+                    |prog| buckets[prog],
+                    |bucket| (bucket == body).then_some(body - 20),
+                )
+                .unwrap()
+            };
+            // Uncapped, the middle chunks take 8192 rows and no 8192 body can hold them.
+            assert_eq!(
+                shape(&steps_of(0, 20000).unwrap()),
+                [(8192, 0, 8192), (8192, 8192, 8192), (8192, 16384, 3616)]
+            );
+            assert_eq!(
+                shape(&capped(20000, 8192)),
+                [(8192, 0, 8172), (8192, 8172, 8172), (8192, 16344, 3656)]
+            );
+            // The cost when the remainder is small: one extra launch, small enough to ride.
+            assert_eq!(
+                shape(&capped(16384, 8192)),
+                [(8192, 0, 8172), (8192, 8172, 8172), (128, 16344, 40)]
+            );
+            // A bucket without a same-width body keeps the planner's plan.
+            assert_eq!(shape(&capped(20000, 2048)), shape(&steps_of(0, 20000).unwrap()));
+            for n in [1, 8172, 8173, 8192, 8193, 16384, 20000, 40961] {
+                let plan = capped(n, 8192);
+                assert_eq!(plan.first().map(|s| s.c0), Some(0));
+                assert!(plan.windows(2).all(|w| w[0].c0 + w[0].clen == w[1].c0), "{n}");
+                let last = plan.last().unwrap();
+                assert_eq!(last.c0 + last.clen, n);
+                assert!(plan[..plan.len() - 1].iter().all(|s| s.clen <= 8172), "{n}");
+            }
+        }
 
         #[test]
         fn a_prompt_finished_inside_a_token_batch_step_retires_and_decodes_from_its_end() {
