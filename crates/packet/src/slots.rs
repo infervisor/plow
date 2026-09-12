@@ -220,7 +220,7 @@ const DOC: &[S] = &[
     S { op: DevOp::GemvArgmax, t: &["C", "x", "W", "part"], i: &["1", "N", "K", "", "a_row0"], f: &["cap"], j: &[] },
     S { op: DevOp::MoeGroupGluGemmaPfW8a8, t: &["fu", "xq8", "ewt", "meta", "row_token", "ascale", "est"], i: &["I_moe", "H", "n_exp", "", "", "act"], f: &[], j: &[] },
     S { op: DevOp::MoeGroupDownGemmaPfW8a8, t: &["part", "fu8", "ewt", "meta", "row_partidx", "row_gate", "est", "fscale"], i: &["H", "I_moe", "n_exp"], f: &[], j: &[] },
-    S { op: DevOp::MoeRouterTopkPf, t: &["table", "logit", "atom_acc?", "bias"], i: &["atom_h", "n_exp", "k", "flags", "T"], f: &["route_scale"], j: &[] },
+    S { op: DevOp::MoeRouterTopkPf, t: &["table", "logit", "atom_acc?", "bias"], i: &["atom_h", "n_exp", "k", "flags", "T", "shared_tail"], f: &["route_scale"], j: &[] },
     S { op: DevOp::MoeAlignPf, t: &["meta", "table", "row_token", "row_partidx", "row_gate"], i: &["T", "n_exp", "k"], f: &[], j: &[] },
     S { op: DevOp::MoeGroupGluPf, t: &["fu_g", "xn2", "expert_weight_table", "expert_scale_table", "meta", "row_token"], i: &["I_moe", "H", "n_exp", "fp8", "", "act"], f: &[], j: &[] },
     S { op: DevOp::MoeGroupDownPf, t: &["part", "fu_g", "expert_weight_table", "expert_scale_table", "meta", "", "row_partidx", "row_gate"], i: &["H", "I_moe", "n_exp", "fp8", "atom_ksh", "det_ksh"], f: &[], j: &[] },

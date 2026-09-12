@@ -80,6 +80,10 @@ pub fn is_host_filled_table(name: &str) -> bool {
         || name.ends_with("mlp.expert_scale_table_moe2")
         || name.ends_with("mlp.dense_weight_table")
         || name.ends_with("mlp.dense_scale_table")
+        // PLOW_GLM_MOE_SHARED_FOLD's spelling of the same pair: one entry longer, the last one
+        // pointing at the SHARED expert packed into the routed slab. Still host addresses.
+        || name.ends_with("mlp.expert_weight_table_sf")
+        || name.ends_with("mlp.expert_scale_table_sf")
         // The PRESHUFFLED twin of expert_weight_table (PLOW_MOE_PF_SHUF): points into a second
         // packed slab whose per-projection layout is [K/64][R][64] so the grouped prefill GEMM's
         // B stream is contiguous per k-tile. Host-computed addresses, no checkpoint bytes.
@@ -169,6 +173,8 @@ mod tests {
                 "mlp.expert_scale_table_moe2",
                 "mlp.dense_weight_table",
                 "mlp.dense_scale_table",
+                "mlp.expert_weight_table_sf",
+                "mlp.expert_scale_table_sf",
             ] {
                 let n = format!("{pfx}layers.3.{suf}");
                 assert!(is_host_filled_table(&n), "{n}");

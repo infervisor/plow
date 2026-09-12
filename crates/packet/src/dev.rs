@@ -799,7 +799,11 @@ pub enum DevOp {
     /// bit-identical PER TOKEN to the decode router by construction. The `[T,n_exp]` logit matrix is
     /// an ordinary [`DevOp::Gemm`], already in the prefill bucket; only this tail was missing.
     /// `t0=table[T*k] t1=logit(bf16[T,n_exp]) t2=atom_acc? t3=bias` ·
-    /// `i0=atom_h i1=n_exp i2=k i3=flags i4=T` · `f0=route_scale`.
+    /// `i0=atom_h i1=n_exp i2=k i3=flags i4=T i5=shared_tail` · `f0=route_scale`.
+    ///
+    /// `i5` is PLOW_GLM_MOE_SHARED_FOLD: 1 makes the table `[T*(k+1)]`, each token's last slot the
+    /// constant `{expert n_exp, gate 1.0}` — the shared expert routed as one more expert. The
+    /// top-k selection itself is unchanged. 0 on every other blob.
     ///
     /// `t2`/`i0` are PLOW_MOE_PF_ATOMIC's fused-MoE accumulator: when set, this packet also zeroes
     /// `atom_acc[T, atom_h]` f32 before the top-k loop, because it is the earliest packet of the
