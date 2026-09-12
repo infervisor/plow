@@ -257,6 +257,12 @@ pub(super) fn attach_ranks<T>(
             "prefix attachment requires ranks and a valid slot".into(),
         ));
     }
+    let tick = crate::obs::tick::on();
+    let kept_before: u64 = if tick {
+        ranks.iter_mut().map(|rank| cache(rank).attach_kept()).sum()
+    } else {
+        0
+    };
     let mut attempted = 0;
     let (mut flush_ns, mut stage_ns, mut commit_ns) = (0u64, 0u64, 0u64);
     let result = (|| {
@@ -294,10 +300,15 @@ pub(super) fn attach_ranks<T>(
         commit_ns = t.elapsed().as_nanos() as u64;
         Ok(rows)
     })();
-    if crate::obs::tick::on() {
+    if tick {
         let ms = |ns: u64| ns as f64 / 1e6;
+        let kept = ranks
+            .iter_mut()
+            .map(|rank| cache(rank).attach_kept())
+            .sum::<u64>()
+            - kept_before;
         eprintln!(
-            "PFATTACH slot={slot} rows={} ranks={} flush={:.3} stage={:.3} commit={:.3}",
+            "PFATTACH slot={slot} rows={} ranks={} flush={:.3} stage={:.3} commit={:.3} kept={kept}",
             result.as_ref().map_or(0, |&rows| rows),
             ranks.len(),
             ms(flush_ns),
@@ -407,6 +418,14 @@ impl SharedPrefix {
         self.groups
             .iter()
             .map(|g| g.pool.stats().blocks_shared_mapped)
+            .sum()
+    }
+
+    /// Prefix blocks attaches found already mapped in place and kept (no unmap, no map).
+    pub fn attach_kept(&self) -> u64 {
+        self.groups
+            .iter()
+            .map(|g| g.pool.stats().blocks_attach_kept)
             .sum()
     }
 
