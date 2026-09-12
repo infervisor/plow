@@ -386,6 +386,7 @@ struct Shapes {
     glm_dsa_pf: bool,
     dsa_decode_batch: bool,
     dsa_select_local: bool,
+    dsa_select_split: bool,
     mla_sparse_fp8: bool,
     /// Any `FlashMlaPrefill` (op 51) with `i[3]` bit 31 — a NoPE (zero-rope) MLA, which the
     /// four-wave V2 kernel can only run if it carries the `<512, 0>` instantiation
@@ -595,6 +596,7 @@ fn shapes(m: &Model) -> Shapes {
                 DevOp::IndexSelect => {
                     s.dsa_decode_batch |= inst.i[3] != 0 || inst.i[4] != 0;
                     s.dsa_select_local |= inst.i[4] == 1;
+                    s.dsa_select_split |= inst.i[4] == 2;
                 }
                 DevOp::FlashMlaPrefillFp8 => {
                     s.mla_prefill_fp8_split |= inst.j[1] != 0;
@@ -909,6 +911,7 @@ fn encoding_features(f: &mut Map<String, Value>, s: &Shapes) {
     f.insert("glm_dsa_pf".into(), json!(s.glm_dsa_pf));
     f.insert("dsa_decode_batch".into(), json!(s.dsa_decode_batch));
     f.insert("dsa_select_local".into(), json!(s.dsa_select_local));
+    f.insert("dsa_select_split".into(), json!(s.dsa_select_split));
     f.insert("mla_sparse_fp8".into(), json!(s.mla_sparse_fp8));
     f.insert("mla_pf_nope".into(), json!(s.mla_pf_nope));
     f.insert("glm_fuse_rope".into(), json!(s.glm_fuse_rope));
@@ -1309,6 +1312,9 @@ fn backend_amd(
     }
     if on("dsa_select_local") {
         req.push("PLOW_DSA_SELECT_LOCAL=1".into());
+    }
+    if on("dsa_select_split") {
+        req.push("PLOW_DSA_SELECT_SPLIT=1".into());
     }
     if on("dsa_decode_batch") {
         req.push("PLOW_DSA_DECODE_BATCH=1".into());

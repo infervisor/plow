@@ -1830,6 +1830,10 @@ pub(crate) struct GlmTn {
     iidx: u32, // i32 [B][index_topk] selected positions (the gather idx; shared reuse target)
     ighist: u32, // u32 [7*256] radix histograms (host-zeroed once)
     igctl: u32, // u32 [3] grid-barrier ctl (host-zeroed once)
+    // PLOW_GLM_SELECT_SPLIT: per-row position bitmap (u32 [rows][ceil(ctx/32)]) and candidate
+    // keys (u64 [rows][ctx]); TENSOR_NONE otherwise.
+    ibits: u32,
+    icand: u32,
     icos: u32,
     isin: u32,
     // `index_kpool>1` DECODE-path per-step scratch (TENSOR_NONE otherwise). `iidx`/`iscore`
@@ -2190,6 +2194,22 @@ pub(crate) fn declare_glm_rows_batched(
     // consumes it: the wq_b/wk/k_norm/weights_proj weights, the per-layer key cache, and the
     // identity-tail RoPE tables.
     let idx_on = dsa || c.dsa_pf();
+    // PLOW_GLM_SELECT_SPLIT selects every decode row at once, so each row gets its own
+    // histogram, control, bitmap and candidate strip; otherwise the one strip the serialized
+    // chain shares.
+    let sel_rows = if dsa && dbatch > 1 && glm_select_split_on() {
+        dbatch as usize
+    } else {
+        1
+    };
+    let (ibits, icand) = if sel_rows > 1 {
+        (
+            ac(b, "ibits", sel_rows as u64 * ctx.div_ceil(32) as u64 * 4),
+            ac(b, "icand", sel_rows as u64 * ctx as u64 * 8),
+        )
+    } else {
+        (TENSOR_NONE, TENSOR_NONE)
+    };
     let (qidx, kidx_raw, kidx_normed, widx, iscore, iidx, ighist, igctl) = if dsa {
         (
             ac(b, "qidx", dbatch as u64 * (hi * di) as u64 * BF16),
@@ -2202,8 +2222,14 @@ pub(crate) fn declare_glm_rows_batched(
             // index_kpool==1 (`c.index_kpool.max(1) - 1 == 0`), so GLM-5.2's `iidx` byte size
             // is unchanged.
             ac(b, "iidx", dbatch as u64 * select_width as u64 * I32),
-            b.tensor_init("act.ighist", vec![0u8; 7 * 256 * 4]),
-            b.tensor_init("act.igctl", vec![0u8; 3 * 4]),
+            b.tensor_init(
+                "act.ighist",
+                vec![0u8; if sel_rows > 1 { sel_rows * GLM_SELECT_SPLIT_NB * 4 } else { 7 * 256 * 4 }],
+            ),
+            b.tensor_init(
+                "act.igctl",
+                vec![0u8; if sel_rows > 1 { sel_rows * GLM_SELECT_SPLIT_CTL * 4 } else { 3 * 4 }],
+            ),
         )
     } else {
         (
@@ -3022,6 +3048,8 @@ pub(crate) fn declare_glm_rows_batched(
         iidx,
         ighist,
         igctl,
+        ibits,
+        icand,
         icos,
         isin,
         gate_score,
@@ -4294,7 +4322,16 @@ fn emit_glm_dsa_decode_select(
             Some([_, c_k0, _]) => c_k0,
             None => gemv_blk(b, n.kidx_raw, n.xn, w.iwk, di, h, &[c_rn1]),
         };
-        let c_kn = b.emit(DevOp::LayerNorm, one.clone(), &[c_k0], |d| {
+        // PLOW_GLM_DECODE_GLUE_CUS: `d_layernorm_bias` is one workgroup per row striding by
+        // `nblk`, so give it `rows` workgroups on a slice past the ropes beside it. Bit-identical:
+        // each row is still reduced by one workgroup.
+        let kn_cus = if emit_config::active().glm_decode_glue_cus {
+            let start = (rq.len() + rk.len() + riq.len() + rik.len()).min(all.len() - rows as usize);
+            all[start..start + rows as usize].to_vec()
+        } else {
+            one.clone()
+        };
+        let c_kn = b.emit(DevOp::LayerNorm, kn_cus, &[c_k0], |d| {
             d.t[0] = n.kidx_normed;
             d.t[1] = n.kidx_raw;
             d.t[2] = w.iknw;
@@ -4499,11 +4536,70 @@ fn emit_glm_dsa_decode_select(
                 d.i[2] = ctx;
                 d.f[0] = (di as f32).powf(-0.5) * (hi as f32).powf(-0.5);
             });
-            emit_glm_dsa_select_rows(b, c, n, ctx, rows, itk, c_sc)
+            match emit_config::active().glm_select_split() {
+                Some(g) if glm_select_split_on() && rows > 1 => {
+                    emit_glm_dsa_select_split(b, c, n, ctx, rows, itk, c_sc, g)
+                }
+                _ => emit_glm_dsa_select_rows(b, c, n, ctx, rows, itk, c_sc),
+            }
         }
     } else {
         0
     }
+}
+
+/// u32 per decode row in the split selection's control strip (`SEL_SPLIT_CTL`,
+/// runtime/amd/op_attention_common.h).
+const GLM_SELECT_SPLIT_CTL: usize = 16;
+/// Histogram bins per decode row in the split selection (`SEL_SPLIT_NB`, the top 12 key bits).
+const GLM_SELECT_SPLIT_NB: usize = 4096;
+
+fn glm_select_split_on() -> bool {
+    let cfg = emit_config::active();
+    cfg.glm_select_local() && cfg.glm_select_split().is_some()
+}
+
+/// `PLOW_GLM_SELECT_SPLIT`: the batched decode selection as three gated packets (op 59 `i[4] = 2`,
+/// `i[6]` = phase), `g` workgroups per row in phases 1-2 (capped so `rows * g` fits the machine)
+/// and one in phase 3 — key-prefix histogram, boundary bitmap and candidates, then candidate
+/// selection and ascending compaction. No workgroup waits on another inside a packet; the gates
+/// order the phases. Same key as the local form, so the same set, listed in ascending position
+/// order. Decode rungs only: the token-batch band keeps `emit_glm_dsa_select_rows`.
+#[allow(clippy::too_many_arguments)]
+fn emit_glm_dsa_select_split(
+    b: &mut Builder,
+    c: &GlmCfg,
+    n: &GlmTn,
+    ctx: u32,
+    rows: u32,
+    itk: u32,
+    c_sc: u32,
+    g: u32,
+) -> u32 {
+    assert!(
+        c.tp == 8 && b.n_cu() == 304 && matches!(rows, 2 | 4 | 8 | 16 | 20),
+        "split GLM decode selection requires gfx942 TP8 with 2/4/8/16/20 rows"
+    );
+    let g = g.min(b.n_cu() / rows);
+    let phase = |b: &mut Builder, blocks: u32, phase: u32, dep: u32| {
+        b.emit(DevOp::IndexSelect, (0..blocks).collect(), &[dep], |d| {
+            d.t[0] = n.iidx;
+            d.t[1] = n.iscore;
+            d.t[2] = n.ighist;
+            d.t[3] = n.igctl;
+            d.t[4] = n.kvlen;
+            d.t[5] = n.ibits;
+            d.t[6] = n.icand;
+            d.i[0] = ctx;
+            d.i[1] = itk;
+            d.i[4] = 2;
+            d.i[5] = g;
+            d.i[6] = phase;
+        })
+    };
+    let c_hist = phase(b, rows * g, 1, c_sc);
+    let c_mark = phase(b, rows * g, 2, c_hist);
+    phase(b, rows, 3, c_mark)
 }
 
 /// The DSA top-k SELECT over `rows` scored rows -> `n.iidx`, shared by the decode chain and the

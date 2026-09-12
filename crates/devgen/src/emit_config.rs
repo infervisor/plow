@@ -646,6 +646,12 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_SELECT_LOCAL", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_select_local: Option<bool>,
 
+    /// Give each batched GLM decode row's DSA selection up to this many workgroups (one
+    /// cooperative radix per row on its own histogram strip) instead of one. Unset or 0 = off.
+    /// Needs `glm_select_local` and decode objects built with `PLOW_DSA_SELECT_SPLIT=1`.
+    #[arg(long, env = "PLOW_GLM_SELECT_SPLIT")]
+    pub glm_select_split: Option<u32>,
+
     /// Give each batched GLM RMSNorm and AddNorm row its own workgroup.
     /// On by default for GLM on gfx942 TP8; `=false` is the rollback.
     #[arg(long, env = "PLOW_GLM_DECODE_NORM_ROWS", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
@@ -1208,6 +1214,7 @@ impl EmitConfig {
             packed_sparse_pf: env_bool("PLOW_PACKED_SPARSE_PF"),
             glm_index_tp: env_bool_opt("PLOW_GLM_INDEX_TP"),
             glm_select_local: env_bool_opt("PLOW_GLM_SELECT_LOCAL"),
+            glm_select_split: env_u32("PLOW_GLM_SELECT_SPLIT"),
             glm_decode_norm_rows: env_bool_opt("PLOW_GLM_DECODE_NORM_ROWS"),
             glm_gemm_lt: env_bool_opt("PLOW_GLM_GEMM_LT"),
             glm_gemm_lt_decode: env_bool_opt("PLOW_GLM_GEMM_LT_DECODE"),
@@ -1425,6 +1432,10 @@ impl EmitConfig {
 
     pub fn glm_select_local(&self) -> bool {
         self.glm_select_local.unwrap_or(self.glm_production_defaults)
+    }
+
+    pub fn glm_select_split(&self) -> Option<u32> {
+        self.glm_select_split.filter(|&g| g > 0)
     }
 
     pub fn glm_decode_norm_rows(&self) -> bool {

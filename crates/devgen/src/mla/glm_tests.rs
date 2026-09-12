@@ -833,6 +833,151 @@ fn glm_dsa_local_selection_keeps_one_completion_for_independent_rows() {
 }
 
 #[test]
+fn glm_decode_glue_cus_gives_the_key_norm_one_workgroup_per_row() {
+    let _g = crate::test_env::env_guard();
+    let mut c = glm_ref_cfg();
+    c.tp = 8;
+    c.indexer_full[3] = true;
+    let ctx = 81920;
+    let mut declarations = Builder::new(304);
+    let n = declare_glm_rows_batched(&mut declarations, &c, ctx, &[3], 8192, 20, MoeEnc::Fp8Blk);
+    let tensors = declarations.tensors();
+    for glue in ["0", "1"] {
+        let _env = crate::test_env::EnvScope::set(&[
+            ("PLOW_GLM_SELECT_LOCAL", "1"),
+            ("PLOW_GLM_DECODE_GLUE_CUS", glue),
+        ]);
+        for rows in [2, 8, 20] {
+            let mut b = Builder::new(304);
+            b.adopt_tensors(tensors.clone());
+            let ready = b.emit(DevOp::Nop, vec![0], &[], |_| {});
+            let rq: Vec<u32> = (0..3).collect();
+            let rk: Vec<u32> = vec![3];
+            emit_glm_dsa_decode_select(
+                &mut b,
+                &c,
+                &n,
+                &n.lw[0],
+                0,
+                ctx,
+                rows,
+                20,
+                MoeEnc::Fp8Blk,
+                &(0..304).collect::<Vec<_>>(),
+                c.eps as f32,
+                c.q_lora,
+                c.hidden,
+                ready,
+                ready,
+                &rq,
+                &rk,
+                None,
+            );
+            let p = b.finish();
+            let blocks = |op: DevOp| -> Vec<u32> {
+                let ix: Vec<usize> = p
+                    .insts
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, d)| d.op == op as u16)
+                    .map(|(i, _)| i)
+                    .collect();
+                ix.iter().map(|&i| u32::from(p.insts[i].blocks)).collect()
+            };
+            let norm = blocks(DevOp::LayerNorm);
+            assert_eq!(norm, [if glue == "1" { rows } else { 1 }], "glue={glue} rows={rows}");
+        }
+    }
+}
+
+#[test]
+fn glm_dsa_split_selection_gives_each_row_its_own_group_and_strips() {
+    let _g = crate::test_env::env_guard();
+    let _env = crate::test_env::EnvScope::set(&[
+        ("PLOW_GLM_SELECT_LOCAL", "1"),
+        ("PLOW_GLM_SELECT_SPLIT", "15"),
+    ]);
+    let mut c = glm_ref_cfg();
+    c.tp = 8;
+    c.indexer_full[3] = true;
+    let ctx = 81920;
+    let mut declarations = Builder::new(304);
+    let n = declare_glm_rows_batched(&mut declarations, &c, ctx, &[3], 8192, 20, MoeEnc::Fp8Blk);
+    let tensors = declarations.tensors();
+    for rows in [1, 2, 4, 8, 16, 20] {
+        let mut b = Builder::new(304);
+        b.adopt_tensors(tensors.clone());
+        let ready = b.emit(DevOp::Nop, vec![0], &[], |_| {});
+        let complete = emit_glm_dsa_decode_select(
+            &mut b,
+            &c,
+            &n,
+            &n.lw[0],
+            0,
+            ctx,
+            rows,
+            20,
+            MoeEnc::Fp8Blk,
+            &(0..304).collect::<Vec<_>>(),
+            c.eps as f32,
+            c.q_lora,
+            c.hidden,
+            ready,
+            ready,
+            &(0..32).collect::<Vec<_>>(),
+            &[0],
+            None,
+        );
+        let p = b.finish();
+        let selects: Vec<_> = p
+            .insts
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.op == DevOp::IndexSelect as u16)
+            .collect();
+        if rows == 1 {
+            // One row keeps the serialized cooperative form.
+            assert_eq!(selects.len(), 1);
+            let (ix, d) = selects[0];
+            assert_eq!(complete as usize, ix);
+            assert_eq!((d.i[4], u32::from(d.blocks)), (0, 32));
+            continue;
+        }
+        // Three gated packets: g workgroups per row in phases 1-2, one in phase 3.
+        assert_eq!(selects.len(), 3);
+        assert_eq!(complete as usize, selects[2].0);
+        let g = 15.min(304 / rows);
+        for (k, (ix, d)) in selects.iter().enumerate() {
+            let phase = k as u32 + 1;
+            let blocks = if phase == 3 { rows } else { rows * g };
+            assert_eq!((d.i[3], d.i[4], d.i[5], d.i[6]), (0, 2, g, phase));
+            assert_eq!(u32::from(d.blocks), blocks);
+            assert_eq!(
+                [d.t[0], d.t[1], d.t[2], d.t[3], d.t[4], d.t[5], d.t[6]],
+                [n.iidx, n.iscore, n.ighist, n.igctl, n.kvlen, n.ibits, n.icand]
+            );
+            let mut slices: Vec<_> = p
+                .stream
+                .iter()
+                .filter(|e| e.inst as usize == *ix)
+                .map(|e| e.slice)
+                .collect();
+            slices.sort_unstable();
+            assert_eq!(slices, (0..blocks).collect::<Vec<_>>());
+        }
+    }
+    // The strips are sized for every decode row.
+    for (t, bytes) in [
+        (n.ighist, 20 * 4096 * 4),
+        (n.igctl, 20 * 16 * 4),
+        (n.ibits, 20 * 81920u64.div_ceil(32) * 4),
+        (n.icand, 20 * 81920 * 8),
+    ] {
+        assert_eq!(tensors[t as usize].bytes, bytes);
+    }
+}
+
+#[test]
 fn glm_dsa_decode_batch_strides_producers_and_serializes_selection() {
     let _g = crate::test_env::env_guard();
     let mut c = glm_ref_cfg();

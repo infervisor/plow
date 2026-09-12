@@ -746,6 +746,9 @@ extern "C" __device__ unsigned plow_gate_hier_1 = 1;
 extern "C" __device__ unsigned plow_dsa_decode_batch_arm = 1;
 #if defined(__gfx942__)
 extern "C" __device__ unsigned plow_dsa_select_local_arm = 1;
+#if PLOW_DSA_SELECT_SPLIT
+extern "C" __device__ unsigned plow_dsa_select_split_arm = 1;
+#endif
 #endif
 #endif
 /* Hoist the instruction fetch above the gate poll (see the probe at the poll). Default OFF. */
@@ -4399,6 +4402,26 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                     lh, lh + 256);
                 break;
             }
+#if PLOW_DSA_SELECT_SPLIT
+            if (in->i[4] == 2u) {
+                static_assert(PLOW_SMEM_HALVES * 2u >= SEL_SPLIT_LDS * 4u,
+                              "the split selection's histogram does not fit the LDS arena");
+                if (in->i[6] == 1u)
+                    d_index_select_split_hist((const float*)TEN(1), (const int*)TEN(4), in->i[0],
+                                              in->i[1], (unsigned*)TEN(2), in->i[5], slice, lh);
+                else if (in->i[6] == 2u)
+                    d_index_select_split_mark((const float*)TEN(1), (const int*)TEN(4), in->i[0],
+                                              in->i[1], (const unsigned*)TEN(2), (unsigned*)TEN(3),
+                                              (unsigned*)TEN(5), (unsigned long long*)TEN(6),
+                                              in->i[5], slice, lh);
+                else
+                    d_index_select_split_emit((int*)TEN(0), (const int*)TEN(4), in->i[0], in->i[1],
+                                              (unsigned*)TEN(2), (unsigned*)TEN(3),
+                                              (const unsigned*)TEN(5),
+                                              (const unsigned long long*)TEN(6), slice, lh);
+                break;
+            }
+#endif
 #endif
             /* i[2]=pool_size: zero-means-1 guard, NOT a plain pass-through. Every emitter this
              * tree ships today writes i[2]==0 (the field didn't exist when those blobs were

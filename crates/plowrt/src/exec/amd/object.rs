@@ -501,6 +501,10 @@ pub(super) const XR_TAGGED_SYM: &str = "plow_xr_tagged_1";
 
 pub(super) const DECODE_ARM_MARKERS: &[(&str, &[&str])] = &[
     ("PLOW_DSA_SELECT_LOCAL", &["plow_dsa_select_local_arm"]),
+    // The gated split selection (op 59 i[4] = 2). An object without the arm runs every phase as
+    // the serialized cooperative form on one row: wrong set, no trap. A BUILD axis
+    // (`#if PLOW_DSA_SELECT_SPLIT`).
+    ("PLOW_DSA_SELECT_SPLIT", &["plow_dsa_select_split_arm"]),
     ("PLOW_KDA_CONV_STEP_DB", &["plow_kda_conv_step_db_arm"]),
     ("PLOW_MOE_PF_ATOMIC", &["plow_moe_pf_atomic_arm"]),
     ("PLOW_MOE_PF_DET", &["plow_moe_pf_det_arm"]),
@@ -877,6 +881,9 @@ pub(super) fn packet_decode_arm_requirements<'a>(
     let mut requires = Vec::new();
     if insts().any(|inst| inst.op == DevOp::IndexSelect as u16 && inst.i[4] == 1) {
         requires.push("PLOW_DSA_SELECT_LOCAL=1".to_owned());
+    }
+    if insts().any(|inst| inst.op == DevOp::IndexSelect as u16 && inst.i[4] == 2) {
+        requires.push("PLOW_DSA_SELECT_SPLIT=1".to_owned());
     }
     if insts().any(|inst| inst.op == DevOp::KdaConvStateStepG as u16) {
         requires.push("PLOW_KDA_CONV_STEP_DB=1".to_owned());
@@ -1959,36 +1966,59 @@ pub(super) fn check_dsa_select_local(
                 RuntimeError::Device(
                 "local DSA selection requires unpacked gfx942 TP8 decode rows 2/4/8/16/20, unpooled top2048 and row-sized operands".into())
             };
+            // The split form (`i[4] == 2`, PLOW_GLM_SELECT_SPLIT) is three gated packets, `i[6]` =
+            // phase 1/2/3, with `i[5]` workgroups per row in phases 1-2 and one in phase 3, over
+            // per-row strips, on decode rungs only.
+            let split = d.i[4] == 2;
+            let g = if split { d.i[5] } else { 1 };
+            let phase = if split { d.i[6] } else { 0 };
             // A token-batch body runs the decode form over its slot band inside a prefill-width
             // program: the band (the packet's block count) is the row count, not `p.t`.
-            let rows = if p.role.is_token_batch_body() {
+            let rows = if p.role.is_token_batch_body() && !split {
                 u32::from(d.blocks)
             } else {
                 p.t
             };
+            let per_row = if split && phase != 3 { g } else { 1 };
+            let geometry = if split {
+                [2048, 0, 0, 2, g, phase, 0]
+            } else {
+                [2048, 0, 0, 1, 0, 0, 0]
+            };
+            let unbound: &[usize] = if split { &[7] } else { &[2, 3, 5, 6, 7] };
             if arch != "gfx942"
                 || !tp8
-                || !(p.role.is_decode_rung() || p.role.is_token_batch_body())
+                || !(p.role.is_decode_rung() || (!split && p.role.is_token_batch_body()))
                 || !matches!(rows, 2 | 4 | 8 | 16 | 20)
-                || u32::from(d.blocks) != rows
+                || g == 0
+                || (split && !(1..=3).contains(&phase))
+                || u32::from(d.blocks) != rows * per_row
                 || !(2048..=131072).contains(&d.i[0])
-                || d.i[1..] != [2048, 0, 0, 1, 0, 0, 0]
+                || d.i[1..] != geometry
                 || d.fj != [0; 3]
-                || [2, 3, 5, 6, 7]
-                    .iter()
-                    .any(|&i| d.t[i] != packet::dev::TENSOR_NONE16)
+                || unbound.iter().any(|&i| d.t[i] != packet::dev::TENSOR_NONE16)
             {
                 return Err(err());
             }
-            let handles = [d.t[0], d.t[1], d.t[4]];
-            if handles.iter().collect::<BTreeSet<_>>().len() != 3 {
+            let rows = u64::from(rows);
+            let ctx = u64::from(d.i[0]);
+            let mut operands = vec![
+                (d.t[0], rows * 2048 * 4),
+                (d.t[1], rows * ctx * 4),
+                (d.t[4], rows * 4),
+            ];
+            if split {
+                operands.extend([
+                    (d.t[2], rows * 4096 * 4),
+                    (d.t[3], rows * 16 * 4),
+                    (d.t[5], rows * ctx.div_ceil(32) * 4),
+                    (d.t[6], rows * ctx * 8),
+                ]);
+            }
+            if operands.iter().map(|(h, _)| h).collect::<BTreeSet<_>>().len() != operands.len() {
                 return Err(err());
             }
-            for (handle, bytes) in handles.into_iter().zip([
-                u64::from(rows) * 2048 * 4,
-                u64::from(rows) * u64::from(d.i[0]) * 4,
-                u64::from(rows) * 4,
-            ]) {
+            for (handle, bytes) in operands {
                 if tensors.get(handle as usize).is_none_or(|t| t.bytes < bytes) {
                     return Err(err());
                 }
