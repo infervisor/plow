@@ -88,6 +88,9 @@
 #ifndef PLOW_NV_FA_QK_UNROLL
 #define PLOW_NV_FA_QK_UNROLL 1
 #endif
+#ifndef PLOW_NV_FA512_N_SPLIT
+#define PLOW_NV_FA512_N_SPLIT 0
+#endif
 /* BKV=16 is the hd512 arm (PLOW_NV_FA512_WG, design (a) of the 32k memo): same HD-split /
  * redundant-S structure, score tile m64n16k16, Ps width 16. Smem at <512,64,16> is ~131 KiB
  * (Qs 64 + K/V ring 32 + Ps 2 + align), inside the arena; O acc = 4 n64 tiles = 128 f32. */
@@ -98,7 +101,8 @@
 /* smem floats claimed by the wgmma arm: Qs[HD/64][BQ][64] + NS x (Ks,Vs)[HD/64][BKV][64] bf16 +
  * Ps[BQ][BKV] bf16, plus the 1024 B the swizzle alignment may burn off the arena base. */
 #define FA_SM90_PRE_FLOATS(HD, BQ, BKV)                                                             \
-    ((2 * ((BQ) * (HD) + 2 * FA_SM90_STAGES(HD, BKV) * (BKV) * (HD) + (BQ) * (BKV)) + 1024 + 3) / 4)
+    ((2 * ((BQ) * (HD) + 2 * FA_SM90_STAGES(HD, BKV) * (BKV) * (HD) + (BQ) * (BKV)) +              \
+      (PLOW_NV_FA512_N_SPLIT && (HD) == 512 && (BKV) == 64 ? 1024 : 0) + 1024 + 3) / 4)
 /* T30 wgitem: two independent per-warpgroup partitions (each the full single-item claim). */
 #define FA_SM90_WGI_FLOATS(HD, BQ, BKV)                                                             \
     ((2 * 2 * ((BQ) * (HD) + 2 * FA_SM90_NS * (BKV) * (HD) + (BQ) * (BKV) + 512) + 2048 + 3) / 4)
@@ -636,6 +640,8 @@ __device__ void d_flash_prefill_sm90(float* __restrict__ Opart, float* __restric
     constexpr int PV_UNROLL = NSTAGE == 1 ? 4 : 1;
     constexpr int KS1 = BKV / 16;      /* GEMM1 k16 steps (contract over BKV)           */
     constexpr int NB0 = BKV / 8;       /* n8 blocks in the score accumulator            */
+    constexpr bool N_SPLIT = PLOW_NV_FA512_N_SPLIT && HD == 512 && BKV == 64;
+    constexpr int NB0_LOCAL = N_SPLIT ? NB0 / 2 : NB0;
     constexpr int QT = BQ * 64;        /* elements per Q sub-tile                       */
     constexpr int KT = BKV * 64;       /* elements per K/V sub-tile                     */
 
@@ -646,6 +652,8 @@ __device__ void d_flash_prefill_sm90(float* __restrict__ Opart, float* __restric
     __nv_bfloat16* const Ks = Qs + NSUB * QT;                       /* [NS][NSUB][BKV][64] */
     __nv_bfloat16* const Vs = Ks + NSTAGE * NSUB * KT;              /* [NS][NSUB][BKV][64] */
     __nv_bfloat16* const Ps = Vs + NSTAGE * NSUB * KT;              /* [BQ][BKV] swizzle-0 */
+    float* const reduce_max = (float*)(Ps + BQ * BKV);
+    float* const reduce_sum = reduce_max + 2 * BQ;
 
     const int tid = threadIdx.x;
     const int wg = tid >> 7;               /* warpgroup 0/1: owns hd [wg*HD/2, +HD/2)      */
@@ -846,13 +854,18 @@ __device__ void d_flash_prefill_sm90(float* __restrict__ Opart, float* __restric
             /* --- GEMM0: S[64][BKV] = Q . K^T. scale-d = 0 on the first k-step seeds the
              * accumulator, so no zeroing pass. --- */
             const __nv_bfloat16* kbuf = Ks + (size_t)sb * NSUB * KT;
-            float S[BKV / 2];
+            float S[4 * NB0_LOCAL];
             sm90_wg_fence();
 #pragma unroll QK_UNROLL
             for (int ks = 0; ks < KS0; ks++) {
                 const int sub = ks >> 2, ko = (ks & 3) * 16; /* +32 B per k16 substep */
-                fa90_wgmma_score<BKV>(S, sm90_desc(Qs + sub * QT + ko),
-                                      sm90_desc(kbuf + sub * KT + ko), ks ? 1 : 0);
+                if constexpr (N_SPLIT)
+                    fa90_wgmma_m64n32k16(
+                        S, sm90_desc(Qs + sub * QT + ko),
+                        sm90_desc(kbuf + sub * KT + wg * 32 * 64 + ko), ks ? 1 : 0);
+                else
+                    fa90_wgmma_score<BKV>(S, sm90_desc(Qs + sub * QT + ko),
+                                          sm90_desc(kbuf + sub * KT + ko), ks ? 1 : 0);
             }
             sm90_wg_commit();
             sm90_wg_wait<0>();
@@ -860,10 +873,11 @@ __device__ void d_flash_prefill_sm90(float* __restrict__ Opart, float* __restric
             /* --- scale + causal/sliding mask IN THE FRAGMENT --- */
             float mxA = FA_NEG_INF, mxB = FA_NEG_INF;
 #pragma unroll
-            for (int nb = 0; nb < NB0; nb++)
+            for (int nb = 0; nb < NB0_LOCAL; nb++)
 #pragma unroll
                 for (int e = 0; e < 2; e++) {
-                    const int kv = (int)kv0 + 8 * nb + 2 * (lane & 3) + e;
+                    const int kv = (int)kv0 + (N_SPLIT ? wg * 32 : 0) + 8 * nb +
+                                   2 * (lane & 3) + e;
                     const bool inr = ((unsigned)kv < hi);
                     bool okA = inr && (kv <= qabsA), okB = inr && (kv <= qabsB);
                     if (window) {
@@ -883,6 +897,15 @@ __device__ void d_flash_prefill_sm90(float* __restrict__ Opart, float* __restric
             mxA = fmaxf(mxA, __shfl_xor_sync(0xffffffffu, mxA, 2));
             mxB = fmaxf(mxB, __shfl_xor_sync(0xffffffffu, mxB, 1));
             mxB = fmaxf(mxB, __shfl_xor_sync(0xffffffffu, mxB, 2));
+            if constexpr (N_SPLIT) {
+                if ((lane & 3) == 0) {
+                    reduce_max[wg * BQ + rA] = mxA;
+                    reduce_max[wg * BQ + rB] = mxB;
+                }
+                __syncthreads();
+                mxA = fmaxf(reduce_max[rA], reduce_max[BQ + rA]);
+                mxB = fmaxf(reduce_max[rB], reduce_max[BQ + rB]);
+            }
 
             const float mnA = fmaxf(mA, mxA), mnB = fmaxf(mB, mxB);
             /* corr==0 on the first attended tile (m_old still -inf) — the shared body's rule. */
@@ -897,15 +920,15 @@ __device__ void d_flash_prefill_sm90(float* __restrict__ Opart, float* __restric
             const bool liveA = (mnA != FA_NEG_INF), liveB = (mnB != FA_NEG_INF);
             float sA = 0.0f, sB = 0.0f;
 #pragma unroll
-            for (int nb = 0; nb < NB0; nb++) {
+            for (int nb = 0; nb < NB0_LOCAL; nb++) {
                 const float pa0 = liveA ? FA_EXP(S[4 * nb + 0] - mnA) : 0.0f;
                 const float pa1 = liveA ? FA_EXP(S[4 * nb + 1] - mnA) : 0.0f;
                 const float pb0 = liveB ? FA_EXP(S[4 * nb + 2] - mnB) : 0.0f;
                 const float pb1 = liveB ? FA_EXP(S[4 * nb + 3] - mnB) : 0.0f;
                 sA += pa0 + pa1;
                 sB += pb0 + pb1;
-                if (wg == 0) {
-                    const int c0 = 8 * nb + 2 * (lane & 3);
+                if (N_SPLIT || wg == 0) {
+                    const int c0 = (N_SPLIT ? wg * 32 : 0) + 8 * nb + 2 * (lane & 3);
                     *(__nv_bfloat162*)(Ps + fa90_cm_off<BKV>(rA, c0)) =
                         __floats2bfloat162_rn(pa0, pa1);
                     *(__nv_bfloat162*)(Ps + fa90_cm_off<BKV>(rB, c0)) =
@@ -916,6 +939,15 @@ __device__ void d_flash_prefill_sm90(float* __restrict__ Opart, float* __restric
             sA += __shfl_xor_sync(0xffffffffu, sA, 2);
             sB += __shfl_xor_sync(0xffffffffu, sB, 1);
             sB += __shfl_xor_sync(0xffffffffu, sB, 2);
+            if constexpr (N_SPLIT) {
+                if ((lane & 3) == 0) {
+                    reduce_sum[wg * BQ + rA] = sA;
+                    reduce_sum[wg * BQ + rB] = sB;
+                }
+                __syncthreads();
+                sA = reduce_sum[rA] + reduce_sum[BQ + rA];
+                sB = reduce_sum[rB] + reduce_sum[BQ + rB];
+            }
             lA = lA * cA + sA;
             lB = lB * cB + sB;
 
@@ -939,7 +971,8 @@ __device__ void d_flash_prefill_sm90(float* __restrict__ Opart, float* __restric
              * cumulativity — NOT the CUTLASS producer-side order (fence-before-barrier), which would
              * only fence wg0. Do not swap these two lines: moving the fence above the barrier drops
              * the ordering guarantee for wg1's reads of wg0's Ps. */
-            __syncthreads(); /* (B) Ps published to the whole block */
+            if constexpr (!N_SPLIT)
+                __syncthreads(); /* (B) Ps published to the whole block */
             fa90_async_proxy_fence();
 
             /* --- GEMM1: O += P . V. A = Ps (K-major over BKV, swizzle-0); B = V MN-MAJOR

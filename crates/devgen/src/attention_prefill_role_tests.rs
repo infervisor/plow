@@ -98,6 +98,16 @@ fn wgmma_object_selects_its_tile_and_rejects_partial_output() {
         Some(expected)
     );
 
+    let mut n_split = globals.to_vec();
+    n_split.push(("plow_attention_score_partitions", 2));
+    n_split[6].1 = 206_848;
+    std::fs::write(directory.join(OBJECT_FILE), object_image(&n_split)).unwrap();
+    let mut split = fixture(512, true, true);
+    assert!(apply_output(&mut split, &mut Vec::new(), "sm90a", &output).unwrap());
+    n_split[6].1 = 205_824;
+    std::fs::write(directory.join(OBJECT_FILE), object_image(&n_split)).unwrap();
+    assert!(apply_output(&mut split, &mut Vec::new(), "sm90a", &output).is_err());
+
     globals[3].1 = 16;
     std::fs::write(directory.join(OBJECT_FILE), object_image(&globals)).unwrap();
     assert!(apply_output(&mut partial, &mut sections, "sm90a", &output).is_err());

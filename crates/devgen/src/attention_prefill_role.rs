@@ -362,17 +362,25 @@ pub(crate) fn apply_output_object(
     let info = plow_asset::cubin::inspect(&image)
         .ok_or_else(|| format!("{} is not a valid cubin", path.display()))?;
     let wgmma = plow_asset::cubin::global_u32(&image, "plow_attention_query_tile") == Some(64);
+    let score_partitions =
+        plow_asset::cubin::global_u32(&image, "plow_attention_score_partitions").unwrap_or(1);
     let mut expected = OBJECT_GLOBALS;
     if wgmma {
         expected[2].1 = 64;
         expected[3].1 = 32;
         if plow_asset::cubin::global_u32(&image, "plow_attention_kv_tile") == Some(64) {
             expected[3].1 = 64;
-            expected[6].1 = 205_824;
+            expected[6].1 = match score_partitions {
+                1 => 205_824,
+                2 => 206_848,
+                _ => 0,
+            };
         }
     }
     if profile != "sm90a"
         || info.sm != 90
+        || !matches!(score_partitions, 1 | 2)
+        || (score_partitions == 2 && (!wgmma || expected[3].1 != 64))
         || !info.entries.iter().any(|entry| entry == OBJECT_ENTRY)
         || expected
             .iter()
