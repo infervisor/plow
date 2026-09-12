@@ -79,7 +79,7 @@ int main(int argc, char** argv) {
     const bool fp8=std::strcmp(argv[4],"fp8")==0;
     if (!m || !n || !k || n%2 || k%128 || (!fp8 && std::strcmp(argv[4],"bf16"))) return 2;
     constexpr unsigned grid=132, threads=384;
-    const unsigned smem=2*PGM90_U256_ARENA;
+    const unsigned smem=2*PGM90_WS384_ARENA;
     std::vector<float> ah(size_t(m)*k), bh(size_t(n)*k);
     uint32_t seed=123;
     auto fill=[&](std::vector<float>& h) -> void* {
@@ -125,6 +125,9 @@ int main(int argc, char** argv) {
     CUmodule module; CUfunction interp;
     CD(cuModuleLoad(&module,argv[5]));
     CD(cuModuleGetFunction(&interp,module,"_Z19interp_sm90a_pfgemm11PlowProgram"));
+    // Materialize the runtime function handle before requesting the Hopper opt-in arena.
+    cudaFuncAttributes plain_attr{};
+    CK(cudaFuncGetAttributes(&plain_attr, plain));
     CK(cudaFuncSetAttribute(plain,cudaFuncAttributeMaxDynamicSharedMemorySize,smem));
     CD(cuFuncSetAttribute(interp,CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,smem));
     void* ma=maps; void* mb=maps+1;
