@@ -185,7 +185,7 @@ pub fn build_digests(build: &kernelcaps::BuildId) -> Digests {
     }
 }
 
-/// Render an op case key for storage: `m,n,k,variant,bm,bn,bk`.
+/// Render an op case key for storage: `m,n,k,variant,bm,bn,bk,split_k`.
 ///
 /// Public so a tuning campaign files records under the same key the compiler
 /// looks them up by. The **variant** is in the key because a bf16 and an fp8
@@ -195,14 +195,15 @@ pub fn build_digests(build: &kernelcaps::BuildId) -> Digests {
 pub fn case_key(q: &GemmQuery, t: TileShape) -> String {
     let g = q.shape;
     format!(
-        "{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{}",
         g.m,
         g.n,
         g.k,
         q.variant(),
         t.bm,
         t.bn,
-        t.bk
+        t.bk,
+        t.split_k,
     )
 }
 
@@ -478,14 +479,20 @@ mod tests {
 
     /// The key the compiler looks up must be the key a campaign writes.
     #[test]
-    fn case_key_carries_shape_and_variant() {
+    fn case_key_carries_shape_variant_and_split_k() {
         assert_eq!(
             case_key(&bf16(shape()), tile(128, 128, 32)),
-            "4096,4096,4096,bf16,128,128,32"
+            "4096,4096,4096,bf16,128,128,32,1"
         );
         assert_eq!(
             case_key(&fp8(shape()), tile(128, 128, 32)),
-            "4096,4096,4096,fp8,128,128,32"
+            "4096,4096,4096,fp8,128,128,32,1"
+        );
+        let mut split = tile(128, 128, 32);
+        split.split_k = 8;
+        assert_eq!(
+            case_key(&bf16(shape()), split),
+            "4096,4096,4096,bf16,128,128,32,8"
         );
     }
 
