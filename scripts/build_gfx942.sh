@@ -805,7 +805,12 @@ fi
 # `twoshot` compiles none of it: the prefill rows are then the shipped 2-byte two-shot.
 case "${PLOW_XR_SCHED:-aiter}" in
   twoshot|off) ;;
-  aiter) AX_PREFILL="$AX_PREFILL -DPLOW_XR_SCHED_AITER=1 -DPLOW_XR_SCHED_NWG=${PLOW_XR_SCHED_NWG:-24} -DPLOW_XR_SCHED_NWG_RS=${PLOW_XR_SCHED_NWG_RS:-8} -DPLOW_XR_SCHED_AG_U=${PLOW_XR_SCHED_AG_U:-1}" ;;
+  aiter) AX_PREFILL="$AX_PREFILL -DPLOW_XR_SCHED_AITER=1 -DPLOW_XR_SCHED_NWG=${PLOW_XR_SCHED_NWG:-24} -DPLOW_XR_SCHED_NWG_RS=${PLOW_XR_SCHED_NWG_RS:-8} -DPLOW_XR_SCHED_AG_U=${PLOW_XR_SCHED_AG_U:-1}"
+         # OPT-IN seam caps (ops 25 / 26); unset, they are PLOW_XR_SCHED_NWG and the objects are
+         # byte-identical to a build without these two lines.
+         [ -n "${PLOW_XR_SCHED_NWG_SRS:-}" ] && AX_PREFILL="$AX_PREFILL -DPLOW_XR_SCHED_NWG_SRS=$PLOW_XR_SCHED_NWG_SRS"
+         [ -n "${PLOW_XR_SCHED_NWG_SAG:-}" ] && AX_PREFILL="$AX_PREFILL -DPLOW_XR_SCHED_NWG_SAG=$PLOW_XR_SCHED_NWG_SAG"
+         ;;
   *) echo "FAIL: PLOW_XR_SCHED must be aiter or twoshot" >&2; exit 2 ;;
 esac
 

@@ -109,6 +109,18 @@ env -u PLOW_XR_SCHED_NWG -u PLOW_XR_SCHED_NWG_RS -u PLOW_XR_SCHED_AG_U PLOW_XR_S
     "$ROOT/scripts/build_gfx942.sh" "$TMP/xr2" >"$TMP/xr2.log" 2>&1 || { cat "$TMP/xr2.log"; exit 1; }
 expect "twoshot compiles no collective-schedule define on any row" \
   bash -c '! grep -q XR_SCHED "$1"' _ "$TMP/xr2/build_defines.json"
+expect "the seam caps are not passed unless set" \
+  bash -c '! grep -q "XR_SCHED_NWG_S" "$1"' _ "$D"
+env -u PLOW_XR_SCHED -u PLOW_XR_SCHED_NWG_SAG PLOW_XR_SCHED_NWG_SRS=8 \
+    PLOW_HSACO_CONFIG="$TMP/assets" PLOW_DEFINES_ONLY=1 \
+    "$ROOT/scripts/build_gfx942.sh" "$TMP/srs" >"$TMP/srs.log" 2>&1 || { cat "$TMP/srs.log"; exit 1; }
+expect "an explicit seam reduce-scatter cap reaches the prefill rows" \
+  has_define "$TMP/srs/build_defines.json" interp_prefill_fp8kv_mla_moe -DPLOW_XR_SCHED_NWG_SRS=8
+expect "and no other row" python3 - "$TMP/srs/build_defines.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+sys.exit(1 if any("XR_SCHED_NWG_SRS" in v for k, v in d.items() if not k.startswith("interp_prefill")) else 0)
+PY
 
 echo "--- explicit env still wins where it agrees or widens"
 env -u PLOW_DECODE_TIERS PLOW_DECODE_BATCH=32 PLOW_GEMV_MM=16 PLOW_GEMV_WALK=1 PLOW_DSA_PF=0 \
