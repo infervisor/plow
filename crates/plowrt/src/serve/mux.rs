@@ -3626,11 +3626,12 @@ fn gpu_prefill_batched_pass(
         // ONE planner for every backend (`crate::sched::step`): this arm only lowers its
         // single fair-split launch. `per_launch` already nets out the decode rows this
         // engine's bucket-cost budget chose, so decodes are recorded, not re-charged.
+        let now = Instant::now();
         let candidates: Vec<crate::sched::step::Candidate> = candidates
             .map(|span| crate::sched::step::Candidate {
                 arrival: slots[span.slot as usize]
                     .as_ref()
-                    .map_or(u64::MAX, |s| arrival_key(s.arrived, Instant::now())),
+                    .map_or(u64::MAX, |s| arrival_key(s.arrived, now)),
                 span,
                 packable: true,
                 planned: true,
