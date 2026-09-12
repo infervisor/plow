@@ -146,6 +146,8 @@ pub(crate) struct RunObserver {
     /// wrote before the tick shows up in exactly the fires that would have
     /// consumed it on a real device.
     pub kv_writes: Vec<KvWrite>,
+    /// SLO tick planner state (`PLOW_TBT_SLO_MS` / `PLOW_TTFT_SLO_MS`); untouched when unset.
+    pub slo: crate::sched::slo::SloState,
 }
 
 /// One recorded consumption of `KV_PAGES` by a `FLASH`-family packet.
@@ -169,6 +171,7 @@ impl RunObserver {
             indirection: IndirectionTable::new(table_size.max(RUN_INDIRECTION_SIZE)),
             kv_pages_range: crate::exec::indirection::slots::kv_pages(0, 0),
             kv_writes: Vec::new(),
+            slo: Default::default(),
         }
     }
 

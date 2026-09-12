@@ -217,6 +217,9 @@ pub struct Report {
     pub tpot_ms: Option<Distribution>,
     pub itl_ms: Option<Distribution>,
     pub e2e_ms: Distribution,
+    /// Attainment of `PLOW_TTFT_SLO_MS` / `PLOW_TBT_SLO_MS`; absent when neither is set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slo: Option<SloReport>,
     pub output_checksum: String,
     pub artifacts: ArtifactReport,
     pub runtime: serde_json::Value,
@@ -329,6 +332,45 @@ pub struct SchedulerReport {
     pub mean_batch_size: f64,
     pub rejected: u64,
     pub admit_shed: u64,
+}
+
+/// Per-request SLO attainment. TBT is judged on each request's mean inter-token time (TPOT);
+/// the per-token distribution is `itl_ms`.
+#[derive(Clone, Debug, Serialize)]
+pub struct SloReport {
+    pub tbt_target_ms: Option<f64>,
+    pub ttft_target_ms: Option<f64>,
+    pub ttft_met: usize,
+    pub tbt_met: usize,
+    /// Requests meeting every set target.
+    pub met: usize,
+    /// `met / completed`.
+    pub goodput_share: f64,
+    /// `met` per second of the measured run.
+    pub goodput_rps: f64,
+}
+
+fn slo_report(targets: crate::sched::slo::Targets, results: &[RequestResult], secs: f64) -> Option<SloReport> {
+    if !targets.active() {
+        return None;
+    }
+    let (mut ttft_met, mut tbt_met, mut met) = (0, 0, 0);
+    for r in results {
+        let tpot = r.tpot.map_or(0.0, ms);
+        let (ttft_ok, tbt_ok) = crate::sched::slo::attained(targets, ms(r.ttft), tpot);
+        ttft_met += usize::from(ttft_ok);
+        tbt_met += usize::from(tbt_ok);
+        met += usize::from(ttft_ok && tbt_ok);
+    }
+    Some(SloReport {
+        tbt_target_ms: targets.tbt_ms,
+        ttft_target_ms: targets.ttft_ms,
+        ttft_met,
+        tbt_met,
+        met,
+        goodput_share: met as f64 / results.len().max(1) as f64,
+        goodput_rps: if secs > 0.0 { met as f64 / secs } else { 0.0 },
+    })
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -695,6 +737,7 @@ pub async fn run(state: &AppState, cfg: Config) -> Result<Report> {
         tpot_ms: distribution(tpot),
         itl_ms: distribution(itl),
         e2e_ms: distribution(e2e).expect("one result"),
+        slo: slo_report(crate::config::RuntimeConfig::get().slo_targets(), &results, secs),
         output_checksum: checksum(&results),
         artifacts,
         runtime: cfg.runtime,

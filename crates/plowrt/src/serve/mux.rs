@@ -2156,6 +2156,10 @@ fn run_one_tick(
             let mut did_prefill = false;
             let _tick = crate::obs::tick::begin();
             let rt = crate::config::RuntimeConfig::get();
+            let slo_targets = rt.slo_targets();
+            let slo_on = slo_targets.active();
+            let slo_t0 = slo_on.then(Instant::now);
+            let mut slo_pf_ms = 0.0f64;
             let no_interleave = rt.pf_no_interleave;
             let decode_rows = slots[..b.min(slots.len())]
                 .iter()
@@ -2286,7 +2290,7 @@ fn run_one_tick(
             //  * A member may consume its prompt to the end. `token_batch_prefill_rows` does
             //    not hold the last token back, and the sampled ids for prompts that finish
             //    here follow the decode feeds in `output`.
-            if !no_interleave && !rt.pf_defer_decode && e.token_batch_rows(1, 1).is_some() {
+            if !no_interleave && !rt.pf_defer_decode && !slo_on && e.token_batch_rows(1, 1).is_some() {
                 let feeds: Vec<(usize, u32)> = slots
                     .iter()
                     .enumerate()
@@ -2543,6 +2547,7 @@ fn run_one_tick(
             if has_decode
                 && !no_interleave
                 && !rt.pf_defer_decode
+                && !slo_on
                 && e.mixed_step_rows(decode_rows, 1).is_some()
             {
                 let mut candidates: Vec<_> = slots
@@ -2721,20 +2726,25 @@ fn run_one_tick(
                     })
                 })
                 .collect();
-            let step = crate::sched::step::plan(
-                backend,
-                crate::sched::step::Tick {
-                    cap_rows: tick_max,
-                    packing: pf_batch,
-                    rotate: rt.pf_rotate(),
-                    turn: e.prefill_turn(),
-                    slots: cap,
-                },
-                (0..cap).filter(|&i| slots[i].as_ref().is_some_and(|s| s.step > 0)).map(|i| i as u32),
-                &candidates,
-                |program| e.prefill_prog_t(program as usize),
-                |program| e.packed_prefill_span_limit(program as usize),
-            );
+            let step_tick = crate::sched::step::Tick {
+                cap_rows: tick_max,
+                packing: pf_batch,
+                rotate: rt.pf_rotate(),
+                turn: e.prefill_turn(),
+                slots: cap,
+            };
+            let step = if slo_on {
+                amd_slo_plan(&*e, &slots, backend, step_tick, slo_targets, &mut obs.slo, now)
+            } else {
+                crate::sched::step::plan(
+                    backend,
+                    step_tick,
+                    (0..cap).filter(|&i| slots[i].as_ref().is_some_and(|s| s.step > 0)).map(|i| i as u32),
+                    &candidates,
+                    |program| e.prefill_prog_t(program as usize),
+                    |program| e.packed_prefill_span_limit(program as usize),
+                )
+            };
             for launch in &step.launches {
                 if launch.is_pack() {
                     let packed = launch.spans.clone();
@@ -2852,7 +2862,21 @@ fn run_one_tick(
                     // never the planner's remainder: a fresh cursor built against a partial budget
                     // would plan the whole prompt in narrower rungs, and the planner only admits a
                     // planned chunk that fits.
-                    let pf = e.prefill_chunked_at_most(i, &slot_ref.prompt_ids, tick_max);
+                    let fresh = slo_on && e.next_prefill_rows(i).is_none();
+                    let (pf, ran) = if slo_on {
+                        let rows = launch.spans[0].n_rows;
+                        match e.prefill_chunk_rows(i, &slot_ref.prompt_ids, tick_max, rows) {
+                            Ok((token, ran)) => (Ok(token), ran),
+                            Err(err) => (Err(err), None),
+                        }
+                    } else {
+                        (e.prefill_chunked_at_most(i, &slot_ref.prompt_ids, tick_max), None)
+                    };
+                    if let Some(ran) = ran {
+                        let ms = t_pf.elapsed().as_secs_f64() * 1e3;
+                        slo_pf_ms += ms;
+                        obs.slo.cost.observe_launch(ran.bucket, ran.clen, ran.c0, fresh, ms);
+                    }
                     let frontier = e.prefill_frontier(i).unwrap_or(slot_ref.prompt_ids.len());
                     crate::obs::tick::prefill(
                         t_pf.elapsed().as_nanos() as u64,
@@ -2970,7 +2994,7 @@ fn run_one_tick(
             );
             let multi = e.multistep_quantum(&feeds, requested);
             let mut deferred = std::mem::take(&mut obs.host.slot_tokens);
-            let t_dec = crate::obs::tick::on().then(Instant::now);
+            let t_dec = (crate::obs::tick::on() || slo_on).then(Instant::now);
             let step_result = if let Some(quantum) = multi {
                 e.multi_step(&feeds, quantum, &mut deferred)
                     .and_then(|quantum| {
@@ -3024,6 +3048,11 @@ fn run_one_tick(
             obs.host.slot_tokens = deferred;
             if let Some(t) = t_dec {
                 crate::obs::tick::decode(t.elapsed().as_nanos() as u64, feeds.len() as u32);
+                if let (Some(t0), None, true) = (slo_t0, multi, step_result.is_ok()) {
+                    let dec_ms = t.elapsed().as_secs_f64() * 1e3;
+                    obs.slo.cost.observe_decode(feeds.len() as u32, did_prefill, dec_ms);
+                    obs.slo.cost.observe_host(t0.elapsed().as_secs_f64() * 1e3 - slo_pf_ms - dec_ms);
+                }
             }
             match step_result {
                 Ok(quantum) => {
@@ -3395,6 +3424,95 @@ fn amd_prefill_pick(
             }
         })
         .map(|(slot, _)| slot)
+}
+
+/// The step plan under `PLOW_TBT_SLO_MS` / `PLOW_TTFT_SLO_MS` (`crate::sched::slo`): isolated
+/// launches only, each chunk sized in milliseconds against the online tick cost model.
+#[cfg(any(feature = "hsa", feature = "cpu"))]
+fn amd_slo_plan(
+    e: &dyn crate::serve::engine::SeqEngine,
+    slots: &[Option<Slot>],
+    backend: crate::sched::step::Backend,
+    tick: crate::sched::step::Tick,
+    targets: crate::sched::slo::Targets,
+    state: &mut crate::sched::slo::SloState,
+    now: Instant,
+) -> crate::sched::step::Plan {
+    use crate::sched::slo::{Ladder, SloCandidate};
+    let ladder = state.ladder.take().unwrap_or_else(|| Ladder {
+        rungs: e.prefill_ladder(),
+        tail_sparse_ctx: crate::config::RuntimeConfig::get().amd_tail_sparse_ctx(),
+    });
+    let candidates: Vec<SloCandidate> = (0..tick.slots)
+        .filter_map(|i| {
+            let slot = slots[i].as_ref().filter(|s| s.step == 0 && !s.respond.is_closed())?;
+            let planned = e.next_prefill_rows(i);
+            let rows = planned.unwrap_or(u32::MAX);
+            let prior = u32::try_from(e.prefill_frontier(i).unwrap_or(0)).unwrap_or(u32::MAX);
+            Some(SloCandidate {
+                base: crate::sched::step::Candidate {
+                    span: packet::dev::PrefillSpan {
+                        row0: 0,
+                        n_rows: rows,
+                        slot: i as u32,
+                        flags: 0,
+                        kv_row0: 0,
+                        kv_len: rows,
+                        state_slot: i as u32,
+                        program: 0,
+                    },
+                    arrival: arrival_key(slot.arrived, now),
+                    packable: false,
+                    planned: planned.is_some(),
+                },
+                prior,
+                remaining: u32::try_from(slot.prompt_ids.len())
+                    .unwrap_or(u32::MAX)
+                    .saturating_sub(prior),
+                age_ms: now.saturating_duration_since(slot.arrived).as_secs_f64() * 1e3,
+            })
+        })
+        .collect();
+    let (plan, outcome) = crate::sched::slo::plan_tick(
+        targets,
+        backend,
+        tick,
+        (0..tick.slots)
+            .filter(|&i| slots[i].as_ref().is_some_and(|s| s.step > 0))
+            .map(|i| i as u32),
+        &candidates,
+        &ladder,
+        &state.cost,
+        &mut state.skipped,
+        |program| e.prefill_prog_t(program as usize),
+        |program| e.packed_prefill_span_limit(program as usize),
+    );
+    if crate::obs::tick::on() {
+        let launches: Vec<String> = plan
+            .launches
+            .iter()
+            .flat_map(|l| &l.spans)
+            .map(|s| {
+                let prior = candidates
+                    .iter()
+                    .find(|c| c.base.span.slot == s.slot)
+                    .map_or(0, |c| c.prior);
+                format!("{}:{}@{}", s.slot, s.n_rows, prior)
+            })
+            .collect();
+        eprintln!(
+            "SLOPLAN budget={:.1} pred={:.1} progress={} k={} decode_rows={} waiting={} launches=[{}]",
+            outcome.budget_ms,
+            outcome.predicted_ms,
+            outcome.progress,
+            outcome.k,
+            plan.decodes.len(),
+            candidates.len(),
+            launches.join(",")
+        );
+    }
+    state.ladder = Some(ladder);
+    plan
 }
 
 /// Members of one token-batch body from an ordered candidate pool: every candidate whose whole
