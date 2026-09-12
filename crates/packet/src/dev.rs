@@ -610,7 +610,7 @@ pub enum DevOp {
     /// Validated (rms ~0.004 vs the merge→fold sequence); ~1.1-1.24x on the MLA chain, composing
     /// with the ctx-scaled nsplit to 1.59x at 32k. `t0=O(v_head) t1=Opart(f32) t2=mlpart(f32)
     /// t3=Wuv` · `i0=n_batch i1=n_head i2=V i4=nsplit i5=native_fp32`.
-    /// `native_fp32=1` selects isolated gfx942 TP8 GEMMs (prefill buckets, decode rungs 16/20).
+    /// `native_fp32=1` selects isolated gfx942 TP8 prefill GEMMs.
     MlaMergeFold = 57,
 
     // ===== DSA lightning indexer (GLM-5.2 GlmMoeDsa; sparse-attn-design.md §3.1, arXiv 2512.02556

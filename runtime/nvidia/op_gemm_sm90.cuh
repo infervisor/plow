@@ -61,6 +61,9 @@
 #ifndef PLOW_NV_SEG_M64N128
 #define PLOW_NV_SEG_M64N128 0
 #endif
+#ifndef PLOW_NV_SEG_M128N128
+#define PLOW_NV_SEG_M128N128 0
+#endif
 #if PLOW_NV_SEG_M64N64 && PLOW_NV_SEG_M64N128
 #error "select one M64 segment tile"
 #endif
@@ -942,9 +945,23 @@ static __device__ void d_gemm_w8a8_sm90_tma(__nv_bfloat16* __restrict__ C, const
 #define PGM90_U256_MBAR_BF16 (PGM90_UNI256_NS * 2 * 4)
 #define PGM90_U256_ARENA                                                                       \
     ((PGM90_U256_MBAR_BF16 + PGM90_UNI256_NS * (PGM90_A8BUF + PGM90_U256_BBUF) / 2) + PGM90_PAD)
-#if PGM_ARENA_BF16 < PGM90_U256_ARENA
+#ifndef PGM90_WS384_BN
+#define PGM90_WS384_BN 256
+#endif
+#if PGM90_WS384_BN != 128 && PGM90_WS384_BN != 256
+#error "PGM90_WS384_BN must be 128 or 256"
+#endif
+#define PGM90_WS384_BBUF (PGM90_WS384_BN * PGM90_BK8)
+#define PGM90_WS384_TXB (PGM90_A8BUF + PGM90_WS384_BBUF)
+#define PGM90_WS384_ARENA                                                                      \
+    ((PGM90_U256_MBAR_BF16 + PGM90_UNI256_NS * (PGM90_A8BUF + PGM90_WS384_BBUF) / 2) + PGM90_PAD)
+#if !PLOW_NV_SEG_M128N128 && PGM_ARENA_BF16 < PGM90_U256_ARENA
 #undef PGM_ARENA_BF16
 #define PGM_ARENA_BF16 PGM90_U256_ARENA
+#endif
+#if PGM_ARENA_BF16 < PGM90_WS384_ARENA
+#undef PGM_ARENA_BF16
+#define PGM_ARENA_BF16 PGM90_WS384_ARENA
 #endif
 
 /* T20b: bf16 twin of the fp8 uni256 body below — SAME staging (BK 64 bf16 = 128 B rows, so
@@ -1327,7 +1344,7 @@ static __device__ void d_gemm_sm90_tma_ws384_role(__nv_bfloat16* __restrict__ C,
     __syncthreads();
 
     const int tiles_m = ((int)m + PGM90_BM - 1) / PGM90_BM;
-    const int tiles_n = ((int)n + PGM90_U256_BN - 1) / PGM90_U256_BN;
+    const int tiles_n = ((int)n + PGM90_WS384_BN - 1) / PGM90_WS384_BN;
     const int ntiles = tiles_m * tiles_n;
     const int ksteps = ((int)k + kelem - 1) / kelem;
 
@@ -1339,7 +1356,7 @@ static __device__ void d_gemm_sm90_tma_ws384_role(__nv_bfloat16* __restrict__ C,
                 int tmi, tni;
                 sm90_tile_remap(tile, tiles_m, tiles_n, &tmi, &tni);
                 const int tm = tmi * PGM90_BM;
-                const int tn = tni * PGM90_U256_BN;
+                const int tn = tni * PGM90_WS384_BN;
                 for (int ks = 0; ks < ksteps; ks++) {
                 const int st = ist % NS;
                 if (ist >= NS) sm90_mbar_wait(bempty + st, ((ist / NS) + 1) & 1);
@@ -1353,15 +1370,17 @@ static __device__ void d_gemm_sm90_tma_ws384_role(__nv_bfloat16* __restrict__ C,
                 int tmi, tni;
                 sm90_tile_remap(tile, tiles_m, tiles_n, &tmi, &tni);
                 const int tm = tmi * PGM90_BM;
-                const int tn = tni * PGM90_U256_BN;
+                const int tn = tni * PGM90_WS384_BN;
 #endif
-                sm90_mbar_expect(bfull + st, PGM90_U256_TXB);
+                sm90_mbar_expect(bfull + st, PGM90_WS384_TXB);
                 const uint32_t bar = sm90_su32(bfull + st);
                 sm90_tma2d(sm90_su32(As + st * PGM90_A8BUF), mapA, ks * kelem, (int)a_row0 + tm,
                            bar);
-                uint8_t* bs = Bs + st * PGM90_U256_BBUF;
+                uint8_t* bs = Bs + st * PGM90_WS384_BBUF;
                 sm90_tma2d(sm90_su32(bs), mapB, ks * kelem, tn, bar);
+#if PGM90_WS384_BN == 256
                 sm90_tma2d(sm90_su32(bs + 128 * BKB), mapB, ks * kelem, tn + 128, bar);
+#endif
                 ist++;
             }
 #if PGM90_WS384_ISSUE_CURSOR
@@ -1377,23 +1396,29 @@ static __device__ void d_gemm_sm90_tma_ws384_role(__nv_bfloat16* __restrict__ C,
             int tmi, tni;
             sm90_tile_remap(tile, tiles_m, tiles_n, &tmi, &tni);
             const int tm = tmi * PGM90_BM;
-            const int tn = tni * PGM90_U256_BN;
-            float acc[2 * PGM90_NACC];
+            const int tn = tni * PGM90_WS384_BN;
+            float acc[PGM90_WS384_BN / 2];
             int prev = -1;
             for (int ks = 0; ks < ksteps; ks++, st++) {
                 const int s = st % NS;
                 sm90_mbar_wait(bfull + s, (st / NS) & 1);
                 const uint8_t* Ac = As + s * PGM90_A8BUF + cwg * PGM90_MSLAB * BKB;
-                const uint8_t* Bc = Bs + s * PGM90_U256_BBUF;
+                const uint8_t* Bc = Bs + s * PGM90_WS384_BBUF;
                 sm90_wg_fence();
 #pragma unroll
                 for (int sub = 0; sub < 4; sub++) {
                     const int sd = (ks == 0 && sub == 0) ? 0 : 1;
-                    if constexpr (E4M3)
+                    if constexpr (E4M3 && PGM90_WS384_BN == 256)
                         wgmma_m64n256k32(acc, sm90_desc(Ac + sub * 32),
                                          sm90_desc(Bc + sub * 32), sd);
-                    else
+                    else if constexpr (!E4M3 && PGM90_WS384_BN == 256)
                         wgmma_m64n256k16(acc, sm90_desc(Ac + sub * 32),
+                                         sm90_desc(Bc + sub * 32), sd);
+                    else if constexpr (E4M3)
+                        wgmma_m64n128k32(acc, sm90_desc(Ac + sub * 32),
+                                         sm90_desc(Bc + sub * 32), sd);
+                    else
+                        wgmma_m64n128k16(acc, sm90_desc(Ac + sub * 32),
                                          sm90_desc(Bc + sub * 32), sd);
                 }
                 sm90_wg_commit();
@@ -1408,7 +1433,7 @@ static __device__ void d_gemm_sm90_tma_ws384_role(__nv_bfloat16* __restrict__ C,
             const int r0 = tm + cwg * PGM90_MSLAB + wiw * 16 + (lane >> 2);
             const int c0 = tn + 2 * (lane & 3);
 #pragma unroll
-            for (int g = 0; g < PGM90_U256_BN / 8; g++)
+            for (int g = 0; g < PGM90_WS384_BN / 8; g++)
 #pragma unroll
                 for (int hi = 0; hi < 2; hi++) {
                     const int rr = r0 + 8 * hi;

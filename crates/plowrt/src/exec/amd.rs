@@ -213,7 +213,6 @@ enum DecodeSegmentKind {
     KdaDecodeFused(usize),
     MoeAiter,
     GemmLt,
-    MlaFold,
     GroupedMoeMxfp4 { glu: usize, down: usize },
     SparseMlaDecode(usize),
 }
@@ -249,7 +248,7 @@ fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
                     Some(i) if i == e.inst as usize => {}
                     Some(_) => multiple_mla_flash = true,
                 }
-            } else if inst.op == DevOp::MlaMergeFold as u16 && !amd_mla_fold::native(inst) {
+            } else if inst.op == DevOp::MlaMergeFold as u16 {
                 match mla_merge_inst {
                     None => mla_merge_inst = Some(e.inst as usize),
                     Some(i) if i == e.inst as usize => {}
@@ -258,14 +257,11 @@ fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
             } else if inst.op == DevOp::KdaDecodeFused as u16
                 || inst.op == DevOp::MoeAiterFp8Pf as u16
                 || inst.op == DevOp::GemmLtPf as u16
-                || amd_mla_fold::native(inst)
             {
                 let name = if inst.op == DevOp::MoeAiterFp8Pf as u16 {
                     "MoeAiterFp8Pf"
                 } else if inst.op == DevOp::GemmLtPf as u16 {
                     "GemmLtPf"
-                } else if inst.op == DevOp::MlaMergeFold as u16 {
-                    "MlaMergeFold"
                 } else {
                     "KdaDecodeFused"
                 };
@@ -326,8 +322,6 @@ fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
                 "MoeAiterFp8Pf"
             } else if prog.insts[inst].op == DevOp::GemmLtPf as u16 {
                 "GemmLtPf"
-            } else if prog.insts[inst].op == DevOp::MlaMergeFold as u16 {
-                "MlaMergeFold"
             } else {
                 "KdaDecodeFused"
             };
@@ -346,8 +340,6 @@ fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
                 DecodeSegmentKind::MoeAiter
             } else if prog.insts[inst].op == DevOp::GemmLtPf as u16 {
                 DecodeSegmentKind::GemmLt
-            } else if prog.insts[inst].op == DevOp::MlaMergeFold as u16 {
-                DecodeSegmentKind::MlaFold
             } else {
                 DecodeSegmentKind::KdaDecodeFused(inst)
             };
@@ -2716,7 +2708,6 @@ enum DecodeSegmentRoute {
     KdaDecodeFused(KdaDecodeFusedArgs),
     MoeAiter(amd_moe_aiter::Route),
     GemmLt(amd_gemm_lt::Route),
-    MlaFold(amd_mla_fold::Route),
     SparseMlaDecode(amd_sparse_mla::DecodeRoute),
     GroupedMoeMxfp4 {
         glu: GroupedMoeGluArgs,
@@ -2754,7 +2745,6 @@ fn decode_segment_routes(
     let aiter = amd_moe_aiter::routes(prog, tensors, kinds.len())?;
     let gemm_lt = amd_gemm_lt::routes(prog, tensors, kinds.len())?;
     let sparse_mla = amd_sparse_mla::decode_routes(prog, tensors, kinds.len())?;
-    let mla_fold = amd_mla_fold::routes(prog, tensors, kinds.len())?;
     let mut routes = Vec::with_capacity(kinds.len());
     for (seg, kind) in kinds.into_iter().enumerate() {
         let inst_ix = match kind {
@@ -2776,12 +2766,6 @@ fn decode_segment_routes(
                 routes.push(DecodeSegmentRoute::GemmLt(gemm_lt[seg].ok_or_else(
                     || RuntimeError::Device("native GEMM segment has no validated route".into()),
                 )?));
-                continue;
-            }
-            DecodeSegmentKind::MlaFold => {
-                routes.push(DecodeSegmentRoute::MlaFold(mla_fold[seg].ok_or_else(|| {
-                    RuntimeError::Device("native MLA fold segment has no validated route".into())
-                })?));
                 continue;
             }
             DecodeSegmentKind::SparseMlaDecode(_) => {
@@ -5211,6 +5195,33 @@ fn state_clear_ranges(
     Ok(out)
 }
 
+/// [`AmdEngine::chunk_steps_from`] over any rung lookup. Each entry of `chunks` is both the bucket
+/// and the row advance, so only a chunk clipped by `n_prompt` runs fewer rows than its bucket.
+pub(crate) fn chunk_steps_over(
+    prog_for: impl Fn(u32) -> Option<usize>,
+    chunks: &[u32],
+    from: u32,
+    n_prompt: u32,
+) -> Result<Vec<ChunkStep>> {
+    let mut out = Vec::with_capacity(chunks.len());
+    let mut c0 = from;
+    for &ch in chunks {
+        if c0 >= n_prompt {
+            break;
+        }
+        let prog = prog_for(ch).ok_or_else(|| {
+            RuntimeError::Device(format!("no compiled bucket for chunk T={ch}"))
+        })?;
+        out.push(ChunkStep {
+            prog,
+            c0,
+            clen: (n_prompt - c0).min(ch),
+        });
+        c0 += ch;
+    }
+    Ok(out)
+}
+
 /// One chunk of a prefill plan: which bucket program runs it, and over which
 /// absolute token range.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -6624,9 +6635,12 @@ impl AmdEngine {
         }
         let has_mla_fold = |p: &DevProg| p.insts.iter().any(amd_mla_fold::native);
         let use_mla_fold = blob.progs.iter().any(has_mla_fold);
-        if use_mla_fold && (arch != "gfx942" || tp.is_none_or(|t| t.n_gpu != 8)) {
+        if use_mla_fold
+            && (arch != "gfx942" || tp.is_none_or(|t| t.n_gpu != 8)
+                || blob.decode_phase().any(has_mla_fold))
+        {
             return Err(RuntimeError::Device(
-                "native MLA fold requires gfx942 TP8".into(),
+                "native MLA fold requires gfx942 TP8 prefill".into(),
             ));
         }
         let has_gemm_lt = |p: &DevProg| p.insts.iter().any(|d| d.op == DevOp::GemmLtPf as u16);
@@ -9243,7 +9257,7 @@ impl AmdEngine {
 
         let mla_fold = if use_mla_fold {
             Some(amd_mla_fold::MlaFold::load(
-                &be, hsaco_dir, &blob.progs, &blob.tensors, &devp, &mut modules,
+                &be, hsaco_dir, blob.prefill_phase(), &blob.tensors, &devp, &mut modules,
             )?)
         } else {
             None
@@ -11917,13 +11931,6 @@ impl AmdEngine {
                 })?;
                 kernel.enqueue(&self.be, route, &self.tens_table)?;
             }
-            DecodeSegmentRoute::MlaFold(route) => {
-                let kernel = self.mla_fold.as_ref().ok_or_else(|| {
-                    RuntimeError::Device("native MLA decode fold has no loaded kernels".into())
-                })?;
-                kernel.enqueue(&self.be, route, &self.tens_table)?;
-                self.seg_launches += 2;
-            }
             DecodeSegmentRoute::KdaDecodeFused(args) => {
                 let kernel = self.k_kda_decode_fused.ok_or_else(|| {
                     RuntimeError::Device(
@@ -13564,27 +13571,12 @@ impl AmdEngine {
         from: u32,
         n_prompt: u32,
     ) -> Result<Vec<ChunkStep>> {
-        let mut out = Vec::with_capacity(chunks.len());
-        let mut c0 = from;
-        for &ch in chunks {
-            if c0 >= n_prompt {
-                break;
-            }
-            let prog = self
-                .prefill_rungs()
-                .find(|&(_, rows)| rows == ch)
-                .map(|(prog, _)| prog)
-                .ok_or_else(|| {
-                    RuntimeError::Device(format!("no compiled bucket for chunk T={ch}"))
-                })?;
-            out.push(ChunkStep {
-                prog,
-                c0,
-                clen: (n_prompt - c0).min(ch),
-            });
-            c0 += ch;
-        }
-        Ok(out)
+        chunk_steps_over(
+            |ch| self.prefill_rungs().find(|&(_, rows)| rows == ch).map(|(prog, _)| prog),
+            chunks,
+            from,
+            n_prompt,
+        )
     }
 
     /// Pool counters (`blocks_live` is the HBM the KV cache actually holds).

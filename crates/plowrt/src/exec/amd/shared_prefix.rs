@@ -257,12 +257,25 @@ pub(super) fn attach_ranks<T>(
             "prefix attachment requires ranks and a valid slot".into(),
         ));
     }
+    let tick = crate::obs::tick::on();
+    let kept_before: u64 = if tick {
+        ranks.iter_mut().map(|rank| cache(rank).attach_kept()).sum()
+    } else {
+        0
+    };
     let mut attempted = 0;
+    let (mut flush_ns, mut stage_ns, mut commit_ns) = (0u64, 0u64, 0u64);
     let result = (|| {
         let mut common = None;
         for rank in ranks.iter_mut() {
             attempted += 1;
+            // `stage_attach` flushes first anyway; flushing here only separates its time.
+            let t = std::time::Instant::now();
+            cache(rank).flush_publish()?;
+            flush_ns += t.elapsed().as_nanos() as u64;
+            let t = std::time::Instant::now();
             let rows = cache(rank).stage_attach(slot, prompt)?;
+            stage_ns += t.elapsed().as_nanos() as u64;
             if rows == 0 {
                 attempted -= 1;
                 return Ok(0);
@@ -273,6 +286,7 @@ pub(super) fn attach_ranks<T>(
             common = Some(rows);
         }
         let rows = common.unwrap();
+        let t = std::time::Instant::now();
         for rank in ranks.iter_mut() {
             let cache = cache(rank);
             cache.commit_attach(slot, rows)?;
@@ -283,8 +297,25 @@ pub(super) fn attach_ranks<T>(
                 "AMD shared prefix attached"
             );
         }
+        commit_ns = t.elapsed().as_nanos() as u64;
         Ok(rows)
     })();
+    if tick {
+        let ms = |ns: u64| ns as f64 / 1e6;
+        let kept = ranks
+            .iter_mut()
+            .map(|rank| cache(rank).attach_kept())
+            .sum::<u64>()
+            - kept_before;
+        eprintln!(
+            "PFATTACH slot={slot} rows={} ranks={} flush={:.3} stage={:.3} commit={:.3} kept={kept}",
+            result.as_ref().map_or(0, |&rows| rows),
+            ranks.len(),
+            ms(flush_ns),
+            ms(stage_ns),
+            ms(commit_ns),
+        );
+    }
     if !matches!(result, Ok(rows) if rows > 0) {
         let mut rollback_error = None;
         for rank in &mut ranks[..attempted] {
@@ -387,6 +418,14 @@ impl SharedPrefix {
         self.groups
             .iter()
             .map(|g| g.pool.stats().blocks_shared_mapped)
+            .sum()
+    }
+
+    /// Prefix blocks attaches found already mapped in place and kept (no unmap, no map).
+    pub fn attach_kept(&self) -> u64 {
+        self.groups
+            .iter()
+            .map(|g| g.pool.stats().blocks_attach_kept)
             .sum()
     }
 
@@ -613,6 +652,105 @@ impl SharedPrefix {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    /// The GLM gfx942 TP8 serving defaults stand on two emit-side facts, and an emit that drops
+    /// either still loads and serves, only slower: the TP shared radix prefix cache needs
+    /// `Layout::from_blob` to accept the packet (else the engine falls back to slot-local
+    /// snapshots and logs `shared_prefix=false`), and the prefill ladder must end in the SPARSE
+    /// 8192 rung that every deep chunk and every `PLOW_AMD_TAIL_SPARSE_CTX` tail runs. The emit
+    /// names only the frozen serving recipe's non-defaulted knobs, so the nine `glm_*` production
+    /// defaults decide themselves. A child process, because the emitter reads the environment.
+    #[test]
+    fn glm_tp8_default_emit_keeps_the_shared_prefix_layout_and_the_sparse_8192_rung() {
+        if std::env::var_os("PLOW_SHARED_PREFIX_EMIT_CHILD").is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "exec::amd::shared_prefix::tests::glm_tp8_default_emit_keeps_the_shared_prefix_layout_and_the_sparse_8192_rung",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env("PLOW_SHARED_PREFIX_EMIT_CHILD", "1")
+                .envs([
+                    ("PLOW_LAYERS", "all"),
+                    ("PLOW_FP8", "1"),
+                    ("PLOW_GLM_DSA", "1"),
+                    ("PLOW_GLM_DSA_PF", "1"),
+                    ("PLOW_GLM_DSA_PF_SPAN", "3"),
+                    ("PLOW_MLA_PREFILL", "full:128,512,2048,8192"),
+                    ("PLOW_DECODE_BATCH_LADDER", "1,2,4,8,16,20"),
+                    ("PLOW_MLA_PF_V2", "1"),
+                    ("PLOW_MLA_PF_AITER", "1"),
+                    ("PLOW_UNISEG", "0"),
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        let dir =
+            std::env::temp_dir().join(format!("plow-glm-default-prefix-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{
+            "model_type": "glm_moe_dsa", "num_hidden_layers": 4,
+            "hidden_size": 6144, "num_attention_heads": 64,
+            "kv_lora_rank": 512, "q_lora_rank": 2048,
+            "qk_nope_head_dim": 192, "qk_rope_head_dim": 64, "v_head_dim": 256,
+            "vocab_size": 128, "rms_norm_eps": 1e-5,
+            "n_routed_experts": 256, "num_experts_per_tok": 8,
+            "moe_intermediate_size": 2048, "intermediate_size": 12288,
+            "first_k_dense_replace": 3, "routed_scaling_factor": 2.5,
+            "rope_theta": 8000000.0,
+            "indexer_types": ["full", "shared", "full", "shared"]
+        }"#,
+        )
+        .unwrap();
+        let path = dir.join("model.pkt");
+        devgen::run(devgen::EmitArgs {
+            dir: dir.clone(),
+            ctx: 81920,
+            out: path.display().to_string(),
+            n_cu: 304,
+            tp: 8,
+            block_spec: None,
+            embed_cubin: None,
+            embed_hsaco: None,
+            rope_gen: true,
+            l2_layout: None,
+            gpu: String::new(),
+            arch: "gfx942".into(),
+            emit_cfg: None,
+            whole_graph_fusions: devgen::WholeGraphFusionDecisions::default(),
+        });
+        let blob = DevBlob::parse_l2(&std::fs::read(&path).unwrap(), true).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        let context = (blob
+            .tensors
+            .iter()
+            .find(|t| t.name == "in.pos")
+            .unwrap()
+            .bytes
+            / 4) as u32;
+        let batch = blob.progs.last().unwrap().t as usize;
+        assert_eq!(batch, 20);
+        assert!(
+            Layout::from_blob(&blob, batch, context).is_some(),
+            "the default GLM gfx942 TP8 packet no longer admits the shared radix prefix cache"
+        );
+        let prefill = blob.prefill_progs();
+        let widest = prefill.iter().max_by_key(|p| p.t).unwrap();
+        assert_eq!(widest.t, 8192);
+        assert!(
+            super::super::sparse_prefill_chain(widest),
+            "the widest GLM prefill rung is no longer the sparse (DSA) chain"
+        );
+    }
 
     #[test]
     #[ignore = "requires PLOW_SHARED_PREFIX_PACKET pointing to a compiled GLM packet"]

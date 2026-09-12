@@ -162,6 +162,18 @@ pub struct RuntimeConfig {
     #[arg(long = "pf-defer-decode", env = "PLOW_PF_DEFER_DECODE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pf_defer_decode: bool,
 
+    /// AMD inter-token (TBT) target, ms. While requests decode, each tick takes the largest
+    /// prefill it can while the predicted tick stays at or under this value; decode rows always
+    /// run. Unset = the throughput schedule (`PLOW_PF_INTERLEAVE`), unchanged.
+    #[arg(long = "tbt-slo-ms", env = "PLOW_TBT_SLO_MS", global = true)]
+    pub tbt_slo_ms: Option<f64>,
+
+    /// AMD time-to-first-token target, ms. Prefill candidates are ordered by deadline slack
+    /// (EDF), prompts finishing this tick first, requests that can no longer make it last.
+    /// Unset = arrival order.
+    #[arg(long = "ttft-slo-ms", env = "PLOW_TTFT_SLO_MS", global = true)]
+    pub ttft_slo_ms: Option<f64>,
+
     /// Override whether freed slabs remain in the process reuse pool.
     #[arg(long = "rt-slab-keep", env = "PLOW_SLAB_KEEP", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub slab_keep: Option<bool>,
@@ -672,6 +684,12 @@ impl RuntimeConfig {
         self.amd.numa_host_pools.unwrap_or(true)
     }
 
+    /// AMD kernarg ring in the GPU's own VRAM through the large BAR (`PLOW_AMD_KERNARG_VRAM`).
+    /// Unset → on; `=0` → the host kernarg pool.
+    pub fn amd_kernarg_vram(&self) -> bool {
+        self.amd.kernarg_vram.unwrap_or(true)
+    }
+
     /// AMD long-context tail placement floor (`PLOW_AMD_TAIL_SPARSE_CTX`). Unset → 16384
     /// rows; `0` → off. Acts only on packets with a sparse (DSA) prefill rung.
     pub fn amd_tail_sparse_ctx(&self) -> Option<u32> {
@@ -679,6 +697,13 @@ impl RuntimeConfig {
             0 => None,
             rows => Some(rows),
         }
+    }
+
+    /// AMD serving latency targets (`PLOW_TBT_SLO_MS`, `PLOW_TTFT_SLO_MS`). A non-positive or
+    /// non-finite value counts as unset.
+    pub fn slo_targets(&self) -> crate::sched::slo::Targets {
+        let valid = |v: Option<f64>| v.filter(|ms| ms.is_finite() && *ms > 0.0);
+        crate::sched::slo::Targets { tbt_ms: valid(self.tbt_slo_ms), ttft_ms: valid(self.ttft_slo_ms) }
     }
 
     /// Cross-request prefill packing on CUDA: off unless asked.
@@ -1112,6 +1137,14 @@ pub struct AmdRuntimeConfig {
     /// through `RuntimeConfig::amd_numa_host_pools`, which supplies the default (on).
     #[arg(long = "amd-numa-host-pools", env = "PLOW_AMD_NUMA_HOST_POOLS", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub numa_host_pools: Option<bool>,
+
+    /// Put each rank's kernarg ring in its own GPU's VRAM through the large-BAR host mapping, so
+    /// the GPU reads kernargs locally with no host-cache snoop; host stores are posted and are
+    /// made visible (CLR's `DeviceKernelArgsReadback`) before the packet header is published.
+    /// Falls back to the host kernarg pool when the BAR cannot map it. `=0` = host kernarg ring.
+    /// Read through `RuntimeConfig::amd_kernarg_vram`, which supplies the default (on).
+    #[arg(long = "amd-kernarg-vram", env = "PLOW_AMD_KERNARG_VRAM", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub kernarg_vram: Option<bool>,
 }
 
 /// Global runtime config, initialized once at startup from CLI parse.
@@ -1418,6 +1451,37 @@ mod tests {
             let cfg = super::RuntimeConfig::from_arg_matches(&matches).unwrap();
             assert_eq!(cfg.amd_numa_host_pools(), want, "{args:?}");
         }
+    }
+
+    #[test]
+    fn kernarg_vram_default_on_and_false_turns_it_off() {
+        use clap::{Args, FromArgMatches};
+        let command = super::RuntimeConfig::augment_args(clap::Command::new("test"));
+        for (args, want) in [
+            (&["test"][..], true),
+            (&["test", "--amd-kernarg-vram=false"][..], false),
+            (&["test", "--amd-kernarg-vram=0"][..], false),
+            (&["test", "--amd-kernarg-vram"][..], true),
+        ] {
+            let matches = command.clone().try_get_matches_from(args).unwrap();
+            let cfg = super::RuntimeConfig::from_arg_matches(&matches).unwrap();
+            assert_eq!(cfg.amd_kernarg_vram(), want, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn slo_targets_default_unset_and_parse_both_flags() {
+        use clap::{Args, FromArgMatches};
+        let command = super::RuntimeConfig::augment_args(clap::Command::new("test"));
+        let parse = |args: &[&str]| {
+            let matches = command.clone().try_get_matches_from(args).unwrap();
+            super::RuntimeConfig::from_arg_matches(&matches).unwrap().slo_targets()
+        };
+        assert!(!parse(&["test"]).active());
+        assert_eq!(parse(&["test"]), crate::sched::slo::Targets::default());
+        let both = parse(&["test", "--tbt-slo-ms", "500", "--ttft-slo-ms=30000"]);
+        assert_eq!((both.tbt_ms, both.ttft_ms), (Some(500.0), Some(30000.0)));
+        assert!(!parse(&["test", "--tbt-slo-ms", "0"]).active());
     }
 
     #[test]

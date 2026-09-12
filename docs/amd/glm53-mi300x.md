@@ -55,6 +55,87 @@ Prepped checkpoint ~714 GiB.
 | TP4 | 178.6 | fits; measured 181.75 GiB/rank live |
 | TP8 | 89.3 | comfortable |
 
+### 3a. The TP8 concurrency ceiling, and what a short-context mode would need (2026-09-12)
+
+Written down, not built. KV sizes are derived from the served load log's own VMM pool lines (`vmm kv
+pool up … va_gib=`), which they reproduce exactly (60.94 + 15.23 + 8.20 GiB of VA per rank at batch 20
+× max_ctx 81,920). Free HBM is measured: sysfs `mem_info_vram_used` on all 8 cards, production serving
+set d9fe7690, idle after load (job `serving8k-t3p`).
+
+**KV per token, per rank — replicated on all eight ranks.** TP8 partitions the query heads, not the
+MLA latent: every rank stores every token's cache.
+
+| pool | layers | bytes/row | what |
+|---|---:|---:|---|
+| latent | 78 | 512 | e4m3 compressed KV (`kv_lora_rank`) |
+| rope | 78 | 128 | bf16 rope key (64 dims) |
+| indexer keys | 21 | 256 | bf16 DSA indexer keys (full-indexer layers only) |
+
+= **55,296 B/token/rank**, mapped on demand in 2 MiB blocks. The only KV buffers outside the pools are
+the 78 per-row FP8 scale tensors (`kv_buffers=255` at load vs the pools' 177 tracks): allocated whole
+at load for batch × max_ctx rows (≈ 488 MiB/rank), not per-token growth.
+
+**Free HBM, measured:** 191.98 GiB per card; 0.28 GiB used with no server; **109.0 GiB used, 82.9 GiB
+free** (worst card, all eight within 0.2 GiB) idle after load — 93.41 GiB of weights (9.01 named +
+84.40 packed experts) plus workspaces, the peer region, the scale tensors and prefill activation
+buffers. The prefix cache may retain up to 5 % of the card (9.6 GiB) on top of the live slots; after
+two 64K conversations it held 9.5 GiB (118.5 GiB used), i.e. it sits at its cap in normal use.
+
+| context | GiB per slot per rank | slots in 82.9 GiB | slots after the 9.6 GiB cache cap |
+|---:|---:|---:|---:|
+| 2K | 0.105 | 786 | 695 |
+| 8K | 0.422 | 196 | 173 |
+| 32K | 1.688 | 49 | 43 |
+| 64K | 3.375 | 24 | 21 |
+| 80K | 4.219 | 19 | 17 |
+
+**So "8K concurrent decodes" does not fit, and at long context the HBM ceiling is already reached.**
+8,192 decoding slots at even 2K context need 8,192 × 0.1055 = 864 GiB per rank. At the C20 / ~64K
+production shape, 20 slots are 67.5 GiB of the 73.3 GiB left beside the cache. Below ~71K context the
+binding limit is not HBM but the batch of 20, fixed by construction:
+
+* the decode ladder ends at 20 (`--emit-decode-batch-ladder 1,2,4,8,16,20`), and the packet's slot
+  arrays, per-slot scale buffers and VMM VA are all sized `batch × max_ctx` at emit/load;
+* the token-batch body's band is `decode_rungs().last()` (20 rows), so an 8192 body would carry as
+  many decode rows as there are live slots, at most 20;
+* admission counts slots, not bytes.
+
+Measured decode cost at the cap: the decode-only tick is 89.8-92.6 ms at 20 rows on the production
+packet with the a6b39a0d runtime (the two controls of the 2026-09-12 combined A/B, bench phase,
+`PLOW_TICK_LOG`), ~220 tok/s of aggregate decode at ~64K context.
+
+**The same arithmetic limits multi-turn prefix hits.** A retained 64K prefix pins 3.38 GiB, so the 5 %
+cap holds ~2.8 of them; at C20 × 64K, the combined A/B's multi-turn workload got 0/20 turn-2 hits (each
+conversation's prefix is evicted by the others' prefills before its turn 2), while 2 conversations at
+C2 hit 2/2 (65,504 of 65,536 rows attached, turn-2 TTFT 2.8 s vs 6.6 s cold). Retaining all 20 would
+need another ~67 GiB per rank beside the ~67 GiB of live KV. Raising the cap does not help at this
+shape: at `PLOW_VMM_CACHE_MEMORY_UTILIZATION=0.12` (23 GiB) the same workload again got 0/20 hits,
+because the 20 live ~66K slots took free HBM down to 6.7 GiB on the worst card (185 of 192 GiB used,
+sampled every 10 s) and the pool's allocation-driven eviction empties the cache whatever its soft cap.
+So the blocker is the replicated latent, not the cap. Only sharding it by token changes this:
+latent-only DCP8 (latent and rope token-sharded, indexer keys replicated) cuts KV from 55,296 to 11,616
+B/token/rank (4.8×), i.e. ~100 slots at 64K in the same free HBM and ~13 retained 64K prefixes at the
+5 % cap (context-parallelism study, 2026-09-12, which also finds that CP does not beat TP8 at C20).
+
+**What a short-context high-concurrency mode would need** (none of it exists):
+
+1. **Decode rungs above 20.** The packet format allows 128 (`DECODE_RUNG_MAX`). Each new width needs
+   its hipBLASLt decode projections (native only at 8/16/20 today), the batched DSA select/score and
+   sparse FP8 decode attention qualified at that row count, and a decode object whose `GV_MM` ceiling
+   covers it without taxing the narrow rungs (`PLOW_DECODE_TIERS`, one object per tier). Decode tick
+   cost above 20 rows is unmeasured on GLM.
+2. **Band = last rung.** Automatic in the emitter (`band = dbatch`); a 128-row band leaves 8,064 span
+   rows in an 8192 body. The body itself is not a default (priced: −14 ms per middle chunk at 78
+   layers, inside its interval; review log, decode-rows negative).
+3. **KV sized from free HBM, not a fixed batch.** Keep the VMM VA reservation (it is free), but make
+   the per-slot fixed allocation (the 78 FP8 scale tensors) VMM-backed or sized by a per-slot context
+   cap, admit by mapped bytes against the measured free HBM rather than by slot count, and give
+   short-context requests a max_ctx below 81,920 so a slot's reservation matches it.
+
+DP attention + EP8 was already judged the wrong shape for C20 / 64K (review log, plan-of-record
+entries): it lifts the KV ceiling by un-replicating the latent but leaves one GPU running a whole
+chunk's 64 heads while the others pad.
+
 ## 4. Reproducing
 
 ```bash

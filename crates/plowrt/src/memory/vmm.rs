@@ -629,6 +629,9 @@ pub struct VmmStats {
     pub blocks_kept: u64,
     /// Stale blocks the reclaimer thread unmapped (off the caller's thread).
     pub blocks_reclaimed: u64,
+    /// Window mappings an attach found already holding the block it maps there (turn 2 in turn
+    /// 1's slot) and kept in place — each one an unmap + map skipped.
+    pub blocks_attach_kept: u64,
 }
 
 /// One physical sharing block: driver handle + mapping/cache refcount.
@@ -1262,30 +1265,12 @@ impl VmmKv {
         let mut frees: Vec<u64> = Vec::new();
         let mut maps: Vec<(u64, u64)> = Vec::new();
 
-        // `begin_seq` pre-maps row 0 (idle-row garbage writes land there);
-        // that private block occupies window slot 0, which the shared prefix
-        // is about to claim — drop the fresh window before multi-mapping.
-        // Stale slots (the previous occupant's blocks awaiting the reclaimer)
-        // are still mapped at these VAs and go the same way.
-        for t in 0..inner.tracks.len() {
-            for h in 0..s.geo.kvh_full {
-                for k in 0..s.bph {
-                    let slot = slot_index(s, seq, h, k);
-                    if let Some(id) = take_slot(&mut inner, t, slot) {
-                        unmaps.push(slot_va(s, &inner.tracks[t], seq, h, k));
-                        if let Some(h) = unref_block(s, &mut inner, id) {
-                            frees.push(h);
-                        }
-                    }
-                }
-            }
-        }
-        inner.seq_blocks[seq] = 0;
-        s.frontier[seq].store(0, Ordering::Release);
-
-        // Multi-map every shared block into this sequence's window slots.
+        // The attach takes window columns [0, pick). Resolve the block each of those slots will
+        // hold before touching any, so a missing payload leaves the window as it was.
         let kvh = s.geo.kvh_full as usize;
-        for (k, key) in placed.iter().enumerate() {
+        let pick = placed.len();
+        let mut prefix_ids: Vec<Vec<u32>> = Vec::with_capacity(pick);
+        for key in &placed {
             let ids = inner
                 .node_blocks
                 .get(key)
@@ -1294,19 +1279,64 @@ impl VmmKv {
                 })?
                 .clone();
             debug_assert_eq!(ids.len(), inner.tracks.len() * kvh);
-            for (j, &id) in ids.iter().enumerate() {
-                let (t, h) = (j / kvh, j % kvh);
-                let va = slot_va(s, &inner.tracks[t], seq, h as u32, k as u32);
-                maps.push((va, inner.blocks[id as usize].handle));
-                inner.blocks[id as usize].refs += 1;
-                let slot = slot_index(s, seq, h as u32, k as u32);
-                debug_assert_eq!(inner.tracks[t].slots[slot], Slot::Empty);
-                inner.tracks[t].slots[slot] = Slot::Live(id);
-                inner.stats.blocks_shared_mapped += 1;
-            }
-            inner.seq_blocks[seq] = k as u32 + 1;
-            s.frontier[seq].store((k as u32 + 1) * s.block_rows, Ordering::Release);
+            prefix_ids.push(ids);
         }
+
+        // Settle the window under the lock. In [0, pick):
+        //  * a slot that already maps the very block the prefix puts there is KEPT: no unmap, no
+        //    map, refcount unchanged (the retired occupant's reference becomes this mapping's).
+        //    That is turn 2 landing in turn 1's slot, whose stale columns ARE the published
+        //    blocks. It cannot race the reclaimer: `reclaim_stale` unmaps only a slot it finds
+        //    `Stale` under this lock, and the slot is `Live` before the lock drops;
+        //  * any other mapping (`begin_seq`'s private column 0, another occupant's stale block)
+        //    is dropped first, since its VA is about to take another handle.
+        // Past the prefix, stale columns stay `Stale` for the reclaimer, exactly as
+        // `retire_window` left them: unreachable, unmapped off-thread, claimable first by
+        // `ensure_rows`. Only a live mapping there is dropped, as before.
+        for t in 0..inner.tracks.len() {
+            for h in 0..s.geo.kvh_full {
+                for k in 0..s.bph {
+                    let slot = slot_index(s, seq, h, k);
+                    let va = slot_va(s, &inner.tracks[t], seq, h, k);
+                    let Some(ids) = prefix_ids.get(k as usize) else {
+                        if let Slot::Live(id) = inner.tracks[t].slots[slot] {
+                            inner.tracks[t].slots[slot] = Slot::Empty;
+                            unmaps.push(va);
+                            if let Some(hnd) = unref_block(s, &mut inner, id) {
+                                frees.push(hnd);
+                            }
+                        }
+                        continue;
+                    };
+                    let id = ids[t * kvh + h as usize];
+                    inner.stats.blocks_shared_mapped += 1;
+                    match inner.tracks[t].slots[slot] {
+                        Slot::Live(held) if held == id => {
+                            inner.stats.blocks_attach_kept += 1;
+                            continue;
+                        }
+                        Slot::Stale(held) if held == id => {
+                            inner.tracks[t].slots[slot] = Slot::Live(id);
+                            inner.stats.blocks_stale -= 1;
+                            inner.stats.blocks_attach_kept += 1;
+                            continue;
+                        }
+                        _ => {}
+                    }
+                    if let Some(old) = take_slot(&mut inner, t, slot) {
+                        unmaps.push(va);
+                        if let Some(hnd) = unref_block(s, &mut inner, old) {
+                            frees.push(hnd);
+                        }
+                    }
+                    maps.push((va, inner.blocks[id as usize].handle));
+                    inner.blocks[id as usize].refs += 1;
+                    inner.tracks[t].slots[slot] = Slot::Live(id);
+                }
+            }
+        }
+        inner.seq_blocks[seq] = pick as u32;
+        s.frontier[seq].store(pick as u32 * s.block_rows, Ordering::Release);
         drop(inner);
 
         // Drive the driver lock-free. Unmaps precede maps (slot 0 is reused).
@@ -1349,23 +1379,28 @@ impl VmmKv {
             }
         }
         if let Some(e) = err {
-            // Unwind. Unmap ONLY the ranges this attach actually mapped —
-            // the backend's unmap contract is exact mapped ranges
-            // (`device/cuda.rs`), never a blanket sweep — then tear the
-            // window bookkeeping down to empty and drop the path references.
-            for &(va, _) in &maps[..mapped] {
-                s.ops.unmap(va, s.block_bytes);
-            }
+            // Unwind to an empty window. Unmap exactly what is mapped — the backend's unmap
+            // contract is exact mapped ranges (`device/cuda.rs`), never a blanket sweep: every
+            // slot of the window is mapped except the maps that never landed (`maps[mapped..]`),
+            // the kept blocks and the stale columns past the prefix included. Unmapped UNDER the
+            // lock, as `reclaim_stale` does, so the reclaimer and `ensure_rows` only ever see a
+            // slot mapped or empty; handles are released once the lock drops.
+            let unlanded: rustc_hash::FxHashSet<u64> =
+                maps[mapped..].iter().map(|&(va, _)| va).collect();
             let mut inner = s.inner.lock();
-            inner.stats.blocks_shared_mapped -= maps.len() as u64;
+            inner.stats.blocks_shared_mapped -= (pick * inner.tracks.len() * kvh) as u64;
             let mut orphans: Vec<u64> = Vec::new();
             for t in 0..inner.tracks.len() {
                 for h in 0..s.geo.kvh_full {
                     for k in 0..s.bph {
                         let slot = slot_index(s, seq, h, k);
                         if let Some(id) = take_slot(&mut inner, t, slot) {
-                            if let Some(h) = unref_block(s, &mut inner, id) {
-                                orphans.push(h);
+                            let va = slot_va(s, &inner.tracks[t], seq, h, k);
+                            if !unlanded.contains(&va) {
+                                s.ops.unmap(va, s.block_bytes);
+                            }
+                            if let Some(hnd) = unref_block(s, &mut inner, id) {
+                                orphans.push(hnd);
                             }
                         }
                     }
@@ -2834,6 +2869,11 @@ mod tests {
         fail_maps: AtomicI64,
         fail_access: AtomicI64,
         pool: std::sync::Mutex<Vec<(u64, u64)>>,
+        /// `strict`: track mapped VAs. Mapping a mapped VA or unmapping an unmapped one counts a
+        /// violation — the per-VA exclusivity the pool promises the driver.
+        strict: std::sync::atomic::AtomicBool,
+        mapped: std::sync::Mutex<std::collections::HashSet<u64>>,
+        violations: AtomicU64,
     }
 
     impl VmmOps for MockVmm {
@@ -2864,7 +2904,7 @@ mod tests {
         fn release(&self, _handle: u64) {
             self.releases.fetch_add(1, Ordering::SeqCst);
         }
-        fn map(&self, _va: u64, _bytes: u64, _handle: u64) -> Result<()> {
+        fn map(&self, va: u64, _bytes: u64, _handle: u64) -> Result<()> {
             // `fail_maps = k` makes the k-th upcoming map call fail, one-shot
             // (earlier calls succeed) — exercises PARTIALLY-mapped unwinds.
             if self.fail_maps.load(Ordering::SeqCst) > 0
@@ -2873,10 +2913,16 @@ mod tests {
                 return Err(RuntimeError::Device("mock map failure".into()));
             }
             self.maps.fetch_add(1, Ordering::SeqCst);
+            if self.strict.load(Ordering::SeqCst) && !self.mapped.lock().unwrap().insert(va) {
+                self.violations.fetch_add(1, Ordering::SeqCst);
+            }
             Ok(())
         }
-        fn unmap(&self, _va: u64, _bytes: u64) {
+        fn unmap(&self, va: u64, _bytes: u64) {
             self.unmaps.fetch_add(1, Ordering::SeqCst);
+            if self.strict.load(Ordering::SeqCst) && !self.mapped.lock().unwrap().remove(&va) {
+                self.violations.fetch_add(1, Ordering::SeqCst);
+            }
         }
         fn set_access(&self, _va: u64, _bytes: u64) -> Result<()> {
             if self.fail_access.load(Ordering::SeqCst) > 0
@@ -4252,8 +4298,9 @@ mod tests {
         assert_eq!(p.stats().blocks_stale, 0);
     }
 
-    /// An attach hit on a recycled slot drops the stale mappings with the rest
-    /// of the window before multi-mapping the shared prefix over the same VAs.
+    /// An attach hit on a recycled slot drops the mappings in the prefix's columns (the private
+    /// column 0 and another occupant's stale block) before multi-mapping the shared prefix over
+    /// the same VAs; the stale column past the prefix is left to the reclaimer.
     #[test]
     fn try_attach_drops_stale_mappings_before_multi_mapping() {
         let ops = Arc::new(MockVmm::default());
@@ -4271,8 +4318,16 @@ mod tests {
         let maps = ops.maps.load(Ordering::SeqCst);
         let hit = p.try_attach(1, &pr).unwrap().expect("hit");
         assert_eq!(hit.rows, 16);
-        assert_eq!(p.stats().blocks_stale, 0);
-        assert_eq!(ops.unmaps.load(Ordering::SeqCst), unmaps + 12, "column 0 + stale 1..2");
+        assert_eq!(
+            p.stats().blocks_stale,
+            4,
+            "column 2, past the prefix, stays for the reclaimer"
+        );
+        assert_eq!(
+            ops.unmaps.load(Ordering::SeqCst),
+            unmaps + 8,
+            "column 0 + stale column 1"
+        );
         assert_eq!(ops.maps.load(Ordering::SeqCst), maps + 8);
         assert_eq!(p.mapped_rows(1), 16);
     }
@@ -4296,6 +4351,162 @@ mod tests {
         assert_eq!(st.blocks_live, 0);
         assert_eq!(ops.unmaps.load(Ordering::SeqCst), 4);
         assert_eq!(ops.releases.load(Ordering::SeqCst), 4);
+    }
+
+    fn strict_ops() -> Arc<MockVmm> {
+        let ops = Arc::new(MockVmm::default());
+        ops.strict.store(true, Ordering::SeqCst);
+        ops
+    }
+
+    /// Every mapping torn down exactly once, and every block handle released exactly once.
+    fn assert_balanced(ops: &MockVmm) {
+        assert_eq!(
+            ops.violations.load(Ordering::SeqCst),
+            0,
+            "a VA mapped twice or unmapped while unmapped"
+        );
+        assert!(
+            ops.mapped.lock().unwrap().is_empty(),
+            "a mapping outlived the pool"
+        );
+        assert_eq!(
+            ops.releases.load(Ordering::SeqCst),
+            ops.creates.load(Ordering::SeqCst)
+        );
+    }
+
+    /// Turn 2 in turn 1's slot: the slot's stale column IS the published block the attach maps
+    /// there, so it is kept in place (no unmap, no map, refcount unchanged); only the private
+    /// column 0 `begin_slot` pre-mapped is swapped, and the stale column past the prefix is left to
+    /// the reclaimer, whose pass then takes it — never the kept, now live, column.
+    #[test]
+    fn try_attach_keeps_a_stale_slot_that_already_maps_the_prefix_block() {
+        let ops = strict_ops();
+        let mut p = uniform_pool(ops.clone());
+        p.enable_block_recycling(16 * 64);
+        let stalled = p.stall_reclaim();
+        let pr = prompt(17);
+        p.ensure_rows(0, 24).unwrap(); // 3 private columns x 4 tracks
+        p.publish(0, &pr, 4, |_| Ok(())).unwrap(); // columns 0, 1 now shared with the cache
+        p.begin_seq(0); // shared column 0 unmapped inline; columns 1 (shared), 2 (private) stale
+        assert_eq!(p.stats().blocks_stale, 8);
+        p.ensure_rows(0, 1).unwrap(); // begin_slot's fresh private column 0
+        let (unmaps, maps) = (
+            ops.unmaps.load(Ordering::SeqCst),
+            ops.maps.load(Ordering::SeqCst),
+        );
+        let hit = p.try_attach(0, &pr).unwrap().expect("hit");
+        assert_eq!(hit.rows, 16);
+        assert_eq!(
+            ops.unmaps.load(Ordering::SeqCst) - unmaps,
+            4,
+            "only the private column 0"
+        );
+        assert_eq!(ops.maps.load(Ordering::SeqCst) - maps, 4, "only column 0");
+        assert_eq!(p.stats().blocks_attach_kept, 4, "column 1 kept in place");
+        assert_eq!(p.stats().blocks_stale, 4, "column 2 left for the reclaimer");
+        assert_eq!(p.mapped_rows(0), 16);
+        reclaim_stale(&p.shared, 0);
+        assert_eq!(
+            ops.unmaps.load(Ordering::SeqCst) - unmaps,
+            8,
+            "the reclaimer took column 2 only"
+        );
+        assert_eq!(p.stats().blocks_stale, 0);
+        assert_eq!(p.mapped_rows(0), 16, "the kept column is still mapped");
+        drop(stalled);
+        drop(p);
+        assert_balanced(&ops);
+    }
+
+    /// The keep path against a live reclaimer thread: every `begin_seq` retires the window to the
+    /// pool thread, and the attach that follows races it for the stale column holding the prefix
+    /// block (kept if the attach gets there first, re-mapped if the reclaimer did). Either way no
+    /// VA is mapped twice or unmapped while unmapped, and every block is released exactly once.
+    #[test]
+    fn attach_keep_races_the_reclaimer_without_unmapping_a_live_block() {
+        let ops = strict_ops();
+        let mut p = uniform_pool(ops.clone());
+        p.enable_block_recycling(16 * 64);
+        p.enable_deferred_reclaim();
+        let pr = prompt(17);
+        p.ensure_rows(0, 24).unwrap();
+        p.publish(0, &pr, 4, |_| Ok(())).unwrap();
+        for _ in 0..200 {
+            p.begin_seq(0);
+            p.ensure_rows(0, 1).unwrap();
+            assert_eq!(p.try_attach(0, &pr).unwrap().expect("hit").rows, 16);
+            p.finish_attach(0);
+            p.ensure_rows(0, 24).unwrap();
+        }
+        p.sync_reclaim();
+        assert_eq!(ops.violations.load(Ordering::SeqCst), 0);
+        assert_eq!(p.stats().blocks_stale, 0);
+        assert_eq!(p.mapped_rows(0), 24);
+        drop(p);
+        assert_balanced(&ops);
+    }
+
+    /// A failed map mid-attach unwinds to an empty window. Unmapped are exactly the slots still
+    /// mapped (the kept column and the stale column past the prefix included), never a VA the
+    /// failed map never reached.
+    #[test]
+    fn a_failed_attach_unmaps_kept_and_stale_columns_exactly_once() {
+        let ops = strict_ops();
+        let mut p = uniform_pool(ops.clone());
+        p.enable_block_recycling(16 * 64);
+        let stalled = p.stall_reclaim();
+        let pr = prompt(17);
+        p.ensure_rows(0, 24).unwrap();
+        p.publish(0, &pr, 4, |_| Ok(())).unwrap();
+        p.begin_seq(0);
+        p.ensure_rows(0, 1).unwrap();
+        ops.fail_maps.store(2, Ordering::SeqCst); // the attach's second map fails; one landed
+        assert!(p.try_attach(0, &pr).is_err());
+        assert_eq!(ops.violations.load(Ordering::SeqCst), 0);
+        assert_eq!(p.mapped_rows(0), 0);
+        assert_eq!(p.stats().blocks_stale, 0);
+        drop(stalled);
+        drop(p);
+        assert_balanced(&ops);
+    }
+
+    /// Leaving stale columns past the prefix to the reclaimer holds nothing the retired windows
+    /// did not: with the reclaimer stalled through 50 grow-recycle-attach rounds on two slots the
+    /// stale count never exceeds one retired window per slot, and one pass per slot clears it.
+    #[test]
+    fn deferred_stale_columns_stay_within_one_window_per_slot() {
+        let ops = strict_ops();
+        let mut p = uniform_pool(ops.clone());
+        p.enable_block_recycling(16 * 64);
+        let stalled = p.stall_reclaim();
+        let pr = prompt(17);
+        p.ensure_rows(0, 17).unwrap();
+        p.publish(0, &pr, 4, |_| Ok(())).unwrap();
+        let bound = 2 * 4 * 3; // slots x tracks x columns 1..bph
+        for round in 0..50 {
+            let seq = round % 2;
+            p.ensure_rows(seq, 32).unwrap();
+            p.begin_seq(seq);
+            p.ensure_rows(seq, 1).unwrap();
+            if let Some(hit) = p.try_attach(seq, &pr).unwrap() {
+                assert_eq!(hit.rows, 16);
+                p.finish_attach(seq);
+            }
+            assert!(
+                p.stats().blocks_stale <= bound,
+                "round {round}: {}",
+                p.stats().blocks_stale
+            );
+        }
+        for seq in 0..2 {
+            reclaim_stale(&p.shared, seq);
+        }
+        assert_eq!(p.stats().blocks_stale, 0);
+        drop(stalled);
+        drop(p);
+        assert_balanced(&ops);
     }
 
     #[test]

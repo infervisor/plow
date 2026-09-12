@@ -505,7 +505,7 @@ enum {
     /* FUSED MLA merge + W_uv fold (d_mla_merge_fold) — replaces FLASH_MERGE<512> + O_UV_FOLD on the
      * MLA decode path (kills the separate merge pass + Olat round-trip + a gate). t0=O(v_head)
      * t1=Opart(f32) t2=mlpart(f32) t3=Wuv; i0=n_batch i1=n_head i2=V i4=nsplit. */
-    /* i5=1 selects isolated native gfx942 TP8 FP32 fold (prefill, decode rungs 16/20). */
+    /* i5=1 selects isolated native gfx942 TP8 FP32 prefill fold. */
     PLOW_DOP_MLA_MERGE_FOLD = 57,
 
     /* DSA lightning-indexer SCORE (d_index_score / d_index_score_fast, op_attention.h): for every KV

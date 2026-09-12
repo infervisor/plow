@@ -736,49 +736,6 @@ fn decode_mla_pair_routes_as_one_specialist_segment() {
 }
 
 #[test]
-fn decode_native_mla_fold_is_its_own_raw_segment() {
-    use packet::dev::TENSOR_NONE16;
-    let mut p = segmented_decode_probe();
-    p.t = 20;
-    p.role = packet::devbuild::ProgramRole::DecodeRung { rows: 20 };
-    p.insts[1] = DevInst64 {
-        op: DevOp::MlaMergeFold as u16,
-        blocks: 1,
-        t: [0, 1, 2, 3, TENSOR_NONE16, TENSOR_NONE16, TENSOR_NONE16, TENSOR_NONE16],
-        i: [20, 8, 256, 0, 16, 1, 0, 0],
-        ..Default::default()
-    };
-    let tensors: Vec<_> = [
-        20 * 8 * 256 * 2,
-        20 * 8 * 16 * 512 * 4,
-        20 * 8 * 16 * 2 * 4,
-        8 * 512 * 256 * 2,
-    ]
-    .into_iter()
-    .enumerate()
-    .map(|(i, bytes)| crate::asset::devblob::DevTensor {
-        name: i.to_string(),
-        bytes,
-        init: None,
-    })
-    .collect();
-    assert_eq!(
-        decode_segment_kinds(&p).unwrap(),
-        [
-            DecodeSegmentKind::Interpreter,
-            DecodeSegmentKind::MlaFold,
-            DecodeSegmentKind::Interpreter,
-        ]
-    );
-    let routes = decode_segment_routes(&p, &tensors, &[], &[]).unwrap();
-    assert!(matches!(routes[1], DecodeSegmentRoute::MlaFold(_)));
-    assert!(requires_segmented_decode(&routes));
-    p.insts[1].i[5] = 0;
-    let err = decode_segment_kinds(&p).unwrap_err().to_string();
-    assert!(err.contains("only half"), "{err}");
-}
-
-#[test]
 fn mixed_decode_mla_ops_remain_on_the_ordinary_interpreter() {
     let mut p = segmented_decode_probe();
     p.insts = vec![
