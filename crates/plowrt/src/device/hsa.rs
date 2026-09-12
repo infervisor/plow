@@ -916,7 +916,7 @@ impl HsaBackend {
             };
             (rc == HSA_STATUS_SUCCESS && a.handle != 0).then_some(a)
         };
-        let numa_local = crate::config::RuntimeConfig::get().amd.numa_host_pools;
+        let numa_local = crate::config::RuntimeConfig::get().amd_numa_host_pools();
         let host_agent = host_agent_for(numa_local, cpu_agent, nearest_cpu);
 
         // Query device name.
