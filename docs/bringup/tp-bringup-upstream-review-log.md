@@ -443,6 +443,47 @@ term from every same-binary bench pair on this box. `PLOW_HSA_DRAIN_BLOCKED` (di
 stays for the record. Confirmation job `host-shadow-j3` (auto from an unpinned start; auto and off
 with the whole process started on socket 1) follows.
 
+## Decode tick: native decode GEMM overlap and grouping, measured (2026-09-12, branch `decode-latency`)
+
+The rung-20 decode tick is 1431 AQL packets per rank (832 native `GemmLtPf`, 75 AITER MoE, 524
+interpreter segments), each with the barrier bit and agent-scope fences. A `PLOW_TRACE_RAW`
+timeline of one full-model step splits it into 64.8 ms of interpreter bodies and 27.4 ms of
+intervals holding native work; a lone native GEMM between two interpreter segments costs ~31 µs
+for ~14 µs of work, so each dependent transition costs ~8 µs. Two opt-in knobs (code on
+`decode-latency`), both bit-identical by construction:
+
+* `PLOW_AMD_DECODE_GEMM_OVERLAP` (runtime): a native decode GEMM that directly follows native
+  GEMMs it is independent of (byte ranges, planned at load) is dispatched without the barrier bit.
+  **Measured loss, keep off.** 7-layer TP8 packet, 14 runs: median +1.5 ms/step (+14 %). The
+  PLOW_TRACE_RAW intervals show why: the native GEMM runs do not get shorter (a second GEMM still
+  adds ~15 µs, so nothing overlaps usefully), and on the grouped packet every native interval grows
+  40–50 µs (single GEMM 45 → 93 µs, three GEMMs 74 → 112 µs). A follow-up that also drops the
+  followers' acquire fence was not run: it weakens a memory fence and needs the user's approval.
+* `PLOW_GLM_DECODE_GEMM_GROUP` (emit): same-input native GEMMs emitted adjacent (shared gate/up
+  after the router GEMM, so top-k and Glu share a segment; indexer k/weights/q beside their
+  siblings). Same instructions and dependencies; pairing hash and objects unchanged; knob-off packet
+  byte-identical. Rung-20 chain 1431 → 1293 packets (−138 interpreter segments at 78 layers).
+  **Unproven.** One traced step: 16 fewer interpreter segments at 7 layers, −0.56 ms GPU span, a
+  class-weighted 78-layer projection of −4.4 ms/tick; but over 14 runs the median is +0.25 ms/step,
+  because each process lands on one of three levels (~9.9 / ~10.9 / ~12.5 ms at 7 layers) and that
+  per-process spread swamps the effect.
+
+Found on the way:
+* `rocprofv3 --kernel-trace` deadlocks on TP8 decode: its queue interposition stalls the ranks'
+  in-kernel rendezvous ("Async signal handler still waiting on signal"). Use `PLOW_TRACE_RAW`
+  (`PLOW_TRACE_ALLRANKS=1` for every rank) for per-segment decode timing.
+* No within-process decode drift at 7 layers: a C20 serve run held 11.26 ms median (p10 11.03,
+  p90 11.52) over 2722 decode-only ticks, and every GPU held mclk 1300 / fclk 1800 under load, so
+  DPM clocks are not what moves the full-model tick between ~95 and ~108 ms; that needs full scale.
+* At the one-shot XReduce, ranks 4–7 arrive 107–180 µs after ranks 0–3 in 12–14 of every 14
+  collectives, in every traced process; ranks 0–3 spend that time waiting inside the op.
+* `amd-bench --prompt` (non-batched TP) decode numbers taken before b11475c0 ran the widest decode
+  rung (rung 20) with stale rows, not a single-sequence decode, and are invalid.
+* A `--layers N` packet never pairs with the full object set: the pairing hash folds in
+  `tuning.tile_lookups`, which scales with layer count.
+
+Report: `/root/.claude/jobs/c08d1232/tmp/reports/decode-latency.md`.
+
 ## Knob organization (2026-09-11)
 
 Inventory: 138 runtime knobs (`RuntimeConfig` 33 shared / NVIDIA 34 / AMD 48 / Apple 14 / CPU 9)
