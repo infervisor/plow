@@ -439,7 +439,7 @@ fn validate_stream_entry(
     Ok(())
 }
 
-fn validate_cpu_blob(blob: &DevBlob) -> Result<()> {
+fn validate_cpu_blob(blob: &DevBlob, language_model: bool) -> Result<()> {
     if blob.n_cu == 0 {
         return Err(RuntimeError::Device(
             "CPU blob declares no compute units".into(),
@@ -567,6 +567,9 @@ fn validate_cpu_blob(blob: &DevBlob) -> Result<()> {
         }
     }
 
+    if !language_model {
+        return Ok(());
+    }
     let dec_ix = blob.decode_rung_lo();
     if dec_ix >= blob.progs.len() {
         return Err(RuntimeError::Device(
@@ -621,12 +624,18 @@ impl CpuModel {
     /// weights / blob init data / generated tables, and resolve kernels for
     /// every program. `ffi::init` must have run.
     pub fn load(blob_path: &Path, checkpoint: &Path) -> Result<CpuModel> {
-        Self::load_on_nodes(blob_path, checkpoint, &[], false)
+        Self::load_on_nodes(blob_path, Some(checkpoint), &[], false)
+    }
+
+    /// Load a model-independent packet program whose checkpoint tensors are carried in the
+    /// blob init section. No tokenizer, KV layout or language-model rung contract is assumed.
+    pub fn load_embedded(blob_path: &Path) -> Result<CpuModel> {
+        Self::load_on_nodes(blob_path, None, &[], false)
     }
 
     fn load_on_nodes(
         blob_path: &Path,
-        checkpoint: &Path,
+        checkpoint: Option<&Path>,
         nodes: &[u32],
         strict: bool,
     ) -> Result<CpuModel> {
@@ -637,7 +646,8 @@ impl CpuModel {
         // domain window itself (`exec::cpu::interp`), so the mis-dispatch the
         // flag guards against cannot happen here.
         let blob = DevBlob::parse_l2(&raw, true)?;
-        validate_cpu_blob(&blob)?;
+        let language_model = blob.tensors.iter().any(|tensor| tensor.name == "in.ids");
+        validate_cpu_blob(&blob, language_model)?;
         // PLOW_FP8_DIR (the `--fp8-dir` runtime flag) names the fp8 weight-twin directory.
         // PLOW_MXFP4_DIR names the mxfp4 twin (`mxfp4/<name>` e2m1 + `_scale` E8M0 rows,
         // perf-data/tools/quantize_mxfp4.py); the two axes are exclusive at emit time.
@@ -645,12 +655,80 @@ impl CpuModel {
         // PLOW_FP8_DIR env); only the mxfp4 twin is CPU-specific. Declaring a second `fp8_dir`
         // field here shadowed the first, and the twin then silently never loaded.
         let rt = crate::config::RuntimeConfig::get();
-        let twin = [rt.amd.fp8_dir.as_deref(), rt.cpu.mxfp4_dir.as_deref()]
-            .into_iter()
-            .flatten()
-            .find(|d| !d.is_empty())
-            .map(std::path::PathBuf::from);
-        let ckpt = Checkpoint::open_with_twin(checkpoint, twin.as_deref())?;
+        let affine_q4 = blob
+            .progs
+            .iter()
+            .flat_map(|p| &p.insts)
+            .any(|d| d.op == DevOp::GemvAffineQ4 as u16 || d.op == DevOp::GemmAffineQ4 as u16);
+        let twin = if affine_q4 {
+            rt.cpu
+                .affine_q4_dir
+                .as_deref()
+                .filter(|d| !d.is_empty())
+                .map(std::path::PathBuf::from)
+        } else {
+            [rt.amd.fp8_dir.as_deref(), rt.cpu.mxfp4_dir.as_deref()]
+                .into_iter()
+                .flatten()
+                .find(|d| !d.is_empty())
+                .map(std::path::PathBuf::from)
+        };
+        let needs_checkpoint = blob.tensors.iter().any(|tensor| {
+            tensor.init.is_none() && packet::names::is_checkpoint_weight(&tensor.name)
+        });
+        let ckpt = if needs_checkpoint {
+            let checkpoint = checkpoint.ok_or_else(|| {
+                RuntimeError::Device("packet asset has external weights but no checkpoint".into())
+            })?;
+            Some(Checkpoint::open_with_twin(checkpoint, twin.as_deref())?)
+        } else {
+            None
+        };
+        for d in
+            blob.progs.iter().flat_map(|p| &p.insts).filter(|d| {
+                d.op == DevOp::GemvAffineQ4 as u16 || d.op == DevOp::GemmAffineQ4 as u16
+            })
+        {
+            let tensor = |slot: usize| {
+                blob.tensors.get(d.t[slot] as usize).ok_or_else(|| {
+                    RuntimeError::Device(format!("affine Q4 missing operand t{slot}"))
+                })
+            };
+            let w = tensor(2)?;
+            let n = d.i[1] as usize;
+            let k = d.i[2] as usize;
+            if let Some(ckpt) = &ckpt {
+                ckpt.validate_affine_q4(&w.name, n, k)?;
+            }
+            for (slot, suffix, bytes) in [
+                (2, "", n * (k / 8) * 4),
+                (3, "_scale", n * (k / 64) * 2),
+                (4, "_bias", n * (k / 64) * 2),
+            ] {
+                let t = tensor(slot)?;
+                if t.name != format!("{}{suffix}", w.name) || t.bytes != bytes as u64 {
+                    return Err(RuntimeError::Device(format!(
+                        "affine Q4 operand t{slot} does not match {}{suffix}",
+                        w.name
+                    )));
+                }
+            }
+            if d.i[0] == 0 || d.i[3] != 0 {
+                return Err(RuntimeError::Device(
+                    "affine Q4 requires positive M and reserved i3=0".into(),
+                ));
+            }
+            for (slot, offset, cols) in [(0, d.i[5], n), (1, d.i[4], k)] {
+                let required = (d.i[0] as u64 + offset as u64)
+                    .checked_mul(cols as u64)
+                    .and_then(|v| v.checked_mul(2));
+                if required.is_none_or(|bytes| bytes > tensor(slot).map_or(0, |t| t.bytes)) {
+                    return Err(RuntimeError::Device(format!(
+                        "affine Q4 operand t{slot} is too small for its rows and offset"
+                    )));
+                }
+            }
+        }
 
         // Kernels first: a missing op is a cheap, loud failure — before 20 GiB of copies.
         let mut kernels = Vec::with_capacity(blob.progs.len());
@@ -700,8 +778,23 @@ impl CpuModel {
                     td.name
                 )));
             }
-            let t = if packet::names::is_checkpoint_weight(&td.name) {
+            let t = if let Some(r) = &td.init {
+                let src = &blob.init[r.clone()];
+                if src.len() != bytes {
+                    return Err(RuntimeError::Device(format!(
+                        "init size mismatch {} (blob {} B, init {} B)",
+                        td.name,
+                        bytes,
+                        src.len()
+                    )));
+                }
+                let t = HostTensor::alloc_on_nodes(bytes, false, nodes, strict)?;
+                unsafe { std::slice::from_raw_parts_mut(t.as_ptr(), t.bytes).copy_from_slice(src) };
+                t
+            } else if packet::names::is_checkpoint_weight(&td.name) {
                 let src = ckpt
+                    .as_ref()
+                    .expect("external checkpoint requirement was checked")
                     .tensor(&td.name)
                     .ok_or_else(|| RuntimeError::Device(format!("MISSING WEIGHT: {}", td.name)))?;
                 if src.len() != bytes {
@@ -716,19 +809,6 @@ impl CpuModel {
                 // SAFETY: fresh allocation of `bytes`, no other reference yet.
                 unsafe { std::slice::from_raw_parts_mut(t.as_ptr(), t.bytes).copy_from_slice(src) };
                 weight_bytes += td.bytes;
-                t
-            } else if let Some(r) = &td.init {
-                let src = &blob.init[r.clone()];
-                if src.len() != bytes {
-                    return Err(RuntimeError::Device(format!(
-                        "init size mismatch {} (blob {} B, init {} B)",
-                        td.name,
-                        bytes,
-                        src.len()
-                    )));
-                }
-                let t = HostTensor::alloc_on_nodes(bytes, false, nodes, strict)?;
-                unsafe { std::slice::from_raw_parts_mut(t.as_ptr(), t.bytes).copy_from_slice(src) };
                 t
             } else if let Some(g) = gen_of.get(&(h as u32)) {
                 let data = g.generate().ok_or_else(|| {
@@ -845,7 +925,7 @@ impl CpuModel {
             let pt: Vec<u32> = blob.progs.iter().map(|p| p.t).collect();
             packet::devbuild::decode_rung_lo(&pt)
         };
-        if blob.kvrow.is_empty() {
+        if language_model && blob.kvrow.is_empty() {
             // MLA-style packets declare no sites and need `exec::amd::derive_kvrow`'s
             // rule; not ported yet, so refuse rather than write every token to row 0.
             return Err(RuntimeError::Device(
@@ -874,7 +954,7 @@ impl CpuModel {
             kv_slot_stride,
             kv_slot: 0,
             wk,
-            dec_ix,
+            dec_ix: if language_model { dec_ix } else { 0 },
             kvrow,
             kernels,
             weight_bytes,
@@ -1658,6 +1738,19 @@ pub struct CpuEngine {
 
 impl CpuEngine {
     pub fn load(blob: &Path, checkpoint: &Path, opts: &CpuEngineOpts) -> Result<CpuEngine> {
+        Self::load_with_checkpoint(blob, Some(checkpoint), opts)
+    }
+
+    /// Load a self-contained packet asset without imposing the language-model step protocol.
+    pub fn load_packet(blob: &Path, opts: &CpuEngineOpts) -> Result<CpuEngine> {
+        Self::load_with_checkpoint(blob, None, opts)
+    }
+
+    fn load_with_checkpoint(
+        blob: &Path,
+        checkpoint: Option<&Path>,
+        opts: &CpuEngineOpts,
+    ) -> Result<CpuEngine> {
         let isa = ffi::init(opts.isa)?;
         let topo = Topology::detect();
         if let NumaMode::Nodes(requested) = &opts.numa {
@@ -1877,6 +1970,16 @@ impl CpuEngine {
         }
         self.last_run_us = t0.elapsed().as_secs_f64() * 1e6;
         Ok(())
+    }
+
+    /// Dispatch one program from a generic packet asset.
+    pub fn run_packet(&mut self, program: usize) -> Result<()> {
+        if program >= self.progs.len() {
+            return Err(RuntimeError::Device(format!(
+                "packet program {program} is missing"
+            )));
+        }
+        self.run_prog(program)
     }
 
     /// Prefill `prompt` into KV rows `[0, len)`; returns the greedy next token
@@ -2137,5 +2240,103 @@ impl CpuEngine {
             .take(n)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect()
+    }
+}
+
+impl crate::exec::packet_runtime::PacketRuntime for CpuEngine {
+    fn tensor(&self, name: &str) -> Option<crate::exec::packet_runtime::PacketTensor> {
+        let handle = self
+            .model
+            .names
+            .iter()
+            .position(|candidate| candidate == name)?;
+        Some(crate::exec::packet_runtime::PacketTensor {
+            handle,
+            bytes: self.model.tensor(handle).bytes,
+        })
+    }
+
+    fn write_tensor(
+        &mut self,
+        tensor: crate::exec::packet_runtime::PacketTensor,
+        bytes: &[u8],
+    ) -> Result<()> {
+        self.model.names.get(tensor.handle).ok_or_else(|| {
+            RuntimeError::Device(format!("packet tensor handle {} is missing", tensor.handle))
+        })?;
+        let storage = self.model.tensor(tensor.handle);
+        crate::exec::packet_runtime::check_transfer(
+            tensor,
+            tensor.handle,
+            storage.bytes,
+            bytes.len(),
+        )?;
+        // SAFETY: the engine is exclusively borrowed, no run is in flight, and the size matches.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), storage.as_ptr(), bytes.len()) };
+        Ok(())
+    }
+
+    fn read_tensor(
+        &self,
+        tensor: crate::exec::packet_runtime::PacketTensor,
+        bytes: &mut [u8],
+    ) -> Result<()> {
+        self.model.names.get(tensor.handle).ok_or_else(|| {
+            RuntimeError::Device(format!("packet tensor handle {} is missing", tensor.handle))
+        })?;
+        let storage = self.model.tensor(tensor.handle);
+        crate::exec::packet_runtime::check_transfer(
+            tensor,
+            tensor.handle,
+            storage.bytes,
+            bytes.len(),
+        )?;
+        // SAFETY: no run mutates storage while `self` is borrowed and the size matches.
+        unsafe { std::ptr::copy_nonoverlapping(storage.as_ptr(), bytes.as_mut_ptr(), bytes.len()) };
+        Ok(())
+    }
+
+    fn copy_tensor(
+        &mut self,
+        source: crate::exec::packet_runtime::PacketTensor,
+        source_offset: usize,
+        target: crate::exec::packet_runtime::PacketTensor,
+        target_offset: usize,
+        bytes: usize,
+    ) -> Result<()> {
+        self.model.names.get(source.handle).ok_or_else(|| {
+            RuntimeError::Device(format!("packet tensor handle {} is missing", source.handle))
+        })?;
+        self.model.names.get(target.handle).ok_or_else(|| {
+            RuntimeError::Device(format!("packet tensor handle {} is missing", target.handle))
+        })?;
+        let source_storage = self.model.tensor(source.handle);
+        let target_storage = self.model.tensor(target.handle);
+        crate::exec::packet_runtime::check_copy(
+            source,
+            source_storage.bytes,
+            source_offset,
+            target,
+            target_storage.bytes,
+            target_offset,
+            bytes,
+        )?;
+        // SAFETY: both ranges were checked and the engine is exclusively borrowed.
+        unsafe {
+            std::ptr::copy(
+                source_storage.as_ptr().add(source_offset),
+                target_storage.as_ptr().add(target_offset),
+                bytes,
+            )
+        };
+        Ok(())
+    }
+
+    fn run(&mut self, program: usize) -> Result<()> {
+        self.run_packet(program)
+    }
+
+    fn last_run_us(&self) -> f64 {
+        self.last_run_us
     }
 }

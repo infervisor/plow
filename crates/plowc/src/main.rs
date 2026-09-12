@@ -1495,7 +1495,18 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
         let tok = ckpt.join("tokenizer.json");
         if tok.exists() {
             symlink_force(&tok, &out_dir.join("tokenizer.json"))?;
-        } else {
+        } else if !(ckpt.join("vocab.json").is_file()
+            && ckpt.join("merges.txt").is_file()
+            && std::fs::read(ckpt.join("tokenizer_config.json"))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .is_some_and(|v| {
+                    matches!(
+                        v["tokenizer_class"].as_str(),
+                        Some("Qwen2Tokenizer" | "Qwen2TokenizerFast")
+                    )
+                }))
+        {
             warn!(
                 checkpoint = %ckpt.display(),
                 "no tokenizer.json in the checkpoint; the bundle will fall back \

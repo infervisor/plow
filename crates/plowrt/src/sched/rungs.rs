@@ -9,6 +9,24 @@ const NARROW_UTIL: f64 = 0.60;
 const NARROW_TICKS: u32 = 32;
 const MIN_DWELL_TICKS: u32 = 64;
 
+/// Number of leading slots a decode dispatch must cover.
+///
+/// Slots keep their backend-owned recurrent state until release, so a live slot
+/// cannot be compacted across a gap without moving that state.
+#[inline]
+pub fn occupied_extent(occupied: impl IntoIterator<Item = bool>) -> usize {
+    occupied.into_iter().enumerate().fold(
+        0,
+        |extent, (slot, live)| {
+            if live {
+                slot + 1
+            } else {
+                extent
+            }
+        },
+    )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RungError {
     Empty,
@@ -271,6 +289,14 @@ impl RungController {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn occupied_extent_preserves_slot_identity() {
+        assert_eq!(occupied_extent([]), 0);
+        assert_eq!(occupied_extent([false, false]), 0);
+        assert_eq!(occupied_extent([true, false, false]), 1);
+        assert_eq!(occupied_extent([false, false, true, false]), 3);
+    }
 
     fn controller(widths: &[u32]) -> RungController {
         RungController::new(DecodeRungs::new(widths, *widths.last().unwrap() as usize).unwrap())

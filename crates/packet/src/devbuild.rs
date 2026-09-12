@@ -933,6 +933,11 @@ impl Builder {
                 );
             }
         }
+        assert!(
+            cus.len() <= u16::MAX as usize,
+            "{op:?} has {} slices, exceeding the packet limit",
+            cus.len()
+        );
         let mut inst = DevInst {
             op: op as u16,
             blocks: cus.len() as u16,

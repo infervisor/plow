@@ -92,21 +92,24 @@ pub fn class_of(op: DevOp) -> RowClass {
         // elementwise, quantization, argmax, the collectives, and the whole MoE routing /
         // grouping / combine chain, whose row maps are built from the batch it is given.
         Nop | RmsNorm | RowRms | Residual | Glu | SituGlu | SoftCap | LayerNorm | NormResidual
-        | AddNorm | NormResidualNorm | PerLayerInput | QuantFp8 | ZeroF32 | CastF32Bf16 | MlaOutGate
-        | KdaGatedNorm | QwenGatedNorm | QwenQGateSplit | QwenSigmoidGate | QwenRmsNorm => {
-            RowClass::A
-        }
+        | AddNorm | NormResidualNorm | PerLayerInput | QuantFp8 | ZeroF32 | CastF32Bf16
+        | MlaOutGate | KdaGatedNorm | QwenGatedNorm | QwenQGateSplit | QwenSigmoidGate
+        | QwenRmsNorm | LayerNormF32 | ScaledAddF32 | GluF32 | EmbedF16F32 | EmbedOverlayBf16
+        | LstmCellF32 | ReluF32 | BroadcastAddF32 => RowClass::A,
         // `Embed` gathers rows of the EMBEDDING TABLE by token id — one id per row, no
         // position, no cross-row coupling. It is not a hidden-row gather; `RowGather` is.
         Embed => RowClass::A,
         Gemm | GemmSmall | GemmMed | GemmWide | GemmC5 | GemmNorm | GemmGlu | GemmSplitK
         | GemmFp8 | GemmMedFp8 | GemmSmallFp8 | GemmGluFp8 | GemmWideFp8 | GemmC5Fp8
         | GemmFp8Blk | GemmMxfp4 | GemmMedMxfp4 | GemmSmallMxfp4 | GemmWideMxfp4 | GemmC5Mxfp4
-        | GemmGluMxfp4 | DenseGluFp8Blk => RowClass::A,
+        | GemmGluMxfp4 | DenseGluFp8Blk | GemmAffineQ4 | Q8GemmF32 | DenseGemmF32 | SiluF32 => {
+            RowClass::A
+        }
         Gemv | GemvSz | GemvGlu | GemvGluSz | GemvArgmax | GemvQkv | GemvQkvg | GemvF32
         | GemvFp8 | GemvGluFp8 | GemvFp8Blk | GemvQkvFp8 | GemvMxfp4 | GemvGluMxfp4
-        | GemvQkvMxfp4 => RowClass::A,
-        Argmax | ArgmaxFin => RowClass::A,
+        | GemvQkvMxfp4 | GemvAffineQ4 => RowClass::A,
+        Argmax | ArgmaxFin | ArgmaxF32 => RowClass::A,
+        Conv2dF32 | PackNcfwRowsF32 => RowClass::C,
         // Collectives reduce whole tensors at live row extents identical on every rank; the
         // element count is an input, the row identity is not.
         XReduce | XReduceScatter | XAllGather | XFlashMerge | XArgmaxFin | XReduceTwoShot
@@ -192,6 +195,10 @@ pub fn class_of(op: DevOp) -> RowClass {
         // own capability marker because a legal packet otherwise runs dense and ignores `t7`.
         IndexScore | IndexScorePf | IndexScoreKpool | IndexSelect | IndexSelectPf
         | IndexUnionPf | DsaPoolExpand | DsaPoolCompress => RowClass::C,
+
+        // Attention couples rows within one sequence. Packed request spans require per-span
+        // execution until the op gains an explicit span descriptor.
+        RelativeAttentionF32 | GroupedAttentionF32 | CausalDepthwiseConv1dF32 => RowClass::C,
 
         // ---- D: per-sequence carried state -------------------------------------------------
         // Operand shapes with no request axis at all: `state`/`outstate` `[1, HV, V, K]`,

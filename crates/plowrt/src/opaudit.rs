@@ -300,6 +300,34 @@ pub fn classify(op: DevOp) -> OpClass {
         DevOp::ZeroF32 => a_rows("i0=M"),
         DevOp::CastF32Bf16 => a_rows("i0=M"),
         DevOp::QuantFp8 => a_rows("i0=M, per-row a_scale"),
+        DevOp::Q8GemmF32 => a_rows("i0=M, dense FP32 rows"),
+        DevOp::LayerNormF32 => a_rows("i0=rows"),
+        DevOp::ScaledAddF32 => a_elem("i0=n"),
+        DevOp::GluF32 => a_rows("i0=rows"),
+        DevOp::SiluF32 => a_elem("i0=n"),
+        DevOp::DenseGemmF32 => a_rows("i0=M, dense FP32 rows"),
+        DevOp::EmbedF16F32 => a_rows("single explicit token row"),
+        DevOp::EmbedOverlayBf16 => a_rows("i0=rows, token gather with explicit row overlay"),
+        DevOp::LstmCellF32 => a_elem("i0=width, explicit state tensors"),
+        DevOp::ArgmaxF32 => a_rows("i0=rows"),
+        DevOp::ReluF32 => a_elem("i0=n"),
+        DevOp::BroadcastAddF32 => a_rows("i0=rows"),
+        DevOp::Conv2dF32 => note(
+            cls_c("2D convolution couples neighboring frame rows"),
+            "run once per request span until a span descriptor is bound",
+        ),
+        DevOp::PackNcfwRowsF32 => note(
+            cls_c("row packing couples convolution layout dimensions"),
+            "run once per request span until a span descriptor is bound",
+        ),
+        DevOp::CausalDepthwiseConv1dF32 => note(
+            cls_c("causal rows belong to one sequence"),
+            "run once per request span until a span descriptor is bound",
+        ),
+        DevOp::RelativeAttentionF32 | DevOp::GroupedAttentionF32 => note(
+            cls_c("attention rows belong to one sequence"),
+            "run once per request span until a span descriptor is bound",
+        ),
 
         // `i3=out_row0` is a packet-scalar ROW base into the DSA indexer's
         // [ctx][DI] key cache: row j lands at out_row0 + j. Zero (the plain
@@ -330,7 +358,8 @@ pub fn classify(op: DevOp) -> OpClass {
         ),
 
         // ---- dense matmul families --------------------------------------
-        DevOp::Gemm | DevOp::GemmSmall | DevOp::GemmMed | DevOp::GemmWide | DevOp::GemmC5 => {
+        DevOp::Gemm | DevOp::GemmSmall | DevOp::GemmMed | DevOp::GemmWide | DevOp::GemmC5
+        | DevOp::GemvAffineQ4 | DevOp::GemmAffineQ4 => {
             a_rows("i0=M")
         }
         DevOp::GemmNorm => a_rows("i0=M"),

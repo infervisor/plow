@@ -1,7 +1,7 @@
 // interp.metal — the device-ISA interpreter for Apple GPUs (plans/apple-silicon-backend.md §4.2).
 //
-// One threadgroup per virtual CU (grid = n_cu, all resident — probe (b)), 256 threads = 8
-// simdgroups = the G_WAVES packing every kernel assumes. Each threadgroup walks its own stream of
+// One threadgroup per virtual CU (grid = n_cu, residency required), 1024 threads = 32
+// simdgroups. Legacy vector/head kernels use their own subgroup packing. Each group walks its stream of
 // (inst, slice) entries for the segment the host dispatched:
 //
 //     thread 0 spins until every wait-counter reaches its threshold
@@ -45,14 +45,6 @@ inline ushort f2bf(float f) {
     return ushort(u >> 16);
 }
 inline float rbf(float f) { return bf2f(f2bf(f)); }
-// e4m3 -> f32 exactly, branch-free: the 7 magnitude bits land in the f32 exponent/mantissa
-// fields (exponent still biased by 7, i.e. the value times 2^-120), the sign in bit 31; the
-// caller multiplies by 2^120 (per element here, or once per accumulator in the dot loops —
-// exact either way). e == 0 codes become f32 denormals, which equals the fp8 subnormal value
-// when denormals are honoured and 0 when flushed (the CPU tiers make the same DAZ choice).
-constant float E4M3_REBIAS = 0x1p120f;
-inline float e4m3_raw(uint c) { return as_type<float>(((c & 0x7Fu) << 20) | ((c & 0x80u) << 24)); }
-inline float e4m3(uint c) { return e4m3_raw(c) * E4M3_REBIAS; }
 inline uchar f2e4m3(float x) {
     uint u = as_type<uint>(x), sign = (u >> 24) & 0x80u;
     u &= 0x7fffffffu;
@@ -63,15 +55,26 @@ inline uchar f2e4m3(float x) {
     u += 0x7ffffu + ((u >> 20) & 1u);
     return uchar(sign | ((u - 0x3c000000u) >> 20));
 }
+// Decode before multiplication: delayed exponent rebias loses valid products to FP32 flush-to-zero.
 inline float e4m3_exact(uint c) {
     uint mag = c & 0x7fu;
     float v = mag < 8u ? float(mag) * 0x1p-9f
         : (mag == 0x7fu ? NAN : as_type<float>((mag << 20) + 0x3c000000u));
     return (c & 0x80u) ? -v : v;
 }
-inline float4 e4m3x4_raw(uchar4 c) {
-    uint4 u = uint4(c);
-    return as_type<float4>(((u & 0x7Fu) << 20) | ((u & 0x80u) << 24));
+inline float e4m3(uint c) { return e4m3_exact(c); }
+inline float4 e4m3x4(uchar4 c) {
+    return float4(e4m3_exact(c.x), e4m3_exact(c.y), e4m3_exact(c.z), e4m3_exact(c.w));
+}
+// Every finite E4M3 value is exact in BF16; no rounding step is needed.
+inline ushort e4m3bf(uint c) {
+    uint mag = c & 0x7fu;
+    uint bits = mag < 8u ? (as_type<uint>(float(mag) * 0x1p-9f) >> 16)
+        : (mag == 0x7fu ? 0x7fc0u : (mag << 4) + 0x3c00u);
+    return ushort(bits | ((c & 0x80u) << 8));
+}
+inline ushort4 e4m3bf4(uchar4 c) {
+    return ushort4(e4m3bf(c.x), e4m3bf(c.y), e4m3bf(c.z), e4m3bf(c.w));
 }
 inline float4 bf4(ushort4 h) { return as_type<float4>(uint4(h) << 16); }
 
@@ -106,6 +109,17 @@ inline float siluf(float x) { return x * sigmoidf(x); }
 inline float gelu_tanhs(float x) {
     float c = 0.7978845608028654f * (x + 0.044715f * x * x * x);
     return 0.5f * x * (1.0f + tanhs(c));
+}
+inline float round_bf16_f32(float x) {
+    uint bits = as_type<uint>(x);
+    return as_type<float>((bits + 0x7fffu + ((bits >> 16u) & 1u)) & 0xffff0000u);
+}
+inline float gelu_erf_bf16(float x) {
+    x = round_bf16_f32(x);
+    float z = x * M_SQRT1_2_F, t = 1.0f / (1.0f + 0.3275911f * abs(z));
+    float r = (((((1.061405429f * t - 1.453152027f) * t + 1.421413741f) * t -
+                  0.284496736f) * t + 0.254829592f) * t) * exp(-z * z);
+    return round_bf16_f32(0.5f * x * (z < 0.0f ? r : 2.0f - r));
 }
 inline float act_gate_only(float g, uint act) { return act >= 2u ? NAN : (act == 1u ? siluf(g) : gelu_tanhs(g)); }
 inline float glu_pair(float g, float u, uint act, float f0, float f1) {
@@ -153,7 +167,36 @@ inline float dot_bf16(device const ushort* w, device const ushort* x, uint K, ui
     for (k = (K & ~7u) + lane; k < K; k += 32u) acc += bf2f(w[k]) * bf2f(x[k]);
     return simd_sum(acc);
 }
-inline float4 e4m3x4(uchar4 c) { return e4m3x4_raw(c) * E4M3_REBIAS; }
+
+#ifdef PLOW_GLU_PAIR
+inline float2 dot_pair_bf16(device const ushort* g, device const ushort* u,
+                          device const ushort* x, uint K, uint lane) {
+    float2 acc = 0.0f;
+    uint k = lane * 8u;
+    for (; k + 776u <= K; k += 1024u) {
+        #pragma unroll
+        for (uint j = 0; j < 4; j++) {
+            uint p = k + j * 256u;
+            float4 x0 = bf4(*(device const ushort4*)(x + p));
+            float4 x1 = bf4(*(device const ushort4*)(x + p + 4));
+            acc.x += dot(bf4(*(device const ushort4*)(g + p)), x0) + dot(bf4(*(device const ushort4*)(g + p + 4)), x1);
+            acc.y += dot(bf4(*(device const ushort4*)(u + p)), x0) + dot(bf4(*(device const ushort4*)(u + p + 4)), x1);
+        }
+    }
+    for (; k + 8u <= K; k += 256u) {
+        float4 x0 = bf4(*(device const ushort4*)(x + k));
+        float4 x1 = bf4(*(device const ushort4*)(x + k + 4));
+        acc.x += dot(bf4(*(device const ushort4*)(g + k)), x0) + dot(bf4(*(device const ushort4*)(g + k + 4)), x1);
+        acc.y += dot(bf4(*(device const ushort4*)(u + k)), x0) + dot(bf4(*(device const ushort4*)(u + k + 4)), x1);
+    }
+    for (k = (K & ~7u) + lane; k < K; k += 32u) {
+        float xv = bf2f(x[k]);
+        acc.x += bf2f(g[k]) * xv;
+        acc.y += bf2f(u[k]) * xv;
+    }
+    return float2(simd_sum(acc.x), simd_sum(acc.y));
+}
+#endif
 
 // Four weight rows per simdgroup: 4 x 2 x 16 B loads in flight per lane per step, one x load
 // shared. Returns the four dots (every lane holds all four after the reductions).
@@ -197,19 +240,19 @@ inline float4 dot4_fp8(device const uchar* W, uint ldw, device const ushort* x, 
         uchar4 b0 = *(device const uchar4*)w1, b1 = *(device const uchar4*)(w1 + 4);
         uchar4 c0 = *(device const uchar4*)w2, c1 = *(device const uchar4*)(w2 + 4);
         uchar4 d0 = *(device const uchar4*)w3, d1 = *(device const uchar4*)(w3 + 4);
-        acc.x += dot(e4m3x4_raw(a0), x0) + dot(e4m3x4_raw(a1), x1);
-        acc.y += dot(e4m3x4_raw(b0), x0) + dot(e4m3x4_raw(b1), x1);
-        acc.z += dot(e4m3x4_raw(c0), x0) + dot(e4m3x4_raw(c1), x1);
-        acc.w += dot(e4m3x4_raw(d0), x0) + dot(e4m3x4_raw(d1), x1);
+        acc.x += dot(e4m3x4(a0), x0) + dot(e4m3x4(a1), x1);
+        acc.y += dot(e4m3x4(b0), x0) + dot(e4m3x4(b1), x1);
+        acc.z += dot(e4m3x4(c0), x0) + dot(e4m3x4(c1), x1);
+        acc.w += dot(e4m3x4(d0), x0) + dot(e4m3x4(d1), x1);
     }
     for (k = (K & ~7u) + lane; k < K; k += 32u) {
         float xv = bf2f(x[k]);
-        acc.x += e4m3_raw(W[k]) * xv;
-        acc.y += e4m3_raw(W[ldw + k]) * xv;
-        acc.z += e4m3_raw(W[2 * ldw + k]) * xv;
-        acc.w += e4m3_raw(W[3 * ldw + k]) * xv;
+        acc.x += e4m3(W[k]) * xv;
+        acc.y += e4m3(W[ldw + k]) * xv;
+        acc.z += e4m3(W[2 * ldw + k]) * xv;
+        acc.w += e4m3(W[3 * ldw + k]) * xv;
     }
-    return float4(simd_sum(acc.x), simd_sum(acc.y), simd_sum(acc.z), simd_sum(acc.w)) * E4M3_REBIAS;
+    return float4(simd_sum(acc.x), simd_sum(acc.y), simd_sum(acc.z), simd_sum(acc.w));
 }
 inline float dot_fp8(device const uchar* w, device const ushort* x, uint K, uint lane) {
     float acc = 0.0f;
@@ -219,18 +262,18 @@ inline float dot_fp8(device const uchar* w, device const ushort* x, uint K, uint
         uchar4 b0 = *(device const uchar4*)(w + k + 256), b1 = *(device const uchar4*)(w + k + 260);
         uchar4 c0 = *(device const uchar4*)(w + k + 512), c1 = *(device const uchar4*)(w + k + 516);
         uchar4 d0 = *(device const uchar4*)(w + k + 768), d1 = *(device const uchar4*)(w + k + 772);
-        acc += dot(e4m3x4_raw(a0), bf4(*(device const ushort4*)(x + k))) + dot(e4m3x4_raw(a1), bf4(*(device const ushort4*)(x + k + 4)));
-        acc += dot(e4m3x4_raw(b0), bf4(*(device const ushort4*)(x + k + 256))) + dot(e4m3x4_raw(b1), bf4(*(device const ushort4*)(x + k + 260)));
-        acc += dot(e4m3x4_raw(c0), bf4(*(device const ushort4*)(x + k + 512))) + dot(e4m3x4_raw(c1), bf4(*(device const ushort4*)(x + k + 516)));
-        acc += dot(e4m3x4_raw(d0), bf4(*(device const ushort4*)(x + k + 768))) + dot(e4m3x4_raw(d1), bf4(*(device const ushort4*)(x + k + 772)));
+        acc += dot(e4m3x4(a0), bf4(*(device const ushort4*)(x + k))) + dot(e4m3x4(a1), bf4(*(device const ushort4*)(x + k + 4)));
+        acc += dot(e4m3x4(b0), bf4(*(device const ushort4*)(x + k + 256))) + dot(e4m3x4(b1), bf4(*(device const ushort4*)(x + k + 260)));
+        acc += dot(e4m3x4(c0), bf4(*(device const ushort4*)(x + k + 512))) + dot(e4m3x4(c1), bf4(*(device const ushort4*)(x + k + 516)));
+        acc += dot(e4m3x4(d0), bf4(*(device const ushort4*)(x + k + 768))) + dot(e4m3x4(d1), bf4(*(device const ushort4*)(x + k + 772)));
     }
     for (; k + 8u <= K; k += 256u) {
         uchar4 a = *(device const uchar4*)(w + k), b = *(device const uchar4*)(w + k + 4);
         float4 x0 = bf4(*(device const ushort4*)(x + k)), x1 = bf4(*(device const ushort4*)(x + k + 4));
-        acc += dot(e4m3x4_raw(a), x0) + dot(e4m3x4_raw(b), x1);
+        acc += dot(e4m3x4(a), x0) + dot(e4m3x4(b), x1);
     }
-    for (k = (K & ~7u) + lane; k < K; k += 32u) acc += e4m3_raw(w[k]) * bf2f(x[k]);
-    return simd_sum(acc) * E4M3_REBIAS;
+    for (k = (K & ~7u) + lane; k < K; k += 32u) acc += e4m3(w[k]) * bf2f(x[k]);
+    return simd_sum(acc);
 }
 // norm==2 / q-norm fold: dot(w, bf16(x * inv * gamma))
 inline float dot_normed(device const ushort* w, device const ushort* x, device const ushort* gamma,
@@ -313,8 +356,13 @@ void op_gemv_glu(const thread Inst& in, device const ulong* tab, uint slice, uin
     range(N, slice, nblk, n0, n1);
     for (uint n = n0 + sg; n < n1; n += NSG)
         for (uint m = 0; m < M; m++) {
+#ifdef PLOW_GLU_PAIR
+            float2 pair = dot_pair_bf16(Wg + n * K, Wu + n * K, x + m * K, K, lane);
+            float g = pair.x, u = pair.y;
+#else
             float g = dot_bf16(Wg + n * K, x + m * K, K, lane);
             float u = dot_bf16(Wu + n * K, x + m * K, K, lane);
+#endif
             if (bg) g += bf2f(bg[n]);
             if (bu) u += bf2f(bu[n]);
             if (lane == 0) C[m * N + n] = f2bf(glu_pair(g, u, act, f0, f1));
@@ -340,6 +388,32 @@ void op_gemv_qkv(const thread Inst& in, device const ulong* tab, uint slice, uin
     for (uint m = 0; m < M; m++) {
         device const ushort* xm = x + m * K;
         float inv = gnorm ? rsqrt(row_ss(xm, K, lane) / float(K) + eps) : 1.0f;
+#ifdef PLOW_QKV_DOT4
+        if (!gnorm) {
+            uint offset = 0;
+            for (uint s = 0; s < 3; s++) {
+                uint lo = max(n0, offset), hi = min(n1, offset + Ns[s]);
+                uint n = lo + sg * 4u;
+                for (; n + 4u <= hi; n += NSG * 4u) {
+                    uint col = n - offset;
+                    float4 a = dot4_bf16(Ws[s] + col * K, K, xm, K, lane);
+                    if (Bs[s]) a += float4(bf2f(Bs[s][col]), bf2f(Bs[s][col + 1]), bf2f(Bs[s][col + 2]), bf2f(Bs[s][col + 3]));
+                    if (lane == 0) {
+                        device ushort* out = Cs[s] + m * Ns[s] + col;
+                        out[0] = f2bf(a.x); out[1] = f2bf(a.y); out[2] = f2bf(a.z); out[3] = f2bf(a.w);
+                    }
+                }
+                for (; n < hi; n++) {
+                    uint col = n - offset;
+                    float a = dot_bf16(Ws[s] + col * K, xm, K, lane);
+                    if (Bs[s]) a += bf2f(Bs[s][col]);
+                    if (lane == 0) Cs[s][m * Ns[s] + col] = f2bf(a);
+                }
+                offset += Ns[s];
+            }
+            continue;
+        }
+#endif
         for (uint n = n0 + sg; n < n1; n += NSG) {
             uint s = 0, col = n;
             while (col >= Ns[s]) { col -= Ns[s]; s++; }
@@ -374,6 +448,47 @@ void op_gemv_fp8(const thread Inst& in, device const ulong* tab, uint slice, uin
             float acc = dot_fp8(W + n * K, x + m * K, K, lane) * ws[n];
             if (lane == 0) C[m * N + n] = f2bf(acc);
         }
+    }
+}
+// Per-channel scales are tensor handles in i5/i6/i7.
+void op_gemv_qkv_fp8(const thread Inst& in, device const ulong* tab, uint slice, uint nblk, uint sg, uint lane) {
+    uint M = in.i[0], K = in.i[2];
+    uint Ns[3] = {in.i[1], in.i[3], in.i[4]};
+    device const ushort* x = ten<ushort>(tab, in, 1);
+    device ushort* Cs[3] = {ten<ushort>(tab, in, 0), ten<ushort>(tab, in, 3), ten<ushort>(tab, in, 5)};
+    device const uchar* Ws[3] = {ten<uchar>(tab, in, 2), ten<uchar>(tab, in, 4), ten<uchar>(tab, in, 6)};
+    uint n0, n1;
+    range(Ns[0] + Ns[1] + Ns[2], slice, nblk, n0, n1);
+    uint offset = 0;
+    for (uint s = 0; s < 3; s++) {
+        uint lo = max(n0, offset), hi = min(n1, offset + Ns[s]);
+        if (lo < hi) {
+            uint h = in.i[5 + s];
+            device const float* ws = h == TNONE ? (device const float*)0 : reinterpret_cast<device const float*>(tab[h]);
+            for (uint m = 0; m < M; m++) {
+                if (!ws) {
+                    for (uint n = lo + sg; n < hi; n += NSG)
+                        if (lane == 0) Cs[s][m * Ns[s] + n - offset] = ushort(0x7fc1);
+                    continue;
+                }
+                uint n = lo + sg * 4u;
+                for (; n + 4u <= hi; n += NSG * 4u) {
+                    uint col = n - offset;
+                    float4 a = dot4_fp8(Ws[s] + col * K, K, x + m * K, K, lane)
+                        * float4(ws[col], ws[col + 1], ws[col + 2], ws[col + 3]);
+                    if (lane == 0) {
+                        device ushort* out = Cs[s] + m * Ns[s] + col;
+                        out[0] = f2bf(a.x); out[1] = f2bf(a.y); out[2] = f2bf(a.z); out[3] = f2bf(a.w);
+                    }
+                }
+                for (; n < hi; n++) {
+                    uint col = n - offset;
+                    float a = dot_fp8(Ws[s] + col * K, x + m * K, K, lane) * ws[col];
+                    if (lane == 0) Cs[s][m * Ns[s] + col] = f2bf(a);
+                }
+            }
+        }
+        offset += Ns[s];
     }
 }
 // t0=fu t1=x t2=Wg t3=g_scale t4=u_scale t5=Wu i0=M i1=N i2=K i5=act
@@ -425,6 +540,9 @@ struct GemmArgs {
     device const uchar* B8;      //          e4m3, or
     device const uchar* B4;      //          e2m1 packed (row stride K/2) with
     device const uchar* S8;      //          E8M0 scales (row stride ceil(K/32)), folded at staging
+    device const uint* AQ4;
+    device const ushort* AQScale;
+    device const ushort* AQBias;
     device const float* wscale;  // [N] for B8
     device const ushort* bias;   // [N] bf16 or null (indexed n*rs+ro like the B rows)
     uint K;
@@ -440,6 +558,7 @@ inline void gemm_args_reset(thread GemmArgs& g) {
     g.A8 = (device const uchar*)0; g.ascale = (device const float*)0;
     g.B16 = (device const ushort*)0; g.B8 = (device const uchar*)0; g.B4 = (device const uchar*)0;
     g.S8 = (device const uchar*)0; g.wscale = (device const float*)0; g.bias = (device const ushort*)0;
+    g.AQ4 = (device const uint*)0; g.AQScale = g.AQBias = (device const ushort*)0;
     g.arow = (device const uint*)0; g.Cf = (device float*)0; g.crow = (device const uint*)0;
     g.rowscale = (device const float*)0; g.rs = 1u; g.ro = 0u;
 }
@@ -473,6 +592,74 @@ constant float E2M1[16] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
 inline float e8m0f(uchar s) { return as_type<float>(uint(s) << 23); }
 // Byte -> (low nibble, high nibble) e2m1 pair: one lookup decodes two weights.
 // Four rows' 32-block dots against x[32], one block per lane per step (16 B of weights per row).
+#ifdef PLOW_MX4_FOUR_ROWS
+inline void dot4_mx4_quad(device const uchar* W, device const uchar* S, uint ldw, uint lds,
+    device const ushort* x, uint K, uint lane, thread float4& a0, thread float4& a1, thread float4& a2, thread float4& a3) {
+    float4 acc0 = float4(0.0f), acc1 = float4(0.0f), acc2 = float4(0.0f), acc3 = float4(0.0f);
+    for (uint b = lane; b < K / 32u; b += 32u) {
+        float4 blk0 = float4(0.0f), blk1 = float4(0.0f), blk2 = float4(0.0f), blk3 = float4(0.0f);
+        for (uint j = 0; j < 4u; j++) {
+            device const ushort* xb = x + b * 32u + 8u * j;
+            float4 x0 = bf4(*(device const ushort4*)xb), x1 = bf4(*(device const ushort4*)(xb + 4u));
+            float4 y0 = bf4(*(device const ushort4*)(xb + K)), y1 = bf4(*(device const ushort4*)(xb + K + 4u));
+            float4 z0 = bf4(*(device const ushort4*)(xb + 2u * K)), z1 = bf4(*(device const ushort4*)(xb + 2u * K + 4u));
+            float4 t0 = bf4(*(device const ushort4*)(xb + 3u * K)), t1 = bf4(*(device const ushort4*)(xb + 3u * K + 4u));
+            for (uint r = 0; r < 4u; r++) {
+                uchar4 c = *(device const uchar4*)(W + r * ldw + b * 16u + 4u * j);
+                float4 w0 = float4(E2M1[c.x & 15u], E2M1[c.x >> 4], E2M1[c.y & 15u], E2M1[c.y >> 4]);
+                float4 w1 = float4(E2M1[c.z & 15u], E2M1[c.z >> 4], E2M1[c.w & 15u], E2M1[c.w >> 4]);
+                blk0[r] += w0.x * x0.x + w0.y * x0.y + w0.z * x0.z + w0.w * x0.w
+                         + w1.x * x1.x + w1.y * x1.y + w1.z * x1.z + w1.w * x1.w;
+                blk1[r] += w0.x * y0.x + w0.y * y0.y + w0.z * y0.z + w0.w * y0.w
+                         + w1.x * y1.x + w1.y * y1.y + w1.z * y1.z + w1.w * y1.w;
+                blk2[r] += w0.x * z0.x + w0.y * z0.y + w0.z * z0.z + w0.w * z0.w
+                         + w1.x * z1.x + w1.y * z1.y + w1.z * z1.z + w1.w * z1.w;
+                blk3[r] += w0.x * t0.x + w0.y * t0.y + w0.z * t0.z + w0.w * t0.w
+                         + w1.x * t1.x + w1.y * t1.y + w1.z * t1.z + w1.w * t1.w;
+            }
+        }
+        for (uint r = 0; r < 4u; r++) {
+            float scale = e8m0f(S[r * lds + b]);
+            acc0[r] += blk0[r] * scale;
+            acc1[r] += blk1[r] * scale;
+            acc2[r] += blk2[r] * scale;
+            acc3[r] += blk3[r] * scale;
+        }
+    }
+    a0 = float4(simd_sum(acc0.x), simd_sum(acc0.y), simd_sum(acc0.z), simd_sum(acc0.w));
+    a1 = float4(simd_sum(acc1.x), simd_sum(acc1.y), simd_sum(acc1.z), simd_sum(acc1.w));
+    a2 = float4(simd_sum(acc2.x), simd_sum(acc2.y), simd_sum(acc2.z), simd_sum(acc2.w));
+    a3 = float4(simd_sum(acc3.x), simd_sum(acc3.y), simd_sum(acc3.z), simd_sum(acc3.w));
+}
+#endif
+inline void dot4_mx4_pair(device const uchar* W, device const uchar* S, uint ldw, uint lds,
+    device const ushort* x, uint K, uint lane, thread float4& a0, thread float4& a1) {
+    float4 acc0 = float4(0.0f), acc1 = float4(0.0f);
+    for (uint b = lane; b < K / 32u; b += 32u) {
+        float4 blk0 = float4(0.0f), blk1 = float4(0.0f);
+        for (uint j = 0; j < 4u; j++) {
+            device const ushort* xb = x + b * 32u + 8u * j;
+            float4 x0 = bf4(*(device const ushort4*)xb), x1 = bf4(*(device const ushort4*)(xb + 4u));
+            float4 y0 = bf4(*(device const ushort4*)(xb + K)), y1 = bf4(*(device const ushort4*)(xb + K + 4u));
+            for (uint r = 0; r < 4u; r++) {
+                uchar4 c = *(device const uchar4*)(W + r * ldw + b * 16u + 4u * j);
+                float4 w0 = float4(E2M1[c.x & 15u], E2M1[c.x >> 4], E2M1[c.y & 15u], E2M1[c.y >> 4]);
+                float4 w1 = float4(E2M1[c.z & 15u], E2M1[c.z >> 4], E2M1[c.w & 15u], E2M1[c.w >> 4]);
+                blk0[r] += w0.x * x0.x + w0.y * x0.y + w0.z * x0.z + w0.w * x0.w
+                         + w1.x * x1.x + w1.y * x1.y + w1.z * x1.z + w1.w * x1.w;
+                blk1[r] += w0.x * y0.x + w0.y * y0.y + w0.z * y0.z + w0.w * y0.w
+                         + w1.x * y1.x + w1.y * y1.y + w1.z * y1.z + w1.w * y1.w;
+            }
+        }
+        for (uint r = 0; r < 4u; r++) {
+            float scale = e8m0f(S[r * lds + b]);
+            acc0[r] += blk0[r] * scale;
+            acc1[r] += blk1[r] * scale;
+        }
+    }
+    a0 = float4(simd_sum(acc0.x), simd_sum(acc0.y), simd_sum(acc0.z), simd_sum(acc0.w));
+    a1 = float4(simd_sum(acc1.x), simd_sum(acc1.y), simd_sum(acc1.z), simd_sum(acc1.w));
+}
 inline float4 dot4_mx4(device const uchar* W, device const uchar* S, uint ldw, uint lds,
                        device const ushort* x, uint K, uint lane) {
     float4 acc = float4(0.0f);
@@ -511,6 +698,60 @@ inline float4 dot4_mx4(device const uchar* W, device const uchar* S, uint ldw, u
     }
     return float4(simd_sum(acc.x), simd_sum(acc.y), simd_sum(acc.z), simd_sum(acc.w));
 }
+#ifdef PLOW_MX4_FOUR_ROWS
+inline float4 dot_mx4_quad(device const uchar* W, device const uchar* S, device const ushort* x, uint K, uint lane) {
+    float acc = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    uint nb = K / 32u;
+    for (uint b = lane; b < nb; b += 32u) {
+        device const ushort* xb = x + b * 32u;
+        device const uchar* wb = W + b * 16u;
+        float blk = 0.0f, blk1 = 0.0f, blk2 = 0.0f, blk3 = 0.0f;
+        for (uint j = 0; j < 4u; j++) {
+            uchar4 c = *(device const uchar4*)(wb + 4u * j);
+            float4 x0 = bf4(*(device const ushort4*)(xb + 8u * j)), x1 = bf4(*(device const ushort4*)(xb + 8u * j + 4u));
+            float4 y0 = bf4(*(device const ushort4*)(xb + K + 8u * j)), y1 = bf4(*(device const ushort4*)(xb + K + 8u * j + 4u));
+            float4 z0 = bf4(*(device const ushort4*)(xb + 2u * K + 8u * j)), z1 = bf4(*(device const ushort4*)(xb + 2u * K + 8u * j + 4u));
+            float4 t0 = bf4(*(device const ushort4*)(xb + 3u * K + 8u * j)), t1 = bf4(*(device const ushort4*)(xb + 3u * K + 8u * j + 4u));
+            blk += E2M1[c.x & 15u] * x0.x + E2M1[c.x >> 4] * x0.y + E2M1[c.y & 15u] * x0.z + E2M1[c.y >> 4] * x0.w
+                 + E2M1[c.z & 15u] * x1.x + E2M1[c.z >> 4] * x1.y + E2M1[c.w & 15u] * x1.z + E2M1[c.w >> 4] * x1.w;
+            blk1 += E2M1[c.x & 15u] * y0.x + E2M1[c.x >> 4] * y0.y + E2M1[c.y & 15u] * y0.z + E2M1[c.y >> 4] * y0.w
+                 + E2M1[c.z & 15u] * y1.x + E2M1[c.z >> 4] * y1.y + E2M1[c.w & 15u] * y1.z + E2M1[c.w >> 4] * y1.w;
+            blk2 += E2M1[c.x & 15u] * z0.x + E2M1[c.x >> 4] * z0.y + E2M1[c.y & 15u] * z0.z + E2M1[c.y >> 4] * z0.w
+                 + E2M1[c.z & 15u] * z1.x + E2M1[c.z >> 4] * z1.y + E2M1[c.w & 15u] * z1.z + E2M1[c.w >> 4] * z1.w;
+            blk3 += E2M1[c.x & 15u] * t0.x + E2M1[c.x >> 4] * t0.y + E2M1[c.y & 15u] * t0.z + E2M1[c.y >> 4] * t0.w
+                 + E2M1[c.z & 15u] * t1.x + E2M1[c.z >> 4] * t1.y + E2M1[c.w & 15u] * t1.z + E2M1[c.w >> 4] * t1.w;
+        }
+        float scale = e8m0f(S[b]);
+        acc += blk * scale;
+        acc1 += blk1 * scale;
+        acc2 += blk2 * scale;
+        acc3 += blk3 * scale;
+    }
+    return float4(simd_sum(acc), simd_sum(acc1), simd_sum(acc2), simd_sum(acc3));
+}
+#endif
+inline float2 dot_mx4_pair(device const uchar* W, device const uchar* S, device const ushort* x, uint K, uint lane) {
+    float acc = 0.0f, acc1 = 0.0f;
+    uint nb = K / 32u;
+    for (uint b = lane; b < nb; b += 32u) {
+        device const ushort* xb = x + b * 32u;
+        device const uchar* wb = W + b * 16u;
+        float blk = 0.0f, blk1 = 0.0f;
+        for (uint j = 0; j < 4u; j++) {
+            uchar4 c = *(device const uchar4*)(wb + 4u * j);
+            float4 x0 = bf4(*(device const ushort4*)(xb + 8u * j)), x1 = bf4(*(device const ushort4*)(xb + 8u * j + 4u));
+            float4 y0 = bf4(*(device const ushort4*)(xb + K + 8u * j)), y1 = bf4(*(device const ushort4*)(xb + K + 8u * j + 4u));
+            blk += E2M1[c.x & 15u] * x0.x + E2M1[c.x >> 4] * x0.y + E2M1[c.y & 15u] * x0.z + E2M1[c.y >> 4] * x0.w
+                 + E2M1[c.z & 15u] * x1.x + E2M1[c.z >> 4] * x1.y + E2M1[c.w & 15u] * x1.z + E2M1[c.w >> 4] * x1.w;
+            blk1 += E2M1[c.x & 15u] * y0.x + E2M1[c.x >> 4] * y0.y + E2M1[c.y & 15u] * y0.z + E2M1[c.y >> 4] * y0.w
+                 + E2M1[c.z & 15u] * y1.x + E2M1[c.z >> 4] * y1.y + E2M1[c.w & 15u] * y1.z + E2M1[c.w >> 4] * y1.w;
+        }
+        float scale = e8m0f(S[b]);
+        acc += blk * scale;
+        acc1 += blk1 * scale;
+    }
+    return float2(simd_sum(acc), simd_sum(acc1));
+}
 inline float dot_mx4(device const uchar* W, device const uchar* S, device const ushort* x, uint K, uint lane) {
     float acc = 0.0f;
     uint nb = K / 32u;
@@ -546,6 +787,32 @@ void op_gemv_mxfp4(const thread Inst& in, device const ulong* tab, uint slice, u
     uint ldw = K / 2u, lds = (K + 31u) / 32u;
     uint n0, n1;
     range(N, slice, nblk, n0, n1);
+#ifdef PLOW_MX4_FOUR_ROWS
+    if (M == 4 && (K % 32u) == 0 && (n0 % 4u) == 0 && (n1 % 4u) == 0) {
+        for (uint n = n0 + sg * 4u; n + 4u <= n1; n += NSG * 4u) {
+            float4 a0, a1, a2, a3;
+            dot4_mx4_quad(W + n * ldw, S + n * lds, ldw, lds, x, K, lane, a0, a1, a2, a3);
+            if (lane == 0) {
+                C[n] = f2bf(a0.x); C[n+1] = f2bf(a0.y); C[n+2] = f2bf(a0.z); C[n+3] = f2bf(a0.w);
+                C[N+n] = f2bf(a1.x); C[N+n+1] = f2bf(a1.y); C[N+n+2] = f2bf(a1.z); C[N+n+3] = f2bf(a1.w);
+                C[2u*N+n] = f2bf(a2.x); C[2u*N+n+1] = f2bf(a2.y); C[2u*N+n+2] = f2bf(a2.z); C[2u*N+n+3] = f2bf(a2.w);
+                C[3u*N+n] = f2bf(a3.x); C[3u*N+n+1] = f2bf(a3.y); C[3u*N+n+2] = f2bf(a3.z); C[3u*N+n+3] = f2bf(a3.w);
+            }
+        }
+        return;
+    }
+#endif
+    if (M == 2 && (K % 32u) == 0 && (n0 % 4u) == 0 && (n1 % 4u) == 0) {
+        for (uint n = n0 + sg * 4u; n + 4u <= n1; n += NSG * 4u) {
+            float4 a0, a1;
+            dot4_mx4_pair(W + n * ldw, S + n * lds, ldw, lds, x, K, lane, a0, a1);
+            if (lane == 0) {
+                C[n] = f2bf(a0.x); C[n+1] = f2bf(a0.y); C[n+2] = f2bf(a0.z); C[n+3] = f2bf(a0.w);
+                C[N+n] = f2bf(a1.x); C[N+n+1] = f2bf(a1.y); C[N+n+2] = f2bf(a1.z); C[N+n+3] = f2bf(a1.w);
+            }
+        }
+        return;
+    }
     for (uint m = 0; m < M; m++) {
         uint n = n0 + sg * 4u;
         for (; n + 4u <= n1; n += NSG * 4u) {
@@ -571,6 +838,32 @@ void op_gemv_glu_mxfp4(const thread Inst& in, device const ulong* tab, uint slic
     uint ldw = K / 2u, lds = (K + 31u) / 32u;
     uint n0, n1;
     range(N, slice, nblk, n0, n1);
+#ifdef PLOW_MX4_FOUR_ROWS
+    if (M == 4 && (K % 32u) == 0) {
+        for (uint n = n0 + sg; n < n1; n += NSG) {
+            float4 g = dot_mx4_quad(Wg + n * ldw, Sg + n * lds, x, K, lane);
+            float4 u = dot_mx4_quad(Wu + n * ldw, Su + n * lds, x, K, lane);
+            if (lane == 0) {
+                C[n] = f2bf(glu_pair(g.x, u.x, act, f0, f1));
+                C[N+n] = f2bf(glu_pair(g.y, u.y, act, f0, f1));
+                C[2u*N+n] = f2bf(glu_pair(g.z, u.z, act, f0, f1));
+                C[3u*N+n] = f2bf(glu_pair(g.w, u.w, act, f0, f1));
+            }
+        }
+        return;
+    }
+#endif
+    if (M == 2 && (K % 32u) == 0) {
+        for (uint n = n0 + sg; n < n1; n += NSG) {
+            float2 g = dot_mx4_pair(Wg + n * ldw, Sg + n * lds, x, K, lane);
+            float2 u = dot_mx4_pair(Wu + n * ldw, Su + n * lds, x, K, lane);
+            if (lane == 0) {
+                C[n] = f2bf(glu_pair(g.x, u.x, act, f0, f1));
+                C[N+n] = f2bf(glu_pair(g.y, u.y, act, f0, f1));
+            }
+        }
+        return;
+    }
     for (uint n = n0 + sg; n < n1; n += NSG)
         for (uint m = 0; m < M; m++) {
             float g = dot_mx4(Wg + n * ldw, Sg + n * lds, x + m * K, K, lane);
@@ -619,6 +912,12 @@ inline ushort4 load_b16(thread const GemmArgs& g, uint n, uint k) {
     const uint N = g.N, K = g.K;
     if (n >= N || k >= K) return ushort4(0);
     n = n * g.rs + g.ro;
+    if (g.AQ4) {
+        uint q = g.AQ4[ulong(n) * (K / 8u) + k / 8u] >> ((k % 8u) * 4u);
+        ulong group = ulong(n) * (K / 64u) + k / 64u;
+        float s = bf2f(g.AQScale[group]), b = bf2f(g.AQBias[group]);
+        return f4bf(float4(q & 15u, (q >> 4) & 15u, (q >> 8) & 15u, (q >> 12) & 15u) * s + b);
+    }
     if (g.B4) {
         // Two packed bytes hold the k-quad; the block scale is a power of two, so the product is
         // exact in bf16.
@@ -640,8 +939,13 @@ inline ushort4 load_b16(thread const GemmArgs& g, uint n, uint k) {
         for (uint j = 0; j < 4u && k + j < K; j++) v[j] = f2bf(e4m3_exact(g.B8[n * K + k + j]));
         return v;
     }
-    if ((K & 3u) == 0u)
+    if ((K & 3u) == 0u) {
+#ifdef PLOW_FP8_CAST_BASELINE
         return g.B8 ? f4bf(e4m3x4(*(device const uchar4*)(g.B8 + n * K + k))) : *(device const ushort4*)(g.B16 + n * K + k);
+#else
+        return g.B8 ? e4m3bf4(*(device const uchar4*)(g.B8 + n * K + k)) : *(device const ushort4*)(g.B16 + n * K + k);
+#endif
+    }
     ushort4 v = ushort4(0);
     for (uint j = 0; j < 4u && k + j < K; j++) v[j] = g.B8 ? f2bf(e4m3(g.B8[n * K + k + j])) : g.B16[n * K + k + j];
     return v;
@@ -874,6 +1178,65 @@ void op_gemm(const thread Inst& in, device const ulong* tab, uint slice, uint nb
         gemm_tile2(g, C, N, m0, m1, n0, n1, BN, tile, lid, sg, lane);
     }
 }
+void op_affine_q4(const thread Inst& in, device const ulong* tab, uint slice, uint nblk,
+                  bool gemm, threadgroup float* tile, uint lid, uint sg, uint lane) {
+    uint M = in.i[0], N = in.i[1], K = in.i[2];
+    if (!nblk || slice >= nblk || !M || !N) return;
+    device ushort* C = ten<ushort>(tab, in, 0);
+    if (!C) return;
+    C += ulong(in.i[5]) * N;
+    GemmArgs g;
+    gemm_args_reset(g);
+    g.A = ten<ushort>(tab, in, 1);
+    g.AQ4 = ten<uint>(tab, in, 2);
+    g.AQScale = ten<ushort>(tab, in, 3);
+    g.AQBias = ten<ushort>(tab, in, 4);
+    g.M = M; g.N = N; g.K = K;
+    bool valid = K && !(K % 64u) && !in.i[3] && g.A && g.AQ4 && g.AQScale && g.AQBias;
+    if (valid) g.A += ulong(in.i[4]) * K;
+    if (gemm) {
+        ulong tn = (ulong(N) + 63u) / 64u, tm = (ulong(M) + 63u) / 64u;
+        for (ulong t = slice; t < tm * tn; t += nblk) {
+            uint m0 = uint(t / tn) * 64u, n0 = uint(t % tn) * 64u;
+            uint m1 = m0 + min(64u, M - m0), n1 = n0 + min(64u, N - n0);
+            if (valid) gemm_tile2(g, C, N, m0, m1, n0, n1, 64u, tile, lid, sg, lane);
+            else for (uint e = lid; e < (m1 - m0) * (n1 - n0); e += NT)
+                C[ulong(m0 + e / (n1 - n0)) * N + n0 + e % (n1 - n0)] = ushort(0x7fc1);
+        }
+        return;
+    }
+    uint n0, n1;
+    range(N, slice, nblk, n0, n1);
+    for (uint m = 0; m < M; m++) for (uint n = n0 + sg * 4u; n < n1; n += NSG * 4u) {
+        float acc[4] = {0, 0, 0, 0};
+        uint rows = min(4u, n1 - n);
+        if (valid) for (uint k = lane * 16u; k < K; k += 512u) {
+            float xs[16], sum = 0;
+            for (uint j = 0; j < 16u; j += 4u) {
+                float4 x = bf4(*(device const ushort4*)(g.A + ulong(m) * K + k + j));
+                sum += rbf(rbf(rbf(x.x + x.y) + x.z) + x.w);
+                xs[j] = x.x; xs[j + 1] = x.y / 16.0f;
+                xs[j + 2] = x.z / 256.0f; xs[j + 3] = x.w / 4096.0f;
+            }
+            for (uint r = 0; r < rows; r++) {
+                device const uint* w = g.AQ4 + ulong(n + r) * (K / 8u) + k / 8u;
+                float dot = 0;
+                for (uint j = 0; j < 4u; j++) {
+                    uint h = (w[j / 2u] >> ((j % 2u) * 16u)) & 65535u;
+                    dot += float(h & 15u) * xs[j * 4u] + float(h & 240u) * xs[j * 4u + 1u]
+                         + float(h & 3840u) * xs[j * 4u + 2u] + float(h & 61440u) * xs[j * 4u + 3u];
+                }
+                ulong p = ulong(n + r) * (K / 64u) + k / 64u;
+                acc[r] += bf2f(g.AQScale[p]) * dot + bf2f(g.AQBias[p]) * sum;
+            }
+        }
+        for (uint r = 0; r < rows; r++) {
+            float v = simd_sum(acc[r]);
+            if (lane == 0) C[ulong(m) * N + n + r] = valid ? f2bf(v) : ushort(0x7fc1);
+        }
+    }
+}
+
 // GLU: t0=fu t1=A t2=Wg t5=Wu t6=bias_g? t7=bias_u? i5=act (bf16) / t3=a_scale? t4=g_scale t6=u_scale (fp8)
 // 64x32 sub-tiles: chunk buffer = A 64x16 | Bg 32x16 | Bu 32x16 (2048 floats), double-buffered;
 // simdgroup sg owns the 8x8 block (rows sg/4*8, cols sg%4*8): one gate + one up accumulator.
@@ -1136,6 +1499,16 @@ void op_headnorm_rope(const thread Inst& in, device const ulong* tab, uint slice
 }
 
 // ---- pointwise ---------------------------------------------------------------------------------------
+void op_glu(const thread Inst& in, device const ulong* tab, uint slice, uint nblk, uint lid) {
+    device ushort* out = ten<ushort>(tab, in, 0);
+    device const ushort* gate = ten<ushort>(tab, in, 1);
+    device const ushort* up = ten<ushort>(tab, in, 2);
+    float f0 = as_type<float>(in.fj[0]), f1 = as_type<float>(in.fj[1]);
+    uint lo, hi;
+    range(in.i[0], slice, nblk, lo, hi);
+    for (uint i = lo + lid; i < hi; i += NT)
+        out[i] = f2bf(glu_pair(bf2f(gate[i]), bf2f(up[i]), in.i[1], f0, f1));
+}
 void op_residual(const thread Inst& in, device const ulong* tab, uint slice, uint nblk, uint lid) {
     device ushort* out = ten<ushort>(tab, in, 0);
     device const ushort* a = ten<ushort>(tab, in, 1);
@@ -1457,7 +1830,11 @@ void op_flash_decode(const thread Inst& in, device const ulong* tab, uint slice,
     float scale = as_type<float>(in.fj[0]);
     if (D > 512u || (D & 31u) || nsplit == 0u) return;
     uint gqa = n_head / n_kv_head;
+#ifdef PLOW_DECODE_HEADS
+    uint gf = 1u;
+#else
     uint gf = gqa % FA_GF == 0u ? FA_GF : 1u;
+#endif
     uint n_grp = (n_head + gf - 1) / gf;
     uint n_work = n_batch * n_grp * nsplit;
     uint per = D / 32u;
@@ -1562,9 +1939,11 @@ void op_flash_merge(const thread Inst& in, device const ulong* tab, uint slice, 
 // Op 155: Gemma-4 E-series per-layer input block, in place on x (dev_isa.h). One threadgroup per
 // row: 32 simdgroups compute the P gate dots (lanes strided over H), the products land in `tile`,
 // every thread then owns H/NT rows of the projection, and the two norms reduce through `red`.
-// Needs P + H <= TILE_FLOATS (E4B: 256 + 2560).
-void op_per_layer_input(const thread Inst& in, device const ulong* tab, uint slice, uint nblk,
+// Projection values must not overlap the reduction scratch (E4B: 256 + 2560).
+bool op_per_layer_input(const thread Inst& in, device const ulong* tab, uint slice, uint nblk,
                         threadgroup float* tile, threadgroup float* red, uint lid, uint sg, uint lane) {
+    uint rows = in.i[0], H = in.i[1], P = in.i[2], col0 = in.i[3], stride = in.i[4];
+    if (P > TILE_FLOATS - NSG || H > TILE_FLOATS - NSG - P || (P & 7u)) return false;
     device ushort* x = ten<ushort>(tab, in, 0);
     device const ushort* wg = ten<ushort>(tab, in, 1);
     device const ushort* wp = ten<ushort>(tab, in, 2);
@@ -1572,17 +1951,11 @@ void op_per_layer_input(const thread Inst& in, device const ulong* tab, uint sli
     device const ushort* ple = ten<ushort>(tab, in, 4);
     device ushort* hn = ten<ushort>(tab, in, 5);
     device const ushort* gnext = ten<ushort>(tab, in, 6);
-    uint rows = in.i[0], H = in.i[1], P = in.i[2], col0 = in.i[3], stride = in.i[4];
     float eps = as_type<float>(in.fj[0]), ls = as_type<float>(in.fj[1]);
     threadgroup float* a = tile;
     threadgroup float* y = tile + P;
     for (uint t = slice; t < rows; t += nblk) {
         device ushort* xr = x + ulong(t) * H;
-        if (P + H > TILE_FLOATS || (P & 7u)) {
-            // Same failure as the golden: a poisoned row, never a silent skip.
-            for (uint h = lid; h < H; h += NT) xr[h] = 0x7FC0;
-            continue;
-        }
         device const ushort* pr = ple + ulong(t) * stride + col0;
         // Gate: one simdgroup per output p, lanes over H (the GEMV family's dot).
         for (uint p = sg; p < P; p += NSG) {
@@ -1632,6 +2005,7 @@ void op_per_layer_input(const thread Inst& in, device const ulong* tab, uint sli
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+    return true;
 }
 
 // ---- GPT-OSS flat MXFP4 MoE: router/align/combine (83/84/87) and the expert GEMMs (150-153) ----
@@ -1988,16 +2362,657 @@ void op_moe_down_mx_pf(const thread Inst& in, device const ulong* tab, uint slic
     }
 }
 
+// ---- backend-neutral FP32 primitives ------------------------------------------------------------
+void op_q8_gemm_f32(const thread Inst& in, device const ulong* tab, uint slice,
+                    threadgroup float* tile, uint lid, uint sg, uint lane) {
+    uint M = in.i[0], N = in.i[1], K = in.i[2], activation = in.i[3];
+    device float* C = ten<float>(tab, in, 0);
+    device const float* A = ten<float>(tab, in, 1) + ulong(in.i[4]) * K;
+    device const uchar* W = ten<uchar>(tab, in, 2);
+    device const float* bias = ten<float>(tab, in, 3);
+    uint nt = (N + 63u) / 64u, row0 = (slice / nt) * 128u, col = (slice % nt) * 64u;
+    uint cluster = sg / 8u, local_sg = sg % 8u, row = row0 + cluster * 32u;
+    uint sr = (local_sg / 4u) * 16u, sc = (local_sg % 4u) * 16u;
+    uint row_bytes = (K / 32u) * 34u;
+    threadgroup float* at = tile + cluster * 1024u;
+    threadgroup float* bt = tile + 4096u;
+    simdgroup_float8x8 a0(0.0f), a1(0.0f), a2(0.0f), a3(0.0f);
+    for (uint base = 0; base < K; base += 32u) {
+        for (uint e = lid; e < 4096u; e += NT) {
+            uint r = e / 32u, c = e % 32u;
+            tile[e] = row0 + r < M ? A[ulong(row0 + r) * K + base + c] : 0.0f;
+        }
+        for (uint e = lid; e < 2048u; e += NT) {
+            uint r = e / 32u, c = e % 32u;
+            if (col + r < N) {
+                device const uchar* block = W + ulong(col + r) * row_bytes + (base / 32u) * 34u;
+                ushort hs = ushort(block[0]) | ushort(ushort(block[1]) << 8u);
+                bt[e] = float(as_type<char>(block[2u + c])) * float(as_type<half>(hs));
+            } else bt[e] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint q = 0; q < 32u; q += 8u) {
+            simdgroup_float8x8 ar0, ar1, br0, br1;
+            simdgroup_load(ar0, at + sr * 32u + q, 32);
+            simdgroup_load(ar1, at + (sr + 8u) * 32u + q, 32);
+            simdgroup_load(br0, bt + sc * 32u + q, 32, ulong2(0), true);
+            simdgroup_load(br1, bt + (sc + 8u) * 32u + q, 32, ulong2(0), true);
+            simdgroup_multiply_accumulate(a0, ar0, br0, a0);
+            simdgroup_multiply_accumulate(a1, ar0, br1, a1);
+            simdgroup_multiply_accumulate(a2, ar1, br0, a2);
+            simdgroup_multiply_accumulate(a3, ar1, br1, a3);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    uint quad = lane / 4u, fr = (quad & 4u) + ((lane / 2u) % 4u);
+    uint fc = (quad & 2u) * 2u + (lane % 2u) * 2u;
+    for (uint e = 0; e < 2u; e++) {
+        uint r = row + sr + fr, c = col + sc + fc + e;
+        float values[4] = {a0.thread_elements()[e], a1.thread_elements()[e],
+                           a2.thread_elements()[e], a3.thread_elements()[e]};
+        uint rr[4] = {r, r, r + 8u, r + 8u};
+        uint cc[4] = {c, c + 8u, c, c + 8u};
+        for (uint z = 0; z < 4u; z++) if (rr[z] < M && cc[z] < N) {
+            float v = values[z] + (bias ? bias[cc[z]] : 0.0f);
+            C[ulong(rr[z]) * N + cc[z]] = activation == 1u ? siluf(v) : v;
+        }
+    }
+}
+
+void op_dense_gemm_f32(const thread Inst& in, device const ulong* tab, uint slice,
+                       threadgroup float* tile, uint lid, uint sg, uint lane) {
+    uint M = in.i[0], N = in.i[1], K = in.i[2], activation = in.i[3];
+    uint weight_stride = in.i[5] ? in.i[5] : K, onehot = in.i[6];
+    uint flags = in.i[7];
+    device float* C = ten<float>(tab, in, 0);
+    device const float* A = ten<float>(tab, in, 1) + ulong(in.i[4]) * K;
+    device const float* W = ten<float>(tab, in, 2);
+    device const ushort* Wbf = ten<ushort>(tab, in, 2);
+    device const float* bias = ten<float>(tab, in, 3);
+    uint nt = (N + 63u) / 64u, row0 = (slice / nt) * 128u, col = (slice % nt) * 64u;
+    uint cluster = sg / 8u, local_sg = sg % 8u, row = row0 + cluster * 32u;
+    uint sr = (local_sg / 4u) * 16u, sc = (local_sg % 4u) * 16u;
+    threadgroup float* at = tile + cluster * 1024u;
+    threadgroup float* bt = tile + 4096u;
+    simdgroup_float8x8 a0(0.0f), a1(0.0f), a2(0.0f), a3(0.0f);
+    for (uint base = 0; base < K; base += 32u) {
+        for (uint e = lid; e < 4096u; e += NT) {
+            uint r = e / 32u, c = e % 32u;
+            tile[e] = row0 + r < M && base + c < K ? A[ulong(row0 + r) * K + base + c] : 0.0f;
+        }
+        for (uint e = lid; e < 2048u; e += NT) {
+            uint r = e / 32u, c = e % 32u;
+            ulong wi = ulong(col + r) * weight_stride + base + c;
+            bt[e] = col + r < N && base + c < K
+                ? (flags & 4u ? as_type<float>(uint(Wbf[wi]) << 16u) : W[wi]) : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint q = 0; q < 32u; q += 8u) {
+            simdgroup_float8x8 ar0, ar1, br0, br1;
+            simdgroup_load(ar0, at + sr * 32u + q, 32);
+            simdgroup_load(ar1, at + (sr + 8u) * 32u + q, 32);
+            simdgroup_load(br0, bt + sc * 32u + q, 32, ulong2(0), true);
+            simdgroup_load(br1, bt + (sc + 8u) * 32u + q, 32, ulong2(0), true);
+            simdgroup_multiply_accumulate(a0, ar0, br0, a0);
+            simdgroup_multiply_accumulate(a1, ar0, br1, a1);
+            simdgroup_multiply_accumulate(a2, ar1, br0, a2);
+            simdgroup_multiply_accumulate(a3, ar1, br1, a3);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    uint quad = lane / 4u, fr = (quad & 4u) + ((lane / 2u) % 4u);
+    uint fc = (quad & 2u) * 2u + (lane % 2u) * 2u;
+    for (uint e = 0; e < 2u; e++) {
+        uint r = row + sr + fr, c = col + sc + fc + e;
+        float values[4] = {a0.thread_elements()[e], a1.thread_elements()[e],
+                           a2.thread_elements()[e], a3.thread_elements()[e]};
+        uint rr[4] = {r, r, r + 8u, r + 8u};
+        uint cc[4] = {c, c + 8u, c, c + 8u};
+        for (uint z = 0; z < 4u; z++) if (rr[z] < M && cc[z] < N) {
+            float value = values[z] + (bias ? bias[cc[z]] : 0.0f);
+            if (in.i[5] && onehot < weight_stride) {
+                ulong wi = ulong(cc[z]) * weight_stride + onehot;
+                value += flags & 4u ? as_type<float>(uint(Wbf[wi]) << 16u) : W[wi];
+            }
+            if (flags & 2u) value = gelu_erf_bf16(value);
+            else if (flags & 1u) value = round_bf16_f32(value);
+            C[ulong(rr[z]) * N + cc[z]] = activation == 1u ? max(value, 0.0f) : value;
+        }
+    }
+}
+
+void op_conv2d_f32(const thread Inst& in, device const ulong* tab, uint slice,
+                       threadgroup float* tile, uint lid, uint sg, uint lane) {
+    uint frames = in.i[0], width = in.i[1], input_channels = in.i[2];
+    uint output_channels = in.i[3], filter_size = in.i[4], step = in.i[5];
+    uint pad_before = in.i[6], pad_after = in.i[7], flags = in.fj[1];
+    uint batches = in.fj[2] ? in.fj[2] : 1u;
+    if (!filter_size || !step || frames + pad_before + pad_after < filter_size ||
+        width + pad_before + pad_after < filter_size) return;
+    uint output_frames = (frames + pad_before + pad_after - filter_size) / step + 1u;
+    uint output_width = (width + pad_before + pad_after - filter_size) / step + 1u;
+    bool depthwise = (flags & 1u) != 0u, relu = (flags & 2u) != 0u;
+    uint output_layout = (flags >> 2u) & 3u, input_layout = (flags >> 4u) & 3u;
+    bool weight_f32 = (flags & 64u) != 0u, gelu = (flags & 128u) != 0u;
+    if (output_layout > 2u || input_layout > 2u) return;
+    device float* out = ten<float>(tab, in, 0);
+    device const float* x = ten<float>(tab, in, 1);
+    device const uchar* weight_raw = ten<uchar>(tab, in, 2);
+    device const half* weight_h = (device const half*)weight_raw;
+    device const float* weight_f = (device const float*)weight_raw;
+    device const float* bias = ten<float>(tab, in, 3);
+
+    if (filter_size == 3u && (input_layout == 2u || (input_layout == 0u && input_channels == 1u)) &&
+        output_layout == 2u && !depthwise) {
+        uint spatial = output_frames * output_width, M = batches * spatial;
+        uint N = output_channels, K = input_channels * 9u;
+        uint ntiles = (N + 63u) / 64u, row0 = (slice / ntiles) * 128u;
+        uint col = (slice % ntiles) * 64u;
+        uint cluster = sg / 8u, local_sg = sg % 8u, row = row0 + cluster * 32u;
+        uint simd_row = (local_sg / 4u) * 16u, simd_col = (local_sg % 4u) * 16u;
+        threadgroup float* at = tile + cluster * 1024u;
+        threadgroup float* bt = tile + 4096u;
+        simdgroup_float8x8 acc0(0.0f), acc1(0.0f), acc2(0.0f), acc3(0.0f);
+        for (uint base = 0u; base < K; base += 32u) {
+            for (uint e = lid; e < 4096u; e += NT) {
+                uint r = e / 32u, c = e % 32u, flat_row = row0 + r, q = base + c;
+                uint batch = flat_row / spatial, pos = flat_row % spatial;
+                int input_frame = int((pos / output_width) * step + (q % 9u) / 3u) -
+                                  int(pad_before);
+                int input_x = int((pos % output_width) * step + q % 3u) - int(pad_before);
+                tile[e] = flat_row < M && q < K && input_frame >= 0 &&
+                                  input_frame < int(frames) && input_x >= 0 && input_x < int(width)
+                    ? x[((ulong(batch) * input_channels + q / 9u) * frames +
+                         uint(input_frame)) * width + uint(input_x)]
+                    : 0.0f;
+            }
+            for (uint e = lid; e < 2048u; e += NT) {
+                uint r = e / 32u, c = e % 32u;
+                ulong wi = ulong(col + r) * K + base + c;
+                bt[e] = col + r < N && base + c < K
+                    ? (weight_f32 ? weight_f[wi] : float(weight_h[wi])) : 0.0f;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint q = 0u; q < 32u; q += 8u) {
+                simdgroup_float8x8 a0, a1, b0, b1;
+                simdgroup_load(a0, at + simd_row * 32u + q, 32);
+                simdgroup_load(a1, at + (simd_row + 8u) * 32u + q, 32);
+                simdgroup_load(b0, bt + simd_col * 32u + q, 32, ulong2(0), true);
+                simdgroup_load(b1, bt + (simd_col + 8u) * 32u + q, 32, ulong2(0), true);
+                simdgroup_multiply_accumulate(acc0, a0, b0, acc0);
+                simdgroup_multiply_accumulate(acc1, a0, b1, acc1);
+                simdgroup_multiply_accumulate(acc2, a1, b0, acc2);
+                simdgroup_multiply_accumulate(acc3, a1, b1, acc3);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        uint quad = lane / 4u, fr = (quad & 4u) + ((lane / 2u) % 4u);
+        uint fc = (quad & 2u) * 2u + (lane % 2u) * 2u;
+        for (uint e = 0u; e < 2u; e++) {
+            uint r = row + simd_row + fr, c = col + simd_col + fc + e;
+            uint rr[4] = {r, r, r + 8u, r + 8u};
+            uint cc[4] = {c, c + 8u, c, c + 8u};
+            float values[4] = {acc0.thread_elements()[e], acc1.thread_elements()[e],
+                               acc2.thread_elements()[e], acc3.thread_elements()[e]};
+            for (uint z = 0u; z < 4u; z++) if (rr[z] < M && cc[z] < N) {
+                float value = values[z] + bias[cc[z]];
+                if (gelu) value = gelu_erf_bf16(value);
+                if (relu) value = max(value, 0.0f);
+                uint batch = rr[z] / spatial, pos = rr[z] % spatial;
+                out[(ulong(batch) * output_channels + cc[z]) * spatial + pos] = value;
+            }
+        }
+        return;
+    }
+
+    if (filter_size == 1u && step == 1u && pad_before == 0u && pad_after == 0u &&
+        !depthwise && input_layout == 0u) {
+        uint M = batches * output_frames * output_width, N = output_channels, K = input_channels;
+        uint ntiles = (N + 63u) / 64u, row0 = (slice / ntiles) * 128u;
+        uint col = (slice % ntiles) * 64u;
+        uint cluster = sg / 8u, local_sg = sg % 8u, row = row0 + cluster * 32u;
+        uint simd_row = (local_sg / 4u) * 16u, simd_col = (local_sg % 4u) * 16u;
+        threadgroup float* at = tile + cluster * 1024u;
+        threadgroup float* bt = tile + 4096u;
+        simdgroup_float8x8 acc0(0.0f), acc1(0.0f), acc2(0.0f), acc3(0.0f);
+        for (uint base = 0u; base < K; base += 32u) {
+            for (uint e = lid; e < 4096u; e += NT) {
+                uint r = e / 32u, c = e % 32u;
+                tile[e] = row0 + r < M && base + c < K
+                    ? x[ulong(row0 + r) * K + base + c] : 0.0f;
+            }
+            for (uint e = lid; e < 2048u; e += NT) {
+                uint r = e / 32u, c = e % 32u;
+                ulong wi = ulong(col + r) * K + base + c;
+                bt[e] = col + r < N && base + c < K
+                    ? (weight_f32 ? weight_f[wi] : float(weight_h[wi])) : 0.0f;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint q = 0u; q < 32u; q += 8u) {
+                simdgroup_float8x8 a0, a1, b0, b1;
+                simdgroup_load(a0, at + simd_row * 32u + q, 32);
+                simdgroup_load(a1, at + (simd_row + 8u) * 32u + q, 32);
+                simdgroup_load(b0, bt + simd_col * 32u + q, 32, ulong2(0), true);
+                simdgroup_load(b1, bt + (simd_col + 8u) * 32u + q, 32, ulong2(0), true);
+                simdgroup_multiply_accumulate(acc0, a0, b0, acc0);
+                simdgroup_multiply_accumulate(acc1, a0, b1, acc1);
+                simdgroup_multiply_accumulate(acc2, a1, b0, acc2);
+                simdgroup_multiply_accumulate(acc3, a1, b1, acc3);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        uint quad = lane / 4u, fr = (quad & 4u) + ((lane / 2u) % 4u);
+        uint fc = (quad & 2u) * 2u + (lane % 2u) * 2u;
+        for (uint e = 0u; e < 2u; e++) {
+            uint rr[4] = {row + simd_row + fr, row + simd_row + fr,
+                          row + simd_row + fr + 8u, row + simd_row + fr + 8u};
+            uint cc[4] = {col + simd_col + fc + e, col + simd_col + fc + e + 8u,
+                          col + simd_col + fc + e, col + simd_col + fc + e + 8u};
+            float values[4] = {acc0.thread_elements()[e], acc1.thread_elements()[e],
+                               acc2.thread_elements()[e], acc3.thread_elements()[e]};
+            for (uint z = 0u; z < 4u; z++) if (rr[z] < M && cc[z] < N) {
+                float value = values[z] + bias[cc[z]];
+                if (gelu) value = gelu_erf_bf16(value);
+                if (relu) value = max(value, 0.0f);
+                uint batch = rr[z] / (output_frames * output_width);
+                uint spatial = rr[z] % (output_frames * output_width);
+                uint output_frame = spatial / output_width, output_x = spatial % output_width;
+                ulong oi;
+                if (output_layout == 0u)
+                    oi = (ulong(rr[z]) * output_channels) + cc[z];
+                else if (output_layout == 1u)
+                    oi = ((ulong(batch) * output_frames + output_frame) * output_channels + cc[z]) *
+                             output_width + output_x;
+                else
+                    oi = ((ulong(batch) * output_channels + cc[z]) * output_frames + output_frame) *
+                             output_width + output_x;
+                out[oi] = value;
+            }
+        }
+        return;
+    }
+
+    ulong count = ulong(batches) * output_frames * output_width * output_channels;
+    ulong index = ulong(slice) * NT + lid;
+    if (index >= count) return;
+    uint output_channel = uint(index % output_channels);
+    uint output_x = uint((index / output_channels) % output_width);
+    uint output_frame = uint((index / (ulong(output_channels) * output_width)) % output_frames);
+    uint batch = uint(index / (ulong(output_channels) * output_width * output_frames));
+    uint channel_start = depthwise ? output_channel : 0u;
+    uint channel_end = depthwise ? output_channel + 1u : input_channels;
+    uint stored_channels = depthwise ? 1u : input_channels;
+    float sum = bias[output_channel];
+    for (uint ky = 0u; ky < filter_size; ky++) {
+        int input_frame = int(output_frame * step + ky) - int(pad_before);
+        if (input_frame < 0 || input_frame >= int(frames)) continue;
+        for (uint kx = 0u; kx < filter_size; kx++) {
+            int input_x = int(output_x * step + kx) - int(pad_before);
+            if (input_x < 0 || input_x >= int(width)) continue;
+            for (uint input_channel = channel_start; input_channel < channel_end; input_channel++) {
+                uint weight_channel = depthwise ? 0u : input_channel;
+                ulong wi = (((ulong(output_channel) * stored_channels + weight_channel) * filter_size + ky)
+                            * filter_size) + kx;
+                ulong xi;
+                if (input_layout == 0u)
+                    xi = ((ulong(batch) * frames + uint(input_frame)) * width + uint(input_x)) *
+                             input_channels + input_channel;
+                else if (input_layout == 1u)
+                    xi = ((ulong(batch) * frames + uint(input_frame)) * input_channels +
+                          input_channel) * width + uint(input_x);
+                else
+                    xi = ((ulong(batch) * input_channels + input_channel) * frames +
+                          uint(input_frame)) * width + uint(input_x);
+                sum = fma(x[xi], weight_f32 ? weight_f[wi] : float(weight_h[wi]), sum);
+            }
+        }
+    }
+    if (gelu) sum = gelu_erf_bf16(sum);
+    if (relu) sum = max(sum, 0.0f);
+    ulong oi;
+    if (output_layout == 0u)
+        oi = ((ulong(batch) * output_frames + output_frame) * output_width + output_x) *
+                 output_channels + output_channel;
+    else if (output_layout == 1u)
+        oi = ((ulong(batch) * output_frames + output_frame) * output_channels + output_channel) *
+                 output_width + output_x;
+    else
+        oi = ((ulong(batch) * output_channels + output_channel) * output_frames + output_frame) *
+                 output_width + output_x;
+    out[oi] = sum;
+}
+
+void op_pack_ncfw_rows_f32(const thread Inst& in, device const ulong* tab, uint slice,
+                           uint lid) {
+    device float* out = ten<float>(tab, in, 0);
+    device const float* x = ten<float>(tab, in, 1);
+    uint rows = in.i[0], channels = in.i[1], frames = in.i[2], width = in.i[3], batches = in.i[4];
+    ulong count = ulong(rows) * channels * frames;
+    ulong index = ulong(slice) * NT + lid;
+    if (!rows || !channels || !frames || !width || !batches ||
+        ulong(rows) > ulong(batches) * width || channels > 0xffffffffu / frames || index >= count)
+        return;
+    uint row_width = channels * frames;
+    uint row = uint(index / row_width), column = uint(index % row_width);
+    uint batch = row / width, position = row % width;
+    uint channel = column / frames, frame = column % frames;
+    out[index] = x[((ulong(batch) * channels + channel) * frames + frame) * width + position];
+}
+
+void op_layernorm_f32(const thread Inst& in, device const ulong* tab, uint slice, uint nblk,
+                      threadgroup float* red, uint lid, uint sg, uint lane) {
+    device float* out = ten<float>(tab, in, 0);
+    device const float* x = ten<float>(tab, in, 1);
+    device const float* gamma = ten<float>(tab, in, 2);
+    device const float* beta = ten<float>(tab, in, 3);
+    uint rows = in.i[0], feat = in.i[1];
+    if (in.i[2] & 2u) {
+        for (uint row = slice * NSG + sg; row < rows; row += nblk * NSG) {
+            ulong base = ulong(row) * feat;
+            float mean = 0.0f;
+            if (lane == 0u) {
+                for (uint i = 0u; i < feat; i++) mean += x[base + i];
+                mean /= float(feat);
+            }
+            mean = simd_broadcast(mean, 0u);
+            float inv = 0.0f;
+            if (lane == 0u) {
+                float variance = 0.0f;
+                for (uint i = 0u; i < feat; i++) {
+                    float value = x[base + i] - mean;
+                    variance += value * value;
+                }
+                inv = rsqrt(variance / float(feat) + as_type<float>(in.fj[0]));
+            }
+            inv = simd_broadcast(inv, 0u);
+            for (uint i = lane; i < feat; i += 32u) {
+                float value = (x[base + i] - mean) * inv * (gamma ? gamma[i] : 1.0f) +
+                              (beta ? beta[i] : 0.0f);
+                out[base + i] = in.i[2] & 1u ? round_bf16_f32(value) : value;
+            }
+        }
+        return;
+    }
+    for (uint row = slice; row < rows; row += nblk) {
+        ulong base = ulong(row) * feat;
+        float sum = 0.0f;
+        for (uint i = lid; i < feat; i += NT) sum += x[base + i];
+        float mean = tg_sum(sum, red, lid, sg, lane) / float(feat);
+        float ss = 0.0f;
+        for (uint i = lid; i < feat; i += NT) { float v = x[base + i] - mean; ss = fma(v, v, ss); }
+        float inv = rsqrt(tg_sum(ss, red, lid, sg, lane) / float(feat) + as_type<float>(in.fj[0]));
+        for (uint i = lid; i < feat; i += NT) {
+            float value = (x[base + i] - mean) * inv * (gamma ? gamma[i] : 1.0f) +
+                          (beta ? beta[i] : 0.0f);
+            out[base + i] = in.i[2] & 1u ? round_bf16_f32(value) : value;
+        }
+    }
+}
+
+void op_scaled_add_f32(const thread Inst& in, device const ulong* tab, uint slice, uint nblk, uint lid) {
+    device float* out = ten<float>(tab, in, 0);
+    device const float* a = ten<float>(tab, in, 1);
+    device const float* b = ten<float>(tab, in, 2);
+    uint lo, hi; range(in.i[0], slice, nblk, lo, hi);
+    float scale = as_type<float>(in.fj[0]);
+    for (uint i = lo + lid; i < hi; i += NT) {
+        float value = fma(scale, b[i], a[i]);
+        out[i] = in.i[1] & 1u ? round_bf16_f32(value) : value;
+    }
+}
+
+void op_glu_f32(const thread Inst& in, device const ulong* tab, uint slice, uint nblk, uint lid) {
+    device float* out = ten<float>(tab, in, 0);
+    device const float* x = ten<float>(tab, in, 1);
+    uint rows = in.i[0], width = in.i[1], lo, hi; range(rows * width, slice, nblk, lo, hi);
+    for (uint i = lo + lid; i < hi; i += NT) {
+        uint row = i / width, col = i % width;
+        out[i] = x[ulong(row) * 2u * width + col] * sigmoidf(x[ulong(row) * 2u * width + width + col]);
+    }
+}
+
+void op_silu_f32(const thread Inst& in, device const ulong* tab, uint slice, uint nblk, uint lid) {
+    device float* out = ten<float>(tab, in, 0);
+    device const float* x = ten<float>(tab, in, 1);
+    uint lo, hi; range(in.i[0], slice, nblk, lo, hi);
+    for (uint i = lo + lid; i < hi; i += NT) out[i] = siluf(x[i]);
+}
+
+void op_embed_f16_f32(const thread Inst& in, device const ulong* tab,
+                      uint slice, uint nblk, uint lid) {
+    device float* out = ten<float>(tab, in, 0);
+    device const half* table = ten<half>(tab, in, 1);
+    device const uint* token = ten<uint>(tab, in, 2);
+    uint vocab = in.i[0], width = in.i[1], lo, hi; range(width, slice, nblk, lo, hi);
+    if (*token >= vocab) return;
+    for (uint i = lo + lid; i < hi; i += NT) out[i] = float(table[ulong(*token) * width + i]);
+}
+
+void op_embed_overlay_bf16(const thread Inst& in, device const ulong* tab,
+                           uint slice, uint nblk, uint lid) {
+    device ushort* out = ten<ushort>(tab, in, 0);
+    device const ushort* table = ten<ushort>(tab, in, 1);
+    device const uint* tokens = ten<uint>(tab, in, 2);
+    device const float* overlay = ten<float>(tab, in, 3);
+    device const uint* overlay_index = ten<uint>(tab, in, 4);
+    uint rows = in.i[0], width = in.i[1], vocab = in.i[2], overlay_rows = in.i[3];
+    if (!rows || !width || !vocab || rows > UINT_MAX / width) return;
+    uint lo, hi; range(rows * width, slice, nblk, lo, hi);
+    for (uint index = lo + lid; index < hi; index += NT) {
+        uint row = index / width, column = index % width, selected = overlay_index[row];
+        if (selected == UINT_MAX) {
+            if (tokens[row] >= vocab) return;
+            out[index] = table[ulong(tokens[row]) * width + column];
+        } else {
+            if (selected >= overlay_rows) return;
+            out[index] = f2bf(overlay[ulong(selected) * width + column]);
+        }
+    }
+}
+
+void op_lstm_cell_f32(const thread Inst& in, device const ulong* tab,
+                      uint slice, uint nblk, uint lid) {
+    device float* h = ten<float>(tab, in, 0);
+    device float* c = ten<float>(tab, in, 1);
+    device const float* gates = ten<float>(tab, in, 2);
+    device const float* previous = ten<float>(tab, in, 3);
+    uint width = in.i[0], lo, hi; range(width, slice, nblk, lo, hi);
+    for (uint i = lo + lid; i < hi; i += NT) {
+        float cell = fma(sigmoidf(gates[width + i]), previous[i],
+                         sigmoidf(gates[i]) * tanh(gates[2u * width + i]));
+        c[i] = cell;
+        h[i] = sigmoidf(gates[3u * width + i]) * tanh(cell);
+    }
+}
+
+void op_argmax_f32(const thread Inst& in, device const ulong* tab, uint slice,
+                   uint nblk, threadgroup float* scratch, uint lid) {
+    device uint* ids = ten<uint>(tab, in, 0);
+    device const float* x = ten<float>(tab, in, 1);
+    uint rows = in.i[0], width = in.i[1];
+    for (uint row = slice; row < rows; row += nblk) {
+        float best = -INFINITY; uint best_id = 0u;
+        for (uint i = lid; i < width; i += NT) {
+            float value = x[ulong(row) * width + i];
+            if (value > best || (value == best && i < best_id)) { best = value; best_id = i; }
+        }
+        scratch[lid] = best; scratch[NT + lid] = as_type<float>(best_id);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = NT / 2u; stride > 0u; stride >>= 1u) {
+            if (lid < stride) {
+                float other = scratch[lid + stride];
+                uint other_id = as_type<uint>(scratch[NT + lid + stride]);
+                uint own_id = as_type<uint>(scratch[NT + lid]);
+                if (other > scratch[lid] || (other == scratch[lid] && other_id < own_id)) {
+                    scratch[lid] = other; scratch[NT + lid] = as_type<float>(other_id);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (lid == 0u) ids[row] = as_type<uint>(scratch[NT]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+void op_relu_f32(const thread Inst& in, device const ulong* tab, uint slice, uint nblk, uint lid) {
+    device float* out = ten<float>(tab, in, 0);
+    device const float* x = ten<float>(tab, in, 1);
+    uint lo, hi; range(in.i[0], slice, nblk, lo, hi);
+    for (uint i = lo + lid; i < hi; i += NT) out[i] = max(x[i], 0.0f);
+}
+
+void op_broadcast_add_f32(const thread Inst& in, device const ulong* tab,
+                          uint slice, uint nblk, uint lid) {
+    device float* out = ten<float>(tab, in, 0);
+    device const float* matrix = ten<float>(tab, in, 1);
+    device const float* vector = ten<float>(tab, in, 2);
+    uint width = in.i[1], lo, hi; range(in.i[0] * width, slice, nblk, lo, hi);
+    for (uint i = lo + lid; i < hi; i += NT) out[i] = matrix[i] + vector[i % width];
+}
+
+void op_causal_depthwise_f32(const thread Inst& in, device const ulong* tab,
+                             uint slice, uint nblk, uint lid) {
+    device float* out = ten<float>(tab, in, 0);
+    device const float* x = ten<float>(tab, in, 1);
+    device const half* weight = ten<half>(tab, in, 2);
+    uint rows = in.i[0], channels = in.i[1], kernel_width = in.i[2], lo, hi;
+    range(rows * channels, slice, nblk, lo, hi);
+    for (uint index = lo + lid; index < hi; index += NT) {
+        uint row = index / channels, channel = index % channels; float sum = 0.0f;
+        for (uint tap = 0; tap < kernel_width; tap++) {
+            int source = int(row) + int(tap) + 1 - int(kernel_width);
+            if (source >= 0) sum = fma(x[ulong(source) * channels + channel],
+                                       float(weight[ulong(channel) * kernel_width + tap]), sum);
+        }
+        out[index] = sum;
+    }
+}
+
+void op_relative_attention_f32(const thread Inst& in, device const ulong* tab, uint slice,
+                               threadgroup float* scores, uint lid, uint sg, uint lane) {
+    device float* context = ten<float>(tab, in, 0);
+    device const float* query = ten<float>(tab, in, 1);
+    device const float* key = ten<float>(tab, in, 2);
+    device const float* value = ten<float>(tab, in, 3);
+    device const float* position = ten<float>(tab, in, 4);
+    device const float* bu = ten<float>(tab, in, 5);
+    device const float* bv = ten<float>(tab, in, 6);
+    uint rows = in.i[0], width = in.i[1], heads = in.i[2], chunk = in.i[3], left = in.i[4];
+    uint cluster = sg / 4u, local_sg = sg % 4u, local_lid = lid % 128u;
+    uint item = slice * 8u + cluster, qr = item / heads, head = item % heads, hw = width / heads;
+    bool active = item < rows * heads;
+    uint first = 0, last = rows;
+    if (active && left != 0xffffffffu) { uint qc = qr / chunk; first = (qc > left ? qc - left : 0u) * chunk; last = min(rows, (qc + 1u) * chunk); }
+    uint count = last - first, qb = qr * width + head * hw, bb = head * hw;
+    threadgroup float* item_scores = scores + cluster * 64u;
+    if (count > 64u) active = false;
+    for (uint local = local_sg; active && local < count; local += 4u) {
+        uint kr = first + local, kb = kr * width + bb, pb = (rows - 1u + kr - qr) * width + bb;
+        float sum = 0.0f;
+        for (uint col = lane; col < hw; col += 32u)
+            sum += key[kb + col] * (query[qb + col] + bu[bb + col]) +
+                   position[pb + col] * (query[qb + col] + bv[bb + col]);
+        float score = simd_sum(sum) * rsqrt(float(hw));
+        if (lane == 0u) item_scores[local] = score;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (active && local_lid == 0u) {
+        float maximum = -INFINITY; for (uint i = 0; i < count; i++) maximum = max(maximum, item_scores[i]);
+        float sum = 0.0f; for (uint i = 0; i < count; i++) { item_scores[i] = exp(item_scores[i] - maximum); sum += item_scores[i]; }
+        for (uint i = 0; i < count; i++) item_scores[i] /= sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint col = local_lid; active && col < hw; col += 128u) {
+        float sum = 0.0f;
+        for (uint local = 0; local < count; local++) sum = fma(item_scores[local], value[ulong(first + local) * width + bb + col], sum);
+        context[ulong(qr) * width + bb + col] = sum;
+    }
+}
+
+void op_grouped_attention_f32(const thread Inst& in, device const ulong* tab, uint slice,
+                              threadgroup float* scores, uint lid, uint sg, uint lane) {
+    device float* context = ten<float>(tab, in, 0);
+    device const float* query = ten<float>(tab, in, 1);
+    device const float* key = ten<float>(tab, in, 2);
+    device const float* value = ten<float>(tab, in, 3);
+    uint rows = in.i[0], width = in.i[1], head_width = in.i[2];
+    uint group_rows = in.i[3], flags = in.i[4];
+    uint valid_rows = in.t[4] == 0xffffu ? rows : *ten<uint>(tab, in, 4);
+    bool geometry = head_width != 0u && width % head_width == 0u &&
+                    group_rows != 0u && group_rows <= 256u &&
+                    valid_rows != 0u && valid_rows <= rows;
+    uint heads = geometry ? width / head_width : 0u;
+    uint item = slice * NSG + sg, row = heads ? item / heads : 0u;
+    uint head = heads ? item % heads : 0u;
+    bool active = geometry && item < valid_rows * heads;
+    uint first = active ? row / group_rows * group_rows : 0u;
+    uint last = min(first + group_rows, valid_rows), count = last - first;
+    ulong qb = ulong(row) * width + head * head_width;
+    uint score_stride = geometry ? group_rows : 1u;
+    threadgroup float* item_scores = scores + sg * score_stride;
+    for (uint local = lane; active && local < count; local += 32u) {
+        ulong kb = ulong(first + local) * width + head * head_width;
+        float score = 0.0f;
+        for (uint col = 0; col < head_width; col++)
+            score += query[qb + col] * key[kb + col];
+        if (flags & 1u) score = round_bf16_f32(score);
+        item_scores[local] = score * rsqrt(float(head_width));
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    if (active && lane == 0u) {
+        float maximum = -INFINITY, denominator = 0.0f;
+        for (uint local = 0; local < count; local++)
+            maximum = max(maximum, item_scores[local]);
+        for (uint local = 0; local < count; local++) {
+            item_scores[local] = exp(item_scores[local] - maximum);
+            denominator += item_scores[local];
+        }
+        for (uint local = 0; local < count; local++) {
+            float probability = item_scores[local] / denominator;
+            item_scores[local] = flags & 2u ? round_bf16_f32(probability) : probability;
+        }
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint col = lane; active && col < head_width; col += 32u) {
+        float sum = 0.0f;
+        for (uint local = 0; local < count; local++) {
+            ulong vb = ulong(first + local) * width + head * head_width;
+            sum += item_scores[local] * value[vb + col];
+        }
+        context[qb + col] = flags & 4u ? round_bf16_f32(sum) : sum;
+    }
+}
+
 bool exec_op(const thread Inst& in, device const ulong* tab, uint slice, uint nblk,
              threadgroup float* tile, threadgroup float* red, threadgroup ulong* keys,
              uint lid, uint sg, uint lane) {
     switch (in.op) {
         case 0: return true;
+        case 156: op_affine_q4(in, tab, slice, nblk, false, tile, lid, sg, lane); return true;
+        case 157: op_affine_q4(in, tab, slice, nblk, true, tile, lid, sg, lane); return true;
+        case 158: op_q8_gemm_f32(in, tab, slice, tile, lid, sg, lane); return true;
+        case 159: op_layernorm_f32(in, tab, slice, nblk, red, lid, sg, lane); return true;
+        case 160: op_scaled_add_f32(in, tab, slice, nblk, lid); return true;
+        case 161: op_glu_f32(in, tab, slice, nblk, lid); return true;
+        case 162: op_causal_depthwise_f32(in, tab, slice, nblk, lid); return true;
+        case 163: op_relative_attention_f32(in, tab, slice, tile, lid, sg, lane); return true;
+        case 164: op_silu_f32(in, tab, slice, in.blocks, lid); return true;
+        case 165: op_dense_gemm_f32(in, tab, slice, tile, lid, sg, lane); return true;
+        case 166: op_embed_f16_f32(in, tab, slice, in.blocks, lid); return true;
+        case 167: op_lstm_cell_f32(in, tab, slice, in.blocks, lid); return true;
+        case 168: op_argmax_f32(in, tab, slice, in.blocks, tile, lid); return true;
+        case 169: op_relu_f32(in, tab, slice, in.blocks, lid); return true;
+        case 170: op_broadcast_add_f32(in, tab, slice, in.blocks, lid); return true;
+        case 171: op_conv2d_f32(in, tab, slice, tile, lid, sg, lane); return true;
+        case 172: op_pack_ncfw_rows_f32(in, tab, slice, lid); return true;
+        case 173: op_grouped_attention_f32(in, tab, slice, tile, lid, sg, lane); return true;
+        case 174: op_embed_overlay_bf16(in, tab, slice, in.blocks, lid); return true;
         case 1: op_rmsnorm(in, tab, slice, nblk, red, lid, sg, lane); return true;
         case 3: op_headnorm_rope<false>(in, tab, slice, nblk, sg, lane); return true;
         case 37: op_headnorm_rope<true>(in, tab, slice, nblk, sg, lane); return true;
         case 32: op_quant_fp8(in, tab, slice, nblk, red, lid, sg, lane); return true;
         case 4: op_residual(in, tab, slice, nblk, lid); return true;
+        case 5: op_glu(in, tab, slice, nblk, lid); return true;
         case 6: op_embed(in, tab, slice, nblk, lid); return true;
         case 7: op_softcap(in, tab, slice, nblk, lid); return true;
         case 8: op_gemm(in, tab, slice, nblk, 256, 256, 0u, tile, lid, sg, lane); return true;
@@ -2023,6 +3038,7 @@ bool exec_op(const thread Inst& in, device const ulong* tab, uint slice, uint nb
         case 10: op_gemv(in, tab, slice, nblk, sg, lane); return true;
         case 19: op_gemv_glu(in, tab, slice, nblk, sg, lane); return true;
         case 22: op_gemv_qkv(in, tab, slice, nblk, sg, lane); return true;
+        case 115: op_gemv_qkv_fp8(in, tab, slice, nblk, sg, lane); return true;
         case 30: op_gemv_fp8(in, tab, slice, nblk, sg, lane); return true;
         case 31: op_gemv_glu_fp8(in, tab, slice, nblk, sg, lane); return true;
         case 11: op_flash_prefill<ushort>(in, tab, slice, nblk, tile, sg, lane); return true;
@@ -2035,7 +3051,7 @@ bool exec_op(const thread Inst& in, device const ulong* tab, uint slice, uint nb
         case 18: op_argmax_fin(in, tab, slice, lid); return true;
         case 21: op_add_norm(in, tab, slice, nblk, red, lid, sg, lane); return true;
         case 23: op_norm_residual_norm(in, tab, slice, nblk, red, lid, sg, lane); return true;
-        case 155: op_per_layer_input(in, tab, slice, nblk, tile, red, lid, sg, lane); return true;
+        case 155: return op_per_layer_input(in, tab, slice, nblk, tile, red, lid, sg, lane);
         case 83: op_moe_router_topk_pf(in, tab, slice, nblk, sg, lane); return true;
         case 84: op_moe_align_pf(in, tab, slice, lid); return true;
         case 87: op_moe_combine_pf(in, tab, slice, nblk, lid); return true;
@@ -2133,4 +3149,35 @@ kernel void plow_single(device const Inst* insts [[buffer(0)]],
     if (tg >= in.blocks) return;
     if (!exec_op(in, tab, tg, in.blocks, tile, red, keys, lid, sg, lane))
         if (lid == 0) fault[0] = 0x40000000u | S.inst;
+}
+
+kernel void plow_mx4_dedicated(device const Inst* insts [[buffer(0)]],
+ device const ulong* tab [[buffer(7)]], constant SingleParams& S [[buffer(8)]],
+ device uint* fault [[buffer(9)]], uint tg [[threadgroup_position_in_grid]],
+ uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    Inst in = insts[S.inst];
+    if ((in.op != 91 && in.op != 92) || !in.i[0] || !in.i[1] || (in.i[1] % 8)
+        || !in.i[2] || (in.i[2] % 32)) {
+        if (tg == 0 && sg == 0 && lane == 0) fault[0] = 0x40000000u | S.inst;
+        return;
+    }
+    uint blocks = uint(in.i[1]) / (in.op == 92 ? 2u : 8u);
+    if (tg >= blocks) return;
+    if (in.op == 92) op_gemv_glu_mxfp4(in, tab, tg, blocks, sg, lane);
+    else op_gemv_mxfp4(in, tab, tg, blocks, sg, lane);
+}
+
+kernel void plow_mx4_prefill(device const Inst* insts [[buffer(0)]],
+ device const ulong* tab [[buffer(7)]], constant SingleParams& S [[buffer(8)]],
+ device uint* fault [[buffer(9)]], uint tg [[threadgroup_position_in_grid]],
+ uint lid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+ uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float tile[TILE_FLOATS];
+    Inst in = insts[S.inst];
+    if (tg >= in.blocks) return;
+    if (in.op == 93 || in.op == 96 || in.op == 98)
+        op_gemm(in, tab, tg, in.blocks, 128, 128, 2u, tile, lid, sg, lane);
+    else if (in.op == 97)
+        op_gemm(in, tab, tg, in.blocks, 64, 64, 2u, tile, lid, sg, lane);
+    else if (lid == 0) fault[0] = 0x40000000u | S.inst;
 }

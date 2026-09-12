@@ -23,6 +23,7 @@
 | [12](12-using-the-tuner.md) | **Using the Tuner** | `plowc tune`, reading the output, taking a measurement |
 | [13](13-prefill-chunking.md) | **Prefill Chunking** | Bucket ladder, the ragged tail, ragged-M |
 | [14](14-amd-arch-divergence.md) | **AMD Arch Divergence** | gfx942 vs gfx950: one tree, what forks, the tripwire |
+| [18](18-asr-pipelines.md) | **ASR Packet Pipelines** | Qwen causal and Nemotron RNNT compilation, runtime, batching and serving |
 | [architecture.md](architecture.md) | **Index / landing page** | Intro + linked table of contents for these chapters |
 
 ---

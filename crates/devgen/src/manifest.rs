@@ -265,6 +265,7 @@ struct Shapes {
     moe_enc: BTreeSet<u32>,
     /// Any w4a16 MXFP4 projection opcode present (91/92/93).
     mxfp4_proj: bool,
+    affine_q4_proj: bool,
     /// Any prefill DOWN/combine with `i[7]=1` — bf16 `part` scatter (PLOW_MOE_PF_PART16).
     moe_pf_part16: bool,
     /// Any prefill GLU with `i[7]=1` — fp8 gathered activations (PLOW_MOE_PF_A8).
@@ -537,6 +538,9 @@ fn shapes(m: &Model) -> Shapes {
                 // `GemmSmallMxfp4` would be classified bf16, load `interp_prefill`, and hit
                 // that object's silent `default:` — an untouched output buffer read as a
                 // result. §4's shape, reached by ADDING an arm rather than by forgetting one.
+                DevOp::GemvAffineQ4 | DevOp::GemmAffineQ4 => {
+                    s.affine_q4_proj = true;
+                }
                 DevOp::GemvMxfp4
                 | DevOp::GemvGluMxfp4
                 | DevOp::GemvQkvMxfp4
@@ -702,7 +706,9 @@ fn precision_axes(
     let on = |k: &str| f.get(k).and_then(Value::as_bool).unwrap_or(false);
 
     // WEIGHT. mxfp4 projections > fp8 (either flavour) > bf16.
-    let weight = if s.mxfp4_proj {
+    let weight = if s.affine_q4_proj {
+        "affine_q4"
+    } else if s.mxfp4_proj {
         "mxfp4"
     } else if on("fp8_weights") {
         "fp8"
@@ -777,6 +783,9 @@ fn encoding_features(f: &mut Map<String, Value>, s: &Shapes) {
     // w4a16 MXFP4 on the plain [N,K] projections — a different question from the experts' A4W4,
     // and both have to be true for a packet to be all-MXFP4.
     f.insert("mxfp4_weights".into(), json!(s.mxfp4_proj));
+    if s.affine_q4_proj {
+        f.insert("affine_q4_weights".into(), json!(true));
+    }
     // A packet is meant to be ALL of one encoding. Two on the grouped ops means a mixed run, which
     // is a thing to see in the manifest rather than to discover in a benchmark number.
     f.insert("moe_enc_mixed".into(), json!(s.moe_enc.len() > 1));

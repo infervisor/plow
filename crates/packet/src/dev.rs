@@ -1827,6 +1827,96 @@ pub enum DevOp {
     /// `t0=x t1=Wg t2=Wp t3=gamma_post t4=ple t5=hn_out? t6=gamma_next?` ·
     /// `i0=T i1=H i2=P i3=col0 i4=stride` · `f0=eps f1=layer_scalar`.
     PerLayerInput = 155,
+    /// Affine unsigned Q4, group64, BF16 scale/bias; decode uses BF16 four-input
+    /// bias-correction sums and FP32 dot accumulation.
+    /// `t0=C t1=A t2=W t3=scale t4=bias` · `i0=M i1=N i2=K i4=a_row0 i5=c_row0`.
+    /// K must be positive and divisible by64; i3 is reserved and must be zero.
+    GemvAffineQ4 = 156,
+    /// Affine Q4 prefill: reconstruct FP32 scale*q+bias, round weights to BF16,
+    /// then FP32 accumulate. Same operands as GemvAffineQ4; 64x64 output tiles.
+    /// `t0=C t1=A t2=W t3=scale t4=bias` · `i0=M i1=N i2=K i4=a_row0 i5=c_row0`.
+    GemmAffineQ4 = 157,
+    /// GGUF Q8_0 projection with FP32 activations and output. The weight is `[N,K]` in canonical
+    /// 34-byte blocks (FP16 scale followed by 32 signed bytes); optional FP32 bias is added before
+    /// `activation` (0 = identity, 1 = SiLU).
+    /// `t0=C(f32) t1=A(f32) t2=W(q8_0) t3=bias?` ·
+    /// `i0=M i1=N i2=K i3=activation i4=a_row0`.
+    Q8GemmF32 = 158,
+    /// FP32 LayerNorm with population variance and optional FP32 affine parameters.
+    /// Numerical flag `i2` bit 0 rounds each output to BF16; bit 1 computes mean and variance
+    /// with ordered FP32 accumulation.
+    /// `t0=out t1=x t2=gamma? t3=beta?` · `i0=rows i1=feat i2=flags` · `f0=eps`.
+    LayerNormF32 = 159,
+    /// FP32 scaled residual update: `out = a + scale * b`; output may alias either input.
+    /// Numerical flag `i1` bit 0 rounds the result to BF16.
+    /// `t0=out t1=a t2=b` · `i0=n i1=flags` · `f0=scale`.
+    ScaledAddF32 = 160,
+    /// FP32 gated linear unit over packed `[rows,2*width]`: `out = first * sigmoid(second)`.
+    /// `t0=out t1=x` · `i0=rows i1=width`.
+    GluF32 = 161,
+    /// FP32 causal depthwise convolution with FP16 `[channels,kernel]` weights and zero left pad.
+    /// `t0=out t1=x t2=weight(f16)` · `i0=rows i1=channels i2=kernel`.
+    CausalDepthwiseConv1dF32 = 162,
+    /// FP32 relative-position attention. Q/K/V/position/context are `[rows,width]`, position has
+    /// `2*rows-1` rows, and u/v are `[heads,width/heads]`. `left_chunks = u32::MAX` selects full
+    /// attention; otherwise keys span the query chunk and `left_chunks` preceding chunks.
+    /// `t0=context t1=query t2=key t3=value t4=position t5=bias_u t6=bias_v` ·
+    /// `i0=rows i1=width i2=heads i3=chunk_size i4=left_chunks`.
+    RelativeAttentionF32 = 163,
+    /// Elementwise FP32 SiLU: `out = x / (1 + exp(-x))`; output may alias input.
+    /// `t0=out t1=x` · `i0=n`.
+    SiluF32 = 164,
+    /// Dense FP32 projection with optional FP32 bias and activation (0 = identity, 1 = ReLU).
+    /// The weight is row-major `[N,K]`. A nonzero `weight_stride` addresses rows with that
+    /// stride and also adds the weight at `implicit_onehot_col`, allowing a compiler to fuse an
+    /// appended one-hot feature without materializing it. Numerical flag `i7` bit 0 rounds the
+    /// result to BF16; bit 1 applies erf-GELU with BF16 input/output rounding; bit 2 selects
+    /// row-major BF16 weights instead of FP32.
+    /// `t0=C t1=A t2=W t3=bias?` ·
+    /// `i0=M i1=N i2=K i3=activation i4=a_row0 i5=weight_stride? i6=implicit_onehot_col i7=flags`.
+    DenseGemmF32 = 165,
+    /// Gather one FP16 embedding row and convert it to FP32.
+    /// `t0=out(f32) t1=table(f16) t2=token(u32)` · `i0=vocab i1=width`.
+    EmbedF16F32 = 166,
+    /// One FP32 LSTM cell after the input and recurrent projections have been summed. Gates are
+    /// contiguous `[input,forget,cell,output]`. `t0=h_new t1=c_new t2=gates t3=c_prev` · `i0=width`.
+    LstmCellF32 = 167,
+    /// Row-wise FP32 argmax. `t0=ids(u32) t1=x(f32)` · `i0=rows i1=width`.
+    ArgmaxF32 = 168,
+    /// Elementwise FP32 ReLU; output may alias input. `t0=out t1=x` · `i0=n`.
+    ReluF32 = 169,
+    /// Add one FP32 vector to every row of a matrix. Output may alias the matrix.
+    /// `t0=out t1=matrix t2=vector` · `i0=rows i1=width`.
+    BroadcastAddF32 = 170,
+    /// FP32 2D convolution with FP16/FP32 weights and FP32 bias. Flag bit 0 selects depthwise,
+    /// bit 1 applies ReLU, bits 2..3 select output layout, bits 4..5 select input layout
+    /// (`0=NHWC, 1=NFCW, 2=NCFW`), bit 6 selects FP32 weights, and bit 7 applies erf-GELU with
+    /// BF16 rounding. `j1=batch` defaults to one.
+    /// `t0=out t1=x t2=weight t3=bias(f32)` ·
+    /// `i0=in_frames i1=in_width i2=in_channels i3=out_channels i4=kernel i5=stride
+    /// i6=pad_before i7=pad_after j0=flags j1=batch`.
+    Conv2dF32 = 171,
+    /// Pack an NCFW convolution tensor into row-major `[rows,channels*frames]`. Rows advance
+    /// through width within each batch; a short final batch may be omitted.
+    /// `t0=out t1=x` · `i0=rows i1=channels i2=frames i3=width i4=batches`.
+    PackNcfwRowsF32 = 172,
+    /// FP32 self-attention within fixed, non-overlapping row groups. Q/K/V/context are
+    /// `[rows,width]`; `head_width` divides width and `group_rows` (at most 256) is the maximum
+    /// number of keys visible to a query. Numerical flag `i4` bit 0 rounds each dot product to
+    /// BF16, bit 1 rounds each normalized probability to BF16, and bit 2 rounds each context
+    /// element to BF16. Optional `valid_rows` points to one `u32`; when present, rows at or after
+    /// that value are padding and are neither read nor written.
+    /// `t0=context t1=query t2=key t3=value t4=valid_rows?` ·
+    /// `i0=rows i1=width i2=head_width i3=group_rows i4=flags`.
+    GroupedAttentionF32 = 173,
+    /// Gather BF16 token embeddings and replace selected rows with BF16-rounded FP32 overlay
+    /// rows. `overlay_index[row] == u32::MAX` selects `table[tokens[row]]`; every other value
+    /// selects that overlay row. This is the generic encoder-to-decoder handoff for audio,
+    /// image, and other multimodal pipelines.
+    /// `t0=out(bf16[rows,width]) t1=table(bf16[vocab,width]) t2=tokens(u32[rows])
+    /// t3=overlay(f32[overlay_rows,width]) t4=overlay_index(u32[rows])` ·
+    /// `i0=rows i1=width i2=vocab i3=overlay_rows`.
+    EmbedOverlayBf16 = 174,
 }
 
 /// GLU-family `act` code for GPT-OSS's `swiglu_oai` (pair form, `f0 = alpha`, `f1 = limit`).
@@ -1998,6 +2088,25 @@ impl DevOp {
         DevOp::MoeDownMxPf,
         DevOp::RowGather,
         DevOp::PerLayerInput,
+        DevOp::GemvAffineQ4,
+        DevOp::GemmAffineQ4,
+        DevOp::Q8GemmF32,
+        DevOp::LayerNormF32,
+        DevOp::ScaledAddF32,
+        DevOp::GluF32,
+        DevOp::CausalDepthwiseConv1dF32,
+        DevOp::RelativeAttentionF32,
+        DevOp::SiluF32,
+        DevOp::DenseGemmF32,
+        DevOp::EmbedF16F32,
+        DevOp::LstmCellF32,
+        DevOp::ArgmaxF32,
+        DevOp::ReluF32,
+        DevOp::BroadcastAddF32,
+        DevOp::Conv2dF32,
+        DevOp::PackNcfwRowsF32,
+        DevOp::GroupedAttentionF32,
+        DevOp::EmbedOverlayBf16,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -2174,6 +2283,25 @@ impl DevOp {
             DevOp::MoeDownMxPf => "PLOW_DOP_MOE_DOWN_MX_PF",
             DevOp::RowGather => "PLOW_DOP_ROW_GATHER",
             DevOp::PerLayerInput => "PLOW_DOP_PER_LAYER_INPUT",
+            DevOp::GemvAffineQ4 => "PLOW_DOP_GEMV_AFFINE_Q4",
+            DevOp::GemmAffineQ4 => "PLOW_DOP_GEMM_AFFINE_Q4",
+            DevOp::Q8GemmF32 => "PLOW_DOP_Q8_GEMM_F32",
+            DevOp::LayerNormF32 => "PLOW_DOP_LAYERNORM_F32",
+            DevOp::ScaledAddF32 => "PLOW_DOP_SCALED_ADD_F32",
+            DevOp::GluF32 => "PLOW_DOP_GLU_F32",
+            DevOp::CausalDepthwiseConv1dF32 => "PLOW_DOP_CAUSAL_DEPTHWISE_CONV1D_F32",
+            DevOp::RelativeAttentionF32 => "PLOW_DOP_RELATIVE_ATTENTION_F32",
+            DevOp::SiluF32 => "PLOW_DOP_SILU_F32",
+            DevOp::DenseGemmF32 => "PLOW_DOP_DENSE_GEMM_F32",
+            DevOp::EmbedF16F32 => "PLOW_DOP_EMBED_F16_F32",
+            DevOp::LstmCellF32 => "PLOW_DOP_LSTM_CELL_F32",
+            DevOp::ArgmaxF32 => "PLOW_DOP_ARGMAX_F32",
+            DevOp::ReluF32 => "PLOW_DOP_RELU_F32",
+            DevOp::BroadcastAddF32 => "PLOW_DOP_BROADCAST_ADD_F32",
+            DevOp::Conv2dF32 => "PLOW_DOP_CONV2D_F32",
+            DevOp::PackNcfwRowsF32 => "PLOW_DOP_PACK_NCFW_ROWS_F32",
+            DevOp::GroupedAttentionF32 => "PLOW_DOP_GROUPED_ATTENTION_F32",
+            DevOp::EmbedOverlayBf16 => "PLOW_DOP_EMBED_OVERLAY_BF16",
         }
     }
 
@@ -2215,7 +2343,10 @@ impl DevOp {
     /// collision-at-merge as 111 -> 113, resolved the same way (renumber the later merge).
     /// 154 -> 155 for `RowGather = 154` (the unified token batch's terminal row selection).
     /// 155 -> 156 for `PerLayerInput = 155` (Gemma-4 E-series per-layer inputs).
-    pub const COUNT: u16 = 156;
+    /// 156 -> 158 for affine Q4 matrix operations.
+    /// 173 -> 174 for backend-neutral grouped FP32 attention.
+    /// 174 -> 175 for backend-neutral multimodal embedding overlay.
+    pub const COUNT: u16 = 175;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///
@@ -2274,6 +2405,7 @@ impl DevOp {
             DevOp::GemvGluMxfp4 => ("gemvglu", i[1], "Mxfp4"),
             DevOp::GemvQkvMxfp4 => ("gemvqkv", i[1] + i[3] + i[4], "Mxfp4"),
             DevOp::GemvQkvFp8 => ("gemvqkv", i[1] + i[3] + i[4], "W8A8"),
+            DevOp::GemvAffineQ4 => ("gemv", i[1], "AffineQ4"),
             _ => return None,
         };
         Some((fam, i[0], n, i[2], q))
