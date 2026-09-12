@@ -57,6 +57,7 @@ env -u PLOW_DECODE_BATCH -u PLOW_GEMV_WALK -u PLOW_DECODE_TIERS -u PLOW_DSA_PF -
     -u PLOW_MOE_PF_ATOMIC -u PLOW_PACKED_PREFILL_CONSUMERS -u PLOW_TOKEN_BATCH_TP_OBJECTS \
     -u GM_BM -u GM_BN -u GM_DBUF \
     -u PLOW_XR_SCHED -u PLOW_XR_SCHED_NWG -u PLOW_XR_SCHED_NWG_RS -u PLOW_XR_SCHED_AG_U \
+    -u PLOW_XR_SCHED_NWG_SRS -u PLOW_XR_SCHED_NWG_SAG \
     PLOW_HSACO_CONFIG="$TMP/assets" PLOW_DEFINES_ONLY=1 \
     "$ROOT/scripts/build_gfx942.sh" "$TMP/cfg" >"$TMP/cfg.log" 2>&1 || { cat "$TMP/cfg.log"; exit 1; }
 D="$TMP/cfg/build_defines.json"
@@ -109,17 +110,19 @@ env -u PLOW_XR_SCHED_NWG -u PLOW_XR_SCHED_NWG_RS -u PLOW_XR_SCHED_AG_U PLOW_XR_S
     "$ROOT/scripts/build_gfx942.sh" "$TMP/xr2" >"$TMP/xr2.log" 2>&1 || { cat "$TMP/xr2.log"; exit 1; }
 expect "twoshot compiles no collective-schedule define on any row" \
   bash -c '! grep -q XR_SCHED "$1"' _ "$TMP/xr2/build_defines.json"
-expect "the seam caps are not passed unless set" \
-  bash -c '! grep -q "XR_SCHED_NWG_S" "$1"' _ "$D"
-env -u PLOW_XR_SCHED -u PLOW_XR_SCHED_NWG_SAG PLOW_XR_SCHED_NWG_SRS=8 \
+expect "the seam reduce-scatter cap defaults to 8 on the prefill rows" \
+  has_define "$D" interp_prefill_fp8kv_mla_moe -DPLOW_XR_SCHED_NWG_SRS=8
+expect "the seam all-gather cap is not passed unless set" \
+  bash -c '! grep -q "XR_SCHED_NWG_SAG" "$1"' _ "$D"
+env -u PLOW_XR_SCHED -u PLOW_XR_SCHED_NWG_SAG PLOW_XR_SCHED_NWG_SRS=24 \
     PLOW_HSACO_CONFIG="$TMP/assets" PLOW_DEFINES_ONLY=1 \
     "$ROOT/scripts/build_gfx942.sh" "$TMP/srs" >"$TMP/srs.log" 2>&1 || { cat "$TMP/srs.log"; exit 1; }
-expect "an explicit seam reduce-scatter cap reaches the prefill rows" \
-  has_define "$TMP/srs/build_defines.json" interp_prefill_fp8kv_mla_moe -DPLOW_XR_SCHED_NWG_SRS=8
-expect "and no other row" python3 - "$TMP/srs/build_defines.json" <<'PY'
+expect "the seam reduce-scatter rollback (PLOW_XR_SCHED_NWG_SRS=24) reaches the prefill rows" \
+  has_define "$TMP/srs/build_defines.json" interp_prefill_fp8kv_mla_moe -DPLOW_XR_SCHED_NWG_SRS=24
+expect "and no other row carries a seam cap" python3 - "$TMP/srs/build_defines.json" <<'PY'
 import json, sys
 d = json.load(open(sys.argv[1]))
-sys.exit(1 if any("XR_SCHED_NWG_SRS" in v for k, v in d.items() if not k.startswith("interp_prefill")) else 0)
+sys.exit(1 if any("XR_SCHED_NWG_S" in v for k, v in d.items() if not k.startswith("interp_prefill")) else 0)
 PY
 
 echo "--- explicit env still wins where it agrees or widens"
