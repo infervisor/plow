@@ -258,6 +258,28 @@ fn glm_dsa_pf_bucket(c: &GlmCfg, t: u32) -> bool {
     c.dsa_pf() && t >= 2048 && t > c.index_topk
 }
 
+/// Row-split sparse attention's per-layer eligibility (`PLOW_GLM_ROWSPLIT_ATTN`,
+/// `reports/rowsplit-attention-design.md`): does layer `layer` reach the sparse (gathered)
+/// prefill arm at the 8192 rung at all? Mirrors `emit_glm_mla_prefill`'s `sparse` flag at
+/// `t=8192` (same "full indexer, or within the reuse window of one" test), computed here at
+/// DECLARE time — before `t` is known — so the arm's extra per-layer W_uv replica
+/// (`GlmLw::wuv_full`) is allocated only where it can be used. A layer with no sparse arm at
+/// 8192 gets no gather to shrink and must not pay for the replica (`full` is the caller's
+/// already-computed `mla && idx_on && c.indexer_is_full(layer)`).
+fn glm_rowsplit_attn_eligible(c: &GlmCfg, layer: u32, full: bool) -> bool {
+    glm_dsa_pf_bucket(c, 8192)
+        && (full || {
+            let cfg = emit_config::active();
+            let span = cfg.glm_dsa_pf_span as usize;
+            let dexact = cfg.glm_dsa_pf_dexact.map(|d| d as usize);
+            let layer = layer as usize;
+            match dexact {
+                Some(d) => layer >= d && c.indexer_is_full((layer - d) as u32),
+                None => (1..=span).any(|d| layer >= d && c.indexer_is_full((layer - d) as u32)),
+            }
+        })
+}
+
 /// May a sparse (DSA) prefill bucket be emitted with the packed-segment topology (a packed
 /// sibling or a token-batch body)? Only when its whole selection chain has a per-span form at
 /// the runtime: the native TP indexer (`IndexTpPf`, which takes a `PlowKvSpan` table) feeding
@@ -1670,6 +1692,11 @@ struct GlmLW {
     gkva: u32, // kv_a_layernorm
     krotd: u32, // DERIVED RAW k_rope down (kv_a rope slice, NOT folded) [DR, H]; RoPE applied dynamically
     wuv: u32,   // DERIVED absorbed value       [NH*DK, VD]
+    // ROW-SPLIT arm only (`PLOW_GLM_ROWSPLIT_ATTN`): the SAME derived checkpoint tensor as
+    // `wuv`, requested at its FULL (un-sharded, all `nh` heads) size instead of this rank's
+    // `nh_l` shard — see `glm_rowsplit_attn_eligible`. TENSOR_NONE unless the knob is on and
+    // this layer reaches the sparse prefill arm at the 8192 rung.
+    wuv_full: u32,
     wo: u32,    // o_proj (NH*VD -> H)
     wofold: u32, // DERIVED fused W_uv·W_o (NH*DK -> H), prefill ofold arm only; else NONE
     gpost: u32, // post_attention_layernorm
@@ -1764,6 +1791,14 @@ pub(crate) struct GlmTn {
     mlpart: u32,
     olat: u32,
     oat: u32,
+    // ROW-SPLIT arm only (`PLOW_GLM_ROWSPLIT_ATTN`, 8192 rung): the two all-to-alls' LOCAL
+    // (non-peer) destinations, [T/8][64][dk|dr] and TENSOR_NONE otherwise. `qa`/`qr` above are
+    // redirected to peer-slot names when the knob is on (see `declare_glm_rows_batched`) and
+    // are this rank's un-gathered [T][nh_l][dk|dr] all-to-all SOURCE; `oat_rs` is the row-split
+    // fold's PEER-VISIBLE source for the all-to-all back into `oat`.
+    qa_rs: u32,
+    qr_rs: u32,
+    oat_rs: u32,
     attn: u32,
     xmid: u32,
     xn2: u32,
@@ -2019,9 +2054,22 @@ pub(crate) fn declare_glm_rows_batched(
     let ckvraw = ac(b, "ckvraw", rows * dk as u64 * BF16);
     // Head-dimensioned activations shrink to nh_l heads under TP (the flash/merge/uv/o-fold ops run
     // this rank's head-shard); expert/dense-intermediate activations shrink to imoe_l/di_l lanes.
-    let qa = ac(b, "qa", rows * (nh_l * dk) as u64 * BF16);
+    // ROW-SPLIT arm (`PLOW_GLM_ROWSPLIT_ATTN`): `qa`/`qr` become this rank's all-to-all SOURCE,
+    // so they move to the peer-slot names `crates/plowrt/src/exec/amd.rs`'s hardcoded peer-slot
+    // table recognizes (step 3 adds the two entries) instead of ordinary VRAM. Knob off keeps
+    // the ordinary `act.qa`/`act.qr` names — zero extra bytes bound, byte-identical.
+    let rowsplit_attn = emit_config::active().glm_rowsplit_attn();
+    let qa = if rowsplit_attn {
+        ac(b, "qa_tp", rows * (nh_l * dk) as u64 * BF16)
+    } else {
+        ac(b, "qa", rows * (nh_l * dk) as u64 * BF16)
+    };
     let qrr = ac(b, "qrr", rows * (nh_l * dr) as u64 * BF16);
-    let qr = ac(b, "qr", rows * (nh_l * dr) as u64 * BF16);
+    let qr = if rowsplit_attn {
+        ac(b, "qr_tp", rows * (nh_l * dr) as u64 * BF16)
+    } else {
+        ac(b, "qr", rows * (nh_l * dr) as u64 * BF16)
+    };
     let krr = ac(b, "krr", rows * dr as u64 * BF16);
     // TP-sharded head count (nh_l) x ctx-adaptive nsplit (glm_nsplit, from glm-tune-flash).
     // nh_l (not global c.heads) so the fill target matches this rank's actual work-item count.
@@ -2042,6 +2090,30 @@ pub(crate) fn declare_glm_rows_batched(
     let mlpart = ac(b, "mlpart", (nh_l * osplits * 2) as u64 * F32);
     let olat = ac(b, "olat", (nh_l * dk) as u64 * BF16);
     let oat = ac(b, "oat", rows * (nh_l * vd) as u64 * BF16);
+    // ROW-SPLIT arm scratch. Same total element count as qa/qr/oat (`nh * rows/8 == nh_l * rows`
+    // since `nh == nh_l * tp` and this rank's row band is `rows/tp`), so turning the knob on
+    // costs exactly the peer-slot moves above plus these three buffers — no hidden growth.
+    // `qa_rs`/`qr_rs` are the Q all-to-all's ordinary (non-peer) destinations; `oat_rs` is the
+    // row-split fold's PEER-VISIBLE source for the all-to-all back into `oat`.
+    assert!(
+        !rowsplit_attn || rows % u64::from(tp) == 0,
+        "PLOW_GLM_ROWSPLIT_ATTN requires the prefill row capacity to divide TP evenly (rows={rows}, tp={tp})"
+    );
+    let qa_rs = if rowsplit_attn {
+        ac(b, "qa_rs", (rows / u64::from(tp)) * (nh * dk) as u64 * BF16)
+    } else {
+        TENSOR_NONE
+    };
+    let qr_rs = if rowsplit_attn {
+        ac(b, "qr_rs", (rows / u64::from(tp)) * (nh * dr) as u64 * BF16)
+    } else {
+        TENSOR_NONE
+    };
+    let oat_rs = if rowsplit_attn {
+        ac(b, "oat_rs_tp", (rows / u64::from(tp)) * (nh * vd) as u64 * BF16)
+    } else {
+        TENSOR_NONE
+    };
     let attn = ac(b, "attn", rows * h as u64 * BF16);
     let xmid = ac(b, "xmid", rows * h as u64 * BF16);
     let xn2 = ac(b, "xn2", rows * h as u64 * BF16);
@@ -2635,6 +2707,18 @@ pub(crate) fn declare_glm_rows_batched(
             } else {
                 TENSOR_NONE
             },
+            // `full == want` in `crates/plowrt/src/asset/shard.rs`'s `slice_for` turns this
+            // tensor's normally-Column shard into Replicated (the same mechanism Kimi-K3's
+            // shared-expert weights already use), so no new binding-path code is needed to
+            // present all `nh` heads. See `GlmLw::wuv_full`.
+            wuv_full: if mla
+                && emit_config::active().glm_rowsplit_attn()
+                && glm_rowsplit_attn_eligible(c, l, full)
+            {
+                t(b, "self_attn.derived.v_absorb.weight", (nh * dk * vd) as u64 * BF16)
+            } else {
+                TENSOR_NONE
+            },
             wo: if !mla {
                 TENSOR_NONE
             } else if lin_fp8 {
@@ -3000,6 +3084,9 @@ pub(crate) fn declare_glm_rows_batched(
         mlpart,
         olat,
         oat,
+        qa_rs,
+        qr_rs,
+        oat_rs,
         attn,
         xmid,
         xn2,
@@ -5785,6 +5872,129 @@ fn emit_glm_dsa_prefill_select(
     )
 }
 
+/// Query-row-split sparse attention for the GLM 8192 rung (`PLOW_GLM_ROWSPLIT_ATTN`,
+/// `reports/rowsplit-attention-design.md`). Two all-to-alls over heads (`DevOp::XAllToAllHeads`,
+/// opcode 160) bracket one sparse attention call and its merge-fold, all run at `nh` (every
+/// head, replicated latent KV) over this rank's `t/tp` row band instead of `nh_l` heads over
+/// every row:
+///
+///   1. Q all-to-all (dir=0), twice — `qa` (`dk`-wide) and `qr` (`dr`-wide) are separate
+///      tensors, so each needs its own instance: this rank's own un-gathered `[t][nh_l][d]`
+///      (peer-visible at `act.qa_tp`/`act.qr_tp`, see `declare_glm_rows_batched`) becomes
+///      `[t/tp][nh][d]` (`qa_rs`/`qr_rs`, local).
+///   2. ONE sparse attention call at `nh` heads, `t/tp` rows — the same `FlashMlaPrefill(Fp8)`
+///      shape the dense sparse arm emits, just wider. `opart`/`mlpart` are reused UNCHANGED:
+///      `nh * t/tp == nh_l * t`, the same total element count the dense arm needs. Runtime
+///      dispatch to four 16-head native launches (`crates/plowrt/src/exec/amd_sparse_mla.rs`)
+///      is a later step; this emits the same instruction shape and trusts that dispatch to
+///      interpret `i1=nh` as its cue.
+///   3. `MlaMergeFold` at `nh` heads against the full-head `w.wuv_full` replica (option 4,
+///      keeping the fold on the rank that computed the attention instead of gathering raw
+///      partials across ranks — see the design doc's discussion of the two rejected
+///      alternatives). `opart`/`mlpart` stay local; no cross-rank traffic here.
+///   4. O all-to-all (dir=1): `oat_rs` (`[t/tp][nh][vd]`, peer-visible) becomes `n.oat`
+///      (`[t][nh_l][vd]`, this rank's ordinary head-sharded slot) — `o_proj` and everything
+///      after it in `emit_glm_mla_prefill` is UNCHANGED and reads `n.oat` exactly as today.
+///
+/// Peer-slot numbering (`n.slot_b`-multiples, `crates/plowrt/src/exec/amd.rs`'s hardcoded
+/// peer-slot table): slots 0-5 are taken (og_tp/dg_tp/ug_tp/h2_tp/xe_tp/rt_tp); this arm claims
+/// 6 (`qa_tp`), 7 (`qr_tp`) and 8 (`oat_rs_tp`) — NEW entries step 3 owns adding to that table
+/// and to the region's slot count, exactly like the design doc's "add to the seam slot-hazard
+/// table" item. Not yet wired: this function only emits the packet: the runtime pieces
+/// (peer-slot table entries, the region-size bump, and `amd_sparse_mla.rs`'s 64-head ->
+/// four-16-head dispatch and its own per-row CSR/selection offset) are step 3.
+///
+/// Returns the counter `o_proj` (and the sequence-parallel seam, if any) should depend on — the
+/// same role `emit_glm_mla_prefill`'s `c_uv` plays on the dense path.
+#[allow(clippy::too_many_arguments)]
+fn emit_glm_rowsplit_attn(
+    b: &mut Builder,
+    c: &GlmCfg,
+    n: &GlmTn,
+    w: &GlmLW,
+    t: u32,
+    ctx: u32,
+    slot: usize,
+    fp8kv: bool,
+    sparse_sel: u32,
+    fl_deps: &[u32],
+    xgate: &mut u32,
+    xr_cus: &[u32],
+) -> u32 {
+    let tp = c.tp;
+    let nh = c.heads;
+    let (dk, dr, vd) = (c.kv_lora, c.qk_rope, c.v_head);
+    let rows = t / tp;
+    assert!(
+        t % tp == 0 && n.qa_rs != TENSOR_NONE && n.oat_rs != TENSOR_NONE,
+        "row-split attention requires t % tp == 0 and its scratch declared (t={t}, tp={tp})"
+    );
+    // 1. Q all-to-all, twice (qa/qr are separate tensors — see the function doc).
+    let c_qa2a =
+        crate::emit_xalltoall_heads(b, xgate, xr_cus, fl_deps, n.qa_rs, rows, 8, dk, nh, tp, 6 * n.slot_b, 0);
+    let c_qr2a = if dr > 0 {
+        crate::emit_xalltoall_heads(
+            b, xgate, xr_cus, fl_deps, n.qr_rs, rows, 8, dr, nh, tp, 7 * n.slot_b, 0,
+        )
+    } else {
+        c_qa2a
+    };
+    // 2. Sparse attention at nh heads over this rank's row band. Same operand shape as the
+    //    dense sparse arm's `c_fl` (`emit_glm_mla_prefill`), just wider.
+    let c_fl = b.emit(
+        if fp8kv {
+            DevOp::FlashMlaPrefillFp8
+        } else {
+            DevOp::FlashMlaPrefill
+        },
+        xr_cus.to_vec(),
+        &[c_qa2a, c_qr2a],
+        |d| {
+            d.t[0] = n.opart;
+            d.t[1] = n.mlpart;
+            d.t[2] = n.qa_rs;
+            d.t[3] = if dr > 0 { n.qr_rs } else { n.qa_rs };
+            d.t[4] = n.ckv[slot];
+            d.t[5] = if dr > 0 { n.krot[slot] } else { n.ckv[slot] };
+            d.t[6] = n.kvlen;
+            if fp8kv {
+                d.t[7] = n.kv_scale[slot];
+                d.j[0] = sparse_sel + 1;
+            } else {
+                d.t[7] = n.iuni;
+            }
+            d.i[6] = glm_dsa_pf_cap(c, ctx);
+            d.i[0] = 1; // n_batch
+            d.i[1] = nh; // ALL heads, not this rank's nh_l
+            d.i[2] = ctx; // kv_stride
+            d.i[3] = if dr == 0 { 1u32 << 31 } else { 0 };
+            d.i[4] = rows; // this rank's row band, not the full t
+            d.i[5] = KV_MASK_NONE;
+            d.i[7] = glm_gf_prefill(ctx, nh);
+            d.f[0] = c.attn_scale;
+        },
+    );
+    // 3. MlaMergeFold at nh heads against the full-head W_uv replica (option 4: the fold stays
+    //    on this rank, no raw-partial all-to-all).
+    let c_fold = b.emit(
+        DevOp::MlaMergeFold,
+        mla_fold_cus(xr_cus, rows * nh, vd),
+        &[c_fl],
+        |d| {
+            d.t[0] = n.oat_rs;
+            d.t[1] = n.opart;
+            d.t[2] = n.mlpart;
+            d.t[3] = w.wuv_full;
+            d.i[0] = rows;
+            d.i[1] = nh;
+            d.i[2] = vd;
+            d.i[4] = 1; // nsplit: the sparse arm always forces ns=1
+        },
+    );
+    // 4. O all-to-all back to this rank's ordinary head-sharded `oat`.
+    crate::emit_xalltoall_heads(b, xgate, xr_cus, &[c_fold], n.oat, rows, 8, vd, nh, tp, 8 * n.slot_b, 1)
+}
+
 pub(crate) fn emit_glm_mla_prefill(
     b: &mut Builder,
     c: &GlmCfg,
@@ -5880,6 +6090,11 @@ pub(crate) fn emit_glm_mla_prefill(
         None => (1..=span).any(|d| slot >= d && c.indexer_is_full((slot - d) as u32)),
     };
     let sparse = glm_dsa_pf_bucket(c, t) && (w.iwqb != TENSOR_NONE || reuses) && nh_l == 8;
+    // Row-split sparse attention (`PLOW_GLM_ROWSPLIT_ATTN`, the 8192 rung only): `w.wuv_full`
+    // is TENSOR_NONE unless `glm_rowsplit_attn_eligible` already agreed this layer reaches the
+    // sparse arm at 8192, so re-checking `sparse && t == 8192` here is belt-and-suspenders, not
+    // the source of truth.
+    let use_rowsplit = sparse && t == 8192 && cfg.glm_rowsplit_attn() && w.wuv_full != TENSOR_NONE;
     // Dense prefill still feeds sparse decode's key cache, including short tail buckets.
     let idx_chain = w.iwqb != TENSOR_NONE && (sparse || (c.dsa(ctx) && c.index_kpool == 1));
 
@@ -6250,6 +6465,9 @@ pub(crate) fn emit_glm_mla_prefill(
     } else {
         glm_pf_ns()
     };
+    let c_uv = if use_rowsplit {
+        emit_glm_rowsplit_attn(b, c, n, w, t, ctx, slot, fp8kv, sparse_sel, &fl_deps, xgate, xr_cus)
+    } else {
     let c_fl = b.emit(
         if fp8kv {
             DevOp::FlashMlaPrefillFp8
@@ -6327,7 +6545,7 @@ pub(crate) fn emit_glm_mla_prefill(
             "native MLA fold requires gfx942 TP8 latent512/value256, splits<8, and no ofold fusion"
         );
     }
-    let c_uv = if ofold {
+    if ofold {
         c_fl
     } else {
         let counter = b.emit(
@@ -6357,6 +6575,7 @@ pub(crate) fn emit_glm_mla_prefill(
             b.isolate(counter);
         }
         counter
+    }
     };
     // TOKEN-BATCH BODY: the band rows take the batched decode attention chain over the same
     // projections. Its fold writes O rows [0, band) AFTER the prefill fold has written all T

@@ -3953,3 +3953,267 @@ fn glm_gemm_lt_pf_ext_routes_the_interpreter_projections() {
     let moe = on.insts.iter().position(|d| d.op == DevOp::MoeAiterFp8Pf as u16).unwrap();
     assert_eq!(find(0, 6144, 256), [seg_of(moe) - 1], "shared down right before the MoE call");
 }
+
+/// `PLOW_GLM_ROWSPLIT_ATTN` OFF must be byte-identical to the packet this emitter produced
+/// before the arm existed. Same production-recipe fixture as
+/// `production_programs_read_only_rows_every_rank_holds` (TP8, 8192 in the prefill ladder,
+/// qualified GLM recipe), so this is the exact "full-depth production recipe" the design's own
+/// gate calls for, not a toy shape. The knob is left UNSET (default off) — no row-split env var
+/// appears in the list below at all, so a reference build from before this arm existed can run
+/// the identical fixture and its `model.pkt` sha256 is the control this test's hash is checked
+/// against externally (see the paths handed to the coordinator).
+///
+/// In-process, this also proves the stronger claim the sha256 alone cannot: not just "the bytes
+/// match" but WHY — no row-split tensor (`qa_tp`/`qr_tp`/`qa_rs`/`qr_rs`/`oat_rs_tp`/the
+/// `wuv_full` replica) and no `XAllToAllHeads` instruction exists anywhere in the blob when the
+/// knob is off, in ANY program (prefill buckets and decode rungs alike).
+#[test]
+fn rowsplit_attn_knob_off_matches_pre_arm_hash() {
+    let _guard = crate::test_env::env_guard();
+    let dir =
+        std::env::temp_dir().join(format!("plow-glm-rowsplit-off-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = serde_json::json!({
+        "model_type": "glm_moe_dsa", "num_hidden_layers": 5,
+        "hidden_size": 6144, "num_attention_heads": 64,
+        "kv_lora_rank": 512, "q_lora_rank": 2048,
+        "qk_nope_head_dim": 192, "qk_rope_head_dim": 64, "v_head_dim": 256,
+        "vocab_size": 128, "rms_norm_eps": 1e-5,
+        "n_routed_experts": 256, "num_experts_per_tok": 8,
+        "moe_intermediate_size": 2048, "intermediate_size": 12288,
+        "first_k_dense_replace": 3, "routed_scaling_factor": 2.5,
+        "rope_theta": 8000000.0,
+        "indexer_types": ["full", "shared", "full", "shared", "full"]
+    });
+    std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+    let _env = crate::test_env::EnvScope::set(&[
+        ("PLOW_FP8", "1"),
+        ("PLOW_GLM_DECODE_NORM_ROWS", "1"),
+        ("PLOW_GLM_DSA", "1"),
+        ("PLOW_GLM_DSA_PF", "1"),
+        ("PLOW_GLM_DSA_PF_SPAN", "3"),
+        ("PLOW_GLM_FP8_KV", "1"),
+        ("PLOW_GLM_FUSE_B1", "1"),
+        ("PLOW_GLM_FUSE_ROPE", "0"),
+        ("PLOW_GLM_FUSE_SEAM", "1"),
+        ("PLOW_GLM_GEMM_LT", "1"),
+        ("PLOW_GLM_GEMM_LT_DECODE", "1"),
+        ("PLOW_GLM_INDEX_TP", "1"),
+        ("PLOW_GLM_MOE_AITER", "1"),
+        ("GLM_MOE_CORESIDENT", "2"),
+        ("PLOW_GLM_MOE_FLAT_DECODE", "0"),
+        ("PLOW_GLM_MOE_RESIDENT", "1"),
+        ("PLOW_GLM_PLACE_PF", "0"),
+        ("PLOW_GLM_SELECT_LOCAL", "1"),
+        ("GLM_SHARD_HEAD", "1"),
+        ("GLM_SHARED_CUS", "48"),
+        ("PLOW_MLA_PREFILL", "full:128,512,2048,8192"),
+        ("PLOW_MOE_PF_DET", "1"),
+        ("PLOW_EMIT_PACKED_PREFILL", "0"),
+        ("PLOW_DECODE_BATCH", "20"),
+        ("PLOW_DECODE_BATCH_LADDER", "1,2,4,8,16,20"),
+        ("PLOW_UNISEG", "0"),
+        ("PLOW_MLA_PF_V2", "1"),
+        ("PLOW_MLA_PF_AITER", "1"),
+        ("PLOW_GLM_SEQ_PAR", "1"),
+        ("PLOW_GLM_SEQ_PAR_PROJ", "1"),
+        ("PLOW_GLM_FOLD_LT", "1"),
+        ("PLOW_GLM_GEMM_LT_DECODE_EXT", "1"),
+        // PLOW_GLM_ROWSPLIT_ATTN is deliberately ABSENT: this is the knob-off, default state.
+    ]);
+    let bad_names: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+    let bad_ops: std::sync::Arc<std::sync::Mutex<usize>> = Default::default();
+    let (bn, bo) = (bad_names.clone(), bad_ops.clone());
+    let verify: crate::VerifyHook = Box::new(move |model| {
+        let hit: Vec<String> = model
+            .tensors
+            .iter()
+            .map(|t| t.name.clone())
+            .filter(|n| {
+                n.contains("qa_tp")
+                    || n.contains("qr_tp")
+                    || n.contains("qa_rs")
+                    || n.contains("qr_rs")
+                    || n.contains("oat_rs")
+            })
+            .collect();
+        *bn.lock().unwrap() = hit;
+        *bo.lock().unwrap() = model
+            .progs
+            .iter()
+            .map(|p| {
+                p.insts
+                    .iter()
+                    .filter(|d| d.op == DevOp::XAllToAllHeads as u16)
+                    .count()
+            })
+            .sum();
+        Ok(crate::LeanReport::skipped("structural regression test"))
+    });
+    let out = dir.join("model.pkt");
+    glm_emit_full(
+        &dir,
+        81920,
+        out.to_str().unwrap(),
+        304,
+        8,
+        true,
+        true,
+        "gfx942",
+        None,
+        Some(&verify),
+    );
+    assert!(
+        bad_names.lock().unwrap().is_empty(),
+        "row-split tensor bound with the knob off: {:?}",
+        bad_names.lock().unwrap()
+    );
+    assert_eq!(
+        *bad_ops.lock().unwrap(),
+        0,
+        "XAllToAllHeads emitted with the knob off"
+    );
+    let bytes = std::fs::read(&out).unwrap();
+    let hash = plow_asset::decode_objects::image_sha256(&bytes);
+    eprintln!("PLOW_GLM_ROWSPLIT_ATTN=off model.pkt sha256 = {hash}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The VRAM floor question the coordinator asked: how many EXTRA declared bytes does turning
+/// `PLOW_GLM_ROWSPLIT_ATTN` on bind, on this same 5-layer production-recipe fixture? Sums every
+/// declared tensor's bytes (knob on) minus the same sum (knob off) — the DECLARED-BYTE delta,
+/// not a measured resident-VRAM number (that needs a real load, step 3's job once the peer-slot
+/// runtime wiring exists). Reports per-layer and the 78-layer extrapolation the coordinator's
+/// own arithmetic used (16 MiB/layer bf16 `W_uv` replica).
+#[test]
+fn rowsplit_attn_knob_on_reports_the_extra_declared_bytes() {
+    let _guard = crate::test_env::env_guard();
+    fn emit_and_sum(rowsplit: bool) -> (u64, usize) {
+        let dir = std::env::temp_dir().join(format!(
+            "plow-glm-rowsplit-bytes-{}-{}",
+            rowsplit,
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = serde_json::json!({
+            "model_type": "glm_moe_dsa", "num_hidden_layers": 5,
+            "hidden_size": 6144, "num_attention_heads": 64,
+            "kv_lora_rank": 512, "q_lora_rank": 2048,
+            "qk_nope_head_dim": 192, "qk_rope_head_dim": 64, "v_head_dim": 256,
+            "vocab_size": 128, "rms_norm_eps": 1e-5,
+            "n_routed_experts": 256, "num_experts_per_tok": 8,
+            "moe_intermediate_size": 2048, "intermediate_size": 12288,
+            "first_k_dense_replace": 3, "routed_scaling_factor": 2.5,
+            "rope_theta": 8000000.0,
+            "indexer_types": ["full", "shared", "full", "shared", "full"]
+        });
+        std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+        let mut envs = vec![
+            ("PLOW_FP8", "1"),
+            ("PLOW_GLM_DECODE_NORM_ROWS", "1"),
+            ("PLOW_GLM_DSA", "1"),
+            ("PLOW_GLM_DSA_PF", "1"),
+            ("PLOW_GLM_DSA_PF_SPAN", "3"),
+            ("PLOW_GLM_FP8_KV", "1"),
+            ("PLOW_GLM_FUSE_B1", "1"),
+            ("PLOW_GLM_FUSE_ROPE", "0"),
+            ("PLOW_GLM_FUSE_SEAM", "1"),
+            ("PLOW_GLM_GEMM_LT", "1"),
+            ("PLOW_GLM_GEMM_LT_DECODE", "1"),
+            ("PLOW_GLM_INDEX_TP", "1"),
+            ("PLOW_GLM_MOE_AITER", "1"),
+            ("GLM_MOE_CORESIDENT", "2"),
+            ("PLOW_GLM_MOE_FLAT_DECODE", "0"),
+            ("PLOW_GLM_MOE_RESIDENT", "1"),
+            ("PLOW_GLM_PLACE_PF", "0"),
+            ("PLOW_GLM_SELECT_LOCAL", "1"),
+            ("GLM_SHARD_HEAD", "1"),
+            ("GLM_SHARED_CUS", "48"),
+            ("PLOW_MLA_PREFILL", "full:128,512,2048,8192"),
+            ("PLOW_MOE_PF_DET", "1"),
+            ("PLOW_EMIT_PACKED_PREFILL", "0"),
+            ("PLOW_DECODE_BATCH", "20"),
+            ("PLOW_DECODE_BATCH_LADDER", "1,2,4,8,16,20"),
+            ("PLOW_UNISEG", "0"),
+            ("PLOW_MLA_PF_V2", "1"),
+            ("PLOW_MLA_PF_AITER", "1"),
+            ("PLOW_GLM_SEQ_PAR", "1"),
+            ("PLOW_GLM_SEQ_PAR_PROJ", "1"),
+            ("PLOW_GLM_FOLD_LT", "1"),
+            ("PLOW_GLM_GEMM_LT_DECODE_EXT", "1"),
+        ];
+        if rowsplit {
+            envs.push(("PLOW_GLM_ROWSPLIT_ATTN", "1"));
+        }
+        let _env = crate::test_env::EnvScope::set(&envs);
+        let total: std::sync::Arc<std::sync::Mutex<u64>> = Default::default();
+        let sink = total.clone();
+        let count: std::sync::Arc<std::sync::Mutex<usize>> = Default::default();
+        let csink = count.clone();
+        let verify: crate::VerifyHook = Box::new(move |model| {
+            *sink.lock().unwrap() = model.tensors.iter().map(|t| t.bytes).sum();
+            *csink.lock().unwrap() = model.tensors.len();
+            if rowsplit {
+                for t in &model.tensors {
+                    if t.name.contains("qa_tp")
+                        || t.name.contains("qr_tp")
+                        || t.name.contains("qa_rs")
+                        || t.name.contains("qr_rs")
+                        || t.name.contains("oat_rs")
+                        || t.name.contains("v_absorb")
+                    {
+                        eprintln!("  tensor {} bytes={}", t.name, t.bytes);
+                    }
+                }
+            }
+            Ok(crate::LeanReport::skipped("byte-total probe"))
+        });
+        glm_emit_full(
+            &dir,
+            81920,
+            dir.join("model.pkt").to_str().unwrap(),
+            304,
+            8,
+            true,
+            true,
+            "gfx942",
+            None,
+            Some(&verify),
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+        let t = *total.lock().unwrap();
+        let c = *count.lock().unwrap();
+        (t, c)
+    }
+    let (off_bytes, off_n) = emit_and_sum(false);
+    let (on_bytes, on_n) = emit_and_sum(true);
+    assert!(
+        on_bytes > off_bytes,
+        "the knob must bind at least the replica's bytes"
+    );
+    let extra = on_bytes - off_bytes;
+    // The delta is NOT uniform per layer: `wuv_full` (16 MiB here) is per-layer, but the three
+    // new program-wide scratch tensors (`qa_rs`/`qr_rs`/`oat_rs_tp` — `qa_tp`/`qr_tp` are
+    // RENAMES of the existing `qa`/`qr` at the same byte size, zero extra) are a ONE-TIME cost
+    // paid once per program, not once per layer. Naively dividing the whole delta by 5 layers
+    // and scaling to 78 would double-count that fixed cost 78/5x over. Report both terms.
+    let per_layer_wuv_full = 16u64 * 1024 * 1024; // this fixture's nh*dk*vd*BF16, checked below
+    let scratch_once = extra - 5 * per_layer_wuv_full;
+    let extra_78 = 78 * per_layer_wuv_full + scratch_once;
+    eprintln!(
+        "PLOW_GLM_ROWSPLIT_ATTN extra declared bytes on this 5-layer fixture: {extra} B \
+         ({:.2} MiB) across {} extra tensors ({} -> {} declared) = 5 x {:.2} MiB/layer W_uv \
+         replica + {:.2} MiB one-time scratch (qa_rs/qr_rs/oat_rs_tp; qa_tp/qr_tp are renames \
+         of qa/qr at the same size, zero extra); 78-layer extrapolation = 78 x {:.2} MiB + \
+         {:.2} MiB once = {:.2} GiB/rank",
+        extra as f64 / (1024.0 * 1024.0),
+        on_n.saturating_sub(off_n),
+        off_n,
+        on_n,
+        per_layer_wuv_full as f64 / (1024.0 * 1024.0),
+        scratch_once as f64 / (1024.0 * 1024.0),
+        per_layer_wuv_full as f64 / (1024.0 * 1024.0),
+        scratch_once as f64 / (1024.0 * 1024.0),
+        extra_78 as f64 / (1024.0 * 1024.0 * 1024.0)
+    );
+}

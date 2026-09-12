@@ -806,6 +806,17 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_SEQ_PAR_PROJ", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_seq_par_proj: Option<bool>,
 
+    /// Query-row-split sparse attention for the GLM 8192 prefill rung only
+    /// (`reports/rowsplit-attention-design.md`): after q_absorb/q_rope/HeadNormRope, an
+    /// all-to-all over heads reshapes `[T][nh_l][576]` into `[T/8][64][576]` per rank, attention
+    /// runs as four 16-head launches over the row band, and a second all-to-all reshapes the
+    /// output back; the selection all-gather is dropped (`IndexTpPf` is already row-split).
+    /// Opt-in, OFF by default (unlike the qualified recipe's other `glm_*` knobs): knob off is
+    /// byte-identical, knob on is not (a different attention object, different accumulation
+    /// order). `=true` to enable.
+    #[arg(long, env = "PLOW_GLM_ROWSPLIT_ATTN", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_rowsplit_attn: Option<bool>,
+
     /// Size the batched-decode glue packets to their work items: the FP8 latent KV writer at one
     /// wave per row instead of one workgroup, the router top-k at one workgroup per token, the
     /// MoE combine at one thread per element. Pure width changes, bit-identical.
@@ -1245,6 +1256,7 @@ impl EmitConfig {
             glm_xr_res: env_bool("PLOW_GLM_XR_RES"),
             glm_seq_par: env_bool_opt("PLOW_GLM_SEQ_PAR"),
             glm_seq_par_proj: env_bool_opt("PLOW_GLM_SEQ_PAR_PROJ"),
+            glm_rowsplit_attn: env_bool_opt("PLOW_GLM_ROWSPLIT_ATTN"),
             glm_decode_glue_cus: env_bool("PLOW_GLM_DECODE_GLUE_CUS"),
             glm_decode_gemm_group: env_bool_opt("PLOW_GLM_DECODE_GEMM_GROUP"),
             glm_fuse_xrn: env_bool("GLM_FUSE_XRN"),
@@ -1492,6 +1504,13 @@ impl EmitConfig {
     pub fn glm_seq_par_proj(&self) -> bool {
         self.glm_seq_par_proj
             .unwrap_or(self.glm_production_defaults && self.glm_seq_par())
+    }
+
+    /// OFF by default even under [`Self::glm_production_defaults`] — opt-in only, unlike every
+    /// other `glm_*` recipe knob. Knob off must stay byte-identical to the packet this emitter
+    /// produced before the arm existed.
+    pub fn glm_rowsplit_attn(&self) -> bool {
+        self.glm_rowsplit_attn.unwrap_or(false)
     }
 
     /// The `(clap id, still unset, resolved value)` triples [`super::apply_production_defaults`]
