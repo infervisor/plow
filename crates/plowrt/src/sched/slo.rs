@@ -981,6 +981,8 @@ mod tests {
         };
         let (mut all_mixed, mut all_decode) = (Vec::new(), Vec::new());
         let (mut covered, mut over) = (Vec::<f64>::new(), Vec::new());
+        let mut by_class = [(0u32, 0u32); 3];
+        let mut margins: Vec<[f64; 3]> = Vec::new();
         for path in paths.split(':') {
             let text = std::fs::read_to_string(path).expect("log");
             let mut cost = TickCost::default();
@@ -1013,6 +1015,8 @@ mod tests {
                             };
                             let planned = pred * cost.margin(class);
                             covered.push(f64::from(u8::from(total <= planned)));
+                            by_class[class as usize].0 += 1;
+                            by_class[class as usize].1 += u32::from(total <= planned);
                             over.push(((total - planned) / planned).max(0.0));
                             cost.observe_margin(class, total / pred);
                             mixed.push(err)
@@ -1030,6 +1034,7 @@ mod tests {
                     launches.clear();
                 }
             }
+            margins.push([TickClass::Plain, TickClass::Completing, TickClass::Fresh].map(|c| cost.margin(c)));
             let n = mixed.len();
             println!("{path}: {n} prefill+decode ticks, |err| p50 {:.1}% p90 {:.1}%", 100.0 * pct(&mut mixed, 0.5), 100.0 * pct(&mut mixed, 0.9));
             all_mixed.extend(mixed);
@@ -1051,6 +1056,16 @@ mod tests {
             100.0 * pct(&mut over.iter().copied().filter(|&o| o > 0.0).collect(), 0.5),
             100.0 * pct(&mut over.iter().copied().filter(|&o| o > 0.0).collect(), 0.99),
         );
+        for (i, name) in ["plain", "completing", "fresh"].iter().enumerate() {
+            let (n, ok) = by_class[i];
+            let mut end: Vec<f64> = margins.iter().map(|m| m[i]).collect();
+            println!(
+                "  {name}: {n} ticks, {:.1}% at or under plan; end-of-log margin p50 {:.3} max {:.3}",
+                100.0 * f64::from(ok) / f64::from(n.max(1)),
+                pct(&mut end, 0.5),
+                end.iter().copied().fold(0.0, f64::max),
+            );
+        }
         assert!(pct(&mut all_mixed, 0.5) < 0.10);
     }
 
