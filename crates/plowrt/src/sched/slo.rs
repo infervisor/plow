@@ -1,0 +1,802 @@
+//! SLO-aware per-tick prefill budget (`PLOW_TBT_SLO_MS`, `PLOW_TTFT_SLO_MS`).
+//!
+//! Every tick still runs every live decode row. Under an inter-token (TBT) target the prefill
+//! the tick carries is sized in MILLISECONDS, not rows: candidates are taken in order and each
+//! gets the largest chunk whose launch keeps the predicted tick (prefill launches + the decode
+//! pass + host remainder) at or under the target. Several requests may each get a launch.
+//! Under a TTFT target candidates are ordered by deadline slack (EDF): prompts this tick
+//! completes first, then by slack, and requests that can no longer make their deadline last.
+//!
+//! **Progress rule.** When even the smallest chunk would push the tick over the target, the
+//! tick runs decode only; after `K - 1` such ticks one chunk runs, where
+//! `K = ceil(p_min / s)`, `s = target - (decode + host)` and `p_min` is the predicted cost of the
+//! smallest chunk. That chunk is sized to fill `K * s`, so over the `K` ticks the mean
+//! inter-token time is `decode + host + cost / K <= target`. `K` is capped at [`MAX_SKIP_TICKS`]:
+//! a target at or below the decode pass itself cannot be met, and the cap keeps prompts moving
+//! (one smallest chunk every `MAX_SKIP_TICKS` ticks) instead of starving them.
+//!
+//! A shrunk chunk runs in whatever bucket the engine plans for `[c0, c0 + n)`, which
+//! [`Ladder::bucket_for`] mirrors: the smallest rung that holds `n`, moved to the sparse rung at
+//! its real row count when the prior context reaches `amd_tail_sparse_ctx`.
+//!
+//! Costs come from [`TickCost`], an online model updated from every observed tick.
+//! Unset targets never reach this module: [`plan_tick`] returns [`step::plan`] verbatim.
+//!
+//! Under a target the plan uses isolated launches only; cross-request packing is not used
+//! because its cost is not modelled.
+
+use super::step::{self, Backend, Candidate, Launch, Plan, Tick};
+
+/// Longest run of decode-only ticks the progress rule allows while prefill waits.
+pub const MAX_SKIP_TICKS: u32 = 8;
+
+/// Latency targets. Both `None` is the throughput schedule.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Targets {
+    pub tbt_ms: Option<f64>,
+    pub ttft_ms: Option<f64>,
+}
+
+impl Targets {
+    pub fn active(&self) -> bool {
+        self.tbt_ms.is_some() || self.ttft_ms.is_some()
+    }
+}
+
+/// The compiled prefill rungs as `(rows, sparse)`, ascending, plus the tail-sparse floor.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Ladder {
+    pub rungs: Vec<(u32, bool)>,
+    pub tail_sparse_ctx: Option<u32>,
+}
+
+impl Ladder {
+    /// The bucket the engine plans for a chunk of `rows` whose first row sits at `prior`: the
+    /// smallest rung that holds it, or the widest sparse rung when that rung is dense and
+    /// `prior` reaches the tail-sparse floor (`serve::engine::retarget_dense_tail`).
+    pub fn bucket_for(&self, rows: u32, prior: u32) -> Option<u32> {
+        let (width, sparse) = *self.rungs.iter().find(|&&(w, _)| w >= rows)?;
+        let wider_sparse = self
+            .rungs
+            .iter()
+            .filter(|&&(w, s)| s && w > width)
+            .map(|&(w, _)| w)
+            .max();
+        match (self.tail_sparse_ctx, wider_sparse) {
+            (Some(floor), Some(sparse_w)) if !sparse && prior >= floor => Some(sparse_w),
+            _ => Some(width),
+        }
+    }
+
+    fn widest(&self) -> u32 {
+        self.rungs.last().map_or(0, |r| r.0)
+    }
+
+    fn granule(&self) -> u32 {
+        self.rungs.first().map_or(1, |r| r.0.max(1))
+    }
+}
+
+/// What the planner needs to price a tick.
+pub trait CostModel {
+    /// One isolated prefill launch of `rows` real rows in `bucket`, first row at `prior`;
+    /// `fresh` = the request's first launch (its cursor is built in the same call).
+    fn launch_ms(&self, bucket: u32, rows: u32, prior: u32, fresh: bool) -> f64;
+    /// The decode pass over `rows` slots; `after_prefill` = it follows a prefill launch.
+    fn decode_ms(&self, rows: u32, after_prefill: bool) -> f64;
+    /// Tick time outside the launches and the decode pass.
+    fn host_ms(&self) -> f64;
+}
+
+/// Recursive least squares with exponential forgetting. The prior is `theta`; the covariance
+/// is kept within its initial trace so directions the data never excite (every chunk the same
+/// width, say) do not wind up and swing on the first sample that does.
+#[derive(Clone, Debug)]
+struct Rls<const N: usize> {
+    theta: [f64; N],
+    p: [[f64; N]; N],
+    trace0: f64,
+    lambda: f64,
+    samples: u64,
+}
+
+impl<const N: usize> Rls<N> {
+    /// `prior_sd` per coefficient and `noise_sd` of one observation, both in ms.
+    fn new(theta: [f64; N], prior_sd: [f64; N], noise_sd: f64, lambda: f64) -> Self {
+        let mut p = [[0.0; N]; N];
+        for i in 0..N {
+            p[i][i] = (prior_sd[i] / noise_sd).powi(2);
+        }
+        let trace0 = (0..N).map(|i| p[i][i]).sum();
+        Self { theta, p, trace0, lambda, samples: 0 }
+    }
+
+    fn predict(&self, x: &[f64; N]) -> f64 {
+        self.theta.iter().zip(x).map(|(t, x)| t * x).sum()
+    }
+
+    fn update(&mut self, x: &[f64; N], y: f64) {
+        let mut px = [0.0; N];
+        for i in 0..N {
+            px[i] = (0..N).map(|j| self.p[i][j] * x[j]).sum();
+        }
+        let denom = self.lambda + x.iter().zip(&px).map(|(a, b)| a * b).sum::<f64>();
+        if !(denom.is_finite() && denom > 0.0 && y.is_finite()) {
+            return;
+        }
+        let err = y - self.predict(x);
+        let mut trace = 0.0;
+        for i in 0..N {
+            let k = px[i] / denom;
+            self.theta[i] += k * err;
+            for j in 0..N {
+                self.p[i][j] = (self.p[i][j] - k * px[j]) / self.lambda;
+            }
+            trace += self.p[i][i];
+        }
+        if trace > self.trace0 {
+            let s = self.trace0 / trace;
+            self.p.iter_mut().flatten().for_each(|v| *v *= s);
+        }
+        self.samples += 1;
+    }
+
+    fn scaled(&self, s: f64) -> Self {
+        let mut out = self.clone();
+        out.theta.iter_mut().for_each(|t| *t *= s);
+        out
+    }
+}
+
+const LAUNCH_DIM: usize = 5;
+const DECODE_DIM: usize = 2;
+
+fn launch_x(rows: u32, prior: u32) -> [f64; LAUNCH_DIM] {
+    let r = f64::from(rows) / 8192.0;
+    let p = f64::from(prior) / 65536.0;
+    [1.0, r, p, r * p, if prior == 0 { 1.0 } else { 0.0 }]
+}
+
+fn decode_x(rows: u32) -> [f64; DECODE_DIM] {
+    [1.0, f64::from(rows) / 20.0]
+}
+
+/// Priors, in ms, over `launch_x`: GLM-5.3 TP8 FP8, 78 layers, MI300X, from the 2026-09-11/12
+/// `PLOW_TICK_LOG` server logs. Online updates replace them within a few samples.
+fn launch_prior(bucket: u32) -> [f64; LAUNCH_DIM] {
+    match bucket {
+        128 => [100.0, 100.0, 650.0, 0.0, 0.0],
+        512 => [120.0, 200.0, 1700.0, 0.0, 0.0],
+        2048 => [356.0, 106.0, 1056.0, 160.0, 0.0],
+        8192 => [150.0, 760.0, 40.0, 0.0, 90.0],
+        _ => [60.0, 800.0, 400.0, 0.0, 0.0],
+    }
+}
+const LAUNCH_PRIOR_SD: [f64; LAUNCH_DIM] = [200.0, 600.0, 600.0, 600.0, 300.0];
+const DECODE_PRIOR: [[f64; DECODE_DIM]; 2] = [[92.8, 7.7], [114.6, 4.3]];
+const DECODE_PRIOR_SD: [f64; DECODE_DIM] = [50.0, 50.0];
+
+/// Online per-tick cost predictor: one RLS model per prefill bucket over
+/// `[1, rows, prior, rows * prior, first chunk]`, one per decode pass kind (after a prefill
+/// launch, or decode-only) over `[1, rows]`, an EWMA of a fresh request's cursor overhead,
+/// and a winsorised EWMA of the host remainder.
+///
+/// A model with no samples yet predicts its prior scaled by how fast this engine's decode-only
+/// pass is relative to the prior's (`speed`), so a faster engine or a truncated packet starts
+/// near its own scale; its first sample starts from that scaled prior.
+#[derive(Clone, Debug)]
+pub struct TickCost {
+    launches: Vec<(u32, Rls<LAUNCH_DIM>)>,
+    decode: [Rls<DECODE_DIM>; 2],
+    fresh_ms: f64,
+    host_ms: f64,
+}
+
+impl Default for TickCost {
+    fn default() -> Self {
+        let decode = |i: usize| Rls::new(DECODE_PRIOR[i], DECODE_PRIOR_SD, 10.0, 0.98);
+        Self { launches: Vec::new(), decode: [decode(0), decode(1)], fresh_ms: 0.0, host_ms: 0.0 }
+    }
+}
+
+impl TickCost {
+    fn speed(&self) -> f64 {
+        let d = &self.decode[0];
+        if d.samples == 0 {
+            return 1.0;
+        }
+        let x = decode_x(20);
+        let prior = DECODE_PRIOR[0][0] * x[0] + DECODE_PRIOR[0][1] * x[1];
+        (d.predict(&x) / prior).clamp(0.01, 100.0)
+    }
+
+    fn launch_model(&self, bucket: u32) -> Option<&Rls<LAUNCH_DIM>> {
+        self.launches.iter().find(|(b, _)| *b == bucket).map(|(_, m)| m)
+    }
+
+    pub fn observe_launch(&mut self, bucket: u32, rows: u32, prior: u32, fresh: bool, ms: f64) {
+        if fresh {
+            let chunk = self.launch_ms(bucket, rows, prior, false);
+            let extra = (ms - chunk).max(0.0);
+            self.fresh_ms = 0.8 * self.fresh_ms + 0.2 * extra;
+            return;
+        }
+        let speed = self.speed();
+        let i = match self.launches.iter().position(|(b, _)| *b == bucket) {
+            Some(i) => i,
+            None => {
+                let prior_model = Rls::new(launch_prior(bucket), LAUNCH_PRIOR_SD, 50.0, 0.99);
+                self.launches.push((bucket, prior_model.scaled(speed)));
+                self.launches.len() - 1
+            }
+        };
+        self.launches[i].1.update(&launch_x(rows, prior), ms);
+    }
+
+    pub fn observe_decode(&mut self, rows: u32, after_prefill: bool, ms: f64) {
+        let i = usize::from(after_prefill);
+        if after_prefill && self.decode[1].samples == 0 {
+            self.decode[1] = Rls::new(DECODE_PRIOR[1], DECODE_PRIOR_SD, 10.0, 0.98).scaled(self.speed());
+        }
+        self.decode[i].update(&decode_x(rows), ms);
+    }
+
+    pub fn observe_host(&mut self, ms: f64) {
+        let capped = ms.max(0.0).min(3.0 * self.host_ms + 5.0);
+        self.host_ms = 0.9 * self.host_ms + 0.1 * capped;
+    }
+}
+
+impl CostModel for TickCost {
+    fn launch_ms(&self, bucket: u32, rows: u32, prior: u32, fresh: bool) -> f64 {
+        let x = launch_x(rows, prior);
+        let chunk = match self.launch_model(bucket) {
+            Some(m) => m.predict(&x),
+            None => {
+                let p = launch_prior(bucket);
+                self.speed() * p.iter().zip(&x).map(|(a, b)| a * b).sum::<f64>()
+            }
+        };
+        chunk.max(0.0) + if fresh { self.fresh_ms } else { 0.0 }
+    }
+
+    fn decode_ms(&self, rows: u32, after_prefill: bool) -> f64 {
+        let i = usize::from(after_prefill);
+        let x = decode_x(rows);
+        let m = &self.decode[i];
+        if i == 1 && m.samples == 0 {
+            return m.predict(&x) * self.speed();
+        }
+        m.predict(&x).max(0.0)
+    }
+
+    fn host_ms(&self) -> f64 {
+        self.host_ms
+    }
+}
+
+/// Per-dispatcher SLO state carried across ticks.
+#[derive(Clone, Debug, Default)]
+pub struct SloState {
+    pub cost: TickCost,
+    /// Consecutive decode-only ticks the progress rule has spent while prefill waited.
+    pub skipped: u32,
+    /// The engine's prefill ladder, read once.
+    pub ladder: Option<Ladder>,
+}
+
+/// A prefill candidate as the SLO planner sees it.
+#[derive(Clone, Copy, Debug)]
+pub struct SloCandidate {
+    pub base: Candidate,
+    /// Absolute position of its next row (its cursor frontier; 0 for a fresh request).
+    pub prior: u32,
+    /// Prompt rows it still has to prefill.
+    pub remaining: u32,
+    /// Time since it arrived.
+    pub age_ms: f64,
+}
+
+impl SloCandidate {
+    fn fresh(&self) -> bool {
+        !self.base.planned
+    }
+
+    /// The most rows this tick may give it: its planned chunk, or for a fresh request what the
+    /// engine's first plan against the full budget would hold.
+    fn max_rows(&self, full_budget: u32) -> u32 {
+        let natural = if self.base.planned { self.base.span.n_rows } else { self.remaining };
+        natural.min(full_budget)
+    }
+}
+
+/// The chunk an isolated launch actually ran: its bucket's rows, first row, real rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ran {
+    pub bucket: u32,
+    pub c0: u32,
+    pub clen: u32,
+}
+
+/// Why a tick's prefill looks the way it does (for the tick log).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SloOutcome {
+    /// Prefill budget the target left this tick (ms); infinite when no target binds.
+    pub budget_ms: f64,
+    /// Predicted tick: launches + decode pass + host (ms).
+    pub predicted_ms: f64,
+    /// The progress rule ran this tick's chunk.
+    pub progress: bool,
+    /// The progress rule's `K` when it applied this tick.
+    pub k: u32,
+}
+
+/// Plan one tick. Unset targets return [`step::plan`] verbatim.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_tick(
+    targets: Targets,
+    backend: Backend,
+    tick: Tick,
+    decodes: impl IntoIterator<Item = u32>,
+    candidates: &[SloCandidate],
+    ladder: &Ladder,
+    cost: &impl CostModel,
+    skipped: &mut u32,
+    program_rows: impl Fn(u32) -> Option<u32>,
+    program_span_limit: impl Fn(u32) -> u32,
+) -> (Plan, SloOutcome) {
+    if !targets.active() {
+        let base: Vec<Candidate> = candidates.iter().map(|c| c.base).collect();
+        let plan = step::plan(backend, tick, decodes, &base, program_rows, program_span_limit);
+        return (plan, SloOutcome::default());
+    }
+    let decodes: Vec<u32> = decodes.into_iter().collect();
+    let full_budget = tick.cap_rows.min(backend.step_budget);
+    let decode_rows = u32::try_from(decodes.len()).unwrap_or(u32::MAX);
+    let fixed_ms = |after_prefill: bool| {
+        if decodes.is_empty() {
+            cost.host_ms()
+        } else {
+            cost.decode_ms(decode_rows, after_prefill) + cost.host_ms()
+        }
+    };
+    let binding = !decodes.is_empty() && targets.tbt_ms.is_some();
+    let slack_ms = targets.tbt_ms.map_or(f64::INFINITY, |t| t - fixed_ms(true));
+    let mut outcome = SloOutcome {
+        budget_ms: if binding { slack_ms } else { f64::INFINITY },
+        ..SloOutcome::default()
+    };
+    let order = order(targets, tick, candidates, ladder, cost, full_budget);
+    let mut launches = Vec::new();
+    let mut left_ms = outcome.budget_ms;
+    let mut left_rows = full_budget;
+    let mut spent_ms = 0.0;
+    for &i in &order {
+        let c = &candidates[i];
+        if left_rows == 0 {
+            break;
+        }
+        let max_rows = c.max_rows(full_budget);
+        let rows = if binding {
+            rows_within(c, max_rows.min(left_rows), left_ms, ladder, cost)
+        } else {
+            // No target binds: a planned chunk runs whole or waits, as in `step::plan`.
+            (max_rows <= left_rows && max_rows > 0).then_some(max_rows)
+        };
+        let Some(rows) = rows else { continue };
+        let ms = launch_cost(c, rows, ladder, cost);
+        spent_ms += ms;
+        left_ms -= ms;
+        left_rows -= rows;
+        launches.push(launch(c, rows));
+    }
+    if binding && launches.is_empty() {
+        if let Some(&first) = order.first() {
+            let c = &candidates[first];
+            let max_rows = c.max_rows(full_budget);
+            let min_rows = ladder.granule().min(max_rows).max(1);
+            let p_min = launch_cost(c, min_rows, ladder, cost);
+            let k = progress_k(p_min, slack_ms);
+            outcome.k = k;
+            if *skipped + 1 >= k {
+                let budget = (f64::from(k) * slack_ms).max(p_min);
+                let rows = rows_within(c, max_rows, budget, ladder, cost).unwrap_or(min_rows);
+                spent_ms = launch_cost(c, rows, ladder, cost);
+                launches.push(launch(c, rows));
+                outcome.progress = true;
+            }
+        }
+    }
+    if launches.is_empty() && binding && !candidates.is_empty() {
+        *skipped += 1;
+    } else {
+        *skipped = 0;
+    }
+    outcome.predicted_ms = spent_ms + fixed_ms(!launches.is_empty());
+    let prefill: u32 = launches.iter().map(Launch::rows).sum();
+    (
+        Plan {
+            decodes,
+            launches,
+            budget_left: full_budget.saturating_sub(prefill),
+        },
+        outcome,
+    )
+}
+
+/// `K` of the progress rule: the fewest ticks whose slack pays for the smallest chunk.
+pub fn progress_k(p_min_ms: f64, slack_ms: f64) -> u32 {
+    if slack_ms <= 0.0 || !slack_ms.is_finite() {
+        return if slack_ms.is_infinite() && slack_ms > 0.0 { 1 } else { MAX_SKIP_TICKS };
+    }
+    let k = (p_min_ms / slack_ms).ceil();
+    if k.is_finite() {
+        (k.max(1.0) as u32).min(MAX_SKIP_TICKS)
+    } else {
+        MAX_SKIP_TICKS
+    }
+}
+
+fn launch(c: &SloCandidate, rows: u32) -> Launch {
+    let mut span = c.base.span;
+    span.row0 = 0;
+    span.n_rows = rows;
+    span.kv_len = span.kv_row0 + rows;
+    Launch { spans: vec![span] }
+}
+
+fn launch_cost(c: &SloCandidate, rows: u32, ladder: &Ladder, cost: &impl CostModel) -> f64 {
+    let bucket = ladder.bucket_for(rows, c.prior).unwrap_or(rows);
+    cost.launch_ms(bucket, rows, c.prior, c.fresh())
+}
+
+/// The largest chunk of at most `max_rows` whose launch fits `budget_ms`: `max_rows` itself or
+/// a multiple of the smallest rung. `None` when nothing fits.
+fn rows_within(
+    c: &SloCandidate,
+    max_rows: u32,
+    budget_ms: f64,
+    ladder: &Ladder,
+    cost: &impl CostModel,
+) -> Option<u32> {
+    if max_rows == 0 {
+        return None;
+    }
+    if launch_cost(c, max_rows, ladder, cost) <= budget_ms {
+        return Some(max_rows);
+    }
+    let granule = ladder.granule();
+    let mut rows = (max_rows - 1) / granule * granule;
+    while rows > 0 {
+        if launch_cost(c, rows, ladder, cost) <= budget_ms {
+            return Some(rows);
+        }
+        rows -= granule;
+    }
+    None
+}
+
+/// Candidate order. With a TTFT target: prompts completing this tick with slack left, then
+/// the rest with slack left by slack, then the requests past saving by arrival. Otherwise the
+/// arrival (or rotation) order of `step::plan`.
+fn order(
+    targets: Targets,
+    tick: Tick,
+    candidates: &[SloCandidate],
+    ladder: &Ladder,
+    cost: &impl CostModel,
+    full_budget: u32,
+) -> Vec<usize> {
+    let mut idx: Vec<usize> = (0..candidates.len())
+        .filter(|&i| {
+            let c = &candidates[i];
+            c.base.span.n_rows > 0 && (c.base.span.slot as usize) < tick.slots
+        })
+        .collect();
+    let slots = tick.slots.max(1);
+    let fifo = |c: &SloCandidate| {
+        let slot = c.base.span.slot as usize;
+        if tick.rotate {
+            ((slot + slots - tick.turn % slots) % slots, 0, slot)
+        } else {
+            (0, c.base.arrival, slot)
+        }
+    };
+    let Some(ttft) = targets.ttft_ms else {
+        idx.sort_by_key(|&i| fifo(&candidates[i]));
+        return idx;
+    };
+    let widest = ladder.widest().max(1);
+    let key = |c: &SloCandidate| {
+        let per_row = cost.launch_ms(ladder.bucket_for(widest, c.prior).unwrap_or(widest), widest, c.prior, false)
+            / f64::from(widest);
+        let slack = ttft - c.age_ms - f64::from(c.remaining) * per_row;
+        let completes = c.remaining <= c.max_rows(full_budget);
+        let tier = match (slack >= 0.0, completes) {
+            (true, true) => 0u8,
+            (true, false) => 1,
+            (false, _) => 2,
+        };
+        (tier, if tier == 2 { 0.0 } else { slack })
+    };
+    idx.sort_by(|&a, &b| {
+        let (ca, cb) = (&candidates[a], &candidates[b]);
+        let (ka, kb) = (key(ca), key(cb));
+        ka.0.cmp(&kb.0)
+            .then(ka.1.total_cmp(&kb.1))
+            .then(fifo(ca).cmp(&fifo(cb)))
+    });
+    idx
+}
+
+/// Whether one request met each target: TTFT, and its mean inter-token time (TPOT) against the
+/// TBT target. An unset target is met.
+pub fn attained(targets: Targets, ttft_ms: f64, tpot_ms: f64) -> (bool, bool) {
+    (
+        targets.ttft_ms.is_none_or(|t| ttft_ms <= t),
+        targets.tbt_ms.is_none_or(|t| tpot_ms <= t),
+    )
+}
+
+/// Seconds a per-launch and per-decode-pass saving removes from a recorded run: the yardstick
+/// the review log applies by hand. `ticks` = `(prefill launches, decode rows)` per recorded tick.
+pub fn seconds_removed(ticks: &[(u32, u32)], per_launch_ms: f64, per_decode_ms: f64) -> f64 {
+    ticks
+        .iter()
+        .map(|&(launches, decode_rows)| {
+            f64::from(launches) * per_launch_ms + if decode_rows > 0 { per_decode_ms } else { 0.0 }
+        })
+        .sum::<f64>()
+        / 1e3
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use packet::dev::PrefillSpan;
+
+    /// Linear fake: a launch costs `fixed + per_row * rows + deep` where `deep` is added at a
+    /// prior of 16384 or more in a dense bucket; decode `decode` ms; no host time.
+    struct Fake {
+        fixed: f64,
+        per_row: f64,
+        dense_deep: f64,
+        decode: f64,
+    }
+
+    impl CostModel for Fake {
+        fn launch_ms(&self, bucket: u32, rows: u32, prior: u32, _fresh: bool) -> f64 {
+            let deep = if bucket < 8192 && prior >= 16384 { self.dense_deep } else { 0.0 };
+            self.fixed + self.per_row * f64::from(rows) + deep
+        }
+        fn decode_ms(&self, _rows: u32, _after: bool) -> f64 {
+            self.decode
+        }
+        fn host_ms(&self) -> f64 {
+            0.0
+        }
+    }
+
+    fn glm() -> Fake {
+        Fake { fixed: 150.0, per_row: 0.09, dense_deep: 1200.0, decode: 110.0 }
+    }
+
+    fn ladder() -> Ladder {
+        Ladder {
+            rungs: vec![(128, false), (512, false), (2048, false), (8192, true)],
+            tail_sparse_ctx: Some(16384),
+        }
+    }
+
+    fn amd() -> Backend {
+        Backend { step_budget: 8192, packing: true, split_spans: false, decode_rows_join_prefill: false }
+    }
+
+    fn tick() -> Tick {
+        Tick { cap_rows: u32::MAX, packing: true, rotate: false, turn: 0, slots: 32 }
+    }
+
+    fn cand(slot: u32, arrival: u64, prior: u32, rows: u32, remaining: u32, age_ms: f64) -> SloCandidate {
+        SloCandidate {
+            base: Candidate {
+                span: PrefillSpan {
+                    row0: 0,
+                    n_rows: rows,
+                    slot,
+                    flags: 0,
+                    kv_row0: 0,
+                    kv_len: rows,
+                    state_slot: slot,
+                    program: 0,
+                },
+                arrival,
+                packable: false,
+                planned: true,
+            },
+            prior,
+            remaining,
+            age_ms,
+        }
+    }
+
+    fn run(targets: Targets, cands: &[SloCandidate], decodes: u32, state: &mut SloState) -> (Plan, SloOutcome) {
+        plan_tick(targets, amd(), tick(), 0..decodes, cands, &ladder(), &glm(), &mut state.skipped, |_| None, |_| u32::MAX)
+    }
+
+    fn rows(plan: &Plan) -> Vec<(u32, u32)> {
+        plan.launches.iter().map(|l| (l.spans[0].slot, l.spans[0].n_rows)).collect()
+    }
+
+    const TBT500: Targets = Targets { tbt_ms: Some(500.0), ttft_ms: None };
+
+    #[test]
+    fn the_bucket_mirror_moves_a_shrunk_deep_chunk_to_the_sparse_rung_at_real_rows() {
+        let l = ladder();
+        assert_eq!(l.bucket_for(1500, 4096), Some(2048));
+        assert_eq!(l.bucket_for(1500, 65536), Some(8192));
+        assert_eq!(l.bucket_for(3000, 0), Some(8192));
+        assert_eq!(l.bucket_for(100, 16383), Some(128));
+        assert_eq!(l.bucket_for(9000, 0), None);
+        let off = Ladder { tail_sparse_ctx: None, ..ladder() };
+        assert_eq!(off.bucket_for(1500, 65536), Some(2048));
+    }
+
+    /// 500 ms target, 110 ms decode: 390 ms of prefill = 150 + 0.09 n, so n = 2666 -> the
+    /// 128-row granule below it, 2560. Decode rows are all admitted.
+    #[test]
+    fn the_budget_is_the_largest_chunk_that_keeps_the_tick_under_target() {
+        let mut s = SloState::default();
+        let (plan, out) = run(TBT500, &[cand(3, 0, 65536, 8192, 20000, 0.0)], 19, &mut s);
+        assert_eq!(plan.decodes.len(), 19);
+        assert_eq!(rows(&plan), [(3, 2560)]);
+        assert!(out.predicted_ms <= 500.0 && out.predicted_ms > 490.0, "{out:?}");
+        assert!(!out.progress);
+    }
+
+    /// Several requests share one tick's budget, each its own launch paying its own fixed cost.
+    #[test]
+    fn several_requests_fill_the_budget_in_order() {
+        let mut s = SloState::default();
+        let cands = [cand(0, 1, 65536, 8192, 20000, 0.0), cand(1, 2, 65536, 8192, 20000, 0.0)];
+        let t = Targets { tbt_ms: Some(1000.0), ttft_ms: None };
+        let (plan, out) = run(t, &cands, 5, &mut s);
+        // 890 ms: slot 0 takes its whole 8192 chunk? 150 + 737 = 887 fits; slot 1 gets nothing.
+        assert_eq!(rows(&plan), [(0, 8192)]);
+        assert!(out.predicted_ms <= 1000.0);
+        let short = [cand(0, 1, 65536, 1000, 1000, 0.0), cand(1, 2, 65536, 8192, 20000, 0.0)];
+        let (plan, _) = run(t, &short, 5, &mut s);
+        // slot 0: 150 + 90 = 240; slot 1 gets 890 - 240 = 650 -> 150 + 0.09 n <= 650 -> 5504.
+        assert_eq!(rows(&plan), [(0, 1000), (1, 5504)]);
+    }
+
+    /// No decoders: nothing binds and planned chunks run whole, as the throughput schedule does.
+    #[test]
+    fn without_decoders_the_target_does_not_bind() {
+        let mut s = SloState::default();
+        let (plan, out) = run(TBT500, &[cand(0, 0, 65536, 8192, 20000, 0.0)], 0, &mut s);
+        assert_eq!(rows(&plan), [(0, 8192)]);
+        assert!(out.budget_ms.is_infinite());
+    }
+
+    /// 250 ms target, 110 ms decode: slack 140 < the 161.5 ms smallest chunk. K = 2: one tick
+    /// decodes alone, the next runs a chunk sized to 2 * 140 = 280 ms (1444 rows -> 1408), and
+    /// the mean tick over the pair is (110 + 110 + 276.7) / 2 <= 250.
+    #[test]
+    fn the_progress_rule_runs_one_chunk_every_k_ticks_and_the_mean_meets_the_target() {
+        let t = Targets { tbt_ms: Some(250.0), ttft_ms: None };
+        let c = [cand(0, 0, 65536, 8192, 60000, 0.0)];
+        let mut s = SloState::default();
+        let mut ticks = Vec::new();
+        let mut prefilled = 0;
+        for _ in 0..100 {
+            let (plan, out) = run(t, &c, 20, &mut s);
+            assert_eq!(plan.decodes.len(), 20);
+            assert_eq!(out.k, 2);
+            ticks.push(out.predicted_ms);
+            prefilled += plan.prefill_rows();
+            if out.progress {
+                assert_eq!(rows(&plan), [(0, 1408)]);
+            }
+        }
+        assert_eq!(prefilled, 50 * 1408);
+        let mean = ticks.iter().sum::<f64>() / ticks.len() as f64;
+        assert!(mean <= 250.0, "mean {mean}");
+        assert!(ticks.iter().copied().fold(0.0, f64::max) > 250.0);
+    }
+
+    #[test]
+    fn k_is_capped_when_the_decode_pass_alone_breaks_the_target() {
+        assert_eq!(progress_k(160.0, 140.0), 2);
+        assert_eq!(progress_k(100.0, 140.0), 1);
+        assert_eq!(progress_k(160.0, -5.0), MAX_SKIP_TICKS);
+        assert_eq!(progress_k(10_000.0, 1.0), MAX_SKIP_TICKS);
+        let t = Targets { tbt_ms: Some(100.0), ttft_ms: None };
+        let mut s = SloState::default();
+        let c = [cand(0, 0, 65536, 8192, 60000, 0.0)];
+        let runs: Vec<bool> = (0..3 * MAX_SKIP_TICKS).map(|_| run(t, &c, 20, &mut s).1.progress).collect();
+        assert_eq!(runs.iter().filter(|&&p| p).count(), 3);
+        assert!(runs[MAX_SKIP_TICKS as usize - 1]);
+    }
+
+    /// EDF: a prompt finishing this tick first, then by slack, the doomed last by arrival.
+    #[test]
+    fn a_ttft_target_orders_by_slack_with_completing_prompts_first_and_doomed_last() {
+        let t = Targets { tbt_ms: None, ttft_ms: Some(10_000.0) };
+        let cands = [
+            // arrival order would pick slot 0 first
+            cand(0, 0, 8192, 8192, 50000, 9_000.0), // needs ~5.5 s, 1 s left: doomed
+            cand(1, 1, 8192, 8192, 30000, 2_000.0),  // needs ~3.4 s, slack ~4.6 s
+            cand(2, 2, 8192, 8192, 60000, 1_000.0),  // needs ~6.7 s, slack ~2.3 s
+            cand(3, 3, 65536, 700, 700, 500.0),      // a prefix-hit suffix: completes now
+        ];
+        let o = order(t, tick(), &cands, &ladder(), &glm(), 8192);
+        assert_eq!(o, [3, 2, 1, 0]);
+        let fifo = order(Targets { tbt_ms: Some(500.0), ttft_ms: None }, tick(), &cands, &ladder(), &glm(), 8192);
+        assert_eq!(fifo, [0, 1, 2, 3]);
+    }
+
+    /// Unset targets hand back `step::plan` verbatim, over the same ragged mixes the step
+    /// planner's accounting test uses.
+    #[test]
+    fn unset_targets_plan_exactly_what_the_step_planner_plans() {
+        for seed in 0..300u64 {
+            let mut x = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let mut next = move || {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x
+            };
+            let d = (next() % 21) as u32;
+            let n = (next() % 8) as u32;
+            let cands: Vec<SloCandidate> = (0..n)
+                .map(|i| {
+                    let rows = [128, 512, 1024, 2048, 8192][(next() % 5) as usize];
+                    let planned = next() % 4 != 0;
+                    let mut c = cand(d + i, next() % 50, 4096, if planned { rows } else { u32::MAX }, 9000, 0.0);
+                    c.base.planned = planned;
+                    c.base.packable = next() % 2 == 0;
+                    c.base.span.program = 3;
+                    c
+                })
+                .collect();
+            let cap = [u32::MAX, 8192, 4096, 2048][(next() % 4) as usize];
+            let t = Tick { cap_rows: cap, packing: true, rotate: next() % 2 == 0, turn: (next() % 20) as usize, slots: 32 };
+            let rungs = |p: u32| (p == 3).then_some(2048);
+            let base: Vec<Candidate> = cands.iter().map(|c| c.base).collect();
+            let want = step::plan(amd(), t, 0..d, &base, rungs, |_| u32::MAX);
+            let mut s = SloState::default();
+            let (got, out) = plan_tick(Targets::default(), amd(), t, 0..d, &cands, &ladder(), &glm(), &mut s.skipped, rungs, |_| u32::MAX);
+            assert_eq!(got, want, "seed={seed}");
+            assert_eq!(out, SloOutcome::default());
+            assert_eq!(s.skipped, 0);
+        }
+    }
+
+    #[test]
+    fn rls_learns_a_new_machine_from_the_prior() {
+        let mut c = TickCost::default();
+        // A machine 10x faster than the prior at decode and prefill.
+        for _ in 0..20 {
+            c.observe_decode(20, false, 10.05);
+        }
+        let first = c.launch_ms(8192, 8192, 32768, false);
+        assert!((first - 93.0).abs() < 15.0, "speed-scaled prior {first}");
+        for i in 0..200u32 {
+            let rows = 1024 + (i * 997) % 7168;
+            let prior = (i * 4099) % 65536 + 1;
+            let truth = 15.0 + 0.009 * f64::from(rows) + 0.0001 * f64::from(prior);
+            c.observe_launch(8192, rows, prior, false, truth);
+        }
+        let got = c.launch_ms(8192, 3000, 40000, false);
+        let truth = 15.0 + 27.0 + 4.0;
+        assert!((got - truth).abs() / truth < 0.03, "{got} vs {truth}");
+        assert!((c.decode_ms(20, false) - 10.05).abs() < 0.5);
+    }
+
+    #[test]
+    fn the_yardstick_counts_launches_and_decode_passes() {
+        let ticks = [(1, 19), (1, 0), (0, 20), (2, 20)];
+        assert!((seconds_removed(&ticks, 25.0, 10.0) - (4.0 * 25.0 + 3.0 * 10.0) / 1e3).abs() < 1e-12);
+    }
+}

@@ -67,6 +67,12 @@ pub struct ServingMetrics {
     pub aborted: AtomicU64,
     pub preempted: AtomicU64,
     pub tick_errors: AtomicU64,
+    /// Completed requests judged against `PLOW_TTFT_SLO_MS` / `PLOW_TBT_SLO_MS`, and how many
+    /// met the TTFT target, the TBT target (mean inter-token time), and both (goodput).
+    pub slo_requests: AtomicU64,
+    pub slo_ttft_met: AtomicU64,
+    pub slo_tbt_met: AtomicU64,
+    pub slo_met: AtomicU64,
     pub ttft: Histogram,
     pub itl: Histogram,
     pub tpot: Histogram,
@@ -159,6 +165,30 @@ impl ServingMetrics {
             "counter",
             "Ticks returning a device fault or worker failure.",
             |m: &Metrics, _| m.serving.tick_errors.load(Relaxed)
+        );
+        scalar!(
+            "plowrt_slo_requests_total",
+            "counter",
+            "Completed requests judged against the configured TTFT/TBT targets.",
+            |m: &Metrics, _| m.serving.slo_requests.load(Relaxed)
+        );
+        scalar!(
+            "plowrt_slo_ttft_met_total",
+            "counter",
+            "Judged requests whose time to first token met PLOW_TTFT_SLO_MS.",
+            |m: &Metrics, _| m.serving.slo_ttft_met.load(Relaxed)
+        );
+        scalar!(
+            "plowrt_slo_tbt_met_total",
+            "counter",
+            "Judged requests whose mean inter-token time met PLOW_TBT_SLO_MS.",
+            |m: &Metrics, _| m.serving.slo_tbt_met.load(Relaxed)
+        );
+        scalar!(
+            "plowrt_slo_met_total",
+            "counter",
+            "Judged requests meeting every configured target (goodput).",
+            |m: &Metrics, _| m.serving.slo_met.load(Relaxed)
         );
         family(
             out,
@@ -382,6 +412,16 @@ impl RequestMetrics {
             m.decode.duration(decode);
             if self.tokens > 1 {
                 m.tpot.duration(decode.div_f64((self.tokens - 1) as f64));
+            }
+            let targets = crate::config::RuntimeConfig::get().slo_targets();
+            if targets.active() {
+                let ttft_ms = first.saturating_duration_since(self.arrived).as_secs_f64() * 1e3;
+                let tpot_ms = decode.as_secs_f64() * 1e3 / self.tokens.saturating_sub(1).max(1) as f64;
+                let (ttft_ok, tbt_ok) = crate::sched::slo::attained(targets, ttft_ms, tpot_ms);
+                m.slo_requests.fetch_add(1, Relaxed);
+                m.slo_ttft_met.fetch_add(u64::from(ttft_ok), Relaxed);
+                m.slo_tbt_met.fetch_add(u64::from(tbt_ok), Relaxed);
+                m.slo_met.fetch_add(u64::from(ttft_ok && tbt_ok), Relaxed);
             }
         }
         m.prompt_tokens.tokens(self.prompt);

@@ -162,6 +162,18 @@ pub struct RuntimeConfig {
     #[arg(long = "pf-defer-decode", env = "PLOW_PF_DEFER_DECODE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pf_defer_decode: bool,
 
+    /// AMD inter-token (TBT) target, ms. While requests decode, each tick takes the largest
+    /// prefill it can while the predicted tick stays at or under this value; decode rows always
+    /// run. Unset = the throughput schedule (`PLOW_PF_INTERLEAVE`), unchanged.
+    #[arg(long = "tbt-slo-ms", env = "PLOW_TBT_SLO_MS", global = true)]
+    pub tbt_slo_ms: Option<f64>,
+
+    /// AMD time-to-first-token target, ms. Prefill candidates are ordered by deadline slack
+    /// (EDF), prompts finishing this tick first, requests that can no longer make it last.
+    /// Unset = arrival order.
+    #[arg(long = "ttft-slo-ms", env = "PLOW_TTFT_SLO_MS", global = true)]
+    pub ttft_slo_ms: Option<f64>,
+
     /// Override whether freed slabs remain in the process reuse pool.
     #[arg(long = "rt-slab-keep", env = "PLOW_SLAB_KEEP", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub slab_keep: Option<bool>,
@@ -673,6 +685,13 @@ impl RuntimeConfig {
             0 => None,
             rows => Some(rows),
         }
+    }
+
+    /// AMD serving latency targets (`PLOW_TBT_SLO_MS`, `PLOW_TTFT_SLO_MS`). A non-positive or
+    /// non-finite value counts as unset.
+    pub fn slo_targets(&self) -> crate::sched::slo::Targets {
+        let valid = |v: Option<f64>| v.filter(|ms| ms.is_finite() && *ms > 0.0);
+        crate::sched::slo::Targets { tbt_ms: valid(self.tbt_slo_ms), ttft_ms: valid(self.ttft_slo_ms) }
     }
 
     /// Cross-request prefill packing on CUDA: off unless asked.
@@ -1389,6 +1408,21 @@ mod tests {
                 enabled
             );
         }
+    }
+
+    #[test]
+    fn slo_targets_default_unset_and_parse_both_flags() {
+        use clap::{Args, FromArgMatches};
+        let command = super::RuntimeConfig::augment_args(clap::Command::new("test"));
+        let parse = |args: &[&str]| {
+            let matches = command.clone().try_get_matches_from(args).unwrap();
+            super::RuntimeConfig::from_arg_matches(&matches).unwrap().slo_targets()
+        };
+        assert!(!parse(&["test"]).active());
+        assert_eq!(parse(&["test"]), crate::sched::slo::Targets::default());
+        let both = parse(&["test", "--tbt-slo-ms", "500", "--ttft-slo-ms=30000"]);
+        assert_eq!((both.tbt_ms, both.ttft_ms), (Some(500.0), Some(30000.0)));
+        assert!(!parse(&["test", "--tbt-slo-ms", "0"]).active());
     }
 
     #[test]

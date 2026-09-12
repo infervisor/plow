@@ -78,6 +78,22 @@ pub trait SeqEngine {
         prompt: &[u32],
         tick_max_bucket: u32,
     ) -> crate::Result<Option<u32>>;
+    /// [`Self::prefill_chunked_at_most`] running at most `rows` rows: a longer pending chunk is
+    /// re-planned as `[c0, c0 + rows)` and the rest, each through the ordinary span planner.
+    /// Also returns the chunk that ran, when the engine knows it.
+    fn prefill_chunk_rows(
+        &mut self,
+        slot: usize,
+        prompt: &[u32],
+        tick_max_bucket: u32,
+        _rows: u32,
+    ) -> crate::Result<(Option<u32>, Option<crate::sched::slo::Ran>)> {
+        self.prefill_chunked_at_most(slot, prompt, tick_max_bucket).map(|t| (t, None))
+    }
+    /// The prefill rungs as `(rows, sparse)`, ascending. Empty = no ladder to budget against.
+    fn prefill_ladder(&self) -> Vec<(u32, bool)> {
+        Vec::new()
+    }
     fn multistep_quantum(&self, feeds: &[(usize, u32)], requested: usize) -> Option<usize>;
     fn multi_step(
         &mut self,
@@ -1677,10 +1693,30 @@ mod amd_serve {
             prompt: &[u32],
             tick_max_bucket: u32,
         ) -> Result<Option<u32>> {
+            self.prefill_chunk_rows(slot, prompt, tick_max_bucket, None).map(|(t, _)| t)
+        }
+
+        /// The prefill rungs as `(rows, sparse)`, ascending.
+        pub fn prefill_ladder(&self) -> Vec<(u32, bool)> {
+            let e = self.ranks.rank0();
+            e.prefill_rungs().map(|(prog, rows)| (rows, e.prefill_prog_sparse(prog))).collect()
+        }
+
+        /// [`Self::prefill_chunked_at_most`], and with `rows` the chunk that runs is at most
+        /// that many rows: the pending chunk is re-planned as `[c0, c0 + rows)` and the rest,
+        /// each through `plan_span_at_most`, so the shrunk chunk is its own span's tail and a
+        /// dense one at deep prior moves to the sparse bucket at its real row count.
+        pub fn prefill_chunk_rows(
+            &mut self,
+            slot: usize,
+            prompt: &[u32],
+            tick_max_bucket: u32,
+            rows: Option<u32>,
+        ) -> Result<(Option<u32>, Option<crate::sched::slo::Ran>)> {
             let chunked = (self.chunk_prefill || self.ranks.shared_prefix_enabled())
                 && !self.decode_only && prompt.len() > 1;
             if !chunked {
-                return self.prefill(slot, prompt).map(Some);
+                return self.prefill(slot, prompt).map(|t| (Some(t), None));
             }
             let tick_log = crate::obs::tick::on();
             let t_all = std::time::Instant::now();
@@ -1697,6 +1733,18 @@ mod amd_serve {
                     g.plan_span_at_most(pending.c0, pending.c0 + pending.clen, max_bucket)?;
                 let cur = self.pf[slot].as_mut().expect("just built");
                 split_pending_prefill(cur, split);
+            }
+            if let Some(n) = rows.filter(|&n| n > 0) {
+                let pending = {
+                    let cur = self.pf[slot].as_ref().expect("just built");
+                    cur.steps[cur.next]
+                };
+                if n < pending.clen {
+                    let (c0, end) = (pending.c0, pending.c0 + pending.clen);
+                    let mut split = g.plan_span_at_most(c0, c0 + n, max_bucket)?;
+                    split.extend(g.plan_span_at_most(c0 + n, end, max_bucket)?);
+                    split_pending_prefill(self.pf[slot].as_mut().expect("just built"), split);
+                }
             }
             let cur = self.pf[slot].as_mut().expect("just built");
             let step = cur.steps[cur.next];
@@ -1772,8 +1820,13 @@ mod amd_serve {
                     ms(crate::obs::tick::take_publish_fill()),
                 );
             }
+            let ran = Some(crate::sched::slo::Ran {
+                bucket: g.rank0().prog_t(step.prog),
+                c0: step.c0,
+                clen: step.clen,
+            });
             if !last {
-                return Ok(None);
+                return Ok((None, ran));
             }
             let tok = g.read_prefill_token()?;
             tracing::debug!(slot, tok, n = prompt.len(), "pf complete");
@@ -1794,7 +1847,7 @@ mod amd_serve {
                     self.snap_at[slot] = 0;
                 }
             }
-            Ok(Some(tok))
+            Ok((Some(tok), ran))
         }
 
         pub fn mixed_step_rows(&self, decode_rows: usize, prefill_rows: usize) -> Option<u32> {
@@ -3561,6 +3614,18 @@ impl SeqEngine for AmdServe {
         tick_max_bucket: u32,
     ) -> crate::Result<Option<u32>> {
         AmdServe::prefill_chunked_at_most(self, slot, prompt, tick_max_bucket)
+    }
+    fn prefill_chunk_rows(
+        &mut self,
+        slot: usize,
+        prompt: &[u32],
+        tick_max_bucket: u32,
+        rows: u32,
+    ) -> crate::Result<(Option<u32>, Option<crate::sched::slo::Ran>)> {
+        AmdServe::prefill_chunk_rows(self, slot, prompt, tick_max_bucket, Some(rows))
+    }
+    fn prefill_ladder(&self) -> Vec<(u32, bool)> {
+        AmdServe::prefill_ladder(self)
     }
     fn multistep_quantum(&self, feeds: &[(usize, u32)], requested: usize) -> Option<usize> {
         AmdServe::multistep_quantum(self, feeds, requested)
