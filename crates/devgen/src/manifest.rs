@@ -2158,6 +2158,22 @@ pub fn pairing_hash(manifest: &Value) -> u64 {
             feed("\x1f");
         }
     }
+    // A backend's `requires` are the -D set its objects must be compiled with, so a change to
+    // them must re-stamp the packet; `recommends` are advisory and stay out.
+    feed("\x1e");
+    if let Some(b) = manifest.get("backends").and_then(Value::as_object) {
+        for (arch, v) in b {
+            if let Some(req) = v.get("requires").and_then(Value::as_array) {
+                feed(arch);
+                feed("=");
+                for r in req {
+                    feed(r.as_str().unwrap_or(""));
+                    feed("\x1f");
+                }
+                feed("\x1e");
+            }
+        }
+    }
     h
 }
 
@@ -2994,6 +3010,28 @@ mod tests {
         assert_eq!(pairing_hash(&a), pairing_hash(&b));
         b["union"] = json!(["Gemv"]);
         assert_ne!(pairing_hash(&a), pairing_hash(&b));
+    }
+
+    /// A packet whose object requirements changed must not keep its stamp: a same-recipe
+    /// re-emit that added PLOW_DSA_DECODE_BATCH=1 to `requires` once kept the old hash, so
+    /// objects built without it paired and loaded silently.
+    #[test]
+    fn pairing_hash_tracks_backend_requires_but_not_recommends() {
+        let a = build(&model(), "gfx950");
+        let arch = a["backends"]
+            .as_object()
+            .and_then(|b| b.iter().find(|(_, v)| v["requires"].is_array()))
+            .map(|(k, _)| k.clone())
+            .expect("a backend with a requires list");
+        let mut req = a.clone();
+        req["backends"][&arch]["requires"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("PLOW_TEST_EXTRA=1"));
+        assert_ne!(pairing_hash(&a), pairing_hash(&req));
+        let mut rec = a.clone();
+        rec["backends"][&arch]["recommends"] = json!(["PLOW_TEST_ADVISORY=1"]);
+        assert_eq!(pairing_hash(&a), pairing_hash(&rec));
     }
 
     /// The four axes must be readable WITHOUT reconstructing them from the feature booleans —
