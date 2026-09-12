@@ -46,11 +46,23 @@ Cargo workspace, 13 member crates (Rust) plus a C/CUDA/HIP device runtime under
 - **Frontend / IR:** `nn-graph` (symbolic operator graph IR, model hub; folds the
   former `frontend`)
 - **Compiler core:** `rewrite`, `costmodel`, `schedule`, `packet`, `plowc`
+- **Device-blob emitter:** `devgen` — a **non-optional** dependency of `plowc`, and the
+  path every shipping GPU asset is emitted through (`plowc --emit devblob`)
 - **Hardware / kernel / tuning registries:** `hwspec`, `kernelcaps`, `tunedb`
 - **Verification:** `lean_verify`
 - **Shared schema:** `plow-asset` (compiler↔runtime boundary types)
 - **Runtime host:** `plowrt` (serve, simulate, mux, executor pool)
-- **Legacy:** `devgen` (deprecated device-blob emitter, feature-gated)
+
+> [!IMPORTANT]
+> **`devgen`, not `rewrite` + `schedule`, is what emits a shipping packet.** The two
+> halves described in chapters 01–03 are a working library that the devblob path does
+> not call: `crates/devgen/Cargo.toml` depends on neither, so no fused term and no
+> scheduled placement can reach the emitter even in principle. Every fusion in a shipped
+> packet is hand-written in `devgen`. See
+> [01 — Compiler Pipeline](01-compiler-pipeline.md)'s opening warning for the measured
+> coverage (0 of 1156 ops on Gemma-4-12B) and the A/B showing that wiring the rewriting
+> half up is not a perf lever. Read chapters 01–03 as the designed pipeline; read
+> `devgen` for what a `.pkt` on disk actually went through.
 
 See [10 — Implementation Status](10-implementation-status.md) for the full
 crate-by-crate breakdown, the build profile, and the device-ISA reconciliation.

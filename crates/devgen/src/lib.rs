@@ -74,6 +74,7 @@ pub mod manifest;
 mod mxfp4_moe_role;
 mod projection_rewrite;
 pub mod tune_demand;
+pub mod segment_resource;
 
 // # THE `PLOW_*` FLAG AUDIT (target dependence)
 //
@@ -8026,6 +8027,34 @@ pub(crate) fn report_dispatch_audit(man: &serde_json::Value) {
     std::process::exit(1);
 }
 
+/// Warn when a segment would be relaunched on the four-wave flash object while carrying work
+/// that object does not dispatch.
+///
+/// Unlike [`report_dispatch_audit`]'s findings, this one is not a throughput number: the flash
+/// object skips every op it does not carry, so the stranded instructions do not execute and
+/// nothing at runtime says so. Both production instances — `PLOW_L2_PLACE` overwriting the tag on
+/// a multi-segment program, and `PLOW_UNISEG` collapsing the split — surfaced as zero logits.
+///
+/// A warning and not a refusal, for now: no shipped recipe has been shown clean by this check
+/// yet, and a fresh tripwire that blocks emits is a worse failure than the one it guards. Promote
+/// it once the qualified recipes are known to pass (see `plans/devgen-resource-model.md`).
+pub(crate) fn report_segment_resource(man: &serde_json::Value) {
+    let Some(section) = man.get("segment_resource") else {
+        return;
+    };
+    let Err(report) = segment_resource::check(section) else {
+        return;
+    };
+    eprintln!(
+        "  WARNING: impure wave-class segments (build.json: segment_resource.findings). The \
+         host relaunches each segment on ONE code object; a segment mixing a flash-prefill op \
+         with anything else runs the whole segment on the four-wave flash object, which does \
+         not dispatch the rest — they are silently skipped.\n{report}  This is a correctness \
+         finding, not a tuning one. Check the emit knobs that rewrite the wave-class tag \
+         (PLOW_UNISEG, PLOW_L2_PLACE) before serving this blob."
+    );
+}
+
 /// Warn when `--arch` and `--gpu` name different vendors.
 ///
 /// The manifest's whole job is to say what object a packet needs, and `arch` is what a backend
@@ -8957,6 +8986,7 @@ fn emit_dense_gqa(
     if !arch.is_empty() {
         let man = manifest::build_for_packet(&m, &arch, &lean, &sections);
         report_dispatch_audit(&man);
+        report_segment_resource(&man);
         if !hetero_progs.is_empty() {
             let plan = emitter.hetero_plan(std::mem::take(&mut hetero_progs), &m.tensors, fp8);
             let hpath = std::path::Path::new(&out).with_file_name("hetero.json");

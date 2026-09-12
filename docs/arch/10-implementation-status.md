@@ -92,11 +92,22 @@ behind its `hub` feature and architecture builders behind its `models` feature.
 | Atomic qualified publication | ✅ | Negative/stale records retained for provenance, not selected |
 | `NetworkBlockDefinition` → manifest | 🔲 | Block-driven tune manifest is open work |
 
-### `crates/devgen/` — Legacy Device-Blob Emitter
+### `crates/devgen/` — Device-Blob Emitter (the shipping emit path)
+
+**Not legacy, not feature-gated.** `crates/plowc/Cargo.toml` carries `devgen` as a
+non-optional dependency ("always linked"), and `plowc --emit devblob` — the path every
+gfx942/gfx950/sm_120 asset is built with — lowers through it. `crates/devgen/src/mla.rs`
+alone is ~10.7k lines and emits the shipped GLM-5.3 TP8 programs.
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| `gemma4` HF checkpoint → device packet program | 🔧 | **Deprecated**; superseded by `plowc --hf-dir`. Built only with `--features legacy-gemma-bins`, slated for removal |
+| HF checkpoint → device packet program (`plowc --emit devblob`) | ✅ | The production path for every shipped GPU asset. Per-model emitters under `mla.rs`, `k3.rs`, `kda.rs`, `gptoss.rs`, `qwen35.rs` |
+| Hand-written operator fusion | ✅ | `GemvQkv`, `GemvGlu`, `NormResidualNorm` and the rest are written here, not derived by `rewrite` — see [01](01-compiler-pipeline.md) |
+| Tile selection | ✅ | `kernelcaps::select_kernel` + `tunedb` measurements; `costmodel` supplies `dma_cycles`/`macs_cycles` only |
+| `dispatch_audit` → `build.json` | ✅ | Occupancy and GEMV-ceiling findings, derived from the emitted stream |
+| `segment_resource` → `build.json` | ✅ | Per-segment CU reservation and the flash-segment purity check (the `PLOW_UNISEG` / `PLOW_L2_PLACE` zero-logits class) |
+| Wave-class segmentation | 🔧 | `packet::devbuild::Builder`'s `wave_class` is a knob-dependent opcode chain; the runtime re-derives its own rule in `plowrt::exec::amd::derive_segments`. The two agree by convention, now cross-checked at emit but not unified |
+| `gemma4` legacy CLI bin | 🔧 | **Deprecated**; superseded by `plowc --hf-dir`. Built only with `--features legacy-gemma-bins`, slated for removal. This row — not the crate — is what "legacy devgen" referred to |
 
 ### `crates/hwspec/` — Hardware Registry
 
@@ -112,6 +123,16 @@ behind its `hub` feature and architecture builders behind its `models` feature.
 | Arch-specific MMA specs | ✅ | Per-instruction throughput/latency |
 
 ### `crates/schedule/` — Scheduler
+
+> [!WARNING]
+> **Every ✅ below is "the library works", not "it runs on the way to an asset."** The
+> devblob path does not call this crate: `devgen` does not depend on it, so no shipping
+> GPU packet is placed or ordered by the list scheduler, and no op in one holds a
+> reservation in `ResourcePool`. Concretely — `ResourcePool` carries per-unit `hbm` and
+> an aggregate `link: BandwidthSet` (`resource.rs:137-138`), while the TP collective
+> `XReduceTwoShot` is emitted by `devgen` and appears in neither `rewrite` nor
+> `schedule`, so the fabric it saturates is never reserved against. The emit-side
+> counterpart that does run is `devgen::segment_resource`.
 
 | Component | Status | Notes |
 |-----------|--------|-------|
