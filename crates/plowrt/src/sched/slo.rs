@@ -200,14 +200,14 @@ impl Default for TickCost {
 }
 
 impl TickCost {
+    /// This engine's decode pass relative to the prior's, from whichever pass kind has samples.
     fn speed(&self) -> f64 {
-        let d = &self.decode[0];
-        if d.samples == 0 {
+        let Some(i) = [0, 1].into_iter().find(|&i| self.decode[i].samples > 0) else {
             return 1.0;
-        }
+        };
         let x = decode_x(20);
-        let prior = DECODE_PRIOR[0][0] * x[0] + DECODE_PRIOR[0][1] * x[1];
-        (d.predict(&x) / prior).clamp(0.01, 100.0)
+        let prior = DECODE_PRIOR[i][0] * x[0] + DECODE_PRIOR[i][1] * x[1];
+        (self.decode[i].predict(&x) / prior).clamp(0.01, 100.0)
     }
 
     fn launch_model(&self, bucket: u32) -> Option<&Rls<LAUNCH_DIM>> {
@@ -773,6 +773,25 @@ mod tests {
         }
     }
 
+    /// Under a target nothing is packed: packable candidates run as isolated launches, so a
+    /// shrunk (possibly retargeted) chunk never meets `packed_span_admissible` at all.
+    #[test]
+    fn a_target_plans_isolated_launches_even_for_packable_candidates() {
+        let mut cands: Vec<SloCandidate> = (0..4).map(|s| cand(s, u64::from(s), 4096, 512, 5000, 0.0)).collect();
+        for c in &mut cands {
+            c.base.packable = true;
+            c.base.span.program = 3;
+        }
+        let mut s = SloState::default();
+        let t = Targets { tbt_ms: Some(10_000.0), ttft_ms: None };
+        let (plan, _) = plan_tick(t, amd(), tick(), 0..2, &cands, &ladder(), &glm(), &mut s.skipped, |p| (p == 3).then_some(2048), |_| u32::MAX);
+        assert_eq!(plan.launches.len(), 4);
+        assert!(plan.launches.iter().all(|l| !l.is_pack()));
+        let base: Vec<Candidate> = cands.iter().map(|c| c.base).collect();
+        let unset = step::plan(amd(), tick(), 0..2, &base, |p| (p == 3).then_some(2048), |_| u32::MAX);
+        assert!(unset.launches[0].is_pack(), "the same candidates do pack without a target");
+    }
+
     #[test]
     fn rls_learns_a_new_machine_from_the_prior() {
         let mut c = TickCost::default();
@@ -792,6 +811,77 @@ mod tests {
         let truth = 15.0 + 27.0 + 4.0;
         assert!((got - truth).abs() / truth < 0.03, "{got} vs {truth}");
         assert!((c.decode_ms(20, false) - 10.05).abs() < 0.5);
+    }
+
+    /// Held-out validation of [`TickCost`] on recorded `PLOW_TICK_LOG` server logs:
+    /// `PLOW_SLO_REPLAY_LOGS=a.log:b.log cargo test -p plowrt --lib replay -- --ignored --nocapture`.
+    /// A fresh model per log; every tick is predicted before it is observed, the way the
+    /// planner uses it. Reports |error| of ticks carrying a prefill launch and decode rows.
+    #[test]
+    #[ignore]
+    fn replay_tick_logs() {
+        let Ok(paths) = std::env::var("PLOW_SLO_REPLAY_LOGS") else { return };
+        let kv = |s: &str| -> std::collections::HashMap<String, String> {
+            s.split_whitespace()
+                .filter_map(|w| w.split_once('='))
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let f = |m: &std::collections::HashMap<String, String>, k: &str| -> f64 {
+            m.get(k).and_then(|v| v.parse().ok()).unwrap_or(0.0)
+        };
+        let pct = |v: &mut Vec<f64>, q: f64| -> f64 {
+            v.sort_by(f64::total_cmp);
+            v.get(((v.len().max(1) - 1) as f64 * q).round() as usize).copied().unwrap_or(f64::NAN)
+        };
+        let (mut all_mixed, mut all_decode) = (Vec::new(), Vec::new());
+        for path in paths.split(':') {
+            let text = std::fs::read_to_string(path).expect("log");
+            let mut cost = TickCost::default();
+            let mut launches: Vec<(u32, u32, u32, f64)> = Vec::new();
+            let mut mixed = Vec::new();
+            for line in text.lines() {
+                if let Some(i) = line.find("PFCHUNK ") {
+                    let m = kv(&line[i..]);
+                    launches.push((f(&m, "bucket") as u32, f(&m, "clen") as u32, f(&m, "c0") as u32, f(&m, "total")));
+                } else if let Some(i) = line.find("TICK n=") {
+                    let m = kv(&line[i..]);
+                    let (total, pf, dec, rows) = (f(&m, "total"), f(&m, "pf"), f(&m, "dec"), f(&m, "dec_rows") as u32);
+                    let after = !launches.is_empty();
+                    if rows > 0 {
+                        let pred = launches
+                            .iter()
+                            .map(|&(b, clen, c0, _)| cost.launch_ms(b, clen, c0, c0 == 0))
+                            .sum::<f64>()
+                            + cost.decode_ms(rows, after)
+                            + cost.host_ms();
+                        let err = ((pred - total) / total).abs();
+                        if after { mixed.push(err) } else { all_decode.push(err) }
+                    }
+                    for &(b, clen, c0, ms) in &launches {
+                        cost.observe_launch(b, clen, c0, c0 == 0, ms);
+                    }
+                    if rows > 0 {
+                        cost.observe_decode(rows, after, dec);
+                    }
+                    cost.observe_host(total - pf - dec);
+                    launches.clear();
+                }
+            }
+            let n = mixed.len();
+            println!("{path}: {n} prefill+decode ticks, |err| p50 {:.1}% p90 {:.1}%", 100.0 * pct(&mut mixed, 0.5), 100.0 * pct(&mut mixed, 0.9));
+            all_mixed.extend(mixed);
+        }
+        let (nm, nd) = (all_mixed.len(), all_decode.len());
+        println!(
+            "held out: {nm} prefill+decode ticks |err| p50 {:.1}% p90 {:.1}% p99 {:.1}%; {nd} decode-only ticks p50 {:.1}% p90 {:.1}%",
+            100.0 * pct(&mut all_mixed, 0.5),
+            100.0 * pct(&mut all_mixed, 0.9),
+            100.0 * pct(&mut all_mixed, 0.99),
+            100.0 * pct(&mut all_decode, 0.5),
+            100.0 * pct(&mut all_decode, 0.9),
+        );
+        assert!(pct(&mut all_mixed, 0.5) < 0.10);
     }
 
     #[test]
