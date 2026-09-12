@@ -951,6 +951,11 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-token-batch-solo", env = "PLOW_TOKEN_BATCH_SOLO", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub token_batch_solo: bool,
 
+    /// Narrowest decode rung a TP engine selects (`PLOW_AMD_DECODE_MIN_RUNG`); `1` = no floor. Read through
+    /// `RuntimeConfig::amd_decode_min_rung`, which supplies the default.
+    #[arg(long = "amd-decode-min-rung", env = "PLOW_AMD_DECODE_MIN_RUNG", global = true)]
+    pub decode_min_rung: Option<u32>,
+
     /// Prior-context floor (rows) above which a request's DENSE final chunk is planned into
     /// the sparse (DSA) prefill bucket instead of the smallest bucket that holds it; `0` = off
     /// (the tail stays in the smallest bucket). Read through `RuntimeConfig::amd_tail_sparse_ctx`,
@@ -960,11 +965,6 @@ pub struct AmdRuntimeConfig {
 
     /// Unified token batch: keep the WIDE dense-GEMM rungs plowc chose per shape.
     ///
-    /// Narrowest decode rung a TP engine selects (`PLOW_AMD_DECODE_MIN_RUNG`); `1` = no floor. Read through
-    /// `RuntimeConfig::amd_decode_min_rung`, which supplies the default.
-    #[arg(long = "amd-decode-min-rung", env = "PLOW_AMD_DECODE_MIN_RUNG", global = true)]
-    pub decode_min_rung: Option<u32>,
-
     /// The token-batch object is the mixed object's shape, and at four waves the fused-GLU
     /// epilogue's `SN == 2` pins `GM_BN` to 128 — so its plain `Gemm` body is one tile for every
     /// projection. The synthesizer collapses `GemmWide` (128x256) and `GemmC5` (192x256) onto

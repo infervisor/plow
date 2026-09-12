@@ -13921,6 +13921,11 @@ impl AmdEngine {
     /// Saturates at the widest rung, so an out-of-range `rows` degrades to today's behaviour
     /// rather than refusing — the slot itself is bounded by `batch` elsewhere.
     pub fn decode_prog_for(&self, rows: usize) -> usize {
+        let rows = if self.tp.is_some() {
+            rows.max(crate::config::RuntimeConfig::get().amd_decode_min_rung())
+        } else {
+            rows
+        };
         self.decode_ladder
             .iter()
             .copied()
@@ -13930,11 +13935,6 @@ impl AmdEngine {
 
     /// The decode kernel handle.
     pub fn decode_kernel(&self) -> HsaKernel {
-        let rows = if self.tp.is_some() {
-            rows.max(crate::config::RuntimeConfig::get().amd_decode_min_rung())
-        } else {
-            rows
-        };
         self.k_decode
     }
 
