@@ -141,6 +141,20 @@ fn band_choice(rows: u32, n: u32, k: u32) -> Option<(usize, u32)> {
     })
 }
 
+/// The `GemmLtPf` mode each program role may carry: decode rungs `1`; prefill-side programs `0`
+/// (bucket rows) and `2` (the sequence-parallel band's fixed rows).
+pub(super) fn modes_match(prog: &DevProg) -> bool {
+    let decode = prog.role.is_decode_rung();
+    prog.insts
+        .iter()
+        .filter(|d| d.op == DevOp::GemmLtPf as u16)
+        .all(|d| match d.i[3] {
+            1 => decode,
+            0 | 2 => !decode,
+            _ => false,
+        })
+}
+
 pub(super) fn segment_owners(
     prog: &DevProg,
     segments: usize,
@@ -537,6 +551,51 @@ mod tests {
         .unwrap();
         specs.extend(ext);
         specs
+    }
+
+    #[test]
+    fn modes_follow_the_program_role() {
+        use packet::devbuild::ProgramRole;
+        for (role, mode, ok) in [
+            (ProgramRole::PrefillBucket { rows: 8192 }, 0, true),
+            (ProgramRole::PrefillBucket { rows: 8192 }, 2, true),
+            (ProgramRole::PrefillBucket { rows: 8192 }, 1, false),
+            (ProgramRole::PrefillBucket { rows: 8192 }, 3, false),
+            (ProgramRole::DecodeRung { rows: 20 }, 1, true),
+            (ProgramRole::DecodeRung { rows: 20 }, 0, false),
+            (ProgramRole::DecodeRung { rows: 20 }, 2, false),
+        ] {
+            let (mut p, _) = fixture();
+            p.role = role;
+            p.insts[0].i[3] = mode;
+            assert_eq!(modes_match(&p), ok, "{role:?} mode {mode}");
+        }
+    }
+
+    /// CPU preflight: every program of the packets named by `PLOW_LT_PACKETS` (comma list of
+    /// `model.pkt` paths) passes the loader's `GemmLtPf` checks: role/mode, segment derivation,
+    /// and route validation.
+    #[test]
+    #[ignore = "reads the packets named by PLOW_LT_PACKETS"]
+    fn packets_pass_the_gemm_lt_load_checks() {
+        let list = std::env::var("PLOW_LT_PACKETS").expect("PLOW_LT_PACKETS");
+        for path in list.split(',').filter(|s| !s.is_empty()) {
+            let raw = std::fs::read(path).unwrap();
+            let blob = crate::asset::devblob::DevBlob::parse_l2(&raw, true).unwrap();
+            let mut native = 0;
+            for (ix, p) in blob.progs.iter().enumerate() {
+                assert!(modes_match(p), "{path}: program {ix} GemmLtPf mode vs role");
+                let segments = super::super::amd::derive_segments(p)
+                    .unwrap_or_else(|e| panic!("{path}: program {ix}: {e}"))
+                    .len();
+                native += routes(p, &blob.tensors, segments)
+                    .unwrap_or_else(|e| panic!("{path}: program {ix}: {e}"))
+                    .iter()
+                    .flatten()
+                    .count();
+            }
+            println!("{path}: {} programs, {native} hipBLASLt routes", blob.progs.len());
+        }
     }
 
     /// `load_kernels` patches each descriptor once and refuses one it already patched, so no
