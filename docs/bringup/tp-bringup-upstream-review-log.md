@@ -646,6 +646,51 @@ attention; then a widen ×Sk into the FP32 buffer the fold reads.
   reading is that at that occupancy the per-query 2048-row gather is latency-bound rather than
   Infinity-Cache-bandwidth-bound, but no counter data was taken.
 
+## Decode rows riding the 8192 body: measured negative (2026-09-12, job `0-1789187400-tb-fix-price2`)
+
+Code on branch `tb-body-chunk-cap` (2d8c62cf + 160c5396), **not merged**. With bodies armed, a middle
+chunk on the 8192 bucket is capped at the 8192 body's span (8172 rows: 8192 minus the 20-row band) so it
+can ride the body with the tick's decode rows. The cap applies only where the planner's launch count is
+kept. On the seed-0 100-prompt lengths it binds in 3 prompts, and 694 of 707 body-admissible middle
+chunks ride.
+
+* **Shape measured:** truncated TP8 span-aware body packets (`PLOW_LAYERS=4` and `=8`, bodies
+  128/512/2048/8192, each on its own stamped objects). Load: 19 decoders plus five ~28.6k-token prompts,
+  with `PLOW_TICK_LOG=1`. Control `PLOW_TOKEN_BATCH=0` against body `=1`, 10 matched middle-chunk ticks
+  per point. Per layer = (N=8 − N=4) / 4; fixed = the intercept; 78 layers = N=8 + 70 × per layer.
+
+| Median tick | 4 layers | 8 layers | per layer | fixed | 78 layers |
+|---|---|---|---|---|---|
+| Isolated 8192 chunk | 50.72 ms | 96.03 ms | 11.33 ms | 5.42 ms | 889 ms |
+| Separate decode pass (19 rows) | 6.55 ms | 11.60 ms | 1.26 ms | 1.49 ms | 100 ms |
+| Control: chunk + decode pass | 57.24 ms | 107.64 ms | 12.60 ms | 6.84 ms | 990 ms |
+| Body: 8172 rows + decode rows | 57.19 ms | 108.31 ms | 12.78 ms | 6.06 ms | 1003 ms |
+
+* **Result:** at 78 layers the body saves **−14.0 ms per middle chunk**, i.e. it is slower (bootstrap
+  90% [−61.7, +15.9] ms). Over the run's 707 ridable middle chunks that is −9.9 s [−43.6, +11.2] s.
+  Final chunks, which already ride without the cap, save +6.7 ms [−2.5, +14.5] per chunk.
+* **Why the roadmap's −54 to −63 s does not appear:** it assumed the separate decode pass (~100 ms per
+  8192 tick at 78 layers) disappears when the decode rows ride. It does not. Inside the body the band
+  still runs the decode attention chain in every layer, after the prefill fold. That chain costs
+  1.46 ms/layer above the isolated chunk, against 1.26 ms/layer for the whole separate pass. Only about
+  0.8 ms of fixed per-tick cost is saved.
+* **What could make it pay:** overlap, not planning (estimate only, not built). The band chain would have
+  to run concurrently with the prefill's fabric-bound two-shot collectives, about 1.1 ms per seam and
+  two seams per layer, with half the CUs idle at `PLOW_XR_CUS=152`. The ceiling is the decode pass itself:
+  about 100 ms per middle chunk (about 71 s over 707). If only the attention seam can be used, it is
+  about 72 ms (about 51 s).
+* **Known limitation (code read, not run; fix before bodies are reconsidered for default):** the body
+  path ignores `PLOW_AMD_TAIL_SPARSE_CTX`.
+  - `token_batch_prefill_rows` takes a member's rows from `step.clen` (`token_batch_cursor_rows`), and the
+    body width from that row count alone (`rows_for`, `body_for_capacity`), never from `step.prog`.
+  - `packed_span_admissible` refuses only sparse programs, only below `SPAN_MIN_PRIOR`, so a dense body
+    is admissible at any depth.
+  - So a deep-context short final chunk that `retarget_dense_tail` planned onto the sparse 8192 program
+    (e.g. 1,500 rows at 65K prior) rides the dense 2048 body. That is the dense-at-depth path the
+    retarget exists to avoid: 2.4–6.8× per the serving-8k agent's read. The retarget's own note
+    measures a 464-row dense tail at 65K prior at 1.9 s, twice a full sparse 8192 chunk.
+* **Verdict:** no-go. The branch stays unmerged and the token-batch body stays opt-in.
+
 ## Artefact policy (applied on every merge)
 
 Raw measurement files pushed upstream are removed here before the branch goes to main:

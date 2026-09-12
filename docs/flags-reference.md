@@ -1082,5 +1082,8 @@ The gap in (3) depends on the model. On the 12B asset it was bounded by one weig
 (~12% of a tick at 2k prompts, ~0.6% at 127k). On GLM-5.3 TP8 at C20 with ~70k prompts the separate
 decode pass costs ~95 ms per prefill tick, so decode rows riding inside every chunk would be worth
 ~6% end to end (see the review log's roadmap and vLLM-parity entry).
+**Measured, that estimate does not hold:** it assumed the decode pass disappears when its rows ride, but
+inside the body the band's decode attention chain costs about as much per layer as the pass, so riding
+middle chunks measures −14 ms per chunk at 78 layers (see the review log's decode-rows negative).
 </content>
 </invoke>
