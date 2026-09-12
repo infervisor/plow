@@ -4540,6 +4540,7 @@ fn emit_glm_band_attention(
     c_rn1: u32,
     c_rnq: u32,
     c_kidx: Option<u32>,
+    widx_gathered: Option<(u32, u32)>,
     q_deps: &[u32],
     c_uv_prefill: u32,
 ) -> u32 {
@@ -4600,12 +4601,17 @@ fn emit_glm_band_attention(
             d.j[0] = 0;
             d.j[1] = KV_MASK_NONE;
         });
-        let c_w = small(b, n.widx, n.xn, w.iwp, hi, h, &[c_rn1]);
+        // Under the band projections `xn` holds this rank's rows only: the band rows' indexer
+        // weights are then rows [0, band) of the prefill chain's gathered weights.
+        let (widx, c_w) = match widx_gathered {
+            Some(gathered) => gathered,
+            None => (n.widx, small(b, n.widx, n.xn, w.iwp, hi, h, &[c_rn1])),
+        };
         let c_sc = b.emit(DevOp::IndexScore, all.to_vec(), &[c_qi, c_kidx, c_w], |d| {
             d.t[0] = n.iscore;
             d.t[1] = n.qidx;
             d.t[2] = n.kidx[slot];
-            d.t[3] = n.widx;
+            d.t[3] = widx;
             d.t[4] = n.kvlen;
             d.i[0] = band;
             d.i[1] = hi;
@@ -5644,9 +5650,12 @@ pub(crate) fn emit_glm_mla_prefill(
 
     // 1 input_layernorm, T rows (on the band + all-gather under the sequence-parallel seams).
     let sp = !raw_output && glm_sp(c, n, b, t);
+    // A body's band indexer needs its rows' indexer weights, which only the sparse chain gathers.
+    let band_indexer = band.is_some() && c.dsa(ctx) && w.iwqb != TENSOR_NONE;
     // Band projections: `widx` rides slot 0, whose next writer (this layer's o_proj) is ordered
     // behind every peer's gather only by the TP indexer's rendezvous.
     let sp_proj = sp
+        && (!band_indexer || sparse)
         && n.ug_tp != TENSOR_NONE
         && dr > 0
         && w.blk_qad == TENSOR_NONE
@@ -6110,6 +6119,7 @@ pub(crate) fn emit_glm_mla_prefill(
             c_rn1,
             c_rnq,
             c_sel_pf,
+            proj_g.and_then(|(_, gi)| gi).filter(|_| sparse).map(|g| (n.widx_pf, g)),
             &[c_qa, c_qr, c_rnkv, c_krd],
             c_uv,
         ),

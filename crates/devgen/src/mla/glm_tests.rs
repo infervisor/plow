@@ -20,10 +20,12 @@ fn a_token_batch_body_carries_its_buckets_seams_and_fold() {
         ("PLOW_GLM_DSA_PF", "1"), ("PLOW_PACKED_SPARSE_PF", "1"), ("PLOW_GLM_INDEX_TP", "1"),
     ]);
     crate::with_emit_target_amd(true, || {
-        let mut c = glm_ref_cfg();
-        c.tp = 8;
         let (ctx, dbatch) = (81920, 20);
-        for t in [2048u32, 8192] {
+        for (full, t) in [(false, 2048u32), (false, 8192), (true, 2048), (true, 8192)] {
+            let mut c = glm_ref_cfg();
+            c.tp = 8;
+            // Layer 3 is the first MoE layer; a full one runs the band's own decode indexer.
+            c.indexer_full[3] = full;
             let emit = |band: Option<u32>| {
                 let mut decl = Builder::new(304);
                 let n = declare_glm_rows_batched(&mut decl, &c, ctx, &[3], t, dbatch, MoeEnc::Fp8Blk);
@@ -43,27 +45,67 @@ fn a_token_batch_body_carries_its_buckets_seams_and_fold() {
             let count = |p: &packet::devbuild::Program, keep: &dyn Fn(&crate::DevInst) -> bool| {
                 p.insts.iter().filter(|d| keep(d)).count()
             };
-            for op in [DevOp::XReduceScatter, DevOp::XAllGather, DevOp::XReduceTwoShot] {
-                let is = |d: &crate::DevInst| d.op == op as u16;
-                assert_eq!(count(&body, &is), count(&plain, &is), "t={t}: {op:?}");
+            let is = |op: DevOp| move |d: &crate::DevInst| d.op == op as u16;
+            assert!(count(&plain, &is(DevOp::XReduceScatter)) > 0, "t={t} full={full}: no seams to compare");
+            for op in [DevOp::XReduceScatter, DevOp::XReduceTwoShot] {
+                assert_eq!(count(&body, &is(op)), count(&plain, &is(op)), "t={t} full={full}: {op:?}");
             }
-            let banded = |p: &packet::devbuild::Program| {
-                p.insts
-                    .iter()
-                    .filter(|d| {
+            // The band projections gather the indexer weights only on a sparse bucket, and the
+            // band's decode indexer reads its rows' weights, so a dense bucket's indexer layer
+            // keeps the full normed-hidden gather in its body.
+            if glm_dsa_pf_bucket(&c, t) {
+                let banded = |p: &packet::devbuild::Program| {
+                    count(p, &|d| {
                         d.t.iter().any(|&h| {
                             p.tensors.get(h as usize).is_some_and(|x| x.name.contains("@band"))
                         })
                     })
-                    .count()
-            };
-            assert!(banded(&plain) > 0, "t={t}: the prefill program has no seams to compare against");
-            assert_eq!(banded(&body), banded(&plain), "t={t}: sequence-parallel seam band ops");
+                };
+                let ag = is(DevOp::XAllGather);
+                assert_eq!(count(&body, &ag), count(&plain, &ag), "t={t} full={full}: XAllGather");
+                assert_eq!(banded(&body), banded(&plain), "t={t} full={full}: sequence-parallel seam band ops");
+            }
+            for (p, what) in [(&plain, "prefill"), (&body, "body")] {
+                assert_eq!(band_only_reads(p), Vec::<String>::new(), "t={t} full={full}: {what}");
+            }
             let native_fold =
                 |d: &crate::DevInst| d.op == DevOp::MlaMergeFold as u16 && d.i[5] == 1;
-            assert_eq!(count(&body, &native_fold), count(&plain, &native_fold), "t={t}: native W_uv fold");
+            assert_eq!(count(&body, &native_fold), count(&plain, &native_fold), "t={t} full={full}: native W_uv fold");
         }
     });
+}
+
+/// Reads of a tensor whose latest write was one rank's rows (a `<base>@band` view or a
+/// reduce-scatter's in-place slot band) before an all-gather or a full write refilled it.
+fn band_only_reads(p: &packet::devbuild::Program) -> Vec<String> {
+    let name = |h: u32| p.tensors.get(h as usize).map_or("", |x| x.name.as_str());
+    let mut banded = std::collections::HashSet::new();
+    let mut bad = Vec::new();
+    for (i, d) in p.insts.iter().enumerate() {
+        if d.op == DevOp::XAllGather as u16 {
+            for h in &d.t[..3] {
+                banded.remove(h);
+            }
+            continue;
+        }
+        if d.op != DevOp::XReduceScatter as u16 {
+            let reads = d.t[1..].iter().filter(|h| banded.contains(*h));
+            bad.extend(reads.map(|&h| format!("inst {i} op {} reads {}", d.op, name(h))));
+        }
+        let out = d.t[0];
+        match name(out).split_once("@band") {
+            Some((base, _)) => {
+                banded.extend(p.tensors.iter().position(|x| x.name == base).map(|h| h as u32));
+            }
+            None if d.op == DevOp::XReduceScatter as u16 => {
+                banded.insert(out);
+            }
+            None => {
+                banded.remove(&out);
+            }
+        }
+    }
+    bad
 }
 
 #[test]
