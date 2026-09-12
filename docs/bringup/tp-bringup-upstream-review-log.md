@@ -592,6 +592,29 @@ objects hits a GPU memory fault after a clean prefill, and it wrote a 97.8 GB co
 worktree. Scripts now set `ulimit -c 0` and `HSA_DISABLE_COREDUMP_ON_EXCEPTION=1`; ROCr writes
 its own GPU coredump and does not honour the core rlimit.
 
+## FP8 block-scale prefill route, second served A/B (2026-09-12, `fp8-prefill-gemms.md` §7e)
+
+Second tier-4 A/B (`1789182456-fp8-blk-ab2`): ctrl1 -> route with the v2 quant -> ctrl2, retrieval
+on the route arm. The binary was built from `d9fe7690`, which includes the socket pin `1cc0c868`
+and the v2 quant `ea202992`. The packets and object sets are the frozen pairs from the first A/B.
+
+**Result: a resolved no-gain.** Out tok/s: 57.05 / **56.60** / 56.50. The control spread is now 0.97
+% (it was 2.0 % before the socket pin), and the route is -0.31 % against the control mean. Retrieval
+18/18. Prefill saving: steady-chunk drain -24.7 ms (-3.2 %; the controls agree to 0.5 ms),
+prefill-tick wall -4.1 s (-2.4 %), median TTFT -1.4 %. Decode took it back: the route arm's
+decode-only ticks cost +4.6 s, and median ITL was 107.1 ms against 97.8 / 102.3.
+
+**The ITL excess is not the route.** The decode program is identical (1,189 segments per tick,
+in-flight enqueue 1,237 vs 1,239). KV geometry is identical (the same VMM pools, `n_kvrow=177`,
+`kv_buffers=255`), and so are the KV block maps (2,040 per arm, in both A/Bs). The extra FP8
+weights only enlarge the weight slab, 14,387 -> 16,712 MiB/rank. The same route packet decoded at
+control speed in the first A/B (102.5 vs 102.3 ms). Within this run, the route arm's decode tick
+swung 13 % over time (107-108, then 94.7, then ~104 ms), while the controls still differ by 3.8 %.
+That is residual decode-state drift the socket pin reduced but did not remove.
+
+**Call: stays opt-in.** A flip would need a resolved served gain, which this A/B does not show, and
+the broader accuracy gate (GSM8K plus long retrieval at C20) for ~2e-2 per-projection error.
+
 ## Artefact policy (applied on every merge)
 
 Raw measurement files pushed upstream are removed here before the branch goes to main:
