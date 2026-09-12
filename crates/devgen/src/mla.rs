@@ -2066,7 +2066,8 @@ pub(crate) fn declare_glm_rows_batched(
             // TASK-9 FIT GATE: the bf16 shared expert also splits into two halves + Glu
             // when rows*K exceeds the staged-LDS fit (see the emit site), and the up half
             // needs this buffer.
-            || rows as u64 * h as u64 > crate::gm_lds_halves()))
+            || rows as u64 * h as u64 > crate::gm_lds_halves()
+            || glm_lt_pf_ext().shared))
         || glm_shared_glu_split(enc)
     {
         ac(b, "shfu_up", rows * imoe_l as u64 * BF16)
@@ -5042,6 +5043,102 @@ fn emit_glm_lt_gemm(
     Some(counter)
 }
 
+/// `PLOW_GLM_GEMM_LT_PF_EXT`: prefill GEMMs `PLOW_GLM_GEMM_LT` leaves on interpreter tiles that
+/// take the same pinned hipBLASLt route. Each becomes its own native segment, so every group
+/// trades its tile for up to two segment boundaries.
+#[derive(Clone, Copy, Default)]
+struct GlmLtExt {
+    o_proj: bool,
+    shared: bool,
+    router: bool,
+    band: bool,
+}
+
+impl GlmLtExt {
+    /// The groups a `t`-row prefill bucket takes: the parent route's rows only.
+    fn at(self, t: u32) -> Self {
+        if (2048..=8192).contains(&t) {
+            self
+        } else {
+            Self::default()
+        }
+    }
+}
+
+fn glm_lt_pf_ext() -> GlmLtExt {
+    let cfg = emit_config::active();
+    let mut set = GlmLtExt::default();
+    let spec = cfg.glm_gemm_lt_pf_ext.as_deref().unwrap_or_default();
+    for name in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        match name {
+            "1" | "true" => {
+                set = GlmLtExt {
+                    o_proj: true,
+                    shared: true,
+                    router: true,
+                    band: true,
+                }
+            }
+            "0" | "false" => {}
+            "o_proj" => set.o_proj = true,
+            "shared" => set.shared = true,
+            "router" => set.router = true,
+            "band" => set.band = true,
+            other => panic!(
+                "PLOW_GLM_GEMM_LT_PF_EXT: unknown group {other:?} (o_proj, shared, router, band)"
+            ),
+        }
+    }
+    if cfg.glm_gemm_lt() {
+        set
+    } else {
+        GlmLtExt::default()
+    }
+}
+
+/// One `PLOW_GLM_GEMM_LT_PF_EXT` projection, alone in its segment. `rows` is the bucket's `t`
+/// (`i3 = 0`, rebased by the host to the chunk's rows) or the sequence-parallel band `t / tp`
+/// (`i3 = 2`, fixed: the host never shrinks a band view).
+#[allow(clippy::too_many_arguments)]
+fn emit_glm_lt_ext(
+    b: &mut Builder,
+    c: &GlmCfg,
+    out: u32,
+    x: u32,
+    weight: u32,
+    t: u32,
+    rows: u32,
+    [nn, k]: [u32; 2],
+    deps: &[u32],
+) -> u32 {
+    let band = rows != t;
+    assert!(
+        c.tp == 8
+            && c.hidden == 6144
+            && b.n_cu() == 304
+            && (2048..=8192).contains(&t)
+            && (!band || (rows * c.tp == t && matches!(rows, 256 | 1024))),
+        "PLOW_GLM_GEMM_LT_PF_EXT requires gfx942 TP8 GLM prefill (band rows 256 or 1024)"
+    );
+    let pinned = if band {
+        matches!((nn, k), (2048 | 512 | 256 | 128 | 64 | 32, 6144))
+    } else {
+        matches!((nn, k), (6144, 2048) | (256, 6144) | (6144, 256))
+    };
+    assert!(pinned, "PLOW_GLM_GEMM_LT_PF_EXT has no pinned kernel for {rows}x{nn}x{k}");
+    let counter = b.emit(DevOp::GemmLtPf, vec![0], deps, |d| {
+        d.t[0] = out;
+        d.t[1] = x;
+        d.t[2] = weight;
+        d.i[0] = rows;
+        d.i[1] = nn;
+        d.i[2] = k;
+        d.i[3] = if band { 2 } else { 0 };
+    });
+    b.isolate(counter);
+    counter
+}
+
 /// `PLOW_GLM_GEMM_BLK`: one projection on the native block-scale FP8 route, alone in its
 /// segment. `quantize` makes this instruction quantize `x` into the shared FP8 scratch first;
 /// without it the instruction reads what the previous quantizing instruction wrote from the
@@ -5576,6 +5673,7 @@ pub(crate) fn emit_glm_mla_prefill(
     let nh_l = nh / tp;
     let w = &n.lw[slot];
     let eps = c.eps;
+    let lt_ext = glm_lt_pf_ext().at(t);
     // Tiled GEMM at prefill shapes. `pick_tile` is the same static cost model the dense prefill path
     // uses, so a narrow M (the 128-row bucket) reaches GemmSmall/GemmMed rather than paying for a
     // 256x256 tile that leaves most of the chip idle.
@@ -5663,6 +5761,9 @@ pub(crate) fn emit_glm_mla_prefill(
         });
         let quant = mxfp4_quant(enc);
         let bgemm = |b: &mut Builder, out: u32, wt: u32, sc: u32, nn: u32, bf16: bool| {
+            if lt_ext.band && (bf16 || enc != MoeEnc::Mxfp4) {
+                return emit_glm_lt_ext(b, c, out, xnb, wt, t, tb, [nn, h], &[c_n]);
+            }
             let op = if bf16 {
                 pick_tile(tb, nn, h, n_cu, kernelcaps::QuantScheme::None)
             } else {
@@ -5683,29 +5784,14 @@ pub(crate) fn emit_glm_mla_prefill(
         };
         let qlr_b = glm_band(b, n.qlr, t, tp, ql as u64 * 2);
         let c_q = bgemm(b, qlr_b, w.qad, w.qad_s, ql, false);
-        let qlat_s = glm_band_as(b, n.h2_tp, t, tp, ql as u64 * 2, ".q");
-        let c_qn = b.emit(DevOp::RmsNorm, pf_wide_cus(n_cu, tb), &[c_q], |d| {
-            d.t[0] = qlat_s;
-            d.t[1] = qlr_b;
-            d.t[2] = w.gqa;
-            d.i[0] = tb;
-            d.i[1] = ql;
-            d.f[0] = eps;
-        });
-        let ckv_s = glm_band_as(b, n.xe_tp, t, tp, dk as u64 * 2, ".kv");
-        let c_kv = bgemm(b, ckv_s, w.ckvd, w.ckvd_s, dk, false);
-        let krr_s = glm_band_as(b, n.rt_tp, t, tp, dr as u64 * 2, ".kr");
-        let c_kr = bgemm(b, krr_s, w.krotd, w.krotd_s, dr, false);
         let slot_b = n.slot_b;
-        let g = crate::emit_xall_gather(
-            b,
-            xgate,
-            xr_cus,
-            &[c_qn, c_kv, c_kr],
-            &[(n.qlat, t * ql, 3 * slot_b), (n.ckvraw, t * dk, 4 * slot_b), (n.krr, t * dr, 5 * slot_b)],
-            tp,
-        );
-        let gi = idx_chain.then(|| {
+        let kv_proj = |b: &mut Builder| {
+            let ckv_s = glm_band_as(b, n.xe_tp, t, tp, dk as u64 * 2, ".kv");
+            let c_kv = bgemm(b, ckv_s, w.ckvd, w.ckvd_s, dk, false);
+            let krr_s = glm_band_as(b, n.rt_tp, t, tp, dr as u64 * 2, ".kr");
+            (c_kv, bgemm(b, krr_s, w.krotd, w.krotd_s, dr, false))
+        };
+        let idx_proj = |b: &mut Builder| {
             let (hi, di) = (c.index_heads, c.index_dim);
             let ki_s = glm_band_as(b, n.ug_tp, t, tp, di as u64 * 2, ".ki");
             let mut deps = vec![bgemm(b, ki_s, w.iwk, TENSOR_NONE, di, true)];
@@ -5715,8 +5801,46 @@ pub(crate) fn emit_glm_mla_prefill(
                 deps.push(bgemm(b, w_s, w.iwp, TENSOR_NONE, hi, true));
                 pairs.push((n.widx_pf, t * hi, 0));
             }
-            crate::emit_xall_gather(b, xgate, xr_cus, &deps, &pairs, tp)
+            (deps, pairs)
+        };
+        // PLOW_GLM_GEMM_LT_PF_EXT: the native band projections go back to back ahead of the q
+        // norm, one run of segments instead of each splitting the interpreter segment.
+        let mut early = None;
+        if lt_ext.band {
+            let kv = kv_proj(b);
+            let idx = if idx_chain { Some(idx_proj(b)) } else { None };
+            early = Some((kv, idx));
+        }
+        let qlat_s = glm_band_as(b, n.h2_tp, t, tp, ql as u64 * 2, ".q");
+        let c_qn = b.emit(DevOp::RmsNorm, pf_wide_cus(n_cu, tb), &[c_q], |d| {
+            d.t[0] = qlat_s;
+            d.t[1] = qlr_b;
+            d.t[2] = w.gqa;
+            d.i[0] = tb;
+            d.i[1] = ql;
+            d.f[0] = eps;
         });
+        let ((c_kv, c_kr), idx) = match early {
+            Some(e) => e,
+            None => (kv_proj(b), None),
+        };
+        let g = crate::emit_xall_gather(
+            b,
+            xgate,
+            xr_cus,
+            &[c_qn, c_kv, c_kr],
+            &[(n.qlat, t * ql, 3 * slot_b), (n.ckvraw, t * dk, 4 * slot_b), (n.krr, t * dr, 5 * slot_b)],
+            tp,
+        );
+        let gi = if idx_chain {
+            let (deps, pairs) = match idx {
+                Some(p) => p,
+                None => idx_proj(b),
+            };
+            Some(crate::emit_xall_gather(b, xgate, xr_cus, &deps, &pairs, tp))
+        } else {
+            None
+        };
         proj_g = Some((g, gi));
         c_n
     } else if sp {
@@ -6141,6 +6265,8 @@ pub(crate) fn emit_glm_mla_prefill(
             counter
         } else if lin_fp8 {
             emit_pf_gemm_fp8_blk(b, &all, out, n.oat, w.wo, w.wo_s, t, h, nh_l * vd, deps)
+        } else if lt_ext.o_proj && enc != MoeEnc::Mxfp4 {
+            emit_glm_lt_ext(b, c, out, n.oat, w.wo, t, t, [h, nh_l * vd], deps)
         } else {
             gemm(b, out, n.oat, w.wo, w.wo_s, h, nh_l * vd, deps)
         }
@@ -6360,6 +6486,7 @@ fn emit_glm_moe_ffn_prefill(
     // expert_weight_table, and the host binds NULL for a non-local expert either way.
     let imoe_e = if c.ep { imoe } else { imoe_l };
     let w = &n.lw[slot];
+    let lt_ext = glm_lt_pf_ext().at(t);
     // EXPERT-COUNT BOUND. Two LDS carves scale with n_exp and neither is checked on device: the
     // align op's `cnt[n_exp] | cur[n_exp] | tot` and the router tail's `scores[n_exp] | keys[n_exp]`.
     // Both fit the AMD raw arena at 384 (the largest, keys, is 384*8 = 3 KiB against ~144 KiB), which
@@ -6443,23 +6570,36 @@ fn emit_glm_moe_ffn_prefill(
         let tb = t / tp;
         let xb = glm_band(b, n.xn2, t, tp, h as u64 * 2);
         let lb = glm_band(b, n.rlogit, t, tp, e as u64 * 2);
-        let op = glm_prefill_projection_op(c, tb, e, h, n_cu, mxfp4_quant(enc));
-        let cs = b.emit(op, all.clone(), &[c_rn2], |d| {
-            d.t[0] = lb;
-            d.t[1] = xb;
-            d.t[2] = w.wr;
-            if enc == MoeEnc::Mxfp4 {
-                d.t[3] = w.wr_s;
-            }
-            d.i[0] = tb;
-            d.i[1] = e;
-            d.i[2] = h;
-        });
+        let cs = if lt_ext.router && enc != MoeEnc::Mxfp4 {
+            emit_glm_lt_ext(b, c, lb, xb, w.wr, t, tb, [e, h], &[c_rn2])
+        } else {
+            let op = glm_prefill_projection_op(c, tb, e, h, n_cu, mxfp4_quant(enc));
+            b.emit(op, all.clone(), &[c_rn2], |d| {
+                d.t[0] = lb;
+                d.t[1] = xb;
+                d.t[2] = w.wr;
+                if enc == MoeEnc::Mxfp4 {
+                    d.t[3] = w.wr_s;
+                }
+                d.i[0] = tb;
+                d.i[1] = e;
+                d.i[2] = h;
+            })
+        };
         let tab_b = glm_band_as(b, n.rt_tp, t, tp, tk_all as u64 * 8, ".rt");
         (tb, lb, tab_b, cs)
     } else {
         (t, n.rlogit, n.tab, gemm(b, n.rlogit, n.xn2, w.wr, w.wr_s, e, h, &[c_rn2]))
     };
+    // PLOW_GLM_GEMM_LT_PF_EXT: the shared expert's gate and up go next to the router score so the
+    // native segments form one run; their GLU is emitted below as its own op.
+    let shared_lt = (lt_ext.shared && !fold && enc != MoeEnc::Mxfp4 && !glm_linear_fp8(enc)).then(
+        || {
+            let gate = emit_glm_lt_ext(b, c, n.shfu, n.xn2, w.shg, t, t, [imoe_l, h], &[c_rn2]);
+            let up = emit_glm_lt_ext(b, c, n.shfu_up, n.xn2, w.shu, t, t, [imoe_l, h], &[c_rn2]);
+            (gate, up)
+        },
+    );
     let router_blocks: Vec<_> = (0..tr.min(n_cu)).collect();
     let c_router = b.emit(DevOp::MoeRouterTopkPf, router_blocks, &[c_score], |d| {
         d.t[0] = tab;
@@ -6552,8 +6692,10 @@ fn emit_glm_moe_ffn_prefill(
             d.i[2] = h;
             d.i[5] = GLM_ACT_SILU;
         })
-    } else if enc == MoeEnc::Mxfp4 || lin_fp8 {
-        let (c_g, c_u) = if lin_fp8 {
+    } else if enc == MoeEnc::Mxfp4 || lin_fp8 || shared_lt.is_some() {
+        let (c_g, c_u) = if let Some(pair) = shared_lt {
+            pair
+        } else if lin_fp8 {
             (
                 emit_pf_gemm_fp8_blk(
                     b,
@@ -6621,6 +6763,8 @@ fn emit_glm_moe_ffn_prefill(
             imoe_l,
             &[c_shglu],
         )
+    } else if shared_lt.is_some() {
+        emit_glm_lt_ext(b, c, n.shared, n.shfu, w.shd, t, t, [h, imoe_l], &[c_shglu])
     } else {
         gemm(b, n.shared, n.shfu, w.shd, w.shd_s, h, imoe_l, &[c_shglu])
     };

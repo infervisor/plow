@@ -3444,3 +3444,107 @@ fn glm_seq_par_proj_routes_on_the_band() {
     assert!(p.insts.iter().filter(|d| is(d, DevOp::MoeAlignPf)).all(|d| d.i[0] == t));
     assert_eq!(p.insts.iter().filter(|d| is(d, DevOp::XReduceScatter)).count(), 2);
 }
+
+/// `PLOW_GLM_GEMM_LT_PF_EXT` on one sequence-parallel MoE layer: every band projection, o_proj,
+/// the band router and the shared expert's gate/up/down become `GemmLtPf`, each alone in its
+/// segment, the native runs back to back; `0` emits exactly what the unset knob does.
+#[test]
+fn glm_gemm_lt_pf_ext_routes_the_interpreter_projections() {
+    let _guard = crate::test_env::env_guard();
+    let _target = crate::EmitAmdGuard::set(true);
+    let (ctx, t) = (81920u32, 8192u32);
+    let tb = t / 8;
+    let layer = |ext: Option<&str>| {
+        let mut env = vec![
+            ("PLOW_GLM_SEQ_PAR", "1"),
+            ("PLOW_GLM_SEQ_PAR_PROJ", "1"),
+            ("PLOW_GLM_MOE_AITER", "1"),
+            ("PLOW_GLM_FP8_KV", "1"),
+            ("PLOW_GLM_GEMM_LT", "1"),
+            ("PLOW_UNISEG", "0"),
+        ];
+        env.extend(ext.map(|v| ("PLOW_GLM_GEMM_LT_PF_EXT", v)));
+        let _env = crate::test_env::EnvScope::set(&env);
+        let mut c = glm_ref_cfg();
+        c.tp = 8;
+        let mut decl = Builder::new(304);
+        let n = declare_glm_rows_batched(&mut decl, &c, ctx, &[3], t, 1, MoeEnc::Fp8Blk);
+        let mut b = Builder::new(304);
+        b.adopt_tensors(decl.tensors());
+        let all = b.all();
+        let mut xgate = 0;
+        let c_rn2 = emit_glm_mla_prefill(&mut b, &c, &n, 0, ctx, t, MoeEnc::Fp8Blk, n.x, &[], false,
+            &mut xgate, &all, None);
+        emit_glm_moe_ffn_prefill(&mut b, &c, &n, 0, t, MoeEnc::Fp8Blk, n.xnext, c_rn2, &mut xgate,
+            &all, false);
+        b.finish()
+    };
+    let off = layer(None);
+    let zero = layer(Some("0"));
+    let decls = |p: &packet::devbuild::Program| {
+        p.tensors.iter().map(|x| (x.name.clone(), x.bytes)).collect::<Vec<_>>()
+    };
+    assert!(off.insts == zero.insts && off.stream == zero.stream && decls(&off) == decls(&zero));
+    let on = layer(Some("1"));
+
+    let is_gemm = |d: &crate::DevInst| {
+        [DevOp::Gemm, DevOp::GemmSmall, DevOp::GemmMed, DevOp::GemmWide, DevOp::GemmC5]
+            .iter()
+            .any(|&o| d.op == o as u16)
+    };
+    let count = |p: &packet::devbuild::Program, op: DevOp| p.insts.iter().filter(|d| d.op == op as u16).count();
+    let lt = |p: &packet::devbuild::Program, mode: u32| {
+        let mut v: Vec<_> = p
+            .insts
+            .iter()
+            .filter(|d| d.op == DevOp::GemmLtPf as u16 && d.i[3] == mode)
+            .map(|d| (d.i[0], d.i[1], d.i[2]))
+            .collect();
+        v.sort_unstable();
+        v
+    };
+    // Every band GEMM of the unset layer, and nothing else, moves to band mode.
+    let mut band_off: Vec<_> = off
+        .insts
+        .iter()
+        .filter(|d| is_gemm(d) && d.i[0] == tb)
+        .map(|d| (d.i[0], d.i[1], d.i[2]))
+        .collect();
+    band_off.sort_unstable();
+    for shape in [(tb, 2048, 6144), (tb, 512, 6144), (tb, 64, 6144), (tb, 256, 6144)] {
+        assert!(band_off.contains(&shape), "{shape:?}");
+    }
+    assert_eq!(lt(&on, 2), band_off);
+    assert!(!on.insts.iter().any(|d| is_gemm(d) && d.i[0] == tb));
+    // Bucket rows: o_proj, shared gate and up, shared down on top of the base route.
+    let mut added = lt(&on, 0);
+    for base in lt(&off, 0) {
+        added.remove(added.iter().position(|&s| s == base).unwrap());
+    }
+    assert_eq!(added, [(t, 256, 6144), (t, 256, 6144), (t, 6144, 256), (t, 6144, 2048)]);
+    assert_eq!((count(&off, DevOp::GemmGlu), count(&on, DevOp::GemmGlu)), (1, 0));
+    assert_eq!(count(&on, DevOp::Glu), count(&off, DevOp::Glu) + 1);
+
+    let seg_of = |ix: usize| on.stream.iter().find(|e| e.inst as usize == ix).unwrap().seg;
+    let find = |mode: u32, n: u32, k: u32| {
+        on.insts
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.op == DevOp::GemmLtPf as u16 && (d.i[1], d.i[2], d.i[3]) == (n, k, mode))
+            .map(|(ix, _)| seg_of(ix))
+            .collect::<Vec<_>>()
+    };
+    for (ix, _) in on.insts.iter().enumerate().filter(|(_, d)| d.op == DevOp::GemmLtPf as u16) {
+        let seg = seg_of(ix);
+        for e in on.stream.iter().chain(&on.gq_stream).filter(|e| e.seg == seg) {
+            assert_eq!(e.inst as usize, ix);
+            assert_eq!((e.wait_len, e.succ_len, e.flags & packet::dev::SE_XCTR), (0, 0, 0));
+        }
+    }
+    let q_a = find(2, 2048, 6144)[0];
+    assert_eq!([find(2, 512, 6144)[0], find(2, 64, 6144)[0]], [q_a + 1, q_a + 2]);
+    let router = find(2, 256, 6144)[0];
+    assert_eq!(find(0, 256, 6144), [router + 1, router + 2], "router, gate, up in one run");
+    let moe = on.insts.iter().position(|d| d.op == DevOp::MoeAiterFp8Pf as u16).unwrap();
+    assert_eq!(find(0, 6144, 256), [seg_of(moe) - 1], "shared down right before the MoE call");
+}

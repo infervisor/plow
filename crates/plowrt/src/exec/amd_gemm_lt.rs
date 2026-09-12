@@ -19,18 +19,32 @@ pub(super) struct Route {
 
 impl Route {
     pub fn rebase(&mut self, rows: u32) -> Result<()> {
-        if rows == 0 || rows > self.inst.i[0] || (self.inst.i[3] == 1 && rows != self.inst.i[0]) {
+        // A band GEMM covers this rank's fixed `T/8` rows whatever the chunk carries.
+        let cap = if self.inst.i[3] == 2 {
+            self.inst.i[0] * 8
+        } else {
+            self.inst.i[0]
+        };
+        if rows == 0 || rows > cap || (self.inst.i[3] == 1 && rows != self.inst.i[0]) {
             return Err(RuntimeError::Device(
                 "hipBLASLt chunk exceeds row capacity".into(),
             ));
         }
-        self.rows = rows;
+        if self.inst.i[3] != 2 {
+            self.rows = rows;
+        }
         Ok(())
     }
 
     fn kernel_choice(self) -> (usize, u32) {
-        if self.inst.i[3] == 1 {
-            return decode_choice(self.rows, self.inst.i[1], self.inst.i[2]).unwrap();
+        let (n, k) = (self.inst.i[1], self.inst.i[2]);
+        match self.inst.i[3] {
+            1 => return decode_choice(self.rows, n, k).unwrap(),
+            2 => return band_choice(self.rows, n, k).unwrap(),
+            _ => {}
+        }
+        if let Some(choice) = ext_choice(self.rows, n, k) {
+            return choice;
         }
         let tail = self.rows <= 4464;
         let kv = self.inst.i[1] == 512;
@@ -87,6 +101,46 @@ fn decode_choice(rows: u32, n: u32, k: u32) -> Option<(usize, u32)> {
         (20, 6144, 2048) => (10, 524289),
         _ => return None,
     })
+}
+
+/// First `PLOW_GLM_GEMM_LT_PF_EXT` kernel: its list follows the four prefill and eight decode
+/// kernels.
+const EXT: usize = 12;
+
+/// Pinned `PLOW_GLM_GEMM_LT_PF_EXT` kernel per bucket-row shape (o_proj, shared gate/up, shared
+/// down) and row tier (<= 2048, <= 4096, above). Chosen by `runtime/bench/amd/glm_projection/
+/// sweep.c`: all 456 256-thread non-stream-K kernels of the pinned object on one MI300X at
+/// M = 2048/4096/8192, the fastest eight at every workgroup mapping (rotating-operand medians,
+/// sampled FP64 oracle).
+fn ext_choice(rows: u32, n: u32, k: u32) -> Option<(usize, u32)> {
+    let tiers: [(usize, u32); 3] = match (n, k) {
+        (6144, 2048) => [(2, 524296), (1, 524292), (0, 1)],
+        (256, 6144) => [(5, 524289), (4, 524289), (3, 524290)],
+        (6144, 256) => [(8, 1), (7, 524290), (6, 524296)],
+        _ => return None,
+    };
+    let (index, info1) = tiers[usize::from(rows > 2048) + usize::from(rows > 4096)];
+    Some((EXT + index, info1))
+}
+
+/// Pinned kernel per sequence-parallel band shape at its fixed `T/8` rows (the 2048 and 8192
+/// buckets), from the same sweep at M = 256/1024.
+fn band_choice(rows: u32, n: u32, k: u32) -> Option<(usize, u32)> {
+    let (index, info1) = match (rows, n, k) {
+        (1024, 2048, 6144) => (3, 524304),
+        (1024, 512, 6144) => (5, 524292),
+        (1024, 256, 6144) => (13, 524289),
+        (1024, 128, 6144) => (15, 1),
+        (1024, 64, 6144) => (11, 524289),
+        (1024, 32, 6144) => (16, 524289),
+        (256, 2048, 6144) => (9, 524294),
+        (256, 512, 6144) => (10, 524289),
+        (256, 256 | 128, 6144) => (14, 524289),
+        (256, 64, 6144) => (12, 524289),
+        (256, 32, 6144) => (17, 524289),
+        _ => return None,
+    };
+    Some((EXT + index, info1))
 }
 
 pub(super) fn segment_owners(
@@ -153,21 +207,27 @@ pub(super) fn routes(
             continue;
         }
         let err = |s: &str| RuntimeError::Device(format!("hipBLASLt instruction {ix}: {s}"));
+        let rows = if inst.i[3] == 2 { prog.t / 8 } else { prog.t };
         let shape_ok = match inst.i[3] {
             0 => {
                 (2048..=8192).contains(&prog.t)
-                    && matches!(
+                    && (matches!(
                         (inst.i[1], inst.i[2]),
                         (2048, 6144) | (512, 6144) | (4096, 2048)
-                    )
+                    ) || ext_choice(prog.t, inst.i[1], inst.i[2]).is_some())
             }
             1 => decode_choice(prog.t, inst.i[1], inst.i[2]).is_some(),
+            2 => {
+                (2048..=8192).contains(&prog.t)
+                    && prog.t % 8 == 0
+                    && band_choice(rows, inst.i[1], inst.i[2]).is_some()
+            }
             _ => false,
         };
         // Packed-prefill siblings carry the same projections: a GEMM over the dense live rows
         // reads no per-row position (class A).
         if !shape_ok
-            || inst.i[0] != prog.t
+            || inst.i[0] != rows
             || inst.i[4..] != [0; 4]
             || inst.fj != [0; 3]
             || inst.t[3..] != [TENSOR_NONE16; 5]
@@ -178,7 +238,7 @@ pub(super) fn routes(
             return Err(err("operands alias"));
         }
         let [m, n, k] = [
-            u64::from(prog.t),
+            u64::from(rows),
             u64::from(inst.i[1]),
             u64::from(inst.i[2]),
         ];
@@ -190,10 +250,7 @@ pub(super) fn routes(
             }
         }
         let seg = owners[ix].ok_or_else(|| err("requires exactly one segment owner"))?;
-        routes[seg] = Some(Route {
-            inst: *inst,
-            rows: prog.t,
-        });
+        routes[seg] = Some(Route { inst: *inst, rows });
     }
     Ok(routes)
 }
@@ -301,6 +358,16 @@ impl GemmLt {
         ))
         .map_err(|e| RuntimeError::Device(format!("hipBLASLt decode specification: {e}")))?;
         specs.extend(decode_specs);
+        if specs.len() != EXT {
+            return Err(RuntimeError::Device(
+                "hipBLASLt prefill and decode specifications moved the extension base".into(),
+            ));
+        }
+        let ext_specs: Vec<KernelSpec> = serde_json::from_str(include_str!(
+            "../../../../runtime/amd/glm_lt_pf_ext_gfx942.json"
+        ))
+        .map_err(|e| RuntimeError::Device(format!("hipBLASLt extension specification: {e}")))?;
+        specs.extend(ext_specs);
         let kernels = load_kernels(
             be,
             dir,
@@ -388,7 +455,7 @@ mod tests {
             match bad {
                 0 => p.t = 1024,
                 1 => p.insts[0].i[0] = 4096,
-                2 => p.insts[0].i[1] = 256,
+                2 => p.insts[0].i[1] = 1024,
                 3 => p.insts[0].i[4] = 1,
                 4 => p.insts[0].fj[0] = 1,
                 5 => p.insts[0].t[3] = 0,
@@ -456,6 +523,84 @@ mod tests {
             assert!(route.rebase(8193).is_err());
         }
     }
+    fn all_specs() -> Vec<KernelSpec> {
+        let mut specs: Vec<KernelSpec> =
+            serde_json::from_str(include_str!("../../../../runtime/amd/glm_lt_gfx942.json"))
+                .unwrap();
+        let decode: Vec<KernelSpec> = serde_json::from_str(include_str!(
+            "../../../../runtime/amd/glm_lt_decode_gfx942.json"
+        ))
+        .unwrap();
+        specs.extend(decode);
+        assert_eq!(specs.len(), EXT);
+        let ext: Vec<KernelSpec> = serde_json::from_str(include_str!(
+            "../../../../runtime/amd/glm_lt_pf_ext_gfx942.json"
+        ))
+        .unwrap();
+        specs.extend(ext);
+        specs
+    }
+
+    #[test]
+    fn ext_routes_tier_bucket_rows_over_pinned_kernels() {
+        let specs = all_specs();
+        for t in [2048, 8192] {
+            for (n, k) in [(6144, 2048), (256, 6144), (6144, 256)] {
+                let (mut p, tn) = fixture();
+                p.t = t;
+                p.insts[0].i = [t, n, k, 0, 0, 0, 0, 0];
+                let mut route = routes(&p, &tn, 1).unwrap()[0].unwrap();
+                for rows in [1, 2048, 2049, 4096, 4097, 8192] {
+                    if rows > t {
+                        assert!(route.rebase(rows).is_err());
+                        continue;
+                    }
+                    route.rebase(rows).unwrap();
+                    let (index, info1) = route.kernel_choice();
+                    assert!((EXT..specs.len()).contains(&index), "{rows}x{n}x{k}");
+                    let args = arguments(route, [0x100000000000, 32, 64], &specs[index], info1);
+                    assert_eq!(args.dims[4..6], [n, rows]);
+                    assert_eq!(
+                        args.dims[3],
+                        n.div_ceil(specs[index].mt_i) * rows.div_ceil(specs[index].mt_j)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn band_routes_keep_the_fixed_band_rows() {
+        let specs = all_specs();
+        for t in [2048u32, 8192] {
+            let band = t / 8;
+            for (n, k) in [(2048, 6144), (512, 6144), (256, 6144), (128, 6144), (64, 6144), (32, 6144)] {
+                let (mut p, tn) = fixture();
+                p.t = t;
+                p.insts[0].i = [band, n, k, 2, 0, 0, 0, 0];
+                let mut route = routes(&p, &tn, 1).unwrap()[0].unwrap();
+                for rows in [1, band, t / 2 + 1, t] {
+                    route.rebase(rows).unwrap();
+                    let (index, info1) = route.kernel_choice();
+                    assert!((EXT..specs.len()).contains(&index), "{band}x{n}x{k}");
+                    let args = arguments(route, [0x100000000000, 32, 64], &specs[index], info1);
+                    assert_eq!(args.dims[4..6], [n, band]);
+                }
+                assert!(route.rebase(0).is_err());
+                assert!(route.rebase(t + 1).is_err());
+                p.insts[0].i[0] = t;
+                assert!(routes(&p, &tn, 1).is_err(), "band mode at bucket rows");
+                p.insts[0].i[0] = band;
+                p.insts[0].i[3] = 0;
+                assert!(routes(&p, &tn, 1).is_err(), "band rows without band mode");
+            }
+        }
+        let (mut p, tn) = fixture();
+        p.t = 4096;
+        p.insts[0].i = [512, 2048, 6144, 2, 0, 0, 0, 0];
+        assert!(routes(&p, &tn, 1).is_err(), "no band kernels at 512 rows");
+    }
+
     const DECODE_SHAPES: [(u32, u32); 11] = [
         (2048, 6144),
         (512, 6144),
