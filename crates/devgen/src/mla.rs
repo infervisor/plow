@@ -1801,6 +1801,10 @@ pub(crate) struct GlmTn {
     /// the bound one agree) stayed healthy while the same decode program inside a prefill bundle
     /// emitted a constant token.
     slot_b: u32,
+    /// `PLOW_GLM_SEQ_PAR`: peer result slot 3 (`act.h2_tp`, bound at `3 * slot_b`), which every
+    /// sequence-parallel seam writes its normed band into for the all-gather. TENSOR_NONE unless
+    /// the knob is on under TP with a prefill bucket the seams cover.
+    h2_tp: u32,
     // DSA indexer (TENSOR_NONE when the DSA gate is off). qidx/kidx_raw/kidx_normed/widx are per-step
     // scratch; iscore/iidx/ighist/igctl are the score+select scratch (shared across layers, sequential);
     // icos/isin are the [ctx][DI/2] identity-tail interleaved-RoPE tables (first qk_rope/2 real, rest 1/0).
@@ -1939,6 +1943,7 @@ pub(crate) fn declare_glm_rows_batched(
     enc: MoeEnc,
 ) -> GlmTn {
     let dbatch = dbatch.max(1);
+    let sp_seams = c.tp > 1 && rows >= GLM_SP_MIN_ROWS && emit_config::active().glm_seq_par;
     let rows = (rows.max(1) as u64).max(dbatch as u64);
     let (h, nh, dk, dr, vd, ql, e, tk, imoe) = (
         c.hidden,
@@ -2148,6 +2153,16 @@ pub(crate) fn declare_glm_rows_batched(
     };
     let zero_h = if tp > 1 {
         b.tensor_init("act.zero_h", vec![0u8; rows as usize * h as usize * 2])
+    } else {
+        TENSOR_NONE
+    };
+    // The host lays out six peer slots once a packet carries the split collectives and requires
+    // all three result names; only slot 3 is written here.
+    let h2_tp = if sp_seams {
+        let h2 = ac(b, "h2_tp", rows * h as u64 * BF16);
+        ac(b, "xe_tp", rows * h as u64 * BF16);
+        ac(b, "rt_tp", rows * h as u64 * BF16);
+        h2
     } else {
         TENSOR_NONE
     };
@@ -2967,6 +2982,7 @@ pub(crate) fn declare_glm_rows_batched(
         // Slot A is [0, rows*h*2); slot B starts where it ends. `rows == 1` (a decode-only emit)
         // gives `h*2`, the value every shipped decode blob already carries.
         slot_b: rows as u32 * h * BF16 as u32,
+        h2_tp,
         meta,
         row_token,
         row_partidx,
@@ -4725,6 +4741,92 @@ fn xr_res_fold() -> bool {
     emit_config::active().glm_xr_res
 }
 
+/// Smallest prefill bucket the sequence-parallel seams cover (the 2048 and 8192 rungs). The
+/// small rungs run on their own objects and carry little seam work.
+const GLM_SP_MIN_ROWS: u32 = 2048;
+
+/// `PLOW_GLM_SEQ_PAR`: this prefill program's TP seams are sequence-parallel. Between seams the
+/// residual stream is valid only on this rank's `t/tp` row band, so every seam of a program —
+/// layer input norm, attention, FFN, final norm — must take the same answer; all of them derive
+/// it from these inputs alone.
+fn glm_sp(c: &GlmCfg, n: &GlmTn, b: &Builder, t: u32) -> bool {
+    n.h2_tp != TENSOR_NONE
+        && t >= GLM_SP_MIN_ROWS
+        && t % c.tp == 0
+        && !b.packed_prefill_segments()
+        && b.token_batch_band().is_none()
+        && !emit_config::active().no_xreduce
+}
+
+/// Rank-relative band view `<base>@band<t>`: rows `[rank*t/tp, (rank+1)*t/tp)` of a `[t][row]`
+/// tensor, bound by the host at `base + rank * bytes`. Declared once per program and bucket.
+fn glm_band(b: &mut Builder, base: u32, t: u32, tp: u32, row_bytes: u64) -> u32 {
+    let name = format!("{}@band{t}", b.tensor_name(base));
+    match (0..b.n_tensors() as u32).find(|&h| b.tensor_name(h) == name) {
+        Some(h) => h,
+        None => b.tensor(&name, (t / tp) as u64 * row_bytes),
+    }
+}
+
+/// Band half of a sequence-parallel seam: `out = resid + reduced` on this rank's rows, where
+/// `reduced` is the reduce-scatter's in-place band of peer slot `slot`.
+#[allow(clippy::too_many_arguments)]
+fn glm_sp_residual(
+    b: &mut Builder,
+    t: u32,
+    tp: u32,
+    h: u32,
+    out: u32,
+    resid: u32,
+    slot: u32,
+    deps: &[u32],
+) -> u32 {
+    let rowb = h as u64 * 2;
+    let o = glm_band(b, out, t, tp, rowb);
+    let r = glm_band(b, resid, t, tp, rowb);
+    let s = glm_band(b, slot, t, tp, rowb);
+    let e = t / tp * h;
+    b.emit(DevOp::Residual, pf_wide_cus(b.n_cu(), e), deps, |d| {
+        d.t[0] = o;
+        d.t[1] = r;
+        d.t[2] = s;
+        d.i[0] = e;
+        d.f[0] = 1.0;
+    })
+}
+
+/// RMSNorm this rank's band of `x` into its band of peer slot 3, then all-gather the normed rows
+/// into `out` on every rank.
+#[allow(clippy::too_many_arguments)]
+fn glm_sp_norm_gather(
+    b: &mut Builder,
+    n: &GlmTn,
+    t: u32,
+    tp: u32,
+    h: u32,
+    eps: f32,
+    out: u32,
+    x: u32,
+    weight: u32,
+    deps: &[u32],
+    xgate: &mut u32,
+    xr_cus: &[u32],
+) -> u32 {
+    let rowb = h as u64 * 2;
+    let xb = glm_band(b, x, t, tp, rowb);
+    let hb = glm_band(b, n.h2_tp, t, tp, rowb);
+    let rows = t / tp;
+    let c_n = b.emit(DevOp::RmsNorm, pf_wide_cus(b.n_cu(), rows), deps, |d| {
+        d.t[0] = hb;
+        d.t[1] = xb;
+        d.t[2] = weight;
+        d.i[0] = rows;
+        d.i[1] = h;
+        d.f[0] = eps;
+    });
+    crate::emit_xall_gather(b, xgate, xr_cus, &[c_n], &[(out, t * h, 3 * n.slot_b)], tp)
+}
+
 /// Causal KV-split factor for the V2 MLA prefill flash (`PLOW_GLM_PF_NS=k`, 2..=8; unset/1 =
 /// the un-split emit, byte-identical to before the knob existed).
 ///
@@ -5512,15 +5614,20 @@ pub(crate) fn emit_glm_mla_prefill(
         })
     };
 
-    // 1 input_layernorm, T rows.
-    let c_rn1 = b.emit(DevOp::RmsNorm, pf_wide_cus(n_cu, t), pre, |d| {
-        d.t[0] = n.xn;
-        d.t[1] = x_in;
-        d.t[2] = w.gin;
-        d.i[0] = t;
-        d.i[1] = h;
-        d.f[0] = eps;
-    });
+    // 1 input_layernorm, T rows (on the band + all-gather under the sequence-parallel seams).
+    let sp = !raw_output && glm_sp(c, n, b, t);
+    let c_rn1 = if sp {
+        glm_sp_norm_gather(b, n, t, tp, h, eps, n.xn, x_in, w.gin, pre, xgate, xr_cus)
+    } else {
+        b.emit(DevOp::RmsNorm, pf_wide_cus(n_cu, t), pre, |d| {
+            d.t[0] = n.xn;
+            d.t[1] = x_in;
+            d.t[2] = w.gin;
+            d.i[0] = t;
+            d.i[1] = h;
+            d.f[0] = eps;
+        })
+    };
     // 2/6/8 the three down-projections. Decode fuses these into ONE GemvQkv (fusion A); there is no
     // GemmQkv, so prefill keeps them split — the same call the dense path makes ("prefill keeps the
     // split; T rows already parallelise"). Each is a separate tiled GEMM over the whole machine.
@@ -5951,6 +6058,18 @@ pub(crate) fn emit_glm_mla_prefill(
     } else {
         xr_band_k(t, "attn")
     };
+    if sp {
+        // Sequence-parallel attention seam: reduce-scatter the o_proj partial in place, residual
+        // and post_attention_layernorm on the owned band, all-gather the normed rows.
+        assert!(kb == 1, "PLOW_GLM_SEQ_PAR cannot combine with PLOW_GLM_XR_BAND");
+        let c_p = oproj(b, n.og_tp, &[c_uv]);
+        let c_rs =
+            crate::emit_xreduce_scatter(b, xgate, xr_cus, &[c_p], n.og_tp, t * h, tp, 0, None, None);
+        let c_res = glm_sp_residual(b, t, tp, h, n.xmid, x_in, n.og_tp, &[c_rs]);
+        return glm_sp_norm_gather(
+            b, n, t, tp, h, eps, n.xn2, n.xmid, w.gpost, &[c_res], xgate, xr_cus,
+        );
+    }
     let xr_deps: Vec<u32> = if tp > 1 && !no_xr && kb > 1 {
         // BANDED TP seam (see emit_xreduce_twoshot_band): K row-band o_proj GEMMs, each
         // feeding its own two-shot — band 0's fabric transfer overlaps bands 1..K-1's
@@ -6457,6 +6576,10 @@ fn emit_glm_moe_ffn_prefill(
         // Residual. kb==1 emits the exact pre-banding packets.
         let kb = xr_band_k(t, "moe");
         let rows = t / kb;
+        // Sequence-parallel FFN seam: reduce-scatter, then the residual on the owned band only;
+        // the next layer's input norm (or the tail's final norm) gathers.
+        let sp = !raw_output && glm_sp(c, n, b, t);
+        assert!(!sp || kb == 1, "PLOW_GLM_SEQ_PAR cannot combine with PLOW_GLM_XR_BAND");
         // CU-SUBSET SCHEDULING — see `xr_band_cus` and the attn seam's twin. Gated on kb>1
         // so `PLOW_GLM_XR_BAND_CUS` never narrows the UNBANDED collective (that is
         // `PLOW_XR_CUS`'s job) and the two seams stay symmetric under every knob combination.
@@ -6490,6 +6613,11 @@ fn emit_glm_moe_ffn_prefill(
                     d.i[4] = u32::from(det); // f64 fixed-point accumulator (PLOW_MOE_PF_DET)
                     d.i[7] = u32::from(native_moe);
                 });
+                if sp {
+                    return crate::emit_xreduce_scatter(
+                        b, xgate, &bcus, &[c_cmb], n.dg_tp, t * h, tp, n.slot_b, None, None,
+                    );
+                }
                 // `n.slot_b`, NOT `t * h * 2`: the offset is a property of the BLOB (where
                 // the host binds `act.dg_tp`), not of this bucket. See GlmTn.
                 emit_xreduce_twoshot_band(
@@ -6506,7 +6634,9 @@ fn emit_glm_moe_ffn_prefill(
                 )
             })
             .collect();
-        if raw_output {
+        if sp {
+            glm_sp_residual(b, t, tp, h, x_out, n.xmid, n.dg_tp, &xr_deps)
+        } else if raw_output {
             // Mirrors emit_glm_mla_prefill's own raw_output tail exactly: n.attn already holds
             // the correct zero-residual TP-summed result (the per-band MoeCombinePf above always
             // passes a null residual), so there is nothing left to add — just join every band's
@@ -6705,7 +6835,12 @@ fn emit_glm_dense_block_prefill(
         });
         // `n.slot_b`, NOT `t * h * 2`: the offset is a property of the BLOB (where the host binds
         // `act.dg_tp`), not of this bucket. See the field's header on GlmTn.
-        if xr_res_fold() {
+        if glm_sp(c, n, b, t) {
+            let c_rs = crate::emit_xreduce_scatter(
+                b, xgate, xr_cus, &[c_cmb], n.dg_tp, t * h, tp, n.slot_b, None, None,
+            );
+            glm_sp_residual(b, t, tp, h, x_out, n.xmid, n.dg_tp, &[c_rs])
+        } else if xr_res_fold() {
             // XR+Residual fold — same seam shape as the MoE block's, degenerate routing aside.
             emit_xreduce_twoshot_band(
                 b,
@@ -8233,6 +8368,13 @@ fn glm_emit_full(
     let nl = cap.unwrap_or(c.layers).min(c.layers);
     let layers: Vec<u32> = (0..nl).collect();
     let enc = MoeEnc::from_flags(use_fp8, false);
+    assert!(
+        !emit_config::active().glm_seq_par
+            || (!emit_config::active().glm_xr_res
+                && emit_config::active().glm_xr_band.unwrap_or(1) <= 1),
+        "PLOW_GLM_SEQ_PAR replaces the two-shot seams; it cannot combine with PLOW_GLM_XR_RES \
+         or PLOW_GLM_XR_BAND"
+    );
     if emit_config::active().glm_moe_resident() {
         assert!(
             crate::emit_is_amd()
@@ -8269,7 +8411,7 @@ fn glm_emit_full(
     // decode-only emit byte-identical to one from before this path existed. `dbatch` widens only
     // the KV rings, `in.kvlen`, the lm_head tail and the flash partials — see the declare's doc.
     let tn = declare_glm_rows_batched(&mut tb, &c, ctx, &layers, max_rows, dbatch, enc);
-    let tensors = tb.tensors();
+    let mut tensors = tb.tensors();
     let gen = tb.gen_tensors();
 
     // One program per prefill bucket, ahead of decode. Same layer chain, same dense/MoE split, the
@@ -8424,7 +8566,12 @@ fn glm_emit_full(
             cur = nxt;
         }
         emit_glm_tail(&mut pb, &c, &tn, cur, &dep, t, false, &mut pxgate, band);
-        progs.push(pb.finish());
+        let prog = pb.finish();
+        // The sequence-parallel seams declare their band views inside the program.
+        if tn.h2_tp != TENSOR_NONE {
+            tensors = prog.tensors.clone();
+        }
+        progs.push(prog);
         prog_t.push(match kind {
             PfKind::Plain => t,
             PfKind::Packed => packet::devbuild::packed_prefill_program_t(t),
@@ -8648,14 +8795,22 @@ fn emit_glm_tail(
     // At prefill (`rows` = the bucket's T) this norms every row of the chunk even though the head
     // GEMV reads only the last — d_rmsnorm has no input row offset — so at least spread the rows
     // across the machine; decode (rows=1) keeps the single workgroup.
-    let c_f = b.emit(DevOp::RmsNorm, pf_wide_cus(b.n_cu(), norm_rows), dep, |d| {
-        d.t[0] = n.xn;
-        d.t[1] = x_final;
-        d.t[2] = n.fin;
-        d.i[0] = norm_rows;
-        d.i[1] = c.hidden;
-        d.f[0] = c.eps;
-    });
+    // Sequence-parallel prefill: `x_final` is valid on this rank's band only.
+    let c_f = if !dec_batch && glm_sp(c, n, b, rows) {
+        let xr = xr_cus_capped(b.n_cu(), &all);
+        glm_sp_norm_gather(
+            b, n, rows, c.tp, c.hidden, c.eps, n.xn, x_final, n.fin, dep, xgate, &xr,
+        )
+    } else {
+        b.emit(DevOp::RmsNorm, pf_wide_cus(b.n_cu(), norm_rows), dep, |d| {
+            d.t[0] = n.xn;
+            d.t[1] = x_final;
+            d.t[2] = n.fin;
+            d.i[0] = norm_rows;
+            d.i[1] = c.hidden;
+            d.f[0] = c.eps;
+        })
+    };
     // Batched decode: per-sequence logits. The Gemma reference for the argmax batching is
     // `lib.rs`' `nb_argmax` (`if decode && t > 1 { t } else { 0 }`) — 0 at one row keeps the
     // packet byte-identical to the pre-batch emit.

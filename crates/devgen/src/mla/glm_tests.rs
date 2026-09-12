@@ -3261,3 +3261,143 @@ fn glm_gemm_blk_isolates_the_checkpoint_fp8_projections() {
     );
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// `PLOW_GLM_SEQ_PAR`: every TP seam of a >= 2048-row prefill program is a reduce-scatter, band
+/// work (residual, norm) and an all-gather of the normed rows; the 128-row rung and decode keep
+/// their collectives. Off, no result slot and no split collective is emitted.
+#[test]
+fn glm_seq_par_splits_every_prefill_seam_on_the_owned_band() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let _guard = crate::test_env::env_guard();
+    let _target = crate::EmitAmdGuard::set(true);
+    let dir = std::env::temp_dir().join(format!("plow-glm-seq-par-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = serde_json::json!({
+        "model_type": "glm_moe_dsa", "num_hidden_layers": 4,
+        "hidden_size": 6144, "num_attention_heads": 64,
+        "kv_lora_rank": 512, "q_lora_rank": 2048,
+        "qk_nope_head_dim": 192, "qk_rope_head_dim": 64, "v_head_dim": 256,
+        "vocab_size": 128, "rms_norm_eps": 1e-5,
+        "n_routed_experts": 256, "num_experts_per_tok": 8,
+        "moe_intermediate_size": 2048, "intermediate_size": 12288,
+        "first_k_dense_replace": 3, "routed_scaling_factor": 2.5,
+        "rope_theta": 8000000.0
+    });
+    std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+    fn is(d: &crate::DevInst, op: DevOp) -> bool {
+        d.op == op as u16
+    }
+    let emit = |verify: crate::VerifyHook| {
+        glm_emit_full(
+            &dir,
+            4096,
+            dir.join("model.pkt").to_str().unwrap(),
+            304,
+            8,
+            true,
+            true,
+            "gfx942",
+            None,
+            Some(&verify),
+        )
+    };
+    let base_env = [
+        ("PLOW_MLA_PREFILL", "full:128,2048"),
+        ("PLOW_EMIT_PACKED_PREFILL", "0"),
+        ("PLOW_UNISEG", "0"),
+    ];
+
+    let ran = std::sync::Arc::new(AtomicBool::new(false));
+    {
+        let _env = crate::test_env::EnvScope::set(&base_env);
+        let ran = ran.clone();
+        emit(Box::new(move |model| {
+            assert!(model.tensors.iter().all(|t| t.name != "act.h2_tp"));
+            assert!(model
+                .progs
+                .iter()
+                .flat_map(|p| &p.insts)
+                .all(|d| !is(d, DevOp::XReduceScatter) && !is(d, DevOp::XAllGather)));
+            ran.store(true, Ordering::SeqCst);
+            Ok(crate::LeanReport::skipped("structural regression test"))
+        }));
+    }
+    assert!(ran.swap(false, Ordering::SeqCst));
+
+    let mut env = base_env.to_vec();
+    env.push(("PLOW_GLM_SEQ_PAR", "1"));
+    let _env = crate::test_env::EnvScope::set(&env);
+    let ran2 = ran.clone();
+    emit(Box::new(move |model| {
+        let (t, h, tp) = (2048u32, 6144u32, 8u32);
+        let slot_b = t * h * 2;
+        let tn = |ix: u32| model.tensors[ix as usize].name.as_str();
+        let count = |p: &packet::devbuild::Program, op: DevOp| {
+            p.insts.iter().filter(|d| is(d, op)).count()
+        };
+        // The 128-row rung keeps its two-shots; decode keeps its one-shots.
+        assert_eq!(count(&model.progs[0], DevOp::XReduceTwoShot), 8);
+        for p in model.progs.iter().filter(|p| p.insts.iter().any(|d| is(d, DevOp::XReduce))) {
+            assert_eq!(count(p, DevOp::XReduceScatter) + count(p, DevOp::XAllGather), 0);
+        }
+        let p = &model.progs[1];
+        assert_eq!(count(p, DevOp::XReduceTwoShot), 0);
+        assert_eq!(count(p, DevOp::XReduceScatter), 8, "4 attention + 3 dense + 1 MoE seams");
+        assert_eq!(count(p, DevOp::XAllGather), 9, "4 input norms + 4 post-attn norms + final");
+        let mut gates = std::collections::BTreeSet::new();
+        for d in &p.insts {
+            if is(d, DevOp::XReduceScatter) {
+                assert_eq!((d.i[0], d.i[1]), (t * h, tp));
+                assert!(d.i[2] == 0 || d.i[2] == slot_b);
+                assert!(gates.insert(d.i[3]), "gate {} reused", d.i[3]);
+            } else if is(d, DevOp::XAllGather) {
+                assert_eq!((d.i[0], d.i[4], d.i[5]), (t * h, tp, 3 * slot_b));
+                assert!(["act.xn", "act.xn2"].contains(&tn(d.t[0])), "gathers {}", tn(d.t[0]));
+                assert!(gates.insert(d.i[3]), "gate {} reused", d.i[3]);
+            }
+        }
+        // Every norm feeding a gather and every seam residual runs on the band.
+        let band_norms: Vec<_> = p
+            .insts
+            .iter()
+            .filter(|d| is(d, DevOp::RmsNorm) && tn(d.t[0]) == "act.h2_tp@band2048")
+            .collect();
+        assert_eq!(band_norms.len(), 9);
+        assert!(band_norms
+            .iter()
+            .all(|d| d.i[0] == t / tp && tn(d.t[1]).ends_with("@band2048")));
+        let res: Vec<_> = p.insts.iter().filter(|d| is(d, DevOp::Residual)).collect();
+        assert_eq!(res.len(), 8);
+        for d in res {
+            assert_eq!(d.i[0], t / tp * h);
+            assert!((0..3).all(|k| tn(d.t[k]).ends_with("@band2048")));
+        }
+        // Band views: an eighth of a base bound before them, all in the blob's table.
+        let mut views = 0;
+        for (ix, v) in model.tensors.iter().enumerate() {
+            let Some(base) = v.name.strip_suffix("@band2048") else {
+                continue;
+            };
+            let bix = model.tensors.iter().position(|x| x.name == base).expect("band base");
+            assert!(bix < ix);
+            assert_eq!(model.tensors[bix].bytes, tp as u64 * v.bytes, "{}", v.name);
+            views += 1;
+        }
+        assert_eq!(views, 6, "x, xnext, xmid, og_tp, dg_tp, h2_tp");
+        for name in ["act.h2_tp", "act.xe_tp", "act.rt_tp"] {
+            assert!(model.tensors.iter().any(|x| x.name == name), "{name} missing");
+        }
+        for q in &model.progs {
+            for d in &q.insts {
+                assert!(d
+                    .t
+                    .iter()
+                    .all(|&h| h == TENSOR_NONE || (h as usize) < model.tensors.len()));
+            }
+        }
+        ran2.store(true, Ordering::SeqCst);
+        Ok(crate::LeanReport::skipped("structural regression test"))
+    }));
+    assert!(ran.load(Ordering::SeqCst));
+    std::fs::remove_dir_all(dir).unwrap();
+}

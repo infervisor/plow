@@ -366,6 +366,11 @@ pub(crate) fn rebase_chunk_rows(
         let Some(t) = bucket.filter(|&t| t > 0 && clen < t) else {
             continue;
         };
+        // A sequence-parallel band packet (`<base>@band<T>` output) covers this rank's fixed
+        // `T/tp` rows, not a prefix of the bucket; shrinking it would drop live band rows.
+        if names.get(d.t[0] as usize).is_some_and(|n| n.contains("@band")) {
+            continue;
+        }
         match prefill_row_field(op) {
             Some(RowField::Rows(f)) if d.i[f] == t => d.i[f] = clen,
             Some(RowField::RowsTimes(f)) if d.i[f] > 0 && d.i[f] % t == 0 => {

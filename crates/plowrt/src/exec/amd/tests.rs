@@ -4290,6 +4290,40 @@ fn ragged_rows_shrink_only_the_fields_that_hold_the_bucket_width() {
     assert_eq!(insts[11].i, before[11].i, "a banded GEMM was rewritten");
 }
 
+/// Sequence-parallel band packets (`<base>@band<T>` outputs) cover the rank's fixed `T/tp` rows;
+/// the ragged shrink must not touch them, even where the field is a multiple of `T`.
+#[test]
+fn ragged_rows_leave_sequence_parallel_band_packets_alone() {
+    const T: u32 = 8192;
+    const CLEN: u32 = 4097;
+    const H: u32 = 6144;
+    let names: Vec<String> = ["act.xmid", "act.xmid@band8192", "act.h2_tp@band8192"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let inst = |op: DevOp, t0, i: [u32; 8]| DevInst64 {
+        op: op as u16,
+        t: [t0, 0, 0, 0, 0, 0, 0, 0],
+        i,
+        ..Default::default()
+    };
+    let mut insts = vec![
+        inst(DevOp::Residual, 0, [T * H, 0, 0, 0, 0, 0, 0, 0]),
+        inst(DevOp::Residual, 1, [T / 8 * H, 0, 0, 0, 0, 0, 0, 0]),
+        inst(DevOp::RmsNorm, 2, [T / 8, H, 0, 0, 0, 0, 0, 0]),
+        inst(DevOp::XReduceScatter, 0, [T * H, 8, 0, 3, 0, 0, 0, 0]),
+        inst(DevOp::XAllGather, 0, [T * H, 0, 0, 4, 8, 0, 0, 0]),
+    ];
+    let before = insts.clone();
+
+    rebase_chunk_rows(&mut insts, &names, 0, CLEN, T, Some(T));
+
+    assert_eq!(insts[0].i[0], CLEN * H, "a full-width residual still shrinks");
+    for k in 1..insts.len() {
+        assert_eq!(insts[k].i, before[k].i, "instruction {k} was rewritten");
+    }
+}
+
 #[test]
 fn ragged_sparse_prefill_keeps_selection_and_flash_layouts_equal() {
     const T: u32 = 8192;
