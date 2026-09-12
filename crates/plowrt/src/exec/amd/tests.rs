@@ -4281,6 +4281,97 @@ fn ragged_rows_leave_sequence_parallel_band_packets_alone() {
     }
 }
 
+/// `PLOW_AMD_RAGGED_SEAMS`: a ragged chunk's band is `ceil(live / tp)` rows per rank (at least
+/// one), every band packet and split collective is re-sized to it, and each rank's
+/// reduce-scatter slice is exactly its band's whole rows, including live < tp and live not
+/// divisible by tp.
+#[test]
+fn ragged_seams_size_bands_and_split_collectives_by_live_rows() {
+    const T: u32 = 8192;
+    const H: u32 = 6144;
+    const TP: u32 = 8;
+    let names: Vec<String> = [
+        "act.xmid",
+        "act.xmid@band8192",
+        "act.h2_tp@band8192",
+        "act.qlr@band8192",
+        "act.rt_tp@band8192.rt",
+        "act.xn2",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let inst = |op: DevOp, t0, i: [u32; 8]| DevInst64 {
+        op: op as u16,
+        t: [t0, 0, 0, 0, 0, 0, 0, 0],
+        i,
+        ..Default::default()
+    };
+    for (clen, b) in [(1, 1), (7, 1), (8, 1), (9, 2), (4073, 510), (8191, 1024)] {
+        let mut insts = vec![
+            inst(DevOp::Residual, 0, [T * H, 0, 0, 0, 0, 0, 0, 0]),
+            inst(DevOp::Residual, 1, [T / TP * H, 0, 0, 0, 0, 0, 0, 0]),
+            inst(DevOp::RmsNorm, 2, [T / TP, H, 0, 0, 0, 0, 0, 0]),
+            inst(DevOp::GemmSmall, 3, [T / TP, 2048, H, 0, 0, 0, 0, 0]),
+            inst(DevOp::MoeRouterTopkPf, 4, [0, 256, 8, 0, T / TP, 0, 1, 1]),
+            inst(DevOp::XReduceScatter, 0, [T * H, TP, 0, 3, 0, 0, 0, 0]),
+            inst(DevOp::XAllGather, 5, [T * H, T * 512, T * 8 * 4, 4, TP, 0, 0, 0]),
+        ];
+        rebase_chunk_rows(&mut insts, &names, 0, clen, T, Some(T));
+        rebase_band_rows(&mut insts, &names, clen, T, TP);
+        assert_eq!(ragged_band_rows(clen, T, TP), b, "clen={clen}");
+        assert!(TP * b >= clen && (b == 1 || TP * (b - 1) < clen), "clen={clen}");
+        assert_eq!(insts[0].i[0], clen * H, "a full-width packet shrinks to live rows");
+        assert_eq!(insts[1].i[0], b * H, "band residual, clen={clen}");
+        assert_eq!(insts[2].i[..2], [b, H], "band norm, clen={clen}");
+        assert_eq!(insts[3].i[..3], [b, 2048, H], "band GEMM, clen={clen}");
+        assert_eq!(insts[4].i[4], b, "band top-k, clen={clen}");
+        assert_eq!(insts[5].i[..2], [TP * b * H, TP], "reduce-scatter, clen={clen}");
+        assert_eq!(insts[6].i[..5], [TP * b * H, TP * b * 512, TP * b * 32, 4, TP], "all-gather");
+        let n = insts[5].i[0] as u64;
+        for r in 0..TP as u64 {
+            assert_eq!(n * r / TP as u64, r * b as u64 * H as u64, "rank {r}'s slice starts its band");
+        }
+    }
+    // A full chunk is left exactly as compiled.
+    let mut full = vec![inst(DevOp::XReduceScatter, 0, [T * H, TP, 0, 3, 0, 0, 0, 0])];
+    rebase_band_rows(&mut full, &names, T, T, TP);
+    assert_eq!(full[0].i[0], T * H);
+}
+
+/// The band views move to `base + rank * band * row`, tagged views (a second row width over the
+/// same base) included; `band = t / tp` is the load-time binding, and `@band81920` is not a
+/// view of the 8192-row program.
+#[test]
+fn ragged_seams_rebind_band_views_to_the_live_band() {
+    const T: u32 = 8192;
+    const TP: u32 = 8;
+    let names: Vec<String> = [
+        "act.xmid",
+        "act.h2_tp",
+        "act.xmid@band8192",
+        "act.h2_tp@band8192.q",
+        "act.xmid@band81920",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let bases = [0x1000_0000u64, 0x9000_0000, 0, 0, 0];
+    let row = [6144u64 * 2, 2048 * 2];
+    let lens = [T as u64 * row[0], T as u64 * 6144 * 2, (T / TP) as u64 * row[0], (T / TP) as u64 * row[1], 0];
+    for rank in 0..TP {
+        for b in [1u32, 2, 510, T / TP] {
+            let v = ragged_band_views(&names, &bases, &lens, T, TP, rank, b);
+            assert_eq!(v.len(), 2);
+            assert_eq!(v[0], (2, bases[0] + (rank * b) as u64 * row[0]));
+            assert_eq!(v[1], (3, bases[1] + (rank * b) as u64 * row[1]));
+            if b == T / TP {
+                assert_eq!(v[0].1, bases[0] + rank as u64 * lens[2], "load-time binding");
+            }
+        }
+    }
+}
+
 #[test]
 fn ragged_sparse_prefill_keeps_selection_and_flash_layouts_equal() {
     const T: u32 = 8192;
