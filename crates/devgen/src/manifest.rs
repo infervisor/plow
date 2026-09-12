@@ -1252,6 +1252,12 @@ fn backend_amd(
     if has("XReduceScatter") || has("XAllGather") {
         req.push("PLOW_SEQ_PAR_SEAMS=1".into());
     }
+    // Row-split sparse attention's cross-GPU head/row transpose (op 160). An object without
+    // the arm would run the packet as a silent no-op — the AMD dispatch's `default:` neither
+    // writes nor traps.
+    if has("XAllToAllHeads") {
+        req.push("PLOW_ROWSPLIT_A2A=1".into());
+    }
     if union.iter().any(|a| {
         matches!(a.op.as_str(), "KdaChunkWu" | "KdaChunkCarry")
             && a.variant.as_deref().is_some_and(|v| v.ends_with("_qpre"))

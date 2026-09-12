@@ -43,6 +43,7 @@ use object::{
     build_requires, check_attn_res_f32mix_symbols, check_compiled_opcode_marker_set,
     check_compiled_opcode_markers, check_dec_stage_capacity, check_decode_object,
     check_dsa_decode_batch, check_dsa_select_local, check_dsa_pf_arm, check_fp8_weight_arms,
+    check_xalltoall_heads,
     check_gate_hier_object, check_gemv_capacity,
     check_interpreter_waves,
     check_k3_arms, check_kda_carry_regstate_symbols, check_kda_chunk, check_kda_conv_step_db,
@@ -6700,6 +6701,7 @@ impl AmdEngine {
         check_sparse_fp8_packet(&blob.progs, &blob.tensors, &arch)?;
         check_dsa_select_local(&blob.progs, &blob.tensors, &arch,
                                tp.is_some_and(|t| t.n_gpu == 8))?;
+        check_xalltoall_heads(&blob.progs, &blob.tensors, &arch)?;
         if use_sparse_mla && arch != "gfx942" {
             return Err(RuntimeError::Device(
                 "sparse AITER MLA requires gfx942".into(),

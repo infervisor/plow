@@ -1372,6 +1372,26 @@ enum {
      * t0=out t1=x t2=weight t3=w_scale t4=xq t5=x_scale t6=bias i0=T i1=N i2=K i3=quantize.
      * Isolated native segment only. */
     PLOW_DOP_GEMM_BLK_PF = 159,
+    /* Row-split sparse attention's cross-GPU head/row transpose (rowsplit-attention-design.md
+     * §3.1 steps 2 and 4). Pull form, one wave (64 lanes) per peer, 16-byte accesses,
+     * one-workgroup rendezvous — modelled on PLOW_DOP_XALLGATHER's AITER access pattern.
+     * TP8 only (the wave-per-peer map assumes 8 waves).
+     *
+     *   dir=0 (Q form): this rank's own peer-visible source is [T][nh_l][d] (all T rows, this
+     *   rank's nh_l heads, contiguous per row). Rank `rank` pulls, from every peer p, p's row
+     *   band [rank*rpr, (rank+1)*rpr) — a CONTIGUOUS run in p's source — into the LOCAL
+     *   dst = [rpr][nh_total][d] at head offset p*nh_l (strided across rows).
+     *
+     *   dir=1 (O form): this rank's own peer-visible source is [rpr][nh_total][d] (this rank's
+     *   row band, every head). Rank `rank` pulls, from every peer p, p's head slice
+     *   [rank*nh_l, (rank+1)*nh_l) at each of p's rpr rows — STRIDED in p's source — into the
+     *   LOCAL dst = [T][nh_l][d] at row band [p*rpr, (p+1)*rpr) (contiguous).
+     *
+     * Pure permutation (no arithmetic): a copied element is byte-exact against the source word.
+     *   t0=dst
+     *   i0=rpr i1=nh_l i2=d i3=nh_total i4=gate i5=n_gpu i6=slot_bytes(src offset into
+     *   peer_scratch) i7=dir(0=q,1=o) */
+    PLOW_DOP_XALLTOALL_HEADS = 160,
 
     PLOW_DOP__COUNT
 };

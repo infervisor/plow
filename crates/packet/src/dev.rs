@@ -1865,6 +1865,30 @@ pub enum DevOp {
     /// `i3=0` reads the `xq`/`x_scale` an earlier instruction quantized from the same `x`.
     /// Requires an isolated native segment.
     GemmBlkPf = 159,
+    /// Row-split sparse attention's cross-GPU head/row transpose
+    /// (`reports/rowsplit-attention-design.md` §3.1 steps 2 and 4). Pull form, one wave (64
+    /// lanes) per peer, 16-byte accesses, one-workgroup rendezvous — modelled on
+    /// [`DevOp::XAllGather`]'s AITER access pattern (measured 225.6 GB/s combined at a
+    /// 48-workgroup cap, `runtime/tests/tp_alltoall_bench.c`). TP8 only: the wave-per-peer map
+    /// (`p = (wave + rank) % nranks`) assumes 8 waves.
+    ///
+    /// `dir=0` (Q form): this rank's own peer-visible source is `[T][nh_l][d]` (all `T` rows,
+    /// this rank's `nh_l` heads, contiguous per row). Rank `rank` pulls, from every peer `p`,
+    /// `p`'s row band `[rank*rpr, (rank+1)*rpr)` — a CONTIGUOUS run in `p`'s source — into the
+    /// LOCAL `dst = [rpr][nh_total][d]` at head offset `p*nh_l` (strided across rows).
+    ///
+    /// `dir=1` (O form): this rank's own peer-visible source is `[rpr][nh_total][d]` (this
+    /// rank's row band, every head). Rank `rank` pulls, from every peer `p`, `p`'s head slice
+    /// `[rank*nh_l, (rank+1)*nh_l)` at each of `p`'s `rpr` rows — STRIDED in `p`'s source —
+    /// into the LOCAL `dst = [T][nh_l][d]` at row band `[p*rpr, (p+1)*rpr)` (contiguous).
+    ///
+    /// A pure permutation (no arithmetic): a copied element is byte-exact against the source
+    /// word. This op moves bytes only — the row-split attention it composes with is not
+    /// bit-identical against the head-sharded route, but that comes from a different
+    /// accumulation order in the attention kernel, not from this op.
+    /// `t0=dst` · `i0=rpr i1=nh_l i2=d i3=nh_total i4=gate i5=n_gpu i6=slot_bytes(src offset
+    /// into peer_scratch) i7=dir(0=q,1=o)`.
+    XAllToAllHeads = 160,
 }
 
 /// GLU-family `act` code for GPT-OSS's `swiglu_oai` (pair form, `f0 = alpha`, `f1 = limit`).
@@ -2040,6 +2064,7 @@ impl DevOp {
         DevOp::IndexTpPf,
         DevOp::GemmLtPf,
         DevOp::GemmBlkPf,
+        DevOp::XAllToAllHeads,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -2220,6 +2245,7 @@ impl DevOp {
             DevOp::IndexTpPf => "PLOW_DOP_INDEX_TP_PF",
             DevOp::GemmLtPf => "PLOW_DOP_GEMM_LT_PF",
             DevOp::GemmBlkPf => "PLOW_DOP_GEMM_BLK_PF",
+            DevOp::XAllToAllHeads => "PLOW_DOP_XALLTOALL_HEADS",
         }
     }
 
@@ -2261,7 +2287,9 @@ impl DevOp {
     /// collision-at-merge as 111 -> 113, resolved the same way (renumber the later merge).
     /// 154 -> 155 for `RowGather = 154` (the unified token batch's terminal row selection).
     /// 155 -> 156 for `PerLayerInput = 155` (Gemma-4 E-series per-layer inputs).
-    pub const COUNT: u16 = 160;
+    /// 160 -> 161 for `XAllToAllHeads = 160` (row-split sparse attention's cross-GPU
+    /// head/row transpose).
+    pub const COUNT: u16 = 161;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///

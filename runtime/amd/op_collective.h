@@ -1611,7 +1611,10 @@ __device__ __forceinline__ void d_xreduce_twoshot_mega(
  * Both bodies are the two-shot's own phases restated, not rewritten: strict rank order
  * r = 0..N-1 in f32, one `f2bf` per element, the same peer-staggered gather order. Anything the
  * two-shot computes for an element, these compute bit-identically. */
-#if PLOW_SEQ_PAR_SEAMS
+/* `xr_rendezvous_one_wg` is shared by the sequence-parallel seams (ops 25/26) and the
+ * row-split sparse attention's head/row transpose (op 160, PLOW_ROWSPLIT_A2A below): both are
+ * self-contained one-gate rendezvous over data an EARLIER packet already published. */
+#if PLOW_SEQ_PAR_SEAMS || PLOW_ROWSPLIT_A2A
 /* One-workgroup announcement + N-arrival wait on `gate`, the two-shot's RENDEZVOUS 1 verbatim.
  * Legal for both ops here because what is being published was written by EARLIER packets
  * (the partial by the producer GEMM, the band results by the band packets), whose completion
@@ -1647,7 +1650,9 @@ __device__ __forceinline__ bool xr_rendezvous_one_wg(const void* const* peer_scr
     __syncthreads();
     return !*bailed;
 }
+#endif /* PLOW_SEQ_PAR_SEAMS || PLOW_ROWSPLIT_A2A */
 
+#if PLOW_SEQ_PAR_SEAMS
 /* op 25 — REDUCE-SCATTER ONLY. Rendezvous on `gate_rs`, then this rank's owned slice
  * [n*rank/N, n*(rank+1)/N) of the flat [n] partial at `slot_bytes` is reduced and written IN
  * PLACE into its own peer-visible slot (the two-shot's PHASE 1; `PLOW_XR_RS_U` elements in
@@ -1771,5 +1776,79 @@ __device__ __forceinline__ void d_xall_gather_mega(
     gather(dst2, n2, slot2);
 }
 #endif /* PLOW_SEQ_PAR_SEAMS */
+
+/* ---- ROW-SPLIT SPARSE ATTENTION: cross-GPU head/row transpose (op 160) ----------------------
+ *
+ * `-DPLOW_ROWSPLIT_A2A=1` (the packet's plow_config.h carries it when the packet has the op; a
+ * flag-off object compiles none of this and stays byte-identical). Two directions of the same
+ * permutation, one wave (64 lanes) per peer, 16-byte (8xbf16) vector accesses — copied from
+ * `xr_ag_sched`'s AITER access pattern (`d_xall_gather_mega`'s own schedule), NOT the scalar
+ * per-element walk: a first cut of this schedule at 2-byte scalar accesses measured ~55-57 GB/s,
+ * 4x under this fabric's ~230 GB/s peer bandwidth (2-byte scalar remote loads are the
+ * pathological case this file's own comments elsewhere warn about). Rewritten to the
+ * one-wave-per-peer 16-byte form: 225.6 GB/s combined at a 48-workgroup cap, byte-exact on every
+ * rank (`runtime/tests/tp_alltoall_bench.c` + `tp_alltoall_kernels.hip`, job
+ * `0-1789234094-a2a-collective-bench3`). Hard-coded to TP8 (`p = (wave + rank) % nranks` assumes
+ * 8 waves), like `xr_ag_sched`'s own wave-per-peer path it copies.
+ *
+ * No scalar fallback: unlike ops 25/26, this op has no prior behavior to stay byte-identical
+ * against, so it always takes the measured-fast schedule. */
+#if PLOW_ROWSPLIT_A2A
+#ifndef PLOW_XA2A_NWG
+#define PLOW_XA2A_NWG 48
+#endif
+/* dir=0 (Q form): this rank's own peer-visible source is [T][nh_l][d] (all T rows, this rank's
+ * nh_l heads, contiguous per row). Rank `rank` pulls, from every peer p, p's row band
+ * [rank*rpr, (rank+1)*rpr) — a CONTIGUOUS run in p's source — into the LOCAL
+ * dst = [rpr][nh_total][d] at head offset p*nh_l (strided across rows).
+ *
+ * dir=1 (O form): this rank's own peer-visible source is [rpr][nh_total][d] (this rank's row
+ * band, every head). Rank `rank` pulls, from every peer p, p's head slice
+ * [rank*nh_l, (rank+1)*nh_l) at each of p's rpr rows — STRIDED in p's source — into the LOCAL
+ * dst = [T][nh_l][d] at row band [p*rpr, (p+1)*rpr) (contiguous).
+ *
+ * Both are pure permutations (no arithmetic): a copied element is byte-exact against the
+ * source word. `row_elems (= nh_l * d)` is a multiple of 8 by construction on the shapes this
+ * op is emitted for (8 heads x 576 or 512), so every (peer, row) block divides into whole
+ * 8xbf16 vectors on both the contiguous and the strided side, with no scalar remainder. */
+__device__ __forceinline__ void d_xalltoall_heads_mega(
+    const void* const* peer_scratch, uint32_t nranks, uint32_t rank, size_t xctr_byte_off,
+    uint32_t gate, uint64_t deadline_ticks, uint32_t* status, unsigned slice, unsigned nblk,
+    bf16* __restrict__ dst, uint32_t rpr, uint32_t nh_l, uint32_t d, uint32_t nh_total,
+    uint32_t slot_bytes, uint32_t dir) {
+    __shared__ int bailed;
+    if (slice >= PLOW_XA2A_NWG) return;
+    const unsigned dnblk = nblk < PLOW_XA2A_NWG ? nblk : PLOW_XA2A_NWG;
+    if (!xr_rendezvous_one_wg(peer_scratch, nranks, rank, xctr_byte_off, gate, deadline_ticks,
+                              status, slice, &bailed))
+        return;
+    const uint32_t row_elems = nh_l * d, vrow = row_elems >> 3u;
+    const uint32_t chunk_vecs = (rpr * row_elems) >> 3u;
+    const uint32_t lane = threadIdx.x & 63u, wave = threadIdx.x >> 6u;
+    const uint32_t t0 = slice * 64u + lane, tstep = dnblk * 64u;
+    const uint32_t p = (wave + rank) % nranks;
+    if (dir == 0u) {
+        const uint32_t dst_row_vecs = (nh_total * d) >> 3u;
+        const bf16* src = (const bf16*)((const char*)peer_scratch[p] + slot_bytes) +
+                          (size_t)rank * rpr * row_elems;
+        const uint32_t dst_head_vecs = p * vrow;
+        for (uint32_t v = t0; v < chunk_vecs; v += tstep) {
+            const uint32_t row = v / vrow, r_in_row = v % vrow;
+            st_glob8(dst + ((size_t)row * dst_row_vecs + dst_head_vecs + r_in_row) * 8u,
+                    ld_glob8(src + (size_t)v * 8u));
+        }
+    } else {
+        const uint32_t src_row_vecs = (nh_total * d) >> 3u;
+        const bf16* src = (const bf16*)((const char*)peer_scratch[p] + slot_bytes);
+        const uint32_t src_head_vecs = rank * vrow;
+        bf16* dp = dst + (size_t)p * chunk_vecs * 8u;
+        for (uint32_t v = t0; v < chunk_vecs; v += tstep) {
+            const uint32_t row = v / vrow, r_in_row = v % vrow;
+            st_glob8(dp + (size_t)v * 8u,
+                    ld_glob8(src + ((size_t)row * src_row_vecs + src_head_vecs + r_in_row) * 8u));
+        }
+    }
+}
+#endif /* PLOW_ROWSPLIT_A2A */
 
 #endif /* PLOW_OP_COLLECTIVE_H */

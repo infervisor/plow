@@ -128,6 +128,17 @@ extern "C" __device__ unsigned plow_token_batch_wide_gemm_1 = 1;
 #define PLOW_SEQ_PAR_SEAMS 0
 #endif
 #endif
+/* Row-split sparse attention's cross-GPU head/row transpose (op 160, op_collective.h). Same
+ * OPT-IN discipline as PLOW_SEQ_PAR_SEAMS above: a packet that carries it says so in its
+ * plow_config.h (PLOW_HAS_XALLTOALL_HEADS, per bucket), and every other object compiles none
+ * of it and stays byte-identical. */
+#ifndef PLOW_ROWSPLIT_A2A
+#if defined(PLOW_HAS_XALLTOALL_HEADS) && PLOW_HAS_XALLTOALL_HEADS
+#define PLOW_ROWSPLIT_A2A 1
+#else
+#define PLOW_ROWSPLIT_A2A 0
+#endif
+#endif
 
 /* Opt-in packet-inventory pruning. A generated PLOW_CONFIG supplies the exact
  * per-bucket PLOW_HAS_* set; ordinary developer objects retain the historical
@@ -374,6 +385,10 @@ extern "C" __device__ unsigned plow_kda_conv_step_db_arm = 1;
 #if PLOW_SEQ_PAR_SEAMS
 /* The loader's `PLOW_SEQ_PAR_SEAMS=1` requirement resolves to this marker. */
 extern "C" __device__ unsigned plow_seq_par_seams_arm_1 = 1;
+#endif
+#if PLOW_ROWSPLIT_A2A
+/* The loader's `PLOW_ROWSPLIT_A2A=1` requirement resolves to this marker. */
+extern "C" __device__ unsigned plow_rowsplit_a2a_arm_1 = 1;
 #endif
 
 /* Compact TP audit. `j[1] == 0` keeps old packets byte-compatible; plowrt patches
@@ -5787,6 +5802,19 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
                 in->i[6],
                 in->t[2] == PLOW_TENSOR_NONE ? nullptr : (bf16*)tens[in->t[2]], in->i[2],
                 in->i[7]);
+#endif
+#if PLOW_ROWSPLIT_A2A
+        } else if (in->op == PLOW_DOP_XALLTOALL_HEADS) {
+            /* Row-split sparse attention's cross-GPU head/row transpose.
+             *   t0=dst i0=rpr i1=nh_l i2=d i3=nh_total i4=gate i5=n_gpu
+             *   i6=slot_bytes(src offset into peer_scratch) i7=dir(0=q,1=o) */
+            const size_t xoff =
+                (const char*)prog.xctr - (const char*)prog.peer_scratch[prog.rank];
+            uint32_t* const xaudit = plow_xaudit_status(prog, in);
+            d_xalltoall_heads_mega(prog.peer_scratch, prog.n_gpu, prog.rank, xoff, in->i[4],
+                                  PLOW_XCTR_DEADLINE_TICKS, xaudit, e.slice, in->blocks,
+                                  (bf16*)tens[in->t[0]], in->i[0], in->i[1], in->i[2],
+                                  in->i[3], in->i[6], in->i[7]);
 #endif
         } else if (in->op == PLOW_DOP_XARGMAX_FIN) {
             /* Cross-rank fold for a VOCAB-COLUMN-PARALLEL lm_head.

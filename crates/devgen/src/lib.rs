@@ -3330,6 +3330,51 @@ pub(crate) fn emit_xall_gather(
     })
 }
 
+/// Row-split sparse attention's cross-GPU head/row transpose ([`DevOp::XAllToAllHeads`],
+/// `reports/rowsplit-attention-design.md` §3.1 steps 2 and 4). `dir=0` (Q form) moves this
+/// rank's own `[T][nh_l][d]` peer-visible source to a LOCAL `[rpr][nh_total][d]` `dst`; `dir=1`
+/// (O form) moves the reverse, `[rpr][nh_total][d]` back to `[T][nh_l][d]`. The source was
+/// written into this rank's own peer slot at `slot_bytes` by an earlier packet (the `deps`).
+/// One xctr gate, one-workgroup rendezvous. TP8 only.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_xalltoall_heads(
+    b: &mut Builder,
+    xgate: &mut u32,
+    xr_cus: &[u32],
+    deps: &[u32],
+    dst: u32,
+    rpr: u32,
+    nh_l: u32,
+    d: u32,
+    nh_total: u32,
+    tp: u32,
+    slot_bytes: u32,
+    dir: u32,
+) -> u32 {
+    assert_eq!(
+        nh_total,
+        nh_l * tp,
+        "XAllToAllHeads: nh_total must be nh_l * tp"
+    );
+    assert!(dir <= 1, "XAllToAllHeads: dir must be 0 (Q) or 1 (O)");
+    let elems = rpr * nh_total * d;
+    let need = (elems.div_ceil(512).max(1) as usize).min(xr_cus.len());
+    let xr_cus = &xr_cus[..need];
+    let gate = *xgate;
+    *xgate += 1;
+    b.emit(DevOp::XAllToAllHeads, xr_cus.to_vec(), deps, |inst| {
+        inst.t[0] = dst;
+        inst.i[0] = rpr;
+        inst.i[1] = nh_l;
+        inst.i[2] = d;
+        inst.i[3] = nh_total;
+        inst.i[4] = gate;
+        inst.i[5] = tp;
+        inst.i[6] = slot_bytes;
+        inst.i[7] = dir;
+    })
+}
+
 /// [`emit_xreduce`], plus an ALL-GATHER of a column-parallel partial folded into the same
 /// packet: `out = sum_r reduced_r + concat_r gathered_r`.
 ///
@@ -7830,6 +7875,7 @@ const GFX950_DISPATCHED: &[&str] = &[
     "PLOW_DOP_SITU_GLU",
     "PLOW_DOP_SOFTCAP",
     "PLOW_DOP_XALLGATHER",
+    "PLOW_DOP_XALLTOALL_HEADS",
     "PLOW_DOP_XARGMAX_FIN",
     "PLOW_DOP_XFLASHMERGE",
     "PLOW_DOP_XREDUCE",
@@ -9147,6 +9193,10 @@ mod emit_capabilities_tests;
 #[cfg(test)]
 #[path = "lib_tests/token_batch_contract.rs"]
 mod token_batch_contract_tests;
+
+#[cfg(test)]
+#[path = "lib_tests/xalltoall_heads.rs"]
+mod xalltoall_heads_tests;
 
 pub mod fp8_m1_role;
 

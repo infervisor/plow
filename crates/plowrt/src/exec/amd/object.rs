@@ -395,6 +395,10 @@ pub(super) const PREFILL_ARM_MARKERS: &[(&str, &[&str])] = &[
     // carries the ops. Without them the dispatch falls through silently: no reduce, no
     // gather, a prefill of stale slots. Refuse.
     ("PLOW_SEQ_PAR_SEAMS", &["plow_seq_par_seams_arm_1"]),
+    // Row-split sparse attention's cross-GPU head/row transpose (op 160), compiled only when
+    // the packet's plow_config.h carries it. Without the arm the dispatch falls through
+    // silently: no transpose, attention reads garbage rows. Refuse.
+    ("PLOW_ROWSPLIT_A2A", &["plow_rowsplit_a2a_arm_1"]),
     // `#if PLOW_K3` (runtime/amd/interp.hip) gates ops 99-106 in BOTH buckets — the KDA mixer,
     // AttnRes, `situ` and the MLA output gate. It is the one arm flag that is not prefill-only,
     // and the one whose absence is most completely silent: a K3 packet on an object without it
@@ -1000,6 +1004,9 @@ pub(super) fn packet_prefill_arm_requirements<'a>(
         .any(|inst| inst.op == DevOp::XReduceScatter as u16 || inst.op == DevOp::XAllGather as u16)
     {
         requires.push("PLOW_SEQ_PAR_SEAMS=1".to_owned());
+    }
+    if insts().any(|inst| inst.op == DevOp::XAllToAllHeads as u16) {
+        requires.push("PLOW_ROWSPLIT_A2A=1".to_owned());
     }
     if insts().any(|inst| {
         matches!(
@@ -2022,6 +2029,55 @@ pub(super) fn check_dsa_select_local(
                 if tensors.get(handle as usize).is_none_or(|t| t.bytes < bytes) {
                     return Err(err());
                 }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Row-split sparse attention's cross-GPU head/row transpose (op 160): geometry a packet must
+/// satisfy on its own, independent of the blob-wide recovered [`crate::asset::devblob::DevTp`]
+/// (a packet built only for this op, as the tier-1/tier-2 checks do, carries no ordinary
+/// `XReduce` for `recover_tp` to key off).
+///
+/// `nh_total == nh_l * n_gpu` for both directions (`i7=dir`): the op moves `rpr * nh_total * d`
+/// elements either way, so one destination-size formula covers `dir=0` (`[rpr][nh_total][d]`)
+/// and `dir=1` (`[T=rpr*n_gpu][nh_l][d]`, same element count). TP8 only — the wave-per-peer map
+/// (`p = (wave + rank) % nranks`) assumes 8 waves — and gfx942 only, like every other native
+/// collective schedule this ISA has.
+pub(super) fn check_xalltoall_heads(
+    progs: &[DevProg],
+    tensors: &[crate::asset::devblob::DevTensor],
+    arch: &str,
+) -> Result<()> {
+    let err = || {
+        RuntimeError::Device(
+            "row-split attention's head/row all-to-all requires gfx942 TP8 with \
+             self-consistent row/head geometry"
+                .into(),
+        )
+    };
+    for p in progs {
+        for d in p.insts.iter().filter(|d| d.op == DevOp::XAllToAllHeads as u16) {
+            let (rpr, nh_l, dsz, nh_total, n_gpu, dir) =
+                (d.i[0], d.i[1], d.i[2], d.i[3], d.i[5], d.i[7]);
+            if arch != "gfx942"
+                || n_gpu != 8
+                || dir > 1
+                || rpr == 0
+                || nh_l == 0
+                || dsz == 0
+                || nh_total != nh_l.saturating_mul(n_gpu)
+                || d.t[0] == packet::dev::TENSOR_NONE16
+            {
+                return Err(err());
+            }
+            let bytes = u64::from(rpr) * u64::from(nh_total) * u64::from(dsz) * 2;
+            if tensors
+                .get(d.t[0] as usize)
+                .is_none_or(|t| t.bytes < bytes)
+            {
+                return Err(err());
             }
         }
     }

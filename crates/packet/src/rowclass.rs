@@ -110,7 +110,7 @@ pub fn class_of(op: DevOp) -> RowClass {
         // Collectives reduce whole tensors at live row extents identical on every rank; the
         // element count is an input, the row identity is not.
         XReduce | XReduceScatter | XAllGather | XFlashMerge | XArgmaxFin | XReduceTwoShot
-        | XReduceAddNorm => RowClass::A,
+        | XReduceAddNorm | XAllToAllHeads => RowClass::A,
         // MoE. Routing, grouping, scatter and combine are the row-grouping contract shared
         // across families: each expert receives its rows from any request or phase, and the
         // maps are built from the batch. `MoeCombinePf`'s `i3 = t_row0` is a band OFFSET into

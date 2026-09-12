@@ -3420,6 +3420,64 @@ fn local_dsa_selection_checks_rows_operands_and_object() {
 }
 
 #[test]
+fn xalltoall_heads_geometry_checks_shape_object_and_arch() {
+    let mut prog = segmented_prog(&[DevOp::XAllToAllHeads], &[0]);
+    let inst = &mut prog.insts[0];
+    inst.t[0] = 0;
+    // i0=rpr i1=nh_l i2=d i3=nh_total i4=gate i5=n_gpu i6=slot_bytes i7=dir
+    inst.i = [1024, 8, 576, 64, 5, 8, 0, 0];
+    let tensors = vec![crate::asset::devblob::DevTensor {
+        name: "act.q_a2a".into(),
+        bytes: 1024u64 * 64 * 576 * 2,
+        init: None,
+    }];
+    let ok = |p: &DevProg, t: &[crate::asset::devblob::DevTensor], arch: &str| {
+        check_xalltoall_heads(std::slice::from_ref(p), t, arch).is_ok()
+    };
+    assert!(ok(&prog, &tensors, "gfx942"));
+    assert!(!ok(&prog, &tensors, "gfx950"), "TP8 native, gfx942 only");
+
+    // dir=1 (O form) moves the same element count (rpr*nh_total*d), so the same tensor size
+    // still covers it.
+    prog.insts[0].i[7] = 1;
+    assert!(ok(&prog, &tensors, "gfx942"));
+    prog.insts[0].i[7] = 2;
+    assert!(!ok(&prog, &tensors, "gfx942"), "dir must be 0 or 1");
+    prog.insts[0].i[7] = 0;
+
+    // nh_total must equal nh_l * n_gpu.
+    prog.insts[0].i[3] = 63;
+    assert!(!ok(&prog, &tensors, "gfx942"));
+    prog.insts[0].i[3] = 64;
+
+    // n_gpu != 8 is refused (the wave-per-peer map is hard-coded to TP8).
+    prog.insts[0].i[5] = 4;
+    assert!(!ok(&prog, &tensors, "gfx942"));
+    prog.insts[0].i[5] = 8;
+
+    // The destination tensor must be bound and large enough.
+    prog.insts[0].t[0] = packet::dev::TENSOR_NONE16;
+    assert!(!ok(&prog, &tensors, "gfx942"));
+    prog.insts[0].t[0] = 0;
+    let small = vec![crate::asset::devblob::DevTensor {
+        name: "act.q_a2a".into(),
+        bytes: tensors[0].bytes - 1,
+        init: None,
+    }];
+    assert!(!ok(&prog, &small, "gfx942"));
+
+    let requires = packet_prefill_arm_requirements(std::slice::from_ref(&prog));
+    assert_eq!(requires, ["PLOW_ROWSPLIT_A2A=1"]);
+    assert!(check_prefill_object(&[], Path::new("old.elf"), &requires).is_err());
+    assert!(check_prefill_object(
+        &["plow_rowsplit_a2a_arm_1"],
+        Path::new("new.elf"),
+        &requires
+    )
+    .is_ok());
+}
+
+#[test]
 fn dsa_decode_batch_refuses_an_object_without_row_offsets() {
     let mut prog = segmented_prog(&[DevOp::IndexSelect], &[0]);
     assert!(
