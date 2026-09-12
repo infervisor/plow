@@ -197,7 +197,13 @@ extern "C" __device__ unsigned plow_xr_rs_u2 = 1;
  * So the packet that runs this arm must be emitted with `PLOW_XR_CUS=48` (the collective's CU
  * set; every other packet is unchanged) — the arm on a 256-workgroup packet is a regression.
  * AITER's exact one-load-per-lane walk (dependency-chained) was 4-9% slower than the hoisted
- * eight; 8-byte packs 2-3% slower than 16; two reduce-scatter packs per lane no better. */
+ * eight; 8-byte packs 2-3% slower than 16; two reduce-scatter packs per lane no better.
+ *
+ * gfx942 (8x MI300X, 8192x6144 two-shot, us): the peak sits lower still and the packet is not
+ * re-emitted; PLOW_XR_SCHED_NWG caps the data workgroups inside the 304-workgroup packet. AG_U=1
+ * (one all-gather pack per lane) at 8/12/16/20/24/32 data workgroups = 1229/1002/926/817/792/842;
+ * the shipped 2-byte loop at 304 = 970. In situ (4-layer TP8 packet, last 8192 chunk) the cap at
+ * 24 takes the collective from 1.08 to 0.99 ms. */
 #ifndef PLOW_XR_SCHED_AITER
 #define PLOW_XR_SCHED_AITER 0
 #endif
