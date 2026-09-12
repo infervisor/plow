@@ -393,6 +393,43 @@ trade-off, so all three flipped.
 Projected on the 100-prompt run: A ≈ 19 s, B ≈ 10 s, C ≈ 2 s, D 0 — ≈ 31 s (−2 %). 40-prompt bench,
 same binary, ctrl vs A+B+C: 55.10 → 55.69 out tok/s (+1.1 %), duration 514.9 → 509.4 s, mean TTFT 56.0 → 53.3 s; the two bench processes drew opposite decode modes (median ITL 100.9 vs 106.5 ms, see below), so this is a no-regression check, not the measurement. Retrieval on A+B+C: 18/18. Defaults: all three on (`=0` is each rollback); D not built. **Measurement note:** decode ticks split ~6 ms (~6 %) between server processes independently of every flag (both tick-arm controls 105 ms, all flagged arms 99 ms, yet the flagless bench process drew the fast mode); host enqueue, the SDMA re-arm and the GPU's per-dispatch retirement are all slower in the slow processes — suspected engine-thread NUMA placement against rank 0's busy-polled completion signal, under test (`PLOW_HSA_DRAIN_BLOCKED`, diagnostic).
 
+## The ~6 % per-process decode split is the engine thread's socket; pinned by default (2026-09-12, `host-shadowing.md` §5)
+
+Host-shadowing's A/B found GLM-5.3 TP8 decode ticks differing by ~6 ms between server processes
+with no flag, config or load-time difference behind it (the ctrl-vs-ABC bench pair drew opposite
+modes, median ITL 100.9 vs 106.5 ms). Job 2 (`host-shadow-j2`, one pinned binary, 20 × 16384 × 96
+out at C20, `taskset -a` on all 412 server threads after READY, the engine thread
+`plow-eng-glm-5.` sampled every 5 s; rank 0's GPU is on NUMA node 3, socket 0):
+
+| arm | engine thread on | decode-only tick | decode after a chunk | DSTEP enqueue / re-arm / drain (µs/token) |
+|---|---|---:|---:|---|
+| free1 (unpinned) | node 0, socket 0 | 96.2 ms | 83.1 ms | 4290 / 2398 / 87 597 |
+| near (pinned) | node 3, socket 0 | 97.5 ms | 83.9 ms | 4306 / 2433 / 88 846 |
+| Cfree (unpinned, a job-1 flag) | node 3, socket 0 | 98.6 ms | 84.3 ms | |
+| near2 (pinned, repeat) | node 3, socket 0 | 98.8 ms | 83.9 ms | |
+| far (pinned) | node 7, socket 1 | **103.4 ms** | **90.2 ms** | **6566 / 3781 / 91 115** |
+| free2 (unpinned) | node 7, socket 1 | **103.7 ms** | **90.3 ms** | |
+| blocked (unpinned, blocked drain wait) | node 4, socket 1 | 102.8 ms | 89.9 ms | |
+| blockedfar (pinned, blocked drain wait) | node 7, socket 1 | 103.5 ms | 90.7 ms | |
+
+Every arm follows its socket, pinned or not, flag or not. On the far socket the host's AQL/kernarg
+writes (+2.3 ms) and SDMA re-arm (+1.4 ms) are slower and the GPU retires the tick's ~1240
+dispatches ~3 ms slower; single-shot host operations (audit, `zero_xctr`, reads) do not move. A
+blocked drain wait does not help (103.5 vs 103.4 ms), so the busy poll is not the mechanism: it is
+the socket of the thread that feeds every dispatch.
+
+**Fix, default on:** `--amd-engine-affinity` / `PLOW_AMD_ENGINE_AFFINITY` = `auto` (default) | `off` |
+a CPU list. `auto` pins the engine thread, once at its first tick, to every online CPU of the socket
+that holds rank 0's GPU, derived from `HSA_AMD_AGENT_INFO_DOMAIN`/`_BDFID` → the device's sysfs
+`numa_node` → the node's CPUs' `physical_package_id` (`exec::engine_affinity`, fake-sysfs test).
+Only the engine thread is pinned, after load, so model load keeps every CPU. Qualifies without a
+served A/B: the pinned arms are causal and the pin changes no numerics. Worth ~6 ms on every decode
+tick that would have landed on socket 1 (half of all processes): ≈ 15 s of decode-only and ≈ 5 s
+of post-chunk decodes on the 100-prompt run for such a process, and it removes a ±3 % per-process
+term from every same-binary bench pair on this box. `PLOW_HSA_DRAIN_BLOCKED` (diagnostic, off)
+stays for the record. Confirmation job `host-shadow-j3` (auto from an unpinned start; auto and off
+with the whole process started on socket 1) follows.
+
 ## Knob organization (2026-09-11)
 
 Inventory: 138 runtime knobs (`RuntimeConfig` 33 shared / NVIDIA 34 / AMD 48 / Apple 14 / CPU 9)

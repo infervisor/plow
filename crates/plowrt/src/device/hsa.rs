@@ -145,6 +145,8 @@ const HSA_AGENT_INFO_DEVICE: u32 = 17;
 // ID: 30115 on gfx950 instead of 256. The engine sizes its cooperative grid
 // from `sm_count()`, so a persistent launch would have asked for 30115 blocks.
 const HSA_AMD_AGENT_INFO_COMPUTE_UNIT_COUNT: u32 = 0xA002;
+const HSA_AMD_AGENT_INFO_BDFID: u32 = 0xA006;
+const HSA_AMD_AGENT_INFO_DOMAIN: u32 = 0xA00F;
 
 // hsa_region_segment_t
 const HSA_REGION_SEGMENT_GROUP: u32 = 2;
@@ -2673,6 +2675,19 @@ impl HsaBackend {
     /// orders packets but the AQL read index does not prove kernel completion.
     pub fn stream_synchronize(&self, _stream: &HsaStream) -> Result<()> {
         self.synchronize()
+    }
+
+    /// This agent's PCI address, `dddd:bb:dd.f` (`HSA_AMD_AGENT_INFO_DOMAIN` + `_BDFID`).
+    pub fn pci_bdf(&self) -> Option<String> {
+        let (mut bdf, mut domain) = (0u32, 0u32);
+        // SAFETY: both attributes are documented as uint32_t; the agent is live for `self`.
+        let ok = unsafe {
+            (self.shared.drv.hsa_agent_get_info)(self.agent, HSA_AMD_AGENT_INFO_BDFID, &mut bdf as *mut u32 as *mut c_void)
+                == HSA_STATUS_SUCCESS
+                && (self.shared.drv.hsa_agent_get_info)(self.agent, HSA_AMD_AGENT_INFO_DOMAIN, &mut domain as *mut u32 as *mut c_void)
+                    == HSA_STATUS_SUCCESS
+        };
+        ok.then(|| format!("{domain:04x}:{:02x}:{:02x}.{:x}", bdf >> 8, (bdf >> 3) & 0x1f, bdf & 0x7))
     }
 
     /// Dispatches published on this queue that have not completed: the counting signal

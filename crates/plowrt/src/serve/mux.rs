@@ -2067,6 +2067,7 @@ fn run_one_tick(
         // engine declines them (`None`), falling to whole-prompt prefill + step.
         #[cfg(any(feature = "hsa", feature = "cpu"))]
         if let Some(e) = guard.seq_engine_mut() {
+            e.bind_engine_thread();
             let stop = Arc::clone(e.stop_ids());
             let b = e.batch();
 

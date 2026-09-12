@@ -810,6 +810,12 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-hsa-drain-blocked", env = "PLOW_HSA_DRAIN_BLOCKED", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub hsa_drain_blocked: bool,
 
+    /// Where the AMD engine thread runs: `auto` pins it to the CPU socket holding rank 0's GPU
+    /// (from the device's sysfs NUMA node), `off` leaves it to the scheduler, or a CPU list
+    /// such as `72-95,264-287`.
+    #[arg(long = "amd-engine-affinity", env = "PLOW_AMD_ENGINE_AFFINITY", default_value = "auto", global = true)]
+    pub engine_affinity: String,
+
     /// Share completed MLA prefixes through ROCr VMM (auto on supported gfx942 packets).
     #[arg(long = "amd-shared-prefix", env = "PLOW_AMD_SHARED_PREFIX", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub shared_prefix: Option<bool>,

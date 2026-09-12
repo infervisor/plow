@@ -47,6 +47,8 @@ pub mod cpu;
 /// that lets `gpu` stop being CUDA-only. Not gated on a vendor feature: it is
 /// the definition both backends implement.
 pub mod device_api;
+#[cfg(feature = "hsa")]
+pub mod engine_affinity;
 pub mod engine_thread;
 #[cfg(feature = "cuda")]
 pub mod gpu;

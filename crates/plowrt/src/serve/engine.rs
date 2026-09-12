@@ -47,6 +47,9 @@ pub use super::cpu_serve::CpuServe;
 pub trait SeqEngine {
     fn stop_ids(&self) -> &Arc<Vec<u32>>;
     fn batch(&self) -> usize;
+    /// Called at the top of every tick on the thread that runs it; an engine that cares where
+    /// its submission thread runs binds it here, once per thread.
+    fn bind_engine_thread(&self) {}
     fn release(&mut self, slot: usize);
     fn prefill_turn(&self) -> usize;
     fn advance_prefill_turn(&mut self, slot: usize);
@@ -444,6 +447,13 @@ mod amd_serve {
             match self {
                 Self::One(e) => e.kv_rebase(slot),
                 Self::Tp(g) => g.kv_rebase_all(slot),
+            }
+        }
+
+        fn rank0_pci_bdf(&self) -> Option<String> {
+            match self {
+                Self::One(e) => e.pci_bdf(),
+                Self::Tp(g) => g.rank(0).pci_bdf(),
             }
         }
 
@@ -2710,6 +2720,46 @@ mod amd_serve {
         /// Free a slot. There is no cache to reclaim — the block is fixed and
         /// preallocated — so this only stops the slot being fed and lets
         /// admission reuse it. The next request rewrites every row it reads.
+        /// Pin the calling thread, which runs every tick, per `--amd-engine-affinity`; once
+        /// per thread. `auto` takes the CPU socket of rank 0's GPU from its sysfs NUMA node:
+        /// that thread writes every AQL packet and kernarg, re-arms the counter banks over
+        /// SDMA and polls completion, and on the other socket a GLM-5.3 TP8 decode tick ran
+        /// 103.4 ms against 97.5 ms (`exec::engine_affinity`).
+        pub fn bind_engine_thread(&self) {
+            use crate::exec::engine_affinity::{pin_current_thread, socket_cpus_of_pci, EngineAffinity};
+            thread_local! {
+                static BOUND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+            }
+            if BOUND.with(|bound| bound.replace(true)) {
+                return;
+            }
+            let spec = &crate::config::RuntimeConfig::get().amd.engine_affinity;
+            let cpus = match EngineAffinity::parse(spec) {
+                Ok(EngineAffinity::Off) => return,
+                Ok(EngineAffinity::Cpus(cpus)) => cpus,
+                Ok(EngineAffinity::Auto) => {
+                    let bdf = self.ranks.rank0_pci_bdf();
+                    match bdf.as_deref().and_then(|b| socket_cpus_of_pci(Path::new("/sys"), b)) {
+                        Some((node, socket, cpus)) => {
+                            tracing::info!(bdf = ?bdf, node, socket, cpus = cpus.len(), "amd: engine thread pinned to rank 0's socket");
+                            cpus
+                        }
+                        None => {
+                            tracing::info!(bdf = ?bdf, "amd: rank 0's GPU reports no NUMA node; engine thread left unpinned");
+                            return;
+                        }
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "amd: engine thread left unpinned");
+                    return;
+                }
+            };
+            if let Err(err) = pin_current_thread(&cpus) {
+                tracing::warn!(error = %err, "amd: pinning the engine thread failed; left unpinned");
+            }
+        }
+
         pub fn release(&mut self, slot: usize) {
             if slot < self.batch {
                 self.ranks.release_shared_prefix(slot);
@@ -3402,6 +3452,9 @@ impl SeqEngine for AmdServe {
     }
     fn batch(&self) -> usize {
         AmdServe::batch(self)
+    }
+    fn bind_engine_thread(&self) {
+        AmdServe::bind_engine_thread(self)
     }
     fn release(&mut self, slot: usize) {
         AmdServe::release(self, slot)

@@ -12984,6 +12984,11 @@ impl AmdEngine {
         }
     }
 
+    /// PCI address of this rank's GPU, `dddd:bb:dd.f`.
+    pub fn pci_bdf(&self) -> Option<String> {
+        self.be.pci_bdf()
+    }
+
     /// Dispatches this rank has published that have not completed (diagnostic).
     pub(crate) fn in_flight(&self) -> i64 {
         self.be.in_flight()
