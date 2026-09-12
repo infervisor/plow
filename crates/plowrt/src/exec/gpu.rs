@@ -540,6 +540,19 @@ fn prefill_needs_segment_pair(blob: &DevBlob, roles: Option<&SegmentRoles>) -> b
     })
 }
 
+fn prefill_can_use_segment_pair(blob: &DevBlob, roles: Option<&SegmentRoles>) -> bool {
+    blob.prefill_progs().iter().enumerate().any(|(index, g)| {
+        g.check_coarse_single_segment().is_err()
+            && roles
+                .and_then(|roles| roles.program(index))
+                .is_none_or(|program| {
+                    program
+                        .roles
+                        .contains(&plow_asset::segment_roles::INTERPRETER)
+                })
+    })
+}
+
 trait SegmentRoleValidation: Sized {
     fn parse(bytes: &[u8], blob: &DevBlob) -> Result<Self>;
     fn validate(
@@ -5975,8 +5988,21 @@ impl GpuEngine {
             .as_deref()
             .filter(|dir| !dir.is_empty())
             .map(PathBuf::from);
+        let suffix = if packed_requests { "pfpacked" } else { "pf" };
+        let kv_suffix = if packed.is_some_and(|p| p.version == 2) {
+            "_fp8kv"
+        } else {
+            ""
+        };
+        let bundled_segment_pair = ["seg", "gemm"].into_iter().all(|role| {
+            assets_dir
+                .join(format!("interp_{interp_tag}_{suffix}{role}{kv_suffix}.cubin"))
+                .is_file()
+        });
         let segment_dir = configured_seg_dir.or_else(|| {
-            prefill_needs_segment_pair(blob, segment_roles).then(|| assets_dir.to_path_buf())
+            (prefill_needs_segment_pair(blob, segment_roles)
+                || (bundled_segment_pair && prefill_can_use_segment_pair(blob, segment_roles)))
+            .then(|| assets_dir.to_path_buf())
         });
         if small_gemm_path.is_some() && segment_dir.is_none() {
             return Err(RuntimeError::Rejected(
@@ -6016,12 +6042,6 @@ impl GpuEngine {
                     be.set_max_dynamic_smem(f, sm)?;
                     let occ = be.occupancy_blocks_per_sm(f, BLOCK, sm as usize)?;
                     Ok((m, f, sm, occ * be.sm_count()))
-                };
-                let suffix = if packed_requests { "pfpacked" } else { "pf" };
-                let kv_suffix = if packed.is_some_and(|p| p.version == 2) {
-                    "_fp8kv"
-                } else {
-                    ""
                 };
                 let seg_file = format!("interp_{interp_tag}_{suffix}seg{kv_suffix}.cubin");
                 let gemm_file = format!("interp_{interp_tag}_{suffix}gemm{kv_suffix}.cubin");
@@ -6115,22 +6135,31 @@ impl GpuEngine {
                     let fa_global_suffix = format!("_{suffix}fa");
                     let fa_arena = format!("plow_arena_bytes{fa_global_suffix}");
                     let (m3, f3, s3, g3) = load(&fa_file, &fa_sym, &fa_global_suffix, &fa_arena)?;
+                    let hd256_capability = be
+                        .module_global_u32(&m3, &format!("plow_fa_hd256{fa_global_suffix}"))?;
                     // PLOW_PF_SEG_FA512=all classes hd256 FlashPrefill onto this object too,
                     // but its hd256 arm exists only when built PLOW_BUILD_FA_HD256=1 —
                     // without it the dispatch hits a bare __trap(): LAUNCH_FAILED, poisoned
                     // context, dead engine, every request 503. Refuse the mismatch here, the
                     // way a missing object is already refused. Absent symbol = older cubin,
                     // unconstrained (same convention as plow_arena_bytes).
-                    if inferred_policy.fa512_mode == 2
-                        && be.module_global_u32(&m3, &format!("plow_fa_hd256{fa_global_suffix}"))?
-                            == Some(0)
-                    {
+                    if inferred_policy.fa512_mode == 2 && hd256_capability == Some(0) {
                         return Err(RuntimeError::Device(format!(
                             "PLOW_PF_SEG_FA512=all classes hd256 flash onto {fa_file}, but that \
                              object was built without its hd256 arm (PLOW_BUILD_FA_HD256=1) — \
                              it would trap on the first hd256 segment. Rebuild the object or set \
                              PLOW_PF_SEG_FA512=1."
                         )));
+                    }
+                    if config.nv.pf_seg_fa512.is_none()
+                        && hd256_capability == Some(1)
+                        && blob.prefill_progs().iter().any(|program| {
+                            program.insts.iter().any(|inst| {
+                                inst.op == DevOp::FlashPrefill as u16 && inst.i[6] == 256
+                            })
+                        })
+                    {
+                        inferred_policy.fa512_mode = 2;
                     }
                     Some((m3, f3, s3, g3))
                 } else {
@@ -8144,6 +8173,37 @@ fn qwen_prefill_state_views_select_exact_batch_slots() {
 
 #[cfg(test)]
 mod decode_rung_tests;
+
+#[cfg(test)]
+#[test]
+fn partial_prefill_roles_keep_bundled_segment_pair_eligible() {
+    let mut blob = decode_rung_tests::fixture();
+    for program in &mut blob.progs {
+        program.role = packet::devbuild::ProgramRole::PrefillBucket { rows: program.t };
+        for entry in &mut program.stream[2..] {
+            entry.seg = 1;
+        }
+    }
+    let roles = SegmentRoles {
+        version: 1,
+        objects: std::collections::BTreeMap::new(),
+        programs: blob
+            .progs
+            .iter()
+            .enumerate()
+            .map(|(index, _)| ProgramRoles {
+                index,
+                roles: vec![
+                    plow_asset::segment_roles::INTERPRETER,
+                    plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32,
+                ],
+            })
+            .collect(),
+    };
+
+    assert!(!prefill_needs_segment_pair(&blob, Some(&roles)));
+    assert!(prefill_can_use_segment_pair(&blob, Some(&roles)));
+}
 
 #[cfg(test)]
 mod gemv_role_tests;
