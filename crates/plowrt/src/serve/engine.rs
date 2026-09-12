@@ -971,6 +971,54 @@ mod amd_serve {
         }
     }
 
+    /// Which token-batch members finish their prompt in this step. Decided from the PRE-step
+    /// frontiers: the step advances them past the rows it wrote, and asked afterwards every
+    /// finishing prompt reads `prompt_len + take` and is never retired.
+    fn token_batch_finishing(
+        members: &[(usize, &[u32], u32)],
+        completed: &[(usize, u32)],
+        frontiers: &[u32],
+    ) -> Vec<bool> {
+        members
+            .iter()
+            .zip(completed)
+            .map(|(&(slot, prompt, _), &(_, take))| frontiers[slot] + take == prompt.len() as u32)
+            .collect()
+    }
+
+    /// Host side of one token-batch step. `device` runs it and advances `pos_stage` past every
+    /// row it wrote. Members that finish (decided before `device` runs) retire their cursor and
+    /// go live at the advanced frontier, so they decode from the prompt length; the rest commit
+    /// `take` rows. Returns the retired cursors.
+    #[allow(clippy::too_many_arguments)]
+    fn token_batch_host_step(
+        members: &[(usize, &[u32], u32)],
+        completed: &[(usize, u32)],
+        feeds: &[(usize, u32)],
+        pos_stage: &mut [u32],
+        pf: &mut [Option<PfCursor>],
+        pos: &mut [u32],
+        live: &mut [bool],
+        device: impl FnOnce(&mut [u32]) -> Result<()>,
+    ) -> Result<Vec<(usize, PfCursor)>> {
+        let finishing = token_batch_finishing(members, completed, pos_stage);
+        device(pos_stage)?;
+        for &(slot, _) in feeds {
+            pos[slot] = pos_stage[slot];
+        }
+        let mut retired = Vec::new();
+        for (&(slot, take), finished) in completed.iter().zip(finishing) {
+            if finished {
+                retired.push((slot, pf[slot].take().expect("staged token-batch cursor")));
+                pos[slot] = pos_stage[slot];
+                live[slot] = true;
+            } else {
+                commit_mixed_prefill(pf[slot].as_mut().expect("staged token-batch cursor"), take);
+            }
+        }
+        Ok(retired)
+    }
+
     fn split_terminal_prefill(cur: &mut PfCursor) {
         if cur.snap_after.is_some() {
             return;
@@ -2149,21 +2197,6 @@ mod amd_serve {
                     selection: Selection::default(),
                 }
             }
-            // Which members finish their prompt here. That is exactly the set whose hidden
-            // rows the step samples, and it is decided from the plan the device will see.
-            fn finishes(
-                members: &[(usize, &[u32], u32)],
-                completed: &[(usize, u32)],
-                pos_stage: &[u32],
-                slot: usize,
-            ) -> bool {
-                members
-                    .iter()
-                    .zip(completed)
-                    .any(|(&(m, prompt, _), &(_, take))| {
-                        m == slot && pos_stage[slot] + take == prompt.len() as u32
-                    })
-            }
             let requests: Vec<Request<'_>> =
                 feeds
                     .iter()
@@ -2189,10 +2222,11 @@ mod amd_serve {
                         },
                     ))
                     .collect();
+            // The members that finish are exactly the set whose hidden rows the step samples.
             let leading = feeds.len()
-                + completed
+                + token_batch_finishing(members, &completed, &self.pos_stage)
                     .iter()
-                    .filter(|&&(slot, _)| finishes(members, &completed, &self.pos_stage, slot))
+                    .filter(|&&f| f)
                     .count();
             let live: u32 =
                 completed.iter().map(|&(_, take)| take).sum::<u32>() + feeds.len() as u32;
@@ -2203,53 +2237,35 @@ mod amd_serve {
                 )));
             }
             output.clear();
-            match &mut self.ranks {
-                Ranks::One(e) => e.token_batch_requests_step(
-                    rows,
-                    &requests,
-                    &self.slot_generation,
-                    &mut self.pos_stage,
-                    output,
-                )?,
-                Ranks::Tp(g) => {
-                    let tb = self
-                        .token_batch_tp
-                        .as_mut()
-                        .expect("the TP token batch was checked above");
-                    tb.step(
-                        g,
-                        rows,
-                        &requests,
-                        &self.slot_generation,
-                        &mut self.pos_stage,
-                        self.max_ctx,
-                        output,
-                    )?;
-                }
-            }
-            for &(slot, _) in feeds {
-                self.pos[slot] = self.pos_stage[slot];
-            }
-            for &(slot, take) in &completed {
-                if finishes(members, &completed, &self.pos_stage, slot) {
-                    // The prompt is consumed and its first generated token is in `output`.
-                    // Retire the cursor and make the slot live, exactly as the terminal-prefill
-                    // path did — except that no second transformer pass produced the token.
-                    let cur = self.pf[slot].take().expect("staged token-batch cursor");
-                    if self.prefix_cache {
-                        let prompt = members.iter().find(|m| m.0 == slot).unwrap().1;
-                        self.cached_prompt[slot].clear();
-                        self.cached_prompt[slot].extend_from_slice(prompt);
-                        if cur.arm > 0 { self.snap_at[slot] = cur.arm; }
-                        else if cur.resume == 0 { self.snap_at[slot] = 0; }
+            let (ranks, tb, generations, max_ctx) =
+                (&mut self.ranks, &mut self.token_batch_tp, &self.slot_generation, self.max_ctx);
+            let retired = token_batch_host_step(
+                members,
+                &completed,
+                feeds,
+                &mut self.pos_stage,
+                &mut self.pf,
+                &mut self.pos,
+                &mut self.live,
+                |frontiers| match ranks {
+                    Ranks::One(e) => {
+                        e.token_batch_requests_step(rows, &requests, generations, frontiers, output)
                     }
-                    self.pos[slot] = self.pos_stage[slot];
-                    self.live[slot] = true;
-                } else {
-                    commit_mixed_prefill(
-                        self.pf[slot].as_mut().expect("staged token-batch cursor"),
-                        take,
-                    );
+                    Ranks::Tp(g) => tb
+                        .as_mut()
+                        .expect("the TP token batch was checked above")
+                        .step(g, rows, &requests, generations, frontiers, max_ctx, output),
+                },
+            )?;
+            if self.prefix_cache {
+                // As the terminal-prefill path does, except that no second transformer pass
+                // produced the first token.
+                for (slot, cur) in retired {
+                    let prompt = members.iter().find(|m| m.0 == slot).unwrap().1;
+                    self.cached_prompt[slot].clear();
+                    self.cached_prompt[slot].extend_from_slice(prompt);
+                    if cur.arm > 0 { self.snap_at[slot] = cur.arm; }
+                    else if cur.resume == 0 { self.snap_at[slot] = 0; }
                 }
             }
             Ok(())
@@ -3028,10 +3044,57 @@ mod amd_serve {
             commit_mixed_prefill, commit_packed_prefill, invalidate_prefix_metadata,
             mixed_cursor_rows, mixed_prefill_continuation_fits, mixed_prefill_padding_fits,
             packable_prefill_step, parse_snapshot_tensors, snapshot_file_component,
-            split_pending_prefill, split_terminal_prefill, stage_parked, terminal_prefill_cursor,
+            slot_decode_position, split_pending_prefill, split_terminal_prefill, stage_parked,
+            terminal_prefill_cursor, token_batch_host_step,
             AmdServe, PfCursor, DEFAULT_SNAPSHOT_TENSORS, MAX_SNAPSHOT_TENSORS,
         };
         use crate::exec::amd::ChunkStep;
+
+        #[test]
+        fn a_prompt_finished_inside_a_token_batch_step_retires_and_decodes_from_its_end() {
+            // Slot 0 finishes a 73-token prompt in this step, slot 1 decodes, slot 2 writes the
+            // first 100 rows of a 300-token prompt.
+            let short: Vec<u32> = (0..73).collect();
+            let long: Vec<u32> = (0..300).collect();
+            let cursor = |clen| PfCursor {
+                steps: vec![ChunkStep { prog: 0, c0: 0, clen }],
+                next: 0,
+                frontier: 0,
+                snap_after: None,
+                resume: 0,
+                arm: 0,
+            };
+            let mut pf = vec![Some(cursor(73)), None, Some(cursor(300))];
+            let mut pos = vec![0, 40, 0];
+            let mut live = vec![false, true, false];
+            let mut pos_stage = vec![0, 40, 0];
+            let members: [(usize, &[u32], u32); 2] = [(0, &short[..], 73), (2, &long[..], 100)];
+            let retired = token_batch_host_step(
+                &members,
+                &[(0, 73), (2, 100)],
+                &[(1, 7)],
+                &mut pos_stage,
+                &mut pf,
+                &mut pos,
+                &mut live,
+                // The staging commit on device success: each frontier moves past its rows.
+                |frontiers| {
+                    frontiers[0] += 73;
+                    frontiers[1] += 1;
+                    frontiers[2] += 100;
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(retired.iter().map(|r| r.0).collect::<Vec<_>>(), [0]);
+            assert!(pf[0].is_none() && live[0]);
+            assert_eq!(slot_decode_position(pos[0], live[0], pf[0].as_ref(), false), 73);
+            pos[0] += 1; // one decode step
+            assert_eq!(slot_decode_position(pos[0], live[0], pf[0].as_ref(), false), 74);
+            assert_eq!(pos[1], 41);
+            assert!(!live[2]);
+            assert_eq!(pf[2].as_ref().map(|c| c.frontier), Some(100));
+        }
 
         #[test]
         #[ignore = "requires AMD packed assets in PLOW_GPU_ASSETS and a free GPU"]
