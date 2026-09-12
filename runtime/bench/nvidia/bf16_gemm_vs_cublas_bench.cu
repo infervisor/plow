@@ -221,7 +221,10 @@ static void cold_flush() {}
 static bf16* dev_bf16(size_t n) {
     bf16* d; CK(cudaMalloc(&d, n*sizeof(bf16)));
 #if defined(PLOW_BENCH_WS384) || defined(PLOW_BENCH_QWEN_GEMV)
-    static unsigned seed = 1;
+    static unsigned seed = [] {
+        const char* value = std::getenv("PLOW_BENCH_SEED");
+        return value ? (unsigned)std::strtoul(value, nullptr, 10) : 1u;
+    }();
     init_nonconstant<<<256, 256>>>(d, n, seed++);
     CK(cudaGetLastError());
 #else
@@ -392,7 +395,9 @@ static void bench_cublas(unsigned M) {
         const unsigned smem = PGM90_TMA_ARENA * sizeof(bf16);
         CK(cudaFuncSetAttribute(k_m64, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
 #else
-        const unsigned smem = PGM90_U256_ARENA * sizeof(bf16);
+        const unsigned smem = PGM90_WS384_ARENA * sizeof(bf16);
+        cudaFuncAttributes ws384_attr{};
+        CK(cudaFuncGetAttributes(&ws384_attr, k_ws384));
         CK(cudaFuncSetAttribute(k_ws384, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
 #endif
         std::vector<CUtensorMap> maps{bf16_map(A, M, s.K)};

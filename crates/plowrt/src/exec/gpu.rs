@@ -6113,9 +6113,15 @@ impl GpuEngine {
                     }
                     let module = be.module_load(&img)?;
                     let abi = be
-                        .module_global_u32(&module, "plow_gemm_shape_abi_pfgemm")?
+                        .module_global_u32(
+                            &module,
+                            &format!("plow_gemm_shape_abi{gemm_global_suffix}"),
+                        )?
                         .unwrap_or(0);
-                    let block = be.module_global_u32(&module, "plow_block_pfgemm")?;
+                    let block = be.module_global_u32(
+                        &module,
+                        &format!("plow_block{gemm_global_suffix}"),
+                    )?;
                     if !matches!(abi, 1 | 2 | 3 | 4)
                         || block != Some(if abi == 4 { 384 } else { BLOCK })
                     {
@@ -6126,7 +6132,10 @@ impl GpuEngine {
                     }
                     let function = be.get_function(&module, &gemm_sym)?;
                     let smem = be
-                        .module_global_u32(&module, "plow_arena_bytes_pfgemm")?
+                        .module_global_u32(
+                            &module,
+                            &format!("plow_arena_bytes{gemm_global_suffix}"),
+                        )?
                         .filter(|v| *v > 0)
                         .ok_or_else(|| {
                             RuntimeError::Rejected(
@@ -6134,8 +6143,9 @@ impl GpuEngine {
                             )
                         })?;
                     be.set_max_dynamic_smem(function, smem)?;
-                    let grid =
-                        be.occupancy_blocks_per_sm(function, BLOCK, smem as usize)? * be.sm_count();
+                    let block = block.expect("validated small GEMM block");
+                    let grid = be.occupancy_blocks_per_sm(function, block, smem as usize)?
+                        * be.sm_count();
                     if grid == 0 {
                         return Err(RuntimeError::Rejected(
                             "small GEMM object has no resident blocks".into(),
@@ -6147,7 +6157,7 @@ impl GpuEngine {
                         function,
                         smem,
                         grid,
-                        block: block.expect("validated small GEMM block"),
+                        block,
                         _module: module,
                     })
                 } else {

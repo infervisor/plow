@@ -608,7 +608,7 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "pf-seg-dir", env = "PLOW_PF_SEG_DIR", global = true)]
     pub pf_seg_dir: Option<String>,
 
-    /// Experimental BF16 TMA object: ABI1 M<=128; ABI2 Gemma12 M128 o/down; ABI3 Gemma31.
+    /// Exact-shape BF16 TMA object; the cubin ABI controls eligible packet segments.
     #[arg(
         long = "pf-seg-gemm-small",
         env = "PLOW_PF_SEG_GEMM_SMALL",
