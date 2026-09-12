@@ -635,6 +635,12 @@ __device__ __forceinline__ PlowStreamEnt ld_stream_ent(const PlowStreamEnt* p) {
 #ifndef PLOW_NV_FA_ONLY_HD256_EXACT
 #define PLOW_NV_FA_ONLY_HD256_EXACT 0
 #endif
+#ifndef PLOW_NV_FA_ONLY_HD256_ONLY
+#define PLOW_NV_FA_ONLY_HD256_ONLY 0
+#endif
+#if PLOW_NV_FA_ONLY_HD256_ONLY && (!PLOW_NV_FA_ONLY || !PLOW_NV_FA_ONLY_HD256 || PLOW_FP8_KV)
+#error "HD256-only attention requires the BF16 FA-only object with its HD256 arm"
+#endif
 #if PLOW_NV_FA_ONLY_HD256_EXACT &&                                                               \
     (!PLOW_NV_FA_ONLY || !PLOW_NV_FA_ONLY_HD256 || !PLOW_NV_FA_WGITEM ||                        \
      !PLOW_NV_FA_GQA2_PAIR || !PLOW_NV_PACKED_REQUEST)
@@ -755,8 +761,12 @@ __device__ __forceinline__ PlowStreamEnt ld_stream_ent(const PlowStreamEnt* p) {
 #else
 #define PLOW_NV_PRE_A256 FA_PRE_SMEM_FLOATS(256, 64, PLOW_NV_FA256_BKV)
 #endif
+#if PLOW_NV_FA_ONLY_HD256_ONLY
+#define PLOW_NV_PRE_A0 PLOW_NV_PRE_A256
+#else
 #define PLOW_NV_PRE_A0                                                                         \
     (PLOW_NV_PRE_A256 > PLOW_NV_PRE_A512 ? PLOW_NV_PRE_A256 : PLOW_NV_PRE_A512)
+#endif
 #define PLOW_NV_PRE_A128 FA_PRE_SMEM_FLOATS(128, 64, PLOW_NV_FA128_BKV)
 #define PLOW_NV_PRE_A                                                                          \
     (PLOW_NV_PRE_A128 > PLOW_NV_PRE_A0 ? PLOW_NV_PRE_A128 : PLOW_NV_PRE_A0)
@@ -934,6 +944,7 @@ extern "C" __device__ unsigned PLOW_SYM(plow_dyn_kvrow) = 1;
  * reads this and refuses the mismatch up front, the way it already refuses a missing object.
  * Absent on older cubins → unconstrained, same convention as plow_arena_bytes. */
 extern "C" __device__ unsigned PLOW_SYM(plow_fa_hd256) = PLOW_NV_FA_ONLY_HD256 ? 1u : 0u;
+extern "C" __device__ unsigned PLOW_SYM(plow_fa_hd512) = PLOW_NV_FA_ONLY_HD256_ONLY ? 0u : 1u;
 /* PAIRING STAMP (cuModuleGetGlobal, like plow_arena_bytes). Present ONLY on a SPECIALISED
  * object — one built -DPLOW_CONFIG=... from a single packet's build.json, carrying just that
  * packet's arms. Such an object is not interchangeable, so `plowrt` refuses to start when the
@@ -1397,7 +1408,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                 in->fj[1].u, in->fj[2].u, in->fj[0].f, slice, nblk, arena, TEN(7));
         else
 #endif
-#if !PLOW_NV_FA_ONLY_HD256_EXACT
+#if !PLOW_NV_FA_ONLY_HD256_EXACT && !PLOW_NV_FA_ONLY_HD256_ONLY
         if (in->i[6] == 512)
 #if defined(PLOW_NV_HOPPER) && PLOW_NV_FA512_WG
             d_flash_prefill_mixed<512, 64, PLOW_NV_FA512_BKV>(
@@ -1449,7 +1460,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                 in->fj[2].u, in->fj[0].f, slice, nblk, arena, TEN(7));
         else
 #endif
-#if !PLOW_NV_FA_ONLY_HD256_EXACT
+#if !PLOW_NV_FA_ONLY_HD256_EXACT && !PLOW_NV_FA_ONLY_HD256_ONLY
         if (in->i[6] == 512)
 #if defined(PLOW_NV_HOPPER) && PLOW_NV_FA512_WG
             /* wgmma hd512 arm (32k memo design (a)): BQ=64 q-tiles; the work enumeration

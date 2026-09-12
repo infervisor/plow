@@ -827,6 +827,7 @@ is **which object gets built**, not which tile a macro selects.
 | `PLOW_BUILD_FATLITE` | `_pfseg` | the fat object arm-stripped of flash → 128 regs, occupancy 2. |
 | `PLOW_BUILD_GEMM_WS384` | `_pfgemm` | 384-thread producer/consumer GEMM; carries **both** precisions' n256 bodies, so one lean object serves bf16 and fp8. |
 | `PLOW_BUILD_FA512` + `PLOW_BUILD_FA_WG` + `PLOW_BUILD_FA_HD256` | `_pffa` | the dedicated flash object: wgmma arms, hd512 and hd256. `--pf-seg-fa512 all` **requires** `FA_HD256=1` (the loader refuses the mismatch). |
+| `PLOW_BUILD_FA_HD256_ONLY` | `_pffa` | omit HD512 when every HD512 segment has a packet-authenticated standalone role; the loader refuses uncovered HD512 work. Requires `PLOW_BUILD_FA_HD256=1`. |
 | `PLOW_BUILD_TMA_GEMM` / `PLOW_BUILD_W8A8` | all | TMA GEMM bodies / fp8 w8a8 arms. Drop `W8A8` for bf16-only cubins. |
 
 The canonical build measured in the GH200 campaign:
