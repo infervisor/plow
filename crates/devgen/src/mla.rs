@@ -1805,6 +1805,11 @@ pub(crate) struct GlmTn {
     /// sequence-parallel seam writes its normed band into for the all-gather. TENSOR_NONE unless
     /// the knob is on under TP with a prefill bucket the seams cover.
     h2_tp: u32,
+    /// `PLOW_GLM_SEQ_PAR_PROJ`: the band projection results travel through slots 2..5 — this is
+    /// slot 2 (`act.ug_tp`, `2 * slot_b`), and slots 4/5 below. TENSOR_NONE otherwise.
+    ug_tp: u32,
+    xe_tp: u32,
+    rt_tp: u32,
     // DSA indexer (TENSOR_NONE when the DSA gate is off). qidx/kidx_raw/kidx_normed/widx are per-step
     // scratch; iscore/iidx/ighist/igctl are the score+select scratch (shared across layers, sequential);
     // icos/isin are the [ctx][DI/2] identity-tail interleaved-RoPE tables (first qk_rope/2 real, rest 1/0).
@@ -2158,11 +2163,17 @@ pub(crate) fn declare_glm_rows_batched(
     };
     // The host lays out six peer slots once a packet carries the split collectives and requires
     // all three result names; only slot 3 is written here.
-    let h2_tp = if sp_seams {
-        let h2 = ac(b, "h2_tp", rows * h as u64 * BF16);
-        ac(b, "xe_tp", rows * h as u64 * BF16);
-        ac(b, "rt_tp", rows * h as u64 * BF16);
-        h2
+    let (h2_tp, xe_tp, rt_tp) = if sp_seams {
+        (
+            ac(b, "h2_tp", rows * h as u64 * BF16),
+            ac(b, "xe_tp", rows * h as u64 * BF16),
+            ac(b, "rt_tp", rows * h as u64 * BF16),
+        )
+    } else {
+        (TENSOR_NONE, TENSOR_NONE, TENSOR_NONE)
+    };
+    let ug_tp = if sp_seams && emit_config::active().glm_seq_par_proj {
+        ac(b, "ug_tp", rows * h as u64 * BF16)
     } else {
         TENSOR_NONE
     };
@@ -2983,6 +2994,9 @@ pub(crate) fn declare_glm_rows_batched(
         // gives `h*2`, the value every shipped decode blob already carries.
         slot_b: rows as u32 * h * BF16 as u32,
         h2_tp,
+        ug_tp,
+        xe_tp,
+        rt_tp,
         meta,
         row_token,
         row_partidx,
@@ -4761,7 +4775,13 @@ fn glm_sp(c: &GlmCfg, n: &GlmTn, b: &Builder, t: u32) -> bool {
 /// Rank-relative band view `<base>@band<t>`: rows `[rank*t/tp, (rank+1)*t/tp)` of a `[t][row]`
 /// tensor, bound by the host at `base + rank * bytes`. Declared once per program and bucket.
 fn glm_band(b: &mut Builder, base: u32, t: u32, tp: u32, row_bytes: u64) -> u32 {
-    let name = format!("{}@band{t}", b.tensor_name(base));
+    glm_band_as(b, base, t, tp, row_bytes, "")
+}
+
+/// [`glm_band`] under its own name, for a second row width over the same base (the host binds
+/// every `<base>@band...` view at `base + rank * bytes`).
+fn glm_band_as(b: &mut Builder, base: u32, t: u32, tp: u32, row_bytes: u64, tag: &str) -> u32 {
+    let name = format!("{}@band{t}{tag}", b.tensor_name(base));
     match (0..b.n_tensors() as u32).find(|&h| b.tensor_name(h) == name) {
         Some(h) => h,
         None => b.tensor(&name, (t / tp) as u64 * row_bytes),
@@ -5155,8 +5175,12 @@ fn emit_glm_dsa_prefill_select(
     pre: &[u32],
     xgate: &mut u32,
     select: bool,
+    // `PLOW_GLM_SEQ_PAR_PROJ`: `kidx_pf` (and `widx_pf` under `select`) were projected on the
+    // band and all-gathered by this packet; the T-row projections from `xn` are not emitted.
+    gathered: Option<u32>,
 ) -> u32 {
     assert!(select || c.index_kpool == 1);
+    assert!(gathered.is_none() || c.index_kpool == 1);
     let (hi, di, h, ql) = (c.index_heads, c.index_dim, c.hidden, c.q_lora);
     let itk = c.index_topk.min(ctx);
     let n_cu = b.n_cu();
@@ -5220,7 +5244,10 @@ fn emit_glm_dsa_prefill_select(
             d.j[1] = KV_MASK_NONE;
         })
     });
-    let c_k0 = bf16_gemm(b, n.kidx_pf, n.xn, w.iwk, di, h, &[pre[0]]);
+    let c_k0 = match gathered {
+        Some(g) => g,
+        None => bf16_gemm(b, n.kidx_pf, n.xn, w.iwk, di, h, &[pre[0]]),
+    };
     let c_kn = b.emit(DevOp::LayerNorm, pf_wide_cus(n_cu, t), &[c_k0], |d| {
         d.t[0] = n.kidx_pf;
         d.t[1] = n.kidx_pf;
@@ -5427,20 +5454,23 @@ fn emit_glm_dsa_prefill_select(
         return c_ki;
     }
     let c_qi = c_qi.unwrap();
-    let c_w = b.emit(
-        pick_tile(t, hi, h, n_cu, kernelcaps::QuantScheme::None),
-        all.to_vec(),
-        &[pre[0]],
-        |d| {
-            d.t[0] = n.widx_pf;
-            d.t[1] = n.xn;
-            d.t[2] = w.iwp;
-            d.i[0] = t;
-            d.i[1] = hi;
-            d.i[2] = h;
-            d.f[0] = c.eps;
-        },
-    );
+    let c_w = match gathered {
+        Some(g) => g,
+        None => b.emit(
+            pick_tile(t, hi, h, n_cu, kernelcaps::QuantScheme::None),
+            all.to_vec(),
+            &[pre[0]],
+            |d| {
+                d.t[0] = n.widx_pf;
+                d.t[1] = n.xn;
+                d.t[2] = w.iwp;
+                d.i[0] = t;
+                d.i[1] = hi;
+                d.i[2] = h;
+                d.f[0] = c.eps;
+            },
+        ),
+    };
     let c_se =
         if emit_config::active().glm_index_tp() && t >= 2048 {
             // Under the packed topology the runtime hands this kernel the launch's PlowKvSpan
@@ -5614,9 +5644,104 @@ pub(crate) fn emit_glm_mla_prefill(
         })
     };
 
+    // SPARSE (PLOW_GLM_DSA_PF) selection for this layer; see the flash below.
+    // SPAN: 0 = indexer layers only, 1 = one successor, 3 = every GLM-5.3 layer.
+    // Keep the default at 1 while qualifying all-layer reuse after the row-count fix.
+    let cfg = emit_config::active();
+    let span = cfg.glm_dsa_pf_span as usize;
+    // Exact-distance selection holds the sparse layer count constant for a reuse bisect.
+    let dexact = cfg.glm_dsa_pf_dexact.map(|d| d as usize);
+    let reuses = match dexact {
+        Some(d) => slot >= d && c.indexer_is_full((slot - d) as u32),
+        None => (1..=span).any(|d| slot >= d && c.indexer_is_full((slot - d) as u32)),
+    };
+    let sparse = glm_dsa_pf_bucket(c, t) && (w.iwqb != TENSOR_NONE || reuses) && nh_l == 8;
+    // Dense prefill still feeds sparse decode's key cache, including short tail buckets.
+    let idx_chain = w.iwqb != TENSOR_NONE && (sparse || (c.dsa(ctx) && c.index_kpool == 1));
+
     // 1 input_layernorm, T rows (on the band + all-gather under the sequence-parallel seams).
     let sp = !raw_output && glm_sp(c, n, b, t);
-    let c_rn1 = if sp {
+    // Band projections: `widx` rides slot 0, whose next writer (this layer's o_proj) is ordered
+    // behind every peer's gather only by the TP indexer's rendezvous.
+    let sp_proj = sp
+        && n.ug_tp != TENSOR_NONE
+        && dr > 0
+        && w.blk_qad == TENSOR_NONE
+        && w.blk_ckvd == TENSOR_NONE
+        && (!idx_chain
+            || (c.index_kpool == 1 && (!sparse || (emit_config::active().glm_index_tp() && t >= 2048))));
+    let mut proj_g: Option<(u32, Option<u32>)> = None;
+    let c_rn1 = if sp_proj {
+        let tb = t / tp;
+        let xb = glm_band(b, x_in, t, tp, h as u64 * 2);
+        let xnb = glm_band(b, n.xn, t, tp, h as u64 * 2);
+        let c_n = b.emit(DevOp::RmsNorm, pf_wide_cus(n_cu, tb), pre, |d| {
+            d.t[0] = xnb;
+            d.t[1] = xb;
+            d.t[2] = w.gin;
+            d.i[0] = tb;
+            d.i[1] = h;
+            d.f[0] = eps;
+        });
+        let quant = mxfp4_quant(enc);
+        let bgemm = |b: &mut Builder, out: u32, wt: u32, sc: u32, nn: u32, bf16: bool| {
+            let op = if bf16 {
+                pick_tile(tb, nn, h, n_cu, kernelcaps::QuantScheme::None)
+            } else {
+                glm_prefill_projection_op(c, tb, nn, h, n_cu, quant)
+            };
+            b.emit(op, all.clone(), &[c_n], |d| {
+                d.t[0] = out;
+                d.t[1] = xnb;
+                d.t[2] = wt;
+                if !bf16 && enc == MoeEnc::Mxfp4 {
+                    d.t[3] = sc;
+                }
+                d.i[0] = tb;
+                d.i[1] = nn;
+                d.i[2] = h;
+                d.f[0] = eps;
+            })
+        };
+        let qlr_b = glm_band(b, n.qlr, t, tp, ql as u64 * 2);
+        let c_q = bgemm(b, qlr_b, w.qad, w.qad_s, ql, false);
+        let qlat_s = glm_band_as(b, n.h2_tp, t, tp, ql as u64 * 2, ".q");
+        let c_qn = b.emit(DevOp::RmsNorm, pf_wide_cus(n_cu, tb), &[c_q], |d| {
+            d.t[0] = qlat_s;
+            d.t[1] = qlr_b;
+            d.t[2] = w.gqa;
+            d.i[0] = tb;
+            d.i[1] = ql;
+            d.f[0] = eps;
+        });
+        let ckv_s = glm_band_as(b, n.xe_tp, t, tp, dk as u64 * 2, ".kv");
+        let c_kv = bgemm(b, ckv_s, w.ckvd, w.ckvd_s, dk, false);
+        let krr_s = glm_band_as(b, n.rt_tp, t, tp, dr as u64 * 2, ".kr");
+        let c_kr = bgemm(b, krr_s, w.krotd, w.krotd_s, dr, false);
+        let slot_b = n.slot_b;
+        let g = crate::emit_xall_gather(
+            b,
+            xgate,
+            xr_cus,
+            &[c_qn, c_kv, c_kr],
+            &[(n.qlat, t * ql, 3 * slot_b), (n.ckvraw, t * dk, 4 * slot_b), (n.krr, t * dr, 5 * slot_b)],
+            tp,
+        );
+        let gi = idx_chain.then(|| {
+            let (hi, di) = (c.index_heads, c.index_dim);
+            let ki_s = glm_band_as(b, n.ug_tp, t, tp, di as u64 * 2, ".ki");
+            let mut deps = vec![bgemm(b, ki_s, w.iwk, TENSOR_NONE, di, true)];
+            let mut pairs = vec![(n.kidx_pf, t * di, 2 * slot_b)];
+            if sparse {
+                let w_s = glm_band_as(b, n.og_tp, t, tp, hi as u64 * 2, ".w");
+                deps.push(bgemm(b, w_s, w.iwp, TENSOR_NONE, hi, true));
+                pairs.push((n.widx_pf, t * hi, 0));
+            }
+            crate::emit_xall_gather(b, xgate, xr_cus, &deps, &pairs, tp)
+        });
+        proj_g = Some((g, gi));
+        c_n
+    } else if sp {
         glm_sp_norm_gather(b, n, t, tp, h, eps, n.xn, x_in, w.gin, pre, xgate, xr_cus)
     } else {
         b.emit(DevOp::RmsNorm, pf_wide_cus(n_cu, t), pre, |d| {
@@ -5633,57 +5758,62 @@ pub(crate) fn emit_glm_mla_prefill(
     // split; T rows already parallelise"). Each is a separate tiled GEMM over the whole machine.
     // PLOW_GLM_GEMM_BLK: q_a quantizes `xn` into the shared FP8 scratch and kv_a reads it back,
     // after q_a by an explicit edge.
-    let blk_qad = emit_glm_blk_gemm(
-        b,
-        c,
-        n,
-        n.qlr,
-        n.xn,
-        [w.blk_qad, w.blk_qad_s],
-        t,
-        [ql, h],
-        true,
-        &[c_rn1],
-    );
-    let c_qad = match blk_qad {
-        Some(counter) => counter,
-        None => gemm(b, n.qlr, n.xn, w.qad, w.qad_s, ql, h, &[c_rn1]),
-    };
-    let kv_deps: &[u32] = if blk_qad.is_some() {
-        &[c_rn1, c_qad]
+    let (c_ckvd, c_krr, c_rnq) = if let Some((g, _)) = proj_g {
+        (g, g, g)
     } else {
-        &[c_rn1]
+        let blk_qad = emit_glm_blk_gemm(
+            b,
+            c,
+            n,
+            n.qlr,
+            n.xn,
+            [w.blk_qad, w.blk_qad_s],
+            t,
+            [ql, h],
+            true,
+            &[c_rn1],
+        );
+        let c_qad = match blk_qad {
+            Some(counter) => counter,
+            None => gemm(b, n.qlr, n.xn, w.qad, w.qad_s, ql, h, &[c_rn1]),
+        };
+        let kv_deps: &[u32] = if blk_qad.is_some() {
+            &[c_rn1, c_qad]
+        } else {
+            &[c_rn1]
+        };
+        let blk_ckvd = emit_glm_blk_gemm(
+            b,
+            c,
+            n,
+            n.ckvraw,
+            n.xn,
+            [w.blk_ckvd, w.blk_ckvd_s],
+            t,
+            [dk, h],
+            blk_qad.is_none(),
+            kv_deps,
+        );
+        let c_ckvd = match blk_ckvd {
+            Some(counter) => counter,
+            None => gemm(b, n.ckvraw, n.xn, w.ckvd, w.ckvd_s, dk, h, &[c_rn1]),
+        };
+        let c_krr = if dr > 0 {
+            gemm(b, n.krr, n.xn, w.krotd, w.krotd_s, dr, h, &[c_rn1])
+        } else {
+            c_rn1
+        };
+        // 3 q_a_layernorm, T rows.
+        let c_rnq = b.emit(DevOp::RmsNorm, pf_wide_cus(n_cu, t), &[c_qad], |d| {
+            d.t[0] = n.qlat;
+            d.t[1] = n.qlr;
+            d.t[2] = w.gqa;
+            d.i[0] = t;
+            d.i[1] = ql;
+            d.f[0] = eps;
+        });
+        (c_ckvd, c_krr, c_rnq)
     };
-    let blk_ckvd = emit_glm_blk_gemm(
-        b,
-        c,
-        n,
-        n.ckvraw,
-        n.xn,
-        [w.blk_ckvd, w.blk_ckvd_s],
-        t,
-        [dk, h],
-        blk_qad.is_none(),
-        kv_deps,
-    );
-    let c_ckvd = match blk_ckvd {
-        Some(counter) => counter,
-        None => gemm(b, n.ckvraw, n.xn, w.ckvd, w.ckvd_s, dk, h, &[c_rn1]),
-    };
-    let c_krr = if dr > 0 {
-        gemm(b, n.krr, n.xn, w.krotd, w.krotd_s, dr, h, &[c_rn1])
-    } else {
-        c_rn1
-    };
-    // 3 q_a_layernorm, T rows.
-    let c_rnq = b.emit(DevOp::RmsNorm, pf_wide_cus(n_cu, t), &[c_qad], |d| {
-        d.t[0] = n.qlat;
-        d.t[1] = n.qlr;
-        d.t[2] = w.gqa;
-        d.i[0] = t;
-        d.i[1] = ql;
-        d.f[0] = eps;
-    });
     // 4/5 absorbed q_nope and raw q_rope (decode's fusion G, likewise unfused here). Output layout
     // [T][nh_l*DK] is exactly the [b][t][head][DK] the flash indexes with b=1.
     let c_qa = gemm(b, n.qa, n.qlat, w.wqa, w.wqa_s, nh_l * dk, ql, &[c_rnq]);
@@ -5792,19 +5922,8 @@ pub(crate) fn emit_glm_mla_prefill(
     // Shared layers consume the last full layer's union. Ragged chunks must patch the
     // selection chain and flash to the same live row count: both derive causal query
     // positions and the union header from it (see plowrt::exec::kvrow).
-    // SPAN: 0 = indexer layers only, 1 = one successor, 3 = every GLM-5.3 layer.
-    // Keep the default at 1 while qualifying all-layer reuse after the row-count fix.
-    let cfg = emit_config::active();
-    let span = cfg.glm_dsa_pf_span as usize;
-    // Exact-distance selection holds the sparse layer count constant for a reuse bisect.
-    let dexact = cfg.glm_dsa_pf_dexact.map(|d| d as usize);
-    let reuses = match dexact {
-        Some(d) => slot >= d && c.indexer_is_full((slot - d) as u32),
-        None => (1..=span).any(|d| slot >= d && c.indexer_is_full((slot - d) as u32)),
-    };
-    let sparse = glm_dsa_pf_bucket(c, t) && (w.iwqb != TENSOR_NONE || reuses) && nh_l == 8;
-    // Dense prefill still feeds sparse decode's key cache, including short tail buckets.
-    let c_sel_pf = if w.iwqb != TENSOR_NONE && (sparse || (c.dsa(ctx) && c.index_kpool == 1)) {
+    // The selection decision (`sparse`, `idx_chain`) is taken above the input norm.
+    let c_sel_pf = if idx_chain {
         Some(emit_glm_dsa_prefill_select(
             b,
             c,
@@ -5817,6 +5936,7 @@ pub(crate) fn emit_glm_mla_prefill(
             &[c_rn1, c_rnq],
             xgate,
             sparse,
+            proj_g.and_then(|(_, gi)| gi),
         ))
     } else {
         None
@@ -8374,6 +8494,10 @@ fn glm_emit_full(
                 && emit_config::active().glm_xr_band.unwrap_or(1) <= 1),
         "PLOW_GLM_SEQ_PAR replaces the two-shot seams; it cannot combine with PLOW_GLM_XR_RES \
          or PLOW_GLM_XR_BAND"
+    );
+    assert!(
+        !emit_config::active().glm_seq_par_proj || emit_config::active().glm_seq_par,
+        "PLOW_GLM_SEQ_PAR_PROJ extends PLOW_GLM_SEQ_PAR; set both"
     );
     if emit_config::active().glm_moe_resident() {
         assert!(

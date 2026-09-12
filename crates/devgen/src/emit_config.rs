@@ -782,6 +782,12 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_SEQ_PAR", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_seq_par: bool,
 
+    /// With `PLOW_GLM_SEQ_PAR`: the layer-input seam also runs q_a (+ its norm), kv_a and k_rope
+    /// (and the indexer's k / weights projections) on the band, and all-gathers their outputs
+    /// instead of the normed hidden. Opt-in; not bit-identical (band-row GEMMs).
+    #[arg(long, env = "PLOW_GLM_SEQ_PAR_PROJ", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_seq_par_proj: bool,
+
     /// Size the batched-decode glue packets to their work items: the FP8 latent KV writer at one
     /// wave per row instead of one workgroup, the router top-k at one workgroup per token, the
     /// MoE combine at one thread per element. Pure width changes, bit-identical.
@@ -1210,6 +1216,7 @@ impl EmitConfig {
             glm_xr_band_seam: env_str("PLOW_GLM_XR_BAND_SEAM"),
             glm_xr_res: env_bool("PLOW_GLM_XR_RES"),
             glm_seq_par: env_bool("PLOW_GLM_SEQ_PAR"),
+            glm_seq_par_proj: env_bool("PLOW_GLM_SEQ_PAR_PROJ"),
             glm_decode_glue_cus: env_bool("PLOW_GLM_DECODE_GLUE_CUS"),
             glm_fuse_xrn: env_bool("GLM_FUSE_XRN"),
             xr_combine_fold: env_opt_out("PLOW_XR_COMBINE_FOLD"),

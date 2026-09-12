@@ -3401,3 +3401,84 @@ fn glm_seq_par_splits_every_prefill_seam_on_the_owned_band() {
     assert!(ran.load(Ordering::SeqCst));
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// `PLOW_GLM_SEQ_PAR_PROJ`: on a full-indexer layer the input norm, q_a (+ its norm), kv_a,
+/// k_rope and the indexer's k / weights projections all run on the owned band; one gather
+/// carries q_a-normed / kv_a / k_rope, a second the indexer k / weights. No packet reads the
+/// T-row `xn`.
+#[test]
+fn glm_seq_par_proj_moves_the_entry_projections_onto_the_band() {
+    let _guard = crate::test_env::env_guard();
+    let _target = crate::EmitAmdGuard::set(true);
+    let _env = crate::test_env::EnvScope::set(&[
+        ("PLOW_GLM_SEQ_PAR", "1"),
+        ("PLOW_GLM_SEQ_PAR_PROJ", "1"),
+        ("PLOW_GLM_DSA_PF", "1"),
+        ("PLOW_GLM_INDEX_TP", "1"),
+        ("PLOW_GLM_FP8_KV", "1"),
+        ("PLOW_UNISEG", "0"),
+    ]);
+    let mut c = glm_ref_cfg();
+    c.tp = 8;
+    let (ctx, t, tp) = (81920u32, 8192u32, 8u32);
+    let tb = t / tp;
+    let mut decl = Builder::new(304);
+    let n = declare_glm_rows_batched(&mut decl, &c, ctx, &[0], t, 1, MoeEnc::Fp8Blk);
+    assert_ne!(n.ug_tp, TENSOR_NONE);
+    let mut b = Builder::new(304);
+    b.adopt_tensors(decl.tensors());
+    let all = b.all();
+    let mut xgate = 0;
+    emit_glm_mla_prefill(&mut b, &c, &n, 0, ctx, t, MoeEnc::Fp8Blk, n.x, &[], false, &mut xgate,
+        &all, None);
+    let p = b.finish();
+    let name = |h: u32| p.tensors[h as usize].name.as_str();
+    let is = |d: &crate::DevInst, op: DevOp| d.op == op as u16;
+    assert!(p.insts.iter().all(|d| d.t[1] != n.xn), "a packet reads the T-row xn");
+    assert!(p.insts.iter().any(|d| is(d, DevOp::IndexTpPf)));
+    let ag: Vec<_> = p.insts.iter().filter(|d| is(d, DevOp::XAllGather)).collect();
+    assert_eq!(ag.len(), 3, "entry projections, indexer k/w, post-attention norm");
+    let slot_b = n.slot_b;
+    assert_eq!(
+        (ag[0].t[0], ag[0].t[1], ag[0].t[2]),
+        (n.qlat, n.ckvraw, n.krr)
+    );
+    assert_eq!(
+        [ag[0].i[0], ag[0].i[1], ag[0].i[2], ag[0].i[5], ag[0].i[6], ag[0].i[7]],
+        [t * c.q_lora, t * c.kv_lora, t * c.qk_rope, 3 * slot_b, 4 * slot_b, 5 * slot_b]
+    );
+    assert_eq!((ag[1].t[0], ag[1].t[1]), (n.kidx_pf, n.widx_pf));
+    assert_eq!(
+        [ag[1].i[0], ag[1].i[1], ag[1].i[5], ag[1].i[6]],
+        [t * c.index_dim, t * c.index_heads, 2 * slot_b, 0]
+    );
+    assert_eq!(ag[1].t[2], TENSOR_NONE);
+    assert_eq!(ag[2].t[0], n.xn2);
+    // The five band projections and the two band norms carry the band's rows.
+    let fam = crate::gemm_family_ops();
+    let band_gemms: Vec<_> = p
+        .insts
+        .iter()
+        .filter(|d| fam.contains(&d.op) && name(d.t[1]).ends_with("@band8192"))
+        .collect();
+    assert_eq!(band_gemms.len(), 5);
+    assert!(band_gemms.iter().all(|d| d.i[0] == tb && name(d.t[0]).contains("@band8192")));
+    let norms: Vec<_> = p
+        .insts
+        .iter()
+        .filter(|d| is(d, DevOp::RmsNorm) && name(d.t[0]).contains("@band8192"))
+        .collect();
+    assert_eq!(norms.len(), 3, "input norm, q_a norm, post-attention norm");
+    assert!(norms.iter().all(|d| d.i[0] == tb));
+    // Every slot-backed view is an eighth of the gathered array, rank-strided from its slot.
+    for (h, rows) in [
+        (".q", c.q_lora),
+        (".kv", c.kv_lora),
+        (".kr", c.qk_rope),
+        (".ki", c.index_dim),
+        (".w", c.index_heads),
+    ] {
+        let v = p.tensors.iter().find(|x| x.name.ends_with(&format!("@band8192{h}"))).unwrap();
+        assert_eq!(v.bytes, tb as u64 * rows as u64 * 2, "{}", v.name);
+    }
+}
