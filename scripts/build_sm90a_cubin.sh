@@ -316,6 +316,13 @@ if [ "${PLOW_BUILD_SEG:-0}" = "1" ]; then
     if [ "${PLOW_BUILD_FA_HD256:-0}" = "1" ]; then
       FA_WG="$FA_WG -DPLOW_NV_FA_ONLY_HD256=1"
     fi
+    if [ "${PLOW_BUILD_FA_HD256_ONLY:-0}" = "1" ]; then
+      [ "${PLOW_BUILD_FA_HD256:-0}" = "1" ] || {
+        echo "FATAL: PLOW_BUILD_FA_HD256_ONLY requires PLOW_BUILD_FA_HD256=1" >&2
+        exit 1
+      }
+      FA_WG="$FA_WG -DPLOW_NV_FA_ONLY_HD256_ONLY=1"
+    fi
     # PLOW_BUILD_FA_WGITEM=1 (T30): warpgroup-per-work-item hd256 flash (forces BKV=32).
     if [ "${PLOW_BUILD_FA_WGITEM:-0}" = "1" ]; then
       FA_WG="$FA_WG -DPLOW_NV_FA_WGITEM=1"

@@ -1260,6 +1260,18 @@ fn packet_role_index(roles: &[u8], segment: usize) -> Option<usize> {
         .map(|role| role as usize - 1)
 }
 
+fn hd512_prefill_segments_have_role(program: &DevProg, roles: &[u8]) -> bool {
+    program.stream.iter().all(|entry| {
+        let Some(inst) = program.insts.get(entry.inst as usize) else {
+            return false;
+        };
+        let hd512 = inst.op == DevOp::FlashPrefill as u16 && inst.i[6] == 512;
+        !hd512
+            || roles.get(entry.seg as usize)
+                == Some(&plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32)
+    })
+}
+
 struct SegPf {
     f_flash: KernelFn,
     smem_flash: u32,
@@ -6009,6 +6021,7 @@ impl GpuEngine {
                 "PLOW_PF_SEG_GEMM_SMALL requires PLOW_PF_SEG_DIR".into(),
             ));
         }
+        let mut fa_hd512_capability = None;
         let seg_pf = match segment_dir {
             Some(dir) => {
                 if !packed_requests
@@ -6137,6 +6150,8 @@ impl GpuEngine {
                     let (m3, f3, s3, g3) = load(&fa_file, &fa_sym, &fa_global_suffix, &fa_arena)?;
                     let hd256_capability = be
                         .module_global_u32(&m3, &format!("plow_fa_hd256{fa_global_suffix}"))?;
+                    fa_hd512_capability = be
+                        .module_global_u32(&m3, &format!("plow_fa_hd512{fa_global_suffix}"))?;
                     // PLOW_PF_SEG_FA512=all classes hd256 FlashPrefill onto this object too,
                     // but its hd256 arm exists only when built PLOW_BUILD_FA_HD256=1 —
                     // without it the dispatch hits a bare __trap(): LAUNCH_FAILED, poisoned
@@ -6355,6 +6370,15 @@ impl GpuEngine {
             } else {
                 Vec::new()
             };
+            if fa_hd512_capability == Some(0)
+                && !hd512_prefill_segments_have_role(g, &packet_segment_roles)
+            {
+                return Err(RuntimeError::Device(
+                    "HD256-only segmented attention object requires every HD512 prefill segment \
+                     to use the packet's HD512 attention role"
+                        .into(),
+                ));
+            }
             let projection_segments = if packet_segment_roles
                 .contains(&plow_asset::segment_roles::CUBLASLT)
             {
@@ -8203,6 +8227,32 @@ fn partial_prefill_roles_keep_bundled_segment_pair_eligible() {
 
     assert!(!prefill_needs_segment_pair(&blob, Some(&roles)));
     assert!(prefill_can_use_segment_pair(&blob, Some(&roles)));
+}
+
+#[cfg(test)]
+#[test]
+fn hd256_only_fa_requires_an_hd512_packet_role() {
+    let mut program = decode_rung_tests::fixture().progs.remove(0);
+    program.insts[0].op = DevOp::FlashPrefill as u16;
+    program.insts[0].i[6] = 512;
+    for entry in &mut program.stream {
+        if entry.inst == 0 {
+            entry.seg = 0;
+        }
+    }
+    assert!(!hd512_prefill_segments_have_role(
+        &program,
+        &[plow_asset::segment_roles::INTERPRETER],
+    ));
+    assert!(hd512_prefill_segments_have_role(
+        &program,
+        &[plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32],
+    ));
+    program.insts[0].i[6] = 256;
+    assert!(hd512_prefill_segments_have_role(
+        &program,
+        &[plow_asset::segment_roles::INTERPRETER],
+    ));
 }
 
 #[cfg(test)]
