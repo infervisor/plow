@@ -1087,5 +1087,3 @@ decode pass costs ~95 ms per prefill tick, so decode rows riding inside every ch
 **Measured, that estimate does not hold:** it assumed the decode pass disappears when its rows ride, but
 inside the body the band's decode attention chain costs about as much per layer as the pass, so riding
 middle chunks measures −14 ms per chunk at 78 layers (see the review log's decode-rows negative).
-</content>
-</invoke>
