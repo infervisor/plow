@@ -1180,7 +1180,7 @@ impl HsaBackend {
         // kernarg pool.
         let ring_bytes = QUEUE_SIZE as usize * KARG_SLOT;
         let mut karg_ring: *mut c_void = std::ptr::null_mut();
-        let karg_vram = crate::config::RuntimeConfig::get().amd.kernarg_vram
+        let karg_vram = crate::config::RuntimeConfig::get().amd_kernarg_vram()
             && unsafe {
                 vram_kernarg_ring(
                     &drv,

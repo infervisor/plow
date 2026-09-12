@@ -684,6 +684,12 @@ impl RuntimeConfig {
         self.amd.numa_host_pools.unwrap_or(true)
     }
 
+    /// AMD kernarg ring in the GPU's own VRAM through the large BAR (`PLOW_AMD_KERNARG_VRAM`).
+    /// Unset → on; `=0` → the host kernarg pool.
+    pub fn amd_kernarg_vram(&self) -> bool {
+        self.amd.kernarg_vram.unwrap_or(true)
+    }
+
     /// AMD long-context tail placement floor (`PLOW_AMD_TAIL_SPARSE_CTX`). Unset → 16384
     /// rows; `0` → off. Acts only on packets with a sparse (DSA) prefill rung.
     pub fn amd_tail_sparse_ctx(&self) -> Option<u32> {
@@ -1135,9 +1141,10 @@ pub struct AmdRuntimeConfig {
     /// Put each rank's kernarg ring in its own GPU's VRAM through the large-BAR host mapping, so
     /// the GPU reads kernargs locally with no host-cache snoop; host stores are posted and are
     /// made visible (CLR's `DeviceKernelArgsReadback`) before the packet header is published.
-    /// Falls back to the host kernarg pool when the BAR cannot map it. Off = host kernarg ring.
-    #[arg(long = "amd-kernarg-vram", env = "PLOW_AMD_KERNARG_VRAM", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub kernarg_vram: bool,
+    /// Falls back to the host kernarg pool when the BAR cannot map it. `=0` = host kernarg ring.
+    /// Read through `RuntimeConfig::amd_kernarg_vram`, which supplies the default (on).
+    #[arg(long = "amd-kernarg-vram", env = "PLOW_AMD_KERNARG_VRAM", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub kernarg_vram: Option<bool>,
 }
 
 /// Global runtime config, initialized once at startup from CLI parse.
@@ -1443,6 +1450,22 @@ mod tests {
             let matches = command.clone().try_get_matches_from(args).unwrap();
             let cfg = super::RuntimeConfig::from_arg_matches(&matches).unwrap();
             assert_eq!(cfg.amd_numa_host_pools(), want, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn kernarg_vram_default_on_and_false_turns_it_off() {
+        use clap::{Args, FromArgMatches};
+        let command = super::RuntimeConfig::augment_args(clap::Command::new("test"));
+        for (args, want) in [
+            (&["test"][..], true),
+            (&["test", "--amd-kernarg-vram=false"][..], false),
+            (&["test", "--amd-kernarg-vram=0"][..], false),
+            (&["test", "--amd-kernarg-vram"][..], true),
+        ] {
+            let matches = command.clone().try_get_matches_from(args).unwrap();
+            let cfg = super::RuntimeConfig::from_arg_matches(&matches).unwrap();
+            assert_eq!(cfg.amd_kernarg_vram(), want, "{args:?}");
         }
     }
 
