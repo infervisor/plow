@@ -1131,6 +1131,13 @@ pub struct AmdRuntimeConfig {
     /// through `RuntimeConfig::amd_numa_host_pools`, which supplies the default (on).
     #[arg(long = "amd-numa-host-pools", env = "PLOW_AMD_NUMA_HOST_POOLS", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub numa_host_pools: Option<bool>,
+
+    /// Put each rank's kernarg ring in its own GPU's VRAM through the large-BAR host mapping, so
+    /// the GPU reads kernargs locally with no host-cache snoop; host stores are posted and are
+    /// made visible (CLR's `DeviceKernelArgsReadback`) before the packet header is published.
+    /// Falls back to the host kernarg pool when the BAR cannot map it. Off = host kernarg ring.
+    #[arg(long = "amd-kernarg-vram", env = "PLOW_AMD_KERNARG_VRAM", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub kernarg_vram: bool,
 }
 
 /// Global runtime config, initialized once at startup from CLI parse.
