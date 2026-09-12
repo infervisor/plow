@@ -11034,11 +11034,7 @@ impl AmdEngine {
             .filter_map(|n| n.strip_prefix("kv.")?.strip_suffix(".ckv")?.parse().ok())
             .collect();
         layers.sort_unstable();
-        let layers: Vec<u32> = match (layers.first(), layers.last()) {
-            (Some(&a), Some(&b)) if a != b => vec![a, b],
-            (Some(&a), _) => vec![a],
-            _ => Vec::new(),
-        };
+        // Every layer (probe A): the index keys (`kidx`) exist only at the full-indexer layers.
         for &l in &layers {
             for kind in ["ckv", "krot", "scale", "kidx"] {
                 let name = format!("kv.{l}.{kind}");
@@ -11054,6 +11050,48 @@ impl AmdEngine {
             }
         }
         Ok(())
+    }
+
+    /// DIAGNOSTIC (`--amd-tb-dump`, probe A): one decode step's inputs and DSA selection. Writes
+    /// `in.ids` (the ids this step sampled), `in.pos` and `in.kvlen` for the batch, and for each
+    /// `(slot, kv_len)` the slot's selected indices (`act.iidx` row) and index scores over
+    /// `[0, kv_len)` (`act.iscore`). Both hold the LAST full-indexer layer's values.
+    pub fn dump_decode_step(&self, dir: &Path, tag: &str, slots: &[(usize, u32)]) -> Result<()> {
+        let io = |e: std::io::Error| RuntimeError::Device(format!("decode dump: {e}"));
+        std::fs::create_dir_all(dir).map_err(io)?;
+        let fetch = |i: usize, off: u64, len: usize| -> Result<Vec<u8>> {
+            let mut buf = vec![0u8; len];
+            EngineDevice::download(&*self.be, &self.devp[i], off, &mut buf)?;
+            Ok(buf)
+        };
+        let write = |name: String, bytes: &[u8]| -> Result<()> {
+            std::fs::write(dir.join(format!("{tag}.{name}")), bytes).map_err(io)
+        };
+        for (name, t) in [("in.ids", self.t_ids), ("in.pos", self.t_pos), ("in.kvlen", self.t_kvlen)] {
+            if let Some(t) = t {
+                write(format!("{name}.bin"), &fetch(t, 0, self.batch * 4)?)?;
+            }
+        }
+        let index = |name: &str| self.tensor_names.iter().position(|n| n == name);
+        for &(slot, kv_len) in slots {
+            if let Some(i) = index("act.iidx") {
+                let row = self.devp[i].len / self.batch as u64;
+                write(format!("slot{slot}.iidx.bin"), &fetch(i, slot as u64 * row, row as usize)?)?;
+            }
+            if let Some(i) = index("act.iscore") {
+                let row = self.devp[i].len / self.batch as u64;
+                let len = (kv_len as u64 * 4).min(row) as usize;
+                write(format!("slot{slot}.iscore.bin"), &fetch(i, slot as u64 * row, len)?)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Monotonic tag for [`Self::dump_decode_step`], shared by both decode paths so their dumps
+    /// sort in execution order.
+    pub fn decode_dump_tag() -> String {
+        static TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        format!("dec{:05}", TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
     }
 
     /// The KV slot the pointer table is currently rebased to (0 = the shared base).

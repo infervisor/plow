@@ -2891,6 +2891,15 @@ mod amd_serve {
                             Ranks::Tp(g) => {
                                 g.submit_decode_batched_at(&self.pos_stage, &self.kvlen_stage, dp)?;
                                 g.complete_decode_batched_deferred(self.batch, step, quantum)?;
+                                if let Some(dir) = crate::config::RuntimeConfig::get().amd.tb_dump.as_ref() {
+                                    let slots: Vec<(usize, u32)> =
+                                        advance.iter().map(|&s| (s, self.kvlen_stage[s])).collect();
+                                    g.rank(0).dump_decode_step(
+                                        dir,
+                                        &crate::exec::amd::AmdEngine::decode_dump_tag(),
+                                        &slots,
+                                    )?;
+                                }
                             }
                         }
                         for &slot in &advance {
@@ -3222,6 +3231,15 @@ mod amd_serve {
                     g.seed_ids(&self.next_id)?;
                     let started = measure_dispatch.then(std::time::Instant::now);
                     let out = g.decode_step_batched_at(&self.pos_stage, &self.kvlen_stage, dp)?;
+                    if let Some(dir) = crate::config::RuntimeConfig::get().amd.tb_dump.as_ref() {
+                        let slots: Vec<(usize, u32)> =
+                            advance.iter().map(|&s| (s, self.kvlen_stage[s])).collect();
+                        g.rank(0).dump_decode_step(
+                            dir,
+                            &crate::exec::amd::AmdEngine::decode_dump_tag(),
+                            &slots,
+                        )?;
+                    }
                     (
                         out,
                         dp,
