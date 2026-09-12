@@ -5863,6 +5863,16 @@ pub struct AmdEngine {
     seg_window: bool,
 }
 
+/// Rows [`AmdEngine::prefill_map_ahead`] ensures after a chunk whose last written row is
+/// `end - 1`: `end + 1` for the decode that follows (`frontier + 1`), and `next_end` for the
+/// same prompt's next chunk. `None` when neither applies or the chunk ends at `max_ctx`.
+fn map_ahead_rows(end: u32, decode: bool, next_end: Option<u32>, max_ctx: usize) -> Option<u32> {
+    if end as usize >= max_ctx {
+        return None;
+    }
+    decode.then_some(end + 1).max(next_end)
+}
+
 fn discover_lowrung_tiers(hsaco_dir: &Path, object: &str) -> Option<String> {
     let mut tiers = std::fs::read_dir(hsaco_dir)
         .ok()?
@@ -12465,7 +12475,11 @@ impl AmdEngine {
                 step.c0, self.max_ctx
             )));
         }
+        let tick = crate::obs::tick::on().then(std::time::Instant::now);
         self.vmm_ensure(self.kv_slot, step.c0 + rows)?;
+        if let Some(t) = tick {
+            crate::obs::tick::prepare_vmm(t.elapsed().as_nanos() as u64);
+        }
         if !self.kda_conv_bank_pairs.is_empty() {
             self.kda_conv_alt_stale[self.kv_slot] = true;
         }
@@ -12533,7 +12547,12 @@ impl AmdEngine {
             (d_ids, &self.h_scalar.as_slice()[..nb]),
             (d_pos, &self.h_scalar.as_slice()[nb..nb * 2]),
         ])?;
-        self.patch_prefill(step.prog, step.c0, step.clen)
+        let tick = crate::obs::tick::on().then(std::time::Instant::now);
+        let patched = self.patch_prefill(step.prog, step.c0, step.clen);
+        if let Some(t) = tick {
+            crate::obs::tick::prepare_patch(t.elapsed().as_nanos() as u64);
+        }
+        patched
     }
 
     /// Stage one dense packed-prefill row set. Dispatch remains the TP wrapper's job so no rank
@@ -12888,6 +12907,11 @@ impl AmdEngine {
         }
     }
 
+    /// Dispatches this rank has published that have not completed (diagnostic).
+    pub(crate) fn in_flight(&self) -> i64 {
+        self.be.in_flight()
+    }
+
     /// Driver mappings `ensure_rows` has made on this rank so far (one `map` call each).
     pub(crate) fn kv_mappings(&self) -> u64 {
         let vmm = self.vmm.as_ref().map_or(0, |v| {
@@ -12910,16 +12934,23 @@ impl AmdEngine {
     /// Mapping VA the GPU is not touching while it runs is what the pre-mapper thread already
     /// does; here it stays on the engine thread. Failures are not fatal here: the decode's
     /// `vmm_ensure` is the correctness backstop and surfaces the real error.
-    pub fn prefill_map_ahead(&self, step: ChunkStep) {
-        if !crate::config::RuntimeConfig::get().amd.kv_map_ahead {
-            return;
-        }
+    ///
+    /// With `--amd-kv-map-next-chunk`, `next` (the same prompt's following chunk) extends the
+    /// range to that chunk's `c0 + rows`: exactly the rows its `prefill_prepare` ensures one
+    /// chunk later on the same slot, so that call becomes a frontier read. The rows lie past
+    /// everything the running chunk writes (`c0 + rows`, pad included) or reads, and the plan
+    /// covers them, so the slot holds no block it would not hold one chunk later.
+    pub fn prefill_map_ahead(&self, step: ChunkStep, next: Option<ChunkStep>) {
+        let rt = &crate::config::RuntimeConfig::get().amd;
         let end = step.c0.saturating_add(self.chunk_rows(step));
-        if end as usize >= self.max_ctx {
+        let next_end = next
+            .filter(|_| rt.kv_map_next_chunk)
+            .map(|n| n.c0.saturating_add(self.chunk_rows(n)));
+        let Some(rows) = map_ahead_rows(end, rt.kv_map_ahead, next_end, self.max_ctx) else {
             return;
-        }
-        if let Err(e) = self.vmm_ensure(self.kv_slot, end + 1) {
-            tracing::warn!(error = %e, slot = self.kv_slot, end, "kv map-ahead failed");
+        };
+        if let Err(e) = self.vmm_ensure(self.kv_slot, rows) {
+            tracing::warn!(error = %e, slot = self.kv_slot, end, rows, "kv map-ahead failed");
         }
     }
 
@@ -13135,15 +13166,41 @@ impl AmdEngine {
         Ok(())
     }
 
-    pub fn publish_shared_prefix(&self, slot: usize, prompt: &[u32], frontier: u32) -> Result<()> {
-        if let Some(cache) = &self.shared_prefix {
+    pub fn publish_shared_prefix(&mut self, slot: usize, prompt: &[u32], frontier: u32) -> Result<()> {
+        if let Some(cache) = &mut self.shared_prefix {
             cache.publish_completed_chunk(slot, prompt, frontier)?;
         }
         Ok(())
     }
 
-    pub fn release_shared_prefix(&self, slot: usize) {
-        if let Some(cache) = &self.shared_prefix {
+    pub fn shared_prefix_publishes_at(&self, prompt_len: usize, frontier: u32) -> bool {
+        self.shared_prefix
+            .as_ref()
+            .is_some_and(|cache| cache.publishes_at(prompt_len, frontier))
+    }
+
+    /// Stash a completed chunk's publish; `SharedPrefix::defer_publish` states the invariant.
+    pub fn defer_shared_prefix_publish(
+        &mut self,
+        slot: usize,
+        prompt: &Arc<[u32]>,
+        frontier: u32,
+    ) -> Result<()> {
+        if let Some(cache) = &mut self.shared_prefix {
+            cache.defer_publish(slot, Arc::clone(prompt), frontier)?;
+        }
+        Ok(())
+    }
+
+    pub fn flush_shared_prefix_publish(&mut self) -> Result<()> {
+        if let Some(cache) = &mut self.shared_prefix {
+            cache.flush_publish()?;
+        }
+        Ok(())
+    }
+
+    pub fn release_shared_prefix(&mut self, slot: usize) {
+        if let Some(cache) = &mut self.shared_prefix {
             cache.release(slot);
         }
     }

@@ -388,6 +388,7 @@ hsa_fns! {
     hsa_signal_store_screlease: unsafe extern "C" fn(HsaSignal, i64),
     hsa_signal_wait_scacquire: unsafe extern "C" fn(HsaSignal, u32, i64, u64, u32) -> i64,
     hsa_signal_add_screlease: unsafe extern "C" fn(HsaSignal, i64),
+    hsa_signal_load_scacquire: unsafe extern "C" fn(HsaSignal) -> i64,
     hsa_code_object_reader_create_from_memory: unsafe extern "C" fn(*const c_void, usize, *mut HsaCodeObjectReader) -> HsaStatus,
     hsa_code_object_reader_destroy: unsafe extern "C" fn(HsaCodeObjectReader) -> HsaStatus,
     hsa_executable_create_alt: unsafe extern "C" fn(u32, u32, *const c_void, *mut HsaExecutable) -> HsaStatus,
@@ -454,6 +455,7 @@ impl HsaDriver {
             hsa_signal_store_screlease: resolve!(lib, b"hsa_signal_store_screlease\0"),
             hsa_signal_wait_scacquire: resolve!(lib, b"hsa_signal_wait_scacquire\0"),
             hsa_signal_add_screlease: resolve!(lib, b"hsa_signal_add_screlease\0"),
+            hsa_signal_load_scacquire: resolve!(lib, b"hsa_signal_load_scacquire\0"),
             hsa_code_object_reader_create_from_memory: resolve!(
                 lib,
                 b"hsa_code_object_reader_create_from_memory\0"
@@ -2673,6 +2675,12 @@ impl HsaBackend {
         self.synchronize()
     }
 
+    /// Dispatches published on this queue that have not completed: the counting signal
+    /// [`Self::synchronize`] waits on. A diagnostic read; it never waits.
+    pub fn in_flight(&self) -> i64 {
+        unsafe { (self.shared.drv.hsa_signal_load_scacquire)(self.done_signal) }
+    }
+
     /// Drain the queue (device-wide; there is one queue).
     pub fn synchronize(&self) -> Result<()> {
         // The AQL read index only says that the packet processor consumed the
@@ -2682,13 +2690,19 @@ impl HsaBackend {
         // counting signal before publication and the device decrements it on
         // completion, so zero is the exact queue-tail completion condition.
         self.guard()?;
+        static BLOCKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let state = if *BLOCKED.get_or_init(|| crate::config::RuntimeConfig::get().amd.hsa_drain_blocked) {
+            HSA_WAIT_STATE_BLOCKED
+        } else {
+            HSA_WAIT_STATE_ACTIVE
+        };
         unsafe {
             (self.shared.drv.hsa_signal_wait_scacquire)(
                 self.done_signal,
                 HSA_SIGNAL_CONDITION_LT,
                 1,
                 u64::MAX,
-                HSA_WAIT_STATE_ACTIVE,
+                state,
             );
         }
         self.guard()

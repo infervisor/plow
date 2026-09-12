@@ -357,6 +357,38 @@ Serving (20 × 70k/700/.14, C20, same binary and packet, objects the only variab
 
 Incident: the first object-build script wrote rebuilt objects THROUGH `serving-safe`'s symlinks (18:07:57–18:12:29 UTC); all four files restored and verified against preserved `.co` bundles — report §3b.
 
+## Host shadowing of the prefill tick: phase 1's last piece (2026-09-11, branch `host-shadow`, `host-shadowing.md`)
+
+Re-measured on this head (map-ahead and slot recycling on): a steady 8192 chunk tick carries
+**~40 ms** of serial host work, not ~100: `prefill_prepare` 25.9 ms (24.98 of it the 624 driver
+maps of the chunk's second 4096-row block), audit 6.0, prefix publish 19.5 ms mean on 5 of 9
+chunks. One FIFO job, one pinned binary, tick log on 20 × 66000 × 96 out:
+
+| piece | flag | tick-level effect | invariant (code comment + test) |
+|---|---|---|---|
+| A: map the next chunk's rows while this one drains | `PLOW_KV_MAP_NEXT_CHUNK` | prepare 25.9 → 0.9 ms, prefill-carrying tick 1078.7 → 1050.8 ms; driver maps 276,480 in both arms | maps exactly what the next `prefill_prepare` would, one chunk early (`map_ahead_of_the_next_chunk_moves_its_maps_without_adding_any`) |
+| B: prefix publish into the next GPU drain window | `PLOW_AMD_PUBLISH_DEFER` | 19.5 ms per publishing chunk → 0.06; the 2.16 s of flushes run under decodes that are no slower (86.8 vs 87.4 ms) | snapshot rows < frontier are not written before the flush; `begin_slot` / attach / publish / release flush first (`deferred_publish_*`) |
+| C: prefill counter audit through large BAR | `PLOW_TP_PREFILL_AUDIT_DIRECT` | 5.35 → 3.50 ms per chunk | same gates, same expectations, every chunk (a stale read can only fail loudly) |
+| D: decode enqueue + re-arm | — | nothing to take: rank 0 still has ~1230 of the tick's dispatches in flight after the enqueue and ~1198 after the re-arm, so both run under the GPU; the serial decode host remainder is ~1.7 ms of 105 | not built |
+
+Why the prefill audit stays every chunk and on the critical path: the next dispatch's `zero_xctr`
+erases its evidence, and a timed-out collective corrupts KV every later row reads (and the prefix
+cache would publish it). The device compact audit cannot be reused for prefill: `plow_xctr_audit`
+has no `IndexTpPf` / `XReduceScatter` / `XAllGather` case and would fail every GLM chunk.
+
+Decode cost per piece (the bench's median ITL rose 100.9 → 106.5 ms, so checked per arm):
+decode-only tick median ctrl 105.1 / ctrl2 105.5 vs A 98.9, B 99.1, C 99.3, ABC 99.3 ms; decode
+after a chunk 92.5 / 92.6 vs 85.8, 86.9, 85.6, 86.5; dispatches in flight after the decode enqueue
+1232 vs 1239. No piece raises decode time. B's deferred publish lands only in the decode of a tick
+that already carries a ~1 s chunk, and those decodes are no slower (86.8 ms with a flush, n = 96,
+vs 87.4 without, n = 76); decode-only ticks never carry one. The bench ITL gap is the per-process
+decode mode below: the ctrl configuration decoded slow in both tick arms but fast in its bench
+process, the ABC configuration fast in its tick arm but slow in its bench process. No TTFT/ITL
+trade-off, so all three flipped.
+
+Projected on the 100-prompt run: A ≈ 19 s, B ≈ 10 s, C ≈ 2 s, D 0 — ≈ 31 s (−2 %). 40-prompt bench,
+same binary, ctrl vs A+B+C: 55.10 → 55.69 out tok/s (+1.1 %), duration 514.9 → 509.4 s, mean TTFT 56.0 → 53.3 s; the two bench processes drew opposite decode modes (median ITL 100.9 vs 106.5 ms, see below), so this is a no-regression check, not the measurement. Retrieval on A+B+C: 18/18. Defaults: all three on (`=0` is each rollback); D not built. **Measurement note:** decode ticks split ~6 ms (~6 %) between server processes independently of every flag (both tick-arm controls 105 ms, all flagged arms 99 ms, yet the flagless bench process drew the fast mode); host enqueue, the SDMA re-arm and the GPU's per-dispatch retirement are all slower in the slow processes — suspected engine-thread NUMA placement against rank 0's busy-polled completion signal, under test (`PLOW_HSA_DRAIN_BLOCKED`, diagnostic).
+
 ## Knob organization (2026-09-11)
 
 Inventory: 138 runtime knobs (`RuntimeConfig` 33 shared / NVIDIA 34 / AMD 48 / Apple 14 / CPU 9)

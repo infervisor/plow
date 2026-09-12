@@ -347,6 +347,7 @@ pub struct AmdTpGroup {
     audit: bool,
     audit_direct: bool,
     audit_compact: bool,
+    prefill_audit_direct: bool,
     index_tp_status: bool,
     /// Read EVERY rank's sampled id, rather than just rank 0's, once every this
     /// many decode tokens — see [`AmdTpGroup::audit_cadence`].
@@ -668,6 +669,7 @@ impl AmdTpGroup {
             gate_expect,
             audit: !crate::config::RuntimeConfig::get().amd.tp_no_audit,
             audit_direct: crate::config::RuntimeConfig::get().amd.tp_audit_direct,
+            prefill_audit_direct: crate::config::RuntimeConfig::get().amd.tp_prefill_audit_direct,
             audit_compact,
             index_tp_status,
             agree_every,
@@ -971,6 +973,7 @@ impl AmdTpGroup {
         if let Some(z) = launched_at {
             dstep::ENQUEUE.add(z.elapsed().as_nanos() as u64);
         }
+        let in_flight_enqueued = crate::obs::tick::on().then(|| self.ranks[0].in_flight());
         // Do not put this work inside the launch closure: every rank must be
         // resident before ~1.5 ms of TP8 counter clears can begin. These are
         // rank-local inactive banks, not peer-visible xctr; xctr remains the
@@ -979,6 +982,9 @@ impl AmdTpGroup {
             for e in &self.ranks {
                 dstep::timed(&dstep::REARM, || e.tp_rearm_inactive_counter_bank(dp))?;
             }
+        }
+        if let Some(enqueued) = in_flight_enqueued {
+            crate::obs::tick::decode_in_flight(enqueued, self.ranks[0].in_flight(), n_segments as u32);
         }
         Ok(())
     }
@@ -1034,6 +1040,8 @@ impl AmdTpGroup {
 
     fn drain_and_audit(&mut self) -> Result<()> {
         use crate::obs::dstep;
+        // The decode is on the GPU: a prefix publish deferred from this tick's chunk runs here.
+        let published = self.flush_deferred_publish();
         dstep::timed(&dstep::DRAIN, || -> Result<()> {
             for e in &self.ranks {
                 e.drain()?;
@@ -1073,7 +1081,7 @@ impl AmdTpGroup {
                 }
             })?;
         }
-        Ok(())
+        published.map(drop)
     }
 
     /// Prefill `prompt` on every rank. Returns each rank's first sampled id.
@@ -1125,8 +1133,8 @@ impl AmdTpGroup {
             "TP prefill plan"
         );
 
-        for step in steps {
-            self.prefill_chunk(prompt, step)?;
+        for (i, &step) in steps.iter().enumerate() {
+            self.prefill_chunk(prompt, step, steps.get(i + 1).copied())?;
         }
 
         let t_read = std::time::Instant::now();
@@ -1228,15 +1236,53 @@ impl AmdTpGroup {
         AmdEngine::attach_shared_prefixes(&mut self.ranks, slot, prompt)
     }
 
-    pub fn publish_shared_prefix(&self, slot: usize, prompt: &[u32], frontier: u32) -> Result<()> {
-        for rank in &self.ranks {
+    pub fn publish_shared_prefix(&mut self, slot: usize, prompt: &[u32], frontier: u32) -> Result<()> {
+        for rank in &mut self.ranks {
             rank.publish_shared_prefix(slot, prompt, frontier)?;
         }
         Ok(())
     }
 
-    pub fn release_shared_prefix(&self, slot: usize) {
-        for rank in &self.ranks {
+    /// Stash this chunk's prefix publish on every rank. It runs at the next flush point, each
+    /// of which sits under GPU work: [`Self::prefill_chunk`] between its enqueue and its drain,
+    /// or the decode's [`Self::drain_and_audit`]. `SharedPrefix::defer_publish` states why
+    /// the bytes are unchanged and when a flush is forced earlier.
+    pub fn defer_publish_shared_prefix(
+        &mut self,
+        slot: usize,
+        prompt: &[u32],
+        frontier: u32,
+    ) -> Result<()> {
+        if !self
+            .ranks
+            .first()
+            .is_some_and(|e| e.shared_prefix_publishes_at(prompt.len(), frontier))
+        {
+            return Ok(());
+        }
+        let prompt: Arc<[u32]> = Arc::from(prompt);
+        for rank in &mut self.ranks {
+            rank.defer_shared_prefix_publish(slot, &prompt, frontier)?;
+        }
+        Ok(())
+    }
+
+    /// Run any deferred prefix publish on every rank; returns its wall time.
+    fn flush_deferred_publish(&mut self) -> Result<u64> {
+        let t = std::time::Instant::now();
+        let mut result = Ok(());
+        for rank in &mut self.ranks {
+            if let Err(err) = rank.flush_shared_prefix_publish() {
+                result = Err(err);
+            }
+        }
+        let ns = t.elapsed().as_nanos() as u64;
+        crate::obs::tick::deferred_publish(ns);
+        result.map(|()| ns)
+    }
+
+    pub fn release_shared_prefix(&mut self, slot: usize) {
+        for rank in &mut self.ranks {
             rank.release_shared_prefix(slot);
         }
     }
@@ -1449,8 +1495,8 @@ impl AmdTpGroup {
         }
         let chunks = self.ranks[0].plan_for(to - from)?;
         let steps = self.ranks[0].chunk_steps_from(&chunks, from, to)?;
-        for step in steps {
-            self.prefill_chunk(prompt, step)?;
+        for (i, &step) in steps.iter().enumerate() {
+            self.prefill_chunk(prompt, step, steps.get(i + 1).copied())?;
         }
         Ok(())
     }
@@ -1528,12 +1574,23 @@ impl AmdTpGroup {
     /// every rank and drained once. A server that wants to overlap prefill with
     /// other work overlaps whole CHUNKS, which is the granularity chunked
     /// prefill already schedules at.
-    pub fn prefill_chunk(&mut self, prompt: &[u32], step: ChunkStep) -> Result<()> {
+    ///
+    /// `next` is the same prompt's following chunk, if the plan has one; see
+    /// [`AmdEngine::prefill_map_ahead`].
+    pub fn prefill_chunk(
+        &mut self,
+        prompt: &[u32],
+        step: ChunkStep,
+        next: Option<ChunkStep>,
+    ) -> Result<()> {
         use crate::obs::ttft;
         let tick_log = crate::obs::tick::on();
         let (mut prepare_ns, mut rearm_ns) = (0u64, 0u64);
         let maps = |ranks: &[AmdEngine]| ranks.iter().map(AmdEngine::kv_mappings).sum::<u64>();
         let maps_before = if tick_log { maps(&self.ranks) } else { 0 };
+        if tick_log {
+            crate::obs::tick::take_prepare();
+        }
         for e in &mut self.ranks {
             let t = std::time::Instant::now();
             e.prefill_prepare(prompt, step)?;
@@ -1597,10 +1654,11 @@ impl AmdTpGroup {
             let t = std::time::Instant::now();
             let maps_prepared = if tick_log { maps(&self.ranks) } else { 0 };
             for e in &self.ranks {
-                e.prefill_map_ahead(step);
+                e.prefill_map_ahead(step, next);
             }
             let map_ahead_ns = t.elapsed().as_nanos() as u64;
             let maps_after = if tick_log { maps(&self.ranks) } else { 0 };
+            let published = self.flush_deferred_publish();
 
             let t = std::time::Instant::now();
             let mut rank_drain_ns = Vec::with_capacity(if tick_log { self.ranks.len() } else { 0 });
@@ -1634,25 +1692,28 @@ impl AmdTpGroup {
             if self.index_tp_status {
                 self.group.audit_xstatus_direct()?;
             }
-            if self.audit {
-                self.group.audit_xctr(&self.gate_expect[step.prog])?;
-            }
+            self.audit_prefill_counters(step.prog)?;
+            let publish_ns = published?;
             if tick_log {
+                let (prep_vmm, prep_patch) = crate::obs::tick::take_prepare();
                 let ms = |ns: u64| ns as f64 / 1e6;
                 let ranks: Vec<String> =
                     rank_drain_ns.iter().map(|&d| format!("{:.1}", ms(d))).collect();
                 eprintln!(
-                    "PFSEG bucket={} c0={} clen={} launches={launches} prepare={:.3} prepare_maps={} rearm={:.3} xctr={:.3} enqueue={:.3} map_ahead={:.3} map_ahead_maps={} drain={:.3} audit={:.3} rank_drain_cum=[{}]",
+                    "PFSEG bucket={} c0={} clen={} launches={launches} prepare={:.3} prepare_maps={} prepare_vmm={:.3} prepare_patch={:.3} rearm={:.3} xctr={:.3} enqueue={:.3} map_ahead={:.3} map_ahead_maps={} publish_deferred={:.3} drain={:.3} audit={:.3} rank_drain_cum=[{}]",
                     self.ranks[0].prog_t(step.prog),
                     step.c0,
                     step.clen,
                     ms(prepare_ns),
                     maps_prepared - maps_before,
+                    ms(prep_vmm),
+                    ms(prep_patch),
                     ms(rearm_ns),
                     ms(xctr_ns),
                     ms(enqueue_ns),
                     ms(map_ahead_ns),
                     maps_after - maps_prepared,
+                    ms(publish_ns),
                     ms(ns),
                     ms(t.elapsed().as_nanos() as u64),
                     ranks.join(","),
@@ -1743,10 +1804,26 @@ impl AmdTpGroup {
         if self.index_tp_status {
             self.group.audit_xstatus_direct()?;
         }
-        if self.audit {
-            self.group.audit_xctr(&self.gate_expect[step.prog])?;
-        }
+        self.audit_prefill_counters(step.prog)?;
         Ok(())
+    }
+
+    /// The exact counter audit after a prefill dispatch has drained on every rank.
+    ///
+    /// With `--amd-tp-prefill-audit-direct` the same gates are compared against the same
+    /// expectations through host loads of the large-BAR mapping, the transport the compact
+    /// decode audit already reads its status word through, instead of one D2H copy per rank.
+    /// It cannot move later or be sampled: the next dispatch's `zero_xctr` erases the
+    /// counters, and a collective that timed out corrupts KV every later row reads.
+    fn audit_prefill_counters(&self, prog: usize) -> Result<()> {
+        if !self.audit {
+            return Ok(());
+        }
+        if self.prefill_audit_direct {
+            self.group.audit_xctr_direct(&self.gate_expect[prog])
+        } else {
+            self.group.audit_xctr(&self.gate_expect[prog])
+        }
     }
 
     /// Execute one packed prefill chunk as an all-rank transaction. No rank launches until all

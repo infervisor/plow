@@ -794,6 +794,22 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-kv-map-ahead", env = "PLOW_KV_MAP_AHEAD", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub kv_map_ahead: bool,
 
+    /// While a prefill chunk drains, also map the KV rows of the same prompt's NEXT chunk, so
+    /// that chunk's `prefill_prepare` maps nothing on the engine thread.
+    #[arg(long = "amd-kv-map-next-chunk", env = "PLOW_KV_MAP_NEXT_CHUNK", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub kv_map_next_chunk: bool,
+
+    /// Run a completed chunk's shared-prefix publish (snapshot allocation and copy) in the next
+    /// GPU drain window, the following chunk's or decode's, instead of before the decode.
+    #[arg(long = "amd-publish-defer", env = "PLOW_AMD_PUBLISH_DEFER", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub publish_defer: bool,
+
+    /// DIAGNOSTIC: drain with a blocked (interrupt-backed) wait on the queue's completion
+    /// signal instead of busy-polling it, so the host core stops contending for the line the
+    /// GPU decrements once per dispatch.
+    #[arg(long = "amd-hsa-drain-blocked", env = "PLOW_HSA_DRAIN_BLOCKED", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub hsa_drain_blocked: bool,
+
     /// Share completed MLA prefixes through ROCr VMM (auto on supported gfx942 packets).
     #[arg(long = "amd-shared-prefix", env = "PLOW_AMD_SHARED_PREFIX", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub shared_prefix: Option<bool>,
@@ -841,6 +857,11 @@ pub struct AmdRuntimeConfig {
     /// Compact the exact TP counter audit on device, then read one status word per rank.
     #[arg(long = "amd-tp-audit-compact", env = "PLOW_TP_AUDIT_COMPACT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub tp_audit_compact: bool,
+
+    /// Read each TP prefill chunk's exact counter audit through host-mapped large BAR instead
+    /// of one D2H copy per rank. Same gates, same expectations.
+    #[arg(long = "amd-tp-prefill-audit-direct", env = "PLOW_TP_PREFILL_AUDIT_DIRECT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub tp_prefill_audit_direct: bool,
 
     /// Override prefill pad/launch-rows tradeoff.
     #[arg(long = "amd-launch-rows", env = "PLOW_LAUNCH_ROWS", global = true)]

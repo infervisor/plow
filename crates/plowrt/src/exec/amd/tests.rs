@@ -4,6 +4,17 @@ use crate::exec::kvrow::KDA_ROW_COUNT_OPS;
 use packet::dev::PREFILL_SPAN_RESET_STATE;
 
 #[test]
+fn map_ahead_rows_covers_the_decode_row_and_the_next_chunk() {
+    let max = 202_752;
+    assert_eq!(map_ahead_rows(8192, true, None, max), Some(8193));
+    assert_eq!(map_ahead_rows(8192, true, Some(16384), max), Some(16384));
+    assert_eq!(map_ahead_rows(8192, false, Some(16384), max), Some(16384));
+    assert_eq!(map_ahead_rows(8192, false, None, max), None);
+    // A chunk that ends the context has no decode row and no next chunk to map.
+    assert_eq!(map_ahead_rows(max as u32, true, Some(max as u32 + 8192), max), None);
+}
+
+#[test]
 fn materialized_mla_flat_grid_covers_every_qblock_head_and_batch_once() {
     for &(n, heads, batches) in &[
         (1u32, 1u32, 1u32),

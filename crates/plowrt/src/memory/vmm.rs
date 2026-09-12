@@ -3336,6 +3336,39 @@ mod tests {
         assert_eq!(p.mapped_rows(0), 32);
     }
 
+    /// `--amd-kv-map-next-chunk`: under chunk [0, 16)'s drain the engine ensures the next
+    /// chunk's rows [16, 32) rather than only row 16. That is exactly the set the next chunk's
+    /// `prefill_prepare` and the same tick's decode would map, so both become frontier reads,
+    /// no block is created that the one-row map-ahead run does not also create, and the slot
+    /// never holds more than its plan covers. `uniform_pool`: 4 tracks, block_rows 8, max_ctx 32.
+    #[test]
+    fn map_ahead_of_the_next_chunk_moves_its_maps_without_adding_any() {
+        // (prepare, map-ahead, decode) ensure_rows targets per chunk, as the engine issues them.
+        let run = |next_chunk: bool| {
+            let ops = Arc::new(MockVmm::default());
+            let p = uniform_pool(ops.clone());
+            let mut prepare_maps = Vec::new();
+            for (c0, next_end) in [(0u32, Some(32u32)), (16, None)] {
+                let end = c0 + 16;
+                let before = ops.maps.load(Ordering::SeqCst);
+                p.ensure_rows(0, end).unwrap();
+                prepare_maps.push(ops.maps.load(Ordering::SeqCst) - before);
+                let ahead = (end + 1).max(next_end.filter(|_| next_chunk).unwrap_or(0));
+                p.ensure_rows(0, ahead).unwrap();
+                assert!(p.mapped_rows(0) <= 32, "never past the plan's last row");
+                let before = ops.maps.load(Ordering::SeqCst);
+                p.ensure_rows(0, end + 1).unwrap();
+                assert_eq!(ops.maps.load(Ordering::SeqCst), before, "the decode maps nothing");
+            }
+            (prepare_maps, ops.creates.load(Ordering::SeqCst), p.stats().blocks_live)
+        };
+        let (control, control_creates, control_live) = run(false);
+        let (ahead, ahead_creates, ahead_live) = run(true);
+        assert_eq!(control, vec![8, 4], "the second chunk's prepare maps its second block");
+        assert_eq!(ahead, vec![8, 0], "with the next chunk mapped ahead it maps nothing");
+        assert_eq!((ahead_creates, ahead_live), (control_creates, control_live));
+    }
+
     /// A refused map-ahead leaves the slot at its budget (no block beyond the frontier held)
     /// and the decode's backstop `ensure_rows` completes the block without over-mapping.
     #[test]
