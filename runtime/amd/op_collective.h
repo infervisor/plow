@@ -241,11 +241,28 @@ extern "C" __device__ unsigned plow_xr_sched_aiter_1 = 1;
 #ifndef PLOW_XR_SCHED_NWG_RS
 #define PLOW_XR_SCHED_NWG_RS PLOW_XR_SCHED_NWG
 #endif
+/* The sequence-parallel seam halves (ops 25 / 26) are separate packets with their own shapes (the
+ * op-26 gathers carry band results as narrow as 2624 columns), so they take their own caps:
+ * PLOW_XR_SCHED_NWG_SRS (op 25) and PLOW_XR_SCHED_NWG_SAG (op 26). Unset, both are
+ * PLOW_XR_SCHED_NWG, the caps these ops had before the knobs existed. */
+#if defined(PLOW_XR_SCHED_NWG_SRS) || defined(PLOW_XR_SCHED_NWG_SAG)
+#define PLOW_XR_SCHED_SEAM_CAPS 1
+#endif
+#ifndef PLOW_XR_SCHED_NWG_SRS
+#define PLOW_XR_SCHED_NWG_SRS PLOW_XR_SCHED_NWG
+#endif
+#ifndef PLOW_XR_SCHED_NWG_SAG
+#define PLOW_XR_SCHED_NWG_SAG PLOW_XR_SCHED_NWG
+#endif
 #define PLOW_XR_SCHED_NWG_MAX \
     (PLOW_XR_SCHED_NWG > PLOW_XR_SCHED_NWG_RS ? PLOW_XR_SCHED_NWG : PLOW_XR_SCHED_NWG_RS)
 #if PLOW_XR_SCHED_CAP
 extern "C" __device__ unsigned plow_xr_sched_nwg = PLOW_XR_SCHED_NWG;
 extern "C" __device__ unsigned plow_xr_sched_nwg_rs = PLOW_XR_SCHED_NWG_RS;
+#if PLOW_XR_SCHED_SEAM_CAPS
+extern "C" __device__ unsigned plow_xr_sched_nwg_srs = PLOW_XR_SCHED_NWG_SRS;
+extern "C" __device__ unsigned plow_xr_sched_nwg_sag = PLOW_XR_SCHED_NWG_SAG;
+#endif
 #if defined(PLOW_XR_ATTNRES) && PLOW_XR_ATTNRES
 #error "PLOW_XR_SCHED_NWG does not cover the XReduceAttnRes row path"
 #endif
@@ -1651,8 +1668,9 @@ __device__ __forceinline__ void d_xreduce_scatter_mega(
     __shared__ int bailed;
     const unsigned tid = slice * PLOW_THREADS + threadIdx.x;
 #if PLOW_XR_SCHED_CAP
-    if (slice >= PLOW_XR_SCHED_NWG) return;
-    const unsigned stride = (nblk < PLOW_XR_SCHED_NWG ? nblk : PLOW_XR_SCHED_NWG) * PLOW_THREADS;
+    if (slice >= PLOW_XR_SCHED_NWG_SRS) return;
+    const unsigned stride =
+        (nblk < PLOW_XR_SCHED_NWG_SRS ? nblk : PLOW_XR_SCHED_NWG_SRS) * PLOW_THREADS;
 #else
     const unsigned stride = nblk * PLOW_THREADS;
 #endif
@@ -1721,8 +1739,8 @@ __device__ __forceinline__ void d_xall_gather_mega(
     __shared__ int bailed;
     const unsigned tid = slice * PLOW_THREADS + threadIdx.x;
 #if PLOW_XR_SCHED_CAP
-    if (slice >= PLOW_XR_SCHED_NWG) return;
-    const unsigned dnblk = nblk < PLOW_XR_SCHED_NWG ? nblk : PLOW_XR_SCHED_NWG;
+    if (slice >= PLOW_XR_SCHED_NWG_SAG) return;
+    const unsigned dnblk = nblk < PLOW_XR_SCHED_NWG_SAG ? nblk : PLOW_XR_SCHED_NWG_SAG;
 #else
     const unsigned dnblk = nblk;
 #endif

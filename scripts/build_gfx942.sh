@@ -805,7 +805,14 @@ fi
 # `twoshot` compiles none of it: the prefill rows are then the shipped 2-byte two-shot.
 case "${PLOW_XR_SCHED:-aiter}" in
   twoshot|off) ;;
-  aiter) AX_PREFILL="$AX_PREFILL -DPLOW_XR_SCHED_AITER=1 -DPLOW_XR_SCHED_NWG=${PLOW_XR_SCHED_NWG:-24} -DPLOW_XR_SCHED_NWG_RS=${PLOW_XR_SCHED_NWG_RS:-8} -DPLOW_XR_SCHED_AG_U=${PLOW_XR_SCHED_AG_U:-1}" ;;
+  aiter) AX_PREFILL="$AX_PREFILL -DPLOW_XR_SCHED_AITER=1 -DPLOW_XR_SCHED_NWG=${PLOW_XR_SCHED_NWG:-24} -DPLOW_XR_SCHED_NWG_RS=${PLOW_XR_SCHED_NWG_RS:-8} -DPLOW_XR_SCHED_AG_U=${PLOW_XR_SCHED_AG_U:-1}"
+         # Seam caps (ops 25 / 26). The seam reduce-scatter runs on 8 workgroups by default, like the
+         # two-shot's (micro5: 8192x6144 394.5 -> ~347 us, -7 ms per 8192 chunk; bit-identical);
+         # rollback PLOW_XR_SCHED_NWG_SRS=24, the all-gather cap it used before. The seam all-gather
+         # keeps PLOW_XR_SCHED_NWG unless PLOW_XR_SCHED_NWG_SAG is set (no cap below 24 pays).
+         AX_PREFILL="$AX_PREFILL -DPLOW_XR_SCHED_NWG_SRS=${PLOW_XR_SCHED_NWG_SRS:-8}"
+         [ -n "${PLOW_XR_SCHED_NWG_SAG:-}" ] && AX_PREFILL="$AX_PREFILL -DPLOW_XR_SCHED_NWG_SAG=$PLOW_XR_SCHED_NWG_SAG"
+         ;;
   *) echo "FAIL: PLOW_XR_SCHED must be aiter or twoshot" >&2; exit 2 ;;
 esac
 
