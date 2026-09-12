@@ -122,6 +122,191 @@ extern "C" __global__ void tp_seams_timed(bf16* out, const void* const* peer_scr
     if (blockIdx.x == 0 && threadIdx.x == 0 && cycles) { cycles[0] = rs; cycles[1] = ag; }
 }
 
+/* ---- SEAMS-OVERLAP BOUNDING MICROBENCHES (tp_seams_overlap_bench.c) ------------------------
+ * Price the two ways past the capped seam collectives without touching a packet:
+ *   tp_push_rs      the reduce-scatter as a PUSH: every rank writes each band slice of its partial
+ *                   into the owner's receive region, then the owner sums recv[0..7] in rank order
+ *                   (the strict-order oracle's sum, one bf16 round);
+ *   tp_push_busy    the same push issued from an o_proj-shaped tile loop (an MFMA burst per 256x256
+ *                   tile, owner-interleaved tile order) against the same loop writing locally (today)
+ *                   and writing nothing (compute only);
+ *   tp_seams_banded op 26 split into K row bands, each with its own one-workgroup rendezvous;
+ *   tp_seams_corun  op 26 on its capped workgroups beside an MFMA + streaming consumer on the rest.
+ * ts[4*wg + {0..3}] = start, work done, rendezvous passed, end (s_memrealtime). */
+__device__ __forceinline__ uint64_t tp_now(void) { return __builtin_amdgcn_s_memrealtime(); }
+
+/* Every workgroup arrives (the two-shot's gate_ag arrival: system-scope release, device-local
+ * aggregation under PLOW_XR_AGG) and waits for nranks * nblk arrivals, then one system acquire. */
+__device__ __forceinline__ bool tp_push_gate(const void* const* peer_scratch, uint32_t nranks,
+                                             uint32_t rank, size_t xoff, uint32_t gate,
+                                             unsigned nblk, uint64_t deadline, uint32_t* status,
+                                             int* bailed) {
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        *bailed = 0;
+        xr2_arrive_ag(peer_scratch, nranks, rank, xoff, gate, nblk);
+        uint32_t* lg = PLOW_CTR((uint32_t*)((char*)peer_scratch[rank] + xoff), gate);
+        const uint64_t t0 = tp_now();
+        while (xctr_poll(lg) < nranks * nblk) {
+            if (tp_now() - t0 > deadline) {
+                if (status) *status = 0xDEAD0000u | rank;
+                *bailed = 1;
+                break;
+            }
+            __builtin_amdgcn_s_sleep(2);
+        }
+        if (!*bailed) xctr_acquire();
+    }
+    __syncthreads();
+    return !*bailed;
+}
+
+/* Strict-order local sum of this rank's band from recv[0..nranks-1], 16-byte packs. */
+__device__ __forceinline__ void tp_recv_sum(const bf16* recv, uint32_t nranks, uint32_t band,
+                                            bf16* out, unsigned slice, unsigned nblk) {
+    for (uint32_t e = (slice * PLOW_THREADS + threadIdx.x) * 8u; e < band;
+         e += nblk * PLOW_THREADS * 8u) {
+        float acc[8] = {};
+        for (uint32_t r = 0; r < nranks; r++) {
+            const bf16v8 v = ld_glob8(recv + (size_t)r * band + e);
+#pragma unroll
+            for (uint32_t k = 0; k < 8u; k++) acc[k] += bf2f(v[k]);
+        }
+        bf16v8 o;
+#pragma unroll
+        for (uint32_t k = 0; k < 8u; k++) o[k] = f2bf(acc[k]);
+        st_glob8(out + e, o);
+    }
+}
+
+/* part: local [n] partial; recv region at recv_off in every rank's peer scratch, [src][band].
+ * kpush workgroups push (wave w -> destination (w + rank) % 8, 16-byte stores); all workgroups
+ * take the rendezvous and the local sum. Needs nranks == 8 (one wave per destination). */
+extern "C" __global__ void tp_push_rs(const bf16* part, const void* const* peer_scratch,
+                                      uint32_t nranks, uint32_t rank, uint32_t n,
+                                      uint32_t recv_off, uint64_t xoff, uint32_t kpush, bf16* out,
+                                      uint64_t deadline, uint32_t* status, uint64_t* ts) {
+    __shared__ int bailed;
+    const unsigned slice = blockIdx.x, nblk = gridDim.x;
+    const uint64_t t0 = tp_now();
+    const uint32_t band = n / nranks;
+    if (slice < kpush) {
+        const uint32_t wave = threadIdx.x >> 6, lane = threadIdx.x & 63u;
+        const uint32_t d = (wave + rank) % nranks;
+        const bf16* src = part + (size_t)d * band;
+        bf16* dst = (bf16*)((char*)peer_scratch[d] + recv_off) + (size_t)rank * band;
+        for (uint32_t e = (slice * 64u + lane) * 8u; e < band; e += kpush * 64u * 8u)
+            st_glob8(dst + e, ld_glob8(src + e));
+    }
+    const uint64_t t1 = tp_now();
+    if (!tp_push_gate(peer_scratch, nranks, rank, (size_t)xoff, 0u, nblk, deadline, status, &bailed))
+        return;
+    const uint64_t t2 = tp_now();
+    tp_recv_sum((const bf16*)((const char*)peer_scratch[rank] + recv_off), nranks, band, out, slice,
+                nblk);
+    __syncthreads();
+    if (threadIdx.x == 0 && ts) {
+        ts[4 * slice] = t0; ts[4 * slice + 1] = t1; ts[4 * slice + 2] = t2; ts[4 * slice + 3] = tp_now();
+    }
+}
+
+/* o_proj-shaped producer: 256x256 output tiles (65536 elements), owner-interleaved tile order
+ * (tile t -> owner t % 8), `mfma_iters` 32x32 bf16 MFMAs per wave per tile, then the tile's
+ * epilogue: mode 0 stores it locally into cbuf (today's partial write), mode 1 pushes it into the
+ * owner's recv slot (then rendezvous + strict-order local sum into out), mode 2 stores nothing. */
+extern "C" __global__ void tp_push_busy(const bf16* part, const void* const* peer_scratch,
+                                        uint32_t nranks, uint32_t rank, uint32_t n,
+                                        uint32_t recv_off, uint64_t xoff, uint32_t mode,
+                                        uint32_t mfma_iters, bf16* cbuf, bf16* out,
+                                        uint64_t deadline, uint32_t* status, uint64_t* ts) {
+    __shared__ int bailed;
+    const unsigned slice = blockIdx.x, nblk = gridDim.x;
+    const uint64_t t0 = tp_now();
+    const uint32_t band = n / nranks;
+    const uint32_t tile = 65536u;
+    const uint32_t ntile = n / tile;
+    f32x16 acc = {};
+    for (uint32_t t = slice; t < ntile; t += nblk) {
+        const uint32_t owner = t % nranks, k = t / nranks;
+        const uint32_t base = owner * band + k * tile;
+        const bf16x8 a = __builtin_bit_cast(bf16x8, ld_glob8(part + base + (threadIdx.x & 63u) * 8u));
+        for (uint32_t i = 0; i < mfma_iters; i++) acc = plow_mfma_bf16_32x32(a, a, acc);
+        bf16* rdst = (bf16*)((char*)peer_scratch[owner] + recv_off) + (size_t)rank * band;
+        for (uint32_t pk = threadIdx.x; pk < tile / 8u; pk += PLOW_THREADS) {
+            const uint32_t e = base + pk * 8u;
+            const bf16v8 v = ld_glob8(part + e);
+            if (mode == 0u) st_glob8(cbuf + e, v);
+            else if (mode == 1u) st_glob8(rdst + (e - owner * band), v);
+        }
+    }
+    if (acc[0] == -1.2345e30f && status) *status = 0xACC00000u;
+    const uint64_t t1 = tp_now();
+    uint64_t t2 = t1;
+    if (mode == 1u) {
+        if (!tp_push_gate(peer_scratch, nranks, rank, (size_t)xoff, 0u, nblk, deadline, status,
+                          &bailed))
+            return;
+        t2 = tp_now();
+        tp_recv_sum((const bf16*)((const char*)peer_scratch[rank] + recv_off), nranks, band, out,
+                    slice, nblk);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0 && ts) {
+        ts[4 * slice] = t0; ts[4 * slice + 1] = t1; ts[4 * slice + 2] = t2; ts[4 * slice + 3] = tp_now();
+    }
+}
+
+/* op 26 in `kbands` row bands of n / kbands elements each (band-major layout: band j's slices are
+ * contiguous, so each band moves 7/8 of n / kbands per rank over all seven links), one
+ * one-workgroup rendezvous per band (gates 1..kbands). Workgroups past the object's seam cap idle. */
+extern "C" __global__ void tp_seams_banded(const void* const* peer_scratch, uint32_t nranks,
+                                           uint32_t rank, uint32_t n, uint32_t slot, uint64_t xoff,
+                                           uint32_t kbands, bf16* out, uint64_t deadline,
+                                           uint32_t* status, uint64_t* ts) {
+    const unsigned slice = blockIdx.x, nblk = gridDim.x;
+    const uint64_t t0 = tp_now();
+    const uint32_t nb = n / kbands;
+    for (uint32_t j = 0; j < kbands; j++)
+        d_xall_gather_mega(peer_scratch, nranks, rank, (size_t)xoff, 1u + j, deadline, status, slice,
+                           nblk, out + (size_t)j * nb, nb, slot + j * nb * 2u, nullptr, 0u, 0u,
+                           nullptr, 0u, 0u);
+    __syncthreads();
+    if (threadIdx.x == 0 && ts) {
+        const uint64_t t = tp_now();
+        ts[4 * slice] = t0; ts[4 * slice + 1] = t; ts[4 * slice + 2] = t; ts[4 * slice + 3] = t;
+    }
+}
+
+/* Workgroups [0, kag) run op 26 over [n] (mode 0 or 2); workgroups [kag, nblk) run a consumer
+ * (mode 1 or 2): a grid-stride stream over the local cbuf with `mfma_iters` MFMAs per 16-byte pack. */
+extern "C" __global__ void tp_seams_corun(const void* const* peer_scratch, uint32_t nranks,
+                                          uint32_t rank, uint32_t n, uint32_t slot, uint64_t xoff,
+                                          bf16* out, const bf16* cbuf, uint32_t cn,
+                                          uint32_t mfma_iters, uint32_t mode, uint32_t kag,
+                                          uint64_t deadline, uint32_t* status, uint64_t* ts) {
+    const unsigned slice = blockIdx.x, nblk = gridDim.x;
+    const uint64_t t0 = tp_now();
+    if (slice < kag) {
+        if (mode != 1u)
+            d_xall_gather_mega(peer_scratch, nranks, rank, (size_t)xoff, 1u, deadline, status, slice,
+                               kag, out, n, slot, nullptr, 0u, 0u, nullptr, 0u, 0u);
+    } else if (mode != 0u) {
+        const unsigned cs = slice - kag, cnb = nblk - kag;
+        f32x16 acc = {};
+        for (uint32_t e = (cs * PLOW_THREADS + threadIdx.x) * 8u; e < cn;
+             e += cnb * PLOW_THREADS * 8u) {
+            const bf16x8 a = __builtin_bit_cast(bf16x8, ld_glob8(cbuf + e));
+            for (uint32_t i = 0; i < mfma_iters; i++) acc = plow_mfma_bf16_32x32(a, a, acc);
+        }
+        if (acc[0] == -1.2345e30f && status) *status = 0xACC00000u;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0 && ts) {
+        const uint64_t t = tp_now();
+        ts[4 * slice] = t0; ts[4 * slice + 1] = t; ts[4 * slice + 2] = t; ts[4 * slice + 3] = t;
+    }
+}
+
 /* Sequence-parallel seam halves (ops 25/26), for tp_seqpar_smoke.c: the reduce-scatter with
  * the FFN-seam gather fold and the local band copy, then the all-gather of up to three
  * arrays. Same bodies the interpreter dispatches. */
