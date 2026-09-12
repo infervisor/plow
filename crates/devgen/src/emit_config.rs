@@ -801,6 +801,13 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_DECODE_GLUE_CUS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_decode_glue_cus: bool,
 
+    /// Emit the batched-decode native GEMMs that share an input next to each other: the shared
+    /// gate/up straight after the router GEMM (so top-k and Glu share one interpreter segment),
+    /// and on full-indexer layers the indexer k/weights projections next to q_a/kv_a/k_rope and
+    /// its q projection next to q_absorb/q_rope. Same instructions and dependencies, reordered.
+    #[arg(long, env = "PLOW_GLM_DECODE_GEMM_GROUP", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_decode_gemm_group: bool,
+
     /// Fuse the seam Residual+Norm into XReduceAddNorm (requires fuse_b1, tp>1).
     #[arg(long, env = "GLM_FUSE_XRN", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_fuse_xrn: bool,
@@ -1225,6 +1232,7 @@ impl EmitConfig {
             glm_seq_par: env_bool_opt("PLOW_GLM_SEQ_PAR"),
             glm_seq_par_proj: env_bool_opt("PLOW_GLM_SEQ_PAR_PROJ"),
             glm_decode_glue_cus: env_bool("PLOW_GLM_DECODE_GLUE_CUS"),
+            glm_decode_gemm_group: env_bool("PLOW_GLM_DECODE_GEMM_GROUP"),
             glm_fuse_xrn: env_bool("GLM_FUSE_XRN"),
             xr_combine_fold: env_opt_out("PLOW_XR_COMBINE_FOLD"),
             kda_fb_fold: env_bool("PLOW_KDA_FB_FOLD"),
