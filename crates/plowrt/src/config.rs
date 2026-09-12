@@ -1131,6 +1131,11 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-dump-act", env = "PLOW_DUMP_ACT", global = true)]
     pub dump_act: Option<String>,
 
+    /// Directory to write rank 0's slot-0 KV rows `[0, in.kvlen)` into after the TP
+    /// prefill/step, first and last layer (`AmdEngine::dump_slot_kv`). Diagnostic; unset = none.
+    #[arg(long = "amd-dump-kv", env = "PLOW_DUMP_KV", hide = true, global = true)]
+    pub dump_kv: Option<std::path::PathBuf>,
+
     /// Allocate each rank's kernarg ring and fine-grained host staging from the CPU agent nearest
     /// its GPU (`HSA_AMD_AGENT_INFO_NEAREST_CPU`) instead of the first CPU agent, so a GPU on the
     /// far socket reads its kernargs from local memory. `=0` = the single-agent placement. Read
