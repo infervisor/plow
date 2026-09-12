@@ -1070,13 +1070,17 @@ Three things are easily conflated:
    and the family objects must be present (`PLOW_PACKED_PREFILL_ROUTE`, automatic); the final
    chunk of every prompt and sparse (DSA) buckets stay isolated, so on a ladder whose widest
    packable rung is 2048 the pack only ever holds chunks of at most 2048 rows in total.
-3. **Mixed batching (prefill ⊕ decode in one launch)** — **not implemented**, and
-   not hidden behind a flag. A tick that does both runs two launches, each
-   re-reading the full weight set (~12 GiB fp8 on the 12B asset, ~9 ms). vLLM's
-   chunked prefill carries the decode rows in the same forward pass.
+3. **Mixed batching (prefill ⊕ decode in one launch)** — on AMD TP8 this is the opt-in
+   token-batch body (`PLOW_TOKEN_BATCH_TP=1`, bodies emitted at the prefill rungs): decode rows ride
+   as a band inside a prefill-rung body. By default a tick that does both runs the prefill chunk and
+   then a separate decode pass. Today only each request's final chunk can ride, because middle
+   chunks are planned whole at 8192 rows. The decode-row retirement bug is fixed (004d9bdf); the
+   route's full-model requalification: passed on the full model after the fix (positions chain step by step, 2 of 12 prompts loop against 4 of 12 on the ordinary route, retrieval 18/18 with bodies armed); still opt-in. vLLM's chunked prefill carries the decode rows
+   in the same forward pass on every step.
 
-The gap in (3) is bounded by one weight read per tick: ~12% of a tick at 2k
-prompts, but only **~0.6% at 127k**. A short-context / high-QPS lever, not a
-long-context one.
+The gap in (3) depends on the model. On the 12B asset it was bounded by one weight read per tick
+(~12% of a tick at 2k prompts, ~0.6% at 127k). On GLM-5.3 TP8 at C20 with ~70k prompts the separate
+decode pass costs ~95 ms per prefill tick, so decode rows riding inside every chunk would be worth
+~6% end to end (see the review log's roadmap and vLLM-parity entry).
 </content>
 </invoke>
