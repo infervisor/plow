@@ -276,6 +276,12 @@ if [ "${PLOW_BUILD_SEG:-0}" = "1" ]; then
   if [ "${PLOW_BUILD_GEMM_WS384:-0}" = "1" ]; then
     GEMM_ONLY_GATE="-DPLOW_NV_GEMM_ONLY=1 -DPGM90_UNI_BN256=1 -DPLOW_NV_SEG_WS384=1"
   fi
+  # Exact Gemma-4-12B M512 output/down projection object. BN128 exposes 120 tiles on
+  # H100 and the six-stage ring hides the long-K TMA latency; the consumers write BF16
+  # directly, so there is no split workspace or reduction launch.
+  if [ "${PLOW_BUILD_GEMM_M512_BF16:-0}" = "1" ]; then
+    GEMM_ONLY_GATE="-DPLOW_NV_GEMM_ONLY=1 -DPLOW_NV_TMA_GEMM=1 -DPGM90_UNI_BN256=1 -DPLOW_NV_SEG_WS384=1 -DPLOW_NV_SEG_M128N128=1 -DPGM90_WS384_BN=128 -DPGM90_UNI256_NS=6 -DPGM90_WS384_ISSUE_CURSOR=1 -DPGM90_WS384_PREFETCH=1"
+  fi
   if [ "${PLOW_BUILD_GEMM_SMALL_BF16:-0}" = "1" ]; then
     GEMM_ONLY_GATE="-DPLOW_NV_GEMM_ONLY=1 -DPLOW_NV_SEG_OCC1=1 -DPLOW_NV_TMA_GEMM=1 -DPLOW_NV_SEG_SMALL_BF16=1"
   fi

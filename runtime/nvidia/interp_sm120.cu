@@ -908,6 +908,12 @@ extern "C" __device__ unsigned PLOW_SYM(plow_block) = PLOW_NV_SEG_WS384 ? 384u :
 #endif
 extern "C" __device__ unsigned PLOW_SYM(plow_gemm_shape_abi) = PLOW_NV_SEG_M64N128 ? 3 : 2;
 #endif
+#if PLOW_NV_SEG_M128N128
+#if !defined(PLOW_NV_HOPPER) || !PLOW_NV_GEMM_ONLY || !PGM90_UNI_BN256 || !PLOW_NV_SEG_WS384 || PGM90_WS384_BN != 128 || PGM90_UNI256_NS != 6 || !PGM90_WS384_ISSUE_CURSOR || !PGM90_WS384_PREFETCH || PLOW_NV_W8A8 || PLOW_NV_SEG_SMALL_BF16 || PLOW_NV_SEG_M64N64 || PLOW_NV_SEG_M64N128
+#error "M128N128 segment requires the dedicated six-stage WS384 BF16 object"
+#endif
+extern "C" __device__ unsigned PLOW_SYM(plow_gemm_shape_abi) = 4;
+#endif
 #if PLOW_NV_SEG_SMALL_BF16
 #if !defined(PLOW_NV_HOPPER) || !PLOW_NV_GEMM_ONLY || !PLOW_NV_TMA_GEMM || !PLOW_NV_SEG_OCC1 || PGM90_UNI_BN256 || PLOW_NV_SEG_WS || PLOW_NV_SEG_WS384 || PLOW_NV_W8A8
 #error "small BF16 segment requires plain m128n128 TMA occ1"
@@ -2501,6 +2507,41 @@ __device__ __forceinline__ void plow_ws384_role_loop(const PlowProgram& prog, ui
 }
 #endif /* PLOW_NV_SEG_WS384 */
 
+#if PLOW_NV_SEG_M128N128
+template <bool PROD>
+__device__ __forceinline__ void plow_m128n128_direct_role(const PlowProgram& prog,
+                                                          unsigned gq_lo, unsigned gq_hi,
+                                                          float* arena) {
+    for (unsigned ix = gq_lo + blockIdx.x; ix < gq_hi; ix += gridDim.x) {
+        const PlowStreamEnt e = ld_stream_ent(prog.gq_stream + ix);
+        const PlowDevInst* in = prog.insts + e.inst;
+        if (e.flags & PLOW_SE_XCTR) {
+            if (threadIdx.x == 0) __trap();
+            return;
+        }
+        for (unsigned w = threadIdx.x; w < e.wait_len; w += blockDim.x) {
+            const PlowWait pw = prog.waits[e.wait_ofs + w];
+            while (ctr_poll(PLOW_CTR(prog.counters, pw.id)) < pw.threshold) {
+            }
+        }
+        __syncthreads();
+        if (!in->i[6] || !in->i[7]
+            || (in->op != PLOW_DOP_GEMM && in->op != PLOW_DOP_GEMM_MED
+                && in->op != PLOW_DOP_GEMM_SMALL)) {
+            if (threadIdx.x == 0) __trap();
+            return;
+        }
+        d_gemm_sm90_tma_ws384_role<PROD, false>(
+            (__nv_bfloat16*)prog.tensors[in->t[0]], prog.tensors[in->i[6]],
+            prog.tensors[in->i[7]], nullptr, nullptr, in->i[0], in->i[1], in->i[2], in->i[4],
+            e.slice, in->blocks, (__nv_bfloat16*)arena);
+        __syncthreads();
+        for (unsigned s = threadIdx.x; s < e.succ_len; s += blockDim.x)
+            ctr_signal(PLOW_CTR(prog.counters, prog.succs[e.succ_ofs + s]));
+    }
+}
+#endif
+
 #if PLOW_NV_GEMM_ONLY && PLOW_NV_SEG_WS_ENTRY
 /* ---- ONCE-per-launch warp-specialized role loop (PLOW_NV_SEG_WS_ENTRY, T11) -------------
  * The per-op setmaxnreg cycle deadlocks in-model (reproduced even with every non-GEMM arm
@@ -2752,7 +2793,16 @@ __global__ __launch_bounds__(PLOW_NV_THREADS, PLOW_NV_MINBLK) void PLOW_SYM(inte
     const unsigned gq_lo = prog.gq_seg_ofs[0];
     const unsigned gq_hi = prog.gq_seg_ofs[1];
 #endif
-#if PLOW_NV_SEG_WS384 || PLOW_NV_SEG_M64N64 || PLOW_NV_SEG_M64N128
+#if PLOW_NV_SEG_M128N128
+    if (threadIdx.x < 128) {
+        sm90_reg_dec(32);
+        plow_m128n128_direct_role<true>(prog, gq_lo, gq_hi, arena);
+    } else {
+        sm90_reg_inc(224);
+        plow_m128n128_direct_role<false>(prog, gq_lo, gq_hi, arena);
+    }
+    return;
+#elif PLOW_NV_SEG_WS384 || PLOW_NV_SEG_M64N64 || PLOW_NV_SEG_M64N128
     /* One register split for the complete launch; roles never rejoin the claim loop. */
     if (threadIdx.x < 128) {
         sm90_reg_dec(32);

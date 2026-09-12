@@ -6067,11 +6067,12 @@ impl GpuEngine {
                     let abi = be
                         .module_global_u32(&module, "plow_gemm_shape_abi_pfgemm")?
                         .unwrap_or(0);
-                    if !matches!(abi, 1 | 2 | 3)
-                        || be.module_global_u32(&module, "plow_block_pfgemm")? != Some(BLOCK)
+                    let block = be.module_global_u32(&module, "plow_block_pfgemm")?;
+                    if !matches!(abi, 1 | 2 | 3 | 4)
+                        || block != Some(if abi == 4 { 384 } else { BLOCK })
                     {
                         return Err(RuntimeError::Rejected(
-                            "small GEMM object requires native BF16 TMA ABI 1, 2 or 3 and 256 threads"
+                            "small GEMM object requires native BF16 TMA ABI 1-4 with its ABI block size"
                                 .into(),
                         ));
                     }
@@ -6098,7 +6099,7 @@ impl GpuEngine {
                         function,
                         smem,
                         grid,
-                        block: BLOCK,
+                        block: block.expect("validated small GEMM block"),
                         _module: module,
                     })
                 } else {

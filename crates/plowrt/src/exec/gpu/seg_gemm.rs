@@ -1,11 +1,11 @@
 use crate::{asset::devblob::DevProg, Result, RuntimeError};
 use packet::dev::{DevInst64, DevOp};
 
-fn compatible(inst: &DevInst64) -> bool {
+fn compatible(inst: &DevInst64, max_rows: u32) -> bool {
     [DevOp::Gemm, DevOp::GemmSmall, DevOp::GemmMed]
         .iter()
         .any(|op| inst.op == *op as u16)
-        && (2..=128).contains(&inst.i[0])
+        && (2..=max_rows).contains(&inst.i[0])
         && inst.i[1] > 0
         && inst.i[2] > 0
         && inst.i[2] % 8 == 0
@@ -16,7 +16,7 @@ fn compatible(inst: &DevInst64) -> bool {
 
 pub(super) fn small_gemm_segments(g: &DevProg, classes: &[u8], abi: u32) -> Result<Vec<bool>> {
     let reject = || RuntimeError::Rejected("invalid small-GEMM segment queue".into());
-    if !matches!(abi, 1 | 2 | 3)
+    if !matches!(abi, 1 | 2 | 3 | 4)
         || g.l2_domains != 0
         || g.gq_seg_ofs.len() != classes.len() + 1
         || g.gq_seg_ofs.first() != Some(&0)
@@ -42,7 +42,10 @@ pub(super) fn small_gemm_segments(g: &DevProg, classes: &[u8], abi: u32) -> Resu
         // Fine successors describe tile ownership; only complete coarse packets may change tiles.
         if entries
             .iter()
-            .any(|e| e.flags != 0 || !compatible(&g.insts[e.inst as usize]))
+            .any(|e| {
+                e.flags != 0
+                    || !compatible(&g.insts[e.inst as usize], if abi == 4 { 512 } else { 128 })
+            })
         {
             continue;
         }
@@ -50,15 +53,17 @@ pub(super) fn small_gemm_segments(g: &DevProg, classes: &[u8], abi: u32) -> Resu
         for entry in entries {
             slices.entry(entry.inst).or_default().push(entry.slice);
         }
-        if abi == 2 || abi == 3 {
+        if matches!(abi, 2 | 3 | 4) {
             let inst = &g.insts[entries[0].inst as usize];
             let shape = (inst.i[1], inst.i[2]);
             let shape_ok = match abi {
                 2 => matches!(shape, (3840, 4096 | 8192 | 15360)),
                 3 => matches!(shape, (5376, 8192 | 16384 | 21504)),
+                4 => matches!(shape, (3840, 8192 | 15360)),
                 _ => unreachable!(),
             };
-            if slices.len() != 1 || inst.i[0] != 128 || inst.i[4] != 0 || !shape_ok {
+            let rows = if abi == 4 { 512 } else { 128 };
+            if slices.len() != 1 || inst.i[0] != rows || inst.i[4] != 0 || !shape_ok {
                 continue;
             }
         }
@@ -179,7 +184,7 @@ mod tests {
         g.gq_seg_ofs[1] = 4;
         assert_eq!(small_gemm_segments(&g, &[8], 2).unwrap(), [false]);
         assert_eq!(small_gemm_segments(&g, &[8], 1).unwrap(), [true]);
-        assert!(small_gemm_segments(&g, &[8], 4).is_err());
+        assert!(small_gemm_segments(&g, &[8], 5).is_err());
     }
 
     #[test]
@@ -206,6 +211,23 @@ mod tests {
                 g.gq_stream[1].slice = 0;
                 assert_eq!(small_gemm_segments(&g, &[8], 3).unwrap(), [false]);
             }
+        }
+    }
+
+    #[test]
+    fn m128n128_requires_isolated_gemma12_m512_o_down() {
+        for (m, n, k, selected) in [
+            (512, 3840, 8192, true),
+            (512, 3840, 15360, true),
+            (256, 3840, 15360, false),
+            (512, 4096, 15360, false),
+            (512, 3840, 3840, false),
+        ] {
+            let mut g = fixture();
+            g.insts[0].i[0] = m;
+            g.insts[0].i[1] = n;
+            g.insts[0].i[2] = k;
+            assert_eq!(small_gemm_segments(&g, &[8], 4).unwrap(), [selected]);
         }
     }
 
