@@ -1278,4 +1278,27 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void index
                             red);
 }
 
+#if PLOW_DSA_SELECT_SPLIT
+/* The batched decode selection as interp.hip dispatches op 59, blockIdx.x standing in for
+ * `slice`: the local form (i[4]=1, one workgroup per row) and the split form (i[4]=2, `g`
+ * workgroups per row). `runtime/bench/interp/dsa_select_split_test.c` checks one against the
+ * other and against a host top-k. */
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void index_select_rows_local_k(
+    int* idx, const float* Score, const int* kv_len, unsigned len_max, unsigned top_k) {
+    __shared__ unsigned lh[SEL_NB];
+    __shared__ unsigned red[4];
+    const unsigned row = blockIdx.x;
+    d_index_select_pf<true>(idx + (size_t)row * top_k, Score + (size_t)row * len_max, kv_len + row,
+                            1, top_k, len_max, 0, 1, lh, red);
+}
+
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void index_select_rows_split_k(
+    int* idx, const float* Score, const int* kv_len, unsigned len_max, unsigned top_k,
+    unsigned* gHist, unsigned* gCtl, unsigned g) {
+    __shared__ unsigned lh[SEL_NB];
+    __shared__ unsigned red[4];
+    d_index_select_split(idx, Score, kv_len, len_max, top_k, gHist, gCtl, g, blockIdx.x, lh, red);
+}
+#endif
+
 #endif /* !PLOW_TK_SAFE_ONLY */

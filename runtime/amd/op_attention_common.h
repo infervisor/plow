@@ -5653,6 +5653,37 @@ __device__ void d_index_select_pf(int* __restrict__ idx, const float* __restrict
     }
 }
 
+#ifndef PLOW_DSA_SELECT_SPLIT
+#define PLOW_DSA_SELECT_SPLIT 0
+#endif
+#if PLOW_DSA_SELECT_SPLIT
+/* Batched decode selection with `g` workgroups per row (op 59, i[4]=2; PLOW_DSA_SELECT_SPLIT).
+ * The local form (i[4]=1) gives each row one workgroup, which scans the row's scores once per
+ * radix pass. Here the row's `g` workgroups run d_index_select_coop over it together, on the
+ * row's own histogram strip ([SEL_NPASS][SEL_NB] u32) and control strip (SEL_SPLIT_CTL u32, zero
+ * on first entry and left clean), grid-syncing only inside the row's group. The packed key is the
+ * local form's (dsa_pack_key_a over the row's live length), so the selected SET is identical; a row
+ * with len <= top_k writes the local form's identity + -1 pad. `slice` spans [0, rows*g) and every
+ * slice is its own interpreter workgroup, so a row's group is co-resident. */
+#define SEL_SPLIT_CTL 16u /* ctl[0..3) used; padded so rows do not share a line */
+__device__ void d_index_select_split(int* __restrict__ idx, const float* __restrict__ Score,
+                                     const int* __restrict__ kv_len, unsigned len_max,
+                                     unsigned top_k, unsigned* __restrict__ gHist,
+                                     unsigned* __restrict__ gCtl, unsigned g, unsigned slice,
+                                     unsigned* lh, unsigned* red) {
+    const unsigned row = slice / g, part = slice - row * g;
+    const unsigned len = (unsigned)as_glob(kv_len)[row];
+    if (len <= top_k) {
+        int* const ib = as_glob(idx) + (size_t)row * top_k;
+        for (unsigned s = part * PLOW_THREADS + threadIdx.x; s < top_k; s += g * PLOW_THREADS)
+            st_act<int>(&ib[s], s < len ? (int)s : -1);
+        return;
+    }
+    d_index_select_coop(idx, Score, len_max, top_k, gHist + (size_t)row * SEL_NPASS * SEL_NB,
+                        gCtl + (size_t)row * SEL_SPLIT_CTL, part, g, lh, red, kv_len, 1u, row);
+}
+#endif
+
 /* op 119: per-64-query-tile UNION build. Scatters the tile's 64 selected-index rows into a
  * u64 membership word per kv position (bit q = local query q selected this position), then
  * compacts positions ASCENDING into the union table the gathered flash walks:

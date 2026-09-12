@@ -2189,6 +2189,13 @@ pub(crate) fn declare_glm_rows_batched(
     // consumes it: the wq_b/wk/k_norm/weights_proj weights, the per-layer key cache, and the
     // identity-tail RoPE tables.
     let idx_on = dsa || c.dsa_pf();
+    // PLOW_GLM_SELECT_SPLIT runs every decode row's radix at once, so each row gets its own
+    // histogram and control strip; otherwise the one strip the serialized chain shares.
+    let sel_rows = if dsa && dbatch > 1 && glm_select_split_on() {
+        dbatch as usize
+    } else {
+        1
+    };
     let (qidx, kidx_raw, kidx_normed, widx, iscore, iidx, ighist, igctl) = if dsa {
         (
             ac(b, "qidx", dbatch as u64 * (hi * di) as u64 * BF16),
@@ -2201,8 +2208,11 @@ pub(crate) fn declare_glm_rows_batched(
             // index_kpool==1 (`c.index_kpool.max(1) - 1 == 0`), so GLM-5.2's `iidx` byte size
             // is unchanged.
             ac(b, "iidx", dbatch as u64 * select_width as u64 * I32),
-            b.tensor_init("act.ighist", vec![0u8; 7 * 256 * 4]),
-            b.tensor_init("act.igctl", vec![0u8; 3 * 4]),
+            b.tensor_init("act.ighist", vec![0u8; sel_rows * 7 * 256 * 4]),
+            b.tensor_init(
+                "act.igctl",
+                vec![0u8; if sel_rows > 1 { sel_rows * GLM_SELECT_SPLIT_CTL * 4 } else { 3 * 4 }],
+            ),
         )
     } else {
         (
@@ -4498,11 +4508,58 @@ fn emit_glm_dsa_decode_select(
                 d.i[2] = ctx;
                 d.f[0] = (di as f32).powf(-0.5) * (hi as f32).powf(-0.5);
             });
-            emit_glm_dsa_select_rows(b, c, n, ctx, rows, itk, c_sc)
+            match emit_config::active().glm_select_split() {
+                Some(g) if glm_select_split_on() && rows > 1 => {
+                    emit_glm_dsa_select_split(b, c, n, ctx, rows, itk, c_sc, g)
+                }
+                _ => emit_glm_dsa_select_rows(b, c, n, ctx, rows, itk, c_sc),
+            }
         }
     } else {
         0
     }
+}
+
+/// u32 per decode row in the split selection's control strip (`SEL_SPLIT_CTL`,
+/// runtime/amd/op_attention_common.h): three used, padded so rows do not share a line.
+const GLM_SELECT_SPLIT_CTL: usize = 16;
+
+fn glm_select_split_on() -> bool {
+    let cfg = emit_config::active();
+    cfg.glm_select_local() && cfg.glm_select_split().is_some()
+}
+
+/// `PLOW_GLM_SELECT_SPLIT`: the batched decode selection with `g` workgroups per row (op 59
+/// `i[4] = 2`, `i[5] = g`, capped so `rows * g` fits the machine). Each row runs the cooperative
+/// radix over its own `ighist`/`igctl` strip; the key is the local form's, so the set is the same.
+/// Decode rungs only: the token-batch band keeps `emit_glm_dsa_select_rows`.
+#[allow(clippy::too_many_arguments)]
+fn emit_glm_dsa_select_split(
+    b: &mut Builder,
+    c: &GlmCfg,
+    n: &GlmTn,
+    ctx: u32,
+    rows: u32,
+    itk: u32,
+    c_sc: u32,
+    g: u32,
+) -> u32 {
+    assert!(
+        c.tp == 8 && b.n_cu() == 304 && matches!(rows, 2 | 4 | 8 | 16 | 20),
+        "split GLM decode selection requires gfx942 TP8 with 2/4/8/16/20 rows"
+    );
+    let g = g.min(b.n_cu() / rows);
+    b.emit(DevOp::IndexSelect, (0..rows * g).collect(), &[c_sc], |d| {
+        d.t[0] = n.iidx;
+        d.t[1] = n.iscore;
+        d.t[2] = n.ighist;
+        d.t[3] = n.igctl;
+        d.t[4] = n.kvlen;
+        d.i[0] = ctx;
+        d.i[1] = itk;
+        d.i[4] = 2;
+        d.i[5] = g;
+    })
 }
 
 /// The DSA top-k SELECT over `rows` scored rows -> `n.iidx`, shared by the decode chain and the

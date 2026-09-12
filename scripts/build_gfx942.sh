@@ -264,6 +264,7 @@ if [ -n "${PLOW_HSACO_CONFIG:-}" ]; then
       PLOW_MOE_PF_ATOMIC)    [ "$val" = 1 ] && : "${PLOW_MOE_PF_ATOMIC:=1}" ;;
       PLOW_MOE_PF_DET)       [ "$val" = 1 ] && : "${PLOW_MOE_PF_DET:=1}" ;;
       PLOW_GLM_FUSE_QNORM)   [ "$val" = 1 ] && : "${PLOW_GLM_FUSE_QNORM:=1}" ;;
+      PLOW_DSA_SELECT_SPLIT) [ "$val" = 1 ] && : "${PLOW_DSA_SELECT_SPLIT:=1}" ;;
       PLOW_WG_WAVES|PLOW_BUCKET_DECODE|PLOW_FP8|PLOW_FP8_KV|PLOW_MXFP4|PLOW_W8A8|PLOW_MLA_PREFILL|PLOW_MOE_PREFILL|PLOW_MOE_PF_A4W4|PLOW_K3|PLOW_MLA_PREFILL_FP8_SPLIT) ;;
       *) cfg_unmapped="$cfg_unmapped $tok" ;;
     esac
@@ -700,6 +701,17 @@ fi
 if [ "${PLOW_GLM_FUSE_QNORM:-1}" = 1 ]; then
   AX_DECODE="$AX_DECODE -DPLOW_GLM_FUSE_QNORM=1"
 fi
+
+# OPT-IN (PLOW_DSA_SELECT_SPLIT=1): the split-row batched decode selection (op 59 i[4]=2,
+# op_attention_common.h d_index_select_split), emitted by PLOW_GLM_SELECT_SPLIT. A packet that
+# carries it requires the arm (set here from its `requires`), and plowrt refuses it on an object
+# without `plow_dsa_select_split_arm`. The selection runs inside the decode MLA segment, so the
+# FLASH rows get it too. Default OFF: the shipped objects are byte-unchanged.
+case "${PLOW_DSA_SELECT_SPLIT:-0}" in
+  0) ;;
+  1) AX_DECODE="$AX_DECODE -DPLOW_DSA_SELECT_SPLIT=1"; AX_FLASH="$AX_FLASH -DPLOW_DSA_SELECT_SPLIT=1" ;;
+  *) echo "FAIL: PLOW_DSA_SELECT_SPLIT must be 0 or 1" >&2; exit 2 ;;
+esac
 
 # OPT-IN (PLOW_L2HIER_PF=1): L2-DOMAIN DISPATCH ON THE PREFILL ROWS, for blobs emitted with
 # PLOW_L2_PLACE_PREFILL=1 (which is NOT the AMD default -- see crates/devgen/src/lib.rs).

@@ -3238,6 +3238,74 @@ fn sparse_fp8_rejects_stale_objects_and_invalid_handles() {
 }
 
 #[test]
+fn split_dsa_selection_checks_groups_operands_and_object() {
+    fn ok(p: &DevProg, t: &[crate::asset::devblob::DevTensor]) -> bool {
+        check_dsa_select_local(std::slice::from_ref(p), t, "gfx942", true).is_ok()
+    }
+    let mut prog = segmented_prog(&[DevOp::IndexSelect], &[0]);
+    prog.t = 20;
+    prog.role = packet::devbuild::ProgramRole::DecodeRung { rows: 20 };
+    prog.insts[0].blocks = 300;
+    prog.insts[0].t = [0, 1, 3, 4, 2, 65535, 65535, 65535];
+    prog.insts[0].i = [81920, 2048, 0, 0, 2, 15, 0, 0];
+    let mut tensors: Vec<_> = [
+        20 * 2048 * 4,
+        20 * 81920 * 4,
+        20 * 4,
+        20 * 7 * 256 * 4,
+        20 * 16 * 4,
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(i, bytes)| crate::asset::devblob::DevTensor {
+        name: format!("act.{i}"),
+        bytes,
+        init: None,
+    })
+    .collect();
+    assert!(ok(&prog, &tensors));
+    // The block count is rows * g, exactly.
+    for (blocks, g) in [(299, 15), (300, 14), (20, 1), (0, 0)] {
+        prog.insts[0].blocks = blocks;
+        prog.insts[0].i[5] = g;
+        assert_eq!(ok(&prog, &tensors), blocks == 20 && g == 1);
+    }
+    prog.insts[0].blocks = 300;
+    prog.insts[0].i[5] = 15;
+    // Every operand, strips included, covers all rows; the strips are their own tensors.
+    for operand in 0..5 {
+        tensors[operand].bytes -= 1;
+        assert!(!ok(&prog, &tensors));
+        tensors[operand].bytes += 1;
+    }
+    prog.insts[0].t[3] = 3;
+    assert!(!ok(&prog, &tensors));
+    prog.insts[0].t[3] = 4;
+    // Decode rungs only.
+    prog.role = packet::devbuild::ProgramRole::PrefillBucket { rows: 20 };
+    assert!(!ok(&prog, &tensors));
+    prog.role = packet::devbuild::ProgramRole::DecodeRung { rows: 20 };
+    let requires = packet_decode_arm_requirements(std::slice::from_ref(&prog));
+    assert_eq!(requires, ["PLOW_DSA_SELECT_SPLIT=1"]);
+    assert!(check_decode_object(
+        &["plow_dsa_select_local_arm"],
+        Path::new("old"),
+        &requires,
+        false,
+        false
+    )
+    .is_err());
+    assert!(check_decode_object(
+        &["plow_dsa_select_split_arm"],
+        Path::new("new"),
+        &requires,
+        false,
+        false
+    )
+    .is_ok());
+}
+
+#[test]
 fn local_dsa_selection_checks_rows_operands_and_object() {
     let mut prog = segmented_prog(&[DevOp::IndexSelect], &[0]);
     prog.t = 8;
