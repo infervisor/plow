@@ -6652,12 +6652,7 @@ impl AmdEngine {
         if use_gemm_lt
             && (arch != "gfx942"
                 || tp.is_none_or(|b| b.n_gpu != 8)
-                || blob.progs.iter().any(|p| {
-                    p.insts.iter().any(|d| {
-                        d.op == DevOp::GemmLtPf as u16
-                            && d.i[3] != u32::from(p.role.is_decode_rung())
-                    })
-                }))
+                || !blob.progs.iter().all(amd_gemm_lt::modes_match))
         {
             return Err(RuntimeError::Device(
                 "hipBLASLt projection requires gfx942 TP8 and a matching prefill/decode mode"

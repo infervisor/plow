@@ -1856,7 +1856,8 @@ pub enum DevOp {
     /// Requires an isolated native segment and three consecutive system-scope arrival gates.
     IndexTpPf = 157,
     /// Native gfx942 BF16 projection using qualified hipBLASLt assembly.
-    /// `t0=out t1=x t2=weight` · `i0=T i1=N i2=K i3=decode`. Requires an isolated native segment.
+    /// `t0=out t1=x t2=weight` · `i0=T i1=N i2=K i3=mode` (0 prefill rows, 1 decode rung, 2 the
+    /// sequence-parallel band's fixed `i0=T/tp` rows). Requires an isolated native segment.
     GemmLtPf = 158,
     /// Native gfx942 W8A8 block-scale FP8 projection using AITER's pre-shuffled assembly.
     /// `t0=out t1=x t2=weight t3=w_scale t4=xq t5=x_scale t6=bias` · `i0=T i1=N i2=K i3=quantize`.

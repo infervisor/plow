@@ -1779,6 +1779,11 @@ fn amd_bench_tp(
                 }
             }
         }
+        if let Some(dir) = plowrt::config::RuntimeConfig::get().amd.dump_kv.as_ref() {
+            let mut len = [0u8; 4];
+            g.rank(0).read_tensor("in.kvlen", &mut len)?;
+            g.rank(0).dump_slot_kv(dir, tag, 0, u32::from_le_bytes(len))?;
+        }
         let Some(dir) = &dump_logits else {
             return Ok(());
         };

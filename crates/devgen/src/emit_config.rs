@@ -678,6 +678,14 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_GEMM_BLK")]
     pub glm_gemm_blk: Option<String>,
 
+    /// Widen `--glm-gemm-lt` to prefill GEMMs it leaves on interpreter tiles: `1` = all, or a
+    /// comma list of `o_proj`, `shared` (shared expert gate, up and down; the GLU becomes its own
+    /// op), `router` (the band router score) and `band` (the sequence-parallel band's q_a, kv_a,
+    /// k_rope and indexer k/weights at `t/8` rows). Same pinned object. Inert without
+    /// `--glm-gemm-lt`.
+    #[arg(long, env = "PLOW_GLM_GEMM_LT_PF_EXT")]
+    pub glm_gemm_lt_pf_ext: Option<String>,
+
     /// Cap the dispatch width of every blocked GEMV. Unset ⇒ byte-identical.
     #[arg(long, env = "PLOW_GLM_GEMV_WG")]
     pub glm_gemv_wg: Option<u32>,
@@ -1199,6 +1207,7 @@ impl EmitConfig {
             glm_gemm_lt_decode_ext: env_bool_opt("PLOW_GLM_GEMM_LT_DECODE_EXT"),
             glm_fold_lt: env_bool_opt("PLOW_GLM_FOLD_LT"),
             glm_gemm_blk: env_str("PLOW_GLM_GEMM_BLK"),
+            glm_gemm_lt_pf_ext: env_str("PLOW_GLM_GEMM_LT_PF_EXT"),
             glm_gemv_wg: env_u32("PLOW_GLM_GEMV_WG"),
             glm_ofold: env_bool("PLOW_GLM_OFOLD"),
             glm_pf_ns: env_u32("PLOW_GLM_PF_NS"),
