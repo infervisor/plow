@@ -5657,30 +5657,256 @@ __device__ void d_index_select_pf(int* __restrict__ idx, const float* __restrict
 #define PLOW_DSA_SELECT_SPLIT 0
 #endif
 #if PLOW_DSA_SELECT_SPLIT
-/* Batched decode selection with `g` workgroups per row (op 59, i[4]=2; PLOW_DSA_SELECT_SPLIT).
- * The local form (i[4]=1) gives each row one workgroup, which scans the row's scores once per
- * radix pass. Here the row's `g` workgroups run d_index_select_coop over it together, on the
- * row's own histogram strip ([SEL_NPASS][SEL_NB] u32) and control strip (SEL_SPLIT_CTL u32, zero
- * on first entry and left clean), grid-syncing only inside the row's group. The packed key is the
- * local form's (dsa_pack_key_a over the row's live length), so the selected SET is identical; a row
- * with len <= top_k writes the local form's identity + -1 pad. `slice` spans [0, rows*g) and every
- * slice is its own interpreter workgroup, so a row's group is co-resident. */
-#define SEL_SPLIT_CTL 16u /* ctl[0..3) used; padded so rows do not share a line */
-__device__ void d_index_select_split(int* __restrict__ idx, const float* __restrict__ Score,
-                                     const int* __restrict__ kv_len, unsigned len_max,
-                                     unsigned top_k, unsigned* __restrict__ gHist,
-                                     unsigned* __restrict__ gCtl, unsigned g, unsigned slice,
-                                     unsigned* lh, unsigned* red) {
-    const unsigned row = slice / g, part = slice - row * g;
+/* Batched decode selection with `g` workgroups per row, in three GATED packets (op 59 i[4]=2,
+ * i[5]=g, i[6]=phase; PLOW_DSA_SELECT_SPLIT). No workgroup waits on another inside a packet: the
+ * global queue's progress argument (interp.hip, the claim loop) covers only packets that finish on
+ * their own, so every cross-workgroup ordering here is the gate between two packets.
+ *   phase 1 (rows*g): histogram of the top SEL_SPLIT_BITS key bits over the slice's chunk, added
+ *                     into the row's strip.
+ *   phase 2 (rows*g): from the row histogram, the boundary bin B (the keys above it number
+ *                     `above` < top_k <= above + |B|); write the chunk's words of the row's position
+ *                     bitmap (bit = key above B) and append the chunk's bin-B keys to the row's
+ *                     candidate list.
+ *   phase 3 (rows)  : the top (top_k - above) candidates by key join the bitmap, which is compacted
+ *                     into ascending positions; the histogram and counters are left zero.
+ * The key is the local form's (dsa_pack_key_a over the row's live length), so the selected SET is
+ * the same, and the list is in ascending position order whatever the scheduling. A row with
+ * len <= top_k gets the local form's identity + -1 pad (phase 3; phases 1-2 skip it).
+ * Per-row strips: hist [SEL_SPLIT_NB] u32; ctl [SEL_SPLIT_CTL] u32 (4 candidate count, 5 above,
+ * 6 B; words 0-2 belong to the serialized cooperative form); bitmap ceil(len_max/32) u32;
+ * candidates len_max u64. LDS: SEL_SPLIT_LDS u32. */
+#define SEL_SPLIT_BITS 12u
+#define SEL_SPLIT_NB (1u << SEL_SPLIT_BITS)
+#define SEL_SPLIT_SHIFT (56u - SEL_SPLIT_BITS)
+#define SEL_SPLIT_CTL 16u
+#define SEL_SPLIT_LDS (SEL_SPLIT_NB + 16u + 8u)
+
+/* A slice's chunk of the row, 32-position aligned so each chunk owns whole bitmap words. */
+__device__ __forceinline__ void sel_split_chunk(unsigned len, unsigned g, unsigned part,
+                                                unsigned* lo, unsigned* hi) {
+    const unsigned per = ((len + g - 1u) / g + 31u) & ~31u;
+    const unsigned a = part * per;
+    *lo = a < len ? a : len;
+    *hi = a + per < len ? a + per : len;
+}
+
+/* Written by atomics in an earlier packet: read at the coherence point. */
+__device__ __forceinline__ unsigned sel_split_ld(const unsigned* p) {
+    return __hip_atomic_load(const_cast<unsigned*>(p), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+}
+
+/* Exclusive prefix of `v` over the workgroup in thread order; `ws` holds PLOW_THREADS/64 + 1 u32. */
+__device__ __forceinline__ unsigned sel_split_block_excl(unsigned v, unsigned* ws) {
+    const unsigned tid = threadIdx.x, lane = tid & 63u, w = tid >> 6;
+    unsigned incl = v;
+    for (unsigned d = 1u; d < 64u; d <<= 1) {
+        const unsigned y = __shfl_up(incl, d, 64);
+        if (lane >= d) incl += y;
+    }
+    if (lane == 63u) ws[w] = incl;
+    __syncthreads();
+    if (tid == 0u) {
+        unsigned acc = 0u;
+        for (unsigned i = 0u; i < PLOW_THREADS / 64u; i++) {
+            const unsigned x = ws[i];
+            ws[i] = acc;
+            acc += x;
+        }
+    }
+    __syncthreads();
+    const unsigned ex = ws[w] + incl - v;
+    __syncthreads();
+    return ex;
+}
+
+__device__ void d_index_select_split_hist(const float* __restrict__ Score,
+                                          const int* __restrict__ kv_len, unsigned len_max,
+                                          unsigned top_k, unsigned* __restrict__ gHist, unsigned g,
+                                          unsigned slice, unsigned* lh) {
+    const unsigned row = slice / g, part = slice - row * g, tid = threadIdx.x;
     const unsigned len = (unsigned)as_glob(kv_len)[row];
+    if (len <= top_k) return;
+    unsigned lo, hi;
+    sel_split_chunk(len, g, part, &lo, &hi);
+    for (unsigned i = tid; i < SEL_SPLIT_NB; i += PLOW_THREADS) lh[i] = 0u;
+    __syncthreads();
+    const float* const sr = as_glob(Score) + (size_t)row * len_max;
+    unsigned s = lo + tid;
+    for (; s + 3u * PLOW_THREADS < hi; s += 4u * PLOW_THREADS) {
+        float v[4];
+#pragma unroll
+        for (int u = 0; u < 4; u++) v[u] = sr[s + (unsigned)u * PLOW_THREADS];
+#pragma unroll
+        for (int u = 0; u < 4; u++)
+            atomicAdd(&lh[(unsigned)(dsa_pack_key_a(v[u], s + (unsigned)u * PLOW_THREADS, len) >>
+                                     SEL_SPLIT_SHIFT)],
+                      1u);
+    }
+    for (; s < hi; s += PLOW_THREADS)
+        atomicAdd(&lh[(unsigned)(dsa_pack_key_a(sr[s], s, len) >> SEL_SPLIT_SHIFT)], 1u);
+    __syncthreads();
+    unsigned* const h = as_glob(gHist) + (size_t)row * SEL_SPLIT_NB;
+    for (unsigned i = tid; i < SEL_SPLIT_NB; i += PLOW_THREADS)
+        if (lh[i]) atomicAdd(&h[i], lh[i]);
+}
+
+__device__ void d_index_select_split_mark(const float* __restrict__ Score,
+                                          const int* __restrict__ kv_len, unsigned len_max,
+                                          unsigned top_k, const unsigned* __restrict__ gHist,
+                                          unsigned* __restrict__ gCtl, unsigned* __restrict__ gBits,
+                                          unsigned long long* __restrict__ gCand, unsigned g,
+                                          unsigned slice, unsigned* lh) {
+    const unsigned row = slice / g, part = slice - row * g, tid = threadIdx.x;
+    const unsigned len = (unsigned)as_glob(kv_len)[row];
+    if (len <= top_k) return;
+    unsigned* const ws = lh + SEL_SPLIT_NB;
+    unsigned* const red = ws + 16u;
+    /* Thread t owns the t-th block of bins counted down from the top. */
+    const unsigned per = SEL_SPLIT_NB / PLOW_THREADS;
+    const unsigned top = SEL_SPLIT_NB - tid * per;
+    const unsigned* const h = as_glob(gHist) + (size_t)row * SEL_SPLIT_NB;
+    unsigned mine = 0u;
+    for (unsigned j = 1u; j <= per; j++) {
+        const unsigned v = sel_split_ld(&h[top - j]);
+        lh[top - j] = v;
+        mine += v;
+    }
+    const unsigned above_me = sel_split_block_excl(mine, ws);
+    if (above_me < top_k && above_me + mine >= top_k) {
+        unsigned acc = above_me;
+        for (unsigned j = 1u; j <= per; j++) {
+            const unsigned v = lh[top - j];
+            if (acc + v >= top_k) {
+                red[0] = top - j;
+                red[1] = acc;
+                break;
+            }
+            acc += v;
+        }
+    }
+    __syncthreads();
+    const unsigned B = red[0], above = red[1];
+    unsigned* const ctl = as_glob(gCtl) + (size_t)row * SEL_SPLIT_CTL;
+    if (part == 0u && tid == 0u) {
+        ctl[5] = above;
+        ctl[6] = B;
+    }
+    __syncthreads();
+    unsigned lo, hi;
+    sel_split_chunk(len, g, part, &lo, &hi);
+    const unsigned nw = (hi - lo + 31u) >> 5;
+    for (unsigned i = tid; i < nw; i += PLOW_THREADS) lh[i] = 0u;
+    __syncthreads();
+    const float* const sr = as_glob(Score) + (size_t)row * len_max;
+    unsigned long long* const cand = as_glob(gCand) + (size_t)row * len_max;
+    for (unsigned s = lo + tid; s < hi; s += PLOW_THREADS) {
+        const unsigned long long key = dsa_pack_key_a(sr[s], s, len);
+        const unsigned p = (unsigned)(key >> SEL_SPLIT_SHIFT);
+        if (p > B) {
+            atomicOr(&lh[(s - lo) >> 5], 1u << (s & 31u));
+        } else if (p == B) {
+            cand[atomicAdd(&ctl[4], 1u)] = key;
+        }
+    }
+    __syncthreads();
+    unsigned* const bits = as_glob(gBits) + (size_t)row * ((len_max + 31u) >> 5) + (lo >> 5);
+    for (unsigned i = tid; i < nw; i += PLOW_THREADS) bits[i] = lh[i];
+}
+
+__device__ void d_index_select_split_emit(int* __restrict__ idx, const int* __restrict__ kv_len,
+                                          unsigned len_max, unsigned top_k,
+                                          unsigned* __restrict__ gHist, unsigned* __restrict__ gCtl,
+                                          const unsigned* __restrict__ gBits,
+                                          const unsigned long long* __restrict__ gCand,
+                                          unsigned row, unsigned* lh) {
+    const unsigned tid = threadIdx.x;
+    const unsigned len = (unsigned)as_glob(kv_len)[row];
+    int* const ib = as_glob(idx) + (size_t)row * top_k;
     if (len <= top_k) {
-        int* const ib = as_glob(idx) + (size_t)row * top_k;
-        for (unsigned s = part * PLOW_THREADS + threadIdx.x; s < top_k; s += g * PLOW_THREADS)
+        for (unsigned s = tid; s < top_k; s += PLOW_THREADS)
             st_act<int>(&ib[s], s < len ? (int)s : -1);
         return;
     }
-    d_index_select_coop(idx, Score, len_max, top_k, gHist + (size_t)row * SEL_NPASS * SEL_NB,
-                        gCtl + (size_t)row * SEL_SPLIT_CTL, part, g, lh, red, kv_len, 1u, row);
+    unsigned* const ctl = as_glob(gCtl) + (size_t)row * SEL_SPLIT_CTL;
+    unsigned* const ws = lh + SEL_SPLIT_NB;
+    unsigned* const red = ws + 16u;
+    const unsigned nc = sel_split_ld(&ctl[4]), above = ctl[5], B = ctl[6];
+    const unsigned long long* const cand = as_glob(gCand) + (size_t)row * len_max;
+    unsigned* const hb = lh;        /* [256] radix bins */
+    unsigned* const wl = lh + 256u; /* the row's bitmap words */
+    const unsigned nw = (len + 31u) >> 5;
+    const unsigned* const bits = as_glob(gBits) + (size_t)row * ((len_max + 31u) >> 5);
+    for (unsigned i = tid; i < nw; i += PLOW_THREADS) wl[i] = bits[i];
+    /* Top k_rem of the candidates by key; they all share key bits 55..44 (= B). */
+    unsigned k_rem = top_k - above;
+    unsigned long long prefix = (unsigned long long)B << SEL_SPLIT_SHIFT;
+    unsigned long long himask = (unsigned long long)(SEL_SPLIT_NB - 1u) << SEL_SPLIT_SHIFT;
+    for (unsigned pass = 0u; pass < 6u; pass++) {
+        const unsigned sh = pass < 5u ? 36u - 8u * pass : 0u;
+        const unsigned nb = pass < 5u ? 256u : 16u;
+        for (unsigned i = tid; i < 256u; i += PLOW_THREADS) hb[i] = 0u;
+        __syncthreads();
+        for (unsigned i = tid; i < nc; i += PLOW_THREADS) {
+            const unsigned long long k = cand[i];
+            if ((k & himask) == prefix) atomicAdd(&hb[(unsigned)(k >> sh) & (nb - 1u)], 1u);
+        }
+        __syncthreads();
+        if (tid == 0u) {
+            unsigned acc = 0u, dsel = 0u, bnd = 0u;
+            for (int d = (int)nb - 1; d >= 0; d--) {
+                const unsigned hd = hb[d];
+                if (acc + hd >= k_rem) {
+                    dsel = (unsigned)d;
+                    bnd = hd;
+                    break;
+                }
+                acc += hd;
+            }
+            red[0] = dsel;
+            red[1] = acc;
+            red[2] = bnd;
+        }
+        __syncthreads();
+        prefix |= (unsigned long long)red[0] << sh;
+        himask |= (unsigned long long)(nb - 1u) << sh;
+        k_rem -= red[1];
+        const unsigned bnd = red[2];
+        __syncthreads();
+        /* The whole boundary group is needed: more digits cannot change the set. */
+        if (bnd == k_rem) break;
+    }
+    for (unsigned i = tid; i < nc; i += PLOW_THREADS) {
+        const unsigned long long k = cand[i];
+        if ((k & himask) >= prefix) {
+            const unsigned pos = len - 1u - (unsigned)(k & 0xFFFFFFull);
+            atomicOr(&wl[pos >> 5], 1u << (pos & 31u));
+        }
+    }
+    __syncthreads();
+    /* Compact into ascending positions: thread t owns a contiguous run of words. */
+    const unsigned wpt = (nw + PLOW_THREADS - 1u) / PLOW_THREADS;
+    const unsigned w0 = tid * wpt < nw ? tid * wpt : nw;
+    const unsigned w1 = w0 + wpt < nw ? w0 + wpt : nw;
+    unsigned cnt = 0u;
+    for (unsigned w = w0; w < w1; w++) cnt += __popc(wl[w]);
+    unsigned o = sel_split_block_excl(cnt, ws);
+    for (unsigned w = w0; w < w1; w++) {
+        unsigned x = wl[w];
+        while (x) {
+            const unsigned b = (unsigned)__builtin_ctz(x);
+            x &= x - 1u;
+            if (o < top_k) st_act<int>(&ib[o], (int)(w * 32u + b));
+            o++;
+        }
+    }
+    /* Leave the strips as phases 1-2 expect them; the gates publish these stores. */
+    unsigned* const hr = as_glob(gHist) + (size_t)row * SEL_SPLIT_NB;
+    for (unsigned i = tid; i < SEL_SPLIT_NB; i += PLOW_THREADS) hr[i] = 0u;
+    if (tid == 0u) {
+        ctl[4] = 0u;
+        ctl[5] = 0u;
+        ctl[6] = 0u;
+    }
 }
 #endif
 

@@ -4404,9 +4404,21 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
             }
 #if PLOW_DSA_SELECT_SPLIT
             if (in->i[4] == 2u) {
-                d_index_select_split((int*)TEN(0), (const float*)TEN(1), (const int*)TEN(4),
-                                     in->i[0], in->i[1], (unsigned*)TEN(2), (unsigned*)TEN(3),
-                                     in->i[5], slice, lh, lh + 256);
+                static_assert(PLOW_SMEM_HALVES * 2u >= SEL_SPLIT_LDS * 4u,
+                              "the split selection's histogram does not fit the LDS arena");
+                if (in->i[6] == 1u)
+                    d_index_select_split_hist((const float*)TEN(1), (const int*)TEN(4), in->i[0],
+                                              in->i[1], (unsigned*)TEN(2), in->i[5], slice, lh);
+                else if (in->i[6] == 2u)
+                    d_index_select_split_mark((const float*)TEN(1), (const int*)TEN(4), in->i[0],
+                                              in->i[1], (const unsigned*)TEN(2), (unsigned*)TEN(3),
+                                              (unsigned*)TEN(5), (unsigned long long*)TEN(6),
+                                              in->i[5], slice, lh);
+                else
+                    d_index_select_split_emit((int*)TEN(0), (const int*)TEN(4), in->i[0], in->i[1],
+                                              (unsigned*)TEN(2), (unsigned*)TEN(3),
+                                              (const unsigned*)TEN(5),
+                                              (const unsigned long long*)TEN(6), slice, lh);
                 break;
             }
 #endif
