@@ -782,14 +782,22 @@ if [ "${PLOW_XR_TRACE_PHASES:-0}" = 1 ]; then
   AX_DECODE="$AX_DECODE -DPLOW_XR_TRACE_PHASES=1"
 fi
 
-# OPT-IN (PLOW_XR_SCHED=aiter): the 16-byte prefill collective schedule (op_collective.h
-# PLOW_XR_SCHED_AITER) on the first PLOW_XR_SCHED_NWG workgroups of each two-shot / op 25 / op 26
-# packet (the two-shot's reduce-scatter on the first PLOW_XR_SCHED_NWG_RS); the rest only arrive.
-# Objects only, the packet is unchanged. Bit-identical.
-case "${PLOW_XR_SCHED:-off}" in
-  off) ;;
+# DEFAULT (PLOW_XR_SCHED=aiter; rollback PLOW_XR_SCHED=twoshot, `off` is an alias): the 16-byte
+# prefill collective schedule (op_collective.h PLOW_XR_SCHED_AITER) on the first
+# PLOW_XR_SCHED_NWG (24) workgroups of each two-shot / op 25 / op 26 packet, the two-shot's
+# reduce-scatter on the first PLOW_XR_SCHED_NWG_RS (8); the other workgroups only arrive. Objects
+# only, prefill rows only (decode emits only the one-shot XReduce); the packet is unchanged.
+# Bit-identical: same r = 0..7 f32 sum and bf16 round per element (strict-order oracle,
+# tp_allreduce_prefill_bench TP_RANDOM=1). MEASURED, 8x MI300X: 8192x6144 two-shot 1002 -> 728 us
+# isolated; 4-layer TP8 1.06 -> 0.92 ms per collective; served A/B, credited as a pair with
+# PLOW_AMD_NUMA_HOST_POOLS: full 8192 chunks 823.4 / 793.9 / 824.4 ms (ctrl / treat / ctrl2,
+# -29.9 ms per chunk against a 1.0 ms control gap), +3.66 % out tok/s (control spread 1.14 %),
+# retrieval 18/18 + 21/21 in every arm.
+# `twoshot` compiles none of it: the prefill rows are then the shipped 2-byte two-shot.
+case "${PLOW_XR_SCHED:-aiter}" in
+  twoshot|off) ;;
   aiter) AX_PREFILL="$AX_PREFILL -DPLOW_XR_SCHED_AITER=1 -DPLOW_XR_SCHED_NWG=${PLOW_XR_SCHED_NWG:-24} -DPLOW_XR_SCHED_NWG_RS=${PLOW_XR_SCHED_NWG_RS:-8} -DPLOW_XR_SCHED_AG_U=${PLOW_XR_SCHED_AG_U:-1}" ;;
-  *) echo "FAIL: PLOW_XR_SCHED must be off or aiter" >&2; exit 2 ;;
+  *) echo "FAIL: PLOW_XR_SCHED must be aiter or twoshot" >&2; exit 2 ;;
 esac
 
 # OPT-IN (PLOW_XR_MLP=1): PEER-BATCHED REDUCE in the cross-GPU collectives (op_collective.h).

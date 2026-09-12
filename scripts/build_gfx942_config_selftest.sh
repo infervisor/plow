@@ -56,6 +56,7 @@ echo "--- config build (defines only)"
 env -u PLOW_DECODE_BATCH -u PLOW_GEMV_WALK -u PLOW_DECODE_TIERS -u PLOW_DSA_PF -u PLOW_KDA_CHUNK \
     -u PLOW_MOE_PF_ATOMIC -u PLOW_PACKED_PREFILL_CONSUMERS -u PLOW_TOKEN_BATCH_TP_OBJECTS \
     -u GM_BM -u GM_BN -u GM_DBUF \
+    -u PLOW_XR_SCHED -u PLOW_XR_SCHED_NWG -u PLOW_XR_SCHED_NWG_RS -u PLOW_XR_SCHED_AG_U \
     PLOW_HSACO_CONFIG="$TMP/assets" PLOW_DEFINES_ONLY=1 \
     "$ROOT/scripts/build_gfx942.sh" "$TMP/cfg" >"$TMP/cfg.log" 2>&1 || { cat "$TMP/cfg.log"; exit 1; }
 D="$TMP/cfg/build_defines.json"
@@ -92,6 +93,23 @@ d = json.load(open(sys.argv[1]))
 sys.exit(0 if all(k in d for k in ("interp_mla_small", "interp_mla_small_fp8kv", "interp_mla_split_fp8kv")) else 1)
 PY
 
+for def in -DPLOW_XR_SCHED_AITER=1 -DPLOW_XR_SCHED_NWG=24 -DPLOW_XR_SCHED_NWG_RS=8 -DPLOW_XR_SCHED_AG_U=1; do
+  expect "prefill rows default to the capped 16-byte collective schedule ($def)" \
+    has_define "$D" interp_prefill_fp8kv_mla_moe "$def"
+done
+expect "only interp_prefill* rows compile the collective schedule" python3 - "$D" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+sys.exit(1 if any("XR_SCHED" in v for k, v in d.items() if not k.startswith("interp_prefill")) else 0)
+PY
+
+echo "--- collective schedule rollback (PLOW_XR_SCHED=twoshot)"
+env -u PLOW_XR_SCHED_NWG -u PLOW_XR_SCHED_NWG_RS -u PLOW_XR_SCHED_AG_U PLOW_XR_SCHED=twoshot \
+    PLOW_HSACO_CONFIG="$TMP/assets" PLOW_DEFINES_ONLY=1 \
+    "$ROOT/scripts/build_gfx942.sh" "$TMP/xr2" >"$TMP/xr2.log" 2>&1 || { cat "$TMP/xr2.log"; exit 1; }
+expect "twoshot compiles no collective-schedule define on any row" \
+  bash -c '! grep -q XR_SCHED "$1"' _ "$TMP/xr2/build_defines.json"
+
 echo "--- explicit env still wins where it agrees or widens"
 env -u PLOW_DECODE_TIERS PLOW_DECODE_BATCH=32 PLOW_GEMV_MM=16 PLOW_GEMV_WALK=1 PLOW_DSA_PF=0 \
     PLOW_HSACO_CONFIG="$TMP/assets/plow_config.h" PLOW_DEFINES_ONLY=1 \
@@ -113,6 +131,7 @@ refuse() {  # <desc> <needle> <env...>
 }
 refuse "narrower explicit decode batch" "packet decodes at batch 20 but PLOW_DECODE_BATCH=4" PLOW_DECODE_BATCH=4 PLOW_GEMV_WALK=1
 refuse "disagreeing GEMM tile" "packet requires GM_BM=192 but GM_BM=64" GM_BM=64
+refuse "unknown collective schedule" "PLOW_XR_SCHED must be aiter or twoshot" PLOW_XR_SCHED=bogus
 sed -i 's/"gfx942"/"gfx950"/' "$TMP/assets/plow_config.h"
 refuse "config for another arch" "describes a gfx950 packet" JOBS=1
 sed -i 's/"gfx950"/"gfx942"/' "$TMP/assets/plow_config.h"
