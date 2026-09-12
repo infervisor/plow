@@ -1758,7 +1758,7 @@ mod amd_serve {
             if tick_log {
                 let ms = |ns: u64| ns as f64 / 1e6;
                 eprintln!(
-                    "PFCHUNK slot={slot} c0={} clen={} bucket={} last={last} total={:.3} cursor={:.3} rebase={:.3} chunk={:.3} restore={:.3} snap={:.3} publish={:.3} publish_fill={:.3}",
+                    "PFCHUNK slot={slot} c0={} clen={} bucket={} last={last} total={:.3} cursor={:.3} rebase={:.3} chunk={:.3} restore={:.3} snap={:.3} publish={:.3} publish_fill={:.3} resume={} sparse={}",
                     step.c0,
                     step.clen,
                     g.rank0().prog_t(step.prog),
@@ -1770,6 +1770,8 @@ mod amd_serve {
                     ms(snap_ns),
                     ms(publish_ns),
                     ms(crate::obs::tick::take_publish_fill()),
+                    cur.resume,
+                    g.rank0().prefill_prog_sparse(step.prog) as u8,
                 );
             }
             if !last {
