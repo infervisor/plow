@@ -78,6 +78,22 @@ pub trait SeqEngine {
         prompt: &[u32],
         tick_max_bucket: u32,
     ) -> crate::Result<Option<u32>>;
+    /// [`Self::prefill_chunked_at_most`] running at most `rows` rows: a longer pending chunk is
+    /// re-planned as `[c0, c0 + rows)` and the rest, each through the ordinary span planner.
+    /// Also returns the chunk that ran, when the engine knows it.
+    fn prefill_chunk_rows(
+        &mut self,
+        slot: usize,
+        prompt: &[u32],
+        tick_max_bucket: u32,
+        _rows: u32,
+    ) -> crate::Result<(Option<u32>, Option<crate::sched::slo::Ran>)> {
+        self.prefill_chunked_at_most(slot, prompt, tick_max_bucket).map(|t| (t, None))
+    }
+    /// The prefill rungs as `(rows, sparse)`, ascending. Empty = no ladder to budget against.
+    fn prefill_ladder(&self) -> Vec<(u32, bool)> {
+        Vec::new()
+    }
     fn multistep_quantum(&self, feeds: &[(usize, u32)], requested: usize) -> Option<usize>;
     fn multi_step(
         &mut self,
@@ -851,6 +867,27 @@ mod amd_serve {
                 *snap += added;
             }
         }
+    }
+
+    /// Shrink `cur`'s pending step to its first `rows` rows. `[c0, c0 + rows)` and
+    /// `[c0 + rows, end)` are planned as two spans by `plan` (`plan_span_at_most`), so the shrunk
+    /// chunk is its own span's tail: `rows` real rows, moved to the sparse bucket at deep prior
+    /// like any tail. The pending step's end stays a chunk end, so a prefix publish or snapshot
+    /// due there still fires at the same row.
+    fn shrink_pending_prefill(
+        cur: &mut PfCursor,
+        rows: u32,
+        plan: impl Fn(u32, u32) -> Result<Vec<crate::exec::amd::ChunkStep>>,
+    ) -> Result<()> {
+        let pending = cur.steps[cur.next];
+        if rows == 0 || rows >= pending.clen {
+            return Ok(());
+        }
+        let (c0, end) = (pending.c0, pending.c0 + pending.clen);
+        let mut steps = plan(c0, c0 + rows)?;
+        steps.extend(plan(c0 + rows, end)?);
+        split_pending_prefill(cur, steps);
+        Ok(())
     }
 
     fn commit_packed_prefill(
@@ -1677,10 +1714,30 @@ mod amd_serve {
             prompt: &[u32],
             tick_max_bucket: u32,
         ) -> Result<Option<u32>> {
+            self.prefill_chunk_rows(slot, prompt, tick_max_bucket, None).map(|(t, _)| t)
+        }
+
+        /// The prefill rungs as `(rows, sparse)`, ascending.
+        pub fn prefill_ladder(&self) -> Vec<(u32, bool)> {
+            let e = self.ranks.rank0();
+            e.prefill_rungs().map(|(prog, rows)| (rows, e.prefill_prog_sparse(prog))).collect()
+        }
+
+        /// [`Self::prefill_chunked_at_most`], and with `rows` the chunk that runs is at most
+        /// that many rows: the pending chunk is re-planned as `[c0, c0 + rows)` and the rest,
+        /// each through `plan_span_at_most`, so the shrunk chunk is its own span's tail and a
+        /// dense one at deep prior moves to the sparse bucket at its real row count.
+        pub fn prefill_chunk_rows(
+            &mut self,
+            slot: usize,
+            prompt: &[u32],
+            tick_max_bucket: u32,
+            rows: Option<u32>,
+        ) -> Result<(Option<u32>, Option<crate::sched::slo::Ran>)> {
             let chunked = (self.chunk_prefill || self.ranks.shared_prefix_enabled())
                 && !self.decode_only && prompt.len() > 1;
             if !chunked {
-                return self.prefill(slot, prompt).map(Some);
+                return self.prefill(slot, prompt).map(|t| (Some(t), None));
             }
             let tick_log = crate::obs::tick::on();
             let t_all = std::time::Instant::now();
@@ -1697,6 +1754,10 @@ mod amd_serve {
                     g.plan_span_at_most(pending.c0, pending.c0 + pending.clen, max_bucket)?;
                 let cur = self.pf[slot].as_mut().expect("just built");
                 split_pending_prefill(cur, split);
+            }
+            if let Some(n) = rows {
+                let cur = self.pf[slot].as_mut().expect("just built");
+                shrink_pending_prefill(cur, n, |a, b| g.plan_span_at_most(a, b, max_bucket))?;
             }
             let cur = self.pf[slot].as_mut().expect("just built");
             let step = cur.steps[cur.next];
@@ -1772,8 +1833,13 @@ mod amd_serve {
                     ms(crate::obs::tick::take_publish_fill()),
                 );
             }
+            let ran = Some(crate::sched::slo::Ran {
+                bucket: g.rank0().prog_t(step.prog),
+                c0: step.c0,
+                clen: step.clen,
+            });
             if !last {
-                return Ok(None);
+                return Ok((None, ran));
             }
             let tok = g.read_prefill_token()?;
             tracing::debug!(slot, tok, n = prompt.len(), "pf complete");
@@ -1794,7 +1860,7 @@ mod amd_serve {
                     self.snap_at[slot] = 0;
                 }
             }
-            Ok(Some(tok))
+            Ok((Some(tok), ran))
         }
 
         pub fn mixed_step_rows(&self, decode_rows: usize, prefill_rows: usize) -> Option<u32> {
@@ -3145,6 +3211,106 @@ mod amd_serve {
             }
         }
 
+        /// `Ranks::plan_span_at_most` on the GLM TP8 ladder without an engine: the same three
+        /// calls (the ragged cover, the tail retarget, the step walk).
+        fn glm_span(from: u32, to: u32, floor: Option<u32>) -> crate::Result<Vec<ChunkStep>> {
+            const LADDER: [(usize, u32, bool); 4] =
+                [(0, 128, false), (1, 512, false), (2, 2048, false), (3, 8192, true)];
+            let buckets: Vec<u32> = LADDER.iter().map(|l| l.1).collect();
+            let mut chunks = crate::exec::amd::plan_chunks_capped(&buckets, to - from, 8192)?;
+            if let Some(min_ctx) = floor {
+                let dense = |w: u32| LADDER.iter().any(|l| l.1 == w && !l.2);
+                super::retarget_dense_tail(&mut chunks, from, min_ctx, Some(8192), dense);
+            }
+            crate::exec::amd::chunk_steps_over(
+                |w| LADDER.iter().find(|l| l.1 == w).map(|l| l.0),
+                &chunks,
+                from,
+                to,
+            )
+        }
+
+        const SPARSE: usize = 3;
+        /// `exec::amd_sparse_mla::SPAN_MIN_PRIOR` (private there): the fewest prior keys a sparse
+        /// span may start behind.
+        const SPAN_MIN_PRIOR: u32 = 2047;
+
+        fn contiguous(steps: &[ChunkStep], from: u32, to: u32) {
+            assert_eq!(steps.first().map(|s| s.c0), Some(from));
+            for w in steps.windows(2) {
+                assert_eq!(w[0].c0 + w[0].clen, w[1].c0, "{steps:?}");
+            }
+            let last = steps.last().unwrap();
+            assert_eq!(last.c0 + last.clen, to);
+        }
+
+        fn cursor(steps: Vec<ChunkStep>, next: usize, snap_after: Option<usize>) -> PfCursor {
+            let frontier = steps[next].c0;
+            PfCursor { steps, next, frontier, snap_after, resume: 0, arm: 0 }
+        }
+
+        #[test]
+        fn a_shrunk_middle_chunk_runs_exactly_its_rows_and_at_deep_prior_on_the_sparse_bucket() {
+            let plan = glm_span(0, 70_000, Some(16384)).unwrap();
+            // Deep prior (32768): 1408 rows -> dense 2048 by size -> sparse 8192 at 1408 rows.
+            let mut cur = cursor(plan.clone(), 4, None);
+            super::shrink_pending_prefill(&mut cur, 1408, |a, b| glm_span(a, b, Some(16384))).unwrap();
+            assert_eq!(cur.steps[4], ChunkStep { prog: SPARSE, c0: 32768, clen: 1408 });
+            assert_eq!(cur.steps[5], ChunkStep { prog: SPARSE, c0: 34176, clen: 6784 });
+            assert_eq!(&cur.steps[6..], &plan[5..], "later chunks are untouched");
+            contiguous(&cur.steps, 0, 70_000);
+            // Shallow prior (8192 < floor): the same shrink stays on the dense 2048 rung.
+            let mut cur = cursor(plan.clone(), 1, None);
+            super::shrink_pending_prefill(&mut cur, 1408, |a, b| glm_span(a, b, Some(16384))).unwrap();
+            assert_eq!(cur.steps[1], ChunkStep { prog: 2, c0: 8192, clen: 1408 });
+            contiguous(&cur.steps, 0, 70_000);
+            // The floor off: dense even at depth. A shrink to the whole chunk changes nothing.
+            let mut cur = cursor(plan.clone(), 4, None);
+            super::shrink_pending_prefill(&mut cur, 1408, |a, b| glm_span(a, b, None)).unwrap();
+            assert_eq!(cur.steps[4].prog, 2);
+            let mut cur = cursor(plan.clone(), 4, None);
+            super::shrink_pending_prefill(&mut cur, 8192, |a, b| glm_span(a, b, Some(16384))).unwrap();
+            assert_eq!(cur.steps, plan);
+        }
+
+        /// Prefix publishes fire at chunk ends on the 16384-row block grid and at the prompt end;
+        /// the snapshot at `snap_after`'s end. Repeated shrinks keep every original chunk end a
+        /// chunk end, so both still fire at the same rows, and `snap_after` follows its step.
+        #[test]
+        fn repeated_shrinks_keep_publish_boundaries_and_the_snapshot_row() {
+            for from in [0u32, 5000, 60_000] {
+                let plan = glm_span(from, 81_000, Some(16384)).unwrap();
+                let ends: Vec<u32> = plan.iter().map(|s| s.c0 + s.clen).collect();
+                for snap in 0..plan.len() - 1 {
+                    let boundary = ends[snap];
+                    let mut cur = cursor(plan.clone(), 0, Some(snap));
+                    let mut x = u64::from(from) + snap as u64 + 1;
+                    while cur.next < cur.steps.len() {
+                        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                        let n = [128, 700, 1408, 2560, 5000, 8192][(x >> 33) as usize % 6];
+                        super::shrink_pending_prefill(&mut cur, n, |a, b| glm_span(a, b, Some(16384))).unwrap();
+                        let s = cur.steps[cur.next];
+                        assert!(s.clen <= n.max(1), "ran {} rows of a {n}-row budget", s.clen);
+                        if s.prog == SPARSE && s.clen <= 2048 && s.c0 + s.clen < 81_000 {
+                            assert!(s.c0 >= SPAN_MIN_PRIOR, "{s:?}");
+                        }
+                        cur.frontier = s.c0 + s.clen;
+                        cur.next += 1;
+                    }
+                    contiguous(&cur.steps, from, 81_000);
+                    let new_ends: Vec<u32> = cur.steps.iter().map(|s| s.c0 + s.clen).collect();
+                    for e in &ends {
+                        assert!(new_ends.contains(e), "chunk end {e} lost: {new_ends:?}");
+                    }
+                    for b in (16384..81_000).step_by(16384).filter(|b| ends.contains(b)) {
+                        assert!(new_ends.contains(&b), "publish boundary {b} lost");
+                    }
+                    let s = cur.steps[cur.snap_after.unwrap()];
+                    assert_eq!(s.c0 + s.clen, boundary, "snapshot moved (from {from}, snap {snap})");
+                }
+            }
+        }
+
         #[test]
         fn dense_tail_moves_to_the_sparse_bucket_only_past_the_context_floor() {
             let dense = |b: u32| b < 8192;
@@ -3561,6 +3727,18 @@ impl SeqEngine for AmdServe {
         tick_max_bucket: u32,
     ) -> crate::Result<Option<u32>> {
         AmdServe::prefill_chunked_at_most(self, slot, prompt, tick_max_bucket)
+    }
+    fn prefill_chunk_rows(
+        &mut self,
+        slot: usize,
+        prompt: &[u32],
+        tick_max_bucket: u32,
+        rows: u32,
+    ) -> crate::Result<(Option<u32>, Option<crate::sched::slo::Ran>)> {
+        AmdServe::prefill_chunk_rows(self, slot, prompt, tick_max_bucket, Some(rows))
+    }
+    fn prefill_ladder(&self) -> Vec<(u32, bool)> {
+        AmdServe::prefill_ladder(self)
     }
     fn multistep_quantum(&self, feeds: &[(usize, u32)], requested: usize) -> Option<usize> {
         AmdServe::multistep_quantum(self, feeds, requested)
