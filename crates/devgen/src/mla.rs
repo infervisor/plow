@@ -3394,15 +3394,9 @@ fn glm_decode_gemv_cus(cus: &[u32], op: DevOp, n: u32, k: u32) -> Vec<u32> {
     }
 }
 
-fn emit_glm_decode_gemm_lt(
-    b: &mut Builder,
-    c: &GlmCfg,
-    enc: MoeEnc,
-    rows: u32,
-    operands: [u32; 3],
-    shape: [u32; 2],
-    deps: &[u32],
-) -> Option<u32> {
+/// Whether [`emit_glm_decode_gemm_lt`] routes a `rows`-row decode projection of `shape` to the
+/// native GEMM.
+fn glm_decode_lt_routes(rows: u32, shape: [u32; 2]) -> bool {
     let cfg = emit_config::active();
     // The EXT set: rung 8, and the narrow projections whose MM16 GEMV moves 14-65 GB/s
     // (k_rope, q_rope, indexer k/weights, lm_head). Measured against the pinned kernels on one
@@ -3417,7 +3411,19 @@ fn emit_glm_decode_gemm_lt(
             shape,
             [64, 6144] | [512, 2048] | [128, 6144] | [32, 6144] | [19360, 6144]
         ));
-    if !cfg.glm_gemm_lt_decode() || !rows_ok || !shape_ok {
+    cfg.glm_gemm_lt_decode() && rows_ok && shape_ok
+}
+
+fn emit_glm_decode_gemm_lt(
+    b: &mut Builder,
+    c: &GlmCfg,
+    enc: MoeEnc,
+    rows: u32,
+    operands: [u32; 3],
+    shape: [u32; 2],
+    deps: &[u32],
+) -> Option<u32> {
+    if !glm_decode_lt_routes(rows, shape) {
         return None;
     }
     assert!(
@@ -3614,6 +3620,28 @@ pub(crate) fn emit_glm_mla(
             },
         )
     };
+    // PLOW_GLM_DECODE_GEMM_GROUP: on a full-indexer layer the indexer's k and weights projections
+    // read `xn` like q_a/kv_a/k_rope, and its q projection reads `qlat` like q_absorb/q_rope. Emit
+    // each next to its siblings so the native GEMMs form two adjacent runs. Same instructions and
+    // dependencies as `emit_glm_dsa_decode_select`, which then skips them.
+    let (idx_hi, idx_di) = (c.index_heads, c.index_dim);
+    let idx_group = emit_config::active().glm_decode_gemm_group
+        && c.dsa(ctx)
+        && w.iwqb != TENSOR_NONE
+        && c.index_kpool <= 1
+        && [[idx_hi * idx_di, ql], [idx_di, h], [idx_hi, h]]
+            .into_iter()
+            .all(|s| glm_decode_lt_routes(rows, s));
+    let pre_idx_kw = idx_group.then(|| {
+        [
+            ([n.kidx_raw, n.xn, w.iwk], [idx_di, h]),
+            ([n.widx, n.xn, w.iwp], [idx_hi, h]),
+        ]
+        .map(|(ops, shape)| {
+            emit_glm_decode_gemm_lt(b, c, enc, rows, ops, shape, &[c_rn1])
+                .expect("routed to the native GEMM")
+        })
+    });
     // 3 q_a_layernorm
     //
     // Q-NORM FOLD (`PLOW_GLM_FUSE_QNORM=1`, opt-in): fusion G's GemvQkv computes this norm
@@ -3728,6 +3756,19 @@ pub(crate) fn emit_glm_mla(
         };
         (qa_dep, qr_dep)
     };
+    let pre_idx = pre_idx_kw.map(|[c_k0, c_w]| {
+        let c_q0 = emit_glm_decode_gemm_lt(
+            b,
+            c,
+            enc,
+            rows,
+            [n.qidx, n.qlat, w.iwqb],
+            [idx_hi * idx_di, ql],
+            &[c_rnq],
+        )
+        .expect("routed to the native GEMM");
+        [c_q0, c_k0, c_w]
+    });
     // The decode ropes take DISJOINT slices of `all` (see `rope_cus`): q needs ceil(nh_l/8)
     // workgroups, the shared-head k rope needs 1, and the two are concurrent siblings.
     let rq = if dr > 0 {
@@ -3900,7 +3941,7 @@ pub(crate) fn emit_glm_mla(
     let full = dsa && w.iwqb != TENSOR_NONE; // 'full' indexer layer (weights bound only there)
     let itk = c.index_topk.min(ctx);
     let c_sel = emit_glm_dsa_decode_select(
-        b, c, n, w, slot, ctx, rows, dbatch, enc, &all, eps, ql, h, c_rnq, c_rn1, &rq, &rk,
+        b, c, n, w, slot, ctx, rows, dbatch, enc, &all, eps, ql, h, c_rnq, c_rn1, &rq, &rk, pre_idx,
     );
     // 9 FLASH (MLA) DECODE — dense (ctx<=2048) or GATHER over the top_k selected latent rows (ctx>2048).
     //   Runs this rank's nh_l head-shard; the latent ckv/krot caches are REPLICATED (all heads read
@@ -4167,6 +4208,7 @@ fn emit_glm_dsa_decode_select(
     c_rn1: u32,
     rq: &[u32],
     rk: &[u32],
+    pre: Option<[u32; 3]>,
 ) -> u32 {
     let one = vec![0u32];
     let dsa = c.dsa(ctx);
@@ -4219,7 +4261,11 @@ fn emit_glm_dsa_decode_select(
         };
     if full {
         // q_idx = interleaved_rope(reshape_HIxDI(wq_b @ q_lat)); rope in-place (reads staged first).
-        let c_q0 = gemv_blk(b, n.qidx, n.qlat, w.iwqb, hi * di, ql, &[c_rnq]);
+        // `pre`: the q/k/weights projections were emitted beside their siblings.
+        let c_q0 = match pre {
+            Some([c_q0, _, _]) => c_q0,
+            None => gemv_blk(b, n.qidx, n.qlat, w.iwqb, hi * di, ql, &[c_rnq]),
+        };
         // The indexer ropes are concurrent with each other AND with the q/k pair above (all four
         // hang off the input norm), so they continue the same disjoint allocation.
         let riq = rope_cus(all, rq.len() + rk.len(), rows, hi);
@@ -4243,7 +4289,10 @@ fn emit_glm_dsa_decode_select(
         });
         // k_idx pre-rope: wk @ xn, k_norm. Shared by both the dense (GLM-5.2) and pooled
         // (GLM-5.3-Flash) paths below — only what the rope writes INTO differs.
-        let c_k0 = gemv_blk(b, n.kidx_raw, n.xn, w.iwk, di, h, &[c_rn1]);
+        let c_k0 = match pre {
+            Some([_, c_k0, _]) => c_k0,
+            None => gemv_blk(b, n.kidx_raw, n.xn, w.iwk, di, h, &[c_rn1]),
+        };
         let c_kn = b.emit(DevOp::LayerNorm, one.clone(), &[c_k0], |d| {
             d.t[0] = n.kidx_normed;
             d.t[1] = n.kidx_raw;
@@ -4408,26 +4457,29 @@ fn emit_glm_dsa_decode_select(
             // Plain bf16 GEMV, explicitly — NOT the encoding-aware helper. Under MXFP4 that helper
             // would emit GEMV_MXFP4 against a bf16 weight with a null scale; the assert above makes the
             // combination unreachable, and this keeps it that way if the assert is ever relaxed.
-            let c_w = emit_glm_decode_gemm_lt(
-                b,
-                c,
-                enc,
-                rows,
-                [n.widx, n.xn, w.iwp],
-                [hi, h],
-                &[c_rn1],
-            )
-            .unwrap_or_else(|| {
-                b.emit(DevOp::Gemv, all.to_vec(), &[c_rn1], |d| {
-                    d.t[0] = n.widx;
-                    d.t[1] = n.xn;
-                    d.t[2] = w.iwp;
-                    d.i[0] = rows;
-                    d.i[1] = hi;
-                    d.i[2] = h;
-                    d.f[0] = 1.0;
-                })
-            });
+            let c_w = match pre {
+                Some([_, _, c_w]) => c_w,
+                None => emit_glm_decode_gemm_lt(
+                    b,
+                    c,
+                    enc,
+                    rows,
+                    [n.widx, n.xn, w.iwp],
+                    [hi, h],
+                    &[c_rn1],
+                )
+                .unwrap_or_else(|| {
+                    b.emit(DevOp::Gemv, all.to_vec(), &[c_rn1], |d| {
+                        d.t[0] = n.widx;
+                        d.t[1] = n.xn;
+                        d.t[2] = w.iwp;
+                        d.i[0] = rows;
+                        d.i[1] = hi;
+                        d.i[2] = h;
+                        d.f[0] = 1.0;
+                    })
+                }),
+            };
             // score[t] = Σ_h w[h]·ReLU(q_idx[h]·k_idx[t]) · scale  (scale = 1/√DI · 1/√HI; selection is
             // scale-invariant, this reproduces HF numerically).
             let c_sc = b.emit(DevOp::IndexScore, all.to_vec(), &[c_qi, c_ki, c_w], |d| {
@@ -7356,6 +7408,19 @@ fn emit_glm_moe_ffn_rows(
                     },
                 )
             });
+    // PLOW_GLM_DECODE_GEMM_GROUP: the shared gate/up read only `xn2`, so emit them straight after
+    // the router GEMM. The three native GEMMs become adjacent (one overlap run under
+    // PLOW_AMD_DECODE_GEMM_OVERLAP) and top-k and Glu share one interpreter segment.
+    let pre_gu = (emit_config::active().glm_decode_gemm_group
+        && !lin_fp8
+        && (rows as u64) * (h as u64) > crate::gm_lds_halves()
+        && glm_decode_lt_routes(rows, [imoe_l, h]))
+    .then(|| {
+        [(n.shfu, w.shg), (n.shfu_up, w.shu)].map(|(out, wt)| {
+            emit_glm_decode_gemm_lt(b, c, enc, rows, [out, n.xn2, wt], [imoe_l, h], &[c_rn2])
+                .expect("routed to the native GEMM")
+        })
+    });
     let resident = emit_config::active().glm_moe_resident();
     assert!(
         !resident || matches!(rows, 1 | 2 | 4 | 8 | 16 | 20),
@@ -7480,8 +7545,10 @@ fn emit_glm_moe_ffn_rows(
                 },
             )
         };
-        let c_g = gemv_half(b, n.shfu, w.shg);
-        let c_u = gemv_half(b, n.shfu_up, w.shu);
+        let [c_g, c_u] = match pre_gu {
+            Some(pre) => pre,
+            None => [gemv_half(b, n.shfu, w.shg), gemv_half(b, n.shfu_up, w.shu)],
+        };
         b.emit(DevOp::Glu, one.clone(), &[c_g, c_u], |d| {
             d.t[0] = n.shfu;
             d.t[1] = n.shfu;

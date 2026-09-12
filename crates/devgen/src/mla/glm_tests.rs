@@ -665,6 +665,7 @@ fn glm_dsa_local_selection_keeps_one_completion_for_independent_rows() {
             ready,
             &(0..32).collect::<Vec<_>>(),
             &[0],
+            None,
         );
         let p = b.finish();
         let selects: Vec<_> = p
@@ -2350,6 +2351,126 @@ fn glm_native_decode_gemm_ext_covers_rung8_and_narrow_projections() {
         Some(&verify),
     );
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// `PLOW_GLM_DECODE_GEMM_GROUP` only reorders: every program keeps the same instructions, rungs
+/// without native decode GEMMs keep their order, and on the native rungs the MoE layer's router and
+/// shared gate/up GEMMs are adjacent while top-k and Glu share one segment.
+#[test]
+fn glm_decode_gemm_group_reorders_native_gemms_without_changing_work() {
+    let _guard = crate::test_env::env_guard();
+    let _target = crate::EmitAmdGuard::set(true);
+    type Inst = (u16, u32, u32, u16);
+    type Prog = (u32, Vec<Inst>, Vec<String>);
+    let emit = |group: &str| -> Vec<Prog> {
+        let _env = crate::test_env::EnvScope::set(&[
+            ("PLOW_MLA_PREFILL", "full:128"),
+            ("PLOW_GLM_PLACE_PF", "0"),
+            ("PLOW_GLM_MOE_AITER", "0"),
+            ("PLOW_GLM_MOE_FLAT_DECODE", "0"),
+            ("PLOW_GLM_GEMM_LT_DECODE", "1"),
+            ("PLOW_GLM_GEMM_LT_DECODE_EXT", "1"),
+            ("PLOW_GLM_GEMM_LT", "0"),
+            ("GLM_SHARD_HEAD", "1"),
+            ("PLOW_DECODE_BATCH_LADDER", "1,4,8,16,20"),
+            ("PLOW_EMIT_PACKED_PREFILL", "0"),
+            ("PLOW_UNISEG", "0"),
+            ("PLOW_GLM_DECODE_GEMM_GROUP", group),
+        ]);
+        let dir = std::env::temp_dir().join(format!(
+            "plow-glm-gemm-group-{group}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = serde_json::json!({
+            "model_type": "glm_moe_dsa", "num_hidden_layers": 4,
+            "hidden_size": 6144, "num_attention_heads": 64,
+            "kv_lora_rank": 512, "q_lora_rank": 2048,
+            "qk_nope_head_dim": 192, "qk_rope_head_dim": 64, "v_head_dim": 256,
+            "vocab_size": 154880, "rms_norm_eps": 1e-5,
+            "n_routed_experts": 256, "num_experts_per_tok": 8,
+            "moe_intermediate_size": 2048, "intermediate_size": 12288,
+            "first_k_dense_replace": 3, "routed_scaling_factor": 2.5,
+            "rope_theta": 8000000.0
+        });
+        std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+        let out = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = out.clone();
+        let verify: crate::VerifyHook = Box::new(move |model| {
+            for (prog, &rows) in model.progs.iter().zip(&model.prog_t) {
+                let seg = |ix: usize| {
+                    prog.stream
+                        .iter()
+                        .find(|e| e.inst as usize == ix)
+                        .map_or(u16::MAX, |e| e.seg)
+                };
+                let insts = prog
+                    .insts
+                    .iter()
+                    .enumerate()
+                    .map(|(ix, d)| (d.op, d.i[1], d.i[2], seg(ix)))
+                    .collect();
+                let payload = prog
+                    .insts
+                    .iter()
+                    .map(|d| format!("{:?} {} {:?} {:?} {:?}", d.op, d.blocks, d.t, d.i, d.j))
+                    .collect();
+                sink.lock().unwrap().push((rows, insts, payload));
+            }
+            Ok(crate::LeanReport::skipped("decode GEMM group test"))
+        });
+        glm_emit_full(
+            &dir,
+            512,
+            dir.join("model.pkt").to_str().unwrap(),
+            304,
+            8,
+            true,
+            true,
+            "gfx942",
+            None,
+            Some(&verify),
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+        let progs = out.lock().unwrap().clone();
+        progs
+    };
+    let (off, on) = (emit("0"), emit("1"));
+    assert_eq!(off.len(), on.len());
+    let lt = DevOp::GemmLtPf as u16;
+    let mut native_rungs = 0;
+    for ((rows, a, pa), (_, b, pb)) in off.iter().zip(&on) {
+        let (mut x, mut y) = (pa.clone(), pb.clone());
+        x.sort();
+        y.sort();
+        assert_eq!(x, y, "rows={rows}: the reorder must keep the same instructions");
+        // The shared expert splits into native gate/up halves + Glu only past its LDS fit (rows
+        // 16/20); below it, or with no native GEMM, there is nothing to move.
+        if !a.iter().any(|i| i.0 == lt) || !a.iter().any(|i| i.0 == DevOp::Glu as u16) {
+            assert_eq!(pa, pb, "rows={rows}: nothing to group, no reorder");
+            continue;
+        }
+        native_rungs += 1;
+        let n_seg = |p: &[Inst]| p.iter().map(|i| i.3).max().unwrap();
+        // One MoE layer in this model: top-k and Glu now share a segment.
+        assert_eq!(n_seg(b) + 1, n_seg(a), "rows={rows}");
+        let topk = b
+            .iter()
+            .position(|i| i.0 == DevOp::MoeRouterTopkPf as u16)
+            .unwrap();
+        assert!(
+            b[topk - 3..topk]
+                .iter()
+                .all(|i| (i.0, i.1, i.2) == (lt, 256, 6144)),
+            "rows={rows}: router, shared gate and shared up must precede top-k back to back"
+        );
+        let glu = b.iter().position(|i| i.0 == DevOp::Glu as u16).unwrap();
+        assert_eq!(
+            b[topk].3, b[glu].3,
+            "rows={rows}: top-k and Glu share a segment"
+        );
+    }
+    assert_eq!(native_rungs, 2);
 }
 
 #[test]
