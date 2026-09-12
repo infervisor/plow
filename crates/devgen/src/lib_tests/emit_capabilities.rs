@@ -272,9 +272,13 @@ fn glm_recipe_precedence_is_cli_then_env_then_production_default() {
         "glm_decode_norm_rows",
         "glm_gemm_lt_decode",
         "glm_gemm_lt_decode_ext",
+        "glm_fold_lt",
+        "glm_seq_par",
+        "glm_seq_par_proj",
     ] {
         assert_eq!(rec[id], ("true".into(), "production_default"), "{id}");
     }
+    assert!(cfg.glm_fold_lt() && cfg.glm_seq_par() && cfg.glm_seq_par_proj());
     assert!(
         cfg.glm_fp8_kv()
             && cfg.glm_moe_aiter()
@@ -313,7 +317,58 @@ fn non_qualified_targets_record_no_glm_production_default() {
     let _guard = crate::test_env::env_guard();
     let (cfg, rec) = resolve_like_plowc(&["test"], "glm_moe_dsa", "sm_90a", 8, 304);
     assert!(!cfg.glm_gemm_lt() && !cfg.glm_fp8_kv() && !cfg.glm_moe_resident());
-    for (id, _) in cfg.glm_recipe_unset() {
+    for (id, _, _) in cfg.glm_recipe_unset() {
+        assert_eq!(rec[id].1, "default", "{id}");
+    }
+    assert!(!cfg.glm_fold_lt() && !cfg.glm_seq_par() && !cfg.glm_seq_par_proj());
+}
+
+/// The three tier-4 knobs (`PLOW_GLM_SEQ_PAR`, `_PROJ`, `PLOW_GLM_FOLD_LT`): each rolls back on
+/// its own flag; `_PROJ`'s default follows `SEQ_PAR`, so rolling back the seams alone takes it
+/// along; the seams' default stands aside for the two-shot seam knobs it replaces; and nothing
+/// turns on for a non-GLM gfx942 TP8 emit.
+#[test]
+fn glm_seq_par_and_fold_defaults_roll_back_per_knob() {
+    let _guard = crate::test_env::env_guard();
+    type Rec = std::collections::BTreeMap<String, (String, &'static str)>;
+    // One knob record per thread (production has one per process): resolve each case fresh.
+    let resolve = |argv: &[&str], model: &str| -> ((bool, bool, bool), Rec) {
+        let argv: Vec<String> = argv.iter().map(|a| a.to_string()).collect();
+        let model = model.to_string();
+        std::thread::spawn(move || {
+            let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+            let (cfg, rec) = resolve_like_plowc(&argv, &model, "gfx942", 8, 304);
+            ((cfg.glm_seq_par(), cfg.glm_seq_par_proj(), cfg.glm_fold_lt()), rec)
+        })
+        .join()
+        .unwrap()
+    };
+    let glm = |argv: &[&str]| resolve(argv, "glm_moe_dsa");
+
+    assert_eq!(glm(&["test"]).0, (true, true, true));
+
+    let (on, rec) = glm(&["test", "--glm-fold-lt=false"]);
+    assert_eq!(on, (true, true, false));
+    assert_eq!(rec["glm_fold_lt"], ("false".into(), "cli"));
+
+    let (on, rec) = glm(&["test", "--glm-seq-par-proj=false"]);
+    assert_eq!(on, (true, false, true));
+    assert_eq!(rec["glm_seq_par_proj"], ("false".into(), "cli"));
+
+    let (on, rec) = glm(&["test", "--glm-seq-par=false"]);
+    assert_eq!(on, (false, false, true));
+    assert_eq!(rec["glm_seq_par"], ("false".into(), "cli"));
+    assert_eq!(rec["glm_seq_par_proj"], ("false".into(), "production_default"));
+
+    for argv in [&["test", "--glm-xr-res=true"][..], &["test", "--glm-xr-band", "4"][..]] {
+        let (on, rec) = glm(argv);
+        assert_eq!(on, (false, false, true), "{argv:?}");
+        assert_eq!(rec["glm_seq_par"], ("false".into(), "production_default"), "{argv:?}");
+    }
+
+    let (on, rec) = resolve(&["test"], "gemma4");
+    assert_eq!(on, (false, false, false));
+    for id in ["glm_fold_lt", "glm_seq_par", "glm_seq_par_proj"] {
         assert_eq!(rec[id].1, "default", "{id}");
     }
 }

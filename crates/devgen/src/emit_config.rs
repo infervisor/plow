@@ -668,8 +668,9 @@ pub struct EmitConfig {
     pub glm_gemm_lt_decode_ext: Option<bool>,
 
     /// Use native gfx942 FP32 MLA fold GEMMs during prefill.
-    #[arg(long, env = "PLOW_GLM_FOLD_LT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
-    pub glm_fold_lt: bool,
+    /// On by default for GLM on gfx942 TP8; `=false` is the rollback.
+    #[arg(long, env = "PLOW_GLM_FOLD_LT", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_fold_lt: Option<bool>,
 
     /// Native gfx942 W8A8 block-scale FP8 prefill projections (AITER pre-shuffled assembly) at
     /// rows 2048..=8192: `1`/`true` = q_a, kv_a, wq_b and o_proj, or a comma list of those.
@@ -774,15 +775,17 @@ pub struct EmitConfig {
     /// Sequence-parallel TP seams for the GLM prefill buckets >= 2048 rows: every o_proj / FFN
     /// all-reduce becomes a reduce-scatter, the residual and the following RMSNorm run on this
     /// rank's `t/tp` row band, and the normed rows are all-gathered (`XReduceScatter` +
-    /// `XAllGather`). Opt-in; off is byte-identical.
-    #[arg(long, env = "PLOW_GLM_SEQ_PAR", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
-    pub glm_seq_par: bool,
+    /// `XAllGather`). On by default for GLM on gfx942 TP8 unless `PLOW_GLM_XR_RES` /
+    /// `PLOW_GLM_XR_BAND` is set; `=false` is the rollback.
+    #[arg(long, env = "PLOW_GLM_SEQ_PAR", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_seq_par: Option<bool>,
 
     /// With `PLOW_GLM_SEQ_PAR`: the layer-input seam also runs q_a (+ its norm), kv_a and k_rope
     /// (and the indexer's k / weights projections) on the band, and all-gathers their outputs
-    /// instead of the normed hidden. Opt-in; not bit-identical (band-row GEMMs).
-    #[arg(long, env = "PLOW_GLM_SEQ_PAR_PROJ", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
-    pub glm_seq_par_proj: bool,
+    /// instead of the normed hidden. Not bit-identical (band-row GEMMs). On by default for GLM
+    /// on gfx942 TP8 wherever `PLOW_GLM_SEQ_PAR` resolves on; `=false` is the rollback.
+    #[arg(long, env = "PLOW_GLM_SEQ_PAR_PROJ", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_seq_par_proj: Option<bool>,
 
     /// Size the batched-decode glue packets to their work items: the FP8 latent KV writer at one
     /// wave per row instead of one workgroup, the router top-k at one workgroup per token, the
@@ -1194,7 +1197,7 @@ impl EmitConfig {
             glm_gemm_lt: env_bool_opt("PLOW_GLM_GEMM_LT"),
             glm_gemm_lt_decode: env_bool_opt("PLOW_GLM_GEMM_LT_DECODE"),
             glm_gemm_lt_decode_ext: env_bool_opt("PLOW_GLM_GEMM_LT_DECODE_EXT"),
-            glm_fold_lt: env_bool("PLOW_GLM_FOLD_LT"),
+            glm_fold_lt: env_bool_opt("PLOW_GLM_FOLD_LT"),
             glm_gemm_blk: env_str("PLOW_GLM_GEMM_BLK"),
             glm_gemv_wg: env_u32("PLOW_GLM_GEMV_WG"),
             glm_ofold: env_bool("PLOW_GLM_OFOLD"),
@@ -1210,8 +1213,8 @@ impl EmitConfig {
             attnres_decode_mwg: env_u32("PLOW_ATTNRES_DECODE_MWG"),
             glm_xr_band_seam: env_str("PLOW_GLM_XR_BAND_SEAM"),
             glm_xr_res: env_bool("PLOW_GLM_XR_RES"),
-            glm_seq_par: env_bool("PLOW_GLM_SEQ_PAR"),
-            glm_seq_par_proj: env_bool("PLOW_GLM_SEQ_PAR_PROJ"),
+            glm_seq_par: env_bool_opt("PLOW_GLM_SEQ_PAR"),
+            glm_seq_par_proj: env_bool_opt("PLOW_GLM_SEQ_PAR_PROJ"),
             glm_decode_glue_cus: env_bool("PLOW_GLM_DECODE_GLUE_CUS"),
             glm_fuse_xrn: env_bool("GLM_FUSE_XRN"),
             xr_combine_fold: env_opt_out("PLOW_XR_COMBINE_FOLD"),
@@ -1424,20 +1427,47 @@ impl EmitConfig {
         self.glm_gemm_lt_decode_ext.unwrap_or(self.glm_production_defaults)
     }
 
-    /// The `(clap id, still unset)` pairs [`super::apply_production_defaults`] walks to record
-    /// which of the nine it actually decided. Kept beside the accessors so a tenth knob joining
-    /// the recipe cannot be added to one list and forgotten in the other.
-    pub fn glm_recipe_unset(&self) -> [(&'static str, bool); 9] {
+    pub fn glm_fold_lt(&self) -> bool {
+        self.glm_fold_lt.unwrap_or(self.glm_production_defaults)
+    }
+
+    /// The default stands aside for the two-shot seam knobs it replaces, so an explicit
+    /// `PLOW_GLM_XR_RES` / `PLOW_GLM_XR_BAND` emit keeps working without naming this one.
+    pub fn glm_seq_par(&self) -> bool {
+        self.glm_seq_par.unwrap_or(
+            self.glm_production_defaults && !self.glm_xr_res && self.glm_xr_band.unwrap_or(1) <= 1,
+        )
+    }
+
+    /// Defaults on only where [`Self::glm_seq_par`] resolves on: it extends those seams, so
+    /// rolling back `--glm-seq-par=false` alone rolls this back too.
+    pub fn glm_seq_par_proj(&self) -> bool {
+        self.glm_seq_par_proj
+            .unwrap_or(self.glm_production_defaults && self.glm_seq_par())
+    }
+
+    /// The `(clap id, still unset, resolved value)` triples [`super::apply_production_defaults`]
+    /// walks to record which of the recipe knobs it actually decided, and to what. Kept beside
+    /// the accessors so a knob joining the recipe cannot be added to one list and forgotten in
+    /// the other.
+    pub fn glm_recipe_unset(&self) -> [(&'static str, bool, bool); 12] {
         [
-            ("glm_fp8_kv", self.glm_fp8_kv.is_none()),
-            ("glm_moe_aiter", self.glm_moe_aiter.is_none()),
-            ("glm_moe_resident", self.glm_moe_resident.is_none()),
-            ("glm_index_tp", self.glm_index_tp.is_none()),
-            ("glm_select_local", self.glm_select_local.is_none()),
-            ("glm_decode_norm_rows", self.glm_decode_norm_rows.is_none()),
-            ("glm_gemm_lt", self.glm_gemm_lt.is_none()),
-            ("glm_gemm_lt_decode", self.glm_gemm_lt_decode.is_none()),
-            ("glm_gemm_lt_decode_ext", self.glm_gemm_lt_decode_ext.is_none()),
+            ("glm_fp8_kv", self.glm_fp8_kv.is_none(), self.glm_fp8_kv()),
+            ("glm_moe_aiter", self.glm_moe_aiter.is_none(), self.glm_moe_aiter()),
+            ("glm_moe_resident", self.glm_moe_resident.is_none(), self.glm_moe_resident()),
+            ("glm_index_tp", self.glm_index_tp.is_none(), self.glm_index_tp()),
+            ("glm_select_local", self.glm_select_local.is_none(), self.glm_select_local()),
+            ("glm_decode_norm_rows", self.glm_decode_norm_rows.is_none(), self.glm_decode_norm_rows()),
+            ("glm_gemm_lt", self.glm_gemm_lt.is_none(), self.glm_gemm_lt()),
+            ("glm_gemm_lt_decode", self.glm_gemm_lt_decode.is_none(), self.glm_gemm_lt_decode()),
+            (
+                "glm_gemm_lt_decode_ext",
+                self.glm_gemm_lt_decode_ext.is_none(),
+                self.glm_gemm_lt_decode_ext(),
+            ),
+            ("glm_fold_lt", self.glm_fold_lt.is_none(), self.glm_fold_lt()),
+            ("glm_seq_par", self.glm_seq_par.is_none(), self.glm_seq_par()),
+            ("glm_seq_par_proj", self.glm_seq_par_proj.is_none(), self.glm_seq_par_proj()),
         ]
     }
 

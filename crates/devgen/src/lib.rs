@@ -7060,9 +7060,9 @@ fn apply_production_defaults(
     // tree's defaults rather than pinning today's.
     if capabilities.glm && arch == "gfx942" && tp == 8 && n_cu == 304 && !cfg.mxfp4 {
         cfg.glm_production_defaults = true;
-        for (id, unset) in cfg.glm_recipe_unset() {
+        for (id, unset, value) in cfg.glm_recipe_unset() {
             if unset {
-                emit_config::note_production_default(id, "true".into());
+                emit_config::note_production_default(id, value.to_string());
             }
         }
     }

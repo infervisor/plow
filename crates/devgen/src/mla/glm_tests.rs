@@ -2955,7 +2955,7 @@ fn the_qualified_glm_recipe_is_what_an_unflagged_gfx942_tp8_emit_produces() {
     });
     std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
     type Snapshot = Vec<(u32, Vec<packet::dev::DevInst>, Vec<packet::dev::StreamEnt>, Vec<packet::dev::StreamEnt>)>;
-    const RECIPE: [&str; 9] = [
+    const RECIPE: [&str; 12] = [
         "PLOW_GLM_FP8_KV",
         "PLOW_GLM_MOE_AITER",
         "PLOW_GLM_MOE_RESIDENT",
@@ -2965,6 +2965,9 @@ fn the_qualified_glm_recipe_is_what_an_unflagged_gfx942_tp8_emit_produces() {
         "PLOW_GLM_GEMM_LT",
         "PLOW_GLM_GEMM_LT_DECODE",
         "PLOW_GLM_GEMM_LT_DECODE_EXT",
+        "PLOW_GLM_FOLD_LT",
+        "PLOW_GLM_SEQ_PAR",
+        "PLOW_GLM_SEQ_PAR_PROJ",
     ];
     let emit = |glm: &[(&str, &str)]| -> Snapshot {
         let mut env: Vec<(&str, &str)> = vec![
@@ -3041,7 +3044,11 @@ fn the_qualified_glm_recipe_is_what_an_unflagged_gfx942_tp8_emit_produces() {
     // EXT is the one exception to "from OFF": it only widens GEMM_LT_DECODE and is inert without
     // it by construction, so it is probed on top of its parent, which is the question that matters.
     for knob in RECIPE {
-        let parent = (knob == "PLOW_GLM_GEMM_LT_DECODE_EXT").then_some("PLOW_GLM_GEMM_LT_DECODE");
+        let parent = match knob {
+            "PLOW_GLM_GEMM_LT_DECODE_EXT" => Some("PLOW_GLM_GEMM_LT_DECODE"),
+            "PLOW_GLM_SEQ_PAR_PROJ" => Some("PLOW_GLM_SEQ_PAR"),
+            _ => None,
+        };
         let with = |extra: Option<&str>| -> Vec<(&'static str, &'static str)> {
             RECIPE
                 .iter()

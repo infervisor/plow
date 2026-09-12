@@ -1948,7 +1948,7 @@ pub(crate) fn declare_glm_rows_batched(
     enc: MoeEnc,
 ) -> GlmTn {
     let dbatch = dbatch.max(1);
-    let sp_seams = c.tp > 1 && rows >= GLM_SP_MIN_ROWS && emit_config::active().glm_seq_par;
+    let sp_seams = c.tp > 1 && rows >= GLM_SP_MIN_ROWS && emit_config::active().glm_seq_par();
     let rows = (rows.max(1) as u64).max(dbatch as u64);
     let (h, nh, dk, dr, vd, ql, e, tk, imoe) = (
         c.hidden,
@@ -2172,7 +2172,7 @@ pub(crate) fn declare_glm_rows_batched(
     } else {
         (TENSOR_NONE, TENSOR_NONE, TENSOR_NONE)
     };
-    let ug_tp = if sp_seams && emit_config::active().glm_seq_par_proj {
+    let ug_tp = if sp_seams && emit_config::active().glm_seq_par_proj() {
         ac(b, "ug_tp", rows * h as u64 * BF16)
     } else {
         TENSOR_NONE
@@ -6041,7 +6041,7 @@ pub(crate) fn emit_glm_mla_prefill(
     //    on this emitter the way `emit_xreduce`'s sizing had to be (knob-contract §7c).
     // Under OFOLD the merge packet does not exist: the flash's normalized bf16 partials ARE
     // the fused GEMM's A operand, so the o-GEMM deps straight on the flash.
-    let native_fold = emit_config::active().glm_fold_lt && t >= 2048;
+    let native_fold = emit_config::active().glm_fold_lt() && t >= 2048;
     if native_fold {
         assert!(
             crate::emit_is_amd()
@@ -8500,14 +8500,14 @@ fn glm_emit_full(
     let layers: Vec<u32> = (0..nl).collect();
     let enc = MoeEnc::from_flags(use_fp8, false);
     assert!(
-        !emit_config::active().glm_seq_par
+        !emit_config::active().glm_seq_par()
             || (!emit_config::active().glm_xr_res
                 && emit_config::active().glm_xr_band.unwrap_or(1) <= 1),
         "PLOW_GLM_SEQ_PAR replaces the two-shot seams; it cannot combine with PLOW_GLM_XR_RES \
          or PLOW_GLM_XR_BAND"
     );
     assert!(
-        !emit_config::active().glm_seq_par_proj || emit_config::active().glm_seq_par,
+        !emit_config::active().glm_seq_par_proj() || emit_config::active().glm_seq_par(),
         "PLOW_GLM_SEQ_PAR_PROJ extends PLOW_GLM_SEQ_PAR; set both"
     );
     if emit_config::active().glm_moe_resident() {
@@ -8636,7 +8636,7 @@ fn glm_emit_full(
             }
             pb.set_l2_placement(l2_layout);
         }
-        if (emit_config::active().glm_fold_lt && t >= 2048)
+        if (emit_config::active().glm_fold_lt() && t >= 2048)
             || emit_config::active().glm_moe_resident()
         {
             assert!(
@@ -9292,7 +9292,7 @@ pub(crate) fn glm_build_block_pf(
         pb.set_moe_prefill_ep_degree(
             (crate::emit_is_amd() && emit_config::active().moe_prefill_ep).then_some(c.tp),
         );
-        if emit_config::active().glm_fold_lt && t >= 2048 {
+        if emit_config::active().glm_fold_lt() && t >= 2048 {
             assert!(
                 crate::emit_is_amd() && n_cu == 304,
                 "native MLA fold requires gfx942"
