@@ -539,3 +539,8 @@ uint64_t plow_hsa_queue_raw(const plow_hsa* h, int dev) {
     if (!h || dev < 0 || dev >= h->n_dev) return 0;
     return (uint64_t)(uintptr_t)h->dev[dev].queue;
 }
+
+uint64_t plow_hsa_done_signal_raw(const plow_hsa* h, int dev) {
+    if (!h || dev < 0 || dev >= h->n_dev) return 0;
+    return h->dev[dev].done.handle;
+}

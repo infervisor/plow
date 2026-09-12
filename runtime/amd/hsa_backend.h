@@ -132,6 +132,11 @@ uint64_t plow_hsa_kernarg_pool_raw(const plow_hsa* h);
 /* The backend's own default queue for `dev`, so a caller can hsa_amd_queue_cu_set_mask it —
  * turning "these two queues' grids happen to sum to n_cu" into a hardware-enforced partition. */
 uint64_t plow_hsa_queue_raw(const plow_hsa* h, int dev);
+/* The backend's own per-device counting completion signal, so a caller can read its
+ * hsa_amd_profiling_get_dispatch_time after a single isolated dispatch on it — the only way to
+ * time an OPAQUE kernel (no source to instrument) on the SAME clock domain as a second queue's
+ * profiled dispatch. */
+uint64_t plow_hsa_done_signal_raw(const plow_hsa* h, int dev);
 
 #ifdef __cplusplus
 }
