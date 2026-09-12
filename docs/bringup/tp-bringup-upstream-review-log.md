@@ -484,6 +484,31 @@ Found on the way:
 
 Report: `/root/.claude/jobs/c08d1232/tmp/reports/decode-latency.md`.
 
+## Kernarg rings and host staging on the GPU's socket (2026-09-12, branch `hsa-numa-kernarg`)
+
+`HsaBackend::new` took the first CPU agent's pools for every GPU, so all eight kernarg rings and
+pinned staging buffers lived on NUMA node 0, and ranks 4–7 (socket 1) read every dispatch's
+kernargs across the socket link. At the one-shot decode XReduce they arrived 107–180 µs late in
+every traced process; the collective agent's split put the extra ~100 µs per window in the
+non-interpreter gap (native kernels + launch), not in interpreter work or the collective.
+
+`PLOW_AMD_NUMA_HOST_POOLS` (3385e6e4) takes each rank's fine-grained and kernarg pools from its
+GPU's nearest CPU agent and names that agent in host-memory copies. No fine-grained allocation is
+shared across ranks (peer buffers are VRAM). Every load logs one `HSA host placement` line per rank.
+
+Tier 3 (7-layer TP8, 6 processes per arm interleaved, all-rank `PLOW_TRACE_RAW`): **12.576 →
+9.665 ms/step median (−23 %)**, spread 1.8 → 0.23 ms (the per-process slow/bimodal levels are
+gone), ranks 0–3 time inside XReduce 196 → 39 µs, mean window between collectives 682 → 525 µs.
+Projected ≈ −25 ms per 78-layer rung-20 tick (92 → ~67 ms), ≈ +9 % on the 100-prompt run. Off by
+default; flip pending the combined tier 4.
+
+Open: a ~65 µs per-window socket asymmetry remains and flips sign per process; best hypothesis is
+the unpinned `amd-bench` host thread (GPUs on the other socket snoop the writer's cache on every
+dispatch read), testable with `taskset` per socket; the fix would be device-memory or
+write-combined kernargs. Placement anomalies (a few rings on a sibling node of the right socket)
+are page-cache pressure: nodes 1, 2, 3, 5, 6 had ≤ 1 GB free, so the kernel fell back from the
+preferred node. `nearest_cpu_node` in the log is a KFD topology id, not a Linux NUMA id.
+
 ## Knob organization (2026-09-11)
 
 Inventory: 138 runtime knobs (`RuntimeConfig` 33 shared / NVIDIA 34 / AMD 48 / Apple 14 / CPU 9)
