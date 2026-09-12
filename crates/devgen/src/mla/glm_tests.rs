@@ -8,6 +8,65 @@
 use super::*;
 
 #[test]
+fn a_token_batch_body_carries_its_buckets_seams_and_fold() {
+    // A body is its bucket's prefill program plus a decode band, so everything but the band's
+    // decode attention chain must lower the same way, the sequence-parallel seams included.
+    // Without them the 8192 body ran full-width two-shots (156 against the prefill program's
+    // reduce-scatter/all-gather seams) and served +114 ms per middle chunk (tier 4, tb-t4).
+    let _guard = crate::test_env::env_guard();
+    let _env = crate::test_env::EnvScope::set(&[
+        ("PLOW_GLM_FP8_KV", "1"), ("PLOW_UNISEG", "0"), ("PLOW_MLA_PF_V2", "1"),
+        ("PLOW_GLM_SEQ_PAR", "1"), ("PLOW_GLM_SEQ_PAR_PROJ", "1"), ("PLOW_GLM_FOLD_LT", "1"),
+        ("PLOW_GLM_DSA_PF", "1"), ("PLOW_PACKED_SPARSE_PF", "1"), ("PLOW_GLM_INDEX_TP", "1"),
+    ]);
+    crate::with_emit_target_amd(true, || {
+        let mut c = glm_ref_cfg();
+        c.tp = 8;
+        let (ctx, dbatch) = (81920, 20);
+        for t in [2048u32, 8192] {
+            let emit = |band: Option<u32>| {
+                let mut decl = Builder::new(304);
+                let n = declare_glm_rows_batched(&mut decl, &c, ctx, &[3], t, dbatch, MoeEnc::Fp8Blk);
+                let mut b = Builder::new(304);
+                if let Some(bw) = band {
+                    b.set_packed_prefill_segments(true);
+                    b.set_token_batch_band(bw);
+                }
+                b.adopt_tensors(decl.tensors());
+                let xr = b.all();
+                emit_glm_block_prefill(
+                    &mut b, &c, &n, 0, ctx, t, MoeEnc::Fp8Blk, n.x, n.xnext, &[], &mut 0, &xr, band,
+                );
+                b.finish()
+            };
+            let (plain, body) = (emit(None), emit(Some(dbatch)));
+            let count = |p: &packet::devbuild::Program, keep: &dyn Fn(&crate::DevInst) -> bool| {
+                p.insts.iter().filter(|d| keep(d)).count()
+            };
+            for op in [DevOp::XReduceScatter, DevOp::XAllGather, DevOp::XReduceTwoShot] {
+                let is = |d: &crate::DevInst| d.op == op as u16;
+                assert_eq!(count(&body, &is), count(&plain, &is), "t={t}: {op:?}");
+            }
+            let banded = |p: &packet::devbuild::Program| {
+                p.insts
+                    .iter()
+                    .filter(|d| {
+                        d.t.iter().any(|&h| {
+                            p.tensors.get(h as usize).is_some_and(|x| x.name.contains("@band"))
+                        })
+                    })
+                    .count()
+            };
+            assert!(banded(&plain) > 0, "t={t}: the prefill program has no seams to compare against");
+            assert_eq!(banded(&body), banded(&plain), "t={t}: sequence-parallel seam band ops");
+            let native_fold =
+                |d: &crate::DevInst| d.op == DevOp::MlaMergeFold as u16 && d.i[5] == 1;
+            assert_eq!(count(&body, &native_fold), count(&plain, &native_fold), "t={t}: native W_uv fold");
+        }
+    });
+}
+
+#[test]
 fn single_row_prefill_gemv_preserves_bf16_projection_layout() {
     let _guard = crate::test_env::env_guard();
     let _env = crate::test_env::EnvScope::set(&[

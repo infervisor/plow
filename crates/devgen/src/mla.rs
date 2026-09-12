@@ -4741,12 +4741,17 @@ const GLM_SP_MIN_ROWS: u32 = 2048;
 /// residual stream is valid only on this rank's `t/tp` row band, so every seam of a program —
 /// layer input norm, attention, FFN, final norm — must take the same answer; all of them derive
 /// it from these inputs alone.
+///
+/// A token-batch body takes its bucket's seams: every seam op is row-local between the
+/// reduce-scatter and the all-gather, so rows of different requests and the leading decode band
+/// (rank 0's row band) need nothing special. Without them the 8192 body ran full-width two-shots
+/// and served +114 ms per middle chunk against the seams prefill program (tier 4, tb-t4). Packed
+/// prefill siblings without a band keep the two-shot seams.
 fn glm_sp(c: &GlmCfg, n: &GlmTn, b: &Builder, t: u32) -> bool {
     n.h2_tp != TENSOR_NONE
         && t >= GLM_SP_MIN_ROWS
         && t % c.tp == 0
-        && !b.packed_prefill_segments()
-        && b.token_batch_band().is_none()
+        && (!b.packed_prefill_segments() || b.token_batch_band().is_some())
         && !emit_config::active().no_xreduce
 }
 
