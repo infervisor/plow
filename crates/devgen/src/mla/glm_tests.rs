@@ -694,6 +694,64 @@ fn glm_dsa_local_selection_keeps_one_completion_for_independent_rows() {
 }
 
 #[test]
+fn glm_decode_glue_cus_gives_the_key_norm_one_workgroup_per_row() {
+    let _g = crate::test_env::env_guard();
+    let mut c = glm_ref_cfg();
+    c.tp = 8;
+    c.indexer_full[3] = true;
+    let ctx = 81920;
+    let mut declarations = Builder::new(304);
+    let n = declare_glm_rows_batched(&mut declarations, &c, ctx, &[3], 8192, 20, MoeEnc::Fp8Blk);
+    let tensors = declarations.tensors();
+    for glue in ["0", "1"] {
+        let _env = crate::test_env::EnvScope::set(&[
+            ("PLOW_GLM_SELECT_LOCAL", "1"),
+            ("PLOW_GLM_DECODE_GLUE_CUS", glue),
+        ]);
+        for rows in [2, 8, 20] {
+            let mut b = Builder::new(304);
+            b.adopt_tensors(tensors.clone());
+            let ready = b.emit(DevOp::Nop, vec![0], &[], |_| {});
+            let rq: Vec<u32> = (0..3).collect();
+            let rk: Vec<u32> = vec![3];
+            emit_glm_dsa_decode_select(
+                &mut b,
+                &c,
+                &n,
+                &n.lw[0],
+                0,
+                ctx,
+                rows,
+                20,
+                MoeEnc::Fp8Blk,
+                &(0..304).collect::<Vec<_>>(),
+                c.eps as f32,
+                c.q_lora,
+                c.hidden,
+                ready,
+                ready,
+                &rq,
+                &rk,
+                None,
+            );
+            let p = b.finish();
+            let blocks = |op: DevOp| -> Vec<u32> {
+                let ix: Vec<usize> = p
+                    .insts
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, d)| d.op == op as u16)
+                    .map(|(i, _)| i)
+                    .collect();
+                ix.iter().map(|&i| u32::from(p.insts[i].blocks)).collect()
+            };
+            let norm = blocks(DevOp::LayerNorm);
+            assert_eq!(norm, [if glue == "1" { rows } else { 1 }], "glue={glue} rows={rows}");
+        }
+    }
+}
+
+#[test]
 fn glm_dsa_split_selection_gives_each_row_its_own_group_and_strips() {
     let _g = crate::test_env::env_guard();
     let _env = crate::test_env::EnvScope::set(&[

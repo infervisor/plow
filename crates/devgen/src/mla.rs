@@ -4303,7 +4303,16 @@ fn emit_glm_dsa_decode_select(
             Some([_, c_k0, _]) => c_k0,
             None => gemv_blk(b, n.kidx_raw, n.xn, w.iwk, di, h, &[c_rn1]),
         };
-        let c_kn = b.emit(DevOp::LayerNorm, one.clone(), &[c_k0], |d| {
+        // PLOW_GLM_DECODE_GLUE_CUS: `d_layernorm_bias` is one workgroup per row striding by
+        // `nblk`, so give it `rows` workgroups on a slice past the ropes beside it. Bit-identical:
+        // each row is still reduced by one workgroup.
+        let kn_cus = if emit_config::active().glm_decode_glue_cus {
+            let start = (rq.len() + rk.len() + riq.len() + rik.len()).min(all.len() - rows as usize);
+            all[start..start + rows as usize].to_vec()
+        } else {
+            one.clone()
+        };
+        let c_kn = b.emit(DevOp::LayerNorm, kn_cus, &[c_k0], |d| {
             d.t[0] = n.kidx_normed;
             d.t[1] = n.kidx_raw;
             d.t[2] = w.iknw;
