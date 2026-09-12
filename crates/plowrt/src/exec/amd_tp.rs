@@ -185,7 +185,7 @@ use crate::asset::devblob::{DevBlob, DevProg};
 use crate::device::hsa::HsaBackend;
 use crate::device::Backend;
 use crate::exec::amd::{AmdEngine, ChunkStep, TpBind};
-use crate::exec::tp::{PeerLayout, TpGroup, XctrReset, PARTIAL_SLOTS};
+use crate::exec::tp::{PeerLayout, TpGroup, XctrReset, PARTIAL_SLOTS, XCTR_STRIDE};
 use crate::{Result, RuntimeError};
 use packet::dev::PrefillSpan;
 
@@ -378,6 +378,7 @@ pub struct AmdTpGroup {
     audit_direct: bool,
     audit_compact: bool,
     prefill_audit_direct: bool,
+    prefill_audit_pinned: bool,
     index_tp_status: bool,
     /// Read EVERY rank's sampled id, rather than just rank 0's, once every this
     /// many decode tokens — see [`AmdTpGroup::audit_cadence`].
@@ -700,6 +701,7 @@ impl AmdTpGroup {
             audit: !crate::config::RuntimeConfig::get().amd.tp_no_audit,
             audit_direct: crate::config::RuntimeConfig::get().amd.tp_audit_direct,
             prefill_audit_direct: crate::config::RuntimeConfig::get().amd.tp_prefill_audit_direct,
+            prefill_audit_pinned: crate::config::RuntimeConfig::get().amd.tp_prefill_audit_pinned,
             audit_compact,
             index_tp_status,
             agree_every,
@@ -1891,11 +1893,19 @@ impl AmdTpGroup {
     /// decode audit already reads its status word through, instead of one D2H copy per rank.
     /// It cannot move later or be sampled: the next dispatch's `zero_xctr` erases the
     /// counters, and a collective that timed out corrupts KV every later row reads.
-    fn audit_prefill_counters(&self, prog: usize) -> Result<()> {
+    fn audit_prefill_counters(&mut self, prog: usize) -> Result<()> {
         if !self.audit {
             return Ok(());
         }
-        if self.prefill_audit_direct {
+        if self.prefill_audit_pinned {
+            // One pinned copy per rank instead of `n_xctr` large-BAR loads per rank.
+            let n = self.group.layout().n_xctr as usize;
+            let expect = &self.gate_expect[prog];
+            for (e, r) in self.ranks.iter_mut().zip(self.group.ranks()) {
+                check_xstate(r.rank(), e.read_xstate_pinned(r.xctr(), n * XCTR_STRIDE + 4)?, expect)?;
+            }
+            Ok(())
+        } else if self.prefill_audit_direct {
             self.group.audit_xctr_direct(&self.gate_expect[prog])
         } else {
             self.group.audit_xctr(&self.gate_expect[prog])
@@ -2043,6 +2053,39 @@ impl AmdTpGroup {
 /// rendezvous and its published u64 past the end of `xctr` into the partial
 /// slots. Measured on the GLM-5.2 TP4 stacked blob: `n_xctr = 312`, prefill fold
 /// at 312/313, and the ranks sampled `[99419, 785, 99419, 785]`.
+/// Check one rank's xctr readback: `expect.len()` gate lines, then the status line.
+///
+/// A nonzero status is a collective that bailed at its deadline (`0xDEAD0000 | rank`) or another
+/// device-recorded fault. A bail whose late peer arrives afterwards still completes every count,
+/// so only the status word shows it.
+fn check_xstate(rank: u32, buf: &[u8], expect: &[Option<u32>]) -> Result<()> {
+    let word = |at: usize| u32::from_le_bytes(buf[at..at + 4].try_into().expect("4 B"));
+    let status = word(expect.len() * XCTR_STRIDE);
+    if status != 0 {
+        return Err(RuntimeError::Device(format!(
+            "cross-GPU status on rank {rank} is {status:#010x}: a collective bailed at its \
+             deadline and returned WITHOUT reducing, or the device recorded another fault"
+        )));
+    }
+    for (gate, want) in expect.iter().enumerate() {
+        let Some(want) = *want else { continue };
+        let v = word(gate * XCTR_STRIDE);
+        if v != want {
+            return Err(RuntimeError::Device(format!(
+                "cross-GPU gate {gate} on rank {rank} reads {v}, expected {want}. {}",
+                if v < want {
+                    "Some rank never arrived — a collective hit its deadline and returned \
+                     WITHOUT reducing."
+                } else {
+                    "MORE arrivals than the program can produce — a stale count survived from a \
+                     previous dispatch."
+                }
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn xargmax_value_lines(n_batch: u32) -> u32 {
     packet::devbuild::xargmax_value_lines(n_batch)
         .expect("AmdEngine rejects XArgmaxFin batches above the packet limit")
@@ -2258,6 +2301,29 @@ fn gate_expectations(blob: &DevBlob, n_gpu: u32, n_xctr: u32) -> Vec<Vec<Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn xstate_readback_is_an_exact_gate_and_status_check() {
+        let expect = [Some(8), Some(0), None, Some(64)];
+        let buf = |gates: [u32; 4], status: u32| {
+            let mut b = vec![0u8; expect.len() * XCTR_STRIDE + 4];
+            for (g, v) in gates.iter().enumerate() {
+                b[g * XCTR_STRIDE..g * XCTR_STRIDE + 4].copy_from_slice(&v.to_le_bytes());
+                // Only a line's first word is a count.
+                b[g * XCTR_STRIDE + 4] = 0xff;
+            }
+            b[expect.len() * XCTR_STRIDE..].copy_from_slice(&status.to_le_bytes());
+            b
+        };
+        assert!(check_xstate(3, &buf([8, 0, 0xdead_beef, 64], 0), &expect).is_ok());
+        let err = |b: Vec<u8>| check_xstate(3, &b, &expect).unwrap_err().to_string();
+        assert!(err(buf([7, 0, 0, 64], 0)).contains("gate 0 on rank 3 reads 7, expected 8"));
+        assert!(err(buf([8, 0, 0, 64], 0x1)).contains("0x00000001"));
+        assert!(err(buf([8, 8, 0, 64], 0)).contains("MORE arrivals"));
+        assert!(err(buf([8, 0, 0, 72], 0)).contains("gate 3"));
+        // Complete counts, bailed collective: only the status word shows it.
+        assert!(err(buf([8, 0, 0, 64], 0xdead_0005)).contains("0xdead0005"));
+    }
 
     /// The tagged one-shot's blob contract (`check_xr_tagged_blob`): the decode program's
     /// XReduce packets alternate gate parity, fit the layout, and use the decode gather form.

@@ -922,6 +922,12 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-tp-prefill-audit-direct", env = "PLOW_TP_PREFILL_AUDIT_DIRECT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub tp_prefill_audit_direct: bool,
 
+    /// Read each TP prefill chunk's exact counter audit and the collectives' status word with one
+    /// pinned D2H copy per rank. Same gates, same expectations. Takes precedence over
+    /// `--amd-tp-prefill-audit-direct`.
+    #[arg(long = "amd-tp-prefill-audit-pinned", env = "PLOW_TP_PREFILL_AUDIT_PINNED", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub tp_prefill_audit_pinned: bool,
+
     /// Override prefill pad/launch-rows tradeoff.
     #[arg(long = "amd-launch-rows", env = "PLOW_LAUNCH_ROWS", global = true)]
     pub launch_rows: Option<u32>,

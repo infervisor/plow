@@ -5905,6 +5905,8 @@ pub struct AmdEngine {
     h_scalar: HsaPinned,
     /// Pinned zero page for the counter/cursor re-arm.
     h_zero: HsaPinned,
+    /// TP: pinned readback of this rank's xctr gates plus the status line after them.
+    h_xctr: Option<HsaPinned>,
     /// Pinned staging for a prefill program's whole instruction array.
     h_pf_inst: HsaPinned,
     /// Persistent device and pinned-host storage for ragged packed-prefill metadata. Sized once
@@ -10025,6 +10027,14 @@ impl AmdEngine {
             );
         let mut h_zero = EngineDevice::host_alloc_pinned(&*be, max_ctr.max(4))?;
         h_zero.as_mut_slice().fill(0);
+        let h_xctr = tp
+            .map(|t| {
+                EngineDevice::host_alloc_pinned(
+                    &*be,
+                    (t.xstatus_id as usize + 1) * CTR_STRIDE_U32 * 4,
+                )
+            })
+            .transpose()?;
         let d_token_ring = k_token_capture
             .map(|_| EngineDevice::alloc(&*be, (batch * DEFERRED_TOKEN_MAX_STEPS * 4) as u64))
             .transpose()?;
@@ -10256,6 +10266,7 @@ impl AmdEngine {
             h_inst,
             h_scalar,
             h_zero,
+            h_xctr,
             h_pf_inst,
             d_prefill_spans,
             d_prefill_parked,
@@ -11183,6 +11194,20 @@ impl AmdEngine {
     /// synchronous single-bank fallback.
     pub fn rearm_prog(&self, p: usize) -> Result<()> {
         self.rearm(p)
+    }
+
+    /// Pinned D2H of `bytes` from this rank's xctr base: the gates, then the status line.
+    pub fn read_xstate_pinned(&mut self, xctr: u64, bytes: usize) -> Result<&[u8]> {
+        let h = self
+            .h_xctr
+            .as_mut()
+            .ok_or_else(|| RuntimeError::Device("rank has no TP xctr readback buffer".into()))?;
+        let dst = h
+            .as_mut_slice()
+            .get_mut(..bytes)
+            .ok_or_else(|| RuntimeError::Device("xctr readback past its buffer".into()))?;
+        self.be.memcpy_dtoh_pinned(dst, xctr)?;
+        Ok(&h.as_slice()[..bytes])
     }
 
     /// Whether TP may select this program's inactive local-counter bank.
