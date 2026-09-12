@@ -2377,6 +2377,11 @@ fn run_one_tick(
                     if pack.len() != take {
                         continue;
                     }
+                    // Every member must fit THIS pack's body (its attention kind and span
+                    // admissibility), not only the narrower body it was vetted against alone.
+                    if !pack.iter().all(|&(slot, _)| e.token_batch_member_fits_body(slot, rows)) {
+                        continue;
+                    }
                     // Which prompts FINISH here decides whether the step has an output segment
                     // at all: `S = 0` means none, and this route has no way to run a body
                     // without one, so such a pack is skipped rather than staged for the engine
