@@ -32,6 +32,7 @@ using bf16 = __nv_bfloat16;
 static const char* interpreter_path = nullptr;
 static const char* snapshot_path = nullptr;
 static bool lean_hd512 = false;
+static bool lean_hd256_bkv32 = false;
 static bool lean_hd256_bkv64 = false;
 static float attention_scale = 0.0f;
 static unsigned test_kv_length = 16384;
@@ -164,12 +165,14 @@ template<int HD, int BKV> static bool check(unsigned kv_heads, unsigned stride,
     std::vector<void*> packet_allocations;
     if (interpreter_path) {
         CD(cuModuleLoad(&module, interpreter_path));
-        const char* entry = lean_hd256_bkv64 ? "plow_sm90a_pfattn_hd256_bkv64" :
+        const char* entry = lean_hd256_bkv32 ? "plow_sm90a_pfattn_hd256_bkv32" :
+            lean_hd256_bkv64 ? "plow_sm90a_pfattn_hd256_bkv64" :
             lean_hd512 ? "plow_sm90a_pfattn_hd512" : "_Z23interp_sm90a_pfpackedfa11PlowProgram";
         CD(cuModuleGetFunction(&interpreter, module, entry));
         CUdeviceptr arena_symbol;
         size_t arena_size;
-        const char* arena_name = lean_hd256_bkv64 ? "plow_arena_bytes_pfattn_hd256_bkv64" :
+        const char* arena_name = lean_hd256_bkv32 ? "plow_arena_bytes_pfattn_hd256_bkv32" :
+            lean_hd256_bkv64 ? "plow_arena_bytes_pfattn_hd256_bkv64" :
             lean_hd512 ? "plow_arena_bytes_pfattn_hd512" : "plow_arena_bytes_pfpackedfa";
         CD(cuModuleGetGlobal(&arena_symbol, &arena_size, module, arena_name));
         if (arena_size != sizeof(smem)) {
@@ -357,6 +360,7 @@ int main(int argc, char** argv) {
         else if (std::strcmp(argv[i], "--json") == 0) json_output = true;
         else if (std::strcmp(argv[i], "--mapped-only") == 0) mapped_only = true;
         else if (std::strcmp(argv[i], "--lean-hd512") == 0) lean_hd512 = true;
+        else if (std::strcmp(argv[i], "--lean-hd256-bkv32") == 0) lean_hd256_bkv32 = true;
         else if (std::strcmp(argv[i], "--lean-hd256-bkv64") == 0) lean_hd256_bkv64 = true;
         else if (std::strcmp(argv[i], "--blocks") == 0 && i + 1 < argc) {
             char* end;
@@ -403,8 +407,9 @@ int main(int argc, char** argv) {
         }
         else return 2;
     }
-    if ((lean_hd512 || lean_hd256_bkv64) && !interpreter_path) return 2;
-    if (lean_hd512 && lean_hd256_bkv64) return 2;
+    if ((lean_hd512 || lean_hd256_bkv32 || lean_hd256_bkv64) && !interpreter_path) return 2;
+    if (unsigned(lean_hd512) + unsigned(lean_hd256_bkv32) + unsigned(lean_hd256_bkv64) > 1)
+        return 2;
     if (PLOW_TEST_FA_ROWS && !lean_hd512 && !PLOW_NV_FA512_KV64 &&
         !PLOW_TEST_FA_HD256_ONLY) return 2;
     if (!PLOW_TEST_FA_ROWS && test_kv_length != 16384) return 2;
@@ -421,6 +426,10 @@ int main(int argc, char** argv) {
     bool ok = true;
     for (bool tma : {false, true}) {
         if (mapped_only && !tma) continue;
+        if (lean_hd256_bkv32) {
+            if (tma) ok &= check<256,32>(8,2048,2047,1024,true,profile);
+            continue;
+        }
         if (lean_hd256_bkv64) {
             if (tma) ok &= check<256,64>(8,2048,2047,1024,true,profile);
             continue;

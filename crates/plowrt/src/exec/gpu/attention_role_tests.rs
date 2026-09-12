@@ -141,6 +141,13 @@ fn hd256_bkv64_object() -> plow_asset::segment_roles::SegmentObject {
     }
 }
 
+fn hd256_bkv32_object() -> plow_asset::segment_roles::SegmentObject {
+    let mut object = hd256_bkv64_object();
+    object.abi = plow_asset::segment_roles::PREFILL_ATTENTION_HD256_BKV32_ABI.into();
+    object.attention.as_mut().unwrap().kv_tile = 32;
+    object
+}
+
 #[test]
 fn accepts_combined_roles_and_preserves_packet_split_counts() {
     for (rows, splits) in [(128, 3), (1024, 2), (4096, 1), (8192, 4)] {
@@ -349,7 +356,7 @@ fn accepts_exact_hd512_wg32_contract_and_rejects_drift() {
 #[test]
 fn accepts_exact_hd256_bkv64_contract_and_rejects_drift() {
     let object = hd256_bkv64_object();
-    check_attention_hd256_bkv64_role(
+    check_attention_hd256_role(
         "sm90a",
         &object,
         Some(1),
@@ -364,9 +371,37 @@ fn accepts_exact_hd256_bkv64_contract_and_rejects_drift() {
         [Some(256), Some(64), Some(64), Some(4)],
     ] {
         assert!(
-            check_attention_hd256_bkv64_role("sm90a", &object, Some(1), Some(256), geometry)
+            check_attention_hd256_role("sm90a", &object, Some(1), Some(256), geometry)
                 .is_err()
         );
+    }
+}
+
+#[test]
+fn accepts_exact_hd256_bkv32_contract_and_rejects_drift() {
+    let object = hd256_bkv32_object();
+    check_attention_hd256_role(
+        "sm90a",
+        &object,
+        Some(1),
+        Some(256),
+        [Some(256), Some(64), Some(32), Some(8)],
+    )
+    .unwrap();
+    for geometry in [
+        [Some(512), Some(64), Some(32), Some(8)],
+        [Some(256), Some(32), Some(32), Some(8)],
+        [Some(256), Some(64), Some(64), Some(8)],
+        [Some(256), Some(64), Some(32), Some(4)],
+    ] {
+        assert!(check_attention_hd256_role(
+            "sm90a",
+            &object,
+            Some(1),
+            Some(256),
+            geometry,
+        )
+        .is_err());
     }
 }
 
@@ -427,6 +462,7 @@ fn actual_packet_attention_roles() {
                 plow_asset::segment_roles::PREFILL_ATTENTION
                     | plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32
                     | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_BKV64
+                    | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_BKV32
             )
         })
         .count();

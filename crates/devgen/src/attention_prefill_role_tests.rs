@@ -169,13 +169,13 @@ fn hd256_record(model: &Model, image: &[u8]) -> tunedb::AttentionRoleMeasurement
             live_kv_bucket: tunedb::KvBucket::K1,
             topology: tunedb::AttentionTopology::Single,
         },
-        role: PREFILL_ATTENTION_HD256_BKV64,
+        role: PREFILL_ATTENTION_HD256_BKV32,
         object_file: HD256_OBJECT_FILE.into(),
         object_sha256: object_sha256.clone(),
         program_sha256,
         config: tunedb::AttentionRoleConfig {
             query_tile: 64,
-            kv_tile: 64,
+            kv_tile: 32,
             warps: 8,
             stages: 2,
             nsplit: 1,
@@ -196,8 +196,8 @@ fn hd256_record(model: &Model, image: &[u8]) -> tunedb::AttentionRoleMeasurement
 }
 
 #[test]
-fn exact_hd256_bkv64_object_preserves_existing_packet_segments() {
-    let directory = output_dir("hd256-bkv64");
+fn exact_hd256_bkv32_object_preserves_existing_packet_segments() {
+    let directory = output_dir("hd256-bkv32");
     let output = directory.join("model.pkt");
     let image = hd256_image();
     std::fs::write(directory.join(HD256_OBJECT_FILE), &image).unwrap();
@@ -221,11 +221,11 @@ fn exact_hd256_bkv64_object_preserves_existing_packet_segments() {
     .unwrap());
     assert_eq!(model.progs[0].insts, original_insts);
     let roles = SegmentRoles::from_bytes(&sections[0].data).unwrap();
-    assert_eq!(roles.programs[0].roles, [0, 10, 0]);
+    assert_eq!(roles.programs[0].roles, [0, 11, 0]);
     assert_eq!(model.progs[0].gq_seg_ofs.len(), 4);
-    let object = &roles.objects[&PREFILL_ATTENTION_HD256_BKV64];
-    assert_eq!(object.abi, PREFILL_ATTENTION_HD256_BKV64_ABI);
-    assert_eq!(object.attention.as_ref().unwrap().kv_tile, 64);
+    let object = &roles.objects[&PREFILL_ATTENTION_HD256_BKV32];
+    assert_eq!(object.abi, PREFILL_ATTENTION_HD256_BKV32_ABI);
+    assert_eq!(object.attention.as_ref().unwrap().kv_tile, 32);
     assert_eq!(object.sha256.as_deref().map(str::len), Some(64));
     std::fs::remove_dir_all(directory).unwrap();
 }

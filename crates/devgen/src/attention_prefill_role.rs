@@ -2,7 +2,7 @@ use packet::dev::{DevOp, TENSOR_NONE};
 use packet::devbuild::{Model, SectionData, SECT_METADATA};
 use plow_asset::segment_roles::{
     AttentionCapability, ProgramRoles, SegmentObject, SegmentRoles, INTERPRETER,
-    PREFILL_ATTENTION_HD256_BKV64, PREFILL_ATTENTION_HD256_BKV64_ABI, PREFILL_ATTENTION_HD512_WG32,
+    PREFILL_ATTENTION_HD256_BKV32, PREFILL_ATTENTION_HD256_BKV32_ABI, PREFILL_ATTENTION_HD512_WG32,
     PREFILL_ATTENTION_HD512_WG32_ABI, SECTION,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -19,21 +19,21 @@ const OBJECT_GLOBALS: [(&str, u32); 7] = [
     ("plow_block_pfattn_hd512", 256),
     ("plow_arena_bytes_pfattn_hd512", 201_728),
 ];
-const HD256_OBJECT_FILE: &str = "interp_sm90a_pfattn_hd256_bkv64.cubin";
-const HD256_OBJECT_ENTRY: &str = "plow_sm90a_pfattn_hd256_bkv64";
+const HD256_OBJECT_FILE: &str = "interp_sm90a_pfattn_hd256_bkv32.cubin";
+const HD256_OBJECT_ENTRY: &str = "plow_sm90a_pfattn_hd256_bkv32";
 const HD256_OBJECT_GLOBALS: [(&str, u32); 7] = [
-    ("plow_attention_sm90_hd256_bkv64_abi", 1),
+    ("plow_attention_sm90_hd256_bkv32_abi", 1),
     ("plow_attention_head_dim", 256),
     ("plow_attention_query_tile", 64),
-    ("plow_attention_kv_tile", 64),
+    ("plow_attention_kv_tile", 32),
     ("plow_attention_warps", 8),
-    ("plow_block_pfattn_hd256_bkv64", 256),
-    ("plow_arena_bytes_pfattn_hd256_bkv64", 173_056),
+    ("plow_block_pfattn_hd256_bkv32", 256),
+    ("plow_arena_bytes_pfattn_hd256_bkv32", 103_424),
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
-    Hd256Bkv64,
+    Hd256Bkv32,
     Hd512,
 }
 
@@ -53,7 +53,7 @@ struct Hd256Qualification {
 
 fn hd256_implementation() -> String {
     plow_asset::decode_objects::image_sha256(include_bytes!(
-        "../../../runtime/nvidia/interp_sm90a_pfattn_hd256_bkv64.cu"
+        "../../../runtime/nvidia/interp_sm90a_pfattn_hd256_bkv32.cu"
     ))
 }
 
@@ -132,7 +132,7 @@ fn qualify_hd256_programs(
             let Some(record) = tunedb::select_attention_role(
                 records,
                 &cell,
-                PREFILL_ATTENTION_HD256_BKV64,
+                PREFILL_ATTENTION_HD256_BKV32,
                 &digests[index],
                 &implementation,
                 toolchain,
@@ -142,7 +142,7 @@ fn qualify_hd256_programs(
             };
             if record.object_file != HD256_OBJECT_FILE
                 || record.config.query_tile != 64
-                || record.config.kv_tile != 64
+                || record.config.kv_tile != 32
                 || record.config.warps != 8
                 || record.config.stages != 2
                 || record.config.nsplit != 1
@@ -204,14 +204,14 @@ fn apply_qualified_hd256(
             .any(|&(name, value)| plow_asset::cubin::global_u32(&image, name) != Some(value))
     {
         return Err(format!(
-            "{} has incompatible HD256 BKV64 prefill attention capabilities",
+            "{} has incompatible HD256 BKV32 prefill attention capabilities",
             path.display()
         ));
     }
     apply(
         model,
         sections,
-        &Selection::hd256_bkv64(qualification.file.clone(), &image),
+        &Selection::hd256_bkv32(qualification.file.clone(), &image),
         profile,
         Some(&qualification.programs),
     )
@@ -229,19 +229,19 @@ impl Selection {
         }
     }
 
-    fn hd256_bkv64(file: String, image: &[u8]) -> Self {
+    fn hd256_bkv32(file: String, image: &[u8]) -> Self {
         Self {
             file,
             sha256: plow_asset::decode_objects::image_sha256(image),
             wgmma: false,
-            kv64: true,
-            kind: Kind::Hd256Bkv64,
+            kv64: false,
+            kind: Kind::Hd256Bkv32,
         }
     }
 
     fn role(&self) -> u8 {
         match self.kind {
-            Kind::Hd256Bkv64 => PREFILL_ATTENTION_HD256_BKV64,
+            Kind::Hd256Bkv32 => PREFILL_ATTENTION_HD256_BKV32,
             Kind::Hd512 => PREFILL_ATTENTION_HD512_WG32,
         }
     }
@@ -281,7 +281,7 @@ fn eligible(op: &packet::dev::DevInst, n_cu: u16) -> bool {
 fn eligible_for(op: &packet::dev::DevInst, n_cu: u16, selection: &Selection) -> bool {
     match selection.kind {
         Kind::Hd512 => eligible(op, n_cu),
-        Kind::Hd256Bkv64 => {
+        Kind::Hd256Bkv32 => {
             op.blocks == n_cu
                 && op.is_hd256_gqa2_sliding_prefill()
                 && op.i[0] > 0
@@ -410,17 +410,17 @@ fn apply(
 ) -> Result<(), String> {
     if profile != "sm90a" {
         return Err(match selection.kind {
-            Kind::Hd256Bkv64 => "HD256 BKV64 prefill attention role requires sm90a".into(),
+            Kind::Hd256Bkv32 => "HD256 BKV32 prefill attention role requires sm90a".into(),
             Kind::Hd512 => "HD512 WG32 prefill attention role requires sm90a".into(),
         });
     }
     let mut attention = match selection.kind {
-        Kind::Hd256Bkv64 => AttentionCapability {
+        Kind::Hd256Bkv32 => AttentionCapability {
             profile: "sm90a".into(),
             dtype: "bf16".into(),
             head_dim: 256,
             query_tile: 64,
-            kv_tile: 64,
+            kv_tile: 32,
             warps: 8,
         },
         Kind::Hd512 => capability(selection.wgmma),
@@ -431,7 +431,7 @@ fn apply(
     let role = selection.role();
     let object = SegmentObject {
         abi: match selection.kind {
-            Kind::Hd256Bkv64 => PREFILL_ATTENTION_HD256_BKV64_ABI,
+            Kind::Hd256Bkv32 => PREFILL_ATTENTION_HD256_BKV32_ABI,
             Kind::Hd512 => PREFILL_ATTENTION_HD512_WG32_ABI,
         }
         .into(),
@@ -463,7 +463,7 @@ fn apply(
     }
     if metadata.objects.contains_key(&role) {
         return Err(match selection.kind {
-            Kind::Hd256Bkv64 => "HD256 BKV64 prefill attention role already declared".into(),
+            Kind::Hd256Bkv32 => "HD256 BKV32 prefill attention role already declared".into(),
             Kind::Hd512 => "HD512 prefill attention role already declared".into(),
         });
     }
@@ -489,7 +489,7 @@ fn apply(
             .iter()
             .map(|op| {
                 let output_head_dim = match selection.kind {
-                    Kind::Hd256Bkv64 => 256,
+                    Kind::Hd256Bkv32 => 256,
                     Kind::Hd512 => 512,
                 };
                 eligible_for(op, n_cu, selection)
@@ -534,7 +534,7 @@ fn apply(
                 .enumerate()
                 .find(|(_, (op, selected))| {
                     (selection.kind != Kind::Hd512 || is_hd512_attention(op))
-                        && (selection.kind != Kind::Hd256Bkv64
+                        && (selection.kind != Kind::Hd256Bkv32
                             || op.is_hd256_gqa2_sliding_prefill())
                         && if op.op == DevOp::FlashPrefill as u16 {
                             !**selected
@@ -546,7 +546,7 @@ fn apply(
             return Err(format!(
                 "incompatible {} prefill attention operand contract at program {index} pc {pc}: blocks={} i={:?} t={:?} map_bytes={:?}",
                 match selection.kind {
-                    Kind::Hd256Bkv64 => "HD256 BKV64",
+                    Kind::Hd256Bkv32 => "HD256 BKV32",
                     Kind::Hd512 => "HD512",
                 },
                 op.blocks,
@@ -560,7 +560,7 @@ fn apply(
         }
         if program.l2_domains != 0 || program.hier_base != 0 {
             return Err(match selection.kind {
-                Kind::Hd256Bkv64 => "HD256 BKV64 role requires a plain prefill program".into(),
+                Kind::Hd256Bkv32 => "HD256 BKV32 role requires a plain prefill program".into(),
                 Kind::Hd512 => "HD512 role requires a plain prefill program".into(),
             });
         }
@@ -629,8 +629,8 @@ fn apply(
             if let Some(prior) = inst_segment[inst] {
                 if prior != segment {
                     return Err(match selection.kind {
-                        Kind::Hd256Bkv64 => {
-                            "HD256 BKV64 role instruction is not contiguous in the queue".into()
+                        Kind::Hd256Bkv32 => {
+                            "HD256 BKV32 role instruction is not contiguous in the queue".into()
                         }
                         Kind::Hd512 => {
                             "HD512 role instruction is not contiguous in the queue".into()
@@ -654,8 +654,8 @@ fn apply(
     }
     if selected == 0 {
         return Err(match selection.kind {
-            Kind::Hd256Bkv64 => {
-                "packet has no compatible HD256 BKV64 prefill attention segments".into()
+            Kind::Hd256Bkv32 => {
+                "packet has no compatible HD256 BKV32 prefill attention segments".into()
             }
             Kind::Hd512 => "packet has no compatible HD512 prefill attention segments".into(),
         });
