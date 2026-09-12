@@ -330,6 +330,36 @@ fn segment_major_order(n_segments: usize, n_ranks: usize) -> impl Iterator<Item 
     (0..n_segments).flat_map(move |seg| (0..n_ranks).map(move |rank| (seg, rank)))
 }
 
+/// One action of a token-batch body launch, in the order [`body_launch_plan`] yields them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BodyLaunch {
+    Reserve(usize),
+    Enqueue { seg: usize, rank: usize },
+    Commit(usize),
+    Drain(usize),
+}
+
+/// A token-batch body launches the way `prefill_chunk` launches a chunk: every rank's graph-phase
+/// replay reserved before any doorbell (a rank-first commit desynchronizes the TP group), every
+/// segment enqueued segment-major, the replays committed, and ONE drain per rank for the step.
+/// Draining every rank after every segment cost one host round trip per segment (85 per 8192
+/// body step at 4 layers), which is most of what the body paid over a chunk plus a decode pass.
+fn body_launch_plan(
+    n_segments: usize,
+    n_ranks: usize,
+    phase_replay: bool,
+) -> impl Iterator<Item = BodyLaunch> {
+    let replay = if phase_replay { n_ranks } else { 0 };
+    (0..replay)
+        .map(BodyLaunch::Reserve)
+        .chain(
+            segment_major_order(n_segments, n_ranks)
+                .map(|(seg, rank)| BodyLaunch::Enqueue { seg, rank }),
+        )
+        .chain((0..replay).map(BodyLaunch::Commit))
+        .chain((0..n_ranks).map(BodyLaunch::Drain))
+}
+
 /// N co-resident ranks of one sharded model.
 pub struct AmdTpGroup {
     /// Peer buffers, counter regions, and the launch discipline.
@@ -1397,12 +1427,47 @@ impl AmdTpGroup {
                 self.ranks[rank].prog_dispatch(prog).launches()
             )));
         }
-        for seg in 0..launches {
-            for e in &mut self.ranks {
-                e.enqueue_segment(prog, seg)?;
+        if crate::config::RuntimeConfig::get().amd.prefill_seg_timing {
+            // Timing a segment needs its own drain, as on the prefill path.
+            for seg in 0..launches {
+                let submit = std::time::Instant::now();
+                for e in &mut self.ranks {
+                    e.enqueue_segment(prog, seg)?;
+                }
+                let enqueued = std::time::Instant::now();
+                for e in &self.ranks {
+                    e.drain()?;
+                }
+                eprintln!(
+                    "TB_SEG_TIMING program={prog} rows={} segment={seg} family={} enqueue_us={:.3} critical_us={:.3}",
+                    self.ranks[0].prog_t(prog),
+                    self.ranks[0].prefill_segment_family(prog, seg),
+                    (enqueued - submit).as_secs_f64() * 1e6,
+                    submit.elapsed().as_secs_f64() * 1e6,
+                );
             }
-            for e in &self.ranks {
-                e.drain()?;
+        } else {
+            let phase_replay = self.ranks[0].graph_phase_replay(prog);
+            if self.ranks.iter().any(|rank| rank.graph_phase_replay(prog) != phase_replay) {
+                return Err(RuntimeError::Device(
+                    "graph phase-object selection differs across TP ranks".into(),
+                ));
+            }
+            for op in body_launch_plan(launches, self.ranks.len(), phase_replay) {
+                match op {
+                    BodyLaunch::Reserve(rank) => {
+                        self.ranks[rank].begin_graph_phase_replay(prog)?;
+                    }
+                    BodyLaunch::Enqueue { seg, rank } => {
+                        self.ranks[rank].enqueue_segment(prog, seg)?;
+                    }
+                    BodyLaunch::Commit(rank) => {
+                        self.ranks[rank].commit_graph_phase_replay()?;
+                    }
+                    BodyLaunch::Drain(rank) => {
+                        self.ranks[rank].drain()?;
+                    }
+                }
             }
         }
         if self.audit {
@@ -2304,6 +2369,41 @@ mod tests {
             assert_eq!(ranks, [(seg, 0), (seg, 1), (seg, 2)]);
         }
         assert_eq!(order.last(), Some(&(3, 2)));
+    }
+
+    #[test]
+    fn a_token_batch_body_launches_segment_major_and_drains_each_rank_once() {
+        use BodyLaunch::{Commit, Drain, Enqueue, Reserve};
+        assert_eq!(
+            body_launch_plan(2, 3, false).collect::<Vec<_>>(),
+            [
+                Enqueue { seg: 0, rank: 0 },
+                Enqueue { seg: 0, rank: 1 },
+                Enqueue { seg: 0, rank: 2 },
+                Enqueue { seg: 1, rank: 0 },
+                Enqueue { seg: 1, rank: 1 },
+                Enqueue { seg: 1, rank: 2 },
+                Drain(0),
+                Drain(1),
+                Drain(2),
+            ]
+        );
+        // Every rank reserved before any doorbell, committed after the last enqueue.
+        assert_eq!(
+            body_launch_plan(2, 2, true).collect::<Vec<_>>(),
+            [
+                Reserve(0),
+                Reserve(1),
+                Enqueue { seg: 0, rank: 0 },
+                Enqueue { seg: 0, rank: 1 },
+                Enqueue { seg: 1, rank: 0 },
+                Enqueue { seg: 1, rank: 1 },
+                Commit(0),
+                Commit(1),
+                Drain(0),
+                Drain(1),
+            ]
+        );
     }
 
     #[test]
