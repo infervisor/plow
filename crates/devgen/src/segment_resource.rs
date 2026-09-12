@@ -3,10 +3,11 @@
 //!
 //! ## The bug class this exists to make visible
 //!
-//! The AMD host relaunches the interpreter once per segment, on the code object matching that
+//! The host relaunches the interpreter once per segment, on the code object matching that
 //! segment's wave class, at that class's thread count ([`docs/arch/06-runtime.md`], "Segmented
 //! dispatch"). The blob does not carry the class: the runtime RE-DERIVES it from the emitted
-//! stream (`plowrt::exec::amd::derive_segments`), and its rule for the flash interpreter is
+//! stream, and **both GPU backends implement the same default rule** —
+//! `plowrt::exec::amd::derive_segments` and `plowrt::asset::devblob::seg_classes_with`:
 //!
 //! > a segment is class 4 (256 threads) iff ANY stream entry in it points at a flash-prefill
 //! > instruction; everything else is class 8.
@@ -17,6 +18,10 @@
 //! twice, in production, both times as **zero logits**: `PLOW_L2_PLACE` "formerly overwrote the
 //! wave-class tag on a MULTI-SEGMENT program", and `PLOW_UNISEG` "destroyed the wave-class split
 //! → zero logits, 8.7 ms 'prefill'". Both were found by serving a model, not by emitting one.
+//!
+//! NVIDIA carries one purity refusal already — a segment mixing exact HD256/GQA2 attention with
+//! another operator is rejected BY NAME at load — which is the shape the rest of the
+//! classification lacks, on both backends. See [`ClassRule`] for the per-target scope.
 //!
 //! The emitter's own segmentation (`packet::devbuild::Builder`'s `wave_class`) and the runtime's
 //! re-derivation are two different functions over the same data, written in two crates, agreeing
@@ -82,8 +87,64 @@ pub struct SegmentResource {
     pub ops: BTreeSet<u16>,
 }
 
-/// The runtime's flash-interpreter predicate ([`derive_segments`]'s first arm), reproduced here
-/// against the emitted instruction rather than the emitter's intent.
+/// Which consumer re-derives the wave class for this target, and therefore whose rule this
+/// section is entitled to apply.
+///
+/// Both GPU backends implement the SAME default rule — `plowrt::exec::amd::derive_segments` and
+/// `plowrt::asset::devblob::seg_classes_with` each set class 4 when ANY entry of a segment is a
+/// flash-prefill op — so one predicate serves both. The CPU and Apple engines honour
+/// `StreamEnt::seg` (they filter the stream by it) but derive no wave class and select no
+/// per-class object, so there is nothing to be impure with respect to.
+///
+/// A target whose rule is not modelled here gets resource facts and NO class claim. That follows
+/// [`crate::dispatch_audit`]'s rule for an unknowable tile: "a guessed tile would put a
+/// fabricated percentage in the manifest, which is strictly worse than an absent one", and the
+/// `resource_contract` in [`crate::manifest`], which is already `null` off AMD.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClassRule {
+    /// `plowrt::exec::amd::derive_segments`.
+    Amd,
+    /// `plowrt::asset::devblob::seg_classes_with` at its DEFAULT policy.
+    ///
+    /// NVIDIA's classification additionally has `pure_mode` (1/2/3), `fa512_mode` (1/2) and
+    /// `fa256_gqa2`, taken from `PLOW_PF_SEG_PURE` / `PLOW_PF_SEG_FA512` /
+    /// `PLOW_PF_SEG_FA256_GQA2` at SERVE time, or inferred from the packet's isolated segments.
+    /// Under `pure_mode` the polarity inverts — a segment is GEMM-class only if every op in it
+    /// is a mapped GEMM — and under `fa512_mode` hd512 flash becomes class 2. None of those are
+    /// decidable from the blob alone, so this section asserts the default policy only. The
+    /// `fa256_gqa2` arm needs no tripwire from here: it already refuses a mixed segment by name
+    /// at load.
+    Nvidia,
+    /// CPU / Apple: segment-aware, but no wave class and no per-class object.
+    NoWaveClass,
+}
+
+impl ClassRule {
+    fn of(arch: &str) -> Self {
+        if arch.starts_with("gfx") {
+            Self::Amd
+        } else if arch.starts_with("sm_") {
+            Self::Nvidia
+        } else {
+            Self::NoWaveClass
+        }
+    }
+
+    fn classifies(self) -> bool {
+        !matches!(self, Self::NoWaveClass)
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Amd => "amd/derive_segments",
+            Self::Nvidia => "nvidia/seg_classes_with@default-policy",
+            Self::NoWaveClass => "none",
+        }
+    }
+}
+
+/// The flash-interpreter predicate both GPU backends implement, reproduced here against the
+/// emitted instruction rather than the emitter's intent.
 fn is_flash_prefill(op: u16) -> bool {
     op == DevOp::FlashPrefill as u16 || op == DevOp::FlashPrefillFp8 as u16
 }
@@ -200,7 +261,7 @@ pub fn table(m: &Model) -> Vec<SegmentResource> {
     out
 }
 
-fn row_json(r: &SegmentResource) -> Value {
+fn row_json(r: &SegmentResource, rule: ClassRule) -> Value {
     json!({
         "program": r.program,
         "kind": &r.kind[1..],
@@ -209,20 +270,27 @@ fn row_json(r: &SegmentResource) -> Value {
         "insts": r.insts,
         "cus": r.cus,
         "workgroups": r.workgroups,
-        "flash_class": r.flash_class(),
+        // Absent, not guessed, where no consumer rule is modelled for this target.
+        "flash_class": if rule.classifies() {
+            json!(r.flash_class())
+        } else {
+            Value::Null
+        },
         "ops": r.ops.iter().copied().map(name_of).collect::<Vec<_>>(),
     })
 }
 
 /// The `segment_resource` section of `build.json`.
-pub fn section(m: &Model) -> Value {
+pub fn section(m: &Model, arch: &str) -> Value {
+    let rule = ClassRule::of(arch);
     let rows = table(m);
     let findings: Vec<Value> = rows
         .iter()
-        .filter(|r| r.flash_impure())
+        .filter(|r| rule.classifies() && r.flash_impure())
         .map(|r| {
             json!({
                 "kind": "flash_segment_impure",
+                "rule": rule.name(),
                 "program": r.program,
                 "t": r.t,
                 "seg": r.seg,
@@ -235,13 +303,31 @@ pub fn section(m: &Model) -> Value {
         "note": "Per-segment resource footprint, derived from Program::stream / stream_ofs / \
                  stream_len and the instruction table — never from the EmitConfig or the \
                  environment. `cus` is the distinct CU ids carrying an entry of the segment; \
-                 `workgroups` is the largest DevInst::blocks in it. `flash_class` applies the \
-                 RUNTIME's rule (plowrt::exec::amd::derive_segments): any FlashPrefill entry \
-                 sends the whole segment to the four-wave flash object.",
+                 `workgroups` is the largest DevInst::blocks in it.",
+        "class_rule": rule.name(),
+        "class_rule_note": "`flash_class` applies the CONSUMER's rule: any flash-prefill entry \
+                            sends the whole segment to the four-wave flash object. AMD and \
+                            NVIDIA implement the same default rule \
+                            (exec::amd::derive_segments, asset::devblob::seg_classes_with). \
+                            NVIDIA additionally has pure_mode / fa512_mode / fa256_gqa2, taken \
+                            from PLOW_PF_SEG_PURE / PLOW_PF_SEG_FA512 / PLOW_PF_SEG_FA256_GQA2 \
+                            at SERVE time; under those the polarity inverts or hd512 flash \
+                            becomes class 2, so this section asserts the DEFAULT policy only \
+                            (the fa256_gqa2 arm already refuses a mixed segment by name at \
+                            load). CPU and Apple honour `seg` but derive no wave class, so \
+                            `flash_class` is null and no finding is raised for them.",
+        "tile_provenance": "NOT joined per segment, deliberately. `tuning.tile_source` is \
+                            blob-global and decision-based (tune_demand::note_decision), which \
+                            is the only correct source: the shape-keyed lookup log is what \
+                            reported 48/48 covered while the packet was byte-identical to a \
+                            --no-tuning build, because the ingest rung table maps tiles to \
+                            opcodes by geometry. Per-segment provenance needs note_decision to \
+                            carry the shape it decided; joining these rows to the lookup log \
+                            would reproduce that exact false positive.",
         "co_residency": "The packet records no launch geometry, so segment co-residency is only \
                          decidable here up to CU disjointness and derived-class equality. Equal \
                          occupancy is an object property and is not checkable from this blob.",
-        "segments": rows.iter().map(row_json).collect::<Vec<_>>(),
+        "segments": rows.iter().map(|r| row_json(r, rule)).collect::<Vec<_>>(),
         "findings": findings,
     })
 }
@@ -406,6 +492,65 @@ mod tests {
         let flash = &segs[0];
         assert!(co_resident(flash, flash, &[0, 1], &[2, 3]));
         assert!(!co_resident(flash, flash, &[0, 1], &[1, 2]));
+    }
+
+    /// Both GPU backends re-derive the same default rule, so both get a class and a finding.
+    /// CPU/Apple derive no wave class, so the row carries `null` and raises nothing — absent
+    /// rather than fabricated.
+    #[test]
+    fn the_class_claim_follows_the_target_that_re_derives_it() {
+        assert_eq!(ClassRule::of("gfx942"), ClassRule::Amd);
+        assert_eq!(ClassRule::of("sm_90a"), ClassRule::Nvidia);
+        assert_eq!(ClassRule::of("sm_120a"), ClassRule::Nvidia);
+        assert_eq!(ClassRule::of("cpu"), ClassRule::NoWaveClass);
+        assert_eq!(ClassRule::of("apple"), ClassRule::NoWaveClass);
+
+        let segs = segments(&split_program(), 0, 128, "0prefill");
+        for rule in [ClassRule::Amd, ClassRule::Nvidia] {
+            assert_eq!(row_json(&segs[0], rule)["flash_class"], json!(true));
+        }
+        assert_eq!(
+            row_json(&segs[0], ClassRule::NoWaveClass)["flash_class"],
+            Value::Null
+        );
+    }
+
+    /// The impurity finding is raised for both GPU targets and suppressed where no consumer
+    /// re-derives a class — on the SAME collapsed program, so the suppression is the variable.
+    #[test]
+    fn findings_are_raised_per_target_rule_not_per_packet() {
+        let mut p = split_program();
+        for e in &mut p.stream {
+            e.seg = 0;
+        }
+        let m = Model {
+            n_cu: 2,
+            target: 0,
+            tensors: vec![],
+            progs: vec![p],
+            kv_row_insts: vec![],
+            prog_t: vec![128],
+            gen: vec![],
+        };
+        for arch in ["gfx942", "sm_90a"] {
+            let s = section(&m, arch);
+            assert_eq!(
+                s["findings"].as_array().map(Vec::len),
+                Some(1),
+                "{arch}: {s}"
+            );
+            assert_eq!(s["findings"][0]["rule"], json!(ClassRule::of(arch).name()));
+        }
+        for arch in ["cpu", "apple"] {
+            let s = section(&m, arch);
+            assert_eq!(
+                s["findings"].as_array().map(Vec::len),
+                Some(0),
+                "{arch}: {s}"
+            );
+            assert_eq!(s["class_rule"], json!("none"));
+            assert_eq!(s["segments"][0]["flash_class"], Value::Null);
+        }
     }
 
     #[test]

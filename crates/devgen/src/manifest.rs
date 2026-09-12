@@ -2097,7 +2097,7 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport, packed_prefill: 
         // `tuning` because those are what `plow_config.h` compiles, and an occupancy number
         // must never invalidate an otherwise-good packet/object pair.
         "dispatch_audit": dispatch_audit,
-        "segment_resource": crate::segment_resource::section(m),
+        "segment_resource": crate::segment_resource::section(m, arch),
         // WHICH PROGRAMS ARE L2-PLACED, so a regression moves in a diff of `build.json`.
         //
         // Placement is invisible everywhere else in this manifest: a placed and an unplaced
