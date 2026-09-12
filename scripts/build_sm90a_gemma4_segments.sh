@@ -60,8 +60,9 @@ for gemma_packed in 0 1; do
       "${gemma_flags[@]}" "${gemma_config_flags[@]}" "${gemma_role_flags[@]}" "${gemma_padding_flags[@]}" -DPLOW_NV_PACKED_REQUEST="$gemma_packed" \
       -o "$gemma_out/interp_sm90a_$gemma_prefix$gemma_role.cubin" runtime/nvidia/interp_sm90a.cu
   done
-  # Packed light occupancy needs matching PLOW_SEG_SLICE_ALL=1 packets.
-  if [ "$gemma_packed" = 1 ] && { [ "${PLOW_BUILD_FATLITE:-0}" = 1 ] || [ "${PLOW_BUILD_MASKED_PADDING:-0}" = 1 ]; }; then
+  # A packet config binds the packed light object to that packet even when its
+  # implementation flags are unchanged.
+  if [ "$gemma_packed" = 1 ] && { [ -n "${PLOW_CUBIN_CONFIG:-}" ] || [ "${PLOW_BUILD_FATLITE:-0}" = 1 ] || [ "${PLOW_BUILD_MASKED_PADDING:-0}" = 1 ]; }; then
     env -i PATH=/usr/local/cuda/bin:/usr/bin:/bin /usr/local/cuda/bin/nvcc \
       "${gemma_flags[@]}" "${gemma_config_flags[@]}" "${gemma_padding_flags[@]}" -DPLOW_NV_PACKED_REQUEST=1 \
       -DPLOW_NV_FATLITE="${PLOW_BUILD_FATLITE:-0}" -DPGM90_TMA_STAGES=3 \
@@ -92,6 +93,45 @@ env -i PATH=/usr/local/cuda/bin:/usr/bin:/bin /usr/local/cuda/bin/nvcc \
   runtime/nvidia/interp_sm90a_pfgemm_w8a16_m1.cu
 /usr/local/cuda/bin/cuobjdump -symbols "$gemma_out/interp_sm90a_pfgemm_w8a16_m1.cubin" | \
   grep -q plow_sm90a_pfgemm_w8a16_m1
+gemma_glu_log=$(mktemp)
+if ! env -i PATH=/usr/local/cuda/bin:/usr/bin:/bin /usr/local/cuda/bin/nvcc \
+  -std=c++17 -arch=sm_90a -O3 -cubin -Xptxas=-v \
+  -I runtime/common -I runtime/nvidia \
+  -o "$gemma_out/interp_sm90a_pfgemm_glu_gemma4.cubin" \
+  runtime/nvidia/interp_sm90a_pfgemm_glu_gemma4.cu 2>&1 | tee "$gemma_glu_log"; then
+  rm -f "$gemma_glu_log"
+  exit 1
+fi
+if grep -Eq '[1-9][0-9]* bytes (stack frame|spill stores|spill loads)' "$gemma_glu_log"; then
+  echo 'Gemma-4 fused GLU object uses stack or spills.' >&2
+  rm -f "$gemma_glu_log"
+  exit 1
+fi
+rm -f "$gemma_glu_log"
+gemma_glu_symbols=$(/usr/local/cuda/bin/cuobjdump -symbols \
+  "$gemma_out/interp_sm90a_pfgemm_glu_gemma4.cubin")
+for gemma_glu_symbol in \
+  plow_sm90a_pfgemm_glu_gemma4 \
+  plow_pfgemm_glu_gemma4_abi \
+  plow_pfgemm_glu_gemma4_min_rows \
+  plow_pfgemm_glu_gemma4_max_rows \
+  plow_pfgemm_glu_gemma4_n \
+  plow_pfgemm_glu_gemma4_k \
+  plow_pfgemm_glu_gemma4_stages \
+  plow_pfgemm_glu_gemma4_bm \
+  plow_pfgemm_glu_gemma4_bn \
+  plow_pfgemm_glu_gemma4_bk \
+  plow_block_pfgemm_glu_gemma4 \
+  plow_arena_bytes_pfgemm_glu_gemma4 \
+  plow_pf_request_abi \
+  plow_pf_masked_padding_abi \
+  plow_pf_fp8_request_abi \
+  plow_pf_fp8_masked_padding_abi; do
+  grep -q "$gemma_glu_symbol" <<<"$gemma_glu_symbols" || {
+    echo "missing Gemma-4 fused GLU symbol: $gemma_glu_symbol" >&2
+    exit 1
+  }
+done
 if [ "${PLOW_BUILD_PFATTN_HD256_BKV64:-0}" = 1 ]; then
   env -i PATH=/usr/local/cuda/bin:/usr/bin:/bin /usr/local/cuda/bin/nvcc \
     -std=c++17 -arch=sm_90a -O3 -cubin -Xptxas=-v -I runtime/common -I runtime/nvidia \

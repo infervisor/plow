@@ -13,7 +13,8 @@ pub const NATIVE_DECODE_TC: u8 = 8;
 pub const W8A16_PREFILL_M1: u8 = 9;
 pub const PREFILL_ATTENTION_HD256_BKV64: u8 = 10;
 pub const PREFILL_ATTENTION_HD256_BKV32: u8 = 11;
-pub const MAX_ROLE: u8 = PREFILL_ATTENTION_HD256_BKV32;
+pub const BF16_PREFILL_GEMM_GLU_GEMMA4: u8 = 12;
+pub const MAX_ROLE: u8 = BF16_PREFILL_GEMM_GLU_GEMMA4;
 
 pub fn is_projection(role: u8) -> bool {
     matches!(role, CUBLASLT | NATIVE_DECODE_TC)
@@ -46,6 +47,7 @@ pub const PREFILL_ATTENTION_HD256_BKV64_ABI: &str = "attention_sm90_hd256_bkv64_
 pub const PREFILL_ATTENTION_HD256_BKV32_ABI: &str = "attention_sm90_hd256_bkv32_v1";
 pub const MXFP4_MOE_ABI: &str = "mxfp4_moe_sm90_v1";
 pub const W8A16_PREFILL_M1_ABI: &str = "w8a16_prefill_m1_sm90_v1";
+pub const BF16_PREFILL_GEMM_GLU_GEMMA4_ABI: &str = "gemm_glu_sm90_gemma4_4k8k_v1";
 
 pub fn requires_object(role: u8) -> bool {
     matches!(
@@ -60,6 +62,7 @@ pub fn requires_object(role: u8) -> bool {
             | W8A16_PREFILL_M1
             | PREFILL_ATTENTION_HD256_BKV64
             | PREFILL_ATTENTION_HD256_BKV32
+            | BF16_PREFILL_GEMM_GLU_GEMMA4
     )
 }
 
@@ -150,6 +153,7 @@ impl SegmentRoles {
                 W8A16_PREFILL_M1 => W8A16_PREFILL_M1_ABI,
                 PREFILL_ATTENTION_HD256_BKV64 => PREFILL_ATTENTION_HD256_BKV64_ABI,
                 PREFILL_ATTENTION_HD256_BKV32 => PREFILL_ATTENTION_HD256_BKV32_ABI,
+                BF16_PREFILL_GEMM_GLU_GEMMA4 => BF16_PREFILL_GEMM_GLU_GEMMA4_ABI,
                 _ => return Err("invalid packet segment object role".into()),
             };
             let valid_hash = |hash: Option<&str>| {
@@ -215,7 +219,13 @@ impl SegmentRoles {
                     && (!valid_hash(object.sha256.as_deref())
                         || object.promote_k512.is_some()
                         || object.attention.as_ref() != Some(&hd256_bkv32)))
-                || (matches!(id, MXFP4_MOE | NATIVE_DECODE_TC | W8A16_PREFILL_M1)
+                || (matches!(
+                    id,
+                    MXFP4_MOE
+                        | NATIVE_DECODE_TC
+                        | W8A16_PREFILL_M1
+                        | BF16_PREFILL_GEMM_GLU_GEMMA4
+                )
                     && (!valid_hash(object.sha256.as_deref())
                         || object.promote_k512.is_some()
                         || object.attention.is_some()))
@@ -228,6 +238,7 @@ impl SegmentRoles {
                         | W8A16_PREFILL_M1
                         | PREFILL_ATTENTION_HD256_BKV64
                         | PREFILL_ATTENTION_HD256_BKV32
+                        | BF16_PREFILL_GEMM_GLU_GEMMA4
                 ) && (object.sha256.is_some()
                     || object.promote_k512.is_some()
                     || object.attention.is_some()))
@@ -437,6 +448,25 @@ mod tests {
         for bad in [
             raw.replace(&"a".repeat(64), "bad"),
             raw.replace("w8a16_prefill_m1_sm90_v1", "w8a16_prefill_small_sm90_v1"),
+        ] {
+            assert!(SegmentRoles::from_bytes(bad.as_bytes()).is_err());
+        }
+    }
+
+    #[test]
+    fn gemma4_bf16_gemm_glu_requires_exact_abi_and_hash() {
+        let raw = format!(
+            r#"{{"version":1,"objects":{{"12":{{"abi":"gemm_glu_sm90_gemma4_4k8k_v1","file":"glu.cubin","sha256":"{}"}}}},"programs":[{{"index":0,"roles":[0,12,0]}}]}}"#,
+            "a".repeat(64)
+        );
+        SegmentRoles::from_bytes(raw.as_bytes()).unwrap();
+        for bad in [
+            raw.replace(&"a".repeat(64), "bad"),
+            raw.replace(
+                BF16_PREFILL_GEMM_GLU_GEMMA4_ABI,
+                "gemm_glu_sm90_gemma4_v0",
+            ),
+            raw.replace("glu.cubin", "../glu.cubin"),
         ] {
             assert!(SegmentRoles::from_bytes(bad.as_bytes()).is_err());
         }

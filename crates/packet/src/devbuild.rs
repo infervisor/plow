@@ -315,6 +315,7 @@ struct LocalityCensus {
 struct Op {
     inst: DevInst,
     isolated: bool,
+    keep_single_grid: bool,
     /// Host-join epoch (see [`Builder::host_join`]); a change between consecutive ops opens a
     /// new segment regardless of wave class or `PLOW_UNISEG`.
     join: u32,
@@ -1037,6 +1038,15 @@ impl Builder {
         self.ops[counter as usize].isolated = true;
     }
 
+    /// Keep this machine-filling op at one workgroup per executor when segment-class slicing is
+    /// enabled. Dedicated occupancy-1 objects use the original grid and cannot consume the
+    /// doubled slice numbering of the broad occupancy-2 GEMM interpreter.
+    pub fn keep_single_grid(&mut self, counter: u32) {
+        let op = &mut self.ops[counter as usize];
+        assert_eq!(op.cus.len(), self.n_cu as usize);
+        op.keep_single_grid = true;
+    }
+
     /// As [`Builder::emit`], but the dependencies may be [`Dep::Fine`] — so a slice waits
     /// only on the producer slices that actually feed it, instead of on the whole op.
     pub fn emit_dep(
@@ -1087,6 +1097,7 @@ impl Builder {
         self.ops.push(Op {
             inst,
             isolated: false,
+            keep_single_grid: false,
             join: self.cur_join,
             cus,
             deps,
@@ -2532,7 +2543,12 @@ impl Builder {
                     .deps
                     .iter()
                     .any(|d| matches!(d, Dep::Fine { .. }));
-                if gemm_class && fills && !has_fine && !fine_prod[i] {
+                if gemm_class
+                    && fills
+                    && !has_fine
+                    && !fine_prod[i]
+                    && !self.ops[i].keep_single_grid
+                {
                     let orig = self.ops[i].cus.clone();
                     let mut cus = orig.clone();
                     cus.extend_from_slice(&orig); // slices 0..2*n_cu-1, cu ids valid (repeated)

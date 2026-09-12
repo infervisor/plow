@@ -49,6 +49,7 @@ use serde_json::Value;
 mod checkpoint;
 use checkpoint::{layer_scalars, validate_coverage};
 mod attention_prefill_role;
+mod gemma4_gemm_glu_role;
 mod w8a16_prefill_role;
 mod block;
 use block::{parse_block, write_block_descriptor};
@@ -5307,7 +5308,17 @@ fn emit_phase(
             && gemv_fused_input_fits(amd, t, c.hidden)
             && !emit_config::active().decode_cublaslt
             && !emit_config::active().decode_native_tc;
-        let gemm_glu = !gemv_family && glu_fusion_wins(tg, inter_l, c.hidden, n_cu);
+        let gemma4_glu_role = !gemv_family
+            && emit_config::active().gemma4_sm90_gemm_glu_role
+            && gemma4_gemm_glu_role::exact_shape(tg, inter_l, c.hidden);
+        let gemm_glu = !gemv_family
+            && gemma4_gemm_glu_role::select_fused(
+                glu_fusion_wins(tg, inter_l, c.hidden, n_cu),
+                gemma4_glu_role,
+                tg,
+                inter_l,
+                c.hidden,
+            );
         // w8a8: quant the (hidden-width) pre-FF norm output feeding gate/up. Reuses xqh/ash (q/k/v
         // already consumed them; the c_pf→o_proj→flash→qkv chain serializes the reuse). Inert
         // (returns c_pf) off the w8a8 path, so glu_fused/bf16 arms below keep their c_pf dep.
@@ -5487,6 +5498,9 @@ fn emit_phase(
                     d.i[3] = mu;
                 }
             });
+            if gemma4_glu_role {
+                b.keep_single_grid(cg);
+            }
             rec(cg);
             cg
         } else {
@@ -7252,6 +7266,17 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
             "cuBLASLt prefill emission requires Gemma 4 BF16 on single-GPU SM90"
         );
     }
+    if emit_config::active().gemma4_sm90_gemm_glu_role {
+        assert!(
+            model_type.starts_with("gemma4")
+                && arch == "sm_90a"
+                && tp == 1
+                && !emit_config::active().any_fp8_weights()
+                && !emit_config::active().mxfp4
+                && emit_config::active().tma_gemm,
+            "Gemma-4 BF16 GemmGlu role requires BF16 Gemma 4, SM90 TP1, and --tma-gemm"
+        );
+    }
     assert!(
         !emit_config::active().gemv_decode_role || capabilities.dense_packet_contracts,
         "GEMV decode role currently requires the dense BF16 emitter"
@@ -8918,7 +8943,6 @@ fn emit_dense_gqa(
             data: serde_json::to_vec(&manifest).expect("serialize LIVE KV manifest"),
         });
     }
-    let lean = apply_verify_gate(&m, verify.as_ref());
     if let Some(bindings) = projection_bindings.as_ref() {
         decode_objects::append_metadata(
             &m,
@@ -8958,6 +8982,50 @@ fn emit_dense_gqa(
         tunedb_root.as_deref(),
     )
     .unwrap_or_else(|error| panic!("prefill attention object: {error}"));
+    if ecfg.gemma4_sm90_gemm_glu_role {
+        let selected = gemma4_gemm_glu_role::apply_output_object(
+            &mut m,
+            &mut sections,
+            &arch,
+            std::path::Path::new(&out),
+        )
+        .unwrap_or_else(|error| panic!("Gemma-4 BF16 GemmGlu object: {error}"));
+        eprintln!("  Gemma-4 BF16 GemmGlu: {selected} lean segments");
+    }
+    if let Some(live_position) = sections
+        .iter()
+        .position(|section| section.name == plow_asset::live_kv::SECTION)
+    {
+        let packed_position = sections
+            .iter()
+            .position(|section| section.name == plow_asset::packed_prefill::SECTION);
+        let packed = packed_position.map(|index| {
+            serde_json::from_slice::<plow_asset::packed_prefill::Manifest>(&sections[index].data)
+                .expect("parse packed prefill manifest")
+        });
+        let (live, packed) = plow_asset::program::with_model(&m, |packet| {
+            let live = plow_asset::live_kv::emit(packet)?;
+            let packed = packed
+                .map(|mut packed| {
+                    packed.programs = packet.programs[..packet.prefill_count]
+                        .iter()
+                        .map(plow_asset::live_kv::program_digest)
+                        .collect();
+                    packed.validate(packet, &live)?;
+                    Ok::<_, String>(packed)
+                })
+                .transpose()?;
+            Ok::<_, String>((live, packed))
+        })
+        .unwrap_or_else(|error| panic!("final program manifests: {error}"));
+        sections[live_position].data =
+            serde_json::to_vec(&live).expect("serialize LIVE KV manifest");
+        if let (Some(index), Some(packed)) = (packed_position, packed) {
+            sections[index].data =
+                serde_json::to_vec(&packed).expect("serialize packed prefill manifest");
+        }
+    }
+    let lean = apply_verify_gate(&m, verify.as_ref());
     let blob = if sections.is_empty() {
         m.to_blob()
     } else {

@@ -103,8 +103,28 @@ fn qualify_hd256_programs(
                 .collect::<Vec<_>>(),
         )
     })?;
+    if crate::emit_config::active().tune_dump {
+        for (index, digest) in digests.iter().enumerate() {
+            if model.progs[index]
+                .insts
+                .iter()
+                .any(packet::dev::DevInst::is_hd256_gqa2_sliding_prefill)
+            {
+                eprintln!(
+                    "ATTENTION_ROLE_DIGEST program={index} rows={} sha256={digest}",
+                    model.prog_t[index]
+                );
+            }
+        }
+    }
     let implementation = hd256_implementation();
     let prefill_count = packet::devbuild::decode_rung_lo(&model.prog_t);
+    if crate::emit_config::active().tune_dump {
+        eprintln!(
+            "ATTENTION_ROLE_CONTEXT hardware={hardware} arch={arch} ctx={ctx} packed={packed} toolchain={toolchain} records={}",
+            records.len()
+        );
+    }
     let mut qualification: Option<Hd256Qualification> = None;
     for index in 0..prefill_count {
         if !model.progs[index]
@@ -137,6 +157,12 @@ fn qualify_hd256_programs(
                 &implementation,
                 toolchain,
             ) else {
+                if crate::emit_config::active().tune_dump {
+                    eprintln!(
+                        "ATTENTION_ROLE_MISS program={index} cell={} sha256={}",
+                        cell.key(), digests[index]
+                    );
+                }
                 selected.clear();
                 break;
             };

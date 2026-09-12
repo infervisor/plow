@@ -1513,6 +1513,155 @@ static __device__ void d_gemm_sm90_tma_ws384_role(__nv_bfloat16* __restrict__ C,
     }
     __syncthreads();
 }
+
+/* Gemma-4 12B exact gate/up projection. One TMA producer shares the A tile between two
+ * m64n128 gate/up consumers; each consumer owns one m64 output slab and therefore applies
+ * GeGLU once, in the output-stationary epilogue. Gate/up round to BF16 before FP32 GELU and
+ * multiply; the final product rounds to BF16. */
+#define PGM90_GEMMA4_GLU_STAGES 4
+#define PGM90_GEMMA4_GLU_BM 128
+#define PGM90_GEMMA4_GLU_BN 128
+#define PGM90_GEMMA4_GLU_BK 64
+#define PGM90_GEMMA4_GLU_TILE_BYTES                                                     \
+    (PGM90_GEMMA4_GLU_BM * PGM90_GEMMA4_GLU_BK * (int)sizeof(__nv_bfloat16))
+#define PGM90_GEMMA4_GLU_TX_BYTES (3 * PGM90_GEMMA4_GLU_TILE_BYTES)
+#define PGM90_GEMMA4_GLU_MBAR_BYTES (2 * PGM90_GEMMA4_GLU_STAGES * (int)sizeof(uint64_t))
+#define PGM90_GEMMA4_GLU_ARENA_BYTES                                                   \
+    (PGM90_GEMMA4_GLU_MBAR_BYTES +                                                     \
+     PGM90_GEMMA4_GLU_STAGES * PGM90_GEMMA4_GLU_TX_BYTES + 1024)
+static_assert(PGM90_GEMMA4_GLU_ARENA_BYTES == 197696,
+              "Gemma-4 fused GLU role arena ABI changed");
+
+__device__ __forceinline__ __nv_bfloat16 pgm90_gemma4_glu_epilogue(float gate, float up) {
+    const float rounded_gate = __bfloat162float(__float2bfloat16(gate));
+    const float rounded_up = __bfloat162float(__float2bfloat16(up));
+    const float activated = act_gelu_tanh(rounded_gate);
+    return __float2bfloat16(activated * rounded_up);
+}
+
+template <bool PROD>
+static __device__ void d_gemm_glu_sm90_tma_ws384_gemma4_role(
+    __nv_bfloat16* __restrict__ output, const void* map_a, const void* map_gate,
+    const void* map_up, unsigned m, unsigned slice, unsigned nblk, void* raw_arena) {
+    uint64_t* full = static_cast<uint64_t*>(raw_arena);
+    uint64_t* empty = full + PGM90_GEMMA4_GLU_STAGES;
+    uint8_t* base = static_cast<uint8_t*>(
+        sm90_align1024(empty + PGM90_GEMMA4_GLU_STAGES));
+    uint8_t* as = base;
+    uint8_t* gs = as + PGM90_GEMMA4_GLU_STAGES * PGM90_GEMMA4_GLU_TILE_BYTES;
+    uint8_t* us = gs + PGM90_GEMMA4_GLU_STAGES * PGM90_GEMMA4_GLU_TILE_BYTES;
+    const int tid = (int)threadIdx.x;
+
+    if constexpr (PROD) {
+        if (tid == 0) {
+            sm90_tmap_prefetch(map_a);
+            sm90_tmap_prefetch(map_gate);
+            sm90_tmap_prefetch(map_up);
+        }
+        if (tid < PGM90_GEMMA4_GLU_STAGES) {
+            sm90_mbar_init(full + tid, 1);
+            sm90_mbar_init(empty + tid, 2);
+        }
+    }
+    __syncthreads();
+
+    constexpr int N = 15360;
+    constexpr int K = 3840;
+    constexpr int TILES_N = N / PGM90_GEMMA4_GLU_BN;
+    constexpr int KSTEPS = K / PGM90_GEMMA4_GLU_BK;
+    const int tiles_m = ((int)m + PGM90_GEMMA4_GLU_BM - 1) / PGM90_GEMMA4_GLU_BM;
+    const int ntiles = tiles_m * TILES_N;
+
+    if constexpr (PROD) {
+        if (tid == 0) {
+            int issued = 0;
+            for (int tile = (int)slice; tile < ntiles; tile += (int)nblk) {
+                int tmi, tni;
+                sm90_tile_remap(tile, tiles_m, TILES_N, &tmi, &tni);
+                const int tm = tmi * PGM90_GEMMA4_GLU_BM;
+                const int tn = tni * PGM90_GEMMA4_GLU_BN;
+                for (int ks = 0; ks < KSTEPS; ++ks, ++issued) {
+                    const int stage = issued % PGM90_GEMMA4_GLU_STAGES;
+                    if (issued >= PGM90_GEMMA4_GLU_STAGES)
+                        sm90_mbar_wait(empty + stage,
+                                      ((issued / PGM90_GEMMA4_GLU_STAGES) + 1) & 1);
+                    sm90_mbar_expect(full + stage, PGM90_GEMMA4_GLU_TX_BYTES);
+                    const uint32_t bar = sm90_su32(full + stage);
+                    sm90_tma2d(sm90_su32(as + stage * PGM90_GEMMA4_GLU_TILE_BYTES), map_a,
+                               ks * PGM90_GEMMA4_GLU_BK, tm, bar);
+                    sm90_tma2d(sm90_su32(gs + stage * PGM90_GEMMA4_GLU_TILE_BYTES), map_gate,
+                               ks * PGM90_GEMMA4_GLU_BK, tn, bar);
+                    sm90_tma2d(sm90_su32(us + stage * PGM90_GEMMA4_GLU_TILE_BYTES), map_up,
+                               ks * PGM90_GEMMA4_GLU_BK, tn, bar);
+                }
+            }
+        }
+    } else {
+        const int consumer = (tid >> 7) - 1;
+        const int local_tid = tid & 127;
+        const int warp = local_tid >> 5;
+        const int lane = local_tid & 31;
+        int step = 0;
+        for (int tile = (int)slice; tile < ntiles; tile += (int)nblk) {
+            int tmi, tni;
+            sm90_tile_remap(tile, tiles_m, TILES_N, &tmi, &tni);
+            const int tm = tmi * PGM90_GEMMA4_GLU_BM;
+            const int tn = tni * PGM90_GEMMA4_GLU_BN;
+            float gate[PGM90_GEMMA4_GLU_BN / 2];
+            float up[PGM90_GEMMA4_GLU_BN / 2];
+            int previous = -1;
+            for (int ks = 0; ks < KSTEPS; ++ks, ++step) {
+                const int stage = step % PGM90_GEMMA4_GLU_STAGES;
+                sm90_mbar_wait(full + stage, (step / PGM90_GEMMA4_GLU_STAGES) & 1);
+                const uint8_t* a = as + stage * PGM90_GEMMA4_GLU_TILE_BYTES +
+                    consumer * 64 * 128;
+                const uint8_t* g = gs + stage * PGM90_GEMMA4_GLU_TILE_BYTES;
+                const uint8_t* u = us + stage * PGM90_GEMMA4_GLU_TILE_BYTES;
+                sm90_wg_fence();
+#pragma unroll
+                for (int sub = 0; sub < 4; ++sub) {
+                    const int accumulate = (ks == 0 && sub == 0) ? 0 : 1;
+                    wgmma_m64n128k16(gate, sm90_desc(a + sub * 32),
+                                     sm90_desc(g + sub * 32), accumulate);
+                    wgmma_m64n128k16(up, sm90_desc(a + sub * 32),
+                                     sm90_desc(u + sub * 32), accumulate);
+                }
+                sm90_wg_commit();
+                sm90_wg_wait<1>();
+                if (previous >= 0 && local_tid == 0) sm90_mbar_arrive(empty + previous);
+                previous = stage;
+            }
+            sm90_wg_wait<0>();
+            if (previous >= 0 && local_tid == 0) sm90_mbar_arrive(empty + previous);
+
+            const int r0 = tm + consumer * 64 + warp * 16 + (lane >> 2);
+            const int c0 = tn + 2 * (lane & 3);
+#pragma unroll
+            for (int group = 0; group < PGM90_GEMMA4_GLU_BN / 8; ++group) {
+#pragma unroll
+                for (int hi = 0; hi < 2; ++hi) {
+                    const int row = r0 + 8 * hi;
+                    const int col = c0 + 8 * group;
+                    if (row >= (int)m) continue;
+#pragma unroll
+                    for (int pair = 0; pair < 2; ++pair) {
+                        const int ai = 4 * group + 2 * hi + pair;
+                        output[(size_t)row * N + col + pair] =
+                            pgm90_gemma4_glu_epilogue(gate[ai], up[ai]);
+                    }
+                }
+            }
+        }
+    }
+    __syncthreads();
+    if constexpr (PROD) {
+        if (tid < PGM90_GEMMA4_GLU_STAGES) {
+            sm90_mbar_inval(full + tid);
+            sm90_mbar_inval(empty + tid);
+        }
+    }
+    __syncthreads();
+}
 #endif /* PGM90_UNI_BN256 && PLOW_NV_SEG_WS384 */
 
 #if PLOW_NV_SEG_M64N64 || PLOW_NV_SEG_M64N128
