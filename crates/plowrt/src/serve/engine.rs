@@ -164,6 +164,10 @@ pub trait SeqEngine {
     fn token_batch_prefill_fits(&self, _slot: usize, _prefill_capacity: u32) -> bool {
         false
     }
+    /// Whether `slot`'s next planned chunk may ride the `rows`-row token-batch body.
+    fn token_batch_member_fits_body(&self, _slot: usize, _rows: u32) -> bool {
+        true
+    }
     /// Run one token batch. `output` receives `(slot, id)` per leading row — the `feeds` in
     /// order, then the members whose prompt completes in this step — the same delivery shape
     /// the CUDA route's `token_batch_step` produces, so one mux arm reads both.
@@ -750,6 +754,19 @@ mod amd_serve {
                 .unwrap_or(0)
         }
 
+        /// The `rows`-row body's program, if the packet carries one.
+        fn body_of_width(&self, rows: u32) -> Option<usize> {
+            self.bodies.iter().find(|&&(_, t)| t == rows).map(|&(prog, _)| prog)
+        }
+
+        /// Span capacity of a body as wide as `bucket` that `admissible` accepts.
+        fn span_capacity_at(&self, bucket: u32, admissible: impl Fn(usize) -> bool) -> Option<u32> {
+            self.bodies
+                .iter()
+                .find(|&&(prog, t)| t == bucket && admissible(prog))
+                .map(|&(_, t)| t - self.band)
+        }
+
         /// The body width for `leading_rows` sampled rows and `prefill_rows` span rows: the
         /// narrowest body whose span capacity fits, else the one that fits most.
         fn rows_for(&self, leading_rows: usize, prefill_rows: usize) -> Option<u32> {
@@ -1056,6 +1073,62 @@ mod amd_serve {
             }
         }
         Ok(retired)
+    }
+
+    /// The chunk plan of `[from, to)` with middle chunks capped to the span of a token-batch body
+    /// that can take them. Planned whole, a middle chunk on the 8192 bucket (8192 rows against a
+    /// span of 8192 - band) can never ride the 8192 body, so it runs isolated and its tick's
+    /// decode rows take a separate pass. A cap costs a launch when the rows it gives up do not
+    /// fit the rest of the plan, and at deep context a launch costs about what riding saves, so
+    /// a chunk is capped only when the re-planned remainder keeps the planner's launch count;
+    /// otherwise it runs whole, as before. `capacity(bucket, c0)` is the span capacity of a body
+    /// of that width admissible for a span starting at `c0`.
+    fn cap_chunks_to_bodies(
+        from: u32,
+        to: u32,
+        plan: impl Fn(u32, u32) -> Result<Vec<crate::exec::amd::ChunkStep>>,
+        bucket: impl Fn(usize) -> u32,
+        capacity: impl Fn(u32, u32) -> Option<u32>,
+    ) -> Result<Vec<crate::exec::amd::ChunkStep>> {
+        let mut out = Vec::new();
+        let mut c0 = from;
+        'plan: while c0 < to {
+            let steps = plan(c0, to)?;
+            let middle = &steps[..steps.len().saturating_sub(1)];
+            for (i, &step) in middle.iter().enumerate() {
+                let Some(cap) = capacity(bucket(step.prog), step.c0)
+                    .filter(|&cap| cap > 0 && step.clen > cap)
+                else {
+                    continue;
+                };
+                if i + 1 + plan(step.c0 + cap, to)?.len() <= steps.len() {
+                    out.extend_from_slice(&steps[..i]);
+                    out.push(crate::exec::amd::ChunkStep { clen: cap, ..step });
+                    c0 = step.c0 + cap;
+                } else {
+                    out.extend_from_slice(&steps[..=i]);
+                    c0 = step.c0 + step.clen;
+                }
+                continue 'plan;
+            }
+            out.extend(steps);
+            break;
+        }
+        Ok(out)
+    }
+
+    /// Bodies respect the planned program: a chunk the planner put on a sparse (DSA) prefill
+    /// program rides only a sparse body, a dense chunk only a dense body, and only a body that
+    /// admits its span. The tail-sparse retarget plans a deep short tail onto the sparse program
+    /// because dense attention over its whole prior context costs several times more; sized by
+    /// row count alone, that tail rode the dense 2048 body. No planned chunk, no body.
+    fn body_respects_plan(
+        prog: usize,
+        planned_sparse: Option<bool>,
+        sparse: impl Fn(usize) -> bool,
+        admissible: impl Fn(usize) -> bool,
+    ) -> bool {
+        planned_sparse == Some(sparse(prog)) && admissible(prog)
     }
 
     fn split_terminal_prefill(cur: &mut PfCursor) {
@@ -1682,20 +1755,37 @@ mod amd_serve {
                     self.invalidate_prefix(slot);
                 }
                 let max_bucket = self.prefill_chunk_rows.min(tick_max_bucket);
-                let g = &mut self.ranks;
+                if resume > 0 && !shared {
+                    self.ranks.restore_carried(slot)?;
+                }
+                // With bodies armed, a middle chunk must fit its bucket's body to ride it.
+                let (g, tb) = (&self.ranks, self.token_batch_tp.as_ref());
+                let plan = |from: u32, to: u32| {
+                    cap_chunks_to_bodies(
+                        from,
+                        to,
+                        |a, b| g.plan_span_at_most(a, b, max_bucket),
+                        |prog| g.rank0().prog_t(prog),
+                        |bucket, c0| match (g, tb) {
+                            (Ranks::Tp(group), Some(tb)) => tb.span_capacity_at(bucket, |prog| {
+                                group.packed_span_admissible(prog, c0)
+                            }),
+                            _ => None,
+                        },
+                    )
+                };
                 let (steps, snap_after) = {
                     if resume > 0 {
-                        if !shared { g.restore_carried(slot)?; }
-                        (g.plan_span_at_most(resume, n, max_bucket)?, None)
+                        (plan(resume, n)?, None)
                     } else if arm > 0 {
-                        let head = g.plan_span_at_most(0, arm, max_bucket)?;
-                        let tail = g.plan_span_at_most(arm, n, max_bucket)?;
+                        let head = plan(0, arm)?;
+                        let tail = plan(arm, n)?;
                         let cut = head.len();
                         let mut all = head;
                         all.extend(tail);
                         (all, cut.checked_sub(1))
                     } else {
-                        (g.plan_span_at_most(0, n, max_bucket)?, None)
+                        (plan(0, n)?, None)
                     }
                 };
                 self.pos[slot] = 0;
@@ -2164,12 +2254,43 @@ mod amd_serve {
             // dense body). Never cut to fit — the mux takes whole chunks.
             match (&self.ranks, &self.token_batch_tp) {
                 (Ranks::Tp(g), Some(tb)) => {
-                    let frontier = self.token_batch_frontier(slot);
-                    let widest =
-                        tb.admissible_capacity(|prog| g.packed_span_admissible(prog, frontier));
+                    let (frontier, planned) =
+                        (self.token_batch_frontier(slot), self.planned_sparse(slot));
+                    let widest = tb.admissible_capacity(|prog| {
+                        body_respects_plan(
+                            prog,
+                            planned,
+                            |p| g.rank(0).prefill_prog_sparse(p),
+                            |p| g.packed_span_admissible(p, frontier),
+                        )
+                    });
                     if rows <= widest { rows } else { 0 }
                 }
                 _ => rows,
+            }
+        }
+
+        /// Whether `slot`'s next planned chunk runs a sparse (DSA) prefill program; `None`
+        /// before its cursor exists.
+        fn planned_sparse(&self, slot: usize) -> Option<bool> {
+            let cur = self.pf.get(slot)?.as_ref()?;
+            let step = cur.steps.get(cur.next)?;
+            Some(self.ranks.rank0().prefill_prog_sparse(step.prog))
+        }
+
+        /// Whether `slot`'s next planned chunk may ride the `rows`-row body
+        /// ([`body_respects_plan`]).
+        pub fn token_batch_member_fits_body(&self, slot: usize, rows: u32) -> bool {
+            match (&self.ranks, &self.token_batch_tp) {
+                (Ranks::Tp(g), Some(tb)) => tb.body_of_width(rows).is_some_and(|prog| {
+                    body_respects_plan(
+                        prog,
+                        self.planned_sparse(slot),
+                        |p| g.rank(0).prefill_prog_sparse(p),
+                        |p| g.packed_span_admissible(p, self.token_batch_frontier(slot)),
+                    )
+                }),
+                _ => true,
             }
         }
 
@@ -2187,7 +2308,12 @@ mod amd_serve {
                     (Ranks::Tp(g), Some(tb)) => tb
                         .body_for_capacity(prefill_capacity)
                         .is_some_and(|prog| {
-                            g.packed_span_admissible(prog, self.token_batch_frontier(slot))
+                            body_respects_plan(
+                                prog,
+                                self.planned_sparse(slot),
+                                |p| g.rank(0).prefill_prog_sparse(p),
+                                |p| g.packed_span_admissible(p, self.token_batch_frontier(slot)),
+                            )
                         }),
                     _ => true,
                 }
@@ -2251,6 +2377,15 @@ mod amd_serve {
                     )));
                 }
                 completed.push((slot, take));
+            }
+            // Refused before anything is staged: a pack whose body would run a member's chunk
+            // as a program the planner did not choose (the mux only forms packs that fit).
+            if let Some(&(slot, _)) =
+                completed.iter().find(|&&(slot, _)| !self.token_batch_member_fits_body(slot, rows))
+            {
+                return Err(RuntimeError::Rejected(format!(
+                    "token-batch slot {slot}: the {rows}-row body does not run its planned prefill program"
+                )));
             }
             for slot in 0..self.batch {
                 self.pos_stage[slot] = self.pf[slot]
@@ -3123,10 +3258,97 @@ mod amd_serve {
             mixed_cursor_rows, mixed_prefill_continuation_fits, mixed_prefill_padding_fits,
             packable_prefill_step, parse_snapshot_tensors, snapshot_file_component,
             slot_decode_position, split_pending_prefill, split_terminal_prefill, stage_parked,
-            terminal_prefill_cursor, token_batch_host_step,
+            terminal_prefill_cursor, token_batch_host_step, cap_chunks_to_bodies, body_respects_plan,
             AmdServe, PfCursor, DEFAULT_SNAPSHOT_TENSORS, MAX_SNAPSHOT_TENSORS,
         };
         use crate::exec::amd::ChunkStep;
+
+        #[test]
+        fn a_body_runs_only_the_attention_kind_its_member_was_planned_on() {
+            // Bodies 0..=3 are 128, 512, 2048 and 8192 rows; only the 8192 one is sparse (DSA),
+            // and a sparse body admits a span only from 2048 keys deep.
+            let sparse = |prog: usize| prog == 3;
+            let at = |frontier: u32| move |prog: usize| !sparse(prog) || frontier >= 2048;
+            // A 1,500-row tail at 65K prior that the tail-sparse retarget planned onto the sparse
+            // 8192 program: the dense 2048 body would run it as dense attention over 65K keys.
+            assert!(!body_respects_plan(2, Some(true), sparse, at(65_536)));
+            assert!(body_respects_plan(3, Some(true), sparse, at(65_536)));
+            // A dense chunk rides only a dense body.
+            assert!(body_respects_plan(2, Some(false), sparse, at(65_536)));
+            assert!(!body_respects_plan(3, Some(false), sparse, at(65_536)));
+            // A sparse body never admits a span before 2048 keys; no planned chunk rides nothing.
+            assert!(!body_respects_plan(3, Some(true), sparse, at(1024)));
+            assert!(!body_respects_plan(2, None, sparse, at(0)));
+        }
+
+        #[test]
+        fn middle_chunks_ride_the_body_span_without_an_extra_launch() {
+            // The packet's ladder under the planner's own cover rule (ragged), and an 8192-row
+            // body whose span is 8192 - 20 band rows.
+            let buckets = [128u32, 512, 2048, 8192];
+            let steps_of = |from: u32, to: u32| {
+                crate::exec::amd::plan_chunks_cfg(&buckets, to - from, 416, true).map(|chunks| {
+                    let mut c0 = from;
+                    chunks
+                        .into_iter()
+                        .map(|ch| {
+                            let step = ChunkStep {
+                                prog: buckets.iter().position(|&b| b == ch).unwrap(),
+                                c0,
+                                clen: (to - c0).min(ch),
+                            };
+                            c0 += ch;
+                            step
+                        })
+                        .collect::<Vec<_>>()
+                })
+            };
+            let shape = |plan: &[ChunkStep]| {
+                plan.iter().map(|s| (buckets[s.prog], s.c0, s.clen)).collect::<Vec<_>>()
+            };
+            // `sparse`: the body admits a span only from 2048 keys deep, as the DSA body does.
+            let capped = |n: u32, sparse: bool| {
+                cap_chunks_to_bodies(
+                    0,
+                    n,
+                    |a, b| steps_of(a, b),
+                    |prog| buckets[prog],
+                    |bucket, c0| (bucket == 8192 && (!sparse || c0 >= 2048)).then_some(8172),
+                )
+                .unwrap()
+            };
+            // Free: 20000 rows take three launches capped or not.
+            assert_eq!(
+                shape(&steps_of(0, 20000).unwrap()),
+                [(8192, 0, 8192), (8192, 8192, 8192), (8192, 16384, 3616)]
+            );
+            assert_eq!(
+                shape(&capped(20000, false)),
+                [(8192, 0, 8172), (8192, 8172, 8172), (8192, 16344, 3656)]
+            );
+            // A sparse body cannot take the first chunk, so that chunk keeps its rows.
+            assert_eq!(
+                shape(&capped(20000, true)),
+                [(8192, 0, 8192), (8192, 8192, 8172), (8192, 16364, 3636)]
+            );
+            // Binding: capping either chunk of 16384 rows would add a launch, so both run whole.
+            assert_eq!(shape(&capped(16384, false)), shape(&steps_of(0, 16384).unwrap()));
+            // Partial: 36 spare rows pay for one cap, not two; the second chunk runs whole.
+            assert_eq!(
+                shape(&capped(24540, false)),
+                [(8192, 0, 8172), (8192, 8172, 8192), (8192, 16364, 8176)]
+            );
+            for n in [1, 2048, 8172, 8193, 16364, 16384, 20000, 24540, 24576, 40961, 65000, 79747] {
+                for sparse in [false, true] {
+                    let (plan, whole) = (capped(n, sparse), steps_of(0, n).unwrap());
+                    assert_eq!(plan.len(), whole.len(), "{n} sparse={sparse}: extra launch");
+                    assert_eq!(plan.first().map(|s| s.c0), Some(0));
+                    assert!(plan.windows(2).all(|w| w[0].c0 + w[0].clen == w[1].c0), "{n}");
+                    let last = plan.last().unwrap();
+                    assert_eq!(last.c0 + last.clen, n);
+                }
+            }
+        }
 
         #[test]
         fn a_prompt_finished_inside_a_token_batch_step_retires_and_decodes_from_its_end() {
@@ -3807,6 +4029,9 @@ impl SeqEngine for AmdServe {
     }
     fn token_batch_prefill_fits(&self, slot: usize, prefill_capacity: u32) -> bool {
         AmdServe::token_batch_prefill_fits(self, slot, prefill_capacity)
+    }
+    fn token_batch_member_fits_body(&self, slot: usize, rows: u32) -> bool {
+        AmdServe::token_batch_member_fits_body(self, slot, rows)
     }
     fn token_batch_step(
         &mut self,
