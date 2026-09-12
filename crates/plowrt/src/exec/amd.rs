@@ -13930,6 +13930,11 @@ impl AmdEngine {
 
     /// The decode kernel handle.
     pub fn decode_kernel(&self) -> HsaKernel {
+        let rows = if self.tp.is_some() {
+            rows.max(crate::config::RuntimeConfig::get().amd_decode_min_rung())
+        } else {
+            rows
+        };
         self.k_decode
     }
 

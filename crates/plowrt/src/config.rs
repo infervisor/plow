@@ -714,6 +714,13 @@ impl RuntimeConfig {
 
     /// Cross-request prefill packing on CUDA: off unless asked.
     pub fn pf_batch_cuda(&self) -> bool {
+    /// Narrowest decode rung a TP engine selects. Unset → 8: on GLM-5.3 TP8 a lone row on the
+    /// native-GEMM rung-8 program decodes in 41.4 ms against 51.9 ms on rung 1, whose one-row GEMVs
+    /// run over every workgroup. Single-GPU engines keep the plain ladder.
+    pub fn amd_decode_min_rung(&self) -> usize {
+        self.amd.decode_min_rung.unwrap_or(8).max(1) as usize
+    }
+
         self.pf_batch.unwrap_or(false)
     }
 
@@ -953,6 +960,11 @@ pub struct AmdRuntimeConfig {
 
     /// Unified token batch: keep the WIDE dense-GEMM rungs plowc chose per shape.
     ///
+    /// Narrowest decode rung a TP engine selects (`PLOW_AMD_DECODE_MIN_RUNG`); `1` = no floor. Read through
+    /// `RuntimeConfig::amd_decode_min_rung`, which supplies the default.
+    #[arg(long = "amd-decode-min-rung", env = "PLOW_AMD_DECODE_MIN_RUNG", global = true)]
+    pub decode_min_rung: Option<u32>,
+
     /// The token-batch object is the mixed object's shape, and at four waves the fused-GLU
     /// epilogue's `SN == 2` pins `GM_BN` to 128 — so its plain `Gemm` body is one tile for every
     /// projection. The synthesizer collapses `GemmWide` (128x256) and `GemmC5` (192x256) onto
@@ -1558,6 +1570,22 @@ mod tests {
                     .find(|arg| arg.get_id() == field)
                     .unwrap()
                     .get_default_values(),
+    #[test]
+    fn decode_min_rung_defaults_to_eight_and_one_turns_it_off() {
+        use clap::{Args, FromArgMatches};
+        let command = super::RuntimeConfig::augment_args(clap::Command::new("test"));
+        for (args, want) in [
+            (&["test"][..], 8),
+            (&["test", "--amd-decode-min-rung=1"][..], 1),
+            (&["test", "--amd-decode-min-rung=0"][..], 1),
+            (&["test", "--amd-decode-min-rung=16"][..], 16),
+        ] {
+            let matches = command.clone().try_get_matches_from(args).unwrap();
+            let cfg = super::RuntimeConfig::from_arg_matches(&matches).unwrap();
+            assert_eq!(cfg.amd_decode_min_rung(), want);
+        }
+    }
+
                 ["true"]
             );
         }
