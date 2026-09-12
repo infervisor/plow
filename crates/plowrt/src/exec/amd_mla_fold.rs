@@ -486,7 +486,7 @@ mod tests {
     #[ignore = "requires a gfx942 GPU lease, PLOW_TEST_FOLD_DIR and PLOW_TEST_FOLD_KBENCH"]
     fn native_fold_decode_rung20_timing() {
         const LAYERS: usize = 78;
-        let rows: u32 = std::env::var("PLOW_TEST_FOLD_rows")
+        let rows: u32 = std::env::var("PLOW_TEST_FOLD_ROWS")
             .map(|v| v.parse().unwrap())
             .unwrap_or(20);
         const REPS: usize = 30;
@@ -634,7 +634,8 @@ mod tests {
                 nblk,
                 pad: 0,
             };
-            be.launch(kbench, nblk, 512, 0, bytemuck::bytes_of(&a)).unwrap();
+            // The kernel declares 52 bytes (no hidden arguments); the struct pads to 56.
+            be.launch(kbench, nblk, 512, 0, &bytemuck::bytes_of(&a)[..52]).unwrap();
         };
         let floor_args = ConvertArgs {
             out: device[0].base,
