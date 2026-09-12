@@ -197,7 +197,15 @@ extern "C" __device__ unsigned plow_xr_rs_u2 = 1;
  * So the packet that runs this arm must be emitted with `PLOW_XR_CUS=48` (the collective's CU
  * set; every other packet is unchanged) — the arm on a 256-workgroup packet is a regression.
  * AITER's exact one-load-per-lane walk (dependency-chained) was 4-9% slower than the hoisted
- * eight; 8-byte packs 2-3% slower than 16; two reduce-scatter packs per lane no better. */
+ * eight; 8-byte packs 2-3% slower than 16; two reduce-scatter packs per lane no better.
+ *
+ * gfx942 (8x MI300X, 8192x6144 two-shot, us): the peak sits lower still and the packet is not
+ * re-emitted; PLOW_XR_SCHED_NWG caps the data workgroups inside the 304-workgroup packet. AG_U=1
+ * (one all-gather pack per lane) at 8/12/16/20/24/32 data workgroups = 1229/1002/926/817/792/842;
+ * the shipped 2-byte loop at 304 = 970. The reduce-scatter wants fewer still (343 us at 8 vs 399
+ * at 24), so PLOW_XR_SCHED_NWG_RS caps it separately: reduce-scatter on 8, all-gather on 24 =
+ * 728 us against 795 for one cap of 24. In situ (4-layer TP8 packet, last 8192 chunk) the single
+ * cap of 24 takes the collective from 1.08 to 0.99 ms. */
 #ifndef PLOW_XR_SCHED_AITER
 #define PLOW_XR_SCHED_AITER 0
 #endif
@@ -218,6 +226,30 @@ extern "C" __device__ unsigned plow_xr_sched_aiter_1 = 1;
 #define PLOW_XR_SCHED_AG_WAVE 1
 #endif
 #define PLOW_XR_SCHED_NR 8u
+/* PLOW_XR_SCHED_NWG=K: only the first K workgroups of a prefill collective move data under the
+ * 16-byte schedule. Every prefill two-shot is emitted on all CUs (304 on MI300X), far past the
+ * 16-byte form's fabric peak (the workgroup note above), and narrowing it at emit (`PLOW_XR_CUS`)
+ * changes the packet. A workgroup with slice >= K takes only the arrival the protocol counts it
+ * in (gate_ag for the two-shot; ops 25/26 count none) and leaves. Every element still has one
+ * owner and the same sum order, so the output is bit-identical. 0 = every workgroup. */
+#ifndef PLOW_XR_SCHED_NWG
+#define PLOW_XR_SCHED_NWG 0
+#endif
+#define PLOW_XR_SCHED_CAP (PLOW_XR_SCHED_ON && PLOW_XR_SCHED_NWG > 0)
+/* The two-shot's reduce-scatter may use its own cap: the RS reads eight peers per lane and is
+ * fastest on fewer workgroups than the all-gather. Defaults to PLOW_XR_SCHED_NWG. */
+#ifndef PLOW_XR_SCHED_NWG_RS
+#define PLOW_XR_SCHED_NWG_RS PLOW_XR_SCHED_NWG
+#endif
+#define PLOW_XR_SCHED_NWG_MAX \
+    (PLOW_XR_SCHED_NWG > PLOW_XR_SCHED_NWG_RS ? PLOW_XR_SCHED_NWG : PLOW_XR_SCHED_NWG_RS)
+#if PLOW_XR_SCHED_CAP
+extern "C" __device__ unsigned plow_xr_sched_nwg = PLOW_XR_SCHED_NWG;
+extern "C" __device__ unsigned plow_xr_sched_nwg_rs = PLOW_XR_SCHED_NWG_RS;
+#if defined(PLOW_XR_ATTNRES) && PLOW_XR_ATTNRES
+#error "PLOW_XR_SCHED_NWG does not cover the XReduceAttnRes row path"
+#endif
+#endif
 
 /* PLOW_XR_AGG -- DEVICE-LOCAL AGGREGATION OF THE TWO-SHOT'S `gate_ag` SIGNAL
  * (default in gfx942/gfx950 prefill objects; objects-only, no blob or emitter change).
@@ -1111,6 +1143,47 @@ __device__ __forceinline__ void xr_ag_sched(const void* const* peer_scratch, uin
 }
 #endif /* PLOW_XR_SCHED_ON */
 
+/* The two-shot's RENDEZVOUS 2 arrival of one workgroup (thread 0 only); see the gate_ag note in
+ * d_xreduce_twoshot_mega. */
+__device__ __forceinline__ void xr2_arrive_ag(const void* const* peer_scratch, uint32_t nranks,
+                                              uint32_t rank, size_t xctr_byte_off,
+                                              uint32_t gate_ag, unsigned nblk) {
+#if !PLOW_XR_NOSIG
+#if PLOW_XR_AGG_ON
+    /* ---- DEVICE-LOCAL SIGNAL AGGREGATION (see the PLOW_XR_AGG header note) ----
+     * Word 1 of this gate's own 128 B counter line, on THIS rank's scratch only: never
+     * peer-read, never audited, zeroed by the host with the rest of the region. */
+    {
+        uint32_t* const agg =
+            PLOW_CTR((uint32_t*)((char*)peer_scratch[rank] + xctr_byte_off), gate_ag) + 1;
+        /* The arrival RMW IS the release, at SYSTEM scope — xctr_signal's exact form aimed
+         * at word 1 — for two load-bearing reasons. (1) A release RMW orders the ISSUING
+         * workgroup's PHASE 1 stores; the first cut's fence+relaxed-agent arrival ordered
+         * nobody's and failed needle@3000 (LESSONS.md #19). (2) SYSTEM scope keeps word 1
+         * memory-side like word 0: an agent-scope RMW executes cached in this XCD's L2 and
+         * dirties the very line the peers' system-scope signals are updating at memory —
+         * a stale-line writeback can lose remote word-0 counts. */
+        const uint32_t prev =
+            __hip_atomic_fetch_add(agg, 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+        if (prev + 1u == nblk) {
+            /* I closed the count for this device. Acquire the other workgroups' releases
+             * at SYSTEM scope BEFORE speaking for them — the peers' visibility of every
+             * other workgroup's slice runs through this fence. Then ONE remote RMW per
+             * peer, carrying nblk, so word 0 still lands on exactly nranks*nblk. */
+            xctr_acquire();
+            for (uint32_t r = 0; r < nranks; r++)
+                __hip_atomic_fetch_add(
+                    PLOW_CTR((uint32_t*)((char*)peer_scratch[r] + xctr_byte_off), gate_ag),
+                    nblk, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+        }
+    }
+#else
+    for (uint32_t r = 0; r < nranks; r++)
+        xctr_signal(PLOW_CTR((uint32_t*)((char*)peer_scratch[r] + xctr_byte_off), gate_ag));
+#endif
+#endif
+}
+
 /* ---- TWO-SHOT all-reduce for the LARGE prefill [T,hidden] message ----------------
  * The one-shot d_xreduce_mega has EVERY rank read ALL N peers' FULL partial: ~(N-1)*msg
  * of fabric traffic per rank. That is optimal for decode's tiny [1,hidden] latency-bound
@@ -1162,7 +1235,29 @@ __device__ __forceinline__ void d_xreduce_twoshot_mega(
     __shared__ __align__(16) bf16 xr_peer_tile[8u * PLOW_THREADS];
 #endif
     const unsigned tid = slice * PLOW_THREADS + threadIdx.x;
-    const unsigned stride = nblk * PLOW_THREADS;
+#if PLOW_XR_SCHED_CAP
+    if (slice >= PLOW_XR_SCHED_NWG_MAX) {
+        if (threadIdx.x == 0) {
+            xr2_arrive_ag(peer_scratch, nranks, rank, xctr_byte_off, gate_ag, nblk);
+#if PLOW_XR_TRACE_PHASES
+            if (xr_trace) {
+                xr_trace->cu = 0u;
+                xr_trace->pc = 0u;
+                xr_trace->t_ready = xr_trace->t_end = __builtin_amdgcn_s_memrealtime();
+            }
+#endif
+        }
+        return;
+    }
+    const unsigned dnblk = nblk < PLOW_XR_SCHED_NWG ? nblk : PLOW_XR_SCHED_NWG;
+    const bool xr_rs_on = slice < PLOW_XR_SCHED_NWG_RS;
+    const unsigned rs_stride =
+        (nblk < PLOW_XR_SCHED_NWG_RS ? nblk : PLOW_XR_SCHED_NWG_RS) * PLOW_THREADS;
+#else
+    const unsigned dnblk = nblk;
+    constexpr bool xr_rs_on = true;
+#endif
+    const unsigned stride = dnblk * PLOW_THREADS;
 
     /* ---- RENDEZVOUS 1 (gate_rs): every rank has published its full partial. One
      * workgroup announces this rank to every peer; ALL workgroups wait N arrivals then
@@ -1180,7 +1275,7 @@ __device__ __forceinline__ void d_xreduce_twoshot_mega(
         xr_trace->pc = (uint32_t)(d > 0xffffffffull ? 0xffffffffull : d);
     }
 #endif
-    if (threadIdx.x == 0) {
+    if (threadIdx.x == 0 && xr_rs_on) {
 #if !PLOW_XR2_SKIP_RS
         uint32_t* lg = PLOW_CTR((uint32_t*)((char*)peer_scratch[rank] + xctr_byte_off), gate_rs);
         const uint64_t t0 = __builtin_amdgcn_s_memrealtime();
@@ -1212,7 +1307,11 @@ __device__ __forceinline__ void d_xreduce_twoshot_mega(
     const uint32_t my_lo = (uint32_t)(((uint64_t)n * rank) / nranks);
     const uint32_t my_hi = (uint32_t)(((uint64_t)n * (rank + 1)) / nranks);
     bf16* my_part = (bf16*)((char*)peer_scratch[rank] + slot_bytes);
-#if PLOW_XR_SCHED_ON
+#if PLOW_XR_SCHED_CAP
+    if (xr_rs_on)
+        xr_rs_sched(peer_scratch, nranks, slot_bytes, my_part, my_lo, my_hi, tid, rs_stride, 0u,
+                    0u, nullptr);
+#elif PLOW_XR_SCHED_ON
     xr_rs_sched(peer_scratch, nranks, slot_bytes, my_part, my_lo, my_hi, tid, stride, 0u, 0u,
                 nullptr);
 #else
@@ -1339,41 +1438,7 @@ __device__ __forceinline__ void d_xreduce_twoshot_mega(
      * writing and released. */
     if (threadIdx.x == 0) bailed = 0;
     __syncthreads();
-#if !PLOW_XR_NOSIG
-#if PLOW_XR_AGG_ON
-    /* ---- DEVICE-LOCAL SIGNAL AGGREGATION (see the PLOW_XR_AGG header note) ----
-     * Word 1 of this gate's own 128 B counter line, on THIS rank's scratch only: never
-     * peer-read, never audited, zeroed by the host with the rest of the region. */
-    if (threadIdx.x == 0) {
-        uint32_t* const agg =
-            PLOW_CTR((uint32_t*)((char*)peer_scratch[rank] + xctr_byte_off), gate_ag) + 1;
-        /* The arrival RMW IS the release, at SYSTEM scope — xctr_signal's exact form aimed
-         * at word 1 — for two load-bearing reasons. (1) A release RMW orders the ISSUING
-         * workgroup's PHASE 1 stores; the first cut's fence+relaxed-agent arrival ordered
-         * nobody's and failed needle@3000 (LESSONS.md #19). (2) SYSTEM scope keeps word 1
-         * memory-side like word 0: an agent-scope RMW executes cached in this XCD's L2 and
-         * dirties the very line the peers' system-scope signals are updating at memory —
-         * a stale-line writeback can lose remote word-0 counts. */
-        const uint32_t prev =
-            __hip_atomic_fetch_add(agg, 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
-        if (prev + 1u == nblk) {
-            /* I closed the count for this device. Acquire the other workgroups' releases
-             * at SYSTEM scope BEFORE speaking for them — the peers' visibility of every
-             * other workgroup's slice runs through this fence. Then ONE remote RMW per
-             * peer, carrying nblk, so word 0 still lands on exactly nranks*nblk. */
-            xctr_acquire();
-            for (uint32_t r = 0; r < nranks; r++)
-                __hip_atomic_fetch_add(
-                    PLOW_CTR((uint32_t*)((char*)peer_scratch[r] + xctr_byte_off), gate_ag),
-                    nblk, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
-        }
-    }
-#else
-    if (threadIdx.x == 0)
-        for (uint32_t r = 0; r < nranks; r++)
-            xctr_signal(PLOW_CTR((uint32_t*)((char*)peer_scratch[r] + xctr_byte_off), gate_ag));
-#endif
-#endif
+    if (threadIdx.x == 0) xr2_arrive_ag(peer_scratch, nranks, rank, xctr_byte_off, gate_ag, nblk);
     if (threadIdx.x == 0) {
 #if !PLOW_XR2_SKIP_AG
         uint32_t* lg = PLOW_CTR((uint32_t*)((char*)peer_scratch[rank] + xctr_byte_off), gate_ag);
@@ -1451,7 +1516,7 @@ __device__ __forceinline__ void d_xreduce_twoshot_mega(
      * a workgroup visits the slices rotates. `+ rank` also decorrelates the ranks so no
      * two ranks start on the same peer. */
 #if PLOW_XR_SCHED_ON
-    xr_ag_sched(peer_scratch, nranks, rank, n, slot_bytes, slice, nblk, out, resid, out2,
+    xr_ag_sched(peer_scratch, nranks, rank, n, slot_bytes, slice, dnblk, out, resid, out2,
                 gslot_bytes, gcols);
 #else
     for (uint32_t i = 0; i < nranks; i++) {
@@ -1585,7 +1650,12 @@ __device__ __forceinline__ void d_xreduce_scatter_mega(
     bf16* __restrict__ band_copy) {
     __shared__ int bailed;
     const unsigned tid = slice * PLOW_THREADS + threadIdx.x;
+#if PLOW_XR_SCHED_CAP
+    if (slice >= PLOW_XR_SCHED_NWG) return;
+    const unsigned stride = (nblk < PLOW_XR_SCHED_NWG ? nblk : PLOW_XR_SCHED_NWG) * PLOW_THREADS;
+#else
     const unsigned stride = nblk * PLOW_THREADS;
+#endif
     if (!xr_rendezvous_one_wg(peer_scratch, nranks, rank, xctr_byte_off, gate_rs, deadline_ticks,
                               status, slice, &bailed))
         return;
@@ -1650,14 +1720,20 @@ __device__ __forceinline__ void d_xall_gather_mega(
     bf16* __restrict__ dst2, uint32_t n2, uint32_t slot2) {
     __shared__ int bailed;
     const unsigned tid = slice * PLOW_THREADS + threadIdx.x;
-    const unsigned stride = nblk * PLOW_THREADS;
+#if PLOW_XR_SCHED_CAP
+    if (slice >= PLOW_XR_SCHED_NWG) return;
+    const unsigned dnblk = nblk < PLOW_XR_SCHED_NWG ? nblk : PLOW_XR_SCHED_NWG;
+#else
+    const unsigned dnblk = nblk;
+#endif
+    const unsigned stride = dnblk * PLOW_THREADS;
     if (!xr_rendezvous_one_wg(peer_scratch, nranks, rank, xctr_byte_off, gate, deadline_ticks,
                               status, slice, &bailed))
         return;
     auto gather = [&](bf16* __restrict__ dst, uint32_t n, uint32_t slot) {
         if (dst == nullptr || n == 0) return;
 #if PLOW_XR_SCHED_ON
-        xr_ag_sched(peer_scratch, nranks, rank, n, slot, slice, nblk, dst, nullptr, nullptr, 0u,
+        xr_ag_sched(peer_scratch, nranks, rank, n, slot, slice, dnblk, dst, nullptr, nullptr, 0u,
                     0u);
         (void)tid;
         (void)stride;

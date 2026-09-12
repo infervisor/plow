@@ -776,10 +776,21 @@ if [ "${PLOW_XR_NOWAIT:-0}" = 1 ]; then
   AX_PREFILL="$AX_PREFILL -DPLOW_XR_NOWAIT=1"
 fi
 
-# Diagnostic-only XREDUCE2 phase timeline in PlowTraceRec. Never a serve asset.
+# Diagnostic-only XREDUCE2 / XREDUCE phase timeline in PlowTraceRec. Never a serve asset.
 if [ "${PLOW_XR_TRACE_PHASES:-0}" = 1 ]; then
   AX_PREFILL="$AX_PREFILL -DPLOW_XR_TRACE_PHASES=1"
+  AX_DECODE="$AX_DECODE -DPLOW_XR_TRACE_PHASES=1"
 fi
+
+# OPT-IN (PLOW_XR_SCHED=aiter): the 16-byte prefill collective schedule (op_collective.h
+# PLOW_XR_SCHED_AITER) on the first PLOW_XR_SCHED_NWG workgroups of each two-shot / op 25 / op 26
+# packet (the two-shot's reduce-scatter on the first PLOW_XR_SCHED_NWG_RS); the rest only arrive.
+# Objects only, the packet is unchanged. Bit-identical.
+case "${PLOW_XR_SCHED:-off}" in
+  off) ;;
+  aiter) AX_PREFILL="$AX_PREFILL -DPLOW_XR_SCHED_AITER=1 -DPLOW_XR_SCHED_NWG=${PLOW_XR_SCHED_NWG:-24} -DPLOW_XR_SCHED_NWG_RS=${PLOW_XR_SCHED_NWG_RS:-8} -DPLOW_XR_SCHED_AG_U=${PLOW_XR_SCHED_AG_U:-1}" ;;
+  *) echo "FAIL: PLOW_XR_SCHED must be off or aiter" >&2; exit 2 ;;
+esac
 
 # OPT-IN (PLOW_XR_MLP=1): PEER-BATCHED REDUCE in the cross-GPU collectives (op_collective.h).
 # The reduce bodies walked the N peers one serialised round trip at a time (ISA: a pointer
