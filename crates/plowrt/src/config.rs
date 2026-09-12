@@ -1099,6 +1099,12 @@ pub struct AmdRuntimeConfig {
     /// `name:path[,name:path...]`. A measurement instrument, not a serving path.
     #[arg(long = "amd-dump-act", env = "PLOW_DUMP_ACT", global = true)]
     pub dump_act: Option<String>,
+
+    /// Allocate each rank's kernarg ring and fine-grained host staging from the CPU agent nearest
+    /// its GPU (`HSA_AMD_AGENT_INFO_NEAREST_CPU`) instead of the first CPU agent, so a GPU on the
+    /// far socket reads its kernargs from local memory. Off = the single-agent placement.
+    #[arg(long = "amd-numa-host-pools", env = "PLOW_AMD_NUMA_HOST_POOLS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub numa_host_pools: bool,
 }
 
 /// Global runtime config, initialized once at startup from CLI parse.
