@@ -114,33 +114,31 @@ const EXT: usize = 12;
 /// sampled FP64 oracle).
 fn ext_choice(rows: u32, n: u32, k: u32) -> Option<(usize, u32)> {
     let tiers: [(usize, u32); 3] = match (n, k) {
-        (6144, 2048) => [(2, 524296), (1, 524292), (0, 1)],
-        (256, 6144) => [(5, 524289), (4, 524289), (3, 524290)],
-        (6144, 256) => [(8, 1), (7, 524290), (6, 524296)],
+        (6144, 2048) => [(13, 524296), (12, 524292), (0, 1)],
+        (256, 6144) => [(16, 524289), (15, 524289), (14, 524290)],
+        (6144, 256) => [(19, 1), (18, 524290), (17, 524296)],
         _ => return None,
     };
-    let (index, info1) = tiers[usize::from(rows > 2048) + usize::from(rows > 4096)];
-    Some((EXT + index, info1))
+    Some(tiers[usize::from(rows > 2048) + usize::from(rows > 4096)])
 }
 
 /// Pinned kernel per sequence-parallel band shape at its fixed `T/8` rows (the 2048 and 8192
 /// buckets), from the same sweep at M = 256/1024.
 fn band_choice(rows: u32, n: u32, k: u32) -> Option<(usize, u32)> {
-    let (index, info1) = match (rows, n, k) {
-        (1024, 2048, 6144) => (3, 524304),
-        (1024, 512, 6144) => (5, 524292),
-        (1024, 256, 6144) => (13, 524289),
-        (1024, 128, 6144) => (15, 1),
-        (1024, 64, 6144) => (11, 524289),
-        (1024, 32, 6144) => (16, 524289),
-        (256, 2048, 6144) => (9, 524294),
-        (256, 512, 6144) => (10, 524289),
-        (256, 256 | 128, 6144) => (14, 524289),
-        (256, 64, 6144) => (12, 524289),
-        (256, 32, 6144) => (17, 524289),
+    Some(match (rows, n, k) {
+        (1024, 2048, 6144) => (14, 524304),
+        (1024, 512, 6144) => (16, 524292),
+        (1024, 256, 6144) => (22, 524289),
+        (1024, 128, 6144) => (24, 1),
+        (1024, 64, 6144) => (10, 524289),
+        (1024, 32, 6144) => (25, 524289),
+        (256, 2048, 6144) => (20, 524294),
+        (256, 512, 6144) => (21, 524289),
+        (256, 256 | 128, 6144) => (23, 524289),
+        (256, 64, 6144) => (5, 524289),
+        (256, 32, 6144) => (6, 524289),
         _ => return None,
-    };
-    Some((EXT + index, info1))
+    })
 }
 
 pub(super) fn segment_owners(
@@ -541,6 +539,17 @@ mod tests {
         specs
     }
 
+    /// `load_kernels` patches each descriptor once and refuses one it already patched, so no
+    /// kernel may appear in two spec lists: a shared kernel is reused by index.
+    #[test]
+    fn spec_lists_name_each_descriptor_once() {
+        let specs = all_specs();
+        let mut offsets: Vec<_> = specs.iter().map(|s| s.kernarg_offset).collect();
+        offsets.sort_unstable();
+        offsets.dedup();
+        assert_eq!(offsets.len(), specs.len());
+    }
+
     #[test]
     fn ext_routes_tier_bucket_rows_over_pinned_kernels() {
         let specs = all_specs();
@@ -557,7 +566,7 @@ mod tests {
                     }
                     route.rebase(rows).unwrap();
                     let (index, info1) = route.kernel_choice();
-                    assert!((EXT..specs.len()).contains(&index), "{rows}x{n}x{k}");
+                    assert!(index < specs.len(), "{rows}x{n}x{k}");
                     let args = arguments(route, [0x100000000000, 32, 64], &specs[index], info1);
                     assert_eq!(args.dims[4..6], [n, rows]);
                     assert_eq!(
@@ -582,7 +591,7 @@ mod tests {
                 for rows in [1, band, t / 2 + 1, t] {
                     route.rebase(rows).unwrap();
                     let (index, info1) = route.kernel_choice();
-                    assert!((EXT..specs.len()).contains(&index), "{band}x{n}x{k}");
+                    assert!(index < specs.len(), "{band}x{n}x{k}");
                     let args = arguments(route, [0x100000000000, 32, 64], &specs[index], info1);
                     assert_eq!(args.dims[4..6], [n, band]);
                 }
