@@ -389,11 +389,22 @@ int plow_hsa_get_kernel(plow_hsa* h, int dev, const char* name, plow_hsa_kernel*
     plow_dev_t* d = &h->dev[dev];
 
     /* The loader exposes kernels under their descriptor symbol, "<name>.kd". */
-    char sym_name[128];
-    snprintf(sym_name, sizeof(sym_name), "%s.kd", name);
+    const size_t name_len = strlen(name);
+    char* sym_name = malloc(name_len + 4);
+    if (!sym_name) {
+        snprintf(g_err, sizeof(g_err), "kernel symbol allocation failed");
+        return -1;
+    }
+    memcpy(sym_name, name, name_len);
+    memcpy(sym_name + name_len, ".kd", 4);
 
     hsa_executable_symbol_t sym;
-    TRY(hsa_executable_get_symbol_by_name(d->exe, sym_name, &d->agent, &sym), name);
+    const hsa_status_t lookup = hsa_executable_get_symbol_by_name(d->exe, sym_name, &d->agent, &sym);
+    free(sym_name);
+    if (lookup != HSA_STATUS_SUCCESS) {
+        set_err("kernel symbol lookup", lookup);
+        return -1;
+    }
     TRY(hsa_executable_symbol_get_info(sym, HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_OBJECT,
                                        &out->kernel_object), "kernel_object");
     TRY(hsa_executable_symbol_get_info(sym, HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_KERNARG_SEGMENT_SIZE,

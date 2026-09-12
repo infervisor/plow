@@ -4,13 +4,26 @@
 //! out-of-band channel, and brings the persistent kernels up once. The hot path
 //! (enqueue packet, poll counter) touches only lock-free structures here.
 
+#[cfg(any(feature = "hsa", feature = "cuda"))]
+mod kv_layout;
+
 /// The AMD/gfx950 serving engine — a port of the proven `gemma4_chat.c` driver,
 /// deliberately separate from the CUDA engine because the two differ in kind
 /// (segmented dispatch, three kernels, per-phase scheduler, static LDS).
 #[cfg(feature = "hsa")]
 pub mod amd;
 #[cfg(feature = "hsa")]
-mod amd_packed;
+mod amd_gemm_blk;
+#[cfg(feature = "hsa")]
+mod amd_gemm_lt;
+#[cfg(feature = "hsa")]
+mod amd_index_tp;
+#[cfg(feature = "hsa")]
+mod amd_mla_fold;
+#[cfg(feature = "hsa")]
+mod amd_moe_aiter;
+#[cfg(feature = "hsa")]
+mod amd_sparse_mla;
 /// N [`amd::AmdEngine`] ranks stepped as one: the host half of the inline
 /// collective. Decode is launch-all-then-drain-all; prefill is per-segment,
 /// all-ranks, with a host barrier — see the module note for why the two differ.
@@ -34,6 +47,8 @@ pub mod cpu;
 /// that lets `gpu` stop being CUDA-only. Not gated on a vendor feature: it is
 /// the definition both backends implement.
 pub mod device_api;
+#[cfg(feature = "hsa")]
+pub mod engine_affinity;
 pub mod engine_thread;
 #[cfg(feature = "cuda")]
 pub mod gpu;

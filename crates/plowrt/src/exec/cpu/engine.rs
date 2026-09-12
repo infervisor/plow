@@ -1291,7 +1291,7 @@ mod placement_tests {
         }
         DevProg {
             t: 1,
-            packed_prefill_only: false,
+            role: packet::devbuild::ProgramRole::DecodeRung { rows: 1 },
             n_counter: 0,
             insts: Vec::new(),
             stream,

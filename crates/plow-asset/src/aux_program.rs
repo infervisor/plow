@@ -54,7 +54,7 @@ pub fn encode(
     require(
         programs
             .iter()
-            .all(|p| !p.packed_prefill_only && p.l2_domains == 0),
+            .all(|p| (p.role.is_prefill_bucket() || p.role.is_decode_rung()) && p.l2_domains == 0),
         "unsupported program placement",
     )?;
     let owned = Section {

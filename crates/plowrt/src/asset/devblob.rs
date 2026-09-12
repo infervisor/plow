@@ -29,12 +29,25 @@ pub struct DevTensor {
     pub init: Option<std::ops::Range<usize>>,
 }
 
+/// A role predicate as a plain `fn`, so both phases of [`DevBlob::prefill_phase`] /
+/// [`DevBlob::decode_phase`] have the SAME iterator type and unify in an `if`/`else`.
+type PhaseFilter = for<'a, 'b> fn(&'a &'b DevProg) -> bool;
+
+/// One phase of the program table, by role. `Clone`, so a caller may make several passes.
+pub type PhaseProgs<'a> = std::iter::Filter<std::slice::Iter<'a, DevProg>, PhaseFilter>;
+
 /// One compiled program (a prefill bucket, or the T=1 decode program last).
 pub struct DevProg {
     /// The T this program was compiled for (decode = 1).
     pub t: u32,
-    /// This topology is selected only for a genuinely packed prefill dispatch.
-    pub packed_prefill_only: bool,
+    /// What this program is FOR (`packet::devbuild::ProgramRole`). Stamped once, by
+    /// [`packet::devbuild::derive_roles`], when the table is parsed; every ladder derivation
+    /// filters on it instead of slicing the table by index.
+    ///
+    /// A PARENT packet's bucket-vs-rung split is positional; an EXTENSION states it with
+    /// `packet::devbuild::DECODE_RUNG_PROG`, because a lone program has no position to read
+    /// the role out of. Which rule applied is settled here and nowhere else.
+    pub role: packet::devbuild::ProgramRole,
     pub n_counter: u32,
     pub insts: Vec<DevInst64>,
     pub stream: Vec<StreamEnt>,
@@ -122,6 +135,19 @@ pub struct DevBlob {
     /// TP sharding recovered from the decode program's collectives, or `None`
     /// for a single-GPU blob. See [`DevTp`].
     pub tp: Option<DevTp>,
+    /// The parent this container references INSTEAD of declaring a tensor table — `Some` iff
+    /// this is an `extension.pkt` (docs/arch/19, phase 2). A parent packet is always `None`,
+    /// and the two are told apart by container magic before anything else is read.
+    pub parent: Option<plow_asset::extension::ParentRef>,
+}
+
+/// Which container [`DevBlob::parse_inner`] was asked for. The two are distinct files with
+/// distinct magics, and reading one as the other is the silent failure the extension magic
+/// exists to prevent — so the caller says which it wants and gets a named refusal otherwise.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Container {
+    Model,
+    Extension,
 }
 
 /// Copy `n` `T` records out of `buf` at `*off` (unaligned-safe — the blob's
@@ -197,20 +223,49 @@ impl DevBlob {
     /// Backends that cannot check keep the old behaviour through [`DevBlob::parse`], which is
     /// this with `false` -- placement is then refused unless runtime configuration opts in.
     pub fn parse_l2(buf: &[u8], l2_dispatch_ok: bool) -> Result<DevBlob> {
-        Self::parse_inner(buf, l2_dispatch_ok)
+        Self::parse_inner(buf, l2_dispatch_ok, Container::Model)
     }
 
     pub fn parse(buf: &[u8]) -> Result<DevBlob> {
-        Self::parse_inner(buf, false)
+        Self::parse_inner(buf, false, Container::Model)
     }
 
-    fn parse_inner(buf: &[u8], l2_dispatch_ok: bool) -> Result<DevBlob> {
+    /// Parse an `extension.pkt` (docs/arch/19, phase 2): the same container with the tensor
+    /// table replaced by a reference to the parent's.
+    ///
+    /// This only decodes the container. Whether the extension may be MERGED is the six-rule
+    /// contract in `plow_asset::extension`, applied by [`crate::asset::extension`].
+    pub fn parse_extension(buf: &[u8], l2_dispatch_ok: bool) -> Result<DevBlob> {
+        Self::parse_inner(buf, l2_dispatch_ok, Container::Extension)
+    }
+
+    fn parse_inner(buf: &[u8], l2_dispatch_ok: bool, want: Container) -> Result<DevBlob> {
         let mut off = 0usize;
         let hdr: BlobHeader = take::<BlobHeader>(buf, &mut off, 1, "header")?[0];
-        if !is_blob_magic(&hdr.magic) {
-            return Err(RuntimeError::Device(
-                "devblob: bad magic — recompile with plowc (format changed)".into(),
-            ));
+        let is_ext = packet::ext::is_ext_magic(&hdr.magic);
+        match (want, is_ext, is_blob_magic(&hdr.magic)) {
+            (Container::Model, false, true) | (Container::Extension, true, _) => {}
+            (Container::Model, true, _) => {
+                return Err(RuntimeError::Device(
+                    "devblob: this is an extension.pkt, not a model packet — an extension \
+                     carries programs and a reference to its parent's tensor table, and binding \
+                     it as a model would leave every tensor handle unresolved. Load the parent \
+                     and merge this as an extension."
+                        .into(),
+                ))
+            }
+            (Container::Extension, false, true) => {
+                return Err(RuntimeError::Device(
+                    "devblob: this is a model.pkt, not an extension — it declares its own \
+                     tensor table and cannot be merged onto a parent."
+                        .into(),
+                ))
+            }
+            _ => {
+                return Err(RuntimeError::Device(
+                    "devblob: bad magic — recompile with plowc (format changed)".into(),
+                ))
+            }
         }
         let is_v7 = &hdr.magic == BLOB_MAGIC_V7 || &hdr.magic == BLOB_MAGIC_V7_L2SEG;
 
@@ -246,12 +301,16 @@ impl DevBlob {
         let kvrow = take::<u32>(buf, &mut off, hdr.n_kvrow as usize, "kvrow table")?;
 
         let mut progs = Vec::with_capacity(hdr.n_prog as usize);
+        let mut prog_t = Vec::with_capacity(hdr.n_prog as usize);
         for p in 0..hdr.n_prog {
             let ph: BlobProgHeader = take::<BlobProgHeader>(buf, &mut off, 1, "prog header")?[0];
             let what = |s: &str| format!("prog {p} {s}");
+            prog_t.push(ph.t);
             progs.push(DevProg {
                 t: packet::devbuild::program_rows(ph.t),
-                packed_prefill_only: packet::devbuild::is_packed_prefill_program(ph.t),
+                // Placeholder: a role needs the WHOLE table (the bucket/rung split has no wire
+                // field yet and falls back to `decode_rung_lo`), so it is stamped below.
+                role: packet::devbuild::ProgramRole::PrefillBucket { rows: 0 },
                 n_counter: ph.n_counter,
                 insts: take(buf, &mut off, ph.n_inst as usize, &what("insts"))?,
                 stream: take(buf, &mut off, ph.n_stream as usize, &what("stream"))?,
@@ -263,6 +322,25 @@ impl DevBlob {
                 gq_seg_ofs: Vec::new(),
                 l2_domains: 0,
             });
+        }
+
+        // THE ONE PLACE a loaded table is turned into roles. Everything downstream — both
+        // ladders, the packed-sibling lookup, the token-batch route and the per-phase object
+        // requirements — filters on `DevProg::role` and never on the program's index.
+        //
+        // The CONTAINER picks the rule, and this is the only place that choice is made: a
+        // parent's bucket/rung split is the positional `decode_rung_lo` run, an extension has
+        // no position and states its roles instead (docs/arch/19, phases 1-2).
+        let source = if is_ext {
+            packet::devbuild::RoleSource::Stated
+        } else {
+            packet::devbuild::RoleSource::Positional
+        };
+        let roles = packet::devbuild::derive_roles(&prog_t, source, |i| {
+            packet::devbuild::token_batch_band_of(&progs[i].insts)
+        });
+        for (prog, role) in progs.iter_mut().zip(roles) {
+            prog.role = role;
         }
 
         // Optional GQ01 appendix: per program { n_seg, gq_stream[n_stream],
@@ -378,15 +456,65 @@ impl DevBlob {
                 }
                 if r.generate().is_none() {
                     return Err(RuntimeError::Device(format!(
-                        "devblob: gen recipe for `{}` has unknown kind {} — this blob \
-                         needs a newer plowrt",
-                        tensors[r.tensor as usize].name, r.kind
+                        "devblob: gen recipe for `{}` is unreadable — kind {}, scale {} \
+                         — this blob needs a newer plowrt. `generate()` refuses on an unknown \
+                         KIND or an unknown SCALE; both are printed because naming only the \
+                         kind sent a reader looking at the wrong field when it was the scale \
+                         (a DeepSeek-family YaRN blob read by a pre-ROPE_SCALE_YARN_DS runtime).",
+                        tensors[r.tensor as usize].name, r.kind, r.scale
                     )));
                 }
             }
             g
         } else {
             Vec::new()
+        };
+
+        // An extension references its parent's tensor table instead of declaring one. Both
+        // halves are checked here rather than at merge time: a container that declares tensors
+        // OR has no parent reference is not an extension at all, whatever its magic says, and
+        // the merge contract would have nothing to check it against.
+        let parent = if is_ext {
+            if hdr.n_tensor != 0 || hdr.init_bytes != 0 {
+                return Err(RuntimeError::Device(format!(
+                    "devblob: extension declares {} tensors and {} B of init data — an \
+                     extension carries programs only",
+                    hdr.n_tensor, hdr.init_bytes
+                )));
+            }
+            let mut refs = sections
+                .iter()
+                .filter(|s| s.kind == packet::ext::SECT_PARENT_REF);
+            let s = refs.next().ok_or_else(|| {
+                RuntimeError::Device(
+                    "devblob: extension has no parent-ref section — nothing says which packet \
+                     it extends"
+                        .into(),
+                )
+            })?;
+            if refs.next().is_some() {
+                return Err(RuntimeError::Device(
+                    "devblob: extension carries two parent-ref sections".into(),
+                ));
+            }
+            let raw = buf.get(s.offset..s.offset + s.size).ok_or_else(|| {
+                RuntimeError::Device("devblob: parent-ref section outside the container".into())
+            })?;
+            let wire = packet::ext::BlobParentRef::from_bytes(raw)
+                .map_err(|e| RuntimeError::Device(format!("devblob: {e}")))?;
+            Some(plow_asset::extension::ParentRef::from(&wire))
+        } else {
+            if sections
+                .iter()
+                .any(|s| s.kind == packet::ext::SECT_PARENT_REF)
+            {
+                return Err(RuntimeError::Device(
+                    "devblob: model packet carries a parent-ref section — a packet cannot \
+                     extend another packet"
+                        .into(),
+                ));
+            }
+            None
         };
 
         // PLOW_L2_PLACE guard: a placed blob requires physical-domain queue dispatch.
@@ -433,7 +561,74 @@ impl DevBlob {
             sections,
             gen,
             tp,
+            parent,
         })
+    }
+
+    /// The tensor table as the extension contract digests it — see
+    /// `plow_asset::extension::tensor_table_digest`.
+    pub fn tensor_identities(&self) -> Vec<plow_asset::extension::TensorIdentity> {
+        self.tensors
+            .iter()
+            .map(|t| plow_asset::extension::TensorIdentity {
+                name: t.name.clone(),
+                bytes: t.bytes,
+                initialized: t.init.is_some(),
+            })
+            .collect()
+    }
+
+    /// TP degree the container was compiled for. `1` when there is no collective — a tp=1 blob
+    /// emits none, so "no collective" and "not sharded" are the same fact.
+    pub fn tp_degree(&self) -> u32 {
+        self.tp.map_or(1, |t| t.n_gpu)
+    }
+
+    /// This container's tensor-table digest (rule 2). On a parent this is what an extension
+    /// must match; on an extension it is meaningless (the table is empty) and the extension's
+    /// CLAIM lives in [`DevBlob::parent`].
+    pub fn tensor_table_digest(&self) -> plow_asset::extension::Digest {
+        plow_asset::extension::tensor_table_digest(&self.tensor_identities(), self.tp_degree())
+    }
+
+    /// The programs' roles, in table order. Stamped at parse by
+    /// [`packet::devbuild::derive_roles`] under the rule this container's magic selected, so
+    /// there is nothing to re-derive here and no second definition to disagree with.
+    pub fn program_roles(&self) -> Vec<packet::devbuild::ProgramRole> {
+        self.progs.iter().map(|p| p.role).collect()
+    }
+
+    /// What one program costs the arenas (rule 6). Instruction-stream bytes are the records
+    /// the loader uploads per program — the same four arrays `AmdEngine::load` sends — plus
+    /// the GQ appendix when the program carries one.
+    pub fn program_budget(&self, p: &DevProg) -> plow_asset::extension::Budget {
+        let bytes = |n: usize, sz: usize| (n * sz) as u64;
+        plow_asset::extension::Budget {
+            inst_stream_bytes: bytes(p.insts.len(), std::mem::size_of::<DevInst64>())
+                + bytes(p.stream.len(), std::mem::size_of::<StreamEnt>())
+                + bytes(p.stream_ofs.len() + p.stream_len.len() + p.succs.len(), 4)
+                + bytes(p.waits.len(), std::mem::size_of::<Wait>())
+                + bytes(p.gq_stream.len(), std::mem::size_of::<StreamEnt>())
+                + bytes(p.gq_seg_ofs.len(), 4),
+            counters: p.n_counter,
+            segments: p.stream.iter().map(|e| e.seg as u32 + 1).max().unwrap_or(1),
+            workspace_bytes: 0,
+        }
+    }
+
+    /// The largest demand over every program in this container.
+    pub fn budget(&self) -> plow_asset::extension::Budget {
+        self.progs
+            .iter()
+            .map(|p| self.program_budget(p))
+            .fold(plow_asset::extension::Budget::default(), |a, b| {
+                plow_asset::extension::Budget {
+                    inst_stream_bytes: a.inst_stream_bytes.max(b.inst_stream_bytes),
+                    counters: a.counters.max(b.counters),
+                    segments: a.segments.max(b.segments),
+                    workspace_bytes: a.workspace_bytes.max(b.workspace_bytes),
+                }
+            })
     }
 
     /// Get a section by kind and architecture-specific name.
@@ -486,7 +681,7 @@ impl DevBlob {
             .iter()
             .map(|p| Program {
                 rows: p.t,
-                packed_prefill_only: p.packed_prefill_only,
+                role: p.role,
                 n_counter: p.n_counter,
                 insts: &p.insts,
                 stream: &p.stream,
@@ -510,21 +705,80 @@ impl DevBlob {
         })
     }
 
-    /// Index of the first decode rung. The compiler emits prefill buckets first,
-    /// then a trailing ascending decode ladder whose widths are at most 128.
-    pub fn decode_rung_lo(&self) -> usize {
-        let widths: Vec<u32> = self.progs.iter().map(|p| p.t).collect();
-        packet::devbuild::decode_rung_lo(&widths)
+    /// Re-derive every program's role from the table, for a blob ASSEMBLED IN MEMORY rather
+    /// than parsed. A program already marked as a packed sibling or a token-batch body keeps
+    /// that marker; the rest split into buckets and rungs by the same rule
+    /// [`packet::devbuild::derive_roles`] applies at load.
+    #[cfg(test)]
+    pub(crate) fn stamp_roles(&mut self) {
+        use packet::devbuild::ProgramRole;
+        let prog_t: Vec<u32> = self
+            .progs
+            .iter()
+            .map(|p| match p.role {
+                ProgramRole::PackedSibling { .. } => {
+                    packet::devbuild::packed_prefill_program_t(p.t)
+                }
+                ProgramRole::TokenBatchBody { .. } => packet::devbuild::token_batch_program_t(p.t),
+                ProgramRole::DecodeRung { .. } if self.parent.is_some() => {
+                    packet::devbuild::decode_rung_program_t(p.t)
+                }
+                _ => p.t,
+            })
+            .collect();
+        let source = if self.parent.is_some() {
+            packet::devbuild::RoleSource::Stated
+        } else {
+            packet::devbuild::RoleSource::Positional
+        };
+        let roles = packet::devbuild::derive_roles(&prog_t, source, |i| {
+            packet::devbuild::token_batch_band_of(&self.progs[i].insts)
+        });
+        for (prog, role) in self.progs.iter_mut().zip(roles) {
+            prog.role = role;
+        }
     }
 
-    /// Prefill bucket programs, excluding every decode rung.
-    pub fn prefill_progs(&self) -> &[DevProg] {
-        &self.progs[..self.decode_rung_lo()]
+    /// Number of prefill-side programs, i.e. the index the decode ladder starts at on a table
+    /// the emitter laid out. Role-derived, so it is a COUNT and not a boundary: a caller that
+    /// wants "the decode programs" asks [`Self::decode_phase`].
+    pub fn decode_rung_lo(&self) -> usize {
+        self.progs
+            .iter()
+            .filter(|p| p.role.is_prefill_side())
+            .count()
+    }
+
+    /// Every prefill-side program — bucket, packed sibling or token-batch body — in table
+    /// order. The old `progs[..decode_rung_lo]` slice, by role.
+    pub fn prefill_phase(&self) -> PhaseProgs<'_> {
+        fn prefill_side(p: &&DevProg) -> bool {
+            p.role.is_prefill_side()
+        }
+        self.progs.iter().filter(prefill_side as PhaseFilter)
+    }
+
+    /// Every decode rung, in table order. The old `progs[decode_rung_lo..]` slice, by role.
+    pub fn decode_phase(&self) -> PhaseProgs<'_> {
+        fn decode_rung(p: &&DevProg) -> bool {
+            p.role.is_decode_rung()
+        }
+        self.progs.iter().filter(decode_rung as PhaseFilter)
+    }
+
+    /// Every prefill-side program, in TABLE ORDER — the old `progs[..decode_rung_lo]` slice.
+    /// Callers index this against the packet's own program numbering, so it must not be
+    /// reordered or thinned; the bucket LADDER (buckets only, by width) is
+    /// `exec::amd::AmdEngine::prefill_rungs`.
+    pub fn prefill_progs(&self) -> Vec<&DevProg> {
+        self.prefill_phase().collect()
     }
 
     /// Decode rung programs in ascending width order.
-    pub fn decode_progs(&self) -> &[DevProg] {
-        &self.progs[self.decode_rung_lo()..]
+    pub fn decode_progs(&self) -> Vec<&DevProg> {
+        let mut out: Vec<&DevProg> = self.decode_phase().collect();
+        out.sort_by_key(|p| p.t);
+        out
     }
 
     /// Widths advertised by the decode ladder.
@@ -535,7 +789,7 @@ impl DevBlob {
     /// The widest decode program. This remains the last program for both the
     /// legacy one-rung blob and a decode ladder.
     pub fn decode_prog(&self) -> Result<&DevProg> {
-        let g = self
+        let g = *self
             .decode_progs()
             .last()
             .ok_or_else(|| RuntimeError::Device("devblob: no programs".into()))?;
@@ -582,7 +836,83 @@ impl DevBlob {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SegmentClassPolicy {
+    pub pure_mode: u8,
+    pub fa512_mode: u8,
+    pub fa256_gqa2: bool,
+}
+
 impl DevProg {
+    pub(crate) fn inferred_segment_policy(&self) -> SegmentClassPolicy {
+        let mut n_seg = 1usize;
+        for entry in &self.stream {
+            n_seg = n_seg.max(entry.seg as usize + 1);
+        }
+        let mut mapped_gemm = vec![false; n_seg];
+        let mut mapless_w8a16 = vec![false; n_seg];
+        let mut hd512 = vec![false; n_seg];
+        let mut hd256_gqa2 = vec![false; n_seg];
+        let mut other_for_gemm = vec![false; n_seg];
+        let mut other_for_hd512 = vec![false; n_seg];
+        let mut other_for_gqa2 = vec![false; n_seg];
+        for entry in &self.stream {
+            let Some(inst) = self.insts.get(entry.inst as usize) else {
+                continue;
+            };
+            let seg = entry.seg as usize;
+            let plain_gemm = matches!(
+                DevOp::from_u16(inst.op),
+                Some(
+                    DevOp::Gemm
+                        | DevOp::GemmMed
+                        | DevOp::GemmSmall
+                        | DevOp::GemmFp8
+                        | DevOp::GemmMedFp8
+                        | DevOp::GemmSmallFp8
+                )
+            );
+            let mapped = plain_gemm && inst.i[6] != 0 && inst.i[7] != 0;
+            let w8a16 = inst.is_mapless_w8a16_gemm();
+            mapped_gemm[seg] |= mapped;
+            mapless_w8a16[seg] |= w8a16;
+            other_for_gemm[seg] |= !mapped && !w8a16;
+
+            let is_hd512 = inst.op == DevOp::FlashPrefill as u16 && inst.i[6] == 512;
+            hd512[seg] |= is_hd512;
+            other_for_hd512[seg] |= !is_hd512;
+
+            let is_gqa2 = inst.is_hd256_gqa2_sliding_prefill();
+            hd256_gqa2[seg] |= is_gqa2;
+            other_for_gqa2[seg] |= !is_gqa2;
+        }
+        let pure = mapped_gemm
+            .iter()
+            .zip(&mapless_w8a16)
+            .zip(&other_for_gemm)
+            .any(|((&mapped, &w8a16), &other)| (mapped || w8a16) && !other);
+        let w8a16 = mapless_w8a16
+            .iter()
+            .zip(&other_for_gemm)
+            .any(|(&present, &other)| present && !other);
+        SegmentClassPolicy {
+            pure_mode: if w8a16 { 3 } else if pure { 1 } else { 0 },
+            fa512_mode: if hd512
+                .iter()
+                .zip(&other_for_hd512)
+                .any(|(&present, &other)| present && !other)
+            {
+                1
+            } else {
+                0
+            },
+            fa256_gqa2: hd256_gqa2
+                .iter()
+                .zip(&other_for_gqa2)
+                .any(|(&present, &other)| present && !other),
+        }
+    }
+
     /// The coarse single-segment gate the sm_120 interpreter implements: every
     /// stream entry must be unsegmented (`seg == 0`) with no per-slice or
     /// cross-GPU counters. Mirrors the harness's fatal check.
@@ -591,6 +921,26 @@ impl DevProg {
     /// `derive_segments`, hoisted here so the CUDA engine (which builds without
     /// the `hsa` module) can classify segments for the SegPf launcher.
     pub fn seg_classes(&self) -> Result<Vec<u8>> {
+        let rt = crate::config::RuntimeConfig::get();
+        let pure_mode = match rt.nv.pf_seg_pure.as_deref() {
+            Some("1") => 1u8,
+            Some("fp8") => 2u8,
+            Some("w8a16") => 3u8,
+            _ => 0u8,
+        };
+        let fa512_mode = match rt.nv.pf_seg_fa512.as_deref() {
+            Some("1") => 1u8,
+            Some("all") => 2u8,
+            _ => 0u8,
+        };
+        self.seg_classes_with(SegmentClassPolicy {
+            pure_mode,
+            fa512_mode,
+            fa256_gqa2: rt.nv.pf_seg_fa256_gqa2,
+        })
+    }
+
+    pub(crate) fn seg_classes_with(&self, policy: SegmentClassPolicy) -> Result<Vec<u8>> {
         let mut n_seg: u32 = 1;
         for e in &self.stream {
             n_seg = n_seg.max(e.seg as u32 + 1);
@@ -602,34 +952,30 @@ impl DevProg {
                 "program declares {n_seg} segments (max 2048) — corrupt stream?"
             )));
         }
-        // PLOW_PF_SEG_PURE=1: mirror of the emit-side PLOW_SEG_PURE_GEMM classing — a segment
+        // Pure mode mirrors the emit-side PLOW_SEG_PURE_GEMM classing — a segment
         // is GEMM-class (8) only if EVERY op in it is a GEMM-family op; anything else (norms,
         // rope, quant, glu, flash) makes it flash-class (4). Required when the lean object is
         // built PLOW_NV_GEMM_ONLY: its dispatch traps on any non-GEMM opcode, so a light-op
-        // segment classified 8 would land there. The two envs must be set together — this one
-        // at serve time, the emit one at plowc time.
+        // segment classified 8 would land there. The CUDA loader recovers this mode from the
+        // packet's isolated segments; PLOW_PF_SEG_PURE remains an explicit override.
         // Must match the emit-side classing in devbuild.rs: "1" = every plain tiled GEMM,
         // "fp8" = only TMA-mapped fp8 GEMMs (the ws-entry object's sole arm).
-        let rt = crate::config::RuntimeConfig::get();
-        let pure_mode = match rt.nv.pf_seg_pure.as_deref() {
-            Some("1") => 1u8,
-            Some("fp8") => 2u8,
-            _ => 0u8,
-        };
+        // "w8a16" pairs mapless W8A16 plus mapped BF16 with a capability-checked object.
+        let pure_mode = policy.pure_mode;
         use packet::dev::DevOp;
         // PLOW_PF_SEG_FA512=1 (T12): hd512 FlashPrefill segments class 2 — launched on the
         // dedicated *_pffa object. Mirror of the emit-side PLOW_SEG_FA512.
-        let fa512_mode = match rt.nv.pf_seg_fa512.as_deref() {
-            Some("1") => 1u8,
-            Some("all") => 2u8,
-            _ => 0u8,
-        };
+        let fa512_mode = policy.fa512_mode;
+        let fa256_gqa2 = policy.fa256_gqa2;
+        let rt = crate::config::RuntimeConfig::get();
         let v2_env = rt.nv.pf_seg_v2.as_deref();
         let seg_v2 = v2_env == Some("1");
         let seg_q8 = seg_v2 || v2_env == Some("q8");
         const FP8_OPS: [DevOp; 3] = [DevOp::GemmFp8, DevOp::GemmMedFp8, DevOp::GemmSmallFp8];
         const BF16_OPS: [DevOp; 3] = [DevOp::Gemm, DevOp::GemmSmall, DevOp::GemmMed];
         let mut class = vec![8u8; n_seg as usize];
+        let mut exact_fa256 = vec![false; n_seg as usize];
+        let mut other_in_exact_segment = vec![false; n_seg as usize];
         for e in &self.stream {
             let inst = self.insts.get(e.inst as usize).ok_or_else(|| {
                 RuntimeError::Device(format!(
@@ -639,6 +985,11 @@ impl DevProg {
                 ))
             })?;
             let op = inst.op;
+            if fa256_gqa2 && inst.is_hd256_gqa2_sliding_prefill() {
+                exact_fa256[e.seg as usize] = true;
+            } else {
+                other_in_exact_segment[e.seg as usize] = true;
+            }
             let flash_op = op == DevOp::FlashPrefill as u16 || op == DevOp::FlashPrefillFp8 as u16;
             if flash_op
                 && ((fa512_mode == 2 && (inst.i[6] == 256 || inst.i[6] == 512))
@@ -663,6 +1014,12 @@ impl DevProg {
                 continue;
             }
             let flashy = match pure_mode {
+                3 => {
+                    !(inst.is_mapless_w8a16_gemm()
+                        || (BF16_OPS.iter().any(|g| *g as u16 == op)
+                            && inst.i[6] != 0
+                            && inst.i[7] != 0))
+                }
                 1 => {
                     // T37 mirror: maps required in mode 1 too (see devbuild.rs).
                     !((FP8_OPS.iter().any(|g| *g as u16 == op)
@@ -681,6 +1038,17 @@ impl DevProg {
             };
             if flashy {
                 class[e.seg as usize] = 4;
+            }
+        }
+        for seg in 0..class.len() {
+            if exact_fa256[seg] {
+                if other_in_exact_segment[seg] {
+                    return Err(RuntimeError::Rejected(format!(
+                        "segment {seg} mixes exact HD256/GQA2 attention with another operator; \
+                         recompile with PLOW_SEG_FA256_GQA2=1"
+                    )));
+                }
+                class[seg] = 3;
             }
         }
         Ok(class)
@@ -749,6 +1117,100 @@ mod tests {
     use packet::dev::DevInst;
     use packet::devbuild::{Model, Program, TensorDecl};
 
+    #[test]
+    fn packet_segments_recover_safe_cuda_object_routing() {
+        let mut insts = vec![DevInst64 {
+            op: DevOp::Embed as u16,
+            blocks: 1,
+            fj: [0; 3],
+            t: [0; 8],
+            i: [0; 8],
+        }; 4];
+        insts[1].op = DevOp::Gemm as u16;
+        insts[1].i[6] = 1;
+        insts[1].i[7] = 2;
+        insts[2].op = DevOp::FlashPrefill as u16;
+        insts[2].i[6] = 512;
+        insts[3].op = DevOp::FlashPrefill as u16;
+        insts[3].i = [128, 128, 16, 8, 0, 1024, 256, 1];
+        insts[3].t[5] = 1;
+        let stream = (0..4)
+            .map(|index| StreamEnt {
+                inst: index,
+                seg: index as u16,
+                ..StreamEnt::default()
+            })
+            .collect();
+        let program = DevProg {
+            t: 128,
+            role: packet::devbuild::ProgramRole::PrefillBucket { rows: 0 },
+            n_counter: 0,
+            insts,
+            stream,
+            stream_ofs: Vec::new(),
+            stream_len: Vec::new(),
+            waits: Vec::new(),
+            succs: Vec::new(),
+            gq_stream: Vec::new(),
+            gq_seg_ofs: Vec::new(),
+            l2_domains: 0,
+        };
+        let policy = program.inferred_segment_policy();
+        assert_eq!(
+            policy,
+            SegmentClassPolicy {
+                pure_mode: 1,
+                fa512_mode: 1,
+                fa256_gqa2: true,
+            }
+        );
+        assert_eq!(program.seg_classes_with(policy).unwrap(), [4, 8, 2, 3]);
+    }
+
+    #[test]
+    fn mixed_light_and_gemm_segment_does_not_claim_a_gemm_only_object() {
+        let insts = vec![
+            DevInst64 {
+                op: DevOp::Gemm as u16,
+                blocks: 1,
+                fj: [0; 3],
+                t: [0; 8],
+                i: [0, 0, 0, 0, 0, 0, 1, 2],
+            },
+            DevInst64 {
+                op: DevOp::RmsNorm as u16,
+                blocks: 1,
+                fj: [0; 3],
+                t: [0; 8],
+                i: [0; 8],
+            },
+        ];
+        let stream = (0..2)
+            .map(|inst| StreamEnt {
+                inst,
+                ..StreamEnt::default()
+            })
+            .collect();
+        let program = DevProg {
+            t: 128,
+            role: packet::devbuild::ProgramRole::PrefillBucket { rows: 0 },
+            n_counter: 0,
+            insts,
+            stream,
+            stream_ofs: Vec::new(),
+            stream_len: Vec::new(),
+            waits: Vec::new(),
+            succs: Vec::new(),
+            gq_stream: Vec::new(),
+            gq_seg_ofs: Vec::new(),
+            l2_domains: 0,
+        };
+        assert_eq!(
+            program.inferred_segment_policy(),
+            SegmentClassPolicy::default()
+        );
+    }
+
     /// `hidden` is a ROW width, and a one-shot collective in a PREFILL program says
     /// `t * hidden`. This used to read `i[0]` outright, which was right only while the
     /// one-shot belonged to decode alone. Kimi-K3's shared-expert reduce carries a folded
@@ -767,7 +1229,7 @@ mod tests {
         };
         let prog = |t: u32, insts: Vec<DevInst64>| DevProg {
             t,
-            packed_prefill_only: false,
+            role: packet::devbuild::ProgramRole::PrefillBucket { rows: 0 },
             n_counter: 0,
             insts,
             stream: Vec::new(),
@@ -1123,6 +1585,150 @@ mod tests {
         assert_eq!(b.decode_prog().unwrap().t, 16);
     }
 
+    /// The POSITIONAL derivation this branch replaced, kept verbatim as the oracle: program
+    /// `[0, dec_lo)` is prefill-side, `[dec_lo, n)` is a decode rung, and the two booleans
+    /// `PACKED_PREFILL_PROG` / `TOKEN_BATCH_PROG` carve the exceptions out of the first range.
+    fn positional_oracle(blob: &DevBlob, encoded: &[u32]) -> (usize, Vec<u32>, Vec<u32>, Vec<u32>) {
+        let widths: Vec<u32> = blob.progs.iter().map(|p| p.t).collect();
+        let dec_lo = packet::devbuild::decode_rung_lo(&widths);
+        let prefill_side: Vec<u32> = widths[..dec_lo].to_vec();
+        let rungs: Vec<u32> = widths[dec_lo..].to_vec();
+        let buckets: Vec<u32> = (0..dec_lo)
+            .filter(|&i| {
+                !packet::devbuild::is_packed_prefill_program(encoded[i])
+                    && !packet::devbuild::is_token_batch_program(encoded[i])
+            })
+            .map(|i| widths[i])
+            .collect();
+        (dec_lo, prefill_side, rungs, buckets)
+    }
+
+    /// The narrowest rung covering `rows`, saturating at the widest — `AmdEngine::decode_prog_for`
+    /// and `CpuModel::decode_prog_for` are this function over their own ladder.
+    fn rung_for(rungs: &[u32], rows: usize) -> u32 {
+        rungs
+            .iter()
+            .copied()
+            .find(|&t| t as usize >= rows)
+            .unwrap_or_else(|| *rungs.last().unwrap())
+    }
+
+    /// THE PIN for phase 1 of `docs/arch/19-packet-extensions.md`. Both ladders, the
+    /// object-phase split and the per-row-count rung selection come out of the ROLES exactly as
+    /// they came out of the index boundary, for every ladder shape the emitter produces.
+    fn assert_role_ladders_match_positional(blob: &DevBlob, encoded: &[u32]) {
+        let (dec_lo, prefill_side, rungs, buckets) = positional_oracle(blob, encoded);
+
+        assert_eq!(blob.decode_rung_lo(), dec_lo);
+        assert_eq!(
+            blob.prefill_phase().map(|p| p.t).collect::<Vec<_>>(),
+            prefill_side
+        );
+        assert_eq!(blob.decode_phase().map(|p| p.t).collect::<Vec<_>>(), rungs);
+        assert_eq!(blob.decode_rungs(), rungs);
+        assert_eq!(blob.decode_prog().unwrap().t, *rungs.last().unwrap());
+
+        // The bucket ladder the chunk planner walks: roles filtered, width-sorted.
+        let mut by_role: Vec<u32> = blob
+            .progs
+            .iter()
+            .filter(|p| p.role.is_prefill_bucket())
+            .map(|p| p.t)
+            .collect();
+        by_role.sort_unstable();
+        let mut want = buckets.clone();
+        want.sort_unstable();
+        assert_eq!(by_role, want);
+
+        // `decode_rung_lo` selection, for EVERY row count the ladder can be asked about.
+        let ladder: Vec<u32> = {
+            let mut ix: Vec<&DevProg> = blob
+                .progs
+                .iter()
+                .filter(|p| p.role.is_decode_rung())
+                .collect();
+            ix.sort_by_key(|p| p.t);
+            ix.iter().map(|p| p.t).collect()
+        };
+        for rows in 0..=(rungs.last().copied().unwrap_or(1) as usize + 4) {
+            assert_eq!(
+                rung_for(&ladder, rows),
+                rung_for(&rungs, rows),
+                "rows={rows}"
+            );
+        }
+    }
+
+    #[test]
+    fn role_derived_ladders_match_the_positional_ones() {
+        let pf = [128u32, 512, 1024];
+        let dec = [1u32, 2, 4, 8, 16];
+        let mut tables: Vec<Vec<u32>> = vec![vec![128, 1], vec![1], vec![128, 128]];
+        for n in 1..=dec.len() {
+            tables.push(pf.iter().chain(&dec[..n]).copied().collect());
+            let mut with_siblings: Vec<u32> = pf.to_vec();
+            with_siblings.extend(
+                pf.iter()
+                    .copied()
+                    .map(packet::devbuild::packed_prefill_program_t),
+            );
+            with_siblings.extend(
+                pf[1..]
+                    .iter()
+                    .copied()
+                    .map(packet::devbuild::token_batch_program_t),
+            );
+            with_siblings.extend(&dec[..n]);
+            tables.push(with_siblings);
+        }
+
+        for table in tables {
+            let mut m = tiny_model();
+            m.progs = (0..table.len())
+                .map(|_| tiny_model().progs.pop().unwrap())
+                .collect();
+            m.prog_t = table.clone();
+            let blob = DevBlob::parse(&m.to_blob()).unwrap();
+            assert_role_ladders_match_positional(&blob, &table);
+        }
+    }
+
+    /// The same pin against a REAL, already-emitted packet — the property backward
+    /// compatibility rests on. `TEST_ROLE_LADDER_PACKET=/path/to/model.pkt`.
+    #[test]
+    fn actual_packet_ladders_match_the_positional_ones() {
+        let Ok(path) = std::env::var("TEST_ROLE_LADDER_PACKET") else {
+            eprintln!("skipped: set TEST_ROLE_LADDER_PACKET to a model.pkt");
+            return;
+        };
+        let bytes = std::fs::read(&path).unwrap();
+        let blob = DevBlob::parse(&bytes).unwrap();
+        // Re-encode the wire `t` words the packet carried, so the oracle sees what it saw.
+        let encoded: Vec<u32> = blob
+            .progs
+            .iter()
+            .map(|p| match p.role {
+                packet::devbuild::ProgramRole::PackedSibling { .. } => {
+                    packet::devbuild::packed_prefill_program_t(p.t)
+                }
+                packet::devbuild::ProgramRole::TokenBatchBody { .. } => {
+                    packet::devbuild::token_batch_program_t(p.t)
+                }
+                _ => p.t,
+            })
+            .collect();
+        assert_role_ladders_match_positional(&blob, &encoded);
+        eprintln!(
+            "{path}: buckets {:?} rungs {:?}",
+            blob.progs
+                .iter()
+                .filter(|p| p.role.is_prefill_bucket())
+                .map(|p| p.t)
+                .collect::<Vec<_>>(),
+            blob.decode_rungs()
+        );
+    }
+
     #[test]
     fn packed_prefill_program_tag_is_normalized_but_retained_as_a_role() {
         let mut m = tiny_model();
@@ -1132,9 +1738,9 @@ mod tests {
         let b = DevBlob::parse(&m.to_blob()).unwrap();
         assert_eq!(b.decode_rung_lo(), 2);
         assert_eq!(b.progs[0].t, 128);
-        assert!(!b.progs[0].packed_prefill_only);
+        assert!(b.progs[0].role.is_prefill_bucket());
         assert_eq!(b.progs[1].t, 128);
-        assert!(b.progs[1].packed_prefill_only);
+        assert!(b.progs[1].role.is_packed_sibling());
         assert_eq!(b.decode_rungs(), vec![1]);
     }
 

@@ -62,9 +62,17 @@
 
 #include "sm90_wgmma.cuh"
 
-/* K/V pipeline depth: tile t+1 streams gmem->smem under tile t's GEMM0+softmax+GEMM1. FIXED at 2
- * (the buffer index is a parity flip, not a modulo ring) — this is a layout constant, not a knob. */
+/* Default K/V pipeline uses two slots, with tile t+1 loading under tile t's math. */
 #define FA_SM90_NS 2
+#ifndef PLOW_NV_FA512_KV64
+#define PLOW_NV_FA512_KV64 0
+#endif
+#if PLOW_NV_FA512_KV64 && defined(PLOW_FP8_KV)
+#error "HD512 KV64 single staging is BF16-only"
+#endif
+/* HD512/KV64 fits shared memory by reusing one slot after both consumers drain. */
+#define FA_SM90_STAGES(HD, BKV) \
+    ((PLOW_NV_FA512_KV64 && (HD) == 512 && (BKV) == 64) ? 1 : FA_SM90_NS)
 
 #ifndef PLOW_NV_FA_SPLIT_OUTER
 #define PLOW_NV_FA_SPLIT_OUTER 0
@@ -77,6 +85,12 @@
 #ifndef PLOW_NV_FA512_WG
 #define PLOW_NV_FA512_WG 0
 #endif
+#ifndef PLOW_NV_FA_QK_UNROLL
+#define PLOW_NV_FA_QK_UNROLL 1
+#endif
+#ifndef PLOW_NV_FA512_N_SPLIT
+#define PLOW_NV_FA512_N_SPLIT 0
+#endif
 /* BKV=16 is the hd512 arm (PLOW_NV_FA512_WG, design (a) of the 32k memo): same HD-split /
  * redundant-S structure, score tile m64n16k16, Ps width 16. Smem at <512,64,16> is ~131 KiB
  * (Qs 64 + K/V ring 32 + Ps 2 + align), inside the arena; O acc = 4 n64 tiles = 128 f32. */
@@ -87,10 +101,13 @@
 /* smem floats claimed by the wgmma arm: Qs[HD/64][BQ][64] + NS x (Ks,Vs)[HD/64][BKV][64] bf16 +
  * Ps[BQ][BKV] bf16, plus the 1024 B the swizzle alignment may burn off the arena base. */
 #define FA_SM90_PRE_FLOATS(HD, BQ, BKV)                                                             \
-    ((2 * ((BQ) * (HD) + 2 * FA_SM90_NS * (BKV) * (HD) + (BQ) * (BKV)) + 1024 + 3) / 4)
+    ((2 * ((BQ) * (HD) + 2 * FA_SM90_STAGES(HD, BKV) * (BKV) * (HD) + (BQ) * (BKV)) +              \
+      (PLOW_NV_FA512_N_SPLIT && (HD) == 512 && (BKV) == 64 ? 1024 : 0) + 1024 + 3) / 4)
 /* T30 wgitem: two independent per-warpgroup partitions (each the full single-item claim). */
 #define FA_SM90_WGI_FLOATS(HD, BQ, BKV)                                                             \
     ((2 * 2 * ((BQ) * (HD) + 2 * FA_SM90_NS * (BKV) * (HD) + (BQ) * (BKV) + 512) + 2048 + 3) / 4)
+#define FA_SM90_GQA2_PAIR_FLOATS(HD, BQ, BKV)                                                       \
+    ((2 * (2 * (BQ) * (HD) + 2 * FA_SM90_NS * (BKV) * (HD) + 2 * (BQ) * (BKV)) + 2048 + 3) / 4)
 
 /* ---- local wgmma shapes ------------------------------------------------------------------
  * sm90_wgmma.cuh exposes m64n128k16 (64 f32/lane); flash needs n32 for the score tile and n64
@@ -213,6 +230,17 @@ template <int W> __device__ __forceinline__ int fa90_cm_off(int r, int c) {
 #ifndef PLOW_NV_FA_WGITEM
 #define PLOW_NV_FA_WGITEM 0
 #endif
+#ifndef PLOW_NV_FA_WGITEM_ONE
+#define PLOW_NV_FA_WGITEM_ONE 0
+#endif
+#ifndef PLOW_NV_FA_GQA2_PAIR
+#define PLOW_NV_FA_GQA2_PAIR 0
+#endif
+#if PLOW_NV_FA_WGITEM_ONE && (!PLOW_NV_FA_WGITEM || PLOW_NV_FA_GQA2_PAIR)
+#error "one-warpgroup attention experiment requires unpaired PLOW_NV_FA_WGITEM"
+#endif
+#define FA_SM90_WGI_ONE_FLOATS(HD, BQ, BKV)                                                       \
+    ((2 * ((BQ) * (HD) + 2 * FA_SM90_NS * (BKV) * (HD) + (BQ) * (BKV) + 512) + 1024 + 3) / 4)
 
 __device__ __forceinline__ void fa90_wg_bar(int wg) {
     asm volatile("bar.sync %0, %1;" ::"r"(wg + 1), "r"(128) : "memory");
@@ -234,6 +262,7 @@ __device__ void d_flash_prefill_sm90_wgitem(
     constexpr int NB0 = BKV / 8;
     constexpr int QT = BQ * 64;
     constexpr int KT = BKV * 64;
+    constexpr bool GQA2_PAIR = PLOW_NV_FA_GQA2_PAIR != 0;
     /* per-wg smem partition (elements), 1024B-aligned per wg */
     constexpr int PERWG =
         NSUB * QT + 2 * FA_SM90_NS * NSUB * KT + BQ * BKV + 512 /* align slack */;
@@ -247,43 +276,69 @@ __device__ void d_flash_prefill_sm90_wgitem(
     const int rB = rA + 8;
 
     __nv_bfloat16* const base0 = (__nv_bfloat16*)sm90_align1024(lds);
-    __nv_bfloat16* const Qs = (__nv_bfloat16*)sm90_align1024(base0 + (size_t)wg * PERWG);
-    __nv_bfloat16* const Ks = Qs + NSUB * QT;
+    __nv_bfloat16* const Qs = GQA2_PAIR
+        ? base0 + (size_t)wg * NSUB * QT
+        : (__nv_bfloat16*)sm90_align1024(base0 + (size_t)wg * PERWG);
+    __nv_bfloat16* const Ks = GQA2_PAIR ? base0 + 2 * NSUB * QT : Qs + NSUB * QT;
     __nv_bfloat16* const Vs = Ks + FA_SM90_NS * NSUB * KT;
-    __nv_bfloat16* const Ps = Vs + FA_SM90_NS * NSUB * KT;
+    __nv_bfloat16* const Ps = GQA2_PAIR
+        ? Vs + FA_SM90_NS * NSUB * KT + (size_t)wg * BQ * BKV
+        : Vs + FA_SM90_NS * NSUB * KT;
 
     __shared__ uint64_t fa90w_bar[2][FA_SM90_NS];
     unsigned fa90_ph[FA_SM90_NS] = {0, 0};
     bool fa90_tma[FA_SM90_NS] = {false, false};
-    if (mapkv && lt == 0) {
-        sm90_mbar_init(&fa90w_bar[wg][0], 1);
-        sm90_mbar_init(&fa90w_bar[wg][1], 1);
+    if (mapkv && (GQA2_PAIR ? tid == 0 : lt == 0)) {
+        const int owner = GQA2_PAIR ? 0 : wg;
+        sm90_mbar_init(&fa90w_bar[owner][0], 1);
+        sm90_mbar_init(&fa90w_bar[owner][1], 1);
     }
-    if (mapkv) fa90_wg_bar(wg);
+    if (mapkv) {
+        if constexpr (GQA2_PAIR)
+            __syncthreads();
+        else
+            fa90_wg_bar(wg);
+    }
 
     const unsigned gqa = n_head / n_kv_head;
     const float lscale = FA_SCALE(scale);
+    if constexpr (GQA2_PAIR) {
+        if (gqa != 2) {
+            if (tid == 0) __trap();
+            return;
+        }
+    }
 
     unsigned n_work;
     if (req) {
         n_work = 0;
         for (int r = 0; r < req[0]; r++) {
             const int qlen = req[2 + 4 * r];
-            if (qlen > 0) n_work += (unsigned)((qlen + BQ - 1) / BQ) * n_head;
+            if (qlen > 0)
+                n_work += (unsigned)((qlen + BQ - 1) / BQ) *
+                          (GQA2_PAIR ? n_kv_head : n_head);
         }
     } else {
-        n_work = ((seq_q + BQ - 1) / BQ) * n_head * nsplit;
+        n_work = ((seq_q + BQ - 1) / BQ) *
+                 (GQA2_PAIR ? n_kv_head : n_head) * nsplit;
     }
 
-    for (unsigned witem = slice * 2u + (unsigned)wg; witem < n_work; witem += nblk * 2u) {
-        unsigned sp, h, q0, sq = seq_q, skv = seq_kv, qp0 = q_pos0, ns = nsplit;
+    constexpr bool ONE_WG = PLOW_NV_FA_WGITEM_ONE != 0;
+    for (unsigned witem = GQA2_PAIR || ONE_WG ? slice : slice * 2u + (unsigned)wg;
+         witem < n_work; witem += GQA2_PAIR || ONE_WG ? nblk : nblk * 2u) {
+        unsigned sp, h, hkv, q0, sq = seq_q, skv = seq_kv, qp0 = q_pos0, ns = nsplit;
         size_t qoff = 0, kvoff = 0;
+        const void* item_mapkv = mapkv;
         if (req) {
             unsigned rem = witem;
             int r = 0, qlen;
             for (;;) {
                 qlen = req[2 + 4 * r];
-                const unsigned nw_r = (qlen > 0) ? (unsigned)((qlen + BQ - 1) / BQ) * n_head : 0u;
+                const unsigned nw_r =
+                    (qlen > 0)
+                        ? (unsigned)((qlen + BQ - 1) / BQ) *
+                              (GQA2_PAIR ? n_kv_head : n_head)
+                        : 0u;
                 if (rem < nw_r) break;
                 rem -= nw_r;
                 r++;
@@ -291,19 +346,29 @@ __device__ void d_flash_prefill_sm90_wgitem(
             const int rq0 = req[1 + 4 * r], slot = req[3 + 4 * r], kvlen = req[4 + 4 * r];
             sp = 0;
             ns = 1;
-            h = rem % n_head;
-            q0 = (rem / n_head) * BQ;
+            const unsigned head_count = GQA2_PAIR ? n_kv_head : n_head;
+            const unsigned head_index = rem % head_count;
+            hkv = GQA2_PAIR ? head_index : head_index / gqa;
+            h = GQA2_PAIR ? hkv * gqa + (unsigned)wg : head_index;
+            q0 = (rem / head_count) * BQ;
             sq = (unsigned)qlen;
             skv = (unsigned)kvlen;
             qp0 = (unsigned)(kvlen - qlen);
             qoff = (size_t)rq0 * n_head * HD;
             kvoff = (size_t)slot * n_kv_head * (size_t)kv_stride * HD;
+#if defined(PLOW_NV_PACKED_FA_TMA) && PLOW_NV_PACKED_FA_TMA
+            item_mapkv = mapkv ? (const void*)((const uint64_t*)mapkv)[slot] : nullptr;
+#else
+            if (kvoff) item_mapkv = nullptr;
+#endif
         } else {
             sp = witem % nsplit;
-            h = (witem / nsplit) % n_head;
-            q0 = (witem / (nsplit * n_head)) * BQ;
+            const unsigned head_count = GQA2_PAIR ? n_kv_head : n_head;
+            const unsigned head_index = (witem / nsplit) % head_count;
+            hkv = GQA2_PAIR ? head_index : head_index / gqa;
+            h = GQA2_PAIR ? hkv * gqa + (unsigned)wg : head_index;
+            q0 = (witem / (nsplit * head_count)) * BQ;
         }
-        const unsigned hkv = h / gqa;
 
         const unsigned per = (skv + ns - 1) / ns;
         const unsigned lo = sp * per;
@@ -323,28 +388,31 @@ __device__ void d_flash_prefill_sm90_wgitem(
         if ((long)qabs_max < cap) cap = (long)qabs_max;
         const int ntile = (cap >= (long)eff_lo) ? (int)((cap - (long)eff_lo) / BKV) + 1 : 0;
 
-        const bool use_tma = mapkv != nullptr && kvoff == 0;
+        const bool use_tma = item_mapkv != nullptr;
         auto stageKV = [&](unsigned kv0, int buf) {
             __nv_bfloat16* kd = Ks + (size_t)buf * NSUB * KT;
             __nv_bfloat16* vd = Vs + (size_t)buf * NSUB * KT;
             const bool full = use_tma && (kv0 + (unsigned)BKV <= hi);
             fa90_tma[buf] = full;
             if (full) {
-                if (lt == 0) {
-                    sm90_mbar_expect(&fa90w_bar[wg][buf], 2 * NSUB * KT * 2);
-                    const uint32_t bar = sm90_su32(&fa90w_bar[wg][buf]);
+                if (GQA2_PAIR ? tid == 0 : lt == 0) {
+                    const int owner = GQA2_PAIR ? 0 : wg;
+                    sm90_mbar_expect(&fa90w_bar[owner][buf], 2 * NSUB * KT * 2);
+                    const uint32_t bar = sm90_su32(&fa90w_bar[owner][buf]);
                     const int kvrow = (int)(kv0 & kv_mask);
 #pragma unroll
                     for (int sub = 0; sub < NSUB; sub++) {
-                        sm90_tma3d(sm90_su32(kd + sub * KT), mapkv, sub * 64, kvrow, (int)hkv,
+                        sm90_tma3d(sm90_su32(kd + sub * KT), item_mapkv, sub * 64, kvrow, (int)hkv,
                                    bar);
-                        sm90_tma3d(sm90_su32(vd + sub * KT), (const char*)mapkv + 128, sub * 64,
+                        sm90_tma3d(sm90_su32(vd + sub * KT), (const char*)item_mapkv + 128, sub * 64,
                                    kvrow, (int)hkv, bar);
                     }
                 }
                 return;
             }
-            for (int i = lt; i < BKV * NSUB * 8; i += 128) {
+            const int worker = GQA2_PAIR ? tid : lt;
+            const int workers = GQA2_PAIR ? 256 : 128;
+            for (int i = worker; i < BKV * NSUB * 8; i += workers) {
                 const int c = i & 7, sub = (i >> 3) % NSUB, r = i / (8 * NSUB);
                 const unsigned kv = kv0 + (unsigned)r;
                 const bool in = (kv < hi);
@@ -359,13 +427,17 @@ __device__ void d_flash_prefill_sm90_wgitem(
         auto waitKV = [&](int buf) {
             sm90_cp_wait<0>();
             if (fa90_tma[buf]) {
-                sm90_mbar_wait(&fa90w_bar[wg][buf], (int)(fa90_ph[buf] & 1u));
+                const int owner = GQA2_PAIR ? 0 : wg;
+                sm90_mbar_wait(&fa90w_bar[owner][buf], (int)(fa90_ph[buf] & 1u));
                 fa90_ph[buf]++;
                 fa90_tma[buf] = false;
             }
         };
 
-        fa90_wg_bar(wg); /* previous item's Qs/Ks/Vs/Ps reads complete before restaging */
+        if constexpr (GQA2_PAIR)
+            __syncthreads();
+        else
+            fa90_wg_bar(wg); /* previous item's Qs/Ks/Vs/Ps reads complete before restaging */
 
         for (int i = lt; i < BQ * NSUB * 8; i += 128) {
             const int c = i & 7, sub = (i >> 3) % NSUB, r = i / (8 * NSUB);
@@ -390,7 +462,10 @@ __device__ void d_flash_prefill_sm90_wgitem(
 
         for (int t = 0; t < ntile; t++) {
             const unsigned kv0 = eff_lo + (unsigned)t * BKV;
-            fa90_wg_bar(wg); /* (A) tile t visible wg-wide; tile t-1's buffer + Ps free */
+            if constexpr (GQA2_PAIR)
+                __syncthreads();
+            else
+                fa90_wg_bar(wg); /* (A) tile t visible wg-wide; tile t-1's buffer + Ps free */
             fa90_async_proxy_fence();
             if (t + 1 < ntile) stageKV(kv0 + BKV, sb ^ 1);
 
@@ -560,8 +635,13 @@ __device__ void d_flash_prefill_sm90(float* __restrict__ Opart, float* __restric
     constexpr int NSUB = HD / 64;      /* 128B-swizzle sub-tiles per [rows][HD] operand */
     constexpr int NTW = HD / 128;      /* n64 O tiles per warpgroup                     */
     constexpr int KS0 = HD / 16;       /* GEMM0 k16 steps (contract over HD)            */
+    constexpr int QK_UNROLL = PLOW_NV_FA_QK_UNROLL;
+    constexpr int NSTAGE = FA_SM90_STAGES(HD, BKV);
+    constexpr int PV_UNROLL = NSTAGE == 1 ? 4 : 1;
     constexpr int KS1 = BKV / 16;      /* GEMM1 k16 steps (contract over BKV)           */
     constexpr int NB0 = BKV / 8;       /* n8 blocks in the score accumulator            */
+    constexpr bool N_SPLIT = PLOW_NV_FA512_N_SPLIT && HD == 512 && BKV == 64;
+    constexpr int NB0_LOCAL = N_SPLIT ? NB0 / 2 : NB0;
     constexpr int QT = BQ * 64;        /* elements per Q sub-tile                       */
     constexpr int KT = BKV * 64;       /* elements per K/V sub-tile                     */
 
@@ -570,8 +650,10 @@ __device__ void d_flash_prefill_sm90(float* __restrict__ Opart, float* __restric
      * Sub-tiles are 8 KiB (Q) / 4 KiB (K,V), so aligning the base aligns all of them. --- */
     __nv_bfloat16* const Qs = (__nv_bfloat16*)sm90_align1024(lds);
     __nv_bfloat16* const Ks = Qs + NSUB * QT;                       /* [NS][NSUB][BKV][64] */
-    __nv_bfloat16* const Vs = Ks + FA_SM90_NS * NSUB * KT;          /* [NS][NSUB][BKV][64] */
-    __nv_bfloat16* const Ps = Vs + FA_SM90_NS * NSUB * KT;          /* [BQ][BKV] swizzle-0 */
+    __nv_bfloat16* const Vs = Ks + NSTAGE * NSUB * KT;              /* [NS][NSUB][BKV][64] */
+    __nv_bfloat16* const Ps = Vs + NSTAGE * NSUB * KT;              /* [BQ][BKV] swizzle-0 */
+    float* const reduce_max = (float*)(Ps + BQ * BKV);
+    float* const reduce_sum = reduce_max + 2 * BQ;
 
     const int tid = threadIdx.x;
     const int wg = tid >> 7;               /* warpgroup 0/1: owns hd [wg*HD/2, +HD/2)      */
@@ -587,12 +669,12 @@ __device__ void d_flash_prefill_sm90(float* __restrict__ Opart, float* __restric
      * 0*NaN != 0 in the mma — the same rule the px4 TMA arm documents). mbarrier phases run
      * continuously across tiles and work items; static smem, so no arena claim and no inval
      * (the barriers are never reused as plain data). */
-    __shared__ uint64_t fa90_bar[FA_SM90_NS];
-    unsigned fa90_ph[FA_SM90_NS] = {0, 0};
-    bool fa90_tma[FA_SM90_NS] = {false, false};
+    __shared__ uint64_t fa90_bar[NSTAGE];
+    // Dynamic stage arrays become local memory; two bits retain each parity and pending state.
+    unsigned fa90_ph = 0;
+    unsigned fa90_tma = 0;
     if (mapkv && tid == 0) {
-        sm90_mbar_init(&fa90_bar[0], 1);
-        sm90_mbar_init(&fa90_bar[1], 1);
+        for (int s = 0; s < NSTAGE; s++) sm90_mbar_init(&fa90_bar[s], 1);
     }
     if (mapkv) __syncthreads();
 
@@ -614,6 +696,7 @@ __device__ void d_flash_prefill_sm90(float* __restrict__ Opart, float* __restric
     for (unsigned witem = slice; witem < n_work; witem += nblk) {
         unsigned sp, h, q0, sq = seq_q, skv = seq_kv, qp0 = q_pos0, ns = nsplit;
         size_t qoff = 0, kvoff = 0;
+        const void* item_mapkv = mapkv;
         if (req) {
             unsigned rem = witem;
             int r = 0, qlen;
@@ -634,6 +717,11 @@ __device__ void d_flash_prefill_sm90(float* __restrict__ Opart, float* __restric
             qp0 = (unsigned)(kvlen - qlen);
             qoff = (size_t)rq0 * n_head * HD;
             kvoff = (size_t)slot * n_kv_head * (size_t)kv_stride * HD;
+#if defined(PLOW_NV_PACKED_FA_TMA) && PLOW_NV_PACKED_FA_TMA
+            item_mapkv = mapkv ? (const void*)((const uint64_t*)mapkv)[slot] : nullptr;
+#else
+            if (kvoff) item_mapkv = nullptr;
+#endif
         } else {
 #if PLOW_NV_FA_SPLIT_OUTER
             if constexpr (HD == 256 && BQ == 64 && BKV == 32) {
@@ -676,20 +764,18 @@ __device__ void d_flash_prefill_sm90(float* __restrict__ Opart, float* __restric
         /* --- staging. cp.async writes 16 B (8 bf16) straight into the 128B-swizzled sub-tile;
          * out-of-range rows pass src-size 0, which zero-fills (so a masked P never multiplies
          * stale V, and QK of a pad row is 0). --- */
-        /* TMA eligibility per work item: the pair maps address the base KV tensor; a
-         * nonzero batch-slot offset (PX-1 varlen, slot>0) would need slot as a 4th
-         * coordinate, so those items keep cp.async. */
+        /* Packed items resolve a descriptor pair whose base already includes the slot. */
         /* The kv-pair map's box is 32 rows, so the staging loop below walks a tile in BKV/32
          * steps: at BKV<32 it runs ZERO times AFTER the barrier is armed for the full byte
          * count, and waitKV() then spins forever (reachable via the documented
          * -DPLOW_NV_FA512_WG=1 -DPLOW_NV_FA_PX4=0 build). BKV is a template constant, so this
          * term folds away; a sub-32 BKV simply keeps the cp.async path below. */
-        const bool use_tma = mapkv != nullptr && kvoff == 0 && (BKV % 32 == 0);
+        const bool use_tma = item_mapkv != nullptr && (BKV % 32 == 0);
         auto stageKV = [&](unsigned kv0, int buf) {
             __nv_bfloat16* kd = Ks + (size_t)buf * NSUB * KT;
             __nv_bfloat16* vd = Vs + (size_t)buf * NSUB * KT;
             const bool full = use_tma && (kv0 + (unsigned)BKV <= hi);
-            fa90_tma[buf] = full;
+            fa90_tma = (fa90_tma & ~(1u << buf)) | (unsigned(full) << buf);
             if (full) {
                 if (tid == 0) {
                     sm90_mbar_expect(&fa90_bar[buf], 2 * NSUB * KT * 2);
@@ -699,10 +785,10 @@ __device__ void d_flash_prefill_sm90(float* __restrict__ Opart, float* __restric
                     for (int sub = 0; sub < NSUB; sub++)
 #pragma unroll
                         for (int hb = 0; hb < BKV / 32; hb++) { /* kv-pair map box is 32 rows */
-                            sm90_tma3d(sm90_su32(kd + sub * KT + hb * 32 * 64), mapkv, sub * 64,
+                            sm90_tma3d(sm90_su32(kd + sub * KT + hb * 32 * 64), item_mapkv, sub * 64,
                                        kvrow + hb * 32, (int)hkv, bar);
                             sm90_tma3d(sm90_su32(vd + sub * KT + hb * 32 * 64),
-                                       (const char*)mapkv + 128, sub * 64, kvrow + hb * 32,
+                                       (const char*)item_mapkv + 128, sub * 64, kvrow + hb * 32,
                                        (int)hkv, bar);
                         }
                 }
@@ -725,10 +811,10 @@ __device__ void d_flash_prefill_sm90(float* __restrict__ Opart, float* __restric
          * cp.async group drain otherwise (Q rides the cp path in both cases). */
         auto waitKV = [&](int buf) {
             sm90_cp_wait<0>();
-            if (fa90_tma[buf]) {
-                sm90_mbar_wait(&fa90_bar[buf], (int)(fa90_ph[buf] & 1u));
-                fa90_ph[buf]++;
-                fa90_tma[buf] = false; /* consumed — a skipped restage must not re-wait */
+            if (fa90_tma & (1u << buf)) {
+                sm90_mbar_wait(&fa90_bar[buf], (int)((fa90_ph >> buf) & 1u));
+                fa90_ph ^= 1u << buf;
+                fa90_tma &= ~(1u << buf); /* consumed — a skipped restage must not re-wait */
             }
         };
 
@@ -761,18 +847,25 @@ __device__ void d_flash_prefill_sm90(float* __restrict__ Opart, float* __restric
             const unsigned kv0 = eff_lo + (unsigned)t * BKV;
             __syncthreads(); /* (A) tile t visible block-wide; tile t-1's buffer + Ps now free */
             fa90_async_proxy_fence();
-            if (t + 1 < ntile) stageKV(kv0 + BKV, sb ^ 1);
+            if constexpr (NSTAGE == 2) {
+                if (t + 1 < ntile) stageKV(kv0 + BKV, sb ^ 1);
+            }
 
             /* --- GEMM0: S[64][BKV] = Q . K^T. scale-d = 0 on the first k-step seeds the
              * accumulator, so no zeroing pass. --- */
             const __nv_bfloat16* kbuf = Ks + (size_t)sb * NSUB * KT;
-            float S[BKV / 2];
+            float S[4 * NB0_LOCAL];
             sm90_wg_fence();
-#pragma unroll 1
+#pragma unroll QK_UNROLL
             for (int ks = 0; ks < KS0; ks++) {
                 const int sub = ks >> 2, ko = (ks & 3) * 16; /* +32 B per k16 substep */
-                fa90_wgmma_score<BKV>(S, sm90_desc(Qs + sub * QT + ko),
-                                      sm90_desc(kbuf + sub * KT + ko), ks ? 1 : 0);
+                if constexpr (N_SPLIT)
+                    fa90_wgmma_m64n32k16(
+                        S, sm90_desc(Qs + sub * QT + ko),
+                        sm90_desc(kbuf + sub * KT + wg * 32 * 64 + ko), ks ? 1 : 0);
+                else
+                    fa90_wgmma_score<BKV>(S, sm90_desc(Qs + sub * QT + ko),
+                                          sm90_desc(kbuf + sub * KT + ko), ks ? 1 : 0);
             }
             sm90_wg_commit();
             sm90_wg_wait<0>();
@@ -780,10 +873,11 @@ __device__ void d_flash_prefill_sm90(float* __restrict__ Opart, float* __restric
             /* --- scale + causal/sliding mask IN THE FRAGMENT --- */
             float mxA = FA_NEG_INF, mxB = FA_NEG_INF;
 #pragma unroll
-            for (int nb = 0; nb < NB0; nb++)
+            for (int nb = 0; nb < NB0_LOCAL; nb++)
 #pragma unroll
                 for (int e = 0; e < 2; e++) {
-                    const int kv = (int)kv0 + 8 * nb + 2 * (lane & 3) + e;
+                    const int kv = (int)kv0 + (N_SPLIT ? wg * 32 : 0) + 8 * nb +
+                                   2 * (lane & 3) + e;
                     const bool inr = ((unsigned)kv < hi);
                     bool okA = inr && (kv <= qabsA), okB = inr && (kv <= qabsB);
                     if (window) {
@@ -803,6 +897,15 @@ __device__ void d_flash_prefill_sm90(float* __restrict__ Opart, float* __restric
             mxA = fmaxf(mxA, __shfl_xor_sync(0xffffffffu, mxA, 2));
             mxB = fmaxf(mxB, __shfl_xor_sync(0xffffffffu, mxB, 1));
             mxB = fmaxf(mxB, __shfl_xor_sync(0xffffffffu, mxB, 2));
+            if constexpr (N_SPLIT) {
+                if ((lane & 3) == 0) {
+                    reduce_max[wg * BQ + rA] = mxA;
+                    reduce_max[wg * BQ + rB] = mxB;
+                }
+                __syncthreads();
+                mxA = fmaxf(reduce_max[rA], reduce_max[BQ + rA]);
+                mxB = fmaxf(reduce_max[rB], reduce_max[BQ + rB]);
+            }
 
             const float mnA = fmaxf(mA, mxA), mnB = fmaxf(mB, mxB);
             /* corr==0 on the first attended tile (m_old still -inf) — the shared body's rule. */
@@ -817,15 +920,15 @@ __device__ void d_flash_prefill_sm90(float* __restrict__ Opart, float* __restric
             const bool liveA = (mnA != FA_NEG_INF), liveB = (mnB != FA_NEG_INF);
             float sA = 0.0f, sB = 0.0f;
 #pragma unroll
-            for (int nb = 0; nb < NB0; nb++) {
+            for (int nb = 0; nb < NB0_LOCAL; nb++) {
                 const float pa0 = liveA ? FA_EXP(S[4 * nb + 0] - mnA) : 0.0f;
                 const float pa1 = liveA ? FA_EXP(S[4 * nb + 1] - mnA) : 0.0f;
                 const float pb0 = liveB ? FA_EXP(S[4 * nb + 2] - mnB) : 0.0f;
                 const float pb1 = liveB ? FA_EXP(S[4 * nb + 3] - mnB) : 0.0f;
                 sA += pa0 + pa1;
                 sB += pb0 + pb1;
-                if (wg == 0) {
-                    const int c0 = 8 * nb + 2 * (lane & 3);
+                if (N_SPLIT || wg == 0) {
+                    const int c0 = (N_SPLIT ? wg * 32 : 0) + 8 * nb + 2 * (lane & 3);
                     *(__nv_bfloat162*)(Ps + fa90_cm_off<BKV>(rA, c0)) =
                         __floats2bfloat162_rn(pa0, pa1);
                     *(__nv_bfloat162*)(Ps + fa90_cm_off<BKV>(rB, c0)) =
@@ -836,6 +939,15 @@ __device__ void d_flash_prefill_sm90(float* __restrict__ Opart, float* __restric
             sA += __shfl_xor_sync(0xffffffffu, sA, 2);
             sB += __shfl_xor_sync(0xffffffffu, sB, 1);
             sB += __shfl_xor_sync(0xffffffffu, sB, 2);
+            if constexpr (N_SPLIT) {
+                if ((lane & 3) == 0) {
+                    reduce_sum[wg * BQ + rA] = sA;
+                    reduce_sum[wg * BQ + rB] = sB;
+                }
+                __syncthreads();
+                sA = reduce_sum[rA] + reduce_sum[BQ + rA];
+                sB = reduce_sum[rB] + reduce_sum[BQ + rB];
+            }
             lA = lA * cA + sA;
             lB = lB * cB + sB;
 
@@ -859,7 +971,8 @@ __device__ void d_flash_prefill_sm90(float* __restrict__ Opart, float* __restric
              * cumulativity — NOT the CUTLASS producer-side order (fence-before-barrier), which would
              * only fence wg0. Do not swap these two lines: moving the fence above the barrier drops
              * the ordering guarantee for wg1's reads of wg0's Ps. */
-            __syncthreads(); /* (B) Ps published to the whole block */
+            if constexpr (!N_SPLIT)
+                __syncthreads(); /* (B) Ps published to the whole block */
             fa90_async_proxy_fence();
 
             /* --- GEMM1: O += P . V. A = Ps (K-major over BKV, swizzle-0); B = V MN-MAJOR
@@ -870,7 +983,7 @@ __device__ void d_flash_prefill_sm90(float* __restrict__ Opart, float* __restric
 #pragma unroll
             for (int nt = 0; nt < NTW; nt++) {
                 const int g = wg * NTW + nt;
-#pragma unroll 1
+#pragma unroll PV_UNROLL
                 for (int ks = 0; ks < KS1; ks++)
                     fa90_wgmma_m64n64k16_tb1(Oacc[nt],
                                              fa90_desc_ns(Ps + ks * 128, 128, 16 * BKV),
@@ -878,8 +991,15 @@ __device__ void d_flash_prefill_sm90(float* __restrict__ Opart, float* __restric
             }
             sm90_wg_commit();
             sm90_wg_wait<0>();
-            waitKV(sb ^ 1); /* tile t+1 has landed for this thread */
-            sb ^= 1;
+            if constexpr (NSTAGE == 1) {
+                // Both warpgroups must finish reading K/V before the shared slot is reused.
+                __syncthreads();
+                if (t + 1 < ntile) stageKV(kv0 + BKV, 0);
+                waitKV(0);
+            } else {
+                waitKV(sb ^ 1); /* tile t+1 has landed for this thread */
+                sb ^= 1;
+            }
         }
 
         /* --- epilogue. nsplit>1: UNNORMALISED partials + (m,l) for d_flash_merge. Otherwise

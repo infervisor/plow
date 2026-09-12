@@ -176,7 +176,7 @@ pub(crate) fn synthesize(
         .progs
         .iter()
         .filter(|p| {
-            !p.packed_prefill_only
+            !p.role.is_packed_sibling()
                 && p.insts.iter().any(|i| i.op == DevOp::FlashDecode as u16)
                 && !p.insts.iter().any(|i| i.op == DevOp::FlashPrefill as u16)
         })
@@ -187,7 +187,7 @@ pub(crate) fn synthesize(
         .progs
         .iter()
         .filter(|p| {
-            !p.packed_prefill_only
+            !p.role.is_packed_sibling()
                 && p.t > 1
                 && p.insts.iter().any(|i| i.op == DevOp::FlashPrefill as u16)
         })
@@ -203,7 +203,7 @@ pub(crate) fn synthesize(
         .progs
         .iter()
         .filter(|p| {
-            !p.packed_prefill_only
+            !p.role.is_packed_sibling()
                 && p.insts.iter().any(|i| i.op == DevOp::FlashDecode as u16)
                 && !p.insts.iter().any(|i| i.op == DevOp::FlashPrefill as u16)
         })

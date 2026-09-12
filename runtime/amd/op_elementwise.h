@@ -38,6 +38,12 @@ __device__ __forceinline__ float act_gelu_tanh(float x) {
 }
 __device__ __forceinline__ float act_silu(float x) { return x / (1.0f + __expf(-x)); }
 
+/* -DPLOW_RESID_U=U: d_residual issues U iterations of loads before consuming any. Default 1
+ * (the shipped loop, byte-identical). */
+#ifndef PLOW_RESID_U
+#define PLOW_RESID_U 1
+#endif
+
 /* out = (a + b) * scale, or with `pre`: out = (pre + bf16(a + b)) * scale.
  *
  * `scale` exists to absorb Gemma's per-layer `layer_scalar`: HF applies
@@ -69,7 +75,35 @@ __device__ void d_residual(bf16* __restrict__ out, const bf16* __restrict__ a,
     const auto* bg = as_glob(b);
     const auto* pg = as_glob(pre);
     auto* og = as_glob(out);
-    for (unsigned i = (slice * PLOW_THREADS + threadIdx.x) * 8; i < n; i += stride) {
+    unsigned i = (slice * PLOW_THREADS + threadIdx.x) * 8;
+#if PLOW_RESID_U > 1
+    /* -DPLOW_RESID_U=U: U iterations of loads issued before any is consumed. The loop below is
+     * one dependent HBM round trip per 16 B per operand (40 of them per thread at T=8192, H=6144:
+     * 0.25 ms for 300 MB). Same per-element arithmetic, same stores: bit-identical. */
+    {
+        constexpr unsigned U = PLOW_RESID_U;
+        for (; i + (U - 1) * stride + 8 <= n; i += U * stride) {
+            bf16v8 va[U], vb[U], vp[U];
+#pragma unroll
+            for (unsigned u = 0; u < U; u++) {
+                va[u] = ld_glob8(ag + i + u * stride);
+                vb[u] = ld_glob8(bg + i + u * stride);
+                vp[u] = pre ? ld_glob8(pg + i + u * stride) : bf16v8_zero();
+            }
+#pragma unroll
+            for (unsigned u = 0; u < U; u++) {
+                bf16v8 vo;
+#pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    const float s = bf2f(va[u][j]) + bf2f(vb[u][j]);
+                    vo[j] = pre ? f2bf((bf2f(vp[u][j]) + bf2f(f2bf(s))) * scale) : f2bf(s * scale);
+                }
+                st_glob8(og + i + u * stride, vo);
+            }
+        }
+    }
+#endif
+    for (; i < n; i += stride) {
         if (i + 8 <= n) {
             const bf16v8 va = ld_glob8(ag + i), vb = ld_glob8(bg + i);
             /* Issued with a/b, not after them: three operands, ONE round trip. */

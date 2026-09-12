@@ -159,7 +159,7 @@ fn work_and_wait_thresholds_may_exceed_resident_grid() {
     let windows = [0, 2];
     let input = crate::program::Program {
         rows: 1,
-        packed_prefill_only: false,
+        role: packet::devbuild::ProgramRole::DecodeRung { rows: 1 },
         n_counter: 1,
         insts: &[inst],
         stream: &stream,

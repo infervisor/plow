@@ -1491,7 +1491,7 @@ construction. §11 lists everything that is not a measurement on this host.
 | Infinity Fabric per GPU | 896 GB/s | the indexer all-reduce rides this; the KV path does not |
 | L2 | 8 × 4 MiB per XCD | used for the compressed-stream residency notes in §6.2 and §6.7 |
 | LDS per workgroup, gfx942 | 65,536 B | `runtime/amd/amd_arch.h:44` |
-| flash-object `fa` LDS arena | 58,368 B | `runtime/amd/op_attention.h:3295`, `interp.hip:803` |
+| flash-object `fa` LDS arena | 58,368 B | `runtime/amd/op_attention_common.h:3295`, `interp.hip:803` |
 
 All quantities are **per rank** (one GPU's share). `h = 64/P` query heads per rank,
 `hi = 64/P` index heads per rank (both `ColumnParallelLinear`).
@@ -1949,7 +1949,7 @@ correct only because V4 caches the RoPE'd row and RoPE's q before the kernel
 (`model.py:506,511`) — it is not an approximation.
 
 `d_flash_mla_prefill_v2`'s static asserts pass at `<512, 0>`: `D = DK+DR = 512`, `D % 32 == 0`,
-`DK % 16 == 0` (`op_attention.h:3328`).
+`DK % 16 == 0` (`op_attention_common.h:3328`).
 
 Two pieces of V4's math are **not** in the existing bodies:
 
@@ -1960,19 +1960,19 @@ Two pieces of V4's math are **not** in the existing bodies:
   m_final))`. Cost: one exp per (query, head). Not a tile decision.
 * **inverse RoPE on the output's last 64 dims** (`model.py:539`). A 64-wide rotation on the
   512-wide O, per head. Fold into the existing o-fold epilogue slot (`ofold` is already a
-  parameter of `d_flash_mla_prefill_v2`, `op_attention.h:3321`) or run as a separate elementwise
+  parameter of `d_flash_mla_prefill_v2`, `op_attention_common.h:3321`) or run as a separate elementwise
   pass; 64 of 512 lanes touched, `h·64·2` B/token/layer read-modify-write = 0.09 MB/token/rank at
   TP4 — negligible either way.
 
 ### 6.2 Body A — decode, all three layer kinds
 
 **Existing, no new instantiation.** `d_flash_mla_decode<512, 0, GF, /*GATHER=*/true>`
-(`op_attention.h:2020`), already emitted at `GF ∈ {2,4,8}` (`interp.hip:1463,1470,1477`).
+(`op_attention_common.h:2020`), already emitted at `GF ∈ {2,4,8}` (`interp.hip:1463,1470,1477`).
 
 * Head groups: V4 has 32 / 16 / 8 heads per rank at TP2/4/8; `GF=8/4/2` respectively, all
   present.
 * Work item is one query token; `idx[b*top_k + t]` is the decode-shaped gather
-  (`op_attention.h:1964,4135`). `top_k` per layer kind: W = `min(T,128)`, C128 = `min(T,128) + T/128`,
+  (`op_attention_common.h:1964,4135`). `top_k` per layer kind: W = `min(T,128)`, C128 = `min(T,128) + T/128`,
   C4 = `min(T,128) + min(512, T/4)`.
 * **The index list must be built for all three kinds, not just C4.** V4's cache is two disjoint
   segments — a 128-row window ring at `[0,128)` plus the compressed rows appended at
@@ -1987,9 +1987,9 @@ Two pieces of V4's math are **not** in the existing bodies:
 
 ### 6.3 Body B — decode indexer score
 
-**Existing kernel, geometry gate.** `d_index_score_mfma<DI, HIc>` (`op_attention.h:4295`).
+**Existing kernel, geometry gate.** `d_index_score_mfma<DI, HIc>` (`op_attention_common.h:4295`).
 `DI = 128` matches V4's `index_head_dim` exactly. `HIc` carries
-`static_assert(HIc == 32, "MFMA subtile assumes index_n_heads == 32")` (`op_attention.h:4302`).
+`static_assert(HIc == 32, "MFMA subtile assumes index_n_heads == 32")` (`op_attention_common.h:4302`).
 
 | TP | index heads/rank | fit |
 |---|---:|---|
@@ -2013,22 +2013,22 @@ staging loop — the same shape as the existing `FP8` arm of the flash bodies.
 
 ### 6.4 Body C — decode top-512 select
 
-**Existing.** Op 118's per-row exact top-k (`op_attention.h:4959`) and the op-59 radix run it
+**Existing.** Op 118's per-row exact top-k (`op_attention_common.h:4959`) and the op-59 radix run it
 wraps. V4 wants top-512 of `T/4` candidates per query; GLM wants top-2048 of `T`. Same kernel
 shape, smaller `k`, smaller candidate set (`T/4` at 1M = 262 144, versus GLM's 131 072 at 128k).
 No change beyond the `k` and stride operands.
 
 ### 6.5 Body D — prefill flash, `d_flash_mla_prefill_v2<512, 0, GATHER, FP8>`
 
-**New instantiation** of an existing template (`op_attention.h:3311`). This is the one body that
+**New instantiation** of an existing template (`op_attention_common.h:3311`). This is the one body that
 needs a real tiling decision, so here is the arithmetic.
 
 Shipped constants: `RW = 16` q rows per wave, `BQ = 4·RW = 64`, `WG = 256` (four waves),
-`BKV = FA_MLA_PF2_BKV = 32`, `FA_MLA_PF2_PAD = 8` (`op_attention.h:3324,3325,3197,3211`).
+`BKV = FA_MLA_PF2_BKV = 32`, `FA_MLA_PF2_PAD = 8` (`op_attention_common.h:3324,3325,3197,3211`).
 
 LDS, from `FA_MLA_PF2_LDS_BYTES(DK,DR) = (BKV·(DK+DR+PAD) + 3·SWZ + 4·16·BKV)·2`
-(`op_attention.h:3297`), against the flash object's **58,368 B** `fa` arena
-(`op_attention.h:3295`):
+(`op_attention_common.h:3297`), against the flash object's **58,368 B** `fa` arena
+(`op_attention_common.h:3295`):
 
 | arm | BKV | LDS bytes | fits 58,368 |
 |---|---:|---:|---|
@@ -2051,7 +2051,7 @@ Dropping the 64-wide rope strip frees 4,096 B of LDS, which is exactly enough LD
 > `v_mfma_f32_16x16x32_bf16`, same K). **`BKV` is the contraction length of the PV pass** — the
 > body reads one A-fragment `Pw[fr*BKV + kg*8]` covering `k = kg*8 + j`, `kg ∈ [0,4)`, `j ∈
 > [0,8)`, i.e. exactly 32 KV columns, and issues one MFMA per output tile
-> (`op_attention.h:4058-4071`). So the rule is **`BKV % 32 == 0`**, not `BKV % 16 == 0`: 48 is
+> (`op_attention_common.h:4058-4071`). So the rule is **`BKV % 32 == 0`**, not `BKV % 16 == 0`: 48 is
 > 1.5 MFMA issues and cannot tile the PV pass at all. The next legal depth is 64, and 64 needs
 > 74,752 B against the 58,368 B arena — the row of this table that already says "no".
 >
@@ -2065,7 +2065,7 @@ The rest of the BKV=48 reasoning, preserved because the LDS half of it is still 
 * The per-wave P strip `Pw[RW][BKV]` grows from 16×32 to 16×48 halves = +512 B per wave, +2,048 B
   for the workgroup — already counted in the 56,064 above.
 * No new live accumulators: `P` is in LDS, not registers, so the 512-register occupancy-1 budget
-  the V2 body already runs at (`op_attention.h:3219`) is untouched by the BKV change.
+  the V2 body already runs at (`op_attention_common.h:3219`) is untouched by the BKV change.
 * Dropping to `DR=0` *reduces* register pressure independently. **Now measured** on the gfx942
   flash object: 256 VGPR / 256 AGPR / 1,464 B scratch / occ 1 with the NoPE arm compiled in,
   byte-for-byte the same cliff as without it. The arm is free, and the predicted spill relief
@@ -2088,13 +2088,13 @@ stay at 64 at TP8. Keep `BQ = 4·RW = 64`.
 
 Softmax strategy: keep the shipped online max/sum with the unconditional corr-rescale. A lazy
 rescale was **tried and rejected twice** on this body — logits-different and slower
-(`op_attention.h:3229-3236`); do not re-propose it as a guard. The `attn_sink` term (§6.1) rides
+(`op_attention_common.h:3229-3236`); do not re-propose it as a guard. The `attn_sink` term (§6.1) rides
 the same epilogue.
 
 Split/merge contract: unchanged. `Opart[b][t][n_head][nsplit][DK] + mlpart[..][2]` unnormalized
-partials, base-2 `FA_SCALE`'d `(m,l)`, consumed by `d_flash_merge<DK>` (`op_attention.h:1806`; operand contract at `:2425`).
+partials, base-2 `FA_SCALE`'d `(m,l)`, consumed by `d_flash_merge<DK>` (`op_attention_common.h:1806`; operand contract at `:2425`).
 V4 uses `DK=512` so `d_flash_merge<512>` is already instantiated. `nsplit` must be 1 for the
-prefill arm (`op_attention.h:2429`); the causal KV-split `ns` (`op_attention.h:3369`) is the
+prefill arm (`op_attention_common.h:2429`); the causal KV-split `ns` (`op_attention_common.h:3369`) is the
 dense-only work-multiplier and stays available for the C128 and W layers.
 
 ### 6.6 Body E — prefill sparse selection (C4 layers)
@@ -2104,27 +2104,27 @@ kernel:
 
 | stage | plow op | V4 fit |
 |---|---|---|
-| per-token indexer score | op 117 `d_index_score_pf` (`op_attention.h:4775`), or arm B `d_index_score_pf_row` (`:4864`) | `DI=128` exact; `HIc==32` gate as in §6.3 |
-| per-row exact top-k | op 118 (`op_attention.h:4959`) | top-512 of `T/4` |
-| per-tile union | op 119 `d_index_union_pf` (`op_attention.h:5063`) | u64 membership word ⇒ ≤64 queries/tile; V4's `tile_p=8` pack fits |
+| per-token indexer score | op 117 `d_index_score_pf` (`op_attention_common.h:4775`), or arm B `d_index_score_pf_row` (`:4864`) | `DI=128` exact; `HIc==32` gate as in §6.3 |
+| per-row exact top-k | op 118 (`op_attention_common.h:4959`) | top-512 of `T/4` |
+| per-tile union | op 119 `d_index_union_pf` (`op_attention_common.h:5063`) | u64 membership word ⇒ ≤64 queries/tile; V4's `tile_p=8` pack fits |
 | gathered flash | `d_flash_mla_prefill_v2<512, 0, /*GATHER=*/true>` | **new instantiation only** |
 
 The head-batched GATHER arm packs `QP = 8` queries × 8 heads into the 64-row M tile and is gated
-on `n_head == 8` (`op_attention.h:3366-3367`). **V4 at TP8 has exactly 8 heads per rank — the
+on `n_head == 8` (`op_attention_common.h:3366-3367`). **V4 at TP8 has exactly 8 heads per rank — the
 shipped pack fits with no change.** At TP4 (16 heads) and TP2 (32 heads) either set `QP = 4` /
 `QP = 2` so `QP · n_head = 64` still holds, or run 2 / 4 head-batches per pack. Setting `QP` is
-an i4 packet field on op 119 already (`op_attention.h:5067`), so this is an emitter change, not a
+an i4 packet field on op 119 already (`op_attention_common.h:5067`), so this is an emitter change, not a
 kernel one; the gate at the `prefill_v2` site is the part that must be widened.
 
 The union's value is the whole point at V4's density: the measured GLM figure is 398 KV rows per
 query for a union-of-8 versus 1 512 for the dense walk at a 16k prompt
-(`op_attention.h:3362-3366`). V4's per-query set is 640 rows out of a `T/4` compressed stream, so
+(`op_attention_common.h:3362-3366`). V4's per-query set is 640 rows out of a `T/4` compressed stream, so
 at 128k the dense walk would be 32 768 rows and the top-512 set is 1.6% of it — the union is
 strictly more valuable here than it is for GLM.
 
 **Note the shipped op-117 arm's operand re-fetch:** it reads both MFMA operands from global for
 every (query, 32-key) item — 16 KiB of load per 8 MFMA, **16 FLOP/B**, VMEM-issue bound, not
-fixable by L2 (`op_attention.h:4830-4832`). Arm B (`d_index_score_pf_row`) is the row-resident
+fixable by L2 (`op_attention_common.h:4830-4832`). Arm B (`d_index_score_pf_row`) is the row-resident
 form at 32 FLOP/B. Since V4's indexer is the dominant prefill FLOP term above 41k (§3), arm B is
 the one to ship, and the fp4 key format (§6.3) doubles its intensity again.
 
@@ -2380,7 +2380,7 @@ test (`emit_gap_list_names_every_unimplemented_piece`) keeps from drifting into 
 
 ## 1. `d_flash_mla_prefill_v2<512, 0, ...>` — the DR=0 MLA prefill
 
-**Closes:** refusal line (5)'s attention half. **Files:** `runtime/amd/op_attention.h`,
+**Closes:** refusal line (5)'s attention half. **Files:** `runtime/amd/op_attention_common.h`,
 `runtime/amd/interp.hip`, `scripts/build_gfx942.sh`,
 `runtime/tests/mla_prefill_nope_gfx942_test.hip`.
 
@@ -2494,7 +2494,7 @@ denominator normalizes it away. A control on a softmax has to break the weight p
 
 ## 3. The lightning indexer at 64 heads, and V4's fake quant
 
-**Closes:** refusal line (2). **Files:** `runtime/amd/op_attention.h`, `runtime/amd/interp.hip`,
+**Closes:** refusal line (2). **Files:** `runtime/amd/op_attention_common.h`, `runtime/amd/interp.hip`,
 `scripts/build_gfx942.sh`, `runtime/tests/dsv4_indexer_gfx942_test.hip`.
 
 *Decode (`d_index_score_kpool`, a `FAKEQ` arm).* GLM-5.3 stores indexer q and k as **real** fp8

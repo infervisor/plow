@@ -192,9 +192,9 @@ const DOC: &[S] = &[
     S { op: DevOp::OUvFold, t: &["O", "Olat", "Wuv"], i: &["n_batch", "n_head", "V"], f: &[], j: &[] },
     S { op: DevOp::FlashGatherDecode, t: &["Opart", "mlpart", "Qabs", "Qrope", "Ckv", "Krope", "kv_len", "idx"], i: &["n_batch", "n_head", "kv_stride", "", "nsplit", "kv_mask", "top_k"], f: &["scale"], j: &[] },
     S { op: DevOp::MoeRouterTopk, t: &["table", "logit", "", "bias"], i: &["", "n_exp", "k", "flags"], f: &["route_scale"], j: &[] },
-    S { op: DevOp::MlaMergeFold, t: &["O", "Opart", "mlpart", "Wuv"], i: &["n_batch", "n_head", "V", "", "nsplit"], f: &[], j: &[] },
+    S { op: DevOp::MlaMergeFold, t: &["O", "Opart", "mlpart", "Wuv"], i: &["n_batch", "n_head", "V", "", "nsplit", "native_fp32"], f: &[], j: &[] },
     S { op: DevOp::IndexScore, t: &["Score", "Qidx", "Kidx", "W", "kv_len"], i: &["n_batch", "index_heads", "kv_stride", "index_head_dim"], f: &["scale"], j: &[] },
-    S { op: DevOp::IndexSelect, t: &["idx", "Score", "gHist", "gCtl", "kv_len"], i: &["len_max", "top_k", "pool_size"], f: &[], j: &[] },
+    S { op: DevOp::IndexSelect, t: &["idx", "Score", "gHist", "gCtl", "kv_len"], i: &["len_max", "top_k", "pool_size", "batch_row", "local_rows"], f: &[], j: &[] },
     S { op: DevOp::IndexScorePf, t: &["Score", "Qidx", "Kidx", "W", "kv_len"], i: &["n_tok", "index_heads", "kv_stride", "index_head_dim"], f: &["scale"], j: &[] },
     S { op: DevOp::IndexSelectPf, t: &["idx", "Score", "kv_len"], i: &["n_tok", "top_k", "kv_stride", "pool_size"], f: &[], j: &[] },
     S { op: DevOp::IndexUnionPf, t: &["union", "umask", "idx", "kv_len"], i: &["n_tok", "top_k", "kv_stride", "cap"], f: &[], j: &[] },
@@ -220,7 +220,7 @@ const DOC: &[S] = &[
     S { op: DevOp::GemvArgmax, t: &["C", "x", "W", "part"], i: &["1", "N", "K", "", "a_row0"], f: &["cap"], j: &[] },
     S { op: DevOp::MoeGroupGluGemmaPfW8a8, t: &["fu", "xq8", "ewt", "meta", "row_token", "ascale", "est"], i: &["I_moe", "H", "n_exp", "", "", "act"], f: &[], j: &[] },
     S { op: DevOp::MoeGroupDownGemmaPfW8a8, t: &["part", "fu8", "ewt", "meta", "row_partidx", "row_gate", "est", "fscale"], i: &["H", "I_moe", "n_exp"], f: &[], j: &[] },
-    S { op: DevOp::MoeRouterTopkPf, t: &["table", "logit", "atom_acc?", "bias"], i: &["atom_h", "n_exp", "k", "flags", "T"], f: &["route_scale"], j: &[] },
+    S { op: DevOp::MoeRouterTopkPf, t: &["table", "logit", "atom_acc?", "bias"], i: &["atom_h", "n_exp", "k", "flags", "T", "shared_tail"], f: &["route_scale"], j: &[] },
     S { op: DevOp::MoeAlignPf, t: &["meta", "table", "row_token", "row_partidx", "row_gate"], i: &["T", "n_exp", "k"], f: &[], j: &[] },
     S { op: DevOp::MoeGroupGluPf, t: &["fu_g", "xn2", "expert_weight_table", "expert_scale_table", "meta", "row_token"], i: &["I_moe", "H", "n_exp", "fp8", "", "act"], f: &[], j: &[] },
     S { op: DevOp::MoeGroupDownPf, t: &["part", "fu_g", "expert_weight_table", "expert_scale_table", "meta", "", "row_partidx", "row_gate"], i: &["H", "I_moe", "n_exp", "fp8", "atom_ksh", "det_ksh"], f: &[], j: &[] },
@@ -273,6 +273,10 @@ const DOC: &[S] = &[
     S { op: DevOp::MoeGluMxPf, t: &["fu_g", "xn2", "W_gu", "S_gu", "meta", "row_token", "bias_gu?"], i: &["I", "K", "n_exp", "layout", "", "act"], f: &["alpha", "limit"], j: &[] },
     S { op: DevOp::MoeDownMxPf, t: &["part", "fu_g", "W_d", "S_d", "meta", "bias_d?", "row_partidx", "row_gate"], i: &["H", "I", "n_exp"], f: &[], j: &[] },
     S { op: DevOp::PerLayerInput, t: &["x", "Wg", "Wp", "gamma_post", "ple", "hn_out?", "gamma_next?"], i: &["T", "H", "P", "col0", "stride"], f: &["eps", "layer_scalar"], j: &[] },
+    S { op: DevOp::MoeAiterFp8Pf, t: &["out", "x", "weights", "scales", "meta_or_raw_routes", "row_token", "row_part", "row_gate"], i: &["T", "H", "I", "E", "topk", "align_tile", "mode", "resident_weights"], f: &[], j: &[] },
+    S { op: DevOp::IndexTpPf, t: &["idx", "score", "q", "k", "w", "kv_len", "peer_slot"], i: &["T", "ctx", "topk", "tp", "slot_bytes", "enter_gate", "complete_gate"], f: &["scale"], j: &[] },
+    S { op: DevOp::GemmLtPf, t: &["out", "x", "weight"], i: &["T", "N", "K", "decode"], f: &[], j: &[] },
+    S { op: DevOp::GemmBlkPf, t: &["out", "x", "weight", "w_scale", "xq", "x_scale", "bias"], i: &["T", "N", "K", "quantize"], f: &[], j: &[] },
 ];
 
 /// Ops that say "As [`DevOp::X`]" / "twin of [`DevOp::X`]" / "Same operands as
@@ -312,12 +316,12 @@ const INHERIT: &[(DevOp, DevOp, S)] = &[
      S { op: DevOp::FlashMlaDecodeFp8,
          t: &["Opart", "mlpart", "Qabs", "Qrope", "Ckv", "Krope", "kv_len", "kv_scale"],
          i: &["n_batch", "n_head", "kv_stride", "window", "nsplit", "kv_mask", "krot_fp8", "gf"],
-         f: &["scale"], j: &[] }),
+         f: &["scale"], j: &["selected_handle_plus_one"] }),
     (DevOp::FlashMlaPrefillFp8, DevOp::FlashMlaDecode,
      S { op: DevOp::FlashMlaPrefillFp8,
          t: &["Opart", "mlpart", "Qabs", "Qrope", "Ckv", "Krope", "kv_len", "kv_scale"],
          i: &["n_batch", "n_head", "kv_stride", "window", "n_tok", "kv_mask", "krot_fp8", "gf"],
-         f: &["scale"], j: &[] }),
+         f: &["scale"], j: &["selected_handle_plus_one"] }),
     // "Operands are identical to opcode 67."
     (DevOp::MoeRouterGemmaScoreFast, DevOp::MoeRouterGemmaScore, NONE),
     // "ABI mirrors [`DevOp::FlashMerge`] with `t1..` in peer_scratch + xctr gates."

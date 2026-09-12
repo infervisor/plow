@@ -241,7 +241,6 @@ pub async fn chat_completions(
 
     // Route to the per-model muxer. Tokens stream back as `StreamChunk`s over
     // an mpsc — the muxer produces one per generated token, ending with `Done`.
-    crate::obs::Metrics::inc(&state.metrics.requests);
     let (Some(mux), Ok(bundle)) = (state.mux(&req.model), state.registry.get(&req.model)) else {
         return crate::serve::api_error(
             axum::http::StatusCode::NOT_FOUND,
@@ -265,10 +264,9 @@ pub async fn chat_completions(
         arrived: std::time::Instant::now(),
         respond: tx,
     };
-    if let Err(err) = mux.submit(job) {
+    if let Err(err) = mux.submit_arrived(job, t_arrive) {
         return match err {
             crate::serve::mux::SubmitError::Full(_) => {
-                crate::obs::Metrics::inc(&state.metrics.rejected);
                 crate::serve::api_error(
                     axum::http::StatusCode::TOO_MANY_REQUESTS,
                     "model request queue full",

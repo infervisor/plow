@@ -145,6 +145,10 @@ const HSA_AGENT_INFO_DEVICE: u32 = 17;
 // ID: 30115 on gfx950 instead of 256. The engine sizes its cooperative grid
 // from `sm_count()`, so a persistent launch would have asked for 30115 blocks.
 const HSA_AMD_AGENT_INFO_COMPUTE_UNIT_COUNT: u32 = 0xA002;
+const HSA_AMD_AGENT_INFO_BDFID: u32 = 0xA006;
+const HSA_AMD_AGENT_INFO_DOMAIN: u32 = 0xA00F;
+const HSA_AMD_AGENT_INFO_NEAREST_CPU: u32 = 0xA113;
+const HSA_AGENT_INFO_NODE: u32 = 16;
 
 // hsa_region_segment_t
 const HSA_REGION_SEGMENT_GROUP: u32 = 2;
@@ -388,6 +392,7 @@ hsa_fns! {
     hsa_signal_store_screlease: unsafe extern "C" fn(HsaSignal, i64),
     hsa_signal_wait_scacquire: unsafe extern "C" fn(HsaSignal, u32, i64, u64, u32) -> i64,
     hsa_signal_add_screlease: unsafe extern "C" fn(HsaSignal, i64),
+    hsa_signal_load_scacquire: unsafe extern "C" fn(HsaSignal) -> i64,
     hsa_code_object_reader_create_from_memory: unsafe extern "C" fn(*const c_void, usize, *mut HsaCodeObjectReader) -> HsaStatus,
     hsa_code_object_reader_destroy: unsafe extern "C" fn(HsaCodeObjectReader) -> HsaStatus,
     hsa_executable_create_alt: unsafe extern "C" fn(u32, u32, *const c_void, *mut HsaExecutable) -> HsaStatus,
@@ -454,6 +459,7 @@ impl HsaDriver {
             hsa_signal_store_screlease: resolve!(lib, b"hsa_signal_store_screlease\0"),
             hsa_signal_wait_scacquire: resolve!(lib, b"hsa_signal_wait_scacquire\0"),
             hsa_signal_add_screlease: resolve!(lib, b"hsa_signal_add_screlease\0"),
+            hsa_signal_load_scacquire: resolve!(lib, b"hsa_signal_load_scacquire\0"),
             hsa_code_object_reader_create_from_memory: resolve!(
                 lib,
                 b"hsa_code_object_reader_create_from_memory\0"
@@ -536,6 +542,36 @@ impl HsaKernel {
 //
 // HSA's iterate APIs take `extern "C" fn(Item, *mut c_void) -> hsa_status_t`.
 // We pack both the driver fn-ptr and our accumulator into the userdata.
+
+/// The CPU agent whose pools back a backend's kernarg ring and fine-grained host staging:
+/// the GPU's nearest CPU agent under `PLOW_AMD_NUMA_HOST_POOLS`, else the first CPU agent.
+fn host_agent_for(numa_local: bool, first: HsaAgent, nearest: Option<HsaAgent>) -> HsaAgent {
+    match nearest {
+        Some(a) if numa_local => a,
+        _ => first,
+    }
+}
+
+/// NUMA node of the page holding `addr` (`get_mempolicy(MPOL_F_NODE | MPOL_F_ADDR)`); `None`
+/// when the kernel refuses (no NUMA support, unmapped address).
+fn page_node(addr: *const c_void) -> Option<i32> {
+    const MPOL_F_NODE: libc::c_ulong = 1;
+    const MPOL_F_ADDR: libc::c_ulong = 2;
+    let mut node: libc::c_int = -1;
+    // SAFETY: get_mempolicy reads the policy of the page at `addr` and writes one int; a null
+    // nodemask with maxnode 0 is valid with these flags, and a bad address returns EFAULT.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_get_mempolicy,
+            &mut node as *mut libc::c_int,
+            std::ptr::null_mut::<libc::c_ulong>(),
+            0 as libc::c_ulong,
+            addr,
+            MPOL_F_NODE | MPOL_F_ADDR,
+        )
+    };
+    (rc == 0 && node >= 0).then_some(node)
+}
 
 struct AgentAccum {
     get_info: unsafe extern "C" fn(HsaAgent, u32, *mut c_void) -> HsaStatus,
@@ -675,6 +711,8 @@ pub struct HsaBackend {
     /// without a second enumeration pass, and it is what maps a peer *ordinal*
     /// to the agent an SDMA copy must name.
     agents: Vec<HsaAgent>,
+    /// Owner of `fine_pool` and `kernarg_pool` (see [`host_agent_for`]); host-memory async
+    /// copies name it.
     cpu_agent: HsaAgent,
     vram_pool: HsaMemoryPool,
     fine_pool: HsaMemoryPool,
@@ -867,6 +905,19 @@ impl HsaBackend {
         }
         let agent = acc.gpus[device_ordinal as usize];
         let agents = acc.gpus.clone();
+        let nearest_cpu = {
+            let mut a = HsaAgent { handle: 0 };
+            let rc = unsafe {
+                (drv.hsa_agent_get_info)(
+                    agent,
+                    HSA_AMD_AGENT_INFO_NEAREST_CPU,
+                    &mut a as *mut HsaAgent as *mut c_void,
+                )
+            };
+            (rc == HSA_STATUS_SUCCESS && a.handle != 0).then_some(a)
+        };
+        let numa_local = crate::config::RuntimeConfig::get().amd_numa_host_pools();
+        let host_agent = host_agent_for(numa_local, cpu_agent, nearest_cpu);
 
         // Query device name.
         let mut name_buf = [0u8; 64];
@@ -935,16 +986,16 @@ impl HsaBackend {
         // Find coarse-grained VRAM pool on this GPU.
         let vram_pool =
             Self::find_pool(&drv, agent, HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED)?;
-        // Find fine-grained system pool on CPU agent.
+        // Find fine-grained system pool on the host agent.
         let fine_pool = Self::find_pool(
             &drv,
-            cpu_agent,
+            host_agent,
             HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_FINE_GRAINED,
         )?;
-        // Find kernarg pool on CPU agent.
+        // Find kernarg pool on the host agent.
         let kernarg_pool = Self::find_pool(
             &drv,
-            cpu_agent,
+            host_agent,
             HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_KERNARG_INIT,
         )?;
 
@@ -1001,6 +1052,24 @@ impl HsaBackend {
             return Err(hsa_fault(rc, "kernarg allow_access"));
         }
 
+        let node = |a: HsaAgent| {
+            let mut n = u32::MAX;
+            unsafe {
+                (drv.hsa_agent_get_info)(a, HSA_AGENT_INFO_NODE, &mut n as *mut u32 as *mut c_void)
+            };
+            n
+        };
+        tracing::info!(
+            ordinal = device_ordinal,
+            numa_host_pools = numa_local,
+            host_cpu_node = node(host_agent),
+            first_cpu_node = node(cpu_agent),
+            nearest_cpu_node = ?nearest_cpu.map(node),
+            kernarg_page_node = ?page_node(karg_ring),
+            aql_ring_page_node = ?page_node(unsafe { (*queue).base_address }),
+            signal_page_node = ?page_node(done_signal.handle as *const c_void),
+            "HSA host placement"
+        );
         let shared = Arc::new(SharedDriver { drv });
 
         // CDNA (gfx8xx, gfx9xx) is wave64; RDNA (gfx10xx, gfx11xx) is wave32.
@@ -1016,7 +1085,7 @@ impl HsaBackend {
             rocr_version,
             agent,
             agents,
-            cpu_agent,
+            cpu_agent: host_agent,
             vram_pool,
             fine_pool,
             kernarg_pool,
@@ -2673,6 +2742,25 @@ impl HsaBackend {
         self.synchronize()
     }
 
+    /// This agent's PCI address, `dddd:bb:dd.f` (`HSA_AMD_AGENT_INFO_DOMAIN` + `_BDFID`).
+    pub fn pci_bdf(&self) -> Option<String> {
+        let (mut bdf, mut domain) = (0u32, 0u32);
+        // SAFETY: both attributes are documented as uint32_t; the agent is live for `self`.
+        let ok = unsafe {
+            (self.shared.drv.hsa_agent_get_info)(self.agent, HSA_AMD_AGENT_INFO_BDFID, &mut bdf as *mut u32 as *mut c_void)
+                == HSA_STATUS_SUCCESS
+                && (self.shared.drv.hsa_agent_get_info)(self.agent, HSA_AMD_AGENT_INFO_DOMAIN, &mut domain as *mut u32 as *mut c_void)
+                    == HSA_STATUS_SUCCESS
+        };
+        ok.then(|| format!("{domain:04x}:{:02x}:{:02x}.{:x}", bdf >> 8, (bdf >> 3) & 0x1f, bdf & 0x7))
+    }
+
+    /// Dispatches published on this queue that have not completed: the counting signal
+    /// [`Self::synchronize`] waits on. A diagnostic read; it never waits.
+    pub fn in_flight(&self) -> i64 {
+        unsafe { (self.shared.drv.hsa_signal_load_scacquire)(self.done_signal) }
+    }
+
     /// Drain the queue (device-wide; there is one queue).
     pub fn synchronize(&self) -> Result<()> {
         // The AQL read index only says that the packet processor consumed the
@@ -2682,13 +2770,19 @@ impl HsaBackend {
         // counting signal before publication and the device decrements it on
         // completion, so zero is the exact queue-tail completion condition.
         self.guard()?;
+        static BLOCKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let state = if *BLOCKED.get_or_init(|| crate::config::RuntimeConfig::get().amd.hsa_drain_blocked) {
+            HSA_WAIT_STATE_BLOCKED
+        } else {
+            HSA_WAIT_STATE_ACTIVE
+        };
         unsafe {
             (self.shared.drv.hsa_signal_wait_scacquire)(
                 self.done_signal,
                 HSA_SIGNAL_CONDITION_LT,
                 1,
                 u64::MAX,
-                HSA_WAIT_STATE_ACTIVE,
+                state,
             );
         }
         self.guard()
@@ -2861,7 +2955,7 @@ impl HsaBackend {
             (self.shared.drv.hsa_signal_create)(live.len() as i64, 0, std::ptr::null(), &mut sig)
         };
         self.check(rc, "hsa_signal_create (dtod batch)")?;
-        for &&(dst, src, bytes) in &live {
+        for (issued, &&(dst, src, bytes)) in live.iter().enumerate() {
             let rc = unsafe {
                 (self.shared.drv.hsa_amd_memory_async_copy)(
                     dst as *mut c_void,
@@ -2878,6 +2972,8 @@ impl HsaBackend {
                 // Copies already issued still hold references to `sig`; wait them out before
                 // destroying it or the runtime writes into freed memory.
                 unsafe {
+                    // Rejected and unsubmitted copies will never decrement the signal.
+                    (self.shared.drv.hsa_signal_add_screlease)(sig, -((live.len() - issued) as i64));
                     (self.shared.drv.hsa_signal_wait_scacquire)(
                         sig,
                         HSA_SIGNAL_CONDITION_LT,
@@ -3152,8 +3248,7 @@ impl HsaBackend {
     /// never decrement, so the signal can no longer reach zero and a
     /// `wait(LT 1, u64::MAX)` would block the thread forever — a hang, not an
     /// error return. Subtracting the un-issued count restores the invariant the
-    /// wait depends on. (`memcpy_dtod_batch` above has this bug: it waits on a
-    /// signal that a mid-loop failure has left permanently short.)
+    /// wait depends on.
     pub fn memcpy_htod_pinned_batch(&self, pairs: &[(u64, &[u8])]) -> Result<()> {
         let live: Vec<&(u64, &[u8])> = pairs.iter().filter(|p| !p.1.is_empty()).collect();
         if live.is_empty() {
@@ -3369,6 +3464,33 @@ impl HsaBackend {
         )
     }
 
+    pub(crate) fn launch_3d(
+        &self,
+        f: HsaKernel,
+        grid: [u32; 3],
+        block: u16,
+        args: &[u8],
+    ) -> Result<()> {
+        let grid_x = grid[0].checked_mul(u32::from(block)).filter(|&n| n != 0);
+        if grid_x.is_none() || grid[1] == 0 || grid[2] == 0 || block > 1024 {
+            return Err(RuntimeError::Device(format!(
+                "invalid 3D launch: grid={grid:?}, block={block}"
+            )));
+        }
+        self.dispatch(
+            &f,
+            grid_x.unwrap(),
+            grid[1],
+            grid[2],
+            block,
+            1,
+            1,
+            0,
+            args.as_ptr().cast(),
+            args.len(),
+        )
+    }
+
     /// No-op with a range check. HSA carries `group_segment_size` in the
     /// dispatch packet, so there is no per-function opt-in to set; the check
     /// keeps an over-budget request from silently becoming a launch failure.
@@ -3573,6 +3695,10 @@ impl crate::memory::vmm::VmmOps for HsaBackend {
         self.memcpy_dtod(dst, src, bytes)
     }
 
+    fn copy_dtod_batch(&self, pairs: &[(u64, u64, u64)]) -> Result<()> {
+        self.memcpy_dtod_batch(pairs)
+    }
+
     fn pool_take(&self) -> Vec<(u64, u64)> {
         std::mem::take(&mut *self.slab_pool.lock())
     }
@@ -3633,6 +3759,26 @@ mod scrub_tests {
 
 #[cfg(test)]
 mod tests {
+    use super::{host_agent_for, page_node, HsaAgent};
+
+    #[test]
+    fn host_pools_follow_the_nearest_cpu_only_when_asked() {
+        let (first, near) = (HsaAgent { handle: 1 }, HsaAgent { handle: 2 });
+        assert_eq!(host_agent_for(true, first, Some(near)).handle, 2);
+        assert_eq!(host_agent_for(false, first, Some(near)).handle, 1);
+        assert_eq!(host_agent_for(true, first, None).handle, 1);
+    }
+
+    #[test]
+    fn page_node_reads_a_touched_page_and_refuses_an_unmapped_one() {
+        let page = vec![1u8; 8192];
+        // A kernel or container without NUMA support refuses every query; it must not report a node.
+        if let Some(n) = page_node(page.as_ptr().cast()) {
+            assert!(n >= 0);
+        }
+        assert_eq!(page_node(8 as *const std::ffi::c_void), None);
+    }
+
     use super::{hsa_status_name, is_hsa_fatal};
 
     #[test]

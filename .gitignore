@@ -54,8 +54,35 @@ venv-sglang/
 .venv-sglang/
 sglang-pkgs/
 
-# Performance measurements are summarized in Markdown.
+# Keep removed performance reports and campaign directories local.
 /perf-data/**/*.json
+/perf-data/**/*.jsonl
+/perf-data/**/*.md
+/perf-data/gemma3-12b-h100/
+/perf-data/gemma4-12b-h100-data/
+/runtime/bench/amd/dsa_pf_tp/*.md
+/runtime/bench/amd/dsa_pf_tp/*.json
+/runtime/bench/amd/dsa_pf_tp/*.jsonl
+/runtime/bench/amd/dsa_select_parallel/*.md
+/runtime/bench/amd/dsa_select_parallel/*.json
+/runtime/bench/amd/dsa_select_parallel/*.jsonl
 
 # Sibling checkouts used for cross-branch comparison
 .worktrees/
+/runtime/bench/amd/moe_aiter/mi300x-resident-trace.json
+/runtime/bench/amd/moe_aiter/mi300x-resident-prefill.json
+
+# Campaign RESULTS stay local: raw measurement JSON/CSV under the bench and perf-data trees
+# and per-probe write-ups are removed on every upstream merge (see
+# docs/bringup/tp-bringup-upstream-review-log.md). Inputs the code reads are tracked
+# explicitly: glm_fold_tail/gemm-selected.json (amd_mla_fold.rs), tuning/**/*.jsonl (tunedb),
+# runtime/ubench/mfma_shape_results/summary.csv (collect_occ1.sh).
+/runtime/bench/**/*.json
+/runtime/bench/**/*.jsonl
+/runtime/bench/**/*.csv
+!/runtime/bench/amd/glm_fold_tail/gemm-selected.json
+!/runtime/bench/amd/mla_materialized_prefill/vllm_capture.example.json
+/perf-data/**/*.csv
+/runtime/nvidia/experiments/*.md
+!/runtime/nvidia/experiments/README.md
+/runtime/bench/amd/*/README.md

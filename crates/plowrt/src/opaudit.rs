@@ -330,6 +330,8 @@ pub fn classify(op: DevOp) -> OpClass {
         ),
 
         // ---- dense matmul families --------------------------------------
+        DevOp::GemmLtPf => a_rows("i0=T; native BF16 projection has no per-sequence state"),
+        DevOp::GemmBlkPf => a_rows("i0=T; native FP8 projection has no per-sequence state"),
         DevOp::Gemm | DevOp::GemmSmall | DevOp::GemmMed | DevOp::GemmWide | DevOp::GemmC5 => {
             a_rows("i0=M")
         }
@@ -431,6 +433,11 @@ pub fn classify(op: DevOp) -> OpClass {
         DevOp::IndexSelect => a_one("i0=len_max, one cooperative launch, one query row"),
         DevOp::IndexScorePf => cls_c("q_pos0 = kv_len[0] - n_tok (op_attention.h:5173)"),
         DevOp::IndexSelectPf => cls_c("q_pos0 = kv_len[0] - n_tok; row bound q_pos0 + t + 1"),
+        // Isolated form: kv_len[0] - T. Under a packed binding the runtime hands the ABI-2
+        // adapter a PlowKvSpan table and every row resolves through its span (exec/amd.rs
+        // `stage_kv_spans`); the static class stays C because the opcode alone cannot say
+        // which form a launch will take.
+        DevOp::IndexTpPf => cls_c("kv_len[0] - T isolated; PlowKvSpan table under packing"),
         DevOp::IndexUnionPf => cls_c("q_pos0 = kv_len[0] - n_tok (op_attention.h:5474)"),
         DevOp::DsaQQuant => a_rows("i0=n_rows (flattened token x index-head)"),
         DevOp::DsaPoolCompress => {
@@ -470,6 +477,7 @@ pub fn classify(op: DevOp) -> OpClass {
         DevOp::MoeAlignGemmaPf => b("i0=T; builds row_token / row_partidx / row_gate maps"),
         DevOp::MoeGroupGluPf => b("t5=row_token gathers the source token per gathered row"),
         DevOp::MoeGroupDownPf => b("t6=row_partidx / t7=row_gate scatter per gathered row"),
+        DevOp::MoeAiterFp8Pf => b("i0=T; native A8 MoE reads aligned row maps in t4..t7"),
         DevOp::MoeGroupGluGemmaPf => b("t4=row_token"),
         DevOp::MoeGroupDownGemmaPf => b("t4=row_partidx / t5=row_gate"),
         DevOp::MoeGroupGluGemmaPfW8a8 => b("t4=row_token, t5=ascale[T]"),

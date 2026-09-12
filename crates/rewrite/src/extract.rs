@@ -70,6 +70,7 @@ pub(crate) fn is_fused(op: &str) -> bool {
             | "FusedResidualNorm"
             | "FusedResidualZeroCenteredNorm"
             | "FusedResidualLayerNorm"
+            | "FusedResidual3Norm"
             | "FusedGroupNormActConv3d"
             | "FusedGroupNormActConv3dBias"
             | "FusedLinearAct"

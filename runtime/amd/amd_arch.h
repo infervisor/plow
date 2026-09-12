@@ -101,10 +101,9 @@ __device__ __forceinline__ f32x4 plow_mfma_bf16_16x16(bf16x8 a, bf16x8 b, f32x4 
  * IDENTICALLY, so every product still pairs A[m][k] with B[k][n], and the four issues partition
  * K=64 exactly once. Only the f32 accumulation GROUPING differs from CDNA4.
  *
- * RATE: this is where CDNA3 gives up the most. op_gemm.h measured the scaled/unscaled K=64 form
- * at 4532 TF/s -- exactly 2x bf16 -- while CDNA3's K=16 fp8 runs at the SAME rate as its bf16
- * (hwspec mi300.rs: fp8 512 vs bf16 256 MACs/cycle/core, i.e. 2x per instruction but a quarter
- * of the K per issue). So on gfx942 fp8 prefill buys memory footprint, not throughput.
+ * RATE: CDNA3 fp8 has twice the theoretical throughput of its bf16 core (hwspec mi300.rs:
+ * 512 vs 256 MACs/cycle/core). At 32x32, K=64 takes four fp8 issues versus eight bf16 issues.
+ * Real GEMM gains still depend on staging, occupancy and activation-quantization costs.
  *
  * FORMAT, and it is the whole reason PLOW_FP8_MMA_FIX exists. The CDNA3 matrix core reads its
  * fp8 operands as e4m3FNUZ while plow's bytes are OCP e4m3 -- see the fp8 section below, where
@@ -432,6 +431,47 @@ __device__ __forceinline__ void plow_fp4x8_to_f16x4(unsigned w, unsigned h[4]) {
     h[2] = ((z1 & 0x00070007u) << 9) | ((z1 & 0x00080008u) << 12);
     h[3] = ((z1 & 0x07000700u) << 1) | ((z1 & 0x08000800u) << 4);
 }
+
+/* One u32 of 8 INT4 -> 4 packed fp16 pairs, in the SAME lane order as `plow_fp4x8_to_f16x4`.
+ *                                                                          [INT4-G32-DECODE]
+ *
+ * For compressed-tensors `pack-quantized` int4 (Kimi-K2.7-Code's routed experts): symmetric,
+ * group_size 32, stored as an UNSIGNED nibble with an offset of 8, so the value is `n - 8`.
+ * The container needs no repack — compressed-tensors puts value `8c+i` at bits `4i` of word `c`,
+ * which little-endian makes byte `j/2` with the low nibble at even `j`: byte for byte the
+ * `fp4v32` order `wave_dot_mxfp4` already loads 32 values per 16 bytes with. Verified elementwise
+ * against `compressed_tensors.unpack_from_int32` over a real 2048x7168 expert.
+ *
+ * WHY A MAGIC CONSTANT RATHER THAN THE fp4 BIT TRICK. The fp4 path above maps e2m1's 3-bit
+ * magnitude straight into the fp16 exponent field, because e2m1 IS a float. int4 is not: its
+ * values are integers, and an exponent-field construction cannot produce them. But fp16 has a
+ * 10-bit mantissa, so for any n in [0,16) the bit pattern `0x6400 | n` is EXACTLY 1024 + n — the
+ * integer lands in the mantissa of a fixed exponent and nothing rounds. One OR gives the value
+ * biased by 1024, and the caller's bias term folds the remaining -1032 (= 1024 + the offset 8).
+ * Cost is one mask and one OR per pair against the fp4 path's two shifts and an OR.
+ *
+ * THE DEINTERLEAVE IS THE fp4 ONE, VERBATIM, and deliberately so: it is what puts a pair's two
+ * elements sixteen bits apart, and reusing it is what lets the GEMV reduction, `dot8` and the
+ * wave reduction stay shared with the fp4 and fp8 arms rather than forking a third lane order.
+ *
+ * Exactness of both halves is checkable without a device: `0x6400|n` reproduces n-8 for all 16
+ * nibbles, and this shuffle reproduces e0..e7 in order. */
+__device__ __forceinline__ void plow_int4x8_to_f16x4(unsigned w, unsigned h[4]) {
+    const unsigned lo = w & 0x0F0F0F0Fu;        /* elements 0,2,4,6 -> bytes 0..3 */
+    const unsigned hi = (w >> 4) & 0x0F0F0F0Fu; /* elements 1,3,5,7 -> bytes 0..3 */
+    const unsigned z0 = (lo & 0x0000FFFFu) | (hi << 16);
+    const unsigned z1 = (lo >> 16) | (hi & 0xFFFF0000u);
+    /* 0x6400 | n == fp16(1024 + n), exact for n < 16. The -1032 bias is the caller's. */
+    h[0] = (z0 & 0x000F000Fu) | 0x64006400u;
+    h[1] = ((z0 >> 8) & 0x000F000Fu) | 0x64006400u;
+    h[2] = (z1 & 0x000F000Fu) | 0x64006400u;
+    h[3] = ((z1 >> 8) & 0x000F000Fu) | 0x64006400u;
+}
+
+/* The bias `plow_int4x8_to_f16x4` leaves for its caller: every decoded element is 1024 + n where
+ * the value is n - 8, so each one is high by 1032. A dot product over a fragment can subtract it
+ * once, as `-1032 * sum(x)`, instead of per element. */
+#define PLOW_INT4_BIAS 1032.0f
 
 /* One u32 of 8 fp4 -> 4 packed bf16 pairs (u32 each), scale folded. `out` gets 4 words. */
 __device__ __forceinline__ void plow_fp4x8_to_bf16x8(unsigned w, float scale, unsigned out[4]) {

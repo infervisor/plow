@@ -216,6 +216,7 @@ const MAX_PREFILL_CAPTURE_BYTES: u64 = 256 << 20;
 #[derive(Debug, Eq, PartialEq)]
 struct PrefillCaptureRequest {
     program_t: u32,
+    chunk_base: Option<u32>,
     segment: usize,
     targets: Vec<(String, PathBuf)>,
 }
@@ -223,17 +224,31 @@ struct PrefillCaptureRequest {
 #[derive(Debug)]
 struct PrefillCapture {
     program: usize,
+    chunk_base: Option<u32>,
     segment: usize,
     targets: Vec<(String, PathBuf)>,
 }
 
 fn parse_prefill_capture(spec: &str) -> Result<PrefillCaptureRequest> {
     let (program_t, rest) = spec.split_once(':').ok_or_else(|| {
-        RuntimeError::Device("PLOW_PF_CAPTURE must be T:SEG:tensor=path[,tensor=path...]".into())
+        RuntimeError::Device(
+            "PLOW_PF_CAPTURE must be T[@C0]:SEG:tensor=path[,tensor=path...]".into(),
+        )
     })?;
     let (segment, targets) = rest.split_once(':').ok_or_else(|| {
-        RuntimeError::Device("PLOW_PF_CAPTURE must be T:SEG:tensor=path[,tensor=path...]".into())
+        RuntimeError::Device(
+            "PLOW_PF_CAPTURE must be T[@C0]:SEG:tensor=path[,tensor=path...]".into(),
+        )
     })?;
+    let (program_t, chunk_base) = match program_t.split_once('@') {
+        Some((t, base)) => (
+            t,
+            Some(base.parse::<u32>().map_err(|_| {
+                RuntimeError::Device("PLOW_PF_CAPTURE has an invalid chunk base".into())
+            })?),
+        ),
+        None => (program_t, None),
+    };
     let program_t = program_t
         .parse::<u32>()
         .map_err(|_| RuntimeError::Device("PLOW_PF_CAPTURE has an invalid program T".into()))?;
@@ -282,13 +297,23 @@ fn parse_prefill_capture(spec: &str) -> Result<PrefillCaptureRequest> {
     }
     Ok(PrefillCaptureRequest {
         program_t,
+        chunk_base,
         segment,
         targets: parsed,
     })
 }
 
-fn prefill_capture_due(capture: Option<&PrefillCapture>, program: usize, segment: usize) -> bool {
-    capture.is_some_and(|capture| capture.program == program && capture.segment == segment)
+fn prefill_capture_due(
+    capture: Option<&PrefillCapture>,
+    program: usize,
+    segment: usize,
+    c0: u32,
+) -> bool {
+    capture.is_some_and(|capture| {
+        capture.program == program
+            && capture.segment == segment
+            && capture.chunk_base.is_none_or(|base| base == c0)
+    })
 }
 
 fn agreement_due(tick: &mut u32, every: u32) -> bool {
@@ -322,6 +347,8 @@ pub struct AmdTpGroup {
     audit: bool,
     audit_direct: bool,
     audit_compact: bool,
+    prefill_audit_direct: bool,
+    index_tp_status: bool,
     /// Read EVERY rank's sampled id, rather than just rank 0's, once every this
     /// many decode tokens — see [`AmdTpGroup::audit_cadence`].
     agree_every: u32,
@@ -409,6 +436,11 @@ impl AmdTpGroup {
         }
         let max_tokens = (tp.slot_bytes / msg) as u32;
         let n_xctr = count_xgates(&blob);
+        let index_tp_status = blob
+            .progs
+            .iter()
+            .flat_map(|p| &p.insts)
+            .any(|d| d.op == packet::dev::DevOp::IndexTpPf as u16);
         let audit_compact_requested = crate::config::RuntimeConfig::get().amd.tp_audit_compact;
         let has_fine_xctr = blob
             .progs
@@ -623,6 +655,7 @@ impl AmdTpGroup {
                 }
                 Ok(PrefillCapture {
                     program,
+                    chunk_base: request.chunk_base,
                     segment: request.segment,
                     targets: request.targets,
                 })
@@ -636,7 +669,9 @@ impl AmdTpGroup {
             gate_expect,
             audit: !crate::config::RuntimeConfig::get().amd.tp_no_audit,
             audit_direct: crate::config::RuntimeConfig::get().amd.tp_audit_direct,
+            prefill_audit_direct: crate::config::RuntimeConfig::get().amd.tp_prefill_audit_direct,
             audit_compact,
+            index_tp_status,
             agree_every,
             agree_tick: agree_every,
             // Overwritten by the first submit; the widest rung is the safe pre-first-step value.
@@ -845,7 +880,18 @@ impl AmdTpGroup {
     /// Scalar convenience over [`Self::submit_decode_batched`] — one sequence, which is every
     /// caller today.
     pub fn submit_decode(&mut self, pos: u32, kvlen: u32) -> Result<()> {
-        self.submit_decode_batched(&[pos], &[kvlen])
+        // One sequence runs on the narrowest rung. The staging upload is batch-wide, so the
+        // other slots park at pos 0 (the serve idle row) instead of carrying stale rows; the
+        // rung never steps them.
+        let dp = self.ranks[0].decode_prog_for(1);
+        let b = self.ranks[0].batch();
+        if b == 1 {
+            return self.submit_decode_batched_at(&[pos], &[kvlen], dp);
+        }
+        let (mut p, mut k) = (vec![0; b], vec![1; b]);
+        p[0] = pos;
+        k[0] = kvlen;
+        self.submit_decode_batched_at(&p, &k, dp)
     }
 
     /// Submit one decode step for `B` sequences across every rank.
@@ -938,6 +984,7 @@ impl AmdTpGroup {
         if let Some(z) = launched_at {
             dstep::ENQUEUE.add(z.elapsed().as_nanos() as u64);
         }
+        let in_flight_enqueued = crate::obs::tick::on().then(|| self.ranks[0].in_flight());
         // Do not put this work inside the launch closure: every rank must be
         // resident before ~1.5 ms of TP8 counter clears can begin. These are
         // rank-local inactive banks, not peer-visible xctr; xctr remains the
@@ -946,6 +993,9 @@ impl AmdTpGroup {
             for e in &self.ranks {
                 dstep::timed(&dstep::REARM, || e.tp_rearm_inactive_counter_bank(dp))?;
             }
+        }
+        if let Some(enqueued) = in_flight_enqueued {
+            crate::obs::tick::decode_in_flight(enqueued, self.ranks[0].in_flight(), n_segments as u32);
         }
         Ok(())
     }
@@ -1001,6 +1051,8 @@ impl AmdTpGroup {
 
     fn drain_and_audit(&mut self) -> Result<()> {
         use crate::obs::dstep;
+        // The decode is on the GPU: a prefix publish deferred from this tick's chunk runs here.
+        let published = self.flush_deferred_publish();
         dstep::timed(&dstep::DRAIN, || -> Result<()> {
             for e in &self.ranks {
                 e.drain()?;
@@ -1040,7 +1092,7 @@ impl AmdTpGroup {
                 }
             })?;
         }
-        Ok(())
+        published.map(drop)
     }
 
     /// Prefill `prompt` on every rank. Returns each rank's first sampled id.
@@ -1092,8 +1144,8 @@ impl AmdTpGroup {
             "TP prefill plan"
         );
 
-        for step in steps {
-            self.prefill_chunk(prompt, step)?;
+        for (i, &step) in steps.iter().enumerate() {
+            self.prefill_chunk(prompt, step, steps.get(i + 1).copied())?;
         }
 
         let t_read = std::time::Instant::now();
@@ -1171,9 +1223,9 @@ impl AmdTpGroup {
     /// The recurrence is sharded by head, so a snapshot is only meaningful if every rank takes
     /// one at the same point in the token stream — a rank that skipped it would resume from a
     /// state one prefix behind its peers and the group would disagree from the first token.
-    pub fn snapshot_carried(&mut self, slot: usize) -> Result<()> {
+    pub fn snapshot_carried(&mut self, slot: usize, rows: u32) -> Result<()> {
         for e in &mut self.ranks {
-            e.snapshot_carried(slot)?;
+            e.snapshot_carried(slot, rows)?;
         }
         Ok(())
     }
@@ -1183,6 +1235,67 @@ impl AmdTpGroup {
             e.restore_carried(slot)?;
         }
         Ok(())
+    }
+
+    /// `all`, not `any`: `attach_shared_prefixes` requires every rank to carry the cache, so a
+    /// group predicate that said "enabled" on one rank would fail every admission.
+    pub fn shared_prefix_enabled(&self) -> bool {
+        self.ranks.iter().all(AmdEngine::shared_prefix_enabled)
+    }
+
+    pub fn attach_shared_prefix(&mut self, slot: usize, prompt: &[u32]) -> Result<u32> {
+        AmdEngine::attach_shared_prefixes(&mut self.ranks, slot, prompt)
+    }
+
+    pub fn publish_shared_prefix(&mut self, slot: usize, prompt: &[u32], frontier: u32) -> Result<()> {
+        for rank in &mut self.ranks {
+            rank.publish_shared_prefix(slot, prompt, frontier)?;
+        }
+        Ok(())
+    }
+
+    /// Stash this chunk's prefix publish on every rank. It runs at the next flush point, each
+    /// of which sits under GPU work: [`Self::prefill_chunk`] between its enqueue and its drain,
+    /// or the decode's [`Self::drain_and_audit`]. `SharedPrefix::defer_publish` states why
+    /// the bytes are unchanged and when a flush is forced earlier.
+    pub fn defer_publish_shared_prefix(
+        &mut self,
+        slot: usize,
+        prompt: &[u32],
+        frontier: u32,
+    ) -> Result<()> {
+        if !self
+            .ranks
+            .first()
+            .is_some_and(|e| e.shared_prefix_publishes_at(prompt.len(), frontier))
+        {
+            return Ok(());
+        }
+        let prompt: Arc<[u32]> = Arc::from(prompt);
+        for rank in &mut self.ranks {
+            rank.defer_shared_prefix_publish(slot, &prompt, frontier)?;
+        }
+        Ok(())
+    }
+
+    /// Run any deferred prefix publish on every rank; returns its wall time.
+    fn flush_deferred_publish(&mut self) -> Result<u64> {
+        let t = std::time::Instant::now();
+        let mut result = Ok(());
+        for rank in &mut self.ranks {
+            if let Err(err) = rank.flush_shared_prefix_publish() {
+                result = Err(err);
+            }
+        }
+        let ns = t.elapsed().as_nanos() as u64;
+        crate::obs::tick::deferred_publish(ns);
+        result.map(|()| ns)
+    }
+
+    pub fn release_shared_prefix(&mut self, slot: usize) {
+        for rank in &mut self.ranks {
+            rank.release_shared_prefix(slot);
+        }
     }
 
     /// Publish the per-row parked mask on every rank. See `AmdEngine::upload_parked`.
@@ -1226,6 +1339,103 @@ impl AmdTpGroup {
             .then_some(t)
     }
 
+    /// The token-batch bodies every rank carries identically, `(program, rows, band)`; empty
+    /// when the ranks disagree, so a disagreeing group offers no body rather than one some
+    /// rank cannot execute.
+    pub fn token_batch_bodies(&self) -> Vec<(usize, u32, u32)> {
+        let Some(first) = self.ranks.first() else {
+            return Vec::new();
+        };
+        let bodies = first.token_batch_bodies();
+        if self.ranks.iter().all(|rank| rank.token_batch_bodies() == bodies) {
+            bodies
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// One token-batch body step on every rank: stage the same slot-band plan on all ranks,
+    /// one `xctr` reset, segment-major enqueue with an all-rank drain per segment (the
+    /// packed-prefill protocol), audit, then the band's sampled ids from rank 0 — every rank's
+    /// copy compared over the sampled rows on the agreement cadence. Returns the ids of ALL
+    /// band rows; the caller reads the ones its plan sampled. Any rank's failure fails the
+    /// step for every request in it, and the packed binding is cleared either way.
+    pub fn token_batch_body_step(
+        &mut self,
+        prog: usize,
+        plan: &plow_asset::mixed_step::Plan,
+    ) -> Result<Vec<u32>> {
+        self.clear_packed_prefill();
+        let result = self.token_batch_body_step_inner(prog, plan);
+        self.clear_packed_prefill();
+        result
+    }
+
+    fn token_batch_body_step_inner(
+        &mut self,
+        prog: usize,
+        plan: &plow_asset::mixed_step::Plan,
+    ) -> Result<Vec<u32>> {
+        let plow_asset::mixed_step::SpanCover::SlotBand { band } = plan.cover else {
+            return Err(RuntimeError::Rejected(
+                "token-batch body needs a slot-band plan".into(),
+            ));
+        };
+        for e in &mut self.ranks {
+            e.token_batch_body_prepare(prog, plan)?;
+            e.rearm_prog(prog)?;
+        }
+        self.group.zero_xctr()?;
+        let launches = self.ranks[0].prog_dispatch(prog).launches();
+        if let Some(rank) = self
+            .ranks
+            .iter()
+            .position(|e| e.prog_dispatch(prog).launches() != launches)
+        {
+            return Err(RuntimeError::Device(format!(
+                "rank {rank} token-batch body {prog} has {} segments, rank 0 has {launches}",
+                self.ranks[rank].prog_dispatch(prog).launches()
+            )));
+        }
+        for seg in 0..launches {
+            for e in &mut self.ranks {
+                e.enqueue_segment(prog, seg)?;
+            }
+            for e in &self.ranks {
+                e.drain()?;
+            }
+        }
+        if self.audit {
+            self.group.audit_xctr(&self.gate_expect[prog])?;
+        }
+        if let Some(dir) = crate::config::RuntimeConfig::get().amd.tb_dump.as_ref() {
+            static TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let tick = TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.ranks[0].token_batch_dump(
+                dir.as_path(),
+                &format!("step{tick:04}"),
+                plan,
+            )?;
+        }
+        let ids = self.ranks[0].read_sampled_batched(band as usize)?;
+        if agreement_due(&mut self.agree_tick, self.agree_every) {
+            for rank in 1..self.ranks.len() {
+                let other = self.ranks[rank].read_sampled_batched(band as usize)?;
+                for &slot in &plan.decode_slots {
+                    let s = slot as usize;
+                    if other[s] != ids[s] {
+                        return Err(RuntimeError::Device(format!(
+                            "token-batch band row {s}: rank 0 sampled {} but rank {rank} \
+                             sampled {} — a collective did not run or a rank bound the wrong shard",
+                            ids[s], other[s]
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(ids)
+    }
+
     /// §5.4's D-class span limit, agreed across ranks: the MINIMUM, and 0 for a rank that
     /// refuses the program, so a disagreeing group admits no packed span rather than a plan one
     /// rank cannot execute. Every rank carries the same program, so in practice they agree.
@@ -1235,6 +1445,14 @@ impl AmdTpGroup {
             .map(|rank| rank.packed_prefill_span_limit(prog).unwrap_or(0))
             .min()
             .unwrap_or(0)
+    }
+
+    /// Whether a span starting at absolute position `kv_row0` may be packed onto `prog` on
+    /// every rank (`AmdEngine::packed_span_admissible`).
+    pub fn packed_span_admissible(&self, prog: usize, kv_row0: u32) -> bool {
+        self.ranks
+            .iter()
+            .all(|rank| rank.packed_span_admissible(prog, kv_row0))
     }
 
     /// True only when every rank can route this exact program through packed prefill.
@@ -1288,8 +1506,8 @@ impl AmdTpGroup {
         }
         let chunks = self.ranks[0].plan_for(to - from)?;
         let steps = self.ranks[0].chunk_steps_from(&chunks, from, to)?;
-        for step in steps {
-            self.prefill_chunk(prompt, step)?;
+        for (i, &step) in steps.iter().enumerate() {
+            self.prefill_chunk(prompt, step, steps.get(i + 1).copied())?;
         }
         Ok(())
     }
@@ -1342,7 +1560,7 @@ impl AmdTpGroup {
             resume
         } else if arm > 0 {
             self.prefill_span(prompt, 0, arm)?;
-            self.snapshot_carried(slot)?;
+            self.snapshot_carried(slot, arm)?;
             arm
         } else {
             0
@@ -1367,20 +1585,40 @@ impl AmdTpGroup {
     /// every rank and drained once. A server that wants to overlap prefill with
     /// other work overlaps whole CHUNKS, which is the granularity chunked
     /// prefill already schedules at.
-    pub fn prefill_chunk(&mut self, prompt: &[u32], step: ChunkStep) -> Result<()> {
+    ///
+    /// `next` is the same prompt's following chunk, if the plan has one; see
+    /// [`AmdEngine::prefill_map_ahead`].
+    pub fn prefill_chunk(
+        &mut self,
+        prompt: &[u32],
+        step: ChunkStep,
+        next: Option<ChunkStep>,
+    ) -> Result<()> {
         use crate::obs::ttft;
+        let tick_log = crate::obs::tick::on();
+        let (mut prepare_ns, mut rearm_ns) = (0u64, 0u64);
+        let maps = |ranks: &[AmdEngine]| ranks.iter().map(AmdEngine::kv_mappings).sum::<u64>();
+        let maps_before = if tick_log { maps(&self.ranks) } else { 0 };
+        if tick_log {
+            crate::obs::tick::take_prepare();
+        }
         for e in &mut self.ranks {
             let t = std::time::Instant::now();
             e.prefill_prepare(prompt, step)?;
-            ttft::PF_PREPARE.add(t.elapsed().as_nanos() as u64);
+            let ns = t.elapsed().as_nanos() as u64;
+            prepare_ns += ns;
+            ttft::PF_PREPARE.add(ns);
             let t = std::time::Instant::now();
             e.rearm_prog(step.prog)?;
-            ttft::PF_REARM.add(t.elapsed().as_nanos() as u64);
+            let ns = t.elapsed().as_nanos() as u64;
+            rearm_ns += ns;
+            ttft::PF_REARM.add(ns);
         }
         // xctr once for the whole chunk, before any rank is dispatched.
         let t = std::time::Instant::now();
         self.group.zero_xctr()?;
-        ttft::PF_XCTR.add(t.elapsed().as_nanos() as u64);
+        let xctr_ns = t.elapsed().as_nanos() as u64;
+        ttft::PF_XCTR.add(xctr_ns);
 
         let dispatch = self.ranks[0].prog_dispatch(step.prog);
         let launches = dispatch.launches();
@@ -1419,11 +1657,27 @@ impl AmdTpGroup {
                     rank.commit_graph_phase_replay()?;
                 }
             }
-            ttft::PF_ENQUEUE.add(t.elapsed().as_nanos() as u64);
+            let enqueue_ns = t.elapsed().as_nanos() as u64;
+            ttft::PF_ENQUEUE.add(enqueue_ns);
+
+            // The GPU is ~1 s behind the host here: map the next KV block on every rank now,
+            // not in the decode that follows the chunk (`AmdEngine::prefill_map_ahead`).
+            let t = std::time::Instant::now();
+            let maps_prepared = if tick_log { maps(&self.ranks) } else { 0 };
+            for e in &self.ranks {
+                e.prefill_map_ahead(step, next);
+            }
+            let map_ahead_ns = t.elapsed().as_nanos() as u64;
+            let maps_after = if tick_log { maps(&self.ranks) } else { 0 };
+            let published = self.flush_deferred_publish();
 
             let t = std::time::Instant::now();
+            let mut rank_drain_ns = Vec::with_capacity(if tick_log { self.ranks.len() } else { 0 });
             for e in &self.ranks {
                 e.drain()?;
+                if tick_log {
+                    rank_drain_ns.push(t.elapsed().as_nanos() as u64);
+                }
             }
             let ns = t.elapsed().as_nanos() as u64;
             ttft::PF_DRAIN.add(ns);
@@ -1445,8 +1699,47 @@ impl AmdTpGroup {
                     step.clen as f64 / (ns as f64 / 1e9),
                 );
             }
-            if self.audit {
-                self.group.audit_xctr(&self.gate_expect[step.prog])?;
+            let t = std::time::Instant::now();
+            if self.index_tp_status {
+                self.group.audit_xstatus_direct()?;
+            }
+            self.audit_prefill_counters(step.prog)?;
+            let publish_ns = published?;
+            if tick_log {
+                let (prep_vmm, prep_patch) = crate::obs::tick::take_prepare();
+                let ms = |ns: u64| ns as f64 / 1e6;
+                let ranks: Vec<String> =
+                    rank_drain_ns.iter().map(|&d| format!("{:.1}", ms(d))).collect();
+                eprintln!(
+                    "PFSEG bucket={} c0={} clen={} launches={launches} prepare={:.3} prepare_maps={} prepare_vmm={:.3} prepare_patch={:.3} rearm={:.3} xctr={:.3} enqueue={:.3} map_ahead={:.3} map_ahead_maps={} publish_deferred={:.3} drain={:.3} audit={:.3} rank_drain_cum=[{}]",
+                    self.ranks[0].prog_t(step.prog),
+                    step.c0,
+                    step.clen,
+                    ms(prepare_ns),
+                    maps_prepared - maps_before,
+                    ms(prep_vmm),
+                    ms(prep_patch),
+                    ms(rearm_ns),
+                    ms(xctr_ns),
+                    ms(enqueue_ns),
+                    ms(map_ahead_ns),
+                    maps_after - maps_prepared,
+                    ms(publish_ns),
+                    ms(ns),
+                    ms(t.elapsed().as_nanos() as u64),
+                    ranks.join(","),
+                );
+            }
+            if let Some(dir) = crate::config::RuntimeConfig::get().amd.tb_dump.as_ref() {
+                static TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let tick = TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let slot = self.ranks[0].kv_slot();
+                self.ranks[0].dump_slot_kv(
+                    dir.as_path(),
+                    &format!("pf{tick:04}"),
+                    slot,
+                    step.c0 + step.clen,
+                )?;
             }
             return Ok(());
         }
@@ -1481,7 +1774,7 @@ impl AmdTpGroup {
                     submit_begin.elapsed().as_secs_f64() * 1e6,
                 );
             }
-            if prefill_capture_due(self.prefill_capture.as_ref(), step.prog, seg) {
+            if prefill_capture_due(self.prefill_capture.as_ref(), step.prog, seg, step.c0) {
                 let capture = self.prefill_capture.take().expect("capture was due");
                 for (tensor, path) in capture.targets {
                     let bytes = self.ranks[0].snapshot_tensor(&tensor)?;
@@ -1519,10 +1812,29 @@ impl AmdTpGroup {
                 );
             }
         }
-        if self.audit {
-            self.group.audit_xctr(&self.gate_expect[step.prog])?;
+        if self.index_tp_status {
+            self.group.audit_xstatus_direct()?;
         }
+        self.audit_prefill_counters(step.prog)?;
         Ok(())
+    }
+
+    /// The exact counter audit after a prefill dispatch has drained on every rank.
+    ///
+    /// With `--amd-tp-prefill-audit-direct` the same gates are compared against the same
+    /// expectations through host loads of the large-BAR mapping, the transport the compact
+    /// decode audit already reads its status word through, instead of one D2H copy per rank.
+    /// It cannot move later or be sampled: the next dispatch's `zero_xctr` erases the
+    /// counters, and a collective that timed out corrupts KV every later row reads.
+    fn audit_prefill_counters(&self, prog: usize) -> Result<()> {
+        if !self.audit {
+            return Ok(());
+        }
+        if self.prefill_audit_direct {
+            self.group.audit_xctr_direct(&self.gate_expect[prog])
+        } else {
+            self.group.audit_xctr(&self.gate_expect[prog])
+        }
     }
 
     /// Execute one packed prefill chunk as an all-rank transaction. No rank launches until all
@@ -1743,14 +2055,13 @@ fn check_seq_par_seams(blob: &DevBlob, n_gpu: u32) -> Result<u64> {
             .iter()
             .any(|d| d.op == DevOp::XReduceScatter as u16 || d.op == DevOp::XAllGather as u16)
     };
-    let dec_lo = blob.decode_rung_lo();
     let mut any = false;
     for (pi, p) in blob.progs.iter().enumerate() {
         if !carries(p) {
             continue;
         }
         any = true;
-        if pi >= dec_lo {
+        if p.role.is_decode_rung() {
             return Err(RuntimeError::Device(format!(
                 "program {pi} (T={}) is a decode rung but carries sequence-parallel seam \
                  collectives (XReduceScatter/XAllGather); those are prefill-only",
@@ -1790,6 +2101,8 @@ fn count_xgates(blob: &DevBlob) -> u32 {
             } else if d.op == DevOp::XReduceTwoShot as u16 {
                 // two-shot: reduce-scatter (i3) and all-gather (i4)
                 top = top.max(d.i[3] + 1).max(d.i[4] + 1);
+            } else if d.op == DevOp::IndexTpPf as u16 {
+                top = top.max(d.i[5] + 1).max(d.i[6] + 1);
             } else if d.op == DevOp::XReduceScatter as u16 || d.op == DevOp::XAllGather as u16 {
                 // split seams: one gate each (i3)
                 top = top.max(d.i[3] + 1);
@@ -1857,6 +2170,10 @@ fn gate_expectations(blob: &DevBlob, n_gpu: u32, n_xctr: u32) -> Vec<Vec<Option<
                 } else if d.op == DevOp::XReduceTwoShot as u16 {
                     set(d.i[3], Some(n_gpu));
                     set(d.i[4], Some(n_gpu * d.blocks as u32));
+                } else if d.op == DevOp::IndexTpPf as u16 {
+                    set(d.i[5], Some(n_gpu));
+                    set(d.i[5] + 1, Some(n_gpu));
+                    set(d.i[6], Some(n_gpu));
                 } else if d.op == DevOp::XReduceScatter as u16 || d.op == DevOp::XAllGather as u16 {
                     // Both announce with ONE workgroup per rank: their producers are earlier
                     // packets, the gate_rs argument.
@@ -1915,15 +2232,19 @@ mod tests {
 
     #[test]
     fn prefill_capture_is_exact_one_shot_selection() {
-        assert!(!prefill_capture_due(None, 2, 7));
-        let capture = PrefillCapture {
+        assert!(!prefill_capture_due(None, 2, 7, 0));
+        let mut capture = PrefillCapture {
             program: 2,
+            chunk_base: None,
             segment: 7,
             targets: vec![("act.pf.q".into(), "/tmp/q.bin".into())],
         };
-        assert!(prefill_capture_due(Some(&capture), 2, 7));
-        assert!(!prefill_capture_due(Some(&capture), 1, 7));
-        assert!(!prefill_capture_due(Some(&capture), 2, 6));
+        assert!(prefill_capture_due(Some(&capture), 2, 7, 0));
+        assert!(!prefill_capture_due(Some(&capture), 1, 7, 0));
+        assert!(!prefill_capture_due(Some(&capture), 2, 6, 0));
+        capture.chunk_base = Some(65536);
+        assert!(!prefill_capture_due(Some(&capture), 2, 7, 0));
+        assert!(prefill_capture_due(Some(&capture), 2, 7, 65536));
     }
 
     #[test]
@@ -1933,6 +2254,13 @@ mod tests {
         assert_eq!(request.program_t, 8192);
         assert_eq!(request.segment, 17);
         assert_eq!(request.targets.len(), 2);
+        assert_eq!(request.chunk_base, None);
+        assert_eq!(
+            parse_prefill_capture("8192@65536:17:act.q=/tmp/q.bin")
+                .unwrap()
+                .chunk_base,
+            Some(65536)
+        );
 
         for spec in [
             "8192:17:act.pf.q=/tmp/q.bin,act.pf.q=/tmp/q2.bin",
@@ -1941,6 +2269,7 @@ mod tests {
             "8192:17:",
             "8192:x:act.pf.q=/tmp/q.bin",
             "0:17:act.pf.q=/tmp/q.bin",
+            "8192@bad:17:act.pf.q=/tmp/q.bin",
         ] {
             assert!(parse_prefill_capture(spec).is_err(), "accepted {spec:?}");
         }
@@ -2076,7 +2405,7 @@ mod tests {
         };
         let prog = |insts: Vec<DevInst64>| DevProg {
             t: 1,
-            packed_prefill_only: false,
+            role: packet::devbuild::ProgramRole::DecodeRung { rows: 1 },
             n_counter: 0,
             insts,
             stream: Vec::new(),
@@ -2108,6 +2437,7 @@ mod tests {
             sections: Vec::new(),
             gen: Vec::new(),
             tp: None,
+            parent: None,
         };
         assert_eq!(
             count_xgates(&blob),
@@ -2136,5 +2466,12 @@ mod tests {
         let e = gate_expectations(&blob, 4, 11);
         assert_eq!(e[0][2], Some(4));
         assert!(e[0][3..11].iter().all(Option::is_none));
+        let mut index = inst(DevOp::IndexTpPf, 0, 0, 1);
+        index.i[5] = 11;
+        index.i[6] = 13;
+        blob.progs[0].insts.push(index);
+        assert_eq!(count_xgates(&blob), 14);
+        let e = gate_expectations(&blob, 8, 14);
+        assert_eq!(&e[0][11..14], &[Some(8), Some(8), Some(8)]);
     }
 }

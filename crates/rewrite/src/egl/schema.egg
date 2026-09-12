@@ -106,6 +106,10 @@
   (FusedResidualNorm Expr Expr Expr f64)             ; a, b, normw, eps  (add(a,b) then RMSNorm)
   (FusedResidualZeroCenteredNorm Expr Expr Expr f64) ; add(a,b) then zero-centered RMSNorm
   (FusedResidualLayerNorm Expr Expr Expr Expr f64)   ; a, b, normw, normb, eps
+  ; The MoE block boundary: the expert combine (routed + shared) added to the residual stream
+  ; and normed — add(x, add(a, b)) then RMSNorm. The inner add is a distinct materialization
+  ; point in the fused kernel's contract (the combine's bf16 partial the TP all-reduce moves).
+  (FusedResidual3Norm Expr Expr Expr Expr f64)       ; x, a, b, normw, eps
 
   ; GroupNorm + Activation + Conv3d fusion (VAE resnet inner loop).
   (FusedGroupNormActConv3d Expr Expr Expr i64 f64 String Expr String String)

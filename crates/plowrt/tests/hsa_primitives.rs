@@ -117,6 +117,39 @@ fn device_to_device_copy_is_exact() {
 }
 
 #[test]
+fn device_copy_batch_drains_submitted_copies_on_rejection() {
+    if !gpu_enabled() {
+        eprintln!("skipped: set PLOW_GPU_TEST=1 (needs GPU)");
+        return;
+    }
+    let be = backend();
+    const CHUNK: usize = 65536;
+    let pattern: Vec<u8> = (0..3 * CHUNK).map(|i| (i % 251 + 1) as u8).collect();
+    let source = be.alloc(0, pattern.len() as u64).unwrap();
+    let destination = be.alloc(0, pattern.len() as u64).unwrap();
+    be.memcpy_htod(source.base, &pattern).unwrap();
+    let zeros = vec![0; pattern.len()];
+    for rejected in 0..=3 {
+        be.memcpy_htod(destination.base, &zeros).unwrap();
+        let mut pairs: Vec<_> = (0..3).map(|i| {
+            let offset = (i * CHUNK) as u64;
+            (destination.base + offset, source.base + offset, CHUNK as u64)
+        }).collect();
+        if rejected < 3 {
+            // ROCr specifies synchronous INVALID_ARGUMENT for a null destination.
+            pairs[rejected].0 = 0;
+        }
+        let result = be.memcpy_dtod_batch(&pairs);
+        assert_eq!(result.is_err(), rejected < 3);
+        let mut actual = vec![0; pattern.len()];
+        be.download(&destination, 0, &mut actual).unwrap();
+        let copied = rejected * CHUNK;
+        assert_eq!(&actual[..copied], &pattern[..copied]);
+        assert_eq!(&actual[copied..], &zeros[copied..]);
+    }
+}
+
+#[test]
 fn events_order_and_report_elapsed() {
     if !gpu_enabled() {
         eprintln!("skipped: set PLOW_GPU_TEST=1 (needs GPU)");

@@ -99,10 +99,10 @@ pub fn class_of(op: DevOp) -> RowClass {
         // `Embed` gathers rows of the EMBEDDING TABLE by token id — one id per row, no
         // position, no cross-row coupling. It is not a hidden-row gather; `RowGather` is.
         Embed => RowClass::A,
-        Gemm | GemmSmall | GemmMed | GemmWide | GemmC5 | GemmNorm | GemmGlu | GemmSplitK
-        | GemmFp8 | GemmMedFp8 | GemmSmallFp8 | GemmGluFp8 | GemmWideFp8 | GemmC5Fp8
-        | GemmFp8Blk | GemmMxfp4 | GemmMedMxfp4 | GemmSmallMxfp4 | GemmWideMxfp4 | GemmC5Mxfp4
-        | GemmGluMxfp4 | DenseGluFp8Blk => RowClass::A,
+        Gemm | GemmSmall | GemmMed | GemmLtPf | GemmBlkPf | GemmWide | GemmC5 | GemmNorm | GemmGlu
+        | GemmSplitK | GemmFp8 | GemmMedFp8 | GemmSmallFp8 | GemmGluFp8 | GemmWideFp8
+        | GemmC5Fp8 | GemmFp8Blk | GemmMxfp4 | GemmMedMxfp4 | GemmSmallMxfp4 | GemmWideMxfp4
+        | GemmC5Mxfp4 | GemmGluMxfp4 | DenseGluFp8Blk => RowClass::A,
         Gemv | GemvSz | GemvGlu | GemvGluSz | GemvArgmax | GemvQkv | GemvQkvg | GemvF32
         | GemvFp8 | GemvGluFp8 | GemvFp8Blk | GemvQkvFp8 | GemvMxfp4 | GemvGluMxfp4
         | GemvQkvMxfp4 => RowClass::A,
@@ -118,7 +118,7 @@ pub fn class_of(op: DevOp) -> RowClass {
         MoeRouter | MoeRouterTopk | MoeRouterTopkPf | MoeAlignPf | MoeExpertGlu | MoeExpertDown
         | MoeCombine | MoeCombinePf | MoeGroupGluPf | MoeGroupDownPf | MoeExpertGluFp8Blk
         | MoeExpertDownFp8Blk | MoeGroupGluFp8Blk | MoeGroupDownFp8Blk | MoeGluMx | MoeDownMx
-        | MoeGluMxPf | MoeDownMxPf => RowClass::A,
+        | MoeGluMxPf | MoeDownMxPf | MoeAiterFp8Pf => RowClass::A,
         MoeRouterGemma
         | MoeRouterGemmaScore
         | MoeRouterGemmaScoreFast
@@ -191,7 +191,7 @@ pub fn class_of(op: DevOp) -> RowClass {
         // wrong for every row outside the last span, with no trap — and DSA already needs its
         // own capability marker because a legal packet otherwise runs dense and ignores `t7`.
         IndexScore | IndexScorePf | IndexScoreKpool | IndexSelect | IndexSelectPf
-        | IndexUnionPf | DsaPoolExpand | DsaPoolCompress => RowClass::C,
+        | IndexUnionPf | IndexTpPf | DsaPoolExpand | DsaPoolCompress => RowClass::C,
 
         // ---- D: per-sequence carried state -------------------------------------------------
         // Operand shapes with no request axis at all: `state`/`outstate` `[1, HV, V, K]`,

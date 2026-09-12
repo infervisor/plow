@@ -185,7 +185,7 @@ pub fn build_digests(build: &kernelcaps::BuildId) -> Digests {
     }
 }
 
-/// Render an op case key for storage: `m,n,k,variant,bm,bn,bk`.
+/// Render an op case key for storage: `m,n,k,variant,bm,bn,bk,split_k`.
 ///
 /// Public so a tuning campaign files records under the same key the compiler
 /// looks them up by. The **variant** is in the key because a bf16 and an fp8
@@ -195,14 +195,15 @@ pub fn build_digests(build: &kernelcaps::BuildId) -> Digests {
 pub fn case_key(q: &GemmQuery, t: TileShape) -> String {
     let g = q.shape;
     format!(
-        "{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{}",
         g.m,
         g.n,
         g.k,
         q.variant(),
         t.bm,
         t.bn,
-        t.bk
+        t.bk,
+        t.split_k,
     )
 }
 
@@ -215,7 +216,8 @@ fn kernel_serves(k: &kernelcaps::KernelSpec, q: &GemmQuery) -> bool {
     use kernelcaps::QuantScheme::*;
     match q.variant() {
         "bf16" => k.quant == None,
-        "fp8" | "fp8fp8" => matches!(k.quant, W8A16 | W8A8),
+        "fp8" => k.quant == W8A16,
+        "fp8fp8" => k.quant == W8A8,
         "w4a8" => matches!(k.quant, W4A8 | BlockFp8),
         "fp4" => matches!(k.quant, Fp4 | Mxfp4),
         _ => false,
@@ -477,14 +479,20 @@ mod tests {
 
     /// The key the compiler looks up must be the key a campaign writes.
     #[test]
-    fn case_key_carries_shape_and_variant() {
+    fn case_key_carries_shape_variant_and_split_k() {
         assert_eq!(
             case_key(&bf16(shape()), tile(128, 128, 32)),
-            "4096,4096,4096,bf16,128,128,32"
+            "4096,4096,4096,bf16,128,128,32,1"
         );
         assert_eq!(
             case_key(&fp8(shape()), tile(128, 128, 32)),
-            "4096,4096,4096,fp8,128,128,32"
+            "4096,4096,4096,fp8,128,128,32,1"
+        );
+        let mut split = tile(128, 128, 32);
+        split.split_k = 8;
+        assert_eq!(
+            case_key(&bf16(shape()), split),
+            "4096,4096,4096,bf16,128,128,32,8"
         );
     }
 
@@ -505,6 +513,22 @@ mod tests {
         assert_eq!(k.quant, QuantScheme::None);
         assert!(kernel_serves(&k, &bf16(shape())));
         assert!(!kernel_serves(&k, &fp8(shape())));
+    }
+
+    #[test]
+    fn fp8_kernel_matching_preserves_activation_dtype() {
+        let w8a16 = fp8(shape());
+        let w8a8 = GemmQuery {
+            activation_elem: 1,
+            ..w8a16
+        };
+        let mut k = KernelSpec::gemm_tile(DevOp::GemmFp8, IsaLevel::Sm90a, 128, 128, 32, "b");
+        k.quant = QuantScheme::W8A16;
+        assert!(kernel_serves(&k, &w8a16));
+        assert!(!kernel_serves(&k, &w8a8));
+        k.quant = QuantScheme::W8A8;
+        assert!(kernel_serves(&k, &w8a8));
+        assert!(!kernel_serves(&k, &w8a16));
     }
 
     #[test]

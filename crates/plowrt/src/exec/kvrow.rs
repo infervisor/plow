@@ -232,6 +232,7 @@ pub(crate) enum RowField {
 pub(crate) const PREFILL_ROW_FIELDS: &[(DevOp, RowField)] = &[
     (DevOp::Embed, RowField::Rows(0)),
     (DevOp::RmsNorm, RowField::Rows(0)),
+    (DevOp::LayerNorm, RowField::Rows(0)),
     (DevOp::HeadNormRope, RowField::Rows(0)),
     (DevOp::HeadNormRopeFp8, RowField::Rows(0)),
     (DevOp::Residual, RowField::RowsTimes(0)),
@@ -258,6 +259,10 @@ pub(crate) const PREFILL_ROW_FIELDS: &[(DevOp, RowField)] = &[
     (DevOp::PerLayerInput, RowField::Rows(0)),
     (DevOp::FlashMlaPrefill, RowField::Rows(4)),
     (DevOp::FlashMlaPrefillFp8, RowField::Rows(4)),
+    // The union header and causal query bases must use the same row count as flash.
+    (DevOp::IndexScorePf, RowField::Rows(0)),
+    (DevOp::IndexSelectPf, RowField::Rows(0)),
+    (DevOp::IndexUnionPf, RowField::Rows(0)),
     (DevOp::MlaMergeFold, RowField::Rows(0)),
     (DevOp::MoeRouterTopkPf, RowField::Rows(4)),
     (DevOp::MoeAlignPf, RowField::Rows(0)),
@@ -361,6 +366,11 @@ pub(crate) fn rebase_chunk_rows(
         let Some(t) = bucket.filter(|&t| t > 0 && clen < t) else {
             continue;
         };
+        // A sequence-parallel band packet (`<base>@band<T>` output) covers this rank's fixed
+        // `T/tp` rows, not a prefix of the bucket; shrinking it would drop live band rows.
+        if names.get(d.t[0] as usize).is_some_and(|n| n.contains("@band")) {
+            continue;
+        }
         match prefill_row_field(op) {
             Some(RowField::Rows(f)) if d.i[f] == t => d.i[f] = clen,
             Some(RowField::RowsTimes(f)) if d.i[f] > 0 && d.i[f] % t == 0 => {

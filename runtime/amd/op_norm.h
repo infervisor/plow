@@ -132,6 +132,11 @@ __device__ __forceinline__ float block_max(float v, float* part) {
     return t;
 }
 
+/* -DPLOW_RN_ROWS=R: d_rmsnorm's multi-row arm (R rows of loads in flight per workgroup).
+ * Default 1 = the shipped single-row loop, byte-identical. */
+#ifndef PLOW_RN_ROWS
+#define PLOW_RN_ROWS 1
+#endif
 __device__ void d_rmsnorm(bf16* __restrict__ out, const bf16* __restrict__ x,
                           const bf16* __restrict__ gamma, unsigned rows, unsigned feat,
                           float eps, unsigned out_row0, unsigned slice, unsigned nblk, float* part,
@@ -166,6 +171,54 @@ __device__ void d_rmsnorm(bf16* __restrict__ out, const bf16* __restrict__ x,
         const size_t out_row = out_row0 + row;
 #endif
         const size_t obase = out_row * feat;
+#if PLOW_RN_ROWS > 1
+        /* MULTI-ROW ARM (-DPLOW_RN_ROWS=R): a prefill norm hands each workgroup rows/nblk rows
+         * (27 at T=8192 on 304 CUs) and the fits path below is one dependent HBM round trip per
+         * row -- load, block-reduce, store, next row: 0.12 ms for 200 MB (1.7 TB/s). Issue R
+         * rows' loads before reducing any. Each row still reduces with the identical per-thread
+         * element map (`rn_index`) and the identical `rn_sumsq` tree, so the outputs are
+         * bit-identical; only the row->time assignment moves. Plain rows only: the fused quant
+         * epilogue and the packed-sibling row map keep the single-row path. */
+        if (fits && !xq && out_row0 == 0 && row + (PLOW_RN_ROWS - 1) * nblk < rows
+#if PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS || PLOW_PACKED_PREFILL_DENSE_CONSUMERS
+            && !plow_packed_prefill_enabled(packed) && packed_slot_stride == 0
+#endif
+        ) {
+            constexpr unsigned R = PLOW_RN_ROWS;
+            bf16v8 v[R][rn_vecs], w[rn_vecs];
+#pragma unroll
+            for (int c = 0; c < rn_vecs; c++) {
+                const unsigned i = rn_index(c);
+                w[c] = bf16v8_zero();
+                if (i < feat && gamma) w[c] = ld_glob8(gg + i);
+#pragma unroll
+                for (unsigned r = 0; r < R; r++) {
+                    v[r][c] = bf16v8_zero();
+                    if (i < feat) v[r][c] = ld_glob8(xg + (size_t)(row + r * nblk) * feat + i);
+                }
+            }
+#pragma unroll
+            for (unsigned r = 0; r < R; r++) {
+                const float inv = rsqrtf(rn_ss(rn_sumsq(v[r], part)) / (float)feat + eps);
+                const size_t ob = (size_t)(row + r * nblk) * feat;
+#pragma unroll
+                for (int c = 0; c < rn_vecs; c++) {
+                    const unsigned i = rn_index(c);
+                    if (i < feat) {
+                        bf16v8 o;
+#pragma unroll
+                        for (int j = 0; j < 8; j++) {
+                            const float g = gamma ? bf2f(w[c][j]) : 1.0f;
+                            o[j] = f2bf(bf2f(v[r][c][j]) * inv * g);
+                        }
+                        st_glob8(og + ob + i, o);
+                    }
+                }
+            }
+            row += (R - 1) * nblk;
+            continue;
+        }
+#endif
         if (fits) {
             /* PRODUCE: the row AND its weight, in one burst. Both are issued before anything
              * is waited on, so they cost ONE round trip between them, not one each. */
@@ -518,8 +571,8 @@ __device__ void d_headnorm_rope(bf16* __restrict__ out, const bf16* __restrict__
                    (position & kv_mask)) * hd
                 :
 #elif PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS || PLOW_PACKED_PREFILL_DENSE_CONSUMERS
-            packed_slot_stride && prow.span
-                ? (((size_t)prow.span->slot * nhead + hh) * packed_slot_stride +
+            packed_slot_stride && plow_packed_prefill_addressed(prow)
+                ? (((size_t)plow_packed_prefill_slot(prow) * nhead + hh) * packed_slot_stride +
                    (position & kv_mask)) * hd
                 :
 #endif
@@ -638,8 +691,9 @@ __device__ void d_headnorm_rope_fp8(unsigned char* __restrict__ out, float* __re
          * so both follow the same formula. */
         const size_t row =
 #if PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS || PLOW_PACKED_PREFILL_DENSE_CONSUMERS
-                           packed_slot_stride && prow.span
-                               ? ((size_t)prow.span->slot * nhead + hh) * packed_slot_stride +
+                           packed_slot_stride && plow_packed_prefill_addressed(prow)
+                               ? ((size_t)plow_packed_prefill_slot(prow) * nhead + hh) *
+                                         packed_slot_stride +
                                      (position & kv_mask)
                                :
 #endif

@@ -12,7 +12,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
 use plowrt::config::RuntimeConfig;
 use plowrt::device::{self, Backend};
@@ -581,7 +581,8 @@ impl SelectArgs {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|err| err.exit());
     let filter =
         tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
     let filter_str = format!("{filter}");
@@ -634,6 +635,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 runtime = ?RuntimeConfig::global(),
                 environment = ?runtime_environment(),
                 "resolved serve configuration"
+            );
+            // The REPLAY line, separate from the Debug dump above on purpose: that dump is every
+            // knob at its resolved value plus every ambient PLOW_* var (PLOW_HIPCC, PLOW_NVCC,
+            // toolchain paths), which records the machine rather than the decision. This one is
+            // only what this serve chose away from the tree's defaults, in the spelling that sets
+            // it again — greppable out of a log a campaign already keeps.
+            tracing::info!(
+                replay = ?plowrt::config::serve_replay(&matches),
+                "serve replay — the runtime half of build.json's emit_config.replay"
             );
             serve(
                 assets,
@@ -2875,10 +2885,11 @@ async fn bringup_runtime(
             // Per-model footprint and TP degree, both from the blob header.
             let granularity = cuda.granularity()?;
             let mut specs: Vec<ModelSpec> = Vec::with_capacity(models.len());
-            for (slug, dir, _) in &models {
-                let plan = plowrt::serve::manager::BlobPlan::from_dir_with_granularity(
+            for (slug, dir, checkpoint) in &models {
+                let plan = plowrt::serve::manager::BlobPlan::from_dir_with_device(
                     dir,
-                    Some(granularity),
+                    Some((granularity, cuda.compute_capability())),
+                    Some(checkpoint),
                 )?;
                 specs.push(ModelSpec {
                     slug: slug.clone(),

@@ -158,7 +158,7 @@ if [ -n "$REQUIRED_MARKER" ]; then
         fail "$OUT does not advertise $REQUIRED_MARKER"
 fi
 PACKED_MLA=0; PACKED_MLA_NORM=0; PACKED_MLA_FLASH=0; PACKED_KDA=0; KDA_CHUNK=0; KDA_QPRE=0
-K3=0; MLA=0; HIER=0; L2=0; GQ=0; DECODE=0
+K3=0; MLA=0; HIER=0; L2=0; GQ=0; DECODE=0; TOKEN_BATCH=0
 for arg in "$@"; do
     case "$arg" in
         -DPLOW_PACKED_PREFILL_CONSUMERS=1) PACKED_MLA=1; PACKED_KDA=1 ;;
@@ -174,8 +174,17 @@ for arg in "$@"; do
         -DPLOW_L2_PLACE_DISPATCH=1) L2=1 ;;
         -DPLOW_GLOBAL_QUEUE=1) GQ=1 ;;
         -DPLOW_BUCKET_DECODE=1) DECODE=1 ;;
+        -DPLOW_TOKEN_BATCH=1) TOKEN_BATCH=1 ;;
     esac
 done
+if [ "$TOKEN_BATCH" = 1 ]; then
+    for marker in plow_token_batch_1 plow_token_batch_dense_gqa_1 \
+                  plow_token_batch_combined_m_1 plow_token_batch_span_attn_1 \
+                  plow_mixed_dynamic_rows_1 plow_mixed_step_bf16_1 \
+                  plow_mixed_gemm_glu_1 plow_mixed_prefill_split_1; do
+        grep -qE "OBJECT .* ${marker}\$" <<<"$SYMS" || fail "$OUT is missing $marker"
+    done
+fi
 if [ "$HIER" = 1 ] && { [ "$L2" != 1 ] || [ "$GQ" != 1 ] || [ "$DECODE" != 1 ]; }; then
     fail "$OUT enables PLOW_GATE_HIER outside a decode GQ object with L2-domain dispatch"
 fi
@@ -234,8 +243,9 @@ elif grep -qE "OBJECT .* plow_packed_prefill_kda_chunk_segments_1\$" <<<"$SYMS";
 fi
 
 rm -f "$CO"
+# On CDNA, metadata vgpr_count already includes the accumulator subset.
 printf '{\n  "schema": 1,\n  "arch": "%s",\n  "kernel": "%s",\n  "object_bytes": %s,\n  "vgpr": %s,\n  "agpr": %s,\n  "total_registers": %s,\n  "sgpr": %s,\n  "occupancy_waves_per_simd": %s,\n  "vgpr_spill": %s,\n  "sgpr_spill": %s,\n  "private_segment_bytes": %s,\n  "group_segment_bytes": %s,\n  "wavefront_size": %s,\n  "max_workgroup_size": %s,\n  "contract": {"max_total_registers": %s, "min_occupancy_waves_per_simd": %s},\n  "accepted": true\n}\n' \
-    "$ARCH" "$SYM" "$(stat -c%s "$OUT")" "$MV" "$MA" "$((MV + MA))" "$MSG" \
+    "$ARCH" "$SYM" "$(stat -c%s "$OUT")" "$MV" "$MA" "$MV" "$MSG" \
     "$O" "$S" "$MSP" "$MP" "$MLDS" "$MW" "$MWG" "$MAXREG" "$MINOCC" \
     >"${CERT}.tmp"
 mv "${CERT}.tmp" "$CERT"

@@ -40,3 +40,20 @@ fn derived_chunk_satisfies_the_wrap_invariant() {
         );
     }
 }
+
+/// `plow_asset::extension::kv_ring_rows` MIRRORS this one: the loader applies the extension
+/// contract's rule 4 with no compiler in the build, so it cannot call `devgen`. The two are
+/// pinned together here rather than trusted to stay in step — a loader that sized the ring
+/// differently would admit exactly the extension that wraps a chunk onto its own history.
+#[test]
+fn extension_kv_ring_rows_mirrors_devgen() {
+    for w in [1u32, 128, 512, 768, 1024, 2048, 4096, 8192, 16384] {
+        for c in [1u32, 512, 1024, 2048, 4096, 8192, 16384] {
+            assert_eq!(
+                kv_ring_rows(w, c),
+                plow_asset::extension::kv_ring_rows(w, c),
+                "window {w} chunk {c}"
+            );
+        }
+    }
+}

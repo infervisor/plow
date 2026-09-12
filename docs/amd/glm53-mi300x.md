@@ -66,6 +66,16 @@ VLLM_ROCM_LIB=/opt/rocm/core-7.14/lib build-gemma31/vllm-python \
 # objects (no GPU)
 nix develop --command bash -c 'PLOW_DECODE_BATCH=4 JOBS=24 \
   bash scripts/build_gfx942.sh /app/plow/build-glm53/hsaco'
+# ...or, once the packet exists, FROM the packet: `PLOW_HSACO_CONFIG=<assets dir>` reads the
+# `plow_config.h` plowc writes beside model.pkt, stamps every object with the packet's pairing
+# hash (plowrt refuses a stamped object against any other packet), and derives the decode
+# batch/walk, the low-rung tiers from the decode ladder, the packed-family rows and their `_tb`
+# twins (for a packet with token-batch body programs), and the opt-in arms
+# `backends.gfx942.requires` names (PLOW_DSA_PF, PLOW_MOE_PF_*, ...) instead of taking them
+# from the environment. An env var that would build an object the loader refuses by name (a
+# GM_BM that disagrees with the packet, a narrower decode batch) fails the build instead.
+nix develop --command bash -c 'PLOW_HSACO_CONFIG=/app/plow/build-glm53/tp4 JOBS=24 \
+  bash scripts/build_gfx942.sh /app/plow/build-glm53/hsaco'
 
 # emit, serve, smoke, bench — every GPU process takes a gpulease
 MAXCTX=10240 scripts/glm53_mi300x.sh emit 4
@@ -584,7 +594,8 @@ the dense GEMMs), and above ~16k it is the attention kernel.
 | `PLOW_MLA_PF_SMX=0 PLOW_MLA_PF_QK1=1` | 12 214 ms | +0.16% |
 
 `PF_NS` is the causal KV-split factor and `QK1` is the alternative softmax dedup — the two are
-mutually exclusive (`op_attention.h` refuses the pair) and `SMX` is the CDNA3 default. Neither
+mutually exclusive (`op_attention_common.h` refuses the pair) and `SMX` is the CDNA3 default
+(`op_attention_gfx942.h`). Neither
 moves the number. **The 17%-of-peak attention kernel is not limited by softmax redundancy or by
 KV-split parallelism**, which is worth knowing because both are the obvious first guesses. The
 QK1 object builds at an identical register cliff (VGPR 256, LDS 64560, spill 126), so this is a
