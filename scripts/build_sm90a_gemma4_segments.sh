@@ -11,6 +11,20 @@ for gemma_file in interp_sm90a.cubin interp_sm90a_pf.cubin interp_sm90a_pfseg.cu
 done
 mkdir -p "$gemma_out"
 cp "$gemma_base"/*.cubin "$gemma_out/"
+gemma_config_flags=()
+if [ -n "${PLOW_CUBIN_CONFIG:-}" ]; then
+  test -f "$PLOW_CUBIN_CONFIG" || {
+    echo "missing PLOW_CUBIN_CONFIG: $PLOW_CUBIN_CONFIG" >&2
+    exit 2
+  }
+  gemma_config_dir=$(dirname -- "$PLOW_CUBIN_CONFIG")
+  gemma_config_name=$(basename -- "$PLOW_CUBIN_CONFIG")
+  gemma_config_flags=(
+    -I "$gemma_config_dir"
+    "-DPLOW_CONFIG=\"$gemma_config_name\""
+    -DPLOW_BUCKET_DECODE=0
+  )
+fi
 gemma_flags=(
   -arch=sm_90a -O3 -cubin -Xptxas=-v -I runtime/common -I runtime/nvidia
   -DPLOW_NV_PREFILL=1 -DPLOW_NV_SEGMENTS=1
@@ -42,13 +56,13 @@ for gemma_packed in 0 1; do
       )
     fi
     env -i PATH=/usr/local/cuda/bin:/usr/bin:/bin /usr/local/cuda/bin/nvcc \
-      "${gemma_flags[@]}" "${gemma_role_flags[@]}" "${gemma_padding_flags[@]}" -DPLOW_NV_PACKED_REQUEST="$gemma_packed" \
+      "${gemma_flags[@]}" "${gemma_config_flags[@]}" "${gemma_role_flags[@]}" "${gemma_padding_flags[@]}" -DPLOW_NV_PACKED_REQUEST="$gemma_packed" \
       -o "$gemma_out/interp_sm90a_$gemma_prefix$gemma_role.cubin" runtime/nvidia/interp_sm90a.cu
   done
   # Packed light occupancy needs matching PLOW_SEG_SLICE_ALL=1 packets.
   if [ "$gemma_packed" = 1 ] && { [ "${PLOW_BUILD_FATLITE:-0}" = 1 ] || [ "${PLOW_BUILD_MASKED_PADDING:-0}" = 1 ]; }; then
     env -i PATH=/usr/local/cuda/bin:/usr/bin:/bin /usr/local/cuda/bin/nvcc \
-      "${gemma_flags[@]}" "${gemma_padding_flags[@]}" -DPLOW_NV_PACKED_REQUEST=1 \
+      "${gemma_flags[@]}" "${gemma_config_flags[@]}" "${gemma_padding_flags[@]}" -DPLOW_NV_PACKED_REQUEST=1 \
       -DPLOW_NV_FATLITE="${PLOW_BUILD_FATLITE:-0}" -DPGM90_TMA_STAGES=3 \
       -o "$gemma_out/interp_sm90a_pfpackedseg.cubin" runtime/nvidia/interp_sm90a.cu
   fi
@@ -59,7 +73,7 @@ if [ "${PLOW_BUILD_FA_GQA2_PAIR:-0}" = 1 ]; then
     gemma_gqa2_padding_flags=(-DPLOW_NV_MASKED_PADDING=1)
   fi
   env -i PATH=/usr/local/cuda/bin:/usr/bin:/bin /usr/local/cuda/bin/nvcc \
-    "${gemma_flags[@]}" "${gemma_gqa2_padding_flags[@]}" -DPLOW_NV_PACKED_REQUEST=1 \
+    "${gemma_flags[@]}" "${gemma_config_flags[@]}" "${gemma_gqa2_padding_flags[@]}" -DPLOW_NV_PACKED_REQUEST=1 \
     -DPLOW_NV_FA_ONLY=1 -DPLOW_NV_FA_ONLY_HD256=1 \
     -DPLOW_NV_FA_ONLY_HD256_EXACT=1 -DPLOW_NV_FA_WGITEM=1 \
     -DPLOW_NV_FA_GQA2_PAIR=1 -DPLOW_NV_PACKED_FA_WGMMA=1 \
