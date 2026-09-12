@@ -164,6 +164,35 @@ fn cublaslt_emission_rejects_unloadable_combinations() {
 /// `glm_moe_resident` each assert gfx942 / `tp == 8` / `n_cu == 304` at their emit site, so a
 /// default that fired more widely would turn a working TP1 or MI300A GLM emit into a panic.
 #[test]
+/// The two knobs the combined tier 4 qualified (job `1789228962-combined-t4`, +7.5% out tok/s):
+/// the prefill hipBLASLt groups `o_proj,band,shared` (NOT `router`, review log #65) and the decode
+/// GEMM grouping. Both are recipe defaults on the qualified target only, and both roll back.
+#[test]
+fn glm_qualified_recipe_defaults_the_lt_groups_and_decode_gemm_group() {
+    let _guard = crate::test_env::env_guard();
+    let qualified = |args: &[&str]| {
+        let mut cfg = EmitArgsForTest::try_parse_from(args).unwrap().emit;
+        apply_production_defaults(&mut cfg, emit_capabilities("glm_moe_dsa"), "gfx942", 8, 304);
+        cfg
+    };
+    let cfg = qualified(&["test"]);
+    assert!(cfg.glm_decode_gemm_group());
+    assert_eq!(cfg.glm_gemm_lt_pf_ext_spec(), emit_config::GLM_GEMM_LT_PF_EXT_QUALIFIED);
+    assert!(!cfg.glm_gemm_lt_pf_ext_spec().contains("router"));
+
+    // Not the qualified target: both stay off, so a TP1 or gfx950 emit is unchanged.
+    let mut tp1 = EmitArgsForTest::try_parse_from(["test"]).unwrap().emit;
+    apply_production_defaults(&mut tp1, emit_capabilities("glm_moe_dsa"), "gfx942", 1, 304);
+    assert!(!tp1.glm_decode_gemm_group());
+    assert_eq!(tp1.glm_gemm_lt_pf_ext_spec(), "");
+
+    // Per-knob rollback.
+    let off = qualified(&["test", "--glm-decode-gemm-group=false", "--glm-gemm-lt-pf-ext", ""]);
+    assert!(!off.glm_decode_gemm_group());
+    assert_eq!(off.glm_gemm_lt_pf_ext_spec(), "");
+}
+
+#[test]
 fn glm_production_recipe_defaults_on_only_for_the_qualified_target() {
     let _guard = crate::test_env::env_guard();
     let resolved = |cfg: &emit_config::EmitConfig| {

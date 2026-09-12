@@ -684,6 +684,12 @@ impl RuntimeConfig {
         self.amd.numa_host_pools.unwrap_or(true)
     }
 
+    /// Size a ragged chunk's sequence-parallel seams by its live rows (`PLOW_AMD_RAGGED_SEAMS`).
+    /// Unset → on; `=0` → the seams move the whole bucket whatever the live rows.
+    pub fn amd_ragged_seams(&self) -> bool {
+        self.amd.ragged_seams.unwrap_or(true)
+    }
+
     /// AMD kernarg ring in the GPU's own VRAM through the large BAR (`PLOW_AMD_KERNARG_VRAM`).
     /// Unset → on; `=0` → the host kernarg pool.
     pub fn amd_kernarg_vram(&self) -> bool {
@@ -993,9 +999,10 @@ pub struct AmdRuntimeConfig {
     /// Size a ragged chunk's sequence-parallel seams (`PLOW_GLM_SEQ_PAR`) by its live rows
     /// instead of the bucket: each rank's band becomes `ceil(live / tp)` rows, the
     /// reduce-scatter / all-gather move `tp * band` rows, and the band views are rebound per
-    /// chunk. Only acts under `PLOW_RAGGED_CHUNK` on a packet that carries the seams. Opt-in.
-    #[arg(long = "amd-ragged-seams", env = "PLOW_AMD_RAGGED_SEAMS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub ragged_seams: bool,
+    /// chunk. Only acts under `PLOW_RAGGED_CHUNK` on a packet that carries the seams. Read through
+    /// `RuntimeConfig::amd_ragged_seams`, which supplies the default (on); `=0` is the rollback.
+    #[arg(long = "amd-ragged-seams", env = "PLOW_AMD_RAGGED_SEAMS", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub ragged_seams: Option<bool>,
 
     /// Track the MLA decode's KV-split count from the LIVE `kv_len` instead of
     /// the `max_ctx` the emitter baked it from.
@@ -1462,6 +1469,24 @@ mod tests {
             let matches = command.clone().try_get_matches_from(args).unwrap();
             let cfg = super::RuntimeConfig::from_arg_matches(&matches).unwrap();
             assert_eq!(cfg.amd_numa_host_pools(), want, "{args:?}");
+        }
+    }
+
+    /// Qualified by the combined tier 4 (job `1789228962-combined-t4`): tail chunks −16.0% with
+    /// retrieval 18/18 + 21/21 in every arm. `=0` is the rollback to whole-bucket seams.
+    #[test]
+    fn ragged_seams_default_on_and_false_turns_them_off() {
+        use clap::{Args, FromArgMatches};
+        let command = super::RuntimeConfig::augment_args(clap::Command::new("test"));
+        for (args, want) in [
+            (&["test"][..], true),
+            (&["test", "--amd-ragged-seams=false"][..], false),
+            (&["test", "--amd-ragged-seams=0"][..], false),
+            (&["test", "--amd-ragged-seams"][..], true),
+        ] {
+            let matches = command.clone().try_get_matches_from(args).unwrap();
+            let cfg = super::RuntimeConfig::from_arg_matches(&matches).unwrap();
+            assert_eq!(cfg.amd_ragged_seams(), want, "{args:?}");
         }
     }
 

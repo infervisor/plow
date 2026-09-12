@@ -7065,6 +7065,14 @@ fn apply_production_defaults(
                 emit_config::note_production_default(id, value.to_string());
             }
         }
+        // The one recipe knob that is a group list rather than a bool; the accessor resolves the
+        // same default, so only the record needs it.
+        if cfg.glm_gemm_lt_pf_ext.is_none() {
+            emit_config::note_production_default(
+                "glm_gemm_lt_pf_ext",
+                emit_config::GLM_GEMM_LT_PF_EXT_QUALIFIED.to_string(),
+            );
+        }
     }
 }
 

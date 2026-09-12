@@ -3654,7 +3654,7 @@ pub(crate) fn emit_glm_mla(
     // each next to its siblings so the native GEMMs form two adjacent runs. Same instructions and
     // dependencies as `emit_glm_dsa_decode_select`, which then skips them.
     let (idx_hi, idx_di) = (c.index_heads, c.index_dim);
-    let idx_group = emit_config::active().glm_decode_gemm_group
+    let idx_group = emit_config::active().glm_decode_gemm_group()
         && c.dsa(ctx)
         && w.iwqb != TENSOR_NONE
         && c.index_kpool <= 1
@@ -5216,7 +5216,7 @@ impl GlmLtExt {
 fn glm_lt_pf_ext() -> GlmLtExt {
     let cfg = emit_config::active();
     let mut set = GlmLtExt::default();
-    let spec = cfg.glm_gemm_lt_pf_ext.as_deref().unwrap_or_default();
+    let spec = cfg.glm_gemm_lt_pf_ext_spec();
     for name in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
         match name {
             "1" | "true" => {
@@ -7651,7 +7651,7 @@ fn emit_glm_moe_ffn_rows(
     // PLOW_GLM_DECODE_GEMM_GROUP: the shared gate/up read only `xn2`, so emit them straight after
     // the router GEMM. The three native GEMMs become adjacent (one overlap run under
     // PLOW_AMD_DECODE_GEMM_OVERLAP) and top-k and Glu share one interpreter segment.
-    let pre_gu = (emit_config::active().glm_decode_gemm_group
+    let pre_gu = (emit_config::active().glm_decode_gemm_group()
         && !lin_fp8
         && (rows as u64) * (h as u64) > crate::gm_lds_halves()
         && glm_decode_lt_routes(rows, [imoe_l, h]))

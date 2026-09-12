@@ -52,6 +52,11 @@ use clap::Args;
 /// * rollbacks of promoted defaults (`=0` restores the pre-promotion packet);
 /// * opt-in candidates that still need a network gate;
 /// * diagnostics, `hide = true` — they never ship a packet anyone serves.
+/// The prefill hipBLASLt groups the qualified GLM gfx942 TP8 recipe takes by default. `router` is
+/// excluded: it was the only group that moved the final logits past the cross-process floor
+/// (review log #65), worth about -6.5 ms of the -35 ms per chunk all four groups would give.
+pub const GLM_GEMM_LT_PF_EXT_QUALIFIED: &str = "o_proj,band,shared";
+
 #[derive(Args, Debug, Clone)]
 #[command(next_help_heading = "Emit knobs")]
 pub struct EmitConfig {
@@ -811,8 +816,10 @@ pub struct EmitConfig {
     /// gate/up straight after the router GEMM (so top-k and Glu share one interpreter segment),
     /// and on full-indexer layers the indexer k/weights projections next to q_a/kv_a/k_rope and
     /// its q projection next to q_absorb/q_rope. Same instructions and dependencies, reordered.
-    #[arg(long, env = "PLOW_GLM_DECODE_GEMM_GROUP", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
-    pub glm_decode_gemm_group: bool,
+    /// Unset on the qualified GLM gfx942 TP8 target means ON (`glm_production_defaults`); read
+    /// through [`Self::glm_decode_gemm_group`].
+    #[arg(long, env = "PLOW_GLM_DECODE_GEMM_GROUP", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_decode_gemm_group: Option<bool>,
 
     /// Fuse the seam Residual+Norm into XReduceAddNorm (requires fuse_b1, tp>1).
     #[arg(long, env = "GLM_FUSE_XRN", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
@@ -1239,7 +1246,7 @@ impl EmitConfig {
             glm_seq_par: env_bool_opt("PLOW_GLM_SEQ_PAR"),
             glm_seq_par_proj: env_bool_opt("PLOW_GLM_SEQ_PAR_PROJ"),
             glm_decode_glue_cus: env_bool("PLOW_GLM_DECODE_GLUE_CUS"),
-            glm_decode_gemm_group: env_bool("PLOW_GLM_DECODE_GEMM_GROUP"),
+            glm_decode_gemm_group: env_bool_opt("PLOW_GLM_DECODE_GEMM_GROUP"),
             glm_fuse_xrn: env_bool("GLM_FUSE_XRN"),
             xr_combine_fold: env_opt_out("PLOW_XR_COMBINE_FOLD"),
             kda_fb_fold: env_bool("PLOW_KDA_FB_FOLD"),
@@ -1450,6 +1457,19 @@ impl EmitConfig {
         self.glm_gemm_lt_decode.unwrap_or(self.glm_production_defaults)
     }
 
+    pub fn glm_decode_gemm_group(&self) -> bool {
+        self.glm_decode_gemm_group.unwrap_or(self.glm_production_defaults)
+    }
+
+    /// Which prefill interpreter GEMM groups take the hipBLASLt route. The qualified GLM target
+    /// defaults to `o_proj,band,shared`; `router` is left out because it moved the final logits
+    /// beyond the cross-process floor (review log #65). Empty = the interpreter keeps all of them.
+    pub fn glm_gemm_lt_pf_ext_spec(&self) -> &str {
+        self.glm_gemm_lt_pf_ext
+            .as_deref()
+            .unwrap_or(if self.glm_production_defaults { GLM_GEMM_LT_PF_EXT_QUALIFIED } else { "" })
+    }
+
     /// Only widens [`Self::glm_gemm_lt_decode`]: with that off it changes nothing.
     pub fn glm_gemm_lt_decode_ext(&self) -> bool {
         self.glm_gemm_lt_decode_ext.unwrap_or(self.glm_production_defaults)
@@ -1478,7 +1498,7 @@ impl EmitConfig {
     /// walks to record which of the recipe knobs it actually decided, and to what. Kept beside
     /// the accessors so a knob joining the recipe cannot be added to one list and forgotten in
     /// the other.
-    pub fn glm_recipe_unset(&self) -> [(&'static str, bool, bool); 12] {
+    pub fn glm_recipe_unset(&self) -> [(&'static str, bool, bool); 13] {
         [
             ("glm_fp8_kv", self.glm_fp8_kv.is_none(), self.glm_fp8_kv()),
             ("glm_moe_aiter", self.glm_moe_aiter.is_none(), self.glm_moe_aiter()),
@@ -1496,6 +1516,11 @@ impl EmitConfig {
             ("glm_fold_lt", self.glm_fold_lt.is_none(), self.glm_fold_lt()),
             ("glm_seq_par", self.glm_seq_par.is_none(), self.glm_seq_par()),
             ("glm_seq_par_proj", self.glm_seq_par_proj.is_none(), self.glm_seq_par_proj()),
+            (
+                "glm_decode_gemm_group",
+                self.glm_decode_gemm_group.is_none(),
+                self.glm_decode_gemm_group(),
+            ),
         ]
     }
 

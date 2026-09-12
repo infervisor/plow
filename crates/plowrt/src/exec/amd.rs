@@ -12573,7 +12573,7 @@ impl AmdEngine {
             self.progs[prog].t,
             bucket.or_else(|| self.ragged_bucket(prog)),
         );
-        if let (true, Some(tp)) = (crate::config::RuntimeConfig::get().amd.ragged_seams, self.tp) {
+        if let (true, Some(tp)) = (crate::config::RuntimeConfig::get().amd_ragged_seams(), self.tp) {
             let t = self.progs[prog].t;
             let ragged = bucket.or_else(|| self.ragged_bucket(prog)).is_some_and(|b| clen < b);
             let b = if ragged && t > 1 && t % tp.n_gpu == 0 {
