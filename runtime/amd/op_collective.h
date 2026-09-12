@@ -202,8 +202,10 @@ extern "C" __device__ unsigned plow_xr_rs_u2 = 1;
  * gfx942 (8x MI300X, 8192x6144 two-shot, us): the peak sits lower still and the packet is not
  * re-emitted; PLOW_XR_SCHED_NWG caps the data workgroups inside the 304-workgroup packet. AG_U=1
  * (one all-gather pack per lane) at 8/12/16/20/24/32 data workgroups = 1229/1002/926/817/792/842;
- * the shipped 2-byte loop at 304 = 970. In situ (4-layer TP8 packet, last 8192 chunk) the cap at
- * 24 takes the collective from 1.08 to 0.99 ms. */
+ * the shipped 2-byte loop at 304 = 970. The reduce-scatter wants fewer still (343 us at 8 vs 399
+ * at 24), so PLOW_XR_SCHED_NWG_RS caps it separately: reduce-scatter on 8, all-gather on 24 =
+ * 728 us against 795 for one cap of 24. In situ (4-layer TP8 packet, last 8192 chunk) the single
+ * cap of 24 takes the collective from 1.08 to 0.99 ms. */
 #ifndef PLOW_XR_SCHED_AITER
 #define PLOW_XR_SCHED_AITER 0
 #endif
@@ -243,6 +245,7 @@ extern "C" __device__ unsigned plow_xr_sched_aiter_1 = 1;
     (PLOW_XR_SCHED_NWG > PLOW_XR_SCHED_NWG_RS ? PLOW_XR_SCHED_NWG : PLOW_XR_SCHED_NWG_RS)
 #if PLOW_XR_SCHED_CAP
 extern "C" __device__ unsigned plow_xr_sched_nwg = PLOW_XR_SCHED_NWG;
+extern "C" __device__ unsigned plow_xr_sched_nwg_rs = PLOW_XR_SCHED_NWG_RS;
 #if defined(PLOW_XR_ATTNRES) && PLOW_XR_ATTNRES
 #error "PLOW_XR_SCHED_NWG does not cover the XReduceAttnRes row path"
 #endif
