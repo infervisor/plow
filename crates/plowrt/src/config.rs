@@ -666,6 +666,15 @@ impl RuntimeConfig {
         self.pf_interleave.unwrap_or(0)
     }
 
+    /// AMD long-context tail placement floor (`PLOW_AMD_TAIL_SPARSE_CTX`). Unset → 16384
+    /// rows; `0` → off. Acts only on packets with a sparse (DSA) prefill rung.
+    pub fn amd_tail_sparse_ctx(&self) -> Option<u32> {
+        match self.amd.tail_sparse_ctx.unwrap_or(16384) {
+            0 => None,
+            rows => Some(rows),
+        }
+    }
+
     /// Cross-request prefill packing on CUDA: off unless asked.
     pub fn pf_batch_cuda(&self) -> bool {
         self.pf_batch.unwrap_or(false)
@@ -899,8 +908,9 @@ pub struct AmdRuntimeConfig {
     pub token_batch_solo: bool,
 
     /// Prior-context floor (rows) above which a request's DENSE final chunk is planned into
-    /// the sparse (DSA) prefill bucket instead of the smallest bucket that holds it. Unset =
-    /// off (the tail stays in the smallest bucket). See `serve::engine::retarget_dense_tail`.
+    /// the sparse (DSA) prefill bucket instead of the smallest bucket that holds it; `0` = off
+    /// (the tail stays in the smallest bucket). Read through `RuntimeConfig::amd_tail_sparse_ctx`,
+    /// which supplies the default. See `serve::engine::retarget_dense_tail`.
     #[arg(long = "amd-tail-sparse-ctx", env = "PLOW_AMD_TAIL_SPARSE_CTX", global = true)]
     pub tail_sparse_ctx: Option<u32>,
 
@@ -1378,6 +1388,21 @@ mod tests {
                     .fusion,
                 enabled
             );
+        }
+    }
+
+    #[test]
+    fn tail_sparse_ctx_defaults_on_and_zero_turns_it_off() {
+        use clap::{Args, FromArgMatches};
+        let command = super::RuntimeConfig::augment_args(clap::Command::new("test"));
+        for (args, want) in [
+            (&["test"][..], Some(16384)),
+            (&["test", "--amd-tail-sparse-ctx=0"][..], None),
+            (&["test", "--amd-tail-sparse-ctx=32768"][..], Some(32768)),
+        ] {
+            let matches = command.clone().try_get_matches_from(args).unwrap();
+            let cfg = super::RuntimeConfig::from_arg_matches(&matches).unwrap();
+            assert_eq!(cfg.amd_tail_sparse_ctx(), want);
         }
     }
 

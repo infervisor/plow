@@ -414,7 +414,7 @@ mod amd_serve {
         ) -> Result<Vec<crate::exec::amd::ChunkStep>> {
             let e = self.rank0();
             let mut chunks = e.plan_for_at_most(to.saturating_sub(from), cap)?;
-            if let Some(min_ctx) = crate::config::RuntimeConfig::get().amd.tail_sparse_ctx {
+            if let Some(min_ctx) = crate::config::RuntimeConfig::get().amd_tail_sparse_ctx() {
                 let sparse = e
                     .prefill_rungs()
                     .filter(|&(prog, width)| width <= cap && e.prefill_prog_sparse(prog))
