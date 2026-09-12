@@ -3482,3 +3482,47 @@ fn glm_seq_par_proj_moves_the_entry_projections_onto_the_band() {
         assert_eq!(v.bytes, tb as u64 * rows as u64 * 2, "{}", v.name);
     }
 }
+
+/// `PLOW_GLM_SEQ_PAR_PROJ` on a MoE layer: the router score and top-k run on the band and the
+/// route table is gathered (slot 5) before the full-T align.
+#[test]
+fn glm_seq_par_proj_routes_on_the_band() {
+    let _guard = crate::test_env::env_guard();
+    let _target = crate::EmitAmdGuard::set(true);
+    let _env = crate::test_env::EnvScope::set(&[
+        ("PLOW_GLM_SEQ_PAR", "1"),
+        ("PLOW_GLM_SEQ_PAR_PROJ", "1"),
+        ("PLOW_GLM_MOE_AITER", "1"),
+        ("PLOW_GLM_FP8_KV", "1"),
+        ("PLOW_UNISEG", "0"),
+    ]);
+    let mut c = glm_ref_cfg();
+    c.tp = 8;
+    let (ctx, t, tp) = (81920u32, 8192u32, 8u32);
+    let tb = t / tp;
+    let mut decl = Builder::new(304);
+    let n = declare_glm_rows_batched(&mut decl, &c, ctx, &[3], t, 1, MoeEnc::Fp8Blk);
+    let mut b = Builder::new(304);
+    b.adopt_tensors(decl.tensors());
+    let all = b.all();
+    let mut xgate = 0;
+    let c_rn2 = emit_glm_mla_prefill(&mut b, &c, &n, 0, ctx, t, MoeEnc::Fp8Blk, n.x, &[], false,
+        &mut xgate, &all, None);
+    emit_glm_moe_ffn_prefill(&mut b, &c, &n, 0, t, MoeEnc::Fp8Blk, n.xnext, c_rn2, &mut xgate,
+        &all, false);
+    let p = b.finish();
+    let name = |h: u32| p.tensors[h as usize].name.as_str();
+    let is = |d: &crate::DevInst, op: DevOp| d.op == op as u16;
+    let router = p.insts.iter().find(|d| is(d, DevOp::MoeRouterTopkPf)).unwrap();
+    assert_eq!(router.i[4], tb);
+    assert!(name(router.t[0]).ends_with("@band8192.rt"));
+    assert!(name(router.t[1]).ends_with("@band8192"));
+    let score = p.insts.iter().find(|d| d.t[0] == router.t[1]).unwrap();
+    assert_eq!(score.i[0], tb);
+    assert_eq!(name(score.t[1]), "act.xn2@band8192");
+    let ag: Vec<_> = p.insts.iter().filter(|d| is(d, DevOp::XAllGather)).collect();
+    assert_eq!(ag.len(), 3, "entry projections, post-attention norm, route table");
+    assert_eq!((ag[2].t[0], ag[2].i[0], ag[2].i[5]), (n.tab, t * c.top_k * 4, 5 * n.slot_b));
+    assert!(p.insts.iter().filter(|d| is(d, DevOp::MoeAlignPf)).all(|d| d.i[0] == t));
+    assert_eq!(p.insts.iter().filter(|d| is(d, DevOp::XReduceScatter)).count(), 2);
+}

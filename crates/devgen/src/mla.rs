@@ -6422,7 +6422,7 @@ fn emit_glm_moe_ffn_prefill(
 
     // 15a router SCORE: the [T, n_exp] logit matrix is an ordinary tiled GEMM — the router split's
     //     decode half was already "the ordinary multi-CU GEMV", and this is its T-row twin.
-    let c_score = gemm(b, n.rlogit, n.xn2, w.wr, w.wr_s, e, h, &[c_rn2]);
+    //     Emitted below, once `det` is known (the band router needs it off).
     // 15b router TOP-K tail, block-per-token. Bit-identical PER TOKEN to the decode tail (the kernel
     //     is literally that kernel under a token loop), so the 8-of-384 selection a prefill chunk
     //     makes is the selection decode would have made for the same row.
@@ -6456,10 +6456,36 @@ fn emit_glm_moe_ffn_prefill(
     let (e_all, tk_all) = (e + u32::from(fold), tk + u32::from(fold));
     let det = !native_moe && moe_pf_fuse(tk) == MoePfFuse::Det;
     let align_par = emit_config::active().moe_align_par && t >= 1024;
-    let router_blocks: Vec<_> = (0..t.min(n_cu)).collect();
+    // PLOW_GLM_SEQ_PAR_PROJ: score and top-k on the owned band, then gather the route table out
+    // of peer slot 5 (free between this layer's attention reduce-scatter and the next layer's
+    // input seam). Needs `!det`: the det prologue zeroes an accumulator over all T rows.
+    let band_router =
+        tp > 1 && !raw_output && !det && n.ug_tp != TENSOR_NONE && glm_sp(c, n, b, t);
+    let (tr, rlogit, tab, c_score) = if band_router {
+        let tb = t / tp;
+        let xb = glm_band(b, n.xn2, t, tp, h as u64 * 2);
+        let lb = glm_band(b, n.rlogit, t, tp, e as u64 * 2);
+        let op = glm_prefill_projection_op(c, tb, e, h, n_cu, mxfp4_quant(enc));
+        let cs = b.emit(op, all.clone(), &[c_rn2], |d| {
+            d.t[0] = lb;
+            d.t[1] = xb;
+            d.t[2] = w.wr;
+            if enc == MoeEnc::Mxfp4 {
+                d.t[3] = w.wr_s;
+            }
+            d.i[0] = tb;
+            d.i[1] = e;
+            d.i[2] = h;
+        });
+        let tab_b = glm_band_as(b, n.rt_tp, t, tp, tk_all as u64 * 8, ".rt");
+        (tb, lb, tab_b, cs)
+    } else {
+        (t, n.rlogit, n.tab, gemm(b, n.rlogit, n.xn2, w.wr, w.wr_s, e, h, &[c_rn2]))
+    };
+    let router_blocks: Vec<_> = (0..tr.min(n_cu)).collect();
     let c_router = b.emit(DevOp::MoeRouterTopkPf, router_blocks, &[c_score], |d| {
-        d.t[0] = n.tab;
-        d.t[1] = n.rlogit;
+        d.t[0] = tab;
+        d.t[1] = rlogit;
         d.t[3] = w.bias;
         if det {
             d.t[2] = n.part;
@@ -6468,7 +6494,7 @@ fn emit_glm_moe_ffn_prefill(
         d.i[1] = e;
         d.i[2] = tk;
         d.i[3] = GLM_ROUTER_FLAGS;
-        d.i[4] = t;
+        d.i[4] = tr;
         // PLOW_GLM_MOE_SHARED_FOLD: the table stride becomes k+1 slots per token and the tail
         // slot is written `{expert n_exp, gate 1.0}`. The SELECTION is untouched — the same
         // top-k over the same n_exp logits, so a folded and an unfolded packet route every token
@@ -6481,6 +6507,13 @@ fn emit_glm_moe_ffn_prefill(
         d.i[7] = c.topk_group;
         d.f[0] = c.route_scale;
     });
+    // 8-byte table entries gathered as bf16 pairs: each rank's slice is still its band's rows.
+    let c_router = if band_router {
+        let pairs = [(n.tab, t * tk_all * 4, 5 * n.slot_b)];
+        crate::emit_xall_gather(b, xgate, xr_cus, &[c_router], &pairs, tp)
+    } else {
+        c_router
+    };
     let align = |b: &mut Builder, blocks: Vec<u32>, deps: &[u32], phase: u32| {
         b.emit(DevOp::MoeAlignPf, blocks, deps, |d| {
             d.t[0] = n.meta;
