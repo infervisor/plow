@@ -3052,6 +3052,10 @@ fn run_one_tick(
                     let dec_ms = t.elapsed().as_secs_f64() * 1e3;
                     obs.slo.cost.observe_decode(feeds.len() as u32, did_prefill, dec_ms);
                     obs.slo.cost.observe_host(t0.elapsed().as_secs_f64() * 1e3 - slo_pf_ms - dec_ms);
+                    if let Some(o) = obs.slo.last.take().filter(|o| o.predicted_ms > 0.0) {
+                        let ratio = t0.elapsed().as_secs_f64() * 1e3 / o.predicted_ms;
+                        obs.slo.cost.observe_margin(o.class, ratio);
+                    }
                 }
             }
             match step_result {
@@ -3501,9 +3505,11 @@ fn amd_slo_plan(
             })
             .collect();
         eprintln!(
-            "SLOPLAN budget={:.1} pred={:.1} progress={} k={} decode_rows={} waiting={} launches=[{}]",
+            "SLOPLAN budget={:.1} pred={:.1} margin={:.3} class={:?} progress={} k={} decode_rows={} waiting={} launches=[{}]",
             outcome.budget_ms,
             outcome.predicted_ms,
+            outcome.margin,
+            outcome.class,
             outcome.progress,
             outcome.k,
             plan.decodes.len(),
@@ -3512,6 +3518,7 @@ fn amd_slo_plan(
         );
     }
     state.ladder = Some(ladder);
+    state.last = Some(outcome);
     plan
 }
 

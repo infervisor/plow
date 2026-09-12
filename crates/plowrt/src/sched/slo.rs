@@ -19,7 +19,9 @@
 //! [`Ladder::bucket_for`] mirrors: the smallest rung that holds `n`, moved to the sparse rung at
 //! its real row count when the prior context reaches `amd_tail_sparse_ctx`.
 //!
-//! Costs come from [`TickCost`], an online model updated from every observed tick.
+//! Costs come from [`TickCost`], an online model updated from every observed tick. The target is
+//! met on an upper quantile, not the mean: each tick's prediction is inflated by the running p90
+//! of actual / predicted for its [`TickClass`] (plain, completing a prompt, starting one).
 //! Unset targets never reach this module: [`plan_tick`] returns [`step::plan`] verbatim.
 //!
 //! Under a target the plan uses isolated launches only; cross-request packing is not used
@@ -86,6 +88,46 @@ pub trait CostModel {
     fn decode_ms(&self, rows: u32, after_prefill: bool) -> f64;
     /// Tick time outside the launches and the decode pass.
     fn host_ms(&self) -> f64;
+    /// What a tick of `class` is planned against: an upper quantile of actual / predicted.
+    fn margin(&self, _class: TickClass) -> f64 {
+        1.0
+    }
+}
+
+/// A tick by its riskiest launch, for the planning margin. The tail of the model's error is
+/// concentrated in ticks that start a request (its cursor build) or complete one (the token read
+/// and the prefix publish); ordinary middle chunks are within a few percent.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TickClass {
+    #[default]
+    Plain,
+    Completing,
+    Fresh,
+}
+
+/// Streaming quantile with multiplicative, scale-free steps: at equilibrium `P(x > q) = 1 - tau`.
+#[derive(Clone, Copy, Debug)]
+pub struct Quantile {
+    q: f64,
+    tau: f64,
+    eta: f64,
+}
+
+impl Quantile {
+    pub fn new(q: f64, tau: f64, eta: f64) -> Self {
+        Self { q, tau, eta }
+    }
+
+    pub fn observe(&mut self, x: f64) {
+        if !(x.is_finite() && x > 0.0) {
+            return;
+        }
+        self.q *= if x > self.q { (self.eta * self.tau).exp() } else { (-self.eta * (1.0 - self.tau)).exp() };
+    }
+
+    pub fn get(&self) -> f64 {
+        self.q
+    }
 }
 
 /// Recursive least squares with exponential forgetting. The prior is `theta`; the covariance
@@ -190,12 +232,21 @@ pub struct TickCost {
     decode: [Rls<DECODE_DIM>; 2],
     fresh_ms: f64,
     host_ms: f64,
+    /// p90 of actual / predicted tick, per [`TickClass`]; fresh ticks are rare, so step faster.
+    margins: [Quantile; 3],
 }
 
 impl Default for TickCost {
     fn default() -> Self {
         let decode = |i: usize| Rls::new(DECODE_PRIOR[i], DECODE_PRIOR_SD, 10.0, 0.98);
-        Self { launches: Vec::new(), decode: [decode(0), decode(1)], fresh_ms: 0.0, host_ms: 0.0 }
+        let q = |eta| Quantile::new(1.0, 0.9, eta);
+        Self {
+            launches: Vec::new(),
+            decode: [decode(0), decode(1)],
+            fresh_ms: 0.0,
+            host_ms: 0.0,
+            margins: [q(0.1), q(0.1), q(0.3)],
+        }
     }
 }
 
@@ -241,6 +292,11 @@ impl TickCost {
         self.decode[i].update(&decode_x(rows), ms);
     }
 
+    /// One planned tick of `class` ran `ratio` times its (raw) prediction.
+    pub fn observe_margin(&mut self, class: TickClass, ratio: f64) {
+        self.margins[class as usize].observe(ratio);
+    }
+
     pub fn observe_host(&mut self, ms: f64) {
         let capped = ms.max(0.0).min(3.0 * self.host_ms + 5.0);
         self.host_ms = 0.9 * self.host_ms + 0.1 * capped;
@@ -273,6 +329,10 @@ impl CostModel for TickCost {
     fn host_ms(&self) -> f64 {
         self.host_ms
     }
+
+    fn margin(&self, class: TickClass) -> f64 {
+        self.margins[class as usize].get().clamp(0.8, 4.0)
+    }
 }
 
 /// Per-dispatcher SLO state carried across ticks.
@@ -283,6 +343,8 @@ pub struct SloState {
     pub skipped: u32,
     /// The engine's prefill ladder, read once.
     pub ladder: Option<Ladder>,
+    /// The last plan's outcome, until its tick is observed.
+    pub last: Option<SloOutcome>,
 }
 
 /// A prefill candidate as the SLO planner sees it.
@@ -300,6 +362,16 @@ pub struct SloCandidate {
 impl SloCandidate {
     fn fresh(&self) -> bool {
         !self.base.planned
+    }
+
+    fn class(&self, rows: u32) -> TickClass {
+        if self.fresh() {
+            TickClass::Fresh
+        } else if rows >= self.remaining {
+            TickClass::Completing
+        } else {
+            TickClass::Plain
+        }
     }
 
     /// The most rows this tick may give it: its planned chunk, or for a fresh request what the
@@ -329,6 +401,9 @@ pub struct SloOutcome {
     pub progress: bool,
     /// The progress rule's `K` when it applied this tick.
     pub k: u32,
+    /// The tick's class and the margin it was planned against.
+    pub class: TickClass,
+    pub margin: f64,
 }
 
 /// Plan one tick. Unset targets return [`step::plan`] verbatim.
@@ -361,14 +436,20 @@ pub fn plan_tick(
         }
     };
     let binding = !decodes.is_empty() && targets.tbt_ms.is_some();
-    let slack_ms = targets.tbt_ms.map_or(f64::INFINITY, |t| t - fixed_ms(true));
-    let mut outcome = SloOutcome {
-        budget_ms: if binding { slack_ms } else { f64::INFINITY },
-        ..SloOutcome::default()
+    let target = targets.tbt_ms.unwrap_or(f64::INFINITY);
+    // Raw prefill ms a tick of `class` may still spend: the target holds on the class's upper
+    // quantile of actual / predicted, not on the mean prediction.
+    let room = |class: TickClass, spent: f64| {
+        if binding {
+            target / cost.margin(class) - fixed_ms(true) - spent
+        } else {
+            f64::INFINITY
+        }
     };
+    let mut outcome = SloOutcome { budget_ms: room(TickClass::Plain, 0.0), ..SloOutcome::default() };
     let order = order(targets, tick, candidates, ladder, cost, full_budget);
     let mut launches = Vec::new();
-    let mut left_ms = outcome.budget_ms;
+    let mut class = TickClass::Plain;
     let mut left_rows = full_budget;
     let mut spent_ms = 0.0;
     for &i in &order {
@@ -376,18 +457,18 @@ pub fn plan_tick(
         if left_rows == 0 {
             break;
         }
-        let max_rows = c.max_rows(full_budget);
+        let whole = c.max_rows(full_budget);
         let rows = if binding {
-            rows_within(c, max_rows.min(left_rows), left_ms, ladder, cost)
+            let max_rows = whole.min(left_rows);
+            rows_within(c, max_rows, room(class.max(c.class(max_rows)), spent_ms), ladder, cost)
         } else {
             // No target binds: a planned chunk runs whole or waits, as in `step::plan`.
-            (max_rows <= left_rows && max_rows > 0).then_some(max_rows)
+            (whole <= left_rows && whole > 0).then_some(whole)
         };
         let Some(rows) = rows else { continue };
-        let ms = launch_cost(c, rows, ladder, cost);
-        spent_ms += ms;
-        left_ms -= ms;
+        spent_ms += launch_cost(c, rows, ladder, cost);
         left_rows -= rows;
+        class = class.max(c.class(rows));
         launches.push(launch(c, rows));
     }
     if binding && launches.is_empty() {
@@ -396,12 +477,14 @@ pub fn plan_tick(
             let max_rows = c.max_rows(full_budget);
             let min_rows = ladder.granule().min(max_rows).max(1);
             let p_min = launch_cost(c, min_rows, ladder, cost);
-            let k = progress_k(p_min, slack_ms);
+            let slack = room(c.class(min_rows), 0.0);
+            let k = progress_k(p_min, slack);
             outcome.k = k;
             if *skipped + 1 >= k {
-                let budget = (f64::from(k) * slack_ms).max(p_min);
+                let budget = (f64::from(k) * slack).max(p_min);
                 let rows = rows_within(c, max_rows, budget, ladder, cost).unwrap_or(min_rows);
                 spent_ms = launch_cost(c, rows, ladder, cost);
+                class = c.class(rows);
                 launches.push(launch(c, rows));
                 outcome.progress = true;
             }
@@ -412,6 +495,8 @@ pub fn plan_tick(
     } else {
         *skipped = 0;
     }
+    outcome.class = class;
+    outcome.margin = cost.margin(class);
     outcome.predicted_ms = spent_ms + fixed_ms(!launches.is_empty());
     let prefill: u32 = launches.iter().map(Launch::rows).sum();
     (
@@ -793,6 +878,66 @@ mod tests {
     }
 
     #[test]
+    fn the_upper_quantile_tracks_p90_and_a_margin_shrinks_the_chunk() {
+        let mut q = Quantile::new(1.0, 0.9, 0.02);
+        let mut x = 12345u64;
+        let mut above = 0;
+        for i in 0..60_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let sample = 1.0 + (x >> 11) as f64 / (1u64 << 53) as f64;
+            if i >= 10_000 && sample > q.get() {
+                above += 1;
+            }
+            q.observe(sample);
+        }
+        // U[1, 2): p90 = 1.9. The tracker jitters by about eta * q around it; what the planner
+        // relies on is the coverage, one sample in ten above the margin.
+        assert!((q.get() - 1.9).abs() < 0.06, "p90 of U[1,2) is 1.9, got {}", q.get());
+        let share = f64::from(above) / 50_000.0;
+        assert!((share - 0.10).abs() < 0.01, "share above the tracked p90: {share}");
+
+        struct Wide(Fake, f64);
+        impl CostModel for Wide {
+            fn launch_ms(&self, b: u32, r: u32, p: u32, f: bool) -> f64 {
+                self.0.launch_ms(b, r, p, f)
+            }
+            fn decode_ms(&self, r: u32, a: bool) -> f64 {
+                self.0.decode_ms(r, a)
+            }
+            fn host_ms(&self) -> f64 {
+                0.0
+            }
+            fn margin(&self, _: TickClass) -> f64 {
+                self.1
+            }
+        }
+        let mut s = SloState::default();
+        let c = [cand(3, 0, 65536, 8192, 20000, 0.0)];
+        let wide = Wide(glm(), 1.25);
+        let (plan, out) = plan_tick(TBT500, amd(), tick(), 0..19, &c, &ladder(), &wide, &mut s.skipped, |_| None, |_| u32::MAX);
+        // 500 / 1.25 = 400: 290 ms of prefill -> 150 + 0.09 n <= 290 -> n = 1555 -> 1536.
+        assert_eq!(rows(&plan), [(3, 1536)]);
+        assert_eq!((out.class, out.margin), (TickClass::Plain, 1.25));
+        assert!(out.predicted_ms * out.margin <= 500.0);
+    }
+
+    #[test]
+    fn a_tick_is_classed_by_its_riskiest_launch() {
+        let mut s = SloState::default();
+        let t = Targets { tbt_ms: Some(2000.0), ttft_ms: None };
+        let mut fresh = cand(1, 2, 0, u32::MAX, 9000, 0.0);
+        fresh.base.planned = false;
+        let cands = [cand(0, 1, 65536, 700, 700, 0.0), fresh];
+        let (plan, out) = run(t, &cands, 5, &mut s);
+        assert_eq!(plan.launches.len(), 2);
+        assert_eq!(out.class, TickClass::Fresh);
+        let (_, out) = run(t, &cands[..1], 5, &mut s);
+        assert_eq!(out.class, TickClass::Completing);
+    }
+
+    #[test]
     fn rls_learns_a_new_machine_from_the_prior() {
         let mut c = TickCost::default();
         // A machine 10x faster than the prior at decode and prefill.
@@ -835,15 +980,17 @@ mod tests {
             v.get(((v.len().max(1) - 1) as f64 * q).round() as usize).copied().unwrap_or(f64::NAN)
         };
         let (mut all_mixed, mut all_decode) = (Vec::new(), Vec::new());
+        let (mut covered, mut over) = (Vec::<f64>::new(), Vec::new());
         for path in paths.split(':') {
             let text = std::fs::read_to_string(path).expect("log");
             let mut cost = TickCost::default();
-            let mut launches: Vec<(u32, u32, u32, f64)> = Vec::new();
+            let mut launches: Vec<(u32, u32, u32, f64, bool)> = Vec::new();
             let mut mixed = Vec::new();
             for line in text.lines() {
                 if let Some(i) = line.find("PFCHUNK ") {
                     let m = kv(&line[i..]);
-                    launches.push((f(&m, "bucket") as u32, f(&m, "clen") as u32, f(&m, "c0") as u32, f(&m, "total")));
+                    let last = m.get("last").is_some_and(|v| v == "true");
+                    launches.push((f(&m, "bucket") as u32, f(&m, "clen") as u32, f(&m, "c0") as u32, f(&m, "total"), last));
                 } else if let Some(i) = line.find("TICK n=") {
                     let m = kv(&line[i..]);
                     let (total, pf, dec, rows) = (f(&m, "total"), f(&m, "pf"), f(&m, "dec"), f(&m, "dec_rows") as u32);
@@ -851,14 +998,29 @@ mod tests {
                     if rows > 0 {
                         let pred = launches
                             .iter()
-                            .map(|&(b, clen, c0, _)| cost.launch_ms(b, clen, c0, c0 == 0))
+                            .map(|&(b, clen, c0, _, _)| cost.launch_ms(b, clen, c0, c0 == 0))
                             .sum::<f64>()
                             + cost.decode_ms(rows, after)
                             + cost.host_ms();
                         let err = ((pred - total) / total).abs();
-                        if after { mixed.push(err) } else { all_decode.push(err) }
+                        if after {
+                            let class = if launches.iter().any(|l| l.2 == 0) {
+                                TickClass::Fresh
+                            } else if launches.iter().any(|l| l.4) {
+                                TickClass::Completing
+                            } else {
+                                TickClass::Plain
+                            };
+                            let planned = pred * cost.margin(class);
+                            covered.push(f64::from(u8::from(total <= planned)));
+                            over.push(((total - planned) / planned).max(0.0));
+                            cost.observe_margin(class, total / pred);
+                            mixed.push(err)
+                        } else {
+                            all_decode.push(err)
+                        }
                     }
-                    for &(b, clen, c0, ms) in &launches {
+                    for &(b, clen, c0, ms, _) in &launches {
                         cost.observe_launch(b, clen, c0, c0 == 0, ms);
                     }
                     if rows > 0 {
@@ -880,6 +1042,14 @@ mod tests {
             100.0 * pct(&mut all_mixed, 0.99),
             100.0 * pct(&mut all_decode, 0.5),
             100.0 * pct(&mut all_decode, 0.9),
+        );
+        let n = covered.len().max(1) as f64;
+        println!(
+            "planned against the per-class p90 margin: {:.1}% of prefill+decode ticks ran at or under the plan; \
+             overrun of the rest p50 {:.1}% p99 {:.1}%",
+            100.0 * covered.iter().sum::<f64>() / n,
+            100.0 * pct(&mut over.iter().copied().filter(|&o| o > 0.0).collect(), 0.5),
+            100.0 * pct(&mut over.iter().copied().filter(|&o| o > 0.0).collect(), 0.99),
         );
         assert!(pct(&mut all_mixed, 0.5) < 0.10);
     }
