@@ -269,6 +269,12 @@ fn attach_ranks_with<T>(
             "prefix attachment requires ranks and a valid slot".into(),
         ));
     }
+    let tick = crate::obs::tick::on();
+    let kept_before: u64 = if tick {
+        caches.iter().map(|cache| cache.attach_kept()).sum()
+    } else {
+        0
+    };
     let t0 = std::time::Instant::now();
     let ns = |t: std::time::Instant| t.elapsed().as_nanos() as u64;
     // Per staged rank: outcome, flush ns, stage ns, and [start, end) ns since `t0`.
@@ -349,14 +355,15 @@ fn attach_ranks_with<T>(
         }
     }
     let commit_ns = ns(t);
-    if crate::obs::tick::on() {
+    if tick {
         let ms = |ns: u64| ns as f64 / 1e6;
         let timeline: Vec<String> = staged
             .iter()
             .map(|r| format!("{:.1}-{:.1}", ms(r.3), ms(r.4)))
             .collect();
+        let kept: u64 = caches.iter().map(|cache| cache.attach_kept()).sum::<u64>() - kept_before;
         eprintln!(
-            "PFATTACH slot={slot} rows={} ranks={} flush={:.3} stage={:.3} commit={:.3} parallel={} stage_wall={:.3} timeline={}",
+            "PFATTACH slot={slot} rows={} ranks={} flush={:.3} stage={:.3} commit={:.3} parallel={} stage_wall={:.3} timeline={} kept={kept}",
             result.as_ref().map_or(0, |&rows| rows),
             caches.len(),
             ms(staged.iter().map(|r| r.1).sum()),
@@ -471,6 +478,14 @@ impl SharedPrefix {
         self.groups
             .iter()
             .map(|g| g.pool.stats().blocks_shared_mapped)
+            .sum()
+    }
+
+    /// Prefix blocks attaches found already mapped in place and kept (no unmap, no map).
+    pub fn attach_kept(&self) -> u64 {
+        self.groups
+            .iter()
+            .map(|g| g.pool.stats().blocks_attach_kept)
             .sum()
     }
 
