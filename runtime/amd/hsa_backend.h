@@ -121,6 +121,18 @@ int plow_hsa_launch(plow_hsa* h, int dev, const plow_hsa_kernel* k,
 
 int plow_hsa_wait(plow_hsa* h, int dev);
 
+/* --- multi-queue AQL probe --------------------------------------------------
+ * Raw handles for a caller that needs a SECOND, independent queue on an agent
+ * this context already opened (`runtime/tests/mq_probe_bench.c`: does an AQL
+ * barrier-free queue actually let two kernels co-reside?). Every other
+ * function above still assumes one queue per device; these two getters are
+ * additive and change nothing about it. 0 means `dev` was out of range. */
+uint64_t plow_hsa_agent_raw(const plow_hsa* h, int dev);
+uint64_t plow_hsa_kernarg_pool_raw(const plow_hsa* h);
+/* The backend's own default queue for `dev`, so a caller can hsa_amd_queue_cu_set_mask it —
+ * turning "these two queues' grids happen to sum to n_cu" into a hardware-enforced partition. */
+uint64_t plow_hsa_queue_raw(const plow_hsa* h, int dev);
+
 #ifdef __cplusplus
 }
 #endif

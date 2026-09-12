@@ -525,3 +525,17 @@ int plow_hsa_wait(plow_hsa* h, int dev) {
                                      HSA_WAIT_STATE_BLOCKED) != 0) {}
     return 0;
 }
+
+uint64_t plow_hsa_agent_raw(const plow_hsa* h, int dev) {
+    if (!h || dev < 0 || dev >= h->n_dev) return 0;
+    return h->dev[dev].agent.handle;
+}
+
+uint64_t plow_hsa_kernarg_pool_raw(const plow_hsa* h) {
+    return h ? h->kernarg.handle : 0;
+}
+
+uint64_t plow_hsa_queue_raw(const plow_hsa* h, int dev) {
+    if (!h || dev < 0 || dev >= h->n_dev) return 0;
+    return (uint64_t)(uintptr_t)h->dev[dev].queue;
+}
