@@ -2097,6 +2097,7 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport, packed_prefill: 
         // `tuning` because those are what `plow_config.h` compiles, and an occupancy number
         // must never invalidate an otherwise-good packet/object pair.
         "dispatch_audit": dispatch_audit,
+        "segment_resource": crate::segment_resource::section(m),
         // WHICH PROGRAMS ARE L2-PLACED, so a regression moves in a diff of `build.json`.
         //
         // Placement is invisible everywhere else in this manifest: a placed and an unplaced
@@ -2960,6 +2961,18 @@ mod tests {
             dense["objects"]["packed_prefill"]["arms"],
             dense["objects"]["ordinary"]["prefill"]["arms"]
         );
+    }
+
+    /// `segment_resource` rides beside `dispatch_audit`, and — being a pure function of the
+    /// emitted `Model` — is byte-identical across two builds of one blob. That stability is
+    /// what makes a diff of this section mean something.
+    #[test]
+    fn segment_resource_section_is_present_and_stable() {
+        let man = build(&model(), "sm_90a");
+        let section = &man["segment_resource"];
+        assert!(section["segments"].is_array(), "{section}");
+        assert!(section["findings"].is_array(), "{section}");
+        assert_eq!(*section, build(&model(), "sm_90a")["segment_resource"]);
     }
 
     /// The nvcc rendering is a BACKEND of the neutral facts, and `requires` is
