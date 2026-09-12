@@ -8,6 +8,232 @@
 use super::*;
 
 #[test]
+fn a_token_batch_body_carries_its_buckets_seams_and_fold() {
+    // A body is its bucket's prefill program plus a decode band, so everything but the band's
+    // decode attention chain must lower the same way, the sequence-parallel seams included.
+    // Without them the 8192 body ran full-width two-shots (156 against the prefill program's
+    // reduce-scatter/all-gather seams) and served +114 ms per middle chunk (tier 4, tb-t4).
+    let _guard = crate::test_env::env_guard();
+    let _env = crate::test_env::EnvScope::set(&[
+        ("PLOW_GLM_FP8_KV", "1"), ("PLOW_UNISEG", "0"), ("PLOW_MLA_PF_V2", "1"),
+        ("PLOW_GLM_SEQ_PAR", "1"), ("PLOW_GLM_SEQ_PAR_PROJ", "1"), ("PLOW_GLM_FOLD_LT", "1"),
+        ("PLOW_GLM_DSA_PF", "1"), ("PLOW_PACKED_SPARSE_PF", "1"), ("PLOW_GLM_INDEX_TP", "1"),
+    ]);
+    crate::with_emit_target_amd(true, || {
+        let (ctx, dbatch) = (81920, 20);
+        for (full, t) in [(false, 2048u32), (false, 8192), (true, 2048), (true, 8192)] {
+            let mut c = glm_ref_cfg();
+            c.tp = 8;
+            // Layer 3 is the first MoE layer; a full one runs the band's own decode indexer.
+            c.indexer_full[3] = full;
+            let emit = |band: Option<u32>| {
+                let mut decl = Builder::new(304);
+                let n = declare_glm_rows_batched(&mut decl, &c, ctx, &[3], t, dbatch, MoeEnc::Fp8Blk);
+                let mut b = Builder::new(304);
+                if let Some(bw) = band {
+                    b.set_packed_prefill_segments(true);
+                    b.set_token_batch_band(bw);
+                }
+                b.adopt_tensors(decl.tensors());
+                let xr = b.all();
+                emit_glm_block_prefill(
+                    &mut b, &c, &n, 0, ctx, t, MoeEnc::Fp8Blk, n.x, n.xnext, &[], &mut 0, &xr, band,
+                );
+                b.finish()
+            };
+            let (plain, body) = (emit(None), emit(Some(dbatch)));
+            let count = |p: &packet::devbuild::Program, keep: &dyn Fn(&crate::DevInst) -> bool| {
+                p.insts.iter().filter(|d| keep(d)).count()
+            };
+            let is = |op: DevOp| move |d: &crate::DevInst| d.op == op as u16;
+            assert!(count(&plain, &is(DevOp::XReduceScatter)) > 0, "t={t} full={full}: no seams to compare");
+            for op in [DevOp::XReduceScatter, DevOp::XReduceTwoShot] {
+                assert_eq!(count(&body, &is(op)), count(&plain, &is(op)), "t={t} full={full}: {op:?}");
+            }
+            // The band projections gather the indexer weights only on a sparse bucket, and the
+            // band's decode indexer reads its rows' weights, so a dense bucket's indexer layer
+            // keeps the full normed-hidden gather in its body.
+            if glm_dsa_pf_bucket(&c, t) {
+                let banded = |p: &packet::devbuild::Program| {
+                    count(p, &|d| {
+                        d.t.iter().any(|&h| {
+                            p.tensors.get(h as usize).is_some_and(|x| x.name.contains("@band"))
+                        })
+                    })
+                };
+                let ag = is(DevOp::XAllGather);
+                assert_eq!(count(&body, &ag), count(&plain, &ag), "t={t} full={full}: XAllGather");
+                assert_eq!(banded(&body), banded(&plain), "t={t} full={full}: sequence-parallel seam band ops");
+            }
+            for (p, what) in [(&plain, "prefill"), (&body, "body")] {
+                let names: Vec<&str> = p.tensors.iter().map(|x| x.name.as_str()).collect();
+                assert_eq!(band_only_reads(&p.insts, &names), Vec::<String>::new(), "t={t} full={full}: {what}");
+            }
+            let native_fold =
+                |d: &crate::DevInst| d.op == DevOp::MlaMergeFold as u16 && d.i[5] == 1;
+            assert_eq!(count(&body, &native_fold), count(&plain, &native_fold), "t={t} full={full}: native W_uv fold");
+        }
+    });
+}
+
+/// Reads of a tensor whose latest write was one rank's rows (a `<base>@band` view or a
+/// reduce-scatter's in-place slot band) before an all-gather or a full write refilled it.
+/// `IndexTpPf`'s peer slot (t6) is write-first: its select pass overwrites every row its gather
+/// reads, behind the op's own entry rendezvous (`runtime/amd/dsa_tp_adapter.hip`).
+fn band_only_reads(insts: &[crate::DevInst], names: &[&str]) -> Vec<String> {
+    let name = |h: u32| names.get(h as usize).copied().unwrap_or("");
+    let mut banded = std::collections::HashSet::new();
+    let mut bad = Vec::new();
+    for (i, d) in insts.iter().enumerate() {
+        if d.op == DevOp::XAllGather as u16 {
+            for h in &d.t[..3] {
+                banded.remove(h);
+            }
+            continue;
+        }
+        if d.op == DevOp::IndexTpPf as u16 {
+            banded.remove(&d.t[6]);
+        }
+        if d.op != DevOp::XReduceScatter as u16 {
+            let reads = d.t[1..].iter().filter(|h| banded.contains(*h));
+            bad.extend(reads.map(|&h| format!("inst {i} op {} reads {}", d.op, name(h))));
+        }
+        let out = d.t[0];
+        match name(out).split_once("@band") {
+            Some((base, _)) => {
+                banded.extend(names.iter().position(|x| *x == base).map(|h| h as u32));
+            }
+            None if d.op == DevOp::XReduceScatter as u16 => {
+                banded.insert(out);
+            }
+            None => {
+                banded.remove(&out);
+            }
+        }
+    }
+    bad
+}
+
+/// The production recipe (glm53-tp8-90a1b438's recorded knobs; seams, band projections and the
+/// W_uv fold by production default) plus bodies, emitted whole: dense and MoE layers, full and
+/// shared indexers, every bucket with its tail, every body, the decode rungs. No program reads
+/// rows only one rank holds. A body's per-row selection `iidx_pf` has no reader but the per-span
+/// sparse flash: the TP indexer's gather copies whole row bands, so rows outside every span hold
+/// stale peer-slot bytes.
+#[test]
+fn production_programs_read_only_rows_every_rank_holds() {
+    use std::sync::{Arc, Mutex};
+    let _guard = crate::test_env::env_guard();
+    let _target = crate::EmitAmdGuard::set(true);
+    let dir = std::env::temp_dir().join(format!("plow-glm-band-reads-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // Layers 0-2 dense and 3-4 MoE: the seams chain across the dense->MoE boundary, and layer
+    // 4's full indexer selects into the peer slot layer 3's reduce-scatter left banded.
+    let config = serde_json::json!({
+        "model_type": "glm_moe_dsa", "num_hidden_layers": 5,
+        "hidden_size": 6144, "num_attention_heads": 64,
+        "kv_lora_rank": 512, "q_lora_rank": 2048,
+        "qk_nope_head_dim": 192, "qk_rope_head_dim": 64, "v_head_dim": 256,
+        "vocab_size": 128, "rms_norm_eps": 1e-5,
+        "n_routed_experts": 256, "num_experts_per_tok": 8,
+        "moe_intermediate_size": 2048, "intermediate_size": 12288,
+        "first_k_dense_replace": 3, "routed_scaling_factor": 2.5,
+        "rope_theta": 8000000.0,
+        "indexer_types": ["full", "shared", "full", "shared", "full"]
+    });
+    std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+    let _env = crate::test_env::EnvScope::set(&[
+        ("PLOW_FP8", "1"),
+        ("PLOW_GLM_DECODE_NORM_ROWS", "1"),
+        ("PLOW_GLM_DSA", "1"),
+        ("PLOW_GLM_DSA_PF", "1"),
+        ("PLOW_GLM_DSA_PF_SPAN", "3"),
+        ("PLOW_GLM_FP8_KV", "1"),
+        ("PLOW_GLM_FUSE_B1", "1"),
+        ("PLOW_GLM_FUSE_ROPE", "0"),
+        ("PLOW_GLM_FUSE_SEAM", "1"),
+        ("PLOW_GLM_GEMM_LT", "1"),
+        ("PLOW_GLM_GEMM_LT_DECODE", "1"),
+        ("PLOW_GLM_INDEX_TP", "1"),
+        ("PLOW_GLM_MOE_AITER", "1"),
+        ("GLM_MOE_CORESIDENT", "2"),
+        ("PLOW_GLM_MOE_FLAT_DECODE", "0"),
+        ("PLOW_GLM_MOE_RESIDENT", "1"),
+        ("PLOW_GLM_PLACE_PF", "0"),
+        ("PLOW_GLM_SELECT_LOCAL", "1"),
+        ("GLM_SHARD_HEAD", "1"),
+        ("GLM_SHARED_CUS", "48"),
+        ("PLOW_MLA_PREFILL", "full:128,512,2048,8192"),
+        ("PLOW_MOE_PF_DET", "1"),
+        ("PLOW_EMIT_PACKED_PREFILL", "0"),
+        ("PLOW_DECODE_BATCH", "20"),
+        ("PLOW_DECODE_BATCH_LADDER", "1,2,4,8,16,20"),
+        ("PLOW_UNISEG", "0"),
+        ("PLOW_MLA_PF_V2", "1"),
+        ("PLOW_MLA_PF_AITER", "1"),
+        ("PLOW_TOKEN_BATCH_TP", "1"),
+        ("PLOW_PACKED_SPARSE_PF", "1"),
+        // The recorded production defaults, which `glm_emit_full` does not apply.
+        ("PLOW_GLM_SEQ_PAR", "1"),
+        ("PLOW_GLM_SEQ_PAR_PROJ", "1"),
+        ("PLOW_GLM_FOLD_LT", "1"),
+        ("PLOW_GLM_GEMM_LT_DECODE_EXT", "1"),
+    ]);
+    // Per program: (t, violations, reduce-scatters, per-span flash readers of the selection).
+    type Seen = Vec<(u32, Vec<String>, usize, usize)>;
+    let seen: Arc<Mutex<Seen>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    let verify: crate::VerifyHook = Box::new(move |model| {
+        let names: Vec<&str> = model.tensors.iter().map(|x| x.name.as_str()).collect();
+        let sel = names.iter().position(|n| *n == "act.iidx_pf").map(|h| h as u32);
+        *sink.lock().unwrap() = model
+            .progs
+            .iter()
+            .zip(&model.prog_t)
+            .map(|(p, &t)| {
+                let mut bad = band_only_reads(&p.insts, &names);
+                let mut flash = 0;
+                // The runtime refuses a packed sparse flash that is not AITER-routed
+                // (`exec/amd_sparse_mla.rs`), and that route walks the spans.
+                if let Some(h) = sel.filter(|_| packet::devbuild::is_token_batch_program(t)) {
+                    for (i, d) in p.insts.iter().enumerate() {
+                        if d.op == DevOp::FlashMlaPrefillFp8 as u16 && d.j[0] == h + 1 {
+                            flash += 1;
+                        } else if d.t[1..].contains(&h) {
+                            bad.push(format!("inst {i} op {} reads the body's iidx_pf", d.op));
+                        }
+                    }
+                }
+                let rs = p.insts.iter().filter(|d| d.op == DevOp::XReduceScatter as u16).count();
+                (t, bad, rs, flash)
+            })
+            .collect();
+        Ok(crate::LeanReport::skipped("structural regression test"))
+    });
+    glm_emit_full(
+        &dir,
+        81920,
+        dir.join("model.pkt").to_str().unwrap(),
+        304,
+        8,
+        true,
+        true,
+        "gfx942",
+        None,
+        Some(&verify),
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+    let seen = seen.lock().unwrap();
+    let body = |t: u32| packet::devbuild::is_token_batch_program(t);
+    assert!(seen.iter().any(|e| !body(e.0) && e.2 > 0), "no prefill program carries the seams");
+    assert!(seen.iter().filter(|e| body(e.0)).count() >= 4, "bodies missing");
+    assert!(seen.iter().any(|e| body(e.0) && e.3 > 0), "no body's flash names the TP selection");
+    for (t, bad, _, _) in seen.iter() {
+        assert!(bad.is_empty(), "program t={t:#x}: {bad:?}");
+    }
+}
+
+#[test]
 fn single_row_prefill_gemv_preserves_bf16_projection_layout() {
     let _guard = crate::test_env::env_guard();
     let _env = crate::test_env::EnvScope::set(&[
