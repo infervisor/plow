@@ -1069,6 +1069,142 @@ mod tests {
         assert!(pct(&mut all_mixed, 0.5) < 0.10);
     }
 
+    /// A model projection, not a measurement: C20, 20 prompts of 70000 +-14% (seeded), 700 output
+    /// tokens each, all arriving at t = 0, served by `plan_tick` on the GLM ladder with "truth"
+    /// costs from a `TickCost` that has replayed `PLOW_SLO_SIM_LOGS` (colon-separated TICK logs;
+    /// priors alone when unset). The planner sees the truth exactly (no model error, margin 1),
+    /// so the SLO arms are an optimistic bound. Targets from `PLOW_SLO_SIM_TARGETS` (ms, 0 = none).
+    /// `cargo test -p plowrt --lib simulate_c20 -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn simulate_c20() {
+        let mut truth = TickCost::default();
+        if let Ok(paths) = std::env::var("PLOW_SLO_SIM_LOGS") {
+            for path in paths.split(':') {
+                let text = std::fs::read_to_string(path).expect("log");
+                let mut launches: Vec<(u32, u32, u32, f64)> = Vec::new();
+                for line in text.lines() {
+                    let kv = |s: &str, k: &str| -> f64 {
+                        s.split_whitespace()
+                            .find_map(|w| w.strip_prefix(&format!("{k}=")[..]))
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(0.0)
+                    };
+                    if let Some(i) = line.find("PFCHUNK ") {
+                        let l = &line[i..];
+                        launches.push((kv(l, "bucket") as u32, kv(l, "clen") as u32, kv(l, "c0") as u32, kv(l, "total")));
+                    } else if let Some(i) = line.find("TICK n=") {
+                        let l = &line[i..];
+                        let rows = kv(l, "dec_rows") as u32;
+                        for &(b, clen, c0, ms) in &launches {
+                            truth.observe_launch(b, clen, c0, c0 == 0, ms);
+                        }
+                        if rows > 0 {
+                            truth.observe_decode(rows, !launches.is_empty(), kv(l, "dec"));
+                        }
+                        launches.clear();
+                    }
+                }
+            }
+        }
+        let targets: Vec<f64> = std::env::var("PLOW_SLO_SIM_TARGETS")
+            .unwrap_or_else(|_| "0,500,250".into())
+            .split(',')
+            .map(|t| t.parse().unwrap())
+            .collect();
+        let mut x = 7u64;
+        let lens: Vec<u32> = (0..20)
+            .map(|_| {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                60_200 + ((x >> 33) % 19_601) as u32
+            })
+            .collect();
+        const OUT: u32 = 700;
+        let l = ladder();
+        for &target in &targets {
+            let t = Targets { tbt_ms: (target > 0.0).then_some(target), ttft_ms: None };
+            // (frontier, planned step end, planned, tokens out, first token time, itls)
+            let mut reqs: Vec<(u32, u32, bool, u32, f64, Vec<f64>)> =
+                lens.iter().map(|_| (0, 0, false, 0, 0.0, Vec::new())).collect();
+            let (mut now, mut skipped, mut ticks) = (0.0f64, 0u32, 0u32);
+            while reqs.iter().any(|r| r.3 < OUT) {
+                ticks += 1;
+                assert!(ticks < 2_000_000, "simulation did not finish");
+                let decodes: Vec<u32> =
+                    (0..20).filter(|&i| reqs[i].0 == lens[i] && reqs[i].3 < OUT).map(|i| i as u32).collect();
+                let cands: Vec<SloCandidate> = (0..20)
+                    .filter(|&i| reqs[i].0 < lens[i])
+                    .map(|i| {
+                        let r = &reqs[i];
+                        let rows = if r.2 { r.1 - r.0 } else { u32::MAX };
+                        let mut c = cand(i as u32, i as u64, r.0, rows, lens[i] - r.0, now);
+                        c.base.planned = r.2;
+                        c
+                    })
+                    .collect();
+                let (plan, _) = plan_tick(t, amd(), tick(), decodes.iter().copied(), &cands, &l, &truth, &mut skipped, |_| None, |_| u32::MAX);
+                let mut dt = 0.0;
+                let mut finished = Vec::new();
+                for launch in &plan.launches {
+                    let i = launch.spans[0].slot as usize;
+                    let r = &mut reqs[i];
+                    let fresh = !r.2;
+                    if fresh {
+                        r.2 = true;
+                        r.1 = (r.0 + 8192).min(lens[i]);
+                    }
+                    let rows = launch.spans[0].n_rows.min(r.1 - r.0);
+                    let bucket = l.bucket_for(rows, r.0).unwrap_or(8192);
+                    dt += truth.launch_ms(bucket, rows, r.0, fresh);
+                    r.0 += rows;
+                    if r.0 == r.1 && r.0 < lens[i] {
+                        r.1 = (r.0 + 8192).min(lens[i]);
+                    }
+                    if r.0 == lens[i] {
+                        finished.push(i);
+                    }
+                }
+                if !decodes.is_empty() {
+                    dt += truth.decode_ms(decodes.len() as u32, !plan.launches.is_empty());
+                }
+                now += dt;
+                for &i in &decodes {
+                    reqs[i as usize].3 += 1;
+                    reqs[i as usize].5.push(dt);
+                }
+                for i in finished {
+                    reqs[i].3 = 1;
+                    reqs[i].4 = now;
+                }
+            }
+            let tok_s = f64::from(20 * OUT) / (now / 1e3);
+            let mut ttft: Vec<f64> = reqs.iter().map(|r| r.4 / 1e3).collect();
+            let mut itl: Vec<f64> = reqs.iter().flat_map(|r| r.5.iter().copied()).collect();
+            let met = reqs
+                .iter()
+                .filter(|r| {
+                    let mut v = r.5.clone();
+                    target <= 0.0 || v.is_empty() || {
+                        v.sort_by(f64::total_cmp);
+                        v[((v.len() - 1) as f64 * 0.99) as usize] <= target
+                    }
+                })
+                .count();
+            let pct = |v: &mut Vec<f64>, q: f64| {
+                v.sort_by(f64::total_cmp);
+                v[((v.len() - 1) as f64 * q) as usize]
+            };
+            println!(
+                "target {target:>5.0} ms: {:.1} s, {tok_s:.2} out tok/s, TTFT p50 {:.1} s p99 {:.1} s, ITL p50 {:.0} p99 {:.0} ms, requests with p99 ITL under target {met}/20, ticks {ticks}",
+                now / 1e3,
+                pct(&mut ttft, 0.5),
+                pct(&mut ttft, 0.99),
+                pct(&mut itl, 0.5),
+                pct(&mut itl, 0.99),
+            );
+        }
+    }
+
     #[test]
     fn the_yardstick_counts_launches_and_decode_passes() {
         let ticks = [(1, 19), (1, 0), (0, 20), (2, 20)];
