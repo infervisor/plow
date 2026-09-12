@@ -1140,7 +1140,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
      * blobs for A/B (128 B, cuTensorMapEncodeTiled over the FULL tensor). 0 = absent →
      * cp.async body; safe sentinel because handle 0 is in.ids, never a tensormap, and
      * pre-TMA packets zero-fill unused i[] words. */
-#if !(PLOW_NV_GEMM_ONLY && PLOW_NV_SEG_WS_ENTRY) && !PLOW_NV_FA_ONLY /* ws-entry object: fp8 ws body ONLY — any
+#if !(PLOW_NV_GEMM_ONLY && PLOW_NV_SEG_WS_ENTRY) && !PLOW_NV_FA_ONLY && !PLOW_NV_FATLITE /* ws-entry object: fp8 ws body ONLY — any
                         * other body reachable from the producer warpgroup raises its register
                         * floor past 32 and ptxas drops the entry setmaxnreg split (C7507). */
     case PLOW_DOP_GEMM:
@@ -1179,7 +1179,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         break;
 #endif /* !(GEMM_ONLY && WS_ENTRY) (bf16 GEMM) */
 
-#if !PLOW_NV_SEG_NOGLU && !PLOW_NV_FA_ONLY /* unfused packet streams never dispatch these; the GLU bodies would
+#if !PLOW_NV_SEG_NOGLU && !PLOW_NV_FA_ONLY && !PLOW_NV_FATLITE /* unfused packet streams never dispatch these; the GLU bodies would
                         * only pollute this TU's register allocation. Fused-GLU packets
                         * classify to the fat object (GEMM_OPS lists exclude GemmGlu*). */
     /* Prefill gate|up GEMM with fused GLU epilogue. t0=fu t1=A t2=Wg t5=Wu  i0=M i1=N i2=K i5=act.
@@ -1201,6 +1201,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 
 #if PLOW_NV_W8A8
 #if !PLOW_NV_FA_ONLY /* the flash object carries no GEMM/quant arms */
+#if !PLOW_NV_FATLITE
     /* fp8 w8a8 prefill GEMM (T7 L2). t0=C t1=A(e4m3) t2=W(e4m3) t3=a_scale(f32[M]) t4=w_scale(f32[N])
      * i0=M i1=N i2=K i4=a_row0. TRUE fp8 tensor cores (m16n8k32), two-scale dequant epilogue. */
     case PLOW_DOP_GEMM_FP8:
@@ -1253,8 +1254,9 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                     in->i[4], slice, nblk, (__nv_bfloat16*)arena);
         break;
 #endif /* GEMM_ONLY && WS_ENTRY alt (fp8 GEMM) */
+#endif /* !PLOW_NV_FATLITE */
 
-#if !PLOW_NV_SEG_NOGLU && !PLOW_NV_FA_ONLY /* fused GLU: fat object only (see the bf16 GLU gate above) */
+#if !PLOW_NV_SEG_NOGLU && !PLOW_NV_FA_ONLY && !PLOW_NV_FATLITE /* fused GLU: fat object only (see the bf16 GLU gate above) */
     /* fp8 w8a8 prefill GEMM+GLU (T7 L2). t0=fu t1=A(e4m3) t2=Wg(e4m3) t5=Wu(e4m3)
      * t3=a_scale t4=g_scale t6=u_scale  i0=M i1=N i2=K i5=act. */
     case PLOW_DOP_GEMM_GLU_FP8:
@@ -1288,7 +1290,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 #endif /* !PLOW_NV_GEMM_ONLY (quant) */
 #endif /* !PLOW_NV_FA_ONLY (w8a8 arms) */
 #else
-#if !PLOW_NV_FA_ONLY
+#if !PLOW_NV_FA_ONLY && !PLOW_NV_FATLITE
     /* fp8 w8a16 prefill GEMM (T6 L2). t0=C t1=A(bf16) t2=W(e4m3) t4=w_scale(f32[N])
      * i0=M i1=N i2=K i4=a_row0. dequant-to-bf16-in-smem, per-channel scale in the epilogue. */
     case PLOW_DOP_GEMM_FP8:
@@ -1315,7 +1317,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
      * DEAD in a dense (12B/31B) GEMM segment; compiled OUT of the lean occ-2 object to relieve
      * register pressure toward 0 spill. A 26B MoE program would run its expert GEMV/GLU segments on
      * the occ-1 _pfseg object instead. Case gating only — op_moe.cuh (T9a) is untouched. */
-#if !PLOW_NV_SEG_GEMM && !PLOW_NV_FA_ONLY
+#if !PLOW_NV_SEG_GEMM && !PLOW_NV_FA_ONLY && !PLOW_NV_FATLITE
     case PLOW_DOP_MOE_ROUTER_GEMMA_PF:
         d_moe_router_gemma_pf((unsigned char*)TEN(0), (const __nv_bfloat16*)TEN(1),
                               (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(3),
