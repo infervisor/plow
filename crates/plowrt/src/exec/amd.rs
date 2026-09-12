@@ -5064,19 +5064,28 @@ fn is_carried_state(name: &str) -> bool {
     name.starts_with("kv.") && (name.contains("state") || name.contains("blkres"))
 }
 
+fn is_tp_collective(op: u16) -> bool {
+    matches!(
+        DevOp::from_u16(op),
+        Some(
+            DevOp::XReduce
+                | DevOp::XReduceTwoShot
+                | DevOp::XReduceAddNorm
+                | DevOp::XArgmaxFin
+                | DevOp::XReduceScatter
+                | DevOp::XAllGather
+        )
+    )
+}
+
+/// The table `plow_xctr_audit` scans: `insts` filtered to TP collectives, in program order.
+fn xaudit_insts(insts: &[DevInst64]) -> Vec<DevInst64> {
+    insts.iter().copied().filter(|d| is_tp_collective(d.op)).collect()
+}
+
 fn patch_tp_xaudit(insts: &mut [DevInst64], status_id: u32) {
     for d in insts {
-        if matches!(
-            DevOp::from_u16(d.op),
-            Some(
-                DevOp::XReduce
-                    | DevOp::XReduceTwoShot
-                    | DevOp::XReduceAddNorm
-                    | DevOp::XArgmaxFin
-                    | DevOp::XReduceScatter
-                    | DevOp::XAllGather
-            )
-        ) {
+        if is_tp_collective(d.op) {
             d.fj[2] = status_id + 1;
         }
     }
@@ -5671,10 +5680,14 @@ struct AmdProg {
     packed_recurrent_spans: std::result::Result<u32, String>,
     /// [`token_batch_body_native_routes`] for a token-batch body; `Ok` for every other program.
     token_batch_native_routes: std::result::Result<(), String>,
-    n_inst: u32,
     trace_records: usize,
     n_counter: u32,
     d_inst: DeviceMem,
+    /// The program's collective instructions only. `plow_xctr_audit` derives each gate's
+    /// expectation from collective opcodes and skips every other instruction, so scanning this
+    /// table gives the same verdict without walking the whole program once per gate.
+    d_xaudit_inst: DeviceMem,
+    n_xaudit_inst: u32,
     d_stream: DeviceMem,
     d_sofs: DeviceMem,
     d_slen: DeviceMem,
@@ -9534,6 +9547,8 @@ impl AmdEngine {
                 xreduce_attnres_args.push(mem);
             }
             let d_inst = up(as_bytes(&p.insts))?;
+            let xaudit_insts = xaudit_insts(&p.insts);
+            let d_xaudit_inst = up(as_bytes(&xaudit_insts))?;
             let d_stream = up(as_bytes(&p.stream))?;
             let d_sofs = up(as_bytes(&p.stream_ofs))?;
             let d_slen = up(as_bytes(&p.stream_len))?;
@@ -9652,10 +9667,11 @@ impl AmdEngine {
                 decode_routes,
                 prefill_routes,
                 _xreduce_attnres_args: xreduce_attnres_args,
-                n_inst: p.insts.len() as u32,
                 trace_records: p.stream.len(),
                 n_counter: p.n_counter,
                 d_inst,
+                n_xaudit_inst: xaudit_insts.len() as u32,
+                d_xaudit_inst,
                 d_stream,
                 d_sofs,
                 d_slen,
@@ -12102,8 +12118,8 @@ impl AmdEngine {
             .ok_or_else(|| RuntimeError::Device("compact TP audit kernel was not loaded".into()))?;
         let prog = &self.progs[p];
         let arg = XAuditArgs {
-            insts: prog.d_inst.base,
-            n_inst: prog.n_inst,
+            insts: prog.d_xaudit_inst.base,
+            n_inst: prog.n_xaudit_inst,
             _pad: 0,
             xctr,
             n_xctr,

@@ -2740,6 +2740,41 @@ fn compact_audit_patches_only_tp_collectives() {
     assert_eq!(&insts[1].i[6..=7], &[23, 29]);
 }
 
+/// `plow_xctr_audit` derives every gate expectation from four opcodes (`PLOW_DOP_XREDUCE` 24,
+/// `PLOW_DOP_XARGMAX_FIN` 28, `PLOW_DOP_XREDUCE2` 29, `PLOW_DOP_XREDUCE_ADD_NORM` 116 in
+/// `dev_isa.h`) and ignores every other instruction, so the audit may scan the collective table
+/// instead of the program only if the table keeps all of those, unchanged and in order.
+#[test]
+fn xaudit_table_keeps_exactly_the_collectives() {
+    let kept: [u16; 6] = [24, 25, 26, 28, 29, 116];
+    assert_eq!(
+        [
+            DevOp::XReduce,
+            DevOp::XReduceScatter,
+            DevOp::XAllGather,
+            DevOp::XArgmaxFin,
+            DevOp::XReduceTwoShot,
+            DevOp::XReduceAddNorm,
+        ]
+        .map(|op| op as u16),
+        kept
+    );
+    let insts: Vec<DevInst64> = (0..=u16::MAX)
+        .map(|op| DevInst64 {
+            op,
+            blocks: op ^ 0x5a5a,
+            fj: [op as u32, 1, 2],
+            i: [op as u32, 7, 0, op as u32 + 3, op as u32 + 4, 0, 0, 9],
+            ..Default::default()
+        })
+        .collect();
+    let table = xaudit_insts(&insts);
+    assert_eq!(table.iter().map(|d| d.op).collect::<Vec<_>>(), kept);
+    for d in &table {
+        assert_eq!(*d, insts[d.op as usize]);
+    }
+}
+
 /// The flash object follows the PREFILL scheduler: a flash segment IS a
 /// prefill segment. Pairing it with the decode choice loads an object whose
 /// scheduling loop does not match the stream it is handed.
