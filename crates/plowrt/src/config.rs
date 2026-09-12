@@ -939,6 +939,12 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-tail-sparse-ctx", env = "PLOW_AMD_TAIL_SPARSE_CTX", global = true)]
     pub tail_sparse_ctx: Option<u32>,
 
+    /// TP shared-prefix attach: stage the ranks on one thread each instead of one after another.
+    /// A measurement arm, off by default: ROCr serializes every `hsa_amd_vmem_*` call behind one
+    /// lock (`memory::vmm`, `ENGINE_SECTIONS`), so the ranks' driver work may not overlap at all.
+    #[arg(long = "amd-attach-parallel", env = "PLOW_AMD_ATTACH_PARALLEL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub attach_parallel: bool,
+
     /// Unified token batch: keep the WIDE dense-GEMM rungs plowc chose per shape.
     ///
     /// The token-batch object is the mixed object's shape, and at four waves the fused-GLU
