@@ -28,6 +28,8 @@ extern "C" __device__ unsigned plow_attention_head_dim = 512;
 extern "C" __device__ unsigned plow_attention_query_tile = PLOW_NV_FA512_WG ? 64 : 32;
 extern "C" __device__ unsigned plow_attention_kv_tile = PLOW_NV_FA512_WG ? FA512_KV_TILE : 16;
 extern "C" __device__ unsigned plow_attention_warps = 8;
+extern "C" __device__ unsigned plow_attention_score_partitions =
+    PLOW_NV_FA512_N_SPLIT ? 2 : 1;
 extern "C" __device__ unsigned plow_block_pfattn_hd512 = 256;
 extern "C" __device__ unsigned plow_arena_bytes_pfattn_hd512 =
     FA_PRE_SMEM_FLOATS(512, 64, FA512_KV_TILE) * sizeof(float);
