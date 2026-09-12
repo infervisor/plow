@@ -3991,9 +3991,27 @@ pub(crate) fn emit_glm_mla(
     //    Sized to its own work items (`mla_fold_cus`): the fold grid-strides
     //    `n_batch * nh_l * ceil(vd/VT)` times, which is 128 at GLM TP4 — half the machine used to
     //    sit in this packet's gate doing nothing. n_batch is 1 for every decode packet here.
+    // PLOW_GLM_FOLD_LT_DECODE: at the rungs that already run segmented, the runtime takes the
+    // isolated fold as normalize -> FP32 hipBLASLt GEMM -> convert (`amd_mla_fold.rs`).
+    let native_fold = emit_config::active().glm_fold_lt_decode && matches!(rows, 16 | 20);
+    if native_fold {
+        assert!(
+            crate::emit_is_amd()
+                && b.n_cu() == 304
+                && tp == 8
+                && nh_l == 8
+                && dk == 512
+                && vd == 256,
+            "native MLA decode fold requires gfx942 TP8 latent512/value256"
+        );
+    }
     let c_uv = b.emit(
         DevOp::MlaMergeFold,
-        mla_fold_cus(&all, rows * nh_l, vd),
+        if native_fold {
+            vec![0]
+        } else {
+            mla_fold_cus(&all, rows * nh_l, vd)
+        },
         &[c_fl],
         |d| {
             d.t[0] = n.oat;
@@ -4004,8 +4022,12 @@ pub(crate) fn emit_glm_mla(
             d.i[1] = nh_l;
             d.i[2] = vd;
             d.i[4] = ns_attn;
+            d.i[5] = u32::from(native_fold);
         },
     );
+    if native_fold {
+        b.isolate(c_uv);
+    }
     // 12 o_proj (NH_l*VD -> H)  [row-parallel]: each rank sums its head-shard into a PARTIAL H-vector.
     //   Under TP the partial goes to the peer-mapped og_tp slot and an XReduce all-reduces the N
     //   partials into n.attn; at tp==1 o_proj writes n.attn directly (byte-identical).
@@ -8437,6 +8459,13 @@ fn glm_emit_full(
             assert!(
                 crate::emit_is_amd() && target == "gfx942",
                 "native GLM decode GEMM requires gfx942"
+            );
+            b.deny_uniseg();
+        }
+        if emit_config::active().glm_fold_lt_decode && matches!(rb, 16 | 20) {
+            assert!(
+                crate::emit_is_amd() && target == "gfx942",
+                "native MLA decode fold requires gfx942"
             );
             b.deny_uniseg();
         }
