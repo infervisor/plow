@@ -72,6 +72,11 @@ def quantiles(values):
         return values[lo] + (values[hi] - values[lo]) * (index - lo)
     return {"p50": percentile(0.5), "p95": percentile(0.95), "p99": percentile(0.99)}
 
+def metric_summary(values):
+    result = quantiles(values)
+    result["mean"] = statistics.fmean(values)
+    return result
+
 def request(length, output, seed, prompt_override=None):
     prompt = make_prompt(length, seed) if prompt_override is None else prompt_override
     body = {"model": model, "prompt": prompt, "add_special_tokens": False, "temperature": 0,
@@ -116,6 +121,7 @@ def request(length, output, seed, prompt_override=None):
             "tpot_ms": (end-first)*1000/(output-1) if output > 1 else None,
             "text_chunk_arrival_ms": arrivals,
             "text_chunk_gap_ms": quantiles(gaps) if gaps else None,
+            "_text_chunk_gaps_ms": gaps,
             "prompt_sha256": hashlib.sha256(
                 prompt.encode() if isinstance(prompt, str) else json.dumps(prompt).encode()).hexdigest(),
             "cached_tokens": (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0),
@@ -138,6 +144,19 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=max(args.concurrency)) as
                     elapsed = time.perf_counter()-start
                     if repeat < 0:
                         continue
+                    metrics = {
+                        "ttft_ms": metric_summary([r["ttft_ms"] for r in results]),
+                        "e2el_ms": metric_summary([r["latency_ms"] for r in results]),
+                    }
+                    if output > 1:
+                        metrics["tpot_ms"] = metric_summary([r["tpot_ms"] for r in results])
+                        itls = [gap for r in results for gap in r.pop("_text_chunk_gaps_ms")]
+                        if not itls:
+                            raise RuntimeError("stream exposed no inter-token arrival samples")
+                        metrics["itl_ms"] = metric_summary(itls)
+                    else:
+                        for r in results:
+                            r.pop("_text_chunk_gaps_ms")
                     result = {"schema_version": 2, "label": args.label, "model": model,
                         "manifest": manifest, "warmups_per_case": args.warmups, "input": length,
                         "requested_cached_prefix_tokens": cached,
@@ -145,6 +164,7 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=max(args.concurrency)) as
                         "output": output, "concurrency": concurrency, "repeat": repeat,
                         "elapsed_s": elapsed, "output_tok_s": output*concurrency/elapsed,
                         "request_s": concurrency/elapsed,
+                        "metrics": metrics,
                         "ttft_ms": statistics.median(r["ttft_ms"] for r in results),
                         "latency_ms": quantiles([r["latency_ms"] for r in results]),
                         "tpot_ms": quantiles([r["tpot_ms"] for r in results]) if output > 1 else None,
