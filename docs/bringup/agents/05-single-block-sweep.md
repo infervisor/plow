@@ -70,7 +70,7 @@ Use the narrowest existing harness that preserves the behavior being tuned:
 | packet planning | `scripts/block_sim.sh` |
 | block numerics | the family C oracle or `plowrt amd-block`; `block_run check` is smoke only |
 | broad NVIDIA object/packet grid | `scripts/tune_decode_sweep.sh --block ... --block-run ...` |
-| exact Gemma-4 H100 rung kernels | `scripts/gemma4_h100_kernel_tuner.py`; use its occurrence-weighted `rung_rollup` |
+| exact Gemma-4 H100 rung kernels | `scripts/gemma4_h100_kernel_tuner.py`; use its control-anchored, counter-gated, occurrence-weighted `rung_rollup` |
 | Gemma block timing | `examples/block_run bench` |
 | MLA-family timing | `scripts/k3_block_sweep.sh` or `scripts/glm52_block_sweep_gfx942.sh` |
 | reference block and per-op floor | `scripts/block_layer_bench.py`, `block_op_bench.py`, then `block_compare.py` |

@@ -30,6 +30,10 @@ def resource(mode):
         "spill_store_bytes": 0,
         "spill_load_bytes": 0,
         "segment_mode": mode,
+        "sm_count": 132,
+        "launch_blocks": 132,
+        "blocks_per_sm": 1,
+        "cluster": [1, 1, 1],
     }
 
 
@@ -42,8 +46,8 @@ class Gemma4H100KernelTunerTests(unittest.TestCase):
             helper.write_text(
                 "#!/usr/bin/env python3\n"
                 "import json,sys\n"
-                "mode,variant,key,index,compiled,order=sys.argv[1:]\n"
-                "with open(order,'a') as f: f.write(f'{mode}:{variant}:{index}\\n')\n"
+                "mode,variant,key,index,arm,compiled,order=sys.argv[1:]\n"
+                "with open(order,'a') as f: f.write(f'{mode}:{variant}:{index}:{arm}\\n')\n"
                 "base={'profile_key':key,'variant':variant,'compiled_profile':json.loads(compiled)}\n"
                 "if mode=='verify':\n"
                 " seed=int(index); base.update(seed=seed,correct=True,all_finite=True,"
@@ -52,6 +56,7 @@ class Gemma4H100KernelTunerTests(unittest.TestCase):
                 "else:\n"
                 " trial=int(index); value=8.0 if variant=='split' else 10.0; base.update("
                 "trial=trial,isolated=True,correct=True,warmups=10,iterations=50,"
+                "arm=arm,counters={'sm_active':0.8 if variant=='split' else 0.5},"
                 "cache_state='hot',telemetry={'sm_clock_mhz':1800,'memory_clock_mhz':2600,'power_w':500},"
                 "samples_us=[value]*50)\n"
                 "print(json.dumps(base))\n"
@@ -59,11 +64,11 @@ class Gemma4H100KernelTunerTests(unittest.TestCase):
             helper.chmod(helper.stat().st_mode | stat.S_IXUSR)
             command = [
                 "{binary}", "verify", "{variant}", "{profile_key}", "{seed}",
-                "{compiled_profile_json}", str(order),
+                "verify", "{compiled_profile_json}", str(order),
             ]
             bench_command = [
                 "{binary}", "bench", "{variant}", "{profile_key}", "{trial}",
-                "{compiled_profile_json}", str(order),
+                "{arm}", "{compiled_profile_json}", str(order),
             ]
             variants = []
             for name, mode, reference in (
@@ -77,6 +82,7 @@ class Gemma4H100KernelTunerTests(unittest.TestCase):
                             **({} if reference else {
                                 "hypothesis": "split work fills idle SMs",
                                 "lever": "split-k",
+                                "predicted_savings_us": 1.5,
                                 "expected_counter_changes": {"sm_active": "increase"},
                             }),
                             "binary": str(helper),
@@ -106,10 +112,14 @@ class Gemma4H100KernelTunerTests(unittest.TestCase):
             self.assertEqual(
                 lines[10:],
                 [
-                    "bench:control:0", "bench:split:0",
-                    "bench:split:1", "bench:control:1",
-                    "bench:control:2", "bench:split:2",
-                    "bench:split:3", "bench:control:3",
+                    "bench:control:0:control_before", "bench:split:0:candidate",
+                    "bench:control:0:control_after",
+                    "bench:control:1:control_before", "bench:split:1:candidate",
+                    "bench:control:1:control_after",
+                    "bench:control:2:control_before", "bench:split:2:candidate",
+                    "bench:control:2:control_after",
+                    "bench:control:3:control_before", "bench:split:3:candidate",
+                    "bench:control:3:control_after",
                 ],
             )
             winners = tuner.select_winners(spec, entries, timings)
@@ -127,6 +137,7 @@ class Gemma4H100KernelTunerTests(unittest.TestCase):
             "variant": "candidate",
             "compiled_profile": resource("direct"),
             "trial": 0,
+            "arm": "candidate",
             "isolated": True,
             "correct": True,
             "cache_state": "cold",
@@ -135,17 +146,22 @@ class Gemma4H100KernelTunerTests(unittest.TestCase):
                 "memory_clock_mhz": 2600,
                 "power_w": 500,
             },
+            "counters": {"sm_active": 0.75},
             "warmups": 10,
             "iterations": 50,
             "samples_us": [1.0] * 50,
         }
         self.assertEqual(
-            len(tuner.validate_benchmark(record, profile, variant, 0, "cell")["samples_us"]),
+            len(
+                tuner.validate_benchmark(
+                    record, profile, variant, 0, "candidate", "cell"
+                )["samples_us"]
+            ),
             50,
         )
         record["samples_us"].pop()
         with self.assertRaisesRegex(tuner.TunerError, "exactly 50"):
-            tuner.validate_benchmark(record, profile, variant, 0, "cell")
+            tuner.validate_benchmark(record, profile, variant, 0, "candidate", "cell")
 
     def test_output_must_stay_outside_repository(self):
         with self.assertRaisesRegex(tuner.TunerError, "outside"):
@@ -177,6 +193,7 @@ class Gemma4H100KernelTunerTests(unittest.TestCase):
                 "benchmark_command": ["{binary}"],
                 "hypothesis": "reduce idle SMs",
                 "lever": "execution mode",
+                "predicted_savings_us": 1.0,
                 "expected_counter_changes": {"sm_active": "increase"},
             }
             reference = {
@@ -233,18 +250,32 @@ class Gemma4H100KernelTunerTests(unittest.TestCase):
             "name": "candidate", "reference": False,
             "compiled_profile": dirty, "binary_sha256": "c" * 64,
             "hypothesis": "reduce queue overhead", "lever": "direct launch",
+            "predicted_savings_us": 1.5,
             "expected_counter_changes": {"launch_cycles": "decrease"},
         }
-        trial = lambda value: {
-            "samples_us": [value] * tuner.ITERATIONS,
-            "cache_state": "hot",
-            "telemetry": {
-                "sm_clock_mhz": 1800, "memory_clock_mhz": 2600, "power_w": 500,
-            },
-        }
+        def trial(value, index, arm, counter):
+            return {
+                "trial": index,
+                "arm": arm,
+                "samples_us": [value] * tuner.ITERATIONS,
+                "cache_state": "hot",
+                "telemetry": {
+                    "sm_clock_mhz": 1800,
+                    "memory_clock_mhz": 2600,
+                    "power_w": 500,
+                },
+                "counters": {"launch_cycles": counter},
+            }
         timings = {
-            ("cell", "control"): [trial(10.0) for _ in range(tuner.TRIALS)],
-            ("cell", "candidate"): [trial(8.0) for _ in range(tuner.TRIALS)],
+            ("cell", "control"): [
+                trial(10.0, index, arm, 100.0)
+                for index in range(tuner.TRIALS)
+                for arm in ("control_before", "control_after")
+            ],
+            ("cell", "candidate"): [
+                trial(8.0, index, "candidate", 80.0)
+                for index in range(tuner.TRIALS)
+            ],
         }
         result = tuner.select_winners(
             {"gates": {"minimum_speedup": 1.01}},
@@ -256,6 +287,70 @@ class Gemma4H100KernelTunerTests(unittest.TestCase):
         rollup = tuner.rung_rollup([result])[0]
         self.assertEqual(rollup["weighted_reference_us"], 80.0)
         self.assertEqual(rollup["weighted_savings_us"], 0.0)
+
+    def test_counter_hypothesis_and_control_noise_are_promotion_gates(self):
+        profile = {
+            "profile_key": "cell", "phase": "prefill", "family": "gemm",
+            "rung": 4096, "request_topology": "single", "occurrences": 4,
+        }
+        control = {
+            "name": "control", "reference": True,
+            "compiled_profile": resource("persistent"), "binary_sha256": "b" * 64,
+        }
+        candidate = {
+            "name": "candidate", "reference": False,
+            "compiled_profile": resource("direct"), "binary_sha256": "c" * 64,
+            "hypothesis": "remove barrier stalls", "lever": "pipeline stages",
+            "predicted_savings_us": 2.0,
+            "expected_counter_changes": {"barrier_stalls": "decrease"},
+        }
+        def row(value, trial, arm, counter):
+            return {
+                "trial": trial, "arm": arm,
+                "samples_us": [value] * tuner.ITERATIONS,
+                "cache_state": "hot",
+                "telemetry": {
+                    "sm_clock_mhz": 1800,
+                    "memory_clock_mhz": 2600,
+                    "power_w": 500,
+                },
+                "counters": {"barrier_stalls": counter},
+            }
+        controls = [
+            row(value, trial, arm, 100.0)
+            for trial in range(tuner.TRIALS)
+            for arm, value in (("control_before", 10.0), ("control_after", 10.4))
+        ]
+        candidates = [
+            row(9.0, trial, "candidate", 105.0) for trial in range(tuner.TRIALS)
+        ]
+        result = tuner.select_winners(
+            {"gates": {"minimum_speedup": 1.01}},
+            [{"profile": profile, "variants": [control, candidate]}],
+            {("cell", "control"): controls, ("cell", "candidate"): candidates},
+        )[0]
+        alternative = result["alternatives"][1]
+        self.assertEqual(result["promotion_decision"], "keep-reference")
+        self.assertIn("counter_hypothesis", alternative["rejection_reasons"])
+        self.assertAlmostEqual(alternative["noise_floor_us"], 0.4)
+
+        noise_limited = [
+            row(10.0, trial, "candidate", 95.0) for trial in range(tuner.TRIALS)
+        ]
+        result = tuner.select_winners(
+            {"gates": {"minimum_speedup": 1.0}},
+            [{"profile": profile, "variants": [control, candidate]}],
+            {("cell", "control"): controls, ("cell", "candidate"): noise_limited},
+        )[0]
+        alternative = result["alternatives"][1]
+        self.assertIn("noise_floor", alternative["rejection_reasons"])
+        self.assertTrue(alternative["counter_hypothesis_matched"])
+
+    def test_resource_profile_checks_h100_occupancy(self):
+        bad = resource("direct")
+        bad["blocks_per_sm"] = 3
+        with self.assertRaisesRegex(tuner.TunerError, "register file"):
+            tuner.validate_resource(bad)
 
 
 if __name__ == "__main__":

@@ -56,7 +56,8 @@ defect, and a row that cannot be filled is a blocker, not a default.
   [`08-rung-campaign.md`](08-rung-campaign.md): one compiled rung, one lever,
   a floor measured in the same job, and a decision rule before any GPU time.
   Record the exact packet profile, both object hashes, resource budgets, paired
-  trial order, correctness hashes, and occurrence-weighted rung savings.
+  control anchors, declared/observed counter movement, correctness hashes,
+  driver-reported occupancy and occurrence-weighted rung savings.
   A standalone winner is only a search result until the same object wins
   through its packet role.
 - **Spend the sweep budget on blocks.** Use standalone probes to reject broken

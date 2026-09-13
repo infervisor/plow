@@ -8,9 +8,10 @@ the exact profile fields plus ``{variant}``, ``{seed}``, ``{trial}``,
 ``{warmups}``, and ``{iterations}``.
 
 Verification runs five deterministic seeds for every selected profile and
-variant before any timing starts. Benchmark commands then run as four separate
-processes and must report exactly 50 positive samples after 10 warmups. Raw
-stdout and stderr exist only in a temporary directory under /tmp. The final
+variant before any timing starts. Each of four timing trials runs the reference,
+the rotated candidate arms, then the reference again. Benchmark commands run as
+separate processes and must report exactly 50 positive samples after 10 warmups.
+Raw stdout and stderr exist only in a temporary directory under /tmp. The final
 summary path must also be outside the repository.
 
 Each command prints one JSON object with this common identity:
@@ -21,7 +22,7 @@ Each command prints one JSON object with this common identity:
 Verification additionally reports ``seed``, ``correct``, ``all_finite``,
 ``input_sha256``, ``reference_sha256``, and ``output_sha256``. Benchmarking
 reports ``trial``, ``isolated``, ``correct``, ``cache_state``, clock/power
-``telemetry``, ``warmups``, ``iterations``, and ``samples_us``.
+``telemetry``, ``counters``, ``warmups``, ``iterations``, and ``samples_us``.
 The compiled profile is declared in the spec and includes the cubin hash,
 symbol, launch resources, tile, pipeline, memory path, and execution mode. The
 tuner rejects any identity mismatch rather than attributing a result to the
@@ -46,6 +47,7 @@ The spec reuses the ladder campaign inventory and command placeholders:
           "name": "native-split-k", "reference": false,
           "hypothesis": "split K fills idle SMs at M128",
           "lever": "split-k count",
+          "predicted_savings_us": 3.0,
           "expected_counter_changes": {"sm_active": "increase"},
           "profile_selector": {"rung": 128},
           "binary": "/tmp/plow-build/native-gemm-bench",
@@ -54,7 +56,8 @@ The spec reuses the ladder campaign inventory and command placeholders:
                              "--variant", "{variant}", "--seed", "{seed}"],
           "benchmark_command": ["{binary}", "bench", "--profile", "{profile_json}",
                                 "--variant", "{variant}", "--warmups", "{warmups}",
-                                "--iterations", "{iterations}", "--trial", "{trial}"],
+                                "--iterations", "{iterations}", "--trial", "{trial}",
+                                "--arm", "{arm}"],
           "compiled_profile": {
             "object_sha256": "...", "kernel_symbol": "...",
             "threads": 384, "warps": 12, "registers": 160,
@@ -62,7 +65,9 @@ The spec reuses the ladder campaign inventory and command placeholders:
             "tma": true, "swizzle": "128b", "spills": 0,
             "stack_bytes": 0, "spill_store_bytes": 0,
             "spill_load_bytes": 0,
-            "segment_mode": "split"
+            "segment_mode": "split",
+            "sm_count": 132, "launch_blocks": 132,
+            "blocks_per_sm": 1, "cluster": [1, 1, 1]
           }
         }]
       }
@@ -114,6 +119,10 @@ RESOURCE_FIELDS = (
     "spill_store_bytes",
     "spill_load_bytes",
     "segment_mode",
+    "sm_count",
+    "launch_blocks",
+    "blocks_per_sm",
+    "cluster",
 )
 
 
@@ -148,9 +157,14 @@ def validate_resource(resource):
         raise TunerError(f"compiled_profile requires {', '.join(RESOURCE_FIELDS)}")
     if not SHA256.fullmatch(str(resource["object_sha256"])):
         raise TunerError("compiled_profile has an invalid object_sha256")
-    for name in ("threads", "warps", "registers", "stages"):
+    for name in (
+        "threads", "warps", "registers", "stages", "sm_count",
+        "launch_blocks", "blocks_per_sm",
+    ):
         if type(resource[name]) is not int or resource[name] <= 0:
             raise TunerError(f"compiled_profile has invalid {name}")
+    if resource["threads"] % 32 or resource["warps"] != resource["threads"] // 32:
+        raise TunerError("compiled_profile warps must match the SM90 thread count")
     for name in (
         "smem_bytes", "spills", "stack_bytes", "spill_store_bytes",
         "spill_load_bytes",
@@ -163,6 +177,24 @@ def validate_resource(resource):
         or any(type(value) is not int or value <= 0 for value in resource["tile"])
     ):
         raise TunerError("compiled_profile tile must contain three positive integers")
+    if (
+        not isinstance(resource["cluster"], list)
+        or len(resource["cluster"]) != 3
+        or any(type(value) is not int or value <= 0 for value in resource["cluster"])
+    ):
+        raise TunerError("compiled_profile cluster must contain three positive integers")
+    if resource["smem_bytes"] > 227328:
+        raise TunerError("compiled_profile exceeds the H100 dynamic shared-memory limit")
+    if resource["smem_bytes"] * resource["blocks_per_sm"] > 227328:
+        raise TunerError("compiled_profile occupancy exceeds H100 shared memory per SM")
+    if (
+        resource["registers"] * resource["threads"] * resource["blocks_per_sm"]
+        > 65536
+    ):
+        raise TunerError("compiled_profile occupancy exceeds the H100 register file")
+    cluster_blocks = math.prod(resource["cluster"])
+    if resource["launch_blocks"] % cluster_blocks:
+        raise TunerError("compiled_profile launch grid is not divisible by its cluster")
     if type(resource["tma"]) is not bool or not isinstance(resource["swizzle"], str):
         raise TunerError("compiled_profile has invalid TMA/swizzle identity")
     if resource["segment_mode"] not in EXECUTION_MODES:
@@ -191,14 +223,19 @@ def validate_variant(variant, cwd):
         for name in ("hypothesis", "lever"):
             if not isinstance(variant.get(name), str) or not variant[name].strip():
                 raise TunerError(f"{variant['name']}: candidate requires nonempty {name}")
+        predicted = variant.get("predicted_savings_us")
+        if type(predicted) not in (int, float) or not math.isfinite(predicted) or predicted <= 0:
+            raise TunerError(
+                f"{variant['name']}: candidate requires positive predicted_savings_us"
+            )
         counters = variant.get("expected_counter_changes")
         if not isinstance(counters, dict) or not counters or any(
             not isinstance(name, str) or not name
-            or not isinstance(change, str) or not change
+            or change not in ("increase", "decrease")
             for name, change in counters.items()
         ):
             raise TunerError(
-                f"{variant['name']}: candidate requires expected_counter_changes"
+                f"{variant['name']}: expected_counter_changes must map counters to increase/decrease"
             )
     validate_resource(variant["compiled_profile"])
     binary = _resolve_file(variant["binary"], cwd, f"{variant['name']} binary")
@@ -391,10 +428,12 @@ def validate_verification(record, profile, variant, seed, label):
             raise TunerError(f"{label}: invalid {field}")
 
 
-def validate_benchmark(record, profile, variant, trial, label):
+def validate_benchmark(record, profile, variant, trial, arm, label):
     validate_identity(record, profile, variant, label)
     if record.get("trial") != trial:
         raise TunerError(f"{label}: trial differs from scheduled trial")
+    if record.get("arm") != arm:
+        raise TunerError(f"{label}: arm differs from scheduled arm")
     if record.get("isolated") is not True or record.get("correct") is not True:
         raise TunerError(f"{label}: benchmark is not isolated and correct")
     if record.get("cache_state") not in ("hot", "cold"):
@@ -406,6 +445,13 @@ def validate_benchmark(record, profile, variant, trial, label):
         value = telemetry.get(name)
         if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
             raise TunerError(f"{label}: invalid telemetry {name}")
+    counters = record.get("counters")
+    if not isinstance(counters, dict) or any(
+        not isinstance(name, str) or not name
+        or type(value) not in (int, float) or not math.isfinite(value) or value < 0
+        for name, value in counters.items()
+    ):
+        raise TunerError(f"{label}: counters must be nonnegative finite numbers")
     if record.get("warmups") != WARMUPS or record.get("iterations") != ITERATIONS:
         raise TunerError(f"{label}: benchmark protocol must be {WARMUPS}/{ITERATIONS}")
     samples = record.get("samples_us")
@@ -416,9 +462,12 @@ def validate_benchmark(record, profile, variant, trial, label):
     ):
         raise TunerError(f"{label}: expected exactly {ITERATIONS} positive timing samples")
     return {
+        "trial": trial,
+        "arm": arm,
         "samples_us": [float(value) for value in samples],
         "cache_state": record["cache_state"],
         "telemetry": telemetry,
+        "counters": {name: float(value) for name, value in counters.items()},
     }
 
 
@@ -470,11 +519,21 @@ def benchmark_all(spec, entries, cwd, raw_dir):
         for entry in entries:
             profile = entry["profile"]
             variants = entry["variants"]
-            offset = trial % len(variants)
-            ordered = variants[offset:] + variants[:offset]
-            for variant in ordered:
-                label = f"bench/{profile['profile_key']}/{variant['name']}/trial{trial}"
-                fields = command_fields(profile, variant, trial=trial, seed=trial)
+            reference = next(variant for variant in variants if variant["reference"])
+            candidates = [variant for variant in variants if not variant["reference"]]
+            offset = trial % len(candidates)
+            ordered = candidates[offset:] + candidates[:offset]
+            arms = [(reference, "control_before")]
+            arms.extend((variant, "candidate") for variant in ordered)
+            arms.append((reference, "control_after"))
+            for variant, arm in arms:
+                label = (
+                    f"bench/{profile['profile_key']}/{variant['name']}/"
+                    f"trial{trial}/{arm}"
+                )
+                fields = command_fields(
+                    profile, variant, trial=trial, seed=trial, arm=arm
+                )
                 command = campaign.expand_command(variant["benchmark_command"], fields)
                 record = invoke(
                     command,
@@ -484,13 +543,14 @@ def benchmark_all(spec, entries, cwd, raw_dir):
                         variant,
                         PLOW_TUNER_TRIAL=trial,
                         PLOW_TUNER_SEED=trial,
+                        PLOW_TUNER_ARM=arm,
                     ),
                     timeout,
                     raw_dir,
                     label,
                 )
                 timings[(profile["profile_key"], variant["name"])].append(
-                    validate_benchmark(record, profile, variant, trial, label)
+                    validate_benchmark(record, profile, variant, trial, arm, label)
                 )
     return timings
 
@@ -500,16 +560,88 @@ def _relative_mad(values):
     return statistics.median(abs(value - center) for value in values) / center
 
 
+def _absolute_mad(values):
+    center = statistics.median(values)
+    return statistics.median(abs(value - center) for value in values)
+
+
+def _trial_median(record):
+    return statistics.median(record["samples_us"])
+
+
+def _reference_trials(records, profile_key):
+    if len(records) != 2 * TRIALS:
+        raise TunerError(f"{profile_key}: missing control anchors")
+    pairs = []
+    for trial in range(TRIALS):
+        current = [record for record in records if record["trial"] == trial]
+        before = [record for record in current if record["arm"] == "control_before"]
+        after = [record for record in current if record["arm"] == "control_after"]
+        if len(before) != 1 or len(after) != 1:
+            raise TunerError(f"{profile_key}/trial{trial}: invalid control anchors")
+        pairs.append((before[0], after[0]))
+    return pairs
+
+
+def _counter_evidence(expected, reference_pairs, candidate_trials, minimum_change):
+    evidence = {}
+    passed = True
+    for name, direction in expected.items():
+        if any(
+            name not in record["counters"]
+            for pair in reference_pairs for record in pair
+        ) or any(name not in record["counters"] for record in candidate_trials):
+            evidence[name] = {"direction": direction, "passed": False, "reason": "missing"}
+            passed = False
+            continue
+        references = [
+            (before["counters"][name] + after["counters"][name]) / 2
+            for before, after in reference_pairs
+        ]
+        candidates = [record["counters"][name] for record in candidate_trials]
+        reference = statistics.median(references)
+        candidate = statistics.median(candidates)
+        relative_change = (
+            (candidate - reference) / reference if reference != 0 else None
+        )
+        changes = [
+            candidate_value - reference_value
+            for reference_value, candidate_value in zip(references, candidates)
+        ]
+        trial_passes = sum(
+            change > 0 if direction == "increase" else change < 0
+            for change in changes
+        )
+        if relative_change is None:
+            large_enough = direction == "increase" and candidate > 0
+        else:
+            direction_change = relative_change if direction == "increase" else -relative_change
+            large_enough = direction_change >= minimum_change
+        counter_passed = trial_passes >= 3 and large_enough
+        evidence[name] = {
+            "direction": direction,
+            "reference_median": reference,
+            "candidate_median": candidate,
+            "relative_change": relative_change,
+            "passing_trials": trial_passes,
+            "passed": counter_passed,
+        }
+        passed = passed and counter_passed
+    return passed, evidence
+
+
 def select_winners(spec, entries, timings):
     gates = spec.get("gates") or {}
     minimum_speedup = float(gates.get("minimum_speedup", 1.01))
     maximum_trial_slowdown = float(gates.get("maximum_trial_slowdown", 1.02))
     maximum_relative_mad = float(gates.get("maximum_relative_mad", 0.10))
     maximum_clock_drift = float(gates.get("maximum_clock_drift", 0.05))
+    minimum_counter_change = float(gates.get("minimum_counter_change", 0.01))
     allow_resource_spills = gates.get("allow_resource_spills", False)
     if (
         minimum_speedup < 1 or maximum_trial_slowdown < 1
         or maximum_relative_mad <= 0 or not 0 < maximum_clock_drift < 1
+        or not 0 <= minimum_counter_change < 1
         or type(allow_resource_spills) is not bool
     ):
         raise TunerError("invalid selection gates")
@@ -518,52 +650,79 @@ def select_winners(spec, entries, timings):
         profile = entry["profile"]
         variants = entry["variants"]
         reference = next(variant for variant in variants if variant["reference"])
+        reference_records = timings[(profile["profile_key"], reference["name"])]
+        reference_pairs = _reference_trials(reference_records, profile["profile_key"])
         ref_trials = [
-            statistics.median(trial["samples_us"])
-            for trial in timings[(profile["profile_key"], reference["name"])]
+            (_trial_median(before) + _trial_median(after)) / 2
+            for before, after in reference_pairs
         ]
         ref_samples = [
             sample
-            for trial in timings[(profile["profile_key"], reference["name"])]
+            for trial in reference_records
             for sample in trial["samples_us"]
         ]
+        noise_by_trial = [
+            abs(_trial_median(before) - _trial_median(after))
+            + 2 * max(
+                _absolute_mad(before["samples_us"]),
+                _absolute_mad(after["samples_us"]),
+            )
+            for before, after in reference_pairs
+        ]
+        noise_floor_us = statistics.median(noise_by_trial)
         reference_stable = _relative_mad(ref_samples) <= maximum_relative_mad
         alternatives = []
         for variant in variants:
             samples_by_trial = timings[(profile["profile_key"], variant["name"])]
-            if len(samples_by_trial) != TRIALS:
+            if variant["reference"]:
+                trial_medians = ref_trials
+                all_samples = ref_samples
+                cache_matched = True
+                clocks_matched = True
+                counter_matched = True
+                counter_evidence = {}
+            elif len(samples_by_trial) != TRIALS or any(
+                trial["trial"] != index or trial["arm"] != "candidate"
+                for index, trial in enumerate(samples_by_trial)
+            ):
                 raise TunerError(f"{profile['profile_key']}/{variant['name']}: missing trials")
-            trial_medians = [
-                statistics.median(trial["samples_us"]) for trial in samples_by_trial
-            ]
-            all_samples = [
-                sample for trial in samples_by_trial for sample in trial["samples_us"]
-            ]
+            else:
+                trial_medians = [_trial_median(trial) for trial in samples_by_trial]
+                all_samples = [
+                    sample for trial in samples_by_trial for sample in trial["samples_us"]
+                ]
+                cache_matched = all(
+                    candidate["cache_state"]
+                    == before["cache_state"]
+                    == after["cache_state"]
+                    for candidate, (before, after) in zip(
+                        samples_by_trial, reference_pairs
+                    )
+                )
+                clocks_matched = all(
+                    abs(candidate["telemetry"][name] / anchor["telemetry"][name] - 1)
+                    <= maximum_clock_drift
+                    for candidate, anchors in zip(samples_by_trial, reference_pairs)
+                    for anchor in anchors
+                    for name in ("sm_clock_mhz", "memory_clock_mhz")
+                )
+                counter_matched, counter_evidence = _counter_evidence(
+                    variant["expected_counter_changes"], reference_pairs,
+                    samples_by_trial, minimum_counter_change,
+                )
             median_us = statistics.median(trial_medians)
             speedup = statistics.median(
                 ref / candidate for ref, candidate in zip(ref_trials, trial_medians)
             )
+            observed_savings_us = statistics.median(
+                ref - candidate for ref, candidate in zip(ref_trials, trial_medians)
+            )
+            above_noise = variant["reference"] or observed_savings_us > noise_floor_us
             no_slow_trial = all(
                 candidate <= ref * maximum_trial_slowdown
                 for ref, candidate in zip(ref_trials, trial_medians)
             )
             stable = _relative_mad(all_samples) <= maximum_relative_mad
-            cache_matched = all(
-                candidate["cache_state"] == reference_trial["cache_state"]
-                for candidate, reference_trial in zip(
-                    samples_by_trial,
-                    timings[(profile["profile_key"], reference["name"])],
-                )
-            )
-            clocks_matched = all(
-                abs(candidate["telemetry"][name] / reference_trial["telemetry"][name] - 1)
-                <= maximum_clock_drift
-                for candidate, reference_trial in zip(
-                    samples_by_trial,
-                    timings[(profile["profile_key"], reference["name"])],
-                )
-                for name in ("sm_clock_mhz", "memory_clock_mhz")
-            )
             resource = variant["compiled_profile"]
             resource_clean = all(
                 resource[name] == 0
@@ -572,14 +731,17 @@ def select_winners(spec, entries, timings):
                 )
             )
             qualified = variant["reference"] or (
-                speedup >= minimum_speedup and no_slow_trial and stable
+                speedup >= minimum_speedup and above_noise and no_slow_trial and stable
                 and reference_stable and cache_matched and clocks_matched
+                and counter_matched
                 and (allow_resource_spills or resource_clean)
             )
             rejection_reasons = []
             if not variant["reference"]:
                 if speedup < minimum_speedup:
                     rejection_reasons.append("speedup")
+                if not above_noise:
+                    rejection_reasons.append("noise_floor")
                 if not no_slow_trial:
                     rejection_reasons.append("trial_regression")
                 if not stable or not reference_stable:
@@ -588,6 +750,8 @@ def select_winners(spec, entries, timings):
                     rejection_reasons.append("cache_state")
                 if not clocks_matched:
                     rejection_reasons.append("clock_drift")
+                if not counter_matched:
+                    rejection_reasons.append("counter_hypothesis")
                 if not allow_resource_spills and not resource_clean:
                     rejection_reasons.append("local_memory")
             alternatives.append(
@@ -601,6 +765,9 @@ def select_winners(spec, entries, timings):
                         trial["samples_us"] for trial in samples_by_trial
                     ],
                     "speedup_vs_reference": speedup,
+                    "observed_savings_us": observed_savings_us,
+                    "noise_floor_us": noise_floor_us,
+                    "above_noise_floor": above_noise,
                     "relative_mad": _relative_mad(all_samples),
                     "reference_relative_mad": _relative_mad(ref_samples),
                     "cache_states": [trial["cache_state"] for trial in samples_by_trial],
@@ -608,16 +775,33 @@ def select_winners(spec, entries, timings):
                     "resource_clean": resource_clean,
                     "cache_matched": cache_matched,
                     "clocks_matched": clocks_matched,
+                    "counter_hypothesis_matched": counter_matched,
+                    "counter_evidence": counter_evidence,
                     "qualified": qualified,
                     "rejection_reasons": rejection_reasons,
                     "hypothesis": variant.get("hypothesis"),
                     "lever": variant.get("lever"),
                     "expected_counter_changes": variant.get("expected_counter_changes"),
+                    "predicted_savings_us": variant.get("predicted_savings_us"),
+                    "prediction_fraction": (
+                        observed_savings_us / variant["predicted_savings_us"]
+                        if not variant["reference"] else None
+                    ),
                     "binary_sha256": variant["binary_sha256"],
                     "compiled_profile": variant["compiled_profile"],
+                    "grid_waves": (
+                        variant["compiled_profile"]["launch_blocks"]
+                        / (
+                            variant["compiled_profile"]["sm_count"]
+                            * variant["compiled_profile"]["blocks_per_sm"]
+                        )
+                    ),
                 }
             )
-        winner = min((row for row in alternatives if row["qualified"]), key=lambda row: row["median_us"])
+        winner = min(
+            (row for row in alternatives if row["qualified"]),
+            key=lambda row: row["median_us"],
+        )
         results.append(
             {
                 "profile_key": profile["profile_key"],
@@ -630,10 +814,21 @@ def select_winners(spec, entries, timings):
                     row["median_us"] for row in alternatives if row["reference"]
                 ) * profile["occurrences"],
                 "weighted_selected_us": winner["median_us"] * profile["occurrences"],
-                "promotion_decision": (
-                    "kernel-qualified-candidate" if not winner["reference"] else "keep-reference"
+                "weighted_noise_floor_us": noise_floor_us * profile["occurrences"],
+                "weighted_predicted_savings_us": (
+                    winner["predicted_savings_us"] * profile["occurrences"]
+                    if not winner["reference"] else 0.0
                 ),
-                "next_gate": "packet-role-block" if not winner["reference"] else None,
+                "promotion_decision": (
+                    "T2-kernel-qualified-candidate"
+                    if not winner["reference"] else "keep-reference"
+                ),
+                "next_gate": "T3-packet-role-block" if not winner["reference"] else None,
+                "control_anchor_medians_us": [
+                    [_trial_median(before), _trial_median(after)]
+                    for before, after in reference_pairs
+                ],
+                "control_noise_by_trial_us": noise_by_trial,
                 "alternatives": alternatives,
             }
         )
@@ -659,8 +854,15 @@ def rung_rollup(results):
             "profile_count": len(group), "weighted_reference_us": reference,
             "weighted_selected_us": selected, "weighted_speedup": reference / selected,
             "weighted_savings_us": reference - selected,
+            "weighted_noise_floor_us": sum(
+                row["weighted_noise_floor_us"] for row in group
+            ),
+            "weighted_predicted_savings_us": sum(
+                row["weighted_predicted_savings_us"] for row in group
+            ),
             "qualified_candidate_profiles": sum(
-                row["promotion_decision"] == "kernel-qualified-candidate" for row in group
+                row["promotion_decision"] == "T2-kernel-qualified-candidate"
+                for row in group
             ),
         })
     return sorted(rows, key=lambda row: row["weighted_savings_us"], reverse=True)
@@ -674,7 +876,7 @@ def run_tuner(spec, output):
         timings = benchmark_all(spec, entries, cwd, raw_dir)
     winners = select_winners(spec, entries, timings)
     summary = {
-        "schema_version": 2,
+        "schema_version": 3,
         "model": "google/gemma-4-12B-it",
         "arch": spec["arch"],
         "gpu": spec["gpu"],
@@ -686,6 +888,7 @@ def run_tuner(spec, output):
             "warmups": WARMUPS,
             "iterations": ITERATIONS,
             "isolated_trials": TRIALS,
+            "control_anchors_per_trial": 2,
         },
         "spec_sha256": hashlib.sha256(
             json.dumps(spec, sort_keys=True).encode()
@@ -735,6 +938,7 @@ def plan_json(spec):
             "warmups": WARMUPS,
             "iterations": ITERATIONS,
             "isolated_trials": TRIALS,
+            "control_anchors_per_trial": 2,
         },
         "profile_count": len(entries),
         "families": dict(sorted(families.items())),
@@ -751,6 +955,11 @@ def plan_json(spec):
                         "hypothesis": variant.get("hypothesis"),
                         "lever": variant.get("lever"),
                         "expected_counter_changes": variant.get("expected_counter_changes"),
+                        "predicted_savings_us": variant.get("predicted_savings_us"),
+                        "predicted_weighted_savings_us": (
+                            variant.get("predicted_savings_us", 0)
+                            * entry["profile"]["occurrences"]
+                        ),
                     }
                     for variant in entry["variants"]
                 ],

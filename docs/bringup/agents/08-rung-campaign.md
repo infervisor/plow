@@ -76,7 +76,7 @@ One all-rank trace of this rung only (`PLOW_TRACE_RAW=1`, `PLOW_TICK_LOG=1`,
 | tier | what | gate to promote |
 |---|---|---|
 | T1 CPU | build; tests; knob-off `model.pkt` sha256 identical; untouched objects disassembly-identical (dead code can shift sibling codegen, so guard new code with a define); instruction diff equals the declared scope and nothing else | all identical outside scope; diff ⊆ scope |
-| T2 one GPU | kernel harness on captured production operands against **the exact dispatched route** (not a nearby shape, not the library's best, not a re-picked kernel), same inputs, device-event timing, bit or FP floor check | faster than the dispatched route beyond run-to-run noise, including the boundary cost the change adds or removes (6–52 µs per native↔interpreter transition) |
+| T2 one GPU | kernel harness on captured production operands against **the exact dispatched route** (not a nearby shape, not the library's best, not a re-picked kernel), same inputs, device-event timing, bit or FP floor check. Run control-before/candidate/control-after anchors and emit the lever card's counters. | faster than the interpolated control beyond `abs(ctrl-before - ctrl-after) + 2*MAD`; predicted counters move in the declared direction in at least 3/4 trials; include the boundary cost the change adds or removes (6–52 µs per native↔interpreter transition) |
 | T3 eight GPUs | the rung itself: truncated `--layers N` packet (N just past the changed ops, with its own object set) or the full model on the rung's workload. ctrl / treat / ctrl2 in one job; value check vs the cross-process floor; the lever's firing proven (launch counts, trace) | rung median faster beyond the noise floor; values inside the floor; every other touched rung not slower |
 | T4 serve | only to flip a default: interleaved ctrl / treat / ctrl2 / treat2 arms, exact-length prompts, ≥ 32 prompts at C1 and ≥ 160 at C16, `--save-detailed`, bootstrap 95% CI of the per-request TTFT/TPOT difference; retrieval base + tail suite; serving guard | CI upper bound < 0 in every cell; no failed requests; TPOT not worse beyond the control spread; retrieval all pass |
 
@@ -94,6 +94,17 @@ Rules at every tier:
 - **Re-time the production choice.** Before comparing against a library, re-time the kernel
   production actually dispatches. Shipped choice tables can be stale (decode rung 20 `q_a` ran at
   46 µs where the best pinned kernel does 21).
+- **Bind tile resources to the object.** Record block size, registers/thread,
+  dynamic shared memory, driver-reported blocks/SM, SM count, launch blocks,
+  cluster, and resulting grid waves. A tile change that alters any of these is
+  a new object/entry ABI. Confirm the runtime loads that entry and recomputes
+  occupancy; packet workgroups alone do not describe residency.
+- **For Gemma-4 H100 exact cells, use the machine gate.** Run
+  `scripts/gemma4_h100_kernel_tuner.py`; a result named
+  `T2-kernel-qualified-candidate` still owes the `T3-packet-role-block` gate.
+  Rank its `rung_rollup` by realized occurrence-weighted savings, and compare
+  that with `weighted_predicted_savings_us` and
+  `weighted_noise_floor_us` before choosing the next lever.
 
 ## 5. Decide, then record
 

@@ -228,12 +228,15 @@ derived from the packet audit. Select an explicit rung and exact GEMM or
 attention geometry; never type a nearby shape into the benchmark. The tuner
 requires one reference and one or more candidates for every selected profile.
 
-Each candidate declares one hypothesis, one changed lever, and the counters
-expected to move. Each compiled profile binds the cubin hash, symbol, launch
-geometry, tile, stages, TMA/swizzle path, registers, shared memory, stack, and
-spill traffic. Verification covers five seeds before timing. Timing uses four
-balanced-order trials of 10 warmups and 50 samples inside one `gpulease`; every
-trial labels hot/cold cache state and records SM clock, memory clock, and power.
+Each candidate declares one hypothesis, one changed lever, predicted isolated
+savings in microseconds, and counters expected to increase or decrease. Each
+compiled profile binds the cubin hash, symbol, launch geometry, tile, stages,
+TMA/swizzle path, registers, shared memory, stack, spill traffic, SM count,
+measured blocks/SM, launch blocks, and cluster shape. Verification covers five
+seeds before timing. Each of four trials runs control-before, the rotated
+candidate arms, then control-after, with 10 warmups and 50 samples per process
+inside one `gpulease`. Every arm labels hot/cold cache state and records SM
+clock, memory clock, power, and the declared counters.
 
 Run the loop in this order:
 
@@ -242,14 +245,19 @@ Run the loop in this order:
 2. Change one algorithm or schedule lever. Compile a separate object when the
    warp, register, shared-memory, or segment budget changes.
 3. Run the exact standalone oracle and A/B. The default gate rejects stack and
-   spill traffic, unstable controls, any slow paired trial, and improvements
-   below the configured speedup.
+   spill traffic, a register/shared-memory occupancy claim that cannot fit the
+   H100, unstable control anchors, a gain below the same-trial noise floor, any
+   slow paired trial, an improvement below the configured speedup, or counters
+   that fail to move in the predicted direction in at least three trials.
 4. Read `rung_rollup` in the summary. It reports occurrence-weighted savings by
    phase, rung, topology, family, and live KV bucket. A fast rare shape does not
    outrank a smaller saving repeated across the block.
 5. Route the candidate through its hash-bound packet role and repeat the
-   single-block A/B. Reject the candidate if launch, role transition, counter,
-   or activation traffic erases the isolated gain.
+   single-block A/B. The block report must reconcile planned and observed
+   launches, object transitions, grid waves, and activation bytes. Reject the
+   candidate if any of these erases the isolated gain. A tile that needs a new
+   block size, register budget, shared-memory claim, cluster, or entry point is
+   a separate lean object; it cannot be represented as a generic opcode retune.
 6. Publish a TuneDB row only for the exact packet/object identity that passes
    the block gate. Prove `plowc tune select` consumes it. Run full logits and
    serving only after every promoted cell in the rung is closed.
@@ -259,6 +267,16 @@ and live KV boundary as part of the cell. For GEMM/GEMV, use exact M/N/K,
 dtype, scale layout, epilogue, split/reduction path, and execution mode. Do not
 average distinct KV buckets or use an isolated direct kernel as evidence for a
 persistent interpreter route.
+
+On NVIDIA, `devgen::nvidia_prefill_gemm_op` emits one canonical opcode per
+dtype; the cubin's `PGM_*`/`PGM90_*` defines choose the generic body's tile.
+`devgen` therefore does not infer a new launch resource budget when that tile
+changes. Exact-shape variants must expose their block and arena globals through
+a packet role. At load, `plowrt` reads those globals and asks the CUDA driver for
+blocks/SM before choosing the cooperative grid. The tuner profile must match
+that observed result. On AMD, `hwspec::ArchGeometry` gates the object-wide LDS
+tile and `pick_tile` selects only an opcode present in the target inventory;
+keep the header-agreement and tuned-tile-selection tests in the gate.
 
 ### 3b. Agent iteration loop (AMD)
 
