@@ -1261,13 +1261,13 @@ static __device__ void d_quant_fp8_ws384(uint8_t* __restrict__ xq, __nv_bfloat16
         if (v8) {
             for (unsigned kk = lane * 8u; kk < K; kk += 256u) {
                 const bf16v8 v = ld_glob8(x + row + kk);
-                uint8_t q8[8];
+                uint2 q8;
+                unsigned short* q2 = (unsigned short*)&q8;
 #pragma unroll
-                for (int j = 0; j < 8; j++) {
-                    __nv_fp8_e4m3 q(__bfloat162float(v.x[j]) * inv);
-                    q8[j] = *(const uint8_t*)&q;
-                }
-                *(uint2*)(xq + row + kk) = *(const uint2*)q8;
+                for (int j = 0; j < 4; j++)
+                    q2[j] = pack_fp8_e4m3(__bfloat162float(v.x[2 * j]) * inv,
+                                           __bfloat162float(v.x[2 * j + 1]) * inv);
+                *(uint2*)(xq + row + kk) = q8;
             }
         } else {
             for (unsigned kk = lane; kk < K; kk += 32u) {

@@ -33,6 +33,13 @@ gemma_flags=(
   -DPLOW_NV_GEMV_RB=1 -DPLOW_MOE_DOWN_LANESPLIT=1 -DPLOW_NV_FA_WPR=1
   -DPLOW_NV_FP8_RB=4 -DPLOW_NV_TMA_GEMM=1
 )
+if [ "${PLOW_BUILD_W8A8:-0}" = 1 ] ||
+   { [ -n "${PLOW_CUBIN_CONFIG:-}" ] && grep -qx '#define PLOW_HAS_QUANT_FP8 1' "$PLOW_CUBIN_CONFIG"; }; then
+  gemma_flags+=(
+    -DPLOW_NV_W8A8=1
+    -DPGM90_FP8_PROMOTE="${PLOW_W8A8_PROMOTE:-1}"
+  )
+fi
 for gemma_packed in 0 1; do
   gemma_prefix=pf
   if [ "$gemma_packed" = 1 ]; then gemma_prefix=pfpacked; fi

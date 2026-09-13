@@ -2158,18 +2158,21 @@ static __device__ void d_quant_fp8(uint8_t* __restrict__ xq, __nv_bfloat16* __re
         if (v8) {
             for (unsigned kk = lane * 8u; kk < K; kk += 256u) {
                 const bf16v8 v = ld_glob8(x + row + kk);
-                uint8_t q8[8];
+                uint2 q8;
+                unsigned short* q2 = (unsigned short*)&q8;
 #pragma unroll
-                for (int j = 0; j < 8; j++) {
+                for (int j = 0; j < 4; j++) {
 #if defined(PLOW_NV_QUANT_FP8_VLLM) && PLOW_NV_QUANT_FP8_VLLM
-                    const float scaled = __fdiv_rn(__bfloat162float(v.x[j]), as);
-                    __nv_fp8_e4m3 q(fmaxf(-448.0f, fminf(scaled, 448.0f)));
+                    const float lo = __fdiv_rn(__bfloat162float(v.x[2 * j]), as);
+                    const float hi = __fdiv_rn(__bfloat162float(v.x[2 * j + 1]), as);
+                    q2[j] = pack_fp8_e4m3(fmaxf(-448.0f, fminf(lo, 448.0f)),
+                                           fmaxf(-448.0f, fminf(hi, 448.0f)));
 #else
-                    __nv_fp8_e4m3 q(__bfloat162float(v.x[j]) * inv);
+                    q2[j] = pack_fp8_e4m3(__bfloat162float(v.x[2 * j]) * inv,
+                                           __bfloat162float(v.x[2 * j + 1]) * inv);
 #endif
-                    q8[j] = *(const uint8_t*)&q;
                 }
-                *(uint2*)(xq + row + kk) = *(const uint2*)q8;
+                *(uint2*)(xq + row + kk) = q8;
             }
         } else {
             for (unsigned kk = lane; kk < K; kk += 32u) {

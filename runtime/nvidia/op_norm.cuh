@@ -143,13 +143,13 @@ static __device__ void d_rmsnorm(__nv_bfloat16* __restrict__ out, const __nv_bfl
                 if (lane == 0) ascale[out_row0 + row] = as;
                 for (unsigned i = lane * 8u; i < feat; i += 256u) {
                     const bf16v8 o = ld_glob8(out + obase + i);
-                    uint8_t q8[8];
+                    uint2 q8;
+                    unsigned short* q2 = (unsigned short*)&q8;
 #pragma unroll
-                    for (int j = 0; j < 8; j++) {
-                        __nv_fp8_e4m3 q(__bfloat162float(o.x[j]) * qinv);
-                        q8[j] = *(const uint8_t*)&q;
-                    }
-                    *(uint2*)(xq + obase + i) = *(const uint2*)q8;
+                    for (int j = 0; j < 4; j++)
+                        q2[j] = pack_fp8_e4m3(__bfloat162float(o.x[2 * j]) * qinv,
+                                               __bfloat162float(o.x[2 * j + 1]) * qinv);
+                    *(uint2*)(xq + obase + i) = q8;
                 }
             }
         }
@@ -217,13 +217,13 @@ static __device__ void d_rmsnorm(__nv_bfloat16* __restrict__ out, const __nv_bfl
                 for (int c = 0; c < RN_VEC; c++) {
                     const unsigned i = (threadIdx.x + (unsigned)c * PLOW_NV_THREADS) * 8;
                     if (i < feat) {
-                        uint8_t q8[8];
+                        uint2 q8;
+                        unsigned short* q2 = (unsigned short*)&q8;
 #pragma unroll
-                        for (int j = 0; j < 8; j++) {
-                            __nv_fp8_e4m3 q(__bfloat162float(o[c].x[j]) * qinv);
-                            q8[j] = *(const uint8_t*)&q;
-                        }
-                        *(uint2*)(xq + obase + i) = *(const uint2*)q8;
+                        for (int j = 0; j < 4; j++)
+                            q2[j] = pack_fp8_e4m3(__bfloat162float(o[c].x[2 * j]) * qinv,
+                                                   __bfloat162float(o[c].x[2 * j + 1]) * qinv);
+                        *(uint2*)(xq + obase + i) = q8;
                     }
                 }
             }
