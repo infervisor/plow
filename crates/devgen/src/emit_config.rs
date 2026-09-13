@@ -139,6 +139,12 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_UNISEG", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub uniseg: bool,
 
+    /// Isolate tiled GEMMs in lean packet segments. `1` covers every tiled GEMM;
+    /// `fp8` and `w8a16` restrict the accepted GEMM contracts. Unset lets plowc
+    /// select a qualified target default; `0` keeps GEMMs in mixed segments.
+    #[arg(long = "emit-pure-gemm-segments", env = "PLOW_SEG_PURE_GEMM")]
+    pub seg_pure_gemm: Option<String>,
+
     /// Emit the packet ABI for packed cross-request prefill. Unset lets plowc
     /// select it from the target and packet capabilities.
     #[arg(long = "emit-packed-prefill", env = "PLOW_EMIT_PACKED_PREFILL", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), num_args = 0..=1, default_missing_value = "true")]
@@ -1143,6 +1149,7 @@ impl EmitConfig {
             mx4_head: env_str("PLOW_MX4_HEAD"),
             mx4_prefill: env_str("PLOW_MX4_PREFILL"),
             uniseg: env_bool("PLOW_UNISEG"),
+            seg_pure_gemm: env_str("PLOW_SEG_PURE_GEMM"),
             emit_packed_prefill: env_bool_opt("PLOW_EMIT_PACKED_PREFILL"),
             packed_prefill_default: false,
             // The legacy no-config entry remains opt-in. `plowc` supplies the clap default-on
@@ -1664,6 +1671,11 @@ static FALLBACK: OnceLock<EmitConfig> = OnceLock::new();
 pub fn install(mut cfg: EmitConfig) {
     cfg.resolve_deprecated_aliases();
     cfg.validate();
+    let mut seg_knobs = packet::devbuild::SegKnobs::from_env();
+    // Carry the resolved field into the packet builder. This is what makes a
+    // production default and a replay behave like the equivalent explicit env
+    // setting instead of silently falling back to mixed segments.
+    seg_knobs.seg_pure_gemm = cfg.seg_pure_gemm.clone();
     let ptr = Box::into_raw(Box::new(cfg));
     // In production there is only one call; in tests the last call wins (matches env-var
     // semantics where `set_var` before `run()` is the intent). We intentionally leak the
@@ -1671,7 +1683,7 @@ pub fn install(mut cfg: EmitConfig) {
     INSTALLED.store(ptr, std::sync::atomic::Ordering::Release);
     // The packet builder's knobs are snapshotted at the same moment, from the same
     // environment, so an `EnvScope` in a test moves both together.
-    packet::devbuild::install_knobs(packet::devbuild::SegKnobs::from_env());
+    packet::devbuild::install_knobs(seg_knobs);
 }
 
 /// The resolved value of one emit knob, and where that value came from.

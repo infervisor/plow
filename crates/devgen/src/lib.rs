@@ -7046,6 +7046,9 @@ pub fn run(args: EmitArgs) {
 
 #[derive(Clone, Copy)]
 struct EmitCapabilities {
+    /// Gemma dense families. Kept separate from `dense_packet_contracts`: a
+    /// shape-qualified Gemma recipe must not silently become a Llama/Qwen one.
+    gemma: bool,
     dense_packet_contracts: bool,
     decode_objects: bool,
     cublaslt_decode: bool,
@@ -7066,6 +7069,7 @@ impl EmitCapabilities {
     /// The capabilities as checkpoint K target atoms.
     fn caps(self) -> Vec<&'static str> {
         [
+            ("gemma", self.gemma),
             ("dense_packet_contracts", self.dense_packet_contracts),
             ("decode_objects", self.decode_objects),
             ("cublaslt_decode", self.cublaslt_decode),
@@ -7091,6 +7095,7 @@ fn emit_capabilities(model_type: &str) -> EmitCapabilities {
     );
     let dense = gemma || matches!(model_type, "llama" | "qwen3");
     EmitCapabilities {
+        gemma,
         dense_packet_contracts: dense,
         decode_objects: dense || model_type == "qwen3_5",
         cublaslt_decode: gemma || model_type == "qwen3_5",
@@ -7107,6 +7112,20 @@ fn apply_production_defaults(
     tp: u32,
     n_cu: u32,
 ) {
+    // Exact Gemma-4 W8A8 4K/8K packets need pure GEMM segments to reach the
+    // lean SM90 TMA/WGMMA object. The mixed 193-segment topology kept the same
+    // math in the fat interpreter and measured 42-45% slower than the 483-
+    // segment topology. Keep the promotion on the qualified dtype/target;
+    // `=0` remains an explicit rollback and BF16 needs its own driver gate.
+    if cfg.seg_pure_gemm.is_none()
+        && cfg.w8a8
+        && capabilities.gemma
+        && arch == "sm_90a"
+        && tp == 1
+    {
+        cfg.seg_pure_gemm = Some("1".into());
+        emit_config::note_production_default("seg_pure_gemm", "1".into());
+    }
     // gfx942 STOPS AT 8, sm_90a KEEPS 16 — and the reason is the OBJECT, not the rung.
     //
     // The fusion argument that stood here was wrong twice, and [`gemv_staged_rows`] now

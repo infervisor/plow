@@ -48,6 +48,11 @@ const DECODE_LADDER: Status = Status::Qualified {
 const PACKED_SIBLINGS: Status = Status::Qualified {
     evidence: &["crates/devgen/src/lib.rs apply_production_defaults: ordinary programs byte-identical with the packed siblings (glm_tests)"],
 };
+const GEMMA_W8A8_PURE_GEMM: Status = Status::Qualified {
+    evidence: &[
+        "plans/gemma4-4k-8k-native-block.md: exact SM90a 4K/8K pure-GEMM packet A/B",
+    ],
+};
 const UNISEG: Status = Status::Qualified {
     evidence: &["crates/plowc/src/main.rs effective_uniseg: the sm_120 interpreter implements the single-segment path only"],
 };
@@ -146,6 +151,19 @@ const DECODE_LADDER_DEFAULT: Default = Default::Production {
             value: Val::Str("1,2,4,8"),
         },
     ],
+    otherwise: Val::Unset,
+};
+
+const PURE_GEMM_DEFAULT: Default = Default::Production {
+    cases: &[DefaultCase {
+        when: F::And(&[
+            F::Target(T::Cap("gemma")),
+            F::Target(T::Arch("sm_90a")),
+            F::Target(T::Tp(1)),
+            F::Atom("emit.w8a8", Cmp::Eq, TRUE),
+        ]),
+        value: Val::Str("1"),
+    }],
     otherwise: Val::Unset,
 };
 
@@ -340,6 +358,7 @@ const GLM53_RECIPE: &[(&str, Val)] = &[
 ];
 
 const DENSE_CAPS: &[&str] = &["dense_packet_contracts", "decode_objects", "decode_ladder"];
+const GEMMA4_W8A8_RECIPE: &[(&str, Val)] = &[("emit.w8a8", TRUE)];
 
 /// G4 (review log #86): the AITER MoE call accumulates onto the shared partial, so the combine pass
 /// leaves the 2048..8192 prefill buckets, and the adapter object is the only object that changes.
@@ -423,6 +442,7 @@ pub const TARGETS: &[TargetSpec] = &[
         n_cu: 132,
         model: "gemma4",
         caps: &[
+            "gemma",
             "dense_packet_contracts",
             "decode_objects",
             "cublaslt_decode",
@@ -431,12 +451,28 @@ pub const TARGETS: &[TargetSpec] = &[
         recipe: &[],
     },
     TargetSpec {
+        name: "gemma4_w8a8_sm90a_tp1",
+        arch: "sm_90a",
+        tp: 1,
+        n_cu: 132,
+        model: "gemma4",
+        caps: &[
+            "gemma",
+            "dense_packet_contracts",
+            "decode_objects",
+            "cublaslt_decode",
+            "decode_ladder",
+        ],
+        recipe: GEMMA4_W8A8_RECIPE,
+    },
+    TargetSpec {
         name: "gemma4_gfx942_tp1",
         arch: "gfx942",
         tp: 1,
         n_cu: 304,
         model: "gemma4",
         caps: &[
+            "gemma",
             "dense_packet_contracts",
             "decode_objects",
             "cublaslt_decode",
@@ -476,6 +512,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.mx4_head", Some("PLOW_MX4_HEAD"), Layer::Emit, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("emit.mx4_prefill", Some("PLOW_MX4_PREFILL"), Layer::Emit, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("emit.uniseg", Some("PLOW_UNISEG"), Layer::Emit, Domain::Bool, UNISEG_DEFAULT, UNISEG),
+    KnobSpec::new("emit.seg_pure_gemm", Some("PLOW_SEG_PURE_GEMM"), Layer::Emit, Domain::Str, PURE_GEMM_DEFAULT, GEMMA_W8A8_PURE_GEMM),
     KnobSpec::new("emit.emit_packed_prefill", Some("PLOW_EMIT_PACKED_PREFILL"), Layer::Emit, Domain::Bool, PACKED_PREFILL_DEFAULT, PACKED_SIBLINGS),
     KnobSpec::new("emit.decode_mla_segments", Some("PLOW_SEG_DECODE_MLA"), Layer::Emit, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("emit.decode_grouped_moe_segments", Some("PLOW_SEG_DECODE_GROUPED_MOE"), Layer::Emit, Domain::Bool, UNSET, OPT_IN),

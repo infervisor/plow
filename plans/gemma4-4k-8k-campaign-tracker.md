@@ -22,21 +22,22 @@ Detailed experiment log: `plans/gemma4-4k-8k-native-block.md`
 | GPU | ISA | Precision | 4K | 8K | Current state |
 |---|---|---|---|---|---|
 | NVIDIA H100 80GB | SM90a | BF16 | open | open | Exact HD256 and fused-GLU roles qualified; 50% full-model gate not met |
-| NVIDIA H100 80GB | SM90a | W8A8/FP8 weights+activations | ~157.5 ms warmed p50 | ~351.2 ms warmed p50 | Latest qualified snapshot; correctness matched in accepted A/Bs; 50% gate not met |
+| NVIDIA H100 80GB | SM90a | W8A8/FP8 weights+activations | 168.3 ms current-schema p50 | 368.0 ms current-schema p50 | Pure-GEMM production default and ABI v5 descriptor TMA qualified; 50% gate not met |
 | AMD MI300X | gfx942 | BF16 | unmeasured in this fixed protocol | unmeasured in this fixed protocol | Establish native block and serving baseline |
 | AMD MI300X | gfx942 | FP8 | unmeasured in this fixed protocol | unmeasured in this fixed protocol | Establish dtype-correct block and serving baseline |
 
-The H100 W8A8 values are the latest comparable full-rung snapshot. They predate
-the ABI v5 descriptor-TMA block winner, whose full-rung transfer remains open.
-They are not an apples-to-apples vLLM result and must not be compared with
-another precision or cache policy.
+The H100 W8A8 values are the three-seed mean p50 for the current-schema ABI v5
+packet with 483 pure-GEMM segments. They are not an apples-to-apples vLLM result
+and must not be compared with another precision or cache policy. An earlier
+157.5/351.2 ms snapshot remains the best recorded packet, but predates the
+current schema/default build and is not the control for new source changes.
 
 ## Cross-GPU checkpoint ledger
 
 | Backend cell | Native kernels | Packet/runtime | Comparable baseline | Promotion state | Next gate |
 |---|---|---|---|---|---|
 | H100 SM90a BF16 4K/8K | HD256, descriptor-TMA HD512, fused gate/up+GeGLU qualified | exact-rung roles and packed R2 qualified | Plow production C1 recorded; matched vLLM pending | kernel wins promoted; 50% TTFT open | transfer HD512 object into a comparable full-model packet, then cold C1/C8 |
-| H100 SM90a FP8 4K/8K | W8A8 fused-GLU and descriptor-TMA HD512 qualified | ABI v5 role/hash, mixed BKV views, and packed R2 qualified | warmed Plow snapshot recorded; matched vLLM pending | provisional end-to-end snapshot | numerical FP8 gate, then cold C1/C8 |
+| H100 SM90a FP8 4K/8K | W8A8 fused-GLU and descriptor-TMA HD512 qualified | ABI v5 role/hash, mixed BKV views, packed R2, and recorded pure-GEMM default qualified | current-schema native C1 recorded; matched vLLM pending | native production topology promoted | numerical FP8 gate, then cold C1/C8 |
 | MI300X gfx942 BF16 4K/8K | no result under `g4-4k8k-v1` | shared planner/packing/VMM code present; driver gate pending | missing | unmeasured | capture four block cells and cold C1/C8 baseline |
 | MI300X gfx942 FP8 4K/8K | no result under `g4-4k8k-v1` | shared planner/packing/VMM code present; driver gate pending | missing | unmeasured | qualify dtype path, then four block cells and cold C1/C8 |
 
@@ -92,6 +93,8 @@ tracker stores enough identity to reject stale or cross-architecture evidence.
 | HD512 row-cooperative TMA issue | BQ64/BKV16, 512 threads | HD512 subtotal -6.12%/-6.82%; full-rung -1.23%/-2.12% | three seeds and packed R2 pass |
 | HD512 score-tile bank swizzle | BQ64/BKV16, score stride 20 + row-parity column swizzle | HD512 subtotal -2.03%/-1.23%; full-rung -0.27%/-0.38% | three seeds, final ABI v4 driver run, and packed R2 pass |
 | HD512 descriptor-backed K/V TMA | M4096/M8192, BQ64/BKV16, rank-3 128B-swizzled maps | direct kernel -8.60%/-9.83% versus accepted ABI v4 object | six exact seed/rung checks, mixed 2K/4K/8K packet, and packed R2 pass |
+| Pure-GEMM production topology | Gemma W8A8 SM90a TP1, all prefill rungs | restores 483 specialized segments; 4K/8K -45.09%/-42.04% versus accidental 193-segment mixed packet | recorded default, explicit `=0` rollback, checkpoint K and driver load pass |
+| HD512 ABI v5 full-rung transfer | current-schema pure packet, M4096/M8192 | three-seed mean -1.51%/-2.21% versus ABI v5 row-TMA control | every paired prompt/output checksum matches |
 | BF16 fused gate/up+GeGLU role | M4096/M8192, N15360/K3840 | five-seed full-rung -3.31%/-3.27% | matching hashes |
 
 ## Rejected H100 changes
@@ -149,8 +152,8 @@ screen must still preserve the accepted BKV16 score/PV reduction order.
 
 ## Next experiments
 
-1. H100 HD512: transfer ABI v5 into a comparable full-model packet and measure exact-rung/full-rung attribution.
-2. H100 HD512: test a non-divergent producer/consumer phase schedule after the shared-memory screen.
+1. H100 HD512: test a non-divergent producer/consumer phase schedule after the qualified descriptor-TMA full-rung transfer.
+2. H100 W8A8: qualify real-prompt logits/greedy agreement for the WS384 pure-GEMM numerics, then record the packet performance certificate.
 3. H100 HD512: qualify live-KV bucket variants and `nsplit` only where the merge pass repays shorter slices; defer GQA multicast until a history-heavy cell shows DRAM pressure.
 4. H100 GEMM: test ping-pong consumers, `stmatrix` + TMA output store, and operand multicast on exact Gemma dimensions.
 5. Devgen/plowrt: add authenticated resource envelopes and live-KV attention variant selection.

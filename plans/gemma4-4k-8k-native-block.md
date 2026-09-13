@@ -1214,3 +1214,65 @@ mixed packet JSON
 `e0bd9d9c87d646cd15f02f09eba4c8dd577537a234536eec324c61bf39ccb9c3`,
 and B2 JSON
 `e89a7f6fc4c945e81c43445da0083a1a538ad8fcdcc6f455b998d15c174827a9`.
+
+### 2026-09-13: current-schema pure-GEMM default and ABI v5 transfer
+
+The first ABI v5 full-model replay exposed a compiler/configuration defect rather
+than a kernel regression. `PLOW_SEG_PURE_GEMM=1` was a raw, unrecorded
+environment read. Replaying `build.json` without that variable emitted only 193
+segments at 4K/8K: 48 fused GLUs, 87 attention segments, and 56 mixed
+GEMM+norm/rope/quant segments. The 288 plain projection GEMMs therefore ran in
+the fat interpreter instead of the native WS384 TMA/WGMMA object. Runtime
+`--pf-seg-pure=1` cannot repair packet boundaries after compilation.
+
+Re-emitting the same packet with pure GEMM segmentation produces 483 segments:
+144 plain `GemmFp8`, 48 fused `GemmGluFp8`, 96 `QuantFp8`, 95
+norm/residual/quant chains, 48 attention, 48 head-normalization/RoPE, and four
+endpoints. A three-seed A/B against the accidental mixed packet improves mean
+p50 TTFT from 306.757 to 168.438 ms at 4K (-45.09%, 1.821x) and 635.317 to
+368.238 ms at 8K (-42.04%, 1.725x). Every 8K checksum matches. The 4K output
+checksum differs because the fat interpreter uses FP8 promoted shadow
+accumulation while the 224-register WS384 consumer cannot retain the additional
+128-register accumulator. Treat this comparison as topology/performance evidence,
+not as the numerical qualification of WS384 against the fat arm.
+
+The compiler now exposes `--emit-pure-gemm-segments`, records it in
+`emit_config`, passes the resolved value directly into `packet::devbuild`, and
+defaults it to `1` only for Gemma W8A8 SM90a TP1. Explicit `=0` remains the
+rollback; BF16, AMD, other model families, and TP>1 remain unchanged pending
+their own driver gates. Checkpoint K has a dtype-specific declared target and
+records `seg_pure_gemm=1` with source `production_default`. A replay with no raw
+`PLOW_SEG_PURE_GEMM` now loads 483 segments while runtime independently infers
+the policy with `pf_seg_pure=None`.
+
+The authoritative ABI v5 comparison uses that 483-segment topology on both
+arms. The row-TMA control object SHA256 is
+`67013b5d90267e611c18a2404a682b59b99bf021263d8ffae21ee735c049605e`;
+the descriptor-TMA candidate is
+`ecd3feeaa853ad8547d8e05c6c61d2ccf09ba7b3317fb1b7147b21dbd5349072`.
+Their packets differ by only the authenticated 59-byte role digest. Under one
+`gpulease`, rotated seeds 37/41/43 give:
+
+| Rung | row-TMA p50s (ms) | descriptor-TMA p50s (ms) | mean delta |
+|---|---|---|---:|
+| 4K | 171.140, 170.782, 170.744 | 167.666, 168.744, 168.534 | -1.51% (1.015x) |
+| 8K | 376.064, 375.606, 377.395 | 367.942, 368.167, 367.982 | -2.21% (1.023x) |
+
+All six prompt checksums and all six output checksums match, and every row
+completed 3/3. Packet SHA256 is
+`a91301c6901f8907b43838dff1f203e7028078c07fab4e201cff7e7bb822fdaa`
+for row-TMA and
+`97442246558dc2c8ca71dfc685f975e31ddebb527f06481d2d22ec3eb3175539`
+for descriptor TMA. Both manifests have SHA256
+`ada699ca639e31cf3d1ced55f590a220e20eb5e4dcdabff4ca8d6dac09752e26`.
+Evidence: `/tmp/gemma4-w8a8-hd512-abi5-{pure-row-default,desc-default}-v5`,
+`/tmp/abi5-pure-default-{row,desc}-s{37,41,43}.{json,log}`, and
+`/tmp/puregemm-full-{control,candidate}-s{17,23,29}.{json,log}`.
+
+The exact W8A8 projection census per 4K/8K rung is 48 down
+`Mx3840x15360`, 48 fused gate/up `Mx15360x3840`, 40 each local K/V
+`Mx2048x3840`, 40 local O `Mx3840x4096`, 40 local Q `Mx4096x3840`, eight
+global O `Mx3840x8192`, eight global K/V `Mx512x3840`, and eight global Q
+`Mx8192x3840`. Existing tile/stage sweeps show only sub-percent packet savings;
+the next material GEMM work is a new WS384 mainloop or fused boundary, while the
+next attention work is the non-divergent HD512 producer/consumer schedule.
