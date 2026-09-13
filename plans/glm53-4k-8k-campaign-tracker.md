@@ -1,0 +1,120 @@
+# GLM-5.3-FP8 4K/8K TTFT campaign tracker
+
+Updated: 2026-09-13
+Branch: `tp-bringup-mi300x`
+Checkpoint: `zai-org/GLM-5.3` (FP8), TP8 on 8x AMD MI300X (gfx942)
+Production serving set: `a7596da2` (packet `8b15f4a2…`, stamp `0xb47295d1df086e6b`)
+Detailed log: `docs/bringup/tp-bringup-upstream-review-log.md` (rows #81–#91); live rung board `plans/rung-board.md` (local)
+
+## Goal and rules
+
+- Cut the 4K and 8K rungs' prefill TTFT by 50% with plow-native work. Library kernels (hipBLASLt, AITER) stay where they
+  win on the same clock.
+- Let those prefill rungs carry decode rows (decode band, KV address table).
+- Follow `docs/bringup/agents/08-rung-campaign.md`: T1 CPU, T2 one GPU on the device clock, T3 rung ctrl/treat/ctrl2 in one
+  job, T4 served A/B with a paired bootstrap CI. One rung at a time; one timing method per comparison.
+- Every GPU process goes through the job queue. Raw logs and serving sets stay outside git.
+- Values: cross-process runs are nondeterministic (#50), so gates use logit floors vs off/off2, byte identity only within one
+  process, plus retrieval 39/39.
+- A default flips only after T4 passes and checkpoint P certifies every touched rung (#90).
+
+## Target matrix
+
+| rung / metric | baseline | 50% target | current best (opt-in) |
+|---|---:|---:|---|
+| P8192-0: first 8192-row chunk, prior 0 | 725.9 ms | 363 ms | 616.8 ms (row split, T3) |
+| P4096-0: first 4096-row chunk, prior 0 | 388.7 ms | 194 ms | 357.7 ms (row split, T3) |
+| P8192-S: 8192-row chunk at prior 65536 | 669.8 ms | 335 ms | 641.4 ms (G4, T3; G1 648.3) |
+| P4096-S: 4096-row tail in the sparse bucket | 390.1 ms | 195 ms | 376.4 ms (G4, T3; G1 379.9) |
+| Served C1 TTFT, ISL 8192 | 845.8 ms | 423 ms | 752.7 ms median (row split, T4, CI not clear) |
+| Served C1 TTFT, ISL 4096 | 412.6 ms | 206 ms | 386.2 ms median (row split, T4, CI not clear) |
+| vLLM 0.28, same hardware, C1 TTFT ISL 8k | 449 ms | — | reference (#81) |
+
+## Where the time goes
+
+8192-row chunk at prior 65536 (attribution v2, rank 0):
+
+| part | ms |
+|---|---:|
+| attention + fold + o_proj | 231 |
+| seam collectives (94.5 transfer) | 115 |
+| AITER MoE + shared down | 114 |
+| glue ops (non-GEMM, non-attention) | 66 |
+| TP indexer | 61 |
+| hipBLASLt GEMMs | 52 |
+| interpreter GEMMs | 20 |
+
+- At prior 0, attention runs in the interpreter (283 ms vs ~171 ms native). The native sparse route needs every row to hold
+  2048 keys (`amd_sparse_mla.rs:17,168`).
+- Served TTFT adds `begin_slot` ~100 ms on slots whose previous occupant published an 8192-token prefix, tokenize
+  8.6–17 ms, and an untimed 10–16 ms handler remainder.
+
+## Levers
+
+| lever | rung | knob | state | measured | next gate |
+|---|---|---|---|---|---|
+| Sparse tail floor 8192 | P4096-S | `PLOW_AMD_TAIL_SPARSE_CTX` | default (#82) | final chunks at prior ≥ 8192 run the sparse bucket | floors 2048/4096 T3 |
+| Row split | P8192-0, P4096-0 | `PLOW_MLA_PF_ROW_SPLIT` | opt-in (#84) | T3 −109 / −31 ms; T4 medians 856.6 → 752.7 ms C1, 1697 → 1488 ms C16, CIs touch 0 (#91) | T4 re-run on the begin_slot fix |
+| G1 union skip | P8192-S | `PLOW_AMD_UNION_SKIP` | opt-in (#85) | T3 −18.7 ms (floor 3.7); P4096-S −11.1 | T4 `glue2-t4-*` (with G4) |
+| G4 MoE shared seed | P8192-S | `PLOW_GLM_MOE_SHARED_SEED` | opt-in (#86) | T3 −7.3 ms (floor 2.3); P4096-S −3.3; P8192-0 −8.6 | T4 `glue2-t4-*` |
+| begin_slot copy-out | P8192-0 admission | `PLOW_VMM_RELEASE_RETIRE` | built | baseline clear 102.8 ms; v1 smoke FAIL (0.4–119 ms); v2 reuses mapped spares, zero ioctls per request | spare probe, smoke2, T4 |
+| Prefix cache fix + fine rows | all | `PLOW_VMM_CACHE_MIN_FREE_MIB`, `PLOW_AMD_PREFIX_FINE_ROWS` | fix default, knobs opt-in (#83) | 0/0 mismatches over 63 attaches | — |
+| Small-rung workgroup cap `auto` | P512, P128 | small-rung CUs | opt-in | T4 r1 not beyond ctrl spread | T4 r2 |
+| Decode band on prefill rungs | Band64 | `PLOW_GLM_ORDINARY_BAND`, `PLOW_AMD_DECODE_BAND_ROWS` | built | CPU gates; knob-off emit byte-identical | 1-layer token equality |
+| KV address table + dynamic slots | D20, Band64 | `PLOW_GLM_KV_ADDR`, `PLOW_KV_ADDR`, `PLOW_AMD_KV_SLOTS` | patch ready | floor gate a PASS (3.72e-2 vs 6.94e-2) | gates b/c/d |
+| Admission path | served TTFT | — | unowned | `encode_fast` 9.6 → 7.2 ms (CPU, 8.5k tokens) | lever card |
+
+## Rejected or parked
+
+| candidate | reason |
+|---|---|
+| Plow GEMM tiles, split-K, grid (#87) | hipBLASLt wins every prefill shape on one clock; plow keeps GEMV at decode 1–2 |
+| Decode kernel re-pick (#88) | T2 −7.7 ms predicted; T3 +0.5 ms measured |
+| G2 router pre-all-gather | −1.2 ms, inside the 4.3 ms floor |
+| FP8 keys in sparse attention | measured negative |
+| FP8 block-scale prefill GEMMs | no end-to-end gain |
+| Two micro-batches, GEMM+RS fusion, parallel decode enqueue, kernarg cache, XRN fusion | fixed cost or null |
+| Token-batch bodies with seams | corrupt output |
+| begin_slot: parallel ranks | 0.93x (driver serializes unmaps process-wide) |
+| begin_slot: pre-retire at finish | 85 ms of serialized unmaps vs a ~35 ms gap |
+
+## Current architecture finding
+
+Each prefill bucket (128/512/2048/8192) is one compiled program; dense vs sparse attention is fixed at emit. Per chunk the
+runtime picks a bucket, native vs interpreter attention (`prior >= 2047`), and patches row counts, prior and `in.kvlen`.
+Top-k 2048 keeps attention flat with context; only the indexer grows. No object, wave or split count switches with context.
+
+Gaps:
+1. Chunks starting below 2047 run all attention in the interpreter. Row split fixes it opt-in.
+2. Final chunks at prior 2047..8191 stay dense: the sparse move was measured only from 8192.
+3. Native sparse decode needs every row ≥ 2048 keys (`amd_sparse_mla.rs:1110`): one short row sends the rung to the
+   interpreter.
+4. The indexer grows 18 ms (prior 0) → 61 ms (prior 65536) per 8192 chunk with one kernel for every length.
+5. The decode dense/sparse switchover (65536) was measured on TP4 and is fixed per packet.
+6. Cap, GF and the sparse decode split count are baked at maximum context.
+
+## Next experiments (agents launched 2026-09-13)
+
+| agent | lever | owner rung | first gate |
+|---|---|---|---|
+| packproj | one GEMM per group of projections sharing an input | D20 | T2 packed vs separate, launch cost included |
+| fusepost | GEMM plus following pointwise ops in one pass | P8192-S | T2 on the top glue ops |
+| parbranch | independent branches on separate device queues; GEMMs during reduce-scatter | D20 | T0 multi-queue feasibility |
+| w8gemv | per-call weight packing check; FP8 weights in decode 1–4 GEMV | D1 | accuracy gate before T4 |
+| spseam | projections on the sequence-parallel row shard | P8192-S | SP status and pricing |
+| pfroute | gaps 1–2: tail floor 2048/4096, row split T4 re-run, row split's interpreter half | P4096-S, P8192-0 | tail-floor T3 |
+| decrowsplit | gap 3: per-row split for native sparse decode | D20 | mixed-rung price and frequency |
+| idxtier | gap 4: exact indexer tiers by length, then block pre-selection behind a quality gate | P8192-S | per-stage attribution |
+| livectx | gaps 5–6: TP8 decode switchover, live cap/GF/split counts | D20 | crossover table |
+
+Not measured yet: the stacked path. No served run combines row split, G1, G4 and the begin_slot fix, and production and the
+real-world vLLM campaign serve none of them. Run the stacked served A/B once the begin_slot fix and the G1+G4 T4 pass.
+
+## Resume protocol
+
+1. Pull `tp-bringup-mi300x`; read this tracker, the review log rows and `docs/bringup/agents/08-rung-campaign.md`.
+2. Reuse the production set as control. Change one variable per candidate; keep ctrl and ctrl2 in the same job.
+3. Register every new knob (`crates/devgen/src/knob_spec.rs`, `crates/plowrt/src/knob_spec.rs`), run the knob tests, and run
+   checkpoint S for emit knobs.
+4. Land qualified code opt-in with a review-log row; flip a default only with T4 and a checkpoint P certificate.
+5. Update this tracker's lever and rejected rows so failed experiments are not repeated.
