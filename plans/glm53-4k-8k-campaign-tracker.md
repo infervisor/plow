@@ -28,7 +28,7 @@ Detailed log: `docs/bringup/tp-bringup-upstream-review-log.md` (rows #81–#91);
 | P4096-S: 4096-row tail in the sparse bucket | 390.1 ms | 195 ms | 376.4 ms (G4, T3; G1 379.9) |
 | Served C1 TTFT, ISL 8192 | 845.8 ms | 423 ms | 752.7 ms median (row split, T4, CI not clear) |
 | Served C1 TTFT, ISL 4096 | 412.6 ms | 206 ms | 386.2 ms median (row split, T4, CI not clear) |
-| vLLM 0.28, same hardware, C1 TTFT ISL 8k | 449 ms | — | reference (#81) |
+| vLLM 0.28, same hardware, C1 TTFT (exact length, unprofiled) | 570.0 ms (8192), 310.6 ms (4096) | — | `vllm-8k-profile`; the older 449 ms (#81) used a different recipe |
 
 ## Where the time goes
 
@@ -49,6 +49,12 @@ Detailed log: `docs/bringup/tp-bringup-upstream-review-log.md` (rows #81–#91);
 - Served TTFT adds `begin_slot` ~100 ms on slots whose previous occupant published an 8192-token prefix, tokenize
   8.6–17 ms, and an untimed 10–16 ms handler remainder.
 
+vLLM per-op profile (`reports/vllm-8k-profile.md`), 8192 at prior 0: GPU span 560.0 ms vs plow 721.3 ms. Attention is
++159.9 ms of the gap; host/admission adds +114.5 ms to TTFT (+16.4 with begin_slot v3). Plow is level or ahead on MoE,
+collectives, indexer and glue. At 4096 the GPU gap is +53 ms. At 8192 over prior 65536 plow is ahead: 669.8 vs 860.3 ms,
+with vLLM's indexer at 308.5 ms per chunk vs plow's 79.7. vLLM's attention speed comes from FP8 query and keys in place
+(`pagedps` below: 20–60× plow's attention error), so it is a precision trade rather than a missing kernel.
+
 ## Levers
 
 | lever | rung | knob | state | measured | next gate |
@@ -60,13 +66,13 @@ Detailed log: `docs/bringup/tp-bringup-upstream-review-log.md` (rows #81–#91);
 | Projection packing | D20, P8192-S | `PLOW_GLM_PACK_PROJ` | built | T2 13/13 PASS; outputs copied by new op `ColSplit` (161) inside the following interpreter segment; hipBLASLt routes only; knob-off byte-identical; checkpoint S accepted | T3 `packproj-t3` (predicted −4.7…−6.6 ms per 8192 chunk, −0.6…−2.1 ms per D20 step) |
 | GEMM + q RoPE fusion | P8192-S | `PLOW_GLM_FUSE_POST` | built | T2 bit-exact, 6/6 trials: 171.6 → 119.1 µs per q_rope GEMM at M=8192 (≈ −4.1 ms/chunk); other fusions rejected (no GEMM→pointwise adjacency) | T3 `fusepost-t3` |
 | Parallel device queues | D20 | `PLOW_AMD_PAR_BRANCH` | built | T2b paired units −19.6 / −28.3 / −59.2 µs (K=2/3/5); predicted −2.6…−4 ms per D20 step in production terms; native GEMMs only, collectives on queue 0 | T3 `parbranch-t3-d20` |
-| Dense decode at kv ≤ 2048 (exact) | D1, D8 | `PLOW_GLM_DECODE_DENSE_EXACT` (emit) + `PLOW_AMD_DECODE_DENSE_EXACT` (runtime) | built, T1 pass | full depth kv 2048: D1 50.1 → 44.1 ms (−12%), D8 39.7 → 35.5 ms (−10.6%); net after indexer key writes ≈ −4.1…−4.6 / −2.3…−2.8 ms; top-2048 over ≤ 2048 keys selects every key, so the path is exact; knob-on packet +6 dense decode programs, +51 MB, ≈ +90 MiB VRAM/rank; knob-off byte-identical; checkpoint S accepted | smoke `livectx-dx-l1-smoke`, T3 `livectx-t3-dx-r1/r8/b20` |
-| G1 union skip | P8192-S | `PLOW_AMD_UNION_SKIP` | opt-in (#85) | T3 −18.7 ms (floor 3.7); P4096-S −11.1 | T4 `glue2-t4-*` (with G4) |
-| G4 MoE shared seed | P8192-S | `PLOW_GLM_MOE_SHARED_SEED` | opt-in (#86) | T3 −7.3 ms (floor 2.3); P4096-S −3.3; P8192-0 −8.6 | T4 `glue2-t4-*` |
+| Dense decode at kv ≤ 2048 (exact) | D8, D16, D20 | `PLOW_GLM_DECODE_DENSE_EXACT` (emit) + `PLOW_AMD_DECODE_DENSE_EXACT` (runtime) | T3 + served C1 pass (P floor) | full depth kv 2048: D1 50.1 → 44.1 ms (−12%), D8 39.7 → 35.5 ms (−10.6%); net after indexer key writes ≈ −4.1…−4.6 / −2.3…−2.8 ms; top-2048 over ≤ 2048 keys selects every key, so the path is exact; full depth T3 (ms/step): D8 38.69 → 36.64 (−5.2%), D20 52.30 → 49.18 (−5.8%), D1 +12.95 from one intermittent ~1 s stall (scoped out: rungs ≥ 8 only); 1-layer logits byte-identical to sparse ≤ kv 2048, transition past 2048 within the off-vs-off floor; served C1 TPOT 37.72 → 35.93 ms (−4.7%, P floor 0.065 ms), TTFT unchanged; knob-on packet +16.2 MB, ≈ +50 MiB VRAM/rank; knob-off byte-identical; checkpoint S accepted | GSM8K + retrieval on the treat arm |
+| G1 union skip | P8192-S | `PLOW_AMD_UNION_SKIP` | opt-in (#85), T4 pass on P floor | T3 −18.7 ms (floor 3.7); P4096-S −11.1; T4 with G4: C1 TTFT −36.9 ms [−47.3, −29.8] at ISL 16384, −17.6 [−19.5, −15.8] at 12288; C16 TPOT −2.57 / −2.27 ms (CIs clear); C16 TTFT unresolvable (harness ±400–480 ms); retrieval 39/39 on all arms | checkpoint P certificate, then runtime default flip |
+| G4 MoE shared seed | P8192-S | `PLOW_GLM_MOE_SHARED_SEED` | opt-in (#86), T4 pass on P floor (with G1) | T3 −7.3 ms (floor 2.3); P4096-S −3.3; P8192-0 −8.6 | P certificate; emit default flips with the next production serving-set regeneration |
 | begin_slot copy-out | P8192-0 admission | `PLOW_VMM_RELEASE_RETIRE` | v3 smoke PASS | baseline clear 102.8 ms; v1 smoke FAIL (0.4–119 ms); spare probe: copy into mapped spares 11.15 ms serial / 2.13 ms parallel (8 GPUs × 78 blocks); v2 smoke2 FAIL (117 ms max: with no spare, 78 maps per rank serialize to 115–153 ms and lose the race to admission) ; v3 (spare pool mapped at load, 354 MiB/rank from the existing KV pool cap; copies outside the process lock; 5 ms bounded wait) smoke3 PASS: every clear 0.38–0.90 ms, 0 inline unmaps, all copies from mapped spares | T4 `slotclear-t4-arms3` + retrieval guard |
 | Prefix cache fix + fine rows | all | `PLOW_VMM_CACHE_MIN_FREE_MIB`, `PLOW_AMD_PREFIX_FINE_ROWS` | fix default, knobs opt-in (#83) | 0/0 mismatches over 63 attaches | — |
-| Small-rung workgroup cap `auto` | P512, P128 | small-rung CUs | opt-in | T4 r1 not beyond ctrl spread; T4 r2 ISL 128: medians C1 126.1/121.5 → 108.0/112.0 ms, C16 249 → 222 ms, TPOT C16 −3.1 ms (CI clear); C16 TTFT CI crosses 0, C1 controls drifted (−7.2 ms, CI excludes 0) → FAIL at ISL 128; `wide` weaker | T4 r2 ISL 512 |
-| Decode band on prefill rungs | Band64 | `PLOW_GLM_ORDINARY_BAND`, `PLOW_AMD_DECODE_BAND_ROWS` | built | CPU gates; knob-off emit byte-identical; gate load refusals fixed in turn: decode row cap 20 → 64 (interpreter FP8 arm is row-count-general), decode objects compiled from the wrong source tree (bare relative build path after a cwd reset), missing vendor/adapter objects; v4 refused: `in.decode_slot` needs the shared-prefix VMM KV layout, which the 1-layer probe does not build | v5: gate env or layout fix, then 1-layer token equality |
+| Small-rung workgroup cap `auto` | P512, P128 | small-rung CUs | opt-in, T4 FAIL | T4 r2 ISL 128: C1 TTFT −12.5 ms (controls drifted), C16 TPOT −3.1 ms; ISL 512: C1 TTFT −3.2 ms [−4.7, −1.9], C16 TPOT −0.58 ms; C16 TTFT CIs cross 0 at both ISLs (harness ±110 ms); `wide` no better | C16-only rerun with more prompts, if pursued |
+| Decode band on prefill rungs (status 15:40) | Band64 | `PLOW_GLM_ORDINARY_BAND`, `PLOW_AMD_DECODE_BAND_ROWS` | built | CPU gates; knob-off emit byte-identical; gate load refusals fixed in turn: decode row cap 20 → 64 (interpreter FP8 arm is row-count-general), decode objects compiled from the wrong source tree (bare relative build path after a cwd reset), missing vendor/adapter objects; v4 refused: `in.decode_slot` needs the shared-prefix VMM KV layout; fixed by sizing KV rows to max(decode ladder, band cap); v5 `band.` runtime prefix; v6 `in.kvlen` capacity check; v7 loads on TP8; v8 cross-rank band program choice tied on HashMap order (fixed); v9 decode reference padding; v9/v10 GPU fault at a 2 MiB VMM block boundary (probe read the unbacked kv-addr scratch slot; band staging never mapped rows) | v11: idle band rows must address the scratch slot, and the GPU bystander isolation check must always run |
 | KV address table + dynamic slots | D20, Band64 | `PLOW_GLM_KV_ADDR`, `PLOW_KV_ADDR`, `PLOW_AMD_KV_SLOTS` | patch ready | floor gate a PASS (3.72e-2 vs 6.94e-2) | gates b/c/d |
 | Admission path | served TTFT | — | unowned | `encode_fast` 9.6 → 7.2 ms (CPU, 8.5k tokens) | lever card |
 
@@ -87,6 +93,7 @@ Detailed log: `docs/bringup/tp-bringup-upstream-review-log.md` (rows #81–#91);
 | Load-time weight pre-packing | nothing to pack: GEMV reads weights in place (`interp.hip:2322-2331`); GemmSmall's per-launch tile copy is the cache load itself |
 | More projections on the sequence-parallel row shard (spseam) | SP seams and `_PROJ` are already default (−68 ms T3, #54–#69); four leftovers total −2.4…−4.0 ms, each below the P8192-S floor; FP8 MoE-input gather (≈ −13 ms) needs a W8A8 shared expert |
 | GEMMs during reduce-scatter (parbranch) | 0.0 ms of independent work in the 8 segments after any collective on D20 and P8192-S |
+| Paged in-place FP8 sparse attention (vLLM's AITER `mla_a8w8_qh16_qseqlen1_gqaratio16_ps`) | T2 numerics: attention rel-L2 1.8e-2…9.7e-2 at prior 65536 and 1.6e-2…9.9e-2 at prior 0 vs plow's bf16 floor 5.7e-4…1.5e-3; timing skipped |
 | Per-row split for native sparse decode (decrowsplit) | native output on rows < 2048 keys is wrong (rel err ≈ 1.0), so the 2048 check stays; a split costs 170–191 µs per layer at D20 vs 108 µs for the interpreter rung (+5–6 ms/step); production decode never takes the native route (`PLOW_GLM_MLA_DEC_AITER` off) |
 | Indexer span/tile tiers (idxtier) | span 2048/4096 identical on the slowest rank; tile 64 bit-identical and never faster |
 | Prior-0 indexer rank skew | in flow ≈ 0.1 ms per 8192 chunk, below the floor |
@@ -128,7 +135,10 @@ real-world vLLM campaign serve none of them. Run the stacked served A/B once the
 
 - MTP speculative decoding (full depth): gate B PASS after fixing draft steps 2+ reusing step 1's top-k over a longer
   kv_len (read a −1 selection row → GPU fault). Acceptance 739/815 drafted (90.7%), 3.68 committed tokens per verify
-  at k=3; spec on vs off identical 6/8 in one process (divergence under investigation), T3 TPOT A/B next.
+  at k=3. The 2/8 same-process divergence is benign: commits equal the verify argmax, and both flips sit on near-ties
+  (margins 0.375 and 0.000) within the logit floor. T3 TPOT A/B with natural-text and random cells is queued.
+- AITER attention objects: plow's pinned `mla_a16w16_qh8…v3.co` (and `mla_a8w8_qh8…v1.co`) carry a zero argument-block
+  size in their descriptor, which plow's `load_attention` patches; loading them through AITER directly faults.
 - `/dev/null` on the host was replaced by a regular file around 10:07 and restored at ~10:15; cause unknown.
 - On the production decode object (MM=16) at one row, GEMV costs 5.6× the MM=1 build: q_a|kv_a|k_rope 60 vs 10.7 µs,
   o_proj 37.4 vs 11.0 µs (w8gemv T2). Relevant to the single-row decode program (b1) and to decode rungs 1–4.
