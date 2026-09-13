@@ -1332,6 +1332,9 @@ __device__ void d_flash_merge(__nv_bfloat16* __restrict__ O, const float* __rest
 #ifndef PLOW_NV_FA_TMA
 #define PLOW_NV_FA_TMA 0
 #endif
+#ifndef PLOW_NV_FA_TMA_ROW_WARP
+#define PLOW_NV_FA_TMA_ROW_WARP 0
+#endif
 #define FA_PX4_ELIGIBLE(HD) (PLOW_NV_FA_PIPE && PLOW_NV_FA_PX4 && (HD) == 512)
 /* ---- fp8-KV FAST-prefill staging (beat-fp8-prefill Exp1) ------------------------------------
  * The PIPE=1 cp.async ring cannot dequant e4m3 inline, so the fp8 arm stages RAW e4m3 bytes into
@@ -2016,25 +2019,47 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
 #error "PLOW_NV_FA_TMA staging is bf16-only; build fp8-KV prefill with PLOW_NV_FA_PIPE=0"
 #endif
         /* TMA staging: one cp.async.bulk per contiguous [kv][hd] row, counted on mbar[K|V].
+         * The BQ64/BKV16 object distributes those row transfers over one warp; issuing all 16
+         * from lane zero leaves the TMA path on the critical path at the exact 4K/8K shapes.
          * Ragged tail V rows are ZEROED (stale smem could hold NaN bits; 0*NaN != 0 in the mma).
          * Ragged K rows only feed masked score columns, which the softmax never reads. */
         auto stageK = [&](unsigned kv0) {
             const unsigned nrows = (hi > kv0) ? ((hi - kv0 < (unsigned)BKV) ? hi - kv0 : (unsigned)BKV) : 0;
+#if PLOW_NV_FA_TMA_ROW_WARP
+            static_assert(BKV <= 32, "row-warp TMA staging requires at most one warp of rows");
+            if (tid == 0) fa_mbar_expect_tx(&mbar[0], nrows * HD * 2);
+            __syncwarp();
+            if ((unsigned)tid < nrows)
+                fa_cp_bulk_g2s(&Ks[tid * (HD + PAD)],
+                               Kb + (size_t)((kv0 + (unsigned)tid) & kv_mask) * HD,
+                               HD * 2, &mbar[0]);
+#else
             if (tid == 0) {
                 fa_mbar_expect_tx(&mbar[0], nrows * HD * 2);
                 for (unsigned r = 0; r < nrows; r++)
                     fa_cp_bulk_g2s(&Ks[r * (HD + PAD)], Kb + (size_t)((kv0 + r) & kv_mask) * HD,
                                    HD * 2, &mbar[0]);
             }
+#endif
         };
         auto stageV = [&](unsigned kv0) {
             const unsigned nrows = (hi > kv0) ? ((hi - kv0 < (unsigned)BKV) ? hi - kv0 : (unsigned)BKV) : 0;
+#if PLOW_NV_FA_TMA_ROW_WARP
+            static_assert(BKV <= 32, "row-warp TMA staging requires at most one warp of rows");
+            if (tid == 0) fa_mbar_expect_tx(&mbar[1], nrows * HD * 2);
+            __syncwarp();
+            if ((unsigned)tid < nrows)
+                fa_cp_bulk_g2s(&Vs[tid * (HD + PAD)],
+                               Vb + (size_t)((kv0 + (unsigned)tid) & kv_mask) * HD,
+                               HD * 2, &mbar[1]);
+#else
             if (tid == 0) {
                 fa_mbar_expect_tx(&mbar[1], nrows * HD * 2);
                 for (unsigned r = 0; r < nrows; r++)
                     fa_cp_bulk_g2s(&Vs[r * (HD + PAD)], Vb + (size_t)((kv0 + r) & kv_mask) * HD,
                                    HD * 2, &mbar[1]);
             }
+#endif
             if (nrows < (unsigned)BKV)
                 for (int idx = tid; idx < (BKV - (int)nrows) * HD; idx += THREADS) {
                     int r = (int)nrows + idx / HD, c = idx % HD;
