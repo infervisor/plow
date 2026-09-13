@@ -40,8 +40,14 @@
 #ifndef PLOW_NV_FA512_WG
 #define PLOW_NV_FA512_WG 1
 #endif
+#ifndef PLOW_NV_FA512_PC
+#define PLOW_NV_FA512_PC 0
+#endif
 
 #include "op_attention.cuh"
+#if PLOW_NV_FA512_PC
+#include "hd512_pc.cuh"
+#endif
 
 using bf16 = __nv_bfloat16;
 constexpr int HD = PLOW_FA_SWEEP_HD;
@@ -61,7 +67,9 @@ static_assert(HD == 256 && BKV == 32);
 #if PLOW_NV_FA_WGITEM
 static_assert(HD == 256 && BKV == 32);
 #endif
-#if PLOW_NV_FA_WGITEM_ONE
+#if PLOW_NV_FA512_PC
+static_assert(HD == 512 && BKV == 32 && THREADS == 384);
+#elif PLOW_NV_FA_WGITEM_ONE
 static_assert(THREADS == 128);
 #else
 static_assert(THREADS == 256);
@@ -74,6 +82,28 @@ static_assert(THREADS == 256);
     std::fprintf(stderr, "%s: %s\n", #call, text ? text : "driver error"); std::exit(2); } } while (0)
 
 template <int D, int BK>
+#if PLOW_NV_FA512_PC
+__global__ __maxnreg__(160) void attention_kernel(
+    float*, float*, const bf16* q, const bf16* k, const bf16* v, bf16* out,
+    unsigned rows, unsigned kv_length, unsigned kv_stride, unsigned kv_mask,
+    unsigned nsplit, const void* maps) {
+    extern __shared__ float arena[];
+    if (threadIdx.x < 128)
+        fa90_pc_reg_dec<PLOW_FA512_PC_PRODUCER_REGS>();
+    else
+        fa90_pc_reg_inc<PLOW_FA512_PC_CONSUMER_REGS>();
+    if (threadIdx.x < 128)
+        d_flash_prefill_sm90_pc512<true, D, BQ, BK>(
+            q, k, v, out, rows, kv_length, HEADS, KV_HEADS, kv_length - rows,
+            WINDOW, nsplit, kv_stride, kv_mask, 1.0f / sqrtf(float(D)), blockIdx.x,
+            gridDim.x, arena, maps);
+    else
+        d_flash_prefill_sm90_pc512<false, D, BQ, BK>(
+            q, k, v, out, rows, kv_length, HEADS, KV_HEADS, kv_length - rows,
+            WINDOW, nsplit, kv_stride, kv_mask, 1.0f / sqrtf(float(D)), blockIdx.x,
+            gridDim.x, arena, maps);
+}
+#else
 __global__ void attention_kernel(float* partial, float* stats, const bf16* q,
                                  const bf16* k, const bf16* v, bf16* out,
                                  unsigned rows, unsigned kv_length,
@@ -85,6 +115,7 @@ __global__ void attention_kernel(float* partial, float* stats, const bf16* q,
         kv_stride, kv_mask, 1.0f / sqrtf(float(D)), blockIdx.x, gridDim.x,
         arena, nullptr, maps);
 }
+#endif
 
 template <int D>
 __global__ void merge_kernel(bf16* out, const float* partial, const float* stats,
@@ -186,7 +217,9 @@ int main(int argc, char** argv) {
     }
 
     size_t smem = FA_PRE_SMEM_FLOATS(HD, BQ, BKV) * sizeof(float);
-#if PLOW_NV_FA_GQA2_PAIR
+#if PLOW_NV_FA512_PC
+    smem = FA_SM90_PC512_FLOATS * sizeof(float);
+#elif PLOW_NV_FA_GQA2_PAIR
     smem = FA_SM90_GQA2_PAIR_FLOATS(HD, BQ, BKV) * sizeof(float);
 #elif PLOW_NV_FA_WGITEM_ONE
     smem = FA_SM90_WGI_ONE_FLOATS(HD, BQ, BKV) * sizeof(float);
@@ -291,7 +324,9 @@ int main(int argc, char** argv) {
     std::sort(samples.begin(), samples.end());
 
     const char* warp_layout =
-#if PLOW_NV_FA_GQA2_PAIR
+#if PLOW_NV_FA512_PC
+        "hd512_pc";
+#elif PLOW_NV_FA_GQA2_PAIR
         "gqa2_pair";
 #elif PLOW_NV_FA_WGITEM_ONE
         "one_wg";
@@ -300,6 +335,12 @@ int main(int argc, char** argv) {
 #else
         "hd_split";
 #endif
+    constexpr int stages =
+#if PLOW_NV_FA512_PC
+        2;
+#else
+        FA_SM90_STAGES(HD, BKV);
+#endif
     std::printf("{\"phase\":\"prefill\",\"seed\":%u,\"head_dim\":%d,\"query_rows\":%u,"
                 "\"kv_length\":%u,\"window\":%d,\"nsplit\":%u,\"bq\":%d,"
                 "\"bkv\":%d,\"warp_layout\":\"%s\",\"warps\":%u,"
@@ -307,7 +348,7 @@ int main(int argc, char** argv) {
                 "\"local_bytes\":%zu,\"checked\":%u,\"worst_rel_l2\":%.9g,"
                 "\"max_abs\":%.9g,\"correct\":%s,\"repetitions\":%u,\"samples_us\":[",
                 seed, HD, rows, kv_length, WINDOW, nsplit, BQ, BKV, warp_layout, THREADS / 32,
-                FA_SM90_STAGES(HD, BKV), tma_active ? "true" : "false", smem,
+                stages, tma_active ? "true" : "false", smem,
                 attributes.numRegs, size_t(attributes.localSizeBytes), checked,
                 worst_rel, max_abs, correct ? "true" : "false", repetitions);
     for (size_t i = 0; i < samples.size(); ++i)
