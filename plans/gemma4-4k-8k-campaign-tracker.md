@@ -118,6 +118,7 @@ tracker stores enough identity to reject stale or cross-architecture evidence.
 | Generic coalesced GEMM epilogue | packet result +0.41%/-0.11% |
 | Fused residual+next-norm opcode | slower and greedy checksums changed |
 | HD512 1QK+3PV warpgroup split | spill-free and exact, but 5.5% slower at 4K and 6.4% slower at 8K than the promoted wait-elided object |
+| WS384 BN128/NS6 consumer ping-pong | ptxas serializes the overlap; BF16 long-K down regresses 22.2%/15.3% at 4K/8K, while FP8 gains a 512-byte stack frame |
 
 ## Current architecture finding
 
@@ -163,7 +164,7 @@ screen must still preserve the accepted BKV16 score/PV reduction order.
 1. H100 HD512: preserve BKV16 arithmetic while flattening packed requests into one global CTA work pool; bucket by live KV and measure cold 4K/8K plus history-heavy concurrency.
 2. H100 W8A8: qualify real-prompt logits/greedy agreement for the WS384 pure-GEMM numerics, then record the packet performance certificate.
 3. H100 HD512: qualify live-KV bucket variants and `nsplit` only where the merge pass repays shorter slices; defer GQA multicast until a history-heavy cell shows DRAM pressure.
-4. H100 GEMM: test the exact-shape WS384 BN128/NS6 consumer ping-pong against matched SMEPI controls, followed by `stmatrix` + TMA output store and operand multicast.
+4. H100 GEMM: test a separate `stmatrix` + TMA output-store phase and operand multicast on exact Gemma dimensions; do not overlap epilogue reads with live WGMMA accumulators.
 5. Devgen/plowrt: add authenticated resource envelopes and live-KV attention variant selection.
 6. MI300X: run the same four exact block cells and attribute GEMM/attention/light/dispatch before changing kernels.
 7. Run matched H100 and MI300X BF16/FP8 full-model C1/C8/heavy-concurrency gates only after block winners qualify.

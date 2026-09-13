@@ -1404,6 +1404,20 @@ Evidence: `/tmp/hd512-snake-current/{exact4k-results,history-results}.jsonl`,
 The spill-free four-warpgroup follow-up is rejected. A 1QK+3PV split compiles
 at 128 registers with zero stack/spills but runs 5.5% slower at 4K and 6.4%
 slower at 8K than the wait-elided control. The next attention experiment is an
-exact-order global work pool for packed requests. The next GEMM experiment is
-the exact-shape WS384 BN128/NS6 consumer ping-pong candidate under matched
-SMEPI controls.
+exact-order global work pool for packed requests.
+
+The exact-shape WS384 BN128/NS6 consumer ping-pong screen is also rejected.
+The prototype issued the first K step for tile `t+1` into a second accumulator
+bank before storing tile `t`. Both BF16 arms remain exact against the same
+BN128/NS6 packet object, and each direct entry stays at 160 registers with zero
+stack. Ptxas nevertheless serializes WGMMA because the intervening epilogue
+reads accumulator registers. The BF16 long-K down projection regresses from
+881.056 to 1076.480 us at 4K (+22.2%) and from 1728.416 to 1992.512 us at 8K
+(+15.3%). The FP8 specialization also creates a 512-byte stack frame and is
+rejected before timing. Evidence:
+`/tmp/ws384-bn128ns6-pingpong-75099793.patch` and
+`/tmp/ws384-pingpong-bf16-down-75099793.log`.
+
+The next GEMM structure must move completed accumulators out of the WGMMA
+register region before overlap. Screen an `stmatrix` shared-memory drain plus
+TMA output-store phase, then operand multicast across exact-shape CTAs.
