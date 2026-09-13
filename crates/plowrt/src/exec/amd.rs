@@ -5710,6 +5710,8 @@ struct AmdProg {
     decode_routes: Vec<DecodeSegmentRoute>,
     /// Optional raw gfx950 route for a pure MXFP4 grouped-MoE Down+Combine segment.
     prefill_routes: Vec<PrefillSegmentRoute>,
+    /// Per segment: the sparse flash segment whose active route leaves this `IndexUnionPf` unread.
+    union_skip: Vec<Option<usize>>,
     /// Immutable device-side typed arguments for raw XR+AttnRes routes. Routes retain only their
     /// addresses; this owner therefore keeps every pointer valid across queued segment launches.
     _xreduce_attnres_args: Vec<DeviceMem>,
@@ -9319,14 +9321,22 @@ impl AmdEngine {
             } else {
                 vec![PrefillSegmentRoute::Interpreter; seg_class.len()]
             };
+            let mut union_skip = Vec::new();
             if p.role.is_prefill_side() {
                 add_kda_key_factor_routes(p, &devp, &mut prefill_routes, kda_key_factor_scratch)?;
                 mla_materialized_routes(p, &devp, &mut prefill_routes)?;
                 if use_sparse_mla {
-                    for (seg, route) in amd_sparse_mla::routes(p, &blob.tensors, seg_class.len())?
-                        .into_iter()
-                        .enumerate()
-                    {
+                    let sparse = amd_sparse_mla::routes(p, &blob.tensors, seg_class.len())?;
+                    union_skip = amd_sparse_mla::union_skip_table(
+                        crate::config::RuntimeConfig::get().amd.union_skip,
+                        p,
+                        &sparse,
+                    );
+                    let skippable = union_skip.iter().flatten().count();
+                    if skippable != 0 {
+                        tracing::info!(prog = prog_ix, skippable, "index union segments unread on the active sparse route");
+                    }
+                    for (seg, route) in sparse.into_iter().enumerate() {
                         if let Some(route) = route {
                             if !matches!(prefill_routes[seg], PrefillSegmentRoute::Interpreter) {
                                 return Err(RuntimeError::Device(
@@ -9669,6 +9679,7 @@ impl AmdEngine {
                 },
                 decode_routes,
                 prefill_routes,
+                union_skip,
                 _xreduce_attnres_args: xreduce_attnres_args,
                 trace_records: p.stream.len(),
                 n_counter: p.n_counter,
@@ -11333,6 +11344,9 @@ impl AmdEngine {
             self.seg_launches += 1;
             return Ok(());
         }
+        if self.union_unread(p, seg) {
+            return Ok(());
+        }
         let active = self.packed_prefill.is_some_and(|b| b.prog == p);
         // The class-A native routes (fold, hipBLASLt, AITER MoE) run over the dense live rows
         // whether or not a packed binding is staged; the two sparse routes take the staged
@@ -11873,6 +11887,15 @@ impl AmdEngine {
         self.be.begin_dispatch_chain(packets)
     }
 
+    /// An `IndexUnionPf` segment whose only reader is a sparse flash on its active native route.
+    fn union_unread(&self, p: usize, seg: usize) -> bool {
+        let g = &self.progs[p];
+        !self.packed_prefill.is_some_and(|b| b.prog == p)
+            && g.union_skip.get(seg).copied().flatten().is_some_and(|flash| {
+                matches!(g.prefill_routes.get(flash), Some(PrefillSegmentRoute::SparseMla(r)) if r.active)
+            })
+    }
+
     /// Exact AQL packets `enqueue_segment` emits for one prefill segment. A phase
     /// chain reserves this many before ringing, so the count must track the
     /// multi-launch route branches in `enqueue_segment`; the commit check refuses
@@ -11882,6 +11905,9 @@ impl AmdEngine {
         let active = self.packed_prefill.is_some_and(|b| b.prog == p);
         if !prefill_segment_specialization_allowed(self.prog_dispatch(p)) {
             return 1;
+        }
+        if self.union_unread(p, seg) {
+            return 0;
         }
         if active {
             return match self.progs[p].prefill_routes.get(seg) {

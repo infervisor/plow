@@ -62,6 +62,69 @@ pub(super) fn union_handle(inst: &DevInst64) -> Option<u32> {
     }
 }
 
+/// Per segment: a sparse flash segment reading the table of the lone `IndexUnionPf` in it, when
+/// every reader of that table is a natively routed sparse flash (a union also feeds the flashes of
+/// the layers that reuse its indexer). All of a program's sparse routes rebase with the same
+/// rows/prior, so while that route is active none reads the union and the host may skip its
+/// segment. `routes` is the output of [`routes`].
+pub(super) fn unread_unions(prog: &DevProg, routes: &[Option<Route>]) -> Vec<Option<usize>> {
+    let n = prog.insts.len();
+    let mut owner = vec![None::<usize>; n];
+    let mut clean = vec![true; n];
+    for e in prog.stream.iter().chain(&prog.gq_stream) {
+        let (i, seg) = (e.inst as usize, e.seg as usize);
+        if i >= n {
+            continue;
+        }
+        if owner[i].is_some_and(|s| s != seg) || e.succ_len != 0 || e.flags & SE_XCTR != 0 {
+            clean[i] = false;
+        }
+        owner[i] = Some(seg);
+    }
+    let mut seg_insts = vec![0usize; routes.len()];
+    for s in owner.iter().flatten() {
+        if let Some(c) = seg_insts.get_mut(*s) {
+            *c += 1;
+        }
+    }
+    let mut out = vec![None; routes.len()];
+    for (ix, u) in prog.insts.iter().enumerate() {
+        if u.op != DevOp::IndexUnionPf as u16 || !clean[ix] {
+            continue;
+        }
+        let Some(seg) = owner[ix].filter(|&s| seg_insts.get(s) == Some(&1)) else {
+            continue;
+        };
+        let table = u32::from(u.t[0]);
+        let mut first = None;
+        let all_routed = prog.insts[ix + 1..]
+            .iter()
+            .enumerate()
+            .take_while(|(_, d)| !(d.op == DevOp::IndexUnionPf as u16 && d.t[0] == u.t[0]))
+            .filter(|(_, d)| {
+                d.t.contains(&u.t[0]) || d.t.contains(&u.t[1]) || union_handle(d) == Some(table)
+            })
+            .all(|(k, d)| {
+                let routed = owner[ix + 1 + k].filter(|&f| routes.get(f).is_some_and(Option::is_some));
+                first = first.or(routed);
+                union_handle(d) == Some(table) && !d.t.contains(&u.t[1]) && routed.is_some()
+            });
+        if all_routed {
+            out[seg] = first;
+        }
+    }
+    out
+}
+
+/// [`unread_unions`] when `PLOW_AMD_UNION_SKIP` is on; otherwise no segment is skippable.
+pub(super) fn union_skip_table(on: bool, prog: &DevProg, routes: &[Option<Route>]) -> Vec<Option<usize>> {
+    if on {
+        unread_unions(prog, routes)
+    } else {
+        vec![None; routes.len()]
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Route {
     inst: DevInst64,
@@ -320,6 +383,42 @@ mod tests {
             })
             .collect();
         (prog, tensors)
+    }
+
+    #[test]
+    fn unread_unions_name_the_lone_union_segment_and_its_routed_reader() {
+        let (mut prog, tensors) = fixture();
+        prog.stream.push(StreamEnt {
+            inst: 0,
+            seg: 0,
+            ..Default::default()
+        });
+        let routed = routes(&prog, &tensors, 2).unwrap();
+        assert_eq!(unread_unions(&prog, &routed), vec![Some(1), None]);
+        assert_eq!(union_skip_table(true, &prog, &routed), vec![Some(1), None]);
+        assert_eq!(union_skip_table(false, &prog, &routed), vec![None, None]);
+        assert_eq!(unread_unions(&prog, &[None, None]), vec![None, None]);
+        prog.stream[1].seg = 1;
+        assert_eq!(unread_unions(&prog, &[None, routed[1]]), vec![None, None]);
+        prog.stream[1].seg = 0;
+        prog.stream[1].succ_len = 1;
+        assert_eq!(unread_unions(&prog, &routed), vec![None, None]);
+        prog.stream[1].succ_len = 0;
+        let mut reader = prog.insts[1];
+        reader.op = DevOp::Residual as u16;
+        prog.insts.push(reader);
+        assert_eq!(unread_unions(&prog, &routed), vec![None, None]);
+        prog.insts[2] = prog.insts[1];
+        let mut routed3 = routed.clone();
+        routed3.push(None);
+        assert_eq!(unread_unions(&prog, &routed3), vec![None, None, None]);
+        prog.stream.push(StreamEnt {
+            inst: 2,
+            seg: 2,
+            ..Default::default()
+        });
+        routed3[2] = routed[1];
+        assert_eq!(unread_unions(&prog, &routed3), vec![Some(1), None, None]);
     }
 
     #[test]

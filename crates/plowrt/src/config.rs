@@ -871,6 +871,12 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-native-launch-timing", env = "PLOW_NATIVE_LAUNCH_TIMING", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub native_launch_timing: bool,
 
+    /// Skip a GLM sparse prefill program's `IndexUnionPf` segments while the native sparse
+    /// attention route is active (prior >= 2047): that route gathers `iidx_pf`, so the union
+    /// table is unread. Off by default; the flip waits on the serving A/B.
+    #[arg(long = "amd-union-skip", env = "PLOW_AMD_UNION_SKIP", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub union_skip: bool,
+
     /// Directory to write token-batch device-state dumps into (body step and the ordinary
     /// prefill chunk, for row-by-row comparison). Diagnostic; unset = no dumps.
     #[arg(long = "amd-tb-dump", env = "PLOW_TB_DUMP", hide = true, global = true)]
