@@ -289,6 +289,11 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_XR_CUS")]
     pub xr_cus: Option<u32>,
 
+    /// Cap machine-wide packets of the GLM prefill buckets below 2048 rows: `auto` = max(64, t/4)
+    /// workgroups, or an explicit count.
+    #[arg(long, env = "PLOW_GLM_PF_SMALL_CUS")]
+    pub glm_pf_small_cus: Option<String>,
+
     /// Cap the DECODE one-shot XReduce at N workgroups (each thread then reduces
     /// `ceil(elems/(512*N))` elements); prefill collectives are untouched. Bit-identical.
     #[arg(long, env = "PLOW_XR_DEC_CUS")]
@@ -1154,6 +1159,7 @@ impl EmitConfig {
             pf_ladder_append: env_str("PLOW_PF_LADDER_APPEND"),
             pf_gemv_head: env_str("PLOW_PF_GEMV_HEAD"),
             xr_cus: env_u32("PLOW_XR_CUS"),
+            glm_pf_small_cus: env_str("PLOW_GLM_PF_SMALL_CUS"),
             xr_dec_cus: env_u32("PLOW_XR_DEC_CUS"),
             xr2_gather: env_opt_out("PLOW_XR2_GATHER"),
             no_xreduce: env_bool("PLOW_NO_XREDUCE"),

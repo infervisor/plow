@@ -4969,6 +4969,18 @@ fn xr_res_fold() -> bool {
     emit_config::active().glm_xr_res
 }
 
+/// `PLOW_GLM_PF_SMALL_CUS`: workgroup cap for a plain prefill bucket below [`GLM_SP_MIN_ROWS`].
+/// Measured on GLM-5.3 TP8 gfx942: 64 is best at 128 rows, 128 at 512 (64 regresses 512 by 11%).
+fn glm_pf_small_cus(t: u32) -> Option<u32> {
+    let v = emit_config::active().glm_pf_small_cus.as_deref()?;
+    (t < GLM_SP_MIN_ROWS).then(|| match v {
+        "auto" => (t / 4).max(64),
+        _ => v.parse().unwrap_or_else(|_| {
+            panic!("PLOW_GLM_PF_SMALL_CUS must be `auto` or a workgroup count, got {v:?}")
+        }),
+    })
+}
+
 /// Smallest prefill bucket the sequence-parallel seams cover (the 2048 and 8192 rungs). The
 /// small rungs run on their own objects and carry little seam work.
 const GLM_SP_MIN_ROWS: u32 = 2048;
@@ -9141,6 +9153,9 @@ fn glm_emit_full(
         let packed_segments = kind != PfKind::Plain;
         let band = (kind == PfKind::TokenBatch).then_some(dbatch);
         let mut pb = Builder::new(n_cu);
+        if let (PfKind::Plain, Some(k)) = (kind, glm_pf_small_cus(t)) {
+            pb.set_cu_cap(k);
+        }
         pb.set_packed_prefill_segments(packed_segments);
         if let Some(bw) = band {
             pb.set_token_batch_band(bw);
