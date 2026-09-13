@@ -469,6 +469,9 @@ pub struct Builder {
     /// Re-declaring a tensor name returns the existing handle instead of appending.
     /// `false` (default) ⇒ byte-identical. See [`Builder::set_tensor_dedup`].
     tensor_dedup: bool,
+    /// Workgroup cap for machine-wide ops; `None` (default) ⇒ byte-identical.
+    /// See [`Builder::set_cu_cap`].
+    cu_cap: Option<u32>,
     /// Coarse dep edges removed by the transitive reduction in [`Builder::finish`].
     /// Reported so an emitter can log it; the reduction itself is unconditional.
     tr_dropped: usize,
@@ -706,8 +709,19 @@ impl Builder {
             attn_res_f32mix_segments: false,
             gemv_split: 1,
             tensor_dedup: false,
+            cu_cap: None,
             tr_dropped: 0,
         }
+    }
+
+    /// Narrow every op emitted on a contiguous `0..n` CU list with `n > k` to `0..k`.
+    ///
+    /// For small prefill buckets: a machine-wide packet costs a claim barrier per workgroup
+    /// whether or not its slice has work. Kernels grid-stride their work items by `nblk`, so the
+    /// width moves only the work→workgroup partition. Clamped to 64 so fixed-block ops (the
+    /// 64-block argmax) keep their width.
+    pub fn set_cu_cap(&mut self, k: u32) {
+        self.cu_cap = Some(k.max(64));
     }
 
     /// Enable L2-domain-aware placement from `hwspec::GpuSpec::l2_partitioning` plus the
@@ -1061,11 +1075,19 @@ impl Builder {
         // regardless of the target's executor count. Repeated ids are legal (gemv_split
         // relies on it) and a CU simply runs both slices in order, so wrapping keeps a
         // small-`n_cu` target (CPU cores) valid; GPU blobs (n_cu >= 64) are unchanged.
-        let cus: Vec<u32> = if cus.iter().any(|&c| c >= self.n_cu) {
+        let mut cus: Vec<u32> = if cus.iter().any(|&c| c >= self.n_cu) {
             cus.into_iter().map(|c| c % self.n_cu).collect()
         } else {
             cus
         };
+        if let Some(k) = self.cu_cap {
+            if cus.len() > k as usize
+                && cus.iter().enumerate().all(|(i, &c)| c == i as u32)
+                && !deps.iter().any(|d| matches!(d, Dep::Fine { .. }))
+            {
+                cus.truncate(k as usize);
+            }
+        }
         for d in &deps {
             if let Dep::Fine { map, .. } = d {
                 assert_eq!(
