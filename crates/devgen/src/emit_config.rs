@@ -562,6 +562,11 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_QNORM_FUSE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub qnorm_fuse: bool,
 
+    /// Fold the GLU producer into its following W8A8 activation quantization without also
+    /// folding either RMSNorm quantization site.
+    #[arg(long, env = "PLOW_GLU_QUANT_FUSE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glu_quant_fuse: bool,
+
     /// Fuse activation quantisation into the producing epilogue. DEFAULT ON for AMD
     /// (opt out with `=0`); the `amd &&` guard stays at the call site.
     #[arg(long, env = "PLOW_FUSE_QUANT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
@@ -1221,6 +1226,7 @@ impl EmitConfig {
             // original call sites tested `!= Some("0")`, so any value other than "0"
             // (including an empty string) enables. Preserved verbatim.
             qnorm_fuse: env_bool("PLOW_QNORM_FUSE"),
+            glu_quant_fuse: env_bool("PLOW_GLU_QUANT_FUSE"),
             fuse_quant: env_opt_out("PLOW_FUSE_QUANT"),
             gemv_wg: env_u32("PLOW_GEMV_WG"),
             gemv_wg_tuning: env_str("PLOW_GEMV_WG_TUNING"),
@@ -1922,6 +1928,25 @@ mod tests {
                 .unwrap()
                 .emit
                 .gemma4_sm90_gemm_glu_role
+        );
+    }
+
+    #[test]
+    fn glu_quant_fuse_is_explicit_and_default_off() {
+        let _guard = crate::test_env::env_guard();
+        let _scope = crate::test_env::EnvScope::set(&[("PLOW_GLU_QUANT_FUSE", "0")]);
+        assert!(!EmitConfig::from_env().glu_quant_fuse);
+        assert!(
+            !TestArgs::try_parse_from(["test"])
+                .unwrap()
+                .emit
+                .glu_quant_fuse
+        );
+        assert!(
+            TestArgs::try_parse_from(["test", "--glu-quant-fuse"])
+                .unwrap()
+                .emit
+                .glu_quant_fuse
         );
     }
 

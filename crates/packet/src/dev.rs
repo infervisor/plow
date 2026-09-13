@@ -310,9 +310,10 @@ pub enum DevOp {
     /// Per-row (per-token) fp8 activation quant — the w8a8 prefill's activation half.
     /// `a_scale[m] = rowmax|x[m,:]|/448`, `xq[m,k] = round_e4m3(x[m,k]/a_scale[m])`.
     /// Emitted once per activation, reused by every fp8 GEMM.
-    /// `t3/t4` (T11, `PLOW_QNORM_FUSE=1`): fused GLU producer — `x` becomes an OUTPUT,
-    /// the packet computes `fu = act(gate)*up` (bf16-rounded, exactly what [`DevOp::Glu`]
-    /// writes) then quantizes it; token-identical to the split form (needs a t3/t4-aware cubin).
+    /// `t3/t4` (T11, `PLOW_QNORM_FUSE=1` or `PLOW_GLU_QUANT_FUSE=1`): fused GLU producer —
+    /// `x` becomes an OUTPUT, the packet computes `fu = act(gate)*up` (bf16-rounded, exactly
+    /// what [`DevOp::Glu`] writes) then quantizes it; token-identical to the split form (needs a
+    /// t3/t4-aware cubin).
     QuantFp8 = 32,
     /// `t0=C t1=A(fp8) t2=B(fp8) t3=a_scale(f32[M]) t4=w_scale(f32[N])` · `i0=M i1=N i2=K i4=a_row0`.
     /// The fp8 (w8a8) prefill twin of [`DevOp::Gemm`]: BOTH operands fp8 e4m3. NOTE the 2x-rate MFMA

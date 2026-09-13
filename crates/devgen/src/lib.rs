@@ -4067,6 +4067,8 @@ fn emit_phase(
     let qnorm_fuse = w8a8
         && !gemv_family
         && (emit_config::active().qnorm_fuse || (amd && emit_config::active().fuse_quant));
+    let glu_quant_fuse =
+        qnorm_fuse || (w8a8 && !gemv_family && emit_config::active().glu_quant_fuse);
 
     // Qwen/Llama PRE-NORM decode fuses each (residual add, RMSNorm) pair into ONE AddNorm packet
     // (see the AddNorm emits in the loop). Deletes 72 packets/token and, more importantly, 72
@@ -5544,7 +5546,7 @@ fn emit_phase(
                 &[dmlp],
             );
             rec(c_u);
-            if qnorm_fuse {
+            if glu_quant_fuse {
                 // T11 GLU-INTO-QUANT: one row-owning packet computes fu = act(g)*u AND its
                 // fp8 quant (QuantFp8 t3/t4/i2 — see d_quant_fp8), deleting the elementwise
                 // Glu packet + gate + the inter-width fu re-read. bf16-rounded before quant,
@@ -5576,8 +5578,8 @@ fn emit_phase(
         // at the second NormResidual boundary. proj() picks the fp8
         // (GemvFp8) arm on the decode fp8 path via the wd8/sd operands.
         // w8a8: quant the (inter-width) GLU output feeding down_proj.
-        // qnorm_fuse (+ unfused GLU): c_gl IS the fused GLU+quant packet above.
-        let dfu = if qnorm_fuse && !glu_fused && !gemm_glu {
+        // glu_quant_fuse (+ unfused GLU): c_gl IS the fused GLU+quant packet above.
+        let dfu = if glu_quant_fuse && !glu_fused && !gemm_glu {
             c_gl
         } else {
             quant(b, n.xqi, n.asi, n.fu, inter_l, c_gl)

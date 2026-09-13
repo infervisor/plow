@@ -3150,7 +3150,7 @@ mod tests {
 
     /// A `QuantFp8` carrying `t[3]` must ask for `PLOW_T11_GLUQUANT=1`, and a plain one must not.
     ///
-    /// THE REGRESSION THIS PINS. `qnorm_fuse` folds the GLU producer into the quant packet
+    /// THE REGRESSION THIS PINS. The GLU-quant fold puts the GLU producer in the quant packet
     /// (t3=gate, t4=up, i2=act) and DELETES the `Glu` packet that used to compute `fu`. The AMD
     /// dispatch ignored t3/t4 for its whole life, so the packet quantized an `fu` nothing had
     /// written: no fault, no NaN, just a garbage FFN output, a wrong KV cache, and fluent wrong
