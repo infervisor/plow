@@ -1218,7 +1218,8 @@ pub struct AmdRuntimeConfig {
 
     /// Split a sparse-rung prefill chunk that starts below 2047 prior keys: rows holding all 2048
     /// causal keys take the AITER sparse route, the earlier rows the interpreter gather arm.
-    #[arg(long = "amd-mla-pf-row-split", env = "PLOW_MLA_PF_ROW_SPLIT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    /// Default on (checkpoint P, perf-certs/rt.mla_pf_row_split.json); `=0` is the rollback.
+    #[arg(long = "amd-mla-pf-row-split", env = "PLOW_MLA_PF_ROW_SPLIT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub mla_pf_row_split: bool,
 
     /// With `PLOW_MLA_PF_ROW_SPLIT`: the rows below the cut (fewer than 2048 causal keys) run the

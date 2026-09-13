@@ -30,8 +30,12 @@ const PREFIX_CACHE_CANDIDATE: Status = Status::Candidate {
 const NATIVE_LO_CANDIDATE: Status = Status::Candidate {
     evidence: &["review log #93: pfroute-lo-t3-full, row split on, P8192-0 615.0 -> 575.1 ms (floor 5.0), P4096-0 356.0 -> 327.0 (floor 0.7), retrieval 39/39; flip waits on a served A/B"],
 };
-const ROW_SPLIT_CANDIDATE: Status = Status::Candidate {
-    evidence: &["review log #84: p0split-full-depth, 8192-row first chunk 725.9 -> 616.8 ms, retrieval 39/39; flip waits on the served A/B"],
+const ROW_SPLIT_QUALIFIED: Status = Status::Qualified {
+    evidence: &[
+        "perf-certs/rt.mla_pf_row_split.json: checkpoint P accepts P8192-0 730.6 -> 630.3 ms (floor 2.3), P4096-0 388.9 -> 357.6 (floor 1.0), P8192-S neutral within 5.0, 32 serving entries not worse",
+        "review log #96: pfroute-t4d served A/B (ctl/split/ctl2/split2, default config), paired-median TTFT -98.5 / -211.8 / -27.4 / -61.6 ms at ISL 8192 C1 / C16 and 4096 C1 / C16 beyond the control drift; TPOT, ITL[0], E2E not worse; 0 failed requests",
+        "docs/flags-reference.md: `=0` is the rollback",
+    ],
 };
 const UNION_SKIP_QUALIFIED: Status = Status::Qualified {
     evidence: &[
@@ -286,7 +290,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.vmm_cache_memory_utilization", Some("PLOW_VMM_CACHE_MEMORY_UTILIZATION"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("0.05")), OPT_IN),
     KnobSpec::new("rt.vmm_cache_min_free_mib", Some("PLOW_VMM_CACHE_MIN_FREE_MIB"), Layer::Runtime, U32, UNSET, PREFIX_CACHE_CANDIDATE),
     KnobSpec::new("rt.amd_prefix_fine_rows", Some("PLOW_AMD_PREFIX_FINE_ROWS"), Layer::Runtime, U32, UNSET, PREFIX_CACHE_CANDIDATE),
-    KnobSpec::new("rt.mla_pf_row_split", Some("PLOW_MLA_PF_ROW_SPLIT"), Layer::Runtime, Domain::Bool, OFF, ROW_SPLIT_CANDIDATE),
+    KnobSpec::new("rt.mla_pf_row_split", Some("PLOW_MLA_PF_ROW_SPLIT"), Layer::Runtime, Domain::Bool, ON, ROW_SPLIT_QUALIFIED),
     KnobSpec::new("rt.mla_pf_row_split_native_lo", Some("PLOW_MLA_PF_ROW_SPLIT_NATIVE_LO"), Layer::Runtime, Domain::Bool, OFF, NATIVE_LO_CANDIDATE),
     KnobSpec::new("rt.vmm_cache_mib", Some("PLOW_VMM_CACHE_MIB"), Layer::Runtime, U32, UNSET, OPT_IN),
     KnobSpec::new("rt.vmm_block_mib", Some("PLOW_VMM_BLOCK_MIB"), Layer::Runtime, U32, Default::Static(Val::Nat(2)), OPT_IN),
