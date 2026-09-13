@@ -436,6 +436,7 @@ fn accepts_exact_hd256_bkv64_contract_and_rejects_drift() {
         "sm90a",
         &object,
         Some(1),
+        1,
         Some(256),
         [Some(256), Some(64), Some(64), Some(8)],
     )
@@ -447,7 +448,7 @@ fn accepts_exact_hd256_bkv64_contract_and_rejects_drift() {
         [Some(256), Some(64), Some(64), Some(4)],
     ] {
         assert!(
-            check_attention_hd256_role("sm90a", &object, Some(1), Some(256), geometry)
+            check_attention_hd256_role("sm90a", &object, Some(1), 1, Some(256), geometry)
                 .is_err()
         );
     }
@@ -460,6 +461,7 @@ fn accepts_exact_hd256_bkv32_contract_and_rejects_drift() {
         "sm90a",
         &object,
         Some(1),
+        1,
         Some(256),
         [Some(256), Some(64), Some(32), Some(8)],
     )
@@ -474,6 +476,7 @@ fn accepts_exact_hd256_bkv32_contract_and_rejects_drift() {
             "sm90a",
             &object,
             Some(1),
+            1,
             Some(256),
             geometry,
         )
@@ -487,7 +490,8 @@ fn accepts_exact_hd256_gqa2_bkv32_contract() {
     check_attention_hd256_role(
         "sm90a",
         &object,
-        Some(1),
+        Some(2),
+        2,
         Some(256),
         [Some(256), Some(64), Some(32), Some(8)],
     )

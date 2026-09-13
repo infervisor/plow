@@ -15,11 +15,17 @@
 
 extern "C" __device__ __constant__ unsigned plow_pf_request_abi = 2;
 extern "C" __device__ __constant__ unsigned plow_pf_masked_padding_abi = 1;
-extern "C" __device__ unsigned plow_attention_sm90_hd256_gqa2_bkv32_abi = 1;
+extern "C" __device__ unsigned plow_attention_sm90_hd256_gqa2_bkv32_abi = 2;
 extern "C" __device__ unsigned plow_attention_head_dim = 256;
 extern "C" __device__ unsigned plow_attention_query_tile = 64;
 extern "C" __device__ unsigned plow_attention_kv_tile = 32;
 extern "C" __device__ unsigned plow_attention_warps = 8;
+extern "C" __device__ unsigned plow_attention_packed_only = 1;
+extern "C" __device__ unsigned plow_attention_n_head = 16;
+extern "C" __device__ unsigned plow_attention_n_kv_head = 8;
+extern "C" __device__ unsigned plow_attention_window = 1024;
+extern "C" __device__ unsigned plow_attention_nsplit = 1;
+extern "C" __device__ unsigned plow_attention_direct_entry = 1;
 extern "C" __device__ unsigned plow_block_pfattn_hd256_gqa2_bkv32 = 256;
 extern "C" __device__ unsigned plow_arena_bytes_pfattn_hd256_gqa2_bkv32 =
     FA_SM90_GQA2_PAIR_FLOATS(256, 64, 32) * sizeof(float);
@@ -40,6 +46,41 @@ __device__ __forceinline__ PlowStreamEnt attention_stream_ent(const PlowStreamEn
     reinterpret_cast<uint2*>(&entry)[1] = reinterpret_cast<const uint2*>(p)[1];
     reinterpret_cast<uint2*>(&entry)[2] = reinterpret_cast<const uint2*>(p)[2];
     return entry;
+}
+
+typedef struct {
+    const int* requests;
+    float* opart;
+    float* mlpart;
+    const __nv_bfloat16* q;
+    const __nv_bfloat16* k;
+    const __nv_bfloat16* v;
+    __nv_bfloat16* output;
+    const void* mapkv;
+    const PlowStreamEnt* entries;
+    const unsigned* succs;
+    unsigned* counters;
+    unsigned seq_q;
+    unsigned seq_kv;
+    unsigned q_pos0;
+    unsigned kv_stride;
+    unsigned kv_mask;
+    float scale;
+} PlowHd256Gqa2Direct;
+static_assert(sizeof(PlowHd256Gqa2Direct) == 112, "HD256 GQA2 direct role ABI");
+
+extern "C" __global__ __launch_bounds__(256, 1)
+void plow_sm90a_pfattn_hd256_gqa2_bkv32_direct(PlowHd256Gqa2Direct args) {
+    extern __shared__ float arena[];
+    d_flash_prefill_mux<256, 64, 32>(
+        args.requests, args.opart, args.mlpart, args.q, args.k, args.v, args.output,
+        args.seq_q, args.seq_kv, 16, 8, args.q_pos0, 1024, 1, args.kv_stride,
+        args.kv_mask, args.scale, blockIdx.x, gridDim.x, arena, args.mapkv);
+
+    __syncthreads();
+    const PlowStreamEnt entry = attention_stream_ent(args.entries + blockIdx.x);
+    for (unsigned s = threadIdx.x; s < entry.succ_len; s += blockDim.x)
+        attention_ctr_signal(PLOW_CTR(args.counters, args.succs[entry.succ_ofs + s]));
 }
 
 extern "C" __global__

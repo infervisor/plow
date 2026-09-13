@@ -67,6 +67,7 @@ pub(super) fn load_fp8_m1_role(
         Ok((function, smem)) => Ok(PacketRole {
             function,
             direct_hd512: None,
+            direct_hd256_gqa2: None,
             grid,
             smem,
             block: 256,

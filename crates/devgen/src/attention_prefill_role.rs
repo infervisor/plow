@@ -51,12 +51,18 @@ const HD256_OBJECT_GLOBALS: [(&str, u32); 7] = [
 ];
 const HD256_GQA2_OBJECT_FILE: &str = "interp_sm90a_pfattn_hd256_gqa2_bkv32.cubin";
 const HD256_GQA2_OBJECT_ENTRY: &str = "plow_sm90a_pfattn_hd256_gqa2_bkv32";
-const HD256_GQA2_OBJECT_GLOBALS: [(&str, u32); 7] = [
-    ("plow_attention_sm90_hd256_gqa2_bkv32_abi", 1),
+const HD256_GQA2_OBJECT_GLOBALS: [(&str, u32); 13] = [
+    ("plow_attention_sm90_hd256_gqa2_bkv32_abi", 2),
     ("plow_attention_head_dim", 256),
     ("plow_attention_query_tile", 64),
     ("plow_attention_kv_tile", 32),
     ("plow_attention_warps", 8),
+    ("plow_attention_packed_only", 1),
+    ("plow_attention_n_head", 16),
+    ("plow_attention_n_kv_head", 8),
+    ("plow_attention_window", 1024),
+    ("plow_attention_nsplit", 1),
+    ("plow_attention_direct_entry", 1),
     ("plow_block_pfattn_hd256_gqa2_bkv32", 256),
     ("plow_arena_bytes_pfattn_hd256_gqa2_bkv32", 141_312),
 ];

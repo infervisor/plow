@@ -50,7 +50,7 @@ pub const PREFILL_ATTENTION_HD512_PX4_BQ64_ABI: &str = "attention_sm90_hd512_px4
 pub const PREFILL_ATTENTION_HD256_BKV64_ABI: &str = "attention_sm90_hd256_bkv64_v1";
 pub const PREFILL_ATTENTION_HD256_BKV32_ABI: &str = "attention_sm90_hd256_bkv32_v1";
 pub const PREFILL_ATTENTION_HD256_GQA2_BKV32_ABI: &str =
-    "attention_sm90_hd256_gqa2_bkv32_v1";
+    "attention_sm90_hd256_gqa2_bkv32_v2";
 pub const MXFP4_MOE_ABI: &str = "mxfp4_moe_sm90_v1";
 pub const W8A16_PREFILL_M1_ABI: &str = "w8a16_prefill_m1_sm90_v1";
 pub const BF16_PREFILL_GEMM_GLU_GEMMA4_ABI: &str = "gemm_glu_sm90_gemma4_4k8k_v1";
@@ -466,7 +466,7 @@ mod tests {
     #[test]
     fn hd256_gqa2_bkv32_attention_role_requires_exact_hash_and_capability() {
         let raw = format!(
-            r#"{{"version":1,"objects":{{"14":{{"abi":"attention_sm90_hd256_gqa2_bkv32_v1","file":"attention.cubin","sha256":"{}","attention":{{"profile":"sm90a","dtype":"bf16","head_dim":256,"query_tile":64,"kv_tile":32,"warps":8}}}}}},"programs":[{{"index":0,"roles":[0,14,0]}}]}}"#,
+            r#"{{"version":1,"objects":{{"14":{{"abi":"attention_sm90_hd256_gqa2_bkv32_v2","file":"attention.cubin","sha256":"{}","attention":{{"profile":"sm90a","dtype":"bf16","head_dim":256,"query_tile":64,"kv_tile":32,"warps":8}}}}}},"programs":[{{"index":0,"roles":[0,14,0]}}]}}"#,
             "a".repeat(64)
         );
         SegmentRoles::from_bytes(raw.as_bytes()).unwrap();

@@ -191,10 +191,29 @@ if [ "${PLOW_BUILD_PFATTN_HD256_BKV32:-0}" = 1 ]; then
     runtime/nvidia/interp_sm90a_pfattn_hd256_bkv32.cu
 fi
 if [ "${PLOW_BUILD_PFATTN_HD256_GQA2_BKV32:-0}" = 1 ]; then
+  gemma_gqa2_log=$(mktemp)
   env -i PATH=/usr/local/cuda/bin:/usr/bin:/bin /usr/local/cuda/bin/nvcc \
     -std=c++17 -arch=sm_90a -O3 -cubin -Xptxas=-v -I runtime/common -I runtime/nvidia \
     -o "$gemma_out/interp_sm90a_pfattn_hd256_gqa2_bkv32.cubin" \
-    runtime/nvidia/interp_sm90a_pfattn_hd256_gqa2_bkv32.cu
+    runtime/nvidia/interp_sm90a_pfattn_hd256_gqa2_bkv32.cu 2> >(tee "$gemma_gqa2_log" >&2)
+  if grep -Eq '[1-9][0-9]* bytes (stack frame|spill stores|spill loads)' "$gemma_gqa2_log"; then
+    echo 'paired HD256/GQA2 object uses stack or spills.' >&2
+    rm -f "$gemma_gqa2_log"
+    exit 1
+  fi
+  rm -f "$gemma_gqa2_log"
+  gemma_gqa2_symbols=$(/usr/local/cuda/bin/cuobjdump -symbols \
+    "$gemma_out/interp_sm90a_pfattn_hd256_gqa2_bkv32.cubin")
+  for gemma_gqa2_symbol in \
+    plow_sm90a_pfattn_hd256_gqa2_bkv32 \
+    plow_sm90a_pfattn_hd256_gqa2_bkv32_direct \
+    plow_attention_sm90_hd256_gqa2_bkv32_abi \
+    plow_attention_direct_entry; do
+    grep -q "$gemma_gqa2_symbol" <<<"$gemma_gqa2_symbols" || {
+      echo "missing paired HD256/GQA2 symbol: $gemma_gqa2_symbol" >&2
+      exit 1
+    }
+  done
 fi
 if [ "${PLOW_BUILD_MASKED_PADDING:-0}" = 1 ]; then
   pfattn_wg=${PLOW_BUILD_PFATTN_WG:-1}

@@ -718,6 +718,7 @@ impl SegmentRoleValidation for SegmentRoles {
 struct PacketRole {
     function: KernelFn,
     direct_hd512: Option<KernelFn>,
+    direct_hd256_gqa2: Option<KernelFn>,
     grid: u32,
     smem: u32,
     block: u32,
@@ -742,6 +743,46 @@ struct Hd512Px4DirectArgs {
 }
 
 const _: () = assert!(std::mem::size_of::<Hd512Px4DirectArgs>() == 88);
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Hd256Gqa2DirectArgs {
+    requests: u64,
+    opart: u64,
+    mlpart: u64,
+    q: u64,
+    k: u64,
+    v: u64,
+    output: u64,
+    mapkv: u64,
+    entries: u64,
+    succs: u64,
+    counters: u64,
+    seq_q: u32,
+    seq_kv: u32,
+    q_pos0: u32,
+    kv_stride: u32,
+    kv_mask: u32,
+    scale: f32,
+}
+
+const _: () = assert!(std::mem::size_of::<Hd256Gqa2DirectArgs>() == 112);
+
+enum DirectAttentionArgs {
+    Hd512(Hd512Px4DirectArgs),
+    Hd256Gqa2(Hd256Gqa2DirectArgs),
+}
+
+impl DirectAttentionArgs {
+    fn kernel_param(&mut self) -> *mut std::ffi::c_void {
+        match self {
+            Self::Hd512(args) => args as *mut Hd512Px4DirectArgs as *mut std::ffi::c_void,
+            Self::Hd256Gqa2(args) => {
+                args as *mut Hd256Gqa2DirectArgs as *mut std::ffi::c_void
+            }
+        }
+    }
+}
 
 fn check_fp8_gemm_role(capability: Option<u32>, block: Option<u32>) -> Result<()> {
     if capability != Some(1) || block != Some(BLOCK) {
@@ -800,12 +841,13 @@ fn check_attention_hd256_role(
     arch: &str,
     object: &plow_asset::segment_roles::SegmentObject,
     capability: Option<u32>,
+    expected_abi: u32,
     block: Option<u32>,
     geometry: [Option<u32>; 4],
 ) -> Result<()> {
     let expected = object.attention.as_ref();
     if arch != "sm90a"
-        || capability != Some(1)
+        || capability != Some(expected_abi)
         || block != Some(BLOCK)
         || expected.is_none_or(|a| {
             a.profile != arch
@@ -4561,6 +4603,13 @@ impl GpuEngine {
                         profile.tag,
                         object,
                         capability,
+                        if id
+                            == plow_asset::segment_roles::PREFILL_ATTENTION_HD256_GQA2_BKV32
+                        {
+                            2
+                        } else {
+                            1
+                        },
                         block,
                         [
                             be.module_global_u32(&module, "plow_attention_head_dim")?,
@@ -4667,6 +4716,22 @@ impl GpuEngine {
                     "paired-GQA2 HD256 role requires a 141312-byte arena".into(),
                 ));
             }
+            if id == plow_asset::segment_roles::PREFILL_ATTENTION_HD256_GQA2_BKV32 {
+                for (name, value) in [
+                    ("plow_attention_packed_only", 1),
+                    ("plow_attention_n_head", 16),
+                    ("plow_attention_n_kv_head", 8),
+                    ("plow_attention_window", 1024),
+                    ("plow_attention_nsplit", 1),
+                    ("plow_attention_direct_entry", 1),
+                ] {
+                    if be.module_global_u32(&module, name)? != Some(value) {
+                        return Err(RuntimeError::Rejected(
+                            "paired-GQA2 HD256 role has incompatible fixed geometry".into(),
+                        ));
+                    }
+                }
+            }
             if id == plow_asset::segment_roles::PREFILL_ATTENTION_HD512_PX4_BQ64 {
                 if smem != 108048 {
                     return Err(RuntimeError::Rejected(
@@ -4700,6 +4765,23 @@ impl GpuEngine {
                 if direct_capacity != grid {
                     return Err(RuntimeError::Rejected(
                         "HD512 px4 direct role occupancy must equal packet grid".into(),
+                    ));
+                }
+                Some(direct)
+            } else {
+                None
+            };
+            let direct_hd256_gqa2 = if id
+                == plow_asset::segment_roles::PREFILL_ATTENTION_HD256_GQA2_BKV32
+            {
+                let direct =
+                    be.get_function(&module, "plow_sm90a_pfattn_hd256_gqa2_bkv32_direct")?;
+                be.set_max_dynamic_smem(direct, smem)?;
+                let direct_capacity = be.occupancy_blocks_per_sm(direct, block, smem as usize)?
+                    * be.sm_count();
+                if direct_capacity != grid {
+                    return Err(RuntimeError::Rejected(
+                        "paired-GQA2 HD256 direct role occupancy must equal packet grid".into(),
                     ));
                 }
                 Some(direct)
@@ -4742,6 +4824,7 @@ impl GpuEngine {
             packet_roles[id as usize - 1] = Some(PacketRole {
                 function,
                 direct_hd512,
+                direct_hd256_gqa2,
                 grid: role_grid,
                 smem,
                 block,
@@ -7403,24 +7486,24 @@ impl GpuEngine {
         Ok((function, grid, block, smem))
     }
 
-    fn hd512_direct_segment(
+    fn direct_attention_segment(
         &self,
         bi: usize,
         seg: usize,
         arg: &DevProgram,
-    ) -> Result<Option<(KernelFn, Hd512Px4DirectArgs)>> {
+    ) -> Result<Option<(KernelFn, DirectAttentionArgs)>> {
         let Some(index) = packet_role_index(&self.prefill[bi].packet_segment_roles, seg) else {
             return Ok(None);
         };
         let role = self.packet_roles[index]
             .as_ref()
             .expect("validated packet role object");
-        let Some(function) = role.direct_hd512 else {
+        if role.direct_hd512.is_none() && role.direct_hd256_gqa2.is_none() {
             return Ok(None);
-        };
+        }
         let [(pc, _)] = self.prefill[bi].segment_sites[seg].as_slice() else {
             return Err(RuntimeError::Rejected(
-                "HD512 px4 direct role lost its single instruction".into(),
+                "direct attention role lost its single instruction".into(),
             ));
         };
         let inst = &self.prefill[bi].h_inst[*pc];
@@ -7431,28 +7514,55 @@ impl GpuEngine {
             self.devp
                 .get(handle as usize)
                 .map(|memory| memory.base)
-                .ok_or_else(|| RuntimeError::Rejected("HD512 direct tensor handle".into()))
+                .ok_or_else(|| RuntimeError::Rejected("direct attention tensor handle".into()))
         };
         let entries = arg.gq_stream
             + u64::from(self.prefill[bi].segment_gq_lo[seg])
                 * std::mem::size_of::<packet::dev::StreamEnt>() as u64;
-        Ok(Some((
-            function,
-            Hd512Px4DirectArgs {
-                requests: tensor(inst.t[6])?,
-                opart: tensor(inst.t[0])?,
-                mlpart: tensor(inst.t[1])?,
-                q: tensor(inst.t[2])?,
-                k: tensor(inst.t[3])?,
-                v: tensor(inst.t[4])?,
-                output: tensor(inst.t[5])?,
-                entries,
-                succs: arg.succs,
-                counters: arg.counters,
-                seq_q: inst.i[0],
-                kv_stride: inst.fj[1],
-            },
-        )))
+        if let Some(function) = role.direct_hd512 {
+            return Ok(Some((
+                function,
+                DirectAttentionArgs::Hd512(Hd512Px4DirectArgs {
+                    requests: tensor(inst.t[6])?,
+                    opart: tensor(inst.t[0])?,
+                    mlpart: tensor(inst.t[1])?,
+                    q: tensor(inst.t[2])?,
+                    k: tensor(inst.t[3])?,
+                    v: tensor(inst.t[4])?,
+                    output: tensor(inst.t[5])?,
+                    entries,
+                    succs: arg.succs,
+                    counters: arg.counters,
+                    seq_q: inst.i[0],
+                    kv_stride: inst.fj[1],
+                }),
+            )));
+        }
+        if let Some(function) = role.direct_hd256_gqa2 {
+            return Ok(Some((
+                function,
+                DirectAttentionArgs::Hd256Gqa2(Hd256Gqa2DirectArgs {
+                    requests: tensor(inst.t[6])?,
+                    opart: tensor(inst.t[0])?,
+                    mlpart: tensor(inst.t[1])?,
+                    q: tensor(inst.t[2])?,
+                    k: tensor(inst.t[3])?,
+                    v: tensor(inst.t[4])?,
+                    output: tensor(inst.t[5])?,
+                    mapkv: tensor(inst.t[7])?,
+                    entries,
+                    succs: arg.succs,
+                    counters: arg.counters,
+                    seq_q: inst.i[0],
+                    seq_kv: inst.i[1],
+                    q_pos0: inst.i[4],
+                    kv_stride: inst.fj[1],
+                    kv_mask: inst.fj[2],
+                    scale: f32::from_bits(inst.fj[0]),
+                }),
+            )));
+        }
+        Ok(None)
     }
 
     fn launch_prefill_chain(
@@ -7559,10 +7669,9 @@ impl GpuEngine {
                                 let (function, grid, block, smem) =
                                     self.prefill_segment_kernel(bi, seg, class, false)?;
                                 if let Some((direct, mut direct_arg)) =
-                                    self.hd512_direct_segment(bi, seg, &arg)?
+                                    self.direct_attention_segment(bi, seg, &arg)?
                                 {
-                                    let mut params = [&mut direct_arg as *mut Hd512Px4DirectArgs
-                                        as *mut std::ffi::c_void];
+                                    let mut params = [direct_arg.kernel_param()];
                                     self.be.launch_cooperative(
                                         direct,
                                         grid,
@@ -7671,7 +7780,7 @@ impl GpuEngine {
                             .expect("validated packet role object")
                     });
                 let (f, gr, blk, sm) = self.prefill_segment_kernel(bi, seg, cls, fat_only)?;
-                let direct = self.hd512_direct_segment(bi, seg, &arg)?;
+                let direct = self.direct_attention_segment(bi, seg, &arg)?;
                 let go = |f: KernelFn, params: &mut [*mut std::ffi::c_void]| -> Result<()> {
                     if noncoop {
                         self.be
@@ -7696,8 +7805,7 @@ impl GpuEngine {
                     let e1 = self.be.event_create(true)?;
                     self.be.event_record(&e0, &self.stream)?;
                     if let Some((function, mut direct_arg)) = direct {
-                        let mut params =
-                            [&mut direct_arg as *mut Hd512Px4DirectArgs as *mut std::ffi::c_void];
+                        let mut params = [direct_arg.kernel_param()];
                         go(function, &mut params)?;
                     } else {
                         let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
@@ -7707,8 +7815,7 @@ impl GpuEngine {
                     evs.push((seg, cls, e0, e1));
                 } else {
                     if let Some((function, mut direct_arg)) = direct {
-                        let mut params =
-                            [&mut direct_arg as *mut Hd512Px4DirectArgs as *mut std::ffi::c_void];
+                        let mut params = [direct_arg.kernel_param()];
                         go(function, &mut params)?;
                     } else {
                         let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
