@@ -145,11 +145,15 @@ if [ "${PLOW_BUILD_PFATTN_HD256_BKV32:-0}" = 1 ]; then
     runtime/nvidia/interp_sm90a_pfattn_hd256_bkv32.cu
 fi
 if [ "${PLOW_BUILD_MASKED_PADDING:-0}" = 1 ]; then
+  pfattn_kv16=${PLOW_BUILD_PFATTN_KV16:-0}
+  pfattn_kv64=${PLOW_BUILD_PFATTN_KV64:-$((1 - pfattn_kv16))}
+  pfattn_qk_unroll=${PLOW_BUILD_PFATTN_QK_UNROLL:-$((pfattn_kv16 ? 4 : 32))}
   env -i PATH=/usr/local/cuda/bin:/usr/bin:/bin /usr/local/cuda/bin/nvcc \
     -std=c++17 -arch=sm_90a -O3 -cubin -Xptxas=-v -I runtime/common -I runtime/nvidia \
     -DPLOW_NV_FA512_WG=1 -DPLOW_NV_FA_GF=2 -DPLOW_NV_FA_WPR=1 \
-    -DPLOW_NV_FA_QK_UNROLL="${PLOW_BUILD_PFATTN_QK_UNROLL:-32}" \
-    -DPLOW_NV_FA512_KV64="${PLOW_BUILD_PFATTN_KV64:-1}" \
+    -DPLOW_NV_FA_QK_UNROLL="$pfattn_qk_unroll" \
+    -DPLOW_NV_FA512_KV16="$pfattn_kv16" \
+    -DPLOW_NV_FA512_KV64="$pfattn_kv64" \
     -DPLOW_NV_FA512_N_SPLIT="${PLOW_BUILD_PFATTN_N_SPLIT:-1}" \
     -DPLOW_NV_FA512_FIXED_HEADS="${PLOW_BUILD_PFATTN_FIXED_HEADS:-0}" \
     -DPLOW_NV_PACKED_REQUEST=1 -DPLOW_NV_PACKED_FA_WGMMA=1 -DPLOW_NV_PACKED_FA_TMA=1 \

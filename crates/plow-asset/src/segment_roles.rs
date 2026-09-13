@@ -179,6 +179,10 @@ impl SegmentRoles {
                 kv_tile: 16,
                 warps: 8,
             };
+            let hd512_wg16 = AttentionCapability {
+                kv_tile: 16,
+                ..hd512_wg.clone()
+            };
             let hd512_wg64 = AttentionCapability {
                 kv_tile: 64,
                 ..hd512_wg.clone()
@@ -210,7 +214,12 @@ impl SegmentRoles {
                         || object
                             .attention
                             .as_ref()
-                            .is_none_or(|a| a != &hd512_wg && a != &hd512_wg64 && a != &hd512_px4)))
+                            .is_none_or(|a| {
+                                a != &hd512_wg
+                                    && a != &hd512_wg16
+                                    && a != &hd512_wg64
+                                    && a != &hd512_px4
+                            })))
                 || (id == PREFILL_ATTENTION_HD256_BKV64
                     && (!valid_hash(object.sha256.as_deref())
                         || object.promote_k512.is_some()
@@ -358,11 +367,12 @@ mod tests {
             .as_bytes(),
         )
         .unwrap();
+        SegmentRoles::from_bytes(raw.replace("\"kv_tile\":32", "\"kv_tile\":16").as_bytes())
+            .unwrap();
         for bad in [
             raw.replace(&"a".repeat(64), "bad"),
             raw.replace("\"head_dim\":512", "\"head_dim\":256"),
             raw.replace("\"query_tile\":64", "\"query_tile\":32"),
-            raw.replace("\"kv_tile\":32", "\"kv_tile\":16"),
             raw.replace("\"kv_tile\":32", "\"kv_tile\":128"),
             raw.replace("\"warps\":8", "\"warps\":4"),
             raw.replace("\"profile\":\"sm90a\"", "\"profile\":\"sm120\""),

@@ -41,7 +41,8 @@ pub struct Selection {
     pub file: String,
     pub sha256: String,
     wgmma: bool,
-    kv64: bool,
+    query_tile: u32,
+    kv_tile: u32,
     kind: Kind,
 }
 
@@ -245,12 +246,16 @@ fn apply_qualified_hd256(
 
 impl Selection {
     pub fn from_image(file: String, image: &[u8], wgmma: bool) -> Self {
+        let query_tile = plow_asset::cubin::global_u32(image, "plow_attention_query_tile")
+            .unwrap_or(if wgmma { 64 } else { 32 });
+        let kv_tile = plow_asset::cubin::global_u32(image, "plow_attention_kv_tile")
+            .unwrap_or(if wgmma { 32 } else { 16 });
         Self {
             file,
             sha256: plow_asset::decode_objects::image_sha256(image),
-            wgmma,
-            kv64: wgmma
-                && plow_asset::cubin::global_u32(image, "plow_attention_kv_tile") == Some(64),
+            wgmma: query_tile == 64,
+            query_tile,
+            kv_tile,
             kind: Kind::Hd512,
         }
     }
@@ -260,7 +265,8 @@ impl Selection {
             file,
             sha256: plow_asset::decode_objects::image_sha256(image),
             wgmma: false,
-            kv64: false,
+            query_tile: 64,
+            kv_tile: 32,
             kind: Kind::Hd256Bkv32,
         }
     }
@@ -273,13 +279,13 @@ impl Selection {
     }
 }
 
-fn capability(wgmma: bool) -> AttentionCapability {
+fn capability(query_tile: u32, kv_tile: u32) -> AttentionCapability {
     AttentionCapability {
         profile: "sm90a".into(),
         dtype: "bf16".into(),
         head_dim: 512,
-        query_tile: if wgmma { 64 } else { 32 },
-        kv_tile: if wgmma { 32 } else { 16 },
+        query_tile,
+        kv_tile,
         warps: 8,
     }
 }
@@ -387,14 +393,25 @@ pub(crate) fn apply_output_object(
     };
     let info = plow_asset::cubin::inspect(&image)
         .ok_or_else(|| format!("{} is not a valid cubin", path.display()))?;
-    let wgmma = plow_asset::cubin::global_u32(&image, "plow_attention_query_tile") == Some(64);
+    let query_tile = plow_asset::cubin::global_u32(&image, "plow_attention_query_tile");
+    let kv_tile = plow_asset::cubin::global_u32(&image, "plow_attention_kv_tile");
+    let wgmma = query_tile == Some(64);
     let score_partitions =
         plow_asset::cubin::global_u32(&image, "plow_attention_score_partitions").unwrap_or(1);
     let mut expected = OBJECT_GLOBALS;
-    if wgmma {
-        expected[2].1 = 64;
-        expected[3].1 = 32;
-        if plow_asset::cubin::global_u32(&image, "plow_attention_kv_tile") == Some(64) {
+    match (query_tile, kv_tile) {
+        (Some(32), Some(16)) => {}
+        (Some(64), Some(16)) => {
+            expected[2].1 = 64;
+            expected[3].1 = 16;
+            expected[6].1 = 134_144;
+        }
+        (Some(64), Some(32)) => {
+            expected[2].1 = 64;
+            expected[3].1 = 32;
+        }
+        (Some(64), Some(64)) => {
+            expected[2].1 = 64;
             expected[3].1 = 64;
             expected[6].1 = match score_partitions {
                 1 => 205_824,
@@ -402,11 +419,12 @@ pub(crate) fn apply_output_object(
                 _ => 0,
             };
         }
+        _ => expected[2].1 = 0,
     }
     if profile != "sm90a"
         || info.sm != 90
         || !matches!(score_partitions, 1 | 2)
-        || (score_partitions == 2 && (!wgmma || expected[3].1 != 64))
+        || (score_partitions == 2 && (query_tile != Some(64) || kv_tile != Some(64)))
         || !info.entries.iter().any(|entry| entry == OBJECT_ENTRY)
         || expected
             .iter()
@@ -440,7 +458,7 @@ fn apply(
             Kind::Hd512 => "HD512 WG32 prefill attention role requires sm90a".into(),
         });
     }
-    let mut attention = match selection.kind {
+    let attention = match selection.kind {
         Kind::Hd256Bkv32 => AttentionCapability {
             profile: "sm90a".into(),
             dtype: "bf16".into(),
@@ -449,11 +467,8 @@ fn apply(
             kv_tile: 32,
             warps: 8,
         },
-        Kind::Hd512 => capability(selection.wgmma),
+        Kind::Hd512 => capability(selection.query_tile, selection.kv_tile),
     };
-    if selection.kind == Kind::Hd512 && selection.kv64 {
-        attention.kv_tile = 64;
-    }
     let role = selection.role();
     let object = SegmentObject {
         abi: match selection.kind {

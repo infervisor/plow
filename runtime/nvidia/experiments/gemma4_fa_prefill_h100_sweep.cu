@@ -25,6 +25,9 @@
 #ifndef PLOW_FA_SWEEP_BKV
 #define PLOW_FA_SWEEP_BKV 32
 #endif
+#ifndef PLOW_FA_SWEEP_BQ
+#define PLOW_FA_SWEEP_BQ 64
+#endif
 #ifndef PLOW_FA_SWEEP_THREADS
 #define PLOW_FA_SWEEP_THREADS 256
 #endif
@@ -52,7 +55,7 @@
 using bf16 = __nv_bfloat16;
 constexpr int HD = PLOW_FA_SWEEP_HD;
 constexpr int BKV = PLOW_FA_SWEEP_BKV;
-constexpr int BQ = 64;
+constexpr int BQ = PLOW_FA_SWEEP_BQ;
 constexpr int HEADS = 16;
 constexpr int KV_HEADS = HD == 256 ? 8 : 1;
 constexpr int WINDOW = HD == 256 ? 1024 : 0;
@@ -69,6 +72,8 @@ static_assert(HD == 256 && BKV == 32);
 #endif
 #if PLOW_NV_FA512_PC
 static_assert(HD == 512 && BKV == 32 && THREADS == 384);
+#elif !PLOW_NV_FA512_WG && HD == 512
+static_assert(BQ == 32 && BKV == 16, "the px4 HD512 control is BQ32/BKV16");
 #elif PLOW_NV_FA_WGITEM_ONE
 static_assert(THREADS == 128);
 #else

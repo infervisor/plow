@@ -11,7 +11,16 @@
 #if PLOW_NV_FA512_KV64 && !PLOW_NV_FA512_WG
 #error "HD512 KV64 requires the WGMMA body"
 #endif
-constexpr int FA512_KV_TILE = PLOW_NV_FA512_KV64 ? 64 : 32;
+#ifndef PLOW_NV_FA512_KV16
+#define PLOW_NV_FA512_KV16 0
+#endif
+#if PLOW_NV_FA512_KV16 && !PLOW_NV_FA512_WG
+#error "HD512 KV16 WGMMA requires the WGMMA body"
+#endif
+#if PLOW_NV_FA512_KV16 && PLOW_NV_FA512_KV64
+#error "HD512 KV16 and KV64 are mutually exclusive"
+#endif
+constexpr int FA512_KV_TILE = PLOW_NV_FA512_KV64 ? 64 : (PLOW_NV_FA512_KV16 ? 16 : 32);
 #ifndef PLOW_NV_FA512_FIXED_HEADS
 #define PLOW_NV_FA512_FIXED_HEADS 0
 #endif
@@ -29,7 +38,7 @@ extern "C" __device__ unsigned plow_attention_query_tile = PLOW_NV_FA512_WG ? 64
 extern "C" __device__ unsigned plow_attention_kv_tile = PLOW_NV_FA512_WG ? FA512_KV_TILE : 16;
 extern "C" __device__ unsigned plow_attention_warps = 8;
 extern "C" __device__ unsigned plow_attention_score_partitions =
-    PLOW_NV_FA512_N_SPLIT ? 2 : 1;
+    PLOW_NV_FA512_N_SPLIT && FA512_KV_TILE == 64 ? 2 : 1;
 extern "C" __device__ unsigned plow_block_pfattn_hd512 = 256;
 extern "C" __device__ unsigned plow_arena_bytes_pfattn_hd512 =
     FA_PRE_SMEM_FLOATS(512, 64, FA512_KV_TILE) * sizeof(float);

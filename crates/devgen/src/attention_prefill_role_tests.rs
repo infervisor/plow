@@ -72,7 +72,7 @@ fn wgmma_object_selects_its_tile_and_rejects_partial_output() {
     let roles = SegmentRoles::from_bytes(&sections[0].data).unwrap();
     assert_eq!(
         roles.objects[&PREFILL_ATTENTION_HD512_WG32].attention,
-        Some(capability(true))
+        Some(capability(64, 32))
     );
 
     let mut partial = fixture(512, true, false);
@@ -82,7 +82,21 @@ fn wgmma_object_selects_its_tile_and_rejects_partial_output() {
     assert_eq!(partial.to_blob(), before);
     assert!(sections.is_empty());
 
+    globals[3].1 = 16;
+    globals[6].1 = 134_144;
+    std::fs::write(directory.join(OBJECT_FILE), object_image(&globals)).unwrap();
+    let mut narrow_wg = fixture(512, true, true);
+    let mut sections = Vec::new();
+    assert!(apply_output(&mut narrow_wg, &mut sections, "sm90a", &output).unwrap());
+    assert_eq!(
+        SegmentRoles::from_bytes(&sections[0].data).unwrap().objects
+            [&PREFILL_ATTENTION_HD512_WG32]
+            .attention,
+        Some(capability(64, 16))
+    );
+
     globals[3].1 = 64;
+    globals[6].1 = 201_728;
     std::fs::write(directory.join(OBJECT_FILE), object_image(&globals)).unwrap();
     let mut wide = fixture(512, true, true);
     assert!(apply_output(&mut wide, &mut Vec::new(), "sm90a", &output).is_err());
@@ -91,7 +105,7 @@ fn wgmma_object_selects_its_tile_and_rejects_partial_output() {
     let mut sections = Vec::new();
     assert!(apply_output(&mut wide, &mut sections, "sm90a", &output).unwrap());
     let roles = SegmentRoles::from_bytes(&sections[0].data).unwrap();
-    let mut expected = capability(true);
+    let mut expected = capability(64, 32);
     expected.kv_tile = 64;
     assert_eq!(
         roles.objects[&PREFILL_ATTENTION_HD512_WG32].attention,
@@ -108,7 +122,9 @@ fn wgmma_object_selects_its_tile_and_rejects_partial_output() {
     std::fs::write(directory.join(OBJECT_FILE), object_image(&n_split)).unwrap();
     assert!(apply_output(&mut split, &mut Vec::new(), "sm90a", &output).is_err());
 
-    globals[3].1 = 16;
+    globals[2].1 = 32;
+    globals[3].1 = 32;
+    globals[6].1 = 201_728;
     std::fs::write(directory.join(OBJECT_FILE), object_image(&globals)).unwrap();
     assert!(apply_output(&mut partial, &mut sections, "sm90a", &output).is_err());
     std::fs::remove_dir_all(directory).unwrap();
@@ -422,7 +438,7 @@ fn isolates_only_compatible_hd512_instructions_and_binds_hash() {
         object.sha256.as_deref(),
         Some(plow_asset::decode_objects::image_sha256(b"cubin").as_str())
     );
-    assert_eq!(object.attention.as_ref(), Some(&capability(false)));
+    assert_eq!(object.attention.as_ref(), Some(&capability(32, 16)));
 }
 
 #[test]
