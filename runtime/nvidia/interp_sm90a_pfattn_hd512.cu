@@ -14,6 +14,9 @@
 #ifndef PLOW_NV_FA_SCORE_SWIZZLE
 #define PLOW_NV_FA_SCORE_SWIZZLE PLOW_NV_FA512_PX4_BQ64
 #endif
+#ifndef PLOW_NV_FA_CTA_SNAKE
+#define PLOW_NV_FA_CTA_SNAKE 0
+#endif
 #include "op_attention.cuh"
 
 #if PLOW_NV_FA512_PX4_BQ64 && (PLOW_NV_FA512_WG || !PLOW_NV_PACKED_REQUEST)
@@ -21,6 +24,9 @@
 #endif
 #if PLOW_NV_FA_TMA_DESC && !PLOW_NV_FA512_PX4_BQ64
 #error "HD512 descriptor TMA is only implemented by the px4 BQ64 object"
+#endif
+#if PLOW_NV_FA_CTA_SNAKE && (!PLOW_NV_FA_TMA_DESC || !PLOW_NV_FA512_PX4_BQ64)
+#error "HD512 CTA snake scheduling requires the descriptor-TMA px4 BQ64 object"
 #endif
 
 #if PLOW_NV_FA512_KV64 && !PLOW_NV_FA512_WG
@@ -68,6 +74,7 @@ extern "C" __device__ unsigned plow_attention_nsplit = 1;
 extern "C" __device__ unsigned plow_attention_direct_entry = 1;
 extern "C" __device__ unsigned plow_attention_score_swizzle = PLOW_NV_FA_SCORE_SWIZZLE;
 extern "C" __device__ unsigned plow_attention_tma_desc = PLOW_NV_FA_TMA_DESC;
+extern "C" __device__ unsigned plow_attention_cta_snake = PLOW_NV_FA_CTA_SNAKE;
 extern "C" __device__ unsigned plow_block_pfattn_hd512_px4_bq64 = 512;
 extern "C" __device__ unsigned plow_arena_bytes_pfattn_hd512_px4_bq64 =
 #if PLOW_NV_FA_TMA_DESC
@@ -144,7 +151,7 @@ __device__ __noinline__ void attention_packed_bkv16(
         }
         d_flash_prefill_px4<512, PLOW_NV_FA512_PX4_BQ64 ? 64 : 32, 16, false,
                             PLOW_NV_FA512_PX4_BQ64 ? 512 : 256, PLOW_NV_FA_TMA_DESC,
-                            PLOW_NV_FA_TMA_DESC>(
+                            PLOW_NV_FA_TMA_DESC, PLOW_NV_FA_CTA_SNAKE>(
             opart + qoff * (PLOW_NV_FA512_PX4_BQ64 ? 1 : nsplit),
             mlpart + (size_t)q0 * (PLOW_NV_FA512_PX4_BQ64 ? 32 : n_head * nsplit * 2),
             q + qoff, k + kvoff, v + kvoff, output ? output + qoff : nullptr,
@@ -252,7 +259,7 @@ void plow_sm90a_pfattn_hd512_px4_bq64_direct(PlowHd512Px4Direct args) {
             return;
         }
         d_flash_prefill_px4<512, 64, 16, false, 512, PLOW_NV_FA_TMA_DESC,
-                            PLOW_NV_FA_TMA_DESC>(
+                            PLOW_NV_FA_TMA_DESC, PLOW_NV_FA_CTA_SNAKE>(
             args.opart + qoff, args.mlpart + (size_t)q0 * 32, args.q + qoff,
             args.k + kvoff, args.v + kvoff, args.output + qoff, qlen, kvlen, 16, 1,
             kvlen - qlen, 0, 1, args.kv_stride, 0xffffffffu, 1.0f,

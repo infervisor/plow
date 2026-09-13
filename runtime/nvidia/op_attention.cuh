@@ -1864,7 +1864,8 @@ __device__ __forceinline__ const __nv_bfloat16* fa_tma_sw128_at(
  * mma reads; the K-scale post-multiplies the score tile per kv column, the V-scale folds into the
  * P fragment — identical numerics to the PIPE=0 reference arm (d_flash_prefill FP8KV). */
 template <int HD, int BQ, int BKV, bool FP8KV = false, int THREADS = PLOW_NV_THREADS,
-          bool TMA_DESC = false, bool TMA_ELIDE_CTA_AFTER_WAIT = false>
+          bool TMA_DESC = false, bool TMA_ELIDE_CTA_AFTER_WAIT = false,
+          bool SNAKE_WORK = false>
 __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict__ mlpart,
                                     const __nv_bfloat16* __restrict__ Q,
                                     const __nv_bfloat16* __restrict__ K,
@@ -1960,7 +1961,20 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
     const int r0 = pv_wm * 16 + (lane >> 2);
     const int c0 = (lane & 3) * 2;
 
-    for (unsigned w = slice; w < n_work; w += nblk) {
+    for (unsigned ordinal = slice, wave = 0; ordinal < n_work;
+         ordinal += nblk, ++wave) {
+        unsigned w = ordinal;
+        if constexpr (SNAKE_WORK) {
+            /* Pair the light and heavy causal waves assigned to a CTA. Reversing odd waves
+             * changes only the order of independent (query tile, head) work items; each item's
+             * BKV16 accumulation order and output address remain unchanged. */
+            if (seq_q == 4096u && q_pos0 == 0u && (wave & 1u)) {
+                const unsigned wave_base = ordinal - slice;
+                const unsigned remaining = n_work - wave_base;
+                const unsigned wave_count = remaining < nblk ? remaining : nblk;
+                w = wave_base + wave_count - 1u - slice;
+            }
+        }
         const unsigned sp = w % nsplit;
         const unsigned h = (w / nsplit) % n_head;
         const unsigned qt = w / (nsplit * n_head);

@@ -37,6 +37,9 @@
 #ifndef PLOW_EXPERIMENT_TMA_ELIDE_CTA_AFTER_WAIT
 #define PLOW_EXPERIMENT_TMA_ELIDE_CTA_AFTER_WAIT 0
 #endif
+#ifndef PLOW_EXPERIMENT_PX4_SNAKE
+#define PLOW_EXPERIMENT_PX4_SNAKE 0
+#endif
 #include "op_attention.cuh"
 
 using bf16 = __nv_bfloat16;
@@ -97,7 +100,8 @@ __global__ __launch_bounds__(BQ64_THREADS, 1) void candidate_kernel(
                                  unsigned nsplit, const void* maps) {
     extern __shared__ float arena[];
     d_flash_prefill_px4<HD, 64, BKV, false, BQ64_THREADS, true,
-                        PLOW_EXPERIMENT_TMA_ELIDE_CTA_AFTER_WAIT != 0>(
+                        PLOW_EXPERIMENT_TMA_ELIDE_CTA_AFTER_WAIT != 0,
+                        PLOW_EXPERIMENT_PX4_SNAKE != 0>(
         partial, stats, q, k, v, out, rows, kv_length, HEADS, KV_HEADS,
         kv_length - rows, 0, nsplit, stride, 0xffffffffu, 1.0f,
         blockIdx.x, gridDim.x, arena, nullptr, nullptr, maps);
