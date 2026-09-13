@@ -36,6 +36,12 @@ def bench_command(plowrt, assets, row_file, checkpoint=None, fp8_dir=None):
     return command
 
 
+def write_diagnostics(output, stdout, stderr):
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.with_suffix(output.suffix + ".stdout").write_text(stdout)
+    output.with_suffix(output.suffix + ".stderr").write_text(stderr)
+
+
 def validate(report, log, rows):
     if report.get("schema") != "plowrt.bench.v1" or report.get("vendor") != "Some(Amd)":
         raise ValueError("not an AMD production bench report")
@@ -82,6 +88,7 @@ def main():
     args = parser.parse_args()
 
     assets = Path(args.assets).resolve()
+    output = Path(args.output)
     packet = assets / "model.pkt"
     packet_sha256 = hashlib.sha256(packet.read_bytes()).hexdigest()
     if packet_sha256 != args.packet_sha256:
@@ -113,6 +120,7 @@ def main():
             stderr=subprocess.PIPE,
             check=False,
         )
+        write_diagnostics(output, result.stdout, result.stderr)
         if result.returncode:
             raise SystemExit(result.stderr.strip().splitlines()[-1])
         report = json.loads(result.stdout)
@@ -136,7 +144,7 @@ def main():
         "prefill_requests": 2,
         "restore_calls": 2,
     }
-    Path(args.output).write_text(json.dumps(record, separators=(",", ":")) + "\n")
+    output.write_text(json.dumps(record, separators=(",", ":")) + "\n")
 
 
 if __name__ == "__main__":

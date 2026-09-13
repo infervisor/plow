@@ -117,7 +117,21 @@ class Gemma4LadderCampaignTests(unittest.TestCase):
         self.assertEqual(plan["axes"]["prefill"], [128, 512, 1024])
         self.assertEqual(plan["axes"]["decode"], [1, 2, 4, 8, 16, 32, 64, 128])
         self.assertEqual(plan["axes"]["concurrency"], [1, 2, 4, 8, 16, 32, 64, 128])
+        self.assertEqual(plan["schema_version"], 4)
         self.assertEqual(len(plan["serving_rungs"]), 40)
+        self.assertEqual(plan["live_kv_buckets"], [128, 1024, 4096, 8192, 16384])
+        full_attention = {
+            profile["kv_length"]: profile["live_kv_bucket"]
+            for profile in plan["profiles"]
+            if profile["family"] == "attention"
+            and profile["rung"] == 128
+            and profile["request_topology"] == "single"
+            and profile["window"] == 0
+        }
+        self.assertEqual(
+            {length: full_attention[length] for length in (4095, 4096, 4097)},
+            {4095: 4096, 4096: 4096, 4097: 8192},
+        )
         rung = next(row for row in plan["serving_rungs"] if row["rung_key"] == "ctx8192/c128")
         self.assertEqual((rung["prefill_bucket"], rung["prefill_chunks"]), (1024, 8))
         self.assertEqual(rung["decode_bucket"], 128)
@@ -452,6 +466,17 @@ class Gemma4LadderCampaignTests(unittest.TestCase):
         self.assertEqual(command[5], "bench")
         self.assertEqual(command.count("--prompt-rows"), 1)
 
+    def test_prefix_copack_probe_persists_failure_diagnostics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "gate.jsonl"
+            prefix_gate.write_diagnostics(output, '{"completed":2}\n', "scheduler trace\n")
+            self.assertEqual(
+                output.with_suffix(".jsonl.stdout").read_text(), '{"completed":2}\n'
+            )
+            self.assertEqual(
+                output.with_suffix(".jsonl.stderr").read_text(), "scheduler trace\n"
+            )
+
     def test_kernel_runner_brackets_candidate_with_control_anchors(self):
         profile = {
             "arch": "sm90a", "dtype": "bf16", "phase": "prefill",
@@ -521,6 +546,36 @@ class Gemma4LadderCampaignTests(unittest.TestCase):
         normalized = campaign.validate_kernel_record(record, profile, "candidate", 5)
         self.assertEqual(normalized["compiled_profile"]["vgprs"], 180)
         del record["compiled_profile"]["agprs"]
+        with self.assertRaisesRegex(campaign.CampaignError, "incomplete compiled profile"):
+            campaign.validate_kernel_record(record, profile, "candidate", 5)
+
+    def test_attention_evidence_binds_live_kv_route_and_launch_envelope(self):
+        profile = {
+            "arch": "gfx942", "dtype": "w8a8", "kv_dtype": "bf16_kv",
+            "phase": "prefill", "family": "attention", "rung": 1024,
+            "concurrency": 1, "request_topology": "single",
+            "packed_topology": "single", "history_layout": "homogeneous",
+            "live_kv_bucket": 4096,
+            "query_rows": 1024, "kv_length": 4096, "q_heads": 16,
+            "kv_heads": 1, "head_dim": 512, "window": 0, "splits": 1,
+        }
+        profile["profile_key"] = campaign.canonical_key(profile)
+        record = {
+            "profile_key": profile["profile_key"], "correct": True,
+            "samples_us": [100.0] * 5,
+            "compiled_profile": {
+                "object_sha256": "a" * 64, "program_digest": "b" * 64,
+                "kernel_symbol": "flash_prefill_hd512", "threads": 256,
+                "wavefronts": 4, "vgprs": 180, "agprs": 0,
+                "lds_bytes": 32768, "tile": [64, 16, 512], "stages": 2,
+                "memory_path": "global-to-lds", "mfma": "intrawave-v3",
+                "bq": 64, "bkv": 16, "nsplit": 1, "occupancy": 0.25,
+                "spills": 0, "segment_mode": "direct",
+            },
+        }
+        normalized = campaign.validate_kernel_record(record, profile, "candidate", 5)
+        self.assertEqual(normalized["compiled_profile"]["bkv"], 16)
+        del record["compiled_profile"]["occupancy"]
         with self.assertRaisesRegex(campaign.CampaignError, "incomplete compiled profile"):
             campaign.validate_kernel_record(record, profile, "candidate", 5)
 

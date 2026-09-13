@@ -20,12 +20,13 @@ isolated execution, and report bitwise equality or same-session control-floor
 bounded error for full-vocabulary snapshots.
 Raw command output stays in a temporary directory under ``/tmp``.
 
-Attention profiles expand the packet rung over live runtime KV lengths, including
-boundary-adjacent global histories through 16K and local-window/ring histories.
+Attention profiles expand the packet rung over explicit live-KV buckets and
+boundary-adjacent global histories through 16K plus local-window/ring histories.
 Packed homogeneous and ragged request tables are distinct profiles. Compiled
 profiles identify the GPU object, symbol, launch geometry, tile, resource
-budgets, pipeline, memory path, spills, and segment mode. Evidence for one
-object therefore cannot be silently applied to another execution profile.
+budgets, BQ/BKV, split count, occupancy, pipeline, memory path, spills, and
+segment mode. Evidence for one object therefore cannot be silently applied to
+another execution profile.
 
 The spec may select ``prefill_rungs``, ``decode_rungs``, ``context_rungs``,
 ``concurrency_rungs`` and ``kernel_families``. CLI rung flags override those
@@ -125,7 +126,8 @@ def canonical_key(profile):
             f"x{profile.get('fused_n0', 0)}x{profile.get('fused_n1', 0)}"
         )
     return (
-        f"{common}/{profile['kv_dtype']}/q{profile['query_rows']}kv{profile['kv_length']}"
+        f"{common}/{profile['kv_dtype']}/bucket{profile['live_kv_bucket']}"
+        f"/q{profile['query_rows']}kv{profile['kv_length']}"
         f"h{profile['q_heads']}x{profile['kv_heads']}d{profile['head_dim']}"
         f"w{profile['window']}s{profile['splits']}/hist-{profile['history_layout']}"
     )
@@ -287,7 +289,9 @@ def _boundary_lengths(boundaries, maximum):
     }))
 
 
-def _kv_profiles(minimum, window, history_layout, global_lengths, local_lengths):
+def _kv_profiles(
+    minimum, window, history_layout, global_lengths, local_lengths, live_kv_buckets
+):
     lengths = local_lengths if window else global_lengths
     eligible = [value for value in lengths if value >= minimum]
     for index, value in enumerate(eligible):
@@ -296,6 +300,10 @@ def _kv_profiles(minimum, window, history_layout, global_lengths, local_lengths)
         previous = eligible[max(0, index - 1)]
         yield {
             "kv_length": value,
+            "live_kv_bucket": next(
+                (bucket for bucket in live_kv_buckets if value <= bucket),
+                live_kv_buckets[-1],
+            ),
             "kv_length_min": previous if history_layout == "ragged" else value,
             "effective_kv_rows": min(value, window) if window else value,
             "q_pos0": value - minimum,
@@ -397,7 +405,8 @@ def audit_inventory(
                  window, splits, kv_stride, kv_mask) = dims
                 query_rows = request["rows_per_request_max"]
                 for history in _kv_profiles(
-                    query_rows, window, request["history_layout"], global_lengths, local_lengths
+                    query_rows, window, request["history_layout"], global_lengths,
+                    local_lengths, context_rungs,
                 ):
                     profile = {
                         "arch": arch, "dtype": dtype, "kv_dtype": kv_dtype,
@@ -442,7 +451,8 @@ def audit_inventory(
                 (kv_dtype, q_heads, kv_heads, kv_stride, window,
                  split_cap, head_dim, kv_mask) = dims
                 for history in _kv_profiles(
-                    1, window, request["history_layout"], global_lengths, local_lengths
+                    1, window, request["history_layout"], global_lengths,
+                    local_lengths, context_rungs,
                 ):
                     profile = {
                         "arch": arch, "dtype": dtype, "kv_dtype": kv_dtype,
@@ -546,15 +556,32 @@ def validate_kernel_record(record, profile, arm, minimum_samples):
             )
         else:
             required += ("warps", "registers", "smem_bytes", "tma", "swizzle")
+        if profile["family"] == "attention":
+            required += ("program_digest", "bq", "bkv", "nsplit", "occupancy")
         if any(name not in compiled for name in required):
             raise CampaignError(f"{profile['profile_key']}: incomplete compiled profile")
         if not SHA256.fullmatch(str(compiled["object_sha256"])):
             raise CampaignError(f"{profile['profile_key']}: invalid object hash")
+        if profile["family"] == "attention" and not SHA256.fullmatch(
+            str(compiled["program_digest"])
+        ):
+            raise CampaignError(f"{profile['profile_key']}: invalid program digest")
         positive = ["threads", "stages"]
         positive += ["wavefronts", "vgprs"] if profile["arch"] == "gfx942" else ["warps", "registers"]
         for name in positive:
             if type(compiled[name]) is not int or compiled[name] <= 0:
                 raise CampaignError(f"{profile['profile_key']}: invalid compiled {name}")
+        if profile["family"] == "attention":
+            for name in ("bq", "bkv", "nsplit"):
+                if type(compiled[name]) is not int or compiled[name] <= 0:
+                    raise CampaignError(f"{profile['profile_key']}: invalid compiled {name}")
+            occupancy = compiled["occupancy"]
+            if (
+                type(occupancy) not in (int, float)
+                or not math.isfinite(occupancy)
+                or occupancy <= 0
+            ):
+                raise CampaignError(f"{profile['profile_key']}: invalid compiled occupancy")
         nonnegative = ["spills"]
         nonnegative += ["agprs", "lds_bytes"] if profile["arch"] == "gfx942" else ["smem_bytes"]
         for name in nonnegative:
@@ -1266,7 +1293,7 @@ def campaign_plan(spec):
     global_lengths = _boundary_lengths(axes["context"], max(axes["context"]))
     local_boundaries = tuple(sorted(set(axes["context"]) | {1, 32, 64, 256, 512, 2048}))
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "model": "google/gemma-4-12B-it",
         "packet_sha256": audit.get("packet_sha256"),
         "architecture": spec["arch"],
@@ -1280,6 +1307,7 @@ def campaign_plan(spec):
             "global": list(global_lengths),
             "local": list(_boundary_lengths(local_boundaries, max(axes["context"]))),
         },
+        "live_kv_buckets": list(axes["context"]),
         "serving_rungs": [
             {
                 "rung_key": f"ctx{context}/c{concurrency}",
