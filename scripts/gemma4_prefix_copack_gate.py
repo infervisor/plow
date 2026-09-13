@@ -11,6 +11,9 @@ import subprocess
 import tempfile
 
 
+ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
 def token_stream(seed, length):
     return [100 + ((seed * 7919 + index * 104729) % 4096) for index in range(length)]
 
@@ -62,6 +65,7 @@ def validate(report, log, rows):
     outputs = audit.get("output_token_ids") or []
     if len(outputs) != 2 or any(len(output) != 8 for output in outputs):
         raise ValueError("token audit does not contain two eight-token outputs")
+    log = ANSI_ESCAPE.sub("", log)
     copacks = [
         line for line in log.splitlines()
         if "AMD token batch" in line

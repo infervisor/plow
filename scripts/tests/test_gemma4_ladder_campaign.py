@@ -452,6 +452,18 @@ class Gemma4LadderCampaignTests(unittest.TestCase):
             'PFX prefix restore calls=2\n'
         )
         prefix_gate.validate(report, log, rows)
+        ansi_log = (
+            '\x1b[2mAMD token batch\x1b[0m '
+            '\x1b[3mrows\x1b[0m=\x1b[0m1024 '
+            '\x1b[3mdecode\x1b[0m=\x1b[0m0 '
+            '\x1b[3mprefill\x1b[0m=\x1b[0m2 '
+            '\x1b[3mcompleted\x1b[0m=\x1b[0m2 '
+            '\x1b[3mfires\x1b[0m=\x1b[0mtrue\n'
+            '\x1b[32mINFO\x1b[0m PFX '
+            '\x1b[3mphase\x1b[0m=\x1b[0m"prefix restore  (dtod, per rank)" '
+            '\x1b[3mcalls\x1b[0m=\x1b[0m2\n'
+        )
+        prefix_gate.validate(report, ansi_log, rows)
         with self.assertRaisesRegex(ValueError, "two-suffix co-pack"):
             prefix_gate.validate(report, log.replace("rows=1024", "rows=512"), rows)
 
