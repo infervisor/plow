@@ -232,6 +232,7 @@ pub(crate) enum RowField {
 pub(crate) const PREFILL_ROW_FIELDS: &[(DevOp, RowField)] = &[
     (DevOp::Embed, RowField::Rows(0)),
     (DevOp::RmsNorm, RowField::Rows(0)),
+    (DevOp::LayerNorm, RowField::Rows(0)),
     (DevOp::HeadNormRope, RowField::Rows(0)),
     (DevOp::HeadNormRopeFp8, RowField::Rows(0)),
     (DevOp::Residual, RowField::RowsTimes(0)),
@@ -258,6 +259,10 @@ pub(crate) const PREFILL_ROW_FIELDS: &[(DevOp, RowField)] = &[
     (DevOp::PerLayerInput, RowField::Rows(0)),
     (DevOp::FlashMlaPrefill, RowField::Rows(4)),
     (DevOp::FlashMlaPrefillFp8, RowField::Rows(4)),
+    // The union header and causal query bases must use the same row count as flash.
+    (DevOp::IndexScorePf, RowField::Rows(0)),
+    (DevOp::IndexSelectPf, RowField::Rows(0)),
+    (DevOp::IndexUnionPf, RowField::Rows(0)),
     (DevOp::MlaMergeFold, RowField::Rows(0)),
     (DevOp::MoeRouterTopkPf, RowField::Rows(4)),
     (DevOp::MoeAlignPf, RowField::Rows(0)),
@@ -361,6 +366,11 @@ pub(crate) fn rebase_chunk_rows(
         let Some(t) = bucket.filter(|&t| t > 0 && clen < t) else {
             continue;
         };
+        // A sequence-parallel band packet (`<base>@band<T>` output) covers this rank's fixed
+        // `T/tp` rows, not a prefix of the bucket; shrinking it would drop live band rows.
+        if names.get(d.t[0] as usize).is_some_and(|n| n.contains("@band")) {
+            continue;
+        }
         match prefill_row_field(op) {
             Some(RowField::Rows(f)) if d.i[f] == t => d.i[f] = clen,
             Some(RowField::RowsTimes(f)) if d.i[f] > 0 && d.i[f] % t == 0 => {
@@ -369,6 +379,68 @@ pub(crate) fn rebase_chunk_rows(
             _ => {}
         }
     }
+}
+
+/// Rows of each rank's band when a `t`-row sequence-parallel bucket carries `clen` live rows
+/// under `PLOW_AMD_RAGGED_SEAMS`: `ceil(clen / tp)`, at least one, at most the compiled `t / tp`.
+pub(crate) fn ragged_band_rows(clen: u32, t: u32, tp: u32) -> u32 {
+    clen.div_ceil(tp).clamp(1, t / tp)
+}
+
+/// `PLOW_AMD_RAGGED_SEAMS`: size a ragged chunk's sequence-parallel seams by its live rows.
+///
+/// Runs after [`rebase_chunk_rows`], which leaves band packets and the split collectives at the
+/// bucket. With `b = ceil(clen / tp)` band rows per rank, the reduce-scatter / all-gather cover
+/// `tp * b >= clen` rows, so each rank's flat slice `[n*r/tp, n*(r+1)/tp)` is exactly its band's
+/// whole rows `[r*b, (r+1)*b)`, and every band packet (output `<base>@band<t>...`) goes from
+/// `t / tp` rows to `b`. Rows `clen..tp*b` are padding, computed and never read. The band views
+/// must be rebound to match: [`ragged_band_views`].
+pub(crate) fn rebase_band_rows(insts: &mut [DevInst64], names: &[String], clen: u32, t: u32, tp: u32) {
+    let (tb, b) = (t / tp, ragged_band_rows(clen, t, tp));
+    let rescale = |v: u32, per: u32, to: u32| if v > 0 && v % per == 0 { v / per * to } else { v };
+    for d in insts.iter_mut() {
+        if d.op == DevOp::XReduceScatter as u16 {
+            d.i[0] = rescale(d.i[0], t, tp * b);
+        } else if d.op == DevOp::XAllGather as u16 {
+            for k in 0..3 {
+                d.i[k] = rescale(d.i[k], t, tp * b);
+            }
+        } else if names.get(d.t[0] as usize).is_some_and(|n| n.contains("@band")) {
+            match prefill_row_field(d.op) {
+                Some(RowField::Rows(f)) if d.i[f] == tb => d.i[f] = b,
+                Some(RowField::RowsTimes(f)) => d.i[f] = rescale(d.i[f], tb, b),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// `(tensor, address)` for every `<base>@band<t>...` view of a `t`-row program when each rank's
+/// band is `b` rows: `base + rank * b * row_bytes`, where `row_bytes = view_bytes / (t / tp)`.
+/// `b = t / tp` reproduces the load-time binding (`base + rank * view_bytes`).
+pub(crate) fn ragged_band_views(
+    names: &[String],
+    bases: &[u64],
+    lens: &[u64],
+    t: u32,
+    tp: u32,
+    rank: u32,
+    b: u32,
+) -> Vec<(usize, u64)> {
+    let tag = format!("@band{t}");
+    let mut out = Vec::new();
+    for (i, n) in names.iter().enumerate() {
+        let Some(pos) = n.find(&tag) else { continue };
+        if n[pos + tag.len()..].starts_with(|c: char| c.is_ascii_digit()) {
+            continue; // `@band8192` is not `@band81920`
+        }
+        let Some(bi) = names.iter().position(|x| *x == n[..pos]) else {
+            continue;
+        };
+        let row = lens[i] / (t / tp) as u64;
+        out.push((i, bases[bi] + rank as u64 * b as u64 * row));
+    }
+    out
 }
 
 pub(crate) const LM_HEAD_MATMUL_OPS: &[DevOp] = &[
@@ -498,4 +570,73 @@ pub(crate) fn derive_mla_nsplit(insts: &[DevInst64]) -> Option<(Vec<u32>, u32)> 
         sites.push(k as u32);
     }
     (n_flash > 0 && n_flash == n_merge).then_some((sites, baked?))
+}
+
+// The KV contract has no caller until the head handoff lands. Keep it here
+// rather than deferring it: the transferable-set rule belongs beside the other
+// KV-row rules this module exists to hold in one place, and splitting it across
+// commits is how the two engines' notions of "which tensors carry a sequence"
+// drifted apart before.
+/// One transferable KV cache in a loaded packet: where the engine's tensor
+/// table holds it, and the geometry the twin must match.
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct KvSlotTensor {
+    /// Index into the packet's tensor table.
+    pub handle: usize,
+    pub name: String,
+    pub per_slot_bytes: u64,
+}
+
+/// The transferable KV set for a packet whose `kv.*` caches are `[batch]` slot
+/// blocks, sorted by name.
+///
+/// Sorted because the digest is a set comparison across two INDEPENDENT emits:
+/// the device packet and its CPU twin need not declare tensors in the same
+/// order, and a digest that depended on that order would refuse every valid
+/// pair.
+///
+/// This is deliberately NOT `AmdEngine`'s `kv_slot_stride`, which keeps the
+/// carried recurrent state when the blob's `PLOW_KDA_F_SEQ_ROWS` carrier says
+/// it is per-slot. A row range does not reconstruct a recurrence, so the head
+/// path excludes it here and refuses the model at admission instead.
+#[allow(dead_code)]
+pub(crate) fn kv_slot_tensors(
+    blob: &crate::asset::devblob::DevBlob,
+    batch: u32,
+) -> crate::Result<Vec<KvSlotTensor>> {
+    let batch = u64::from(batch.max(1));
+    let mut out = Vec::new();
+    for (handle, t) in blob.tensors.iter().enumerate() {
+        if !plow_asset::kv_contract::is_cache_tensor(&t.name) {
+            continue;
+        }
+        if !t.bytes.is_multiple_of(batch) {
+            return Err(crate::RuntimeError::Device(format!(
+                "KV cache tensor `{}` has {} bytes, not divisible by batch {batch}",
+                t.name, t.bytes
+            )));
+        }
+        out.push(KvSlotTensor {
+            handle,
+            name: t.name.clone(),
+            per_slot_bytes: t.bytes / batch,
+        });
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
+/// The digest a device packet and its CPU twin must agree on before a head's KV
+/// rows may be copied between them.
+#[allow(dead_code)]
+pub(crate) fn kv_contract_digest(tensors: &[KvSlotTensor]) -> String {
+    let set: Vec<_> = tensors
+        .iter()
+        .map(|t| plow_asset::kv_contract::CacheTensor {
+            name: t.name.clone(),
+            per_slot_bytes: t.per_slot_bytes,
+        })
+        .collect();
+    plow_asset::kv_contract::digest(&set)
 }

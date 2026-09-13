@@ -353,6 +353,10 @@ __device__ __forceinline__ void sm90_tmap_acquire(const void* map) {
     asm volatile("fence.proxy.tensormap::generic.acquire.gpu [%0], 128;\n" ::"l"(map) : "memory");
 }
 
+__device__ __forceinline__ void sm90_tmap_prefetch(const void* map) {
+    asm volatile("prefetch.tensormap [%0];" :: "l"(map) : "memory");
+}
+
 /* ---- accumulator -> (row, col) --------------------------------------------
  * See the header comment. `g` is the n-block (0..N/8-1), `hi`/`lo` in {0,1}. */
 __device__ __forceinline__ int sm90_acc_reg(int g, int hi, int lo) { return 4 * g + 2 * hi + lo; }

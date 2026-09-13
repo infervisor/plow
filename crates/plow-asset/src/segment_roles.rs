@@ -9,10 +9,48 @@ pub const FP8_M1: u8 = 4;
 pub const CUBLASLT: u8 = 5;
 pub const PREFILL_ATTENTION_HD512_WG32: u8 = 6;
 pub const MXFP4_MOE: u8 = 7;
-pub const MAX_ROLE: u8 = MXFP4_MOE;
+pub const NATIVE_DECODE_TC: u8 = 8;
+pub const W8A16_PREFILL_M1: u8 = 9;
+pub const PREFILL_ATTENTION_HD256_BKV64: u8 = 10;
+pub const PREFILL_ATTENTION_HD256_BKV32: u8 = 11;
+pub const BF16_PREFILL_GEMM_GLU_GEMMA4: u8 = 12;
+pub const W8A8_PREFILL_GEMM_GLU_GEMMA4: u8 = 13;
+pub const MAX_ROLE: u8 = W8A8_PREFILL_GEMM_GLU_GEMMA4;
+
+pub fn is_projection(role: u8) -> bool {
+    matches!(role, CUBLASLT | NATIVE_DECODE_TC)
+}
+
+pub const CUBLASLT_PREFILL_MAX_ROWS: u32 = 8192;
+pub const CUBLASLT_PREFILL_ROWS: [u32; 3] = [128, 256, 512];
+pub const CUBLASLT_PREFILL_WIDE_ROWS: [u32; 4] = [1024, 2048, 4096, 8192];
+pub const CUBLASLT_PREFILL_GEMMA4_SHAPES: [(u32, u32); 8] = [
+    (15360, 3840),
+    (2048, 3840),
+    (3840, 15360),
+    (4096, 3840),
+    (3840, 4096),
+    (8192, 3840),
+    (512, 3840),
+    (3840, 8192),
+];
+
+pub fn cublaslt_prefill_bf16(profile: &str, m: u32, n: u32, k: u32) -> bool {
+    matches!(profile, "sm90a" | "sm_90a")
+        && ((CUBLASLT_PREFILL_ROWS.contains(&m)
+            && matches!((n, k), (3840, 15360) | (3840, 8192)))
+            || (CUBLASLT_PREFILL_WIDE_ROWS.contains(&m)
+                && CUBLASLT_PREFILL_GEMMA4_SHAPES.contains(&(n, k))))
+}
 
 pub const PREFILL_ATTENTION_HD512_WG32_ABI: &str = "attention_sm90_hd512_wg32_v1";
+pub const PREFILL_ATTENTION_HD256_BKV64_ABI: &str = "attention_sm90_hd256_bkv64_v1";
+pub const PREFILL_ATTENTION_HD256_BKV32_ABI: &str = "attention_sm90_hd256_bkv32_v1";
 pub const MXFP4_MOE_ABI: &str = "mxfp4_moe_sm90_v1";
+pub const W8A16_PREFILL_M1_ABI: &str = "w8a16_prefill_m1_sm90_v1";
+pub const BF16_PREFILL_GEMM_GLU_GEMMA4_ABI: &str = "gemm_glu_sm90_gemma4_4k8k_v1";
+pub const W8A8_PREFILL_GEMM_GLU_GEMMA4_ABI: &str =
+    "gemm_glu_w8a8_sm90_gemma4_4k8k_v1";
 
 pub fn requires_object(role: u8) -> bool {
     matches!(
@@ -23,6 +61,12 @@ pub fn requires_object(role: u8) -> bool {
             | FP8_M1
             | PREFILL_ATTENTION_HD512_WG32
             | MXFP4_MOE
+            | NATIVE_DECODE_TC
+            | W8A16_PREFILL_M1
+            | PREFILL_ATTENTION_HD256_BKV64
+            | PREFILL_ATTENTION_HD256_BKV32
+            | BF16_PREFILL_GEMM_GLU_GEMMA4
+            | W8A8_PREFILL_GEMM_GLU_GEMMA4
     )
 }
 
@@ -46,7 +90,7 @@ pub struct SegmentObject {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attention: Option<AttentionCapability>,
 }
-#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AttentionCapability {
     pub profile: String,
@@ -109,6 +153,12 @@ impl SegmentRoles {
                 FP8_M1 => crate::fp8_m1_role::ABI,
                 PREFILL_ATTENTION_HD512_WG32 => PREFILL_ATTENTION_HD512_WG32_ABI,
                 MXFP4_MOE => MXFP4_MOE_ABI,
+                NATIVE_DECODE_TC => "gemv_transposed_sm90_bf16_v1",
+                W8A16_PREFILL_M1 => W8A16_PREFILL_M1_ABI,
+                PREFILL_ATTENTION_HD256_BKV64 => PREFILL_ATTENTION_HD256_BKV64_ABI,
+                PREFILL_ATTENTION_HD256_BKV32 => PREFILL_ATTENTION_HD256_BKV32_ABI,
+                BF16_PREFILL_GEMM_GLU_GEMMA4 => BF16_PREFILL_GEMM_GLU_GEMMA4_ABI,
+                W8A8_PREFILL_GEMM_GLU_GEMMA4 => W8A8_PREFILL_GEMM_GLU_GEMMA4_ABI,
                 _ => return Err("invalid packet segment object role".into()),
             };
             let valid_hash = |hash: Option<&str>| {
@@ -134,6 +184,26 @@ impl SegmentRoles {
                 kv_tile: 16,
                 warps: 8,
             };
+            let hd512_wg16 = AttentionCapability {
+                kv_tile: 16,
+                ..hd512_wg.clone()
+            };
+            let hd512_wg64 = AttentionCapability {
+                kv_tile: 64,
+                ..hd512_wg.clone()
+            };
+            let hd256_bkv64 = AttentionCapability {
+                profile: "sm90a".into(),
+                dtype: "bf16".into(),
+                head_dim: 256,
+                query_tile: 64,
+                kv_tile: 64,
+                warps: 8,
+            };
+            let hd256_bkv32 = AttentionCapability {
+                kv_tile: 32,
+                ..hd256_bkv64.clone()
+            };
             if object.abi != abi
                 || object.file.is_empty()
                 || std::path::Path::new(&object.file)
@@ -149,15 +219,45 @@ impl SegmentRoles {
                         || object
                             .attention
                             .as_ref()
-                            .is_none_or(|a| a != &hd512_wg && a != &hd512_px4)))
-                || (id == MXFP4_MOE
+                            .is_none_or(|a| {
+                                a != &hd512_wg
+                                    && a != &hd512_wg16
+                                    && a != &hd512_wg64
+                                    && a != &hd512_px4
+                            })))
+                || (id == PREFILL_ATTENTION_HD256_BKV64
+                    && (!valid_hash(object.sha256.as_deref())
+                        || object.promote_k512.is_some()
+                        || object.attention.as_ref() != Some(&hd256_bkv64)))
+                || (id == PREFILL_ATTENTION_HD256_BKV32
+                    && (!valid_hash(object.sha256.as_deref())
+                        || object.promote_k512.is_some()
+                        || object.attention.as_ref() != Some(&hd256_bkv32)))
+                || (matches!(
+                    id,
+                    MXFP4_MOE
+                        | NATIVE_DECODE_TC
+                        | W8A16_PREFILL_M1
+                        | BF16_PREFILL_GEMM_GLU_GEMMA4
+                        | W8A8_PREFILL_GEMM_GLU_GEMMA4
+                )
                     && (!valid_hash(object.sha256.as_deref())
                         || object.promote_k512.is_some()
                         || object.attention.is_some()))
-                || (!matches!(id, FP8_M1 | PREFILL_ATTENTION_HD512_WG32 | MXFP4_MOE)
-                    && (object.sha256.is_some()
-                        || object.promote_k512.is_some()
-                        || object.attention.is_some()))
+                || (!matches!(
+                    id,
+                    FP8_M1
+                        | PREFILL_ATTENTION_HD512_WG32
+                        | MXFP4_MOE
+                        | NATIVE_DECODE_TC
+                        | W8A16_PREFILL_M1
+                        | PREFILL_ATTENTION_HD256_BKV64
+                        | PREFILL_ATTENTION_HD256_BKV32
+                        | BF16_PREFILL_GEMM_GLU_GEMMA4
+                        | W8A8_PREFILL_GEMM_GLU_GEMMA4
+                ) && (object.sha256.is_some()
+                    || object.promote_k512.is_some()
+                    || object.attention.is_some()))
             {
                 return Err("invalid packet segment object".into());
             }
@@ -168,6 +268,7 @@ impl SegmentRoles {
             if !programs.insert(program.index)
                 || program.roles.is_empty()
                 || program.roles.iter().any(|&r| r > MAX_ROLE)
+                || (program.roles.contains(&CUBLASLT) && program.roles.contains(&NATIVE_DECODE_TC))
             {
                 return Err("invalid packet segment program".into());
             }
@@ -189,6 +290,34 @@ impl SegmentRoles {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cublaslt_prefill_policy_is_exactly_the_measured_sm90_bf16_cells() {
+        for profile in ["sm90a", "sm_90a"] {
+            for m in CUBLASLT_PREFILL_ROWS {
+                assert!(cublaslt_prefill_bf16(profile, m, 3840, 15360));
+                assert!(cublaslt_prefill_bf16(profile, m, 3840, 8192));
+            }
+            for m in CUBLASLT_PREFILL_WIDE_ROWS {
+                for (n, k) in CUBLASLT_PREFILL_GEMMA4_SHAPES {
+                    assert!(cublaslt_prefill_bf16(profile, m, n, k));
+                }
+            }
+        }
+        for (profile, m, n, k) in [
+            ("sm120", 128, 3840, 15360),
+            ("gfx942", 128, 3840, 8192),
+            ("sm90a", 0, 3840, 15360),
+            ("sm90a", 64, 3840, 15360),
+            ("sm90a", 1024, 3840, 3840),
+            ("sm90a", 1024, 15360, 8192),
+            ("sm90a", 16384, 3840, 15360),
+            ("sm90a", 128, 15360, 3840),
+            ("sm90a", 128, 3840, 4096),
+        ] {
+            assert!(!cublaslt_prefill_bf16(profile, m, n, k));
+        }
+    }
+
     #[test]
     fn schema_rejects_duplicate_alias_ids_and_unknown_fields() {
         let object = r#"{"abi":"fp8_gemm_tma128_v1","file":"role.cubin"}"#;
@@ -235,6 +364,8 @@ mod tests {
             "a".repeat(64)
         );
         SegmentRoles::from_bytes(raw.as_bytes()).unwrap();
+        SegmentRoles::from_bytes(raw.replace("\"kv_tile\":32", "\"kv_tile\":64").as_bytes())
+            .unwrap();
         SegmentRoles::from_bytes(
             raw.replace(
                 "\"query_tile\":64,\"kv_tile\":32",
@@ -243,14 +374,52 @@ mod tests {
             .as_bytes(),
         )
         .unwrap();
+        SegmentRoles::from_bytes(raw.replace("\"kv_tile\":32", "\"kv_tile\":16").as_bytes())
+            .unwrap();
         for bad in [
             raw.replace(&"a".repeat(64), "bad"),
             raw.replace("\"head_dim\":512", "\"head_dim\":256"),
             raw.replace("\"query_tile\":64", "\"query_tile\":32"),
-            raw.replace("\"kv_tile\":32", "\"kv_tile\":16"),
+            raw.replace("\"kv_tile\":32", "\"kv_tile\":128"),
             raw.replace("\"warps\":8", "\"warps\":4"),
             raw.replace("\"profile\":\"sm90a\"", "\"profile\":\"sm120\""),
             raw.replace("\"dtype\":\"bf16\"", "\"dtype\":\"fp8\""),
+        ] {
+            assert!(SegmentRoles::from_bytes(bad.as_bytes()).is_err());
+        }
+    }
+
+    #[test]
+    fn hd256_bkv64_attention_role_requires_exact_hash_and_capability() {
+        let raw = format!(
+            r#"{{"version":1,"objects":{{"10":{{"abi":"attention_sm90_hd256_bkv64_v1","file":"attention.cubin","sha256":"{}","attention":{{"profile":"sm90a","dtype":"bf16","head_dim":256,"query_tile":64,"kv_tile":64,"warps":8}}}}}},"programs":[{{"index":0,"roles":[0,10,0]}}]}}"#,
+            "a".repeat(64)
+        );
+        SegmentRoles::from_bytes(raw.as_bytes()).unwrap();
+        for bad in [
+            raw.replace(&"a".repeat(64), "bad"),
+            raw.replace("\"head_dim\":256", "\"head_dim\":512"),
+            raw.replace("\"query_tile\":64", "\"query_tile\":32"),
+            raw.replace("\"kv_tile\":64", "\"kv_tile\":32"),
+            raw.replace("\"warps\":8", "\"warps\":4"),
+        ] {
+            assert!(SegmentRoles::from_bytes(bad.as_bytes()).is_err());
+        }
+    }
+
+    #[test]
+    fn hd256_bkv32_attention_role_requires_exact_hash_and_capability() {
+        let raw = format!(
+            r#"{{"version":1,"objects":{{"11":{{"abi":"attention_sm90_hd256_bkv32_v1","file":"attention.cubin","sha256":"{}","attention":{{"profile":"sm90a","dtype":"bf16","head_dim":256,"query_tile":64,"kv_tile":32,"warps":8}}}}}},"programs":[{{"index":0,"roles":[0,11,0]}}]}}"#,
+            "a".repeat(64)
+        );
+        SegmentRoles::from_bytes(raw.as_bytes()).unwrap();
+        for bad in [
+            raw.replace(&"a".repeat(64), "bad"),
+            raw.replace("\"head_dim\":256", "\"head_dim\":512"),
+            raw.replace("\"query_tile\":64", "\"query_tile\":32"),
+            raw.replace("\"kv_tile\":32", "\"kv_tile\":64"),
+            raw.replace("\"warps\":8", "\"warps\":4"),
         ] {
             assert!(SegmentRoles::from_bytes(bad.as_bytes()).is_err());
         }
@@ -266,6 +435,74 @@ mod tests {
         for bad in [
             raw.replace(&format!(r#","sha256":"{}""#, "a".repeat(64)), ""),
             raw.replace(&"a".repeat(64), "bad"),
+        ] {
+            assert!(SegmentRoles::from_bytes(bad.as_bytes()).is_err());
+        }
+    }
+
+    #[test]
+    fn native_decode_requires_hash_and_one_projection_backend() {
+        let raw = format!(
+            r#"{{"version":1,"objects":{{"8":{{"abi":"gemv_transposed_sm90_bf16_v1","file":"native.cubin","sha256":"{}"}}}},"programs":[{{"index":0,"roles":[0,8,0]}}]}}"#,
+            "a".repeat(64)
+        );
+        SegmentRoles::from_bytes(raw.as_bytes()).unwrap();
+        for bad in [
+            raw.replace(&"a".repeat(64), "bad"),
+            raw.replace("[0,8,0]", "[5,8,0]"),
+        ] {
+            assert!(SegmentRoles::from_bytes(bad.as_bytes()).is_err());
+        }
+    }
+
+    #[test]
+    fn native_w8a16_m1_requires_exact_abi_and_hash() {
+        let raw = format!(
+            r#"{{"version":1,"objects":{{"9":{{"abi":"w8a16_prefill_m1_sm90_v1","file":"m1.cubin","sha256":"{}"}}}},"programs":[{{"index":0,"roles":[0,9,0]}}]}}"#,
+            "a".repeat(64)
+        );
+        SegmentRoles::from_bytes(raw.as_bytes()).unwrap();
+        for bad in [
+            raw.replace(&"a".repeat(64), "bad"),
+            raw.replace("w8a16_prefill_m1_sm90_v1", "w8a16_prefill_small_sm90_v1"),
+        ] {
+            assert!(SegmentRoles::from_bytes(bad.as_bytes()).is_err());
+        }
+    }
+
+    #[test]
+    fn gemma4_bf16_gemm_glu_requires_exact_abi_and_hash() {
+        let raw = format!(
+            r#"{{"version":1,"objects":{{"12":{{"abi":"gemm_glu_sm90_gemma4_4k8k_v1","file":"glu.cubin","sha256":"{}"}}}},"programs":[{{"index":0,"roles":[0,12,0]}}]}}"#,
+            "a".repeat(64)
+        );
+        SegmentRoles::from_bytes(raw.as_bytes()).unwrap();
+        for bad in [
+            raw.replace(&"a".repeat(64), "bad"),
+            raw.replace(
+                BF16_PREFILL_GEMM_GLU_GEMMA4_ABI,
+                "gemm_glu_sm90_gemma4_v0",
+            ),
+            raw.replace("glu.cubin", "../glu.cubin"),
+        ] {
+            assert!(SegmentRoles::from_bytes(bad.as_bytes()).is_err());
+        }
+    }
+
+    #[test]
+    fn gemma4_w8a8_gemm_glu_requires_exact_abi_and_hash() {
+        let raw = format!(
+            r#"{{"version":1,"objects":{{"13":{{"abi":"gemm_glu_w8a8_sm90_gemma4_4k8k_v1","file":"glu.cubin","sha256":"{}"}}}},"programs":[{{"index":0,"roles":[0,13,0]}}]}}"#,
+            "a".repeat(64)
+        );
+        SegmentRoles::from_bytes(raw.as_bytes()).unwrap();
+        for bad in [
+            raw.replace(&"a".repeat(64), "bad"),
+            raw.replace(
+                W8A8_PREFILL_GEMM_GLU_GEMMA4_ABI,
+                "gemm_glu_w8a8_sm90_gemma4_v0",
+            ),
+            raw.replace("glu.cubin", "../glu.cubin"),
         ] {
             assert!(SegmentRoles::from_bytes(bad.as_bytes()).is_err());
         }

@@ -2,6 +2,7 @@
 """Turn a built object directory into an `objset.json`.
 
 Input is what `scripts/build_gfx942.sh` already leaves behind: the `.elf` files
+(plus any pinned vendor `.co` code objects the adapter scripts copied beside them)
 and the `build_defines.json` it writes from the same `$ROWS` the compile loop
 uses, "so the recorded -D set cannot drift from the compiled one". This script
 adds identity — a digest per object, the marker symbols read out of `.symtab`,
@@ -75,6 +76,21 @@ def build(args) -> dict:
                 # symbol would bloat the manifest without adding a check.
                 "arms": [s for s in syms if not s.startswith("plow_packet_hash_")],
                 **({"packet_hash": stamp} if stamp else {}),
+            }
+        )
+
+    # Pinned vendor code objects (AITER fmoe / MLA `.co`) are loaded by plow's own adapters and are
+    # part of the set: a set without the 64-row fmoe object serves the 32x256 MoE tile, and one
+    # without the QH8 object refuses the sparse MLA routes. They carry no plow markers and no packet
+    # stamp (each adapter script pins its own sha256), so identity is the digest alone.
+    for p in sorted(p for p in objdir.glob("*.co") if p.is_file()):
+        objects.append(
+            {
+                "name": p.name,
+                "sha256": pd.sha256_file(p),
+                "bytes": p.stat().st_size,
+                "arms": [],
+                "vendor": True,
             }
         )
 
@@ -209,6 +225,16 @@ def self_test() -> None:
             )
             (d / "a.elf").write_bytes(b"\x7fELF-a")
             assert build(args)["objset_id"] == one["objset_id"], "identity must be stable"
+
+            # A pinned vendor code object is part of the set, not debris: it is recorded, and it
+            # moves the id, because a set without it serves a different kernel.
+            (d / "fmoe.co").write_bytes(b"\x7fELF-vendor")
+            five = build(args)
+            vendor = [o for o in five["objects"] if o["name"] == "fmoe.co"]
+            assert vendor and vendor[0]["vendor"] and vendor[0]["arms"] == [], five["objects"]
+            assert "packet_hash" not in vendor[0], "vendor objects carry no packet stamp"
+            assert five["objset_id"] != one["objset_id"], "dropping a .co must change the id"
+            (d / "fmoe.co").unlink()
 
             # A half-stamped object is a broken build, not a general one.
             pd.elf_symbols = lambda p: ["plow_packet_hash_lo_0000dead"]

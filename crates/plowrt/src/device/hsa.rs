@@ -145,6 +145,10 @@ const HSA_AGENT_INFO_DEVICE: u32 = 17;
 // ID: 30115 on gfx950 instead of 256. The engine sizes its cooperative grid
 // from `sm_count()`, so a persistent launch would have asked for 30115 blocks.
 const HSA_AMD_AGENT_INFO_COMPUTE_UNIT_COUNT: u32 = 0xA002;
+const HSA_AMD_AGENT_INFO_BDFID: u32 = 0xA006;
+const HSA_AMD_AGENT_INFO_DOMAIN: u32 = 0xA00F;
+const HSA_AMD_AGENT_INFO_NEAREST_CPU: u32 = 0xA113;
+const HSA_AGENT_INFO_NODE: u32 = 16;
 
 // hsa_region_segment_t
 const HSA_REGION_SEGMENT_GROUP: u32 = 2;
@@ -388,6 +392,7 @@ hsa_fns! {
     hsa_signal_store_screlease: unsafe extern "C" fn(HsaSignal, i64),
     hsa_signal_wait_scacquire: unsafe extern "C" fn(HsaSignal, u32, i64, u64, u32) -> i64,
     hsa_signal_add_screlease: unsafe extern "C" fn(HsaSignal, i64),
+    hsa_signal_load_scacquire: unsafe extern "C" fn(HsaSignal) -> i64,
     hsa_code_object_reader_create_from_memory: unsafe extern "C" fn(*const c_void, usize, *mut HsaCodeObjectReader) -> HsaStatus,
     hsa_code_object_reader_destroy: unsafe extern "C" fn(HsaCodeObjectReader) -> HsaStatus,
     hsa_executable_create_alt: unsafe extern "C" fn(u32, u32, *const c_void, *mut HsaExecutable) -> HsaStatus,
@@ -454,6 +459,7 @@ impl HsaDriver {
             hsa_signal_store_screlease: resolve!(lib, b"hsa_signal_store_screlease\0"),
             hsa_signal_wait_scacquire: resolve!(lib, b"hsa_signal_wait_scacquire\0"),
             hsa_signal_add_screlease: resolve!(lib, b"hsa_signal_add_screlease\0"),
+            hsa_signal_load_scacquire: resolve!(lib, b"hsa_signal_load_scacquire\0"),
             hsa_code_object_reader_create_from_memory: resolve!(
                 lib,
                 b"hsa_code_object_reader_create_from_memory\0"
@@ -536,6 +542,181 @@ impl HsaKernel {
 //
 // HSA's iterate APIs take `extern "C" fn(Item, *mut c_void) -> hsa_status_t`.
 // We pack both the driver fn-ptr and our accumulator into the userdata.
+
+/// The CPU agent whose pools back a backend's kernarg ring and fine-grained host staging:
+/// the GPU's nearest CPU agent under `PLOW_AMD_NUMA_HOST_POOLS`, else the first CPU agent.
+fn host_agent_for(numa_local: bool, first: HsaAgent, nearest: Option<HsaAgent>) -> HsaAgent {
+    match nearest {
+        Some(a) if numa_local => a,
+        _ => first,
+    }
+}
+
+/// NUMA node of the page holding `addr` (`get_mempolicy(MPOL_F_NODE | MPOL_F_ADDR)`); `None`
+/// when the kernel refuses (no NUMA support, unmapped address).
+fn page_node(addr: *const c_void) -> Option<i32> {
+    const MPOL_F_NODE: libc::c_ulong = 1;
+    const MPOL_F_ADDR: libc::c_ulong = 2;
+    let mut node: libc::c_int = -1;
+    // SAFETY: get_mempolicy reads the policy of the page at `addr` and writes one int; a null
+    // nodemask with maxnode 0 is valid with these flags, and a bad address returns EFAULT.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_get_mempolicy,
+            &mut node as *mut libc::c_int,
+            std::ptr::null_mut::<libc::c_ulong>(),
+            0 as libc::c_ulong,
+            addr,
+            MPOL_F_NODE | MPOL_F_ADDR,
+        )
+    };
+    (rc == 0 && node >= 0).then_some(node)
+}
+
+/// Write one kernarg slot: the explicit args, a zero tail up to `kernarg_size`, and the COv5 implicit
+/// block (block counts, group sizes, remainders, grid dims).
+///
+/// # Safety
+/// `dst` must be writable for `kernarg_size` bytes, `args` readable for `args_size` bytes when
+/// non-null, and `args_size <= kernarg_size`.
+unsafe fn write_kernarg(
+    dst: *mut u8,
+    kernarg_size: u32,
+    args: *const c_void,
+    args_size: usize,
+    [grid_x, grid_y, grid_z]: [u32; 3],
+    [wg_x, wg_y, wg_z]: [u16; 3],
+) {
+    // Copy explicit args.
+    if args_size > 0 && !args.is_null() {
+        // SAFETY: the caller's contract is that `args` points at `args_size`
+        // readable bytes and `dst` at `kernarg_size` writable ones, with
+        // `args_size <= kernarg_size` (`dispatch` checks it; `resolve_kernel`
+        // bounds `kernarg_size` by `KARG_SLOT`) — so both the copy and the
+        // zero-fill of the tail stay inside the slot and the fill length cannot
+        // underflow. The two ranges are disjoint (the fill starts at
+        // `args_size`), which is what `copy_nonoverlapping` requires.
+        unsafe {
+            std::ptr::copy_nonoverlapping(args as *const u8, dst, args_size);
+            std::ptr::write_bytes(dst.add(args_size), 0, kernarg_size as usize - args_size);
+        }
+    } else {
+        // SAFETY: as above — `dst` holds `kernarg_size` writable bytes.
+        unsafe {
+            std::ptr::write_bytes(dst, 0, kernarg_size as usize);
+        }
+    }
+
+    // Fill COv5 implicit block (blockDim, gridDim, remainders).
+    let hoff = (args_size + 7) & !7;
+    if (kernarg_size as usize) > hoff {
+        // SAFETY: guarded by `kernarg_size > hoff` immediately above, so
+        // the COv5 implicit block starts inside the slot.
+        let hid = unsafe { dst.add(hoff) };
+        let avail = kernarg_size as usize - hoff;
+        let dims: u16 = if grid_z > 1 {
+            3
+        } else if grid_y > 1 {
+            2
+        } else {
+            1
+        };
+        // SAFETY (both macros): the `avail >= off + width` guard is the
+        // bounds check — a field is written only when the object's declared
+        // kernarg segment actually reaches it, which is why an object built
+        // without the implicit block is not corrupted here. `write_unaligned`
+        // because `hoff` is only 8-byte aligned and the u16 fields are not.
+        macro_rules! put32 {
+            ($off:expr, $val:expr) => {
+                if avail >= $off + 4 {
+                    unsafe {
+                        std::ptr::write_unaligned(hid.add($off) as *mut u32, $val);
+                    }
+                }
+            };
+        }
+        macro_rules! put16 {
+            ($off:expr, $val:expr) => {
+                if avail >= $off + 2 {
+                    unsafe {
+                        std::ptr::write_unaligned(hid.add($off) as *mut u16, $val);
+                    }
+                }
+            };
+        }
+        put32!(0, (grid_x as u32 + wg_x as u32 - 1) / wg_x as u32);
+        put32!(4, (grid_y as u32 + wg_y as u32 - 1) / wg_y as u32);
+        put32!(8, (grid_z as u32 + wg_z as u32 - 1) / wg_z as u32);
+        put16!(12, wg_x);
+        put16!(14, wg_y);
+        put16!(16, wg_z);
+        put16!(18, (grid_x as u16).wrapping_rem(wg_x));
+        put16!(20, (grid_y as u16).wrapping_rem(wg_y));
+        put16!(22, (grid_z as u16).wrapping_rem(wg_z));
+        put16!(64, dims);
+    }
+}
+
+/// Make a kernarg slot written through the large-BAR mapping visible before its packet is published.
+/// This is CLR's `DeviceKernelArgsReadback`, the gfx94x default (ROCm/clr develop 12fe581a,
+/// `rocclr/device/rocm/rocvirtual.cpp`, `VirtualGPU::submitKernelInternal`): sfence, rewrite the
+/// last kernarg byte, mfence, then a volatile read of that byte. The read cannot complete before the
+/// earlier posted writes through the BAR land, so a packet published after it never points at
+/// kernargs still in flight.
+///
+/// Returns whether the byte read back is the byte written.
+///
+/// # Safety
+/// `karg` must be the host mapping of device memory, readable and writable for `n > 0` bytes.
+unsafe fn publish_device_kernarg(karg: *mut u8, n: usize, last: u8) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    std::arch::x86_64::_mm_sfence();
+    #[cfg(not(target_arch = "x86_64"))]
+    std::sync::atomic::fence(Ordering::SeqCst);
+    std::ptr::write_volatile(karg.add(n - 1), last);
+    #[cfg(target_arch = "x86_64")]
+    std::arch::x86_64::_mm_mfence();
+    #[cfg(not(target_arch = "x86_64"))]
+    std::sync::atomic::fence(Ordering::SeqCst);
+    std::ptr::read_volatile(karg.add(n - 1)) == last
+}
+
+/// Allocate the kernarg ring in `agent`'s VRAM with host access (large BAR) and prefault its CPU
+/// mapping every 64 KiB, as CLR does for its device kernarg pool (KFD/TTM map CPU PTEs lazily).
+/// `false` (nothing left allocated) when the pool or the BAR mapping refuses; the caller then uses
+/// the host kernarg pool.
+///
+/// # Safety
+/// `drv` must be a loaded driver and `vram_pool` a pool of `agent`.
+unsafe fn vram_kernarg_ring(
+    drv: &HsaDriver,
+    vram_pool: HsaMemoryPool,
+    agent: HsaAgent,
+    host_agent: HsaAgent,
+    bytes: usize,
+    out: &mut *mut c_void,
+) -> bool {
+    let mut ptr: *mut c_void = std::ptr::null_mut();
+    if (drv.hsa_amd_memory_pool_allocate)(vram_pool, bytes, 0, &mut ptr) != HSA_STATUS_SUCCESS {
+        tracing::warn!("kernarg ring: VRAM allocation refused, using the host kernarg pool");
+        return false;
+    }
+    let allow = [agent, host_agent];
+    let rc = (drv.hsa_amd_agents_allow_access)(2, allow.as_ptr(), std::ptr::null(), ptr);
+    if rc != HSA_STATUS_SUCCESS {
+        (drv.hsa_amd_memory_pool_free)(ptr);
+        tracing::warn!(
+            "kernarg ring: no host mapping of VRAM (small BAR), using the host kernarg pool"
+        );
+        return false;
+    }
+    const PREFAULT_SPAN: usize = 64 * 1024;
+    for offset in (0..bytes).step_by(PREFAULT_SPAN) {
+        std::ptr::write_volatile((ptr as *mut u8).add(offset), 0);
+    }
+    *out = ptr;
+    true
+}
 
 struct AgentAccum {
     get_info: unsafe extern "C" fn(HsaAgent, u32, *mut c_void) -> HsaStatus,
@@ -675,6 +856,8 @@ pub struct HsaBackend {
     /// without a second enumeration pass, and it is what maps a peer *ordinal*
     /// to the agent an SDMA copy must name.
     agents: Vec<HsaAgent>,
+    /// Owner of `fine_pool` and `kernarg_pool` (see [`host_agent_for`]); host-memory async
+    /// copies name it.
     cpu_agent: HsaAgent,
     vram_pool: HsaMemoryPool,
     fine_pool: HsaMemoryPool,
@@ -682,6 +865,9 @@ pub struct HsaBackend {
     queue: *mut HsaQueue,
     done_signal: HsaSignal,
     karg_ring: *mut u8,
+    /// `karg_ring` is VRAM mapped through the large BAR (`PLOW_AMD_KERNARG_VRAM`): every slot is
+    /// staged on the stack, copied through the BAR and made visible before its header is published.
+    karg_vram: bool,
     device_name: String,
     cu_count: u32,
     lds_bytes: u32,
@@ -867,6 +1053,19 @@ impl HsaBackend {
         }
         let agent = acc.gpus[device_ordinal as usize];
         let agents = acc.gpus.clone();
+        let nearest_cpu = {
+            let mut a = HsaAgent { handle: 0 };
+            let rc = unsafe {
+                (drv.hsa_agent_get_info)(
+                    agent,
+                    HSA_AMD_AGENT_INFO_NEAREST_CPU,
+                    &mut a as *mut HsaAgent as *mut c_void,
+                )
+            };
+            (rc == HSA_STATUS_SUCCESS && a.handle != 0).then_some(a)
+        };
+        let numa_local = crate::config::RuntimeConfig::get().amd_numa_host_pools();
+        let host_agent = host_agent_for(numa_local, cpu_agent, nearest_cpu);
 
         // Query device name.
         let mut name_buf = [0u8; 64];
@@ -935,16 +1134,16 @@ impl HsaBackend {
         // Find coarse-grained VRAM pool on this GPU.
         let vram_pool =
             Self::find_pool(&drv, agent, HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED)?;
-        // Find fine-grained system pool on CPU agent.
+        // Find fine-grained system pool on the host agent.
         let fine_pool = Self::find_pool(
             &drv,
-            cpu_agent,
+            host_agent,
             HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_FINE_GRAINED,
         )?;
-        // Find kernarg pool on CPU agent.
+        // Find kernarg pool on the host agent.
         let kernarg_pool = Self::find_pool(
             &drv,
-            cpu_agent,
+            host_agent,
             HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_KERNARG_INIT,
         )?;
 
@@ -976,11 +1175,28 @@ impl HsaBackend {
             return Err(hsa_fault(rc, "hsa_signal_create"));
         }
 
-        // Allocate kernarg ring.
+        // Allocate kernarg ring: this GPU's VRAM through the large BAR under
+        // PLOW_AMD_KERNARG_VRAM (CLR's device kernarg pool, `ManagedBuffer::Create`), else the host
+        // kernarg pool.
         let ring_bytes = QUEUE_SIZE as usize * KARG_SLOT;
         let mut karg_ring: *mut c_void = std::ptr::null_mut();
-        let rc = unsafe {
-            (drv.hsa_amd_memory_pool_allocate)(kernarg_pool, ring_bytes, 0, &mut karg_ring)
+        let karg_vram = crate::config::RuntimeConfig::get().amd_kernarg_vram()
+            && unsafe {
+                vram_kernarg_ring(
+                    &drv,
+                    vram_pool,
+                    agent,
+                    host_agent,
+                    ring_bytes,
+                    &mut karg_ring,
+                )
+            };
+        let rc = if karg_vram {
+            HSA_STATUS_SUCCESS
+        } else {
+            unsafe {
+                (drv.hsa_amd_memory_pool_allocate)(kernarg_pool, ring_bytes, 0, &mut karg_ring)
+            }
         };
         if rc != HSA_STATUS_SUCCESS {
             unsafe {
@@ -989,9 +1205,12 @@ impl HsaBackend {
             }
             return Err(hsa_fault(rc, "kernarg ring alloc"));
         }
-        // Allow GPU agent access to the kernarg ring.
-        let rc =
-            unsafe { (drv.hsa_amd_agents_allow_access)(1, &agent, std::ptr::null(), karg_ring) };
+        // Allow GPU agent access to the kernarg ring (the VRAM ring is mapped for it already).
+        let rc = if karg_vram {
+            HSA_STATUS_SUCCESS
+        } else {
+            unsafe { (drv.hsa_amd_agents_allow_access)(1, &agent, std::ptr::null(), karg_ring) }
+        };
         if rc != HSA_STATUS_SUCCESS {
             unsafe {
                 (drv.hsa_amd_memory_pool_free)(karg_ring);
@@ -1001,6 +1220,25 @@ impl HsaBackend {
             return Err(hsa_fault(rc, "kernarg allow_access"));
         }
 
+        let node = |a: HsaAgent| {
+            let mut n = u32::MAX;
+            unsafe {
+                (drv.hsa_agent_get_info)(a, HSA_AGENT_INFO_NODE, &mut n as *mut u32 as *mut c_void)
+            };
+            n
+        };
+        tracing::info!(
+            ordinal = device_ordinal,
+            numa_host_pools = numa_local,
+            kernarg_vram = karg_vram,
+            host_cpu_node = node(host_agent),
+            first_cpu_node = node(cpu_agent),
+            nearest_cpu_node = ?nearest_cpu.map(node),
+            kernarg_page_node = ?page_node(karg_ring),
+            aql_ring_page_node = ?page_node(unsafe { (*queue).base_address }),
+            signal_page_node = ?page_node(done_signal.handle as *const c_void),
+            "HSA host placement"
+        );
         let shared = Arc::new(SharedDriver { drv });
 
         // CDNA (gfx8xx, gfx9xx) is wave64; RDNA (gfx10xx, gfx11xx) is wave32.
@@ -1016,13 +1254,14 @@ impl HsaBackend {
             rocr_version,
             agent,
             agents,
-            cpu_agent,
+            cpu_agent: host_agent,
             vram_pool,
             fine_pool,
             kernarg_pool,
             queue,
             done_signal,
             karg_ring: karg_ring as *mut u8,
+            karg_vram,
             device_name,
             cu_count,
             lds_bytes,
@@ -2095,77 +2334,46 @@ impl HsaBackend {
         // guarantees the previous user of this slot has retired.
         let karg = unsafe { self.karg_ring.add(slot as usize * KARG_SLOT) };
 
-        // Copy explicit args.
-        if args_size > 0 && !args.is_null() {
-            // SAFETY: the caller's contract is that `args` points at
-            // `args_size` readable bytes; `kernarg_size <= KARG_SLOT` is checked
-            // in `resolve_kernel` and `args_size <= kernarg_size` at the top of
-            // this function — so both the copy and the zero-fill of the tail stay
-            // inside this slot and the fill length cannot underflow. The two
-            // ranges are disjoint (the fill starts at `args_size`), which is what
-            // `copy_nonoverlapping` requires.
-            unsafe {
-                std::ptr::copy_nonoverlapping(args as *const u8, karg, args_size);
-                std::ptr::write_bytes(
-                    karg.add(args_size),
-                    0,
-                    kernel.kernarg_size as usize - args_size,
+        // SAFETY: `karg` is this slot (`KARG_SLOT` bytes) and the stage is a `KARG_SLOT` stack
+        // buffer; `kernarg_size <= KARG_SLOT` and `args_size <= kernarg_size` are checked above.
+        unsafe {
+            if self.karg_vram {
+                let n = kernel.kernarg_size as usize;
+                let mut stage = [0u8; KARG_SLOT];
+                write_kernarg(
+                    stage.as_mut_ptr(),
+                    kernel.kernarg_size,
+                    args,
+                    args_size,
+                    [grid_x, grid_y, grid_z],
+                    [wg_x, wg_y, wg_z],
+                );
+                std::ptr::copy_nonoverlapping(stage.as_ptr(), karg, n);
+                if n > 0 && !publish_device_kernarg(karg, n, stage[n - 1]) {
+                    // A BAR write that did not land: copy once more, and poison the device rather
+                    // than publish a packet over a stale slot.
+                    std::ptr::copy_nonoverlapping(stage.as_ptr(), karg, n);
+                    if !publish_device_kernarg(karg, n, stage[n - 1]) {
+                        let info = DeviceErrorInfo {
+                            operation: "kernarg readback (PLOW_AMD_KERNARG_VRAM)".into(),
+                            code: -1,
+                            name: "KERNARG_READBACK_MISMATCH".into(),
+                            fatal: true,
+                        };
+                        self.mark_poisoned(&info);
+                        return Err(RuntimeError::DeviceFault { info });
+                    }
+                }
+            } else {
+                write_kernarg(
+                    karg,
+                    kernel.kernarg_size,
+                    args,
+                    args_size,
+                    [grid_x, grid_y, grid_z],
+                    [wg_x, wg_y, wg_z],
                 );
             }
-        } else {
-            // SAFETY: as above — `kernarg_size <= KARG_SLOT` bytes of this slot.
-            unsafe {
-                std::ptr::write_bytes(karg, 0, kernel.kernarg_size as usize);
-            }
-        }
-
-        // Fill COv5 implicit block (blockDim, gridDim, remainders).
-        let hoff = (args_size + 7) & !7;
-        if (kernel.kernarg_size as usize) > hoff {
-            // SAFETY: guarded by `kernarg_size > hoff` immediately above, so
-            // the COv5 implicit block starts inside the slot.
-            let hid = unsafe { karg.add(hoff) };
-            let avail = kernel.kernarg_size as usize - hoff;
-            let dims: u16 = if grid_z > 1 {
-                3
-            } else if grid_y > 1 {
-                2
-            } else {
-                1
-            };
-            // SAFETY (both macros): the `avail >= off + width` guard is the
-            // bounds check — a field is written only when the object's declared
-            // kernarg segment actually reaches it, which is why an object built
-            // without the implicit block is not corrupted here. `write_unaligned`
-            // because `hoff` is only 8-byte aligned and the u16 fields are not.
-            macro_rules! put32 {
-                ($off:expr, $val:expr) => {
-                    if avail >= $off + 4 {
-                        unsafe {
-                            std::ptr::write_unaligned(hid.add($off) as *mut u32, $val);
-                        }
-                    }
-                };
-            }
-            macro_rules! put16 {
-                ($off:expr, $val:expr) => {
-                    if avail >= $off + 2 {
-                        unsafe {
-                            std::ptr::write_unaligned(hid.add($off) as *mut u16, $val);
-                        }
-                    }
-                };
-            }
-            put32!(0, (grid_x as u32 + wg_x as u32 - 1) / wg_x as u32);
-            put32!(4, (grid_y as u32 + wg_y as u32 - 1) / wg_y as u32);
-            put32!(8, (grid_z as u32 + wg_z as u32 - 1) / wg_z as u32);
-            put16!(12, wg_x);
-            put16!(14, wg_y);
-            put16!(16, wg_z);
-            put16!(18, (grid_x as u16).wrapping_rem(wg_x));
-            put16!(20, (grid_y as u16).wrapping_rem(wg_y));
-            put16!(22, (grid_z as u16).wrapping_rem(wg_z));
-            put16!(64, dims);
         }
 
         // Write the AQL dispatch packet (everything except the header).
@@ -2673,6 +2881,25 @@ impl HsaBackend {
         self.synchronize()
     }
 
+    /// This agent's PCI address, `dddd:bb:dd.f` (`HSA_AMD_AGENT_INFO_DOMAIN` + `_BDFID`).
+    pub fn pci_bdf(&self) -> Option<String> {
+        let (mut bdf, mut domain) = (0u32, 0u32);
+        // SAFETY: both attributes are documented as uint32_t; the agent is live for `self`.
+        let ok = unsafe {
+            (self.shared.drv.hsa_agent_get_info)(self.agent, HSA_AMD_AGENT_INFO_BDFID, &mut bdf as *mut u32 as *mut c_void)
+                == HSA_STATUS_SUCCESS
+                && (self.shared.drv.hsa_agent_get_info)(self.agent, HSA_AMD_AGENT_INFO_DOMAIN, &mut domain as *mut u32 as *mut c_void)
+                    == HSA_STATUS_SUCCESS
+        };
+        ok.then(|| format!("{domain:04x}:{:02x}:{:02x}.{:x}", bdf >> 8, (bdf >> 3) & 0x1f, bdf & 0x7))
+    }
+
+    /// Dispatches published on this queue that have not completed: the counting signal
+    /// [`Self::synchronize`] waits on. A diagnostic read; it never waits.
+    pub fn in_flight(&self) -> i64 {
+        unsafe { (self.shared.drv.hsa_signal_load_scacquire)(self.done_signal) }
+    }
+
     /// Drain the queue (device-wide; there is one queue).
     pub fn synchronize(&self) -> Result<()> {
         // The AQL read index only says that the packet processor consumed the
@@ -2682,13 +2909,19 @@ impl HsaBackend {
         // counting signal before publication and the device decrements it on
         // completion, so zero is the exact queue-tail completion condition.
         self.guard()?;
+        static BLOCKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let state = if *BLOCKED.get_or_init(|| crate::config::RuntimeConfig::get().amd.hsa_drain_blocked) {
+            HSA_WAIT_STATE_BLOCKED
+        } else {
+            HSA_WAIT_STATE_ACTIVE
+        };
         unsafe {
             (self.shared.drv.hsa_signal_wait_scacquire)(
                 self.done_signal,
                 HSA_SIGNAL_CONDITION_LT,
                 1,
                 u64::MAX,
-                HSA_WAIT_STATE_ACTIVE,
+                state,
             );
         }
         self.guard()
@@ -2861,7 +3094,7 @@ impl HsaBackend {
             (self.shared.drv.hsa_signal_create)(live.len() as i64, 0, std::ptr::null(), &mut sig)
         };
         self.check(rc, "hsa_signal_create (dtod batch)")?;
-        for &&(dst, src, bytes) in &live {
+        for (issued, &&(dst, src, bytes)) in live.iter().enumerate() {
             let rc = unsafe {
                 (self.shared.drv.hsa_amd_memory_async_copy)(
                     dst as *mut c_void,
@@ -2878,6 +3111,8 @@ impl HsaBackend {
                 // Copies already issued still hold references to `sig`; wait them out before
                 // destroying it or the runtime writes into freed memory.
                 unsafe {
+                    // Rejected and unsubmitted copies will never decrement the signal.
+                    (self.shared.drv.hsa_signal_add_screlease)(sig, -((live.len() - issued) as i64));
                     (self.shared.drv.hsa_signal_wait_scacquire)(
                         sig,
                         HSA_SIGNAL_CONDITION_LT,
@@ -3152,8 +3387,7 @@ impl HsaBackend {
     /// never decrement, so the signal can no longer reach zero and a
     /// `wait(LT 1, u64::MAX)` would block the thread forever — a hang, not an
     /// error return. Subtracting the un-issued count restores the invariant the
-    /// wait depends on. (`memcpy_dtod_batch` above has this bug: it waits on a
-    /// signal that a mid-loop failure has left permanently short.)
+    /// wait depends on.
     pub fn memcpy_htod_pinned_batch(&self, pairs: &[(u64, &[u8])]) -> Result<()> {
         let live: Vec<&(u64, &[u8])> = pairs.iter().filter(|p| !p.1.is_empty()).collect();
         if live.is_empty() {
@@ -3369,6 +3603,33 @@ impl HsaBackend {
         )
     }
 
+    pub(crate) fn launch_3d(
+        &self,
+        f: HsaKernel,
+        grid: [u32; 3],
+        block: u16,
+        args: &[u8],
+    ) -> Result<()> {
+        let grid_x = grid[0].checked_mul(u32::from(block)).filter(|&n| n != 0);
+        if grid_x.is_none() || grid[1] == 0 || grid[2] == 0 || block > 1024 {
+            return Err(RuntimeError::Device(format!(
+                "invalid 3D launch: grid={grid:?}, block={block}"
+            )));
+        }
+        self.dispatch(
+            &f,
+            grid_x.unwrap(),
+            grid[1],
+            grid[2],
+            block,
+            1,
+            1,
+            0,
+            args.as_ptr().cast(),
+            args.len(),
+        )
+    }
+
     /// No-op with a range check. HSA carries `group_segment_size` in the
     /// dispatch packet, so there is no per-function opt-in to set; the check
     /// keeps an over-budget request from silently becoming a launch failure.
@@ -3573,6 +3834,10 @@ impl crate::memory::vmm::VmmOps for HsaBackend {
         self.memcpy_dtod(dst, src, bytes)
     }
 
+    fn copy_dtod_batch(&self, pairs: &[(u64, u64, u64)]) -> Result<()> {
+        self.memcpy_dtod_batch(pairs)
+    }
+
     fn pool_take(&self) -> Vec<(u64, u64)> {
         std::mem::take(&mut *self.slab_pool.lock())
     }
@@ -3633,6 +3898,62 @@ mod scrub_tests {
 
 #[cfg(test)]
 mod tests {
+    use super::{host_agent_for, page_node, publish_device_kernarg, write_kernarg, HsaAgent};
+
+    #[test]
+    fn kernarg_slot_holds_args_zero_tail_and_the_implicit_block() {
+        let args: [u8; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        let mut slot = [0xAAu8; 256];
+        // 12 explicit bytes, implicit block at the next 8-byte boundary (16), 256-byte segment.
+        unsafe {
+            write_kernarg(
+                slot.as_mut_ptr(),
+                256,
+                args.as_ptr().cast(),
+                12,
+                [1000, 1, 1],
+                [256, 1, 1],
+            );
+        }
+        assert_eq!(&slot[..12], &args);
+        assert_eq!(&slot[12..16], &[0; 4]);
+        let u32_at = |o: usize| u32::from_le_bytes(slot[o..o + 4].try_into().unwrap());
+        let u16_at = |o: usize| u16::from_le_bytes(slot[o..o + 2].try_into().unwrap());
+        assert_eq!(u32_at(16), 4, "block count x = ceil(1000 / 256)");
+        assert_eq!((u32_at(20), u32_at(24)), (1, 1));
+        assert_eq!((u16_at(28), u16_at(30), u16_at(32)), (256, 1, 1));
+        assert_eq!(u16_at(34), 1000 % 256, "remainder x");
+        assert_eq!(u16_at(16 + 64), 1, "grid dims");
+        // Bytes the implicit block does not name stay zeroed by the tail fill.
+        assert_eq!(slot[16 + 66..].iter().filter(|&&b| b != 0).count(), 0);
+    }
+
+    #[test]
+    fn device_kernarg_publish_rewrites_the_last_byte_it_reads_back() {
+        let mut slot = [7u8; 64];
+        assert!(unsafe { publish_device_kernarg(slot.as_mut_ptr(), 40, 9) });
+        assert_eq!(slot[39], 9);
+        assert!(slot[..39].iter().all(|&b| b == 7) && slot[40..].iter().all(|&b| b == 7));
+    }
+
+    #[test]
+    fn host_pools_follow_the_nearest_cpu_only_when_asked() {
+        let (first, near) = (HsaAgent { handle: 1 }, HsaAgent { handle: 2 });
+        assert_eq!(host_agent_for(true, first, Some(near)).handle, 2);
+        assert_eq!(host_agent_for(false, first, Some(near)).handle, 1);
+        assert_eq!(host_agent_for(true, first, None).handle, 1);
+    }
+
+    #[test]
+    fn page_node_reads_a_touched_page_and_refuses_an_unmapped_one() {
+        let page = vec![1u8; 8192];
+        // A kernel or container without NUMA support refuses every query; it must not report a node.
+        if let Some(n) = page_node(page.as_ptr().cast()) {
+            assert!(n >= 0);
+        }
+        assert_eq!(page_node(8 as *const std::ffi::c_void), None);
+    }
+
     use super::{hsa_status_name, is_hsa_fatal};
 
     #[test]

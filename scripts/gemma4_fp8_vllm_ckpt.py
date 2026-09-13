@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Assemble a vLLM-servable FP8 checkpoint from plow's `fp8/`-keyed PTPC export.
 
-The export holds only the 410 projection matrices, each keyed `fp8/<name>` with an
+The export holds only the projection matrices, each keyed `fp8/<name>` with an
 `fp8/<name>_scale` twin, because that is the contract plowc/plowrt read. vLLM needs
 the bare `<name>` / `<name>.weight_scale` spelling, plus every tensor the export does
 not carry (embeddings, norms, layer scalars, vision tower). Nothing is requantized
@@ -166,6 +166,8 @@ def main():
     ap.add_argument("--export", required=True, help="plow fp8 export directory")
     ap.add_argument("--source", required=True, help="original BF16 checkpoint directory")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--weight-only", action="store_true",
+                    help="keep BF16 activations (W8A16) instead of dynamic FP8 activations")
     ap.add_argument("--force", action="store_true")
     args = ap.parse_args()
 
@@ -180,8 +182,13 @@ def main():
         sys.exit("export is not marked complete")
     exported = set(quantization["sources"])
 
-    index = json.load(open(os.path.join(args.source, "model.safetensors.index.json")))
-    weight_map = index["weight_map"]
+    index_path = os.path.join(args.source, "model.safetensors.index.json")
+    if os.path.exists(index_path):
+        weight_map = json.load(open(index_path))["weight_map"]
+    else:
+        header, _ = read_header(os.path.join(args.source, "model.safetensors"))
+        weight_map = {name: "model.safetensors" for name in header
+                      if name != "__metadata__"}
     missing = exported - set(weight_map)
     if missing:
         sys.exit(f"export names absent from the source index: {sorted(missing)[:3]}")
@@ -207,7 +214,10 @@ def main():
         json.dump(new_index, f, indent=2)
 
     config = json.load(open(os.path.join(args.source, "config.json")))
-    config["quantization_config"] = QUANT_CONFIG
+    quant_config = json.loads(json.dumps(QUANT_CONFIG))
+    if args.weight_only:
+        quant_config["config_groups"]["group_0"]["input_activations"] = None
+    config["quantization_config"] = quant_config
     with open(os.path.join(args.out, "config.json"), "w") as f:
         json.dump(config, f, indent=2)
 
@@ -224,6 +234,7 @@ def main():
         "source": os.path.abspath(args.source),
         "scale_mode": quantization["scale_mode"],
         "weight_dtype": quantization["weight_dtype"],
+        "activation_scheme": "bf16" if args.weight_only else "dynamic-token-fp8",
         "renaming": "fp8/<name> -> <name>; fp8/<name>_scale -> <name>.weight_scale",
         "requantized": False,
         "note": "shard 1 data region is a byte-for-byte copy of the export; only the "

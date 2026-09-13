@@ -60,8 +60,14 @@ pub const MI300X: GpuSpec = GpuSpec {
         kind: MemKind::Hbm3,
         capacity: Bytes::gib(192),
         bandwidth: GBps(5325.0),
-        // Not measured on this part; a reported bound falls back to the datasheet peak.
-        bandwidth_measured: None,
+        // MEASURED on this part, 2026-09-08, `scripts/glm53_hbm_ceiling.py` on one
+        // leased MI300X (gfx942, ROCm 7.14 nix): read-only reduction 4266.0 GB/s over
+        // a 2 GiB buffer and 4091.9 GB/s over 8 GiB; read+write copy 3856.1 / 3744.3.
+        // The 8 GiB read figure is taken as the bound because it is the one that
+        // outlives cache residency. 4091.9 is 76.8% of the 5325 datasheet peak, and
+        // that gap is the whole point of the field: a roofline drawn against 5325
+        // understates every kernel on this part by ~30%.
+        bandwidth_measured: Some(GBps(4091.9)),
         bus_width_bits: 8192,
     },
     copy_engines: 4, // SDMA engines (approx.)

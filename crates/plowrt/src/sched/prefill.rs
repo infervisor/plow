@@ -8,7 +8,7 @@ pub enum SpanPolicy {
     /// fixes each request's next chunk before admission.
     Whole,
     /// Divide the row budget across the rotated candidates. Short requests
-    /// return unused rows to later candidates in the same launch.
+    /// return unused rows to other candidates in the same launch.
     FairSplit,
 }
 
@@ -142,6 +142,22 @@ pub fn admit(
         pack.spans[pack.len] = span;
         pack.len += 1;
     }
+    if policy == SpanPolicy::FairSplit && rows < bucket_rows {
+        // Preserve each initial share; reclaim unused rows in rotation order.
+        let mut spare = bucket_rows - rows;
+        let mut row0 = 0;
+        for span in &mut pack.spans[..pack.len] {
+            let offered = by_slot[span.slot as usize]
+                .expect("admitted candidate")
+                .n_rows;
+            let extra = spare.min(offered - span.n_rows);
+            spare -= extra;
+            span.n_rows += extra;
+            span.row0 = row0;
+            span.kv_len = span.kv_row0 + span.n_rows;
+            row0 += span.n_rows;
+        }
+    }
     pack
 }
 
@@ -208,6 +224,73 @@ mod tests {
         assert_eq!(pack.dense_rows(), 64);
         assert_eq!(pack.padding_rows(), 0);
         assert_eq!(pack.last_slot(), Some(0));
+    }
+
+    #[test]
+    fn fair_split_reclaims_rows_from_a_short_last_request() {
+        let pack = admit(
+            [span(0, 40, 100, 7), span(1, 8, 1, 7)],
+            64,
+            0,
+            2,
+            SpanPolicy::FairSplit,
+            |_| Some(64),
+        );
+        assert_eq!(
+            pack.spans()
+                .iter()
+                .map(|s| (s.slot, s.row0, s.n_rows, s.kv_row0, s.kv_len))
+                .collect::<Vec<_>>(),
+            [(0, 0, 63, 40, 103), (1, 63, 1, 8, 9)]
+        );
+        assert_eq!(pack.padding_rows(), 0);
+        assert_eq!(pack.last_slot(), Some(1));
+    }
+
+    #[test]
+    fn fair_split_uses_available_rows_without_exceeding_request_caps() {
+        for shape in 0..625u32 {
+            let mut encoded = shape;
+            let demands: [u32; 4] = std::array::from_fn(|_| {
+                let rows = encoded % 5;
+                encoded /= 5;
+                rows
+            });
+            for start in 0..4 {
+                for budget in 1..=16 {
+                    let pack = admit(
+                        demands
+                            .iter()
+                            .enumerate()
+                            .map(|(slot, &rows)| span(slot as u32, 10 + slot as u32, rows, 7)),
+                        budget,
+                        start,
+                        4,
+                        SpanPolicy::FairSplit,
+                        |_| Some(16),
+                    );
+                    assert_eq!(pack.dense_rows(), budget.min(demands.iter().sum()));
+                    let mut row = 0;
+                    let mut seen = 0u8;
+                    let mut previous = None;
+                    for s in pack.spans() {
+                        let slot = s.slot as usize;
+                        let order = (slot + 4 - start) % 4;
+                        assert!(previous.is_none_or(|p| p < order));
+                        previous = Some(order);
+                        assert_eq!(seen & (1 << slot), 0);
+                        seen |= 1 << slot;
+                        assert!(s.n_rows > 0 && s.n_rows <= demands[slot]);
+                        assert_eq!(s.row0, row);
+                        assert_eq!(s.kv_row0, 10 + s.slot);
+                        assert_eq!(s.kv_len, s.kv_row0 + s.n_rows);
+                        assert_eq!(s.state_slot, s.slot);
+                        assert_eq!(s.program, 7);
+                        row += s.n_rows;
+                    }
+                }
+            }
+        }
     }
 
     #[test]

@@ -82,6 +82,12 @@ impl TuneStore {
         self.root.join(hardware).join("attention_measurement.jsonl")
     }
 
+    fn attention_role_path(&self, hardware: &str) -> PathBuf {
+        self.root
+            .join(hardware)
+            .join("attention_role_measurement.jsonl")
+    }
+
     fn projection_path(&self, hardware: &str) -> PathBuf {
         self.root
             .join(hardware)
@@ -219,6 +225,48 @@ impl TuneStore {
             r.state = RecordState::Qualified;
         }
         self.append_jsonl(&self.attention_path(hardware), &records)?;
+        Ok(records.len())
+    }
+
+    pub fn load_attention_roles(
+        &self,
+        hardware: &str,
+    ) -> Result<Vec<crate::AttentionRoleMeasurement>, StoreError> {
+        let path = self.attention_role_path(hardware);
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let mut records = Vec::new();
+        for line in BufReader::new(File::open(path)?).lines() {
+            let line = line?;
+            if !line.trim().is_empty() {
+                records.push(serde_json::from_str(&line)?);
+            }
+        }
+        Ok(records)
+    }
+
+    pub fn publish_attention_roles(
+        &self,
+        hardware: &str,
+        mut records: Vec<crate::AttentionRoleMeasurement>,
+    ) -> Result<usize, StoreError> {
+        for record in &records {
+            let mut blockers = record.qualification_blockers();
+            if record.cell.hardware != hardware {
+                blockers.push("hardware directory differs from record".into());
+            }
+            if !blockers.is_empty() {
+                return Err(StoreError::NotQualifiable {
+                    kernel: record.cell.key(),
+                    blockers,
+                });
+            }
+        }
+        for record in &mut records {
+            record.state = RecordState::Qualified;
+        }
+        self.append_jsonl(&self.attention_role_path(hardware), &records)?;
         Ok(records.len())
     }
 

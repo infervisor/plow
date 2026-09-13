@@ -34,6 +34,7 @@ fn kimi_ref_cfg() -> GlmCfg {
         route_scale: 2.5,
         attn_scale: (48f32).powf(-0.5), // 1/sqrt(qk_nope+qk_rope = 48)
         rope_theta: Some(50_000.0),
+        rope_scale: packet::rope::RopeScale::None,
         prefix: "model.".into(),
         tp: 1,
         ep: false,

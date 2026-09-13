@@ -33,6 +33,8 @@ duplicate them and is now an index only.
 | [12](12-using-the-tuner.md) | **Using the Tuner** | `plowc tune`, reading the output, taking a measurement |
 | [13](13-prefill-chunking.md) | **Prefill Chunking** | Bucket ladder, the ragged tail, ragged-M |
 | [14](14-amd-arch-divergence.md) | **AMD Arch Divergence** | gfx942 vs gfx950: one source tree, what forks, the tripwire |
+| [18](18-serving-metrics.md) | **Serving Metrics** | Model-scoped Prometheus metrics, vLLM compatibility, request/tick accounting and lifecycle |
+| [19](19-packet-extensions.md) | **Packet Extensions** | Adding prefill buckets, decode rungs, packed siblings and token-batch bodies to a packet that is already compiled, without re-emitting it |
 
 ---
 
@@ -44,11 +46,23 @@ Cargo workspace, 13 member crates (Rust) plus a C/CUDA/HIP device runtime under
 - **Frontend / IR:** `nn-graph` (symbolic operator graph IR, model hub; folds the
   former `frontend`)
 - **Compiler core:** `rewrite`, `costmodel`, `schedule`, `packet`, `plowc`
+- **Device-blob emitter:** `devgen` — a **non-optional** dependency of `plowc`, and the
+  path every shipping GPU asset is emitted through (`plowc --emit devblob`)
 - **Hardware / kernel / tuning registries:** `hwspec`, `kernelcaps`, `tunedb`
 - **Verification:** `lean_verify`
 - **Shared schema:** `plow-asset` (compiler↔runtime boundary types)
 - **Runtime host:** `plowrt` (serve, simulate, mux, executor pool)
-- **Legacy:** `devgen` (deprecated device-blob emitter, feature-gated)
+
+> [!IMPORTANT]
+> **`devgen`, not `rewrite` + `schedule`, is what emits a shipping packet.** The two
+> halves described in chapters 01–03 are a working library that the devblob path does
+> not call: `crates/devgen/Cargo.toml` depends on neither, so no fused term and no
+> scheduled placement can reach the emitter even in principle. Every fusion in a shipped
+> packet is hand-written in `devgen`. See
+> [01 — Compiler Pipeline](01-compiler-pipeline.md)'s opening warning for the measured
+> coverage (0 of 1156 ops on Gemma-4-12B) and the A/B showing that wiring the rewriting
+> half up is not a perf lever. Read chapters 01–03 as the designed pipeline; read
+> `devgen` for what a `.pkt` on disk actually went through.
 
 See [10 — Implementation Status](10-implementation-status.md) for the full
 crate-by-crate breakdown, the build profile, and the device-ISA reconciliation.

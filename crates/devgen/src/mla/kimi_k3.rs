@@ -1711,6 +1711,7 @@ mod kimi_k3_tests {
 
     #[test]
     fn decode_batch_above_sixteen_requires_walk_and_caps_at_xargmax_limit() {
+        let _guard = crate::test_env::env_guard();
         assert_eq!(checked_k3_decode_batch(0, false), 1);
         assert_eq!(checked_k3_decode_batch(16, false), 16);
         assert_eq!(checked_k3_decode_batch(32, true), 32);
@@ -1776,6 +1777,7 @@ mod kimi_k3_tests {
     /// `q_a_proj` to a layer that ships `q_proj` — or, worse, does not fail and mixes the two.
     #[test]
     fn layer_lists_are_one_based_and_partition_the_tower() {
+        let _guard = crate::test_env::env_guard();
         let c = k3_cfg_from(&k3_json(&[]));
         assert_eq!(
             c.attn,
@@ -2223,6 +2225,7 @@ mod kimi_k3_tests {
     /// 4k-context deployment for an 8192-row program it cannot run.
     #[test]
     fn the_prefill_ladder_is_capped_at_the_context() {
+        let _guard = crate::test_env::env_guard();
         assert_eq!(
             k3_prefill_buckets(131072),
             vec![128, 512, 1024, 2048, 4096, 8192]
@@ -2243,6 +2246,7 @@ mod kimi_k3_tests {
     /// scope here, and this is what says so.
     #[test]
     fn every_prefill_bucket_is_a_whole_model() {
+        let _guard = crate::test_env::env_guard();
         let d = k3_dir("whole");
         let m = k3_build_model(&d, 4096, 256, 1, &[128, 512], None);
         let c = cfg_kimi_k3(&d);
@@ -2278,6 +2282,7 @@ mod kimi_k3_tests {
     /// indices must produce a different map even though the counts are identical.
     #[test]
     fn attn_map_is_not_a_count() {
+        let _guard = crate::test_env::env_guard();
         let a = k3_cfg_from(&k3_json(&[]));
         let b = k3_cfg_from(&k3_json(&[
             ("text_config/linear_attn_config/full_attn_layers", "[1, 4]"),
@@ -2290,6 +2295,7 @@ mod kimi_k3_tests {
     #[test]
     #[should_panic(expected = "appears in BOTH")]
     fn overlapping_layer_lists_are_rejected() {
+        let _guard = crate::test_env::env_guard();
         k3_cfg_from(&k3_json(&[(
             "text_config/linear_attn_config/kda_layers",
             "[1, 2, 3, 4, 5]",
@@ -2299,6 +2305,7 @@ mod kimi_k3_tests {
     #[test]
     #[should_panic(expected = "are in neither list")]
     fn incomplete_layer_lists_are_rejected() {
+        let _guard = crate::test_env::env_guard();
         // Dropping 1-based layer 5 leaves 0-based layer 4 unclassified. Deriving KDA as the
         // complement of full_attn_layers would hide this; the partition check is the point.
         k3_cfg_from(&k3_json(&[(
@@ -2310,6 +2317,7 @@ mod kimi_k3_tests {
     #[test]
     #[should_panic(expected = "num_hidden_layers is 6")]
     fn out_of_range_layer_index_is_rejected() {
+        let _guard = crate::test_env::env_guard();
         k3_cfg_from(&k3_json(&[(
             "text_config/linear_attn_config/full_attn_layers",
             "[3, 7]",
@@ -2321,6 +2329,7 @@ mod kimi_k3_tests {
     /// [moe_inter, routed_expert_hidden_size/2].
     #[test]
     fn routed_experts_run_at_the_latent_width() {
+        let _guard = crate::test_env::env_guard();
         let c = k3_cfg_from(&k3_json(&[]));
         assert_eq!(c.moe_latent, 128);
         assert_eq!(c.moe_inter, 96);
@@ -2341,6 +2350,7 @@ mod kimi_k3_tests {
     #[test]
     #[should_panic(expected = "missing required field \"num_experts\"")]
     fn deepseek_moe_spellings_are_not_accepted() {
+        let _guard = crate::test_env::env_guard();
         k3_cfg_from(&k3_json(&[("text_config/num_experts", "<remove>")]));
     }
 
@@ -2349,6 +2359,7 @@ mod kimi_k3_tests {
     /// half is `require_mla_rope` (see `mla_rope_tests` in lib.rs).
     #[test]
     fn absent_rope_theta_is_none_not_a_default() {
+        let _guard = crate::test_env::env_guard();
         let c = k3_cfg_from(&k3_json(&[]));
         assert_eq!(c.rope_theta, None);
         assert!(c.mla_nope);
@@ -2361,6 +2372,7 @@ mod kimi_k3_tests {
     /// Vision is recorded and REFUSED by name — never silently dropped.
     #[test]
     fn vision_is_recorded_for_explicit_refusal() {
+        let _guard = crate::test_env::env_guard();
         let c = k3_cfg_from(&k3_json(&[]));
         let v = c
             .vision
@@ -2380,6 +2392,7 @@ mod kimi_k3_tests {
     /// the failure mode this whole path exists to replace.
     #[test]
     fn every_gap_names_a_fix_site() {
+        let _guard = crate::test_env::env_guard();
         let gaps = k3_gaps(&k3_cfg_from(&k3_json(&[])));
         assert!(
             gaps.len() >= 8,
@@ -2404,6 +2417,7 @@ mod kimi_k3_tests {
     /// makes the claim unfalsifiable.
     #[test]
     fn closed_gaps_carry_evidence_and_open_gaps_do_not_claim_any() {
+        let _guard = crate::test_env::env_guard();
         let gaps = k3_gaps(&k3_cfg_from(&k3_json(&[])));
         let closed: Vec<_> = gaps.iter().filter(|g| g.done.is_some()).collect();
         let open: Vec<_> = gaps.iter().filter(|g| g.done.is_none()).collect();
@@ -2443,6 +2457,7 @@ mod kimi_k3_tests {
     /// is the absent model-level emitter.
     #[test]
     fn k3_is_refused_by_the_gap_report_not_by_require_mla_rope() {
+        let _guard = crate::test_env::env_guard();
         // A NoPE K3 config parses CLEANLY here. If `require_mla_rope` were on this path, this
         // call would panic instead of returning.
         let c = k3_cfg_from(&k3_json(&[]));
@@ -2468,6 +2483,7 @@ mod kimi_k3_tests {
     /// indistinguishable from correctness at runtime.
     #[test]
     fn topk_gap_is_conditional_on_the_kernel_bound() {
+        let _guard = crate::test_env::env_guard();
         let has = |c: &K3Cfg| k3_gaps(c).iter().any(|g| g.what.contains("top-k beyond"));
         // Against the constant, never a literal — the bound moved 8 -> 16 for this very model,
         // and a hardcoded test would then have asserted the opposite of what it means.
@@ -2487,6 +2503,7 @@ mod kimi_k3_tests {
     /// This is the assertion that the raise actually removed a blocker rather than renaming one.
     #[test]
     fn kimi_k3_real_topk_is_within_the_raised_bound() {
+        let _guard = crate::test_env::env_guard();
         assert!(16 <= crate::MOE_MAX_TOPK, "K3 routes top-16");
         let c = k3_cfg_from(&k3_json(&[("text_config/num_experts_per_token", "16")]));
         assert!(!k3_gaps(&c).iter().any(|g| g.what.contains("top-k beyond")));
@@ -2496,6 +2513,7 @@ mod kimi_k3_tests {
     /// width; a hidden-width MoE (DeepSeek/GLM shape) is already covered by the existing emit.
     #[test]
     fn latent_moe_gap_is_conditional_on_the_width() {
+        let _guard = crate::test_env::env_guard();
         let has = |c: &K3Cfg| k3_gaps(c).iter().any(|g| g.what.contains("LATENT MoE"));
         assert!(has(&k3_cfg_from(&k3_json(&[]))));
         assert!(!has(&k3_cfg_from(&k3_json(&[(

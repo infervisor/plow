@@ -58,6 +58,8 @@
 #include <cstdint>
 #include <vector>
 #include <algorithm>
+#include <chrono>
+#include <thread>
 
 #define PLOW_NV_KVBOUNDS 0
 #include "../op_attention.cuh" /* d_flash_decode<D,GF>, d_flash_merge<D>, FA_DEC_SMEM_FLOATS */
@@ -86,8 +88,21 @@ static const int KVH = PLOW_FA_BENCH_KVH;
 #ifndef PLOW_FA_BENCH_SCALE
 #define PLOW_FA_BENCH_SCALE (1.0f / sqrtf((float)D))
 #endif
+#ifndef PLOW_FA_BENCH_WINDOW
+#define PLOW_FA_BENCH_WINDOW 0
+#endif
+#ifndef PLOW_FA_BENCH_RING
+#define PLOW_FA_BENCH_RING 0
+#endif
+#ifndef PLOW_FA_BENCH_SHORT_BURST
+#define PLOW_FA_BENCH_SHORT_BURST 0
+#endif
 static const float SCALE = PLOW_FA_BENCH_SCALE;
+static const int WINDOW = PLOW_FA_BENCH_WINDOW;
+static const int RING = PLOW_FA_BENCH_RING;
 static const double REL_GATE = 3e-3;
+static_assert((RING == 0 && WINDOW == 0) ||
+              (RING >= WINDOW && (RING & (RING - 1)) == 0));
 
 /* ---- launch wrappers: production-faithful persistent grid ------------------------------------
  * The megakernel runs a cooperative grid of n_cu blocks; every op body walks its work items with
@@ -140,6 +155,8 @@ static __nv_bfloat16 rbf() { return __float2bfloat16((float)rand() / RAND_MAX * 
 /* ---- per-context device state + f32 CPU oracle ----------------------------------------------- */
 struct CtxBuf {
     int ctx = 0, nrep = 1;
+    int stride = 0;
+    unsigned mask = 0xffffffffu;
     size_t kvelem = 0, kvbytes = 0, wset = 0;
     __nv_bfloat16 *dQ = nullptr, *dK = nullptr, *dV = nullptr, *dO = nullptr;
     int* dLen = nullptr;
@@ -147,11 +164,20 @@ struct CtxBuf {
 
     void init(int c) {
         ctx = c;
-        kvelem = (size_t)KVH * ctx * D;
+        stride = RING ? RING : ctx;
+        mask = RING ? unsigned(RING - 1) : 0xffffffffu;
+        kvelem = (size_t)KVH * stride * D;
         kvbytes = kvelem * 2;
         wset = 2 * kvbytes;
-        nrep = (int)((2ull << 30) / kvbytes);
-        nrep = std::max(1, std::min(16, nrep));
+        if constexpr (PLOW_FA_BENCH_SHORT_BURST) {
+            // Cycle at least 512 MiB per operand so every cell exceeds H100's
+            // 60 MiB L2 without making one timing burst long enough to throttle.
+            nrep = int(((512ull << 20) + kvbytes - 1) / kvbytes);
+            nrep = std::max(2, std::min(128, nrep));
+        } else {
+            nrep = (int)((2ull << 30) / kvbytes);
+            nrep = std::max(1, std::min(16, nrep));
+        }
 
         std::vector<__nv_bfloat16> hQ((size_t)NH * D), hK(kvelem), hV(kvelem);
         for (auto& x : hQ) x = rbf();
@@ -175,24 +201,28 @@ struct CtxBuf {
 
         ref.assign((size_t)NH * D, 0.f);
         const int qpos = ctx - 1;
-        std::vector<float> sc(ctx);
+        const int first = WINDOW && ctx > WINDOW ? ctx - WINDOW : 0;
+        std::vector<float> sc(ctx - first);
         for (int h = 0; h < NH; h++) {
             const int hkv = h / (NH / KVH);
             float m = -1e30f;
-            for (int r = 0; r <= qpos; r++) {
+            for (int r = first; r <= qpos; r++) {
                 float d = 0;
                 const __nv_bfloat16* q = &hQ[(size_t)h * D];
-                const __nv_bfloat16* k = &hK[((size_t)hkv * ctx + r) * D];
+                const __nv_bfloat16* k = &hK[((size_t)hkv * stride + (r & mask)) * D];
                 for (int i = 0; i < D; i++) d += __bfloat162float(q[i]) * __bfloat162float(k[i]);
-                sc[r] = d * SCALE;
-                if (sc[r] > m) m = sc[r];
+                sc[r - first] = d * SCALE;
+                if (sc[r - first] > m) m = sc[r - first];
             }
             float l = 0;
-            for (int r = 0; r <= qpos; r++) { sc[r] = expf(sc[r] - m); l += sc[r]; }
+            for (int r = first; r <= qpos; r++) {
+                sc[r - first] = expf(sc[r - first] - m);
+                l += sc[r - first];
+            }
             float* out = &ref[(size_t)h * D];
-            for (int r = 0; r <= qpos; r++) {
-                const __nv_bfloat16* v = &hV[((size_t)hkv * ctx + r) * D];
-                const float w = sc[r];
+            for (int r = first; r <= qpos; r++) {
+                const __nv_bfloat16* v = &hV[((size_t)hkv * stride + (r & mask)) * D];
+                const float w = sc[r - first];
                 for (int i = 0; i < D; i++) out[i] += w * __bfloat162float(v[i]);
             }
             const float inv = 1.f / l;
@@ -221,8 +251,8 @@ static Cell bench(CtxBuf& c, int GF, int nsplit, int NCU, const char* dump = nul
     auto run = [&](int rep) {
         kern<<<NCU, 256, smem>>>(dOp, dMl, c.dQ, c.dK + (size_t)rep * c.kvelem,
                                  c.dV + (size_t)rep * c.kvelem, c.dLen, NH, KVH,
-                                 (unsigned)c.ctx, /*window*/ 0u, SCALE, (unsigned)nsplit,
-                                 0xFFFFFFFFu);
+                                 (unsigned)c.stride, (unsigned)WINDOW, SCALE,
+                                 (unsigned)nsplit, c.mask);
         merge_launch<<<NCU, 256>>>(c.dO, dOp, dMl, NH, (unsigned)nsplit);
     };
 
@@ -253,29 +283,60 @@ static Cell bench(CtxBuf& c, int GF, int nsplit, int NCU, const char* dump = nul
     out.rel = sqrt(num / (den + 1e-30));
     out.ok = out.rel <= REL_GATE;
 
-    const int iters = std::max(30, 3 * c.nrep);
     cudaEvent_t a, b;
     CK(cudaEventCreate(&a));
     CK(cudaEventCreate(&b));
 
-    for (int w = 0; w < 5; w++) run(w % c.nrep);
-    CK(cudaDeviceSynchronize());
-    CK(cudaEventRecord(a));
-    for (int it = 0; it < iters; it++) run(it % c.nrep);
-    CK(cudaEventRecord(b));
-    CK(cudaEventSynchronize(b));
-    float ms;
-    CK(cudaEventElapsedTime(&ms, a, b));
-    out.cold = ms / iters;
+    if constexpr (PLOW_FA_BENCH_SHORT_BURST) {
+        auto short_burst = [&](bool hot) {
+            for (int warm = 0; warm < 3; ++warm) run(hot ? 0 : warm % c.nrep);
+            CK(cudaDeviceSynchronize());
+            CK(cudaEventRecord(a));
+            run(0);
+            CK(cudaEventRecord(b));
+            CK(cudaEventSynchronize(b));
+            float probe = 0.0f;
+            CK(cudaEventElapsedTime(&probe, a, b));
+            const int repeats = std::max(1, std::min(c.nrep,
+                int(std::floor(2.0 / std::max(double(probe), 0.001)))));
+            std::vector<double> samples;
+            for (int sample = 0; sample < 15; ++sample) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(25));
+                CK(cudaEventRecord(a));
+                for (int repeat = 0; repeat < repeats; ++repeat)
+                    run(hot ? 0 : (sample * repeats + repeat) % c.nrep);
+                CK(cudaEventRecord(b));
+                CK(cudaEventSynchronize(b));
+                float elapsed = 0.0f;
+                CK(cudaEventElapsedTime(&elapsed, a, b));
+                samples.push_back(elapsed / repeats);
+            }
+            std::sort(samples.begin(), samples.end());
+            return samples.front();
+        };
+        out.cold = short_burst(false);
+        out.hot = short_burst(true);
+    } else {
+        const int iters = std::max(30, 3 * c.nrep);
+        for (int w = 0; w < 5; w++) run(w % c.nrep);
+        CK(cudaDeviceSynchronize());
+        CK(cudaEventRecord(a));
+        for (int it = 0; it < iters; it++) run(it % c.nrep);
+        CK(cudaEventRecord(b));
+        CK(cudaEventSynchronize(b));
+        float ms;
+        CK(cudaEventElapsedTime(&ms, a, b));
+        out.cold = ms / iters;
 
-    for (int w = 0; w < 5; w++) run(0);
-    CK(cudaDeviceSynchronize());
-    CK(cudaEventRecord(a));
-    for (int it = 0; it < iters; it++) run(0);
-    CK(cudaEventRecord(b));
-    CK(cudaEventSynchronize(b));
-    CK(cudaEventElapsedTime(&ms, a, b));
-    out.hot = ms / iters;
+        for (int w = 0; w < 5; w++) run(0);
+        CK(cudaDeviceSynchronize());
+        CK(cudaEventRecord(a));
+        for (int it = 0; it < iters; it++) run(0);
+        CK(cudaEventRecord(b));
+        CK(cudaEventSynchronize(b));
+        CK(cudaEventElapsedTime(&ms, a, b));
+        out.hot = ms / iters;
+    }
 
     CK(cudaEventDestroy(a));
     CK(cudaEventDestroy(b));
@@ -285,7 +346,9 @@ static Cell bench(CtxBuf& c, int GF, int nsplit, int NCU, const char* dump = nul
 }
 
 int main(int argc, char** argv) {
-    srand(1234);
+    unsigned seed = 1234;
+    if (argc == 7) seed = (unsigned)strtoul(argv[6], nullptr, 10);
+    srand(seed);
 
     cudaDeviceProp prop;
     CK(cudaGetDeviceProperties(&prop, 0));
@@ -294,12 +357,12 @@ int main(int argc, char** argv) {
     printf("device: %s  SM=%d  L2=%.1f MB  smem/SM=%zu KiB  cc=%d.%d\n", prop.name, NCU,
            L2 / 1048576.0, (size_t)prop.sharedMemPerMultiprocessor / 1024, prop.major, prop.minor);
 
-    printf("attention: D=%d NH=%d KVH=%d scale=%.9g QREG=%d seed=1234\n",
-           D, NH, KVH, SCALE, PLOW_NV_FA_QREG);
+    printf("attention: D=%d NH=%d KVH=%d scale=%.9g QREG=%d seed=%u\n",
+           D, NH, KVH, SCALE, PLOW_NV_FA_QREG, seed);
 
     if (argc != 1) {
-        if (argc != 6) {
-            fprintf(stderr, "usage: %s [context gf nsplit trials dump]\n", argv[0]);
+        if (argc != 6 && argc != 7) {
+            fprintf(stderr, "usage: %s [context gf nsplit trials dump [seed]]\n", argv[0]);
             return 2;
         }
         const int ctx = atoi(argv[1]), gf = atoi(argv[2]);
@@ -314,9 +377,10 @@ int main(int argc, char** argv) {
         int fails = 0;
         for (int trial = 0; trial < trials; trial++) {
             Cell r = bench(c, gf, ns, NCU, trial == 0 ? argv[5] : nullptr);
-            printf("D=%d NH=%d KVH=%d ctx=%d gf=%d ns=%d trial=%d cold_ms=%.6f "
-                   "hot_ms=%.6f relL2=%.9g %s\n", D, NH, KVH, ctx, gf, ns, trial,
-                   r.cold, r.hot, r.rel, r.ok ? "PASS" : "FAIL");
+            printf("D=%d NH=%d KVH=%d window=%d ring=%d seed=%u ctx=%d gf=%d ns=%d trial=%d "
+                   "cold_ms=%.6f hot_ms=%.6f relL2=%.9g %s\n", D, NH, KVH,
+                   WINDOW, RING, seed, ctx, gf, ns, trial, r.cold, r.hot, r.rel,
+                   r.ok ? "PASS" : "FAIL");
             fails += !r.ok;
         }
         c.free_all();
@@ -402,10 +466,11 @@ int main(int argc, char** argv) {
                 Cell r = bench(c, GF, ns, NCU);
                 if (r.rel > worst_rel[gi]) worst_rel[gi] = r.rel;
                 if (!r.ok) fails++;
-                const double logical = (double)n_grp * c.ctx * D * 2.0 * 2.0; /* K+V per group */
+                const int effective = WINDOW ? std::min(c.ctx, WINDOW) : c.ctx;
+                const double logical = (double)n_grp * effective * D * 2.0 * 2.0; /* K+V per group */
                 printf("  %-3d %-4d %-7d %-9.2f | %9.4f %10.0f | %9.4f | %8d %6.0fx | %.2e%s\n",
                        GF, ns, n_work, (double)n_work / NCU, r.cold,
-                       logical / 1e9 / (r.cold / 1e3), r.hot, (c.ctx + ns - 1) / ns,
+                       logical / 1e9 / (r.cold / 1e3), r.hot, (effective + ns - 1) / ns,
                        logical / (double)c.wset, r.rel, r.ok ? "" : "  <<< FAIL");
                 if (r.ok && r.cold < best_ms[ci]) {
                     best_ms[ci] = r.cold; best_gf[ci] = GF; best_ns[ci] = ns;

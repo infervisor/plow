@@ -173,6 +173,24 @@ if(PLOW_CUDA)
     # PRIVATE: the core is absorbed, not re-exported to whoever dlopens us.
     target_link_libraries(plow_runtime_cuda PRIVATE plow_runtime)
 
+    # Standalone Hopper correctness harnesses. They are build targets rather
+    # than CTest entries because a PLOW_CUDA build may run on a non-Hopper GPU.
+    foreach(target gemma3_norm_sm90 packed_flash_fp8_sm90_correct packed_kv_padding_sm90)
+        add_executable(${target} tests/${target}.cu)
+        target_include_directories(${target} PRIVATE nvidia common ${PLOW_INCLUDE})
+        set_target_properties(${target} PROPERTIES CUDA_ARCHITECTURES "90a" CUDA_STANDARD 17)
+    endforeach()
+    target_link_libraries(packed_flash_fp8_sm90_correct PRIVATE cuda)
+    target_link_libraries(packed_kv_padding_sm90 PRIVATE cuda)
+
+    add_executable(packed_flash_sm90_correct tests/packed_flash_sm90_correct.cu)
+    target_include_directories(packed_flash_sm90_correct PRIVATE nvidia common ${PLOW_INCLUDE})
+    target_compile_definitions(packed_flash_sm90_correct PRIVATE
+        PLOW_NV_FA_WGITEM=1 PLOW_NV_FA_GQA2_PAIR=1 PLOW_TEST_FA_HD256_ONLY=1)
+    target_link_libraries(packed_flash_sm90_correct PRIVATE cuda)
+    set_target_properties(packed_flash_sm90_correct PROPERTIES
+        CUDA_ARCHITECTURES "90a" CUDA_STANDARD 17)
+
     # Numeric validation of the sm_120 kernels against the CPU f32 golden oracle.
     # GUARDED: tests/sm120_numeric_test.cu is authored on a concurrent branch (the
     # gemma_sm120.cu B-tile fix). Configuring without it is a hard CMake error, which
@@ -650,6 +668,11 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN)
             list(APPEND _cubin_rows
                 "${_vstem}_pfpackedseg|${_ksym_pfpackedseg}|_ax_packed_seg_fat|"
                 "${_vstem}_pfpackedgemm|${_ksym_pfpackedgemm}|_ax_packed_seg_gemm|")
+            if(PLOW_SM120_CUBIN_FP8KV)
+                list(APPEND _cubin_rows
+                    "${_vstem}_pfpackedseg_fp8kv|${_ksym_pfpackedseg}|_ax_packed_seg_fat|_ax_fp8kv_pf"
+                    "${_vstem}_pfpackedgemm_fp8kv|${_ksym_pfpackedgemm}|_ax_packed_seg_gemm|_ax_fp8kv_pf")
+            endif()
         endif()
 
         foreach(_row ${_cubin_rows})
@@ -659,6 +682,13 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN)
             list(GET _f 2 _a1)
             list(GET _f 3 _a2)
             set(_defs ${_cubin_base} ${${_vdefs_var}} ${${_a1}})
+            if(_varch STREQUAL "sm_90a" AND PLOW_CUBIN_GEMMA AND
+               ((PLOW_NV_W8A8 AND _a1 STREQUAL "_ax_seg_gemm") OR
+                (NOT PLOW_NV_W8A8 AND NOT PLOW_FP8_KV AND
+                 _a1 STREQUAL "_ax_packed_seg_gemm")))
+                # The 128-register cap spills Hopper GEMM accumulators.
+                list(APPEND _defs -DPLOW_NV_SEG_OCC1=1)
+            endif()
             if(_a2)
                 list(APPEND _defs ${${_a2}})
             endif()
@@ -673,6 +703,20 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN)
             list(APPEND _cubin_outs "${_out}")
         endforeach()
     endforeach()
+
+    if(PLOW_SM90A_CUBIN)
+        set(_w8a16_m1_src "${CMAKE_CURRENT_SOURCE_DIR}/nvidia/interp_sm90a_pfgemm_w8a16_m1.cu")
+        set(_w8a16_m1_out "${PLOW_CUBIN_DIR}/interp_sm90a_pfgemm_w8a16_m1.cubin")
+        add_custom_command(OUTPUT "${_w8a16_m1_out}"
+            COMMAND bash "${_cubin_run}" "${PLOW_CUBIN_NVCC}" "${_w8a16_m1_out}"
+                    plow_sm90a_pfgemm_w8a16_m1 required
+                    -arch=sm_90a -O3 -std=c++17 -cubin ${_cubin_inc}
+                    "${_w8a16_m1_src}"
+            DEPENDS "${_w8a16_m1_src}" "${_cubin_run}" ${_cubin_headers}
+            COMMENT "nvcc interp_sm90a_pfgemm_w8a16_m1.cubin"
+            VERBATIM)
+        list(APPEND _cubin_outs "${_w8a16_m1_out}")
+    endif()
 
     # The device stochastic sampler is NOT the megakernel and shares none of its
     # defines, so it is not a row in the table above. A failure here is non-fatal:
@@ -882,6 +926,12 @@ set(PLOW_GQ_BATCH "1" CACHE STRING "global-queue claim batch")
 set(PLOW_DECODE_BATCH "1" CACHE STRING "decode batch bucket")
 set(PLOW_GEMV_MM "" CACHE STRING "decode GEMV rows per walk pass (empty = derived)")
 option(PLOW_GEMV_WALK "Walk a <=16-row GEMV object across wider decode batches" OFF)
+set(_plow_decode_tiers_default OFF)
+if(PLOW_HSACO_ARCH STREQUAL "gfx942")
+    set(_plow_decode_tiers_default ON)
+endif()
+option(PLOW_HSACO_DECODE_TIERS "Build matching narrow decode interpreter objects"
+       ${_plow_decode_tiers_default})
 set(_plow_l2_default OFF)
 set(_plow_gate_hier_default OFF)
 if(PLOW_HSACO_ARCH STREQUAL "gfx942" OR PLOW_HSACO_ARCH STREQUAL "gfx950")
@@ -1356,8 +1406,12 @@ if(PLOW_GFX950_HSACO)
         set(_hs_ax_mixed -DPLOW_MIXED_STEP=1 -DPLOW_BUCKET_DECODE=0
             -DPLOW_WG_WAVES=4 -DPLOW_GEMV_MM=4 -DGM_BM=64 -DGM_BN=128
             -DFA_DC=256 -DFA_DBUF=1)
+        set(_hs_ax_tokbatch -DPLOW_TOKEN_BATCH=1 -DPLOW_MIXED_STEP=1
+            -DPLOW_BUCKET_DECODE=0 -DPLOW_WG_WAVES=4 -DPLOW_GEMV_MM=4
+            -DGM_BM=256 -DGM_BN=128 -DFA_DC=256 -DFA_DBUF=1)
         list(APPEND _hs_rows
-            "interp_mixed|plow_interp_mixed_gfx942|_hs_ax_mixed|_hs_ax_none|512|1")
+            "interp_mixed|plow_interp_mixed_gfx942|_hs_ax_mixed|_hs_ax_none|512|1"
+            "interp_tokbatch|plow_interp_tokbatch_gfx942|_hs_ax_tokbatch|_hs_ax_none|512|1")
     endif()
     if(PLOW_HSACO_FP8)
         # MIXED-PRECISION OBJECTS, and the names do not say so. `interp_*_fp8` carries the fp8
@@ -1406,8 +1460,20 @@ if(PLOW_GFX950_HSACO)
             "interp_prefill_mxfp4|${_hs_kpf}|_hs_ax_prefill|_hs_ax_mxfp4|256|2")
     endif()
     if(PLOW_HSACO_MLA)
+        set(_hs_ax_mla_small -DPLOW_BUCKET_DECODE=0 -DPLOW_WG_WAVES=8
+            -DPLOW_MLA_PREFILL=1 -DPLOW_BUCKET_MLA_PREFILL_SMALL=1
+            -DPLOW_L2_PLACE_DISPATCH=1)
         list(APPEND _hs_rows
+            "interp_mla_small|plow_interp_mla_small_${PLOW_HSACO_ARCH}|_hs_ax_mla_small|_hs_ax_none|256|2"
             "interp_prefill_mla|${_hs_kpf}|_hs_ax_prefill|_hs_ax_mla|256|2")
+        if(PLOW_HSACO_FP8KV)
+            set(_hs_ax_mla_split -DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4
+                -DFA_DC=256 -DFA_DBUF=1 -DPLOW_MLA_PF_V2_ARM=1
+                -DPLOW_BUCKET_MLA_PREFILL_SPLIT=1 -DPLOW_L2_PLACE_DISPATCH=1)
+            list(APPEND _hs_rows
+                "interp_mla_split_fp8kv|plow_interp_mla_split_${PLOW_HSACO_ARCH}|_hs_ax_mla_split|_hs_ax_fp8kv|512|1"
+                "interp_mla_small_fp8kv|plow_interp_mla_small_${PLOW_HSACO_ARCH}|_hs_ax_mla_small|_hs_ax_fp8kv|256|2")
+        endif()
         if(PLOW_HSACO_ARCH STREQUAL "gfx950")
             # Build-time gate: V2+SV is 348 architectural registers, occupancy 1,
             # scratch-free in the exact T8192 kernel probe.
@@ -1512,7 +1578,7 @@ if(PLOW_GFX950_HSACO)
             set(_gq "")
             set(_row_kind_extra "")
             set(_row_extra ${_hs_extra})
-            if(_a1 STREQUAL "_hs_ax_mixed")
+            if(_a1 STREQUAL "_hs_ax_mixed" OR _a1 STREQUAL "_hs_ax_tokbatch")
                 # Runtime-built schedules require the universal qualified object.
                 set(_row_extra "")
             endif()
@@ -1536,6 +1602,26 @@ if(PLOW_GFX950_HSACO)
                 COMMENT "hipcc ${_stem}${_sfx}.elf"
                 VERBATIM)
             list(APPEND _hs_outs "${_out}")
+            if(PLOW_HSACO_DECODE_TIERS AND _a1 STREQUAL "_hs_ax_decode")
+                foreach(_width 1 2 4 8)
+                    if(_width GREATER_EQUAL _hs_gvmm)
+                        continue()
+                    endif()
+                    set(_tier_decode ${_hs_ax_decode})
+                    list(REMOVE_ITEM _tier_decode -DPLOW_GEMV_MM=${_hs_gvmm})
+                    list(APPEND _tier_decode -DPLOW_GEMV_MM=${_width})
+                    set(_tier_out "${PLOW_HSACO_DIR}/lowrung${_width}/${_stem}${_sfx}.elf")
+                    add_custom_command(OUTPUT "${_tier_out}"
+                        COMMAND bash "${_hs_run}" "${PLOW_HSACO_HIPCC}" "${PLOW_HSACO_BUNDLER}"
+                                "${PLOW_HSACO_ARCH}" "${_tier_out}" "${_sym}${_sfx}" ${_maxreg} ${_minocc}
+                                ${_hs_inc} ${_hs_arch_def} ${_tier_decode} ${${_a2}} ${_gq}
+                                ${_row_kind_extra} ${_row_extra} "${_hs_src}"
+                        DEPENDS "${_hs_src}" "${_hs_run}" ${_hs_hdrs} ${_hs_config_dep}
+                        COMMENT "hipcc lowrung${_width}/${_stem}${_sfx}.elf"
+                        VERBATIM)
+                    list(APPEND _hs_outs "${_tier_out}")
+                endforeach()
+            endif()
         endforeach()
     endforeach()
 

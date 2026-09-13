@@ -13,7 +13,7 @@ fn inst(op: DevOp) -> DevInst64 {
 fn prog(t: u32, ops: &[DevInst64]) -> DevProg {
     DevProg {
         t,
-        packed_prefill_only: false,
+        role: packet::devbuild::ProgramRole::PrefillBucket { rows: t },
         n_counter: 0,
         insts: ops.to_vec(),
         stream: Vec::new(),
@@ -329,7 +329,7 @@ fn text_of(rep: &BlobAudit) -> String {
 ///
 /// v1 synthesizes its packed program at model load by rewriting the blob's
 /// ordinary prefill program against a hand-written opcode whitelist
-/// (`exec/mixed_program.rs`'s match, re-checked by `exec/amd_mixed_step.rs`'s
+/// (`exec/mixed_program.rs`'s match, re-checked by `exec/amd/mixed_step.rs`'s
 /// 12-opcode `validate_program`). This audits the result — the actual
 /// instruction stream v1 would upload — rather than reading the whitelist.
 ///

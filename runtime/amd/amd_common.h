@@ -363,6 +363,51 @@ __device__ __forceinline__ void cp_async16(const PLOW_GLOB bf16* src,
     (void)dst_lane_contiguous;
 #endif
 }
+/* 4 BYTES PER LANE, and on CDNA3 that is the ONLY width that is actually direct-to-LDS.
+ *                                                                        [LDS-DMA-4B]
+ * `cp_async16` above asks for 16 B/lane, which gfx942 does not implement, so its CDNA3 arm is a
+ * VGPR-staged copy — correct, but it spends exactly the registers the technique exists to save.
+ * This is the width the hardware has: `global_load_lds_dword`, verified emitted by clang for
+ * gfx942 (a HIP probe compiles to a single `global_load_lds_dword`, no VGPR round trip).
+ *
+ * WHY IT MATTERS HERE. AITER's shipped gfx942 MLA-prefill kernel
+ * (`fwd_hd192x128_bf16_causal_*.co`) issues 132 `buffer_load_dword … lds`; plow's flash object
+ * issues ZERO and stages K/V through a register file that is already fully committed (512 VGPR,
+ * one wave per SIMD). That is the one structural difference between the two kernels — the tiling
+ * already matches at BM 128 / BN 32 / 4 waves — and the flash segment is ~75% of long-context
+ * prefill wall time (docs/amd/tp-bringup-mi300x.md §7f).
+ *
+ * THE CONTRACT IS THE SAME SHARP ONE `cp_async16` DOCUMENTS, at a different stride: the LDS
+ * destination comes from M0 and is UNIFORM, and the hardware lays the 64 lanes down contiguously
+ * at the ISSUE width — so here lane `l` lands at `dst + l*4 bytes` = `dst + l*2` bf16, and ONE
+ * wave issue moves 64 x 4 B = 256 B = 128 bf16. The global source may be per-lane; the LDS
+ * destination may not. A caller whose LDS tile is padded (the usual bank-conflict `+8`) must
+ * therefore issue in runs that never cross the pad — which is free when the row width is a
+ * multiple of 128 bf16, as D=512 is.
+ *
+ * Tracked on vmcnt like every other global load, so `cp_async_wait()` drains it. */
+__device__ __forceinline__ void cp_async4(const PLOW_GLOB bf16* src, bf16* dst_wave_contiguous) {
+#ifdef __HIP_DEVICE_COMPILE__
+#if defined(__clang_major__) && __clang_major__ >= 23
+    __builtin_amdgcn_global_load_lds(
+        (PLOW_GLOB void*)(const PLOW_GLOB void*)src,
+        (__attribute__((address_space(3))) void*)dst_wave_contiguous,
+        4 /* bytes per lane — the only CDNA3 width */, 0 /* offset */, 0 /* aux */);
+#else
+    __builtin_amdgcn_global_load_lds(
+        (const PLOW_GLOB unsigned*)(const PLOW_GLOB void*)src,
+        (__attribute__((address_space(3))) unsigned*)(__attribute__((address_space(3))) void*)
+            dst_wave_contiguous,
+        4, 0, 0);
+#endif
+#else
+    (void)src;
+    (void)dst_wave_contiguous;
+#endif
+}
+/* bf16 moved by ONE `cp_async4` wave issue: 64 lanes x 2. */
+#define CP_ASYNC4_BF16 (PLOW_WAVE * 2)
+
 __device__ __forceinline__ void cp_async_wait(void) {
     asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
 }
@@ -814,6 +859,64 @@ __device__ __forceinline__ float fp4_dot32(const fp4_frag32& f, bf16v8 x0, bf16v
     }
     return acc + ((p[0] + p[1]) + (p[2] + p[3])) * f.s;
 #endif
+}
+
+/* 32 INT4 (one compressed-tensors group of 32) + one BF16 group scale, dotted against 32 bf16
+ * activations. The int4 twin of `fp4_prep32` / `fp4_dot32`.        [INT4-G32-DECODE]
+ *
+ * SAME SHAPE AS THE MXFP4 ARM ON PURPOSE. A lane's b128 weight load is 16 bytes = 32 int4 =
+ * EXACTLY one group of 32, so one load consumes one scale and the scale never varies inside a
+ * fragment — the alignment property `fp4v32`'s header is about, and it holds here for the same
+ * reason: group_size 32 and 4 bits. The load, the `k>>5` indexing, the wave reduction and the
+ * caller are therefore shared verbatim with the mxfp4 path; only the element decode and the
+ * scale's TYPE differ (BF16 per group here, an E8M0 byte there).
+ *
+ * THE BIAS IS WHY THIS IS NOT JUST `fp4_dot32` WITH ANOTHER CONVERTER. `plow_int4x8_to_f16x4`
+ * leaves every element high by `PLOW_INT4_BIAS`, so the true dot is
+ * `s * (sum(v_i * x_i) - 1032 * sum(x_i))`. Subtracting per element would cost 32 extra VALU per
+ * fragment; the sum of the activations costs 32 adds ONCE and is then reused, and in the MoE
+ * decode walk the same activation fragment is dotted against every routed expert row, so this
+ * term is amortized over the whole walk rather than paid per row. `xsum` is that value; a caller
+ * that has not computed it can pass the fragment's own sum. */
+struct int4_frag32 {
+    unsigned h[16]; /* raw fp16 pairs: the value biased by +1032 */
+    float s;        /* the group's BF16 scale, applied once to the finished sum */
+};
+
+__device__ __forceinline__ int4_frag32 int4_prep32(fp4v32 w, float scale) {
+    int4_frag32 f;
+#pragma unroll
+    for (int i = 0; i < 4; i++) plow_int4x8_to_f16x4((unsigned)w[i], &f.h[i * 4]);
+    f.s = scale;
+    return f;
+}
+
+/* `xsum` is sum(x0..x3) over the 32 activations — the bias term's multiplicand. */
+__device__ __forceinline__ float int4_dot32(const int4_frag32& f, bf16v8 x0, bf16v8 x1, bf16v8 x2,
+                                            bf16v8 x3, float xsum, float acc) {
+    const bf16v8 xs[4] = {x0, x1, x2, x3};
+    float p[4];
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        bf16v8_pairs xp{xs[i]};
+        float s0 = 0.0f, s1 = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            const plow_f16x2 wv = __builtin_bit_cast(plow_f16x2, f.h[i * 4 + j]);
+            /* bf16 -> f32 is a 16-bit SHIFT, not a numeric conversion — same note as fp4_dot32. */
+            const unsigned xu = __builtin_bit_cast(unsigned, xp.p[j]);
+            float xa, xb;
+            unsigned t = xu << 16;
+            __builtin_memcpy(&xa, &t, 4);
+            t = xu & 0xffff0000u;
+            __builtin_memcpy(&xb, &t, 4);
+            s0 = __builtin_fmaf((float)wv[0], xa, s0); /* v_fma_mix_f32: f16 source, f32 acc */
+            s1 = __builtin_fmaf((float)wv[1], xb, s1);
+        }
+        p[i] = s0 + s1;
+    }
+    const float biased = (p[0] + p[1]) + (p[2] + p[3]);
+    return acc + (biased - PLOW_INT4_BIAS * xsum) * f.s;
 }
 
 /* One u32 (8 fp4) + one E8M0 scale -> bf16v8, the per-word slice of fp4_to_bf16v8x4. Used by the

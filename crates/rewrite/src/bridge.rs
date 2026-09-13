@@ -833,6 +833,7 @@ fn fused_shape(
         | "FusedResidualNorm"
         | "FusedResidualZeroCenteredNorm"
         | "FusedResidualLayerNorm"
+        | "FusedResidual3Norm"
         | "FusedGroupNormAct"
         | "FusedRmsNormSiluGate"
         | "FusedPackedAttnGate" => child(0),
@@ -969,6 +970,8 @@ fn fused_op_kind(fused: &FusedGraph, shapes: &[Vec<i64>], i: usize) -> Result<Op
         "FusedResidualNorm" => row(3, true),
         "FusedResidualZeroCenteredNorm" => row(3, true),
         "FusedResidualLayerNorm" => row(4, true),
+        // Combine + residual + norm: 4 operands (x, a, b, normw), reduction sweep.
+        "FusedResidual3Norm" => row(4, true),
         "Softmax" => row(1, true),
         "Act" | "Scale" | "Rope" | "ProportionalRope" => row(1, false),
         // Embedding/FusedEmbeddingScale: memory-bound row-wise lookup.

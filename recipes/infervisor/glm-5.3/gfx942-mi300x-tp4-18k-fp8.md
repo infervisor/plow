@@ -22,12 +22,14 @@ nix develop .#quantize --command python3 scripts/glm52_prep_lite.py \
 ```bash
 nix develop --command env \
   JOBS=8 \
-  PLOW_DECODE_TIERS=1,2,4,8 \
+  PLOW_DECODE_BATCH=4 \
+  PLOW_DECODE_TIERS=1,2 \
   scripts/build_gfx942.sh \
   $OBJDIR
 
 # rung <= 1: a PARTIAL directory, valid only as an override
 nix develop --command env \
+  PLOW_DECODE_BATCH=4 \
   PLOW_DECODE_TIER=1 \
   PLOW_ROWS_ONLY==interp_decode \
   scripts/build_gfx942.sh \
@@ -35,6 +37,7 @@ nix develop --command env \
 
 # rung <= 2: a PARTIAL directory, valid only as an override
 nix develop --command env \
+  PLOW_DECODE_BATCH=4 \
   PLOW_DECODE_TIER=2 \
   PLOW_ROWS_ONLY==interp_decode \
   scripts/build_gfx942.sh \

@@ -45,20 +45,27 @@ shell = "nix develop .#quantize"
 args = ["--model", "$CKPT", "--out", "$WORK/glm53-lite"]
 produces = ["zz-derived-00001.safetensors"]
 
+# `PLOW_DECODE_BATCH` is the ladder's widest rung (docs/amd/glm53-mi300x.md §4,
+# `PLOW_DECODE_BATCH_LADDER = "1,2,4"` below). It was missing here, which made
+# the whole `[objects]` surface describe a B=1 build: the script derives every
+# tier from it (`w >= PLOW_DECODE_BATCH` is skipped, so "1,2,4,8" at the default
+# batch of 1 built no tier at all) and refuses `PLOW_DECODE_TIER=2` against it.
+# Found by scripts/tests/test_recipe_objects_env.py.
 [objects]
 script = "scripts/build_gfx942.sh"
-env = { PLOW_DECODE_TIERS = "1,2,4,8", JOBS = "8" }
+env = { PLOW_DECODE_BATCH = "4", PLOW_DECODE_TIERS = "1,2", JOBS = "8" }
 
 # Batch-width-matched decode tiers. `PLOW_GEMV_MM` is a compiled CEILING, so
 # without them a rung-1 packet runs the wide object's body and computes — then
-# discards — one dot product per dead activation row.
+# discards — one dot product per dead activation row. Each rung is rendered as
+# its own invocation (render_recipe.py), so each carries the batch it subsets.
 [[objects.lowrung]]
 max = 1
-env = { PLOW_DECODE_TIER = "1", PLOW_ROWS_ONLY = "=interp_decode" }
+env = { PLOW_DECODE_BATCH = "4", PLOW_DECODE_TIER = "1", PLOW_ROWS_ONLY = "=interp_decode" }
 
 [[objects.lowrung]]
 max = 2
-env = { PLOW_DECODE_TIER = "2", PLOW_ROWS_ONLY = "=interp_decode" }
+env = { PLOW_DECODE_BATCH = "4", PLOW_DECODE_TIER = "2", PLOW_ROWS_ONLY = "=interp_decode" }
 
 # The GLM-5.2 campaign's knob set minus `PLOW_GLM_FUSE_QNORM`: its M>1 staging
 # is unvalidated and the emit refuses it alongside a decode-batch ladder.

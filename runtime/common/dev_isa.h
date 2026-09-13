@@ -56,7 +56,10 @@ enum {
     PLOW_DOP_NOP = 0,
 
     /* t0=out t1=x t2=gamma?            i0=rows i1=feat          f0=eps
-     * gamma==NONE is the weightless RMSNorm (Gemma's v_norm). */
+     * gamma==NONE is the weightless RMSNorm (Gemma's v_norm).
+     * i7=1 marks Gemma3's FP32 (1+gamma) weight semantics, also on HEADNORM_ROPE,
+     * HEADNORM_ROPE_FP8, NORM_RESIDUAL and NORM_RESIDUAL_NORM. Requires a matching
+     * interpreter object; zero retains plain gamma. */
     PLOW_DOP_RMSNORM = 1,
 
     /* t0=rms(f32) t1=x                 i0=rows i1=feat          f0=eps
@@ -502,6 +505,7 @@ enum {
     /* FUSED MLA merge + W_uv fold (d_mla_merge_fold) — replaces FLASH_MERGE<512> + O_UV_FOLD on the
      * MLA decode path (kills the separate merge pass + Olat round-trip + a gate). t0=O(v_head)
      * t1=Opart(f32) t2=mlpart(f32) t3=Wuv; i0=n_batch i1=n_head i2=V i4=nsplit. */
+    /* i5=1 selects isolated native gfx942 TP8 FP32 prefill fold. */
     PLOW_DOP_MLA_MERGE_FOLD = 57,
 
     /* DSA lightning-indexer SCORE (d_index_score / d_index_score_fast, op_attention.h): for every KV
@@ -517,8 +521,11 @@ enum {
      * host-patched every decode step); i2=pool_size (GLM-5.3-Flash pooled indexer, DEFAULT 1 — unset
      * on every existing emission, dispatch treats zero as 1, no existing blob changes) divides it down
      * to whatever granularity len_max/Score were emitted in. t0=idx(i32) t1=Score(f32) t2=gHist(u32
-     * [7*256]) t3=gCtl(u32[3]) t4=kv_len(i32); i0=len_max i1=top_k i2=pool_size. Host zeroes gHist/gCtl
-     * once; kernel leaves them clean. [GLM52-DSA] */
+     * [7*256]) t3=gCtl(u32[3]) t4=kv_len(i32); i0=len_max i1=top_k i2=pool_size i3=batch_row. Score/idx use
+     * [batch][len_max/top_k] strides; kv_len uses batch_row. Rows serialize over gHist/gCtl.
+     * i4=1 selects one workgroup per row (row=i3+slice), with LDS-only radix selection,
+     * unused t2/t3 and -1 padding on short rows. This mode is unpooled; i4=0 keeps cooperation.
+     * Host zeroes gHist/gCtl once; kernel leaves them clean. [GLM52-DSA] */
     PLOW_DOP_INDEX_SELECT = 59,
 
     /* LayerNorm WITH bias + mean-subtract (d_layernorm_bias, op_norm.h): the DSA indexer k_norm
@@ -944,9 +951,13 @@ enum {
      *   t0=Opart t1=mlpart t2=Qabs t3=Qrope t4=Ckv(fp8) t5=Krope t6=kv_len t7=kv_scale
      *   i0=n_batch i1=n_head i2=kv_stride i3=window i4=nsplit(decode)/n_tok(prefill) i5=kv_mask
      *   i6=krot_fp8 i7=gf   f0=scale
+     * Sparse extension (object marker required): fj[1].u = selected tensor handle + 1,
+     * zero = dense. Decode uses an idx table and i6=top_k; prefill uses a union table
+     * and i6=capacity. Both sparse forms retain BF16 rope and t7=latent scales.
      * See d_flash_mla_decode<...,FP8=true> in op_attention.h. */
     PLOW_DOP_FLASH_MLA_DECODE_FP8 = 109,
-    PLOW_DOP_FLASH_MLA_PREFILL_FP8 = 110, /* same operands; i4 = n_tok (PLOW_MLA_PREFILL) */
+    PLOW_DOP_FLASH_MLA_PREFILL_FP8 = 110, /* i4=n_tok; dense fj2>1=small-rung split capacity,
+                                          requires the dedicated split object and matching merge */
     /* KDA short conv over all three streams in ONE packet — op 88 merged along its CHANNEL axis.
      *
      * The three convs are independent, which is why they were three packets; at batch 1 that
@@ -1342,6 +1353,45 @@ enum {
      * whose 1/sqrt(2) the emitter already applied when it combined the table); Wp is the checkpoint
      * weight verbatim. t5/t6 fold the NEXT layer's input norm. */
     PLOW_DOP_PER_LAYER_INPUT = 155,
+    /* Native gfx942 A8 block-FP8 MoE, BF16 routed accumulation; mode 0 writes FP32.
+     * t0=out t1=x t2=weights t3=scales t4=meta t5=row_token t6=row_part t7=row_gate
+     * i0=T i1=H i2=I i3=E i4=topk i5=align_tile. Isolated native segment only.
+     * i6=1: flat A16 decode writes BF16 plus 8 protocol bytes, t4=raw routes,
+     * t5..t7 absent and i5=0; consume one partial with MoeCombinePf.i7=1.
+     * i6=2: sorted A8 prefill writes BF16 directly; consume with MoeCombinePf.i7=1. */
+    PLOW_DOP_MOE_AITER_FP8_PF = 156,
+    /* Native gfx942 TP8 DSA score, top-k and raw index gather.
+     * t0=idx t1=score t2=q t3=k t4=w t5=kv_len t6=peer_slot
+     * i0=T i1=ctx i2=topk i3=tp i4=slot_bytes i5=enter_gate i6=complete_gate f0=scale.
+     * Isolated native segment with three consecutive system-scope arrival gates. */
+    PLOW_DOP_INDEX_TP_PF = 157,
+    /* Native gfx942 BF16 projection using qualified hipBLASLt assembly.
+     * t0=out t1=x t2=weight i0=T i1=N i2=K i3=decode. Isolated native segment only. */
+    PLOW_DOP_GEMM_LT_PF = 158,
+    /* Native gfx942 W8A8 block-scale FP8 projection using AITER pre-shuffled assembly.
+     * t0=out t1=x t2=weight t3=w_scale t4=xq t5=x_scale t6=bias i0=T i1=N i2=K i3=quantize.
+     * Isolated native segment only. */
+    PLOW_DOP_GEMM_BLK_PF = 159,
+    /* Row-split sparse attention's cross-GPU head/row transpose (rowsplit-attention-design.md
+     * §3.1 steps 2 and 4). Pull form, one wave (64 lanes) per peer, 16-byte accesses,
+     * one-workgroup rendezvous — modelled on PLOW_DOP_XALLGATHER's AITER access pattern.
+     * TP8 only (the wave-per-peer map assumes 8 waves).
+     *
+     *   dir=0 (Q form): this rank's own peer-visible source is [T][nh_l][d] (all T rows, this
+     *   rank's nh_l heads, contiguous per row). Rank `rank` pulls, from every peer p, p's row
+     *   band [rank*rpr, (rank+1)*rpr) — a CONTIGUOUS run in p's source — into the LOCAL
+     *   dst = [rpr][nh_total][d] at head offset p*nh_l (strided across rows).
+     *
+     *   dir=1 (O form): this rank's own peer-visible source is [rpr][nh_total][d] (this rank's
+     *   row band, every head). Rank `rank` pulls, from every peer p, p's head slice
+     *   [rank*nh_l, (rank+1)*nh_l) at each of p's rpr rows — STRIDED in p's source — into the
+     *   LOCAL dst = [T][nh_l][d] at row band [p*rpr, (p+1)*rpr) (contiguous).
+     *
+     * Pure permutation (no arithmetic): a copied element is byte-exact against the source word.
+     *   t0=dst
+     *   i0=rpr i1=nh_l i2=d i3=nh_total i4=gate i5=n_gpu i6=slot_bytes(src offset into
+     *   peer_scratch) i7=dir(0=q,1=o) */
+    PLOW_DOP_XALLTOALL_HEADS = 160,
 
     PLOW_DOP__COUNT
 };
@@ -1521,6 +1571,21 @@ typedef struct {
     uint32_t state_slot; /* carried-state slot */
     uint32_t program;    /* compiled prefill program/rung */
 } PlowPrefillSpan;
+
+/* Per-request KV addressing for a native (host-launched) sparse-prefill kernel. Rows
+ * [row0, row0 + n_rows) of the launch belong to one request: local row r sits at absolute
+ * position kv_row0 + r, the request's live KV length is kv_len, and its position 0 is
+ * `kv_base` cache rows into the bound cache tensor — an explicit field, never slot arithmetic
+ * in the kernel (DCP places it). A row no entry covers is inactive: nothing is read or written
+ * for it. A launch with no table (`spans == NULL`) is the legacy single-request form. */
+typedef struct {
+    uint32_t row0;
+    uint32_t n_rows;
+    uint32_t kv_row0;
+    uint32_t kv_len;
+    uint32_t kv_base;
+    uint32_t _pad[3];
+} PlowKvSpan;
 
 /* ===== UNIFIED TOKEN BATCH (docs/arch/17-unified-token-batch.md) =============================
  *
