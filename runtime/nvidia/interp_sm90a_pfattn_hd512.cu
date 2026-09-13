@@ -42,7 +42,7 @@ extern "C" __device__ __constant__ unsigned plow_pf_masked_padding_abi = 1;
 #endif
 
 #if PLOW_NV_FA512_PX4_BQ64
-extern "C" __device__ unsigned plow_attention_sm90_hd512_px4_bq64_abi = 2;
+extern "C" __device__ unsigned plow_attention_sm90_hd512_px4_bq64_abi = 3;
 #else
 extern "C" __device__ unsigned plow_attention_sm90_hd512_wg32_abi = 1;
 #endif
@@ -59,6 +59,7 @@ extern "C" __device__ unsigned plow_attention_n_head = 16;
 extern "C" __device__ unsigned plow_attention_n_kv_head = 1;
 extern "C" __device__ unsigned plow_attention_global = 1;
 extern "C" __device__ unsigned plow_attention_nsplit = 1;
+extern "C" __device__ unsigned plow_attention_direct_entry = 1;
 extern "C" __device__ unsigned plow_block_pfattn_hd512_px4_bq64 = 512;
 extern "C" __device__ unsigned plow_arena_bytes_pfattn_hd512_px4_bq64 =
     FA_PX4_SMEM_FLOATS(512, 64, 16) * sizeof(float);
@@ -196,6 +197,61 @@ __device__ __forceinline__ void attention_body(const PlowDevInst* in, void* cons
         arena, nullptr, tensors[t7]);
 #endif
 }
+
+#if PLOW_NV_FA512_PX4_BQ64
+typedef struct {
+    const int* requests;
+    float* opart;
+    float* mlpart;
+    const __nv_bfloat16* q;
+    const __nv_bfloat16* k;
+    const __nv_bfloat16* v;
+    __nv_bfloat16* output;
+    const PlowStreamEnt* entries;
+    const unsigned* succs;
+    unsigned* counters;
+    unsigned seq_q;
+    unsigned kv_stride;
+} PlowHd512Px4Direct;
+static_assert(sizeof(PlowHd512Px4Direct) == 88, "HD512 direct role ABI");
+
+extern "C" __global__ __launch_bounds__(512, 1)
+void plow_sm90a_pfattn_hd512_px4_bq64_direct(PlowHd512Px4Direct args) {
+    extern __shared__ float arena[];
+    const unsigned count = (unsigned)args.requests[0];
+    for (unsigned r = 0; r < count; ++r) {
+        const unsigned q0 = (unsigned)args.requests[1 + 4 * r];
+        const unsigned qlen = (unsigned)args.requests[2 + 4 * r];
+        const unsigned slot = (unsigned)args.requests[3 + 4 * r];
+        const unsigned kvlen = (unsigned)args.requests[4 + 4 * r];
+        const size_t qoff = (size_t)q0 * 16 * 512;
+        const size_t kvoff = (size_t)slot * args.kv_stride * 512;
+        d_flash_prefill_px4<512, 64, 16, false, 512>(
+            args.opart + qoff, args.mlpart + (size_t)q0 * 32, args.q + qoff,
+            args.k + kvoff, args.v + kvoff, args.output + qoff, qlen, kvlen, 16, 1,
+            kvlen - qlen, 0, 1, args.kv_stride, 0xffffffffu, 1.0f,
+            blockIdx.x, gridDim.x, arena);
+        __syncthreads();
+    }
+
+    unsigned real = 0;
+    if (count) {
+        const unsigned last = count - 1;
+        real = (unsigned)args.requests[1 + 4 * last] +
+               (unsigned)args.requests[2 + 4 * last];
+    }
+    const size_t begin = (size_t)real * 16 * 512;
+    const size_t end = (size_t)args.seq_q * 16 * 512;
+    for (size_t i = begin + (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < end;
+         i += (size_t)gridDim.x * blockDim.x)
+        args.output[i] = __float2bfloat16(0.0f);
+
+    __syncthreads();
+    const PlowStreamEnt entry = attention_stream_ent(args.entries + blockIdx.x);
+    for (unsigned s = threadIdx.x; s < entry.succ_len; s += blockDim.x)
+        attention_ctr_signal(PLOW_CTR(args.counters, args.succs[entry.succ_ofs + s]));
+}
+#endif
 
 #if PLOW_NV_FA512_PX4_BQ64
 #define PLOW_HD512_ENTRY plow_sm90a_pfattn_hd512_px4_bq64

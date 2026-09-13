@@ -124,6 +124,7 @@ fn hd512_px4_fixture() -> (DevProg, Vec<DevTensor>) {
         init: None,
     });
     program.insts[2].i = [rows, rows, 16, 1, 0, 0, 512, 1];
+    program.insts[2].fj = [1.0f32.to_bits(), 65536, u32::MAX];
     program.insts[2].t[5] = 5;
     program.insts[2].t[7] = 6;
     (program, tensors)
@@ -394,8 +395,13 @@ fn accepts_exact_hd512_wg32_contract_and_rejects_drift() {
 fn accepts_exact_hd512_px4_bq64_resource_contract() {
     let object = hd512_px4_bq64_object();
     let geometry = [Some(512), Some(64), Some(16), Some(16)];
-    check_attention_hd512_role("sm90a", &object, Some(2), Some(512), geometry).unwrap();
-    assert!(check_attention_hd512_role("sm90a", &object, Some(2), Some(256), geometry).is_err());
+    check_attention_hd512_role("sm90a", &object, Some(3), Some(512), geometry).unwrap();
+    assert!(
+        check_attention_hd512_role("sm90a", &object, Some(2), Some(512), geometry).is_err()
+    );
+    assert!(
+        check_attention_hd512_role("sm90a", &object, Some(3), Some(256), geometry).is_err()
+    );
 }
 
 #[test]
@@ -408,7 +414,10 @@ fn hd512_px4_bq64_packet_role_rejects_non_gemma_geometry() {
         0,
     ];
     let (mut program, tensors) = hd512_px4_fixture();
-    assert_eq!(packet_role_segments(&program, &roles, &tensors).unwrap(), roles);
+    assert_eq!(
+        packet_role_segments(&program, &roles, &tensors).unwrap(),
+        roles
+    );
 
     for (field, value) in [(2, 32), (3, 4), (5, 1024), (7, 2)] {
         let original = program.insts[2].i[field];
