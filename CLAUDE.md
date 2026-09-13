@@ -43,6 +43,9 @@ Before coding:
 * Check existing dependencies before adding crates.
 * Add crates only when justified.
 * Use **nix** `nix develop` for terminal/build tasks.
+* Register every new `PLOW_*` knob, env read or `#if PLOW_*` define in `crates/devgen/src/knob_spec.rs`
+  or `crates/plowrt/src/knob_spec.rs`; run `cargo test -p devgen --lib knob` and
+  `cargo test -p plowrt --features cuda,hsa --lib knob`.
 
 ### Comments
 
