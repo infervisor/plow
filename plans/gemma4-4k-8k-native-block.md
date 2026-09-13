@@ -1312,3 +1312,59 @@ prompt/output checksums. Evidence:
 `/tmp/bf16-mixed-{rollback,explicit}-classified-s47.{json,log}`. Final release
 smokes with the regenerated load-time evaluator are
 `/tmp/bf16-final-{default,mixed-rollback}-s47.{json,log}`.
+
+### 2026-09-13: HD512 descriptor-TMA wait barriers elided
+
+Commit `5a28f449` removes the CTA-wide rendezvous that immediately followed each
+successful descriptor-TMA K or V `mbarrier.try_wait.parity`. Every thread waits
+on the transaction barrier, so the wait supplies the acquire before that thread
+consumes the completed tile. The CTA rendezvous remains when threads
+cooperatively zero a ragged V tail. The change is enabled only for the exact
+descriptor-TMA role; the row-bulk path retains its prior synchronization.
+
+The rebuilt direct object SHA256 is
+`b65117f8340a73e46afff9e2bf66eb3308abebf4a6b567979b80422d49dfa674`.
+Its direct entry remains at 128 registers, one barrier resource, a 110,592-byte
+arena, and zero stack/spills/local memory. Rotated direct A/B seeds 17/23/29
+were bit-exact in every 4K/8K cell and measured:
+
+| Rung | descriptor control mean | wait-elided mean | Delta |
+|---|---:|---:|---:|
+| 4K | 3.303296 ms | 3.001557 ms | -9.13% (1.101x) |
+| 8K | 11.815926 ms | 10.754464 ms | -8.98% (1.099x) |
+
+Eight additional ragged/history cells covered `(qlen,kvlen)` 4095/4095,
+2048/4095, 8191/8191, and 2048/8191 across seeds 31/37. All were bit-exact and
+the candidate was 1.119--1.123x faster than the row-TMA harness control.
+Compute Sanitizer memcheck and synccheck both report zero errors on the 63/63
+ragged case.
+
+The W8A8 current-schema packet authenticates the new object at role 15 for all
+483 launches. With seeds 47/53/59, mean p50 TTFT moves from 168.018 to 165.517
+ms at 4K (-1.49%, 1.015x) and from 367.281 to 358.531 ms at 8K (-2.38%,
+1.024x). A packed R2 gate formed `R=2 rows=4096` from two 2048-token chunks,
+completed 4/4 without failures, and preserved the previously qualified output
+hash. Packet SHA256 is
+`28c8a1f4cdffa8e72478201e3badeb8336f3c715c903805e76d00d4e2e461612`.
+
+The BF16 transfer used the same rotated seeds and completed all 18 measured
+requests without failures. Every paired prompt and output checksum matches.
+Mean p50 moves from 224.491 to 221.674 ms at 4K (-1.25%, 1.013x) and from
+476.892 to 467.463 ms at 8K (-1.98%, 1.020x). Its packet SHA256 is
+`07939cdbdb6e58f1a3cb93b9ca325fc9df997a5b1d7f5916c645d0173926a43a`;
+the manifest SHA256 remains
+`b68b17b22f79ff5ce8f3694019c7d5d8deebf99d8a3f490b9e4df406f9bdfc84`.
+
+Evidence remains outside git:
+`/tmp/hd512-tma-wait-elide/results.jsonl`,
+`/tmp/hd512-tma-wait-elide/ragged.jsonl`,
+`/tmp/hd512-tma-wait-elide/{memcheck,synccheck}.log`,
+`/tmp/hd512-wait-elide-{control,candidate}-s{47,53,59}.{json,log}`,
+`/tmp/hd512-wait-elide-b2.{json,log}`, and
+`/tmp/bf16-hd512-wait-elide-{control,candidate}-s{47,53,59}.{json,log}`.
+
+The next HD512 experiment is a structurally non-divergent four-warpgroup
+`mma.sync` phase-overlap object. Two QK groups split N0..7 and N8..15, while
+two PV groups split HD0..255 and HD256..511. It must preserve the accepted
+BKV16 softmax order, keep producer and consumer register regions separate,
+and beat this new direct/full-rung control without spills.
