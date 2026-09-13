@@ -30,8 +30,12 @@ const PREFIX_CACHE_CANDIDATE: Status = Status::Candidate {
 const ROW_SPLIT_CANDIDATE: Status = Status::Candidate {
     evidence: &["review log #84: p0split-full-depth, 8192-row first chunk 725.9 -> 616.8 ms, retrieval 39/39; flip waits on the served A/B"],
 };
-const UNION_SKIP_CANDIDATE: Status = Status::Candidate {
-    evidence: &["review log #85: glue2-t3-g1-rung, P8192-S 667.2 -> 648.3 ms (floor 3.7), P4096-S -11.1, P8192-0 unchanged; flip waits on the served A/B"],
+const UNION_SKIP_QUALIFIED: Status = Status::Qualified {
+    evidence: &[
+        "perf-certs/rt.union_skip.json: checkpoint P accepts P8192-S 667.0 -> 648.3 ms (floor 3.7), P4096-S 391.0 -> 379.9 (floor 1.2), P8192-0 neutral, 16 serving cells not worse",
+        "review log #92: glue2-t4 served A/B (off/on/off2/on2), C16 TTFT -39.0 / -23.1 ms and TPOT -2.66 / -1.92 ms beyond the P floor at ISL 16384 / 12288; retrieval 18/18 + 21/21 every arm",
+        "docs/flags-reference.md: `=0` is the rollback",
+    ],
 };
 const PROMOTED: Status = Status::Qualified {
     evidence: &["docs/flags-reference.md: a promoted default; `=false` is the rollback"],
@@ -351,7 +355,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.tp_prefill_segment_major", Some("PLOW_TP_PREFILL_SEGMENT_MAJOR"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.prefill_seg_timing", Some("PLOW_PREFILL_SEG_TIMING"), Layer::Runtime, Domain::Bool, OFF, DIAG),
     KnobSpec::new("rt.native_launch_timing", Some("PLOW_NATIVE_LAUNCH_TIMING"), Layer::Runtime, Domain::Bool, OFF, DIAG),
-    KnobSpec::new("rt.union_skip", Some("PLOW_AMD_UNION_SKIP"), Layer::Runtime, Domain::Bool, OFF, UNION_SKIP_CANDIDATE).scoped(UNION_SKIP_SCOPE),
+    KnobSpec::new("rt.union_skip", Some("PLOW_AMD_UNION_SKIP"), Layer::Runtime, Domain::Bool, ON, UNION_SKIP_QUALIFIED).scoped(UNION_SKIP_SCOPE),
     KnobSpec::new("rt.tb_dump", Some("PLOW_TB_DUMP"), Layer::Runtime, Domain::Str, UNSET, DIAG),
     KnobSpec::new("rt.trace_allranks", Some("PLOW_TRACE_ALLRANKS"), Layer::Runtime, Domain::Bool, OFF, DIAG),
     KnobSpec::new("rt.attnres_f32mix_grid", Some("PLOW_ATTNRES_F32MIX_GRID"), Layer::Runtime, U32, UNSET, DIAG),
