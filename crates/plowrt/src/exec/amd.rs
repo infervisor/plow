@@ -5074,6 +5074,7 @@ fn is_tp_collective(op: u16) -> bool {
                 | DevOp::XArgmaxFin
                 | DevOp::XReduceScatter
                 | DevOp::XAllGather
+                | DevOp::XAllToAllHeads
         )
     )
 }

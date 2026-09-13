@@ -2286,6 +2286,13 @@ fn gate_expectations(blob: &DevBlob, n_gpu: u32, n_xctr: u32) -> Vec<Vec<Option<
                     // Both announce with ONE workgroup per rank: their producers are earlier
                     // packets, the gate_rs argument.
                     set(d.i[3], Some(n_gpu));
+                } else if d.op == DevOp::XAllToAllHeads as u16 {
+                    // Row-split sparse attention's cross-GPU head/row transpose
+                    // (interp.hip PLOW_DOP_XALLTOALL_HEADS): one arrival per rank via
+                    // `xr_rendezvous_one_wg`, i[4]=gate. Missing here left gate_expectations
+                    // blind to this op entirely -- every rank's real n_gpu arrivals read as
+                    // "MORE than the program can produce" against a silent default of 0.
+                    set(d.i[4], Some(n_gpu));
                 } else if d.op == DevOp::XArgmaxFin as u16 {
                     set(d.i[3], Some(n_gpu));
                     for line in 0..xargmax_value_lines(d.i[1]) {
@@ -2639,5 +2646,58 @@ mod tests {
         assert_eq!(count_xgates(&blob), 14);
         let e = gate_expectations(&blob, 8, 14);
         assert_eq!(&e[0][11..14], &[Some(8), Some(8), Some(8)]);
+    }
+
+    /// XAllToAllHeads (row-split sparse attention's cross-GPU head/row transpose) carries its
+    /// gate at i[4] (interp.hip: "i4=gate i5=n_gpu"), one arrival per rank via
+    /// `xr_rendezvous_one_wg` -- missing from `gate_expectations` this read as "gate reads
+    /// n_gpu, expected 0" the first time the op actually dispatched (rung P8192-S / P8192-0).
+    /// A dense program (no XAllToAllHeads) must keep every gate at the untouched default.
+    #[test]
+    fn all_to_all_heads_gate_is_accounted() {
+        use crate::asset::devblob::DevProg;
+        use packet::dev::{DevInst64, DevOp};
+        let prog = |insts: Vec<DevInst64>| DevProg {
+            t: 8192,
+            role: packet::devbuild::ProgramRole::DecodeRung { rows: 1 },
+            n_counter: 0,
+            insts,
+            stream: Vec::new(),
+            stream_ofs: Vec::new(),
+            stream_len: Vec::new(),
+            waits: Vec::new(),
+            succs: Vec::new(),
+            gq_stream: Vec::new(),
+            gq_seg_ofs: Vec::new(),
+            l2_domains: 0,
+        };
+        let a2a = DevInst64 {
+            op: DevOp::XAllToAllHeads as u16,
+            i: [64, 8, 512, 64, 5, 0, 0, 1],
+            ..Default::default()
+        };
+        let blob = DevBlob {
+            n_cu: 256,
+            flags: 0,
+            target: 0,
+            tensors: Vec::new(),
+            init: Vec::new(),
+            kvrow: Vec::new(),
+            progs: vec![prog(vec![a2a]), prog(vec![])],
+            sections: Vec::new(),
+            gen: Vec::new(),
+            tp: None,
+            parent: None,
+        };
+        let e = gate_expectations(&blob, 8, 6);
+        assert_eq!(
+            e[0][5],
+            Some(8),
+            "row-split program: gate 5 is XAllToAllHeads's, one arrival per rank"
+        );
+        assert!(
+            e[1].iter().all(|g| *g == Some(0)),
+            "dense program (no XAllToAllHeads): every gate stays at the untouched default"
+        );
     }
 }
