@@ -447,7 +447,8 @@ mod amd_serve {
                     e.prefill_rungs()
                         .any(|(prog, w)| w == width && !e.prefill_prog_sparse(prog))
                 };
-                retarget_dense_tail(&mut chunks, from, min_ctx, sparse, dense);
+                let min_pairs = crate::config::RuntimeConfig::get().amd.tail_sparse_min_pairs;
+                retarget_dense_tail(&mut chunks, from, to, min_ctx, min_pairs, sparse, dense);
             }
             e.chunk_steps_from(&chunks, from, to)
         }
@@ -943,11 +944,16 @@ mod amd_serve {
     /// cost is set by the selection width. Measured on GLM-5.3 TP8 at 65k prior rows: a 464-row
     /// tail in the dense 512 bucket = 1.9 s of GPU time, twice a full sparse 8192 chunk. So a
     /// dense tail whose prior context is at least `min_ctx` moves to the sparse bucket; the
-    /// chunk keeps its real row count. Returns whether the tail moved.
+    /// chunk keeps its real row count. With `min_pairs` the tail also needs `prior x rows` of at
+    /// least that: below it the sparse bucket's fixed cost exceeds the dense attention it saves
+    /// (GLM-5.3 TP8, `pfroute-t3-tail`: crossover near 1.3M pairs at prior 2112-6208). `to` is
+    /// the span end. Returns whether the tail moved.
     pub(crate) fn retarget_dense_tail(
         chunks: &mut [u32],
         from: u32,
+        to: u32,
         min_ctx: u32,
+        min_pairs: Option<u32>,
         sparse_bucket: Option<u32>,
         dense: impl Fn(u32) -> bool,
     ) -> bool {
@@ -959,6 +965,9 @@ mod amd_serve {
         };
         let prior = head.iter().fold(from, |acc, &c| acc.saturating_add(c));
         if prior < min_ctx || *tail >= sparse || !dense(*tail) {
+            return false;
+        }
+        if min_pairs.is_some_and(|p| u64::from(prior) * u64::from(to.saturating_sub(prior)) < u64::from(p)) {
             return false;
         }
         *tail = sparse;
@@ -3497,7 +3506,7 @@ mod amd_serve {
             let mut chunks = crate::exec::amd::plan_chunks_capped(&buckets, to - from, 8192)?;
             if let Some(min_ctx) = floor {
                 let dense = |w: u32| LADDER.iter().any(|l| l.1 == w && !l.2);
-                super::retarget_dense_tail(&mut chunks, from, min_ctx, Some(8192), dense);
+                super::retarget_dense_tail(&mut chunks, from, to, min_ctx, None, Some(8192), dense);
             }
             crate::exec::amd::chunk_steps_over(
                 |w| LADDER.iter().find(|l| l.1 == w).map(|l| l.0),
@@ -3589,28 +3598,51 @@ mod amd_serve {
         }
 
         #[test]
+        fn dense_tail_pair_floor_keeps_small_shallow_tails_dense() {
+            let dense = |b: u32| b < 8192;
+            let pairs = Some(1_500_000);
+            for (from, bucket, rows, moved) in [
+                (2112, 512, 512, false),
+                (2112, 2048, 2048, true),
+                (4160, 128, 128, false),
+                (4160, 512, 512, true),
+                (6208, 128, 128, false),
+                (60_000, 512, 271, true),
+            ] {
+                let mut plan = vec![bucket];
+                let r = super::retarget_dense_tail(&mut plan, from, from + rows, 2048, pairs, Some(8192), dense);
+                assert_eq!((r, plan[0]), (moved, if moved { 8192 } else { bucket }), "prior {from} rows {rows}");
+            }
+            let mut plan = vec![8192, 512];
+            assert!(!super::retarget_dense_tail(&mut plan, 0, 8192 + 128, 2048, pairs, Some(8192), dense));
+            assert!(super::retarget_dense_tail(&mut plan, 0, 8192 + 200, 2048, pairs, Some(8192), dense));
+            let mut plan = vec![512];
+            assert!(super::retarget_dense_tail(&mut plan, 2112, 2624, 2048, None, Some(8192), dense));
+        }
+
+        #[test]
         fn dense_tail_moves_to_the_sparse_bucket_only_past_the_context_floor() {
             let dense = |b: u32| b < 8192;
             // 70k prompt from row 0: 8 full chunks, 4464-row tail — already sparse, untouched.
             let mut plan = vec![8192; 8];
             plan.push(8192);
-            assert!(!super::retarget_dense_tail(&mut plan, 0, 16384, Some(8192), dense));
+            assert!(!super::retarget_dense_tail(&mut plan, 0, u32::MAX, 16384, None, Some(8192), dense));
             // 464-row tail behind 65k of prior rows: dense 512 → sparse 8192.
             let mut plan = vec![8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192, 512];
-            assert!(super::retarget_dense_tail(&mut plan, 0, 16384, Some(8192), dense));
+            assert!(super::retarget_dense_tail(&mut plan, 0, u32::MAX, 16384, None, Some(8192), dense));
             assert_eq!(plan.last(), Some(&8192));
             // A prefix-cache resume counts as prior context.
             let mut plan = vec![512];
-            assert!(super::retarget_dense_tail(&mut plan, 60_000, 16384, Some(8192), dense));
+            assert!(super::retarget_dense_tail(&mut plan, 60_000, u32::MAX, 16384, None, Some(8192), dense));
             assert_eq!(plan, [8192]);
             // Below the floor the smallest bucket stays.
             let mut plan = vec![2048, 512];
-            assert!(!super::retarget_dense_tail(&mut plan, 0, 16384, Some(8192), dense));
+            assert!(!super::retarget_dense_tail(&mut plan, 0, u32::MAX, 16384, None, Some(8192), dense));
             assert_eq!(plan, [2048, 512]);
             // No sparse bucket compiled, or a cap that excludes it: nothing moves.
             let mut plan = vec![512];
-            assert!(!super::retarget_dense_tail(&mut plan, 60_000, 16384, None, dense));
-            assert!(!super::retarget_dense_tail(&mut [], 60_000, 16384, Some(8192), dense));
+            assert!(!super::retarget_dense_tail(&mut plan, 60_000, u32::MAX, 16384, None, None, dense));
+            assert!(!super::retarget_dense_tail(&mut [], 60_000, u32::MAX, 16384, None, Some(8192), dense));
         }
 
         #[test]

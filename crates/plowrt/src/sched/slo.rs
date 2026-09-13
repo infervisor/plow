@@ -50,6 +50,7 @@ impl Targets {
 pub struct Ladder {
     pub rungs: Vec<(u32, bool)>,
     pub tail_sparse_ctx: Option<u32>,
+    pub tail_sparse_min_pairs: Option<u32>,
 }
 
 impl Ladder {
@@ -65,7 +66,15 @@ impl Ladder {
             .map(|&(w, _)| w)
             .max();
         match (self.tail_sparse_ctx, wider_sparse) {
-            (Some(floor), Some(sparse_w)) if !sparse && prior >= floor => Some(sparse_w),
+            (Some(floor), Some(sparse_w))
+                if !sparse
+                    && prior >= floor
+                    && self
+                        .tail_sparse_min_pairs
+                        .is_none_or(|p| u64::from(prior) * u64::from(rows) >= u64::from(p)) =>
+            {
+                Some(sparse_w)
+            }
             _ => Some(width),
         }
     }
@@ -670,6 +679,7 @@ mod tests {
         Ladder {
             rungs: vec![(128, false), (512, false), (2048, false), (8192, true)],
             tail_sparse_ctx: Some(16384),
+            tail_sparse_min_pairs: None,
         }
     }
 
@@ -724,6 +734,10 @@ mod tests {
         assert_eq!(l.bucket_for(9000, 0), None);
         let off = Ladder { tail_sparse_ctx: None, ..ladder() };
         assert_eq!(off.bucket_for(1500, 65536), Some(2048));
+        let pairs = Ladder { tail_sparse_ctx: Some(2048), tail_sparse_min_pairs: Some(1_500_000), ..ladder() };
+        assert_eq!(pairs.bucket_for(512, 2112), Some(512));
+        assert_eq!(pairs.bucket_for(512, 4160), Some(8192));
+        assert_eq!(pairs.bucket_for(100, 6208), Some(128));
     }
 
     /// 500 ms target, 110 ms decode: 390 ms of prefill = 150 + 0.09 n, so n = 2666 -> the

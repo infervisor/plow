@@ -1041,6 +1041,11 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-tail-sparse-ctx", env = "PLOW_AMD_TAIL_SPARSE_CTX", global = true)]
     pub tail_sparse_ctx: Option<u32>,
 
+    /// With the tail-sparse floor: the dense final chunk moves only when `prior x tail rows` (the
+    /// query-key pairs its dense attention scores) reaches this many; unset = no pair floor.
+    #[arg(long = "amd-tail-sparse-min-pairs", env = "PLOW_AMD_TAIL_SPARSE_MIN_PAIRS", global = true)]
+    pub tail_sparse_min_pairs: Option<u32>,
+
     /// Unified token batch: keep the WIDE dense-GEMM rungs plowc chose per shape.
     ///
     /// The token-batch object is the mixed object's shape, and at four waves the fused-GLU

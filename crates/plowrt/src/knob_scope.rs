@@ -377,6 +377,7 @@ pub fn pairs(base: &Packet, variant: &Packet) -> Result<Vec<Value>, String> {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RouteKnobs {
     pub tail_sparse_ctx: Option<u32>,
+    pub tail_sparse_min_pairs: Option<u32>,
     pub decode_min_rung: Option<u32>,
     pub union_skip: bool,
 }
@@ -394,6 +395,7 @@ impl RouteKnobs {
         };
         match id {
             "rt.tail_sparse_ctx" => self.tail_sparse_ctx = num()?,
+            "rt.tail_sparse_min_pairs" => self.tail_sparse_min_pairs = num()?,
             "rt.decode_min_rung" => self.decode_min_rung = num()?,
             "rt.union_skip" => self.union_skip = matches!(value, "1" | "true"),
             _ => return Err(format!("no route model for {id}")),
@@ -458,7 +460,15 @@ pub fn route(p: &Packet, w: &Workload, knobs: RouteKnobs) -> Result<Vec<Step>, S
         if let Some(min_ctx) = knobs.tail_sparse_ctx {
             let sparse = prefill.values().filter(|k| k.sparse).map(|k| k.rows).max();
             let dense = |w: u32| prefill.get(&w).is_some_and(|k| !k.sparse);
-            crate::serve::engine::retarget_dense_tail(&mut chunks, s.from, min_ctx, sparse, dense);
+            crate::serve::engine::retarget_dense_tail(
+                &mut chunks,
+                s.from,
+                s.to,
+                min_ctx,
+                knobs.tail_sparse_min_pairs,
+                sparse,
+                dense,
+            );
         }
         let mut c0 = s.from;
         for (i, ch) in chunks.iter().enumerate() {

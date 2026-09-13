@@ -47,6 +47,7 @@ pub const KNOBS: &[KnobSpec] = &[
     KnobSpec::new("rt.union_skip", Some("PLOW_AMD_UNION_SKIP"), Layer::Runtime, Domain::Bool, Default::Static(Val::Bool(true)), Status::Qualified { evidence: &["perf-certs/rt.union_skip.json: checkpoint P accepts P8192-S 667.0 -> 648.3 ms (floor 3.7), P4096-S 391.0 -> 379.9 (floor 1.2), P8192-0 neutral, 16 serving cells not worse", "review log #92: glue2-t4 served A/B (off/on/off2/on2), C16 TTFT -39.0 / -23.1 ms and TPOT -2.66 / -1.92 ms beyond the P floor at ISL 16384 / 12288; retrieval 18/18 + 21/21 every arm", "docs/flags-reference.md: `=0` is the rollback"] }).scoped(&[Allow { kinds: &["prefill"], rows: (0, 4294967295), topology: None, sparse: Some(true), model: None, ops: OpSel::Any, fields: &[ScopeField::Route], facts: &[] }]),
     KnobSpec::new("rt.decode_min_rung", Some("PLOW_AMD_DECODE_MIN_RUNG"), Layer::Runtime, Domain::Nat { min: 0, max: 4294967295 }, Default::Static(Val::Unset), Status::OptIn).scoped(&[Allow { kinds: &["decode"], rows: (0, 4294967295), topology: None, sparse: None, model: None, ops: OpSel::Any, fields: &[ScopeField::Route], facts: &[] }]),
     KnobSpec::new("rt.tail_sparse_ctx", Some("PLOW_AMD_TAIL_SPARSE_CTX"), Layer::Runtime, Domain::Nat { min: 0, max: 4294967295 }, Default::Static(Val::Unset), Status::OptIn).scoped(&[Allow { kinds: &["prefill"], rows: (0, 4294967295), topology: None, sparse: None, model: None, ops: OpSel::Any, fields: &[ScopeField::Route], facts: &[] }]),
+    KnobSpec::new("rt.tail_sparse_min_pairs", Some("PLOW_AMD_TAIL_SPARSE_MIN_PAIRS"), Layer::Runtime, Domain::Nat { min: 0, max: 4294967295 }, Default::Static(Val::Unset), Status::OptIn).scoped(&[Allow { kinds: &["prefill"], rows: (0, 4294967295), topology: None, sparse: None, model: None, ops: OpSel::Any, fields: &[ScopeField::Route], facts: &[] }]),
     KnobSpec::new("rt.mla_pf_v2", Some("PLOW_MLA_PF_V2"), Layer::Runtime, Domain::Bool, Default::Static(Val::Bool(true)), Status::Qualified { evidence: &["docs/flags-reference.md: a promoted default; `=false` is the rollback"] }),
     KnobSpec::new("rt.serial", Some("PLOW_METAL_SERIAL"), Layer::Runtime, Domain::Bool, Default::Static(Val::Bool(false)), Status::OptIn),
     KnobSpec::new("rt.ane_mlp", Some("PLOW_ANE_MLP"), Layer::Runtime, Domain::Bool, Default::Static(Val::Bool(false)), Status::OptIn),
@@ -94,9 +95,9 @@ pub fn holds(i: usize, v: &[Val<'_>], t: &Target) -> bool {
         8 => !cmp(Cmp::Ne, v[34], Val::Unset) || (TargetAtom::Arch("metal3").eval(t) && TargetAtom::Tp(1).eval(t) && (TargetAtom::Model("llama").eval(t) || TargetAtom::Model("qwen3").eval(t))),
         9 => !cmp(Cmp::Ne, v[34], Val::Unset) || (cmp(Cmp::Eq, v[33], Val::Unset) && !cmp(Cmp::Eq, v[1], Val::Bool(true)) && !cmp(Cmp::Eq, v[6], Val::Bool(true)) && cmp(Cmp::Eq, v[35], Val::Unset)),
         10 => !cmp(Cmp::Ne, v[39], Val::Unset) || (cmp(Cmp::Ne, v[38], Val::Unset) || TargetAtom::Cap("bundled_segment_pair").eval(t)),
-        11 => !cmp(Cmp::Eq, v[37], Val::Str("1")) || cmp(Cmp::Eq, v[43], Val::Bool(true)),
-        12 => !cmp(Cmp::Eq, v[36], Val::Str("1")) || cmp(Cmp::Eq, v[43], Val::Bool(true)),
-        13 => !cmp(Cmp::Eq, v[45], Val::Bool(true)) || (!cmp(Cmp::Eq, v[44], Val::Bool(true)) && cmp(Cmp::Eq, v[33], Val::Unset)),
+        11 => !cmp(Cmp::Eq, v[37], Val::Str("1")) || cmp(Cmp::Eq, v[44], Val::Bool(true)),
+        12 => !cmp(Cmp::Eq, v[36], Val::Str("1")) || cmp(Cmp::Eq, v[44], Val::Bool(true)),
+        13 => !cmp(Cmp::Eq, v[46], Val::Bool(true)) || (!cmp(Cmp::Eq, v[45], Val::Bool(true)) && cmp(Cmp::Eq, v[33], Val::Unset)),
         _ => true,
     }
 }

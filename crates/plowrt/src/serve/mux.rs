@@ -3451,6 +3451,7 @@ fn amd_slo_plan(
     let ladder = state.ladder.take().unwrap_or_else(|| Ladder {
         rungs: e.prefill_ladder(),
         tail_sparse_ctx: crate::config::RuntimeConfig::get().amd_tail_sparse_ctx(),
+        tail_sparse_min_pairs: crate::config::RuntimeConfig::get().amd.tail_sparse_min_pairs,
     });
     let candidates: Vec<SloCandidate> = (0..tick.slots)
         .filter_map(|i| {
