@@ -16,6 +16,7 @@
 //! | F  | Memory        | wired (shares D's verifier) |
 //! | K  | Knobs         | wired (emit, default on)    |
 //! | S  | Knob scope    | wired (`plowrt knob-scope`) |
+//! | P  | Perf floor    | wired (`scripts/perf_cert.py`, CI) |
 //!
 //! Additionally, the `query` interface allows the compiler to ask Lean for
 //! provably-optimal decisions (counter granularity, lower bounds, ordering

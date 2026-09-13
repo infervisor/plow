@@ -1,0 +1,1978 @@
+{
+ "note": "checkpoint P history replay (plans/lean-knob-verification.md \u00a75.4); built from the measuring jobs' outputs. Stats-only entries are what those harnesses kept.",
+ "cases": [
+  {
+   "name": "PLOW_AMD_UNION_SKIP=1 (G1)",
+   "expect": "accept",
+   "source": "review log #85",
+   "request": {
+    "ledger": [
+     {
+      "id": "glue2-t3-g1-rung:P8192-S:ctrl",
+      "date": "2026-09-13",
+      "job": "glue2-t3-g1-rung",
+      "harness": "proto",
+      "hardware": {
+       "box": "8xMI300X",
+       "rocm": "7.14",
+       "driver": null,
+       "firmware": null
+      },
+      "rung": {
+       "digest": "glm53-tp8/prog3/T8192/rows8192/prior65536",
+       "role": "prefill",
+       "rows": 8192,
+       "prior": 65536,
+       "topology": "ordinary"
+      },
+      "recipe_digest": "8b15f4a28b289a72",
+      "knob_delta": {},
+      "metric": "chunk_ms",
+      "better": "lower",
+      "stats": {
+       "n": 5,
+       "median": 667.186,
+       "mad": 1.1769999999999072,
+       "p95": 1136.8600000000001
+      },
+      "samples": [
+       664.7349999999999,
+       667.186,
+       666.7539999999999,
+       668.3629999999999,
+       1136.8600000000001
+      ]
+     },
+     {
+      "id": "glue2-t3-g1-rung:P8192-S:ctrl2",
+      "date": "2026-09-13",
+      "job": "glue2-t3-g1-rung",
+      "harness": "proto",
+      "hardware": {
+       "box": "8xMI300X",
+       "rocm": "7.14",
+       "driver": null,
+       "firmware": null
+      },
+      "rung": {
+       "digest": "glm53-tp8/prog3/T8192/rows8192/prior65536",
+       "role": "prefill",
+       "rows": 8192,
+       "prior": 65536,
+       "topology": "ordinary"
+      },
+      "recipe_digest": "8b15f4a28b289a72",
+      "knob_delta": {},
+      "metric": "chunk_ms",
+      "better": "lower",
+      "stats": {
+       "n": 5,
+       "median": 666.822,
+       "mad": 1.6580000000000155,
+       "p95": 668.715
+      },
+      "samples": [
+       665.164,
+       665.4630000000001,
+       666.822,
+       668.6750000000001,
+       668.715
+      ]
+     },
+     {
+      "id": "glue2-t3-g1-rung:P8192-S:g1",
+      "date": "2026-09-13",
+      "job": "glue2-t3-g1-rung",
+      "harness": "proto",
+      "hardware": {
+       "box": "8xMI300X",
+       "rocm": "7.14",
+       "driver": null,
+       "firmware": null
+      },
+      "rung": {
+       "digest": "glm53-tp8/prog3/T8192/rows8192/prior65536",
+       "role": "prefill",
+       "rows": 8192,
+       "prior": 65536,
+       "topology": "ordinary"
+      },
+      "recipe_digest": "8b15f4a28b289a72",
+      "knob_delta": {
+       "runtime": "glue2 G1 IndexUnionPf skip (plowrt bd7a1375)"
+      },
+      "metric": "chunk_ms",
+      "better": "lower",
+      "stats": {
+       "n": 5,
+       "median": 648.313,
+       "mad": 1.2859999999999445,
+       "p95": 650.79
+      },
+      "samples": [
+       645.127,
+       647.027,
+       648.313,
+       649.149,
+       650.79
+      ],
+      "control_of": "glue2-t3-g1-rung:P8192-S:ctrl",
+      "repeat_control_of": "glue2-t3-g1-rung:P8192-S:ctrl2"
+     },
+     {
+      "id": "glue2-t3-g1-rung:P4096-S:ctrl",
+      "date": "2026-09-13",
+      "job": "glue2-t3-g1-rung",
+      "harness": "proto",
+      "hardware": {
+       "box": "8xMI300X",
+       "rocm": "7.14",
+       "driver": null,
+       "firmware": null
+      },
+      "rung": {
+       "digest": "glm53-tp8/prog3/T8192/rows4096/prior65536",
+       "role": "prefill",
+       "rows": 4096,
+       "prior": 65536,
+       "topology": "ordinary"
+      },
+      "recipe_digest": "8b15f4a28b289a72",
+      "knob_delta": {},
+      "metric": "chunk_ms",
+      "better": "lower",
+      "stats": {
+       "n": 5,
+       "median": 391.107,
+       "mad": 0.4490000000000123,
+       "p95": 391.605
+      },
+      "samples": [
+       389.491,
+       391.107,
+       391.55600000000004,
+       391.605,
+       390.674
+      ]
+     },
+     {
+      "id": "glue2-t3-g1-rung:P4096-S:ctrl2",
+      "date": "2026-09-13",
+      "job": "glue2-t3-g1-rung",
+      "harness": "proto",
+      "hardware": {
+       "box": "8xMI300X",
+       "rocm": "7.14",
+       "driver": null,
+       "firmware": null
+      },
+      "rung": {
+       "digest": "glm53-tp8/prog3/T8192/rows4096/prior65536",
+       "role": "prefill",
+       "rows": 4096,
+       "prior": 65536,
+       "topology": "ordinary"
+      },
+      "recipe_digest": "8b15f4a28b289a72",
+      "knob_delta": {},
+      "metric": "chunk_ms",
+      "better": "lower",
+      "stats": {
+       "n": 5,
+       "median": 390.825,
+       "mad": 0.15200000000004366,
+       "p95": 391.459
+      },
+      "samples": [
+       390.19199999999995,
+       390.97700000000003,
+       390.825,
+       390.746,
+       391.459
+      ]
+     },
+     {
+      "id": "glue2-t3-g1-rung:P4096-S:g1",
+      "date": "2026-09-13",
+      "job": "glue2-t3-g1-rung",
+      "harness": "proto",
+      "hardware": {
+       "box": "8xMI300X",
+       "rocm": "7.14",
+       "driver": null,
+       "firmware": null
+      },
+      "rung": {
+       "digest": "glm53-tp8/prog3/T8192/rows4096/prior65536",
+       "role": "prefill",
+       "rows": 4096,
+       "prior": 65536,
+       "topology": "ordinary"
+      },
+      "recipe_digest": "8b15f4a28b289a72",
+      "knob_delta": {
+       "runtime": "glue2 G1 IndexUnionPf skip (plowrt bd7a1375)"
+      },
+      "metric": "chunk_ms",
+      "better": "lower",
+      "stats": {
+       "n": 5,
+       "median": 379.911,
+       "mad": 0.38800000000003365,
+       "p95": 380.29900000000004
+      },
+      "samples": [
+       379.15099999999995,
+       380.13100000000003,
+       379.522,
+       380.29900000000004,
+       379.911
+      ],
+      "control_of": "glue2-t3-g1-rung:P4096-S:ctrl",
+      "repeat_control_of": "glue2-t3-g1-rung:P4096-S:ctrl2"
+     },
+     {
+      "id": "glue2-t3-g1-rung:P8192-0:ctrl",
+      "date": "2026-09-13",
+      "job": "glue2-t3-g1-rung",
+      "harness": "proto",
+      "hardware": {
+       "box": "8xMI300X",
+       "rocm": "7.14",
+       "driver": null,
+       "firmware": null
+      },
+      "rung": {
+       "digest": "glm53-tp8/prog3/T8192/rows8192/prior0",
+       "role": "prefill",
+       "rows": 8192,
+       "prior": 0,
+       "topology": "ordinary"
+      },
+      "recipe_digest": "8b15f4a28b289a72",
+      "knob_delta": {},
+      "metric": "chunk_ms",
+      "better": "lower",
+      "stats": {
+       "n": 15,
+       "median": 733.506,
+       "mad": 3.594000000000051,
+       "p95": 738.403
+      },
+      "samples": [
+       721.534,
+       721.892,
+       728.742,
+       727.0060000000001,
+       729.49,
+       731.351,
+       733.8530000000001,
+       731.166,
+       733.506,
+       736.024,
+       735.492,
+       738.403,
+       734.0790000000001,
+       737.1,
+       738.6
+      ]
+     },
+     {
+      "id": "glue2-t3-g1-rung:P8192-0:ctrl2",
+      "date": "2026-09-13",
+      "job": "glue2-t3-g1-rung",
+      "harness": "proto",
+      "hardware": {
+       "box": "8xMI300X",
+       "rocm": "7.14",
+       "driver": null,
+       "firmware": null
+      },
+      "rung": {
+       "digest": "glm53-tp8/prog3/T8192/rows8192/prior0",
+       "role": "prefill",
+       "rows": 8192,
+       "prior": 0,
+       "topology": "ordinary"
+      },
+      "recipe_digest": "8b15f4a28b289a72",
+      "knob_delta": {},
+      "metric": "chunk_ms",
+      "better": "lower",
+      "stats": {
+       "n": 15,
+       "median": 733.215,
+       "mad": 2.4010000000000673,
+       "p95": 735.6160000000001
+      },
+      "samples": [
+       721.396,
+       721.457,
+       724.727,
+       727.458,
+       728.9929999999999,
+       730.8399999999999,
+       733.215,
+       733.5699999999999,
+       730.359,
+       735.6160000000001,
+       734.194,
+       736.34,
+       735.143,
+       734.664,
+       734.174
+      ]
+     },
+     {
+      "id": "glue2-t3-g1-rung:P8192-0:g1",
+      "date": "2026-09-13",
+      "job": "glue2-t3-g1-rung",
+      "harness": "proto",
+      "hardware": {
+       "box": "8xMI300X",
+       "rocm": "7.14",
+       "driver": null,
+       "firmware": null
+      },
+      "rung": {
+       "digest": "glm53-tp8/prog3/T8192/rows8192/prior0",
+       "role": "prefill",
+       "rows": 8192,
+       "prior": 0,
+       "topology": "ordinary"
+      },
+      "recipe_digest": "8b15f4a28b289a72",
+      "knob_delta": {
+       "runtime": "glue2 G1 IndexUnionPf skip (plowrt bd7a1375)"
+      },
+      "metric": "chunk_ms",
+      "better": "lower",
+      "stats": {
+       "n": 15,
+       "median": 732.5540000000001,
+       "mad": 2.1919999999998936,
+       "p95": 735.566
+      },
+      "samples": [
+       721.997,
+       722.7639999999999,
+       724.265,
+       725.923,
+       730.486,
+       731.361,
+       732.0609999999999,
+       732.587,
+       739.936,
+       733.52,
+       732.7460000000001,
+       734.746,
+       735.566,
+       732.5540000000001,
+       734.764
+      ],
+      "control_of": "glue2-t3-g1-rung:P8192-0:ctrl",
+      "repeat_control_of": "glue2-t3-g1-rung:P8192-0:ctrl2"
+     }
+    ],
+    "touched": [
+     {
+      "rung": "glm53-tp8/prog3/T8192/rows8192/prior65536",
+      "treat": "glue2-t3-g1-rung:P8192-S:g1"
+     },
+     {
+      "rung": "glm53-tp8/prog3/T8192/rows4096/prior65536",
+      "treat": "glue2-t3-g1-rung:P4096-S:g1"
+     },
+     {
+      "rung": "glm53-tp8/prog3/T8192/rows8192/prior0",
+      "treat": "glue2-t3-g1-rung:P8192-0:g1",
+      "neutral_evidence": [
+       "review log #85: at prior 0 no union is skippable, so the rung is unchanged by design"
+      ]
+     }
+    ],
+    "untouched": [
+     {
+      "rung": "packet",
+      "base": "8b15f4a28b289a72",
+      "variant": "8b15f4a28b289a72"
+     }
+    ],
+    "tier4": false,
+    "numeric": false,
+    "facts": []
+   }
+  },
+  {
+   "name": "PLOW_GLM_MOE_SHARED_SEED=1 (G4)",
+   "expect": "accept",
+   "source": "review log #86",
+   "request": {
+    "ledger": [
+     {
+      "id": "glue2-t3-g4-rung:P8192-S:off",
+      "date": "2026-09-13",
+      "job": "glue2-t3-g4-rung",
+      "harness": "proto",
+      "hardware": {
+       "box": "8xMI300X",
+       "rocm": "7.14",
+       "driver": null,
+       "firmware": null
+      },
+      "rung": {
+       "digest": "glm53-tp8/prog3/T8192/rows8192/prior65536",
+       "role": "prefill",
+       "rows": 8192,
+       "prior": 65536,
+       "topology": "ordinary"
+      },
+      "recipe_digest": "8b15f4a28b289a72",
+      "knob_delta": {},
+      "metric": "chunk_ms",
+      "better": "lower",
+      "stats": {
+       "n": 5,
+       "median": 648.521,
+       "mad": 0.8019999999999072,
+       "p95": 650.216
+      },
+      "samples": [
+       643.906,
+       647.719,
+       648.521,
+       648.5350000000001,
+       650.216
+      ]
+     },
+     {
+      "id": "glue2-t3-g4-rung:P8192-S:off2",
+      "date": "2026-09-13",
+      "job": "glue2-t3-g4-rung",
+      "harness": "proto",
+      "hardware": {
+       "box": "8xMI300X",
+       "rocm": "7.14",
+       "driver": null,
+       "firmware": null
+      },
+      "rung": {
+       "digest": "glm53-tp8/prog3/T8192/rows8192/prior65536",
+       "role": "prefill",
+       "rows": 8192,
+       "prior": 65536,
+       "topology": "ordinary"
+      },
+      "recipe_digest": "8b15f4a28b289a72",
+      "knob_delta": {},
+      "metric": "chunk_ms",
+      "better": "lower",
+      "stats": {
+       "n": 5,
+       "median": 648.832,
+       "mad": 0.9950000000000045,
+       "p95": 650.312
+      },
+      "samples": [
+       644.804,
+       647.837,
+       648.9989999999999,
+       648.832,
+       650.312
+      ]
+     },
+     {
+      "id": "glue2-t3-g4-rung:P8192-S:g4",
+      "date": "2026-09-13",
+      "job": "glue2-t3-g4-rung",
+      "harness": "proto",
+      "hardware": {
+       "box": "8xMI300X",
+       "rocm": "7.14",
+       "driver": null,
+       "firmware": null
+      },
+      "rung": {
+       "digest": "glm53-tp8/prog3/T8192/rows8192/prior65536",
+       "role": "prefill",
+       "rows": 8192,
+       "prior": 65536,
+       "topology": "ordinary"
+      },
+      "recipe_digest": "c2aeb0022e7a4030",
+      "knob_delta": {
+       "PLOW_GLM_MOE_SHARED_SEED": "true"
+      },
+      "metric": "chunk_ms",
+      "better": "lower",
+      "stats": {
+       "n": 5,
+       "median": 641.386,
+       "mad": 1.7150000000000318,
+       "p95": 643.152
+      },
+      "samples": [
+       639.258,
+       641.386,
+       640.134,
+       643.101,
+       643.152
+      ],
+      "control_of": "glue2-t3-g4-rung:P8192-S:off",
+      "repeat_control_of": "glue2-t3-g4-rung:P8192-S:off2"
+     },
+     {
+      "id": "glue2-t3-g4-rung:P4096-S:off",
+      "date": "2026-09-13",
+      "job": "glue2-t3-g4-rung",
+      "harness": "proto",
+      "hardware": {
+       "box": "8xMI300X",
+       "rocm": "7.14",
+       "driver": null,
+       "firmware": null
+      },
+      "rung": {
+       "digest": "glm53-tp8/prog3/T8192/rows4096/prior65536",
+       "role": "prefill",
+       "rows": 4096,
+       "prior": 65536,
+       "topology": "ordinary"
+      },
+      "recipe_digest": "8b15f4a28b289a72",
+      "knob_delta": {},
+      "metric": "chunk_ms",
+      "better": "lower",
+      "stats": {
+       "n": 5,
+       "median": 380.389,
+       "mad": 0.2740000000000009,
+       "p95": 380.663
+      },
+      "samples": [
+       379.082,
+       380.389,
+       380.55100000000004,
+       380.663,
+       379.77299999999997
+      ]
+     },
+     {
+      "id": "glue2-t3-g4-rung:P4096-S:off2",
+      "date": "2026-09-13",
+      "job": "glue2-t3-g4-rung",
+      "harness": "proto",
+      "hardware": {
+       "box": "8xMI300X",
+       "rocm": "7.14",
+       "driver": null,
+       "firmware": null
+      },
+      "rung": {
+       "digest": "glm53-tp8/prog3/T8192/rows4096/prior65536",
+       "role": "prefill",
+       "rows": 4096,
+       "prior": 65536,
+       "topology": "ordinary"
+      },
+      "recipe_digest": "8b15f4a28b289a72",
+      "knob_delta": {},
+      "metric": "chunk_ms",
+      "better": "lower",
+      "stats": {
+       "n": 5,
+       "median": 379.014,
+       "mad": 0.3709999999999809,
+       "p95": 380.234
+      },
+      "samples": [
+       378.64300000000003,
+       378.924,
+       379.614,
+       379.014,
+       380.234
+      ]
+     },
+     {
+      "id": "glue2-t3-g4-rung:P4096-S:g4",
+      "date": "2026-09-13",
+      "job": "glue2-t3-g4-rung",
+      "harness": "proto",
+      "hardware": {
+       "box": "8xMI300X",
+       "rocm": "7.14",
+       "driver": null,
+       "firmware": null
+      },
+      "rung": {
+       "digest": "glm53-tp8/prog3/T8192/rows4096/prior65536",
+       "role": "prefill",
+       "rows": 4096,
+       "prior": 65536,
+       "topology": "ordinary"
+      },
+      "recipe_digest": "c2aeb0022e7a4030",
+      "knob_delta": {
+       "PLOW_GLM_MOE_SHARED_SEED": "true"
+      },
+      "metric": "chunk_ms",
+      "better": "lower",
+      "stats": {
+       "n": 5,
+       "median": 376.442,
+       "mad": 0.24500000000000455,
+       "p95": 376.687
+      },
+      "samples": [
+       375.624,
+       376.442,
+       375.34499999999997,
+       376.659,
+       376.687
+      ],
+      "control_of": "glue2-t3-g4-rung:P4096-S:off",
+      "repeat_control_of": "glue2-t3-g4-rung:P4096-S:off2"
+     },
+     {
+      "id": "glue2-t3-g4-rung:P8192-0:off",
+      "date": "2026-09-13",
+      "job": "glue2-t3-g4-rung",
+      "harness": "proto",
+      "hardware": {
+       "box": "8xMI300X",
+       "rocm": "7.14",
+       "driver": null,
+       "firmware": null
+      },
+      "rung": {
+       "digest": "glm53-tp8/prog3/T8192/rows8192/prior0",
+       "role": "prefill",
+       "rows": 8192,
+       "prior": 0,
+       "topology": "ordinary"
+      },
+      "recipe_digest": "8b15f4a28b289a72",
+      "knob_delta": {},
+      "metric": "chunk_ms",
+      "better": "lower",
+      "stats": {
+       "n": 15,
+       "median": 731.732,
+       "mad": 3.5930000000000746,
+       "p95": 1069.4669999999999
+      },
+      "samples": [
+       721.21,
+       723.008,
+       725.385,
+       724.408,
+       728.957,
+       727.635,
+       1296.485,
+       731.557,
+       733.0590000000001,
+       735.325,
+       734.645,
+       731.732,
+       734.0690000000001,
+       1069.4669999999999,
+       732.5310000000001
+      ]
+     },
+     {
+      "id": "glue2-t3-g4-rung:P8192-0:off2",
+      "date": "2026-09-13",
+      "job": "glue2-t3-g4-rung",
+      "harness": "proto",
+      "hardware": {
+       "box": "8xMI300X",
+       "rocm": "7.14",
+       "driver": null,
+       "firmware": null
+      },
+      "rung": {
+       "digest": "glm53-tp8/prog3/T8192/rows8192/prior0",
+       "role": "prefill",
+       "rows": 8192,
+       "prior": 0,
+       "topology": "ordinary"
+      },
+      "recipe_digest": "8b15f4a28b289a72",
+      "knob_delta": {},
+      "metric": "chunk_ms",
+      "better": "lower",
+      "stats": {
+       "n": 15,
+       "median": 731.966,
+       "mad": 2.4879999999999427,
+       "p95": 734.565
+      },
+      "samples": [
+       721.042,
+       729.26,
+       725.408,
+       728.041,
+       727.3389999999999,
+       731.674,
+       731.966,
+       730.908,
+       734.454,
+       734.101,
+       733.3729999999999,
+       734.565,
+       738.316,
+       733.627,
+       733.514
+      ]
+     },
+     {
+      "id": "glue2-t3-g4-rung:P8192-0:g4",
+      "date": "2026-09-13",
+      "job": "glue2-t3-g4-rung",
+      "harness": "proto",
+      "hardware": {
+       "box": "8xMI300X",
+       "rocm": "7.14",
+       "driver": null,
+       "firmware": null
+      },
+      "rung": {
+       "digest": "glm53-tp8/prog3/T8192/rows8192/prior0",
+       "role": "prefill",
+       "rows": 8192,
+       "prior": 0,
+       "topology": "ordinary"
+      },
+      "recipe_digest": "c2aeb0022e7a4030",
+      "knob_delta": {
+       "PLOW_GLM_MOE_SHARED_SEED": "true"
+      },
+      "metric": "chunk_ms",
+      "better": "lower",
+      "stats": {
+       "n": 15,
+       "median": 723.238,
+       "mad": 3.5179999999999154,
+       "p95": 727.196
+      },
+      "samples": [
+       713.333,
+       714.121,
+       715.818,
+       716.964,
+       719.232,
+       723.238,
+       720.157,
+       727.34,
+       727.196,
+       724.37,
+       722.983,
+       725.597,
+       725.158,
+       723.905,
+       726.756
+      ],
+      "control_of": "glue2-t3-g4-rung:P8192-0:off",
+      "repeat_control_of": "glue2-t3-g4-rung:P8192-0:off2"
+     }
+    ],
+    "touched": [
+     {
+      "rung": "glm53-tp8/prog3/T8192/rows8192/prior65536",
+      "treat": "glue2-t3-g4-rung:P8192-S:g4"
+     },
+     {
+      "rung": "glm53-tp8/prog3/T8192/rows4096/prior65536",
+      "treat": "glue2-t3-g4-rung:P4096-S:g4"
+     },
+     {
+      "rung": "glm53-tp8/prog3/T8192/rows8192/prior0",
+      "treat": "glue2-t3-g4-rung:P8192-0:g4"
+     }
+    ],
+    "untouched": [
+     {
+      "rung": "packet",
+      "base": "8b15f4a28b289a72",
+      "variant": "8b15f4a28b289a72"
+     }
+    ],
+    "tier4": false,
+    "numeric": true,
+    "facts": [
+     {
+      "kind": "last_row_logits_rel_l2",
+      "pass": true,
+      "evidence": "glue2-t3-g4-value: 4.3e-2 against the off/off2 floor 3.4e-2, bound 0.14, argmax equal"
+     }
+    ]
+   }
+  },
+  {
+   "name": "PLOW_AMD_TAIL_SPARSE_CTX=8192",
+   "expect": "accept",
+   "source": "review log #82",
+   "request": {
+    "ledger": [
+     {
+      "id": "rung2048-tail-ab:tail600:ctrl",
+      "date": "2026-09-13",
+      "job": "rung2048-tail-ab",
+      "harness": "bench",
+      "hardware": {
+       "box": "8xMI300X",
+       "rocm": "7.14",
+       "driver": null,
+       "firmware": null
+      },
+      "rung": {
+       "digest": "glm53-tp8/prefill-tail/prior8192/rows600",
+       "role": "prefill",
+       "rows": 600,
+       "prior": 8192,
+       "topology": "ordinary"
+      },
+      "recipe_digest": "8b15f4a28b289a72",
+      "knob_delta": {},
+      "metric": "chunk_ms",
+      "better": "lower",
+      "samples": [
+       285.505,
+       285.504,
+       285.343
+      ],
+      "stats": {
+       "n": 3,
+       "median": 285.504,
+       "mad": 0.0009999999999763531
+      }
+     },
+     {
+      "id": "rung2048-tail-ab:tail600:ctrl2",
+      "date": "2026-09-13",
+      "job": "rung2048-tail-ab",
+      "harness": "bench",
+      "hardware": {
+       "box": "8xMI300X",
+       "rocm": "7.14",
+       "driver": null,
+       "firmware": null
+      },
+      "rung": {
+       "digest": "glm53-tp8/prefill-tail/prior8192/rows600",
+       "role": "prefill",
+       "rows": 600,
+       "prior": 8192,
+       "topology": "ordinary"
+      },
+      "recipe_digest": "8b15f4a28b289a72",
+      "knob_delta": {},
+      "metric": "chunk_ms",
+      "better": "lower",
+      "samples": [
+       438.785,
+       285.717,
+       285.471
+      ],
+      "stats": {
+       "n": 3,
+       "median": 285.717,
+       "mad": 0.2459999999999809
+      }
+     },
+     {
+      "id": "rung2048-tail-ab:tail600:treat",
+      "date": "2026-09-13",
+      "job": "rung2048-tail-ab",
+      "harness": "bench",
+      "hardware": {
+       "box": "8xMI300X",
+       "rocm": "7.14",
+       "driver": null,
+       "firmware": null
+      },
+      "rung": {
+       "digest": "glm53-tp8/prefill-tail/prior8192/rows600",
+       "role": "prefill",
+       "rows": 600,
+       "prior": 8192,
+       "topology": "ordinary"
+      },
+      "recipe_digest": "8b15f4a28b289a72",
+      "knob_delta": {},
+      "metric": "chunk_ms",
+      "better": "lower",
+      "samples": [
+       144.891,
+       145.054,
+       145.379
+      ],
+      "stats": {
+       "n": 3,
+       "median": 145.054,
+       "mad": 0.16300000000001091
+      },
+      "control_of": "rung2048-tail-ab:tail600:ctrl",
+      "repeat_control_of": "rung2048-tail-ab:tail600:ctrl2"
+     },
+     {
+      "id": "rung2048-tail-ab:tail1200:ctrl",
+      "date": "2026-09-13",
+      "job": "rung2048-tail-ab",
+      "harness": "bench",
+      "hardware": {
+       "box": "8xMI300X",
+       "rocm": "7.14",
+       "driver": null,
+       "firmware": null
+      },
+      "rung": {
+       "digest": "glm53-tp8/prefill-tail/prior8192/rows1200",
+       "role": "prefill",
+       "rows": 1200,
+       "prior": 8192,
+       "topology": "ordinary"
+      },
+      "recipe_digest": "8b15f4a28b289a72",
+      "knob_delta": {},
+      "metric": "chunk_ms",
+      "better": "lower",
+      "samples": [
+       319.592,
+       320.488,
+       319.804
+      ],
+      "stats": {
+       "n": 3,
+       "median": 319.804,
+       "mad": 0.21199999999998909
+      }
+     },
+     {
+      "id": "rung2048-tail-ab:tail1200:ctrl2",
+      "date": "2026-09-13",
+      "job": "rung2048-tail-ab",
+      "harness": "bench",
+      "hardware": {
+       "box": "8xMI300X",
+       "rocm": "7.14",
+       "driver": null,
+       "firmware": null
+      },
+      "rung": {
+       "digest": "glm53-tp8/prefill-tail/prior8192/rows1200",
+       "role": "prefill",
+       "rows": 1200,
+       "prior": 8192,
+       "topology": "ordinary"
+      },
+      "recipe_digest": "8b15f4a28b289a72",
+      "knob_delta": {},
+      "metric": "chunk_ms",
+      "better": "lower",
+      "samples": [
+       319.671,
+       320.364,
+       320.053
+      ],
+      "stats": {
+       "n": 3,
+       "median": 320.053,
+       "mad": 0.3109999999999786
+      }
+     },
+     {
+      "id": "rung2048-tail-ab:tail1200:treat",
+      "date": "2026-09-13",
+      "job": "rung2048-tail-ab",
+      "harness": "bench",
+      "hardware": {
+       "box": "8xMI300X",
+       "rocm": "7.14",
+       "driver": null,
+       "firmware": null
+      },
+      "rung": {
+       "digest": "glm53-tp8/prefill-tail/prior8192/rows1200",
+       "role": "prefill",
+       "rows": 1200,
+       "prior": 8192,
+       "topology": "ordinary"
+      },
+      "recipe_digest": "8b15f4a28b289a72",
+      "knob_delta": {},
+      "metric": "chunk_ms",
+      "better": "lower",
+      "samples": [
+       181.444,
+       181.864,
+       180.875
+      ],
+      "stats": {
+       "n": 3,
+       "median": 181.444,
+       "mad": 0.4200000000000159
+      },
+      "control_of": "rung2048-tail-ab:tail1200:ctrl",
+      "repeat_control_of": "rung2048-tail-ab:tail1200:ctrl2"
+     },
+     {
+      "id": "rung2048-tail-ab:tail1854:ctrl",
+      "date": "2026-09-13",
+      "job": "rung2048-tail-ab",
+      "harness": "bench",
+      "hardware": {
+       "box": "8xMI300X",
+       "rocm": "7.14",
+       "driver": null,
+       "firmware": null
+      },
+      "rung": {
+       "digest": "glm53-tp8/prefill-tail/prior8192/rows1854",
+       "role": "prefill",
+       "rows": 1854,
+       "prior": 8192,
+       "topology": "ordinary"
+      },
+      "recipe_digest": "8b15f4a28b289a72",
+      "knob_delta": {},
+      "metric": "chunk_ms",
+      "better": "lower",
+      "samples": [
+       360.551,
+       359.826,
+       359.878
+      ],
+      "stats": {
+       "n": 3,
+       "median": 359.878,
+       "mad": 0.051999999999964075
+      }
+     },
+     {
+      "id": "rung2048-tail-ab:tail1854:ctrl2",
+      "date": "2026-09-13",
+      "job": "rung2048-tail-ab",
+      "harness": "bench",
+      "hardware": {
+       "box": "8xMI300X",
+       "rocm": "7.14",
+       "driver": null,
+       "firmware": null
+      },
+      "rung": {
+       "digest": "glm53-tp8/prefill-tail/prior8192/rows1854",
+       "role": "prefill",
+       "rows": 1854,
+       "prior": 8192,
+       "topology": "ordinary"
+      },
+      "recipe_digest": "8b15f4a28b289a72",
+      "knob_delta": {},
+      "metric": "chunk_ms",
+      "better": "lower",
+      "samples": [
+       359.79,
+       359.684,
+       359.561
+      ],
+      "stats": {
+       "n": 3,
+       "median": 359.684,
+       "mad": 0.10599999999999454
+      }
+     },
+     {
+      "id": "rung2048-tail-ab:tail1854:treat",
+      "date": "2026-09-13",
+      "job": "rung2048-tail-ab",
+      "harness": "bench",
+      "hardware": {
+       "box": "8xMI300X",
+       "rocm": "7.14",
+       "driver": null,
+       "firmware": null
+      },
+      "rung": {
+       "digest": "glm53-tp8/prefill-tail/prior8192/rows1854",
+       "role": "prefill",
+       "rows": 1854,
+       "prior": 8192,
+       "topology": "ordinary"
+      },
+      "recipe_digest": "8b15f4a28b289a72",
+      "knob_delta": {},
+      "metric": "chunk_ms",
+      "better": "lower",
+      "samples": [
+       226.606,
+       226.699,
+       226.827
+      ],
+      "stats": {
+       "n": 3,
+       "median": 226.699,
+       "mad": 0.09300000000001774
+      },
+      "control_of": "rung2048-tail-ab:tail1854:ctrl",
+      "repeat_control_of": "rung2048-tail-ab:tail1854:ctrl2"
+     },
+     {
+      "id": "rung2048-tail-ab:tail2048:ctrl",
+      "date": "2026-09-13",
+      "job": "rung2048-tail-ab",
+      "harness": "bench",
+      "hardware": {
+       "box": "8xMI300X",
+       "rocm": "7.14",
+       "driver": null,
+       "firmware": null
+      },
+      "rung": {
+       "digest": "glm53-tp8/prefill-tail/prior8192/rows2048",
+       "role": "prefill",
+       "rows": 2048,
+       "prior": 8192,
+       "topology": "ordinary"
+      },
+      "recipe_digest": "8b15f4a28b289a72",
+      "knob_delta": {},
+      "metric": "chunk_ms",
+      "better": "lower",
+      "samples": [
+       369.585,
+       369.324,
+       369.518
+      ],
+      "stats": {
+       "n": 3,
+       "median": 369.518,
+       "mad": 0.06700000000000728
+      }
+     },
+     {
+      "id": "rung2048-tail-ab:tail2048:ctrl2",
+      "date": "2026-09-13",
+      "job": "rung2048-tail-ab",
+      "harness": "bench",
+      "hardware": {
+       "box": "8xMI300X",
+       "rocm": "7.14",
+       "driver": null,
+       "firmware": null
+      },
+      "rung": {
+       "digest": "glm53-tp8/prefill-tail/prior8192/rows2048",
+       "role": "prefill",
+       "rows": 2048,
+       "prior": 8192,
+       "topology": "ordinary"
+      },
+      "recipe_digest": "8b15f4a28b289a72",
+      "knob_delta": {},
+      "metric": "chunk_ms",
+      "better": "lower",
+      "samples": [
+       368.916,
+       369.118,
+       368.682
+      ],
+      "stats": {
+       "n": 3,
+       "median": 368.916,
+       "mad": 0.20199999999999818
+      }
+     },
+     {
+      "id": "rung2048-tail-ab:tail2048:treat",
+      "date": "2026-09-13",
+      "job": "rung2048-tail-ab",
+      "harness": "bench",
+      "hardware": {
+       "box": "8xMI300X",
+       "rocm": "7.14",
+       "driver": null,
+       "firmware": null
+      },
+      "rung": {
+       "digest": "glm53-tp8/prefill-tail/prior8192/rows2048",
+       "role": "prefill",
+       "rows": 2048,
+       "prior": 8192,
+       "topology": "ordinary"
+      },
+      "recipe_digest": "8b15f4a28b289a72",
+      "knob_delta": {},
+      "metric": "chunk_ms",
+      "better": "lower",
+      "samples": [
+       232.911,
+       232.53,
+       232.891
+      ],
+      "stats": {
+       "n": 3,
+       "median": 232.891,
+       "mad": 0.020000000000010232
+      },
+      "control_of": "rung2048-tail-ab:tail2048:ctrl",
+      "repeat_control_of": "rung2048-tail-ab:tail2048:ctrl2"
+     }
+    ],
+    "touched": [
+     {
+      "rung": "glm53-tp8/prefill-tail/prior8192/rows600",
+      "treat": "rung2048-tail-ab:tail600:treat"
+     },
+     {
+      "rung": "glm53-tp8/prefill-tail/prior8192/rows1200",
+      "treat": "rung2048-tail-ab:tail1200:treat"
+     },
+     {
+      "rung": "glm53-tp8/prefill-tail/prior8192/rows1854",
+      "treat": "rung2048-tail-ab:tail1854:treat"
+     },
+     {
+      "rung": "glm53-tp8/prefill-tail/prior8192/rows2048",
+      "treat": "rung2048-tail-ab:tail2048:treat"
+     }
+    ],
+    "untouched": [
+     {
+      "rung": "packet",
+      "base": "8b15f4a28b289a72",
+      "variant": "8b15f4a28b289a72"
+     }
+    ],
+    "tier4": false,
+    "numeric": true,
+    "facts": [
+     {
+      "kind": "retrieval",
+      "pass": true,
+      "evidence": "rung2048-guard-tail8192: 39/39, every tail at prior 8192 on the sparse path"
+     }
+    ]
+   }
+  },
+  {
+   "name": "PLOW_AMD_DECODE_MIN_RUNG=8",
+   "expect": "insufficient_evidence",
+   "source": "review log #76",
+   "request": {
+    "ledger": [
+     {
+      "id": "1789245417-decode-c1-serve-ab:tpot:ctrl",
+      "date": "2026-09-13",
+      "job": "1789245417-decode-c1-serve-ab",
+      "harness": "serve-ab",
+      "hardware": {
+       "box": "8xMI300X",
+       "rocm": "7.14",
+       "driver": null,
+       "firmware": null
+      },
+      "rung": {
+       "digest": "glm53-tp8/serve/isl8192-osl1024-c1",
+       "role": "decode",
+       "rows": 0,
+       "prior": 0,
+       "topology": "ordinary"
+      },
+      "recipe_digest": "8b15f4a28b289a72",
+      "knob_delta": {},
+      "metric": "tpot_ms",
+      "better": "lower",
+      "stats": {
+       "n": 8,
+       "median": 51.84875281155925
+      }
+     },
+     {
+      "id": "1789245417-decode-c1-serve-ab:tpot:treat",
+      "date": "2026-09-13",
+      "job": "1789245417-decode-c1-serve-ab",
+      "harness": "serve-ab",
+      "hardware": {
+       "box": "8xMI300X",
+       "rocm": "7.14",
+       "driver": null,
+       "firmware": null
+      },
+      "rung": {
+       "digest": "glm53-tp8/serve/isl8192-osl1024-c1",
+       "role": "decode",
+       "rows": 0,
+       "prior": 0,
+       "topology": "ordinary"
+      },
+      "recipe_digest": "8b15f4a28b289a72",
+      "knob_delta": {},
+      "metric": "tpot_ms",
+      "better": "lower",
+      "stats": {
+       "n": 8,
+       "median": 41.44272957159762
+      },
+      "control_of": "1789245417-decode-c1-serve-ab:tpot:ctrl",
+      "repeat_control_of": "1789245417-decode-c1-serve-ab:tpot:ctrl2"
+     },
+     {
+      "id": "1789245417-decode-c1-serve-ab:tpot:ctrl2",
+      "date": "2026-09-13",
+      "job": "1789245417-decode-c1-serve-ab",
+      "harness": "serve-ab",
+      "hardware": {
+       "box": "8xMI300X",
+       "rocm": "7.14",
+       "driver": null,
+       "firmware": null
+      },
+      "rung": {
+       "digest": "glm53-tp8/serve/isl8192-osl1024-c1",
+       "role": "decode",
+       "rows": 0,
+       "prior": 0,
+       "topology": "ordinary"
+      },
+      "recipe_digest": "8b15f4a28b289a72",
+      "knob_delta": {},
+      "metric": "tpot_ms",
+      "better": "lower",
+      "stats": {
+       "n": 8,
+       "median": 52.26665343911715
+      }
+     }
+    ],
+    "touched": [
+     {
+      "rung": "glm53-tp8/serve/isl8192-osl1024-c1",
+      "treat": "1789245417-decode-c1-serve-ab:tpot:treat"
+     }
+    ],
+    "untouched": [
+     {
+      "rung": "packet",
+      "base": "8b15f4a28b289a72",
+      "variant": "8b15f4a28b289a72"
+     }
+    ],
+    "tier4": true,
+    "serving": [
+     "1789245417-decode-c1-serve-ab:tpot:treat"
+    ],
+    "numeric": false,
+    "facts": []
+   }
+  },
+  {
+   "name": "PLOW_GLM_XR_RES=1",
+   "expect": "insufficient_evidence",
+   "source": "review log roadmap table: chunk 937.91 -> 942.55 ms",
+   "request": {
+    "ledger": [
+     {
+      "id": "glue-xrres-trace:ctrl",
+      "date": "2026-09-13",
+      "job": "glue-xrres-trace",
+      "harness": "bench",
+      "hardware": {
+       "box": "8xMI300X",
+       "rocm": "7.14",
+       "driver": null,
+       "firmware": null
+      },
+      "rung": {
+       "digest": "glm53-tp8/chunk_ms",
+       "role": "prefill",
+       "rows": 0,
+       "prior": 0,
+       "topology": "ordinary"
+      },
+      "recipe_digest": "8b15f4a28b289a72",
+      "knob_delta": {},
+      "metric": "chunk_ms",
+      "better": "lower",
+      "stats": {
+       "n": 1,
+       "median": 937.91
+      }
+     },
+     {
+      "id": "glue-xrres-trace:treat",
+      "date": "2026-09-13",
+      "job": "glue-xrres-trace",
+      "harness": "bench",
+      "hardware": {
+       "box": "8xMI300X",
+       "rocm": "7.14",
+       "driver": null,
+       "firmware": null
+      },
+      "rung": {
+       "digest": "glm53-tp8/chunk_ms",
+       "role": "prefill",
+       "rows": 0,
+       "prior": 0,
+       "topology": "ordinary"
+      },
+      "recipe_digest": "8b15f4a28b289a72",
+      "knob_delta": {},
+      "metric": "chunk_ms",
+      "better": "lower",
+      "stats": {
+       "n": 1,
+       "median": 942.55
+      },
+      "control_of": "glue-xrres-trace:ctrl"
+     }
+    ],
+    "touched": [
+     {
+      "rung": "glm53-tp8/chunk_ms",
+      "treat": "glue-xrres-trace:treat"
+     }
+    ],
+    "untouched": [],
+    "tier4": false,
+    "numeric": false,
+    "facts": []
+   }
+  },
+  {
+   "name": "PLOW_XR_DEC_CUS=60",
+   "expect": "insufficient_evidence",
+   "source": "review log roadmap table: +6.7 ms per decode step at N=60",
+   "request": {
+    "ledger": [
+     {
+      "id": "glue-dc60:ctrl",
+      "date": "2026-09-13",
+      "job": "glue-dc60",
+      "harness": "bench",
+      "hardware": {
+       "box": "8xMI300X",
+       "rocm": "7.14",
+       "driver": null,
+       "firmware": null
+      },
+      "rung": {
+       "digest": "glm53-tp8/step_ms",
+       "role": "prefill",
+       "rows": 0,
+       "prior": 0,
+       "topology": "ordinary"
+      },
+      "recipe_digest": "8b15f4a28b289a72",
+      "knob_delta": {},
+      "metric": "step_ms",
+      "better": "lower",
+      "stats": {
+       "n": 1,
+       "median": 100.213
+      }
+     },
+     {
+      "id": "glue-dc60:treat",
+      "date": "2026-09-13",
+      "job": "glue-dc60",
+      "harness": "bench",
+      "hardware": {
+       "box": "8xMI300X",
+       "rocm": "7.14",
+       "driver": null,
+       "firmware": null
+      },
+      "rung": {
+       "digest": "glm53-tp8/step_ms",
+       "role": "prefill",
+       "rows": 0,
+       "prior": 0,
+       "topology": "ordinary"
+      },
+      "recipe_digest": "8b15f4a28b289a72",
+      "knob_delta": {},
+      "metric": "step_ms",
+      "better": "lower",
+      "stats": {
+       "n": 1,
+       "median": 106.9
+      },
+      "control_of": "glue-dc60:ctrl"
+     }
+    ],
+    "touched": [
+     {
+      "rung": "glm53-tp8/step_ms",
+      "treat": "glue-dc60:treat"
+     }
+    ],
+    "untouched": [],
+    "tier4": false,
+    "numeric": false,
+    "facts": []
+   }
+  },
+  {
+   "name": "PLOW_GLM_GEMM_BLK=1 at tier 4",
+   "expect": "insufficient_evidence",
+   "source": "review log: FP8 block-scale prefill route, second served A/B",
+   "request": {
+    "ledger": [
+     {
+      "id": "1789182456-fp8-blk-ab2:ttft:ctrl",
+      "date": "2026-09-13",
+      "job": "1789182456-fp8-blk-ab2",
+      "harness": "serve-ab",
+      "hardware": {
+       "box": "8xMI300X",
+       "rocm": "7.14",
+       "driver": null,
+       "firmware": null
+      },
+      "rung": {
+       "digest": "glm53-tp8/serve/c20-70k",
+       "role": "prefill",
+       "rows": 0,
+       "prior": 0,
+       "topology": "ordinary"
+      },
+      "recipe_digest": "8b15f4a28b289a72",
+      "knob_delta": {},
+      "metric": "ttft_ms",
+      "better": "lower",
+      "samples": [
+       53420.08066806011,
+       158966.8764070375,
+       29730.596390087157,
+       95608.74205606524,
+       104781.95863799192,
+       36893.339907051995,
+       6692.050829995424,
+       13556.937641929835,
+       44323.970830999315,
+       113782.24974800833,
+       70185.27353892568,
+       87940.93754189089,
+       61662.01440396253,
+       150353.72459096834,
+       123076.06097799726,
+       133349.44038500544,
+       78678.87680302374,
+       141757.40590097848,
+       21637.287894031033,
+       168296.36536096223
+      ],
+      "stats": {
+       "n": 20,
+       "median": 83309.90717245732,
+       "mad": 43091.36053547263
+      }
+     },
+     {
+      "id": "1789182456-fp8-blk-ab2:toks:ctrl",
+      "date": "2026-09-13",
+      "job": "1789182456-fp8-blk-ab2",
+      "harness": "serve-ab",
+      "hardware": {
+       "box": "8xMI300X",
+       "rocm": "7.14",
+       "driver": null,
+       "firmware": null
+      },
+      "rung": {
+       "digest": "glm53-tp8/serve/c20-70k",
+       "role": "prefill",
+       "rows": 0,
+       "prior": 0,
+       "topology": "ordinary"
+      },
+      "recipe_digest": "8b15f4a28b289a72",
+      "knob_delta": {},
+      "metric": "tok_s",
+      "better": "higher",
+      "stats": {
+       "n": 1,
+       "median": 57.05392486671802
+      }
+     },
+     {
+      "id": "1789182456-fp8-blk-ab2:ttft:treat",
+      "date": "2026-09-13",
+      "job": "1789182456-fp8-blk-ab2",
+      "harness": "serve-ab",
+      "hardware": {
+       "box": "8xMI300X",
+       "rocm": "7.14",
+       "driver": null,
+       "firmware": null
+      },
+      "rung": {
+       "digest": "glm53-tp8/serve/c20-70k",
+       "role": "prefill",
+       "rows": 0,
+       "prior": 0,
+       "topology": "ordinary"
+      },
+      "recipe_digest": "8b15f4a28b289a72",
+      "knob_delta": {},
+      "metric": "ttft_ms",
+      "better": "lower",
+      "samples": [
+       112272.20269292593,
+       120895.95821395051,
+       145721.759233973,
+       137628.6676679738,
+       21813.31884395331,
+       13089.45469208993,
+       6386.682752054185,
+       51960.589258000255,
+       45049.04753097799,
+       95341.95908391848,
+       164292.4146669684,
+       77139.73341102246,
+       68202.23723608069,
+       29854.25487800967,
+       86461.18745894637,
+       155839.37813097145,
+       60160.973611986265,
+       103374.02804591693,
+       37872.511908994056,
+       130226.7097729491
+      ],
+      "stats": {
+       "n": 20,
+       "median": 81800.46043498442,
+       "mad": 41511.723152478226
+      },
+      "control_of": "1789182456-fp8-blk-ab2:ttft:ctrl",
+      "repeat_control_of": "1789182456-fp8-blk-ab2:ttft:ctrl2"
+     },
+     {
+      "id": "1789182456-fp8-blk-ab2:toks:treat",
+      "date": "2026-09-13",
+      "job": "1789182456-fp8-blk-ab2",
+      "harness": "serve-ab",
+      "hardware": {
+       "box": "8xMI300X",
+       "rocm": "7.14",
+       "driver": null,
+       "firmware": null
+      },
+      "rung": {
+       "digest": "glm53-tp8/serve/c20-70k",
+       "role": "prefill",
+       "rows": 0,
+       "prior": 0,
+       "topology": "ordinary"
+      },
+      "recipe_digest": "8b15f4a28b289a72",
+      "knob_delta": {},
+      "metric": "tok_s",
+      "better": "higher",
+      "stats": {
+       "n": 1,
+       "median": 56.60064921205239
+      },
+      "control_of": "1789182456-fp8-blk-ab2:toks:ctrl",
+      "repeat_control_of": "1789182456-fp8-blk-ab2:toks:ctrl2"
+     },
+     {
+      "id": "1789182456-fp8-blk-ab2:ttft:ctrl2",
+      "date": "2026-09-13",
+      "job": "1789182456-fp8-blk-ab2",
+      "harness": "serve-ab",
+      "hardware": {
+       "box": "8xMI300X",
+       "rocm": "7.14",
+       "driver": null,
+       "firmware": null
+      },
+      "rung": {
+       "digest": "glm53-tp8/serve/c20-70k",
+       "role": "prefill",
+       "rows": 0,
+       "prior": 0,
+       "topology": "ordinary"
+      },
+      "recipe_digest": "8b15f4a28b289a72",
+      "knob_delta": {},
+      "metric": "ttft_ms",
+      "better": "lower",
+      "samples": [
+       15313.711585011333,
+       48190.85927901324,
+       139766.25283702742,
+       22735.696563031524,
+       95968.57512497809,
+       70183.80644393619,
+       55450.193552998826,
+       6550.454663927667,
+       62903.07608200237,
+       39699.0423949901,
+       122086.14322601352,
+       105206.5909949597,
+       30775.237850029953,
+       148376.40715704765,
+       157871.68424099218,
+       168318.19968903437,
+       78592.48522506095,
+       86814.47557895444,
+       113519.95082898065,
+       131364.1251459485
+      ],
+      "stats": {
+       "n": 20,
+       "median": 82703.4804020077,
+       "mad": 41193.55041551171
+      }
+     },
+     {
+      "id": "1789182456-fp8-blk-ab2:toks:ctrl2",
+      "date": "2026-09-13",
+      "job": "1789182456-fp8-blk-ab2",
+      "harness": "serve-ab",
+      "hardware": {
+       "box": "8xMI300X",
+       "rocm": "7.14",
+       "driver": null,
+       "firmware": null
+      },
+      "rung": {
+       "digest": "glm53-tp8/serve/c20-70k",
+       "role": "prefill",
+       "rows": 0,
+       "prior": 0,
+       "topology": "ordinary"
+      },
+      "recipe_digest": "8b15f4a28b289a72",
+      "knob_delta": {},
+      "metric": "tok_s",
+      "better": "higher",
+      "stats": {
+       "n": 1,
+       "median": 56.50407153223455
+      }
+     }
+    ],
+    "touched": [],
+    "untouched": [
+     {
+      "rung": "packet",
+      "base": "8b15f4a28b289a72",
+      "variant": "8b15f4a28b289a72"
+     }
+    ],
+    "tier4": true,
+    "serving": [
+     "1789182456-fp8-blk-ab2:ttft:treat",
+     "1789182456-fp8-blk-ab2:toks:treat"
+    ],
+    "numeric": true,
+    "facts": [
+     {
+      "kind": "retrieval",
+      "pass": true,
+      "evidence": "18/18 on the route arm"
+     }
+    ]
+   }
+  },
+  {
+   "name": "PLOW_GLM_PF_SMALL_CUS=auto (wide collectives)",
+   "expect": "insufficient_evidence",
+   "source": "small-rungs serve A/B; checkpoint S accepts c5d93e38 and rejects 6deb4025",
+   "request": {
+    "ledger": [
+     {
+      "id": "small-rungs-serve-ab:isl128:ctrl",
+      "date": "2026-09-13",
+      "job": "small-rungs-serve-ab",
+      "harness": "serve-ab",
+      "hardware": {
+       "box": "8xMI300X",
+       "rocm": "7.14",
+       "driver": null,
+       "firmware": null
+      },
+      "rung": {
+       "digest": "glm53-tp8/serve/isl128-c1",
+       "role": "prefill",
+       "rows": 0,
+       "prior": 0,
+       "topology": "ordinary"
+      },
+      "recipe_digest": "8b15f4a28b289a72",
+      "knob_delta": {},
+      "metric": "ttft_ms",
+      "better": "lower",
+      "stats": {
+       "n": 8,
+       "median": 120.38112449226901
+      }
+     },
+     {
+      "id": "small-rungs-serve-ab:isl128:treat",
+      "date": "2026-09-13",
+      "job": "small-rungs-serve-ab",
+      "harness": "serve-ab",
+      "hardware": {
+       "box": "8xMI300X",
+       "rocm": "7.14",
+       "driver": null,
+       "firmware": null
+      },
+      "rung": {
+       "digest": "glm53-tp8/serve/isl128-c1",
+       "role": "prefill",
+       "rows": 0,
+       "prior": 0,
+       "topology": "ordinary"
+      },
+      "recipe_digest": "8b15f4a28b289a72",
+      "knob_delta": {},
+      "metric": "ttft_ms",
+      "better": "lower",
+      "stats": {
+       "n": 8,
+       "median": 110.85899698082358
+      },
+      "control_of": "small-rungs-serve-ab:isl128:ctrl",
+      "repeat_control_of": "small-rungs-serve-ab:isl128:ctrl2"
+     },
+     {
+      "id": "small-rungs-serve-ab:isl128:ctrl2",
+      "date": "2026-09-13",
+      "job": "small-rungs-serve-ab",
+      "harness": "serve-ab",
+      "hardware": {
+       "box": "8xMI300X",
+       "rocm": "7.14",
+       "driver": null,
+       "firmware": null
+      },
+      "rung": {
+       "digest": "glm53-tp8/serve/isl128-c1",
+       "role": "prefill",
+       "rows": 0,
+       "prior": 0,
+       "topology": "ordinary"
+      },
+      "recipe_digest": "8b15f4a28b289a72",
+      "knob_delta": {},
+      "metric": "ttft_ms",
+      "better": "lower",
+      "stats": {
+       "n": 8,
+       "median": 115.31310994178057
+      }
+     },
+     {
+      "id": "small-rungs-serve-ab:isl512:ctrl",
+      "date": "2026-09-13",
+      "job": "small-rungs-serve-ab",
+      "harness": "serve-ab",
+      "hardware": {
+       "box": "8xMI300X",
+       "rocm": "7.14",
+       "driver": null,
+       "firmware": null
+      },
+      "rung": {
+       "digest": "glm53-tp8/serve/isl512-c1",
+       "role": "prefill",
+       "rows": 0,
+       "prior": 0,
+       "topology": "ordinary"
+      },
+      "recipe_digest": "8b15f4a28b289a72",
+      "knob_delta": {},
+      "metric": "ttft_ms",
+      "better": "lower",
+      "stats": {
+       "n": 8,
+       "median": 140.31362696550786
+      }
+     },
+     {
+      "id": "small-rungs-serve-ab:isl512:treat",
+      "date": "2026-09-13",
+      "job": "small-rungs-serve-ab",
+      "harness": "serve-ab",
+      "hardware": {
+       "box": "8xMI300X",
+       "rocm": "7.14",
+       "driver": null,
+       "firmware": null
+      },
+      "rung": {
+       "digest": "glm53-tp8/serve/isl512-c1",
+       "role": "prefill",
+       "rows": 0,
+       "prior": 0,
+       "topology": "ordinary"
+      },
+      "recipe_digest": "8b15f4a28b289a72",
+      "knob_delta": {},
+      "metric": "ttft_ms",
+      "better": "lower",
+      "stats": {
+       "n": 8,
+       "median": 137.53082504263148
+      },
+      "control_of": "small-rungs-serve-ab:isl512:ctrl",
+      "repeat_control_of": "small-rungs-serve-ab:isl512:ctrl2"
+     },
+     {
+      "id": "small-rungs-serve-ab:isl512:ctrl2",
+      "date": "2026-09-13",
+      "job": "small-rungs-serve-ab",
+      "harness": "serve-ab",
+      "hardware": {
+       "box": "8xMI300X",
+       "rocm": "7.14",
+       "driver": null,
+       "firmware": null
+      },
+      "rung": {
+       "digest": "glm53-tp8/serve/isl512-c1",
+       "role": "prefill",
+       "rows": 0,
+       "prior": 0,
+       "topology": "ordinary"
+      },
+      "recipe_digest": "8b15f4a28b289a72",
+      "knob_delta": {},
+      "metric": "ttft_ms",
+      "better": "lower",
+      "stats": {
+       "n": 8,
+       "median": 142.87431648699567
+      }
+     }
+    ],
+    "touched": [
+     {
+      "rung": "glm53-tp8/serve/isl128-c1",
+      "treat": "small-rungs-serve-ab:isl128:treat"
+     },
+     {
+      "rung": "glm53-tp8/serve/isl512-c1",
+      "treat": "small-rungs-serve-ab:isl512:treat"
+     }
+    ],
+    "untouched": [
+     {
+      "rung": "packet",
+      "base": "8b15f4a28b289a72",
+      "variant": "8b15f4a28b289a72"
+     }
+    ],
+    "tier4": false,
+    "numeric": true,
+    "facts": []
+   }
+  }
+ ]
+}

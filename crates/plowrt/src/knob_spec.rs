@@ -130,7 +130,14 @@ pub fn check_assets(blob: &Path) -> Result<()> {
         Err(source) => return Err(RuntimeError::Io { path, source }),
     };
     let rejected = |e: String| RuntimeError::Rejected(format!("{}: {e}", path.display()));
-    let knobs = read_knobs(std::io::BufReader::new(file)).map_err(rejected)?;
+    let (knobs, rungs) = read_knobs(std::io::BufReader::new(file)).map_err(rejected)?;
+    if !has_perf_cert(rungs.as_ref()) {
+        tracing::warn!(
+            manifest = %path.display(),
+            "no checkpoint P certificate (build.json has no `rungs[].perf_cert`): this packet's \
+             knob defaults load without a measured performance certificate"
+        );
+    }
     let Some(knobs) = knobs else {
         tracing::warn!(
             manifest = %path.display(),
@@ -142,11 +149,20 @@ pub fn check_assets(blob: &Path) -> Result<()> {
     check_knobs(&knobs, RuntimeConfig::get()).map_err(rejected)
 }
 
-/// The `knobs` block of a `build.json`, reading no further than its end.
-fn read_knobs(reader: impl std::io::Read) -> std::result::Result<Option<Value>, String> {
+fn has_perf_cert(rungs: Option<&Value>) -> bool {
+    rungs
+        .and_then(Value::as_array)
+        .is_some_and(|r| r.iter().any(|x| x.get("perf_cert").is_some()))
+}
+
+type HeadBlocks = (Option<Value>, Option<Value>);
+
+/// The `knobs` block of a `build.json` and the `rungs` block `scripts/perf_cert.py stamp` writes
+/// right after it, reading no further.
+fn read_knobs(reader: impl std::io::Read) -> std::result::Result<HeadBlocks, String> {
     use serde::de::{Error as _, IgnoredAny, MapAccess, Visitor};
 
-    struct Head<'s>(&'s mut Option<Value>);
+    struct Head<'s>(&'s mut HeadBlocks);
 
     impl<'de> Visitor<'de> for Head<'_> {
         type Value = ();
@@ -158,7 +174,10 @@ fn read_knobs(reader: impl std::io::Read) -> std::result::Result<Option<Value>, 
         fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> std::result::Result<(), A::Error> {
             while let Some(key) = m.next_key::<String>()? {
                 if key == "knobs" {
-                    *self.0 = Some(m.next_value()?);
+                    self.0 .0 = Some(m.next_value()?);
+                    if m.next_key::<String>()?.as_deref() == Some("rungs") {
+                        self.0 .1 = Some(m.next_value()?);
+                    }
                     // Stop: the rest of the manifest is megabytes the check does not read.
                     return Err(A::Error::custom("knobs block read"));
                 }
@@ -168,13 +187,12 @@ fn read_knobs(reader: impl std::io::Read) -> std::result::Result<Option<Value>, 
         }
     }
 
-    let mut out = None;
+    let mut out = (None, None);
     let mut de = serde_json::Deserializer::from_reader(reader);
     let r = serde::Deserializer::deserialize_map(&mut de, Head(&mut out));
     match (r, out) {
-        (_, Some(v)) => Ok(Some(v)),
-        (Ok(()), None) => Ok(None),
-        (Err(e), None) => Err(format!("not a valid build.json: {e}")),
+        (_, out @ (Some(_), _)) | (Ok(()), out) => Ok(out),
+        (Err(e), _) => Err(format!("not a valid build.json: {e}")),
     }
 }
 
@@ -1094,6 +1112,7 @@ mod tests {
                 std::fs::File::open(dir.join("build.json")).unwrap(),
             ))
             .unwrap()
+            .0
             .unwrap();
             check_knobs(&knobs, &rt).unwrap();
             best = best.min(t0.elapsed());
@@ -1101,6 +1120,29 @@ mod tests {
         eprintln!("knob load check: {best:?}");
         let _ = blob;
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `scripts/perf_cert.py stamp` puts `rungs` right after `knobs`; the reader takes both and
+    /// stops.
+    #[test]
+    fn head_reader_takes_stamped_rungs() {
+        let rungs = serde_json::json!([{"rung": "packet", "perf_cert": [{"checkpoint": "P"}]}]);
+        let head = serde_json::json!({"schema": 1, "knobs": production_knobs(), "rungs": rungs});
+        let mut text = head.to_string();
+        text.pop();
+        text.push_str(", \"programs\": [ this is not json");
+        let (knobs, got) = read_knobs(text.as_bytes()).unwrap();
+        assert!(knobs.is_some());
+        assert_eq!(got.as_ref(), Some(&rungs));
+        assert!(has_perf_cert(got.as_ref()));
+
+        let text = serde_json::json!({"knobs": production_knobs(), "programs": []}).to_string();
+        let (knobs, got) = read_knobs(text.as_bytes()).unwrap();
+        assert!(knobs.is_some() && got.is_none());
+        assert!(!has_perf_cert(got.as_ref()));
+        assert!(!has_perf_cert(Some(
+            &serde_json::json!([{"rung": "packet"}])
+        )));
     }
 
     /// Absent and skipped warn and load; failed and a violated constraint refuse.

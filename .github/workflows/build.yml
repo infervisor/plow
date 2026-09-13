@@ -77,6 +77,12 @@ jobs:
         run: |
           git fetch --no-tags --depth=1 origin "$BASE_SHA"
           nix develop --command bash -c 'cargo build --release -p plowc -p plowrt --features plowrt/hsa && scripts/knob_scope_ci.sh "$BASE_SHA"'
+      # Checkpoint P on default flips (scripts/perf_gate_ci.sh): a change to a production default
+      # or Qualified status needs a committed perf-certs/<knob>.json that plow_verify P accepts.
+      - name: Perf gate (checkpoint P)
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: nix develop --command scripts/perf_gate_ci.sh "$BASE_SHA"
 
   # Hosted, sandboxed: safe for fork PRs. CPU paths only, no GPU toolchain.
   check:

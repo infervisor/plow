@@ -17,6 +17,7 @@ import Plow.Rewrite
 import Plow.TilePartition
 import Plow.Knobs.Consistency
 import Plow.Knobs.Scope
+import Plow.Knobs.Ledger
 
 namespace Plow.CLI.Checkpoints
 
@@ -42,6 +43,18 @@ def checkS (payload : Json) : Certificate :=
   match Plow.Knobs.Scope.runS payload with
   | .ok notes => ok "S" notes
   | .error msg => reject "S" msg
+
+/-! ## Checkpoint P: performance certificate for a default flip. -/
+
+/-- Decide a flip from ledger measurements: untouched rungs keep their digests, touched rungs
+    improve beyond the control-vs-control floor, tier 4 is not worse, numeric changes carry
+    passing facts. A floor that cannot be computed is `insufficient_evidence`, never a pass.
+    Backed by `Plow.Knobs.Ledger.checkP_sound`, `insufficient_blocks`, `flip_non_regression`,
+    `carry_over` and `per_rung_argmin`. -/
+def checkP (payload : Json) : Certificate :=
+  match Plow.Knobs.Ledger.runP payload with
+  | .ok notes => ok "P" notes
+  | .error msg => reject "P" msg
 
 /-! ## Checkpoint A: Rewrite rule soundness (§5.10-A). -/
 

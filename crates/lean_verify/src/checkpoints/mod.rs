@@ -2,6 +2,7 @@
 
 pub mod knobs;
 pub mod memory;
+pub mod perf;
 pub mod scope;
 pub mod rewrite;
 pub mod schedule;
@@ -11,6 +12,7 @@ pub mod wire;
 
 pub use knobs::check_knobs;
 pub use memory::check_address_map;
+pub use perf::check_perf;
 pub use scope::check_scope;
 pub use rewrite::check_rewrite_rules;
 pub use schedule::check_schedule;
