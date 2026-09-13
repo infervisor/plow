@@ -4,7 +4,7 @@ Updated: 2026-09-13
 Branch: `tp-bringup-mi300x`
 Checkpoint: `google/gemma-4-12B-it`
 Protocol: `g4-4k8k-v1`
-Last qualified kernel commit: `5a28f449`
+Last qualified kernel commit: `75099793`
 Detailed experiment log: `plans/gemma4-4k-8k-native-block.md`
 
 ## Goal and rules
@@ -21,8 +21,8 @@ Detailed experiment log: `plans/gemma4-4k-8k-native-block.md`
 
 | GPU | ISA | Precision | 4K | 8K | Current state |
 |---|---|---|---|---|---|
-| NVIDIA H100 80GB | SM90a | BF16 | 221.7 ms current-schema p50 | 467.5 ms current-schema p50 | Pure-GEMM production default, exact HD256, descriptor-TMA HD512 with redundant wait barriers removed, and fused-GLU roles qualified; 50% gate not met |
-| NVIDIA H100 80GB | SM90a | W8A8/FP8 weights+activations | 165.5 ms current-schema p50 | 358.5 ms current-schema p50 | Pure-GEMM production default and ABI v5 descriptor TMA with redundant wait barriers removed qualified; 50% gate not met |
+| NVIDIA H100 80GB | SM90a | BF16 | 221.6 ms current-schema p50 | 467.0 ms current-schema p50 | Pure-GEMM production default, exact HD256, descriptor-TMA HD512 with 4K causal-wave balancing, and fused-GLU roles qualified; 50% gate not met |
+| NVIDIA H100 80GB | SM90a | W8A8/FP8 weights+activations | 164.9 ms current-schema p50 | 358.7 ms current-schema p50 | Pure-GEMM production default and ABI v5 descriptor TMA with 4K causal-wave balancing qualified; 50% gate not met |
 | AMD MI300X | gfx942 | BF16 | unmeasured in this fixed protocol | unmeasured in this fixed protocol | Establish native block and serving baseline |
 | AMD MI300X | gfx942 | FP8 | unmeasured in this fixed protocol | unmeasured in this fixed protocol | Establish dtype-correct block and serving baseline |
 
@@ -68,6 +68,8 @@ Do not enter a cross-GPU speedup without a same-cell control under protocol
 | `ecd3feeaa853ad8547d8e05c6c61d2ccf09ba7b3317fb1b7147b21dbd5349072` | H100 SM90a | qualified ABI v5 direct cubin SHA256, 128 registers, zero direct-entry stack/spills, 110,592-byte arena |
 | `5a28f449` | H100 SM90a | remove redundant CTA rendezvous after each successful descriptor-TMA K/V wait while retaining the ragged V-tail rendezvous |
 | `b65117f8340a73e46afff9e2bf66eb3308abebf4a6b567979b80422d49dfa674` | H100 SM90a | qualified barrier-elided ABI v5 direct cubin SHA256, 128 registers, zero direct-entry stack/spills/local, 110,592-byte arena |
+| `75099793` | H100 SM90a | reverse alternate CTA work waves for exact cold 4K HD512 attention, pairing light and heavy causal tiles without changing per-tile arithmetic |
+| `efb732a1fd2b364a1437cfaa8555a9a3e83fb925a64adecd956a34638dd5ab81` | H100 SM90a | qualified causal-wave-balanced cubin SHA256, 128 registers, zero direct-entry stack/spills/local, 110,592-byte arena |
 
 Raw profiler reports, generated assets, and timing logs stay outside git. The
 tracker stores enough identity to reject stale or cross-architecture evidence.
@@ -98,6 +100,7 @@ tracker stores enough identity to reject stale or cross-architecture evidence.
 | Pure-GEMM production topology | Gemma BF16 and W8A8 SM90a TP1, all prefill rungs | BF16 4K/8K -30.00%/-25.96%; W8A8 -45.09%/-42.04% versus accidental mixed packets | recorded defaults, explicit `=0` rollback, checkpoint K, exact default/explicit routing, and driver load pass |
 | HD512 ABI v5 full-rung transfer | current-schema pure packet, M4096/M8192 | three-seed mean -1.51%/-2.21% versus ABI v5 row-TMA control | every paired prompt/output checksum matches |
 | HD512 descriptor-TMA wait-barrier elision | M4096/M8192, BQ64/BKV16, descriptor TMA | direct -9.13%/-8.98%; W8A8 full-rung -1.49%/-2.38%; BF16 full-rung -1.25%/-1.98% | six direct exact cells, eight ragged/history exact cells, compute-sanitizer memcheck/synccheck, W8A8 packed R2, and every paired full-rung checksum pass |
+| HD512 causal CTA wave balancing | cold M4096, BQ64/BKV16, descriptor TMA | direct -5.66%; W8A8 full-rung -0.57%; BF16 neutral | three exact direct seeds, history/ragged exact cells, compute-sanitizer memcheck/synccheck, and every paired full-rung checksum pass |
 | BF16 fused gate/up+GeGLU role | M4096/M8192, N15360/K3840 | five-seed full-rung -3.31%/-3.27% | matching hashes |
 
 ## Rejected H100 changes
@@ -114,6 +117,7 @@ tracker stores enough identity to reject stale or cross-architecture evidence.
 | W8A8 down projection NS3 | packet subtotal +4.29%/+0.94% |
 | Generic coalesced GEMM epilogue | packet result +0.41%/-0.11% |
 | Fused residual+next-norm opcode | slower and greedy checksums changed |
+| HD512 1QK+3PV warpgroup split | spill-free and exact, but 5.5% slower at 4K and 6.4% slower at 8K than the promoted wait-elided object |
 
 ## Current architecture finding
 
@@ -156,10 +160,10 @@ screen must still preserve the accepted BKV16 score/PV reduction order.
 
 ## Next experiments
 
-1. H100 HD512: test the four-warpgroup exact-order `mma.sync` phase-overlap candidate: two QK groups split N0..7/N8..15 and two PV groups split HD0..255/256..511, with one TMA issuer and the accepted BKV16 softmax order.
+1. H100 HD512: preserve BKV16 arithmetic while flattening packed requests into one global CTA work pool; bucket by live KV and measure cold 4K/8K plus history-heavy concurrency.
 2. H100 W8A8: qualify real-prompt logits/greedy agreement for the WS384 pure-GEMM numerics, then record the packet performance certificate.
 3. H100 HD512: qualify live-KV bucket variants and `nsplit` only where the merge pass repays shorter slices; defer GQA multicast until a history-heavy cell shows DRAM pressure.
-4. H100 GEMM: test ping-pong consumers, `stmatrix` + TMA output store, and operand multicast on exact Gemma dimensions.
+4. H100 GEMM: test the exact-shape WS384 BN128/NS6 consumer ping-pong against matched SMEPI controls, followed by `stmatrix` + TMA output store and operand multicast.
 5. Devgen/plowrt: add authenticated resource envelopes and live-KV attention variant selection.
 6. MI300X: run the same four exact block cells and attribute GEMM/attention/light/dispatch before changing kernels.
 7. Run matched H100 and MI300X BF16/FP8 full-model C1/C8/heavy-concurrency gates only after block winners qualify.

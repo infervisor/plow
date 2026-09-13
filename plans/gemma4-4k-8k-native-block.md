@@ -1368,3 +1368,42 @@ The next HD512 experiment is a structurally non-divergent four-warpgroup
 two PV groups split HD0..255 and HD256..511. It must preserve the accepted
 BKV16 softmax order, keep producer and consumer register regions separate,
 and beat this new direct/full-rung control without spills.
+
+### 2026-09-13: exact 4K HD512 causal-wave balancing qualified
+
+Commit `75099793` changes only the assignment of independent HD512 work items
+to CTAs for cold 4K prefill. The old static order gives one CTA the same causal
+position in every grid wave. Reversing each odd wave pairs shorter and longer
+query tiles on that CTA. Each `(query tile, head)` retains the accepted BKV16
+score, softmax, and P.V order and writes the same output address. The branch is
+limited to `seq_q=4096 && q_pos0=0`; 8K, prefix-hit, and ragged paths keep their
+prior mapping.
+
+Rotated direct seeds 31/37/41 are bit-exact. Mean kernel time moves from
+3.001323 to 2.831328 ms at 4K (-5.66%, 1.060x). The inactive 8K path is neutral:
+10.775787 vs 10.773578 ms. Four history/ragged shapes are also bit-exact. The
+canonical cubin SHA256 is
+`efb732a1fd2b364a1437cfaa8555a9a3e83fb925a64adecd956a34638dd5ab81`.
+Its direct entry uses 128 registers, one barrier resource, a 110,592-byte arena,
+and zero stack/spills/local memory. CUDA memcheck and synccheck both report zero
+errors at 4096/4096. The canonical builder enables it for the descriptor-TMA
+BQ64 object; `PLOW_BUILD_PFATTN_CTA_SNAKE=0` restores static work assignment.
+
+The W8A8 production packet transfers the win across seeds 61/67/71. Mean p50
+TTFT changes from 165.844 to 164.900 ms at 4K (-0.57%, 1.006x); all three paired
+seeds improve. The inactive 8K path is neutral at 358.471 vs 358.665 ms. BF16
+is neutral at 221.781 vs 221.633 ms for 4K and 467.016 vs 467.035 ms for 8K.
+All 36 measured requests complete, and every paired prompt/output checksum
+matches.
+
+Evidence: `/tmp/hd512-snake-current/{exact4k-results,history-results}.jsonl`,
+`/tmp/hd512-snake-{control,candidate}-s{61,67,71}.{json,log}`,
+`/tmp/bf16-hd512-snake-{control,candidate}-s{61,67,71}.{json,log}`, and
+`/tmp/hd512-snake-canonical-585d8c95-v3.log`.
+
+The spill-free four-warpgroup follow-up is rejected. A 1QK+3PV split compiles
+at 128 registers with zero stack/spills but runs 5.5% slower at 4K and 6.4%
+slower at 8K than the wait-elided control. The next attention experiment is an
+exact-order global work pool for packed requests. The next GEMM experiment is
+the exact-shape WS384 BN128/NS6 consumer ping-pong candidate under matched
+SMEPI controls.
