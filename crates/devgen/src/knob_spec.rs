@@ -48,9 +48,9 @@ const DECODE_LADDER: Status = Status::Qualified {
 const PACKED_SIBLINGS: Status = Status::Qualified {
     evidence: &["crates/devgen/src/lib.rs apply_production_defaults: ordinary programs byte-identical with the packed siblings (glm_tests)"],
 };
-const GEMMA_W8A8_PURE_GEMM: Status = Status::Qualified {
+const GEMMA_NATIVE_PURE_GEMM: Status = Status::Qualified {
     evidence: &[
-        "plans/gemma4-4k-8k-native-block.md: exact SM90a 4K/8K pure-GEMM packet A/B",
+        "plans/gemma4-4k-8k-native-block.md: exact SM90a BF16 and W8A8 4K/8K pure-GEMM packet A/B",
     ],
 };
 const UNISEG: Status = Status::Qualified {
@@ -160,7 +160,15 @@ const PURE_GEMM_DEFAULT: Default = Default::Production {
             F::Target(T::Cap("gemma")),
             F::Target(T::Arch("sm_90a")),
             F::Target(T::Tp(1)),
-            F::Atom("emit.w8a8", Cmp::Eq, TRUE),
+            F::Or(&[
+                F::Atom("emit.w8a8", Cmp::Eq, TRUE),
+                F::And(&[
+                    F::Atom("emit.fp8", Cmp::Eq, FALSE),
+                    F::Atom("emit.w8a8", Cmp::Eq, FALSE),
+                    F::Atom("emit.w8a16", Cmp::Eq, FALSE),
+                    F::Atom("emit.mxfp4", Cmp::Eq, FALSE),
+                ]),
+            ]),
         ]),
         value: Val::Str("1"),
     }],
@@ -512,7 +520,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.mx4_head", Some("PLOW_MX4_HEAD"), Layer::Emit, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("emit.mx4_prefill", Some("PLOW_MX4_PREFILL"), Layer::Emit, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("emit.uniseg", Some("PLOW_UNISEG"), Layer::Emit, Domain::Bool, UNISEG_DEFAULT, UNISEG),
-    KnobSpec::new("emit.seg_pure_gemm", Some("PLOW_SEG_PURE_GEMM"), Layer::Emit, Domain::Str, PURE_GEMM_DEFAULT, GEMMA_W8A8_PURE_GEMM),
+    KnobSpec::new("emit.seg_pure_gemm", Some("PLOW_SEG_PURE_GEMM"), Layer::Emit, Domain::Str, PURE_GEMM_DEFAULT, GEMMA_NATIVE_PURE_GEMM),
     KnobSpec::new("emit.emit_packed_prefill", Some("PLOW_EMIT_PACKED_PREFILL"), Layer::Emit, Domain::Bool, PACKED_PREFILL_DEFAULT, PACKED_SIBLINGS),
     KnobSpec::new("emit.decode_mla_segments", Some("PLOW_SEG_DECODE_MLA"), Layer::Emit, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("emit.decode_grouped_moe_segments", Some("PLOW_SEG_DECODE_GROUPED_MOE"), Layer::Emit, Domain::Bool, UNSET, OPT_IN),

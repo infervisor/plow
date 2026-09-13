@@ -4,10 +4,12 @@ use crate::knob::*;
 
 #[rustfmt::skip]
 pub const KNOBS: &[KnobSpec] = &[
+    KnobSpec::new("emit.fp8", Some("PLOW_FP8"), Layer::Emit, Domain::Bool, Default::Static(Val::Bool(false)), Status::OptIn),
     KnobSpec::new("emit.w8a8", Some("PLOW_W8A8"), Layer::Emit, Domain::Bool, Default::Static(Val::Bool(false)), Status::OptIn),
     KnobSpec::new("emit.w8a16", Some("PLOW_W8A16"), Layer::Emit, Domain::Bool, Default::Static(Val::Bool(false)), Status::OptIn),
     KnobSpec::new("emit.mxfp4", Some("PLOW_MXFP4"), Layer::Emit, Domain::Bool, Default::Static(Val::Bool(false)), Status::OptIn),
     KnobSpec::new("emit.uniseg", Some("PLOW_UNISEG"), Layer::Emit, Domain::Bool, Default::Production { cases: &[DefaultCase { when: Formula::Target(TargetAtom::Cap("segmented")), value: Val::Bool(false) }, DefaultCase { when: Formula::Or(&[Formula::Target(TargetAtom::Arch("sm_120a")), Formula::Target(TargetAtom::Arch("sm_120")), Formula::Target(TargetAtom::Arch("metal3"))]), value: Val::Bool(true) }], otherwise: Val::Bool(false) }, Status::Qualified { evidence: &["crates/plowc/src/main.rs effective_uniseg: the sm_120 interpreter implements the single-segment path only"] }),
+    KnobSpec::new("emit.seg_pure_gemm", Some("PLOW_SEG_PURE_GEMM"), Layer::Emit, Domain::Str, Default::Production { cases: &[DefaultCase { when: Formula::And(&[Formula::Target(TargetAtom::Cap("gemma")), Formula::Target(TargetAtom::Arch("sm_90a")), Formula::Target(TargetAtom::Tp(1)), Formula::Or(&[Formula::Atom("emit.w8a8", Cmp::Eq, Val::Bool(true)), Formula::And(&[Formula::Atom("emit.fp8", Cmp::Eq, Val::Bool(false)), Formula::Atom("emit.w8a8", Cmp::Eq, Val::Bool(false)), Formula::Atom("emit.w8a16", Cmp::Eq, Val::Bool(false)), Formula::Atom("emit.mxfp4", Cmp::Eq, Val::Bool(false))])])]), value: Val::Str("1") }], otherwise: Val::Unset }, Status::Qualified { evidence: &["plans/gemma4-4k-8k-native-block.md: exact SM90a BF16 and W8A8 4K/8K pure-GEMM packet A/B"] }),
     KnobSpec::new("emit.emit_packed_prefill", Some("PLOW_EMIT_PACKED_PREFILL"), Layer::Emit, Domain::Bool, Default::Production { cases: &[DefaultCase { when: Formula::And(&[Formula::Target(TargetAtom::Cap("packed_prefill_siblings")), Formula::Target(TargetAtom::Arch("gfx942"))]), value: Val::Bool(true) }], otherwise: Val::Unset }, Status::Qualified { evidence: &["crates/devgen/src/lib.rs apply_production_defaults: ordinary programs byte-identical with the packed siblings (glm_tests)"] }),
     KnobSpec::new("emit.decode_batch", Some("PLOW_DECODE_BATCH"), Layer::Emit, Domain::Nat { min: 0, max: 4294967295 }, Default::Static(Val::Nat(1)), Status::OptIn),
     KnobSpec::new("emit.decode_ladder", Some("PLOW_DECODE_BATCH_LADDER"), Layer::Emit, Domain::Str, Default::Production { cases: &[DefaultCase { when: Formula::And(&[Formula::Target(TargetAtom::Arch("sm_90a")), Formula::Target(TargetAtom::Cap("decode_ladder")), Formula::Target(TargetAtom::Tp(1)), Formula::Atom("emit.decode_batch", Cmp::Eq, Val::Nat(1))]), value: Val::Str("1,2,4,8,16") }, DefaultCase { when: Formula::And(&[Formula::Target(TargetAtom::Arch("gfx942")), Formula::Target(TargetAtom::Cap("decode_ladder")), Formula::Target(TargetAtom::Tp(1)), Formula::Atom("emit.decode_batch", Cmp::Eq, Val::Nat(1))]), value: Val::Str("1,2,4,8") }], otherwise: Val::Unset }, Status::Qualified { evidence: &["crates/devgen/src/lib.rs apply_production_defaults: gfx942 MM=16 object costs c=8 -27.5%; the ladder stops at 8"] }),
@@ -71,8 +73,9 @@ pub const CONSTRAINTS: &[Constraint] = &[
 #[rustfmt::skip]
 pub const TARGETS: &[TargetSpec] = &[
     TargetSpec { name: "glm53_fp8_gfx942_tp8", arch: "gfx942", tp: 8, n_cu: 304, model: "glm_moe_dsa", caps: &["packed_prefill_siblings", "glm"], recipe: &[("emit.fp8", Val::Bool(true)), ("emit.decode_ladder", Val::Str("1,2,4,8,16,20")), ("emit.emit_packed_prefill", Val::Bool(false)), ("emit.uniseg", Val::Bool(false)), ("emit.mla_prefill", Val::Str("full:128,512,2048,8192")), ("emit.moe_pf_det", Val::Bool(true)), ("emit.glm_dsa", Val::Str("1")), ("emit.glm_shard_head", Val::Bool(true)), ("emit.glm_moe_coresident", Val::Nat(2)), ("emit.glm_shared_cus", Val::Nat(48)), ("emit.glm_fuse_b1", Val::Bool(true)), ("emit.glm_fuse_seam", Val::Bool(true)), ("emit.glm_fuse_rope", Val::Bool(false)), ("emit.glm_dsa_pf", Val::Bool(true)), ("emit.glm_fp8_kv", Val::Bool(true)), ("emit.glm_moe_aiter", Val::Bool(true)), ("emit.glm_moe_flat_decode", Val::Bool(false)), ("emit.glm_moe_resident", Val::Bool(true)), ("emit.glm_index_tp", Val::Bool(true)), ("emit.glm_select_local", Val::Bool(true)), ("emit.glm_decode_norm_rows", Val::Bool(true)), ("emit.glm_gemm_lt", Val::Bool(true)), ("emit.glm_gemm_lt_decode", Val::Bool(true)), ("emit.glm_dsa_pf_span", Val::Nat(3)), ("emit.glm_place_pf", Val::Bool(false)), ("env.PLOW_UNISEG", Val::Str("0")), ("env.PLOW_MLA_PF_V2", Val::Str("1")), ("env.PLOW_MLA_PF_AITER", Val::Str("1"))] },
-    TargetSpec { name: "gemma4_sm90a_tp1", arch: "sm_90a", tp: 1, n_cu: 132, model: "gemma4", caps: &["dense_packet_contracts", "decode_objects", "cublaslt_decode", "decode_ladder"], recipe: &[] },
-    TargetSpec { name: "gemma4_gfx942_tp1", arch: "gfx942", tp: 1, n_cu: 304, model: "gemma4", caps: &["dense_packet_contracts", "decode_objects", "cublaslt_decode", "decode_ladder"], recipe: &[] },
+    TargetSpec { name: "gemma4_sm90a_tp1", arch: "sm_90a", tp: 1, n_cu: 132, model: "gemma4", caps: &["gemma", "dense_packet_contracts", "decode_objects", "cublaslt_decode", "decode_ladder"], recipe: &[] },
+    TargetSpec { name: "gemma4_w8a8_sm90a_tp1", arch: "sm_90a", tp: 1, n_cu: 132, model: "gemma4", caps: &["gemma", "dense_packet_contracts", "decode_objects", "cublaslt_decode", "decode_ladder"], recipe: &[("emit.w8a8", Val::Bool(true))] },
+    TargetSpec { name: "gemma4_gfx942_tp1", arch: "gfx942", tp: 1, n_cu: 304, model: "gemma4", caps: &["gemma", "dense_packet_contracts", "decode_objects", "cublaslt_decode", "decode_ladder"], recipe: &[] },
     TargetSpec { name: "qwen3_metal3_tp1", arch: "metal3", tp: 1, n_cu: 10, model: "qwen3", caps: &["dense_packet_contracts", "decode_objects", "decode_ladder"], recipe: &[] },
     TargetSpec { name: "kimi_k3_gfx950_tp8", arch: "gfx950", tp: 8, n_cu: 256, model: "kimi_k3", caps: &[], recipe: &[] },
 ];
@@ -80,20 +83,20 @@ pub const TARGETS: &[TargetSpec] = &[
 #[rustfmt::skip]
 pub fn holds(i: usize, v: &[Val<'_>], t: &Target) -> bool {
     match i {
-        0 => !(cmp(Cmp::Eq, v[0], Val::Bool(true)) && cmp(Cmp::Eq, v[1], Val::Bool(true))),
-        1 => !(cmp(Cmp::Eq, v[2], Val::Bool(true)) && (cmp(Cmp::Eq, v[0], Val::Bool(true)) || cmp(Cmp::Eq, v[1], Val::Bool(true)))),
-        2 => !(TargetAtom::Model("kimi_k3").eval(t) && cmp(Cmp::Gt, v[5], Val::Nat(16)) && cmp(Cmp::Eq, v[6], Val::Unset)) || cmp(Cmp::Eq, v[8], Val::Bool(true)),
-        3 => !(cmp(Cmp::Eq, v[14], Val::Bool(true)) && cmp(Cmp::Eq, v[27], Val::Bool(true))),
-        4 => !cmp(Cmp::Eq, v[15], Val::Bool(true)) || (cmp(Cmp::Eq, v[16], Val::Bool(true)) && cmp(Cmp::Eq, v[10], Val::Bool(true)) && !TargetAtom::Cap("indexer_pooled").eval(t)),
-        5 => !cmp(Cmp::Eq, v[24], Val::Bool(true)) || (!cmp(Cmp::Eq, v[9], Val::Bool(true)) && !cmp(Cmp::Eq, v[10], Val::Bool(true))),
-        6 => !cmp(Cmp::Eq, v[27], Val::Bool(true)) || (!cmp(Cmp::Gt, v[25], Val::Nat(1)) && !cmp(Cmp::Eq, v[26], Val::Bool(true))),
-        7 => !cmp(Cmp::Eq, v[28], Val::Bool(true)) || cmp(Cmp::Eq, v[27], Val::Bool(true)),
-        8 => !cmp(Cmp::Ne, v[32], Val::Unset) || (TargetAtom::Arch("metal3").eval(t) && TargetAtom::Tp(1).eval(t) && (TargetAtom::Model("llama").eval(t) || TargetAtom::Model("qwen3").eval(t))),
-        9 => !cmp(Cmp::Ne, v[32], Val::Unset) || (cmp(Cmp::Eq, v[31], Val::Unset) && !cmp(Cmp::Eq, v[0], Val::Bool(true)) && !cmp(Cmp::Eq, v[4], Val::Bool(true)) && cmp(Cmp::Eq, v[33], Val::Unset)),
-        10 => !cmp(Cmp::Ne, v[37], Val::Unset) || (cmp(Cmp::Ne, v[36], Val::Unset) || TargetAtom::Cap("bundled_segment_pair").eval(t)),
-        11 => !cmp(Cmp::Eq, v[35], Val::Str("1")) || cmp(Cmp::Eq, v[41], Val::Bool(true)),
-        12 => !cmp(Cmp::Eq, v[34], Val::Str("1")) || cmp(Cmp::Eq, v[41], Val::Bool(true)),
-        13 => !cmp(Cmp::Eq, v[43], Val::Bool(true)) || (!cmp(Cmp::Eq, v[42], Val::Bool(true)) && cmp(Cmp::Eq, v[31], Val::Unset)),
+        0 => !(cmp(Cmp::Eq, v[1], Val::Bool(true)) && cmp(Cmp::Eq, v[2], Val::Bool(true))),
+        1 => !(cmp(Cmp::Eq, v[3], Val::Bool(true)) && (cmp(Cmp::Eq, v[1], Val::Bool(true)) || cmp(Cmp::Eq, v[2], Val::Bool(true)))),
+        2 => !(TargetAtom::Model("kimi_k3").eval(t) && cmp(Cmp::Gt, v[7], Val::Nat(16)) && cmp(Cmp::Eq, v[8], Val::Unset)) || cmp(Cmp::Eq, v[10], Val::Bool(true)),
+        3 => !(cmp(Cmp::Eq, v[16], Val::Bool(true)) && cmp(Cmp::Eq, v[29], Val::Bool(true))),
+        4 => !cmp(Cmp::Eq, v[17], Val::Bool(true)) || (cmp(Cmp::Eq, v[18], Val::Bool(true)) && cmp(Cmp::Eq, v[12], Val::Bool(true)) && !TargetAtom::Cap("indexer_pooled").eval(t)),
+        5 => !cmp(Cmp::Eq, v[26], Val::Bool(true)) || (!cmp(Cmp::Eq, v[11], Val::Bool(true)) && !cmp(Cmp::Eq, v[12], Val::Bool(true))),
+        6 => !cmp(Cmp::Eq, v[29], Val::Bool(true)) || (!cmp(Cmp::Gt, v[27], Val::Nat(1)) && !cmp(Cmp::Eq, v[28], Val::Bool(true))),
+        7 => !cmp(Cmp::Eq, v[30], Val::Bool(true)) || cmp(Cmp::Eq, v[29], Val::Bool(true)),
+        8 => !cmp(Cmp::Ne, v[34], Val::Unset) || (TargetAtom::Arch("metal3").eval(t) && TargetAtom::Tp(1).eval(t) && (TargetAtom::Model("llama").eval(t) || TargetAtom::Model("qwen3").eval(t))),
+        9 => !cmp(Cmp::Ne, v[34], Val::Unset) || (cmp(Cmp::Eq, v[33], Val::Unset) && !cmp(Cmp::Eq, v[1], Val::Bool(true)) && !cmp(Cmp::Eq, v[6], Val::Bool(true)) && cmp(Cmp::Eq, v[35], Val::Unset)),
+        10 => !cmp(Cmp::Ne, v[39], Val::Unset) || (cmp(Cmp::Ne, v[38], Val::Unset) || TargetAtom::Cap("bundled_segment_pair").eval(t)),
+        11 => !cmp(Cmp::Eq, v[37], Val::Str("1")) || cmp(Cmp::Eq, v[43], Val::Bool(true)),
+        12 => !cmp(Cmp::Eq, v[36], Val::Str("1")) || cmp(Cmp::Eq, v[43], Val::Bool(true)),
+        13 => !cmp(Cmp::Eq, v[45], Val::Bool(true)) || (!cmp(Cmp::Eq, v[44], Val::Bool(true)) && cmp(Cmp::Eq, v[33], Val::Unset)),
         _ => true,
     }
 }

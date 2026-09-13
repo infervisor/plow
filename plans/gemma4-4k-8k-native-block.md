@@ -1238,9 +1238,10 @@ not as the numerical qualification of WS384 against the fat arm.
 
 The compiler now exposes `--emit-pure-gemm-segments`, records it in
 `emit_config`, passes the resolved value directly into `packet::devbuild`, and
-defaults it to `1` only for Gemma W8A8 SM90a TP1. Explicit `=0` remains the
-rollback; BF16, AMD, other model families, and TP>1 remain unchanged pending
-their own driver gates. Checkpoint K has a dtype-specific declared target and
+defaults it to `1` for qualified Gemma BF16 and W8A8 SM90a TP1 packets. Explicit
+`=0` remains the rollback; AMD, other quantization modes, other model families,
+and TP>1 remain unchanged pending their own driver gates. Checkpoint K has a
+dtype-specific declared target and
 records `seg_pure_gemm=1` with source `production_default`. A replay with no raw
 `PLOW_SEG_PURE_GEMM` now loads 483 segments while runtime independently infers
 the policy with `pf_seg_pure=None`.
@@ -1276,3 +1277,38 @@ global O `Mx3840x8192`, eight global K/V `Mx512x3840`, and eight global Q
 `Mx8192x3840`. Existing tile/stage sweeps show only sub-percent packet savings;
 the next material GEMM work is a new WS384 mainloop or fused boundary, while the
 next attention work is the non-divergent HD512 producer/consumer schedule.
+
+### 2026-09-13: BF16 pure-GEMM default qualified
+
+The same topology defect affected native BF16. An otherwise identical explicit
+mixed/pure A/B uses 193 versus 387 launches at the 4K and 8K programs. Rotated
+seeds 47/53/59, one warmup plus three measured requests per length, preserve
+every corresponding prompt and output checksum. Mean p50 TTFT improves from
+297.984 to 208.585 ms at 4K (-30.00%, 1.429x) and from 620.976 to 459.755 ms at
+8K (-25.96%, 1.351x). Evidence:
+`/tmp/bf16-pureseg2-{mixed,pure}-s{47,53,59}.{json,log}`.
+
+The production default is limited to unquantized BF16 Gemma on SM90a TP1 in
+addition to the already-qualified W8A8 cell. `--fp8`, W8A16, MXFP4, AMD, TP>1,
+and other model families remain unset. A current-tree replay with the prior
+explicit setting removed records `seg_pure_gemm=1` from
+`production_default`, passes checkpoint K, and emits BF16/BF16/BF16 precision.
+Packet SHA256 is
+`9d33c978450d4382e9236b3bd67052c50a0172e6b49b55c9b3b3e5e4e32169e7`;
+manifest SHA256 is
+`b68b17b22f79ff5ce8f3694019c7d5d8deebf99d8a3f490b9e4df406f9bdfc84`.
+
+The driver gate exposed a runtime classification edge. Mode `1` is the strict
+per-op classifier: a segment containing mapped GEMM plus a light op must use the
+fat object (class 4), while an isolated mapped GEMM uses the lean object (class
+8). Inferring the mode only from an already-isolated GEMM left a 193-segment
+rollback packet in mode 0 and faulted its first mixed segment. Plowrt now infers
+mode 1 whenever any mapped GEMM is present. Unit tests cover a mixed-only
+segment and a mixed plus isolated pair. Under `gpulease`, both the 387-launch
+production-default packet and the 193-launch rollback packet complete 4K/8K;
+for each packet, `pf_seg_pure=None` and explicit `--pf-seg-pure=1` have exact
+prompt/output checksums. Evidence:
+`/tmp/bf16-default-v4-{s47,explicit-s47}.{json,log}` and
+`/tmp/bf16-mixed-{rollback,explicit}-classified-s47.{json,log}`. Final release
+smokes with the regenerated load-time evaluator are
+`/tmp/bf16-final-{default,mixed-rollback}-s47.{json,log}`.

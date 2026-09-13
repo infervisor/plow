@@ -93,7 +93,7 @@ fn production_defaults_are_capability_and_target_driven() {
 }
 
 #[test]
-fn pure_gemm_default_is_scoped_to_sm90a_gemma_w8a8() {
+fn pure_gemm_default_is_scoped_to_sm90a_gemma_native_dtypes() {
     let _guard = crate::test_env::env_guard();
     let mut qualified =
         EmitArgsForTest::try_parse_from(["test", "--w8a8"]).unwrap().emit;
@@ -111,6 +111,16 @@ fn pure_gemm_default_is_scoped_to_sm90a_gemma_w8a8() {
         Some("1")
     );
 
+    let mut bf16 = EmitArgsForTest::try_parse_from(["test"]).unwrap().emit;
+    apply_production_defaults(
+        &mut bf16,
+        emit_capabilities("gemma4"),
+        "sm_90a",
+        1,
+        132,
+    );
+    assert_eq!(bf16.seg_pure_gemm.as_deref(), Some("1"));
+
     let mut disabled = EmitArgsForTest::try_parse_from([
         "test",
         "--w8a8",
@@ -127,13 +137,18 @@ fn pure_gemm_default_is_scoped_to_sm90a_gemma_w8a8() {
     );
     assert_eq!(disabled.seg_pure_gemm.as_deref(), Some("0"));
 
-    for (model, arch, tp, w8a8) in [
-        ("gemma4", "sm_90a", 1, false),
-        ("gemma4", "gfx942", 1, true),
-        ("gemma4", "sm_90a", 2, true),
-        ("qwen3", "sm_90a", 1, true),
+    for (model, arch, tp, dtype_flag) in [
+        ("gemma4", "sm_90a", 1, Some("--fp8")),
+        ("gemma4", "sm_90a", 1, Some("--w8a16")),
+        ("gemma4", "sm_90a", 1, Some("--mxfp4")),
+        ("gemma4", "gfx942", 1, None),
+        ("gemma4", "sm_90a", 2, None),
+        ("qwen3", "sm_90a", 1, None),
     ] {
-        let argv = if w8a8 { vec!["test", "--w8a8"] } else { vec!["test"] };
+        let mut argv = vec!["test"];
+        if let Some(flag) = dtype_flag {
+            argv.push(flag);
+        }
         let mut cfg = EmitArgsForTest::try_parse_from(argv).unwrap().emit;
         apply_production_defaults(&mut cfg, emit_capabilities(model), arch, tp, 132);
         assert_eq!(cfg.seg_pure_gemm, None, "{model} {arch} tp={tp}");

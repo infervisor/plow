@@ -7112,13 +7112,13 @@ fn apply_production_defaults(
     tp: u32,
     n_cu: u32,
 ) {
-    // Exact Gemma-4 W8A8 4K/8K packets need pure GEMM segments to reach the
-    // lean SM90 TMA/WGMMA object. The mixed 193-segment topology kept the same
-    // math in the fat interpreter and measured 42-45% slower than the 483-
-    // segment topology. Keep the promotion on the qualified dtype/target;
-    // `=0` remains an explicit rollback and BF16 needs its own driver gate.
+    // Exact Gemma-4 BF16 and W8A8 4K/8K packets need pure GEMM segments to
+    // reach the lean SM90 TMA/WGMMA object. The mixed topology measured 26-45%
+    // slower than the pure topology. Keep the promotion on the qualified
+    // dtypes/target; `=0` remains an explicit rollback.
+    let bf16 = !cfg.any_fp8_weights() && !cfg.mxfp4;
     if cfg.seg_pure_gemm.is_none()
-        && cfg.w8a8
+        && (cfg.w8a8 || bf16)
         && capabilities.gemma
         && arch == "sm_90a"
         && tp == 1

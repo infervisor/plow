@@ -886,11 +886,11 @@ impl DevProg {
             hd256_gqa2[seg] |= is_gqa2;
             other_for_gqa2[seg] |= !is_gqa2;
         }
-        let pure = mapped_gemm
-            .iter()
-            .zip(&mapless_w8a16)
-            .zip(&other_for_gemm)
-            .any(|((&mapped, &w8a16), &other)| (mapped || w8a16) && !other);
+        // Mode 1 is a strict per-op classifier, not a claim that every segment
+        // is already pure. Enable it whenever mapped GEMMs exist so a mixed
+        // GEMM+light segment is routed to the fat object instead of trapping in
+        // the GEMM-only object. Isolated mapped GEMMs still take the lean object.
+        let pure = mapped_gemm.iter().any(|&mapped| mapped);
         let w8a16 = mapless_w8a16
             .iter()
             .zip(&other_for_gemm)
@@ -1168,7 +1168,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_light_and_gemm_segment_does_not_claim_a_gemm_only_object() {
+    fn mixed_light_and_gemm_segment_is_classified_for_the_fat_object() {
         let insts = vec![
             DevInst64 {
                 op: DevOp::Gemm as u16,
@@ -1205,10 +1205,82 @@ mod tests {
             gq_seg_ofs: Vec::new(),
             l2_domains: 0,
         };
+        let policy = program.inferred_segment_policy();
         assert_eq!(
-            program.inferred_segment_policy(),
-            SegmentClassPolicy::default()
+            policy,
+            SegmentClassPolicy {
+                pure_mode: 1,
+                ..SegmentClassPolicy::default()
+            }
         );
+        assert_eq!(program.seg_classes_with(policy).unwrap(), [4]);
+    }
+
+    #[test]
+    fn one_pure_gemm_segment_enables_safe_classing_for_a_mixed_peer() {
+        let insts = vec![
+            DevInst64 {
+                op: DevOp::Gemm as u16,
+                blocks: 1,
+                fj: [0; 3],
+                t: [0; 8],
+                i: [0, 0, 0, 0, 0, 0, 1, 2],
+            },
+            DevInst64 {
+                op: DevOp::RmsNorm as u16,
+                blocks: 1,
+                fj: [0; 3],
+                t: [0; 8],
+                i: [0; 8],
+            },
+            DevInst64 {
+                op: DevOp::Gemm as u16,
+                blocks: 1,
+                fj: [0; 3],
+                t: [0; 8],
+                i: [0, 0, 0, 0, 0, 0, 1, 2],
+            },
+        ];
+        let stream = vec![
+            StreamEnt {
+                inst: 0,
+                seg: 0,
+                ..StreamEnt::default()
+            },
+            StreamEnt {
+                inst: 1,
+                seg: 0,
+                ..StreamEnt::default()
+            },
+            StreamEnt {
+                inst: 2,
+                seg: 1,
+                ..StreamEnt::default()
+            },
+        ];
+        let program = DevProg {
+            t: 128,
+            role: packet::devbuild::ProgramRole::PrefillBucket { rows: 0 },
+            n_counter: 0,
+            insts,
+            stream,
+            stream_ofs: Vec::new(),
+            stream_len: Vec::new(),
+            waits: Vec::new(),
+            succs: Vec::new(),
+            gq_stream: Vec::new(),
+            gq_seg_ofs: Vec::new(),
+            l2_domains: 0,
+        };
+        let policy = program.inferred_segment_policy();
+        assert_eq!(
+            policy,
+            SegmentClassPolicy {
+                pure_mode: 1,
+                ..SegmentClassPolicy::default()
+            }
+        );
+        assert_eq!(program.seg_classes_with(policy).unwrap(), [4, 8]);
     }
 
     /// `hidden` is a ROW width, and a one-shot collective in a PREFILL program says
