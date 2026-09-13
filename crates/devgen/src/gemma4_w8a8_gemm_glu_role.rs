@@ -10,8 +10,8 @@ use std::path::Path;
 
 pub(crate) const OBJECT_FILE: &str = "interp_sm90a_pfgemm_glu_w8a8_gemma4.cubin";
 const OBJECT_ENTRY: &str = "plow_sm90a_pfgemm_glu_w8a8_gemma4";
-const OBJECT_GLOBALS: [(&str, u32); 11] = [
-    ("plow_pfgemm_glu_w8a8_gemma4_abi", 1),
+const OBJECT_GLOBALS: [(&str, u32); 13] = [
+    ("plow_pfgemm_glu_w8a8_gemma4_abi", 2),
     ("plow_pfgemm_glu_w8a8_gemma4_min_rows", 4096),
     ("plow_pfgemm_glu_w8a8_gemma4_max_rows", 8192),
     ("plow_pfgemm_glu_w8a8_gemma4_n", 15360),
@@ -20,6 +20,8 @@ const OBJECT_GLOBALS: [(&str, u32); 11] = [
     ("plow_pfgemm_glu_w8a8_gemma4_bm", 128),
     ("plow_pfgemm_glu_w8a8_gemma4_bn", 128),
     ("plow_pfgemm_glu_w8a8_gemma4_bk", 128),
+    ("plow_pfgemm_glu_w8a8_gemma4_tile_band", 16),
+    ("plow_pfgemm_glu_w8a8_gemma4_direct_entry", 1),
     ("plow_block_pfgemm_glu_w8a8_gemma4", 384),
     ("plow_arena_bytes_pfgemm_glu_w8a8_gemma4", 197696),
 ];

@@ -68,6 +68,7 @@ pub(super) fn load_fp8_m1_role(
             function,
             direct_hd512: None,
             direct_hd256_gqa2: None,
+            direct_w8a8_glu: None,
             grid,
             smem,
             block: 256,

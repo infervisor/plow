@@ -14,7 +14,7 @@
 #define PGM90_UNI256_NS 4
 #include "op_gemm.cuh"
 
-extern "C" __device__ unsigned plow_pfgemm_glu_w8a8_gemma4_abi = 1;
+extern "C" __device__ unsigned plow_pfgemm_glu_w8a8_gemma4_abi = 2;
 extern "C" __device__ unsigned plow_pfgemm_glu_w8a8_gemma4_min_rows = 4096;
 extern "C" __device__ unsigned plow_pfgemm_glu_w8a8_gemma4_max_rows = 8192;
 extern "C" __device__ unsigned plow_pfgemm_glu_w8a8_gemma4_n = 15360;
@@ -23,6 +23,8 @@ extern "C" __device__ unsigned plow_pfgemm_glu_w8a8_gemma4_stages = PGM90_GEMMA4
 extern "C" __device__ unsigned plow_pfgemm_glu_w8a8_gemma4_bm = PGM90_GEMMA4_GLU_BM;
 extern "C" __device__ unsigned plow_pfgemm_glu_w8a8_gemma4_bn = PGM90_GEMMA4_GLU_BN;
 extern "C" __device__ unsigned plow_pfgemm_glu_w8a8_gemma4_bk = PGM90_GEMMA4_GLU_W8A8_BK;
+extern "C" __device__ unsigned plow_pfgemm_glu_w8a8_gemma4_tile_band = PGM90_TILE_BAND;
+extern "C" __device__ unsigned plow_pfgemm_glu_w8a8_gemma4_direct_entry = 1;
 extern "C" __device__ unsigned plow_block_pfgemm_glu_w8a8_gemma4 = 384;
 extern "C" __device__ unsigned plow_arena_bytes_pfgemm_glu_w8a8_gemma4 =
     PGM90_GEMMA4_GLU_ARENA_BYTES;
@@ -47,6 +49,42 @@ __device__ __forceinline__ PlowStreamEnt gemma4_glu_w8a8_stream_ent(const PlowSt
     reinterpret_cast<uint2*>(&entry)[1] = reinterpret_cast<const uint2*>(address)[1];
     reinterpret_cast<uint2*>(&entry)[2] = reinterpret_cast<const uint2*>(address)[2];
     return entry;
+}
+
+typedef struct {
+    __nv_bfloat16* output;
+    const void* map_a;
+    const void* map_gate;
+    const void* map_up;
+    const float* input_scale;
+    const float* gate_scale;
+    const float* up_scale;
+    const PlowStreamEnt* entries;
+    const unsigned* succs;
+    unsigned* counters;
+    unsigned rows;
+} PlowGemma4GluW8A8Direct;
+static_assert(sizeof(PlowGemma4GluW8A8Direct) == 88, "Gemma-4 W8A8 GLU direct role ABI");
+
+extern "C" __global__ __maxnreg__(160)
+void plow_sm90a_pfgemm_glu_w8a8_gemma4_direct(PlowGemma4GluW8A8Direct args) {
+    extern __shared__ unsigned char arena[];
+    if (threadIdx.x < 128) {
+        sm90_reg_dec(32);
+        d_gemm_glu_w8a8_sm90_tma_ws384_gemma4_role<true>(
+            args.output, args.map_a, args.map_gate, args.map_up, args.input_scale,
+            args.gate_scale, args.up_scale, args.rows, blockIdx.x, gridDim.x, arena);
+    } else {
+        sm90_reg_inc(224);
+        d_gemm_glu_w8a8_sm90_tma_ws384_gemma4_role<false>(
+            args.output, args.map_a, args.map_gate, args.map_up, args.input_scale,
+            args.gate_scale, args.up_scale, args.rows, blockIdx.x, gridDim.x, arena);
+    }
+
+    __syncthreads();
+    const PlowStreamEnt entry = gemma4_glu_w8a8_stream_ent(args.entries + blockIdx.x);
+    for (unsigned s = threadIdx.x; s < entry.succ_len; s += blockDim.x)
+        gemma4_glu_w8a8_ctr_signal(PLOW_CTR(args.counters, args.succs[entry.succ_ofs + s]));
 }
 
 template <bool PROD>

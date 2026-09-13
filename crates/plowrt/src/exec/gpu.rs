@@ -719,6 +719,7 @@ struct PacketRole {
     function: KernelFn,
     direct_hd512: Option<KernelFn>,
     direct_hd256_gqa2: Option<KernelFn>,
+    direct_w8a8_glu: Option<KernelFn>,
     grid: u32,
     smem: u32,
     block: u32,
@@ -768,17 +769,39 @@ struct Hd256Gqa2DirectArgs {
 
 const _: () = assert!(std::mem::size_of::<Hd256Gqa2DirectArgs>() == 112);
 
-enum DirectAttentionArgs {
-    Hd512(Hd512Px4DirectArgs),
-    Hd256Gqa2(Hd256Gqa2DirectArgs),
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Gemma4GluW8A8DirectArgs {
+    output: u64,
+    map_a: u64,
+    map_gate: u64,
+    map_up: u64,
+    input_scale: u64,
+    gate_scale: u64,
+    up_scale: u64,
+    entries: u64,
+    succs: u64,
+    counters: u64,
+    rows: u32,
 }
 
-impl DirectAttentionArgs {
+const _: () = assert!(std::mem::size_of::<Gemma4GluW8A8DirectArgs>() == 88);
+
+enum DirectSegmentArgs {
+    Hd512(Hd512Px4DirectArgs),
+    Hd256Gqa2(Hd256Gqa2DirectArgs),
+    Gemma4GluW8A8(Gemma4GluW8A8DirectArgs),
+}
+
+impl DirectSegmentArgs {
     fn kernel_param(&mut self) -> *mut std::ffi::c_void {
         match self {
             Self::Hd512(args) => args as *mut Hd512Px4DirectArgs as *mut std::ffi::c_void,
             Self::Hd256Gqa2(args) => {
                 args as *mut Hd256Gqa2DirectArgs as *mut std::ffi::c_void
+            }
+            Self::Gemma4GluW8A8(args) => {
+                args as *mut Gemma4GluW8A8DirectArgs as *mut std::ffi::c_void
             }
         }
     }
@@ -4676,8 +4699,10 @@ impl GpuEngine {
                         ("plow_pfgemm_glu_w8a8_gemma4_bm", 128),
                         ("plow_pfgemm_glu_w8a8_gemma4_bn", 128),
                         ("plow_pfgemm_glu_w8a8_gemma4_bk", 128),
+                        ("plow_pfgemm_glu_w8a8_gemma4_tile_band", 16),
+                        ("plow_pfgemm_glu_w8a8_gemma4_direct_entry", 1),
                     ];
-                    if capability != Some(1) || block != Some(384) {
+                    if capability != Some(2) || block != Some(384) {
                         return Err(RuntimeError::Rejected(
                             "incompatible Gemma-4 W8A8 GemmGlu role".into(),
                         ));
@@ -4788,6 +4813,25 @@ impl GpuEngine {
             } else {
                 None
             };
+            let direct_w8a8_glu = if id
+                == plow_asset::segment_roles::W8A8_PREFILL_GEMM_GLU_GEMMA4
+            {
+                let direct = be.get_function(
+                    &module,
+                    "plow_sm90a_pfgemm_glu_w8a8_gemma4_direct",
+                )?;
+                be.set_max_dynamic_smem(direct, smem)?;
+                let direct_capacity =
+                    be.occupancy_blocks_per_sm(direct, block, smem as usize)? * be.sm_count();
+                if direct_capacity != grid {
+                    return Err(RuntimeError::Rejected(
+                        "Gemma-4 W8A8 GLU direct role occupancy must equal packet grid".into(),
+                    ));
+                }
+                Some(direct)
+            } else {
+                None
+            };
             if id == plow_asset::segment_roles::GEMV_CTA512 && smem != 65536 {
                 return Err(RuntimeError::Rejected(
                     "GEMV512 role requires the full 64 KiB arena".into(),
@@ -4825,6 +4869,7 @@ impl GpuEngine {
                 function,
                 direct_hd512,
                 direct_hd256_gqa2,
+                direct_w8a8_glu,
                 grid: role_grid,
                 smem,
                 block,
@@ -6848,37 +6893,48 @@ impl GpuEngine {
                 sites.sort_unstable();
             }
             for (seg, &role) in packet_segment_roles.iter().enumerate() {
-                if role != plow_asset::segment_roles::PREFILL_ATTENTION_HD512_PX4_BQ64 {
+                if !matches!(
+                    role,
+                    plow_asset::segment_roles::PREFILL_ATTENTION_HD512_PX4_BQ64
+                        | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_GQA2_BKV32
+                        | plow_asset::segment_roles::W8A8_PREFILL_GEMM_GLU_GEMMA4
+                ) {
                     continue;
                 }
                 let [site] = segment_sites[seg].as_slice() else {
                     return Err(RuntimeError::Rejected(
-                        "HD512 px4 direct role requires one instruction per segment".into(),
+                        "direct packet role requires one instruction per segment".into(),
                     ));
                 };
                 let inst = &g.insts[site.0];
                 let lo = g.gq_seg_ofs[seg] as usize;
                 let hi = g.gq_seg_ofs[seg + 1] as usize;
                 let entries = &g.gq_stream[lo..hi];
-                if site.1 != DevOp::FlashPrefill as u16
-                    || entries.len() != grid as usize
+                if entries.len() != grid as usize
                     || entries.iter().enumerate().any(|(slice, entry)| {
                         entry.inst as usize != site.0
                             || entry.slice as usize != slice
                             || entry.flags & packet::dev::SE_XCTR != 0
                     })
-                    || inst.i[0] != g.t
-                    || !matches!(inst.i[0], 4096 | 8192)
-                    || inst.i[2..8] != [16, 1, 0, 0, 512, 1]
                     || inst.blocks != grid as u16
-                    || inst.t[5] == TENSOR_NONE16
-                    || inst.t[6] != TENSOR_NONE16
-                    || inst.fj[0] != 1.0f32.to_bits()
-                    || inst.fj[1] == 0
-                    || inst.fj[2] != u32::MAX
                 {
                     return Err(RuntimeError::Rejected(
-                        "HD512 px4 direct role requires exact ordered Gemma-4 geometry".into(),
+                        "direct packet role requires an exact ordered grid".into(),
+                    ));
+                }
+                if role == plow_asset::segment_roles::PREFILL_ATTENTION_HD512_PX4_BQ64
+                    && (site.1 != DevOp::FlashPrefill as u16
+                        || inst.i[0] != g.t
+                        || !matches!(inst.i[0], 4096 | 8192)
+                        || inst.i[2..8] != [16, 1, 0, 0, 512, 1]
+                        || inst.t[5] == TENSOR_NONE16
+                        || inst.t[6] != TENSOR_NONE16
+                        || inst.fj[0] != 1.0f32.to_bits()
+                        || inst.fj[1] == 0
+                        || inst.fj[2] != u32::MAX)
+                {
+                    return Err(RuntimeError::Rejected(
+                        "HD512 px4 direct role requires exact Gemma-4 geometry".into(),
                     ));
                 }
             }
@@ -7486,19 +7542,22 @@ impl GpuEngine {
         Ok((function, grid, block, smem))
     }
 
-    fn direct_attention_segment(
+    fn direct_packet_segment(
         &self,
         bi: usize,
         seg: usize,
         arg: &DevProgram,
-    ) -> Result<Option<(KernelFn, DirectAttentionArgs)>> {
+    ) -> Result<Option<(KernelFn, DirectSegmentArgs)>> {
         let Some(index) = packet_role_index(&self.prefill[bi].packet_segment_roles, seg) else {
             return Ok(None);
         };
         let role = self.packet_roles[index]
             .as_ref()
             .expect("validated packet role object");
-        if role.direct_hd512.is_none() && role.direct_hd256_gqa2.is_none() {
+        if role.direct_hd512.is_none()
+            && role.direct_hd256_gqa2.is_none()
+            && role.direct_w8a8_glu.is_none()
+        {
             return Ok(None);
         }
         let [(pc, _)] = self.prefill[bi].segment_sites[seg].as_slice() else {
@@ -7507,7 +7566,9 @@ impl GpuEngine {
             ));
         };
         let inst = &self.prefill[bi].h_inst[*pc];
-        if inst.t[6] == TENSOR_NONE16 {
+        if (role.direct_hd512.is_some() || role.direct_hd256_gqa2.is_some())
+            && inst.t[6] == TENSOR_NONE16
+        {
             return Ok(None);
         }
         let tensor = |handle: u16| {
@@ -7522,7 +7583,7 @@ impl GpuEngine {
         if let Some(function) = role.direct_hd512 {
             return Ok(Some((
                 function,
-                DirectAttentionArgs::Hd512(Hd512Px4DirectArgs {
+                DirectSegmentArgs::Hd512(Hd512Px4DirectArgs {
                     requests: tensor(inst.t[6])?,
                     opart: tensor(inst.t[0])?,
                     mlpart: tensor(inst.t[1])?,
@@ -7541,7 +7602,7 @@ impl GpuEngine {
         if let Some(function) = role.direct_hd256_gqa2 {
             return Ok(Some((
                 function,
-                DirectAttentionArgs::Hd256Gqa2(Hd256Gqa2DirectArgs {
+                DirectSegmentArgs::Hd256Gqa2(Hd256Gqa2DirectArgs {
                     requests: tensor(inst.t[6])?,
                     opart: tensor(inst.t[0])?,
                     mlpart: tensor(inst.t[1])?,
@@ -7559,6 +7620,30 @@ impl GpuEngine {
                     kv_stride: inst.fj[1],
                     kv_mask: inst.fj[2],
                     scale: f32::from_bits(inst.fj[0]),
+                }),
+            )));
+        }
+        if let Some(function) = role.direct_w8a8_glu {
+            return Ok(Some((
+                function,
+                DirectSegmentArgs::Gemma4GluW8A8(Gemma4GluW8A8DirectArgs {
+                    output: tensor(inst.t[0])?,
+                    map_a: tensor(u16::try_from(inst.i[6]).map_err(|_| {
+                        RuntimeError::Rejected("direct W8A8 GLU A map handle".into())
+                    })?)?,
+                    map_gate: tensor(u16::try_from(inst.i[7]).map_err(|_| {
+                        RuntimeError::Rejected("direct W8A8 GLU gate map handle".into())
+                    })?)?,
+                    map_up: tensor(u16::try_from(inst.i[3]).map_err(|_| {
+                        RuntimeError::Rejected("direct W8A8 GLU up map handle".into())
+                    })?)?,
+                    input_scale: tensor(inst.t[3])?,
+                    gate_scale: tensor(inst.t[4])?,
+                    up_scale: tensor(inst.t[6])?,
+                    entries,
+                    succs: arg.succs,
+                    counters: arg.counters,
+                    rows: inst.i[0],
                 }),
             )));
         }
@@ -7653,8 +7738,12 @@ impl GpuEngine {
                             .packet_segment_roles
                             .iter()
                             .any(|&role| {
-                                role
-                                    == plow_asset::segment_roles::PREFILL_ATTENTION_HD512_PX4_BQ64
+                                matches!(
+                                    role,
+                                    plow_asset::segment_roles::PREFILL_ATTENTION_HD512_PX4_BQ64
+                                        | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_GQA2_BKV32
+                                        | plow_asset::segment_roles::W8A8_PREFILL_GEMM_GLU_GEMMA4
+                                )
                             });
                     let g = if has_external {
                         let capture_stream = self.be.stream_create()?;
@@ -7669,7 +7758,7 @@ impl GpuEngine {
                                 let (function, grid, block, smem) =
                                     self.prefill_segment_kernel(bi, seg, class, false)?;
                                 if let Some((direct, mut direct_arg)) =
-                                    self.direct_attention_segment(bi, seg, &arg)?
+                                    self.direct_packet_segment(bi, seg, &arg)?
                                 {
                                     let mut params = [direct_arg.kernel_param()];
                                     self.be.launch_cooperative(
@@ -7780,7 +7869,7 @@ impl GpuEngine {
                             .expect("validated packet role object")
                     });
                 let (f, gr, blk, sm) = self.prefill_segment_kernel(bi, seg, cls, fat_only)?;
-                let direct = self.direct_attention_segment(bi, seg, &arg)?;
+                let direct = self.direct_packet_segment(bi, seg, &arg)?;
                 let go = |f: KernelFn, params: &mut [*mut std::ffi::c_void]| -> Result<()> {
                     if noncoop {
                         self.be

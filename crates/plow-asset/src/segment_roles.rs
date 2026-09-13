@@ -55,7 +55,7 @@ pub const MXFP4_MOE_ABI: &str = "mxfp4_moe_sm90_v1";
 pub const W8A16_PREFILL_M1_ABI: &str = "w8a16_prefill_m1_sm90_v1";
 pub const BF16_PREFILL_GEMM_GLU_GEMMA4_ABI: &str = "gemm_glu_sm90_gemma4_4k8k_v1";
 pub const W8A8_PREFILL_GEMM_GLU_GEMMA4_ABI: &str =
-    "gemm_glu_w8a8_sm90_gemma4_4k8k_v1";
+    "gemm_glu_w8a8_sm90_gemma4_4k8k_v2";
 
 pub fn requires_object(role: u8) -> bool {
     matches!(
@@ -552,7 +552,7 @@ mod tests {
     #[test]
     fn gemma4_w8a8_gemm_glu_requires_exact_abi_and_hash() {
         let raw = format!(
-            r#"{{"version":1,"objects":{{"13":{{"abi":"gemm_glu_w8a8_sm90_gemma4_4k8k_v1","file":"glu.cubin","sha256":"{}"}}}},"programs":[{{"index":0,"roles":[0,13,0]}}]}}"#,
+            r#"{{"version":1,"objects":{{"13":{{"abi":"gemm_glu_w8a8_sm90_gemma4_4k8k_v2","file":"glu.cubin","sha256":"{}"}}}},"programs":[{{"index":0,"roles":[0,13,0]}}]}}"#,
             "a".repeat(64)
         );
         SegmentRoles::from_bytes(raw.as_bytes()).unwrap();

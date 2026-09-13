@@ -158,6 +158,7 @@ gemma_w8a8_glu_symbols=$(/usr/local/cuda/bin/cuobjdump -symbols \
   "$gemma_out/interp_sm90a_pfgemm_glu_w8a8_gemma4.cubin")
 for gemma_w8a8_glu_symbol in \
   plow_sm90a_pfgemm_glu_w8a8_gemma4 \
+  plow_sm90a_pfgemm_glu_w8a8_gemma4_direct \
   plow_pfgemm_glu_w8a8_gemma4_abi \
   plow_pfgemm_glu_w8a8_gemma4_min_rows \
   plow_pfgemm_glu_w8a8_gemma4_max_rows \
@@ -167,6 +168,8 @@ for gemma_w8a8_glu_symbol in \
   plow_pfgemm_glu_w8a8_gemma4_bm \
   plow_pfgemm_glu_w8a8_gemma4_bn \
   plow_pfgemm_glu_w8a8_gemma4_bk \
+  plow_pfgemm_glu_w8a8_gemma4_tile_band \
+  plow_pfgemm_glu_w8a8_gemma4_direct_entry \
   plow_block_pfgemm_glu_w8a8_gemma4 \
   plow_arena_bytes_pfgemm_glu_w8a8_gemma4 \
   plow_pf_request_abi \
