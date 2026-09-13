@@ -696,10 +696,10 @@ impl RuntimeConfig {
         self.amd.kernarg_vram.unwrap_or(true)
     }
 
-    /// AMD long-context tail placement floor (`PLOW_AMD_TAIL_SPARSE_CTX`). Unset → 16384
+    /// AMD long-context tail placement floor (`PLOW_AMD_TAIL_SPARSE_CTX`). Unset → 8192
     /// rows; `0` → off. Acts only on packets with a sparse (DSA) prefill rung.
     pub fn amd_tail_sparse_ctx(&self) -> Option<u32> {
-        match self.amd.tail_sparse_ctx.unwrap_or(16384) {
+        match self.amd.tail_sparse_ctx.unwrap_or(8192) {
             0 => None,
             rows => Some(rows),
         }
@@ -1544,7 +1544,7 @@ mod tests {
         use clap::{Args, FromArgMatches};
         let command = super::RuntimeConfig::augment_args(clap::Command::new("test"));
         for (args, want) in [
-            (&["test"][..], Some(16384)),
+            (&["test"][..], Some(8192)),
             (&["test", "--amd-tail-sparse-ctx=0"][..], None),
             (&["test", "--amd-tail-sparse-ctx=32768"][..], Some(32768)),
         ] {
