@@ -46,7 +46,7 @@ parking_lot = "0.12"
 rustc-hash = "2"
 smallvec = { version = "1", features = ["union"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net"] }
-axum = "0.7"
+axum = { version = "0.7", features = ["multipart", "ws"] }
 # Direct hyper access is used to serve the same axum router over a Unix domain
 # socket alongside the TCP listener (axum 0.7's `serve` only takes TcpListener).
 hyper = { version = "1", features = ["http1", "http2", "server"] }
@@ -56,6 +56,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive", "env"] }
 futures = "0.3"
+hound = "3.5"
+rustfft = "6"
 
 # Optional: real tokenizer + checkpoint reader. Off by default so the skeleton
 # builds fast and offline; a byte-fallback tokenizer stands in when absent.
@@ -71,6 +73,7 @@ zstd = { version = "0.13", optional = true }
 # static binary carries no link-time GPU dependency, and NVIDIA + AMD libs can be
 # loaded side-by-side in one process (distinct `cu*` / `hsa_*` symbol namespaces).
 libloading = { version = "0.8", optional = true }
+gguf-rs-lib = { version = "0.3", optional = true }
 # CPU engine: thread affinity / mbind for the persistent worker pool
 # (`exec::cpu`). Optional because only the `cpu` feature links the kernel lib.
 libc = { version = "0.2", optional = true }
@@ -127,8 +130,14 @@ cuda = ["dep:libloading", "dep:safetensors", "hf-tokenizer"]
 # side, 2026-07-19). The features stay symmetric so an AMD serve cannot inherit
 # a failure mode the NVIDIA one was fixed for.
 hsa = ["dep:libloading", "dep:safetensors", "hf-tokenizer"]
+# Generic GGUF asset reader; it is independent of the execution backend.
+gguf = ["dep:gguf-rs-lib"]
+# In-process adapter for NVIDIA NeMo-Speech's stable ASR C ABI. The selected
+# runtime library supplies its own CPU/CUDA/Metal kernels at deployment time.
+nemo-asr = ["dep:libloading", "gguf"]
 
 [dev-dependencies]
+tokio-tungstenite = "0.24"
 plow-asset = { workspace = true, features = ["test-util"] }
 # `tests/op_audit_families.rs` emits one miniature blob per model family and runs
 # the operator audit over it. Emission is host-only (`arch: ""`, config.json with
@@ -161,3 +170,129 @@ required-features = ["cuda"]
 [[example]]
 name = "s1_switch_bench"
 required-features = ["cuda"]
+
+[[example]]
+name = "asr_check"
+path = "examples/asr/check.rs"
+
+[[example]]
+name = "asr_dataset"
+path = "examples/asr/dataset.rs"
+
+[[example]]
+name = "asr_packet_dataset"
+path = "examples/asr/packet_dataset.rs"
+
+[[example]]
+name = "asr_batch_check"
+path = "examples/asr/batch_check.rs"
+
+[[example]]
+name = "asr_batch_dataset"
+path = "examples/asr/batch_dataset.rs"
+
+[[example]]
+name = "asr_stream"
+path = "examples/asr/stream.rs"
+
+[[example]]
+name = "asr_decoder_trace"
+path = "examples/asr/decoder_trace.rs"
+
+[[example]]
+name = "asr_matrix_sweep"
+path = "examples/asr/matrix_sweep.rs"
+
+[[example]]
+name = "asr_slot_check"
+path = "examples/asr/slot_check.rs"
+
+[[example]]
+name = "asr_nemotron"
+path = "examples/asr/nemotron.rs"
+required-features = ["nemo-asr"]
+
+[[example]]
+name = "asr_nemotron_dataset"
+path = "examples/asr/nemotron_dataset.rs"
+required-features = ["nemo-asr"]
+
+[[example]]
+name = "asr_qwen_conv_packet"
+path = "examples/asr/qwen_conv_packet.rs"
+required-features = ["metal"]
+
+[[example]]
+name = "asr_nemotron_q8"
+path = "examples/asr/nemotron_q8.rs"
+required-features = ["gguf"]
+
+[[example]]
+name = "asr_nemotron_q8_metal"
+path = "examples/asr/nemotron_q8_metal.rs"
+required-features = ["gguf", "metal"]
+
+[[example]]
+name = "asr_nemotron_q8_gemm_metal"
+path = "examples/asr/nemotron_q8_gemm_metal.rs"
+required-features = ["gguf", "metal"]
+
+[[example]]
+name = "asr_nemotron_frontend"
+path = "examples/asr/nemotron_frontend.rs"
+required-features = ["gguf"]
+
+[[example]]
+name = "asr_nemotron_subsampling"
+path = "examples/asr/nemotron_subsampling.rs"
+required-features = ["gguf"]
+
+[[example]]
+name = "asr_nemotron_subsampling_metal"
+path = "examples/asr/nemotron_subsampling_metal.rs"
+required-features = ["gguf", "metal"]
+
+[[example]]
+name = "asr_nemotron_projection_metal"
+path = "examples/asr/nemotron_projection_metal.rs"
+required-features = ["gguf", "metal"]
+
+[[example]]
+name = "asr_nemotron_conformer"
+path = "examples/asr/nemotron_conformer.rs"
+required-features = ["gguf"]
+
+[[example]]
+name = "asr_nemotron_encoder"
+path = "examples/asr/nemotron_encoder.rs"
+required-features = ["gguf"]
+
+[[example]]
+name = "asr_nemotron_conformer_metal"
+path = "examples/asr/nemotron_conformer_metal.rs"
+required-features = ["gguf", "metal"]
+
+[[example]]
+name = "asr_nemotron_encoder_metal"
+path = "examples/asr/nemotron_encoder_metal.rs"
+required-features = ["gguf", "metal"]
+
+[[example]]
+name = "asr_nemotron_packet_metal"
+path = "examples/asr/nemotron_packet_metal.rs"
+required-features = ["gguf", "metal"]
+
+[[example]]
+name = "asr_rnnt_packet"
+path = "examples/asr/rnnt_packet.rs"
+required-features = ["gguf", "cpu"]
+
+[[example]]
+name = "asr_nemotron_rnnt_compile"
+path = "examples/asr/nemotron_rnnt_compile.rs"
+required-features = ["gguf"]
+
+[[example]]
+name = "asr_nemotron_pipeline_compile"
+path = "examples/asr/nemotron_pipeline_compile.rs"
+required-features = ["gguf"]

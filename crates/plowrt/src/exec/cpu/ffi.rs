@@ -398,3 +398,251 @@ pub mod abi {
 
 /// `PLOW_CPU_DOP_TABLE`: dispatch-table extent on the C side.
 pub const DOP_TABLE: usize = 256;
+
+#[cfg(test)]
+mod f32_packet_tests {
+    use super::*;
+    use packet::dev::{DevOp, TENSOR_NONE16};
+
+    fn inst(op: DevOp) -> DevInst64 {
+        DevInst64 {
+            op: op as u16,
+            blocks: 1,
+            fj: [0; 3],
+            t: [TENSOR_NONE16; 8],
+            i: [0; 8],
+        }
+    }
+
+    #[test]
+    fn q8_projection_and_layer_norm_execute_as_packets() {
+        init(Isa::Scalar).unwrap();
+        let input: Vec<f32> = (0..64).map(|i| i as f32 / 16.0 - 2.0).collect();
+        let mut weight = Vec::new();
+        for row in 0..2 {
+            weight.extend_from_slice(&0x3c00u16.to_le_bytes());
+            weight.extend((0..32).map(|i| (i as i8 - 16 + row) as u8));
+        }
+        let mut projected = vec![0.0f32; 4];
+        let mut table = vec![std::ptr::null_mut(); 4];
+        table[0] = projected.as_mut_ptr().cast();
+        table[1] = input.as_ptr().cast_mut().cast();
+        table[2] = weight.as_ptr().cast_mut().cast();
+        let mut q8 = inst(DevOp::Q8GemmF32);
+        q8.t[..4].copy_from_slice(&[0, 1, 2, TENSOR_NONE16]);
+        q8.i[..4].copy_from_slice(&[2, 2, 32, 0]);
+        let mut ctx = PlowCpuCtx::new(0, 0);
+        unsafe { kernel(q8.op).unwrap()(&q8, 0, 1, table.as_ptr(), &mut ctx) };
+        for row in 0..2 {
+            for column in 0..2 {
+                let expected = (0..32)
+                    .map(|i| input[row * 32 + i] * (i as f32 - 16.0 + column as f32))
+                    .sum::<f32>();
+                assert!((projected[row * 2 + column] - expected).abs() < 1e-5);
+            }
+        }
+
+        let gamma = [1.0f32, 1.0];
+        let beta = [0.0f32, 0.0];
+        let mut normalized = [0.0f32; 4];
+        table[0] = normalized.as_mut_ptr().cast();
+        table[1] = projected.as_ptr().cast_mut().cast();
+        table[2] = gamma.as_ptr().cast_mut().cast();
+        table[3] = beta.as_ptr().cast_mut().cast();
+        let mut norm = inst(DevOp::LayerNormF32);
+        norm.t[..4].copy_from_slice(&[0, 1, 2, 3]);
+        norm.i[..3].copy_from_slice(&[2, 2, 3]);
+        norm.fj[0] = 1e-5f32.to_bits();
+        unsafe { kernel(norm.op).unwrap()(&norm, 0, 1, table.as_ptr(), &mut ctx) };
+        assert!(normalized.iter().all(|value| value.is_finite()));
+        assert!(normalized.iter().all(|value| value.to_bits() & 0xffff == 0));
+        assert!((normalized[0] + normalized[1]).abs() < 1e-5);
+        assert!((normalized[2] + normalized[3]).abs() < 1e-5);
+    }
+
+    #[test]
+    fn rnnt_f32_primitives_execute_as_packets() {
+        init(Isa::Scalar).unwrap();
+        let mut ctx = PlowCpuCtx::new(0, 0);
+        let input = [1.0f32, 2.0, 3.0, 4.0];
+        let weight = [1.0f32, 0.0, 0.0, 1.0];
+        let bias = [-2.0f32, -1.0];
+        let mut projected = [0.0f32; 4];
+        let mut table = vec![std::ptr::null_mut(); 5];
+        table[0] = projected.as_mut_ptr().cast();
+        table[1] = input.as_ptr().cast_mut().cast();
+        table[2] = weight.as_ptr().cast_mut().cast();
+        table[3] = bias.as_ptr().cast_mut().cast();
+        let mut dense = inst(DevOp::DenseGemmF32);
+        dense.t[..4].copy_from_slice(&[0, 1, 2, 3]);
+        dense.i[..4].copy_from_slice(&[2, 2, 2, 1]);
+        unsafe { kernel(dense.op).unwrap()(&dense, 0, 1, table.as_ptr(), &mut ctx) };
+        assert_eq!(projected, [0.0, 1.0, 1.0, 3.0]);
+
+        let strided_weight = [1.0f32, 0.0, 10.0, 0.0, 1.0, 20.0];
+        table[2] = strided_weight.as_ptr().cast_mut().cast();
+        dense.i[5] = 3;
+        dense.i[6] = 2;
+        unsafe { kernel(dense.op).unwrap()(&dense, 0, 1, table.as_ptr(), &mut ctx) };
+        assert_eq!(projected, [9.0, 21.0, 11.0, 23.0]);
+
+        let bf16_weight = [0x3f80u16, 0, 0, 0x3f80];
+        table[2] = bf16_weight.as_ptr().cast_mut().cast();
+        dense.i[5] = 0;
+        dense.i[6] = 0;
+        dense.i[7] = 4;
+        unsafe { kernel(dense.op).unwrap()(&dense, 0, 1, table.as_ptr(), &mut ctx) };
+        assert_eq!(projected, [0.0, 1.0, 1.0, 3.0]);
+
+        let embedding = [0x3f80u16, 0x4000, 0x4040, 0x4080];
+        let tokens = [1u32, 0, 0];
+        let overlay = [1.001f32, -2.25];
+        let overlay_index = [u32::MAX, 0, u32::MAX];
+        let mut spliced = [0u16; 6];
+        table[0] = spliced.as_mut_ptr().cast();
+        table[1] = embedding.as_ptr().cast_mut().cast();
+        table[2] = tokens.as_ptr().cast_mut().cast();
+        table[3] = overlay.as_ptr().cast_mut().cast();
+        table[4] = overlay_index.as_ptr().cast_mut().cast();
+        let mut splice = inst(DevOp::EmbedOverlayBf16);
+        splice.t[..5].copy_from_slice(&[0, 1, 2, 3, 4]);
+        splice.i[..4].copy_from_slice(&[3, 2, 2, 1]);
+        unsafe { kernel(splice.op).unwrap()(&splice, 0, 1, table.as_ptr(), &mut ctx) };
+        let bits = overlay[0].to_bits();
+        let rounded = ((bits + 0x7fff + ((bits >> 16) & 1)) >> 16) as u16;
+        assert_eq!(spliced, [0x4040, 0x4080, rounded, 0xc010, 0x3f80, 0x4000]);
+
+        let convolution_weight = [0x3c00u16, 0xbc00];
+        let convolution_bias = [0.0f32; 2];
+        let mut convolution_output = [f32::NAN; 8];
+        table[0] = convolution_output.as_mut_ptr().cast();
+        table[1] = input.as_ptr().cast_mut().cast();
+        table[2] = convolution_weight.as_ptr().cast_mut().cast();
+        table[3] = convolution_bias.as_ptr().cast_mut().cast();
+        let mut convolution = inst(DevOp::Conv2dF32);
+        convolution.t[..4].copy_from_slice(&[0, 1, 2, 3]);
+        convolution.i.copy_from_slice(&[2, 2, 1, 2, 1, 1, 0, 0]);
+        convolution.fj[1] = 2 | 4;
+        unsafe { kernel(convolution.op).unwrap()(&convolution, 0, 1, table.as_ptr(), &mut ctx) };
+        assert_eq!(convolution_output, [1.0, 2.0, 0.0, 0.0, 3.0, 4.0, 0.0, 0.0]);
+
+        let convolution_weight_f32 = [1.0f32, -1.0];
+        table[2] = convolution_weight_f32.as_ptr().cast_mut().cast();
+        convolution_output.fill(f32::NAN);
+        convolution.fj[1] = (2 << 2) | (2 << 4) | (1 << 6);
+        convolution.fj[2] = 2;
+        convolution.i[..4].copy_from_slice(&[1, 2, 1, 2]);
+        unsafe { kernel(convolution.op).unwrap()(&convolution, 0, 1, table.as_ptr(), &mut ctx) };
+        assert_eq!(
+            convolution_output,
+            [1.0, 2.0, -1.0, -2.0, 3.0, 4.0, -3.0, -4.0]
+        );
+
+        let packed_input = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let mut packed_rows = [f32::NAN; 6];
+        table[0] = packed_rows.as_mut_ptr().cast();
+        table[1] = packed_input.as_ptr().cast_mut().cast();
+        let mut pack = inst(DevOp::PackNcfwRowsF32);
+        pack.t[..2].copy_from_slice(&[0, 1]);
+        pack.i[..5].copy_from_slice(&[3, 2, 1, 2, 2]);
+        unsafe { kernel(pack.op).unwrap()(&pack, 0, 1, table.as_ptr(), &mut ctx) };
+        assert_eq!(packed_rows, [1.0, 3.0, 2.0, 4.0, 5.0, 7.0]);
+        packed_rows.fill(f32::NAN);
+        pack.i[0] = 5;
+        unsafe { kernel(pack.op).unwrap()(&pack, 0, 1, table.as_ptr(), &mut ctx) };
+        assert!(packed_rows.iter().all(|value| value.is_nan()));
+
+        let attention_query = [0.0f32; 8];
+        let attention_key = [0.0f32; 8];
+        let attention_value = [1.0f32, 10.0, 3.0, 30.0, 100.0, 1000.0, 300.0, 3000.0];
+        let mut attention_output = [f32::NAN; 8];
+        table[0] = attention_output.as_mut_ptr().cast();
+        table[1] = attention_query.as_ptr().cast_mut().cast();
+        table[2] = attention_key.as_ptr().cast_mut().cast();
+        table[3] = attention_value.as_ptr().cast_mut().cast();
+        let mut attention = inst(DevOp::GroupedAttentionF32);
+        attention.t[..4].copy_from_slice(&[0, 1, 2, 3]);
+        attention.i[..5].copy_from_slice(&[4, 2, 1, 2, 0]);
+        unsafe { kernel(attention.op).unwrap()(&attention, 0, 1, table.as_ptr(), &mut ctx) };
+        assert_eq!(
+            attention_output,
+            [2.0, 20.0, 2.0, 20.0, 200.0, 2000.0, 200.0, 2000.0]
+        );
+        let valid_rows = 1u32;
+        table[4] = (&valid_rows as *const u32).cast_mut().cast();
+        attention.t[4] = 4;
+        attention_output.fill(f32::NAN);
+        unsafe { kernel(attention.op).unwrap()(&attention, 0, 1, table.as_ptr(), &mut ctx) };
+        assert_eq!(&attention_output[..2], &[1.0, 10.0]);
+        assert!(attention_output[2..].iter().all(|value| value.is_nan()));
+
+        let dense_input = [1.001f32];
+        let dense_weight = [1.0f32];
+        let mut rounded = [f32::NAN];
+        table[0] = rounded.as_mut_ptr().cast();
+        table[1] = dense_input.as_ptr().cast_mut().cast();
+        table[2] = dense_weight.as_ptr().cast_mut().cast();
+        let mut dense_bf16 = inst(DevOp::DenseGemmF32);
+        dense_bf16.t[..4].copy_from_slice(&[0, 1, 2, TENSOR_NONE16]);
+        dense_bf16.i[..4].copy_from_slice(&[1, 1, 1, 0]);
+        dense_bf16.i[7] = 1;
+        unsafe { kernel(dense_bf16.op).unwrap()(&dense_bf16, 0, 1, table.as_ptr(), &mut ctx) };
+        let bits = dense_input[0].to_bits();
+        let expected = f32::from_bits((bits + 0x7fff + ((bits >> 16) & 1)) & 0xffff_0000);
+        assert_eq!(rounded, [expected]);
+
+        let addend = [0.0f32];
+        table[0] = rounded.as_mut_ptr().cast();
+        table[1] = dense_input.as_ptr().cast_mut().cast();
+        table[2] = addend.as_ptr().cast_mut().cast();
+        let mut scaled_add = inst(DevOp::ScaledAddF32);
+        scaled_add.t[..3].copy_from_slice(&[0, 1, 2]);
+        scaled_add.i[..2].copy_from_slice(&[1, 1]);
+        scaled_add.fj[0] = 1.0f32.to_bits();
+        unsafe { kernel(scaled_add.op).unwrap()(&scaled_add, 0, 1, table.as_ptr(), &mut ctx) };
+        assert_eq!(rounded, [expected]);
+
+        let query = [1.0f32, 0.0, 0.0, 1.0];
+        let key = query;
+        let value = [1.0f32, 2.0, 3.0, 4.0];
+        let mut attended = [f32::NAN; 4];
+        table[0] = attended.as_mut_ptr().cast();
+        table[1] = query.as_ptr().cast_mut().cast();
+        table[2] = key.as_ptr().cast_mut().cast();
+        table[3] = value.as_ptr().cast_mut().cast();
+        let mut attention = inst(DevOp::GroupedAttentionF32);
+        attention.t[..4].copy_from_slice(&[0, 1, 2, 3]);
+        attention.i[..5].copy_from_slice(&[2, 2, 2, 2, 0]);
+        unsafe { kernel(attention.op).unwrap()(&attention, 0, 1, table.as_ptr(), &mut ctx) };
+        assert!((attended[0] - 1.6604769).abs() < 1e-6);
+        assert!((attended[1] - 2.660477).abs() < 1e-6);
+        assert!((attended[2] - 2.339523).abs() < 1e-6);
+        assert!((attended[3] - 3.339523).abs() < 1e-6);
+
+        let gates = [0.0f32; 8];
+        let previous = [1.0f32; 2];
+        let mut hidden = [0.0f32; 2];
+        let mut cell = [0.0f32; 2];
+        table[0] = hidden.as_mut_ptr().cast();
+        table[1] = cell.as_mut_ptr().cast();
+        table[2] = gates.as_ptr().cast_mut().cast();
+        table[3] = previous.as_ptr().cast_mut().cast();
+        let mut lstm = inst(DevOp::LstmCellF32);
+        lstm.t[..4].copy_from_slice(&[0, 1, 2, 3]);
+        lstm.i[0] = 2;
+        unsafe { kernel(lstm.op).unwrap()(&lstm, 0, 1, table.as_ptr(), &mut ctx) };
+        assert_eq!(cell, [0.5, 0.5]);
+        let expected = 0.5 * 0.5f32.tanh();
+        assert!(hidden.iter().all(|value| (*value - expected).abs() < 1e-7));
+
+        let scores = [1.0f32, 5.0, 5.0, -1.0, 2.0, 3.0];
+        let mut ids = [u32::MAX; 2];
+        table[0] = ids.as_mut_ptr().cast();
+        table[1] = scores.as_ptr().cast_mut().cast();
+        let mut argmax = inst(DevOp::ArgmaxF32);
+        argmax.t[..2].copy_from_slice(&[0, 1]);
+        argmax.i[..2].copy_from_slice(&[2, 3]);
+        unsafe { kernel(argmax.op).unwrap()(&argmax, 0, 1, table.as_ptr(), &mut ctx) };
+        assert_eq!(ids, [1, 2]);
+    }
+}

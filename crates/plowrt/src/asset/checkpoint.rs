@@ -40,6 +40,59 @@ pub struct Checkpoint {
     index: FxHashMap<String, Entry>,
 }
 
+#[cfg(test)]
+mod affine_q4_tests {
+    use super::*;
+
+    fn checkpoint() -> Checkpoint {
+        let mut index = FxHashMap::default();
+        for (suffix, dtype, cols, size) in [
+            ("", safetensors::Dtype::U32, 16, 4),
+            ("_scale", safetensors::Dtype::BF16, 2, 2),
+            ("_bias", safetensors::Dtype::BF16, 2, 2),
+        ] {
+            index.insert(
+                format!("affineq4/proj.weight{suffix}"),
+                Entry {
+                    shard: 0,
+                    range: 0..3 * cols * size,
+                    shape: vec![3, cols],
+                    fp8: false,
+                    dtype,
+                },
+            );
+        }
+        Checkpoint {
+            shards: Vec::new(),
+            index,
+        }
+    }
+
+    #[test]
+    fn affine_q4_requires_complete_typed_group64_matrices() {
+        let name = "affineq4/proj.weight";
+        checkpoint().validate_affine_q4(name, 3, 128).unwrap();
+        for (n, k) in [(0, 128), (3, 0), (3, 127), (6, 64), (3, 256)] {
+            assert!(checkpoint().validate_affine_q4(name, n, k).is_err());
+        }
+        for suffix in ["", "_scale", "_bias"] {
+            let key = format!("{name}{suffix}");
+            let mut ck = checkpoint();
+            ck.index.remove(&key);
+            assert!(ck.validate_affine_q4(name, 3, 128).is_err());
+            let mut ck = checkpoint();
+            ck.index.get_mut(&key).unwrap().dtype = safetensors::Dtype::F16;
+            assert!(ck.validate_affine_q4(name, 3, 128).is_err());
+            let mut ck = checkpoint();
+            ck.index.get_mut(&key).unwrap().shape.reverse();
+            assert!(ck.validate_affine_q4(name, 3, 128).is_err());
+            let mut ck = checkpoint();
+            ck.index.get_mut(&key).unwrap().range.end -= 1;
+            assert!(ck.validate_affine_q4(name, 3, 128).is_err());
+        }
+    }
+}
+
 /// One tensor's location and shape.
 ///
 /// The shape is kept because a ROW-parallel shard cannot be expressed without
@@ -193,6 +246,33 @@ impl Checkpoint {
 
     pub fn dtype(&self, name: &str) -> Option<safetensors::Dtype> {
         self.index.get(name).map(|e| e.dtype)
+    }
+
+    pub(crate) fn validate_affine_q4(&self, name: &str, n: usize, k: usize) -> Result<()> {
+        if !name.starts_with("affineq4/") || n == 0 || k == 0 || k % 64 != 0 {
+            return Err(RuntimeError::Device(format!(
+                "invalid affine Q4 matrix {name}: N={n}, K={k}"
+            )));
+        }
+        for (suffix, dtype, cols, size) in [
+            ("", safetensors::Dtype::U32, k / 8, 4),
+            ("_scale", safetensors::Dtype::BF16, k / 64, 2),
+            ("_bias", safetensors::Dtype::BF16, k / 64, 2),
+        ] {
+            let key = format!("{name}{suffix}");
+            let e = self
+                .index
+                .get(&key)
+                .ok_or_else(|| RuntimeError::Device(format!("missing affine Q4 tensor {key}")))?;
+            let bytes = n.checked_mul(cols).and_then(|v| v.checked_mul(size));
+            if e.dtype != dtype || e.shape != [n, cols] || bytes != Some(e.range.len()) {
+                return Err(RuntimeError::Device(format!(
+                    "affine Q4 tensor {key}: expected {dtype:?} [{n}, {cols}], got {:?} {:?} ({} bytes)",
+                    e.dtype, e.shape, e.range.len()
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Is `name` an OCP e4m3 (`F8_E4M3`) payload? Drives the loader's 0x80

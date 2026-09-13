@@ -38,6 +38,10 @@ model, formal verification, multi-GPU. Build-system rationale:
 [`docs/BUILD.md`](docs/BUILD.md). Every emit/build/runtime flag:
 [`docs/flags-reference.md`](docs/flags-reference.md).
 
+ASR architecture: [packet pipelines for Qwen3-ASR and Nemotron
+RNNT](docs/arch/18-asr-pipelines.md). Commands, protocol and validation details:
+[ASR runtime guide](docs/runtime/asr.md).
+
 Bringing up a new model: a staged playbook — operator IR → rewrite rules →
 formal verification → kernel tuning → single-block sweep → runtime
 optimization → measured campaign — lives in
@@ -180,6 +184,64 @@ Measured campaigns and their protocols live in
 [`perf-data/plow-gfx942/`](perf-data/plow-gfx942/).
 The full Kimi-K3 TP8/MI325X build and serving recipe is
 [`docs/amd/kimi-k3-mi325x.md`](docs/amd/kimi-k3-mi325x.md).
+
+## ASR quickstart (Apple Silicon)
+
+The verified optimized ASR backend is Metal on Apple Silicon. Put the complete
+Qwen Hugging Face snapshot and Nemotron GGUF at the paths below, then build the
+compiler, runtime and Nemotron packet compiler:
+
+```bash
+nix develop -c cargo build --release -p plowc
+nix develop -c cargo build --release -p plowrt --features metal,gguf \
+  --bin plowrt --example asr_nemotron_pipeline_compile
+```
+
+Compile and transcribe with Qwen3-ASR-1.7B:
+
+```bash
+QWEN=models/Qwen3-ASR-1.7B
+QWEN_ASSET=plow-out/qwen3-asr-1.7b
+
+nix develop -c target/release/plowc --emit devblob \
+  --hf-dir "$QWEN" --gpu m4pro --max-ctx 2048 --out "$QWEN_ASSET"
+
+nix develop -c target/release/plowrt asr \
+  --packet "$QWEN_ASSET/model.pkt" --tokenizer "$QWEN" \
+  --audio speech.wav --backend metal
+```
+
+Compile and transcribe with Nemotron 3.5 ASR Streaming 0.6B:
+
+```bash
+NEMO=models/nemotron-3.5-asr-streaming-0.6b/model.gguf
+
+nix develop -c target/release/examples/asr_nemotron_pipeline_compile \
+  "$NEMO" \
+  200,400,600,800,1000,1200,1400,1600,1800,2000,2200,2400,2600,2800,3000 \
+  /tmp/nemotron.pkt 16 16
+
+nix develop -c target/release/plowrt asr \
+  --packet /tmp/nemotron.pkt --tokenizer "$NEMO" \
+  --audio speech.wav --language en-US --backend metal
+```
+
+Omit `--audio` and add `--port 8080 --websocket` to serve either packet:
+
+```bash
+nix develop -c target/release/plowrt asr \
+  --packet "$QWEN_ASSET/model.pkt" --tokenizer "$QWEN" \
+  --backend metal --port 8080 --websocket
+
+curl --fail http://127.0.0.1:8080/v1/audio/transcriptions \
+  -F model=decode -F file=@speech.wav -F language=English
+```
+
+The request model is the packet pipeline name: `decode` for the current Qwen
+asset and `transcribe` for Nemotron. Input is 16 kHz WAV, 0.5–30 seconds. The
+WebSocket route is `/v1/audio/transcriptions/stream` and currently returns one
+final transcript after `finish`. See the [ASR runtime guide](docs/runtime/asr.md)
+for the framing and credit protocol.
 
 ## Getting a model without building one
 

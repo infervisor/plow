@@ -349,8 +349,9 @@ async fn completion_and_tokenize_apply_requested_special_tokens() {
         assert_eq!(result["token_ids"]["prompt"], serde_json::json!(expected));
         assert_eq!(result["usage"]["prompt_tokens"], expected.len());
     }
+    // `/tokenize` defaults `add_special_tokens` to true, like `/v1/completions` and vLLM.
     for (special, expected) in [
-        (None, vec![0]),
+        (None, vec![2, 0]),
         (Some(true), vec![2, 0]),
         (Some(false), vec![0]),
     ] {

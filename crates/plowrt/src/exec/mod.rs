@@ -49,6 +49,7 @@ pub mod mixed_packet;
 pub(crate) mod mixed_program;
 pub mod mixed_step_staging;
 pub mod oob;
+pub mod packet_runtime;
 pub mod queue;
 /// Multi-GPU (tensor-parallel) device group: peer buffers, cross-GPU counters,
 /// and the per-token launch discipline. See the design notes.

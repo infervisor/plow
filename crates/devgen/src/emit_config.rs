@@ -78,6 +78,10 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_MXFP4", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub mxfp4: bool,
 
+    /// Unsigned affine Q4 weights, BF16 activations, and BF16 group64 scale/bias.
+    #[arg(long, env = "PLOW_AFFINE_Q4", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub affine_q4: bool,
+
     /// e4m3 KV cache (halves KV bytes). Lossy — greedy diverges after ~21
     /// tokens.
     #[arg(long, env = "PLOW_FP8_KV", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
@@ -917,6 +921,7 @@ impl EmitConfig {
             w8a8: env_bool("PLOW_W8A8"),
             w8a16: env_bool("PLOW_W8A16"),
             mxfp4: env_bool("PLOW_MXFP4"),
+            affine_q4: env_bool("PLOW_AFFINE_Q4"),
             fp8_kv: env_bool("PLOW_FP8_KV") || env_bool("PLOW_KV_FP8"),
             fp8_kv_full: env_bool("PLOW_FP8_KV_FULL"),
             fp8_head: env_bool("PLOW_FP8_HEAD"),

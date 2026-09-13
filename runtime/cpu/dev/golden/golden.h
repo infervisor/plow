@@ -43,6 +43,27 @@ G_K(g_gemv);
 G_K(g_gemv_glu);
 G_K(g_gemv_qkv);
 G_K(g_gemv_argmax);
+/* f32_primitives.c */
+G_K(g_q8_gemm_f32);
+G_K(g_layernorm_f32);
+G_K(g_scaled_add_f32);
+G_K(g_glu_f32);
+G_K(g_causal_depthwise_conv1d_f32);
+G_K(g_relative_attention_f32);
+G_K(g_silu_f32);
+G_K(g_dense_gemm_f32);
+G_K(g_conv2d_f32);
+G_K(g_pack_ncfw_rows_f32);
+G_K(g_embed_f16_f32);
+G_K(g_embed_overlay_bf16);
+G_K(g_lstm_cell_f32);
+G_K(g_argmax_f32);
+G_K(g_relu_f32);
+G_K(g_broadcast_add_f32);
+G_K(g_grouped_attention_f32);
+/* affine_q4.c */
+G_K(g_gemv_affine_q4);
+G_K(g_gemm_affine_q4);
 /* attention.c */
 G_K(g_flash_prefill);
 G_K(g_flash_decode);

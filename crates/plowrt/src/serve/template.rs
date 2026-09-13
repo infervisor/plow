@@ -70,6 +70,19 @@ fn find(dir: &Path) -> Option<(String, String, Option<String>, Option<String>)> 
         if let Some(text) = read_to_string(&jinja) {
             return Some((text, jinja.display().to_string(), tok("bos_token"), tok("eos_token")));
         }
+        let json_path = base.join("chat_template.json");
+        if let Some(text) = read_to_string(&json_path)
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| v.get("chat_template")?.as_str().map(str::to_owned))
+            .filter(|s| !s.trim().is_empty())
+        {
+            return Some((
+                text,
+                json_path.display().to_string(),
+                tok("bos_token"),
+                tok("eos_token"),
+            ));
+        }
         if let Some(text) = cfg
             .as_ref()
             .and_then(|c| c.get("chat_template"))

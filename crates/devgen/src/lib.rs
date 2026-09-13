@@ -65,12 +65,18 @@ mod qwen35;
 #[cfg(test)]
 mod test_env;
 use mla::{glm_emit_block, glm_main, kimi_emit_block, nemotron_emit_block, MlaArch};
+pub mod asr_subsampling;
+pub mod asr;
+pub mod conv2d;
 mod decode_objects;
 pub mod dispatch_audit;
+pub mod conformer;
 mod gemv_decode_role;
 pub mod manifest;
 mod mxfp4_moe_role;
+pub mod pipeline;
 mod projection_rewrite;
+pub mod rnnt;
 pub mod tune_demand;
 
 // # THE `PLOW_*` FLAG AUDIT (target dependence)
@@ -1589,7 +1595,11 @@ fn amd_rung_specs(build_label: &str, isa: hwspec::IsaLevel) -> Vec<kernelcaps::K
         // was 256 wide. `hwspec` already declares the per-ISA answer; take it from there
         // rather than restating it, which is the drift `kernelcaps` exists to prevent.
         let (bm, bn, bk) = match (bf16, isa.geometry()) {
-            (DevOp::Gemm, Some(g)) => (g.gemm_tile.bm as i64, g.gemm_tile.bn as i64, g.gemm_tile.bk as i64),
+            (DevOp::Gemm, Some(g)) => (
+                g.gemm_tile.bm as i64,
+                g.gemm_tile.bn as i64,
+                g.gemm_tile.bk as i64,
+            ),
             _ => (bm, bn, bk),
         };
         for (op, quant, mma) in [
@@ -1658,6 +1668,8 @@ fn tiles(m: u32, n: u32) -> u32 {
 #[allow(dead_code)]
 struct Tn {
     ids: u32,
+    encoder_overlay: u32,
+    encoder_overlay_index: u32,
     pos: u32,
     kvlen: u32,
     cos_s: u32,
@@ -1676,6 +1688,7 @@ struct Tn {
     // reads this one. Wins over head8 when both are asked for — 0.53 GB against 1.01 GB.
     head4: u32,
     head4s: u32,
+    affine_head: [u32; 3],
     x: u32,
     // NRN-fold residual ping-pong twin of `x` (Gemma fp8 decode on AMD only; TENSOR_NONE
     // otherwise so every other blob stays byte-identical). NRN1 writes its residual here and
@@ -1765,6 +1778,13 @@ struct Tn {
     lw: Vec<LW>,
 }
 struct LW {
+    bq: u32,
+    bk: u32,
+    bv: u32,
+    bo: u32,
+    bg: u32,
+    bu: u32,
+    bd: u32,
     wq: u32,
     wk: u32,
     wv: u32,
@@ -1863,6 +1883,13 @@ fn declare(
     nrn_fold: bool,
     merge_fold: bool,
 ) -> Tn {
+    let affine_q4 = emit_config::active().affine_q4;
+    if affine_q4 {
+        assert!(
+            c.hidden % 64 == 0 && c.inter % 64 == 0 && (c.heads * c.hd_full) % 64 == 0,
+            "affine Q4 requires projection K dimensions divisible by 64"
+        );
+    }
     // ACTIVATIONS ARE SIZED BY THE CHUNK, NOT THE CONTEXT.
     //
     // Every activation used to be `ctx * ...`, which is 131072 rows of scratch for a machine
@@ -1956,6 +1983,19 @@ fn declare(
 
     let t = Tn {
         ids: b.tensor("in.ids", ctx as u64 * I32),
+        encoder_overlay: if c.encoder_overlay_rows > 0 {
+            b.tensor(
+                "in.encoder_overlay",
+                u64::from(c.encoder_overlay_rows) * u64::from(c.hidden) * F32,
+            )
+        } else {
+            TENSOR_NONE
+        },
+        encoder_overlay_index: if c.encoder_overlay_rows > 0 {
+            b.tensor("in.encoder_overlay_index", ctx as u64 * I32)
+        } else {
+            TENSOR_NONE
+        },
         pos: b.tensor("in.pos", ctx as u64 * I32),
         // BATCH>1 (serving pending #4): one KV length per sequence. dbatch==1 => I32, identical.
         kvlen: b.tensor("in.kvlen", dbatch as u64 * I32),
@@ -1969,10 +2009,17 @@ fn declare(
         ),
         fin: b.tensor(&format!("{}norm.weight", c.prefix), c.hidden as u64 * BF16),
         // Untied lm_head (Llama): a separate top-level "lm_head.weight". Tied models reuse emb.
-        head: if c.tied {
+        head: if c.tied || affine_q4 {
             TENSOR_NONE
         } else {
-            b.tensor("lm_head.weight", (c.vocab * c.hidden) as u64 * BF16)
+            b.tensor(
+                if c.prefix == "thinker.model." {
+                    "thinker.lm_head.weight"
+                } else {
+                    "lm_head.weight"
+                },
+                (c.vocab * c.hidden) as u64 * BF16,
+            )
         },
         head8: if c.tied && emit_config::active().fp8_head && !mx4_head_on() {
             b.tensor(
@@ -2005,6 +2052,23 @@ fn declare(
             )
         } else {
             TENSOR_NONE
+        },
+        affine_head: if affine_q4 {
+            let name = if c.tied {
+                format!("{}embed_tokens.weight", c.prefix)
+            } else if c.prefix == "thinker.model." {
+                "thinker.lm_head.weight".into()
+            } else {
+                "lm_head.weight".into()
+            };
+            let numel = c.vocab as u64 * c.hidden as u64;
+            [
+                b.tensor(&format!("affineq4/{name}"), numel / 2),
+                b.tensor(&format!("affineq4/{name}_scale"), numel / 32),
+                b.tensor(&format!("affineq4/{name}_bias"), numel / 32),
+            ]
+        } else {
+            [TENSOR_NONE; 3]
         },
         x: ac(b, "x", (rows * c.hidden) as u64 * BF16),
         xr: if nrn_fold {
@@ -2348,7 +2412,7 @@ fn declare(
         let mx4 = emit_config::active().mxfp4;
         let mx4_pf = mx4_prefill_on();
         let wproj = |b: &mut Builder, s: &str, sz: u64| {
-            if fp8 || mx4_pf || !in_block {
+            if fp8 || mx4_pf || affine_q4 || !in_block {
                 TENSOR_NONE
             } else {
                 b.tensor(&format!("{prefix}layers.{l}.{s}"), sz)
@@ -2419,7 +2483,9 @@ fn declare(
         // the loader routes to the fp8 checkpoint, plus its per-output-channel f32 dequant scale
         // ("<name>_scale", [out]). `out` is the row count of the [out,in] weight = numel/in.
         let w8 = |b: &mut Builder, s: &str, numel: u64| -> u32 {
-            if fp8 && in_block {
+            if affine_q4 && in_block {
+                b.tensor(&format!("affineq4/{prefix}layers.{l}.{s}"), numel / 2)
+            } else if fp8 && in_block {
                 b.tensor(&format!("fp8/{prefix}layers.{l}.{s}"), numel)
             } else if mx4 && in_block {
                 b.tensor(&format!("mxfp4/{prefix}layers.{l}.{s}"), numel / 2)
@@ -2429,7 +2495,12 @@ fn declare(
         };
         // Scale twin: fp8 = f32 per output channel; mxfp4 = one E8M0 byte per 32 K per row.
         let sc = |b: &mut Builder, s: &str, out: u64, numel: u64| -> u32 {
-            if fp8 && in_block {
+            if affine_q4 && in_block {
+                b.tensor(
+                    &format!("affineq4/{prefix}layers.{l}.{s}_scale"),
+                    numel / 32,
+                )
+            } else if fp8 && in_block {
                 b.tensor(&format!("fp8/{prefix}layers.{l}.{s}_scale"), out * F32)
             } else if mx4 && in_block {
                 b.tensor(&format!("mxfp4/{prefix}layers.{l}.{s}_scale"), numel / 32)
@@ -2437,7 +2508,21 @@ fn declare(
                 TENSOR_NONE
             }
         };
+        let bias = |b: &mut Builder, s: &str, numel: u64| -> u32 {
+            if affine_q4 && in_block {
+                b.tensor(&format!("affineq4/{prefix}layers.{l}.{s}_bias"), numel / 32)
+            } else {
+                TENSOR_NONE
+            }
+        };
         t.lw.push(LW {
+            bq: bias(b, "self_attn.q_proj.weight", qd as u64 * c.hidden as u64),
+            bk: bias(b, "self_attn.k_proj.weight", kd as u64 * c.hidden as u64),
+            bv: bias(b, "self_attn.v_proj.weight", kd as u64 * c.hidden as u64),
+            bo: bias(b, "self_attn.o_proj.weight", c.hidden as u64 * qd as u64),
+            bg: bias(b, "mlp.gate_proj.weight", inter_sh as u64 * c.hidden as u64),
+            bu: bias(b, "mlp.up_proj.weight", inter_sh as u64 * c.hidden as u64),
+            bd: bias(b, "mlp.down_proj.weight", c.hidden as u64 * inter_sh as u64),
             wq: wproj(b, "self_attn.q_proj.weight", (qd * c.hidden) as u64 * BF16),
             wk: if shared {
                 TENSOR_NONE
@@ -2448,7 +2533,7 @@ fn declare(
             // always have a real v_proj. (fp8 mode elides the bf16 twin like the other projections.)
             wv: wopt(
                 b,
-                !keqv && !fp8 && !mx4_pf && !shared,
+                !keqv && !fp8 && !mx4_pf && !affine_q4 && !shared,
                 "self_attn.v_proj.weight",
                 (kd * c.hidden) as u64 * BF16,
             ),
@@ -3536,6 +3621,7 @@ fn emit_phase(
     // MXFP4 dense PREFILL: the tiled projections and the fused gate|up GLU take the fp4 rungs, so
     // the bf16 twins are dead and `declare()` stops emitting them (see `wproj`).
     let mx4_pf = mx4_prefill_on();
+    let affine_q4 = emit_config::active().affine_q4;
     // A decode LADDER makes every rung — the one-row rung included — address the KV cache per
     // sequence out of `pos[]`. See the two `i[6] = n_batch_kv` sites below for why.
     let seq_rows = emit_config::active().decode_ladder_on();
@@ -3641,6 +3727,17 @@ fn emit_phase(
     // layer's RmsNorm reads `act.x` directly (its dep is `&[]`; see below).
     let mut dep = if block_mode {
         0u32
+    } else if !decode && c.encoder_overlay_rows > 0 {
+        b.emit(DevOp::EmbedOverlayBf16, rows.clone(), &[], |d| {
+            d.t[..5].copy_from_slice(&[
+                n.x,
+                n.emb,
+                n.ids,
+                n.encoder_overlay,
+                n.encoder_overlay_index,
+            ]);
+            d.i[..4].copy_from_slice(&[t, c.hidden, c.vocab, c.encoder_overlay_rows]);
+        })
     } else {
         b.emit(DevOp::Embed, rows.clone(), &[], |d| {
             d.t[0] = n.x;
@@ -3758,6 +3855,7 @@ fn emit_phase(
                 w: u32,
                 w8: u32,
                 scale: u32,
+                affine_bias: u32,
                 xq: u32,
                 ascale_t: u32,
                 m: u32,
@@ -3767,6 +3865,28 @@ fn emit_phase(
                 cus: Vec<u32>,
                 deps: &[u32]|
      -> u32 {
+        if affine_q4 {
+            assert_eq!(
+                gamma, TENSOR_NONE,
+                "affine Q4 projections require a separate norm"
+            );
+            assert!(w8 != TENSOR_NONE && scale != TENSOR_NONE && affine_bias != TENSOR_NONE);
+            let op = if gemv_family {
+                DevOp::GemvAffineQ4
+            } else {
+                DevOp::GemmAffineQ4
+            };
+            return b.emit(op, cus, deps, |d| {
+                d.t[0] = out;
+                d.t[1] = a;
+                d.t[2] = w8;
+                d.t[3] = scale;
+                d.t[4] = affine_bias;
+                d.i[0] = m;
+                d.i[1] = nn;
+                d.i[2] = k;
+            });
+        }
         // THE CU BUDGET THIS OP ACTUALLY GETS, not the whole machine.
         //
         // `tile_cost` ranks by `rounds x per-tile cost` with `rounds = ceil(tiles / n_units)`, so
@@ -4060,6 +4180,7 @@ fn emit_phase(
             && !shared
             && !fp8
             && !mx4
+            && !affine_q4
             && gemv_fused_input_fits(amd, t, c.hidden)
             && !emit_config::active().no_fuse_qkv;
         // FUSED Q|K|V, per-channel fp8 (DevOp::GemvQkvFp8, op 115) — the arm the comment above
@@ -4077,14 +4198,13 @@ fn emit_phase(
         // wait on the whole 304-WG packet. The op stays in the ISA (correct, golden-tested,
         // byte-exact to split3) because the trade flips where the fine map does not exist:
         // the static scheduler, and batched decode. Opt in with PLOW_FUSE_QKV_FP8=1.
-        // AMD-ONLY: no sm_120 arm exists for op 115, and check_gfx950_opcode_coverage guards only
-        // the AMD side, so the gate lives here.
+        // Metal also implements op 115 without staging x. CUDA has no arm.
         let fuse_qkv_fp8 = gemv_family
             && !keqv
             && !shared
             && fp8
-            && amd
-            && (gemv_staged_rows(t) as u64 * c.hidden as u64) <= gm_lds_halves()
+            && (emit_is_apple()
+                || (amd && (gemv_staged_rows(t) as u64 * c.hidden as u64) <= gm_lds_halves()))
             && emit_config::active().fuse_qkv_fp8;
 
         // GQA FUSION changes the decode split, and the two have to agree or the machine idles.
@@ -4440,6 +4560,7 @@ fn emit_phase(
                     w.wq,
                     w.wq8,
                     w.sq,
+                    w.bq,
                     n.xqh,
                     n.ash,
                     tg,
@@ -4463,6 +4584,7 @@ fn emit_phase(
                     w.wk,
                     w.wk8,
                     w.sk,
+                    w.bk,
                     n.xqh,
                     n.ash,
                     tg,
@@ -4492,6 +4614,7 @@ fn emit_phase(
                         w.wv,
                         w.wv8,
                         w.sv,
+                        w.bv,
                         n.xqh,
                         n.ash,
                         tg,
@@ -5060,6 +5183,7 @@ fn emit_phase(
                 w.wo,
                 w.wo8,
                 w.so,
+                w.bo,
                 n.xqo,
                 n.aso,
                 t,
@@ -5078,6 +5202,7 @@ fn emit_phase(
                 w.wo,
                 w.wo8,
                 w.so,
+                w.bo,
                 n.xqo,
                 n.aso,
                 tg,
@@ -5206,8 +5331,8 @@ fn emit_phase(
         // gate/up are COLUMN-parallel (inter_l lanes on this rank); the GLU is elementwise on the
         // rank's own lanes, so no communication. `c_gl` is the dependency feeding down_proj.
         // Same backend-specific bound as `fuse_qkv` above.
-        let glu_fused = gemv_family && gemv_fused_input_fits(amd, t, c.hidden);
-        let gemm_glu = !gemv_family && glu_fusion_wins(tg, inter_l, c.hidden, n_cu);
+        let glu_fused = !affine_q4 && gemv_family && gemv_fused_input_fits(amd, t, c.hidden);
+        let gemm_glu = !affine_q4 && !gemv_family && glu_fusion_wins(tg, inter_l, c.hidden, n_cu);
         // w8a8: quant the (hidden-width) pre-FF norm output feeding gate/up. Reuses xqh/ash (q/k/v
         // already consumed them; the c_pf→o_proj→flash→qkv chain serializes the reuse). Inert
         // (returns c_pf) off the w8a8 path, so glu_fused/bf16 arms below keep their c_pf dep.
@@ -5403,6 +5528,7 @@ fn emit_phase(
                 w.wg,
                 w.wg8,
                 w.sg,
+                w.bg,
                 n.xqh,
                 n.ash,
                 tg,
@@ -5420,6 +5546,7 @@ fn emit_phase(
                 w.wu,
                 w.wu8,
                 w.su,
+                w.bu,
                 n.xqh,
                 n.ash,
                 tg,
@@ -5476,6 +5603,7 @@ fn emit_phase(
                 w.wd,
                 w.wd8,
                 w.sd,
+                w.bd,
                 n.xqi,
                 n.asi,
                 t,
@@ -5496,6 +5624,7 @@ fn emit_phase(
                 w.wd,
                 w.wd8,
                 w.sd,
+                w.bd,
                 n.xqi,
                 n.asi,
                 tg,
@@ -6103,8 +6232,11 @@ fn emit_phase(
     // E5 (rtx-19) PLOW_FUSE_ARGMAX: fuse the greedy-argmax epilogue (+ softcap) into the lm_head
     // GEMV, folding each block's owned vocab slice into an amax partial and dropping the SoftCap +
     // Argmax packets. Greedy B=1 decode on the bf16 head only (fp8 head keeps the classic path).
-    let fuse_am = fuse_argmax_on() && decode && gemv_family && !fp8_head && !mx4_head && t == 1;
-    let lm_op = if fuse_am {
+    let fuse_am =
+        fuse_argmax_on() && decode && gemv_family && !fp8_head && !mx4_head && !affine_q4 && t == 1;
+    let lm_op = if affine_q4 {
+        DevOp::GemvAffineQ4
+    } else if fuse_am {
         DevOp::GemvArgmax
     } else if mx4_head {
         DevOp::GemvMxfp4
@@ -6125,14 +6257,19 @@ fn emit_phase(
     let c_lm = b.emit(lm_op, all.clone(), &[c_f], |d| {
         d.t[0] = n.logits;
         d.t[1] = head_src;
-        d.t[2] = if mx4_head {
+        d.t[2] = if affine_q4 {
+            n.affine_head[0]
+        } else if mx4_head {
             n.head4
         } else if fp8_head {
             n.head8
         } else {
             head_w
         };
-        if mx4_head {
+        if affine_q4 {
+            d.t[3] = n.affine_head[1];
+            d.t[4] = n.affine_head[2];
+        } else if mx4_head {
             d.t[3] = n.head4s;
         } else if fp8_head {
             d.t[5] = n.head8s;
@@ -6904,7 +7041,13 @@ struct EmitCapabilities {
 fn emit_capabilities(model_type: &str) -> EmitCapabilities {
     let dense = matches!(
         model_type,
-        "gemma4" | "gemma4_text" | "gemma4_unified" | "gemma4_unified_text" | "llama" | "qwen3"
+        "gemma4"
+            | "gemma4_text"
+            | "gemma4_unified"
+            | "gemma4_unified_text"
+            | "llama"
+            | "qwen3"
+            | "qwen3_asr"
     );
     EmitCapabilities {
         dense_packet_contracts: dense,
@@ -6984,6 +7127,29 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
     let capabilities = emit_capabilities(&model_type);
     let mut emit_cfg = _emit_cfg.unwrap_or_else(emit_config::EmitConfig::from_env);
     apply_production_defaults(&mut emit_cfg, capabilities, &arch, tp);
+    if emit_cfg.affine_q4 {
+        assert!(
+            (arch == "metal3" || (arch.is_empty() && gpu.is_empty()))
+                && matches!(model_type.as_str(), "qwen3_asr" | "qwen3" | "llama")
+                && tp == 1,
+            "affine Q4 requires a dense Qwen3/Llama model on Metal or the CPU tier, TP1"
+        );
+        assert!(
+            !emit_cfg.fp8
+                && !emit_cfg.w8a8
+                && !emit_cfg.w8a16
+                && !emit_cfg.mxfp4
+                && !emit_cfg.fp8_head
+                && emit_cfg.mx4_head.is_none(),
+            "affine Q4 is exclusive with FP8/MXFP4 weight and head options"
+        );
+        assert!(
+            emit_cfg.row_split.is_none()
+                && emit_cfg.ane_mlp_channels.is_none()
+                && !emit_cfg.packed_prefill_on(),
+            "affine Q4 does not yet support heterogeneous or packed prefill"
+        );
+    }
     if emit_cfg.ane_mlp_channels.is_some() {
         assert!(
             arch == "metal3" && tp == 1 && matches!(model_type.as_str(), "llama" | "qwen3"),
@@ -8459,6 +8625,29 @@ fn emit_dense_gqa(
             .unwrap_or_else(|error| panic!("decode projection tuning: {error}"));
     // Emit v6 with sections when --embed-cubin/--embed-hsaco given, else v5.
     let mut sections = Vec::new();
+    if c.encoder_overlay_rows > 0 && !block_mode {
+        sections.push(
+            pipeline::causal_pipeline_section(
+                &m,
+                pipeline::CausalPipelineSpec {
+                    name: "decode",
+                    max_context: ctx,
+                    hidden: c.hidden,
+                    decode_capacity: dbatch,
+                    overlay_rows: c.encoder_overlay_rows,
+                    ordered_dispatch: true,
+                    tensors: pipeline::CausalPipelineTensors {
+                        tokens: emitter.tn.ids,
+                        positions: emitter.tn.pos,
+                        kv_lengths: emitter.tn.kvlen,
+                        overlay: Some(emitter.tn.encoder_overlay),
+                        overlay_index: Some(emitter.tn.encoder_overlay_index),
+                    },
+                },
+            )
+            .unwrap_or_else(|error| panic!("causal packet pipeline: {error}")),
+        );
+    }
     if ecfg.gemv_decode_role {
         assert!(
             !amd && arch == "sm_90a" && !fp8 && !c.moe && rungs == [1],
@@ -8707,7 +8896,10 @@ fn emit_dense_gqa(
     check_fp8_a_scale_bound(&m, &arch, &gpu);
     check_gfx950_opcode_coverage(&m, amd);
     check_nvidia_opcode_coverage(&m, amd);
-    check_apple_only_opcodes(&m, arch == "metal3");
+    check_cpu_or_metal_opcode_coverage(
+        &m,
+        arch == "metal3" || (arch.is_empty() && gpu.is_empty()),
+    );
     check_group_routing_supported(&m, amd, &arch);
     warn_arch_gpu_vendor_mismatch(&arch, &gpu);
 
@@ -8716,7 +8908,31 @@ fn emit_dense_gqa(
         hetero_channel::plan(&m, channels, weights, channel_progs)
             .unwrap_or_else(|e| panic!("{e}"))
     });
+    let audio_blob = (c.encoder_overlay_rows > 0 && !block_mode).then(|| {
+        let mut encoder = asr::qwen::lower_audio_encoder(3000, n_cu)
+            .unwrap_or_else(|error| panic!("Qwen audio packet lowering: {error}"));
+        for capacity in [400, 800, 1200, 1600, 2000] {
+            let bucket = asr::qwen::lower_audio_encoder(capacity, n_cu)
+                .unwrap_or_else(|error| panic!("Qwen audio packet lowering: {error}"));
+            encoder
+                .merge_capacity(bucket)
+                .unwrap_or_else(|error| panic!("Qwen audio packet capacity: {error}"));
+        }
+        encoder.prefix.model.target = m.target;
+        encoder
+            .embed_checkpoint(&dir)
+            .unwrap_or_else(|error| panic!("Qwen audio packet weights: {error}"));
+        let section = encoder
+            .pipeline_section(3000)
+            .unwrap_or_else(|error| panic!("Qwen audio packet metadata: {error}"));
+        encoder.prefix.model.to_blob_v6(&[section])
+    });
     std::fs::write(&out, blob).unwrap();
+    if let Some(blob) = audio_blob {
+        let path = std::path::Path::new(&out).with_file_name("encoder.pkt");
+        std::fs::write(&path, blob).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        eprintln!("  audio encoder packet -> {}", path.display());
+    }
     if let Some(plan) = channel_plan {
         let path = std::path::Path::new(&out).with_file_name(plow_asset::hetero::FILE);
         std::fs::write(&path, serde_json::to_vec_pretty(&plan).unwrap()).unwrap();
@@ -8902,12 +9118,17 @@ pub mod fp8_m1_role;
 /// Opcodes only the Metal interpreter (and the CPU golden tier) implement. Refused at emit for
 /// any other GPU target, so an E-series blob cannot reach a CUDA/HIP interpreter's
 /// `default: __trap()`.
-fn check_apple_only_opcodes(m: &Model, apple: bool) {
-    if apple {
+fn check_cpu_or_metal_opcode_coverage(m: &Model, supported: bool) {
+    if supported {
         return;
     }
-    const APPLE_ONLY: [DevOp; 1] = [DevOp::PerLayerInput];
-    let bad: Vec<&'static str> = APPLE_ONLY
+    const CPU_OR_METAL_ONLY: [DevOp; 4] = [
+        DevOp::PerLayerInput,
+        DevOp::GemvAffineQ4,
+        DevOp::GemmAffineQ4,
+        DevOp::EmbedOverlayBf16,
+    ];
+    let bad: Vec<&'static str> = CPU_OR_METAL_ONLY
         .iter()
         .filter(|op| {
             m.progs
@@ -8918,7 +9139,7 @@ fn check_apple_only_opcodes(m: &Model, apple: bool) {
         .collect();
     assert!(
         bad.is_empty(),
-        "this packet carries opcode(s) only the Apple (metal3) interpreter implements: {bad:?}; \
-         emit with --gpu <apple part> or a CPU target"
+        "this packet carries opcode(s) only the CPU and Apple (metal3) interpreters currently \
+         implement: {bad:?}; emit with --gpu <apple part> or a CPU target"
     );
 }

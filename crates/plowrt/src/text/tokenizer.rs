@@ -68,6 +68,14 @@ pub fn load_tokenizer(dir: &Path) -> Arc<dyn Tokenize> {
                 }
             }
         }
+        for base in [dir.to_path_buf(), dir.join("checkpoint")] {
+            if base.join("vocab.json").is_file() && base.join("merges.txt").is_file() {
+                match HfTokenizer::from_qwen2_files(&base) {
+                    Ok(t) => return Arc::new(t),
+                    Err(e) => tracing::warn!(error = %e, "Qwen2 tokenizer failed to load"),
+                }
+            }
+        }
     }
     let _ = dir;
     Arc::new(ByteTokenizer)
@@ -81,6 +89,51 @@ pub struct HfTokenizer {
 
 #[cfg(feature = "hf-tokenizer")]
 impl HfTokenizer {
+    pub fn from_qwen2_files(dir: &Path) -> crate::Result<Self> {
+        let fail = |e: String| crate::RuntimeError::Msg(format!("Qwen2 tokenizer: {e}"));
+        let config: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dir.join("tokenizer_config.json")).map_err(|e| fail(e.to_string()))?,
+        )
+        .map_err(|e| fail(e.to_string()))?;
+        if !matches!(
+            config["tokenizer_class"].as_str(),
+            Some("Qwen2Tokenizer" | "Qwen2TokenizerFast")
+        ) {
+            return Err(fail(
+                "vocab/merges loading requires a Qwen2 tokenizer class".into(),
+            ));
+        }
+        let model = tokenizers::models::bpe::BPE::from_file(
+            &dir.join("vocab.json").to_string_lossy(),
+            &dir.join("merges.txt").to_string_lossy(),
+        )
+        .build()
+        .map_err(|e| fail(e.to_string()))?;
+        let mut inner = tokenizers::Tokenizer::new(model);
+        let added = config["added_tokens_decoder"]
+            .as_object()
+            .ok_or_else(|| fail("missing added_tokens_decoder".into()))?;
+        let mut tokens = added
+            .iter()
+            .map(|(id, value)| {
+                let id = id.parse::<u32>().map_err(|e| fail(e.to_string()))?;
+                let token: tokenizers::AddedToken =
+                    serde_json::from_value(value.clone()).map_err(|e| fail(e.to_string()))?;
+                Ok((id, token))
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
+        tokens.sort_by_key(|(id, _)| *id);
+        for (id, token) in tokens {
+            let content = token.content.clone();
+            inner.add_tokens(&[token]);
+            if inner.token_to_id(&content) != Some(id) {
+                return Err(fail(format!("token {content:?} must have id {id}")));
+            }
+        }
+        Self::qwen2_processors(&mut inner, &config)?;
+        Ok(Self { inner })
+    }
+
     /// Load a `tokenizer.json` from disk.
     pub fn from_file(path: &std::path::Path) -> crate::Result<Self> {
         let mut inner = tokenizers::Tokenizer::from_file(path)
@@ -99,26 +152,34 @@ impl HfTokenizer {
                     Some("Qwen2Tokenizer" | "Qwen2TokenizerFast")
                 )
             }) {
-                use tokenizers::pre_tokenizers::{
-                    byte_level::ByteLevel,
-                    sequence::Sequence,
-                    split::{Split, SplitPattern},
-                };
-                // Transformers reconstructs Qwen2's processors from its class, overriding
-                // tokenizer.json's combining-mark regex. Match that reference API behavior.
-                let split = Split::new(
-                    SplitPattern::Regex(r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+".into()),
-                    tokenizers::SplitDelimiterBehavior::Isolated, false,
-                ).map_err(|e| crate::RuntimeError::Msg(format!("Qwen2 tokenizer: {e}")))?;
-                let prefix = config["add_prefix_space"].as_bool().unwrap_or(false);
-                inner.with_pre_tokenizer(Some(Sequence::new(vec![
-                    split.into(),
-                    ByteLevel::new(prefix, true, false).into(),
-                ])));
-                inner.with_decoder(Some(ByteLevel::default()));
+                Self::qwen2_processors(&mut inner, &config)?;
             }
         }
         Ok(HfTokenizer { inner })
+    }
+
+    fn qwen2_processors(
+        inner: &mut tokenizers::Tokenizer,
+        config: &serde_json::Value,
+    ) -> crate::Result<()> {
+        use tokenizers::pre_tokenizers::{
+            byte_level::ByteLevel,
+            sequence::Sequence,
+            split::{Split, SplitPattern},
+        };
+        // Transformers reconstructs Qwen2's processors from its class, overriding
+        // tokenizer.json's combining-mark regex. Match that reference API behavior.
+        let split = Split::new(
+                    SplitPattern::Regex(r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+".into()),
+                    tokenizers::SplitDelimiterBehavior::Isolated, false,
+                ).map_err(|e| crate::RuntimeError::Msg(format!("Qwen2 tokenizer: {e}")))?;
+        let prefix = config["add_prefix_space"].as_bool().unwrap_or(false);
+        inner.with_pre_tokenizer(Some(Sequence::new(vec![
+            split.into(),
+            ByteLevel::new(prefix, true, false).into(),
+        ])));
+        inner.with_decoder(Some(ByteLevel::default()));
+        Ok(())
     }
 }
 

@@ -38,6 +38,32 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Transcribe audio with a compiled ASR packet, or serve it locally.
+    #[cfg(any(
+        all(feature = "cpu", feature = "gguf"),
+        all(feature = "metal", target_os = "macos")
+    ))]
+    Asr {
+        /// Compiled packet asset. `--blob` is retained as a compatibility alias.
+        #[arg(long, visible_alias = "blob")]
+        packet: PathBuf,
+        /// Tokenizer assets. Numerical weights and execution metadata come from the packet.
+        #[arg(long, visible_alias = "checkpoint")]
+        tokenizer: PathBuf,
+        #[arg(long, conflicts_with = "port", required_unless_present = "port")]
+        audio: Option<PathBuf>,
+        #[arg(long, conflicts_with = "port")]
+        language: Option<String>,
+        #[arg(long, default_value = "", conflicts_with = "port")]
+        prompt: String,
+        #[arg(long)]
+        port: Option<u16>,
+        #[arg(long, requires = "port")]
+        websocket: bool,
+        /// Packet execution backend. `auto` selects the best compiled backend.
+        #[arg(long, default_value = "auto")]
+        backend: String,
+    },
     /// Load compiled assets and serve the OpenAI-compatible API.
     // A serve needs a source, and there are two: a directory on disk or a
     // reference in the local store. Grouping them means the error names BOTH,
@@ -585,9 +611,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let filter =
         tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
     let filter_str = format!("{filter}");
-    // `op-audit --format json` writes a document to stdout; the startup banner
-    // would land inside it. Same reason `bench` logs to stderr.
-    if matches!(&cli.cmd, Cmd::Bench { .. } | Cmd::OpAudit { .. }) {
+    let structured_output = match &cli.cmd {
+        Cmd::Bench { .. } | Cmd::OpAudit { .. } => true,
+        #[cfg(any(
+            all(feature = "cpu", feature = "gguf"),
+            all(feature = "metal", target_os = "macos")
+        ))]
+        Cmd::Asr { .. } => true,
+        _ => false,
+    };
+    if structured_output {
         tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_writer(std::io::stderr)
@@ -607,6 +640,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     RuntimeConfig::init(cli.rt_cfg);
     match cli.cmd {
+        #[cfg(any(
+            all(feature = "cpu", feature = "gguf"),
+            all(feature = "metal", target_os = "macos")
+        ))]
+        Cmd::Asr {
+            packet,
+            tokenizer,
+            audio,
+            language,
+            prompt,
+            port,
+            websocket,
+            backend,
+        } => {
+            let samples = if let Some(audio) = audio {
+                Some(plowrt::asr::frontend::decode_wav(&std::fs::read(audio)?)?)
+            } else {
+                None
+            };
+            let loaded = plowrt::asr::load_packet_transcriber(&packet, &tokenizer, &backend)?;
+            let served_model = loaded.pipeline;
+            let mut engine = loaded.engine;
+            if let Some(samples) = samples {
+                let result = engine.transcribe(
+                    &samples,
+                    language.as_deref(),
+                    &prompt,
+                    &std::sync::atomic::AtomicBool::new(false),
+                )?;
+                println!("{}", serde_json::to_string(&result)?);
+            } else {
+                let router =
+                    plowrt::asr::serving::AsrServer::new(served_model, engine).router(websocket);
+                let listener =
+                    tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port.unwrap()))
+                        .await?;
+                tracing::info!(address = %listener.local_addr()?, websocket, "ASR server ready");
+                axum::serve(listener, router)
+                    .with_graceful_shutdown(async {
+                        let _ = tokio::signal::ctrl_c().await;
+                    })
+                    .await?;
+            }
+            Ok(())
+        }
         Cmd::Serve {
             assets,
             model,
@@ -927,6 +1005,26 @@ mod amd_bench_cli_tests {
     fn unbound_run_requires_explicit_synthetic_probe() {
         assert!(require_synthetic_probe(false, false).is_err());
         assert!(require_synthetic_probe(false, true).is_err());
+    }
+
+    #[cfg(any(
+        all(feature = "cpu", feature = "gguf"),
+        all(feature = "metal", target_os = "macos")
+    ))]
+    #[test]
+    fn asr_names_packet_and_tokenizer_inputs() {
+        for args in [
+            ["--packet", "model.pkt", "--tokenizer", "tokens"],
+            ["--blob", "model.pkt", "--checkpoint", "tokens"],
+        ] {
+            assert!(Cli::try_parse_from(
+                ["plowrt", "asr"]
+                    .into_iter()
+                    .chain(args)
+                    .chain(["--audio", "speech.wav"]),
+            )
+            .is_ok());
+        }
     }
 
     #[test]

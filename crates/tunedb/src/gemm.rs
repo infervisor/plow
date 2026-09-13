@@ -169,6 +169,7 @@ pub fn parse_quant(s: &str) -> Option<QuantScheme> {
         "None" => QuantScheme::None,
         "W8A8" => QuantScheme::W8A8,
         "Mxfp4" => QuantScheme::Mxfp4,
+        "AffineQ4" => QuantScheme::AffineQ4,
         _ => return None,
     })
 }

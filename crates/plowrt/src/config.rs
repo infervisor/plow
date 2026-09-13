@@ -255,6 +255,18 @@ pub struct AppleRuntimeConfig {
     /// raise it only if a legitimately slow producer starts faulting.
     #[arg(long = "metal-spin-max", env = "PLOW_METAL_SPIN_MAX", global = true)]
     pub spin_max: Option<u32>,
+    /// Override dot4 QKV decode specialization selected by model tuning.
+    #[arg(long = "metal-qkv-dot4", env = "PLOW_METAL_QKV_DOT4", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub qkv_dot4: Option<bool>,
+    /// Override single-workitem decode heads selected by model tuning.
+    #[arg(long = "metal-decode-heads", env = "PLOW_METAL_DECODE_HEADS", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub decode_heads: Option<bool>,
+    /// Compile the paired GLU Metal specialization.
+    #[arg(long = "metal-glu-pair", env = "PLOW_METAL_GLU_PAIR", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub glu_pair: bool,
+    /// Use the dedicated MXFP4 Metal pipeline.
+    #[arg(long = "metal-mx4-dedicated", env = "PLOW_METAL_MX4_DEDICATED", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub mx4_dedicated: bool,
     /// CPU decode column share: percent[:instruction count].
     #[arg(long = "apple-cpu-share", env = "PLOW_CPU_SHARE", global = true)]
     pub cpu_share: Option<String>,
@@ -372,6 +384,10 @@ pub struct CpuRuntimeConfig {
     /// Directory holding the MXFP4 weight twin (`mxfp4/<name>` + `_scale`, quantize_mxfp4.py).
     #[arg(long = "cpu-mxfp4-dir", env = "PLOW_MXFP4_DIR", global = true)]
     pub mxfp4_dir: Option<String>,
+
+    /// Directory holding unsigned affine Q4 weights and BF16 group64 scales/biases.
+    #[arg(long = "affine-q4-dir", env = "PLOW_AFFINE_Q4_DIR", global = true)]
+    pub affine_q4_dir: Option<String>,
 
     /// Opt in to the global work queue instead of static per-CU streams. Measured 2x slower on
     /// this box; kept for A/B on hosts where the static partition is a poor fit. Named `gq_opt_in`

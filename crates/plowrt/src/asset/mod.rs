@@ -24,10 +24,12 @@ mod bucket;
 #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
 // The prefetcher/slab helpers are GPU upload machinery; a cpu-only build binds directly.
 #[cfg_attr(not(any(feature = "cuda", feature = "hsa")), allow(dead_code))]
-pub(crate) mod checkpoint;
+pub mod checkpoint;
 #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
 pub use checkpoint::Checkpoint;
 pub mod devblob;
+#[cfg(feature = "gguf")]
+pub mod gguf;
 /// The DSA lightning indexer's fp8 -> bf16 upcast. Gated with `checkpoint` for the same
 /// reason `shard` is: it is a rule about how a checkpoint tensor becomes a bound one.
 #[cfg(any(feature = "cuda", feature = "hsa"))]

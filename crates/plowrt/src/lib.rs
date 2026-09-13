@@ -20,6 +20,7 @@
 //! The design is documented per subsystem under `docs/runtime/`.
 
 pub mod analysis;
+pub mod asr;
 pub mod asset;
 pub mod config;
 pub mod device;
@@ -31,6 +32,7 @@ pub mod exec;
 pub mod memory;
 pub mod obs;
 pub mod opaudit;
+pub mod ops;
 pub mod orch;
 pub mod sched;
 pub mod serve;

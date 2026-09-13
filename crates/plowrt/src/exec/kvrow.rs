@@ -255,6 +255,8 @@ pub(crate) const PREFILL_ROW_FIELDS: &[(DevOp, RowField)] = &[
     (DevOp::GemmWideMxfp4, RowField::Rows(0)),
     (DevOp::GemmC5Mxfp4, RowField::Rows(0)),
     (DevOp::GemmGluMxfp4, RowField::Rows(0)),
+    (DevOp::GemmAffineQ4, RowField::Rows(0)),
+    (DevOp::GemvAffineQ4, RowField::Rows(0)),
     (DevOp::PerLayerInput, RowField::Rows(0)),
     (DevOp::FlashMlaPrefill, RowField::Rows(4)),
     (DevOp::FlashMlaPrefillFp8, RowField::Rows(4)),
@@ -372,6 +374,8 @@ pub(crate) fn rebase_chunk_rows(
 }
 
 pub(crate) const LM_HEAD_MATMUL_OPS: &[DevOp] = &[
+    DevOp::GemvAffineQ4,
+    DevOp::GemmAffineQ4,
     DevOp::Gemv,
     // bf16
     DevOp::Gemm,
@@ -413,6 +417,35 @@ pub(crate) fn place_lm_head_row(
         .position(|d| d.t[0] as usize == t && is_lm_head_matmul(d.op))?;
     insts[lm].i[4] = row;
     Some(lm)
+}
+
+#[test]
+fn affine_q4_ragged_prefill_places_head_on_real_row() {
+    for head in [DevOp::GemvAffineQ4, DevOp::GemmAffineQ4] {
+        let mut projection = DevInst64 {
+            op: DevOp::GemmAffineQ4 as u16,
+            ..Default::default()
+        };
+        projection.i[0] = 128;
+        projection.i[1] = 2048;
+        projection.i[2] = 2048;
+        let mut logits = DevInst64 {
+            op: head as u16,
+            ..Default::default()
+        };
+        logits.t[0] = 1;
+        logits.i[0] = 1;
+        logits.i[4] = 127;
+        let mut insts = [projection, logits];
+        let names = ["act.q".into(), "act.logits".into()];
+        rebase_chunk_rows(&mut insts, &names, 64, 17, 128, Some(128));
+        assert_eq!(insts[0].i[0], 17);
+        assert_eq!(insts[1].i[0], 1);
+        assert_eq!(place_lm_head_row(&mut insts, Some(1), 16), Some(1));
+        assert_eq!(insts[1].i[4], 16);
+        assert_eq!(insts[0].i[3], 0);
+        assert_eq!(insts[1].i[3], 0);
+    }
 }
 
 /// KV rows one MLA flash step stages (`op_attention.h` `FA_BKV`) — the tile a

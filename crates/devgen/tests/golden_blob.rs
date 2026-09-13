@@ -457,6 +457,142 @@ fn emit_arch(dir: &Path, arch: &str, gpu: &str, l2: Option<packet::devbuild::L2L
     });
 }
 
+#[test]
+fn affine_q4_emits_complete_triplets_and_separate_glu() {
+    use packet::dev::DevOp;
+    let _g = emit_guard();
+    let dir = tempdir("affine_q4");
+    write_qwen3_config(&dir);
+    let mut cfg = devgen::emit_config::EmitConfig::from_env();
+    cfg.affine_q4 = true;
+    let seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hook_seen = seen.clone();
+    devgen::run_verified(
+        devgen::EmitArgs {
+            dir: dir.clone(),
+            ctx: 512,
+            out: dir.join("model.pkt").to_str().unwrap().into(),
+            n_cu: 16,
+            tp: 1,
+            block_spec: None,
+            embed_cubin: None,
+            embed_hsaco: None,
+            rope_gen: true,
+            l2_layout: None,
+            gpu: "m4pro".into(),
+            arch: "metal3".into(),
+            emit_cfg: Some(cfg),
+            whole_graph_fusions: devgen::WholeGraphFusionDecisions::default(),
+        },
+        Some(Box::new(move |m| {
+            assert_eq!(
+                m.tensors
+                    .iter()
+                    .filter(|t| t.name.starts_with("affineq4/"))
+                    .count(),
+                45
+            );
+            assert!(m
+                .tensors
+                .iter()
+                .any(|t| t.name == "model.embed_tokens.weight"));
+            assert!(!m
+                .tensors
+                .iter()
+                .any(|t| t.name.starts_with("model.layers.") && t.name.contains("_proj.weight")));
+            for (p, rows) in m.progs.iter().zip(&m.prog_t) {
+                let op = if *rows == 1 {
+                    DevOp::GemvAffineQ4
+                } else {
+                    DevOp::GemmAffineQ4
+                };
+                assert_eq!(
+                    p.insts.iter().filter(|i| i.op == op as u16).count(),
+                    if *rows == 1 { 15 } else { 14 }
+                );
+                let matrices: Vec<_> = p
+                    .insts
+                    .iter()
+                    .filter(|i| {
+                        i.op == DevOp::GemvAffineQ4 as u16 || i.op == DevOp::GemmAffineQ4 as u16
+                    })
+                    .collect();
+                assert_eq!(matrices.len(), 15);
+                assert_eq!(
+                    p.insts.iter().filter(|i| i.op == DevOp::Glu as u16).count(),
+                    2
+                );
+                for i in matrices {
+                    let n = i.i[1] as u64;
+                    let k = i.i[2] as u64;
+                    let w = &m.tensors[i.t[2] as usize];
+                    assert!(w.name.starts_with("affineq4/"));
+                    assert_eq!(w.bytes, n * k / 2);
+                    for (slot, suffix) in [(3, "_scale"), (4, "_bias")] {
+                        let t = &m.tensors[i.t[slot] as usize];
+                        assert_eq!(t.name, format!("{}{suffix}", w.name));
+                        assert_eq!(t.bytes, n * k / 32);
+                    }
+                }
+            }
+            hook_seen.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(devgen::LeanReport {
+                verified: false,
+                oracle: false,
+                reason: Some("structural test only".into()),
+            })
+        })),
+    );
+    assert!(seen.load(std::sync::atomic::Ordering::SeqCst));
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("build.json")).unwrap()).unwrap();
+    assert_eq!(manifest["precision"]["weight_enc"], "affine_q4");
+    assert_eq!(manifest["features"]["affine_q4_weights"], true);
+}
+
+#[test]
+fn affine_q4_rejects_unsupported_routes() {
+    let _g = emit_guard();
+    let dir = tempdir("affine_q4_reject");
+    write_qwen3_config(&dir);
+    for case in 0..5 {
+        let mut cfg = devgen::emit_config::EmitConfig::from_env();
+        cfg.affine_q4 = true;
+        if case == 2 {
+            cfg.fp8 = true;
+        }
+        if case == 3 {
+            cfg.row_split = Some("cpu=50".into());
+        }
+        let arch = match case {
+            0 => "gfx950",
+            1 => "sm_90a",
+            _ => "metal3",
+        };
+        let args = devgen::EmitArgs {
+            dir: dir.clone(),
+            ctx: 512,
+            out: dir.join("model.pkt").to_str().unwrap().into(),
+            n_cu: 16,
+            tp: if case == 4 { 2 } else { 1 },
+            block_spec: None,
+            embed_cubin: None,
+            embed_hsaco: None,
+            rope_gen: true,
+            l2_layout: None,
+            gpu: "m4pro".into(),
+            arch: arch.into(),
+            emit_cfg: Some(cfg),
+            whole_graph_fusions: devgen::WholeGraphFusionDecisions::default(),
+        };
+        assert!(
+            std::panic::catch_unwind(|| devgen::run(args)).is_err(),
+            "case {case}"
+        );
+        assert!(!dir.join("model.pkt").exists());
+    }
+}
+
 /// A dense prefill bucket must carry `2*layers + 1` wave-class segments.
 ///
 /// PREFILL ONLY, and the qualifier is load-bearing. A DECODE program is legitimately one segment —
@@ -793,6 +929,78 @@ fn a_mxfp4_tied_head_keeps_the_bf16_embedding_table() {
         !has(&plain, "mxfp4/"),
         "unset must leave the blob exactly as it was"
     );
+}
+
+#[test]
+fn an_fp8_tied_head_can_share_an_mxfp4_body() {
+    use packet::dev::DevOp;
+    let _g = emit_guard();
+    let dir = tempdir("mx4_body_fp8_head");
+    write_qwen3_config(&dir);
+    let mut cfg = devgen::emit_config::EmitConfig::from_env();
+    cfg.mxfp4 = true;
+    cfg.mx4_head = Some("0".into());
+    cfg.fp8_head = true;
+    let seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hook_seen = seen.clone();
+    devgen::run_verified(
+        devgen::EmitArgs {
+            dir: dir.clone(),
+            ctx: 512,
+            out: dir.join("model.pkt").to_str().unwrap().into(),
+            n_cu: 16,
+            tp: 1,
+            block_spec: None,
+            embed_cubin: None,
+            embed_hsaco: None,
+            rope_gen: true,
+            l2_layout: None,
+            gpu: "m4pro".into(),
+            arch: "metal3".into(),
+            emit_cfg: Some(cfg),
+            whole_graph_fusions: devgen::WholeGraphFusionDecisions::default(),
+        },
+        Some(Box::new(move |model| {
+            let decode = model
+                .progs
+                .iter()
+                .zip(&model.prog_t)
+                .find(|(_, rows)| **rows == 1)
+                .unwrap()
+                .0;
+            let head = decode
+                .insts
+                .iter()
+                .find(|inst| inst.op == DevOp::GemvFp8 as u16)
+                .expect("decode must use the FP8 head");
+            assert_eq!(
+                model.tensors[head.t[2] as usize].name,
+                "fp8/model.embed_tokens.weight"
+            );
+            assert_eq!(
+                model.tensors[head.t[5] as usize].name,
+                "fp8/model.embed_tokens.weight_scale"
+            );
+            assert!(decode.insts.iter().any(|inst| {
+                inst.op == DevOp::GemvMxfp4 as u16 || inst.op == DevOp::GemvGluMxfp4 as u16
+            }));
+            assert!(model
+                .tensors
+                .iter()
+                .any(|tensor| tensor.name == "model.embed_tokens.weight"));
+            assert!(!decode
+                .insts
+                .iter()
+                .any(|inst| inst.op == DevOp::Gemv as u16));
+            hook_seen.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(devgen::LeanReport {
+                verified: false,
+                oracle: false,
+                reason: Some("structural test only".into()),
+            })
+        })),
+    );
+    assert!(seen.load(std::sync::atomic::Ordering::SeqCst));
 }
 
 /// `build.json`'s `emit_config.replay` must be ENOUGH TO REBUILD THE BLOB.
