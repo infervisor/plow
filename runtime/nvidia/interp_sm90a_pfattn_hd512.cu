@@ -55,6 +55,54 @@ __device__ __forceinline__ PlowStreamEnt attention_stream_ent(const PlowStreamEn
     return entry;
 }
 
+#if PLOW_NV_PACKED_REQUEST && !PLOW_NV_FA512_WG
+__device__ __noinline__ void attention_packed_bkv16(
+    const int* __restrict__ requests, float* __restrict__ opart,
+    float* __restrict__ mlpart, const __nv_bfloat16* __restrict__ q,
+    const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+    __nv_bfloat16* __restrict__ output, unsigned seq_q, unsigned seq_kv,
+    unsigned n_head, unsigned n_kv_head, unsigned q_pos0, unsigned window,
+    unsigned nsplit, unsigned kv_stride, unsigned kv_mask, float scale,
+    unsigned slice, unsigned nblk, float* arena) {
+    if (!requests) {
+        d_flash_prefill_px4<512, 32, 16>(
+            opart, mlpart, q, k, v, output, seq_q, seq_kv, n_head, n_kv_head,
+            q_pos0, window, nsplit, kv_stride, kv_mask, scale, slice, nblk, arena);
+        return;
+    }
+
+    const unsigned count = (unsigned)requests[0];
+    for (unsigned r = 0; r < count; ++r) {
+        const unsigned q0 = (unsigned)requests[1 + 4 * r];
+        const unsigned qlen = (unsigned)requests[2 + 4 * r];
+        const unsigned slot = (unsigned)requests[3 + 4 * r];
+        const unsigned kvlen = (unsigned)requests[4 + 4 * r];
+        const size_t qoff = (size_t)q0 * n_head * 512;
+        const size_t kvoff = (size_t)slot * n_kv_head * kv_stride * 512;
+        d_flash_prefill_px4<512, 32, 16>(
+            opart + qoff * nsplit, mlpart + (size_t)q0 * n_head * nsplit * 2,
+            q + qoff, k + kvoff, v + kvoff, output ? output + qoff : nullptr,
+            qlen, kvlen, n_head, n_kv_head, kvlen - qlen, window, nsplit,
+            kv_stride, kv_mask, scale, slice, nblk, arena);
+        __syncthreads();
+    }
+
+    if (output) {
+        unsigned real = 0;
+        if (count) {
+            const unsigned last = count - 1;
+            real =
+                (unsigned)requests[1 + 4 * last] + (unsigned)requests[2 + 4 * last];
+        }
+        const size_t begin = (size_t)real * n_head * 512;
+        const size_t end = (size_t)seq_q * n_head * 512;
+        for (size_t i = begin + (size_t)slice * blockDim.x + threadIdx.x; i < end;
+             i += (size_t)nblk * blockDim.x)
+            output[i] = __float2bfloat16(0.0f);
+    }
+}
+#endif
+
 template <bool GEMMA = false>
 __device__ __forceinline__ void attention_body(const PlowDevInst* in, void* const* tensors,
                                              unsigned slice, unsigned nblk, float* arena) {
@@ -73,7 +121,7 @@ __device__ __forceinline__ void attention_body(const PlowDevInst* in, void* cons
     }
     d_flash_prefill_mux<512, 64, FA512_KV_TILE>(requests,
 #elif PLOW_NV_PACKED_REQUEST
-    d_flash_prefill_mux<512, 32, 16>(requests,
+    attention_packed_bkv16(requests,
 #else
     d_flash_prefill<512, 32, 16>(
 #endif
@@ -84,8 +132,10 @@ __device__ __forceinline__ void attention_body(const PlowDevInst* in, void* cons
         output, in->i[0], in->i[1], GEMMA ? 16 : in->i[2], GEMMA ? 1 : in->i[3],
         in->i[4], GEMMA ? 0 : in->i[5], GEMMA ? 1 : in->i[7], in->fj[1].u,
         in->fj[2].u, in->fj[0].f, slice, nblk,
-#if PLOW_NV_FA512_WG || PLOW_NV_PACKED_REQUEST
+#if PLOW_NV_FA512_WG
         arena, t7 == PLOW_TENSOR_NONE ? nullptr : tensors[t7]);
+#elif PLOW_NV_PACKED_REQUEST
+        arena);
 #else
         arena, nullptr, tensors[t7]);
 #endif
