@@ -437,18 +437,20 @@ fn plan_into_inner(
             .start
             .checked_add(n_rows)
             .ok_or("mixed step: prefill extent overflow")?;
+        let completes = prefix_free && end == request.prompt_len;
+        // Completing terminals were placed in the leading band above.
+        let body_rows = request.tokens.len().saturating_sub(usize::from(completes));
         require(
             n_rows > 0
                 && request.start == frontiers[slot]
                 && end <= request.prompt_len
                 && end <= max_ctx
-                && out.rows.len().saturating_add(request.tokens.len()) <= capacity,
+                && out.rows.len().saturating_add(body_rows) <= capacity,
             "prefill frontier or extent",
         )?;
         // Under PrefixFree a completing prompt's last token has already been placed as a
         // leading length-one span, so the body span is the rest — possibly empty, when the
         // whole remaining prompt was one token.
-        let completes = prefix_free && end == request.prompt_len;
         let body = if completes {
             &request.tokens[..request.tokens.len() - 1]
         } else {

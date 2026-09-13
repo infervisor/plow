@@ -928,6 +928,76 @@ fn the_request_contract_plans_the_same_leading_band_layout() {
     assert!(err.contains("decode span"), "{err}");
 }
 
+#[test]
+fn two_cached_prefix_suffixes_fill_one_1024_row_token_batch() {
+    use crate::token_batch::{Phase, Request, Selection};
+    let suffix_a = [11u32; 512];
+    let suffix_b = [22u32; 512];
+    let requests = [
+        Request {
+            id: 100,
+            slot: 0,
+            state_slot: 0,
+            generation: 7,
+            phase: Phase::Prefill,
+            tokens: &suffix_a,
+            prompt_len: 1536,
+            selection: Selection::default(),
+        },
+        Request {
+            id: 200,
+            slot: 1,
+            state_slot: 1,
+            generation: 9,
+            phase: Phase::Prefill,
+            tokens: &suffix_b,
+            prompt_len: 1536,
+            selection: Selection::default(),
+        },
+    ];
+    let mut plan = Plan::with_capacity(1024, 4, 2);
+    let mut owners = Vec::with_capacity(2);
+    plan_requests_into(
+        &requests,
+        &[1024, 1024],
+        &[7, 9],
+        1024,
+        16_512,
+        3,
+        &mut plan,
+        &mut owners,
+    )
+    .unwrap();
+
+    assert_eq!((plan.real_rows, plan.decode_rows), (1024, 2));
+    assert_eq!(owners, [100, 200]);
+    assert_eq!(plan.prefill_spans.len(), 4);
+    assert_eq!(
+        plan.prefill_spans
+            .iter()
+            .filter(|span| {
+                span.n_rows == 511 && span.kv_row0 == 1024 && span.kv_len == 1535
+            })
+            .count(),
+        2
+    );
+    assert_eq!(
+        plan.commits,
+        [
+            Commit {
+                slot: 0,
+                expect: 1024,
+                after: 1536,
+            },
+            Commit {
+                slot: 1,
+                expect: 1024,
+                after: 1536,
+            },
+        ]
+    );
+}
+
 /// A one-token prompt is one span with one selected row, and no empty body span — a zero-length
 /// entry would trap in `plow_tb_view`.
 #[test]

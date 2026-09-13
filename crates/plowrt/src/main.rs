@@ -3576,6 +3576,7 @@ async fn bench(
     if let Some(mux) = state.mux(model) {
         mux.drain().await;
     }
+    plowrt::obs::pfx::report();
     let diagnostics =
         engine_diagnostics.then(|| plowrt::serve::bench::finish_engine_diagnostics(&state, model));
     #[cfg(feature = "hsa")]
