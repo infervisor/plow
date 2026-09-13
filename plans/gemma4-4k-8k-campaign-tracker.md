@@ -3,6 +3,8 @@
 Updated: 2026-09-13
 Branch: `tp-bringup-mi300x`
 Checkpoint: `google/gemma-4-12B-it`
+Protocol: `g4-4k8k-v1`
+Last qualified kernel commit: `6f5d9fe7`
 Detailed experiment log: `plans/gemma4-4k-8k-native-block.md`
 
 ## Goal and rules
@@ -27,6 +29,42 @@ Detailed experiment log: `plans/gemma4-4k-8k-native-block.md`
 The H100 W8A8 values are the latest exact-rung snapshot after the accepted HD512
 row-cooperative TMA issue path. They are not an apples-to-apples vLLM result and
 must not be compared with another precision or cache policy.
+
+## Cross-GPU checkpoint ledger
+
+| Backend cell | Native kernels | Packet/runtime | Comparable baseline | Promotion state | Next gate |
+|---|---|---|---|---|---|
+| H100 SM90a BF16 4K/8K | HD256, HD512, fused gate/up+GeGLU qualified | exact-rung roles and packed R2 qualified | Plow production C1 recorded; matched vLLM pending | kernel wins promoted; 50% TTFT open | descriptor-backed HD512 TMA layout, then cold C1/C8 |
+| H100 SM90a FP8 4K/8K | W8A8 fused-GLU and HD512 score swizzle qualified | ABI v4 role/hash and packed R2 qualified | warmed Plow snapshot recorded; matched vLLM pending | provisional end-to-end snapshot | numerical FP8 gate, then cold C1/C8 |
+| MI300X gfx942 BF16 4K/8K | no result under `g4-4k8k-v1` | shared planner/packing/VMM code present; driver gate pending | missing | unmeasured | capture four block cells and cold C1/C8 baseline |
+| MI300X gfx942 FP8 4K/8K | no result under `g4-4k8k-v1` | shared planner/packing/VMM code present; driver gate pending | missing | unmeasured | qualify dtype path, then four block cells and cold C1/C8 |
+
+`qualified` is architecture-local. A portable scheduler or packet change may be
+shared, but its correctness and performance state remains pending until that
+backend completes its own driver run.
+
+### Required run record
+
+Every new row or promotion must record:
+
+- UTC run ID, branch commit, GPU SKU/UUID, architecture, driver, compiler, clocks, and power mode.
+- Model revision, precision/quantization, TP, concurrency, exact query rung, live-KV bucket, cache state, and packed topology.
+- Program digest, object SHA, kernel shape/config, registers, spills, shared memory, occupancy, and launch count.
+- Median/p95, prompt/output hashes, numerical metric, rotated-seed result, and `gpulease` command/log location.
+
+Do not enter a cross-GPU speedup without a same-cell control under protocol
+`g4-4k8k-v1`. Missing fields keep the cell `unmeasured` or `provisional`.
+
+### Durable evidence checkpoints
+
+| Checkpoint | Architecture | Evidence |
+|---|---|---|
+| `6f5d9fe7` | H100 SM90a | accepted HD512 score-tile swizzle, ABI v4, role authentication |
+| `51f77652` | H100 SM90a | post-swizzle NCU attribution, Q/K/V padding rejection, single-thread poll rejection |
+| `c43f539dbae0137da1dc38ce3ec65096c8b6c8b7dbcdf9349cadd3f97fb64817` | H100 SM90a | qualified HD512 direct cubin SHA256, 122 registers, zero stack/spills, 110,096-byte arena |
+
+Raw profiler reports, generated assets, and timing logs stay outside git. The
+tracker stores enough identity to reject stale or cross-architecture evidence.
 
 ## Portable packet/runtime state
 
