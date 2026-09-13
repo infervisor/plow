@@ -831,6 +831,7 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
     KnobSpec::new("def.PLOW_EXPERIMENT_HD512_PC_CUH", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_EXPERIMENT_LAUNCH_SMEM", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_EXPERIMENT_PX4_TMA_DESC", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_EXPERIMENT_TMA_ELIDE_CTA_AFTER_WAIT", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_EXTRA_DEFINES", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_F2BF_SELECT", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_FA512_PC_CONSUMER_REGS", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
