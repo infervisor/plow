@@ -16,7 +16,7 @@ constexpr int FA512_KV_TILE = PLOW_NV_FA512_KV64 ? 64 : 32;
 #define PLOW_NV_FA512_FIXED_HEADS 0
 #endif
 
-#if PLOW_NV_PACKED_REQUEST && PLOW_NV_FA512_WG
+#if PLOW_NV_PACKED_REQUEST
 extern "C" __device__ __constant__ unsigned plow_pf_request_abi = 2;
 #if defined(PLOW_NV_MASKED_PADDING) && PLOW_NV_MASKED_PADDING
 extern "C" __device__ __constant__ unsigned plow_pf_masked_padding_abi = 1;
@@ -62,16 +62,18 @@ __device__ __forceinline__ void attention_body(const PlowDevInst* in, void* cons
     const unsigned t4 = in->t[4], t5 = in->t[5], t7 = in->t[7];
     __nv_bfloat16* const output =
         t5 == PLOW_TENSOR_NONE ? nullptr : static_cast<__nv_bfloat16*>(tensors[t5]);
+    const int* requests = nullptr;
+#if PLOW_NV_PACKED_REQUEST
+    if (in->t[6] != PLOW_TENSOR_NONE) requests = static_cast<const int*>(tensors[in->t[6]]);
+#endif
 #if PLOW_NV_FA512_WG
     if (in->op != PLOW_DOP_FLASH_PREFILL || in->i[6] != 512 || !output || in->i[7] != 1) {
         __trap();
         return;
     }
-    const int* requests = nullptr;
-#if PLOW_NV_PACKED_REQUEST
-    if (in->t[6] != PLOW_TENSOR_NONE) requests = static_cast<const int*>(tensors[in->t[6]]);
-#endif
     d_flash_prefill_mux<512, 64, FA512_KV_TILE>(requests,
+#elif PLOW_NV_PACKED_REQUEST
+    d_flash_prefill_mux<512, 32, 16>(requests,
 #else
     d_flash_prefill<512, 32, 16>(
 #endif
@@ -82,7 +84,7 @@ __device__ __forceinline__ void attention_body(const PlowDevInst* in, void* cons
         output, in->i[0], in->i[1], GEMMA ? 16 : in->i[2], GEMMA ? 1 : in->i[3],
         in->i[4], GEMMA ? 0 : in->i[5], GEMMA ? 1 : in->i[7], in->fj[1].u,
         in->fj[2].u, in->fj[0].f, slice, nblk,
-#if PLOW_NV_FA512_WG
+#if PLOW_NV_FA512_WG || PLOW_NV_PACKED_REQUEST
         arena, t7 == PLOW_TENSOR_NONE ? nullptr : tensors[t7]);
 #else
         arena, nullptr, tensors[t7]);
