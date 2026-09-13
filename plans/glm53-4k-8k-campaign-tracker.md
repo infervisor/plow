@@ -57,10 +57,10 @@ Detailed log: `docs/bringup/tp-bringup-upstream-review-log.md` (rows #81–#91);
 | Row split | P8192-0, P4096-0 | `PLOW_MLA_PF_ROW_SPLIT` | opt-in (#84) | T3 −109 / −31 ms; T4 medians 856.6 → 752.7 ms C1, 1697 → 1488 ms C16, CIs touch 0 (#91) | T4 re-run on the begin_slot fix |
 | G1 union skip | P8192-S | `PLOW_AMD_UNION_SKIP` | opt-in (#85) | T3 −18.7 ms (floor 3.7); P4096-S −11.1 | T4 `glue2-t4-*` (with G4) |
 | G4 MoE shared seed | P8192-S | `PLOW_GLM_MOE_SHARED_SEED` | opt-in (#86) | T3 −7.3 ms (floor 2.3); P4096-S −3.3; P8192-0 −8.6 | T4 `glue2-t4-*` |
-| begin_slot copy-out | P8192-0 admission | `PLOW_VMM_RELEASE_RETIRE` | built | baseline clear 102.8 ms; v1 smoke FAIL (0.4–119 ms); v2 reuses mapped spares, zero ioctls per request | spare probe, smoke2, T4 |
+| begin_slot copy-out | P8192-0 admission | `PLOW_VMM_RELEASE_RETIRE` | building v3 | baseline clear 102.8 ms; v1 smoke FAIL (0.4–119 ms); spare probe: copy into mapped spares 11.15 ms serial / 2.13 ms parallel (8 GPUs × 78 blocks); v2 smoke2 FAIL (117 ms max: with no spare, 78 maps per rank serialize to 115–153 ms and lose the race to admission) | v3: spare pool mapped at load, copy outside the lock; smoke3, then T4 |
 | Prefix cache fix + fine rows | all | `PLOW_VMM_CACHE_MIN_FREE_MIB`, `PLOW_AMD_PREFIX_FINE_ROWS` | fix default, knobs opt-in (#83) | 0/0 mismatches over 63 attaches | — |
 | Small-rung workgroup cap `auto` | P512, P128 | small-rung CUs | opt-in | T4 r1 not beyond ctrl spread | T4 r2 |
-| Decode band on prefill rungs | Band64 | `PLOW_GLM_ORDINARY_BAND`, `PLOW_AMD_DECODE_BAND_ROWS` | built | CPU gates; knob-off emit byte-identical | 1-layer token equality |
+| Decode band on prefill rungs | Band64 | `PLOW_GLM_ORDINARY_BAND`, `PLOW_AMD_DECODE_BAND_ROWS` | built | CPU gates; knob-off emit byte-identical; 1-layer gate refused at load: no `PLOW_MLA_PF_V2` in the gate env, and sparse FP8 decode qualification caps rows at 20 | fix env and qualify the 64-row band path, then 1-layer token equality |
 | KV address table + dynamic slots | D20, Band64 | `PLOW_GLM_KV_ADDR`, `PLOW_KV_ADDR`, `PLOW_AMD_KV_SLOTS` | patch ready | floor gate a PASS (3.72e-2 vs 6.94e-2) | gates b/c/d |
 | Admission path | served TTFT | — | unowned | `encode_fast` 9.6 → 7.2 ms (CPU, 8.5k tokens) | lever card |
 
@@ -77,6 +77,10 @@ Detailed log: `docs/bringup/tp-bringup-upstream-review-log.md` (rows #81–#91);
 | Token-batch bodies with seams | corrupt output |
 | begin_slot: parallel ranks | 0.93x (driver serializes unmaps process-wide) |
 | begin_slot: pre-retire at finish | 85 ms of serialized unmaps vs a ~35 ms gap |
+| FP8 weights in decode GEMV (w8gemv) | T2 on the production object, M=1: q_a\|kv_a\|k_rope 60.0 → 67.2 µs (grid 304), 73.5 → 87.5 µs (grid 64); o_proj 37.4 → 56.0 µs (grid 304); only o_proj at grid 64 wins |
+| Load-time weight pre-packing | nothing to pack: GEMV reads weights in place (`interp.hip:2322-2331`); GemmSmall's per-launch tile copy is the cache load itself |
+| More projections on the sequence-parallel row shard (spseam) | SP seams and `_PROJ` are already default (−68 ms T3, #54–#69); four leftovers total −2.4…−4.0 ms, each below the P8192-S floor; FP8 MoE-input gather (≈ −13 ms) needs a W8A8 shared expert |
+| GEMMs during reduce-scatter (parbranch) | 0.0 ms of independent work in the 8 segments after any collective on D20 and P8192-S |
 
 ## Current architecture finding
 
@@ -95,20 +99,26 @@ Gaps:
 
 ## Next experiments (agents launched 2026-09-13)
 
-| agent | lever | owner rung | first gate |
-|---|---|---|---|
-| packproj | one GEMM per group of projections sharing an input | D20 | T2 packed vs separate, launch cost included |
-| fusepost | GEMM plus following pointwise ops in one pass | P8192-S | T2 on the top glue ops |
-| parbranch | independent branches on separate device queues; GEMMs during reduce-scatter | D20 | T0 multi-queue feasibility |
-| w8gemv | per-call weight packing check; FP8 weights in decode 1–4 GEMV | D1 | accuracy gate before T4 |
-| spseam | projections on the sequence-parallel row shard | P8192-S | SP status and pricing |
-| pfroute | gaps 1–2: tail floor 2048/4096, row split T4 re-run, row split's interpreter half | P4096-S, P8192-0 | tail-floor T3 |
-| decrowsplit | gap 3: per-row split for native sparse decode | D20 | mixed-rung price and frequency |
-| idxtier | gap 4: exact indexer tiers by length, then block pre-selection behind a quality gate | P8192-S | per-stage attribution |
-| livectx | gaps 5–6: TP8 decode switchover, live cap/GF/split counts | D20 | crossover table |
+| agent | lever | owner rung | first gate | result so far |
+|---|---|---|---|---|
+| packproj | one GEMM per group of projections sharing an input | D20 | T2 packed vs separate, launch cost included | T2 PASS 13/13 cells: decode −16 / −33 / −17 µs per group (3-proj attention, 5-proj attention, router+gate+up), band 1024 −42 / −61 µs, bucket −32 µs (4096) / −60 µs (8192); ≈ −2.9 ms per D20 step, ≈ −8 ms per 8192 chunk (kernel only); scoped to hipBLASLt routes; T1, then T3 |
+| fusepost | GEMM plus following pointwise ops in one pass | P8192-S | T2 on the top glue ops | running |
+| parbranch | independent branches on separate device queues; GEMMs during reduce-scatter | D20 | T0 multi-queue feasibility | T0 feasible; T2 probe decode chains 0.59–0.60× serial with GPU-side join, prefill 0.94–0.98×, parity PASS; in-model D20 net predicted −1.7…−3.6 ms; reduce-scatter overlap killed |
+| w8gemv | per-call weight packing check; FP8 weights in decode 1–4 GEMV | D1 | accuracy gate before T4 | killed at T2 (see Rejected) |
+| spseam | projections on the sequence-parallel row shard | P8192-S | SP status and pricing | killed at design (see Rejected) |
+| pfroute | gaps 1–2: tail floor 2048/4096, row split T4 re-run, row split's interpreter half | P4096-S, P8192-0 | tail-floor T3 | running |
+| decrowsplit | gap 3: per-row split for native sparse decode | D20 | mixed-rung price and frequency | running |
+| idxtier | gap 4: exact indexer tiers by length, then block pre-selection behind a quality gate | P8192-S | per-stage attribution | T2: score per layer at 8192 rows grows linearly with prior (54 → 370 → 729 → 1408 µs at 0 / 8192 / 32768 / 65536), select 6.7 → 509 µs; ≈ 40 ms over 21 layers at 65536; tile 64 bit-identical but no faster; select is 27–36% at long prior; rank 7 is 3× (score) and 17–30× (select) rank 0 at prior 0 |
+| livectx | gaps 5–6: TP8 decode switchover, live cap/GF/split counts | D20 | crossover table | running |
 
 Not measured yet: the stacked path. No served run combines row split, G1, G4 and the begin_slot fix, and production and the
 real-world vLLM campaign serve none of them. Run the stacked served A/B once the begin_slot fix and the G1+G4 T4 pass.
+
+## Side findings
+
+- On the production decode object (MM=16) at one row, GEMV costs 5.6× the MM=1 build: q_a|kv_a|k_rope 60 vs 10.7 µs,
+  o_proj 37.4 vs 11.0 µs (w8gemv T2). Relevant to the single-row decode program (b1) and to decode rungs 1–4.
+- The fused shared gate|up GEMV costs 103 µs at one row against 31 µs for two plain GEMVs on the same object.
 
 ## Resume protocol
 
