@@ -27,8 +27,12 @@ const PREFIX_CACHE_CANDIDATE: Status = Status::Candidate {
         "review log #83: attach-verify4, 0/0 mismatches over 63 attaches; opt-in, unset by default",
     ],
 };
-const NATIVE_LO_CANDIDATE: Status = Status::Candidate {
-    evidence: &["review log #93: pfroute-lo-t3-full, row split on, P8192-0 615.0 -> 575.1 ms (floor 5.0), P4096-0 356.0 -> 327.0 (floor 0.7), retrieval 39/39; flip waits on a served A/B"],
+const NATIVE_LO_QUALIFIED: Status = Status::Qualified {
+    evidence: &[
+        "perf-certs/rt.mla_pf_row_split_native_lo.json: checkpoint P accepts P8192-0 615.2 -> 575.1 ms (floor 5.0), P4096-0 355.9 -> 327.0 (floor 0.7), P8192-S neutral within 2.1, 32 serving entries not worse",
+        "review log #98: pfroute-t4lo served A/B (row split on in every arm), paired-median TTFT -35.5 / -80.9 / -23.1 / -58.7 ms at ISL 8192 C1 / C16 and 4096 C1 / C16 beyond the control drift; TPOT, ITL[0], E2E not worse; 0 failed requests",
+        "docs/flags-reference.md: `=0` is the rollback",
+    ],
 };
 const ROW_SPLIT_QUALIFIED: Status = Status::Qualified {
     evidence: &[
@@ -291,7 +295,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.vmm_cache_min_free_mib", Some("PLOW_VMM_CACHE_MIN_FREE_MIB"), Layer::Runtime, U32, UNSET, PREFIX_CACHE_CANDIDATE),
     KnobSpec::new("rt.amd_prefix_fine_rows", Some("PLOW_AMD_PREFIX_FINE_ROWS"), Layer::Runtime, U32, UNSET, PREFIX_CACHE_CANDIDATE),
     KnobSpec::new("rt.mla_pf_row_split", Some("PLOW_MLA_PF_ROW_SPLIT"), Layer::Runtime, Domain::Bool, ON, ROW_SPLIT_QUALIFIED),
-    KnobSpec::new("rt.mla_pf_row_split_native_lo", Some("PLOW_MLA_PF_ROW_SPLIT_NATIVE_LO"), Layer::Runtime, Domain::Bool, OFF, NATIVE_LO_CANDIDATE),
+    KnobSpec::new("rt.mla_pf_row_split_native_lo", Some("PLOW_MLA_PF_ROW_SPLIT_NATIVE_LO"), Layer::Runtime, Domain::Bool, ON, NATIVE_LO_QUALIFIED),
     KnobSpec::new("rt.vmm_cache_mib", Some("PLOW_VMM_CACHE_MIB"), Layer::Runtime, U32, UNSET, OPT_IN),
     KnobSpec::new("rt.vmm_block_mib", Some("PLOW_VMM_BLOCK_MIB"), Layer::Runtime, U32, Default::Static(Val::Nat(2)), OPT_IN),
     KnobSpec::new("rt.weight_vmm", Some("PLOW_WEIGHT_VMM"), Layer::Runtime, Domain::Bool, UNSET, OPT_IN),

@@ -1224,7 +1224,8 @@ pub struct AmdRuntimeConfig {
 
     /// With `PLOW_MLA_PF_ROW_SPLIT`: the rows below the cut (fewer than 2048 causal keys) run the
     /// AITER kernel too, over a ragged identity CSR, instead of the interpreter gather arm.
-    #[arg(long = "amd-mla-pf-row-split-native-lo", env = "PLOW_MLA_PF_ROW_SPLIT_NATIVE_LO", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    /// Default on (checkpoint P, perf-certs/rt.mla_pf_row_split_native_lo.json); `=0` is the rollback.
+    #[arg(long = "amd-mla-pf-row-split-native-lo", env = "PLOW_MLA_PF_ROW_SPLIT_NATIVE_LO", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub mla_pf_row_split_native_lo: bool,
 
     /// Run native GLM MoE prefill rows >= 1024 on AITER's 64-row persistent tile
