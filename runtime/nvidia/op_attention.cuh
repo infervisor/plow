@@ -1864,7 +1864,7 @@ __device__ __forceinline__ const __nv_bfloat16* fa_tma_sw128_at(
  * mma reads; the K-scale post-multiplies the score tile per kv column, the V-scale folds into the
  * P fragment — identical numerics to the PIPE=0 reference arm (d_flash_prefill FP8KV). */
 template <int HD, int BQ, int BKV, bool FP8KV = false, int THREADS = PLOW_NV_THREADS,
-          bool TMA_DESC = false>
+          bool TMA_DESC = false, bool TMA_ELIDE_CTA_AFTER_WAIT = false>
 __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict__ mlpart,
                                     const __nv_bfloat16* __restrict__ Q,
                                     const __nv_bfloat16* __restrict__ K,
@@ -1881,6 +1881,8 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
     static_assert(THREADS == BQ * 8, "px4 needs one warp per query/kv/hd partition");
     static_assert(!TMA_DESC || (!FP8KV && PLOW_NV_FA_TMA),
                   "descriptor staging requires the BF16 TMA arm");
+    static_assert(!TMA_ELIDE_CTA_AFTER_WAIT || TMA_DESC,
+                  "post-wait CTA barrier elision requires descriptor TMA");
     constexpr int PAD = FA_PRE_PAD;
     /* QK: 2(khalf) x BQ/16(query groups) x 2(kv halves). */
     constexpr int KSTEPS_H = HD / 2 / 16; /* 16 k16 steps per hd half */
@@ -2243,7 +2245,7 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
             }
 #endif
             FA_PX4_WAIT_K();
-            __syncthreads();
+            if constexpr (!TMA_ELIDE_CTA_AFTER_WAIT) __syncthreads();
 #if !(PLOW_NV_FA_FP8MMA && defined(PLOW_FP8_KV)) && !PLOW_NV_FA_TMA
             /* fp8 NO-GO arm: K[t] landed as raw e4m3 in Ks8 — dequant (unscaled) to bf16 Ks
              * before QK. The fp8mma arm (Lever A) consumes Ks8 RAW below: no pass, no barrier.
@@ -2552,7 +2554,13 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
                     *fa_tma_sw128_at<HD, BKV>(Vs, row, col) = __float2bfloat16(0.0f);
                 }
             }
-            __syncthreads(); /* all threads' V rows visible */
+            if constexpr (!TMA_ELIDE_CTA_AFTER_WAIT) {
+                __syncthreads(); /* all threads' V rows visible */
+            } else if (rmax < (unsigned)BKV) {
+                /* Every consumer waited on the descriptor transaction itself. Only a ragged
+                 * tail needs a CTA rendezvous because its zero fill is distributed by thread. */
+                __syncthreads();
+            }
 #if !PLOW_NV_FA_TMA
             /* fp8: V[t] landed as raw e4m3 in Vs8 — dequant (unscaled; V-scale is folded into P). */
             if constexpr (FP8KV) {
