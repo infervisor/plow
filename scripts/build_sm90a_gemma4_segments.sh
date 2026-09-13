@@ -132,6 +132,45 @@ for gemma_glu_symbol in \
     exit 1
   }
 done
+gemma_w8a8_glu_log=$(mktemp)
+if ! env -i PATH=/usr/local/cuda/bin:/usr/bin:/bin /usr/local/cuda/bin/nvcc \
+  -std=c++17 -arch=sm_90a -O3 -cubin -Xptxas=-v \
+  -I runtime/common -I runtime/nvidia \
+  -o "$gemma_out/interp_sm90a_pfgemm_glu_w8a8_gemma4.cubin" \
+  runtime/nvidia/interp_sm90a_pfgemm_glu_w8a8_gemma4.cu 2>&1 | tee "$gemma_w8a8_glu_log"; then
+  rm -f "$gemma_w8a8_glu_log"
+  exit 1
+fi
+if grep -Eq '[1-9][0-9]* bytes (stack frame|spill stores|spill loads)' "$gemma_w8a8_glu_log"; then
+  echo 'Gemma-4 W8A8 fused GLU object uses stack or spills.' >&2
+  rm -f "$gemma_w8a8_glu_log"
+  exit 1
+fi
+rm -f "$gemma_w8a8_glu_log"
+gemma_w8a8_glu_symbols=$(/usr/local/cuda/bin/cuobjdump -symbols \
+  "$gemma_out/interp_sm90a_pfgemm_glu_w8a8_gemma4.cubin")
+for gemma_w8a8_glu_symbol in \
+  plow_sm90a_pfgemm_glu_w8a8_gemma4 \
+  plow_pfgemm_glu_w8a8_gemma4_abi \
+  plow_pfgemm_glu_w8a8_gemma4_min_rows \
+  plow_pfgemm_glu_w8a8_gemma4_max_rows \
+  plow_pfgemm_glu_w8a8_gemma4_n \
+  plow_pfgemm_glu_w8a8_gemma4_k \
+  plow_pfgemm_glu_w8a8_gemma4_stages \
+  plow_pfgemm_glu_w8a8_gemma4_bm \
+  plow_pfgemm_glu_w8a8_gemma4_bn \
+  plow_pfgemm_glu_w8a8_gemma4_bk \
+  plow_block_pfgemm_glu_w8a8_gemma4 \
+  plow_arena_bytes_pfgemm_glu_w8a8_gemma4 \
+  plow_pf_request_abi \
+  plow_pf_masked_padding_abi \
+  plow_pf_fp8_request_abi \
+  plow_pf_fp8_masked_padding_abi; do
+  grep -q "$gemma_w8a8_glu_symbol" <<<"$gemma_w8a8_glu_symbols" || {
+    echo "missing Gemma-4 W8A8 fused GLU symbol: $gemma_w8a8_glu_symbol" >&2
+    exit 1
+  }
+done
 if [ "${PLOW_BUILD_PFATTN_HD256_BKV64:-0}" = 1 ]; then
   env -i PATH=/usr/local/cuda/bin:/usr/bin:/bin /usr/local/cuda/bin/nvcc \
     -std=c++17 -arch=sm_90a -O3 -cubin -Xptxas=-v -I runtime/common -I runtime/nvidia \

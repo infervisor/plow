@@ -283,6 +283,56 @@ fn fp8_gemm_maps_match_sources_and_extents() {
 }
 
 #[test]
+fn fp8_glu_maps_match_all_three_sources_and_extents() {
+    for mutation in 0..13 {
+        let result = validate_generated(None, |insts, tensors, generated| {
+            tensors[4].bytes = 2 * 256;
+            tensors[5].bytes = 4 * 256;
+            tensors[6].bytes = 4 * 256;
+            for _ in 0..3 {
+                tensors.push(Tensor {
+                    name: "tmap",
+                    bytes: 128,
+                    initialized: false,
+                });
+            }
+            for (handle, source, rows) in [(7, 4, 2), (8, 5, 4), (9, 6, 4)] {
+                let mut g = packet::rope::GenTensor::tmap_e4m3(source, rows, 256, 128);
+                g.tensor = handle;
+                generated.push(g);
+            }
+            let mut d = inst(DevOp::GemmGluFp8);
+            d.t[1] = 4;
+            d.t[2] = 5;
+            d.t[5] = 6;
+            d.i = [2, 4, 256, 9, 0, 0, 7, 8];
+            match mutation {
+                0 => {}
+                1 => generated[0].aux = 2,
+                2 => generated[1].kind = packet::rope::GEN_TMAP_BF16,
+                3 => generated[2].hd = 128,
+                4 => generated[0].ctx = 1,
+                5 => generated.push(generated[2].clone()),
+                6 => tensors[9].bytes = 64,
+                7 => tensors[6].bytes = 1,
+                8 => d.i[3] = 0,
+                9 => d.i[6] = u32::MAX,
+                10 => generated[1].aux = 6,
+                11 => d.i[7] = 9,
+                12 => generated[2].scale = 64,
+                _ => unreachable!(),
+            }
+            insts.push(d);
+        });
+        assert_eq!(
+            result.is_ok(),
+            mutation == 0,
+            "mutation {mutation}: {result:?}"
+        );
+    }
+}
+
+#[test]
 fn hd64_half_split_cache_geometry_is_valid() {
     let hd64 = |insts: &mut Vec<DevInst64>, tensors: &mut Vec<Tensor<'_>>| {
         insts[0].i[6] = 64;

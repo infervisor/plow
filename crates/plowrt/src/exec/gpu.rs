@@ -599,6 +599,7 @@ impl SegmentRoleValidation for SegmentRoles {
                         | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_BKV64
                         | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_BKV32
                         | plow_asset::segment_roles::BF16_PREFILL_GEMM_GLU_GEMMA4
+                        | plow_asset::segment_roles::W8A8_PREFILL_GEMM_GLU_GEMMA4
                 ) {
                     let g = &blob.progs[program.index];
                     let pc = g.gq_stream[g.gq_seg_ofs[seg] as usize].inst as usize;
@@ -1129,6 +1130,61 @@ fn validate_gemma4_glu_role_inst(
     Ok(())
 }
 
+fn validate_gemma4_w8a8_glu_role_inst(
+    d: &DevInst64,
+    rows: u32,
+    tensors: &[crate::asset::devblob::DevTensor],
+) -> Result<()> {
+    let reject = || RuntimeError::Rejected("invalid Gemma-4 W8A8 GemmGlu role instruction".into());
+    if d.op != DevOp::GemmGluFp8 as u16
+        || d.i[0] != rows
+        || !matches!(rows, 4096 | 8192)
+        || d.i[1] != 15360
+        || d.i[2] != 3840
+        || d.i[3] == 0
+        || d.i[4] != 0
+        || d.i[5] != 0
+        || d.i[6] == 0
+        || d.i[7] == 0
+        || d.fj != [0; 3]
+        || [d.t[0], d.t[1], d.t[2], d.t[3], d.t[4], d.t[5], d.t[6]]
+            .contains(&TENSOR_NONE16)
+        || d.t[7] != TENSOR_NONE16
+    {
+        return Err(reject());
+    }
+    let matrix_bytes = |a: u32, b: u32, element_bytes: u64| {
+        u64::from(a)
+            .checked_mul(u64::from(b))
+            .and_then(|elements| elements.checked_mul(element_bytes))
+    };
+    for (handle, required) in [
+        (u32::from(d.t[0]), matrix_bytes(rows, 15360, 2)),
+        (u32::from(d.t[1]), matrix_bytes(rows, 3840, 1)),
+        (u32::from(d.t[2]), matrix_bytes(15360, 3840, 1)),
+        (u32::from(d.t[3]), Some(u64::from(rows) * 4)),
+        (u32::from(d.t[4]), Some(15360 * 4)),
+        (u32::from(d.t[5]), matrix_bytes(15360, 3840, 1)),
+        (u32::from(d.t[6]), Some(15360 * 4)),
+    ] {
+        let required = required.ok_or_else(reject)?;
+        if tensors
+            .get(handle as usize)
+            .is_none_or(|tensor| tensor.bytes < required)
+        {
+            return Err(reject());
+        }
+    }
+    if [d.i[3], d.i[6], d.i[7]].into_iter().any(|handle| {
+        tensors
+            .get(handle as usize)
+            .is_none_or(|tensor| tensor.bytes != 128)
+    }) {
+        return Err(reject());
+    }
+    Ok(())
+}
+
 fn packet_role_segments(
     g: &crate::asset::devblob::DevProg,
     roles: &[u8],
@@ -1273,6 +1329,8 @@ fn packet_role_segments(
                 validate_mxfp4_moe_role_inst(d, g.t, g.stream_ofs.len(), tensors)?;
             } else if role == plow_asset::segment_roles::BF16_PREFILL_GEMM_GLU_GEMMA4 {
                 validate_gemma4_glu_role_inst(d, g.t, tensors)?;
+            } else if role == plow_asset::segment_roles::W8A8_PREFILL_GEMM_GLU_GEMMA4 {
+                validate_gemma4_w8a8_glu_role_inst(d, g.t, tensors)?;
             } else if role == plow_asset::segment_roles::FP8_M1
                 && (g.t != 1 || d.op != DevOp::GemmFp8 as u16)
             {
@@ -4297,6 +4355,7 @@ impl GpuEngine {
                     | plow_asset::segment_roles::GEMV_CTA512
                     | plow_asset::segment_roles::W8A16_PREFILL_M1
                     | plow_asset::segment_roles::BF16_PREFILL_GEMM_GLU_GEMMA4
+                    | plow_asset::segment_roles::W8A8_PREFILL_GEMM_GLU_GEMMA4
             ) && profile.tag != "sm90a"
             {
                 return Err(RuntimeError::Rejected("packet role requires SM90".into()));
@@ -4356,6 +4415,12 @@ impl GpuEngine {
                     "plow_sm90a_pfgemm_glu_gemma4",
                     "plow_arena_bytes_pfgemm_glu_gemma4",
                 ),
+                plow_asset::segment_roles::W8A8_PREFILL_GEMM_GLU_GEMMA4 => (
+                    "plow_pfgemm_glu_w8a8_gemma4_abi",
+                    "plow_block_pfgemm_glu_w8a8_gemma4",
+                    "plow_sm90a_pfgemm_glu_w8a8_gemma4",
+                    "plow_arena_bytes_pfgemm_glu_w8a8_gemma4",
+                ),
                 _ => {
                     return Err(RuntimeError::Rejected(
                         "unsupported packet object role".into(),
@@ -4372,6 +4437,7 @@ impl GpuEngine {
                     | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_BKV32
                     | plow_asset::segment_roles::W8A16_PREFILL_M1
                     | plow_asset::segment_roles::BF16_PREFILL_GEMM_GLU_GEMMA4
+                    | plow_asset::segment_roles::W8A8_PREFILL_GEMM_GLU_GEMMA4
             ) && object.sha256.as_deref()
                 != Some(plow_asset::decode_objects::image_sha256(&image).as_str())
             {
@@ -4477,6 +4543,30 @@ impl GpuEngine {
                         }
                     }
                 }
+                plow_asset::segment_roles::W8A8_PREFILL_GEMM_GLU_GEMMA4 => {
+                    let globals = [
+                        ("plow_pfgemm_glu_w8a8_gemma4_min_rows", 4096),
+                        ("plow_pfgemm_glu_w8a8_gemma4_max_rows", 8192),
+                        ("plow_pfgemm_glu_w8a8_gemma4_n", 15360),
+                        ("plow_pfgemm_glu_w8a8_gemma4_k", 3840),
+                        ("plow_pfgemm_glu_w8a8_gemma4_stages", 4),
+                        ("plow_pfgemm_glu_w8a8_gemma4_bm", 128),
+                        ("plow_pfgemm_glu_w8a8_gemma4_bn", 128),
+                        ("plow_pfgemm_glu_w8a8_gemma4_bk", 128),
+                    ];
+                    if capability != Some(1) || block != Some(384) {
+                        return Err(RuntimeError::Rejected(
+                            "incompatible Gemma-4 W8A8 GemmGlu role".into(),
+                        ));
+                    }
+                    for (name, value) in globals {
+                        if be.module_global_u32(&module, name)? != Some(value) {
+                            return Err(RuntimeError::Rejected(
+                                "incompatible Gemma-4 W8A8 GemmGlu role".into(),
+                            ));
+                        }
+                    }
+                }
                 _ => unreachable!("object role validated above"),
             }
             let block = block.expect("validated role block");
@@ -4485,7 +4575,11 @@ impl GpuEngine {
                 .module_global_u32(&module, arena)?
                 .filter(|&bytes| bytes > 0)
                 .ok_or_else(|| RuntimeError::Rejected("packet role lacks arena metadata".into()))?;
-            if id == plow_asset::segment_roles::BF16_PREFILL_GEMM_GLU_GEMMA4
+            if matches!(
+                id,
+                plow_asset::segment_roles::BF16_PREFILL_GEMM_GLU_GEMMA4
+                    | plow_asset::segment_roles::W8A8_PREFILL_GEMM_GLU_GEMMA4
+            )
                 && smem != 197696
             {
                 return Err(RuntimeError::Rejected(

@@ -524,10 +524,43 @@ fn direct_operands(op: DevOp, d: &DevInst64, packet: &Packet<'_>) -> Result<()> 
             return Ok(());
         }
         DevOp::GemmGluFp8 => {
-            return require(
-                d.i[3] == 0 && d.i[6] == 0 && d.i[7] == 0,
-                "unaudited FP8 GLU tensor-map operands",
-            );
+            if d.i[3] == 0 && d.i[6] == 0 && d.i[7] == 0 {
+                return Ok(());
+            }
+            for (handle, source, rows) in [
+                (d.i[6], d.t[1], u64::from(d.i[0])),
+                (d.i[7], d.t[2], u64::from(d.i[1])),
+                (d.i[3], d.t[5], u64::from(d.i[1])),
+            ] {
+                let mut generators = packet.generated.iter().filter(|g| g.tensor == handle);
+                let g = generators
+                    .next()
+                    .ok_or("missing FP8 GLU tensor-map operands")?;
+                require(
+                    handle != 0
+                        && handle < u32::from(TENSOR_NONE16)
+                        && handle != u32::from(source)
+                        && generators.next().is_none()
+                        && g.kind == packet::rope::GEN_TMAP_E4M3
+                        && g.aux == u32::from(source)
+                        && g.hd == d.i[2]
+                        && g.hd > 0
+                        && g.hd % 128 == 0
+                        && rows > 0
+                        && rows <= u64::from(g.ctx)
+                        && g.scale == 128
+                        && packet
+                            .tensors
+                            .get(handle as usize)
+                            .is_some_and(|t| t.bytes == 128)
+                        && packet
+                            .tensors
+                            .get(source as usize)
+                            .is_some_and(|t| t.bytes >= u64::from(g.ctx) * u64::from(g.hd)),
+                    "FP8 GLU tensor-map operands disagree with direct operands",
+                )?;
+            }
+            return Ok(());
         }
         DevOp::GemvGluFp8 => {
             return require(d.fj[2] == 0, "unaudited FP8 GLU folded operands");

@@ -50,6 +50,7 @@ mod checkpoint;
 use checkpoint::{layer_scalars, validate_coverage};
 mod attention_prefill_role;
 mod gemma4_gemm_glu_role;
+mod gemma4_w8a8_gemm_glu_role;
 mod w8a16_prefill_role;
 mod block;
 use block::{parse_block, write_block_descriptor};
@@ -5313,10 +5314,20 @@ fn emit_phase(
         let gemma4_glu_role = !gemv_family
             && emit_config::active().gemma4_sm90_gemm_glu_role
             && gemma4_gemm_glu_role::exact_shape(tg, inter_l, c.hidden);
+        let gemma4_w8a8_glu_role = !gemv_family
+            && w8a8
+            && emit_config::active().gemma4_sm90_w8a8_gemm_glu_role
+            && gemma4_w8a8_gemm_glu_role::exact_shape(tg, inter_l, c.hidden);
         let gemm_glu = !gemv_family
-            && gemma4_gemm_glu_role::select_fused(
-                glu_fusion_wins(tg, inter_l, c.hidden, n_cu),
-                gemma4_glu_role,
+            && gemma4_w8a8_gemm_glu_role::select_fused(
+                gemma4_gemm_glu_role::select_fused(
+                    glu_fusion_wins(tg, inter_l, c.hidden, n_cu),
+                    gemma4_glu_role,
+                    tg,
+                    inter_l,
+                    c.hidden,
+                ),
+                gemma4_w8a8_glu_role,
                 tg,
                 inter_l,
                 c.hidden,
@@ -5450,6 +5461,9 @@ fn emit_phase(
                     d.i[3] = mu;
                 }
             });
+            if gemma4_w8a8_glu_role {
+                b.keep_single_grid(cg);
+            }
             rec(cg);
             cg
         } else if mx4_pf && !gemv_family && glu_fusion_wins_mxfp4(t, inter_l, c.hidden, n_cu) {
@@ -7279,6 +7293,17 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
             "Gemma-4 BF16 GemmGlu role requires BF16 Gemma 4, SM90 TP1, and --tma-gemm"
         );
     }
+    if emit_config::active().gemma4_sm90_w8a8_gemm_glu_role {
+        assert!(
+            model_type.starts_with("gemma4")
+                && arch == "sm_90a"
+                && tp == 1
+                && emit_config::active().w8a8
+                && !emit_config::active().mxfp4
+                && emit_config::active().tma_gemm,
+            "Gemma-4 W8A8 GemmGlu role requires W8A8 Gemma 4, SM90 TP1, and --tma-gemm"
+        );
+    }
     assert!(
         !emit_config::active().gemv_decode_role || capabilities.dense_packet_contracts,
         "GEMV decode role currently requires the dense BF16 emitter"
@@ -8993,6 +9018,16 @@ fn emit_dense_gqa(
         )
         .unwrap_or_else(|error| panic!("Gemma-4 BF16 GemmGlu object: {error}"));
         eprintln!("  Gemma-4 BF16 GemmGlu: {selected} lean segments");
+    }
+    if ecfg.gemma4_sm90_w8a8_gemm_glu_role {
+        let selected = gemma4_w8a8_gemm_glu_role::apply_output_object(
+            &mut m,
+            &mut sections,
+            &arch,
+            std::path::Path::new(&out),
+        )
+        .unwrap_or_else(|error| panic!("Gemma-4 W8A8 GemmGlu object: {error}"));
+        eprintln!("  Gemma-4 W8A8 GemmGlu: {selected} lean segments");
     }
     if let Some(live_position) = sections
         .iter()
