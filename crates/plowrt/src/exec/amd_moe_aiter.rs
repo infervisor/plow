@@ -45,6 +45,9 @@ pub(super) fn tile64_available(dir: &Path) -> bool {
 enum Mode {
     Sorted,
     SortedBf16,
+    /// BF16 output the shared expert's down projection already wrote: prepare keeps it and the
+    /// fused call accumulates the routed partials onto it. No combine follows.
+    SharedBf16,
     Flat,
 }
 
@@ -76,7 +79,7 @@ impl Route {
                 }
             }
             Mode::Flat => 2,
-            Mode::SortedBf16 => {
+            Mode::SortedBf16 | Mode::SharedBf16 => {
                 if self.inst.i[7] == 1 {
                     2
                 } else {
@@ -122,6 +125,7 @@ pub(super) fn routes(
             0 => Mode::Sorted,
             1 => Mode::Flat,
             2 => Mode::SortedBf16,
+            3 => Mode::SharedBf16,
             _ => return Err(err("unknown output mode")),
         };
         let flat = mode == Mode::Flat;
@@ -237,6 +241,22 @@ pub(super) fn routes(
                 return Err(err("sorted BF16 output has incomplete combine coverage"));
             }
         }
+        if mode == Mode::SharedBf16 {
+            let writer = prog.insts[..ix].iter().rev().find(|d| d.t[0] == inst.t[0]);
+            if inst.t[1..].contains(&inst.t[0])
+                || !writer.is_some_and(|d| {
+                    d.op == DevOp::GemmLtPf as u16 && d.i[..2] == [prog.t, 6144] && d.i[3] == 0
+                })
+                || prog.insts[ix + 1..]
+                    .iter()
+                    .take_while(|d| d.t[0] != inst.t[0])
+                    .any(|d| d.op == DevOp::MoeCombinePf as u16 && d.t[3] == inst.t[0])
+            {
+                return Err(err(
+                    "shared BF16 output requires a preceding full-row shared projection into it and no combine",
+                ));
+            }
+        }
         let rows = u64::from(prog.t);
         let (n_exp, topk) = (u64::from(n_exp), u64::from(topk));
         let capacity = rows * topk + n_exp * 63;
@@ -253,7 +273,7 @@ pub(super) fn routes(
             ]
         } else {
             [
-                rows * 6144 * if mode == Mode::SortedBf16 { 2 } else { 4 },
+                rows * 6144 * if matches!(mode, Mode::SortedBf16 | Mode::SharedBf16) { 2 } else { 4 },
                 rows * 6144 * 2,
                 n_exp * 3 * 8,
                 n_exp * 3 * 8,
@@ -462,7 +482,7 @@ struct PrepareArgs {
     swizzle: u32,
     n_exp: u32,
     topk: u32,
-    pad: u32,
+    keep_out: u32,
 }
 
 /// Kernarg bytes of `plow_moe_aiter_prepare` per adapter ABI, each a prefix of the next:
@@ -532,6 +552,8 @@ pub(super) struct MoeAiter {
     n_exp: u32,
     resident_weights: Vec<Option<ResidentWeights>>,
     prepare_args: u32,
+    /// The adapter's prepare honours `keep_out` (`plow_moe_aiter_keep_out_abi_1`).
+    keep_out: bool,
     xcd_swizzle: bool,
 }
 
@@ -701,6 +723,7 @@ impl MoeAiter {
         } else {
             PREPARE_ARGS_LEGACY
         };
+        let keep_out = adapter_syms.contains(&"plow_moe_aiter_keep_out_abi_1");
         // Older prepare kernels hardcode 256 experts / top-8; only the fold needs more.
         if n_exp != 256 && prepare_args != PREPARE_ARGS_NEXP {
             return Err(RuntimeError::Device(format!(
@@ -758,6 +781,7 @@ impl MoeAiter {
             n_exp,
             resident_weights: Vec::new(),
             prepare_args,
+            keep_out,
             xcd_swizzle: false,
         })
     }
@@ -884,7 +908,13 @@ impl MoeAiter {
                 bytemuck::cast_slice(&[gu, down, gs, ds, t[2], t[3]]),
             )?;
         }
-        let out = if route.mode == Mode::SortedBf16 {
+        if route.mode == Mode::SharedBf16 && !self.keep_out {
+            return Err(RuntimeError::Device(
+                "shared BF16 MoE route needs the keep-out adapter (plow_moe_aiter_keep_out_abi_1)"
+                    .into(),
+            ));
+        }
+        let out = if matches!(route.mode, Mode::SortedBf16 | Mode::SharedBf16) {
             t[0]
         } else {
             workspace_out
@@ -902,7 +932,7 @@ impl MoeAiter {
             swizzle: u32::from(self.xcd_swizzle && tile64.is_none()),
             n_exp: self.n_exp,
             topk: route.topk(),
-            pad: 0,
+            keep_out: u32::from(route.mode == Mode::SharedBf16),
         };
         if stages & STAGE_PREPARE != 0 {
             be.launch(
@@ -960,7 +990,7 @@ impl MoeAiter {
                 bytemuck::cast_slice(&args),
             )?;
         }
-        if route.mode == Mode::SortedBf16 || stages & STAGE_STORE == 0 {
+        if matches!(route.mode, Mode::SortedBf16 | Mode::SharedBf16) || stages & STAGE_STORE == 0 {
             return Ok(());
         }
         let store = StoreArgs {
@@ -1170,6 +1200,39 @@ mod tests {
         next_combine.i[7] = 0;
         prog.insts.push(next_combine);
         assert!(routes(&prog, &tensors, 2).is_ok());
+    }
+
+    #[test]
+    fn shared_bf16_routes_require_a_full_row_shared_writer_and_no_combine() {
+        let (mut prog, mut tensors) = sorted_bf16_fixture(128, 0);
+        prog.insts[1].i[6] = 3;
+        assert!(routes(&prog, &tensors, 2).is_err());
+        prog.insts.insert(
+            0,
+            DevInst64 {
+                op: DevOp::GemmLtPf as u16,
+                t: [0, 8, 2, TENSOR_NONE16, TENSOR_NONE16, TENSOR_NONE16, TENSOR_NONE16, TENSOR_NONE16],
+                i: [128, 6144, 256, 0, 0, 0, 0, 0],
+                ..Default::default()
+            },
+        );
+        prog.stream[0].inst = 2;
+        let route = routes(&prog, &tensors, 2).unwrap()[1].unwrap();
+        assert_eq!((route.mode, route.launches()), (Mode::SharedBf16, 3));
+        prog.insts[0].i[3] = 2;
+        assert!(routes(&prog, &tensors, 2).is_err());
+        prog.insts[0].i[3] = 0;
+        tensors[0].bytes -= 1;
+        assert!(routes(&prog, &tensors, 2).is_err());
+        tensors[0].bytes += 1;
+        let mut combine = DevInst64 {
+            op: DevOp::MoeCombinePf as u16,
+            i: [6144, 1, 128, 0, 0, 0, 0, 1],
+            ..Default::default()
+        };
+        combine.t = [8, TENSOR_NONE16, TENSOR_NONE16, 0, TENSOR_NONE16, TENSOR_NONE16, TENSOR_NONE16, TENSOR_NONE16];
+        prog.insts.push(combine);
+        assert!(routes(&prog, &tensors, 2).is_err());
     }
 
     #[test]

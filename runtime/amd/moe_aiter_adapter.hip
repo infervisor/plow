@@ -61,7 +61,9 @@ struct MoePrepareArgs {
     // 112 (swizzle; `n_exp` lands in what was its pad), 120 (this).
     unsigned n_exp;
     unsigned topk;
-    unsigned pad;
+    // Nonzero: `out` already holds the shared expert's partial and the fused call accumulates the
+    // routed partials onto it, so it is not zeroed. Was `pad`; ABI plow_moe_aiter_keep_out_abi_1.
+    unsigned keep_out;
 };
 static_assert(sizeof(MoePrepareArgs) == 120);
 
@@ -88,8 +90,9 @@ extern "C" __global__ void plow_moe_aiter_prepare(MoePrepareArgs a) {
             x0 * inverse, x1 * inverse, 0, false);
         if (lane == 0) a.qs[col * a.rows + row] = scale;
     }
-    for (unsigned i = first; i < a.rows * 768u; i += stride)
-        a.out[i] = make_uint4(0, 0, 0, 0);
+    if (!a.keep_out)
+        for (unsigned i = first; i < a.rows * 768u; i += stride)
+            a.out[i] = make_uint4(0, 0, 0, 0);
     const unsigned padded = a.meta[3u * a.n_exp] * 64u;
     const unsigned blocks = padded / a.block_m;
     for (unsigned i = first; i < padded; i += stride) {
@@ -138,6 +141,7 @@ extern "C" __device__ unsigned plow_moe_aiter_swizzle_abi_1 = 1;
  * An adapter without this marker reads `block_m` where the new one writes `n_exp` and would walk
  * `meta` at the wrong stride — refuse it in the loader rather than sort a garbage routing table. */
 extern "C" __device__ unsigned plow_moe_aiter_nexp_abi_1 = 1;
+extern "C" __device__ unsigned plow_moe_aiter_keep_out_abi_1 = 1;
 
 struct MoeFlatPackArgs {
     uint4* gu;

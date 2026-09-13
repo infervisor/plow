@@ -897,6 +897,13 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_MOE_ALIGN_PAR", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub moe_align_par: bool,
 
+    /// GLM TP8 prefill on the AITER MoE route: the shared expert's down projection writes the
+    /// MoE seam's reduce-scatter source and the fused call accumulates the routed partials onto
+    /// it, so no `MoeCombinePf` runs. Needs the keep-out MoE adapter. Opt-in; unset ⇒
+    /// byte-identical blob.
+    #[arg(long, env = "PLOW_GLM_MOE_SHARED_SEED", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_moe_shared_seed: bool,
+
     /// Sequence-parallel TP seams for prefill: run AttnRes / router / latent xe / top-k on the
     /// reduce-scatter-owned `t/tp` row band and all-gather the results (`XReduceScatter` +
     /// `XAllGather`) instead of replicating the row work on every rank. Default on; the
@@ -1294,6 +1301,7 @@ impl EmitConfig {
             gemv_prefetch: env_bool("PLOW_GEMV_PREFETCH"),
             moe_stage2_lean: env_opt_out("PLOW_MOE_STAGE2_LEAN"),
             moe_align_par: env_opt_out("PLOW_MOE_ALIGN_PAR"),
+            glm_moe_shared_seed: env_bool("PLOW_GLM_MOE_SHARED_SEED"),
             seq_par_seams: env_opt_out("PLOW_SEQ_PAR_SEAMS"),
             moe_prefill_ep: env_bool("PLOW_MOE_PREFILL_EP"),
             moe_stage1_lean: env_opt_out("PLOW_MOE_STAGE1_LEAN"),

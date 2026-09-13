@@ -7126,6 +7126,14 @@ fn emit_glm_moe_ffn_prefill(
             d.i[5] = GLM_ACT_SILU;
         })
     };
+    // PLOW_GLM_MOE_SHARED_SEED: the shared down writes the seam's reduce-scatter source and the
+    // AITER call accumulates the routed partials onto it, so no MoeCombinePf runs.
+    let seed = emit_config::active().glm_moe_shared_seed
+        && native_moe
+        && shared_lt.is_some()
+        && tp > 1
+        && !raw_output
+        && glm_sp(c, n, b, t);
     // 17 shared expert down — row-parallel (imoe_l input): a PARTIAL [T,H] under TP.
     let c_shd = if fold {
         c_shglu
@@ -7143,7 +7151,8 @@ fn emit_glm_moe_ffn_prefill(
             &[c_shglu],
         )
     } else if shared_lt.is_some() {
-        emit_glm_lt_ext(b, c, n.shared, n.shfu, w.shd, t, t, [h, imoe_l], &[c_shglu])
+        let out = if seed { n.dg_tp } else { n.shared };
+        emit_glm_lt_ext(b, c, out, n.shfu, w.shd, t, t, [h, imoe_l], &[c_shglu])
     } else {
         gemm(b, n.shared, n.shfu, w.shd, w.shd_s, h, imoe_l, &[c_shglu])
     };
@@ -7151,9 +7160,11 @@ fn emit_glm_moe_ffn_prefill(
     //    expert's gate|up crosses HBM ONCE for every token that chose it — the reuse decode cannot
     //    have. i[3] picks the block-fp8 or bf16 weight arm from the same tables decode uses.
     let c_d = if native_moe {
-        let counter = b.emit(DevOp::MoeAiterFp8Pf, one.clone(), &[c_align, c_rn2], |d| {
+        let aiter_deps = [c_align, c_rn2, c_shd];
+        let aiter_deps = &aiter_deps[..2 + usize::from(seed)];
+        let counter = b.emit(DevOp::MoeAiterFp8Pf, one.clone(), aiter_deps, |d| {
             d.t = [
-                n.part,
+                if seed { n.dg_tp } else { n.part },
                 n.xn2,
                 w.ewt,
                 w.est,
@@ -7162,7 +7173,8 @@ fn emit_glm_moe_ffn_prefill(
                 n.row_partidx,
                 n.row_gate,
             ];
-            d.i = [t, h, imoe_e, e_all, tk_all, 64, 2, u32::from(resident)];
+            // Mode 3: `out` already holds the shared partial (amd_moe_aiter.rs `SharedBf16`).
+            d.i = [t, h, imoe_e, e_all, tk_all, 64, 2 + u32::from(seed), u32::from(resident)];
         });
         b.isolate(counter);
         counter
@@ -7244,29 +7256,33 @@ fn emit_glm_moe_ffn_prefill(
         };
         let xr_deps: Vec<u32> = (0..kb)
             .map(|i| {
-                let c_cmb = b.emit(DevOp::MoeCombinePf, all.clone(), &[c_shd, c_d], |d| {
-                    d.t[0] = n.dg_tp;
-                    // TENSOR_NONE, not `n.zero_h`. Under TP the combine's residual must be ZERO
-                    // (xmid is added after the all-reduce, or XReduce would sum it tp times) —
-                    // and `d_moe_combine_pf` ALREADY spells zero as a null pointer
-                    // (`residual ? bf2f(residual[i]) : 0.0f`). Naming a [T,H] bf16 buffer of
-                    // literal zeros made the kernel READ 100.7 MB per layer per rank at T=8192
-                    // (7.5 GB per 8k chunk over 75 MoE layers) to add 0.0f. Bit-identical by
-                    // inspection of that ternary, and it removes one of this op's four streams.
-                    d.t[1] = TENSOR_NONE;
-                    // Under the fold the shared expert is inside `part`; `d_moe_combine_pf`
-                    // already spells "no shared partial" as a null pointer (`if (shared)`).
-                    d.t[2] = if fold { TENSOR_NONE } else { n.shared };
-                    d.t[3] = n.part;
-                    d.i[0] = h;
-                    // PLOW_MOE_PF_DET: op 86 already summed the k slots in place, so this
-                    // reads ONE contiguous stream. Same kernel, same expression, k = 1.
-                    d.i[1] = if det || native_moe { 1 } else { tk };
-                    d.i[2] = rows;
-                    d.i[3] = i * rows; // t_row0
-                    d.i[4] = u32::from(det); // f64 fixed-point accumulator (PLOW_MOE_PF_DET)
-                    d.i[7] = u32::from(native_moe);
-                });
+                let c_cmb = if seed {
+                    c_d
+                } else {
+                    b.emit(DevOp::MoeCombinePf, all.clone(), &[c_shd, c_d], |d| {
+                        d.t[0] = n.dg_tp;
+                        // TENSOR_NONE, not `n.zero_h`. Under TP the combine's residual must be ZERO
+                        // (xmid is added after the all-reduce, or XReduce would sum it tp times) —
+                        // and `d_moe_combine_pf` ALREADY spells zero as a null pointer
+                        // (`residual ? bf2f(residual[i]) : 0.0f`). Naming a [T,H] bf16 buffer of
+                        // literal zeros made the kernel READ 100.7 MB per layer per rank at T=8192
+                        // (7.5 GB per 8k chunk over 75 MoE layers) to add 0.0f. Bit-identical by
+                        // inspection of that ternary, and it removes one of this op's four streams.
+                        d.t[1] = TENSOR_NONE;
+                        // Under the fold the shared expert is inside `part`; `d_moe_combine_pf`
+                        // already spells "no shared partial" as a null pointer (`if (shared)`).
+                        d.t[2] = if fold { TENSOR_NONE } else { n.shared };
+                        d.t[3] = n.part;
+                        d.i[0] = h;
+                        // PLOW_MOE_PF_DET: op 86 already summed the k slots in place, so this
+                        // reads ONE contiguous stream. Same kernel, same expression, k = 1.
+                        d.i[1] = if det || native_moe { 1 } else { tk };
+                        d.i[2] = rows;
+                        d.i[3] = i * rows; // t_row0
+                        d.i[4] = u32::from(det); // f64 fixed-point accumulator (PLOW_MOE_PF_DET)
+                        d.i[7] = u32::from(native_moe);
+                    })
+                };
                 if sp {
                     return crate::emit_xreduce_scatter(
                         b, xgate, &bcus, &[c_cmb], n.dg_tp, t * h, tp, n.slot_b, None, None,

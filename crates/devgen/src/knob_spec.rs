@@ -58,6 +58,9 @@ const TOKEN_BATCH_TP_PARKED: Status = Status::Parked {
         "docs/flags-reference.md: PLOW_TOKEN_BATCH_TP",
     ],
 };
+const MOE_SHARED_SEED_CANDIDATE: Status = Status::Candidate {
+    evidence: &["review log #86: glue2-t3-g4-rung, P8192-S 648.5 -> 641.4 ms (floor 2.3), P4096-S -3.3, P8192-0 -8.6; values inside the cross-process floor (glue2-t3-g4-value); served A/B pending"],
+};
 const SEG_EXPERIMENT_PARKED: Status = Status::Parked {
     reason: "rejected segmentation experiment (+91.7 / +3.6 / +22.6 ms TTFT)",
     evidence: &["docs/flags-reference.md: Emit-side knobs that are NOT EmitConfig fields"],
@@ -504,6 +507,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.glm_mla_dec_aiter", Some("PLOW_GLM_MLA_DEC_AITER"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_moe_resident", Some("PLOW_GLM_MOE_RESIDENT"), Layer::Emit, Domain::Bool, GLM_RECIPE_ON, GLM_RECIPE),
     KnobSpec::new("emit.glm_moe_shared_fold", Some("PLOW_GLM_MOE_SHARED_FOLD"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("emit.glm_moe_shared_seed", Some("PLOW_GLM_MOE_SHARED_SEED"), Layer::Emit, Domain::Bool, OFF, MOE_SHARED_SEED_CANDIDATE),
     KnobSpec::new("emit.token_batch_tp", Some("PLOW_TOKEN_BATCH_TP"), Layer::Emit, Domain::Bool, OFF, TOKEN_BATCH_TP_PARKED).with(C_TOKEN_BATCH_TP),
     KnobSpec::new("emit.packed_sparse_pf", Some("PLOW_PACKED_SPARSE_PF"), Layer::Emit, Domain::Bool, OFF, OPT_IN).with(C_PACKED_SPARSE_PF),
     KnobSpec::new("emit.glm_index_tp", Some("PLOW_GLM_INDEX_TP"), Layer::Emit, Domain::Bool, GLM_RECIPE_ON, GLM_RECIPE),
