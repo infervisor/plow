@@ -11413,6 +11413,14 @@ impl AmdEngine {
                 self.seg_launches += 3;
                 return Ok(());
             }
+            if route.split_row0 != 0 {
+                let sparse = self.sparse_mla.as_ref().ok_or_else(|| {
+                    RuntimeError::Device("sparse MLA route has no loaded kernels".into())
+                })?;
+                // The interpreter launch below runs the segment's rows [0, split_row0).
+                self.seg_launches +=
+                    sparse.enqueue_split(&self.be, route, &self.tens_table)? as u64;
+            }
         }
         if !active {
             if let Some(PrefillSegmentRoute::MlaMaterializePack {
@@ -12635,9 +12643,15 @@ impl AmdEngine {
             self.progs[prog].t
         };
         mla_prefill::rebase(&self.progs[prog].small_mla_split_sites, insts, c0 + rows)?;
+        let row_split = crate::config::RuntimeConfig::get().amd.mla_pf_row_split;
         for route in &mut self.progs[prog].prefill_routes {
             if let PrefillSegmentRoute::SparseMla(route) = route {
-                route.rebase(rows, c0)?;
+                route.rebase(rows, c0, row_split)?;
+                // The union header and the flash's query tiles must agree on the row count.
+                if let Some((flash, union, n)) = route.split_patch() {
+                    insts[flash].i[4] = n;
+                    insts[union].i[0] = n;
+                }
             }
             if let PrefillSegmentRoute::MoeAiter(route) = route {
                 route.rebase(rows)?;

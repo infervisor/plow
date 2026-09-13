@@ -13,9 +13,10 @@ pipeline described in [`docs/bringup/00-overview.md`](../00-overview.md):
 | [`agents/05-single-block-sweep.md`](05-single-block-sweep.md) | Single-block correctness + latency |
 | [`agents/06-runtime-opt.md`](06-runtime-opt.md) | Whole-model serving optimization |
 | [`agents/07-perf-campaign.md`](07-perf-campaign.md) | End-to-end measured campaign + written results |
+| [`agents/08-rung-campaign.md`](08-rung-campaign.md) | Per-rung optimization loop: rung card, attribution, lever card, T1–T4 ladder, decision, record |
 
 Prompts **01–03 are target-independent** and take no target parameters.
-Prompts **04–07 each open with the parameter block** from
+Prompts **04–08 each open with the parameter block** from
 [`docs/bringup/target.md`](../target.md) — `$VENDOR $ISA $GPU $NCU $NGPU
 $PARALLEL $MAXCTX $TOOLCHAIN $BUILD $FEATURES $BW_BOUND $COMPUTE_CEIL
 $RESULTS` — which must be filled in before the agent runs anything. Their
@@ -28,7 +29,7 @@ defect, and a row that cannot be filled is a blocker, not a default.
    and edit files) in the repo root, inside the nix dev shell or with the
    ability to invoke `nix develop --command`.
 2. Paste the stage prompt, filling in the placeholders at the top — the model
-   ones (HF model id, parameter budget) and, for stages 4–7, the whole target
+   ones (HF model id, parameter budget) and, for stages 4–8, the whole target
    parameter block.
 3. The prompt tells the agent what to read first, the edits to make, the
    commands to run, and the **gate** it must pass. The agent reports back in a
@@ -38,7 +39,7 @@ defect, and a row that cannot be filled is a blocker, not a default.
 
 - **Gates are blocking.** An agent that cannot pass its gate stops and reports;
   it does not proceed or weaken the gate.
-- **The target is never hardcoded.** Stages 4–7 write `--gpu $GPU --arch $ISA`;
+- **The target is never hardcoded.** Stages 4–8 write `--gpu $GPU --arch $ISA`;
   a number measured on one part is never carried to another, including between
   two parts at the same `$ISA`.
 - **Stop-and-ask conditions are listed per stage** — hardware access, ambiguous
@@ -51,14 +52,17 @@ defect, and a row that cannot be filled is a blocker, not a default.
   harnesses and name the selected harness in the report. Extend an existing
   harness when its semantic boundary is incomplete; do not create a
   campaign-specific runner for a case an existing harness can express.
+- **Optimize one rung at a time.** After Stage 6, performance work follows
+  [`08-rung-campaign.md`](08-rung-campaign.md): one compiled rung, one lever,
+  a floor measured in the same job, and a decision rule before any GPU time.
+  Record the exact packet profile, both object hashes, resource budgets, paired
+  trial order, correctness hashes, and occurrence-weighted rung savings.
+  A standalone winner is only a search result until the same object wins
+  through its packet role.
 - **Spend the sweep budget on blocks.** Use standalone probes to reject broken
   arms, single-block or truncated-model sweeps to rank the broad grid, and a
   whole-model step only for the 2–3 finalists. Serving is the promotion gate,
   not the tuning loop.
-- **Close one rung at a time.** Record the exact packet profile, control and
-  candidate object hashes, resource budgets, paired trial order, correctness
-  hashes, and occurrence-weighted rung savings. A standalone winner is only a
-  search result until the same object wins through its packet role.
 - **Proof obligations are never vacuous.** Stage 2/3 prompts require real
   `rfl`-backed theorems for new rewrite rules; `sorry` fails the gate.
 

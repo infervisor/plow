@@ -70,10 +70,13 @@ pub(super) struct Route {
     rows: u32,
     kv_len: u32,
     pub active: bool,
+    ix: u32,
+    union_ix: Option<u32>,
+    pub split_row0: u32,
 }
 
 impl Route {
-    pub fn rebase(&mut self, rows: u32, prior: u32) -> Result<()> {
+    pub fn rebase(&mut self, rows: u32, prior: u32, row_split: bool) -> Result<()> {
         if rows > self.inst.i[4] || prior.checked_add(rows).is_none_or(|n| n > self.inst.i[2]) {
             return Err(RuntimeError::Device(
                 "sparse MLA chunk exceeds its query/KV capacity".into(),
@@ -83,7 +86,21 @@ impl Route {
         self.kv_len = prior + rows;
         // Fixed-width CSR is valid only when every row has all 2048 causal keys.
         self.active = rows != 0 && prior >= 2047;
+        self.split_row0 = 0;
+        if row_split && !self.active && rows != 0 && self.union_ix.is_some() {
+            // 8-aligned so the interpreter keeps exactly the unsplit per-8-query union tiles.
+            let s = (SPAN_MIN_PRIOR - prior).next_multiple_of(8);
+            if rows > s {
+                self.split_row0 = s;
+            }
+        }
         Ok(())
+    }
+
+    /// `(flash, union, rows)`: the instructions whose row count the interpreter half runs with.
+    pub fn split_patch(&self) -> Option<(usize, usize, u32)> {
+        let union = self.union_ix?;
+        (self.split_row0 != 0).then_some((self.ix as usize, union as usize, self.split_row0))
     }
 }
 
@@ -165,6 +182,9 @@ mod tests {
                 rows: ROWS,
                 kv_len: 0,
                 active: false,
+                ix: 0,
+                union_ix: None,
+                split_row0: 0,
             };
             for slot in 0..2u64 {
                 let mut table: Vec<u64> = buffers.iter().map(|m| m.base).collect();
@@ -179,7 +199,7 @@ mod tests {
                         EngineDevice::upload(&be, &buffers[b], 0, bytemuck::cast_slice(&poison))
                             .unwrap();
                     }
-                    route.rebase(rows, 2048).unwrap();
+                    route.rebase(rows, 2048, false).unwrap();
                     kernel
                         .enqueue(&be, route, bytemuck::cast_slice(&table))
                         .unwrap();
@@ -359,17 +379,17 @@ mod tests {
     fn sparse_mla_rebases_ragged_rows_and_restores_early_fallback() {
         let (prog, tensors) = fixture();
         let mut route = routes(&prog, &tensors, 2).unwrap()[1].unwrap();
-        route.rebase(129, 65536).unwrap();
+        route.rebase(129, 65536, false).unwrap();
         assert!(route.active);
         assert_eq!(route.rows, 129);
-        route.rebase(8192, 0).unwrap();
+        route.rebase(8192, 0, false).unwrap();
         assert!(!route.active);
-        route.rebase(1, 2046).unwrap();
+        route.rebase(1, 2046, false).unwrap();
         assert!(!route.active);
-        route.rebase(1, 2047).unwrap();
+        route.rebase(1, 2047, false).unwrap();
         assert!(route.active);
-        assert!(route.rebase(8193, 0).is_err());
-        assert!(route.rebase(129, 81920).is_err());
+        assert!(route.rebase(8193, 0, false).is_err());
+        assert!(route.rebase(129, 81920, false).is_err());
     }
 
     #[test]
@@ -390,6 +410,24 @@ mod tests {
                 }
                 assert!(routes(&prog, &tensors, 2).is_err());
             }
+        }
+    }
+
+    #[test]
+    fn sparse_mla_row_split_cuts_at_the_first_8_aligned_full_key_row() {
+        let (prog, tensors) = fixture();
+        let mut route = routes(&prog, &tensors, 2).unwrap()[1].unwrap();
+        for (rows, prior, split, active, want) in [
+            (8192, 0, true, false, Some((1, 0, 2048))),
+            (4096, 0, true, false, Some((1, 0, 2048))),
+            (2048, 0, true, false, None),
+            (8192, 100, true, false, Some((1, 0, 1952))),
+            (8192, 0, false, false, None),
+            (8192, 2047, true, true, None),
+        ] {
+            route.rebase(rows, prior, split).unwrap();
+            assert_eq!(route.active, active);
+            assert_eq!(route.split_patch(), want, "rows={rows} prior={prior}");
         }
     }
 
@@ -454,10 +492,11 @@ pub(super) fn routes(
         // table (op 119) and the route reads the union's `iidx_pf` operand; a packed sibling /
         // token-batch body carries no union (its 8-query tiles could straddle request spans)
         // and names the TP indexer's per-row selection directly.
-        let producer = prog.insts[..ix]
+        let (producer_ix, producer) = prog.insts[..ix]
             .iter()
+            .enumerate()
             .rev()
-            .find(|d| {
+            .find(|(_, d)| {
                 (d.op == DevOp::IndexUnionPf as u16 || d.op == DevOp::IndexTpPf as u16)
                     && u32::from(d.t[0]) == union_handle
             })
@@ -541,6 +580,9 @@ pub(super) fn routes(
             rows: prog.t,
             kv_len: 0,
             active: false,
+            ix: ix as u32,
+            union_ix: (producer.op == DevOp::IndexUnionPf as u16).then_some(producer_ix as u32),
+            split_row0: 0,
         });
     }
     Ok(routes)
@@ -757,6 +799,17 @@ impl SparseMla {
             kv_base: 0,
         };
         self.enqueue_window(be, route, tensor_table, one).map(|_| ())
+    }
+
+    /// Native half of a row-split chunk: rows `[split_row0, rows)`, each with all 2048 causal keys.
+    pub fn enqueue_split(&self, be: &HsaBackend, route: Route, tensor_table: &[u8]) -> Result<usize> {
+        let window = SpanWindow {
+            row0: route.split_row0,
+            rows: route.rows - route.split_row0,
+            kv_len: route.kv_len,
+            kv_base: 0,
+        };
+        self.enqueue_window(be, route, tensor_table, window)
     }
 
     /// The AQL packets [`Self::enqueue_spans`] emits for `spans` (each span is its own
