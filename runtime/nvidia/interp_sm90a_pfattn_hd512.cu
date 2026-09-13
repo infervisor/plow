@@ -11,6 +11,9 @@
 #ifndef PLOW_NV_FA512_PX4_BQ64
 #define PLOW_NV_FA512_PX4_BQ64 0
 #endif
+#ifndef PLOW_NV_FA_SCORE_SWIZZLE
+#define PLOW_NV_FA_SCORE_SWIZZLE PLOW_NV_FA512_PX4_BQ64
+#endif
 #include "op_attention.cuh"
 
 #if PLOW_NV_FA512_PX4_BQ64 && (PLOW_NV_FA512_WG || !PLOW_NV_PACKED_REQUEST)
@@ -42,7 +45,7 @@ extern "C" __device__ __constant__ unsigned plow_pf_masked_padding_abi = 1;
 #endif
 
 #if PLOW_NV_FA512_PX4_BQ64
-extern "C" __device__ unsigned plow_attention_sm90_hd512_px4_bq64_abi = 3;
+extern "C" __device__ unsigned plow_attention_sm90_hd512_px4_bq64_abi = 4;
 #else
 extern "C" __device__ unsigned plow_attention_sm90_hd512_wg32_abi = 1;
 #endif
@@ -60,6 +63,7 @@ extern "C" __device__ unsigned plow_attention_n_kv_head = 1;
 extern "C" __device__ unsigned plow_attention_global = 1;
 extern "C" __device__ unsigned plow_attention_nsplit = 1;
 extern "C" __device__ unsigned plow_attention_direct_entry = 1;
+extern "C" __device__ unsigned plow_attention_score_swizzle = PLOW_NV_FA_SCORE_SWIZZLE;
 extern "C" __device__ unsigned plow_block_pfattn_hd512_px4_bq64 = 512;
 extern "C" __device__ unsigned plow_arena_bytes_pfattn_hd512_px4_bq64 =
     FA_PX4_SMEM_FLOATS(512, 64, 16) * sizeof(float);

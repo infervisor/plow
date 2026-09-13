@@ -1335,6 +1335,13 @@ __device__ void d_flash_merge(__nv_bfloat16* __restrict__ O, const float* __rest
 #ifndef PLOW_NV_FA_TMA_ROW_WARP
 #define PLOW_NV_FA_TMA_ROW_WARP 0
 #endif
+#ifndef PLOW_NV_FA_SCORE_SWIZZLE
+#define PLOW_NV_FA_SCORE_SWIZZLE 0
+#endif
+#define FA_PX4_SCORE_STRIDE(BKV) ((BKV) + (PLOW_NV_FA_SCORE_SWIZZLE ? 4 : 0))
+#define FA_PX4_SCORE_INDEX(ROW, COL, BKV)                                                           \
+    ((ROW) * FA_PX4_SCORE_STRIDE(BKV) +                                                            \
+     (PLOW_NV_FA_SCORE_SWIZZLE ? ((COL) ^ ((ROW) & 1)) : (COL)))
 #define FA_PX4_ELIGIBLE(HD) (PLOW_NV_FA_PIPE && PLOW_NV_FA_PX4 && (HD) == 512)
 /* ---- fp8-KV FAST-prefill staging (beat-fp8-prefill Exp1) ------------------------------------
  * The PIPE=1 cp.async ring cannot dequant e4m3 inline, so the fp8 arm stages RAW e4m3 bytes into
@@ -1399,7 +1406,7 @@ __device__ void d_flash_merge(__nv_bfloat16* __restrict__ O, const float* __rest
  * fp8 (PLOW_FP8_KV) additionally reserves the raw-e4m3 Ks8/Vs8 staging pair; the fp8mma arm
  * (PLOW_NV_FA_FP8MMA) swaps the dead bf16 Ks for Qs8+qsc (FA_PX4_KS_OR_Q8_FLOATS). */
 #define FA_PX4_SMEM_FLOATS(HD, BQ, BKV)                                                             \
-    (4 + 2 * (BQ) * (BKV) +                                                                         \
+    (4 + 2 * (BQ) * FA_PX4_SCORE_STRIDE(BKV) +                                                      \
      ((BQ) * ((HD) + FA_PRE_PAD) + (BKV) * ((HD) + FA_PRE_PAD) + 1) / 2 +                           \
      FA_PX4_KS_OR_Q8_FLOATS(HD, BQ, BKV) + FA_FP8_STAGE_FLOATS(HD, BKV))
 /* ---- PX-8: e4m3 P.V at BKV=32 (perf-data/px8-flash-fp8-pv.md) --------------------------------
@@ -1848,9 +1855,9 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
 
     unsigned long long* mbar = (unsigned long long*)lds; /* [0]=K, [1]=V (TMA arm only) */
     (void)mbar;
-    float* SsA = lds + 4;                                /* [BQ][BKV] scores, hd 0..255 */
-    float* SsB = SsA + BQ * BKV;                         /* [BQ][BKV] scores, hd 256..511 */
-    __nv_bfloat16* Qs = (__nv_bfloat16*)(SsB + BQ * BKV); /* [BQ][HD+PAD] */
+    float* SsA = lds + 4; /* [BQ][FA_PX4_SCORE_STRIDE(BKV)] scores, hd 0..255 */
+    float* SsB = SsA + BQ * FA_PX4_SCORE_STRIDE(BKV); /* scores, hd 256..511 */
+    __nv_bfloat16* Qs = (__nv_bfloat16*)(SsB + BQ * FA_PX4_SCORE_STRIDE(BKV));
     constexpr int PAD8 = FA_FP8_PAD8_K; /* fp8 staging row pad (32; see FA_FP8_PAD8) */
     __nv_bfloat16* Ks;      /* [BKV][HD+PAD] natural (bf16 arms; DEAD under fp8mma) */
     __nv_bfloat16* Vs;      /* [BKV][HD+PAD] natural */
@@ -2249,10 +2256,17 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
                     const float ks0 = ksc_s[kc0] * lscale, ks1 = ksc_s[kc0 + 1] * lscale;
                     const int qlo = qk_wm * 16 + (lane / 4);
                     const float q0s = qsc_s[qlo], q1s = qsc_s[qlo + 8];
+#if PLOW_NV_FA_SCORE_SWIZZLE
+                    Sdst[FA_PX4_SCORE_INDEX(qlo, kc0, BKV)] = acc[0] * ks0 * q0s;
+                    Sdst[FA_PX4_SCORE_INDEX(qlo, kc0 + 1, BKV)] = acc[1] * ks1 * q0s;
+                    Sdst[FA_PX4_SCORE_INDEX(qlo + 8, kc0, BKV)] = acc[2] * ks0 * q1s;
+                    Sdst[FA_PX4_SCORE_INDEX(qlo + 8, kc0 + 1, BKV)] = acc[3] * ks1 * q1s;
+#else
                     *(float2*)&Sdst[qlo * BKV + kc0] =
                         make_float2(acc[0] * ks0 * q0s, acc[1] * ks1 * q0s);
                     *(float2*)&Sdst[(qlo + 8) * BKV + kc0] =
                         make_float2(acc[2] * ks0 * q1s, acc[3] * ks1 * q1s);
+#endif
                 } else
 #endif
 #pragma unroll
@@ -2268,7 +2282,7 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
                         const unsigned kvr = kv0 + (unsigned)kc;
                         if (kvr < hi) sc = ksc[kvr & kv_mask];
                     }
-                    Sdst[qr * BKV + kc] = acc[e] * lscale * sc;
+                    Sdst[FA_PX4_SCORE_INDEX(qr, kc, BKV)] = acc[e] * lscale * sc;
                 }
             }
             __syncthreads(); /* Ss halves published; Ks free for K[t+1] */
@@ -2338,10 +2352,21 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
 #if PLOW_NV_FA_FP8MMA && defined(PLOW_FP8_KV)
                     if constexpr (FP8KV) {
                         /* col pairs (c0,c0+1) and (c0+8,c0+9) are adjacent: 4 LDS.64. */
+#if PLOW_NV_FA_SCORE_SWIZZLE
+                        const float2 a0 = make_float2(SsA[FA_PX4_SCORE_INDEX(row, c0, BKV)],
+                                                     SsA[FA_PX4_SCORE_INDEX(row, c0 + 1, BKV)]);
+                        const float2 b0 = make_float2(SsB[FA_PX4_SCORE_INDEX(row, c0, BKV)],
+                                                     SsB[FA_PX4_SCORE_INDEX(row, c0 + 1, BKV)]);
+                        const float2 a1 = make_float2(SsA[FA_PX4_SCORE_INDEX(row, c0 + 8, BKV)],
+                                                     SsA[FA_PX4_SCORE_INDEX(row, c0 + 9, BKV)]);
+                        const float2 b1 = make_float2(SsB[FA_PX4_SCORE_INDEX(row, c0 + 8, BKV)],
+                                                     SsB[FA_PX4_SCORE_INDEX(row, c0 + 9, BKV)]);
+#else
                         const float2 a0 = *(const float2*)&SsA[row * BKV + c0];
                         const float2 b0 = *(const float2*)&SsB[row * BKV + c0];
                         const float2 a1 = *(const float2*)&SsA[row * BKV + c0 + 8];
                         const float2 b1 = *(const float2*)&SsB[row * BKV + c0 + 8];
+#endif
                         s[0] = a0.x + b0.x; s[1] = a0.y + b0.y;
                         s[2] = a1.x + b1.x; s[3] = a1.y + b1.y;
 #pragma unroll
@@ -2361,7 +2386,9 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
                         const int kv = (int)kv0 + col;
                         bool masked = ((unsigned)col >= rmax) || (kv > qabs);
                         if (window) masked |= ((unsigned)(qabs - kv) >= window);
-                        s[ci] = masked ? FA_NEG_INF : SsA[row * BKV + col] + SsB[row * BKV + col];
+                        s[ci] = masked ? FA_NEG_INF
+                                       : SsA[FA_PX4_SCORE_INDEX(row, col, BKV)] +
+                                             SsB[FA_PX4_SCORE_INDEX(row, col, BKV)];
                         mx = fmaxf(mx, s[ci]);
                     }
                     mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 1));

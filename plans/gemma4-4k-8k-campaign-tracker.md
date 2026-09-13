@@ -20,7 +20,7 @@ Detailed experiment log: `plans/gemma4-4k-8k-native-block.md`
 | GPU | ISA | Precision | 4K | 8K | Current state |
 |---|---|---|---|---|---|
 | NVIDIA H100 80GB | SM90a | BF16 | open | open | Exact HD256 and fused-GLU roles qualified; 50% full-model gate not met |
-| NVIDIA H100 80GB | SM90a | W8A8/FP8 weights+activations | ~157.6 ms warmed p50 | ~351.0 ms warmed p50 | Latest qualified snapshot; correctness matched in accepted A/Bs; 50% gate not met |
+| NVIDIA H100 80GB | SM90a | W8A8/FP8 weights+activations | ~157.5 ms warmed p50 | ~351.2 ms warmed p50 | Latest qualified snapshot; correctness matched in accepted A/Bs; 50% gate not met |
 | AMD MI300X | gfx942 | BF16 | unmeasured in this fixed protocol | unmeasured in this fixed protocol | Establish native block and serving baseline |
 | AMD MI300X | gfx942 | FP8 | unmeasured in this fixed protocol | unmeasured in this fixed protocol | Establish dtype-correct block and serving baseline |
 
@@ -49,6 +49,7 @@ must not be compared with another precision or cache policy.
 | W8A8 fused-GLU direct role | M4096/M8192, N15360/K3840 | 48-site subtotal -1.15%/-2.32%; full-rung -0.78%/-0.72% | packed R2 and hashes pass |
 | HD512 direct role | M4096/M8192, HD512, GQA16 | direct boundary removed; prior 8K sites -15.7% | three seeds and packed R2 pass |
 | HD512 row-cooperative TMA issue | BQ64/BKV16, 512 threads | HD512 subtotal -6.12%/-6.82%; full-rung -1.23%/-2.12% | three seeds and packed R2 pass |
+| HD512 score-tile bank swizzle | BQ64/BKV16, score stride 20 + row-parity column swizzle | HD512 subtotal -2.03%/-1.23%; full-rung -0.27%/-0.38% | three seeds, final ABI v4 driver run, and packed R2 pass |
 | BF16 fused gate/up+GeGLU role | M4096/M8192, N15360/K3840 | five-seed full-rung -3.31%/-3.27% | matching hashes |
 
 ## Rejected H100 changes
@@ -90,11 +91,11 @@ grid (132 CTAs), block size (512 threads), and 108,048-byte arena. The standalon
 
 | Signal | Result | Decision |
 |---|---:|---|
-| Registers / occupancy | 117 registers/thread; 25% achieved and theoretical occupancy; one register-limited block/SM | Treat register growth as a rejection gate |
+| Registers / occupancy | accepted score-swizzle object uses 122 registers/thread; 25% occupancy; one register-limited block/SM | Reject growth that lowers residency or fails full-rung transfer |
 | Compute / memory | 27.35% compute; 62.47% memory; 0.71% DRAM; 98.99% L2 hit | Do not prioritize HBM bandwidth or GQA multicast for the full-query cell |
 | Scheduler | eligible in 29.26% of cycles; 0.54 eligible warps/scheduler | Reduce dependency and synchronization gaps |
 | Stall per issued instruction | short scoreboard 4.71; barrier 2.85; wait 1.98; MIO throttle 0.91 | Repair shared-memory access and phase scheduling first |
-| Shared conflicts | 436,862,976 excessive wavefronts; scalar score loads dominate; Q/K and V `LDSM` also conflict | Screen score layout/access before changing arithmetic order |
+| Shared conflicts | score swizzle cuts total bank conflicts from 438,612,278 to 1,073,696 and measured load conflicts from 403,046,400 to zero | Move the next screen to Q/K and V `LDSM` dependencies |
 
 Source counters localize the largest barrier sample to the Q/K `LDSM.16.M88.2`
 load and the largest MIO samples to the scalar score-tile `LDS` sequence. Any
@@ -102,7 +103,7 @@ candidate must preserve the accepted BKV16 score/PV reduction order.
 
 ## Next experiments
 
-1. H100 HD512: screen a bank-safe score-tile layout/access path, then the Q/K `LDSM` layout; reject register growth or changed reduction order.
+1. H100 HD512: screen the Q/K `LDSM` layout, then V's transposed `LDSM`; preserve reduction order and one block/SM.
 2. H100 HD512: test a non-divergent producer/consumer phase schedule after the shared-memory screen.
 3. H100 HD512: qualify live-KV bucket variants and `nsplit` only where the merge pass repays shorter slices; defer GQA multicast until a history-heavy cell shows DRAM pressure.
 4. H100 GEMM: test ping-pong consumers, `stmatrix` + TMA output store, and operand multicast on exact Gemma dimensions.

@@ -245,7 +245,7 @@ if [ "${PLOW_BUILD_PFATTN_HD512_PX4_BQ64:-0}" = 1 ]; then
   env -i PATH=/usr/local/cuda/bin:/usr/bin:/bin /usr/local/cuda/bin/nvcc \
     -std=c++17 -arch=sm_90a -O3 -cubin -Xptxas=-v -I runtime/common -I runtime/nvidia \
     -DPLOW_NV_FA512_PX4_BQ64=1 -DPLOW_NV_FA512_WG=0 -DPLOW_NV_FA_TMA=1 \
-    -DPLOW_NV_FA_TMA_ROW_WARP=1 \
+    -DPLOW_NV_FA_TMA_ROW_WARP=1 -DPLOW_NV_FA_SCORE_SWIZZLE=1 \
     -DPLOW_NV_PACKED_REQUEST=1 -DPLOW_NV_MASKED_PADDING=1 \
     -o "$gemma_out/interp_sm90a_pfattn_hd512_px4_bq64.cubin" \
     runtime/nvidia/interp_sm90a_pfattn_hd512.cu

@@ -1101,3 +1101,32 @@ candidate that raises the 117-register envelope. Evidence:
 `/tmp/hd512-rowwarp-ncu{6,7,8}.ncu-rep`,
 `/tmp/hd512-rowwarp-ncu8-source.csv`, and
 `/tmp/hd512_direct_profile`.
+
+### 2026-09-13: HD512 score-tile bank swizzle qualified
+
+The exact BQ64/BKV16 object now stores each score half with a 20-float row
+stride and maps logical column `c` to `c ^ (row & 1)`. This is conflict-free for
+the scalar score stores and the four softmax loads owned by each lane while
+preserving every score, mask, reduction, and P.V operation. The dedicated role
+defaults the layout on, exports a layout marker, and advances to ABI v4 with an
+exact 110,096-byte arena. Devgen registers the object define and the build script
+sets it explicitly.
+
+The direct entry compiles at 122 registers with zero stack or spills. Residency
+remains one block/SM. Nsight's custom counters fall from 438,612,278 total bank
+conflicts to 1,073,696 (-99.76%); measured shared-load conflicts fall from
+403,046,400 to zero. Three rotated standalone screens improve 3.267 to 3.209 ms
+at 4K (-1.78%) and 11.944 to 11.661 ms at 8K (-2.37%).
+
+The packet screen preserves both prompt and output hashes and reduces the eight
+HD512 sites from 26.510 to 25.972 ms at 4K (-2.03%) and 96.515 to 95.324 ms at
+8K (-1.23%). Balanced graph-mode seeds 17/23/29 preserve every paired checksum
+and improve mean p50 TTFT from 157.965 to 157.541 ms at 4K (-0.27%) and 352.588
+to 351.238 ms at 8K (-0.38%). The R=2 gate formed a 4096-row packet from two
+2048-row requests, completed 4/4 without a device fault, and retained aggregate
+hash `fnv1a64:30b1695c24b2aa4e`. A final v4 driver run accepted the object and
+reproduced the exact 4K/8K hashes. Object SHA256:
+`c43f539dbae0137da1dc38ce3ec65096c8b6c8b7dbcdf9349cadd3f97fb64817`.
+Evidence: `/tmp/hd512-score-swizzle-*.{log,json}`,
+`/tmp/hd512-score-swizzle-ncu.ncu-rep`, and
+`/tmp/gemma4-hd512-score-swizzle-v4/build.log`.

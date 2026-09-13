@@ -834,7 +834,7 @@ fn check_attention_hd512_role(
     let expected_abi = if object.abi
         == plow_asset::segment_roles::PREFILL_ATTENTION_HD512_PX4_BQ64_ABI
     {
-        3
+        4
     } else {
         1
     };
@@ -4758,7 +4758,7 @@ impl GpuEngine {
                 }
             }
             if id == plow_asset::segment_roles::PREFILL_ATTENTION_HD512_PX4_BQ64 {
-                if smem != 108048 {
+                if smem != 110096 {
                     return Err(RuntimeError::Rejected(
                         "HD512 px4 BQ64 role has incompatible fixed geometry".into(),
                     ));
@@ -4770,6 +4770,7 @@ impl GpuEngine {
                     ("plow_attention_global", 1),
                     ("plow_attention_nsplit", 1),
                     ("plow_attention_direct_entry", 1),
+                    ("plow_attention_score_swizzle", 1),
                 ] {
                     if be.module_global_u32(&module, name)? != Some(value) {
                         return Err(RuntimeError::Rejected(
