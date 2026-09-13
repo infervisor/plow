@@ -84,6 +84,8 @@ fn px4_bq64_object_selects_only_the_exact_4k_role() {
     let flash = &mut model.progs[0].insts[1];
     flash.i[0] = 4096;
     flash.i[1] = 4096;
+    flash.i[2] = 16;
+    flash.i[3] = 1;
     model.tensors[flash.t[5] as usize].bytes = 4096 * 32 * 512 * 2;
     let mut sections = Vec::new();
     assert!(apply_output_object(
@@ -105,6 +107,37 @@ fn px4_bq64_object_selects_only_the_exact_4k_role() {
         roles.objects[&PREFILL_ATTENTION_HD512_PX4_BQ64].attention,
         Some(px4_bq64_capability())
     );
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn px4_bq64_object_rejects_non_gemma_hd512_geometry() {
+    let directory = output_dir("px4-bq64-non-gemma");
+    let output = directory.join("model.pkt");
+    let image = plow_asset::cubin::synthetic_elf(
+        HD512_PX4_BQ64_OBJECT_ENTRY,
+        &HD512_PX4_BQ64_OBJECT_GLOBALS,
+        90,
+    );
+    std::fs::write(directory.join(HD512_PX4_BQ64_OBJECT_FILE), image).unwrap();
+    let mut model = fixture(512, true, true);
+    model.prog_t[0] = 4096;
+    model.progs[0].insts[1].i[0] = 4096;
+    model.progs[0].insts[1].i[1] = 4096;
+    let mut sections = Vec::new();
+    assert!(apply_output_object(
+        &mut model,
+        &mut sections,
+        "sm90a",
+        &output,
+        "h100",
+        8192,
+        true,
+        None,
+        false,
+        true,
+    )
+    .is_err());
     std::fs::remove_dir_all(directory).unwrap();
 }
 

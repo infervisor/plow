@@ -23,12 +23,17 @@ const OBJECT_GLOBALS: [(&str, u32); 7] = [
 ];
 const HD512_PX4_BQ64_OBJECT_FILE: &str = "interp_sm90a_pfattn_hd512_px4_bq64.cubin";
 const HD512_PX4_BQ64_OBJECT_ENTRY: &str = "plow_sm90a_pfattn_hd512_px4_bq64";
-const HD512_PX4_BQ64_OBJECT_GLOBALS: [(&str, u32); 7] = [
-    ("plow_attention_sm90_hd512_px4_bq64_abi", 1),
+const HD512_PX4_BQ64_OBJECT_GLOBALS: [(&str, u32); 12] = [
+    ("plow_attention_sm90_hd512_px4_bq64_abi", 2),
     ("plow_attention_head_dim", 512),
     ("plow_attention_query_tile", 64),
     ("plow_attention_kv_tile", 16),
     ("plow_attention_warps", 16),
+    ("plow_attention_packed_only", 1),
+    ("plow_attention_n_head", 16),
+    ("plow_attention_n_kv_head", 1),
+    ("plow_attention_global", 1),
+    ("plow_attention_nsplit", 1),
     ("plow_block_pfattn_hd512_px4_bq64", 512),
     ("plow_arena_bytes_pfattn_hd512_px4_bq64", 108_048),
 ];
@@ -403,7 +408,14 @@ fn eligible(op: &packet::dev::DevInst, n_cu: u16) -> bool {
 
 fn eligible_for(op: &packet::dev::DevInst, n_cu: u16, selection: &Selection) -> bool {
     match selection.kind {
-        Kind::Hd512 | Kind::Hd512Px4Bq64 => eligible(op, n_cu),
+        Kind::Hd512 => eligible(op, n_cu),
+        Kind::Hd512Px4Bq64 => {
+            eligible(op, n_cu)
+                && op.i[2] == 16
+                && op.i[3] == 1
+                && op.i[5] == 0
+                && op.i[7] == 1
+        }
         Kind::Hd256Bkv32 | Kind::Hd256Gqa2Bkv32 => {
             op.blocks == n_cu
                 && op.is_hd256_gqa2_sliding_prefill()

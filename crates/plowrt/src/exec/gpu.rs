@@ -747,8 +747,15 @@ fn check_attention_hd512_role(
     geometry: [Option<u32>; 4],
 ) -> Result<()> {
     let expected = object.attention.as_ref();
+    let expected_abi = if object.abi
+        == plow_asset::segment_roles::PREFILL_ATTENTION_HD512_PX4_BQ64_ABI
+    {
+        2
+    } else {
+        1
+    };
     if arch != "sm90a"
-        || capability != Some(1)
+        || capability != Some(expected_abi)
         || expected.is_none_or(|a| block != Some(a.warps * 32))
         || expected.is_none_or(|a| {
             a.profile != arch
@@ -1320,6 +1327,18 @@ fn packet_role_segments(
                     ));
                 }
                 validate_attention_role_inst(d, g.t, tensors, 512, true, true)?;
+                if role == plow_asset::segment_roles::PREFILL_ATTENTION_HD512_PX4_BQ64
+                    && (!matches!(g.t, 4096 | 8192)
+                        || d.i[2] != 16
+                        || d.i[3] != 1
+                        || d.i[5] != 0
+                        || d.i[7] != 1
+                        || d.t[5] == TENSOR_NONE16)
+                {
+                    return Err(RuntimeError::Rejected(
+                        "HD512 px4 BQ64 role requires exact Gemma-4 global attention".into(),
+                    ));
+                }
             } else if matches!(
                 role,
                 plow_asset::segment_roles::PREFILL_ATTENTION_HD256_BKV64
@@ -4627,12 +4646,25 @@ impl GpuEngine {
                     "paired-GQA2 HD256 role requires a 141312-byte arena".into(),
                 ));
             }
-            if id == plow_asset::segment_roles::PREFILL_ATTENTION_HD512_PX4_BQ64
-                && smem != 108048
-            {
-                return Err(RuntimeError::Rejected(
-                    "HD512 px4 BQ64 role requires a 108048-byte arena".into(),
-                ));
+            if id == plow_asset::segment_roles::PREFILL_ATTENTION_HD512_PX4_BQ64 {
+                if smem != 108048 {
+                    return Err(RuntimeError::Rejected(
+                        "HD512 px4 BQ64 role has incompatible fixed geometry".into(),
+                    ));
+                }
+                for (name, value) in [
+                    ("plow_attention_packed_only", 1),
+                    ("plow_attention_n_head", 16),
+                    ("plow_attention_n_kv_head", 1),
+                    ("plow_attention_global", 1),
+                    ("plow_attention_nsplit", 1),
+                ] {
+                    if be.module_global_u32(&module, name)? != Some(value) {
+                        return Err(RuntimeError::Rejected(
+                            "HD512 px4 BQ64 role has incompatible fixed geometry".into(),
+                        ));
+                    }
+                }
             }
             be.set_max_dynamic_smem(function, smem)?;
             if id == plow_asset::segment_roles::GEMV_CTA512 && smem != 65536 {

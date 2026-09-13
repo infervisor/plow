@@ -42,7 +42,7 @@ extern "C" __device__ __constant__ unsigned plow_pf_masked_padding_abi = 1;
 #endif
 
 #if PLOW_NV_FA512_PX4_BQ64
-extern "C" __device__ unsigned plow_attention_sm90_hd512_px4_bq64_abi = 1;
+extern "C" __device__ unsigned plow_attention_sm90_hd512_px4_bq64_abi = 2;
 #else
 extern "C" __device__ unsigned plow_attention_sm90_hd512_wg32_abi = 1;
 #endif
@@ -54,6 +54,11 @@ extern "C" __device__ unsigned plow_attention_warps = PLOW_NV_FA512_PX4_BQ64 ? 1
 extern "C" __device__ unsigned plow_attention_score_partitions =
     PLOW_NV_FA512_N_SPLIT && FA512_KV_TILE == 64 ? 2 : 1;
 #if PLOW_NV_FA512_PX4_BQ64
+extern "C" __device__ unsigned plow_attention_packed_only = 1;
+extern "C" __device__ unsigned plow_attention_n_head = 16;
+extern "C" __device__ unsigned plow_attention_n_kv_head = 1;
+extern "C" __device__ unsigned plow_attention_global = 1;
+extern "C" __device__ unsigned plow_attention_nsplit = 1;
 extern "C" __device__ unsigned plow_block_pfattn_hd512_px4_bq64 = 512;
 extern "C" __device__ unsigned plow_arena_bytes_pfattn_hd512_px4_bq64 =
     FA_PX4_SMEM_FLOATS(512, 64, 16) * sizeof(float);
@@ -95,6 +100,12 @@ __device__ __noinline__ void attention_packed_bkv16(
     unsigned n_head, unsigned n_kv_head, unsigned q_pos0, unsigned window,
     unsigned nsplit, unsigned kv_stride, unsigned kv_mask, float scale,
     unsigned slice, unsigned nblk, float* arena) {
+#if PLOW_NV_FA512_PX4_BQ64
+    if (!requests) {
+        __trap();
+        return;
+    }
+#else
     if (!requests) {
         d_flash_prefill_px4<512, PLOW_NV_FA512_PX4_BQ64 ? 64 : 32, 16, false,
                             PLOW_NV_FA512_PX4_BQ64 ? 512 : 256>(
@@ -102,6 +113,7 @@ __device__ __noinline__ void attention_packed_bkv16(
             q_pos0, window, nsplit, kv_stride, kv_mask, scale, slice, nblk, arena);
         return;
     }
+#endif
 
     const unsigned count = (unsigned)requests[0];
     for (unsigned r = 0; r < count; ++r) {
@@ -109,13 +121,17 @@ __device__ __noinline__ void attention_packed_bkv16(
         const unsigned qlen = (unsigned)requests[2 + 4 * r];
         const unsigned slot = (unsigned)requests[3 + 4 * r];
         const unsigned kvlen = (unsigned)requests[4 + 4 * r];
-        const size_t qoff = (size_t)q0 * n_head * 512;
-        const size_t kvoff = (size_t)slot * n_kv_head * kv_stride * 512;
+        const size_t qoff = (size_t)q0 * (PLOW_NV_FA512_PX4_BQ64 ? 16 : n_head) * 512;
+        const size_t kvoff =
+            (size_t)slot * (PLOW_NV_FA512_PX4_BQ64 ? 1 : n_kv_head) * kv_stride * 512;
         d_flash_prefill_px4<512, PLOW_NV_FA512_PX4_BQ64 ? 64 : 32, 16, false,
                             PLOW_NV_FA512_PX4_BQ64 ? 512 : 256>(
-            opart + qoff * nsplit, mlpart + (size_t)q0 * n_head * nsplit * 2,
+            opart + qoff * (PLOW_NV_FA512_PX4_BQ64 ? 1 : nsplit),
+            mlpart + (size_t)q0 * (PLOW_NV_FA512_PX4_BQ64 ? 32 : n_head * nsplit * 2),
             q + qoff, k + kvoff, v + kvoff, output ? output + qoff : nullptr,
-            qlen, kvlen, n_head, n_kv_head, kvlen - qlen, window, nsplit,
+            qlen, kvlen, PLOW_NV_FA512_PX4_BQ64 ? 16 : n_head,
+            PLOW_NV_FA512_PX4_BQ64 ? 1 : n_kv_head, kvlen - qlen,
+            PLOW_NV_FA512_PX4_BQ64 ? 0 : window, PLOW_NV_FA512_PX4_BQ64 ? 1 : nsplit,
             kv_stride, kv_mask, scale, slice, nblk, arena);
         __syncthreads();
     }
@@ -154,6 +170,13 @@ __device__ __forceinline__ void attention_body(const PlowDevInst* in, void* cons
     }
     d_flash_prefill_mux<512, 64, FA512_KV_TILE>(requests,
 #elif PLOW_NV_PACKED_REQUEST
+#if PLOW_NV_FA512_PX4_BQ64
+    if (!requests || in->i[2] != 16 || in->i[3] != 1 || in->i[5] != 0 || in->i[7] != 1 ||
+        !output) {
+        __trap();
+        return;
+    }
+#endif
     attention_packed_bkv16(requests,
 #else
     d_flash_prefill<512, 32, 16>(

@@ -107,6 +107,28 @@ fn hd512_fixture() -> (DevProg, Vec<DevTensor>) {
     (program, tensors)
 }
 
+fn hd512_px4_fixture() -> (DevProg, Vec<DevTensor>) {
+    let rows = 4096;
+    let heads = 16_u64;
+    let (mut program, mut tensors) = fixture(rows, 1);
+    let work = u64::from(rows) * heads;
+    tensors[0].bytes = work * 512 * 4;
+    tensors[1].bytes = work * 8;
+    tensors[2].bytes = work * 512 * 2;
+    tensors[3].bytes = 65536 * 512 * 2;
+    tensors[4].bytes = 65536 * 512 * 2;
+    tensors[5].bytes = work * 512 * 2;
+    tensors.push(DevTensor {
+        name: "kv.map".into(),
+        bytes: 256,
+        init: None,
+    });
+    program.insts[2].i = [rows, rows, 16, 1, 0, 0, 512, 1];
+    program.insts[2].t[5] = 5;
+    program.insts[2].t[7] = 6;
+    (program, tensors)
+}
+
 fn hd512_object() -> plow_asset::segment_roles::SegmentObject {
     plow_asset::segment_roles::SegmentObject {
         abi: plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32_ABI.into(),
@@ -372,8 +394,30 @@ fn accepts_exact_hd512_wg32_contract_and_rejects_drift() {
 fn accepts_exact_hd512_px4_bq64_resource_contract() {
     let object = hd512_px4_bq64_object();
     let geometry = [Some(512), Some(64), Some(16), Some(16)];
-    check_attention_hd512_role("sm90a", &object, Some(1), Some(512), geometry).unwrap();
-    assert!(check_attention_hd512_role("sm90a", &object, Some(1), Some(256), geometry).is_err());
+    check_attention_hd512_role("sm90a", &object, Some(2), Some(512), geometry).unwrap();
+    assert!(check_attention_hd512_role("sm90a", &object, Some(2), Some(256), geometry).is_err());
+}
+
+#[test]
+fn hd512_px4_bq64_packet_role_rejects_non_gemma_geometry() {
+    let roles = [
+        0,
+        0,
+        plow_asset::segment_roles::PREFILL_ATTENTION_HD512_PX4_BQ64,
+        0,
+        0,
+    ];
+    let (mut program, tensors) = hd512_px4_fixture();
+    assert_eq!(packet_role_segments(&program, &roles, &tensors).unwrap(), roles);
+
+    for (field, value) in [(2, 32), (3, 4), (5, 1024), (7, 2)] {
+        let original = program.insts[2].i[field];
+        program.insts[2].i[field] = value;
+        assert!(packet_role_segments(&program, &roles, &tensors).is_err());
+        program.insts[2].i[field] = original;
+    }
+    program.insts[2].t[5] = TENSOR_NONE16;
+    assert!(packet_role_segments(&program, &roles, &tensors).is_err());
 }
 
 #[test]

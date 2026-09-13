@@ -46,7 +46,7 @@ pub fn cublaslt_prefill_bf16(profile: &str, m: u32, n: u32, k: u32) -> bool {
 }
 
 pub const PREFILL_ATTENTION_HD512_WG32_ABI: &str = "attention_sm90_hd512_wg32_v1";
-pub const PREFILL_ATTENTION_HD512_PX4_BQ64_ABI: &str = "attention_sm90_hd512_px4_bq64_v1";
+pub const PREFILL_ATTENTION_HD512_PX4_BQ64_ABI: &str = "attention_sm90_hd512_px4_bq64_v2";
 pub const PREFILL_ATTENTION_HD256_BKV64_ABI: &str = "attention_sm90_hd256_bkv64_v1";
 pub const PREFILL_ATTENTION_HD256_BKV32_ABI: &str = "attention_sm90_hd256_bkv32_v1";
 pub const PREFILL_ATTENTION_HD256_GQA2_BKV32_ABI: &str =
