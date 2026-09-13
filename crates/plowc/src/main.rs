@@ -447,6 +447,18 @@ enum Cmd {
     /// plowc --hf-dir /path/to/kimi-k3 viz --port 8384
     /// ```
     Viz(VizCli),
+
+    /// Checkpoint S for one knob: emit the recipe given by the flags BEFORE the word
+    /// `knob-scope` with the knob at each of two values, then compare the packets against the
+    /// knob's declared scope with `plowrt knob-scope`.
+    ///
+    /// ```text
+    /// plowc --hf-dir <ckpt> ... --replay-knobs <build.json> knob-scope \
+    ///     --knob emit.glm_pf_small_cus --values ,auto
+    /// ```
+    ///
+    /// A runtime knob (`rt.*`) emits once and compares the route of `--workload`.
+    KnobScope(KnobScopeCli),
 }
 
 /// `plowc tune <action>`.
@@ -541,6 +553,100 @@ struct TuneCli {
     /// digests. `gemm_c4` regressed ~0.30 and nothing reported it.
     #[arg(long, default_value_t = 0.10, value_name = "FRACTION")]
     threshold: f64,
+}
+
+/// `plowc knob-scope`.
+#[derive(Args, Debug)]
+struct KnobScopeCli {
+    /// Registry id: `emit.<field>` or `rt.<field>`.
+    #[arg(long)]
+    knob: String,
+    /// `OFF,ON`; an empty side leaves the env var unset.
+    #[arg(long)]
+    values: String,
+    /// Route workload JSON, required for a runtime knob.
+    #[arg(long)]
+    workload: Option<PathBuf>,
+    /// The plowrt binary; defaults to the one beside this plowc.
+    #[arg(long)]
+    plowrt: Option<PathBuf>,
+    /// Where the packets and `scope-<knob>.json` go.
+    #[arg(long, default_value = "knob-scope")]
+    dir: PathBuf,
+}
+
+fn run_knob_scope(k: &KnobScopeCli) -> Result<PathBuf, String> {
+    let (off, on) = k.values.split_once(',').ok_or("--values wants OFF,ON")?;
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let at = argv
+        .iter()
+        .position(|a| a == "knob-scope")
+        .ok_or("knob-scope must follow the emit flags")?;
+    let mut emit = Vec::with_capacity(at);
+    let mut flags = argv[..at].iter();
+    while let Some(a) = flags.next() {
+        if a == "--out" {
+            flags.next();
+        } else if !a.to_string_lossy().starts_with("--out=") {
+            emit.push(a.clone());
+        }
+    }
+    let runtime = k.knob.starts_with("rt.");
+    let env = if runtime {
+        None
+    } else {
+        let spec = devgen::knob_spec::EMIT
+            .iter()
+            .chain(devgen::knob_spec::RAW_ENV)
+            .find(|s| s.id == k.knob)
+            .ok_or_else(|| format!("{} is not a registered emit knob", k.knob))?;
+        Some(spec.env.ok_or_else(|| format!("{} has no env var to set", k.knob))?)
+    };
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&k.dir).map_err(|e| format!("{}: {e}", k.dir.display()))?;
+    let emit_one = |tag: &str, value: &str| -> Result<PathBuf, String> {
+        let out = k.dir.join(tag);
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.args(&emit).arg("--out").arg(&out);
+        if let Some(env) = env {
+            if value.is_empty() {
+                cmd.env_remove(env);
+            } else {
+                cmd.env(env, value);
+            }
+        }
+        let status = cmd.status().map_err(|e| format!("{}: {e}", exe.display()))?;
+        if status.success() {
+            Ok(out)
+        } else {
+            Err(format!("the {tag} emit failed: {status}"))
+        }
+    };
+    let (base, variant) = if runtime {
+        let packet = emit_one("packet", "")?;
+        (packet.clone(), packet)
+    } else {
+        (emit_one("off", off)?, emit_one("on", on)?)
+    };
+    let plowrt = k.plowrt.clone().unwrap_or_else(|| exe.with_file_name("plowrt"));
+    let report = k.dir.join(format!("scope-{}.json", k.knob));
+    let mut cmd = std::process::Command::new(&plowrt);
+    cmd.args(["knob-scope", "--knob", &k.knob, "--values", &k.values])
+        .arg("--base")
+        .arg(&base)
+        .arg("--variant")
+        .arg(&variant)
+        .arg("--out")
+        .arg(&report);
+    if let Some(w) = &k.workload {
+        cmd.arg("--workload").arg(w);
+    }
+    let status = cmd.status().map_err(|e| format!("{}: {e}", plowrt.display()))?;
+    if status.success() {
+        Ok(report)
+    } else {
+        Err(format!("checkpoint S rejected {} (report: {})", k.knob, report.display()))
+    }
 }
 
 /// `plowc viz` — serve or dump the nn-graph visualization.
@@ -782,6 +888,19 @@ fn main() -> ExitCode {
             }
             Err(e) => {
                 error!(error = %e, "tuning command failed");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    if let Some(Cmd::KnobScope(k)) = &cli.cmd {
+        return match run_knob_scope(k) {
+            Ok(report) => {
+                info!(report = %report.display(), "checkpoint S accepted");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                error!(error = %e, "knob-scope failed");
                 ExitCode::FAILURE
             }
         };

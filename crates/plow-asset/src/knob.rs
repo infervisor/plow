@@ -139,6 +139,98 @@ pub struct KnobSpec {
     pub default: Default,
     pub status: Status,
     pub constraints: &'static [Constraint],
+    /// What the knob may change in a packet or a route (checkpoint S). Empty: nothing.
+    pub scope: &'static [Allow],
+}
+
+/// A packet or route property checkpoint S compares.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScopeField {
+    /// An instruction's workgroup count (`blocks`).
+    Cus,
+    /// Tensor handles.
+    Operands,
+    /// Immediates (`i`, `fj`).
+    Shape,
+    /// The opcode, or an inserted/removed instruction.
+    Op,
+    Segments,
+    TensorBytes,
+    ObjectFacts,
+    ProgramSet,
+    Route,
+}
+
+/// Op classes (`packet::disasm` class names, or `op:N`) an allowance covers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpSel {
+    Any,
+    In(&'static [&'static str]),
+    NotIn(&'static [&'static str]),
+}
+
+/// One allowance: in the selected programs, differences in these fields on these op classes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Allow {
+    /// Program kinds (`prefill`, `decode`, `packed`, `token_batch`, `global`); empty = any.
+    pub kinds: &'static [&'static str],
+    pub rows: (u32, u32),
+    pub topology: Option<&'static str>,
+    pub sparse: Option<bool>,
+    pub model: Option<&'static str>,
+    pub ops: OpSel,
+    pub fields: &'static [ScopeField],
+    /// For object facts: every differing fact must contain one of these. Empty: any fact.
+    pub facts: &'static [&'static str],
+}
+
+impl Allow {
+    pub const ANY: Allow = Allow {
+        kinds: &[],
+        rows: (0, u32::MAX),
+        topology: None,
+        sparse: None,
+        model: None,
+        ops: OpSel::Any,
+        fields: &[],
+        facts: &[],
+    };
+
+    pub fn to_json(&self) -> Value {
+        let field = |f: &ScopeField| match f {
+            ScopeField::Cus => "cus",
+            ScopeField::Operands => "operands",
+            ScopeField::Shape => "shape",
+            ScopeField::Op => "op",
+            ScopeField::Segments => "segments",
+            ScopeField::TensorBytes => "tensor_bytes",
+            ScopeField::ObjectFacts => "object_facts",
+            ScopeField::ProgramSet => "program_set",
+            ScopeField::Route => "route",
+        };
+        let mut o = json!({
+            "kinds": self.kinds,
+            "rows_min": self.rows.0,
+            "rows_max": self.rows.1,
+            "fields": self.fields.iter().map(field).collect::<Vec<_>>(),
+            "facts": self.facts,
+        });
+        if let Some(t) = self.topology {
+            o["topology"] = json!(t);
+        }
+        if let Some(s) = self.sparse {
+            o["sparse"] = json!(s);
+        }
+        if let Some(m) = self.model {
+            o["model"] = json!(m);
+        }
+        match self.ops {
+            OpSel::Any => {}
+            OpSel::In(cs) => o["ops"] = json!({"in": cs}),
+            OpSel::NotIn(cs) => o["ops"] = json!({"not_in": cs}),
+        }
+        o
+    }
 }
 
 impl KnobSpec {
@@ -158,7 +250,12 @@ impl KnobSpec {
             default,
             status,
             constraints: &[],
+            scope: &[],
         }
+    }
+
+    pub const fn scoped(self, scope: &'static [Allow]) -> KnobSpec {
+        KnobSpec { scope, ..self }
     }
 
     pub const fn with(self, constraints: &'static [Constraint]) -> KnobSpec {
@@ -461,6 +558,7 @@ impl KnobSpec {
             "domain": self.domain.to_json(),
             "default": default,
             "status": status,
+            "scope": self.scope.iter().map(Allow::to_json).collect::<Vec<_>>(),
         })
     }
 }
@@ -537,6 +635,10 @@ pub fn registry_json(
 }
 
 /// sha256 over the canonical registry JSON: specs, constraints, targets.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+}
+
 pub fn registry_digest(
     specs: &[&KnobSpec],
     constraints: &[&Constraint],

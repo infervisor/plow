@@ -116,6 +116,24 @@ pub(super) fn unread_unions(prog: &DevProg, routes: &[Option<Route>]) -> Vec<Opt
     out
 }
 
+/// The segments of `prog` whose union `PLOW_AMD_UNION_SKIP` skips while its sparse routes are
+/// active: the load-time table, for tools that plan without an engine.
+pub(crate) fn skippable_unions(prog: &DevProg, tensors: &[DevTensor]) -> Result<Vec<usize>> {
+    let segments = prog
+        .stream
+        .iter()
+        .chain(&prog.gq_stream)
+        .map(|e| e.seg as usize + 1)
+        .max()
+        .unwrap_or(0);
+    let routes = routes(prog, tensors, segments)?;
+    Ok(unread_unions(prog, &routes)
+        .iter()
+        .enumerate()
+        .filter_map(|(seg, flash)| flash.map(|_| seg))
+        .collect())
+}
+
 /// [`unread_unions`] when `PLOW_AMD_UNION_SKIP` is on; otherwise no segment is skippable.
 pub(super) fn union_skip_table(on: bool, prog: &DevProg, routes: &[Option<Route>]) -> Vec<Option<usize>> {
     if on {

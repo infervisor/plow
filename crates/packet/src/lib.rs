@@ -36,6 +36,7 @@ pub mod ext;
 pub mod moe;
 pub mod moe_ep;
 pub mod names;
+pub mod opclass;
 pub mod rope;
 pub mod rowclass;
 pub mod slots;

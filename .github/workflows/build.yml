@@ -67,6 +67,16 @@ jobs:
       # #[ignore]d) and run without a GPU.
       - name: Test engine host paths (cuda,hsa)
         run: "nix develop --command cargo test -p plowrt --features cuda,hsa --lib exec::"
+      # Checkpoint S for every knob this change touches (scripts/knob_scope_ci.sh): the production
+      # recipe and its one-layer cut, compared against the knob's declared scope. Passes at once
+      # when no knob is touched; otherwise it needs the runner's KNOB_SCOPE_HF_DIR,
+      # KNOB_SCOPE_RECIPE and PLOW_VERIFY_BIN, and fails without them.
+      - name: Knob scope (checkpoint S)
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          nix develop --command bash -c 'cargo build --release -p plowc -p plowrt --features plowrt/hsa && scripts/knob_scope_ci.sh "$BASE_SHA"'
 
   # Hosted, sandboxed: safe for fork PRs. CPU paths only, no GPU toolchain.
   check:

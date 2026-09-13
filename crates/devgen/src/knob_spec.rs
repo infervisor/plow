@@ -12,8 +12,8 @@
 //! `EMIT`, the source tree for `RAW_ENV` and `OBJECT_DEFINES`.
 
 use plow_asset::knob::{
-    Check, Cmp, Constraint, Default, DefaultCase, Domain, Formula as F, KnobSpec, Layer, Source,
-    Status, Target, TargetAtom as T, TargetSpec, Val, U32,
+    Allow, Check, Cmp, Constraint, Default, DefaultCase, Domain, Formula as F, KnobSpec, Layer,
+    OpSel, ScopeField, Source, Status, Target, TargetAtom as T, TargetSpec, Val, U32,
 };
 use serde_json::{json, Value};
 
@@ -341,6 +341,69 @@ const GLM53_RECIPE: &[(&str, Val)] = &[
 
 const DENSE_CAPS: &[&str] = &["dense_packet_contracts", "decode_objects", "decode_ladder"];
 
+/// G4 (review log #86): the AITER MoE call accumulates onto the shared partial, so the combine pass
+/// leaves the 2048..8192 prefill buckets, and the adapter object is the only object that changes.
+/// Measured on the GLM-5.3 recipe: `MoeCombinePf` removed, `MoeAiterFp8Pf` re-pointed at the shared
+/// partial (operands, mode immediate, output size) and the shared down `GemmLtPf` (op 158) writing
+/// that partial, 75 layers in each of the two programs.
+const MOE_SHARED_SEED_SCOPE: &[Allow] = &[
+    Allow {
+        kinds: &["prefill"],
+        rows: (2048, 8192),
+        ops: OpSel::In(&["moe", "op:158"]),
+        fields: &[
+            ScopeField::Op,
+            ScopeField::Operands,
+            ScopeField::Shape,
+            ScopeField::Segments,
+            ScopeField::TensorBytes,
+        ],
+        ..Allow::ANY
+    },
+    Allow {
+        kinds: &["global"],
+        fields: &[ScopeField::ObjectFacts],
+        facts: &["moe_aiter"],
+        ..Allow::ANY
+    },
+];
+
+/// The small-rung workgroup cap narrows the compute of the small GLM prefill buckets and nothing
+/// else: not their collectives (6deb4025 did, and this is the scope that says it may not).
+const SMALL_CUS_SCOPE: &[Allow] = &[Allow {
+    kinds: &["prefill"],
+    rows: (0, 2047),
+    topology: Some("ordinary"),
+    model: Some("glm_moe_dsa"),
+    ops: OpSel::NotIn(&["collective"]),
+    fields: &[ScopeField::Cus, ScopeField::Segments],
+    ..Allow::ANY
+}];
+
+/// The row-split attention arm: attention and the all-to-all in the 2048..8192 prefill buckets,
+/// and the packet-wide object facts its arm adds.
+const ROWSPLIT_ATTN_SCOPE: &[Allow] = &[
+    Allow {
+        kinds: &["prefill"],
+        rows: (2048, 8192),
+        ops: OpSel::In(&["attention", "op:160"]),
+        fields: &[
+            ScopeField::Op,
+            ScopeField::Operands,
+            ScopeField::Cus,
+            ScopeField::Segments,
+            ScopeField::TensorBytes,
+            ScopeField::ObjectFacts,
+        ],
+        ..Allow::ANY
+    },
+    Allow {
+        kinds: &["global"],
+        fields: &[ScopeField::ObjectFacts, ScopeField::TensorBytes],
+        ..Allow::ANY
+    },
+];
+
 /// Declared targets. Formulas speak in capabilities (`emit_capabilities`), so a family joins by
 /// adding its target here, not by changing checkpoint K.
 pub const TARGETS: &[TargetSpec] = &[
@@ -442,7 +505,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.pf_ladder_append", Some("PLOW_PF_LADDER_APPEND"), Layer::Emit, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("emit.pf_gemv_head", Some("PLOW_PF_GEMV_HEAD"), Layer::Emit, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("emit.xr_cus", Some("PLOW_XR_CUS"), Layer::Emit, U32, UNSET, OPT_IN),
-    KnobSpec::new("emit.glm_pf_small_cus", Some("PLOW_GLM_PF_SMALL_CUS"), Layer::Emit, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("emit.glm_pf_small_cus", Some("PLOW_GLM_PF_SMALL_CUS"), Layer::Emit, Domain::Str, UNSET, OPT_IN).scoped(SMALL_CUS_SCOPE),
     KnobSpec::new("emit.xr_dec_cus", Some("PLOW_XR_DEC_CUS"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.xr2_gather", Some("PLOW_XR2_GATHER"), Layer::Emit, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("emit.no_xreduce", Some("PLOW_NO_XREDUCE"), Layer::Emit, Domain::Bool, OFF, DIAG),
@@ -507,7 +570,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.glm_mla_dec_aiter", Some("PLOW_GLM_MLA_DEC_AITER"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_moe_resident", Some("PLOW_GLM_MOE_RESIDENT"), Layer::Emit, Domain::Bool, GLM_RECIPE_ON, GLM_RECIPE),
     KnobSpec::new("emit.glm_moe_shared_fold", Some("PLOW_GLM_MOE_SHARED_FOLD"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
-    KnobSpec::new("emit.glm_moe_shared_seed", Some("PLOW_GLM_MOE_SHARED_SEED"), Layer::Emit, Domain::Bool, OFF, MOE_SHARED_SEED_CANDIDATE),
+    KnobSpec::new("emit.glm_moe_shared_seed", Some("PLOW_GLM_MOE_SHARED_SEED"), Layer::Emit, Domain::Bool, OFF, MOE_SHARED_SEED_CANDIDATE).scoped(MOE_SHARED_SEED_SCOPE),
     KnobSpec::new("emit.token_batch_tp", Some("PLOW_TOKEN_BATCH_TP"), Layer::Emit, Domain::Bool, OFF, TOKEN_BATCH_TP_PARKED).with(C_TOKEN_BATCH_TP),
     KnobSpec::new("emit.packed_sparse_pf", Some("PLOW_PACKED_SPARSE_PF"), Layer::Emit, Domain::Bool, OFF, OPT_IN).with(C_PACKED_SPARSE_PF),
     KnobSpec::new("emit.glm_index_tp", Some("PLOW_GLM_INDEX_TP"), Layer::Emit, Domain::Bool, GLM_RECIPE_ON, GLM_RECIPE),
@@ -536,7 +599,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.glm_xr_res", Some("PLOW_GLM_XR_RES"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_seq_par", Some("PLOW_GLM_SEQ_PAR"), Layer::Emit, Domain::Bool, GLM_SEQ_PAR_DEFAULT, GLM_RECIPE).with(C_SEQ_PAR),
     KnobSpec::new("emit.glm_seq_par_proj", Some("PLOW_GLM_SEQ_PAR_PROJ"), Layer::Emit, Domain::Bool, GLM_SEQ_PAR_PROJ_DEFAULT, GLM_RECIPE).with(C_SEQ_PAR_PROJ),
-    KnobSpec::new("emit.glm_rowsplit_attn", Some("PLOW_GLM_ROWSPLIT_ATTN"), Layer::Emit, Domain::Bool, UNSET, OPT_IN),
+    KnobSpec::new("emit.glm_rowsplit_attn", Some("PLOW_GLM_ROWSPLIT_ATTN"), Layer::Emit, Domain::Bool, UNSET, OPT_IN).scoped(ROWSPLIT_ATTN_SCOPE),
     KnobSpec::new("emit.glm_decode_glue_cus", Some("PLOW_GLM_DECODE_GLUE_CUS"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_decode_gemm_group", Some("PLOW_GLM_DECODE_GEMM_GROUP"), Layer::Emit, Domain::Bool, GLM_RECIPE_ON, GLM_RECIPE),
     KnobSpec::new("emit.glm_fuse_xrn", Some("GLM_FUSE_XRN"), Layer::Emit, Domain::Bool, OFF, OPT_IN),

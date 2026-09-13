@@ -346,6 +346,9 @@ impl ServeEngine {
 pub use amd_serve::AmdServe;
 
 #[cfg(feature = "hsa")]
+pub(crate) use amd_serve::retarget_dense_tail;
+
+#[cfg(feature = "hsa")]
 mod amd_serve {
     use std::io::Write;
     use std::path::{Path, PathBuf};
@@ -941,7 +944,7 @@ mod amd_serve {
     /// tail in the dense 512 bucket = 1.9 s of GPU time, twice a full sparse 8192 chunk. So a
     /// dense tail whose prior context is at least `min_ctx` moves to the sparse bucket; the
     /// chunk keeps its real row count. Returns whether the tail moved.
-    fn retarget_dense_tail(
+    pub(crate) fn retarget_dense_tail(
         chunks: &mut [u32],
         from: u32,
         min_ctx: u32,

@@ -29,6 +29,8 @@ minijinja = { version = "2", default-features = false, features = ["builtins", "
 # the workspace lock via egglog with the same features, so it adds no build.
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 plow-asset = { workspace = true }
+# Checkpoint S at `plowrt knob-scope` (serde and thiserror only).
+lean_verify = { workspace = true }
 packet = { workspace = true }
 hwspec = { workspace = true }
 costmodel = { workspace = true }

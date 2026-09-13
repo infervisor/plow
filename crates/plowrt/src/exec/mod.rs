@@ -24,6 +24,8 @@ mod amd_mla_fold;
 mod amd_moe_aiter;
 #[cfg(feature = "hsa")]
 mod amd_sparse_mla;
+#[cfg(feature = "hsa")]
+pub(crate) use amd_sparse_mla::{skippable_unions, SPAN_MIN_PRIOR};
 /// N [`amd::AmdEngine`] ranks stepped as one: the host half of the inline
 /// collective. Decode is launch-all-then-drain-all; prefill is per-segment,
 /// all-ranks, with a host barrier — see the module note for why the two differ.

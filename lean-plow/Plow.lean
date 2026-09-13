@@ -9,6 +9,7 @@ import Plow.Knobs.Schema
 import Plow.Knobs.Formula
 import Plow.Knobs.Resolve
 import Plow.Knobs.Consistency
+import Plow.Knobs.Scope
 import Plow.CLI.Schema
 import Plow.CLI.Payload
 import Plow.CLI.Checkpoints

@@ -444,6 +444,36 @@ enum Cmd {
         format: String,
     },
 
+    /// Checkpoint S: compare a base and a variant packet (and, for a runtime knob, the route a
+    /// workload takes) against the knob's declared scope. CPU only.
+    ///
+    /// For an emit knob pass the two emitted asset directories; for a runtime knob pass one
+    /// directory twice with `--workload`. `--values OFF,ON` equal (or omitted) checks identity.
+    KnobScope {
+        #[arg(long)]
+        base: PathBuf,
+        #[arg(long)]
+        variant: PathBuf,
+        /// Registry id, e.g. `emit.glm_pf_small_cus` or `rt.tail_sparse_ctx`.
+        #[arg(long)]
+        knob: String,
+        #[arg(long)]
+        values: Option<String>,
+        /// Route workload JSON: `{"prefill": [{"id", "from", "to"}], "decode": [rows]}`.
+        #[arg(long)]
+        workload: Option<PathBuf>,
+        /// Model type, when `build.json` names none.
+        #[arg(long)]
+        model: Option<String>,
+        /// Write the report here instead of stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Check against this scope (a JSON array of allowances) instead of the declared one, to
+        /// draft a scope.
+        #[arg(long)]
+        scope_json: Option<PathBuf>,
+    },
+
     // ── asset distribution ────────────────────────────────────────────────
     /// Fetch a model's assets into the local store. Contacts no server.
     Pull {
@@ -588,7 +618,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let filter_str = format!("{filter}");
     // `op-audit --format json` writes a document to stdout; the startup banner
     // would land inside it. Same reason `bench` logs to stderr.
-    if matches!(&cli.cmd, Cmd::Bench { .. } | Cmd::OpAudit { .. }) {
+    if matches!(&cli.cmd, Cmd::Bench { .. } | Cmd::OpAudit { .. } | Cmd::KnobScope { .. }) {
         tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_writer(std::io::stderr)
@@ -746,6 +776,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             program,
             format,
         } => op_audit_cmd(blob, table, program, format),
+        Cmd::KnobScope {
+            base,
+            variant,
+            knob,
+            values,
+            workload,
+            model,
+            out,
+            scope_json,
+        } => knob_scope_cmd(base, variant, knob, values, workload, model, out, scope_json),
         Cmd::Devices {
             tp,
             hidden,
@@ -2375,6 +2415,88 @@ fn devices(
 /// packed token batch, `1` when any opcode is refused. That makes the audit
 /// usable as a gate in the enablement of a (family, backend) pair, which is what
 /// the plan asks of it — not just as something to read.
+#[cfg(feature = "hsa")]
+fn knob_routes(
+    knob: &str,
+    (off, on): (&str, &str),
+    base: &plowrt::knob_scope::Packet,
+    variant: &plowrt::knob_scope::Packet,
+    workload: &plowrt::knob_scope::Workload,
+) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+    use plowrt::knob_scope as ks;
+    let (mut k_off, mut k_on) = (ks::RouteKnobs::default(), ks::RouteKnobs::default());
+    if knob.starts_with("rt.") {
+        k_off.set(knob, off)?;
+        k_on.set(knob, on)?;
+    }
+    Ok(ks::route_steps(
+        &ks::route(base, workload, k_off)?,
+        &ks::route(variant, workload, k_on)?,
+    ))
+}
+
+#[cfg(not(feature = "hsa"))]
+fn knob_routes(
+    _: &str,
+    _: (&str, &str),
+    _: &plowrt::knob_scope::Packet,
+    _: &plowrt::knob_scope::Packet,
+    _: &plowrt::knob_scope::Workload,
+) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+    Err("the route trace plans the AMD serve: build plowrt with --features hsa".into())
+}
+
+fn knob_scope_cmd(
+    base: PathBuf,
+    variant: PathBuf,
+    knob: String,
+    values: Option<String>,
+    workload: Option<PathBuf>,
+    model: Option<String>,
+    out: Option<PathBuf>,
+    scope_json: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use plowrt::knob_scope as ks;
+    let (off, on) = match values.as_deref() {
+        Some(v) => v.split_once(',').ok_or("--values wants OFF,ON")?,
+        None => ("", ""),
+    };
+    let delta: Vec<String> = if off != on { vec![knob.clone()] } else { Vec::new() };
+    let a = ks::extract(&base)?;
+    let b = if variant == base { None } else { Some(ks::extract(&variant)?) };
+    let b = b.as_ref().unwrap_or(&a);
+    let model = model
+        .or_else(|| a.model.clone())
+        .ok_or("the packet names no model (build.json knobs.target); pass --model")?;
+    let routes = match workload {
+        None => Vec::new(),
+        Some(w) => {
+            let w: ks::Workload = serde_json::from_slice(&std::fs::read(&w)?)?;
+            knob_routes(&knob, (off, on), &a, b, &w)?
+        }
+    };
+    let mut payload =
+        ks::payload(&model, &delta, ks::declared_scope(&knob), ks::pairs(&a, b)?, routes);
+    if let Some(p) = scope_json {
+        payload["scope"] = serde_json::from_slice(&std::fs::read(p)?)?;
+    }
+    let cert = lean_verify::checkpoints::scope::check_scope(&payload)?;
+    let report = serde_json::json!({
+        "knob": knob, "values": [off, on], "base": base, "variant": variant,
+        "ok": cert.ok, "notes": cert.notes, "reason": cert.reason,
+    });
+    let text = serde_json::to_string_pretty(&report)?;
+    match out {
+        Some(o) => std::fs::write(o, &text)?,
+        None => println!("{text}"),
+    }
+    if cert.ok {
+        Ok(())
+    } else {
+        Err(format!("checkpoint S rejected {knob}: {}", cert.reason.unwrap_or_default()).into())
+    }
+}
+
 fn op_audit_cmd(
     blob_path: Option<PathBuf>,
     table: bool,

@@ -16,6 +16,7 @@ import Plow.Wire
 import Plow.Rewrite
 import Plow.TilePartition
 import Plow.Knobs.Consistency
+import Plow.Knobs.Scope
 
 namespace Plow.CLI.Checkpoints
 
@@ -31,6 +32,16 @@ def checkK (payload : Json) : Certificate :=
   match Plow.Knobs.runK payload with
   | .ok notes => ok "K" notes
   | .error msg => reject "K" msg
+
+/-! ## Checkpoint S: knob scope. -/
+
+/-- Compare a base and a variant packet program by program against a knob's declared scope.
+    Backed by `Plow.Knobs.Scope.checkS_sound`, `diff_complete`, `off_identity`,
+    `untouched_rungs` and `route_untouched`. -/
+def checkS (payload : Json) : Certificate :=
+  match Plow.Knobs.Scope.runS payload with
+  | .ok notes => ok "S" notes
+  | .error msg => reject "S" msg
 
 /-! ## Checkpoint A: Rewrite rule soundness (§5.10-A). -/
 

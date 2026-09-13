@@ -3477,7 +3477,7 @@ fn packed_kda_compatible(prog: &DevProg) -> bool {
 /// this constant is never read (see the early return in [`plan_chunks_cfg`]).
 /// Raise this only if ragged-M is ruled out for a reason other than speed.
 /// `perf-data/plow-gfx942/glm52-chunk-policy.md`.
-const LAUNCH_ROWS: u32 = 416;
+pub(crate) const LAUNCH_ROWS: u32 = 416;
 
 /// Cover `n_prompt` tokens with chunks drawn from the compiled bucket ladder.
 ///

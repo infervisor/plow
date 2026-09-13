@@ -36,6 +36,7 @@ def runCheckpoint (cp : String) (payload : Json) : IO Certificate := do
   | "F" => Checkpoints.checkF payload
   | "G" => return Checkpoints.checkG payload
   | "K" => return Checkpoints.checkK payload
+  | "S" => return Checkpoints.checkS payload
   | _   => return { ok := false, checkpoint := cp,
                     notes := none, reason := some s!"unknown checkpoint '{cp}'" }
 

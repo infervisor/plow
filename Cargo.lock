@@ -2759,6 +2759,7 @@ dependencies = [
  "hwspec",
  "hyper",
  "hyper-util",
+ "lean_verify",
  "libc",
  "libloading",
  "memmap2",

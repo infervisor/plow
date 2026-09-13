@@ -8,8 +8,8 @@
 use crate::config::RuntimeConfig;
 use crate::{Result, RuntimeError};
 use plow_asset::knob::{
-    Check, Cmp, Constraint, Default, Domain, Formula as F, KnobSpec, Layer, Status, Target,
-    TargetAtom as T, Val, U32, USIZE,
+    Allow, Check, Cmp, Constraint, Default, Domain, Formula as F, KnobSpec, Layer, OpSel,
+    ScopeField, Status, Target, TargetAtom as T, Val, U32, USIZE,
 };
 use plow_asset::knob_gen;
 use serde_json::Value;
@@ -36,6 +36,26 @@ const UNION_SKIP_CANDIDATE: Status = Status::Candidate {
 const PROMOTED: Status = Status::Qualified {
     evidence: &["docs/flags-reference.md: a promoted default; `=false` is the rollback"],
 };
+
+/// Runtime knobs change no packet byte; their scope is the route a workload takes.
+/// G1 (review log #85) skips union segments inside the sparse prefill programs; the packet does not
+/// change, so the route is its whole scope.
+const UNION_SKIP_SCOPE: &[Allow] = &[Allow {
+    kinds: &["prefill"],
+    sparse: Some(true),
+    fields: &[ScopeField::Route],
+    ..Allow::ANY
+}];
+const TAIL_SPARSE_SCOPE: &[Allow] = &[Allow {
+    kinds: &["prefill"],
+    fields: &[ScopeField::Route],
+    ..Allow::ANY
+}];
+const DECODE_MIN_RUNG_SCOPE: &[Allow] = &[Allow {
+    kinds: &["decode"],
+    fields: &[ScopeField::Route],
+    ..Allow::ANY
+}];
 
 const C_PF_SEG_GEMM_SMALL: &[Constraint] = &[Constraint {
     id: "pf_seg_gemm_small_requires_seg_dir",
@@ -309,7 +329,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.tp_prefill_segment_major", Some("PLOW_TP_PREFILL_SEGMENT_MAJOR"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.prefill_seg_timing", Some("PLOW_PREFILL_SEG_TIMING"), Layer::Runtime, Domain::Bool, OFF, DIAG),
     KnobSpec::new("rt.native_launch_timing", Some("PLOW_NATIVE_LAUNCH_TIMING"), Layer::Runtime, Domain::Bool, OFF, DIAG),
-    KnobSpec::new("rt.union_skip", Some("PLOW_AMD_UNION_SKIP"), Layer::Runtime, Domain::Bool, OFF, UNION_SKIP_CANDIDATE),
+    KnobSpec::new("rt.union_skip", Some("PLOW_AMD_UNION_SKIP"), Layer::Runtime, Domain::Bool, OFF, UNION_SKIP_CANDIDATE).scoped(UNION_SKIP_SCOPE),
     KnobSpec::new("rt.tb_dump", Some("PLOW_TB_DUMP"), Layer::Runtime, Domain::Str, UNSET, DIAG),
     KnobSpec::new("rt.trace_allranks", Some("PLOW_TRACE_ALLRANKS"), Layer::Runtime, Domain::Bool, OFF, DIAG),
     KnobSpec::new("rt.attnres_f32mix_grid", Some("PLOW_ATTNRES_F32MIX_GRID"), Layer::Runtime, U32, UNSET, DIAG),
@@ -335,8 +355,8 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.launch_rows", Some("PLOW_LAUNCH_ROWS"), Layer::Runtime, U32, UNSET, OPT_IN),
     KnobSpec::new("rt.token_batch_rows", Some("PLOW_TOKEN_BATCH_ROWS"), Layer::Runtime, U32, UNSET, OPT_IN),
     KnobSpec::new("rt.token_batch_solo", Some("PLOW_TOKEN_BATCH_SOLO"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
-    KnobSpec::new("rt.decode_min_rung", Some("PLOW_AMD_DECODE_MIN_RUNG"), Layer::Runtime, U32, UNSET, OPT_IN),
-    KnobSpec::new("rt.tail_sparse_ctx", Some("PLOW_AMD_TAIL_SPARSE_CTX"), Layer::Runtime, U32, UNSET, OPT_IN),
+    KnobSpec::new("rt.decode_min_rung", Some("PLOW_AMD_DECODE_MIN_RUNG"), Layer::Runtime, U32, UNSET, OPT_IN).scoped(DECODE_MIN_RUNG_SCOPE),
+    KnobSpec::new("rt.tail_sparse_ctx", Some("PLOW_AMD_TAIL_SPARSE_CTX"), Layer::Runtime, U32, UNSET, OPT_IN).scoped(TAIL_SPARSE_SCOPE),
     KnobSpec::new("rt.token_batch_wide_tiles", Some("PLOW_TOKEN_BATCH_WIDE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.ragged_chunk", Some("PLOW_RAGGED_CHUNK"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.ragged_seams", Some("PLOW_AMD_RAGGED_SEAMS"), Layer::Runtime, Domain::Bool, UNSET, OPT_IN),
@@ -742,9 +762,41 @@ mod tests {
             Status::Diagnostic => "Status::Diagnostic".into(),
             Status::Removed => "Status::Removed".into(),
         };
+        let scoped = if k.scope.is_empty() {
+            String::new()
+        } else {
+            format!(
+                ".scoped(&[{}])",
+                k.scope.iter().map(allow_src).collect::<Vec<_>>().join(", ")
+            )
+        };
         format!(
-            "    KnobSpec::new({:?}, {:?}, Layer::{:?}, {domain}, {default}, {status}),",
+            "    KnobSpec::new({:?}, {:?}, Layer::{:?}, {domain}, {default}, {status}){scoped},",
             k.id, k.env, k.layer
+        )
+    }
+
+    fn allow_src(a: &Allow) -> String {
+        let opt = |o: Option<&str>| o.map_or("None".to_string(), |s| format!("Some({s:?})"));
+        let ops = match a.ops {
+            OpSel::Any => "OpSel::Any".to_string(),
+            OpSel::In(cs) => format!("OpSel::In({})", strs_src(cs)),
+            OpSel::NotIn(cs) => format!("OpSel::NotIn({})", strs_src(cs)),
+        };
+        format!(
+            "Allow {{ kinds: {}, rows: ({}, {}), topology: {}, sparse: {:?}, model: {}, ops: {ops}, fields: &[{}], facts: {} }}",
+            strs_src(a.kinds),
+            a.rows.0,
+            a.rows.1,
+            opt(a.topology),
+            a.sparse,
+            opt(a.model),
+            a.fields
+                .iter()
+                .map(|f| format!("ScopeField::{f:?}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            strs_src(a.facts)
         )
     }
 
@@ -784,7 +836,7 @@ mod tests {
             for c in k.constraints {
                 c.formula.vars(&mut wanted);
             }
-            if matches!(k.default, Default::Production { .. }) {
+            if matches!(k.default, Default::Production { .. }) || !k.scope.is_empty() {
                 wanted.push(k.id);
                 wanted.extend(k.default.vars());
             }
@@ -879,9 +931,13 @@ mod tests {
             have == want,
             "plow-asset/src/knob_gen.rs is stale: rerun with KNOB_GEN_WRITE=1"
         );
+        let mut read: Vec<&str> = Vec::new();
+        for c in knob_gen::CONSTRAINTS {
+            c.formula.vars(&mut read);
+        }
         let runtime_ids: Vec<&str> = knob_gen::KNOBS
             .iter()
-            .filter(|k| k.layer == Layer::Runtime)
+            .filter(|k| k.layer == Layer::Runtime && read.contains(&k.id))
             .map(|k| k.id)
             .collect();
         let mut readers: Vec<&str> = READERS.iter().map(|(id, _)| *id).collect();
@@ -913,6 +969,30 @@ mod tests {
             (_, Domain::Bool) => Val::Bool(rng.next() % 2 == 0),
             (_, Domain::Nat { .. }) => Val::Nat(rng.next() % 20),
             _ => Val::Str(STRS[(rng.next() % STRS.len() as u64) as usize]),
+        }
+    }
+
+    #[test]
+    fn declared_scopes_name_known_kinds_and_classes() {
+        const KINDS: &[&str] = &["prefill", "decode", "packed", "token_batch", "global"];
+        let known = |c: &str| {
+            packet::opclass::CLASSES.contains(&c)
+                || c.strip_prefix("op:")
+                    .and_then(|n| n.parse::<u16>().ok())
+                    .is_some_and(|n| packet::dev::DevOp::from_u16(n).is_some())
+        };
+        for k in registry() {
+            for a in k.scope {
+                assert!(!a.fields.is_empty(), "{}: an allowance with no field allows nothing", k.id);
+                for kind in a.kinds {
+                    assert!(KINDS.contains(kind), "{}: unknown program kind {kind}", k.id);
+                }
+                if let OpSel::In(cs) | OpSel::NotIn(cs) = a.ops {
+                    for c in cs {
+                        assert!(known(c), "{}: unknown op class {c}", k.id);
+                    }
+                }
+            }
         }
     }
 
