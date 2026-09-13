@@ -2098,10 +2098,93 @@ static __device__ void d_gemm_glu_w8a8(__nv_bfloat16* __restrict__ C, const uint
  * `x` is an OUTPUT — the warp computes fu = act(gate)*up inline (bf16-rounded, exactly what
  * the separate Glu packet would have written), stores it, and quantizes from the rounded
  * value, deleting the Glu packet + its gate + the full inter-width fu re-read per layer. */
+/* Exact wide-row prefill shapes use the whole CTA on fewer rows. Max is associative and the
+ * element conversion is unchanged, so the row scales and FP8 bytes remain identical. */
+template <unsigned WPR>
+static __device__ __noinline__ void d_quant_fp8_wpr(uint8_t* __restrict__ xq,
+                                      const __nv_bfloat16* __restrict__ x,
+                                      float* __restrict__ ascale, unsigned M, unsigned K,
+                                      unsigned slice, unsigned nblk, float* part) {
+    static_assert((WPR == 4 || WPR == 8) && PLOW_NV_WARPS >= WPR && PLOW_NV_WARPS % WPR == 0,
+                  "supported quant row groups");
+    constexpr unsigned groups = PLOW_NV_WARPS / WPR;
+    const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
+    const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
+    const unsigned group = warp / WPR;
+    const unsigned sub = warp % WPR;
+    for (unsigned wave = 0;; wave++) {
+        const unsigned row0 = slice + wave * groups * nblk;
+        if (row0 >= M) break;
+        const unsigned mm = row0 + group * nblk;
+        const bool active = mm < M;
+        const size_t row = (size_t)mm * K;
+        float amax = 0.0f;
+        if (active) {
+            for (unsigned kk = (sub * 32u + lane) * 8u; kk < K; kk += WPR * 256u) {
+                const bf16v8 v = ld_glob8(x + row + kk);
+#pragma unroll
+                for (int j = 0; j < 8; j++)
+                    amax = fmaxf(amax, fabsf(__bfloat162float(v.x[j])));
+            }
+        }
+        amax = warp_max32(amax);
+        if (lane == 0) part[warp] = amax;
+        __syncthreads();
+        if (lane == 0) {
+            amax = 0.0f;
+#pragma unroll
+            for (unsigned w = 0; w < WPR; w++)
+                amax = fmaxf(amax, part[group * WPR + w]);
+        }
+        amax = __shfl_sync(0xffffffffu, amax, 0);
+#if defined(PLOW_NV_QUANT_FP8_VLLM) && PLOW_NV_QUANT_FP8_VLLM
+        const float as = fmaxf(__fdiv_rn(amax, 448.0f), 1.0f / (448.0f * 512.0f));
+#else
+        const float as = fmaxf(amax * (1.0f / 448.0f), 1e-12f);
+        const float inv = 1.0f / as;
+#endif
+        if (active && sub == 0 && lane == 0) ascale[mm] = as;
+        if (active) {
+            for (unsigned kk = (sub * 32u + lane) * 8u; kk < K; kk += WPR * 256u) {
+                const bf16v8 v = ld_glob8(x + row + kk);
+                uint2 q8;
+                unsigned short* q2 = (unsigned short*)&q8;
+#pragma unroll
+                for (int j = 0; j < 4; j++) {
+#if defined(PLOW_NV_QUANT_FP8_VLLM) && PLOW_NV_QUANT_FP8_VLLM
+                    const float lo = __fdiv_rn(__bfloat162float(v.x[2 * j]), as);
+                    const float hi = __fdiv_rn(__bfloat162float(v.x[2 * j + 1]), as);
+                    q2[j] = pack_fp8_e4m3(fmaxf(-448.0f, fminf(lo, 448.0f)),
+                                           fmaxf(-448.0f, fminf(hi, 448.0f)));
+#else
+                    q2[j] = pack_fp8_e4m3(__bfloat162float(v.x[2 * j]) * inv,
+                                           __bfloat162float(v.x[2 * j + 1]) * inv);
+#endif
+                }
+                *(uint2*)(xq + row + kk) = q8;
+            }
+        }
+        __syncthreads();
+    }
+}
+
 static __device__ void d_quant_fp8(uint8_t* __restrict__ xq, __nv_bfloat16* __restrict__ x,
                             float* __restrict__ ascale, unsigned M, unsigned K, unsigned slice,
                             unsigned nblk, const __nv_bfloat16* __restrict__ gate = nullptr,
-                            const __nv_bfloat16* __restrict__ up = nullptr, unsigned act = 0) {
+                            const __nv_bfloat16* __restrict__ up = nullptr, unsigned act = 0,
+                            float* part = nullptr) {
+#if defined(PLOW_NV_QUANT_WPR) && PLOW_NV_QUANT_WPR
+    if (!gate && part) {
+        if (K == 15360u) {
+            d_quant_fp8_wpr<8>(xq, x, ascale, M, K, slice, nblk, part);
+            return;
+        }
+        if (K == 4096u) {
+            d_quant_fp8_wpr<4>(xq, x, ascale, M, K, slice, nblk, part);
+            return;
+        }
+    }
+#endif
     const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
     const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
     const unsigned per = (M + nblk - 1) / nblk;

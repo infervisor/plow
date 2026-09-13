@@ -1296,7 +1296,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
     case PLOW_DOP_QUANT_FP8:
         d_quant_fp8((uint8_t*)TEN(0), (__nv_bfloat16*)TEN(1), (float*)TEN(2), in->i[0],
                     in->i[1], slice, nblk, (const __nv_bfloat16*)TEN(3),
-                    (const __nv_bfloat16*)TEN(4), in->i[2]);
+                    (const __nv_bfloat16*)TEN(4), in->i[2], arena);
         break;
 #endif /* !PLOW_NV_GEMM_ONLY (quant) */
 #endif /* !PLOW_NV_FA_ONLY (w8a8 arms) */
