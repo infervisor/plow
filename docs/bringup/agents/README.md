@@ -13,9 +13,10 @@ pipeline described in [`docs/bringup/00-overview.md`](../00-overview.md):
 | [`agents/05-single-block-sweep.md`](05-single-block-sweep.md) | Single-block correctness + latency |
 | [`agents/06-runtime-opt.md`](06-runtime-opt.md) | Whole-model serving optimization |
 | [`agents/07-perf-campaign.md`](07-perf-campaign.md) | End-to-end measured campaign + written results |
+| [`agents/08-rung-campaign.md`](08-rung-campaign.md) | Per-rung optimization loop: rung card, attribution, lever card, T1–T4 ladder, decision, record |
 
 Prompts **01–03 are target-independent** and take no target parameters.
-Prompts **04–07 each open with the parameter block** from
+Prompts **04–08 each open with the parameter block** from
 [`docs/bringup/target.md`](../target.md) — `$VENDOR $ISA $GPU $NCU $NGPU
 $PARALLEL $MAXCTX $TOOLCHAIN $BUILD $FEATURES $BW_BOUND $COMPUTE_CEIL
 $RESULTS` — which must be filled in before the agent runs anything. Their
@@ -51,6 +52,9 @@ defect, and a row that cannot be filled is a blocker, not a default.
   harnesses and name the selected harness in the report. Extend an existing
   harness when its semantic boundary is incomplete; do not create a
   campaign-specific runner for a case an existing harness can express.
+- **Optimize one rung at a time.** After Stage 6, performance work follows
+  [`08-rung-campaign.md`](08-rung-campaign.md): one compiled rung, one lever,
+  a floor measured in the same job, and a decision rule before any GPU time.
 - **Spend the sweep budget on blocks.** Use standalone probes to reject broken
   arms, single-block or truncated-model sweeps to rank the broad grid, and a
   whole-model step only for the 2–3 finalists. Serving is the promotion gate,
