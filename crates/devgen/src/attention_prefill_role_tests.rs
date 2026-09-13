@@ -65,6 +65,7 @@ fn wgmma_object_selects_its_tile_and_rejects_partial_output() {
     let mut globals = OBJECT_GLOBALS;
     globals[2].1 = 64;
     globals[3].1 = 32;
+    globals[6].1 = 201_728;
     std::fs::write(directory.join(OBJECT_FILE), object_image(&globals)).unwrap();
     let mut model = fixture(512, true, true);
     let mut sections = Vec::new();
@@ -472,6 +473,13 @@ fn output_object_is_explicit_inert_and_validated_before_mutation() {
     assert!(sections.is_empty());
 
     let mut stale = OBJECT_GLOBALS;
+    stale[6].1 = 201_728;
+    std::fs::write(directory.join(OBJECT_FILE), object_image(&stale)).unwrap();
+    assert!(apply_output(&mut model, &mut sections, "sm90a", &output).is_err());
+    assert_eq!(model.to_blob(), before);
+    assert!(sections.is_empty());
+
+    stale = OBJECT_GLOBALS;
     stale[3].1 = 32;
     std::fs::write(directory.join(OBJECT_FILE), object_image(&stale)).unwrap();
     assert!(apply_output(&mut model, &mut sections, "sm90a", &output).is_err());

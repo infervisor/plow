@@ -25,7 +25,9 @@
 #define PLOW_NV_PREFILL 1
 #define PLOW_NV_THREADS 256u
 #define PLOW_NV_FA_PIPE 1
+#ifndef PLOW_NV_FA_TMA
 #define PLOW_NV_FA_TMA 1
+#endif
 #define PLOW_NV_FA512_WG 1
 #define PLOW_NV_FA512_KV64 0
 #ifndef PLOW_NV_FA512_QK_HALVES
@@ -170,10 +172,15 @@ int main(int argc, char** argv) {
     Buffers control = allocate_buffers(q_elements, rows, nsplit);
     Buffers candidate = allocate_buffers(q_elements, rows, nsplit);
 
+#ifdef PLOW_EXPERIMENT_LAUNCH_SMEM
+    constexpr size_t control_smem = PLOW_EXPERIMENT_LAUNCH_SMEM;
+    constexpr size_t candidate_smem = PLOW_EXPERIMENT_LAUNCH_SMEM;
+#else
     constexpr size_t control_smem =
         FA_PX4_SMEM_FLOATS(HD, 32, BKV) * sizeof(float);
     constexpr size_t candidate_smem =
         FA_SM90_PRE_FLOATS(HD, 64, BKV) * sizeof(float);
+#endif
     CK(cudaFuncSetAttribute(control_kernel,
                             cudaFuncAttributeMaxDynamicSharedMemorySize,
                             int(control_smem)));
@@ -222,6 +229,13 @@ int main(int argc, char** argv) {
         max_abs = std::max(max_abs, std::abs(error));
     }
     const double rel_l2 = std::sqrt(error2 / std::max(reference2, 1e-30));
+    uint64_t control_hash = 1469598103934665603ull;
+    for (const bf16& value : expected) {
+        uint16_t bits;
+        std::memcpy(&bits, &value, sizeof(bits));
+        control_hash = (control_hash ^ uint8_t(bits)) * 1099511628211ull;
+        control_hash = (control_hash ^ uint8_t(bits >> 8)) * 1099511628211ull;
+    }
 
     unsigned* trash = nullptr;
     constexpr size_t eviction_bytes = 256ull << 20;
@@ -266,10 +280,12 @@ int main(int argc, char** argv) {
                 rows, kv_length, nsplit, seed);
     print_resources("control", (const void*)control_kernel, control_smem);
     print_resources("candidate", (const void*)candidate_kernel, candidate_smem);
-    std::printf("\"mismatches\":%zu,\"rel_l2\":%.9g,\"max_abs\":%.9g,"
+    std::printf("\"control_hash\":\"fnv1a64:%016llx\",\"mismatches\":%zu,"
+                "\"rel_l2\":%.9g,\"max_abs\":%.9g,"
                 "\"exact\":%s,\"control_p50_us\":%.6f,"
                 "\"candidate_p50_us\":%.6f,\"speedup\":%.6f}\n",
-                mismatches, rel_l2, max_abs, mismatches ? "false" : "true",
+                (unsigned long long)control_hash, mismatches, rel_l2, max_abs,
+                mismatches ? "false" : "true",
                 control_p50, candidate_p50, control_p50 / candidate_p50);
 
     CK(cudaEventDestroy(begin));

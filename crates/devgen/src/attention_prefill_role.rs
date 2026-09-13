@@ -17,7 +17,7 @@ const OBJECT_GLOBALS: [(&str, u32); 7] = [
     ("plow_attention_kv_tile", 16),
     ("plow_attention_warps", 8),
     ("plow_block_pfattn_hd512", 256),
-    ("plow_arena_bytes_pfattn_hd512", 201_728),
+    ("plow_arena_bytes_pfattn_hd512", 70_672),
 ];
 const HD256_OBJECT_FILE: &str = "interp_sm90a_pfattn_hd256_bkv32.cubin";
 const HD256_OBJECT_ENTRY: &str = "plow_sm90a_pfattn_hd256_bkv32";
@@ -409,6 +409,7 @@ pub(crate) fn apply_output_object(
         (Some(64), Some(32)) => {
             expected[2].1 = 64;
             expected[3].1 = 32;
+            expected[6].1 = 201_728;
         }
         (Some(64), Some(64)) => {
             expected[2].1 = 64;

@@ -2,7 +2,9 @@
 
 #define PLOW_NV_HOPPER 1
 #define PLOW_NV_FA_PIPE 1
+#ifndef PLOW_NV_FA_TMA
 #define PLOW_NV_FA_TMA 1
+#endif
 #ifndef PLOW_NV_FA512_WG
 #define PLOW_NV_FA512_WG 0
 #endif
@@ -41,7 +43,9 @@ extern "C" __device__ unsigned plow_attention_score_partitions =
     PLOW_NV_FA512_N_SPLIT && FA512_KV_TILE == 64 ? 2 : 1;
 extern "C" __device__ unsigned plow_block_pfattn_hd512 = 256;
 extern "C" __device__ unsigned plow_arena_bytes_pfattn_hd512 =
-    FA_PRE_SMEM_FLOATS(512, 64, FA512_KV_TILE) * sizeof(float);
+    (PLOW_NV_FA512_WG ? FA_PRE_SMEM_FLOATS(512, 64, FA512_KV_TILE)
+                      : FA_PX4_SMEM_FLOATS(512, 32, 16)) *
+    sizeof(float);
 
 __device__ __forceinline__ unsigned attention_ctr_poll(const unsigned* p) {
     unsigned value;
