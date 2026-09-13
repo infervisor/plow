@@ -286,8 +286,8 @@ __device__ void d_flash_prefill_sm90_wgitem(
         : Vs + FA_SM90_NS * NSUB * KT;
 
     __shared__ uint64_t fa90w_bar[2][FA_SM90_NS];
-    unsigned fa90_ph[FA_SM90_NS] = {0, 0};
-    bool fa90_tma[FA_SM90_NS] = {false, false};
+    unsigned fa90_ph = 0;
+    unsigned fa90_tma = 0;
     if (mapkv && (GQA2_PAIR ? tid == 0 : lt == 0)) {
         const int owner = GQA2_PAIR ? 0 : wg;
         sm90_mbar_init(&fa90w_bar[owner][0], 1);
@@ -393,7 +393,7 @@ __device__ void d_flash_prefill_sm90_wgitem(
             __nv_bfloat16* kd = Ks + (size_t)buf * NSUB * KT;
             __nv_bfloat16* vd = Vs + (size_t)buf * NSUB * KT;
             const bool full = use_tma && (kv0 + (unsigned)BKV <= hi);
-            fa90_tma[buf] = full;
+            fa90_tma = (fa90_tma & ~(1u << buf)) | (unsigned(full) << buf);
             if (full) {
                 if (GQA2_PAIR ? tid == 0 : lt == 0) {
                     const int owner = GQA2_PAIR ? 0 : wg;
@@ -426,11 +426,11 @@ __device__ void d_flash_prefill_sm90_wgitem(
         };
         auto waitKV = [&](int buf) {
             sm90_cp_wait<0>();
-            if (fa90_tma[buf]) {
+            if (fa90_tma & (1u << buf)) {
                 const int owner = GQA2_PAIR ? 0 : wg;
-                sm90_mbar_wait(&fa90w_bar[owner][buf], (int)(fa90_ph[buf] & 1u));
-                fa90_ph[buf]++;
-                fa90_tma[buf] = false;
+                sm90_mbar_wait(&fa90w_bar[owner][buf], (int)((fa90_ph >> buf) & 1u));
+                fa90_ph ^= 1u << buf;
+                fa90_tma &= ~(1u << buf);
             }
         };
 

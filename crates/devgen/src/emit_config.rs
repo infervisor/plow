@@ -953,6 +953,10 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GEMMA4_SM90_W8A8_GEMM_GLU_ROLE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub gemma4_sm90_w8a8_gemm_glu_role: bool,
 
+    /// Route exact Gemma-4 M4096/M8192 sliding attention through the paired-GQA2 Hopper object.
+    #[arg(long, env = "PLOW_GEMMA4_SM90_HD256_GQA2_ROLE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub gemma4_sm90_hd256_gqa2_role: bool,
+
     /// Select the packet-declared native FP8 prefill GEMM role.
     #[arg(long, env = "PLOW_FP8_PF_GEMM_ROLE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub fp8_pf_gemm_role: bool,
@@ -1300,6 +1304,7 @@ impl EmitConfig {
             gemma4_sm90_w8a8_gemm_glu_role: env_bool(
                 "PLOW_GEMMA4_SM90_W8A8_GEMM_GLU_ROLE",
             ),
+            gemma4_sm90_hd256_gqa2_role: env_bool("PLOW_GEMMA4_SM90_HD256_GQA2_ROLE"),
             fp8_pf_gemm_role: env_bool("PLOW_FP8_PF_GEMM_ROLE"),
             fp8_pf_isolate: env_bool("PLOW_QWEN_FP8_PF_ISOLATE"),
             attention_pf_role: env_bool("PLOW_ATTENTION_PF_ROLE"),
@@ -1963,6 +1968,25 @@ mod tests {
                 .unwrap()
                 .emit
                 .gemma4_sm90_w8a8_gemm_glu_role
+        );
+    }
+
+    #[test]
+    fn gemma4_sm90_hd256_gqa2_role_is_explicit_and_default_off() {
+        let _guard = crate::test_env::env_guard();
+        let _scope = crate::test_env::EnvScope::set(&[("PLOW_GEMMA4_SM90_HD256_GQA2_ROLE", "0")]);
+        assert!(!EmitConfig::from_env().gemma4_sm90_hd256_gqa2_role);
+        assert!(
+            !TestArgs::try_parse_from(["test"])
+                .unwrap()
+                .emit
+                .gemma4_sm90_hd256_gqa2_role
+        );
+        assert!(
+            TestArgs::try_parse_from(["test", "--gemma4-sm90-hd256-gqa2-role"])
+                .unwrap()
+                .emit
+                .gemma4_sm90_hd256_gqa2_role
         );
     }
 

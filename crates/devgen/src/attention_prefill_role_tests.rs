@@ -55,7 +55,9 @@ fn apply_output(
     profile: &str,
     output: &Path,
 ) -> Result<bool, String> {
-    apply_output_object(model, sections, profile, output, "h100", 1024, false, None)
+    apply_output_object(
+        model, sections, profile, output, "h100", 1024, false, None, false,
+    )
 }
 
 #[test]
@@ -90,8 +92,7 @@ fn wgmma_object_selects_its_tile_and_rejects_partial_output() {
     let mut sections = Vec::new();
     assert!(apply_output(&mut narrow_wg, &mut sections, "sm90a", &output).unwrap());
     assert_eq!(
-        SegmentRoles::from_bytes(&sections[0].data).unwrap().objects
-            [&PREFILL_ATTENTION_HD512_WG32]
+        SegmentRoles::from_bytes(&sections[0].data).unwrap().objects[&PREFILL_ATTENTION_HD512_WG32]
             .attention,
         Some(capability(64, 16))
     );
@@ -167,6 +168,43 @@ fn hd256_image() -> Vec<u8> {
     plow_asset::cubin::synthetic_elf(HD256_OBJECT_ENTRY, &HD256_OBJECT_GLOBALS, 90)
 }
 
+fn hd256_gqa2_image() -> Vec<u8> {
+    plow_asset::cubin::synthetic_elf(HD256_GQA2_OBJECT_ENTRY, &HD256_GQA2_OBJECT_GLOBALS, 90)
+}
+
+#[test]
+fn exact_hd256_gqa2_object_selects_only_a_packed_4k_rung() {
+    let directory = output_dir("hd256-gqa2-bkv32");
+    let output = directory.join("model.pkt");
+    std::fs::write(directory.join(HD256_GQA2_OBJECT_FILE), hd256_gqa2_image()).unwrap();
+    let mut model = hd256_fixture();
+    model.prog_t[0] = 4096;
+    let flash = &mut model.progs[0].insts[1];
+    flash.i[0] = 4096;
+    flash.i[1] = 4096;
+    model.tensors[flash.t[5] as usize].bytes = 4096 * 16 * 256 * 2;
+    let mut sections = Vec::new();
+    assert!(apply_output_object(
+        &mut model,
+        &mut sections,
+        "sm90a",
+        &output,
+        "h100",
+        8192,
+        true,
+        None,
+        true,
+    )
+    .unwrap());
+    let roles = SegmentRoles::from_bytes(&sections[0].data).unwrap();
+    assert_eq!(roles.programs[0].roles, [0, 14, 0]);
+    let object = &roles.objects[&PREFILL_ATTENTION_HD256_GQA2_BKV32];
+    assert_eq!(object.abi, PREFILL_ATTENTION_HD256_GQA2_BKV32_ABI);
+    assert_eq!(object.sha256.as_deref().map(str::len), Some(64));
+    assert_eq!(object.attention.as_ref().unwrap().kv_tile, 32);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
 fn hd256_record(model: &Model, image: &[u8]) -> tunedb::AttentionRoleMeasurement {
     let program_sha256 = plow_asset::program::with_model(model, |packet| {
         plow_asset::live_kv::program_digest(&packet.programs[0])
@@ -234,6 +272,7 @@ fn exact_hd256_bkv32_object_preserves_existing_packet_segments() {
         1024,
         false,
         store_root.to_str(),
+        false,
     )
     .unwrap());
     assert_eq!(model.progs[0].insts, original_insts);
@@ -274,6 +313,7 @@ fn hd256_qualification_can_select_a_subset_of_prefill_rungs() {
         1024,
         false,
         store_root.to_str(),
+        false,
     )
     .unwrap());
     let roles = SegmentRoles::from_bytes(&sections[0].data).unwrap();
@@ -320,6 +360,7 @@ fn inexact_hd256_record_falls_back_byte_identically() {
         1024,
         false,
         store_root.to_str(),
+        false,
     )
     .unwrap());
     assert_eq!(model.to_blob(), before);
@@ -349,6 +390,7 @@ fn selected_hd256_object_hash_drift_fails_before_packet_mutation() {
         1024,
         false,
         store_root.to_str(),
+        false,
     )
     .unwrap_err()
     .contains("differs from qualified SHA256"));

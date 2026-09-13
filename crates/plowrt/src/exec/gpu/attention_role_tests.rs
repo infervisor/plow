@@ -148,6 +148,12 @@ fn hd256_bkv32_object() -> plow_asset::segment_roles::SegmentObject {
     object
 }
 
+fn hd256_gqa2_bkv32_object() -> plow_asset::segment_roles::SegmentObject {
+    let mut object = hd256_bkv32_object();
+    object.abi = plow_asset::segment_roles::PREFILL_ATTENTION_HD256_GQA2_BKV32_ABI.into();
+    object
+}
+
 #[test]
 fn accepts_combined_roles_and_preserves_packet_split_counts() {
     for (rows, splits) in [(128, 3), (1024, 2), (4096, 1), (8192, 4)] {
@@ -406,6 +412,38 @@ fn accepts_exact_hd256_bkv32_contract_and_rejects_drift() {
 }
 
 #[test]
+fn accepts_exact_hd256_gqa2_bkv32_contract() {
+    let object = hd256_gqa2_bkv32_object();
+    check_attention_hd256_role(
+        "sm90a",
+        &object,
+        Some(1),
+        Some(256),
+        [Some(256), Some(64), Some(32), Some(8)],
+    )
+    .unwrap();
+
+    let (mut program, mut tensors) = fixture(4096, 1);
+    tensors.push(DevTensor {
+        name: "kv.map".into(),
+        bytes: 256,
+        init: None,
+    });
+    tensors[3].bytes *= 2;
+    tensors[4].bytes *= 2;
+    program.insts[2].i[2] = 16;
+    program.insts[2].i[3] = 8;
+    program.insts[2].i[5] = 1024;
+    program.insts[2].i[7] = 1;
+    program.insts[2].t[5] = 5;
+    program.insts[2].t[7] = 6;
+    assert_eq!(
+        packet_role_segments(&program, &[0, 0, 14, 0, 0], &tensors).unwrap(),
+        [0, 0, 14, 0, 0]
+    );
+}
+
+#[test]
 fn packet_role_overrides_only_its_legacy_prefill_segment() {
     let (program, tensors) = hd512_fixture();
     let roles = packet_role_segments(&program, &[0, 0, 6, 0, 0], &tensors).unwrap();
@@ -463,6 +501,7 @@ fn actual_packet_attention_roles() {
                     | plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32
                     | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_BKV64
                     | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_BKV32
+                    | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_GQA2_BKV32
             )
         })
         .count();

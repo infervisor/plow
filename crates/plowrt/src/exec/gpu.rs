@@ -598,6 +598,7 @@ impl SegmentRoleValidation for SegmentRoles {
                     plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32
                         | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_BKV64
                         | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_BKV32
+                        | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_GQA2_BKV32
                         | plow_asset::segment_roles::BF16_PREFILL_GEMM_GLU_GEMMA4
                         | plow_asset::segment_roles::W8A8_PREFILL_GEMM_GLU_GEMMA4
                 ) {
@@ -1203,6 +1204,7 @@ fn packet_role_segments(
                         | plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32
                         | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_BKV64
                         | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_BKV32
+                        | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_GQA2_BKV32
                 )
             }))
     {
@@ -1316,6 +1318,7 @@ fn packet_role_segments(
                 role,
                 plow_asset::segment_roles::PREFILL_ATTENTION_HD256_BKV64
                     | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_BKV32
+                    | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_GQA2_BKV32
             ) {
                 if !d.is_hd256_gqa2_sliding_prefill() {
                     return Err(RuntimeError::Rejected(
@@ -4352,6 +4355,7 @@ impl GpuEngine {
                     | plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32
                     | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_BKV64
                     | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_BKV32
+                    | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_GQA2_BKV32
                     | plow_asset::segment_roles::GEMV_CTA512
                     | plow_asset::segment_roles::W8A16_PREFILL_M1
                     | plow_asset::segment_roles::BF16_PREFILL_GEMM_GLU_GEMMA4
@@ -4390,6 +4394,12 @@ impl GpuEngine {
                     "plow_block_pfattn_hd256_bkv32",
                     "plow_sm90a_pfattn_hd256_bkv32",
                     "plow_arena_bytes_pfattn_hd256_bkv32",
+                ),
+                plow_asset::segment_roles::PREFILL_ATTENTION_HD256_GQA2_BKV32 => (
+                    "plow_attention_sm90_hd256_gqa2_bkv32_abi",
+                    "plow_block_pfattn_hd256_gqa2_bkv32",
+                    "plow_sm90a_pfattn_hd256_gqa2_bkv32",
+                    "plow_arena_bytes_pfattn_hd256_gqa2_bkv32",
                 ),
                 plow_asset::segment_roles::GEMV_CTA512 => (
                     "plow_gemv_sm90_cta512_abi",
@@ -4435,6 +4445,7 @@ impl GpuEngine {
                 plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32
                     | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_BKV64
                     | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_BKV32
+                    | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_GQA2_BKV32
                     | plow_asset::segment_roles::W8A16_PREFILL_M1
                     | plow_asset::segment_roles::BF16_PREFILL_GEMM_GLU_GEMMA4
                     | plow_asset::segment_roles::W8A8_PREFILL_GEMM_GLU_GEMMA4
@@ -4482,7 +4493,8 @@ impl GpuEngine {
                     )?
                 }
                 plow_asset::segment_roles::PREFILL_ATTENTION_HD256_BKV64
-                | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_BKV32 => {
+                | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_BKV32
+                | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_GQA2_BKV32 => {
                     check_attention_hd256_role(
                         profile.tag,
                         object,
@@ -4584,6 +4596,13 @@ impl GpuEngine {
             {
                 return Err(RuntimeError::Rejected(
                     "Gemma-4 BF16 GemmGlu role requires a 197696-byte arena".into(),
+                ));
+            }
+            if id == plow_asset::segment_roles::PREFILL_ATTENTION_HD256_GQA2_BKV32
+                && smem != 141312
+            {
+                return Err(RuntimeError::Rejected(
+                    "paired-GQA2 HD256 role requires a 141312-byte arena".into(),
                 ));
             }
             be.set_max_dynamic_smem(function, smem)?;
@@ -6577,6 +6596,7 @@ impl GpuEngine {
                                     | plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32
                                     | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_BKV64
                                     | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_BKV32
+                                    | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_GQA2_BKV32
                             )
                         })
                         .count(),
