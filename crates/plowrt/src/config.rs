@@ -111,6 +111,25 @@ pub struct RuntimeConfig {
     #[arg(long = "vmm-cache-mib", env = "PLOW_VMM_CACHE_MIB", global = true)]
     pub vmm_cache_mib: Option<u32>,
 
+    /// Keep every cached prefix (whole shared blocks and private boundary snapshots alike)
+    /// until free device memory would drop below this many MiB, instead of trimming as soon
+    /// as `--vmm-cache-mib`/`--vmm-cache-memory-utilization` bytes of cache are held. Unset
+    /// (the default) leaves the static byte budget as the only trim trigger — this is opt-in
+    /// because it needs the backend to report free device memory cheaply
+    /// (`VmmOps::free_bytes`); a backend that cannot degrades to the static budget unchanged.
+    #[arg(long = "vmm-cache-min-free-mib", env = "PLOW_VMM_CACHE_MIN_FREE_MIB", global = true)]
+    pub vmm_cache_min_free_mib: Option<u32>,
+
+    /// Share content below the shared-prefix cache's physical block floor (the 2 MiB VMM
+    /// granule — unshrinkable, measured: `hsa_vmm.rs`'s sub-granule probe) at this many rows
+    /// per chunk instead of leaving it an unshareable, per-request private copy. Unset (the
+    /// default) leaves the floor as today's ceiling for any sharing at all. Must divide the
+    /// coarsest cache group's own block size evenly for every group in one `SharedPrefix` to
+    /// agree on the same matched row count (`AmdSharedPrefix::new` picks one shared value
+    /// for every group, never a group's own finer native granularity).
+    #[arg(long = "amd-prefix-fine-rows", env = "PLOW_AMD_PREFIX_FINE_ROWS", global = true)]
+    pub amd_prefix_fine_rows: Option<u32>,
+
     /// VMM sharing block size (MiB) for the prefix pools on either vendor. 2 MiB ≈ 4096 tokens
     /// at hd256 bf16; raise (e.g. 64) for 128k-dedup work.
     #[arg(
@@ -1335,6 +1354,30 @@ impl RuntimeConfig {
         }
         // Whole MiB, so the figure in logs and metrics reads like the knob.
         ((device_bytes as f64 * fraction) as u64) >> 20 << 20
+    }
+
+    /// `--vmm-cache-min-free-mib` in bytes, or `None` when unset (the static budget from
+    /// [`Self::prefix_cache_cap_bytes`] is the only trim trigger, unchanged from before this
+    /// existed). See [`crate::memory::vmm::VmmKv::enable_pressure_eviction`].
+    pub(crate) fn vmm_cache_min_free_bytes(&self) -> Option<u64> {
+        let allow_env = !Self::is_initialized();
+        let mib: Option<u32> = if allow_env {
+            Self::env_parse("PLOW_VMM_CACHE_MIN_FREE_MIB").or(self.vmm_cache_min_free_mib)
+        } else {
+            self.vmm_cache_min_free_mib
+        };
+        mib.map(|mib| (mib as u64) << 20)
+    }
+
+    /// `--amd-prefix-fine-rows` / `PLOW_AMD_PREFIX_FINE_ROWS`, or `None` when unset (fine
+    /// matching off, the default). See [`crate::memory::vmm::VmmKv::enable_fine_matching`].
+    pub(crate) fn amd_prefix_fine_rows(&self) -> Option<u32> {
+        let allow_env = !Self::is_initialized();
+        if allow_env {
+            Self::env_parse("PLOW_AMD_PREFIX_FINE_ROWS").or(self.amd_prefix_fine_rows)
+        } else {
+            self.amd_prefix_fine_rows
+        }
     }
 
     #[cfg(feature = "cuda")]

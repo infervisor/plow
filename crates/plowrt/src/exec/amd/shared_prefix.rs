@@ -233,6 +233,13 @@ pub(super) struct SharedPrefix {
     pending: Vec<Vec<Attach>>,
     ops: Arc<dyn VmmOps>,
     deferred: Option<DeferredPublish>,
+    /// Sub-`block_rows` matching (`PLOW_AMD_PREFIX_FINE_ROWS`), 0 = off. One shared value
+    /// across every group — see [`VmmKv::enable_fine_matching`]'s doc for why it can't be
+    /// each group's own, possibly finer, native `block_rows`.
+    fine_rows: u32,
+    /// Use fine matching below this many rows; at or above it, every group's own native
+    /// `block_rows` path (unchanged) applies, exactly as before this existed.
+    fine_ceiling: u32,
 }
 
 struct DeferredPublish {
@@ -262,6 +269,11 @@ pub(super) fn attach_ranks<T>(
         ranks.iter_mut().map(|rank| cache(rank).attach_kept()).sum()
     } else {
         0
+    };
+    let evicted_before: (u64, u64) = if tick {
+        ranks.iter_mut().map(|rank| cache(rank).evicted()).fold((0, 0), |(n, s), (dn, ds)| (n + dn, s + ds))
+    } else {
+        (0, 0)
     };
     let mut attempted = 0;
     let (mut flush_ns, mut stage_ns, mut commit_ns) = (0u64, 0u64, 0u64);
@@ -307,8 +319,15 @@ pub(super) fn attach_ranks<T>(
             .map(|rank| cache(rank).attach_kept())
             .sum::<u64>()
             - kept_before;
+        let (nodes_evicted, snapshots_evicted) = {
+            let (n, s) = ranks
+                .iter_mut()
+                .map(|rank| cache(rank).evicted())
+                .fold((0, 0), |(n, s), (dn, ds)| (n + dn, s + ds));
+            (n - evicted_before.0, s - evicted_before.1)
+        };
         eprintln!(
-            "PFATTACH slot={slot} rows={} ranks={} flush={:.3} stage={:.3} commit={:.3} kept={kept}",
+            "PFATTACH slot={slot} rows={} ranks={} flush={:.3} stage={:.3} commit={:.3} kept={kept} nodes_evicted={nodes_evicted} snapshots_evicted={snapshots_evicted}",
             result.as_ref().map_or(0, |&rows| rows),
             ranks.len(),
             ms(flush_ns),
@@ -370,14 +389,39 @@ impl SharedPrefix {
             if crate::config::RuntimeConfig::get().vmm_deferred_reclaim() {
                 pool.enable_deferred_reclaim();
             }
+            if let Some(min_free) = crate::config::RuntimeConfig::get().vmm_cache_min_free_bytes() {
+                pool.enable_pressure_eviction(min_free);
+            }
             groups.push(Group { pool, tensors });
         }
+        // Every group, not just group 0 (see `copy_snapshot`'s `if group == 0` branch): group
+        // 0's own snapshot copies scale rows over `[0, rows)`, the clearest case, but the
+        // byte check found the SAME class of mismatch on kidx's own whole blocks too (its
+        // dedup is not immune just because its own tail copy is safe in isolation — a
+        // sequence that missed can still end up owning blocks another, still-live sequence's
+        // publish never validated against this one's live window). Always on: this is a
+        // correctness fix, not a performance knob.
+        for g in &mut groups {
+            g.pool.enable_strict_publish();
+        }
+        let (fine_rows, fine_ceiling) = match crate::config::RuntimeConfig::get().amd_prefix_fine_rows() {
+            Some(fine_rows) if fine_rows > 0 => {
+                let ceiling = groups.iter().map(|g| g.pool.block_rows()).max().unwrap_or(0);
+                for g in &mut groups {
+                    g.pool.enable_fine_matching(fine_rows, ceiling);
+                }
+                (fine_rows, ceiling)
+            }
+            _ => (0, 0),
+        };
         Ok(Self {
             groups,
             scales: layout.scales,
             pending: (0..layout.batch).map(|_| Vec::new()).collect(),
             ops,
             deferred: None,
+            fine_rows,
+            fine_ceiling,
         })
     }
 
@@ -427,6 +471,15 @@ impl SharedPrefix {
             .iter()
             .map(|g| g.pool.stats().blocks_attach_kept)
             .sum()
+    }
+
+    /// `(radix nodes evicted, boundary/fine snapshots evicted)`, summed across every cache
+    /// group — so eviction under the static `cache_cap` or `enable_pressure_eviction`'s real
+    /// free-memory floor is a number in the log, not an inference from the miss rate.
+    pub fn evicted(&self) -> (u64, u64) {
+        self.groups.iter().map(|g| g.pool.stats()).fold((0, 0), |(n, s), stats| {
+            (n + stats.nodes_evicted, s + stats.snapshots_evicted)
+        })
     }
 
     /// Private block mappings made by `ensure_rows` so far (one driver map each).
@@ -545,6 +598,86 @@ impl SharedPrefix {
         copied
     }
 
+    /// One fine chunk's snapshot size ([`VmmKv::publish_fine`]'s `chunk_bytes`, and
+    /// `Attach::snap_bytes`'s per-segment unit for the fine path). Unlike [`Self::
+    /// snapshot_bytes`], scales ARE chunked here (`fine_rows`, not the full `rows`): a fine
+    /// chunk has no physical block behind it to lean on, so its scale rows need the same
+    /// per-chunk sharing its KV rows get, not `snapshot_bytes`'s "whole prefix so far"
+    /// convention (which exists only because scales never get physical multi-mapping).
+    fn fine_snapshot_bytes(&self, group: usize) -> u64 {
+        let g = &self.groups[group];
+        let fine_rows = u64::from(self.fine_rows);
+        let cache_bytes: u64 = g.tensors.iter().map(|t| fine_rows * t.row_bytes).sum();
+        let scale_bytes: u64 = if group == 0 {
+            self.scales.iter().map(|t| fine_rows * t.row_bytes).sum()
+        } else {
+            0
+        };
+        (cache_bytes + scale_bytes).max(4)
+    }
+
+    /// [`Self::copy_snapshot`]'s fine-grained counterpart: exactly `fine_rows` rows starting
+    /// at `chunk_start`, not `copy_snapshot`'s `rows - (rows % block_rows)` (which assumes
+    /// the copy ends AT `rows`; a fine chunk's own range does not depend on where the
+    /// request's overall matched depth ends). Same per-tensor-then-scales layout and order
+    /// as `copy_snapshot`, so a chunk this creates is a valid segment for
+    /// `restore_fine_segments`.
+    fn copy_fine_chunk(&self, group: usize, slot: usize, chunk_start: u32, mut snapshot: u64, to_snapshot: bool) -> Result<()> {
+        let g = &self.groups[group];
+        let fine_rows = self.fine_rows;
+        let mut pairs = Vec::new();
+        let mut copy = |tensor: &CacheTensor, start: u32, count: u32| {
+            let bytes = u64::from(count) * tensor.row_bytes;
+            if bytes != 0 {
+                let address = tensor.base + slot as u64 * tensor.slot_bytes + u64::from(start) * tensor.row_bytes;
+                let (dst, src) = if to_snapshot { (snapshot, address) } else { (address, snapshot) };
+                pairs.push((dst, src, bytes));
+                snapshot += bytes;
+            }
+        };
+        for tensor in &g.tensors {
+            copy(tensor, chunk_start, fine_rows);
+        }
+        if group == 0 {
+            for tensor in &self.scales {
+                copy(tensor, chunk_start, fine_rows);
+            }
+        }
+        self.ops.copy_dtod_batch(&pairs)
+    }
+
+    /// Restore a fine-chain match (`Attach::segments`) into the live window: each segment is
+    /// one independently-owned chunk (built by [`Self::copy_fine_chunk`], possibly published
+    /// by a completely different request that happened to share this prefix), laid end to
+    /// end in row order — never one contiguous buffer the way `snap_va` is.
+    fn restore_fine_segments(&self, group: usize, slot: usize, segments: &[(u64, u64)]) -> Result<()> {
+        let g = &self.groups[group];
+        let fine_rows = u64::from(self.fine_rows);
+        let mut pairs = Vec::new();
+        let mut row_offset = 0u64;
+        for &(seg_va, _seg_bytes) in segments {
+            let mut cursor = seg_va;
+            let mut copy = |tensor: &CacheTensor, cursor: &mut u64| {
+                let bytes = fine_rows * tensor.row_bytes;
+                if bytes != 0 {
+                    let address = tensor.base + slot as u64 * tensor.slot_bytes + row_offset * tensor.row_bytes;
+                    pairs.push((address, *cursor, bytes));
+                    *cursor += bytes;
+                }
+            };
+            for tensor in &g.tensors {
+                copy(tensor, &mut cursor);
+            }
+            if group == 0 {
+                for tensor in &self.scales {
+                    copy(tensor, &mut cursor);
+                }
+            }
+            row_offset += fine_rows;
+        }
+        self.ops.copy_dtod_batch(&pairs)
+    }
+
     pub fn commit_attach(&mut self, slot: usize, rows: u32) -> Result<()> {
         self.flush_publish()?;
         if rows == 0
@@ -557,12 +690,22 @@ impl SharedPrefix {
         }
         self.ensure_rows(slot, rows + 1)?;
         for (group, attach) in self.pending[slot].iter().enumerate() {
-            if attach.snap_bytes != self.snapshot_bytes(group, rows) {
-                return Err(RuntimeError::Device(
-                    "prefix snapshot layout mismatch".into(),
-                ));
+            if attach.segments.is_empty() {
+                if attach.snap_bytes != self.snapshot_bytes(group, rows) {
+                    return Err(RuntimeError::Device(
+                        "prefix snapshot layout mismatch".into(),
+                    ));
+                }
+                self.copy_snapshot(group, slot, rows, attach.snap_va, false)?;
+            } else {
+                let expected = self.fine_snapshot_bytes(group) * attach.segments.len() as u64;
+                if attach.snap_bytes != expected {
+                    return Err(RuntimeError::Device(
+                        "prefix fine snapshot layout mismatch".into(),
+                    ));
+                }
+                self.restore_fine_segments(group, slot, &attach.segments)?;
             }
-            self.copy_snapshot(group, slot, rows, attach.snap_va, false)?;
         }
         for group in &self.groups {
             group.pool.finish_attach(slot);
@@ -581,14 +724,44 @@ impl SharedPrefix {
         if rows == 0 {
             return Ok(());
         }
+        // Resolve every group's orphaned-blocks hazard (see `Inner::strict_publish`) BEFORE
+        // any group publishes, not per-group and not stopping at the first: each group has
+        // its own block size and its own independent radix tree, so a hazard (or its
+        // resolution) on one says nothing about another. Run all of them regardless of
+        // whether an earlier one refused, so eviction still makes progress on every group
+        // this call — then refuse together: if even one group cannot be fully resolved, NO
+        // group may publish for this call, or the resolved ones publish snapshots at a depth
+        // the refusing one can never join (`stage_attach` requires every group to agree),
+        // pure wasted budget.
+        let mut hazard_ok = true;
+        for group in &self.groups {
+            if !group.pool.resolve_prefix_hazard(slot, prompt, rows) {
+                hazard_ok = false;
+            }
+        }
+        if !hazard_ok {
+            tracing::debug!(slot, rows, "amd: shared prefix publish refused (unresolved orphaned blocks in at least one group)");
+            return Ok(());
+        }
         for (index, group) in self.groups.iter().enumerate() {
-            group.pool.publish_at(
-                slot,
-                prompt,
-                rows,
-                self.snapshot_bytes(index, rows),
-                |snapshot| self.copy_snapshot(index, slot, rows, snapshot, true),
-            )?;
+            if self.fine_rows > 0 && rows < self.fine_ceiling {
+                let depth = rows / self.fine_rows;
+                if depth == 0 {
+                    continue;
+                }
+                let chunk_bytes = self.fine_snapshot_bytes(index);
+                group.pool.publish_fine(prompt, self.fine_rows, depth, chunk_bytes, |chunk, va| {
+                    self.copy_fine_chunk(index, slot, chunk * self.fine_rows, va, true)
+                })?;
+            } else {
+                group.pool.publish_at(
+                    slot,
+                    prompt,
+                    rows,
+                    self.snapshot_bytes(index, rows),
+                    |snapshot| self.copy_snapshot(index, slot, rows, snapshot, true),
+                )?;
+            }
         }
         Ok(())
     }

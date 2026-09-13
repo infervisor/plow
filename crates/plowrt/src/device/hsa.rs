@@ -148,6 +148,10 @@ const HSA_AMD_AGENT_INFO_COMPUTE_UNIT_COUNT: u32 = 0xA002;
 const HSA_AMD_AGENT_INFO_BDFID: u32 = 0xA006;
 const HSA_AMD_AGENT_INFO_DOMAIN: u32 = 0xA00F;
 const HSA_AMD_AGENT_INFO_NEAREST_CPU: u32 = 0xA113;
+/// Free bytes across every global pool this agent owns (`uint64_t`) — `hsa_ext_amd.h`'s
+/// `hsa_amd_agent_info_t`. Not a per-pool `hsa_amd_memory_pool_get_info` attribute: that enum
+/// has no "available" field, only `HSA_AMD_MEMORY_POOL_INFO_SIZE` (total capacity).
+const HSA_AMD_AGENT_INFO_MEMORY_AVAIL: u32 = 0xA015;
 const HSA_AGENT_INFO_NODE: u32 = 16;
 
 // hsa_region_segment_t
@@ -3701,6 +3705,27 @@ impl crate::memory::vmm::VmmOps for HsaBackend {
             ));
         }
         Ok(g as u64)
+    }
+
+    /// Backs [`crate::memory::vmm::VmmKv::enable_pressure_eviction`] on AMD: free bytes
+    /// across every global pool this agent owns, straight from the driver
+    /// (`HSA_AMD_AGENT_INFO_MEMORY_AVAIL`) — not a snapshot this process keeps itself, so it
+    /// reflects every other consumer of the device's VRAM too (model weights, the live KV
+    /// pool, other processes). Any query failure degrades to `None`, per the trait's
+    /// contract, rather than propagating an error: pressure eviction is a soft optimisation,
+    /// never a request-failing one.
+    fn free_bytes(&self) -> Option<u64> {
+        let mut avail: u64 = 0;
+        // SAFETY: out-pointer sized for the uint64_t attribute hsa_ext_amd.h declares.
+        let rc = unsafe {
+            (self.shared.drv.hsa_agent_get_info)(
+                self.agent,
+                HSA_AMD_AGENT_INFO_MEMORY_AVAIL,
+                &mut avail as *mut _ as *mut c_void,
+            )
+        };
+        self.check(rc, "hsa_agent_get_info(MEMORY_AVAIL)").ok()?;
+        Some(avail)
     }
 
     fn reserve(&self, bytes: u64) -> Result<u64> {

@@ -442,3 +442,124 @@ fn unmap_release_cost_range_unmap_and_concurrency() {
     }
     VmmOps::address_free(be, va, span);
 }
+
+/// `VmmOps::free_bytes` — what `VmmKv::enable_pressure_eviction` reads to decide whether
+/// there is real memory pressure (design-review-vllm-throughput.md §7 follow-up). Where the
+/// backend allows it (a real ROCr agent, gated like every other test here): the query must
+/// succeed, report a plausible number, and actually move when this process commits a
+/// sizeable physical block — proving it reads live device state, not a cached constant.
+#[test]
+fn free_bytes_is_live_and_moves_with_physical_allocation() {
+    if !gpu_enabled() {
+        eprintln!("skipped: set PLOW_GPU_TEST=1");
+        return;
+    }
+    let _env = common::env_guard();
+    let be = backend();
+    let gran = VmmOps::granularity(be).expect("granularity");
+
+    let free0 = VmmOps::free_bytes(be).expect("HSA_AMD_AGENT_INFO_MEMORY_AVAIL");
+    println!("free_bytes before: {free0} B ({} MiB)", free0 / MIB);
+    assert!(free0 > 0, "a live agent must have some free memory");
+    assert!(
+        free0 < 1u64 << 40,
+        "free_bytes {free0} B exceeds 1 TiB — implausible for a single agent, likely the \
+         wrong attribute or a garbage read"
+    );
+
+    // Commit (not just reserve) a big-enough physical block that its absence from `free0`
+    // is not noise: 1 GiB, rounded to a whole granule.
+    let big = (1u64 << 30) / gran * gran;
+    let va = VmmOps::reserve(be, big).expect("reserve");
+    let h = VmmOps::create(be, big).expect("create 1 GiB");
+    VmmOps::map(be, va, big, h).expect("map");
+    VmmOps::set_access(be, va, big).expect("set_access");
+
+    let free1 = VmmOps::free_bytes(be).expect("free_bytes after commit");
+    println!("free_bytes after committing {} MiB: {free1} B ({} MiB)", big / MIB, free1 / MIB);
+    assert!(
+        free1 + big / 2 <= free0,
+        "committing {big} B did not measurably reduce free_bytes ({free0} -> {free1}) — \
+         the query is not tracking live allocations"
+    );
+
+    VmmOps::unmap(be, va, big);
+    VmmOps::release(be, h);
+    VmmOps::address_free(be, va, big);
+}
+
+/// Probe (a') for design-review §7's sub-16384-row matching gap: does ROCr's vmem path
+/// actually accept and back a handle smaller than the recommended 2 MiB granule, or is that
+/// number a hard floor in practice regardless of what `hsa_ext_amd.h` calls it? 64/256/512
+/// KiB straddle the "one krot row is 128 B" arithmetic (256 KiB = 2048 krot rows, matching
+/// ckv's own 4096-row granularity at half size) without needing a GPU that supports anything
+/// exotic. Three questions per size: does create+map+set_access even succeed; does each
+/// handle's own window round-trip independently (not aliased into a shared rounded-up
+/// region); and — the one number that actually decides this — does `free_bytes` show VRAM
+/// consumption matching the REQUESTED size, or does the driver silently commit a full 2 MiB
+/// per handle regardless (in which case shrinking `block_hint` buys nothing and design
+/// option (c), not (a'), is the one to build).
+#[test]
+fn small_vmem_handles_probe_sub_granule_sharing() {
+    if !gpu_enabled() {
+        eprintln!("skipped: set PLOW_GPU_TEST=1");
+        return;
+    }
+    let _env = common::env_guard();
+    let be = backend();
+    let gran = VmmOps::granularity(be).expect("granularity");
+    println!("driver-recommended granule (REC_GRANULE): {gran} B ({} KiB)", gran >> 10);
+
+    for &size in &[64 * 1024u64, 256 * 1024, 512 * 1024] {
+        let n = 16u64;
+        let free_before = VmmOps::free_bytes(be).expect("free_bytes before");
+
+        let t = Instant::now();
+        let handles: Vec<u64> =
+            (0..n).map(|_| VmmOps::create(be, size).expect("create at sub-granule size")).collect();
+        let create_us = t.elapsed().as_secs_f64() * 1e6 / n as f64;
+
+        let va = VmmOps::reserve(be, size * n).expect("reserve");
+        let t = Instant::now();
+        for (i, &h) in handles.iter().enumerate() {
+            VmmOps::map(be, va + i as u64 * size, size, h)
+                .unwrap_or_else(|e| panic!("map at requested size {size} B (handle {i}): {e}"));
+            VmmOps::set_access(be, va + i as u64 * size, size).expect("set_access");
+        }
+        let map_us = t.elapsed().as_secs_f64() * 1e6 / n as f64;
+
+        // Independent addressability: a distinct pattern per handle, all round-tripped, none
+        // aliasing a neighbour — the failure mode if the driver rounded up and packed several
+        // requested handles into one real page/granule.
+        let probe_len = (size as usize).min(4096);
+        for i in 0..n {
+            let pattern: Vec<u8> = (0..probe_len).map(|b| ((b as u64 * 31 + i * 7 + 3) % 256) as u8).collect();
+            be.memcpy_htod(va + i * size, &pattern).expect("H2D");
+            let mut back = vec![0u8; probe_len];
+            d2h(be, va + i * size, &mut back);
+            assert_eq!(back, pattern, "handle {i} at size {size} B did not round-trip in isolation");
+        }
+
+        let free_after = VmmOps::free_bytes(be).expect("free_bytes after");
+        let consumed = free_before.saturating_sub(free_after);
+        let per_handle = consumed as f64 / n as f64;
+        println!(
+            "size={size:>7} B: create {create_us:.1} us/call, map+set_access {map_us:.1} us/call, \
+             VRAM consumed {per_handle:.0} B/handle (requested {size}, granule {gran})"
+        );
+
+        for i in 0..n {
+            VmmOps::unmap(be, va + i * size, size);
+        }
+        for h in handles {
+            VmmOps::release(be, h);
+        }
+        VmmOps::address_free(be, va, size * n);
+
+        assert!(
+            per_handle < gran as f64 * 1.5,
+            "size={size} B consumed {per_handle:.0} B/handle — indistinguishable from the \
+             {gran} B granule; sub-granule handles buy nothing here, build design option (c) instead"
+        );
+    }
+}

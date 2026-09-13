@@ -79,6 +79,14 @@ pub trait VmmOps: Send + Sync {
         Ok(())
     }
 
+    /// Free bytes on the underlying device right now, if the backend can report it cheaply
+    /// (a pool-info query, not a full sync). `None` (the default) means "unsupported" —
+    /// [`VmmKv::enable_pressure_eviction`]'s floor then has nothing to compare against and
+    /// `trim_cache` falls back to the static byte cap, unchanged from today.
+    fn free_bytes(&self) -> Option<u64> {
+        None
+    }
+
     /// Take every pooled physical chunk `(handle, bytes)` a previous
     /// [`VmmSlab`] kept via [`Self::pool_put`]. Re-mapping a pooled chunk is
     /// ~free (map+set_access, µs-class) where creating one pays the driver's
@@ -578,14 +586,22 @@ impl LiveKvLayout {
 }
 
 /// Result of a successful prefix attach.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Attach {
     /// Reused rows. Whole blocks are shared; a partial block is restored from the snapshot.
     pub rows: u32,
     /// Device VA of the boundary snapshot taken at `rows`; the engine owns
     /// its layout and restores the borrower's rings and partial full-KV block.
+    /// Meaningless when `segments` is non-empty (the fine-matching case) — use that instead.
     pub snap_va: u64,
     pub snap_bytes: u64,
+    /// Fine-chain restore ([`VmmKv::enable_fine_matching`]): `(va, bytes)` per matched
+    /// `fine_rows` chunk, in row order, each independently owned (they are NOT one
+    /// contiguous buffer like `snap_va`/`snap_bytes`, because they are shared/deduplicated
+    /// across sequences and may have been published by different, unrelated requests).
+    /// Empty for every ordinary attach — the only caller that populates it is
+    /// `try_attach_fine`.
+    pub segments: Vec<(u64, u64)>,
 }
 
 /// Point-in-time pool counters (tests, metrics, the perf campaign).
@@ -730,6 +746,12 @@ struct SlotSeq {
     prompt_rows: usize,
     held: usize,
     snapshot: Option<BoundaryKey>,
+    /// The fine-cache counterpart of `hashes`/`held` ([`try_attach_fine`]): held exactly the
+    /// same way, in the SEPARATE `fine_cache` radix tree, so `evict_one_fine` cannot evict a
+    /// node a live attach is reading between `try_attach_fine`'s lock and the copy that
+    /// happens after it. Empty/0 for every ordinary (native) attach.
+    fine_hashes: Vec<BlockHash>,
+    fine_held: usize,
 }
 
 /// A published boundary's sliding-window snapshot buffer.
@@ -769,6 +791,37 @@ struct Inner {
     next_pub: u32,
     seqs: Vec<SlotSeq>,
     stats: VmmStats,
+    /// Sub-`block_rows` matching ([`VmmKv::enable_fine_matching`]): 0 = off, the default.
+    /// The driver cannot back anything smaller than `block_rows` physically (measured,
+    /// `hsa_vmm.rs::small_vmem_handles_probe_sub_granule_sharing` — every requested size
+    /// consumed exactly one full granule), so content below it can only ever be SHARED via
+    /// small deduplicated copies, never multi-mapped; this is that copy path, chunked at
+    /// `fine_rows` instead of leaving everything below the floor one large private blob.
+    fine_rows: u32,
+    /// Use fine matching for any prompt shorter than this many rows; at or above it, the
+    /// ordinary `block_rows` path (unchanged) applies, matching every sibling group's own
+    /// native granularity again as it already does once content clears `block_rows` — see
+    /// [`VmmKv::enable_fine_matching`].
+    fine_ceiling: u32,
+    /// A second, independent radix tree at `fine_rows` granularity — never touches `cache`,
+    /// `node_blocks` or `published`, which stay exactly as they were for `block_rows`.
+    fine_cache: Option<PrefixCache>,
+    /// One small owned snapshot per fine node, keyed the same way `published` is
+    /// (`(pid, chunk index)` from whoever first published that exact content) — reusing
+    /// [`Snap`] as a plain, refcount-free "one shared copy of `fine_rows` rows" record.
+    /// `users`/`last_used`/`referenced`/`reusable_prompt` are unused here: fine chunks are
+    /// never evicted in this version (see the module note above `enable_fine_matching`), so
+    /// nothing needs pinning against a concurrent evictor.
+    fine_published: FxHashMap<Option<(u32, u32)>, Vec<Snap>>,
+    fine_next_pub: u32,
+    /// [`VmmKv::enable_strict_publish`]: off by default. Set on the one pool per
+    /// `SharedPrefix` whose snapshot carries per-row scales copied over `[0, rows)` rather
+    /// than just the tail (`SharedPrefix::copy_snapshot`'s `if group == 0` branch) — the only
+    /// place a stale/fresh mismatch across two different prefills of the same content is
+    /// observable, since every OTHER tensor's snapshot copy is tail-only and therefore always
+    /// freshly produced by whichever publish call is running, never re-copying rows already
+    /// covered by pre-existing (possibly differently-valued) whole blocks.
+    strict_publish: bool,
 }
 
 enum PublishLocked {
@@ -786,6 +839,12 @@ struct Shared {
     head_span: u64,
     /// Cache soft cap in bytes (0 = only OOM-driven eviction).
     cache_cap: u64,
+    /// Real-pressure floor in bytes (0 = off, the default): while positive AND
+    /// [`VmmOps::free_bytes`] reports a number, `trim_cache` evicts to keep free device
+    /// memory at or above this instead of consulting `cache_cap` at all — see
+    /// [`VmmKv::enable_pressure_eviction`]. Atomic: set once after construction, like
+    /// `pool_cap`, so `trim_cache` (which only ever borrows `&Shared`) can read it.
+    cache_min_free: AtomicU64,
     /// Max handles the reuse pool may hold (0 = pooling off, the default).
     /// Set once by [`VmmKv::enable_block_pool`]; atomic only so `deref_block`
     /// can read it without threading a config borrow through `Inner`.
@@ -906,6 +965,7 @@ impl VmmKv {
             bph,
             head_span,
             cache_cap,
+            cache_min_free: AtomicU64::new(0),
             pool_cap: AtomicU32::new(0),
             inner: Mutex::new(Inner {
                 tracks,
@@ -921,6 +981,12 @@ impl VmmKv {
                 next_pub: 0,
                 seqs: (0..batch).map(|_| SlotSeq::default()).collect(),
                 stats: VmmStats::default(),
+                fine_rows: 0,
+                fine_ceiling: 0,
+                fine_cache: None,
+                fine_published: FxHashMap::default(),
+                fine_next_pub: 0,
+                strict_publish: false,
             }),
             frontier: (0..batch).map(|_| AtomicU32::new(0)).collect(),
             generation: (0..batch).map(|_| AtomicU64::new(0)).collect(),
@@ -1061,6 +1127,19 @@ impl VmmKv {
         self.shared.pool_cap.store(cap_blocks, Ordering::Relaxed);
     }
 
+    /// Keep every published prefix (whole shared blocks and private boundary snapshots
+    /// alike) until the device is actually short on memory, instead of trimming as soon as
+    /// `cache_cap` bytes of cache are held. While `min_free_bytes > 0` and
+    /// [`VmmOps::free_bytes`] answers, `trim_cache` evicts LRU-first only enough to keep
+    /// free device memory at or above `min_free_bytes`, and does not consult `cache_cap` at
+    /// all — a backend that cannot report `free_bytes` (the default) makes this a no-op and
+    /// `trim_cache` keeps using `cache_cap`, so requesting pressure mode on an unsupported
+    /// backend degrades to today's behaviour rather than disabling eviction outright.
+    /// Off by default (`min_free_bytes == 0`): every existing caller is unaffected.
+    pub fn enable_pressure_eviction(&mut self, min_free_bytes: u64) {
+        self.shared.cache_min_free.store(min_free_bytes, Ordering::Relaxed);
+    }
+
     /// Take slot recycling off the caller's thread: [`Self::begin_seq`] keeps a
     /// private row-0 block in place and hands the rest of the window to the
     /// pool thread (see [`retire_window`]); zero-ref handles past the pool cap
@@ -1195,9 +1274,12 @@ impl VmmKv {
         }
         let _section = EngineSection::enter();
         let s = &self.shared;
+        let mut inner = s.inner.lock();
+        if inner.fine_rows > 0 && (prompt.len() as u64) < u64::from(inner.fine_ceiling) {
+            return try_attach_fine(&mut inner, seq, prompt);
+        }
         let hashes = hash_blocks(prompt, s.block_rows);
         let aligned = &prompt[..hashes.len() * s.block_rows as usize];
-        let mut inner = s.inner.lock();
 
         let m = inner.cache.lookup(&hashes, aligned);
         let mut chosen = None;
@@ -1224,6 +1306,7 @@ impl VmmKv {
                 prompt_rows: prompt.len(),
                 held: 0,
                 snapshot: None,
+                ..Default::default()
             };
             return Ok(None);
         };
@@ -1242,6 +1325,7 @@ impl VmmKv {
             prompt_rows: prompt.len(),
             held: pick,
             snapshot: Some(snap_key),
+            ..Default::default()
         };
         inner.snapshot_tick += 1;
         let tick = inner.snapshot_tick;
@@ -1251,7 +1335,7 @@ impl VmmKv {
         snap.last_used = tick;
         snap.referenced = true;
         snap.reusable_prompt = true;
-        let attach = Attach { rows, snap_va: snap.va, snap_bytes: snap.bytes };
+        let attach = Attach { rows, snap_va: snap.va, snap_bytes: snap.bytes, segments: Vec::new() };
 
         // COMMIT the whole attach under the lock — slot table, refcounts,
         // frontier — but only COLLECT the driver work. The map/set_access
@@ -1499,6 +1583,221 @@ impl VmmKv {
         }
     }
 
+    /// Turn sub-`block_rows` matching on ([`try_attach`](Self::try_attach) /
+    /// [`publish_fine`](Self::publish_fine)): below `ceiling` rows, share content at
+    /// `fine_rows`-row granularity instead of leaving it an unshareable private copy. Off by
+    /// default (`fine_rows == 0`, the no-op this method is never called with): every existing
+    /// caller of this crate is unaffected. See the field docs on `Inner::fine_rows` for why
+    /// this exists (the driver cannot back a physical block smaller than `block_rows`) and
+    /// [`SharedPrefix::new`](crate::exec::amd::shared_prefix::SharedPrefix::new) for why
+    /// `ceiling` must be the SAME value across every sibling group sharing one prompt, not
+    /// each group's own (possibly finer) native `block_rows`.
+    pub fn enable_fine_matching(&mut self, fine_rows: u32, ceiling: u32) {
+        if fine_rows == 0 {
+            return;
+        }
+        let mut inner = self.shared.inner.lock();
+        inner.fine_rows = fine_rows;
+        inner.fine_ceiling = ceiling;
+        inner.fine_cache = Some(
+            PrefixCache::new(
+                GrowablePool { base: 0, kv_factor: 1, kv_heads: 1, max_seqs: u32::MAX, head_slot_bytes: 1 << 32 },
+                fine_rows as u64,
+                1,
+            )
+            .expect("fine radix pool geometry"),
+        );
+    }
+
+    /// Refuse to `publish`/`publish_at` a new snapshot whenever the prefix's whole-block
+    /// lookup finds MORE pre-existing blocks than this sequence itself currently holds
+    /// (`SlotSeq::held`) — i.e. those extra blocks came from some other publish (a different
+    /// sequence sharing this prefix, or this same sequence's own earlier attempt whose
+    /// boundary snapshot was since evicted while its blocks lived on), so this sequence's own
+    /// live window for that range was not necessarily aliased to them and cannot be trusted
+    /// to reproduce their exact values. Off by default: only call this on a pool whose
+    /// snapshot copies rows it did not itself just write — see `Inner::strict_publish`'s doc
+    /// for why that is scales specifically, and only on one pool per `SharedPrefix`. A pool
+    /// with this OFF still publishes exactly as before this existed (a same-conversation
+    /// growing prefix, or a fresh sequence that legitimately attached first, is unaffected
+    /// either way, since `held` already covers `m.blocks` in both those cases).
+    pub fn enable_strict_publish(&mut self) {
+        self.shared.inner.lock().strict_publish = true;
+    }
+
+    /// Called by [`SharedPrefix::publish_rows`](crate::exec::amd::shared_prefix::SharedPrefix)
+    /// BEFORE publishing on a `strict_publish` pool, so the hazard `publish_locked` refuses on
+    /// (this sequence's own live window not aliased to some pre-existing whole-block range,
+    /// per `Inner::strict_publish`'s doc) does not leave that range permanently orphaned —
+    /// otherwise a busy shared prefix could stay uncacheable forever, since other paths keep
+    /// the tree warm enough that ordinary LRU pressure never reaches it. Evicts exactly the
+    /// orphaned suffix (`held..m.blocks`) via [`PrefixCache::evict_tail`] so the NEXT publish
+    /// for this prefix (very likely later in this SAME call, once `publish_locked` re-checks)
+    /// creates fresh blocks from this sequence's own prefill, scales included.
+    ///
+    /// Returns `false` only when eviction could not fully clear the orphaned range (a
+    /// concurrent sequence is attached partway through it) — the caller must then skip
+    /// publishing on every group for this call, not just this one, or the other groups would
+    /// publish snapshots this one can never join in a future attach (`stage_attach` requires
+    /// every group to agree). A no-op returning `true` unless `strict_publish` is on.
+    pub fn resolve_prefix_hazard(&self, seq: usize, tokens: &[u32], rows: u32) -> bool {
+        let s = &self.shared;
+        let mut inner = s.inner.lock();
+        if !inner.strict_publish || rows as usize > tokens.len() {
+            return true;
+        }
+        let hashes = hash_blocks(&tokens[..rows as usize], s.block_rows);
+        let held = inner.seqs[seq].held;
+        let m = inner.cache.lookup(&hashes, tokens);
+        inner.cache.release(&hashes, m.blocks);
+        if m.blocks <= held {
+            return true;
+        }
+        let orphaned = m.blocks - held;
+        let evicted = inner.cache.evict_tail(&hashes, m.blocks, held);
+        let evicted_count = evicted.len();
+        for key in evicted {
+            if let Some(ids) = inner.node_blocks.remove(&key) {
+                inner.stats.cache_blocks -= ids.len() as u64;
+                inner.stats.cache_bytes -= ids.len() as u64 * s.block_bytes;
+                for id in ids {
+                    deref_block(s, &mut inner, id);
+                }
+            }
+            if let Some(snapshots) = inner.published.remove(&Some(key)) {
+                for snap in snapshots {
+                    free_snapshot(s, &mut inner, snap);
+                }
+            }
+            inner.stats.nodes_evicted += 1;
+        }
+        // Re-check: eviction may have stopped early (a referenced node in the way, e.g. a
+        // still-live sequence's own decode — never force-evictable, since its live window
+        // may still be multi-mapped to that exact block; overwriting it is `commit_map`'s
+        // territory, not this).
+        let m = inner.cache.lookup(&hashes, tokens);
+        inner.cache.release(&hashes, m.blocks);
+        let resolved = m.blocks <= held;
+        tracing::debug!(
+            seq,
+            rows,
+            held,
+            orphaned_blocks = orphaned,
+            evicted = evicted_count,
+            remaining_referenced = m.blocks.saturating_sub(held),
+            resolved,
+            "amd: shared prefix strict-publish hazard"
+        );
+        resolved
+    }
+
+    /// Publish up to `depth` fine-grained (`fine_rows`-row) chunks of `tokens`, for
+    /// [`try_attach`](Self::try_attach)'s fine-matching fallback. Deduplicated: a chunk whose
+    /// content already exists under an earlier publish (this sequence's own, or any other
+    /// one sharing the same prefix) is left alone — `fill` is called only for genuinely new
+    /// chunks, the same copy-on-write point [`PrefixCache::insert`] documents for whole
+    /// blocks. `fill(chunk_index, va)` must copy exactly `chunk_bytes` of that chunk's rows
+    /// into `va`. No-op unless [`Self::enable_fine_matching`] was called (`fine_rows == 0`).
+    pub fn publish_fine(
+        &self,
+        tokens: &[u32],
+        fine_rows: u32,
+        depth: u32,
+        chunk_bytes: u64,
+        mut fill: impl FnMut(u32, u64) -> Result<()>,
+    ) -> Result<()> {
+        if !self.prefix_reuse || depth == 0 || fine_rows == 0 {
+            return Ok(());
+        }
+        let s = &self.shared;
+        let rows = depth as usize * fine_rows as usize;
+        if rows > tokens.len() {
+            return Ok(());
+        }
+        let hashes = hash_blocks(&tokens[..rows], fine_rows);
+        if hashes.len() != depth as usize {
+            return Ok(());
+        }
+
+        // Phase 1 (locked): how much of this chain already exists? Mirrors `publish_at`'s own
+        // two-phase shape — never allocate or run `fill` (device I/O) while holding the lock.
+        let existing = {
+            let mut inner = s.inner.lock();
+            let Some(cache) = inner.fine_cache.as_mut() else {
+                return Ok(());
+            };
+            let m = cache.lookup(&hashes, tokens);
+            cache.release(&hashes, m.blocks);
+            m.blocks
+        };
+        if existing >= depth as usize {
+            return Ok(()); // every chunk this call would publish is already shared
+        }
+
+        // Phase 2 (unlocked): allocate + fill only the new chunks.
+        let mut new_snaps = Vec::with_capacity(depth as usize - existing);
+        for idx in existing..depth as usize {
+            let va = alloc_snapshot(s, chunk_bytes)?;
+            if let Err(error) = fill(idx as u32, va) {
+                s.ops.free(va);
+                for &(_, prior_va) in &new_snaps {
+                    s.ops.free(prior_va);
+                }
+                return Err(error);
+            }
+            new_snaps.push((idx, va));
+        }
+
+        // Phase 3 (locked): commit. Two publishers of the SAME prefix can race here (unlike
+        // `publish_at`'s single owning sequence, a fine chunk is meant to be shared by many
+        // sequences at once) — re-check under the lock and free any allocation this call made
+        // that a concurrent publish already covered, rather than leak or double-insert it.
+        let mut inner = s.inner.lock();
+        let Some(cache) = inner.fine_cache.as_mut() else {
+            for &(_, va) in &new_snaps {
+                s.ops.free(va);
+            }
+            return Ok(());
+        };
+        let m = cache.lookup(&hashes, tokens);
+        let start = m.blocks;
+        cache.release(&hashes, start);
+        inner.fine_next_pub += 1;
+        let pid = inner.fine_next_pub;
+        let cache = inner.fine_cache.as_mut().unwrap();
+        let n_ok = cache.insert(&hashes, tokens, pid, start);
+        // `insert` leaves refcount 1 on every node it just created, "held by the inserting
+        // sequence" (its doc) — meaning THIS publish call, which is not an attach and does
+        // not itself read from these nodes afterward. Drop it immediately: unlike
+        // `try_attach_fine`, which holds until its copy is done, a publish has nothing left
+        // to protect, and an unreleased ref would pin every fine node forever (nothing could
+        // ever evict them).
+        cache.release(&hashes[..n_ok], n_ok);
+        for (idx, va) in new_snaps {
+            if idx < start || idx >= n_ok {
+                s.ops.free(va); // raced: a concurrent publish already covers this index
+                continue;
+            }
+            inner.fine_published.entry(Some((pid, idx as u32))).or_default().push(Snap {
+                va,
+                bytes: chunk_bytes,
+                rows: fine_rows,
+                tail: Vec::new(),
+                users: 0,
+                last_used: 0,
+                referenced: false,
+                reusable_prompt: false,
+            });
+            // Counts toward the same budget whole blocks and boundary snapshots do, so
+            // `trim_cache` (both the static `cache_cap` and pressure-eviction branches) sees
+            // fine chunks too, and `evict_one_fine` can reclaim them under real pressure.
+            inner.stats.cache_bytes += chunk_bytes;
+            inner.stats.snapshot_bytes += chunk_bytes;
+        }
+        trim_cache(s, &mut inner);
+        Ok(())
+    }
+
     pub fn stats(&self) -> VmmStats {
         stats_of(&self.shared)
     }
@@ -1569,6 +1868,25 @@ fn publish_locked(
     let tail = &tokens[n_pub * s.block_rows as usize..rows as usize];
 
     let m = inner.cache.lookup(&hashes, tokens);
+    // Scale/KV consistency hazard: if the lookup finds MORE pre-existing whole blocks than
+    // this sequence itself is currently attached to (`held`, unmodified since the `try_attach`
+    // that started this request), those extra blocks came from some OTHER publish — a
+    // different request sharing this prefix, or this same request's own earlier attempt
+    // whose boundary snapshot was since evicted while its blocks lived on (`evict_one`'s
+    // snapshot-only fallback can do exactly that). This sequence's own live window for that
+    // extra range was therefore independently (re)computed, not aliased to those blocks via
+    // an attach, so its bytes cannot be trusted to match what is already cached there —
+    // scales in particular are copied wholesale from `[0, rows)` on every publish
+    // (`SharedPrefix::copy_snapshot`), so a mismatched new snapshot here would pair the OLD
+    // blocks' FP8 values with THIS prefill's scales. Decline to publish rather than risk
+    // that: a missed cache opportunity, never a wrong one. (When `held == m.blocks`, this
+    // sequence's own live window for the whole matched range came from an attach to exactly
+    // these blocks, or created them itself in an earlier chunk of this same publish — always
+    // consistent; same-conversation growth across turns is exactly that case.)
+    if inner.strict_publish && m.blocks > inner.seqs[seq].held {
+        inner.cache.release(&hashes, m.blocks);
+        return Ok(PublishLocked::Done { unused_snapshot: snapshot });
+    }
     let matched_key = if n_pub == 0 {
         Some(None)
     } else if n_pub <= m.blocks {
@@ -1620,6 +1938,7 @@ fn publish_locked(
         hashes,
         held: n_pub,
         snapshot: None,
+        ..Default::default()
     };
 
     let bkey = if n_pub == 0 {
@@ -1656,6 +1975,79 @@ fn publish_locked(
 
     trim_cache(s, inner);
     Ok(PublishLocked::Done { unused_snapshot })
+}
+
+/// [`VmmKv::try_attach`]'s fallback for `prompt.len() < fine_ceiling` — see
+/// `Inner::fine_rows`. Matches the longest EXACT multiple of `fine_rows`; a shorter,
+/// unaligned remainder is left for prefill to recompute, the same boundary quantisation
+/// [`hash_blocks`]'s own doc already accepts for whole `block_rows` blocks. No refcounting:
+/// fine snapshots are never evicted in this version (a documented limitation, not a
+/// correctness gap — nothing frees them out from under a concurrent reader), so there is
+/// nothing to pin.
+fn try_attach_fine(inner: &mut Inner, seq: usize, prompt: &[u32]) -> Result<Option<Attach>> {
+    let fine_rows = inner.fine_rows;
+    let miss = |inner: &mut Inner| {
+        inner.stats.attach_misses += 1;
+        inner.seqs[seq] = SlotSeq {
+            hashes: Vec::new(),
+            tokens: prompt.to_vec(),
+            prompt_rows: prompt.len(),
+            held: 0,
+            snapshot: None,
+            fine_hashes: Vec::new(),
+            fine_held: 0,
+        };
+    };
+    let Some(cache) = inner.fine_cache.as_mut() else {
+        miss(inner);
+        return Ok(None);
+    };
+    let hashes = hash_blocks(prompt, fine_rows);
+    let aligned = &prompt[..hashes.len() * fine_rows as usize];
+    let m = cache.lookup(&hashes, aligned); // bumps refs for m.blocks nodes: pins them against evict_one_fine
+
+    let mut segments = Vec::with_capacity(m.blocks);
+    for i in 0..m.blocks {
+        match inner.fine_published.get(&Some(m.placed[i])).and_then(|v| v.first()) {
+            Some(snap) => segments.push((snap.va, snap.bytes)),
+            None => break, // an evicted node: everything past it is untrusted, stop here
+        }
+    }
+    let pick = segments.len();
+    let rows = pick as u32 * fine_rows;
+
+    // Release refs on whatever we are NOT keeping (mirrors the native path's own
+    // `if pick < m.blocks` dance) — a real device copy happens later, outside this lock
+    // (`SharedPrefix::commit_attach` → `restore_fine_segments`), so anything kept must stay
+    // pinned until `release_prefix_hold` runs, or a concurrent `evict_one_fine` could free
+    // the very snapshot mid-copy.
+    if pick < m.blocks {
+        cache.release(&hashes, m.blocks);
+        if pick > 0 {
+            let again = cache.lookup(&hashes[..pick], aligned);
+            debug_assert_eq!(again.blocks, pick);
+        }
+    }
+    if rows == 0 || (rows as usize) >= prompt.len() {
+        if pick > 0 {
+            cache.release(&hashes[..pick], pick);
+        }
+        miss(inner);
+        return Ok(None);
+    }
+    inner.stats.attach_hits += 1;
+    inner.stats.tokens_attached += rows as u64;
+    let snap_bytes = segments.iter().map(|&(_, b)| b).sum();
+    inner.seqs[seq] = SlotSeq {
+        hashes: Vec::new(),
+        tokens: prompt.to_vec(),
+        prompt_rows: prompt.len(),
+        held: 0,
+        snapshot: None,
+        fine_hashes: hashes[..pick].to_vec(),
+        fine_held: pick,
+    };
+    Ok(Some(Attach { rows, snap_va: 0, snap_bytes, segments }))
 }
 
 fn stats_of(s: &Shared) -> VmmStats {
@@ -1835,6 +2227,21 @@ fn install_block(inner: &mut Inner, block: Block) -> u32 {
 }
 
 fn trim_cache(s: &Shared, inner: &mut Inner) {
+    let min_free = s.cache_min_free.load(Ordering::Relaxed);
+    if min_free > 0 {
+        if let Some(mut free) = s.ops.free_bytes() {
+            // Real pressure only: a backend that can answer this is authoritative, so
+            // `cache_cap` is not consulted at all while this branch runs — that is the
+            // point (evict on demand, not on a fixed count of cached bytes).
+            while free < min_free {
+                if !evict_one(s, inner, true) {
+                    break;
+                }
+                free = s.ops.free_bytes().unwrap_or(u64::MAX);
+            }
+            return;
+        }
+    }
     while s.cache_cap > 0 && inner.stats.cache_bytes > s.cache_cap {
         if !evict_one(s, inner, true) {
             break;
@@ -1847,6 +2254,20 @@ fn release_snapshot_hold(inner: &mut Inner, seq: usize) {
         let snap = inner.published.get_mut(&key.node).unwrap()
             .iter_mut().find(|snap| snap.va == key.va).unwrap();
         snap.users -= 1;
+    }
+    // The fine-chain counterpart: like the snapshot hold above (not like the native radix
+    // `held`/`hashes` below, which `release_prefix_hold` keeps for the whole request because
+    // whole blocks stay multi-mapped into the live window) — fine segments are copied ONCE,
+    // synchronously, and the live window is independent of them afterward, so the hold only
+    // needs to survive until that copy finishes, i.e. exactly as long as a snapshot's `users`
+    // ref does. `mem::take` makes this idempotent: `finish_attach` runs it right after the
+    // copy, and `release_prefix_hold`'s later call (below) is then a no-op.
+    let fine_held = std::mem::take(&mut inner.seqs[seq].fine_held);
+    if fine_held > 0 {
+        let fine_hashes = std::mem::take(&mut inner.seqs[seq].fine_hashes);
+        if let Some(cache) = inner.fine_cache.as_mut() {
+            cache.release(&fine_hashes, fine_held);
+        }
     }
 }
 
@@ -1866,8 +2287,38 @@ fn free_snapshot(s: &Shared, inner: &mut Inner, snap: Snap) {
     s.ops.free(snap.va);
 }
 
+/// Fine-cache eviction ([`VmmKv::enable_fine_matching`]): the cheapest tier, no physical
+/// block behind it, so `evict_one` tries this first. Driven entirely by `fine_cache`'s own
+/// LRU (`PrefixCache::evict_lru` only picks a zero-ref LEAF, so a node a live attach is still
+/// reading, or an ancestor of one, cannot be picked — the same guarantee the native path
+/// leans on for `inner.cache`); this function only reacts to that choice by freeing the
+/// backing [`Snap`] it names. `Snap::users` is unused here (always 0): the radix ref IS the
+/// protection, held via `SlotSeq::fine_hashes`/`fine_held` until `release_snapshot_hold`.
+fn evict_one_fine(s: &Shared, inner: &mut Inner) -> bool {
+    let Some(cache) = inner.fine_cache.as_mut() else {
+        return false;
+    };
+    let Some(key) = cache.evict_lru() else {
+        return false;
+    };
+    if let Some(snapshots) = inner.fine_published.remove(&Some(key)) {
+        for snap in snapshots {
+            free_snapshot(s, inner, snap);
+        }
+        inner.stats.nodes_evicted += 1;
+        return true;
+    }
+    // A radix node with no backing snapshot: already reclaimed some other way, or never
+    // filled (should not happen by construction, but evicting the dangling node itself —
+    // already done by `evict_lru` above — is enough to make progress either way).
+    true
+}
+
 /// Reclaim output snapshots first, then LRU cache entries. `false` when pinned.
 fn evict_one(s: &Shared, inner: &mut Inner, preserve_hot: bool) -> bool {
+    if evict_one_fine(s, inner) {
+        return true;
+    }
     // Output-only boundaries cannot replay the original prompt. Reclaim them
     // before removing prompt snapshots or the KV blocks those snapshots need.
     if let Some((node, index)) = inner.published.iter()
@@ -2874,6 +3325,10 @@ mod tests {
         strict: std::sync::atomic::AtomicBool,
         mapped: std::sync::Mutex<std::collections::HashSet<u64>>,
         violations: AtomicU64,
+        /// [`VmmOps::free_bytes`] override for pressure-eviction tests. `None` (the
+        /// default) reproduces every real backend today: pressure mode reports
+        /// "unsupported" and `trim_cache` falls back to `cache_cap`.
+        free_bytes: std::sync::Mutex<Option<u64>>,
     }
 
     impl VmmOps for MockVmm {
@@ -2941,6 +3396,9 @@ mod tests {
         }
         fn copy_dtod(&self, _dst: u64, _src: u64, _bytes: u64) -> Result<()> {
             Ok(())
+        }
+        fn free_bytes(&self) -> Option<u64> {
+            *self.free_bytes.lock().unwrap()
         }
         fn pool_take(&self) -> Vec<(u64, u64)> {
             std::mem::take(&mut *self.pool.lock().unwrap())
@@ -3533,6 +3991,97 @@ mod tests {
         assert_eq!(p.mapped_rows(1), 8);
     }
 
+    /// The scale/KV desync hazard: a snapshot evicted while its whole blocks survive must
+    /// never be silently replaced by a later, unrelated publish's own (possibly
+    /// differently-valued) snapshot at the same node identity — that would pair the OLD
+    /// blocks with a NEW snapshot's per-row scales/tail, computed by a DIFFERENT prefill run.
+    #[test]
+    fn publish_declines_to_replace_a_snapshot_whose_blocks_it_did_not_attach_to() {
+        let ops = Arc::new(MockVmm::default());
+        let mut p = pool(ops.clone());
+        p.enable_strict_publish();
+        let a = prompt(17);
+        // seq 0: cold miss, publish -> 2 whole blocks (block_rows=8) plus a boundary snapshot.
+        p.try_attach(0, &a).unwrap();
+        p.ensure_rows(0, 17).unwrap();
+        p.publish(0, &a, 192, |_| Ok(())).unwrap();
+        assert!(ops.allocs.load(Ordering::SeqCst) > 0, "the first publish must allocate a snapshot");
+
+        // Surgically evict just the snapshot, leaving the (still node_blocks-referenced)
+        // whole blocks in place -- simulating exactly what `evict_one`'s snapshot-only
+        // fallback can do under pressure, without engineering the full eviction-order dance.
+        {
+            let mut inner = p.shared.inner.lock();
+            let node = inner.published.keys().next().copied().expect("a snapshot was published");
+            remove_snapshot(&p.shared, &mut inner, node, 0);
+            assert!(inner.published.get(&node).is_none_or(|v| v.is_empty()));
+            assert!(!inner.node_blocks.is_empty(), "blocks must still be cached");
+        }
+
+        // A fresh sequence on the same content now misses -- blocks exist but no snapshot
+        // survives at any depth. That is today's accepted, separate behaviour (stranded
+        // blocks), not the bug this test targets.
+        assert!(p.try_attach(1, &a).unwrap().is_none());
+        p.ensure_rows(1, 17).unwrap();
+
+        // seq 1 re-prefills independently (it missed) and republishes the identical content.
+        // Before the fix this would happily create a new snapshot at the SAME node identity
+        // sourced from seq 1's own live window; the fix must decline before ever touching the
+        // `fill` closure (a device copy), not merely discard its result afterward.
+        let allocs_before = ops.allocs.load(Ordering::SeqCst);
+        p.publish(1, &a, 192, |_| panic!("must not fill a snapshot for this hazard")).unwrap();
+        assert_eq!(
+            ops.allocs.load(Ordering::SeqCst), allocs_before,
+            "declined: no new snapshot allocated over blocks this sequence did not itself attach to"
+        );
+    }
+
+    /// The recovery path `SharedPrefix::publish_rows` uses: resolving the hazard before
+    /// republishing evicts the orphaned blocks, so THIS SAME publish (not some later one)
+    /// creates a fresh, consistent snapshot immediately — a busy prefix must not stay
+    /// uncacheable forever just because ordinary LRU pressure never reaches an orphaned path
+    /// that other, unrelated paths keep the tree warm around. A third sequence then attaches
+    /// successfully on the very first try: at most one miss (seq 1's) after the eviction.
+    #[test]
+    fn resolve_prefix_hazard_lets_a_republish_succeed_immediately() {
+        let ops = Arc::new(MockVmm::default());
+        let mut p = pool(ops.clone());
+        p.enable_strict_publish();
+        let a = prompt(17);
+        p.try_attach(0, &a).unwrap();
+        p.ensure_rows(0, 17).unwrap();
+        p.publish(0, &a, 192, |_| Ok(())).unwrap();
+        // Release seq 0's own hold (as a real request completing / its slot recycling would):
+        // the orphaned blocks must be UNREFERENCED for eviction to be safe at all.
+        p.release_prefix(0);
+
+        {
+            let mut inner = p.shared.inner.lock();
+            let node = inner.published.keys().next().copied().expect("a snapshot was published");
+            remove_snapshot(&p.shared, &mut inner, node, 0);
+        }
+        assert!(p.try_attach(1, &a).unwrap().is_none(), "blocks survive but no snapshot: today's accepted miss");
+        p.ensure_rows(1, 17).unwrap();
+
+        assert!(
+            p.resolve_prefix_hazard(1, &a, 16),
+            "nothing else references the orphaned blocks: eviction must fully succeed"
+        );
+
+        let mut filled = false;
+        p.publish(1, &a, 192, |_| {
+            filled = true;
+            Ok(())
+        })
+        .unwrap();
+        assert!(filled, "hazard resolved: this publish must create a fresh snapshot from seq 1's own prefill");
+
+        // `pool`'s test geometry has `batch: 2` (only slots 0/1 exist); slot 0 is free again
+        // (its hold was released above), so reuse it for the third, independent attacher.
+        let attach = p.try_attach(0, &a).unwrap();
+        assert!(attach.is_some(), "a third sequence attaches on the first try: blocks and snapshot are both from seq 1's prefill now");
+    }
+
     #[test]
     fn cache_budget_includes_boundary_snapshots() {
         let ops = Arc::new(MockVmm::default());
@@ -3578,6 +4127,212 @@ mod tests {
         assert!(p.stats().cache_bytes <= 448);
         assert_eq!(p.stats().snapshot_bytes, 192);
         assert_eq!(ops.frees.load(Ordering::SeqCst), 1);
+    }
+
+    /// The direct proof for the eviction-policy ask: a cache soft cap that would ordinarily
+    /// trim a fresh publish is not consulted at all once pressure mode is on and the device
+    /// reports ample free memory — the entry is KEPT, not dropped at a fixed byte count.
+    #[test]
+    fn pressure_eviction_keeps_entries_the_static_cap_would_have_trimmed() {
+        let ops = Arc::new(MockVmm::default());
+        let mut p = pool_with_cap(ops.clone(), 64); // one block's worth: trips on the first publish
+        p.enable_pressure_eviction(500);
+        *ops.free_bytes.lock().unwrap() = Some(1 << 30); // far above the floor: no real pressure
+        let a = prompt(17);
+        p.try_attach(0, &a).unwrap();
+        p.ensure_rows(0, 17).unwrap();
+        p.publish(0, &a, 192, |_| Ok(())).unwrap();
+        p.begin_seq(0);
+        assert_eq!(p.stats().cache_bytes, 448, "cache_cap=64 must not fire while pressure mode reports ample free memory");
+        assert_eq!(ops.frees.load(Ordering::SeqCst), 0);
+    }
+
+    /// The other half: pressure mode evicts even when the static cap is nowhere close,
+    /// because it is real free memory — not `cache_bytes` — that trim_cache now watches.
+    #[test]
+    fn pressure_eviction_evicts_below_the_static_cap_when_memory_is_short() {
+        let ops = Arc::new(MockVmm::default());
+        let mut p = pool_with_cap(ops.clone(), 1 << 20); // cap alone would never trip here
+        p.enable_pressure_eviction(500);
+        *ops.free_bytes.lock().unwrap() = Some(100); // already short of the 500-byte floor
+        let a = prompt(17);
+        p.try_attach(0, &a).unwrap();
+        p.ensure_rows(0, 17).unwrap();
+        p.publish(0, &a, 192, |_| Ok(())).unwrap();
+        p.begin_seq(0);
+        assert_eq!(p.stats().cache_bytes, 0, "a scarce-memory report must evict although cache_cap was nowhere near its limit");
+        assert_eq!(ops.frees.load(Ordering::SeqCst), 1);
+    }
+
+    /// A backend that cannot answer `free_bytes` (every real one, today) must not silently
+    /// disable eviction just because pressure mode was requested: `trim_cache` falls back to
+    /// `cache_cap`, unchanged from before this feature existed.
+    #[test]
+    fn pressure_eviction_without_backend_support_falls_back_to_the_static_cap() {
+        let ops = Arc::new(MockVmm::default());
+        let mut p = pool_with_cap(ops.clone(), 64);
+        p.enable_pressure_eviction(500); // requested, but MockVmm::free_bytes defaults to None
+        let a = prompt(17);
+        p.try_attach(0, &a).unwrap();
+        p.ensure_rows(0, 17).unwrap();
+        p.publish(0, &a, 192, |_| Ok(())).unwrap();
+        p.begin_seq(0);
+        assert!(p.stats().cache_bytes <= 64, "no free_bytes support: must fall back to trimming by cache_cap");
+        assert_eq!(ops.frees.load(Ordering::SeqCst), 1);
+    }
+
+    /// Sub-`block_rows` matching ([`VmmKv::enable_fine_matching`]) — the direct test for
+    /// design-review-vllm-throughput.md §7's cross-conversation system-prompt case. Two
+    /// sequences share the first `fine_rows`-multiple depth of their content and diverge
+    /// after it; the SECOND must attach the shared depth even though NEITHER prompt ever
+    /// reaches the test pool's own `block_rows` (8) — the whole point of this mechanism.
+    #[test]
+    fn fine_matching_shares_a_common_prefix_below_the_physical_floor() {
+        let ops = Arc::new(MockVmm::default());
+        let mut p = pool(ops);
+        p.enable_fine_matching(2, 100); // ceiling far above every prompt below, and above block_rows=8
+        let shared = prompt(6); // 3 fine chunks of 2
+        let mut a = shared.clone();
+        a.extend(prompt(9).into_iter().map(|t| t + 1000)); // diverges after row 6
+        p.try_attach(0, &a).unwrap(); // cold miss: nothing published yet
+        p.publish_fine(&a, 2, 3, 8, |_, _| Ok(())).unwrap(); // 3 chunks x 2 rows = 6 rows shared
+
+        let mut b = shared;
+        b.extend(prompt(9).into_iter().map(|t| t + 2000)); // a DIFFERENT divergence
+        let attach = p.try_attach(1, &b).unwrap().expect("shares the first 6 rows with `a`");
+        assert_eq!(attach.rows, 6);
+        assert_eq!(attach.segments.len(), 3);
+        assert_eq!(attach.snap_bytes, 3 * 8);
+    }
+
+    /// A 9-chunk chain (mirroring 9,216 = 9 x 1,024 in the real deployment) well past the
+    /// test pool's own native `block_rows` (8) — proving fine matching's depth is bounded
+    /// only by `fine_ceiling`, not by any sibling native granularity.
+    #[test]
+    fn fine_matching_matches_a_nine_chunk_chain_past_the_native_block_size() {
+        let ops = Arc::new(MockVmm::default());
+        let mut p = pool(ops);
+        p.enable_fine_matching(2, 100);
+        let shared = prompt(18); // 9 fine chunks of 2, far past block_rows=8
+        let mut a = shared.clone();
+        a.push(999);
+        p.try_attach(0, &a).unwrap();
+        p.publish_fine(&a, 2, 9, 8, |_, _| Ok(())).unwrap();
+
+        let mut b = shared;
+        b.push(111);
+        let attach = p.try_attach(1, &b).unwrap().expect("shares all 18 rows");
+        assert_eq!(attach.rows, 18);
+        assert_eq!(attach.segments.len(), 9);
+    }
+
+    /// The remainder past the longest matched EXACT multiple of `fine_rows` is left for
+    /// prefill, the same boundary quantisation `hash_blocks`'s own doc accepts for whole
+    /// `block_rows` blocks — not a bug, a deliberately bounded scope (see
+    /// `try_attach_fine`'s doc).
+    #[test]
+    fn fine_matching_does_not_credit_a_partial_final_chunk() {
+        let ops = Arc::new(MockVmm::default());
+        let mut p = pool(ops);
+        p.enable_fine_matching(2, 100);
+        let shared = prompt(6);
+        let mut a = shared.clone();
+        a.push(1); // row 6: an extra row NOT aligned to another fine chunk
+        a.push(2);
+        p.try_attach(0, &a).unwrap();
+        p.publish_fine(&a, 2, 3, 8, |_, _| Ok(())).unwrap(); // only the aligned 6 rows published
+
+        let mut b = shared;
+        b.push(9); // diverges at row 6, same as `a` up to there
+        b.push(9);
+        let attach = p.try_attach(1, &b).unwrap().expect("the aligned 6-row prefix still matches");
+        assert_eq!(attach.rows, 6, "must not credit rows 6-7, published only as part of an unaligned remainder");
+    }
+
+    /// Dedup: two sequences publishing the IDENTICAL shared prefix must not double-allocate
+    /// — the copy-on-write point [`crate::memory::prefix::PrefixCache::insert`] documents for
+    /// whole blocks applies here too.
+    #[test]
+    fn fine_matching_deduplicates_across_publishers() {
+        let ops = Arc::new(MockVmm::default());
+        let mut p = pool(ops.clone());
+        p.enable_fine_matching(2, 100);
+        let shared = prompt(6);
+        let mut a = shared.clone();
+        a.push(1);
+        p.try_attach(0, &a).unwrap();
+        p.publish_fine(&a, 2, 3, 8, |_, _| Ok(())).unwrap();
+        assert_eq!(ops.allocs.load(Ordering::SeqCst), 3, "3 new chunks");
+
+        let mut b = shared;
+        b.push(2);
+        p.try_attach(1, &b).unwrap();
+        p.publish_fine(&b, 2, 3, 8, |_, _| Ok(())).unwrap();
+        assert_eq!(
+            ops.allocs.load(Ordering::SeqCst), 3,
+            "publishing the identical 3-chunk prefix again must allocate nothing new"
+        );
+    }
+
+    /// Off by default: without `enable_fine_matching`, `publish_fine` is a pure no-op and
+    /// `try_attach` never takes the fine branch — every existing caller of this crate is
+    /// unaffected by this feature existing.
+    #[test]
+    fn fine_matching_off_by_default_is_a_no_op() {
+        let ops = Arc::new(MockVmm::default());
+        let p = pool(ops.clone());
+        let a = prompt(6);
+        p.publish_fine(&a, 2, 3, 8, |_, _| Ok(())).unwrap();
+        assert_eq!(ops.allocs.load(Ordering::SeqCst), 0, "fine matching is off: publish_fine must do nothing");
+        assert!(p.try_attach(0, &a).unwrap().is_none(), "nothing published on the (unchanged) native path either");
+    }
+
+    /// Fine chunks count toward `cache_cap` and get evicted LRU under it, exactly like whole
+    /// blocks and boundary snapshots — the bound the eviction-policy ask requires before this
+    /// can ever be a default. Four distinct single-chunk prefixes, cap room for three: the
+    /// fourth publish evicts the oldest (`a`), which must then miss; the newest still hits.
+    #[test]
+    fn fine_matching_evicts_lru_under_the_cache_cap_then_misses_correctly() {
+        let ops = Arc::new(MockVmm::default());
+        let mut p = pool_with_cap(ops.clone(), 24); // exactly 3 chunks x 8 B
+        p.enable_fine_matching(2, 100);
+
+        // Widely separated values, not `prompt(2)` plus a low-bit tweak: with only 2 u32s per
+        // chunk, FxHasher (fast, non-cryptographic — `hash_blocks`'s own choice) has little
+        // input to avalanche on, and a near-identical low-bit difference risks a genuine
+        // 64-bit hash collision between two of these tiny test chunks (found the hard way:
+        // this test originally used `prompt(2)` + `^= small`, and `insert()` correctly
+        // detected the collision and refused the later chunk, which is the RIGHT behaviour
+        // for a real hash collision — this test wants four independent chunks, not that).
+        let a = vec![10_000u32, 10_001];
+        let b = vec![20_000u32, 20_001];
+        let c = vec![30_000u32, 30_001];
+        // `pool_with_cap`'s test geometry has `batch: 2` (only slots 0/1 exist); every
+        // `try_attach` call here is independent (a fresh cold check or a one-shot hit test),
+        // so reusing slot 0 throughout is fine — nothing depends on per-slot identity.
+        for content in [&a, &b, &c] {
+            p.try_attach(0, content).unwrap();
+            p.publish_fine(content, 2, 1, 8, |_, _| Ok(())).unwrap();
+        }
+        assert_eq!(p.stats().cache_bytes, 24, "3 distinct chunks fit exactly at the cap");
+        assert_eq!(ops.frees.load(Ordering::SeqCst), 0, "cap not yet exceeded: nothing evicted");
+
+        let d = vec![40_000u32, 40_001];
+        p.try_attach(0, &d).unwrap();
+        p.publish_fine(&d, 2, 1, 8, |_, _| Ok(())).unwrap();
+        assert!(p.stats().cache_bytes <= 24, "still bounded after a 4th distinct chunk");
+        assert_eq!(ops.frees.load(Ordering::SeqCst), 1, "the LRU chunk (a, published first) was evicted");
+
+        // An attach must leave at least one token for prefill to recompute (the same
+        // invariant the native path enforces), so query with one extra trailing token beyond
+        // each published chunk — exactly at chunk length, `rows >= prompt.len()` and a
+        // correct chunk would still (correctly) report a miss.
+        let mut a_query = a.clone();
+        a_query.push(1);
+        let mut d_query = d.clone();
+        d_query.push(1);
+        assert!(p.try_attach(0, &a_query).unwrap().is_none(), "a's only chunk was evicted: must miss now");
+        assert!(p.try_attach(0, &d_query).unwrap().is_some(), "d is the most recent: must still hit");
     }
 
     #[test]
