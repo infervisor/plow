@@ -1819,7 +1819,7 @@ __device__ __forceinline__ void fa_cp_bulk_g2s(void* smem_dst, const void* gmem_
  * scale. Raw bytes are cp.async-staged into Ks8/Vs8, dequanted (unscaled) to the bf16 Ks/Vs the
  * mma reads; the K-scale post-multiplies the score tile per kv column, the V-scale folds into the
  * P fragment — identical numerics to the PIPE=0 reference arm (d_flash_prefill FP8KV). */
-template <int HD, int BQ, int BKV, bool FP8KV = false>
+template <int HD, int BQ, int BKV, bool FP8KV = false, int THREADS = PLOW_NV_THREADS>
 __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict__ mlpart,
                                     const __nv_bfloat16* __restrict__ Q,
                                     const __nv_bfloat16* __restrict__ K,
@@ -1830,12 +1830,13 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
                                     unsigned kv_mask, float scale, unsigned slice, unsigned nblk,
                                     float* lds, const float* __restrict__ k_scale = nullptr,
                                     const float* __restrict__ v_scale = nullptr) {
-    static_assert(HD == 512 && BQ == 32 && BKV == 16, "px4 arm is the hd512 FULL-layer tiling");
-    static_assert((int)PLOW_NV_WARPS == 8, "px4 warp grids assume 8 warps");
+    static_assert(HD == 512 && (BQ == 32 || BQ == 64) && BKV == 16,
+                  "px4 arm requires the hd512/BKV16 tiling");
+    static_assert(THREADS == BQ * 8, "px4 needs one warp per query/kv/hd partition");
     constexpr int PAD = FA_PRE_PAD;
-    /* QK: 8 warps = 2(khalf: hd 0..255 / 256..511) x 2(query 16-row half) x 2(kv 8-col half). */
+    /* QK: 2(khalf) x BQ/16(query groups) x 2(kv halves). */
     constexpr int KSTEPS_H = HD / 2 / 16; /* 16 k16 steps per hd half */
-    /* P.V: 2 query-warp-rows x 4 hd-warp-cols (as T4/T5); softmax rides this partition. */
+    /* P.V: BQ/16 query-warp-rows x 4 hd-warp-cols; softmax rides this partition. */
     constexpr int WPV_N = 4;
     constexpr int HDW = HD / WPV_N;  /* 128 */
     constexpr int NJ_PV = HDW / 8;   /* 16 */
@@ -1895,7 +1896,10 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
     const unsigned n_qt = (seq_q + BQ - 1) / BQ;
     const unsigned n_work = n_qt * n_head * nsplit;
     const float lscale = FA_SCALE(scale);
-    const int qk_kh = warp >> 2, qk_wm = (warp >> 1) & 1, qk_wn = warp & 1;
+    constexpr int QK_WARPS_PER_HALF = (BQ / 16) * 2;
+    const int qk_kh = warp / QK_WARPS_PER_HALF;
+    const int qk_wm = (warp % QK_WARPS_PER_HALF) >> 1;
+    const int qk_wn = warp & 1;
     const int pv_wm = warp >> 2, pv_wn = warp & 3;
     /* This lane's softmax/P.V ownership: rows r0 / r0+8 of the q-tile, kv cols c0,c0+1,c0+8,c0+9. */
     const int r0 = pv_wm * 16 + (lane >> 2);
@@ -1926,7 +1930,7 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
         }
 
         __syncthreads(); /* previous item's Qs/Ks/Vs/Ss reads done before restage */
-        for (int idx = tid; idx < BQ * HD; idx += (int)PLOW_NV_THREADS) {
+        for (int idx = tid; idx < BQ * HD; idx += THREADS) {
             int r = idx / HD, c = idx % HD;
             __nv_bfloat16 v = __float2bfloat16(0.f);
             if (q0 + r < seq_q) v = Qh[(size_t)r * n_head * HD + c];
@@ -1934,7 +1938,8 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
         }
 #if PLOW_NV_FA_FP8MMA && defined(PLOW_FP8_KV)
         /* fp8mma (Lever A): quantize Q -> e4m3 ONCE per q-tile (amortized over the whole KV loop).
-         * 8 warps x 4 rows each; 8 lanes per row cover HD/8=64 elems. Per-row amax -> qinv, the
+         * THREADS/32 warps x 4 rows each; 8 lanes per row cover HD/8=64 elems.
+         * Per-row amax -> qinv, the
          * inverse scale lands in qsc_s and multiplies the score with the k-scale (both factor out
          * of the e4m3 dot exactly as the decode/GEMM w8a8 scales do). Zero rows (pad) => qinv 0 =>
          * stored bytes 0, scale 0 — masked columns aside, a zero Q row yields zero scores. */
@@ -2031,7 +2036,7 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
                                    HD * 2, &mbar[1]);
             }
             if (nrows < (unsigned)BKV)
-                for (int idx = tid; idx < (BKV - (int)nrows) * HD; idx += (int)PLOW_NV_THREADS) {
+                for (int idx = tid; idx < (BKV - (int)nrows) * HD; idx += THREADS) {
                     int r = (int)nrows + idx / HD, c = idx % HD;
                     Vs[r * (HD + PAD) + c] = __float2bfloat16(0.f);
                 }
@@ -2043,7 +2048,7 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
         constexpr int HCH8 = HD / 16;
         auto stageK = [&](unsigned kv0) {
             if constexpr (FP8KV) {
-                for (int L = tid; L < BKV * HCH8; L += (int)PLOW_NV_THREADS) {
+                for (int L = tid; L < BKV * HCH8; L += THREADS) {
                     int r = L / HCH8, c16 = (L % HCH8) * 16;
                     unsigned kv = kv0 + (unsigned)r;
                     bool in = (kv < hi);
@@ -2051,7 +2056,7 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
                     fa_cp_async_cg16(&Ks8[r * (HD + PAD8) + c16], g, in ? 16 : 0);
                 }
             } else {
-                for (int L = tid; L < BKV * HCH; L += (int)PLOW_NV_THREADS) {
+                for (int L = tid; L < BKV * HCH; L += THREADS) {
                     int r = L / HCH, c8 = (L % HCH) * 8;
                     unsigned kv = kv0 + (unsigned)r;
                     bool in = (kv < hi);
@@ -2063,7 +2068,7 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
         };
         auto stageV = [&](unsigned kv0) {
             if constexpr (FP8KV) {
-                for (int L = tid; L < BKV * HCH8; L += (int)PLOW_NV_THREADS) {
+                for (int L = tid; L < BKV * HCH8; L += THREADS) {
                     int r = L / HCH8, c16 = (L % HCH8) * 16;
                     unsigned kv = kv0 + (unsigned)r;
                     bool in = (kv < hi);
@@ -2071,7 +2076,7 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
                     fa_cp_async_cg16(&Vs8[r * (HD + PAD8) + c16], g, in ? 16 : 0);
                 }
             } else {
-                for (int L = tid; L < BKV * HCH; L += (int)PLOW_NV_THREADS) {
+                for (int L = tid; L < BKV * HCH; L += THREADS) {
                     int r = L / HCH, c8 = (L % HCH) * 8;
                     unsigned kv = kv0 + (unsigned)r;
                     bool in = (kv < hi);
@@ -2085,14 +2090,14 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
          * (reuses the exact fp8v8->bf16v8 idiom). Scales apply later (K post-mma, V into P). The
          * caller fences Ks8/Vs8 visible (post-wait __syncthreads) before and Ks/Vs after. */
         auto dequantK = [&]() {
-            for (int L = tid; L < BKV * HCH; L += (int)PLOW_NV_THREADS) {
+            for (int L = tid; L < BKV * HCH; L += THREADS) {
                 int r = L / HCH, c8 = (L % HCH) * 8;
                 bf16v8 d = fp8v8_to_bf16v8(ld_glob_fp8v8(&Ks8[r * (HD + PAD8) + c8]));
                 *(uint4*)&Ks[r * (HD + PAD) + c8] = *(const uint4*)&d;
             }
         };
         auto dequantV = [&]() {
-            for (int L = tid; L < BKV * HCH; L += (int)PLOW_NV_THREADS) {
+            for (int L = tid; L < BKV * HCH; L += THREADS) {
                 int r = L / HCH, c8 = (L % HCH) * 8;
                 bf16v8 d = fp8v8_to_bf16v8(ld_glob_fp8v8(&Vs8[r * (HD + PAD8) + c8]));
                 *(uint4*)&Vs[r * (HD + PAD) + c8] = *(const uint4*)&d;
@@ -2150,7 +2155,7 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
             }
 #endif
 
-            /* S = Q.K^T, all 8 warps: this warp contracts one HD HALF for a 16(query) x 8(kv)
+            /* S = Q.K^T, all warps: this warp contracts one HD HALF for a 16(query) x 8(kv)
              * block; the halves land in SsA/SsB and are summed at the softmax read. */
             {
                 float acc[4] = {0.f, 0.f, 0.f, 0.f};
@@ -2262,7 +2267,7 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
                  * activation magnitude, comfortably fp16; P then stays UNSCALED in [0,1] and
                  * the softmax path drops its per-element scale entirely). Vs holds half. */
                 constexpr int HCH8 = HD / 16;
-                for (int L = tid; L < BKV * HCH8; L += (int)PLOW_NV_THREADS) {
+                for (int L = tid; L < BKV * HCH8; L += THREADS) {
                     const int r = L / HCH8, c16 = (L % HCH8) * 16;
                     const __half2 vs2 = __float2half2_rn(vsc_s[r]);
                     const uint4 raw = *(const uint4*)&Vs8[r * (HD + PAD8) + c16];

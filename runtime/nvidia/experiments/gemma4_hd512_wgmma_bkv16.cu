@@ -43,6 +43,7 @@ constexpr int KV_HEADS = 1;
 constexpr int BKV = 16;
 constexpr unsigned GRID = 132;
 constexpr unsigned THREADS = 256;
+constexpr unsigned BQ64_THREADS = 512;
 
 #define CK(call)                                                                                 \
     do {                                                                                         \
@@ -65,6 +66,19 @@ __global__ void control_kernel(float* partial, float* stats, const bf16* q,
         blockIdx.x, gridDim.x, arena);
 }
 
+#if defined(PLOW_EXPERIMENT_PX4_BQ64)
+__global__ __launch_bounds__(BQ64_THREADS, 1) void candidate_kernel(
+                                 float* partial, float* stats, const bf16* q,
+                                 const bf16* k, const bf16* v, bf16* out,
+                                 unsigned rows, unsigned kv_length, unsigned stride,
+                                 unsigned nsplit) {
+    extern __shared__ float arena[];
+    d_flash_prefill_px4<HD, 64, BKV, false, BQ64_THREADS>(
+        partial, stats, q, k, v, out, rows, kv_length, HEADS, KV_HEADS,
+        kv_length - rows, 0, nsplit, stride, 0xffffffffu, 1.0f,
+        blockIdx.x, gridDim.x, arena);
+}
+#else
 __global__ void candidate_kernel(float* partial, float* stats, const bf16* q,
                                  const bf16* k, const bf16* v, bf16* out,
                                  unsigned rows, unsigned kv_length, unsigned stride,
@@ -75,6 +89,7 @@ __global__ void candidate_kernel(float* partial, float* stats, const bf16* q,
         kv_length - rows, 0, nsplit, stride, 0xffffffffu, 1.0f,
         blockIdx.x, gridDim.x, arena, nullptr, nullptr);
 }
+#endif
 
 __global__ void merge_kernel(bf16* out, const float* partial, const float* stats,
                              unsigned rows, unsigned nsplit) {
@@ -131,12 +146,13 @@ static Buffers allocate_buffers(size_t output_elements, unsigned rows,
     return result;
 }
 
-static void print_resources(const char* name, const void* kernel, size_t smem) {
+static void print_resources(const char* name, const void* kernel, unsigned threads,
+                            size_t smem) {
     cudaFuncAttributes attr{};
     CK(cudaFuncGetAttributes(&attr, kernel));
     int blocks = 0;
     CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &blocks, kernel, THREADS, smem));
+        &blocks, kernel, threads, smem));
     std::printf("\"%s_regs\":%d,\"%s_local\":%zu,\"%s_smem\":%zu,"
                 "\"%s_blocks_per_sm\":%d,", name, attr.numRegs, name,
                 size_t(attr.localSizeBytes), name, smem, name, blocks);
@@ -179,7 +195,11 @@ int main(int argc, char** argv) {
     constexpr size_t control_smem =
         FA_PX4_SMEM_FLOATS(HD, 32, BKV) * sizeof(float);
     constexpr size_t candidate_smem =
+#if defined(PLOW_EXPERIMENT_PX4_BQ64)
+        FA_PX4_SMEM_FLOATS(HD, 64, BKV) * sizeof(float);
+#else
         FA_SM90_PRE_FLOATS(HD, 64, BKV) * sizeof(float);
+#endif
 #endif
     CK(cudaFuncSetAttribute(control_kernel,
                             cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -197,7 +217,13 @@ int main(int argc, char** argv) {
                                             control.stats, rows, nsplit);
     };
     auto launch_candidate = [&] {
-        candidate_kernel<<<GRID, THREADS, candidate_smem>>>(
+        candidate_kernel<<<GRID,
+#if defined(PLOW_EXPERIMENT_PX4_BQ64)
+                           BQ64_THREADS,
+#else
+                           THREADS,
+#endif
+                           candidate_smem>>>(
             candidate.partial, candidate.stats, q, k, v, candidate.out, rows,
             kv_length, stride, nsplit);
         if (nsplit > 1)
@@ -278,8 +304,14 @@ int main(int argc, char** argv) {
 
     std::printf("{\"rows\":%u,\"kv_length\":%u,\"nsplit\":%u,\"seed\":%u,",
                 rows, kv_length, nsplit, seed);
-    print_resources("control", (const void*)control_kernel, control_smem);
-    print_resources("candidate", (const void*)candidate_kernel, candidate_smem);
+    print_resources("control", (const void*)control_kernel, THREADS, control_smem);
+    print_resources("candidate", (const void*)candidate_kernel,
+#if defined(PLOW_EXPERIMENT_PX4_BQ64)
+                    BQ64_THREADS,
+#else
+                    THREADS,
+#endif
+                    candidate_smem);
     std::printf("\"control_hash\":\"fnv1a64:%016llx\",\"mismatches\":%zu,"
                 "\"rel_l2\":%.9g,\"max_abs\":%.9g,"
                 "\"exact\":%s,\"control_p50_us\":%.6f,"

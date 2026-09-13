@@ -65,6 +65,31 @@ struct Hd256Qualification {
     sha256: String,
 }
 
+fn validate_hardware_resources(
+    gpu: &str,
+    profile: &str,
+    block_threads: u32,
+    warps: u32,
+    arena_bytes: u32,
+) -> Result<(), String> {
+    let spec = hwspec::registry::lookup(gpu)
+        .ok_or_else(|| format!("packet role resource validation requires a known GPU: {gpu}"))?;
+    let fingerprint = kernelcaps::HardwareFingerprint::from_spec(spec)
+        .ok_or_else(|| format!("packet role resource validation lacks an ISA for {gpu}"))?;
+    if fingerprint.isa.arch_flag().replace('_', "") != profile.replace('_', "")
+        || block_threads == 0
+        || arena_bytes == 0
+        || warps.checked_mul(spec.sm.warp_lanes) != Some(block_threads)
+        || block_threads > spec.sm.max_threads
+        || u64::from(arena_bytes) > spec.sm.shared_mem.0
+    {
+        return Err(format!(
+            "packet role resources do not fit {gpu}: profile={profile} block={block_threads} warps={warps} arena={arena_bytes}"
+        ));
+    }
+    Ok(())
+}
+
 fn hd256_implementation() -> String {
     plow_asset::decode_objects::image_sha256(include_bytes!(
         "../../../runtime/nvidia/interp_sm90a_pfattn_hd256_bkv32.cu"
@@ -227,6 +252,7 @@ fn apply_qualified_hd256(
     model: &mut Model,
     sections: &mut Vec<SectionData>,
     profile: &str,
+    gpu: &str,
     directory: &Path,
     qualification: &Hd256Qualification,
 ) -> Result<(), String> {
@@ -249,6 +275,7 @@ fn apply_qualified_hd256(
             path.display()
         ));
     }
+    validate_hardware_resources(gpu, profile, 256, 8, 103_424)?;
     apply(
         model,
         sections,
@@ -412,6 +439,7 @@ pub(crate) fn apply_output_object(
                 path.display()
             ));
         }
+        validate_hardware_resources(gpu, profile, 256, 8, 141_312)?;
         let programs = model.progs[..prefill_count]
             .iter()
             .enumerate()
@@ -452,7 +480,7 @@ pub(crate) fn apply_output_object(
             None
         };
         if let Some(qualification) = qualification {
-            apply_qualified_hd256(model, sections, profile, directory, &qualification)?;
+            apply_qualified_hd256(model, sections, profile, gpu, directory, &qualification)?;
             applied = true;
         }
     }
@@ -510,6 +538,7 @@ pub(crate) fn apply_output_object(
             path.display()
         ));
     }
+    validate_hardware_resources(gpu, profile, expected[5].1, expected[4].1, expected[6].1)?;
     apply(
         model,
         sections,

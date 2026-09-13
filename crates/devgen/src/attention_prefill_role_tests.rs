@@ -61,6 +61,15 @@ fn apply_output(
 }
 
 #[test]
+fn role_resources_follow_the_selected_tile_on_h100() {
+    assert!(validate_hardware_resources("h100", "sm90a", 256, 8, 201_728).is_ok());
+    assert!(validate_hardware_resources("h100", "sm90a", 512, 16, 108_048).is_ok());
+    assert!(validate_hardware_resources("h100", "sm90a", 512, 8, 108_048).is_err());
+    assert!(validate_hardware_resources("h100", "sm90a", 256, 8, 233_473).is_err());
+    assert!(validate_hardware_resources("mi300x", "sm90a", 256, 8, 70_672).is_err());
+}
+
+#[test]
 fn wgmma_object_selects_its_tile_and_rejects_partial_output() {
     let directory = output_dir("wgmma");
     let output = directory.join("model.pkt");
