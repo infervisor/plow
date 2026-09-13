@@ -4,7 +4,7 @@ Updated: 2026-09-13
 Branch: `tp-bringup-mi300x`
 Checkpoint: `google/gemma-4-12B-it`
 Protocol: `g4-4k8k-v1`
-Last qualified kernel commit: `6f5d9fe7`
+Last qualified kernel commit: `68f72fe1`
 Detailed experiment log: `plans/gemma4-4k-8k-native-block.md`
 
 ## Goal and rules
@@ -26,16 +26,17 @@ Detailed experiment log: `plans/gemma4-4k-8k-native-block.md`
 | AMD MI300X | gfx942 | BF16 | unmeasured in this fixed protocol | unmeasured in this fixed protocol | Establish native block and serving baseline |
 | AMD MI300X | gfx942 | FP8 | unmeasured in this fixed protocol | unmeasured in this fixed protocol | Establish dtype-correct block and serving baseline |
 
-The H100 W8A8 values are the latest exact-rung snapshot after the accepted HD512
-row-cooperative TMA issue path. They are not an apples-to-apples vLLM result and
-must not be compared with another precision or cache policy.
+The H100 W8A8 values are the latest comparable full-rung snapshot. They predate
+the ABI v5 descriptor-TMA block winner, whose full-rung transfer remains open.
+They are not an apples-to-apples vLLM result and must not be compared with
+another precision or cache policy.
 
 ## Cross-GPU checkpoint ledger
 
 | Backend cell | Native kernels | Packet/runtime | Comparable baseline | Promotion state | Next gate |
 |---|---|---|---|---|---|
-| H100 SM90a BF16 4K/8K | HD256, HD512, fused gate/up+GeGLU qualified | exact-rung roles and packed R2 qualified | Plow production C1 recorded; matched vLLM pending | kernel wins promoted; 50% TTFT open | descriptor-backed HD512 TMA layout, then cold C1/C8 |
-| H100 SM90a FP8 4K/8K | W8A8 fused-GLU and HD512 score swizzle qualified | ABI v4 role/hash and packed R2 qualified | warmed Plow snapshot recorded; matched vLLM pending | provisional end-to-end snapshot | numerical FP8 gate, then cold C1/C8 |
+| H100 SM90a BF16 4K/8K | HD256, descriptor-TMA HD512, fused gate/up+GeGLU qualified | exact-rung roles and packed R2 qualified | Plow production C1 recorded; matched vLLM pending | kernel wins promoted; 50% TTFT open | transfer HD512 object into a comparable full-model packet, then cold C1/C8 |
+| H100 SM90a FP8 4K/8K | W8A8 fused-GLU and descriptor-TMA HD512 qualified | ABI v5 role/hash, mixed BKV views, and packed R2 qualified | warmed Plow snapshot recorded; matched vLLM pending | provisional end-to-end snapshot | numerical FP8 gate, then cold C1/C8 |
 | MI300X gfx942 BF16 4K/8K | no result under `g4-4k8k-v1` | shared planner/packing/VMM code present; driver gate pending | missing | unmeasured | capture four block cells and cold C1/C8 baseline |
 | MI300X gfx942 FP8 4K/8K | no result under `g4-4k8k-v1` | shared planner/packing/VMM code present; driver gate pending | missing | unmeasured | qualify dtype path, then four block cells and cold C1/C8 |
 
@@ -62,6 +63,8 @@ Do not enter a cross-GPU speedup without a same-cell control under protocol
 | `6f5d9fe7` | H100 SM90a | accepted HD512 score-tile swizzle, ABI v4, role authentication |
 | `51f77652` | H100 SM90a | post-swizzle NCU attribution, Q/K/V padding rejection, single-thread poll rejection |
 | `c43f539dbae0137da1dc38ce3ec65096c8b6c8b7dbcdf9349cadd3f97fb64817` | H100 SM90a | qualified HD512 direct cubin SHA256, 122 registers, zero stack/spills, 110,096-byte arena |
+| `68f72fe1` | H100 SM90a | exact 4K/8K HD512 K/V descriptor-TMA layout, ABI v5, mixed BKV16/BKV32 packet views |
+| `ecd3feeaa853ad8547d8e05c6c61d2ccf09ba7b3317fb1b7147b21dbd5349072` | H100 SM90a | qualified ABI v5 direct cubin SHA256, 128 registers, zero direct-entry stack/spills, 110,592-byte arena |
 
 Raw profiler reports, generated assets, and timing logs stay outside git. The
 tracker stores enough identity to reject stale or cross-architecture evidence.
@@ -88,6 +91,7 @@ tracker stores enough identity to reject stale or cross-architecture evidence.
 | HD512 direct role | M4096/M8192, HD512, GQA16 | direct boundary removed; prior 8K sites -15.7% | three seeds and packed R2 pass |
 | HD512 row-cooperative TMA issue | BQ64/BKV16, 512 threads | HD512 subtotal -6.12%/-6.82%; full-rung -1.23%/-2.12% | three seeds and packed R2 pass |
 | HD512 score-tile bank swizzle | BQ64/BKV16, score stride 20 + row-parity column swizzle | HD512 subtotal -2.03%/-1.23%; full-rung -0.27%/-0.38% | three seeds, final ABI v4 driver run, and packed R2 pass |
+| HD512 descriptor-backed K/V TMA | M4096/M8192, BQ64/BKV16, rank-3 128B-swizzled maps | direct kernel -8.60%/-9.83% versus accepted ABI v4 object | six exact seed/rung checks, mixed 2K/4K/8K packet, and packed R2 pass |
 | BF16 fused gate/up+GeGLU role | M4096/M8192, N15360/K3840 | five-seed full-rung -3.31%/-3.27% | matching hashes |
 
 ## Rejected H100 changes
@@ -125,25 +129,27 @@ The packet's dependency and counter ABI remains common across variants.
 
 ## Current H100 bottleneck evidence
 
-The exact accepted HD512 direct object was profiled at M8192 with its production
-grid (132 CTAs), block size (512 threads), and 110,096-byte arena. The standalone
-11.65 ms duration matches the approximately 12 ms production site time.
+The descriptor-TMA HD512 direct object was profiled at M8192 with its production
+grid (132 CTAs), block size (512 threads), and 110,592-byte arena. Direct A/B
+timing against the accepted ABI v4 object is authoritative because the profiler
+harness has a different compile context.
 
 | Signal | Result | Decision |
 |---|---:|---|
-| Registers / occupancy | accepted score-swizzle object uses 122 registers/thread; 25% occupancy; one register-limited block/SM | Reject growth that lowers residency or fails full-rung transfer |
-| Compute / memory | 27.79% compute; 47.99% memory; 0.71% DRAM; 98.84% L2 hit | Do not prioritize HBM bandwidth or GQA multicast for the full-query cell |
-| Scheduler | eligible in 29.67% of cycles; 0.58 eligible warps/scheduler | Reduce dependency and synchronization gaps |
-| Stall per issued instruction | barrier 4.17; short scoreboard 3.38; wait 1.98; MIO throttle 0.50 | Phase synchronization is now the primary wall |
+| Registers / occupancy | descriptor-TMA direct entry uses 128 registers/thread; 25% occupancy; one block/SM; zero stack/spills | Reject growth that lowers residency or fails full-rung transfer |
+| Compute / memory | 44.14% compute; 46.70% memory; 0.69% DRAM; 98.20% L2 hit | Do not prioritize HBM bandwidth or GQA multicast for the full-query cell |
+| Scheduler | eligible in 47.16% of cycles; 0.90 eligible warps/scheduler | The swizzled fragment layout removed a material dependency gap; phase overlap remains next |
+| Direct timing | 4K 3.207861 -> 2.932128 ms; 8K 11.698603 -> 10.548309 ms | Promote for exact 4K/8K and require comparable full-rung transfer |
 | Shared conflicts | score swizzle cuts total bank conflicts from 438,612,278 to 1,073,696 and measured load conflicts from 403,046,400 to zero | Move the next screen to Q/K and V `LDSM` dependencies |
 
-Source counters localize the largest barrier sample to the Q/K `LDSM.16.M88.2`
-load and the largest MIO samples to the scalar score-tile `LDS` sequence. Any
-candidate must preserve the accepted BKV16 score/PV reduction order.
+The prior ABI v4 source counters localize the largest barrier sample to the Q/K
+`LDSM.16.M88.2` load and the largest MIO samples to the scalar score-tile `LDS`
+sequence. ABI v5 improves scheduler eligibility materially; its next source
+screen must still preserve the accepted BKV16 score/PV reduction order.
 
 ## Next experiments
 
-1. H100 HD512: screen descriptor-backed TMA swizzling or an equivalent fragment-native Q/K/V layout; row padding is closed.
+1. H100 HD512: transfer ABI v5 into a comparable full-model packet and measure exact-rung/full-rung attribution.
 2. H100 HD512: test a non-divergent producer/consumer phase schedule after the shared-memory screen.
 3. H100 HD512: qualify live-KV bucket variants and `nsplit` only where the merge pass repays shorter slices; defer GQA multicast until a history-heavy cell shows DRAM pressure.
 4. H100 GEMM: test ping-pong consumers, `stmatrix` + TMA output store, and operand multicast on exact Gemma dimensions.

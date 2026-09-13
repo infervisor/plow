@@ -1151,3 +1151,66 @@ the next phase screen must retain distributed TMA completion. Evidence:
 `/tmp/hd512-score-swizzle-v4-ncu2.ncu-rep`,
 `/tmp/hd512-score-swizzle-v4-source.ncu-rep`,
 `/tmp/hd512-pad-screen.log`, and `/tmp/hd512-waitone-ab.log`.
+
+### 2026-09-13: HD512 descriptor-backed TMA K/V layout qualified
+
+Commit `68f72fe1` specializes the exact SM90a HD512 BQ64/BKV16 role with rank-3
+TMA descriptors. Each K/V stage arrives as eight `{64,16,1}` subtiles in the
+Hopper 128-byte-swizzled shared layout, and logical fragment addresses map to
+that physical layout before `ldmatrix`. QK, softmax, and P.V arithmetic order is
+unchanged. A ragged V tail is zeroed after TMA completion.
+
+Run identity: NVIDIA H100 80GB HBM3
+`GPU-3a031377-c6c4-4b76-93c9-a723129ec669`, driver 580.126.20, CUDA 13.0
+nvcc 13.0.48, 700 W power limit. Clocks were not locked; every timing run used
+`perf-data/tools/gpulease -n 1` and rotated control/candidate order.
+
+The packet recipe now carries the TMA box height while preserving `factor=0` as
+the legacy BKV32 wire representation. Devgen emits the BKV16 view only for
+HD512 4K/8K programs with the role enabled. The same K/V tensors may therefore
+have authenticated BKV32 and BKV16 descriptor views; runtime validation admits
+only identical tensor pairs and geometry and still rejects partial overlap.
+
+Experimental same-TU runs for seeds 17/23/29 at 4K and 8K were exact in all six
+cells (rel-L2 zero, zero mismatches). A rotated direct A/B against the accepted
+ABI v4 object measured:
+
+| Rung | ABI v4 mean | ABI v5 mean | Delta |
+|---|---:|---:|---:|
+| 4K | 3.207861 ms | 2.932128 ms | -8.60% (1.094x) |
+| 8K | 11.698603 ms | 10.548309 ms | -9.83% (1.109x) |
+
+The ABI v5 direct cubin SHA256 is
+`ecd3feeaa853ad8547d8e05c6c61d2ccf09ba7b3317fb1b7147b21dbd5349072`.
+Its direct entry uses 128 registers, zero stack/spills, a 110,592-byte dynamic
+arena, and one block/SM. Nsight records 44.14% compute, 46.70% memory, 0.69%
+DRAM, 98.20% L2 hit, 47.16% eligible cycles, and 0.90 eligible warps/scheduler.
+
+The final mixed-view packet SHA256 is
+`12d407d4cd59ce84948ba2225017cc72f63890d04774c781294fb06c165f41bb`.
+It validated 56 descriptor pairs across one slot and ran 2K through the legacy
+BKV32 route plus 4K/8K through ABI v5 without a device fault. A B2 packet then
+validated the same 56 pairs across two slots. Under `gpulease`, four 2K requests
+formed `R=2 rows=4096`, completed 4/4 with zero failures, and exercised slot 1.
+That B2 packet SHA256 is
+`91200a5c26841e1b8767f3ed9fb7bba25cc81407b9c07259a592fd7f21b77465`.
+
+Evidence: `/tmp/hd512-tma-desc-bq64-screen.log`,
+`/tmp/hd512-tma-desc-abi5-direct-ab.log`,
+`/tmp/hd512-tma-desc-ncu.ncu-rep`,
+`/tmp/hd512-tma-desc-abi5-mixed-packet-sweep.{log,json}`, and
+`/tmp/hd512-tma-desc-abi5-b2.{log,json}`. This qualifies the native HD512 block
+and packet route. It does not close the campaign's 50% full-model TTFT target;
+the next gate is a comparable full-model packet followed by producer/consumer
+phase overlap.
+
+Evidence SHA256: direct A/B
+`f7304d094ee316037bf26af18bade68c9e1ac6062d4e19a5b7c3dc296e907fdc`,
+correctness screen
+`f1f98a7686a4d5bc63a1d5d2280c913c0913503140973495ef83d3249f592a77`,
+Nsight report
+`8a7290274731beec33af938dd71c5115b8aec76a54d1039e1bd318fff5dfd096`,
+mixed packet JSON
+`e0bd9d9c87d646cd15f02f09eba4c8dd577537a234536eec324c61bf39ccb9c3`,
+and B2 JSON
+`e89a7f6fc4c945e81c43445da0083a1a538ad8fcdcc6f455b998d15c174827a9`.
