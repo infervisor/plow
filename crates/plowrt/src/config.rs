@@ -1216,6 +1216,11 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-mla-pf-row-split", env = "PLOW_MLA_PF_ROW_SPLIT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub mla_pf_row_split: bool,
 
+    /// With `PLOW_MLA_PF_ROW_SPLIT`: the rows below the cut (fewer than 2048 causal keys) run the
+    /// AITER kernel too, over a ragged identity CSR, instead of the interpreter gather arm.
+    #[arg(long = "amd-mla-pf-row-split-native-lo", env = "PLOW_MLA_PF_ROW_SPLIT_NATIVE_LO", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub mla_pf_row_split_native_lo: bool,
+
     /// Run native GLM MoE prefill rows >= 1024 on AITER's 64-row persistent tile
     /// (`..._psx_64x256.co`), the object its GLM-5 gfx942 tuning selects there.
     /// Unset = on when the object dir carries the pinned object and a tile64-marked

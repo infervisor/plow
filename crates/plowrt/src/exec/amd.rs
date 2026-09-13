@@ -9328,8 +9328,9 @@ impl AmdEngine {
                 mla_materialized_routes(p, &devp, &mut prefill_routes)?;
                 if use_sparse_mla {
                     let sparse = amd_sparse_mla::routes(p, &blob.tensors, seg_class.len())?;
+                    let cfg = &crate::config::RuntimeConfig::get().amd;
                     union_skip = amd_sparse_mla::union_skip_table(
-                        crate::config::RuntimeConfig::get().amd.union_skip,
+                        cfg.union_skip || cfg.mla_pf_row_split_native_lo,
                         p,
                         &sparse,
                     );
@@ -11433,6 +11434,12 @@ impl AmdEngine {
                 let sparse = self.sparse_mla.as_ref().ok_or_else(|| {
                     RuntimeError::Device("sparse MLA route has no loaded kernels".into())
                 })?;
+                if route.native_lo {
+                    let lo = sparse.enqueue_split_lo(&self.be, route, &self.tens_table)?;
+                    let hi = sparse.enqueue_split(&self.be, route, &self.tens_table)?;
+                    self.seg_launches += (lo + hi) as u64;
+                    return Ok(());
+                }
                 // The interpreter launch below runs the segment's rows [0, split_row0).
                 self.seg_launches +=
                     sparse.enqueue_split(&self.be, route, &self.tens_table)? as u64;
@@ -11893,7 +11900,8 @@ impl AmdEngine {
         let g = &self.progs[p];
         !self.packed_prefill.is_some_and(|b| b.prog == p)
             && g.union_skip.get(seg).copied().flatten().is_some_and(|flash| {
-                matches!(g.prefill_routes.get(flash), Some(PrefillSegmentRoute::SparseMla(r)) if r.active)
+                matches!(g.prefill_routes.get(flash), Some(PrefillSegmentRoute::SparseMla(r))
+                    if r.native_lo || r.active && crate::config::RuntimeConfig::get().amd.union_skip)
             })
     }
 
@@ -11926,6 +11934,10 @@ impl AmdEngine {
         }
         match self.progs[p].prefill_routes.get(seg) {
             Some(PrefillSegmentRoute::SparseMla(route)) if route.active => 3,
+            Some(PrefillSegmentRoute::SparseMla(route)) if route.native_lo => self
+                .sparse_mla
+                .as_ref()
+                .map_or(1, |s| s.native_lo_launches(*route)),
             Some(PrefillSegmentRoute::GemmLt(_)) => 1,
             Some(PrefillSegmentRoute::GemmBlk(route)) => route.launches(),
             Some(PrefillSegmentRoute::MlaFold(_)) => 3,
@@ -12672,9 +12684,10 @@ impl AmdEngine {
         };
         mla_prefill::rebase(&self.progs[prog].small_mla_split_sites, insts, c0 + rows)?;
         let row_split = crate::config::RuntimeConfig::get().amd.mla_pf_row_split;
+        let native_lo = crate::config::RuntimeConfig::get().amd.mla_pf_row_split_native_lo;
         for route in &mut self.progs[prog].prefill_routes {
             if let PrefillSegmentRoute::SparseMla(route) = route {
-                route.rebase(rows, c0, row_split)?;
+                route.rebase(rows, c0, row_split, native_lo)?;
                 // The union header and the flash's query tiles must agree on the row count.
                 if let Some((flash, union, n)) = route.split_patch() {
                     insts[flash].i[4] = n;

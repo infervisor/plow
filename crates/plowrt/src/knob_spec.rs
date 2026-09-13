@@ -27,6 +27,9 @@ const PREFIX_CACHE_CANDIDATE: Status = Status::Candidate {
         "review log #83: attach-verify4, 0/0 mismatches over 63 attaches; opt-in, unset by default",
     ],
 };
+const NATIVE_LO_CANDIDATE: Status = Status::Candidate {
+    evidence: &["review log #93: pfroute-lo-t3-full, row split on, P8192-0 615.0 -> 575.1 ms (floor 5.0), P4096-0 356.0 -> 327.0 (floor 0.7), retrieval 39/39; flip waits on a served A/B"],
+};
 const ROW_SPLIT_CANDIDATE: Status = Status::Candidate {
     evidence: &["review log #84: p0split-full-depth, 8192-row first chunk 725.9 -> 616.8 ms, retrieval 39/39; flip waits on the served A/B"],
 };
@@ -284,6 +287,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.vmm_cache_min_free_mib", Some("PLOW_VMM_CACHE_MIN_FREE_MIB"), Layer::Runtime, U32, UNSET, PREFIX_CACHE_CANDIDATE),
     KnobSpec::new("rt.amd_prefix_fine_rows", Some("PLOW_AMD_PREFIX_FINE_ROWS"), Layer::Runtime, U32, UNSET, PREFIX_CACHE_CANDIDATE),
     KnobSpec::new("rt.mla_pf_row_split", Some("PLOW_MLA_PF_ROW_SPLIT"), Layer::Runtime, Domain::Bool, OFF, ROW_SPLIT_CANDIDATE),
+    KnobSpec::new("rt.mla_pf_row_split_native_lo", Some("PLOW_MLA_PF_ROW_SPLIT_NATIVE_LO"), Layer::Runtime, Domain::Bool, OFF, NATIVE_LO_CANDIDATE),
     KnobSpec::new("rt.vmm_cache_mib", Some("PLOW_VMM_CACHE_MIB"), Layer::Runtime, U32, UNSET, OPT_IN),
     KnobSpec::new("rt.vmm_block_mib", Some("PLOW_VMM_BLOCK_MIB"), Layer::Runtime, U32, Default::Static(Val::Nat(2)), OPT_IN),
     KnobSpec::new("rt.weight_vmm", Some("PLOW_WEIGHT_VMM"), Layer::Runtime, Domain::Bool, UNSET, OPT_IN),

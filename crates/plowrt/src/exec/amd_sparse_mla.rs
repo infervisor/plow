@@ -154,10 +154,11 @@ pub(super) struct Route {
     ix: u32,
     union_ix: Option<u32>,
     pub split_row0: u32,
+    pub native_lo: bool,
 }
 
 impl Route {
-    pub fn rebase(&mut self, rows: u32, prior: u32, row_split: bool) -> Result<()> {
+    pub fn rebase(&mut self, rows: u32, prior: u32, row_split: bool, native_lo: bool) -> Result<()> {
         if rows > self.inst.i[4] || prior.checked_add(rows).is_none_or(|n| n > self.inst.i[2]) {
             return Err(RuntimeError::Device(
                 "sparse MLA chunk exceeds its query/KV capacity".into(),
@@ -168,11 +169,18 @@ impl Route {
         // Fixed-width CSR is valid only when every row has all 2048 causal keys.
         self.active = rows != 0 && prior >= 2047;
         self.split_row0 = 0;
+        self.native_lo = false;
         if row_split && !self.active && rows != 0 && self.union_ix.is_some() {
-            // 8-aligned so the interpreter keeps exactly the unsplit per-8-query union tiles.
-            let s = (SPAN_MIN_PRIOR - prior).next_multiple_of(8);
+            // Interpreter rows: 8-aligned so it keeps exactly the unsplit per-8-query union tiles.
+            // Native lower rows need no alignment.
+            let s = if native_lo {
+                SPAN_MIN_PRIOR - prior
+            } else {
+                (SPAN_MIN_PRIOR - prior).next_multiple_of(8)
+            };
             if rows > s {
                 self.split_row0 = s;
+                self.native_lo = native_lo;
             }
         }
         Ok(())
@@ -181,7 +189,7 @@ impl Route {
     /// `(flash, union, rows)`: the instructions whose row count the interpreter half runs with.
     pub fn split_patch(&self) -> Option<(usize, usize, u32)> {
         let union = self.union_ix?;
-        (self.split_row0 != 0).then_some((self.ix as usize, union as usize, self.split_row0))
+        (self.split_row0 != 0 && !self.native_lo).then_some((self.ix as usize, union as usize, self.split_row0))
     }
 }
 
@@ -266,6 +274,7 @@ mod tests {
                 ix: 0,
                 union_ix: None,
                 split_row0: 0,
+                native_lo: false,
             };
             for slot in 0..2u64 {
                 let mut table: Vec<u64> = buffers.iter().map(|m| m.base).collect();
@@ -280,7 +289,7 @@ mod tests {
                         EngineDevice::upload(&be, &buffers[b], 0, bytemuck::cast_slice(&poison))
                             .unwrap();
                     }
-                    route.rebase(rows, 2048, false).unwrap();
+                    route.rebase(rows, 2048, false, false).unwrap();
                     kernel
                         .enqueue(&be, route, bytemuck::cast_slice(&table))
                         .unwrap();
@@ -496,17 +505,17 @@ mod tests {
     fn sparse_mla_rebases_ragged_rows_and_restores_early_fallback() {
         let (prog, tensors) = fixture();
         let mut route = routes(&prog, &tensors, 2).unwrap()[1].unwrap();
-        route.rebase(129, 65536, false).unwrap();
+        route.rebase(129, 65536, false, false).unwrap();
         assert!(route.active);
         assert_eq!(route.rows, 129);
-        route.rebase(8192, 0, false).unwrap();
+        route.rebase(8192, 0, false, false).unwrap();
         assert!(!route.active);
-        route.rebase(1, 2046, false).unwrap();
+        route.rebase(1, 2046, false, false).unwrap();
         assert!(!route.active);
-        route.rebase(1, 2047, false).unwrap();
+        route.rebase(1, 2047, false, false).unwrap();
         assert!(route.active);
-        assert!(route.rebase(8193, 0, false).is_err());
-        assert!(route.rebase(129, 81920, false).is_err());
+        assert!(route.rebase(8193, 0, false, false).is_err());
+        assert!(route.rebase(129, 81920, false, false).is_err());
     }
 
     #[test]
@@ -542,10 +551,44 @@ mod tests {
             (8192, 0, false, false, None),
             (8192, 2047, true, true, None),
         ] {
-            route.rebase(rows, prior, split).unwrap();
+            route.rebase(rows, prior, split, false).unwrap();
             assert_eq!(route.active, active);
             assert_eq!(route.split_patch(), want, "rows={rows} prior={prior}");
         }
+    }
+
+    #[test]
+    fn sparse_mla_native_lo_cuts_at_the_first_full_key_row_without_interpreter_rows() {
+        let (prog, tensors) = fixture();
+        let mut route = routes(&prog, &tensors, 2).unwrap()[1].unwrap();
+        for (rows, prior, split, lo, row0, native) in [
+            (8192, 0, true, true, 2047, true),
+            (4096, 0, true, true, 2047, true),
+            (8192, 100, true, true, 1947, true),
+            (2047, 0, true, true, 0, false),
+            (8192, 0, false, true, 0, false),
+            (8192, 2047, true, true, 0, false),
+            (8192, 0, true, false, 2048, false),
+        ] {
+            route.rebase(rows, prior, split, lo).unwrap();
+            assert_eq!((route.split_row0, route.native_lo), (row0, native), "rows={rows} prior={prior}");
+            assert_eq!(route.split_patch().is_some(), row0 != 0 && !native);
+        }
+    }
+
+    #[test]
+    fn sparse_mla_native_lo_csr_is_causal_identity_within_its_buffer() {
+        for prior in [0u32, 1, 100, 1535, 2046] {
+            let rows = SPAN_MIN_PRIOR - prior;
+            let (kp, idx) = lo_csr(prior, rows);
+            assert_eq!(kp.len(), rows as usize + 1);
+            for t in 0..rows as usize {
+                let row = &idx[kp[t] as usize..kp[t + 1] as usize];
+                assert!(row.iter().copied().eq(0..=prior + t as u32), "prior={prior} t={t}");
+            }
+            assert!(idx.len() as u64 <= LO_KEYS && (kp.len() as u64) * 4 <= LO_IDX_OFF);
+        }
+        assert_eq!(lo_csr(0, SPAN_MIN_PRIOR).1.len() as u64, LO_KEYS);
     }
 
     #[test]
@@ -700,6 +743,7 @@ pub(super) fn routes(
             ix: ix as u32,
             union_ix: (producer.op == DevOp::IndexUnionPf as u16).then_some(producer_ix as u32),
             split_row0: 0,
+            native_lo: false,
         });
     }
     Ok(routes)
@@ -752,6 +796,28 @@ const _: () = assert!(std::mem::size_of::<PackFp8Args>() == 96);
 const _: () = assert!(std::mem::size_of::<PackSingleArgs>() == 104);
 const _: () = assert!(std::mem::size_of::<ReduceArgs>() == 40);
 
+/// Most key entries a native lower half holds: at prior 0, rows `[0, 2047)` with `t + 1` keys each
+/// (fewer at any later prior).
+const LO_KEYS: u64 = SPAN_MIN_PRIOR as u64 * (SPAN_MIN_PRIOR as u64 + 1) / 2;
+const LO_IDX_OFF: u64 = (SPAN_MIN_PRIOR as u64 + 1) * 4;
+
+/// `(kp, kv_indices)` of a native lower half at `prior`: row `t` attends `[0, prior + t]`.
+fn lo_csr(prior: u32, rows: u32) -> (Vec<u32>, Vec<u32>) {
+    let mut kp = Vec::with_capacity(rows as usize + 1);
+    let mut idx = Vec::new();
+    kp.push(0);
+    for t in 0..rows {
+        idx.extend(0..=prior + t);
+        kp.push(idx.len() as u32);
+    }
+    (kp, idx)
+}
+
+struct LoCsr {
+    mem: DeviceMem,
+    prior: std::sync::atomic::AtomicU32,
+}
+
 pub(super) struct SparseMla {
     pack: HsaKernel,
     pack_fp8: Option<HsaKernel>,
@@ -767,6 +833,7 @@ pub(super) struct SparseMla {
     kp: u64,
     last: u64,
     splits: u64,
+    lo: Option<LoCsr>,
 }
 
 fn load_attention(be: &HsaBackend, dir: &Path, modules: &mut Vec<Module>) -> Result<HsaKernel> {
@@ -885,6 +952,14 @@ impl SparseMla {
             p
         });
         let [q, kv, part, lse, qp, kp, last, splits] = offsets;
+        let lo = if crate::config::RuntimeConfig::get().amd.mla_pf_row_split_native_lo {
+            Some(LoCsr {
+                mem: EngineDevice::alloc(be, (LO_IDX_OFF + LO_KEYS * 4).div_ceil(256) * 256)?,
+                prior: std::sync::atomic::AtomicU32::new(u32::MAX),
+            })
+        } else {
+            None
+        };
         tracing::info!(
             bytes,
             single_pass = pack_fp8_single.is_some(),
@@ -905,6 +980,7 @@ impl SparseMla {
             kp,
             last,
             splits,
+            lo,
         })
     }
 
@@ -915,7 +991,7 @@ impl SparseMla {
             kv_len: route.kv_len,
             kv_base: 0,
         };
-        self.enqueue_window(be, route, tensor_table, one).map(|_| ())
+        self.enqueue_window(be, route, tensor_table, one, None).map(|_| ())
     }
 
     /// Native half of a row-split chunk: rows `[split_row0, rows)`, each with all 2048 causal keys.
@@ -926,7 +1002,47 @@ impl SparseMla {
             kv_len: route.kv_len,
             kv_base: 0,
         };
-        self.enqueue_window(be, route, tensor_table, window)
+        self.enqueue_window(be, route, tensor_table, window, None)
+    }
+
+    /// Rows `[0, split_row0)` of a native-lo chunk, every causal key through the ragged identity
+    /// CSR. Single split only: the pinned kernel mis-merges ragged rows at ns=2.
+    pub fn enqueue_split_lo(&self, be: &HsaBackend, route: Route, tensor_table: &[u8]) -> Result<usize> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let lo = self.lo.as_ref().ok_or_else(|| {
+            RuntimeError::Device("native lower half CSR was not allocated".into())
+        })?;
+        let prior = route.kv_len - route.rows;
+        let rows = route.split_row0;
+        if !route.native_lo || prior + rows != SPAN_MIN_PRIOR {
+            return Err(RuntimeError::Device(
+                "native lower half must end at the first 2048-key row".into(),
+            ));
+        }
+        if lo.prior.load(Relaxed) != prior {
+            // Launches still queued may read the previous prior's layout.
+            be.synchronize()?;
+            let (kp, idx) = lo_csr(prior, rows);
+            EngineDevice::upload(be, &lo.mem, 0, bytemuck::cast_slice(&kp))?;
+            EngineDevice::upload(be, &lo.mem, LO_IDX_OFF, bytemuck::cast_slice(&idx))?;
+            lo.prior.store(prior, Relaxed);
+        }
+        let window = SpanWindow {
+            row0: 0,
+            rows,
+            kv_len: SPAN_MIN_PRIOR,
+            kv_base: 0,
+        };
+        let csr = (lo.mem.base, lo.mem.base + LO_IDX_OFF);
+        self.enqueue_window(be, route, tensor_table, window, Some(csr))
+    }
+
+    /// Launches of [`Self::enqueue_split_lo`] plus [`Self::enqueue_split`].
+    pub fn native_lo_launches(&self, route: Route) -> usize {
+        let single = route.rows - route.split_row0 >= 512
+            && route.scale.is_some()
+            && self.pack_fp8_single.is_some();
+        2 + if single { 2 } else { 3 }
     }
 
     /// The AQL packets [`Self::enqueue_spans`] emits for `spans` (each span is its own
@@ -976,7 +1092,7 @@ impl SparseMla {
                 kv_len: s.kv_len,
                 kv_base: u64::from(s.slot) * u64::from(ctx),
             };
-            launches += self.enqueue_window(be, route, tensor_table, window)?;
+            launches += self.enqueue_window(be, route, tensor_table, window, None)?;
         }
         Ok(launches)
     }
@@ -987,6 +1103,7 @@ impl SparseMla {
         route: Route,
         tensor_table: &[u8],
         w: SpanWindow,
+        csr: Option<(u64, u64)>,
     ) -> Result<usize> {
         let addr = |handle: u16| {
             let at = usize::from(handle) * 8;
@@ -996,7 +1113,12 @@ impl SparseMla {
         let fp8 = route.scale.is_some();
         let row0 = u64::from(w.row0);
         let mut timer = SplitTimer::start(be)?;
-        let single = w.rows >= 512 && fp8 && self.pack_fp8_single.is_some();
+        let single = (w.rows >= 512 || csr.is_some()) && fp8 && self.pack_fp8_single.is_some();
+        if csr.is_some() && !single {
+            return Err(RuntimeError::Device(
+                "sparse MLA ragged CSR requires the single-pass FP8 pack (ns=1)".into(),
+            ));
+        }
         let splits = if single { 1 } else { 2 };
         let pack = PackArgs {
             q: self.q,
@@ -1045,8 +1167,8 @@ impl SparseMla {
         args[2] = self.lse;
         args[4] = self.q;
         args[6] = self.kv;
-        args[8] = self.kp;
-        args[10] = addr(route.index) + row0 * 2048 * 4;
+        args[8] = csr.map_or(self.kp, |c| c.0);
+        args[10] = csr.map_or(addr(route.index) + row0 * 2048 * 4, |c| c.1);
         args[12] = self.last;
         args[14] = u64::from(route.inst.fj[0]);
         args[16] = 8;
@@ -1064,7 +1186,7 @@ impl SparseMla {
         )?;
         timer.lap(be, "attention")?;
         if single {
-            timer.report("sparse_mla_single", w.rows);
+            timer.report(if csr.is_some() { "sparse_mla_lo" } else { "sparse_mla_single" }, w.rows);
             return Ok(2);
         }
         let reduce = ReduceArgs {
