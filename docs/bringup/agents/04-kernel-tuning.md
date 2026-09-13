@@ -221,7 +221,46 @@ Respect the couplings: `GV_MM_MAX` moves the register ceiling of every arm in
 the object; MoE grouped GEMM shares the dense `PGM_*` tile; `PGM_BM` is
 packet-layout-visible. These cannot be swept independently.
 
-### 3a. Agent iteration loop (AMD)
+### 3a. Exact-rung agent loop (NVIDIA)
+
+For Gemma-4 on H100, use `scripts/gemma4_h100_kernel_tuner.py` with profiles
+derived from the packet audit. Select an explicit rung and exact GEMM or
+attention geometry; never type a nearby shape into the benchmark. The tuner
+requires one reference and one or more candidates for every selected profile.
+
+Each candidate declares one hypothesis, one changed lever, and the counters
+expected to move. Each compiled profile binds the cubin hash, symbol, launch
+geometry, tile, stages, TMA/swizzle path, registers, shared memory, stack, and
+spill traffic. Verification covers five seeds before timing. Timing uses four
+balanced-order trials of 10 warmups and 50 samples inside one `gpulease`; every
+trial labels hot/cold cache state and records SM clock, memory clock, and power.
+
+Run the loop in this order:
+
+1. Use the packet trace to rank cells by `occurrences × control_us`. Pick the
+   largest cell in one rung and family.
+2. Change one algorithm or schedule lever. Compile a separate object when the
+   warp, register, shared-memory, or segment budget changes.
+3. Run the exact standalone oracle and A/B. The default gate rejects stack and
+   spill traffic, unstable controls, any slow paired trial, and improvements
+   below the configured speedup.
+4. Read `rung_rollup` in the summary. It reports occurrence-weighted savings by
+   phase, rung, topology, family, and live KV bucket. A fast rare shape does not
+   outrank a smaller saving repeated across the block.
+5. Route the candidate through its hash-bound packet role and repeat the
+   single-block A/B. Reject the candidate if launch, role transition, counter,
+   or activation traffic erases the isolated gain.
+6. Publish a TuneDB row only for the exact packet/object identity that passes
+   the block gate. Prove `plowc tune select` consumes it. Run full logits and
+   serving only after every promoted cell in the rung is closed.
+
+For attention, treat head dimension, GQA, window, query rung, packed topology,
+and live KV boundary as part of the cell. For GEMM/GEMV, use exact M/N/K,
+dtype, scale layout, epilogue, split/reduction path, and execution mode. Do not
+average distinct KV buckets or use an isolated direct kernel as evidence for a
+persistent interpreter route.
+
+### 3b. Agent iteration loop (AMD)
 
 Use [CUDA-Agent](https://arxiv.org/abs/2602.24286)'s implement → compile → verify → profile loop, with Plow's
 stronger controls:
@@ -243,7 +282,7 @@ A fixed 5% target is not proof of improvement. Precision, scale layout and
 tolerance must be identical across arms. Stop at a decisive measured win or
 exhausted hypotheses, not after a fixed number of agent turns.
 
-### 3b. Prefill fusion promotion ladder (AMD)
+### 3c. Prefill fusion promotion ladder (AMD)
 
 Keep this procedure model-agnostic. Derive every operator, shape, dtype,
 consumer count, parallel degree and prompt bucket from the emitted artifact and
@@ -363,7 +402,7 @@ coverage evidence; and the scope-specific gates. At kernel scope,
 sets `qualified=false` when any scope is missing or any measured shape fails. It
 never fills missing scopes or promotes an unmeasured arm.
 
-### 3c. General AMD candidate families
+### 3d. General AMD candidate families
 
 Derive these from the emitted graph and live trace; never key the harness on a model name.
 

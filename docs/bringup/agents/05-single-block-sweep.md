@@ -70,6 +70,7 @@ Use the narrowest existing harness that preserves the behavior being tuned:
 | packet planning | `scripts/block_sim.sh` |
 | block numerics | the family C oracle or `plowrt amd-block`; `block_run check` is smoke only |
 | broad NVIDIA object/packet grid | `scripts/tune_decode_sweep.sh --block ... --block-run ...` |
+| exact Gemma-4 H100 rung kernels | `scripts/gemma4_h100_kernel_tuner.py`; use its occurrence-weighted `rung_rollup` |
 | Gemma block timing | `examples/block_run bench` |
 | MLA-family timing | `scripts/k3_block_sweep.sh` or `scripts/glm52_block_sweep_gfx942.sh` |
 | reference block and per-op floor | `scripts/block_layer_bench.py`, `block_op_bench.py`, then `block_compare.py` |
@@ -164,6 +165,13 @@ Run repeated control/candidate pairs in reversed order, evict L2 symmetrically,
 and retain SM-clock/power telemetry. Any chosen attention split, warp count, or
 register budget must be encoded by geometry/rung in compiler packet metadata;
 do not add model-name branches or runtime environment knobs.
+
+Close a rung from the inside out: exact operator → exact unfused/fused semantic
+sequence → packet role → isolated block. Preserve the same packet digest,
+object hash, input seed, cache state, and control/candidate trial order in the
+record. Rank follow-up work by occurrence-weighted block savings. A candidate
+that wins alone but loses after its segment launch or role transition stays a
+rejected search result and does not enter TuneDB.
 
 ### 5. Anchor and attribute
 

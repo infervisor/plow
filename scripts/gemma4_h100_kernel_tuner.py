@@ -8,18 +8,20 @@ the exact profile fields plus ``{variant}``, ``{seed}``, ``{trial}``,
 ``{warmups}``, and ``{iterations}``.
 
 Verification runs five deterministic seeds for every selected profile and
-variant before any timing starts. Benchmark commands then run as three separate
+variant before any timing starts. Benchmark commands then run as four separate
 processes and must report exactly 50 positive samples after 10 warmups. Raw
 stdout and stderr exist only in a temporary directory under /tmp. The final
 summary path must also be outside the repository.
 
 Each command prints one JSON object with this common identity:
 
-    {"profile_key": "...", "variant": "...", "compiled_profile": {...}}
+    {"profile_key": "...", "packet_sha256": "...", "variant": "...",
+     "compiled_profile": {...}}
 
 Verification additionally reports ``seed``, ``correct``, ``all_finite``,
-``input_sha256``, and ``reference_sha256``. Benchmarking reports ``trial``,
-``isolated``, ``correct``, ``warmups``, ``iterations``, and ``samples_us``.
+``input_sha256``, ``reference_sha256``, and ``output_sha256``. Benchmarking
+reports ``trial``, ``isolated``, ``correct``, ``cache_state``, clock/power
+``telemetry``, ``warmups``, ``iterations``, and ``samples_us``.
 The compiled profile is declared in the spec and includes the cubin hash,
 symbol, launch resources, tile, pipeline, memory path, and execution mode. The
 tuner rejects any identity mismatch rather than attributing a result to the
@@ -30,6 +32,8 @@ The spec reuses the ladder campaign inventory and command placeholders:
     {
       "audit": "/tmp/packet-audit.json",
       "arch": "sm90a",
+      "gpu": "H100 SXM5",
+      "toolchain": "nvcc 13.1",
       "dtype": "bf16",
       "packed_topology": "packed-varlen",
       "max_concurrency": 16,
@@ -40,6 +44,9 @@ The spec reuses the ladder campaign inventory and command placeholders:
       "variant_groups": {
         "prefill_gemm": [{
           "name": "native-split-k", "reference": false,
+          "hypothesis": "split K fills idle SMs at M128",
+          "lever": "split-k count",
+          "expected_counter_changes": {"sm_active": "increase"},
           "profile_selector": {"rung": 128},
           "binary": "/tmp/plow-build/native-gemm-bench",
           "object": "/tmp/plow-build/native-gemm.cubin",
@@ -53,6 +60,8 @@ The spec reuses the ladder campaign inventory and command placeholders:
             "threads": 384, "warps": 12, "registers": 160,
             "smem_bytes": 196608, "tile": [128, 256, 64], "stages": 4,
             "tma": true, "swizzle": "128b", "spills": 0,
+            "stack_bytes": 0, "spill_store_bytes": 0,
+            "spill_load_bytes": 0,
             "segment_mode": "split"
           }
         }]
@@ -85,7 +94,7 @@ _CAMPAIGN_SPEC.loader.exec_module(campaign)
 
 WARMUPS = 10
 ITERATIONS = 50
-TRIALS = 3
+TRIALS = 4
 VERIFY_SEEDS = (0, 1, 2, 3, 4)
 SHA256 = re.compile(r"[0-9a-f]{64}")
 EXECUTION_MODES = {"direct", "persistent", "split"}
@@ -101,6 +110,9 @@ RESOURCE_FIELDS = (
     "tma",
     "swizzle",
     "spills",
+    "stack_bytes",
+    "spill_store_bytes",
+    "spill_load_bytes",
     "segment_mode",
 )
 
@@ -139,7 +151,10 @@ def validate_resource(resource):
     for name in ("threads", "warps", "registers", "stages"):
         if type(resource[name]) is not int or resource[name] <= 0:
             raise TunerError(f"compiled_profile has invalid {name}")
-    for name in ("smem_bytes", "spills"):
+    for name in (
+        "smem_bytes", "spills", "stack_bytes", "spill_store_bytes",
+        "spill_load_bytes",
+    ):
         if type(resource[name]) is not int or resource[name] < 0:
             raise TunerError(f"compiled_profile has invalid {name}")
     if (
@@ -172,6 +187,19 @@ def validate_variant(variant, cwd):
         raise TunerError("variant name must be nonempty")
     if type(variant["reference"]) is not bool:
         raise TunerError(f"{variant['name']}: reference must be boolean")
+    if not variant["reference"]:
+        for name in ("hypothesis", "lever"):
+            if not isinstance(variant.get(name), str) or not variant[name].strip():
+                raise TunerError(f"{variant['name']}: candidate requires nonempty {name}")
+        counters = variant.get("expected_counter_changes")
+        if not isinstance(counters, dict) or not counters or any(
+            not isinstance(name, str) or not name
+            or not isinstance(change, str) or not change
+            for name, change in counters.items()
+        ):
+            raise TunerError(
+                f"{variant['name']}: candidate requires expected_counter_changes"
+            )
     validate_resource(variant["compiled_profile"])
     binary = _resolve_file(variant["binary"], cwd, f"{variant['name']} binary")
     object_path = variant.get("object")
@@ -240,15 +268,26 @@ def variants_for_profile(spec, profile, cwd):
     references = [variant for variant in variants if variant["reference"]]
     if len(references) != 1:
         raise TunerError(f"{profile['profile_key']}: exactly one reference variant is required")
+    if len(variants) < 2:
+        raise TunerError(f"{profile['profile_key']}: at least one candidate is required")
     return variants
 
 
 def load_plan(spec):
-    for name in ("audit", "arch", "dtype", "packed_topology", "max_concurrency"):
+    for name in (
+        "audit", "arch", "gpu", "toolchain", "dtype", "packed_topology",
+        "max_concurrency",
+    ):
         if name not in spec:
             raise TunerError(f"spec is missing {name}")
+    for name in ("gpu", "toolchain"):
+        if not isinstance(spec[name], str) or not spec[name].strip():
+            raise TunerError(f"spec {name} must be nonempty")
     campaign.validate_spec(spec)
     audit = read_json(spec["audit"])
+    packet_sha256 = audit.get("packet_sha256")
+    if not SHA256.fullmatch(str(packet_sha256 or "")):
+        raise TunerError("packet audit has no valid packet SHA256")
     profiles, _, _ = campaign.audit_inventory(
         audit,
         spec["arch"],
@@ -257,13 +296,15 @@ def load_plan(spec):
         spec["max_concurrency"],
     )
     selected = select_profiles(profiles, spec.get("profile_selectors"))
+    for profile in selected:
+        profile["packet_sha256"] = packet_sha256
     cwd = str(Path(spec.get("cwd", ROOT)).resolve())
     entries = []
     for profile in selected:
         entries.append(
             {"profile": profile, "variants": variants_for_profile(spec, profile, cwd)}
         )
-    return cwd, entries
+    return cwd, packet_sha256, entries
 
 
 def _safe_label(text):
@@ -334,6 +375,9 @@ def validate_identity(record, profile, variant, label):
         raise TunerError(f"{label}: variant differs from scheduled variant")
     if record.get("compiled_profile") != variant["compiled_profile"]:
         raise TunerError(f"{label}: compiled_profile differs from declared resource identity")
+    packet_sha256 = profile.get("packet_sha256")
+    if packet_sha256 is not None and record.get("packet_sha256") != packet_sha256:
+        raise TunerError(f"{label}: packet SHA256 differs from scheduled packet")
 
 
 def validate_verification(record, profile, variant, seed, label):
@@ -342,7 +386,7 @@ def validate_verification(record, profile, variant, seed, label):
         raise TunerError(f"{label}: seed differs from scheduled seed")
     if record.get("correct") is not True or record.get("all_finite") is not True:
         raise TunerError(f"{label}: correctness failed")
-    for field in ("input_sha256", "reference_sha256"):
+    for field in ("input_sha256", "reference_sha256", "output_sha256"):
         if not SHA256.fullmatch(str(record.get(field, ""))):
             raise TunerError(f"{label}: invalid {field}")
 
@@ -353,6 +397,15 @@ def validate_benchmark(record, profile, variant, trial, label):
         raise TunerError(f"{label}: trial differs from scheduled trial")
     if record.get("isolated") is not True or record.get("correct") is not True:
         raise TunerError(f"{label}: benchmark is not isolated and correct")
+    if record.get("cache_state") not in ("hot", "cold"):
+        raise TunerError(f"{label}: cache_state must be hot or cold")
+    telemetry = record.get("telemetry")
+    if not isinstance(telemetry, dict):
+        raise TunerError(f"{label}: missing clock/power telemetry")
+    for name in ("sm_clock_mhz", "memory_clock_mhz", "power_w"):
+        value = telemetry.get(name)
+        if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+            raise TunerError(f"{label}: invalid telemetry {name}")
     if record.get("warmups") != WARMUPS or record.get("iterations") != ITERATIONS:
         raise TunerError(f"{label}: benchmark protocol must be {WARMUPS}/{ITERATIONS}")
     samples = record.get("samples_us")
@@ -362,12 +415,17 @@ def validate_benchmark(record, profile, variant, trial, label):
         or any(type(value) not in (int, float) or not math.isfinite(value) or value <= 0 for value in samples)
     ):
         raise TunerError(f"{label}: expected exactly {ITERATIONS} positive timing samples")
-    return [float(value) for value in samples]
+    return {
+        "samples_us": [float(value) for value in samples],
+        "cache_state": record["cache_state"],
+        "telemetry": telemetry,
+    }
 
 
 def verify_all(spec, entries, cwd, raw_dir):
     timeout = int(spec.get("verify_timeout_s", 900))
     identities = collections.defaultdict(dict)
+    evidence = []
     for entry in entries:
         profile = entry["profile"]
         for variant in entry["variants"]:
@@ -387,11 +445,22 @@ def verify_all(spec, entries, cwd, raw_dir):
                 pair = (record["input_sha256"], record["reference_sha256"])
                 previous = identities[(profile["profile_key"], seed)]
                 previous[variant["name"]] = pair
+                evidence.append({
+                    "profile_key": profile["profile_key"],
+                    "variant": variant["name"],
+                    "seed": seed,
+                    "input_sha256": record["input_sha256"],
+                    "reference_sha256": record["reference_sha256"],
+                    "output_sha256": record["output_sha256"],
+                    "correct": True,
+                    "all_finite": True,
+                })
     for (profile_key, seed), variants in identities.items():
         if len(set(variants.values())) != 1:
             raise TunerError(
                 f"{profile_key}/seed{seed}: variants did not verify the same input/reference"
             )
+    return evidence
 
 
 def benchmark_all(spec, entries, cwd, raw_dir):
@@ -436,7 +505,13 @@ def select_winners(spec, entries, timings):
     minimum_speedup = float(gates.get("minimum_speedup", 1.01))
     maximum_trial_slowdown = float(gates.get("maximum_trial_slowdown", 1.02))
     maximum_relative_mad = float(gates.get("maximum_relative_mad", 0.10))
-    if minimum_speedup < 1 or maximum_trial_slowdown < 1 or maximum_relative_mad <= 0:
+    maximum_clock_drift = float(gates.get("maximum_clock_drift", 0.05))
+    allow_resource_spills = gates.get("allow_resource_spills", False)
+    if (
+        minimum_speedup < 1 or maximum_trial_slowdown < 1
+        or maximum_relative_mad <= 0 or not 0 < maximum_clock_drift < 1
+        or type(allow_resource_spills) is not bool
+    ):
         raise TunerError("invalid selection gates")
     results = []
     for entry in entries:
@@ -444,16 +519,26 @@ def select_winners(spec, entries, timings):
         variants = entry["variants"]
         reference = next(variant for variant in variants if variant["reference"])
         ref_trials = [
-            statistics.median(samples)
-            for samples in timings[(profile["profile_key"], reference["name"])]
+            statistics.median(trial["samples_us"])
+            for trial in timings[(profile["profile_key"], reference["name"])]
         ]
+        ref_samples = [
+            sample
+            for trial in timings[(profile["profile_key"], reference["name"])]
+            for sample in trial["samples_us"]
+        ]
+        reference_stable = _relative_mad(ref_samples) <= maximum_relative_mad
         alternatives = []
         for variant in variants:
             samples_by_trial = timings[(profile["profile_key"], variant["name"])]
             if len(samples_by_trial) != TRIALS:
                 raise TunerError(f"{profile['profile_key']}/{variant['name']}: missing trials")
-            trial_medians = [statistics.median(samples) for samples in samples_by_trial]
-            all_samples = [sample for trial_samples in samples_by_trial for sample in trial_samples]
+            trial_medians = [
+                statistics.median(trial["samples_us"]) for trial in samples_by_trial
+            ]
+            all_samples = [
+                sample for trial in samples_by_trial for sample in trial["samples_us"]
+            ]
             median_us = statistics.median(trial_medians)
             speedup = statistics.median(
                 ref / candidate for ref, candidate in zip(ref_trials, trial_medians)
@@ -463,9 +548,48 @@ def select_winners(spec, entries, timings):
                 for ref, candidate in zip(ref_trials, trial_medians)
             )
             stable = _relative_mad(all_samples) <= maximum_relative_mad
+            cache_matched = all(
+                candidate["cache_state"] == reference_trial["cache_state"]
+                for candidate, reference_trial in zip(
+                    samples_by_trial,
+                    timings[(profile["profile_key"], reference["name"])],
+                )
+            )
+            clocks_matched = all(
+                abs(candidate["telemetry"][name] / reference_trial["telemetry"][name] - 1)
+                <= maximum_clock_drift
+                for candidate, reference_trial in zip(
+                    samples_by_trial,
+                    timings[(profile["profile_key"], reference["name"])],
+                )
+                for name in ("sm_clock_mhz", "memory_clock_mhz")
+            )
+            resource = variant["compiled_profile"]
+            resource_clean = all(
+                resource[name] == 0
+                for name in (
+                    "spills", "stack_bytes", "spill_store_bytes", "spill_load_bytes"
+                )
+            )
             qualified = variant["reference"] or (
                 speedup >= minimum_speedup and no_slow_trial and stable
+                and reference_stable and cache_matched and clocks_matched
+                and (allow_resource_spills or resource_clean)
             )
+            rejection_reasons = []
+            if not variant["reference"]:
+                if speedup < minimum_speedup:
+                    rejection_reasons.append("speedup")
+                if not no_slow_trial:
+                    rejection_reasons.append("trial_regression")
+                if not stable or not reference_stable:
+                    rejection_reasons.append("unstable")
+                if not cache_matched:
+                    rejection_reasons.append("cache_state")
+                if not clocks_matched:
+                    rejection_reasons.append("clock_drift")
+                if not allow_resource_spills and not resource_clean:
+                    rejection_reasons.append("local_memory")
             alternatives.append(
                 {
                     "variant": variant["name"],
@@ -473,9 +597,22 @@ def select_winners(spec, entries, timings):
                     "execution_mode": variant["compiled_profile"]["segment_mode"],
                     "median_us": median_us,
                     "trial_medians_us": trial_medians,
+                    "trial_samples_us": [
+                        trial["samples_us"] for trial in samples_by_trial
+                    ],
                     "speedup_vs_reference": speedup,
                     "relative_mad": _relative_mad(all_samples),
+                    "reference_relative_mad": _relative_mad(ref_samples),
+                    "cache_states": [trial["cache_state"] for trial in samples_by_trial],
+                    "telemetry": [trial["telemetry"] for trial in samples_by_trial],
+                    "resource_clean": resource_clean,
+                    "cache_matched": cache_matched,
+                    "clocks_matched": clocks_matched,
                     "qualified": qualified,
+                    "rejection_reasons": rejection_reasons,
+                    "hypothesis": variant.get("hypothesis"),
+                    "lever": variant.get("lever"),
+                    "expected_counter_changes": variant.get("expected_counter_changes"),
                     "binary_sha256": variant["binary_sha256"],
                     "compiled_profile": variant["compiled_profile"],
                 }
@@ -489,24 +626,61 @@ def select_winners(spec, entries, timings):
                 "selected_execution_mode": winner["execution_mode"],
                 "selected_binary_sha256": winner["binary_sha256"],
                 "selected_compiled_profile": winner["compiled_profile"],
+                "weighted_reference_us": next(
+                    row["median_us"] for row in alternatives if row["reference"]
+                ) * profile["occurrences"],
+                "weighted_selected_us": winner["median_us"] * profile["occurrences"],
+                "promotion_decision": (
+                    "kernel-qualified-candidate" if not winner["reference"] else "keep-reference"
+                ),
+                "next_gate": "packet-role-block" if not winner["reference"] else None,
                 "alternatives": alternatives,
             }
         )
     return results
 
 
+def rung_rollup(results):
+    groups = collections.defaultdict(list)
+    for result in results:
+        profile = result["profile"]
+        key = (
+            profile["phase"], profile["rung"], profile["request_topology"],
+            profile["family"], profile.get("kv_length"),
+        )
+        groups[key].append(result)
+    rows = []
+    for key, group in sorted(groups.items()):
+        reference = sum(row["weighted_reference_us"] for row in group)
+        selected = sum(row["weighted_selected_us"] for row in group)
+        rows.append({
+            "phase": key[0], "rung": key[1], "request_topology": key[2],
+            "family": key[3], "kv_length": key[4],
+            "profile_count": len(group), "weighted_reference_us": reference,
+            "weighted_selected_us": selected, "weighted_speedup": reference / selected,
+            "weighted_savings_us": reference - selected,
+            "qualified_candidate_profiles": sum(
+                row["promotion_decision"] == "kernel-qualified-candidate" for row in group
+            ),
+        })
+    return sorted(rows, key=lambda row: row["weighted_savings_us"], reverse=True)
+
+
 def run_tuner(spec, output):
-    cwd, entries = load_plan(spec)
+    cwd, packet_sha256, entries = load_plan(spec)
     with tempfile.TemporaryDirectory(prefix="plow-gemma4-kernel-tuner-", dir="/tmp") as directory:
         raw_dir = Path(directory)
-        verify_all(spec, entries, cwd, raw_dir)
+        verification = verify_all(spec, entries, cwd, raw_dir)
         timings = benchmark_all(spec, entries, cwd, raw_dir)
     winners = select_winners(spec, entries, timings)
     summary = {
-        "schema_version": 1,
+        "schema_version": 2,
         "model": "google/gemma-4-12B-it",
         "arch": spec["arch"],
+        "gpu": spec["gpu"],
+        "toolchain": spec["toolchain"],
         "dtype": spec["dtype"],
+        "packet_sha256": packet_sha256,
         "protocol": {
             "verify_seeds": list(VERIFY_SEEDS),
             "warmups": WARMUPS,
@@ -517,6 +691,8 @@ def run_tuner(spec, output):
             json.dumps(spec, sort_keys=True).encode()
         ).hexdigest(),
         "profiles": winners,
+        "rung_rollup": rung_rollup(winners),
+        "verification": verification,
     }
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
@@ -545,12 +721,15 @@ def lease_command(spec_path, summary_path):
 
 
 def plan_json(spec):
-    _, entries = load_plan(spec)
+    _, packet_sha256, entries = load_plan(spec)
     families = collections.Counter(
         f"{entry['profile']['phase']}_{entry['profile']['family']}" for entry in entries
     )
     return {
         "model": "google/gemma-4-12B-it",
+        "gpu": spec["gpu"],
+        "toolchain": spec["toolchain"],
+        "packet_sha256": packet_sha256,
         "protocol": {
             "verify_seeds": list(VERIFY_SEEDS),
             "warmups": WARMUPS,
@@ -569,6 +748,9 @@ def plan_json(spec):
                         "execution_mode": variant["compiled_profile"]["segment_mode"],
                         "binary_sha256": variant["binary_sha256"],
                         "compiled_profile": variant["compiled_profile"],
+                        "hypothesis": variant.get("hypothesis"),
+                        "lever": variant.get("lever"),
+                        "expected_counter_changes": variant.get("expected_counter_changes"),
                     }
                     for variant in entry["variants"]
                 ],

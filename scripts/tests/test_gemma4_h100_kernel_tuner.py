@@ -26,6 +26,9 @@ def resource(mode):
         "tma": True,
         "swizzle": "128b",
         "spills": 0,
+        "stack_bytes": 0,
+        "spill_store_bytes": 0,
+        "spill_load_bytes": 0,
         "segment_mode": mode,
     }
 
@@ -44,10 +47,12 @@ class Gemma4H100KernelTunerTests(unittest.TestCase):
                 "base={'profile_key':key,'variant':variant,'compiled_profile':json.loads(compiled)}\n"
                 "if mode=='verify':\n"
                 " seed=int(index); base.update(seed=seed,correct=True,all_finite=True,"
-                "input_sha256=format(seed,'064x'),reference_sha256=format(seed+10,'064x'))\n"
+                "input_sha256=format(seed,'064x'),reference_sha256=format(seed+10,'064x'),"
+                "output_sha256=format(seed+20,'064x'))\n"
                 "else:\n"
                 " trial=int(index); value=8.0 if variant=='split' else 10.0; base.update("
                 "trial=trial,isolated=True,correct=True,warmups=10,iterations=50,"
+                "cache_state='hot',telemetry={'sm_clock_mhz':1800,'memory_clock_mhz':2600,'power_w':500},"
                 "samples_us=[value]*50)\n"
                 "print(json.dumps(base))\n"
             )
@@ -69,6 +74,11 @@ class Gemma4H100KernelTunerTests(unittest.TestCase):
                         {
                             "name": name,
                             "reference": reference,
+                            **({} if reference else {
+                                "hypothesis": "split work fills idle SMs",
+                                "lever": "split-k",
+                                "expected_counter_changes": {"sm_active": "increase"},
+                            }),
                             "binary": str(helper),
                             "verify_command": command,
                             "benchmark_command": bench_command,
@@ -77,15 +87,17 @@ class Gemma4H100KernelTunerTests(unittest.TestCase):
                         root,
                     )
                 )
-            profile = {"profile_key": "prefill/gemm/m128n3840k15360"}
+            profile = {"profile_key": "prefill/gemm/m128n3840k15360", "occurrences": 1}
             entries = [{"profile": profile, "variants": variants}]
             spec = {"gates": {"minimum_speedup": 1.01}}
             raw = root / "raw"
             raw.mkdir()
 
-            tuner.verify_all(spec, entries, str(root), raw)
+            verification = tuner.verify_all(spec, entries, str(root), raw)
             verify_lines = order.read_text().splitlines()
             self.assertEqual(len(verify_lines), 10)
+            self.assertEqual(len(verification), 10)
+            self.assertTrue(all(row["correct"] for row in verification))
             self.assertTrue(all(line.startswith("verify:") for line in verify_lines))
 
             timings = tuner.benchmark_all(spec, entries, str(root), raw)
@@ -97,6 +109,7 @@ class Gemma4H100KernelTunerTests(unittest.TestCase):
                     "bench:control:0", "bench:split:0",
                     "bench:split:1", "bench:control:1",
                     "bench:control:2", "bench:split:2",
+                    "bench:split:3", "bench:control:3",
                 ],
             )
             winners = tuner.select_winners(spec, entries, timings)
@@ -116,11 +129,20 @@ class Gemma4H100KernelTunerTests(unittest.TestCase):
             "trial": 0,
             "isolated": True,
             "correct": True,
+            "cache_state": "cold",
+            "telemetry": {
+                "sm_clock_mhz": 1800,
+                "memory_clock_mhz": 2600,
+                "power_w": 500,
+            },
             "warmups": 10,
             "iterations": 50,
             "samples_us": [1.0] * 50,
         }
-        self.assertEqual(len(tuner.validate_benchmark(record, profile, variant, 0, "cell")), 50)
+        self.assertEqual(
+            len(tuner.validate_benchmark(record, profile, variant, 0, "cell")["samples_us"]),
+            50,
+        )
         record["samples_us"].pop()
         with self.assertRaisesRegex(tuner.TunerError, "exactly 50"):
             tuner.validate_benchmark(record, profile, variant, 0, "cell")
@@ -153,6 +175,9 @@ class Gemma4H100KernelTunerTests(unittest.TestCase):
                 "binary": str(binary),
                 "verify_command": ["{binary}"],
                 "benchmark_command": ["{binary}"],
+                "hypothesis": "reduce idle SMs",
+                "lever": "execution mode",
+                "expected_counter_changes": {"sm_active": "increase"},
             }
             reference = {
                 **base,
@@ -176,6 +201,61 @@ class Gemma4H100KernelTunerTests(unittest.TestCase):
             profile = {"profile_key": "m128", "phase": "prefill", "family": "gemm", "rung": 128}
             variants = tuner.variants_for_profile(spec, profile, directory)
             self.assertEqual([variant["name"] for variant in variants], ["control", "split"])
+
+    def test_candidate_requires_a_hypothesis_and_counter_direction(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            binary = Path(directory) / "bench"
+            binary.write_text("#!/bin/sh\nexit 0\n")
+            binary.chmod(binary.stat().st_mode | stat.S_IXUSR)
+            candidate = {
+                "name": "candidate",
+                "reference": False,
+                "binary": str(binary),
+                "verify_command": ["{binary}"],
+                "benchmark_command": ["{binary}"],
+                "compiled_profile": resource("direct"),
+            }
+            with self.assertRaisesRegex(tuner.TunerError, "hypothesis"):
+                tuner.validate_variant(candidate, directory)
+
+    def test_spilling_candidate_is_rejected_and_rung_rollup_is_weighted(self):
+        profile = {
+            "profile_key": "cell", "phase": "prefill", "family": "gemm",
+            "rung": 4096, "request_topology": "single", "occurrences": 8,
+        }
+        control = {
+            "name": "control", "reference": True,
+            "compiled_profile": resource("persistent"), "binary_sha256": "b" * 64,
+        }
+        dirty = resource("direct")
+        dirty["stack_bytes"] = 16
+        candidate = {
+            "name": "candidate", "reference": False,
+            "compiled_profile": dirty, "binary_sha256": "c" * 64,
+            "hypothesis": "reduce queue overhead", "lever": "direct launch",
+            "expected_counter_changes": {"launch_cycles": "decrease"},
+        }
+        trial = lambda value: {
+            "samples_us": [value] * tuner.ITERATIONS,
+            "cache_state": "hot",
+            "telemetry": {
+                "sm_clock_mhz": 1800, "memory_clock_mhz": 2600, "power_w": 500,
+            },
+        }
+        timings = {
+            ("cell", "control"): [trial(10.0) for _ in range(tuner.TRIALS)],
+            ("cell", "candidate"): [trial(8.0) for _ in range(tuner.TRIALS)],
+        }
+        result = tuner.select_winners(
+            {"gates": {"minimum_speedup": 1.01}},
+            [{"profile": profile, "variants": [control, candidate]}],
+            timings,
+        )[0]
+        self.assertEqual(result["promotion_decision"], "keep-reference")
+        self.assertIn("local_memory", result["alternatives"][1]["rejection_reasons"])
+        rollup = tuner.rung_rollup([result])[0]
+        self.assertEqual(rollup["weighted_reference_us"], 80.0)
+        self.assertEqual(rollup["weighted_savings_us"], 0.0)
 
 
 if __name__ == "__main__":

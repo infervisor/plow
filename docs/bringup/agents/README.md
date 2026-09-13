@@ -55,6 +55,10 @@ defect, and a row that cannot be filled is a blocker, not a default.
   arms, single-block or truncated-model sweeps to rank the broad grid, and a
   whole-model step only for the 2–3 finalists. Serving is the promotion gate,
   not the tuning loop.
+- **Close one rung at a time.** Record the exact packet profile, control and
+  candidate object hashes, resource budgets, paired trial order, correctness
+  hashes, and occurrence-weighted rung savings. A standalone winner is only a
+  search result until the same object wins through its packet role.
 - **Proof obligations are never vacuous.** Stage 2/3 prompts require real
   `rfl`-backed theorems for new rewrite rules; `sorry` fails the gate.
 
