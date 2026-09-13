@@ -48,10 +48,25 @@ jobs:
           python3 scripts/render_recipe.py recipes/*/*/*.toml --check
       - name: Enter Nix shell
         run: nix develop --command true
+      # Both need the flake's ROCm toolchain (build_gfx942.sh refuses to run without it), and
+      # neither compiles a kernel: PLOW_DEFINES_ONLY resolves the axes in seconds. The first
+      # asserts the PLOW_HSACO_CONFIG path derives the object set from a packet and refuses a
+      # disagreeing environment by name; the second asserts every checked-in recipe's
+      # `[objects].env` produces the -D set `check_recipe.py` would later compare against.
+      - name: Check build_gfx942.sh packet-config path
+        run: nix develop --command scripts/build_gfx942_config_selftest.sh
+      - name: Check recipes' object env against build_gfx942.sh
+        run: nix develop --command python3 scripts/tests/test_recipe_objects_env.py
       - name: Build default package
         run: nix build
       - name: Test workspace
         run: nix develop --command cargo test --workspace
+      # The engine unit tests under exec/{amd,gpu} are feature-gated, so the
+      # default-feature workspace run never compiles them and the hosted job
+      # only `cargo check`s them. They are host-side (device cases are
+      # #[ignore]d) and run without a GPU.
+      - name: Test engine host paths (cuda,hsa)
+        run: "nix develop --command cargo test -p plowrt --features cuda,hsa --lib exec::"
 
   # Hosted, sandboxed: safe for fork PRs. CPU paths only, no GPU toolchain.
   check:
@@ -102,7 +117,9 @@ jobs:
       # The store, the reference grammar, the selector and the pull pipeline all
       # run against a `file://` fixture, so this needs no network and no GPU.
       - name: Distribution
-        run: cargo test -p plowrt --no-default-features --features cpu,dist --lib dist::
+        # Quoted: a plain scalar ending in `::` is a YAML mapping indicator, and
+        # GitHub then refuses the whole workflow before any job starts.
+        run: "cargo test -p plowrt --no-default-features --features cpu,dist --lib dist::"
       - name: serve is offline
         run: |
           tree=$(cargo tree -p plowrt --no-default-features --features cuda,hsa,cpu -e normal)

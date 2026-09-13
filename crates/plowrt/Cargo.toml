@@ -126,7 +126,7 @@ cuda = ["dep:libloading", "dep:safetensors", "hf-tokenizer"]
 # tokenizer produces silent garbage rather than an error (measured on the CUDA
 # side, 2026-07-19). The features stay symmetric so an AMD serve cannot inherit
 # a failure mode the NVIDIA one was fixed for.
-hsa = ["dep:libloading", "dep:safetensors", "hf-tokenizer"]
+hsa = ["dep:libloading", "dep:libc", "dep:safetensors", "hf-tokenizer"]
 
 [dev-dependencies]
 plow-asset = { workspace = true, features = ["test-util"] }

@@ -676,10 +676,15 @@ pub mod dist;
 pub mod cubin;
 pub mod decode_coverage;
 
+/// The extension load contract — `extension.pkt` and the six rules that admit one
+/// (docs/arch/19, phases 2 and 3).
+pub mod extension;
+
 pub mod aux_program;
 pub mod program;
 pub mod splitk;
 
+pub mod kv_contract;
 pub mod live_kv;
 pub mod mixed_step;
 

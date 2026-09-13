@@ -303,9 +303,10 @@ __device__ __forceinline__ void dsa_grid_sync(unsigned* ctl, unsigned nwg) {
  *
  * Emission ORDER is immaterial: attention's online softmax is set-order invariant.
  *
- *   idx    [top_k]  out, selected positions
+ *   idx    [batch][top_k_max]  out, selected positions
  *   n_sel  [1]      out, how many are actually valid ([RAG]: min(top_k, len))
- *   Score  [len]    in,  f32 indexer scores
+ *   Score  [batch][len_max]    in, f32 indexer scores
+ *   kv_len [batch]             in, live token count (optional for legacy packets)
  *   gHist  [NPASS*NB] scratch, zeroed by the kernel itself (idempotent)
  *   gCtl   [3]      scratch, {arrive, generation, emit-slot}; host zeroes ONCE before first launch
  *   nwg    == gridDim.x, must be co-resident
@@ -320,11 +321,17 @@ __device__ __forceinline__ void dsa_grid_sync(unsigned* ctl, unsigned nwg) {
 template <bool PAR_SCAN = true>
 __device__ void d_index_select_sm120(
     int* __restrict__ idx, unsigned* __restrict__ n_sel, const float* __restrict__ Score,
-    unsigned len, unsigned top_k, unsigned* __restrict__ gHist, unsigned* __restrict__ gCtl,
+    unsigned len_max, unsigned top_k_max, unsigned* __restrict__ gHist,
+    unsigned* __restrict__ gCtl, const int* __restrict__ kv_len, unsigned batch_row,
     unsigned bid, unsigned nwg) {
     __shared__ unsigned lh[DSA_SEL_NB];
     __shared__ unsigned red[3];
     const unsigned tid = threadIdx.x;
+    const float* const Sc = Score + (size_t)batch_row * len_max;
+    int* const ib = idx + (size_t)batch_row * top_k_max;
+    const unsigned live_len = kv_len ? (unsigned)kv_len[batch_row] : len_max;
+    const unsigned len = live_len < len_max ? live_len : len_max;
+    const unsigned top_k = top_k_max < len ? top_k_max : len;
 
     /* [RAG] Ragged / short context: fewer positions than requested. Select ALL of them (identity)
      * and report the true count. The radix path below cannot satisfy k_rem = top_k > len and would
@@ -332,7 +339,7 @@ __device__ void d_index_select_sm120(
      * saved from only by its upstream ctx > 65536 gate. */
     if (len <= top_k) {
         if (bid == 0 && tid == 0 && n_sel) *n_sel = len;
-        for (unsigned t = bid * DSA_THREADS + tid; t < len; t += nwg * DSA_THREADS) idx[t] = (int)t;
+        for (unsigned t = bid * DSA_THREADS + tid; t < len; t += nwg * DSA_THREADS) ib[t] = (int)t;
         return;
     }
     if (bid == 0 && tid == 0) {
@@ -354,7 +361,7 @@ __device__ void d_index_select_sm120(
         __syncthreads();
         /* histogram this block's slice of the keys still matching the resolved prefix. */
         for (unsigned t = bid * DSA_THREADS + tid; t < len; t += nwg * DSA_THREADS) {
-            const unsigned long long key = dsa_pack_key_a(Score[t], t, len);
+            const unsigned long long key = dsa_pack_key_a(Sc[t], t, len);
             if ((key & himask) == prefix)
                 atomicAdd(&lh[(unsigned)((key >> sh) & (DSA_SEL_NB - 1u))], 1u);
         }
@@ -410,9 +417,9 @@ __device__ void d_index_select_sm120(
     }
     /* Unique keys => #{key >= prefix} == top_k exactly. */
     for (unsigned t = bid * DSA_THREADS + tid; t < len; t += nwg * DSA_THREADS) {
-        if (dsa_pack_key_a(Score[t], t, len) >= prefix) {
+        if (dsa_pack_key_a(Sc[t], t, len) >= prefix) {
             const unsigned slot = atomicAdd(&gCtl[2], 1u);
-            if (slot < top_k) idx[slot] = (int)t;
+            if (slot < top_k) ib[slot] = (int)t;
         }
     }
 }

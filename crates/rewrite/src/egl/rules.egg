@@ -111,6 +111,17 @@
 (rewrite (LayerNorm (Ew "add" ?a ?b) ?w ?bias ?eps)
          (FusedResidualLayerNorm ?a ?b ?w ?bias ?eps))
 
+; residual3-rmsnorm-fuse: the MoE block boundary of every MoE decoder (GLM, DeepSeek, Kimi):
+; `RmsNorm(add(x, add(routed, shared)))` — the expert combine, the residual add and the next
+; norm as ONE kernel (devgen: `MoeCombinePf` with its residual operand + the norm; under TP the
+; residual add rides in the two-shot all-gather epilogue, `PLOW_GLM_XR_RES`). 3 e-nodes → 1, so
+; extraction prefers it to `residual-rmsnorm-fuse` on the same class, which would leave the
+; combine as a separate Ew. The inner add stays a distinct materialization point (see the
+; schema note) — same contract as `materialized-residual3-block-fuse`.
+; rule: residual3-rmsnorm-fuse
+(rewrite (RmsNorm (Ew "add" ?x (Ew "add" ?a ?b)) ?w ?eps)
+         (FusedResidual3Norm ?x ?a ?b ?w ?eps))
+
 ; === GroupNorm + Activation + Conv3d fusion (VAE resnet inner loop) ===
 
 ; GroupNorm+Act already fused → fold in the Conv that immediately consumes it.

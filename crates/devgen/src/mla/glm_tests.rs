@@ -7,6 +7,294 @@
 //! the tile choice offline.
 use super::*;
 
+/// Reads of a tensor whose latest write was one rank's rows (a `<base>@band` view or a
+/// reduce-scatter's in-place slot band) before an all-gather or a full write refilled it.
+/// `IndexTpPf`'s peer slot (t6) is write-first: its select pass overwrites every row its gather
+/// reads, behind the op's own entry rendezvous (`runtime/amd/dsa_tp_adapter.hip`).
+fn band_only_reads(insts: &[crate::DevInst], names: &[&str]) -> Vec<String> {
+    let name = |h: u32| names.get(h as usize).copied().unwrap_or("");
+    let mut banded = std::collections::HashSet::new();
+    let mut bad = Vec::new();
+    for (i, d) in insts.iter().enumerate() {
+        if d.op == DevOp::XAllGather as u16 {
+            for h in &d.t[..3] {
+                banded.remove(h);
+            }
+            continue;
+        }
+        if d.op == DevOp::IndexTpPf as u16 {
+            banded.remove(&d.t[6]);
+        }
+        if d.op != DevOp::XReduceScatter as u16 {
+            let reads = d.t[1..].iter().filter(|h| banded.contains(*h));
+            bad.extend(reads.map(|&h| format!("inst {i} op {} reads {}", d.op, name(h))));
+        }
+        let out = d.t[0];
+        match name(out).split_once("@band") {
+            Some((base, _)) => {
+                banded.extend(names.iter().position(|x| *x == base).map(|h| h as u32));
+            }
+            None if d.op == DevOp::XReduceScatter as u16 => {
+                banded.insert(out);
+            }
+            None => {
+                banded.remove(&out);
+            }
+        }
+    }
+    bad
+}
+
+/// The production recipe (glm53-tp8-90a1b438's recorded knobs; seams, band projections and the
+/// W_uv fold by production default), emitted whole: dense and MoE layers, full and shared
+/// indexers, every bucket with its tail, and the decode rungs. No program reads rows only one
+/// rank holds. The shipped packet 0xa6e7db0b3b83e581, checked instruction by instruction under
+/// the same rule, is clean.
+#[test]
+fn production_programs_read_only_rows_every_rank_holds() {
+    use std::sync::{Arc, Mutex};
+    let _guard = crate::test_env::env_guard();
+    let _target = crate::EmitAmdGuard::set(true);
+    let dir = std::env::temp_dir().join(format!("plow-glm-band-reads-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // Layers 0-2 dense and 3-4 MoE: the seams chain across the dense->MoE boundary, and layer
+    // 4's full indexer selects into the peer slot layer 3's reduce-scatter left banded.
+    let config = serde_json::json!({
+        "model_type": "glm_moe_dsa", "num_hidden_layers": 5,
+        "hidden_size": 6144, "num_attention_heads": 64,
+        "kv_lora_rank": 512, "q_lora_rank": 2048,
+        "qk_nope_head_dim": 192, "qk_rope_head_dim": 64, "v_head_dim": 256,
+        "vocab_size": 128, "rms_norm_eps": 1e-5,
+        "n_routed_experts": 256, "num_experts_per_tok": 8,
+        "moe_intermediate_size": 2048, "intermediate_size": 12288,
+        "first_k_dense_replace": 3, "routed_scaling_factor": 2.5,
+        "rope_theta": 8000000.0,
+        "indexer_types": ["full", "shared", "full", "shared", "full"]
+    });
+    std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+    let _env = crate::test_env::EnvScope::set(&[
+        ("PLOW_FP8", "1"),
+        ("PLOW_GLM_DECODE_NORM_ROWS", "1"),
+        ("PLOW_GLM_DSA", "1"),
+        ("PLOW_GLM_DSA_PF", "1"),
+        ("PLOW_GLM_DSA_PF_SPAN", "3"),
+        ("PLOW_GLM_FP8_KV", "1"),
+        ("PLOW_GLM_FUSE_B1", "1"),
+        ("PLOW_GLM_FUSE_ROPE", "0"),
+        ("PLOW_GLM_FUSE_SEAM", "1"),
+        ("PLOW_GLM_GEMM_LT", "1"),
+        ("PLOW_GLM_GEMM_LT_DECODE", "1"),
+        ("PLOW_GLM_INDEX_TP", "1"),
+        ("PLOW_GLM_MOE_AITER", "1"),
+        ("GLM_MOE_CORESIDENT", "2"),
+        ("PLOW_GLM_MOE_FLAT_DECODE", "0"),
+        ("PLOW_GLM_MOE_RESIDENT", "1"),
+        ("PLOW_GLM_PLACE_PF", "0"),
+        ("PLOW_GLM_SELECT_LOCAL", "1"),
+        ("GLM_SHARD_HEAD", "1"),
+        ("GLM_SHARED_CUS", "48"),
+        ("PLOW_MLA_PREFILL", "full:128,512,2048,8192"),
+        ("PLOW_MOE_PF_DET", "1"),
+        ("PLOW_EMIT_PACKED_PREFILL", "0"),
+        ("PLOW_DECODE_BATCH", "20"),
+        ("PLOW_DECODE_BATCH_LADDER", "1,2,4,8,16,20"),
+        ("PLOW_UNISEG", "0"),
+        ("PLOW_MLA_PF_V2", "1"),
+        ("PLOW_MLA_PF_AITER", "1"),
+        // The recorded production defaults, which `glm_emit_full` does not apply.
+        ("PLOW_GLM_SEQ_PAR", "1"),
+        ("PLOW_GLM_SEQ_PAR_PROJ", "1"),
+        ("PLOW_GLM_FOLD_LT", "1"),
+        ("PLOW_GLM_GEMM_LT_DECODE_EXT", "1"),
+    ]);
+    // Per program: (t, violations, reduce-scatters, TP indexer packets).
+    type Seen = Vec<(u32, Vec<String>, usize, usize)>;
+    let seen: Arc<Mutex<Seen>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    let verify: crate::VerifyHook = Box::new(move |model| {
+        let names: Vec<&str> = model.tensors.iter().map(|x| x.name.as_str()).collect();
+        *sink.lock().unwrap() = model
+            .progs
+            .iter()
+            .zip(&model.prog_t)
+            .map(|(p, &t)| {
+                let count = |op: DevOp| p.insts.iter().filter(|d| d.op == op as u16).count();
+                let bad = band_only_reads(&p.insts, &names);
+                (t, bad, count(DevOp::XReduceScatter), count(DevOp::IndexTpPf))
+            })
+            .collect();
+        Ok(crate::LeanReport::skipped("structural regression test"))
+    });
+    glm_emit_full(
+        &dir,
+        81920,
+        dir.join("model.pkt").to_str().unwrap(),
+        304,
+        8,
+        true,
+        true,
+        "gfx942",
+        None,
+        Some(&verify),
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+    let seen = seen.lock().unwrap();
+    assert!(seen.iter().any(|e| e.2 > 0), "no program carries the seams");
+    assert!(seen.iter().any(|e| e.2 > 0 && e.3 > 0), "no seams program runs the TP indexer");
+    for (t, bad, _, _) in seen.iter() {
+        assert!(bad.is_empty(), "program t={t:#x}: {bad:?}");
+    }
+}
+
+#[test]
+fn single_row_prefill_gemv_preserves_bf16_projection_layout() {
+    let _guard = crate::test_env::env_guard();
+    let _env = crate::test_env::EnvScope::set(&[
+        ("PLOW_GLM_FP8_KV", "1"), ("PLOW_UNISEG", "0"),
+    ]);
+    let mut c = glm_ref_cfg();
+    c.tp = 8;
+    for rows in [1, 2, 8, 128] {
+        let mut decl = Builder::new(304);
+        let n = declare_glm_rows_batched(&mut decl, &c, 81920, &[0], rows, 20, MoeEnc::Fp8Blk);
+        let mut b = Builder::new(304);
+        b.adopt_tensors(decl.tensors());
+        let all = b.all();
+        emit_glm_mla_prefill(&mut b, &c, &n, 0, 81920, rows, MoeEnc::Fp8Blk,
+            n.x, &[], false, &mut 0, &all, None);
+        let p = b.finish();
+        let projections: Vec<_> = p.insts.iter().filter(|d|
+            d.t[0] == n.qlr && d.t[1] == n.xn && d.t[2] == n.lw[0].qad
+        ).collect();
+        assert_eq!(projections.len(), 1);
+        let d = projections[0];
+        assert_eq!(d.op, if rows == 1 { DevOp::Gemv } else { DevOp::GemmSmall } as u16);
+        assert_eq!(d.i[..4], [rows, 2048, 6144, 0]);
+        assert_eq!(d.t[3..], [TENSOR_NONE; 5]);
+    }
+    let quant = kernelcaps::QuantScheme::None;
+    crate::with_emit_target_amd(false, || {
+        assert_eq!(glm_prefill_projection_op(&c, 1, 2048, 6144, 304, quant),
+            pick_tile(1, 2048, 6144, 304, quant));
+    });
+    assert_eq!(glm_prefill_projection_op(&c, 1, 6144, 256, 304, quant),
+        pick_tile(1, 6144, 256, 304, quant));
+    assert_eq!(glm_prefill_projection_op(&c, 1, 2048, 6144, 256, quant),
+        pick_tile(1, 2048, 6144, 256, quant));
+    let fp4 = mxfp4_quant(MoeEnc::Mxfp4);
+    assert_eq!(glm_prefill_projection_op(&c, 1, 2048, 6144, 304, fp4),
+        pick_tile(1, 2048, 6144, 304, fp4));
+    c.tp = 4;
+    assert_eq!(glm_prefill_projection_op(&c, 1, 2048, 6144, 304, quant),
+        pick_tile(1, 2048, 6144, 304, quant));
+}
+
+#[test]
+fn small_prefill_splits_allocate_and_emit_matching_partial_layouts() {
+    let _guard = crate::test_env::env_guard();
+    let _env = crate::test_env::EnvScope::set(&[
+        ("PLOW_GLM_FP8_KV", "1"), ("PLOW_MLA_PF_V2", ""), ("PLOW_UNISEG", "0"),
+    ]);
+    let mut c = glm_ref_cfg();
+    c.tp = 8;
+    for (rows, expected) in [(1,32), (2,32), (4,32), (8,32), (16,32), (20,32),
+        (32,32), (64,32), (128,16), (256,8), (512,4), (1024,2),
+        (2048,1), (4096,1), (8192,1)] {
+        assert_eq!(glm_small_pf_split_cap(&c, 304, rows, false), expected);
+        // A packed-topology program has no KV-split axis in its flash arm: one partial per row.
+        assert_eq!(glm_small_pf_split_cap(&c, 304, rows, true), 1);
+        assert_eq!(crate::with_emit_target_amd(false, || glm_small_pf_split_cap(&c, 304, rows, false)), 1);
+        assert_eq!(glm_small_pf_split_cap(&c, 256, rows, false), 1);
+        let mut decl = Builder::new(304);
+        let n = declare_glm_rows_batched(&mut decl, &c, 81920, &[0], rows, 20, MoeEnc::Fp8Blk);
+        let mut b = Builder::new(304);
+        b.adopt_tensors(decl.tensors());
+        let all = b.all();
+        emit_glm_mla_prefill(&mut b, &c, &n, 0, 81920, rows, MoeEnc::Fp8Blk,
+            n.x, &[], false, &mut 0, &all, None);
+        let prog = b.finish();
+        let ix = prog.insts.iter().position(|d| d.op == DevOp::FlashMlaPrefillFp8 as u16).unwrap();
+        let flash = &prog.insts[ix];
+        let merge = &prog.insts[ix + 1];
+        assert_eq!(flash.j[1], if expected > 1 { expected } else { 0 });
+        if expected > 1 {
+            let segment = prog.stream.iter().find(|e| e.inst as usize == ix).unwrap().seg;
+            assert!(prog.stream.iter().filter(|e| e.seg == segment).all(|e| e.inst as usize == ix));
+        }
+        assert_eq!(merge.op, DevOp::MlaMergeFold as u16);
+        assert_eq!((merge.t[1], merge.t[2], merge.i[4]), (n.opart, n.mlpart, expected));
+        assert!(decl.tensors()[n.opart as usize].bytes >= u64::from(rows) * 8 * u64::from(expected) * 512 * 4);
+        assert!(decl.tensors()[n.mlpart as usize].bytes >= u64::from(rows) * 8 * u64::from(expected) * 2 * 4);
+    }
+}
+
+#[test]
+fn dense_prefill_rungs_populate_keys_for_sparse_decode() {
+    let _guard = crate::test_env::env_guard();
+    let mut c = glm_ref_cfg();
+    c.tp = 8;
+    let ctx = 81920;
+    for sparse_prefill in ["0", "1"] {
+        let _env = crate::test_env::EnvScope::set(&[
+            ("PLOW_GLM_DSA", "1"),
+            ("PLOW_GLM_DSA_PF", sparse_prefill),
+            ("PLOW_GLM_FP8_KV", "1"),
+        ]);
+        for t in [128, 512, 2048, 8192] {
+            let mut decl = Builder::new(304);
+            let n = declare_glm_rows_batched(&mut decl, &c, ctx, &[0], t, 20, MoeEnc::Fp8Blk);
+            assert_ne!(n.kidx_pf, TENSOR_NONE);
+            let mut b = Builder::new(304);
+            b.adopt_tensors(decl.tensors());
+            let all = b.all();
+            emit_glm_mla_prefill(
+                &mut b,
+                &c,
+                &n,
+                0,
+                ctx,
+                t,
+                MoeEnc::Fp8Blk,
+                n.x,
+                &[],
+                false,
+                &mut 0,
+                &all,
+                None,
+            );
+            let p = b.finish();
+            let writers: Vec<_> = p.insts.iter().filter(|d| d.t[0] == n.kidx[0]).collect();
+            assert_eq!(
+                writers.len(),
+                1,
+                "DSA key rows missing or duplicated at T={t}"
+            );
+            let writer = writers[0];
+            assert_eq!(writer.op, DevOp::HeadNormRope as u16);
+            assert_eq!(
+                (writer.t[1], writer.i[0], writer.i[1], writer.i[2]),
+                (n.kidx_pf, t, 1, 128)
+            );
+            assert_eq!(writer.j[1], KV_MASK_NONE);
+            assert!(p
+                .insts
+                .iter()
+                .any(|d| d.t[0] == n.kidx_pf && d.t[1] == n.xn && d.t[2] == n.lw[0].iwk));
+            assert!(p.insts.iter().any(|d| d.op == DevOp::LayerNorm as u16
+                && d.t[0] == n.kidx_pf
+                && d.t[2] == n.lw[0].iknw
+                && d.t[3] == n.lw[0].iknb));
+            if sparse_prefill == "0" || t <= 2048 {
+                assert!(!p.insts.iter().any(|d| matches!(
+                    DevOp::from_u16(d.op),
+                    Some(DevOp::IndexScorePf | DevOp::IndexTpPf | DevOp::IndexSelectPf)
+                )));
+                assert!(!p.insts.iter().any(|d| d.t[2] == n.lw[0].iwqb));
+            }
+        }
+    }
+}
+
 /// The real GLM-5.2-FP8 config dims. `layers` is trimmed — the single
 /// block only touches one layer.
 fn glm_ref_cfg() -> GlmCfg {
@@ -31,6 +319,7 @@ fn glm_ref_cfg() -> GlmCfg {
         route_scale: 2.5,
         attn_scale: (256f32).powf(-0.5),
         rope_theta: Some(8_000_000.0),
+        rope_scale: packet::rope::RopeScale::None,
         prefix: "model.".into(),
         tp: 1,
         ep: false,
@@ -115,6 +404,7 @@ fn ref_sequence(use_fp8: bool) -> Vec<u16> {
 
 #[test]
 fn glm_block_matches_reference_bf16() {
+    let _guard = crate::test_env::env_guard();
     assert_eq!(
         emitted_ops(false),
         ref_sequence(false),
@@ -124,6 +414,7 @@ fn glm_block_matches_reference_bf16() {
 
 #[test]
 fn glm_block_matches_reference_fp8() {
+    let _guard = crate::test_env::env_guard();
     assert_eq!(
         emitted_ops(true),
         ref_sequence(true),
@@ -190,6 +481,7 @@ fn emitted_ops_dsa(ctx: u32, full: bool) -> Vec<u16> {
 
 #[test]
 fn glm_dsa_gate_off_below_cutover() {
+    let _guard = crate::test_env::env_guard();
     use DevOp::*;
     // ctx<=CROSSOVER (65536): NO DSA ops, dense FlashMlaDecode — byte-identical to the non-DSA MoE
     // block. 32768 is in the mid-ctx band, where the measured full-model TP4 winner is dense.
@@ -334,6 +626,7 @@ fn glm_flash_decode_packet_matches_the_arm_the_interpreter_dispatches() {
 ///    drift again without the assert catching it.
 #[test]
 fn glm_dsa_selector_is_bound_to_the_live_kv_length_and_declares_its_geometry() {
+    let _guard = crate::test_env::env_guard();
     let mut c = glm_ref_cfg();
     c.indexer_full = vec![false, false, false, true];
     let ctx = 131072; // above CROSSOVER, so the DSA arm is live
@@ -396,7 +689,371 @@ fn glm_dsa_selector_is_bound_to_the_live_kv_length_and_declares_its_geometry() {
 }
 
 #[test]
+fn glm_sparse_fp8_cache_writer_and_attention_operands() {
+    let _g = crate::test_env::env_guard();
+    let _env = crate::test_env::EnvScope::set(&[
+        ("PLOW_GLM_FP8_KV", "1"),
+        ("PLOW_GLM_DSA", "1"),
+        ("PLOW_GLM_FUSE_ROPE", "0"),
+        ("PLOW_GLM_DSA_PF", "1"),
+    ]);
+    let mut c = glm_ref_cfg();
+    c.heads = 8;
+    c.indexer_full[3] = true;
+    let ctx = 81920;
+    let mut declarations = Builder::new(256);
+    let n = declare_glm_rows_batched(&mut declarations, &c, ctx, &[3], 8192, 16, MoeEnc::Fp8Blk);
+    let tensors = declarations.tensors();
+    assert_eq!(tensors[n.ckv[0] as usize].bytes, 16 * u64::from(ctx) * 512);
+    assert_eq!(
+        tensors[n.kv_scale[0] as usize].bytes,
+        16 * u64::from(ctx) * 4
+    );
+    for rows in [1, 8, 16] {
+        let mut b = Builder::new(256);
+        b.adopt_tensors(tensors.clone());
+        emit_glm_mla(
+            &mut b,
+            &c,
+            &n,
+            0,
+            ctx,
+            rows,
+            16,
+            MoeEnc::Fp8Blk,
+            n.x,
+            &[],
+            false,
+            &mut 0,
+            &[],
+        );
+        let p = b.finish();
+        let writer = p.insts.iter().find(|d| d.t[0] == n.ckv[0]).unwrap();
+        assert_eq!(writer.op, DevOp::HeadNormRopeFp8 as u16);
+        assert_eq!((writer.i[0], writer.i[6], writer.j[0]), (rows, rows, ctx));
+        assert_eq!(writer.t[6], n.kv_scale[0]);
+        let flash = p
+            .insts
+            .iter()
+            .find(|d| d.op == DevOp::FlashMlaDecodeFp8 as u16)
+            .unwrap();
+        assert_eq!(
+            (flash.t[7], flash.j[0], flash.i[6]),
+            (n.kv_scale[0], n.iidx + 1, 2048)
+        );
+    }
+    let mut b = Builder::new(256);
+    b.adopt_tensors(tensors);
+    emit_glm_mla_prefill(
+        &mut b,
+        &c,
+        &n,
+        0,
+        ctx,
+        8192,
+        MoeEnc::Fp8Blk,
+        n.x,
+        &[],
+        false,
+        &mut 0,
+        &[],
+        None,
+    );
+    let p = b.finish();
+    let flash = p
+        .insts
+        .iter()
+        .find(|d| d.op == DevOp::FlashMlaPrefillFp8 as u16)
+        .unwrap();
+    assert_eq!(
+        (flash.t[7], flash.j[0], flash.i[6]),
+        (n.kv_scale[0], n.iuni + 1, 16384)
+    );
+}
+
+#[test]
+fn glm_dsa_local_selection_keeps_one_completion_for_independent_rows() {
+    let _g = crate::test_env::env_guard();
+    let _env = crate::test_env::EnvScope::set(&[("PLOW_GLM_SELECT_LOCAL", "1")]);
+    let mut c = glm_ref_cfg();
+    c.tp = 8;
+    c.indexer_full[3] = true;
+    let ctx = 81920;
+    let mut declarations = Builder::new(304);
+    let n = declare_glm_rows_batched(&mut declarations, &c, ctx, &[3], 8192, 20, MoeEnc::Fp8Blk);
+    let tensors = declarations.tensors();
+    for rows in [1, 2, 4, 8, 16, 20] {
+        let mut b = Builder::new(304);
+        b.adopt_tensors(tensors.clone());
+        let ready = b.emit(DevOp::Nop, vec![0], &[], |_| {});
+        let complete = emit_glm_dsa_decode_select(
+            &mut b,
+            &c,
+            &n,
+            &n.lw[0],
+            0,
+            ctx,
+            rows,
+            20,
+            MoeEnc::Fp8Blk,
+            &(0..304).collect::<Vec<_>>(),
+            c.eps as f32,
+            c.q_lora,
+            c.hidden,
+            ready,
+            ready,
+            &(0..32).collect::<Vec<_>>(),
+            &[0],
+            None,
+        );
+        let p = b.finish();
+        let selects: Vec<_> = p
+            .insts
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.op == DevOp::IndexSelect as u16)
+            .collect();
+        assert_eq!(selects.len(), 1);
+        let (ix, d) = selects[0];
+        assert_eq!(complete as usize, ix);
+        assert_eq!((d.i[3], d.i[4]), (0, u32::from(rows > 1)));
+        assert_eq!(u32::from(d.blocks), if rows == 1 { 32 } else { rows });
+        if rows > 1 {
+            assert_eq!([d.t[2], d.t[3]], [TENSOR_NONE; 2]);
+        }
+        let mut slices: Vec<_> = p
+            .stream
+            .iter()
+            .filter(|e| e.inst as usize == ix)
+            .map(|e| e.slice)
+            .collect();
+        slices.sort_unstable();
+        assert_eq!(slices, (0..u32::from(d.blocks)).collect::<Vec<_>>());
+    }
+}
+
+#[test]
+fn glm_decode_glue_cus_gives_the_key_norm_one_workgroup_per_row() {
+    let _g = crate::test_env::env_guard();
+    let mut c = glm_ref_cfg();
+    c.tp = 8;
+    c.indexer_full[3] = true;
+    let ctx = 81920;
+    let mut declarations = Builder::new(304);
+    let n = declare_glm_rows_batched(&mut declarations, &c, ctx, &[3], 8192, 20, MoeEnc::Fp8Blk);
+    let tensors = declarations.tensors();
+    for glue in ["0", "1"] {
+        let _env = crate::test_env::EnvScope::set(&[
+            ("PLOW_GLM_SELECT_LOCAL", "1"),
+            ("PLOW_GLM_DECODE_GLUE_CUS", glue),
+        ]);
+        for rows in [2, 8, 20] {
+            let mut b = Builder::new(304);
+            b.adopt_tensors(tensors.clone());
+            let ready = b.emit(DevOp::Nop, vec![0], &[], |_| {});
+            let rq: Vec<u32> = (0..3).collect();
+            let rk: Vec<u32> = vec![3];
+            emit_glm_dsa_decode_select(
+                &mut b,
+                &c,
+                &n,
+                &n.lw[0],
+                0,
+                ctx,
+                rows,
+                20,
+                MoeEnc::Fp8Blk,
+                &(0..304).collect::<Vec<_>>(),
+                c.eps as f32,
+                c.q_lora,
+                c.hidden,
+                ready,
+                ready,
+                &rq,
+                &rk,
+                None,
+            );
+            let p = b.finish();
+            let blocks = |op: DevOp| -> Vec<u32> {
+                let ix: Vec<usize> = p
+                    .insts
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, d)| d.op == op as u16)
+                    .map(|(i, _)| i)
+                    .collect();
+                ix.iter().map(|&i| u32::from(p.insts[i].blocks)).collect()
+            };
+            let norm = blocks(DevOp::LayerNorm);
+            assert_eq!(norm, [if glue == "1" { rows } else { 1 }], "glue={glue} rows={rows}");
+        }
+    }
+}
+
+#[test]
+fn glm_dsa_split_selection_gives_each_row_its_own_group_and_strips() {
+    let _g = crate::test_env::env_guard();
+    let _env = crate::test_env::EnvScope::set(&[
+        ("PLOW_GLM_SELECT_LOCAL", "1"),
+        ("PLOW_GLM_SELECT_SPLIT", "15"),
+    ]);
+    let mut c = glm_ref_cfg();
+    c.tp = 8;
+    c.indexer_full[3] = true;
+    let ctx = 81920;
+    let mut declarations = Builder::new(304);
+    let n = declare_glm_rows_batched(&mut declarations, &c, ctx, &[3], 8192, 20, MoeEnc::Fp8Blk);
+    let tensors = declarations.tensors();
+    for rows in [1, 2, 4, 8, 16, 20] {
+        let mut b = Builder::new(304);
+        b.adopt_tensors(tensors.clone());
+        let ready = b.emit(DevOp::Nop, vec![0], &[], |_| {});
+        let complete = emit_glm_dsa_decode_select(
+            &mut b,
+            &c,
+            &n,
+            &n.lw[0],
+            0,
+            ctx,
+            rows,
+            20,
+            MoeEnc::Fp8Blk,
+            &(0..304).collect::<Vec<_>>(),
+            c.eps as f32,
+            c.q_lora,
+            c.hidden,
+            ready,
+            ready,
+            &(0..32).collect::<Vec<_>>(),
+            &[0],
+            None,
+        );
+        let p = b.finish();
+        let selects: Vec<_> = p
+            .insts
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.op == DevOp::IndexSelect as u16)
+            .collect();
+        if rows == 1 {
+            // One row keeps the serialized cooperative form.
+            assert_eq!(selects.len(), 1);
+            let (ix, d) = selects[0];
+            assert_eq!(complete as usize, ix);
+            assert_eq!((d.i[4], u32::from(d.blocks)), (0, 32));
+            continue;
+        }
+        // Three gated packets: g workgroups per row in phases 1-2, one in phase 3.
+        assert_eq!(selects.len(), 3);
+        assert_eq!(complete as usize, selects[2].0);
+        let g = 15.min(304 / rows);
+        for (k, (ix, d)) in selects.iter().enumerate() {
+            let phase = k as u32 + 1;
+            let blocks = if phase == 3 { rows } else { rows * g };
+            assert_eq!((d.i[3], d.i[4], d.i[5], d.i[6]), (0, 2, g, phase));
+            assert_eq!(u32::from(d.blocks), blocks);
+            assert_eq!(
+                [d.t[0], d.t[1], d.t[2], d.t[3], d.t[4], d.t[5], d.t[6]],
+                [n.iidx, n.iscore, n.ighist, n.igctl, n.kvlen, n.ibits, n.icand]
+            );
+            let mut slices: Vec<_> = p
+                .stream
+                .iter()
+                .filter(|e| e.inst as usize == *ix)
+                .map(|e| e.slice)
+                .collect();
+            slices.sort_unstable();
+            assert_eq!(slices, (0..blocks).collect::<Vec<_>>());
+        }
+    }
+    // The strips are sized for every decode row.
+    for (t, bytes) in [
+        (n.ighist, 20 * 4096 * 4),
+        (n.igctl, 20 * 16 * 4),
+        (n.ibits, 20 * 81920u64.div_ceil(32) * 4),
+        (n.icand, 20 * 81920 * 8),
+    ] {
+        assert_eq!(tensors[t as usize].bytes, bytes);
+    }
+}
+
+#[test]
+fn glm_dsa_decode_batch_strides_producers_and_serializes_selection() {
+    let _g = crate::test_env::env_guard();
+    let mut c = glm_ref_cfg();
+    c.indexer_full[3] = true;
+    let ctx = 81920;
+    let mut tb = Builder::new(256);
+    let n = declare_glm_rows_batched(&mut tb, &c, ctx, &[3], 8192, 8, MoeEnc::Fp8Blk);
+    let tensors = tb.tensors();
+    for (handle, bytes) in [
+        (n.qidx, 8 * 32 * 128 * 2),
+        (n.kidx_raw, 8 * 128 * 2),
+        (n.kidx_normed, 8 * 128 * 2),
+        (n.widx, 8 * 32 * 2),
+        (n.iscore, 8 * ctx * 4),
+        (n.iidx, 8 * 2048 * 4),
+    ] {
+        assert_eq!(tensors[handle as usize].bytes, bytes as u64);
+    }
+    for rows in [1, 2, 8] {
+        let mut b = Builder::new(256);
+        b.adopt_tensors(tensors.clone());
+        emit_glm_block(
+            &mut b,
+            &c,
+            &n,
+            0,
+            ctx,
+            rows,
+            8,
+            MoeEnc::Fp8Blk,
+            n.x,
+            n.xnext,
+            &[],
+            &mut 0,
+            &[],
+        );
+        let prog = b.finish();
+        for output in [n.qidx, n.kidx_raw, n.kidx_normed, n.widx, n.iscore] {
+            for d in prog.insts.iter().filter(|d| d.t[0] == output) {
+                assert_eq!(d.i[0], rows, "producer op {}", d.op);
+            }
+        }
+        let writer = prog.insts.iter().find(|d| d.t[0] == n.kidx[0]).unwrap();
+        assert_eq!((writer.i[0], writer.i[6], writer.j[0]), (rows, rows, ctx));
+        let select: Vec<_> = prog
+            .insts
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.op == DevOp::IndexSelect as u16)
+            .collect();
+        assert_eq!(select.len(), rows as usize);
+        for (row, (_, d)) in select.iter().enumerate() {
+            assert_eq!((d.i[0], d.i[1], d.i[3]), (ctx, 2048, row as u32));
+            assert_eq!(d.t[4], n.kvlen);
+        }
+        for pair in select.windows(2) {
+            let before = prog
+                .stream
+                .iter()
+                .find(|e| e.inst as usize == pair[0].0)
+                .unwrap();
+            let after = prog
+                .stream
+                .iter()
+                .find(|e| e.inst as usize == pair[1].0)
+                .unwrap();
+            let succs = &prog.succs[before.succ_ofs as usize..][..before.succ_len as usize];
+            let waits = &prog.waits[after.wait_ofs as usize..][..after.wait_len as usize];
+            assert!(waits.iter().any(|w| succs.contains(&w.id)));
+        }
+    }
+}
+
+#[test]
 fn glm_dsa_full_layer_emits_indexer() {
+    let _guard = crate::test_env::env_guard();
     use DevOp::*;
     // ctx>CROSSOVER, 'full': indexer (2 fp8 projections + LayerNorm + 2 rope + weights_proj GEMV +
     // score + select) then FLASH_GATHER (not dense).
@@ -422,6 +1079,7 @@ fn glm_dsa_full_layer_emits_indexer() {
 
 #[test]
 fn glm_dsa_shared_layer_reuses_idx() {
+    let _guard = crate::test_env::env_guard();
     use DevOp::*;
     // ctx>CROSSOVER, 'shared': NO indexer ops (reuses the last full layer's idx) but still GATHERs.
     let ops = emitted_ops_dsa(131072, false);
@@ -481,6 +1139,7 @@ fn emitted_ops_dsa_pooled(ctx: u32, full: bool, index_kpool: u32) -> Vec<u16> {
 
 #[test]
 fn glm_dsa_pool_size_one_is_byte_identical_to_dense() {
+    let _guard = crate::test_env::env_guard();
     // index_kpool=1 is the explicit no-op path — same op multiset as the ordinary
     // (unspecified-index_kpool, defaults to 1 in glm_ref_cfg) dense-indexer test above,
     // for BOTH full and shared layers. This is the hard regression bar for the whole
@@ -507,6 +1166,7 @@ fn glm_dsa_pool_size_one_is_byte_identical_to_dense() {
 
 #[test]
 fn glm_dsa_pooled_full_layer_emits_the_kpool_chain_in_order() {
+    let _guard = crate::test_env::env_guard();
     use DevOp::*;
     // ctx>CROSSOVER, 'full', index_kpool=4: the pooled indexer chain, not plain IndexScore/
     // IndexSelect — gate-score Gemv, iwp_f32 GemvF32, DsaPoolStash, DsaPoolCompress,
@@ -570,6 +1230,7 @@ fn glm_dsa_pooled_full_layer_emits_the_kpool_chain_in_order() {
 
 #[test]
 fn glm_dsa_pooled_selection_width_matches_decode_and_prefill_geometry() {
+    let _guard = crate::test_env::env_guard();
     const CTX: u32 = 131072;
     const POOL: u32 = 4;
     const WIDTH: u32 = 2051;
@@ -605,6 +1266,7 @@ fn glm_dsa_pooled_selection_width_matches_decode_and_prefill_geometry() {
 
 #[test]
 fn glm_dsa_pooled_shared_layer_reuses_the_pool_cache() {
+    let _guard = crate::test_env::env_guard();
     use DevOp::*;
     // 'shared' pooled layers reuse the last full layer's selection — no indexer ops of
     // ANY kind (dense or pooled), same as the dense-indexer shared-layer case.
@@ -630,6 +1292,7 @@ fn glm_dsa_pooled_shared_layer_reuses_the_pool_cache() {
 
 #[test]
 fn glm_dense_block_sequence() {
+    let _guard = crate::test_env::env_guard();
     use DevOp::*;
     // Fused MLA (A+G): the 3 input GEMVs (q_a/kv_a/k_rope) -> one GemvQkv, and Wqa+Wqr -> one GemvQkv.
     let mla = vec![
@@ -654,6 +1317,7 @@ fn glm_dense_block_sequence() {
 
 #[test]
 fn glm_block_op_count() {
+    let _guard = crate::test_env::env_guard();
     // 16 attention/pre-MoE ops after the A/G fusion (input q_a/kv_a/k_rope -> 1 GemvQkv, Wqa/Wqr
     // -> 1 GemvQkv; 2 dynamic-rope HeadNormRope + the 2-op router split + fused MlaMergeFold)
     // + 8*(glu+down) + 1 combine = 33 (was 36 pre-fusion).
@@ -676,6 +1340,7 @@ fn block_ops(c: &GlmCfg, ctx: u32, block: std::ops::Range<usize>) -> Vec<u16> {
 /// coverage lever: the block inherits glm_block_matches_reference_*'s GPU parity.
 #[test]
 fn glm_block_extract_matches_reference() {
+    let _guard = crate::test_env::env_guard();
     let c = glm_ref_cfg();
     assert_eq!(
         block_ops(&c, 512, 3..4),
@@ -699,6 +1364,7 @@ fn glm_block_extract_matches_reference() {
 /// same byte sizes.
 #[test]
 fn the_weight_prefix_is_cfg_data_and_moves_only_the_weights() {
+    let _guard = crate::test_env::env_guard();
     let decl = |pfx: &str| {
         let mut c = glm_ref_cfg();
         c.prefix = pfx.to_string();
@@ -763,6 +1429,7 @@ fn the_weight_prefix_is_cfg_data_and_moves_only_the_weights() {
 /// like a weight, lives under the model prefix, and must NOT be demanded of a checkpoint.
 #[test]
 fn the_new_weight_predicate_binds_everything_the_old_one_did() {
+    let _guard = crate::test_env::env_guard();
     let c = glm_ref_cfg();
     let mut b = Builder::new(256);
     let _ = declare_glm(&mut b, &c, 512, &[3]);
@@ -798,6 +1465,7 @@ fn the_new_weight_predicate_binds_everything_the_old_one_did() {
 /// `act.x` after an even layer count.
 #[test]
 fn glm_block_extract_multi_layer_chains() {
+    let _guard = crate::test_env::env_guard();
     let c = glm_ref_cfg();
     let mut want = emitted_dense_ops(); // layer 2 (dense)
     want.extend(ref_sequence(true)); // layer 3 (MoE)
@@ -818,6 +1486,7 @@ fn glm_block_extract_multi_layer_chains() {
 /// layer count) + kv carried state, DSA gate OFF at this ctx (no dsa_indices).
 #[test]
 fn glm_block_descriptor_moe() {
+    let _guard = crate::test_env::env_guard();
     let c = glm_ref_cfg(); // indexer_full[3] = false (reuse)
     let (_, d) = glm_build_block(&c, 512, 256, 3..4, true, "glm-ref", MlaArch::Glm);
     assert_eq!(d.arch, "glm_mla_dsa");
@@ -851,6 +1520,7 @@ fn glm_block_descriptor_moe() {
 /// Descriptor for a DENSE block (`--block 0`): no MoE dims, dense_ffn kind.
 #[test]
 fn glm_block_descriptor_dense() {
+    let _guard = crate::test_env::env_guard();
     let c = glm_ref_cfg();
     let (_, d) = glm_build_block(&c, 512, 256, 0..1, true, "glm-ref", MlaArch::Glm);
     assert_eq!(d.kind, vec!["mla_dsa", "dense_ffn"]);
@@ -864,6 +1534,7 @@ fn glm_block_descriptor_dense() {
 /// 'indexer' layer computes them in-block (kv carries its kidx cache instead).
 #[test]
 fn glm_block_dsa_indexshare_carried_state() {
+    let _guard = crate::test_env::env_guard();
     // 'reuse' layer 3 (indexer_types[3] = shared).
     let mut c = glm_ref_cfg();
     c.indexer_full = vec![false, false, false, false];
@@ -1106,6 +1777,172 @@ fn blocked_gemv_drops_only_the_empty_ceiling_tail() {
     assert_eq!(blocked_gemv_cus(&all, 16 * 512 + 16 * 64).len(), 256);
 }
 
+#[test]
+fn glm_decode_gemv_tuning_preserves_live_column_ownership() {
+    let _guard = crate::test_env::env_guard();
+    let _env = crate::test_env::EnvScope::set(&[
+        ("PLOW_GLM_WGFIT", "1"),
+        ("PLOW_GEMV_WG_TUNING", ""),
+        ("PLOW_GLM_DSA", "1"),
+        ("PLOW_GLM_FUSE_ROPE", "0"),
+    ]);
+    let mut c = glm_ref_cfg();
+    c.tp = 8;
+    let all: Vec<u32> = (0..304).collect();
+    let mut declarations = Builder::new(304);
+    let n = declare_glm_rows_batched(&mut declarations, &c, 81920, &[3], 8192, 8, MoeEnc::Fp8Blk);
+    let tensors = declarations.tensors();
+    for rows in [1, 2, 4, 8] {
+        let emit = || {
+            let mut b = Builder::new(304);
+            b.adopt_tensors(tensors.clone());
+            emit_glm_block(
+                &mut b,
+                &c,
+                &n,
+                0,
+                81920,
+                rows,
+                8,
+                MoeEnc::Fp8Blk,
+                n.x,
+                n.xnext,
+                &[],
+                &mut 0,
+                &all,
+            );
+            b.finish()
+        };
+        let baseline = emit();
+        let _tuning =
+            crate::test_env::EnvScope::set(&[("PLOW_GEMV_WG_TUNING", "64x6144=304,256x6144=304")]);
+        let tuned = emit();
+        assert_eq!(baseline.insts.len(), tuned.insts.len());
+        let mut changed = 0;
+        for (before, after) in baseline.insts.iter().zip(&tuned.insts) {
+            assert_eq!(
+                (before.op, before.t, before.i, before.j, before.f),
+                (after.op, after.t, after.i, after.j, after.f)
+            );
+            if before.blocks != after.blocks {
+                changed += 1;
+                assert_eq!(after.op, DevOp::Gemv as u16);
+                assert!(matches!(after.i[1], 64 | 256));
+                assert_eq!(after.i[2], 6144);
+                let n = after.i[1];
+                let per = n.div_ceil(u32::from(before.blocks));
+                assert_eq!(n.div_ceil(u32::from(after.blocks)), per);
+                for column in 0..n {
+                    assert!(column / per < u32::from(after.blocks));
+                }
+            }
+        }
+        if rows > 1 {
+            assert!(changed > 0, "B{rows} tuning was ignored");
+        }
+    }
+    let all: Vec<_> = (0..304).rev().collect();
+    let _tuning = crate::test_env::EnvScope::set(&[("PLOW_GEMV_WG_TUNING", "64x6144=304")]);
+    assert_eq!(glm_decode_gemv_cus(&all, DevOp::Gemv, 64, 6144), all[..64]);
+    for op in [DevOp::GemvMxfp4, DevOp::GemvFp8Blk, DevOp::GemvQkv] {
+        assert_eq!(glm_decode_gemv_cus(&all, op, 64, 6144), all);
+    }
+    assert_eq!(glm_decode_gemv_cus(&all, DevOp::Gemv, 64, 2048), all);
+    let _disabled = crate::test_env::EnvScope::set(&[("PLOW_GLM_WGFIT", "0")]);
+    assert_eq!(glm_decode_gemv_cus(&all, DevOp::Gemv, 64, 6144), all);
+}
+
+#[test]
+fn glm_decode_norm_rows_preserves_arithmetic_and_completion() {
+    let _guard = crate::test_env::env_guard();
+    let _target = crate::EmitAmdGuard::set(true);
+    let _env = crate::test_env::EnvScope::set(&[
+        ("PLOW_GLM_DECODE_NORM_ROWS", "0"),
+        ("PLOW_GLM_FUSE_B1", "1"),
+        ("PLOW_GLM_FUSE_SEAM", "1"),
+        ("PLOW_GLM_FUSE_QNORM", "0"),
+        ("GLM_FUSE_XRN", "0"),
+        ("PLOW_GLM_MOE_RESIDENT", "0"),
+    ]);
+    let mut c = glm_ref_cfg();
+    c.tp = 8;
+    c.layers = 5;
+    c.indexer_full.push(false);
+    let layers: Vec<_> = (0..c.layers).collect();
+    let mut declarations = Builder::new(304);
+    let n = declare_glm_rows_batched(&mut declarations, &c, 64, &layers, 128, 20, MoeEnc::Fp8Blk);
+    let tensors = declarations.tensors();
+    for rows in [1, 2, 3, 4, 8, 16, 20] {
+        let emit = || {
+            let mut b = Builder::new(304);
+            b.adopt_tensors(tensors.clone());
+            let all = b.all();
+            let mut dep = Vec::new();
+            let mut xgate = 0;
+            let mut cur = n.x;
+            for (slot, &layer) in layers.iter().enumerate() {
+                let next = if cur == n.x { n.xnext } else { n.x };
+                let emit_block = if c.is_dense(layer) {
+                    emit_glm_dense_block
+                } else {
+                    emit_glm_block
+                };
+                dep = vec![emit_block(
+                    &mut b,
+                    &c,
+                    &n,
+                    slot,
+                    64,
+                    rows,
+                    20,
+                    MoeEnc::Fp8Blk,
+                    cur,
+                    next,
+                    &dep,
+                    &mut xgate,
+                    &all,
+                )];
+                cur = next;
+            }
+            b.finish()
+        };
+        let baseline = emit();
+        let _wide = crate::test_env::EnvScope::set(&[("PLOW_GLM_DECODE_NORM_ROWS", "1")]);
+        let wide = emit();
+        assert_eq!(baseline.insts.len(), wide.insts.len());
+        let mut changed = 0;
+        for (ix, (before, after)) in baseline.insts.iter().zip(&wide.insts).enumerate() {
+            assert_eq!(
+                (before.op, before.t, before.i, before.j, before.f),
+                (after.op, after.t, after.i, after.j, after.f)
+            );
+            if before.blocks != after.blocks {
+                changed += 1;
+                assert!(matches!(
+                    DevOp::from_u16(after.op),
+                    Some(DevOp::RmsNorm | DevOp::AddNorm)
+                ));
+                assert_eq!(after.blocks as u32, rows);
+                let slices: std::collections::BTreeSet<_> = wide
+                    .stream
+                    .iter()
+                    .filter(|e| e.inst as usize == ix)
+                    .map(|e| e.slice)
+                    .collect();
+                assert_eq!(slices, (0..rows).collect());
+                for wait in wide.waits.iter().filter(|w| w.id as usize == ix) {
+                    assert_eq!(wait.threshold, rows);
+                }
+            }
+        }
+        if rows == 1 {
+            assert_eq!(baseline.to_blob(), wide.to_blob());
+        } else {
+            assert_eq!(changed, 15);
+        }
+    }
+}
+
 /// The MLA flash-decode split factor is the ctx-scaled cost optimum, capped by the ACTUAL
 /// per-rank chip-fill `fill = ceil(n_cu / (nh_l/GF))` and the KV-tile count. `glm_nsplit` takes
 /// nh_l (= n_head/tp) so the cap is correct under TP/EP — the pre-fix bug sized it from the
@@ -1113,6 +1950,7 @@ fn blocked_gemv_drops_only_the_empty_ceiling_tail() {
 /// measured (MI350X mla_perf) chain optima: ns~16 up to 8k, ns~64 at 32k.
 #[test]
 fn glm_nsplit_is_ctx_scaled_and_capped_per_rank() {
+    let _guard = crate::test_env::env_guard();
     let n_cu = 256u32;
     for &(_tp, nh_l) in &[(1u32, 64u32), (2, 32), (4, 16), (8, 8)] {
         let n_grp = (nh_l / GLM_MLA_GF).max(1);
@@ -1182,6 +2020,7 @@ fn glm_nsplit_is_ctx_scaled_and_capped_per_rank() {
 
 #[test]
 fn glm_cfg_qk_scale() {
+    let _guard = crate::test_env::env_guard();
     let c = glm_ref_cfg();
     assert_eq!(c.qk_head(), 256);
     assert!(
@@ -1208,6 +2047,7 @@ fn glm_cfg_qk_scale() {
 /// this test set the var. Test the pure part as a pure function.
 #[test]
 fn glm_linear_fp8_prefill_routes_to_the_block_fp8_gemm() {
+    let _guard = crate::test_env::env_guard();
     let mut b = Builder::new(256);
     let w = b.tensor("w.weight_fp8", 6144 * 4096);
     let s = b.tensor("w.weight_scale_inv", 48 * 32 * F32);
@@ -1233,6 +2073,7 @@ fn glm_linear_fp8_prefill_routes_to_the_block_fp8_gemm() {
 /// The two handles are declared as a pair; refuse rather than emit half of one.
 #[test]
 fn glm_linear_fp8_prefill_refuses_a_weight_with_no_scale_grid() {
+    let _guard = crate::test_env::env_guard();
     let mut b = Builder::new(256);
     let w = b.tensor("w.weight_fp8", 64);
     let x = b.tensor("act.x", 64);
@@ -1279,6 +2120,7 @@ fn glm53_ref_cfg() -> GlmCfg {
         route_scale: 1.0,
         attn_scale: (512f32).powf(-0.5),
         rope_theta: None,
+        rope_scale: packet::rope::RopeScale::None,
         prefix: "model.language_model.".into(),
         tp: 1,
         ep: false,
@@ -1309,6 +2151,7 @@ fn glm53_ref_cfg() -> GlmCfg {
 /// references must be within the final table's bounds.
 #[test]
 fn glm53_program_assembly_keeps_every_tensor_handle_in_the_final_table() {
+    let _guard = crate::test_env::env_guard();
     let c = glm53_ref_cfg();
     let layers: Vec<u32> = (0..c.layers).collect();
     let enc = MoeEnc::from_flags(false, false);
@@ -1334,4 +2177,2043 @@ fn glm53_program_assembly_keeps_every_tensor_handle_in_the_final_table() {
             );
         }
     }
+}
+
+#[test]
+fn glm_placed_prefill_preserves_native_segment_boundaries() {
+    let _guard = crate::test_env::env_guard();
+    let _target = crate::EmitAmdGuard::set(true);
+    let _env = crate::test_env::EnvScope::set(&[
+        ("PLOW_MLA_PREFILL", "full:128"),
+        ("PLOW_GLM_PLACE_PF", "1"),
+        ("PLOW_GLM_MOE_AITER", "1"),
+        ("PLOW_EMIT_PACKED_PREFILL", "0"),
+        ("PLOW_UNISEG", "0"),
+    ]);
+    let dir = std::env::temp_dir().join(format!("plow-glm-placed-prefill-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = serde_json::json!({
+        "model_type": "glm_moe_dsa", "num_hidden_layers": 4,
+        "hidden_size": 6144, "num_attention_heads": 64,
+        "kv_lora_rank": 512, "q_lora_rank": 2048,
+        "qk_nope_head_dim": 192, "qk_rope_head_dim": 64, "v_head_dim": 256,
+        "vocab_size": 128, "rms_norm_eps": 1e-5,
+        "n_routed_experts": 256, "num_experts_per_tok": 8,
+        "moe_intermediate_size": 2048, "intermediate_size": 12288,
+        "first_k_dense_replace": 3, "routed_scaling_factor": 2.5,
+        "rope_theta": 8000000.0
+    });
+    std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+    let verify: crate::VerifyHook = Box::new(|model| {
+        let prefill = &model.progs[0];
+        assert_eq!(prefill.l2_domains, 8);
+        let native = prefill
+            .insts
+            .iter()
+            .position(|d| d.op == DevOp::MoeAiterFp8Pf as u16)
+            .unwrap();
+        let segment = prefill
+            .stream
+            .iter()
+            .find(|e| e.inst as usize == native)
+            .unwrap()
+            .seg;
+        assert!(segment > 0);
+        for entries in [&prefill.stream, &prefill.gq_stream] {
+            assert!(entries
+                .iter()
+                .filter(|e| e.seg == segment)
+                .all(|e| e.inst as usize == native));
+            assert!(entries.iter().any(|e| e.seg > segment));
+        }
+        let segments = prefill
+            .stream
+            .iter()
+            .map(|e| usize::from(e.seg) + 1)
+            .max()
+            .unwrap();
+        assert_eq!(prefill.gq_seg_ofs.len(), segments * 8 + 1);
+        Ok(crate::LeanReport::skipped("structural regression test"))
+    });
+    glm_emit_full(
+        &dir,
+        512,
+        dir.join("model.pkt").to_str().unwrap(),
+        304,
+        8,
+        true,
+        true,
+        "gfx942",
+        Some(packet::devbuild::L2Layout {
+            sms: 38,
+            domains: 8,
+            map: packet::devbuild::L2Map::RoundRobin,
+        }),
+        Some(&verify),
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn glm_flat_decode_preserves_xcd_native_segment_boundaries() {
+    check_glm_flat_segments(false);
+}
+
+#[test]
+fn glm_resident_moe_preserves_all_native_segment_boundaries() {
+    check_glm_flat_segments(true);
+}
+
+fn check_glm_flat_segments(resident: bool) {
+    let _guard = crate::test_env::env_guard();
+    let _target = crate::EmitAmdGuard::set(true);
+    let _env = crate::test_env::EnvScope::set(&[
+        ("PLOW_MLA_PREFILL", if resident { "full:1,2,4,8,16,20,32,64,128,256,512,1024,2048,4096,8192" } else { "full:128" }),
+        ("PLOW_GLM_PLACE_PF", "0"),
+        ("PLOW_GLM_MOE_AITER", "0"),
+        ("PLOW_GLM_MOE_FLAT_DECODE", if resident { "0" } else { "1" }),
+        ("PLOW_GLM_MOE_RESIDENT", if resident { "1" } else { "0" }),
+        (
+            "PLOW_DECODE_BATCH_LADDER",
+            if resident { "1,2,4,8,16,20" } else { "1,2,4,8" },
+        ),
+        ("PLOW_EMIT_PACKED_PREFILL", "0"),
+        ("PLOW_UNISEG", "0"),
+    ]);
+    let dir = std::env::temp_dir().join(format!("plow-glm-flat-decode-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = serde_json::json!({
+        "model_type": "glm_moe_dsa", "num_hidden_layers": 4,
+        "hidden_size": 6144, "num_attention_heads": 64,
+        "kv_lora_rank": 512, "q_lora_rank": 2048,
+        "qk_nope_head_dim": 192, "qk_rope_head_dim": 64, "v_head_dim": 256,
+        "vocab_size": 128, "rms_norm_eps": 1e-5,
+        "n_routed_experts": 256, "num_experts_per_tok": 8,
+        "moe_intermediate_size": 2048, "intermediate_size": 12288,
+        "first_k_dense_replace": 3, "routed_scaling_factor": 2.5,
+        "rope_theta": 8000000.0
+    });
+    std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+    let verify: crate::VerifyHook = Box::new(move |model| {
+        let mut checked = 0;
+        let prefill_count = packet::devbuild::decode_rung_lo(&model.prog_t);
+        assert_eq!(prefill_count, if resident { 15 } else { 1 });
+        for (p, (prog, &rows)) in model.progs.iter().zip(&model.prog_t).enumerate() {
+            let decode = p >= prefill_count;
+            let native = prog
+                .insts
+                .iter()
+                .enumerate()
+                .filter(|(_, d)| d.op == DevOp::MoeAiterFp8Pf as u16)
+                .collect::<Vec<_>>();
+            if !resident && !matches!(rows, 2 | 4 | 8) {
+                assert!(native.is_empty());
+                continue;
+            }
+            checked += 1;
+            if decode {
+                assert_eq!(prog.l2_domains, 8);
+            }
+            assert_eq!(native.len(), 1);
+            let (ix, inst) = native[0];
+            if !decode {
+                assert_eq!(inst.i, [rows, 6144, 256, 256, 8, 64, 2, 1]);
+                let combine = prog.insts[ix + 1..]
+                    .iter()
+                    .find(|d| d.op == DevOp::MoeCombinePf as u16 && d.t[3] == inst.t[0])
+                    .unwrap();
+                assert_eq!(combine.i, [6144, 1, rows, 0, 0, 0, 0, 1]);
+            } else {
+                assert_eq!(inst.i, [rows, 6144, 256, 256, 8, 0, 1, u32::from(resident)]);
+                assert_eq!(&inst.t[5..], &[TENSOR_NONE; 3]);
+                let router = prog.insts[..ix]
+                    .iter()
+                    .rposition(|d| d.op == DevOp::MoeRouterTopkPf as u16 && d.t[0] == inst.t[4])
+                    .unwrap();
+                assert!(!prog.insts[router..ix]
+                    .iter()
+                    .any(|d| d.op == DevOp::MoeAlignPf as u16));
+                let combine = prog.insts[ix + 1..]
+                    .iter()
+                    .find(|d| d.op == DevOp::MoeCombinePf as u16 && d.t[3] == inst.t[0])
+                    .unwrap();
+                assert_eq!(combine.i, [6144, 1, rows, 0, 0, 0, 0, 1]);
+            }
+            let segment = prog
+                .stream
+                .iter()
+                .find(|e| e.inst as usize == ix)
+                .unwrap()
+                .seg;
+            assert!(segment > 0);
+            for entries in [&prog.stream, &prog.gq_stream] {
+                for e in entries.iter().filter(|e| e.seg == segment) {
+                    assert_eq!(e.inst as usize, ix);
+                    assert_eq!(
+                        (e.wait_len, e.succ_len, e.flags & packet::dev::SE_XCTR),
+                        (0, 0, 0)
+                    );
+                }
+                assert!(entries.iter().any(|e| e.seg > segment));
+            }
+            let segments = prog
+                .stream
+                .iter()
+                .map(|e| usize::from(e.seg) + 1)
+                .max()
+                .unwrap();
+            if decode {
+                assert_eq!(prog.gq_seg_ofs.len(), segments * 8 + 1);
+            }
+        }
+        assert_eq!(checked, if resident { 21 } else { 3 });
+        Ok(crate::LeanReport::skipped(
+            "flat decode segment regression test",
+        ))
+    });
+    glm_emit_full(
+        &dir,
+        81920,
+        dir.join("model.pkt").to_str().unwrap(),
+        304,
+        8,
+        true,
+        true,
+        "gfx942",
+        Some(packet::devbuild::L2Layout {
+            sms: 38,
+            domains: 8,
+            map: packet::devbuild::L2Map::RoundRobin,
+        }),
+        Some(&verify),
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn glm_native_decode_gemm_preserves_xcd_boundaries() {
+    let _guard = crate::test_env::env_guard();
+    let _target = crate::EmitAmdGuard::set(true);
+    let _env = crate::test_env::EnvScope::set(&[
+        ("PLOW_MLA_PREFILL", "full:128"),
+        ("PLOW_GLM_PLACE_PF", "0"),
+        ("PLOW_GLM_MOE_AITER", "0"),
+        ("PLOW_GLM_MOE_FLAT_DECODE", "0"),
+        ("PLOW_GLM_GEMM_LT_DECODE", "1"),
+        ("PLOW_GLM_GEMM_LT", "0"),
+        ("PLOW_DECODE_BATCH_LADDER", "1,16,20"),
+        ("PLOW_EMIT_PACKED_PREFILL", "0"),
+        ("PLOW_UNISEG", "0"),
+    ]);
+    let dir = std::env::temp_dir().join(format!("plow-glm-native-gemm-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = serde_json::json!({
+        "model_type": "glm_moe_dsa", "num_hidden_layers": 4,
+        "hidden_size": 6144, "num_attention_heads": 64,
+        "kv_lora_rank": 512, "q_lora_rank": 2048,
+        "qk_nope_head_dim": 192, "qk_rope_head_dim": 64, "v_head_dim": 256,
+        "vocab_size": 128, "rms_norm_eps": 1e-5,
+        "n_routed_experts": 256, "num_experts_per_tok": 8,
+        "moe_intermediate_size": 2048, "intermediate_size": 12288,
+        "first_k_dense_replace": 3, "routed_scaling_factor": 2.5,
+        "rope_theta": 8000000.0
+    });
+    std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+    let verify: crate::VerifyHook = Box::new(|model| {
+        let mut checked = 0;
+        for (prog, &rows) in model.progs.iter().zip(&model.prog_t) {
+            let native = prog
+                .insts
+                .iter()
+                .enumerate()
+                .filter(|(_, d)| d.op == DevOp::GemmLtPf as u16)
+                .collect::<Vec<_>>();
+            if !matches!(rows, 16 | 20) {
+                assert!(native.is_empty());
+                continue;
+            }
+            checked += 1;
+            assert_eq!(prog.l2_domains, 8);
+            assert_eq!(native.len(), 16);
+            assert_eq!(
+                native
+                    .iter()
+                    .filter(|(_, d)| (d.i[1], d.i[2]) == (256, 6144))
+                    .count(),
+                3
+            );
+            assert_eq!(
+                native
+                    .iter()
+                    .filter(|(_, d)| (d.i[1], d.i[2]) == (6144, 256))
+                    .count(),
+                1
+            );
+            for (ix, inst) in native {
+                assert_eq!(inst.i[0], rows);
+                assert_eq!(inst.i[3], 1);
+                assert!(matches!(
+                    (inst.i[1], inst.i[2]),
+                    (2048, 6144)
+                        | (512, 6144)
+                        | (4096, 2048)
+                        | (6144, 2048)
+                        | (256, 6144)
+                        | (6144, 256)
+                ));
+                let segment = prog
+                    .stream
+                    .iter()
+                    .find(|e| e.inst as usize == ix)
+                    .unwrap()
+                    .seg;
+                assert!(segment > 0);
+                for entries in [&prog.stream, &prog.gq_stream] {
+                    for e in entries.iter().filter(|e| e.seg == segment) {
+                        assert_eq!(e.inst as usize, ix);
+                        assert_eq!(
+                            (e.wait_len, e.succ_len, e.flags & packet::dev::SE_XCTR),
+                            (0, 0, 0)
+                        );
+                    }
+                    assert!(entries.iter().any(|e| e.seg > segment));
+                }
+            }
+            let segments = prog
+                .stream
+                .iter()
+                .map(|e| usize::from(e.seg) + 1)
+                .max()
+                .unwrap();
+            assert_eq!(prog.gq_seg_ofs.len(), segments * 8 + 1);
+        }
+        assert_eq!(checked, 2);
+        Ok(crate::LeanReport::skipped(
+            "native decode GEMM segment regression test",
+        ))
+    });
+    glm_emit_full(
+        &dir,
+        512,
+        dir.join("model.pkt").to_str().unwrap(),
+        304,
+        8,
+        true,
+        true,
+        "gfx942",
+        Some(packet::devbuild::L2Layout {
+            sms: 38,
+            domains: 8,
+            map: packet::devbuild::L2Map::RoundRobin,
+        }),
+        Some(&verify),
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn glm_native_decode_gemm_ext_covers_rung8_and_narrow_projections() {
+    let _guard = crate::test_env::env_guard();
+    let _target = crate::EmitAmdGuard::set(true);
+    let _env = crate::test_env::EnvScope::set(&[
+        ("PLOW_MLA_PREFILL", "full:128"),
+        ("PLOW_GLM_PLACE_PF", "0"),
+        ("PLOW_GLM_MOE_AITER", "0"),
+        ("PLOW_GLM_MOE_FLAT_DECODE", "0"),
+        ("PLOW_GLM_GEMM_LT_DECODE", "1"),
+        ("PLOW_GLM_GEMM_LT_DECODE_EXT", "1"),
+        ("PLOW_GLM_GEMM_LT", "0"),
+        ("GLM_SHARD_HEAD", "1"),
+        ("PLOW_DECODE_BATCH_LADDER", "1,4,8,16,20"),
+        ("PLOW_EMIT_PACKED_PREFILL", "0"),
+        ("PLOW_UNISEG", "0"),
+    ]);
+    let dir =
+        std::env::temp_dir().join(format!("plow-glm-native-gemm-ext-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // GLM-5.3 geometry with the real vocab: the lm_head shard is the whitelisted [19360, 6144].
+    let config = serde_json::json!({
+        "model_type": "glm_moe_dsa", "num_hidden_layers": 4,
+        "hidden_size": 6144, "num_attention_heads": 64,
+        "kv_lora_rank": 512, "q_lora_rank": 2048,
+        "qk_nope_head_dim": 192, "qk_rope_head_dim": 64, "v_head_dim": 256,
+        "vocab_size": 154880, "rms_norm_eps": 1e-5,
+        "n_routed_experts": 256, "num_experts_per_tok": 8,
+        "moe_intermediate_size": 2048, "intermediate_size": 12288,
+        "first_k_dense_replace": 3, "routed_scaling_factor": 2.5,
+        "rope_theta": 8000000.0
+    });
+    std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+    let verify: crate::VerifyHook = Box::new(|model| {
+        let mut checked = 0;
+        for (prog, &rows) in model.progs.iter().zip(&model.prog_t) {
+            let native = prog
+                .insts
+                .iter()
+                .enumerate()
+                .filter(|(_, d)| d.op == DevOp::GemmLtPf as u16)
+                .collect::<Vec<_>>();
+            // Prefill buckets and rungs 1/4 stay on the interpreter GEMV.
+            if !matches!(rows, 8 | 16 | 20) {
+                assert!(native.is_empty(), "rows={rows}");
+                continue;
+            }
+            checked += 1;
+            let count = |shape: (u32, u32)| {
+                native
+                    .iter()
+                    .filter(|(_, d)| (d.i[1], d.i[2]) == shape)
+                    .count()
+            };
+            // The EXT shapes: k_rope and q_rope once per layer wherever the rung emits them
+            // unfused (fusions A/G fold them into a GemvQkv below their LDS fit), lm_head once.
+            let fused = |nq: u32, k: u32| {
+                prog.insts
+                    .iter()
+                    .filter(|d| d.op == DevOp::GemvQkv as u16 && (d.i[1], d.i[2]) == (nq, k))
+                    .count()
+            };
+            assert_eq!(count((64, 6144)) + fused(2048, 6144), 4, "k_rope rows={rows}");
+            assert_eq!(count((512, 2048)) + fused(4096, 2048), 4, "q_rope rows={rows}");
+            assert_eq!(count((19360, 6144)), 1, "lm_head rows={rows}");
+            // The base set the plain knob already routes is still routed where it is unfused
+            // (rung 8 folds q_a|kv_a into fusion A in this 4-layer model).
+            for shape in [
+                (2048, 6144),
+                (512, 6144),
+                (4096, 2048),
+                (6144, 2048),
+                (256, 6144),
+                (6144, 256),
+            ] {
+                let fused_form = match shape {
+                    (2048, 6144) | (512, 6144) => fused(2048, 6144),
+                    (4096, 2048) => fused(4096, 2048),
+                    _ => 0,
+                };
+                assert!(count(shape) + fused_form > 0, "{shape:?} rows={rows}");
+            }
+            assert!(
+                prog.insts.iter().all(|d| d.op != DevOp::Gemv as u16
+                    || !matches!((d.i[1], d.i[2]), (64, 6144) | (512, 2048) | (19360, 6144))),
+                "an EXT shape stayed on the interpreter GEMV at rows={rows}"
+            );
+            for (ix, inst) in native {
+                assert_eq!(inst.i[0], rows);
+                assert_eq!(inst.i[3], 1);
+                assert_eq!(inst.i[4..], [0; 4]);
+                let segment = prog
+                    .stream
+                    .iter()
+                    .find(|e| e.inst as usize == ix)
+                    .unwrap()
+                    .seg;
+                for e in prog.stream.iter().filter(|e| e.seg == segment) {
+                    assert_eq!(e.inst as usize, ix);
+                    assert_eq!(
+                        (e.wait_len, e.succ_len, e.flags & packet::dev::SE_XCTR),
+                        (0, 0, 0)
+                    );
+                }
+            }
+        }
+        assert_eq!(checked, 3);
+        Ok(crate::LeanReport::skipped(
+            "native decode GEMM EXT regression test",
+        ))
+    });
+    glm_emit_full(
+        &dir,
+        512,
+        dir.join("model.pkt").to_str().unwrap(),
+        304,
+        8,
+        true,
+        true,
+        "gfx942",
+        None,
+        Some(&verify),
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// `PLOW_GLM_DECODE_GEMM_GROUP` only reorders: every program keeps the same instructions, rungs
+/// without native decode GEMMs keep their order, and on the native rungs the MoE layer's router and
+/// shared gate/up GEMMs are adjacent while top-k and Glu share one segment.
+#[test]
+fn glm_decode_gemm_group_reorders_native_gemms_without_changing_work() {
+    let _guard = crate::test_env::env_guard();
+    let _target = crate::EmitAmdGuard::set(true);
+    type Inst = (u16, u32, u32, u16);
+    type Prog = (u32, Vec<Inst>, Vec<String>);
+    let emit = |group: &str| -> Vec<Prog> {
+        let _env = crate::test_env::EnvScope::set(&[
+            ("PLOW_MLA_PREFILL", "full:128"),
+            ("PLOW_GLM_PLACE_PF", "0"),
+            ("PLOW_GLM_MOE_AITER", "0"),
+            ("PLOW_GLM_MOE_FLAT_DECODE", "0"),
+            ("PLOW_GLM_GEMM_LT_DECODE", "1"),
+            ("PLOW_GLM_GEMM_LT_DECODE_EXT", "1"),
+            ("PLOW_GLM_GEMM_LT", "0"),
+            ("GLM_SHARD_HEAD", "1"),
+            ("PLOW_DECODE_BATCH_LADDER", "1,4,8,16,20"),
+            ("PLOW_EMIT_PACKED_PREFILL", "0"),
+            ("PLOW_UNISEG", "0"),
+            ("PLOW_GLM_DECODE_GEMM_GROUP", group),
+        ]);
+        let dir = std::env::temp_dir().join(format!(
+            "plow-glm-gemm-group-{group}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = serde_json::json!({
+            "model_type": "glm_moe_dsa", "num_hidden_layers": 4,
+            "hidden_size": 6144, "num_attention_heads": 64,
+            "kv_lora_rank": 512, "q_lora_rank": 2048,
+            "qk_nope_head_dim": 192, "qk_rope_head_dim": 64, "v_head_dim": 256,
+            "vocab_size": 154880, "rms_norm_eps": 1e-5,
+            "n_routed_experts": 256, "num_experts_per_tok": 8,
+            "moe_intermediate_size": 2048, "intermediate_size": 12288,
+            "first_k_dense_replace": 3, "routed_scaling_factor": 2.5,
+            "rope_theta": 8000000.0
+        });
+        std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+        let out = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = out.clone();
+        let verify: crate::VerifyHook = Box::new(move |model| {
+            for (prog, &rows) in model.progs.iter().zip(&model.prog_t) {
+                let seg = |ix: usize| {
+                    prog.stream
+                        .iter()
+                        .find(|e| e.inst as usize == ix)
+                        .map_or(u16::MAX, |e| e.seg)
+                };
+                let insts = prog
+                    .insts
+                    .iter()
+                    .enumerate()
+                    .map(|(ix, d)| (d.op, d.i[1], d.i[2], seg(ix)))
+                    .collect();
+                let payload = prog
+                    .insts
+                    .iter()
+                    .map(|d| format!("{:?} {} {:?} {:?} {:?}", d.op, d.blocks, d.t, d.i, d.j))
+                    .collect();
+                sink.lock().unwrap().push((rows, insts, payload));
+            }
+            Ok(crate::LeanReport::skipped("decode GEMM group test"))
+        });
+        glm_emit_full(
+            &dir,
+            512,
+            dir.join("model.pkt").to_str().unwrap(),
+            304,
+            8,
+            true,
+            true,
+            "gfx942",
+            None,
+            Some(&verify),
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+        let progs = out.lock().unwrap().clone();
+        progs
+    };
+    let (off, on) = (emit("0"), emit("1"));
+    assert_eq!(off.len(), on.len());
+    let lt = DevOp::GemmLtPf as u16;
+    let mut native_rungs = 0;
+    for ((rows, a, pa), (_, b, pb)) in off.iter().zip(&on) {
+        let (mut x, mut y) = (pa.clone(), pb.clone());
+        x.sort();
+        y.sort();
+        assert_eq!(x, y, "rows={rows}: the reorder must keep the same instructions");
+        // The shared expert splits into native gate/up halves + Glu only past its LDS fit (rows
+        // 16/20); below it, or with no native GEMM, there is nothing to move.
+        if !a.iter().any(|i| i.0 == lt) || !a.iter().any(|i| i.0 == DevOp::Glu as u16) {
+            assert_eq!(pa, pb, "rows={rows}: nothing to group, no reorder");
+            continue;
+        }
+        native_rungs += 1;
+        let n_seg = |p: &[Inst]| p.iter().map(|i| i.3).max().unwrap();
+        // One MoE layer in this model: top-k and Glu now share a segment.
+        assert_eq!(n_seg(b) + 1, n_seg(a), "rows={rows}");
+        let topk = b
+            .iter()
+            .position(|i| i.0 == DevOp::MoeRouterTopkPf as u16)
+            .unwrap();
+        assert!(
+            b[topk - 3..topk]
+                .iter()
+                .all(|i| (i.0, i.1, i.2) == (lt, 256, 6144)),
+            "rows={rows}: router, shared gate and shared up must precede top-k back to back"
+        );
+        let glu = b.iter().position(|i| i.0 == DevOp::Glu as u16).unwrap();
+        assert_eq!(
+            b[topk].3, b[glu].3,
+            "rows={rows}: top-k and Glu share a segment"
+        );
+    }
+    assert_eq!(native_rungs, 2);
+}
+
+#[test]
+fn glm_native_prefill_fold_preserves_xcd_boundaries() {
+    let _guard = crate::test_env::env_guard();
+    let _target = crate::EmitAmdGuard::set(true);
+    let _env = crate::test_env::EnvScope::set(&[
+        ("PLOW_MLA_PREFILL", "full:128,2048"),
+        ("PLOW_GLM_PLACE_PF", "1"),
+        ("PLOW_GLM_MOE_AITER", "0"),
+        ("PLOW_GLM_MOE_FLAT_DECODE", "0"),
+        ("PLOW_GLM_GEMM_LT_DECODE", "0"),
+        ("PLOW_GLM_FOLD_LT", "1"),
+        ("PLOW_GLM_GEMM_LT", "0"),
+        ("PLOW_DECODE_BATCH_LADDER", "1"),
+        ("PLOW_EMIT_PACKED_PREFILL", "0"),
+        ("PLOW_UNISEG", "1"),
+    ]);
+    let dir = std::env::temp_dir().join(format!("plow-glm-native-fold-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = serde_json::json!({
+        "model_type": "glm_moe_dsa", "num_hidden_layers": 4,
+        "hidden_size": 6144, "num_attention_heads": 64,
+        "kv_lora_rank": 512, "q_lora_rank": 2048,
+        "qk_nope_head_dim": 192, "qk_rope_head_dim": 64, "v_head_dim": 256,
+        "vocab_size": 128, "rms_norm_eps": 1e-5,
+        "n_routed_experts": 256, "num_experts_per_tok": 8,
+        "moe_intermediate_size": 2048, "intermediate_size": 12288,
+        "first_k_dense_replace": 3, "routed_scaling_factor": 2.5,
+        "rope_theta": 8000000.0
+    });
+    std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+    let verify: crate::VerifyHook = Box::new(|model| {
+        let mut checked = 0;
+        for (prog, &rows) in model.progs.iter().zip(&model.prog_t) {
+            let native = prog
+                .insts
+                .iter()
+                .enumerate()
+                .filter(|(_, d)| d.op == DevOp::MlaMergeFold as u16 && d.i[5] != 0)
+                .collect::<Vec<_>>();
+            if rows != 2048 {
+                assert!(native.is_empty());
+                continue;
+            }
+            checked += 1;
+            assert_eq!(prog.l2_domains, 8);
+            assert_eq!(native.len(), 4);
+            for (ix, inst) in native {
+                assert_eq!(inst.i[0], rows);
+                assert_eq!(inst.i[5], 1);
+                assert_eq!((inst.i[1], inst.i[2]), (8, 256));
+                let segment = prog
+                    .stream
+                    .iter()
+                    .find(|e| e.inst as usize == ix)
+                    .unwrap()
+                    .seg;
+                assert!(segment > 0);
+                for entries in [&prog.stream, &prog.gq_stream] {
+                    for e in entries.iter().filter(|e| e.seg == segment) {
+                        assert_eq!(e.inst as usize, ix);
+                        assert_eq!(
+                            (e.wait_len, e.succ_len, e.flags & packet::dev::SE_XCTR),
+                            (0, 0, 0)
+                        );
+                    }
+                    assert!(entries.iter().any(|e| e.seg > segment));
+                }
+            }
+            let segments = prog
+                .stream
+                .iter()
+                .map(|e| usize::from(e.seg) + 1)
+                .max()
+                .unwrap();
+            assert_eq!(prog.gq_seg_ofs.len(), segments * 8 + 1);
+        }
+        assert_eq!(checked, 1);
+        Ok(crate::LeanReport::skipped(
+            "native prefill fold segment regression test",
+        ))
+    });
+    glm_emit_full(
+        &dir,
+        4096,
+        dir.join("model.pkt").to_str().unwrap(),
+        304,
+        8,
+        true,
+        true,
+        "gfx942",
+        Some(packet::devbuild::L2Layout {
+            sms: 38,
+            domains: 8,
+            map: packet::devbuild::L2Map::RoundRobin,
+        }),
+        Some(&verify),
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Token-batch body (`plans/unified-token-batch.md`, "AMD TP8 lowering decision"): the band rows
+/// take the batched decode attention chain BEHIND the prefill fold, on the prefill projections;
+/// the tail samples the whole band through a tiled GEMM; the band packets sit in their own
+/// segment class. The plain emit (`band = None`) is what every other test in this module pins.
+#[test]
+fn token_batch_body_band_rides_the_prefill_program() {
+    let _guard = crate::test_env::env_guard();
+    let _env = crate::test_env::EnvScope::set(&[("PLOW_GLM_FP8_KV", "1"), ("PLOW_UNISEG", "0")]);
+    let mut c = glm_ref_cfg();
+    c.tp = 8;
+    let (ctx, rows, band) = (81920u32, 128u32, 20u32);
+    let mut decl = Builder::new(304);
+    let n = declare_glm_rows_batched(&mut decl, &c, ctx, &[0], rows, band, MoeEnc::Fp8Blk);
+    let mut b = Builder::new(304);
+    b.adopt_tensors(decl.tensors());
+    b.set_packed_prefill_segments(true);
+    b.set_token_batch_band(band);
+    let all = b.all();
+    emit_glm_mla_prefill(&mut b, &c, &n, 0, ctx, rows, MoeEnc::Fp8Blk, n.x, &[], false, &mut 0, &all,
+        Some(band));
+    emit_glm_tail(&mut b, &c, &n, n.x, &[], rows, false, &mut 0, Some(band));
+    let p = b.finish();
+    let ops: Vec<u16> = p.insts.iter().map(|d| d.op).collect();
+    let pf = ops.iter().position(|&o| o == DevOp::FlashMlaPrefillFp8 as u16).unwrap();
+    let dec = ops.iter().position(|&o| o == DevOp::FlashMlaDecodeFp8 as u16).unwrap();
+    let folds: Vec<usize> = ops.iter().enumerate()
+        .filter(|(_, &o)| o == DevOp::MlaMergeFold as u16).map(|(i, _)| i).collect();
+    assert_eq!(folds.len(), 2, "one prefill fold over T, one band fold over the band");
+    assert!(pf < folds[0] && folds[0] < dec && dec < folds[1],
+        "order: prefill flash {pf}, prefill fold {}, band flash {dec}, band fold {}", folds[0], folds[1]);
+    assert_eq!(p.insts[folds[0]].i[0], rows);
+    assert_eq!(p.insts[folds[1]].i[0], band);
+    let fl = &p.insts[dec];
+    assert_eq!((fl.i[0], fl.i[1], fl.t[6], fl.t[4]), (band, c.heads / c.tp, n.kvlen, n.ckv[0]));
+    // The prefill flash still covers every row: band rows are ordinary rows of the T-row packets.
+    assert_eq!(p.insts[pf].i[4], rows);
+    if c.dsa(ctx) && n.lw[0].iwqb != TENSOR_NONE {
+        let sc = p.insts.iter().find(|d| d.op == DevOp::IndexScore as u16).unwrap();
+        assert_eq!((sc.i[0], sc.t[1], sc.t[3]), (band, n.qidx, n.widx));
+        assert!(p.insts.iter().any(|d| d.op == DevOp::IndexSelect as u16));
+        assert_eq!(fl.j[0], n.iidx + 1, "sparse gather over the band's own selection");
+        // The band's indexer query projection is a tiled GEMM over the band, not a Gemv.
+        let qi = p.insts.iter().find(|d| d.t[0] == n.qidx && d.t[1] == n.qlat).unwrap();
+        assert_ne!(qi.op, DevOp::Gemv as u16);
+        assert_eq!(qi.i[0], band);
+    }
+    // Tail: the head is a tiled GEMM over the band and every band row samples.
+    let am = p.insts.iter().find(|d| d.op == DevOp::Argmax as u16).unwrap();
+    assert_eq!(am.i[1], band);
+    let head = p.insts.iter().find(|d| d.t[0] == n.logits).unwrap();
+    assert_ne!(head.op, DevOp::Gemv as u16);
+    assert_eq!((head.i[0], head.i[1]), (band, glm_vocab_l(&c)));
+    let fin = p.insts.iter().find(|d| d.op == DevOp::XArgmaxFin as u16 || d.op == DevOp::ArgmaxFin as u16).unwrap();
+    assert_eq!(fin.i[1], band);
+    // Segment isolation: the band attention is not in the prefill flash's or fold's segment.
+    let seg_of = |ix: usize| p.stream.iter().find(|e| e.inst as usize == ix).unwrap().seg;
+    assert_ne!(seg_of(dec), seg_of(pf));
+    assert_ne!(seg_of(folds[1]), seg_of(folds[0]));
+    assert_eq!(seg_of(dec), seg_of(folds[1]), "the band flash and its fold share one segment");
+}
+
+#[test]
+fn dsa_decode_nsplit_fills_one_item_per_cu() {
+    let _guard = crate::test_env::env_guard();
+    let _env = crate::test_env::EnvScope::set(&[("PLOW_MLA_NS", "")]);
+    // TP8 (nh_l=8, GF=4): 2 head-groups per row on 304 CUs.
+    for (rows, expected) in [(1, 16), (2, 16), (4, 16), (8, 16), (16, 8), (20, 4), (64, 4)] {
+        assert_eq!(glm_dsa_decode_nsplit(rows, 8, 4, 304), expected, "rows {rows}");
+    }
+    // TP4 (nh_l=16): 4 head-groups per row.
+    assert_eq!(glm_dsa_decode_nsplit(1, 16, 4, 304), 16);
+    assert_eq!(glm_dsa_decode_nsplit(20, 16, 4, 304), 4);
+    // The pin wins, as it does for the dense rule.
+    let _pin = crate::test_env::EnvScope::set(&[("PLOW_MLA_NS", "8")]);
+    assert_eq!(glm_dsa_decode_nsplit(20, 8, 4, 304), 8);
+}
+
+/// The sparse (DSA) 8192 rung joins the packed-sibling and token-batch-body passes only under
+/// `PLOW_PACKED_SPARSE_PF=1`, and then with the span-aware chain: the TP indexer feeds the
+/// sparse FP8 flash directly (`fj[1] = iidx_pf + 1`), no per-8-query union. Every ordinary
+/// program is byte-identical either way — `PLOW_PACKED_SPARSE_PF=0` is the rollback.
+#[test]
+fn sparse_rung_joins_the_packed_passes_only_under_packed_sparse_pf() {
+    use std::sync::{Arc, Mutex};
+    let _guard = crate::test_env::env_guard();
+    let _target = crate::EmitAmdGuard::set(true);
+    let dir = std::env::temp_dir().join(format!("plow-glm-packed-sparse-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // `indexer_types`: a "full" layer owns the DSA indexer whose prefill selection chain is
+    // the class-C site under test; "shared" layers reuse the last full layer's selection.
+    let config = serde_json::json!({
+        "model_type": "glm_moe_dsa", "num_hidden_layers": 4,
+        "hidden_size": 6144, "num_attention_heads": 64,
+        "kv_lora_rank": 512, "q_lora_rank": 2048,
+        "qk_nope_head_dim": 192, "qk_rope_head_dim": 64, "v_head_dim": 256,
+        "vocab_size": 128, "rms_norm_eps": 1e-5,
+        "n_routed_experts": 256, "num_experts_per_tok": 8,
+        "moe_intermediate_size": 2048, "intermediate_size": 12288,
+        "first_k_dense_replace": 3, "routed_scaling_factor": 2.5,
+        "rope_theta": 8000000.0,
+        "indexer_types": ["full", "shared", "full", "shared"]
+    });
+    std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+    type Snapshot = Vec<(u32, Vec<packet::dev::DevInst>, Vec<packet::dev::StreamEnt>, Vec<packet::dev::StreamEnt>)>;
+    let emit = |sparse_pf: &str| -> Snapshot {
+        let _env = crate::test_env::EnvScope::set(&[
+            ("PLOW_MLA_PREFILL", "full:2048,8192"),
+            ("PLOW_DECODE_BATCH", "20"),
+            ("PLOW_GLM_DSA_PF", "1"),
+            ("PLOW_GLM_INDEX_TP", "1"),
+            ("PLOW_GLM_FP8_KV", "1"),
+            ("PLOW_GLM_MOE_AITER", "1"),
+            ("PLOW_GLM_GEMM_LT", "1"),
+            ("PLOW_MLA_PF_V2", "1"),
+            ("PLOW_MLA_PF_AITER", "1"),
+            ("PLOW_EMIT_PACKED_PREFILL", "1"),
+            ("PLOW_TOKEN_BATCH_TP", "1"),
+            ("PLOW_PACKED_SPARSE_PF", sparse_pf),
+            ("PLOW_UNISEG", "0"),
+        ]);
+        let seen: Arc<Mutex<Snapshot>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let verify: crate::VerifyHook = Box::new(move |model| {
+            *sink.lock().unwrap() = model
+                .progs
+                .iter()
+                .zip(&model.prog_t)
+                .map(|(p, &t)| (t, p.insts.clone(), p.stream.clone(), p.gq_stream.clone()))
+                .collect();
+            Ok(crate::LeanReport::skipped("structural regression test"))
+        });
+        // The production context: a batched FP8-KV decode ladder needs the DSA decode arm,
+        // which arms above the 64K crossover.
+        glm_emit_full(
+            &dir,
+            81920,
+            dir.join("model.pkt").to_str().unwrap(),
+            304,
+            8,
+            true,
+            true,
+            "gfx942",
+            None,
+            Some(&verify),
+        );
+        let out = seen.lock().unwrap().clone();
+        out
+    };
+    let dense_only = emit("0");
+    let with_sparse = emit("1");
+    std::fs::remove_dir_all(dir).unwrap();
+
+    type Entry = (u32, Vec<packet::dev::DevInst>, Vec<packet::dev::StreamEnt>, Vec<packet::dev::StreamEnt>);
+    fn ordinary(s: &[Entry]) -> Vec<&Entry> {
+        s.iter()
+            .filter(|e| !packet::devbuild::is_packed_prefill_program(e.0) && !packet::devbuild::is_token_batch_program(e.0))
+            .collect()
+    }
+    for entry in ordinary(&dense_only) {
+        let twin = with_sparse
+            .iter()
+            .find(|e| e.0 == entry.0)
+            .unwrap_or_else(|| panic!("program t={} vanished under PLOW_PACKED_SPARSE_PF", entry.0));
+        assert!(entry == twin, "ordinary program t={} changed under PLOW_PACKED_SPARSE_PF", entry.0);
+    }
+    let has = |insts: &[packet::dev::DevInst], op: DevOp| insts.iter().any(|d| d.op == op as u16);
+    // The ordinary 8192 rung is sparse and keeps the union: its flash names `iuni`.
+    let plain_8192 = dense_only.iter().find(|e| e.0 == 8192).expect("8192 rung");
+    assert!(has(&plain_8192.1, DevOp::IndexTpPf) && has(&plain_8192.1, DevOp::IndexUnionPf));
+    let plain_flash = plain_8192.1.iter().find(|d| d.op == DevOp::FlashMlaPrefillFp8 as u16 && d.j[0] != 0).unwrap();
+    let plain_union = plain_8192.1.iter().find(|d| d.op == DevOp::IndexUnionPf as u16).unwrap();
+    assert_eq!(plain_flash.j[0], plain_union.t[0] + 1);
+    // Dense-only: the sparse bucket gets neither a sibling nor a body; the dense 2048 gets both.
+    fn tagged(s: &[Entry], t: u32) -> Vec<&Vec<packet::dev::DevInst>> {
+        s.iter()
+            .filter(|e| e.0 == packet::devbuild::packed_prefill_program_t(t) || e.0 == packet::devbuild::token_batch_program_t(t))
+            .map(|e| &e.1)
+            .collect()
+    }
+    assert_eq!(tagged(&dense_only, 8192).len(), 0);
+    assert_eq!(tagged(&dense_only, 2048).len(), 2);
+    // With the knob: one sibling and one body at 8192, carrying the span-aware chain.
+    let sparse_packed = tagged(&with_sparse, 8192);
+    assert_eq!(sparse_packed.len(), 2, "one packed sibling and one token-batch body at 8192");
+    for insts in sparse_packed {
+        assert!(has(insts, DevOp::IndexTpPf), "the TP indexer (PlowKvSpan table at the runtime)");
+        assert!(!has(insts, DevOp::IndexUnionPf), "no per-8-query union under the packed topology");
+        assert!(!has(insts, DevOp::IndexScorePf) && !has(insts, DevOp::IndexSelectPf));
+        let tp = insts.iter().find(|d| d.op == DevOp::IndexTpPf as u16).unwrap();
+        let flash = insts.iter().find(|d| d.op == DevOp::FlashMlaPrefillFp8 as u16 && d.j[0] != 0).unwrap();
+        assert_eq!(flash.j[0], tp.t[0] + 1, "the sparse flash gathers the TP indexer's per-row selection");
+        assert_eq!((flash.i[4], tp.i[0]), (8192, 8192));
+    }
+    assert_eq!(tagged(&with_sparse, 2048).len(), 2);
+}
+
+/// PLOW_GLM_MOE_SHARED_FOLD: the two-emit comparison. Same config and knobs, fold off vs on.
+///
+/// Off is the default-off contract (the knob's first emit IS the ordinary packet). On, every
+/// native prefill MoE chain moves as one: the router appends its constant slot (i5=1) over the
+/// same 256/8 selection, the align and the fused call both run 257/9, the shared expert's
+/// GLU/down packets disappear, and every combine band gives up its `shared` operand while still
+/// covering all T rows. Decode keeps top-8 over the 257-entry table and its own shared GEMVs.
+#[test]
+fn shared_fold_rewrites_only_the_prefill_moe_chain() {
+    use std::sync::{Arc, Mutex};
+    let _guard = crate::test_env::env_guard();
+    let _target = crate::EmitAmdGuard::set(true);
+    let dir = std::env::temp_dir().join(format!("plow-glm-shared-fold-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = serde_json::json!({
+        "model_type": "glm_moe_dsa", "num_hidden_layers": 4,
+        "hidden_size": 6144, "num_attention_heads": 64,
+        "kv_lora_rank": 512, "q_lora_rank": 2048,
+        "qk_nope_head_dim": 192, "qk_rope_head_dim": 64, "v_head_dim": 256,
+        "vocab_size": 128, "rms_norm_eps": 1e-5,
+        "n_routed_experts": 256, "num_experts_per_tok": 8,
+        "moe_intermediate_size": 2048, "intermediate_size": 12288,
+        "first_k_dense_replace": 3, "routed_scaling_factor": 2.5,
+        "rope_theta": 8000000.0
+    });
+    std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+    type Snapshot = (Vec<(u32, Vec<packet::dev::DevInst>)>, Vec<(String, u64)>);
+    let emit = |fold: &str| -> Snapshot {
+        let _env = crate::test_env::EnvScope::set(&[
+            ("PLOW_MLA_PREFILL", "full:1,2,4,8,16,20,32,64,128,256,512,1024,2048,4096,8192"),
+            ("PLOW_GLM_PLACE_PF", "0"),
+            ("PLOW_GLM_MOE_AITER", "0"),
+            ("PLOW_GLM_MOE_FLAT_DECODE", "0"),
+            ("PLOW_GLM_MOE_RESIDENT", "1"),
+            ("PLOW_GLM_MOE_SHARED_FOLD", fold),
+            ("PLOW_DECODE_BATCH_LADDER", "1,2,4,8,16,20"),
+            ("PLOW_EMIT_PACKED_PREFILL", "0"),
+            ("PLOW_UNISEG", "0"),
+        ]);
+        let seen: Arc<Mutex<Snapshot>> = Arc::new(Mutex::new((Vec::new(), Vec::new())));
+        let sink = Arc::clone(&seen);
+        let verify: crate::VerifyHook = Box::new(move |model| {
+            *sink.lock().unwrap() = (
+                model.progs.iter().zip(&model.prog_t).map(|(p, &t)| (t, p.insts.clone())).collect(),
+                model.tensors.iter().map(|t| (t.name.clone(), t.bytes)).collect(),
+            );
+            Ok(crate::LeanReport::skipped("shared-fold structural test"))
+        });
+        glm_emit_full(
+            &dir,
+            81920,
+            dir.join("model.pkt").to_str().unwrap(),
+            304,
+            8,
+            true,
+            true,
+            "gfx942",
+            Some(packet::devbuild::L2Layout {
+                sms: 38,
+                domains: 8,
+                map: packet::devbuild::L2Map::RoundRobin,
+            }),
+            Some(&verify),
+        );
+        let out = seen.lock().unwrap().clone();
+        out
+    };
+    let (plain, plain_tensors) = emit("0");
+    let (folded, folded_tensors) = emit("1");
+    std::fs::remove_dir_all(dir).unwrap();
+
+    let prefill_count =
+        packet::devbuild::decode_rung_lo(&plain.iter().map(|(t, _)| *t).collect::<Vec<_>>());
+    assert_eq!(plain.len(), folded.len());
+    let mut native_prefill = 0;
+    for (p, ((t, off), (t2, on))) in plain.iter().zip(&folded).enumerate() {
+        assert_eq!(t, t2);
+        let decode = p >= prefill_count;
+        let natives: Vec<usize> = on
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.op == DevOp::MoeAiterFp8Pf as u16)
+            .map(|(i, _)| i)
+            .collect();
+        let plain_natives = off.iter().filter(|d| d.op == DevOp::MoeAiterFp8Pf as u16).count();
+        assert_eq!(natives.len(), plain_natives, "t={t}: a MoE layer gained or lost its call");
+        for &ix in &natives {
+            let call = &on[ix];
+            if decode {
+                assert_eq!(call.i[3..5], [257, 8], "t={t}: decode keeps top-8 over 257 entries");
+                let router = on[..ix]
+                    .iter()
+                    .rev()
+                    .find(|d| d.op == DevOp::MoeRouterTopkPf as u16 && d.t[0] == call.t[4])
+                    .unwrap();
+                assert_eq!((router.i[1], router.i[2], router.i[5]), (256, 8, 0));
+                continue;
+            }
+            native_prefill += 1;
+            assert_eq!(call.i, [*t, 6144, 256, 257, 9, 64, 2, 1], "t={t}");
+            let align = on[..ix]
+                .iter()
+                .rev()
+                .find(|d| d.op == DevOp::MoeAlignPf as u16 && d.t[0] == call.t[4])
+                .unwrap();
+            assert_eq!(align.i[..3], [*t, 257, 9], "t={t}");
+            let router = on[..ix]
+                .iter()
+                .rev()
+                .find(|d| d.op == DevOp::MoeRouterTopkPf as u16 && d.t[0] == align.t[1])
+                .unwrap();
+            assert_eq!((router.i[1], router.i[2], router.i[5]), (256, 8, 1), "t={t}");
+            let mut covered = 0;
+            for c in on[ix + 1..]
+                .iter()
+                .take_while(|d| d.t[0] != call.t[0])
+                .filter(|d| d.op == DevOp::MoeCombinePf as u16 && d.t[3] == call.t[0])
+            {
+                assert_eq!(c.t[2], TENSOR_NONE, "t={t}: the combine still reads `shared`");
+                assert_eq!(c.i[3], covered, "t={t}: combine bands are not contiguous");
+                covered += c.i[2];
+            }
+            assert_eq!(covered, *t, "t={t}: combine bands do not cover every row");
+        }
+        let mut a: Vec<u16> = off.iter().map(|d| d.op).collect();
+        let mut b: Vec<u16> = on.iter().map(|d| d.op).collect();
+        a.sort_unstable();
+        b.sort_unstable();
+        if decode {
+            assert_eq!(a, b, "t={t}: the fold changed a decode program's ops");
+            continue;
+        }
+        // Prefill: what goes away is EXACTLY the packets that touched a `shared_experts.*`
+        // weight in the unfolded program (its gate|up and down, whatever tile op the rung picked),
+        // two per native MoE layer, and nothing is added.
+        for o in &b {
+            let at = a.iter().position(|x| x == o).expect("the fold added an op");
+            a.remove(at);
+        }
+        let shared_weight = |h: u32| {
+            plain_tensors
+                .get(h as usize)
+                .is_some_and(|(n, _)| n.contains("shared_experts."))
+        };
+        let mut shared_ops: Vec<u16> =
+            off.iter().filter(|d| d.t.iter().any(|&h| shared_weight(h))).map(|d| d.op).collect();
+        shared_ops.sort_unstable();
+        assert_eq!(a, shared_ops, "t={t}: the fold removed something other than the shared GEMMs");
+        assert_eq!(a.len(), 2 * natives.len(), "t={t}: removed {a:?}");
+    }
+    assert!(native_prefill > 0, "no prefill program carried a native MoE call");
+    // The pointer tables switch to the `_sf` spelling at 257 entries; nothing else is added or
+    // removed from the tensor table.
+    let sf: Vec<_> = folded_tensors.iter().filter(|(n, _)| n.ends_with("_table_sf")).collect();
+    assert!(!sf.is_empty() && sf.iter().all(|(_, b)| *b == 257 * 3 * 8));
+    assert!(!folded_tensors.iter().any(|(n, _)| n.ends_with("expert_weight_table")));
+    assert_eq!(plain_tensors.len(), folded_tensors.len());
+}
+
+/// The packed siblings ride next to the native AITER MoE and hipBLASLt segments — the production
+/// gfx942 TP8 recipe — and emitting them leaves every ordinary program byte-identical. This is
+/// the emit half of what lets the serve mux pack several requests' spans into one rung on that
+/// recipe; the runtime half is `exec/amd.rs`'s `packed_mla_compatible`.
+#[test]
+fn packed_siblings_carry_native_moe_and_leave_the_plain_programs_byte_identical() {
+    use std::sync::{Arc, Mutex};
+    let _guard = crate::test_env::env_guard();
+    let _target = crate::EmitAmdGuard::set(true);
+    let dir = std::env::temp_dir().join(format!("plow-glm-packed-native-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = serde_json::json!({
+        "model_type": "glm_moe_dsa", "num_hidden_layers": 4,
+        "hidden_size": 6144, "num_attention_heads": 64,
+        "kv_lora_rank": 512, "q_lora_rank": 2048,
+        "qk_nope_head_dim": 192, "qk_rope_head_dim": 64, "v_head_dim": 256,
+        "vocab_size": 128, "rms_norm_eps": 1e-5,
+        "n_routed_experts": 256, "num_experts_per_tok": 8,
+        "moe_intermediate_size": 2048, "intermediate_size": 12288,
+        "first_k_dense_replace": 3, "routed_scaling_factor": 2.5,
+        "rope_theta": 8000000.0
+    });
+    std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+    type Snapshot = Vec<(u32, Vec<packet::dev::DevInst>, Vec<packet::dev::StreamEnt>, Vec<packet::dev::StreamEnt>)>;
+    let emit = |packed: &str| -> Snapshot {
+        let _env = crate::test_env::EnvScope::set(&[
+            ("PLOW_MLA_PREFILL", "full:128,2048"),
+            ("PLOW_GLM_MOE_AITER", "1"),
+            ("PLOW_GLM_GEMM_LT", "1"),
+            ("PLOW_EMIT_PACKED_PREFILL", packed),
+            ("PLOW_UNISEG", "0"),
+        ]);
+        let seen: Arc<Mutex<Snapshot>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let verify: crate::VerifyHook = Box::new(move |model| {
+            *sink.lock().unwrap() = model
+                .progs
+                .iter()
+                .zip(&model.prog_t)
+                .map(|(p, &t)| (t, p.insts.clone(), p.stream.clone(), p.gq_stream.clone()))
+                .collect();
+            Ok(crate::LeanReport::skipped("structural regression test"))
+        });
+        glm_emit_full(
+            &dir,
+            4096,
+            dir.join("model.pkt").to_str().unwrap(),
+            304,
+            8,
+            true,
+            true,
+            "gfx942",
+            None,
+            Some(&verify),
+        );
+        let out = seen.lock().unwrap().clone();
+        out
+    };
+    let plain = emit("0");
+    let with_siblings = emit("1");
+    std::fs::remove_dir_all(dir).unwrap();
+
+    assert!(plain.iter().all(|(t, ..)| !packet::devbuild::is_packed_prefill_program(*t)));
+    // Every ordinary program — both prefill buckets and the decode rung — is byte-identical.
+    for entry in &plain {
+        let twin = with_siblings
+            .iter()
+            .find(|e| e.0 == entry.0)
+            .unwrap_or_else(|| panic!("program t={} vanished under the packed emit", entry.0));
+        assert!(entry == twin, "program t={} changed under the packed emit", entry.0);
+    }
+    // Each dense bucket gained exactly one sibling, and the sibling carries the native segments.
+    for rows in [128u32, 2048] {
+        let siblings: Vec<_> = with_siblings
+            .iter()
+            .filter(|e| e.0 == packet::devbuild::packed_prefill_program_t(rows))
+            .collect();
+        assert_eq!(siblings.len(), 1, "rows={rows}");
+        let (_, insts, stream, _) = siblings[0];
+        let has = |op: DevOp| insts.iter().any(|d| d.op == op as u16);
+        assert!(has(DevOp::MoeAiterFp8Pf), "rows={rows}: native MoE");
+        assert_eq!(has(DevOp::GemmLtPf), rows >= 2048, "rows={rows}: hipBLASLt");
+        assert!(!has(DevOp::IndexTpPf) && !has(DevOp::FlashGatherPrefill));
+        // The MLA family segments are pure: a norm/flash op never shares its segment with a
+        // Gemm or the MoE chain, which is what `check_packed_prefill_program` routes on.
+        let family = |op: u16| -> u8 {
+            if op == DevOp::RmsNorm as u16
+                || op == DevOp::HeadNormRope as u16
+                || op == DevOp::HeadNormRopeFp8 as u16
+            {
+                5
+            } else if op == DevOp::FlashMlaPrefill as u16 || op == DevOp::FlashMlaPrefillFp8 as u16 {
+                6
+            } else {
+                0
+            }
+        };
+        let seg_family = |seg: u16| -> Vec<u8> {
+            stream
+                .iter()
+                .filter(|e| e.seg == seg)
+                .map(|e| family(insts[e.inst as usize].op))
+                .collect()
+        };
+        for e in stream {
+            let f = family(insts[e.inst as usize].op);
+            if f != 0 {
+                assert!(seg_family(e.seg).iter().all(|&g| g == f), "rows={rows} seg={}", e.seg);
+            }
+        }
+    }
+}
+
+
+/// THE QUALIFIED RECIPE IS WHAT AN UNFLAGGED GLM gfx942 TP8 EMIT PRODUCES.
+///
+/// The packet serving GLM-5.3 on 8x MI300X (47-50 out tok/s, 18/18 on the retrieval screen) was
+/// emitted by naming the `glm_*` recipe flags. Every one of them used to be `default_value_t = false`,
+/// so the qualified configuration was reachable only by typing the whole incantation and dropping
+/// one emitted a slower packet that still loaded and still served. This is the gate on that: the
+/// explicit recipe and the unflagged emit produce the SAME programs, and an arm with the recipe
+/// explicitly OFF produces different ones — which is what makes the first assertion mean
+/// something rather than pass vacuously.
+///
+/// `PLOW_GLM_DSA_PF` is set in every arm: it is part of the frozen recipe but is NOT one of the
+/// defaulted knobs (sparse prefill is a separate qualification), so it has to be named on both
+/// sides for the comparison to be about the recipe.
+#[test]
+fn the_qualified_glm_recipe_is_what_an_unflagged_gfx942_tp8_emit_produces() {
+    use std::sync::{Arc, Mutex};
+    let _guard = crate::test_env::env_guard();
+    let _target = crate::EmitAmdGuard::set(true);
+    let dir = std::env::temp_dir().join(format!("plow-glm-defaults-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = serde_json::json!({
+        "model_type": "glm_moe_dsa", "num_hidden_layers": 4,
+        "hidden_size": 6144, "num_attention_heads": 64,
+        "kv_lora_rank": 512, "q_lora_rank": 2048,
+        "qk_nope_head_dim": 192, "qk_rope_head_dim": 64, "v_head_dim": 256,
+        "vocab_size": 128, "rms_norm_eps": 1e-5,
+        "n_routed_experts": 256, "num_experts_per_tok": 8,
+        "moe_intermediate_size": 2048, "intermediate_size": 12288,
+        "first_k_dense_replace": 3, "routed_scaling_factor": 2.5,
+        "rope_theta": 8000000.0,
+        "indexer_types": ["full", "shared", "full", "shared"]
+    });
+    std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+    type Snapshot = Vec<(u32, Vec<packet::dev::DevInst>, Vec<packet::dev::StreamEnt>, Vec<packet::dev::StreamEnt>)>;
+    const RECIPE: [&str; 12] = [
+        "PLOW_GLM_FP8_KV",
+        "PLOW_GLM_MOE_AITER",
+        "PLOW_GLM_MOE_RESIDENT",
+        "PLOW_GLM_INDEX_TP",
+        "PLOW_GLM_SELECT_LOCAL",
+        "PLOW_GLM_DECODE_NORM_ROWS",
+        "PLOW_GLM_GEMM_LT",
+        "PLOW_GLM_GEMM_LT_DECODE",
+        "PLOW_GLM_GEMM_LT_DECODE_EXT",
+        "PLOW_GLM_FOLD_LT",
+        "PLOW_GLM_SEQ_PAR",
+        "PLOW_GLM_SEQ_PAR_PROJ",
+    ];
+    let emit = |glm: &[(&str, &str)]| -> Snapshot {
+        let mut env: Vec<(&str, &str)> = vec![
+            ("PLOW_MLA_PREFILL", "full:2048,8192"),
+            ("PLOW_DECODE_BATCH", "20"),
+            ("PLOW_GLM_DSA", "1"),
+            ("PLOW_GLM_DSA_PF", "1"),
+            ("PLOW_MLA_PF_V2", "1"),
+            ("PLOW_MLA_PF_AITER", "1"),
+            ("PLOW_UNISEG", "0"),
+        ];
+        env.extend_from_slice(glm);
+        let _env = crate::test_env::EnvScope::set(&env);
+        // Exactly what `run_verified` does between parsing and emitting. `EnvScope` has already
+        // installed the parsed config; this replaces it with the resolved one.
+        let mut cfg = crate::emit_config::EmitConfig::from_env();
+        crate::apply_production_defaults(
+            &mut cfg,
+            crate::emit_capabilities("glm_moe_dsa"),
+            "gfx942",
+            8,
+            304,
+        );
+        crate::emit_config::install(cfg);
+        let seen: Arc<Mutex<Snapshot>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let verify: crate::VerifyHook = Box::new(move |model| {
+            *sink.lock().unwrap() = model
+                .progs
+                .iter()
+                .zip(&model.prog_t)
+                .map(|(p, &t)| (t, p.insts.clone(), p.stream.clone(), p.gq_stream.clone()))
+                .collect();
+            Ok(crate::LeanReport::skipped("structural regression test"))
+        });
+        glm_emit_full(
+            &dir,
+            81920,
+            dir.join("model.pkt").to_str().unwrap(),
+            304,
+            8,
+            true,
+            true,
+            "gfx942",
+            None,
+            Some(&verify),
+        );
+        let out = seen.lock().unwrap().clone();
+        out
+    };
+
+    let on: Vec<(&str, &str)> = RECIPE.iter().map(|k| (*k, "1")).collect();
+    let off: Vec<(&str, &str)> = RECIPE.iter().map(|k| (*k, "0")).collect();
+    let explicit = emit(&on);
+    let unflagged = emit(&[]);
+    let rolled_back = emit(&off);
+    assert!(!explicit.is_empty());
+    assert_eq!(
+        explicit, unflagged,
+        "an unflagged gfx942 TP8 GLM emit must be the qualified recipe"
+    );
+    assert_ne!(
+        explicit, rolled_back,
+        "the recipe must still be rollable back, and must still change the packet"
+    );
+
+    // And each knob individually: from the fully rolled-back arm, turning ONE on moves the
+    // packet, so none of them is riding along inert.
+    //
+    // Probed from OFF rather than from ON because two of them overlap: `native_moe` is
+    // `glm_moe_aiter || glm_moe_resident`, so dropping AITER out of the full recipe changes
+    // nothing while RESIDENT still holds the native arm. Off-plus-one has no such shadow.
+    //
+    // EXT is the one exception to "from OFF": it only widens GEMM_LT_DECODE and is inert without
+    // it by construction, so it is probed on top of its parent, which is the question that matters.
+    for knob in RECIPE {
+        let parent = match knob {
+            "PLOW_GLM_GEMM_LT_DECODE_EXT" => Some("PLOW_GLM_GEMM_LT_DECODE"),
+            "PLOW_GLM_SEQ_PAR_PROJ" => Some("PLOW_GLM_SEQ_PAR"),
+            _ => None,
+        };
+        let with = |extra: Option<&str>| -> Vec<(&'static str, &'static str)> {
+            RECIPE
+                .iter()
+                .map(|k| (*k, if Some(*k) == parent || Some(*k) == extra { "1" } else { "0" }))
+                .collect()
+        };
+        let base = if parent.is_some() { emit(&with(None)) } else { rolled_back.clone() };
+        assert_ne!(base, emit(&with(Some(knob))), "{knob}=1 changed nothing");
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// `PLOW_GLM_GEMM_BLK`: at a >=2048-row bucket, q_a / kv_a / o_proj each sit alone in a segment
+/// as `GemmBlkPf`; q_a quantizes `xn` and kv_a reuses it; q_absorb (a prep product) stays on
+/// `GemmLtPf`; the 128-row bucket keeps the bf16 arms.
+#[test]
+fn glm_gemm_blk_isolates_the_checkpoint_fp8_projections() {
+    let _guard = crate::test_env::env_guard();
+    let _target = crate::EmitAmdGuard::set(true);
+    let _env = crate::test_env::EnvScope::set(&[
+        ("PLOW_MLA_PREFILL", "full:128,2048"),
+        ("PLOW_GLM_PLACE_PF", "1"),
+        ("PLOW_GLM_MOE_AITER", "0"),
+        ("PLOW_GLM_MOE_FLAT_DECODE", "0"),
+        ("PLOW_GLM_GEMM_LT_DECODE", "0"),
+        ("PLOW_GLM_FOLD_LT", "0"),
+        ("PLOW_GLM_GEMM_LT", "1"),
+        ("PLOW_GLM_GEMM_BLK", "1"),
+        ("PLOW_DECODE_BATCH_LADDER", "1"),
+        ("PLOW_EMIT_PACKED_PREFILL", "0"),
+        ("PLOW_UNISEG", "1"),
+    ]);
+    let dir = std::env::temp_dir().join(format!("plow-glm-gemm-blk-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = serde_json::json!({
+        "model_type": "glm_moe_dsa", "num_hidden_layers": 4,
+        "hidden_size": 6144, "num_attention_heads": 64,
+        "kv_lora_rank": 512, "q_lora_rank": 2048,
+        "qk_nope_head_dim": 192, "qk_rope_head_dim": 64, "v_head_dim": 256,
+        "vocab_size": 128, "rms_norm_eps": 1e-5,
+        "n_routed_experts": 256, "num_experts_per_tok": 8,
+        "moe_intermediate_size": 2048, "intermediate_size": 12288,
+        "first_k_dense_replace": 3, "routed_scaling_factor": 2.5,
+        "rope_theta": 8000000.0
+    });
+    std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+    let verify: crate::VerifyHook = Box::new(|model| {
+        let mut checked = 0;
+        for (prog, &rows) in model.progs.iter().zip(&model.prog_t) {
+            let blk = prog
+                .insts
+                .iter()
+                .enumerate()
+                .filter(|(_, d)| d.op == DevOp::GemmBlkPf as u16)
+                .collect::<Vec<_>>();
+            if rows != 2048 {
+                assert!(blk.is_empty());
+                continue;
+            }
+            checked += 1;
+            let mut shapes = blk
+                .iter()
+                .map(|(_, d)| (d.i[1], d.i[2], d.i[3]))
+                .collect::<Vec<_>>();
+            shapes.sort_unstable();
+            let mut want = [(2048, 6144, 1), (512, 6144, 0), (6144, 2048, 1)].repeat(4);
+            want.sort_unstable();
+            assert_eq!(shapes, want);
+            let lt = prog
+                .insts
+                .iter()
+                .filter(|d| d.op == DevOp::GemmLtPf as u16)
+                .map(|d| (d.i[1], d.i[2]))
+                .collect::<Vec<_>>();
+            assert_eq!(lt, [(4096, 2048); 4]);
+            let seg_of = |ix: usize| {
+                prog.stream
+                    .iter()
+                    .find(|e| e.inst as usize == ix)
+                    .unwrap()
+                    .seg
+            };
+            let mut last_quant = None;
+            let mut order = blk
+                .iter()
+                .map(|(ix, d)| (seg_of(*ix), *ix, *d))
+                .collect::<Vec<_>>();
+            order.sort_unstable_by_key(|(seg, ix, _)| (*seg, *ix));
+            for (segment, ix, inst) in order {
+                assert_eq!(inst.i[0], rows);
+                assert!(segment > 0);
+                if inst.i[3] == 1 {
+                    last_quant = Some(inst.t[1]);
+                } else {
+                    assert_eq!(last_quant, Some(inst.t[1]), "reuse without its quantizer");
+                }
+                for entries in [&prog.stream, &prog.gq_stream] {
+                    for e in entries.iter().filter(|e| e.seg == segment) {
+                        assert_eq!(e.inst as usize, ix);
+                        assert_eq!(
+                            (e.wait_len, e.succ_len, e.flags & packet::dev::SE_XCTR),
+                            (0, 0, 0)
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 1);
+        Ok(crate::LeanReport::skipped(
+            "block-scale FP8 projection segment regression test",
+        ))
+    });
+    glm_emit_full(
+        &dir,
+        4096,
+        dir.join("model.pkt").to_str().unwrap(),
+        304,
+        8,
+        true,
+        true,
+        "gfx942",
+        Some(packet::devbuild::L2Layout {
+            sms: 38,
+            domains: 8,
+            map: packet::devbuild::L2Map::RoundRobin,
+        }),
+        Some(&verify),
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// `PLOW_GLM_SEQ_PAR`: every TP seam of a >= 2048-row prefill program is a reduce-scatter, band
+/// work (residual, norm) and an all-gather of the normed rows; the 128-row rung and decode keep
+/// their collectives. Off, no result slot and no split collective is emitted.
+#[test]
+fn glm_seq_par_splits_every_prefill_seam_on_the_owned_band() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let _guard = crate::test_env::env_guard();
+    let _target = crate::EmitAmdGuard::set(true);
+    let dir = std::env::temp_dir().join(format!("plow-glm-seq-par-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = serde_json::json!({
+        "model_type": "glm_moe_dsa", "num_hidden_layers": 4,
+        "hidden_size": 6144, "num_attention_heads": 64,
+        "kv_lora_rank": 512, "q_lora_rank": 2048,
+        "qk_nope_head_dim": 192, "qk_rope_head_dim": 64, "v_head_dim": 256,
+        "vocab_size": 128, "rms_norm_eps": 1e-5,
+        "n_routed_experts": 256, "num_experts_per_tok": 8,
+        "moe_intermediate_size": 2048, "intermediate_size": 12288,
+        "first_k_dense_replace": 3, "routed_scaling_factor": 2.5,
+        "rope_theta": 8000000.0
+    });
+    std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+    fn is(d: &crate::DevInst, op: DevOp) -> bool {
+        d.op == op as u16
+    }
+    let emit = |verify: crate::VerifyHook| {
+        glm_emit_full(
+            &dir,
+            4096,
+            dir.join("model.pkt").to_str().unwrap(),
+            304,
+            8,
+            true,
+            true,
+            "gfx942",
+            None,
+            Some(&verify),
+        )
+    };
+    let base_env = [
+        ("PLOW_MLA_PREFILL", "full:128,2048"),
+        ("PLOW_EMIT_PACKED_PREFILL", "0"),
+        ("PLOW_UNISEG", "0"),
+    ];
+
+    let ran = std::sync::Arc::new(AtomicBool::new(false));
+    {
+        let _env = crate::test_env::EnvScope::set(&base_env);
+        let ran = ran.clone();
+        emit(Box::new(move |model| {
+            assert!(model.tensors.iter().all(|t| t.name != "act.h2_tp"));
+            assert!(model
+                .progs
+                .iter()
+                .flat_map(|p| &p.insts)
+                .all(|d| !is(d, DevOp::XReduceScatter) && !is(d, DevOp::XAllGather)));
+            ran.store(true, Ordering::SeqCst);
+            Ok(crate::LeanReport::skipped("structural regression test"))
+        }));
+    }
+    assert!(ran.swap(false, Ordering::SeqCst));
+
+    let mut env = base_env.to_vec();
+    env.push(("PLOW_GLM_SEQ_PAR", "1"));
+    let _env = crate::test_env::EnvScope::set(&env);
+    let ran2 = ran.clone();
+    emit(Box::new(move |model| {
+        let (t, h, tp) = (2048u32, 6144u32, 8u32);
+        let slot_b = t * h * 2;
+        let tn = |ix: u32| model.tensors[ix as usize].name.as_str();
+        let count = |p: &packet::devbuild::Program, op: DevOp| {
+            p.insts.iter().filter(|d| is(d, op)).count()
+        };
+        // The 128-row rung keeps its two-shots; decode keeps its one-shots.
+        assert_eq!(count(&model.progs[0], DevOp::XReduceTwoShot), 8);
+        for p in model.progs.iter().filter(|p| p.insts.iter().any(|d| is(d, DevOp::XReduce))) {
+            assert_eq!(count(p, DevOp::XReduceScatter) + count(p, DevOp::XAllGather), 0);
+        }
+        let p = &model.progs[1];
+        assert_eq!(count(p, DevOp::XReduceTwoShot), 0);
+        assert_eq!(count(p, DevOp::XReduceScatter), 8, "4 attention + 3 dense + 1 MoE seams");
+        assert_eq!(count(p, DevOp::XAllGather), 9, "4 input norms + 4 post-attn norms + final");
+        let mut gates = std::collections::BTreeSet::new();
+        for d in &p.insts {
+            if is(d, DevOp::XReduceScatter) {
+                assert_eq!((d.i[0], d.i[1]), (t * h, tp));
+                assert!(d.i[2] == 0 || d.i[2] == slot_b);
+                assert!(gates.insert(d.i[3]), "gate {} reused", d.i[3]);
+            } else if is(d, DevOp::XAllGather) {
+                assert_eq!((d.i[0], d.i[4], d.i[5]), (t * h, tp, 3 * slot_b));
+                assert!(["act.xn", "act.xn2"].contains(&tn(d.t[0])), "gathers {}", tn(d.t[0]));
+                assert!(gates.insert(d.i[3]), "gate {} reused", d.i[3]);
+            }
+        }
+        // Every norm feeding a gather and every seam residual runs on the band.
+        let band_norms: Vec<_> = p
+            .insts
+            .iter()
+            .filter(|d| is(d, DevOp::RmsNorm) && tn(d.t[0]) == "act.h2_tp@band2048")
+            .collect();
+        assert_eq!(band_norms.len(), 9);
+        assert!(band_norms
+            .iter()
+            .all(|d| d.i[0] == t / tp && tn(d.t[1]).ends_with("@band2048")));
+        let res: Vec<_> = p.insts.iter().filter(|d| is(d, DevOp::Residual)).collect();
+        assert_eq!(res.len(), 8);
+        for d in res {
+            assert_eq!(d.i[0], t / tp * h);
+            assert!((0..3).all(|k| tn(d.t[k]).ends_with("@band2048")));
+        }
+        // Band views: an eighth of a base bound before them, all in the blob's table.
+        let mut views = 0;
+        for (ix, v) in model.tensors.iter().enumerate() {
+            let Some(base) = v.name.strip_suffix("@band2048") else {
+                continue;
+            };
+            let bix = model.tensors.iter().position(|x| x.name == base).expect("band base");
+            assert!(bix < ix);
+            assert_eq!(model.tensors[bix].bytes, tp as u64 * v.bytes, "{}", v.name);
+            views += 1;
+        }
+        assert_eq!(views, 6, "x, xnext, xmid, og_tp, dg_tp, h2_tp");
+        for name in ["act.h2_tp", "act.xe_tp", "act.rt_tp"] {
+            assert!(model.tensors.iter().any(|x| x.name == name), "{name} missing");
+        }
+        for q in &model.progs {
+            for d in &q.insts {
+                assert!(d
+                    .t
+                    .iter()
+                    .all(|&h| h == TENSOR_NONE || (h as usize) < model.tensors.len()));
+            }
+        }
+        ran2.store(true, Ordering::SeqCst);
+        Ok(crate::LeanReport::skipped("structural regression test"))
+    }));
+    assert!(ran.load(Ordering::SeqCst));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// `PLOW_GLM_SEQ_PAR_PROJ`: on a full-indexer layer the input norm, q_a (+ its norm), kv_a,
+/// k_rope and the indexer's k / weights projections all run on the owned band; one gather
+/// carries q_a-normed / kv_a / k_rope, a second the indexer k / weights. No packet reads the
+/// T-row `xn`.
+#[test]
+fn glm_seq_par_proj_moves_the_entry_projections_onto_the_band() {
+    let _guard = crate::test_env::env_guard();
+    let _target = crate::EmitAmdGuard::set(true);
+    let _env = crate::test_env::EnvScope::set(&[
+        ("PLOW_GLM_SEQ_PAR", "1"),
+        ("PLOW_GLM_SEQ_PAR_PROJ", "1"),
+        ("PLOW_GLM_DSA_PF", "1"),
+        ("PLOW_GLM_INDEX_TP", "1"),
+        ("PLOW_GLM_FP8_KV", "1"),
+        ("PLOW_UNISEG", "0"),
+    ]);
+    let mut c = glm_ref_cfg();
+    c.tp = 8;
+    let (ctx, t, tp) = (81920u32, 8192u32, 8u32);
+    let tb = t / tp;
+    let mut decl = Builder::new(304);
+    let n = declare_glm_rows_batched(&mut decl, &c, ctx, &[0], t, 1, MoeEnc::Fp8Blk);
+    assert_ne!(n.ug_tp, TENSOR_NONE);
+    let mut b = Builder::new(304);
+    b.adopt_tensors(decl.tensors());
+    let all = b.all();
+    let mut xgate = 0;
+    emit_glm_mla_prefill(&mut b, &c, &n, 0, ctx, t, MoeEnc::Fp8Blk, n.x, &[], false, &mut xgate,
+        &all, None);
+    let p = b.finish();
+    let name = |h: u32| p.tensors[h as usize].name.as_str();
+    let is = |d: &crate::DevInst, op: DevOp| d.op == op as u16;
+    assert!(p.insts.iter().all(|d| d.t[1] != n.xn), "a packet reads the T-row xn");
+    assert!(p.insts.iter().any(|d| is(d, DevOp::IndexTpPf)));
+    let ag: Vec<_> = p.insts.iter().filter(|d| is(d, DevOp::XAllGather)).collect();
+    assert_eq!(ag.len(), 3, "entry projections, indexer k/w, post-attention norm");
+    let slot_b = n.slot_b;
+    assert_eq!(
+        (ag[0].t[0], ag[0].t[1], ag[0].t[2]),
+        (n.qlat, n.ckvraw, n.krr)
+    );
+    assert_eq!(
+        [ag[0].i[0], ag[0].i[1], ag[0].i[2], ag[0].i[5], ag[0].i[6], ag[0].i[7]],
+        [t * c.q_lora, t * c.kv_lora, t * c.qk_rope, 3 * slot_b, 4 * slot_b, 5 * slot_b]
+    );
+    assert_eq!((ag[1].t[0], ag[1].t[1]), (n.kidx_pf, n.widx_pf));
+    assert_eq!(
+        [ag[1].i[0], ag[1].i[1], ag[1].i[5], ag[1].i[6]],
+        [t * c.index_dim, t * c.index_heads, 2 * slot_b, 0]
+    );
+    assert_eq!(ag[1].t[2], TENSOR_NONE);
+    assert_eq!(ag[2].t[0], n.xn2);
+    // The five band projections and the two band norms carry the band's rows.
+    let fam = crate::gemm_family_ops();
+    let band_gemms: Vec<_> = p
+        .insts
+        .iter()
+        .filter(|d| fam.contains(&d.op) && name(d.t[1]).ends_with("@band8192"))
+        .collect();
+    assert_eq!(band_gemms.len(), 5);
+    assert!(band_gemms.iter().all(|d| d.i[0] == tb && name(d.t[0]).contains("@band8192")));
+    let norms: Vec<_> = p
+        .insts
+        .iter()
+        .filter(|d| is(d, DevOp::RmsNorm) && name(d.t[0]).contains("@band8192"))
+        .collect();
+    assert_eq!(norms.len(), 3, "input norm, q_a norm, post-attention norm");
+    assert!(norms.iter().all(|d| d.i[0] == tb));
+    // Every slot-backed view is an eighth of the gathered array, rank-strided from its slot.
+    for (h, rows) in [
+        (".q", c.q_lora),
+        (".kv", c.kv_lora),
+        (".kr", c.qk_rope),
+        (".ki", c.index_dim),
+        (".w", c.index_heads),
+    ] {
+        let v = p.tensors.iter().find(|x| x.name.ends_with(&format!("@band8192{h}"))).unwrap();
+        assert_eq!(v.bytes, tb as u64 * rows as u64 * 2, "{}", v.name);
+    }
+}
+
+/// `PLOW_GLM_SEQ_PAR_PROJ` on a MoE layer: the router score and top-k run on the band and the
+/// route table is gathered (slot 5) before the full-T align.
+#[test]
+fn glm_seq_par_proj_routes_on_the_band() {
+    let _guard = crate::test_env::env_guard();
+    let _target = crate::EmitAmdGuard::set(true);
+    let _env = crate::test_env::EnvScope::set(&[
+        ("PLOW_GLM_SEQ_PAR", "1"),
+        ("PLOW_GLM_SEQ_PAR_PROJ", "1"),
+        ("PLOW_GLM_MOE_AITER", "1"),
+        ("PLOW_GLM_FP8_KV", "1"),
+        ("PLOW_UNISEG", "0"),
+    ]);
+    let mut c = glm_ref_cfg();
+    c.tp = 8;
+    let (ctx, t, tp) = (81920u32, 8192u32, 8u32);
+    let tb = t / tp;
+    let mut decl = Builder::new(304);
+    let n = declare_glm_rows_batched(&mut decl, &c, ctx, &[3], t, 1, MoeEnc::Fp8Blk);
+    let mut b = Builder::new(304);
+    b.adopt_tensors(decl.tensors());
+    let all = b.all();
+    let mut xgate = 0;
+    let c_rn2 = emit_glm_mla_prefill(&mut b, &c, &n, 0, ctx, t, MoeEnc::Fp8Blk, n.x, &[], false,
+        &mut xgate, &all, None);
+    emit_glm_moe_ffn_prefill(&mut b, &c, &n, 0, t, MoeEnc::Fp8Blk, n.xnext, c_rn2, &mut xgate,
+        &all, false);
+    let p = b.finish();
+    let name = |h: u32| p.tensors[h as usize].name.as_str();
+    let is = |d: &crate::DevInst, op: DevOp| d.op == op as u16;
+    let router = p.insts.iter().find(|d| is(d, DevOp::MoeRouterTopkPf)).unwrap();
+    assert_eq!(router.i[4], tb);
+    assert!(name(router.t[0]).ends_with("@band8192.rt"));
+    assert!(name(router.t[1]).ends_with("@band8192"));
+    let score = p.insts.iter().find(|d| d.t[0] == router.t[1]).unwrap();
+    assert_eq!(score.i[0], tb);
+    assert_eq!(name(score.t[1]), "act.xn2@band8192");
+    let ag: Vec<_> = p.insts.iter().filter(|d| is(d, DevOp::XAllGather)).collect();
+    assert_eq!(ag.len(), 3, "entry projections, post-attention norm, route table");
+    assert_eq!((ag[2].t[0], ag[2].i[0], ag[2].i[5]), (n.tab, t * c.top_k * 4, 5 * n.slot_b));
+    assert!(p.insts.iter().filter(|d| is(d, DevOp::MoeAlignPf)).all(|d| d.i[0] == t));
+    assert_eq!(p.insts.iter().filter(|d| is(d, DevOp::XReduceScatter)).count(), 2);
+}
+
+/// `PLOW_GLM_GEMM_LT_PF_EXT` on one sequence-parallel MoE layer: every band projection, o_proj,
+/// the band router and the shared expert's gate/up/down become `GemmLtPf`, each alone in its
+/// segment, the native runs back to back; `0` emits exactly what the unset knob does.
+#[test]
+fn glm_gemm_lt_pf_ext_routes_the_interpreter_projections() {
+    let _guard = crate::test_env::env_guard();
+    let _target = crate::EmitAmdGuard::set(true);
+    let (ctx, t) = (81920u32, 8192u32);
+    let tb = t / 8;
+    let layer = |ext: Option<&str>| {
+        let mut env = vec![
+            ("PLOW_GLM_SEQ_PAR", "1"),
+            ("PLOW_GLM_SEQ_PAR_PROJ", "1"),
+            ("PLOW_GLM_MOE_AITER", "1"),
+            ("PLOW_GLM_FP8_KV", "1"),
+            ("PLOW_GLM_GEMM_LT", "1"),
+            ("PLOW_UNISEG", "0"),
+        ];
+        env.extend(ext.map(|v| ("PLOW_GLM_GEMM_LT_PF_EXT", v)));
+        let _env = crate::test_env::EnvScope::set(&env);
+        let mut c = glm_ref_cfg();
+        c.tp = 8;
+        let mut decl = Builder::new(304);
+        let n = declare_glm_rows_batched(&mut decl, &c, ctx, &[3], t, 1, MoeEnc::Fp8Blk);
+        let mut b = Builder::new(304);
+        b.adopt_tensors(decl.tensors());
+        let all = b.all();
+        let mut xgate = 0;
+        let c_rn2 = emit_glm_mla_prefill(&mut b, &c, &n, 0, ctx, t, MoeEnc::Fp8Blk, n.x, &[], false,
+            &mut xgate, &all, None);
+        emit_glm_moe_ffn_prefill(&mut b, &c, &n, 0, t, MoeEnc::Fp8Blk, n.xnext, c_rn2, &mut xgate,
+            &all, false);
+        b.finish()
+    };
+    let off = layer(None);
+    let zero = layer(Some("0"));
+    let decls = |p: &packet::devbuild::Program| {
+        p.tensors.iter().map(|x| (x.name.clone(), x.bytes)).collect::<Vec<_>>()
+    };
+    assert!(off.insts == zero.insts && off.stream == zero.stream && decls(&off) == decls(&zero));
+    let on = layer(Some("1"));
+
+    let is_gemm = |d: &crate::DevInst| {
+        [DevOp::Gemm, DevOp::GemmSmall, DevOp::GemmMed, DevOp::GemmWide, DevOp::GemmC5]
+            .iter()
+            .any(|&o| d.op == o as u16)
+    };
+    let count = |p: &packet::devbuild::Program, op: DevOp| p.insts.iter().filter(|d| d.op == op as u16).count();
+    let lt = |p: &packet::devbuild::Program, mode: u32| {
+        let mut v: Vec<_> = p
+            .insts
+            .iter()
+            .filter(|d| d.op == DevOp::GemmLtPf as u16 && d.i[3] == mode)
+            .map(|d| (d.i[0], d.i[1], d.i[2]))
+            .collect();
+        v.sort_unstable();
+        v
+    };
+    // Every band GEMM of the unset layer, and nothing else, moves to band mode.
+    let mut band_off: Vec<_> = off
+        .insts
+        .iter()
+        .filter(|d| is_gemm(d) && d.i[0] == tb)
+        .map(|d| (d.i[0], d.i[1], d.i[2]))
+        .collect();
+    band_off.sort_unstable();
+    for shape in [(tb, 2048, 6144), (tb, 512, 6144), (tb, 64, 6144), (tb, 256, 6144)] {
+        assert!(band_off.contains(&shape), "{shape:?}");
+    }
+    assert_eq!(lt(&on, 2), band_off);
+    assert!(!on.insts.iter().any(|d| is_gemm(d) && d.i[0] == tb));
+    // Bucket rows: o_proj, shared gate and up, shared down on top of the base route.
+    let mut added = lt(&on, 0);
+    for base in lt(&off, 0) {
+        added.remove(added.iter().position(|&s| s == base).unwrap());
+    }
+    assert_eq!(added, [(t, 256, 6144), (t, 256, 6144), (t, 6144, 256), (t, 6144, 2048)]);
+    assert_eq!((count(&off, DevOp::GemmGlu), count(&on, DevOp::GemmGlu)), (1, 0));
+    assert_eq!(count(&on, DevOp::Glu), count(&off, DevOp::Glu) + 1);
+
+    let seg_of = |ix: usize| on.stream.iter().find(|e| e.inst as usize == ix).unwrap().seg;
+    let find = |mode: u32, n: u32, k: u32| {
+        on.insts
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.op == DevOp::GemmLtPf as u16 && (d.i[1], d.i[2], d.i[3]) == (n, k, mode))
+            .map(|(ix, _)| seg_of(ix))
+            .collect::<Vec<_>>()
+    };
+    for (ix, _) in on.insts.iter().enumerate().filter(|(_, d)| d.op == DevOp::GemmLtPf as u16) {
+        let seg = seg_of(ix);
+        for e in on.stream.iter().chain(&on.gq_stream).filter(|e| e.seg == seg) {
+            assert_eq!(e.inst as usize, ix);
+            assert_eq!((e.wait_len, e.succ_len, e.flags & packet::dev::SE_XCTR), (0, 0, 0));
+        }
+    }
+    let q_a = find(2, 2048, 6144)[0];
+    assert_eq!([find(2, 512, 6144)[0], find(2, 64, 6144)[0]], [q_a + 1, q_a + 2]);
+    let router = find(2, 256, 6144)[0];
+    assert_eq!(find(0, 256, 6144), [router + 1, router + 2], "router, gate, up in one run");
+    let moe = on.insts.iter().position(|d| d.op == DevOp::MoeAiterFp8Pf as u16).unwrap();
+    assert_eq!(find(0, 6144, 256), [seg_of(moe) - 1], "shared down right before the MoE call");
+}
+
+/// `PLOW_GLM_ROWSPLIT_ATTN` OFF must be byte-identical to the packet this emitter produced
+/// before the arm existed. Same production-recipe fixture as
+/// `production_programs_read_only_rows_every_rank_holds` (TP8, 8192 in the prefill ladder,
+/// qualified GLM recipe), so this is the exact "full-depth production recipe" the design's own
+/// gate calls for, not a toy shape. The knob is left UNSET (default off) — no row-split env var
+/// appears in the list below at all, so a reference build from before this arm existed can run
+/// the identical fixture and its `model.pkt` sha256 is the control this test's hash is checked
+/// against externally (see the paths handed to the coordinator).
+///
+/// In-process, this also proves the stronger claim the sha256 alone cannot: not just "the bytes
+/// match" but WHY — no row-split tensor (`qa_tp`/`qr_tp`/`qa_rs`/`qr_rs`/`oat_rs_tp`/the
+/// `wuv_full` replica) and no `XAllToAllHeads` instruction exists anywhere in the blob when the
+/// knob is off, in ANY program (prefill buckets and decode rungs alike).
+#[test]
+fn rowsplit_attn_knob_off_matches_pre_arm_hash() {
+    let _guard = crate::test_env::env_guard();
+    let dir =
+        std::env::temp_dir().join(format!("plow-glm-rowsplit-off-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = serde_json::json!({
+        "model_type": "glm_moe_dsa", "num_hidden_layers": 5,
+        "hidden_size": 6144, "num_attention_heads": 64,
+        "kv_lora_rank": 512, "q_lora_rank": 2048,
+        "qk_nope_head_dim": 192, "qk_rope_head_dim": 64, "v_head_dim": 256,
+        "vocab_size": 128, "rms_norm_eps": 1e-5,
+        "n_routed_experts": 256, "num_experts_per_tok": 8,
+        "moe_intermediate_size": 2048, "intermediate_size": 12288,
+        "first_k_dense_replace": 3, "routed_scaling_factor": 2.5,
+        "rope_theta": 8000000.0,
+        "indexer_types": ["full", "shared", "full", "shared", "full"]
+    });
+    std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+    let _env = crate::test_env::EnvScope::set(&[
+        ("PLOW_FP8", "1"),
+        ("PLOW_GLM_DECODE_NORM_ROWS", "1"),
+        ("PLOW_GLM_DSA", "1"),
+        ("PLOW_GLM_DSA_PF", "1"),
+        ("PLOW_GLM_DSA_PF_SPAN", "3"),
+        ("PLOW_GLM_FP8_KV", "1"),
+        ("PLOW_GLM_FUSE_B1", "1"),
+        ("PLOW_GLM_FUSE_ROPE", "0"),
+        ("PLOW_GLM_FUSE_SEAM", "1"),
+        ("PLOW_GLM_GEMM_LT", "1"),
+        ("PLOW_GLM_GEMM_LT_DECODE", "1"),
+        ("PLOW_GLM_INDEX_TP", "1"),
+        ("PLOW_GLM_MOE_AITER", "1"),
+        ("GLM_MOE_CORESIDENT", "2"),
+        ("PLOW_GLM_MOE_FLAT_DECODE", "0"),
+        ("PLOW_GLM_MOE_RESIDENT", "1"),
+        ("PLOW_GLM_PLACE_PF", "0"),
+        ("PLOW_GLM_SELECT_LOCAL", "1"),
+        ("GLM_SHARD_HEAD", "1"),
+        ("GLM_SHARED_CUS", "48"),
+        ("PLOW_MLA_PREFILL", "full:128,512,2048,8192"),
+        ("PLOW_MOE_PF_DET", "1"),
+        ("PLOW_EMIT_PACKED_PREFILL", "0"),
+        ("PLOW_DECODE_BATCH", "20"),
+        ("PLOW_DECODE_BATCH_LADDER", "1,2,4,8,16,20"),
+        ("PLOW_UNISEG", "0"),
+        ("PLOW_MLA_PF_V2", "1"),
+        ("PLOW_MLA_PF_AITER", "1"),
+        ("PLOW_GLM_SEQ_PAR", "1"),
+        ("PLOW_GLM_SEQ_PAR_PROJ", "1"),
+        ("PLOW_GLM_FOLD_LT", "1"),
+        ("PLOW_GLM_GEMM_LT_DECODE_EXT", "1"),
+        // PLOW_GLM_ROWSPLIT_ATTN is deliberately ABSENT: this is the knob-off, default state.
+    ]);
+    let bad_names: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+    let bad_ops: std::sync::Arc<std::sync::Mutex<usize>> = Default::default();
+    let (bn, bo) = (bad_names.clone(), bad_ops.clone());
+    let verify: crate::VerifyHook = Box::new(move |model| {
+        let hit: Vec<String> = model
+            .tensors
+            .iter()
+            .map(|t| t.name.clone())
+            .filter(|n| {
+                n.contains("qa_tp")
+                    || n.contains("qr_tp")
+                    || n.contains("qa_rs")
+                    || n.contains("qr_rs")
+                    || n.contains("oat_rs")
+            })
+            .collect();
+        *bn.lock().unwrap() = hit;
+        *bo.lock().unwrap() = model
+            .progs
+            .iter()
+            .map(|p| {
+                p.insts
+                    .iter()
+                    .filter(|d| d.op == DevOp::XAllToAllHeads as u16)
+                    .count()
+            })
+            .sum();
+        Ok(crate::LeanReport::skipped("structural regression test"))
+    });
+    let out = dir.join("model.pkt");
+    glm_emit_full(
+        &dir,
+        81920,
+        out.to_str().unwrap(),
+        304,
+        8,
+        true,
+        true,
+        "gfx942",
+        None,
+        Some(&verify),
+    );
+    assert!(
+        bad_names.lock().unwrap().is_empty(),
+        "row-split tensor bound with the knob off: {:?}",
+        bad_names.lock().unwrap()
+    );
+    assert_eq!(
+        *bad_ops.lock().unwrap(),
+        0,
+        "XAllToAllHeads emitted with the knob off"
+    );
+    let bytes = std::fs::read(&out).unwrap();
+    let hash = plow_asset::decode_objects::image_sha256(&bytes);
+    eprintln!("PLOW_GLM_ROWSPLIT_ATTN=off model.pkt sha256 = {hash}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The VRAM floor question the coordinator asked: how many EXTRA declared bytes does turning
+/// `PLOW_GLM_ROWSPLIT_ATTN` on bind, on this same 5-layer production-recipe fixture? Sums every
+/// declared tensor's bytes (knob on) minus the same sum (knob off) — the DECLARED-BYTE delta,
+/// not a measured resident-VRAM number (that needs a real load, step 3's job once the peer-slot
+/// runtime wiring exists). Reports per-layer and the 78-layer extrapolation the coordinator's
+/// own arithmetic used (16 MiB/layer bf16 `W_uv` replica).
+#[test]
+fn rowsplit_attn_knob_on_reports_the_extra_declared_bytes() {
+    let _guard = crate::test_env::env_guard();
+    fn emit_and_sum(rowsplit: bool) -> (u64, usize) {
+        let dir = std::env::temp_dir().join(format!(
+            "plow-glm-rowsplit-bytes-{}-{}",
+            rowsplit,
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = serde_json::json!({
+            "model_type": "glm_moe_dsa", "num_hidden_layers": 5,
+            "hidden_size": 6144, "num_attention_heads": 64,
+            "kv_lora_rank": 512, "q_lora_rank": 2048,
+            "qk_nope_head_dim": 192, "qk_rope_head_dim": 64, "v_head_dim": 256,
+            "vocab_size": 128, "rms_norm_eps": 1e-5,
+            "n_routed_experts": 256, "num_experts_per_tok": 8,
+            "moe_intermediate_size": 2048, "intermediate_size": 12288,
+            "first_k_dense_replace": 3, "routed_scaling_factor": 2.5,
+            "rope_theta": 8000000.0,
+            "indexer_types": ["full", "shared", "full", "shared", "full"]
+        });
+        std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+        let mut envs = vec![
+            ("PLOW_FP8", "1"),
+            ("PLOW_GLM_DECODE_NORM_ROWS", "1"),
+            ("PLOW_GLM_DSA", "1"),
+            ("PLOW_GLM_DSA_PF", "1"),
+            ("PLOW_GLM_DSA_PF_SPAN", "3"),
+            ("PLOW_GLM_FP8_KV", "1"),
+            ("PLOW_GLM_FUSE_B1", "1"),
+            ("PLOW_GLM_FUSE_ROPE", "0"),
+            ("PLOW_GLM_FUSE_SEAM", "1"),
+            ("PLOW_GLM_GEMM_LT", "1"),
+            ("PLOW_GLM_GEMM_LT_DECODE", "1"),
+            ("PLOW_GLM_INDEX_TP", "1"),
+            ("PLOW_GLM_MOE_AITER", "1"),
+            ("GLM_MOE_CORESIDENT", "2"),
+            ("PLOW_GLM_MOE_FLAT_DECODE", "0"),
+            ("PLOW_GLM_MOE_RESIDENT", "1"),
+            ("PLOW_GLM_PLACE_PF", "0"),
+            ("PLOW_GLM_SELECT_LOCAL", "1"),
+            ("GLM_SHARD_HEAD", "1"),
+            ("GLM_SHARED_CUS", "48"),
+            ("PLOW_MLA_PREFILL", "full:128,512,2048,8192"),
+            ("PLOW_MOE_PF_DET", "1"),
+            ("PLOW_EMIT_PACKED_PREFILL", "0"),
+            ("PLOW_DECODE_BATCH", "20"),
+            ("PLOW_DECODE_BATCH_LADDER", "1,2,4,8,16,20"),
+            ("PLOW_UNISEG", "0"),
+            ("PLOW_MLA_PF_V2", "1"),
+            ("PLOW_MLA_PF_AITER", "1"),
+            ("PLOW_GLM_SEQ_PAR", "1"),
+            ("PLOW_GLM_SEQ_PAR_PROJ", "1"),
+            ("PLOW_GLM_FOLD_LT", "1"),
+            ("PLOW_GLM_GEMM_LT_DECODE_EXT", "1"),
+        ];
+        if rowsplit {
+            envs.push(("PLOW_GLM_ROWSPLIT_ATTN", "1"));
+        }
+        let _env = crate::test_env::EnvScope::set(&envs);
+        let total: std::sync::Arc<std::sync::Mutex<u64>> = Default::default();
+        let sink = total.clone();
+        let count: std::sync::Arc<std::sync::Mutex<usize>> = Default::default();
+        let csink = count.clone();
+        let verify: crate::VerifyHook = Box::new(move |model| {
+            *sink.lock().unwrap() = model.tensors.iter().map(|t| t.bytes).sum();
+            *csink.lock().unwrap() = model.tensors.len();
+            if rowsplit {
+                for t in &model.tensors {
+                    if t.name.contains("qa_tp")
+                        || t.name.contains("qr_tp")
+                        || t.name.contains("qa_rs")
+                        || t.name.contains("qr_rs")
+                        || t.name.contains("oat_rs")
+                        || t.name.contains("v_absorb")
+                    {
+                        eprintln!("  tensor {} bytes={}", t.name, t.bytes);
+                    }
+                }
+            }
+            Ok(crate::LeanReport::skipped("byte-total probe"))
+        });
+        glm_emit_full(
+            &dir,
+            81920,
+            dir.join("model.pkt").to_str().unwrap(),
+            304,
+            8,
+            true,
+            true,
+            "gfx942",
+            None,
+            Some(&verify),
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+        let t = *total.lock().unwrap();
+        let c = *count.lock().unwrap();
+        (t, c)
+    }
+    let (off_bytes, off_n) = emit_and_sum(false);
+    let (on_bytes, on_n) = emit_and_sum(true);
+    assert!(
+        on_bytes > off_bytes,
+        "the knob must bind at least the replica's bytes"
+    );
+    let extra = on_bytes - off_bytes;
+    // The delta is NOT uniform per layer: `wuv_full` (16 MiB here) is per-layer, but the three
+    // new program-wide scratch tensors (`qa_rs`/`qr_rs`/`oat_rs_tp` — `qa_tp`/`qr_tp` are
+    // RENAMES of the existing `qa`/`qr` at the same byte size, zero extra) are a ONE-TIME cost
+    // paid once per program, not once per layer. Naively dividing the whole delta by 5 layers
+    // and scaling to 78 would double-count that fixed cost 78/5x over. Report both terms.
+    let per_layer_wuv_full = 16u64 * 1024 * 1024; // this fixture's nh*dk*vd*BF16, checked below
+    let scratch_once = extra - 5 * per_layer_wuv_full;
+    let extra_78 = 78 * per_layer_wuv_full + scratch_once;
+    eprintln!(
+        "PLOW_GLM_ROWSPLIT_ATTN extra declared bytes on this 5-layer fixture: {extra} B \
+         ({:.2} MiB) across {} extra tensors ({} -> {} declared) = 5 x {:.2} MiB/layer W_uv \
+         replica + {:.2} MiB one-time scratch (qa_rs/qr_rs/oat_rs_tp; qa_tp/qr_tp are renames \
+         of qa/qr at the same size, zero extra); 78-layer extrapolation = 78 x {:.2} MiB + \
+         {:.2} MiB once = {:.2} GiB/rank",
+        extra as f64 / (1024.0 * 1024.0),
+        on_n.saturating_sub(off_n),
+        off_n,
+        on_n,
+        per_layer_wuv_full as f64 / (1024.0 * 1024.0),
+        scratch_once as f64 / (1024.0 * 1024.0),
+        per_layer_wuv_full as f64 / (1024.0 * 1024.0),
+        scratch_once as f64 / (1024.0 * 1024.0),
+        extra_78 as f64 / (1024.0 * 1024.0 * 1024.0)
+    );
 }

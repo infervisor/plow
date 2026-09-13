@@ -104,7 +104,7 @@ DSA `indexer.k_norm`), and neither shipped blob emits it: `scripts/glm53_mi300x.
 ### 1.4 All 93 layers: the debug-build tripwire
 
 `PLOW_NORM_RANGE_CHECK=1` (default 0) compiles a predicate on every reduced sum-of-squares in
-`op_norm.h` and in `op_gemm.h`'s fused-norm GEMV; a violating workgroup traps.
+`op_norm.h` and in `op_gemm_common.h`'s fused-norm GEMV; a violating workgroup traps.
 `PLOW_NORM_SS_MAX` sets the ceiling — `FLT_MAX` by default, i.e. only real overflow. Lowering it
 turns the facility into a *bound*: a campaign that completes proves nothing anywhere exceeded it.
 

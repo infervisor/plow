@@ -40,6 +40,102 @@ use crate::rope::GenTensor;
 /// closure as the input, so removing every covered edge AT ONCE is safe even
 /// when a justifying path's own edges are also removed: each is in turn covered
 /// by a further path, and acyclicity makes the induction terminate.
+/// Every environment knob the packet builder reads, in ONE place.
+///
+/// These used to be twenty-one `std::env::var` calls scattered through `Builder::new` and
+/// `Builder::finish`, which is why `devgen`'s manifest carries `UNRECORDED_ENV`: a knob read
+/// this way has no CLI flag and no `build.json` record. The builder now reads this struct;
+/// `from_env` is the only place the names appear, and the caller that owns configuration
+/// (`devgen::emit_config::install`) hands the builder its snapshot through [`install_knobs`].
+/// Nothing installed means "read the environment", exactly the old behaviour, so a caller
+/// that never configures anything (the packet crate's own tests) is unchanged.
+///
+/// Field semantics are the old parses verbatim: a `bool` is `== "1"` (`tr_quiet` is
+/// "set at all"); an `Option<String>` is the raw value the site matches on; `mla_pf_v2` is
+/// `Some(true)`/`Some(false)` for `"1"`/`"0"` and `None` otherwise.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct SegKnobs {
+    pub tune_dump: bool,
+    /// `PLOW_GQ_ORDER`: unset or anything else = ASAP gate order within segment order,
+    /// `"asap"` = ASAP program-wide, `"emit"` = emit order.
+    pub gq_order: Option<String>,
+    pub fine_force: bool,
+    pub fuse_xr_attnres: bool,
+    pub chain_bypass: Option<String>,
+    pub tr_quiet: bool,
+    pub uniseg: bool,
+    pub mla_pf_v2: Option<bool>,
+    pub mla_pf_aiter: bool,
+    pub moe_decode_standalone: bool,
+    pub phase_objects: bool,
+    pub xr_wave_rs: bool,
+    pub seg_pure_gemm: Option<String>,
+    pub seg_fa512: Option<String>,
+    pub seg_fa256_gqa2: bool,
+    pub seg_v2: Option<String>,
+    pub seg_per_op: bool,
+    pub seg_dump: bool,
+    pub place_report: bool,
+    pub seg_class_slice: Option<String>,
+    pub seg_slice_all: bool,
+}
+
+impl SegKnobs {
+    /// The one place these names are read. Kept as literal `std::env::var("…")` calls so
+    /// `devgen`'s `unrecorded_env_list_is_complete` keeps auditing them against the source.
+    pub fn from_env() -> Self {
+        SegKnobs {
+            tune_dump: std::env::var("PLOW_TUNE_DUMP").ok().as_deref() == Some("1"),
+            gq_order: std::env::var("PLOW_GQ_ORDER").ok(),
+            fine_force: std::env::var("PLOW_FINE_FORCE").ok().as_deref() == Some("1"),
+            fuse_xr_attnres: std::env::var("PLOW_FUSE_XR_ATTNRES").ok().as_deref() == Some("1"),
+            chain_bypass: std::env::var("PLOW_CHAIN_BYPASS").ok(),
+            tr_quiet: std::env::var_os("PLOW_TR_QUIET").is_some(),
+            uniseg: std::env::var("PLOW_UNISEG").ok().as_deref() == Some("1"),
+            mla_pf_v2: match std::env::var("PLOW_MLA_PF_V2").ok().as_deref() {
+                Some("0") => Some(false),
+                Some("1") => Some(true),
+                _ => None,
+            },
+            mla_pf_aiter: std::env::var("PLOW_MLA_PF_AITER").ok().as_deref() == Some("1"),
+            moe_decode_standalone: std::env::var("PLOW_MOE_DECODE_STANDALONE").ok().as_deref()
+                == Some("1"),
+            phase_objects: std::env::var("PLOW_PHASE_OBJECTS").ok().as_deref() == Some("1"),
+            xr_wave_rs: std::env::var("PLOW_XR_WAVE_RS").ok().as_deref() == Some("1"),
+            seg_pure_gemm: std::env::var("PLOW_SEG_PURE_GEMM").ok(),
+            seg_fa512: std::env::var("PLOW_SEG_FA512").ok(),
+            seg_fa256_gqa2: std::env::var("PLOW_SEG_FA256_GQA2").ok().as_deref() == Some("1"),
+            seg_v2: std::env::var("PLOW_SEG_V2").ok(),
+            seg_per_op: std::env::var("PLOW_SEG_PER_OP").ok().as_deref() == Some("1"),
+            seg_dump: std::env::var("PLOW_SEG_DUMP").ok().as_deref() == Some("1"),
+            place_report: std::env::var("PLOW_PLACE_REPORT").ok().as_deref() == Some("1"),
+            seg_class_slice: std::env::var("PLOW_SEG_CLASS_SLICE").ok(),
+            seg_slice_all: std::env::var("PLOW_SEG_SLICE_ALL").ok().as_deref() == Some("1"),
+        }
+    }
+}
+
+static KNOBS: std::sync::atomic::AtomicPtr<SegKnobs> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// Make `knobs` the builder's configuration. Last install wins, as with
+/// `devgen::emit_config::install`; the previous snapshot is leaked so no `&'static` can dangle.
+pub fn install_knobs(knobs: SegKnobs) {
+    let ptr = Box::into_raw(Box::new(knobs));
+    KNOBS.store(ptr, std::sync::atomic::Ordering::Release);
+}
+
+/// The builder's current knobs: the installed snapshot, else the environment.
+pub fn knobs() -> SegKnobs {
+    let ptr = KNOBS.load(std::sync::atomic::Ordering::Acquire);
+    if ptr.is_null() {
+        SegKnobs::from_env()
+    } else {
+        // SAFETY: `install_knobs` wrote a valid, never-freed Box.
+        unsafe { (*ptr).clone() }
+    }
+}
+
 pub fn transitive_reduction(n: usize, edges: &BTreeSet<(u32, u32)>) -> BTreeSet<(u32, u32)> {
     // Reachability by 2+ hops. The op DAG is emitted in topological order
     // (producer index < consumer index), so a single reverse sweep suffices.
@@ -125,7 +221,7 @@ pub fn set_tuned_gemv_cases(cases: std::collections::HashSet<String>) {
 /// TUNEDUMP_GEMV <m> <n> <k> <quant> <PLOW_DOP_...> <HIT|MISS>
 /// ```
 fn tune_dump_gemv(op: DevOp, inst: &DevInst) {
-    if std::env::var("PLOW_TUNE_DUMP").ok().as_deref() != Some("1") {
+    if !knobs().tune_dump {
         return;
     }
     let Some((fam, m, n, k, quant)) = op.gemv_case(&inst.i) else {
@@ -219,6 +315,7 @@ struct LocalityCensus {
 struct Op {
     inst: DevInst,
     isolated: bool,
+    keep_single_grid: bool,
     /// Host-join epoch (see [`Builder::host_join`]); a change between consecutive ops opens a
     /// new segment regardless of wave class or `PLOW_UNISEG`.
     join: u32,
@@ -336,6 +433,9 @@ pub struct Builder {
     /// Split descriptor-consuming prefill families into independent wave classes.
     /// Callers must enable this only for prefill programs.
     packed_prefill_segments: bool,
+    /// Token-batch body: the slot band's width. The band's decode-attention packets get their
+    /// own segment class so the runtime can route them to an object that carries those arms.
+    token_batch_band: Option<u32>,
     /// Isolate structurally compatible MXFP4 grouped-MoE stage-2 boundaries.
     lean_moe_stage2_segments: bool,
     /// Isolate structurally compatible MXFP4 grouped-MoE stage-1 packets.
@@ -369,13 +469,34 @@ pub struct Builder {
     /// Re-declaring a tensor name returns the existing handle instead of appending.
     /// `false` (default) ⇒ byte-identical. See [`Builder::set_tensor_dedup`].
     tensor_dedup: bool,
+    /// Workgroup cap for machine-wide ops; `None` (default) ⇒ byte-identical.
+    /// See [`Builder::set_cu_cap`].
+    cu_cap: Option<u32>,
     /// Coarse dep edges removed by the transitive reduction in [`Builder::finish`].
     /// Reported so an emitter can log it; the reduction itself is unconditional.
     tr_dropped: usize,
 }
 
-fn mla_v2_segment(op: u16, n_tok: u32) -> bool {
-    n_tok >= 2048 && (op == DevOp::FlashMlaPrefill as u16 || op == DevOp::FlashMlaPrefillFp8 as u16)
+fn mla_prefill_segment_class(op: u16, n_tok: u32) -> Option<u8> {
+    (op == DevOp::FlashMlaPrefill as u16 || op == DevOp::FlashMlaPrefillFp8 as u16)
+        .then_some(if n_tok >= 2048 { 4 } else { 26 })
+}
+
+/// Segment class of a token-batch body's BAND attention packets: the batched-decode chain
+/// (`IndexScore`/`IndexSelect`, the MLA decode flash, its fold) run over the band rows inside a
+/// prefill-width program. They are isolated so the runtime can route the segment to the decode
+/// object, whose inventory carries those arms; the prefill fold (`i0 = T`) stays where it is.
+pub const TOKEN_BATCH_BAND_SEGMENT_CLASS: u8 = 27;
+
+fn token_batch_band_segment_class(inst: &DevInst, band: u32) -> Option<u8> {
+    let op = inst.op;
+    let band_op = op == DevOp::FlashMlaDecode as u16
+        || op == DevOp::FlashMlaDecodeFp8 as u16
+        || op == DevOp::FlashGatherDecode as u16
+        || op == DevOp::IndexScore as u16
+        || op == DevOp::IndexSelect as u16
+        || (op == DevOp::MlaMergeFold as u16 && inst.i[0] == band);
+    band_op.then_some(TOKEN_BATCH_BAND_SEGMENT_CLASS)
 }
 
 // Experimental packed-prefill segment classes. These values describe an operator
@@ -558,6 +679,7 @@ fn lean_kda_key_factor_pair(ops: &[Op], i: usize) -> bool {
 
 impl Builder {
     pub fn new(n_cu: u32) -> Self {
+        let knobs = knobs();
         Self {
             n_cu,
             ops: Vec::new(),
@@ -567,12 +689,10 @@ impl Builder {
             uniseg_denied: false,
             uniseg_forced: false,
             cur_join: 0,
-            gq_order_asap: std::env::var("PLOW_GQ_ORDER").ok().as_deref() != Some("emit"),
-            gq_order_seg: !matches!(
-                std::env::var("PLOW_GQ_ORDER").ok().as_deref(),
-                Some("emit") | Some("asap")
-            ),
+            gq_order_asap: knobs.gq_order.as_deref() != Some("emit"),
+            gq_order_seg: !matches!(knobs.gq_order.as_deref(), Some("emit") | Some("asap")),
             packed_prefill_segments: false,
+            token_batch_band: None,
             lean_moe_stage2_segments: false,
             lean_moe_stage1_segments: false,
             lean_moe_combine_segments: false,
@@ -589,8 +709,19 @@ impl Builder {
             attn_res_f32mix_segments: false,
             gemv_split: 1,
             tensor_dedup: false,
+            cu_cap: None,
             tr_dropped: 0,
         }
+    }
+
+    /// Narrow every op emitted on a contiguous `0..n` CU list with `n > k` to `0..k`.
+    ///
+    /// For small prefill buckets: a machine-wide packet costs a claim barrier per workgroup
+    /// whether or not its slice has work. Kernels grid-stride their work items by `nblk`, so the
+    /// width moves only the work→workgroup partition. Clamped to 64 so fixed-block ops (the
+    /// 64-block argmax) keep their width.
+    pub fn set_cu_cap(&mut self, k: u32) {
+        self.cu_cap = Some(k.max(64));
     }
 
     /// Enable L2-domain-aware placement from `hwspec::GpuSpec::l2_partitioning` plus the
@@ -688,6 +819,22 @@ impl Builder {
 
     pub fn set_packed_prefill_segments(&mut self, enabled: bool) {
         self.packed_prefill_segments = enabled;
+    }
+
+    /// Whether this program is being emitted as a packed-prefill topology (sibling or
+    /// token-batch body), i.e. its cache writers will resolve rows through span metadata.
+    pub fn packed_prefill_segments(&self) -> bool {
+        self.packed_prefill_segments
+    }
+
+    /// Mark this program as a token-batch BODY with a slot band of `band` rows.
+    pub fn set_token_batch_band(&mut self, band: u32) {
+        assert!(band > 0, "token-batch band must have at least one row");
+        self.token_batch_band = Some(band);
+    }
+
+    pub fn token_batch_band(&self) -> Option<u32> {
+        self.token_batch_band
     }
 
     pub fn set_lean_moe_stage2_segments(&mut self, enabled: bool) {
@@ -905,6 +1052,15 @@ impl Builder {
         self.ops[counter as usize].isolated = true;
     }
 
+    /// Keep this machine-filling op at one workgroup per executor when segment-class slicing is
+    /// enabled. Dedicated occupancy-1 objects use the original grid and cannot consume the
+    /// doubled slice numbering of the broad occupancy-2 GEMM interpreter.
+    pub fn keep_single_grid(&mut self, counter: u32) {
+        let op = &mut self.ops[counter as usize];
+        assert_eq!(op.cus.len(), self.n_cu as usize);
+        op.keep_single_grid = true;
+    }
+
     /// As [`Builder::emit`], but the dependencies may be [`Dep::Fine`] — so a slice waits
     /// only on the producer slices that actually feed it, instead of on the whole op.
     pub fn emit_dep(
@@ -919,11 +1075,19 @@ impl Builder {
         // regardless of the target's executor count. Repeated ids are legal (gemv_split
         // relies on it) and a CU simply runs both slices in order, so wrapping keeps a
         // small-`n_cu` target (CPU cores) valid; GPU blobs (n_cu >= 64) are unchanged.
-        let cus: Vec<u32> = if cus.iter().any(|&c| c >= self.n_cu) {
+        let mut cus: Vec<u32> = if cus.iter().any(|&c| c >= self.n_cu) {
             cus.into_iter().map(|c| c % self.n_cu).collect()
         } else {
             cus
         };
+        if let Some(k) = self.cu_cap {
+            if cus.len() > k as usize
+                && cus.iter().enumerate().all(|(i, &c)| c == i as u32)
+                && !deps.iter().any(|d| matches!(d, Dep::Fine { .. }))
+            {
+                cus.truncate(k as usize);
+            }
+        }
         for d in &deps {
             if let Dep::Fine { map, .. } = d {
                 assert_eq!(
@@ -955,6 +1119,7 @@ impl Builder {
         self.ops.push(Op {
             inst,
             isolated: false,
+            keep_single_grid: false,
             join: self.cur_join,
             cus,
             deps,
@@ -1063,7 +1228,7 @@ impl Builder {
         // collapses to full fan-in under wave-interleaving) is still downgraded, so the test
         // isolates the recoverable gates (headnorm->flash, flash->merge) and never pays the
         // 256x256-atomic all-to-all cost the Dep doc warns about. Default (unset) = byte-identical.
-        let force = std::env::var("PLOW_FINE_FORCE").ok().as_deref() == Some("1");
+        let force = knobs().fine_force;
         let blocks: Vec<usize> = self.ops.iter().map(|o| o.cus.len()).collect();
         let (mut kept, mut downgraded) = (0, 0);
         for i in 0..n {
@@ -1659,6 +1824,7 @@ impl Builder {
     }
 
     pub fn finish(mut self) -> Program {
+        let knobs = knobs();
         if let Some(degree) = self.moe_prefill_ep_degree {
             let rewritten = self.rewrite_replicated_moe_prefill_ep(degree);
             assert!(
@@ -1673,7 +1839,7 @@ impl Builder {
                 eprintln!("  whole-graph fusion: {fused} materialized residual inputs");
             }
         }
-        if std::env::var("PLOW_FUSE_XR_ATTNRES").ok().as_deref() == Some("1") {
+        if knobs.fuse_xr_attnres {
             let fused = self.fuse_xreduce_attnres();
             if fused != 0 {
                 eprintln!("  whole-graph fusion: {fused} XReduceTwoShot+AttnRes consumers");
@@ -1742,7 +1908,7 @@ impl Builder {
         //
         // Consumers read the op's stale output, so tokens are garbage. That is intended: this
         // measures scheduling, and wrong numerics are a valid instrument for scheduling.
-        if let Ok(spec) = std::env::var("PLOW_CHAIN_BYPASS") {
+        if let Some(spec) = knobs.chain_bypass.clone() {
             let want: Vec<u16> = spec
                 .split(',')
                 .filter_map(|s| s.trim().parse().ok())
@@ -1875,7 +2041,7 @@ impl Builder {
                 dup += before - op.deps.len();
             }
             self.tr_dropped = dropped;
-            if (dropped > 0 || dup > dropped) && std::env::var_os("PLOW_TR_QUIET").is_none() {
+            if (dropped > 0 || dup > dropped) && !knobs.tr_quiet {
                 eprintln!(
                     "  counter-graph reduction: {} of {} distinct coarse edges implied by a path, \
                      {} duplicate waits; {} wait entries removed",
@@ -1926,27 +2092,24 @@ impl Builder {
         // the segment boundary is spurious there and would otherwise force a segmented relaunch path.
         // `deny_uniseg` wins over the environment: a target that cannot express one segment must
         // not be given one because a variable said so. See that method for the failure it prevents.
-        let uniseg = !self.uniseg_denied
-            && (self.uniseg_forced || std::env::var("PLOW_UNISEG").ok().as_deref() == Some("1"));
-        // AMD L2-placed packets split FlashMlaPrefill (bf16, op 51) and its fp8-KV twin
-        // (op 110) into their own wave-class-4
-        // segments at T>=2048 so the AMD host can route them to the 4-wave flash object's V2
-        // kernel (d_flash_mla_prefill_v2). Smaller buckets remain one 8-wave L2-placed launch.
-        // Emit-time, because segments only form on wave_class
-        // BOUNDARIES: reclassifying host-side would drag whatever ops share the segment onto
-        // an object that silently skips them. PLOW_MLA_PF_V2=0 is the explicit opt-out; non-AMD
-        // packets remain byte-identical. The host applies
-        // its own purity + size guards (exec/amd.rs derive_segments), so an env mismatch in
-        // either direction degrades to the 8-wave kernel rather than corrupting.
+        let uniseg = !self.uniseg_denied && (self.uniseg_forced || knobs.uniseg);
+        // Isolate MLA at every query rung: a small chunk can still have a long KV cache.
+        // Class 26 separates small MLA from GEMM. The host selects four-wave split
+        // or eight-wave unsplit objects from the instruction's validated layout.
+        let split_mla = self
+            .ops
+            .iter()
+            .any(|op| op.inst.op == DevOp::FlashMlaPrefillFp8 as u16 && op.inst.j[1] != 0);
         let mla_v2 = !uniseg
-            && match std::env::var("PLOW_MLA_PF_V2").ok().as_deref() {
-                Some("0") => false,
-                Some("1") => true,
-                // A placed packet is an AMD production artifact. Isolating a pure MLA flash
-                // segment is safe even when its optional lean object is absent: the host then
-                // runs that ordered segment on the ordinary 8-wave interpreter.
-                _ => self.place_l2.is_some(),
-            };
+            && (split_mla
+                || match knobs.mla_pf_v2 {
+                    Some(explicit) => explicit,
+                    // A placed packet is an AMD production artifact. Isolating a pure MLA flash
+                    // segment is safe even when its optional lean object is absent: the host then
+                    // runs that ordered segment on the ordinary 8-wave interpreter.
+                    None => self.place_l2.is_some(),
+                });
+        let mla_aiter = mla_v2 && knobs.mla_pf_aiter;
         // Opt-in only: live packed serving remains disabled. Giving descriptor-consuming
         // families distinct classes lets a future runtime route them to lean objects without
         // putting their branches in the production megakernel. Unset preserves packet bytes.
@@ -1993,17 +2156,15 @@ impl Builder {
                     && pair[1].inst.op == DevOp::MlaMergeFold as u16
             });
         let decode_grouped_moe = !uniseg
-            && (self.decode_grouped_moe_segments
-                || std::env::var("PLOW_MOE_DECODE_STANDALONE").ok().as_deref() == Some("1"))
+            && (self.decode_grouped_moe_segments || knobs.moe_decode_standalone)
             && self.ops.windows(2).any(|pair| {
                 pair[0].inst.op == DevOp::MoeGroupGluFp8Blk as u16
                     && pair[1].inst.op == DevOp::MoeGroupDownFp8Blk as u16
             });
-        let graph_phase_objects = std::env::var("PLOW_PHASE_OBJECTS").ok().as_deref() == Some("1");
+        let graph_phase_objects = knobs.phase_objects;
         let xreduce_wave_rs = !uniseg
             && self.place_l2.is_some()
-            && (self.xreduce_wave_rs_segments
-                || std::env::var("PLOW_XR_WAVE_RS").ok().as_deref() == Some("1"))
+            && (self.xreduce_wave_rs_segments || knobs.xr_wave_rs)
             && self
                 .ops
                 .iter()
@@ -2042,28 +2203,29 @@ impl Builder {
         // "fp8" = ONLY TMA-mapped fp8 GEMMs are class-8 (pairs with the ws-entry object,
         // whose sole arm is the warp-specialized w8a8 body — a bf16 or mapless packet
         // landing there would __trap()).
-        let pure_env = std::env::var("PLOW_SEG_PURE_GEMM").ok();
+        // "w8a16" adds validated mapless W8A16 GEMMs and requires the matching object ABI.
+        let pure_env = knobs.seg_pure_gemm.clone();
         let pure_mode = match pure_env.as_deref() {
             Some("1") => 1u8,
             Some("fp8") => 2u8,
+            Some("w8a16") => 3u8,
             _ => 0u8,
         };
-        let pure_gemm = !uniseg
-            && pure_mode != 0
-            && self.ops.iter().any(|o| {
-                o.inst.op == DevOp::FlashPrefill as u16
-                    || o.inst.op == DevOp::FlashPrefillFp8 as u16
-            });
+        let has_flash_prefill = self.ops.iter().any(|o| {
+            o.inst.op == DevOp::FlashPrefill as u16 || o.inst.op == DevOp::FlashPrefillFp8 as u16
+        });
+        let pure_gemm = !uniseg && pure_mode != 0 && has_flash_prefill;
         // PLOW_SEG_FA512=1 (T12): hd512 (full-attention) FlashPrefill packets get their OWN
         // class (2) so the host can launch them on the dedicated *_pffa flash object. hd is
         // carried in inst.i[6]. Requires the serve-side mirror PLOW_PF_SEG_FA512=1.
         // "1" = hd512 only; "all" = every FlashPrefill (needs the PLOW_NV_FA_ONLY_HD256 object).
-        let fa512_env = std::env::var("PLOW_SEG_FA512").ok();
+        let fa512_env = knobs.seg_fa512.clone();
         let fa512_mode = match fa512_env.as_deref() {
             Some("1") if !uniseg => 1u8,
             Some("all") if !uniseg => 2u8,
             _ => 0u8,
         };
+        let fa256_gqa2 = !uniseg && knobs.seg_fa256_gqa2;
         // PLOW_SEG_V2=1 (T16, needs fa512=all + pure=fp8): rope and flash-merge join the FA
         // class (the *_pffa object carries their arms under PLOW_NV_FA_ROPE), and QuantFp8
         // joins the GEMM class (the uni256 object carries the quant arm) — the per-layer
@@ -2071,7 +2233,7 @@ impl Builder {
         // "1" = full v2 (rope/merge->FA + quant->GEMM; refuted on the 256-thread objects);
         // "q8" (T36) = quant->GEMM only — the ws384 object carries a consumer-warpgroup
         // quant arm, so the [gate/up, glu-quant, down] chain becomes one class-8 run.
-        let v2_env = std::env::var("PLOW_SEG_V2").ok();
+        let v2_env = knobs.seg_v2.clone();
         let seg_v2 = v2_env.as_deref() == Some("1");
         let seg_q8 = seg_v2 || v2_env.as_deref() == Some("q8");
         let wave_class = |i: usize| -> u8 {
@@ -2160,8 +2322,15 @@ impl Builder {
                 19
             } else if uniseg {
                 8
+            } else if let Some(class) = self
+                .token_batch_band
+                .and_then(|band| token_batch_band_segment_class(&self.ops[i].inst, band))
+            {
+                class
             } else if packed_prefill_segments && packed_prefill_segment_class(op).is_some() {
                 packed_prefill_segment_class(op).unwrap()
+            } else if fa256_gqa2 && self.ops[i].inst.is_hd256_gqa2_sliding_prefill() {
+                3
             } else if op == DevOp::FlashPrefill as u16 || op == DevOp::FlashPrefillFp8 as u16 {
                 // T37: the *_pffa object instantiates hd 256/512 only — other head dims
                 // (Qwen/Llama hd128) stay on the fat object rather than trapping there.
@@ -2171,8 +2340,8 @@ impl Builder {
                 } else {
                     4
                 }
-            } else if mla_v2 && mla_v2_segment(op, self.ops[i].inst.i[4]) {
-                4
+            } else if mla_v2 && mla_prefill_segment_class(op, self.ops[i].inst.i[4]).is_some() {
+                mla_prefill_segment_class(op, self.ops[i].inst.i[4]).unwrap()
             } else if seg_v2
                 && pure_gemm // pure_gemm implies a prefill program — decode stays unsegmented
                 && fa512_mode == 2
@@ -2194,11 +2363,12 @@ impl Builder {
                 let fp8 = FP8_OPS.iter().any(|g| *g as u16 == op);
                 let bf16 = BF16_OPS.iter().any(|g| *g as u16 == op);
                 let mapped = self.ops[i].inst.i[6] != 0 && self.ops[i].inst.i[7] != 0;
-                // T37 GENERALITY: BOTH modes require the TMA maps — the ws384/uni256 lean
+                // T37 GENERALITY: modes 1/fp8 require the TMA maps — the ws384/uni256 lean
                 // objects trap on a mapless class-8 packet, and another model/emitter may
                 // legitimately skip a mint. Unmapped GEMMs go to the fat object's cp.async
                 // fallback instead (correct, just slower).
                 let claimed = match pure_mode {
+                    3 => (bf16 && mapped) || self.ops[i].inst.pack().is_mapless_w8a16_gemm(),
                     // T24: mapped bf16 GEMMs (lm_head) also class 8 — the uni256 lean object
                     // carries both precisions' n256 bodies, and the fat 128-reg object runs
                     // the bf16 tile spilled (measured 4.45 ms on the lm_head segment).
@@ -2240,7 +2410,7 @@ impl Builder {
         // Materialized so later passes (SEG_CLASS_SLICE mutates self.ops) can read it.
         let op_class: Vec<u8> = (0..self.ops.len()).map(wave_class).collect();
         let wave_class = |i: usize| -> u8 { op_class[i] };
-        let seg_per_op = std::env::var("PLOW_SEG_PER_OP").ok().as_deref() == Some("1");
+        let seg_per_op = knobs.seg_per_op;
         let mut seg_of = vec![0u16; self.ops.len()];
         let mut cur_seg = 0u16;
         for i in 0..self.ops.len() {
@@ -2268,11 +2438,15 @@ impl Builder {
         // The HSA queue barrier between segment launches already orders every earlier segment
         // before every later one, so cross-segment counter edges are redundant. Keep all
         // same-segment edges unchanged; this applies only to programs carrying the raw boundary.
-        let raw_segmented = self
-            .ops
-            .iter()
-            .any(|op| op.inst.op == DevOp::KdaDecodeFused as u16)
-            || lean_moe_stage2
+        let raw_segmented = self.ops.iter().any(|op| {
+            op.inst.op == DevOp::KdaDecodeFused as u16
+                || op.inst.op == DevOp::MoeAiterFp8Pf as u16
+                || op.inst.op == DevOp::IndexTpPf as u16
+                || op.inst.op == DevOp::GemmLtPf as u16
+                || op.inst.op == DevOp::GemmBlkPf as u16
+                || (op.inst.op == DevOp::MlaMergeFold as u16 && op.inst.i[5] == 1)
+                || (op.inst.op == DevOp::FlashMlaDecodeFp8 as u16 && op.isolated)
+        }) || lean_moe_stage2
             || lean_moe_stage1
             || lean_moe_combine
             || lean_attn_res_f32mix
@@ -2281,6 +2455,7 @@ impl Builder {
             || lean_kda_key_factor
             || xr_attnres
             || mla_materialized
+            || mla_aiter
             || decode_mla_segments
             || decode_grouped_moe
             || isolate_xreduce;
@@ -2312,7 +2487,7 @@ impl Builder {
         // in one's head. It is also the field whose corruption produces the all-zero-logits
         // failure described directly below, which is the strongest argument for being able to
         // print it. Diagnostic only: no packet bytes depend on this.
-        if !seg_per_op && std::env::var("PLOW_SEG_DUMP").ok().as_deref() == Some("1") {
+        if !seg_per_op && knobs.seg_dump {
             let mut counts: Vec<(u8, usize)> = Vec::new();
             for i in 0..self.ops.len() {
                 let cls = wave_class(i); // signature changed to index-based (T24/T37 classing)
@@ -2339,7 +2514,7 @@ impl Builder {
         // Locality census (`PLOW_PLACE_REPORT=1`). Diagnostic only — reads the op DAG, writes
         // nothing. Answers the question a locality-aware placement pass has to answer FIRST:
         // how much of this program's slice-level dataflow could same-domain placement capture?
-        if std::env::var("PLOW_PLACE_REPORT").ok().as_deref() == Some("1") {
+        if knobs.place_report {
             self.locality_census(l2_place);
         }
 
@@ -2359,18 +2534,18 @@ impl Builder {
         // "light" (T25) = double ONLY class-4 light ops — the uni256 GEMM object is occ-1
         // (grid 132), and 264 slices there make every block run the full TMA-ring
         // prologue/drain TWICE per op (measured ~30% in-model loss vs the standalone probe).
-        let slice_env = std::env::var("PLOW_SEG_CLASS_SLICE").ok();
+        let slice_env = knobs.seg_class_slice.clone();
         let slice_mode = match slice_env.as_deref() {
             Some("1") => 1u8,
             Some("light") => 2u8,
             _ => 0u8,
         };
-        let seg_class_slice = !uniseg && slice_mode != 0;
+        // Decode runs one persistent grid; prefill occupancy must not change its slices.
+        let seg_class_slice = !uniseg && slice_mode != 0 && has_flash_prefill;
         // PLOW_SEG_SLICE_ALL=1 (T14): also double the machine-filling FLASH-class (light) ops
         // — the FATLITE object runs them at occ-2, so both resident blocks need slices.
         // Class-2 (dedicated flash) ops keep n_cu: the FA object is occ-1.
-        let seg_slice_all =
-            seg_class_slice && std::env::var("PLOW_SEG_SLICE_ALL").ok().as_deref() == Some("1");
+        let seg_slice_all = seg_class_slice && knobs.seg_slice_all;
         if seg_class_slice {
             let n_cu_sz = self.n_cu as usize;
             // Ops that some other op depends on FINELY — skip these (map[] would desync).
@@ -2390,7 +2565,12 @@ impl Builder {
                     .deps
                     .iter()
                     .any(|d| matches!(d, Dep::Fine { .. }));
-                if gemm_class && fills && !has_fine && !fine_prod[i] {
+                if gemm_class
+                    && fills
+                    && !has_fine
+                    && !fine_prod[i]
+                    && !self.ops[i].keep_single_grid
+                {
                     let orig = self.ops[i].cus.clone();
                     let mut cus = orig.clone();
                     cus.extend_from_slice(&orig); // slices 0..2*n_cu-1, cu ids valid (repeated)
@@ -2974,19 +3154,67 @@ pub const DECODE_RUNG_MAX: u32 = 128;
 /// wire layout while allowing an ordinary and segmented program for one rung.
 pub const PACKED_PREFILL_PROG: u32 = 1 << 31;
 
+/// [`BlobProgHeader::t`] bit marking a TOKEN-BATCH BODY: a prefill-width program that carries a
+/// slot-indexed decode band ahead of its prefill spans and samples that band
+/// (`plans/unified-token-batch.md`, "AMD TP8 lowering decision"). It is neither an ordinary
+/// prefill rung nor a decode rung, so every ladder scan skips it; only the token-batch route
+/// selects it, by rows.
+pub const TOKEN_BATCH_PROG: u32 = 1 << 30;
+
+/// [`BlobProgHeader::t`] bit marking a program as a DECODE RUNG explicitly.
+///
+/// A parent packet never sets it: there the decode ladder is a trailing ascending run and
+/// [`decode_rung_lo`] finds the boundary positionally, which every shipped packet depends on
+/// and which stays byte-identical.
+///
+/// An EXTENSION has no such boundary to find. It carries one or two programs, and a lone
+/// program is `prog_t.len() - 1` — the positional rule would read every extension's single
+/// program as a decode rung, which is how a 4096-row prefill bucket gets refused as a rung
+/// outside the decode band. So an extension states the role instead of implying it, which is
+/// what docs/arch/19 phase 1 does for the parent too; the bit is the down payment on it.
+pub const DECODE_RUNG_PROG: u32 = 1 << 29;
+
+const PROGRAM_ROLE_BITS: u32 = PACKED_PREFILL_PROG | TOKEN_BATCH_PROG | DECODE_RUNG_PROG;
+
 pub fn program_rows(t: u32) -> u32 {
-    t & !PACKED_PREFILL_PROG
+    t & !PROGRAM_ROLE_BITS
 }
 
 pub fn is_packed_prefill_program(t: u32) -> bool {
     t & PACKED_PREFILL_PROG != 0
 }
 
+pub fn is_token_batch_program(t: u32) -> bool {
+    t & TOKEN_BATCH_PROG != 0
+}
+
+pub fn is_decode_rung_program(t: u32) -> bool {
+    t & DECODE_RUNG_PROG != 0
+}
+
+pub fn decode_rung_program_t(rows: u32) -> u32 {
+    assert_eq!(
+        rows & PROGRAM_ROLE_BITS,
+        0,
+        "program row count exceeds 29 bits"
+    );
+    rows | DECODE_RUNG_PROG
+}
+
+pub fn token_batch_program_t(rows: u32) -> u32 {
+    assert_eq!(
+        rows & PROGRAM_ROLE_BITS,
+        0,
+        "program row count exceeds 29 bits"
+    );
+    rows | TOKEN_BATCH_PROG
+}
+
 pub fn packed_prefill_program_t(rows: u32) -> u32 {
     assert_eq!(
-        rows & PACKED_PREFILL_PROG,
+        rows & PROGRAM_ROLE_BITS,
         0,
-        "program row count exceeds 31 bits"
+        "program row count exceeds 29 bits"
     );
     rows | PACKED_PREFILL_PROG
 }
@@ -2996,7 +3224,7 @@ pub fn packed_prefill_program_t(rows: u32) -> u32 {
 ///
 /// THE RULE, and why it needs no new blob field. Programs are emitted
 /// prefill-buckets-ascending then decode-rungs-ascending, and the two ranges are
-/// ordered by construction: decode is a trailing strictly ascending run at widths no greater
+/// separated by construction: decode is a trailing strictly ascending run at widths no greater
 /// than [`DECODE_RUNG_MAX`]. A width-128 prefill bucket may equal a width-128 decode rung, but
 /// the strict comparison below cannot cross that equal-width boundary.
 ///
@@ -3008,6 +3236,152 @@ pub fn decode_rung_lo(prog_t: &[u32]) -> usize {
         lo -= 1;
     }
     lo
+}
+
+// --- program roles -----------------------------------------------------------
+
+/// WHAT A PROGRAM IS FOR, as one value.
+///
+/// The prefill/decode split used to be read off the program's INDEX: `[0, decode_rung_lo)` was
+/// the prefill bucket ladder and the rest the decode rungs, with [`PACKED_PREFILL_PROG`] and
+/// [`TOKEN_BATCH_PROG`] carving exceptions out of the prefill range. A merged program table
+/// (`docs/arch/19-packet-extensions.md`) arrives in whatever order the extensions were found,
+/// so the index says nothing; and even without extensions the boundary was re-derived
+/// independently at a dozen call sites.
+///
+/// The four roles are mutually exclusive by construction — a program cannot be both a packed
+/// sibling and a token-batch body — which is the property the two booleans did not have.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ProgramRole {
+    /// An ordinary prefill bucket: one rung of the chunk ladder, `rows` tokens wide.
+    PrefillBucket { rows: u32 },
+    /// One rung of the decode batch ladder, advancing up to `rows` sequence slots.
+    DecodeRung { rows: u32 },
+    /// A packed-dispatch-only topology for the prefill bucket of the same width
+    /// ([`PACKED_PREFILL_PROG`]). Never selected as a rung of its own.
+    PackedSibling { of_rows: u32 },
+    /// A token-batch body ([`TOKEN_BATCH_PROG`]): `rows` of prefill width carrying a
+    /// slot-indexed decode band of `band` rows ahead of its prefill spans. Neither ladder
+    /// offers it; only the token-batch route selects it, by rows.
+    TokenBatchBody { band: u32, rows: u32 },
+}
+
+impl ProgramRole {
+    /// The compiled row count, whatever the role.
+    pub fn rows(self) -> u32 {
+        match self {
+            Self::PrefillBucket { rows }
+            | Self::DecodeRung { rows }
+            | Self::PackedSibling { of_rows: rows }
+            | Self::TokenBatchBody { rows, .. } => rows,
+        }
+    }
+
+    pub fn is_prefill_bucket(self) -> bool {
+        matches!(self, Self::PrefillBucket { .. })
+    }
+
+    pub fn is_decode_rung(self) -> bool {
+        matches!(self, Self::DecodeRung { .. })
+    }
+
+    pub fn is_packed_sibling(self) -> bool {
+        matches!(self, Self::PackedSibling { .. })
+    }
+
+    pub fn is_token_batch_body(self) -> bool {
+        matches!(self, Self::TokenBatchBody { .. })
+    }
+
+    /// The band a token-batch body samples, or `None` for every other role.
+    pub fn token_batch_band(self) -> Option<u32> {
+        match self {
+            Self::TokenBatchBody { band, .. } => Some(band),
+            _ => None,
+        }
+    }
+
+    /// Prefill-side: exactly the programs the positional code found below `decode_rung_lo` —
+    /// buckets, their packed siblings and the token-batch bodies.
+    pub fn is_prefill_side(self) -> bool {
+        !self.is_decode_rung()
+    }
+
+    /// The role's name, for a refusal message.
+    pub fn kind(self) -> &'static str {
+        match self {
+            Self::PrefillBucket { .. } => "prefill bucket",
+            Self::DecodeRung { .. } => "decode rung",
+            Self::PackedSibling { .. } => "packed sibling",
+            Self::TokenBatchBody { .. } => "token-batch body",
+        }
+    }
+}
+
+/// Where the BUCKET-vs-RUNG distinction comes from. The other two roles are always stated, by
+/// [`PACKED_PREFILL_PROG`] and [`TOKEN_BATCH_PROG`]; this is the pair that has two answers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoleSource {
+    /// A PARENT packet. Its decode ladder is a trailing strictly-ascending run and
+    /// [`decode_rung_lo`] finds the boundary positionally — which is what every already
+    /// emitted packet carries, and why one loads unchanged and byte-identical.
+    Positional,
+    /// An EXTENSION. It carries one or two programs, and a lone program is `prog_t.len() - 1`,
+    /// so the positional rule would read every extension's single program as a decode rung and
+    /// refuse a 4096-row prefill bucket as a rung outside the decode band. An extension states
+    /// its roles with [`DECODE_RUNG_PROG`]; unmarked means prefill bucket.
+    Stated,
+}
+
+/// The band a token-batch body samples: the row count on its `Argmax`, or 0 when the program
+/// carries none. Read from the instruction stream because `PlowProgHeader` is fixed at 24
+/// bytes and has no field to spare.
+pub fn token_batch_band_of(insts: &[crate::dev::DevInst64]) -> u32 {
+    insts
+        .iter()
+        .find(|d| d.op == crate::dev::DevOp::Argmax as u16)
+        .map_or(0, |d| d.i[1])
+}
+
+/// THE ONE PLACE a program table is turned into roles.
+///
+/// `prog_t` is the ENCODED `t` word of every program, in table order — row count in the low
+/// bits plus the [`PACKED_PREFILL_PROG`] / [`TOKEN_BATCH_PROG`] / [`DECODE_RUNG_PROG`] markers.
+/// The first two name their roles outright in either container. The bucket-vs-rung pair is what
+/// [`RoleSource`] decides: a parent falls back to the positional [`decode_rung_lo`] rule, an
+/// extension reads the stated bit. A STATED bit always wins, so `Positional` is a fallback and
+/// not an override — the day the emitter marks a parent's rungs, nothing here changes.
+///
+/// `band` supplies the token-batch band for program `i` (see [`token_batch_band_of`]); it is
+/// only consulted for a [`TOKEN_BATCH_PROG`].
+pub fn derive_roles(
+    prog_t: &[u32],
+    source: RoleSource,
+    band: impl Fn(usize) -> u32,
+) -> Vec<ProgramRole> {
+    let lo = match source {
+        RoleSource::Positional => decode_rung_lo(prog_t),
+        RoleSource::Stated => prog_t.len(),
+    };
+    prog_t
+        .iter()
+        .enumerate()
+        .map(|(i, &t)| {
+            let rows = program_rows(t);
+            if is_token_batch_program(t) {
+                ProgramRole::TokenBatchBody {
+                    band: band(i),
+                    rows,
+                }
+            } else if is_packed_prefill_program(t) {
+                ProgramRole::PackedSibling { of_rows: rows }
+            } else if is_decode_rung_program(t) || i >= lo {
+                ProgramRole::DecodeRung { rows }
+            } else {
+                ProgramRole::PrefillBucket { rows }
+            }
+        })
+        .collect()
 }
 
 // --- v6 section directory ----------------------------------------------------
@@ -3353,6 +3727,43 @@ impl Model {
     /// If [`Self::gen`] is non-empty the recipes are prepended as a
     /// [`SECT_GEN_TENSORS`] section and the container becomes v7.
     pub fn to_blob_v6(&self, sections: &[SectionData]) -> Vec<u8> {
+        self.container(None, sections)
+    }
+
+    /// Serialise as an EXTENSION container (`extension.pkt`) — docs/arch/19, phase 2.
+    ///
+    /// Identical to [`Self::to_blob_v6`] but for the magic and a leading
+    /// [`crate::ext::SECT_PARENT_REF`] section: the tensor table is replaced by `parent`, a
+    /// reference to the parent packet's. Everything a reader walks after the (empty) tensor
+    /// table is the parent format unchanged, so one parser handles both.
+    ///
+    /// An extension carries programs only. Declaring a tensor here would give it an index the
+    /// parent's table does not have, which is precisely what
+    /// [`crate::ext::BlobParentRef::tensor_digest`] exists to make impossible — so it is an
+    /// assertion at build rather than a refusal at load.
+    pub fn to_ext_blob(
+        &self,
+        parent: &crate::ext::BlobParentRef,
+        sections: &[SectionData],
+    ) -> Vec<u8> {
+        assert!(
+            self.tensors.is_empty(),
+            "an extension declares no tensors of its own — it references the parent's table \
+             ({} declared)",
+            self.tensors.len()
+        );
+        assert!(
+            self.gen.is_empty(),
+            "an extension declares no generated tensors — the parent materialises them"
+        );
+        self.container(Some(parent), sections)
+    }
+
+    fn container(
+        &self,
+        ext_parent: Option<&crate::ext::BlobParentRef>,
+        sections: &[SectionData],
+    ) -> Vec<u8> {
         fn pod<T: Copy>(v: &[T], out: &mut Vec<u8>) {
             let n = std::mem::size_of_val(v);
             out.extend_from_slice(unsafe {
@@ -3362,7 +3773,16 @@ impl Model {
 
         // Generated tensors ride in front of the caller's sections so a reader can
         // resolve every tensor before it touches anything optional.
-        let mut all: Vec<SectionData> = Vec::with_capacity(sections.len() + 1);
+        let mut all: Vec<SectionData> = Vec::with_capacity(sections.len() + 2);
+        // The parent reference rides in FRONT of everything: it is the first thing a loader
+        // must resolve, before it has any reason to trust the rest of the container.
+        if let Some(p) = ext_parent {
+            all.push(SectionData {
+                kind: crate::ext::SECT_PARENT_REF,
+                name: "parent".into(),
+                data: p.to_bytes(),
+            });
+        }
         if !self.gen.is_empty() {
             let mut data = Vec::with_capacity(self.gen.len() * size_of::<GenTensor>());
             pod(&self.gen, &mut data);
@@ -3428,11 +3848,14 @@ impl Model {
         };
         // Header placeholder — sect_dir_offset patched after we know the full layout.
         let hdr = BlobHeader {
-            magic: match (self.gen.is_empty(), l2_flag == 0) {
-                (true, true) => *BLOB_MAGIC_V6,
-                (false, true) => *BLOB_MAGIC_V7,
-                (true, false) => *BLOB_MAGIC_L2SEG,
-                (false, false) => *BLOB_MAGIC_V7_L2SEG,
+            magic: match ext_parent {
+                Some(_) => *crate::ext::EXT_MAGIC,
+                None => match (self.gen.is_empty(), l2_flag == 0) {
+                    (true, true) => *BLOB_MAGIC_V6,
+                    (false, true) => *BLOB_MAGIC_V7,
+                    (true, false) => *BLOB_MAGIC_L2SEG,
+                    (false, false) => *BLOB_MAGIC_V7_L2SEG,
+                },
             },
             n_cu: self.n_cu,
             n_tensor: self.tensors.len() as u32,
@@ -4398,6 +4821,15 @@ mod l2_placement_tests {
 mod granularity_tests {
     use super::*;
 
+    #[test]
+    fn prefill_slice_option_preserves_decode_work() {
+        let mut b = Builder::new(4);
+        let p = b.emit(DevOp::Gemv, vec![0, 1, 2, 3], &[], |_| {});
+        b.emit(DevOp::Gemv, vec![0, 1, 2, 3], &[p], |_| {});
+        let p = b.finish();
+        assert!(p.insts.iter().all(|inst| inst.blocks == 4));
+    }
+
     /// Build `producer -> consumer` with a fine dep, and report how many fine edges survive
     /// `select_granularity`. `work` is the consumer's per-slice cost.
     fn survives(work: Vec<u32>) -> bool {
@@ -4445,12 +4877,16 @@ mod seg_window_tests {
     use super::*;
 
     #[test]
-    fn mla_v2_segments_only_machine_filling_prefill_buckets() {
-        assert!(!mla_v2_segment(DevOp::FlashMlaPrefill as u16, 1024));
-        assert!(!mla_v2_segment(DevOp::FlashMlaPrefillFp8 as u16, 1024));
-        assert!(mla_v2_segment(DevOp::FlashMlaPrefill as u16, 2048));
-        assert!(mla_v2_segment(DevOp::FlashMlaPrefillFp8 as u16, 2048));
-        assert!(!mla_v2_segment(DevOp::Gemv as u16, 8192));
+    fn mla_prefill_is_isolated_at_every_query_rung() {
+        for op in [DevOp::FlashMlaPrefill, DevOp::FlashMlaPrefillFp8] {
+            for rows in [1, 4, 8, 16, 20, 128, 512, 1024] {
+                assert_eq!(mla_prefill_segment_class(op as u16, rows), Some(26));
+            }
+            for rows in [2048, 8192] {
+                assert_eq!(mla_prefill_segment_class(op as u16, rows), Some(4));
+            }
+        }
+        assert_eq!(mla_prefill_segment_class(DevOp::Gemv as u16, 8192), None);
     }
 
     #[test]
@@ -5686,6 +6122,113 @@ mod v6_tests {
         );
         assert_eq!(program_rows(packed_prefill_program_t(1024)), 1024);
         assert!(is_packed_prefill_program(packed_prefill_program_t(1024)));
+        // A token-batch body per prefill rung sits in the same place and is neither role.
+        assert_eq!(
+            decode_rung_lo(&[
+                128,
+                1024,
+                packed_prefill_program_t(128),
+                token_batch_program_t(128),
+                token_batch_program_t(1024),
+                1,
+                4,
+                8,
+            ]),
+            5
+        );
+        assert_eq!(program_rows(token_batch_program_t(1024)), 1024);
+        assert!(is_token_batch_program(token_batch_program_t(1024)));
+        assert!(!is_packed_prefill_program(token_batch_program_t(1024)));
+        assert!(!is_token_batch_program(packed_prefill_program_t(1024)));
+    }
+
+    /// THE PIN for phase 1 of `docs/arch/19-packet-extensions.md`: the role of every program
+    /// is exactly what the POSITIONAL rule said before roles existed — decode is the trailing
+    /// run `decode_rung_lo` finds, `PACKED_PREFILL_PROG` is a sibling, `TOKEN_BATCH_PROG` is a
+    /// body, everything else is a bucket — for every ladder shape the emitter can produce.
+    #[test]
+    fn roles_reproduce_the_positional_derivation() {
+        let pf = [128u32, 512, 1024, 2048, 8192];
+        let dec = [1u32, 2, 4, 8, 16];
+        let mut tables: Vec<Vec<u32>> = vec![
+            vec![1],
+            vec![128, 1],
+            vec![128, 128],
+            vec![1, 1],
+            vec![128, 512, 1024, 1, 2, 4, 8, 16],
+            vec![128, 1024, 1, 3, 6, 12],
+            vec![128, 512, 1, 16, 32, 64, 128],
+        ];
+        for n in 1..=dec.len() {
+            tables.push(pf.iter().chain(&dec[..n]).copied().collect());
+            // The same ladder with a packed sibling per bucket, then the token-batch bodies:
+            // the order `mla.rs` emits them in.
+            let mut with_siblings: Vec<u32> = pf.to_vec();
+            with_siblings.extend(pf.iter().copied().map(packed_prefill_program_t));
+            with_siblings.extend(pf[2..].iter().copied().map(token_batch_program_t));
+            with_siblings.extend(&dec[..n]);
+            tables.push(with_siblings);
+        }
+
+        for table in &tables {
+            let lo = decode_rung_lo(table);
+            let roles = derive_roles(table, RoleSource::Positional, |i| 8 + i as u32);
+            assert_eq!(roles.len(), table.len(), "{table:?}");
+            for (i, (&t, &role)) in table.iter().zip(&roles).enumerate() {
+                let rows = program_rows(t);
+                assert_eq!(role.rows(), rows, "{table:?} at {i}");
+                // The positional oracle, verbatim.
+                let want = if is_token_batch_program(t) {
+                    ProgramRole::TokenBatchBody {
+                        band: 8 + i as u32,
+                        rows,
+                    }
+                } else if is_packed_prefill_program(t) {
+                    ProgramRole::PackedSibling { of_rows: rows }
+                } else if i >= lo {
+                    ProgramRole::DecodeRung { rows }
+                } else {
+                    ProgramRole::PrefillBucket { rows }
+                };
+                assert_eq!(role, want, "{table:?} at {i}");
+                assert_eq!(role.is_decode_rung(), i >= lo, "{table:?} at {i}");
+                assert_eq!(role.is_prefill_side(), i < lo, "{table:?} at {i}");
+            }
+            // Both ladders, filtered by role and sorted by width, are the two index ranges.
+            let buckets: Vec<u32> = roles
+                .iter()
+                .filter(|r| r.is_prefill_bucket())
+                .map(|r| r.rows())
+                .collect();
+            let mut sorted = buckets.clone();
+            sorted.sort_unstable();
+            assert_eq!(buckets, sorted, "{table:?}");
+            let rungs: Vec<u32> = roles[lo..].iter().map(|r| r.rows()).collect();
+            assert_eq!(
+                roles
+                    .iter()
+                    .filter(|r| r.is_decode_rung())
+                    .map(|r| r.rows())
+                    .collect::<Vec<_>>(),
+                rungs,
+                "{table:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_rung_lo_preserves_overlapping_prefill_widths() {
+        let prefill = [
+            1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192,
+        ];
+        let decode = [1, 2, 4, 8, 16, 32, 64, 128];
+        for n in 1..=decode.len() {
+            let widths: Vec<_> = prefill.iter().chain(&decode[..n]).copied().collect();
+            assert_eq!(decode_rung_lo(&widths), prefill.len());
+        }
+        assert_eq!(decode_rung_lo(&[1, 1]), 1);
+        // The same increasing run cannot encode two phases without a boundary.
+        assert_ne!(decode_rung_lo(&[1, 2, 4, 8]), 2);
     }
 
     #[test]
@@ -5702,6 +6245,35 @@ mod v6_tests {
 #[cfg(test)]
 mod isolated_segment_tests {
     use super::*;
+    use crate::dev::SE_XCTR;
+
+    #[test]
+    fn native_moe_boundary_orders_segments_without_counter_obligations() {
+        let mut b = Builder::new(4);
+        b.force_uniseg();
+        let first = b.emit(DevOp::Nop, b.all(), &[], |_| {});
+        let second = b.emit(DevOp::Nop, b.all(), &[first], |_| {});
+        let raw = b.emit(DevOp::MoeAiterFp8Pf, vec![0], &[second], |_| {});
+        b.isolate(raw);
+        b.emit(DevOp::Nop, b.all(), &[raw], |_| {});
+        let p = b.finish();
+        assert!(p.insts[1].wait_len > 0);
+        for stream in [&p.stream, &p.gq_stream] {
+            for entry in stream {
+                if entry.inst == raw {
+                    assert_eq!(entry.seg, 1);
+                    assert_eq!(
+                        (entry.wait_len, entry.succ_len, entry.flags & SE_XCTR),
+                        (0, 0, 0)
+                    );
+                }
+                if entry.inst == raw + 1 {
+                    assert_eq!(entry.seg, 2);
+                    assert_eq!(entry.wait_len, 0);
+                }
+            }
+        }
+    }
 
     fn program(isolate: bool) -> Program {
         let mut b = Builder::new(4);

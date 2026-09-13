@@ -13,6 +13,20 @@ fn header(rel: &str) -> Option<String> {
     std::fs::read_to_string(root.join(rel)).ok()
 }
 
+/// The AMD GEMM family as one text: `op_gemm.h` only selects the arch file, and a knob's
+/// `#ifndef` guard lives in the arch file (arch-defaulted) or in the shared body.
+fn amd_gemm_header() -> Option<String> {
+    let mut s = String::new();
+    for rel in [
+        "runtime/amd/op_gemm_gfx942.h",
+        "runtime/amd/op_gemm_gfx950.h",
+        "runtime/amd/op_gemm_common.h",
+    ] {
+        s.push_str(&header(rel)?);
+    }
+    Some(s)
+}
+
 #[test]
 fn the_documented_snippet_compiles_and_holds() {
     let Some(h) = header("runtime/nvidia/op_gemm.cuh") else {
@@ -27,10 +41,7 @@ fn the_documented_snippet_compiles_and_holds() {
 /// the M axis sweeps on AMD and not on NVIDIA, and the K axis sweeps on neither.
 #[test]
 fn the_documented_sweep_axes_are_accurate() {
-    let (Some(nv), Some(amd)) = (
-        header("runtime/nvidia/op_gemm.cuh"),
-        header("runtime/amd/op_gemm.h"),
-    ) else {
+    let (Some(nv), Some(amd)) = (header("runtime/nvidia/op_gemm.cuh"), amd_gemm_header()) else {
         return;
     };
 

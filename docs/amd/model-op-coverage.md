@@ -108,7 +108,7 @@ weights, an NVIDIA experiment), `NOP`.
 
 ## MLA attention arm coverage on gfx942 (MI300X)
 
-The shared MLA family in `runtime/amd/op_attention.h` + `runtime/amd/interp.hip`
+The shared MLA family in `runtime/amd/op_attention_common.h` + `runtime/amd/interp.hip`
 serves GLM-5.2/5.3, DeepSeek-V2/V3 and Kimi-K2.7/K3. This is an audit of every
 place where a legally-emitted MLA packet either finds **no arm at all**, or finds
 a far slower arm than the one it should have — and what was done about each.
@@ -950,7 +950,7 @@ references do, at the cost of the accuracy that produced 4/9 character-identical
    Both fp8-KV arms above were emitted that way, so the A/B is internally consistent but its
    absolute numbers are not comparable with the published measured-tile Gemma sweep. Not run here
    because that script refuses while any `plowrt` is serving and siblings were serving throughout
-   — and because the next edit to the shared `op_attention.h` re-stales it again.
+   — and because the next edit to the shared `op_attention_common.h` re-stales it again.
 2. **No `_fp8kv` low-rung decode row.** See the fp8-KV section.
 3. **Ops 150-153 and op 80 still have no AMD arm.** Refused at emit, not implemented.
 4. **`V = unRoPE(K) / gamma_k` on Gemma-4's full layers.** Measured precondition, unbuilt kernel.

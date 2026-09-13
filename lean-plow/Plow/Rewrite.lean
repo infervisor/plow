@@ -63,6 +63,7 @@ inductive Op
   | FusedResidualNorm       (a b w : Op) (eps : Nat)
   | FusedResidualZeroCenteredNorm (a b w : Op) (eps : Nat)
   | FusedResidualLayerNorm  (a b w bias : Op) (eps : Nat)
+  | FusedResidual3Norm      (x a b w : Op) (eps : Nat)
   | FusedGroupNormAct       (x w b : Op) (g eps : Nat) (kind : String)
   | FusedAdaLN              (x scale shift : Op)
   | FusedGatedResidual      (x y gate : Op)
@@ -113,6 +114,8 @@ def expand : Op → Op
       Op.ZeroCenteredRmsNorm (Op.Ew "add" (expand a) (expand b)) (expand w) eps
   | Op.FusedResidualLayerNorm a b w bias eps =>
       Op.LayerNorm (Op.Ew "add" (expand a) (expand b)) (expand w) (expand bias) eps
+  | Op.FusedResidual3Norm x a b w eps =>
+      Op.RmsNorm (Op.Ew "add" (expand x) (Op.Ew "add" (expand a) (expand b))) (expand w) eps
   | Op.FusedGroupNormAct x w b g eps kind =>
       Op.Act kind (Op.GroupNorm (expand x) (expand w) (expand b) g eps)
   | Op.FusedAdaLN x scale shift =>
@@ -236,6 +239,13 @@ theorem rule_residual_zero_centered_rmsnorm_fuse (a b w : Op) (eps : Nat) :
 theorem rule_residual_layernorm_fuse (a b w bias : Op) (eps : Nat) :
     expand (Op.FusedResidualLayerNorm a b w bias eps) =
       Op.LayerNorm (Op.Ew "add" (expand a) (expand b)) (expand w) (expand bias) eps :=
+  rfl
+
+/-- `residual3-rmsnorm-fuse`: the MoE block boundary, `RmsNorm(add(x, add(a, b)))`. The inner
+    add remains a distinct BF16 materialization point (the combine's partial). -/
+theorem rule_residual3_rmsnorm_fuse (x a b w : Op) (eps : Nat) :
+    expand (Op.FusedResidual3Norm x a b w eps) =
+      Op.RmsNorm (Op.Ew "add" (expand x) (Op.Ew "add" (expand a) (expand b))) (expand w) eps :=
   rfl
 
 /-- `groupnorm-act-fuse` -/
@@ -372,6 +382,7 @@ def soundRules : List String :=
    "residual-rmsnorm-fuse",
    "residual-zero-centered-rmsnorm-fuse",
    "residual-layernorm-fuse",
+   "residual3-rmsnorm-fuse",
    "groupnorm-act-fuse",
    "adaln-modulate-fuse",
    "gated-residual-fuse",

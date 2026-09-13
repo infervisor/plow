@@ -26,6 +26,7 @@
 //! doing the measuring stop being separable.
 
 pub mod attention;
+pub mod attention_role;
 pub mod decode;
 pub mod gemm;
 pub mod gemv;
@@ -45,6 +46,10 @@ pub use gemv::{gemv_case, gemv_op_case, gemv_sample_bucket, gemv_sample_opcode, 
 pub use attention::{
     select_attention, AttentionAlgorithm, AttentionCapabilities, AttentionCell,
     AttentionMeasurement, AttentionSelection, AttentionSource, KvBucket, ATTENTION_ORACLE,
+};
+pub use attention_role::{
+    select_attention_role, AttentionRoleCell, AttentionRoleConfig, AttentionRoleMeasurement,
+    AttentionTopology, ATTENTION_ROLE_ORACLE,
 };
 pub use decode::{
     rank_by_cell, CellRanking, CtxBucket, DecodeCell, DecodeKnobs, DecodeMeasurement,

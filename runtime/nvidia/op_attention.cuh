@@ -1481,9 +1481,11 @@ __device__ void d_flash_merge(__nv_bfloat16* __restrict__ O, const float* __rest
  * fp8-KV arm, and every sm_120a build — is untouched and byte-identical. */
 #if defined(PLOW_NV_HOPPER)
 #include "op_attention_sm90.cuh"
+/* Single-stage BF16 WGMMA never dispatches the legacy layout. */
 #define FA_PRE_SMEM_FLOATS(HD, BQ, BKV)                                                             \
     (FA_SM90_WG_ELIGIBLE(HD, BQ, BKV) && PLOW_NV_FA_PIPE                                            \
-         ? (FA_SM90_PRE_FLOATS(HD, BQ, BKV) > FA_PRE_SMEM_BASE(HD, BQ, BKV)                         \
+         ? ((FA_SM90_STAGES(HD, BKV) == 1 ||                                                      \
+             FA_SM90_PRE_FLOATS(HD, BQ, BKV) > FA_PRE_SMEM_BASE(HD, BQ, BKV))                       \
                 ? FA_SM90_PRE_FLOATS(HD, BQ, BKV)                                                   \
                 : FA_PRE_SMEM_BASE(HD, BQ, BKV))                                                    \
          : FA_PRE_SMEM_BASE(HD, BQ, BKV))
@@ -3655,15 +3657,41 @@ __device__ void d_flash_prefill_mux(const int* __restrict__ req, float* __restri
 #if PLOW_NV_PACKED_REQUEST
     if (req) {
         const unsigned count=(unsigned)req[0];
+#if defined(PLOW_NV_HOPPER) && PLOW_NV_FA_PIPE && defined(PLOW_NV_PACKED_FA_WGMMA) && PLOW_NV_PACKED_FA_WGMMA
+        if constexpr (FA_SM90_WG_ELIGIBLE(HD, BQ, BKV)) {
+            if (O && nsplit == 1) {
+                // Packed mapkv holds per-slot pointers, not a CUtensorMap pair.
+#if defined(PLOW_NV_PACKED_FA_TMA) && PLOW_NV_PACKED_FA_TMA
+                const void* packed_maps = mapkv;
+#else
+                const void* packed_maps = nullptr;
+#endif
+                d_flash_prefill<HD,BQ,BKV>(Opart,mlpart,Q,K,V,O,seq_q,seq_kv,
+                    n_head,n_kv_head,q_pos0,window,nsplit,kv_stride,kv_mask,
+                    scale,slice,nblk,lds,req,packed_maps);
+                const unsigned real=req[1+4*(count-1)]+req[2+4*(count-1)];
+                const size_t begin=(size_t)real*n_head*HD, end=(size_t)seq_q*n_head*HD;
+                for (size_t i=begin+(size_t)slice*blockDim.x+threadIdx.x;i<end;i+=(size_t)nblk*blockDim.x)
+                    O[i]=__float2bfloat16(0.0f);
+                return;
+            }
+        }
+#endif
         for (unsigned r=0; r<count; ++r) {
             const unsigned q0=req[1+4*r], qlen=req[2+4*r], slot=req[3+4*r], kvlen=req[4+4*r];
             const size_t qoff=(size_t)q0*n_head*HD;
             const size_t kvoff=(size_t)slot*n_kv_head*kv_stride*HD;
+#if PLOW_NV_FA_PIPE
             const void* descriptor=mapkv ? (const void*)((const uint64_t*)mapkv)[slot] : nullptr;
+#endif
             d_flash_prefill<HD,BQ,BKV>(Opart+qoff*nsplit,
                 mlpart+(size_t)q0*n_head*nsplit*2, Q+qoff,K+kvoff,V+kvoff,
                 O ? O+qoff : nullptr,qlen,kvlen,n_head,n_kv_head,kvlen-qlen,
-                window,nsplit,kv_stride,kv_mask,scale,slice,nblk,lds,nullptr,descriptor);
+                window,nsplit,kv_stride,kv_mask,scale,slice,nblk,lds
+#if PLOW_NV_FA_PIPE
+                ,nullptr,descriptor
+#endif
+            );
             __syncthreads();
         }
         if (O) {
@@ -3710,6 +3738,61 @@ __device__ void d_flash_prefill_mux(const int* __restrict__ req, float* __restri
         }
     }
 }
+
+#if PLOW_FP8_KV && PLOW_NV_PACKED_REQUEST
+template <int HD>
+__device__ void d_flash_prefill_fp8_mux(
+    const int* __restrict__ req, float* __restrict__ Opart, float* __restrict__ mlpart,
+    const __nv_bfloat16* __restrict__ Q, const uint8_t* __restrict__ K,
+    const uint8_t* __restrict__ V, __nv_bfloat16* __restrict__ O,
+    const float* __restrict__ k_scale, const float* __restrict__ v_scale,
+    unsigned seq_q, unsigned seq_kv, unsigned n_head, unsigned n_kv_head,
+    unsigned q_pos0, unsigned window, unsigned nsplit, unsigned kv_stride,
+    unsigned kv_mask, float scale, unsigned slice, unsigned nblk, float* lds) {
+    const unsigned count = req ? (unsigned)req[0] : 1;
+    for (unsigned r = 0; r < count; ++r) {
+        const unsigned q0 = req ? (unsigned)req[1 + 4*r] : 0;
+        const unsigned qlen = req ? (unsigned)req[2 + 4*r] : seq_q;
+        const unsigned slot = req ? (unsigned)req[3 + 4*r] : 0;
+        const unsigned kvlen = req ? (unsigned)req[4 + 4*r] : seq_kv;
+        const unsigned pos0 = req ? kvlen - qlen : q_pos0;
+        const size_t qoff = (size_t)q0 * n_head * HD;
+        const size_t soff = (size_t)slot * n_kv_head * kv_stride;
+        // KV offsets are bytes; scale offsets count F32 rows.
+#define PLOW_FP8_REQUEST_ARGS \
+        Opart + qoff * nsplit, mlpart + (size_t)q0 * n_head * nsplit * 2, Q + qoff, \
+        (const __nv_bfloat16*)(K + soff * HD), (const __nv_bfloat16*)(V + soff * HD), \
+        O ? O + qoff : nullptr, qlen, kvlen, n_head, n_kv_head, pos0, window, nsplit, \
+        kv_stride, kv_mask, scale, slice, nblk, lds, k_scale + soff, v_scale + soff
+#if PLOW_NV_FA_PIPE
+#if PLOW_NV_FA_FP8MMA
+        if constexpr (HD == 256) {
+            d_flash_prefill_px23<256, 64, 32>(PLOW_FP8_REQUEST_ARGS);
+        } else {
+#if PLOW_NV_FA_FP8PV
+            d_flash_prefill_px8<512, 32, 32, true>(PLOW_FP8_REQUEST_ARGS);
+#else
+            d_flash_prefill_px4<512, 32, 16, true>(PLOW_FP8_REQUEST_ARGS);
+#endif
+        }
+#else
+        __trap();
+#endif
+#else
+        d_flash_prefill<HD, HD == 256 ? 64 : 32, HD == 256 ? 32 : 16, true>(PLOW_FP8_REQUEST_ARGS);
+#endif
+#undef PLOW_FP8_REQUEST_ARGS
+        __syncthreads();
+    }
+    if (req && O) {
+        const unsigned real = req[1 + 4*(count-1)] + req[2 + 4*(count-1)];
+        const size_t end = (size_t)seq_q * n_head * HD;
+        for (size_t i = (size_t)real * n_head * HD + (size_t)slice * blockDim.x + threadIdx.x;
+             i < end; i += (size_t)nblk * blockDim.x)
+            O[i] = __float2bfloat16(0.0f);
+    }
+}
+#endif
 
 #if PLOW_MIXED_STEP
 template <int HD, int BQ, int BKV>

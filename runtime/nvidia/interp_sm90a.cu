@@ -40,3 +40,5 @@
 #define plow_sm120_launch plow_sm90a_launch
 
 #include "interp_sm120.cu"
+
+extern "C" __device__ unsigned plow_norm_weight_offset = PLOW_NV_GEMMA3;

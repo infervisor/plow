@@ -74,7 +74,8 @@ instead (`.bss`, and therefore 0, when the knob is 0) — which is what lets a m
 86 markers, ~350 bytes of `.data`, no code.
 
 **The roster is checked, not trusted.** The audit re-derives the knob list by scanning
-`amd_arch.h`, `op_attention.h`, `op_moe.h` and `op_gemm.h` for `#ifndef (GM_|FA_|GV_|MPF_)*`,
+`amd_arch.h`, `op_moe.h` and the `op_attention*.h` / `op_gemm*.h` families (selector, `_common`
+body and both `_gfx942` / `_gfx950` arch files) for `#ifndef (GM_|FA_|GV_|MPF_)*`,
 and fails when one has no `PLOW_GEOM_MARK` line. It fails in the other direction too: a knob
 that is marked but is no longer `#ifndef`-guarded is a knob whose bare `#define` now silently
 beats the command line — which is the `GM_SM_BK` defect itself, catchable without anyone

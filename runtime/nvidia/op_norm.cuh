@@ -5,8 +5,8 @@
  * __amdgpu_buffer_rsrc_t / hardware num_records bound, so every overshoot is an explicit
  * predicate here).
  *
- * NUMERICS (unchanged from AMD): y = x * rsqrt(mean(x^2) + eps) * gamma, eps INSIDE the
- * power, gamma a PLAIN multiply (no 1+w). gamma == nullptr is the weightless variant.
+ * NUMERICS: y = x * rsqrt(mean(x^2) + eps) * gamma. PLOW_NV_GEMMA3 adds 1 to
+ * gamma in FP32. gamma == nullptr is the weightless variant.
  *
  * d_headnorm_rope IS WRITTEN FRESH, not adapted from gemma_normrope_sm120 — that kernel is
  * silently wrong for head_dim != 128 (it holds the head in a thread-local `float nv[FA_HD]`
@@ -27,8 +27,28 @@
 #include "sm120_common.cuh"
 #include <cuda_fp8.h> /* __nv_fp8_e4m3 — the T11 fused activation quant */
 
+#ifndef PLOW_NV_GEMMA3
+#define PLOW_NV_GEMMA3 0
+#endif
+
+static __device__ __forceinline__ float norm_weight(float x) {
+#if PLOW_NV_GEMMA3
+    return 1.0f + x;
+#else
+    return x;
+#endif
+}
+
+static __device__ __forceinline__ float gemma3_bf16_round(float x) {
+#if PLOW_NV_GEMMA3
+    return __bfloat162float(__float2bfloat16(x));
+#else
+    return x;
+#endif
+}
+
 static __device__ __forceinline__ float gemma_postnorm_round(float x) {
-#if defined(PLOW_NV_GEMMA) && PLOW_NV_GEMMA && PLOW_NV_GEMMA_NRN_BF16
+#if (defined(PLOW_NV_GEMMA) && PLOW_NV_GEMMA && PLOW_NV_GEMMA_NRN_BF16) || PLOW_NV_GEMMA3
     return __bfloat162float(__float2bfloat16(x));
 #else
     return x;
@@ -46,10 +66,13 @@ static __device__ __forceinline__ float gemma_postnorm_round(float x) {
 #endif
 #define RN_VEC (RN_REG / 8)
 
-/* T17 warp-per-row cut-in (see the note on d_rmsnorm). Above the widest decode batch the
- * emitter mints (`PLOW_DECODE_BATCH` 1..8, clamped to 16), below any prefill chunk — so the
- * new reduction order applies to prefill only and batched decode stays byte-identical. */
+/* Decode rungs must use one reduction order even when the batch reaches the
+ * prefill warp-per-row threshold. Standalone probes retain the row heuristic. */
+#if defined(PLOW_NV_PREFILL) && !PLOW_NV_PREFILL
+#define PLOW_NV_T17_MIN_ROWS 0u
+#else
 #define PLOW_NV_T17_MIN_ROWS 32u
+#endif
 
 /* RMSNorm over `feat`. One block per row, strided by nblk.
  *
@@ -67,12 +90,8 @@ static __device__ __forceinline__ float gemma_postnorm_round(float x) {
  * accumulation order changes (lane-strided vs thread-strided), so outputs can differ in the
  * last bf16 ulp from the legacy body — DECODE keeps the legacy path and stays byte-identical.
  *
- * That last guarantee is why the threshold is NOT PLOW_NV_WARPS: `rows` is packet i[0], which
- * decode sets to its batch width (`dbatch`), so a gate at 8 silently moved batched decode onto
- * the new reduction order at the shipped PLOW_DECODE_BATCH=8. The threshold sits above the
- * widest decode batch the emitter will mint (documented 1..8, clamped to 16) and far below any
- * prefill chunk (smallest bucket T is hundreds of rows), so it partitions the two phases
- * exactly.
+ * The decode object disables this row threshold: `rows` is also its batch width,
+ * so a threshold alone changes reduction order when a decode ladder reaches B32.
  *
  * T11 w8a8 QUANT FUSION (t3=xq e4m3, t4=ascale f32[rows]; both null on legacy packets):
  * the row is already normed in registers, so the per-row fp8 activation quant that would
@@ -84,7 +103,7 @@ static __device__ void d_rmsnorm(__nv_bfloat16* __restrict__ out, const __nv_bfl
                           float eps, unsigned out_row0, unsigned slice, unsigned nblk,
                           float* part, uint8_t* __restrict__ xq = nullptr,
                           float* __restrict__ ascale = nullptr) {
-    if (rows >= PLOW_NV_T17_MIN_ROWS && (feat & 7u) == 0) {
+    if (PLOW_NV_T17_MIN_ROWS && rows >= PLOW_NV_T17_MIN_ROWS && (feat & 7u) == 0) {
         /* T17 warp-per-row (see header comment). Row set of this block is unchanged:
          * {slice + k*nblk}; warp w takes k ≡ w (mod WARPS). */
         const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
@@ -112,7 +131,7 @@ static __device__ void d_rmsnorm(__nv_bfloat16* __restrict__ out, const __nv_bfl
                 bf16v8 o;
 #pragma unroll
                 for (int j = 0; j < 8; j++) {
-                    const float g = gamma ? __bfloat162float(w.x[j]) : 1.0f;
+                    const float g = gamma ? norm_weight(__bfloat162float(w.x[j])) : 1.0f;
                     o.x[j] = __float2bfloat16(__bfloat162float(v.x[j]) * inv * g);
                     if (xq) am = fmaxf(am, fabsf(__bfloat162float(o.x[j])));
                 }
@@ -169,7 +188,7 @@ static __device__ void d_rmsnorm(__nv_bfloat16* __restrict__ out, const __nv_bfl
                         bf16v8 o;
 #pragma unroll
                         for (int j = 0; j < 8; j++) {
-                            const float g = gamma ? __bfloat162float(w[c].x[j]) : 1.0f;
+                            const float g = gamma ? norm_weight(__bfloat162float(w[c].x[j])) : 1.0f;
                             o.x[j] = __float2bfloat16(__bfloat162float(v[c].x[j]) * inv * g);
                         }
                         st_glob8(out + obase + i, o);
@@ -184,7 +203,7 @@ static __device__ void d_rmsnorm(__nv_bfloat16* __restrict__ out, const __nv_bfl
                     if (i < feat) {
 #pragma unroll
                         for (int j = 0; j < 8; j++) {
-                            const float g = gamma ? __bfloat162float(w[c].x[j]) : 1.0f;
+                            const float g = gamma ? norm_weight(__bfloat162float(w[c].x[j])) : 1.0f;
                             o[c].x[j] = __float2bfloat16(__bfloat162float(v[c].x[j]) * inv * g);
                             am = fmaxf(am, fabsf(__bfloat162float(o[c].x[j])));
                         }
@@ -217,7 +236,7 @@ static __device__ void d_rmsnorm(__nv_bfloat16* __restrict__ out, const __nv_bfl
             const float inv = rsqrtf(block_sum(ss, part) * __fdividef(1.0f, (float)feat) + eps);
             float am = 0.0f;
             for (unsigned i = threadIdx.x; i < feat; i += PLOW_NV_THREADS) {
-                const float g = gamma ? __bfloat162float(gamma[i]) : 1.0f;
+                const float g = gamma ? norm_weight(__bfloat162float(gamma[i])) : 1.0f;
                 const __nv_bfloat16 ob = __float2bfloat16(__bfloat162float(x[base + i]) * inv * g);
                 out[obase + i] = ob;
                 if (xq) am = fmaxf(am, fabsf(__bfloat162float(ob)));
@@ -312,7 +331,7 @@ static __device__ void d_add_norm(__nv_bfloat16* __restrict__ out, __nv_bfloat16
                     bf16v8 ro, no;
 #pragma unroll
                     for (int j = 0; j < 8; j++) {
-                        const float g = gamma ? __bfloat162float(w[c].x[j]) : 1.0f;
+                        const float g = gamma ? norm_weight(__bfloat162float(w[c].x[j])) : 1.0f;
                         const float f = r[c * 8 + j];
                         ro.x[j] = __float2bfloat16(f);
                         no.x[j] = __float2bfloat16(f * inv * g);
@@ -330,7 +349,7 @@ static __device__ void d_add_norm(__nv_bfloat16* __restrict__ out, __nv_bfloat16
             const float inv = rsqrtf(block_sum(ss, part) * __fdividef(1.0f, (float)feat) + eps);
             for (unsigned i = threadIdx.x; i < feat; i += PLOW_NV_THREADS) {
                 const float f = __bfloat162float(a[base + i]) + __bfloat162float(b[base + i]);
-                const float g = gamma ? __bfloat162float(gamma[i]) : 1.0f;
+                const float g = gamma ? norm_weight(__bfloat162float(gamma[i])) : 1.0f;
                 resid[base + i] = __float2bfloat16(f);
                 out[base + i] = __float2bfloat16(f * inv * g);
             }
@@ -351,7 +370,7 @@ static __device__ void d_norm_residual(__nv_bfloat16* __restrict__ out, const __
                                 const __nv_bfloat16* __restrict__ gamma, unsigned rows,
                                 unsigned feat, float eps, float scale, unsigned slice,
                                 unsigned nblk, float* part) {
-    if (rows >= PLOW_NV_T17_MIN_ROWS && (feat & 7u) == 0) {
+    if (PLOW_NV_T17_MIN_ROWS && rows >= PLOW_NV_T17_MIN_ROWS && (feat & 7u) == 0) {
         /* T17 warp-per-row — see d_rmsnorm. */
         const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
         const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
@@ -377,7 +396,7 @@ static __device__ void d_norm_residual(__nv_bfloat16* __restrict__ out, const __
                 bf16v8 o;
 #pragma unroll
                 for (int j = 0; j < 8; j++) {
-                    const float g = gamma ? __bfloat162float(w.x[j]) : 1.0f;
+                    const float g = gamma ? norm_weight(__bfloat162float(w.x[j])) : 1.0f;
                     o.x[j] = __float2bfloat16(
                         (__bfloat162float(av.x[j]) + gemma_postnorm_round(__bfloat162float(v.x[j]) * inv * g)) * scale);
                 }
@@ -419,7 +438,7 @@ static __device__ void d_norm_residual(__nv_bfloat16* __restrict__ out, const __
                     bf16v8 o;
 #pragma unroll
                     for (int j = 0; j < 8; j++) {
-                        const float g = gamma ? __bfloat162float(w[c].x[j]) : 1.0f;
+                        const float g = gamma ? norm_weight(__bfloat162float(w[c].x[j])) : 1.0f;
                         o.x[j] = __float2bfloat16(
                             (__bfloat162float(av[c].x[j]) + gemma_postnorm_round(__bfloat162float(v[c].x[j]) * inv * g)) *
                             scale);
@@ -435,7 +454,7 @@ static __device__ void d_norm_residual(__nv_bfloat16* __restrict__ out, const __
             }
             const float inv = rsqrtf(block_sum(ss, part) * __fdividef(1.0f, (float)feat) + eps);
             for (unsigned i = threadIdx.x; i < feat; i += PLOW_NV_THREADS) {
-                const float g = gamma ? __bfloat162float(gamma[i]) : 1.0f;
+                const float g = gamma ? norm_weight(__bfloat162float(gamma[i])) : 1.0f;
                 out[base + i] = __float2bfloat16(
                     (__bfloat162float(a[base + i]) + gemma_postnorm_round(__bfloat162float(b[base + i]) * inv * g)) *
                     scale);
@@ -459,7 +478,7 @@ static __device__ void d_norm_residual_norm(__nv_bfloat16* __restrict__ out, __n
                                      unsigned feat, float eps, float scale, unsigned slice,
                                      unsigned nblk, float* part) {
 #if PLOW_NV_NRN_WPR
-    if (rows >= PLOW_NV_T17_MIN_ROWS && (feat & 7u) == 0) {
+    if (PLOW_NV_T17_MIN_ROWS && rows >= PLOW_NV_T17_MIN_ROWS && (feat & 7u) == 0) {
         const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
         const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
         for (unsigned k = warp;; k += PLOW_NV_WARPS) {
@@ -484,7 +503,7 @@ static __device__ void d_norm_residual_norm(__nv_bfloat16* __restrict__ out, __n
                 bf16v8 r;
 #pragma unroll
                 for (int j = 0; j < 8; j++) {
-                    const float g = gb ? __bfloat162float(w.x[j]) : 1.0f;
+                    const float g = gb ? norm_weight(__bfloat162float(w.x[j])) : 1.0f;
                     r.x[j] = __float2bfloat16(
                         (__bfloat162float(av.x[j]) + gemma_postnorm_round(__bfloat162float(v.x[j]) * invb * g)) * scale);
                     const float f = __bfloat162float(r.x[j]);
@@ -499,7 +518,7 @@ static __device__ void d_norm_residual_norm(__nv_bfloat16* __restrict__ out, __n
                 bf16v8 o;
 #pragma unroll
                 for (int j = 0; j < 8; j++) {
-                    const float g = gn ? __bfloat162float(w.x[j]) : 1.0f;
+                    const float g = gn ? norm_weight(__bfloat162float(w.x[j])) : 1.0f;
                     o.x[j] = __float2bfloat16(__bfloat162float(r.x[j]) * invr * g);
                 }
                 st_glob8(out + base + i, o);
@@ -546,7 +565,7 @@ static __device__ void d_norm_residual_norm(__nv_bfloat16* __restrict__ out, __n
                 bf16v8 r;
 #pragma unroll
                 for (int j = 0; j < 8; j++) {
-                    const float g = gb ? __bfloat162float(wb[c].x[j]) : 1.0f;
+                    const float g = gb ? norm_weight(__bfloat162float(wb[c].x[j])) : 1.0f;
                     const float f =
                         (__bfloat162float(av[c].x[j]) + gemma_postnorm_round(__bfloat162float(bv[c].x[j]) * invb * g)) *
                         scale;
@@ -564,7 +583,7 @@ static __device__ void d_norm_residual_norm(__nv_bfloat16* __restrict__ out, __n
                     bf16v8 no;
 #pragma unroll
                     for (int j = 0; j < 8; j++) {
-                        const float g = gn ? __bfloat162float(wn[c].x[j]) : 1.0f;
+                        const float g = gn ? norm_weight(__bfloat162float(wn[c].x[j])) : 1.0f;
                         no.x[j] = __float2bfloat16(__bfloat162float(rv[c].x[j]) * invr * g);
                     }
                     st_glob8(resid + base + i, rv[c]);
@@ -580,7 +599,7 @@ static __device__ void d_norm_residual_norm(__nv_bfloat16* __restrict__ out, __n
             const float invb = rsqrtf(block_sum(ssb, part) / (float)feat + eps);
             float ssr = 0.0f;
             for (unsigned i = threadIdx.x; i < feat; i += PLOW_NV_THREADS) {
-                const float g = gb ? __bfloat162float(gb[i]) : 1.0f;
+                const float g = gb ? norm_weight(__bfloat162float(gb[i])) : 1.0f;
                 const __nv_bfloat16 rb = __float2bfloat16(
                     (__bfloat162float(a[base + i]) + gemma_postnorm_round(__bfloat162float(b[base + i]) * invb * g)) *
                     scale);
@@ -590,7 +609,7 @@ static __device__ void d_norm_residual_norm(__nv_bfloat16* __restrict__ out, __n
             }
             const float invr = rsqrtf(block_sum(ssr, part) / (float)feat + eps);
             for (unsigned i = threadIdx.x; i < feat; i += PLOW_NV_THREADS) {
-                const float g = gn ? __bfloat162float(gn[i]) : 1.0f;
+                const float g = gn ? norm_weight(__bfloat162float(gn[i])) : 1.0f;
                 out[base + i] = __float2bfloat16(__bfloat162float(resid[base + i]) * invr * g);
             }
         }
@@ -669,6 +688,9 @@ static __device__ void d_headnorm_rope(__nv_bfloat16* __restrict__ out,
             const unsigned nsh = 31u - (unsigned)__clz((int)nhead);
             t = w >> nsh; hh = w & (nhead - 1u);
         } else { t = w / nhead; hh = w % nhead; }
+#if defined(PLOW_NV_MASKED_PADDING) && PLOW_NV_MASKED_PADDING
+        if (out_stride && pfslot && pfslot[t] < 0) continue;
+#endif
 #if PLOW_MIXED_STEP
         PlowMixedRow mixed_row = {nullptr, 0u, 0u, 0u, 0u};
         if (out_stride && mixed) {
@@ -719,7 +741,7 @@ static __device__ void d_headnorm_rope(__nv_bfloat16* __restrict__ out,
                     const unsigned short* gs = (const unsigned short*)&gv;
 #pragma unroll
                     for (int k = 0; k < 4; k++)
-                        g[4 * c + k] = __bfloat162float(*(const __nv_bfloat16*)&gs[k]);
+                        g[4 * c + k] = norm_weight(__bfloat162float(*(const __nv_bfloat16*)&gs[k]));
                 } else {
 #pragma unroll
                     for (int k = 0; k < 4; k++) g[4 * c + k] = 1.0f;
@@ -733,9 +755,9 @@ static __device__ void d_headnorm_rope(__nv_bfloat16* __restrict__ out,
                 inv = rsqrtf(warp_sum32(ss) * __fdividef(1.0f, (float)hd) + eps);
             }
 #pragma unroll
-            for (unsigned e = 0; e < 4 * C; e++) v[e] = v[e] * inv * g[e];
+            for (unsigned e = 0; e < 4 * C; e++) v[e] = gemma3_bf16_round(v[e] * inv * g[e]);
             if (cosb) {
-#if PLOW_NV_GEMMA && PLOW_NV_GEMMA_HNR_BF16
+#if (PLOW_NV_GEMMA && PLOW_NV_GEMMA_HNR_BF16) || PLOW_NV_GEMMA3
                 // Match separate BF16 Q/K normalization before the rotary kernel.
 #pragma unroll
                 for (unsigned e = 0; e < 4 * C; e++)
@@ -753,7 +775,7 @@ static __device__ void d_headnorm_rope(__nv_bfloat16* __restrict__ out,
 #pragma unroll
                     for (int k = 0; k < 4; k++) {
                         const unsigned lo = 4 * c + k, hi = 4 * (c + CH) + k;
-#if PLOW_NV_GEMMA && PLOW_NV_GEMMA_HNR_BF16
+#if (PLOW_NV_GEMMA && PLOW_NV_GEMMA_HNR_BF16) || PLOW_NV_GEMMA3
                         const float cr = __bfloat162float(__float2bfloat16(cp[k]));
                         const float sr = __bfloat162float(__float2bfloat16(sp[k]));
                         r[lo] = v[lo] * cr - v[hi] * sr;
@@ -785,7 +807,7 @@ static __device__ void d_headnorm_rope(__nv_bfloat16* __restrict__ out,
 #pragma unroll
         for (unsigned e = 0; e < E; e++) {
             v[e] = __bfloat162float(x[ibase + lane + e * 32]);
-            g[e] = gamma ? __bfloat162float(gamma[lane + e * 32]) : 1.0f;
+            g[e] = gamma ? norm_weight(__bfloat162float(gamma[lane + e * 32])) : 1.0f;
         }
         float inv = 1.0f;
         if (!skip_norm) {
@@ -795,7 +817,7 @@ static __device__ void d_headnorm_rope(__nv_bfloat16* __restrict__ out,
             inv = rsqrtf(warp_sum32(ss) * __fdividef(1.0f, (float)hd) + eps);
         }
 #pragma unroll
-        for (unsigned e = 0; e < E; e++) v[e] = v[e] * inv * g[e];
+        for (unsigned e = 0; e < E; e++) v[e] = gemma3_bf16_round(v[e] * inv * g[e]);
 
         if (cosb) {
             constexpr unsigned H2 = HD / 2;
@@ -807,7 +829,7 @@ static __device__ void d_headnorm_rope(__nv_bfloat16* __restrict__ out,
                 for (unsigned e = 0; e < E; e++) {
                     const unsigned i = lane + e * 32;
                     const unsigned j = (i < H2) ? i : (i - H2);
-                    const float c = cosb[p + j], s = sinb[p + j];
+                    const float c = gemma3_bf16_round(cosb[p + j]), s = gemma3_bf16_round(sinb[p + j]);
                     r[e] = (e < EH) ? (v[e] * c - v[e + EH] * s)  /* i in [0, H2)  */
                                     : (v[e] * c + v[e - EH] * s); /* i in [H2, hd) */
                 }
@@ -815,7 +837,7 @@ static __device__ void d_headnorm_rope(__nv_bfloat16* __restrict__ out,
 #pragma unroll
                 for (unsigned e = 0; e < E; e++) {
                     const unsigned i = lane + e * 32;
-                    const float c = cosb[p + (i >> 1)], s = sinb[p + (i >> 1)];
+                    const float c = gemma3_bf16_round(cosb[p + (i >> 1)]), s = gemma3_bf16_round(sinb[p + (i >> 1)]);
                     const float partner = __shfl_xor_sync(0xffffffffu, v[e], 1, 32);
                     r[e] = ((i & 1u) == 0u) ? (v[e] * c - partner * s)
                                             : (v[e] * c + partner * s);
@@ -870,6 +892,9 @@ static __device__ void d_headnorm_rope_fp8(uint8_t* __restrict__ out, float* __r
             const unsigned nsh = 31u - (unsigned)__clz((int)nhead);
             t = w >> nsh; hh = w & (nhead - 1u);
         } else { t = w / nhead; hh = w % nhead; }
+#if defined(PLOW_NV_MASKED_PADDING) && PLOW_NV_MASKED_PADDING
+        if (pfslot && pfslot[t] < 0) continue;
+#endif
         const size_t ibase = ((size_t)t * nhead + hh) * hd;
         /* KV write (out_stride!=0 always here): per-row slot map (batched prefill), per-batch ring
          * when n_batch_kv!=0 (pos[t]-derived row; ==1 is the patch-free B=1 decode ring), else
@@ -909,7 +934,7 @@ static __device__ void d_headnorm_rope_fp8(uint8_t* __restrict__ out, float* __r
                     const unsigned short* gs = (const unsigned short*)&gv;
 #pragma unroll
                     for (int k = 0; k < 4; k++)
-                        g[4 * c + k] = __bfloat162float(*(const __nv_bfloat16*)&gs[k]);
+                        g[4 * c + k] = norm_weight(__bfloat162float(*(const __nv_bfloat16*)&gs[k]));
                 } else {
 #pragma unroll
                     for (int k = 0; k < 4; k++) g[4 * c + k] = 1.0f;
@@ -923,7 +948,7 @@ static __device__ void d_headnorm_rope_fp8(uint8_t* __restrict__ out, float* __r
                 inv = rsqrtf(warp_sum32(ss) * __fdividef(1.0f, (float)hd) + eps);
             }
 #pragma unroll
-            for (unsigned e = 0; e < 4 * C; e++) v[e] = v[e] * inv * g[e];
+            for (unsigned e = 0; e < 4 * C; e++) v[e] = gemma3_bf16_round(v[e] * inv * g[e]);
             if (cosb) {
                 const size_t p = (size_t)pos[t] * (HD / 2);
                 float r[4 * C];
@@ -966,7 +991,7 @@ static __device__ void d_headnorm_rope_fp8(uint8_t* __restrict__ out, float* __r
 #pragma unroll
         for (unsigned e = 0; e < E; e++) {
             v[e] = __bfloat162float(x[ibase + lane + e * 32]);
-            g[e] = gamma ? __bfloat162float(gamma[lane + e * 32]) : 1.0f;
+            g[e] = gamma ? norm_weight(__bfloat162float(gamma[lane + e * 32])) : 1.0f;
         }
         float inv = 1.0f;
         if (!skip_norm) {
@@ -976,7 +1001,7 @@ static __device__ void d_headnorm_rope_fp8(uint8_t* __restrict__ out, float* __r
             inv = rsqrtf(warp_sum32(ss) * __fdividef(1.0f, (float)hd) + eps);
         }
 #pragma unroll
-        for (unsigned e = 0; e < E; e++) v[e] = v[e] * inv * g[e];
+        for (unsigned e = 0; e < E; e++) v[e] = gemma3_bf16_round(v[e] * inv * g[e]);
 
         if (cosb) {
             constexpr unsigned H2 = HD / 2;
@@ -988,14 +1013,14 @@ static __device__ void d_headnorm_rope_fp8(uint8_t* __restrict__ out, float* __r
                 for (unsigned e = 0; e < E; e++) {
                     const unsigned i = lane + e * 32;
                     const unsigned j = (i < H2) ? i : (i - H2);
-                    const float c = cosb[p + j], s = sinb[p + j];
+                    const float c = gemma3_bf16_round(cosb[p + j]), s = gemma3_bf16_round(sinb[p + j]);
                     r[e] = (e < EH) ? (v[e] * c - v[e + EH] * s) : (v[e] * c + v[e - EH] * s);
                 }
             } else {
 #pragma unroll
                 for (unsigned e = 0; e < E; e++) {
                     const unsigned i = lane + e * 32;
-                    const float c = cosb[p + (i >> 1)], s = sinb[p + (i >> 1)];
+                    const float c = gemma3_bf16_round(cosb[p + (i >> 1)]), s = gemma3_bf16_round(sinb[p + (i >> 1)]);
                     const float partner = __shfl_xor_sync(0xffffffffu, v[e], 1, 32);
                     r[e] = ((i & 1u) == 0u) ? (v[e] * c - partner * s) : (v[e] * c + partner * s);
                 }

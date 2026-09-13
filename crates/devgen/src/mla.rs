@@ -55,6 +55,10 @@ pub(crate) struct GlmCfg {
     ///
     /// `cfg_glm` now REFUSES rather than defaulting, and [`GlmCfg::rope_theta`] is the only reader.
     rope_theta: Option<f64>,
+    /// The RoPE frequency-scaling scheme, materialised into the cos/sin tables.
+    /// `RopeScale::None` for GLM / a plain MLA checkpoint; `YarnDeepSeek` for the
+    /// DeepSeek/Kimi family, whose `mscale` handling `require_mla_rope` validates.
+    rope_scale: packet::rope::RopeScale,
     /// The namespace this checkpoint's weights live under, `.`-terminated — `model.` for GLM /
     /// DeepSeek / Kimi-K2.7, `language_model.model.` for a multimodal wrapper like Kimi-K3.
     ///
@@ -254,12 +258,80 @@ fn glm_dsa_pf_bucket(c: &GlmCfg, t: u32) -> bool {
     c.dsa_pf() && t >= 2048 && t > c.index_topk
 }
 
+/// Row-split sparse attention's per-layer eligibility (`PLOW_GLM_ROWSPLIT_ATTN`,
+/// `reports/rowsplit-attention-design.md`): does layer `layer` reach the sparse (gathered)
+/// prefill arm at the 8192 rung at all? Mirrors `emit_glm_mla_prefill`'s `sparse` flag at
+/// `t=8192` (same "full indexer, or within the reuse window of one" test), computed here at
+/// DECLARE time — before `t` is known — so the arm's extra per-layer W_uv replica
+/// (`GlmLw::wuv_full`) is allocated only where it can be used. A layer with no sparse arm at
+/// 8192 gets no gather to shrink and must not pay for the replica (`full` is the caller's
+/// already-computed `mla && idx_on && c.indexer_is_full(layer)`).
+fn glm_rowsplit_attn_eligible(c: &GlmCfg, layer: u32, full: bool) -> bool {
+    glm_dsa_pf_bucket(c, 8192)
+        && (full || {
+            let cfg = emit_config::active();
+            let span = cfg.glm_dsa_pf_span as usize;
+            let dexact = cfg.glm_dsa_pf_dexact.map(|d| d as usize);
+            let layer = layer as usize;
+            match dexact {
+                Some(d) => layer >= d && c.indexer_is_full((layer - d) as u32),
+                None => (1..=span).any(|d| layer >= d && c.indexer_is_full((layer - d) as u32)),
+            }
+        })
+}
+
+/// May a sparse (DSA) prefill bucket be emitted with the packed-segment topology (a packed
+/// sibling or a token-batch body)? Only when its whole selection chain has a per-span form at
+/// the runtime: the native TP indexer (`IndexTpPf`, which takes a `PlowKvSpan` table) feeding
+/// the AITER sparse FP8 flash directly (no per-8-query union, whose tiles could straddle two
+/// requests). The interpreter selectors (`IndexScorePf`/`IndexSelectPf`/`IndexUnionPf`, the
+/// pooled chain) derive every row's position from `kv_len[0]` and stay class C. Gated by
+/// `PLOW_PACKED_SPARSE_PF` so the shipped blob is unchanged until the rung is qualified.
+fn glm_sparse_spans(c: &GlmCfg) -> bool {
+    let cfg = emit_config::active();
+    c.dsa_pf() && cfg.packed_sparse_pf && cfg.glm_index_tp() && c.index_kpool == 1 && glm_fp8_kv()
+}
+
+/// `packed`: the program carries the packed-prefill family topology, whose flash arm has no
+/// KV-split axis (one partial per row). Keyed on the BUILDER, not the global emit flag, so a
+/// packed emit leaves the ordinary sibling's split — and its bytes — exactly as flag-off.
+fn glm_small_pf_split_cap(c: &GlmCfg, n_cu: u32, rows: u32, packed: bool) -> u32 {
+    if !crate::emit_is_amd() || n_cu != 304 || c.tp != 8 || c.heads != 64
+        || c.kv_lora != 512 || c.qk_rope != 64 || !glm_fp8_kv()
+        || rows == 0 || rows >= 2048 || packed
+        // The split capacity must agree with the arm `packet::devbuild` routes the packet
+        // to, so both read the builder's own knob snapshot.
+        || packet::devbuild::knobs().mla_pf_v2 == Some(false)
+        || emit_config::active().uniseg
+    {
+        return 1;
+    }
+    let capacity = (n_cu / (rows.div_ceil(64) * 8)).clamp(1, 32);
+    1 << capacity.ilog2()
+}
+
 fn cfg_glm(dir: &Path) -> GlmCfg {
     let root: Value =
         serde_json::from_slice(&std::fs::read(dir.join("config.json")).expect("config.json"))
             .unwrap();
     let glm53 = root["model_type"].as_str() == Some("glm5_next");
-    let v = if glm53 { &root["text_config"] } else { &root };
+    // Multimodal wrappers nest the text geometry under `text_config` AND move every
+    // tensor under their own prefix. The two travel together — reading the nested
+    // geometry while binding flat `model.` names yields MISSING WEIGHT on tensor one
+    // — so one match decides both. `kimi_k25` is Kimi-K2.7-Code
+    // (KimiK25ForConditionalGeneration): its text tower is `text_config` with
+    // model_type "kimi_k2", and its checkpoint ships `language_model.model.layers.…`,
+    // not the flat `model.layers.…` a text-only K2.7 export would carry.
+    let wrapper = match root["model_type"].as_str() {
+        Some("glm5_next") => Some("model.language_model."),
+        Some("kimi_k25") => Some("language_model.model."),
+        _ => None,
+    };
+    let v = if wrapper.is_some() {
+        &root["text_config"]
+    } else {
+        &root
+    };
     let g = |k: &str| {
         v[k].as_u64()
             .unwrap_or_else(|| panic!("config.json missing {k}")) as u32
@@ -293,12 +365,62 @@ fn cfg_glm(dir: &Path) -> GlmCfg {
         .as_f64()
         .or_else(|| rp["rope_theta"].as_f64());
     let mla_nope = v["mla_use_nope"].as_bool().unwrap_or(false);
+    // DeepSeek-family YaRN. `rope_scaling.type` is the DeepSeek spelling, `rope_type` the HF one;
+    // both appear in the wild and mean the same key. `attn_mscale` is the factor this family folds
+    // into softmax_scale — `yarn_get_mscale(factor, mscale_all_dim)`, applied TWICE
+    // (`softmax_scale = softmax_scale * mscale * mscale` in modeling_deepseek.py) — and is 1.0
+    // when the config carries no `mscale_all_dim`, which is what makes the fold a no-op for every
+    // checkpoint that does not use it.
+    let rsc = &v["rope_scaling"];
+    let rsc_type = rsc["type"].as_str().or_else(|| rsc["rope_type"].as_str());
+    let (rope_scale, attn_mscale) = if rsc.is_object() && rsc_type == Some("yarn") {
+        let f = |k: &str, d: f64| rsc[k].as_f64().unwrap_or(d);
+        let factor = rsc["factor"]
+            .as_f64()
+            .unwrap_or_else(|| panic!("{model}: rope_scaling.factor"));
+        let orig = rsc["original_max_position_embeddings"]
+            .as_f64()
+            .unwrap_or_else(|| panic!("{model}: rope_scaling.original_max_position_embeddings"));
+        let mscale = f("mscale", 1.0);
+        let mscale_all_dim = f("mscale_all_dim", 1.0);
+        // The table factor is the RATIO of the two (see RopeScale::YarnDeepSeek). Only the equal
+        // case is representable — the ratio is then exactly 1.0 and needs no field. An unequal
+        // pair would need a per-table factor the ABI-locked GenTensor has no room for, so it is
+        // refused rather than silently rounded to one of the two.
+        assert!(
+            (mscale - mscale_all_dim).abs() < 1e-12,
+            "{model}: rope_scaling.mscale ({mscale}) != mscale_all_dim ({mscale_all_dim}). The \
+             RoPE table factor is yarn_get_mscale(factor, mscale) / yarn_get_mscale(factor, \
+             mscale_all_dim), which is only representable in GenTensor when the two are equal \
+             (ratio 1.0). Add a per-table attention factor to the GenTensor ABI before accepting \
+             this checkpoint."
+        );
+        let m = if factor > 1.0 {
+            0.1 * mscale_all_dim * factor.ln() + 1.0
+        } else {
+            1.0
+        };
+        (
+            packet::rope::RopeScale::YarnDeepSeek {
+                factor,
+                beta_fast: f("beta_fast", 32.0),
+                beta_slow: f("beta_slow", 1.0),
+                orig,
+                truncate: rsc["truncate"].as_bool().unwrap_or(true),
+            },
+            m * m,
+        )
+    } else {
+        (packet::rope::RopeScale::None, 1.0)
+    };
     if qk_head != g("qk_nope_head_dim") || g("qk_rope_head_dim") != 0 {
         crate::require_mla_rope(
             rope_theta,
             mla_nope,
             rp["rope_type"].as_str(),
-            v["rope_scaling"].as_object().is_some(),
+            // A scheme this parse RESOLVED is no longer an unhandled one. The gate still fires
+            // for llama3/linear and for any yarn shape the branch above refused.
+            v["rope_scaling"].as_object().is_some() && rope_scale == packet::rope::RopeScale::None,
             model,
         );
     } else {
@@ -337,16 +459,16 @@ fn cfg_glm(dir: &Path) -> GlmCfg {
         dense_inter: g("intermediate_size"),
         first_k_dense: g("first_k_dense_replace"),
         route_scale: v["routed_scaling_factor"].as_f64().unwrap() as f32,
-        attn_scale: (qk_head as f32).powf(-0.5),
+        // 1/sqrt(qk_head_dim), times the DeepSeek-family YaRN softmax fold
+        // (`yarn_get_mscale(factor, mscale_all_dim)^2`, 1.0 for every other checkpoint).
+        // This is the half of the family's mscale that does NOT belong in the tables.
+        attn_scale: (qk_head as f64).powf(-0.5) as f32 * attn_mscale as f32,
+        rope_scale,
         rope_theta,
-        // Flat checkpoint: GLM / DeepSeek / Kimi-K2.7 all ship `model.layers.…` at the root.
-        // A nested (multimodal) variant sets this from its own wrapper, and nothing else changes.
-        prefix: if glm53 {
-            "model.language_model."
-        } else {
-            "model."
-        }
-        .to_string(),
+        // Flat checkpoint: GLM / DeepSeek / a text-only Kimi-K2.7 export all ship
+        // `model.layers.…` at the root. A nested (multimodal) variant carries its own
+        // wrapper prefix, decided with the `text_config` probe above.
+        prefix: wrapper.unwrap_or("model.").to_string(),
         tp: 1,
         ep: emit_config::active().glm_ep,
         group: emit_config::active().glm_group,
@@ -611,6 +733,7 @@ fn emit_glm53_program(
                     true,
                     &mut xgate,
                     &xr,
+                    None,
                 )
             } else {
                 emit_glm_mla(
@@ -712,7 +835,7 @@ fn emit_glm53_program(
             d.i[3] = 2;
         },
     );
-    emit_glm_tail(b, c, n, n.x, &[contract], rows, !prefill, &mut xgate);
+    emit_glm_tail(b, c, n, n.x, &[contract], rows, !prefill, &mut xgate, None);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -949,6 +1072,35 @@ fn require_gf_divides(gf: u32, nh_l: u32, phase: &str) {
         nh_l - (nh_l / gf) * gf,
     );
 }
+
+/// Split count for the SPARSE (DSA) decode flash. The gathered walk is `index_topk` rows per
+/// (row, head-group) whatever the context, so this is a fill problem, not a stream problem, and
+/// `glm_nsplit(index_topk, ..)` (= 16 for every rung) is the wrong instrument: it was fitted to
+/// a dense latent stream. Measured on the shipped gfx942 decode object (exact-object replay,
+/// FP8 latent, GF=4, top_k 2048, us per packet on one rank; the walk is context-independent):
+///
+///     rows   ns=4   ns=8   ns=16 (shipped)  ns=32
+///       1     85     69     64               62
+///       8    100     82     80              114
+///      16    105     90    125              188
+///      20    108    142    167              226
+///
+/// Past one item per CU the second round costs more than the shorter walk saves (rows 16 and
+/// 20 at ns=16 run 640 items on 304 CUs); below it the per-item fixed cost (Q staging, six
+/// barriers, the epilogue) dominates. So: the largest power of two with
+/// `rows * (nh_l / GF) * ns <= n_cu`, clamped to [4, 16] — 16 is where rows 1..4 already sit and
+/// 32 never beat it by more than noise. `PLOW_MLA_NS` pins it, as it pins the dense rule.
+pub(crate) fn glm_dsa_decode_nsplit(rows: u32, nh_l: u32, gf: u32, n_cu: u32) -> u32 {
+    let n_grp = (nh_l / gf.max(1)).max(1);
+    let items = (rows.max(1) * n_grp).max(1);
+    let fill = (n_cu.max(1) / items).max(1);
+    let ns = (1u32 << fill.ilog2()).clamp(4, 16);
+    emit_config::active()
+        .mla_ns
+        .filter(|&v| v >= 1)
+        .unwrap_or(ns)
+}
+
 /// MLA flash-decode KV-split count, CTX-ADAPTIVE (mirrors Gemma's PLOW_NS_MUL/ABS). The flash
 /// splits its work into `n_grp*nsplit = (heads/GF)*nsplit` items over 256 CUs; nsplit must fill
 /// the machine (n_grp*nsplit >= n_cu) without over-splitting short contexts (FlashMerge crit-path
@@ -1069,6 +1221,12 @@ pub(crate) enum MoeEnc {
     /// bridge — SwiGLU, MXFP4 quantize and the E8M0 scale write all happen there, so `fu` is
     /// written already-fp4 in the sorted layout DOWN reads and no bf16 intermediate exists.
     Mxfp4 = 2,
+    /// compressed-tensors `pack-quantized` int4: symmetric, `group_size` 32, stored as an unsigned
+    /// nibble with an offset of 8, one BF16 scale per group. Kimi-K2.7-Code's routed experts, and
+    /// the ONLY encoding that reads that checkpoint without re-quantizing it — measured
+    /// alternatives cost 2.26% (block-fp8, and it does not fit this host) or 9.96% (mxfp4) mean
+    /// weight error. w4a16: the activation stays bf16, as on the block-fp8 arms.
+    Int4G32 = 3,
 }
 
 impl MoeEnc {
@@ -1245,6 +1403,42 @@ fn glm_linear_fp8(enc: MoeEnc) -> bool {
     enc == MoeEnc::Fp8Blk && emit_config::active().glm_linear_fp8
 }
 
+/// `PLOW_GLM_MOE_SHARED_FOLD=1` — the shared expert becomes routed expert `n_exp` with a
+/// constant gate of 1.0, so the native MoE call runs top-(k+1) over n_exp+1 experts.
+///
+/// GLM's shared expert is shape-identical to one routed expert (`moe_intermediate_size` gate/up
+/// and down, the same `[128,128]` block-fp8 grid), and every token passes through it with weight
+/// 1. AITER and vLLM therefore fold it into the fused call as one extra expert — AITER's own
+/// GLM-5 gfx942 tuning table (`a8w8_blockscale_tuned_fmoe_glm5_1.csv`) is indexed by
+/// **expert 257, topk 9**, not 256/8, so the configuration plow already picks out of that table
+/// was tuned with the shared expert inside the call. plow instead ran it as two interpreter
+/// GEMMs — `GemmGlu` [T,256,6144] + `Gemm` [T,6144,256], 35 + 19 ms per 8192-row chunk at
+/// ~105 TF/s against the fused call's 530 — and the fold buys that back for the cost of one
+/// extra (token, expert) pair per token (+1/k on the fmoe k-loop).
+///
+/// THREE THINGS MOVE, and they have to move together:
+///   * the ROUTER writes a `k+1`th slot per token, `{expert n_exp, gate 1.0}` (`i[5]`), so the
+///     align/sort chain sees a genuine top-(k+1) table it can histogram without knowing why;
+///   * every `n_exp`/`k`-shaped buffer (`tab`, `moe_meta`, the three row maps, the expert
+///     pointer tables) is sized at `n_exp+1` / `k+1`;
+///   * the shared expert's own GLU/down packets are NOT emitted and `MoeCombinePf`'s `shared`
+///     operand becomes `TENSOR_NONE` (`d_moe_combine_pf` already spells "no shared" that way).
+///
+/// NOT bit-identical, and not only by reassociation: the shared expert stops being a bf16 GEMM
+/// pair and becomes block-fp8 W8 against the A8 activation quant the routed experts already use
+/// — the checkpoint's OWN fp8 bytes rather than the lite prep's bf16 dequant of them, which is
+/// what vLLM serves. Requires the native AITER MoE route (nothing else consumes a 257-entry
+/// table) and TP, not EP: under EP the routed experts are distributed whole across ranks while
+/// the shared expert is TP-sliced on every rank, so it has no single owner to be expert 256 of.
+fn glm_shared_fold(c: &GlmCfg, enc: MoeEnc) -> bool {
+    let cfg = emit_config::active();
+    cfg.glm_moe_shared_fold
+        && (cfg.glm_moe_aiter() || cfg.glm_moe_resident())
+        && enc == MoeEnc::Fp8Blk
+        && !c.ep
+        && c.tp > 1
+}
+
 /// OPT-IN (`PLOW_GLM_OFOLD=1`): the MlaMergeFold+o_proj fusion (fusion-audit seam 1).
 ///
 /// At prefill nsplit==1 the merge is exactly `oat = normalize(opart) × W_uv`, so the pair
@@ -1263,6 +1457,52 @@ fn glm_ofold(enc: MoeEnc) -> bool {
     emit_config::active().glm_ofold && !glm_linear_fp8(enc) && enc != MoeEnc::Mxfp4
 }
 
+/// `PLOW_GLM_GEMM_BLK`: the prefill projections that take the native block-scale FP8 route
+/// (`GemmBlkPf`). Only whole checkpoint block-FP8 tensors, or block-row-aligned slices of one,
+/// are nameable: `q_absorb` and `q_rope` are prep products with no scale grid of their own.
+#[derive(Clone, Copy, Default)]
+struct GlmBlk {
+    q_a: bool,
+    kv_a: bool,
+    wq_b: bool,
+    o_proj: bool,
+}
+
+impl GlmBlk {
+    fn any(self) -> bool {
+        self.q_a || self.kv_a || self.wq_b || self.o_proj
+    }
+}
+
+fn glm_gemm_blk() -> GlmBlk {
+    let spec = emit_config::active()
+        .glm_gemm_blk
+        .clone()
+        .unwrap_or_default();
+    let mut set = GlmBlk::default();
+    for name in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        match name {
+            "1" | "true" => {
+                set = GlmBlk {
+                    q_a: true,
+                    kv_a: true,
+                    wq_b: true,
+                    o_proj: true,
+                }
+            }
+            "0" | "false" => {}
+            "q_a" => set.q_a = true,
+            "kv_a" => set.kv_a = true,
+            "wq_b" => set.wq_b = true,
+            "o_proj" => set.o_proj = true,
+            other => {
+                panic!("PLOW_GLM_GEMM_BLK: unknown projection {other:?} (q_a, kv_a, wq_b, o_proj)")
+            }
+        }
+    }
+    set
+}
+
 /// OPT-IN (PLOW_GLM_FP8_KV=1): store the MLA latent cache (`kv.{l}.ckv`) as e4m3 with a per-row
 /// f32 scale (`kv.{l}.scale`), exactly the K3 form — the latent writer becomes `HeadNormRopeFp8`
 /// (RMSNorm + quantize + scale record in one pass) and the dense flash swaps to the `*Fp8` MLA
@@ -1270,11 +1510,10 @@ fn glm_ofold(enc: MoeEnc) -> bool {
 /// (`i[6]=0`), matching the shipped K3 arm. NOT bit-identical to the bf16 arm — e4m3 has 3
 /// mantissa bits — so this ships only behind its own serve gate. Unset = byte-identical emit.
 ///
-/// Incompatible with an armed DSA gate: `FlashGatherDecode` has no fp8 twin (its `t7` is the idx
-/// table, where the scale array would live), so a gathered packet would read fp8 bytes as bf16.
-/// The emitters assert.
+/// Sparse FP8 uses the same opcodes with `j[0] = selected-handle + 1`; zero remains dense.
+/// The runtime requires sparse-FP8 object markers before accepting that extension.
 fn glm_fp8_kv() -> bool {
-    emit_config::active().glm_fp8_kv
+    emit_config::active().glm_fp8_kv()
 }
 
 /// One DENSE prefill GEMM against CHECKPOINT block-fp8 weights — [`DevOp::GemmFp8Blk`] (107).
@@ -1453,6 +1692,11 @@ struct GlmLW {
     gkva: u32, // kv_a_layernorm
     krotd: u32, // DERIVED RAW k_rope down (kv_a rope slice, NOT folded) [DR, H]; RoPE applied dynamically
     wuv: u32,   // DERIVED absorbed value       [NH*DK, VD]
+    // ROW-SPLIT arm only (`PLOW_GLM_ROWSPLIT_ATTN`): the SAME derived checkpoint tensor as
+    // `wuv`, requested at its FULL (un-sharded, all `nh` heads) size instead of this rank's
+    // `nh_l` shard — see `glm_rowsplit_attn_eligible`. TENSOR_NONE unless the knob is on and
+    // this layer reaches the sparse prefill arm at the 8192 rung.
+    wuv_full: u32,
     wo: u32,    // o_proj (NH*VD -> H)
     wofold: u32, // DERIVED fused W_uv·W_o (NH*DK -> H), prefill ofold arm only; else NONE
     gpost: u32, // post_attention_layernorm
@@ -1506,6 +1750,17 @@ struct GlmLW {
     // writes this name twice: bf16 bytes under `iwp` (unused when index_kpool>1) and f32
     // bytes here. `iwp` itself is UNTOUCHED — GLM-5.2 keeps reading it exactly as today.
     iwp_f32: u32, // indexer.weights_proj.weight [HI, H] f32 (index_kpool>1 only)
+    // PLOW_GLM_GEMM_BLK: checkpoint block-FP8 bytes (`.weight_fp8`) and `[N/128][K/128]` scale
+    // grids of the prefill projections the native FP8 route reads. ADDITIONAL to the bf16
+    // handles above, which decode keeps reading. TENSOR_NONE unless selected.
+    blk_qad: u32,
+    blk_qad_s: u32,
+    blk_ckvd: u32,
+    blk_ckvd_s: u32,
+    blk_iwqb: u32,
+    blk_iwqb_s: u32,
+    blk_wo: u32,
+    blk_wo_s: u32,
 }
 
 /// The GLM tensor table. Decode-shaped activations (one row) + per-layer latent/rope caches +
@@ -1536,6 +1791,14 @@ pub(crate) struct GlmTn {
     mlpart: u32,
     olat: u32,
     oat: u32,
+    // ROW-SPLIT arm only (`PLOW_GLM_ROWSPLIT_ATTN`, 8192 rung): the two all-to-alls' LOCAL
+    // (non-peer) destinations, [T/8][64][dk|dr] and TENSOR_NONE otherwise. `qa`/`qr` above are
+    // redirected to peer-slot names when the knob is on (see `declare_glm_rows_batched`) and
+    // are this rank's un-gathered [T][nh_l][dk|dr] all-to-all SOURCE; `oat_rs` is the row-split
+    // fold's PEER-VISIBLE source for the all-to-all back into `oat`.
+    qa_rs: u32,
+    qr_rs: u32,
+    oat_rs: u32,
     attn: u32,
     xmid: u32,
     xn2: u32,
@@ -1573,6 +1836,15 @@ pub(crate) struct GlmTn {
     /// the bound one agree) stayed healthy while the same decode program inside a prefill bundle
     /// emitted a constant token.
     slot_b: u32,
+    /// `PLOW_GLM_SEQ_PAR`: peer result slot 3 (`act.h2_tp`, bound at `3 * slot_b`), which every
+    /// sequence-parallel seam writes its normed band into for the all-gather. TENSOR_NONE unless
+    /// the knob is on under TP with a prefill bucket the seams cover.
+    h2_tp: u32,
+    /// `PLOW_GLM_SEQ_PAR_PROJ`: the band projection results travel through slots 2..5 — this is
+    /// slot 2 (`act.ug_tp`, `2 * slot_b`), and slots 4/5 below. TENSOR_NONE otherwise.
+    ug_tp: u32,
+    xe_tp: u32,
+    rt_tp: u32,
     // DSA indexer (TENSOR_NONE when the DSA gate is off). qidx/kidx_raw/kidx_normed/widx are per-step
     // scratch; iscore/iidx/ighist/igctl are the score+select scratch (shared across layers, sequential);
     // icos/isin are the [ctx][DI/2] identity-tail interleaved-RoPE tables (first qk_rope/2 real, rest 1/0).
@@ -1585,14 +1857,18 @@ pub(crate) struct GlmTn {
     iidx_pf: u32,     // i32 [T][top_k] per-query selection (-1 pads)
     iuni: u32,        // per-64-query-tile union table (see op 119)
     iumask: u32,      // u64 [n_qt][ctx] membership scratch for the union build
-    qidx: u32,        // rope'd indexer query [HI*DI]
-    kidx_raw: u32,    // wk @ xn [DI] (pre-norm)
-    kidx_normed: u32, // k_norm(kidx_raw) [DI] (pre-rope)
-    widx: u32,        // weights_proj @ xn [HI]
-    iscore: u32,      // f32 [ctx] indexer scores
-    iidx: u32,        // i32 [index_topk] selected positions (the gather idx; shared reuse target)
-    ighist: u32,      // u32 [7*256] radix histograms (host-zeroed once)
-    igctl: u32,       // u32 [3] grid-barrier ctl (host-zeroed once)
+    qidx: u32,        // rope'd indexer query [B][HI*DI]
+    kidx_raw: u32,    // wk @ xn [B][DI] (pre-norm)
+    kidx_normed: u32, // k_norm(kidx_raw) [B][DI] (pre-rope)
+    widx: u32,        // weights_proj @ xn [B][HI]
+    iscore: u32,      // f32 [B][ctx] indexer scores
+    iidx: u32, // i32 [B][index_topk] selected positions (the gather idx; shared reuse target)
+    ighist: u32, // u32 [7*256] radix histograms (host-zeroed once)
+    igctl: u32, // u32 [3] grid-barrier ctl (host-zeroed once)
+    // PLOW_GLM_SELECT_SPLIT: per-row position bitmap (u32 [rows][ceil(ctx/32)]) and candidate
+    // keys (u64 [rows][ctx]); TENSOR_NONE otherwise.
+    ibits: u32,
+    icand: u32,
     icos: u32,
     isin: u32,
     // `index_kpool>1` DECODE-path per-step scratch (TENSOR_NONE otherwise). `iidx`/`iscore`
@@ -1622,6 +1898,11 @@ pub(crate) struct GlmTn {
     /// E8M0 scale rows for `fu_g` under A4W4 — WRITTEN by the gate/up epilogue, READ by DOWN.
     /// TENSOR_NONE on the bf16 / block-fp8 arms, which have no per-block scale.
     fu_scale: u32,
+    // PLOW_GLM_GEMM_BLK scratch: the quantized activation [T][K] fp8, its group-major [K/128][T]
+    // f32 scales, and the zero [N] f32 bias the kernel requires. TENSOR_NONE otherwise.
+    blk_xq: u32,
+    blk_xs: u32,
+    blk_bias: u32,
     // per-emitted-layer caches + weights (index i <-> layer_ids[i]); kidx = indexer key cache [ctx][DI]
     // on 'full' layers (TENSOR_NONE otherwise).
     ckv: Vec<u32>,
@@ -1706,6 +1987,7 @@ pub(crate) fn declare_glm_rows_batched(
     enc: MoeEnc,
 ) -> GlmTn {
     let dbatch = dbatch.max(1);
+    let sp_seams = c.tp > 1 && rows >= GLM_SP_MIN_ROWS && emit_config::active().glm_seq_par();
     let rows = (rows.max(1) as u64).max(dbatch as u64);
     let (h, nh, dk, dr, vd, ql, e, tk, imoe) = (
         c.hidden,
@@ -1744,7 +2026,7 @@ pub(crate) fn declare_glm_rows_batched(
     // for a rotation the model does not have.
     let (cos, sin) = if c.qk_rope > 0 {
         let [cos_t, sin_t] =
-            GenTensor::rope_pair(ctx, c.qk_rope, c.rope_theta(), 1.0, RopeScale::None);
+            GenTensor::rope_pair(ctx, c.qk_rope, c.rope_theta(), 1.0, c.rope_scale);
         (
             b.tensor_gen("in.cos", cos_t.byte_len(), cos_t),
             b.tensor_gen("in.sin", sin_t.byte_len(), sin_t),
@@ -1772,9 +2054,22 @@ pub(crate) fn declare_glm_rows_batched(
     let ckvraw = ac(b, "ckvraw", rows * dk as u64 * BF16);
     // Head-dimensioned activations shrink to nh_l heads under TP (the flash/merge/uv/o-fold ops run
     // this rank's head-shard); expert/dense-intermediate activations shrink to imoe_l/di_l lanes.
-    let qa = ac(b, "qa", rows * (nh_l * dk) as u64 * BF16);
+    // ROW-SPLIT arm (`PLOW_GLM_ROWSPLIT_ATTN`): `qa`/`qr` become this rank's all-to-all SOURCE,
+    // so they move to the peer-slot names `crates/plowrt/src/exec/amd.rs`'s hardcoded peer-slot
+    // table recognizes (step 3 adds the two entries) instead of ordinary VRAM. Knob off keeps
+    // the ordinary `act.qa`/`act.qr` names — zero extra bytes bound, byte-identical.
+    let rowsplit_attn = emit_config::active().glm_rowsplit_attn();
+    let qa = if rowsplit_attn {
+        ac(b, "qa_tp", rows * (nh_l * dk) as u64 * BF16)
+    } else {
+        ac(b, "qa", rows * (nh_l * dk) as u64 * BF16)
+    };
     let qrr = ac(b, "qrr", rows * (nh_l * dr) as u64 * BF16);
-    let qr = ac(b, "qr", rows * (nh_l * dr) as u64 * BF16);
+    let qr = if rowsplit_attn {
+        ac(b, "qr_tp", rows * (nh_l * dr) as u64 * BF16)
+    } else {
+        ac(b, "qr", rows * (nh_l * dr) as u64 * BF16)
+    };
     let krr = ac(b, "krr", rows * dr as u64 * BF16);
     // TP-sharded head count (nh_l) x ctx-adaptive nsplit (glm_nsplit, from glm-tune-flash).
     // nh_l (not global c.heads) so the fill target matches this rank's actual work-item count.
@@ -1788,11 +2083,37 @@ pub(crate) fn declare_glm_rows_batched(
     // rows*nh_l*pf_ns partials (each split a ceil-equal share of its tile's causal range;
     // dead splits carry m=-inf/l=0, which d_mla_merge_fold weighs 0 branch-free — the old
     // "empty split divides the merge" objection predates that merge rewrite).
-    let osplits = (ns * dbatch).max(rows as u32 * glm_pf_ns());
+    let small_cap = glm_small_pf_split_cap(c, b.n_cu(), 128, false);
+    let small_partials = if small_cap > 1 { 128 * small_cap } else { 0 };
+    let osplits = (ns * dbatch).max(rows as u32 * glm_pf_ns()).max(small_partials);
     let opart = ac(b, "opart", (nh_l * osplits * dk) as u64 * F32);
     let mlpart = ac(b, "mlpart", (nh_l * osplits * 2) as u64 * F32);
     let olat = ac(b, "olat", (nh_l * dk) as u64 * BF16);
     let oat = ac(b, "oat", rows * (nh_l * vd) as u64 * BF16);
+    // ROW-SPLIT arm scratch. Same total element count as qa/qr/oat (`nh * rows/8 == nh_l * rows`
+    // since `nh == nh_l * tp` and this rank's row band is `rows/tp`), so turning the knob on
+    // costs exactly the peer-slot moves above plus these three buffers — no hidden growth.
+    // `qa_rs`/`qr_rs` are the Q all-to-all's ordinary (non-peer) destinations; `oat_rs` is the
+    // row-split fold's PEER-VISIBLE source for the all-to-all back into `oat`.
+    assert!(
+        !rowsplit_attn || rows % u64::from(tp) == 0,
+        "PLOW_GLM_ROWSPLIT_ATTN requires the prefill row capacity to divide TP evenly (rows={rows}, tp={tp})"
+    );
+    let qa_rs = if rowsplit_attn {
+        ac(b, "qa_rs", (rows / u64::from(tp)) * (nh * dk) as u64 * BF16)
+    } else {
+        TENSOR_NONE
+    };
+    let qr_rs = if rowsplit_attn {
+        ac(b, "qr_rs", (rows / u64::from(tp)) * (nh * dr) as u64 * BF16)
+    } else {
+        TENSOR_NONE
+    };
+    let oat_rs = if rowsplit_attn {
+        ac(b, "oat_rs_tp", (rows / u64::from(tp)) * (nh * vd) as u64 * BF16)
+    } else {
+        TENSOR_NONE
+    };
     let attn = ac(b, "attn", rows * h as u64 * BF16);
     let xmid = ac(b, "xmid", rows * h as u64 * BF16);
     let xn2 = ac(b, "xn2", rows * h as u64 * BF16);
@@ -1800,7 +2121,14 @@ pub(crate) fn declare_glm_rows_batched(
     // token-sorted, so the routing table, the [T,n_exp] logits, the shared-expert lanes and the
     // per-slot partials all carry T tokens); `fu`/`dfu` are the DECODE per-slot buffers and stay
     // one row — prefill's gathered equivalent is `fu_g` below, sized on the padded row bound.
-    let tab = ac(b, "tab", rows * tk as u64 * 8);
+    // PLOW_GLM_MOE_SHARED_FOLD widens the routing SLOT count (`k+1` per token: the top-k plus the
+    // constant shared slot) and the EXPERT count (`n_exp+1`) — `glm_shared_fold`. The router still
+    // scores only the `n_exp` routed experts, so `rlogit` is untouched. These are arena
+    // allocations shared with the decode programs, which keep routing top-k out of n_exp; a wider
+    // buffer is a superset for them.
+    let fold = glm_shared_fold(c, enc);
+    let (e_all, tk_all) = (e + u32::from(fold), tk + u32::from(fold));
+    let tab = ac(b, "tab", rows * tk_all as u64 * 8);
     let rlogit = ac(b, "rlogit", rows * e as u64 * BF16); // router score output [T][n_exp] bf16
     let shfu = ac(b, "shfu", rows * imoe_l as u64 * BF16);
     // The `up` half of the shared expert's GLU. Needed on the MXFP4 PREFILL arm, where the absence
@@ -1814,7 +2142,8 @@ pub(crate) fn declare_glm_rows_batched(
             // TASK-9 FIT GATE: the bf16 shared expert also splits into two halves + Glu
             // when rows*K exceeds the staged-LDS fit (see the emit site), and the up half
             // needs this buffer.
-            || rows as u64 * h as u64 > crate::gm_lds_halves()))
+            || rows as u64 * h as u64 > crate::gm_lds_halves()
+            || glm_lt_pf_ext().shared))
         || glm_shared_glu_split(enc)
     {
         ac(b, "shfu_up", rows * imoe_l as u64 * BF16)
@@ -1840,45 +2169,46 @@ pub(crate) fn declare_glm_rows_batched(
     // gathered-row bound: the align op pads each expert's row range up to a whole MPF_BM tile, so
     // every expert can waste at most MPF_BM-1 rows. Sizing this from T*k alone is an out-of-bounds
     // device write with no symptom at low expert counts and a guaranteed one at 384.
-    let (meta, row_token, row_partidx, row_gate, fu_g, fu_scale) = if rows > 1 {
-        let pad_rows = rows * tk as u64 + (e * (MPF_BM - 1)) as u64;
-        // The gathered GLU output is bf16 on the bf16/block-fp8 arms and PACKED fp4 under A4W4 —
-        // half a byte per value plus one E8M0 byte per 32. The buffer is sized for whichever the
-        // packet asks for; the fp4 form is SMALLER, so a bf16-sized allocation would merely waste,
-        // but the E8M0 rows have no bf16 counterpart and must be declared or the bridge writes to a
-        // null handle.
-        let fug_bytes = match enc {
-            MoeEnc::Mxfp4 => pad_rows * (imoe_e / 2) as u64,
-            _ => pad_rows * imoe_e as u64 * BF16,
-        };
-        const ALIGN_BLOCKS: u64 = 64;
-        let align_extra = if emit_config::active().moe_align_par && rows >= 1024 {
-            ALIGN_BLOCKS * e as u64
-        } else {
-            0
-        };
-        (
-            ac(b, "moe_meta", ((3 * e + 1) as u64 + align_extra) * I32),
-            ac(b, "moe_rowtok", pad_rows * I32),
-            ac(b, "moe_rowpart", pad_rows * I32),
-            ac(b, "moe_rowgate", pad_rows * F32),
-            ac(b, "moe_fug", fug_bytes),
-            if enc == MoeEnc::Mxfp4 {
-                ac(b, "moe_fuscale", pad_rows * (imoe_e / MX_BLOCK) as u64)
+    let (meta, row_token, row_partidx, row_gate, fu_g, fu_scale) =
+        if rows > 1 || emit_config::active().glm_moe_resident() {
+            let pad_rows = rows * tk_all as u64 + (e_all * (MPF_BM - 1)) as u64;
+            // The gathered GLU output is bf16 on the bf16/block-fp8 arms and PACKED fp4 under A4W4 —
+            // half a byte per value plus one E8M0 byte per 32. The buffer is sized for whichever the
+            // packet asks for; the fp4 form is SMALLER, so a bf16-sized allocation would merely waste,
+            // but the E8M0 rows have no bf16 counterpart and must be declared or the bridge writes to a
+            // null handle.
+            let fug_bytes = match enc {
+                MoeEnc::Mxfp4 => pad_rows * (imoe_e / 2) as u64,
+                _ => pad_rows * imoe_e as u64 * BF16,
+            };
+            const ALIGN_BLOCKS: u64 = 64;
+            let align_extra = if emit_config::active().moe_align_par && rows >= 1024 {
+                ALIGN_BLOCKS * e_all as u64
             } else {
-                TENSOR_NONE
-            },
-        )
-    } else {
-        (
-            TENSOR_NONE,
-            TENSOR_NONE,
-            TENSOR_NONE,
-            TENSOR_NONE,
-            TENSOR_NONE,
-            TENSOR_NONE,
-        )
-    };
+                0
+            };
+            (
+                ac(b, "moe_meta", ((3 * e_all + 1) as u64 + align_extra) * I32),
+                ac(b, "moe_rowtok", pad_rows * I32),
+                ac(b, "moe_rowpart", pad_rows * I32),
+                ac(b, "moe_rowgate", pad_rows * F32),
+                ac(b, "moe_fug", fug_bytes),
+                if enc == MoeEnc::Mxfp4 {
+                    ac(b, "moe_fuscale", pad_rows * (imoe_e / MX_BLOCK) as u64)
+                } else {
+                    TENSOR_NONE
+                },
+            )
+        } else {
+            (
+                TENSOR_NONE,
+                TENSOR_NONE,
+                TENSOR_NONE,
+                TENSOR_NONE,
+                TENSOR_NONE,
+                TENSOR_NONE,
+            )
+        };
     let xnext = ac(b, "xnext", rows * h as u64 * BF16);
     let logits = ac(b, "logits", dbatch as u64 * glm_vocab_l(c) as u64 * BF16);
     let amax = ac(b, "amax.part", dbatch as u64 * AMAX_BLOCKS as u64 * 8);
@@ -1908,6 +2238,22 @@ pub(crate) fn declare_glm_rows_batched(
     } else {
         TENSOR_NONE
     };
+    // The host lays out six peer slots once a packet carries the split collectives and requires
+    // all three result names; only slot 3 is written here.
+    let (h2_tp, xe_tp, rt_tp) = if sp_seams {
+        (
+            ac(b, "h2_tp", rows * h as u64 * BF16),
+            ac(b, "xe_tp", rows * h as u64 * BF16),
+            ac(b, "rt_tp", rows * h as u64 * BF16),
+        )
+    } else {
+        (TENSOR_NONE, TENSOR_NONE, TENSOR_NONE)
+    };
+    let ug_tp = if sp_seams && emit_config::active().glm_seq_par_proj() {
+        ac(b, "ug_tp", rows * h as u64 * BF16)
+    } else {
+        TENSOR_NONE
+    };
 
     // --- DSA lightning indexer scratch (ctx>2048 only). qidx/kidx/widx are per-step; iscore/iidx/
     //     ighist/igctl are the score+select scratch (shared across layers — decode runs them
@@ -1920,20 +2266,42 @@ pub(crate) fn declare_glm_rows_batched(
     // consumes it: the wq_b/wk/k_norm/weights_proj weights, the per-layer key cache, and the
     // identity-tail RoPE tables.
     let idx_on = dsa || c.dsa_pf();
+    // PLOW_GLM_SELECT_SPLIT selects every decode row at once, so each row gets its own
+    // histogram, control, bitmap and candidate strip; otherwise the one strip the serialized
+    // chain shares.
+    let sel_rows = if dsa && dbatch > 1 && glm_select_split_on() {
+        dbatch as usize
+    } else {
+        1
+    };
+    let (ibits, icand) = if sel_rows > 1 {
+        (
+            ac(b, "ibits", sel_rows as u64 * ctx.div_ceil(32) as u64 * 4),
+            ac(b, "icand", sel_rows as u64 * ctx as u64 * 8),
+        )
+    } else {
+        (TENSOR_NONE, TENSOR_NONE)
+    };
     let (qidx, kidx_raw, kidx_normed, widx, iscore, iidx, ighist, igctl) = if dsa {
         (
-            ac(b, "qidx", (hi * di) as u64 * BF16),
-            ac(b, "kidx_raw", di as u64 * BF16),
-            ac(b, "kidx_normed", di as u64 * BF16),
-            ac(b, "widx", hi as u64 * BF16),
-            ac(b, "iscore", ctx as u64 * F32),
+            ac(b, "qidx", dbatch as u64 * (hi * di) as u64 * BF16),
+            ac(b, "kidx_raw", dbatch as u64 * di as u64 * BF16),
+            ac(b, "kidx_normed", dbatch as u64 * di as u64 * BF16),
+            ac(b, "widx", dbatch as u64 * hi as u64 * BF16),
+            ac(b, "iscore", dbatch as u64 * ctx as u64 * F32),
             // `+ (index_kpool - 1)` headroom for `DsaPoolExpand`'s tail-append (`topk +
             // pool_size - 1` output slots, see its packet doc comment) — a no-op at
             // index_kpool==1 (`c.index_kpool.max(1) - 1 == 0`), so GLM-5.2's `iidx` byte size
             // is unchanged.
-            ac(b, "iidx", select_width as u64 * I32),
-            b.tensor_init("act.ighist", vec![0u8; 7 * 256 * 4]),
-            b.tensor_init("act.igctl", vec![0u8; 3 * 4]),
+            ac(b, "iidx", dbatch as u64 * select_width as u64 * I32),
+            b.tensor_init(
+                "act.ighist",
+                vec![0u8; if sel_rows > 1 { sel_rows * GLM_SELECT_SPLIT_NB * 4 } else { 7 * 256 * 4 }],
+            ),
+            b.tensor_init(
+                "act.igctl",
+                vec![0u8; if sel_rows > 1 { sel_rows * GLM_SELECT_SPLIT_CTL * 4 } else { 3 * 4 }],
+            ),
         )
     } else {
         (
@@ -2017,6 +2385,11 @@ pub(crate) fn declare_glm_rows_batched(
             TENSOR_NONE,
         )
     };
+    let kidx_pf = if kidx_pf == TENSOR_NONE && idx_on && c.index_kpool == 1 {
+        ac(b, "kidx_pf", rows64 * di as u64 * BF16)
+    } else {
+        kidx_pf
+    };
     let pool_pf_on = dsa_pf && c.index_kpool > 1;
     let (gate_score_pf, q_fp8_pf, q_scale_pf, widx_f32_pf, iidx_pool_pf) = if pool_pf_on {
         (
@@ -2041,6 +2414,16 @@ pub(crate) fn declare_glm_rows_batched(
     };
 
     let lin_fp8 = glm_linear_fp8(enc);
+    // Declared only where a >=2048-row prefill bucket exists; decode never reads them.
+    let blk = if rows >= 2048 {
+        glm_gemm_blk()
+    } else {
+        GlmBlk::default()
+    };
+    assert!(
+        !blk.any() || (enc != MoeEnc::Mxfp4 && !lin_fp8 && !glm_ofold(enc)),
+        "PLOW_GLM_GEMM_BLK excludes MXFP4, GLM_LINEAR_FP8 and PLOW_GLM_OFOLD"
+    );
     // The checkpoint's weight namespace, from the cfg — NOT the literal `model.` these closures
     // used to carry. `kv.*` above stays compiler-owned and is deliberately not prefixed.
     let pfx = c.prefix.as_str();
@@ -2324,6 +2707,18 @@ pub(crate) fn declare_glm_rows_batched(
             } else {
                 TENSOR_NONE
             },
+            // `full == want` in `crates/plowrt/src/asset/shard.rs`'s `slice_for` turns this
+            // tensor's normally-Column shard into Replicated (the same mechanism Kimi-K3's
+            // shared-expert weights already use), so no new binding-path code is needed to
+            // present all `nh` heads. See `GlmLw::wuv_full`.
+            wuv_full: if mla
+                && emit_config::active().glm_rowsplit_attn()
+                && glm_rowsplit_attn_eligible(c, l, full)
+            {
+                t(b, "self_attn.derived.v_absorb.weight", (nh * dk * vd) as u64 * BF16)
+            } else {
+                TENSOR_NONE
+            },
             wo: if !mla {
                 TENSOR_NONE
             } else if lin_fp8 {
@@ -2391,13 +2786,22 @@ pub(crate) fn declare_glm_rows_batched(
                     imoe_l as u64,
                 )
             },
+            // `_sf` under PLOW_GLM_MOE_SHARED_FOLD: same [E][3] u64 layout, one entry LONGER, and
+            // its last entry is the SHARED expert. The suffix is the whole signal the loader gets
+            // — `bind_packed_experts` resolves `{gate,up,down}` for entry `n_exp` under
+            // `shared_experts.` instead of `experts.{e}.` — and it follows the `_ep` / `_pf` /
+            // `_moe2` companion-table convention already in this table.
             ewt: if dense {
                 TENSOR_NONE
+            } else if fold {
+                t(b, "mlp.expert_weight_table_sf", (e_all * 3) as u64 * 8)
             } else {
                 t(b, "mlp.expert_weight_table", (e * 3) as u64 * 8)
             },
             est: if dense {
                 TENSOR_NONE
+            } else if fold {
+                t(b, "mlp.expert_scale_table_sf", (e_all * 3) as u64 * 8)
             } else {
                 t(b, "mlp.expert_scale_table", (e * 3) as u64 * 8)
             },
@@ -2424,9 +2828,21 @@ pub(crate) fn declare_glm_rows_batched(
             // Dense-FFN weights. Block-fp8 keeps the checkpoint's own byte layout and its
             // [N/128][K/128] f32 `weight_scale_inv` grid; MXFP4 halves the weight and swaps the
             // grid for E8M0 rows. `mxd`/`mxd_s` pick per encoding so the two never disagree.
+            //
+            // BF16 IS ITS OWN ARM, and it has to be. The catch-all used to size every non-MXFP4
+            // dense weight at ONE byte per element and declare a `weight_scale_inv` beside it,
+            // which is block-fp8's layout, not bf16's. Kimi-K2.7-Code's `ignore` list excludes
+            // `mlp.(gate|up|gate_up|down)_proj` from quantization, so its dense weights really
+            // are BF16 [18432, 7168] with no scale grid at all -- and the catch-all declared
+            // 132,120,576 bytes for a 264,241,152-byte tensor. The grouped prefill arm, correctly
+            // told `fp8=0`, then read two bytes per element out of a half-sized allocation and
+            // walked off the end: `Memory access fault by GPU node-8 ... Reason: Unknown` on the
+            // dense block, while the MoE block in the same lease ran clean. Sizing follows the
+            // encoding here so a bf16 dense layer cannot be handed an fp8 footprint again.
             dgate: if dense {
                 match enc {
                     MoeEnc::Mxfp4 => t(b, "mlp.gate_proj.weight", (di_l * h) as u64 / 2),
+                    MoeEnc::Bf16 => t(b, "mlp.gate_proj.weight", (di_l * h) as u64 * BF16),
                     _ => t(b, "mlp.gate_proj.weight", (di_l * h) as u64),
                 }
             } else {
@@ -2435,6 +2851,9 @@ pub(crate) fn declare_glm_rows_batched(
             dgate_s: if dense {
                 match enc {
                     MoeEnc::Mxfp4 => mxs(b, "mlp.gate_proj.weight", di_l as u64, h as u64),
+                    // bf16 dense carries NO scale grid; declaring one invents a tensor the
+                    // checkpoint does not have and desynchronises the arm from the weight.
+                    MoeEnc::Bf16 => TENSOR_NONE,
                     _ => t(
                         b,
                         "mlp.gate_proj.weight_scale_inv",
@@ -2447,6 +2866,7 @@ pub(crate) fn declare_glm_rows_batched(
             dup: if dense {
                 match enc {
                     MoeEnc::Mxfp4 => t(b, "mlp.up_proj.weight", (di_l * h) as u64 / 2),
+                    MoeEnc::Bf16 => t(b, "mlp.up_proj.weight", (di_l * h) as u64 * BF16),
                     _ => t(b, "mlp.up_proj.weight", (di_l * h) as u64),
                 }
             } else {
@@ -2455,6 +2875,7 @@ pub(crate) fn declare_glm_rows_batched(
             dup_s: if dense {
                 match enc {
                     MoeEnc::Mxfp4 => mxs(b, "mlp.up_proj.weight", di_l as u64, h as u64),
+                    MoeEnc::Bf16 => TENSOR_NONE,
                     _ => t(b, "mlp.up_proj.weight_scale_inv", (db_l * hb) as u64 * F32),
                 }
             } else {
@@ -2463,6 +2884,7 @@ pub(crate) fn declare_glm_rows_batched(
             ddown: if dense {
                 match enc {
                     MoeEnc::Mxfp4 => t(b, "mlp.down_proj.weight", (h * di_l) as u64 / 2),
+                    MoeEnc::Bf16 => t(b, "mlp.down_proj.weight", (h * di_l) as u64 * BF16),
                     _ => t(b, "mlp.down_proj.weight", (h * di_l) as u64),
                 }
             } else {
@@ -2471,6 +2893,7 @@ pub(crate) fn declare_glm_rows_batched(
             ddown_s: if dense {
                 match enc {
                     MoeEnc::Mxfp4 => mxs(b, "mlp.down_proj.weight", h as u64, di_l as u64),
+                    MoeEnc::Bf16 => TENSOR_NONE,
                     _ => t(
                         b,
                         "mlp.down_proj.weight_scale_inv",
@@ -2581,9 +3004,64 @@ pub(crate) fn declare_glm_rows_batched(
             } else {
                 TENSOR_NONE
             },
+            blk_qad: if mla && blk.q_a {
+                q8(b, "self_attn.q_a_proj", ql as u64, h as u64)
+            } else {
+                TENSOR_NONE
+            },
+            blk_qad_s: if mla && blk.q_a {
+                q8s(b, "self_attn.q_a_proj", ql as u64, h as u64)
+            } else {
+                TENSOR_NONE
+            },
+            blk_ckvd: if mla && blk.kv_a {
+                q8(b, "self_attn.derived.kv_a_latent", dk as u64, h as u64)
+            } else {
+                TENSOR_NONE
+            },
+            blk_ckvd_s: if mla && blk.kv_a {
+                q8s(b, "self_attn.derived.kv_a_latent", dk as u64, h as u64)
+            } else {
+                TENSOR_NONE
+            },
+            blk_iwqb: if full && blk.wq_b {
+                q8(b, "self_attn.indexer.wq_b", (hi * di) as u64, ql as u64)
+            } else {
+                TENSOR_NONE
+            },
+            blk_iwqb_s: if full && blk.wq_b {
+                q8s(b, "self_attn.indexer.wq_b", (hi * di) as u64, ql as u64)
+            } else {
+                TENSOR_NONE
+            },
+            blk_wo: if mla && blk.o_proj {
+                q8(b, "self_attn.o_proj", h as u64, (nh_l * vd) as u64)
+            } else {
+                TENSOR_NONE
+            },
+            blk_wo_s: if mla && blk.o_proj {
+                q8s(b, "self_attn.o_proj", h as u64, (nh_l * vd) as u64)
+            } else {
+                TENSOR_NONE
+            },
         });
     }
 
+    let blk_xq = if blk.any() {
+        ac(b, "blk_xq", rows * h as u64)
+    } else {
+        TENSOR_NONE
+    };
+    let blk_xs = if blk.any() {
+        ac(b, "blk_xs", rows * (h / 128) as u64 * F32)
+    } else {
+        TENSOR_NONE
+    };
+    let blk_bias = if blk.any() {
+        ac(b, "blk_bias", h as u64 * F32)
+    } else {
+        TENSOR_NONE
+    };
     GlmTn {
         ids,
         pos,
@@ -2606,6 +3084,9 @@ pub(crate) fn declare_glm_rows_batched(
         mlpart,
         olat,
         oat,
+        qa_rs,
+        qr_rs,
+        oat_rs,
         attn,
         xmid,
         xn2,
@@ -2626,12 +3107,19 @@ pub(crate) fn declare_glm_rows_batched(
         // Slot A is [0, rows*h*2); slot B starts where it ends. `rows == 1` (a decode-only emit)
         // gives `h*2`, the value every shipped decode blob already carries.
         slot_b: rows as u32 * h * BF16 as u32,
+        h2_tp,
+        ug_tp,
+        xe_tp,
+        rt_tp,
         meta,
         row_token,
         row_partidx,
         row_gate,
         fu_g,
         fu_scale,
+        blk_xq,
+        blk_xs,
+        blk_bias,
         qidx_pf,
         kidx_pf,
         widx_pf,
@@ -2647,6 +3135,8 @@ pub(crate) fn declare_glm_rows_batched(
         iidx,
         ighist,
         igctl,
+        ibits,
+        icand,
         icos,
         isin,
         gate_score,
@@ -2778,6 +3268,14 @@ fn spine_cus(n_cu: u32) -> Vec<u32> {
     {
         Some(k) if k > 1 => (0..k.min(n_cu)).collect(),
         _ => vec![0u32],
+    }
+}
+
+fn decode_norm_cus(n_cu: u32, rows: u32) -> Vec<u32> {
+    if emit_config::active().glm_decode_norm_rows() {
+        (0..rows.min(n_cu)).collect()
+    } else {
+        vec![0]
     }
 }
 
@@ -3004,6 +3502,62 @@ pub(crate) fn blocked_gemv_cus_tuned(cus: &[u32], n: u32, k: u32) -> Vec<u32> {
     scoped
 }
 
+fn glm_decode_gemv_cus(cus: &[u32], op: DevOp, n: u32, k: u32) -> Vec<u32> {
+    if op == DevOp::Gemv && emit_config::active().gemv_wg_for(n, k).is_some() {
+        blocked_gemv_cus_tuned(cus, n, k)
+    } else {
+        cus.to_vec()
+    }
+}
+
+/// Whether [`emit_glm_decode_gemm_lt`] routes a `rows`-row decode projection of `shape` to the
+/// native GEMM.
+fn glm_decode_lt_routes(rows: u32, shape: [u32; 2]) -> bool {
+    let cfg = emit_config::active();
+    // The EXT set: rung 8, and the narrow projections whose MM16 GEMV moves 14-65 GB/s
+    // (k_rope, q_rope, indexer k/weights, lm_head). Measured against the pinned kernels on one
+    // MI300X; see docs/flags-reference.md `PLOW_GLM_GEMM_LT_DECODE_EXT`.
+    let ext = cfg.glm_gemm_lt_decode_ext();
+    let rows_ok = matches!(rows, 16 | 20) || (ext && rows == 8);
+    let shape_ok = matches!(
+        shape,
+        [2048, 6144] | [512, 6144] | [4096, 2048] | [6144, 2048] | [256, 6144] | [6144, 256]
+    ) || (ext
+        && matches!(
+            shape,
+            [64, 6144] | [512, 2048] | [128, 6144] | [32, 6144] | [19360, 6144]
+        ));
+    cfg.glm_gemm_lt_decode() && rows_ok && shape_ok
+}
+
+fn emit_glm_decode_gemm_lt(
+    b: &mut Builder,
+    c: &GlmCfg,
+    enc: MoeEnc,
+    rows: u32,
+    operands: [u32; 3],
+    shape: [u32; 2],
+    deps: &[u32],
+) -> Option<u32> {
+    if !glm_decode_lt_routes(rows, shape) {
+        return None;
+    }
+    assert!(
+        crate::emit_is_amd()
+            && c.tp == 8
+            && c.hidden == 6144
+            && b.n_cu() == 304
+            && enc != MoeEnc::Mxfp4,
+        "native GLM decode GEMM requires gfx942 TP8 BF16 projections"
+    );
+    let counter = b.emit(DevOp::GemmLtPf, vec![0], deps, |d| {
+        d.t[..3].copy_from_slice(&operands);
+        d.i[..4].copy_from_slice(&[rows, shape[0], shape[1], 1]);
+    });
+    b.isolate(counter);
+    Some(counter)
+}
+
 /// Emit the shared MLA attention sub-block (input norm -> q/kv down + absorbed folds -> dynamic
 /// interleaved RoPE on the 64 rope dims -> FLASH_MLA_DECODE -> merge -> O_UV_FOLD -> o_proj ->
 /// residual -> post-attention norm). Writes `n.xn2` (the FFN input) and returns the post-attn-norm
@@ -3059,7 +3613,11 @@ pub(crate) fn emit_glm_mla(
         } else {
             DevOp::Gemv
         };
-        b.emit(op, all.clone(), deps, |d| {
+        if let Some(counter) = emit_glm_decode_gemm_lt(b, c, enc, rows, [out, x, wt], [nn, k], deps)
+        {
+            return counter;
+        }
+        b.emit(op, glm_decode_gemv_cus(&all, op, nn, k), deps, |d| {
             d.t[0] = out;
             d.t[1] = x;
             d.t[2] = wt;
@@ -3123,7 +3681,7 @@ pub(crate) fn emit_glm_mla(
         );
         pre[0]
     } else {
-        b.emit(DevOp::RmsNorm, one.clone(), pre, |d| {
+        b.emit(DevOp::RmsNorm, decode_norm_cus(b.n_cu(), rows), pre, |d| {
             d.t[0] = n.xn;
             d.t[1] = x_in;
             d.t[2] = w.gin;
@@ -3178,6 +3736,28 @@ pub(crate) fn emit_glm_mla(
             },
         )
     };
+    // PLOW_GLM_DECODE_GEMM_GROUP: on a full-indexer layer the indexer's k and weights projections
+    // read `xn` like q_a/kv_a/k_rope, and its q projection reads `qlat` like q_absorb/q_rope. Emit
+    // each next to its siblings so the native GEMMs form two adjacent runs. Same instructions and
+    // dependencies as `emit_glm_dsa_decode_select`, which then skips them.
+    let (idx_hi, idx_di) = (c.index_heads, c.index_dim);
+    let idx_group = emit_config::active().glm_decode_gemm_group()
+        && c.dsa(ctx)
+        && w.iwqb != TENSOR_NONE
+        && c.index_kpool <= 1
+        && [[idx_hi * idx_di, ql], [idx_di, h], [idx_hi, h]]
+            .into_iter()
+            .all(|s| glm_decode_lt_routes(rows, s));
+    let pre_idx_kw = idx_group.then(|| {
+        [
+            ([n.kidx_raw, n.xn, w.iwk], [idx_di, h]),
+            ([n.widx, n.xn, w.iwp], [idx_hi, h]),
+        ]
+        .map(|(ops, shape)| {
+            emit_glm_decode_gemm_lt(b, c, enc, rows, ops, shape, &[c_rn1])
+                .expect("routed to the native GEMM")
+        })
+    });
     // 3 q_a_layernorm
     //
     // Q-NORM FOLD (`PLOW_GLM_FUSE_QNORM=1`, opt-in): fusion G's GemvQkv computes this norm
@@ -3219,14 +3799,19 @@ pub(crate) fn emit_glm_mla(
     let c_rnq = if fuse_qnorm {
         c_qad
     } else {
-        b.emit(DevOp::RmsNorm, one.clone(), &[c_qad], |d| {
-            d.t[0] = n.qlat;
-            d.t[1] = n.qlr;
-            d.t[2] = w.gqa;
-            d.i[0] = rows;
-            d.i[1] = ql;
-            d.f[0] = eps;
-        })
+        b.emit(
+            DevOp::RmsNorm,
+            decode_norm_cus(b.n_cu(), rows),
+            &[c_qad],
+            |d| {
+                d.t[0] = n.qlat;
+                d.t[1] = n.qlr;
+                d.t[2] = w.gqa;
+                d.i[0] = rows;
+                d.i[1] = ql;
+                d.f[0] = eps;
+            },
+        )
     };
     // 4/5 absorbed q_nope (Wqa: QL -> NH_l*DK) and q_rope raw down (Wqr: QL -> NH_l*DR). FUSION G
     //   (audit §G): both read n.qlat with K=ql, so fuse into ONE GemvQkv with Nv=0 (q half + k half).
@@ -3287,6 +3872,19 @@ pub(crate) fn emit_glm_mla(
         };
         (qa_dep, qr_dep)
     };
+    let pre_idx = pre_idx_kw.map(|[c_k0, c_w]| {
+        let c_q0 = emit_glm_decode_gemm_lt(
+            b,
+            c,
+            enc,
+            rows,
+            [n.qidx, n.qlat, w.iwqb],
+            [idx_hi * idx_di, ql],
+            &[c_rnq],
+        )
+        .expect("routed to the native GEMM");
+        [c_q0, c_k0, c_w]
+    });
     // The decode ropes take DISJOINT slices of `all` (see `rope_cus`): q needs ceil(nh_l/8)
     // workgroups, the shared-head k rope needs 1, and the two are concurrent siblings.
     let rq = if dr > 0 {
@@ -3347,23 +3945,34 @@ pub(crate) fn emit_glm_mla(
     //   kv_row_writer scan patches its i[3]; the bf16 RmsNorm writer's row is i[2].
     let fp8kv = glm_fp8_kv();
     assert!(
-        !(fp8kv && rows > 1),
-        "PLOW_GLM_FP8_KV=1 with a batched decode program (rows={rows}): the fp8 latent writer's \
-         batch-ring form is unvalidated on GLM. Emit the ladder blob without fp8-KV."
+        !(fp8kv && dbatch > 1 && !c.dsa(ctx)),
+        "batched GLM FP8 KV requires the qualified sparse AMD decode path"
     );
+    // PLOW_GLM_DECODE_GLUE_CUS: the fp8 writer is one WAVE per row (`d_headnorm_rope_fp8`
+    // strides `w` by `nblk*PLOW_WAVES`), so at rows > 8 one workgroup serialises rows; size it
+    // like the k-rope beside it. Bit-identical: only the row->wave partition moves.
+    let kvw_cus = if emit_config::active().glm_decode_glue_cus {
+        rope_cus(&all, 0, rows, 1)
+    } else {
+        one.clone()
+    };
     let c_rnkv = if fp8kv {
-        b.emit(DevOp::HeadNormRopeFp8, one.clone(), &[c_ckvd], |d| {
+        b.emit(DevOp::HeadNormRopeFp8, kvw_cus, &[c_ckvd], |d| {
             d.t[0] = n.ckv[slot];
             d.t[1] = n.ckvraw;
             d.t[2] = w.gkva;
             d.t[5] = n.pos;
             d.t[6] = n.kv_scale[slot];
-            d.i[0] = 1;
+            d.i[0] = rows;
             d.i[1] = 1;
             d.i[2] = dk;
             d.i[3] = 0; // row, patched per step
             d.i[4] = 0; // apply RMSNorm before quantizing
             d.f[0] = eps;
+            if rows > 1 || dbatch > 1 {
+                d.i[6] = rows;
+                d.j[0] = ctx;
+            }
             d.j[1] = KV_MASK_NONE;
         })
     } else if rows > 1 || dbatch > 1 {
@@ -3448,14 +4057,14 @@ pub(crate) fn emit_glm_mla(
     let full = dsa && w.iwqb != TENSOR_NONE; // 'full' indexer layer (weights bound only there)
     let itk = c.index_topk.min(ctx);
     let c_sel = emit_glm_dsa_decode_select(
-        b, c, n, w, slot, ctx, rows, enc, &all, eps, ql, h, c_rnq, c_rn1, &rq, &rk,
+        b, c, n, w, slot, ctx, rows, dbatch, enc, &all, eps, ql, h, c_rnq, c_rn1, &rq, &rk, pre_idx,
     );
     // 9 FLASH (MLA) DECODE — dense (ctx<=2048) or GATHER over the top_k selected latent rows (ctx>2048).
     //   Runs this rank's nh_l head-shard; the latent ckv/krot caches are REPLICATED (all heads read
     //   the same shared latent), so the cache stays full-width on every rank. Under DSA the flash reads
     //   ONLY the top_k rows via n.iidx (constant work ~ top_k regardless of ctx).
     let ns_attn = if dsa {
-        glm_nsplit(itk, nh_l)
+        glm_dsa_decode_nsplit(rows, nh_l, glm_gf(ctx, nh_l), b.n_cu())
     } else {
         glm_nsplit(ctx, nh_l)
     };
@@ -3469,13 +4078,6 @@ pub(crate) fn emit_glm_mla(
     }
     //   Sized to `n_batch*n_tok*(nh_l/GF)*nsplit` (`flash_mla_cus`), which is exactly `n_cu` at
     //   GF=4 and half of it at GF=2 — see the helper for why the two do not cancel.
-    // `FlashGatherDecode` has no fp8 twin (t7 = idx table, where the scales would live), so a
-    // gathered packet would read fp8 latent bytes as bf16 — refuse the combination at emit.
-    assert!(
-        !(fp8kv && dsa),
-        "PLOW_GLM_FP8_KV=1 with an armed DSA gate (ctx={ctx}): FlashGatherDecode keeps its bf16 \
-         arm in the fp8kv object and cannot dequant an fp8 latent. Set PLOW_GLM_DSA=0."
-    );
     // The q-rope fold spends `t[7]` (cos) and `i[6]` (sin, as a demoted handle — the
     // `DevOp::GemvQkvg` rule). BOTH other features on this packet already own those two slots:
     // GATHER puts its idx table in t7 and its top_k in i6, fp8-KV puts its per-row scale strip
@@ -3493,11 +4095,22 @@ pub(crate) fn emit_glm_mla(
             "PLOW_GLM_FP8_KV=1"
         }
     );
+    if dsa && fp8kv {
+        assert!(
+            nh_l == 8
+                && dk == 512
+                && dr == 64
+                && rows <= 20
+                && glm_gf(ctx, nh_l) == 4
+                && glm_dsa_select_width(c, ctx) == 2048,
+            "sparse FP8 decode requires qualified QH8 latent512/rope64 GF4 geometry"
+        );
+    }
     let c_fl = b.emit(
         match (dsa, fp8kv) {
-            (true, _) => DevOp::FlashGatherDecode,
+            (_, true) => DevOp::FlashMlaDecodeFp8,
+            (true, false) => DevOp::FlashGatherDecode,
             (false, false) => DevOp::FlashMlaDecode,
-            (false, true) => DevOp::FlashMlaDecodeFp8,
         },
         flash_mla_cus(&all, rows, 1, nh_l, glm_gf(ctx, nh_l), ns_attn),
         &fl_deps,
@@ -3543,11 +4156,21 @@ pub(crate) fn emit_glm_mla(
                 d.i[6] = 0; // krot stays bf16 (the shipped K3 form)
             }
             if dsa {
-                d.t[7] = n.iidx; // idx table (this or the last full layer's selection)
+                if fp8kv {
+                    d.j[0] = n.iidx + 1;
+                } else {
+                    d.t[7] = n.iidx;
+                }
                 d.i[6] = glm_dsa_select_width(c, ctx); // fixed selection-row width
             }
         },
     );
+    // Native sparse decode boundary (PLOW_GLM_MLA_DEC_AITER): the runtime routes the isolated
+    // segment through the pinned AITER QH8 object and runs this arm on steps where any row
+    // holds fewer than 2048 keys.
+    if dsa && fp8kv && emit_config::active().glm_mla_dec_aiter {
+        b.isolate(c_fl);
+    }
     // 10 FUSED MLA MERGE+FOLD: online-softmax-merge the ns_attn latent partials (Opart/mlpart) in
     //    LDS, then fold olat @ W_uv straight to v_head_dim — replaces FLASH_MERGE<512> + O_UV_FOLD,
     //    killing the Olat[nh_l*DK] HBM round-trip and one dependency gate (validated rms ~0.004;
@@ -3641,16 +4264,21 @@ pub(crate) fn emit_glm_mla(
     //   whereas the split path norms the bf16-rounded xmid, so this is algebraically exact but NOT
     //   guaranteed byte-identical to the split — the decode stream is verified before it is kept.
     if fuse_b1 {
-        b.emit(DevOp::AddNorm, one.clone(), &[c_op], |d| {
-            d.t[0] = n.xn2;
-            d.t[1] = n.xmid;
-            d.t[2] = x_in;
-            d.t[3] = n.attn;
-            d.t[4] = w.gpost;
-            d.i[0] = rows;
-            d.i[1] = h;
-            d.f[0] = eps;
-        })
+        b.emit(
+            DevOp::AddNorm,
+            decode_norm_cus(b.n_cu(), rows),
+            &[c_op],
+            |d| {
+                d.t[0] = n.xn2;
+                d.t[1] = n.xmid;
+                d.t[2] = x_in;
+                d.t[3] = n.attn;
+                d.t[4] = w.gpost;
+                d.i[0] = rows;
+                d.i[1] = h;
+                d.f[0] = eps;
+            },
+        )
     } else {
         let c_rs = b.emit(DevOp::Residual, spine_cus(b.n_cu()), &[c_op], |d| {
             d.t[0] = n.xmid;
@@ -3686,6 +4314,7 @@ fn emit_glm_dsa_decode_select(
     slot: usize,
     ctx: u32,
     rows: u32,
+    dbatch: u32,
     enc: MoeEnc,
     all: &[u32],
     eps: f32,
@@ -3695,17 +4324,18 @@ fn emit_glm_dsa_decode_select(
     c_rn1: u32,
     rq: &[u32],
     rk: &[u32],
+    pre: Option<[u32; 3]>,
 ) -> u32 {
     let one = vec![0u32];
     let dsa = c.dsa(ctx);
-    // The indexer is single-row end to end: `IndexSelect` has no batch axis (one cooperative
-    // grid-sync over one [ctx] score array) and every scratch row (`iscore`/`iidx`/`qidx`/...)
-    // is declared one row wide. A batched gate would need per-row histograms and a widened
-    // scratch family; refuse until that exists.
+    // Batched DSA decode hands `IndexSelect` a per-row offset in `i[3]`. Both objects honour
+    // it behind `PLOW_DSA_DECODE_BATCH` (`d_index_select_sm120` takes `batch_row`/`kv_len`;
+    // the gfx942 arm likewise), and the manifest requires that arm on BOTH backends
+    // (`manifest.rs` `backend_amd`/`backend_nvcc`), so an object without it is refused at load
+    // rather than reading row 0's scores for every row.
     assert!(
-        !(dsa && rows > 1),
-        "DSA indexer with a batched decode program (rows={rows}): IndexSelect and the indexer \
-         scratch are single-row. Emit the ladder blob with PLOW_GLM_DSA=0 or max-ctx <= 65536."
+        !(dsa && rows > 1 && c.index_kpool > 1),
+        "batched pooled DSA decode is not qualified; emit a single-row ladder or disable DSA"
     );
     // The DSA lightning indexer has NO MXFP4 path: plow reads `wq_b`/`wk`/`weights_proj` as bf16
     // and none of the three ops takes an encoding. (A block-fp8 checkpoint does quantize wq_b and
@@ -3731,22 +4361,31 @@ fn emit_glm_dsa_decode_select(
     // block-fp8 checkpoint stores them quantized and that combination is refused at binding.
     let gemv_blk =
         |b: &mut Builder, out: u32, x: u32, wt: u32, nn: u32, k: u32, deps: &[u32]| -> u32 {
+            if let Some(counter) =
+                emit_glm_decode_gemm_lt(b, c, enc, rows, [out, x, wt], [nn, k], deps)
+            {
+                return counter;
+            }
             b.emit(DevOp::Gemv, all.to_vec(), deps, |d| {
                 d.t[0] = out;
                 d.t[1] = x;
                 d.t[2] = wt;
-                d.i[0] = 1;
+                d.i[0] = rows;
                 d.i[1] = nn;
                 d.i[2] = k;
             })
         };
     if full {
         // q_idx = interleaved_rope(reshape_HIxDI(wq_b @ q_lat)); rope in-place (reads staged first).
-        let c_q0 = gemv_blk(b, n.qidx, n.qlat, w.iwqb, hi * di, ql, &[c_rnq]);
+        // `pre`: the q/k/weights projections were emitted beside their siblings.
+        let c_q0 = match pre {
+            Some([c_q0, _, _]) => c_q0,
+            None => gemv_blk(b, n.qidx, n.qlat, w.iwqb, hi * di, ql, &[c_rnq]),
+        };
         // The indexer ropes are concurrent with each other AND with the q/k pair above (all four
         // hang off the input norm), so they continue the same disjoint allocation.
-        let riq = rope_cus(all, rq.len() + rk.len(), 1, hi);
-        let rik = rope_cus(all, rq.len() + rk.len() + riq.len(), 1, 1);
+        let riq = rope_cus(all, rq.len() + rk.len(), rows, hi);
+        let rik = rope_cus(all, rq.len() + rk.len() + riq.len(), rows, 1);
         let c_qi = b.emit(DevOp::HeadNormRope, riq.clone(), &[c_q0], |d| {
             d.t[0] = n.qidx;
             d.t[1] = n.qidx;
@@ -3754,7 +4393,7 @@ fn emit_glm_dsa_decode_select(
             d.t[3] = n.icos;
             d.t[4] = n.isin;
             d.t[5] = n.pos;
-            d.i[0] = 1;
+            d.i[0] = rows;
             d.i[1] = hi;
             d.i[2] = di;
             d.i[3] = 0;
@@ -3766,13 +4405,25 @@ fn emit_glm_dsa_decode_select(
         });
         // k_idx pre-rope: wk @ xn, k_norm. Shared by both the dense (GLM-5.2) and pooled
         // (GLM-5.3-Flash) paths below — only what the rope writes INTO differs.
-        let c_k0 = gemv_blk(b, n.kidx_raw, n.xn, w.iwk, di, h, &[c_rn1]);
-        let c_kn = b.emit(DevOp::LayerNorm, one.clone(), &[c_k0], |d| {
+        let c_k0 = match pre {
+            Some([_, c_k0, _]) => c_k0,
+            None => gemv_blk(b, n.kidx_raw, n.xn, w.iwk, di, h, &[c_rn1]),
+        };
+        // PLOW_GLM_DECODE_GLUE_CUS: `d_layernorm_bias` is one workgroup per row striding by
+        // `nblk`, so give it `rows` workgroups on a slice past the ropes beside it. Bit-identical:
+        // each row is still reduced by one workgroup.
+        let kn_cus = if emit_config::active().glm_decode_glue_cus {
+            let start = (rq.len() + rk.len() + riq.len() + rik.len()).min(all.len() - rows as usize);
+            all[start..start + rows as usize].to_vec()
+        } else {
+            one.clone()
+        };
+        let c_kn = b.emit(DevOp::LayerNorm, kn_cus, &[c_k0], |d| {
             d.t[0] = n.kidx_normed;
             d.t[1] = n.kidx_raw;
             d.t[2] = w.iknw;
             d.t[3] = w.iknb;
-            d.i[0] = 1;
+            d.i[0] = rows;
             d.i[1] = di;
             d.i[3] = 0;
             d.f[0] = 1e-6; // k_norm eps
@@ -3914,29 +4565,46 @@ fn emit_glm_dsa_decode_select(
                 d.t[3] = n.icos;
                 d.t[4] = n.isin;
                 d.t[5] = n.pos;
-                d.i[0] = 1;
+                d.i[0] = rows;
                 d.i[1] = 1;
                 d.i[2] = di;
                 d.i[3] = 0;
                 d.i[4] = 1;
                 d.i[5] = 1;
                 d.f[0] = eps;
-                d.j[0] = 0;
+                if rows > 1 || dbatch > 1 {
+                    d.i[6] = rows;
+                    d.j[0] = ctx;
+                }
                 d.j[1] = KV_MASK_NONE;
             });
             // w = weights_proj @ xn  [HI]  (bf16 GEMV)
             // Plain bf16 GEMV, explicitly — NOT the encoding-aware helper. Under MXFP4 that helper
             // would emit GEMV_MXFP4 against a bf16 weight with a null scale; the assert above makes the
             // combination unreachable, and this keeps it that way if the assert is ever relaxed.
-            let c_w = b.emit(DevOp::Gemv, all.to_vec(), &[c_rn1], |d| {
-                d.t[0] = n.widx;
-                d.t[1] = n.xn;
-                d.t[2] = w.iwp;
-                d.i[0] = 1;
-                d.i[1] = hi;
-                d.i[2] = h;
-                d.f[0] = 1.0;
-            });
+            let c_w = match pre {
+                Some([_, _, c_w]) => c_w,
+                None => emit_glm_decode_gemm_lt(
+                    b,
+                    c,
+                    enc,
+                    rows,
+                    [n.widx, n.xn, w.iwp],
+                    [hi, h],
+                    &[c_rn1],
+                )
+                .unwrap_or_else(|| {
+                    b.emit(DevOp::Gemv, all.to_vec(), &[c_rn1], |d| {
+                        d.t[0] = n.widx;
+                        d.t[1] = n.xn;
+                        d.t[2] = w.iwp;
+                        d.i[0] = rows;
+                        d.i[1] = hi;
+                        d.i[2] = h;
+                        d.f[0] = 1.0;
+                    })
+                }),
+            };
             // score[t] = Σ_h w[h]·ReLU(q_idx[h]·k_idx[t]) · scale  (scale = 1/√DI · 1/√HI; selection is
             // scale-invariant, this reproduces HF numerically).
             let c_sc = b.emit(DevOp::IndexScore, all.to_vec(), &[c_qi, c_ki, c_w], |d| {
@@ -3945,7 +4613,7 @@ fn emit_glm_dsa_decode_select(
                 d.t[2] = n.kidx[slot];
                 d.t[3] = n.widx;
                 d.t[4] = n.kvlen;
-                d.i[0] = 1;
+                d.i[0] = rows;
                 // i1/i3 are the indexer geometry the ISA contract has always specified (dev_isa.h:419)
                 // and that this emitter left at ZERO, while `interp.hip` hardcoded `DI_=128, HI_=32`.
                 // They are now WRITTEN — see `glm_assert_indexer_geom` for why writing them is not the
@@ -3955,34 +4623,297 @@ fn emit_glm_dsa_decode_select(
                 d.i[2] = ctx;
                 d.f[0] = (di as f32).powf(-0.5) * (hi as f32).powf(-0.5);
             });
-            // top-k SELECT -> n.iidx (ONE cooperative launch: grid-sync radix). Perf floor 2: emit on a
-            // 32-CU slice, NOT all 256. The selector is grid-barrier CONTENTION-bound, not bandwidth-bound
-            // (the score array is only ctx*4 B); cutting the co-resident WG count 256->32 drops the atomic
-            // contention on the grid-sync counter and the shared histogram bins (~204->144us @128k, STILL
-            // set-EXACT). The kernel reads nwg from in->blocks (=32) and partitions the score array by the
-            // entry's LOGICAL SLICE (0..31) — not by blockIdx.x, which under the global-queue decode
-            // scheduler is whichever workgroup claimed the entry (that confusion is the end-to-end DSA bug;
-            // see d_index_select_coop). All 32 are co-resident under the persistent interp (256 CUs
-            // resident, this op gates on INDEX_SCORE, so its 32 WGs run together).
-            let sel_wgs: Vec<u32> = (0..32.min(b.n_cu())).collect();
-            b.emit(DevOp::IndexSelect, sel_wgs, &[c_sc], |d| {
-                d.t[0] = n.iidx;
-                d.t[1] = n.iscore;
-                d.t[2] = n.ighist;
-                d.t[3] = n.igctl;
-                // The LIVE kv occupancy. `i[0]` below is only the packet's max ctx, and INDEX_SCORE
-                // writes `iscore[pos]` for `pos < kvlen` ONLY — so without this operand the radix
-                // ranked `ctx - kvlen` never-written words and selected rows past the end of the
-                // latent cache, which the gather then read unmasked. DSA arms only above a 64k
-                // crossover, so that gap was the overwhelming majority of every scan.
-                d.t[4] = n.kvlen;
-                d.i[0] = ctx;
-                d.i[1] = itk;
-            })
+            match emit_config::active().glm_select_split() {
+                Some(g) if glm_select_split_on() && rows > 1 => {
+                    emit_glm_dsa_select_split(b, c, n, ctx, rows, itk, c_sc, g)
+                }
+                _ => emit_glm_dsa_select_rows(b, c, n, ctx, rows, itk, c_sc),
+            }
         }
     } else {
         0
     }
+}
+
+/// u32 per decode row in the split selection's control strip (`SEL_SPLIT_CTL`,
+/// runtime/amd/op_attention_common.h).
+const GLM_SELECT_SPLIT_CTL: usize = 16;
+/// Histogram bins per decode row in the split selection (`SEL_SPLIT_NB`, the top 12 key bits).
+const GLM_SELECT_SPLIT_NB: usize = 4096;
+
+fn glm_select_split_on() -> bool {
+    let cfg = emit_config::active();
+    cfg.glm_select_local() && cfg.glm_select_split().is_some()
+}
+
+/// `PLOW_GLM_SELECT_SPLIT`: the batched decode selection as three gated packets (op 59 `i[4] = 2`,
+/// `i[6]` = phase), `g` workgroups per row in phases 1-2 (capped so `rows * g` fits the machine)
+/// and one in phase 3 — key-prefix histogram, boundary bitmap and candidates, then candidate
+/// selection and ascending compaction. No workgroup waits on another inside a packet; the gates
+/// order the phases. Same key as the local form, so the same set, listed in ascending position
+/// order. Decode rungs only: the token-batch band keeps `emit_glm_dsa_select_rows`.
+#[allow(clippy::too_many_arguments)]
+fn emit_glm_dsa_select_split(
+    b: &mut Builder,
+    c: &GlmCfg,
+    n: &GlmTn,
+    ctx: u32,
+    rows: u32,
+    itk: u32,
+    c_sc: u32,
+    g: u32,
+) -> u32 {
+    assert!(
+        c.tp == 8 && b.n_cu() == 304 && matches!(rows, 2 | 4 | 8 | 16 | 20),
+        "split GLM decode selection requires gfx942 TP8 with 2/4/8/16/20 rows"
+    );
+    let g = g.min(b.n_cu() / rows);
+    let phase = |b: &mut Builder, blocks: u32, phase: u32, dep: u32| {
+        b.emit(DevOp::IndexSelect, (0..blocks).collect(), &[dep], |d| {
+            d.t[0] = n.iidx;
+            d.t[1] = n.iscore;
+            d.t[2] = n.ighist;
+            d.t[3] = n.igctl;
+            d.t[4] = n.kvlen;
+            d.t[5] = n.ibits;
+            d.t[6] = n.icand;
+            d.i[0] = ctx;
+            d.i[1] = itk;
+            d.i[4] = 2;
+            d.i[5] = g;
+            d.i[6] = phase;
+        })
+    };
+    let c_hist = phase(b, rows * g, 1, c_sc);
+    let c_mark = phase(b, rows * g, 2, c_hist);
+    phase(b, rows, 3, c_mark)
+}
+
+/// The DSA top-k SELECT over `rows` scored rows -> `n.iidx`, shared by the decode chain and the
+/// token-batch band. Byte-identical to the decode emit it was lifted from.
+fn emit_glm_dsa_select_rows(
+    b: &mut Builder,
+    c: &GlmCfg,
+    n: &GlmTn,
+    ctx: u32,
+    rows: u32,
+    itk: u32,
+    c_sc: u32,
+) -> u32 {
+    if emit_config::active().glm_select_local() && rows > 1 {
+        assert!(
+            c.tp == 8 && b.n_cu() == 304 && matches!(rows, 2 | 4 | 8 | 16 | 20),
+            "local GLM decode selection requires gfx942 TP8 with 2/4/8/16/20 rows"
+        );
+        return b.emit(DevOp::IndexSelect, (0..rows).collect(), &[c_sc], |d| {
+            d.t[0] = n.iidx;
+            d.t[1] = n.iscore;
+            d.t[4] = n.kvlen;
+            d.i[0] = ctx;
+            d.i[1] = itk;
+            d.i[4] = 1;
+        });
+    }
+    // top-k SELECT -> n.iidx (ONE cooperative launch: grid-sync radix). Perf floor 2: emit on a
+    // 32-CU slice, NOT all 256. The selector is grid-barrier CONTENTION-bound, not bandwidth-bound
+    // (the score array is only ctx*4 B); cutting the co-resident WG count 256->32 drops the atomic
+    // contention on the grid-sync counter and the shared histogram bins (~204->144us @128k, STILL
+    // set-EXACT). The kernel reads nwg from in->blocks (=32) and partitions the score array by the
+    // entry's LOGICAL SLICE (0..31) — not by blockIdx.x, which under the global-queue decode
+    // scheduler is whichever workgroup claimed the entry (that confusion is the end-to-end DSA bug;
+    // see d_index_select_coop). All 32 are co-resident under the persistent interp (256 CUs
+    // resident, this op gates on INDEX_SCORE, so its 32 WGs run together).
+    let sel_wgs: Vec<u32> = (0..32.min(b.n_cu())).collect();
+    let mut selected = c_sc;
+    // Each row owns the shared radix histogram/control until its successor starts.
+    for row in 0..rows {
+        selected = b.emit(DevOp::IndexSelect, sel_wgs.clone(), &[selected], |d| {
+            d.t[0] = n.iidx;
+            d.t[1] = n.iscore;
+            d.t[2] = n.ighist;
+            d.t[3] = n.igctl;
+            // The LIVE kv occupancy. `i[0]` below is only the packet's max ctx, and INDEX_SCORE
+            // writes `iscore[pos]` for `pos < kvlen` ONLY — so without this operand the radix
+            // ranked `ctx - kvlen` never-written words and selected rows past the end of the
+            // latent cache, which the gather then read unmasked. DSA arms only above a 64k
+            // crossover, so that gap was the overwhelming majority of every scan.
+            d.t[4] = n.kvlen;
+            d.i[0] = ctx;
+            d.i[1] = itk;
+            d.i[3] = row;
+        });
+    }
+    selected
+}
+
+/// The token-batch band's attention: the batched DECODE chain over rows `[0, band)` of a
+/// prefill-width program, on the projections that program already computed for every row.
+///
+/// What is reused and what is not, deliberately:
+/// * `q_a`/`q_nope`/`q_rope` and the KV cache writes are the T-row prefill packets — band rows
+///   are ordinary rows of them (the packed cache-write arms resolve a band row by slot).
+/// * The indexer's key cache is written by the prefill chain's key writer (`c_kidx`), so only
+///   the QUERY side is projected here, over the band rows alone, as a tiled GEMM: the body runs
+///   on prefill objects whose `Gemv` bucket is one row.
+/// * Score, select, flash and fold are the decode packets at `rows = band`, unchanged — that
+///   is what "row t is slot t" buys, and why the band cannot be compacted.
+/// * The band's flash writes `opart`/`mlpart` in the decode layout over the same allocation the
+///   prefill flash used, so it waits for the prefill fold (`c_uv_prefill`); its own fold then
+///   rewrites O rows `[0, band)`, which the prefill fold had filled with garbage.
+#[allow(clippy::too_many_arguments)]
+fn emit_glm_band_attention(
+    b: &mut Builder,
+    c: &GlmCfg,
+    n: &GlmTn,
+    w: &GlmLW,
+    slot: usize,
+    ctx: u32,
+    band: u32,
+    all: &[u32],
+    eps: f32,
+    ql: u32,
+    h: u32,
+    c_rn1: u32,
+    c_rnq: u32,
+    c_kidx: Option<u32>,
+    q_deps: &[u32],
+    c_uv_prefill: u32,
+) -> u32 {
+    let (nh, dk, dr, vd) = (c.heads, c.kv_lora, c.qk_rope, c.v_head);
+    let nh_l = nh / c.tp;
+    let n_cu = b.n_cu();
+    let dsa = c.dsa(ctx);
+    let fp8kv = glm_fp8_kv();
+    let full = dsa && w.iwqb != TENSOR_NONE;
+    let itk = c.index_topk.min(ctx);
+    let (hi, di) = (c.index_heads, c.index_dim);
+    assert!(
+        !(dsa && c.index_kpool > 1),
+        "token-batch band: the pooled DSA indexer (index_kpool={}) has no batched decode path",
+        c.index_kpool
+    );
+    if dsa && fp8kv {
+        assert!(
+            nh_l == 8
+                && dk == 512
+                && dr == 64
+                && band <= 20
+                && glm_gf(ctx, nh_l) == 4
+                && glm_dsa_select_width(c, ctx) == 2048,
+            "sparse FP8 decode requires qualified QH8 latent512/rope64 GF4 geometry"
+        );
+    }
+    let small = |b: &mut Builder, out: u32, x: u32, wt: u32, nn: u32, k: u32, deps: &[u32]| {
+        let op = pick_tile(band, nn, k, n_cu, kernelcaps::QuantScheme::None);
+        b.emit(op, all.to_vec(), deps, |d| {
+            d.t[0] = out;
+            d.t[1] = x;
+            d.t[2] = wt;
+            d.i[0] = band;
+            d.i[1] = nn;
+            d.i[2] = k;
+        })
+    };
+    let mut fl_deps: Vec<u32> = q_deps.to_vec();
+    if full {
+        let c_kidx = c_kidx.expect("a full indexer layer's prefill chain writes its key cache");
+        // q_idx for the band rows: rows [0, band) of the T-row q-latent norm, roped per row.
+        let c_q0 = small(b, n.qidx, n.qlat, w.iwqb, hi * di, ql, &[c_rnq]);
+        let c_qi = b.emit(DevOp::HeadNormRope, rope_cus(all, 0, band, hi), &[c_q0], |d| {
+            d.t[0] = n.qidx;
+            d.t[1] = n.qidx;
+            d.t[2] = TENSOR_NONE;
+            d.t[3] = n.icos;
+            d.t[4] = n.isin;
+            d.t[5] = n.pos;
+            d.i[0] = band;
+            d.i[1] = hi;
+            d.i[2] = di;
+            d.i[3] = 0;
+            d.i[4] = 1;
+            d.i[5] = 1;
+            d.f[0] = eps;
+            d.j[0] = 0;
+            d.j[1] = KV_MASK_NONE;
+        });
+        let c_w = small(b, n.widx, n.xn, w.iwp, hi, h, &[c_rn1]);
+        let c_sc = b.emit(DevOp::IndexScore, all.to_vec(), &[c_qi, c_kidx, c_w], |d| {
+            d.t[0] = n.iscore;
+            d.t[1] = n.qidx;
+            d.t[2] = n.kidx[slot];
+            d.t[3] = n.widx;
+            d.t[4] = n.kvlen;
+            d.i[0] = band;
+            d.i[1] = hi;
+            d.i[2] = ctx;
+            d.i[3] = di;
+            d.f[0] = (di as f32).powf(-0.5) * (hi as f32).powf(-0.5);
+        });
+        fl_deps.push(emit_glm_dsa_select_rows(b, c, n, ctx, band, itk, c_sc));
+    }
+    // The prefill fold must have consumed the T-row partials before the band's flash rewrites
+    // the same allocation in the decode layout.
+    fl_deps.push(c_uv_prefill);
+    fl_deps.dedup();
+    let ns_attn = if dsa {
+        glm_nsplit(itk, nh_l)
+    } else {
+        glm_nsplit(ctx, nh_l)
+    };
+    let gf = glm_gf(ctx, nh_l);
+    let c_fl = b.emit(
+        match (dsa, fp8kv) {
+            (_, true) => DevOp::FlashMlaDecodeFp8,
+            (true, false) => DevOp::FlashGatherDecode,
+            (false, false) => DevOp::FlashMlaDecode,
+        },
+        flash_mla_cus(all, band, 1, nh_l, gf, ns_attn),
+        &fl_deps,
+        |d| {
+            d.t[0] = n.opart;
+            d.t[1] = n.mlpart;
+            d.t[2] = n.qa;
+            d.t[3] = if dr > 0 { n.qr } else { n.qa };
+            d.t[4] = n.ckv[slot];
+            d.t[5] = if dr > 0 { n.krot[slot] } else { n.ckv[slot] };
+            d.t[6] = n.kvlen;
+            d.i[0] = band;
+            d.i[1] = nh_l;
+            d.i[2] = ctx;
+            d.i[3] = if dr == 0 { 1u32 << 31 } else { 0 };
+            d.i[4] = ns_attn;
+            d.i[5] = KV_MASK_NONE;
+            d.i[7] = gf;
+            d.f[0] = c.attn_scale;
+            if fp8kv {
+                d.t[7] = n.kv_scale[slot];
+                d.i[6] = 0;
+            }
+            if dsa {
+                if fp8kv {
+                    d.j[0] = n.iidx + 1;
+                } else {
+                    d.t[7] = n.iidx;
+                }
+                d.i[6] = glm_dsa_select_width(c, ctx);
+            }
+        },
+    );
+    b.emit(
+        DevOp::MlaMergeFold,
+        mla_fold_cus(all, band * nh_l, vd),
+        &[c_fl],
+        |d| {
+            d.t[0] = n.oat;
+            d.t[1] = n.opart;
+            d.t[2] = n.mlpart;
+            d.t[3] = w.wuv;
+            d.i[0] = band;
+            d.i[1] = nh_l;
+            d.i[2] = vd;
+            d.i[4] = ns_attn;
+        },
+    )
 }
 
 /// MLA head-fusion factor for a PREFILL packet. The decode `glm_gf` returns 8 above its crossover
@@ -4036,6 +4967,110 @@ fn pf_wide_cus(n_cu: u32, rows: u32) -> Vec<u32> {
 /// bf16 and the add order is d_residual's). Default off.
 fn xr_res_fold() -> bool {
     emit_config::active().glm_xr_res
+}
+
+/// `PLOW_GLM_PF_SMALL_CUS`: workgroup cap for a plain prefill bucket below [`GLM_SP_MIN_ROWS`].
+/// Measured on GLM-5.3 TP8 gfx942: 64 is best at 128 rows, 128 at 512 (64 regresses 512 by 11%).
+fn glm_pf_small_cus(t: u32) -> Option<u32> {
+    let v = emit_config::active().glm_pf_small_cus.as_deref()?;
+    (t < GLM_SP_MIN_ROWS).then(|| match v {
+        "auto" => (t / 4).max(64),
+        _ => v.parse().unwrap_or_else(|_| {
+            panic!("PLOW_GLM_PF_SMALL_CUS must be `auto` or a workgroup count, got {v:?}")
+        }),
+    })
+}
+
+/// Smallest prefill bucket the sequence-parallel seams cover (the 2048 and 8192 rungs). The
+/// small rungs run on their own objects and carry little seam work.
+const GLM_SP_MIN_ROWS: u32 = 2048;
+
+/// `PLOW_GLM_SEQ_PAR`: this prefill program's TP seams are sequence-parallel. Between seams the
+/// residual stream is valid only on this rank's `t/tp` row band, so every seam of a program —
+/// layer input norm, attention, FFN, final norm — must take the same answer; all of them derive
+/// it from these inputs alone.
+fn glm_sp(c: &GlmCfg, n: &GlmTn, b: &Builder, t: u32) -> bool {
+    n.h2_tp != TENSOR_NONE
+        && t >= GLM_SP_MIN_ROWS
+        && t % c.tp == 0
+        && !b.packed_prefill_segments()
+        && b.token_batch_band().is_none()
+        && !emit_config::active().no_xreduce
+}
+
+/// Rank-relative band view `<base>@band<t>`: rows `[rank*t/tp, (rank+1)*t/tp)` of a `[t][row]`
+/// tensor, bound by the host at `base + rank * bytes`. Declared once per program and bucket.
+fn glm_band(b: &mut Builder, base: u32, t: u32, tp: u32, row_bytes: u64) -> u32 {
+    glm_band_as(b, base, t, tp, row_bytes, "")
+}
+
+/// [`glm_band`] under its own name, for a second row width over the same base (the host binds
+/// every `<base>@band...` view at `base + rank * bytes`).
+fn glm_band_as(b: &mut Builder, base: u32, t: u32, tp: u32, row_bytes: u64, tag: &str) -> u32 {
+    let name = format!("{}@band{t}{tag}", b.tensor_name(base));
+    match (0..b.n_tensors() as u32).find(|&h| b.tensor_name(h) == name) {
+        Some(h) => h,
+        None => b.tensor(&name, (t / tp) as u64 * row_bytes),
+    }
+}
+
+/// Band half of a sequence-parallel seam: `out = resid + reduced` on this rank's rows, where
+/// `reduced` is the reduce-scatter's in-place band of peer slot `slot`.
+#[allow(clippy::too_many_arguments)]
+fn glm_sp_residual(
+    b: &mut Builder,
+    t: u32,
+    tp: u32,
+    h: u32,
+    out: u32,
+    resid: u32,
+    slot: u32,
+    deps: &[u32],
+) -> u32 {
+    let rowb = h as u64 * 2;
+    let o = glm_band(b, out, t, tp, rowb);
+    let r = glm_band(b, resid, t, tp, rowb);
+    let s = glm_band(b, slot, t, tp, rowb);
+    let e = t / tp * h;
+    b.emit(DevOp::Residual, pf_wide_cus(b.n_cu(), e), deps, |d| {
+        d.t[0] = o;
+        d.t[1] = r;
+        d.t[2] = s;
+        d.i[0] = e;
+        d.f[0] = 1.0;
+    })
+}
+
+/// RMSNorm this rank's band of `x` into its band of peer slot 3, then all-gather the normed rows
+/// into `out` on every rank.
+#[allow(clippy::too_many_arguments)]
+fn glm_sp_norm_gather(
+    b: &mut Builder,
+    n: &GlmTn,
+    t: u32,
+    tp: u32,
+    h: u32,
+    eps: f32,
+    out: u32,
+    x: u32,
+    weight: u32,
+    deps: &[u32],
+    xgate: &mut u32,
+    xr_cus: &[u32],
+) -> u32 {
+    let rowb = h as u64 * 2;
+    let xb = glm_band(b, x, t, tp, rowb);
+    let hb = glm_band(b, n.h2_tp, t, tp, rowb);
+    let rows = t / tp;
+    let c_n = b.emit(DevOp::RmsNorm, pf_wide_cus(b.n_cu(), rows), deps, |d| {
+        d.t[0] = hb;
+        d.t[1] = xb;
+        d.t[2] = weight;
+        d.i[0] = rows;
+        d.i[1] = h;
+        d.f[0] = eps;
+    });
+    crate::emit_xall_gather(b, xgate, xr_cus, &[c_n], &[(out, t * h, 3 * n.slot_b)], tp)
 }
 
 /// Causal KV-split factor for the V2 MLA prefill flash (`PLOW_GLM_PF_NS=k`, 2..=8; unset/1 =
@@ -4195,6 +5230,204 @@ fn glm_gf_prefill(ctx: u32, nh_l: u32) -> u32 {
     gf
 }
 
+fn glm_prefill_projection_op(
+    c: &GlmCfg,
+    rows: u32,
+    n: u32,
+    k: u32,
+    n_cu: u32,
+    quant: kernelcaps::QuantScheme,
+) -> DevOp {
+    // Prefill objects already carry MM1 GEMV; larger rows need a different compiled width.
+    if crate::emit_is_amd()
+        && c.tp == 8
+        && c.hidden == 6144
+        && n_cu == 304
+        && rows == 1
+        && quant == kernelcaps::QuantScheme::None
+        && matches!(
+            (n, k),
+            (2048, 6144) | (512, 6144) | (64, 6144) | (4096, 2048)
+                | (512, 2048) | (6144, 2048) | (256, 6144)
+        )
+    {
+        return DevOp::Gemv;
+    }
+    pick_tile(rows, n, k, n_cu, quant)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_glm_lt_gemm(
+    b: &mut Builder,
+    c: &GlmCfg,
+    out: u32,
+    x: u32,
+    weight: u32,
+    t: u32,
+    nn: u32,
+    k: u32,
+    deps: &[u32],
+) -> Option<u32> {
+    if !emit_config::active().glm_gemm_lt()
+        || t < 2048
+        || !matches!((nn, k), (2048, 6144) | (512, 6144) | (4096, 2048))
+    {
+        return None;
+    }
+    assert!(
+        c.tp == 8 && c.hidden == 6144 && b.n_cu() == 304 && t <= 8192,
+        "PLOW_GLM_GEMM_LT requires gfx942 TP8 GLM prefill"
+    );
+    let counter = b.emit(DevOp::GemmLtPf, vec![0], deps, |d| {
+        d.t[0] = out;
+        d.t[1] = x;
+        d.t[2] = weight;
+        d.i[0] = t;
+        d.i[1] = nn;
+        d.i[2] = k;
+    });
+    b.isolate(counter);
+    Some(counter)
+}
+
+/// `PLOW_GLM_GEMM_LT_PF_EXT`: prefill GEMMs `PLOW_GLM_GEMM_LT` leaves on interpreter tiles that
+/// take the same pinned hipBLASLt route. Each becomes its own native segment, so every group
+/// trades its tile for up to two segment boundaries.
+#[derive(Clone, Copy, Default)]
+struct GlmLtExt {
+    o_proj: bool,
+    shared: bool,
+    router: bool,
+    band: bool,
+}
+
+impl GlmLtExt {
+    /// The groups a `t`-row prefill bucket takes: the parent route's rows only.
+    fn at(self, t: u32) -> Self {
+        if (2048..=8192).contains(&t) {
+            self
+        } else {
+            Self::default()
+        }
+    }
+}
+
+fn glm_lt_pf_ext() -> GlmLtExt {
+    let cfg = emit_config::active();
+    let mut set = GlmLtExt::default();
+    let spec = cfg.glm_gemm_lt_pf_ext_spec();
+    for name in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        match name {
+            "1" | "true" => {
+                set = GlmLtExt {
+                    o_proj: true,
+                    shared: true,
+                    router: true,
+                    band: true,
+                }
+            }
+            "0" | "false" => {}
+            "o_proj" => set.o_proj = true,
+            "shared" => set.shared = true,
+            "router" => set.router = true,
+            "band" => set.band = true,
+            other => panic!(
+                "PLOW_GLM_GEMM_LT_PF_EXT: unknown group {other:?} (o_proj, shared, router, band)"
+            ),
+        }
+    }
+    if cfg.glm_gemm_lt() {
+        set
+    } else {
+        GlmLtExt::default()
+    }
+}
+
+/// One `PLOW_GLM_GEMM_LT_PF_EXT` projection, alone in its segment. `rows` is the bucket's `t`
+/// (`i3 = 0`, rebased by the host to the chunk's rows) or the sequence-parallel band `t / tp`
+/// (`i3 = 2`, fixed: the host never shrinks a band view).
+#[allow(clippy::too_many_arguments)]
+fn emit_glm_lt_ext(
+    b: &mut Builder,
+    c: &GlmCfg,
+    out: u32,
+    x: u32,
+    weight: u32,
+    t: u32,
+    rows: u32,
+    [nn, k]: [u32; 2],
+    deps: &[u32],
+) -> u32 {
+    let band = rows != t;
+    assert!(
+        c.tp == 8
+            && c.hidden == 6144
+            && b.n_cu() == 304
+            && (2048..=8192).contains(&t)
+            && (!band || (rows * c.tp == t && matches!(rows, 256 | 1024))),
+        "PLOW_GLM_GEMM_LT_PF_EXT requires gfx942 TP8 GLM prefill (band rows 256 or 1024)"
+    );
+    let pinned = if band {
+        matches!((nn, k), (2048 | 512 | 256 | 128 | 64 | 32, 6144))
+    } else {
+        matches!((nn, k), (6144, 2048) | (256, 6144) | (6144, 256))
+    };
+    assert!(pinned, "PLOW_GLM_GEMM_LT_PF_EXT has no pinned kernel for {rows}x{nn}x{k}");
+    let counter = b.emit(DevOp::GemmLtPf, vec![0], deps, |d| {
+        d.t[0] = out;
+        d.t[1] = x;
+        d.t[2] = weight;
+        d.i[0] = rows;
+        d.i[1] = nn;
+        d.i[2] = k;
+        d.i[3] = if band { 2 } else { 0 };
+    });
+    b.isolate(counter);
+    counter
+}
+
+/// `PLOW_GLM_GEMM_BLK`: one projection on the native block-scale FP8 route, alone in its
+/// segment. `quantize` makes this instruction quantize `x` into the shared FP8 scratch first;
+/// without it the instruction reads what the previous quantizing instruction wrote from the
+/// same `x`, so the caller must order the two. `None` (the bf16 arm) when the projection is
+/// not selected or the bucket is outside the route's rows.
+#[allow(clippy::too_many_arguments)]
+fn emit_glm_blk_gemm(
+    b: &mut Builder,
+    c: &GlmCfg,
+    n: &GlmTn,
+    out: u32,
+    x: u32,
+    [weight, scale]: [u32; 2],
+    t: u32,
+    [nn, k]: [u32; 2],
+    quantize: bool,
+    deps: &[u32],
+) -> Option<u32> {
+    if weight == TENSOR_NONE || !(2048..=8192).contains(&t) {
+        return None;
+    }
+    assert!(
+        c.tp == 8 && c.hidden == 6144 && b.n_cu() == 304 && scale != TENSOR_NONE,
+        "PLOW_GLM_GEMM_BLK requires gfx942 TP8 GLM prefill"
+    );
+    let counter = b.emit(DevOp::GemmBlkPf, vec![0], deps, |d| {
+        d.t[0] = out;
+        d.t[1] = x;
+        d.t[2] = weight;
+        d.t[3] = scale;
+        d.t[4] = n.blk_xq;
+        d.t[5] = n.blk_xs;
+        d.t[6] = n.blk_bias;
+        d.i[0] = t;
+        d.i[1] = nn;
+        d.i[2] = k;
+        d.i[3] = u32::from(quantize);
+    });
+    b.isolate(counter);
+    Some(counter)
+}
+
 /// Emit the MLA attention sub-block for a PREFILL bucket of `t` query rows: the T-row twin of
 /// [`emit_glm_mla`]. Writes `n.xn2` (what the FFN would consume) and returns its completion dep.
 ///
@@ -4241,8 +5474,10 @@ fn glm_gf_prefill(ctx: u32, nh_l: u32) -> u32 {
 ///   q_idx = interleaved_rope(reshape_HIxDI(wq_b @ q_lat))     [T][HI*DI]
 ///   k_idx = interleaved_rope(k_norm(wk @ xn))                 [T][DI], written at the chunk base
 ///   w     = weights_proj @ xn                                 [T][HI]
-/// `wq_b`/`wk`/`weights_proj` are all bf16 (no shipped checkpoint quantizes any of the three —
-/// see the field doc comments on `GlmLW::iwqb`/`iwk`), so all three take the plain tiled GEMM.
+/// `wq_b`/`wk`/`weights_proj` are all DECLARED bf16, so all three take the plain tiled GEMM. A
+/// block-fp8 checkpoint (GLM-5.3-FP8) stores `wq_b` and `wk` as F8_E4M3 with a `weight_scale_inv`
+/// grid, and the loader upcasts them at bind (`plowrt::asset::dsa_indexer`); see the field doc
+/// comments on `GlmLW::iwqb`/`iwk`.
 ///
 /// KEY CACHE. The scorer reads the indexer keys for the WHOLE context `[0, kv_len)`, of which this
 /// chunk contributes rows `[q_pos0, q_pos0 + t)` — the same append discipline `kv.{l}.kidx` already
@@ -4260,13 +5495,21 @@ fn emit_glm_dsa_prefill_select(
     t: u32,
     all: &[u32],
     pre: &[u32],
+    xgate: &mut u32,
+    select: bool,
+    // `PLOW_GLM_SEQ_PAR_PROJ`: `kidx_pf` (and `widx_pf` under `select`) were projected on the
+    // band and all-gathered by this packet; the T-row projections from `xn` are not emitted.
+    gathered: Option<u32>,
 ) -> u32 {
+    assert!(select || c.index_kpool == 1);
+    assert!(gathered.is_none() || c.index_kpool == 1);
     let (hi, di, h, ql) = (c.index_heads, c.index_dim, c.hidden, c.q_lora);
     let itk = c.index_topk.min(ctx);
     let n_cu = b.n_cu();
-    // `wq_b`/`wk` are plain BF16 in every shipped GLM-5.3-Flash checkpoint (no
-    // `.weight_scale_inv` sibling — confirmed against the real checkpoint and against the
-    // reference: `nvidia/attention.py`'s `wk_weights_proj` is built with `quant_config=None`
+    // `wq_b`/`wk` are computed in BF16 whatever the checkpoint holds. GLM-5.3-FP8 stores them as
+    // F8_E4M3 with a `weight_scale_inv` grid and the loader upcasts them at bind, so the declared
+    // bf16 holds either way. This matches the reference: `nvidia/attention.py`'s
+    // `wk_weights_proj` is built with `quant_config=None`
     // unconditionally, and its own comment says "FP8 wk weights are upcasted to BF16 during
     // loading to maintain fusion" — the indexer's q/k projections compute in BF16 regardless
     // of what the rest of the model's `quantization_config` says. `GemmFp8Blk` needs a real
@@ -4274,6 +5517,9 @@ fn emit_glm_dsa_prefill_select(
     // every other unquantized prefill projection uses, not `emit_pf_gemm_fp8_blk`.
     let bf16_gemm =
         |b: &mut Builder, out: u32, x: u32, wt: u32, nn: u32, k: u32, deps: &[u32]| -> u32 {
+            if let Some(counter) = emit_glm_lt_gemm(b, c, out, x, wt, t, nn, k, deps) {
+                return counter;
+            }
             let op = pick_tile(t, nn, k, n_cu, kernelcaps::QuantScheme::None);
             b.emit(op, all.to_vec(), deps, |d| {
                 d.t[0] = out;
@@ -4285,25 +5531,45 @@ fn emit_glm_dsa_prefill_select(
             })
         };
     // q_idx: [T][HI*DI] from the q-latent; k_idx: [T][DI] from the input norm.
-    let c_q0 = bf16_gemm(b, n.qidx_pf, n.qlat, w.iwqb, hi * di, ql, &[pre[1]]);
-    let c_qi = b.emit(DevOp::HeadNormRope, all.to_vec(), &[c_q0], |d| {
-        d.t[0] = n.qidx_pf;
-        d.t[1] = n.qidx_pf;
-        d.t[2] = TENSOR_NONE;
-        d.t[3] = n.icos;
-        d.t[4] = n.isin;
-        d.t[5] = n.pos;
-        d.i[0] = t;
-        d.i[1] = hi;
-        d.i[2] = di;
-        d.i[3] = 0;
-        d.i[4] = 1;
-        d.i[5] = 1;
-        d.f[0] = c.eps;
-        d.j[0] = 0;
-        d.j[1] = KV_MASK_NONE;
+    let c_qi = select.then(|| {
+        let blk_q0 = emit_glm_blk_gemm(
+            b,
+            c,
+            n,
+            n.qidx_pf,
+            n.qlat,
+            [w.blk_iwqb, w.blk_iwqb_s],
+            t,
+            [hi * di, ql],
+            true,
+            &[pre[1]],
+        );
+        let c_q0 = match blk_q0 {
+            Some(counter) => counter,
+            None => bf16_gemm(b, n.qidx_pf, n.qlat, w.iwqb, hi * di, ql, &[pre[1]]),
+        };
+        b.emit(DevOp::HeadNormRope, all.to_vec(), &[c_q0], |d| {
+            d.t[0] = n.qidx_pf;
+            d.t[1] = n.qidx_pf;
+            d.t[2] = TENSOR_NONE;
+            d.t[3] = n.icos;
+            d.t[4] = n.isin;
+            d.t[5] = n.pos;
+            d.i[0] = t;
+            d.i[1] = hi;
+            d.i[2] = di;
+            d.i[3] = 0;
+            d.i[4] = 1;
+            d.i[5] = 1;
+            d.f[0] = c.eps;
+            d.j[0] = 0;
+            d.j[1] = KV_MASK_NONE;
+        })
     });
-    let c_k0 = bf16_gemm(b, n.kidx_pf, n.xn, w.iwk, di, h, &[pre[0]]);
+    let c_k0 = match gathered {
+        Some(g) => g,
+        None => bf16_gemm(b, n.kidx_pf, n.xn, w.iwk, di, h, &[pre[0]]),
+    };
     let c_kn = b.emit(DevOp::LayerNorm, pf_wide_cus(n_cu, t), &[c_k0], |d| {
         d.t[0] = n.kidx_pf;
         d.t[1] = n.kidx_pf;
@@ -4405,7 +5671,7 @@ fn emit_glm_dsa_prefill_select(
                 d.i[2] = row;
             });
         }
-        let c_qq = b.emit(DevOp::DsaQQuant, all.to_vec(), &[c_qi], |d| {
+        let c_qq = b.emit(DevOp::DsaQQuant, all.to_vec(), &[c_qi.unwrap()], |d| {
             d.t[0] = n.q_fp8_pf;
             d.t[1] = n.q_scale_pf;
             d.t[2] = n.qidx_pf;
@@ -4433,6 +5699,10 @@ fn emit_glm_dsa_prefill_select(
                 d.i[5] = 1;
                 d.f[0] = (di as f32).powf(-0.5) * (hi as f32).powf(-0.5);
             },
+        );
+        assert!(
+            !b.packed_prefill_segments(),
+            "the pooled DSA prefill selection has no per-span form; packed sparse prefill needs index_kpool == 1"
         );
         let itk_pool = itk / c.index_kpool;
         let c_se = b.emit(
@@ -4476,6 +5746,14 @@ fn emit_glm_dsa_prefill_select(
         );
     }
     // ...into the SHARED key cache at the chunk base (out_row0), like krot.
+    //
+    // PACKED TOPOLOGY: `i7 = ctx` is the per-slot cache row stride the packed norm arm uses to
+    // place span (and slot-band) rows at `slot * ctx + position`, exactly as the latent and rope
+    // writers above carry it. Without it every span's index keys landed in slot 0's cache at
+    // DENSE-ROW offsets and sparse decode ranked garbage keys (found on the first fired
+    // token-batch step). Ordinary programs keep 0 so their packet bytes are unchanged; the
+    // ordinary object never reads the field.
+    let packed_stride = if b.packed_prefill_segments() { ctx } else { 0 };
     let c_ki = b.emit(DevOp::HeadNormRope, all.to_vec(), &[c_kn], |d| {
         d.t[0] = n.kidx[slot];
         d.t[1] = n.kidx_pf;
@@ -4489,51 +5767,103 @@ fn emit_glm_dsa_prefill_select(
         d.i[3] = 0;
         d.i[4] = 1;
         d.i[5] = 1;
+        d.i[7] = packed_stride;
         d.f[0] = c.eps;
         d.j[0] = 0;
         d.j[1] = KV_MASK_NONE;
     });
-    let c_w = b.emit(
-        pick_tile(t, hi, h, n_cu, kernelcaps::QuantScheme::None),
-        all.to_vec(),
-        &[pre[0]],
-        |d| {
-            d.t[0] = n.widx_pf;
-            d.t[1] = n.xn;
-            d.t[2] = w.iwp;
-            d.i[0] = t;
-            d.i[1] = hi;
-            d.i[2] = h;
-            d.f[0] = c.eps;
-        },
-    );
-    let c_sc = b.emit(DevOp::IndexScorePf, all.to_vec(), &[c_qi, c_ki, c_w], |d| {
-        d.t[0] = n.iscore_pf;
-        d.t[1] = n.qidx_pf;
-        d.t[2] = n.kidx[slot];
-        d.t[3] = n.widx_pf;
-        d.t[4] = n.kvlen;
-        d.i[0] = t;
-        d.i[1] = hi;
-        d.i[2] = ctx;
-        d.i[3] = di;
-        d.f[0] = (di as f32).powf(-0.5) * (hi as f32).powf(-0.5);
-    });
-    // One workgroup per query row; grid-strided, so any width is correct and `min(t, n_cu)` is
-    // the point where extra workgroups would idle.
-    let c_se = b.emit(
-        DevOp::IndexSelectPf,
-        (0..n_cu.min(t)).collect::<Vec<_>>(),
-        &[c_sc],
-        |d| {
-            d.t[0] = n.iidx_pf;
-            d.t[1] = n.iscore_pf;
-            d.t[2] = n.kvlen;
-            d.i[0] = t;
-            d.i[1] = itk;
-            d.i[2] = ctx;
-        },
-    );
+    if !select {
+        return c_ki;
+    }
+    let c_qi = c_qi.unwrap();
+    let c_w = match gathered {
+        Some(g) => g,
+        None => b.emit(
+            pick_tile(t, hi, h, n_cu, kernelcaps::QuantScheme::None),
+            all.to_vec(),
+            &[pre[0]],
+            |d| {
+                d.t[0] = n.widx_pf;
+                d.t[1] = n.xn;
+                d.t[2] = w.iwp;
+                d.i[0] = t;
+                d.i[1] = hi;
+                d.i[2] = h;
+                d.f[0] = c.eps;
+            },
+        ),
+    };
+    let c_se =
+        if emit_config::active().glm_index_tp() && t >= 2048 {
+            // Under the packed topology the runtime hands this kernel the launch's PlowKvSpan
+            // table (dsa_tp_adapter ABI 2): every row's position, causal bound and key base
+            // come from its span, so a packed sibling / body may carry it. `t5 = kvlen` is the
+            // isolated form's scalar and is unread under a table.
+            assert!(
+            c.tp == 8 && n_cu == 304 && h == 6144
+                && hi == 32 && di == 128 && itk == 2048 && t <= 8192,
+            "PLOW_GLM_INDEX_TP requires a gfx942 TP8 GLM H6144/HI32/DI128/top2048 prefill program"
+        );
+            let enter = *xgate;
+            *xgate = enter.checked_add(3).expect("indexer TP gate overflow");
+            let counter = b.emit(DevOp::IndexTpPf, vec![0], &[c_qi, c_ki, c_w], |d| {
+                d.t = [
+                    n.iidx_pf,
+                    n.iscore_pf,
+                    n.qidx_pf,
+                    n.kidx[slot],
+                    n.widx_pf,
+                    n.kvlen,
+                    n.dg_tp,
+                    TENSOR_NONE,
+                ];
+                d.i = [t, ctx, itk, c.tp, n.slot_b, enter, enter + 2, 0];
+                d.f[0] = (di as f32).powf(-0.5) * (hi as f32).powf(-0.5);
+            });
+            b.isolate(counter);
+            counter
+        } else {
+            assert!(
+                !b.packed_prefill_segments(),
+                "packed sparse prefill requires the native TP indexer (PLOW_GLM_INDEX_TP=1): the \
+                 interpreter selectors derive every row's position from kv_len[0]"
+            );
+            let c_sc = b.emit(DevOp::IndexScorePf, all.to_vec(), &[c_qi, c_ki, c_w], |d| {
+                d.t[0] = n.iscore_pf;
+                d.t[1] = n.qidx_pf;
+                d.t[2] = n.kidx[slot];
+                d.t[3] = n.widx_pf;
+                d.t[4] = n.kvlen;
+                d.i[0] = t;
+                d.i[1] = hi;
+                d.i[2] = ctx;
+                d.i[3] = di;
+                d.f[0] = (di as f32).powf(-0.5) * (hi as f32).powf(-0.5);
+            });
+            // One workgroup per query row; grid-strided, so any width is correct and `min(t, n_cu)` is
+            // the point where extra workgroups would idle.
+            let c_se = b.emit(
+                DevOp::IndexSelectPf,
+                (0..n_cu.min(t)).collect::<Vec<_>>(),
+                &[c_sc],
+                |d| {
+                    d.t[0] = n.iidx_pf;
+                    d.t[1] = n.iscore_pf;
+                    d.t[2] = n.kvlen;
+                    d.i[0] = t;
+                    d.i[1] = itk;
+                    d.i[2] = ctx;
+                },
+            );
+            c_se
+        };
+    // PACKED TOPOLOGY: no union. An 8-query tile could straddle two request spans (the band is
+    // 20 rows, spans are ragged), and the AITER sparse route gathers `iidx_pf` per row anyway —
+    // the flash names the per-row selection directly (`fj[1] = iidx_pf + 1`) and the runtime
+    // refuses a packed sparse program whose flash is not AITER-routed.
+    if b.packed_prefill_segments() {
+        return c_se;
+    }
     // One workgroup per query PACK (B2: 8 queries share a union; all 8 heads share the walk).
     let n_qt = t.div_ceil(GLM_DSA_PF_PACK);
     b.emit(
@@ -4554,6 +5884,129 @@ fn emit_glm_dsa_prefill_select(
     )
 }
 
+/// Query-row-split sparse attention for the GLM 8192 rung (`PLOW_GLM_ROWSPLIT_ATTN`,
+/// `reports/rowsplit-attention-design.md`). Two all-to-alls over heads (`DevOp::XAllToAllHeads`,
+/// opcode 160) bracket one sparse attention call and its merge-fold, all run at `nh` (every
+/// head, replicated latent KV) over this rank's `t/tp` row band instead of `nh_l` heads over
+/// every row:
+///
+///   1. Q all-to-all (dir=0), twice — `qa` (`dk`-wide) and `qr` (`dr`-wide) are separate
+///      tensors, so each needs its own instance: this rank's own un-gathered `[t][nh_l][d]`
+///      (peer-visible at `act.qa_tp`/`act.qr_tp`, see `declare_glm_rows_batched`) becomes
+///      `[t/tp][nh][d]` (`qa_rs`/`qr_rs`, local).
+///   2. ONE sparse attention call at `nh` heads, `t/tp` rows — the same `FlashMlaPrefill(Fp8)`
+///      shape the dense sparse arm emits, just wider. `opart`/`mlpart` are reused UNCHANGED:
+///      `nh * t/tp == nh_l * t`, the same total element count the dense arm needs. Runtime
+///      dispatch to four 16-head native launches (`crates/plowrt/src/exec/amd_sparse_mla.rs`)
+///      is a later step; this emits the same instruction shape and trusts that dispatch to
+///      interpret `i1=nh` as its cue.
+///   3. `MlaMergeFold` at `nh` heads against the full-head `w.wuv_full` replica (option 4,
+///      keeping the fold on the rank that computed the attention instead of gathering raw
+///      partials across ranks — see the design doc's discussion of the two rejected
+///      alternatives). `opart`/`mlpart` stay local; no cross-rank traffic here.
+///   4. O all-to-all (dir=1): `oat_rs` (`[t/tp][nh][vd]`, peer-visible) becomes `n.oat`
+///      (`[t][nh_l][vd]`, this rank's ordinary head-sharded slot) — `o_proj` and everything
+///      after it in `emit_glm_mla_prefill` is UNCHANGED and reads `n.oat` exactly as today.
+///
+/// Peer-slot numbering (`n.slot_b`-multiples, `crates/plowrt/src/exec/amd.rs`'s hardcoded
+/// peer-slot table): slots 0-5 are taken (og_tp/dg_tp/ug_tp/h2_tp/xe_tp/rt_tp); this arm claims
+/// 6 (`qa_tp`), 7 (`qr_tp`) and 8 (`oat_rs_tp`) — NEW entries step 3 owns adding to that table
+/// and to the region's slot count, exactly like the design doc's "add to the seam slot-hazard
+/// table" item. Not yet wired: this function only emits the packet: the runtime pieces
+/// (peer-slot table entries, the region-size bump, and `amd_sparse_mla.rs`'s 64-head ->
+/// four-16-head dispatch and its own per-row CSR/selection offset) are step 3.
+///
+/// Returns the counter `o_proj` (and the sequence-parallel seam, if any) should depend on — the
+/// same role `emit_glm_mla_prefill`'s `c_uv` plays on the dense path.
+#[allow(clippy::too_many_arguments)]
+fn emit_glm_rowsplit_attn(
+    b: &mut Builder,
+    c: &GlmCfg,
+    n: &GlmTn,
+    w: &GlmLW,
+    t: u32,
+    ctx: u32,
+    slot: usize,
+    fp8kv: bool,
+    sparse_sel: u32,
+    fl_deps: &[u32],
+    xgate: &mut u32,
+    xr_cus: &[u32],
+) -> u32 {
+    let tp = c.tp;
+    let nh = c.heads;
+    let (dk, dr, vd) = (c.kv_lora, c.qk_rope, c.v_head);
+    let rows = t / tp;
+    assert!(
+        t % tp == 0 && n.qa_rs != TENSOR_NONE && n.oat_rs != TENSOR_NONE,
+        "row-split attention requires t % tp == 0 and its scratch declared (t={t}, tp={tp})"
+    );
+    // 1. Q all-to-all, twice (qa/qr are separate tensors — see the function doc).
+    let c_qa2a =
+        crate::emit_xalltoall_heads(b, xgate, xr_cus, fl_deps, n.qa_rs, rows, 8, dk, nh, tp, 6 * n.slot_b, 0);
+    let c_qr2a = if dr > 0 {
+        crate::emit_xalltoall_heads(
+            b, xgate, xr_cus, fl_deps, n.qr_rs, rows, 8, dr, nh, tp, 7 * n.slot_b, 0,
+        )
+    } else {
+        c_qa2a
+    };
+    // 2. Sparse attention at nh heads over this rank's row band. Same operand shape as the
+    //    dense sparse arm's `c_fl` (`emit_glm_mla_prefill`), just wider.
+    let c_fl = b.emit(
+        if fp8kv {
+            DevOp::FlashMlaPrefillFp8
+        } else {
+            DevOp::FlashMlaPrefill
+        },
+        xr_cus.to_vec(),
+        &[c_qa2a, c_qr2a],
+        |d| {
+            d.t[0] = n.opart;
+            d.t[1] = n.mlpart;
+            d.t[2] = n.qa_rs;
+            d.t[3] = if dr > 0 { n.qr_rs } else { n.qa_rs };
+            d.t[4] = n.ckv[slot];
+            d.t[5] = if dr > 0 { n.krot[slot] } else { n.ckv[slot] };
+            d.t[6] = n.kvlen;
+            if fp8kv {
+                d.t[7] = n.kv_scale[slot];
+                d.j[0] = sparse_sel + 1;
+            } else {
+                d.t[7] = n.iuni;
+            }
+            d.i[6] = glm_dsa_pf_cap(c, ctx);
+            d.i[0] = 1; // n_batch
+            d.i[1] = nh; // ALL heads, not this rank's nh_l
+            d.i[2] = ctx; // kv_stride
+            d.i[3] = if dr == 0 { 1u32 << 31 } else { 0 };
+            d.i[4] = rows; // this rank's row band, not the full t
+            d.i[5] = KV_MASK_NONE;
+            d.i[7] = glm_gf_prefill(ctx, nh);
+            d.f[0] = c.attn_scale;
+        },
+    );
+    // 3. MlaMergeFold at nh heads against the full-head W_uv replica (option 4: the fold stays
+    //    on this rank, no raw-partial all-to-all).
+    let c_fold = b.emit(
+        DevOp::MlaMergeFold,
+        mla_fold_cus(xr_cus, rows * nh, vd),
+        &[c_fl],
+        |d| {
+            d.t[0] = n.oat_rs;
+            d.t[1] = n.opart;
+            d.t[2] = n.mlpart;
+            d.t[3] = w.wuv_full;
+            d.i[0] = rows;
+            d.i[1] = nh;
+            d.i[2] = vd;
+            d.i[4] = 1; // nsplit: the sparse arm always forces ns=1
+        },
+    );
+    // 4. O all-to-all back to this rank's ordinary head-sharded `oat`.
+    crate::emit_xalltoall_heads(b, xgate, xr_cus, &[c_fold], n.oat, rows, 8, vd, nh, tp, 8 * n.slot_b, 1)
+}
+
 pub(crate) fn emit_glm_mla_prefill(
     b: &mut Builder,
     c: &GlmCfg,
@@ -4567,8 +6020,17 @@ pub(crate) fn emit_glm_mla_prefill(
     raw_output: bool,
     xgate: &mut u32,
     xr_cus: &[u32],
+    band: Option<u32>,
 ) -> u32 {
-    assert!(t > 1, "prefill bucket must carry more than one row (t={t})");
+    assert!(t > 0, "prefill bucket must carry at least one row");
+    // TOKEN-BATCH BODY: rows `[0, band)` are a slot-indexed decode band. Every T-row packet
+    // below covers them too (projections, norms, cache writes — the packed cache-write arms
+    // resolve band rows by slot); the attention over them is the batched DECODE chain emitted
+    // by `emit_glm_band_attention` behind the prefill fold.
+    assert!(
+        band.is_none_or(|bw| bw > 0 && bw < t),
+        "token-batch band must be narrower than the bucket (band={band:?}, t={t})"
+    );
     let all = b.all();
     let n_cu = b.n_cu();
     let (h, nh, dk, dr, vd, ql) = (c.hidden, c.heads, c.kv_lora, c.qk_rope, c.v_head, c.q_lora);
@@ -4581,6 +6043,7 @@ pub(crate) fn emit_glm_mla_prefill(
     let nh_l = nh / tp;
     let w = &n.lw[slot];
     let eps = c.eps;
+    let lt_ext = glm_lt_pf_ext().at(t);
     // Tiled GEMM at prefill shapes. `pick_tile` is the same static cost model the dense prefill path
     // uses, so a narrow M (the 128-row bucket) reaches GemmSmall/GemmMed rather than paying for a
     // 256x256 tile that leaves most of the chip idle.
@@ -4605,7 +6068,12 @@ pub(crate) fn emit_glm_mla_prefill(
         // What it cost: Kimi's `kv_a_proj` (M=128, N=576) is THREE 256x256 tiles on 256 CUs,
         // measured at ≈0.4% of peak — the worst number in the campaign. `op_gemm.h` now
         // instantiates the fp4 body at all five rungs, so the selection applies.
-        let op = pick_tile(t, nn, k, n_cu, mxfp4_quant(enc));
+        if enc != MoeEnc::Mxfp4 {
+            if let Some(counter) = emit_glm_lt_gemm(b, c, out, x, wt, t, nn, k, deps) {
+                return counter;
+            }
+        }
+        let op = glm_prefill_projection_op(c, t, nn, k, n_cu, mxfp4_quant(enc));
         b.emit(op, all.clone(), deps, |d| {
             d.t[0] = out;
             d.t[1] = x;
@@ -4622,34 +6090,207 @@ pub(crate) fn emit_glm_mla_prefill(
         })
     };
 
-    // 1 input_layernorm, T rows.
-    let c_rn1 = b.emit(DevOp::RmsNorm, pf_wide_cus(n_cu, t), pre, |d| {
-        d.t[0] = n.xn;
-        d.t[1] = x_in;
-        d.t[2] = w.gin;
-        d.i[0] = t;
-        d.i[1] = h;
-        d.f[0] = eps;
-    });
+    // SPARSE (PLOW_GLM_DSA_PF) selection for this layer; see the flash below.
+    // SPAN: 0 = indexer layers only, 1 = one successor, 3 = every GLM-5.3 layer.
+    // Keep the default at 1 while qualifying all-layer reuse after the row-count fix.
+    let cfg = emit_config::active();
+    let span = cfg.glm_dsa_pf_span as usize;
+    // Exact-distance selection holds the sparse layer count constant for a reuse bisect.
+    let dexact = cfg.glm_dsa_pf_dexact.map(|d| d as usize);
+    let reuses = match dexact {
+        Some(d) => slot >= d && c.indexer_is_full((slot - d) as u32),
+        None => (1..=span).any(|d| slot >= d && c.indexer_is_full((slot - d) as u32)),
+    };
+    let sparse = glm_dsa_pf_bucket(c, t) && (w.iwqb != TENSOR_NONE || reuses) && nh_l == 8;
+    // Row-split sparse attention (`PLOW_GLM_ROWSPLIT_ATTN`, the 8192 rung only): `w.wuv_full`
+    // is TENSOR_NONE unless `glm_rowsplit_attn_eligible` already agreed this layer reaches the
+    // sparse arm at 8192, so re-checking `sparse && t == 8192` here is belt-and-suspenders, not
+    // the source of truth.
+    let use_rowsplit = sparse && t == 8192 && cfg.glm_rowsplit_attn() && w.wuv_full != TENSOR_NONE;
+    // Dense prefill still feeds sparse decode's key cache, including short tail buckets.
+    let idx_chain = w.iwqb != TENSOR_NONE && (sparse || (c.dsa(ctx) && c.index_kpool == 1));
+
+    // 1 input_layernorm, T rows (on the band + all-gather under the sequence-parallel seams).
+    let sp = !raw_output && glm_sp(c, n, b, t);
+    // Band projections: `widx` rides slot 0, whose next writer (this layer's o_proj) is ordered
+    // behind every peer's gather only by the TP indexer's rendezvous.
+    let sp_proj = sp
+        && n.ug_tp != TENSOR_NONE
+        && dr > 0
+        && w.blk_qad == TENSOR_NONE
+        && w.blk_ckvd == TENSOR_NONE
+        && (!idx_chain
+            || (c.index_kpool == 1 && (!sparse || (emit_config::active().glm_index_tp() && t >= 2048))));
+    let mut proj_g: Option<(u32, Option<u32>)> = None;
+    let c_rn1 = if sp_proj {
+        let tb = t / tp;
+        let xb = glm_band(b, x_in, t, tp, h as u64 * 2);
+        let xnb = glm_band(b, n.xn, t, tp, h as u64 * 2);
+        let c_n = b.emit(DevOp::RmsNorm, pf_wide_cus(n_cu, tb), pre, |d| {
+            d.t[0] = xnb;
+            d.t[1] = xb;
+            d.t[2] = w.gin;
+            d.i[0] = tb;
+            d.i[1] = h;
+            d.f[0] = eps;
+        });
+        let quant = mxfp4_quant(enc);
+        let bgemm = |b: &mut Builder, out: u32, wt: u32, sc: u32, nn: u32, bf16: bool| {
+            if lt_ext.band && (bf16 || enc != MoeEnc::Mxfp4) {
+                return emit_glm_lt_ext(b, c, out, xnb, wt, t, tb, [nn, h], &[c_n]);
+            }
+            let op = if bf16 {
+                pick_tile(tb, nn, h, n_cu, kernelcaps::QuantScheme::None)
+            } else {
+                glm_prefill_projection_op(c, tb, nn, h, n_cu, quant)
+            };
+            b.emit(op, all.clone(), &[c_n], |d| {
+                d.t[0] = out;
+                d.t[1] = xnb;
+                d.t[2] = wt;
+                if !bf16 && enc == MoeEnc::Mxfp4 {
+                    d.t[3] = sc;
+                }
+                d.i[0] = tb;
+                d.i[1] = nn;
+                d.i[2] = h;
+                d.f[0] = eps;
+            })
+        };
+        let qlr_b = glm_band(b, n.qlr, t, tp, ql as u64 * 2);
+        let c_q = bgemm(b, qlr_b, w.qad, w.qad_s, ql, false);
+        let slot_b = n.slot_b;
+        let kv_proj = |b: &mut Builder| {
+            let ckv_s = glm_band_as(b, n.xe_tp, t, tp, dk as u64 * 2, ".kv");
+            let c_kv = bgemm(b, ckv_s, w.ckvd, w.ckvd_s, dk, false);
+            let krr_s = glm_band_as(b, n.rt_tp, t, tp, dr as u64 * 2, ".kr");
+            (c_kv, bgemm(b, krr_s, w.krotd, w.krotd_s, dr, false))
+        };
+        let idx_proj = |b: &mut Builder| {
+            let (hi, di) = (c.index_heads, c.index_dim);
+            let ki_s = glm_band_as(b, n.ug_tp, t, tp, di as u64 * 2, ".ki");
+            let mut deps = vec![bgemm(b, ki_s, w.iwk, TENSOR_NONE, di, true)];
+            let mut pairs = vec![(n.kidx_pf, t * di, 2 * slot_b)];
+            if sparse {
+                let w_s = glm_band_as(b, n.og_tp, t, tp, hi as u64 * 2, ".w");
+                deps.push(bgemm(b, w_s, w.iwp, TENSOR_NONE, hi, true));
+                pairs.push((n.widx_pf, t * hi, 0));
+            }
+            (deps, pairs)
+        };
+        // PLOW_GLM_GEMM_LT_PF_EXT: the native band projections go back to back ahead of the q
+        // norm, one run of segments instead of each splitting the interpreter segment.
+        let mut early = None;
+        if lt_ext.band {
+            let kv = kv_proj(b);
+            let idx = if idx_chain { Some(idx_proj(b)) } else { None };
+            early = Some((kv, idx));
+        }
+        let qlat_s = glm_band_as(b, n.h2_tp, t, tp, ql as u64 * 2, ".q");
+        let c_qn = b.emit(DevOp::RmsNorm, pf_wide_cus(n_cu, tb), &[c_q], |d| {
+            d.t[0] = qlat_s;
+            d.t[1] = qlr_b;
+            d.t[2] = w.gqa;
+            d.i[0] = tb;
+            d.i[1] = ql;
+            d.f[0] = eps;
+        });
+        let ((c_kv, c_kr), idx) = match early {
+            Some(e) => e,
+            None => (kv_proj(b), None),
+        };
+        let g = crate::emit_xall_gather(
+            b,
+            xgate,
+            xr_cus,
+            &[c_qn, c_kv, c_kr],
+            &[(n.qlat, t * ql, 3 * slot_b), (n.ckvraw, t * dk, 4 * slot_b), (n.krr, t * dr, 5 * slot_b)],
+            tp,
+        );
+        let gi = if idx_chain {
+            let (deps, pairs) = match idx {
+                Some(p) => p,
+                None => idx_proj(b),
+            };
+            Some(crate::emit_xall_gather(b, xgate, xr_cus, &deps, &pairs, tp))
+        } else {
+            None
+        };
+        proj_g = Some((g, gi));
+        c_n
+    } else if sp {
+        glm_sp_norm_gather(b, n, t, tp, h, eps, n.xn, x_in, w.gin, pre, xgate, xr_cus)
+    } else {
+        b.emit(DevOp::RmsNorm, pf_wide_cus(n_cu, t), pre, |d| {
+            d.t[0] = n.xn;
+            d.t[1] = x_in;
+            d.t[2] = w.gin;
+            d.i[0] = t;
+            d.i[1] = h;
+            d.f[0] = eps;
+        })
+    };
     // 2/6/8 the three down-projections. Decode fuses these into ONE GemvQkv (fusion A); there is no
     // GemmQkv, so prefill keeps them split — the same call the dense path makes ("prefill keeps the
     // split; T rows already parallelise"). Each is a separate tiled GEMM over the whole machine.
-    let c_qad = gemm(b, n.qlr, n.xn, w.qad, w.qad_s, ql, h, &[c_rn1]);
-    let c_ckvd = gemm(b, n.ckvraw, n.xn, w.ckvd, w.ckvd_s, dk, h, &[c_rn1]);
-    let c_krr = if dr > 0 {
-        gemm(b, n.krr, n.xn, w.krotd, w.krotd_s, dr, h, &[c_rn1])
+    // PLOW_GLM_GEMM_BLK: q_a quantizes `xn` into the shared FP8 scratch and kv_a reads it back,
+    // after q_a by an explicit edge.
+    let (c_ckvd, c_krr, c_rnq) = if let Some((g, _)) = proj_g {
+        (g, g, g)
     } else {
-        c_rn1
+        let blk_qad = emit_glm_blk_gemm(
+            b,
+            c,
+            n,
+            n.qlr,
+            n.xn,
+            [w.blk_qad, w.blk_qad_s],
+            t,
+            [ql, h],
+            true,
+            &[c_rn1],
+        );
+        let c_qad = match blk_qad {
+            Some(counter) => counter,
+            None => gemm(b, n.qlr, n.xn, w.qad, w.qad_s, ql, h, &[c_rn1]),
+        };
+        let kv_deps: &[u32] = if blk_qad.is_some() {
+            &[c_rn1, c_qad]
+        } else {
+            &[c_rn1]
+        };
+        let blk_ckvd = emit_glm_blk_gemm(
+            b,
+            c,
+            n,
+            n.ckvraw,
+            n.xn,
+            [w.blk_ckvd, w.blk_ckvd_s],
+            t,
+            [dk, h],
+            blk_qad.is_none(),
+            kv_deps,
+        );
+        let c_ckvd = match blk_ckvd {
+            Some(counter) => counter,
+            None => gemm(b, n.ckvraw, n.xn, w.ckvd, w.ckvd_s, dk, h, &[c_rn1]),
+        };
+        let c_krr = if dr > 0 {
+            gemm(b, n.krr, n.xn, w.krotd, w.krotd_s, dr, h, &[c_rn1])
+        } else {
+            c_rn1
+        };
+        // 3 q_a_layernorm, T rows.
+        let c_rnq = b.emit(DevOp::RmsNorm, pf_wide_cus(n_cu, t), &[c_qad], |d| {
+            d.t[0] = n.qlat;
+            d.t[1] = n.qlr;
+            d.t[2] = w.gqa;
+            d.i[0] = t;
+            d.i[1] = ql;
+            d.f[0] = eps;
+        });
+        (c_ckvd, c_krr, c_rnq)
     };
-    // 3 q_a_layernorm, T rows.
-    let c_rnq = b.emit(DevOp::RmsNorm, pf_wide_cus(n_cu, t), &[c_qad], |d| {
-        d.t[0] = n.qlat;
-        d.t[1] = n.qlr;
-        d.t[2] = w.gqa;
-        d.i[0] = t;
-        d.i[1] = ql;
-        d.f[0] = eps;
-    });
     // 4/5 absorbed q_nope and raw q_rope (decode's fusion G, likewise unfused here). Output layout
     // [T][nh_l*DK] is exactly the [b][t][head][DK] the flash indexes with b=1.
     let c_qa = gemm(b, n.qa, n.qlat, w.wqa, w.wqa_s, nh_l * dk, ql, &[c_rnq]);
@@ -4754,12 +6395,12 @@ pub(crate) fn emit_glm_mla_prefill(
     //   routing degrades to dense (the 8-wave kernel ignores t7) rather than corrupting.
     // B2's head-batched gather fills the 64 M-rows with (8 queries x 8 heads); a shard with
     // any other per-rank head count has no row map, so those configs stay dense.
-    let sparse = glm_dsa_pf_bucket(c, t) && w.iwqb != TENSOR_NONE && nh_l == 8;
-    // The indexer chain is emitted on the layers that carry its weights ('full' layers); shared
-    // layers reuse the previous full layer's union table, exactly as the decode chain reuses its
-    // idx. `c_uni` threads that reuse: it is the last emitted union's dep, or the flash's own deps
-    // when no chain has run yet in this program.
-    let c_sel_pf = if sparse {
+    //
+    // Shared layers consume the last full layer's union. Ragged chunks must patch the
+    // selection chain and flash to the same live row count: both derive causal query
+    // positions and the union header from it (see plowrt::exec::kvrow).
+    // The selection decision (`sparse`, `idx_chain`) is taken above the input norm.
+    let c_sel_pf = if idx_chain {
         Some(emit_glm_dsa_prefill_select(
             b,
             c,
@@ -4770,16 +6411,13 @@ pub(crate) fn emit_glm_mla_prefill(
             t,
             &all,
             &[c_rn1, c_rnq],
+            xgate,
+            sparse,
+            proj_g.and_then(|(_, gi)| gi),
         ))
     } else {
         None
     };
-    assert!(
-        !(sparse && fp8kv),
-        "PLOW_GLM_DSA_PF=1 with fp8 latent KV: the V2 flash GATHER arm is bf16-only (op 110 never \
-         routes to the flash object), so the gathered packet would read fp8 latent bytes as bf16. \
-         Unset one of PLOW_GLM_FP8_KV / PLOW_GLM_DSA_PF."
-    );
     // OFOLD (fusion-audit seam 1): flash writes normalized bf16 partials (i[6]), the merge
     // packet disappears, o_proj becomes the fused W_ofold GEMM. Refuse the arms it cannot
     // compose with rather than silently downgrade — both would corrupt (sparse/fp8kv own
@@ -4801,6 +6439,19 @@ pub(crate) fn emit_glm_mla_prefill(
         "PLOW_GLM_OFOLD=1 cannot combine with PLOW_GLM_DSA_PF or PLOW_GLM_FP8_KV: the ofold \
          epilogue is the dense V2 arm's i[6], and the fused GEMM reads bf16 partials. Unset one."
     );
+    // The band's decode fold rewrites O rows [0, band) behind the prefill fold; under ofold
+    // there is no prefill fold to order behind. A sparse bucket takes the packed topology only
+    // with the span-aware chain (`glm_sparse_spans`) — `glm_emit_full` filters, this is the
+    // backstop.
+    assert!(
+        band.is_none() || !ofold,
+        "token-batch body cannot carry the ofold epilogue (t={t})"
+    );
+    assert!(
+        !(sparse && b.packed_prefill_segments()) || glm_sparse_spans(c),
+        "packed sparse prefill (t={t}) requires PLOW_PACKED_SPARSE_PF=1 with PLOW_GLM_INDEX_TP=1, \
+         an unpooled indexer and FP8 KV"
+    );
     let mut fl_deps = vec![c_qa, c_qr, c_rnkv, c_krd];
     if let Some(d) = c_sel_pf {
         fl_deps.push(d);
@@ -4809,14 +6460,26 @@ pub(crate) fn emit_glm_mla_prefill(
     // each split a ceil-equal share of ITS tile's causal range — what fixes the tail-round
     // quantization (1024 items on 304 CUs = 3.37 rounds, 34% of the machine idle inside the
     // packet, 8k trace). i[6] carries it on the DENSE arm only; the sparse arm owns i[6]=cap.
-    // t >= 2048 mirrors the host's V2 routing threshold (exec/amd.rs): below it the packet
-    // runs on the 8-wave kernel, which does not honor the split — the host refuses that
-    // combination, so the emitter must not produce it for the small rungs.
-    let pf_ns = if fp8kv || sparse || t < 2048 || ofold {
+    // Small dense FP8 rungs use a separate four-wave object; fj[2] carries its
+    // split capacity and the runtime rebases it together with the matching merge.
+    // A body's flash runs the packed per-span arm, which has no KV-split axis; the fold must
+    // expect ONE partial per row, as under the global packed emit (`glm_small_pf_split_cap`).
+    let small_pf_ns = if band.is_some() {
+        1
+    } else {
+        glm_small_pf_split_cap(c, n_cu, t, b.packed_prefill_segments())
+    };
+    let sparse_sel = if b.packed_prefill_segments() { n.iidx_pf } else { n.iuni };
+    let pf_ns = if fp8kv && !sparse {
+        small_pf_ns
+    } else if fp8kv || sparse || t < 2048 || ofold {
         1 // ofold owns this bucket: the fold consumes the un-split l (ns==1 premise)
     } else {
         glm_pf_ns()
     };
+    let c_uv = if use_rowsplit {
+        emit_glm_rowsplit_attn(b, c, n, w, t, ctx, slot, fp8kv, sparse_sel, &fl_deps, xgate, xr_cus)
+    } else {
     let c_fl = b.emit(
         if fp8kv {
             DevOp::FlashMlaPrefillFp8
@@ -4834,7 +6497,17 @@ pub(crate) fn emit_glm_mla_prefill(
             d.t[5] = if dr > 0 { n.krot[slot] } else { n.ckv[slot] };
             d.t[6] = n.kvlen;
             if fp8kv {
-                d.t[7] = n.kv_scale[slot]; // per-row dequant scales; the kernel traps on NULL
+                d.t[7] = n.kv_scale[slot];
+                if small_pf_ns > 1 && !sparse {
+                    d.j[1] = small_pf_ns;
+                }
+                if sparse {
+                    // The selection the gather walks: the per-8-query union table, or — under
+                    // the packed topology, which emits no union — the TP indexer's per-row
+                    // selection (`emit_glm_dsa_prefill_select`).
+                    d.j[0] = sparse_sel + 1;
+                    d.i[6] = glm_dsa_pf_cap(c, ctx);
+                }
             } else if sparse {
                 d.t[7] = n.iuni; // the union table; its presence selects the GATHER arm
                 d.i[6] = glm_dsa_pf_cap(c, ctx);
@@ -4870,12 +6543,30 @@ pub(crate) fn emit_glm_mla_prefill(
     //    on this emitter the way `emit_xreduce`'s sizing had to be (knob-contract §7c).
     // Under OFOLD the merge packet does not exist: the flash's normalized bf16 partials ARE
     // the fused GEMM's A operand, so the o-GEMM deps straight on the flash.
-    let c_uv = if ofold {
+    let native_fold = emit_config::active().glm_fold_lt() && t >= 2048;
+    if native_fold {
+        assert!(
+            crate::emit_is_amd()
+                && b.n_cu() == 304
+                && c.tp == 8
+                && nh_l == 8
+                && dk == 512
+                && vd == 256
+                && (1..8).contains(&pf_ns)
+                && !ofold,
+            "native MLA fold requires gfx942 TP8 latent512/value256, splits<8, and no ofold fusion"
+        );
+    }
+    if ofold {
         c_fl
     } else {
-        b.emit(
+        let counter = b.emit(
             DevOp::MlaMergeFold,
-            mla_fold_cus(&all, t * nh_l, vd),
+            if native_fold {
+                vec![0]
+            } else {
+                mla_fold_cus(&all, t * nh_l, vd)
+            },
             &[c_fl],
             |d| {
                 d.t[0] = n.oat;
@@ -4889,8 +6580,38 @@ pub(crate) fn emit_glm_mla_prefill(
                 // m=-inf/l=0, which this merge weighs 0 branch-free (the "empty split"
                 // precondition the old comment described predates that merge rewrite).
                 d.i[4] = pf_ns;
+                d.i[5] = u32::from(native_fold);
             },
-        )
+        );
+        if native_fold {
+            b.isolate(counter);
+        }
+        counter
+    }
+    };
+    // TOKEN-BATCH BODY: the band rows take the batched decode attention chain over the same
+    // projections. Its fold writes O rows [0, band) AFTER the prefill fold has written all T
+    // rows (the two chains share `opart`/`mlpart`), so o_proj below depends on the band fold.
+    let c_uv = match band {
+        Some(bw) => emit_glm_band_attention(
+            b,
+            c,
+            n,
+            w,
+            slot,
+            ctx,
+            bw,
+            &all,
+            eps,
+            ql,
+            h,
+            c_rn1,
+            c_rnq,
+            c_sel_pf,
+            &[c_qa, c_qr, c_rnkv, c_krd],
+            c_uv,
+        ),
+        None => c_uv,
     };
     // 12 o_proj, row-parallel over this rank's head shard. Under TP the [T,hidden] partial goes
     //    through the TWO-SHOT all-reduce (reduce-scatter + all-gather), not decode's one-shot: the
@@ -4908,8 +6629,23 @@ pub(crate) fn emit_glm_mla_prefill(
             // Fused W_ofold GEMM: A = the flash's normalized bf16 partials in the opart
             // allocation ([T, nh_l*DK] row-major), K = nh_l*DK. Replaces merge + o_proj.
             gemm(b, out, n.opart, w.wofold, TENSOR_NONE, h, nh_l * dk, deps)
+        } else if let Some(counter) = emit_glm_blk_gemm(
+            b,
+            c,
+            n,
+            out,
+            n.oat,
+            [w.blk_wo, w.blk_wo_s],
+            t,
+            [h, nh_l * vd],
+            true,
+            deps,
+        ) {
+            counter
         } else if lin_fp8 {
             emit_pf_gemm_fp8_blk(b, &all, out, n.oat, w.wo, w.wo_s, t, h, nh_l * vd, deps)
+        } else if lt_ext.o_proj && enc != MoeEnc::Mxfp4 {
+            emit_glm_lt_ext(b, c, out, n.oat, w.wo, t, t, [h, nh_l * vd], deps)
         } else {
             gemm(b, out, n.oat, w.wo, w.wo_s, h, nh_l * vd, deps)
         }
@@ -4919,11 +6655,24 @@ pub(crate) fn emit_glm_mla_prefill(
     // block-fp8 and MXFP4 GEMM families do not, and banding them would silently overwrite
     // band 0's rows.
     // (ofold also forces kb=1: the banded arm's inline GEMMs hardcode oat/wo.)
-    let kb = if lin_fp8 || enc == MoeEnc::Mxfp4 || ofold {
+    let blk_oproj = w.blk_wo != TENSOR_NONE && (2048..=8192).contains(&t);
+    let kb = if lin_fp8 || enc == MoeEnc::Mxfp4 || ofold || blk_oproj {
         1
     } else {
         xr_band_k(t, "attn")
     };
+    if sp {
+        // Sequence-parallel attention seam: reduce-scatter the o_proj partial in place, residual
+        // and post_attention_layernorm on the owned band, all-gather the normed rows.
+        assert!(kb == 1, "PLOW_GLM_SEQ_PAR cannot combine with PLOW_GLM_XR_BAND");
+        let c_p = oproj(b, n.og_tp, &[c_uv]);
+        let c_rs =
+            crate::emit_xreduce_scatter(b, xgate, xr_cus, &[c_p], n.og_tp, t * h, tp, 0, None, None);
+        let c_res = glm_sp_residual(b, t, tp, h, n.xmid, x_in, n.og_tp, &[c_rs]);
+        return glm_sp_norm_gather(
+            b, n, t, tp, h, eps, n.xn2, n.xmid, w.gpost, &[c_res], xgate, xr_cus,
+        );
+    }
     let xr_deps: Vec<u32> = if tp > 1 && !no_xr && kb > 1 {
         // BANDED TP seam (see emit_xreduce_twoshot_band): K row-band o_proj GEMMs, each
         // feeding its own two-shot — band 0's fabric transfer overlaps bands 1..K-1's
@@ -5064,8 +6813,10 @@ fn emit_glm_block_prefill(
     pre: &[u32],
     xgate: &mut u32,
     xr_cus: &[u32],
+    band: Option<u32>,
 ) -> u32 {
-    let c_rn2 = emit_glm_mla_prefill(b, c, n, slot, ctx, t, enc, x_in, pre, false, xgate, xr_cus);
+    let c_rn2 =
+        emit_glm_mla_prefill(b, c, n, slot, ctx, t, enc, x_in, pre, false, xgate, xr_cus, band);
     emit_glm_moe_ffn_prefill(b, c, n, slot, t, enc, x_out, c_rn2, xgate, xr_cus, false)
 }
 
@@ -5114,6 +6865,7 @@ fn emit_glm_moe_ffn_prefill(
     // expert_weight_table, and the host binds NULL for a non-local expert either way.
     let imoe_e = if c.ep { imoe } else { imoe_l };
     let w = &n.lw[slot];
+    let lt_ext = glm_lt_pf_ext().at(t);
     // EXPERT-COUNT BOUND. Two LDS carves scale with n_exp and neither is checked on device: the
     // align op's `cnt[n_exp] | cur[n_exp] | tot` and the router tail's `scores[n_exp] | keys[n_exp]`.
     // Both fit the AMD raw arena at 384 (the largest, keys, is 384*8 = 3 KiB against ~144 KiB), which
@@ -5138,7 +6890,7 @@ fn emit_glm_moe_ffn_prefill(
      -> u32 {
         // Same fix as the sibling emitter above: the fp4 prefill GEMM goes through `pick_tile`
         // like every other encoding, instead of being pinned to the object's default tile.
-        let op = pick_tile(t, nn, k, n_cu, mxfp4_quant(enc));
+        let op = glm_prefill_projection_op(c, t, nn, k, n_cu, mxfp4_quant(enc));
         b.emit(op, all.clone(), deps, |d| {
             d.t[0] = out;
             d.t[1] = x;
@@ -5154,7 +6906,7 @@ fn emit_glm_moe_ffn_prefill(
 
     // 15a router SCORE: the [T, n_exp] logit matrix is an ordinary tiled GEMM — the router split's
     //     decode half was already "the ordinary multi-CU GEMV", and this is its T-row twin.
-    let c_score = gemm(b, n.rlogit, n.xn2, w.wr, w.wr_s, e, h, &[c_rn2]);
+    //     Emitted below, once `det` is known (the band router needs it off).
     // 15b router TOP-K tail, block-per-token. Bit-identical PER TOKEN to the decode tail (the kernel
     //     is literally that kernel under a token loop), so the 8-of-384 selection a prefill chunk
     //     makes is the selection decode would have made for the same row.
@@ -5162,12 +6914,75 @@ fn emit_glm_moe_ffn_prefill(
     // It is the earliest packet of the MoE chain (router -> align -> GLU -> DOWN), so the
     // existing edges already order the zero before every writer — no new packet, no new gate.
     // `tk.is_power_of_two()` is what makes `tok = pidx >> log2(k)` exact.
-    let det = moe_pf_fuse(tk) == MoePfFuse::Det;
+    let resident = emit_config::active().glm_moe_resident();
+    let native_moe = emit_config::active().glm_moe_aiter() || resident;
+    if native_moe {
+        assert!(
+            enc == MoeEnc::Fp8Blk
+                && tp == 8
+                && n_cu == 304
+                && (1..=8192).contains(&t)
+                && (h, imoe_e, e, tk) == (6144, 256, 256, 8),
+            "PLOW_GLM_MOE_AITER requires gfx942 TP8 GLM block-FP8 prefill, rows 1..8192"
+        );
+    }
+    // PLOW_GLM_MOE_SHARED_FOLD — see `glm_shared_fold`. `e_all`/`tk_all` are what the ROUTING
+    // chain (router tail -> align -> the fused call) is shaped for; `e`/`tk` stay what the router
+    // SCORES, because the [T, n_exp] logit matrix has no column for the shared expert.
+    let fold = glm_shared_fold(c, enc);
+    assert!(
+        !fold || native_moe,
+        "PLOW_GLM_MOE_SHARED_FOLD needs the native MoE route: nothing else reads a {}-entry \
+         expert table or a top-{} routing slot",
+        e + 1,
+        tk + 1
+    );
+    let (e_all, tk_all) = (e + u32::from(fold), tk + u32::from(fold));
+    let det = !native_moe && moe_pf_fuse(tk) == MoePfFuse::Det;
     let align_par = emit_config::active().moe_align_par && t >= 1024;
-    let router_blocks: Vec<_> = (0..t.min(n_cu)).collect();
+    // PLOW_GLM_SEQ_PAR_PROJ: score and top-k on the owned band, then gather the route table out
+    // of peer slot 5 (free between this layer's attention reduce-scatter and the next layer's
+    // input seam). Needs `!det`: the det prologue zeroes an accumulator over all T rows.
+    let band_router =
+        tp > 1 && !raw_output && !det && n.ug_tp != TENSOR_NONE && glm_sp(c, n, b, t);
+    let (tr, rlogit, tab, c_score) = if band_router {
+        let tb = t / tp;
+        let xb = glm_band(b, n.xn2, t, tp, h as u64 * 2);
+        let lb = glm_band(b, n.rlogit, t, tp, e as u64 * 2);
+        let cs = if lt_ext.router && enc != MoeEnc::Mxfp4 {
+            emit_glm_lt_ext(b, c, lb, xb, w.wr, t, tb, [e, h], &[c_rn2])
+        } else {
+            let op = glm_prefill_projection_op(c, tb, e, h, n_cu, mxfp4_quant(enc));
+            b.emit(op, all.clone(), &[c_rn2], |d| {
+                d.t[0] = lb;
+                d.t[1] = xb;
+                d.t[2] = w.wr;
+                if enc == MoeEnc::Mxfp4 {
+                    d.t[3] = w.wr_s;
+                }
+                d.i[0] = tb;
+                d.i[1] = e;
+                d.i[2] = h;
+            })
+        };
+        let tab_b = glm_band_as(b, n.rt_tp, t, tp, tk_all as u64 * 8, ".rt");
+        (tb, lb, tab_b, cs)
+    } else {
+        (t, n.rlogit, n.tab, gemm(b, n.rlogit, n.xn2, w.wr, w.wr_s, e, h, &[c_rn2]))
+    };
+    // PLOW_GLM_GEMM_LT_PF_EXT: the shared expert's gate and up go next to the router score so the
+    // native segments form one run; their GLU is emitted below as its own op.
+    let shared_lt = (lt_ext.shared && !fold && enc != MoeEnc::Mxfp4 && !glm_linear_fp8(enc)).then(
+        || {
+            let gate = emit_glm_lt_ext(b, c, n.shfu, n.xn2, w.shg, t, t, [imoe_l, h], &[c_rn2]);
+            let up = emit_glm_lt_ext(b, c, n.shfu_up, n.xn2, w.shu, t, t, [imoe_l, h], &[c_rn2]);
+            (gate, up)
+        },
+    );
+    let router_blocks: Vec<_> = (0..tr.min(n_cu)).collect();
     let c_router = b.emit(DevOp::MoeRouterTopkPf, router_blocks, &[c_score], |d| {
-        d.t[0] = n.tab;
-        d.t[1] = n.rlogit;
+        d.t[0] = tab;
+        d.t[1] = rlogit;
         d.t[3] = w.bias;
         if det {
             d.t[2] = n.part;
@@ -5176,7 +6991,12 @@ fn emit_glm_moe_ffn_prefill(
         d.i[1] = e;
         d.i[2] = tk;
         d.i[3] = GLM_ROUTER_FLAGS;
-        d.i[4] = t;
+        d.i[4] = tr;
+        // PLOW_GLM_MOE_SHARED_FOLD: the table stride becomes k+1 slots per token and the tail
+        // slot is written `{expert n_exp, gate 1.0}`. The SELECTION is untouched — the same
+        // top-k over the same n_exp logits, so a folded and an unfolded packet route every token
+        // to the same routed experts and differ only by the appended constant slot.
+        d.i[5] = u32::from(fold);
         // Same group operands as the decode tail — the prefill kernel is that kernel under a token
         // loop, so an emitter that set them on one and not the other would make prefill and decode
         // route the same token to DIFFERENT experts.
@@ -5184,6 +7004,13 @@ fn emit_glm_moe_ffn_prefill(
         d.i[7] = c.topk_group;
         d.f[0] = c.route_scale;
     });
+    // 8-byte table entries gathered as bf16 pairs: each rank's slice is still its band's rows.
+    let c_router = if band_router {
+        let pairs = [(n.tab, t * tk_all * 4, 5 * n.slot_b)];
+        crate::emit_xall_gather(b, xgate, xr_cus, &[c_router], &pairs, tp)
+    } else {
+        c_router
+    };
     let align = |b: &mut Builder, blocks: Vec<u32>, deps: &[u32], phase: u32| {
         b.emit(DevOp::MoeAlignPf, blocks, deps, |d| {
             d.t[0] = n.meta;
@@ -5192,8 +7019,8 @@ fn emit_glm_moe_ffn_prefill(
             d.t[3] = n.row_partidx;
             d.t[4] = n.row_gate;
             d.i[0] = t;
-            d.i[1] = e;
-            d.i[2] = tk;
+            d.i[1] = e_all;
+            d.i[2] = tk_all;
             d.i[3] = phase;
             d.i[4] = u32::from(phase != 0) * 64;
         })
@@ -5225,8 +7052,13 @@ fn emit_glm_moe_ffn_prefill(
     // sets on top of two accumulators and cannot be built at 8 waves (see `d_gemm_fp8_blk`'s note
     // on why that family has one tile rung at all). MXFP4 has no such cost — its E8M0 scale folds
     // into the cvt exactly — which is why the fp4 arm falls out and the block-fp8 one does not.
+    // PLOW_GLM_MOE_SHARED_FOLD: the shared expert is expert `e` of the fused call now, so these
+    // two packets — the 54 ms per 8192-row chunk the fold exists to remove — are not emitted and
+    // the combine's `shared` operand goes away with them.
     let lin_fp8 = glm_linear_fp8(enc);
-    let c_shglu = if enc == MoeEnc::Mxfp4 && glu_fusion_wins_mxfp4(t, imoe_l, h, n_cu) {
+    let c_shglu = if fold {
+        c_rn2
+    } else if enc == MoeEnc::Mxfp4 && glu_fusion_wins_mxfp4(t, imoe_l, h, n_cu) {
         b.emit(DevOp::GemmGluMxfp4, all.clone(), &[c_rn2], |d| {
             d.t[0] = n.shfu;
             d.t[1] = n.xn2;
@@ -5239,8 +7071,10 @@ fn emit_glm_moe_ffn_prefill(
             d.i[2] = h;
             d.i[5] = GLM_ACT_SILU;
         })
-    } else if enc == MoeEnc::Mxfp4 || lin_fp8 {
-        let (c_g, c_u) = if lin_fp8 {
+    } else if enc == MoeEnc::Mxfp4 || lin_fp8 || shared_lt.is_some() {
+        let (c_g, c_u) = if let Some(pair) = shared_lt {
+            pair
+        } else if lin_fp8 {
             (
                 emit_pf_gemm_fp8_blk(
                     b,
@@ -5293,7 +7127,9 @@ fn emit_glm_moe_ffn_prefill(
         })
     };
     // 17 shared expert down — row-parallel (imoe_l input): a PARTIAL [T,H] under TP.
-    let c_shd = if lin_fp8 {
+    let c_shd = if fold {
+        c_shglu
+    } else if lin_fp8 {
         emit_pf_gemm_fp8_blk(
             b,
             &all,
@@ -5306,61 +7142,82 @@ fn emit_glm_moe_ffn_prefill(
             imoe_l,
             &[c_shglu],
         )
+    } else if shared_lt.is_some() {
+        emit_glm_lt_ext(b, c, n.shared, n.shfu, w.shd, t, t, [h, imoe_l], &[c_shglu])
     } else {
         gemm(b, n.shared, n.shfu, w.shd, w.shd_s, h, imoe_l, &[c_shglu])
     };
     // 18 grouped gate/up + GLU over the sorted rows. A is gathered from xn2 by row_token, so an
     //    expert's gate|up crosses HBM ONCE for every token that chose it — the reuse decode cannot
     //    have. i[3] picks the block-fp8 or bf16 weight arm from the same tables decode uses.
-    let c_g = b.emit(DevOp::MoeGroupGluPf, all.clone(), &[c_align, c_rn2], |d| {
-        d.t[0] = n.fu_g;
-        d.t[1] = n.xn2;
-        d.t[2] = w.ewt;
-        d.t[3] = w.est;
-        d.t[4] = n.meta;
-        d.t[5] = n.row_token;
-        // A4W4 binds two more: t6 = row_partidx, so the fused bridge can tell a PAD row from a live
-        // one and skip it (the bf16/fp8 arms let pad rows fall out in DOWN's scatter instead, but a
-        // bridge that quantized them would write E8M0 bytes for rows nothing reads); t7 = the E8M0
-        // scale rows it WRITES, because the bridge is this op's epilogue rather than a separate op.
-        if enc == MoeEnc::Mxfp4 {
+    let c_d = if native_moe {
+        let counter = b.emit(DevOp::MoeAiterFp8Pf, one.clone(), &[c_align, c_rn2], |d| {
+            d.t = [
+                n.part,
+                n.xn2,
+                w.ewt,
+                w.est,
+                n.meta,
+                n.row_token,
+                n.row_partidx,
+                n.row_gate,
+            ];
+            d.i = [t, h, imoe_e, e_all, tk_all, 64, 2, u32::from(resident)];
+        });
+        b.isolate(counter);
+        counter
+    } else {
+        let c_g = b.emit(DevOp::MoeGroupGluPf, all.clone(), &[c_align, c_rn2], |d| {
+            d.t[0] = n.fu_g;
+            d.t[1] = n.xn2;
+            d.t[2] = w.ewt;
+            d.t[3] = w.est;
+            d.t[4] = n.meta;
+            d.t[5] = n.row_token;
+            // A4W4 binds two more: t6 = row_partidx, so the fused bridge can tell a PAD row from a live
+            // one and skip it (the bf16/fp8 arms let pad rows fall out in DOWN's scatter instead, but a
+            // bridge that quantized them would write E8M0 bytes for rows nothing reads); t7 = the E8M0
+            // scale rows it WRITES, because the bridge is this op's epilogue rather than a separate op.
+            if enc == MoeEnc::Mxfp4 {
+                d.t[6] = n.row_partidx;
+                d.t[7] = n.fu_scale;
+            }
+            d.i[0] = imoe_e;
+            d.i[1] = h;
+            d.i[2] = e;
+            d.i[MoeEnc::PREFILL_SLOT] = enc.code();
+            d.i[5] = GLM_ACT_SILU;
+        });
+        // 19 grouped down + gate-scale + SCATTER into part[T*k, H]. row_partidx carries each gathered
+        //    row's fixed destination, so the align op's nondeterministic within-expert row ORDER does
+        //    not reach the output — the combine below still sums part in FIXED slot order.
+        let c_d = b.emit(DevOp::MoeGroupDownPf, all.clone(), &[c_g], |d| {
+            d.t[0] = n.part;
+            d.t[1] = n.fu_g;
+            d.t[2] = w.ewt;
+            d.t[3] = w.est;
+            d.t[4] = n.meta;
+            // t5 = the E8M0 rows the bridge wrote — DOWN's A operand is fp4 + these, so under A4W4 the
+            // activation never returns to bf16 between the two GEMMs.
+            if enc == MoeEnc::Mxfp4 {
+                d.t[5] = n.fu_scale;
+            }
             d.t[6] = n.row_partidx;
-            d.t[7] = n.fu_scale;
-        }
-        d.i[0] = imoe_e;
-        d.i[1] = h;
-        d.i[2] = e;
-        d.i[MoeEnc::PREFILL_SLOT] = enc.code();
-        d.i[5] = GLM_ACT_SILU;
-    });
-    // 19 grouped down + gate-scale + SCATTER into part[T*k, H]. row_partidx carries each gathered
-    //    row's fixed destination, so the align op's nondeterministic within-expert row ORDER does
-    //    not reach the output — the combine below still sums part in FIXED slot order.
-    let c_d = b.emit(DevOp::MoeGroupDownPf, all.clone(), &[c_g], |d| {
-        d.t[0] = n.part;
-        d.t[1] = n.fu_g;
-        d.t[2] = w.ewt;
-        d.t[3] = w.est;
-        d.t[4] = n.meta;
-        // t5 = the E8M0 rows the bridge wrote — DOWN's A operand is fp4 + these, so under A4W4 the
-        // activation never returns to bf16 between the two GEMMs.
-        if enc == MoeEnc::Mxfp4 {
-            d.t[5] = n.fu_scale;
-        }
-        d.t[6] = n.row_partidx;
-        d.t[7] = n.row_gate;
-        d.i[0] = h;
-        d.i[1] = imoe_e;
-        d.i[2] = e;
-        d.i[MoeEnc::PREFILL_SLOT] = enc.code();
-        // PLOW_MOE_PF_DET: log2(k)+1 in i[5]. `row_partidx[row] == token*k + slot`
-        // (d_moe_align_pf), so the epilogue recovers the token with one shift and adds into
-        // acc[token][H]. i[4] was the retired atomic arm's field; an object carrying one arm can
-        // never read a blob emitted for the other as its own.
-        if det {
-            d.i[5] = tk.trailing_zeros() + 1;
-        }
-    });
+            d.t[7] = n.row_gate;
+            d.i[0] = h;
+            d.i[1] = imoe_e;
+            d.i[2] = e;
+            d.i[MoeEnc::PREFILL_SLOT] = enc.code();
+            // PLOW_MOE_PF_DET: log2(k)+1 in i[5]. `row_partidx[row] == token*k + slot`
+            // (d_moe_align_pf), so the epilogue recovers the token with one shift and adds into
+            // acc[token][H]. i[4] was the retired atomic arm's field; an object carrying one arm can
+            // never read a blob emitted for the other as its own.
+            if det {
+                d.i[5] = tk.trailing_zeros() + 1;
+            }
+        });
+        c_d
+    };
     // 20 T-token combine. Under TP `shared`/`part` are PARTIALS, so the combine residual must NOT be
     //    xmid (XReduce would sum it tp times): it writes the partial with a zero residual, the
     //    two-shot all-reduce folds the ranks, and a Residual then adds the real xmid. tp==1 keeps
@@ -5373,6 +7230,10 @@ fn emit_glm_moe_ffn_prefill(
         // Residual. kb==1 emits the exact pre-banding packets.
         let kb = xr_band_k(t, "moe");
         let rows = t / kb;
+        // Sequence-parallel FFN seam: reduce-scatter, then the residual on the owned band only;
+        // the next layer's input norm (or the tail's final norm) gathers.
+        let sp = !raw_output && glm_sp(c, n, b, t);
+        assert!(!sp || kb == 1, "PLOW_GLM_SEQ_PAR cannot combine with PLOW_GLM_XR_BAND");
         // CU-SUBSET SCHEDULING — see `xr_band_cus` and the attn seam's twin. Gated on kb>1
         // so `PLOW_GLM_XR_BAND_CUS` never narrows the UNBANDED collective (that is
         // `PLOW_XR_CUS`'s job) and the two seams stay symmetric under every knob combination.
@@ -5393,16 +7254,24 @@ fn emit_glm_moe_ffn_prefill(
                     // (7.5 GB per 8k chunk over 75 MoE layers) to add 0.0f. Bit-identical by
                     // inspection of that ternary, and it removes one of this op's four streams.
                     d.t[1] = TENSOR_NONE;
-                    d.t[2] = n.shared;
+                    // Under the fold the shared expert is inside `part`; `d_moe_combine_pf`
+                    // already spells "no shared partial" as a null pointer (`if (shared)`).
+                    d.t[2] = if fold { TENSOR_NONE } else { n.shared };
                     d.t[3] = n.part;
                     d.i[0] = h;
                     // PLOW_MOE_PF_DET: op 86 already summed the k slots in place, so this
                     // reads ONE contiguous stream. Same kernel, same expression, k = 1.
-                    d.i[1] = if det { 1 } else { tk };
+                    d.i[1] = if det || native_moe { 1 } else { tk };
                     d.i[2] = rows;
                     d.i[3] = i * rows; // t_row0
                     d.i[4] = u32::from(det); // f64 fixed-point accumulator (PLOW_MOE_PF_DET)
+                    d.i[7] = u32::from(native_moe);
                 });
+                if sp {
+                    return crate::emit_xreduce_scatter(
+                        b, xgate, &bcus, &[c_cmb], n.dg_tp, t * h, tp, n.slot_b, None, None,
+                    );
+                }
                 // `n.slot_b`, NOT `t * h * 2`: the offset is a property of the BLOB (where
                 // the host binds `act.dg_tp`), not of this bucket. See GlmTn.
                 emit_xreduce_twoshot_band(
@@ -5419,7 +7288,9 @@ fn emit_glm_moe_ffn_prefill(
                 )
             })
             .collect();
-        if raw_output {
+        if sp {
+            glm_sp_residual(b, t, tp, h, x_out, n.xmid, n.dg_tp, &xr_deps)
+        } else if raw_output {
             // Mirrors emit_glm_mla_prefill's own raw_output tail exactly: n.attn already holds
             // the correct zero-residual TP-summed result (the per-band MoeCombinePf above always
             // passes a null residual), so there is nothing left to add — just join every band's
@@ -5447,12 +7318,13 @@ fn emit_glm_moe_ffn_prefill(
         b.emit(DevOp::MoeCombinePf, all.clone(), &[c_shd, c_d], |d| {
             d.t[0] = if raw_output { n.attn } else { x_out };
             d.t[1] = if raw_output { TENSOR_NONE } else { n.xmid };
-            d.t[2] = n.shared;
+            d.t[2] = if fold { TENSOR_NONE } else { n.shared }; // see the banded twin
             d.t[3] = n.part;
             d.i[0] = h;
-            d.i[1] = if det { 1 } else { tk }; // see the banded twin
+            d.i[1] = if det || native_moe { 1 } else { tk }; // see the banded twin
             d.i[2] = t;
             d.i[4] = u32::from(det); // see the banded twin
+            d.i[7] = u32::from(native_moe);
         })
     }
 }
@@ -5531,8 +7403,10 @@ fn emit_glm_dense_block_prefill(
     pre: &[u32],
     xgate: &mut u32,
     xr_cus: &[u32],
+    band: Option<u32>,
 ) -> u32 {
-    let c_rn2 = emit_glm_mla_prefill(b, c, n, slot, ctx, t, enc, x_in, pre, false, xgate, xr_cus);
+    let c_rn2 =
+        emit_glm_mla_prefill(b, c, n, slot, ctx, t, enc, x_in, pre, false, xgate, xr_cus, band);
     let all = b.all();
     let one = vec![0u32];
     let n_cu = b.n_cu();
@@ -5615,7 +7489,12 @@ fn emit_glm_dense_block_prefill(
         });
         // `n.slot_b`, NOT `t * h * 2`: the offset is a property of the BLOB (where the host binds
         // `act.dg_tp`), not of this bucket. See the field's header on GlmTn.
-        if xr_res_fold() {
+        if glm_sp(c, n, b, t) {
+            let c_rs = crate::emit_xreduce_scatter(
+                b, xgate, xr_cus, &[c_cmb], n.dg_tp, t * h, tp, n.slot_b, None, None,
+            );
+            glm_sp_residual(b, t, tp, h, x_out, n.xmid, n.dg_tp, &[c_rs])
+        } else if xr_res_fold() {
             // XR+Residual fold — same seam shape as the MoE block's, degenerate routing aside.
             emit_xreduce_twoshot_band(
                 b,
@@ -5697,6 +7576,17 @@ fn mxfp4_bf16_exceptions() -> &'static [&'static str] {
 /// So this reads `quantization_config` and nothing else.
 fn mla_ckpt_enc(dir: &Path) -> Option<MoeEnc> {
     let v: Value = serde_json::from_slice(&std::fs::read(dir.join("config.json")).ok()?).ok()?;
+    // A multimodal wrapper nests `quantization_config` under `text_config` with the rest of the
+    // text geometry. Reading only the root found NOTHING on such a checkpoint and returned None,
+    // which this function's caller reads as "unquantized" and answers with the flags — so a
+    // Kimi-K2.7-Code emit produced bf16 expert ops for a checkpoint whose routed experts are
+    // 4-bit. That is the exact substitution the refusal below exists to prevent, reached by
+    // looking in the wrong place rather than by a missing arm.
+    let root = &v;
+    let v = match root["model_type"].as_str() {
+        Some("glm5_next") | Some("kimi_k25") => root.get("text_config").unwrap_or(root),
+        _ => root,
+    };
     let q = v.get("quantization_config")?;
     let method = q.get("quant_method").and_then(|m| m.as_str()).unwrap_or("");
     let fmt = q.get("fmt").and_then(|m| m.as_str()).unwrap_or("");
@@ -5723,6 +7613,35 @@ fn mla_ckpt_enc(dir: &Path) -> Option<MoeEnc> {
              `fp8_block_size_{blk:?}`."
         );
         return Some(MoeEnc::Fp8Blk);
+    }
+    // compressed-tensors `pack-quantized` int4 (Kimi-K2.7-Code's routed experts). Every field is
+    // CHECKED rather than assumed, because each one that differs is a different kernel: the
+    // container is only byte-compatible with the mxfp4 load at 4 bits, the fragment only covers
+    // exactly one scale at group_size 32, and the offset-8 decode in `plow_int4x8_to_f16x4` is
+    // only correct for a SYMMETRIC scheme (an asymmetric one carries its own zero point per
+    // group, which nothing here binds).
+    if method == "compressed-tensors" {
+        let g = q.get("config_groups").and_then(|g| g.as_object());
+        let w = g
+            .and_then(|g| g.values().next())
+            .and_then(|v| v.get("weights"))
+            .unwrap_or_else(|| {
+                panic!("checkpoint quantization_config.config_groups has no weights entry")
+            });
+        let num = |k: &str| w.get(k).and_then(|v| v.as_u64());
+        let fmt = q.get("format").and_then(|f| f.as_str()).unwrap_or("");
+        let ty = w.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let sym = w
+            .get("symmetric")
+            .and_then(|t| t.as_bool())
+            .unwrap_or(false);
+        let bits = num("num_bits").unwrap_or(0);
+        let group = num("group_size").unwrap_or(0);
+        assert!(
+            fmt == "pack-quantized" && ty == "int" && sym && bits == 4 && group == 32,
+            "checkpoint compressed-tensors weights are format={fmt:?} type={ty:?}              symmetric={sym} num_bits={bits} group_size={group}; the int4 arm reads              pack-quantized int4, symmetric, group_size 32 and nothing else. Missing              capability: `ckpt_quant_ct_{ty}{bits}_g{group}`."
+        );
+        return Some(MoeEnc::Int4G32);
     }
     // Anything else is a quantization we cannot emit. REFUSE rather than fall back to bf16: the
     // weights on disk are not bf16, so a bf16 packet is a WRONG packet, not an unoptimised one —
@@ -5871,7 +7790,7 @@ pub(crate) fn glm_prefill_buckets_env(ctx: u32) -> (Vec<u32>, PrefillScope) {
     let parse_list = |list: &str| -> Vec<u32> {
         list.split(',')
             .filter_map(|s| s.trim().parse::<u32>().ok())
-            .filter(|&x| x > 1 && x <= ctx)
+            .filter(|&x| x > 0 && x <= ctx)
             .collect()
     };
     match emit_config::active().mla_prefill.as_deref() {
@@ -5897,8 +7816,8 @@ pub(crate) fn glm_prefill_buckets_env(ctx: u32) -> (Vec<u32>, PrefillScope) {
 /// `n_exp = 1, top_k = 1` dense FFN.
 ///
 /// Differences from the prefill seam, each deliberate:
-///   * projections stay GEMV-family at `M = rows` (a 16-row GEMM tile would pad 8x; the GEMV
-///     rung ladder is the object's decode shape and `check_gemv_capacity` gates the pairing);
+///   * projections use GEMV-family at `M = rows`, with optional native BF16 GEMMs at
+///     qualified decode rungs; `check_gemv_capacity` gates the interpreter pairing;
 ///   * the TP fold is the decode ONE-SHOT `XReduce` over `rows*h` elements, not the row-banded
 ///     two-shot — banding exists to overlap an 8k-row chunk's fabric time, and at 16 rows the
 ///     band bookkeeping costs more than it hides;
@@ -5939,20 +7858,78 @@ fn emit_glm_moe_ffn_rows(
     } else {
         DevOp::Gemv
     };
-    let c_score = b.emit(score_op, all.clone(), &[c_rn2], |d| {
-        d.t[0] = n.rlogit;
-        d.t[1] = n.xn2;
-        d.t[2] = w.wr;
-        if enc == MoeEnc::Mxfp4 {
-            d.t[3] = w.wr_s;
-        }
-        d.i[0] = rows;
-        d.i[1] = e;
-        d.i[2] = h;
-        d.f[0] = 1.0;
+    let c_score =
+        emit_glm_decode_gemm_lt(b, c, enc, rows, [n.rlogit, n.xn2, w.wr], [e, h], &[c_rn2])
+            .unwrap_or_else(|| {
+                b.emit(
+                    score_op,
+                    glm_decode_gemv_cus(&all, score_op, e, h),
+                    &[c_rn2],
+                    |d| {
+                        d.t[0] = n.rlogit;
+                        d.t[1] = n.xn2;
+                        d.t[2] = w.wr;
+                        if enc == MoeEnc::Mxfp4 {
+                            d.t[3] = w.wr_s;
+                        }
+                        d.i[0] = rows;
+                        d.i[1] = e;
+                        d.i[2] = h;
+                        d.f[0] = 1.0;
+                    },
+                )
+            });
+    // PLOW_GLM_DECODE_GEMM_GROUP: the shared gate/up read only `xn2`, so emit them straight after
+    // the router GEMM. The three native GEMMs become adjacent (one overlap run under
+    // PLOW_AMD_DECODE_GEMM_OVERLAP) and top-k and Glu share one interpreter segment.
+    let pre_gu = (emit_config::active().glm_decode_gemm_group()
+        && !lin_fp8
+        && (rows as u64) * (h as u64) > crate::gm_lds_halves()
+        && glm_decode_lt_routes(rows, [imoe_l, h]))
+    .then(|| {
+        [(n.shfu, w.shg), (n.shfu_up, w.shu)].map(|(out, wt)| {
+            emit_glm_decode_gemm_lt(b, c, enc, rows, [out, n.xn2, wt], [imoe_l, h], &[c_rn2])
+                .expect("routed to the native GEMM")
+        })
     });
-    let det = moe_pf_fuse(tk) == MoePfFuse::Det;
-    let c_router = b.emit(DevOp::MoeRouterTopkPf, all.clone(), &[c_score], |d| {
+    let resident = emit_config::active().glm_moe_resident();
+    assert!(
+        !resident || matches!(rows, 1 | 2 | 4 | 8 | 16 | 20),
+        "resident GLM MoE decode requires rows 1/2/4/8/16/20"
+    );
+    let flat = resident || (emit_config::active().glm_moe_flat_decode && matches!(rows, 2 | 4 | 8));
+    if flat {
+        assert!(
+            enc == MoeEnc::Fp8Blk
+                && tp == 8
+                && !c.ep
+                && b.n_cu() == 304
+                && (h, imoe_e, e, tk) == (6144, 256, 256, 8),
+            "flat GLM MoE requires gfx942 TP8 H6144/I256/E256/top8"
+        );
+    }
+    // PLOW_GLM_MOE_SHARED_FOLD is a PREFILL fold: decode keeps its own shared-expert GEMV pair
+    // (one row has no reuse to win back), and expert `e` is simply never selected here. What the
+    // decode route must agree on is the TABLE LENGTH — `i[3]` is what `bind_packed_experts` sizes
+    // the packed slab from, and a decode instruction claiming 256 against a 257-entry table would
+    // make the two disagree about which allocation the pointers describe.
+    let e_all = e + u32::from(glm_shared_fold(c, enc));
+    let det = !flat && moe_pf_fuse(tk) == MoePfFuse::Det;
+    // PLOW_GLM_DECODE_GLUE_CUS: the top-k tail is block-per-token, so `rows` workgroups is
+    // its saturation point (the prefill twin already sizes it so); the combine saturates at
+    // one thread per element (`elem_cus`). Both are pure narrowings, bit-identical.
+    let glue_cus = emit_config::active().glm_decode_glue_cus;
+    let router_cus: Vec<u32> = if glue_cus {
+        (0..rows.min(b.n_cu())).collect()
+    } else {
+        all.clone()
+    };
+    let combine_cus = if glue_cus {
+        elem_cus(&all, rows * h)
+    } else {
+        all.clone()
+    };
+    let c_router = b.emit(DevOp::MoeRouterTopkPf, router_cus, &[c_score], |d| {
         d.t[0] = n.tab;
         d.t[1] = n.rlogit;
         d.t[3] = w.bias;
@@ -5968,16 +7945,20 @@ fn emit_glm_moe_ffn_rows(
         d.i[7] = c.topk_group;
         d.f[0] = c.route_scale;
     });
-    let c_align = b.emit(DevOp::MoeAlignPf, one.clone(), &[c_router], |d| {
-        d.t[0] = n.meta;
-        d.t[1] = n.tab;
-        d.t[2] = n.row_token;
-        d.t[3] = n.row_partidx;
-        d.t[4] = n.row_gate;
-        d.i[0] = rows;
-        d.i[1] = e;
-        d.i[2] = tk;
-    });
+    let c_routes = if flat {
+        c_router
+    } else {
+        b.emit(DevOp::MoeAlignPf, one.clone(), &[c_router], |d| {
+            d.t[0] = n.meta;
+            d.t[1] = n.tab;
+            d.t[2] = n.row_token;
+            d.t[3] = n.row_partidx;
+            d.t[4] = n.row_gate;
+            d.i[0] = rows;
+            d.i[1] = e;
+            d.i[2] = tk;
+        })
+    };
 
     // Shared expert at M = rows. The decode fused ops that cannot carry M (`DenseGluFp8Blk` is
     // i0=N) unfuse into their GEMV halves; the plain arm is `GemvGlu`, which takes M directly.
@@ -6016,17 +7997,29 @@ fn emit_glm_moe_ffn_rows(
              no split form exists for the mxfp4 shared expert — cap the decode ladder"
         );
         let gemv_half = |b: &mut Builder, out: u32, wt: u32| {
-            b.emit(DevOp::Gemv, all.clone(), &[c_rn2], |d| {
-                d.t[0] = out;
-                d.t[1] = n.xn2;
-                d.t[2] = wt;
-                d.i[0] = rows;
-                d.i[1] = imoe_l;
-                d.i[2] = h;
-            })
+            if let Some(counter) =
+                emit_glm_decode_gemm_lt(b, c, enc, rows, [out, n.xn2, wt], [imoe_l, h], &[c_rn2])
+            {
+                return counter;
+            }
+            b.emit(
+                DevOp::Gemv,
+                glm_decode_gemv_cus(&all, DevOp::Gemv, imoe_l, h),
+                &[c_rn2],
+                |d| {
+                    d.t[0] = out;
+                    d.t[1] = n.xn2;
+                    d.t[2] = wt;
+                    d.i[0] = rows;
+                    d.i[1] = imoe_l;
+                    d.i[2] = h;
+                },
+            )
         };
-        let c_g = gemv_half(b, n.shfu, w.shg);
-        let c_u = gemv_half(b, n.shfu_up, w.shu);
+        let [c_g, c_u] = match pre_gu {
+            Some(pre) => pre,
+            None => [gemv_half(b, n.shfu, w.shg), gemv_half(b, n.shfu_up, w.shu)],
+        };
         b.emit(DevOp::Glu, one.clone(), &[c_g, c_u], |d| {
             d.t[0] = n.shfu;
             d.t[1] = n.shfu;
@@ -6066,6 +8059,16 @@ fn emit_glm_moe_ffn_rows(
             d.i[2] = imoe_l;
             d.i[4] = 0;
         })
+    } else if let Some(counter) = emit_glm_decode_gemm_lt(
+        b,
+        c,
+        enc,
+        rows,
+        [n.shared, n.shfu, w.shd],
+        [h, imoe_l],
+        &[c_shglu],
+    ) {
+        counter
     } else {
         let shd_op = if enc == MoeEnc::Mxfp4 {
             DevOp::GemvMxfp4
@@ -6086,59 +8089,76 @@ fn emit_glm_moe_ffn_rows(
         })
     };
 
-    // Grouped gate/up + down over the sorted (row, expert) slots — the prefill pair verbatim
-    // at T = rows.
-    let c_g = b.emit(DevOp::MoeGroupGluPf, all.clone(), &[c_align, c_rn2], |d| {
-        d.t[0] = n.fu_g;
-        d.t[1] = n.xn2;
-        d.t[2] = w.ewt;
-        d.t[3] = w.est;
-        d.t[4] = n.meta;
-        d.t[5] = n.row_token;
-        if enc == MoeEnc::Mxfp4 {
+    let c_d = if flat {
+        let counter = b.emit(DevOp::MoeAiterFp8Pf, one.clone(), &[c_routes, c_rn2], |d| {
+            d.t = [
+                n.part,
+                n.xn2,
+                w.ewt,
+                w.est,
+                n.tab,
+                TENSOR_NONE,
+                TENSOR_NONE,
+                TENSOR_NONE,
+            ];
+            d.i = [rows, h, imoe_e, e_all, tk, 0, 1, u32::from(resident)];
+        });
+        b.isolate(counter);
+        counter
+    } else {
+        let c_g = b.emit(DevOp::MoeGroupGluPf, all.clone(), &[c_routes, c_rn2], |d| {
+            d.t[0] = n.fu_g;
+            d.t[1] = n.xn2;
+            d.t[2] = w.ewt;
+            d.t[3] = w.est;
+            d.t[4] = n.meta;
+            d.t[5] = n.row_token;
+            if enc == MoeEnc::Mxfp4 {
+                d.t[6] = n.row_partidx;
+                d.t[7] = n.fu_scale;
+            }
+            d.i[0] = imoe_e;
+            d.i[1] = h;
+            d.i[2] = e;
+            d.i[MoeEnc::PREFILL_SLOT] = enc.code();
+            d.i[5] = GLM_ACT_SILU;
+        });
+        b.emit(DevOp::MoeGroupDownPf, all.clone(), &[c_g], |d| {
+            d.t[0] = n.part;
+            d.t[1] = n.fu_g;
+            d.t[2] = w.ewt;
+            d.t[3] = w.est;
+            d.t[4] = n.meta;
+            if enc == MoeEnc::Mxfp4 {
+                d.t[5] = n.fu_scale;
+            }
             d.t[6] = n.row_partidx;
-            d.t[7] = n.fu_scale;
-        }
-        d.i[0] = imoe_e;
-        d.i[1] = h;
-        d.i[2] = e;
-        d.i[MoeEnc::PREFILL_SLOT] = enc.code();
-        d.i[5] = GLM_ACT_SILU;
-    });
-    let c_d = b.emit(DevOp::MoeGroupDownPf, all.clone(), &[c_g], |d| {
-        d.t[0] = n.part;
-        d.t[1] = n.fu_g;
-        d.t[2] = w.ewt;
-        d.t[3] = w.est;
-        d.t[4] = n.meta;
-        if enc == MoeEnc::Mxfp4 {
-            d.t[5] = n.fu_scale;
-        }
-        d.t[6] = n.row_partidx;
-        d.t[7] = n.row_gate;
-        d.i[0] = h;
-        d.i[1] = imoe_e;
-        d.i[2] = e;
-        d.i[MoeEnc::PREFILL_SLOT] = enc.code();
-        if det {
-            d.i[5] = tk.trailing_zeros() + 1;
-        }
-    });
+            d.t[7] = n.row_gate;
+            d.i[0] = h;
+            d.i[1] = imoe_e;
+            d.i[2] = e;
+            d.i[MoeEnc::PREFILL_SLOT] = enc.code();
+            if det {
+                d.i[5] = tk.trailing_zeros() + 1;
+            }
+        })
+    };
 
     // Combine + the decode-shaped TP seam: one-shot XReduce over rows*h, then the layer-seam
     // AddNorm (or Residual), exactly as the single-row decode block ends.
     let no_xr = tp > 1 && emit_config::active().no_xreduce;
     if tp > 1 && !no_xr {
-        let c_cmb = b.emit(DevOp::MoeCombinePf, all.clone(), &[c_shd, c_d], |d| {
+        let c_cmb = b.emit(DevOp::MoeCombinePf, combine_cus, &[c_shd, c_d], |d| {
             d.t[0] = n.dg_tp;
             d.t[1] = TENSOR_NONE; // residual rides AFTER the all-reduce (else summed tp times)
             d.t[2] = if raw_output { n.attn } else { n.shared };
             d.t[3] = n.part;
             d.i[0] = h;
-            d.i[1] = if det { 1 } else { tk };
+            d.i[1] = if det || flat { 1 } else { tk };
             d.i[2] = rows;
             d.i[3] = 0;
             d.i[4] = u32::from(det);
+            d.i[7] = u32::from(flat);
         });
         let c_xr = emit_xreduce(
             b,
@@ -6154,16 +8174,21 @@ fn emit_glm_moe_ffn_rows(
         if raw_output {
             c_xr
         } else if let Some(gin_next) = seam_next_gin(n, slot, tp) {
-            b.emit(DevOp::AddNorm, one.clone(), &[c_xr], |d| {
-                d.t[0] = n.xn;
-                d.t[1] = x_out;
-                d.t[2] = n.xmid;
-                d.t[3] = n.attn;
-                d.t[4] = gin_next;
-                d.i[0] = rows;
-                d.i[1] = h;
-                d.f[0] = c.eps;
-            })
+            b.emit(
+                DevOp::AddNorm,
+                decode_norm_cus(b.n_cu(), rows),
+                &[c_xr],
+                |d| {
+                    d.t[0] = n.xn;
+                    d.t[1] = x_out;
+                    d.t[2] = n.xmid;
+                    d.t[3] = n.attn;
+                    d.t[4] = gin_next;
+                    d.i[0] = rows;
+                    d.i[1] = h;
+                    d.f[0] = c.eps;
+                },
+            )
         } else {
             b.emit(DevOp::Residual, spine_cus(b.n_cu()), &[c_xr], |d| {
                 d.t[0] = x_out;
@@ -6180,10 +8205,11 @@ fn emit_glm_moe_ffn_rows(
             d.t[2] = n.shared;
             d.t[3] = n.part;
             d.i[0] = h;
-            d.i[1] = if det { 1 } else { tk };
+            d.i[1] = if det || flat { 1 } else { tk };
             d.i[2] = rows;
             d.i[3] = 0;
             d.i[4] = u32::from(det);
+            d.i[7] = u32::from(flat);
         })
     }
 }
@@ -6231,7 +8257,7 @@ pub(crate) fn emit_glm_moe_ffn(
     let use_fp8 = enc != MoeEnc::Bf16;
     let lin_fp8 = glm_linear_fp8(enc);
     let glu_split = glm_shared_glu_split(enc);
-    if rows > 1 {
+    if rows > 1 || emit_config::active().glm_moe_resident() {
         // BATCHED DECODE FFN: the decode MoE op family carries no token dimension
         // (`MoeRouterTopk`/`MoeGroupGluFp8Blk`/`MoeGroupDownFp8Blk`/`MoeCombine` are all
         // single-row), so at rows > 1 the seam is emitted with the PREFILL family at T = rows —
@@ -6502,6 +8528,14 @@ pub(crate) fn emit_glm_moe_ffn(
         });
         vec![c_d]
     } else {
+        // Int4G32 is DETECTED (mla_ckpt_enc) and has decode primitives (amd_common.h
+        // [INT4-G32-DECODE]), but no emit site routes to them yet, and the `else` below is bf16.
+        // Falling through would emit bf16 expert ops against 4-bit weights — the substitution
+        // `mla_ckpt_enc` exists to refuse, arrived at from the other side. Refuse here instead.
+        assert!(
+            enc != MoeEnc::Int4G32,
+            "MoeEnc::Int4G32 has no decode emit site yet: the kernel primitives exist              (plow_int4x8_to_f16x4 / int4_dot32 / wave_dot_int4_g32) but no DevOp selects them,              so this would emit bf16 expert ops against 4-bit weights. Missing capability:              `moe_decode_int4_g32`. Convert the experts to block-fp8 for a single-block bringup              (scripts/kimi_k27_prep.py), or wire the arm."
+        );
         let (glu_op, down_op) = if use_fp8 {
             (DevOp::MoeExpertGluFp8Blk, DevOp::MoeExpertDownFp8Blk)
         } else {
@@ -6615,10 +8649,17 @@ pub(crate) fn emit_glm_moe_ffn(
 /// The dense-FFN down projection's opcode for an encoding. Block-fp8 and bf16 both go through
 /// `GEMV_FP8_BLK` (the dense down has no bf16-specific op); MXFP4 has its own.
 fn dense_down_op(enc: MoeEnc) -> DevOp {
-    if enc == MoeEnc::Mxfp4 {
-        DevOp::GemvMxfp4
-    } else {
-        DevOp::GemvFp8Blk
+    match enc {
+        MoeEnc::Mxfp4 => DevOp::GemvMxfp4,
+        // A BF16 dense layer is not block-fp8 with the scales left off: `GemvFp8Blk` casts its
+        // weight to `const unsigned char*` and its scale to `const float*`, so pointing it at a
+        // bf16 weight reads half the bytes and dereferences a null grid. Kimi-K2.7-Code's
+        // `ignore` list excludes `mlp.(gate|up|gate_up|down)_proj`, so its dense FFN really is
+        // bf16 and needs the plain arm. The operand slots already line up -- `Gemv` is
+        // [C, x, W] with i = [M, N, K], which is what this call site binds -- so only the opcode
+        // changes; `ddown_s` is TENSOR_NONE on this arm and the t5 bind below is inert.
+        MoeEnc::Bf16 => DevOp::Gemv,
+        _ => DevOp::GemvFp8Blk,
     }
 }
 
@@ -6682,7 +8723,22 @@ pub(crate) fn emit_glm_dense_ffn(
     // the E8M0 rows land in t3/t4 exactly where the block-fp8 grids did. i[0]/i[1] swap meaning
     // between the two ops (op 47 is i0=N i1=K; op 92 is i0=M i1=N i2=K), which is why this is a
     // separate emit rather than an opcode substitution.
-    let c_glu = if enc == MoeEnc::Mxfp4 {
+    let c_glu = if enc == MoeEnc::Bf16 {
+        // BF16 dense SwiGLU: the plain fused GLU (`GemvGlu`), same operands minus the scale
+        // grids. The index meanings DIFFER from op 47 -- `GemvGlu` is i0=M i1=N i2=K where
+        // block-fp8 is i0=N i1=K -- which is why this is its own emit and not an opcode swap,
+        // exactly as the MXFP4 arm below is.
+        b.emit(DevOp::GemvGlu, all.clone(), &[c_rn2], |d| {
+            d.t[0] = n.dfu;
+            d.t[1] = n.xn2;
+            d.t[2] = w.dgate;
+            d.t[5] = w.dup;
+            d.i[0] = 1;
+            d.i[1] = di_l;
+            d.i[2] = h;
+            d.i[5] = GLM_ACT_SILU;
+        })
+    } else if enc == MoeEnc::Mxfp4 {
         b.emit(DevOp::GemvGluMxfp4, all.clone(), &[c_rn2], |d| {
             d.t[0] = n.dfu;
             d.t[1] = n.xn2;
@@ -6908,16 +8964,21 @@ fn emit_glm_dense_ffn_rows(
         if raw_output {
             c_xr
         } else if let Some(gin_next) = seam_next_gin(n, slot, tp) {
-            b.emit(DevOp::AddNorm, one.clone(), &[c_xr], |d| {
-                d.t[0] = n.xn;
-                d.t[1] = x_out;
-                d.t[2] = n.xmid;
-                d.t[3] = n.attn;
-                d.t[4] = gin_next;
-                d.i[0] = rows;
-                d.i[1] = h;
-                d.f[0] = c.eps;
-            })
+            b.emit(
+                DevOp::AddNorm,
+                decode_norm_cus(b.n_cu(), rows),
+                &[c_xr],
+                |d| {
+                    d.t[0] = n.xn;
+                    d.t[1] = x_out;
+                    d.t[2] = n.xmid;
+                    d.t[3] = n.attn;
+                    d.t[4] = gin_next;
+                    d.i[0] = rows;
+                    d.i[1] = h;
+                    d.f[0] = c.eps;
+                },
+            )
         } else {
             b.emit(DevOp::Residual, spine_cus(b.n_cu()), &[c_xr], |d| {
                 d.t[0] = x_out;
@@ -6962,8 +9023,7 @@ fn glm_emit_full(
     verify: Option<&crate::VerifyHook>,
 ) {
     // The decode-batch ladder: one decode program per rung, ascending, after the prefill
-    // buckets (`decode_rung_lo` separates the two ranges by width alone, so every rung must sit
-    // strictly below the narrowest bucket — 32 < 128 holds by construction). Unset, this is
+    // buckets (a non-increasing boundary separates the two ascending ladders). Unset, this is
     // `[1]` and the emit is byte-identical to the pre-ladder one; that anchor is the gate the
     // batched path is validated against.
     let rungs: Vec<u32> = emit_config::active().decode_rungs();
@@ -6977,6 +9037,28 @@ fn glm_emit_full(
     let nl = cap.unwrap_or(c.layers).min(c.layers);
     let layers: Vec<u32> = (0..nl).collect();
     let enc = MoeEnc::from_flags(use_fp8, false);
+    assert!(
+        !emit_config::active().glm_seq_par()
+            || (!emit_config::active().glm_xr_res
+                && emit_config::active().glm_xr_band.unwrap_or(1) <= 1),
+        "PLOW_GLM_SEQ_PAR replaces the two-shot seams; it cannot combine with PLOW_GLM_XR_RES \
+         or PLOW_GLM_XR_BAND"
+    );
+    assert!(
+        !emit_config::active().glm_seq_par_proj() || emit_config::active().glm_seq_par(),
+        "PLOW_GLM_SEQ_PAR_PROJ extends PLOW_GLM_SEQ_PAR; set both"
+    );
+    if emit_config::active().glm_moe_resident() {
+        assert!(
+            crate::emit_is_amd()
+                && target == "gfx942"
+                && tp == 8
+                && enc == MoeEnc::Fp8Blk
+                && !c.ep
+                && !emit_config::active().moe_prefill_ep,
+            "resident GLM MoE requires gfx942 TP8 block-FP8 without EP"
+        );
+    }
 
     // PREFILL BUCKETS. `PLOW_MLA_PREFILL=full` turns the serving blob from decode-only (n_prog = 1)
     // into a bucket ladder + decode. Decode-only is what made GLM's TTFT 20x vLLM's: with no
@@ -6994,7 +9076,7 @@ fn glm_emit_full(
          post_attention_layernorm and never writes act.logits — the runtime would select those \
          programs and sample from a buffer nothing wrote."
     );
-    let max_rows = pf.iter().copied().max().unwrap_or(1);
+    let max_rows = pf.iter().copied().max().map(|rows| rows.max(2)).unwrap_or(1);
 
     let mut tb = Builder::new(n_cu);
     // Row-parameterised declare: activations are sized for the WIDEST bucket, so one tensor table
@@ -7002,7 +9084,7 @@ fn glm_emit_full(
     // decode-only emit byte-identical to one from before this path existed. `dbatch` widens only
     // the KV rings, `in.kvlen`, the lm_head tail and the flash partials — see the declare's doc.
     let tn = declare_glm_rows_batched(&mut tb, &c, ctx, &layers, max_rows, dbatch, enc);
-    let tensors = tb.tensors();
+    let mut tensors = tb.tensors();
     let gen = tb.gen_tensors();
 
     // One program per prefill bucket, ahead of decode. Same layer chain, same dense/MoE split, the
@@ -7022,20 +9104,62 @@ fn glm_emit_full(
     // This mirrors what `mla/kimi_k3.rs` already does for K3; GLM simply never had it, which is
     // why `PLOW_PACKED_PREFILL_ROUTE=1` on a GLM blob loaded three family objects and then
     // refused every rung with "MLA consumer is in a mixed segment".
-    let pf_plan: Vec<(u32, bool)> = pf
+    // TOKEN-BATCH BODIES (`PLOW_TOKEN_BATCH_TP=1`, third pass): the packed sibling of each
+    // bucket wider than the decode band, plus the batched decode attention chain and a
+    // band-sampling tail over rows `[0, dbatch)` — `plans/unified-token-batch.md`, "AMD TP8
+    // lowering decision". Flag unset ⇒ byte-identical blob.
+    // The body sets the packed-segment topology on ITS OWN builder; it does not need the global
+    // `PLOW_EMIT_PACKED_PREFILL` siblings. Both passes carry the native AITER MoE and hipBLASLt
+    // segments unchanged — they are row-agnostic over the dense live rows (class A).
+    // SPARSE (DSA) BUCKETS join both passes only under `glm_sparse_spans`: the TP indexer takes
+    // a per-span table and the AITER flash runs per span at the runtime; the interpreter
+    // selectors derive every row's position from one scalar (class C) and keep those buckets
+    // out of the packed passes.
+    let token_batch_tp = emit_config::active().token_batch_tp;
+    let sparse_spans = glm_sparse_spans(&c);
+    if token_batch_tp {
+        assert!(
+            crate::emit_is_amd() && dbatch > 1,
+            "PLOW_TOKEN_BATCH_TP=1 needs an AMD emit with a decode ladder wider than one row"
+        );
+    }
+    #[derive(Clone, Copy, PartialEq)]
+    enum PfKind {
+        Plain,
+        Packed,
+        TokenBatch,
+    }
+    let pf_plan: Vec<(u32, PfKind)> = pf
         .iter()
-        .map(|&t| (t, false))
+        .map(|&t| (t, PfKind::Plain))
         .chain(
             (crate::emit_is_amd() && emit_config::active().packed_prefill_on())
                 .then_some(&pf)
                 .into_iter()
                 .flatten()
-                .map(|&t| (t, true)),
+                .filter(|&&t| sparse_spans || !glm_dsa_pf_bucket(&c, t))
+                .map(|&t| (t, PfKind::Packed)),
+        )
+        .chain(
+            token_batch_tp
+                .then_some(&pf)
+                .into_iter()
+                .flatten()
+                .filter(|&&t| t > dbatch && (sparse_spans || !glm_dsa_pf_bucket(&c, t)))
+                .map(|&t| (t, PfKind::TokenBatch)),
         )
         .collect();
-    for &(t, packed_segments) in &pf_plan {
+    for &(t, kind) in &pf_plan {
+        let packed_segments = kind != PfKind::Plain;
+        let band = (kind == PfKind::TokenBatch).then_some(dbatch);
         let mut pb = Builder::new(n_cu);
+        if let (PfKind::Plain, Some(k)) = (kind, glm_pf_small_cus(t)) {
+            pb.set_cu_cap(k);
+        }
         pb.set_packed_prefill_segments(packed_segments);
+        if let Some(bw) = band {
+            pb.set_token_batch_band(bw);
+        }
         pb.set_lean_moe_stage2_segments(
             crate::emit_is_amd() && emit_config::active().moe_stage2_lean,
         );
@@ -7045,15 +9169,22 @@ fn glm_emit_full(
         pb.set_moe_prefill_ep_degree(
             (crate::emit_is_amd() && emit_config::active().moe_prefill_ep).then_some(c.tp),
         );
-        // PLOW_L2_PLACE reaches the DECODE builder unconditionally (below). GLM's prefill
-        // program is uni-segment, so `Builder::finish` WOULD place it too — but the
-        // shipped prefill objects are built without -DPLOW_L2_PLACE_DISPATCH
-        // (build_gfx942.sh adds it to decode objects by default, to prefill objects only
-        // under PLOW_L2HIER_PF=1) and the loader refuses a placed program on an unbuilt
-        // object. PLOW_GLM_PLACE_PF=1 opts prefill placement in; pair it with objects
-        // from a PLOW_L2HIER_PF=1 build.
+        // Placed AMD prefill must retain the native-kernel segment boundaries and
+        // pair with objects built under PLOW_L2HIER_PF=1.
         if emit_config::active().glm_place_pf {
+            if crate::emit_is_amd() {
+                pb.deny_uniseg();
+            }
             pb.set_l2_placement(l2_layout);
+        }
+        if (emit_config::active().glm_fold_lt() && t >= 2048)
+            || emit_config::active().glm_moe_resident()
+        {
+            assert!(
+                crate::emit_is_amd() && target == "gfx942",
+                "native GLM prefill requires gfx942"
+            );
+            pb.deny_uniseg();
         }
         pb.adopt_tensors(tensors.clone());
         let pall = pb.all();
@@ -7088,6 +9219,7 @@ fn glm_emit_full(
                     &dep,
                     &mut pxgate,
                     &pxr,
+                    band,
                 )
             } else {
                 emit_glm_block_prefill(
@@ -7103,30 +9235,31 @@ fn glm_emit_full(
                     &dep,
                     &mut pxgate,
                     &pxr,
+                    band,
                 )
             };
             dep = vec![d];
             cur = nxt;
         }
-        emit_glm_tail(&mut pb, &c, &tn, cur, &dep, t, false, &mut pxgate);
-        progs.push(pb.finish());
-        prog_t.push(if packed_segments {
-            packet::devbuild::packed_prefill_program_t(t)
-        } else {
-            t
+        emit_glm_tail(&mut pb, &c, &tn, cur, &dep, t, false, &mut pxgate, band);
+        let prog = pb.finish();
+        // The sequence-parallel seams declare their band views inside the program.
+        if tn.h2_tp != TENSOR_NONE {
+            tensors = prog.tensors.clone();
+        }
+        progs.push(prog);
+        prog_t.push(match kind {
+            PfKind::Plain => t,
+            PfKind::Packed => packet::devbuild::packed_prefill_program_t(t),
+            PfKind::TokenBatch => packet::devbuild::token_batch_program_t(t),
         });
     }
 
-    // The decode-rung separation `decode_rung_lo` depends on: every rung strictly below every
-    // prefill bucket. 32 < 128 by construction, but assert like the Gemma ladder does — a future
-    // bucket table edit must not silently fold a rung into the prefill range.
-    if let Some(&min_bucket) = pf.iter().min() {
-        assert!(
-            dbatch < min_bucket,
-            "decode rung {dbatch} >= narrowest prefill bucket {min_bucket}: \
-             decode_rung_lo separates the ranges by width alone"
-        );
-    }
+    let widths: Vec<_> = prog_t.iter().chain(&rungs).copied().collect();
+    assert_eq!(
+        packet::devbuild::decode_rung_lo(&widths), prog_t.len(),
+        "prefill and decode ladders require a non-increasing phase boundary"
+    );
     // One decode program per rung, ascending. 78 decoder layers each, ping-ponging x <-> xnext so
     // layer l+1 reads layer l's output; each layer's first op waits on the previous layer's
     // completion (`dep`). XReduce collectives (decode one-shot): each o_proj + FFN-down
@@ -7134,6 +9267,24 @@ fn glm_emit_full(
     let mut n_ops = 0;
     for &rb in &rungs {
         let mut b = Builder::new(n_cu);
+        if (emit_config::active().glm_moe_flat_decode && matches!(rb, 2 | 4 | 8))
+            || emit_config::active().glm_moe_resident()
+        {
+            assert!(
+                crate::emit_is_amd() && target == "gfx942",
+                "flat GLM MoE requires gfx942"
+            );
+            b.deny_uniseg();
+        }
+        if emit_config::active().glm_gemm_lt_decode()
+            && (matches!(rb, 16 | 20) || (emit_config::active().glm_gemm_lt_decode_ext() && rb == 8))
+        {
+            assert!(
+                crate::emit_is_amd() && target == "gfx942",
+                "native GLM decode GEMM requires gfx942"
+            );
+            b.deny_uniseg();
+        }
         b.set_l2_placement(l2_layout); // PLOW_L2_PLACE: None ⇒ byte-identical
         b.adopt_tensors(tensors.clone());
         let all = b.all();
@@ -7189,7 +9340,7 @@ fn glm_emit_full(
             cur = nxt;
         }
         // final RMSNorm (model.norm) -> xn, then lm_head GEMV -> logits, greedy argmax -> in.ids.
-        emit_glm_tail(&mut b, &c, &tn, cur, &[dep], rb, true, &mut xgate);
+        emit_glm_tail(&mut b, &c, &tn, cur, &[dep], rb, true, &mut xgate, None);
         let prog = b.finish();
         n_ops = prog.insts.len();
         progs.push(prog);
@@ -7297,37 +9448,88 @@ fn emit_glm_tail(
     rows: u32,
     dec_batch: bool,
     xgate: &mut u32,
+    band: Option<u32>,
 ) {
     let all = b.all();
+    // TOKEN-BATCH BODY (`band = Some(B)`): the sampled rows are the slot band `[0, B)` of a
+    // `rows`-wide prefill program. The norm and the head run over the band only, and the head
+    // is a TILED GEMM rather than `Gemv`: this program runs on PREFILL objects, whose GEMV row
+    // bucket is compiled at one row (`PLOW_GEMV_MM=1`), so a `Gemv` at `i0 = B` would be
+    // refused at load by `check_gemv_capacity`. Every row of the band samples (`nb = B`),
+    // parked rows included — the host reads only the rows it planned.
+    let norm_rows = band.unwrap_or(rows);
     // `vocab_l` is the full vocab when replicated and vocab/tp under GLM_SHARD_HEAD. The GEMV, the
     // argmax and the tensor declarations all read this same helper, so the arms cannot drift.
     let vocab_l = glm_vocab_l(c);
     // At prefill (`rows` = the bucket's T) this norms every row of the chunk even though the head
     // GEMV reads only the last — d_rmsnorm has no input row offset — so at least spread the rows
     // across the machine; decode (rows=1) keeps the single workgroup.
-    let c_f = b.emit(DevOp::RmsNorm, pf_wide_cus(b.n_cu(), rows), dep, |d| {
-        d.t[0] = n.xn;
-        d.t[1] = x_final;
-        d.t[2] = n.fin;
-        d.i[0] = rows;
-        d.i[1] = c.hidden;
-        d.f[0] = c.eps;
-    });
+    // Sequence-parallel prefill: `x_final` is valid on this rank's band only.
+    let c_f = if !dec_batch && glm_sp(c, n, b, rows) {
+        let xr = xr_cus_capped(b.n_cu(), &all);
+        glm_sp_norm_gather(
+            b, n, rows, c.tp, c.hidden, c.eps, n.xn, x_final, n.fin, dep, xgate, &xr,
+        )
+    } else {
+        b.emit(DevOp::RmsNorm, pf_wide_cus(b.n_cu(), norm_rows), dep, |d| {
+            d.t[0] = n.xn;
+            d.t[1] = x_final;
+            d.t[2] = n.fin;
+            d.i[0] = norm_rows;
+            d.i[1] = c.hidden;
+            d.f[0] = c.eps;
+        })
+    };
     // Batched decode: per-sequence logits. The Gemma reference for the argmax batching is
     // `lib.rs`' `nb_argmax` (`if decode && t > 1 { t } else { 0 }`) — 0 at one row keeps the
     // packet byte-identical to the pre-batch emit.
-    let nb = if dec_batch && rows > 1 { rows } else { 0 };
-    let c_lm = b.emit(DevOp::Gemv, all, &[c_f], |d| {
-        d.t[0] = n.logits;
-        d.t[1] = n.xn;
-        d.t[2] = n.head;
-        d.i[0] = if nb > 0 { rows } else { 1 };
-        d.i[1] = vocab_l;
-        d.i[2] = c.hidden;
-        // a_row0: the last real row (host re-patches per chunk); 0 on the batched decode tail —
-        // every row samples.
-        d.i[4] = if nb > 0 { 0 } else { rows - 1 };
-    });
+    let nb = match band {
+        Some(bw) => bw,
+        None if dec_batch && rows > 1 => rows,
+        None => 0,
+    };
+    // Batched decode only: the prefill tail's `a_row0 = rows - 1` has no native form, and the
+    // helper's shape whitelist (GLM-5.3 vocab/8) is what keeps every other model byte-identical.
+    // A token-batch body samples its band through a tiled GEMM (see above), never through the
+    // native decode route: the body runs on prefill objects.
+    let lt = if nb > 0 && band.is_none() {
+        emit_glm_decode_gemm_lt(
+            b,
+            c,
+            MoeEnc::Bf16,
+            rows,
+            [n.logits, n.xn, n.head],
+            [vocab_l, c.hidden],
+            &[c_f],
+        )
+    } else {
+        None
+    };
+    let c_lm = if let Some(bw) = band {
+        let op = pick_tile(bw, vocab_l, c.hidden, b.n_cu(), kernelcaps::QuantScheme::None);
+        b.emit(op, all, &[c_f], |d| {
+            d.t[0] = n.logits;
+            d.t[1] = n.xn;
+            d.t[2] = n.head;
+            d.i[0] = bw;
+            d.i[1] = vocab_l;
+            d.i[2] = c.hidden;
+        })
+    } else if let Some(counter) = lt {
+        counter
+    } else {
+        b.emit(DevOp::Gemv, all, &[c_f], |d| {
+            d.t[0] = n.logits;
+            d.t[1] = n.xn;
+            d.t[2] = n.head;
+            d.i[0] = if nb > 0 { rows } else { 1 };
+            d.i[1] = vocab_l;
+            d.i[2] = c.hidden;
+            // a_row0: the last real row (host re-patches per chunk); 0 on the batched decode
+            // tail — every row samples.
+            d.i[4] = if nb > 0 { 0 } else { rows - 1 };
+        })
+    };
     let c_am = b.emit(DevOp::Argmax, (0..AMAX_BLOCKS).collect(), &[c_lm], |d| {
         d.t[0] = n.amax;
         d.t[1] = n.logits;
@@ -7631,6 +9833,13 @@ pub(crate) fn glm_build_block_pf(
         pb.set_moe_prefill_ep_degree(
             (crate::emit_is_amd() && emit_config::active().moe_prefill_ep).then_some(c.tp),
         );
+        if emit_config::active().glm_fold_lt() && t >= 2048 {
+            assert!(
+                crate::emit_is_amd() && n_cu == 304,
+                "native MLA fold requires gfx942"
+            );
+            pb.deny_uniseg();
+        }
         pb.adopt_tensors(tensors.clone());
         let pall = pb.all();
         let mut pxgate = 0u32;
@@ -7649,6 +9858,7 @@ pub(crate) fn glm_build_block_pf(
                     false,
                     &mut pxgate,
                     &pall,
+                    None,
                 );
             }
             PrefillScope::Full => {
@@ -7672,6 +9882,7 @@ pub(crate) fn glm_build_block_pf(
                             &dep,
                             &mut pxgate,
                             &pall,
+                            None,
                         )
                     } else {
                         emit_glm_block_prefill(
@@ -7687,6 +9898,7 @@ pub(crate) fn glm_build_block_pf(
                             &dep,
                             &mut pxgate,
                             &pall,
+                            None,
                         )
                     };
                     dep = vec![d];
@@ -8008,9 +10220,28 @@ pub(crate) fn kimi_emit_block(
         "tp={tp} must divide n_head={} (each rank owns a whole head shard)",
         c.heads
     );
-    let enc = mla_moe_enc_env(dir);
-    let use_fp8 = enc == MoeEnc::Fp8Blk;
     let block = parse_block(spec, c.layers as usize);
+    // The checkpoint's expert encoding is an authority over a block that HAS routed experts.
+    // Consulting it unconditionally made a dense-FFN block inherit the refusal owed to the MoE
+    // layers, which takes the single-block bringup path (docs/bringup/05-single-block-sweep.md)
+    // away from exactly the checkpoints that need it most: a model whose experts are in an
+    // encoding plow cannot emit is still worth extracting an attention block from.
+    //
+    // NARROWED HERE AND NOT IN `glm_emit_block`, and that asymmetry is the checkpoints, not an
+    // oversight. Kimi-K2.7-Code quantizes ONLY the routed experts — its `ignore` list names
+    // `self_attn`, `shared_experts`, `mlp.(gate|up|down)_proj` and `lm_head` — so its dense
+    // layers really are bf16. GLM-5.3-FP8 is block-fp8 THROUGHOUT, dense FFN included, so the
+    // same narrowing there would emit bf16 ops against fp8 dense weights: the very substitution
+    // `mla_ckpt_enc` exists to refuse.
+    //
+    // A block that does carry routed experts still consults it and still refuses.
+    let has_moe = (block.start..block.end).any(|l| !c.is_dense(l as u32));
+    let enc = if has_moe {
+        mla_moe_enc_env(dir)
+    } else {
+        MoeEnc::Bf16
+    };
+    let use_fp8 = enc == MoeEnc::Fp8Blk;
     let model = dir
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())

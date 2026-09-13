@@ -107,7 +107,7 @@ impl Default for Selection {
 }
 
 impl Selection {
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if self.greedy {
             return require(
                 self.temperature == 0.0,
@@ -143,7 +143,7 @@ pub struct Request<'a> {
     /// The tokens scheduled this step, in order.
     pub tokens: &'a [u32],
     /// Total prompt length. A prefill span whose end reaches this completes the prompt and
-    /// therefore contributes a sample row; a decode request must pass its own frontier + 1.
+    /// contributes a sample row. Decode starts at or past this original prompt boundary.
     pub prompt_len: u32,
     pub selection: Selection,
 }
@@ -170,7 +170,7 @@ pub struct PendingCommit {
     pub expected_frontier: u32,
     /// The frontier after this step's rows are committed.
     pub new_frontier: u32,
-    /// This span finished the prompt, so the request becomes ready for decode.
+    /// The prompt is complete after this span, including spans already in decode.
     pub completes_prompt: bool,
     /// Index into [`Plan::sample_input_rows`] / [`Plan::sample_owners`], or `None` for an
     /// intermediate chunk that produces no output.
@@ -310,23 +310,20 @@ fn plan_inner(
     // for reproducibility and simple metadata construction — it is NOT a projection boundary,
     // and it is identical on every backend so a CPU-computed reference is comparable row for
     // row with a GPU result.
-    let mut order: Vec<usize> = Vec::with_capacity(requests.len());
-    order.extend(
-        requests
-            .iter()
-            .enumerate()
-            .filter(|(_, r)| r.phase == Phase::Decode)
-            .map(|(i, _)| i),
-    );
-    order.extend(
-        requests
-            .iter()
-            .enumerate()
-            .filter(|(_, r)| r.phase == Phase::Prefill)
-            .map(|(i, _)| i),
-    );
+    let order = requests
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.phase == Phase::Decode)
+        .map(|(i, _)| i)
+        .chain(
+            requests
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.phase == Phase::Prefill)
+                .map(|(i, _)| i),
+        );
 
-    for (position, &index) in order.iter().enumerate() {
+    for (position, index) in order.clone().enumerate() {
         let request = &requests[index];
         request.selection.validate()?;
         let slot = request.slot as usize;
@@ -338,13 +335,12 @@ fn plan_inner(
         // A request contributes AT MOST ONE span in this mode (§4.4). Duplicate slots are the
         // interesting failure: two spans on one slot would both start at its frontier and both
         // claim to advance it.
-        let prior = &order[..position];
         require(
-            !prior.iter().any(|&p| requests[p].id == request.id)
-                && !prior.iter().any(|&p| requests[p].slot == request.slot)
-                && !prior
-                    .iter()
-                    .any(|&p| requests[p].state_slot == request.state_slot),
+            !order.clone().take(position).any(|p| {
+                requests[p].id == request.id
+                    || requests[p].slot == request.slot
+                    || requests[p].state_slot == request.state_slot
+            }),
             "duplicate request id, physical slot or carried-state slot",
         )?;
         require(

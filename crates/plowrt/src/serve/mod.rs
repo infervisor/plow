@@ -11,6 +11,11 @@ pub mod cpu_serve;
 /// the seam that lets `serve` stop being CUDA-only.
 #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
 pub mod engine;
+/// The CPU prefill-head pool: the twin packet and the cores reserved for it.
+// Allowed dead until the mux drives it.
+#[cfg(feature = "cpu")]
+#[allow(dead_code)]
+pub mod head;
 #[cfg(feature = "cuda")]
 pub mod manager;
 pub mod models;
@@ -18,6 +23,8 @@ pub mod mux;
 pub mod openai;
 pub mod placement;
 pub mod stream;
+#[cfg(all(test, any(feature = "hsa", feature = "cpu")))]
+mod step_lowering_tests;
 pub mod template;
 pub mod tokenize;
 
@@ -144,6 +151,8 @@ pub(crate) struct RunObserver {
     /// wrote before the tick shows up in exactly the fires that would have
     /// consumed it on a real device.
     pub kv_writes: Vec<KvWrite>,
+    /// SLO tick planner state (`PLOW_TBT_SLO_MS` / `PLOW_TTFT_SLO_MS`); untouched when unset.
+    pub slo: crate::sched::slo::SloState,
 }
 
 /// One recorded consumption of `KV_PAGES` by a `FLASH`-family packet.
@@ -167,6 +176,7 @@ impl RunObserver {
             indirection: IndirectionTable::new(table_size.max(RUN_INDIRECTION_SIZE)),
             kv_pages_range: crate::exec::indirection::slots::kv_pages(0, 0),
             kv_writes: Vec::new(),
+            slo: Default::default(),
         }
     }
 
@@ -311,6 +321,7 @@ pub struct AppState {
     pub registry: Registry,
     pub execset: Arc<ExecutorSet>,
     pub metrics: Arc<Metrics>,
+    model_metrics: RwLock<FxHashMap<String, Arc<Metrics>>>,
     /// Per-slug bucket muxer handles. Populated at startup by `main::serve`
     /// after the registry is loaded; read (Sender-clone) on the request path.
     muxes: RwLock<FxHashMap<String, mux::ModelMux>>,
@@ -392,6 +403,7 @@ impl AppState {
             registry,
             execset,
             metrics: Arc::new(Metrics::default()),
+            model_metrics: RwLock::new(FxHashMap::default()),
             muxes: RwLock::new(FxHashMap::default()),
             #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
             gpu: RwLock::new(FxHashMap::default()),
@@ -607,6 +619,18 @@ impl AppState {
                 map.insert(slug.to_string(), state);
             }
         }
+    }
+
+    pub(crate) fn model_metrics(&self, slug: &str) -> Arc<Metrics> {
+        let mut models = self.model_metrics.write();
+        models.retain(|name, metrics| {
+            let keep = self.registry.contains(name) || Arc::strong_count(metrics) > 1;
+            if !keep {
+                self.metrics.accumulate_counters(metrics);
+            }
+            keep
+        });
+        Arc::clone(models.entry(slug.to_owned()).or_default())
     }
 
     /// Register a dispatcher for a model slug. Called once at startup.
@@ -833,15 +857,76 @@ async fn healthz() -> &'static str {
 
 async fn metrics_handler(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
-) -> String {
-    #[allow(unused_mut)]
-    let mut out = state.metrics.to_prometheus();
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let models: Vec<_> = {
+        let mut metrics = state.model_metrics.write();
+        for slug in state.registry.slugs() {
+            metrics.entry(slug).or_default();
+        }
+        metrics.retain(|slug, metrics| {
+            let keep = state.registry.contains(slug) || Arc::strong_count(metrics) > 1;
+            if !keep {
+                state.metrics.accumulate_counters(metrics);
+            }
+            keep
+        });
+        let mut models: Vec<_> = metrics.iter().map(|(slug, m)| {
+            (
+                slug.clone(),
+                Arc::clone(m),
+                state.mux(slug).is_some() && state.residency(slug).admits(),
+            )
+        }).collect();
+        models.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        models
+    };
+    let aggregate = Metrics::default();
+    aggregate.accumulate(&state.metrics);
+    for (_, metrics, _) in &models {
+        aggregate.accumulate(metrics);
+    }
+    let mut out = aggregate.to_prometheus();
+    for (index, (slug, metrics, _)) in models.iter().enumerate() {
+        let label = crate::obs::serving::escape_label(slug);
+        for line in metrics.to_prometheus().replace("plowrt_", "plowrt_model_").lines() {
+            if line.starts_with('#') {
+                if index == 0 {
+                    out.push_str(line);
+                    out.push('\n');
+                }
+                continue;
+            }
+            if let Some((name, value)) = line.split_once(' ') {
+                use std::fmt::Write;
+                let _ = writeln!(out, "{name}{{model_name=\"{label}\",engine=\"0\"}} {value}");
+            }
+        }
+    }
+    crate::obs::serving::ServingMetrics::write(&mut out, &models);
     // Prefix-cache (VMM) counters, one block per GPU-served model, read
     // through the engine-lock-free stats handles — series stay continuous
     // under sustained inference (only the pool mutex is taken, µs holds).
     #[cfg(feature = "cuda")]
+    for (name, kind, help) in [
+        ("attach_hits_total", "counter", "Successful prefix attach requests."),
+        ("attach_misses_total", "counter", "Prefix attach requests without a reusable prefix."),
+        ("tokens_attached_total", "counter", "Tokens attached from reusable prefix blocks."),
+        ("hash_collisions_total", "counter", "Prefix hash collisions detected."),
+        ("blocks_shared_mapped_total", "counter", "Shared prefix blocks mapped."),
+        ("nodes_evicted_total", "counter", "Prefix tree nodes evicted."),
+        ("blocks_live", "gauge", "Live prefix pool blocks."),
+        ("cache_blocks", "gauge", "Prefix cache blocks."),
+        ("cache_bytes", "gauge", "Prefix cache bytes."),
+        ("snapshot_bytes", "gauge", "Prefix snapshot bytes."),
+        ("snapshots_evicted_total", "counter", "Prefix snapshots evicted."),
+    ] {
+        crate::obs::serving::family(&mut out, &format!("plowrt_prefix_{name}"), kind, help);
+    }
+    #[cfg(feature = "cuda")]
     for (slug, h) in state.vmm_stats.read().iter() {
         let s = h.stats();
+        let slug = crate::obs::serving::escape_label(slug);
         use std::fmt::Write;
         let _ = write!(
             out,
@@ -852,7 +937,10 @@ async fn metrics_handler(
              plowrt_prefix_blocks_shared_mapped_total{{model=\"{slug}\"}} {}\n\
              plowrt_prefix_nodes_evicted_total{{model=\"{slug}\"}} {}\n\
              plowrt_prefix_blocks_live{{model=\"{slug}\"}} {}\n\
-             plowrt_prefix_cache_blocks{{model=\"{slug}\"}} {}\n",
+             plowrt_prefix_cache_blocks{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_cache_bytes{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_snapshot_bytes{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_snapshots_evicted_total{{model=\"{slug}\"}} {}\n",
             s.attach_hits,
             s.attach_misses,
             s.tokens_attached,
@@ -861,9 +949,12 @@ async fn metrics_handler(
             s.nodes_evicted,
             s.blocks_live,
             s.cache_blocks,
+            s.cache_bytes,
+            s.snapshot_bytes,
+            s.snapshots_evicted,
         );
     }
-    out
+    ([("content-type", "text/plain; version=0.0.4; charset=utf-8")], out).into_response()
 }
 
 /// Build an OpenAI-shaped error response: `{"error": {message, type, code}}`.

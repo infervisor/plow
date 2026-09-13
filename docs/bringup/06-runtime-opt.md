@@ -229,7 +229,7 @@ GH200 among them — are **not** `--gpu` registry entries. Take `$GPU` from
 | lever | flag / env | default | effect |
 |---|---|---|---|
 | Weight slab | `--rt-weight-slab` / `PLOW_WEIGHT_SLAB`; `--rt-slab-keep` / `PLOW_SLAB_KEEP` | on / off | one allocation for all weights. Measured on MI355X: named-tensor alloc ~6.4–8.8 s → ~0.1–0.27 s, wall halved (`perf-data/weight-slab-amd-mi355x.md`) |
-| VMM lazy-commit weight slab | `--nv-weight-vmm` / `PLOW_WEIGHT_VMM`; `--nv-upload-direct` / `PLOW_UPLOAD_DIRECT` | on (nvidia) / off (amd) | commit chunks behind the upload. Measured 12B on GH200: load 3.67→2.0 s (`perf-data/vmm-weight-slab-gh200.md`). **Default off on `$VENDOR = amd` — a measured regression there** |
+| VMM lazy-commit weight slab | `--weight-vmm` / `PLOW_WEIGHT_VMM`; `--nv-upload-direct` / `PLOW_UPLOAD_DIRECT` | on (nvidia) / off (amd) | commit chunks behind the upload. Measured 12B on GH200: load 3.67→2.0 s (`perf-data/vmm-weight-slab-gh200.md`). **Default off on `$VENDOR = amd` — a measured regression there** |
 | Prefetch | `--rt-prefetch` / `PLOW_PREFETCH`, `--rt-prefetch-threads` / `PLOW_PREFETCH_THREADS` | 256 / 16 | parallel weight upload. Measured 12B on GH200: cold start 17.55→11.19 s (`perf-data/coldstart-plow-vs-vllm-gh200.md`). Reader count saturates against the host storage, not `$GPU` — re-fit per host |
 
 ### 7. Tensor parallelism (TP) — `$VENDOR`: both; the ONLY wired multi-GPU mode

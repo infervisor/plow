@@ -249,7 +249,13 @@ fn rows(m: &Model) -> BTreeMap<Row, u32> {
     let mut out: BTreeMap<Row, u32> = BTreeMap::new();
     for (pi, p) in m.progs.iter().enumerate() {
         let encoded_t = m.prog_t.get(pi).copied().unwrap_or(0);
-        let kind = if pi >= dec_lo { "1decode" } else { "0prefill" };
+        let kind = if pi >= dec_lo {
+            "1decode"
+        } else if packet::devbuild::is_token_batch_program(encoded_t) {
+            "2token_batch"
+        } else {
+            "0prefill"
+        };
         let t = packet::devbuild::program_rows(encoded_t);
         let cus = cus_per_inst(p);
         for (j, d) in p.insts.iter().enumerate() {

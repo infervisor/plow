@@ -101,7 +101,7 @@ impl Arm {
 ///     (`if (in->i[3] == 128) d_flash_merge<128>(...)`), emitters
 ///     `crates/devgen/src/lib.rs` (`d.i[3] = hd`) and `crates/devgen/src/mla.rs:4626`
 ///     (`i.i[3] = c.attn_head_dim`). `i[6]` is never assigned on a `FlashMerge` packet.
-fn arm_of(op: DevOp, i: &[u32; 8]) -> Arm {
+pub fn arm_of(op: DevOp, i: &[u32; 8]) -> Arm {
     let hd = match op {
         DevOp::FlashMerge => Some(i[3]),
         DevOp::HeadNormRope | DevOp::HeadNormRopeFp8 => Some(i[2]),
@@ -163,8 +163,14 @@ fn program_arms(m: &Model) -> Vec<ProgramArms> {
     // prefill object absorb every lower decode rung.
     let dec_lo = packet::devbuild::decode_rung_lo(&m.prog_t);
     for (pi, p) in m.progs.iter().enumerate() {
-        let kind = if pi >= dec_lo { "decode" } else { "prefill" };
         let encoded_t = m.prog_t.get(pi).copied().unwrap_or(0);
+        let kind = if pi >= dec_lo {
+            "decode"
+        } else if packet::devbuild::is_token_batch_program(encoded_t) {
+            "token_batch"
+        } else {
+            "prefill"
+        };
         let t = packet::devbuild::program_rows(encoded_t);
         for (seg, arms) in segment_arms(p) {
             out.push(ProgramArms {
@@ -179,6 +185,74 @@ fn program_arms(m: &Model) -> Vec<ProgramArms> {
         }
     }
     out
+}
+
+fn kernel_cases(m: &Model) -> Value {
+    #[derive(PartialEq, Eq, PartialOrd, Ord)]
+    struct Case {
+        op: u16,
+        blocks: u16,
+        i: [u32; 8],
+        f_bits: [u32; 2],
+        j: [u32; 2],
+        operand_present: [bool; 8],
+        tensor_bytes: [Option<u64>; 8],
+    }
+    let decode = packet::devbuild::decode_rung_lo(&m.prog_t);
+    let programs: Vec<_> = m
+        .progs
+        .iter()
+        .enumerate()
+        .map(|(index, p)| {
+            let mut cases = BTreeMap::<Case, Vec<usize>>::new();
+            for (pc, d) in p.insts.iter().enumerate() {
+                cases
+                    .entry(Case {
+                        op: d.op,
+                        blocks: d.blocks,
+                        i: d.i,
+                        f_bits: d.f.map(f32::to_bits),
+                        j: d.j,
+                        operand_present: d.t.map(|t| t != packet::TENSOR_NONE),
+                        tensor_bytes: d.t.map(|t| m.tensors.get(t as usize).map(|t| t.bytes)),
+                    })
+                    .or_default()
+                    .push(pc);
+            }
+            let cases: Vec<_> = cases
+                .into_iter()
+                .map(|(c, pcs)| {
+                    json!({
+                        "op": c.op,
+                        "arm": op_of(c.op).map(|op| arm_of(op, &c.i).key()),
+                        "blocks": c.blocks, "i": c.i, "f_bits": c.f_bits, "j": c.j,
+                        "operand_present": c.operand_present, "tensor_bytes": c.tensor_bytes,
+                        "pcs": pcs,
+                    })
+                })
+                .collect();
+            let encoded = m.prog_t.get(index).copied().unwrap_or(0);
+            json!({
+                "program": index,
+                "kind": if index >= decode {
+                    "decode"
+                } else if packet::devbuild::is_token_batch_program(encoded) {
+                    "token_batch"
+                } else {
+                    "prefill"
+                },
+                "rows": packet::devbuild::program_rows(encoded),
+                "packed_only": packet::devbuild::is_packed_prefill_program(encoded),
+                "token_batch_body": packet::devbuild::is_token_batch_program(encoded),
+                "instruction_count": p.insts.len(), "cases": cases,
+            })
+        })
+        .collect();
+    json!({
+        "programs": programs,
+        "performance_evidence": null,
+        "note": "All emitted ops and raw parameters, including handle-valued immediates. Operand extents are bytes, not dtypes. Cases are coverage inventory, not measured kernel selections; tensor bindings, aliasing, dependencies and runtime object overrides require separate validation.",
+    })
 }
 
 /// Split one program's arms by segment. A single-segment program yields exactly
@@ -288,6 +362,8 @@ struct Shapes {
     /// t[0] is a [T,H] **f64** fixed-point accumulator. Same overrun class as `moe_pf_atomic`,
     /// and additionally op 87 would read f64 bytes as f32 without the arm.
     moe_pf_det: bool,
+    moe_aiter_fp8: bool,
+    moe_aiter_flat: bool,
     /// Compiler-declared replicated-input expert-parallel boundaries as
     /// `(degree, experts, full_intermediate_width)` tuples.
     moe_prefill_ep: BTreeSet<(u32, u32, u32)>,
@@ -295,6 +371,7 @@ struct Shapes {
     /// layout (PLOW_MLA_PF_NS). The sparse GATHER arm reuses `i[6]` whole as `cap`,
     /// disambiguated by the union table in `t[7]`.
     mla_pf_ns: bool,
+    mla_prefill_fp8_split: bool,
     /// Any dense `FlashMlaPrefill` with `i[6]` bit 8 set and no t7 — the W_ofold fusion
     /// (PLOW_GLM_OFOLD): normalized-bf16 flash epilogue + fused o-GEMM. Exclusive with the
     /// KV-split on a packet (the fold consumes the un-split l), so the two live in one
@@ -307,6 +384,10 @@ struct Shapes {
     /// arm it falls to never reads `t[7]`. The result is full causal attention where the model
     /// was trained sparse: no trap, no NaN, a fluent answer to a different question.
     glm_dsa_pf: bool,
+    dsa_decode_batch: bool,
+    dsa_select_local: bool,
+    dsa_select_split: bool,
+    mla_sparse_fp8: bool,
     /// Any `FlashMlaPrefill` (op 51) with `i[3]` bit 31 — a NoPE (zero-rope) MLA, which the
     /// four-wave V2 kernel can only run if it carries the `<512, 0>` instantiation
     /// (PLOW_MLA_PF2_NOPE_ARM). An object that predates the arm traps on the packet rather than
@@ -354,8 +435,10 @@ fn shapes(m: &Model) -> Shapes {
     let dec_lo = packet::devbuild::decode_rung_lo(&m.prog_t);
     for (pi, p) in m.progs.iter().enumerate() {
         let decode = pi >= dec_lo;
+        let encoded = m.prog_t.get(pi).copied().unwrap_or(0);
         if !decode
-            && !packet::devbuild::is_packed_prefill_program(m.prog_t.get(pi).copied().unwrap_or(0))
+            && !packet::devbuild::is_packed_prefill_program(encoded)
+            && !packet::devbuild::is_token_batch_program(encoded)
         {
             s.prefill_buckets.push(packet::devbuild::program_rows(
                 m.prog_t.get(pi).copied().unwrap_or(0),
@@ -439,6 +522,11 @@ fn shapes(m: &Model) -> Shapes {
                         s.moe_pf_det = true;
                     }
                 }
+                DevOp::MoeAiterFp8Pf => {
+                    s.moe_aiter_fp8 = true;
+                    s.moe_aiter_flat |= inst.i[6] == 1;
+                    s.moe_enc.insert(crate::mla::MoeEnc::Fp8Blk as u32);
+                }
                 DevOp::QuantFp8 => {
                     if inst.t[3] != packet::TENSOR_NONE {
                         s.quant_glu_fold = true;
@@ -470,6 +558,7 @@ fn shapes(m: &Model) -> Shapes {
                     }
                 }
                 DevOp::FlashGatherDecode | DevOp::FlashMlaDecodeFp8 => {
+                    s.mla_sparse_fp8 |= op == DevOp::FlashMlaDecodeFp8 && inst.j[0] != 0;
                     if decode {
                         s.decode_batch = s.decode_batch.max(inst.i[0]);
                     }
@@ -503,6 +592,16 @@ fn shapes(m: &Model) -> Shapes {
                     if inst.t[3] != packet::TENSOR_NONE {
                         s.attention_sinks = true;
                     }
+                }
+                DevOp::IndexSelect => {
+                    s.dsa_decode_batch |= inst.i[3] != 0 || inst.i[4] != 0;
+                    s.dsa_select_local |= inst.i[4] == 1;
+                    s.dsa_select_split |= inst.i[4] == 2;
+                }
+                DevOp::FlashMlaPrefillFp8 => {
+                    s.mla_prefill_fp8_split |= inst.j[1] != 0;
+                    s.mla_sparse_fp8 |= inst.j[0] != 0;
+                    s.glm_dsa_pf |= op == DevOp::FlashMlaPrefillFp8 && inst.j[0] != 0;
                 }
                 DevOp::FlashMlaPrefill => {
                     if (inst.i[6] & 0xff) > 1 && inst.t[7] == packet::TENSOR_NONE {
@@ -785,6 +884,8 @@ fn encoding_features(f: &mut Map<String, Value>, s: &Shapes) {
     f.insert("moe_pf_part16".into(), json!(s.moe_pf_part16));
     f.insert("moe_pf_atomic".into(), json!(s.moe_pf_atomic));
     f.insert("moe_pf_det".into(), json!(s.moe_pf_det));
+    f.insert("moe_aiter_fp8".into(), json!(s.moe_aiter_fp8));
+    f.insert("moe_aiter_flat".into(), json!(s.moe_aiter_flat));
     f.insert("moe_pf_a8".into(), json!(s.moe_pf_a8));
     f.insert("xr_combine_fold".into(), json!(s.xr_combine_fold));
     f.insert("kda_fb_fold".into(), json!(s.kda_fb_fold));
@@ -805,8 +906,13 @@ fn encoding_features(f: &mut Map<String, Value>, s: &Shapes) {
     f.insert("moe_prefill_ep".into(), json!(!s.moe_prefill_ep.is_empty()));
     f.insert("quant_glu_fold".into(), json!(s.quant_glu_fold));
     f.insert("mla_pf_ns".into(), json!(s.mla_pf_ns));
+    f.insert("mla_prefill_fp8_split".into(), json!(s.mla_prefill_fp8_split));
     f.insert("glm_ofold".into(), json!(s.glm_ofold));
     f.insert("glm_dsa_pf".into(), json!(s.glm_dsa_pf));
+    f.insert("dsa_decode_batch".into(), json!(s.dsa_decode_batch));
+    f.insert("dsa_select_local".into(), json!(s.dsa_select_local));
+    f.insert("dsa_select_split".into(), json!(s.dsa_select_split));
+    f.insert("mla_sparse_fp8".into(), json!(s.mla_sparse_fp8));
     f.insert("mla_pf_nope".into(), json!(s.mla_pf_nope));
     f.insert("glm_fuse_rope".into(), json!(s.glm_fuse_rope));
     f.insert("glm_fuse_qnorm".into(), json!(s.glm_fuse_qnorm));
@@ -903,9 +1009,11 @@ pub(crate) const UNRECORDED_ENV: &[&str] = &[
     "PLOW_FUSE_XR_ATTNRES",
     "PLOW_GQ_ORDER",
     "PLOW_MLA_PF_V2",
+    "PLOW_MLA_PF_AITER",
     "PLOW_MOE_DECODE_STANDALONE",
     "PLOW_PHASE_OBJECTS",
     "PLOW_SEG_CLASS_SLICE",
+    "PLOW_SEG_FA256_GQA2",
     "PLOW_SEG_FA512",
     "PLOW_SEG_PER_OP",
     "PLOW_SEG_PURE_GEMM",
@@ -975,6 +1083,9 @@ fn backend_nvcc(f: &Map<String, Value>, t: &Map<String, Value>, s: &Shapes) -> V
     // hd256/512). A Qwen-only (hd=128) packet must NOT carry this flag — the
     // Gemma build drops the hd=128 arm entirely.
     let mut req = Vec::new();
+    if on("norm_weight_offset") {
+        req.push("PLOW_NV_GEMMA3=1".into());
+    }
     if s.hd.iter().any(|&h| h > 128) {
         req.push("PLOW_NV_GEMMA=1".to_string());
     }
@@ -997,6 +1108,9 @@ fn backend_nvcc(f: &Map<String, Value>, t: &Map<String, Value>, s: &Shapes) -> V
         if s.prefill_gemv {
             req.push("PLOW_NV_PF_GEMV_HEAD=1".into());
         }
+    }
+    if on("dsa_decode_batch") {
+        req.push("PLOW_DSA_DECODE_BATCH=1".into());
     }
     let mut rec = Vec::new();
     if let Some(v) = t.get("gv_mm_max").and_then(Value::as_u64) {
@@ -1138,6 +1252,12 @@ fn backend_amd(
     if has("XReduceScatter") || has("XAllGather") {
         req.push("PLOW_SEQ_PAR_SEAMS=1".into());
     }
+    // Row-split sparse attention's cross-GPU head/row transpose (op 160). An object without
+    // the arm would run the packet as a silent no-op — the AMD dispatch's `default:` neither
+    // writes nor traps.
+    if has("XAllToAllHeads") {
+        req.push("PLOW_ROWSPLIT_A2A=1".into());
+    }
     if union.iter().any(|a| {
         matches!(a.op.as_str(), "KdaChunkWu" | "KdaChunkCarry")
             && a.variant.as_deref().is_some_and(|v| v.ends_with("_qpre"))
@@ -1186,12 +1306,27 @@ fn backend_amd(
     if on("mla_pf_ns") {
         req.push("PLOW_MLA_PF_NS=1".into());
     }
+    if on("mla_prefill_fp8_split") {
+        req.push("PLOW_MLA_PREFILL_FP8_SPLIT=1".into());
+    }
     // The W_ofold fusion (op 51 i[6] bit 8): the FLASH object must carry the ofold-aware V2
     // arm AND the serve must route MLA prefill there (PLOW_MLA_PF_V2=1) — the 8-wave kernel
     // ignores i[6] and the fused GEMM would read unnormalized f32 partials as bf16. plowrt
     // enforces both.
     if on("glm_ofold") {
         req.push("PLOW_GLM_OFOLD=1".into());
+    }
+    if on("dsa_select_local") {
+        req.push("PLOW_DSA_SELECT_LOCAL=1".into());
+    }
+    if on("dsa_select_split") {
+        req.push("PLOW_DSA_SELECT_SPLIT=1".into());
+    }
+    if on("dsa_decode_batch") {
+        req.push("PLOW_DSA_DECODE_BATCH=1".into());
+    }
+    if on("mla_sparse_fp8") {
+        req.push("PLOW_MLA_SPARSE_FP8=1".into());
     }
     // The DSA sparse V2 prefill arm (op 51 t[7] = union table). A BUILD AXIS that is OFF by
     // default, so this is the strongest entry in the list after PLOW_K3: absence does not mean
@@ -1354,11 +1489,30 @@ pub fn build_for_packet(
     lean: &crate::LeanReport,
     sections: &[packet::devbuild::SectionData],
 ) -> Value {
-    let packed_prefill = sections.iter().any(|section| {
+    let packed_prefill = sections.iter().find(|section| {
         section.kind == packet::devbuild::SECT_METADATA
             && section.name == plow_asset::packed_prefill::SECTION
     });
-    build_with_packed_prefill(m, arch, lean, packed_prefill)
+    let mut manifest = build_with_packed_prefill(m, arch, lean, packed_prefill.is_some());
+    if let Some(section) = packed_prefill {
+        let packed: plow_asset::packed_prefill::Manifest =
+            serde_json::from_slice(&section.data).expect("emitted packed request manifest");
+        if let Some(rows) = packed.max_request_rows {
+            manifest["objects"]["packed_prefill"]["max_request_rows"] = json!(rows);
+            manifest["objects"]["packed_prefill"]["masked_padding_capability"] = json!({
+                "symbol": plow_asset::packed_prefill::MASKED_PADDING_CAPABILITY,
+                "value": 1,
+            });
+            if packed.version == 2 {
+                manifest["objects"]["packed_prefill"]["fp8_masked_padding_capability"] = json!({
+                    "symbol": plow_asset::packed_prefill::FP8_MASKED_PADDING_CAPABILITY,
+                    "value": 1,
+                });
+            }
+            manifest["pairing"]["hash"] = json!(format!("0x{:016x}", pairing_hash(&manifest)));
+        }
+    }
+    manifest
 }
 
 fn build_with_packed_prefill(
@@ -1503,7 +1657,7 @@ fn object_inventory(progs: &[ProgramArms], arch: &str, packed_metadata: bool) ->
     let key_factor_wu = singleton_arm("KdaChunkWu");
     let key_factor_carry = singleton_arm("KdaChunkCarry");
     let key_factor_pair = !key_factor_wu.is_empty() && !key_factor_carry.is_empty();
-    json!({
+    let mut objects = json!({
         "packed_prefill": {
             "required": !packed_prefill.is_empty(),
             "topology": "packed",
@@ -1550,7 +1704,14 @@ fn object_inventory(progs: &[ProgramArms], arch: &str, packed_metadata: bool) ->
                 "carry_arms": keys(&key_factor_carry),
             },
         },
-    })
+    });
+    if packed_prefill.iter().any(|a| a.op == "FlashPrefillFp8") {
+        objects["packed_prefill"]["fp8_capability"] = json!({
+            "symbol": plow_asset::packed_prefill::FP8_CAPABILITY,
+            "value": plow_asset::packed_prefill::FP8_CAPABILITY_VALUE,
+        });
+    }
+    objects
 }
 
 /// Stable, model-neutral family labels for object partitioning and reports.
@@ -1782,6 +1943,13 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport, packed_prefill: 
             json!({ "required": true, "define": "PLOW_MOE2_BODY" });
     }
     let mut f = features(&union);
+    if m.progs
+        .iter()
+        .flat_map(|p| &p.insts)
+        .any(|d| d.op == DevOp::RmsNorm as u16 && d.i[7] == 1)
+    {
+        f.insert("norm_weight_offset".into(), json!(true));
+    }
     let materialized_residual_input = m.progs.iter().flat_map(|p| &p.insts).any(|inst| {
         inst.op == DevOp::AttnRes as u16
             && (inst.t[6] != packet::TENSOR_NONE
@@ -1923,6 +2091,7 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport, packed_prefill: 
         // artifact?", and both have a value that means "not established".
         "lean": lean_block(lean),
         "programs": programs,
+        "kernel_cases": kernel_cases(m),
         "dispatch_chains": dispatch_chains(&progs, arch),
         "objects": objects,
         // What a specialised object must compile: the union over every program
@@ -1934,6 +2103,7 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport, packed_prefill: 
         // `tuning` because those are what `plow_config.h` compiles, and an occupancy number
         // must never invalidate an otherwise-good packet/object pair.
         "dispatch_audit": dispatch_audit,
+        "segment_resource": crate::segment_resource::section(m, arch),
         // WHICH PROGRAMS ARE L2-PLACED, so a regression moves in a diff of `build.json`.
         //
         // Placement is invisible everywhere else in this manifest: a placed and an unplaced
@@ -1999,6 +2169,22 @@ pub fn pairing_hash(manifest: &Value) -> u64 {
             feed("=");
             feed(&v.to_string());
             feed("\x1f");
+        }
+    }
+    // A backend's `requires` are the -D set its objects must be compiled with, so a change to
+    // them must re-stamp the packet; `recommends` are advisory and stay out.
+    feed("\x1e");
+    if let Some(b) = manifest.get("backends").and_then(Value::as_object) {
+        for (arch, v) in b {
+            if let Some(req) = v.get("requires").and_then(Value::as_array) {
+                feed(arch);
+                feed("=");
+                for r in req {
+                    feed(r.as_str().unwrap_or(""));
+                    feed("\x1f");
+                }
+                feed("\x1e");
+            }
         }
     }
     h
@@ -2107,6 +2293,9 @@ pub fn config_header(manifest: &Value) -> String {
         .iter()
         .any(|arm| arm.starts_with("KdaChunk") && arm.ends_with("_qpre"));
     out.push_str("/* --- packet and per-object opcode inventory --- */\n");
+    if manifest.pointer("/objects/packed_prefill/max_request_rows").is_some() {
+        out.push_str("#ifndef PLOW_NV_MASKED_PADDING\n#define PLOW_NV_MASKED_PADDING 1\n#endif\n");
+    }
     out.push_str(&format!(
         "#define PLOW_PACKET_HAS_DECODE_MLA_SEGMENTS {}\n",
         if decode_mla_required { 1 } else { 0 }
@@ -2230,6 +2419,14 @@ pub fn config_header(manifest: &Value) -> String {
         "#define PLOW_PACKET_REQUIRES_KDA_DECODE_FUSED_ARM {0}\n#ifndef PLOW_KDA_DECODE_FUSED_ARM\n#define PLOW_KDA_DECODE_FUSED_ARM {0}\n#endif\n",
         if kda_decode_fused_arm { 1 } else { 0 }
     ));
+    let dsa_decode_batch = manifest
+        .pointer("/features/dsa_decode_batch")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    out.push_str(&format!(
+        "#define PLOW_PACKET_REQUIRES_DSA_DECODE_BATCH {0}\n#ifndef PLOW_DSA_DECODE_BATCH\n#define PLOW_DSA_DECODE_BATCH {0}\n#endif\n",
+        if dsa_decode_batch { 1 } else { 0 }
+    ));
     let gemv_prefetch = manifest
         .pointer("/features/gemv_prefetch")
         .and_then(Value::as_bool)
@@ -2294,6 +2491,60 @@ pub fn config_header(manifest: &Value) -> String {
     if let Some(gqa) = manifest.pointer("/shapes/gqa").and_then(Value::as_u64) {
         out.push_str(&format!("#define PLOW_PACKET_GQA {gqa}\n"));
     }
+
+    // What `scripts/build_gfx942.sh` reads under PLOW_HSACO_CONFIG: the AMD `requires` list,
+    // the decode batch and ladder, and whether token-batch BODY programs (the `_tb` object
+    // twins) are present, so the object set is derived from the packet instead of hand-set
+    // env. Strings and integers no kernel consumes — they move neither the pairing hash nor
+    // the compiled object.
+    out.push_str(
+        "\n/* --- object recipe inputs (scripts/build_gfx942.sh PLOW_HSACO_CONFIG) --- */\n",
+    );
+    let amd_key = manifest
+        .get("backends")
+        .and_then(Value::as_object)
+        .and_then(|b| b.keys().find(|k| k.starts_with("gfx")).cloned());
+    if let Some(k) = &amd_key {
+        out.push_str(&format!("#define PLOW_PACKET_OBJECT_ARCH \"{k}\"\n"));
+        let req: Vec<&str> = manifest
+            .pointer(&format!("/backends/{k}/requires"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        out.push_str(&format!(
+            "#define PLOW_PACKET_OBJECT_REQUIRES \"{}\"\n",
+            req.join(" ")
+        ));
+    }
+    if let Some(b) = manifest
+        .pointer("/shapes/decode_batch")
+        .and_then(Value::as_u64)
+    {
+        out.push_str(&format!("#define PLOW_PACKET_DECODE_BATCH {b}\n"));
+    }
+    let ladder = manifest
+        .pointer("/emit_config/knobs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|k| k.get("id").and_then(Value::as_str) == Some("decode_ladder"))
+        .and_then(|k| k.get("value").and_then(Value::as_str))
+        .filter(|v| !v.is_empty());
+    if let Some(l) = ladder {
+        out.push_str(&format!("#define PLOW_PACKET_DECODE_LADDER \"{l}\"\n"));
+    }
+    let token_batch_bodies = manifest
+        .get("programs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|p| p.get("kind").and_then(Value::as_str) == Some("token_batch"));
+    out.push_str(&format!(
+        "#define PLOW_PACKET_HAS_TOKEN_BATCH_BODIES {}\n",
+        if token_batch_bodies { 1 } else { 0 }
+    ));
     out
 }
 
@@ -2359,6 +2610,41 @@ mod tests {
             prog_t: vec![1024, 8],
             gen: vec![],
         }
+    }
+
+    #[test]
+    fn kernel_cases_cover_every_op_and_preserve_variant_parameters() {
+        let mut m = model();
+        m.progs[0].insts = DevOp::ALL.iter().map(|&op| inst(op, [0; 8])).collect();
+        let cases = kernel_cases(&m);
+        let rows = cases["programs"][0]["cases"].as_array().unwrap();
+        assert_eq!(rows.len(), DevOp::ALL.len());
+        assert_eq!(
+            rows.iter()
+                .map(|c| c["pcs"].as_array().unwrap().len())
+                .sum::<usize>(),
+            m.progs[0].insts.len()
+        );
+        assert!(rows.iter().all(|c| c["arm"].is_string()));
+
+        let base = inst(DevOp::RmsNorm, [128, 3840, 0, 0, 0, 0, 0, 0]);
+        let mut width = base;
+        width.i[1] = 4096;
+        let mut epsilon = base;
+        epsilon.f[0] = f32::from_bits(0x7fc00001);
+        let mut stride = base;
+        stride.j[0] = 16384;
+        let mut operand = base;
+        operand.t[3] = packet::TENSOR_NONE;
+        m.progs[0].insts = vec![base, base, width, epsilon, stride, operand];
+        let cases = kernel_cases(&m);
+        let rows = cases["programs"][0]["cases"].as_array().unwrap();
+        assert_eq!(rows.len(), 5);
+        assert!(rows.iter().any(|c| c["pcs"] == json!([0, 1])));
+        assert!(rows.iter().any(|c| c["f_bits"][0] == 0x7fc00001u32));
+        assert_eq!(cases["programs"][1]["kind"], "decode");
+        assert_eq!(cases["programs"][1]["rows"], 8);
+        assert!(cases["performance_evidence"].is_null());
     }
 
     /// The manifest must reflect the STREAM. An op nothing emitted must not
@@ -2668,7 +2954,7 @@ mod tests {
         let section = packet::devbuild::SectionData {
             kind: packet::devbuild::SECT_METADATA,
             name: plow_asset::packed_prefill::SECTION.into(),
-            data: vec![],
+            data: br#"{"version":1,"slot":0,"request":1,"maps":[],"programs":[]}"#.to_vec(),
         };
         let dense = build_for_packet(
             &model(),
@@ -2681,6 +2967,18 @@ mod tests {
             dense["objects"]["packed_prefill"]["arms"],
             dense["objects"]["ordinary"]["prefill"]["arms"]
         );
+    }
+
+    /// `segment_resource` rides beside `dispatch_audit`, and — being a pure function of the
+    /// emitted `Model` — is byte-identical across two builds of one blob. That stability is
+    /// what makes a diff of this section mean something.
+    #[test]
+    fn segment_resource_section_is_present_and_stable() {
+        let man = build(&model(), "sm_90a");
+        let section = &man["segment_resource"];
+        assert!(section["segments"].is_array(), "{section}");
+        assert!(section["findings"].is_array(), "{section}");
+        assert_eq!(*section, build(&model(), "sm_90a")["segment_resource"]);
     }
 
     /// The nvcc rendering is a BACKEND of the neutral facts, and `requires` is
@@ -2737,6 +3035,28 @@ mod tests {
         assert_eq!(pairing_hash(&a), pairing_hash(&b));
         b["union"] = json!(["Gemv"]);
         assert_ne!(pairing_hash(&a), pairing_hash(&b));
+    }
+
+    /// A packet whose object requirements changed must not keep its stamp: a same-recipe
+    /// re-emit that added PLOW_DSA_DECODE_BATCH=1 to `requires` once kept the old hash, so
+    /// objects built without it paired and loaded silently.
+    #[test]
+    fn pairing_hash_tracks_backend_requires_but_not_recommends() {
+        let a = build(&model(), "gfx950");
+        let arch = a["backends"]
+            .as_object()
+            .and_then(|b| b.iter().find(|(_, v)| v["requires"].is_array()))
+            .map(|(k, _)| k.clone())
+            .expect("a backend with a requires list");
+        let mut req = a.clone();
+        req["backends"][&arch]["requires"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("PLOW_TEST_EXTRA=1"));
+        assert_ne!(pairing_hash(&a), pairing_hash(&req));
+        let mut rec = a.clone();
+        rec["backends"][&arch]["recommends"] = json!(["PLOW_TEST_ADVISORY=1"]);
+        assert_eq!(pairing_hash(&a), pairing_hash(&rec));
     }
 
     /// The four axes must be readable WITHOUT reconstructing them from the feature booleans —
@@ -2830,7 +3150,7 @@ mod tests {
 
     /// A `QuantFp8` carrying `t[3]` must ask for `PLOW_T11_GLUQUANT=1`, and a plain one must not.
     ///
-    /// THE REGRESSION THIS PINS. `qnorm_fuse` folds the GLU producer into the quant packet
+    /// THE REGRESSION THIS PINS. The GLU-quant fold puts the GLU producer in the quant packet
     /// (t3=gate, t4=up, i2=act) and DELETES the `Glu` packet that used to compute `fu`. The AMD
     /// dispatch ignored t3/t4 for its whole life, so the packet quantized an `fu` nothing had
     /// written: no fault, no NaN, just a garbage FFN output, a wrong KV cache, and fluent wrong
@@ -2947,6 +3267,79 @@ mod tests {
         };
         assert!(qpre_req(true).iter().any(|r| r == "PLOW_KDA_CHUNK_QPRE=1"));
         assert!(!qpre_req(false).iter().any(|r| r == "PLOW_KDA_CHUNK_QPRE=1"));
+    }
+
+    #[test]
+    fn sparse_fp8_requires_object_support_and_prefill_routing() {
+        for op in [DevOp::FlashMlaDecodeFp8, DevOp::FlashMlaPrefillFp8] {
+            for handle in [0, 1, 65535] {
+                let mut d = inst(op, [0; 8]);
+                d.j[0] = handle;
+                let m = Model {
+                    n_cu: 256,
+                    target: 0,
+                    tensors: vec![],
+                    progs: vec![prog(vec![d])],
+                    kv_row_insts: vec![],
+                    prog_t: vec![if op == DevOp::FlashMlaPrefillFp8 {
+                        8192
+                    } else {
+                        1
+                    }],
+                    gen: vec![],
+                };
+                let manifest = build(&m, "gfx942");
+                let req = manifest["backends"]["gfx942"]["requires"]
+                    .as_array()
+                    .unwrap();
+                assert_eq!(
+                    req.iter().any(|r| r == "PLOW_MLA_SPARSE_FP8=1"),
+                    handle != 0
+                );
+                assert_eq!(
+                    req.iter().any(|r| r == "PLOW_DSA_PF_ARM=1"),
+                    handle != 0 && op == DevOp::FlashMlaPrefillFp8
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dsa_decode_batch_requires_a_row_aware_object() {
+        for (row, local) in [(0, 0), (1, 0), (7, 0), (0, 1)] {
+            let mut d = inst(DevOp::IndexSelect, [0; 8]);
+            d.i[3] = row;
+            d.i[4] = local;
+            let m = Model {
+                n_cu: 256,
+                target: 0,
+                tensors: vec![],
+                progs: vec![prog(vec![d])],
+                kv_row_insts: vec![],
+                prog_t: vec![1],
+                gen: vec![],
+            };
+            let manifest = build(&m, "gfx942");
+            let req = manifest["backends"]["gfx942"]["requires"]
+                .as_array()
+                .unwrap();
+            assert_eq!(
+                req.iter().any(|r| r == "PLOW_DSA_DECODE_BATCH=1"),
+                row != 0 || local != 0
+            );
+            assert_eq!(req.iter().any(|r| r == "PLOW_DSA_SELECT_LOCAL=1"), local != 0);
+            let nvcc = manifest["backends"]["nvcc"]["requires"]
+                .as_array()
+                .unwrap();
+            assert_eq!(
+                nvcc.iter().any(|r| r == "PLOW_DSA_DECODE_BATCH=1"),
+                row != 0 || local != 0
+            );
+            assert!(config_header(&manifest).contains(&format!(
+                "#define PLOW_PACKET_REQUIRES_DSA_DECODE_BATCH {}\n",
+                u8::from(row != 0 || local != 0)
+            )));
+        }
     }
 
     /// The three arms multiplexed onto `FlashMlaPrefill`'s `i[6]`/`t[7]` must ask for the
@@ -3503,6 +3896,64 @@ mod tests {
         assert!(h.contains("#define GV_MM_MAX 8"));
         assert!(h.contains("#ifndef GV_MM_MAX"));
         assert!(h.contains("PLOW_PACKET_HASH"));
+    }
+
+    /// The section `scripts/build_gfx942.sh` consumes under PLOW_HSACO_CONFIG: the AMD
+    /// `requires` list verbatim, the decode batch, the ladder the emit was told, and whether
+    /// token-batch body programs (the `_tb` object twins) exist.
+    #[test]
+    fn header_carries_the_object_recipe_inputs() {
+        let _guard = crate::test_env::env_guard();
+        let _scope = crate::test_env::EnvScope::set(&[("PLOW_DECODE_BATCH_LADDER", "1,2,4")]);
+        let mut man = build(&model(), "gfx942");
+        let h = config_header(&man);
+        assert!(
+            h.contains("#define PLOW_PACKET_OBJECT_ARCH \"gfx942\"\n"),
+            "{h}"
+        );
+        assert!(h.contains("#define PLOW_PACKET_DECODE_BATCH 8\n"), "{h}");
+        assert!(
+            h.contains("#define PLOW_PACKET_DECODE_LADDER \"1,2,4\"\n"),
+            "{h}"
+        );
+        assert!(
+            h.contains("#define PLOW_PACKET_HAS_TOKEN_BATCH_BODIES 0\n"),
+            "{h}"
+        );
+        let line = h
+            .lines()
+            .find(|l| l.starts_with("#define PLOW_PACKET_OBJECT_REQUIRES \""))
+            .expect("requires line");
+        let req: Vec<&str> = man["backends"]["gfx942"]["requires"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(
+            line,
+            format!("#define PLOW_PACKET_OBJECT_REQUIRES \"{}\"", req.join(" "))
+        );
+        for tok in [
+            "PLOW_WG_WAVES=8",
+            "GM_DBUF=1",
+            "GM_BM=192",
+            "GM_BN=256",
+            "PLOW_FP8_KV=1",
+        ] {
+            assert!(req.contains(&tok), "{tok} missing from {req:?}");
+        }
+        // A token-batch body program is what selects the `_tb` twins.
+        man["programs"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"kind": "token_batch", "topology": "ordinary"}));
+        assert!(config_header(&man).contains("#define PLOW_PACKET_HAS_TOKEN_BATCH_BODIES 1\n"));
+        // Recipe inputs are outside the pairing hash: a different ladder is the same pair.
+        let _scope2 = crate::test_env::EnvScope::set(&[("PLOW_DECODE_BATCH_LADDER", "1,2")]);
+        let other = build(&model(), "gfx942");
+        assert_eq!(man["pairing"]["hash"], other["pairing"]["hash"]);
+        assert!(config_header(&other).contains("#define PLOW_PACKET_DECODE_LADDER \"1,2\"\n"));
     }
 
     #[test]

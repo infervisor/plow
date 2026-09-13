@@ -59,7 +59,7 @@ warp-group MMA). The **idea** transfers; the code does not.
 
 ## 2. What actually transfers: the pipeline schedule
 
-`runtime/amd/op_gemm.h` already records the diagnosis, from measurements taken
+`runtime/amd/op_gemm_common.h` already records the diagnosis, from measurements taken
 on real MI350X hardware:
 
 > bf16 barrier-halving gave only +7-9%; fp8's 4x barrier cut gave parity. The

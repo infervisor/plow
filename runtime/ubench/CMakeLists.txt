@@ -72,9 +72,15 @@ if(PLOW_ROCM)
     set(UBENCH_DEPS
         ${CMAKE_CURRENT_SOURCE_DIR}/../amd/amd_common.h
         ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_gemm.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_gemm_common.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_gemm_gfx942.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_gemm_gfx950.h
         ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_norm.h
         ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_elementwise.h
-        ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_attention.h)
+        ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_attention.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_attention_common.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_attention_gfx942.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_attention_gfx950.h)
 
     add_custom_command(
         OUTPUT ${UBENCH_ELF}
