@@ -19,6 +19,9 @@
 #if PLOW_NV_FA512_PX4_BQ64 && (PLOW_NV_FA512_WG || !PLOW_NV_PACKED_REQUEST)
 #error "HD512 px4 BQ64 requires the packed non-WGMMA object"
 #endif
+#if PLOW_NV_FA_TMA_DESC && !PLOW_NV_FA512_PX4_BQ64
+#error "HD512 descriptor TMA is only implemented by the px4 BQ64 object"
+#endif
 
 #if PLOW_NV_FA512_KV64 && !PLOW_NV_FA512_WG
 #error "HD512 KV64 requires the WGMMA body"
@@ -45,7 +48,7 @@ extern "C" __device__ __constant__ unsigned plow_pf_masked_padding_abi = 1;
 #endif
 
 #if PLOW_NV_FA512_PX4_BQ64
-extern "C" __device__ unsigned plow_attention_sm90_hd512_px4_bq64_abi = 4;
+extern "C" __device__ unsigned plow_attention_sm90_hd512_px4_bq64_abi = 5;
 #else
 extern "C" __device__ unsigned plow_attention_sm90_hd512_wg32_abi = 1;
 #endif
@@ -64,9 +67,14 @@ extern "C" __device__ unsigned plow_attention_global = 1;
 extern "C" __device__ unsigned plow_attention_nsplit = 1;
 extern "C" __device__ unsigned plow_attention_direct_entry = 1;
 extern "C" __device__ unsigned plow_attention_score_swizzle = PLOW_NV_FA_SCORE_SWIZZLE;
+extern "C" __device__ unsigned plow_attention_tma_desc = PLOW_NV_FA_TMA_DESC;
 extern "C" __device__ unsigned plow_block_pfattn_hd512_px4_bq64 = 512;
 extern "C" __device__ unsigned plow_arena_bytes_pfattn_hd512_px4_bq64 =
+#if PLOW_NV_FA_TMA_DESC
+    FA_PX4_TMA_DESC_SMEM_FLOATS(512, 64, 16) * sizeof(float);
+#else
     FA_PX4_SMEM_FLOATS(512, 64, 16) * sizeof(float);
+#endif
 #else
 extern "C" __device__ unsigned plow_block_pfattn_hd512 = 256;
 extern "C" __device__ unsigned plow_arena_bytes_pfattn_hd512 =
@@ -104,7 +112,7 @@ __device__ __noinline__ void attention_packed_bkv16(
     __nv_bfloat16* __restrict__ output, unsigned seq_q, unsigned seq_kv,
     unsigned n_head, unsigned n_kv_head, unsigned q_pos0, unsigned window,
     unsigned nsplit, unsigned kv_stride, unsigned kv_mask, float scale,
-    unsigned slice, unsigned nblk, float* arena) {
+    unsigned slice, unsigned nblk, const void* mapkv, float* arena) {
 #if PLOW_NV_FA512_PX4_BQ64
     if (!requests) {
         __trap();
@@ -129,15 +137,20 @@ __device__ __noinline__ void attention_packed_bkv16(
         const size_t qoff = (size_t)q0 * (PLOW_NV_FA512_PX4_BQ64 ? 16 : n_head) * 512;
         const size_t kvoff =
             (size_t)slot * (PLOW_NV_FA512_PX4_BQ64 ? 1 : n_kv_head) * kv_stride * 512;
+        const void* descriptor = mapkv ? (const void*)((const uint64_t*)mapkv)[slot] : nullptr;
+        if (PLOW_NV_FA_TMA_DESC && !descriptor) {
+            __trap();
+            return;
+        }
         d_flash_prefill_px4<512, PLOW_NV_FA512_PX4_BQ64 ? 64 : 32, 16, false,
-                            PLOW_NV_FA512_PX4_BQ64 ? 512 : 256>(
+                            PLOW_NV_FA512_PX4_BQ64 ? 512 : 256, PLOW_NV_FA_TMA_DESC>(
             opart + qoff * (PLOW_NV_FA512_PX4_BQ64 ? 1 : nsplit),
             mlpart + (size_t)q0 * (PLOW_NV_FA512_PX4_BQ64 ? 32 : n_head * nsplit * 2),
             q + qoff, k + kvoff, v + kvoff, output ? output + qoff : nullptr,
             qlen, kvlen, PLOW_NV_FA512_PX4_BQ64 ? 16 : n_head,
             PLOW_NV_FA512_PX4_BQ64 ? 1 : n_kv_head, kvlen - qlen,
             PLOW_NV_FA512_PX4_BQ64 ? 0 : window, PLOW_NV_FA512_PX4_BQ64 ? 1 : nsplit,
-            kv_stride, kv_mask, scale, slice, nblk, arena);
+            kv_stride, kv_mask, scale, slice, nblk, arena, nullptr, nullptr, descriptor);
         __syncthreads();
     }
 
@@ -196,7 +209,7 @@ __device__ __forceinline__ void attention_body(const PlowDevInst* in, void* cons
 #if PLOW_NV_FA512_WG
         arena, t7 == PLOW_TENSOR_NONE ? nullptr : tensors[t7]);
 #elif PLOW_NV_PACKED_REQUEST
-        arena);
+        t7 == PLOW_TENSOR_NONE ? nullptr : tensors[t7], arena);
 #else
         arena, nullptr, tensors[t7]);
 #endif
@@ -211,13 +224,14 @@ typedef struct {
     const __nv_bfloat16* k;
     const __nv_bfloat16* v;
     __nv_bfloat16* output;
+    const void* mapkv;
     const PlowStreamEnt* entries;
     const unsigned* succs;
     unsigned* counters;
     unsigned seq_q;
     unsigned kv_stride;
 } PlowHd512Px4Direct;
-static_assert(sizeof(PlowHd512Px4Direct) == 88, "HD512 direct role ABI");
+static_assert(sizeof(PlowHd512Px4Direct) == 96, "HD512 direct role ABI");
 
 extern "C" __global__ __launch_bounds__(512, 1)
 void plow_sm90a_pfattn_hd512_px4_bq64_direct(PlowHd512Px4Direct args) {
@@ -230,11 +244,17 @@ void plow_sm90a_pfattn_hd512_px4_bq64_direct(PlowHd512Px4Direct args) {
         const unsigned kvlen = (unsigned)args.requests[4 + 4 * r];
         const size_t qoff = (size_t)q0 * 16 * 512;
         const size_t kvoff = (size_t)slot * args.kv_stride * 512;
-        d_flash_prefill_px4<512, 64, 16, false, 512>(
+        const void* descriptor = args.mapkv ? (const void*)((const uint64_t*)args.mapkv)[slot]
+                                            : nullptr;
+        if (!descriptor) {
+            __trap();
+            return;
+        }
+        d_flash_prefill_px4<512, 64, 16, false, 512, PLOW_NV_FA_TMA_DESC>(
             args.opart + qoff, args.mlpart + (size_t)q0 * 32, args.q + qoff,
             args.k + kvoff, args.v + kvoff, args.output + qoff, qlen, kvlen, 16, 1,
             kvlen - qlen, 0, 1, args.kv_stride, 0xffffffffu, 1.0f,
-            blockIdx.x, gridDim.x, arena);
+            blockIdx.x, gridDim.x, arena, nullptr, nullptr, descriptor);
         __syncthreads();
     }
 

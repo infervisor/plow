@@ -303,6 +303,13 @@ impl Manifest {
             if g.kind == packet::rope::GEN_TMAP_KV_PAIR {
                 let pair = *maps.get(&g.tensor).ok_or("undeclared KV map")?;
                 let c = caches[&pair];
+                let box_rows = if g.factor == 0.0 {
+                    32
+                } else if g.factor.is_finite() && g.factor.fract() == 0.0 {
+                    g.factor as u32
+                } else {
+                    0
+                };
                 require(
                     c.scales.is_none()
                         && g.aux == u32::from(pair[0])
@@ -310,7 +317,8 @@ impl Manifest {
                         && g.ctx == c.stride
                         && g.hd == c.hd
                         && g.frac == c.heads as f64
-                        && c.stride % 32 == 0
+                        && matches!(box_rows, 16 | 32 | 64)
+                        && c.stride % box_rows == 0
                         && tensor(g.tensor as u16)?.bytes == 256
                         && generated_maps.insert(g.tensor, pair).is_none(),
                     "KV map geometry",

@@ -736,6 +736,7 @@ struct Hd512Px4DirectArgs {
     k: u64,
     v: u64,
     output: u64,
+    mapkv: u64,
     entries: u64,
     succs: u64,
     counters: u64,
@@ -743,7 +744,7 @@ struct Hd512Px4DirectArgs {
     kv_stride: u32,
 }
 
-const _: () = assert!(std::mem::size_of::<Hd512Px4DirectArgs>() == 88);
+const _: () = assert!(std::mem::size_of::<Hd512Px4DirectArgs>() == 96);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -834,7 +835,7 @@ fn check_attention_hd512_role(
     let expected_abi = if object.abi
         == plow_asset::segment_roles::PREFILL_ATTENTION_HD512_PX4_BQ64_ABI
     {
-        4
+        5
     } else {
         1
     };
@@ -1557,6 +1558,7 @@ struct KvTensorMap {
     rows: u32,
     hd: u32,
     heads: u32,
+    box_rows: u32,
     stride: u64,
     batch: usize,
 }
@@ -1579,6 +1581,16 @@ fn kv_tensor_maps(
         };
         let tensor = g.tensor as usize;
         let pair = [g.aux as usize, g.scale as usize];
+        let box_rows = if g.factor == 0.0 {
+            32
+        } else if g.factor.is_finite()
+            && g.factor.fract() == 0.0
+            && matches!(g.factor as u32, 16 | 32 | 64)
+        {
+            g.factor as u32
+        } else {
+            return Err(reject());
+        };
         if batch == 0
             || g.ctx == 0
             || g.hd == 0
@@ -1589,6 +1601,7 @@ fn kv_tensor_maps(
             || g.frac.fract() != 0.0
             || pair[0] == pair[1]
             || pair.contains(&tensor)
+            || g.ctx % box_rows != 0
             || tensors.get(tensor).is_none_or(|t| t.bytes != 256)
             || recipes.iter().filter(|r| r.tensor == g.tensor).count() != 1
             || recipes.iter().any(|r| pair.contains(&(r.tensor as usize)))
@@ -1608,7 +1621,10 @@ fn kv_tensor_maps(
                 .is_none_or(|t| t.bytes % batch as u64 != 0 || t.bytes != bytes)
         }) || maps.iter().any(|map| {
             map.pair.iter().any(|id| pair.contains(id))
-                && (map.pair != pair || map.rows != g.ctx || map.hd != g.hd || map.heads != heads)
+                && (map.pair != pair
+                    || map.rows != g.ctx
+                    || map.hd != g.hd
+                    || map.heads != heads)
         }) {
             return Err(reject());
         }
@@ -1618,6 +1634,7 @@ fn kv_tensor_maps(
             rows: g.ctx,
             hd: g.hd,
             heads,
+            box_rows,
             stride,
             batch,
         });
@@ -1662,7 +1679,8 @@ impl KvTensorMap {
     ) -> Result<[(usize, u64); 3]> {
         let bindings = self.slot_bindings(ptrs, slot, descriptor.base)?;
         for (i, &(_, base)) in bindings[1..].iter().enumerate() {
-            let bytes = be.encode_tmap_kv3(base, self.rows, self.hd, self.heads, 32)?;
+            let bytes =
+                be.encode_tmap_kv3(base, self.rows, self.hd, self.heads, self.box_rows)?;
             be.upload(descriptor, (i * 128) as u64, &bytes)?;
         }
         Ok(bindings)
@@ -4758,7 +4776,7 @@ impl GpuEngine {
                 }
             }
             if id == plow_asset::segment_roles::PREFILL_ATTENTION_HD512_PX4_BQ64 {
-                if smem != 110096 {
+                if smem != 110592 {
                     return Err(RuntimeError::Rejected(
                         "HD512 px4 BQ64 role has incompatible fixed geometry".into(),
                     ));
@@ -4771,6 +4789,7 @@ impl GpuEngine {
                     ("plow_attention_nsplit", 1),
                     ("plow_attention_direct_entry", 1),
                     ("plow_attention_score_swizzle", 1),
+                    ("plow_attention_tma_desc", 1),
                 ] {
                     if be.module_global_u32(&module, name)? != Some(value) {
                         return Err(RuntimeError::Rejected(
@@ -7592,6 +7611,7 @@ impl GpuEngine {
                     k: tensor(inst.t[3])?,
                     v: tensor(inst.t[4])?,
                     output: tensor(inst.t[5])?,
+                    mapkv: tensor(inst.t[7])?,
                     entries,
                     succs: arg.succs,
                     counters: arg.counters,

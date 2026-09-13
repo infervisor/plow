@@ -395,12 +395,12 @@ fn accepts_exact_hd512_wg32_contract_and_rejects_drift() {
 fn accepts_exact_hd512_px4_bq64_resource_contract() {
     let object = hd512_px4_bq64_object();
     let geometry = [Some(512), Some(64), Some(16), Some(16)];
-    check_attention_hd512_role("sm90a", &object, Some(4), Some(512), geometry).unwrap();
+    check_attention_hd512_role("sm90a", &object, Some(5), Some(512), geometry).unwrap();
     assert!(
         check_attention_hd512_role("sm90a", &object, Some(2), Some(512), geometry).is_err()
     );
     assert!(
-        check_attention_hd512_role("sm90a", &object, Some(4), Some(256), geometry).is_err()
+        check_attention_hd512_role("sm90a", &object, Some(5), Some(256), geometry).is_err()
     );
 }
 

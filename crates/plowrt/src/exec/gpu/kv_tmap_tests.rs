@@ -123,9 +123,20 @@ fn rejects_invalid_or_conflicting_geometry() {
         };
         assert!(kv_tensor_maps(&tensors, &[bad], 2).is_err());
     }
+    for factor in [-16.0, 8.0, 24.0, 128.0, 16.5, f64::NAN] {
+        let bad = GenTensor { factor, ..recipe };
+        assert!(kv_tensor_maps(&tensors, &[bad], 2).is_err());
+    }
+    let map16 = GenTensor::tmap_kv_pair_box(1, 2, 128, 256, 2, 16);
+    assert_eq!(kv_tensor_maps(&tensors, &[map16], 2).unwrap()[0].box_rows, 16);
     let mut shared = tensors;
     shared.push(DevTensor {
         name: "second_map".into(),
+        bytes: 256,
+        init: None,
+    });
+    shared.push(DevTensor {
+        name: "third_map".into(),
         bytes: 256,
         init: None,
     });
@@ -135,6 +146,17 @@ fn rejects_invalid_or_conflicting_geometry() {
     };
     assert_eq!(
         kv_tensor_maps(&shared, &[recipe, same_pair], 2)
+            .unwrap()
+            .len(),
+        2
+    );
+    let same_pair_bkv16 = GenTensor {
+        tensor: 4,
+        factor: 16.0,
+        ..recipe
+    };
+    assert_eq!(
+        kv_tensor_maps(&shared, &[recipe, same_pair_bkv16], 2)
             .unwrap()
             .len(),
         2

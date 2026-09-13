@@ -260,9 +260,10 @@ pub const GEN_TMAP_E4M3: u32 = 5;
 /// [`GenTensor::kind`]: a 256-byte K/V tensor-map PAIR for the flash-prefill TMA stager
 /// (K's rank-3 map at +0, V's at +128 — FLASH_PREFILL has ONE spare t[] slot, so the pair
 /// rides in one buffer). Each map: bf16, rank-3 {hd, ring_rows, n_kv_head}, 128B swizzle,
-/// box {64, BKV=32, 1}. Field reuse: `ctx` = ring rows, `hd` = head_dim, `aux` = K tensor
-/// handle, `scale` = V tensor handle, `frac` = n_kv_head (f64 carrying a small integer).
-/// Same zero-placeholder contract as the other TMAP kinds.
+/// box {64, BKV, 1}. Field reuse: `ctx` = ring rows, `hd` = head_dim, `aux` = K tensor
+/// handle, `scale` = V tensor handle, `frac` = n_kv_head and `factor` = BKV. Legacy
+/// recipes carry `factor=0`, meaning BKV=32. Same zero-placeholder contract as the other
+/// TMAP kinds.
 pub const GEN_TMAP_KV_PAIR: u32 = 6;
 
 /// [`GenTensor::scale`]: no inv_freq rescaling (Gemma / Qwen / GLM).
@@ -474,6 +475,17 @@ impl GenTensor {
         hd: u32,
         n_kv_head: u32,
     ) -> GenTensor {
+        Self::tmap_kv_pair_box(k_target, v_target, ring_rows, hd, n_kv_head, 32)
+    }
+
+    pub fn tmap_kv_pair_box(
+        k_target: u32,
+        v_target: u32,
+        ring_rows: u32,
+        hd: u32,
+        n_kv_head: u32,
+        box_rows: u32,
+    ) -> GenTensor {
         GenTensor {
             tensor: 0,
             kind: GEN_TMAP_KV_PAIR,
@@ -483,7 +495,11 @@ impl GenTensor {
             scale: v_target,
             theta: 0.0,
             frac: n_kv_head as f64,
-            factor: 0.0,
+            factor: if box_rows == 32 {
+                0.0
+            } else {
+                box_rows as f64
+            },
             low: 0.0,
             high: 0.0,
             orig: 0.0,
@@ -731,5 +747,15 @@ mod tests {
         // all-zero: the ENGINE overwrites it at bind time, and a zero descriptor fed to
         // TMA would fault rather than compute — never silently serve.
         assert_eq!(g.generate().unwrap(), vec![0u8; 128]);
+    }
+
+    #[test]
+    fn kv_tmap_recipe_keeps_legacy_bkv32_and_encodes_other_boxes() {
+        let legacy = GenTensor::tmap_kv_pair(7, 8, 16384, 512, 1);
+        let bkv16 = GenTensor::tmap_kv_pair_box(7, 8, 16384, 512, 1, 16);
+        assert_eq!(legacy.factor, 0.0);
+        assert_eq!(bkv16.factor, 16.0);
+        assert_eq!(bkv16.byte_len(), 256);
+        assert_eq!(bkv16.generate().unwrap(), vec![0u8; 256]);
     }
 }

@@ -23,8 +23,8 @@ const OBJECT_GLOBALS: [(&str, u32); 7] = [
 ];
 const HD512_PX4_BQ64_OBJECT_FILE: &str = "interp_sm90a_pfattn_hd512_px4_bq64.cubin";
 const HD512_PX4_BQ64_OBJECT_ENTRY: &str = "plow_sm90a_pfattn_hd512_px4_bq64";
-const HD512_PX4_BQ64_OBJECT_GLOBALS: [(&str, u32); 13] = [
-    ("plow_attention_sm90_hd512_px4_bq64_abi", 3),
+const HD512_PX4_BQ64_OBJECT_GLOBALS: [(&str, u32); 15] = [
+    ("plow_attention_sm90_hd512_px4_bq64_abi", 5),
     ("plow_attention_head_dim", 512),
     ("plow_attention_query_tile", 64),
     ("plow_attention_kv_tile", 16),
@@ -35,8 +35,10 @@ const HD512_PX4_BQ64_OBJECT_GLOBALS: [(&str, u32); 13] = [
     ("plow_attention_global", 1),
     ("plow_attention_nsplit", 1),
     ("plow_attention_direct_entry", 1),
+    ("plow_attention_score_swizzle", 1),
+    ("plow_attention_tma_desc", 1),
     ("plow_block_pfattn_hd512_px4_bq64", 512),
-    ("plow_arena_bytes_pfattn_hd512_px4_bq64", 108_048),
+    ("plow_arena_bytes_pfattn_hd512_px4_bq64", 110_592),
 ];
 const HD256_OBJECT_FILE: &str = "interp_sm90a_pfattn_hd256_bkv32.cubin";
 const HD256_OBJECT_ENTRY: &str = "plow_sm90a_pfattn_hd256_bkv32";
@@ -500,7 +502,7 @@ pub(crate) fn apply_output_object(
                 path.display()
             ));
         }
-        validate_hardware_resources(gpu, profile, 512, 16, 108_048)?;
+        validate_hardware_resources(gpu, profile, 512, 16, 110_592)?;
         let programs = model.progs[..prefill_count]
             .iter()
             .enumerate()

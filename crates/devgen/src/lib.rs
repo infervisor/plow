@@ -3846,8 +3846,10 @@ fn emit_phase(
     let tmap8 = |target: u32, rows: u32, k: u32| -> u32 {
         tmaps.borrow_mut().handle(target, rows, k, true)
     };
-    let tmap_kv = |kt: u32, vt: u32, ring: u32, hd: u32, nkv: u32| -> u32 {
-        tmaps.borrow_mut().kv_pair(kt, vt, ring, hd, nkv)
+    let tmap_kv = |kt: u32, vt: u32, ring: u32, hd: u32, nkv: u32, box_rows: u32| -> u32 {
+        tmaps
+            .borrow_mut()
+            .kv_pair(kt, vt, ring, hd, nkv, box_rows)
     };
 
     let proj = |b: &mut Builder,
@@ -5054,8 +5056,16 @@ fn emit_phase(
             // bf16-KV packet the slot was always TENSOR_NONE.
             // T33: hd512 (full-attn) too — the stager is HD-generic (NSUB sub-tiles), and
             // k_eq_v just encodes the same base at both pair slots.
+            let box_rows = if hd == 512
+                && matches!(t, 4096 | 8192)
+                && emit_config::active().gemma4_sm90_hd512_px4_bq64_role
+            {
+                16
+            } else {
+                32
+            };
             let fa_tm = (tma_gemm && !fp8_kv && (hd == 256 || hd == 512) && !gemv_family)
-                .then(|| tmap_kv(n.kc[l], n.vc[l], kvr, hd, kvh));
+                .then(|| tmap_kv(n.kc[l], n.vc[l], kvr, hd, kvh, box_rows));
             let fa_deps: Vec<u32> = if shared {
                 vec![c_qn]
             } else {
@@ -6751,17 +6761,26 @@ impl TmapMint {
     }
 
     /// A `GEN_TMAP_KV_PAIR` (256 B: K map + V map) for the flash-prefill TMA stager.
-    /// Memoised on the (K, V) tensor pair (`u32::MAX` marks the key as a pair — a rows
-    /// value no real tensor reaches).
-    fn kv_pair(&mut self, kt: u32, vt: u32, ring: u32, hd: u32, nkv: u32) -> u32 {
-        if let Some(&h) = self.memo.get(&(kt, vt, u32::MAX)) {
+    /// Memoised on the (K, V) tensor pair and box rows. Reserved high row keys distinguish
+    /// pair descriptors from rank-2 tensor maps.
+    fn kv_pair(
+        &mut self,
+        kt: u32,
+        vt: u32,
+        ring: u32,
+        hd: u32,
+        nkv: u32,
+        box_rows: u32,
+    ) -> u32 {
+        let key = (kt, vt, u32::MAX - box_rows);
+        if let Some(&h) = self.memo.get(&key) {
             return h;
         }
         let h = self.base + self.decls.len() as u32;
-        let mut g = GenTensor::tmap_kv_pair(kt, vt, ring, hd, nkv);
+        let mut g = GenTensor::tmap_kv_pair_box(kt, vt, ring, hd, nkv, box_rows);
         g.tensor = h;
         self.decls.push((format!("tmap.kv.{kt}"), g));
-        self.memo.insert((kt, vt, u32::MAX), h);
+        self.memo.insert(key, h);
         h
     }
 }

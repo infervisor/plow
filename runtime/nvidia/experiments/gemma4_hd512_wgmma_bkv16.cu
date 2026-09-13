@@ -8,6 +8,7 @@
  *     -Xptxas=-v runtime/nvidia/experiments/gemma4_hd512_wgmma_bkv16.cu \
  *     -lcuda -o /tmp/gemma4_hd512_wgmma_bkv16
  */
+#include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -44,6 +45,11 @@ constexpr int BKV = 16;
 constexpr unsigned GRID = 132;
 constexpr unsigned THREADS = 256;
 constexpr unsigned BQ64_THREADS = 512;
+#if defined(PLOW_EXPERIMENT_PX4_TMA_DESC)
+constexpr unsigned CONTROL_THREADS = BQ64_THREADS;
+#else
+constexpr unsigned CONTROL_THREADS = THREADS;
+#endif
 
 #define CK(call)                                                                                 \
     do {                                                                                         \
@@ -55,6 +61,19 @@ constexpr unsigned BQ64_THREADS = 512;
         }                                                                                        \
     } while (0)
 
+#if defined(PLOW_EXPERIMENT_PX4_TMA_DESC)
+__global__ __launch_bounds__(BQ64_THREADS, 1) void control_kernel(
+                               float* partial, float* stats, const bf16* q,
+                               const bf16* k, const bf16* v, bf16* out,
+                               unsigned rows, unsigned kv_length, unsigned stride,
+                               unsigned nsplit) {
+    extern __shared__ float arena[];
+    d_flash_prefill_px4<HD, 64, BKV, false, BQ64_THREADS>(
+        partial, stats, q, k, v, out, rows, kv_length, HEADS, KV_HEADS,
+        kv_length - rows, 0, nsplit, stride, 0xffffffffu, 1.0f,
+        blockIdx.x, gridDim.x, arena);
+}
+#else
 __global__ void control_kernel(float* partial, float* stats, const bf16* q,
                                const bf16* k, const bf16* v, bf16* out,
                                unsigned rows, unsigned kv_length, unsigned stride,
@@ -65,8 +84,21 @@ __global__ void control_kernel(float* partial, float* stats, const bf16* q,
         kv_length - rows, 0, nsplit, stride, 0xffffffffu, 1.0f,
         blockIdx.x, gridDim.x, arena);
 }
+#endif
 
-#if defined(PLOW_EXPERIMENT_PX4_BQ64)
+#if defined(PLOW_EXPERIMENT_PX4_TMA_DESC)
+__global__ __launch_bounds__(BQ64_THREADS, 1) void candidate_kernel(
+                                 float* partial, float* stats, const bf16* q,
+                                 const bf16* k, const bf16* v, bf16* out,
+                                 unsigned rows, unsigned kv_length, unsigned stride,
+                                 unsigned nsplit, const void* maps) {
+    extern __shared__ float arena[];
+    d_flash_prefill_px4<HD, 64, BKV, false, BQ64_THREADS, true>(
+        partial, stats, q, k, v, out, rows, kv_length, HEADS, KV_HEADS,
+        kv_length - rows, 0, nsplit, stride, 0xffffffffu, 1.0f,
+        blockIdx.x, gridDim.x, arena, nullptr, nullptr, maps);
+}
+#elif defined(PLOW_EXPERIMENT_PX4_BQ64)
 __global__ __launch_bounds__(BQ64_THREADS, 1) void candidate_kernel(
                                  float* partial, float* stats, const bf16* q,
                                  const bf16* k, const bf16* v, bf16* out,
@@ -185,6 +217,29 @@ int main(int argc, char** argv) {
     bf16* q = upload(values(q_elements, 123u ^ seed * 0x9e3779b9u));
     bf16* k = upload(values(kv_elements, 456u ^ seed * 0x85ebca6bu));
     bf16* v = upload(values(kv_elements, 789u ^ seed * 0xc2b2ae35u));
+    CUtensorMap maps[2]{};
+    CUtensorMap* device_maps = nullptr;
+#if defined(PLOW_EXPERIMENT_PX4_TMA_DESC)
+    const uint64_t map_dims[]{HD, stride, KV_HEADS};
+    const uint64_t map_strides[]{HD * sizeof(bf16), uint64_t(HD) * stride * sizeof(bf16)};
+    const uint32_t map_box[]{64, BKV, 1};
+    const uint32_t map_steps[]{1, 1, 1};
+    for (int operand = 0; operand < 2; ++operand) {
+        void* base = operand ? static_cast<void*>(v) : static_cast<void*>(k);
+        const CUresult result = cuTensorMapEncodeTiled(
+            &maps[operand], CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3, base, map_dims,
+            map_strides, map_box, map_steps, CU_TENSOR_MAP_INTERLEAVE_NONE,
+            CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
+            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+        if (result != CUDA_SUCCESS) {
+            const char* error = nullptr;
+            cuGetErrorString(result, &error);
+            std::fprintf(stderr, "cuTensorMapEncodeTiled: %s\n", error ? error : "driver error");
+            return 2;
+        }
+    }
+    device_maps = upload(std::vector<CUtensorMap>{maps[0], maps[1]});
+#endif
     Buffers control = allocate_buffers(q_elements, rows, nsplit);
     Buffers candidate = allocate_buffers(q_elements, rows, nsplit);
 
@@ -193,9 +248,15 @@ int main(int argc, char** argv) {
     constexpr size_t candidate_smem = PLOW_EXPERIMENT_LAUNCH_SMEM;
 #else
     constexpr size_t control_smem =
+#if defined(PLOW_EXPERIMENT_PX4_TMA_DESC)
+        FA_PX4_SMEM_FLOATS(HD, 64, BKV) * sizeof(float);
+#else
         FA_PX4_SMEM_FLOATS(HD, 32, BKV) * sizeof(float);
+#endif
     constexpr size_t candidate_smem =
-#if defined(PLOW_EXPERIMENT_PX4_BQ64)
+#if defined(PLOW_EXPERIMENT_PX4_TMA_DESC)
+        FA_PX4_TMA_DESC_SMEM_FLOATS(HD, 64, BKV) * sizeof(float);
+#elif defined(PLOW_EXPERIMENT_PX4_BQ64)
         FA_PX4_SMEM_FLOATS(HD, 64, BKV) * sizeof(float);
 #else
         FA_SM90_PRE_FLOATS(HD, 64, BKV) * sizeof(float);
@@ -209,7 +270,7 @@ int main(int argc, char** argv) {
                             int(candidate_smem)));
 
     auto launch_control = [&] {
-        control_kernel<<<GRID, THREADS, control_smem>>>(
+        control_kernel<<<GRID, CONTROL_THREADS, control_smem>>>(
             control.partial, control.stats, q, k, v, control.out, rows,
             kv_length, stride, nsplit);
         if (nsplit > 1)
@@ -218,14 +279,18 @@ int main(int argc, char** argv) {
     };
     auto launch_candidate = [&] {
         candidate_kernel<<<GRID,
-#if defined(PLOW_EXPERIMENT_PX4_BQ64)
+#if defined(PLOW_EXPERIMENT_PX4_TMA_DESC) || defined(PLOW_EXPERIMENT_PX4_BQ64)
                            BQ64_THREADS,
 #else
                            THREADS,
 #endif
                            candidate_smem>>>(
             candidate.partial, candidate.stats, q, k, v, candidate.out, rows,
-            kv_length, stride, nsplit);
+            kv_length, stride, nsplit
+#if defined(PLOW_EXPERIMENT_PX4_TMA_DESC)
+            , device_maps
+#endif
+            );
         if (nsplit > 1)
             merge_kernel<<<GRID, THREADS>>>(candidate.out, candidate.partial,
                                             candidate.stats, rows, nsplit);
@@ -304,9 +369,9 @@ int main(int argc, char** argv) {
 
     std::printf("{\"rows\":%u,\"kv_length\":%u,\"nsplit\":%u,\"seed\":%u,",
                 rows, kv_length, nsplit, seed);
-    print_resources("control", (const void*)control_kernel, THREADS, control_smem);
+    print_resources("control", (const void*)control_kernel, CONTROL_THREADS, control_smem);
     print_resources("candidate", (const void*)candidate_kernel,
-#if defined(PLOW_EXPERIMENT_PX4_BQ64)
+#if defined(PLOW_EXPERIMENT_PX4_TMA_DESC) || defined(PLOW_EXPERIMENT_PX4_BQ64)
                     BQ64_THREADS,
 #else
                     THREADS,
@@ -332,5 +397,6 @@ int main(int argc, char** argv) {
     CK(cudaFree(q));
     CK(cudaFree(k));
     CK(cudaFree(v));
+    if (device_maps) CK(cudaFree(device_maps));
     return 0;
 }
