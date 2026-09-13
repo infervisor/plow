@@ -2051,10 +2051,13 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport, packed_prefill: 
             .unwrap_or(crate::dispatch_audit::DEFAULT_GEMV_WASTE_MAX_PCT),
     );
 
+    let backends = backends(arch, &f, &s, &union, &t);
     json!({
         "schema": 1,
         "arch": arch,
         "n_cu": m.n_cu,
+        // Before the large sections: plowrt's load check stops reading here.
+        "knobs": crate::knob_spec::manifest_section(arch, m.n_cu, &backends),
         "input_contract": {
             "kind": "token_ids",
             "modalities": ["text"],
@@ -2113,7 +2116,7 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport, packed_prefill: 
         // Outside `pairing_hash` deliberately, like `dispatch_audit`: placement does not change
         // what `plow_config.h` compiles, and stamping it would invalidate every existing pair.
         "l2_placement": l2_placement(m),
-        "backends": backends(arch, &f, &s, &union, &t),
+        "backends": backends,
     })
 }
 

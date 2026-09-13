@@ -29,6 +29,10 @@ SERVELOG="${5:-}"
 [ -f "$ASSETS/model.pkt" ] || { echo "no $ASSETS/model.pkt" >&2; exit 2; }
 [ -f "$ASSETS/build.json" ] || { echo "no $ASSETS/build.json" >&2; exit 2; }
 [ -x "$PLOWRT" ] || { echo "not executable: $PLOWRT" >&2; exit 2; }
+# A packet whose knob configuration checkpoint K did not verify (`plowc --no-knob-verify`) is a
+# bring-up artifact, not a serving set.
+KNOBS_K=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("knobs", {}).get("K", "missing"))' "$ASSETS/build.json")
+[ "$KNOBS_K" = verified ] || { echo "$ASSETS/build.json: knobs.K is $KNOBS_K, not verified; re-emit without --no-knob-verify" >&2; exit 2; }
 mkdir -p "$OUT/assets" "$OUT/hsaco"
 
 # The packet and its manifest. Symlinks are NOT followed for `checkpoint` (see above); everything

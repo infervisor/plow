@@ -14,6 +14,7 @@
 //! | D  | Schedule      | wired      |
 //! | E  | Emit          | stub       |
 //! | F  | Memory        | wired (shares D's verifier) |
+//! | K  | Knobs         | wired (emit, default on)    |
 //!
 //! Additionally, the `query` interface allows the compiler to ask Lean for
 //! provably-optimal decisions (counter granularity, lower bounds, ordering

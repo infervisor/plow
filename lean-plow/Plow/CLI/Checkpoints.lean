@@ -15,11 +15,22 @@ import Plow.Sram
 import Plow.Wire
 import Plow.Rewrite
 import Plow.TilePartition
+import Plow.Knobs.Consistency
 
 namespace Plow.CLI.Checkpoints
 
 open Lean (Json)
 open Plow.CLI Plow.Verify
+
+/-! ## Checkpoint K: knob consistency. -/
+
+/-- Resolve the knob sources against the registry and target, and check every constraint.
+    Backed by `Plow.Knobs.checkK_sound`; the registry-consistency and record-agreement checks
+    around it are instance checks. -/
+def checkK (payload : Json) : Certificate :=
+  match Plow.Knobs.runK payload with
+  | .ok notes => ok "K" notes
+  | .error msg => reject "K" msg
 
 /-! ## Checkpoint A: Rewrite rule soundness (§5.10-A). -/
 

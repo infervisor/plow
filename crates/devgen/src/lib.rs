@@ -56,6 +56,7 @@ mod block;
 use block::{parse_block, write_block_descriptor};
 mod config;
 pub mod emit_config;
+pub mod knob_spec;
 pub mod hetero;
 mod hetero_channel;
 pub mod k3;
@@ -6620,6 +6621,7 @@ pub(crate) fn apply_verify_gate(
     m: &packet::devbuild::Model,
     verify: Option<&VerifyHook>,
 ) -> LeanReport {
+    knob_spec::gate();
     match verify {
         Some(v) => match v(m) {
             Ok(r) => r,
@@ -7041,6 +7043,23 @@ struct EmitCapabilities {
     glm: bool,
 }
 
+impl EmitCapabilities {
+    /// The capabilities as checkpoint K target atoms.
+    fn caps(self) -> Vec<&'static str> {
+        [
+            ("dense_packet_contracts", self.dense_packet_contracts),
+            ("decode_objects", self.decode_objects),
+            ("cublaslt_decode", self.cublaslt_decode),
+            ("decode_ladder", self.decode_ladder),
+            ("packed_prefill_siblings", self.packed_prefill_siblings),
+            ("glm", self.glm),
+        ]
+        .into_iter()
+        .filter_map(|(name, on)| on.then_some(name))
+        .collect()
+    }
+}
+
 fn emit_capabilities(model_type: &str) -> EmitCapabilities {
     let gemma = matches!(
         model_type,
@@ -7181,18 +7200,28 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
         whole_graph_fusions,
     } = args;
 
-    let model_type =
-        serde_json::from_slice::<Value>(&std::fs::read(dir.join("config.json")).unwrap())
-            .ok()
-            .and_then(|v| {
-                v.get("model_type")
-                    .and_then(|m| m.as_str())
-                    .map(str::to_string)
-            })
-            .unwrap_or_default();
+    let model_config =
+        serde_json::from_slice::<Value>(&std::fs::read(dir.join("config.json")).unwrap()).ok();
+    let model_type = model_config
+        .as_ref()
+        .and_then(|v| {
+            v.get("model_type")
+                .and_then(|m| m.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
     let capabilities = emit_capabilities(&model_type);
     let mut emit_cfg = _emit_cfg.unwrap_or_else(emit_config::EmitConfig::from_env);
     apply_production_defaults(&mut emit_cfg, capabilities, &arch, tp, n_cu);
+    let mut knob_caps = capabilities.caps();
+    if model_config
+        .as_ref()
+        .and_then(|v| v.get("index_kpool")?.as_u64())
+        .is_some_and(|k| k > 1)
+    {
+        knob_caps.push("indexer_pooled");
+    }
+    knob_spec::note_target(&arch, tp, n_cu, &model_type, knob_caps, block_spec.as_deref());
     if emit_cfg.ane_mlp_channels.is_some() {
         assert!(
             arch == "metal3" && tp == 1 && matches!(model_type.as_str(), "llama" | "qwen3"),

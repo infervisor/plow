@@ -6264,6 +6264,7 @@ impl AmdEngine {
         shared_ckpt: Option<Arc<crate::asset::checkpoint::Checkpoint>>,
     ) -> Result<Self> {
         let t_rank = Instant::now();
+        crate::knob_spec::check_assets(blob_path)?;
         let raw = std::fs::read(blob_path)
             .map_err(|e| RuntimeError::Device(format!("read {}: {e}", blob_path.display())))?;
         let arch = EngineDevice::arch(&*be);

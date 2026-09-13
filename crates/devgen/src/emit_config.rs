@@ -1697,6 +1697,9 @@ pub struct Knob {
     /// `apply_production_defaults`, which is this tree's only real third source (`--preset`
     /// is the bucket grid and never reaches an emit knob).
     pub source: &'static str,
+    /// The env var's own value when set, also where a flag won: checkpoint K resolves precedence
+    /// itself.
+    pub env_value: Option<String>,
 }
 
 /// The recorded configuration: the knobs as parsed, whether that parse was clap's (and so
@@ -1779,11 +1782,16 @@ pub fn record_knobs(matches: Option<&clap::ArgMatches>) {
                 None => (declared_default(arg), "default"),
             },
         };
+        let env_value = env
+            .as_deref()
+            .and_then(|e| std::env::var(e).ok())
+            .filter(|v| !v.is_empty());
         out.push(Knob {
             id,
             env,
             value,
             source,
+            env_value,
         });
     }
     // Sorted by id so the section diffs cleanly wherever a new field lands in the struct, and

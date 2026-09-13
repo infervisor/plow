@@ -631,6 +631,7 @@ impl CpuModel {
         strict: bool,
     ) -> Result<CpuModel> {
         let t0 = Instant::now();
+        crate::knob_spec::check_assets(blob_path)?;
         let raw = std::fs::read(blob_path)
             .map_err(|e| RuntimeError::Device(format!("read {}: {e}", blob_path.display())))?;
         // L2-domain placement is accepted: the CPU interpreter dispatches per

@@ -2832,6 +2832,7 @@ impl GpuEngine {
     /// server startup, never on the request path.
     pub fn load(be: Arc<CudaBackend>, assets_dir: &Path, checkpoint_dir: &Path) -> Result<Self> {
         let t0 = std::time::Instant::now();
+        crate::knob_spec::check_assets(&assets_dir.join("model.pkt"))?;
         let load_prof = load_profile();
         let mut load_tim = load_prof.then(|| LoadTiming::new(t0));
         if load_prof {

@@ -236,6 +236,13 @@ struct Cli {
           require_equals = true, default_missing_value = "true")]
     lean_oracle_devblob: bool,
 
+    /// Skip checkpoint K, the knob-consistency certificate. On by default: a rejection, or no
+    /// runnable `plow_verify`, fails the emit. Bring-up only: `build.json` records
+    /// `knobs.K = "skipped"`: plowrt serves it with a warning, `scripts/freeze_serving_set.sh`
+    /// refuses to freeze it.
+    #[arg(long, default_value_t = false)]
+    no_knob_verify: bool,
+
     /// Drop counters already covered by resource-order (§8.1 counter
     /// elimination). Provably safe by the DAG-side theorem; combined with
     /// `--lean-verify`, the reduced schedule is cross-checked per bucket.
@@ -885,6 +892,32 @@ fn lean_unavailable_reason() -> Option<&'static str> {
     }
 }
 
+/// Checkpoint K is fatal: a rejection and an unusable `plow_verify` both abort the emit, unlike the
+/// ordering certificate's degrade. `--no-knob-verify` is the way past it.
+#[cfg(feature = "lean-verify")]
+fn install_knob_verifier() {
+    devgen::knob_spec::install_verifier(|payload| {
+        match lean_verify::checkpoints::knobs::check_knobs(payload) {
+            Ok(cert) if cert.ok => Ok(cert.notes.unwrap_or_default()),
+            Ok(cert) => Err(cert.reason.unwrap_or_else(|| "no reason given".into())),
+            Err(e) if e.is_binary_unusable() => Err(format!(
+                "{e}; build it with `nix develop -c lake build` in lean-plow/, or pass \
+                 --no-knob-verify (bring-up only)"
+            )),
+            Err(e) => Err(e.to_string()),
+        }
+    });
+}
+
+#[cfg(not(feature = "lean-verify"))]
+fn install_knob_verifier() {
+    devgen::knob_spec::install_verifier(|_| {
+        Err("plowc was built without the `lean-verify` feature; pass --no-knob-verify \
+             (bring-up only)"
+            .into())
+    });
+}
+
 #[cfg(feature = "lean-verify")]
 fn devblob_verify_hook(
     do_verify: bool,
@@ -1432,6 +1465,14 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
                 .unwrap_or_else(|| "tuning".to_string())
         },
     );
+    if cli.segmented {
+        devgen::knob_spec::note_cap("segmented");
+    }
+    if cli.no_knob_verify {
+        devgen::knob_spec::disable("disabled on the command line (--no-knob-verify)");
+    } else {
+        install_knob_verifier();
+    }
     devgen::run_verified(
         devgen::EmitArgs {
             dir: dir.clone(),
