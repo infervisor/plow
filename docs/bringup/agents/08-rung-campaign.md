@@ -92,8 +92,11 @@ Rules at every tier:
   host time and check the step moves. Parallel enqueue and kernarg caching measured null because
   decode was GPU-bound.
 - **Re-time the production choice.** Before comparing against a library, re-time the kernel
-  production actually dispatches. Shipped choice tables can be stale (decode rung 20 `q_a` ran at
-  46 µs where the best pinned kernel does 21).
+  production actually dispatches, through the same launch path it ships on.
+- **One timing method per comparison.** Every arm is timed on the same clock (device dispatch time
+  through the production launch path). A host wall-clock sweep around blocking drains and a
+  device-clock arm are not comparable: a re-pick that looked −7.7 ms/step at T2 on mixed clocks was
+  +0.5 ms/step at T3, and a plow-tile winner table built the same way was wrong on nearly every shape.
 - **Bind tile resources to the object.** Record block size, registers/thread,
   dynamic shared memory, driver-reported blocks/SM, SM count, launch blocks,
   cluster, and resulting grid waves. A tile change that alters any of these is
