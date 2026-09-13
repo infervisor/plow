@@ -1130,3 +1130,24 @@ reproduced the exact 4K/8K hashes. Object SHA256:
 Evidence: `/tmp/hd512-score-swizzle-*.{log,json}`,
 `/tmp/hd512-score-swizzle-ncu.ncu-rep`, and
 `/tmp/gemma4-hd512-score-swizzle-v4/build.log`.
+
+### 2026-09-13: post-swizzle attribution and closed screens
+
+The ABI v4 exact object remains one wave/SM and takes 11.65 ms under the full
+Nsight section pass. Score swizzling lowers memory throughput from 62.47% to
+47.99% and short-scoreboard stalls from 4.71 to 3.38 cycles per issued
+instruction. Compute remains 27.79%, DRAM 0.71%, L2 hit 98.84%, and scheduler
+eligibility 29.67%. Barrier stalls are now dominant at 4.17 cycles. Source
+counters place 204,044 barrier samples at the Q/K `LDSM.16.M88.2` following K
+publication and 161,220 at V's `LDSM.16.MT88.2` following V publication.
+
+Changing the Q/K/V row pad from 8 to 0, 16, 24, or 32 does not solve it. Pad 24
+is neutral at 4K (-0.01%) and 8K (-0.12%); pads 0/16/32 regress by 37–277%.
+Keep pad 8. Letting only thread zero poll each TMA completion before the existing
+block barrier raises registers 122 to 125 and regresses the direct kernel by
+8.6% at 4K and 9.9% at 8K. Keep per-thread polling. The next layout screen must
+use a descriptor-backed TMA swizzle or an equivalent fragment-native layout;
+the next phase screen must retain distributed TMA completion. Evidence:
+`/tmp/hd512-score-swizzle-v4-ncu2.ncu-rep`,
+`/tmp/hd512-score-swizzle-v4-source.ncu-rep`,
+`/tmp/hd512-pad-screen.log`, and `/tmp/hd512-waitone-ab.log`.

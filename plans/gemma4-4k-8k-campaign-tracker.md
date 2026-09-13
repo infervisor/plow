@@ -58,6 +58,8 @@ must not be compared with another precision or cache policy.
 |---|---|
 | HD512 WGMMA single/two-chain | large speedup, but only 72.40%/78.65% token agreement overall |
 | HD512 TMA issue restricted to warp 0 | registers 117→121; HD512 subtotal +3.41%/+4.09% |
+| HD512 Q/K/V row padding 0/16/24/32 | pad 24 is neutral (-0.01%/-0.12%); other strides regress 37–277% |
+| HD512 single-thread TMA completion poll | registers 122→125; direct kernel +8.6%/+9.9% |
 | HD256 BKV64 promotion | standalone win did not transfer; checksums changed |
 | W8A8 GLU two WGMMA groups in flight | 48-site subtotal +1.59% |
 | W8A8 GLU raster band 8 | packet subtotal +2.04%/+1.53% |
@@ -86,15 +88,15 @@ The packet's dependency and counter ABI remains common across variants.
 ## Current H100 bottleneck evidence
 
 The exact accepted HD512 direct object was profiled at M8192 with its production
-grid (132 CTAs), block size (512 threads), and 108,048-byte arena. The standalone
-11.91 ms duration matches the approximately 12 ms production site time.
+grid (132 CTAs), block size (512 threads), and 110,096-byte arena. The standalone
+11.65 ms duration matches the approximately 12 ms production site time.
 
 | Signal | Result | Decision |
 |---|---:|---|
 | Registers / occupancy | accepted score-swizzle object uses 122 registers/thread; 25% occupancy; one register-limited block/SM | Reject growth that lowers residency or fails full-rung transfer |
-| Compute / memory | 27.35% compute; 62.47% memory; 0.71% DRAM; 98.99% L2 hit | Do not prioritize HBM bandwidth or GQA multicast for the full-query cell |
-| Scheduler | eligible in 29.26% of cycles; 0.54 eligible warps/scheduler | Reduce dependency and synchronization gaps |
-| Stall per issued instruction | short scoreboard 4.71; barrier 2.85; wait 1.98; MIO throttle 0.91 | Repair shared-memory access and phase scheduling first |
+| Compute / memory | 27.79% compute; 47.99% memory; 0.71% DRAM; 98.84% L2 hit | Do not prioritize HBM bandwidth or GQA multicast for the full-query cell |
+| Scheduler | eligible in 29.67% of cycles; 0.58 eligible warps/scheduler | Reduce dependency and synchronization gaps |
+| Stall per issued instruction | barrier 4.17; short scoreboard 3.38; wait 1.98; MIO throttle 0.50 | Phase synchronization is now the primary wall |
 | Shared conflicts | score swizzle cuts total bank conflicts from 438,612,278 to 1,073,696 and measured load conflicts from 403,046,400 to zero | Move the next screen to Q/K and V `LDSM` dependencies |
 
 Source counters localize the largest barrier sample to the Q/K `LDSM.16.M88.2`
@@ -103,7 +105,7 @@ candidate must preserve the accepted BKV16 score/PV reduction order.
 
 ## Next experiments
 
-1. H100 HD512: screen the Q/K `LDSM` layout, then V's transposed `LDSM`; preserve reduction order and one block/SM.
+1. H100 HD512: screen descriptor-backed TMA swizzling or an equivalent fragment-native Q/K/V layout; row padding is closed.
 2. H100 HD512: test a non-divergent producer/consumer phase schedule after the shared-memory screen.
 3. H100 HD512: qualify live-KV bucket variants and `nsplit` only where the merge pass repays shorter slices; defer GQA multicast until a history-heavy cell shows DRAM pressure.
 4. H100 GEMM: test ping-pong consumers, `stmatrix` + TMA output store, and operand multicast on exact Gemma dimensions.
