@@ -4,6 +4,7 @@ use plow_asset::segment_roles::{
     AttentionCapability, ProgramRoles, SegmentObject, SegmentRoles, INTERPRETER,
     PREFILL_ATTENTION_HD256_BKV32, PREFILL_ATTENTION_HD256_BKV32_ABI,
     PREFILL_ATTENTION_HD256_GQA2_BKV32, PREFILL_ATTENTION_HD256_GQA2_BKV32_ABI,
+    PREFILL_ATTENTION_HD512_PX4_BQ64, PREFILL_ATTENTION_HD512_PX4_BQ64_ABI,
     PREFILL_ATTENTION_HD512_WG32, PREFILL_ATTENTION_HD512_WG32_ABI, SECTION,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -19,6 +20,17 @@ const OBJECT_GLOBALS: [(&str, u32); 7] = [
     ("plow_attention_warps", 8),
     ("plow_block_pfattn_hd512", 256),
     ("plow_arena_bytes_pfattn_hd512", 70_672),
+];
+const HD512_PX4_BQ64_OBJECT_FILE: &str = "interp_sm90a_pfattn_hd512_px4_bq64.cubin";
+const HD512_PX4_BQ64_OBJECT_ENTRY: &str = "plow_sm90a_pfattn_hd512_px4_bq64";
+const HD512_PX4_BQ64_OBJECT_GLOBALS: [(&str, u32); 7] = [
+    ("plow_attention_sm90_hd512_px4_bq64_abi", 1),
+    ("plow_attention_head_dim", 512),
+    ("plow_attention_query_tile", 64),
+    ("plow_attention_kv_tile", 16),
+    ("plow_attention_warps", 16),
+    ("plow_block_pfattn_hd512_px4_bq64", 512),
+    ("plow_arena_bytes_pfattn_hd512_px4_bq64", 108_048),
 ];
 const HD256_OBJECT_FILE: &str = "interp_sm90a_pfattn_hd256_bkv32.cubin";
 const HD256_OBJECT_ENTRY: &str = "plow_sm90a_pfattn_hd256_bkv32";
@@ -48,12 +60,19 @@ enum Kind {
     Hd256Bkv32,
     Hd256Gqa2Bkv32,
     Hd512,
+    Hd512Px4Bq64,
+}
+
+impl Kind {
+    fn is_hd512(self) -> bool {
+        matches!(self, Self::Hd512 | Self::Hd512Px4Bq64)
+    }
 }
 
 pub struct Selection {
     pub file: String,
     pub sha256: String,
-    wgmma: bool,
+    requires_fused_output: bool,
     query_tile: u32,
     kv_tile: u32,
     kind: Kind,
@@ -294,7 +313,7 @@ impl Selection {
         Self {
             file,
             sha256: plow_asset::decode_objects::image_sha256(image),
-            wgmma: query_tile == 64,
+            requires_fused_output: query_tile == 64,
             query_tile,
             kv_tile,
             kind: Kind::Hd512,
@@ -305,7 +324,7 @@ impl Selection {
         Self {
             file,
             sha256: plow_asset::decode_objects::image_sha256(image),
-            wgmma: false,
+            requires_fused_output: false,
             query_tile: 64,
             kv_tile: 32,
             kind: Kind::Hd256Bkv32,
@@ -316,10 +335,21 @@ impl Selection {
         Self {
             file: HD256_GQA2_OBJECT_FILE.into(),
             sha256: plow_asset::decode_objects::image_sha256(image),
-            wgmma: true,
+            requires_fused_output: true,
             query_tile: 64,
             kv_tile: 32,
             kind: Kind::Hd256Gqa2Bkv32,
+        }
+    }
+
+    fn hd512_px4_bq64(image: &[u8]) -> Self {
+        Self {
+            file: HD512_PX4_BQ64_OBJECT_FILE.into(),
+            sha256: plow_asset::decode_objects::image_sha256(image),
+            requires_fused_output: true,
+            query_tile: 64,
+            kv_tile: 16,
+            kind: Kind::Hd512Px4Bq64,
         }
     }
 
@@ -328,6 +358,7 @@ impl Selection {
             Kind::Hd256Bkv32 => PREFILL_ATTENTION_HD256_BKV32,
             Kind::Hd256Gqa2Bkv32 => PREFILL_ATTENTION_HD256_GQA2_BKV32,
             Kind::Hd512 => PREFILL_ATTENTION_HD512_WG32,
+            Kind::Hd512Px4Bq64 => PREFILL_ATTENTION_HD512_PX4_BQ64,
         }
     }
 }
@@ -340,6 +371,13 @@ fn capability(query_tile: u32, kv_tile: u32) -> AttentionCapability {
         query_tile,
         kv_tile,
         warps: 8,
+    }
+}
+
+fn px4_bq64_capability() -> AttentionCapability {
+    AttentionCapability {
+        warps: 16,
+        ..capability(64, 16)
     }
 }
 
@@ -365,7 +403,7 @@ fn eligible(op: &packet::dev::DevInst, n_cu: u16) -> bool {
 
 fn eligible_for(op: &packet::dev::DevInst, n_cu: u16, selection: &Selection) -> bool {
     match selection.kind {
-        Kind::Hd512 => eligible(op, n_cu),
+        Kind::Hd512 | Kind::Hd512Px4Bq64 => eligible(op, n_cu),
         Kind::Hd256Bkv32 | Kind::Hd256Gqa2Bkv32 => {
             op.blocks == n_cu
                 && op.is_hd256_gqa2_sliding_prefill()
@@ -399,6 +437,7 @@ pub(crate) fn apply_output_object(
     packed: bool,
     tunedb_root: Option<&str>,
     gqa2_role: bool,
+    hd512_px4_bq64_role: bool,
 ) -> Result<bool, String> {
     let profile = if profile == "sm_90a" {
         "sm90a"
@@ -416,6 +455,51 @@ pub(crate) fn apply_output_object(
         .any(is_hd512_attention);
     let mut applied = false;
     let directory = output.parent().unwrap_or_else(|| Path::new("."));
+    if hd512_px4_bq64_role {
+        if !packed {
+            return Err("HD512 px4 BQ64 role requires packed prefill metadata".into());
+        }
+        let path = directory.join(HD512_PX4_BQ64_OBJECT_FILE);
+        let image = std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+        let info = plow_asset::cubin::inspect(&image)
+            .ok_or_else(|| format!("{} is not a valid cubin", path.display()))?;
+        if profile != "sm90a"
+            || info.sm != 90
+            || !info
+                .entries
+                .iter()
+                .any(|entry| entry == HD512_PX4_BQ64_OBJECT_ENTRY)
+            || HD512_PX4_BQ64_OBJECT_GLOBALS
+                .iter()
+                .any(|&(name, value)| plow_asset::cubin::global_u32(&image, name) != Some(value))
+        {
+            return Err(format!(
+                "{} has incompatible HD512 px4 BQ64 prefill attention capabilities",
+                path.display()
+            ));
+        }
+        validate_hardware_resources(gpu, profile, 512, 16, 108_048)?;
+        let programs = model.progs[..prefill_count]
+            .iter()
+            .enumerate()
+            .filter(|(index, program)| {
+                matches!(model.prog_t[*index], 4096 | 8192)
+                    && program.insts.iter().any(is_hd512_attention)
+            })
+            .map(|(index, _)| index)
+            .collect::<BTreeSet<_>>();
+        if programs.is_empty() {
+            return Err("packet has no M4096/M8192 HD512 attention rungs".into());
+        }
+        apply(
+            model,
+            sections,
+            &Selection::hd512_px4_bq64(&image),
+            profile,
+            Some(&programs),
+        )?;
+        applied = true;
+    }
     if gqa2_role {
         if !packed {
             return Err("paired HD256/GQA2 role requires packed prefill metadata".into());
@@ -484,7 +568,7 @@ pub(crate) fn apply_output_object(
             applied = true;
         }
     }
-    if !has_hd512 {
+    if !has_hd512 || hd512_px4_bq64_role {
         return Ok(applied);
     }
     let path = directory.join(OBJECT_FILE);
@@ -563,6 +647,7 @@ fn apply(
                 "paired HD256/GQA2 prefill attention role requires sm90a".into()
             }
             Kind::Hd512 => "HD512 WG32 prefill attention role requires sm90a".into(),
+            Kind::Hd512Px4Bq64 => "HD512 px4 BQ64 prefill attention role requires sm90a".into(),
         });
     }
     let attention = match selection.kind {
@@ -575,6 +660,7 @@ fn apply(
             warps: 8,
         },
         Kind::Hd512 => capability(selection.query_tile, selection.kv_tile),
+        Kind::Hd512Px4Bq64 => px4_bq64_capability(),
     };
     let role = selection.role();
     let object = SegmentObject {
@@ -582,6 +668,7 @@ fn apply(
             Kind::Hd256Bkv32 => PREFILL_ATTENTION_HD256_BKV32_ABI,
             Kind::Hd256Gqa2Bkv32 => PREFILL_ATTENTION_HD256_GQA2_BKV32_ABI,
             Kind::Hd512 => PREFILL_ATTENTION_HD512_WG32_ABI,
+            Kind::Hd512Px4Bq64 => PREFILL_ATTENTION_HD512_PX4_BQ64_ABI,
         }
         .into(),
         file: selection.file.clone(),
@@ -617,6 +704,7 @@ fn apply(
                 "paired HD256/GQA2 prefill attention role already declared".into()
             }
             Kind::Hd512 => "HD512 prefill attention role already declared".into(),
+            Kind::Hd512Px4Bq64 => "HD512 px4 BQ64 role already declared".into(),
         });
     }
 
@@ -642,10 +730,11 @@ fn apply(
             .map(|op| {
                 let output_head_dim = match selection.kind {
                     Kind::Hd256Bkv32 | Kind::Hd256Gqa2Bkv32 => 256,
-                    Kind::Hd512 => 512,
+                    Kind::Hd512 | Kind::Hd512Px4Bq64 => 512,
                 };
                 eligible_for(op, n_cu, selection)
-                    && (!selection.wgmma || (op.t[5] != TENSOR_NONE && op.i[7] == 1))
+                    && (!selection.requires_fused_output
+                        || (op.t[5] != TENSOR_NONE && op.i[7] == 1))
                     && tensor_bytes
                         .get(op.t[7] as usize)
                         .is_some_and(|&bytes| bytes == 256)
@@ -673,7 +762,7 @@ fn apply(
             .iter()
             .filter(|op| op.op == DevOp::FlashMerge as u16 && op.i[3] == 512)
             .count();
-        if selection.kind == Kind::Hd512 && unfused_flash != full_merge {
+        if selection.kind.is_hd512() && unfused_flash != full_merge {
             return Err(format!(
                 "incompatible HD512 prefill attention pairing in program {index}"
             ));
@@ -685,7 +774,7 @@ fn apply(
                 .zip(&eligible)
                 .enumerate()
                 .find(|(_, (op, selected))| {
-                    (selection.kind != Kind::Hd512 || is_hd512_attention(op))
+                    (!selection.kind.is_hd512() || is_hd512_attention(op))
                         && (!matches!(selection.kind, Kind::Hd256Bkv32 | Kind::Hd256Gqa2Bkv32)
                             || op.is_hd256_gqa2_sliding_prefill())
                         && if op.op == DevOp::FlashPrefill as u16 {
@@ -700,7 +789,7 @@ fn apply(
                 match selection.kind {
                     Kind::Hd256Bkv32 => "HD256 BKV32",
                     Kind::Hd256Gqa2Bkv32 => "paired HD256/GQA2 BKV32",
-                    Kind::Hd512 => "HD512",
+                    Kind::Hd512 | Kind::Hd512Px4Bq64 => "HD512",
                 },
                 op.blocks,
                 op.i,
@@ -717,7 +806,9 @@ fn apply(
                 Kind::Hd256Gqa2Bkv32 => {
                     "paired HD256/GQA2 role requires a plain prefill program".into()
                 }
-                Kind::Hd512 => "HD512 role requires a plain prefill program".into(),
+                Kind::Hd512 | Kind::Hd512Px4Bq64 => {
+                    "HD512 role requires a plain prefill program".into()
+                }
             });
         }
         let prior_position = metadata
@@ -792,7 +883,7 @@ fn apply(
                             "paired HD256/GQA2 role instruction is not contiguous in the queue"
                                 .into()
                         }
-                        Kind::Hd512 => {
+                        Kind::Hd512 | Kind::Hd512Px4Bq64 => {
                             "HD512 role instruction is not contiguous in the queue".into()
                         }
                     });
@@ -820,7 +911,9 @@ fn apply(
             Kind::Hd256Gqa2Bkv32 => {
                 "packet has no compatible paired HD256/GQA2 prefill attention segments".into()
             }
-            Kind::Hd512 => "packet has no compatible HD512 prefill attention segments".into(),
+            Kind::Hd512 | Kind::Hd512Px4Bq64 => {
+                "packet has no compatible HD512 prefill attention segments".into()
+            }
         });
     }
     metadata.objects.insert(role, object);

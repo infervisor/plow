@@ -16,7 +16,8 @@ pub const PREFILL_ATTENTION_HD256_BKV32: u8 = 11;
 pub const BF16_PREFILL_GEMM_GLU_GEMMA4: u8 = 12;
 pub const W8A8_PREFILL_GEMM_GLU_GEMMA4: u8 = 13;
 pub const PREFILL_ATTENTION_HD256_GQA2_BKV32: u8 = 14;
-pub const MAX_ROLE: u8 = PREFILL_ATTENTION_HD256_GQA2_BKV32;
+pub const PREFILL_ATTENTION_HD512_PX4_BQ64: u8 = 15;
+pub const MAX_ROLE: u8 = PREFILL_ATTENTION_HD512_PX4_BQ64;
 
 pub fn is_projection(role: u8) -> bool {
     matches!(role, CUBLASLT | NATIVE_DECODE_TC)
@@ -45,6 +46,7 @@ pub fn cublaslt_prefill_bf16(profile: &str, m: u32, n: u32, k: u32) -> bool {
 }
 
 pub const PREFILL_ATTENTION_HD512_WG32_ABI: &str = "attention_sm90_hd512_wg32_v1";
+pub const PREFILL_ATTENTION_HD512_PX4_BQ64_ABI: &str = "attention_sm90_hd512_px4_bq64_v1";
 pub const PREFILL_ATTENTION_HD256_BKV64_ABI: &str = "attention_sm90_hd256_bkv64_v1";
 pub const PREFILL_ATTENTION_HD256_BKV32_ABI: &str = "attention_sm90_hd256_bkv32_v1";
 pub const PREFILL_ATTENTION_HD256_GQA2_BKV32_ABI: &str =
@@ -71,6 +73,7 @@ pub fn requires_object(role: u8) -> bool {
             | BF16_PREFILL_GEMM_GLU_GEMMA4
             | W8A8_PREFILL_GEMM_GLU_GEMMA4
             | PREFILL_ATTENTION_HD256_GQA2_BKV32
+            | PREFILL_ATTENTION_HD512_PX4_BQ64
     )
 }
 
@@ -166,6 +169,7 @@ impl SegmentRoles {
                 PREFILL_ATTENTION_HD256_GQA2_BKV32 => {
                     PREFILL_ATTENTION_HD256_GQA2_BKV32_ABI
                 }
+                PREFILL_ATTENTION_HD512_PX4_BQ64 => PREFILL_ATTENTION_HD512_PX4_BQ64_ABI,
                 _ => return Err("invalid packet segment object role".into()),
             };
             let valid_hash = |hash: Option<&str>| {
@@ -197,6 +201,11 @@ impl SegmentRoles {
             };
             let hd512_wg64 = AttentionCapability {
                 kv_tile: 64,
+                ..hd512_wg.clone()
+            };
+            let hd512_px4_bq64 = AttentionCapability {
+                kv_tile: 16,
+                warps: 16,
                 ..hd512_wg.clone()
             };
             let hd256_bkv64 = AttentionCapability {
@@ -244,6 +253,10 @@ impl SegmentRoles {
                     && (!valid_hash(object.sha256.as_deref())
                         || object.promote_k512.is_some()
                         || object.attention.as_ref() != Some(&hd256_bkv32)))
+                || (id == PREFILL_ATTENTION_HD512_PX4_BQ64
+                    && (!valid_hash(object.sha256.as_deref())
+                        || object.promote_k512.is_some()
+                        || object.attention.as_ref() != Some(&hd512_px4_bq64)))
                 || (matches!(
                     id,
                     MXFP4_MOE
@@ -267,6 +280,7 @@ impl SegmentRoles {
                         | BF16_PREFILL_GEMM_GLU_GEMMA4
                         | W8A8_PREFILL_GEMM_GLU_GEMMA4
                         | PREFILL_ATTENTION_HD256_GQA2_BKV32
+                        | PREFILL_ATTENTION_HD512_PX4_BQ64
                 ) && (object.sha256.is_some()
                     || object.promote_k512.is_some()
                     || object.attention.is_some()))
@@ -399,6 +413,18 @@ mod tests {
         ] {
             assert!(SegmentRoles::from_bytes(bad.as_bytes()).is_err());
         }
+    }
+
+    #[test]
+    fn hd512_px4_bq64_role_requires_512_thread_geometry() {
+        let hash = "a".repeat(64);
+        let raw = format!(
+            r#"{{"version":1,"objects":{{"15":{{"abi":"{}","file":"attention.cubin","sha256":"{}","attention":{{"profile":"sm90a","dtype":"bf16","head_dim":512,"query_tile":64,"kv_tile":16,"warps":16}}}}}},"programs":[{{"index":0,"roles":[0,15,0]}}]}}"#,
+            PREFILL_ATTENTION_HD512_PX4_BQ64_ABI, hash
+        );
+        SegmentRoles::from_bytes(raw.as_bytes()).unwrap();
+        assert!(SegmentRoles::from_bytes(raw.replace("\"warps\":16", "\"warps\":8").as_bytes())
+            .is_err());
     }
 
     #[test]

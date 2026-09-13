@@ -8,7 +8,14 @@
 #ifndef PLOW_NV_FA512_WG
 #define PLOW_NV_FA512_WG 0
 #endif
+#ifndef PLOW_NV_FA512_PX4_BQ64
+#define PLOW_NV_FA512_PX4_BQ64 0
+#endif
 #include "op_attention.cuh"
+
+#if PLOW_NV_FA512_PX4_BQ64 && (PLOW_NV_FA512_WG || !PLOW_NV_PACKED_REQUEST)
+#error "HD512 px4 BQ64 requires the packed non-WGMMA object"
+#endif
 
 #if PLOW_NV_FA512_KV64 && !PLOW_NV_FA512_WG
 #error "HD512 KV64 requires the WGMMA body"
@@ -34,18 +41,29 @@ extern "C" __device__ __constant__ unsigned plow_pf_masked_padding_abi = 1;
 #endif
 #endif
 
+#if PLOW_NV_FA512_PX4_BQ64
+extern "C" __device__ unsigned plow_attention_sm90_hd512_px4_bq64_abi = 1;
+#else
 extern "C" __device__ unsigned plow_attention_sm90_hd512_wg32_abi = 1;
+#endif
 extern "C" __device__ unsigned plow_attention_head_dim = 512;
-extern "C" __device__ unsigned plow_attention_query_tile = PLOW_NV_FA512_WG ? 64 : 32;
+extern "C" __device__ unsigned plow_attention_query_tile =
+    PLOW_NV_FA512_PX4_BQ64 || PLOW_NV_FA512_WG ? 64 : 32;
 extern "C" __device__ unsigned plow_attention_kv_tile = PLOW_NV_FA512_WG ? FA512_KV_TILE : 16;
-extern "C" __device__ unsigned plow_attention_warps = 8;
+extern "C" __device__ unsigned plow_attention_warps = PLOW_NV_FA512_PX4_BQ64 ? 16 : 8;
 extern "C" __device__ unsigned plow_attention_score_partitions =
     PLOW_NV_FA512_N_SPLIT && FA512_KV_TILE == 64 ? 2 : 1;
+#if PLOW_NV_FA512_PX4_BQ64
+extern "C" __device__ unsigned plow_block_pfattn_hd512_px4_bq64 = 512;
+extern "C" __device__ unsigned plow_arena_bytes_pfattn_hd512_px4_bq64 =
+    FA_PX4_SMEM_FLOATS(512, 64, 16) * sizeof(float);
+#else
 extern "C" __device__ unsigned plow_block_pfattn_hd512 = 256;
 extern "C" __device__ unsigned plow_arena_bytes_pfattn_hd512 =
     (PLOW_NV_FA512_WG ? FA_PRE_SMEM_FLOATS(512, 64, FA512_KV_TILE)
                       : FA_PX4_SMEM_FLOATS(512, 32, 16)) *
     sizeof(float);
+#endif
 
 __device__ __forceinline__ unsigned attention_ctr_poll(const unsigned* p) {
     unsigned value;
@@ -78,7 +96,8 @@ __device__ __noinline__ void attention_packed_bkv16(
     unsigned nsplit, unsigned kv_stride, unsigned kv_mask, float scale,
     unsigned slice, unsigned nblk, float* arena) {
     if (!requests) {
-        d_flash_prefill_px4<512, 32, 16>(
+        d_flash_prefill_px4<512, PLOW_NV_FA512_PX4_BQ64 ? 64 : 32, 16, false,
+                            PLOW_NV_FA512_PX4_BQ64 ? 512 : 256>(
             opart, mlpart, q, k, v, output, seq_q, seq_kv, n_head, n_kv_head,
             q_pos0, window, nsplit, kv_stride, kv_mask, scale, slice, nblk, arena);
         return;
@@ -92,7 +111,8 @@ __device__ __noinline__ void attention_packed_bkv16(
         const unsigned kvlen = (unsigned)requests[4 + 4 * r];
         const size_t qoff = (size_t)q0 * n_head * 512;
         const size_t kvoff = (size_t)slot * n_kv_head * kv_stride * 512;
-        d_flash_prefill_px4<512, 32, 16>(
+        d_flash_prefill_px4<512, PLOW_NV_FA512_PX4_BQ64 ? 64 : 32, 16, false,
+                            PLOW_NV_FA512_PX4_BQ64 ? 512 : 256>(
             opart + qoff * nsplit, mlpart + (size_t)q0 * n_head * nsplit * 2,
             q + qoff, k + kvoff, v + kvoff, output ? output + qoff : nullptr,
             qlen, kvlen, n_head, n_kv_head, kvlen - qlen, window, nsplit,
@@ -154,8 +174,15 @@ __device__ __forceinline__ void attention_body(const PlowDevInst* in, void* cons
 #endif
 }
 
-extern "C" __global__
-void plow_sm90a_pfattn_hd512(PlowProgram prog) {
+#if PLOW_NV_FA512_PX4_BQ64
+#define PLOW_HD512_ENTRY plow_sm90a_pfattn_hd512_px4_bq64
+#define PLOW_HD512_BLOCK 512
+#else
+#define PLOW_HD512_ENTRY plow_sm90a_pfattn_hd512
+#define PLOW_HD512_BLOCK 256
+#endif
+extern "C" __global__ __launch_bounds__(PLOW_HD512_BLOCK, 1)
+void PLOW_HD512_ENTRY(PlowProgram prog) {
     extern __shared__ float arena[];
     const unsigned lo = prog.gq_seg_ofs[prog.cur_seg];
     const unsigned hi = prog.gq_seg_ofs[prog.cur_seg + 1];

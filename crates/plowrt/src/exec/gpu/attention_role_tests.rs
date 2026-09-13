@@ -124,6 +124,15 @@ fn hd512_object() -> plow_asset::segment_roles::SegmentObject {
     }
 }
 
+fn hd512_px4_bq64_object() -> plow_asset::segment_roles::SegmentObject {
+    let mut object = hd512_object();
+    object.abi = plow_asset::segment_roles::PREFILL_ATTENTION_HD512_PX4_BQ64_ABI.into();
+    let attention = object.attention.as_mut().unwrap();
+    attention.kv_tile = 16;
+    attention.warps = 16;
+    object
+}
+
 fn hd256_bkv64_object() -> plow_asset::segment_roles::SegmentObject {
     plow_asset::segment_roles::SegmentObject {
         abi: plow_asset::segment_roles::PREFILL_ATTENTION_HD256_BKV64_ABI.into(),
@@ -360,6 +369,14 @@ fn accepts_exact_hd512_wg32_contract_and_rejects_drift() {
 }
 
 #[test]
+fn accepts_exact_hd512_px4_bq64_resource_contract() {
+    let object = hd512_px4_bq64_object();
+    let geometry = [Some(512), Some(64), Some(16), Some(16)];
+    check_attention_hd512_role("sm90a", &object, Some(1), Some(512), geometry).unwrap();
+    assert!(check_attention_hd512_role("sm90a", &object, Some(1), Some(256), geometry).is_err());
+}
+
+#[test]
 fn accepts_exact_hd256_bkv64_contract_and_rejects_drift() {
     let object = hd256_bkv64_object();
     check_attention_hd256_role(
@@ -499,6 +516,7 @@ fn actual_packet_attention_roles() {
                 role,
                 plow_asset::segment_roles::PREFILL_ATTENTION
                     | plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32
+                    | plow_asset::segment_roles::PREFILL_ATTENTION_HD512_PX4_BQ64
                     | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_BKV64
                     | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_BKV32
                     | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_GQA2_BKV32

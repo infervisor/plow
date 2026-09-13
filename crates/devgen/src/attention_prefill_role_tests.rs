@@ -56,7 +56,7 @@ fn apply_output(
     output: &Path,
 ) -> Result<bool, String> {
     apply_output_object(
-        model, sections, profile, output, "h100", 1024, false, None, false,
+        model, sections, profile, output, "h100", 1024, false, None, false, false,
     )
 }
 
@@ -67,6 +67,45 @@ fn role_resources_follow_the_selected_tile_on_h100() {
     assert!(validate_hardware_resources("h100", "sm90a", 512, 8, 108_048).is_err());
     assert!(validate_hardware_resources("h100", "sm90a", 256, 8, 233_473).is_err());
     assert!(validate_hardware_resources("mi300x", "sm90a", 256, 8, 70_672).is_err());
+}
+
+#[test]
+fn px4_bq64_object_selects_only_the_exact_4k_role() {
+    let directory = output_dir("px4-bq64");
+    let output = directory.join("model.pkt");
+    let image = plow_asset::cubin::synthetic_elf(
+        HD512_PX4_BQ64_OBJECT_ENTRY,
+        &HD512_PX4_BQ64_OBJECT_GLOBALS,
+        90,
+    );
+    std::fs::write(directory.join(HD512_PX4_BQ64_OBJECT_FILE), image).unwrap();
+    let mut model = fixture(512, true, true);
+    model.prog_t[0] = 4096;
+    let flash = &mut model.progs[0].insts[1];
+    flash.i[0] = 4096;
+    flash.i[1] = 4096;
+    model.tensors[flash.t[5] as usize].bytes = 4096 * 32 * 512 * 2;
+    let mut sections = Vec::new();
+    assert!(apply_output_object(
+        &mut model,
+        &mut sections,
+        "sm90a",
+        &output,
+        "h100",
+        8192,
+        true,
+        None,
+        false,
+        true,
+    )
+    .unwrap());
+    let roles = SegmentRoles::from_bytes(&sections[0].data).unwrap();
+    assert_eq!(roles.programs[0].roles, [0, 15, 0]);
+    assert_eq!(
+        roles.objects[&PREFILL_ATTENTION_HD512_PX4_BQ64].attention,
+        Some(px4_bq64_capability())
+    );
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
@@ -203,6 +242,7 @@ fn exact_hd256_gqa2_object_selects_only_a_packed_4k_rung() {
         true,
         None,
         true,
+        false,
     )
     .unwrap());
     let roles = SegmentRoles::from_bytes(&sections[0].data).unwrap();
@@ -282,6 +322,7 @@ fn exact_hd256_bkv32_object_preserves_existing_packet_segments() {
         false,
         store_root.to_str(),
         false,
+        false,
     )
     .unwrap());
     assert_eq!(model.progs[0].insts, original_insts);
@@ -322,6 +363,7 @@ fn hd256_qualification_can_select_a_subset_of_prefill_rungs() {
         1024,
         false,
         store_root.to_str(),
+        false,
         false,
     )
     .unwrap());
@@ -370,6 +412,7 @@ fn inexact_hd256_record_falls_back_byte_identically() {
         false,
         store_root.to_str(),
         false,
+        false,
     )
     .unwrap());
     assert_eq!(model.to_blob(), before);
@@ -399,6 +442,7 @@ fn selected_hd256_object_hash_drift_fails_before_packet_mutation() {
         1024,
         false,
         store_root.to_str(),
+        false,
         false,
     )
     .unwrap_err()

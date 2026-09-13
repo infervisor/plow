@@ -9037,6 +9037,7 @@ fn emit_dense_gqa(
         packed_prefill_emitted,
         tunedb_root.as_deref(),
         ecfg.gemma4_sm90_hd256_gqa2_role,
+        ecfg.gemma4_sm90_hd512_px4_bq64_role,
     )
     .unwrap_or_else(|error| panic!("prefill attention object: {error}"));
     if ecfg.gemma4_sm90_gemm_glu_role {

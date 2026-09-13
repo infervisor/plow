@@ -596,6 +596,7 @@ impl SegmentRoleValidation for SegmentRoles {
                 if matches!(
                     role,
                     plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32
+                        | plow_asset::segment_roles::PREFILL_ATTENTION_HD512_PX4_BQ64
                         | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_BKV64
                         | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_BKV32
                         | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_GQA2_BKV32
@@ -748,7 +749,7 @@ fn check_attention_hd512_role(
     let expected = object.attention.as_ref();
     if arch != "sm90a"
         || capability != Some(1)
-        || block != Some(BLOCK)
+        || expected.is_none_or(|a| block != Some(a.warps * 32))
         || expected.is_none_or(|a| {
             a.profile != arch
                 || a.dtype != "bf16"
@@ -762,7 +763,7 @@ fn check_attention_hd512_role(
         })
     {
         return Err(RuntimeError::Rejected(
-            "incompatible HD512 WG32 attention role".into(),
+            "incompatible HD512 attention role".into(),
         ));
     }
     Ok(())
@@ -1202,6 +1203,7 @@ fn packet_role_segments(
                     role,
                     plow_asset::segment_roles::PREFILL_ATTENTION
                         | plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32
+                        | plow_asset::segment_roles::PREFILL_ATTENTION_HD512_PX4_BQ64
                         | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_BKV64
                         | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_BKV32
                         | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_GQA2_BKV32
@@ -1307,7 +1309,11 @@ fn packet_role_segments(
                 }
             } else if role == plow_asset::segment_roles::PREFILL_ATTENTION {
                 validate_attention_role_inst(d, g.t, tensors, 256, false, false)?;
-            } else if role == plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32 {
+            } else if matches!(
+                role,
+                plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32
+                    | plow_asset::segment_roles::PREFILL_ATTENTION_HD512_PX4_BQ64
+            ) {
                 if d.op != DevOp::FlashPrefill as u16 {
                     return Err(RuntimeError::Rejected(
                         "HD512 WG32 role requires FlashPrefill".into(),
@@ -1392,7 +1398,13 @@ fn hd512_prefill_segments_have_role(program: &DevProg, roles: &[u8]) -> bool {
         let hd512 = inst.op == DevOp::FlashPrefill as u16 && inst.i[6] == 512;
         !hd512
             || roles.get(entry.seg as usize)
-                == Some(&plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32)
+                .is_some_and(|role| {
+                    matches!(
+                        *role,
+                        plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32
+                            | plow_asset::segment_roles::PREFILL_ATTENTION_HD512_PX4_BQ64
+                    )
+                })
     })
 }
 
@@ -4354,6 +4366,7 @@ impl GpuEngine {
                 id,
                 plow_asset::segment_roles::PREFILL_ATTENTION
                     | plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32
+                    | plow_asset::segment_roles::PREFILL_ATTENTION_HD512_PX4_BQ64
                     | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_BKV64
                     | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_BKV32
                     | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_GQA2_BKV32
@@ -4383,6 +4396,12 @@ impl GpuEngine {
                     "plow_block_pfattn_hd512",
                     "plow_sm90a_pfattn_hd512",
                     "plow_arena_bytes_pfattn_hd512",
+                ),
+                plow_asset::segment_roles::PREFILL_ATTENTION_HD512_PX4_BQ64 => (
+                    "plow_attention_sm90_hd512_px4_bq64_abi",
+                    "plow_block_pfattn_hd512_px4_bq64",
+                    "plow_sm90a_pfattn_hd512_px4_bq64",
+                    "plow_arena_bytes_pfattn_hd512_px4_bq64",
                 ),
                 plow_asset::segment_roles::PREFILL_ATTENTION_HD256_BKV64 => (
                     "plow_attention_sm90_hd256_bkv64_abi",
@@ -4444,6 +4463,7 @@ impl GpuEngine {
             if matches!(
                 id,
                 plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32
+                    | plow_asset::segment_roles::PREFILL_ATTENTION_HD512_PX4_BQ64
                     | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_BKV64
                     | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_BKV32
                     | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_GQA2_BKV32
@@ -4479,7 +4499,8 @@ impl GpuEngine {
                 plow_asset::segment_roles::PREFILL_ATTENTION => {
                     check_attention_role(profile.tag, capability, block)?
                 }
-                plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32 => {
+                plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32
+                | plow_asset::segment_roles::PREFILL_ATTENTION_HD512_PX4_BQ64 => {
                     check_attention_hd512_role(
                         profile.tag,
                         object,
@@ -4604,6 +4625,13 @@ impl GpuEngine {
             {
                 return Err(RuntimeError::Rejected(
                     "paired-GQA2 HD256 role requires a 141312-byte arena".into(),
+                ));
+            }
+            if id == plow_asset::segment_roles::PREFILL_ATTENTION_HD512_PX4_BQ64
+                && smem != 108048
+            {
+                return Err(RuntimeError::Rejected(
+                    "HD512 px4 BQ64 role requires a 108048-byte arena".into(),
                 ));
             }
             be.set_max_dynamic_smem(function, smem)?;
@@ -6595,6 +6623,7 @@ impl GpuEngine {
                                 role,
                                 plow_asset::segment_roles::PREFILL_ATTENTION
                                     | plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32
+                                    | plow_asset::segment_roles::PREFILL_ATTENTION_HD512_PX4_BQ64
                                     | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_BKV64
                                     | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_BKV32
                                     | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_GQA2_BKV32
