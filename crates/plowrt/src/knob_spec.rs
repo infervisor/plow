@@ -132,11 +132,15 @@ pub fn check_assets(blob: &Path) -> Result<()> {
     let rejected = |e: String| RuntimeError::Rejected(format!("{}: {e}", path.display()));
     let (knobs, rungs) = read_knobs(std::io::BufReader::new(file)).map_err(rejected)?;
     if !has_perf_cert(rungs.as_ref()) {
-        tracing::warn!(
-            manifest = %path.display(),
-            "no checkpoint P certificate (build.json has no `rungs[].perf_cert`): this packet's \
-             knob defaults load without a measured performance certificate"
-        );
+        // Every TP rank loads the same packet; one warning per process.
+        static PERF_CERT_WARNED: std::sync::Once = std::sync::Once::new();
+        PERF_CERT_WARNED.call_once(|| {
+            tracing::warn!(
+                manifest = %path.display(),
+                "no checkpoint P certificate (build.json has no `rungs[].perf_cert`): this packet's \
+                 knob defaults load without a measured performance certificate"
+            );
+        });
     }
     let Some(knobs) = knobs else {
         tracing::warn!(
