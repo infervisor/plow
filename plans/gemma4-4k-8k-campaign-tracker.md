@@ -82,11 +82,29 @@ Each selected record must bind object SHA, program digest, BQ/BKV, threads/warps
 `nsplit`, shared memory, registers, spills, occupancy, and timing certificate.
 The packet's dependency and counter ABI remains common across variants.
 
+## Current H100 bottleneck evidence
+
+The exact accepted HD512 direct object was profiled at M8192 with its production
+grid (132 CTAs), block size (512 threads), and 108,048-byte arena. The standalone
+11.91 ms duration matches the approximately 12 ms production site time.
+
+| Signal | Result | Decision |
+|---|---:|---|
+| Registers / occupancy | 117 registers/thread; 25% achieved and theoretical occupancy; one register-limited block/SM | Treat register growth as a rejection gate |
+| Compute / memory | 27.35% compute; 62.47% memory; 0.71% DRAM; 98.99% L2 hit | Do not prioritize HBM bandwidth or GQA multicast for the full-query cell |
+| Scheduler | eligible in 29.26% of cycles; 0.54 eligible warps/scheduler | Reduce dependency and synchronization gaps |
+| Stall per issued instruction | short scoreboard 4.71; barrier 2.85; wait 1.98; MIO throttle 0.91 | Repair shared-memory access and phase scheduling first |
+| Shared conflicts | 436,862,976 excessive wavefronts; scalar score loads dominate; Q/K and V `LDSM` also conflict | Screen score layout/access before changing arithmetic order |
+
+Source counters localize the largest barrier sample to the Q/K `LDSM.16.M88.2`
+load and the largest MIO samples to the scalar score-tile `LDS` sequence. Any
+candidate must preserve the accepted BKV16 score/PV reduction order.
+
 ## Next experiments
 
-1. H100 HD512: capture Nsight Compute metrics for the exact direct role; choose by measured stall source.
-2. H100 HD512: cluster adjacent GQA16 head CTAs and use TMA multicast for shared K/V while preserving BKV16 arithmetic order.
-3. H100 HD512: qualify live-KV bucket variants and `nsplit` only where the merge pass repays shorter slices.
+1. H100 HD512: screen a bank-safe score-tile layout/access path, then the Q/K `LDSM` layout; reject register growth or changed reduction order.
+2. H100 HD512: test a non-divergent producer/consumer phase schedule after the shared-memory screen.
+3. H100 HD512: qualify live-KV bucket variants and `nsplit` only where the merge pass repays shorter slices; defer GQA multicast until a history-heavy cell shows DRAM pressure.
 4. H100 GEMM: test ping-pong consumers, `stmatrix` + TMA output store, and operand multicast on exact Gemma dimensions.
 5. Devgen/plowrt: add authenticated resource envelopes and live-KV attention variant selection.
 6. MI300X: run the same four exact block cells and attribute GEMM/attention/light/dispatch before changing kernels.

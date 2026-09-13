@@ -1073,3 +1073,31 @@ the reused operand; and fused Q+KV/norm+quant roles when they eliminate a packet
 activation pass. Stream-K/split-K is reserved for small-M/underfilled shapes; the
 4K/8K wide projection grids already have ample output tiles and should not pay a
 reduction pass without measured evidence.
+
+### 2026-09-13: HD512 exact-object Nsight attribution
+
+The accepted row-cooperative TMA cubin was profiled through a system-glibc CUDA
+Driver API harness because root Nsight Compute aborts the Nix-glibc `plowrt`
+binary. The harness launches the production direct symbol with grid 132, block
+512, 108,048 bytes of dynamic shared memory, and M=KV=8192. Its unprofiled
+median is 12.011 ms, matching the approximately 12 ms production segment site.
+
+The profiled kernel takes 11.91 ms at 117 registers/thread, zero local/shared
+spills, and one register-limited block per SM (25% occupancy). It reaches 27.35%
+compute throughput, 62.47% memory throughput, 66.86% L1/TEX, but only 0.71%
+DRAM with a 98.99% L2 hit rate. Tensor-pipe utilization is 14.12% and TMA-pipe
+utilization is 1.18%. Schedulers have an eligible warp in only 29.26% of cycles
+(0.54 eligible warps/scheduler). Per-issued-instruction stalls are led by short
+scoreboard 4.71, barrier 2.85, wait 1.98, and MIO throttle 0.91.
+
+Source counters report 436,862,976 excessive shared-memory wavefronts. The
+dominant entries are the scalar score-tile `LDS` sequence (three-way conflicts,
+approximately 25.1 million excessive wavefronts per instruction). The largest
+barrier sample is the Q/K `LDSM.16.M88.2`; V's transposed `LDSM` also contributes.
+This makes shared layout/access and phase dependencies the next one-variable
+screen. HBM bandwidth and GQA multicast are not the first constraint for the
+full-query 8K cell. Preserve BKV16 score/PV arithmetic order and reject any
+candidate that raises the 117-register envelope. Evidence:
+`/tmp/hd512-rowwarp-ncu{6,7,8}.ncu-rep`,
+`/tmp/hd512-rowwarp-ncu8-source.csv`, and
+`/tmp/hd512_direct_profile`.
