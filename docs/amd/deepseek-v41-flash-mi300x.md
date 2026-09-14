@@ -492,6 +492,38 @@ handful of VALU ops, so the whole dequant is well under a millisecond against
 13.3 ms of bf16 MFMA for the same weights. The fp4 encoding buys the memory
 traffic (5.3) and costs almost nothing in arithmetic.
 
+**The w4a16 arm, specified.** Derived against `op_moe.h`; every piece it needs
+already exists and is verified.
+
+| | fp8 arm (shipped) | w4a16 arm (to add) |
+|---|---|---|
+| per-lane B load | `fp8v16`, 16 B = 16 elems | `fp4v32`, 16 B = **32 elems = 1 MX block** |
+| passes over `BPT` | `BPASS/2` | `BPASS/4` |
+| weight row stride | `K` | `K >> 1` (packed) |
+| scale | `float` per [row, K/128] | **E8M0 byte** per [row, K/32], stride `K >> 5` |
+| dequant at commit | `fp8_to_bf16v8` -> 2x `bf16v8` | `fp4_to_bf16v8x4` -> **4x** `bf16v8` |
+| block scale applied | in `MPF_MFMA_PROMO` | **in the dequant, free** |
+
+The last row is the one that matters and it falls out for nothing: the
+promotion in `MPF_MFMA_PROMO` is gated on `if constexpr (FP8)`, so an arm that
+is not FP8 skips it automatically -- which is correct here, because an E8M0
+scale is a power of two and folding it into the convert is exact rather than
+an approximation. The MX arm therefore behaves like the bf16 rung through the
+MFMA and promotion, and differs only in the B fetch and commit.
+
+`fp4_to_bf16v8x4`'s CDNA3 arm is already documented bit-identical to gfx950's
+native `cvt_scalef32_pk_bf16_fp4`, same op_sel order, with the nibble-order
+oracle behind it -- so the arm inherits verified numerics rather than needing
+new ones.
+
+Concretely: a third template parameter on `d_moe_group_pf_t` behind
+`PLOW_MOE_PF_W4A16` (declared only under the macro, with a
+`constexpr bool MX = false` fallback when it is off, so the default object's
+mangled names and bytes do not move), an MX branch in `MPF_FETCH_B_S` and
+`MPF_COMMIT_S`, and the `enc == PLOW_MOE_ENC_MXFP4` route in
+`d_moe_group_glu_pf` / `d_moe_group_down_pf` changed from `moe_pf_refuse` to
+that instantiation.
+
 **2. A `deepseek_v41` route through devgen.** `crates/devgen/src/lib.rs` routes
 `glm5_next`, `glm_moe_dsa`, `kimi_k3`, and `kimi_k2`/`deepseek_v2`/
 `deepseek_v3`; there is no `deepseek_v4` or `deepseek_v41` arm, and the
