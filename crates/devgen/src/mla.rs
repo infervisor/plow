@@ -5167,6 +5167,11 @@ fn glm_sp_norm_gather(
     crate::emit_xall_gather(b, xgate, xr_cus, &[c_n], &[(out, t * h, 3 * n.slot_b)], tp)
 }
 
+/// The band norm behind a [`glm_sp_norm_gather`] result: it is the op emitted just before the gather.
+fn glm_sp_gather_norm(gather: u32) -> u32 {
+    gather - 1
+}
+
 /// Causal KV-split factor for the V2 MLA prefill flash (`PLOW_GLM_PF_NS=k`, 2..=8; unset/1 =
 /// the un-split emit, byte-identical to before the knob existed).
 ///
@@ -7259,15 +7264,27 @@ fn emit_glm_moe_ffn_prefill(
     // input seam). Needs `!det`: the det prologue zeroes an accumulator over all T rows.
     let band_router =
         tp > 1 && !raw_output && !det && n.ug_tp != TENSOR_NONE && glm_sp(c, n, b, t);
+    // PLOW_GLM_ROUTER_OVERLAP: slot 3's band holds the bytes the hidden gather copies into
+    // `xn2@band`, and its next writer is behind this layer's FFN reduce-scatter.
+    let overlap = if band_router && !(lt_ext.router && enc != MoeEnc::Mxfp4) {
+        emit_config::active().glm_router_overlap.unwrap_or(0).min(2)
+    } else {
+        0
+    };
     let (tr, rlogit, tab, c_score) = if band_router {
         let tb = t / tp;
-        let xb = glm_band(b, n.xn2, t, tp, h as u64 * 2);
+        let (src, dep) = if overlap > 0 {
+            (n.h2_tp, glm_sp_gather_norm(c_rn2))
+        } else {
+            (n.xn2, c_rn2)
+        };
+        let xb = glm_band(b, src, t, tp, h as u64 * 2);
         let lb = glm_band(b, n.rlogit, t, tp, e as u64 * 2);
         let cs = if lt_ext.router && enc != MoeEnc::Mxfp4 {
-            emit_glm_lt_ext(b, c, lb, xb, w.wr, t, tb, [e, h], &[c_rn2])
+            emit_glm_lt_ext(b, c, lb, xb, w.wr, t, tb, [e, h], &[dep])
         } else {
             let op = glm_prefill_projection_op(c, tb, e, h, n_cu, mxfp4_quant(enc));
-            b.emit(op, all.clone(), &[c_rn2], |d| {
+            b.emit(op, all.clone(), &[dep], |d| {
                 d.t[0] = lb;
                 d.t[1] = xb;
                 d.t[2] = w.wr;
@@ -7286,13 +7303,13 @@ fn emit_glm_moe_ffn_prefill(
     };
     // PLOW_GLM_GEMM_LT_PF_EXT: the shared expert's gate and up go next to the router score so the
     // native segments form one run; their GLU is emitted below as its own op.
-    let shared_lt = (lt_ext.shared && !fold && enc != MoeEnc::Mxfp4 && !glm_linear_fp8(enc)).then(
-        || {
-            let gate = emit_glm_lt_ext(b, c, n.shfu, n.xn2, w.shg, t, t, [imoe_l, h], &[c_rn2]);
-            let up = emit_glm_lt_ext(b, c, n.shfu_up, n.xn2, w.shu, t, t, [imoe_l, h], &[c_rn2]);
-            (gate, up)
-        },
-    );
+    let want_shared_lt = lt_ext.shared && !fold && enc != MoeEnc::Mxfp4 && !glm_linear_fp8(enc);
+    let shared_pair = |b: &mut Builder| {
+        let gate = emit_glm_lt_ext(b, c, n.shfu, n.xn2, w.shg, t, t, [imoe_l, h], &[c_rn2]);
+        let up = emit_glm_lt_ext(b, c, n.shfu_up, n.xn2, w.shu, t, t, [imoe_l, h], &[c_rn2]);
+        (gate, up)
+    };
+    let mut shared_lt = (want_shared_lt && overlap == 0).then(|| shared_pair(b));
     let router_blocks: Vec<_> = (0..tr.min(n_cu)).collect();
     let c_router = b.emit(DevOp::MoeRouterTopkPf, router_blocks, &[c_score], |d| {
         d.t[0] = tab;
@@ -7318,6 +7335,9 @@ fn emit_glm_moe_ffn_prefill(
         d.i[7] = c.topk_group;
         d.f[0] = c.route_scale;
     });
+    if overlap == 1 && want_shared_lt {
+        shared_lt = Some(shared_pair(b));
+    }
     // 8-byte table entries gathered as bf16 pairs: each rank's slice is still its band's rows.
     let c_router = if band_router {
         let pairs = [(n.tab, t * tk_all * 4, 5 * n.slot_b)];
@@ -7356,6 +7376,9 @@ fn emit_glm_moe_ffn_prefill(
     } else {
         align(b, one.clone(), &[c_router], 0)
     };
+    if overlap == 2 && want_shared_lt {
+        shared_lt = Some(shared_pair(b));
+    }
     // 16 shared expert gate|up — GemmGlu, the T-row twin of decode's GemvGlu (same operand slots,
     //    M in i[0]). Column-parallel: this rank's imoe_l lanes. Routing-independent, so it gates
     //    only on the post-attn norm and overlaps the whole router/align/expert chain.

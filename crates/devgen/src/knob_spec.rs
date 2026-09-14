@@ -395,6 +395,24 @@ const MOE_SHARED_SEED_SCOPE: &[Allow] = &[
     },
 ];
 
+/// The band router score reads slot 3's band behind the norm; score, top-k (and at 2 the route
+/// gather and the align) move ahead of the shared gate/up `GemmLtPf` in the 2048..8192 buckets.
+const ROUTER_OVERLAP_SCOPE: &[Allow] = &[
+    Allow {
+        kinds: &["prefill"],
+        rows: (2048, 8192),
+        ops: OpSel::In(&["gemm", "moe", "collective"]),
+        fields: &[ScopeField::Op, ScopeField::Operands, ScopeField::Segments],
+        ..Allow::ANY
+    },
+    // The unread `act.xn2@band<t>` views are no longer declared.
+    Allow {
+        kinds: &["global"],
+        fields: &[ScopeField::TensorBytes],
+        ..Allow::ANY
+    },
+];
+
 /// The q_rope `GemmMed` (op 15) of the 8192 prefill bucket takes the RoPE operands and the q
 /// `HeadNormRope` leaves; the prefill objects gain the arm define through the packet's requires.
 const FUSE_POST_SCOPE: &[Allow] = &[
@@ -766,6 +784,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.glm_gemv_wg", Some("PLOW_GLM_GEMV_WG"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.glm_ofold", Some("PLOW_GLM_OFOLD"), Layer::Emit, Domain::Bool, OFF, OPT_IN).with(C_OFOLD),
     KnobSpec::new("emit.glm_pf_ns", Some("PLOW_GLM_PF_NS"), Layer::Emit, U32, UNSET, OPT_IN),
+    KnobSpec::new("emit.glm_router_overlap", Some("PLOW_GLM_ROUTER_OVERLAP"), Layer::Emit, U32, UNSET, OPT_IN).scoped(ROUTER_OVERLAP_SCOPE),
     KnobSpec::new("emit.glm_dsa_pf_span", Some("PLOW_GLM_DSA_PF_SPAN"), Layer::Emit, U32, Default::Static(Val::Nat(1)), OPT_IN),
     KnobSpec::new("emit.glm_dsa_pf_dexact", Some("PLOW_GLM_DSA_PF_DEXACT"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.pf_floor", Some("PLOW_PF_FLOOR"), Layer::Emit, Domain::Bool, OFF, OPT_IN),

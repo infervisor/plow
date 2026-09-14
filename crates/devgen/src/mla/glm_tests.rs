@@ -4017,6 +4017,93 @@ fn glm_seq_par_proj_routes_on_the_band() {
     assert_eq!(p.insts.iter().filter(|d| is(d, DevOp::XReduceScatter)).count(), 2);
 }
 
+/// `PLOW_GLM_ROUTER_OVERLAP`: the band router scores slot 3's band behind the norm, so it shares the
+/// hidden all-gather's segment ahead of the shared gate/up; 2 also brings the route-table gather
+/// and the align. Holds with the native MoE align (`PLOW_GLM_MOE_NATIVE_ALIGN`) and the fused seam
+/// norm (`PLOW_GLM_FUSE_SEAM_RN`); `0` emits exactly what the unset knob does.
+#[test]
+fn glm_router_overlap_runs_the_band_router_beside_the_hidden_gather() {
+    let _guard = crate::test_env::env_guard();
+    let _target = crate::EmitAmdGuard::set(true);
+    let (ctx, t) = (81920u32, 8192u32);
+    let layer = |extra: &[(&'static str, &'static str)], lvl: Option<&'static str>| {
+        let mut env = vec![
+            ("PLOW_GLM_SEQ_PAR", "1"),
+            ("PLOW_GLM_SEQ_PAR_PROJ", "1"),
+            ("PLOW_GLM_MOE_AITER", "1"),
+            ("PLOW_GLM_FP8_KV", "1"),
+            ("PLOW_GLM_GEMM_LT", "1"),
+            ("PLOW_GLM_GEMM_LT_PF_EXT", "o_proj,band,shared"),
+            ("PLOW_UNISEG", "0"),
+        ];
+        env.extend_from_slice(extra);
+        env.extend(lvl.map(|v| ("PLOW_GLM_ROUTER_OVERLAP", v)));
+        let _env = crate::test_env::EnvScope::set(&env);
+        let mut c = glm_ref_cfg();
+        c.tp = 8;
+        let mut decl = Builder::new(304);
+        let n = declare_glm_rows_batched(&mut decl, &c, ctx, &[3], t, 1, MoeEnc::Fp8Blk);
+        let mut b = Builder::new(304);
+        b.adopt_tensors(decl.tensors());
+        let all = b.all();
+        let mut xgate = 0;
+        let c_rn2 = emit_glm_mla_prefill(&mut b, &c, &n, 0, ctx, t, MoeEnc::Fp8Blk, n.x, &[], false,
+            &mut xgate, &all, None);
+        emit_glm_moe_ffn_prefill(&mut b, &c, &n, 0, t, MoeEnc::Fp8Blk, n.xnext, c_rn2, &mut xgate,
+            &all, false);
+        (n, c, b.finish())
+    };
+    type P = packet::devbuild::Program;
+    let is = |d: &crate::DevInst, op: DevOp| d.op == op as u16;
+    let seg = |p: &P, ix: usize| p.stream.iter().find(|e| e.inst as usize == ix).unwrap().seg;
+    let pos = |p: &P, f: &dyn Fn(&crate::DevInst) -> bool| p.insts.iter().position(f);
+    let shape = |p: &P| {
+        let nm = |h: u32| p.tensors.get(h as usize).map_or(String::new(), |x| x.name.clone());
+        let mut v: Vec<_> = p.insts.iter().map(|d| (d.op, d.blocks, d.i, nm(d.t[0]), nm(d.t[2]))).collect();
+        v.sort_unstable();
+        v
+    };
+    const G3: (&str, &str) = ("PLOW_GLM_MOE_NATIVE_ALIGN", "1");
+    const G5: (&str, &str) = ("PLOW_GLM_FUSE_SEAM_RN", "1");
+    for extra in [&[][..], &[G3][..], &[G5][..], &[G3, G5][..]] {
+        let (g3, g5) = (extra.contains(&G3), extra.contains(&G5));
+        let (_, c, off) = layer(extra, None);
+        let (_, _, zero) = layer(extra, Some("0"));
+        assert!(off.insts == zero.insts && off.stream == zero.stream, "{extra:?}");
+        let native_align = g3 && (c.n_exp, c.top_k) == (256, 8);
+        assert_eq!(pos(&off, &|d| is(d, DevOp::MoeAlignPf)).is_none(), native_align, "{extra:?}");
+        for (lvl, route_moves) in [("1", false), ("2", true)] {
+            let (n, _, on) = layer(extra, Some(lvl));
+            let ctx_msg = format!("{extra:?} level {lvl}");
+            let name = |h: u32| on.tensors[h as usize].name.as_str();
+            assert_eq!(shape(&on), shape(&off), "{ctx_msg}: same instructions");
+            let topk = pos(&on, &|d| is(d, DevOp::MoeRouterTopkPf)).unwrap();
+            let score = pos(&on, &|d| d.t[0] == on.insts[topk].t[1]).unwrap();
+            assert_eq!(name(on.insts[score].t[1]), "act.h2_tp@band8192", "{ctx_msg}");
+            let off_topk = pos(&off, &|d| is(d, DevOp::MoeRouterTopkPf)).unwrap();
+            let off_score = pos(&off, &|d| d.t[0] == off.insts[off_topk].t[1]).unwrap();
+            assert_eq!(off.tensors[off.insts[off_score].t[1] as usize].name, "act.xn2@band8192");
+            let ags: Vec<usize> =
+                (0..on.insts.len()).filter(|&i| is(&on.insts[i], DevOp::XAllGather)).collect();
+            let (hidden, route) = (ags[1], ags[2]);
+            assert_eq!(on.insts[hidden].t[0], n.xn2, "{ctx_msg}");
+            assert_eq!(on.insts[route].t[0], n.tab, "{ctx_msg}");
+            // `glm_sp_gather_norm`: the band norm the router waits on is the op just before the gather.
+            let norm = &on.insts[hidden - 1];
+            assert!(is(norm, if g5 { DevOp::AddNorm } else { DevOp::RmsNorm }), "{ctx_msg}");
+            assert_eq!(name(norm.t[0]), "act.h2_tp@band8192", "{ctx_msg}");
+            let shared = pos(&on, &|d| is(d, DevOp::GemmLtPf) && d.t[1] == n.xn2).unwrap();
+            assert!(hidden < score && score < topk && topk < shared, "{ctx_msg}");
+            assert_eq!((seg(&on, score), seg(&on, topk)), (seg(&on, hidden), seg(&on, hidden)), "{ctx_msg}");
+            assert_eq!(route < shared, route_moves, "{ctx_msg}");
+            if let Some(align) = pos(&on, &|d| is(d, DevOp::MoeAlignPf)) {
+                assert_eq!(align < shared, route_moves, "{ctx_msg}");
+                assert_eq!(seg(&on, align) == seg(&on, hidden), route_moves, "{ctx_msg}");
+            }
+        }
+    }
+}
+
 /// `PLOW_GLM_GEMM_LT_PF_EXT` on one sequence-parallel MoE layer: every band projection, o_proj,
 /// the band router and the shared expert's gate/up/down become `GemmLtPf`, each alone in its
 /// segment, the native runs back to back; `0` emits exactly what the unset knob does.

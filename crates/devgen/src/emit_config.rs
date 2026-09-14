@@ -756,6 +756,12 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_PF_NS")]
     pub glm_pf_ns: Option<u32>,
 
+    /// GLM TP8 sequence-parallel prefill: the band router reads the post-attention norm's band in
+    /// peer slot 3 and runs while the hidden all-gather is in flight (1 = score + top-k, 2 = also
+    /// the route-table gather and the align). Unset/0 = byte-identical blob.
+    #[arg(long, env = "PLOW_GLM_ROUTER_OVERLAP")]
+    pub glm_router_overlap: Option<u32>,
+
     /// Sparse-prefill selection reuse span: layers after an indexer layer that gather against
     /// its union (0 = indexer layers only, 3 = every GLM-5.3 layer).
     #[arg(long, env = "PLOW_GLM_DSA_PF_SPAN", default_value_t = 1)]
@@ -1331,6 +1337,7 @@ impl EmitConfig {
             glm_gemv_wg: env_u32("PLOW_GLM_GEMV_WG"),
             glm_ofold: env_bool("PLOW_GLM_OFOLD"),
             glm_pf_ns: env_u32("PLOW_GLM_PF_NS"),
+            glm_router_overlap: env_u32("PLOW_GLM_ROUTER_OVERLAP"),
             glm_dsa_pf_span: env_u32("PLOW_GLM_DSA_PF_SPAN").unwrap_or(1),
             glm_dsa_pf_dexact: env_u32("PLOW_GLM_DSA_PF_DEXACT"),
             dense_pf_ns: env_u32("PLOW_DENSE_PF_NS"),
