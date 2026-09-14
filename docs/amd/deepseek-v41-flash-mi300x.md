@@ -449,33 +449,85 @@ annotation and an entry in `Plow.Rewrite.soundRules` with a proof
 Campaign goal, set 2026-09-14: serve V4.1-Flash end to end at 8192 input
 tokens within **300 ms**, read as TTFT, on 8x MI300X (gfx942).
 
+### Roofline: the measured baseline for 8k prefill
+
+Computed by `scripts/dsv41_roofline.py`, which reads the checkpoint's own
+`config.json` and safetensors headers -- so every shape and dtype below is the
+checkpoint's, not an estimate -- and `crates/hwspec` MI300X, which carries a
+MEASURED 4091.9 GB/s rather than the 5325 datasheet peak. A roofline drawn
+against the datasheet understates every kernel here by ~30%.
+
+`build-dsv41-ref/roofline-8k.json` holds the full breakdown.
+
+| 8192-token prefill, 8x MI300X | |
+|---|---|
+| total | **281.6 TFLOP**, **377.9 GB** HBM, **14.8 GB** per-GPU xGMI |
+| arithmetic intensity | 745 FLOP/byte vs machine balance 639 |
+| bound | **compute, but only by 1.17x** -- this sits on the knee |
+| fp8 dense peak, 8 GPUs | 20 919 TFLOP/s (2614.9 each) |
+| HBM, 8 GPUs, measured | 32.74 TB/s |
+| compute floor @100% fp8 | 13.5 ms (unreachable) |
+| compute floor @55% / @35% | 24.5 ms / 38.5 ms |
+| HBM floor | 11.5 ms |
+| collectives, if fully exposed | 16.5 ms |
+| **baseline 8k TTFT floor** | **24 - 55 ms** |
+| headroom to the 300 ms target | **5.5x - 12.3x** |
+
+Where the FLOPs are: routed experts 49.4%, attention projections 29.5%,
+sparse attention core 9.4%, shared expert 8.2%, Engram 1.8%, everything else
+under 1% each. Where the bytes are: routed expert weights 76.4%, the residual
+stream 21.3%, all weights besides the experts 2.3%.
+
+Cross-check: active params per token are 15.05 B (126.6 M attention + 35.4 M
+shared + 6 x 35.4 M routed per layer, x40), and 2 x 15.05 B x 8192 = 246.6
+TFLOP, which is the 281.6 total less attention core, Engram and the indexer.
+**The model card's "8 B active" does not describe this checkpoint**; the
+attention projections alone are 126.6 M/layer because `wq_b` is
+[32768, 1280] -- 64 heads at head_dim 512.
+
+### Three structural facts the config does not show
+
+**1. Prefill attention is LINEAR in T, not quadratic.** `Attention.forward`
+concatenates a 128-token sliding window with `index_topk` = 512 compressed
+positions and makes one `sparse_attn` call, so every query attends exactly
+640 keys at any sequence length (128 on layers 0-1, which have ratio 0 and no
+compressed stream). The only quadratic term left in the model is the
+indexer's own score einsum, and at 8k that is 1.79 TFLOP -- 0.6% of the
+total. Consequence: **8k is not a hard context for this model, and the 300 ms
+target does not get easier by shortening it.** The risk that replaces
+quadratic cost is the gather: 640 scattered KV rows per query is between
+4 MB/layer (perfect reuse) and 2.7 GB/layer (none), a 650x spread that no
+roofline can settle and that the Stage-5 block sweep must measure.
+
+**2. MI300X has no fp4 matrix engine.** `hwspec` MI300X reports
+`mma.fp4: None`, and `scripts/asm_expect_gfx942.json` forbids
+`v_mfma_f32_32x32x64_f8f6f4` for exactly that reason. The routed experts are
+MXFP4 (group 32, E8M0 -- confirmed from the headers: `w1` is I8 [2304, 2560]
+for a logical [2304, 5120], two values per byte, with scale [2304, 160]).
+So on this part **fp4 buys memory, not FLOPs**: the weights must be
+dequantized and issued at the fp8 rate. That is already priced in above --
+the 49.4% expert share is computed at the fp8 peak -- but it means the
+dequant is on the critical path of half the model's arithmetic, and a
+dequant that lands in VALU rather than fused into the MFMA feed is the single
+largest performance risk in the expert path.
+
+**3. The collectives are first-order, and the indexer's is the surprise.**
+With expert parallelism (48 of 384 experts per rank) and row-parallel `wo_b`,
+each rank moves 14.8 GB over xGMI per prefill: 5.87 GB for `wo_b`, 5.87 GB
+for the MoE output, and **3.05 GB for the indexer score all-reduce**. That
+last one is [S, S/ratio] fp32 -- 268 MB on a single ratio-1 layer, larger
+than any weight tensor in the model -- because the 32 index heads are sharded
+and the score must be summed before the top-k. At 896 GB/s that is 16.5 ms if
+nothing overlaps, comparable to the entire compute floor. Overlapping it is
+not optional.
+
 ### The target is not the hard part
 
-Params from `config.json`; bandwidth from `crates/hwspec` MI300X, which
-carries a MEASURED 4091.9 GB/s rather than the 5325 datasheet peak — a
-roofline drawn against the datasheet understates every kernel here by ~30%.
-
-| | |
-|---|---|
-| dense (non-expert) params / layer | 165.0 M |
-| one routed expert | 35.4 M |
-| active / token / layer | 377.3 M (165.0 dense + 6 x 35.4 routed) |
-| active / token | 15.1 B — note the model card says 8 B for prefill; the gap is worth resolving, and it moves the floor DOWN |
-| 8k prefill FLOPs | 247 TFLOP, plus ~28 for sparse attention and ~2 for the indexer |
-| compute, 8 GPUs, fp8 @45% | **~29 ms** |
-| weight traffic | 281 GB (routed fp4 272, dense 6.6, embed/head 2.6) |
-| HBM, 8 GPUs @measured | ~8.6 ms |
-
-At 8192 tokens with top-6 over 384 experts every expert is hit (~128 tokens
-each), so prefill reads the whole checkpoint once; it is still compute-bound
-by ~3x. Engram is a sparse gather, not a dense read, so its 196 B parameters
-contribute almost no traffic.
-
-**300 ms is ~11x the roofline floor.** That is a comfortable target for a
-mature stack — the V4-Flash-0731 recipe reports 7.9-8.5 K tok/s prefill on a
-SINGLE MI300X, which is ~1.0 s for 8k, so ~128 ms on 8 GPUs at perfect
-scaling. The risk in this campaign is therefore not the number. It is that
-six pieces between `config.json` and a served token do not exist yet.
+**300 ms is 5.5x-12.3x the roofline floor.** That is a comfortable target for
+a mature stack -- the V4-Flash-0731 recipe reports 7.9-8.5 K tok/s prefill on
+a SINGLE MI300X, ~1.0 s for 8k, so ~128 ms on 8 GPUs at perfect scaling. The
+risk in this campaign is therefore not the number. It is that six pieces
+between `config.json` and a served token do not exist yet.
 
 ### What stands between here and it
 

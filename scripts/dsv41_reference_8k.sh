@@ -39,8 +39,23 @@ find_vllm_root () {
 ROOT="${VLLM_ROOT:-$(find_vllm_root)}"
 [ -n "${ROOT:-}" ] || { echo "!! no .venv-vllm028 at or above $WT"; exit 1; }
 PY="${VLLM_PYTHON:-$ROOT/build-gemma31/vllm-python}"
-export ROCM_PATH="${ROCM_PATH:-/opt/rocm/core-7.14}"
-export VLLM_ROCM_LIB="${VLLM_ROCM_LIB:-$ROCM_PATH/lib}"
+
+# Do NOT inherit ROCM_PATH. Inside `nix develop` it points at the nix ROCm,
+# whose lib has no libroctx64.so.4, and this venv's torch is linked against the
+# system one -- so an inherited value makes `import torch` fail while every arm
+# that does not import torch still passes. Pick the first tree that actually
+# carries the library.
+find_rocm_lib () {
+  local d
+  for d in "${VLLM_ROCM_LIB:-}" /opt/rocm/core-7.14/lib /opt/rocm-7.2.4/lib /opt/rocm/lib; do
+    [ -n "$d" ] && [ -e "$d/libroctx64.so.4" ] && { echo "$d"; return 0; }
+  done
+  return 1
+}
+VLLM_ROCM_LIB="$(find_rocm_lib)" || {
+  echo "!! no ROCm lib dir with libroctx64.so.4 found"; exit 1; }
+export VLLM_ROCM_LIB
+export ROCM_PATH="$(dirname "$VLLM_ROCM_LIB")"
 
 case "${1:?convert|run|check}" in
 
