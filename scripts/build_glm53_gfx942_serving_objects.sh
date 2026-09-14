@@ -81,10 +81,21 @@ cp -f "$vendor/glm_lt_gfx942.elf" "$out/glm_lt_gfx942.elf"
 
 # Only a packet emitted with PLOW_GLM_FOLD_LT routes MlaMergeFold to the FP32 hipBLASLt fold; the
 # loader then needs its pinned GEMM image (from VENDOR_DIR) and the adapter built from this tree.
-if python3 -c 'import json, sys; k = {x["id"]: x["value"] for x in json.load(open(sys.argv[1]))["emit_config"]["knobs"]}; sys.exit(k.get("glm_fold_lt") != "true")' "$assets/build.json"; then
+# The knob is recorded as "true" or "1" depending on the emitting plowc, and a native fold in the
+# packet itself (MlaMergeFold with i[5] != 0, amd_mla_fold::native) also needs both objects.
+if python3 -c '
+import json, sys
+b = json.load(open(sys.argv[1]))
+knob = {x["id"]: str(x["value"]).lower() for x in b["emit_config"]["knobs"]}.get("glm_fold_lt") in ("1", "true", "yes", "on")
+folds = sum(len(c["pcs"]) for p in b["kernel_cases"]["programs"] for c in p["cases"] if c["arm"] == "MlaMergeFold" and c["i"][5] != 0)
+print(f"glm_fold_lt knob={knob}, native MlaMergeFold instructions={folds}", file=sys.stderr)
+sys.exit(not (knob or folds))' "$assets/build.json"; then
     echo ">>> native FP32 MLA prefill fold (packet emitted with PLOW_GLM_FOLD_LT)"
     [ -f "$vendor/glm_fold_lt_gfx942.elf" ] || { echo "no $vendor/glm_fold_lt_gfx942.elf -- the packet carries native MLA folds" >&2; exit 2; }
     (cd "$root" && scripts/build_glm_fold_lt.sh "$out" "$vendor/glm_fold_lt_gfx942.elf")
+    for obj in glm_fold_lt_gfx942.elf glm_fold_adapter.elf; do
+        [ -f "$out/$obj" ] || { echo "no $out/$obj -- the packet carries native MLA folds" >&2; exit 1; }
+    done
 fi
 
 echo ">>> serving object set at $out"
