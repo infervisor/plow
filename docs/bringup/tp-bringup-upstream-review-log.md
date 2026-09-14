@@ -1440,6 +1440,57 @@ already answered no, twice — `rbfault10` showed no prefix is attached to the f
 runs `program=4 c0=0 clen=8192`, the full chunk), and `rbfault11` showed a preceding 4096 whose
 needle sits at row 0, sharing no prefix at all, poisons identically.
 
+## `PLOW_PREFIX_CACHE=0` cannot load the packet on a cold machine either, so the prefix cache stays unmeasured (2026-09-14, job `rbfault17-prefixcache`)
+
+`rbfault10` and `rbfault11` both tried `PLOW_PREFIX_CACHE=0` and both arms were void, each dying
+during load with `hsa_amd_memory_pool_allocate(1207959552 bytes)` →
+`HSA_STATUS_ERROR_OUT_OF_RESOURCES` seconds after a previous server had been killed. That was read
+as leftover VRAM. **It is not.** `rbfault17` ran the cache-off arm FIRST, as the very first server
+of the job, after waiting for any prior `plowrt` to exit, on a machine with nothing else resident:
+
+| arm | sequence | result |
+|---|---|---|
+| `cold0` | cache off, 8192 only | **server died during load**, same 1.2 GB pool allocation |
+| `off` | cache off, 4096 then 8192 | **server died during load**, identically |
+| `on` | cache on, 4096 then 8192 | 0/3 FAIL — the reproducer control holds |
+
+Each failure comes right after `weights carved from one allocation slab_mib=126795 carved=1907
+views=272`, i.e. ~124 GiB of weights are already resident and a further 1.2 GB pool allocation has
+nowhere to go. So with the prefix cache off, something else in the allocation plan grows enough to
+leave no room, and the knob does not work as a rollback on this packet at all. Filed as its own
+task; it is not a row-band defect.
+
+**The consequence for the row-band hunt is that the prefix cache remains the one candidate never
+actually measured**, and this knob cannot measure it. Testing it needs a different instrument.
+
+## The row-band carrier is a one-time DECISION, not residue anywhere (2026-09-14, reading `rbfault12` again)
+
+Worth stating separately because it has been underused and it narrows the search more than any
+single probe has. `rbfault12` ran the whole sequence in ONE server with 8192 FIRST, and the 4096 it
+issued afterwards did **not** poison the 8192s that followed it. If the ordinary program left a
+damaging residue, it would leave it every time it ran, and that post-8192 4096 would have poisoned
+exactly like a pre-8192 one. It did not.
+
+**That rules out stale data in every buffer at once**, not merely the sparse-MLA workspace
+`rbfault16` cleared, and it leaves exactly one shape: something is decided ONCE, by whichever
+sibling first uses the 8192 bucket, and never revised. Run the row-band program first and the
+decision is right for it; run the ordinary program first and the decision is wrong for the sibling
+that comes later.
+
+Two more candidates fall out for free. `PLOW_VMM_KV` defaults **off**, so the VMM-backed KV was
+never in play in any of these runs. And the prefix cache cannot be tested by its own knob, per the
+section above.
+
+**So look for the decision directly.** A one-time initialization usually says so once, in the log,
+at the moment it happens. Queued as `rbfault18-logdiff`: two servers identical but for the order —
+one 8192 request, versus one 4096 then one 8192 — both at `RUST_LOG=debug`, then a normalized diff
+(timestamps, hex, integers and floats collapsed) over the message SHAPES each emits, both scoped to
+the 8192 request and scoped to everything after load. The second scope is the one that matters: a
+decision taken at the first chunk is made during the 4096 in the poisoned arm and during the 8192 in
+the healthy arm, so it cancels out of a request-scoped diff and appears only in the whole-server
+one. If the diff is empty the decision is silent, and the candidates get instrumented by hand
+instead of guessed at.
+
 ## The tile-campaign blocker resolves into three classes with three different owners (2026-09-14, job `gemmtune-glm53`, follow-up)
 
 The section above records 374 FAIL lines over 44 objects and stops at "it wants an owner". Building
