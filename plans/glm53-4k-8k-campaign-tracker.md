@@ -303,9 +303,12 @@ Two openings that remain, both better than a rewrite:
    and several share a macro-tile at different kernarg sizes (an `MT256x224x64 ... AFC0` variant is
    144 bytes), so the layout above was read off the exact pinned name
    `MT256x224x64_MI16x16x1_SN_LDSB0_AFC1`, which is 160 bytes and carries the full epilogue.
-   Still unverified before building: the integer `activationType` expects for SiLU -- the bodies
-   dispatch activation through a PC table, so the enum has to come off the jump table rather than be
-   assumed. Tool: `scripts/tensile_args.py <image.elf> [kernel-substring]`.
+   Still unverified before building: the integer `activationType` expects for SiLU. The bodies
+   dispatch activation through a PC table, and the shipped ROCm headers do not carry the enum --
+   `hipblaslt-ext.hpp:389` is just `int activationType; //!< The activation type`, and no Tensile
+   header is installed -- so it is not a lookup. Settle it with a 1-GPU T2 that launches one pinned
+   kernel per candidate value and compares the output against a reference SiLU; guessing the value
+   silently computes the wrong activation. Tool: `scripts/tensile_args.py <image.elf> [substring]`.
 
 ## Rejected or parked
 
