@@ -511,13 +511,65 @@ contract is deliberate -- an emitted packet cannot tell which arch ran it -- but
 against the reference it is an extra lossy step on every routed expert. It
 needs a numerics comparison, not a new kernel.
 
-**2. A `deepseek_v41` route through devgen.** `crates/devgen/src/lib.rs` routes
-`glm5_next`, `glm_moe_dsa`, `kimi_k3`, and `kimi_k2`/`deepseek_v2`/
-`deepseek_v3`; there is no `deepseek_v4` or `deepseek_v41` arm, and the
-DeepSeek arm wires only `--block` (a full-model emit panics). With the expert
-kernel struck off, **this is the whole gate**, and it is section 10's point
-restated: serving goes through devgen, so this is the path a 90 ms number has
-to come out of.
+**2. The real critical path, audited op by op.** With the expert kernel struck
+off, what remains is emit-side plus two runtime holes. This list is read from
+the source, not from built blobs -- the mistake that produced item 1.
+
+The runtime is further along than this doc has been giving it credit for. Six
+V4-specific pieces are already written, each with a gfx942 test:
+
+| piece | kernel | dispatchable from `interp.hip`? |
+|---|---|---|
+| mHC | `op_hyperconn.h` `d_hyperconn_pre` / `_post` | **yes** -- `PLOW_DOP_HYPER_CONN_PRE/POST` |
+| DSA indexer | `op_attention_common.h` `[DSV4-IDX]` | **yes** -- ops 58 / 117 / 134 |
+| MXFP4 experts | `op_moe.h` `d_moe_group_pf_a4w4` CDNA3 arm | **yes** -- `enc = 2` on ops 85/86 |
+| clamped SwiGLU | `PLOW_MOE_ACT_SWIGLU_CLAMP` `[DSV4-ACT]` | **yes** -- `act = 4` |
+| router | `op_moe.h` `[DSV4-ROUTE]` | **yes** |
+| nope MLA prefill | `[DSV4-MLA-PF]` | **yes** |
+
+Two are written and tested but **have no opcode and no interpreter case**, so
+no packet can reach them:
+
+* `op_compress.h` `d_compress_pool` -- the CSA2 learned-pooling KV compressor
+  (`runtime/tests/compress_pool_gfx942_test.hip`, `[DSV4-COMPRESS]`). Called
+  today only from that test and from `runtime/bench/amd/kx/exp_quant_scale.hip`.
+* `op_compress.h` `d_rope_inverse_o` -- the conjugate rotation on the attention
+  output's last `rd` dims (`runtime/tests/dsv4_ops_gfx942_test.hip`,
+  `[DSV4-IROPE]`). Same: test-only.
+
+Wiring these is the standard add-an-opcode flow -- `dev_isa.h` enum (next free
+slot is 180), an `interp.hip` case, the presence macro, and the `DevOp` mirrors
+in `devgen` and `plowrt`. No new math.
+
+One piece has **nothing at all**: **Engram**. `engram_layer_ids` names layers 1
+and 14; each carries an fp8 table of `engram_num_embeddings` rows of
+`engram_head_dim`, addressed by a hash over up to `engram_max_ngram_size`
+tokens. It exists in `crates/nn-graph/src/models/config/deepseek_v41.rs` and
+nowhere else in the tree -- no kernel, no opcode, no test. It is a forward-path
+component, so end-to-end V4.1 needs it built: an n-gram hash, a gathered fp8
+embedding read, and the mix into the layer.
+
+And the emit side is untouched. `crates/devgen/src/lib.rs` routes `glm5_next`,
+`glm_moe_dsa`, `kimi_k3`, and `kimi_k2`/`deepseek_v2`/`deepseek_v3`; there is no
+`deepseek_v4` or `deepseek_v41` arm, and the DeepSeek arm wires only `--block`
+(a full-model emit panics). devgen can emit the DSA indexer chain today (via
+GLM's DSA path) but has no mHC emit and no CSA2 emit at all. Stage 1a/1b live in
+`nn-graph`, which section 10 already established is NOT the serving path.
+
+So the ordered critical path to an 8k/90 ms number is:
+
+1. opcodes + dispatch for `d_compress_pool` and `d_rope_inverse_o` (mechanical);
+2. Engram: kernel, opcode, test (new math, small tensors, large tables);
+3. a `deepseek_v41` claim in `devgen::run_verified` with `--block` emit, the
+   pattern every family since M3 has started from;
+4. mHC and CSA2 emit in the block path;
+5. full-model emit -- the `glm_main` / `kimi_k3_emit` analogue.
+
+Only after 5 does an end-to-end number exist to measure against 90 ms. The
+roofline (section 9) says the target is reachable at 28.9% of matrix peak and
+the expert GEMM already runs at ~71%; nothing found so far contradicts that.
+What stands in the way is emit plumbing and two-and-a-bit missing ops, not
+arithmetic.
 
 ## 6. Pipelining changes
 
