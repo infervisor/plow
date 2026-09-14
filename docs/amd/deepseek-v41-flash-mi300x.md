@@ -1195,6 +1195,34 @@ DSpark and the vision tower are out of scope for the first number: the
 reference `generate.py` never calls `forward_spec`, so base output is
 bit-exact without DSpark, and an 8k TEXT prefill does not touch the ViT.
 
+### `costmodel` cannot answer "how many milliseconds", and it was worth finding out
+
+An obvious-looking shortcut to a 90 ms answer without a GPU: cost every V4.1 GEMM
+shape through `crates/costmodel`, the model devgen already uses to pick tiles,
+convert `Cycles` to time, and sum. It does not work, and the reason is worth
+recording so the next person does not spend the afternoon on it.
+
+`costmodel::Cycles` is a **tile-RANKING metric, not a wall-clock prediction**.
+`cost::gemm_cycles` computes `steps = out_tiles * k_iters` and multiplies by the
+per-tile cost with **no division by `sm_count`** -- the chip's parallelism is
+deliberately absent from the compute term, because ranking two tiles for the same
+GEMM does not need it. The memory term is per-SM by construction too:
+`dma_cycles` divides bandwidth by `spec.sm_count` (`cost.rs:73`). `sm_count`
+enters only through `wave_tail_penalty`, which is a quantization correction, not
+a throughput divisor.
+
+Taken as wall-clock the numbers are absurd -- 3.3 s per layer, 130 s for the
+model -- and, tellingly, dividing by the 304 CUs does NOT rescue them either
+(still ~428 ms for the model against a 281.6 TFLOP roofline floor of 24-55 ms).
+There is no scaling factor that converts this metric into time, which is the
+clearest possible sign it is not a time.
+
+This is the same shape of error as section 5.6's retracted w4a16 item: building on
+a tool read wrong rather than on a measurement. The honest position stands --
+**the 8k number comes from hardware, and nothing else substitutes for it.** What
+`costmodel` legitimately answers is which of two tiles to pick for a given shape,
+and devgen already asks it that.
+
 ### Measurement caveat that will outlive this doc
 
 No V4.1 reference exists on this box (§4), so "300 ms" cannot yet be checked
