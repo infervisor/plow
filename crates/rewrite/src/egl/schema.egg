@@ -85,6 +85,15 @@
   (SnapCons Expr Expr)                ; snapshot, rest
   (SnapNil)                           ; end of the snapshot chain
 
+  ; --- DeepSeek-V4.1 mHC ---
+  ; Every weight leaf is named, as with K3 above: hc_fn, hc_scale and hc_base
+  ; travel together, and a constructor taking only hc_fn would drop the other
+  ; two from the manifest.
+  (HcMixes Expr Expr Expr Expr i64 i64 f64)
+      ; x, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps
+  (HcPre Expr Expr i64)               ; x, pre_mix, hc_mult
+  (HcPost Expr Expr Expr Expr i64)    ; x, residual, post_mix, comb_mix, hc_mult
+
   ; --- catch-all for ops not yet in the fusion vocabulary ---
   ; Allows the full graph to lower without error; no rewrite targets Opaque.
   (Opaque String Expr)                ; op_name, single-input passthrough

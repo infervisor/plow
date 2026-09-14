@@ -677,6 +677,60 @@ impl Nn {
         self.emit(Op::SituGlu { beta, linear_beta }, vec![gate, up])
     }
 
+    /// DeepSeek-V4.1 mHC coefficients for one sublayer. `name` is the block
+    /// prefix and the sublayer's own stem (`hc_attn` / `hc_ffn`), which is how
+    /// the checkpoint names them: `layers.{L}.hc_attn_fn` and friends.
+    ///
+    /// Every weight leaf is named here so the manifest stays complete — the
+    /// three of them travel together and an op that took only `hc_fn` would
+    /// silently drop `hc_base` and `hc_scale`.
+    pub fn hc_mixes(
+        &mut self,
+        name: &str,
+        x: TensorId,
+        hidden: i64,
+        hc_mult: u32,
+        sinkhorn_iters: u32,
+        eps: f32,
+    ) -> TensorId {
+        let mix = (2 + hc_mult as i64) * hc_mult as i64;
+        let fnw = self.param_dtype(
+            &format!("{name}_fn"),
+            [Dim::stat(mix), Dim::stat(hc_mult as i64 * hidden)],
+            DType::F32,
+        );
+        let scale = self.param_dtype(&format!("{name}_scale"), [Dim::stat(3)], DType::F32);
+        let base = self.param_dtype(&format!("{name}_base"), [Dim::stat(mix)], DType::F32);
+        self.emit(
+            Op::HcMixes {
+                hc_mult,
+                sinkhorn_iters,
+                eps,
+            },
+            vec![x, fnw, scale, base],
+        )
+    }
+
+    /// Collapse the `hc_mult` residual copies into one sublayer input.
+    /// `pre_mix` comes from the PREVIOUS sublayer's [`Nn::hc_mixes`] — V4.1's
+    /// mHC is single-pass.
+    pub fn hc_pre(&mut self, x: TensorId, pre_mix: TensorId, hc_mult: u32) -> TensorId {
+        self.emit(Op::HcPre { hc_mult }, vec![x, pre_mix])
+    }
+
+    /// Expand a sublayer output back to `hc_mult` copies, mixing the residual
+    /// in through `comb`. Replaces the plain residual add.
+    pub fn hc_post(
+        &mut self,
+        x: TensorId,
+        residual: TensorId,
+        post_mix: TensorId,
+        comb_mix: TensorId,
+        hc_mult: u32,
+    ) -> TensorId {
+        self.emit(Op::HcPost { hc_mult }, vec![x, residual, post_mix, comb_mix])
+    }
+
     /// Kimi-K3's `AttnRes` block residual: a softmax mix over the running
     /// prefix sum and the snapshot stack, in place of a plain residual add.
     pub fn block_residual(

@@ -373,6 +373,29 @@ fn term_for(
             )
         }
         // Variable snapshots lower to a cons chain; both checkpoint weights remain leaves.
+        Op::HcMixes {
+            hc_mult,
+            sinkhorn_iters,
+            eps,
+        } => format!(
+            "(HcMixes {} {} {} {} {} {} {})",
+            e(0)?,
+            e(1)?,
+            e(2)?,
+            e(3)?,
+            hc_mult,
+            sinkhorn_iters,
+            f64lit(*eps)
+        ),
+        Op::HcPre { hc_mult } => format!("(HcPre {} {} {})", e(0)?, e(1)?, hc_mult),
+        Op::HcPost { hc_mult } => format!(
+            "(HcPost {} {} {} {} {})",
+            e(0)?,
+            e(1)?,
+            e(2)?,
+            e(3)?,
+            hc_mult
+        ),
         Op::BlockResidual { max_snapshots } => {
             let norm = inputs.len() - 2;
             let proj = inputs.len() - 1;
