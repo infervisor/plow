@@ -303,6 +303,10 @@ impl MetalEngine {
             .bf16_m4
             .then(|| format!("#define PLOW_BF16_M4 1\n{source}"));
         let source = bf16_m4_source.as_deref().unwrap_or(source);
+        let bf16_m8_source = apple_config
+            .bf16_m8
+            .then(|| format!("#define PLOW_BF16_M8 1\n{source}"));
+        let source = bf16_m8_source.as_deref().unwrap_or(source);
         let four_rows = model.batch == 4
             && model
                 .blob
@@ -2438,6 +2442,7 @@ mod source_tests {
             ),
             format!("#define PLOW_BF16_M2 1\n{MSL}"),
             format!("#define PLOW_BF16_M4 1\n{MSL}"),
+            format!("#define PLOW_BF16_M8 1\n{MSL}"),
         ] {
             device
                 .newLibraryWithSource_options_error(&NSString::from_str(&source), Some(&options))

@@ -347,6 +347,34 @@ inline void dot4_bf16_quad(device const ushort* W, uint ldw, device const ushort
     a3 = float4(simd_sum(acc3.x), simd_sum(acc3.y), simd_sum(acc3.z), simd_sum(acc3.w));
 }
 #endif
+#ifdef PLOW_BF16_M8
+inline void dot_bf16_octet(device const ushort* W, device const ushort* x, uint K, uint lane,
+                          thread float4& a0, thread float4& a1) {
+    float4 acc0 = 0.0f, acc1 = 0.0f;
+    uint k = lane * 8u;
+    for (; k + 8u <= K; k += 256u) {
+        float4 w0 = bf4(*(device const ushort4*)(W + k));
+        float4 w1 = bf4(*(device const ushort4*)(W + k + 4u));
+        for (uint m = 0; m < 4u; m++) {
+            device const ushort* xm = x + m * K + k;
+            device const ushort* ym = xm + 4u * K;
+            acc0[m] += dot(w0, bf4(*(device const ushort4*)xm))
+                + dot(w1, bf4(*(device const ushort4*)(xm + 4u)));
+            acc1[m] += dot(w0, bf4(*(device const ushort4*)ym))
+                + dot(w1, bf4(*(device const ushort4*)(ym + 4u)));
+        }
+    }
+    for (k = (K & ~7u) + lane; k < K; k += 32u) {
+        float wv = bf2f(W[k]);
+        for (uint m = 0; m < 4u; m++) {
+            acc0[m] += wv * bf2f(x[m * K + k]);
+            acc1[m] += wv * bf2f(x[(m + 4u) * K + k]);
+        }
+    }
+    a0 = float4(simd_sum(acc0.x), simd_sum(acc0.y), simd_sum(acc0.z), simd_sum(acc0.w));
+    a1 = float4(simd_sum(acc1.x), simd_sum(acc1.y), simd_sum(acc1.z), simd_sum(acc1.w));
+}
+#endif
 inline float4 dot4_fp8(device const uchar* W, uint ldw, device const ushort* x, uint K, uint lane) {
     float4 acc = 0.0f;
     uint k = lane * 8u;
@@ -434,6 +462,30 @@ void op_gemv(const thread Inst& in, device const ulong* tab, uint slice, uint nb
     float eps = as_type<float>(in.fj[0]);
     uint n0, n1;
     range(N, slice, nblk, n0, n1);
+#ifdef PLOW_BF16_M8
+    if (M == 8u && norm == 0u) {
+        for (uint n = n0 + sg; n < n1; n += NSG) {
+            float4 a0, a1;
+            dot_bf16_octet(W + n * K, x, K, lane, a0, a1);
+            if (bias) {
+                float b = bf2f(bias[n]);
+                a0 += b;
+                a1 += b;
+            }
+            if (lane == 0) {
+                C[n] = f2bf(a0.x);
+                C[N + n] = f2bf(a0.y);
+                C[2u * N + n] = f2bf(a0.z);
+                C[3u * N + n] = f2bf(a0.w);
+                C[4u * N + n] = f2bf(a1.x);
+                C[5u * N + n] = f2bf(a1.y);
+                C[6u * N + n] = f2bf(a1.z);
+                C[7u * N + n] = f2bf(a1.w);
+            }
+        }
+        return;
+    }
+#endif
 #ifdef PLOW_BF16_M4
     if (M == 8u && norm == 0u && (n0 % 4u) == 0u && (n1 % 4u) == 0u) {
         for (uint n = n0 + sg * 4u; n + 4u <= n1; n += NSG * 4u) {
@@ -562,6 +614,36 @@ void op_gemv_glu(const thread Inst& in, device const ulong* tab, uint slice, uin
     float f0 = as_type<float>(in.fj[0]), f1 = as_type<float>(in.fj[1]);
     uint n0, n1;
     range(N, slice, nblk, n0, n1);
+#ifdef PLOW_BF16_M8
+    if (M == 8u) {
+        for (uint n = n0 + sg; n < n1; n += NSG) {
+            float4 g0, g1, u0, u1;
+            dot_bf16_octet(Wg + n * K, x, K, lane, g0, g1);
+            dot_bf16_octet(Wu + n * K, x, K, lane, u0, u1);
+            if (bg) {
+                float b = bf2f(bg[n]);
+                g0 += b;
+                g1 += b;
+            }
+            if (bu) {
+                float b = bf2f(bu[n]);
+                u0 += b;
+                u1 += b;
+            }
+            if (lane == 0) {
+                C[n] = f2bf(glu_pair(g0.x, u0.x, act, f0, f1));
+                C[N + n] = f2bf(glu_pair(g0.y, u0.y, act, f0, f1));
+                C[2u * N + n] = f2bf(glu_pair(g0.z, u0.z, act, f0, f1));
+                C[3u * N + n] = f2bf(glu_pair(g0.w, u0.w, act, f0, f1));
+                C[4u * N + n] = f2bf(glu_pair(g1.x, u1.x, act, f0, f1));
+                C[5u * N + n] = f2bf(glu_pair(g1.y, u1.y, act, f0, f1));
+                C[6u * N + n] = f2bf(glu_pair(g1.z, u1.z, act, f0, f1));
+                C[7u * N + n] = f2bf(glu_pair(g1.w, u1.w, act, f0, f1));
+            }
+        }
+        return;
+    }
+#endif
 #ifdef PLOW_BF16_M4
     if (M == 8u) {
         for (uint n = n0 + sg; n < n1; n += NSG) {
