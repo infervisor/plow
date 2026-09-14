@@ -963,6 +963,35 @@ preflight that refuses any plowrt without the serve gate, and a per-arm assertio
 line appears exactly when the knob says it should, reporting an arm INVALID rather than scoring it.
 That assertion is precisely what v1 lacked.
 
+### v2: the fault is in the CURRENT stack packet, and `PLOW_GLM_ROWBAND=0` is a BROKEN ROLLBACK (2026-09-14, job `rbfault2`)
+
+| arm | result |
+|---|---|
+| `on` (gate=1) | **VALID: FAULTED** — sibling selected as wanted, 3 fault lines, quality rc=1 |
+| `off` (gate=0) | **server never became ready** — faulted during LOAD |
+
+Two findings, and the second was not what the probe went looking for.
+
+1. **The fault is not specific to the old `rb-rowband` packet.** It reproduces on the CURRENT
+   binary with the CURRENT stack packet `9e76b70bf97ee4a6` — the artifact the stacked T4 result
+   (`-8.86 ms` at isl8192 C1) rests on.
+2. **`PLOW_GLM_ROWBAND=0` does not work as a rollback.** With the gate off the packet faults at
+   LOAD: `Memory access fault by GPU node-8 (Agent handle: 0x5555563f8680) on address 0x13000` —
+   a near-null address — immediately after `checkpoint weights uploaded rank=0`. `flags-reference`
+   documents `=0` as the rollback for this knob; it is not one. The earlier reading of
+   `rowband_on || !rb_twin[id]` as a safe skip path was wrong. **This is a separate bug from the
+   C20 fault and needs its own fix**: a landed lever whose documented rollback crashes at load is
+   not shippable even if the C20 fault turns out to belong to something else.
+
+So a null cannot come from the knob at all. `rbfault/probe3.sh` (job `0-rbfault3-null`) takes it
+from a packet with no row-band in it: the SHIPPING serving set `plow-serving/glm53-tp8-a7596da2`,
+packet `8b15f4a28b289a72`, its own 70 objects and its own pinned `plowrt` per its README. Its
+preflight asserts the set carries **no** `OBJECT16` — that file IS the `row_split_ready` gate
+(`exec/amd.rs`: `hsaco_dir.join(OBJECT16).exists()`), so its absence is what makes the arm a null.
+One arm only, since the positive is established. Clean => row-band convicted. Faults => row-band
+exonerated AND the shipping set has a memory-safety fault under concurrent retrieval, which is the
+bigger problem and wants escalating on its own.
+
 ## Every gfx942 GEMM tile is chosen by the analytical model, and 4961 measured records sit unused (2026-09-14)
 
 `plowc tune status --gpu MI300X` states it directly:
