@@ -5,7 +5,7 @@
  * and spot-checks correctness against a CPU dot product. The kernel SYMBOL is argv[1] so a
  * tile sweep only rebuilds test_kernels.hip, never this file.
  *
- *   usage: gemm_bench_8k <kernel_symbol> [M] [qwen|gemma12|gemma31]
+ *   usage: gemm_bench_8k <kernel_symbol> [M] [qwen|gemma12|gemma31] [object.elf]
  *
  * `gemma_gemm_glu_bf16{,_outlined}` runs only the gate/up shape and checks the fused GELU output.
  *
@@ -119,12 +119,20 @@ static void bench(plow_hsa_kernel* k, const char* label, unsigned M, unsigned N,
 
 int main(int argc, char** argv) {
     const char* sym = argc > 1 ? argv[1] : "gemm_c0";
-    const int glu = strncmp(sym, "gemma_gemm_glu_bf16", sizeof("gemma_gemm_glu_bf16") - 1) == 0;
+    const int glu =
+        strncmp(sym, "gemma_gemm_glu_bf16", sizeof("gemma_gemm_glu_bf16") - 1) == 0 ||
+        strncmp(sym, "plow_gemma4_", sizeof("plow_gemma4_") - 1) == 0;
     const char* model_arg = argc > 3 ? argv[3] : "qwen";
+    const char* object = argc > 4 ? argv[4] : "test_kernels.elf";
     int gemma31 = strcmp(model_arg, "gemma31") == 0 || strcmp(model_arg, "gemma") == 0;
     int gemma12 = strcmp(model_arg, "gemma12") == 0;
     if (!gemma12 && !gemma31 && strcmp(model_arg, "qwen") != 0) {
         fprintf(stderr, "unknown model %s (want qwen, gemma12, or gemma31)\n", model_arg);
+        return 2;
+    }
+    if ((strstr(sym, "plow_gemma4_12b_") && !gemma12) ||
+        (strstr(sym, "plow_gemma4_31b_") && !gemma31)) {
+        fprintf(stderr, "exact-shape Gemma symbol does not match model %s\n", model_arg);
         return 2;
     }
     unsigned Mov = argc > 2 ? (unsigned)atoi(argv[2]) : 0;
@@ -135,8 +143,8 @@ int main(int argc, char** argv) {
     plow_hsa_device_info(H, 0, nm, &cus, &lds);
     NCU = cus;
 
-    FILE* f = fopen("test_kernels.elf", "rb");
-    if (!f) { perror("test_kernels.elf"); return 1; }
+    FILE* f = fopen(object, "rb");
+    if (!f) { perror(object); return 1; }
     fseek(f, 0, SEEK_END);
     long n = ftell(f);
     fseek(f, 0, SEEK_SET);

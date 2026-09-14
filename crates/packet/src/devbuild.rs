@@ -463,6 +463,8 @@ pub struct Builder {
     fuse_materialized_residual_inputs: bool,
     /// Isolate f32-mix AttnRes packets (`f[1]` = output-norm epsilon) for the gfx950 object.
     attn_res_f32mix_segments: bool,
+    /// Isolate exact gfx942 Gemma-4 BF16 gate/up packets for the raw C2/C5 object.
+    native_gemma4_glu_segments: bool,
     /// Slices per machine-filling decode GEMV, as a multiple of `n_cu`. 1 (default) ⇒
     /// byte-identical. See [`Builder::set_gemv_split`].
     gemv_split: u32,
@@ -707,6 +709,7 @@ impl Builder {
             xreduce_wave_rs_segments: false,
             fuse_materialized_residual_inputs: true,
             attn_res_f32mix_segments: false,
+            native_gemma4_glu_segments: false,
             gemv_split: 1,
             tensor_dedup: false,
             cu_cap: None,
@@ -733,6 +736,10 @@ impl Builder {
     /// and L2 domains are independent fields, so segmented programs remain placeable.
     pub fn set_l2_placement(&mut self, layout: Option<L2Layout>) {
         self.place_l2 = layout;
+    }
+
+    pub fn set_native_gemma4_glu_segments(&mut self, enabled: bool) {
+        self.native_gemma4_glu_segments = enabled;
     }
 
     /// Refuse to honour `PLOW_UNISEG` for this program, whatever the environment says.
@@ -1883,6 +1890,26 @@ impl Builder {
                 Some(l)
             }
         });
+        let mut native_gemma4_glu = false;
+        if self.native_gemma4_glu_segments && l2_place.is_none() {
+            for op in &mut self.ops {
+                let inst = &op.inst;
+                let shape = matches!(inst.i[0], 1024 | 2048 | 4096 | 8192)
+                    && matches!((inst.i[1], inst.i[2]), (15_360, 3_840) | (21_504, 5_376));
+                let abi = inst.op == DevOp::GemmGlu as u16
+                    && inst.i[3..5] == [0; 2]
+                    && inst.i[5] == 0
+                    && inst.i[6..] == [0; 2]
+                    && inst.f.iter().all(|value| value.to_bits() == 0)
+                    && inst.j == [0; 2]
+                    && inst.t[3..5] == [TENSOR_NONE; 2]
+                    && inst.t[6..] == [TENSOR_NONE; 2];
+                if shape && abi && op.cus.len() == n_cu {
+                    op.isolated = true;
+                    native_gemma4_glu = true;
+                }
+            }
+        }
 
         // Coarse or fine, decided from the dataflow — not from a flag. See the doc comment on
         // `select_granularity`, and the `collapse` theorem it implements.
@@ -2451,7 +2478,8 @@ impl Builder {
                 || op.inst.op == DevOp::GemmBlkPf as u16
                 || (op.inst.op == DevOp::MlaMergeFold as u16 && op.inst.i[5] == 1)
                 || (op.inst.op == DevOp::FlashMlaDecodeFp8 as u16 && op.isolated)
-        }) || lean_moe_stage2
+        }) || native_gemma4_glu
+            || lean_moe_stage2
             || lean_moe_stage1
             || lean_moe_combine
             || lean_attn_res_f32mix
@@ -5184,6 +5212,62 @@ mod xreduce_wave_rs_segment_tests {
                 .len(),
             1
         );
+    }
+}
+
+#[cfg(test)]
+mod gemma4_glu_segment_tests {
+    use super::*;
+
+    fn program(l2: bool, rows: u32) -> Program {
+        let mut b = Builder::new(8);
+        b.deny_uniseg();
+        b.set_native_gemma4_glu_segments(true);
+        if l2 {
+            b.set_l2_placement(Some(L2Layout {
+                sms: 1,
+                domains: 8,
+                map: L2Map::RoundRobin,
+            }));
+        }
+        let all = b.all();
+        let before = b.emit(DevOp::Nop, all.clone(), &[], |_| {});
+        let glu = b.emit(DevOp::GemmGlu, all.clone(), &[before], |d| {
+            d.t = [
+                0,
+                1,
+                2,
+                TENSOR_NONE,
+                TENSOR_NONE,
+                3,
+                TENSOR_NONE,
+                TENSOR_NONE,
+            ];
+            d.i = [rows, 15_360, 3_840, 0, 0, 0, 0, 0];
+        });
+        b.emit(DevOp::Nop, all, &[glu], |_| {});
+        b.finish()
+    }
+
+    #[test]
+    fn exact_gfx942_glu_is_a_counter_free_raw_segment() {
+        for rows in [1024, 2048, 4096, 8192] {
+            let p = program(false, rows);
+            let segment = p.stream.iter().find(|e| e.inst == 1).unwrap().seg;
+            assert!(p
+                .stream
+                .iter()
+                .filter(|e| e.seg == segment)
+                .all(|e| e.inst == 1 && e.wait_len == 0 && e.succ_len == 0));
+            assert!(p.insts.iter().all(|d| d.wait_len == 0 && d.succ_len == 0));
+        }
+    }
+
+    #[test]
+    fn l2_placement_keeps_the_interpreter_counter_protocol() {
+        let p = program(true, 1024);
+        assert_ne!(p.insts[1].wait_len, 0);
+        assert_ne!(p.insts[1].succ_len, 0);
     }
 }
 

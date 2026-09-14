@@ -26,7 +26,8 @@ use crate::exec::kvrow::{
     RowField,
 };
 use crate::exec::{
-    amd_gemm_blk, amd_gemm_lt, amd_index_tp, amd_mla_fold, amd_moe_aiter, amd_sparse_mla,
+    amd_gemm_blk, amd_gemm_lt, amd_gemma4_glu, amd_index_tp, amd_mla_fold, amd_moe_aiter,
+    amd_sparse_mla,
 };
 use crate::memory::slab_carve;
 use crate::memory::vmm::{VmmGeometry, VmmKv, VmmOps, WeightSlab};
@@ -1008,6 +1009,7 @@ enum PrefillSegmentRoute {
     IndexTp(amd_index_tp::Route),
     GemmLt(amd_gemm_lt::Route),
     GemmBlk(amd_gemm_blk::Route),
+    Gemma4Glu(amd_gemma4_glu::Route),
     MlaFold(amd_mla_fold::Route),
     XReduceWaveRs,
     GraphPhaseXReduceWaveRs,
@@ -5885,6 +5887,7 @@ pub struct AmdEngine {
     index_tp: Option<amd_index_tp::IndexTp>,
     gemm_lt: Option<amd_gemm_lt::GemmLt>,
     gemm_blk: Option<amd_gemm_blk::GemmBlk>,
+    gemma4_glu: Option<amd_gemma4_glu::Gemma4Glu>,
     mla_fold: Option<amd_mla_fold::MlaFold>,
     k_xaudit: Option<HsaKernel>,
     k_state_clear: Option<HsaKernel>,
@@ -6705,6 +6708,10 @@ impl AmdEngine {
                 "block-scale FP8 projection requires gfx942 TP8 prefill".into(),
             ));
         }
+        let wants_gemma4_glu = arch == "gfx942"
+            && blob
+                .prefill_phase()
+                .any(amd_gemma4_glu::program_candidate);
         // Weights and scale grids the route binds in its own layout (shuffled, doubled).
         let gemm_blk_bound = if use_gemm_blk {
             amd_gemm_blk::bound_weights(&blob.progs)?
@@ -8577,6 +8584,11 @@ impl AmdEngine {
         } else {
             None
         };
+        let gemma4_glu = if wants_gemma4_glu {
+            amd_gemma4_glu::Gemma4Glu::load(&be, &hsaco_dir, blob.n_cu, &mut modules)?
+        } else {
+            None
+        };
         let index_tp = if use_index_tp {
             Some(amd_index_tp::IndexTp::load(&be, &hsaco_dir, &mut modules)?)
         } else {
@@ -9384,6 +9396,29 @@ impl AmdEngine {
                         }
                     }
                 }
+                if gemma4_glu.is_some() {
+                    let gemma4_glu_routes =
+                        amd_gemma4_glu::routes(p, &blob.tensors, seg_class.len())?;
+                    let route_count = gemma4_glu_routes.iter().flatten().count();
+                    if route_count != 0 {
+                        tracing::info!(
+                            program = prog_ix,
+                            rows = p.t,
+                            segments = route_count,
+                            "native Gemma-4 BF16 GemmGlu route enabled"
+                        );
+                    }
+                    for (seg, route) in gemma4_glu_routes.into_iter().enumerate() {
+                        if let Some(route) = route {
+                            if !matches!(prefill_routes[seg], PrefillSegmentRoute::Interpreter) {
+                                return Err(RuntimeError::Device(
+                                    "native Gemma-4 GemmGlu overlaps another route".into(),
+                                ));
+                            }
+                            prefill_routes[seg] = PrefillSegmentRoute::Gemma4Glu(route);
+                        }
+                    }
+                }
                 if use_gemm_lt {
                     for (seg, route) in amd_gemm_lt::routes(p, &blob.tensors, seg_class.len())?
                         .into_iter()
@@ -9493,6 +9528,9 @@ impl AmdEngine {
                             | PrefillSegmentRoute::MlaMaterializedPrefill { .. }
                     )
                 });
+                let has_gemma4_glu = prefill_routes
+                    .iter()
+                    .any(|r| matches!(r, PrefillSegmentRoute::Gemma4Glu(_)));
                 let has_ep = prefill_routes.iter().any(|r| {
                     matches!(
                         r,
@@ -9518,11 +9556,12 @@ impl AmdEngine {
                     || use_index_tp
                     || use_gemm_lt
                     || use_gemm_blk
+                    || has_gemma4_glu
                     || use_mla_fold)
                     && !prefill_segment_specialization_allowed(dispatch)
                 {
                     return Err(RuntimeError::Device(
-                        "native AITER kernels require ordered segment dispatch".into(),
+                        "native prefill kernels require ordered segment dispatch".into(),
                     ));
                 }
                 if has_ep && !prefill_segment_specialization_allowed(dispatch) {
@@ -10311,6 +10350,7 @@ impl AmdEngine {
             index_tp,
             gemm_lt,
             gemm_blk,
+            gemma4_glu,
             mla_fold,
             k_xaudit,
             k_state_clear,
@@ -11429,6 +11469,16 @@ impl AmdEngine {
             self.seg_launches += 1;
             return Ok(());
         }
+        if let Some(PrefillSegmentRoute::Gemma4Glu(route)) =
+            self.progs[p].prefill_routes.get(seg).copied()
+        {
+            let kernel = self.gemma4_glu.as_ref().ok_or_else(|| {
+                RuntimeError::Device("native Gemma-4 GemmGlu route has no loaded kernel".into())
+            })?;
+            kernel.enqueue(&self.be, route, &self.tens_table)?;
+            self.seg_launches += 1;
+            return Ok(());
+        }
         if let Some(PrefillSegmentRoute::GemmBlk(route)) =
             self.progs[p].prefill_routes.get(seg).copied()
         {
@@ -11980,6 +12030,7 @@ impl AmdEngine {
                     .as_ref()
                     .map_or(1, |s| s.span_launches(*route, &self.packed_spans)),
                 Some(PrefillSegmentRoute::GemmLt(_)) => 1,
+                Some(PrefillSegmentRoute::Gemma4Glu(_)) => 1,
                 Some(PrefillSegmentRoute::GemmBlk(route)) => route.launches(),
                 Some(PrefillSegmentRoute::MlaFold(_)) => 3,
                 Some(PrefillSegmentRoute::MoeAiter(route)) => route.launches() as usize,
@@ -11994,6 +12045,7 @@ impl AmdEngine {
                 .as_ref()
                 .map_or(1, |s| s.native_lo_launches(*route)),
             Some(PrefillSegmentRoute::GemmLt(_)) => 1,
+            Some(PrefillSegmentRoute::Gemma4Glu(_)) => 1,
             Some(PrefillSegmentRoute::GemmBlk(route)) => route.launches(),
             Some(PrefillSegmentRoute::MlaFold(_)) => 3,
             Some(PrefillSegmentRoute::MoeAiter(route)) => route.launches() as usize,
@@ -12756,6 +12808,9 @@ impl AmdEngine {
                 route.rebase(rows)?;
             }
             if let PrefillSegmentRoute::GemmLt(route) = route {
+                route.rebase(rows)?;
+            }
+            if let PrefillSegmentRoute::Gemma4Glu(route) = route {
                 route.rebase(rows)?;
             }
             if let PrefillSegmentRoute::GemmBlk(route) = route {

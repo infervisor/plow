@@ -988,6 +988,7 @@ if(PLOW_GFX950_HSACO)
     endif()
     set(_hs_src "${CMAKE_CURRENT_SOURCE_DIR}/amd/interp.hip")
     set(_hs_tk_src "${CMAKE_CURRENT_SOURCE_DIR}/amd/test_kernels.hip")
+    set(_hs_gemma4_glu_src "${CMAKE_CURRENT_SOURCE_DIR}/amd/gemma4_gemm_glu_gfx942.hip")
     set(_hs_inc -I "${CMAKE_CURRENT_SOURCE_DIR}/amd" -I "${CMAKE_CURRENT_SOURCE_DIR}/common")
     set(_hs_config_dep "")
     set(_hs_need_kda_fused ON)
@@ -2031,6 +2032,24 @@ if(PLOW_GFX950_HSACO)
         COMMENT "hipcc test_kernels.elf"
         VERBATIM)
     list(APPEND _hs_outs "${_hs_tk_out}")
+
+    if(PLOW_HSACO_ARCH STREQUAL "gfx942")
+        set(_hs_gemma4_glu_out "${PLOW_HSACO_DIR}/gemma4_gemm_glu_gfx942.elf")
+        add_custom_command(OUTPUT "${_hs_gemma4_glu_out}"
+            COMMAND "${CMAKE_COMMAND}" -E make_directory "${PLOW_HSACO_DIR}"
+            COMMAND "${CMAKE_COMMAND}" -E rm -f
+                    "${_hs_gemma4_glu_out}" "${_hs_gemma4_glu_out}.co"
+            COMMAND "${PLOW_HSACO_HIPCC}" --offload-arch=gfx942 -O3 -w --genco
+                    ${_hs_inc} "${_hs_gemma4_glu_src}" -o "${_hs_gemma4_glu_out}.co"
+            COMMAND "${PLOW_HSACO_BUNDLER}" --unbundle --type=o
+                    --targets=hipv4-amdgcn-amd-amdhsa--gfx942
+                    --input=${_hs_gemma4_glu_out}.co --output=${_hs_gemma4_glu_out}
+            COMMAND "${CMAKE_COMMAND}" -E rm -f "${_hs_gemma4_glu_out}.co"
+            DEPENDS "${_hs_gemma4_glu_src}" ${_hs_hdrs}
+            COMMENT "hipcc gemma4_gemm_glu_gfx942.elf"
+            VERBATIM)
+        list(APPEND _hs_outs "${_hs_gemma4_glu_out}")
+    endif()
 
     add_custom_target(gfx950_hsaco ALL DEPENDS ${_hs_outs})
 endif()

@@ -1531,6 +1531,7 @@ fi
 # Delete FIRST. A build that dies must leave nothing behind to run: a stale .elf
 # that a test prints CORRECT against is the failure every guard here exists for.
 for row in "${ROWS[@]}"; do rm -f "${row%%|*}.elf" "${row%%|*}.co"; done
+rm -f gemma4_gemm_glu_gfx942.elf gemma4_glu.co
 
 one() {  # <stem> <axes...>
   local stem="$1"; shift
@@ -1545,7 +1546,7 @@ one() {  # <stem> <axes...>
 }
 export -f one; export HIPCC ARCH R INC BUN AX_CONFIG AX_EXTRA
 
-# test_kernels.elf is STARTED HERE, alongside the row batch, and waited on after it.
+# The harness and the isolated Gemma-4 GLU object are started alongside the row batch.
 # It shares no input with the rows and nothing between here and the wait consumes it, so
 # the only thing its old position bought was serialisation: measured 29.7 s of a 79.4 s
 # build at JOBS=48, against a 30.1 s critical path for the whole parallel batch. See the
@@ -1562,6 +1563,18 @@ if [ -z "${PLOW_ROWS_ONLY:-}" ]; then
     fi
   ) &
   TK_PID=$!
+  (
+    if "$HIPCC" --offload-arch="$ARCH" -O3 -w --genco \
+          "$R/amd/gemma4_gemm_glu_gfx942.hip" -o gemma4_glu.co $INC \
+          > gemma4_gemm_glu_gfx942.log 2>&1; then
+      "$BUN" --unbundle --type=o --targets="hipv4-amdgcn-amd-amdhsa--$ARCH" \
+          --input=gemma4_glu.co --output=gemma4_gemm_glu_gfx942.elf
+      rm -f gemma4_glu.co gemma4_gemm_glu_gfx942.log
+    else
+      exit 1
+    fi
+  ) &
+  GEMMA4_GLU_PID=$!
 fi
 
 # Both scheduler twins: which one a packet needs is decided by the packet
@@ -1609,6 +1622,7 @@ fi
   # test_kernels.elf takes no axes at all; it is listed so the contract audits it as an
   # object rather than skipping it for want of a defines entry.
   printf '%s "test_kernels": "-DPLOW_ARCH_SUFFIX=%s"' "$sep" "$ARCH"
+  printf ',\n "gemma4_gemm_glu_gfx942": "-DPLOW_ARCH_SUFFIX=%s"' "$ARCH"
   printf '\n}\n'
 } > build_defines.json
 
@@ -1637,6 +1651,15 @@ if [ -n "${TK_PID:-}" ]; then
     echo "ok    test_kernels"
   else
     echo "FAIL  test_kernels"; [ -f test_kernels.log ] && tail -20 test_kernels.log; exit 1
+  fi
+fi
+if [ -n "${GEMMA4_GLU_PID:-}" ]; then
+  if wait "$GEMMA4_GLU_PID"; then
+    echo "ok    gemma4_gemm_glu_gfx942"
+  else
+    echo "FAIL  gemma4_gemm_glu_gfx942"
+    [ -f gemma4_gemm_glu_gfx942.log ] && tail -20 gemma4_gemm_glu_gfx942.log
+    exit 1
   fi
 fi
 

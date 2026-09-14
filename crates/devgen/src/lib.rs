@@ -8906,6 +8906,9 @@ fn emit_dense_gqa(
         b.set_fuse_materialized_residual_inputs(ecfg.fuse_residual_input);
         b.adopt_tensors(tensors.clone());
         b.set_l2_placement(l2_layout.filter(|_| l2_place_prefill));
+        b.set_native_gemma4_glu_segments(
+            amd && amd_target::active().1 == hwspec::IsaLevel::Gfx942,
+        );
         b.set_lean_moe_stage2_segments(amd && emit_config::active().moe_stage2_lean);
         b.set_lean_moe_stage1_segments(amd && emit_config::active().moe_stage1_lean);
         b.set_lean_moe_combine_segments(amd && emit_config::active().moe_combine_lean);

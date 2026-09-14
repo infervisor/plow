@@ -741,6 +741,23 @@
   "p7": {}
  },
  "objects": {
+  "gemma4_gemm_glu_gfx942": {
+   "defines": {
+    "PLOW_ARCH_SUFFIX": "gfx942"
+   },
+   "vgpr": 234,
+   "agpr": 0,
+   "lds": 64512,
+   "occ": 2,
+   "meta_spill": 0,
+   "isa_spill": 0,
+   "unmetered_spill": 0,
+   "meta_lies": {},
+   "bpermute": 0,
+   "lds16": 0,
+   "arms": {},
+   "geom": "p7"
+  },
   "interp_decode": {
    "defines": {
     "PLOW_ARCH_SUFFIX": "gfx942",
