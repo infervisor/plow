@@ -33,3 +33,38 @@ pub fn formation_window_ms(lambda: f64, max_hold_ms: f64) -> f64 {
     // ~ time to accrue one more arrival, capped.
     (1000.0 / lambda).min(max_hold_ms)
 }
+
+/// The hold for an arrival into an empty slot table. `pending` counts requests queued behind it
+/// or still inside a handler (tokenizing). With `idle_dispatch`, a lone arrival dispatches at once;
+/// a burst's first arrival still sees its peers in `pending` and holds as before.
+pub fn cold_start_hold_ms(lambda: f64, max_hold_ms: f64, idle_dispatch: bool, pending: usize) -> f64 {
+    if idle_dispatch && pending == 0 {
+        return 0.0;
+    }
+    formation_window_ms(lambda, max_hold_ms)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn idle_dispatch_skips_the_hold_only_for_a_lone_arrival() {
+        for lambda in [0.0, 1.3, 50.0, 5000.0] {
+            for pending in [0, 1, 15] {
+                assert_eq!(
+                    cold_start_hold_ms(lambda, 8.0, false, pending),
+                    formation_window_ms(lambda, 8.0)
+                );
+            }
+            assert_eq!(cold_start_hold_ms(lambda, 8.0, true, 0), 0.0);
+            for pending in [1, 15] {
+                assert_eq!(
+                    cold_start_hold_ms(lambda, 8.0, true, pending),
+                    formation_window_ms(lambda, 8.0)
+                );
+            }
+        }
+        assert_eq!(cold_start_hold_ms(1.3, 8.0, false, 0), 8.0);
+    }
+}

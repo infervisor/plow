@@ -2821,6 +2821,7 @@ dependencies = [
  "packet",
  "parking_lot",
  "plow-asset",
+ "rayon",
  "rustc-hash",
  "rustfft",
  "safetensors",

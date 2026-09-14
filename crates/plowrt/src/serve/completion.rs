@@ -153,6 +153,7 @@ pub async fn completions(
             Some("model".into()),
         );
     };
+    let ingress = mux.ingress();
     // OpenAI's four prompt forms. Token-id prompts skip the tokenizer entirely;
     // batches are refused explicitly rather than silently serving element 0.
     let batch_refusal = || {
@@ -219,7 +220,9 @@ pub async fn completions(
         arrived: std::time::Instant::now(),
         respond: tx,
     };
-    if let Err(err) = mux.submit_arrived(job, t_arrive) {
+    let submitted = mux.submit_arrived(job, t_arrive);
+    drop(ingress);
+    if let Err(err) = submitted {
         return match err {
             crate::serve::mux::SubmitError::Full(_) => {
                 crate::serve::api_error(

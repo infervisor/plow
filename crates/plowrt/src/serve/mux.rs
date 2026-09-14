@@ -49,7 +49,7 @@ use crate::memory::AddressSpace;
 use crate::obs::serving::RequestMetrics;
 use crate::obs::Metrics;
 use crate::sched::admission::{admit, Admit, LoadEstimator};
-use crate::sched::batching::{formation_window_ms, select_bucket};
+use crate::sched::batching::{cold_start_hold_ms, select_bucket};
 use crate::sched::multistep::MultiStep;
 use crate::sched::rungs::{DecodeRungs, RungController, RungLoad};
 use crate::serve::stream::{ChunkSender, FinishReason, StreamChunk};
@@ -189,6 +189,17 @@ pub struct ModelMux {
     /// from the message channel (see [`ModelMux::preempt`]).
     preempt: Arc<std::sync::atomic::AtomicBool>,
     preempt_notify: Arc<tokio::sync::Notify>,
+    /// Requests past model lookup whose job is not on `tx` yet (still tokenizing).
+    ingress: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// Holds one count in [`ModelMux::ingress`] until dropped.
+pub(crate) struct IngressGuard<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl Drop for IngressGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// Internal messages to the dispatcher: jobs or control signals.
@@ -280,6 +291,12 @@ fn completed_decode(feeds: &[(usize, u32)], steps: usize) -> Option<DecodeProgre
 }
 
 impl ModelMux {
+    /// Count a request as pending before it tokenizes; drop the guard after `submit_arrived`.
+    pub(crate) fn ingress(&self) -> IngressGuard<'_> {
+        self.ingress.fetch_add(1, Ordering::Relaxed);
+        IngressGuard(&self.ingress)
+    }
+
     /// Submit a job. Returns immediately; the caller awaits the stream.
     pub fn submit(&self, job: Job) -> std::result::Result<(), SubmitError> {
         let arrived = job.arrived;
@@ -412,6 +429,9 @@ pub fn spawn(
     let preempt_seen = Arc::clone(&preempt_flag);
     let preempt_notify = Arc::new(tokio::sync::Notify::new());
     let preempt_wake = Arc::clone(&preempt_notify);
+    let ingress = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let ingress_seen = Arc::clone(&ingress);
+    let idle_dispatch = crate::config::RuntimeConfig::get().idle_dispatch;
     let metrics = state.model_metrics(&slug);
     let handle_metrics = Arc::clone(&metrics);
 
@@ -698,7 +718,12 @@ pub fn spawn(
                 // if any slot is already live, spinning up the tick delivers
                 // TTFT faster than waiting for more arrivals.
                 let hold_ms = if live == 0 {
-                    formation_window_ms(lambda, cfg.max_hold_ms)
+                    cold_start_hold_ms(
+                        lambda,
+                        cfg.max_hold_ms,
+                        idle_dispatch,
+                        rx.len() + ingress_seen.load(Ordering::Relaxed),
+                    )
                 } else {
                     0.0
                 };
@@ -1079,6 +1104,7 @@ pub fn spawn(
         metrics: handle_metrics,
         preempt: preempt_flag,
         preempt_notify,
+        ingress,
     }
 }
 
@@ -4390,7 +4416,15 @@ mod tests {
             metrics: Arc::clone(&metrics),
             preempt: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             preempt_notify: Arc::new(tokio::sync::Notify::new()),
+            ingress: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
+
+        let (a, b) = (mux.ingress(), mux.ingress());
+        assert_eq!(mux.ingress.load(Ordering::Relaxed), 2);
+        drop(a);
+        assert_eq!(mux.ingress.load(Ordering::Relaxed), 1);
+        drop(b);
+        assert_eq!(mux.ingress.load(Ordering::Relaxed), 0);
 
         assert!(mux.submit(test_job()).is_ok());
         assert_eq!(metrics.queued_requests.load(Ordering::Relaxed), 1);

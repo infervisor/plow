@@ -250,6 +250,7 @@ pub async fn chat_completions(
             Some("model".into()),
         );
     };
+    let ingress = mux.ingress();
     // Tokenize HERE, on the handler task — the dispatcher loop is the
     // serialized decode critical path and must never encode a long prompt.
     let reasoning_open = opens_reasoning(&prompt);
@@ -264,7 +265,9 @@ pub async fn chat_completions(
         arrived: std::time::Instant::now(),
         respond: tx,
     };
-    if let Err(err) = mux.submit_arrived(job, t_arrive) {
+    let submitted = mux.submit_arrived(job, t_arrive);
+    drop(ingress);
+    if let Err(err) = submitted {
         return match err {
             crate::serve::mux::SubmitError::Full(_) => {
                 crate::serve::api_error(

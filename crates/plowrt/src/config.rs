@@ -92,6 +92,19 @@ pub struct RuntimeConfig {
     #[arg(long = "prefix-cache", env = "PLOW_PREFIX_CACHE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub prefix_cache: bool,
 
+    /// Skip the cold-start batch-formation hold when no other request is queued or tokenizing.
+    #[arg(long = "idle-dispatch", env = "PLOW_IDLE_DISPATCH", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub idle_dispatch: bool,
+
+    /// Tokenize prompts without computing offsets (same ids).
+    #[arg(long = "encode-fast", env = "PLOW_ENCODE_FAST", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub encode_fast: bool,
+
+    /// Tokenize long prompts in pieces on a pool of this many threads, for tokenizers whose
+    /// pre-tokenizer makes the pieces' ids identical to a whole-text encode; others stay serial.
+    #[arg(long = "encode-threads", env = "PLOW_ENCODE_THREADS", global = true)]
+    pub encode_threads: Option<u32>,
+
     /// Soft cap on prefix blocks and boundary snapshots as a fraction of the device's
     /// memory, 0..=1 — the unit vLLM's `--gpu-memory-utilization` uses, scoped here to
     /// the prefix cache. A fixed byte count is the wrong unit: 4 GiB is 5% of an H100
