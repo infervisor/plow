@@ -194,6 +194,14 @@ pub fn class_of(op: DevOp) -> RowClass {
         // own capability marker because a legal packet otherwise runs dense and ignores `t7`.
         IndexScore | IndexScorePf | IndexScoreKpool | IndexSelect | IndexSelectPf
         | IndexUnionPf | IndexTpPf | DsaPoolExpand | DsaPoolCompress => RowClass::C,
+        // DeepSeek-V4's CSA2 pair, C for the same derivation hazard the two groups above
+        // name. `CompressPool` takes ONE `out_base` for the whole packet and resolves a
+        // pool's source rows as `pool * ratio + r` off it; `RopeInverseO` takes one `pos0`
+        // and de-rotates row `t` by `pos0 + t`. Both are the scalar-base form, and both are
+        // wrong for every row outside the last span under packing. The `pos` tensor each
+        // gained supersedes the scalar, but it carries ONE step, not a per-row array, so it
+        // does not lift either op out of C.
+        CompressPool | RopeInverseO => RowClass::C,
 
         // Attention couples rows within one sequence. Packed request spans require per-span
         // execution until the op gains an explicit span descriptor.

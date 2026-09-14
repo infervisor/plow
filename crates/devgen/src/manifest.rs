@@ -1266,6 +1266,14 @@ fn backend_amd(
     if on("moe_prefill") {
         req.push("PLOW_MOE_PREFILL=1".into());
     }
+    // DeepSeek-V4 CSA2 (ops 180/181). Its own axis for the same reason PLOW_MOE_PREFILL has one:
+    // the compressor is a second pooling body with its own LDS staging, and only a V4 object can
+    // reach it. An object without the axis has no case for either op, so a CSA2 packet would fall
+    // through the interpreter's switch -- which is what `plow_dsv4_csa2_arm` lets the loader
+    // refuse instead.
+    if has("CompressPool") || has("RopeInverseO") {
+        req.push("PLOW_DSV4_CSA2=1".into());
+    }
     if on("a4w4") {
         req.push("PLOW_MOE_PF_A4W4=1".into());
     }

@@ -253,12 +253,18 @@ __device__ void d_compress_pool(bf16* __restrict__ out, const bf16* __restrict__
  * no cross-lane shuffle is needed, unlike d_headnorm_rope's lane-strided layout.
  *
  * `pos0` is the absolute position of token 0 of this call (decode passes the step position and
- * n_tok 1); query t de-rotates by `pos0 + t`. In place: `o` is both source and destination. */
+ * n_tok 1); query t de-rotates by `pos0 + t`. In place: `o` is both source and destination.
+ *
+ * `pos`, when non-null, SUPERSEDES `pos0` and is read as `pos[0]` — the same device-resident
+ * step counter `d_headnorm_rope` takes, and the same override `d_compress_pool` above takes.
+ * A decode packet cannot carry the step in an immediate (the packet stream is built once and
+ * replayed), so the tensor is the only form that works there; prefill passes `pos0` and null. */
 __device__ void d_rope_inverse_o(bf16* __restrict__ o, const float* __restrict__ cosb,
                                  const float* __restrict__ sinb, unsigned n_tok, unsigned n_head,
                                  unsigned D, unsigned rd, unsigned pos0, unsigned slice,
-                                 unsigned nblk) {
+                                 unsigned nblk, const int* __restrict__ pos = nullptr) {
     if (!rd) return;
+    if (pos != nullptr) pos0 = (unsigned)pos[0];
     const unsigned h2 = rd / 2, c0 = D - rd;
     const size_t rows = (size_t)n_tok * n_head;
     for (size_t r = (size_t)slice * PLOW_THREADS + threadIdx.x; r < rows * h2;

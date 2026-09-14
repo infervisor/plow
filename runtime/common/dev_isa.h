@@ -1418,6 +1418,26 @@ enum {
     PLOW_DOP_PACK_NCFW_ROWS_F32 = 177,
     PLOW_DOP_GROUPED_ATTENTION_F32 = 178,
     PLOW_DOP_EMBED_OVERLAY_BF16 = 179,
+    /* DeepSeek-V4 CSA2: the learned-pooling KV compressor (`op_compress.h` d_compress_pool,
+     * [DSV4-COMPRESS]). One workgroup per compressed entry, grid-strided over `n_pools`; the
+     * per-channel softmax pools `ratio` source rows into one cache row, RMSNorms it, applies
+     * RoPE, and quantizes. `i7 = rotate` selects the template arm: 0 = the fp8 path, 1 = the
+     * Hadamard-rotated fp4 path (the ROTATE=true instantiation, different clamp constants).
+     *   t0=out t1=kv t2=score t3=ape t4=gamma t5=cosb t6=sinb t7=pos(decode only, may be 0)
+     *   i0=n_pools i1=ratio i2=coff i3=d i4=rd i5=qblk i6=out_base i7=rotate   f0=eps
+     * `t7` non-null makes this a DECODE call: the kernel gates on
+     * `(pos[0] + 1) % ratio == 0` and derives the output slot from pos[0] rather than
+     * `out_base`, so a decode packet needs no per-step immediate patching. */
+    PLOW_DOP_COMPRESS_POOL = 180,
+    /* DeepSeek-V4 CSA2: the conjugate rotation on the attention output's last `rd` dims
+     * (`op_compress.h` d_rope_inverse_o, [DSV4-IROPE]). `o` mixes cached rows each rotated by
+     * its OWN position, so de-rotating by the QUERY's position leaves a position-independent
+     * latent the fixed `wo_a` can consume -- skipping it builds a plausible wrong model.
+     * Interleaved (GPT-J) pairs, NOT the half-split HeadNormRope defaults to. In place.
+     *   t0=o(in/out) t1=cosb t2=sinb t3=pos(may be 0)
+     *   i0=n_tok i1=n_head i2=D i3=rd i4=pos0
+     * `t3` supersedes `i4` when present, for the same reason op 180's does. */
+    PLOW_DOP_ROPE_INVERSE_O = 181,
 
     PLOW_DOP__COUNT
 };

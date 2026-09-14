@@ -377,6 +377,10 @@ pub(super) const PREFILL_ARM_MARKERS: &[(&str, &[&str])] = &[
     // ns packets at the nsplit=1 partial layout while the merge reads ns — refuse.
     ("PLOW_MLA_PF_NS", &["plow_mla_pf_ns_arm"]),
     ("PLOW_MOE_PF_A8", &["plow_moe_pf_a8_arm"]),
+    // DeepSeek-V4 CSA2 (ops 180/181). CONDITIONALLY compiled, like PLOW_MOE_PF_ATOMIC below: an
+    // object built without -DPLOW_DSV4_CSA2=1 has no case for either op, so the packet would fall
+    // through the interpreter's switch rather than compute anything. Refuse at load.
+    ("PLOW_DSV4_CSA2", &["plow_dsv4_csa2_arm"]),
     // Op 83's `i[5]` shared-expert tail (PLOW_GLM_MOE_SHARED_FOLD). Unconditional arm, so the
     // marker IS the test: no marker means the object predates the fold and would drop the
     // shared expert entirely. See `packet_prefill_arm_requirements`.

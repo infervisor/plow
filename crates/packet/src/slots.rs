@@ -297,6 +297,8 @@ const DOC: &[S] = &[
     S { op: DevOp::PackNcfwRowsF32, t: &["out", "x"], i: &["rows", "channels", "frames", "width", "batches"], f: &[], j: &[] },
     S { op: DevOp::GroupedAttentionF32, t: &["context", "query", "key", "value", "valid_rows?"], i: &["rows", "width", "head_width", "group_rows", "flags"], f: &[], j: &[] },
     S { op: DevOp::EmbedOverlayBf16, t: &["out", "table", "tokens", "overlay", "overlay_index"], i: &["rows", "width", "vocab", "overlay_rows"], f: &[], j: &[] },
+    S { op: DevOp::CompressPool, t: &["out", "kv", "score", "ape", "gamma", "cosb", "sinb", "pos"], i: &["n_pools", "ratio", "coff", "d", "rd", "qblk", "out_base", "rotate"], f: &["eps"], j: &[] },
+    S { op: DevOp::RopeInverseO, t: &["o", "cosb", "sinb", "pos"], i: &["n_tok", "n_head", "D", "rd", "pos0"], f: &[], j: &[] },
 ];
 
 /// Ops that say "As [`DevOp::X`]" / "twin of [`DevOp::X`]" / "Same operands as

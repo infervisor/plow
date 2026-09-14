@@ -549,6 +549,31 @@ nowhere else in the tree -- no kernel, no opcode, no test. It is a forward-path
 component, so end-to-end V4.1 needs it built: an n-gram hash, a gathered fp8
 embedding read, and the mix into the layer.
 
+**Engram is a CAPACITY problem, not a bandwidth one.** From the checkpoint:
+
+| field | value |
+|---|---|
+| `engram_layer_ids` | `[1, 14]` |
+| `engram_num_embeddings` | `[384 006 168, 384 016 682]` |
+| `engram_head_dim` | 256 |
+| `engram_n_heads` | 8 |
+| `engram_max_ngram_size` | 4 |
+| `engram_vocab_size` | 16 000 000 (compressed: 99 092) |
+
+384 M rows x 256 fp8 is **98.3 GB per layer, 196.6 GB for the two** -- about 41%
+of the 475.3 GiB checkpoint, which is what "the checkpoint's largest tensors by
+far" means concretely. It fits 8x192 GB comfortably (24.6 GB/rank sharded), but
+it is the single biggest term in the memory plan and nothing else in this doc
+has been accounting for it.
+
+The TRAFFIC is negligible and does not move section 9's roofline. A token reads
+`n_heads` rows of `head_dim` fp8 = 2 KB; at 8k tokens over two layers that is
+33.5 MB of gathers total, and sharded by head each rank touches an eighth of it.
+The reads are random into a 98 GB table, so they will not prefetch -- but 4 MB
+of scattered reads per rank is not a millisecond-scale term against 377.9 GB of
+HBM traffic. Build it for correctness and for the capacity budget; do not expect
+it to show up in the prefill time.
+
 And the emit side is untouched. `crates/devgen/src/lib.rs` routes `glm5_next`,
 `glm_moe_dsa`, `kimi_k3`, and `kimi_k2`/`deepseek_v2`/`deepseek_v3`; there is no
 `deepseek_v4` or `deepseek_v41` arm, and the DeepSeek arm wires only `--block`

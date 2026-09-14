@@ -475,6 +475,16 @@ pub fn classify(op: DevOp) -> OpClass {
             cls_c("t5=pos read at index 0; boundary from pos[0] / pool_size")
         }
         DevOp::DsaPoolExpand => cls_c("t2=kv_len SCALAR; q_pos0 = kv_len[0] - rows"),
+
+        // ---- CSA2 (DeepSeek-V4) -----------------------------------------
+        DevOp::CompressPool => note(
+            cls_c("i6=out_base for the whole packet; source rows are pool * i1 + r off it"),
+            "t7=pos makes it a decode call: the slot comes from pos[0] / i1 and the gate from              (pos[0] + 1) % i1, so the scalar base is unused there -- but pos carries ONE step,              not a per-row array, so the class does not lift",
+        ),
+        DevOp::RopeInverseO => note(
+            cls_c("i4=pos0 for the whole packet; row t de-rotates by pos0 + t"),
+            "t3=pos supersedes i4 and is read at index 0 only; same single-step limit as              CompressPool, and the same hazard HeadNormRope's out_row0 form has",
+        ),
         // One ring per launch, shape [pool_size, head_dim], no request axis.
         DevOp::DsaPoolStash => d("t0/t1 ring [pool_size, head_dim], no batch axis"),
 

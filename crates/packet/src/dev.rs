@@ -1982,6 +1982,30 @@ pub enum DevOp {
     /// t3=overlay(f32[overlay_rows,width]) t4=overlay_index(u32[rows])` ·
     /// `i0=rows i1=width i2=vocab i3=overlay_rows`.
     EmbedOverlayBf16 = 179,
+    /// DeepSeek-V4 CSA2's learned-pooling KV compressor (`op_compress.h`
+    /// `d_compress_pool`, `[DSV4-COMPRESS]`). One workgroup per compressed entry,
+    /// grid-strided over `n_pools`: a per-channel softmax pools `ratio` source rows
+    /// into one cache row, RMSNorms it, applies RoPE and quantizes.
+    /// `t0=out t1=kv t2=score t3=ape t4=gamma t5=cosb t6=sinb t7=pos` ·
+    /// `i0=n_pools i1=ratio i2=coff i3=d i4=rd i5=qblk i6=out_base i7=rotate` ·
+    /// `f0=eps`.
+    ///
+    /// `i7 = rotate` picks the template arm: 0 is the fp8 path, 1 the
+    /// Hadamard-rotated fp4 path (different clamp constants, not a tuning flag).
+    /// A non-null `t7` makes it a DECODE call — the kernel gates on
+    /// `(pos[0] + 1) % ratio == 0` and takes the output slot from `pos[0]` instead
+    /// of `i6`, so the decode packet needs no per-step immediate patching.
+    CompressPool = 180,
+    /// DeepSeek-V4 CSA2's conjugate rotation on the attention output's last `rd`
+    /// dims (`op_compress.h` `d_rope_inverse_o`, `[DSV4-IROPE]`). In place.
+    /// `t0=o(in/out) t1=cosb t2=sinb t3=pos` · `i0=n_tok i1=n_head i2=D i3=rd i4=pos0`.
+    ///
+    /// STRUCTURAL, not cosmetic: `o` mixes cached rows each rotated by its OWN
+    /// position, so de-rotating by the QUERY's position is what leaves a
+    /// position-independent latent for the fixed `wo_a`. Interleaved (GPT-J) pairs,
+    /// NOT the half-split [`DevOp::HeadNormRope`] defaults to. `t3` supersedes `i4`
+    /// when present, for the same reason [`DevOp::CompressPool`]'s does.
+    RopeInverseO = 181,
 }
 
 /// GLU-family `act` code for GPT-OSS's `swiglu_oai` (pair form, `f0 = alpha`, `f1 = limit`).
@@ -2177,6 +2201,8 @@ impl DevOp {
         DevOp::PackNcfwRowsF32,
         DevOp::GroupedAttentionF32,
         DevOp::EmbedOverlayBf16,
+        DevOp::CompressPool,
+        DevOp::RopeInverseO,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -2377,6 +2403,8 @@ impl DevOp {
             DevOp::PackNcfwRowsF32 => "PLOW_DOP_PACK_NCFW_ROWS_F32",
             DevOp::GroupedAttentionF32 => "PLOW_DOP_GROUPED_ATTENTION_F32",
             DevOp::EmbedOverlayBf16 => "PLOW_DOP_EMBED_OVERLAY_BF16",
+            DevOp::CompressPool => "PLOW_DOP_COMPRESS_POOL",
+            DevOp::RopeInverseO => "PLOW_DOP_ROPE_INVERSE_O",
         }
     }
 
@@ -2423,8 +2451,11 @@ impl DevOp {
     /// 161 -> 163 for affine Q4 matrix operations. The speech/vision ops were numbered from
     /// 156 on main; merging them after the gfx942 ops at 156-160 moved every one up by 5.
     /// 178 -> 179 for backend-neutral grouped FP32 attention.
+    /// 180 -> 182 for `CompressPool = 180` / `RopeInverseO = 181` (DeepSeek-V4 CSA2). Both
+    /// kernels and their gfx942 tests predate the opcodes by some time: they were reachable
+    /// only from the tests, so no packet could run them.
     /// 179 -> 180 for backend-neutral multimodal embedding overlay.
-    pub const COUNT: u16 = 180;
+    pub const COUNT: u16 = 182;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///

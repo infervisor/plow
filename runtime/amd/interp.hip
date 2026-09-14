@@ -242,6 +242,13 @@ extern "C" __device__ unsigned plow_phase_xreduce_wave64_occ2_nospill_1 = 1;
 #include "op_qwen_gdn.h"
 #endif
 #include "op_moe.h"
+#if PLOW_DSV4_CSA2
+#include "op_compress.h"
+/* CONDITIONALLY compiled, like PLOW_MOE_PF_ATOMIC's marker and unlike the unconditional
+ * part16/a8 ones: an object built without the axis has no case for ops 180/181 at all, so a
+ * CSA2 packet would fall through the switch. The loader refuses on the missing symbol instead. */
+extern "C" __device__ unsigned plow_dsv4_csa2_arm = 1;
+#endif
 #if PLOW_TOKEN_BATCH
 /* Placed here, not at the axis definition: PLOW_FP8 and friends are resolved by the op headers
  * above, and `#if UNDEFINED` is 0 — a guard written before they exist reads as satisfied and
@@ -747,6 +754,12 @@ extern "C" __device__ unsigned plow_prefill_nrn_consumer_1 = 1;
  * already at the 256/occ-2 cliff. Off => every existing object is byte-identical. */
 #ifndef PLOW_MOE_PREFILL
 #define PLOW_MOE_PREFILL 0
+#endif
+/* DeepSeek-V4 CSA2 (ops 180/181). Own flag for the same reason PLOW_MOE_PREFILL has one: the
+ * compressor is a second pooling body with its own LDS staging, and nothing but a V4 object can
+ * reach it. Off => every existing object is byte-identical. */
+#ifndef PLOW_DSV4_CSA2
+#define PLOW_DSV4_CSA2 0
 #endif
 #ifndef PLOW_GLOBAL_QUEUE
 #define PLOW_GLOBAL_QUEUE 0
@@ -3835,6 +3848,32 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
             break;
 #endif /* PLOW_HAS_MLA_OUT_GATE */
 #endif /* PLOW_K3 */
+#if PLOW_DSV4_CSA2
+        /* CSA2 (DeepSeek-V4). i7 = rotate picks the template arm: 0 the fp8 path, 1 the
+         * Hadamard-rotated fp4 path -- different clamp constants, not a tuning flag, so it is a
+         * uniform branch over two instantiations and not a runtime predicate inside one. t7=pos
+         * non-null is the DECODE form, which gates on (pos[0] + 1) % ratio and takes its output
+         * slot from pos[0]; prefill passes null and i6=out_base. */
+        case PLOW_DOP_COMPRESS_POOL:
+            if (in->i[7])
+                d_compress_pool<true>(
+                    (bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2), (const float*)TEN(3),
+                    (const bf16*)TEN(4), (const float*)TEN(5), (const float*)TEN(6), in->i[0],
+                    in->i[1], in->i[2], in->i[3], in->i[4], in->i[5], in->fj[0].f, in->i[6], slice,
+                    nblk, (float*)sm->raw, sm->part, (const int*)TEN(7));
+            else
+                d_compress_pool<false>(
+                    (bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2), (const float*)TEN(3),
+                    (const bf16*)TEN(4), (const float*)TEN(5), (const float*)TEN(6), in->i[0],
+                    in->i[1], in->i[2], in->i[3], in->i[4], in->i[5], in->fj[0].f, in->i[6], slice,
+                    nblk, (float*)sm->raw, sm->part, (const int*)TEN(7));
+            break;
+        case PLOW_DOP_ROPE_INVERSE_O:
+            d_rope_inverse_o((bf16*)TEN(0), (const float*)TEN(1), (const float*)TEN(2), in->i[0],
+                             in->i[1], in->i[2], in->i[3], in->i[4], slice, nblk,
+                             (const int*)TEN(3));
+            break;
+#endif /* PLOW_DSV4_CSA2 */
         /* Greedy sampling on device. In BOTH buckets: prefill samples the first token, decode
          * every one after it, and the id lands in `in.ids` where the next EMBED reads it. */
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_ARGMAX
