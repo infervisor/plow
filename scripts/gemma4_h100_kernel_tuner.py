@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Select exact-profile Gemma-4 H100 kernels with a correctness-first GPU search.
+"""Select exact-profile Gemma-4 CUDA or AMD kernels with a correctness-first GPU search.
 
 The tuner consumes a packet audit through ``gemma4_ladder_campaign.py`` and a
 JSON specification containing profile selectors and benchmark variants. Every
@@ -72,6 +72,15 @@ The spec reuses the ladder campaign inventory and command placeholders:
         }]
       }
     }
+
+For ``gfx*`` targets, ``compiled_profile`` replaces CUDA-specific launch
+fields with ``waves``, ``vgprs``, ``agprs``, ``lds_bytes``,
+``isa_scratch_instructions``, ``private_segment_bytes``, ``compute_units``,
+``launch_workgroups``, ``workgroups_per_cu``, and ``waves_per_simd``. The
+tuner normalizes both schemas before applying its shared no-spill promotion
+gate. Variants may bind source checks through ``source_contract`` and exact
+profiler ceilings through ``anti_pattern_limits``; each named counter must be
+returned by the benchmark command.
 """
 
 import argparse
@@ -103,6 +112,13 @@ TRIALS = 4
 VERIFY_SEEDS = (0, 1, 2, 3, 4)
 SHA256 = re.compile(r"[0-9a-f]{64}")
 EXECUTION_MODES = {"direct", "persistent", "split"}
+ANTI_PATTERN_COUNTERS = {
+    "inner_loop_divergent_branches",
+    "uncoalesced_global_transactions",
+    "shared_bank_conflicts",
+    "barrier_stall_cycles",
+    "global_atomics",
+}
 RESOURCE_FIELDS = (
     "object_sha256",
     "kernel_symbol",
@@ -123,6 +139,27 @@ RESOURCE_FIELDS = (
     "launch_blocks",
     "blocks_per_sm",
     "cluster",
+)
+AMD_RESOURCE_FIELDS = (
+    "object_sha256",
+    "kernel_symbol",
+    "threads",
+    "waves",
+    "vgprs",
+    "agprs",
+    "lds_bytes",
+    "tile",
+    "stages",
+    "swizzle",
+    "isa_scratch_instructions",
+    "private_segment_bytes",
+    "spill_store_bytes",
+    "spill_load_bytes",
+    "segment_mode",
+    "compute_units",
+    "launch_workgroups",
+    "workgroups_per_cu",
+    "waves_per_simd",
 )
 
 
@@ -152,7 +189,42 @@ def file_sha256(path):
     return digest.hexdigest()
 
 
-def validate_resource(resource):
+def _is_amd(arch):
+    return str(arch).startswith("gfx")
+
+
+def _normalize_amd_resource(resource):
+    if not isinstance(resource, dict) or any(name not in resource for name in AMD_RESOURCE_FIELDS):
+        raise TunerError(f"AMD compiled_profile requires {', '.join(AMD_RESOURCE_FIELDS)}")
+    for name in (
+        "threads", "waves", "stages", "compute_units", "launch_workgroups",
+        "workgroups_per_cu", "waves_per_simd",
+    ):
+        if type(resource[name]) is not int or resource[name] <= 0:
+            raise TunerError(f"AMD compiled_profile has invalid {name}")
+    for name in (
+        "vgprs", "agprs", "lds_bytes", "isa_scratch_instructions",
+        "private_segment_bytes", "spill_store_bytes", "spill_load_bytes",
+    ):
+        if type(resource[name]) is not int or resource[name] < 0:
+            raise TunerError(f"AMD compiled_profile has invalid {name}")
+    return {
+        **resource,
+        "warps": resource["waves"],
+        "registers": resource["vgprs"] + resource["agprs"],
+        "smem_bytes": resource["lds_bytes"],
+        "tma": False,
+        "spills": resource["isa_scratch_instructions"],
+        "stack_bytes": resource["private_segment_bytes"],
+        "sm_count": resource["compute_units"],
+        "launch_blocks": resource["launch_workgroups"],
+        "blocks_per_sm": resource["workgroups_per_cu"],
+        "cluster": [1, 1, 1],
+    }
+
+
+def validate_resource(resource, arch="sm90a"):
+    resource = _normalize_amd_resource(resource) if _is_amd(arch) else resource
     if not isinstance(resource, dict) or any(name not in resource for name in RESOURCE_FIELDS):
         raise TunerError(f"compiled_profile requires {', '.join(RESOURCE_FIELDS)}")
     if not SHA256.fullmatch(str(resource["object_sha256"])):
@@ -163,8 +235,11 @@ def validate_resource(resource):
     ):
         if type(resource[name]) is not int or resource[name] <= 0:
             raise TunerError(f"compiled_profile has invalid {name}")
-    if resource["threads"] % 32 or resource["warps"] != resource["threads"] // 32:
-        raise TunerError("compiled_profile warps must match the SM90 thread count")
+    wave_size = 64 if _is_amd(arch) else 32
+    if resource["threads"] % wave_size or resource["warps"] != resource["threads"] // wave_size:
+        raise TunerError(
+            f"compiled_profile warps/waves must match the {wave_size}-lane thread count"
+        )
     for name in (
         "smem_bytes", "spills", "stack_bytes", "spill_store_bytes",
         "spill_load_bytes",
@@ -183,15 +258,23 @@ def validate_resource(resource):
         or any(type(value) is not int or value <= 0 for value in resource["cluster"])
     ):
         raise TunerError("compiled_profile cluster must contain three positive integers")
-    if resource["smem_bytes"] > 227328:
-        raise TunerError("compiled_profile exceeds the H100 dynamic shared-memory limit")
-    if resource["smem_bytes"] * resource["blocks_per_sm"] > 227328:
-        raise TunerError("compiled_profile occupancy exceeds H100 shared memory per SM")
-    if (
-        resource["registers"] * resource["threads"] * resource["blocks_per_sm"]
-        > 65536
-    ):
-        raise TunerError("compiled_profile occupancy exceeds the H100 register file")
+    if _is_amd(arch):
+        if resource["smem_bytes"] > 65536:
+            raise TunerError("compiled_profile exceeds the CDNA LDS limit")
+        if resource["registers"] > 512:
+            raise TunerError("compiled_profile exceeds the CDNA VGPR+AGPR limit")
+        if resource["waves_per_simd"] <= 0:
+            raise TunerError("compiled_profile has invalid AMD waves_per_simd")
+    else:
+        if resource["smem_bytes"] > 227328:
+            raise TunerError("compiled_profile exceeds the H100 dynamic shared-memory limit")
+        if resource["smem_bytes"] * resource["blocks_per_sm"] > 227328:
+            raise TunerError("compiled_profile occupancy exceeds H100 shared memory per SM")
+        if (
+            resource["registers"] * resource["threads"] * resource["blocks_per_sm"]
+            > 65536
+        ):
+            raise TunerError("compiled_profile occupancy exceeds the H100 register file")
     cluster_blocks = math.prod(resource["cluster"])
     if resource["launch_blocks"] % cluster_blocks:
         raise TunerError("compiled_profile launch grid is not divisible by its cluster")
@@ -199,6 +282,7 @@ def validate_resource(resource):
         raise TunerError("compiled_profile has invalid TMA/swizzle identity")
     if resource["segment_mode"] not in EXECUTION_MODES:
         raise TunerError("compiled_profile segment_mode must be direct, persistent, or split")
+    return resource
 
 
 def _resolve_file(path, cwd, label):
@@ -211,7 +295,7 @@ def _resolve_file(path, cwd, label):
     return resolved
 
 
-def validate_variant(variant, cwd):
+def validate_variant(variant, cwd, arch="sm90a"):
     required = ("name", "reference", "binary", "verify_command", "benchmark_command", "compiled_profile")
     if any(name not in variant for name in required):
         raise TunerError(f"variant requires {', '.join(required)}")
@@ -237,7 +321,29 @@ def validate_variant(variant, cwd):
             raise TunerError(
                 f"{variant['name']}: expected_counter_changes must map counters to increase/decrease"
             )
-    validate_resource(variant["compiled_profile"])
+    compiled_profile = validate_resource(variant["compiled_profile"], arch)
+    variant = {**variant, "compiled_profile": compiled_profile}
+    source_contract = variant.get("source_contract")
+    if source_contract is not None:
+        if not isinstance(source_contract, dict):
+            raise TunerError(f"{variant['name']}: source_contract must be an object")
+        if source_contract.get("device_printf_calls") != 0:
+            raise TunerError(f"{variant['name']}: production device printf is forbidden")
+        if source_contract.get("pointer_aliasing") not in ("restrict", "intentional-alias"):
+            raise TunerError(
+                f"{variant['name']}: pointer_aliasing must be restrict or intentional-alias"
+            )
+    anti_pattern_limits = variant.get("anti_pattern_limits", {})
+    if not isinstance(anti_pattern_limits, dict) or any(
+        name not in ANTI_PATTERN_COUNTERS
+        or type(limit) not in (int, float)
+        or not math.isfinite(limit)
+        or limit < 0
+        for name, limit in anti_pattern_limits.items()
+    ):
+        raise TunerError(
+            f"{variant['name']}: anti_pattern_limits has an unknown or invalid counter"
+        )
     binary = _resolve_file(variant["binary"], cwd, f"{variant['name']} binary")
     object_path = variant.get("object")
     if object_path is not None:
@@ -298,7 +404,7 @@ def variants_for_profile(spec, profile, cwd):
     ]
     if not selected:
         raise TunerError(f"{profile['profile_key']}: no variant matches the exact profile")
-    variants = [validate_variant(variant, cwd) for variant in selected]
+    variants = [validate_variant(variant, cwd, spec.get("arch", "sm90a")) for variant in selected]
     names = [variant["name"] for variant in variants]
     if len(names) != len(set(names)):
         raise TunerError(f"{profile['profile_key']}: duplicate variant names")
@@ -452,6 +558,13 @@ def validate_benchmark(record, profile, variant, trial, arm, label):
         for name, value in counters.items()
     ):
         raise TunerError(f"{label}: counters must be nonnegative finite numbers")
+    for name, limit in variant.get("anti_pattern_limits", {}).items():
+        if name not in counters:
+            raise TunerError(f"{label}: missing anti-pattern counter {name}")
+        if counters[name] > limit:
+            raise TunerError(
+                f"{label}: anti-pattern counter {name}={counters[name]} exceeds {limit}"
+            )
     if record.get("warmups") != WARMUPS or record.get("iterations") != ITERATIONS:
         raise TunerError(f"{label}: benchmark protocol must be {WARMUPS}/{ITERATIONS}")
     samples = record.get("samples_us")

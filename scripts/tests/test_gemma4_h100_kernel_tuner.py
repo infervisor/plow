@@ -37,7 +37,118 @@ def resource(mode):
     }
 
 
+def amd_resource(mode):
+    return {
+        "object_sha256": "b" * 64,
+        "kernel_symbol": f"kernel_{mode}",
+        "threads": 256,
+        "waves": 4,
+        "vgprs": 256,
+        "agprs": 128,
+        "lds_bytes": 64544,
+        "tile": [128, 128, 64],
+        "stages": 2,
+        "swizzle": "xor32",
+        "isa_scratch_instructions": 0,
+        "private_segment_bytes": 0,
+        "spill_store_bytes": 0,
+        "spill_load_bytes": 0,
+        "segment_mode": mode,
+        "compute_units": 304,
+        "launch_workgroups": 304,
+        "workgroups_per_cu": 1,
+        "waves_per_simd": 1,
+    }
+
+
 class Gemma4H100KernelTunerTests(unittest.TestCase):
+    def test_source_and_profile_anti_pattern_contracts_are_enforced(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            binary = Path(directory) / "bench"
+            binary.write_text("#!/bin/sh\nexit 0\n")
+            binary.chmod(binary.stat().st_mode | stat.S_IXUSR)
+            variant = tuner.validate_variant(
+                {
+                    "name": "control",
+                    "reference": True,
+                    "binary": str(binary),
+                    "verify_command": ["{binary}"],
+                    "benchmark_command": ["{binary}"],
+                    "compiled_profile": resource("direct"),
+                    "source_contract": {
+                        "device_printf_calls": 0,
+                        "pointer_aliasing": "restrict",
+                    },
+                    "anti_pattern_limits": {
+                        "inner_loop_divergent_branches": 0,
+                        "shared_bank_conflicts": 4,
+                    },
+                },
+                directory,
+            )
+            profile = {"profile_key": "cell"}
+            record = {
+                "profile_key": "cell",
+                "variant": "control",
+                "compiled_profile": variant["compiled_profile"],
+                "trial": 0,
+                "arm": "control_before",
+                "isolated": True,
+                "correct": True,
+                "cache_state": "hot",
+                "telemetry": {
+                    "sm_clock_mhz": 1800,
+                    "memory_clock_mhz": 2600,
+                    "power_w": 500,
+                },
+                "counters": {
+                    "inner_loop_divergent_branches": 0,
+                    "shared_bank_conflicts": 5,
+                },
+                "warmups": 10,
+                "iterations": 50,
+                "samples_us": [1.0] * 50,
+            }
+            with self.assertRaisesRegex(tuner.TunerError, "shared_bank_conflicts"):
+                tuner.validate_benchmark(
+                    record, profile, variant, 0, "control_before", "cell/control"
+                )
+
+            bad = {**variant, "source_contract": {
+                "device_printf_calls": 1,
+                "pointer_aliasing": "restrict",
+            }}
+            with self.assertRaisesRegex(tuner.TunerError, "device printf"):
+                tuner.validate_variant(bad, directory)
+
+    def test_amd_resource_identity_uses_wave64_and_isa_scratch(self):
+        compiled = tuner.validate_resource(amd_resource("persistent"), "gfx942")
+        self.assertEqual(compiled["warps"], 4)
+        self.assertEqual(compiled["registers"], 384)
+        self.assertEqual(compiled["smem_bytes"], 64544)
+        self.assertEqual(compiled["spills"], 0)
+        self.assertFalse(compiled["tma"])
+
+        bad = amd_resource("persistent")
+        bad["isa_scratch_instructions"] = 1
+        self.assertEqual(tuner.validate_resource(bad, "gfx942")["spills"], 1)
+
+    def test_amd_resource_rejects_cuda_warp_geometry_and_cdna_cliffs(self):
+        bad = amd_resource("persistent")
+        bad["waves"] = 8
+        with self.assertRaisesRegex(tuner.TunerError, "64-lane"):
+            tuner.validate_resource(bad, "gfx942")
+
+        bad = amd_resource("persistent")
+        bad["lds_bytes"] = 65537
+        with self.assertRaisesRegex(tuner.TunerError, "CDNA LDS"):
+            tuner.validate_resource(bad, "gfx942")
+
+        bad = amd_resource("persistent")
+        bad["vgprs"] = 385
+        with self.assertRaisesRegex(tuner.TunerError, r"VGPR\+AGPR"):
+            tuner.validate_resource(bad, "gfx942")
+
     def test_correctness_finishes_before_rotated_isolated_trials(self):
         with tempfile.TemporaryDirectory(dir="/tmp") as directory:
             root = Path(directory)
