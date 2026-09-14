@@ -1287,6 +1287,14 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-mla-pf-row-split-native-lo", env = "PLOW_MLA_PF_ROW_SPLIT_NATIVE_LO", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub mla_pf_row_split_native_lo: bool,
 
+    /// DIAGNOSTIC. Zero the whole sparse-MLA workspace before every row-band dispatch, so the
+    /// dispatch sees the device state a freshly loaded server would give it. Bisects the
+    /// row-band wrong-answer defect: that defect is armed by any ordinary program-3 execution in
+    /// the 8192 bucket, and this workspace is the only device memory both paths share that no
+    /// per-sequence clear covers. Hundreds of MB of H2D per dispatch — never leave it on.
+    #[arg(long = "amd-glm-rowband-clear-ws", env = "PLOW_GLM_ROWBAND_CLEAR_WS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub glm_rowband_clear_ws: bool,
+
     /// Run native GLM MoE prefill rows >= 1024 on AITER's 64-row persistent tile
     /// (`..._psx_64x256.co`), the object its GLM-5 gfx942 tuning selects there.
     /// Unset = on when the object dir carries the pinned object and a tile64-marked

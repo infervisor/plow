@@ -1356,6 +1356,45 @@ removes the APERTURE_VIOLATION and leaves the answer garbage), still determinist
 first chunk at `c0 = 0` already wrong, and still unrelated to the band decomposition, the band seam,
 prefix attach or prefix sharing — all falsified earlier and not retried.
 
+## The row-band threshold was bucket admission, and any program-3 chunk in the 8192 bucket poisons (2026-09-14, job `rbfault15-bucket`)
+
+The section above left two readings open and named the fact that separates them: which program and
+bucket the harmless 2048-token request actually took. `PLOW_PREFILL_SEG_TIMING=1` prints it, and the
+answer was already visible offline in the packet's own `build.json`, where
+`shapes/prefill_buckets = [128, 512, 2048, 8192]`. `rbfault14`'s three harmless first requests —
+128, 512 and 2048 — are EXACTLY the three smaller prefill rungs.
+
+| first request | chunk shape it ran | then 8192 |
+|---|---|---|
+| 2048 | `program=2 bucket=2048 c0=0 clen=2048` | 3/3 pass |
+| 3072 | (the 8192 bucket, by admission) | **0/3 FAIL** |
+| 4096 | `program=3 bucket=8192 c0=0 clen=4096` | **0/3 FAIL** |
+
+**So there is no volume threshold.** A 2048-token prompt is harmless because it takes its own rung
+and never enters the 8192 bucket at all; 3072 is the first length that does, and it poisons. The
+rule is now flat and has no size term in it:
+
+> Any ordinary (program 3) execution in the 8192 bucket poisons every later row-band chunk on that
+> server, however short its `clen`, and it stays poisoned.
+
+**This kills the stale-tail reading** that the apparent threshold had kept alive. What program 3
+leaves behind is a specific value — a count, a header, a pointer — not an unwritten tail that a
+large enough first request happens to cover. It also closes the last confound in the chain:
+`rbfault13`'s "the program decides" was right, and `rbfault14`'s apparent counter-example was an
+artefact of picking three lengths that are all rung boundaries.
+
+**Next, and it needs a build rather than another probe.** The sparse-MLA workspace (`q`, `kv`,
+`part`, `lse`, `qp`, `kp`, `last`, `splits`, and the lower-half CSR) is allocated in
+`SparseMla::load`, not in the packet's tensor table, so no per-sequence state clear covers it — it
+is the only device memory the two paths share on that footing. `PLOW_GLM_ROWBAND_CLEAR_WS=1`
+(diagnostic, off by default) zeroes all of it and forgets the CSR's staged key before every
+row-band dispatch, so the dispatch sees the device state a freshly loaded server would give it.
+Queued as `rbfault16-clearws` with both controls: knob off on the poisoned sequence must fail, and
+knob on with no preceding request must pass, or the middle arm says nothing. A pass in the middle
+arm puts the carrier inside that allocation and the next step is bisecting its regions; a fail
+exonerates the whole allocation in one run and moves the search to interpreter activations, the KV
+cache, or the peer reduction slots.
+
 ## The tile-campaign blocker resolves into three classes with three different owners (2026-09-14, job `gemmtune-glm53`, follow-up)
 
 The section above records 374 FAIL lines over 44 objects and stops at "it wants an owner". Building

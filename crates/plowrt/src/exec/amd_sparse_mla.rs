@@ -1105,6 +1105,13 @@ struct LoCsr {
 }
 
 impl LoCsr {
+    /// Drop the staged `(prior, rows)` so the next [`Self::stage`] re-uploads unconditionally.
+    fn forget(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.prior.store(u32::MAX, Relaxed);
+        self.rows.store(u32::MAX, Relaxed);
+    }
+
     /// Upload the identity CSR of `rows` rows after `prior` unless it is already staged.
     fn stage(&self, be: &HsaBackend, prior: u32, rows: u32) -> Result<()> {
         use std::sync::atomic::Ordering::Relaxed;
@@ -1404,6 +1411,41 @@ impl SparseMla {
         })
     }
 
+    /// DIAGNOSTIC (`PLOW_GLM_ROWBAND_CLEAR_WS`). Zero every byte of the sparse workspace and the
+    /// lower-half CSR, and forget the CSR's staged key, so a row-band dispatch sees exactly the
+    /// device state a freshly loaded server would give it.
+    ///
+    /// It exists to decide ONE question. The row-band wrong-answer defect is triggered by any
+    /// ordinary (program 3) execution in the 8192 bucket: run one first on a fresh server and
+    /// every later row-band chunk is wrong, permanently; run the row-band program first and
+    /// everything after is right (`rbfault13`/`14`/`15`). This workspace is the only device
+    /// memory the two paths share that no per-sequence state clear covers -- it is allocated in
+    /// [`SparseMla::load`], not in the packet's tensor table. If clearing it here makes the
+    /// poisoned sequence correct, the carrier is in this allocation and the next step is to
+    /// bisect its regions; if it does not, the whole allocation is exonerated in one run and the
+    /// carrier is elsewhere (interpreter activations, KV, or the peer slots).
+    ///
+    /// Deliberately slow and deliberately off by default: a full zero of a workspace sized for
+    /// the packet's max rows is hundreds of MB of H2D per dispatch.
+    fn clear_workspace(&self, be: &HsaBackend) -> Result<()> {
+        const CHUNK: usize = 4 << 20;
+        let zeros = vec![0u8; CHUNK];
+        // Launches still queued would otherwise race the clear.
+        be.synchronize()?;
+        for mem in std::iter::once(&self._scratch).chain(self.lo.as_ref().map(|l| &l.mem)) {
+            let mut off = 0u64;
+            while off < mem.len {
+                let n = CHUNK.min((mem.len - off) as usize);
+                EngineDevice::upload(be, mem, off, &zeros[..n])?;
+                off += n as u64;
+            }
+        }
+        if let Some(lo) = self.lo.as_ref() {
+            lo.forget();
+        }
+        Ok(())
+    }
+
     pub fn enqueue(&self, be: &HsaBackend, route: Route, tensor_table: &[u8], rank: u32) -> Result<usize> {
         let one = SpanWindow {
             row0: 0,
@@ -1642,6 +1684,9 @@ impl SparseMla {
         let attention16 = self.attention16.ok_or_else(|| {
             RuntimeError::Device("row-split sparse AITER MLA object was not loaded".into())
         })?;
+        if crate::config::RuntimeConfig::get().amd.glm_rowband_clear_ws {
+            self.clear_workspace(be)?;
+        }
         if !rowsplit_scratch_fits(self.rows_cap, u64::from(w.rows)) {
             return Err(RuntimeError::Device(format!(
                 "row-split sparse MLA: {} rows inflated 8x exceeds the workspace's {} row \
