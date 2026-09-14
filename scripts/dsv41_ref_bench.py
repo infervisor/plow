@@ -56,13 +56,19 @@ def _use_system_toolchain() -> None:
 
     # TVM binds create_shared.get_target_triple ONCE, at `import tvm.contrib.cc`,
     # from os.environ["CXX"] -- so this has to be set before tilelang is
-    # imported, not later. An unset or broken CXX leaves the triple empty and
+    # imported, not later. A CXX that cannot run leaves the triple empty and
     # every export_library dies on
     #     AssertionError: Target triple should not be empty
-    # which surfaces only after the kernel has compiled. /usr/bin/g++ answers
-    # -dumpmachine with x86_64-linux-gnu and matches the system glibc above.
-    if os.path.exists("/usr/bin/g++"):
-        os.environ.setdefault("CXX", "/usr/bin/g++")
+    # which surfaces only after the kernel has already compiled.
+    #
+    # OVERRIDE, do not setdefault: `nix develop` exports CXX=g++ / CC=gcc as
+    # bare names, which resolve through the nix PATH to compilers built against
+    # the nix glibc this function just removed, so they fail -dumpmachine and
+    # yield an empty triple. Absolute system paths match the glibc selected
+    # above; /usr/bin/g++ answers x86_64-linux-gnu.
+    for var, exe in (("CXX", "/usr/bin/g++"), ("CC", "/usr/bin/gcc")):
+        if os.path.exists(exe):
+            os.environ[var] = exe
 
 
 # Must run BEFORE `model` pulls in tilelang -> tvm, which freezes both the
