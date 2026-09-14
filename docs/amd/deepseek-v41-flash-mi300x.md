@@ -574,21 +574,55 @@ of scattered reads per rank is not a millisecond-scale term against 377.9 GB of
 HBM traffic. Build it for correctness and for the capacity budget; do not expect
 it to show up in the prefill time.
 
-And the emit side is untouched. `crates/devgen/src/lib.rs` routes `glm5_next`,
-`glm_moe_dsa`, `kimi_k3`, and `kimi_k2`/`deepseek_v2`/`deepseek_v3`; there is no
-`deepseek_v4` or `deepseek_v41` arm, and the DeepSeek arm wires only `--block`
-(a full-model emit panics). devgen can emit the DSA indexer chain today (via
-GLM's DSA path) but has no mHC emit and no CSA2 emit at all. Stage 1a/1b live in
-`nn-graph`, which section 10 already established is NOT the serving path.
+On the emit side there is no `deepseek_v4` or `deepseek_v41` arm in
+`crates/devgen/src/lib.rs` -- it routes `glm5_next`, `glm_moe_dsa`, `kimi_k3`
+and `kimi_k2`/`deepseek_v2`/`deepseek_v3`, and the DeepSeek arm wires only
+`--block` (a full-model emit panics). Stage 1a/1b live in `nn-graph`, which
+section 10 already established is NOT the serving path.
+
+**But mHC is a drop-in, not new work, and that was worth checking rather than
+assuming.** `glm53_emit_full` (`mla.rs`, reached from the `glm5_next` route)
+already emits full prefill buckets AND decode rungs with hyper-connections --
+the `glm_main` analogue item 5 below asks for. Its `emit_glm53_hc_pre` /
+`_hc_post` emit ops 128/129 with the constants already at V4.1's values, and
+`declare_glm53` names the weights with V4.1's own checkpoint spellings.
+Checked against the shards:
+
+| devgen declares | V4.1 checkpoint | shape | agrees |
+|---|---|---|---|
+| `hc_attn_fn` (`MIX * N * width`) | `layers.N.hc_attn_fn` | `[24, 20480]` | MIX=24, N=4, width=5120 |
+| `hc_attn_base` (`MIX`) | `layers.N.hc_attn_base` | `[24]` | yes |
+| `hc_attn_scale` (`3`) | `layers.N.hc_attn_scale` | `[3]` | yes |
+| `hc_ffn_*` | `layers.N.hc_ffn_*` | same | yes |
+| `HyperConnPre.i1 = 4` | `hc_mult` | 4 | yes |
+| `HyperConnPre.i3 = 20` | `hc_sinkhorn_iters` | 20 | yes |
+| `GemvF32.i1 = 24`, `i2 = 4 * hidden` | -- | 20480 | yes |
+
+GLM-5.3-Flash and V4.1 share the mHC scheme down to the tensor names, which is
+also why `op_hyperconn.h` carries the `[DSV4-MHC]` tag. So "mHC emit" is a
+binding exercise, not an implementation.
+
+What IS genuinely new on the emit side: the CSA2 chain (ops 180/181, which had
+no opcodes until now), the two-level indexer split (`index_source_layer_ids` has
+8 layers, `kv_source_layer_ids` 4, so 8 `indexer.wq_b` against 4 `indexer.wk`),
+Engram, and the V4.1 config/tensor binding itself. The compressor's operands are
+in the checkpoint at the shapes op 180 wants -- `attn.compressor.wkv` and
+`.wgate` both `[512, 5120]`, `.norm` `[512]` -- so that binding is mechanical
+too once the emit site exists.
 
 So the ordered critical path to an 8k/90 ms number is:
 
 1. opcodes + dispatch for `d_compress_pool` and `d_rope_inverse_o` (mechanical);
 2. Engram: kernel, opcode, test (new math, small tensors, large tables);
 3. a `deepseek_v41` claim in `devgen::run_verified` with `--block` emit, the
-   pattern every family since M3 has started from;
-4. mHC and CSA2 emit in the block path;
-5. full-model emit -- the `glm_main` / `kimi_k3_emit` analogue.
+   pattern every family since M3 has started from -- V4.1's config/tensor
+   binding is the substance here, since `hc_mult = 4` puts mHC on EVERY layer
+   and there is no mHC-free block to extract;
+4. CSA2 emit (ops 180/181) and the two-level indexer in the block path. mHC
+   comes along with the `glm53` emit, per the table above;
+5. full-model emit -- fork `glm53_emit_full` rather than writing one, since it
+   already does prefill buckets plus decode rungs with the mHC wiring V4.1
+   needs.
 
 Only after 5 does an end-to-end number exist to measure against 90 ms. The
 roofline (section 9) says the target is reachable at 28.9% of matrix peak and
