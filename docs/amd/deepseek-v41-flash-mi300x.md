@@ -686,10 +686,38 @@ in the checkpoint at the shapes op 180 wants -- `attn.compressor.wkv` and
 `.wgate` both `[512, 5120]`, `.norm` `[512]` -- so that binding is mechanical
 too once the emit site exists.
 
+**One decision to make before item 3, recorded so it is not re-derived.** V4.1's
+config is already parsed and validated once, by
+`crates/nn-graph/src/models/config/deepseek_v41.rs` (Stage 1a) -- compress-ratio
+reconciliation, the two-level index split, the Engram field cross-checks, all of
+it, with a test against the released shards
+(`crates/nn-graph/tests/deepseek_v41_official.rs`). devgen cannot see any of
+that: it depends on `costmodel`, `packet`, `kernelcaps`, `tunedb`, `hwspec` and
+`plow-asset`, and NOT on `nn-graph`. So the emit path either
+
+* gains a `devgen -> nn-graph` dependency and reuses the verified parser, which
+  makes Stage 1a serving-relevant after all and is the only way the two cannot
+  drift; or
+* grows a second V4.1 reader beside `cfg_glm`, matching how every other family
+  on the devgen side reads its own checkpoint, at the cost of two parsers for
+  one config -- and this config's whole difficulty is in fields that are easy to
+  read and easy to misread.
+
+Neither is obviously right, and picking wrong is expensive either way: the first
+adds a crate edge to the serving compiler, the second guarantees drift on a
+config where `compress_ratios` and `kv_source_layer_ids` already disagree by
+construction (section 5.1). Decide it deliberately, not while writing the first
+`cfg_dsv41` line.
+
 So the ordered critical path to an 8k/90 ms number is:
 
-1. opcodes + dispatch for `d_compress_pool` and `d_rope_inverse_o` (mechanical);
-2. Engram: kernel, opcode, test (new math, small tensors, large tables);
+1. ~~opcodes + dispatch for `d_compress_pool` and `d_rope_inverse_o`~~ -- DONE
+   (ops 180/181, verified on gfx942 hardware);
+2. ~~Engram: kernel, opcode, test~~ -- DONE for the device side (ops 182/183).
+   What remains is stage 1's host side: the compressed-token map, the per-layer
+   hash multipliers and the prime bucket ranges, all built from the tokenizer at
+   load time, plus the cache that lets an n-gram look back across the
+   prefill/decode split;
 3. a `deepseek_v41` claim in `devgen::run_verified` with `--block` emit, the
    pattern every family since M3 has started from -- V4.1's config/tensor
    binding is the substance here, since `hc_mult = 4` puts mHC on EVERY layer
