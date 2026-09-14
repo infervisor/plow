@@ -390,6 +390,40 @@ retrieval 39/39 and the serving guard passing. `kvslots2-gate-f` prints its own 
 token-identical. Worth repeating as method: a job's rc=0 means it ran, not that anyone read it, and
 the tracker's "queued" is not evidence of anything.
 
+## The in-tree port emits the packet rb-t4 is measuring (2026-09-14)
+
+`rb-t4` runs the EXPORT's packet, built on `e724c7bd`. What was committed is a PORT onto main. Those
+are not the same tree, so before the T4 numbers could be claimed for the commit, the emit had to be
+reproduced in-tree. Both gates ran against `target/release/plowc` from this branch, using the same
+recipe replay and flags as lever-hunt `scripts/emit_t1.sh`:
+
+| gate | result |
+|---|---|
+| knob-off `model.pkt` | `8b15f4a28b289a72` -- **byte-identical to production**, so the port does not touch the default path |
+| `PLOW_GLM_ROWBAND_ATTN=1` `model.pkt` | `b73d4440c2814625` -- **byte-identical to the export's packet, which is what rb-t4 runs** |
+
+So the served T4 describes this commit, not only its ancestor.
+
+The knob-off `PLOW_PACKET_HASH` does NOT match production (`0x164ae4a829ecebec` vs
+`0x6dc830f4826df097`) even though the packet bytes are identical, and that is expected rather than a
+defect: `pairing_hash` (manifest.rs:2252) covers `union` / `objects` / `tuning`, and `tuning` carries
+`tile_lookups` (manifest.rs:980). This tree probes as build `gfx942-97116a9dc1be9326`, against which
+all 4961 tuning records are stale, so tile selection fell back to the analytical model and the stamp
+moved with it. A deployment emitted from this tree therefore needs its own object set -- the ordinary
+packet/objects pairing contract, not a regression.
+
+Worth collecting separately: BOTH emits print `ALL 1584 (resp. 1659) dense-GEMM tile(s) chosen by the
+ANALYTICAL MODEL. This build is UNMEASURED -- pick_tile reports tier portable, which is what it
+reports when no campaign has ever run.` The export fell back the same way (its own log says so
+against build `gfx942-fd1cb965cd14133c`), so the A/B is fair and the comparison stands. But it means
+every number in this campaign's row-band work was measured on analytically-tiled GEMMs, and a tuning
+campaign for the current build hash is an uncollected win the compiler is explicitly asking for.
+
+Method note: the first attempt aborted at `knob_spec.rs:1682` with `checkpoint K rejected the knob
+configuration: spawn failed`. That was the harness, not the port -- `PLOW_VERIFY_BIN` was unset, so
+checkpoint K could not spawn the Lean verifier. stageD is required here; stageC rejects rule names
+this tree carries.
+
 ## Rejected or parked
 
 | candidate | reason |
