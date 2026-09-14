@@ -44,13 +44,14 @@ extern "C" __device__ unsigned plow_mixed_block = 256;
  * duplicating a second object contract.
  *
  * WHY THE MARKERS. AMD's dispatch `default:` writes nothing and does not trap, so an object
- * built without an arm a packet needs is a SILENT WRONG ANSWER, not a crash. These four names
+ * built without an arm a packet needs is a SILENT WRONG ANSWER, not a crash. These names
  * are what `AmdEngine` reads out of `.symtab` before the object reaches a device, and they say
  * different things on purpose:
  *   plow_token_batch_1              the object was compiled with this axis at all
  *   plow_token_batch_dense_gqa_1    the dense-GQA operator set is present and armed
  *   plow_token_batch_combined_m_1   projections run at combined M (no phase band)
  *   plow_token_batch_span_attn_1    FlashPrefill/FlashDecode read their bounds from spans
+ *   plow_token_batch_split_merge_1  split FlashMerge reads the prefix-free span table
  *   plow_token_batch_wide_gemm_1    GEMM_WIDE/GEMM_C5 take their M from the descriptor too,
  *                                   so the synthesizer may keep the rung plowc chose instead
  *                                   of collapsing every projection onto GEMM's one tile
@@ -68,6 +69,7 @@ extern "C" __device__ unsigned plow_token_batch_1 = 1;
 extern "C" __device__ unsigned plow_token_batch_dense_gqa_1 = 1;
 extern "C" __device__ unsigned plow_token_batch_combined_m_1 = 1;
 extern "C" __device__ unsigned plow_token_batch_span_attn_1 = 1;
+extern "C" __device__ unsigned plow_token_batch_split_merge_1 = 1;
 extern "C" __device__ unsigned plow_token_batch_wide_gemm_1 = 1;
 #if PLOW_FP8
 extern "C" __device__ unsigned plow_token_batch_fp8_gemm_1 = 1;
@@ -1358,10 +1360,22 @@ __device__ __forceinline__ void exec_flash_merge(CInst in, CTens T, unsigned n_b
 template <int HD>
 __device__ __forceinline__ void exec_mixed_prefill_merge(
     CInst in, CTens tensors, unsigned slice, unsigned nblk, const PlowProgram* prog) {
+#if PLOW_TOKEN_BATCH
+    const PlowTokenBatchView batch = plow_tb_view(prog);
+    if (in->i[0] != batch.row_capacity || in->i[4] >= batch.row_capacity || !in->i[2])
+        __builtin_trap();
+    const unsigned first = plow_tb_decode_spans(batch);
+    const unsigned n_spans = batch.n_spans;
+#define PLOW_MERGE_SPAN(i) plow_tb_span(batch, i)
+#else
     if (!plow_mixed_step_enabled(prog) || in->i[0] != prog->n_prefill_rows ||
         in->i[4] < plow_mixed_prefill_span(prog, 0)->row0 ||
         in->i[4] >= prog->n_prefill_rows || !in->i[2])
         __builtin_trap();
+    const unsigned first = 0;
+    const unsigned n_spans = prog->n_prefill_spans;
+#define PLOW_MERGE_SPAN(i) plow_mixed_prefill_span(prog, i)
+#endif
     auto* out = (bf16*)tensors[in->t[0]];
     const auto* partial = (const float*)tensors[in->t[1]];
     const auto* ml = (const float*)tensors[in->t[2]];
@@ -1369,13 +1383,14 @@ __device__ __forceinline__ void exec_mixed_prefill_merge(
      * routed through the mixed step. NONE for every model that currently takes this path. */
     const auto* sinks =
         in->t[3] == PLOW_TENSOR_NONE ? nullptr : (const bf16*)tensors[in->t[3]];
-    for (unsigned i = 0; i < prog->n_prefill_spans; ++i) {
-        const PlowPrefillSpan* span = plow_mixed_prefill_span(prog, i);
+    for (unsigned i = first; i < n_spans; ++i) {
+        const PlowPrefillSpan* span = PLOW_MERGE_SPAN(i);
         const size_t row = (size_t)span->row0 * in->i[1];
         d_flash_merge<HD>(out + row * HD, partial + row * in->i[2] * HD,
                           ml + row * in->i[2] * 2, span->n_rows, in->i[1], in->i[2],
                           slice, nblk, sinks);
     }
+#undef PLOW_MERGE_SPAN
 }
 #endif
 

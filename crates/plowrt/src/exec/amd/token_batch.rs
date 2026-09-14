@@ -20,15 +20,17 @@ use std::path::{Path, PathBuf};
 /// * `plow_token_batch_dense_gqa_1` — the dense-GQA operator set is present.
 /// * `plow_token_batch_combined_m_1` — projections run at combined M, with no phase band.
 /// * `plow_token_batch_span_attn_1` — FlashPrefill/FlashDecode read their bounds from spans.
+/// * `plow_token_batch_split_merge_1` — split FlashMerge reads the prefix-free span table.
 /// * `plow_token_batch_fp8_gemm_1` — required separately for FP8-weight programs.
 ///
 /// `scripts/build_gfx942.sh`'s object contract fails a build that drops any of them, so a
 /// missing marker here means a stale object, not a fresh one built wrong.
-pub(super) const TOKEN_BATCH_MARKERS: [&str; 4] = [
+pub(super) const TOKEN_BATCH_MARKERS: [&str; 5] = [
     "plow_token_batch_1",
     "plow_token_batch_dense_gqa_1",
     "plow_token_batch_combined_m_1",
     "plow_token_batch_span_attn_1",
+    "plow_token_batch_split_merge_1",
 ];
 
 /// The object file and kernel the route needs. The kernel symbol is deliberately NOT
@@ -398,6 +400,7 @@ mod tests {
         let text = cap.refusal.unwrap().to_string();
         assert!(text.contains("plow_token_batch_combined_m_1"), "{text}");
         assert!(text.contains("plow_token_batch_span_attn_1"), "{text}");
+        assert!(text.contains("plow_token_batch_split_merge_1"), "{text}");
     }
 
     #[test]

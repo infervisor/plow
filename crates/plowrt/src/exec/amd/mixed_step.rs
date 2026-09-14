@@ -173,34 +173,24 @@ impl MixedAmdStep {
                 path.display()
             ))
         })?;
-        let markers: &[&str] = match route {
-            StepRoute::Mixed => &[
-                "plow_mixed_dynamic_rows_1",
-                "plow_mixed_step_bf16_1",
-                "plow_mixed_gemm_glu_1",
-                "plow_mixed_prefill_split_1",
-            ],
-            // The token-batch object is built ON the mixed object's shape, so it must answer
-            // for that contract too; the four `plow_token_batch_*` names are what say the
-            // descriptor-aware arms are actually present rather than merely compiled around.
-            StepRoute::TokenBatch => &[
-                "plow_mixed_dynamic_rows_1",
-                "plow_mixed_step_bf16_1",
-                "plow_mixed_gemm_glu_1",
-                "plow_mixed_prefill_split_1",
-                "plow_token_batch_1",
-                "plow_token_batch_dense_gqa_1",
-                "plow_token_batch_combined_m_1",
-                "plow_token_batch_span_attn_1",
-            ],
-        };
+        const MIXED_MARKERS: [&str; 4] = [
+            "plow_mixed_dynamic_rows_1",
+            "plow_mixed_step_bf16_1",
+            "plow_mixed_gemm_glu_1",
+            "plow_mixed_prefill_split_1",
+        ];
+        // The token-batch object is built ON the mixed object's shape, so it must answer for
+        // that contract too. Reuse the capability probe's list so load paths cannot drift.
+        let token_markers =
+            (route == StepRoute::TokenBatch).then_some(super::token_batch::TOKEN_BATCH_MARKERS);
         // The wide rungs are a SEPARATE claim about the object, so they need a separate marker:
         // an object built before `exec_gemm_wide`/`exec_gemm_c5` learned to read live M would
         // run the compiled bucket width over rows nobody wrote, and AMD's dispatch would not
         // say so. Only asked for when the knob is on, so an old object still serves the route.
-        let markers: Vec<&str> = markers
+        let markers: Vec<&str> = MIXED_MARKERS
             .iter()
             .copied()
+            .chain(token_markers.into_iter().flatten())
             .chain(wide_tiles.then_some("plow_token_batch_wide_gemm_1"))
             .chain(
                 (route == StepRoute::TokenBatch && fp8_weights)

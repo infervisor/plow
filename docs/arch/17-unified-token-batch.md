@@ -609,6 +609,7 @@ reaches a device:
 | `plow_token_batch_dense_gqa_1` | the dense-GQA operator set is present |
 | `plow_token_batch_combined_m_1` | projections run at combined M, no phase band |
 | `plow_token_batch_span_attn_1` | attention bounds come from spans |
+| `plow_token_batch_split_merge_1` | split FlashMerge reads prefix-free token-batch spans |
 | `plow_token_batch_fp8_gemm_1` | FP8 quantization and GEMM arms consume live packed rows |
 
 The kernel symbol is `plow_interp_tokbatch_<arch>` — deliberately **not**

@@ -1754,12 +1754,13 @@ for row in "${ROWS[@]}"; do
         }
         ;;
       interp_tokbatch*)
-        # The four capability markers exec/amd.rs reads out of .symtab before the object reaches
+        # The capability markers exec/amd.rs reads out of .symtab before the object reaches
         # a device. AMD's dispatch `default:` writes nothing and does not trap, so an object
         # missing an arm a packet needs is a silent wrong answer; a name costs nothing here and
         # a device round trip everywhere else.
         for m in plow_token_batch_1 plow_token_batch_dense_gqa_1 \
-                 plow_token_batch_combined_m_1 plow_token_batch_span_attn_1; do
+                 plow_token_batch_combined_m_1 plow_token_batch_span_attn_1 \
+                 plow_token_batch_split_merge_1; do
           grep -qE "OBJECT .* $m\$" <<<"$symbols" || {
             echo "  MISSING TOKEN-BATCH MARKER: expected $m"
             fail=1

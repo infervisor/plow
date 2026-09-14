@@ -102,14 +102,20 @@ def main():
         row_file = Path(directory) / "rows.csv"
         row_file.write_text("".join(",".join(map(str, row)) + "\n" for row in rows))
         env = os.environ.copy()
+        # This is the production-default gate. Remove inherited overrides so the run proves
+        # prefix reuse, AMD prefill batching, interleaving, and token batching are selected by
+        # their defaults rather than by the campaign shell.
+        for name in (
+            "PLOW_PREFIX_CACHE",
+            "PLOW_TOKEN_BATCH",
+            "PLOW_PF_BATCH",
+            "PLOW_PF_NO_INTERLEAVE",
+            "PLOW_PF_DEFER_DECODE",
+        ):
+            env.pop(name, None)
         env.update({
             "RUST_LOG": "plowrt::serve::mux=debug,plowrt::obs::pfx=info,plowrt=info",
             "PLOW_PFX_LOG": "1",
-            "PLOW_PREFIX_CACHE": "1",
-            "PLOW_TOKEN_BATCH": "1",
-            "PLOW_PF_BATCH": "1",
-            "PLOW_PF_NO_INTERLEAVE": "0",
-            "PLOW_PF_DEFER_DECODE": "0",
             "PLOW_AMD_SHARED_PREFIX": "0",
             "PLOW_VMM_KV": "0",
             "HSA_DISABLE_COREDUMP_ON_EXCEPTION": "1",

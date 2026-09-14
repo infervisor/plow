@@ -1743,6 +1743,19 @@ mod tests {
                 ["true"]
             );
         }
+        let defaults = super::RuntimeConfig::from_arg_matches(
+            &command.clone().try_get_matches_from(["test"]).unwrap(),
+        )
+        .unwrap();
+        assert!(defaults.prefix_cache && defaults.token_batch && defaults.pf_batch_amd());
+        assert!(!defaults.fusion);
+        assert!(
+            !defaults.pf_no_chunk && !defaults.pf_no_interleave && !defaults.pf_defer_decode
+        );
+        assert!(!defaults.pf_rotate());
+        assert_eq!(defaults.amd.packed_prefill_route, None);
+        assert!(!defaults.amd.token_batch_solo && !defaults.amd.token_batch_wide_tiles);
+
         let matches = command
             .try_get_matches_from([
                 "test",

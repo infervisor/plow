@@ -2442,10 +2442,9 @@ fn run_one_tick(
                     // ADMIT ONLY A STEP THAT IS ACTUALLY BATCHING SOMETHING.
                     //
                     // `feeds + completing > 0` is the CORRECTNESS floor: without a sampled row
-                    // there is no output segment to run. `>= 2` is the policy on top of it, and
-                    // it is there because this route is confined to buckets with `nsplit == 1`.
-                    // A prompt admitted alone therefore runs a rung with far fewer attention
-                    // workgroups than the one the ordinary route would have picked for it —
+                    // there is no output segment to run. `>= 2` is the policy on top of it:
+                    // a prompt admitted alone does no cross-request packing and may run a rung
+                    // with fewer attention workgroups than ordinary execution would pick —
                     // measured on Gemma-4 31B at concurrency 1, -3.5% throughput and -35% TTFT
                     // at 512 input, -10.5% and -48.8% at 2048 — for no packing at all, because
                     // there is nothing to pack it with. The ordinary route already samples a
