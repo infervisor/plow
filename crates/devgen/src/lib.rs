@@ -81,6 +81,7 @@ pub mod manifest;
 mod mxfp4_moe_role;
 pub mod pipeline;
 mod projection_rewrite;
+mod rewrite_lower;
 pub mod rnnt;
 pub mod tune_demand;
 pub mod segment_resource;
@@ -4208,6 +4209,19 @@ fn emit_phase(
     // cost is the extra HBM round trip + packet per pair, which holds at any T (norms ~9%
     // of a 4k chunk). Opt-in until token-gated on hardware.
     let gfuse = c.arch.is_gemma() && (gemv_family || emit_config::active().pf_gfuse);
+    // Is the seam whose norm uses `gamma` fused? The family flags are the structural gate; under
+    // PLOW_EMIT_REWRITE the rewrite's extracted fused graph decides each seam. Producer and
+    // consumer of a seam ask with the same gamma, so they agree.
+    let seam_fused = |b: &Builder, gamma: u32| -> bool {
+        if fuse_norm {
+            rewrite_lower::fused(b, rewrite_lower::Lowering::AddNorm, gamma).unwrap_or(true)
+        } else if gfuse {
+            rewrite_lower::fused(b, rewrite_lower::Lowering::NormResidualNorm, gamma)
+                .unwrap_or(true)
+        } else {
+            false
+        }
+    };
     // NRN2 -> q/k/v FOLD (Experiment N2, the item "norm fusion capped at 0.43 ms by t[8]"):
     // delete the END-OF-LAYER NormResidualNorm packet by computing it inside the NEXT layer's
     // q/k/v GemvFp8 staging (op 30 i3; gemv_nrn_lds in op_gemm.h — bit-exact replication of
@@ -4226,7 +4240,12 @@ fn emit_phase(
         && n.xr != TENSOR_NONE
         && (c.hidden & 7) == 0
         && c.hidden <= 16 * 512 /* RN_REG * PLOW_THREADS */
-        && (gemv_staged_rows(t) as u64 * c.hidden as u64 + 16) <= gm_lds_halves();
+        && (gemv_staged_rows(t) as u64 * c.hidden as u64 + 16) <= gm_lds_halves()
+        // The fold's two halves cross layers, so it needs every sandwich seam of the block.
+        && block.clone().all(|l| {
+            let next = if l + 1 < block.end { n.lw[l + 1].g_in } else { n.fin };
+            seam_fused(b, n.lw[l].g_pf) && seam_fused(b, next)
+        });
     // (b tensor, gamma_b, gamma_n, layer_scale) of a skipped NRN2, consumed by the next
     // iteration's q/k/v emission. Crosses loop iterations by construction.
     let mut nrn_pending: Option<(u32, u32, u32, f32)> = None;
@@ -4525,7 +4544,7 @@ fn emit_phase(
         // 2 (it is right for a single consumer), but the compiler does not use it here.
         // The end-of-layer AddNorm ALSO produces the NEXT layer's normed input, so for l>0 the
         // input RMSNorm is already done and `dep` carries n.hn directly.
-        let c_n = if (fuse_norm || gfuse) && l > block.start {
+        let c_n = if l > block.start && seam_fused(b, w.g_in) {
             dep // previous layer's end-of-layer fused norm already wrote the normed n.hn
         } else {
             // The block's FIRST layer reads the uploaded `act.x` with no producer
@@ -5343,7 +5362,7 @@ fn emit_phase(
         // decode: x += o, then post_attention_layernorm(x) — fused into ONE AddNorm. Qwen/Llama
         // prefill keeps the split (T rows already parallelise the norm; a parallel agent owns it).
         let mut nrn1_fold = false;
-        let c_pf = if fuse_norm {
+        let c_pf = if fuse_norm && seam_fused(b, w.g_pa) {
             b.emit(DevOp::AddNorm, rows.clone(), &[c_o], |d| {
                 d.t[0] = n.hn;
                 d.t[1] = n.x;
@@ -5363,7 +5382,7 @@ fn emit_phase(
             // serial gate on the decode chain.
             nrn1_fold = true;
             c_o
-        } else if gfuse {
+        } else if gfuse && seam_fused(b, w.g_pf) {
             // x = x + post_attn_norm(o); hn = pre_feedforward_norm(x) — Gemma sandwich in ONE packet.
             // Under the NRN fold the residual PING-PONGS: this packet writes its residual to
             // `n.xr`, which the folded NRN2 inside the next layer's q/k/v reads back and stores
@@ -6186,10 +6205,15 @@ fn emit_phase(
                     d.f[1] = ls[l];
                 })
             };
+        let next_norm = if l + 1 < block.end {
+            n.lw[l + 1].g_in
+        } else {
+            n.fin
+        };
         dep = if let Some(ct) = moe_fused_tail {
             // op72 already produced the new residual (n.x) AND the next input norm (n.hn).
             ct
-        } else if fuse_norm {
+        } else if fuse_norm && seam_fused(b, next_norm) {
             // x += down; then normalise for the NEXT sublayer's attention (the next layer's
             // input_layernorm, or the model's final norm after the last layer). One packet does
             // the end-of-layer residual AND the next input norm, so the loop top skips c_n.
@@ -6208,7 +6232,7 @@ fn emit_phase(
                 d.i[1] = c.hidden;
                 d.f[0] = c.eps;
             })
-        } else if gfuse {
+        } else if gfuse && seam_fused(b, next_norm) {
             // x = (x + post_ffn_norm(down)) * layer_scalar; hn = input_norm(x) for the NEXT layer
             // (or the final norm after the last layer). One packet does the end-of-layer sandwich
             // residual AND the next input norm, so the loop top skips c_n (same as fuse_norm).
@@ -6314,7 +6338,7 @@ fn emit_phase(
 
     // In the fused path the last layer's end-of-layer fused norm already applied the FINAL norm
     // (its next_gin was n.fin), so n.hn holds the final-normed row and c_f is just that dep.
-    let c_f = if fuse_norm || gfuse {
+    let c_f = if seam_fused(b, n.fin) {
         dep
     } else {
         b.emit(DevOp::RmsNorm, rows.clone(), &[dep], |d| {
@@ -6661,7 +6685,13 @@ pub struct EmitArgs {
 pub struct WholeGraphFusionDecisions {
     pub tp: u32,
     pub parallel_linear2: Vec<ParallelLinear2Decision>,
+    /// `PLOW_EMIT_REWRITE`: the egglog rewrite's fused sites over the complete graph. Ignored
+    /// with the knob off.
+    pub rewrite_sites: Option<RewriteSites>,
 }
+
+/// Fused kind → the checkpoint weight names anchoring its instances (`rewrite::FusedSites`).
+pub type RewriteSites = std::collections::BTreeMap<String, std::collections::BTreeSet<String>>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParallelLinear2Decision {
@@ -7438,6 +7468,8 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
 
     // Installed process-wide so deeply nested emit functions can call emit_config::active().
     emit_config::install(emit_cfg);
+    let mut whole_graph_fusions = whole_graph_fusions;
+    rewrite_lower::install(whole_graph_fusions.rewrite_sites.take());
     install_whole_graph_fusions(whole_graph_fusions);
     clear_attention_decisions();
 

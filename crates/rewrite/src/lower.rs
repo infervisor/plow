@@ -26,6 +26,27 @@ pub enum LowerError {
 
 /// Returns `(let-bindings, root_var)`.
 pub fn lower(g: &Graph) -> Result<(String, String), LowerError> {
+    let (body, var) = lower_nodes(g)?;
+    let out = *g.outputs.last().ok_or(LowerError::NoOutput)?;
+    let root = expr_of(g, out, &var)?;
+    Ok((body, root))
+}
+
+/// [`lower`] with one root per graph output, in output order.
+pub fn lower_outputs(g: &Graph) -> Result<(String, Vec<String>), LowerError> {
+    let (body, var) = lower_nodes(g)?;
+    if g.outputs.is_empty() {
+        return Err(LowerError::NoOutput);
+    }
+    let roots = g
+        .outputs
+        .iter()
+        .map(|&out| expr_of(g, out, &var))
+        .collect::<Result<_, _>>()?;
+    Ok((body, roots))
+}
+
+fn lower_nodes(g: &Graph) -> Result<(String, HashMap<TensorId, String>), LowerError> {
     let mut body = String::new();
     let mut var: HashMap<TensorId, String> = HashMap::new();
 
@@ -35,10 +56,7 @@ pub fn lower(g: &Graph) -> Result<(String, String), LowerError> {
         let _ = writeln!(body, "(let {v} {term})");
         var.insert(node.output, v);
     }
-
-    let out = *g.outputs.last().ok_or(LowerError::NoOutput)?;
-    let root = expr_of(g, out, &var)?;
-    Ok((body, root))
+    Ok((body, var))
 }
 
 /// Egglog expression for a tensor: a leaf constructor, or the node's `let` var.

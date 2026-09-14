@@ -84,6 +84,7 @@ impl FusionCoverage {
         devgen::WholeGraphFusionDecisions {
             tp,
             parallel_linear2,
+            rewrite_sites: None,
         }
     }
 

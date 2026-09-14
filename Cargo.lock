@@ -799,6 +799,7 @@ dependencies = [
  "kernelcaps",
  "packet",
  "plow-asset",
+ "rewrite",
  "serde_json",
  "tracing",
  "tunedb",

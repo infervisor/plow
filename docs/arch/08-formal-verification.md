@@ -66,7 +66,7 @@ theorem rule_gated_mlp_fuse (g u : Op) (k : String) :
 
 **What it proves:** The fused op is *definitionally* the unfused composition, so the two denote the same value. (The mini-IR is intentionally abstract: each op carries only the operand references from its egglog signature; the definitional-equality argument carries through unchanged if types/denotations are attached.)
 
-**Verification:** The Rust side submits the list of fired rule names (`{"rules": [...]}`); `checkA` rejects any name not in the closed enumeration `Plow.Rewrite.soundRules`. That table holds one entry per `rule_*` theorem — 19 rules today, mirroring the `; rule:` annotations in `rules.egg`.
+**Verification:** The Rust side submits the list of fired rule names (`{"rules": [...]}`); `checkA` rejects any name not in the closed enumeration `Plow.Rewrite.soundRules`. That table holds one entry per `rule_*` theorem — 29 rules today, mirroring the `; rule:` annotations in `rules.egg`.
 
 ### Checkpoint B — Tile Partition Validity
 

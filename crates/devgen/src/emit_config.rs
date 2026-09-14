@@ -453,6 +453,13 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_FUSE_POST", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_fuse_post: bool,
 
+    /// Lower the egglog rewrite: at every emitter fusion site a rewrite rule covers, the extracted
+    /// fused graph decides the fusion instead of the hand knob (plowc supplies the sites). Default
+    /// on; without a rewrite for the checkpoint the hand fusions stay, and only an explicit `=1`
+    /// refuses. `=0` is the rollback.
+    #[arg(long, env = "PLOW_EMIT_REWRITE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub emit_rewrite: bool,
+
     /// GLM router off-shared dispatch (co-resident mode 2 only).
     #[arg(long, env = "GLM_ROUTER_OFF_SHARED", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_router_off_shared: bool,
@@ -1250,6 +1257,7 @@ impl EmitConfig {
             glm_fuse_seam: env_bool("PLOW_GLM_FUSE_SEAM"),
             glm_fuse_qnorm: env_bool("PLOW_GLM_FUSE_QNORM"),
             glm_fuse_post: env_bool("PLOW_GLM_FUSE_POST"),
+            emit_rewrite: env_opt_out("PLOW_EMIT_REWRITE"),
             glm_router_off_shared: env_bool("GLM_ROUTER_OFF_SHARED"),
             glm_router_old: env_bool("GLM_ROUTER_OLD"),
             k3_fuse_ngemv: env_str("PLOW_K3_FUSE_NGEMV"),
@@ -1880,6 +1888,14 @@ pub fn knobs_or_env() -> Vec<Knob> {
         }
         knobs
     })
+}
+
+/// Whether knob `id` (the `EmitConfig` field name) was set on the command line or in the
+/// environment for this emit, rather than resolved from a default.
+pub fn explicitly_set(id: &str) -> bool {
+    knobs_or_env()
+        .iter()
+        .any(|k| k.id == id && matches!(k.source, "cli" | "env"))
 }
 
 /// Access the active emit config.

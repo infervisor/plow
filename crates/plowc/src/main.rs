@@ -968,6 +968,46 @@ fn fusion_coverage_hook(
     })
 }
 
+/// The rewrite's fused sites for `PLOW_EMIT_REWRITE`, or `None` to keep the hand fusions.
+fn rewrite_sites(
+    dir: &std::path::Path,
+    explicit: bool,
+) -> Result<Option<devgen::RewriteSites>, String> {
+    let sites = std::fs::read_to_string(dir.join("config.json"))
+        .map_err(|e| rewrite::SitesError::Unavailable(format!("config.json: {e}")))
+        .and_then(|json| rewrite::fused_sites_for_config(&json));
+    resolve_rewrite_sites(sites, explicit)
+}
+
+/// A default-on knob cannot refuse an emit: a missing rewrite falls back to the hand fusions
+/// unless `PLOW_EMIT_REWRITE=1` was set explicitly.
+fn resolve_rewrite_sites(
+    sites: Result<rewrite::FusedSites, rewrite::SitesError>,
+    explicit: bool,
+) -> Result<Option<devgen::RewriteSites>, String> {
+    match sites {
+        Ok(sites) => {
+            info!(
+                kinds = sites.len(),
+                sites = sites.values().map(|w| w.len()).sum::<usize>(),
+                "PLOW_EMIT_REWRITE: devgen lowers the extracted fused graph"
+            );
+            Ok(Some(sites))
+        }
+        Err(e) if explicit => Err(format!(
+            "PLOW_EMIT_REWRITE=1: no whole-graph rewrite for this checkpoint: {e}"
+        )),
+        Err(e @ rewrite::SitesError::Unavailable(_)) => {
+            info!(error = %e, "PLOW_EMIT_REWRITE: rewrite unavailable for this architecture; emitting the hand fusions");
+            Ok(None)
+        }
+        Err(e) => {
+            warn!(error = %e, "PLOW_EMIT_REWRITE: the rewrite failed; emitting the hand fusions");
+            Ok(None)
+        }
+    }
+}
+
 fn whole_graph_fusion_decisions(
     coverage: Option<&fusion_coverage::FusionCoverage>,
     tp: u32,
@@ -1452,11 +1492,18 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
     };
     // Candidate eligibility comes only from full-graph analysis. Qualification
     // remains an explicit experiment until the network gate promotes it.
-    let whole_graph_fusions = whole_graph_fusion_decisions(
+    let mut whole_graph_fusions = whole_graph_fusion_decisions(
         fusion_coverage.as_ref(),
         tp,
         cli.experiment_parallel_linear2,
     );
+    // `PLOW_EMIT_REWRITE` (default on): devgen lowers the extracted fused graph at the seams a rule
+    // covers. Without a rewrite for this checkpoint the emit keeps the hand fusions, exactly as
+    // `=0` does; only an explicit `=1` refuses.
+    if cli.emit_cfg.emit_rewrite {
+        let explicit = devgen::emit_config::explicitly_set("emit_rewrite");
+        whole_graph_fusions.rewrite_sites = rewrite_sites(&dir, explicit)?;
+    }
 
     // The Lean gates on the devblob path. BOTH ARE ON BY DEFAULT (disable with
     // `--no-lean-verify` / `--no-lean-oracle`, one switch each, no coupling).
@@ -2513,6 +2560,53 @@ fn run_viz(v: &VizCli, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 mod cli_tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn emit_rewrite_falls_back_by_default_and_refuses_only_when_explicit() {
+        let unavailable = || Err(rewrite::SitesError::Unavailable("no builder".into()));
+        let failed = || Err(rewrite::SitesError::Rewrite("extraction".into()));
+        assert_eq!(resolve_rewrite_sites(unavailable(), false), Ok(None));
+        assert_eq!(resolve_rewrite_sites(failed(), false), Ok(None));
+        assert!(resolve_rewrite_sites(unavailable(), true)
+            .unwrap_err()
+            .contains("no builder"));
+        assert!(resolve_rewrite_sites(failed(), true)
+            .unwrap_err()
+            .contains("extraction"));
+        let sites: rewrite::FusedSites =
+            [("FusedResidualNorm".to_string(), ["w".to_string()].into())]
+                .into_iter()
+                .collect();
+        for explicit in [false, true] {
+            assert_eq!(
+                resolve_rewrite_sites(Ok(sites.clone()), explicit),
+                Ok(Some(sites.clone()))
+            );
+        }
+    }
+
+    #[test]
+    fn emit_rewrite_sites_come_from_the_checkpoint_graph_or_not_at_all() {
+        let dir = std::env::temp_dir().join(format!("plowc-emit-rewrite-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"model_type": "llama", "vocab_size": 1000, "hidden_size": 256,
+                "intermediate_size": 512, "num_hidden_layers": 2, "num_attention_heads": 4,
+                "num_key_value_heads": 2, "rms_norm_eps": 1e-5, "rope_theta": 500000.0}"#,
+        )
+        .unwrap();
+        let sites = rewrite_sites(&dir, true).unwrap().unwrap();
+        assert!(sites["FusedResidualNorm"].contains("model.norm.weight"));
+
+        std::fs::write(dir.join("config.json"), r#"{"model_type": "gpt_oss"}"#).unwrap();
+        assert_eq!(rewrite_sites(&dir, false), Ok(None));
+        assert!(rewrite_sites(&dir, true).is_err());
+
+        std::fs::remove_file(dir.join("config.json")).unwrap();
+        assert_eq!(rewrite_sites(&dir, false), Ok(None));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn mixed_fusion_has_no_compiler_options() {

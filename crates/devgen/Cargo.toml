@@ -20,3 +20,4 @@ tracing = "0.1"
 
 [dev-dependencies]
 plow-asset = { workspace = true, features = ["test-util"] }
+rewrite = { workspace = true }

@@ -25,7 +25,7 @@ pub use explore::{
     best_chunk_count, best_chunk_count_egglog, chunk_prefill_cycles, explore_tiles, Choice,
     ChunkCostIn, GemmJob,
 };
-pub use extract::{Arg, FNode, FusedGraph};
+pub use extract::{Arg, FNode, FusedGraph, FusedSites};
 pub use footprint::{footprints, Footprint, OpIo, TensorSlice, TileDomain};
 pub use tile::{lower_gemm, TileNode, TileSeq};
 /// Re-export of [`tilegraph::TileNode`] under a distinct name so downstream
@@ -74,13 +74,51 @@ pub struct RewriteStats {
 /// Rewrite a graph: lower → saturate with fusion rules → extract.
 pub fn rewrite_graph(g: &Graph) -> Result<(FusedGraph, RewriteStats), RewriteError> {
     let (lets, root) = lower::lower(g)?;
-    let fused = extract::run(SCHEMA, RULES, &lets, &root)?;
+    let fused = extract::run(SCHEMA, RULES, &lets, &[root])?;
     let stats = RewriteStats {
         ops_before: g.nodes.len(),
         ops_after: fused.op_count(),
         fused: fused.fused_count(),
     };
     Ok((fused, stats))
+}
+
+/// [`rewrite_graph`] extracting EVERY graph output from the same e-graph and extractor, so shared
+/// paths extract identically. Extracting only the last output drops every fused site that feeds
+/// only an earlier one — on GLM, whose last output is the MTP head, the base `model.norm`.
+pub fn rewrite_graph_outputs(g: &Graph) -> Result<(FusedGraph, RewriteStats), RewriteError> {
+    let (lets, roots) = lower::lower_outputs(g)?;
+    let fused = extract::run(SCHEMA, RULES, &lets, &roots)?;
+    let stats = RewriteStats {
+        ops_before: g.nodes.len(),
+        ops_after: fused.op_count(),
+        fused: fused.fused_count(),
+    };
+    Ok((fused, stats))
+}
+
+#[derive(thiserror::Error, Debug, PartialEq, Eq)]
+pub enum SitesError {
+    /// No graph for this checkpoint: no builder for its architecture, or a config it cannot parse.
+    #[error("graph build failed: {0}")]
+    Unavailable(String),
+    /// The graph built, but lowering or extraction failed.
+    #[error("rewrite failed: {0}")]
+    Rewrite(String),
+}
+
+/// The fused sites devgen lowers under `PLOW_EMIT_REWRITE`: [`FusedGraph::sites`] of the
+/// checkpoint's text-generation graph, built and bound as plowc's whole-graph coverage builds it.
+pub fn fused_sites_for_config(config_json: &str) -> Result<FusedSites, SitesError> {
+    let mut graph = nn_graph::models::build_text_generation_from_config_json_at(
+        config_json,
+        &nn_graph::models::ShapeBucket::default(),
+    )
+    .map_err(|e| SitesError::Unavailable(e.to_string()))?;
+    graph.bind(&nn_graph::Bindings::new().set("B", 1).set("S", 8192));
+    let (fused, _) =
+        rewrite_graph_outputs(&graph).map_err(|e| SitesError::Rewrite(e.to_string()))?;
+    Ok(fused.sites())
 }
 
 /// Saturate the fusion rules over `g` and report per-fused-op e-graph match

@@ -64,6 +64,10 @@ inductive Op
   | FusedResidualZeroCenteredNorm (a b w : Op) (eps : Nat)
   | FusedResidualLayerNorm  (a b w bias : Op) (eps : Nat)
   | FusedResidual3Norm      (x a b w : Op) (eps : Nat)
+  /-- Sandwich seam: `RmsNorm(a + RmsNorm(b, w1), w2)`. -/
+  | FusedNormResidualNorm   (a b w1 w2 : Op) (eps1 eps2 : Nat)
+  /-- Sandwich seam with the layer scalar: `RmsNorm((a + RmsNorm(b, w1)) * s, w2)`. -/
+  | FusedNormResidualScaleNorm (a b w1 s w2 : Op) (eps1 eps2 : Nat)
   | FusedGroupNormAct       (x w b : Op) (g eps : Nat) (kind : String)
   | FusedAdaLN              (x scale shift : Op)
   | FusedGatedResidual      (x y gate : Op)
@@ -116,6 +120,13 @@ def expand : Op → Op
       Op.LayerNorm (Op.Ew "add" (expand a) (expand b)) (expand w) (expand bias) eps
   | Op.FusedResidual3Norm x a b w eps =>
       Op.RmsNorm (Op.Ew "add" (expand x) (Op.Ew "add" (expand a) (expand b))) (expand w) eps
+  | Op.FusedNormResidualNorm a b w1 w2 eps1 eps2 =>
+      Op.RmsNorm (Op.Ew "add" (expand a) (Op.RmsNorm (expand b) (expand w1) eps1))
+        (expand w2) eps2
+  | Op.FusedNormResidualScaleNorm a b w1 s w2 eps1 eps2 =>
+      Op.RmsNorm
+        (Op.Ew "mul" (Op.Ew "add" (expand a) (Op.RmsNorm (expand b) (expand w1) eps1)) (expand s))
+        (expand w2) eps2
   | Op.FusedGroupNormAct x w b g eps kind =>
       Op.Act kind (Op.GroupNorm (expand x) (expand w) (expand b) g eps)
   | Op.FusedAdaLN x scale shift =>
@@ -247,6 +258,19 @@ theorem rule_residual3_rmsnorm_fuse (x a b w : Op) (eps : Nat) :
     expand (Op.FusedResidual3Norm x a b w eps) =
       Op.RmsNorm (Op.Ew "add" (expand x) (Op.Ew "add" (expand a) (expand b))) (expand w) eps :=
   rfl
+
+/-- `norm-residual-rmsnorm-fuse` -/
+theorem rule_norm_residual_rmsnorm_fuse (a b w1 w2 : Op) (eps1 eps2 : Nat) :
+    expand (Op.FusedNormResidualNorm a b w1 w2 eps1 eps2) =
+      Op.RmsNorm (Op.Ew "add" (expand a) (Op.RmsNorm (expand b) (expand w1) eps1))
+        (expand w2) eps2 := rfl
+
+/-- `norm-residual-scale-rmsnorm-fuse` -/
+theorem rule_norm_residual_scale_rmsnorm_fuse (a b w1 s w2 : Op) (eps1 eps2 : Nat) :
+    expand (Op.FusedNormResidualScaleNorm a b w1 s w2 eps1 eps2) =
+      Op.RmsNorm
+        (Op.Ew "mul" (Op.Ew "add" (expand a) (Op.RmsNorm (expand b) (expand w1) eps1)) (expand s))
+        (expand w2) eps2 := rfl
 
 /-- `groupnorm-act-fuse` -/
 theorem rule_groupnorm_act_fuse (x w b : Op) (g eps : Nat) (k : String) :
@@ -383,6 +407,8 @@ def soundRules : List String :=
    "residual-zero-centered-rmsnorm-fuse",
    "residual-layernorm-fuse",
    "residual3-rmsnorm-fuse",
+   "norm-residual-rmsnorm-fuse",
+   "norm-residual-scale-rmsnorm-fuse",
    "groupnorm-act-fuse",
    "adaln-modulate-fuse",
    "gated-residual-fuse",

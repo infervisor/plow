@@ -415,6 +415,40 @@ const FUSE_POST_SCOPE: &[Allow] = &[
     },
 ];
 
+/// Rule-driven emission lowers residual/norm seams only: a fused `AddNorm` or `NormResidualNorm`
+/// against its split pair, the arm set that follows, and the packet-wide object facts.
+const EMIT_REWRITE_SCOPE: &[Allow] = &[
+    Allow {
+        ops: OpSel::In(&["norm", "elementwise"]),
+        fields: &[
+            ScopeField::Op,
+            ScopeField::Operands,
+            ScopeField::Cus,
+            ScopeField::Segments,
+            ScopeField::ObjectFacts,
+        ],
+        facts: &["AddNorm", "Residual", "RmsNorm", "NormResidual"],
+        ..Allow::ANY
+    },
+    Allow {
+        kinds: &["global"],
+        fields: &[ScopeField::ObjectFacts],
+        facts: &[
+            "PLOW_PACKET_OBJECT_REQUIRES",
+            "PLOW_PACKET_HASH ",
+            "HAS_ADD_NORM ",
+            "HAS_RESIDUAL ",
+            "HAS_RMS_NORM ",
+            "HAS_NORM_RESIDUAL",
+            "union:AddNorm",
+            "union:Residual",
+            "union:RmsNorm",
+            "union:NormResidual",
+        ],
+        ..Allow::ANY
+    },
+];
+
 /// The small-rung workgroup cap narrows the compute of the small GLM prefill buckets and nothing
 /// else: not their collectives (6deb4025 did, and this is the scope that says it may not).
 const SMALL_CUS_SCOPE: &[Allow] = &[Allow {
@@ -615,6 +649,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.glm_fuse_rope", Some("PLOW_GLM_FUSE_ROPE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_fuse_qnorm", Some("PLOW_GLM_FUSE_QNORM"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_fuse_post", Some("PLOW_GLM_FUSE_POST"), Layer::Emit, Domain::Bool, OFF, OPT_IN).scoped(FUSE_POST_SCOPE),
+    KnobSpec::new("emit.emit_rewrite", Some("PLOW_EMIT_REWRITE"), Layer::Emit, Domain::Bool, ON, PROMOTED).scoped(EMIT_REWRITE_SCOPE),
     KnobSpec::new("emit.glm_router_off_shared", Some("GLM_ROUTER_OFF_SHARED"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_router_old", Some("GLM_ROUTER_OLD"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.k3_fuse_ngemv", Some("PLOW_K3_FUSE_NGEMV"), Layer::Emit, Domain::Str, UNSET, OPT_IN),

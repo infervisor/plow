@@ -110,6 +110,10 @@
   ; and normed — add(x, add(a, b)) then RMSNorm. The inner add is a distinct materialization
   ; point in the fused kernel's contract (the combine's bf16 partial the TP all-reduce moves).
   (FusedResidual3Norm Expr Expr Expr Expr f64)       ; x, a, b, normw, eps
+  ; The sandwich seam: add(a, RmsNorm(b)) then RmsNorm; the scale form multiplies the sum first.
+  (FusedNormResidualNorm Expr Expr Expr f64 Expr f64)      ; a, b, post_normw, post_eps, normw, eps
+  (FusedNormResidualScaleNorm Expr Expr Expr f64 Expr Expr f64)
+      ; a, b, post_normw, post_eps, scale, normw, eps
 
   ; GroupNorm + Activation + Conv3d fusion (VAE resnet inner loop).
   (FusedGroupNormActConv3d Expr Expr Expr i64 f64 String Expr String String)

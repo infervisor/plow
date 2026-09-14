@@ -3189,8 +3189,14 @@ pub(crate) fn declare_glm_rows_batched(
 /// a lone `RmsNorm` and folding it would need a norm epilogue inside the combine — a different
 /// change. `PLOW_NO_XREDUCE` takes the same tp==1-shaped branch and is excluded for the same
 /// reason. Both ends of the seam ask this one predicate, so producer and consumer cannot disagree.
-fn glm_fuse_seam(tp: u32) -> bool {
-    emit_config::active().glm_fuse_seam && tp > 1 && !emit_config::active().no_xreduce
+///
+/// `gin` is the `input_layernorm` the seam's `AddNorm` normalizes with. Under `PLOW_EMIT_REWRITE`
+/// the rewrite's extracted fused graph decides each seam in place of the knob.
+fn glm_fuse_seam(b: &Builder, tp: u32, gin: u32) -> bool {
+    crate::rewrite_lower::fused(b, crate::rewrite_lower::Lowering::AddNorm, gin)
+        .unwrap_or(emit_config::active().glm_fuse_seam)
+        && tp > 1
+        && !emit_config::active().no_xreduce
 }
 
 /// The Q-NORM FOLD gate (`PLOW_GLM_FUSE_QNORM`): may `q_a_layernorm` be computed inside fusion
@@ -3240,11 +3246,9 @@ fn glm_fuse_qnorm(fuse_g: bool, mx: bool, dsa: bool, ql: u32) -> bool {
 
 /// The gamma the layer-seam fold's `AddNorm` normalizes with: the NEXT layer's `input_layernorm`,
 /// or `None` when there is no next layer in this program (last layer, or a single-block bring-up).
-fn seam_next_gin(n: &GlmTn, slot: usize, tp: u32) -> Option<u32> {
-    if !glm_fuse_seam(tp) {
-        return None;
-    }
-    n.lw.get(slot + 1).map(|w| w.gin)
+fn seam_next_gin(b: &Builder, n: &GlmTn, slot: usize, tp: u32) -> Option<u32> {
+    let gin = n.lw.get(slot + 1)?.gin;
+    glm_fuse_seam(b, tp, gin).then_some(gin)
 }
 
 /// Workgroup list for the ELEMENTWISE spine ops (`Residual`).
@@ -3658,7 +3662,8 @@ pub(crate) fn emit_glm_mla(
     // B1 defaults OFF (opt-in): AddNorm reduces over the un-rounded a+b sum, so unlike A/G it is NOT
     // byte-identical to the split Residual+RmsNorm — a reorder-level fp diff that flips one early
     // greedy argmax and cascades. Ship it only behind the HF-coherence gate; PLOW_GLM_FUSE_B1=1 opts in.
-    let fuse_b1 = emit_config::active().glm_fuse_b1;
+    let fuse_b1 = crate::rewrite_lower::fused(b, crate::rewrite_lower::Lowering::AddNorm, w.gpost)
+        .unwrap_or(emit_config::active().glm_fuse_b1);
 
     // --- MLA ---
     // 1 input_layernorm
@@ -3671,7 +3676,7 @@ pub(crate) fn emit_glm_mla(
     // blocks are emitted in slot order, layer 0's input comes from the embedding (nothing upstream
     // to fold into), and `seam_next_gin` is what guarantees the producer actually did it (it
     // returns None for the last slot, so the two ends of the seam agree by construction).
-    let c_rn1 = if glm_fuse_seam(tp) && slot > 0 {
+    let c_rn1 = if slot > 0 && glm_fuse_seam(b, tp, w.gin) {
         assert_eq!(
             pre.len(),
             1,
@@ -8262,7 +8267,7 @@ fn emit_glm_moe_ffn_rows(
         );
         if raw_output {
             c_xr
-        } else if let Some(gin_next) = seam_next_gin(n, slot, tp) {
+        } else if let Some(gin_next) = seam_next_gin(b, n, slot, tp) {
             b.emit(
                 DevOp::AddNorm,
                 decode_norm_cus(b.n_cu(), rows),
@@ -8693,7 +8698,7 @@ pub(crate) fn emit_glm_moe_ffn(
         // input, deleting the next block's `RmsNorm` packet. See `glm_fuse_seam`.
         if raw_output {
             c_xr
-        } else if let Some(gin_next) = seam_next_gin(n, slot, tp) {
+        } else if let Some(gin_next) = seam_next_gin(b, n, slot, tp) {
             b.emit(DevOp::AddNorm, one.clone(), &[c_xr], |d| {
                 d.t[0] = n.xn; // the NEXT layer's input_layernorm output
                 d.t[1] = x_out; // the residual stream, unchanged (still bf16)
@@ -8878,7 +8883,7 @@ pub(crate) fn emit_glm_dense_ffn(
         // LAYER-SEAM FOLD, dense-FFN twin of the MoE tail's. Same packet, same argument.
         if raw_output {
             c_xr
-        } else if let Some(gin_next) = seam_next_gin(n, slot, tp) {
+        } else if let Some(gin_next) = seam_next_gin(b, n, slot, tp) {
             b.emit(DevOp::AddNorm, vec![0u32], &[c_xr], |d| {
                 d.t[0] = n.xn;
                 d.t[1] = x_out;
@@ -9052,7 +9057,7 @@ fn emit_glm_dense_ffn_rows(
         );
         if raw_output {
             c_xr
-        } else if let Some(gin_next) = seam_next_gin(n, slot, tp) {
+        } else if let Some(gin_next) = seam_next_gin(b, n, slot, tp) {
             b.emit(
                 DevOp::AddNorm,
                 decode_norm_cus(b.n_cu(), rows),

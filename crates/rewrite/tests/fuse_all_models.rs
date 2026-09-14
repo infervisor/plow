@@ -93,10 +93,15 @@ fn fuse_gemma() {
         fused.contains("FusedEmbeddingScale"),
         "embedding+scale fusion did not fire"
     );
-    // Residual-add + RMSNorm at block boundaries.
+    // Gemma's residual add sits between two norms at every seam, so the sandwich fusion takes
+    // the whole seam and leaves no bare residual+norm.
     assert!(
-        fused.contains("FusedResidualNorm"),
-        "residual+norm fusion did not fire"
+        fused.contains("FusedNormResidualNorm"),
+        "norm+residual+norm fusion did not fire"
+    );
+    assert!(
+        !fused.contains("FusedResidualNorm"),
+        "a Gemma seam extracted as residual+norm with a separate post-norm"
     );
     assert!(
         stats.fused >= 6,

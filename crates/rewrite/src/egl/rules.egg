@@ -122,6 +122,20 @@
 (rewrite (RmsNorm (Ew "add" ?x (Ew "add" ?a ?b)) ?w ?eps)
          (FusedResidual3Norm ?x ?a ?b ?w ?eps))
 
+; norm-residual-rmsnorm-fuse: the sandwich seam of Gemma blocks — the branch's post-norm, the
+; residual add and the next pre-norm, `RmsNorm(add(a, RmsNorm(b)))`, as ONE kernel (devgen:
+; `NormResidualNorm`). 3 e-nodes → 1, so extraction prefers it to `residual-rmsnorm-fuse` on the
+; same class, which would leave the post-norm as a separate RmsNorm.
+; rule: norm-residual-rmsnorm-fuse
+(rewrite (RmsNorm (Ew "add" ?a (RmsNorm ?b ?w1 ?e1)) ?w2 ?e2)
+         (FusedNormResidualNorm ?a ?b ?w1 ?e1 ?w2 ?e2))
+
+; Gemma 4 scales the block output by its layer scalar between the add and the next norm
+; (devgen: the same `NormResidualNorm`, scale in `f1`).
+; rule: norm-residual-scale-rmsnorm-fuse
+(rewrite (RmsNorm (Ew "mul" (Ew "add" ?a (RmsNorm ?b ?w1 ?e1)) ?s) ?w2 ?e2)
+         (FusedNormResidualScaleNorm ?a ?b ?w1 ?e1 ?s ?w2 ?e2))
+
 ; === GroupNorm + Activation + Conv3d fusion (VAE resnet inner loop) ===
 
 ; GroupNorm+Act already fused → fold in the Conv that immediately consumes it.
