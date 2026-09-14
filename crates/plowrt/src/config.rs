@@ -105,6 +105,13 @@ pub struct RuntimeConfig {
     #[arg(long = "encode-threads", env = "PLOW_ENCODE_THREADS", global = true)]
     pub encode_threads: Option<u32>,
 
+    /// Smallest piece a split encode hands a thread, in bytes (default 4096). This, not the
+    /// thread count, is what caps the parallelism of a given prompt: the split encode takes
+    /// `min(len / this, threads)` pieces, so an 8192-token prompt (~32 KB) uses at most 8 threads
+    /// at the default no matter how large the pool is.
+    #[arg(long = "encode-split-min", env = "PLOW_ENCODE_SPLIT_MIN", global = true)]
+    pub encode_split_min: Option<u32>,
+
     /// Soft cap on prefix blocks and boundary snapshots as a fraction of the device's
     /// memory, 0..=1 — the unit vLLM's `--gpu-memory-utilization` uses, scoped here to
     /// the prefix cache. A fixed byte count is the wrong unit: 4 GiB is 5% of an H100
