@@ -349,6 +349,23 @@ impl SeqEngine for CpuServe {
             .find_map(|&(p, rows)| (p == prog).then_some(rows))
     }
 
+    fn step_backend(&self) -> crate::sched::step::Backend {
+        if !self.eng.packed_prefill() {
+            return crate::sched::step::Backend::default();
+        }
+        crate::sched::step::Backend {
+            step_budget: self
+                .buckets
+                .iter()
+                .map(|&(_, rows)| rows)
+                .max()
+                .unwrap_or(u32::MAX),
+            packing: true,
+            split_spans: false,
+            decode_rows_join_prefill: false,
+        }
+    }
+
     fn packable_prefill_span(&self, slot: usize, max_rows: u32) -> Option<PrefillSpan> {
         if !self.eng.packed_prefill() || self.live.get(slot).copied()? {
             return None;
@@ -357,7 +374,19 @@ impl SeqEngine for CpuServe {
         if rows == 0 || !rows.is_multiple_of(32) || self.pf_pos.get(slot).copied()? != 0 {
             return None;
         }
-        let wanted = rows.checked_mul(2)?;
+        let peers = self
+            .pf_len
+            .iter()
+            .zip(&self.pf_pos)
+            .zip(&self.live)
+            .filter(|&((&len, &pos), &live)| !live && pos == 0 && len == rows)
+            .count();
+        if peers < 4 {
+            return None;
+        }
+        let wanted = rows
+            .checked_mul(u32::try_from(peers).ok()?)?
+            .min(max_rows);
         let program = self
             .buckets
             .iter()
@@ -447,6 +476,35 @@ impl SeqEngine for CpuServe {
             }
         }
         Ok(())
+    }
+
+    fn terminal_prefill_ready(&self, slot: usize, prompt: &[u32]) -> bool {
+        self.pf_ready.get(slot).is_some_and(Option::is_some)
+            && self.pf_pos.get(slot).copied() == Some(prompt.len() as u32)
+    }
+
+    fn finish_prefill_batch(
+        &mut self,
+        feeds: &[(usize, u32)],
+        members: &[(usize, &[u32])],
+    ) -> Result<Vec<(usize, u32)>> {
+        for &(slot, prompt) in members {
+            self.check_prompt(slot, prompt)?;
+            if !self.terminal_prefill_ready(slot, prompt) {
+                return Err(RuntimeError::Rejected(
+                    "packed prefill member is not ready".into(),
+                ));
+            }
+        }
+        let mut output = self.dispatch(feeds)?;
+        for &(slot, prompt) in members {
+            let token = self.pf_ready[slot]
+                .take()
+                .expect("terminal prefill was validated above");
+            self.admit_prefilled(slot, prompt, token);
+            output.push((slot, token));
+        }
+        Ok(output)
     }
 
     /// `tick_max_bucket` is the mux's interleave budget (u32::MAX when no slot decodes, so a
