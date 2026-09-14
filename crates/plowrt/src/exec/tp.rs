@@ -199,15 +199,21 @@ impl PeerLayout {
     /// Slots per rank for a packet that declares the sequence-parallel result slots.
     pub const SEQ_PAR_SLOTS: u64 = 6;
 
-    /// [`PeerLayout::new`] with an explicit partial-slot count (3, or 6 under the
-    /// sequence-parallel seams). The counter region moves with it, so every rank of one
-    /// group — and every program of one blob — must be laid out with the same count.
+    /// Slots per rank under `PLOW_GLM_ROWSPLIT_ATTN`: `SEQ_PAR_SLOTS` plus
+    /// `act.qa_tp`/`act.qr_tp`/`act.oat_rs_tp` (op 160's two all-to-alls).
+    pub const ROWSPLIT_SLOTS: u64 = 9;
+
+    /// [`PeerLayout::new`] with an explicit partial-slot count (3, 6 under the
+    /// sequence-parallel seams, or 9 under `PLOW_GLM_ROWSPLIT_ATTN`). The counter region moves
+    /// with it, so every rank of one group — and every program of one blob — must be laid out
+    /// with the same count.
     pub fn with_slots(hidden: u32, max_tokens: u32, n_xctr: u32, slots: u64) -> Option<Self> {
         let partial_bytes = max_tokens as u64 * hidden as u64 * 2;
         if partial_bytes == 0 || partial_bytes % PEER_ALIGN != 0 {
             return None;
         }
-        if slots != PARTIAL_SLOTS && slots != Self::SEQ_PAR_SLOTS {
+        if slots != PARTIAL_SLOTS && slots != Self::SEQ_PAR_SLOTS && slots != Self::ROWSPLIT_SLOTS
+        {
             return None;
         }
         let xctr_off = partial_bytes * slots;

@@ -1602,6 +1602,16 @@ __device__ __forceinline__ void exec_mla_merge_fold(CInst in, CTens T, unsigned 
 #define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
     const unsigned bh = in->i[0] * in->i[1]; /* n_batch * n_head_local */
     const unsigned V = in->i[2];             /* v_head_dim: GLM-5.2 256, Kimi-K3 128 */
+    /* Row-split's per-group fold (PLOW_GLM_ROWSPLIT_ATTN): i3=group selects a dense
+     * [n_batch][n_head_local][*] slice of every operand — group-major, since the attention
+     * kernel that filled opart/mlpart has no independent row stride to interleave its
+     * head-groups (amd_sparse_mla.rs's `rowsplit_launch_args`). i3=0 on every packet before
+     * this arm existed makes every offset 0, byte-identical to today. */
+    const size_t fold_g_off = (size_t)in->i[3] * bh;
+    bf16* const FOLD_O = (bf16*)TEN(0) + fold_g_off * V;
+    const float* const FOLD_OPART = (const float*)TEN(1) + fold_g_off * 512;
+    const float* const FOLD_MLPART = (const float*)TEN(2) + fold_g_off * 2;
+    const bf16* const FOLD_WUV = (const bf16*)TEN(3) + (size_t)in->i[3] * in->i[1] * 512 * V;
 #if PLOW_MLA_FOLD_TB > 1
     /* TOKEN-BLOCKED PREFILL ARM (-DPLOW_MLA_FOLD_TB=<G>; op_attention.h d_mla_merge_fold_tb).
      *
@@ -1633,22 +1643,22 @@ __device__ __forceinline__ void exec_mla_merge_fold(CInst in, CTens T, unsigned 
             const unsigned tail = ragged_v256 ? in->i[0] % TB : 0u;
             const unsigned full = in->i[0] - tail;
             d_mla_merge_fold_tb<512, 256, (int)TB>(
-                (bf16*)TEN(0), (const float*)TEN(1), (const float*)TEN(2), (const bf16*)TEN(3),
+                FOLD_O, FOLD_OPART, FOLD_MLPART, FOLD_WUV,
                 full, in->i[1], in->i[2], in->i[4], slice, nblk, raw);
             if (tail) {
                 const size_t rows = (size_t)full * in->i[1];
                 d_mla_merge_fold<512, 256>(
-                    (bf16*)TEN(0) + rows * V,
-                    (const float*)TEN(1) + rows * in->i[4] * 512,
-                    (const float*)TEN(2) + rows * in->i[4] * 2,
-                    (const bf16*)TEN(3), tail, in->i[1], V, in->i[4], slice, nblk, raw);
+                    FOLD_O + rows * V,
+                    FOLD_OPART + rows * in->i[4] * 512,
+                    FOLD_MLPART + rows * in->i[4] * 2,
+                    FOLD_WUV, tail, in->i[1], V, in->i[4], slice, nblk, raw);
             }
             return;
         }
         if (common && V >= 128u && V < 256u && (V % 128u) == 0u &&
             (in->i[0] / TB) * in->i[1] * (V / 128u) >= nblk) {
             d_mla_merge_fold_tb<512, 128, (int)TB>(
-                (bf16*)TEN(0), (const float*)TEN(1), (const float*)TEN(2), (const bf16*)TEN(3),
+                FOLD_O, FOLD_OPART, FOLD_MLPART, FOLD_WUV,
                 in->i[0], in->i[1], in->i[2], in->i[4], slice, nblk, raw);
             return;
         }
@@ -1671,15 +1681,15 @@ __device__ __forceinline__ void exec_mla_merge_fold(CInst in, CTens T, unsigned 
         static_assert(DVT >= PLOW_MLA_FOLD_VEC && DVT <= PLOW_MLA_FOLD_VT, "DVT range");
         if ((V % DVT) == 0u && bh * (V / DVT) <= nblk) {
             d_mla_merge_fold_split<512, (int)DVT, PLOW_MLA_FOLD_VT>(
-                (bf16*)TEN(0), (const float*)TEN(1), (const float*)TEN(2), (const bf16*)TEN(3),
+                FOLD_O, FOLD_OPART, FOLD_MLPART, FOLD_WUV,
                 in->i[0], in->i[1], in->i[2], in->i[4], slice, nblk, raw);
             return;
         }
         if constexpr (DVT * 2 <= PLOW_MLA_FOLD_VT) {
             if ((V % (DVT * 2)) == 0u && bh * (V / (DVT * 2)) <= nblk) {
                 d_mla_merge_fold_split<512, (int)(DVT * 2), PLOW_MLA_FOLD_VT>(
-                    (bf16*)TEN(0), (const float*)TEN(1), (const float*)TEN(2),
-                    (const bf16*)TEN(3), in->i[0], in->i[1], in->i[2], in->i[4], slice, nblk,
+                    FOLD_O, FOLD_OPART, FOLD_MLPART,
+                    FOLD_WUV, in->i[0], in->i[1], in->i[2], in->i[4], slice, nblk,
                     raw);
                 return;
             }
@@ -1688,7 +1698,7 @@ __device__ __forceinline__ void exec_mla_merge_fold(CInst in, CTens T, unsigned 
 #endif
     if (bh && bh * 8u <= nblk) {
         d_mla_merge_fold<512, PLOW_MLA_FOLD_VT>(
-            (bf16*)TEN(0), (const float*)TEN(1), (const float*)TEN(2), (const bf16*)TEN(3),
+            FOLD_O, FOLD_OPART, FOLD_MLPART, FOLD_WUV,
             in->i[0], in->i[1], in->i[2], in->i[4], slice, nblk, raw);
     } else if (V < 256u && V >= 128u) {
         /* VT MUST NOT EXCEED V, or the fast body is unreachable and the op silently runs 7.7x
@@ -1722,8 +1732,8 @@ __device__ __forceinline__ void exec_mla_merge_fold(CInst in, CTens T, unsigned 
          * perf-data/glm52-linear-fp8-reeval.md:228) predates it and MUST be re-recorded before it
          * is used as a pass/fail control again. `-DPLOW_MLA_FOLD_MAP=0` restores the old fold for
          * an A/B without editing code. */
-        d_mla_merge_fold<512, 128>((bf16*)TEN(0), (const float*)TEN(1), (const float*)TEN(2),
-                                   (const bf16*)TEN(3), in->i[0], in->i[1], in->i[2], in->i[4],
+        d_mla_merge_fold<512, 128>(FOLD_O, FOLD_OPART, FOLD_MLPART,
+                                   FOLD_WUV, in->i[0], in->i[1], in->i[2], in->i[4],
                                    slice, nblk, raw);
     } else if (V >= (unsigned)PLOW_MLA_FOLD_VT && V < 128u &&
                (V % (unsigned)PLOW_MLA_FOLD_VT) == 0u) {
@@ -1748,11 +1758,11 @@ __device__ __forceinline__ void exec_mla_merge_fold(CInst in, CTens T, unsigned 
          * in this tree has. `require_mla_geometry` refuses the `V % VEC` case at emit; this one
          * is legal, slow, and rare enough to leave documented rather than paid for. */
         d_mla_merge_fold<512, PLOW_MLA_FOLD_VT>(
-            (bf16*)TEN(0), (const float*)TEN(1), (const float*)TEN(2), (const bf16*)TEN(3),
+            FOLD_O, FOLD_OPART, FOLD_MLPART, FOLD_WUV,
             in->i[0], in->i[1], in->i[2], in->i[4], slice, nblk, raw);
     } else {
-        d_mla_merge_fold<512, 256>((bf16*)TEN(0), (const float*)TEN(1), (const float*)TEN(2),
-                                   (const bf16*)TEN(3), in->i[0], in->i[1], in->i[2], in->i[4],
+        d_mla_merge_fold<512, 256>(FOLD_O, FOLD_OPART, FOLD_MLPART,
+                                   FOLD_WUV, in->i[0], in->i[1], in->i[2], in->i[4],
                                    slice, nblk, raw);
     }
 #undef TEN
@@ -5852,14 +5862,15 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
         } else if (in->op == PLOW_DOP_XALLTOALL_HEADS) {
             /* Row-split sparse attention's cross-GPU head/row transpose.
              *   t0=dst i0=rpr i1=nh_l i2=d i3=nh_total i4=gate i5=n_gpu
-             *   i6=slot_bytes(src offset into peer_scratch) i7=dir(0=q,1=o) */
+             *   i6=slot_bytes(src offset into peer_scratch) i7=dir(0=q,1=o)
+             *   j0=heads_per_group(dir=1 only; nh_total=one interleaved group) */
             const size_t xoff =
                 (const char*)prog.xctr - (const char*)prog.peer_scratch[prog.rank];
             uint32_t* const xaudit = plow_xaudit_status(prog, in);
             d_xalltoall_heads_mega(prog.peer_scratch, prog.n_gpu, prog.rank, xoff, in->i[4],
                                   PLOW_XCTR_DEADLINE_TICKS, xaudit, e.slice, in->blocks,
                                   (bf16*)tens[in->t[0]], in->i[0], in->i[1], in->i[2],
-                                  in->i[3], in->i[6], in->i[7]);
+                                  in->i[3], in->i[6], in->i[7], in->fj[1].u);
 #endif
         } else if (in->op == PLOW_DOP_XARGMAX_FIN) {
             /* Cross-rank fold for a VOCAB-COLUMN-PARALLEL lm_head.

@@ -325,6 +325,15 @@ pub struct RuntimeConfig {
     #[arg(long = "vmm-release-retire", env = "PLOW_VMM_RELEASE_RETIRE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub vmm_release_retire: bool,
 
+    /// Row-band attention (`PLOW_GLM_ROWBAND_ATTN` siblings in the packet): each rank runs its
+    /// `T/8` rows at full head width, which deletes the Q/O all-to-all and the o_proj
+    /// reduce-scatter from the 8192 prefill seam. Read ONCE at engine build, never per request:
+    /// the cost is the full-width `q_absorb`/`q_rope`/`o_proj` twins resident on every rank, so
+    /// turning it off has to skip BINDING them, not just dispatching to them. Off, a packet that
+    /// carries the siblings costs only their program records.
+    #[arg(long = "glm-rowband", env = "PLOW_GLM_ROWBAND", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub glm_rowband: bool,
+
     // ──────────────────────────────────────────────────────────────────────────
     // Diagnostic / observability (shared, off by default)
     // ──────────────────────────────────────────────────────────────────────────
@@ -1504,6 +1513,10 @@ impl RuntimeConfig {
             Self::env_bool("PLOW_VMM_RELEASE_RETIRE"),
             !Self::is_initialized(),
         )
+    }
+
+    pub(crate) fn glm_rowband(&self) -> bool {
+        select_compat(self.glm_rowband, Self::env_bool("PLOW_GLM_ROWBAND"), !Self::is_initialized())
     }
 
     #[cfg(feature = "cuda")]

@@ -3864,6 +3864,58 @@ fn prefault_ns(src: &[u8]) -> u64 {
 
 use crate::asset::checkpoint::{prefetch_depth, prefetch_threads};
 
+/// A column-parallel weight declared a second time at full width (`PLOW_GLM_ROWBAND_ATTN`, and the
+/// all-to-all arm's W_uv replica). Its shard is a contiguous row range of that twin (`slice_for`),
+/// so the rank binds the shard as a view `rank * bytes` into the twin instead of a second copy.
+/// Per tensor: the index of its full twin, when it has one.
+fn column_twins(tensors: &[crate::asset::devblob::DevTensor], n_gpu: u32) -> Vec<Option<usize>> {
+    tensors
+        .iter()
+        .enumerate()
+        .map(|(i, td)| {
+            if n_gpu < 2
+                || !packet::names::is_checkpoint_weight(&td.name)
+                || crate::asset::shard::shard_of(&td.name) != crate::asset::shard::Shard::Column
+            {
+                return None;
+            }
+            let full = td.bytes.checked_mul(u64::from(n_gpu))?;
+            tensors
+                .iter()
+                .enumerate()
+                .position(|(j, w)| j != i && w.name == td.name && w.bytes == full)
+        })
+        .collect()
+}
+
+/// The full-width twins the row-band arm declares: a checkpoint weight that also has a
+/// `1/n_gpu` declaration. With `--glm-rowband` off these are never carved and never uploaded,
+/// so a packet that carries the siblings costs their program records and nothing else.
+fn rowband_twin_ids(tensors: &[crate::asset::devblob::DevTensor], n_gpu: u32) -> Vec<bool> {
+    tensors
+        .iter()
+        .map(|t| {
+            n_gpu > 1
+                && packet::names::is_checkpoint_weight(&t.name)
+                && tensors.iter().any(|s| s.name == t.name && s.bytes * u64::from(n_gpu) == t.bytes)
+        })
+        .collect()
+}
+
+/// Device bytes the row-band arm replicates on every rank: each full-width weight that also has
+/// a `1/n_gpu` declaration, plus the FP32 copy the native fold makes of the full W_uv.
+fn rowband_replicated_bytes(tensors: &[crate::asset::devblob::DevTensor], n_gpu: u32) -> u64 {
+    tensors
+        .iter()
+        .filter(|t| {
+            n_gpu > 1
+                && packet::names::is_checkpoint_weight(&t.name)
+                && tensors.iter().any(|s| s.name == t.name && s.bytes * u64::from(n_gpu) == t.bytes)
+        })
+        .map(|t| if t.name.ends_with("derived.v_absorb.weight") { 3 * t.bytes } else { t.bytes })
+        .sum()
+}
+
 /// The bytes rank `rank` will actually TOUCH for `name`, as a queueable span.
 ///
 /// Not the whole tensor: a column-parallel rank binds one contiguous 1/tp range
@@ -5234,6 +5286,28 @@ pub(crate) fn chunk_steps_over(
     Ok(out)
 }
 
+/// The program one chunk runs: the bucket's row-split `sibling` only for a full chunk the sibling
+/// can key. The all-to-all arm (`PLOW_GLM_ROWSPLIT_ATTN`) needs every row to own the 2048 causal
+/// keys; the row-band arm (`rowband`, `PLOW_GLM_ROWBAND_ATTN`) also takes a chunk whose low bands
+/// read every causal key (`amd_sparse_mla::band_keys`), which includes a first chunk at prior 0.
+/// Every other chunk runs the bucket exactly as without the lever.
+pub(crate) fn rowsplit_chunk_prog(
+    step: ChunkStep,
+    bucket_rows: u32,
+    sibling: Option<usize>,
+    rowband: bool,
+) -> usize {
+    let keyed = if rowband {
+        amd_sparse_mla::rowsplit_prior_ok(step.c0, bucket_rows / 8)
+    } else {
+        step.c0 >= amd_sparse_mla::SPAN_MIN_PRIOR
+    };
+    match sibling {
+        Some(s) if step.clen == bucket_rows && keyed => s,
+        _ => step.prog,
+    }
+}
+
 /// One chunk of a prefill plan: which bucket program runs it, and over which
 /// absolute token range.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5779,6 +5853,13 @@ pub struct AmdEngine {
     /// the DSA selection width it stands in for. Empty unless armed.
     dense_exact_ladder: Vec<usize>,
     dense_exact_select: u32,
+    /// Per program: the bucket's [`ProgramRole::RowSplitSibling`], if the packet carries one.
+    rowsplit_sibling: Vec<Option<usize>>,
+    /// Per program: a row-split sibling on the row-band arm (no head all-to-all).
+    rowband_sibling: Vec<bool>,
+    /// `--glm-rowband` as read at engine build. Serve-start only: with it off the packet's
+    /// full-width twins were never bound, so the siblings must never be dispatched either.
+    rowband_on: bool,
     devp: Vec<DeviceMem>,
     /// Owner of the one allocation the ordinarily-allocated tensors are carved
     /// out of; `devp` then holds **views** into it. Unlike the CUDA side, this
@@ -6721,7 +6802,12 @@ impl AmdEngine {
             return Err(RuntimeError::Device("AITER MoE requires gfx942 TP8".into()));
         }
         let use_sparse_mla = crate::config::RuntimeConfig::get().amd.mla_pf_aiter;
-        check_sparse_fp8_packet(&blob.progs, &blob.tensors, &arch)?;
+        check_sparse_fp8_packet(
+            &blob.progs,
+            &blob.tensors,
+            &arch,
+            hsaco_dir.join(amd_sparse_mla::OBJECT16).exists(),
+        )?;
         check_dsa_select_local(&blob.progs, &blob.tensors, &arch,
                                tp.is_some_and(|t| t.n_gpu == 8))?;
         check_xalltoall_heads(&blob.progs, &blob.tensors, &arch)?;
@@ -8736,19 +8822,41 @@ impl AmdEngine {
                     | (true, "act.h2_tp")
                     | (true, "act.xe_tp")
                     | (true, "act.rt_tp")
+                    | (true, "act.qa_tp")
+                    | (true, "act.qr_tp")
+                    | (true, "act.oat_rs_tp")
             )
         };
         // Rank-relative BAND VIEWS (`<base>@band<t>`, sequence-parallel seams): rows
         // `[rank*t/tp, (rank+1)*t/tp)` of an already-bound base, i.e. `base + rank * bytes`.
         // Storage belongs to the base, so they are views like the peer slots.
         let is_band_view = |name: &str| tp.is_some() && name.contains("@band");
-        let slab_bytes: u64 = blob
-            .tensors
-            .iter()
-            .enumerate()
-            .filter(|(id, td)| !is_peer_slot(&td.name) && !is_band_view(&td.name) && cache_va[*id].is_none())
-            .map(|(_, td)| slab_carve(td.bytes))
-            .sum();
+        // Serve-start, never per request: the row-band cost is RESIDENT weights, so the knob
+        // has to decide binding, not just dispatch. Off, the shard carves its own storage (the
+        // ordinary path) and the full twin is skipped entirely.
+        let rowband_on = config.glm_rowband();
+        let rb_twin = rowband_twin_ids(&blob.tensors, n_gpu);
+        let twins = if rowband_on {
+            column_twins(&blob.tensors, n_gpu)
+        } else {
+            vec![None; blob.tensors.len()]
+        };
+        let carved = |id: usize, name: &str| {
+            !is_peer_slot(name)
+                && !is_band_view(name)
+                && cache_va[id].is_none()
+                && twins[id].is_none()
+                && (rowband_on || !rb_twin[id])
+        };
+        // Slab offset of every carved tensor, so a column shard can view a full twin declared after it.
+        let mut carve_at = vec![None; blob.tensors.len()];
+        let mut slab_bytes: u64 = 0;
+        for (id, td) in blob.tensors.iter().enumerate() {
+            if carved(id, &td.name) {
+                carve_at[id] = Some(slab_bytes);
+                slab_bytes += slab_carve(td.bytes);
+            }
+        }
 
         // ---- EVERY checkpoint weight is RESOLVED before a byte is uploaded
         //
@@ -8842,6 +8950,12 @@ impl AmdEngine {
                 (Some(t), "act.h2_tp") => Some(t.scratch_base + 3 * t.slot_b),
                 (Some(t), "act.xe_tp") => Some(t.scratch_base + 4 * t.slot_b),
                 (Some(t), "act.rt_tp") => Some(t.scratch_base + 5 * t.slot_b),
+                // Slots 6/7/8: PLOW_GLM_ROWSPLIT_ATTN's two all-to-alls (op 160) — this rank's
+                // un-gathered Q (qa/qr) and the row-split fold's output, before the all-to-all
+                // back into `act.oat`. Requires the seq-par-seams region (9 slots total).
+                (Some(t), "act.qa_tp") => Some(t.scratch_base + 6 * t.slot_b),
+                (Some(t), "act.qr_tp") => Some(t.scratch_base + 7 * t.slot_b),
+                (Some(t), "act.oat_rs_tp") => Some(t.scratch_base + 8 * t.slot_b),
                 _ => None,
             };
             if let Some(base) = peer_slot {
@@ -8850,6 +8964,15 @@ impl AmdEngine {
                     "bound into the peer region"
                 );
                 devp.push(DeviceMem::view(base, td.bytes.max(1)));
+                names.push(td.name.clone());
+                n_view += 1;
+                continue;
+            }
+            // Row-band off: the full-width twin is declared by the packet but nothing may read
+            // it, because the siblings that would are never dispatched. Bind one byte at
+            // address 0 so a stray access faults instead of silently reading other weights.
+            if !rowband_on && rb_twin[i] {
+                devp.push(DeviceMem::view(0, 1));
                 names.push(td.name.clone());
                 n_view += 1;
                 continue;
@@ -8875,6 +8998,21 @@ impl AmdEngine {
                     )));
                 }
                 devp.push(DeviceMem::view(base_mem.base + off, td.bytes.max(1)));
+                names.push(td.name.clone());
+                n_view += 1;
+                continue;
+            }
+            let slab_base = match &weight_slab {
+                WeightSlab::Vmm(slab) => Some(slab.base()),
+                WeightSlab::Flat(slab) => Some(slab.base),
+                WeightSlab::PerTensor => None,
+            };
+            if let (Some(twin), Some(slab_base)) = (twins[i], slab_base) {
+                let at = carve_at[twin].ok_or_else(|| {
+                    RuntimeError::Device(format!("{}: its full twin is not carved from the slab", td.name))
+                })?;
+                let rank = u64::from(tp.map_or(0, |t| t.rank));
+                devp.push(DeviceMem::view(slab_base + at + rank * td.bytes, td.bytes.max(1)));
                 names.push(td.name.clone());
                 n_view += 1;
                 continue;
@@ -9741,6 +9879,24 @@ impl AmdEngine {
         let decode_ladder = ladder(|r| r.is_decode_rung() && !r.is_dense_exact_rung());
         let prefill_ladder = ladder(ProgramRole::is_prefill_bucket);
         let dense_exact_ladder = ladder(ProgramRole::is_dense_exact_rung);
+        let rowsplit_sibling: Vec<Option<usize>> = blob
+            .progs
+            .iter()
+            .map(|p| {
+                blob.progs
+                    .iter()
+                    .position(|s| s.role == ProgramRole::RowSplitSibling { of_rows: p.t })
+                    .filter(|_| p.role.is_prefill_bucket())
+            })
+            .collect();
+        let rowband_sibling: Vec<bool> = blob
+            .progs
+            .iter()
+            .map(|p| {
+                p.role.is_rowsplit_sibling()
+                    && !p.insts.iter().any(|d| d.op == DevOp::XAllToAllHeads as u16)
+            })
+            .collect();
         let decode = *decode_ladder.last().ok_or_else(|| {
             RuntimeError::Device("devblob: no decode rung in the program table".into())
         })?;
@@ -10157,6 +10313,31 @@ impl AmdEngine {
             shared_prefix = shared_prefix.is_some(),
             "AMD engine ready"
         );
+        // Every GPU job logs what the load left free. `PLOW_GLM_ROWBAND_ATTN` replicates attention
+        // projections on every rank, so a packet carrying them must leave that much again plus
+        // 8 GiB, or the KV pool would absorb the cost silently.
+        let replicated = if rowband_on { rowband_replicated_bytes(&blob.tensors, n_gpu) } else { 0 };
+        let free = VmmOps::free_bytes(&*be);
+        tracing::info!(
+            rank,
+            free_gib = free.map(|f| f as f64 / (1u64 << 30) as f64),
+            replicated_gib = replicated as f64 / (1u64 << 30) as f64,
+            "device memory after load"
+        );
+        if replicated > 0 {
+            match free {
+                Some(f) if f < replicated + (8 << 30) => {
+                    return Err(RuntimeError::Device(format!(
+                        "PLOW_GLM_ROWBAND_ATTN: rank {rank} has {} MiB free after load, needs the \
+                         {} MiB of replicated projections plus 8 GiB",
+                        f >> 20,
+                        replicated >> 20
+                    )))
+                }
+                Some(_) => {}
+                None => tracing::warn!("PLOW_GLM_ROWBAND_ATTN: free device memory is unknown; load not checked"),
+            }
+        }
         // P3 (coalesce the two decode scalar H2Ds into one) is only legal when
         // `in.kvlen` sits immediately after `in.pos` IN THE DEVICE LAYOUT, so
         // log the two bases: the answer is a property of this blob's slab, not
@@ -10252,6 +10433,9 @@ impl AmdEngine {
             prefill_ladder,
             dense_exact_ladder,
             dense_exact_select,
+            rowsplit_sibling,
+            rowband_sibling,
+            rowband_on,
             devp,
             _weight_slab: weight_slab,
             d_tens,
@@ -11436,7 +11620,7 @@ impl AmdEngine {
                 n: self.packed_spans.len() as u32,
             });
             kernel.enqueue(&self.be, route, &self.tens_table, self.tp.unwrap(), spans)?;
-            self.seg_launches += 4;
+            self.seg_launches += route.launches() as u64;
             return Ok(());
         }
         if let Some(PrefillSegmentRoute::MoeAiter(route)) =
@@ -11465,8 +11649,8 @@ impl AmdEngine {
                 let sparse = self.sparse_mla.as_ref().ok_or_else(|| {
                     RuntimeError::Device("sparse MLA route has no loaded kernels".into())
                 })?;
-                sparse.enqueue(&self.be, route, &self.tens_table)?;
-                self.seg_launches += 3;
+                sparse.enqueue(&self.be, route, &self.tens_table, self.tp.map_or(0, |t| t.rank))?;
+                self.seg_launches += route.active_launches() as u64;
                 return Ok(());
             }
             if route.split_row0 != 0 {
@@ -11967,12 +12151,12 @@ impl AmdEngine {
                 Some(PrefillSegmentRoute::GemmBlk(route)) => route.launches(),
                 Some(PrefillSegmentRoute::MlaFold(_)) => 3,
                 Some(PrefillSegmentRoute::MoeAiter(route)) => route.launches() as usize,
-                Some(PrefillSegmentRoute::IndexTp(_)) => 4,
+                Some(PrefillSegmentRoute::IndexTp(route)) => route.launches(),
                 _ => 1,
             };
         }
         match self.progs[p].prefill_routes.get(seg) {
-            Some(PrefillSegmentRoute::SparseMla(route)) if route.active => 3,
+            Some(PrefillSegmentRoute::SparseMla(route)) if route.active => route.active_launches(),
             Some(PrefillSegmentRoute::SparseMla(route)) if route.native_lo => self
                 .sparse_mla
                 .as_ref()
@@ -11981,7 +12165,7 @@ impl AmdEngine {
             Some(PrefillSegmentRoute::GemmBlk(route)) => route.launches(),
             Some(PrefillSegmentRoute::MlaFold(_)) => 3,
             Some(PrefillSegmentRoute::MoeAiter(route)) => route.launches() as usize,
-            Some(PrefillSegmentRoute::IndexTp(_)) => 4,
+            Some(PrefillSegmentRoute::IndexTp(route)) => route.launches(),
             Some(PrefillSegmentRoute::MoeEpAlign(_)) if self.k_moe_ep_align.is_some() => 4,
             Some(PrefillSegmentRoute::MoeStage1A4Reuse(_))
                 if self.k_moe_stage1_a4_quant.is_some() && self.k_moe_stage1_a4_reuse.is_some() =>
@@ -12844,6 +13028,25 @@ impl AmdEngine {
         self.patch_prefill_rows(prog, c0, clen, self.ragged_bucket(prog))
     }
 
+    /// `step` resolved to the program that executes it ([`rowsplit_chunk_prog`]). The sibling
+    /// has no native route without the sparse AITER MLA kernels, so it is never picked then.
+    pub fn chunk_program(&self, step: ChunkStep) -> ChunkStep {
+        let sibling = self
+            .rowsplit_sibling
+            .get(step.prog)
+            .copied()
+            .flatten()
+            .filter(|_| self.sparse_mla.is_some())
+            .filter(|_| self.rowband_on);
+        let rowband = sibling.is_some_and(|s| self.rowband_sibling[s]);
+        let prog = rowsplit_chunk_prog(step, self.progs[step.prog].t, sibling, rowband);
+        if prog != step.prog {
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| tracing::info!(prog, "PLOW_GLM_ROWSPLIT_ATTN: row-split sibling selected"));
+        }
+        ChunkStep { prog, ..step }
+    }
+
     /// Resolve a chunk plan to the programs and ranges that run it.
     ///
     /// Shared by the single-GPU prefill and the TP one, so both walk the prompt
@@ -13058,6 +13261,7 @@ impl AmdEngine {
     }
 
     pub(crate) fn prefill_chunk(&mut self, prompt: &[u32], step: ChunkStep) -> Result<()> {
+        let step = self.chunk_program(step);
         self.prefill_prepare(prompt, step)?;
         self.run_segmented(step.prog)
     }
@@ -13130,6 +13334,7 @@ impl AmdEngine {
         );
 
         for step in steps {
+            let step = self.chunk_program(step);
             let t = std::time::Instant::now();
             self.prefill_prepare(prompt, step)?;
             crate::obs::ttft::PF_PREPARE.add(t.elapsed().as_nanos() as u64);

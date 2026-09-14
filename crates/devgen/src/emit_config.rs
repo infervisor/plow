@@ -864,6 +864,15 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_ROWSPLIT_ATTN", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_rowsplit_attn: Option<bool>,
 
+    /// Row-band sparse attention with replicated projections for the GLM 8192 prefill rung
+    /// (`PLOW_GLM_ROWBAND_ATTN`), the row-split sibling's other arm: each rank runs its `T/8`
+    /// rows with every head, q_absorb/q_rope/o_proj at full width on that band and one native
+    /// 64-head fold, with no head all-to-all and no attention reduce-scatter. Opt-in, OFF by
+    /// default; the full-width projections cost ~16.9 GiB per rank on GLM-5.3 TP8. Excludes
+    /// `PLOW_GLM_ROWSPLIT_ATTN`.
+    #[arg(long, env = "PLOW_GLM_ROWBAND_ATTN", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_rowband_attn: Option<bool>,
+
     /// Size the batched-decode glue packets to their work items: the FP8 latent KV writer at one
     /// wave per row instead of one workgroup, the router top-k at one workgroup per token, the
     /// MoE combine at one thread per element. Pure width changes, bit-identical.
@@ -1336,6 +1345,7 @@ impl EmitConfig {
             glm_seq_par: env_bool_opt("PLOW_GLM_SEQ_PAR"),
             glm_seq_par_proj: env_bool_opt("PLOW_GLM_SEQ_PAR_PROJ"),
             glm_rowsplit_attn: env_bool_opt("PLOW_GLM_ROWSPLIT_ATTN"),
+            glm_rowband_attn: env_bool_opt("PLOW_GLM_ROWBAND_ATTN"),
             glm_decode_glue_cus: env_bool("PLOW_GLM_DECODE_GLUE_CUS"),
             glm_decode_gemm_group: env_bool_opt("PLOW_GLM_DECODE_GEMM_GROUP"),
             glm_fuse_xrn: env_bool("GLM_FUSE_XRN"),
@@ -1595,6 +1605,25 @@ impl EmitConfig {
     /// produced before the arm existed.
     pub fn glm_rowsplit_attn(&self) -> bool {
         self.glm_rowsplit_attn.unwrap_or(false)
+    }
+
+    /// OFF by default, like [`Self::glm_rowsplit_attn`].
+    pub fn glm_rowband_attn(&self) -> bool {
+        self.glm_rowband_attn.unwrap_or(false)
+    }
+
+    /// The row-split sibling's arm, or `None` when neither knob is on. Checkpoint K refuses
+    /// both (`rowband_attn_excludes_rowsplit_attn`); this is the backstop.
+    pub fn glm_rowsplit_arm(&self) -> Option<packet::devbuild::RowSplitArm> {
+        use packet::devbuild::RowSplitArm;
+        match (self.glm_rowsplit_attn(), self.glm_rowband_attn()) {
+            (true, true) => panic!(
+                "PLOW_GLM_ROWSPLIT_ATTN and PLOW_GLM_ROWBAND_ATTN are two arms of one row-split sibling; set one"
+            ),
+            (true, false) => Some(RowSplitArm::AllToAll),
+            (false, true) => Some(RowSplitArm::Replicated),
+            (false, false) => None,
+        }
     }
 
     /// The `(clap id, still unset, resolved value)` triples [`super::apply_production_defaults`]

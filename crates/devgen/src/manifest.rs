@@ -147,6 +147,7 @@ pub struct ProgramArms {
     pub kind: &'static str,
     pub packed_prefill_only: bool,
     pub dense_exact: bool,
+    pub rowsplit_only: bool,
     /// Prefill chunk rows, or decode batch — the `T` the program was compiled for.
     pub t: u32,
     pub seg: Option<u32>,
@@ -180,6 +181,7 @@ fn program_arms(m: &Model) -> Vec<ProgramArms> {
                 kind,
                 packed_prefill_only: packet::devbuild::is_packed_prefill_program(encoded_t),
                 dense_exact,
+                rowsplit_only: packet::devbuild::is_rowsplit_prefill_program(encoded_t),
                 t,
                 seg,
                 insts: arms.1,
@@ -450,6 +452,7 @@ fn shapes(m: &Model) -> Shapes {
         if !decode
             && !packet::devbuild::is_packed_prefill_program(encoded)
             && !packet::devbuild::is_token_batch_program(encoded)
+            && !packet::devbuild::is_rowsplit_prefill_program(encoded)
         {
             s.prefill_buckets.push(packet::devbuild::program_rows(
                 m.prog_t.get(pi).copied().unwrap_or(0),
@@ -1489,7 +1492,8 @@ fn analysis(progs: &[ProgramArms]) -> Value {
                 q.kind == p.kind
                     && (q.t != p.t
                         || q.seg != p.seg
-                        || q.packed_prefill_only != p.packed_prefill_only)
+                        || q.packed_prefill_only != p.packed_prefill_only
+                        || q.rowsplit_only != p.rowsplit_only)
             })
             .flat_map(|q| q.arms.iter())
             .collect();
@@ -1913,6 +1917,8 @@ fn dispatch_chains(progs: &[ProgramArms], arch: &str) -> Vec<Value> {
                 "packed"
             } else if first.dense_exact {
                 "dense_exact"
+            } else if first.rowsplit_only {
+                "rowsplit"
             } else {
                 "ordinary"
             },
@@ -2099,6 +2105,8 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport, packed_prefill: 
                     "packed"
                 } else if p.dense_exact {
                     "dense_exact"
+                } else if p.rowsplit_only {
+                    "rowsplit"
                 } else {
                     "ordinary"
                 }),
@@ -3817,6 +3825,7 @@ mod tests {
             kind: "prefill",
             packed_prefill_only: false,
             dense_exact: false,
+            rowsplit_only: false,
             t: 8192,
             seg: Some(1),
             arms: BTreeSet::from([arm(op)]),
@@ -3852,6 +3861,7 @@ mod tests {
             kind: "decode",
             packed_prefill_only: false,
             dense_exact: false,
+            rowsplit_only: false,
             t: 1,
             seg: Some(1),
             arms: ops.iter().map(|op| arm(op)).collect(),

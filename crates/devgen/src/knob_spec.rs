@@ -504,6 +504,40 @@ const DENSE_EXACT_SCOPE: &[Allow] = &[Allow {
 
 /// The row-split attention arm: attention and the all-to-all in the 2048..8192 prefill buckets,
 /// and the packet-wide object facts its arm adds.
+const ROWBAND_ATTN_SCOPE: &[Allow] = &[
+    Allow {
+        kinds: &["prefill"],
+        rows: (8192, 8192),
+        topology: Some("rowsplit"),
+        fields: &[
+            ScopeField::ProgramSet,
+            ScopeField::Op,
+            ScopeField::Operands,
+            ScopeField::Shape,
+            ScopeField::Cus,
+            ScopeField::Segments,
+            ScopeField::TensorBytes,
+            ScopeField::ObjectFacts,
+        ],
+        ..Allow::ANY
+    },
+    Allow {
+        kinds: &["global"],
+        fields: &[ScopeField::ObjectFacts, ScopeField::TensorBytes],
+        ..Allow::ANY
+    },
+];
+
+const C_ROWBAND_ATTN: &[Constraint] = &[Constraint {
+    id: "rowband_attn_excludes_rowsplit_attn",
+    formula: F::Implies(
+        &F::Atom("emit.glm_rowband_attn", Cmp::Eq, TRUE),
+        &F::Not(&F::Atom("emit.glm_rowsplit_attn", Cmp::Eq, TRUE)),
+    ),
+    site: "crates/devgen/src/emit_config.rs: PLOW_GLM_ROWBAND_ATTN and PLOW_GLM_ROWSPLIT_ATTN are two arms of one row-split sibling",
+    check: Check::Load,
+}];
+
 const ROWSPLIT_ATTN_SCOPE: &[Allow] = &[
     Allow {
         kinds: &["prefill"],
@@ -746,6 +780,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.glm_seq_par", Some("PLOW_GLM_SEQ_PAR"), Layer::Emit, Domain::Bool, GLM_SEQ_PAR_DEFAULT, GLM_RECIPE).with(C_SEQ_PAR),
     KnobSpec::new("emit.glm_seq_par_proj", Some("PLOW_GLM_SEQ_PAR_PROJ"), Layer::Emit, Domain::Bool, GLM_SEQ_PAR_PROJ_DEFAULT, GLM_RECIPE).with(C_SEQ_PAR_PROJ),
     KnobSpec::new("emit.glm_rowsplit_attn", Some("PLOW_GLM_ROWSPLIT_ATTN"), Layer::Emit, Domain::Bool, UNSET, OPT_IN).scoped(ROWSPLIT_ATTN_SCOPE),
+    KnobSpec::new("emit.glm_rowband_attn", Some("PLOW_GLM_ROWBAND_ATTN"), Layer::Emit, Domain::Bool, UNSET, OPT_IN).scoped(ROWBAND_ATTN_SCOPE).with(C_ROWBAND_ATTN),
     KnobSpec::new("emit.glm_decode_glue_cus", Some("PLOW_GLM_DECODE_GLUE_CUS"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_decode_gemm_group", Some("PLOW_GLM_DECODE_GEMM_GROUP"), Layer::Emit, Domain::Bool, GLM_RECIPE_ON, GLM_RECIPE),
     KnobSpec::new("emit.glm_fuse_xrn", Some("GLM_FUSE_XRN"), Layer::Emit, Domain::Bool, OFF, OPT_IN),

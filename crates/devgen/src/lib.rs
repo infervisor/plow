@@ -3426,6 +3426,7 @@ pub(crate) fn emit_xall_gather(
 /// written into this rank's own peer slot at `slot_bytes` by an earlier packet (the `deps`).
 /// One xctr gate, one-workgroup rendezvous. TP8 only.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_xalltoall_heads(
     b: &mut Builder,
     xgate: &mut u32,
@@ -3439,6 +3440,7 @@ pub(crate) fn emit_xalltoall_heads(
     tp: u32,
     slot_bytes: u32,
     dir: u32,
+    heads_per_group: u32,
 ) -> u32 {
     assert_eq!(
         nh_total,
@@ -3446,6 +3448,12 @@ pub(crate) fn emit_xalltoall_heads(
         "XAllToAllHeads: nh_total must be nh_l * tp"
     );
     assert!(dir <= 1, "XAllToAllHeads: dir must be 0 (Q) or 1 (O)");
+    assert!(
+        heads_per_group > 0
+            && heads_per_group % nh_l == 0
+            && nh_total % heads_per_group == 0,
+        "XAllToAllHeads: heads_per_group must divide nh_total and be a multiple of nh_l"
+    );
     let elems = rpr * nh_total * d;
     let need = (elems.div_ceil(512).max(1) as usize).min(xr_cus.len());
     let xr_cus = &xr_cus[..need];
@@ -3461,6 +3469,7 @@ pub(crate) fn emit_xalltoall_heads(
         inst.i[5] = tp;
         inst.i[6] = slot_bytes;
         inst.i[7] = dir;
+        inst.j[0] = heads_per_group;
     })
 }
 

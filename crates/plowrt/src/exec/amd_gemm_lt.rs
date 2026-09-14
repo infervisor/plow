@@ -132,6 +132,12 @@ fn band_choice(rows: u32, n: u32, k: u32) -> Option<(usize, u32)> {
         (1024, 128, 6144) => (24, 1),
         (1024, 64, 6144) => (10, 524289),
         (1024, 32, 6144) => (25, 524289),
+        // PLOW_GLM_ROWBAND_ATTN's full-width band projections, each the best of the 456 at its
+        // shape (lever-hunt sweeps, rotating): o_proj kernel 116 (415 us), q_absorb kernel 100
+        // (272 us), q_rope kernel 428 (60 us).
+        (1024, 6144, 16384) => (EXT + 14, 524296),
+        (1024, 32768, 2048) => (EXT + 15, 524292),
+        (1024, 4096, 2048) => (EXT + 16, 1),
         (256, 2048, 6144) => (20, 524294),
         (256, 512, 6144) => (21, 524289),
         (256, 256 | 128, 6144) => (23, 524289),
@@ -667,6 +673,24 @@ mod tests {
         p.t = 4096;
         p.insts[0].i = [512, 2048, 6144, 2, 0, 0, 0, 0];
         assert!(routes(&p, &tn, 1).is_err(), "no band kernels at 512 rows");
+    }
+
+    #[test]
+    fn row_band_projection_routes_have_pinned_kernels() {
+        let specs = all_specs();
+        for (n, k) in [(32768, 2048), (4096, 2048), (6144, 16384)] {
+            let (mut p, tn) = fixture();
+            p.t = 8192;
+            p.insts[0].i = [1024, n, k, 2, 0, 0, 0, 0];
+            let mut route = routes(&p, &tn, 1).unwrap()[0].unwrap();
+            route.rebase(8192).unwrap();
+            let (index, info1) = route.kernel_choice();
+            assert!(index < specs.len(), "1024x{n}x{k}");
+            let args = arguments(route, [0x100000000000, 32, 64], &specs[index], info1);
+            assert_eq!(args.dims[4..6], [n, 1024]);
+        }
+        let (index, _) = band_choice(1024, 6144, 16384).unwrap();
+        assert_eq!((specs[index].mt_i, specs[index].mt_j), (160, 160), "kernel 116 of the sweep");
     }
 
     const DECODE_SHAPES: [(u32, u32); 11] = [

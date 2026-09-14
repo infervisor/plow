@@ -510,7 +510,7 @@ impl AmdTpGroup {
             );
         }
         let gate_expect = gate_expectations(&blob, n_gpu, n_xctr);
-        let slots = check_seq_par_seams(&blob, n_gpu)?;
+        let slots = check_rowsplit_attn(&blob, check_seq_par_seams(&blob, n_gpu)?)?;
         let layout =
             PeerLayout::with_slots(tp.hidden, max_tokens, n_xctr, slots).ok_or_else(|| {
                 RuntimeError::Device(format!(
@@ -1716,6 +1716,8 @@ impl AmdTpGroup {
         next: Option<ChunkStep>,
     ) -> Result<()> {
         use crate::obs::ttft;
+        let step = self.ranks[0].chunk_program(step);
+        let next = next.map(|n| self.ranks[0].chunk_program(n));
         let tick_log = crate::obs::tick::on();
         let (mut prepare_ns, mut rearm_ns) = (0u64, 0u64);
         let maps = |ranks: &[AmdEngine]| ranks.iter().map(AmdEngine::kv_mappings).sum::<u64>();
@@ -2253,6 +2255,35 @@ fn check_seq_par_seams(blob: &DevBlob, n_gpu: u32) -> Result<u64> {
     Ok(PeerLayout::SEQ_PAR_SLOTS)
 }
 
+/// `PLOW_GLM_ROWSPLIT_ATTN` (op 160, `DevOp::XAllToAllHeads`): the region grows to
+/// [`PeerLayout::ROWSPLIT_SLOTS`], on top of the seq-par-seams slots the 8192 rung always
+/// carries under the qualified recipe.
+fn check_rowsplit_attn(blob: &DevBlob, seq_par_slots: u64) -> Result<u64> {
+    use packet::dev::DevOp;
+    let carries = blob
+        .progs
+        .iter()
+        .any(|p| p.insts.iter().any(|d| d.op == DevOp::XAllToAllHeads as u16));
+    if !carries {
+        return Ok(seq_par_slots);
+    }
+    if seq_par_slots != PeerLayout::SEQ_PAR_SLOTS {
+        return Err(RuntimeError::Device(
+            "packet carries XAllToAllHeads without the sequence-parallel seam slots it is laid \
+             out against"
+                .into(),
+        ));
+    }
+    for name in ["act.qa_tp", "act.qr_tp", "act.oat_rs_tp"] {
+        if !blob.tensors.iter().any(|t| t.name == name) {
+            return Err(RuntimeError::Device(format!(
+                "packet carries XAllToAllHeads but declares no `{name}` peer slot"
+            )));
+        }
+    }
+    Ok(PeerLayout::ROWSPLIT_SLOTS)
+}
+
 fn count_xgates(blob: &DevBlob) -> u32 {
     use packet::dev::DevOp;
     let mut top = 0u32;
@@ -2333,9 +2364,12 @@ fn gate_expectations(blob: &DevBlob, n_gpu: u32, n_xctr: u32) -> Vec<Vec<Option<
                     set(d.i[3], Some(n_gpu));
                     set(d.i[4], Some(n_gpu * d.blocks as u32));
                 } else if d.op == DevOp::IndexTpPf as u16 {
+                    // Local band (i7 = 1, row-split sibling): gather and complete never run, so
+                    // their reserved gates must read 0 on every rank.
+                    let peers = if d.i[7] == 1 { 0 } else { n_gpu };
                     set(d.i[5], Some(n_gpu));
-                    set(d.i[5] + 1, Some(n_gpu));
-                    set(d.i[6], Some(n_gpu));
+                    set(d.i[5] + 1, Some(peers));
+                    set(d.i[6], Some(peers));
                 } else if d.op == DevOp::XReduceScatter as u16 || d.op == DevOp::XAllGather as u16 {
                     // Both announce with ONE workgroup per rank: their producers are earlier
                     // packets, the gate_rs argument.
@@ -2729,6 +2763,19 @@ mod tests {
         assert_eq!(count_xgates(&blob), 14);
         let e = gate_expectations(&blob, 8, 14);
         assert_eq!(&e[0][11..14], &[Some(8), Some(8), Some(8)]);
+        let mut local = index;
+        local.i[5] = 14;
+        local.i[6] = 16;
+        local.i[7] = 1;
+        blob.progs[0].insts.push(local);
+        assert_eq!(count_xgates(&blob), 17, "the local band keeps its three gate ids reserved");
+        let e = gate_expectations(&blob, 8, 17);
+        assert_eq!(&e[0][11..14], &[Some(8), Some(8), Some(8)]);
+        assert_eq!(
+            &e[0][14..17],
+            &[Some(8), Some(0), Some(0)],
+            "local band: select arrives, gather and complete never do"
+        );
     }
 
     /// XAllToAllHeads (row-split sparse attention's cross-GPU head/row transpose) carries its

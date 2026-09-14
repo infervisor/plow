@@ -3270,8 +3270,8 @@ fn sparse_fp8_rejects_stale_objects_and_invalid_handles() {
         bytes: 16 * 81920 * 512,
         init: None,
     }];
-    assert!(check_sparse_fp8_packet(std::slice::from_ref(&p), &tensors, "gfx942").is_ok());
-    assert!(check_sparse_fp8_packet(std::slice::from_ref(&p), &tensors, "gfx950").is_err());
+    assert!(check_sparse_fp8_packet(std::slice::from_ref(&p), &tensors, "gfx942", false).is_ok());
+    assert!(check_sparse_fp8_packet(std::slice::from_ref(&p), &tensors, "gfx950", false).is_err());
     assert!(
         check_sparse_fp8_object(&[], Path::new("old"), std::slice::from_ref(&p), true).is_err()
     );
@@ -3283,9 +3283,38 @@ fn sparse_fp8_rejects_stale_objects_and_invalid_handles() {
     )
     .is_ok());
     p.insts[0].fj[1] = u32::MAX;
-    assert!(check_sparse_fp8_packet(std::slice::from_ref(&p), &tensors, "gfx942").is_err());
+    assert!(check_sparse_fp8_packet(std::slice::from_ref(&p), &tensors, "gfx942", false).is_err());
     p.insts[0].fj[1] = 0;
     assert!(check_sparse_fp8_object(&[], Path::new("old"), &[p], true).is_ok());
+}
+
+#[test]
+fn sparse_fp8_qh8_gate_widens_to_row_split_only_with_object_and_alltoall() {
+    let mut p = segmented_prog(&[DevOp::FlashMlaPrefillFp8, DevOp::XAllToAllHeads], &[0, 0]);
+    p.t = 8192;
+    p.insts[0].i = [1, 64, 2048, 0, 1024, u32::MAX, 2048, 0];
+    p.insts[0].t = [0; 8];
+    p.insts[0].fj = [0.0625f32.to_bits(), 1, 0];
+    let tensors = vec![crate::asset::devblob::DevTensor {
+        name: "large".into(),
+        bytes: 16 * 81920 * 512,
+        init: None,
+    }];
+    // Knob-off byte-identity: even with the a2a op present, `row_split_ready=false` (no 16-head
+    // object installed) must still reject nh=64 exactly as before this change.
+    assert!(check_sparse_fp8_packet(std::slice::from_ref(&p), &tensors, "gfx942", false).is_err());
+    // The object alone, without a genuine row-split program (no XAllToAllHeads), does not widen
+    // the gate either -- an nh=64 instruction elsewhere is not proof of row-split geometry.
+    let solo = segmented_prog(&[DevOp::FlashMlaPrefillFp8], &[0]);
+    let mut solo = solo;
+    solo.t = 8192;
+    solo.insts[0] = p.insts[0];
+    assert!(check_sparse_fp8_packet(&[solo], &tensors, "gfx942", true).is_err());
+    // Both present: qualifies.
+    assert!(check_sparse_fp8_packet(std::slice::from_ref(&p), &tensors, "gfx942", true).is_ok());
+    // The row count must still be exactly this program's T/8, not any nh=64 value.
+    p.insts[0].i[4] = 1023;
+    assert!(check_sparse_fp8_packet(std::slice::from_ref(&p), &tensors, "gfx942", true).is_err());
 }
 
 #[test]
@@ -3477,6 +3506,7 @@ fn xalltoall_heads_geometry_checks_shape_object_and_arch() {
     inst.t[0] = 0;
     // i0=rpr i1=nh_l i2=d i3=nh_total i4=gate i5=n_gpu i6=slot_bytes i7=dir
     inst.i = [1024, 8, 576, 64, 5, 8, 0, 0];
+    inst.fj[1] = 64; // j0=heads_per_group: one interleaved group
     let tensors = vec![crate::asset::devblob::DevTensor {
         name: "act.q_a2a".into(),
         bytes: 1024u64 * 64 * 576 * 2,
@@ -3505,6 +3535,18 @@ fn xalltoall_heads_geometry_checks_shape_object_and_arch() {
     prog.insts[0].i[5] = 4;
     assert!(!ok(&prog, &tensors, "gfx942"));
     prog.insts[0].i[5] = 8;
+
+    // heads_per_group must divide nh_total and be a multiple of nh_l; the row-split O side
+    // (4 groups of 16) is exactly as valid as the degenerate one-group case.
+    prog.insts[0].fj[1] = 16;
+    assert!(ok(&prog, &tensors, "gfx942"), "group-major O source, 4 groups of 16");
+    prog.insts[0].fj[1] = 0;
+    assert!(!ok(&prog, &tensors, "gfx942"), "heads_per_group must be nonzero");
+    prog.insts[0].fj[1] = 24;
+    assert!(!ok(&prog, &tensors, "gfx942"), "24 does not divide nh_total=64");
+    prog.insts[0].fj[1] = 12;
+    assert!(!ok(&prog, &tensors, "gfx942"), "12 is not a multiple of nh_l=8");
+    prog.insts[0].fj[1] = 64;
 
     // The destination tensor must be bound and large enough.
     prog.insts[0].t[0] = packet::dev::TENSOR_NONE16;
@@ -5530,4 +5572,83 @@ fn decode_upload_rows_must_cover_the_batch() {
     assert!(check_decode_rows(20, &[5], &[6]).is_err());
     assert!(check_decode_rows(20, &[5; 20], &[6; 19]).is_err());
     assert!(check_decode_rows(1, &[], &[]).is_err());
+}
+
+#[test]
+fn rowsplit_sibling_runs_only_full_chunks_with_every_key() {
+    let at = |c0, clen| ChunkStep { prog: 3, c0, clen };
+    for (step, sibling, want) in [
+        (at(0, 8192), Some(7), 3),
+        (at(2046, 8192), Some(7), 3),
+        (at(2047, 8192), Some(7), 7),
+        (at(65536, 8192), Some(7), 7),
+        (at(65536, 4096), Some(7), 3),
+        (at(65536, 8192), None, 3),
+    ] {
+        assert_eq!(rowsplit_chunk_prog(step, 8192, sibling, false), want, "{step:?} {sibling:?}");
+    }
+}
+
+#[test]
+fn rowband_sibling_also_runs_full_chunks_whose_low_bands_read_every_key() {
+    let at = |c0, clen| ChunkStep { prog: 3, c0, clen };
+    for (step, want) in [
+        (at(0, 8192), 7),
+        (at(1, 8192), 3),
+        (at(1023, 8192), 7),
+        (at(1024, 8192), 7),
+        (at(1025, 8192), 3),
+        (at(2046, 8192), 3),
+        (at(2047, 8192), 7),
+        (at(65536, 8192), 7),
+        (at(0, 4096), 3),
+    ] {
+        assert_eq!(rowsplit_chunk_prog(step, 8192, Some(7), true), want, "{step:?}");
+    }
+}
+
+#[test]
+fn column_shards_bind_as_views_of_their_full_twin() {
+    let t = |name: &str, bytes| crate::asset::devblob::DevTensor { name: name.into(), bytes, init: None };
+    let qa = "model.layers.3.self_attn.derived.q_absorb.weight";
+    let o = "model.layers.3.self_attn.o_proj.weight";
+    let uv = "model.layers.3.self_attn.derived.v_absorb.weight";
+    let tensors = [t(qa, 100), t(o, 50), t(uv, 30), t("act.qa", 100), t(qa, 800), t(o, 400), t(uv, 240)];
+    assert_eq!(
+        column_twins(&tensors, 8),
+        [Some(4), None, Some(6), None, None, None, None],
+        "column shards view their full twin wherever it is declared; row shards and activations copy"
+    );
+    assert_eq!(column_twins(&tensors, 1), [None; 7], "tp=1 binds whole");
+    assert_eq!(column_twins(&tensors[..4], 8), [None; 4], "no twin, no view");
+    assert_eq!(rowband_replicated_bytes(&tensors, 8), 800 + 400 + 3 * 240);
+    assert_eq!(rowband_replicated_bytes(&tensors[..4], 8), 0);
+}
+
+/// The property `--glm-rowband=false` rests on: the packet may declare the full-width twins, but
+/// with the arm off they must be identifiable so the loader can skip carving and uploading them.
+/// Only the FULL-width declaration is a twin — the shard it shadows still needs its own storage.
+#[test]
+fn rowband_twins_are_the_full_width_declarations_only() {
+    let t = |name: &str, bytes| crate::asset::devblob::DevTensor { name: name.into(), bytes, init: None };
+    let qa = "model.layers.3.self_attn.derived.q_absorb.weight";
+    let o = "model.layers.3.self_attn.o_proj.weight";
+    let uv = "model.layers.3.self_attn.derived.v_absorb.weight";
+    let tensors = [t(qa, 100), t(o, 50), t(uv, 30), t("act.qa", 100), t(qa, 800), t(o, 400), t(uv, 240)];
+    assert_eq!(
+        rowband_twin_ids(&tensors, 8),
+        [false, false, false, false, true, true, true],
+        "the 1/n_gpu shards and activations are bound as usual; only the full twins are skippable"
+    );
+    assert_eq!(rowband_twin_ids(&tensors, 1), [false; 7], "tp=1 declares no twins");
+    assert_eq!(rowband_twin_ids(&tensors[..4], 8), [false; 4], "no full declaration, nothing to skip");
+    // The skippable bytes are exactly what the load-time refusal prices, minus the fold's FP32 copy
+    // (made at run time, not declared), so the two views of the cost cannot drift apart.
+    let skipped: u64 = tensors
+        .iter()
+        .zip(rowband_twin_ids(&tensors, 8))
+        .filter(|(_, twin)| *twin)
+        .map(|(td, _)| td.bytes)
+        .sum();
+    assert_eq!(skipped, 800 + 400 + 240);
 }

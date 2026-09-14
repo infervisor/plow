@@ -4494,3 +4494,343 @@ fn glm_fuse_post_folds_the_q_rope_into_the_8192_gemm_med() {
     }
     assert_eq!(folded_programs, 1);
 }
+
+/// `PLOW_GLM_ROWBAND_ATTN` on keeps every knob-off program instruction for instruction and adds
+/// one 8192 sibling on the row-band arm: 64-head flash over the rank's band with no head
+/// all-to-all, full-width band q_absorb/q_rope/o_proj, one grouped native fold per sparse layer,
+/// no attention reduce-scatter, and the q latents all-gathered only on the indexer layers. The
+/// all-to-all arm's sibling is unchanged by the arm switch.
+#[test]
+fn rowband_attn_on_adds_only_the_8192_sibling_on_the_replicated_arm() {
+    let _guard = crate::test_env::env_guard();
+    type Inst = (u16, u16, Vec<String>, [u32; 8], Vec<u32>, u32);
+    type Prog = (u32, Vec<Inst>);
+    fn emit(arm: Option<&str>) -> Vec<Prog> {
+        let dir = std::env::temp_dir().join(format!(
+            "plow-glm-rowband-sibling-{}-{}",
+            arm.unwrap_or("off"),
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = serde_json::json!({
+            "model_type": "glm_moe_dsa", "num_hidden_layers": 5,
+            "hidden_size": 6144, "num_attention_heads": 64,
+            "kv_lora_rank": 512, "q_lora_rank": 2048,
+            "qk_nope_head_dim": 192, "qk_rope_head_dim": 64, "v_head_dim": 256,
+            "vocab_size": 128, "rms_norm_eps": 1e-5,
+            "n_routed_experts": 256, "num_experts_per_tok": 8,
+            "moe_intermediate_size": 2048, "intermediate_size": 12288,
+            "first_k_dense_replace": 3, "routed_scaling_factor": 2.5,
+            "rope_theta": 8000000.0,
+            "indexer_types": ["full", "shared", "full", "shared", "full"]
+        });
+        std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+        let mut envs = vec![
+            ("PLOW_FP8", "1"),
+            ("PLOW_GLM_DECODE_NORM_ROWS", "1"),
+            ("PLOW_GLM_DSA", "1"),
+            ("PLOW_GLM_DSA_PF", "1"),
+            ("PLOW_GLM_DSA_PF_SPAN", "3"),
+            ("PLOW_GLM_FP8_KV", "1"),
+            ("PLOW_GLM_FUSE_B1", "1"),
+            ("PLOW_GLM_FUSE_ROPE", "0"),
+            ("PLOW_GLM_FUSE_SEAM", "1"),
+            ("PLOW_GLM_GEMM_LT", "1"),
+            ("PLOW_GLM_GEMM_LT_DECODE", "1"),
+            ("PLOW_GLM_INDEX_TP", "1"),
+            ("PLOW_GLM_MOE_AITER", "1"),
+            ("GLM_MOE_CORESIDENT", "2"),
+            ("PLOW_GLM_MOE_FLAT_DECODE", "0"),
+            ("PLOW_GLM_MOE_RESIDENT", "1"),
+            ("PLOW_GLM_PLACE_PF", "0"),
+            ("PLOW_GLM_SELECT_LOCAL", "1"),
+            ("GLM_SHARD_HEAD", "1"),
+            ("GLM_SHARED_CUS", "48"),
+            ("PLOW_MLA_PREFILL", "full:128,512,2048,8192"),
+            ("PLOW_MOE_PF_DET", "1"),
+            ("PLOW_EMIT_PACKED_PREFILL", "0"),
+            ("PLOW_DECODE_BATCH_LADDER", "1,2,4,8,16,20"),
+            ("PLOW_UNISEG", "0"),
+            ("PLOW_MLA_PF_V2", "1"),
+            ("PLOW_MLA_PF_AITER", "1"),
+            ("PLOW_GLM_SEQ_PAR", "1"),
+            ("PLOW_GLM_SEQ_PAR_PROJ", "1"),
+            ("PLOW_GLM_FOLD_LT", "1"),
+            ("PLOW_GLM_GEMM_LT_PF_EXT", "o_proj,band,shared"),
+        ];
+        if let Some(knob) = arm {
+            envs.push((knob, "1"));
+        }
+        let _env = crate::test_env::EnvScope::set(&envs);
+        let out: std::sync::Arc<std::sync::Mutex<Vec<Prog>>> = Default::default();
+        let sink = out.clone();
+        let verify: crate::VerifyHook = Box::new(move |model| {
+            let name = |h: u32| {
+                model.tensors.get(h as usize).map_or(String::new(), |t| {
+                    t.name.replace("act.qa_tp", "act.qa").replace("act.qr_tp", "act.qr")
+                })
+            };
+            *sink.lock().unwrap() = model
+                .progs
+                .iter()
+                .zip(&model.prog_t)
+                .map(|(p, &t)| {
+                    let mut seg = vec![u32::MAX; p.insts.len()];
+                    for e in &p.stream {
+                        seg[e.inst as usize] = u32::from(e.seg);
+                    }
+                    let insts = p
+                        .insts
+                        .iter()
+                        .zip(&seg)
+                        .map(|(d, &s)| {
+                            let mut names: Vec<String> = d.t.iter().map(|&h| name(h)).collect();
+                            let mut j = d.j;
+                            let flash = [
+                                DevOp::FlashMlaPrefillFp8,
+                                DevOp::FlashMlaPrefill,
+                                DevOp::FlashMlaDecodeFp8,
+                                DevOp::FlashMlaDecode,
+                            ]
+                            .iter()
+                            .any(|&op| d.op == op as u16);
+                            if flash && j[0] != 0 {
+                                names.push(name(j[0] - 1));
+                                j[0] = 0;
+                            }
+                            let imm = d.f.iter().map(|x| x.to_bits()).chain(j);
+                            (d.op, d.blocks, names, d.i, imm.collect(), s)
+                        })
+                        .collect();
+                    (t, insts)
+                })
+                .collect();
+            Ok(crate::LeanReport::skipped("row-split sibling structure"))
+        });
+        glm_emit_full(
+            &dir,
+            81920,
+            dir.join("model.pkt").to_str().unwrap(),
+            304,
+            8,
+            true,
+            true,
+            "gfx942",
+            None,
+            Some(&verify),
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+        let progs = out.lock().unwrap().clone();
+        progs
+    }
+    let off = emit(None);
+    let mut on = emit(Some("PLOW_GLM_ROWBAND_ATTN"));
+    let sib = on
+        .iter()
+        .position(|(t, _)| packet::devbuild::is_rowsplit_prefill_program(*t))
+        .expect("the knob emits a row-split sibling");
+    let sibling = on.remove(sib);
+    assert_eq!(on.len(), off.len());
+    for (pi, (a, b)) in off.iter().zip(&on).enumerate() {
+        assert_eq!((a.0, a.1.len()), (b.0, b.1.len()), "program {pi}");
+        if let Some((k, (x, y))) = a.1.iter().zip(&b.1).enumerate().find(|(_, (x, y))| x != y) {
+            panic!("program {pi} instruction {k} differs with the knob on:\noff {x:?}\non  {y:?}");
+        }
+    }
+    let count = |p: &Prog, op: DevOp| p.1.iter().filter(|d| d.0 == op as u16).count();
+    let ordinary = on.iter().find(|p| p.0 == 8192).unwrap();
+    assert_eq!(count(&sibling, DevOp::XAllToAllHeads), 0, "no head all-to-all on the row-band arm");
+    let flashes = sibling
+        .1
+        .iter()
+        .filter(|d| d.0 == DevOp::FlashMlaPrefillFp8 as u16)
+        .collect::<Vec<_>>();
+    assert!(!flashes.is_empty() && flashes.iter().all(|d| d.3[1] == 64 && d.3[4] == 1024));
+    let folds = sibling.1.iter().filter(|d| d.0 == DevOp::MlaMergeFold as u16).collect::<Vec<_>>();
+    assert_eq!(folds.len(), flashes.len(), "one fold per row-band attention");
+    assert!(folds.iter().all(|d| d.3 == [1024, 64, 256, 0, 1, 1, 16, 0]), "grouped native 64-head folds");
+    let band_gemm = |n: u32, k: u32| {
+        sibling.1.iter().filter(|d| d.0 == DevOp::GemmLtPf as u16 && d.3[..4] == [1024, n, k, 2]).count()
+    };
+    assert_eq!(band_gemm(32768, 2048), flashes.len(), "band q_absorb per layer");
+    assert_eq!(band_gemm(4096, 2048), flashes.len(), "band q_rope per layer");
+    assert_eq!(band_gemm(6144, 16384), flashes.len(), "band o_proj per layer");
+    assert_eq!(
+        count(&sibling, DevOp::XReduceScatter) + flashes.len(),
+        count(ordinary, DevOp::XReduceScatter),
+        "the row-band arm drops exactly the attention reduce-scatters"
+    );
+    let q_gathers = |p: &Prog| {
+        p.1.iter()
+            .filter(|d| d.0 == DevOp::XAllGather as u16 && d.2.first().is_some_and(|n| n == "act.qlat"))
+            .count()
+    };
+    let indexers = count(ordinary, DevOp::IndexTpPf);
+    assert!(indexers > 0 && indexers < flashes.len());
+    assert_eq!(q_gathers(&sibling), indexers, "q latents gathered only where an indexer reads them");
+    assert_eq!(q_gathers(ordinary), count(ordinary, DevOp::FlashMlaPrefillFp8));
+    let names: std::collections::BTreeSet<&str> =
+        sibling.1.iter().flat_map(|d| d.2.iter().map(String::as_str)).collect();
+    assert!(names.contains("act.qa_rs") && names.contains("act.qrr_rs") && names.contains("act.oat_rs"));
+    assert!(!names.iter().any(|n| n.ends_with("_tp") && (n.contains("qa_tp") || n.contains("oat_rs_tp"))));
+    assert!(names.contains("in.pos@band8192"), "the band q RoPE reads its own rows' positions");
+    let a2a = emit(Some("PLOW_GLM_ROWSPLIT_ATTN"));
+    let a2a_sibling = a2a.iter().find(|(t, _)| packet::devbuild::is_rowsplit_prefill_program(*t)).unwrap();
+    assert!(count(a2a_sibling, DevOp::XAllToAllHeads) > 0, "the all-to-all arm keeps its sibling");
+}
+
+/// `PLOW_GLM_ROWSPLIT_ATTN` on keeps every knob-off program instruction for instruction (by
+/// tensor name; `qa`/`qr` move to their peer slots) and adds only the 8192 bucket's row-split
+/// sibling. The runtime never runs a prior < SPAN_MIN_PRIOR chunk on the sibling, so such a chunk
+/// executes the same instructions with the knob on or off.
+#[test]
+fn rowsplit_attn_on_adds_only_the_8192_sibling() {
+    let _guard = crate::test_env::env_guard();
+    type Inst = (u16, u16, Vec<String>, [u32; 8], Vec<u32>, u32);
+    type Prog = (u32, Vec<Inst>);
+    fn emit(rowsplit: bool) -> Vec<Prog> {
+        let dir = std::env::temp_dir().join(format!(
+            "plow-glm-rowsplit-sibling-{}-{}",
+            rowsplit,
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = serde_json::json!({
+            "model_type": "glm_moe_dsa", "num_hidden_layers": 5,
+            "hidden_size": 6144, "num_attention_heads": 64,
+            "kv_lora_rank": 512, "q_lora_rank": 2048,
+            "qk_nope_head_dim": 192, "qk_rope_head_dim": 64, "v_head_dim": 256,
+            "vocab_size": 128, "rms_norm_eps": 1e-5,
+            "n_routed_experts": 256, "num_experts_per_tok": 8,
+            "moe_intermediate_size": 2048, "intermediate_size": 12288,
+            "first_k_dense_replace": 3, "routed_scaling_factor": 2.5,
+            "rope_theta": 8000000.0,
+            "indexer_types": ["full", "shared", "full", "shared", "full"]
+        });
+        std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+        let mut envs = vec![
+            ("PLOW_FP8", "1"),
+            ("PLOW_GLM_DECODE_NORM_ROWS", "1"),
+            ("PLOW_GLM_DSA", "1"),
+            ("PLOW_GLM_DSA_PF", "1"),
+            ("PLOW_GLM_DSA_PF_SPAN", "3"),
+            ("PLOW_GLM_FP8_KV", "1"),
+            ("PLOW_GLM_FUSE_B1", "1"),
+            ("PLOW_GLM_FUSE_ROPE", "0"),
+            ("PLOW_GLM_FUSE_SEAM", "1"),
+            ("PLOW_GLM_GEMM_LT", "1"),
+            ("PLOW_GLM_GEMM_LT_DECODE", "1"),
+            ("PLOW_GLM_INDEX_TP", "1"),
+            ("PLOW_GLM_MOE_AITER", "1"),
+            ("GLM_MOE_CORESIDENT", "2"),
+            ("PLOW_GLM_MOE_FLAT_DECODE", "0"),
+            ("PLOW_GLM_MOE_RESIDENT", "1"),
+            ("PLOW_GLM_PLACE_PF", "0"),
+            ("PLOW_GLM_SELECT_LOCAL", "1"),
+            ("GLM_SHARD_HEAD", "1"),
+            ("GLM_SHARED_CUS", "48"),
+            ("PLOW_MLA_PREFILL", "full:128,512,2048,8192"),
+            ("PLOW_MOE_PF_DET", "1"),
+            ("PLOW_EMIT_PACKED_PREFILL", "0"),
+            ("PLOW_DECODE_BATCH_LADDER", "1,2,4,8,16,20"),
+            ("PLOW_UNISEG", "0"),
+            ("PLOW_MLA_PF_V2", "1"),
+            ("PLOW_MLA_PF_AITER", "1"),
+        ];
+        if rowsplit {
+            envs.push(("PLOW_GLM_ROWSPLIT_ATTN", "1"));
+        }
+        let _env = crate::test_env::EnvScope::set(&envs);
+        let out: std::sync::Arc<std::sync::Mutex<Vec<Prog>>> = Default::default();
+        let sink = out.clone();
+        let verify: crate::VerifyHook = Box::new(move |model| {
+            let name = |h: u32| {
+                model.tensors.get(h as usize).map_or(String::new(), |t| {
+                    t.name.replace("act.qa_tp", "act.qa").replace("act.qr_tp", "act.qr")
+                })
+            };
+            *sink.lock().unwrap() = model
+                .progs
+                .iter()
+                .zip(&model.prog_t)
+                .map(|(p, &t)| {
+                    let mut seg = vec![u32::MAX; p.insts.len()];
+                    for e in &p.stream {
+                        seg[e.inst as usize] = u32::from(e.seg);
+                    }
+                    let insts = p
+                        .insts
+                        .iter()
+                        .zip(&seg)
+                        .map(|(d, &s)| {
+                            let mut names: Vec<String> = d.t.iter().map(|&h| name(h)).collect();
+                            let mut j = d.j;
+                            let flash = [
+                                DevOp::FlashMlaPrefillFp8,
+                                DevOp::FlashMlaPrefill,
+                                DevOp::FlashMlaDecodeFp8,
+                                DevOp::FlashMlaDecode,
+                            ]
+                            .iter()
+                            .any(|&op| d.op == op as u16);
+                            if flash && j[0] != 0 {
+                                names.push(name(j[0] - 1));
+                                j[0] = 0;
+                            }
+                            let imm = d.f.iter().map(|x| x.to_bits()).chain(j);
+                            (d.op, d.blocks, names, d.i, imm.collect(), s)
+                        })
+                        .collect();
+                    (t, insts)
+                })
+                .collect();
+            Ok(crate::LeanReport::skipped("row-split sibling structure"))
+        });
+        glm_emit_full(
+            &dir,
+            81920,
+            dir.join("model.pkt").to_str().unwrap(),
+            304,
+            8,
+            true,
+            true,
+            "gfx942",
+            None,
+            Some(&verify),
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+        let progs = out.lock().unwrap().clone();
+        progs
+    }
+    let off = emit(false);
+    let mut on = emit(true);
+    let sib = on
+        .iter()
+        .position(|(t, _)| packet::devbuild::is_rowsplit_prefill_program(*t))
+        .expect("the knob emits a row-split sibling");
+    let sibling = on.remove(sib);
+    assert_eq!(sibling.0, packet::devbuild::rowsplit_prefill_program_t(8192));
+    assert_eq!(on.len(), off.len());
+    for (pi, (a, b)) in off.iter().zip(&on).enumerate() {
+        assert_eq!((a.0, a.1.len()), (b.0, b.1.len()), "program {pi}");
+        if let Some((k, (x, y))) = a.1.iter().zip(&b.1).enumerate().find(|(_, (x, y))| x != y) {
+            panic!("program {pi} (t={}) instruction {k} differs with the knob on:\noff {x:?}\non  {y:?}", a.0);
+        }
+    }
+    let alltoall = |p: &Prog| p.1.iter().filter(|d| d.0 == DevOp::XAllToAllHeads as u16).count();
+    assert!(on.iter().all(|p| alltoall(p) == 0));
+    assert!(alltoall(&sibling) > 0);
+    assert!(sibling
+        .1
+        .iter()
+        .any(|d| d.0 == DevOp::FlashMlaPrefillFp8 as u16 && d.3[1] == 64 && d.3[4] == 1024));
+    let count = |p: &Prog, op: DevOp| p.1.iter().filter(|d| d.0 == op as u16).count();
+    let ordinary = on.iter().find(|p| p.0 == 8192).unwrap();
+    assert!(count(ordinary, DevOp::IndexUnionPf) > 0);
+    assert_eq!(count(&sibling, DevOp::IndexUnionPf), 0, "the sibling names its TP selection directly");
+    let local = |p: &Prog| {
+        p.1.iter().filter(|d| d.0 == DevOp::IndexTpPf as u16).map(|d| d.3[7]).collect::<Vec<_>>()
+    };
+    assert!(!local(ordinary).is_empty() && local(ordinary).iter().all(|&f| f == 0));
+    assert_eq!(local(&sibling), vec![1; local(ordinary).len()], "every sibling indexer keeps its band");
+}

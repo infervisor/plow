@@ -185,6 +185,53 @@ identical to the decimal (med 0.3, p90 0.4, p99 2.9, max 3.1, 11 requests > 3x m
 (p90 1.5, max 4.5, 16 requests), with the twin equally active in both treatment arms -- a stall in one run, not
 an effect of the knob.
 
+## Row-band ported in-tree, behind a serve-start knob (2026-09-14)
+
+Row-band was never in the repo: `git log --all -S"ROWBAND"` hit one commit and it edited only tracker prose.
+It lived as the export `/workspace/lever-hunt-c08d1232/rowband-e724`, based on `e724c7bd` (an ancestor of main).
+Ported by diffing that export against its base: 3963 lines, 34 files, of which 31 applied clean. Hand-merged
+three one-line op-signature edits in `crates/packet/src/slots.rs` (`XAllToAllHeads` gains `heads_per_group`,
+`MlaMergeFold` gains `group`, `IndexTpPf` gains `local_band`); skipped the generated `knob_gen.rs` (regenerated
+instead) and the review log (separate merge).
+
+**Why a serve-start knob and not a runtime one.** The programs were never the problem: sibling *selection* is
+already a per-chunk runtime decision. The cost is the packet's TENSOR declarations -- the full-width
+`q_absorb`/`q_rope`/`o_proj` twins. `amd.rs` prices them from `blob.tensors` and hard-errors unless free memory
+clears `replicated + 8 GiB`, so a packet that declares the twins pays the 29.25 GiB at load whether or not a
+single chunk dispatches the sibling. A per-request flag is therefore impossible without paying always. The
+extension container cannot help either: `crates/packet/src/ext.rs` says it "carries programs only -- no
+checkpoint, no weights, no tensor data", with the tensor table a reference to the parent's. Extensions could
+ship the siblings; they cannot ship the twins.
+
+`PLOW_GLM_ROWBAND` / `--glm-rowband` (runtime, default off, read once at engine build) gates four points:
+
+1. `column_twins` returns all-`None` when off, so each column shard carves its own storage (the ordinary path).
+2. New `rowband_twin_ids` marks the full-width declarations; when off they are excluded from `carved`, so they
+   are neither allocated nor uploaded.
+3. The load-time free-VRAM refusal applies only when the arm is actually bound.
+4. `chunk_program` will not select a sibling when off.
+
+Program tensor handles are positional, so the twins still need a binding when off: they get a one-byte view at
+address 0, which faults on a stray read instead of silently returning another tensor's weights. Registered as
+`rt.glm_rowband`; evaluator regenerated; devgen knob gate 12 passed, plowrt knob gate 17 passed.
+`rowband_twins_are_the_full_width_declarations_only` asserts only the full-width declarations are skippable and
+that the skipped bytes reconcile with what the load-time refusal prices.
+
+Net: ONE packet carries the metadata and the knob decides whether the deployment pays for it -- a latency
+profile and a capacity profile from the same artifact.
+
+**Scaling.** Compute scales: -19.2% at prior 0, -20.8% at prior 65536, -23.1% on the 73728 sweep. Two effects
+stack -- deleting the collectives saves a roughly constant absolute amount per chunk (they are sized by chunk
+rows, not KV length), while the kernel reshape (T/8 rows x 64 heads instead of T rows x 8 heads, 1854.8 ->
+1226.4 us/layer) scales with attention work. Coverage also improves with context, since the sibling needs a full
+8192 chunk and long prompts are mostly full chunks. Capacity does NOT scale: the 29.25 GiB is fixed while KV
+grows, and the failure mode is a refused load, not graceful degradation. Row-band is prefill-only, so a
+long-context decode-heavy workload pays the squeeze and gets nothing. The T=73728 treat arm also ran noisier
+(spread 8.09% vs ctrl 0.84%), unexplained.
+
+The served T4 `rb-t4-{a..d}` gained an `isl65536-c1` cell for exactly this; without it the run could not have
+answered the context question.
+
 ## Rejected or parked
 
 | candidate | reason |
