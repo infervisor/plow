@@ -1,7 +1,8 @@
 # GLM-5.3-FP8 4K/8K TTFT campaign tracker
 
 Updated: 2026-09-14
-Branch: `tp-bringup-mi300x`
+Branch: `glm53-8k-ttft` (continuation). `tp-bringup-mi300x` and `worktree-tp-merge` (tip `2655520b`) are merged
+into `origin/main` at `e72ffa79`; the new branch is cut from that merge commit.
 Checkpoint: `zai-org/GLM-5.3` (FP8), TP8 on 8x AMD MI300X (gfx942)
 Production serving set: `a7596da2` (packet `8b15f4a2…`, stamp `0xb47295d1df086e6b`)
 Detailed log: `docs/bringup/tp-bringup-upstream-review-log.md` (rows #81–#99); live rung board `plans/rung-board.md` (local)
@@ -106,6 +107,83 @@ ISL 1024, OSL 4096), 8192 TTFT < 550 with band rows > 0 on every prefill tick an
 | 9 | Band64 band chain in a sibling program selected only with band rows > 0 | 0 at C1 | v29/v30 FAIL token equality (band rows use the cooperative IndexSelect with rows > 1, never exercised in production); kv-isolation v2: knob-on, a slot-5 prefill after a band advance overwrites slot 0 KV from byte 0 (stale decode_slot in the band KV write), knob-off clean on device, so not a production bug; fix is the sibling-only band program |
 
 With step 4 at ≈ −4 and step 6 at ≈ −7 (G5 T2 byte-identical but ≈ −1.6 ms in flow), steps 1–7 predict ≈ 562–566 ms: the goal needs step 8 or new levers. Lever hunt: the simple swaps are exhausted (every P8192-0 attention row already native; MoE already on AITER's tuned `64x256` kernel with no wider tile; GEMM picks equal the 456-kernel sweep best; collective transport concurrency-limited at ≈ 256–261 GB/s). Remaining structural levers, all T2 queued: (1) row-band attention with replicated q_absorb/q_rope/fold/o_proj, each rank running its 1024 rows × 64 heads as 4 × 16-head launches with no o_proj reduce-scatter or Q/O all-to-all, −50…−110 ms predicted from #71's 1.88× and the rowsplit-attn attribution, ≈ +29 GB VRAM/rank to check; (3) o_proj on the row band, −12…−17, a subset of (1); (4) bit-identical ns=1 fold normalize + fused permute/convert, −3…−12; (5) shared expert on the band beside the MoE all-gather, −8…−15; (6) seam all-gather cap 24 → 16, −1…−3; (2) a plow-owned grouped block-FP8 MoE kernel with a ≥ 256-row tile, −25…−45, no cheap T2. Rank-3 skew is the card: with 65:00.0 rotated to rank 7 (confirmed on NUMA node 1), its native time stays +5.9 ms over the other ranks' median (+5.86 as rank 3, +5.92 as rank 7) and its late arrivals move with it (109 → 122 of 405), while rank 3 on another card drops to +2.7 ms; per-device probe +2.0…+3.2% on the pinned attention kernel. Reseating or swapping it is worth ≈ −3…−5 ms served.
+
+## Continuation branch and row-band re-verdict (2026-09-14)
+
+The campaign branch is merged. Work continues on `glm53-8k-ttft`, cut from `origin/main` `e72ffa79`. Stale worktrees
+pruned 49 -> 12 (37 removed, all ancestors of main; uncommitted state from 3 of them archived under
+`/workspace/c08d1232-scratch-archive/worktree-diffs/`). Both unlanded patches still apply clean to main:
+`patch1-glm-recipe-parity.patch` (#106) and `router-overlap-on-2655520b.patch` (#103).
+
+**Row-band stage 2 was a PASS misreported as a failure.** `lh-t3-stage2-rowband` exited rc=1 and was recorded as an
+unexplained failure. It did not fault; it ran all three arms and the gate tripped on one cell:
+
+| cell | ctrl | treat | ctrl2 | delta | floor | gate |
+|---|---:|---:|---:|---:|---:|---|
+| P8192-0 (owner) | 574.79 | 465.06 | 575.79 | **-110.23** | 6.33 | PASS |
+| P8192-S (prior 65536) | 650.85 | 515.68 | 650.77 | **-135.13** | 3.95 | PASS |
+| P4096-0 | 324.64 | 325.55 | 324.89 | +0.78 | 0.61 | FAIL |
+
+The whole gate failed on a +0.78 ms (0.24%) move at the 4096 rung while 8192 got 110-135 ms faster. That FAIL is not
+attributable to the lever: `emit.glm_rowband_attn` is scoped `rows: (8192, 8192)`, and a structural diff of the two
+packets confirms it — keying programs on (kind, topology, batch, segment), **all 5689 shared program keys are
+byte-identical between knob-off `8b15f4a2` and row-band `b73d4440`; zero differ.** The row-band packet only adds 1414
+new `(prefill, rowsplit, *)` sibling programs. So the 4096 program is unchanged instruction for instruction and the
++0.78 ms is second-order (the +29.25 GiB/rank of replicated attention weights perturbing residency), inside a run whose
+ctrl2 arm also threw a 1411.9 ms outlier rep at 8192 (spread 145.8%). The rung rule needs to distinguish "this rung's
+program changed" from "this rung moved"; checkpoint S already supplies that distinction and should gate it.
+
+Measured memory matches the corrected estimate, not the original: replicated 29.25 GiB/rank, 55.58 GiB free after load
+(knob-off leaves 83.44). That is above the ~40-43 GiB/rank long-context KV need, so the knob is viable at production
+max_ctx, but it is the binding constraint and every row-band run must keep reporting free-after-load.
+
+Served T4 queued as `rb-t4-{a-ctl,b-treat,c-ctl2,d-treat2}` (`/workspace/ttft550-c08d1232/rb-t4/t4-arm.sh`): one arm per
+job, same plowrt `b013a9f9` on every arm so the packet is the only variable, cells isl8192-c1 / isl8192-c16 / isl4096-c1.
+If the -110 ms carries to the served path it lands C1 8192 near 485-495 ms and the 550 ms goal is met by this lever alone.
+
+**Dense-exact decode flip, scored.** The T4 that had been sitting unreported: a real decode win, not a TTFT lever.
+Pooled treat-vs-ctl TPOT -1.79 ms at isl1024-c1 (floor 0.041) and -2.58 ms at isl1024-c16 (floor 0.629), both beyond
+floor; twin share 0 -> 1.000 in the treat arms and the controls never fire the twin. On the goal cell isl8192-c1 the
+effect is -1.3 ms against a 3.68 ms floor, i.e. nothing. The harness verdict is T4 FAIL, from the isl1024-c16 TTFT cell
+where the two treatment arms disagree (treat-ctl +137.8 [+60.1, +225.4], treat2-ctl2 -1.4 [-50.7, +49.1]) -- an outlier
+in one arm, not an effect, but unresolved until that cell is repeated.
+
+**The three decode-rung T3s were PASSes recorded as FAILs: a scorer bug, not a result.**
+`harness/t3-score.py` declared `ARMS = ("ctl", "treat", "ctl2")` and then unpacked
+`c, c2, t = (median(r[a]) for a in ARMS)`, so `c2` received *treat* and `t` received *ctl2*. The printed
+"drift" was therefore the ctl-vs-treat gap and the "effect" was ctl2 against the ctl/treat mean; both printed
+numbers reproduce exactly under that reading, which is what identified it. Corrected (`c, t, c2`):
+
+| rung | ctl | treat | ctl2 | effect | drift | floor | verdict |
+|---|---:|---:|---:|---:|---:|---:|---|
+| D8  | 40.609 | 38.475 | 40.612 | **-2.135 ms (-5.26%)** | 0.003 | 0.193 | PASS |
+| D16 | 46.177 | 43.453 | 46.292 | **-2.781 ms (-6.02%)** | 0.116 | 0.570 | PASS |
+| D20 | 52.781 | 49.460 | 52.719 | **-3.290 ms (-6.24%)** | 0.062 | 0.725 | PASS |
+
+Twin firing 1.0000 in treat and 0.0000 in both controls at every rung. A second bug in the same scorer opened
+`{D}/set-on/assets/build.json` while `load()` globs `{D}/{arm}/round*/ticks.log`, so the ledger write always
+died on the path; it now resolves the set from the script's own location. Both fixed in the harness (not the
+repo). 45 ledger entries appended for D8/D16/D20 + the served cells.
+
+Checkpoint P is still not stampable: the request's `facts` block needs the retrieval/serving-guard result, and
+that job had been failing preflight because `serving8k/validate.sh` hard-coded `quality.py` inside
+`worktrees/agent-ae72ad71d98fa7843` -- a worktree removed during this session's cleanup. `quality.py` is
+byte-identical between that worktree's commit and the branch, so the two live references were repointed at the
+tp-merge worktree and the gate re-queued as `dxflip-retrieval-refix`. The historical `wt=` build scripts were
+left pointing at the removed path deliberately: they should fail loudly rather than silently build from a
+different tree.
+
+The runtime half of that work is landed on this branch: `decode_dense_exact` takes a `parked` row list so rows that are
+not advancing no longer disqualify the batch from the dense-exact twin. Without it the twin never fired in a mixed
+batch (mix-fire twin share 0.000 -> 1.000 decode-only, 0.028 -> 1.000 with_prefill; short-request median TPOT
+53.97 -> 49.74 ms retained, 50.05 -> 46.06 ms mixed). The default flip itself (`flip-draft/flip-code.diff`) is NOT
+landed as a commit: it is applied and saved at
+`/workspace/ttft550-c08d1232/dense-exact-default-flip-staged.patch`, but `scripts/perf_gate_ci.sh` fails any run
+whose flipped knob has no `perf-certs/<id>.json`, and that certificate cannot be made until the retrieval fact
+exists. The isl1024-c16 objection is withdrawn: per-request TTFT distributions show ctl, ctl2 and treat2
+identical to the decimal (med 0.3, p90 0.4, p99 2.9, max 3.1, 11 requests > 3x median) and only treat fat
+(p90 1.5, max 4.5, 16 requests), with the twin equally active in both treatment arms -- a stall in one run, not
+an effect of the knob.
 
 ## Rejected or parked
 
