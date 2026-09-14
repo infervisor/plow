@@ -1280,6 +1280,13 @@ fn backend_amd(
     if has("EngramGate") || has("EngramEmbed") {
         req.push("PLOW_DSV41_ENGRAM=1".into());
     }
+    // V4.1's [32,32] ue8m0 block-fp8 GEMM (op 184). Its own axis, not folded into the Engram one:
+    // the projections need it on EVERY layer where Engram is on two, and a V4.1 object could in
+    // principle want one without the other. Without the axis there is no case for op 184 and the
+    // packet would fall through the switch, leaving every projection's output untouched.
+    if has("GemmFp8Mx") {
+        req.push("PLOW_DSV41_BLKFP8=1".into());
+    }
     if on("a4w4") {
         req.push("PLOW_MOE_PF_A4W4=1".into());
     }

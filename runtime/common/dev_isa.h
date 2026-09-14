@@ -1462,6 +1462,22 @@ enum {
      * emitter's XReduce sums the ranks back together. blk is 32 for V4.1 (weight_block_size
      * [32,32]), NOT the [128,128] grid V4 used -- getting it wrong rescales every lookup. */
     PLOW_DOP_ENGRAM_EMBED = 183,
+    /* DeepSeek-V4.1 block-fp8 PREFILL GEMM at a [32,32] ue8m0 grid (`op_gemm_common.h`
+     * d_gemm_fp8_mx -> d_gemm_t<WFP8MX>, [DSV41-BLKFP8]). The twin of op 107, and a SEPARATE
+     * opcode for the reason the two cannot share one: 107's kernel indexes its scale grid as
+     * `S[(n>>7)*ceil(K/128) + (k>>7)]` with f32 entries, and V4.1's grid is `[ceil(N/32)]
+     * [ceil(K/32)]` with UE8M0 BYTES. Handing 107 a V4.1 scale handle does not fault -- it
+     * rescales every output and the model merely gets worse, which is why the encoding is in
+     * the OPCODE rather than in a field.
+     *   t0=out(bf16[T][N]) t1=x(bf16[T][K]) t2=w(fp8 e4m3 OCP[N][K])
+     *   t3=scale(ue8m0[ceil(N/32)][ceil(K/32)], row-major, K innermost)
+     *   i0=T i1=N i2=K
+     * K % 32 == 0 is REQUIRED (the kernel is the KEXACT instantiation at BK=32); every V4.1
+     * projection satisfies it by construction, since the scale grid could not exist otherwise.
+     * This is what every V4.1 projection lowers to -- wq_a/wq_b/wkv/wo_a/wo_b, the shared
+     * expert, engram.wkv, indexer.wq_b -- i.e. 39.8% of an 8k prefill's FLOPs. The routed
+     * experts do NOT use it; they are MXFP4 on ops 85/86. */
+    PLOW_DOP_GEMM_FP8_MX = 184,
 
     PLOW_DOP__COUNT
 };

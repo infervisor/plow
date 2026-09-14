@@ -2039,6 +2039,26 @@ pub enum DevOp {
     /// `i3 = blk` is 32 for V4.1 (`weight_block_size [32, 32]`), NOT the `[128, 128]` grid
     /// V4 used. Getting it wrong rescales every lookup and faults nowhere.
     EngramEmbed = 183,
+    /// DeepSeek-V4.1 block-fp8 prefill GEMM at a `[32, 32]` **ue8m0** scale grid
+    /// (`op_gemm_common.h` `d_gemm_fp8_mx` -> `d_gemm_t<WFP8MX>`).
+    ///
+    /// `t0=out(bf16[T][N]) t1=x(bf16[T][K]) t2=w(fp8 e4m3 OCP[N][K])
+    /// t3=scale(ue8m0[ceil(N/32)][ceil(K/32)])` · `i0=T i1=N i2=K`.
+    ///
+    /// The scale grid is row-major with K innermost. `K % 32 == 0` is REQUIRED -- the kernel is
+    /// the KEXACT instantiation at BK=32 -- and every V4.1 projection satisfies it by
+    /// construction, since the scale grid could not exist otherwise.
+    ///
+    /// **A SEPARATE OPCODE FROM [`DevOp::GemmFp8Blk`], NOT A FLAG ON IT.** Op 107 indexes its
+    /// grid as `S[(n>>7) * ceil(K/128) + (k>>7)]` with **f32** entries; this one is blocked 32
+    /// on BOTH axes with **byte** entries. Handing 107 a V4.1 scale handle does not fault -- it
+    /// rescales every output, and the model merely gets worse. Encoding that in the opcode is
+    /// what makes the mismatch a load-time refusal instead of a silent one.
+    ///
+    /// Every V4.1 projection lowers to this: `wq_a`/`wq_b`/`wkv`/`wo_a`/`wo_b`, the shared
+    /// expert, `engram.wkv` and `indexer.wq_b` -- 39.8% of an 8k prefill's FLOPs. The routed
+    /// experts do NOT; they are MXFP4 on ops 85/86.
+    GemmFp8Mx = 184,
 }
 
 /// GLU-family `act` code for GPT-OSS's `swiglu_oai` (pair form, `f0 = alpha`, `f1 = limit`).
@@ -2238,6 +2258,7 @@ impl DevOp {
         DevOp::RopeInverseO,
         DevOp::EngramGate,
         DevOp::EngramEmbed,
+        DevOp::GemmFp8Mx,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -2442,6 +2463,7 @@ impl DevOp {
             DevOp::RopeInverseO => "PLOW_DOP_ROPE_INVERSE_O",
             DevOp::EngramGate => "PLOW_DOP_ENGRAM_GATE",
             DevOp::EngramEmbed => "PLOW_DOP_ENGRAM_EMBED",
+            DevOp::GemmFp8Mx => "PLOW_DOP_GEMM_FP8_MX",
         }
     }
 
@@ -2488,6 +2510,9 @@ impl DevOp {
     /// 161 -> 163 for affine Q4 matrix operations. The speech/vision ops were numbered from
     /// 156 on main; merging them after the gfx942 ops at 156-160 moved every one up by 5.
     /// 178 -> 179 for backend-neutral grouped FP32 attention.
+    /// 184 -> 185 for `GemmFp8Mx = 184` (DeepSeek-V4.1's `[32, 32]` ue8m0 block-fp8 GEMM).
+    /// An opcode rather than a field on 107 because the scale OPERAND TYPE differs -- byte
+    /// against f32 -- and a mismatch there rescales every output without faulting.
     /// 182 -> 184 for `EngramGate = 182` / `EngramEmbed = 183` (DeepSeek-V4.1 Engram). The
     /// hash is host work and the `wkv` projection is an ordinary fp8 GEMM, so the family costs
     /// two opcodes rather than four.
@@ -2495,7 +2520,7 @@ impl DevOp {
     /// kernels and their gfx942 tests predate the opcodes by some time: they were reachable
     /// only from the tests, so no packet could run them.
     /// 179 -> 180 for backend-neutral multimodal embedding overlay.
-    pub const COUNT: u16 = 184;
+    pub const COUNT: u16 = 185;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///

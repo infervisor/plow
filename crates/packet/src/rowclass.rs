@@ -101,7 +101,8 @@ pub fn class_of(op: DevOp) -> RowClass {
         Embed => RowClass::A,
         Gemm | GemmSmall | GemmMed | GemmLtPf | GemmBlkPf | GemmWide | GemmC5 | GemmNorm | GemmGlu
         | GemmSplitK | GemmFp8 | GemmMedFp8 | GemmSmallFp8 | GemmGluFp8 | GemmWideFp8
-        | GemmC5Fp8 | GemmFp8Blk | GemmMxfp4 | GemmMedMxfp4 | GemmSmallMxfp4 | GemmWideMxfp4
+        | GemmC5Fp8 | GemmFp8Blk | GemmFp8Mx | GemmMxfp4 | GemmMedMxfp4 | GemmSmallMxfp4
+        | GemmWideMxfp4
         | GemmC5Mxfp4 | GemmGluMxfp4 | DenseGluFp8Blk | GemmAffineQ4 | Q8GemmF32 | DenseGemmF32
         | SiluF32 => RowClass::A,
         Gemv | GemvSz | GemvGlu | GemvGluSz | GemvArgmax | GemvQkv | GemvQkvg | GemvF32

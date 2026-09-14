@@ -249,6 +249,11 @@ extern "C" __device__ unsigned plow_phase_xreduce_wave64_occ2_nospill_1 = 1;
  * memory contribution and no fault anywhere. The loader refuses on the missing symbol. */
 extern "C" __device__ unsigned plow_dsv41_engram_arm = 1;
 #endif
+/* No #include: `d_gemm_fp8_mx` lives in op_gemm_common.h, which this file already pulls in via
+ * op_gemm.h. Only the marker and the case are conditional, so the axis-off object is unchanged. */
+#if PLOW_DSV41_BLKFP8
+extern "C" __device__ unsigned plow_dsv41_blkfp8_arm = 1;
+#endif
 #if PLOW_DSV4_CSA2
 #include "op_compress.h"
 /* CONDITIONALLY compiled, like PLOW_MOE_PF_ATOMIC's marker and unlike the unconditional
@@ -771,6 +776,9 @@ extern "C" __device__ unsigned plow_prefill_nrn_consumer_1 = 1;
 /* DeepSeek-V4.1 Engram (op 182). Its own flag rather than riding PLOW_DSV4_CSA2: a model can
  * have CSA2 without Engram (V4 does), and only two layers of V4.1 carry a table. Off => every
  * existing object is byte-identical. */
+#ifndef PLOW_DSV41_BLKFP8
+#define PLOW_DSV41_BLKFP8 0
+#endif
 #ifndef PLOW_DSV41_ENGRAM
 #define PLOW_DSV41_ENGRAM 0
 #endif
@@ -2663,6 +2671,22 @@ __device__ __forceinline__ void exec_gemm_fp8_blk(CInst in, CTens T, unsigned sl
                    (const float*)TEN(3), in->i[0], in->i[1], in->i[2], slice, nblk, lds);
 #undef TEN
 }
+
+/* DeepSeek-V4.1's [32,32] ue8m0 twin of the above. The SCALE OPERAND TYPE is the whole reason
+ * this is a separate opcode and not a field on 107: `const unsigned char*` here against
+ * `const float*` there, over a grid blocked 32 rather than 128 on BOTH axes. Its tile is
+ * 128x128x32, so its LDS (2*(128+128)*32 halves = 32 KiB) is HALF op 107's and well under the
+ * arena, and it measured 136 VGPR / 0 spill / occupancy 3 against 107's 160 / occupancy 2 -- so
+ * it cannot move the worst case this switch already sets. */
+#if PLOW_DSV41_BLKFP8
+__device__ __forceinline__ void exec_gemm_fp8_mx(CInst in, CTens T, unsigned slice, unsigned nblk,
+                                                 bf16* lds) {
+#define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
+    d_gemm_fp8_mx((bf16*)TEN(0), (const bf16*)TEN(1), (const unsigned char*)TEN(2),
+                  (const unsigned char*)TEN(3), in->i[0], in->i[1], in->i[2], slice, nblk, lds);
+#undef TEN
+}
+#endif /* PLOW_DSV41_BLKFP8 */
 #endif /* PLOW_BUCKET_PREFILL */
 
 /* RESTORE THE SCALAR PROMISE ACROSS THE CALL BOUNDARY.
@@ -4063,6 +4087,11 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMM_FP8_BLK
         case PLOW_DOP_GEMM_FP8_BLK:
             exec_gemm_fp8_blk(in, T, slice, nblk, sm->gm);
+            break;
+#endif
+#if PLOW_DSV41_BLKFP8
+        case PLOW_DOP_GEMM_FP8_MX:
+            exec_gemm_fp8_mx(in, T, slice, nblk, sm->gm);
             break;
 #endif
         /* PREFILL-ONLY, and it has to be: d_gemm_glu is a full 256x256 MFMA GEMM, so inlining

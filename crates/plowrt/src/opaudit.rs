@@ -376,6 +376,7 @@ pub fn classify(op: DevOp) -> OpClass {
         | DevOp::GemmC5Fp8 => a_rows("i0=M, i4=a_row0 (contiguous row band)"),
         DevOp::GemmGluFp8 => a_rows("i0=M"),
         DevOp::GemmFp8Blk => a_rows("i0=M"),
+        DevOp::GemmFp8Mx => a_rows("i0=M"),
         DevOp::GemmMxfp4
         | DevOp::GemmMedMxfp4
         | DevOp::GemmSmallMxfp4
