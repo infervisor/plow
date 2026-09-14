@@ -510,6 +510,55 @@ gate now points at these four PASS markers) and checkpoint P.
 
 Against the 490 ms target that replaced 550, row-band alone leaves 38.4 ms. `stack-t4` follows.
 
+## Two decode/serving traps found while chasing 490 and 25 ms (2026-09-14)
+
+**A serving object set that is missing ONE file refuses the packet, and the message names neither
+the file nor the knob.** `stack-t4-b-treat` died 18 s into load with `Device("sparse FP8 MLA
+requires qualified gfx942 QH8 geometry and V2 prefill routing")`, while the control -- same
+runtime, same env, same row-band knob -- loaded fine. The cause is not the stacked levers. In
+`exec/amd.rs` the `row_split_ready` argument to `check_sparse_fp8_packet` is literally
+`hsaco_dir.join(amd_sparse_mla::OBJECT16).exists()`, i.e. whether
+`mla_dec_stage1_bf16_a16w16_subQ16_mqa16.co` sits in the object directory. Without it the guard's
+row-split branch is unreachable, every row-band `i[1]=64` instruction falls to the `d.i[1] != 8`
+test, and the packet is refused. `objs-stack-rb` had been built without that pinned vendor object
+(it is copied, not compiled). Installing it -- sha matches the pinned `OBJECT16_HASH` -- and
+re-running the manifest (120 -> 121 entries) fixes the arm. **Check object-set diffs against a
+KNOWN-GOOD set before blaming a lever**: `comm` over two `ls` listings found this in one command.
+
+**The low-rung decode tiers are already on, so their headroom is already spent.** Chasing
+"C1 decode 25 ms" it is tempting to reach for the two T2 numbers in Side findings -- the
+production decode object at one row costing 5.6x the MM=1 build, and the fused shared gate|up
+GEMV at 103 us against 31 us for two plain GEMVs. Neither is available:
+
+* `PLOW_HSACO_LOWRUNG` is unset in every serving arm (`t4-arm.sh` even unsets it explicitly), but
+  the runtime DISCOVERS the tiers anyway -- `exec/amd.rs` falls back to `discover_lowrung_tiers`
+  and logs `decode tiers discovered next to the object dir (PLOW_HSACO_LOWRUNG unset)`. Every
+  rb-t4 and stack-t4 server log carries that line with
+  `lowrung1:1,lowrung2:2,lowrung4:4,lowrung8:8,lowrung16:16`. **The measured TPOT 40.0 ms at C1
+  already runs the MM=1 object at rung 1.**
+* Both T2 figures were measured ON THE MM=16 OBJECT, which rung 1 therefore never executes. The
+  un-fused gate|up candidate may still be real, but it has to be re-priced on the `lowrung1`
+  object before it can be counted; the old number does not transfer.
+
+So the C1 decode lever list is MTP (`spec-t3`, full-depth gate B PASS: 90.7% acceptance, 3.68
+committed tokens per verify at k=3) and not much else that is already priced. Note MTP moves TTFT
+the WRONG way for the 490 goal: prefill must run layer 78 to fill the MTP KV, about +1/78 of a
+prefill, and the two goals are then in tension on the same packet.
+
+**"Beat vLLM on throughput" had no measurement to stand on.** The only recorded vLLM figures are
+C1 TTFT 570.0 (8192) and 310.6 (4096), and `reports/vllm-8k-profile.md` is gone from scratch.
+There is NO recorded vLLM TPOT or output throughput at ANY concurrency. `vllm-t4/vllm-arm.sh`
+fixes that: same `vllm bench serve` client, dataset, seeds, lengths and prompt counts as
+stack-t4, two arms for a vLLM-side drift floor. It needs the ROCm shim
+(`scripts/glm53_vllm_shim.sh`, recovered from history) because the 0.28 wheel runs with nix glibc
+first and every system binary its AITER workers fork dies without it; `VLLM_ROCM_USE_AITER=0` is
+not an escape hatch, since GLM-5.3's DSA indexer has no non-AITER ROCm kernel.
+
+Control reproducibility on this runtime is excellent: stack-t4 ctl 520.6 / ctl2 519.0 ms at
+`isl8192-c1`, a 1.6 ms drift, and the c16 cell reproduced rb-t4 to 0.1 ms across two runtimes.
+Row-band alone under this branch's plowrt is ~9 ms faster than under lever-hunt's, so the stack
+needs -29.8 ms rather than -38.4 to reach 490.
+
 ## Rejected or parked
 
 | candidate | reason |
