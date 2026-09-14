@@ -441,3 +441,62 @@ annotation and an entry in `Plow.Rewrite.soundRules` with a proof
 4. `kvnorm-quant-fuse` — `_window_kv` does `kv_norm(wkv(x))` then RoPE then
    `act_quant` in place (`model.py:705-707`). `RmsNorm`'s `t3/t4` fused w8a8
    quant slot already exists for exactly this shape.
+
+---
+
+## 9. Target: 8k context, 300 ms
+
+Campaign goal, set 2026-09-14: serve V4.1-Flash end to end at 8192 input
+tokens within **300 ms**, read as TTFT, on 8x MI300X (gfx942).
+
+### The target is not the hard part
+
+Params from `config.json`; bandwidth from `crates/hwspec` MI300X, which
+carries a MEASURED 4091.9 GB/s rather than the 5325 datasheet peak — a
+roofline drawn against the datasheet understates every kernel here by ~30%.
+
+| | |
+|---|---|
+| dense (non-expert) params / layer | 165.0 M |
+| one routed expert | 35.4 M |
+| active / token / layer | 377.3 M (165.0 dense + 6 x 35.4 routed) |
+| active / token | 15.1 B — note the model card says 8 B for prefill; the gap is worth resolving, and it moves the floor DOWN |
+| 8k prefill FLOPs | 247 TFLOP, plus ~28 for sparse attention and ~2 for the indexer |
+| compute, 8 GPUs, fp8 @45% | **~29 ms** |
+| weight traffic | 281 GB (routed fp4 272, dense 6.6, embed/head 2.6) |
+| HBM, 8 GPUs @measured | ~8.6 ms |
+
+At 8192 tokens with top-6 over 384 experts every expert is hit (~128 tokens
+each), so prefill reads the whole checkpoint once; it is still compute-bound
+by ~3x. Engram is a sparse gather, not a dense read, so its 196 B parameters
+contribute almost no traffic.
+
+**300 ms is ~11x the roofline floor.** That is a comfortable target for a
+mature stack — the V4-Flash-0731 recipe reports 7.9-8.5 K tok/s prefill on a
+SINGLE MI300X, which is ~1.0 s for 8k, so ~128 ms on 8 GPUs at perfect
+scaling. The risk in this campaign is therefore not the number. It is that
+six pieces between `config.json` and a served token do not exist yet.
+
+### What stands between here and it
+
+In dependency order. Items 1-3 are prerequisites for any measurement at all.
+
+| # | Piece | Where |
+|---|---|---|
+| 1 | `MoeScoring::SqrtSoftplus` + a scoring-parameterised `moe_router_noaux` | §8 — the IR cannot express V4.1's router today |
+| 2 | IR ops for single-pass mHC, the CSA2 compressor and Engram, each naming every weight leaf | §8 |
+| 3 | the `deepseek_v41` graph builder | §3 |
+| 4 | the fp4 group-16 / E4M3 KV-cache kernel | §5.2 — the one genuinely new kernel body |
+| 5 | runtime: 4 shared compressed caches for 40 layers, not 40; window ring + Bounded Replay in the prefix cache | §6.2, §6.4 |
+| 6 | Stage-2 rules + `soundRules` proofs, then stages 4-7 | §8 |
+
+DSpark and the vision tower are out of scope for the first number: the
+reference `generate.py` never calls `forward_spec`, so base output is
+bit-exact without DSpark, and an 8k TEXT prefill does not touch the ViT.
+
+### Measurement caveat that will outlive this doc
+
+No V4.1 reference exists on this box (§4), so "300 ms" cannot yet be checked
+against a second implementation. Until a container runtime or a source-built
+vLLM >= 0.30 lands, a plow number at 8k is unfalsified rather than validated,
+and should be reported that way.
