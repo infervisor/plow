@@ -887,6 +887,88 @@ largest addressable non-GPU TTFT lever — is withdrawn.
   (SEED/PREPARE/REARM/XCTR/ENQUEUE/DRAIN/AUDIT/READ/AGREE/STREAM), so `hostpath-probe` runs with
   `PLOW_DSTEP_LOG=1` and osl=64 to price it against the 40 → 25 ms goal.
 
+## Row-band takes an aperture violation on the C20 retrieval suite (2026-09-14, job `rb-retrieval`)
+
+`rb-retrieval` (the `rb-rowband` packet, full-depth `PLOW_GLM_ROWBAND_ATTN` set, `quality.py
+--suite all --concurrency 20`) died rc=1 at **base 9/18, tail 0/6**:
+
+```
+Queue error: HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION:
+  The agent attempted to access memory beyond the largest legal address.
+Queue at 0x7ffebc00e000 inactivated due to async error
+```
+
+The harness also printed "server error lines: 11"; **those are false positives** — its grep matches
+`fault_ms=0` inside ordinary INFO lines. The crash is the signal.
+
+Last lines before it:
+
+```
+decode ladder rung rung=20 occupied=17
+decode ladder rung rung=8  occupied=4
+decode admission rung from=20 to=16 occupied_extent=19 queued=0 reason=LowLoad
+Queue error: ...APERTURE_VIOLATION
+```
+
+Host-side suspects checked and **cleared**, so they are not the bug:
+
+* `occupied` in the engine log is already the EXTENT, not the live count
+  (`(0..batch).filter(live||pf).map(|s| s+1).max()`, `serve/engine.rs`), and it carries a
+  release-mode guard that refuses to advance a slot the rung does not cover.
+* The mux narrows ADMISSION only (`serve/mux.rs:658`, "existing high slots are never moved");
+  execution takes `controller.covering(extent)`, which for extent 19 returns the 20-wide rung.
+* `rowsplit_chunk_prog` takes the row-band sibling only when `step.clen == bucket_rows` — so ragged
+  final chunks are excluded — AND `rowsplit_prior_ok(c0, bucket_rows/8)`, which at
+  `SPAN_MIN_PRIOR = 2047` admits only prior 0 or prior >= 2047, never a band straddling row 2047.
+
+Queued `0-1789405497-rbfault-probe`: the SAME packet, objects, pinned binary and workload with
+`PLOW_GLM_ROWBAND=1` and `=0`. The packet is built to load with the gate off
+(`rowband_on || !rb_twin[id]` at load; `!rowband_on && rb_twin[i]` skips the twins), so this is a
+true null rather than a different build. Read it as: on faults + off clean => row-band's bug;
+both fault => the C20 retrieval path owns it; neither => intermittent, needs repeats first.
+
+**Until this resolves, row-band is not a default candidate**, and the stacked T4 result that rests
+on it (`-8.86 ms` at isl8192 C1) is provisional at depth.
+
+## Every gfx942 GEMM tile is chosen by the analytical model, and 4961 measured records sit unused (2026-09-14)
+
+`plowc tune status --gpu MI300X` states it directly:
+
+```
+tuning digest: gfx942-fea2746522ef589b
+records      : 4961 (4961 qualified)
+*** EVERY RECORD IN THIS CELL IS STALE. ***
+The store holds 4961 record(s) and the compiler can use NONE of them: selection
+falls back to the analytical model for every shape and reports tier `portable`.
+```
+
+The 4961 records key to **14 older build digests**, every one marked STALE on implementation,
+interpreter, or toolchain. So the campaign-wide observation that every emit reports `tier portable`
+is not "tiles were never measured" — it is "they were measured 4961 times and the store cannot
+reach the compiler". `select_gemm_over` falls through `gfx950_gemm_measurements()` (which does have
+a CDNA3/gfx942 slot) to the analytical `tile_cost` for every shape.
+
+The demand is not hypothetical. Under the shipping replay knobs, with `GLM_FULL=1` so the TP8 emit
+clears `mla.rs:9978`'s `tp == 1` single-layer assert:
+
+```
+demand   : 40 distinct shapes
+coverage : 0 HIT / 40 MISS against tuning
+```
+
+M over {128, 256, 512, 1024, 2048, 8192} against GLM's own N,K — including the **K=6144** column
+that `lib.rs` records was never in the store at all (every M>=256 record there was a Gemma-31B or
+Qwen shape with K in {2560, 4096, 5376, 8192, 21504}).
+
+`scripts/rebench_tune_gemm_gfx942.sh` is the in-tree fix and already encodes the environment rules.
+Queued as `gemmtune-glm53` through `/workspace/ttft550-c08d1232/gemmtune/run.sh`, which changes only
+the checkpoint (GLM-5.3-plow-lite, not 5.2-FP8), the scratch root (/workspace, not /tmp — the root
+overlay runs near 100% here) and max-ctx (81920), then adds the check the script cannot make: it
+re-derives the demand under the **production** `--replay-knobs` afterwards and requires 0 MISS. The
+script observes `PLOW_MLA_PREFILL=full` with no replay (48 shapes), a neighbour of the compile that
+ships (40) — and "48 ought to be a superset of 40" is the reasoning that let this cell go stale in
+the first place.
+
 ## Artefact policy (applied on every merge)
 
 Raw measurement files pushed upstream are removed here before the branch goes to main:
