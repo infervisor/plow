@@ -326,6 +326,45 @@ Also `d_moe_group_{glu,down}_gemma_pf` both spill 16 and run 0.8%/1.6% MFMA
 density at burst 3, which is the shape of the prefill expert kernel V4.1 would
 inherit.
 
+### 5.5 What a 70 ms target demands of the expert kernel
+
+Priced by `scripts/dsv41_roofline.py --target-ms 70`. A 70 ms TTFT needs
+**39.7%** of matrix peak as built with collectives exposed -- above the 35%
+low end of plow's own gfx942 GEMM band -- 30.3% if the collectives overlap,
+and 19.2% if the experts also reach fp8. So unlike 300 ms, 70 ms has no
+slack: the fp8 expert path and collective overlap both have to land.
+
+gfx942 is not the obstacle. The kernels that DO reach
+`v_mfma_f32_32x32x16_fp8_fp8` are well pipelined, and they live only in
+`interp_prefill_fp8.elf`:
+
+| kernel | MFMA | burst | wait-stalled | spill |
+|---|---|---|---|---|
+| `d_gemm_fp8_t<192,256,64,2,4>` | 48 fp8 | **23** | 4/48 | 230 |
+| `d_gemm_glu_fp8` | 48 fp8 | **23** | 4/48 | 247 |
+| `plow_exec` | 56 of 156 fp8 | 15 | 38/156 | 153 |
+| -- versus grouped MoE -- | bf16 only | 3 | 16/32 | 16-112 |
+
+Burst 23 at 8% wait-stalled is what this part does when a kernel is written
+for it; burst 3 at 50% is what the grouped-MoE kernels do. The gap is the
+kernel, not the hardware. Note the trade the good kernels make: deep MFMA
+bursts need accumulator VGPRs, and both spill >200. A 70 ms expert kernel
+will have to buy its burst depth the same way and carry an explicit spill
+budget, because `asm_audit.py` contract class 2 refuses on spill.
+
+**The tile does not fit the problem.** The well-pipelined template is tiled
+BM=192, but the expert GEMM at 8k is M=128: 8192 tokens x top-6 / 384
+experts = 128 tokens per expert on average. A 192-row tile on a 128-row
+problem wastes a third of the tile before anything else goes wrong, and the
+per-expert M is a distribution, not a constant -- routing skew makes some
+experts much smaller. So the expert kernel cannot simply reuse
+`d_gemm_fp8_t`'s shape; it needs a smaller BM, or token grouping that packs
+several experts' rows into one tile.
+
+That is the single largest open design question for a sub-120 ms number, and
+it is orthogonal to the fp4 dequant: even a perfect MXFP4 unpack feeding a
+BM=192 tile leaves a third of the matrix engine idle on the average expert.
+
 ## 6. Pipelining changes
 
 These are the changes that are NOT kernel bodies — they are dataflow and
