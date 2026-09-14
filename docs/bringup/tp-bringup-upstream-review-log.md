@@ -1030,6 +1030,75 @@ band that spans rows belonging to more than one packed sequence, or that indexes
 wrong member, would produce exactly this signature. That is the first thing to check, before the
 `rowsplit_prior_ok` / `band_keys` gate, which reads correctly in isolation.
 
+## Correction: row-band is not a memory-safety bug — wherever it runs, the answer is wrong (2026-09-14, job `rbfault4-localise`)
+
+The section above convicts row-band of "a memory-safety fault under concurrent retrieval". That
+classification is wrong, and the localisation probe that was meant to name the faulting launch is
+what falsifies it.
+
+**The instrument.** `PLOW_PREFILL_SEG_TIMING=1` takes the other branch in `amd_tp.rs`: one segment
+enqueued across all ranks, then a drain, per segment. A drain after every launch makes an async GPU
+fault synchronous, so the last line printed names the faulting segment. The probe ran the same
+`quality.py --suite all --concurrency 20` that faults, on the same stack packet `9e76b70bf97ee4a6`.
+
+**What came back.** Zero fault lines in 245,229 segment records — and the probe's own banner
+therefore printed "NO FAULT … points AWAY from one bad launch and TOWARD a cross-segment overlap".
+**That banner is read off the fault counter alone and is wrong.** `rc=1` was neither a timeout nor
+a null: the suite ran to completion, through the 67k tails, and returned
+
+| suite | length | pass | fail |
+|---|---|---|---|
+| base | 8000 | 9 | 0 |
+| base | 100000 | 0 | 9 |
+| tail | 65807 | 0 | 3 |
+| tail | 66234 | 0 | 9 |
+| tail | 67000 | 0 | 9 |
+
+with the failures returning not wrong answers but **garbage**: `" n 6 say none yes.   all .  not
+ # #"`, `"5).66).5b9.2  not et."`, `"381. o81 no3..4.enu956 but ..2.3"`. Serialising every segment
+removed the *fault* and left the *answer* wrong. A missing barrier does not behave that way. This
+is a wrong computation, and the aperture violation is a downstream symptom of it.
+
+**Why the 8000 cell passes, and why that is not evidence of correctness.** The row-split sibling is
+selected only for a full chunk (`rowsplit_chunk_prog`: `step.clen == bucket_rows`). The probe's log
+separates the two 8192-bucket programs exactly:
+
+```
+program=4   clen=8192 only,  c0 = 0, 8192, 16384, … 57344     <- the row-split sibling
+program=3   clen 271 … 5438, never 8192                        <- the ordinary program
+```
+
+The 8000-token base prompts tokenize to 5437/5438, run program 3, and never execute row-band at
+all. **Every cell in which program 4 actually ran failed.** So the finding is not "row-band faults
+under concurrency" but *wherever row-band runs, the output is wrong* — and the C20 mixed-length
+condition earlier believed necessary is only the condition under which the corruption escalates
+into an unmapped address instead of a mapped one.
+
+**Consequences, replacing the three above.**
+
+* The defect is numerical, not a race. The "cross-segment overlap" lead in the previous section, and
+  the per-sequence-span lead that closes it, are both withdrawn — neither survives a corruption that
+  is present with every segment serialised.
+* **The `-8.86 ms` isl8192 C1 figure is withdrawn outright, not merely as unshippable.** isl8192 C1
+  is `clen == 8192`, so it ran program 4 with no quality gate attached: it timed a computation that
+  produces garbage. It is not a measurement of what row-band would buy.
+* The broken `PLOW_GLM_ROWBAND=0` rollback remains a second, independent defect, unchanged.
+* The shipping set's health at C20 (18/18 base, 21/21 tail, no faults) is unaffected and still holds.
+
+**One theory checked and discarded before it reached a patch**, recorded because it is the obvious
+one to try next and it is wrong. `enqueue_window_rowsplit` offsets the selection table by
+`index_row0 = rank * route.rows`, while the load-time contract in the same file says the table is
+sized at the packet's full row count and each rank reads its band at `rank * rows` where `rows` is
+`inst.i[4]`, the *band*. That reads like an 8× over-offset. It is not: `Route::rebase` reassigns
+`self.rows = self.inst.i[4]` on the row-split arm, so `route.rows` **is** the band by the time
+`enqueue` runs, and the offset is correct.
+
+**Next**, queued as `rbfault5-determinism`: the same tail suite at concurrency 1 and 4 against the
+shipping control. Every row-band observation to date comes from C20. If C1 reproduces the garbage
+the defect is deterministic — one prompt, one program, no mux, no admission, no packed multi-
+sequence window — and reduces to bisecting numerics against the ordinary program, which is a far
+cheaper object than a scheduler.
+
 ## Every gfx942 GEMM tile is chosen by the analytical model, and 4961 measured records sit unused (2026-09-14)
 
 `plowc tune status --gpu MI300X` states it directly:
