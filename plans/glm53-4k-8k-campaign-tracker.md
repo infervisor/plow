@@ -381,6 +381,15 @@ Paired with G4 MoE shared seed (P certificate already accepted, -8.6 ms at P8192
 serving-set regeneration), these two are -19.8 ms at the goal cell's prior from work that is already
 done rather than proposed.
 
+Having been caught twice by a passing result nobody read, all 67 campaign jobs in the queue's `done/`
+were then swept by exit code. Nothing else is hiding: the remaining unreported rc=0 runs are genuine
+nulls, and both say so in their own output. `parbranch-t3-d20` moves the decode tick by less than the
+control drift (rows 8: ctl 42.73 / on 42.71 / ctl2 42.78; rows 16: 48.83 / 48.72 / 48.93), with
+retrieval 39/39 and the serving guard passing. `kvslots2-gate-f` prints its own verdict --
+`ms/step: ctl 45.29 on 45.34 ctl2 46.06, on-ctl -0.33 floor 0.77 neutral` -- with all 8 ranks
+token-identical. Worth repeating as method: a job's rc=0 means it ran, not that anyone read it, and
+the tracker's "queued" is not evidence of anything.
+
 ## Rejected or parked
 
 | candidate | reason |
