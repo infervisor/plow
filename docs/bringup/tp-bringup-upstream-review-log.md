@@ -1420,6 +1420,21 @@ scratch ops against a budget of 1957 (+675, +35 %), `interp_prefill_k3_gq` at 26
 `amd_common.h` is what moved them. This is a real regression with a name on it, one day old, and
 blessing it would be absorbing it.
 
+Two refinements matter for whoever picks it up. First, the `-D` axes for `interp_prefill_k3` are
+BYTE-IDENTICAL between the two builds, so nothing about the flags changed: the +675 scratch ops come
+purely from `f89d3a5c`'s source edits. The visible candidate is that every FP8 GEMM arm and the FP8
+quantizer stopped reading `M` from `in->i[0]` inside the callee and now take it as a parameter,
+`PLOW_RUNTIME_ROWS(in->i[0])` — which expands to `(capacity)`, an exact no-op, on an object that
+sets neither `PLOW_TOKEN_BATCH` nor `PLOW_MIXED_STEP`, as this one does not. So the semantics are
+unchanged and the cost is an emergent register-allocation effect, which is precisely the class the
+committed budget exists to catch and precisely the class that is invisible without it.
+
+Second, and it changes the urgency rather than the verdict: **the 35 % blowup is not on the GLM
+path.** `interp_prefill_k3` compiles `-DPLOW_K3=1 -DPLOW_MXFP4=1`, the K3/MXFP4 family; the two GLM
+prefill rows in the same list, `interp_prefill_mla_moe` and `interp_prefill_fp8kv_mla`, are over by
+1 and 6 scratch ops, which is noise. The 8K TTFT campaign is not paying for this regression. The
+K3/MXFP4 prefill family is.
+
 **Class 3 — the K3 MoE expert spills predate the last bless.** `d_moe_expert_glu_fp8_blk` at 105
 spill instructions and `d_moe_expert_down_fp8_blk` at 80, across four decode objects, are present
 at HEAD, at `3d54bd95`, AND at `ee624310` — identical counts in all three. These come from
