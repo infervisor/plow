@@ -50,6 +50,7 @@
 /// * `in.`  — engine inputs and compiler-materialised tables (`in.ids`, `in.pos`, `in.cos`, …)
 /// * `kv.`  — the KV / MLA-latent ring (`kv.{l}.ckv`, `kv.{l}.krot`, …)
 /// * `state.` — request-local recurrent state, reset when its slot is reused
+/// * `pf.` — request tables used by packed prefill
 /// * `moe.` — Gemma's fused-expert pointer tables (`moe.ewt.{l}`, `moe.est.{l}`), filled by the
 ///   host from the addresses of tensors that ARE weights
 /// * `tmap.` — sm_90a TMA tensor-map descriptors (`GEN_TMAP_BF16`), 128 B each, encoded by
@@ -57,7 +58,7 @@
 ///
 /// Kept as data, not as a chain of `||`, so a test can assert over the constant rather than
 /// re-spelling the literals it is supposed to be checking.
-pub const RUNTIME_PREFIXES: &[&str] = &["act.", "in.", "kv.", "moe.", "tmap.", "state."];
+pub const RUNTIME_PREFIXES: &[&str] = &["act.", "in.", "kv.", "moe.", "tmap.", "state.", "pf."];
 
 /// True for a name in one of the [`RUNTIME_PREFIXES`] namespaces.
 pub fn is_runtime_tensor(name: &str) -> bool {
@@ -155,6 +156,8 @@ mod tests {
             "in.cos",
             "kv.3.krot",
             "moe.ewt.7",
+            "pf.request.slot",
+            "pf.request.table",
         ] {
             assert!(!is_checkpoint_weight(n), "{n}");
         }

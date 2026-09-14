@@ -4,12 +4,13 @@ use plow_asset::hetero_channel::{
 };
 
 pub fn program(prog: u32, rows: u32, hidden: u32, spans: Vec<Span>) -> ProgPlan {
+    let min_rows = if rows == 128 { 64 } else { rows };
     ProgPlan {
         prog,
         rows,
-        min_rows: 64,
-        max_rows: 128,
-        call_rows: 128,
+        min_rows,
+        max_rows: rows,
+        call_rows: rows,
         original_sha256: String::new(),
         partials: Partials {
             gpu: format!("channel.{prog}.gpu_partial"),
@@ -73,6 +74,7 @@ pub fn plan(
         hidden: h,
         inter: i,
         ane_channels: channels,
+        mlp_act: weights.mlp_act,
         weight_encoding: weights.weight_encoding,
         layers: weights
             .layers

@@ -798,14 +798,34 @@ fn tb_plan(
 fn prefix_free_spans_tile_the_batch_with_no_decode_prefix() {
     // §6.1's worked example: two ongoing decodes, a prompt that finishes, an intermediate chunk.
     let decode = [
-        DecodeRequest { slot: 0, state_slot: 0, token: 11 },
-        DecodeRequest { slot: 1, state_slot: 1, token: 22 },
+        DecodeRequest {
+            slot: 0,
+            state_slot: 0,
+            token: 11,
+        },
+        DecodeRequest {
+            slot: 1,
+            state_slot: 1,
+            token: 22,
+        },
     ];
     let c: Vec<u32> = (0..50).collect();
     let d: Vec<u32> = (0..80).collect();
     let prefill = [
-        PrefillRequest { slot: 2, state_slot: 2, start: 70, tokens: &c, prompt_len: 120 },
-        PrefillRequest { slot: 3, state_slot: 3, start: 0, tokens: &d, prompt_len: 400 },
+        PrefillRequest {
+            slot: 2,
+            state_slot: 2,
+            start: 70,
+            tokens: &c,
+            prompt_len: 120,
+        },
+        PrefillRequest {
+            slot: 3,
+            state_slot: 3,
+            start: 0,
+            tokens: &d,
+            prompt_len: 400,
+        },
     ];
     let frontiers = [100, 900, 70, 0];
     let plan = tb_plan(&decode, &prefill, &frontiers, 256, 4096).unwrap();
@@ -829,13 +849,20 @@ fn prefix_free_spans_tile_the_batch_with_no_decode_prefix() {
 
     // The leading run of length-one spans is exactly S. `plow_tb_decode_spans` reads that run
     // as the attention partition AND, through PLOW_SAMPLE_ROWS, as the selection row count.
-    let leading = plan.prefill_spans.iter().take_while(|s| s.n_rows == 1).count();
+    let leading = plan
+        .prefill_spans
+        .iter()
+        .take_while(|s| s.n_rows == 1)
+        .count();
     assert_eq!(leading as u32, plan.decode_rows);
 
     // The completing prompt's terminal token leads the batch at its own absolute position, and
     // its body follows: two spans, one slot, contiguous in KV.
     let terminal = plan.prefill_spans[2];
-    assert_eq!((terminal.slot, terminal.kv_row0, terminal.kv_len), (2, 119, 120));
+    assert_eq!(
+        (terminal.slot, terminal.kv_row0, terminal.kv_len),
+        (2, 119, 120)
+    );
     let body = plan
         .prefill_spans
         .iter()
@@ -847,12 +874,23 @@ fn prefix_free_spans_tile_the_batch_with_no_decode_prefix() {
 
     // The intermediate chunk samples nothing and its span is not in the leading run.
     let intermediate = plan.prefill_spans.last().unwrap();
-    assert_eq!((intermediate.slot, intermediate.n_rows, intermediate.kv_len), (3, 80, 80));
+    assert_eq!(
+        (intermediate.slot, intermediate.n_rows, intermediate.kv_len),
+        (3, 80, 80)
+    );
 
     // Commit is per REQUEST: the completing prompt advances once, to prompt_len.
     assert_eq!(plan.commits.len(), 4);
-    assert!(plan.commits.contains(&Commit { slot: 2, expect: 70, after: 120 }));
-    assert!(plan.commits.contains(&Commit { slot: 0, expect: 100, after: 101 }));
+    assert!(plan.commits.contains(&Commit {
+        slot: 2,
+        expect: 70,
+        after: 120
+    }));
+    assert!(plan.commits.contains(&Commit {
+        slot: 0,
+        expect: 100,
+        after: 101
+    }));
 }
 
 /// The shared request contract plans EXACTLY the plan the AMD request pair does — same rows,
@@ -1003,7 +1041,13 @@ fn two_cached_prefix_suffixes_fill_one_1024_row_token_batch() {
 #[test]
 fn a_one_token_prompt_is_one_length_one_span() {
     let tokens = [5u32];
-    let prefill = [PrefillRequest { slot: 0, state_slot: 0, start: 0, tokens: &tokens, prompt_len: 1 }];
+    let prefill = [PrefillRequest {
+        slot: 0,
+        state_slot: 0,
+        start: 0,
+        tokens: &tokens,
+        prompt_len: 1,
+    }];
     let plan = tb_plan(&[], &prefill, &[0], 8, 64).unwrap();
     assert_eq!(plan.prefill_spans.len(), 1);
     assert_eq!(plan.prefill_spans[0].n_rows, 1);
@@ -1019,7 +1063,13 @@ fn a_one_token_prompt_is_one_length_one_span() {
 #[test]
 fn an_intermediate_chunk_alone_samples_nothing() {
     let tokens: Vec<u32> = (0..64).collect();
-    let prefill = [PrefillRequest { slot: 0, state_slot: 0, start: 0, tokens: &tokens, prompt_len: 512 }];
+    let prefill = [PrefillRequest {
+        slot: 0,
+        state_slot: 0,
+        start: 0,
+        tokens: &tokens,
+        prompt_len: 512,
+    }];
     let plan = tb_plan(&[], &prefill, &[0], 128, 4096).unwrap();
     assert_eq!(plan.decode_rows, 0);
     assert_eq!(plan.real_rows, 64);
@@ -1031,28 +1081,55 @@ fn an_intermediate_chunk_alone_samples_nothing() {
 /// decode rows in a band ahead of the spans and hold the prompt's last token back.
 #[test]
 fn the_decode_band_contract_is_unchanged_by_the_new_mode() {
-    let decode = [DecodeRequest { slot: 0, state_slot: 0, token: 11 }];
+    let decode = [DecodeRequest {
+        slot: 0,
+        state_slot: 0,
+        token: 11,
+    }];
     let tokens: Vec<u32> = (0..50).collect();
-    let prefill = [PrefillRequest { slot: 1, state_slot: 1, start: 70, tokens: &tokens, prompt_len: 120 }];
+    let prefill = [PrefillRequest {
+        slot: 1,
+        state_slot: 1,
+        start: 70,
+        tokens: &tokens,
+        prompt_len: 120,
+    }];
     let frontiers = [100, 70];
     let band = plan(&decode, &prefill, &frontiers, 128, 4096, 7).unwrap();
     assert_eq!(band.cover, SpanCover::DecodeBand);
     assert_eq!(band.decode_rows, 1);
     assert_eq!(band.prefill_spans.len(), 1);
-    assert_eq!(band.prefill_spans[0].row0, 1, "spans start AFTER the decode band");
+    assert_eq!(
+        band.prefill_spans[0].row0, 1,
+        "spans start AFTER the decode band"
+    );
     assert_eq!(band.prefill_spans[0].n_rows, 50, "no terminal split");
     // The commit list reproduces exactly what the per-span commit used to do.
     assert_eq!(band.commits.len(), 2);
-    assert!(band.commits.contains(&Commit { slot: 1, expect: 70, after: 120 }));
+    assert!(band.commits.contains(&Commit {
+        slot: 1,
+        expect: 70,
+        after: 120
+    }));
 }
 
 /// Padding belongs to nobody: it is parked, and a live row is never invented for it.
 #[test]
 fn prefix_free_padding_is_parked_and_outside_every_span() {
-    let decode = [DecodeRequest { slot: 0, state_slot: 0, token: 11 }];
+    let decode = [DecodeRequest {
+        slot: 0,
+        state_slot: 0,
+        token: 11,
+    }];
     let frontiers = [10, 0];
     let tokens: Vec<u32> = (0..4).collect();
-    let prefill = [PrefillRequest { slot: 1, state_slot: 1, start: 0, tokens: &tokens, prompt_len: 4 }];
+    let prefill = [PrefillRequest {
+        slot: 1,
+        state_slot: 1,
+        start: 0,
+        tokens: &tokens,
+        prompt_len: 4,
+    }];
     let plan = tb_plan(&decode, &prefill, &frontiers, 32, 4096).unwrap();
     assert_eq!(plan.real_rows, 5);
     assert!(plan.parked[..5].iter().all(|&v| v == 0));

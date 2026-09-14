@@ -234,6 +234,10 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_FUSE_QKV_FP8", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub fuse_qkv_fp8: bool,
 
+    /// Fused Q|K|V, MXFP4 weights.
+    #[arg(long, env = "PLOW_FUSE_QKV_MX4", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub fuse_qkv_mx4: bool,
+
     /// Disable norm+residual+norm fusion.
     #[arg(long, env = "PLOW_NO_FUSE_NRN", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub no_fuse_nrn: bool,
@@ -1199,6 +1203,7 @@ impl EmitConfig {
             fuse_argmax: env_bool("PLOW_FUSE_ARGMAX"),
             no_fuse_qkv: env_bool("PLOW_NO_FUSE_QKV"),
             fuse_qkv_fp8: env_bool("PLOW_FUSE_QKV_FP8"),
+            fuse_qkv_mx4: env_bool("PLOW_FUSE_QKV_MX4"),
             no_fuse_nrn: env_bool("PLOW_NO_FUSE_NRN"),
             fuse_hnr: env_bool("PLOW_FUSE_HNR"),
             fuse_merge: env_bool("PLOW_FUSE_MERGE"),

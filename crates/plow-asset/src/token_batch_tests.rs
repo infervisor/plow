@@ -752,6 +752,8 @@ fn dropping_a_conversion_refuses_the_program_naming_the_opcode() {
 #[test]
 fn the_dense_gqa_pair_does_not_claim_an_output_segment() {
     let caps = Capabilities::amd_dense_gqa("gfx942", 4096, 3);
-    let err = caps.can_run_output().expect_err("no terminal segment is emitted");
+    let err = caps
+        .can_run_output()
+        .expect_err("no terminal segment is emitted");
     assert!(err.capability.contains(ROW_GATHER_CAPABILITY), "{err}");
 }

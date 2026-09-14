@@ -3,7 +3,7 @@ use crate::program::{Packet, Program};
 use packet::dev::{DevInst64, DevOp, TENSOR_NONE16};
 use serde::{Deserialize, Serialize};
 
-pub const SCHEMA: &str = "plow-hetero-v3";
+pub const SCHEMA: &str = "plow-hetero-v4";
 #[cfg(test)]
 #[path = "hetero_channel_tests.rs"]
 mod tests;
@@ -60,7 +60,7 @@ pub struct Layer {
 #[serde(deny_unknown_fields)]
 pub struct Span {
     pub layer: u32,
-    /// Half-open instruction range of the original, complete GPU MLP plus residual.
+    /// Half-open instruction range of the original gate/up activation and down projection.
     pub insts: [u32; 2],
     pub input: String,
     pub residual: String,
@@ -100,6 +100,8 @@ pub struct ChannelPlan {
     pub hidden: u32,
     pub inter: u32,
     pub ane_channels: u32,
+    /// 0 = GeGLU, 1 = SwiGLU.
+    pub mlp_act: u32,
     pub weight_encoding: WeightEncoding,
     pub layers: Vec<Layer>,
     pub programs: Vec<ProgPlan>,
@@ -136,7 +138,8 @@ impl ChannelPlan {
             self.hidden > 0
                 && self.inter > 0
                 && self.ane_channels > 0
-                && self.ane_channels < self.inter,
+                && self.ane_channels < self.inter
+                && self.mlp_act <= 1,
             "nonempty complementary channels required",
         )?;
         need(
@@ -209,14 +212,18 @@ impl ChannelPlan {
                 .programs
                 .get(pp.prog as usize)
                 .ok_or("channel MLP: missing program")?;
+            let rows_ok = match pp.rows {
+                128 => pp.min_rows == 64,
+                256 => pp.min_rows == 256,
+                _ => false,
+            };
             need(
                 !prog.role.is_packed_sibling()
                     && prog.rows == pp.rows
-                    && pp.rows == 128
-                    && pp.min_rows == 64
-                    && pp.max_rows == 128
-                    && pp.call_rows == 128,
-                "initial fixed-call row contract",
+                    && rows_ok
+                    && pp.max_rows == pp.rows
+                    && pp.call_rows == pp.rows,
+                "fixed-call row contract",
             )?;
             need(
                 pp.original_sha256 == crate::live_kv::program_digest(prog),
@@ -312,17 +319,17 @@ impl ChannelPlan {
         let (wg, sg) = self.weight_handles(p, &layer.gate)?;
         let (wu, su) = self.weight_handles(p, &layer.up)?;
         let (wd, sd) = self.weight_handles(p, &layer.down)?;
-        // Only these complete, unfurled SwiGLU shapes are replaceable. No runtime graph search.
+        // Only these complete, unfurled GLU shapes are replaceable. No runtime graph search.
         let fused = match self.weight_encoding {
             WeightEncoding::Bf16 => DevOp::GemmGlu,
             WeightEncoding::Fp8 => DevOp::GemmGluFp8,
             WeightEncoding::Mxfp4 => DevOp::GemmGluMxfp4,
         };
         need(
-            insts.len() == 3 || insts.len() == 5,
+            insts.len() == 2 || insts.len() == 4,
             "unsupported fused MLP span",
         )?;
-        if insts.len() == 3 {
+        if insts.len() == 2 {
             let d = &insts[0];
             let scales = match self.weight_encoding {
                 WeightEncoding::Bf16 => [
@@ -340,9 +347,9 @@ impl ChannelPlan {
                     && d.t[..3] == [z, x, wg]
                     && d.t[3..] == scales
                     && d.i[..3] == [prog.rows, self.inter, self.hidden]
-                    && d.i[3..] == [0, 0, 1, 0, 0]
+                    && d.i[3..] == [0, 0, self.mlp_act, 0, 0]
                     && d.fj == [0; 3],
-                "gate/up SwiGLU binding",
+                "gate/up GLU binding",
             )?;
         } else {
             let (g, u, act) = (&insts[0], &insts[1], &insts[2]);
@@ -372,7 +379,7 @@ impl ChannelPlan {
                             prog.rows
                                 .checked_mul(self.inter)
                                 .ok_or("channel MLP: GLU extent overflow")?,
-                            1,
+                            self.mlp_act,
                             0,
                             0,
                             0,
@@ -381,33 +388,12 @@ impl ChannelPlan {
                             0,
                         ]
                     && act.fj == [0; 3],
-                "SwiGLU binding",
+                "GLU binding",
             )?;
         }
-        let down = &insts[insts.len() - 2];
+        let down = &insts[insts.len() - 1];
         self.validate_projection(down, [prog.rows, self.hidden, self.inter], z, wd, sd)?;
         need(down.t[0] == y, "down output binding")?;
-        let r = &insts[insts.len() - 1];
-        need(
-            r.op == DevOp::Residual as u16
-                && r.t[..3] == [residual, residual, y]
-                && r.t[3..] == [TENSOR_NONE16; 5]
-                && r.i
-                    == [
-                        prog.rows
-                            .checked_mul(self.hidden)
-                            .ok_or("channel MLP: residual extent overflow")?,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                    ]
-                && r.fj == [1f32.to_bits(), 0, 0],
-            "single residual addition required",
-        )?;
         Ok(())
     }
 

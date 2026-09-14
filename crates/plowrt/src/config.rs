@@ -410,6 +410,15 @@ pub struct AppleRuntimeConfig {
     /// Use the dedicated MXFP4 Metal pipeline.
     #[arg(long = "metal-mx4-dedicated", env = "PLOW_METAL_MX4_DEDICATED", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub mx4_dedicated: bool,
+    /// Compute two adjacent MXFP4 GLU output channels per Metal SIMD group at M1.
+    #[arg(long = "metal-mx4-glu-rows2", env = "PLOW_METAL_MX4_GLU_ROWS2", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub mx4_glu_rows2: bool,
+    /// Compute two adjacent plain MXFP4 output rows per Metal SIMD group at M1.
+    #[arg(long = "metal-mx4-rows2", env = "PLOW_METAL_MX4_ROWS2", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub mx4_rows2: bool,
+    /// Reuse plain BF16 projection weights across two decode rows.
+    #[arg(long = "metal-bf16-m2", env = "PLOW_METAL_BF16_M2", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub bf16_m2: bool,
     /// CPU decode column share: percent[:instruction count].
     #[arg(long = "apple-cpu-share", env = "PLOW_CPU_SHARE", global = true)]
     pub cpu_share: Option<String>,

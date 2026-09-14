@@ -518,10 +518,7 @@ pub fn split_reasoning(text: &str) -> (Option<String>, String) {
         Some(i) => {
             let reasoning = text[..i].trim().to_string();
             let answer = text[i + CLOSE.len()..].trim_start().to_string();
-            (
-                (!reasoning.is_empty()).then_some(reasoning),
-                answer,
-            )
+            ((!reasoning.is_empty()).then_some(reasoning), answer)
         }
         None => (None, text.to_string()),
     }
@@ -765,10 +762,7 @@ fn sse_response(
                                     let after = st.hold[i + CLOSE.len()..].to_string();
                                     st.hold.clear();
                                     st.in_reasoning = false;
-                                    (
-                                        (!before.is_empty()).then_some(before),
-                                        Some(after),
-                                    )
+                                    ((!before.is_empty()).then_some(before), Some(after))
                                 }
                                 None => {
                                     // Hold back only as much as could still be
@@ -871,11 +865,10 @@ fn sse_response(
                             None,
                             None,
                         );
-                        let data = serde_json::to_string(&body)
-                            .unwrap_or_else(|_| {
-                                "{\"error\":{\"message\":\"stream error\",\"type\":\"server_error\"}}"
-                                    .to_string()
-                            });
+                        let data = serde_json::to_string(&body).unwrap_or_else(|_| {
+                            "{\"error\":{\"message\":\"stream error\",\"type\":\"server_error\"}}"
+                                .to_string()
+                        });
                         st.done = true;
                         return Some((Ok(Event::default().data(data)), st));
                     }
@@ -935,12 +928,8 @@ mod tests {
             vec![("system", "You are helpful."), ("user", "Hi there")],
             vec![("user", "one"), ("assistant", "two"), ("user", "three")],
         ] {
-            let built = gemma_chat_prompt(
-                &convo
-                    .iter()
-                    .map(|&(r, c)| msg(r, c))
-                    .collect::<Vec<_>>(),
-            );
+            let built =
+                gemma_chat_prompt(&convo.iter().map(|&(r, c)| msg(r, c)).collect::<Vec<_>>());
             let rendered = t
                 .render(
                     &convo

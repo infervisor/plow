@@ -33,6 +33,19 @@ pub trait SlotEngine: Send {
     fn max_ctx(&self) -> usize;
     /// One line for the ready log (unit, threads, tier).
     fn describe(&self) -> String;
+    fn packed_prefill(&self) -> bool {
+        false
+    }
+    fn prefill_packed(
+        &mut self,
+        _prog: usize,
+        _spans: &[PrefillSpan],
+        _prompts: &[&[u32]],
+    ) -> Result<Vec<u32>> {
+        Err(RuntimeError::Rejected(
+            "packed prefill is not supported by this slot engine".into(),
+        ))
+    }
 }
 
 impl SlotEngine for CpuEngine {
@@ -85,6 +98,8 @@ pub struct CpuServe {
     max_ctx: usize,
     /// Prompt rows already prefilled per slot (0 = no chunked prefill in flight).
     pf_pos: Vec<u32>,
+    pf_len: Vec<u32>,
+    pf_ready: Vec<Option<u32>>,
     /// Compiled prefill buckets `(program, rows)`.
     buckets: Vec<(usize, u32)>,
     /// Largest chunk one tick may prefill while other slots decode (`PLOW_CPU_PF_CHUNK`;
@@ -138,6 +153,8 @@ impl CpuServe {
             last_rung: 0,
             max_ctx,
             pf_pos: vec![0; batch],
+            pf_len: vec![0; batch],
+            pf_ready: vec![None; batch],
             buckets,
             pf_chunk,
         })
@@ -187,6 +204,7 @@ impl CpuServe {
 
     fn admit_prefilled(&mut self, slot: usize, prompt: &[u32], tok: u32) {
         self.pf_pos[slot] = 0;
+        self.pf_len[slot] = 0;
         self.pos[slot] = prompt.len() as u32;
         self.live[slot] = true;
         self.next_id[slot] = tok;
@@ -205,6 +223,10 @@ impl CpuServe {
     /// row (see `dispatch`), so a decode tick in between cannot touch a finished KV row.
     pub fn prefill_chunk(&mut self, slot: usize, prompt: &[u32], cap: u32) -> Result<Option<u32>> {
         self.check_prompt(slot, prompt)?;
+        if let Some(tok) = self.pf_ready[slot].take() {
+            self.admit_prefilled(slot, prompt, tok);
+            return Ok(Some(tok));
+        }
         let n = prompt.len() as u32;
         if self.pf_pos[slot] >= n && self.pf_pos[slot] != 0 {
             return Err(RuntimeError::Rejected(format!(
@@ -215,6 +237,8 @@ impl CpuServe {
         let ch = next_chunk(&self.buckets, n, self.pf_pos[slot], cap.max(1));
         if let Err(e) = self.eng.prefill_slot_chunk(slot, prompt, ch) {
             self.pf_pos[slot] = 0;
+            self.pf_len[slot] = 0;
+            self.pf_ready[slot] = None;
             return Err(e);
         }
         self.pf_pos[slot] += ch.clen;
@@ -294,6 +318,8 @@ impl CpuServe {
             self.live[slot] = false;
             self.pos[slot] = 0;
             self.pf_pos[slot] = 0;
+            self.pf_len[slot] = 0;
+            self.pf_ready[slot] = None;
         }
     }
 }
@@ -317,22 +343,110 @@ impl SeqEngine for CpuServe {
 
     fn advance_prefill_turn(&mut self, _slot: usize) {}
 
-    fn prefill_prog_t(&self, _prog: usize) -> Option<u32> {
-        None
+    fn prefill_prog_t(&self, prog: usize) -> Option<u32> {
+        self.buckets
+            .iter()
+            .find_map(|&(p, rows)| (p == prog).then_some(rows))
     }
 
-    fn packable_prefill_span(&self, _slot: usize, _max_rows: u32) -> Option<PrefillSpan> {
-        None
+    fn packable_prefill_span(&self, slot: usize, max_rows: u32) -> Option<PrefillSpan> {
+        if !self.eng.packed_prefill() || self.live.get(slot).copied()? {
+            return None;
+        }
+        let rows = *self.pf_len.get(slot)?;
+        if rows == 0 || !rows.is_multiple_of(32) || self.pf_pos.get(slot).copied()? != 0 {
+            return None;
+        }
+        let wanted = rows.checked_mul(2)?;
+        let program = self
+            .buckets
+            .iter()
+            .find(|&&(_, width)| width >= wanted && width <= max_rows)?
+            .0;
+        Some(PrefillSpan {
+            row0: 0,
+            n_rows: rows,
+            slot: slot as u32,
+            flags: packet::dev::PREFILL_SPAN_RESET_STATE,
+            kv_row0: 0,
+            kv_len: rows,
+            state_slot: slot as u32,
+            program: program as u32,
+        })
     }
 
-    fn advance_packed_prefill(&mut self, _members: &[(usize, &[u32])]) -> Result<()> {
-        Err(RuntimeError::Rejected(
-            "packed prefill is not supported by the CPU engine".into(),
-        ))
+    fn advance_packed_prefill(&mut self, members: &[(usize, &[u32])]) -> Result<()> {
+        if members.len() < 2 || !self.eng.packed_prefill() {
+            return Err(RuntimeError::Rejected(
+                "packed prefill is unavailable".into(),
+            ));
+        }
+        let total = members.iter().try_fold(0u32, |rows, &(slot, prompt)| {
+            self.check_prompt(slot, prompt)?;
+            if self.live[slot] || self.pf_pos[slot] != 0 || self.pf_len[slot] != prompt.len() as u32
+            {
+                return Err(RuntimeError::Rejected(
+                    "invalid packed prefill member".into(),
+                ));
+            }
+            rows.checked_add(prompt.len() as u32)
+                .ok_or_else(|| RuntimeError::Rejected("packed prefill row overflow".into()))
+        })?;
+        let (prog, _) = self
+            .buckets
+            .iter()
+            .copied()
+            .find(|&(_, width)| width >= total)
+            .ok_or_else(|| RuntimeError::Rejected("no packed prefill bucket".into()))?;
+        let mut row0 = 0u32;
+        let spans: Vec<_> = members
+            .iter()
+            .map(|&(slot, prompt)| {
+                let rows = prompt.len() as u32;
+                let span = PrefillSpan {
+                    row0,
+                    n_rows: rows,
+                    slot: slot as u32,
+                    flags: packet::dev::PREFILL_SPAN_RESET_STATE,
+                    kv_row0: 0,
+                    kv_len: rows,
+                    state_slot: slot as u32,
+                    program: prog as u32,
+                };
+                row0 += rows;
+                span
+            })
+            .collect();
+        let prompts: Vec<_> = members.iter().map(|&(_, prompt)| prompt).collect();
+        let tokens = self.eng.prefill_packed(prog, &spans, &prompts)?;
+        if tokens.len() != members.len() {
+            return Err(RuntimeError::Device("packed prefill token count".into()));
+        }
+        for ((&(slot, prompt), token), span) in members.iter().zip(tokens).zip(&spans) {
+            self.pf_pos[slot] = prompt.len() as u32;
+            self.pf_ready[slot] = Some(token);
+            debug_assert_eq!(span.slot as usize, slot);
+        }
+        Ok(())
     }
 
     fn prefill_frontier(&self, slot: usize) -> Option<usize> {
         (slot < self.batch).then(|| self.pf_pos[slot] as usize)
+    }
+
+    fn prepare_packed_prefill_slot(
+        &mut self,
+        slot: usize,
+        prompt: &[u32],
+        _max_rows: u32,
+    ) -> Result<()> {
+        if self.eng.packed_prefill() {
+            self.check_prompt(slot, prompt)?;
+            if !self.live[slot] && self.pf_pos[slot] == 0 {
+                self.pf_len[slot] = prompt.len() as u32;
+            }
+        }
+        Ok(())
     }
 
     /// `tick_max_bucket` is the mux's interleave budget (u32::MAX when no slot decodes, so a

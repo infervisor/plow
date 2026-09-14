@@ -221,6 +221,8 @@ pub(crate) struct Cfg {
     // non-shared layer of their type; 0 = none). See `dev_isa.h` op 155.
     pub(crate) ple: u32,
     pub(crate) kv_shared: u32,
+    // Gemma 4 E2B doubles the dense MLP width on the trailing KV-shared layers.
+    pub(crate) double_wide_mlp: bool,
 }
 
 impl Cfg {
@@ -235,6 +237,22 @@ impl Cfg {
             .rev()
             .find(|&s| self.is_full[s] == self.is_full[l])
             .expect("a KV-shared layer needs an earlier layer of its type")
+    }
+
+    pub(crate) fn inter_for_layer(&self, l: usize) -> u32 {
+        if self.double_wide_mlp && self.kv_is_shared(l) {
+            self.inter * 2
+        } else {
+            self.inter
+        }
+    }
+
+    pub(crate) fn max_inter(&self) -> u32 {
+        if self.double_wide_mlp {
+            self.inter * 2
+        } else {
+            self.inter
+        }
     }
     pub(crate) fn kv_is_shared(&self, l: usize) -> bool {
         self.kv_source(l) != l
@@ -366,7 +384,20 @@ fn cfg_gemma(v: &Value, flat: bool) -> Cfg {
         moe_inter: t["moe_intermediate_size"].as_u64().unwrap_or(0) as u32,
         ple: t["hidden_size_per_layer_input"].as_u64().unwrap_or(0) as u32,
         kv_shared: t["num_kv_shared_layers"].as_u64().unwrap_or(0) as u32,
+        double_wide_mlp: t["use_double_wide_mlp"].as_bool().unwrap_or(false),
     };
+    assert_eq!(
+        c.is_full.len(),
+        c.layers as usize,
+        "gemma4: layer_types vs num_hidden_layers"
+    );
+    if c.ple > 0 {
+        assert_eq!(
+            t["vocab_size_per_layer_input"].as_u64(),
+            Some(u64::from(c.vocab)),
+            "gemma4: PLE vocabulary must match the token vocabulary"
+        );
+    }
     if c.moe {
         crate::require_moe_topk(c.top_k, "gemma4 (enable_moe_block)");
     }
@@ -375,6 +406,10 @@ fn cfg_gemma(v: &Value, flat: bool) -> Cfg {
         "gemma4: num_kv_shared_layers {} must be below num_hidden_layers {}",
         c.kv_shared,
         c.layers
+    );
+    assert!(
+        !c.double_wide_mlp || c.kv_shared > 0,
+        "gemma4: use_double_wide_mlp requires KV-shared layers"
     );
     for l in 0..c.layers as usize {
         let _ = c.kv_source(l); // every shared layer must have an earlier layer of its type
@@ -547,6 +582,7 @@ fn cfg_llama_qwen(v: &Value, arch: Arch) -> Cfg {
         moe_inter: 0,
         ple: 0,
         kv_shared: 0,
+        double_wide_mlp: false,
     }
 }
 
@@ -638,5 +674,85 @@ mod asr_tests {
         let mut v = config();
         v["thinker_config"]["text_config"]["rope_scaling"]["rope_type"] = "yarn".into();
         cfg_qwen3_asr(&v);
+    }
+}
+
+#[cfg(test)]
+mod gemma_tests {
+    use super::*;
+
+    fn e2b_config() -> Value {
+        let layer_types: Vec<_> = (0..35)
+            .map(|layer| {
+                if (layer + 1) % 5 == 0 {
+                    "full_attention"
+                } else {
+                    "sliding_attention"
+                }
+            })
+            .collect();
+        serde_json::json!({"model_type":"gemma4","text_config":{
+            "model_type":"gemma4_text","hidden_size":1536,"intermediate_size":6144,
+            "num_hidden_layers":35,"num_attention_heads":8,"num_key_value_heads":1,
+            "num_global_key_value_heads":null,"head_dim":256,"global_head_dim":512,
+            "sliding_window":512,"rms_norm_eps":0.000001,"vocab_size":262144,
+            "vocab_size_per_layer_input":262144,"final_logit_softcapping":30.0,
+            "attention_k_eq_v":false,"hidden_size_per_layer_input":256,
+            "num_kv_shared_layers":20,"use_double_wide_mlp":true,"enable_moe_block":false,
+            "tie_word_embeddings":true,"layer_types":layer_types,
+            "rope_parameters":{
+                "sliding_attention":{"rope_theta":10000.0,"rope_type":"default"},
+                "full_attention":{"rope_theta":1000000.0,"rope_type":"proportional",
+                                  "partial_rotary_factor":0.25}
+            }
+        }})
+    }
+
+    #[test]
+    fn gemma4_e2b_geometry_and_shared_kv_are_pinned() {
+        let c = cfg_gemma(&e2b_config(), false);
+        assert_eq!((c.hidden, c.inter, c.layers), (1536, 6144, 35));
+        assert_eq!((c.heads, c.kvh_slide, c.kvh_full), (8, 1, 1));
+        assert_eq!((c.hd_slide, c.hd_full, c.ple), (256, 512, 256));
+        assert_eq!(c.prefix, "model.language_model.");
+        assert!(!c.k_eq_v && !c.moe && c.tied);
+        assert_eq!(c.is_full.iter().filter(|&&full| full).count(), 7);
+        assert_eq!(
+            (c.inter_for_layer(14), c.inter_for_layer(15)),
+            (6144, 12288)
+        );
+        assert_eq!(c.kv_source(14), 14);
+        assert_eq!(c.kv_source(15), 13);
+        assert_eq!(c.kv_source(19), 14);
+        assert_eq!(c.kv_source(34), 14);
+    }
+
+    #[test]
+    #[should_panic(expected = "PLE vocabulary must match")]
+    fn gemma4_e2b_rejects_mismatched_ple_vocabulary() {
+        let mut v = e2b_config();
+        v["text_config"]["vocab_size_per_layer_input"] = 262143.into();
+        cfg_gemma(&v, false);
+    }
+}
+
+#[cfg(test)]
+mod qwen_tests {
+    use super::*;
+
+    #[test]
+    fn qwen3_1_7b_geometry_is_pinned() {
+        let v = serde_json::json!({
+            "model_type":"qwen3","hidden_size":2048,"intermediate_size":6144,
+            "num_hidden_layers":28,"num_attention_heads":16,"num_key_value_heads":8,
+            "head_dim":128,"vocab_size":151936,"rms_norm_eps":0.000001,
+            "rope_theta":1000000.0,"rope_scaling":null,"tie_word_embeddings":true,
+            "hidden_act":"silu","attention_bias":false,"use_sliding_window":false
+        });
+        let c = cfg_llama_qwen(&v, Arch::Qwen3);
+        assert_eq!((c.hidden, c.inter, c.layers), (2048, 6144, 28));
+        assert_eq!((c.heads, c.kvh_full, c.hd_full), (16, 8, 128));
+        assert_eq!(c.vocab, 151936);
+        assert!(c.has_qk_norm && c.tied && c.is_full.iter().all(|&full| full));
     }
 }

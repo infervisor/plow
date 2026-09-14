@@ -357,13 +357,22 @@ decode:
 | Llama-3.2-3B | MXFP4 (w4a16) | `--mxfp4` | mxfp4 |
 | Gemma-4-E4B | w8a16 + fp8 head | `--fp8 --w8a16 --fp8-head` | fp8 |
 | Gemma-4-E4B | MXFP4 | `--mxfp4` | mxfp4 |
+| Gemma-4-E2B-it | bf16 | `--emit-decode-batch-ladder 1,2,4,8` | — |
+| Qwen3-1.7B | bf16 | `--emit-decode-batch-ladder 1,2,4,8` | — |
 | GPT-OSS-20B | MXFP4 MoE | — (the checkpoint is already fp4) | — |
 
-Qwen3 and Gemma-4 12B/26B-A4B emit for `metal3` on the same recipe. The
+Qwen3 and Gemma-4 12B/26B-A4B emit for `metal3` on the same recipe. Gemma-4
+E2B's trailing KV-shared layers use the checkpoint's double-wide MLP geometry;
+Qwen3-1.7B is the validated dense sub-2B Qwen target. The
 Metal interpreter implements 50 of the 156 device opcodes — the dense +
 GQA-attention + fp8/mxfp4 + GPT-OSS-MoE set. MLA, KDA and the Gemma MoE
 families emit but have no Metal kernels yet, so they refuse at load rather
 than run wrong.
+
+For Gemma-4-E2B and Qwen3-1.7B batch-1 latency, enable
+`PLOW_METAL_DECODE_HEADS=1`. The specialization is restricted to the batch-1
+rung. For serving throughput, retain the emitted `1,2,4,8` decode ladder; the
+runtime selects the smallest live rung.
 
 ### 1. Build
 

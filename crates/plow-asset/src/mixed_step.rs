@@ -296,7 +296,12 @@ fn plan_into_inner(
     let span_capacity = if prefix_free {
         decode
             .len()
-            .checked_add(prefill.len().checked_mul(2).ok_or("mixed step: span count")?)
+            .checked_add(
+                prefill
+                    .len()
+                    .checked_mul(2)
+                    .ok_or("mixed step: span count")?,
+            )
             .ok_or("mixed step: span count")?
     } else {
         prefill.len()

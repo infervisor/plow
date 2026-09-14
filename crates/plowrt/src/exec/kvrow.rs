@@ -463,6 +463,7 @@ pub(crate) const LM_HEAD_MATMUL_OPS: &[DevOp] = &[
     DevOp::GemmWideFp8,
     DevOp::GemmC5Fp8,
     // MXFP4 (w4a16)
+    DevOp::GemvMxfp4,
     DevOp::GemmMxfp4,
     DevOp::GemmMedMxfp4,
     DevOp::GemmSmallMxfp4,
@@ -494,7 +495,7 @@ pub(crate) fn place_lm_head_row(
 
 #[test]
 fn affine_q4_ragged_prefill_places_head_on_real_row() {
-    for head in [DevOp::GemvAffineQ4, DevOp::GemmAffineQ4] {
+    for head in [DevOp::GemvAffineQ4, DevOp::GemmAffineQ4, DevOp::GemvMxfp4] {
         let mut projection = DevInst64 {
             op: DevOp::GemmAffineQ4 as u16,
             ..Default::default()
@@ -593,7 +594,10 @@ pub(crate) fn decode_dense_exact(kvlen: &[u32], select_width: u32) -> bool {
 /// * there are no MLA flash sites at all.
 pub(crate) fn derive_mla_nsplit(insts: &[DevInst64]) -> Option<(Vec<u32>, u32)> {
     let gather = DevOp::FlashGatherDecode as u16;
-    let flash = [DevOp::FlashMlaDecode as u16, DevOp::FlashMlaDecodeFp8 as u16];
+    let flash = [
+        DevOp::FlashMlaDecode as u16,
+        DevOp::FlashMlaDecodeFp8 as u16,
+    ];
     let merge = DevOp::MlaMergeFold as u16;
     let (mut sites, mut baked, mut n_flash, mut n_merge) = (Vec::new(), None, 0usize, 0usize);
     for (k, d) in insts.iter().enumerate() {

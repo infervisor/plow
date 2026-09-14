@@ -77,6 +77,7 @@ fn fixture() -> (ChannelPlan, Model) {
         hidden: h as u32,
         inter: i as u32,
         ane_channels: a,
+        mlp_act: 1,
         weight_encoding: WeightEncoding::Bf16,
         layers: vec![Layer {
             layer: 0,
@@ -100,7 +101,7 @@ fn fixture() -> (ChannelPlan, Model) {
             },
             spans: vec![Span {
                 layer: 0,
-                insts: [1, 4],
+                insts: [1, 3],
                 input: "x".into(),
                 residual: "residual".into(),
                 intermediate: "z".into(),
@@ -125,7 +126,7 @@ fn typed_schema_preserves_row_versions_and_rejects_ambiguity() {
     ));
     for (field, value) in [
         ("mode", serde_json::json!("row")),
-        ("schema", serde_json::json!("plow-hetero-v4")),
+        ("schema", serde_json::json!("plow-hetero-v3")),
         ("rows_ane", serde_json::json!(64)),
     ] {
         let mut invalid = v.clone();
@@ -186,10 +187,10 @@ fn refuses_bad_coverage_scales_aliases_rows_and_spans() {
 #[test]
 fn rejects_packet_drift_even_with_refreshed_digest() {
     let (mut plan, mut model) = fixture();
-    model.progs[0].insts[3].f[0] = 2.0;
+    model.progs[0].insts[2].i[1] += 1;
     assert!(crate::program::with_model(&model, |p| plan.validate(p)).is_err());
     crate::program::with_model(&model, |p| {
         plan.programs[0].original_sha256 = crate::live_kv::program_digest(&p.programs[0]);
-        assert!(plan.validate(p).unwrap_err().contains("single residual"));
+        assert!(plan.validate(p).unwrap_err().contains("projection"));
     });
 }

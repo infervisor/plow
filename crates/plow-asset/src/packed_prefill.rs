@@ -245,7 +245,7 @@ impl Manifest {
                 if matches!(op, DevOp::FlashPrefill | DevOp::FlashPrefillFp8) {
                     flash_sites += 1;
                     need(
-                        matches!(d.i[6], 256 | 512)
+                        matches!(d.i[6], 64 | 128 | 256 | 512)
                             && d.i[7] > 0
                             && (op == DevOp::FlashPrefillFp8 || d.t[6] == TENSOR_NONE16),
                         "attention contract",

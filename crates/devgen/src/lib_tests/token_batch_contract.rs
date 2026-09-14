@@ -33,7 +33,10 @@ fn packing_pins_an_unsplit_fused_flash() {
 #[test]
 fn without_packing_a_wide_machine_still_splits() {
     let (ns, fused) = dense_flash_split(false, false, 304, 8, 512);
-    assert!(ns > 1, "expected a split at n_cu=304 heads=8 t=512, got {ns}");
+    assert!(
+        ns > 1,
+        "expected a split at n_cu=304 heads=8 t=512, got {ns}"
+    );
     assert!(!fused);
 }
 
@@ -57,7 +60,10 @@ fn nsplit_is_never_zero() {
             for &heads in &[1u32, 1024] {
                 for &n_cu in &[1u32, 304] {
                     let (ns, _) = dense_flash_split(gemv, packed, n_cu, heads, 1);
-                    assert!(ns >= 1, "gemv={gemv} packed={packed} heads={heads} n_cu={n_cu}");
+                    assert!(
+                        ns >= 1,
+                        "gemv={gemv} packed={packed} heads={heads} n_cu={n_cu}"
+                    );
                 }
             }
         }

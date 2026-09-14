@@ -22,7 +22,7 @@ kernel void mlp_gate(device const ushort* x [[buffer(0)]], device const uchar* w
     uint tn = (p.z + 127u) / 128u, tm = (p.x + 255u) / 256u;
     for (uint lin = slice; lin < tm * tn; lin += nblk) {
         uint m0 = lin / tn * 256u, n0 = lin % tn * 128u;
-        gemm_tile2_glu(g, up, u, 1u, 0.0f, 0.0f, p.w == 1u,
+        gemm_tile2_glu(g, up, u, (p.w >> 3u) & 1u, 0.0f, 0.0f, (p.w & 3u) == 1u,
             m0, min(m0 + 256u, p.x), n0, min(n0 + 128u, p.z), tile, lid, sg, lane);
     }
 }
@@ -51,10 +51,11 @@ kernel void mlp_down(device const ushort* u [[buffer(0)]], device const uchar* w
 
 kernel void mlp_finish(device const float* g [[buffer(0)]], device const float* a [[buffer(1)]],
                        device const ushort* residual [[buffer(2)]], device ushort* out [[buffer(3)]],
-                       constant uint3& p [[buffer(4)]], uint e [[thread_position_in_grid]]) {
+                       constant uint4& p [[buffer(4)]], uint e [[thread_position_in_grid]]) {
     if (e < p.x) {
         float value = p.z ? bf2f(((device const ushort*)g)[e]) : g[e];
-        out[e] = f2bf((value + (p.y ? a[e] : 0.0f)) + bf2f(residual[e]));
+        float value2 = value + (p.y ? a[e] : 0.0f);
+        out[e] = f2bf(value2 + (p.w ? bf2f(residual[e]) : 0.0f));
     }
 }
 

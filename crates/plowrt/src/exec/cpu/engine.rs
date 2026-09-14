@@ -624,13 +624,19 @@ impl CpuModel {
     /// weights / blob init data / generated tables, and resolve kernels for
     /// every program. `ffi::init` must have run.
     pub fn load(blob_path: &Path, checkpoint: &Path) -> Result<CpuModel> {
-        Self::load_on_nodes(blob_path, Some(checkpoint), &[], false)
+        Self::load_on_nodes(blob_path, Some(checkpoint), &[], false, true)
     }
 
     /// Load a model-independent packet program whose checkpoint tensors are carried in the
     /// blob init section. No tokenizer, KV layout or language-model rung contract is assumed.
     pub fn load_embedded(blob_path: &Path) -> Result<CpuModel> {
-        Self::load_on_nodes(blob_path, None, &[], false)
+        Self::load_on_nodes(blob_path, None, &[], false, true)
+    }
+
+    /// Bind host-visible tensors for a non-CPU executor. Device backends validate their own
+    /// opcode tables and never dispatch through `kernels`.
+    pub(crate) fn load_for_device(blob_path: &Path, checkpoint: Option<&Path>) -> Result<CpuModel> {
+        Self::load_on_nodes(blob_path, checkpoint, &[], false, false)
     }
 
     fn load_on_nodes(
@@ -638,6 +644,7 @@ impl CpuModel {
         checkpoint: Option<&Path>,
         nodes: &[u32],
         strict: bool,
+        resolve_kernels: bool,
     ) -> Result<CpuModel> {
         let t0 = Instant::now();
         crate::knob_spec::check_assets(blob_path)?;
@@ -734,7 +741,8 @@ impl CpuModel {
         // Kernels first: a missing op is a cheap, loud failure — before 20 GiB of copies.
         let mut kernels = Vec::with_capacity(blob.progs.len());
         for (pi, p) in blob.progs.iter().enumerate() {
-            let table = KernelTable::resolve(p.insts.iter().map(|d| d.op)).map_err(|missing| {
+            let table = if resolve_kernels {
+                KernelTable::resolve(p.insts.iter().map(|d| d.op)).map_err(|missing| {
                 let names: Vec<String> = missing
                     .iter()
                     .map(|&op| {
@@ -749,7 +757,10 @@ impl CpuModel {
                     missing.len(),
                     names.join(", ")
                 ))
-            })?;
+                })?
+            } else {
+                KernelTable::empty()
+            };
             kernels.push(table);
         }
 
@@ -1810,6 +1821,7 @@ impl CpuEngine {
             checkpoint,
             &memory_nodes,
             matches!(opts.numa, NumaMode::Nodes(_)),
+            true,
         )?;
         let n_cu = model.blob.n_cu;
         // The pool needs the Exec before it exists; build the exec against the

@@ -69,13 +69,13 @@ mod qwen35;
 #[cfg(test)]
 mod test_env;
 use mla::{glm_emit_block, glm_main, kimi_emit_block, nemotron_emit_block, MlaArch};
-pub mod asr_subsampling;
 pub mod asr;
+pub mod asr_subsampling;
+pub mod conformer;
 pub mod conv2d;
 mod decode_objects;
 mod dense_cublaslt;
 pub mod dispatch_audit;
-pub mod conformer;
 mod gemv_decode_role;
 pub mod manifest;
 mod mxfp4_moe_role;
@@ -1954,7 +1954,7 @@ fn declare(
     let kd_max =
         (kvh_local(c.kvh_slide, tp, 0) * c.hd_slide).max(kvh_local(c.kvh_full, tp, 0) * c.hd_full);
     let hd_max = c.hd_slide.max(c.hd_full);
-    let inter_sh = c.inter / tp;
+    let inter_sh = c.max_inter() / tp;
     // lm_head is REPLICATED under TP here, not vocab-sharded. ONE reason is left, and it is
     // specific to THIS emitter: Gemma TIES lm_head to embed_tokens, and the emitted lm_head Gemv
     // reads `emb` from offset 0 with no per-rank vocab offset, so a vocab shard would make every
@@ -2318,6 +2318,7 @@ fn declare(
         // indexes them by absolute `l`). Full model => in_block always true =>
         // byte-identical allocation.
         let in_block = block.contains(&(l as usize));
+        let inter_l = c.inter_for_layer(l as usize) / tp;
         let full = c.is_full[l as usize];
         // MIXED fp8-KV (PLOW_FP8_KV_FULL=1, beat-fp8-mma): e4m3 cache on the hd512 FULL layers
         // only. Sliding rings are window-bounded (tiny), so fp8 buys them nothing; keeping them
@@ -2527,9 +2528,9 @@ fn declare(
             bk: bias(b, "self_attn.k_proj.weight", kd as u64 * c.hidden as u64),
             bv: bias(b, "self_attn.v_proj.weight", kd as u64 * c.hidden as u64),
             bo: bias(b, "self_attn.o_proj.weight", c.hidden as u64 * qd as u64),
-            bg: bias(b, "mlp.gate_proj.weight", inter_sh as u64 * c.hidden as u64),
-            bu: bias(b, "mlp.up_proj.weight", inter_sh as u64 * c.hidden as u64),
-            bd: bias(b, "mlp.down_proj.weight", c.hidden as u64 * inter_sh as u64),
+            bg: bias(b, "mlp.gate_proj.weight", inter_l as u64 * c.hidden as u64),
+            bu: bias(b, "mlp.up_proj.weight", inter_l as u64 * c.hidden as u64),
+            bd: bias(b, "mlp.down_proj.weight", c.hidden as u64 * inter_l as u64),
             wq: wproj(b, "self_attn.q_proj.weight", (qd * c.hidden) as u64 * BF16),
             wk: if shared {
                 TENSOR_NONE
@@ -2548,13 +2549,13 @@ fn declare(
             wg: wproj(
                 b,
                 "mlp.gate_proj.weight",
-                (inter_sh * c.hidden) as u64 * BF16,
+                (inter_l * c.hidden) as u64 * BF16,
             ),
-            wu: wproj(b, "mlp.up_proj.weight", (inter_sh * c.hidden) as u64 * BF16),
+            wu: wproj(b, "mlp.up_proj.weight", (inter_l * c.hidden) as u64 * BF16),
             wd: wproj(
                 b,
                 "mlp.down_proj.weight",
-                (c.hidden * inter_sh) as u64 * BF16,
+                (c.hidden * inter_l) as u64 * BF16,
             ),
             // fp8 twins (numel bytes) + scales ([out] f32). k_eq_v layers have no v_proj to quantize.
             // Dims use the TP-sharded shard extents (qd/kd/inter_sh); at tp==1 these equal the full
@@ -2571,9 +2572,9 @@ fn declare(
                 w8(b, "self_attn.v_proj.weight", (kd * c.hidden) as u64)
             },
             wo8: w8(b, "self_attn.o_proj.weight", (c.hidden * qd) as u64),
-            wg8: w8(b, "mlp.gate_proj.weight", (inter_sh * c.hidden) as u64),
-            wu8: w8(b, "mlp.up_proj.weight", (inter_sh * c.hidden) as u64),
-            wd8: w8(b, "mlp.down_proj.weight", (c.hidden * inter_sh) as u64),
+            wg8: w8(b, "mlp.gate_proj.weight", (inter_l * c.hidden) as u64),
+            wu8: w8(b, "mlp.up_proj.weight", (inter_l * c.hidden) as u64),
+            wd8: w8(b, "mlp.down_proj.weight", (c.hidden * inter_l) as u64),
             sq: sc(
                 b,
                 "self_attn.q_proj.weight",
@@ -2609,20 +2610,20 @@ fn declare(
             sg: sc(
                 b,
                 "mlp.gate_proj.weight",
-                inter_sh as u64,
-                (inter_sh * c.hidden) as u64,
+                inter_l as u64,
+                (inter_l * c.hidden) as u64,
             ),
             su: sc(
                 b,
                 "mlp.up_proj.weight",
-                inter_sh as u64,
-                (inter_sh * c.hidden) as u64,
+                inter_l as u64,
+                (inter_l * c.hidden) as u64,
             ),
             sd: sc(
                 b,
                 "mlp.down_proj.weight",
                 c.hidden as u64,
-                (c.hidden * inter_sh) as u64,
+                (c.hidden * inter_l) as u64,
             ),
             g_in: w(b, "input_layernorm.weight", c.hidden as u64 * BF16),
             g_pa: w(b, "post_attention_layernorm.weight", c.hidden as u64 * BF16),
@@ -3731,7 +3732,6 @@ fn emit_phase(
     // intermediate- and vocab-dimensioned op runs 1/N wide, and o_proj/down get an XReduce.
     let tp = c.tp;
     let heads = c.heads / tp; // this rank's q-heads
-    let inter_l = c.inter / tp; // this rank's gate/up/down intermediate lanes
     let vocab_l = c.vocab; // lm_head REPLICATED under TP (Phase 2); see declare() note above
     let mut xgate: u32 = 0; // xctr gate-id allocator for XReduce (unique per collective)
                             // XReduce runs on a REDUCED CU set (F-lever). The all-reduce is a
@@ -4251,6 +4251,7 @@ fn emit_phase(
     let mut nrn_pending: Option<(u32, u32, u32, f32)> = None;
 
     for l in block.clone() {
+        let inter_l = c.inter_for_layer(l) / tp;
         let full = c.is_full[l];
         // KV sharing (E-series): no k/v projection, norm or cache write; attention reads the
         // source layer's cache (`n.kc[l]` aliases it, see declare()).
@@ -4329,6 +4330,12 @@ fn emit_phase(
             && (emit_is_apple()
                 || (amd && (gemv_staged_rows(t) as u64 * c.hidden as u64) <= gm_lds_halves()))
             && emit_config::active().fuse_qkv_fp8;
+        let fuse_qkv_mx4 = gemv_family
+            && !keqv
+            && !shared
+            && mx4
+            && emit_is_apple()
+            && emit_config::active().fuse_qkv_mx4;
 
         // GQA FUSION changes the decode split, and the two have to agree or the machine idles.
         //
@@ -4579,7 +4586,7 @@ fn emit_phase(
         // proportion to weight bytes so they finish together.
         let (nq, nk, nv);
         let (c_q, c_k, c_v, v_src);
-        if fuse_qkv || fuse_qkv_fp8 {
+        if fuse_qkv || fuse_qkv_fp8 || fuse_qkv_mx4 {
             // ONE packet on all CUs: cols [0,qd) -> q, [qd,qd+kd) -> k, [qd+kd,qd+2kd) -> v.
             (nq, nk, nv) = (n_cu, n_cu, n_cu); // unused: fused headnorm deps are coarse
             let fused = if fuse_qkv_fp8 {
@@ -4598,6 +4605,24 @@ fn emit_phase(
                     d.i[4] = kd;
                     // The tenth, eleventh and twelfth pointers: the three per-channel f32
                     // dequant-scale rows, as handles in the integer slots op 22 leaves empty.
+                    d.i[5] = w.sq;
+                    d.i[6] = w.sk;
+                    d.i[7] = w.sv;
+                })
+            } else if fuse_qkv_mx4 {
+                b.emit(DevOp::GemvQkvMxfp4, all.clone(), &[c_n], |d| {
+                    d.t[0] = n.qg;
+                    d.t[1] = qkv_src;
+                    d.t[2] = w.wq8;
+                    d.t[3] = n.kg;
+                    d.t[4] = w.wk8;
+                    d.t[5] = n.vg;
+                    d.t[6] = w.wv8;
+                    d.i[0] = t;
+                    d.i[1] = qd;
+                    d.i[2] = c.hidden;
+                    d.i[3] = kd;
+                    d.i[4] = kd;
                     d.i[5] = w.sq;
                     d.i[6] = w.sk;
                     d.i[7] = w.sv;
@@ -4826,7 +4851,7 @@ fn emit_phase(
         // fan-in is 128 of 128 — measured, and the reason the first attempt at a fine chain
         // bought nothing.
         let hn_dep = |gemv: u32, nblk_g: u32, nheads: u32| -> Vec<Dep> {
-            if !gemv_family || fuse_qkv || fuse_qkv_fp8 {
+            if !gemv_family || fuse_qkv || fuse_qkv_fp8 || fuse_qkv_mx4 {
                 // the gemv column map assumes d_gemv (GV_BLOCKED); prefill is
                 // a GEMM. The fused q|k|v op concatenates all three projections' columns across the
                 // SAME 256 workgroups, so a head's per-workgroup producer set is no longer the
@@ -6313,7 +6338,7 @@ fn emit_phase(
         if let Some(channel) = channel {
             channel.borrow_mut().push(plow_asset::hetero_channel::Span {
                 layer: l as u32,
-                insts: [mlp_start, b.n_insts() as u32],
+                insts: [mlp_start, c_d + 1],
                 input: b.tensor_name(mlp_src).into(),
                 residual: b.tensor_name(n.x).into(),
                 intermediate: b.tensor_name(n.fu).into(),
@@ -6394,8 +6419,10 @@ fn emit_phase(
     // reads the fp8 twin. Own reporting row — vLLM's fp8 recipe keeps lm_head bf16.
     let fp8_head = decode && n.head8 != TENSOR_NONE;
     // PLOW_MX4_HEAD: the same trade at w4 — 2.01 GB of bf16 tied head -> 0.53 GB of e2m1
-    // + E8M0 block scales. Decode only; the tied EMBED lookup still reads the bf16 table.
-    let mx4_head = decode && n.head4 != TENSOR_NONE;
+    // + E8M0 block scales. The tied EMBED lookup still reads the bf16 table. Prefill also
+    // selects the quantized head: its one requested logit row has the same precision contract
+    // as decode and must not restream the BF16 embedding table.
+    let mx4_head = n.head4 != TENSOR_NONE;
     // E5 (rtx-19) PLOW_FUSE_ARGMAX: fuse the greedy-argmax epilogue (+ softcap) into the lm_head
     // GEMV, folding each block's owned vocab slice into an amax partial and dropping the SoftCap +
     // Argmax packets. Greedy B=1 decode on the bf16 head only (fp8 head keeps the classic path).
@@ -7093,7 +7120,13 @@ impl<'a> DenseGqaEmitter<'a> {
     ) -> hetero::HeteroPlan {
         use plow_asset::hetero::WeightEncoding;
         let mx4 = mx4_prefill_on();
-        let name = |h: u32| tensors[h as usize].name.clone();
+        let name = |h: u32| {
+            if h == TENSOR_NONE {
+                String::new()
+            } else {
+                tensors[h as usize].name.clone()
+            }
+        };
         let opt = |h: u32| (h != TENSOR_NONE).then(|| name(h));
         let n = &self.tn;
         let c = self.c;
@@ -7158,6 +7191,11 @@ impl<'a> DenseGqaEmitter<'a> {
 impl DevblobEmitter for DenseGqaEmitter<'_> {
     fn emit_prefill(&self, b: &mut Builder, t: u32) {
         let mut dummy = Vec::new();
+        let channel_rows = if emit_config::active().packed_prefill_on() {
+            256
+        } else {
+            128
+        };
         emit_phase(
             b,
             self.c,
@@ -7177,7 +7215,8 @@ impl DevblobEmitter for DenseGqaEmitter<'_> {
             self.amd,
             &self.tmaps,
             self.hetero_on.get().then_some(&self.hetero),
-            (emit_config::active().ane_mlp_channels.is_some() && t == 128).then_some(&self.channel),
+            (emit_config::active().ane_mlp_channels.is_some() && t == channel_rows)
+                .then_some(&self.channel),
         );
     }
     fn emit_decode(&self, b: &mut Builder, dbatch: u32, dmode: Mode, kv_rows: &mut Vec<u32>) {
@@ -7317,8 +7356,10 @@ fn apply_production_defaults(
         "gfx942" => Some("1,2,4,8"),
         _ => None,
     };
-    let eligible =
-        cfg.decode_ladder.is_none() && cfg.decode_batch == 1 && capabilities.decode_ladder && tp == 1;
+    let eligible = cfg.decode_ladder.is_none()
+        && cfg.decode_batch == 1
+        && capabilities.decode_ladder
+        && tp == 1;
     if let (Some(ladder), true) = (ladder, eligible) {
         cfg.decode_ladder = Some(ladder.into());
         cfg.decode_ladder_default = true;
@@ -7454,16 +7495,25 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
     }
     if emit_cfg.ane_mlp_channels.is_some() {
         assert!(
-            arch == "metal3" && tp == 1 && matches!(model_type.as_str(), "llama" | "qwen3"),
-            "channel MLP requires Metal dense Llama/Qwen3 TP1"
+            arch == "metal3"
+                && tp == 1
+                && matches!(model_type.as_str(), "llama" | "qwen3" | "gemma4"),
+            "channel MLP requires Metal dense Llama/Qwen3/Gemma-4 TP1"
         );
         assert!(
-            emit_cfg.row_split.is_none()
-                && !emit_cfg.w8a8
-                && !emit_cfg.packed_prefill_on()
-                && block_spec.is_none(),
-            "channel MLP cannot combine row split, packed prefill, W8A8 or block mode"
+            emit_cfg.row_split.is_none() && !emit_cfg.w8a8 && block_spec.is_none(),
+            "channel MLP cannot combine row split, W8A8 or block mode"
         );
+        if emit_cfg.packed_prefill_on() {
+            let has_256 = emit_cfg
+                .pf_ladder_append
+                .as_deref()
+                .is_some_and(|s| s.split(',').any(|x| x.trim() == "256"));
+            assert!(
+                has_256,
+                "packed channel MLP requires PLOW_PF_LADDER_APPEND to include 256"
+            );
+        }
     }
 
     // Installed process-wide so deeply nested emit functions can call emit_config::active().
@@ -7582,8 +7632,10 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
         // `mla/kimi_k3.rs` has asked for the sibling topology since it was written and this
         // assertion is why it could never be given one; a GLM-5.3 gfx942 TP4 emit died here.
         assert!(
-            emit_is_amd() || (arch == "sm_90a" && tp == 1),
-            "packed request emission requires Hopper single-GPU direct KV"
+            emit_is_amd()
+                || (arch == "sm_90a" && tp == 1)
+                || (arch == "metal3" && tp == 1 && !emit_config::active().fp8_kv),
+            "packed request emission requires Hopper direct KV or Metal single-GPU BF16 KV"
         );
         assert!(
             emit_is_amd() || capabilities.dense_packet_contracts,
@@ -8602,13 +8654,13 @@ fn emit_dense_gqa(
     if let Some(channels) = ecfg.ane_mlp_channels {
         assert!(
             !c.moe
-                && c.mlp_act == 1
+                && c.mlp_act <= 1
                 && channels > 0
                 && channels < c.inter
                 && channels % 32 == 0
                 && c.hidden % 32 == 0
                 && c.inter % 32 == 0,
-            "channel MLP requires dense SwiGLU and nonempty 32-aligned channel partitions"
+            "channel MLP requires dense GLU and nonempty 32-aligned channel partitions"
         );
     }
     // T8 w8a8 (PLOW_W8A8=1, requires PLOW_FP8=1). PREFILL emits the true fp8 tensor-core path:
@@ -8853,8 +8905,8 @@ fn emit_dense_gqa(
     // Gemma-4-31B BF16 TP1 MI300X, served, medians of six: TPOT +4.7% to +8.0%.
     // An explicit `PLOW_L2_PLACE_PREFILL=1` still asks for it (pair it with `PLOW_L2HIER_PF=1`
     // objects); NVIDIA is unchanged, where one cooperative launch reads no wave class.
-    let l2_place_prefill = ecfg.l2_place_prefill
-        && (!amd || std::env::var_os("PLOW_L2_PLACE_PREFILL").is_some());
+    let l2_place_prefill =
+        ecfg.l2_place_prefill && (!amd || std::env::var_os("PLOW_L2_PLACE_PREFILL").is_some());
     let mut progs = Vec::new();
     let mut tlist = Vec::new();
     let mut hetero_progs: Vec<hetero::ProgPlan> = Vec::new();
@@ -9394,17 +9446,24 @@ fn emit_dense_gqa(
     check_fp8_a_scale_bound(&m, &arch, &gpu);
     check_gfx950_opcode_coverage(&m, amd);
     check_nvidia_opcode_coverage(&m, amd);
-    check_cpu_or_metal_opcode_coverage(
-        &m,
-        arch == "metal3" || (arch.is_empty() && gpu.is_empty()),
-    );
+    check_cpu_or_metal_opcode_coverage(&m, arch == "metal3" || (arch.is_empty() && gpu.is_empty()));
     check_group_routing_supported(&m, amd, &arch);
     warn_arch_gpu_vendor_mismatch(&arch, &gpu);
 
     let channel_plan = ecfg.ane_mlp_channels.map(|channels| {
-        let weights = emitter.hetero_plan(Vec::new(), &m.tensors, fp8);
-        hetero_channel::plan(&m, channels, weights, channel_progs)
-            .unwrap_or_else(|e| panic!("{e}"))
+        let mut weights = emitter.hetero_plan(Vec::new(), &m.tensors, fp8);
+        if c.double_wide_mlp {
+            let uniform_layers = (0..c.layers as usize)
+                .take_while(|&layer| c.inter_for_layer(layer) == c.inter)
+                .count();
+            weights.layers.truncate(uniform_layers);
+            for program in &mut channel_progs {
+                program
+                    .spans
+                    .retain(|span| span.layer < uniform_layers as u32);
+            }
+        }
+        hetero_channel::plan(&m, channels, weights, channel_progs).unwrap_or_else(|e| panic!("{e}"))
     });
     let audio_blob = (c.encoder_overlay_rows > 0 && !block_mode).then(|| {
         let mut encoder = asr::qwen::lower_audio_encoder(3000, n_cu)

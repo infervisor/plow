@@ -354,6 +354,20 @@ fn hd64_half_split_cache_geometry_is_valid() {
 }
 
 #[test]
+fn hd128_cache_geometry_is_valid() {
+    validate_all(None, |insts, tensors| {
+        insts[0].i[6] = 128;
+        for d in &mut insts[1..] {
+            d.i[2] = 128;
+        }
+        for tensor in &mut tensors[2..=5] {
+            tensor.bytes /= 2;
+        }
+    })
+    .unwrap();
+}
+
+#[test]
 fn flat_mxfp4_moe_operands_are_direct_and_cannot_alias_kv() {
     for op in [
         DevOp::MoeRouterTopkPf,
@@ -363,6 +377,33 @@ fn flat_mxfp4_moe_operands_are_direct_and_cannot_alias_kv() {
         DevOp::MoeDownMx,
         DevOp::MoeGluMxPf,
         DevOp::MoeDownMxPf,
+    ] {
+        validate_all(None, |insts, _| insts.push(inst(op))).unwrap();
+        assert!(validate_all(None, |insts, _| {
+            let mut d = inst(op);
+            d.t[0] = 2;
+            insts.push(d);
+        })
+        .is_err());
+    }
+}
+
+#[test]
+fn dense_mxfp4_operands_are_direct_and_cannot_alias_kv() {
+    for op in [
+        DevOp::GemmSmall,
+        DevOp::GemmMed,
+        DevOp::GemmWide,
+        DevOp::GemmC5,
+        DevOp::GemvMxfp4,
+        DevOp::GemvGluMxfp4,
+        DevOp::GemmMxfp4,
+        DevOp::GemmMedMxfp4,
+        DevOp::GemmSmallMxfp4,
+        DevOp::GemmWideMxfp4,
+        DevOp::GemmC5Mxfp4,
+        DevOp::GemmGluMxfp4,
+        DevOp::GemvQkvMxfp4,
     ] {
         validate_all(None, |insts, _| insts.push(inst(op))).unwrap();
         assert!(validate_all(None, |insts, _| {

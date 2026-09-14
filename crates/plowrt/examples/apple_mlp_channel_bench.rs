@@ -329,7 +329,7 @@ mod bench {
                 let name = format!("m{m}-c{c}-t{t}-k{}", args.deep_k);
                 let dir = cache.join(&name);
                 std::fs::create_dir(&dir).unwrap();
-                let spec = mlp_spec(t, &aw[0], &aw[1], &aw[2], args.deep_k);
+                let spec = mlp_spec(t, &aw[0], &aw[1], &aw[2], args.deep_k, 1);
                 let layers = spec.layers.len();
                 let io = (spec.inputs.clone(), spec.outputs.clone());
                 let mut net =
