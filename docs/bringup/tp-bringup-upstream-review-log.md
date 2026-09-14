@@ -818,6 +818,75 @@ chunks ride.
     measures a 464-row dense tail at 65K prior at 1.9 s, twice a full sparse 8192 chunk.
 * **Verdict:** no-go. The branch stays unmerged and the token-batch body stays opt-in.
 
+## The concurrency ceiling is an admission cap, not kernel serialisation (2026-09-14, job `conc-probe`)
+
+Every cell this campaign had measured stopped at C16/C20, so the curve past the ladder was inferred.
+It is now measured: one server on the stack packet `9e76b70bf97ee4a6`, `vllm bench serve`,
+isl 8192 / osl 128, `--request-rate inf`, C1→128 in one sweep. Seven cells, rc=0, **zero** server
+error lines and zero load refusals.
+
+| C | out tok/s | median TTFT ms | median TPOT ms | median ITL ms |
+|---|---|---|---|---|
+| 1 | 22.75 | 506.9 | 40.3 | 40.1 |
+| 8 | 107.43 | 1034.8 | 67.0 | 42.9 |
+| 16 | 140.31 | 1046.6 | 105.0 | 48.8 |
+| 20 | **146.21** | 1049.3 | 127.5 | 56.2 |
+| 32 | 137.63 | 13697.7 | 138.9 | 56.3 |
+| 64 | 139.76 | 39616.9 | 139.6 | — |
+| 128 | 133.72 | 35814.3 | 137.1 | — |
+
+* **Result:** throughput peaks at **C20 = 146.2 tok/s** and then flatlines at 134–140 for every higher
+  concurrency, while TTFT climbs to 39.6 s. ITL stays at ~56 ms from C20 on.
+* **Cause, and it is not the kernels.** `serve/mux.rs:446` — *"Slot capacity from the compiler-emitted
+  ladder — the largest decode bucket sets the ceiling for concurrent live requests."* `capacity` is the
+  widest decode rung, so the server logs `mux capacity resolved capacity=20 ingress_capacity=80`
+  (`ingress = capacity × 4`). Past C20 the surplus requests never reach the engine; they queue in
+  ingress. Flat ITL is the proof: the engine keeps running exactly 20 rows, and all the added latency
+  is queueing, none of it is work.
+* **This falsifies the probe's own stated hypothesis**, which was that beyond 20 the engine would
+  "serialise into ceil(C/20) full passes over every weight" and step the per-token cost up at each
+  multiple of 20. It does not serialise — it refuses admission. TPOT is flat at ~138 ms from C32 on,
+  not stepping.
+* **Consequence for "beat vLLM on throughput":** our ceiling is 146.2 tok/s at C20 against the recorded
+  vLLM C64 = 729.5 tok/s, a ~5× gap that no kernel-level lever can close, because the binding
+  constraint is `capacity = max decode rung = 20`. Widening the ladder is the whole lever, i.e. Band64
+  and its three walls (`devgen/src/mla.rs:4763` select_local, `devgen/src/mla.rs:4121` sparse FP8
+  geometry, `plowrt/src/exec/amd/object.rs:2146` loader), plus the `PLOW_GEMV_MM` 16 cap.
+
+## Correction: prefill segment launch is NOT 8 % of TTFT (2026-09-14)
+
+Commit `ce5ead11` records "8 % of TTFT is segment launch" from the `ttftgap` breakdown. **Both halves
+of that reading are wrong** and the conclusion it supported — that segment-count reduction was the
+largest addressable non-GPU TTFT lever — is withdrawn.
+
+* **Per-packet cost was off by 8×.** `PF_SEGMENTS.tally(launches)` (`exec/amd_tp.rs:1748`) counts ONE
+  rank's segments; the loop beneath it is `for (seg, rank) in segment_major_order(launches, n_ranks)`,
+  so the AQL packets submitted are 1414 × 8 = 11 312, not 1414. 39.81 ms / 11 312 = **3.52 µs per
+  packet**, not ~28 µs. There is no slow path to hunt.
+* **And it is not on the critical path.** The dump's COUNT column reads **1** for both
+  `enqueue_segment` and `drain`: one chunk, one uninterrupted enqueue of all 11 312 packets, one drain
+  at the end. The engine already submits everything and waits only on the last segment — the
+  `segment_major` branch at `exec/amd_tp.rs:1774`, and `submit_decode` at `exec/amd_tp.rs:1059`
+  ("segment-major, all ranks, with no intermediate drain"). The doorbell rings per packet, and
+  `QUEUE_SIZE = 4096` (`device/hsa.rs:243`) against 1414 packets per rank means the host never spins on
+  the read index. The host finishes its 39.9 ms while the GPU has 474 ms of work — 12× ahead, never
+  starving it. Deleting the entire enqueue path would move TTFT by ~0.
+* **What is in those 3.52 µs** (`device/hsa.rs:2278` `dispatch`): no module parse and no module load —
+  every `.co` is loaded once at serve start and `kernel_object` is a `u64` in the packet. Per launch it
+  is a kernarg write, a 60-byte packet memset, one atomic signal add, one doorbell store. With the
+  default `PLOW_AMD_KERNARG_VRAM=1` the ring is in VRAM behind the large BAR and
+  `publish_device_kernarg` (`device/hsa.rs:675`) adds an uncached device READ of the last byte to
+  confirm the BAR write landed.
+* **What survives:** of the host-side items only **tokenize (15.53 ms)** is genuinely additive — it is
+  serial, on the handler task, before the job is ever submitted. `text/tokenizer.rs` already has a
+  rayon split-encode path (`encode_split`), gated off because `PLOW_ENCODE_THREADS` is UNSET and
+  because it requires `split_safe(&inner)`. GLM-5.3's `tokenizer.json` was checked against that
+  predicate clause by clause and **passes**. Queued as `hostpath-probe`.
+* **Where a per-launch submit cost could still bite is decode**, which re-enqueues its segments on
+  every ~40 ms token with no 474 ms GPU run to hide behind; `obs/dstep.rs` already partitions the tick
+  (SEED/PREPARE/REARM/XCTR/ENQUEUE/DRAIN/AUDIT/READ/AGREE/STREAM), so `hostpath-probe` runs with
+  `PLOW_DSTEP_LOG=1` and osl=64 to price it against the 40 → 25 ms goal.
+
 ## Artefact policy (applied on every merge)
 
 Raw measurement files pushed upstream are removed here before the branch goes to main:
