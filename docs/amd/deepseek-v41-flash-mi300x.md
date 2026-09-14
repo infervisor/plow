@@ -190,10 +190,10 @@ compressor and lets `compress_ratios[l]` name the cache layer `l` reads.
 So vLLM is not a route to a V4.1 number, and an architecture alias would not
 make it one. Two things it is still worth reading for:
 
-* its ROCm MXFP4 + ue8m0 path (`Mxfp4MoEMethod`, `models/deepseek_v4/amd/`) is
-  a live reference for the gap section 5.3 found -- plow has no MXFP4
-  grouped-MoE kernel on gfx942 at all, and that path carries 49.4% of V4.1's
-  prefill FLOPs;
+* its ROCm MXFP4 + ue8m0 path (`Mxfp4MoEMethod`, `models/deepseek_v4/amd/`)
+  remains a useful second opinion on a path carrying 49.4% of V4.1's prefill
+  FLOPs -- though NOT, as this bullet first said, a stand-in for something plow
+  lacks: plow's own gfx942 MXFP4 grouped-MoE body exists and is measured (5.6);
 * V4-Flash-0731 DOES run on this vLLM, so it remains available as a measured
   comparison point on the same 8 cards.
 
@@ -230,10 +230,11 @@ stored bytes directly. So a correct fp8 path on this part needs either an
 OCP->FNUZ re-encode of the weights (which loses the top binade, since the
 exponent ranges differ by 2x) or an in-kernel dequantize.
 
-This is the same shape as section 5.3's MXFP4 finding, and it has the same
-resolution: gfx950 has native OCP fp8 AND an fp4 matrix engine, so the
-reference's own dtypes land there without re-encoding. On gfx942 both the
-reference and plow need a conversion layer that does not exist yet.
+The resolution is the same one gfx950 offers throughout: it has native OCP fp8
+AND an fp4 matrix engine, so the reference's own dtypes land there without
+re-encoding. On gfx942 the fp8 side still needs the conversion layer above.
+(This paragraph used to cite 5.3's MXFP4 finding as the same shape. It is not:
+that finding was retracted in 5.6 -- the fp4 side of gfx942 is covered.)
 
 ## 5. Kernel extraction: what V4.1 needs against what plow has
 
@@ -359,10 +360,16 @@ are VALU. And the `w8a8` variant issuing bf16 MFMA with 8-bit weights AND
 8-bit activations shows this is not a missing-dtype plumbing problem that a
 flag fixes: no grouped-MoE kernel here has ever targeted the fp8 MFMA.
 
-So "get the experts onto fp8" is new kernel work, not tuning. Combined with
-5.3's finding that no MXFP4 grouped-MoE kernel exists at all, the expert path
-that carries 49.4% of V4.1's prefill FLOPs has to be written from scratch to
-hit a target below ~120 ms.
+So "get the experts onto fp8" is new kernel work, not tuning -- which is what
+puts a sub-120 ms target out of reach without it.
+
+The MXFP4 half of this finding was RETRACTED on 2026-09-14; see 5.6. The audit
+reads built objects, and the gfx942 `_k3_moe_a4w4` variant was not among the
+blobs on disk -- but `d_moe_group_pf_a4w4`'s CDNA3 arm (`op_moe.h:4308`) is in
+the tree, builds for gfx942 without spilling, and benches at ~71% of the part's
+bf16 MFMA peak. Nothing below is retracted: no grouped-MoE kernel here targets
+the fp8 MFMA, and that is still true of the MXFP4 arm, which uses bf16 MFMA by
+construction.
 
 Caveat on reading the table: MFMA counts are STATIC disassembly counts, so a
 low MFMA-to-instruction ratio is not directly an achieved-FLOP number -- the
@@ -444,92 +451,73 @@ That is the single largest open design question for a sub-120 ms number, and
 it is orthogonal to the fp4 dequant: even a perfect MXFP4 unpack feeding a
 BM=192 tile leaves a third of the matrix engine idle on the average expert.
 
-### 5.6 The plow path to 90 ms, and the one kernel that gates it
+### 5.6 The plow path to 90 ms, and the one thing that gates it
 
 Target moved to 90 ms on 2026-09-14. `scripts/dsv41_roofline.py --target-ms 90`
 puts that at **28.9%** of matrix peak as built with collectives exposed, 23.6%
 if they overlap -- inside plow's own 35-55% gfx942 GEMM band. So unlike 70 ms,
 90 ms needs no fp8 expert kernel and no change of part.
 
-What it does need is an expert path that exists. Two items, in order:
+**Correction, 2026-09-14: the expert kernel is NOT the gate. It already
+exists.** An earlier revision of this section specified a new `w4a16` arm on
+`d_moe_group_pf_t` and called it the one item standing between here and 90 ms.
+That was wrong, and it was wrong because section 5.3 audited the *built*
+objects rather than the source: the gfx942 `_k3_moe_a4w4` variant was not among
+the blobs on disk, so the audit reported no MXFP4 grouped-MoE kernel anywhere.
+The body is in the tree and has been for some time.
 
-**1. A grouped MXFP4 prefill body for gfx942.** The ASM audit (5.3) found no
-MXFP4 grouped-MoE kernel in any servable object. The source says why, and says
-it deliberately: `d_moe_group_glu_pf` (`runtime/amd/op_moe.h:4739`) takes an
-`enc`, routes `PLOW_MOE_ENC_MXFP4` to `d_moe_group_pf_a4w4` under
-`PLOW_MOE_PF_A4W4`, and otherwise calls `moe_pf_refuse` -- "No body for this
-encoding in THIS object -- refuse, do not alias onto bf16."
+`runtime/amd/op_moe.h:4308` is `#else /* !PLOW_HAS_MX_MMA`, the CDNA3 arm of
+`d_moe_group_pf_a4w4`. Its own header states the design, which is the design
+the retracted spec re-derived:
 
-A4W4 is correctly unavailable here: `amd_arch.h` gates it on `PLOW_HAS_MX_MMA`
-= CDNA4, because fp4 on BOTH operands needs the scaled f8f6f4 matrix core that
-CDNA3 does not have. But that is not the only way to run mxfp4 experts, and
-`amd_arch.h:364-370` already draws the distinction: in **w4a16** fp4 is only a
-WEIGHT ENCODING, dequantized to bf16 before it reaches the matrix core, and
-that lowers to CDNA3 fine. Kimi-K3's routed experts run exactly this way.
+* fp4 x 2^e8m0 is EXACT in bf16 (<= 3 significant bits, power-of-two scale), so
+  it dequantizes both operands to bf16 and feeds the ordinary bf16 MFMA --
+  differing from CDNA4's scaled-MFMA path only in accumulation GROUPING;
+* the dequant lives at **commit**, not at fragment-read time, because a B
+  fragment is re-read by `MPF4_WMc` waves and an A fragment by `MPF4_WNc`, so
+  read-time dequant would run 2-4x per element while commit-time runs once --
+  and lands in the staging phase, whose latency the in-flight global reads
+  already cover. The MFMA block is then pure `ds_read_b128` + MFMA with no
+  scale traffic at all;
+* the tile is BK=64 single-buffered (40,960 B) because bf16 staging doubles the
+  tile bytes and CDNA3 halves the arena to 64 KiB -- the CDNA4 plan of
+  BK=128 double-buffered fp4 is over budget before the first bf16 byte;
+* the swizzle is a 3-bit XOR over 16-byte chunks, chosen by measurement:
+  1-bit 737 GB/s, 2-bit 928, **3-bit 963 GB/s** weight stream.
 
-Every primitive is already in the tree and already verified:
+The GLU op on this arm **is** w4a16 in the strict sense, and the header says so
+as a deliberate divergence from CDNA4: "the GLU A side stages the gathered bf16
+activation RAW instead of quantizing it to fp4 first -- CDNA4 quantizes because
+its matrix core demands fp4 operands; this one does not, so the
+A-quantization error term simply does not exist here."
 
-* `plow_fp4x8_to_f16x4` -- fp4 -> packed f16, matching CDNA4's native
-  `cvt_scalef32_pk_bf16_fp4` VALUE FOR VALUE, with a nibble-order oracle
-  (`runtime/tests/k3_mxfp4_nibble_*`) pinning the lane order;
-* the E8M0 scale is free -- a lane's b128 weight load is 16 bytes = 32 fp4 =
-  exactly one MX block, so one load consumes one scale byte and no cross-lane
-  reshuffle exists;
-* `GEMM_MXFP4_VARIANT` shows the shape: it is the SAME templated `d_gemm_t` as
-  the bf16 rung with the w4a16 B-fetch flag set, staging bf16 into the same
-  LDS halves.
+Its measured number is the one that settles the budget question. On its own
+bench (`moe_prefill_a4w4_cdna3_test.hip`, `MPA4C3_BENCH=1`, H=3584, IM=3072,
+4096 rows, grid 304) the GLU runs **232 TF/s, ~71% of this part's bf16 MFMA
+peak**. The 90 ms target needs 28.9%. The expert GEMM is not close to being the
+constraint.
 
-So the work is an `enc == PLOW_MOE_ENC_MXFP4` arm on `d_moe_group_pf_t` that
-dequants in the B-fetch, not a new kernel. It is verifiable without a GPU:
-`asm_audit.py` asserts the instruction selection, and 5.3's table gives the
-numbers to beat -- the fp8 grouped kernels run burst 3 at 16/32 wait-stalled
-with 112 spill ops, while a well-written gfx942 fp8 GEMM reaches burst 23 at
-4/48.
+The build axis is wired already: `scripts/build_gfx942.sh:615` and
+`runtime/CMakeLists.txt:1350` build the `_k3_moe_a4w4` gfx942 variant with
+`-DPLOW_MOE_PF_A4W4=1`, and the flag stopped demanding `PLOW_HAS_MX_MMA` when
+the simulated arm landed. Verified here by building it: the gfx942 object
+compiles, both ops emit `v_mfma_f32_32x32x8_bf16`, and **neither spills**.
 
-**Dequant is not the bottleneck, so this is worth doing.** Reading every expert
-weight once at 8k is 543.6 B fp4 elements; `plow_fp4x8_to_f16x4` converts 8 per
-handful of VALU ops, so the whole dequant is well under a millisecond against
-13.3 ms of bf16 MFMA for the same weights. The fp4 encoding buys the memory
-traffic (5.3) and costs almost nothing in arithmetic.
-
-**The w4a16 arm, specified.** Derived against `op_moe.h`; every piece it needs
-already exists and is verified.
-
-| | fp8 arm (shipped) | w4a16 arm (to add) |
-|---|---|---|
-| per-lane B load | `fp8v16`, 16 B = 16 elems | `fp4v32`, 16 B = **32 elems = 1 MX block** |
-| passes over `BPT` | `BPASS/2` | `BPASS/4` |
-| weight row stride | `K` | `K >> 1` (packed) |
-| scale | `float` per [row, K/128] | **E8M0 byte** per [row, K/32], stride `K >> 5` |
-| dequant at commit | `fp8_to_bf16v8` -> 2x `bf16v8` | `fp4_to_bf16v8x4` -> **4x** `bf16v8` |
-| block scale applied | in `MPF_MFMA_PROMO` | **in the dequant, free** |
-
-The last row is the one that matters and it falls out for nothing: the
-promotion in `MPF_MFMA_PROMO` is gated on `if constexpr (FP8)`, so an arm that
-is not FP8 skips it automatically -- which is correct here, because an E8M0
-scale is a power of two and folding it into the convert is exact rather than
-an approximation. The MX arm therefore behaves like the bf16 rung through the
-MFMA and promotion, and differs only in the B fetch and commit.
-
-`fp4_to_bf16v8x4`'s CDNA3 arm is already documented bit-identical to gfx950's
-native `cvt_scalef32_pk_bf16_fp4`, same op_sel order, with the nibble-order
-oracle behind it -- so the arm inherits verified numerics rather than needing
-new ones.
-
-Concretely: a third template parameter on `d_moe_group_pf_t` behind
-`PLOW_MOE_PF_W4A16` (declared only under the macro, with a
-`constexpr bool MX = false` fallback when it is off, so the default object's
-mangled names and bytes do not move), an MX branch in `MPF_FETCH_B_S` and
-`MPF_COMMIT_S`, and the `enc == PLOW_MOE_ENC_MXFP4` route in
-`d_moe_group_glu_pf` / `d_moe_group_down_pf` changed from `moe_pf_refuse` to
-that instantiation.
+One real divergence from the reference remains, and it is an accuracy question
+rather than a missing capability. On this path the GLU epilogue is a fused
+bridge that writes `fu` as MXFP4 + E8M0, so the DOWN op's A side is
+bridge-quantized fp4 where the reference keeps bf16 activations. Cross-arch the
+contract is deliberate -- an emitted packet cannot tell which arch ran it -- but
+against the reference it is an extra lossy step on every routed expert. It
+needs a numerics comparison, not a new kernel.
 
 **2. A `deepseek_v41` route through devgen.** `crates/devgen/src/lib.rs` routes
 `glm5_next`, `glm_moe_dsa`, `kimi_k3`, and `kimi_k2`/`deepseek_v2`/
 `deepseek_v3`; there is no `deepseek_v4` or `deepseek_v41` arm, and the
-DeepSeek arm wires only `--block` (a full-model emit panics). That is the
-larger item, and it is section 10's point restated: serving goes through
-devgen, so this is the path a 90 ms number has to come out of.
+DeepSeek arm wires only `--block` (a full-model emit panics). With the expert
+kernel struck off, **this is the whole gate**, and it is section 10's point
+restated: serving goes through devgen, so this is the path a 90 ms number has
+to come out of.
 
 ## 6. Pipelining changes
 
