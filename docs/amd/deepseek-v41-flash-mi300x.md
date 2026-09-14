@@ -257,7 +257,7 @@ piece of the V4.1 attention/FFN block to an existing `DevOp` or marks it new.
 | MXFP4 routed experts | `model.py:830` | `MoeGluMx` / `MoeDownMx` (+`Pf`) | w4a16 arms; V4.1 is w4a8, same gap V4 records |
 | clamped SwiGLU | `model.py:841` | `Glu` `f1=limit` | `swiglu_limit` 10.0 |
 | sqrtsoftplus / noaux_tc routing | `model.py:809` | `MoeRouterTopk` + `MoeAlignPf` | |
-| block-FP8 projections | — | `GemmFp8Blk` / `GemvFp8Blk` / `GemmBlkPf` | grid is a packet immediate, so `[32,32]` needs no new body |
+| block-FP8 projections | — | **`GemmFp8Mx` (184)**, new; NOT `GemmFp8Blk` | ~~grid is a packet immediate, so `[32,32]` needs no new body~~ **WRONG, corrected 2026-09-14 — see item 5b.** The scale ELEMENT TYPE differs (ue8m0 bytes vs f32), and at a 32-block the promotion lands inside the MFMA burst instead of between k-tiles. Needed a new arm and a new opcode |
 | learned-pool KV compressor | `model.py:429` | `d_v4_compress` (`runtime/amd/op_compress.h`) | per-channel softmax pool + learned RMSNorm + post-norm RoPE. Epilogue differs — §5.2 |
 
 ### 5.2 New kernel work
@@ -336,6 +336,38 @@ piece of the V4.1 attention/FFN block to an existing `DevOp` or marks it new.
    (`mla_ckpt_enc`): "the 128 is not a parameter anywhere in this emitter —
    `div_ceil(128)` is written into every scale-grid size". So V4.1 stops here
    whatever else is built, and no amount of emit plumbing gets past it.
+
+   **That refusal was true and badly incomplete, corrected 2026-09-14.** It named
+   the block size, which is the *easiest* of the three things in the way, and a
+   reader who took it at face value would change a 128 to a 32 and find the other
+   two waiting. V4.1's `quantization_config` reads, in full:
+
+   ```json
+   {"quant_method": "fp8", "activation_scheme": "dynamic",
+    "weight_block_size": [32, 32], "scale_fmt": "ue8m0", "expert_dtype": "fp4"}
+   ```
+
+   `mla_ckpt_enc` read *neither* of the last two fields. What they mean:
+
+   1. **`div_ceil(128)` -> `div_ceil(32)`** — 16x the grid elements. The stated gap,
+      and the mechanical one.
+   2. **`scale_fmt: ue8m0`** — the grid's entries are **bytes**, where op 107's are
+      **f32**. This is why op 184 is a separate opcode rather than a flag on 107:
+      binding a V4.1 grid to 107 faults nowhere. It rescales every output by a
+      number read out of the wrong type at the wrong stride, and the model merely
+      gets worse — the silent-corruption shape, not a crash.
+   3. **`expert_dtype: fp4` while the dense projections are block-FP8** — so this
+      checkpoint is **MIXED**, and that breaks an invariant rather than a constant.
+      `MoeEnc` carries ONE encoding for a whole run; `mla_moe_enc_env` says so in
+      as many words, refusing `PLOW_MXFP4` and `PLOW_FP8` together because "a run
+      is ALL-mxfp4 or ALL-fp8 or ALL-bf16; pick one". V4.1 needs both at once. That
+      is a change to what the enum MEANS, not another variant on it, and it is the
+      largest of the three.
+
+   The refusal now names all three, keyed on `[32,32]` **and** `scale_fmt ue8m0`
+   together so a hypothetical f32-scaled 32-block still takes the generic path
+   (`ckpt_quant_tests`, two tests). Capability tag:
+   `ckpt_quant_fp8_blk32_ue8m0_mixed_fp4_experts`.
 
    **The encouraging half: plow already reads exactly V4.1's scale convention,
    just on the wrong operand.** The MXFP4 B-fetch takes "E8M0 scale rows

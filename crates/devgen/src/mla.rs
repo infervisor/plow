@@ -7755,6 +7755,29 @@ fn mla_ckpt_enc(dir: &Path) -> Option<MoeEnc> {
             "checkpoint quantization_config.fmt = {fmt:?}; the block-fp8 arms are e4m3 only. \
              Missing capability: `fp8_fmt_{fmt}`."
         );
+        // Two fields nothing here used to read. Both are load-bearing on DeepSeek-V4.1 and both
+        // are INVISIBLE to the generic block-size check below, which would refuse that checkpoint
+        // while naming only the block size -- sending the reader after a single constant when the
+        // actual gap is three separate things. Name them instead.
+        let scale_fmt = q.get("scale_fmt").and_then(|m| m.as_str()).unwrap_or("");
+        let expert_dtype = q.get("expert_dtype").and_then(|m| m.as_str()).unwrap_or("");
+        assert!(
+            !(blk == vec![32, 32] && scale_fmt == "ue8m0"),
+            "this is a DeepSeek-V4.1 checkpoint (weight_block_size [32,32], scale_fmt ue8m0, \
+             expert_dtype {expert_dtype:?}) and the gap is in THIS EMITTER, not in the kernels -- \
+             `PLOW_DOP_GEMM_FP8_MX` (184) and its `d_gemm_t<WFP8MX>` arm already exist. Three \
+             distinct things are missing here, and the block size is only the first:\n  \
+             (1) every scale-grid size in this emitter is written div_ceil(128); V4.1's is \
+             div_ceil(32), so each grid is 16x the elements;\n  \
+             (2) the grid ELEMENT TYPE differs -- V4.1's entries are ue8m0 BYTES, op 107's are \
+             f32. That is why 184 is a separate opcode and not a flag: binding a V4.1 grid to 107 \
+             faults nowhere, it just rescales every output;\n  \
+             (3) expert_dtype is fp4 while the dense projections are block-fp8, so this checkpoint \
+             is MIXED. `MoeEnc` carries ONE encoding for a whole run (`mla_moe_enc_env` refuses \
+             mxfp4 and fp8 together in so many words), and V4.1 needs both at once -- which is a \
+             change to what the enum MEANS, not another variant on it.\n\
+             Missing capability: `ckpt_quant_fp8_blk32_ue8m0_mixed_fp4_experts`."
+        );
         assert!(
             blk == vec![128, 128],
             "checkpoint quantization_config.weight_block_size = {blk:?}, but every scale-grid size \

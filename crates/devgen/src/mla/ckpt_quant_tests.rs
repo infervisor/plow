@@ -67,6 +67,44 @@ fn an_unsupported_quantization_is_refused_rather_than_downgraded() {
     mla_ckpt_enc(&d);
 }
 
+/// The REAL DeepSeek-V4.1-Flash `quantization_config`, copied field for field off the
+/// checkpoint. It parses as `quant_method: "fp8"` and carries no `fmt` at all, so it walks
+/// straight past the e4m3 check and into the block-size one — where, before this refusal
+/// existed, it was rejected with a message naming ONLY the block size.
+///
+/// That message was true and badly incomplete. Two of the three things V4.1 actually needs are
+/// invisible to a block-size check: the grid's entries are ue8m0 BYTES rather than f32 (which is
+/// why op 184 is a separate opcode from 107 and not a flag on it), and `expert_dtype: "fp4"`
+/// means the checkpoint is MIXED — dense block-fp8, routed experts fp4 — which `MoeEnc` cannot
+/// express at all, since it carries one encoding for a whole run. A reader who took the old
+/// message at face value would go change a 128 to a 32 and find the other two waiting.
+#[test]
+#[should_panic(expected = "ckpt_quant_fp8_blk32_ue8m0_mixed_fp4_experts")]
+fn the_v41_checkpoint_is_refused_naming_all_three_gaps_not_just_the_block_size() {
+    let d = cfg_dir(
+        "ckpt_v41",
+        r#"{"model_type":"deepseek_v41","dtype":"bfloat16",
+                "quantization_config":{"quant_method":"fp8","activation_scheme":"dynamic",
+                "weight_block_size":[32,32],"scale_fmt":"ue8m0","expert_dtype":"fp4"}}"#,
+    );
+    mla_ckpt_enc(&d);
+}
+
+/// The V4.1 refusal is keyed on BOTH the block size and the scale format, so it must not
+/// swallow a plain `[32,32]` fp8 checkpoint with f32 scales — a shape no V4.1 has, and which
+/// still belongs to the generic block-size refusal below it. Pinning this keeps the specific
+/// branch from widening into the general one on a later edit.
+#[test]
+#[should_panic(expected = "fp8_block_size")]
+fn a_32_block_without_ue8m0_scales_still_takes_the_generic_refusal() {
+    let d = cfg_dir(
+        "ckpt_blk32_f32",
+        r#"{"quantization_config":{"quant_method":"fp8","fmt":"e4m3",
+                "weight_block_size":[32,32]}}"#,
+    );
+    mla_ckpt_enc(&d);
+}
+
 /// A non-e4m3 fp8 flavour is refused too — `fmt` is checked, not assumed.
 #[test]
 #[should_panic(expected = "fp8_fmt_e5m2")]
