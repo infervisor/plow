@@ -80,7 +80,15 @@ pub fn amd_tuning_cell(spec: &hwspec::GpuSpec) -> String {
 ///
 /// Part of the staleness key, so a record checked by a weaker oracle cannot be served to a
 /// caller expecting this one.
-pub const GEMM_ORACLE: &str = "gemm-f64-dot-spotcheck-runtime-tile-v2";
+pub const GEMM_ORACLE: &str = "gemm-f64-dot-spotcheck-v1";
+pub const GFX942_GEMM_ORACLE: &str = "gemm-f64-dot-spotcheck-runtime-tile-v2";
+
+pub fn gemm_oracle(isa: hwspec::IsaLevel) -> &'static str {
+    match isa {
+        hwspec::IsaLevel::Gfx942 => GFX942_GEMM_ORACLE,
+        _ => GEMM_ORACLE,
+    }
+}
 
 /// The op-case key a GEMM measurement is filed and looked up under.
 ///
@@ -216,6 +224,13 @@ mod tests {
         assert_ne!(b, c);
         assert_ne!(a, c);
         assert_eq!(a, "gemm/128x576x6144/None");
+    }
+
+    #[test]
+    fn runtime_tile_oracle_is_scoped_to_gfx942() {
+        assert_eq!(gemm_oracle(hwspec::IsaLevel::Gfx942), GFX942_GEMM_ORACLE);
+        assert_eq!(gemm_oracle(hwspec::IsaLevel::Gfx950), GEMM_ORACLE);
+        assert_eq!(gemm_oracle(hwspec::IsaLevel::Sm90a), GEMM_ORACLE);
     }
 
     /// Every ordinary rung resolves to a distinct opcode in every encoding. Tagged c8 resolves

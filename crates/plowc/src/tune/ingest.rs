@@ -31,8 +31,8 @@ use kernelcaps::QuantScheme;
 use packet::dev::DevOp;
 use tunedb::gemm::parse_quant;
 use tunedb::{
-    gemm_op_case, gemm_rung_emit_plan, Correctness, Digests, KernelMeasurement, RecordState, Stats,
-    TuneStore, GEMM_ORACLE,
+    gemm_op_case, gemm_oracle, gemm_rung_emit_plan, Correctness, Digests, KernelMeasurement,
+    RecordState, Stats, TuneStore,
 };
 
 type Err = Box<dyn std::error::Error>;
@@ -94,7 +94,7 @@ fn probe_inventory(
         implementation: build.label(),
         interpreter: build.label(),
         toolchain: build.toolchain.clone(),
-        oracle: GEMM_ORACLE.to_string(),
+        oracle: gemm_oracle(isa).to_string(),
     };
     Ok((inv, want))
 }

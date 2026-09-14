@@ -1003,7 +1003,7 @@ fn gfx950_gemm_measurements() -> &'static GemmMeasurements {
             implementation: build.label(),
             interpreter: build.label(),
             toolchain: build.toolchain.clone(),
-            oracle: tunedb::GEMM_ORACLE.to_string(),
+            oracle: tunedb::gemm_oracle(amd_target::active().1).to_string(),
         };
         let cell = amd_tuning_cell();
         let Ok(records) = store.load_kernels(&cell) else {
