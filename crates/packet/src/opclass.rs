@@ -115,7 +115,11 @@ pub fn op_classes(op: DevOp) -> &'static [&'static str] {
         | GemvAffineQ4 => &["gemv"],
 
         RmsNorm | RowRms | NormResidual | AddNorm | NormResidualNorm | LayerNorm | QwenRmsNorm
-        | QwenGatedNorm | KdaGatedNorm | LayerNormF32 => &["norm"],
+        | QwenGatedNorm | KdaGatedNorm | LayerNormF32
+        // Engram's gate is two RMS reductions over `hidden` driving a gated residual add, so
+        // its cost and its knob scope are a norm's, not the hc machinery's -- it mixes INTO the
+        // mHC stream but carries none of the Sinkhorn/combine state HyperConnPre does.
+        | EngramGate => &["norm"],
 
         KdaConv | KdaGate | Mamba2Scan | KdaStateStep | KdaConv3 | KdaStateStepG
         | KdaConvStateStepG | KdaChunkPrepare | KdaChunkIntra | KdaChunkWu | KdaChunkCarry

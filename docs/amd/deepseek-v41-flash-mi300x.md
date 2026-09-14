@@ -568,13 +568,49 @@ failed -- the object simply did not grow. What caught it was diffing the armed
 object's `.text` against the unarmed one and finding them identical, which is
 the same check that proves the axis-off path unchanged. Run both directions.
 
-One piece has **nothing at all**: **Engram**. `engram_layer_ids` names layers 1
-and 14; each carries an fp8 table of `engram_num_embeddings` rows of
-`engram_head_dim`, addressed by a hash over up to `engram_max_ngram_size`
-tokens. It exists in `crates/nn-graph/src/models/config/deepseek_v41.rs` and
-nowhere else in the tree -- no kernel, no opcode, no test. It is a forward-path
-component, so end-to-end V4.1 needs it built: an n-gram hash, a gathered fp8
-embedding read, and the mix into the layer.
+**Engram, decomposed (2026-09-14).** Read from the reference rather than guessed
+at: `inference/engram.py` for the hash and `inference/model.py:296-366` for the
+rest. It is three stages, and only one of them wants an opcode.
+
+1. **Hash.** Each position is hashed with the `max_ngram_size - 1` tokens before
+   it, once per (n-gram size, head) pair, into that pair's own prime-sized
+   bucket range -- `(max_ngram_size - 1) * n_heads` = 24 ids per token. This is
+   integer work over TOKEN IDS ALONE: it reads no activation, and its primes,
+   multipliers and compressed-token map are fixed at load time from the
+   tokenizer. So it is host work arriving as a tensor, like `pos` or
+   `row_token`, and there is no hash kernel. It cannot be folded into the embed
+   either -- the lookback stops at a dead token, so a position's ids depend on
+   the mask, not only on its own id.
+2. **Embed + project.** The 24 ids fetch 24 fp8 rows of `head_dim`, dequantized
+   by block scale, flattened to 6144 and run through `wkv` -- an ordinary fp8
+   block-scale GEMM to `dim * (hc_mult + 1)` = 25600, which is exactly the
+   `engram.wkv.weight` `[25600, 6144]` in the shards. The table is sharded over
+   its rows with an all-reduce.
+3. **Gate + mix.** A per-(token, hc copy) normalized dot of the residual stream
+   against the key, through a SIGNED sqrt before the sigmoid, with the shared
+   value added into every hc copy under that gate.
+
+Only (3) is new math, and it is now **op 182, `PLOW_DOP_ENGRAM_GATE`**
+(`runtime/amd/op_engram.h`), behind a `PLOW_DSV41_ENGRAM` axis that defaults
+off, with a `plow_dsv41_engram_arm` marker the loader requires. Axis off leaves
+the gfx942 interpreter's `.text` byte-identical; on it adds ~3.4 KB.
+
+Three things in the gate that look like details and are not, each recorded
+because getting one wrong compiles, runs, and is a different model:
+
+* the normalization is per (token, hc copy) over `dim`, **not** jointly over
+  the copies;
+* the signed sqrt before the sigmoid is what shapes the gate's response, and
+  `clamp_min` sits INSIDE it on the magnitude -- a dot of zero gives
+  `sqrt(1e-6)` carrying zero's sign, not zero;
+* `token_mask = 0` shuts the GATE, so the position passes through untouched. It
+  does not add a zero value. That distinction is the whole reason image spans
+  are masked, and the test asserts the masked token comes back bit-identical
+  rather than merely close.
+
+What is still missing for Engram is stage 2's gather -- 24 fp8 row reads per
+token out of a 98.3 GB sharded table with a block-scale dequant -- plus the host
+side of stage 1. Neither is new math; both are plumbing.
 
 **Engram is a CAPACITY problem, not a bandwidth one.** From the checkpoint:
 

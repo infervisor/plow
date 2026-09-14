@@ -1438,6 +1438,19 @@ enum {
      *   i0=n_tok i1=n_head i2=D i3=rd i4=pos0
      * `t3` supersedes `i4` when present, for the same reason op 180's does. */
     PLOW_DOP_ROPE_INVERSE_O = 181,
+    /* DeepSeek-V4.1 Engram conditional memory: the gate + mix (`op_engram.h` d_engram_gate,
+     * [DSV41-ENGRAM]). The n-gram HASH is host work -- integer over token ids alone, with its
+     * primes and multipliers fixed at load time -- and the embed + `wkv` projection are an
+     * ordinary gathered fp8 read and fp8 block-scale GEMM, so this opcode is only the third
+     * stage: the normalized dot of the residual stream against the key, and the shared value
+     * added into every hc copy under that gate. In place on t0.
+     *   t0=x(bf16[T][n][hidden], IN AND OUT) t1=kv(bf16[T][(n+1)*hidden]: n keys then the
+     *   shared value) t2=q_weight t3=k_weight t4=token_mask(u8[T], may be 0)
+     *   i0=T i1=n(hc_mult) i2=hidden   f0=norm_eps
+     * A zero in t4 SHUTS THE GATE, so that token passes through untouched -- it does not get a
+     * zero value added to it. That is the image-span case, where the position took no part in
+     * any n-gram. */
+    PLOW_DOP_ENGRAM_GATE = 182,
 
     PLOW_DOP__COUNT
 };

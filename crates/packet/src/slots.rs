@@ -299,6 +299,7 @@ const DOC: &[S] = &[
     S { op: DevOp::EmbedOverlayBf16, t: &["out", "table", "tokens", "overlay", "overlay_index"], i: &["rows", "width", "vocab", "overlay_rows"], f: &[], j: &[] },
     S { op: DevOp::CompressPool, t: &["out", "kv", "score", "ape", "gamma", "cosb", "sinb", "pos"], i: &["n_pools", "ratio", "coff", "d", "rd", "qblk", "out_base", "rotate"], f: &["eps"], j: &[] },
     S { op: DevOp::RopeInverseO, t: &["o", "cosb", "sinb", "pos"], i: &["n_tok", "n_head", "D", "rd", "pos0"], f: &[], j: &[] },
+    S { op: DevOp::EngramGate, t: &["x", "kv", "q_weight", "k_weight", "token_mask"], i: &["T", "n", "hidden"], f: &["norm_eps"], j: &[] },
 ];
 
 /// Ops that say "As [`DevOp::X`]" / "twin of [`DevOp::X`]" / "Same operands as

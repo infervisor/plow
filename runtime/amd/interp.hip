@@ -242,6 +242,13 @@ extern "C" __device__ unsigned plow_phase_xreduce_wave64_occ2_nospill_1 = 1;
 #include "op_qwen_gdn.h"
 #endif
 #include "op_moe.h"
+#if PLOW_DSV41_ENGRAM
+#include "op_engram.h"
+/* CONDITIONALLY compiled, like plow_dsv4_csa2_arm: without the axis there is no case for op
+ * 182 and an Engram packet would fall through the switch, leaving the residual stream with no
+ * memory contribution and no fault anywhere. The loader refuses on the missing symbol. */
+extern "C" __device__ unsigned plow_dsv41_engram_arm = 1;
+#endif
 #if PLOW_DSV4_CSA2
 #include "op_compress.h"
 /* CONDITIONALLY compiled, like PLOW_MOE_PF_ATOMIC's marker and unlike the unconditional
@@ -760,6 +767,12 @@ extern "C" __device__ unsigned plow_prefill_nrn_consumer_1 = 1;
  * reach it. Off => every existing object is byte-identical. */
 #ifndef PLOW_DSV4_CSA2
 #define PLOW_DSV4_CSA2 0
+#endif
+/* DeepSeek-V4.1 Engram (op 182). Its own flag rather than riding PLOW_DSV4_CSA2: a model can
+ * have CSA2 without Engram (V4 does), and only two layers of V4.1 carry a table. Off => every
+ * existing object is byte-identical. */
+#ifndef PLOW_DSV41_ENGRAM
+#define PLOW_DSV41_ENGRAM 0
 #endif
 #ifndef PLOW_GLOBAL_QUEUE
 #define PLOW_GLOBAL_QUEUE 0
@@ -3874,6 +3887,13 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                              (const int*)TEN(3));
             break;
 #endif /* PLOW_DSV4_CSA2 */
+#if PLOW_DSV41_ENGRAM
+        case PLOW_DOP_ENGRAM_GATE:
+            d_engram_gate((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+                          (const bf16*)TEN(3), (const unsigned char*)TEN(4), in->i[0], in->i[1],
+                          in->i[2], in->fj[0].f, slice, nblk, sm->part);
+            break;
+#endif /* PLOW_DSV41_ENGRAM */
         /* Greedy sampling on device. In BOTH buckets: prefill samples the first token, decode
          * every one after it, and the id lands in `in.ids` where the next EMBED reads it. */
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_ARGMAX

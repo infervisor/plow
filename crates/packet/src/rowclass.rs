@@ -148,7 +148,9 @@ pub fn class_of(op: DevOp) -> RowClass {
         MlaMaterializePack | QwenGdnQkvPrep | QwenGdnGatePrep | KdaGate => RowClass::A,
         // Per-token hyper-connection mix/push and the attention-residual ring: the ring is per
         // token and the workgroups partition tokens.
-        HyperConnPre | HyperConnPost | AttnRes => RowClass::A,
+        // Engram joins them: per token, workgroups partition tokens, no scalar base and no
+        // cross-token coupling. Its `token_mask` is a per-row array, not a derived position.
+        HyperConnPre | HyperConnPost | AttnRes | EngramGate => RowClass::A,
         // Per-row Hadamard + fp8 quant of the indexer queries. `n_rows` is the only axis; it
         // has no pool, no `ape`, and no position, unlike the rest of the DSA chain.
         DsaQQuant => RowClass::A,

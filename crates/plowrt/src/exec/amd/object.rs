@@ -381,6 +381,9 @@ pub(super) const PREFILL_ARM_MARKERS: &[(&str, &[&str])] = &[
     // object built without -DPLOW_DSV4_CSA2=1 has no case for either op, so the packet would fall
     // through the interpreter's switch rather than compute anything. Refuse at load.
     ("PLOW_DSV4_CSA2", &["plow_dsv4_csa2_arm"]),
+    // Engram (op 182). Same standing as CSA2 above, and the silent failure is worse: the
+    // packet runs as a no-op and the model answers fluently without its memory.
+    ("PLOW_DSV41_ENGRAM", &["plow_dsv41_engram_arm"]),
     // Op 83's `i[5]` shared-expert tail (PLOW_GLM_MOE_SHARED_FOLD). Unconditional arm, so the
     // marker IS the test: no marker means the object predates the fold and would drop the
     // shared expert entirely. See `packet_prefill_arm_requirements`.

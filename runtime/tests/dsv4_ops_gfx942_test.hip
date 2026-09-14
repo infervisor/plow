@@ -19,6 +19,7 @@
 #if defined(__HIP_DEVICE_COMPILE__)
 #include "op_compress.h"
 #include "op_elementwise.h"
+#include "op_engram.h"
 #include "op_hyperconn.h"
 #include "op_moe.h"
 #else
@@ -368,8 +369,89 @@ static void act_case() {
     hipFree(dg); hipFree(du); hipFree(dout); hipFree(dmo);
 }
 
+
+__global__ __launch_bounds__(256, 1) void k_engram(bf16* x, const bf16* kv, const bf16* qw,
+                                                   const bf16* kw, const unsigned char* tmask,
+                                                   unsigned T, unsigned n, unsigned hidden,
+                                                   float eps) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    __shared__ float part[PLOW_WAVES];
+    d_engram_gate(x, kv, qw, kw, tmask, T, n, hidden, eps, blockIdx.x, gridDim.x, part);
+#endif
+}
+
+/* Engram gate + mix against the reference (model.py:352-366) recomputed here in double.
+ *
+ * `masked_at` shuts the gate for one token; that token must come back BIT-IDENTICAL, which is a
+ * stronger check than "close to the reference" and is the property the image-span mask exists
+ * for -- a masked position passes through, it does not get a zero value added to it. */
+static void engram_case(unsigned T, unsigned n, unsigned hidden, int masked_at) {
+    const float eps = 1e-6f;
+    std::vector<bf16> x((size_t)T * n * hidden), kv((size_t)T * (n + 1) * hidden);
+    std::vector<bf16> qw((size_t)n * hidden), kw((size_t)n * hidden);
+    for (auto& v : x) v = f2b(rnd());
+    for (auto& v : kv) v = f2b(rnd());
+    for (auto& v : qw) v = f2b(rnd());
+    for (auto& v : kw) v = f2b(rnd());
+    std::vector<unsigned char> tm(T, 1);
+    if (masked_at >= 0) tm[(unsigned)masked_at] = 0;
+    const std::vector<bf16> x0 = x;
+
+    auto* dX = up(x);
+    auto* dKv = up(kv);
+    auto* dQ = up(qw);
+    auto* dK = up(kw);
+    auto* dM = up(tm);
+    hipLaunchKernelGGL(k_engram, dim3(T < 64 ? T : 64), dim3(256), 0, 0, dX, dKv, dQ, dK,
+                       masked_at >= 0 ? dM : (const unsigned char*)nullptr, T, n, hidden, eps);
+    ck(hipDeviceSynchronize());
+    ck(hipMemcpy(x.data(), dX, x.size() * sizeof(bf16), hipMemcpyDeviceToHost));
+
+    double worst = 0.0;
+    int untouched_ok = 1, gates_nontrivial = 0;
+    for (unsigned t = 0; t < T; t++) {
+        const bool masked = masked_at >= 0 && t == (unsigned)masked_at;
+        const bf16* vrow = &kv[(size_t)t * (n + 1) * hidden + (size_t)n * hidden];
+        for (unsigned c = 0; c < n; c++) {
+            double ssh = 0.0, ssk = 0.0, dot = 0.0;
+            for (unsigned d = 0; d < hidden; d++) {
+                const double h = b2f(x0[((size_t)t * n + c) * hidden + d]);
+                const double k = b2f(kv[(size_t)t * (n + 1) * hidden + (size_t)c * hidden + d]);
+                ssh += h * h;
+                ssk += k * k;
+                dot += h * ((double)b2f(qw[(size_t)c * hidden + d]) *
+                            (double)b2f(kw[(size_t)c * hidden + d])) * k;
+            }
+            double gate = 0.0;
+            if (!masked) {
+                const double rstd = (1.0 / std::sqrt(ssh / hidden + eps)) *
+                                    (1.0 / std::sqrt(ssk / hidden + eps));
+                const double dv = dot * rstd / std::sqrt((double)hidden);
+                const double mag = std::sqrt(std::max(std::fabs(dv), 1e-6));
+                gate = 1.0 / (1.0 + std::exp(-std::copysign(mag, dv)));
+                if (gate > 0.01 && gate < 0.99) gates_nontrivial++;
+            }
+            for (unsigned d = 0; d < hidden; d++) {
+                const size_t i = ((size_t)t * n + c) * hidden + d;
+                const double want = (double)b2f(x0[i]) + gate * (double)b2f(vrow[d]);
+                const double got = b2f(x[i]);
+                if (masked && x[i] != x0[i]) untouched_ok = 0;
+                const double den = std::max(1.0, std::fabs(want));
+                worst = std::max(worst, std::fabs(got - want) / den);
+            }
+        }
+    }
+    char det[192];
+    std::snprintf(det, sizeof det,
+                  "(T=%u n=%u hidden=%u worst rel %.2e, %d non-saturated gates, masked token "
+                  "untouched=%d)",
+                  T, n, hidden, worst, gates_nontrivial, untouched_ok);
+    say("engram gate + mix", worst < 5e-3 && untouched_ok && gates_nontrivial > 0, det);
+    hipFree(dX); hipFree(dKv); hipFree(dQ); hipFree(dK); hipFree(dM);
+}
+
 int main() {
-    std::printf("DeepSeek-V4 router / mHC-head / inverse-RoPE / clamped-SwiGLU arms\n");
+    std::printf("DeepSeek-V4 router / mHC-head / inverse-RoPE / clamped-SwiGLU / engram arms\n");
     router_case("router SIGMOID+norm (SHIPPED, must not move)", 256, 8, SIG | NORM, 1.0f, true);
     router_case("router SOFTMAX (SHIPPED, must not move)", 128, 4, NORM, 1.0f, false);
     router_case("router sqrtsoftplus + bias + norm, scale 1.5", 256, 6, SQSP | NORM, 1.5f, true);
@@ -383,6 +465,9 @@ int main() {
     irope_case(3, 8, 512, 64, 0);
     irope_case(17, 8, 512, 64, 1000);
     act_case();
+    engram_case(7, 4, 5120, -1);
+    engram_case(5, 4, 5120, 2);
+    engram_case(3, 4, 512, 1);
     std::printf("%s (%d failures)\n", fails ? "FAIL" : "PASS", fails);
     return fails ? 1 : 0;
 }

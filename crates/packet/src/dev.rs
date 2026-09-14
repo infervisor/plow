@@ -2006,6 +2006,23 @@ pub enum DevOp {
     /// NOT the half-split [`DevOp::HeadNormRope`] defaults to. `t3` supersedes `i4`
     /// when present, for the same reason [`DevOp::CompressPool`]'s does.
     RopeInverseO = 181,
+    /// DeepSeek-V4.1's Engram conditional memory: the gate + mix (`op_engram.h`
+    /// `d_engram_gate`, `[DSV41-ENGRAM]`). In place on `t0`.
+    /// `t0=x(bf16[T][n][hidden], in/out) t1=kv(bf16[T][(n+1)*hidden]) t2=q_weight
+    /// t3=k_weight t4=token_mask(u8[T])` · `i0=T i1=n i2=hidden` · `f0=norm_eps`.
+    ///
+    /// Only the THIRD stage of Engram is an opcode. The n-gram hash is integer work over
+    /// token ids alone, with its primes, multipliers and compressed-token map fixed at
+    /// load time from the tokenizer, so it arrives as a host-built tensor like `pos`. The
+    /// embed and `wkv` projection are an ordinary gathered fp8 read and fp8 block-scale
+    /// GEMM. What is left, and what this computes, is the gate: a per-(token, hc copy)
+    /// normalized dot of the stream against the key, through a SIGNED sqrt before the
+    /// sigmoid, with the shared value added into every copy under it.
+    ///
+    /// `t4 = 0` shuts the gate and the token passes through UNTOUCHED -- it does not get a
+    /// zero value added. That distinction is the whole point of masking image spans, which
+    /// take part in no n-gram.
+    EngramGate = 182,
 }
 
 /// GLU-family `act` code for GPT-OSS's `swiglu_oai` (pair form, `f0 = alpha`, `f1 = limit`).
@@ -2203,6 +2220,7 @@ impl DevOp {
         DevOp::EmbedOverlayBf16,
         DevOp::CompressPool,
         DevOp::RopeInverseO,
+        DevOp::EngramGate,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -2405,6 +2423,7 @@ impl DevOp {
             DevOp::EmbedOverlayBf16 => "PLOW_DOP_EMBED_OVERLAY_BF16",
             DevOp::CompressPool => "PLOW_DOP_COMPRESS_POOL",
             DevOp::RopeInverseO => "PLOW_DOP_ROPE_INVERSE_O",
+            DevOp::EngramGate => "PLOW_DOP_ENGRAM_GATE",
         }
     }
 
@@ -2451,11 +2470,13 @@ impl DevOp {
     /// 161 -> 163 for affine Q4 matrix operations. The speech/vision ops were numbered from
     /// 156 on main; merging them after the gfx942 ops at 156-160 moved every one up by 5.
     /// 178 -> 179 for backend-neutral grouped FP32 attention.
+    /// 182 -> 183 for `EngramGate = 182` (DeepSeek-V4.1 Engram's gate + mix; the hash is
+    /// host work and the embed/projection are ordinary ops, so the family costs one opcode).
     /// 180 -> 182 for `CompressPool = 180` / `RopeInverseO = 181` (DeepSeek-V4 CSA2). Both
     /// kernels and their gfx942 tests predate the opcodes by some time: they were reachable
     /// only from the tests, so no packet could run them.
     /// 179 -> 180 for backend-neutral multimodal embedding overlay.
-    pub const COUNT: u16 = 182;
+    pub const COUNT: u16 = 183;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///
