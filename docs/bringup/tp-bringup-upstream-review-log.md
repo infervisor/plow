@@ -1480,20 +1480,41 @@ prefill rows in the same list, `interp_prefill_mla_moe` and `interp_prefill_fp8k
 1 and 6 scratch ops, which is noise. The 8K TTFT campaign is not paying for this regression. The
 K3/MXFP4 prefill family is.
 
-**Class 3 — the K3 MoE expert spills predate the last bless.** `d_moe_expert_glu_fp8_blk` at 105
-spill instructions and `d_moe_expert_down_fp8_blk` at 80, across four decode objects, are present
-at HEAD, at `3d54bd95`, AND at `ee624310` — identical counts in all three. These come from
-`no_scratch` in `scripts/asm_expect_gfx942.json`, a hand-written rule whose note reads "Both bodies
-must remain spill-free", landed 2026-08-11 and untouched since 2026-09-08. So the rule already
-failed when the baseline was last re-blessed on 2026-09-11, and `--bless` cannot silence it: it is
-an expect rule with no baseline row, checked on every object regardless of axes. The K3 MXFP4
-decode experts have been spilling to scratch through at least one bless, in a GLM decode path, and
-nobody has been building gfx942 objects often enough to see it.
+**Class 3 — the K3 MoE expert spills are `PLOW_OCC4=1`, and that flag does not ship.**
+`d_moe_expert_glu_fp8_blk` at 105 spill instructions and `d_moe_expert_down_fp8_blk` at 80, across
+four decode objects, are present at HEAD, at `3d54bd95` and at `ee624310` — identical counts in all
+three, which first read as a standing failure that predated the last bless. It is not. All three of
+those builds passed `PLOW_OCC4=1`, because that is what `rebench_tune_gemm_gfx942.sh` passed and the
+control builds copied it. **Build the same 53 objects at HEAD without `PLOW_OCC4` and all eight FAIL
+lines disappear**, with nothing else about them changing.
 
-**What this means for the campaign.** The gate that blocks it is class 3, which is the oldest of the
-three and the only one `--bless` cannot touch. Classes 1 and 2 are both one commit old and both
-attributable. The tile cell is still stale for the reason already recorded — 4961 records over 14
-older digests, none keyed to the current family, 40 shipping shapes at 0 HIT, tier `portable`.
+The mechanism is in the recorded axes: with `PLOW_OCC4=1`, `interp_decode_k3` compiles
+`-DPLOW_WPE=5` (plus `-DGM_BK=32 -DGM_BM=128 -DGM_BN=256`); without it, none of those. `PLOW_WPE=5`
+is the occupancy-4 register ration, and rationing registers is what pushes those two outlined bodies
+to scratch. `no_scratch` in `scripts/asm_expect_gfx942.json` is written for the default build and
+does not model that axis, so it fires on an OCC4 build by construction.
+
+**And `PLOW_OCC4=1` cannot ship for this model anyway**, which is the part that settles it.
+`build_gfx942.sh` refuses the flag outright once the packet's decode ladder has batch > 1 — GLM's
+ends at 20 — with "the WPE=5/4 register ration hangs the batched program's first decode dispatch".
+The shipped serving set proves the same thing from the other side: its `build_defines.json` carries
+no `PLOW_WPE=5` and no `GM_BK=32`, and every row carries `-DPLOW_CONFIG="plow_config.h"`. The
+shipping recipe is a PACKET-SCOPED build with no OCC4.
+
+**What this means for the campaign**, and it is now a fix rather than an owner's decision. The
+rebench script's step 1 called `PLOW_OCC4=1` "the SHIPPING recipe, not a special one", and the store
+is keyed by the object digest, so the campaign was measuring tiles for a `-D` set that does not
+ship — exactly the staleness that script's own header warns about. Step 1 now drops `PLOW_OCC4` and
+takes `PLOW_TUNE_CONFIG=<assets dir>` to build for one packet the way the shipped set is built. A
+packet build at HEAD matched the contract over all 53 objects, zero FAIL lines, so the campaign has
+a green step 1 again without blessing anything.
+
+Classes 1 and 2 survive on the generic build and keep their owners: the stale geometry profile is
+bookkeeping that wants a re-bless, and `f89d3a5c`'s scratch-budget regressions want their author. A
+packet build sidesteps both by the axis rule rather than by fixing them, which is worth saying
+plainly — its PASS on those rows is the absence of a check. The tile cell is still stale for the
+reason already recorded: 4961 records over 14 older digests, none keyed to the current family, 40
+shipping shapes at 0 HIT, tier `portable`.
 
 Artefacts on `/workspace`: `objcontract-c08d1232/parent-build.log` and `.../bless-build.log`.
 

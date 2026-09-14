@@ -81,8 +81,32 @@ fi
 echo "=== 1/5  building the gfx942 objects + test_kernels.elf into $OBJ (inside nix)"
 # The SHIPPING recipe, not a special one: the defines participate in the store's digest, so a
 # campaign measured against a different -D set is stale the moment it lands.
+#
+# PLOW_OCC4=1 WAS HERE UNTIL 2026-09-14 AND IT IS NOT THE SHIPPING RECIPE. Three independent
+# facts, each checked on this box:
+#   * the shipped serving set's own `build_defines.json` carries no `PLOW_WPE=5` and no
+#     `GM_BK=32/GM_BM=128/GM_BN=256`, which is what PLOW_OCC4 adds -- it was built without it;
+#   * `build_gfx942.sh` REFUSES `PLOW_OCC4=1` outright once the packet's decode ladder has
+#     batch > 1, and GLM's ends at 20 ("the WPE=5/4 register ration hangs the batched program's
+#     first decode dispatch"), so this flag cannot ship for this model at all;
+#   * it is what produced the audit's only non-bookkeeping failures that are not a source
+#     regression -- `d_moe_expert_glu_fp8_blk` at 105 spill instructions and
+#     `d_moe_expert_down_fp8_blk` at 80, across four K3 decode objects, against an
+#     `asm_expect_gfx942.json` rule whose note says both bodies must remain spill-free. Drop
+#     PLOW_OCC4 and those eight FAIL lines disappear; nothing else about them changes.
+# So the flag both broke the build and pointed the campaign at a `-D` set that does not ship,
+# which is precisely the staleness this header warns about two paragraphs up.
+#
+# PLOW_TUNE_CONFIG=<assets dir | plow_config.h> builds for ONE PACKET, the way the shipped set
+# is built (its rows carry `-DPLOW_CONFIG="plow_config.h"`). Set it when tuning tiles for a
+# specific model -- which is the only kind of tile campaign there is, since the store is keyed
+# by the object digest. It is also what makes the contract audit pass: a packet build derives
+# its row set from the packet and matched the contract over all 53 objects here, where the
+# generic build still carries f89d3a5c's scratch-budget regressions and the stale geometry
+# profile (both attributed in docs/bringup/tp-bringup-upstream-review-log.md).
 "$NIX" develop "$WT" -c \
-  env PLOW_OCC4=1 PLOW_L2HIER=1 JOBS="${JOBS:-14}" ./scripts/build_gfx942.sh "$OBJ"
+  env ${PLOW_TUNE_CONFIG:+PLOW_HSACO_CONFIG="$PLOW_TUNE_CONFIG"} \
+      PLOW_L2HIER=1 JOBS="${JOBS:-14}" ./scripts/build_gfx942.sh "$OBJ"
 [ -f "$OBJ/test_kernels.elf" ] || {
   echo "FAIL: $OBJ/test_kernels.elf missing — build_gfx942.sh must build it (see its own note)"; exit 1; }
 
