@@ -151,6 +151,9 @@ pub fn class_of(op: DevOp) -> RowClass {
         // Engram joins them: per token, workgroups partition tokens, no scalar base and no
         // cross-token coupling. Its `token_mask` is a per-row array, not a derived position.
         HyperConnPre | HyperConnPost | AttnRes | EngramGate => RowClass::A,
+        // The table read is per token too: `t3=ids` is a per-row array already, and a row's
+        // lookup depends on nothing but its own ids.
+        EngramEmbed => RowClass::A,
         // Per-row Hadamard + fp8 quant of the indexer queries. `n_rows` is the only axis; it
         // has no pool, no `ape`, and no position, unlike the rest of the DSA chain.
         DsaQQuant => RowClass::A,

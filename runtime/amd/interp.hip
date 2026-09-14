@@ -3888,6 +3888,11 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
             break;
 #endif /* PLOW_DSV4_CSA2 */
 #if PLOW_DSV41_ENGRAM
+        case PLOW_DOP_ENGRAM_EMBED:
+            d_engram_embed((bf16*)TEN(0), (const unsigned char*)TEN(1),
+                           (const unsigned char*)TEN(2), (const int*)TEN(3), in->i[0], in->i[1],
+                           in->i[2], in->i[3], in->i[4], in->i[5], slice, nblk);
+            break;
         case PLOW_DOP_ENGRAM_GATE:
             d_engram_gate((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
                           (const bf16*)TEN(3), (const unsigned char*)TEN(4), in->i[0], in->i[1],

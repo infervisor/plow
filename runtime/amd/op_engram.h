@@ -1,4 +1,4 @@
-/* op_engram.h — DeepSeek-V4.1's Engram conditional memory, gate + mix.  [DSV41-ENGRAM]
+/* op_engram.h — DeepSeek-V4.1's Engram conditional memory.  [DSV41-ENGRAM]
  *
  * Ported term for term from the shipped reference, `inference/engram.py` (the hash side) and
  * `inference/model.py:328-366` (`class Engram`), not from prose.
@@ -17,15 +17,17 @@
  *      kernel here. (It cannot be folded into the embed op either: the lookback stops at a dead
  *      token, so a position's ids depend on the mask, not only on its own id.)
  *
- *   2. EMBED + PROJECT. The 24 ids fetch 24 fp8 rows of `engram_head_dim`, dequantized by their
- *      block scales, flattened to `n_hash_cols * head_dim` (6144) and run through `wkv`, an
- *      ordinary fp8 block-scale GEMM to `dim * (hc_mult + 1)` (25600). The table is sharded over
- *      its ROWS with an all-reduce, because it is the largest tensor in the checkpoint by a wide
- *      margin -- 384 006 168 rows of 256 fp8 is 98.3 GB, and there are two of them.
+ *   2. EMBED -- `d_engram_embed` below, op 183. The 24 ids fetch 24 fp8 rows of
+ *      `engram_head_dim`, dequantized by their ue8m0 block scales and laid out flat as
+ *      `n_hash_cols * head_dim` (6144) per token. The PROJECTION that follows it (`wkv`, to
+ *      `dim * (hc_mult + 1)` = 25600) is an ordinary fp8 block-scale GEMM and needs no opcode of
+ *      its own. The table is sharded over its ROWS with an all-reduce, because it is the largest
+ *      tensor in the checkpoint by a wide margin -- 384 006 168 rows of 256 fp8 is 98.3 GB, and
+ *      there are two of them.
  *
- *   3. GATE + MIX -- this file. `wkv`'s output splits into `hc_mult` keys and one shared value;
- *      the gate is a normalized dot of the residual stream against the key, and the value is
- *      added into every hc copy under it.
+ *   3. GATE + MIX -- `d_engram_gate` below, op 182. `wkv`'s output splits into `hc_mult` keys and
+ *      one shared value; the gate is a normalized dot of the residual stream against the key, and
+ *      the value is added into every hc copy under it.
  *
  * THE GATE, EXACTLY (model.py:352-366). Per token `t` and hc copy `c`, over `dim`:
  *
@@ -134,6 +136,67 @@ __device__ void d_engram_gate(bf16* __restrict__ x, const bf16* __restrict__ kv,
             }
             /* `hc` is read by the NEXT copy's reductions only through its own slice, so no
              * barrier is needed between copies beyond the ones block_sum already issues. */
+        }
+    }
+}
+
+
+/* op 183 — Engram stage 2's gathered table read (`ParallelEngramEmbedding.forward`,
+ * model.py:296-325). The 24 hash ids fetch 24 fp8 rows of `head_dim`, each dequantized by its
+ * own ue8m0 block scales, laid out flat as one `n_cols * head_dim` row per token -- which is
+ * exactly the operand `wkv` wants, so no reshape op sits between this and the GEMM.
+ *
+ *   out    [T][n_cols * head_dim]   bf16
+ *   table  [part_rows][head_dim]    fp8 e4m3, OCP
+ *   scale  [part_rows][head_dim/32] ue8m0, one byte per 32 elements
+ *   ids    [T][n_cols]              i32, ALREADY offset into the global table
+ *
+ * SHARDING. The table is the largest tensor in the checkpoint -- 384 006 168 rows of 256 fp8 is
+ * 98.3 GB, and a V4.1 checkpoint has two -- so it is split over its ROWS and each rank holds
+ * `[vocab_start, vocab_start + part_rows)`. An id outside that window is NOT this rank's to
+ * serve, and writes ZEROS: the reference masks exactly this way and then all-reduces, so the
+ * sum over ranks reconstructs the row. The all-reduce is the emitter's `XReduce`, not this op --
+ * the same split every other TP-sharded read in the tree takes.
+ *
+ * TWO DECODE FACTS WORTH STATING, because either one silently halves or doubles the result:
+ *  - the elements are OCP e4m3, and `dequant_fp8` is the OCP decode (the FNUZ hazard §4.2
+ *    records applies to gfx942's fp8 MATRIX CORE, which this op does not touch -- an
+ *    element-wise convert has no such constraint);
+ *  - the scale is ue8m0 at a 32-element block, NOT the [128,128] grid V4 used.
+ *    `weight_block_size` is [32, 32] in V4.1's `quantization_config`, so `head_dim / 32` = 8
+ *    scale bytes per row, matching the shard's `engram.embed.scale` [rows, 8].
+ *
+ * ONE WORKGROUP PER TOKEN, threads striding the flattened `n_cols * head_dim`. This op moves
+ * ~33.5 MB across a whole 8k prefill (24 rows of 256 bytes per token, two engram layers), so it
+ * is written for clarity: the reads are random into a 98 GB table and will not prefetch, and no
+ * amount of vectorization changes that.
+ */
+__device__ void d_engram_embed(bf16* __restrict__ out, const unsigned char* __restrict__ table,
+                               const unsigned char* __restrict__ scale,
+                               const int* __restrict__ ids, unsigned T, unsigned n_cols,
+                               unsigned head_dim, unsigned blk, unsigned vocab_start,
+                               unsigned part_rows, unsigned slice, unsigned nblk) {
+    const unsigned width = n_cols * head_dim;
+    const unsigned spr = head_dim / blk; /* scale bytes per table row */
+
+    for (unsigned t = slice; t < T; t += nblk) {
+        bf16* orow = out + (size_t)t * width;
+        const int* irow = ids + (size_t)t * n_cols;
+
+        for (unsigned i = threadIdx.x; i < width; i += PLOW_THREADS) {
+            const unsigned col = i / head_dim, d = i % head_dim;
+            /* Signed, then compared as signed: an id below `vocab_start` must fall out, and the
+             * unsigned wrap of `id - vocab_start` would instead make it a huge in-range-looking
+             * index straight past the end of this rank's shard. */
+            const long long local = (long long)irow[col] - (long long)vocab_start;
+            if (local < 0 || local >= (long long)part_rows) {
+                orow[i] = f2bf(0.0f);
+                continue;
+            }
+            const size_t r = (size_t)local;
+            const float v = dequant_fp8(table[r * head_dim + d]);
+            const float sc = e8m0_to_f32(scale[r * spr + d / blk]);
+            orow[i] = f2bf(v * sc);
         }
     }
 }

@@ -2023,6 +2023,22 @@ pub enum DevOp {
     /// zero value added. That distinction is the whole point of masking image spans, which
     /// take part in no n-gram.
     EngramGate = 182,
+    /// DeepSeek-V4.1 Engram stage 2: the gathered table read (`op_engram.h`
+    /// `d_engram_embed`, `[DSV41-ENGRAM]`).
+    /// `t0=out(bf16[T][n_cols*head_dim]) t1=table(fp8 e4m3 OCP) t2=scale(ue8m0)
+    /// t3=ids(i32[T][n_cols])` · `i0=T i1=n_cols i2=head_dim i3=blk i4=vocab_start
+    /// i5=part_rows`.
+    ///
+    /// The output is laid out flat as one `n_cols * head_dim` row per token, which is
+    /// exactly what the `wkv` GEMM consumes, so no reshape sits between them.
+    ///
+    /// The table is sharded over its ROWS -- it is the largest tensor in the checkpoint,
+    /// 384 006 168 rows of 256 fp8 -- so an id outside `[i4, i4 + i5)` writes ZEROS and the
+    /// emitter's [`DevOp::XReduce`] sums the ranks back together.
+    ///
+    /// `i3 = blk` is 32 for V4.1 (`weight_block_size [32, 32]`), NOT the `[128, 128]` grid
+    /// V4 used. Getting it wrong rescales every lookup and faults nowhere.
+    EngramEmbed = 183,
 }
 
 /// GLU-family `act` code for GPT-OSS's `swiglu_oai` (pair form, `f0 = alpha`, `f1 = limit`).
@@ -2221,6 +2237,7 @@ impl DevOp {
         DevOp::CompressPool,
         DevOp::RopeInverseO,
         DevOp::EngramGate,
+        DevOp::EngramEmbed,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -2424,6 +2441,7 @@ impl DevOp {
             DevOp::CompressPool => "PLOW_DOP_COMPRESS_POOL",
             DevOp::RopeInverseO => "PLOW_DOP_ROPE_INVERSE_O",
             DevOp::EngramGate => "PLOW_DOP_ENGRAM_GATE",
+            DevOp::EngramEmbed => "PLOW_DOP_ENGRAM_EMBED",
         }
     }
 
@@ -2470,13 +2488,14 @@ impl DevOp {
     /// 161 -> 163 for affine Q4 matrix operations. The speech/vision ops were numbered from
     /// 156 on main; merging them after the gfx942 ops at 156-160 moved every one up by 5.
     /// 178 -> 179 for backend-neutral grouped FP32 attention.
-    /// 182 -> 183 for `EngramGate = 182` (DeepSeek-V4.1 Engram's gate + mix; the hash is
-    /// host work and the embed/projection are ordinary ops, so the family costs one opcode).
+    /// 182 -> 184 for `EngramGate = 182` / `EngramEmbed = 183` (DeepSeek-V4.1 Engram). The
+    /// hash is host work and the `wkv` projection is an ordinary fp8 GEMM, so the family costs
+    /// two opcodes rather than four.
     /// 180 -> 182 for `CompressPool = 180` / `RopeInverseO = 181` (DeepSeek-V4 CSA2). Both
     /// kernels and their gfx942 tests predate the opcodes by some time: they were reachable
     /// only from the tests, so no packet could run them.
     /// 179 -> 180 for backend-neutral multimodal embedding overlay.
-    pub const COUNT: u16 = 183;
+    pub const COUNT: u16 = 184;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///

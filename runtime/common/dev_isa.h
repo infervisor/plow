@@ -1451,6 +1451,17 @@ enum {
      * zero value added to it. That is the image-span case, where the position took no part in
      * any n-gram. */
     PLOW_DOP_ENGRAM_GATE = 182,
+    /* DeepSeek-V4.1 Engram stage 2: the gathered table read (`op_engram.h` d_engram_embed,
+     * [DSV41-ENGRAM]). The 24 hash ids fetch 24 fp8 rows of head_dim, each dequantized by its
+     * own ue8m0 block scale, flat as one n_cols*head_dim row per token -- exactly the operand
+     * the `wkv` GEMM wants, so nothing reshapes between them.
+     *   t0=out(bf16[T][n_cols*head_dim]) t1=table(fp8 e4m3 OCP[part_rows][head_dim])
+     *   t2=scale(ue8m0[part_rows][head_dim/blk]) t3=ids(i32[T][n_cols])
+     *   i0=T i1=n_cols i2=head_dim i3=blk i4=vocab_start i5=part_rows
+     * The table is sharded over its ROWS: an id outside [i4, i4+i5) writes ZEROS, and the
+     * emitter's XReduce sums the ranks back together. blk is 32 for V4.1 (weight_block_size
+     * [32,32]), NOT the [128,128] grid V4 used -- getting it wrong rescales every lookup. */
+    PLOW_DOP_ENGRAM_EMBED = 183,
 
     PLOW_DOP__COUNT
 };

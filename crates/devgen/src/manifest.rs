@@ -1277,7 +1277,7 @@ fn backend_amd(
     // Engram (op 182). Separate from CSA2 above: V4 has the compressor without the tables, and
     // only two V4.1 layers carry one. An object without the axis has no case for the op, so the
     // packet would run as a no-op and the stream would simply lose its memory contribution.
-    if has("EngramGate") {
+    if has("EngramGate") || has("EngramEmbed") {
         req.push("PLOW_DSV41_ENGRAM=1".into());
     }
     if on("a4w4") {

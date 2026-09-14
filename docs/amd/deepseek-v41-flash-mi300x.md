@@ -590,10 +590,22 @@ rest. It is three stages, and only one of them wants an opcode.
    against the key, through a SIGNED sqrt before the sigmoid, with the shared
    value added into every hc copy under that gate.
 
-Only (3) is new math, and it is now **op 182, `PLOW_DOP_ENGRAM_GATE`**
-(`runtime/amd/op_engram.h`), behind a `PLOW_DSV41_ENGRAM` axis that defaults
-off, with a `plow_dsv41_engram_arm` marker the loader requires. Axis off leaves
-the gfx942 interpreter's `.text` byte-identical; on it adds ~3.4 KB.
+Stages (2) and (3) are now opcodes -- **183 `PLOW_DOP_ENGRAM_EMBED`** and
+**182 `PLOW_DOP_ENGRAM_GATE`**, both in `runtime/amd/op_engram.h`, behind one
+`PLOW_DSV41_ENGRAM` axis that defaults off with a `plow_dsv41_engram_arm`
+marker the loader requires. Axis off leaves the gfx942 interpreter's `.text`
+byte-identical. The `wkv` projection between them needs no opcode: it is an
+ordinary fp8 block-scale GEMM.
+
+Two decode facts about the table read, either of which silently rescales every
+lookup: the elements are **OCP** e4m3 and `dequant_fp8` is the OCP decode (the
+FNUZ hazard §4.2 records applies to gfx942's fp8 MATRIX CORE, which this op
+does not touch), and the scale is **ue8m0 at a 32-element block** --
+`weight_block_size` is `[32, 32]` in V4.1's `quantization_config`, not V4's
+`[128, 128]`, which is why `engram.embed.scale` is `[rows, 8]` for a 256-wide
+row. The shard mask is compared as SIGNED: an unsigned `id - vocab_start` turns
+an id below the window into a huge in-range-looking index and reads past the
+shard, so the test plants ids on both sides and at both boundaries.
 
 Three things in the gate that look like details and are not, each recorded
 because getting one wrong compiles, runs, and is a different model:
@@ -608,9 +620,10 @@ because getting one wrong compiles, runs, and is a different model:
   are masked, and the test asserts the masked token comes back bit-identical
   rather than merely close.
 
-What is still missing for Engram is stage 2's gather -- 24 fp8 row reads per
-token out of a 98.3 GB sharded table with a block-scale dequant -- plus the host
-side of stage 1. Neither is new math; both are plumbing.
+What is still missing for Engram is stage 1's host side: the compressed-token
+map, the per-layer hash multipliers and the prime bucket ranges, all built from
+the tokenizer at load time, plus the per-step cache that lets an n-gram look
+back across the prefill/decode split. No new math, and no kernel.
 
 **Engram is a CAPACITY problem, not a bandwidth one.** From the checkpoint:
 

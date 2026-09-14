@@ -129,7 +129,10 @@ pub fn op_classes(op: DevOp) -> &'static [&'static str] {
 
         Argmax | ArgmaxFin | GemvArgmax | RowGather | ArgmaxF32 => &["sample"],
 
-        Nop | Residual | Glu | Embed | SoftCap | QuantFp8 | SituGlu | ZeroF32 | CastF32Bf16
+        // Engram's table read is a gather-and-dequantize, the same shape of work as `Embed`
+        // and `RowGather` -- no reduction, no coupling between rows.
+        EngramEmbed
+        | Nop | Residual | Glu | Embed | SoftCap | QuantFp8 | SituGlu | ZeroF32 | CastF32Bf16
         | PerLayerInput | ScaledAddF32 | GluF32 | SiluF32 | ReluF32 | BroadcastAddF32 | EmbedF16F32
         | EmbedOverlayBf16 | PackNcfwRowsF32 => &["elementwise"],
     }

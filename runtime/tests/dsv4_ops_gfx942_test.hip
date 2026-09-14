@@ -450,6 +450,98 @@ static void engram_case(unsigned T, unsigned n, unsigned hidden, int masked_at) 
     hipFree(dX); hipFree(dKv); hipFree(dQ); hipFree(dK); hipFree(dM);
 }
 
+
+/* One OCP e4m3 byte -> double, by the format's definition rather than by calling the device
+ * helper: this is the ORACLE, so it must not share code with what it checks. Bias 7, and the
+ * all-ones exponent with a full mantissa is the only NaN. */
+static double ocp_e4m3(unsigned char b) {
+    const int sgn = (b >> 7) & 1, e = (b >> 3) & 0xF, m = b & 0x7;
+    const double s = sgn ? -1.0 : 1.0;
+    if (e == 0) return s * std::ldexp((double)m / 8.0, -6); /* subnormal: 2^-6 * m/8 */
+    return s * std::ldexp(1.0 + (double)m / 8.0, e - 7);
+}
+
+
+__global__ __launch_bounds__(256, 1) void k_engembed(bf16* out, const unsigned char* table,
+                                                     const unsigned char* scale, const int* ids,
+                                                     unsigned T, unsigned n_cols,
+                                                     unsigned head_dim, unsigned blk,
+                                                     unsigned vocab_start, unsigned part_rows) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    d_engram_embed(out, table, scale, ids, T, n_cols, head_dim, blk, vocab_start, part_rows,
+                   blockIdx.x, gridDim.x);
+#endif
+}
+
+/* Engram's gathered table read, against a host dequant of the same bytes.
+ *
+ * The SHARD MASK is the half worth testing hardest: ids below `vocab_start` and ids past the end
+ * of this rank's rows must both produce zeros, and the low side is the one that bites -- an
+ * unsigned `id - vocab_start` turns a below-range id into a huge in-range-looking index and reads
+ * straight past the shard. So the case deliberately plants ids on both sides and at both
+ * boundaries. */
+static void engembed_case(unsigned T, unsigned n_cols, unsigned head_dim, unsigned blk,
+                          unsigned vocab_start, unsigned part_rows) {
+    const unsigned width = n_cols * head_dim, spr = head_dim / blk;
+    std::vector<unsigned char> table((size_t)part_rows * head_dim);
+    std::vector<unsigned char> scale((size_t)part_rows * spr);
+    for (auto& v : table) v = (unsigned char)(std::rand() & 0xFF);
+    /* e8m0 around 2^0: 127 +/- 3, so the scales are ordinary small powers of two and a wrong
+     * block index shows up as a factor of 2..8 rather than hiding in the noise. */
+    for (auto& v : scale) v = (unsigned char)(124 + (std::rand() % 7));
+
+    std::vector<int> ids((size_t)T * n_cols);
+    for (size_t i = 0; i < ids.size(); i++)
+        ids[i] = (int)(vocab_start + (unsigned)(std::rand() % (int)part_rows));
+    /* Plant the out-of-range cases: below the window, at its first and last row, and past it. */
+    ids[0] = (int)vocab_start - 1;
+    ids[1] = (int)vocab_start;
+    ids[2] = (int)(vocab_start + part_rows - 1);
+    ids[3] = (int)(vocab_start + part_rows);
+    ids[4] = 0;
+
+    std::vector<bf16> out((size_t)T * width, f2b(-1.0f));
+    auto* dT = up(table);
+    auto* dS = up(scale);
+    auto* dI = up(ids);
+    auto* dO = up(out);
+    hipLaunchKernelGGL(k_engembed, dim3(T < 64 ? T : 64), dim3(256), 0, 0, dO, dT, dS, dI, T,
+                       n_cols, head_dim, blk, vocab_start, part_rows);
+    ck(hipDeviceSynchronize());
+    ck(hipMemcpy(out.data(), dO, out.size() * sizeof(bf16), hipMemcpyDeviceToHost));
+
+    double worst = 0.0;
+    int zeroed = 0, nonzero = 0, bad_zero = 0;
+    for (unsigned t = 0; t < T; t++)
+        for (unsigned c = 0; c < n_cols; c++) {
+            const long long local = (long long)ids[(size_t)t * n_cols + c] - (long long)vocab_start;
+            const bool in = local >= 0 && local < (long long)part_rows;
+            for (unsigned d = 0; d < head_dim; d++) {
+                const double got = b2f(out[(size_t)t * width + c * head_dim + d]);
+                if (!in) {
+                    if (got != 0.0) bad_zero++;
+                    zeroed++;
+                    continue;
+                }
+                const size_t r = (size_t)local;
+                /* host dequant: OCP e4m3 byte, times 2^(e8m0 - 127) for this 32-block */
+                const double v = ocp_e4m3(table[r * head_dim + d]);
+                const double sc = std::ldexp(1.0, (int)scale[r * spr + d / blk] - 127);
+                const double want = v * sc;
+                if (want != 0.0) nonzero++;
+                const double den = std::max(1.0, std::fabs(want));
+                worst = std::max(worst, std::fabs(got - want) / den);
+            }
+        }
+    char det[192];
+    std::snprintf(det, sizeof det,
+                  "(T=%u cols=%u hd=%u blk=%u worst rel %.2e, %d masked elems all zero=%d, %d "
+                  "non-zero reads)",
+                  T, n_cols, head_dim, blk, worst, zeroed, bad_zero == 0, nonzero);
+    say("engram gathered table read", worst < 5e-3 && bad_zero == 0 && nonzero > 0, det);
+    hipFree(dT); hipFree(dS); hipFree(dI); hipFree(dO);
+}
+
 int main() {
     std::printf("DeepSeek-V4 router / mHC-head / inverse-RoPE / clamped-SwiGLU / engram arms\n");
     router_case("router SIGMOID+norm (SHIPPED, must not move)", 256, 8, SIG | NORM, 1.0f, true);
@@ -468,6 +560,8 @@ int main() {
     engram_case(7, 4, 5120, -1);
     engram_case(5, 4, 5120, 2);
     engram_case(3, 4, 512, 1);
+    engembed_case(6, 24, 256, 32, 1000, 4096);
+    engembed_case(4, 8, 256, 32, 0, 512);
     std::printf("%s (%d failures)\n", fails ? "FAIL" : "PASS", fails);
     return fails ? 1 : 0;
 }

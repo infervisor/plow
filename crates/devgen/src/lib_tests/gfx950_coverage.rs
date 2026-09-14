@@ -285,6 +285,12 @@ const GFX950_UNEMITTED: &[(&str, &str)] = &[
     // The prefill twin (`emit_glm_dsa_prefill_select`) and `glm53.rs` itself are still
     // pending; HyperConnPre/HyperConnPost below remain unrouted until glm53.rs exists.
     (
+        "PLOW_DOP_ENGRAM_EMBED",
+        "DeepSeek-V4.1 Engram's gathered table read (op 183), the sibling of ENGRAM_GATE below \
+          and unemitted for the same reason. Both arrive with the `deepseek_v41` arm, which also \
+          owns the one stage that is NOT an opcode: the host-side n-gram hash.",
+    ),
+    (
         "PLOW_DOP_ENGRAM_GATE",
         "DeepSeek-V4.1 Engram's gate + mix (op 182). The kernel and its gfx942 test landed with \
           the opcode; the emit side arrives with the `deepseek_v41` arm, which also has to build \

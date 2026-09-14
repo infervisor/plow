@@ -559,6 +559,7 @@ pub fn classify(op: DevOp) -> OpClass {
 
         // ---- hyper-connections (GLM5-Next) ------------------------------
         DevOp::EngramGate => a_rows("i0=T; t4=token_mask[T] is per row"),
+        DevOp::EngramEmbed => a_rows("i0=T; t3=ids[T][n_cols] is per row"),
         DevOp::HyperConnPre => a_rows("i0=T"),
         DevOp::HyperConnPost => a_rows("i0=T"),
         DevOp::AttnRes => note(
