@@ -504,6 +504,7 @@ fn cfg_gemma3(v: &Value) -> Cfg {
         moe_inter: 0,
         ple: 0,
         kv_shared: 0,
+        double_wide_mlp: false,
     }
 }
 

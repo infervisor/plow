@@ -368,6 +368,25 @@ fn hd128_cache_geometry_is_valid() {
 }
 
 #[test]
+fn identical_shared_cache_readers_are_canonicalized() {
+    validate_all(None, |insts, _| {
+        let reader = insts[0];
+        insts.push(reader);
+    })
+    .unwrap();
+}
+
+#[test]
+fn conflicting_shared_cache_geometry_is_rejected() {
+    assert!(validate_all(None, |insts, _| {
+        let mut reader = insts[0];
+        reader.i[6] = 128;
+        insts.push(reader);
+    })
+    .is_err());
+}
+
+#[test]
 fn flat_mxfp4_moe_operands_are_direct_and_cannot_alias_kv() {
     for op in [
         DevOp::MoeRouterTopkPf,
@@ -413,6 +432,17 @@ fn dense_mxfp4_operands_are_direct_and_cannot_alias_kv() {
         })
         .is_err());
     }
+}
+
+#[test]
+fn per_layer_input_operands_are_direct_and_cannot_alias_kv() {
+    validate_all(None, |insts, _| insts.push(inst(DevOp::PerLayerInput))).unwrap();
+    assert!(validate_all(None, |insts, _| {
+        let mut d = inst(DevOp::PerLayerInput);
+        d.t[0] = 2;
+        insts.push(d);
+    })
+    .is_err());
 }
 
 #[test]

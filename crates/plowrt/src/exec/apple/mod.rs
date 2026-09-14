@@ -2058,7 +2058,7 @@ impl MetalEngine {
             .blob
             .progs
             .get(prog)
-            .filter(|p| !p.packed_prefill_only)
+            .filter(|p| p.role.is_prefill_bucket())
             .map(|p| p.t as usize)
             .ok_or_else(|| RuntimeError::Rejected("invalid Metal packed prefill program".into()))?;
         let mut requests = Vec::with_capacity(spans.len());
