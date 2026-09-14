@@ -220,9 +220,7 @@ pub async fn completions(
         arrived: std::time::Instant::now(),
         respond: tx,
     };
-    let submitted = mux.submit_arrived(job, t_arrive);
-    drop(ingress);
-    if let Err(err) = submitted {
+    if let Err(err) = mux.submit_arrived(job, t_arrive, Some(ingress)) {
         return match err {
             crate::serve::mux::SubmitError::Full(_) => {
                 crate::serve::api_error(

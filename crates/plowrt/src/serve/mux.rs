@@ -152,6 +152,9 @@ pub struct MuxConfig {
     /// Maximum requests waiting outside the engine slot table. `0` derives a
     /// bound of four full engine batches.
     pub max_queued_requests: usize,
+    /// Skip or end the cold-start hold once nothing else is queued or tokenizing
+    /// (`PLOW_IDLE_DISPATCH`).
+    pub idle_dispatch: bool,
 }
 
 impl Default for MuxConfig {
@@ -162,6 +165,7 @@ impl Default for MuxConfig {
             multi_step: true,
             queue_depth: 0,
             max_queued_requests: 0,
+            idle_dispatch: crate::config::RuntimeConfig::get().idle_dispatch,
         }
     }
 }
@@ -194,7 +198,7 @@ pub struct ModelMux {
 }
 
 /// Holds one count in [`ModelMux::ingress`] until dropped.
-pub(crate) struct IngressGuard<'a>(&'a std::sync::atomic::AtomicUsize);
+pub struct IngressGuard<'a>(&'a std::sync::atomic::AtomicUsize);
 
 impl Drop for IngressGuard<'_> {
     fn drop(&mut self) {
@@ -291,8 +295,8 @@ fn completed_decode(feeds: &[(usize, u32)], steps: usize) -> Option<DecodeProgre
 }
 
 impl ModelMux {
-    /// Count a request as pending before it tokenizes; drop the guard after `submit_arrived`.
-    pub(crate) fn ingress(&self) -> IngressGuard<'_> {
+    /// Count a request as pending before it tokenizes; hand the guard to `submit_arrived`.
+    pub fn ingress(&self) -> IngressGuard<'_> {
         self.ingress.fetch_add(1, Ordering::Relaxed);
         IngressGuard(&self.ingress)
     }
@@ -300,17 +304,20 @@ impl ModelMux {
     /// Submit a job. Returns immediately; the caller awaits the stream.
     pub fn submit(&self, job: Job) -> std::result::Result<(), SubmitError> {
         let arrived = job.arrived;
-        self.submit_arrived(job, arrived)
+        self.submit_arrived(job, arrived, None)
     }
 
-    pub(crate) fn submit_arrived(
+    pub fn submit_arrived(
         &self,
         job: Job,
         arrived: Instant,
+        ingress: Option<IngressGuard<'_>>,
     ) -> std::result::Result<(), SubmitError> {
         Metrics::inc(&self.metrics.requests);
         self.metrics.serving.max_tokens.tokens(job.gen.max_tokens);
         Metrics::inc(&self.metrics.queued_requests);
+        // Released before the send: a dispatcher that dequeues this job must not see it as a peer.
+        drop(ingress);
         match self.tx.try_send(MuxMsg::Job(job, arrived)) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(MuxMsg::Job(job, _))) => {
@@ -431,7 +438,6 @@ pub fn spawn(
     let preempt_wake = Arc::clone(&preempt_notify);
     let ingress = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let ingress_seen = Arc::clone(&ingress);
-    let idle_dispatch = crate::config::RuntimeConfig::get().idle_dispatch;
     let metrics = state.model_metrics(&slug);
     let handle_metrics = Arc::clone(&metrics);
 
@@ -721,7 +727,7 @@ pub fn spawn(
                     cold_start_hold_ms(
                         lambda,
                         cfg.max_hold_ms,
-                        idle_dispatch,
+                        cfg.idle_dispatch,
                         rx.len() + ingress_seen.load(Ordering::Relaxed),
                     )
                 } else {
@@ -741,16 +747,24 @@ pub fn spawn(
                             Ok(Some(msg)) => {
                                 note_dequeued(&msg, &metrics);
                                 match msg {
-                                    MuxMsg::Job(job, arrived) => admit_into(
-                                        &mut slots[..admission_limit],
-                                        job,
-                                        arrived,
-                                        &mut load,
-                                        &mut last_arrival,
-                                        arena.as_ref(),
-                                        &metrics,
-                                        &health,
-                                    ),
+                                    MuxMsg::Job(job, arrived) => {
+                                        admit_into(
+                                            &mut slots[..admission_limit],
+                                            job,
+                                            arrived,
+                                            &mut load,
+                                            &mut last_arrival,
+                                            arena.as_ref(),
+                                            &metrics,
+                                            &health,
+                                        );
+                                        if cfg.idle_dispatch
+                                            && rx.is_empty()
+                                            && ingress_seen.load(Ordering::Relaxed) == 0
+                                        {
+                                            break;
+                                        }
+                                    }
                                     MuxMsg::Drain(done) => {
                                         draining = true;
                                         drain_done = Some(done);
