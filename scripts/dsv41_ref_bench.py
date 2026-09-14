@@ -82,6 +82,18 @@ def _use_system_toolchain() -> None:
         if os.path.exists(exe):
             os.environ[var] = exe
 
+    # tilelang's HIP backend has no UE8M0 type -- upstream hip_fp8.h says
+    # "E8M0 types are not supported in current HIP version" and leaves the
+    # alias commented out -- but every block scale in this checkpoint is
+    # F8_E8M0, so act_quant and both quantized GEMMs emit `fp8_e8_t` and fail
+    # to compile on ROCm. scripts/dsv41_tl_hip_ue8m0.py writes a private copy
+    # of the templates with the type added; point tilelang at it. Must be set
+    # before tilelang is imported (tilelang/env.py:495 only defaults it when
+    # unset), and kept out of the shared venv, which other campaigns use.
+    tpl = "/workspace/dsv41-tl-templates/src"
+    if os.path.isdir(tpl):
+        os.environ["TL_TEMPLATE_PATH"] = tpl
+
 
 # Must run BEFORE `model` pulls in tilelang -> tvm, which freezes both the
 # compiler used for host-side linking and the target triple at import time.
