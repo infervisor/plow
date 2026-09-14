@@ -22,7 +22,10 @@ Raw command output stays in a temporary directory under ``/tmp``.
 
 Attention profiles expand the packet rung over explicit live-KV buckets and
 boundary-adjacent global histories through 16K plus local-window/ring histories.
-Packed homogeneous and ragged request tables are distinct profiles. Compiled
+Packed homogeneous and ragged request tables are distinct profiles at every
+selected concurrency rung. Each profile records the serving cells and chunk
+count it affects, so kernel cost rank follows the production ladder rather
+than a topology-free microbenchmark subtotal. Compiled
 profiles identify the GPU object, symbol, launch geometry, tile, resource
 budgets, BQ/BKV, split count, occupancy, pipeline, memory path, spills, and
 segment mode. Evidence for one object therefore cannot be silently applied to
@@ -243,25 +246,33 @@ def _validate_decode_gemma_shapes(rung, gemm, attention):
         raise CampaignError(f"decode rung {rung}: attention shapes/counts differ from Gemma-4-12B")
 
 
-def _prefill_topologies(rung, topology, max_concurrency):
-    active = min(rung, max_concurrency)
-    rows_lo, extra = divmod(rung, active)
-    result = [
-        {"request_topology": "single", "packed_topology": "single",
-         "concurrency": 1, "active_requests": 1,
-         "rows_per_request_min": rung, "rows_per_request_max": rung,
-         "history_layout": "homogeneous"},
-        {"request_topology": "packed_homogeneous", "packed_topology": topology,
-         "concurrency": active, "target_concurrency": max_concurrency,
-         "active_requests": active, "rows_per_request_min": rows_lo,
-         "rows_per_request_max": rows_lo + bool(extra),
-         "history_layout": "homogeneous"},
-    ]
-    if active > 1:
-        result.append({
-            **result[-1], "request_topology": "packed_ragged",
-            "history_layout": "ragged",
-        })
+def _prefill_topologies(rung, topology, concurrency_rungs):
+    concurrency_rungs = _rung_list(concurrency_rungs)
+    result = []
+    for target in concurrency_rungs:
+        active = min(rung, target)
+        rows_lo, extra = divmod(rung, active)
+        if target == 1:
+            result.append({
+                "request_topology": "single", "packed_topology": "single",
+                "concurrency": 1, "target_concurrency": 1, "active_requests": 1,
+                "rows_per_request_min": rung, "rows_per_request_max": rung,
+                "history_layout": "homogeneous",
+            })
+            continue
+        homogeneous = {
+            "request_topology": "packed_homogeneous", "packed_topology": topology,
+            "concurrency": target, "target_concurrency": target,
+            "active_requests": active, "rows_per_request_min": rows_lo,
+            "rows_per_request_max": rows_lo + bool(extra),
+            "history_layout": "homogeneous",
+        }
+        result.append(homogeneous)
+        if active > 1:
+            result.append({
+                **homogeneous, "request_topology": "packed_ragged",
+                "history_layout": "ragged",
+            })
     return tuple(result)
 
 
@@ -320,6 +331,7 @@ def audit_inventory(
     prefill_rungs=None,
     decode_rungs=None,
     context_rungs=None,
+    concurrency_rungs=None,
 ):
     use_legacy_kv_grid = context_rungs is None
     prefill = [p for p in audit.get("programs", []) if p.get("phase") == "prefill"]
@@ -339,6 +351,7 @@ def audit_inventory(
     if missing:
         raise CampaignError(f"packet audit is missing decode rungs {sorted(missing)}")
     context_rungs = tuple(context_rungs or CONTEXTS)
+    concurrency_rungs = tuple(concurrency_rungs or _rung_list(max_concurrency))
     maximum_context = max(context_rungs)
     if use_legacy_kv_grid:
         global_lengths = GLOBAL_KV_LENGTHS
@@ -381,7 +394,7 @@ def audit_inventory(
             if not valid_layout:
                 raise CampaignError(f"rung {rung}: invalid Gemma KV ring layout")
         before = len(profiles)
-        for request in _prefill_topologies(rung, topology, max_concurrency):
+        for request in _prefill_topologies(rung, topology, concurrency_rungs):
             for (dispatch_arm, m, n, k), occurrences in sorted(gemm.items()):
                 profile = {
                     "arch": arch,
@@ -643,6 +656,12 @@ def run_kernels(spec, profiles, cwd, env):
                 "weighted_control_us": control * profile["occurrences"],
                 "weighted_candidate_us": candidate * profile["occurrences"],
                 "weighted_noise_floor_us": noise * profile["occurrences"],
+                "campaign_weighted_control_us": control * profile.get(
+                    "campaign_occurrences", profile["occurrences"]
+                ),
+                "campaign_weighted_candidate_us": candidate * profile.get(
+                    "campaign_occurrences", profile["occurrences"]
+                ),
                 "compiled_profile": measurements["candidate"]["compiled_profile"],
             }
         )
@@ -1055,7 +1074,11 @@ def gate_kernels(rows, gates):
     for row in rows:
         if row["candidate_us"] > row["control_us"] * regression:
             failures.append(f"{row['profile_key']} regressed by {row['candidate_us']/row['control_us']:.4f}x")
-    ranked = sorted(rows, key=lambda x: x["weighted_control_us"], reverse=True)
+    ranked = sorted(
+        rows,
+        key=lambda x: x.get("campaign_weighted_control_us", x["weighted_control_us"]),
+        reverse=True,
+    )
     for rank, row in enumerate(ranked, 1):
         row["cost_rank"] = rank
         row["weighted_savings_us"] = row["weighted_control_us"] - row["weighted_candidate_us"]
@@ -1273,11 +1296,69 @@ def campaign_axes(spec, audit):
     }
 
 
+def serving_ladder(axes, output_tokens):
+    return [
+        {
+            "order": order,
+            "rung_key": f"ctx{context}/c{concurrency}",
+            "context": context,
+            "concurrency": concurrency,
+            "prefill_bucket": _prefill_execution(context, axes["prefill"])[0],
+            "prefill_chunks": _prefill_execution(context, axes["prefill"])[1],
+            "decode_bucket": _decode_execution(concurrency, axes["decode"]),
+            "decode_steps": output_tokens - 1,
+        }
+        for order, (context, concurrency) in enumerate(
+            (
+                (context, concurrency)
+                for context in axes["context"]
+                for concurrency in axes["concurrency"]
+            ),
+            1,
+        )
+    ]
+
+
+def bind_serving_impact(profiles, serving_rungs):
+    for profile in profiles:
+        matches_context = lambda cell: (
+            profile["family"] != "attention"
+            or cell["context"] == profile["live_kv_bucket"]
+        )
+        if profile["phase"] == "prefill":
+            matches = [
+                (cell, cell["prefill_chunks"])
+                for cell in serving_rungs
+                if cell["prefill_bucket"] == profile["rung"]
+                and cell["concurrency"] == profile["concurrency"]
+                and matches_context(cell)
+            ]
+        else:
+            matches = [
+                (cell, cell["decode_steps"])
+                for cell in serving_rungs
+                if cell["decode_bucket"] == profile["rung"]
+                and cell["concurrency"] == profile["concurrency"]
+                and matches_context(cell)
+            ]
+        profile["serving_impact"] = [
+            {"rung_key": cell["rung_key"], "executions": executions}
+            for cell, executions in matches
+        ]
+        profile["campaign_occurrences"] = profile["occurrences"] * sum(
+            executions for _, executions in matches
+        )
+
+
 def campaign_plan(spec):
     audit = read_json(spec["audit"])
     if not SHA256.fullmatch(str(audit.get("packet_sha256", ""))):
         raise CampaignError("packet audit has no valid packet SHA256")
     axes = campaign_axes(spec, audit)
+    output_tokens = spec.get("serving_output_tokens", 128)
+    if type(output_tokens) is not int or output_tokens <= 1:
+        raise CampaignError("serving_output_tokens must be an integer greater than one")
+    serving_rungs = serving_ladder(axes, output_tokens)
     profiles, rungs, decode_rungs = audit_inventory(
         audit,
         spec["arch"],
@@ -1287,13 +1368,19 @@ def campaign_plan(spec):
         axes["prefill"],
         axes["decode"],
         axes["context"],
+        axes["concurrency"],
     )
     kernel_families = tuple(spec.get("kernel_families", ("gemm", "attention")))
     profiles = [profile for profile in profiles if profile["family"] in kernel_families]
+    bind_serving_impact(profiles, serving_rungs)
+    profiles.sort(key=lambda profile: (-profile["campaign_occurrences"], profile["profile_key"]))
+    for rank, profile in enumerate(profiles, 1):
+        profile["optimization_rank"] = rank
+        profile["validation_only"] = profile["campaign_occurrences"] == 0
     global_lengths = _boundary_lengths(axes["context"], max(axes["context"]))
     local_boundaries = tuple(sorted(set(axes["context"]) | {1, 32, 64, 256, 512, 2048}))
     return {
-        "schema_version": 4,
+        "schema_version": 5,
         "model": "google/gemma-4-12B-it",
         "packet_sha256": audit.get("packet_sha256"),
         "architecture": spec["arch"],
@@ -1308,18 +1395,8 @@ def campaign_plan(spec):
             "local": list(_boundary_lengths(local_boundaries, max(axes["context"]))),
         },
         "live_kv_buckets": list(axes["context"]),
-        "serving_rungs": [
-            {
-                "rung_key": f"ctx{context}/c{concurrency}",
-                "context": context,
-                "concurrency": concurrency,
-                "prefill_bucket": _prefill_execution(context, axes["prefill"])[0],
-                "prefill_chunks": _prefill_execution(context, axes["prefill"])[1],
-                "decode_bucket": _decode_execution(concurrency, axes["decode"]),
-            }
-            for context in axes["context"]
-            for concurrency in axes["concurrency"]
-        ],
+        "serving_output_tokens": output_tokens,
+        "serving_rungs": serving_rungs,
         "profile_count": len(profiles),
         "profiles": profiles,
     }

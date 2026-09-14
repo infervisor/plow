@@ -117,7 +117,7 @@ class Gemma4LadderCampaignTests(unittest.TestCase):
         self.assertEqual(plan["axes"]["prefill"], [128, 512, 1024])
         self.assertEqual(plan["axes"]["decode"], [1, 2, 4, 8, 16, 32, 64, 128])
         self.assertEqual(plan["axes"]["concurrency"], [1, 2, 4, 8, 16, 32, 64, 128])
-        self.assertEqual(plan["schema_version"], 4)
+        self.assertEqual(plan["schema_version"], 5)
         self.assertEqual(len(plan["serving_rungs"]), 40)
         self.assertEqual(plan["live_kv_buckets"], [128, 1024, 4096, 8192, 16384])
         full_attention = {
@@ -135,6 +135,44 @@ class Gemma4LadderCampaignTests(unittest.TestCase):
         rung = next(row for row in plan["serving_rungs"] if row["rung_key"] == "ctx8192/c128")
         self.assertEqual((rung["prefill_bucket"], rung["prefill_chunks"]), (1024, 8))
         self.assertEqual(rung["decode_bucket"], 128)
+        self.assertEqual((rung["order"], rung["decode_steps"]), (32, 127))
+        gemm = next(
+            profile for profile in plan["profiles"]
+            if profile["phase"] == "prefill" and profile["family"] == "gemm"
+            and profile["rung"] == 1024 and profile["concurrency"] == 16
+            and profile["request_topology"] == "packed_homogeneous"
+            and (profile["n"], profile["k"]) == (15360, 3840)
+        )
+        self.assertEqual(
+            gemm["serving_impact"],
+            [
+                {"rung_key": "ctx1024/c16", "executions": 1},
+                {"rung_key": "ctx4096/c16", "executions": 4},
+                {"rung_key": "ctx8192/c16", "executions": 8},
+                {"rung_key": "ctx16384/c16", "executions": 16},
+            ],
+        )
+        self.assertEqual(gemm["campaign_occurrences"], 96 * 29)
+        self.assertEqual(
+            [profile["optimization_rank"] for profile in plan["profiles"]],
+            list(range(1, len(plan["profiles"]) + 1)),
+        )
+        self.assertEqual(
+            [profile["campaign_occurrences"] for profile in plan["profiles"]],
+            sorted(
+                (profile["campaign_occurrences"] for profile in plan["profiles"]),
+                reverse=True,
+            ),
+        )
+
+    def test_focused_prefill_topology_has_only_selected_concurrency(self):
+        topologies = campaign._prefill_topologies(1024, "unified", (16,))
+        self.assertEqual(len(topologies), 2)
+        self.assertEqual({row["concurrency"] for row in topologies}, {16})
+        self.assertEqual(
+            {row["request_topology"] for row in topologies},
+            {"packed_homogeneous", "packed_ragged"},
+        )
 
     def test_plan_rejects_decode_ladder_that_cannot_cover_concurrency(self):
         audit = audit_fixture()
