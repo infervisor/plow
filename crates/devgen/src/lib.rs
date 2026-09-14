@@ -7729,6 +7729,37 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
         }
         mla::kimi_k3_emit(&dir, ctx, tp, block_spec.as_deref());
     }
+    // DeepSeek-V4.1-Flash (`deepseek_v41`, text tower `deepseek_v41_text`). Claimed HERE for the
+    // same reason `kimi_k3` above is: it nests its geometry under `text_config`, which `cfg_from`
+    // (crates/devgen/src/config.rs) treats as "Gemma-4 multimodal" unconditionally, so an
+    // unclaimed checkpoint dies unwrapping Gemma's `layer_types` -- an error naming the wrong
+    // field of the wrong architecture, which is worse than no support at all.
+    //
+    // It is ALSO the case that the `kimi`/`deepseek_v3` arm below would parse V4.1's MLA keys:
+    // they have the same spelling. That arm has no CSA2, no Engram and no two-level indexer, so
+    // it would emit a blob for a model this is not, and the blob would run. Hence a claim that
+    // refuses rather than an arm that is absent.
+    //
+    // What is actually missing is tracked in docs/amd/deepseek-v41-flash-mi300x.md section 5.6.
+    // mHC is NOT in the list: `glm53_emit_full` already emits ops 128/129 at V4.1's own constants
+    // (hc_mult 4, sinkhorn 20) reading V4.1's own tensor names, so the full-model emit forks that
+    // rather than starting over.
+    if model_type == "deepseek_v41" || model_type == "deepseek_v41_text" {
+        panic!(
+            "deepseek_v41: no device emit yet, and this refuses rather than emitting a wrong \
+             model. The runtime side is ready except for two things -- mHC, the DSA indexer, the \
+             MXFP4 experts, the clamped SwiGLU and the CSA2 kernels (ops 180/181) all dispatch \
+             today. What the emitter still needs: (1) CSA2 emit -- the compressor runs on the 4 \
+             layers named by `kv_source_layer_ids` and every other layer READS that cache, so a \
+             per-layer compressor is the wrong shape; (2) the two-level indexer -- \
+             `index_source_layer_ids` has 8 layers but only the 4 that are also \
+             `kv_source_layer_ids` own index keys; (3) Engram at `engram_layer_ids`, which has no \
+             kernel anywhere in the tree; (4) the V4.1 config/tensor binding itself. See \
+             docs/amd/deepseek-v41-flash-mi300x.md section 5.6 for the ordered path. \
+             `--block` is not a shortcut here: `hc_mult` puts mHC on EVERY layer, so there is no \
+             mHC-free block to extract."
+        );
+    }
     if model_type == "glm5_next" {
         assert!(
             block_spec.is_none(),
