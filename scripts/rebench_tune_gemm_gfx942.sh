@@ -136,6 +136,21 @@ echo "=== 4/5  measuring and publishing (ROCR_VISIBLE_DEVICES=$ROCR)"
 # With both set the demand is 48 distinct shapes. The remaining three are the recipe's shipping
 # knobs; they do not change the shape set (checked), but the campaign should observe the compile
 # that ships rather than a neighbour of it.
+#
+# PLOW_TUNE_REPLAY=<build.json> closes that gap, and as of 2026-09-14 it is not optional for GLM.
+# `PLOW_GLM_GEMM_LT_PF_EXT` now DEFAULTS to "o_proj,band,shared" on a GLM target
+# (knob_spec.rs GLM_GEMM_LT_PF_EXT_DEFAULT), and `emit_glm_lt_ext` asserts
+# `(2048..=8192).contains(&t)` with band rows 256 or 1024. plowc's default `--seq` is
+# 512,2048,8192, so the 512 bucket reaches that assert and the campaign ABORTS mid-measurement:
+#
+#   panicked at crates/devgen/src/mla.rs:5461:
+#   PLOW_GLM_GEMM_LT_PF_EXT requires gfx942 TP8 GLM prefill (band rows 256 or 1024)
+#
+# The shipping packet does not hit it because its build.json predates that default and records
+# `PLOW_GLM_GEMM_LT=true` with no `_PF_EXT` entry at all, so replaying its knobs is both the
+# correct campaign (measure what ships) and the thing that keeps the emit off the assert.
+REPLAY_FLAG=""
+[ -z "${PLOW_TUNE_REPLAY:-}" ] || REPLAY_FLAG="--replay-knobs $PLOW_TUNE_REPLAY"
 "$NIX" develop "$WT" -c bash -c \
   "set -euo pipefail; cd '$WT'; \
    export LD_LIBRARY_PATH=\"\${LD_LIBRARY_PATH:-}:$ROCM/lib\"; \
@@ -143,7 +158,7 @@ echo "=== 4/5  measuring and publishing (ROCR_VISIBLE_DEVICES=$ROCR)"
    export ROCR_VISIBLE_DEVICES=$ROCR; unset HIP_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES; \
    export GLM_FULL=1 PLOW_MLA_PREFILL=full GLM_MOE_CORESIDENT=2 GLM_SHARED_CUS=48 GLM_SHARD_HEAD=1; \
    ./target/release/plowc --hf-dir '$HF' --max-ctx $MAXCTX --n-cu $NCU --num-gpus $NGPU \
-       --gpu MI300X --arch gfx942 \
+       --gpu MI300X --arch gfx942 $REPLAY_FLAG \
        tune gemm --gpu MI300X --root . --obj '$OBJ' \
        --samples '$OUT/bf16.jsonl' --campaign gfx942-mi300x-gemm-tile"
 
