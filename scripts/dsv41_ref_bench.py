@@ -26,6 +26,26 @@ import torch
 import torch.distributed as dist
 from transformers import AutoTokenizer
 
+
+def _unnix_ld_path() -> None:
+    """Drop the nix entries from LD_LIBRARY_PATH now that torch is imported.
+
+    The vllm-python wrapper puts nix glibc/gcc first so `import torch` resolves;
+    those libraries are mapped by the time this runs. But tilelang JIT-compiles
+    its HIP kernels at the first call of every kernel shape and SHELLS OUT to do
+    it, and the child `sh` then loads the same nix glibc against the system
+    loader:
+
+        sh: symbol lookup error: .../glibc-2.42-67/lib/libc.so.6:
+            undefined symbol: __tunable_is_initialized, version GLIBC_PRIVATE
+
+    which fails every kernel compile and so every forward. Keep the ROCm entry
+    -- torch still dlopens from it -- and drop only /nix/store.
+    """
+    parts = os.environ.get("LD_LIBRARY_PATH", "").split(":")
+    kept = [p for p in parts if p and not p.startswith("/nix/store")]
+    os.environ["LD_LIBRARY_PATH"] = ":".join(kept)
+
 from model import ModelArgs, Transformer  # from the checkpoint's inference/
 from generate import load_model
 
@@ -41,6 +61,7 @@ def main() -> None:
     p.add_argument("--max-seq-len", type=int, default=16384)
     p.add_argument("--json-out", default="")
     args_cli = p.parse_args()
+    _unnix_ld_path()
 
     world_size = int(os.getenv("WORLD_SIZE", "1"))
     rank = int(os.getenv("RANK", "0"))
