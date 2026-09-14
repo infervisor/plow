@@ -244,6 +244,82 @@ impl DeepSeekV41Config {
         self.is_kv_source(layer) && self.compress_ratios[layer as usize] > 1
     }
 
+    /// Engram's n-gram hash tables: one multiplier per (engram layer, lookback), and one
+    /// prime-sized bucket range per (engram layer, n-gram size, head) with the offset it
+    /// starts at.
+    ///
+    /// THE PRIMES ARE DERIVED AND SELF-CHECKING. The reference walks upward from
+    /// `engram_vocab_size - 1` with `sympy.isprime`, handing each (n-gram size, head) pair the
+    /// next prime never yet handed out -- a single GLOBAL walk across all engram layers, which
+    /// is what keeps the ranges disjoint. A plain trial-division walk reproduces it, and the
+    /// result proves itself: each layer's primes must SUM to that layer's
+    /// `engram_num_embeddings`, because the table is exactly those ranges laid end to end.
+    /// [`Self::validate`] asserts it, so a wrong walk cannot reach a lookup.
+    ///
+    /// THE MULTIPLIERS ARE CONSTANTS, and that is deliberate. The reference draws them from
+    /// `np.random.default_rng(10007 * layer_id).integers(...)` -- numpy's PCG64 plus its
+    /// bounded-integer algorithm. Reproducing that bit-exactly in Rust is a real undertaking
+    /// whose failure mode is silent: every hash comes out wrong and the model merely gets worse.
+    /// The draw is also TINY -- one value per (layer, lookback), eight numbers for the released
+    /// checkpoint -- so they are what they actually are, fixed constants of that checkpoint,
+    /// extracted once rather than re-derived. Any OTHER V4.1 checkpoint needs its own extraction;
+    /// [`Self::engram_hash_tables`] returns `None` rather than guessing when the shape it was
+    /// extracted for does not match.
+    pub fn engram_hash_tables(&self) -> Option<EngramHashTables> {
+        /// Extracted from the released DeepSeek-V4.1-Flash with numpy, indexed
+        /// `[engram layer][lookback]`. Valid only for `engram_layer_ids == [1, 14]`,
+        /// `engram_max_ngram_size == 4` and `engram_compressed_vocab_size == 99_092`, since the
+        /// draw's bound is `(i64::MAX / compressed_vocab) / 2`.
+        const MULTIPLIERS: [[i64; 4]; 2] = [
+            [76_632_096_046_245, 4_839_876_093_313, 35_959_672_319_349, 73_987_337_458_391],
+            [67_716_810_739_261, 51_510_806_800_915, 30_921_347_202_721, 82_619_226_485_591],
+        ];
+        if self.engram_layer_ids != [1, 14]
+            || self.engram_max_ngram_size != 4
+            || self.engram_compressed_vocab_size != 99_092
+        {
+            return None;
+        }
+
+        let per_layer = (self.engram_max_ngram_size as usize - 1) * self.engram_n_heads as usize;
+        let mut seen: Vec<i64> = Vec::with_capacity(per_layer * self.engram_layer_ids.len());
+        let mut primes = Vec::with_capacity(self.engram_layer_ids.len());
+        let mut offsets = Vec::with_capacity(self.engram_layer_ids.len());
+
+        for _ in &self.engram_layer_ids {
+            let mut flat = Vec::with_capacity(per_layer);
+            for _ in 0..self.engram_max_ngram_size - 1 {
+                // `current` restarts at the vocab bound for every n-gram size, but `seen`
+                // persists -- so each search skips past every prime already handed out.
+                let mut current = self.engram_vocab_size - 1;
+                for _ in 0..self.engram_n_heads {
+                    loop {
+                        current += 1;
+                        if is_prime(current) && !seen.contains(&current) {
+                            break;
+                        }
+                    }
+                    seen.push(current);
+                    flat.push(current);
+                }
+            }
+            let mut offs = Vec::with_capacity(per_layer);
+            let mut acc = 0i64;
+            for p in &flat {
+                offs.push(acc);
+                acc += *p;
+            }
+            primes.push(flat);
+            offsets.push(offs);
+        }
+
+        Some(EngramHashTables {
+            multipliers: MULTIPLIERS.iter().map(|r| r.to_vec()).collect(),
+            primes,
+            offsets,
+        })
+    }
+
     /// Rows in `layer`'s Engram table, if it has one.
     pub fn engram_rows(&self, layer: u32) -> Option<i64> {
         let at = self.engram_layer_ids.iter().position(|l| *l == layer)?;
@@ -646,6 +722,28 @@ impl DeepSeekV41Config {
                 self.dspark_noise_token_id, self.vocab_size
             ));
         }
+        // The Engram hash ranges must tile the table exactly. Each (n-gram size, head) pair owns
+        // a prime-sized bucket range and the ranges are laid end to end, so a layer's primes SUM
+        // to its `engram_num_embeddings` -- which makes the checkpoint's own row counts a
+        // checksum on the prime walk in `engram_hash_tables`. A walk that drifts (a missed
+        // `seen`, a wrong restart point) lands here rather than in a silently wrong lookup.
+        if let Some(t) = self.engram_hash_tables() {
+            for (at, (primes, rows)) in
+                t.primes.iter().zip(self.engram_num_embeddings.iter()).enumerate()
+            {
+                let span: i64 = primes.iter().sum();
+                if span != *rows {
+                    return bad(format!(
+                        "deepseek_v41 engram layer {} (id {}): the hash bucket ranges span {span} \
+                         rows but the table has {rows}; the prime walk does not reproduce this \
+                         checkpoint's layout",
+                        at,
+                        self.engram_layer_ids.get(at).copied().unwrap_or(u32::MAX),
+                    ));
+                }
+            }
+        }
+
         Ok(())
     }
 }
@@ -670,6 +768,37 @@ fn check_layer_set(what: &str, ids: &[u32], num_layers: u32) -> Result<(), Confi
         }
     }
     Ok(())
+}
+
+/// See [`DeepSeekV41Config::engram_hash_tables`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EngramHashTables {
+    /// `[engram layer][lookback]`, always odd and bounded so `token_id * multiplier` cannot
+    /// overflow `i64`.
+    pub multipliers: Vec<Vec<i64>>,
+    /// `[engram layer][flat (n-gram size, head) column]` bucket modulus.
+    pub primes: Vec<Vec<i64>>,
+    /// `[engram layer][flat column]` first row of that column's bucket range.
+    pub offsets: Vec<Vec<i64>>,
+}
+
+/// Trial division, which is plenty: the primes wanted sit just above `engram_vocab_size`
+/// (~1.6e7), so the loop runs to ~4000.
+fn is_prime(n: i64) -> bool {
+    if n < 2 {
+        return false;
+    }
+    if n % 2 == 0 {
+        return n == 2;
+    }
+    let mut d = 3i64;
+    while d * d <= n {
+        if n % d == 0 {
+            return false;
+        }
+        d += 2;
+    }
+    true
 }
 
 #[cfg(test)]

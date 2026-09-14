@@ -198,3 +198,59 @@ fn graph_build_refuses_with_a_checklist() {
     assert!(text.contains("CSA2 cache SHARING"), "{text}");
     assert!(text.contains("graph builder"), "{text}");
 }
+
+/// Engram's hash tables, against the reference's own arithmetic.
+///
+/// The primes are DERIVED here (a trial-division walk replacing `sympy.isprime`) and the
+/// derivation proves itself: each layer's bucket ranges are laid end to end, so they must sum
+/// to that layer's `engram_num_embeddings`. `validate()` enforces it; this pins the individual
+/// values too, so a walk that drifts in a way the sum happens to survive still fails.
+///
+/// The multipliers cannot be derived -- they come from numpy's PCG64 -- so they are constants,
+/// and this checks the ones extracted from the released checkpoint.
+#[test]
+fn engram_hash_tables_match_the_reference() {
+    let cfg = official();
+    let t = cfg.engram_hash_tables().expect("released checkpoint's engram shape");
+
+    assert_eq!(t.multipliers.len(), 2);
+    assert_eq!(
+        t.multipliers[0],
+        vec![76_632_096_046_245, 4_839_876_093_313, 35_959_672_319_349, 73_987_337_458_391]
+    );
+    assert_eq!(
+        t.multipliers[1],
+        vec![67_716_810_739_261, 51_510_806_800_915, 30_921_347_202_721, 82_619_226_485_591]
+    );
+    // Odd by construction: the reference draws `v` and stores `2v + 1`.
+    for row in &t.multipliers {
+        for m in row {
+            assert_eq!(m % 2, 1, "multiplier {m} must be odd");
+        }
+    }
+
+    // (max_ngram_size - 1) * n_heads = 3 * 8 columns per layer.
+    assert_eq!(t.primes[0].len(), 24);
+    assert_eq!(t.primes[1].len(), 24);
+    // The walk is GLOBAL: layer 14's ranges start above every one of layer 1's.
+    assert_eq!(t.primes[0][0], 16_000_057);
+    assert_eq!(t.primes[0][23], 16_000_463);
+    assert_eq!(t.primes[1][0], 16_000_477);
+    assert_eq!(t.primes[1][23], 16_000_889);
+    let mut all: Vec<i64> = t.primes.iter().flatten().copied().collect();
+    let n = all.len();
+    all.sort_unstable();
+    all.dedup();
+    assert_eq!(all.len(), n, "every bucket range must own a DISTINCT prime");
+
+    // Offsets are the exclusive prefix sum, and the last range ends exactly at the table's end.
+    for (primes, (offsets, rows)) in
+        t.primes.iter().zip(t.offsets.iter().zip(cfg.engram_num_embeddings.iter()))
+    {
+        assert_eq!(offsets[0], 0);
+        for i in 1..offsets.len() {
+            assert_eq!(offsets[i], offsets[i - 1] + primes[i - 1]);
+        }
+        assert_eq!(offsets[offsets.len() - 1] + primes[primes.len() - 1], *rows);
+    }
+}
