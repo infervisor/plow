@@ -64,6 +64,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tokens", type=int, default=8192)
     ap.add_argument("--gpus", type=int, default=8)
+    ap.add_argument("--target-ms", type=float, default=300.0)
     ap.add_argument("--json-out", default="")
     a = ap.parse_args()
     T, G = a.tokens, a.gpus
@@ -274,6 +275,22 @@ def main():
     print(f"    compute @100%          {t_built_peak*1e3:>10.1f} ms")
     print(f"    AS-BUILT floor         {b_lo*1e3:>7.0f} - {b_hi*1e3:.0f} ms"
           f"   headroom {300/(b_lo*1e3):.1f}x - {300/(b_hi*1e3):.1f}x")
+
+    # ---------------------------------------------------------- budget
+    # What a given TTFT target demands of the matrix engine, which is the
+    # question an aggressive target actually asks. Two collective policies:
+    # none overlapped (worst) and all overlapped (the limit of the work).
+    tgt = a.target_ms / 1e3
+    print(f"\nBudget for a {a.target_ms:.0f} ms target")
+    print(f"  {'':<26}{'exposed coll':>14}{'overlapped':>13}")
+    for label, peak_t in (("as built (experts bf16)", t_built_peak),
+                          ("if experts reach fp8", total_flops / fp8_peak)):
+        need_x = peak_t / max(tgt - t_coll, 1e-9)
+        need_o = peak_t / tgt
+        print(f"  {label:<26}{need_x:>13.1%}{need_o:>13.1%}")
+    print(f"  plow's gfx942 GEMM band   {EFF_LO:>13.0%}{EFF_HI:>13.0%}")
+    print(f"  aggregate throughput      {T/tgt:>13,.0f} tok/s"
+          f"  = {T/tgt/G:,.0f}/GPU")
 
     if a.json_out:
         out = {

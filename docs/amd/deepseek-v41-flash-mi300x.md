@@ -258,6 +258,40 @@ survives it -- 3.9x-7.8x headroom -- but half the model's arithmetic is
 running at half the peak the part advertises, and closing that is the largest
 single performance item in the expert path.
 
+**The grouped-MoE path never reaches the fp8 matrix engine.** Checked because
+a 70 ms target depends on it. Every grouped-MoE kernel in the tree that issues
+MFMA at all issues `v_mfma_f32_32x32x8_bf16` -- not one uses
+`v_mfma_f32_32x32x16_fp8_fp8`, which gfx942 does have and
+`interp_prefill_fp8.elf` does use elsewhere:
+
+| kernel | instrs | MFMA | burst | stalled | spill |
+|---|---|---|---|---|---|
+| `d_moe_group_glu_pf` | 9210 | 32 bf16 | 3 | 16/32 | **112** |
+| `d_moe_group_down_pf` | 5274 | 32 bf16 | 3 | 16/32 | **62** |
+| `d_moe_group_glu_gemma_pf` | 1937 | 16 bf16 | 3 | 8/16 | 16 |
+| `d_moe_group_down_gemma_pf` | 986 | 16 bf16 | 3 | 8/16 | 16 |
+| `d_moe_group_glu_gemma_pf_w8a8` | 2831 | 16 bf16 | 3 | 8/16 | 16 |
+| `d_moe_group_glu_fp8_blk` | 801 | **0** | - | - | 2 |
+| `d_moe_expert_down_fp8_blk` | 2512 | **0** | - | - | 0 |
+
+Two things follow. The `_fp8_blk` kernels have no MFMA whatever -- "fp8" there
+names the weight storage format, not the matrix instruction, and those bodies
+are VALU. And the `w8a8` variant issuing bf16 MFMA with 8-bit weights AND
+8-bit activations shows this is not a missing-dtype plumbing problem that a
+flag fixes: no grouped-MoE kernel here has ever targeted the fp8 MFMA.
+
+So "get the experts onto fp8" is new kernel work, not tuning. Combined with
+5.3's finding that no MXFP4 grouped-MoE kernel exists at all, the expert path
+that carries 49.4% of V4.1's prefill FLOPs has to be written from scratch to
+hit a target below ~120 ms.
+
+Caveat on reading the table: MFMA counts are STATIC disassembly counts, so a
+low MFMA-to-instruction ratio is not directly an achieved-FLOP number -- the
+MFMAs sit in loop bodies with unknown trip counts. What the static form does
+settle without inference is the instruction SELECTION (bf16, never fp8), the
+spill traffic, and the in-body pipelining (longest burst 3, half the MFMAs
+issuing straight after an `s_waitcnt`).
+
 **What IS shipped and healthy.** The mHC, DSA-pool and indexer kernels are
 real and present, but only in the `_k3` objects (`interp_{prefill,decode}_*_k3*`) --
 not, as the unconditional `#include` in `runtime/amd/interp.hip` suggests,
