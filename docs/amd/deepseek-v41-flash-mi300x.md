@@ -343,3 +343,101 @@ and the shared expert are block-FP8 e4m3 on a `[32,32]` ue8m0 grid. A single
 Note this is the WEIGHT encoding. The compressed KV *cache* is a different fp4
 again — group 16 with E4M3 scales, written at runtime (§5.2) — and the two
 must not be conflated.
+
+---
+
+## 8. Stage 2: egglog rules
+
+### Where egglog sits relative to devgen
+
+devgen depends on `rewrite` only as a **dev-dependency**
+(`crates/devgen/Cargo.toml`). It never runs saturation. `plowc` does, extracts
+the fused graph, and hands devgen a `fused kind -> anchor weight name` map;
+`devgen/src/rewrite_lower.rs` looks a site up by the tensor handle it would
+fuse on. With `PLOW_EMIT_REWRITE` off — or on with no sites — every query
+answers `None` and devgen uses its hand fusions. So there is no separate
+"devgen rule set" to extend: the rules live in
+`crates/rewrite/src/egl/rules.egg`, and what devgen adds is a LOWERING for
+each fused kind it can consume.
+
+### The first problem: devgen consumes only residual+norm fusions
+
+`Lowering` in `rewrite_lower.rs` has exactly two variants:
+
+| devgen lowering | fused kinds it accepts |
+|---|---|
+| `AddNorm` | `FusedResidualNorm`, `FusedResidual3Norm` |
+| `NormResidualNorm` | `FusedNormResidualNorm`, `FusedNormResidualScaleNorm` |
+
+All four are residual-**add**-plus-norm. V4.1 has no plain residual add: both
+sublayers end in `hc_post`, which is `post * x + sum(comb * residual)`
+(`model.py:962`). So **none of the existing rewrite-driven lowerings can fire
+on a V4.1 block**, and the rules that produce them (`residual-rmsnorm-fuse`,
+`residual3-rmsnorm-fuse`, `norm-residual-rmsnorm-fuse`, ...) have no match.
+This is not a gap to patch around — it is the same observation as §6.1 seen
+from the rewrite side, and it means Stage 2 for V4.1 is mostly NEW rules
+rather than reused ones.
+
+The rules that DO still fire on V4.1 are the ones that do not touch the
+residual: `rmsnorm-linear-fuse` matches `wq_b(q_norm(...))`, and
+`linear-act-fuse` / `gated-mlp-fuse` match the expert SwiGLU.
+
+### The second problem: the router cannot be represented
+
+`nn_graph::op::MoeScoring` has two variants, `Softmax` and `Sigmoid`. V4.1 —
+and V4 — route with **`sqrtsoftplus`**, which is not one of them. Worse,
+`Nn::moe_router_noaux` hard-codes `scoring: MoeScoring::Sigmoid`
+(`builder.rs:508`), and `lower.rs`'s `MoeRouterNoAux` arm pattern-matches that
+variant explicitly. `schema.egg` states the assumption outright: "Scoring is
+sigmoid by definition."
+
+So before any V4.1 graph can saturate:
+
+1. add `MoeScoring::SqrtSoftplus`;
+2. give `moe_router_noaux` the scoring as a parameter instead of a constant;
+3. carry it into the egglog term.
+
+Step 3 matters for more than fidelity. A grouped router that does NOT match
+the `Sigmoid` arm falls through to `MoeRouterGrouped`, which passes only
+`e(0)` and `e(1)` — the correction-bias leaf `e(2)` is **dropped**, and with
+it `ffn.gate.bias` from the weight manifest. The same class of bug the schema
+comments record for Kimi-K3 ("`Opaque` ... would have dropped every weight but
+the first").
+
+### New constructors Stage 2 needs
+
+`lower.rs`'s match over `Op` is **exhaustive** — there is no catch-all arm, and
+`Opaque` is declared in `schema.egg` but never emitted. That is a good
+property: adding an IR op for V4.1 will not compile until `lower.rs` handles
+it, so the egglog schema cannot silently fall behind the IR. Each new op needs
+a constructor that names every weight leaf:
+
+| V4.1 piece | weight leaves that must not be dropped |
+|---|---|
+| single-pass mHC | `hc_attn_fn`, `hc_attn_base`, `hc_attn_scale` (x2, attn + ffn) |
+| CSA2 compressor | `compressor.wkv`, `compressor.wgate` (ratio > 1 only), `compressor.norm` |
+| Engram | `engram.embed` (+ `scale`), `engram.q_weight`, `engram.k_weight`, `engram.wkv` |
+| grouped output LoRA | `wo_a`, `wo_b` |
+
+`DsaIndexer` already exists with the right leaves (`wq_b`, `wk`, `k_norm_w`,
+`k_norm_b`, `weights_proj`) but its arity assumes the layer OWNS its index
+keys; the 4 V4.1 indexers that read published keys have no `wk`/`k_norm`.
+
+### Candidate new rules
+
+Worth trying once a graph exists, in rough value order. Each needs a `; rule:`
+annotation and an entry in `Plow.Rewrite.soundRules` with a proof
+(`lean-plow/Plow/Rewrite.lean:397`) before it may fire.
+
+1. `hcpost-hcmixes-fuse` — `hc_post` feeding the next sublayer's `hc_mixes`
+   reads the stream it just wrote; fusing them saves a `[B,S,hc*D]` round trip
+   per sublayer, 80 per token.
+2. `hcpre-rmsnorm-fuse` — `hc_pre` is immediately followed by `attn_norm` /
+   `ffn_norm` in every block (`model.py:975,992`); the collapse and the norm
+   are one pass over the same row.
+3. `compressor-norm-rope-fuse` — the compressor's pool, learned RMSNorm and
+   post-norm RoPE are already one kernel in `op_compress.h`; the rule makes
+   the emitter reach it.
+4. `kvnorm-quant-fuse` — `_window_kv` does `kv_norm(wkv(x))` then RoPE then
+   `act_quant` in place (`model.py:705-707`). `RmsNorm`'s `t3/t4` fused w8a8
+   quant slot already exists for exactly this shape.
