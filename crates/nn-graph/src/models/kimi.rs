@@ -214,6 +214,7 @@ fn moe(nn: &mut Nn, cfg: &KimiConfig, p: &str, x: TensorId, h: i64) -> TensorId 
         },
         cfg.norm_topk_prob,
         cfg.routed_scaling_factor,
+        crate::op::MoeScoring::Sigmoid,
     );
     let routed_experts = register_experts(nn, cfg, p, h);
     nn.expert_binding(ExpertLayerBinding {

@@ -297,10 +297,20 @@ pub struct MoeGroups {
     pub topk_group: u32,
 }
 
+/// How a router turns logits into expert scores.
+///
+/// This is not cosmetic: the scores are what the top-k weights are read from,
+/// so a router scored with the wrong function selects plausible experts and
+/// weights them wrongly. `noaux_tc` routing does NOT imply sigmoid — DeepSeek
+/// V3 and Kimi are sigmoid, DeepSeek V4/V4.1 are `sqrtsoftplus` — which is why
+/// this rides on [`Op::MoeRouter`] rather than being implied by `group`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MoeScoring {
     Softmax,
     Sigmoid,
+    /// `sqrt(softplus(logits))`, DeepSeek V4 and V4.1 (`scoring_func:
+    /// "sqrtsoftplus"`). Unbounded above, unlike sigmoid.
+    SqrtSoftplus,
 }
 
 /// Which linear-attention recurrence [`Op::LinearAttention`] carries.

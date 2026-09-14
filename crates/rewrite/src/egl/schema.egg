@@ -51,9 +51,14 @@
   (MoeRouter Expr Expr i64 i64)       ; x, weight, num_experts, top_k
   (MoeRouterGrouped Expr Expr i64 i64 i64 i64)
       ; x, weight, num_experts, top_k, n_group, topk_group
-  (MoeRouterNoAux Expr Expr Expr i64 i64 i64 i64 i64 f64)
-      ; x, weight, correction_bias, num_experts, top_k, n_group, topk_group,
-      ; norm_topk, route_scale. Scoring is sigmoid by definition.
+  (MoeRouterNoAux Expr Expr Expr String i64 i64 i64 i64 i64 f64)
+      ; x, weight, correction_bias, scoring-token, num_experts, top_k, n_group,
+      ; topk_group, norm_topk, route_scale.
+      ;
+      ; Scoring is a TOKEN, not "sigmoid by definition": `noaux_tc` says how
+      ; experts are selected, not how their logits are scored. V3/Kimi/GLM
+      ; score with sigmoid, DeepSeek V4 and V4.1 with sqrtsoftplus, and the
+      ; two must not share an e-class.
   (MoeExperts Expr Expr i64 i64 i64 i64)
       ; x, routes, num_experts, top_k, intermediate_size, block_fp8
   (DsaIndexer Expr Expr Expr Expr Expr Expr Expr String)

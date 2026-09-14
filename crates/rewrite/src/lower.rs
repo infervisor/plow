@@ -246,19 +246,25 @@ fn term_for(
         } => {
             format!("(MoeRouter {} {} {} {})", e(0)?, e(1)?, num_experts, top_k)
         }
+        // Every grouped router WITH a correction bias lowers here, whatever it
+        // scores with. Matching only `Sigmoid` sent the others to
+        // `MoeRouterGrouped`, which takes no bias operand — so `e(2)`, the
+        // `e_score_correction_bias` weight leaf, was dropped from the term and
+        // with it from the manifest.
         Op::MoeRouter {
             num_experts,
             top_k,
             group: Some(group),
-            scoring: nn_graph::op::MoeScoring::Sigmoid,
+            scoring,
             norm_topk,
             route_scale,
             correction_bias: true,
         } => format!(
-            "(MoeRouterNoAux {} {} {} {} {} {} {} {} {})",
+            "(MoeRouterNoAux {} {} {} {} {} {} {} {} {} {})",
             e(0)?,
             e(1)?,
             e(2)?,
+            quote(moe_scoring(*scoring)),
             num_experts,
             top_k,
             group.n_group,
@@ -407,6 +413,14 @@ fn act(k: ActKind) -> &'static str {
     }
 }
 
+fn moe_scoring(s: nn_graph::op::MoeScoring) -> &'static str {
+    match s {
+        nn_graph::op::MoeScoring::Softmax => "softmax",
+        nn_graph::op::MoeScoring::Sigmoid => "sigmoid",
+        nn_graph::op::MoeScoring::SqrtSoftplus => "sqrtsoftplus",
+    }
+}
+
 fn reduce(k: ReduceKind) -> &'static str {
     match k {
         ReduceKind::Mean => "mean",
@@ -426,4 +440,73 @@ fn f64lit(x: f32) -> String {
         s.push_str(".0");
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use nn_graph::op::{MoeGroups, MoeScoring};
+    use nn_graph::{DType, Nn};
+
+    /// Lower a one-router graph scored with `scoring`.
+    fn router_term(scoring: MoeScoring) -> String {
+        let mut nn = Nn::new(DType::BF16, DType::BF16);
+        let b = nn.sym("B");
+        let s = nn.sym("S");
+        let ids = nn.input("input_ids", nn.shape([b, s]), DType::I32);
+        let x = nn.embedding("model.embed_tokens", ids, 128, 64);
+        let routes = nn.moe_router_noaux(
+            "model.layers.0.mlp.gate",
+            x,
+            64,
+            8,
+            2,
+            MoeGroups {
+                n_group: 1,
+                topk_group: 1,
+            },
+            true,
+            1.5,
+            scoring,
+        );
+        nn.mark_output(routes);
+        let g = nn.finish();
+        super::lower(&g).expect("lower").0
+    }
+
+    /// Three scoring functions, three distinct terms. A sqrtsoftplus router did
+    /// not reach `MoeRouterNoAux` at all before it carried the scoring: the arm
+    /// matched `Sigmoid` alone.
+    #[test]
+    fn scoring_is_not_sigmoid_by_definition() {
+        let softmax = router_term(MoeScoring::Softmax);
+        let sigmoid = router_term(MoeScoring::Sigmoid);
+        let sqrt = router_term(MoeScoring::SqrtSoftplus);
+
+        assert!(sigmoid.contains("\"sigmoid\""), "{sigmoid}");
+        assert!(sqrt.contains("\"sqrtsoftplus\""), "{sqrt}");
+        assert!(softmax.contains("\"softmax\""), "{softmax}");
+        assert_ne!(softmax, sigmoid);
+        assert_ne!(sigmoid, sqrt);
+        assert_ne!(softmax, sqrt);
+    }
+
+    /// Every scoring keeps the correction-bias leaf. A grouped router that
+    /// missed the `Sigmoid` arm used to fall through to `MoeRouterGrouped`,
+    /// which has no bias operand -- dropping `e_score_correction_bias` from the
+    /// term and with it from the weight manifest.
+    #[test]
+    fn correction_bias_survives_every_scoring() {
+        for scoring in [
+            MoeScoring::Softmax,
+            MoeScoring::Sigmoid,
+            MoeScoring::SqrtSoftplus,
+        ] {
+            let term = router_term(scoring);
+            assert!(term.contains("MoeRouterNoAux"), "{scoring:?}: {term}");
+            assert!(
+                term.contains("e_score_correction_bias"),
+                "{scoring:?} dropped the correction bias: {term}"
+            );
+        }
+    }
 }

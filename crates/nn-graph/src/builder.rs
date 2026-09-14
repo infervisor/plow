@@ -476,9 +476,15 @@ impl Nn {
         )
     }
 
-    /// DeepSeek-family sigmoid/noaux_tc router. The correction bias affects
-    /// expert selection only; its presence is an explicit third operand so it
-    /// cannot disappear during lowering or checkpoint validation.
+    /// DeepSeek-family `noaux_tc` router. The correction bias affects expert
+    /// selection only; its presence is an explicit third operand so it cannot
+    /// disappear during lowering or checkpoint validation.
+    ///
+    /// `scoring` is a PARAMETER, not sigmoid by definition: `noaux_tc` says how
+    /// experts are selected, not how their logits are scored. V3/Kimi/GLM are
+    /// [`MoeScoring::Sigmoid`]; DeepSeek V4 and V4.1 are
+    /// [`MoeScoring::SqrtSoftplus`], and reading their weights out of a sigmoid
+    /// router is a silently wrong model, not a failure.
     #[allow(clippy::too_many_arguments)]
     pub fn moe_router_noaux(
         &mut self,
@@ -490,6 +496,7 @@ impl Nn {
         group: crate::op::MoeGroups,
         norm_topk: bool,
         route_scale: f32,
+        scoring: MoeScoring,
     ) -> TensorId {
         let w = self.param(
             &format!("{name}.weight"),
@@ -505,7 +512,7 @@ impl Nn {
                 num_experts,
                 top_k,
                 group: Some(group),
-                scoring: MoeScoring::Sigmoid,
+                scoring,
                 norm_topk,
                 route_scale,
                 correction_bias: true,
