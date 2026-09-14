@@ -1627,6 +1627,17 @@ The fix keys `band_rows_bound` by `t`. Unit test
 ragged and load-time views are the same tensor slot at different addresses (so skipping the
 restore is not benign), and that the poisoning sequence now issues the restore.
 
+**Verified on 8 GPUs (`rbfault21-bandmemo-fix`).** The same eight band centres `rbfault19` used,
+three samples each, on three servers:
+
+| arm | first request | 8 band centres | before the fix |
+|---|---|---|---|
+| `healthy` | none | **24/24 pass** | 24/24 (control holds) |
+| `poisoned` | 4096 | **24/24 pass** | **0/24** |
+| `poisoned3072` | 3072 | **24/24 pass** | 0/24 (`rbfault15`) |
+
+Zero fault lines on all three, and each poisoning request passed 3/3 itself. The defect is closed.
+
 This is a live defect for RAGGED SEAMS generally, not only for row-band: any two programs sharing
 a `@band{t}` family could desynchronise the same way. Row-band is simply the first pair where one
 sibling never goes ragged and so never re-derives the binding for itself.
