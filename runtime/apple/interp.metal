@@ -258,6 +258,26 @@ inline void dot4_bf16_pair(device const ushort* W, uint ldw, device const ushort
 }
 #endif
 #ifdef PLOW_BF16_M4
+inline float4 dot_bf16_quad(device const ushort* W, device const ushort* x,
+                           uint K, uint lane) {
+    float4 acc = 0.0f;
+    uint k = lane * 8u;
+    for (; k + 8u <= K; k += 256u) {
+        float4 w0 = bf4(*(device const ushort4*)(W + k));
+        float4 w1 = bf4(*(device const ushort4*)(W + k + 4u));
+        for (uint m = 0; m < 4u; m++) {
+            device const ushort* xm = x + m * K + k;
+            float4 x0 = bf4(*(device const ushort4*)xm);
+            float4 x1 = bf4(*(device const ushort4*)(xm + 4u));
+            acc[m] += dot(w0, x0) + dot(w1, x1);
+        }
+    }
+    for (k = (K & ~7u) + lane; k < K; k += 32u) {
+        float wv = bf2f(W[k]);
+        for (uint m = 0; m < 4u; m++) acc[m] += wv * bf2f(x[m * K + k]);
+    }
+    return float4(simd_sum(acc.x), simd_sum(acc.y), simd_sum(acc.z), simd_sum(acc.w));
+}
 inline void dot4_bf16_quad(device const ushort* W, uint ldw, device const ushort* x,
                           uint K, uint lane, thread float4& a0, thread float4& a1,
                           thread float4& a2, thread float4& a3) {
@@ -471,6 +491,23 @@ void op_gemv_glu(const thread Inst& in, device const ulong* tab, uint slice, uin
     float f0 = as_type<float>(in.fj[0]), f1 = as_type<float>(in.fj[1]);
     uint n0, n1;
     range(N, slice, nblk, n0, n1);
+#ifdef PLOW_BF16_M4
+    if (M == 4u) {
+        for (uint n = n0 + sg; n < n1; n += NSG) {
+            float4 g = dot_bf16_quad(Wg + n * K, x, K, lane);
+            float4 u = dot_bf16_quad(Wu + n * K, x, K, lane);
+            if (bg) g += bf2f(bg[n]);
+            if (bu) u += bf2f(bu[n]);
+            if (lane == 0) {
+                C[n] = f2bf(glu_pair(g.x, u.x, act, f0, f1));
+                C[N + n] = f2bf(glu_pair(g.y, u.y, act, f0, f1));
+                C[2u * N + n] = f2bf(glu_pair(g.z, u.z, act, f0, f1));
+                C[3u * N + n] = f2bf(glu_pair(g.w, u.w, act, f0, f1));
+            }
+        }
+        return;
+    }
+#endif
     for (uint n = n0 + sg; n < n1; n += NSG)
         for (uint m = 0; m < M; m++) {
 #ifdef PLOW_GLU_PAIR
