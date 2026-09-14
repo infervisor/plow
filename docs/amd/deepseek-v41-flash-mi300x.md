@@ -213,6 +213,85 @@ piece of the V4.1 attention/FFN block to an existing `DevOp` or marks it new.
    (`model.py:783`) — the V4 campaign reports a kernel for this; it needs a
    packet slot on the V4.1 path.
 
+### 5.3 ASM audit, done up front
+
+Run before any kernel work, against the 1295 prebuilt gfx942 objects in
+`build-tile/hsaco-bm256c5/` -- so this is what the compiler actually emitted,
+not what the headers imply. `scripts/asm_audit.py` in report mode; the arch in
+each object's ELF header is gfx942, matching `scripts/asm_expect_gfx942.json`.
+
+**The MXFP4 expert path does not exist in any servable object.** This is the
+finding that matters, because the roofline puts 49.4% of V4.1's prefill FLOPs
+through routed MXFP4 experts.
+
+* There is no MXFP4 grouped-MoE kernel anywhere. Every grouped expert kernel
+  is fp8 or gemma: `d_moe_group_glu_fp8_blk`, `d_moe_group_down_fp8_blk`,
+  `d_moe_group_{glu,down}_gemma_pf`. The grouped/batched form prefill needs
+  has no fp4 variant at all.
+* The mxfp4 bodies that do exist are in `test_kernels.elf` -- 14 symbols,
+  a test object, not something served. Of the shipped objects only the four
+  `interp_decode*_k3*` carry a single mxfp4 symbol, and it is
+  `d_gemm_mxfp4_k` at **59 instructions with zero MFMA**: a dispatch shell,
+  not a GEMM body. No prefill object defines any mxfp4 kernel.
+
+**Where fp4 lands on gfx942, when it lands at all.** `gemm_mxfp4_c2/c3/c4`
+are real bodies, and every one of them issues `v_mfma_f32_32x32x8_bf16`:
+
+| kernel | instrs | MFMA | burst | wait-stalled | spill |
+|---|---|---|---|---|---|
+| `gemm_mxfp4_c2` | 2129 | 32 bf16 | 7 | 8/32 | 0 |
+| `gemm_mxfp4_c3` | 1204 | 16 bf16 | 4 | 4/16 | 0 |
+| `gemm_mxfp4_c4` | 837 | 8 bf16 | 2 | 4/8 | 0 |
+| `d_gemv_mxfp4_k` | 12355 | **0** | - | - | 0 |
+| `d_gemv_glu_mxfp4_k` | 1193 | **0** | - | - | 0 |
+
+So fp4 weights are dequantized and fed to the **bf16** matrix engine, never
+fp8 -- which is the best gfx942 can do, since it has no fp4 MFMA at all
+(`hwspec` MI300X `mma.fp4: None`). `d_gemv_mxfp4_k` is the decode shape and
+uses no matrix engine whatever: 12355 instructions, **1579 `cvt`** and 8560
+VALU, i.e. it is a dequantization kernel with a dot product attached.
+
+This changes the baseline. Pricing the expert FLOPs at the bf16 rate they
+actually issue at, rather than the fp8 peak, moves the 8k floor from
+**24-55 ms to 39-77 ms** (`scripts/dsv41_roofline.py` prints both). 300 ms
+survives it -- 3.9x-7.8x headroom -- but half the model's arithmetic is
+running at half the peak the part advertises, and closing that is the largest
+single performance item in the expert path.
+
+**What IS shipped and healthy.** The mHC, DSA-pool and indexer kernels are
+real and present, but only in the `_k3` objects (`interp_{prefill,decode}_*_k3*`) --
+not, as the unconditional `#include` in `runtime/amd/interp.hip` suggests,
+in every object:
+
+| kernel | instrs | MFMA | spill | note |
+|---|---|---|---|---|
+| `d_hyperconn_pre` | 1270 | 0 | **2** | 775 VALU, 23 ds_read / 14 ds_write |
+| `d_hyperconn_post` | 301 | 0 | 0 | clean |
+| `d_dsa_pool_compress` | 575 | 0 | 0 | 16 barriers |
+| `d_dsa_pool_expand` | 130 | 0 | 0 | clean |
+| `d_dsa_pool_stash` | 60 | 0 | 0 | clean |
+| `d_dsa_q_quant` | 333 | 0 | 0 | 16 barriers |
+| `d_index_score_kpool` | 496 | 0 | 0 | 25 ds_write |
+| `d_index_score_pf_row` | 311 | 16 bf16 | 0 | burst 2, **8/16 wait-stalled** |
+
+Three things to carry into Stage 4:
+
+1. `d_hyperconn_pre` **spills** (2 scratch ops). `asm_audit.py`'s contract
+   class 2 refuses on spill, so this kernel fails the contract as built. The
+   mHC mix is GEMM-shaped -- [24, 20480], 0.64 TFLOP at 8k -- and runs
+   entirely in VALU with no matrix engine.
+2. `d_index_score_pf_row` has a longest MFMA burst of 2 and half its MFMAs
+   issuing straight after an `s_waitcnt`. That is the quadratic term in the
+   model; it is small at 8k (1.79 TFLOP) but it is the term that grows.
+3. The `_k3` prefill object contains **only** `v_mfma_f32_32x32x8_bf16` --
+   no fp8 MFMA at all, where `interp_prefill_fp8.elf` does carry
+   `v_mfma_f32_32x32x16_fp8_fp8`. The object that holds V4.1's new kernels is
+   the one with no fp8 matrix path.
+
+Also `d_moe_group_{glu,down}_gemma_pf` both spill 16 and run 0.8%/1.6% MFMA
+density at burst 3, which is the shape of the prefill expert kernel V4.1 would
+inherit.
+
 ## 6. Pipelining changes
 
 These are the changes that are NOT kernel bodies — they are dataflow and

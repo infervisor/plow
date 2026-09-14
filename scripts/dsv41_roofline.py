@@ -259,6 +259,22 @@ def main():
     print(f"  target                          300 ms")
     print(f"  headroom                 {300/(lo*1e3):.1f}x - {300/(hi*1e3):.1f}x")
 
+    # ---------------------------------------------------------- as built
+    # The floor above prices every FLOP at the fp8 peak. The ASM audit of the
+    # prebuilt gfx942 objects says the expert path does not get it: the mxfp4
+    # GEMM bodies (gemm_mxfp4_c2/c3/c4 in test_kernels.elf) dequantize and
+    # issue v_mfma_f32_32x32x8_bf16, so the MXFP4 experts run at the BF16 rate
+    # -- half of fp8. Price the experts there and the rest at fp8.
+    expert_flops = f["routed_expert"] + f["shared_expert"]
+    other_flops = total_flops - expert_flops
+    t_built_peak = expert_flops / bf16_peak + other_flops / fp8_peak
+    b_lo = max(t_built_peak / EFF_HI, t_mem)
+    b_hi = max(t_built_peak / EFF_LO, t_mem) + t_coll
+    print("\n  As built (experts at the bf16 MFMA the mxfp4 kernels actually issue)")
+    print(f"    compute @100%          {t_built_peak*1e3:>10.1f} ms")
+    print(f"    AS-BUILT floor         {b_lo*1e3:>7.0f} - {b_hi*1e3:.0f} ms"
+          f"   headroom {300/(b_lo*1e3):.1f}x - {300/(b_hi*1e3):.1f}x")
+
     if a.json_out:
         out = {
             "tokens": T, "gpus": G,
