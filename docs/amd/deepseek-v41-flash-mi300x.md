@@ -156,6 +156,47 @@ Unblocking a real V4.1 number needs a container runtime plus
 
 ---
 
+### 4.1 Re-checked against a current vLLM tree, and corrected
+
+Checked again on 2026-09-14 against both the installed vLLM 0.28.0 and the
+source checkout at `/tmp/vllm` (HEAD 2026-09-09, post-0.28 dev). Neither
+registers `DeepseekV41ForCausalLM`; both register `DeepseekV4ForCausalLM` out
+of `vllm.models.deepseek_v4`.
+
+**A correction to what this doc said earlier.** vLLM's V4 module is much
+closer to V4.1 than section 1 implied. It already carries `hc_mult` and
+hyper-connections, `sqrtsoftplus` routing, and `o_groups` / `o_lora_rank`;
+`quant_config.py` handles `expert_dtype="fp4"` MXFP4 experts with **ue8m0**
+(e8m0fnu) scales and has an `amd/` path. Those were listed here as V4.1-only
+gaps. They are not.
+
+The real blockers are narrower, and both are load-fatal. Reproduce with
+`scripts/dsv41_vllm_compat.py`:
+
+| | |
+|---|---|
+| compressors vLLM would build | 18 (layers 2-19) |
+| compressors the checkpoint has | **4** (2, 8, 14, 20) |
+| weights vLLM demands that do not exist | **15 layers** |
+| checkpoint compressor vLLM never instantiates | layer 20 |
+| Engram | 12 tensors, layers 1 and 14, ~196 B params, **no support anywhere in vLLM** |
+
+The compressor mismatch is section 1's V4.1-vs-V4 semantics, seen from the
+serving side: `attention.py:227` takes `compress_ratio = max(1,
+compress_ratios[layer_id])` and builds a compressor wherever that exceeds 1,
+which is the V4 reading. V4.1 uses `kv_source_layer_ids` to say who OWNS a
+compressor and lets `compress_ratios[l]` name the cache layer `l` reads.
+
+So vLLM is not a route to a V4.1 number, and an architecture alias would not
+make it one. Two things it is still worth reading for:
+
+* its ROCm MXFP4 + ue8m0 path (`Mxfp4MoEMethod`, `models/deepseek_v4/amd/`) is
+  a live reference for the gap section 5.3 found -- plow has no MXFP4
+  grouped-MoE kernel on gfx942 at all, and that path carries 49.4% of V4.1's
+  prefill FLOPs;
+* V4-Flash-0731 DOES run on this vLLM, so it remains available as a measured
+  comparison point on the same 8 cards.
+
 ## 5. Kernel extraction: what V4.1 needs against what plow has
 
 The V4 campaign left plow with most of the primitives. What follows maps each
