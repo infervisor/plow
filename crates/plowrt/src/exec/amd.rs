@@ -5775,6 +5775,10 @@ pub struct AmdEngine {
     /// and token-batch bodies are prefill-WIDTH programs but are not rungs, so they are not
     /// here; they are reached by role from the bucket they serve.
     prefill_ladder: Vec<usize>,
+    /// `PLOW_AMD_DECODE_DENSE_EXACT`: the dense-exact rung of every ladder width, ascending, and
+    /// the DSA selection width it stands in for. Empty unless armed.
+    dense_exact_ladder: Vec<usize>,
+    dense_exact_select: u32,
     devp: Vec<DeviceMem>,
     /// Owner of the one allocation the ordinarily-allocated tensors are carved
     /// out of; `devp` then holds **views** into it. Unlike the CUDA side, this
@@ -9723,28 +9727,31 @@ impl AmdEngine {
         // THE TWO LADDERS, derived from the program ROLES and ordered by WIDTH — never by
         // index (`docs/arch/19-packet-extensions.md`). On a table the emitter laid out this is
         // the old `[0, dec_lo)` / `[dec_lo, n_prog)` split, program for program.
-        let ladder = |want_decode: bool| {
+        let ladder = |want: fn(ProgramRole) -> bool| {
             let mut ix: Vec<usize> = blob
                 .progs
                 .iter()
                 .enumerate()
-                .filter(|(_, p)| {
-                    if want_decode {
-                        p.role.is_decode_rung()
-                    } else {
-                        p.role.is_prefill_bucket()
-                    }
-                })
+                .filter(|(_, p)| want(p.role))
                 .map(|(i, _)| i)
                 .collect();
             ix.sort_by_key(|&i| blob.progs[i].t);
             ix
         };
-        let decode_ladder = ladder(true);
-        let prefill_ladder = ladder(false);
+        let decode_ladder = ladder(|r| r.is_decode_rung() && !r.is_dense_exact_rung());
+        let prefill_ladder = ladder(ProgramRole::is_prefill_bucket);
+        let dense_exact_ladder = ladder(ProgramRole::is_dense_exact_rung);
         let decode = *decode_ladder.last().ok_or_else(|| {
             RuntimeError::Device("devblob: no decode rung in the program table".into())
         })?;
+        let widths = |l: &[usize]| l.iter().map(|&p| blob.progs[p].t).collect::<Vec<_>>();
+        if !widths(&dense_exact_ladder).iter().all(|t| widths(&decode_ladder).contains(t)) {
+            return Err(RuntimeError::Device(format!(
+                "dense-exact decode rungs {:?} are not widths of the decode ladder {:?}",
+                widths(&dense_exact_ladder),
+                widths(&decode_ladder)
+            )));
+        }
         log_gate_hier_status(
             &blob.progs,
             decode_objects != 0 && decode_objects_gate_hier == decode_objects,
@@ -9780,6 +9787,36 @@ impl AmdEngine {
                 "in.kvlen has {metadata_rows} rows incompatible with decode capacity {batch}"
             )));
         }
+        let dense_exact_select = blob.progs[decode]
+            .insts
+            .iter()
+            .find(|d| d.op == DevOp::FlashMlaDecodeFp8 as u16 && d.fj[1] != 0)
+            .map_or(0, |d| d.i[6]);
+        let dense_exact_ladder = if crate::config::RuntimeConfig::get().amd.amd_decode_dense_exact {
+            let refusal = if dense_exact_ladder.is_empty() || dense_exact_select == 0 {
+                Some("the packet carries no dense-exact decode rungs (PLOW_GLM_DECODE_DENSE_EXACT=1)")
+            } else if batch == 1 {
+                Some("a batch-1 packet patches the KV row of the widest decode program only")
+            } else {
+                None
+            };
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| match refusal {
+                Some(why) => tracing::warn!("PLOW_AMD_DECODE_DENSE_EXACT stays off: {why}"),
+                None => tracing::info!(
+                    rungs = ?widths(&dense_exact_ladder),
+                    select_width = dense_exact_select,
+                    "PLOW_AMD_DECODE_DENSE_EXACT: dense-exact rungs serve steps where every row selects all keys"
+                ),
+            });
+            if refusal.is_none() {
+                dense_exact_ladder
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
 
         // KV slot geometry, for the per-slot prefill rebase. Only meaningful at
         // batch > 1; at batch 1 the list is empty and every rebase is a no-op,
@@ -10213,6 +10250,8 @@ impl AmdEngine {
             decode,
             decode_ladder,
             prefill_ladder,
+            dense_exact_ladder,
+            dense_exact_select,
             devp,
             _weight_slab: weight_slab,
             d_tens,
@@ -14079,6 +14118,24 @@ impl AmdEngine {
             .copied()
             .find(|&p| self.progs[p].t as usize >= rows)
             .unwrap_or(self.decode)
+    }
+
+    /// The armed dense-exact rung of ladder program `dp`'s width.
+    pub fn dense_exact_for(&self, dp: usize) -> Option<usize> {
+        let t = self.progs[dp].t;
+        if t < Self::DENSE_EXACT_MIN_RUNG || !self.decode_ladder.contains(&dp) {
+            return None;
+        }
+        self.dense_exact_ladder.iter().copied().find(|&p| self.progs[p].t == t)
+    }
+
+    /// Narrower dense-exact rungs an older packet may carry are never dispatched (the emitter's
+    /// `GLM_DENSE_EXACT_MIN_RUNG`).
+    const DENSE_EXACT_MIN_RUNG: u32 = 8;
+
+    /// The DSA selection width the dense-exact rungs stand in for.
+    pub fn dense_exact_select_width(&self) -> u32 {
+        self.dense_exact_select
     }
 
     /// The decode kernel handle.

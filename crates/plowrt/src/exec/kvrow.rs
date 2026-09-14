@@ -529,6 +529,16 @@ pub(crate) fn mla_live_nsplit(baked: u32, kv_len: u32) -> u32 {
         .min(baked.max(1))
 }
 
+/// `PLOW_AMD_DECODE_DENSE_EXACT`: may this step run the dense-exact rung instead of the DSA one?
+///
+/// The DSA selector keeps `min(select_width, kv_len[row])` keys, `kv_len` counting the current
+/// token (`d_index_select_coop`, `d_index_select_pf`, the gather flash's `tk_live`). So while
+/// every row the rung advances holds at most `select_width` keys it selects all of them and dense
+/// attention reads the same key set. One row past it and the sets differ.
+pub(crate) fn decode_dense_exact(kvlen: &[u32], select_width: u32) -> bool {
+    !kvlen.is_empty() && kvlen.iter().all(|&k| k <= select_width)
+}
+
 /// The decode program's MLA split sites — every instruction whose `i[4]` is the
 /// KV-split count — and the count the emitter baked into them.
 ///

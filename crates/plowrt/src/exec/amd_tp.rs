@@ -330,6 +330,28 @@ fn segment_major_order(n_segments: usize, n_ranks: usize) -> impl Iterator<Item 
     (0..n_segments).flat_map(move |seg| (0..n_ranks).map(move |rank| (seg, rank)))
 }
 
+/// `PLOW_AMD_DECODE_DENSE_EXACT`: the dense-exact rung while every row rung `dp` advances selects
+/// all its keys, else `dp`.
+fn pick_decode_prog(
+    dp: usize,
+    dense: Option<usize>,
+    kvlen: &[u32],
+    rows: usize,
+    select_width: u32,
+) -> usize {
+    match dense {
+        Some(de)
+            if crate::exec::kvrow::decode_dense_exact(
+                &kvlen[..rows.min(kvlen.len())],
+                select_width,
+            ) =>
+        {
+            de
+        }
+        _ => dp,
+    }
+}
+
 /// One action of a token-batch body launch, in the order [`body_launch_plan`] yields them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BodyLaunch {
@@ -950,6 +972,14 @@ impl AmdTpGroup {
         dp: usize,
     ) -> Result<()> {
         use crate::obs::dstep;
+        let r0 = &self.ranks[0];
+        let dp = pick_decode_prog(
+            dp,
+            r0.dense_exact_for(dp),
+            kvlen,
+            r0.prog_t(dp) as usize,
+            r0.dense_exact_select_width(),
+        );
         self.cur_dp = dp;
         let counter_dbuf = self.ranks[0].tp_counter_double_buffered();
         // Preparation can fail without changing bank state. Only after EVERY
@@ -2313,6 +2343,20 @@ fn gate_expectations(blob: &DevBlob, n_gpu: u32, n_xctr: u32) -> Vec<Vec<Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pick_decode_prog_takes_dense_exact_only_while_every_advanced_row_selects_all_keys() {
+        let pick = |dense, kvlen: &[u32], rows| pick_decode_prog(7, dense, kvlen, rows, 2048);
+        assert_eq!(pick(Some(1), &[2047], 1), 1);
+        assert_eq!(pick(Some(1), &[2048], 1), 1);
+        assert_eq!(pick(Some(1), &[2049], 1), 7);
+        assert_eq!(pick(None, &[1], 1), 7);
+        assert_eq!(pick(Some(3), &[2048, 17, 1, 2048], 4), 3);
+        assert_eq!(pick(Some(3), &[2048, 17, 2049, 1], 4), 7);
+        // A slot past the rung is not advanced by it.
+        assert_eq!(pick(Some(3), &[1, 2048, 17, 1, 5000], 4), 3);
+        assert_eq!(pick(Some(3), &[2049, 1], 1), 7);
+    }
 
     #[test]
     fn xstate_readback_is_an_exact_gate_and_status_check() {

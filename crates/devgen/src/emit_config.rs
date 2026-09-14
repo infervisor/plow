@@ -633,6 +633,11 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_MLA_DEC_AITER", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_mla_dec_aiter: bool,
 
+    /// Also emit a dense-exact GLM DSA decode rung per ladder width: dense FP8 attention plus the
+    /// indexer key-cache write, no top-k selection. Served by `PLOW_AMD_DECODE_DENSE_EXACT`.
+    #[arg(long, env = "PLOW_GLM_DECODE_DENSE_EXACT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_decode_dense_exact: bool,
+
     /// Pack GLM expert weights once for native gfx942 TP8 prefill and decode.
     /// On by default for GLM on gfx942 TP8; `=false` is the rollback.
     #[arg(long, env = "PLOW_GLM_MOE_RESIDENT", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
@@ -1274,6 +1279,7 @@ impl EmitConfig {
             glm_moe_aiter: env_bool_opt("PLOW_GLM_MOE_AITER"),
             glm_moe_flat_decode: env_bool("PLOW_GLM_MOE_FLAT_DECODE"),
             glm_mla_dec_aiter: env_bool("PLOW_GLM_MLA_DEC_AITER"),
+            glm_decode_dense_exact: env_bool("PLOW_GLM_DECODE_DENSE_EXACT"),
             glm_moe_resident: env_bool_opt("PLOW_GLM_MOE_RESIDENT"),
             glm_moe_shared_fold: env_bool("PLOW_GLM_MOE_SHARED_FOLD"),
             token_batch_tp: env_bool("PLOW_TOKEN_BATCH_TP"),

@@ -146,6 +146,7 @@ pub struct ProgramArms {
     pub program: usize,
     pub kind: &'static str,
     pub packed_prefill_only: bool,
+    pub dense_exact: bool,
     /// Prefill chunk rows, or decode batch — the `T` the program was compiled for.
     pub t: u32,
     pub seg: Option<u32>,
@@ -164,7 +165,8 @@ fn program_arms(m: &Model) -> Vec<ProgramArms> {
     let dec_lo = packet::devbuild::decode_rung_lo(&m.prog_t);
     for (pi, p) in m.progs.iter().enumerate() {
         let encoded_t = m.prog_t.get(pi).copied().unwrap_or(0);
-        let kind = if pi >= dec_lo {
+        let dense_exact = packet::devbuild::is_dense_exact_program(encoded_t);
+        let kind = if pi >= dec_lo || dense_exact {
             "decode"
         } else if packet::devbuild::is_token_batch_program(encoded_t) {
             "token_batch"
@@ -177,6 +179,7 @@ fn program_arms(m: &Model) -> Vec<ProgramArms> {
                 program: pi,
                 kind,
                 packed_prefill_only: packet::devbuild::is_packed_prefill_program(encoded_t),
+                dense_exact,
                 t,
                 seg,
                 insts: arms.1,
@@ -234,7 +237,7 @@ fn kernel_cases(m: &Model) -> Value {
             let encoded = m.prog_t.get(index).copied().unwrap_or(0);
             json!({
                 "program": index,
-                "kind": if index >= decode {
+                "kind": if index >= decode || packet::devbuild::is_dense_exact_program(encoded) {
                     "decode"
                 } else if packet::devbuild::is_token_batch_program(encoded) {
                     "token_batch"
@@ -438,8 +441,8 @@ fn shapes(m: &Model) -> Shapes {
     // ladder that is the last program alone, i.e. exactly the `pi == last` this replaced.
     let dec_lo = packet::devbuild::decode_rung_lo(&m.prog_t);
     for (pi, p) in m.progs.iter().enumerate() {
-        let decode = pi >= dec_lo;
         let encoded = m.prog_t.get(pi).copied().unwrap_or(0);
+        let decode = pi >= dec_lo || packet::devbuild::is_dense_exact_program(encoded);
         if !decode
             && !packet::devbuild::is_packed_prefill_program(encoded)
             && !packet::devbuild::is_token_batch_program(encoded)
@@ -1841,7 +1844,13 @@ fn dispatch_chains(progs: &[ProgramArms], arch: &str) -> Vec<Value> {
         out.push(json!({
             "program": program,
             "kind": first.kind,
-            "topology": if first.packed_prefill_only { "packed" } else { "ordinary" },
+            "topology": if first.packed_prefill_only {
+                "packed"
+            } else if first.dense_exact {
+                "dense_exact"
+            } else {
+                "ordinary"
+            },
             if first.kind == "prefill" { "bucket" } else { "batch" }: first.t,
             "segments": segment_values,
             "phases": phases,
@@ -2023,6 +2032,8 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport, packed_prefill: 
                 "topology".into(),
                 json!(if p.packed_prefill_only {
                     "packed"
+                } else if p.dense_exact {
+                    "dense_exact"
                 } else {
                     "ordinary"
                 }),
@@ -3714,6 +3725,7 @@ mod tests {
             program: 0,
             kind: "prefill",
             packed_prefill_only: false,
+            dense_exact: false,
             t: 8192,
             seg: Some(1),
             arms: BTreeSet::from([arm(op)]),
@@ -3748,6 +3760,7 @@ mod tests {
             program: 0,
             kind: "decode",
             packed_prefill_only: false,
+            dense_exact: false,
             t: 1,
             seg: Some(1),
             arms: ops.iter().map(|op| arm(op)).collect(),

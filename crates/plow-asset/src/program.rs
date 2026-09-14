@@ -88,7 +88,7 @@ pub fn with_model<T>(model: &packet::devbuild::Model, f: impl FnOnce(&Packet<'_>
                         .is_some_and(|op| matches!(op, packet::dev::DevOp::XReduce))
                 })
         }),
-        prefill_count: packet::devbuild::decode_rung_lo(&model.prog_t),
+        prefill_count: roles.iter().filter(|r| r.is_prefill_side()).count(),
         tensors: &tensors,
         programs: &programs,
         generated: &model.gen,

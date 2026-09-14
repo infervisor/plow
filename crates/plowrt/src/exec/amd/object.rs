@@ -1095,6 +1095,8 @@ pub(super) fn graph_phase_xreduce_segments_from_manifest(
         };
         let expected_topology = if role.is_packed_sibling() {
             "packed"
+        } else if role.is_dense_exact_rung() {
+            "dense_exact"
         } else {
             "ordinary"
         };

@@ -1124,6 +1124,13 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "mla-ns-live", env = "PLOW_MLA_NS_LIVE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub mla_ns_live: bool,
 
+    /// Run the dense-exact decode rung of a `PLOW_GLM_DECODE_DENSE_EXACT` packet instead of the
+    /// DSA rung of the same width on TP steps where every advanced row holds at most the
+    /// selection width of keys (the selection would keep all of them). Not bit-identical: the
+    /// selection order reassociates the softmax.
+    #[arg(long = "amd-decode-dense-exact", env = "PLOW_AMD_DECODE_DENSE_EXACT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub amd_decode_dense_exact: bool,
+
     /// hsaco directory override. Default: <assets>/hsaco.
     ///
     /// The clap **id** and **long** are both `rt-hsaco`, not `hsaco`. A

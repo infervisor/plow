@@ -3174,10 +3174,26 @@ pub const TOKEN_BATCH_PROG: u32 = 1 << 30;
 /// what docs/arch/19 phase 1 does for the parent too; the bit is the down payment on it.
 pub const DECODE_RUNG_PROG: u32 = 1 << 29;
 
-const PROGRAM_ROLE_BITS: u32 = PACKED_PREFILL_PROG | TOKEN_BATCH_PROG | DECODE_RUNG_PROG;
+/// [`BlobProgHeader::t`] bit marking a DENSE-EXACT decode rung (`PLOW_GLM_DECODE_DENSE_EXACT`): the
+/// DSA rung of the same width with dense attention and no top-k selection. Emitted between the
+/// prefill programs and the decode ladder, so the positional [`decode_rung_lo`] walk stops before
+/// it. Selected only by the runtime's dense-exact rule, never by width.
+pub const DENSE_EXACT_PROG: u32 = 1 << 28;
+
+const PROGRAM_ROLE_BITS: u32 =
+    PACKED_PREFILL_PROG | TOKEN_BATCH_PROG | DECODE_RUNG_PROG | DENSE_EXACT_PROG;
 
 pub fn program_rows(t: u32) -> u32 {
     t & !PROGRAM_ROLE_BITS
+}
+
+pub fn is_dense_exact_program(t: u32) -> bool {
+    t & DENSE_EXACT_PROG != 0
+}
+
+pub fn dense_exact_program_t(rows: u32) -> u32 {
+    assert_eq!(rows & PROGRAM_ROLE_BITS, 0, "program row count exceeds 28 bits");
+    rows | DENSE_EXACT_PROG
 }
 
 pub fn is_packed_prefill_program(t: u32) -> bool {
@@ -3264,6 +3280,9 @@ pub enum ProgramRole {
     /// slot-indexed decode band of `band` rows ahead of its prefill spans. Neither ladder
     /// offers it; only the token-batch route selects it, by rows.
     TokenBatchBody { band: u32, rows: u32 },
+    /// A dense-exact decode rung ([`DENSE_EXACT_PROG`]): the decode rung of the same width
+    /// without top-k selection. Decode-side, but not a rung of the width ladder.
+    DenseExactRung { rows: u32 },
 }
 
 impl ProgramRole {
@@ -3273,7 +3292,8 @@ impl ProgramRole {
             Self::PrefillBucket { rows }
             | Self::DecodeRung { rows }
             | Self::PackedSibling { of_rows: rows }
-            | Self::TokenBatchBody { rows, .. } => rows,
+            | Self::TokenBatchBody { rows, .. }
+            | Self::DenseExactRung { rows } => rows,
         }
     }
 
@@ -3281,8 +3301,13 @@ impl ProgramRole {
         matches!(self, Self::PrefillBucket { .. })
     }
 
+    /// Decode-side: a ladder rung or a dense-exact rung.
     pub fn is_decode_rung(self) -> bool {
-        matches!(self, Self::DecodeRung { .. })
+        matches!(self, Self::DecodeRung { .. } | Self::DenseExactRung { .. })
+    }
+
+    pub fn is_dense_exact_rung(self) -> bool {
+        matches!(self, Self::DenseExactRung { .. })
     }
 
     pub fn is_packed_sibling(self) -> bool {
@@ -3314,6 +3339,7 @@ impl ProgramRole {
             Self::DecodeRung { .. } => "decode rung",
             Self::PackedSibling { .. } => "packed sibling",
             Self::TokenBatchBody { .. } => "token-batch body",
+            Self::DenseExactRung { .. } => "dense-exact decode rung",
         }
     }
 }
@@ -3375,6 +3401,8 @@ pub fn derive_roles(
                 }
             } else if is_packed_prefill_program(t) {
                 ProgramRole::PackedSibling { of_rows: rows }
+            } else if is_dense_exact_program(t) {
+                ProgramRole::DenseExactRung { rows }
             } else if is_decode_rung_program(t) || i >= lo {
                 ProgramRole::DecodeRung { rows }
             } else {
@@ -6214,6 +6242,48 @@ mod v6_tests {
                 "{table:?}"
             );
         }
+    }
+
+    /// Dense-exact rungs sit between the prefill-side programs and the ladder: their bit names
+    /// the role, and the positional walk still stops at the first ladder rung.
+    #[test]
+    fn dense_exact_rungs_keep_the_decode_boundary() {
+        let pf = [128u32, 512, 2048, 8192];
+        let dec = [1u32, 2, 4, 8, 16, 20];
+        let mut table: Vec<u32> = pf.to_vec();
+        table.extend(pf[2..].iter().copied().map(packed_prefill_program_t));
+        let side = table.len();
+        table.extend(dec.iter().copied().map(dense_exact_program_t));
+        let lo = table.len();
+        table.extend(&dec);
+        assert_eq!(decode_rung_lo(&table), lo);
+        let ordinary: Vec<u32> = table
+            .iter()
+            .copied()
+            .filter(|&t| !is_dense_exact_program(t))
+            .collect();
+        assert_eq!(decode_rung_lo(&ordinary), side);
+        let roles = derive_roles(&table, RoleSource::Positional, |_| 0);
+        for (i, (&t, &role)) in table.iter().zip(&roles).enumerate() {
+            let rows = program_rows(t);
+            let want = if i < pf.len() {
+                ProgramRole::PrefillBucket { rows }
+            } else if i < side {
+                ProgramRole::PackedSibling { of_rows: rows }
+            } else if i < lo {
+                ProgramRole::DenseExactRung { rows }
+            } else {
+                ProgramRole::DecodeRung { rows }
+            };
+            assert_eq!(role, want, "at {i}");
+            assert_eq!(role.is_decode_rung(), i >= side, "at {i}");
+            assert_eq!(role.is_dense_exact_rung(), (side..lo).contains(&i), "at {i}");
+            assert_eq!(role.is_prefill_side(), i < side, "at {i}");
+        }
+        assert_eq!(
+            derive_roles(&table, RoleSource::Stated, |_| 0)[side..lo],
+            roles[side..lo]
+        );
     }
 
     #[test]

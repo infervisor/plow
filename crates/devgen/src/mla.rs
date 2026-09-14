@@ -3748,7 +3748,9 @@ pub(crate) fn emit_glm_mla(
         && [[idx_hi * idx_di, ql], [idx_di, h], [idx_hi, h]]
             .into_iter()
             .all(|s| glm_decode_lt_routes(rows, s));
-    let pre_idx_kw = idx_group.then(|| {
+    // A dense-exact rung keeps only the k projection, which feeds the indexer key cache.
+    let dense_exact = dense_exact_emit();
+    let pre_idx_kw = (idx_group && !dense_exact).then(|| {
         [
             ([n.kidx_raw, n.xn, w.iwk], [idx_di, h]),
             ([n.widx, n.xn, w.iwp], [idx_hi, h]),
@@ -3757,6 +3759,10 @@ pub(crate) fn emit_glm_mla(
             emit_glm_decode_gemm_lt(b, c, enc, rows, ops, shape, &[c_rn1])
                 .expect("routed to the native GEMM")
         })
+    });
+    let pre_idx_k = (idx_group && dense_exact).then(|| {
+        emit_glm_decode_gemm_lt(b, c, enc, rows, [n.kidx_raw, n.xn, w.iwk], [idx_di, h], &[c_rn1])
+            .expect("routed to the native GEMM")
     });
     // 3 q_a_layernorm
     //
@@ -3884,7 +3890,8 @@ pub(crate) fn emit_glm_mla(
         )
         .expect("routed to the native GEMM");
         [c_q0, c_k0, c_w]
-    });
+    })
+    .or(pre_idx_k.map(|c_k0| [0, c_k0, 0]));
     // The decode ropes take DISJOINT slices of `all` (see `rope_cus`): q needs ceil(nh_l/8)
     // workgroups, the shared-head k rope needs 1, and the two are concurrent siblings.
     let rq = if dr > 0 {
@@ -4056,6 +4063,7 @@ pub(crate) fn emit_glm_mla(
     let dsa = c.dsa(ctx);
     let full = dsa && w.iwqb != TENSOR_NONE; // 'full' indexer layer (weights bound only there)
     let itk = c.index_topk.min(ctx);
+    let sparse = dsa && !dense_exact;
     let c_sel = emit_glm_dsa_decode_select(
         b, c, n, w, slot, ctx, rows, dbatch, enc, &all, eps, ql, h, c_rnq, c_rn1, &rq, &rk, pre_idx,
     );
@@ -4095,7 +4103,7 @@ pub(crate) fn emit_glm_mla(
             "PLOW_GLM_FP8_KV=1"
         }
     );
-    if dsa && fp8kv {
+    if sparse && fp8kv {
         assert!(
             nh_l == 8
                 && dk == 512
@@ -4155,7 +4163,7 @@ pub(crate) fn emit_glm_mla(
                 d.t[7] = n.kv_scale[slot]; // per-row dequant scales; the kernel traps on NULL
                 d.i[6] = 0; // krot stays bf16 (the shipped K3 form)
             }
-            if dsa {
+            if sparse {
                 if fp8kv {
                     d.j[0] = n.iidx + 1;
                 } else {
@@ -4168,7 +4176,7 @@ pub(crate) fn emit_glm_mla(
     // Native sparse decode boundary (PLOW_GLM_MLA_DEC_AITER): the runtime routes the isolated
     // segment through the pinned AITER QH8 object and runs this arm on steps where any row
     // holds fewer than 2048 keys.
-    if dsa && fp8kv && emit_config::active().glm_mla_dec_aiter {
+    if sparse && fp8kv && emit_config::active().glm_mla_dec_aiter {
         b.isolate(c_fl);
     }
     // 10 FUSED MLA MERGE+FOLD: online-softmax-merge the ns_attn latent partials (Opart/mlpart) in
@@ -4298,6 +4306,34 @@ pub(crate) fn emit_glm_mla(
     }
 }
 
+thread_local! {
+    static DENSE_EXACT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Marks the decode program being emitted as a dense-exact rung (`PLOW_GLM_DECODE_DENSE_EXACT`).
+struct DenseExactEmit;
+
+impl DenseExactEmit {
+    fn set() -> Self {
+        DENSE_EXACT.with(|f| f.set(true));
+        DenseExactEmit
+    }
+}
+
+impl Drop for DenseExactEmit {
+    fn drop(&mut self) {
+        DENSE_EXACT.with(|f| f.set(false));
+    }
+}
+
+/// Narrowest decode rung that gets a dense-exact twin: production TP never dispatches below rung 8, and
+/// rung 1 stalled on a shared-expert GEMV at full depth.
+pub(crate) const GLM_DENSE_EXACT_MIN_RUNG: u32 = 8;
+
+fn dense_exact_emit() -> bool {
+    DENSE_EXACT.with(|f| f.get())
+}
+
 /// Emit the DSA lightning indexer's DECODE-path selection chain for one layer (G2/G5):
 /// ctx>2048 => project q_idx/k_idx/w, score, top-k select -> idx table, consumed by
 /// `FlashGatherDecode` back in `emit_glm_mla`. ctx<=2048 => dense flash (this returns 0, a
@@ -4328,6 +4364,7 @@ fn emit_glm_dsa_decode_select(
 ) -> u32 {
     let one = vec![0u32];
     let dsa = c.dsa(ctx);
+    let dense_exact = dense_exact_emit();
     // Batched DSA decode hands `IndexSelect` a per-row offset in `i[3]`. Both objects honour
     // it behind `PLOW_DSA_DECODE_BATCH` (`d_index_select_sm120` takes `batch_row`/`kv_len`;
     // the gfx942 arm likewise), and the manifest requires that arm on BOTH backends
@@ -4380,29 +4417,34 @@ fn emit_glm_dsa_decode_select(
         // `pre`: the q/k/weights projections were emitted beside their siblings.
         let c_q0 = match pre {
             Some([c_q0, _, _]) => c_q0,
+            None if dense_exact => 0,
             None => gemv_blk(b, n.qidx, n.qlat, w.iwqb, hi * di, ql, &[c_rnq]),
         };
         // The indexer ropes are concurrent with each other AND with the q/k pair above (all four
         // hang off the input norm), so they continue the same disjoint allocation.
         let riq = rope_cus(all, rq.len() + rk.len(), rows, hi);
         let rik = rope_cus(all, rq.len() + rk.len() + riq.len(), rows, 1);
-        let c_qi = b.emit(DevOp::HeadNormRope, riq.clone(), &[c_q0], |d| {
-            d.t[0] = n.qidx;
-            d.t[1] = n.qidx;
-            d.t[2] = TENSOR_NONE;
-            d.t[3] = n.icos;
-            d.t[4] = n.isin;
-            d.t[5] = n.pos;
-            d.i[0] = rows;
-            d.i[1] = hi;
-            d.i[2] = di;
-            d.i[3] = 0;
-            d.i[4] = 1;
-            d.i[5] = 1;
-            d.f[0] = eps;
-            d.j[0] = 0;
-            d.j[1] = KV_MASK_NONE;
-        });
+        let c_qi = if dense_exact {
+            0
+        } else {
+            b.emit(DevOp::HeadNormRope, riq.clone(), &[c_q0], |d| {
+                d.t[0] = n.qidx;
+                d.t[1] = n.qidx;
+                d.t[2] = TENSOR_NONE;
+                d.t[3] = n.icos;
+                d.t[4] = n.isin;
+                d.t[5] = n.pos;
+                d.i[0] = rows;
+                d.i[1] = hi;
+                d.i[2] = di;
+                d.i[3] = 0;
+                d.i[4] = 1;
+                d.i[5] = 1;
+                d.f[0] = eps;
+                d.j[0] = 0;
+                d.j[1] = KV_MASK_NONE;
+            })
+        };
         // k_idx pre-rope: wk @ xn, k_norm. Shared by both the dense (GLM-5.2) and pooled
         // (GLM-5.3-Flash) paths below — only what the rope writes INTO differs.
         let c_k0 = match pre {
@@ -4578,6 +4620,9 @@ fn emit_glm_dsa_decode_select(
                 }
                 d.j[1] = KV_MASK_NONE;
             });
+            if dense_exact {
+                return c_ki;
+            }
             // w = weights_proj @ xn  [HI]  (bf16 GEMV)
             // Plain bf16 GEMV, explicitly — NOT the encoding-aware helper. Under MXFP4 that helper
             // would emit GEMV_MXFP4 against a bf16 weight with a null scale; the assert above makes the
@@ -9308,8 +9353,23 @@ fn glm_emit_full(
     // layer l+1 reads layer l's output; each layer's first op waits on the previous layer's
     // completion (`dep`). XReduce collectives (decode one-shot): each o_proj + FFN-down
     // all-reduce takes a unique xctr gate id per program. At tp==1 no XReduce is emitted.
+    // PLOW_GLM_DECODE_DENSE_EXACT: a dense-exact rung per width >= GLM_DENSE_EXACT_MIN_RUNG, between the
+    // prefill-side programs
+    // and the ladder. Its role bit stops the positional ladder walk before it.
+    let dense_exact = emit_config::active().glm_decode_dense_exact;
+    assert!(
+        !dense_exact || (c.dsa(ctx) && glm_fp8_kv() && c.index_kpool <= 1),
+        "PLOW_GLM_DECODE_DENSE_EXACT needs the unpooled sparse FP8-KV DSA decode (DSA gate armed \
+         at ctx={ctx}, PLOW_GLM_FP8_KV=1)"
+    );
     let mut n_ops = 0;
-    for &rb in &rungs {
+    for (rb, dense) in rungs
+        .iter()
+        .filter(|&&rb| dense_exact && rb >= GLM_DENSE_EXACT_MIN_RUNG)
+        .map(|&rb| (rb, true))
+        .chain(rungs.iter().map(|&rb| (rb, false)))
+    {
+        let _dense_exact = dense.then(DenseExactEmit::set);
         let mut b = Builder::new(n_cu);
         if (emit_config::active().glm_moe_flat_decode && matches!(rb, 2 | 4 | 8))
             || emit_config::active().glm_moe_resident()
@@ -9388,7 +9448,11 @@ fn glm_emit_full(
         let prog = b.finish();
         n_ops = prog.insts.len();
         progs.push(prog);
-        prog_t.push(rb);
+        prog_t.push(if dense {
+            packet::devbuild::dense_exact_program_t(rb)
+        } else {
+            rb
+        });
     }
 
     let mut m = Model {

@@ -427,6 +427,16 @@ const SMALL_CUS_SCOPE: &[Allow] = &[Allow {
     ..Allow::ANY
 }];
 
+/// The dense-exact decode rungs are programs added beside the ladder; the ladder, the tensor table
+/// and the packet-wide object facts do not move.
+const DENSE_EXACT_SCOPE: &[Allow] = &[Allow {
+    kinds: &["decode"],
+    rows: (8, 20),
+    topology: Some("dense_exact"),
+    fields: &[ScopeField::ProgramSet, ScopeField::Op, ScopeField::ObjectFacts],
+    ..Allow::ANY
+}];
+
 /// The row-split attention arm: attention and the all-to-all in the 2048..8192 prefill buckets,
 /// and the packet-wide object facts its arm adds.
 const ROWSPLIT_ATTN_SCOPE: &[Allow] = &[
@@ -634,6 +644,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.glm_moe_aiter", Some("PLOW_GLM_MOE_AITER"), Layer::Emit, Domain::Bool, GLM_RECIPE_ON, GLM_RECIPE),
     KnobSpec::new("emit.glm_moe_flat_decode", Some("PLOW_GLM_MOE_FLAT_DECODE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_mla_dec_aiter", Some("PLOW_GLM_MLA_DEC_AITER"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("emit.glm_decode_dense_exact", Some("PLOW_GLM_DECODE_DENSE_EXACT"), Layer::Emit, Domain::Bool, OFF, OPT_IN).scoped(DENSE_EXACT_SCOPE),
     KnobSpec::new("emit.glm_moe_resident", Some("PLOW_GLM_MOE_RESIDENT"), Layer::Emit, Domain::Bool, GLM_RECIPE_ON, GLM_RECIPE),
     KnobSpec::new("emit.glm_moe_shared_fold", Some("PLOW_GLM_MOE_SHARED_FOLD"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_moe_shared_seed", Some("PLOW_GLM_MOE_SHARED_SEED"), Layer::Emit, Domain::Bool, OFF, MOE_SHARED_SEED_CANDIDATE).scoped(MOE_SHARED_SEED_SCOPE),

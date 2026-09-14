@@ -146,6 +146,173 @@ fn production_programs_read_only_rows_every_rank_holds() {
     }
 }
 
+/// The production fixture above, emitted with `PLOW_GLM_DECODE_DENSE_EXACT` off or on: program
+/// words, instructions, tensor table and `build.json`.
+#[allow(clippy::type_complexity)]
+fn emit_dense_exact_fixture(
+    on: bool,
+) -> (Vec<u32>, Vec<Vec<crate::DevInst>>, Vec<(String, u64)>, serde_json::Value) {
+    use std::sync::{Arc, Mutex};
+    let _target = crate::EmitAmdGuard::set(true);
+    // `tuning.tile_lookups` counts this thread's tile decisions; each emit starts from zero.
+    crate::tune_demand::reset_tally();
+    let dir = std::env::temp_dir().join(format!("plow-glm-dense-exact-{on}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = serde_json::json!({
+        "model_type": "glm_moe_dsa", "num_hidden_layers": 5,
+        "hidden_size": 6144, "num_attention_heads": 64,
+        "kv_lora_rank": 512, "q_lora_rank": 2048,
+        "qk_nope_head_dim": 192, "qk_rope_head_dim": 64, "v_head_dim": 256,
+        "vocab_size": 128, "rms_norm_eps": 1e-5,
+        "n_routed_experts": 256, "num_experts_per_tok": 8,
+        "moe_intermediate_size": 2048, "intermediate_size": 12288,
+        "first_k_dense_replace": 3, "routed_scaling_factor": 2.5,
+        "rope_theta": 8000000.0,
+        "indexer_types": ["full", "shared", "full", "shared", "full"]
+    });
+    std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+    let mut env = vec![
+        ("PLOW_FP8", "1"),
+        ("PLOW_GLM_DECODE_NORM_ROWS", "1"),
+        ("PLOW_GLM_DSA", "1"),
+        ("PLOW_GLM_DSA_PF", "1"),
+        ("PLOW_GLM_DSA_PF_SPAN", "3"),
+        ("PLOW_GLM_FP8_KV", "1"),
+        ("PLOW_GLM_FUSE_B1", "1"),
+        ("PLOW_GLM_FUSE_ROPE", "0"),
+        ("PLOW_GLM_FUSE_SEAM", "1"),
+        ("PLOW_GLM_GEMM_LT", "1"),
+        ("PLOW_GLM_GEMM_LT_DECODE", "1"),
+        ("PLOW_GLM_INDEX_TP", "1"),
+        ("PLOW_GLM_MOE_AITER", "1"),
+        ("GLM_MOE_CORESIDENT", "2"),
+        ("PLOW_GLM_MOE_FLAT_DECODE", "0"),
+        ("PLOW_GLM_MOE_RESIDENT", "1"),
+        ("PLOW_GLM_PLACE_PF", "0"),
+        ("PLOW_GLM_SELECT_LOCAL", "1"),
+        ("GLM_SHARD_HEAD", "1"),
+        ("GLM_SHARED_CUS", "48"),
+        ("PLOW_MLA_PREFILL", "full:128,512,2048,8192"),
+        ("PLOW_MOE_PF_DET", "1"),
+        ("PLOW_EMIT_PACKED_PREFILL", "0"),
+        ("PLOW_DECODE_BATCH", "20"),
+        ("PLOW_DECODE_BATCH_LADDER", "1,2,4,8,16,20"),
+        ("PLOW_UNISEG", "0"),
+        ("PLOW_MLA_PF_V2", "1"),
+        ("PLOW_MLA_PF_AITER", "1"),
+        ("PLOW_GLM_SEQ_PAR", "1"),
+        ("PLOW_GLM_SEQ_PAR_PROJ", "1"),
+        ("PLOW_GLM_FOLD_LT", "1"),
+        ("PLOW_GLM_GEMM_LT_DECODE_EXT", "1"),
+    ];
+    if on {
+        env.push(("PLOW_GLM_DECODE_DENSE_EXACT", "1"));
+    }
+    let _env = crate::test_env::EnvScope::set(&env);
+    type Seen = (Vec<u32>, Vec<Vec<crate::DevInst>>, Vec<(String, u64)>);
+    let seen: Arc<Mutex<Seen>> = Default::default();
+    let sink = Arc::clone(&seen);
+    let verify: crate::VerifyHook = Box::new(move |model| {
+        *sink.lock().unwrap() = (
+            model.prog_t.clone(),
+            model.progs.iter().map(|p| p.insts.clone()).collect(),
+            model.tensors.iter().map(|t| (t.name.clone(), t.bytes)).collect(),
+        );
+        Ok(crate::LeanReport::skipped("structural regression test"))
+    });
+    glm_emit_full(
+        &dir,
+        81920,
+        dir.join("model.pkt").to_str().unwrap(),
+        304,
+        8,
+        true,
+        true,
+        "gfx942",
+        None,
+        Some(&verify),
+    );
+    let man = serde_json::from_slice(&std::fs::read(dir.join("build.json")).unwrap()).unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+    let (t, p, x) = std::mem::take(&mut *seen.lock().unwrap());
+    (t, p, x, man)
+}
+
+/// `PLOW_GLM_DECODE_DENSE_EXACT` adds one dense-exact rung per ladder width between the prefill
+/// programs and the ladder, and moves nothing else: the ladder, the tensor table, `union`,
+/// `objects` and the pairing hash are those of the knob-off emit.
+#[test]
+fn dense_exact_rungs_join_the_production_emit_beside_an_unchanged_ladder() {
+    use packet::devbuild::{decode_rung_lo, is_dense_exact_program, program_rows};
+    let _guard = crate::test_env::env_guard();
+    let (off_t, off_p, off_x, off_m) = emit_dense_exact_fixture(false);
+    let (on_t, on_p, on_x, on_m) = emit_dense_exact_fixture(true);
+    let rungs = [1u32, 2, 4, 8, 16, 20];
+    let de_rungs = [8u32, 16, 20];
+    assert!(off_t.iter().all(|&t| !is_dense_exact_program(t)));
+    let lo = decode_rung_lo(&off_t);
+    assert_eq!(off_t[lo..], rungs);
+
+    let dense: Vec<usize> = (0..on_t.len()).filter(|&i| is_dense_exact_program(on_t[i])).collect();
+    assert_eq!(dense, (lo..lo + de_rungs.len()).collect::<Vec<_>>());
+    assert_eq!(dense.iter().map(|&i| program_rows(on_t[i])).collect::<Vec<_>>(), de_rungs);
+    assert_eq!(decode_rung_lo(&on_t), lo + de_rungs.len());
+    let ordinary: Vec<usize> = (0..on_t.len()).filter(|i| !dense.contains(i)).collect();
+    assert_eq!(ordinary.iter().map(|&i| on_t[i]).collect::<Vec<_>>(), off_t);
+    for (&i, off) in ordinary.iter().zip(&off_p) {
+        assert!(on_p[i] == *off, "program {i} (t={:#x}) moved", on_t[i]);
+    }
+    assert_eq!(on_x, off_x, "tensor table moved");
+    for key in ["union", "objects", "pairing"] {
+        assert_eq!(on_m[key], off_m[key], "build.json {key} moved");
+    }
+    assert_eq!(on_m["shapes"]["prefill_buckets"], off_m["shapes"]["prefill_buckets"]);
+    let de_entries: Vec<&serde_json::Value> = on_m["programs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p["topology"] == "dense_exact")
+        .collect();
+    assert!(!de_entries.is_empty());
+    assert!(de_entries.iter().all(|p| p["kind"] == "decode"));
+
+    let kidx: Vec<u32> = (0..on_x.len() as u32)
+        .filter(|&h| on_x[h as usize].0.ends_with(".kidx"))
+        .collect();
+    assert_eq!(kidx.len(), 3, "layers 0, 2 and 4 are full indexer layers");
+    let count = |p: &[crate::DevInst], op: DevOp| p.iter().filter(|d| d.op == op as u16).count();
+    let kidx_writes = |p: &[crate::DevInst]| {
+        let mut w: Vec<u32> = p
+            .iter()
+            .filter(|d| d.op == DevOp::HeadNormRope as u16 && kidx.contains(&d.t[0]))
+            .map(|d| d.t[0])
+            .collect();
+        w.sort_unstable();
+        w
+    };
+    for (k, &i) in dense.iter().enumerate() {
+        let twin = rungs.iter().position(|&r| r == de_rungs[k]).unwrap();
+        let (de, dsa) = (&on_p[i], &on_p[lo + de_rungs.len() + twin]);
+        let flash = |p: &[crate::DevInst]| -> Vec<crate::DevInst> {
+            p.iter()
+                .filter(|d| d.op == DevOp::FlashMlaDecodeFp8 as u16)
+                .copied()
+                .collect()
+        };
+        let (fd, fs) = (flash(de), flash(dsa));
+        assert_eq!(fd.len(), 5, "rung {}", de_rungs[k]);
+        assert_eq!(fd.len(), fs.len());
+        for (d, s) in fd.iter().zip(&fs) {
+            assert_ne!(s.j[0], 0, "the DSA rung is sparse");
+            assert_eq!((d.j[0], d.i[6], d.i[2], d.i[4]), (0, 0, 81920, s.i[4]), "rung {}", de_rungs[k]);
+        }
+        assert!(count(dsa, DevOp::IndexScore) > 0);
+        assert_eq!(count(de, DevOp::IndexScore) + count(de, DevOp::IndexSelect), 0);
+        assert_eq!(kidx_writes(de), kidx, "rung {}", de_rungs[k]);
+        assert_eq!(kidx_writes(de), kidx_writes(dsa));
+    }
+}
+
 #[test]
 fn single_row_prefill_gemv_preserves_bf16_projection_layout() {
     let _guard = crate::test_env::env_guard();

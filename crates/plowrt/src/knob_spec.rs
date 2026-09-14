@@ -79,6 +79,12 @@ const DECODE_MIN_RUNG_SCOPE: &[Allow] = &[Allow {
     fields: &[ScopeField::Route],
     ..Allow::ANY
 }];
+const DECODE_DENSE_EXACT_SCOPE: &[Allow] = &[Allow {
+    kinds: &["decode"],
+    rows: (8, 20),
+    fields: &[ScopeField::Route],
+    ..Allow::ANY
+}];
 
 const C_PF_SEG_GEMM_SMALL: &[Constraint] = &[Constraint {
     id: "pf_seg_gemm_small_requires_seg_dir",
@@ -409,6 +415,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.ragged_chunk", Some("PLOW_RAGGED_CHUNK"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.ragged_seams", Some("PLOW_AMD_RAGGED_SEAMS"), Layer::Runtime, Domain::Bool, UNSET, OPT_IN),
     KnobSpec::new("rt.mla_ns_live", Some("PLOW_MLA_NS_LIVE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("rt.amd_decode_dense_exact", Some("PLOW_AMD_DECODE_DENSE_EXACT"), Layer::Runtime, Domain::Bool, OFF, OPT_IN).scoped(DECODE_DENSE_EXACT_SCOPE),
     KnobSpec::new("rt.rt_hsaco", Some("PLOW_HSACO"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.fp8_dir", Some("PLOW_FP8_DIR"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.trace_raw", Some("PLOW_TRACE_RAW"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),

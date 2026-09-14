@@ -75,6 +75,7 @@ fn role_key(role: ProgramRole, insts: &[DevInst64]) -> Key {
         ProgramRole::DecodeRung { .. } => ("decode", "ordinary"),
         ProgramRole::PackedSibling { .. } => ("packed", "packed"),
         ProgramRole::TokenBatchBody { .. } => ("token_batch", "ordinary"),
+        ProgramRole::DenseExactRung { .. } => ("decode", "dense_exact"),
     };
     Key {
         kind,
@@ -492,7 +493,7 @@ pub fn route(p: &Packet, w: &Workload, knobs: RouteKnobs) -> Result<Vec<Step>, S
     let mut rungs: Vec<&Key> = p
         .programs
         .iter()
-        .filter(|x| x.key.kind == "decode")
+        .filter(|x| x.key.kind == "decode" && x.key.topology == "ordinary")
         .map(|x| &x.key)
         .collect();
     rungs.sort();

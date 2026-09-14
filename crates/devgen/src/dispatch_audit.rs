@@ -249,7 +249,7 @@ fn rows(m: &Model) -> BTreeMap<Row, u32> {
     let mut out: BTreeMap<Row, u32> = BTreeMap::new();
     for (pi, p) in m.progs.iter().enumerate() {
         let encoded_t = m.prog_t.get(pi).copied().unwrap_or(0);
-        let kind = if pi >= dec_lo {
+        let kind = if pi >= dec_lo || packet::devbuild::is_dense_exact_program(encoded_t) {
             "1decode"
         } else if packet::devbuild::is_token_batch_program(encoded_t) {
             "2token_batch"

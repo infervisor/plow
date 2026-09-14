@@ -720,6 +720,7 @@ impl DevBlob {
                     packet::devbuild::packed_prefill_program_t(p.t)
                 }
                 ProgramRole::TokenBatchBody { .. } => packet::devbuild::token_batch_program_t(p.t),
+                ProgramRole::DenseExactRung { .. } => packet::devbuild::dense_exact_program_t(p.t),
                 ProgramRole::DecodeRung { .. } if self.parent.is_some() => {
                     packet::devbuild::decode_rung_program_t(p.t)
                 }
@@ -774,9 +775,12 @@ impl DevBlob {
         self.prefill_phase().collect()
     }
 
-    /// Decode rung programs in ascending width order.
+    /// Decode rung programs in ascending width order; dense-exact rungs are not ladder rungs.
     pub fn decode_progs(&self) -> Vec<&DevProg> {
-        let mut out: Vec<&DevProg> = self.decode_phase().collect();
+        let mut out: Vec<&DevProg> = self
+            .decode_phase()
+            .filter(|p| !p.role.is_dense_exact_rung())
+            .collect();
         out.sort_by_key(|p| p.t);
         out
     }
@@ -1785,6 +1789,9 @@ mod tests {
                 }
                 packet::devbuild::ProgramRole::TokenBatchBody { .. } => {
                     packet::devbuild::token_batch_program_t(p.t)
+                }
+                packet::devbuild::ProgramRole::DenseExactRung { .. } => {
+                    packet::devbuild::dense_exact_program_t(p.t)
                 }
                 _ => p.t,
             })
