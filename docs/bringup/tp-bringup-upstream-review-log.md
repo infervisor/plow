@@ -1539,6 +1539,47 @@ the Selection branch; only ranks 0-1 would point back at the CSR, which would be
 `rbfault16` zeroed that buffer and forgot its staged key on every dispatch without helping. Any
 other split names the quantity by where the boundary falls. Client-side only — no build, no knob.
 
+## On a poisoned server ALL EIGHT bands are wrong, which clears both `band_keys` arms (2026-09-14, job `rbfault19-whichband`)
+
+`rbfault18` having shown the two servers narrate nothing different, the question changed from
+"which buffer is wrong" to "which part of the output is wrong". The row-split sibling does not
+treat its eight bands alike: at 8192 the chunk has `prior = 0` and 1024 rows per rank, so
+`band_keys(prior, rank, rows)` gives rank 0 the Identity lower-half CSR at `band_prior = 0`, rank 1
+the same CSR at 1024, and ranks 2-7 the Selection path — `self.kp` from the pack kernel plus the
+`IndexTpPf` index tensor at `index_row0`. Two code paths inside one dispatch, split at a known row.
+
+A needle at each of the eight band centres (absolute rows `b*1024 + 512`), three samples each:
+
+| arm | sequence | result |
+|---|---|---|
+| `healthy` | 8192 only | **24/24 pass** — reproduces `rbfault7` on this binary |
+| `poisoned` | 4096 first, then the sweep | **0/24 — every band fails** |
+
+Zero fault lines in both, and the preceding 4096 passed 3/3.
+
+**Both arms of `band_keys` are wrong together, so neither is the defect.** The Identity CSR was
+already the weaker candidate — `rbfault16` zeroed that buffer and forgot its staged key before
+every dispatch without helping — and this removes the Selection arm alongside it. What is left is
+what FEEDS the dispatch (the row-band Q, the FP8 single-pass pack's inputs, the latent cache) or
+what happens to its result (the single grouped `MlaMergeFold`, the band `o_proj`, the sequence-
+parallel residual and norm gather).
+
+**Why the next step is a trace and not another arm.** Every quantity the dispatch derives —
+`w.rows`, `w.kv_len`, `w.kv_base`, `prior`, `route.kv_len`, `route.local_index`, `index_row0`, and
+which `band_keys` arm was actually taken — is computed inside `enqueue_window_rowsplit` and then
+used, silently. `rbfault18` could only compare log lines that exist, and none of these did. One
+`tracing::debug!` per rank per dispatch now prints them, and `rbfault20-dispatchnums` diffs a
+healthy against a poisoned dispatch field by field.
+
+One hypothesis is worth naming in advance because it predicts exactly this "all eight wrong"
+signature: if `w.kv_len` is larger than the chunk on a poisoned server, then
+`prior = kv_len - rows*8` is no longer 0, every band's `band_prior` shifts by the same amount,
+`band_keys` sends ALL ranks down Selection, and every band reads the wrong keys — deterministic,
+in bounds, no fault, first chunk already wrong. `rbfault10` reported `program=4 bucket=8192 c0=0
+clen=8192` with no prefix attached, which establishes the CHUNK is right; it says nothing about
+what `route.kv_len` was. If instead every field matches, the inputs agree and the corruption is in
+the tensors those addresses point at, which is a different set of things to instrument.
+
 ## The tile-campaign blocker resolves into three classes with three different owners (2026-09-14, job `gemmtune-glm53`, follow-up)
 
 The section above records 374 FAIL lines over 44 objects and stops at "it wants an owner". Building

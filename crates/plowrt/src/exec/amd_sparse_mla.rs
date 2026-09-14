@@ -1727,6 +1727,31 @@ impl SparseMla {
         timer.lap(be, "pack")?;
         let index_row0 = if route.local_index { 0 } else { u64::from(rank) * u64::from(route.rows) };
         let prior = w.kv_len - w.rows * (NH / 8);
+        // Every quantity the row-band dispatch derives, per rank. `rbfault19` showed that on a
+        // poisoned server ALL EIGHT bands are wrong, which rules out either arm of `band_keys`
+        // on its own and points at what feeds them; none of these is printed anywhere else, so
+        // a healthy and a poisoned run cannot currently be compared on the numbers they use.
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let band = band_keys(prior, rank, w.rows);
+            tracing::debug!(
+                rank,
+                rows = w.rows,
+                kv_len = w.kv_len,
+                kv_base = w.kv_base,
+                row0 = w.row0,
+                prior,
+                route_rows = route.rows,
+                route_kv_len = route.kv_len,
+                local_index = route.local_index,
+                index_row0,
+                band = match band {
+                    Some(BandKeys::Identity { band_prior }) => format!("identity@{band_prior}"),
+                    Some(BandKeys::Selection) => "selection".to_string(),
+                    None => "STRADDLE".to_string(),
+                },
+                "row-band dispatch"
+            );
+        }
         let csr = match band_keys(prior, rank, w.rows) {
             Some(BandKeys::Selection) => None,
             Some(BandKeys::Identity { band_prior }) => {
