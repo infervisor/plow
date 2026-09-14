@@ -1389,6 +1389,29 @@ fn packed_dense_contract_accepts_split_attention_and_refuses_other_state() {
 }
 
 #[test]
+fn packed_dense_contract_accepts_fp8_weight_and_activation_ops() {
+    let mut p = segmented_prog(
+        &[
+            DevOp::RmsNorm,
+            DevOp::QuantFp8,
+            DevOp::GemmFp8,
+            DevOp::GemmSmallFp8,
+            DevOp::GemmMedFp8,
+            DevOp::GemmWideFp8,
+            DevOp::GemmC5Fp8,
+            DevOp::GemmGluFp8,
+            DevOp::HeadNormRope,
+            DevOp::FlashPrefill,
+            DevOp::FlashMerge,
+        ],
+        &[0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2],
+    );
+    p.insts[9].i[6] = 512;
+    p.insts[9].i[7] = 4;
+    assert!(super::check_packed_dense_program(&p.insts).is_ok());
+}
+
+#[test]
 fn prefill_sandwich_norm_requires_dispatch_marker() {
     let plain = segmented_prog(&[DevOp::RmsNorm], &[0]);
     let fused = segmented_prog(&[DevOp::NormResidualNorm], &[0]);

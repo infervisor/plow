@@ -3283,6 +3283,13 @@ fn check_packed_dense_program(insts: &[DevInst64]) -> Result<()> {
                     | DevOp::GemmMed
                     | DevOp::GemmWide
                     | DevOp::GemmGlu
+                    | DevOp::QuantFp8
+                    | DevOp::GemmFp8
+                    | DevOp::GemmMedFp8
+                    | DevOp::GemmSmallFp8
+                    | DevOp::GemmWideFp8
+                    | DevOp::GemmC5Fp8
+                    | DevOp::GemmGluFp8
                     | DevOp::NormResidual
                     | DevOp::NormResidualNorm
             )
