@@ -859,9 +859,22 @@ and eight. When a lease comes free, spend it here first.
 
 So the ordered critical path to an 8k/90 ms number is:
 
-0. **block-FP8 at `[32, 32]` with E8M0 scales** -- a scale-handling arm on the
-   existing block-FP8 GEMM, borrowing the MXFP4 path's group-32 E8M0 row
-   convention. Gates 112.0 TFLOP of 281.6;
+0. **block-FP8 at `[32, 32]` with E8M0 scales** -- gates 112.0 TFLOP of 281.6.
+   **The arm is WRITTEN (`d_gemm_t<WFP8MX>` / `d_gemm_fp8_mx`) and verified
+   offline; its NUMERICS ARE UNVERIFIED** because no GPU came free. It runs at
+   BK=32, where one k-tile is exactly one scale block, so the promotion is every
+   tile and still lands outside the MFMA burst. Offline it compiles, issues
+   `v_mfma_f32_32x32x8_bf16`, reads the scale with `global_load_ubyte` (not
+   `flat_`), does not spill, and costs **136 VGPR at occupancy 3** against the
+   `[128, 128]` sibling's 160 VGPR at occupancy 2 -- BK=32 halves the staging
+   fragments, so it is *cheaper* in registers than the arm it parallels and the
+   halved K step is at least partly bought back. The interpreter's `.text` is
+   byte-identical to the commit before it, which is the check that matters for a
+   new template parameter on a `d_gemm_t` every GEMM in the tree instantiates.
+   `runtime/tests/dsv41_blockfp8_gfx942_test.hip` is built and queued: it checks
+   the real projection shapes plus ragged tails and an `N = 33` case against a
+   reference that decodes e4m3 and ue8m0 from first principles. Remaining: run
+   it, then measure BK=32 against a BK=64 variant that promotes twice per tile;
 
 1. ~~opcodes + dispatch for `d_compress_pool` and `d_rope_inverse_o`~~ -- DONE
    (ops 180/181, verified on gfx942 hardware);
