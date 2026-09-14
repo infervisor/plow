@@ -303,3 +303,43 @@ indexer needs the pre-RoPE latent and the write applies RoPE in place
 (`model.py:748-750`, and the reference comments the read-after-write at
 `model.py:762`). An emitter that reorders the compressor's cache write ahead
 of the indexer reads roped keys and silently produces wrong indices.
+
+---
+
+## 7. Object contract (read from the shards, not the reference)
+
+Safetensors headers of the downloaded shards. Two entries contradict
+`inference/model.py`, and in both cases the SHARD wins — `convert.py`
+dequantizes on the way to the reference implementation, so reading dtypes off
+`model.py` would size the weights wrong.
+
+| tensor | dtype | shape | note |
+|---|---|---|---|
+| `attn.wq_a.weight` / `.scale` | F8_E4M3 / F8_E8M0 | `[1280, 5120]` / `[40, 160]` | 40 x 160 = ceil(1280/32) x ceil(5120/32) — the `[32,32]` grid, confirmed |
+| `attn.wq_b.weight` / `.scale` | F8_E4M3 / F8_E8M0 | `[32768, 1280]` / `[1024, 40]` | 32768 = 64 heads x 512 |
+| `attn.wkv.weight` / `.scale` | F8_E4M3 / F8_E8M0 | `[512, 5120]` / `[16, 160]` | the single 512-wide KV latent |
+| `attn.wo_a.weight` / `.scale` | **F8_E4M3** / F8_E8M0 | `[8192, 4096]` / `[256, 128]` | `model.py:645` declares `dtype=bfloat16`; the shard is fp8. 8192 = `o_groups * o_lora_rank`, 4096 = `o_group_in_features` |
+| `attn.wo_b.weight` / `.scale` | F8_E4M3 / F8_E8M0 | `[5120, 8192]` / `[160, 256]` | |
+| `ffn.experts.{E}.w1.weight` / `.scale` | **I8** / F8_E8M0 | `[2304, 2560]` / `[2304, 160]` | 2560 = 5120/2, two fp4 nibbles per byte. 160 = 5120/32 — MXFP4 group 32, E8M0 |
+| `ffn.experts.{E}.w2.weight` / `.scale` | I8 / F8_E8M0 | `[5120, 1152]` / `[5120, 72]` | 72 = 2304/32 |
+| `ffn.shared_experts.w*` | F8_E4M3 / F8_E8M0 | `[2304, 5120]` / `[72, 160]` | the shared expert is block-FP8, NOT fp4 |
+| `attn.compressor.wkv.weight` | **BF16** | `[512, 5120]` | `model.py:446` declares f32 at ratio > 1; the shard is bf16 |
+| `attn.compressor.wgate.weight` | BF16 | `[512, 5120]` | |
+| `attn.indexer.wq_b.weight` / `.scale` | F8_E4M3 / F8_E8M0 | `[4096, 1280]` / `[128, 40]` | 4096 = 32 index heads x 128 |
+| `attn.indexer.wk.weight` | BF16 | `[128, 512]` | index key from the 512-wide latent |
+| `attn.attn_sink` | **F32** | `[64]` | one per head. plow's `FlashMerge` `t3=sinks` slot is bf16 |
+| `hc_attn_fn` / `hc_ffn_fn` | F32 | `[24, 20480]` | 24 = `(2 + hc_mult) * hc_mult`, 20480 = `hc_mult * hidden` |
+| `hc_attn_base` / `hc_attn_scale` | F32 | `[24]` / `[3]` | |
+| `ffn.gate.weight` | BF16 | `[384, 5120]` | |
+| `ffn.gate.bias` / `.bias_vl` | F32 | `[384]` | `bias_vl` is the image-span routing bias |
+| `embed.weight` | BF16 | `[129280, 5120]` | |
+| `vision.blocks.{B}.mlp.w1.weight` | BF16 | `[5632, 1024]` | 5632 = 2 x 2816 — fused gate+up |
+
+Two encodings therefore live in one layer, as in V4: routed experts are
+nibble-packed fp4 with an E8M0 scale per 32 along K, while every projection
+and the shared expert are block-FP8 e4m3 on a `[32,32]` ue8m0 grid. A single
+`projection_weight_dtype` cannot describe the block.
+
+Note this is the WEIGHT encoding. The compressed KV *cache* is a different fp4
+again — group 16 with E4M3 scales, written at runtime (§5.2) — and the two
+must not be conflated.
