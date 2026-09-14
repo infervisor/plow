@@ -91,5 +91,27 @@ run)
       --input-file "$PROMPT" --max-new-tokens "$NEW_TOKENS" --temperature 0
   ;;
 
-*) echo "usage: $0 {check|convert|run}"; exit 2 ;;
+# ---------------------------------------------------------------- BENCH (leases MP GPUs)
+# Same load path as `run`, but times prefill and decode separately. The
+# reference's generate() reports no timing and is the Stage-5 oracle, so it is
+# imported rather than edited.
+bench)
+  [ -f "$PROMPT" ] || { echo "!! prompt $PROMPT missing"; exit 1; }
+  for r in $(seq 0 $((MP - 1))); do
+    [ -f "$TP8/model${r}-mp${MP}.safetensors" ] || {
+      echo "!! $TP8 missing model${r}-mp${MP}.safetensors — run 'convert' first"; exit 1; }
+  done
+  mkdir -p "$OUT"
+  exec env GPU_LEASE_TIMEOUT="${GPU_LEASE_TIMEOUT:-43200}" "$LEASE" -n "$MP" "dsv41-ref-bench-8k" \
+    env ROCM_PATH="$ROCM_PATH" VLLM_ROCM_LIB="$VLLM_ROCM_LIB" \
+        PYTHONPATH="$HF/inference" HF_HUB_OFFLINE=1 \
+    "$PY" -m torch.distributed.run --nproc-per-node "$MP" \
+      "$WT/scripts/dsv41_ref_bench.py" \
+      --ckpt-path "$TP8" --config "$HF/inference/config.json" \
+      --prompt-file "$PROMPT" --prefill-len "${PREFILL:-8192}" \
+      --decode-steps "${DECODE_STEPS:-8}" \
+      --json-out "$OUT/ref-8k.json"
+  ;;
+
+*) echo "usage: $0 {check|convert|run|bench}"; exit 2 ;;
 esac
