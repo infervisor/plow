@@ -52,18 +52,20 @@
 /* gv_un_fp8 picks the fp8 GEMV unroll by the K-divisor rule (op_gemm_common.h). Measured HERE:
  * K=3840/4096 -18..-27% standalone; gfx950 keeps the constant until someone measures the rule there. */
 #define PLOW_GV_UN_FP8_KDIV 1
-/* CDNA3 ONLY: the matrix core reads e4m3FNUZ, in which 0x80 is a NaN rather than OCP's -0.
- * Zeroing it here -- on the 8-byte group already sitting in registers, two SWAR words, before it
- * ever reaches LDS -- is the whole cost of running plow's OCP bytes through it. Every other byte
- * is exactly half its OCP value and PLOW_FP8_MMA_FIX puts that back in the epilogue.
- * A weight that quantised to negative zero would otherwise NaN the entire output tile. */
+/* CDNA3 reads e4m3FNUZ, where OCP's 0x80 (-0) is NaN. Production operands are already
+ * canonical: d_quant_fp8 never emits 0x80, and HsaUploadRing scrubs every F8_E4M3 checkpoint
+ * payload once while uploading it. Repeating the SWAR scrub for every operand K-tile only burns
+ * VALU and registers in the hot GEMM loop. Keep it in C5: deleting it there crosses a compiler
+ * allocation cliff (+2 scratch operations), while Gemma's M1024 projection rung uses E2. */
 #define GM8_FIX8(p)                                                                          \
     do {                                                                                      \
-        unsigned w_[2];                                                                       \
-        __builtin_memcpy(w_, (p), 8);                                                         \
-        w_[0] = plow_fp8_mask_neg0(w_[0]);                                                    \
-        w_[1] = plow_fp8_mask_neg0(w_[1]);                                                    \
-        __builtin_memcpy((p), w_, 8);                                                         \
+        if constexpr (BM == 192 && BN == 256) {                                               \
+            unsigned w_[2];                                                                   \
+            __builtin_memcpy(w_, (p), 8);                                                     \
+            w_[0] = plow_fp8_mask_neg0(w_[0]);                                                \
+            w_[1] = plow_fp8_mask_neg0(w_[1]);                                                \
+            __builtin_memcpy((p), w_, 8);                                                     \
+        }                                                                                     \
     } while (0)
 
 /* ---- arch-DEFAULTED knobs. `#ifndef`-guarded, so -D wins; PLOW_GEOM_MARK'd in geom_contract.h. */

@@ -1597,8 +1597,8 @@ __device__ void d_gemm_fp8_t(bf16* __restrict__ C, const unsigned char* __restri
         }                                                                                     \
     }
 
-/* GM8_FIX8(p): the CDNA3 e4m3FNUZ negative-zero mask on an 8-byte group in registers; a no-op on
- * CDNA4. Defined by op_gemm_gfx942.h / op_gemm_gfx950.h. */
+/* GM8_FIX8(p): the arch hook for an 8-byte FP8 staging group. Production gfx942 operands are
+ * canonical before this loop, so both current arch definitions are no-ops. */
 #define GM8_COMMIT(buf)                                                                      \
     _Pragma("unroll") for (int it = 0; it < APASS; it++) {                                    \
         const unsigned e = threadIdx.x * 8 + it * (THREADS * 8);                              \
