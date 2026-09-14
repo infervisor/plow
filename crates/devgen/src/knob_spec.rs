@@ -1375,6 +1375,7 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
     KnobSpec::new("def.PLOW_PACKED_PREFILL_MLA_FLASH_CONSUMERS", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_PACKET_HASH", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_PACKET_HAS_GEMM_FP8", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_PACKET_HAS_PACKED_PREFILL_TOPOLOGY", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_PACKET_LINEAR_BIAS", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_QKV_DOT4", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
