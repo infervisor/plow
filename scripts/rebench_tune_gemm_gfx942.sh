@@ -24,11 +24,15 @@
 # ------------------------------------------------------------------------------------------
 # THE ENVIRONMENT RULES, all of them learned the expensive way on this box:
 #
-#   * `build_gfx942.sh` runs OUTSIDE nix. hipcc is the system ROCm one and nix's
-#     CPATH/LIBRARY_PATH shadow the glibc it was built against. The digest the store keys on
-#     comes from THESE sources, so the campaign must build the objects it then measures.
-#   * `PLOW_HIPCC=/opt/rocm-7.2.4/bin/hipcc` and the matching ROCM_PATH/HIP_PATH:
-#     `/opt/rocm/bin/hipcc` on this box is broken (its internal clang++ is missing).
+#   * `build_gfx942.sh` runs INSIDE nix, and this script must NOT hand it a hipcc. It now
+#     refuses unless IN_NIX_SHELL is set, PLOW_HIPCC/PLOW_BUNDLER/PLOW_READELF all resolve into
+#     /nix/store, and PLOW_TOOLCHAIN_LABEL is `rocm-7.14.0-nix` -- the flake supplies all four.
+#     THIS RULE WAS THE REVERSE UNTIL 2026-09-14: the script used to build outside nix with
+#     `PLOW_HIPCC=/opt/rocm-7.2.4/bin/hipcc`, and that override is exactly what the guard now
+#     rejects ("FAIL: hipcc must resolve into /nix/store"). The campaign died at step 1/5 in
+#     0.0 min until this was corrected. The digest the store keys on comes from whatever built
+#     the objects, so measuring the nix-built objects is also the correct choice: those are the
+#     ones that ship, since build_gfx942.sh can no longer produce any other kind.
 #   * plowc runs INSIDE nix (it needs the cargo toolchain), and needs `/opt/rocm-*/lib` on
 #     LD_LIBRARY_PATH from INSIDE that shell -- the flake does not carry it, and without it the
 #     HSA dlopen fails.
@@ -74,11 +78,11 @@ if pgrep '^plowrt' >/dev/null 2>&1; then
   echo "FAIL: a plowrt is already running — kernel timings would be fiction:"; pgrep -a '^plowrt'; exit 1
 fi
 
-echo "=== 1/5  building the gfx942 objects + test_kernels.elf into $OBJ (outside nix)"
+echo "=== 1/5  building the gfx942 objects + test_kernels.elf into $OBJ (inside nix)"
 # The SHIPPING recipe, not a special one: the defines participate in the store's digest, so a
 # campaign measured against a different -D set is stale the moment it lands.
-PLOW_HIPCC="$ROCM/bin/hipcc" HIP_PATH="$ROCM" ROCM_PATH="$ROCM" ROCM_HOME="$ROCM" \
-  PLOW_OCC4=1 PLOW_L2HIER=1 JOBS="${JOBS:-14}" ./scripts/build_gfx942.sh "$OBJ"
+"$NIX" develop "$WT" -c \
+  env PLOW_OCC4=1 PLOW_L2HIER=1 JOBS="${JOBS:-14}" ./scripts/build_gfx942.sh "$OBJ"
 [ -f "$OBJ/test_kernels.elf" ] || {
   echo "FAIL: $OBJ/test_kernels.elf missing — build_gfx942.sh must build it (see its own note)"; exit 1; }
 
