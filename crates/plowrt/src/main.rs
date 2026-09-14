@@ -572,6 +572,28 @@ enum Cmd {
         #[arg(long, default_value_t = false)]
         gc: bool,
     },
+
+    /// Package a built bundle + objset + their files into one `.zip`, ready
+    /// to upload to a registry's publish API. Does not build the manifests —
+    /// those still come from `pack_bundle.py`/`pack_objset.py`.
+    #[cfg(feature = "dist")]
+    Pack {
+        /// Bundle manifest, as written by `pack_bundle.py`.
+        #[arg(long)]
+        bundle: PathBuf,
+        /// Objset manifest, as written by `pack_objset.py`.
+        #[arg(long)]
+        objset: PathBuf,
+        /// Directory `bundle.json`'s `files[]` live in.
+        #[arg(long)]
+        assets: PathBuf,
+        /// Directory `objset.json`'s `objects[]` live in.
+        #[arg(long)]
+        objects: PathBuf,
+        /// Output archive path.
+        #[arg(long)]
+        out: PathBuf,
+    },
 }
 
 /// Narrowing shared by `pull` and `load`. Everything not constrained here is
@@ -848,6 +870,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             dist_cmd::report(dist_cmd::cmd_prepare(&model, checkpoint))
         }
         Cmd::Rm { model, gc } => dist_cmd::report(dist_cmd::cmd_rm(&model, gc)),
+        #[cfg(feature = "dist")]
+        Cmd::Pack {
+            bundle,
+            objset,
+            assets,
+            objects,
+            out,
+        } => dist_cmd::report(dist_cmd::cmd_pack(&bundle, &objset, &assets, &objects, &out)),
         #[cfg(feature = "hsa")]
         Cmd::AmdBench {
             blob,
