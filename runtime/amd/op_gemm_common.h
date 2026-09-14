@@ -1598,7 +1598,7 @@ __device__ void d_gemm_fp8_t(bf16* __restrict__ C, const unsigned char* __restri
     }
 
 /* GM8_FIX8(p): the arch hook for an 8-byte FP8 staging group. Production gfx942 operands are
- * canonical before this loop, so both current arch definitions are no-ops. */
+ * canonical before this loop; its C5 arm retains the old mask only to avoid a compiler spill. */
 #define GM8_COMMIT(buf)                                                                      \
     _Pragma("unroll") for (int it = 0; it < APASS; it++) {                                    \
         const unsigned e = threadIdx.x * 8 + it * (THREADS * 8);                              \
