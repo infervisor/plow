@@ -4217,3 +4217,113 @@ fn rowsplit_attn_knob_on_reports_the_extra_declared_bytes() {
         extra_78 as f64 / (1024.0 * 1024.0 * 1024.0)
     );
 }
+
+type FusePostProg = (u32, Vec<(u16, Vec<u32>, Vec<u32>)>);
+
+fn fuse_post_emit(on: bool) -> (Vec<FusePostProg>, String) {
+    let _guard = crate::test_env::env_guard();
+    let _target = crate::EmitAmdGuard::set(true);
+    let _env = crate::test_env::EnvScope::set(&[
+        ("PLOW_MLA_PREFILL", "full:2048,8192"),
+        ("PLOW_GLM_MOE_AITER", "0"),
+        ("PLOW_GLM_MOE_FLAT_DECODE", "0"),
+        ("PLOW_GLM_GEMM_LT_DECODE", "0"),
+        ("PLOW_GLM_GEMM_LT", "0"),
+        ("PLOW_DECODE_BATCH_LADDER", "1"),
+        ("PLOW_EMIT_PACKED_PREFILL", "0"),
+        ("PLOW_UNISEG", "1"),
+        ("PLOW_GLM_FUSE_POST", if on { "1" } else { "0" }),
+    ]);
+    let dir = std::env::temp_dir().join(format!("plow-glm-fuse-post-{on}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = serde_json::json!({
+        "model_type": "glm_moe_dsa", "num_hidden_layers": 4,
+        "hidden_size": 6144, "num_attention_heads": 64,
+        "kv_lora_rank": 512, "q_lora_rank": 2048,
+        "qk_nope_head_dim": 192, "qk_rope_head_dim": 64, "v_head_dim": 256,
+        "vocab_size": 128, "rms_norm_eps": 1e-5,
+        "n_routed_experts": 256, "num_experts_per_tok": 8,
+        "moe_intermediate_size": 2048, "intermediate_size": 12288,
+        "first_k_dense_replace": 3, "routed_scaling_factor": 2.5,
+        "rope_theta": 8000000.0
+    });
+    std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    let verify: crate::VerifyHook = Box::new(move |model| {
+        for (prog, &rows) in model.progs.iter().zip(&model.prog_t) {
+            let insts = prog
+                .insts
+                .iter()
+                .map(|d| (d.op, d.t.iter().map(|&x| x as u32).collect(), d.i.to_vec()))
+                .collect();
+            sink.lock().unwrap().push((rows, insts));
+        }
+        Ok(crate::LeanReport::skipped("fuse-post emit test"))
+    });
+    glm_emit_full(
+        &dir,
+        16384,
+        dir.join("model.pkt").to_str().unwrap(),
+        304,
+        8,
+        true,
+        true,
+        "gfx942",
+        None,
+        Some(&verify),
+    );
+    let config_h = std::fs::read_to_string(dir.join("plow_config.h")).unwrap_or_default();
+    std::fs::remove_dir_all(dir).unwrap();
+    let progs = seen.lock().unwrap().clone();
+    (progs, config_h)
+}
+
+#[test]
+fn glm_fuse_post_folds_the_q_rope_into_the_8192_gemm_med() {
+    let (off, off_h) = fuse_post_emit(false);
+    let (on, on_h) = fuse_post_emit(true);
+    assert_eq!(off.len(), on.len());
+    assert!(!off_h.contains("PLOW_GLM_FUSE_POST"));
+    assert!(on_h.contains("PLOW_GLM_FUSE_POST=1"));
+    let none = packet::dev::TENSOR_NONE;
+    let mut folded_programs = 0;
+    for ((rows, a), (rows_on, b)) in off.iter().zip(&on) {
+        assert_eq!(rows, rows_on);
+        let fused: Vec<usize> = (0..b.len())
+            .filter(|&k| b[k].0 == DevOp::GemmMed as u16 && b[k].1[5] != none)
+            .collect();
+        if *rows != 8192 {
+            assert_eq!(a, b, "program with {rows} rows changed");
+            continue;
+        }
+        folded_programs += 1;
+        assert_eq!(fused.len(), 4);
+        let q_rope: Vec<usize> = (0..a.len())
+            .filter(|&k| a[k].0 == DevOp::HeadNormRope as u16 && a[k].2[1] == 8 && a[k].2[2] == 64)
+            .collect();
+        assert_eq!(q_rope.len(), 4);
+        assert_eq!(a.len(), b.len() + 4);
+        let mut expect = Vec::new();
+        for (k, inst) in a.iter().enumerate() {
+            if q_rope.contains(&k) {
+                continue;
+            }
+            let rope = q_rope.iter().find(|&&h| h > k && a[h].1[1] == inst.1[0]);
+            match rope {
+                Some(&h) if inst.0 == DevOp::GemmMed as u16 => {
+                    let mut t = inst.1.clone();
+                    t[0] = a[h].1[0];
+                    t[3] = a[h].1[3];
+                    t[4] = a[h].1[4];
+                    t[5] = a[h].1[5];
+                    assert_eq!(&inst.2[..4], &[8192, 512, 2048, 0]);
+                    expect.push((inst.0, t, inst.2.clone()));
+                }
+                _ => expect.push(inst.clone()),
+            }
+        }
+        assert_eq!(&expect, b);
+    }
+    assert_eq!(folded_programs, 1);
+}

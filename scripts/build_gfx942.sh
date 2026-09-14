@@ -264,6 +264,7 @@ if [ -n "${PLOW_HSACO_CONFIG:-}" ]; then
       PLOW_MOE_PF_ATOMIC)    [ "$val" = 1 ] && : "${PLOW_MOE_PF_ATOMIC:=1}" ;;
       PLOW_MOE_PF_DET)       [ "$val" = 1 ] && : "${PLOW_MOE_PF_DET:=1}" ;;
       PLOW_GLM_FUSE_QNORM)   [ "$val" = 1 ] && : "${PLOW_GLM_FUSE_QNORM:=1}" ;;
+      PLOW_GLM_FUSE_POST)    [ "$val" = 1 ] && : "${PLOW_GLM_FUSE_POST:=1}" ;;
       PLOW_DSA_SELECT_SPLIT) [ "$val" = 1 ] && : "${PLOW_DSA_SELECT_SPLIT:=1}" ;;
       PLOW_WG_WAVES|PLOW_BUCKET_DECODE|PLOW_FP8|PLOW_FP8_KV|PLOW_MXFP4|PLOW_W8A8|PLOW_MLA_PREFILL|PLOW_MOE_PREFILL|PLOW_MOE_PF_A4W4|PLOW_K3|PLOW_MLA_PREFILL_FP8_SPLIT) ;;
       *) cfg_unmapped="$cfg_unmapped $tok" ;;
@@ -700,6 +701,12 @@ fi
 # hand-built object. The EMIT side stays opt-in.
 if [ "${PLOW_GLM_FUSE_QNORM:-1}" = 1 ]; then
   AX_DECODE="$AX_DECODE -DPLOW_GLM_FUSE_QNORM=1"
+fi
+
+# PLOW_GLM_FUSE_POST=1 (set from the packet's requires): the q-RoPE epilogue on op 15 `GemmMed`
+# (op_gemm_common.h). Prefill objects only; default OFF keeps them byte-unchanged.
+if [ "${PLOW_GLM_FUSE_POST:-0}" = 1 ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_GLM_FUSE_POST=1"
 fi
 
 # OPT-IN (PLOW_DSA_SELECT_SPLIT=1): the split-row batched decode selection (op 59 i[4]=2,

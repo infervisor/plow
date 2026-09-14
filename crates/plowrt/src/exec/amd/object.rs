@@ -367,6 +367,9 @@ pub(super) const PREFILL_ARM_MARKERS: &[(&str, &[&str])] = &[
     // part16 packet stores f32 into a HALF-SIZED part buffer (silent heap overrun); given an
     // a8 packet it matmuls fp8 bytes as bf16. Both must refuse at load.
     ("PLOW_MOE_PF_PART16", &["plow_moe_pf_part16_arm"]),
+    // The prefill q-rope fold (op 15 t5 = pos). An object without the arm stores the unroped
+    // q_rope projection and attention runs on it: no trap. A BUILD axis.
+    ("PLOW_GLM_FUSE_POST", &["plow_glm_fuse_post_arm"]),
     // Dense causal KV-split of the V2 MLA prefill (packet i6 on op 51). Older objects run
     // ns packets at the nsplit=1 partial layout while the merge reads ns — refuse.
     ("PLOW_MLA_PF_NS", &["plow_mla_pf_ns_arm"]),
@@ -980,6 +983,11 @@ pub(super) fn packet_prefill_arm_requirements<'a>(
         .any(|inst| inst.op == DevOp::QuantFp8 as u16 && inst.t[3] != packet::dev::TENSOR_NONE16)
     {
         requires.push("PLOW_T11_GLUQUANT=1".to_owned());
+    }
+    if insts()
+        .any(|inst| inst.op == DevOp::GemmMed as u16 && inst.t[5] != packet::dev::TENSOR_NONE16)
+    {
+        requires.push("PLOW_GLM_FUSE_POST=1".to_owned());
     }
     if required_moe_pf_accum(progs.clone(), 4) {
         requires.push("PLOW_MOE_PF_ATOMIC=1".to_owned());

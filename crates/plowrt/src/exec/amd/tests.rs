@@ -1408,6 +1408,21 @@ fn prefill_sandwich_norm_requires_dispatch_marker() {
     assert!(check_prefill_object(&["plow_prefill_nrn_consumer_1"], path, &requires).is_ok());
 }
 
+#[test]
+fn prefill_q_rope_fold_requires_dispatch_marker() {
+    let mut plain = segmented_prog(&[DevOp::GemmMed], &[0]);
+    plain.insts[0].t = [packet::dev::TENSOR_NONE16; 8];
+    let mut fused = segmented_prog(&[DevOp::GemmMed], &[0]);
+    fused.insts[0].t = [packet::dev::TENSOR_NONE16; 8];
+    fused.insts[0].t[5] = 7;
+    let path = Path::new("interp_prefill_fp8kv_mla_moe_gq.elf");
+    assert!(packet_prefill_arm_requirements(&[plain]).is_empty());
+    let requires = packet_prefill_arm_requirements(&[fused]);
+    assert_eq!(requires, ["PLOW_GLM_FUSE_POST=1"]);
+    assert!(check_prefill_object(&["d_gemm_med"], path, &requires).is_err());
+    assert!(check_prefill_object(&["plow_glm_fuse_post_arm"], path, &requires).is_ok());
+}
+
 fn phase_chain_manifest() -> serde_json::Value {
     serde_json::json!({
         "dispatch_chains": [{

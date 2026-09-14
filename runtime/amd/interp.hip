@@ -2160,9 +2160,21 @@ __device__ __forceinline__ void exec_gemm_small(CInst in, CTens T,
                  (const bf16*)TEN(2), in->i[0], in->i[1], in->i[2], slice, nblk, lds);
 #undef TEN
 }
+#if PLOW_GLM_FUSE_POST
+/* Marker: GemmMed's t5 = pos selects the q-RoPE epilogue (emit knob PLOW_GLM_FUSE_POST). An
+ * object without it stores the unroped projection into `qr`. */
+extern "C" __device__ unsigned plow_glm_fuse_post_arm = 1;
+#endif
 __device__ __forceinline__ void exec_gemm_med(CInst in, CTens T,
                                               unsigned slice, unsigned nblk, bf16* lds) {
 #define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
+#if PLOW_GLM_FUSE_POST
+    if (in->t[5] != PLOW_TENSOR_NONE)
+        d_gemm_med_rope((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2), in->i[0],
+                        in->i[1], in->i[2], slice, nblk, lds, (const float*)TEN(3),
+                        (const float*)TEN(4), (const int*)TEN(5), in->i[3]);
+    else
+#endif
     d_gemm_med((bf16*)TEN(0) + (size_t)in->i[5] * in->i[1],
            (const bf16*)TEN(1) + (size_t)in->i[4] * in->i[2],
                (const bf16*)TEN(2), in->i[0], in->i[1], in->i[2], slice, nblk, lds);

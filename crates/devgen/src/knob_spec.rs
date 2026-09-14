@@ -395,6 +395,26 @@ const MOE_SHARED_SEED_SCOPE: &[Allow] = &[
     },
 ];
 
+/// The q_rope `GemmMed` (op 15) of the 8192 prefill bucket takes the RoPE operands and the q
+/// `HeadNormRope` leaves; the prefill objects gain the arm define through the packet's requires.
+const FUSE_POST_SCOPE: &[Allow] = &[
+    Allow {
+        kinds: &["prefill"],
+        rows: (8192, 8192),
+        topology: Some("ordinary"),
+        model: Some("glm_moe_dsa"),
+        ops: OpSel::In(&["gemm", "kv_write"]),
+        fields: &[ScopeField::Op, ScopeField::Operands, ScopeField::Segments, ScopeField::TensorBytes],
+        ..Allow::ANY
+    },
+    Allow {
+        kinds: &["global"],
+        fields: &[ScopeField::ObjectFacts],
+        facts: &["PLOW_PACKET_OBJECT_REQUIRES", "PLOW_PACKET_HASH"],
+        ..Allow::ANY
+    },
+];
+
 /// The small-rung workgroup cap narrows the compute of the small GLM prefill buckets and nothing
 /// else: not their collectives (6deb4025 did, and this is the scope that says it may not).
 const SMALL_CUS_SCOPE: &[Allow] = &[Allow {
@@ -583,6 +603,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.glm_fuse_seam", Some("PLOW_GLM_FUSE_SEAM"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_fuse_rope", Some("PLOW_GLM_FUSE_ROPE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_fuse_qnorm", Some("PLOW_GLM_FUSE_QNORM"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("emit.glm_fuse_post", Some("PLOW_GLM_FUSE_POST"), Layer::Emit, Domain::Bool, OFF, OPT_IN).scoped(FUSE_POST_SCOPE),
     KnobSpec::new("emit.glm_router_off_shared", Some("GLM_ROUTER_OFF_SHARED"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_router_old", Some("GLM_ROUTER_OLD"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.k3_fuse_ngemv", Some("PLOW_K3_FUSE_NGEMV"), Layer::Emit, Domain::Str, UNSET, OPT_IN),
@@ -876,6 +897,7 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
     KnobSpec::new("def.PLOW_GEMV_PREFETCH", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_GEMV_TRANSPOSE_SWIZZLE", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_GEMV_WALK", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_GLM_FUSE_POST", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_GLM_FUSE_QNORM", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_GLM_GF8_ARM", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_GLOBAL_QUEUE", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),

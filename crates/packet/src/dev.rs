@@ -186,7 +186,9 @@ pub enum DevOp {
     FlashMerge = 13,
     /// As [`DevOp::Gemm`], 64x128 tile.
     GemmSmall = 14,
-    /// As [`DevOp::Gemm`], 128x128 tile.
+    /// As [`DevOp::Gemm`], 128x128 tile. `t3=cos? t4=sin? t5=pos?` · `i3=rope_off`: a present
+    /// `pos` applies the interleaved hd-64 RoPE to columns `[rope_off, N)` in the store
+    /// (`PLOW_GLM_FUSE_POST`).
     GemmMed = 15,
     /// `t0=out t1=a t2=b t3=gamma?` · `i0=rows i1=feat` · `f0=eps f1=scale`, computing
     /// `out = (a + RMSNorm(b, gamma)) * scale` — Gemma's sandwich tail in ONE packet instead

@@ -341,9 +341,16 @@ __device__ __forceinline__ unsigned gm_remap(unsigned lin, unsigned n_tiles, uns
 #ifndef GM_WGM
 #define GM_WGM 8   /* grouped-M: tile-rows per column-major group */
 #endif
+#ifndef PLOW_GLM_FUSE_POST
+#define PLOW_GLM_FUSE_POST 0
+#endif
 template <int BM, int BN, int BK, int WM, int WN, bool NORM, int SWZ = GM_SWZ, int WGM = GM_WGM,
           bool PP = (GM_PP != 0), bool KEXACT = true, bool GLU = false, bool WFP4 = false,
-          bool WFP8BLK = false>
+          bool WFP8BLK = false
+#if PLOW_GLM_FUSE_POST
+          , bool ROPE = false
+#endif
+          >
 __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
                          const bf16* __restrict__ B, const float* __restrict__ rms,
                          const bf16* __restrict__ gamma, unsigned M, unsigned N, unsigned K,
@@ -351,7 +358,16 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
                          const bf16* __restrict__ B2 = nullptr, unsigned act = 0,
                          const unsigned char* __restrict__ bscale = nullptr,
                          const float* __restrict__ bsblk = nullptr,
-                         const unsigned char* __restrict__ bscale2 = nullptr) {
+                         const unsigned char* __restrict__ bscale2 = nullptr
+#if PLOW_GLM_FUSE_POST
+                         , const float* __restrict__ rcos = nullptr,
+                         const float* __restrict__ rsin = nullptr,
+                         const int* __restrict__ rpos = nullptr, unsigned roff = 0
+#endif
+                         ) {
+#if PLOW_GLM_FUSE_POST
+    static_assert(!ROPE || (!NORM && !GLU && !WFP4 && !WFP8BLK), "the RoPE epilogue is bf16 only");
+#endif
     (void)B2;
     (void)bscale;
     (void)bsblk;
@@ -940,7 +956,38 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
                         st_act1(&Cg[(size_t)mm * N + nn], f2bf(sg * u));
                     }
             }
-        } else {
+        }
+#if PLOW_GLM_FUSE_POST
+        else if constexpr (ROPE) {
+            /* d_headnorm_rope<64, INTERLEAVE> on the stored bf16, bit for bit: round first, then the
+             * same f32 expression. Column parity is lane parity (every column offset below is a
+             * multiple of 32) and the row depends on the lane only through lane/32, so the pair
+             * partner of column nn is lane^1. Columns before `roff` are stored unroped. */
+            const auto* const cg = as_glob(rcos);
+            const auto* const sg = as_glob(rsin);
+            const auto* const pg = as_glob(rpos);
+#pragma unroll
+            for (int i = 0; i < SM; i++)
+#pragma unroll
+                for (int j = 0; j < SN; j++) {
+                    const unsigned nn = n0 + wn * (BN / WN) + j * MFMA_N + mfma_acc_n(lane);
+                    const unsigned col = nn - roff;
+#pragma unroll
+                    for (int e = 0; e < 16; e++) {
+                        const unsigned mm = m0 + wm * (BM / WM) + i * MFMA_M + mfma_acc_m(lane, e);
+                        const float v = bf2f(f2bf(acc[i][j][e]));
+                        const float partner = __shfl_xor(v, 1, PLOW_WAVE);
+                        const size_t p = (size_t)(unsigned)pg[mm < M ? mm : 0u] * 32u;
+                        const float c = cg[p + ((col & 63u) >> 1)], s = sg[p + ((col & 63u) >> 1)];
+                        const float r = ((col & 1u) == 0u) ? (v * c - partner * s)
+                                                           : (v * c + partner * s);
+                        if (mm < M && nn < N)
+                            st_act1(&Cg[(size_t)mm * N + nn], f2bf(nn >= roff ? r : v));
+                    }
+                }
+        }
+#endif
+        else {
 #pragma unroll
         for (int i = 0; i < SM; i++)
 #pragma unroll
@@ -1194,6 +1241,17 @@ __device__ void d_gemm_med(bf16* C, const bf16* A, const bf16* B, unsigned M, un
     d_gemm_t<GM_MD_BM, GM_MD_BN, GM_MD_BK, GM_WM, GM_WN, false>(C, A, B, nullptr, nullptr, M, N, K,
                                                                 slice, nblk, lds);
 }
+#if PLOW_GLM_FUSE_POST
+__device__ void d_gemm_med_rope(bf16* C, const bf16* A, const bf16* B, unsigned M, unsigned N,
+                                unsigned K, unsigned slice, unsigned nblk, bf16* lds,
+                                const float* rcos, const float* rsin, const int* rpos,
+                                unsigned roff) {
+    d_gemm_t<GM_MD_BM, GM_MD_BN, GM_MD_BK, GM_WM, GM_WN, false, GM_SWZ, GM_WGM, (GM_PP != 0), true,
+             false, false, false, true>(C, A, B, nullptr, nullptr, M, N, K, slice, nblk, lds,
+                                        nullptr, 0, nullptr, nullptr, nullptr, rcos, rsin, rpos,
+                                        roff);
+}
+#endif
 __device__ void d_gemm_wide(bf16* C, const bf16* A, const bf16* B, unsigned M, unsigned N,
                             unsigned K, unsigned slice, unsigned nblk, bf16* lds) {
     d_gemm_t<GM_WD_BM, GM_WD_BN, GM_WD_BK, GM_WM, GM_WN, false>(C, A, B, nullptr, nullptr, M, N, K,

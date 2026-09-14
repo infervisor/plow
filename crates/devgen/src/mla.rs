@@ -6294,7 +6294,33 @@ pub(crate) fn emit_glm_mla_prefill(
     // 4/5 absorbed q_nope and raw q_rope (decode's fusion G, likewise unfused here). Output layout
     // [T][nh_l*DK] is exactly the [b][t][head][DK] the flash indexes with b=1.
     let c_qa = gemm(b, n.qa, n.qlat, w.wqa, w.wqa_s, nh_l * dk, ql, &[c_rnq]);
-    let c_qrr = if dr > 0 {
+    // PLOW_GLM_FUSE_POST: the q RoPE rides the q_rope `GemmMed` store (t3..t5, i3 = first roped
+    // column), so its `HeadNormRope` is not emitted.
+    let fuse_post = emit_config::active().glm_fuse_post
+        && dr == 64
+        && enc != MoeEnc::Mxfp4
+        && !b.packed_prefill_segments()
+        && b.token_batch_band().is_none()
+        && matches!(
+            glm_prefill_projection_op(c, t, nh_l * dr, ql, n_cu, mxfp4_quant(enc)),
+            DevOp::GemmMed
+        );
+    let c_qrr = if fuse_post {
+        b.emit(DevOp::GemmMed, all.clone(), &[c_rnq], |d| {
+            d.t[0] = n.qr;
+            d.t[1] = n.qlat;
+            d.t[2] = w.wqr;
+            d.t[3] = n.cos;
+            d.t[4] = n.sin;
+            d.t[5] = n.pos;
+            d.i[0] = t;
+            d.i[1] = nh_l * dr;
+            d.i[2] = ql;
+            d.i[3] = 0;
+            d.i[4] = 0;
+            d.f[0] = eps;
+        })
+    } else if dr > 0 {
         gemm(b, n.qrr, n.qlat, w.wqr, w.wqr_s, nh_l * dr, ql, &[c_rnq])
     } else {
         c_qa
@@ -6303,6 +6329,8 @@ pub(crate) fn emit_glm_mla_prefill(
     // per-token angle comes from in.pos[t], which the host already fills for a prefill chunk.
     let c_qr = if dr == 0 {
         c_qa
+    } else if fuse_post {
+        c_qrr
     } else {
         b.emit(DevOp::HeadNormRope, all.clone(), &[c_qrr], |d| {
             d.t[0] = n.qr;

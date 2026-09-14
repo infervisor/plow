@@ -409,6 +409,10 @@ struct Shapes {
     /// A pre-arm object ignores both and stages `t[1]` verbatim, i.e. it runs the projection
     /// over an UNNORMED row and returns finite, fluent, wrong tokens. Refuse at load.
     glm_fuse_qnorm: bool,
+    /// Any `GemmMed` (op 15) carrying a `t[5]` — the prefill q-rope fold (PLOW_GLM_FUSE_POST):
+    /// t3/t4 = cos/sin, t5 = pos, i3 = the first roped column. An object without the arm stores
+    /// the unroped projection and attention runs on it. Refuse at load.
+    glm_fuse_post: bool,
     /// Optional linear biases carried by the instruction stream. Plain GEMM/GEMV use `t7`;
     /// fused QKV uses the three demoted handles in `i5/i6/i7`.
     linear_bias: bool,
@@ -576,6 +580,9 @@ fn shapes(m: &Model) -> Shapes {
                     }
                 }
                 DevOp::Gemm | DevOp::GemmMed | DevOp::GemmSmall | DevOp::Gemv => {
+                    if op == DevOp::GemmMed && inst.t[5] != packet::TENSOR_NONE {
+                        s.glm_fuse_post = true;
+                    }
                     if inst.t[7] != packet::TENSOR_NONE {
                         s.linear_bias = true;
                     }
@@ -916,6 +923,9 @@ fn encoding_features(f: &mut Map<String, Value>, s: &Shapes) {
     f.insert("mla_pf_nope".into(), json!(s.mla_pf_nope));
     f.insert("glm_fuse_rope".into(), json!(s.glm_fuse_rope));
     f.insert("glm_fuse_qnorm".into(), json!(s.glm_fuse_qnorm));
+    if s.glm_fuse_post {
+        f.insert("glm_fuse_post".into(), json!(true));
+    }
 }
 
 /// Performance constants derived by RULE from the shapes, never hardcoded. Both
@@ -1364,6 +1374,9 @@ fn backend_amd(
     // answers fluently and wrongly.
     if on("glm_fuse_qnorm") {
         req.push("PLOW_GLM_FUSE_QNORM=1".into());
+    }
+    if on("glm_fuse_post") {
+        req.push("PLOW_GLM_FUSE_POST=1".into());
     }
     // The fused decode QKV/GLU emitted against a STATED arena (PLOW_DEC_STAGE_HALVES). The
     // object must publish the arena it was built at so plowrt can compare M*K against it —

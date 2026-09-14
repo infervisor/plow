@@ -291,7 +291,9 @@ const INHERIT: &[(DevOp, DevOp, S)] = &[
      S { op: DevOp::GemmNorm, t: &["", "", "", "rms", "gamma"], i: &[], f: &[], j: &[] }),
     // Pure tile-size twins: same operands, different MFMA tile.
     (DevOp::GemmSmall,  DevOp::Gemm, NONE),
-    (DevOp::GemmMed,    DevOp::Gemm, NONE),
+    // t5 present = the prefill q-rope fold (PLOW_GLM_FUSE_POST).
+    (DevOp::GemmMed, DevOp::Gemm,
+     S { op: DevOp::GemmMed, t: &["", "", "", "cos?", "sin?", "pos?"], i: &["", "", "", "rope_off"], f: &[], j: &[] }),
     (DevOp::GemmWide, DevOp::Gemm,
      S { op: DevOp::GemmWide, t: &[], i: &["", "", "", "", "", "", "", "tile_variant"], f: &[], j: &[] }),
     (DevOp::GemmC5,     DevOp::Gemm, NONE),

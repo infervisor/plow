@@ -375,6 +375,7 @@ the 2026-09-04 audit that removed the rejected experiment knobs are in
 | `PLOW_GLM_FUSE_B1` | `--glm-fuse-b1` | false | GLM fuse block-1 residual+norm (opt-in, off by default). |
 | `PLOW_GLM_FUSE_SEAM` | `--glm-fuse-seam` | false | GLM layer-seam fold: the FFN tail's residual and the next layer's input_layernorm as one AddNorm packet (opt-in, off by default; TP only). |
 | `PLOW_GLM_FUSE_ROPE` | `--glm-fuse-rope` | false | GLM decode q-rope fold: apply the interleaved q RoPE inside the MLA flash decode's query staging and drop the `HeadNormRope` packet (opt-in, off by default). |
+| `PLOW_GLM_FUSE_POST` | `--glm-fuse-post` | false | GLM prefill q-rope fold: the 8192-bucket q_rope `GemmMed` (op 15; `t3/t4/t5` = cos/sin/pos, `i3` = first roped column) applies the interleaved hd-64 RoPE in its store, and the q `HeadNormRope` packet is not emitted. The prefill objects need `-DPLOW_GLM_FUSE_POST=1` (`build_gfx942.sh` sets it from the packet's requires; plowrt refuses an object without `plow_glm_fuse_post_arm`). Bit-identical by construction: bf16 round, then the `HeadNormRope` expression. Opt-in. |
 | `PLOW_GLM_FUSE_QNORM` | `--glm-fuse-qnorm` | false | GLM decode q-norm fold: compute `q_a_layernorm` inside fusion G's `GemvQkv` LDS staging and drop the one-workgroup `RmsNorm` packet (opt-in, off by default). |
 | `GLM_ROUTER_OFF_SHARED` | `--glm-router-off-shared` | false | GLM router off-shared dispatch (co-resident mode 2 only). |
 | `GLM_ROUTER_OLD` | `--glm-router-old` | false | GLM use legacy (unfused) single-CU router. |

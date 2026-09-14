@@ -444,6 +444,11 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_FUSE_QNORM", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_fuse_qnorm: bool,
 
+    /// GLM prefill q-rope fold: apply the interleaved q RoPE in the q_rope `GemmMed` store and
+    /// drop the `HeadNormRope` packet (opt-in, off by default).
+    #[arg(long, env = "PLOW_GLM_FUSE_POST", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_fuse_post: bool,
+
     /// GLM router off-shared dispatch (co-resident mode 2 only).
     #[arg(long, env = "GLM_ROUTER_OFF_SHARED", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_router_off_shared: bool,
@@ -1234,6 +1239,7 @@ impl EmitConfig {
             glm_fuse_rope: env_bool("PLOW_GLM_FUSE_ROPE"),
             glm_fuse_seam: env_bool("PLOW_GLM_FUSE_SEAM"),
             glm_fuse_qnorm: env_bool("PLOW_GLM_FUSE_QNORM"),
+            glm_fuse_post: env_bool("PLOW_GLM_FUSE_POST"),
             glm_router_off_shared: env_bool("GLM_ROUTER_OFF_SHARED"),
             glm_router_old: env_bool("GLM_ROUTER_OLD"),
             k3_fuse_ngemv: env_str("PLOW_K3_FUSE_NGEMV"),
