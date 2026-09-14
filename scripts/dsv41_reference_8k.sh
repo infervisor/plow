@@ -117,7 +117,17 @@ bench)
       echo "!! $TP8 missing model${r}-mp${MP}.safetensors — run 'convert' first"; exit 1; }
   done
   mkdir -p "$OUT"
-  exec env GPU_LEASE_TIMEOUT="${GPU_LEASE_TIMEOUT:-43200}" "$LEASE" -n "$MP" "dsv41-ref-bench-8k" \
+  # DSV41_NO_LEASE=1 when something upstream ALREADY holds the cards -- notably
+  # the shared gpuq runner, which takes one `gpulease -n 8` for everyone and
+  # runs the spool underneath it. Taking a second lease there deadlocks: the
+  # runner holds all 8 and would never release to its own child.
+  if [ "${DSV41_NO_LEASE:-0}" = 1 ]; then
+    set --
+  else
+    set -- env GPU_LEASE_TIMEOUT="${GPU_LEASE_TIMEOUT:-43200}" \
+      "$LEASE" -n "$MP" "dsv41-ref-bench-8k"
+  fi
+  exec "$@" \
     env ROCM_PATH="$ROCM_PATH" VLLM_ROCM_LIB="$VLLM_ROCM_LIB" \
         PYTHONPATH="$HF/inference" HF_HUB_OFFLINE=1 \
     "$PY" -m torch.distributed.run --nproc-per-node "$MP" \
