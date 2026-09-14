@@ -2217,10 +2217,13 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport, packed_prefill: 
 fn l2_placement(m: &Model) -> Value {
     let dec_lo = packet::devbuild::decode_rung_lo(&m.prog_t);
     let domains = m.progs.iter().map(|p| p.l2_domains).max().unwrap_or(0);
+    // Dense-exact twins sit below the ladder index but are decode programs.
+    let decode = |i: usize| i >= dec_lo || packet::devbuild::is_dense_exact_program(m.prog_t[i]);
+    let placed = |want: bool| m.progs.iter().enumerate().any(|(i, p)| decode(i) == want && p.l2_domains != 0);
     json!({
         "domains": domains,
-        "decode": m.progs[dec_lo..].iter().any(|p| p.l2_domains != 0),
-        "prefill": m.progs[..dec_lo].iter().any(|p| p.l2_domains != 0),
+        "decode": placed(true),
+        "prefill": placed(false),
         "requires_object_define": "PLOW_L2_PLACE_DISPATCH",
     })
 }
@@ -3004,6 +3007,15 @@ mod tests {
 
         m.progs[0].l2_domains = 8;
         assert_eq!(build(&m, "gfx942")["l2_placement"]["prefill"], true);
+
+        let mut m = model();
+        m.progs.insert(1, prog(vec![inst(DevOp::FlashDecodeFp8, [8, 8, 1, 0, 0, 0, 512, 0])]));
+        m.prog_t = vec![1024, packet::devbuild::dense_exact_program_t(8), 8];
+        m.progs[1].l2_domains = 8;
+        m.progs[2].l2_domains = 8;
+        let twin = build(&m, "gfx942")["l2_placement"].clone();
+        assert_eq!(twin["decode"], true);
+        assert_eq!(twin["prefill"], false, "a placed dense-exact twin is decode-side");
     }
 
     /// Per-program arm sets, keyed on (kind, bucket|batch, segment).

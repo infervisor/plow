@@ -331,18 +331,21 @@ fn segment_major_order(n_segments: usize, n_ranks: usize) -> impl Iterator<Item 
 }
 
 /// `PLOW_AMD_DECODE_DENSE_EXACT`: the dense-exact rung while every row rung `dp` advances selects
-/// all its keys, else `dp`.
+/// all its keys, else `dp`. Rows `parked` marks are not advanced (`kvrow::decode_dense_exact`).
 fn pick_decode_prog(
     dp: usize,
     dense: Option<usize>,
     kvlen: &[u32],
+    parked: &[u32],
     rows: usize,
     select_width: u32,
 ) -> usize {
+    let rows = rows.min(kvlen.len());
     match dense {
         Some(de)
             if crate::exec::kvrow::decode_dense_exact(
-                &kvlen[..rows.min(kvlen.len())],
+                &kvlen[..rows],
+                &parked[..rows.min(parked.len())],
                 select_width,
             ) =>
         {
@@ -964,6 +967,20 @@ impl AmdTpGroup {
         self.submit_decode_batched_at(pos, kvlen, dp)
     }
 
+    /// The program to launch for rung `dp` when only the rows `parked` leaves at zero advance:
+    /// its dense-exact twin or `dp`.
+    pub fn decode_prog_advancing(&self, dp: usize, kvlen: &[u32], parked: &[u32]) -> usize {
+        let r0 = &self.ranks[0];
+        pick_decode_prog(
+            dp,
+            r0.dense_exact_for(dp),
+            kvlen,
+            parked,
+            r0.prog_t(dp) as usize,
+            r0.dense_exact_select_width(),
+        )
+    }
+
     /// [`Self::submit_decode_batched`] on a NAMED decode rung of the ladder.
     pub fn submit_decode_batched_at(
         &mut self,
@@ -977,9 +994,11 @@ impl AmdTpGroup {
             dp,
             r0.dense_exact_for(dp),
             kvlen,
+            &[],
             r0.prog_t(dp) as usize,
             r0.dense_exact_select_width(),
         );
+        crate::obs::tick::decode_prog(r0.prog_t(dp), r0.prog_dense_exact(dp));
         self.cur_dp = dp;
         let counter_dbuf = self.ranks[0].tp_counter_double_buffered();
         // Preparation can fail without changing bank state. Only after EVERY
@@ -2346,7 +2365,7 @@ mod tests {
 
     #[test]
     fn pick_decode_prog_takes_dense_exact_only_while_every_advanced_row_selects_all_keys() {
-        let pick = |dense, kvlen: &[u32], rows| pick_decode_prog(7, dense, kvlen, rows, 2048);
+        let pick = |dense, kvlen: &[u32], rows| pick_decode_prog(7, dense, kvlen, &[], rows, 2048);
         assert_eq!(pick(Some(1), &[2047], 1), 1);
         assert_eq!(pick(Some(1), &[2048], 1), 1);
         assert_eq!(pick(Some(1), &[2049], 1), 7);
@@ -2356,6 +2375,21 @@ mod tests {
         // A slot past the rung is not advanced by it.
         assert_eq!(pick(Some(3), &[1, 2048, 17, 1, 5000], 4), 3);
         assert_eq!(pick(Some(3), &[2049, 1], 1), 7);
+    }
+
+    #[test]
+    fn pick_decode_prog_counts_only_unparked_rows() {
+        let pick = |kvlen: &[u32], parked: &[u32]| pick_decode_prog(7, Some(3), kvlen, parked, 4, 2048);
+        assert_eq!(pick(&[2047, 9000, 2048, 5000], &[0, 1, 0, 1]), 3);
+        assert_eq!(pick(&[2047, 9000, 2049, 5000], &[0, 1, 0, 1]), 7);
+        assert_eq!(pick(&[2049, 2047, 2048, 2048], &[1, 0, 0, 0]), 3);
+        assert_eq!(pick(&[2049, 2047, 2048, 2048], &[0, 1, 1, 1]), 7);
+        assert_eq!(pick(&[1, 1, 1, 1], &[1, 1, 1, 1]), 7);
+        // A mask shorter than the rung leaves its tail advanced.
+        assert_eq!(pick(&[9000, 2048, 2049, 1], &[1, 0]), 7);
+        assert_eq!(pick(&[9000, 2048, 2048, 1], &[1]), 3);
+        assert_eq!(pick_decode_prog(7, Some(3), &[1, 1, 9000], &[0, 0, 0], 2, 2048), 3);
+        assert_eq!(pick_decode_prog(7, None, &[1, 1], &[0, 1], 2, 2048), 7);
     }
 
     #[test]

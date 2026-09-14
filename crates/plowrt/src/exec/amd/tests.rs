@@ -4265,13 +4265,16 @@ fn live_nsplit_walks_the_measured_ladder_and_never_grows() {
 #[test]
 fn dense_exact_only_while_every_row_selects_all_keys() {
     use crate::exec::kvrow::decode_dense_exact;
-    assert!(decode_dense_exact(&[2047], 2048));
-    assert!(decode_dense_exact(&[2048], 2048));
-    assert!(!decode_dense_exact(&[2049], 2048));
-    assert!(decode_dense_exact(&[1, 2048, 17, 1], 2048));
-    assert!(!decode_dense_exact(&[1, 2048, 2049, 1], 2048));
-    assert!(!decode_dense_exact(&[2049, 1], 2048));
-    assert!(!decode_dense_exact(&[], 2048));
+    assert!(decode_dense_exact(&[2047], &[], 2048));
+    assert!(decode_dense_exact(&[2048], &[], 2048));
+    assert!(!decode_dense_exact(&[2049], &[], 2048));
+    assert!(decode_dense_exact(&[1, 2048, 17, 1], &[], 2048));
+    assert!(!decode_dense_exact(&[1, 2048, 2049, 1], &[], 2048));
+    assert!(!decode_dense_exact(&[2049, 1], &[], 2048));
+    assert!(!decode_dense_exact(&[], &[], 2048));
+    assert!(decode_dense_exact(&[2049, 1], &[1, 0], 2048));
+    assert!(!decode_dense_exact(&[2049, 1], &[0, 1], 2048));
+    assert!(!decode_dense_exact(&[2049, 1], &[1, 1], 2048));
 }
 
 /// The flash and its merge move together, and anything that is not a plain

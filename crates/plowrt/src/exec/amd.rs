@@ -14228,6 +14228,10 @@ impl AmdEngine {
         self.progs[p].t
     }
 
+    pub fn prog_dense_exact(&self, p: usize) -> bool {
+        self.progs[p].role.is_dense_exact_rung()
+    }
+
     /// Segment count for program `p`.
     pub fn prog_segments(&self, p: usize) -> usize {
         self.progs[p].seg_class.len()
