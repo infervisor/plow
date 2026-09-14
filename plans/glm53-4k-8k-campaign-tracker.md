@@ -232,6 +232,49 @@ long-context decode-heavy workload pays the squeeze and gets nothing. The T=7372
 The served T4 `rb-t4-{a..d}` gained an `isl65536-c1` cell for exactly this; without it the run could not have
 answered the context question.
 
+## The GEMMs are already plow-dispatched; hipBLASLt is not linked (2026-09-14)
+
+The attribution row "hipBLASLt GEMMs | 52" reads like library time. It is not, and the distinction
+decides what is left to win.
+
+`scripts/build_glm_lt.sh` takes hipBLASLt's fat binary and runs
+`clang-offload-bundler --unbundle --targets=hipv4-amdgcn-amd-amdhsa--gfx942`, pinning the sha256 of
+BOTH the input bundle and the unbundled image. The result, `glm_lt_gfx942.elf`, is loaded by
+`crates/plowrt/src/exec/amd_gemm_lt.rs:315`, which re-checks the hash against `OBJECT_HASH`
+(`efa5b036...`) and resolves each Tensile kernel by name. `enqueue()` (:401) then builds the launch
+itself: the 160-byte Tensile kernarg (`dims`, `pointers`, `strides`, `alpha`, `beta`, `epilogue`), the
+grid from the macro-tile (`n.div_ceil(mt_i) * m.div_ceil(mt_j)`), workgroup 256. Load verifies the
+resource ABI: `kernarg_size == 160`, `private_segment_size == 0`, `lds == spec.lds`.
+
+Evidence that the library is gone at run time: no `hipblaslt` in any `Cargo.toml` or `build.rs`, no
+`hipblasLt*()` call anywhere in `crates/plowrt/src`, and `ldd` on a built plowrt reports five shared
+objects, none of them hipBLASLt or Tensile. 29 kernels are pinned: 4 prefill (`glm_lt_gfx942.json`),
+8 decode (`glm_lt_decode_gfx942.json`), 17 prefill-ext (`glm_lt_pf_ext_gfx942.json`).
+
+So "capture the exact launch and dispatch it ourselves" is done and shipping. What is NOT plow-native
+is the kernel BODIES -- Tensile assembly, extracted rather than authored. Re-authoring them is #87 in
+the rejected table: hipBLASLt wins every prefill shape on one clock. That is the version of this idea
+that has already been measured and lost.
+
+Two openings that remain, both better than a rewrite:
+
+1. **Coverage.** `glm_tests.rs:3463` asserts `has(GemmLtPf) == (rows >= 2048)`: only GEMMs at 2048+
+   rows take the native path, the rest stay interpreted (the 20 ms row). Widening that is the same
+   capture technique applied where it still pays. The gate is structural, not numeric --
+   `segment_owners` (`amd_gemm_lt.rs:164`) refuses a native GEMM unless it owns its segment alone
+   ("native GEMM segment contains other interpreter work", "native segment retains interpreter counter
+   obligations"), so coverage is an emitter-segmentation question, not a kernel question.
+2. **The epilogue is nearly unused.** `Args.epilogue` is `[u32; 14]` and `arguments()` writes only
+   `[9..10]` (the dstD pointer); the other twelve slots go out as zero. The pinned kernel names
+   advertise `_Bias_` and `_SAV_`, so epilogue capability is compiled into the bodies plow already
+   dispatches. What each remaining slot means still has to be read off Tensile's UserArgs layout
+   before anything is built on it. If they are what the names suggest, that is fusion without
+   authoring a kernel -- what `fusepost` (-4.1 ms,
+   bit-exact, opt-in only because T3 missed its floor by 0.1 ms) and `packproj` (-8 ms in T2 13/13,
+   T3 FAIL at +73 ms purely because packing forced a `ColSplit` copy OUTSIDE the GEMM) both wanted.
+   An epilogue that writes each projection to its own destination removes packproj's copy by
+   construction.
+
 ## Rejected or parked
 
 | candidate | reason |
