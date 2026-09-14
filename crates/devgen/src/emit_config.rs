@@ -453,6 +453,11 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_FUSE_POST", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_fuse_post: bool,
 
+    /// GLM prefill on the AITER MoE route: the native adapter sorts the gathered routing table
+    /// before prepare, so the four interpreter `MoeAlignPf` packets are not emitted (opt-in).
+    #[arg(long, env = "PLOW_GLM_MOE_NATIVE_ALIGN", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_moe_native_align: bool,
+
     /// Lower the egglog rewrite: at every emitter fusion site a rewrite rule covers, the extracted
     /// fused graph decides the fusion instead of the hand knob (plowc supplies the sites). Default
     /// on; without a rewrite for the checkpoint the hand fusions stay, and only an explicit `=1`
@@ -1257,6 +1262,7 @@ impl EmitConfig {
             glm_fuse_seam: env_bool("PLOW_GLM_FUSE_SEAM"),
             glm_fuse_qnorm: env_bool("PLOW_GLM_FUSE_QNORM"),
             glm_fuse_post: env_bool("PLOW_GLM_FUSE_POST"),
+            glm_moe_native_align: env_bool("PLOW_GLM_MOE_NATIVE_ALIGN"),
             emit_rewrite: env_opt_out("PLOW_EMIT_REWRITE"),
             glm_router_off_shared: env_bool("GLM_ROUTER_OFF_SHARED"),
             glm_router_old: env_bool("GLM_ROUTER_OLD"),

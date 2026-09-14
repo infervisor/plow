@@ -70,7 +70,7 @@ pub(super) struct Route {
 
 impl Route {
     pub fn launches(self) -> u64 {
-        match self.mode {
+        u64::from(self.inst.fj[1] != 0) * 4 + match self.mode {
             Mode::Sorted => {
                 if self.inst.i[7] == 1 {
                     3
@@ -108,6 +108,12 @@ impl Route {
         self.rows = rows;
         Ok(())
     }
+}
+
+/// The native-align form of a sorted prefill instruction: `fj[1]` = routing table + 1, `fj[2]` =
+/// the align's partition count. GLM's 256/8 routing only.
+fn native_align_form(inst: &DevInst64, flat: bool) -> bool {
+    !flat && inst.fj[0] == 0 && inst.fj[1] != 0 && matches!(inst.fj[2], 64 | 304) && inst.i[3..5] == [256, 8]
 }
 
 pub(super) fn routes(
@@ -155,7 +161,7 @@ pub(super) fn routes(
             })
             || !shaped
             || inst.i != geometry
-            || inst.fj != [0; 3]
+            || !(inst.fj == [0; 3] || native_align_form(inst, flat))
         {
             return Err(err("requires H6144/I256 with E256/top8 or the shared-expert fold's E257/top9; sorted prefill rows1..8192 or flat decode rows2/4/8 (resident:1/2/4/8/16/20)"));
         }
@@ -176,6 +182,14 @@ pub(super) fn routes(
                 .ok_or_else(|| err("flat output has no BF16 combine consumer"))?;
             if combine.i[..5] != [6144, 1, prog.t, 0, 0] || combine.i[7] != 1 {
                 return Err(err("flat output requires one BF16 partial per row"));
+            }
+        } else if let Some(table) = inst.fj[1].checked_sub(1) {
+            // PLOW_GLM_MOE_NATIVE_ALIGN: the adapter sorts the gathered routing table itself.
+            if tensors
+                .get(table as usize)
+                .is_none_or(|t| t.bytes < u64::from(prog.t) * u64::from(topk) * 8)
+            {
+                return Err(err("native align table capacity is insufficient"));
             }
         } else {
             let align = prog.insts[..ix]
@@ -534,6 +548,21 @@ struct StoreArgs {
 }
 
 const _: () = assert!(std::mem::size_of::<PrepareArgs>() == PREPARE_ARGS_NEXP as usize);
+
+/// `plow_moe_align` kernarg (moe_align_adapter.hip `MoeAlignArgs`).
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct AlignArgs {
+    pointers: [u64; 5],
+    rows: u32,
+    n_exp: u32,
+    topk: u32,
+    phase: u32,
+    npart: u32,
+    pad: u32,
+}
+const _: () = assert!(std::mem::size_of::<AlignArgs>() == 64);
+const ALIGN_MAX_NPART: u64 = 304;
 const _: () = assert!(std::mem::size_of::<StoreArgs>() == 24);
 
 pub(super) struct MoeAiter {
@@ -554,6 +583,8 @@ pub(super) struct MoeAiter {
     prepare_args: u32,
     /// The adapter's prepare honours `keep_out` (`plow_moe_aiter_keep_out_abi_1`).
     keep_out: bool,
+    /// `moe_align_adapter_gfx942.elf` and its meta workspace (partial counts of up to 304 parts).
+    align: Option<(HsaKernel, DeviceMem)>,
     xcd_swizzle: bool,
 }
 
@@ -724,6 +755,22 @@ impl MoeAiter {
             PREPARE_ARGS_LEGACY
         };
         let keep_out = adapter_syms.contains(&"plow_moe_aiter_keep_out_abi_1");
+        let align = match std::fs::read(dir.join("moe_align_adapter_gfx942.elf")) {
+            Ok(image) if super::amd::elf_symbol_names(&image).contains(&"plow_moe_align_abi_1") => {
+                let module = EngineDevice::module_load(be, &image)?;
+                let kernel = EngineDevice::get_function(be, &module, "plow_moe_align")?;
+                if ![64, 320].contains(&kernel.kernarg_size()) || kernel.private_segment_size() != 0 {
+                    return Err(RuntimeError::Device("native MoE align adapter resource ABI mismatch".into()));
+                }
+                modules.push(module);
+                let meta = EngineDevice::alloc(
+                    be,
+                    (u64::from(3 * n_exp + 1) + ALIGN_MAX_NPART * u64::from(n_exp)) * 4,
+                )?;
+                Some((kernel, meta))
+            }
+            _ => None,
+        };
         // Older prepare kernels hardcode 256 experts / top-8; only the fold needs more.
         if n_exp != 256 && prepare_args != PREPARE_ARGS_NEXP {
             return Err(RuntimeError::Device(format!(
@@ -782,6 +829,7 @@ impl MoeAiter {
             resident_weights: Vec::new(),
             prepare_args,
             keep_out,
+            align,
             xcd_swizzle: false,
         })
     }
@@ -920,9 +968,36 @@ impl MoeAiter {
             workspace_out
         };
         let tile64 = self.tile64.filter(|_| route.rows >= TILE64_MIN_ROWS);
+        let meta = match route.inst.fj[1].checked_sub(1) {
+            None => t[4],
+            Some(table) => {
+                let (kernel, ws) = self.align.as_ref().ok_or_else(|| {
+                    RuntimeError::Device(
+                        "native MoE align route needs moe_align_adapter_gfx942.elf (plow_moe_align_abi_1)"
+                            .into(),
+                    )
+                })?;
+                let npart = route.inst.fj[2];
+                if stages & STAGE_PREPARE != 0 {
+                    for (phase, grid) in [(1, npart), (2, 1), (3, npart), (4, npart)] {
+                        let args = AlignArgs {
+                            pointers: [ws.base, addr(table as u16), t[5], t[6], t[7]],
+                            rows: route.rows,
+                            n_exp: self.n_exp,
+                            topk: route.topk(),
+                            phase,
+                            npart,
+                            pad: 0,
+                        };
+                        be.launch(*kernel, grid, 512, 0, bytemuck::bytes_of(&args))?;
+                    }
+                }
+                ws.base
+            }
+        };
         let prepare = PrepareArgs {
             pointers: [
-                q, qs, out, ids, weights, experts, valid, t[1], t[4], t[5], t[6], t[7],
+                q, qs, out, ids, weights, experts, valid, t[1], meta, t[5], t[6], t[7],
             ],
             rows: route.rows,
             block_m: if tile64.is_some() { 64 } else { 32 },
@@ -1060,6 +1135,110 @@ fn flat_moe_args(
 mod tests {
     use super::*;
     use packet::dev::StreamEnt;
+
+    /// The native align adapter (`moe_align_adapter.hip`) against the interpreter align on a
+    /// captured production routing table: meta, the partial counts and the row maps must be the
+    /// same bytes; timed on the host clock around a full synchronize.
+    #[test]
+    #[ignore = "requires a gfx942 GPU lease, PLOW_TEST_ALIGN_OBJ and PLOW_TEST_ALIGN_CAPTURE"]
+    fn native_align_matches_captured_interpreter_align() {
+        const ROWS: u32 = 8192;
+        const N_EXP: u32 = 256;
+        const TOPK: u32 = 8;
+        let obj = std::env::var("PLOW_TEST_ALIGN_OBJ").unwrap();
+        let cap = std::env::var("PLOW_TEST_ALIGN_CAPTURE").unwrap();
+        let read = |n: &str| std::fs::read(format!("{cap}/{n}.prefill.bin")).unwrap();
+        let (tab, meta, rt, rp, rg) =
+            (read("tab"), read("meta"), read("row_token"), read("row_partidx"), read("row_gate"));
+        let be = HsaBackend::new(0).unwrap();
+        let image = std::fs::read(&obj).unwrap();
+        let module = EngineDevice::module_load(&be, &image).unwrap();
+        let kernel = EngineDevice::get_function(&be, &module, "plow_moe_align").unwrap();
+        assert!([64, 320].contains(&kernel.kernarg_size()), "kernarg {}", kernel.kernarg_size());
+        let upload = |bytes: &[u8]| {
+            let m = EngineDevice::alloc(&be, bytes.len() as u64).unwrap();
+            EngineDevice::upload(&be, &m, 0, bytes).unwrap();
+            m
+        };
+        let npart: u32 = std::env::var("PLOW_TEST_ALIGN_NPART").map_or(64, |v| v.parse().unwrap());
+        let d_tab = upload(&tab);
+        let meta_cap = ((3 * N_EXP + 1) + npart * N_EXP) as usize * 4;
+        let d_meta = upload(&vec![0xa5u8; meta_cap]);
+        let d_rt = upload(&vec![0xa5u8; rt.len()]);
+        let d_rp = upload(&vec![0xa5u8; rp.len()]);
+        let d_rg = upload(&vec![0xa5u8; rg.len()]);
+        #[repr(C)]
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+        struct Args {
+            p: [u64; 5],
+            rows: u32,
+            n_exp: u32,
+            topk: u32,
+            phase: u32,
+            npart: u32,
+            pad: u32,
+        }
+        let run = |split: bool| -> Vec<f64> {
+            let mut laps = Vec::new();
+            let t0 = std::time::Instant::now();
+            for (phase, grid) in [(1u32, npart), (2, 1), (3, npart), (4, npart)] {
+                let a = Args {
+                    p: [d_meta.base, d_tab.base, d_rt.base, d_rp.base, d_rg.base],
+                    rows: ROWS,
+                    n_exp: N_EXP,
+                    topk: TOPK,
+                    phase,
+                    npart,
+                    pad: 0,
+                };
+                be.launch(kernel, grid, 512, 0, bytemuck::bytes_of(&a)).unwrap();
+                if split {
+                    be.synchronize().unwrap();
+                    laps.push(t0.elapsed().as_secs_f64() * 1e6);
+                }
+            }
+            be.synchronize().unwrap();
+            laps.push(t0.elapsed().as_secs_f64() * 1e6);
+            laps
+        };
+        run(false);
+        // What prepare reads: rowoff/cnt/tilep. The partial counts behind them depend on npart.
+        let meta_bytes = (3 * N_EXP + 1) as usize * 4;
+        let mut got = vec![0u8; meta_cap];
+        EngineDevice::download(&be, &d_meta, 0, &mut got).unwrap();
+        assert!(got[..meta_bytes] == meta[..meta_bytes], "meta differs");
+        let at = (3 * N_EXP) as usize * 4;
+        let tiles = u32::from_le_bytes(meta[at..at + 4].try_into().unwrap()) as usize;
+        let pad = tiles * 64;
+        for (name, d, want) in [("row_token", &d_rt, &rt), ("row_partidx", &d_rp, &rp), ("row_gate", &d_rg, &rg)] {
+            let mut g = vec![0u8; want.len()];
+            EngineDevice::download(&be, d, 0, &mut g).unwrap();
+            assert!(g[..pad * 4] == want[..pad * 4], "{name} differs");
+        }
+        for _ in 0..3 {
+            run(false);
+        }
+        let med = |v: &mut Vec<f64>| {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            (v[v.len() / 10], v[v.len() / 2], v[v.len() * 9 / 10])
+        };
+        let mut total: Vec<f64> = (0..40).map(|_| *run(false).last().unwrap()).collect();
+        let mut phases = vec![Vec::new(); 5];
+        for _ in 0..20 {
+            let mut prev = 0.0;
+            for (i, t) in run(true).into_iter().enumerate() {
+                phases[i].push(t - prev);
+                prev = t;
+            }
+        }
+        let (p10, p50, p90) = med(&mut total);
+        let ph: Vec<String> = phases.iter_mut().map(|v| format!("{:.1}", med(v).1)).collect();
+        eprintln!(
+            "NATIVE_ALIGN rows={ROWS} slots={} tiles={tiles} byte-exact meta+partials+row maps; total us p10 {p10:.1} p50 {p50:.1} p90 {p90:.1}; split phase1..4 + sync us {}",
+            ROWS * TOPK,
+            ph.join(" ")
+        );
+    }
 
     #[test]
     fn tile64_auto_requires_pinned_object_and_marked_adapter() {

@@ -39,6 +39,13 @@ trap 'rm -f "$stem" "$stem.co" "$stem.elf"' EXIT
 "${PLOW_BUNDLER:?run inside nix develop}" --unbundle --type=o \
     --targets=hipv4-amdgcn-amd-amdhsa--gfx942 --input="$stem.co" --output="$stem.elf"
 mv "$stem.elf" "$out/moe_aiter_adapter_gfx942.elf"
+# The native MoE align (PLOW_GLM_MOE_NATIVE_ALIGN): its own object, so the adapter above is unchanged.
+"${PLOW_HIPCC:?run inside nix develop}" --genco --offload-arch=gfx942 -O3 -w \
+    -std=c++17 -I"$root/runtime/amd" -I"$root/runtime/common" \
+    "$root/runtime/amd/moe_align_adapter.hip" -o "$stem.co"
+"${PLOW_BUNDLER:?run inside nix develop}" --unbundle --type=o \
+    --targets=hipv4-amdgcn-amd-amdhsa--gfx942 --input="$stem.co" --output="$stem.elf"
+mv "$stem.elf" "$out/moe_align_adapter_gfx942.elf"
 target="$out/fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256.co"
 if ! cmp -s "$object" "$target"; then
     cp "$object" "$target"

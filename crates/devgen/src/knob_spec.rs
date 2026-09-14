@@ -449,6 +449,17 @@ const EMIT_REWRITE_SCOPE: &[Allow] = &[
     },
 ];
 
+/// The AITER MoE instruction names the gathered routing table and the interpreter align leaves.
+const NATIVE_ALIGN_SCOPE: &[Allow] = &[Allow {
+    kinds: &["prefill"],
+    rows: (1024, 8192),
+    topology: Some("ordinary"),
+    model: Some("glm_moe_dsa"),
+    ops: OpSel::In(&["moe"]),
+    fields: &[ScopeField::Op, ScopeField::Operands, ScopeField::Segments, ScopeField::TensorBytes],
+    ..Allow::ANY
+}];
+
 /// The small-rung workgroup cap narrows the compute of the small GLM prefill buckets and nothing
 /// else: not their collectives (6deb4025 did, and this is the scope that says it may not).
 const SMALL_CUS_SCOPE: &[Allow] = &[Allow {
@@ -649,6 +660,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.glm_fuse_rope", Some("PLOW_GLM_FUSE_ROPE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_fuse_qnorm", Some("PLOW_GLM_FUSE_QNORM"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_fuse_post", Some("PLOW_GLM_FUSE_POST"), Layer::Emit, Domain::Bool, OFF, OPT_IN).scoped(FUSE_POST_SCOPE),
+    KnobSpec::new("emit.glm_moe_native_align", Some("PLOW_GLM_MOE_NATIVE_ALIGN"), Layer::Emit, Domain::Bool, OFF, OPT_IN).scoped(NATIVE_ALIGN_SCOPE),
     KnobSpec::new("emit.emit_rewrite", Some("PLOW_EMIT_REWRITE"), Layer::Emit, Domain::Bool, ON, PROMOTED).scoped(EMIT_REWRITE_SCOPE),
     KnobSpec::new("emit.glm_router_off_shared", Some("GLM_ROUTER_OFF_SHARED"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_router_old", Some("GLM_ROUTER_OLD"), Layer::Emit, Domain::Bool, OFF, OPT_IN),

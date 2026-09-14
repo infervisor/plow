@@ -6918,6 +6918,11 @@ fn emit_glm_block_prefill(
 /// rows, but ... was compiled PLOW_GEMV_MM=1") — correctly: the kernel has no outer loop over
 /// `M > 16`, so it is not a build-flag gap, there is no object that could have served it.
 #[allow(clippy::too_many_arguments)]
+/// Partition count of the native MoE align (`PLOW_GLM_MOE_NATIVE_ALIGN`), 64 or 304. At 8192 rows
+/// 64 measured 90.0 us per layer and 304 118.2 (the single-workgroup prefix grows faster than the
+/// scatter shrinks).
+const GLM_MOE_NATIVE_ALIGN_NPART: u32 = 64;
+
 fn emit_glm_moe_ffn_prefill(
     b: &mut Builder,
     c: &GlmCfg,
@@ -7103,7 +7108,15 @@ fn emit_glm_moe_ffn_prefill(
             d.i[4] = u32::from(phase != 0) * 64;
         })
     };
-    let c_align = if align_par {
+    // PLOW_GLM_MOE_NATIVE_ALIGN: the AITER call sorts the gathered table itself (j0 = tab + 1,
+    // j1 = the align's partition count), so no MoeAlignPf is emitted.
+    let native_align = emit_config::active().glm_moe_native_align
+        && native_moe
+        && align_par
+        && (e_all, tk_all) == (256, 8);
+    let c_align = if native_align {
+        c_router
+    } else if align_par {
         let par_blocks: Vec<u32> = all.iter().copied().take(64).collect();
         let c_count = align(b, par_blocks.clone(), &[c_router], 1);
         let c_prefix = align(b, one.clone(), &[c_count], 2);
@@ -7253,6 +7266,10 @@ fn emit_glm_moe_ffn_prefill(
             ];
             // Mode 3: `out` already holds the shared partial (amd_moe_aiter.rs `SharedBf16`).
             d.i = [t, h, imoe_e, e_all, tk_all, 64, 2 + u32::from(seed), u32::from(resident)];
+            if native_align {
+                d.j[0] = n.tab + 1;
+                d.j[1] = GLM_MOE_NATIVE_ALIGN_NPART;
+            }
         });
         b.isolate(counter);
         counter
