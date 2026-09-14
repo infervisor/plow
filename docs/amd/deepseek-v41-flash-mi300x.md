@@ -541,3 +541,38 @@ Items 1-6 remain worth doing in order — the IR ops and the shape contract are
 what the emitter is written against, and the object contract in §7 is what it
 binds. But "run V4.1 end to end" is gated on item 7, and no amount of
 nn-graph work reaches a served token without it.
+
+---
+
+## 11. Two things the reference settles
+
+### The CED split does not skip layers
+
+`Transformer.forward` (`model.py:1241`) runs **all 40 layers in one loop**.
+There is no encoder/decoder branch, no early exit and no layer skipping: the
+"20-layer causal encoder + 20-layer decoder" split is about which KV cache each
+layer READS (`compress_ratio` 2 vs 1, §1), not about how much compute a token
+does.
+
+So §9's 15.1 B activated parameters per token is what the shipped code
+executes, and the model card's "8 B (prefill)" does not reconcile with it from
+the reference. Note 15.1 B = 6.6 B dense + 8.5 B routed, and 8.5 B is within
+rounding of the card's 8 B — the card is plausibly counting the routed experts
+alone. Either way the roofline in §9 used the LARGER number, so the floor it
+gives is conservative and the 300 ms target has at least the headroom stated.
+
+### The residual stream is 4x hidden, everywhere
+
+`h = h.unsqueeze(2).repeat(1, 1, hc_mult, 1)` right after the embedding
+(`model.py:1257`), and it stays that way to the final `hc_pre`. Every layer
+therefore carries `[B, S, 4, 5120]` of activation, not `[B, S, 5120]`, and
+each sublayer's `hc_mixes` reads it flattened at 20480 wide. The WEIGHT cost is
+trivial (`hc_*_fn` is 24 x 20480, ~0.5 M x 2 x 40 = 39 M params) but the
+activation traffic and the LDS/register pressure are 4x what a normal decoder
+block plans for. At 8k that is 8192 x 4 x 5120 x 2 B = 336 MiB per layer of
+residual alone.
+
+`make_identity_pre_mix(h, hc_mult)` seeds layer 0's `pre_mix` before the loop —
+confirming that `pre_mix` is genuinely loop-carried across layers (§6.1) and
+that the first layer needs an explicit identity rather than reading a previous
+sublayer's mix.
