@@ -34,10 +34,21 @@
 /* No 16-byte global_load_lds on CDNA3 (amd_arch.h), so d_gemm_t's DMA-direct stage is never
  * selected here: the register-staging path, with GM_PGR2 as its two-deep prefetch, is the ladder. */
 #define PLOW_GM_DIRECT_STAGE 0
-/* CDNA3's packed fp8 encoder is e4m3FNUZ, a DIFFERENT format (amd_arch.h), so d_quant_fp8 encodes
- * OCP e4m3 in software, two bytes per call. */
+/* Encoding x/2 as FNUZ produces the same finite byte as encoding x as OCP because the formats'
+ * exponent biases differ by one. Exhaustively compared on gfx942 over every finite FP32 bit
+ * pattern in d_quant_fp8's [-448,448] domain: zero mismatches. Balanced M1024 timing wins every
+ * 3840/4096/5376/8192 width by 1.21x--1.33x, so gfx942 defaults it on. */
+#ifndef GM_NATIVE_OCP_QUANT
+#define GM_NATIVE_OCP_QUANT 1
+#endif
+#if GM_NATIVE_OCP_QUANT
+#define PLOW_GM_FP8_PACK2(a, b)                                                             \
+    (plow_fp8_mask_neg0(__builtin_amdgcn_cvt_pk_fp8_f32((a) * 0.5f, (b) * 0.5f, 0u, false)) \
+     & 0xffffu)
+#else
 #define PLOW_GM_FP8_PACK2(a, b) \
     ((unsigned)plow_f32_to_fp8_ocp(a) | ((unsigned)plow_f32_to_fp8_ocp(b) << 8))
+#endif
 /* gv_un_fp8 picks the fp8 GEMV unroll by the K-divisor rule (op_gemm_common.h). Measured HERE:
  * K=3840/4096 -18..-27% standalone; gfx950 keeps the constant until someone measures the rule there. */
 #define PLOW_GV_UN_FP8_KDIV 1

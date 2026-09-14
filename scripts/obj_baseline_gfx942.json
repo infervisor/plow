@@ -135,7 +135,8 @@
    "GM_C8_BN": 384,
    "GM_C5_BN": 256,
    "GM_WD_BM": 128,
-   "GM_PRIO8": 0
+   "GM_PRIO8": 0,
+   "GM_NATIVE_OCP_QUANT": 1
   },
   "p1": {
    "FA_DC": 128,
@@ -234,7 +235,8 @@
    "GM_C8_BN": 384,
    "GM_C5_BN": 256,
    "GM_WD_BM": 128,
-   "GM_PRIO8": 0
+   "GM_PRIO8": 0,
+   "GM_NATIVE_OCP_QUANT": 1
   },
   "p2": {
    "FA_MLA_PF2_BKV": 32,
@@ -333,7 +335,8 @@
    "GM_C8_BN": 384,
    "GM_C5_BN": 256,
    "GM_WD_BM": 128,
-   "GM_PRIO8": 0
+   "GM_PRIO8": 0,
+   "GM_NATIVE_OCP_QUANT": 1
   },
   "p3": {
    "FA_MLA_PF2_BKV": 32,
@@ -432,7 +435,8 @@
    "GM_C8_BN": 384,
    "GM_C5_BN": 256,
    "GM_WD_BM": 128,
-   "GM_PRIO8": 0
+   "GM_PRIO8": 0,
+   "GM_NATIVE_OCP_QUANT": 1
   },
   "p4": {
    "FA_LAZY_RESCALE": 0,
@@ -531,7 +535,8 @@
    "GM_C8_BN": 384,
    "GM_C5_BN": 256,
    "GM_WD_BM": 128,
-   "GM_PRIO8": 0
+   "GM_PRIO8": 0,
+   "GM_NATIVE_OCP_QUANT": 1
   },
   "p5": {
    "FA_MLA_PF2_BKV": 32,
@@ -630,7 +635,8 @@
    "GM_C8_BN": 384,
    "GM_C5_BN": 256,
    "GM_WD_BM": 128,
-   "GM_PRIO8": 0
+   "GM_PRIO8": 0,
+   "GM_NATIVE_OCP_QUANT": 1
   },
   "p6": {
    "FA_MERGE_UNROLL4": 1,
@@ -729,7 +735,8 @@
    "GM_C8_BN": 384,
    "GM_C5_BN": 256,
    "GM_WD_BM": 128,
-   "GM_PRIO8": 0
+   "GM_PRIO8": 0,
+   "GM_NATIVE_OCP_QUANT": 1
   },
   "p7": {}
  },

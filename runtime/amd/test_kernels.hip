@@ -332,8 +332,8 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void gemma
  * absmax/round path that produces it. (The GEMM itself is already covered by gemm_fp8_c0, whose
  * 256/256/64 tile is the one the interpreter carries.) */
 extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void d_quant_fp8_k(
-    unsigned char* xq, bf16* x, float* ascale, unsigned M, unsigned K) {
-    d_quant_fp8(xq, x, ascale, M, K, blockIdx.x, gridDim.x);
+    unsigned char* xq, bf16* x, float* ascale, unsigned M, unsigned K, unsigned nblk) {
+    d_quant_fp8(xq, x, ascale, M, K, blockIdx.x, nblk);
 }
 
 /* MXFP4 (OCP microscaling e2m1 + one E8M0 scale per 32 K) decode GEMV, w4a16.
