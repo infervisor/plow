@@ -8,6 +8,7 @@
 
 mod deepseek;
 mod deepseek_v4;
+mod deepseek_v41;
 mod gemma;
 mod gemma4_multimodal;
 mod glm;
@@ -24,6 +25,10 @@ mod siglip;
 pub use deepseek::DeepSeekConfig;
 pub use deepseek_v4::{
     DeepSeekV4Config, DeepSeekV4QuantizationConfig, DeepSeekV4RopeScaling, V4Attn, MXFP4_GROUP,
+};
+pub use deepseek_v41::{
+    DeepSeekV41Config, DeepSeekV41QuantizationConfig, DeepSeekV41RopeScaling, V41Attn,
+    V41_MXFP4_GROUP,
 };
 pub use gemma::{GemmaConfig, RopeParameters, RopeSpec};
 pub use gemma4_multimodal::{Gemma4MultimodalConfig, MmProjectorConfig};
@@ -72,6 +77,12 @@ pub enum ModelConfig {
     /// 512-wide latent, a grouped output LoRA, MXFP4 routed experts beside
     /// block-FP8 projections, and an attached DSpark speculative module.
     DeepSeekV4(DeepSeekV4Config),
+    /// DeepSeek-V4.1-Flash: a causal encoder/decoder over CSA2 -- one
+    /// compressed KV cache written by `kv_source_layer_ids` and read by every
+    /// layer -- a two-level lightning indexer, Engram n-gram memory,
+    /// single-pass mHC, and block-FP8 at a [32,32] scale grid beside MXFP4
+    /// routed experts.
+    DeepSeekV41(DeepSeekV41Config),
     Siglip(SiglipConfig),
     QwenVl(QwenVlVisionConfig),
     QwenImageDit(QwenImageDitConfig),
@@ -186,6 +197,21 @@ impl ModelConfig {
             "qwen3_5_text" => parse_qwen35(v),
             "deepseek" | "deepseek_v2" | "deepseek_v3" => parse_deepseek(v),
             "deepseek_v4" => parse_deepseek_v4(v),
+            // The multimodal wrapper. Its vision tower and aligner are not
+            // modeled, so -- as with gemma4/qwen3_5 -- the text tower is
+            // reached through the text-generation frontend rather than by
+            // silently dropping the vision half here.
+            "deepseek_v41" => {
+                if v.get("vision_config").is_some() {
+                    return Err(ConfigError::Unsupported(
+                        "deepseek_v41 vision graph is not implemented (DeepSeek-ViT + aligner); \
+                         use the text-generation frontend to compile only its language model"
+                            .to_string(),
+                    ));
+                }
+                parse_deepseek_v41(sub_config(&v, "text_config"))
+            }
+            "deepseek_v41_text" => parse_deepseek_v41(v),
             "muse_glimmer" | "muse_glimmer_text" | "muse_glimmer_vision" => {
                 Err(ConfigError::Unsupported(
                     "muse_glimmer (Muse Glimmer text uses alternating sliding/NoPE attention, \
@@ -263,6 +289,15 @@ fn parse_deepseek_v4(v: serde_json::Value) -> Result<ModelConfig, ConfigError> {
     Ok(ModelConfig::DeepSeekV4(cfg))
 }
 
+/// DeepSeek-V4.1 parses and validates; the refusal moved to the emit path
+/// ([`crate::models::build_graph`]), where [`DeepSeekV41Config::unimplemented`]
+/// names every missing piece.
+fn parse_deepseek_v41(v: serde_json::Value) -> Result<ModelConfig, ConfigError> {
+    let cfg: DeepSeekV41Config = serde_json::from_value(v)?;
+    cfg.validate()?;
+    Ok(ModelConfig::DeepSeekV41(cfg))
+}
+
 fn parse_deepseek(v: serde_json::Value) -> Result<ModelConfig, ConfigError> {
     let cfg: DeepSeekConfig = serde_json::from_value(v)?;
     cfg.validate().map_err(ConfigError::Unsupported)?;
@@ -287,6 +322,9 @@ fn model_type(v: &serde_json::Value) -> Option<String> {
         .and_then(|a| a.as_str())?;
     let mapped = match arch {
         a if a.starts_with("Gemma") => "gemma3",
+        // Before the `DeepseekV4` arm: that prefix also matches
+        // `DeepseekV41ForCausalLM`, which is a different architecture.
+        a if a.starts_with("DeepseekV41") => "deepseek_v41",
         a if a.starts_with("DeepseekV4") => "deepseek_v4",
         a if a.starts_with("DeepseekV3") || a.starts_with("DeepseekV2") => "deepseek_v3",
         a if a.starts_with("GlmMoeDsa") || a.starts_with("Glm") => "glm_moe_dsa",
