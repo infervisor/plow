@@ -370,6 +370,9 @@ pub(super) const PREFILL_ARM_MARKERS: &[(&str, &[&str])] = &[
     // The prefill q-rope fold (op 15 t5 = pos). An object without the arm stores the unroped
     // q_rope projection and attention runs on it: no trap. A BUILD axis.
     ("PLOW_GLM_FUSE_POST", &["plow_glm_fuse_post_arm"]),
+    // The GLM SP attention seam as one band AddNorm (i2 = 1). An object without the arm runs
+    // d_add_norm on the unrounded sum: finite, slightly different numbers. A BUILD axis.
+    ("PLOW_GLM_FUSE_SEAM_RN", &["plow_glm_fuse_seam_rn_arm"]),
     // Dense causal KV-split of the V2 MLA prefill (packet i6 on op 51). Older objects run
     // ns packets at the nsplit=1 partial layout while the merge reads ns — refuse.
     ("PLOW_MLA_PF_NS", &["plow_mla_pf_ns_arm"]),
@@ -988,6 +991,9 @@ pub(super) fn packet_prefill_arm_requirements<'a>(
         .any(|inst| inst.op == DevOp::GemmMed as u16 && inst.t[5] != packet::dev::TENSOR_NONE16)
     {
         requires.push("PLOW_GLM_FUSE_POST=1".to_owned());
+    }
+    if insts().any(|inst| inst.op == DevOp::AddNorm as u16 && inst.i[2] == 1) {
+        requires.push("PLOW_GLM_FUSE_SEAM_RN=1".to_owned());
     }
     if required_moe_pf_accum(progs.clone(), 4) {
         requires.push("PLOW_MOE_PF_ATOMIC=1".to_owned());

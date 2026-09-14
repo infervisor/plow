@@ -813,6 +813,68 @@ __device__ void d_norm_residual(bf16* __restrict__ out, const bf16* __restrict__
     }
 }
 
+#if PLOW_GLM_FUSE_SEAM_RN
+/* PLOW_GLM_FUSE_SEAM_RN (AddNorm i2 = 1, the GLM SP attention seam): resid = f2bf(a + b); out = RMSNorm(resid) with the SAME rounded bf16 row d_rmsnorm would re-read,
+ * reduced with rn_sumsq over rn_index exactly as d_rmsnorm does. One burst of loads per
+ * PLOW_RN_ROWS rows, one pass of stores: the norm never re-reads the residual. */
+__device__ void d_residual_rmsnorm(bf16* __restrict__ out, bf16* __restrict__ resid,
+                                   const bf16* __restrict__ a, const bf16* __restrict__ b,
+                                   const bf16* __restrict__ gamma, unsigned rows, unsigned feat,
+                                   float eps, unsigned slice, unsigned nblk, float* part) {
+    constexpr unsigned R = PLOW_RN_ROWS > 1 ? PLOW_RN_ROWS : 1;
+    const auto* ag = as_glob(a);
+    const auto* bg = as_glob(b);
+    const auto* gg = as_glob(gamma);
+    auto* og = as_glob(out);
+    auto* rg = as_glob(resid);
+    for (unsigned row = slice; row < rows; row += R * nblk) {
+        bf16v8 w[rn_vecs], va[R][rn_vecs], vb[R][rn_vecs];
+#pragma unroll
+        for (int c = 0; c < rn_vecs; c++) {
+            const unsigned i = rn_index(c);
+            w[c] = bf16v8_zero();
+            if (i < feat && gamma) w[c] = ld_glob8(gg + i);
+#pragma unroll
+            for (unsigned r = 0; r < R; r++) {
+                const unsigned rr = row + r * nblk;
+                va[r][c] = bf16v8_zero();
+                vb[r][c] = bf16v8_zero();
+                if (i < feat && rr < rows) {
+                    va[r][c] = ld_glob8(ag + (size_t)rr * feat + i);
+                    vb[r][c] = ld_glob8(bg + (size_t)rr * feat + i);
+                }
+            }
+        }
+#pragma unroll
+        for (unsigned r = 0; r < R; r++) {
+            const unsigned rr = row + r * nblk;
+            bf16v8 v[rn_vecs];
+#pragma unroll
+            for (int c = 0; c < rn_vecs; c++)
+#pragma unroll
+                for (int j = 0; j < 8; j++) v[c][j] = f2bf(bf2f(va[r][c][j]) + bf2f(vb[r][c][j]));
+            const float inv = rsqrtf(rn_ss(rn_sumsq(v, part)) / (float)feat + eps);
+            if (rr >= rows) continue;
+            const size_t base = (size_t)rr * feat;
+#pragma unroll
+            for (int c = 0; c < rn_vecs; c++) {
+                const unsigned i = rn_index(c);
+                if (i < feat) {
+                    bf16v8 o;
+#pragma unroll
+                    for (int j = 0; j < 8; j++) {
+                        const float g = gamma ? bf2f(w[c][j]) : 1.0f;
+                        o[j] = f2bf(bf2f(v[c][j]) * inv * g);
+                    }
+                    st_glob8(rg + base + i, v[c]);
+                    st_glob8(og + base + i, o);
+                }
+            }
+        }
+    }
+}
+#endif
+
 /* Qwen/Llama PRE-NORM tail, in ONE packet: the residual add AND the norm that always follows it.
  *
  *     resid = a + b                    (the running residual stream)

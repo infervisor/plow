@@ -236,6 +236,7 @@ pub(crate) const PREFILL_ROW_FIELDS: &[(DevOp, RowField)] = &[
     (DevOp::HeadNormRope, RowField::Rows(0)),
     (DevOp::HeadNormRopeFp8, RowField::Rows(0)),
     (DevOp::Residual, RowField::RowsTimes(0)),
+    (DevOp::AddNorm, RowField::Rows(0)),
     (DevOp::Glu, RowField::RowsTimes(0)),
     (DevOp::Gemm, RowField::Rows(0)),
     (DevOp::GemmNorm, RowField::Rows(0)),

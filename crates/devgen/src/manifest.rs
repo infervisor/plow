@@ -417,6 +417,9 @@ struct Shapes {
     /// t3/t4 = cos/sin, t5 = pos, i3 = the first roped column. An object without the arm stores
     /// the unroped projection and attention runs on it. Refuse at load.
     glm_fuse_post: bool,
+    /// Any `AddNorm` with `i[2] == 1` — the GLM SP attention seam's band Residual + RmsNorm
+    /// (PLOW_GLM_FUSE_SEAM_RN). An object without the arm norms the unrounded sum. Refuse at load.
+    glm_fuse_seam_rn: bool,
     /// Optional linear biases carried by the instruction stream. Plain GEMM/GEMV use `t7`;
     /// fused QKV uses the three demoted handles in `i5/i6/i7`.
     linear_bias: bool,
@@ -583,6 +586,7 @@ fn shapes(m: &Model) -> Shapes {
                         s.linear_bias = true;
                     }
                 }
+                DevOp::AddNorm if inst.i[2] == 1 => s.glm_fuse_seam_rn = true,
                 DevOp::Gemm | DevOp::GemmMed | DevOp::GemmSmall | DevOp::Gemv => {
                     if op == DevOp::GemmMed && inst.t[5] != packet::TENSOR_NONE {
                         s.glm_fuse_post = true;
@@ -937,6 +941,9 @@ fn encoding_features(f: &mut Map<String, Value>, s: &Shapes) {
     f.insert("glm_fuse_qnorm".into(), json!(s.glm_fuse_qnorm));
     if s.glm_fuse_post {
         f.insert("glm_fuse_post".into(), json!(true));
+    }
+    if s.glm_fuse_seam_rn {
+        f.insert("glm_fuse_seam_rn".into(), json!(true));
     }
 }
 
@@ -1389,6 +1396,9 @@ fn backend_amd(
     }
     if on("glm_fuse_post") {
         req.push("PLOW_GLM_FUSE_POST=1".into());
+    }
+    if on("glm_fuse_seam_rn") {
+        req.push("PLOW_GLM_FUSE_SEAM_RN=1".into());
     }
     // The fused decode QKV/GLU emitted against a STATED arena (PLOW_DEC_STAGE_HALVES). The
     // object must publish the arena it was built at so plowrt can compare M*K against it —

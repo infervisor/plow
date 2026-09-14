@@ -458,6 +458,11 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_MOE_NATIVE_ALIGN", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_moe_native_align: bool,
 
+    /// GLM prefill attention seam: the band `Residual` and the post-attention `RmsNorm` as one
+    /// `AddNorm` in band mode (opt-in; the prefill objects gain the arm through the requires).
+    #[arg(long, env = "PLOW_GLM_FUSE_SEAM_RN", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_fuse_seam_rn: bool,
+
     /// Lower the egglog rewrite: at every emitter fusion site a rewrite rule covers, the extracted
     /// fused graph decides the fusion instead of the hand knob (plowc supplies the sites). Default
     /// on; without a rewrite for the checkpoint the hand fusions stay, and only an explicit `=1`
@@ -1263,6 +1268,7 @@ impl EmitConfig {
             glm_fuse_qnorm: env_bool("PLOW_GLM_FUSE_QNORM"),
             glm_fuse_post: env_bool("PLOW_GLM_FUSE_POST"),
             glm_moe_native_align: env_bool("PLOW_GLM_MOE_NATIVE_ALIGN"),
+            glm_fuse_seam_rn: env_bool("PLOW_GLM_FUSE_SEAM_RN"),
             emit_rewrite: env_opt_out("PLOW_EMIT_REWRITE"),
             glm_router_off_shared: env_bool("GLM_ROUTER_OFF_SHARED"),
             glm_router_old: env_bool("GLM_ROUTER_OLD"),

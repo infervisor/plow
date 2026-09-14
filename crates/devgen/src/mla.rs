@@ -5091,6 +5091,41 @@ fn glm_sp_residual(
     })
 }
 
+/// PLOW_GLM_FUSE_SEAM_RN: [`glm_sp_residual`] and the band RMSNorm of [`glm_sp_norm_gather`] as one
+/// `AddNorm` in band mode (i2 = 1): `out` = f2bf(resid + slot) on the band, normed into peer slot 3.
+#[allow(clippy::too_many_arguments)]
+fn glm_sp_residual_norm(
+    b: &mut Builder,
+    n: &GlmTn,
+    t: u32,
+    tp: u32,
+    h: u32,
+    eps: f32,
+    out: u32,
+    resid: u32,
+    slot: u32,
+    weight: u32,
+    deps: &[u32],
+) -> u32 {
+    let rowb = h as u64 * 2;
+    let o = glm_band(b, out, t, tp, rowb);
+    let r = glm_band(b, resid, t, tp, rowb);
+    let s = glm_band(b, slot, t, tp, rowb);
+    let hb = glm_band(b, n.h2_tp, t, tp, rowb);
+    let rows = t / tp;
+    b.emit(DevOp::AddNorm, pf_wide_cus(b.n_cu(), rows), deps, |d| {
+        d.t[0] = hb;
+        d.t[1] = o;
+        d.t[2] = r;
+        d.t[3] = s;
+        d.t[4] = weight;
+        d.i[0] = rows;
+        d.i[1] = h;
+        d.i[2] = 1;
+        d.f[0] = eps;
+    })
+}
+
 /// RMSNorm this rank's band of `x` into its band of peer slot 3, then all-gather the normed rows
 /// into `out` on every rank.
 #[allow(clippy::too_many_arguments)]
@@ -6746,6 +6781,10 @@ pub(crate) fn emit_glm_mla_prefill(
         let c_p = oproj(b, n.og_tp, &[c_uv]);
         let c_rs =
             crate::emit_xreduce_scatter(b, xgate, xr_cus, &[c_p], n.og_tp, t * h, tp, 0, None, None);
+        if emit_config::active().glm_fuse_seam_rn {
+            let c_n = glm_sp_residual_norm(b, n, t, tp, h, eps, n.xmid, x_in, n.og_tp, w.gpost, &[c_rs]);
+            return crate::emit_xall_gather(b, xgate, xr_cus, &[c_n], &[(n.xn2, t * h, 3 * n.slot_b)], tp);
+        }
         let c_res = glm_sp_residual(b, t, tp, h, n.xmid, x_in, n.og_tp, &[c_rs]);
         return glm_sp_norm_gather(
             b, n, t, tp, h, eps, n.xn2, n.xmid, w.gpost, &[c_res], xgate, xr_cus,

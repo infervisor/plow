@@ -2165,6 +2165,11 @@ __device__ __forceinline__ void exec_gemm_small(CInst in, CTens T,
  * object without it stores the unroped projection into `qr`. */
 extern "C" __device__ unsigned plow_glm_fuse_post_arm = 1;
 #endif
+#if PLOW_GLM_FUSE_SEAM_RN
+/* Marker: AddNorm i2 = 1 is the band Residual + RmsNorm seam (emit knob PLOW_GLM_FUSE_SEAM_RN). An
+ * object without it runs d_add_norm, which norms the unrounded sum. */
+extern "C" __device__ unsigned plow_glm_fuse_seam_rn_arm = 1;
+#endif
 __device__ __forceinline__ void exec_gemm_med(CInst in, CTens T,
                                               unsigned slice, unsigned nblk, bf16* lds) {
 #define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
@@ -3340,6 +3345,14 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
 #endif
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_ADD_NORM
         case PLOW_DOP_ADD_NORM:
+#if PLOW_GLM_FUSE_SEAM_RN
+            if (in->i[2] == 1u) {
+                d_residual_rmsnorm((bf16*)TEN(0), (bf16*)TEN(1), (const bf16*)TEN(2),
+                                   (const bf16*)TEN(3), (const bf16*)TEN(4), in->i[0], in->i[1],
+                                   in->fj[0].f, slice, nblk, sm->part);
+                break;
+            }
+#endif
             d_add_norm((bf16*)TEN(0), (bf16*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
                        (const bf16*)TEN(4), in->i[0], in->i[1], in->fj[0].f, slice, nblk, sm->part);
             break;
