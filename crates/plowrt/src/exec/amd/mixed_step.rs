@@ -126,14 +126,25 @@ impl MixedAmdStep {
                 .amd
                 .token_batch_wide_tiles;
         let mut synthesized = crate::exec::mixed_program::synthesize(blob, batch, wide_tiles)?;
+        let fp8_weights = synthesized.programs.iter().any(|spec| {
+            spec.program.insts.iter().any(|inst| {
+                matches!(
+                    DevOp::from_u16(inst.op),
+                    Some(
+                        DevOp::QuantFp8
+                            | DevOp::GemmFp8
+                            | DevOp::GemmMedFp8
+                            | DevOp::GemmSmallFp8
+                            | DevOp::GemmWideFp8
+                            | DevOp::GemmC5Fp8
+                            | DevOp::GemmGluFp8
+                    )
+                )
+            })
+        });
         if route == StepRoute::TokenBatch {
-            // The route is qualified at `nsplit == 1` with a fused flash epilogue, and
-            // `runtime/amd/interp.hip`'s token-batch FlashPrefill arm TRAPS on anything else:
-            // when the KV partition moves with a span boundary the merge is no longer
-            // associative, and `exec_mixed_prefill_merge` still resolves rows through
-            // `plow_mixed_prefill_span`, which requires the decode prefix this contract
-            // removes. Drop those buckets here rather than admit a plan that would trap —
-            // a refused bucket is a scheduling limit, a trapped wavefront is an outage.
+            // Unsplit attention writes its fused output. Split attention writes contiguous
+            // row/head/split partials and the synthesized FlashMerge consumes them.
             synthesized.programs.retain(|spec| {
                 spec.program
                     .insts
@@ -191,6 +202,10 @@ impl MixedAmdStep {
             .iter()
             .copied()
             .chain(wide_tiles.then_some("plow_token_batch_wide_gemm_1"))
+            .chain(
+                (route == StepRoute::TokenBatch && fp8_weights)
+                    .then_some("plow_token_batch_fp8_gemm_1"),
+            )
             .collect();
         for marker in markers {
             if elf_symbol_u32(&object, marker) != Some(1) {
@@ -447,6 +462,13 @@ fn validate_program(program: &plow_asset::aux_program::Program) -> Result<()> {
                     | DevOp::GemmWide
                     | DevOp::GemmC5
                     | DevOp::GemmGlu
+                    | DevOp::QuantFp8
+                    | DevOp::GemmFp8
+                    | DevOp::GemmMedFp8
+                    | DevOp::GemmSmallFp8
+                    | DevOp::GemmWideFp8
+                    | DevOp::GemmC5Fp8
+                    | DevOp::GemmGluFp8
                     | DevOp::FlashDecode
                     | DevOp::FlashPrefill
                     | DevOp::FlashMerge
@@ -484,14 +506,32 @@ impl AmdEngine {
         self.packed_step_rows(StepRoute::Mixed, decode_rows, prefill_rows)
     }
 
-    /// Row capacity of the token-batch bucket that would carry `leading_rows` sampled rows
-    /// (decode requests plus prompts completing this step) and `prefill_rows` body rows.
+    /// Row capacity of the token-batch bucket that would carry `sample_rows` sampled rows,
+    /// `decode_rows` decode inputs, and `prefill_rows` prefill inputs.
     ///
-    /// `leading_rows == 0` is refused, not treated as one: `S = 0` means no output segment,
+    /// `sample_rows == 0` is refused, not treated as one: `S = 0` means no output segment,
     /// and the legacy `n_batch == 0 means one row` convention would deliver a token to a
     /// request that asked for none.
-    pub fn token_batch_rows(&self, leading_rows: usize, prefill_rows: usize) -> Option<u32> {
-        self.packed_step_rows(StepRoute::TokenBatch, leading_rows, prefill_rows)
+    pub fn token_batch_rows(
+        &self,
+        sample_rows: usize,
+        decode_rows: usize,
+        prefill_rows: usize,
+    ) -> Option<u32> {
+        let real_rows = decode_rows.checked_add(prefill_rows)?;
+        if sample_rows == 0 || real_rows == 0 {
+            return None;
+        }
+        let pinned = crate::config::RuntimeConfig::get().amd.token_batch_rows;
+        select_token_batch_rows(
+            self.step_ref(StepRoute::TokenBatch)?
+                .programs
+                .iter()
+                .map(|p| (p.rows, p.decode_rows, p.samples)),
+            sample_rows,
+            real_rows,
+            pinned,
+        )
     }
 
     fn packed_step_rows(
@@ -508,12 +548,8 @@ impl AmdEngine {
             return None;
         }
         let step = self.step_ref(route)?;
-        // ATTRIBUTION KNOB, not a tuning one. This route is confined to buckets with
-        // `nsplit == 1`, which on a blob whose small rungs split their attention means it runs
-        // a DIFFERENT bucket from the ordinary route for the same prompt — so a greedy output
-        // difference has two candidate causes at once, the packing and the bucket. Pinning the
-        // bucket holds the packing fixed and moves only the reduction order, which is what
-        // separates them. Unset in every measured configuration.
+        // ATTRIBUTION KNOB, not a tuning one. Pinning the bucket holds packet geometry fixed while
+        // comparing token-batch packing against the ordinary route. Unset in production.
         let pinned = crate::config::RuntimeConfig::get().amd.token_batch_rows;
         step.programs
             .iter()
@@ -783,6 +819,45 @@ impl AmdEngine {
         }
         *self.step_slot(route) = Some(mixed);
         result
+    }
+}
+
+fn select_token_batch_rows(
+    programs: impl Iterator<Item = (u32, u32, bool)>,
+    sample_rows: usize,
+    real_rows: usize,
+    pinned: Option<u32>,
+) -> Option<u32> {
+    programs
+        .filter(|&(rows, sample_capacity, has_samples)| {
+            pinned.is_none_or(|want| rows == want)
+                && has_samples
+                && sample_rows <= sample_capacity as usize
+                && real_rows <= rows as usize
+        })
+        .min_by_key(|&(rows, _, _)| rows - real_rows as u32)
+        .map(|(rows, _, _)| rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_token_batch_rows;
+
+    #[test]
+    fn completing_prefill_samples_do_not_consume_rows_twice() {
+        let programs = [(128, 128, true), (512, 128, true), (1024, 128, true)];
+        assert_eq!(
+            select_token_batch_rows(programs.into_iter(), 2, 1024, None),
+            Some(1024)
+        );
+        assert_eq!(
+            select_token_batch_rows(programs.into_iter(), 2, 1025, None),
+            None
+        );
+        assert_eq!(
+            select_token_batch_rows(programs.into_iter(), 129, 1024, None),
+            None
+        );
     }
 }
 

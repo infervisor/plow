@@ -12,9 +12,11 @@ now code and tests. Where the two disagree, the disagreement is called out here.
 ## Contents
 
 Runtime selection defaults on. `--token-batch=false` or `PLOW_TOKEN_BATCH=0` disables it;
-explicit `--fusion` takes precedence. Selection still requires a gfx942 dense BF16 program,
-matching object markers, multiple slots, unsplit attention and a fused attention epilogue.
-Tensor parallelism, prefix-cache mode and unsupported programs use ordinary execution.
+explicit `--fusion` takes precedence. Selection still requires a gfx942 dense program with
+direct BF16 KV, matching object markers, multiple slots, and an attention epilogue compatible
+with the packet: fused output for `nsplit=1`, or contiguous partials followed by `FlashMerge` for
+`nsplit>1`. BF16 and FP8 weights are armed; FP8 KV is not. Tensor parallelism and unsupported
+programs use ordinary execution. The ring-aware snapshot prefix cache composes with this route.
 CUDA has no token-batch executor yet, so the default does not enable token batching on H100.
 
 Startup logs distinguish object `armed` from executor `ready` and always report `fires=false`.
@@ -538,11 +540,9 @@ tile is an **exact** no-op on the online softmax: every `p[i]` is `-inf`, so `rm
 `oacc *= 1.0f`. The real KV tiles are still visited in ascending `kv0`. Hence bit-identity.
 
 At `nsplit > 1` the KV *partition* moves with `kv_end`, so the partial sums differ and the merge
-is not associative in floating point. **Bit-identity is not claimed there**, and the route refuses
-it: a `FlashPrefill` packet with `i7 != 1` traps. The emitter already pins `ns = 1` when packing
-(`crates/devgen/src/lib.rs`, `dense_flash_split`), for the same reason — and
-`crates/devgen/src/lib_tests/token_batch_contract.rs` pins that, with a negative control, so a
-change that lost it fails a test instead of trapping on a device.
+is not associative in floating point. The route keeps those partials in a contiguous
+`(row, head, split)` buffer and runs `FlashMerge`; a split packet with no merge binding is refused
+at admission rather than trapping after launch.
 
 ---
 
@@ -561,6 +561,14 @@ interp_tokbatch     444  188  64544    1        43/40     825
 
 22 VGPR and 22 AGPR lighter than the object it replaces, same LDS, same scratch. The phase-band
 loop and the per-span flash loop were not free.
+
+A packet-specialized build may also set `PLOW_DECODE_INVENTORY_PRUNE=1` on
+`interp_tokbatch`. This is allowed only when the generated header carries
+`PLOW_PACKET_HAS_TOKEN_BATCH_INVENTORY=1`: that inventory is distinct from ordinary prefill
+because the single-GPU runtime synthesis injects `FlashDecode`/`FlashMerge`, converts the
+prefill head `Gemv` to `Gemm`, and may split `NormResidualNorm`. Older headers have no marker
+and therefore keep the conservative unpruned object. This gate prevents a smaller code object
+from silently dropping a synthesized dispatch arm.
 
 `.vgpr_spill_count` is not the check and was not trusted — those are `scripts/asm_audit.py`'s
 counts from the ISA. Both objects' entry kernels issue 43 (static) / 40 (`_gq`) scratch ops while
@@ -588,9 +596,9 @@ branch before with an identical opcode histogram.
 Everything the route cannot execute is refused with the capability named. Nothing falls back.
 
 **At build.** `scripts/build_gfx942.sh`'s `interp_tokbatch` contract fails on a missing marker.
-`interp.hip` `#error`s on any non-BF16-dense encoding — placed **after** the op headers, because
-`#if UNDEFINED` is `0` and a guard written before the axis macros resolve reads as satisfied and
-proves nothing.
+`interp.hip` `#error`s on FP8 KV, MXFP4, MLA, MoE, K3, or recurrent encodings — placed **after**
+the op headers, because `#if UNDEFINED` is `0` and a guard written before the axis macros resolve
+reads as satisfied and proves nothing. FP8-weight objects advertise a separate marker.
 
 **At load** (`crates/plowrt/src/exec/amd_token_batch.rs`), from `.symtab`, before the object
 reaches a device:
@@ -601,6 +609,7 @@ reaches a device:
 | `plow_token_batch_dense_gqa_1` | the dense-GQA operator set is present |
 | `plow_token_batch_combined_m_1` | projections run at combined M, no phase band |
 | `plow_token_batch_span_attn_1` | attention bounds come from spans |
+| `plow_token_batch_fp8_gemm_1` | FP8 quantization and GEMM arms consume live packed rows |
 
 The kernel symbol is `plow_interp_tokbatch_<arch>` — deliberately **not**
 `plow_interp_mixed_<arch>`. The two objects have the same shape and different dispatch; a shared
@@ -608,7 +617,7 @@ name would let a stale `interp_mixed_gq.elf` answer a token-batch lookup and ser
 route against a descriptor with no decode prefix. Symbol resolution refuses it instead.
 
 **At admission**, one capability name per reason:
-`token_batch_prefix_free_spans`, `token_batch_unsplit_attention`, `token_batch_fused_epilogue`.
+`token_batch_prefix_free_spans` or `token_batch_attention_epilogue`.
 
 **Armed is not fires.** One log line at load carries both as separate fields:
 
@@ -679,9 +688,8 @@ The seam, for whoever picks it up:
    `FlashPrefill.i[4]`, `FlashPrefill.i[1]`, and `FlashDecode.t[6]`. All four are already
    descriptor-sourced on the device side by this work, so the emitter's job is to stop writing
    them, not to write them differently.
-5. `ns = 1` and the fused epilogue are already the packed-emit behaviour (`dense_flash_split`),
-   which is what the device arm requires and what
-   `lib_tests/token_batch_contract.rs` now pins.
+5. The packed emitter preserves either `ns = 1` plus fused output or `ns > 1` plus the following
+   `FlashMerge`; the device admission gate checks that binding before enabling the route.
 
 ---
 
@@ -1159,14 +1167,14 @@ by intent:
   the mixed object is the one place in the tree where `default:` is
   `__builtin_trap()` rather than a silent no-op (`interp.hip:4559-4562`).
 - **No `single-row` class-A operator.** The rewrite's whole purpose is to give
-  every packed operator a live row count: it normalizes five GEMM tile opcodes to
-  `Gemm`, converts the lm_head `Gemv` to a `Gemm` with `i0=dcap`, folds
-  `Gemm·Gemm·Glu` into `GemmGlu`, and rewrites `SoftCap`/`Argmax`/`ArgmaxFin`'s
-  counts.
+  every packed operator a live row count: it normalizes BF16 GEMM tile opcodes,
+  retains packet-selected FP8 Small/Med/Wide/C5 rungs, converts the lm_head
+  `Gemv` to a `Gemm` with `i0=dcap`, folds `Gemm·Gemm·Glu` into `GemmGlu`, and
+  rewrites `SoftCap`/`Argmax`/`ArgmaxFin`'s counts.
 - **No `HeadNormRopeFp8`, `FlashDecodeFp8`, `FlashPrefillFp8`.** Refused by name
   (`plow-asset/src/mixed_step.rs:1011-1013`, "dense consumer requires BF16 direct
-  KV"), and the object refuses to *compile* with `PLOW_FP8`/`PLOW_FP8_KV`/
-  `PLOW_MXFP4` set (`interp.hip:19-21`).
+  KV"), and the object refuses to *compile* with `PLOW_FP8_KV` set. `PLOW_FP8`
+  means FP8 weights and is admitted only with `plow_token_batch_fp8_gemm_1`.
 
 So the answer is the one the task anticipated — the gate makes the hazards
 unreachable — with two refinements worth recording.
@@ -1283,8 +1291,8 @@ Reasons, in order of weight:
    extend rather than replace.
 4. **The plan keeps the new route opt-in per (backend, family) pair until
    measured**, so a period with both present is expected, not a failure. v1
-   covers (AMD, dense GQA, single-GPU, BF16) and nothing else; the new route's
-   first pair is the same one. Once the new route wins that cell on the same
+   covers (AMD, dense GQA, single-GPU, direct BF16 KV) with BF16 or FP8 weights
+   and nothing else. Once the new route wins those cells on the same
    workload, v1 should stop being armable for it — leave `--fusion` accepted and
    have it select the new route, rather than keeping two paths a user can choose
    between.

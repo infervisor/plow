@@ -1575,7 +1575,9 @@ pub fn dense_amd_capacity_consumer_contract(
                 | DevOp::RmsNorm
                 | DevOp::HeadNormRope
                 | DevOp::NormResidual
-                | DevOp::GemmGlu,
+                | DevOp::GemmGlu
+                | DevOp::GemmGluFp8
+                | DevOp::QuantFp8,
             ) => {
                 require(inst.i[0] == program.rows, "mixed dynamic body row capacity")?;
             }
@@ -1585,6 +1587,18 @@ pub fn dense_amd_capacity_consumer_contract(
                         && inst.i[4] == 0
                         && inst.i[5] == 0,
                     "mixed dynamic GEMM row capacity or offset",
+                )?;
+            }
+            Some(
+                DevOp::GemmFp8
+                | DevOp::GemmMedFp8
+                | DevOp::GemmSmallFp8
+                | DevOp::GemmWideFp8
+                | DevOp::GemmC5Fp8,
+            ) => {
+                require(
+                    inst.i[0] == program.rows && inst.i[3] == 0 && inst.i[4] == 0 && inst.i[5] == 0,
+                    "mixed dynamic FP8 GEMM row capacity or offset",
                 )?;
             }
             Some(DevOp::FlashMerge) if inst.i[4] == 0 => {

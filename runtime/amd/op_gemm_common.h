@@ -1221,15 +1221,33 @@ PLOW_GM_MXFP4_TILE(d_gemm_mxfp4, GM_BM, GM_BN, GM_BK)
  * worst arm of a SWITCH; it does not budget for the worst arm of a `case` in the interpreter
  * dispatch, whose live ranges do not overlap. GemmMed/GemmSmall have always worked this way.
  */
+#ifndef GM_WD_BM
 #define GM_WD_BM 128
+#endif
+#ifndef GM_WD_BN
 #define GM_WD_BN 256
+#endif
+#ifndef GM_WD_BK
 #define GM_WD_BK 64
+#endif
+#ifndef GM_C5_BM
 #define GM_C5_BM 192
+#endif
+#ifndef GM_C5_BN
 #define GM_C5_BN 256
+#endif
+#ifndef GM_C5_BK
 #define GM_C5_BK 64
+#endif
+#ifndef GM_C8_BM
 #define GM_C8_BM 128
+#endif
+#ifndef GM_C8_BN
 #define GM_C8_BN 384
+#endif
+#ifndef GM_C8_BK
 #define GM_C8_BK 64
+#endif
 
 __device__ void d_gemm_small(bf16* C, const bf16* A, const bf16* B, unsigned M, unsigned N,
                              unsigned K, unsigned slice, unsigned nblk, bf16* lds) {
@@ -1783,7 +1801,7 @@ __device__ void d_gemm_c5_fp8(bf16* C, const unsigned char* A, const unsigned ch
     d_gemm_fp8_t<GM_C5_BM, GM_C5_BN, GM_C5_BK, GM_WM, GM_WN>(C, A, B, ascale, wscale, M, N, K,
                                                              slice, nblk, lds);
 }
-#if PLOW_WAVES == 8
+#if PLOW_WAVES == 8 || PLOW_MIXED_STEP
 __device__ void d_gemm_glu_fp8(bf16* C, const unsigned char* A, const unsigned char* Bg,
                                const unsigned char* Bu, const float* ascale, const float* gscale,
                                const float* uscale, unsigned M, unsigned N, unsigned K, unsigned act,
@@ -1845,8 +1863,7 @@ __device__ void d_quant_fp8(unsigned char* __restrict__ xq_, bf16* __restrict__ 
             for (unsigned k = lane; k < K; k += PLOW_WAVE)
                 amax = fmaxf(amax, fabsf(bf2f(x[row + k])));
         }
-#pragma unroll
-        for (int off = 32; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor(amax, off, PLOW_WAVE));
+        amax = wave_max(amax);
         const float as = fmaxf(amax * (1.0f / 448.0f), 1e-12f);
         const float inv = 1.0f / as;
         if (lane == 0) st_act<float>(&ascale[m], as);

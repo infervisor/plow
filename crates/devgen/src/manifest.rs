@@ -929,7 +929,10 @@ fn encoding_features(f: &mut Map<String, Value>, s: &Shapes) {
     f.insert("moe_prefill_ep".into(), json!(!s.moe_prefill_ep.is_empty()));
     f.insert("quant_glu_fold".into(), json!(s.quant_glu_fold));
     f.insert("mla_pf_ns".into(), json!(s.mla_pf_ns));
-    f.insert("mla_prefill_fp8_split".into(), json!(s.mla_prefill_fp8_split));
+    f.insert(
+        "mla_prefill_fp8_split".into(),
+        json!(s.mla_prefill_fp8_split),
+    );
     f.insert("glm_ofold".into(), json!(s.glm_ofold));
     f.insert("glm_dsa_pf".into(), json!(s.glm_dsa_pf));
     f.insert("dsa_decode_batch".into(), json!(s.dsa_decode_batch));
@@ -1639,6 +1642,42 @@ fn object_inventory(progs: &[ProgramArms], arch: &str, packed_metadata: bool) ->
         .filter(|p| p.kind == "decode" && !decode_mla_segment(p))
         .flat_map(|p| p.arms.iter().cloned())
         .collect();
+    // Single-GPU unified token batches are synthesized by plowrt from an ordinary prefill
+    // body plus the dense decode attention pair.  Give that object its own conservative
+    // inventory: using the ordinary prefill set alone silently prunes the injected decode
+    // attention and the Gemv -> Gemm conversion.  Explicit token-batch bodies already carry
+    // their exact arm set and win when present.
+    let mut token_batch = phase("token_batch");
+    if token_batch.is_empty() {
+        token_batch = prefill.clone();
+        token_batch.extend(
+            decode
+                .iter()
+                .filter(|a| matches!(a.op.as_str(), "FlashDecode" | "FlashMerge"))
+                .cloned(),
+        );
+        let plain = |op| Arm {
+            op: op_name(op),
+            hd: None,
+            variant: None,
+        };
+        let bf16_gemm = prefill.iter().any(|a| {
+            matches!(
+                a.op.as_str(),
+                "Gemm" | "GemmSmall" | "GemmMed" | "GemmWide" | "GemmC5"
+            )
+        });
+        if prefill.iter().any(|a| a.op == "Gemv") || bf16_gemm {
+            token_batch.insert(plain(DevOp::Gemm));
+        }
+        if prefill.iter().any(|a| a.op == "NormResidualNorm") {
+            token_batch.insert(plain(DevOp::NormResidual));
+            token_batch.insert(plain(DevOp::RmsNorm));
+        }
+        if prefill.iter().any(|a| a.op == "Glu") && bf16_gemm {
+            token_batch.insert(plain(DevOp::GemmGlu));
+        }
+    }
     let flash_family = |arm: &&Arm| arm.op.starts_with("Flash") || arm.op == "MlaMergeFold";
     let keys = |arms: &BTreeSet<Arm>| arms.iter().map(Arm::key).collect::<Vec<_>>();
     let families = |arms: &BTreeSet<Arm>| {
@@ -1711,6 +1750,13 @@ fn object_inventory(progs: &[ProgramArms], arch: &str, packed_metadata: bool) ->
                 "families": families(&prefill),
                 "excluded_opcodes": excluded(&prefill),
                 "resource_contract": resource_contract(false),
+                "inventory_prune_capable": true,
+            },
+            "token_batch": {
+                "arms": keys(&token_batch),
+                "families": families(&token_batch),
+                "excluded_opcodes": excluded(&token_batch),
+                "resource_contract": resource_contract(true),
                 "inventory_prune_capable": true,
             },
             "decode": {
@@ -2302,6 +2348,7 @@ pub fn config_header(manifest: &Value) -> String {
             .collect()
     };
     let prefill_ops = object_ops("prefill");
+    let token_batch_ops = object_ops("token_batch");
     let decode_ops = object_ops("decode");
     let flash_ops = object_ops("flash");
     let decode_mla_ops = object_ops("decode_mla");
@@ -2341,7 +2388,11 @@ pub fn config_header(manifest: &Value) -> String {
         .iter()
         .any(|arm| arm.starts_with("KdaChunk") && arm.ends_with("_qpre"));
     out.push_str("/* --- packet and per-object opcode inventory --- */\n");
-    if manifest.pointer("/objects/packed_prefill/max_request_rows").is_some() {
+    out.push_str("#define PLOW_PACKET_HAS_TOKEN_BATCH_INVENTORY 1\n");
+    if manifest
+        .pointer("/objects/packed_prefill/max_request_rows")
+        .is_some()
+    {
         out.push_str("#ifndef PLOW_NV_MASKED_PADDING\n#define PLOW_NV_MASKED_PADDING 1\n#endif\n");
     }
     out.push_str(&format!(
@@ -2403,9 +2454,10 @@ pub fn config_header(manifest: &Value) -> String {
             if present { 1 } else { 0 }
         ));
         out.push_str(&format!(
-            "#ifndef {m}\n#if defined(PLOW_BUCKET_FLASH)\n#define {m} {}\n#elif defined(PLOW_BUCKET_DECODE_MLA)\n#define {m} {}\n#elif PLOW_BUCKET_DECODE\n#define {m} {}\n#else\n#define {m} {}\n#endif\n#endif\n",
+            "#ifndef {m}\n#if defined(PLOW_BUCKET_FLASH)\n#define {m} {}\n#elif defined(PLOW_BUCKET_DECODE_MLA)\n#define {m} {}\n#elif PLOW_TOKEN_BATCH\n#define {m} {}\n#elif PLOW_BUCKET_DECODE\n#define {m} {}\n#else\n#define {m} {}\n#endif\n#endif\n",
             if flash_ops.contains(&name) { 1 } else { 0 },
             if decode_mla_ops.contains(&name) { 1 } else { 0 },
+            if token_batch_ops.contains(&name) { 1 } else { 0 },
             if decode_ops.contains(&name) { 1 } else { 0 },
             if prefill_ops.contains(&name) { 1 } else { 0 },
         ));
@@ -2532,7 +2584,8 @@ pub fn config_header(manifest: &Value) -> String {
         }
         if let Some(v) = t.get("gf_full").and_then(Value::as_u64) {
             out.push_str(&format!(
-                "#ifndef PLOW_NV_FA_GF_FULL\n#define PLOW_NV_FA_GF_FULL {v}\n#endif\n"
+                "#ifndef PLOW_NV_FA_GF_FULL\n#define PLOW_NV_FA_GF_FULL {v}\n#endif\n\
+                 #ifndef PLOW_FA_GF_FULL\n#define PLOW_FA_GF_FULL {v}\n#endif\n"
             ));
         }
     }
@@ -3375,10 +3428,11 @@ mod tests {
                 req.iter().any(|r| r == "PLOW_DSA_DECODE_BATCH=1"),
                 row != 0 || local != 0
             );
-            assert_eq!(req.iter().any(|r| r == "PLOW_DSA_SELECT_LOCAL=1"), local != 0);
-            let nvcc = manifest["backends"]["nvcc"]["requires"]
-                .as_array()
-                .unwrap();
+            assert_eq!(
+                req.iter().any(|r| r == "PLOW_DSA_SELECT_LOCAL=1"),
+                local != 0
+            );
+            let nvcc = manifest["backends"]["nvcc"]["requires"].as_array().unwrap();
             assert_eq!(
                 nvcc.iter().any(|r| r == "PLOW_DSA_DECODE_BATCH=1"),
                 row != 0 || local != 0
@@ -3434,12 +3488,18 @@ mod tests {
 
         // ns=4, no union table -> the KV-split layout, and NOT the sparse arm.
         let ns = req(4, false);
-        assert!(has(&ns, "PLOW_MLA_PF_NS=1"), "ns packet asks for the split arm");
+        assert!(
+            has(&ns, "PLOW_MLA_PF_NS=1"),
+            "ns packet asks for the split arm"
+        );
         assert!(!has(&ns, "PLOW_DSA_PF_ARM=1"), "ns is not sparse");
 
         // bit 8, no union table -> the W_ofold epilogue, and NOT the sparse arm.
         let of = req(1 << 8, false);
-        assert!(has(&of, "PLOW_GLM_OFOLD=1"), "ofold packet asks for the fold arm");
+        assert!(
+            has(&of, "PLOW_GLM_OFOLD=1"),
+            "ofold packet asks for the fold arm"
+        );
         assert!(!has(&of, "PLOW_DSA_PF_ARM=1"), "ofold is not sparse");
 
         // A union table makes i[6] a `cap`: the sparse arm, and NEITHER of the other two
@@ -3936,6 +3996,69 @@ mod tests {
         }
     }
 
+    #[test]
+    fn token_batch_header_covers_runtime_synthesized_arms() {
+        let mut merge = inst(DevOp::FlashMerge, [0; 8]);
+        merge.i[3] = 256;
+        let m = Model {
+            n_cu: 304,
+            target: 0,
+            tensors: vec![],
+            progs: vec![
+                prog(vec![
+                    inst(DevOp::FlashPrefill, [0, 0, 16, 8, 0, 0, 256, 1]),
+                    inst(DevOp::Gemv, [0; 8]),
+                    inst(DevOp::NormResidualNorm, [0; 8]),
+                ]),
+                prog(vec![
+                    inst(DevOp::FlashDecode, [128, 16, 8, 0, 0, 0, 256, 0]),
+                    merge,
+                ]),
+            ],
+            kv_row_insts: vec![],
+            prog_t: vec![1024, 128],
+            gen: vec![],
+        };
+        let man = build(&m, "gfx942");
+        let arms: Vec<&str> = man["objects"]["ordinary"]["token_batch"]["arms"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        for arm in [
+            "FlashPrefill/hd256",
+            "FlashDecode/hd256",
+            "FlashMerge/hd256",
+            "Gemm",
+            "NormResidual",
+            "RmsNorm",
+        ] {
+            assert!(
+                arms.contains(&arm),
+                "missing synthesized token-batch arm {arm}"
+            );
+        }
+
+        let h = config_header(&man);
+        assert!(h.contains("#define PLOW_PACKET_HAS_TOKEN_BATCH_INVENTORY 1\n"));
+        for name in [
+            "FLASH_PREFILL",
+            "FLASH_DECODE",
+            "FLASH_MERGE",
+            "GEMM",
+            "NORM_RESIDUAL",
+            "RMSNORM",
+        ] {
+            assert!(
+                h.contains(&format!(
+                    "#elif PLOW_TOKEN_BATCH\n#define PLOW_HAS_{name} 1\n"
+                )),
+                "token-batch config omitted {name}"
+            );
+        }
+    }
+
     /// The header gates arms on presence, and the guard lets an explicit -D win.
     #[test]
     fn header_has_presence_and_shape_macros() {
@@ -3945,6 +4068,8 @@ mod tests {
         assert!(h.contains("#define PLOW_HAS_FLASH_HD512 1"));
         assert!(h.contains("#define GV_MM_MAX 8"));
         assert!(h.contains("#ifndef GV_MM_MAX"));
+        assert!(h.contains("#define PLOW_NV_FA_GF_FULL 8"));
+        assert!(h.contains("#define PLOW_FA_GF_FULL 8"));
         assert!(h.contains("PLOW_PACKET_HASH"));
     }
 

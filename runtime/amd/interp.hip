@@ -16,7 +16,8 @@
 #include "dev_isa.h"
 #include "mixed_step.h"
 #if PLOW_MIXED_STEP
-#if PLOW_FP8 || PLOW_FP8_KV || PLOW_MXFP4 || PLOW_BUCKET_DECODE || defined(PLOW_BUCKET_FLASH)
+#if (PLOW_FP8 && !PLOW_TOKEN_BATCH) || PLOW_FP8_KV || PLOW_MXFP4 || PLOW_BUCKET_DECODE || \
+    defined(PLOW_BUCKET_FLASH)
 #error "mixed dense interpreter requires BF16 prefill and decode in one universal object"
 #endif
 extern "C" __device__ unsigned plow_mixed_interpreter
@@ -53,6 +54,7 @@ extern "C" __device__ unsigned plow_mixed_block = 256;
  *   plow_token_batch_wide_gemm_1    GEMM_WIDE/GEMM_C5 take their M from the descriptor too,
  *                                   so the synthesizer may keep the rung plowc chose instead
  *                                   of collapsing every projection onto GEMM's one tile
+ *   plow_token_batch_fp8_gemm_1     FP8 quantization and every FP8 GEMM take live M too
  * "Armed" is not "fires": a step only fires the route when it is launched with a descriptor
  * carrying more than one span, and that is logged separately by the host. */
 #ifndef PLOW_TOKEN_BATCH
@@ -67,6 +69,9 @@ extern "C" __device__ unsigned plow_token_batch_dense_gqa_1 = 1;
 extern "C" __device__ unsigned plow_token_batch_combined_m_1 = 1;
 extern "C" __device__ unsigned plow_token_batch_span_attn_1 = 1;
 extern "C" __device__ unsigned plow_token_batch_wide_gemm_1 = 1;
+#if PLOW_FP8
+extern "C" __device__ unsigned plow_token_batch_fp8_gemm_1 = 1;
+#endif
 #endif
 
 #ifdef PLOW_CONFIG
@@ -238,10 +243,11 @@ extern "C" __device__ unsigned plow_phase_xreduce_wave64_occ2_nospill_1 = 1;
 #if PLOW_TOKEN_BATCH
 /* Placed here, not at the axis definition: PLOW_FP8 and friends are resolved by the op headers
  * above, and `#if UNDEFINED` is 0 — a guard written before they exist reads as satisfied and
- * proves nothing. §8 Phase 2 is dense BF16 GQA; every other encoding is Phase 3. */
-#if PLOW_FP8 || PLOW_FP8_KV || PLOW_MXFP4 || PLOW_MLA_PREFILL || PLOW_MOE_PREFILL || PLOW_K3 || \
+ * proves nothing. Dense GQA supports BF16 or FP8 weights with direct BF16 KV; every other
+ * encoding remains refused. */
+#if PLOW_FP8_KV || PLOW_MXFP4 || PLOW_MLA_PREFILL || PLOW_MOE_PREFILL || PLOW_K3 || \
     PLOW_QWEN_GDN
-#error "the token-batch route is qualified for the dense BF16 GQA family only (§8 Phase 2)"
+#error "the token-batch route requires dense GQA with direct BF16 KV"
 #endif
 #endif
 
@@ -1198,12 +1204,10 @@ __device__ __forceinline__ void exec_flash_prefill(CInst in, CTens T, unsigned s
 #endif
 #endif
 #if PLOW_TOKEN_BATCH
-    /* The route's own admission check, at the packet. `i7` is nsplit and it must be 1: the
-     * flat schedule is bit-identical to an isolated run only while the KV partition does not
-     * move with the span boundary (see the harness's gate-1 note), so a split packet on this
-     * route TRAPS rather than quietly changing the arithmetic under packing. */
+    /* The route's own admission check, at the packet. An unsplit flash writes its fused bf16
+     * output; a split flash writes contiguous partials for the following FlashMerge. */
     if (!plow_tb_enabled(mixed) || in->i[0] != plow_tb_view(mixed).row_capacity ||
-        in->i[7] != 1u || TEN(5) == nullptr)
+        !in->i[7] || ((in->i[7] == 1u) != (TEN(5) != nullptr)))
         __builtin_trap();
 #elif PLOW_MIXED_STEP
     if (!plow_mixed_step_enabled(mixed) || in->i[0] != mixed->n_prefill_rows ||
@@ -2442,7 +2446,7 @@ __device__ __forceinline__ void exec_gemv_glu_fp8(CInst in, CTens T, unsigned sl
  *
  * t0=C(bf16) t1=A(fp8) t2=B(fp8) t3=a_scale(f32[M]) t4=w_scale(f32[N])  i0=M i1=N i2=K i4=a_row0 */
 __device__ __forceinline__ void exec_gemm_fp8(CInst in, CTens T, unsigned slice, unsigned nblk,
-                                              bf16* lds) {
+                                              bf16* lds, unsigned rows) {
 #define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
     /* i4 = a_row0 skips rows of A. A is 1 byte/elt here, so the stride is K bytes, not K*2 —
      * the bf16 arm's `+ i4*i2` on a bf16* is the same element count, a different byte count.
@@ -2457,39 +2461,39 @@ __device__ __forceinline__ void exec_gemm_fp8(CInst in, CTens T, unsigned slice,
      * such vector, which is why the asymmetry survived this long. */
     d_gemm_fp8((bf16*)TEN(0), (const unsigned char*)TEN(1) + (size_t)in->i[4] * in->i[2],
                (const unsigned char*)TEN(2), (const float*)TEN(3) + in->i[4],
-               (const float*)TEN(4), in->i[0], in->i[1], in->i[2], slice, nblk, lds);
+               (const float*)TEN(4), rows, in->i[1], in->i[2], slice, nblk, lds);
 #undef TEN
 }
 __device__ __forceinline__ void exec_gemm_med_fp8(CInst in, CTens T, unsigned slice, unsigned nblk,
-                                                  bf16* lds) {
+                                                  bf16* lds, unsigned rows) {
 #define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
     d_gemm_med_fp8((bf16*)TEN(0), (const unsigned char*)TEN(1) + (size_t)in->i[4] * in->i[2],
                    (const unsigned char*)TEN(2), (const float*)TEN(3) + in->i[4],
-                   (const float*)TEN(4), in->i[0], in->i[1], in->i[2], slice, nblk, lds);
+                   (const float*)TEN(4), rows, in->i[1], in->i[2], slice, nblk, lds);
 #undef TEN
 }
 __device__ __forceinline__ void exec_gemm_small_fp8(CInst in, CTens T, unsigned slice,
-                                                    unsigned nblk, bf16* lds) {
+                                                    unsigned nblk, bf16* lds, unsigned rows) {
 #define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
     d_gemm_small_fp8((bf16*)TEN(0), (const unsigned char*)TEN(1) + (size_t)in->i[4] * in->i[2],
                      (const unsigned char*)TEN(2), (const float*)TEN(3) + in->i[4],
-                     (const float*)TEN(4), in->i[0], in->i[1], in->i[2], slice, nblk, lds);
+                     (const float*)TEN(4), rows, in->i[1], in->i[2], slice, nblk, lds);
 #undef TEN
 }
 __device__ __forceinline__ void exec_gemm_wide_fp8(CInst in, CTens T, unsigned slice,
-                                                   unsigned nblk, bf16* lds) {
+                                                   unsigned nblk, bf16* lds, unsigned rows) {
 #define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
     d_gemm_wide_fp8((bf16*)TEN(0), (const unsigned char*)TEN(1) + (size_t)in->i[4] * in->i[2],
                     (const unsigned char*)TEN(2), (const float*)TEN(3) + in->i[4],
-                    (const float*)TEN(4), in->i[0], in->i[1], in->i[2], slice, nblk, lds);
+                    (const float*)TEN(4), rows, in->i[1], in->i[2], slice, nblk, lds);
 #undef TEN
 }
 __device__ __forceinline__ void exec_gemm_c5_fp8(CInst in, CTens T, unsigned slice, unsigned nblk,
-                                                 bf16* lds) {
+                                                 bf16* lds, unsigned rows) {
 #define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
     d_gemm_c5_fp8((bf16*)TEN(0), (const unsigned char*)TEN(1) + (size_t)in->i[4] * in->i[2],
                   (const unsigned char*)TEN(2), (const float*)TEN(3) + in->i[4],
-                  (const float*)TEN(4), in->i[0], in->i[1], in->i[2], slice, nblk, lds);
+                  (const float*)TEN(4), rows, in->i[1], in->i[2], slice, nblk, lds);
 #undef TEN
 }
 #endif /* PLOW_BUCKET_PREFILL */
@@ -3868,43 +3872,44 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
              * quantizes an `fu` nothing wrote: fluent wrong tokens, no fault. See
              * `plow_t11_gluquant_arm` and op_gemm.h. */
             d_quant_fp8((unsigned char*)TEN(0), (bf16*)TEN(1), (float*)TEN(2),
-                        in->i[0], in->i[1], slice, nblk, (const bf16*)TEN(3),
+                        PLOW_RUNTIME_ROWS(in->i[0]), in->i[1], slice, nblk, (const bf16*)TEN(3),
                         (const bf16*)TEN(4), in->i[2]);
             break;
 #endif
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMM_FP8
         case PLOW_DOP_GEMM_FP8:
-            exec_gemm_fp8(in, T, slice, nblk, sm->gm);
+            exec_gemm_fp8(in, T, slice, nblk, sm->gm, PLOW_RUNTIME_ROWS(in->i[0]));
             break;
 #endif
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMM_MED_FP8
         case PLOW_DOP_GEMM_MED_FP8:
-            exec_gemm_med_fp8(in, T, slice, nblk, sm->gm);
+            exec_gemm_med_fp8(in, T, slice, nblk, sm->gm, PLOW_RUNTIME_ROWS(in->i[0]));
             break;
 #endif
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMM_SMALL_FP8
         case PLOW_DOP_GEMM_SMALL_FP8:
-            exec_gemm_small_fp8(in, T, slice, nblk, sm->gm);
+            exec_gemm_small_fp8(in, T, slice, nblk, sm->gm, PLOW_RUNTIME_ROWS(in->i[0]));
             break;
 #endif
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMM_WIDE_FP8
         case PLOW_DOP_GEMM_WIDE_FP8:
-            exec_gemm_wide_fp8(in, T, slice, nblk, sm->gm);
+            exec_gemm_wide_fp8(in, T, slice, nblk, sm->gm, PLOW_RUNTIME_ROWS(in->i[0]));
             break;
 #endif
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMM_C5_FP8
         case PLOW_DOP_GEMM_C5_FP8:
-            exec_gemm_c5_fp8(in, T, slice, nblk, sm->gm);
+            exec_gemm_c5_fp8(in, T, slice, nblk, sm->gm, PLOW_RUNTIME_ROWS(in->i[0]));
             break;
 #endif
-#if PLOW_WAVES == 8 && (!PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMM_GLU_FP8)
+#if (PLOW_WAVES == 8 || PLOW_MIXED_STEP) && (!PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMM_GLU_FP8)
         /* Twin of the bf16 GEMM_GLU arm below, and prefill-only for the same reason.
          * t0=fu t1=A(fp8) t2=Wg t5=Wu t3=a_scale t4=g_scale t6=u_scale  i0=M i1=N i2=K i5=act */
         case PLOW_DOP_GEMM_GLU_FP8:
             d_gemm_glu_fp8((bf16*)TEN(0), (const unsigned char*)TEN(1),
                            (const unsigned char*)TEN(2), (const unsigned char*)TEN(5),
                            (const float*)TEN(3), (const float*)TEN(4), (const float*)TEN(6),
-                           in->i[0], in->i[1], in->i[2], in->i[5], slice, nblk, sm->gm);
+                           PLOW_RUNTIME_ROWS(in->i[0]), in->i[1], in->i[2], in->i[5], slice, nblk,
+                           sm->gm);
             break;
 #endif
 #endif /* PLOW_FP8 — the fp8 arms ADD to the bf16 ones below, they do not replace them */

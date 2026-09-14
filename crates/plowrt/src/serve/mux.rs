@@ -2330,7 +2330,11 @@ fn run_one_tick(
             //  * A member may consume its prompt to the end. `token_batch_prefill_rows` does
             //    not hold the last token back, and the sampled ids for prompts that finish
             //    here follow the decode feeds in `output`.
-            if !no_interleave && !rt.pf_defer_decode && !slo_on && e.token_batch_rows(1, 1).is_some() {
+            if !no_interleave
+                && !rt.pf_defer_decode
+                && !slo_on
+                && e.token_batch_rows(1, 0, 1).is_some()
+            {
                 let feeds: Vec<(usize, u32)> = slots
                     .iter()
                     .enumerate()
@@ -2369,9 +2373,9 @@ fn run_one_tick(
                 // sparse launch it displaces. Chunks no body can hold stay with the planner arm
                 // below (one isolated launch each), and never block the ones that fit.
                 let capacity_for = |members: usize, rows: u32| {
-                    let leading = feeds.len() + members;
-                    e.token_batch_rows(leading, rows as usize)
-                        .map(|t| t.saturating_sub(leading as u32).min(tick_max))
+                    let samples = feeds.len() + members;
+                    e.token_batch_rows(samples, feeds.len(), rows as usize)
+                        .map(|t| e.token_batch_prefill_capacity(t, feeds.len()).min(tick_max))
                 };
                 let mut candidates: Vec<(usize, Instant, u32)> = slots
                     .iter()
@@ -2405,14 +2409,14 @@ fn run_one_tick(
                 // youngest and every accepted pack is a prefix of the arrival order.
                 let mut chosen: Option<(u32, Vec<(usize, u32)>)> = None;
                 for take in (1..=candidates.len()).rev() {
-                    let leading = feeds.len() + take;
+                    let samples = feeds.len() + take;
                     let want: u32 = candidates[..take]
                         .iter()
                         .fold(0u32, |sum, c| sum.saturating_add(c.2));
-                    let Some(rows) = e.token_batch_rows(leading, want as usize) else {
+                    let Some(rows) = e.token_batch_rows(samples, feeds.len(), want as usize) else {
                         continue;
                     };
-                    let capacity = rows.saturating_sub(leading as u32).min(tick_max);
+                    let capacity = e.token_batch_prefill_capacity(rows, feeds.len()).min(tick_max);
                     let pack = amd_token_batch_pack(&candidates[..take], capacity);
                     if pack.len() != take {
                         continue;
@@ -4740,6 +4744,8 @@ mod tests {
         assert_eq!(amd_token_batch_pack(&pool, 2028), [(4, 700), (1, 300), (9, 900)]);
         // Exactly full.
         assert_eq!(amd_token_batch_pack(&pool, 1000), [(4, 700), (1, 300)]);
+        let suffixes = vec![(0, now, 512), (1, now, 512)];
+        assert_eq!(amd_token_batch_pack(&suffixes, 1024), [(0, 512), (1, 512)]);
         // Nothing fits: no member is cut to fit.
         assert!(amd_token_batch_pack(&pool, 299).is_empty());
         assert!(amd_token_batch_pack(&[], 4096).is_empty());

@@ -150,6 +150,24 @@ PLOW_GEOM_MARK(GM_DBUF)
 #ifdef GM_HACK_NOFETCH
 PLOW_GEOM_MARK(GM_HACK_NOFETCH)
 #endif
+#ifdef GM_C5_BK
+PLOW_GEOM_MARK(GM_C5_BK)
+#endif
+#ifdef GM_C5_BM
+PLOW_GEOM_MARK(GM_C5_BM)
+#endif
+#ifdef GM_C5_BN
+PLOW_GEOM_MARK(GM_C5_BN)
+#endif
+#ifdef GM_C8_BK
+PLOW_GEOM_MARK(GM_C8_BK)
+#endif
+#ifdef GM_C8_BM
+PLOW_GEOM_MARK(GM_C8_BM)
+#endif
+#ifdef GM_C8_BN
+PLOW_GEOM_MARK(GM_C8_BN)
+#endif
 #ifdef GM_MD_BK
 PLOW_GEOM_MARK(GM_MD_BK)
 #endif
@@ -185,6 +203,15 @@ PLOW_GEOM_MARK(GM_SM_BN)
 #endif
 #ifdef GM_SWZ
 PLOW_GEOM_MARK(GM_SWZ)
+#endif
+#ifdef GM_WD_BK
+PLOW_GEOM_MARK(GM_WD_BK)
+#endif
+#ifdef GM_WD_BM
+PLOW_GEOM_MARK(GM_WD_BM)
+#endif
+#ifdef GM_WD_BN
+PLOW_GEOM_MARK(GM_WD_BN)
 #endif
 #ifdef GM_WGM
 PLOW_GEOM_MARK(GM_WGM)

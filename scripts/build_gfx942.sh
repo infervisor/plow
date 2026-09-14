@@ -166,6 +166,7 @@ fi
 # read the knobs this block fills. `cfg_get` reads one `#define NAME value` line; the header
 # is machine-written (devgen::manifest::config_header), so the grammar is exactly that.
 CFG=""; AX_CONFIG=""; AX_CONFIG_JSON=""
+: "${PLOW_TOKEN_BATCH_FP8:=0}"
 # PLOW_HSACO_EXTRA_DEFINES="-DX=1 ...": raw -D appended to EVERY row, for an opt-in kernel-arm
 # A/B whose header default is the shipped body (e.g. -DPLOW_COMBINE_VEC=1 -DPLOW_RN_ROWS=2).
 # Recorded in build_defines.json beside AX_CONFIG so the contract audit sees the axis.
@@ -239,6 +240,9 @@ if [ -n "${PLOW_HSACO_CONFIG:-}" ]; then
     fi
     printf -v "$key" 1
   done
+  if grep -q '^#define PLOW_PACKET_HAS_QUANT_FP8 1$' "$CFG"; then
+    PLOW_TOKEN_BATCH_FP8=1
+  fi
   # `backends.<arch>.requires`, verbatim. Three kinds of entry: row-selecting axes (every
   # variant row is built anyway -- the small-rung MLA and split objects included -- and plowrt
   # picks by filename and refuses by marker), the tile geometry (op_gemm.h's CDNA3 defaults ARE
@@ -287,7 +291,8 @@ mkdir -p "$OUT"; cd "$OUT"
 # tile from outside would silently override the header's defaults; the flags stay
 # only as an A/B escape hatch.
 # GM_AX is the same escape hatch one level down: raw -D for the per-rung geometry and schedule
-# knobs op_gemm.h `#ifndef`-guards (GM_SM_BK, GM_MD_*, GM_PGR2, GM_PLR, GM_PRIO). They have no
+# knobs op_gemm.h `#ifndef`-guards (GM_SM_*, GM_MD_*, GM_WD_*, GM_C5_*, GM_C8_*, GM_PGR2,
+# GM_PLR, GM_PRIO). They have no
 # dedicated variable because there are a dozen of them and each is an A/B, not a policy.
 CDNA3_TILE="-DPLOW_WG_WAVES=8${GM_BM:+ -DGM_BM=$GM_BM}${GM_BN:+ -DGM_BN=$GM_BN}${GM_BK:+ -DGM_BK=$GM_BK}${GM_DBUF:+ -DGM_DBUF=$GM_DBUF}${GM_AX:+ $GM_AX}"
 # The 4-wave flash object: GM_WN=2 there, so the wave-grid assert is satisfied at
@@ -490,24 +495,41 @@ fi
 # NOT bit-identical in scheduling and NOT yet measured, so it is OFF by default: cp_async4 moves
 # 4 B/lane (the only width CDNA3 implements), which lays lanes down at a lane*4 stride, so the
 # staging loop is per-WAVE rather than per-thread and the LDS destination must be wave-uniform.
+# The token-batch object executes the same dense prefill body and must carry the same experiment.
+AX_TOKEN_BATCH_LDS_DMA=""
 if [ "${PLOW_FA_LDS_DMA:-0}" = 1 ]; then
   AX_FLASH="$AX_FLASH -DFA_LDS_DMA=1"
+  AX_TOKEN_BATCH_LDS_DMA="-DFA_LDS_DMA=1"
 fi
-# DPP/swizzle half-wave reductions (PLOW_FA_RED_DPP, default ON) and the interior-tile mask
-# skip (PLOW_FA_FASTMASK, default ON). Both are bit-identical and both are FLASH-OBJECT ONLY
-# for the same register-cliff reason as PLOW_FA_LAZY above: the 8-wave prefill/decode rows hold
-# 256 registers and are not re-qualified here. Measured on d_flash_prefill<256>, one KV tile:
+# DPP/swizzle reductions (PLOW_FA_RED_DPP, default ON) and the interior-tile mask skip
+# (PLOW_FA_FASTMASK, default ON). Both are bit-identical and stay on the 4-wave flash and
+# token-batch objects for the same register-cliff reason as PLOW_FA_LAZY above: the 8-wave
+# prefill/decode rows hold 256 registers and are not re-qualified here. Measured on
+# d_flash_prefill<256>, one KV tile:
 # 1651 -> 1584 instructions, ds_bpermute 160 -> 64 ds_swizzle, s_waitcnt 163 -> 91, and
 # d_flash_prefill<512> scratch spill 47 -> 10 B. Gemma-4 31B cold-prefill TTFT -0.6/-2.0/-3.5%
 # at 128/1024/4096 tokens with identical greedy output; docs/amd/gemma4-31b-mi300x.md.
-[ "${PLOW_FA_RED_DPP:-1}" = 0 ] || AX_FLASH="$AX_FLASH -DPLOW_WAVE_RED_DPP=1"
-[ "${PLOW_FA_FASTMASK:-1}" = 0 ] || AX_FLASH="$AX_FLASH -DFA_FASTMASK=1"
+AX_TOKEN_BATCH_REDUCE=""
+if [ "${PLOW_FA_RED_DPP:-1}" != 0 ]; then
+  AX_FLASH="$AX_FLASH -DPLOW_WAVE_RED_DPP=1"
+  AX_TOKEN_BATCH_REDUCE="$AX_TOKEN_BATCH_REDUCE -DPLOW_WAVE_RED_DPP=1"
+fi
+if [ "${PLOW_FA_FASTMASK:-1}" != 0 ]; then
+  AX_FLASH="$AX_FLASH -DFA_FASTMASK=1"
+  AX_TOKEN_BATCH_REDUCE="$AX_TOKEN_BATCH_REDUCE -DFA_FASTMASK=1"
+fi
 # OPT-IN (PLOW_FA_HEAD_MAJOR=1): head-slowest prefill work order, for the KV-window/L2 study.
 # Measured and a small loss (op_attention.h FA_HEAD_MAJOR); kept as the arm that prices it.
 if [ "${PLOW_FA_HEAD_MAJOR:-0}" = 1 ]; then
   AX_FLASH="$AX_FLASH -DFA_HEAD_MAJOR=1"
 fi
 AX_FP8="-DPLOW_FP8=1"
+AX_TOKEN_BATCH_FP8=""
+[ "$PLOW_TOKEN_BATCH_FP8" = 0 ] || AX_TOKEN_BATCH_FP8="$AX_FP8"
+AX_TOKEN_BATCH_PRUNE=""
+if [ -n "$CFG" ] && grep -q '^#define PLOW_PACKET_HAS_TOKEN_BATCH_INVENTORY 1$' "$CFG"; then
+  AX_TOKEN_BATCH_PRUNE="-DPLOW_DECODE_INVENTORY_PRUNE=1"
+fi
 AX_FP8KV="-DPLOW_FP8_KV=1"
 AX_MLA="-DPLOW_MLA_PREFILL=1"
 AX_MOE="-DPLOW_MOE_PREFILL=1"
@@ -1410,9 +1432,9 @@ ROWS=(
   # A separate row, not a define on the one above: the two routes are different dispatch and
   # `interp_mixed` stays byte-for-byte the qualified object it is today.
   # GM_BM=256, NOT the mixed row's 64, and it is the single biggest thing measured about this
-  # route. `mixed_program::synthesize` rewrites every GEMM opcode -- `GemmWide` and `GemmC5`
-  # included -- onto plain `Gemm`, so this object's ONE compiled tile runs every dense
-  # projection of a prefill chunk. At 64x128 that is the slowest rung in op_gemm.h's own
+  # route. BF16 `GemmWide`/`GemmC5` and all packet-selected FP8 GEMM rungs are retained; ordinary
+  # BF16 GEMMs share this object's generic tile. At 64x128 that was the slowest rung in
+  # op_gemm.h's own
   # inventory: 332-458 TF/s against 192x256's 1033-1236 on exactly the Gemma-31B shapes
   # (see the tile-inventory table above GM_WD_BM). BN stays 128 because the fused-GLU
   # epilogue's `SN == 2` pins it there at four waves; BM is free, and 256x128 is 2x the
@@ -1425,7 +1447,7 @@ ROWS=(
   # at concurrency 1 with `--amd-token-batch-solo` (no packing at all, so the prefill chunk
   # alone) 7168 goes -24.8% -> -6.5% and its TTFT +64.8% -> +13.0%.
   # `TB_GM_BM`/`TB_GM_BN` stay overridable so the A/B that found this is one env away.
-  "interp_tokbatch|-DPLOW_TOKEN_BATCH=1 -DPLOW_MIXED_STEP=1 -DPLOW_BUCKET_DECODE=0 -DPLOW_WG_WAVES=4 -DPLOW_GEMV_MM=4 -DGM_BM=${TB_GM_BM:-256} -DGM_BN=${TB_GM_BN:-128} -DFA_DC=256 -DFA_DBUF=1"
+  "interp_tokbatch|-DPLOW_TOKEN_BATCH=1 -DPLOW_MIXED_STEP=1 -DPLOW_BUCKET_DECODE=0 -DPLOW_WG_WAVES=4 -DPLOW_GEMV_MM=4 -DGM_BM=${TB_GM_BM:-256} -DGM_BN=${TB_GM_BN:-128} -DFA_DC=256 -DFA_DBUF=1 $AX_TOKEN_BATCH_REDUCE $AX_TOKEN_BATCH_LDS_DMA $AX_TOKEN_BATCH_FP8 $AX_TOKEN_BATCH_PRUNE"
   "interp_prefill_fp8|$AX_PREFILL $AX_FP8"
   "interp_decode_fp8|$AX_DECODE $AX_FP8"
   "interp_prefill_fp8kv|$AX_PREFILL $AX_FP8 $AX_FP8KV"
@@ -1743,6 +1765,12 @@ for row in "${ROWS[@]}"; do
             fail=1
           }
         done
+        if [ "$PLOW_TOKEN_BATCH_FP8" = 1 ]; then
+          grep -qE "OBJECT .* plow_token_batch_fp8_gemm_1\$" <<<"$symbols" || {
+            echo "  MISSING TOKEN-BATCH FP8 GEMM: expected plow_token_batch_fp8_gemm_1"
+            fail=1
+          }
+        fi
         # The route is built ON the mixed object, so it must still answer for that contract.
         grep -qE "OBJECT .* plow_mixed_step_bf16_1$" <<<"$symbols" || {
           echo "  MISSING MIXED BF16 CONSUMERS on the token-batch row"

@@ -145,16 +145,24 @@ pub trait SeqEngine {
     // ---- unified token batch (`plans/unified-token-batch.md` §7) ----------------------------
     //
     // Deliberately NOT hung off the mixed-step surface. The two routes select different
-    // buckets (the token batch needs `nsplit == 1`), admit different work (it does not need a
+    // buckets (token batch accepts fused nsplit=1 or merge-backed nsplit>1), admit different work (it does not need a
     // decode row, and it may complete a prompt in the same step) and commit differently, so a
     // mux arm that reused `mixed_step_rows` would silently admit a plan the other route cannot
     // execute. Every default declines, so no other backend changes.
 
-    /// Row capacity of the bucket that would carry `leading_rows` sampled rows — decode
-    /// requests plus prompts completing this step — and `prefill_rows` body rows. `None` when
-    /// this engine has no token-batch route or no bucket fits.
-    fn token_batch_rows(&self, _leading_rows: usize, _prefill_rows: usize) -> Option<u32> {
+    /// Row capacity of the bucket that would carry `sample_rows` output samples,
+    /// `decode_rows` decode inputs, and `prefill_rows` prefill inputs. `None` when this engine
+    /// has no token-batch route or no bucket fits.
+    fn token_batch_rows(
+        &self,
+        _sample_rows: usize,
+        _decode_rows: usize,
+        _prefill_rows: usize,
+    ) -> Option<u32> {
         None
+    }
+    fn token_batch_prefill_capacity(&self, rows: u32, decode_rows: usize) -> u32 {
+        rows.saturating_sub(decode_rows as u32)
     }
     /// Rows of `slot`'s prompt this route may take next. Unlike `mixed_prefill_rows` this does
     /// NOT hold the prompt's last token back: consuming it is the point.
@@ -1033,6 +1041,17 @@ mod amd_serve {
                 .checked_add(partial)
                 .and_then(|row| row.checked_add(bucket))
                 .is_some_and(|end| end as usize <= max_ctx)
+    }
+
+    fn token_batch_prefill_continuation_fits(
+        frontier: u32,
+        pending_rows: u32,
+        capacity: u32,
+        max_ctx: usize,
+    ) -> bool {
+        pending_rows > 0
+            && pending_rows <= capacity
+            && frontier.checked_add(pending_rows).is_some_and(|end| end as usize <= max_ctx)
     }
 
     fn commit_mixed_prefill(cur: &mut PfCursor, rows: u32) {
@@ -2014,7 +2033,7 @@ mod amd_serve {
             // being armed is the third way a pack can form.
             if prompt.len() <= 1
                 || (self.mixed_step_rows(1, 1).is_none()
-                    && self.token_batch_rows(1, 1).is_none()
+                    && self.token_batch_rows(1, 0, 1).is_none()
                     && !self.packed_prefill_reachable(max_rows))
             {
                 return Ok(());
@@ -2255,16 +2274,29 @@ mod amd_serve {
             Ok(())
         }
 
-        pub fn token_batch_rows(&self, leading_rows: usize, prefill_rows: usize) -> Option<u32> {
+        pub fn token_batch_rows(
+            &self,
+            sample_rows: usize,
+            decode_rows: usize,
+            prefill_rows: usize,
+        ) -> Option<u32> {
             if !self.chunk_prefill || self.decode_only {
                 return None;
             }
             match &self.ranks {
-                Ranks::One(e) => e.token_batch_rows(leading_rows, prefill_rows),
+                Ranks::One(e) => e.token_batch_rows(sample_rows, decode_rows, prefill_rows),
                 Ranks::Tp(_) => self
                     .token_batch_tp
                     .as_ref()
-                    .and_then(|tb| tb.rows_for(leading_rows, prefill_rows)),
+                    .and_then(|tb| tb.rows_for(sample_rows, prefill_rows)),
+            }
+        }
+
+        pub fn token_batch_prefill_capacity(&self, rows: u32, decode_rows: usize) -> u32 {
+            match &self.ranks {
+                Ranks::One(_) => rows.saturating_sub(decode_rows as u32),
+                Ranks::Tp(_) => self.token_batch_tp.as_ref()
+                    .map_or(0, |tb| rows.saturating_sub(tb.band)),
             }
         }
 
@@ -2332,7 +2364,14 @@ mod amd_serve {
         }
 
         pub fn token_batch_prefill_fits(&self, slot: usize, prefill_capacity: u32) -> bool {
-            self.mixed_prefill_fits(slot, prefill_capacity)
+            self.pf.get(slot).is_some_and(|cursor| cursor.as_ref().is_some_and(|cursor| {
+                cursor.steps.get(cursor.next).is_some_and(|step| {
+                    step.c0 == cursor.frontier
+                        && token_batch_prefill_continuation_fits(
+                            cursor.frontier, step.clen, prefill_capacity, self.max_ctx,
+                        )
+                })
+            }))
                 && match (&self.ranks, &self.token_batch_tp) {
                     (Ranks::Tp(g), Some(tb)) => tb
                         .body_for_capacity(prefill_capacity)
@@ -3310,7 +3349,8 @@ mod amd_serve {
             mixed_cursor_rows, mixed_prefill_continuation_fits, mixed_prefill_padding_fits,
             packable_prefill_step, parse_snapshot_tensors, snapshot_file_component,
             slot_decode_position, split_pending_prefill, split_terminal_prefill, stage_parked,
-            terminal_prefill_cursor, token_batch_host_step, cap_chunks_to_bodies, body_respects_plan,
+            body_respects_plan, cap_chunks_to_bodies, terminal_prefill_cursor,
+            token_batch_host_step, token_batch_prefill_continuation_fits,
             AmdServe, PfCursor, DEFAULT_SNAPSHOT_TENSORS, MAX_SNAPSHOT_TENSORS,
         };
         use crate::exec::amd::ChunkStep;
@@ -3454,7 +3494,12 @@ mod amd_serve {
             let assets = std::path::PathBuf::from(std::env::var("PLOW_GPU_ASSETS").unwrap());
             let mut e = AmdServe::load(&assets.join("model.pkt"), &assets.join("hsaco"),
                 Some(&assets.join("checkpoint"))).unwrap();
-            assert!(e.prefix_cache && e.batch >= 2 && e.token_batch_rows(2, 32).is_some());
+            assert!(e.prefix_cache, "prefix cache was not selected");
+            assert!(e.batch >= 2, "decode batch is {}", e.batch);
+            assert!(
+                e.token_batch_rows(2, 1, 32).is_some(),
+                "unified token batch has no bucket for two samples, one decode row, and 32 prefill rows"
+            );
             let raw = std::fs::read(assets.join("model.pkt")).unwrap();
             let blob = crate::asset::devblob::DevBlob::parse_l2(&raw, true).unwrap();
             let ring = blob.decode_progs().iter().flat_map(|p| &p.insts)
@@ -3479,7 +3524,7 @@ mod amd_serve {
                     assert!(e.prefill_chunked_at_most(0, &prompt, u32::MAX).unwrap().is_none());
                 }
                 assert_eq!(e.cached_rows(0), if repeat == 0 { 0 } else { 992 });
-                let rows = e.token_batch_rows(2, 32).unwrap();
+                let rows = e.token_batch_rows(2, 1, 32).unwrap();
                 let mut out: Vec<(u32, u32)> = Vec::new();
                 e.token_batch_step(rows, &[(1, token)], &[(0, &prompt, 32)], &mut out).unwrap();
                 assert_eq!(out.iter().map(|o| o.0).collect::<Vec<_>>(), [1, 0]);
@@ -3643,6 +3688,13 @@ mod amd_serve {
             let mut plan = vec![512];
             assert!(!super::retarget_dense_tail(&mut plan, 60_000, u32::MAX, 16384, None, None, dense));
             assert!(!super::retarget_dense_tail(&mut [], 60_000, u32::MAX, 16384, None, Some(8192), dense));
+        }
+
+        #[test]
+        fn token_batch_suffix_uses_only_real_rows_at_the_context_boundary() {
+            let frontier = 16_384 - 512;
+            assert!(token_batch_prefill_continuation_fits(frontier, 512, 1024, 16_512));
+            assert!(!mixed_prefill_continuation_fits(frontier, 1024, 512, 1024, 16_512));
         }
 
         #[test]
@@ -4096,8 +4148,16 @@ impl SeqEngine for AmdServe {
     ) -> crate::Result<()> {
         AmdServe::mixed_step(self, rows, feeds, members, output)
     }
-    fn token_batch_rows(&self, leading_rows: usize, prefill_rows: usize) -> Option<u32> {
-        AmdServe::token_batch_rows(self, leading_rows, prefill_rows)
+    fn token_batch_rows(
+        &self,
+        sample_rows: usize,
+        decode_rows: usize,
+        prefill_rows: usize,
+    ) -> Option<u32> {
+        AmdServe::token_batch_rows(self, sample_rows, decode_rows, prefill_rows)
+    }
+    fn token_batch_prefill_capacity(&self, rows: u32, decode_rows: usize) -> u32 {
+        AmdServe::token_batch_prefill_capacity(self, rows, decode_rows)
     }
     fn token_batch_prefill_rows(&self, slot: usize, prompt: &[u32], max_rows: u32) -> u32 {
         AmdServe::token_batch_prefill_rows(self, slot, prompt, max_rows)

@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 /// * `plow_token_batch_dense_gqa_1` — the dense-GQA operator set is present.
 /// * `plow_token_batch_combined_m_1` — projections run at combined M, with no phase band.
 /// * `plow_token_batch_span_attn_1` — FlashPrefill/FlashDecode read their bounds from spans.
+/// * `plow_token_batch_fp8_gemm_1` — required separately for FP8-weight programs.
 ///
 /// `scripts/build_gfx942.sh`'s object contract fails a build that drops any of them, so a
 /// missing marker here means a stale object, not a fresh one built wrong.
@@ -54,13 +55,9 @@ pub(super) enum TokenBatchRefusal {
     /// `[0, decode_rows)` are not covered by a span. §4.4 requires spans to cover exactly
     /// `[0, M)`, and `runtime/amd/token_batch.h` traps on anything else rather than guess.
     SpansNotPrefixFree { decode_rows: u32 },
-    /// The program splits attention over KV (`nsplit > 1`). The flat per-span schedule is
-    /// bit-identical to an isolated run only while the KV partition does not move with the span
-    /// boundary; a split packet must be refused, never silently re-approximated.
-    AttentionSplit { nsplit: u32 },
-    /// The program has no fused flash epilogue, so FlashPrefill would need a separate merge
-    /// whose row map this route does not yet define.
-    NoFusedEpilogue,
+    /// FlashPrefill's split count and output binding disagree. An unsplit flash writes its final
+    /// output directly; a split flash leaves partials for the following FlashMerge.
+    AttentionEpilogue { nsplit: u32, fused: bool },
     /// The route was not asked for. Distinct from every other variant: nothing is wrong, and
     /// reporting it as a capability failure would make an opt-in read like a defect.
     NotRequested,
@@ -91,24 +88,20 @@ impl std::fmt::Display for TokenBatchRefusal {
                  row(s) in a band ahead of the span table. §4.4 requires spans to cover exactly \
                  [0, M) with decode spans of length one included"
             ),
-            Self::AttentionSplit { nsplit } => write!(
+            Self::AttentionEpilogue { nsplit, fused } => write!(
                 f,
-                "capability `token_batch_unsplit_attention`: FlashPrefill nsplit={nsplit}; this \
-                 route is qualified at nsplit=1, where a span split cannot move the KV partition"
-            ),
-            Self::NoFusedEpilogue => write!(
-                f,
-                "capability `token_batch_fused_epilogue`: FlashPrefill has no O_final operand; \
-                 the split-merge row map is not defined on this route"
+                "capability `token_batch_attention_epilogue`: FlashPrefill nsplit={nsplit}, \
+                 fused_epilogue={fused}; nsplit=1 requires the fused output and nsplit>1 \
+                 requires contiguous partials for FlashMerge"
             ),
             Self::NotRequested => {
                 write!(f, "disabled by --token-batch=false or PLOW_TOKEN_BATCH=0")
             }
             Self::NoLegalBucket => write!(
                 f,
-                "capability `token_batch_unsplit_attention`: no prefill bucket in this blob has \
-                 nsplit=1 with a fused flash epilogue, and a split packet moves the KV \
-                 partition with the span boundary"
+                "capability `token_batch_attention_epilogue`: no prefill bucket in this blob has \
+                 either nsplit=1 with a fused flash epilogue or nsplit>1 with a contiguous \
+                 FlashMerge partial output"
             ),
         }
     }
@@ -181,11 +174,11 @@ pub(super) fn admit_token_batch(
     if decode_rows != 0 {
         return Err(TokenBatchRefusal::SpansNotPrefixFree { decode_rows });
     }
-    if nsplit != 1 {
-        return Err(TokenBatchRefusal::AttentionSplit { nsplit });
-    }
-    if !fused_epilogue {
-        return Err(TokenBatchRefusal::NoFusedEpilogue);
+    if nsplit == 0 || ((nsplit == 1) != fused_epilogue) {
+        return Err(TokenBatchRefusal::AttentionEpilogue {
+            nsplit,
+            fused: fused_epilogue,
+        });
     }
     Ok(())
 }
@@ -209,7 +202,7 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore = "CPU packet inspection; set TEST_AMD_TOKEN_BATCH_ASSETS to a fresh BF16 Gemma31 packet"]
+    #[ignore = "CPU packet inspection; set TEST_AMD_TOKEN_BATCH_ASSETS to a fresh Gemma4 packet"]
     fn fresh_gemma_packet_preserves_rungs_and_passes_unified_contracts() {
         use crate::asset::devblob::DevBlob;
         use packet::dev::{DevOp, TENSOR_NONE16};
@@ -220,7 +213,7 @@ mod tests {
         let blob = DevBlob::parse_l2(&raw, true).unwrap();
         assert_eq!(
             blob.decode_progs().iter().map(|p| p.t).collect::<Vec<_>>(),
-            [1, 2, 4, 8]
+            [1, 2, 4, 8, 16, 32, 64, 128]
         );
         let batch = blob.decode_progs().last().unwrap().t as usize;
         let synthesized = crate::exec::mixed_program::synthesize(&blob, batch, false).unwrap();
@@ -232,6 +225,23 @@ mod tests {
                 .collect::<Vec<_>>(),
             [128, 512, 1024]
         );
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(directory.join("build.json")).unwrap()).unwrap();
+        let inventory: std::collections::BTreeSet<String> = manifest["objects"]["ordinary"]
+            ["token_batch"]["arms"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(|arm| arm.split('/').next().unwrap().to_string())
+            .collect();
+        for inst in synthesized.programs.iter().flat_map(|p| &p.program.insts) {
+            let op = DevOp::from_u16(inst.op).unwrap();
+            assert!(
+                inventory.contains(&format!("{op:?}")),
+                "generated token-batch inventory omitted synthesized {op:?}"
+            );
+        }
         let mut tensors: Vec<_> = blob
             .tensors
             .iter()
@@ -258,6 +268,40 @@ mod tests {
         }
         for spec in &synthesized.programs {
             let program = &spec.program;
+            let fp8_ops = |insts: &[packet::dev::DevInst64]| {
+                insts
+                    .iter()
+                    .filter_map(|i| {
+                        matches!(
+                            DevOp::from_u16(i.op),
+                            Some(
+                                DevOp::QuantFp8
+                                    | DevOp::GemmFp8
+                                    | DevOp::GemmMedFp8
+                                    | DevOp::GemmSmallFp8
+                                    | DevOp::GemmWideFp8
+                                    | DevOp::GemmC5Fp8
+                                    | DevOp::GemmGluFp8
+                            )
+                        )
+                        .then_some(i.op)
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let source = blob
+                .progs
+                .iter()
+                .find(|p| {
+                    p.t == program.rows
+                        && p.insts.iter().any(|i| i.op == DevOp::FlashPrefill as u16)
+                })
+                .unwrap();
+            assert_eq!(
+                fp8_ops(&program.insts),
+                fp8_ops(&source.insts),
+                "bucket {} changed its FP8 GEMM rung",
+                program.rows
+            );
             assert!(program
                 .insts
                 .iter()
@@ -294,6 +338,7 @@ mod tests {
         let directory = PathBuf::from(std::env::var_os("TEST_AMD_TOKEN_BATCH_OBJECTS").unwrap());
         let cap = probe_token_batch(&directory, "gfx942", |p| std::fs::read(p), elf_symbol_u32);
         assert!(cap.armed, "{:?}", cap.refusal);
+        let mut packet_hash = None;
         for (name, suffix) in [("interp_tokbatch.elf", ""), (TOKEN_BATCH_OBJECT, "_gq")] {
             let image = std::fs::read(directory.join(name)).unwrap();
             let symbol = format!("plow_interp_tokbatch_gfx942{suffix}");
@@ -307,19 +352,11 @@ mod tests {
                 assert_eq!(elf_symbol_u32(&image, marker), Some(1), "{name}: {marker}");
             }
             assert_eq!(elf_symbol_u32(&image, "plow_mixed_block"), Some(256));
-            assert_eq!(elf_symbol_u32(&image, "plow_packet_hash_lo"), None);
-            let resources: serde_json::Value = serde_json::from_slice(
-                &std::fs::read(directory.join(format!("{name}.resources.json"))).unwrap(),
-            )
-            .unwrap();
-            let total = resources["total_registers"].as_u64().unwrap();
-            assert_eq!(total, resources["vgpr"].as_u64().unwrap());
-            assert!(
-                total
-                    <= resources["contract"]["max_total_registers"]
-                        .as_u64()
-                        .unwrap()
+            let hash = (
+                elf_symbol_u32(&image, "plow_packet_hash_hi").unwrap(),
+                elf_symbol_u32(&image, "plow_packet_hash_lo").unwrap(),
             );
+            assert_eq!(*packet_hash.get_or_insert(hash), hash, "scheduler twins");
         }
         let mixed = std::fs::read(directory.join("interp_mixed_gq.elf")).unwrap();
         let cap = probe_token_batch(&directory, "gfx942", |_| Ok(mixed.clone()), elf_symbol_u32);
@@ -398,15 +435,16 @@ mod tests {
     }
 
     #[test]
-    fn a_split_attention_packet_is_refused() {
+    fn split_attention_requires_merge_partials() {
+        assert!(admit_token_batch(0, 4, false).is_ok());
         let err = admit_token_batch(0, 4, true).unwrap_err();
-        assert!(err.to_string().contains("token_batch_unsplit_attention"));
+        assert!(err.to_string().contains("token_batch_attention_epilogue"));
     }
 
     #[test]
-    fn a_missing_fused_epilogue_is_refused() {
+    fn unsplit_attention_requires_fused_epilogue() {
         let err = admit_token_batch(0, 1, false).unwrap_err();
-        assert!(err.to_string().contains("token_batch_fused_epilogue"));
+        assert!(err.to_string().contains("token_batch_attention_epilogue"));
     }
 
     #[test]

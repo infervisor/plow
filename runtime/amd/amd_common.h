@@ -1159,9 +1159,26 @@ __device__ __forceinline__ unsigned char quant_fp8(float v) {
 
 /* Reduce a MAX across the 64 lanes of a wave (the HeadNormRope per-row amax for the KV scale). */
 __device__ __forceinline__ float wave_max(float v) {
+#if PLOW_WAVE_RED_DPP
+    /* Max is order-independent: collapse each 32-lane half through VALU DPP, then pay one
+     * cross-half shuffle. FP8 row quantization shares this helper, so it avoids five of its six
+     * LDS-crossbar reductions per row too. */
+    v = fmaxf(v, __int_as_float(__builtin_amdgcn_update_dpp(
+                     __float_as_int(-INFINITY), __float_as_int(v), 0xb1, 0xf, 0xf, true)));
+    v = fmaxf(v, __int_as_float(__builtin_amdgcn_update_dpp(
+                     __float_as_int(-INFINITY), __float_as_int(v), 0x4e, 0xf, 0xf, true)));
+    v = fmaxf(v, __int_as_float(__builtin_amdgcn_update_dpp(
+                     __float_as_int(-INFINITY), __float_as_int(v), 0x141, 0xf, 0xf, true)));
+    v = fmaxf(v, __int_as_float(__builtin_amdgcn_update_dpp(
+                     __float_as_int(-INFINITY), __float_as_int(v), 0x140, 0xf, 0xf, true)));
+    v = fmaxf(v, __int_as_float(__builtin_amdgcn_ds_swizzle(
+                     __float_as_int(v), (16 << 10) | 31)));
+    return fmaxf(v, __shfl_xor(v, 32, 64));
+#else
 #pragma unroll
     for (int off = 32; off > 0; off >>= 1) v = fmaxf(v, __shfl_xor(v, off, 64));
     return v;
+#endif
 }
 
 /* e4m3 max finite magnitude (torch.float8_e4m3fn): 448. A row's scale maps its amax to 448 so the
@@ -1326,9 +1343,22 @@ __device__ __forceinline__ float rn_ss(float ss) {
 }
 
 __device__ __forceinline__ float wave_sum(float v) {
+#if PLOW_WAVE_RED_DPP
+    /* Preserve the original 32,16,8,4,2,1 addition tree: only the transport changes. */
+    v += __shfl_xor(v, 32, PLOW_WAVE);
+    v += __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(v), (16 << 10) | 31));
+    v += __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(v), (8 << 10) | 31));
+    v += __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(v), (4 << 10) | 31));
+    v += __int_as_float(__builtin_amdgcn_update_dpp(
+        __float_as_int(0.0f), __float_as_int(v), 0x4e, 0xf, 0xf, true));
+    v += __int_as_float(__builtin_amdgcn_update_dpp(
+        __float_as_int(0.0f), __float_as_int(v), 0xb1, 0xf, 0xf, true));
+    return v;
+#else
 #pragma unroll
     for (int off = 32; off > 0; off >>= 1) v += __shfl_xor(v, off, PLOW_WAVE);
     return v;
+#endif
 }
 
 /* DPP/SWIZZLE HALF-WAVE REDUCTIONS. `__shfl_xor` has ONE lowering on gfx9 —

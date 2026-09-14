@@ -17,7 +17,9 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifndef S
 #define S 64
+#endif
 #define GUARD 512
 #define MAXK 1024
 
