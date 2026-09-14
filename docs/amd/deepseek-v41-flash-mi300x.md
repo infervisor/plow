@@ -703,11 +703,32 @@ that: it depends on `costmodel`, `packet`, `kernelcaps`, `tunedb`, `hwspec` and
   one config -- and this config's whole difficulty is in fields that are easy to
   read and easy to misread.
 
-Neither is obviously right, and picking wrong is expensive either way: the first
-adds a crate edge to the serving compiler, the second guarantees drift on a
-config where `compress_ratios` and `kv_source_layer_ids` already disagree by
-construction (section 5.1). Decide it deliberately, not while writing the first
-`cfg_dsv41` line.
+**Settled: reuse the parser.** The supposed cost of the first option is not
+real -- `costmodel` already depends on `nn-graph`, and devgen depends on
+`costmodel`, so nn-graph was ALREADY in devgen's transitive tree. The direct
+edge adds no crate, and nn-graph's own dependencies are `smallvec` and
+`thiserror` plus optional serde. A second reader, by contrast, would drift on
+exactly the fields whose difficulty is the whole problem -- `compress_ratios`
+and `kv_source_layer_ids` disagree by construction (section 5.1).
+
+So `devgen`'s `deepseek_v41` refusal now reports the checkpoint's own VALIDATED
+geometry, read through `nn_graph::models::config`: 40 layers, 4 kv_source layers
+`[2, 8, 14, 20]` whose compressed cache all of them read, 8 indexer layers, and
+Engram at `[1, 14]`. A test asserts those numbers come from the released shards
+rather than a hardcoded copy.
+
+Two things that made this less obvious than it looks, both worth knowing before
+the emit path reads a config again:
+
+* `ModelConfig::from_json` deliberately REFUSES the released checkpoint. It is
+  the multimodal wrapper, its ViT and aligner are unmodeled, and the parser
+  points at the text-generation frontend rather than silently dropping the
+  vision half. The text tower is the `text_config` sub-object.
+* That sub-object does not parse on its own either: `quantization_config` and
+  `dtype` live at the wrapper's TOP level. `sub_config` is the merge that lifts
+  them down, and it is now `pub` for that reason -- every consumer that wants a
+  refused wrapper's text tower needs exactly it, and copying the ten lines into
+  each one is how the rule drifts.
 
 So the ordered critical path to an 8k/90 ms number is:
 

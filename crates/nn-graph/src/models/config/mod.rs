@@ -352,7 +352,17 @@ fn model_type(v: &serde_json::Value) -> Option<String> {
 /// Return `v[key]` if present (a nested sub-config), else `v` itself. Newer
 /// multimodal configs put `dtype` at the top level, so inherit it into the
 /// sub-config when the sub-config doesn't carry its own.
-fn sub_config(v: &serde_json::Value, key: &str) -> serde_json::Value {
+/// Normalize a multimodal wrapper's text tower into a config that parses on its own.
+///
+/// A wrapper nests its geometry under `text_config` but keeps `dtype`/`torch_dtype` and
+/// `quantization_config` at the TOP level, so the sub-object alone is missing fields its own
+/// parser requires. This lifts them down.
+///
+/// `pub` because the wrapper case is not private to this module: [`ModelConfig::from_json`]
+/// deliberately REFUSES a wrapper whose vision tower is unmodeled (DeepSeek-V4.1, Gemma-4,
+/// Qwen3.5), which leaves every downstream consumer that wants the text tower needing exactly
+/// this merge. Copying these ten lines into each one is how the rule drifts.
+pub fn sub_config(v: &serde_json::Value, key: &str) -> serde_json::Value {
     let mut sub = v.get(key).cloned().unwrap_or_else(|| v.clone());
     if let serde_json::Value::Object(map) = &mut sub {
         if !map.contains_key("dtype") && !map.contains_key("torch_dtype") {

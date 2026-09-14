@@ -109,3 +109,37 @@ fn the_refusal_says_what_is_missing_and_where_it_is_tracked() {
         );
     }
 }
+
+/// With the REAL checkpoint present, the refusal must carry its validated geometry -- not a
+/// hardcoded copy of it. This is what makes the `devgen -> nn-graph` edge worth having: the
+/// config is parsed and validated in exactly one place, and devgen reports what that place
+/// found. Skips when the shards are not on this machine.
+#[test]
+fn the_refusal_carries_the_real_checkpoints_validated_geometry() {
+    let hf = std::path::PathBuf::from("/workspace/models/DeepSeek-V4.1-Flash");
+    if !hf.join("config.json").exists() {
+        eprintln!("skipping: DeepSeek-V4.1-Flash not present");
+        return;
+    }
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let err = std::panic::catch_unwind(move || emit(hf)).unwrap_err();
+    std::panic::set_hook(hook);
+    let msg = err
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_default();
+
+    assert!(
+        msg.contains("VALIDATES"),
+        "the real config should parse AND validate through nn-graph; got: {msg}"
+    );
+    // Read off the released checkpoint: 40 layers, kv_source [2, 8, 14, 20], engram [1, 14].
+    for needle in ["40 layers", "4 kv_source layers", "[2, 8, 14, 20]", "[1, 14]"] {
+        assert!(
+            msg.contains(needle),
+            "the refusal should report {needle:?} from the checkpoint; got: {msg}"
+        );
+    }
+}

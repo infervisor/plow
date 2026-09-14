@@ -797,6 +797,7 @@ dependencies = [
  "costmodel",
  "hwspec",
  "kernelcaps",
+ "nn-graph",
  "packet",
  "plow-asset",
  "rewrite",

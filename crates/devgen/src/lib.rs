@@ -7745,20 +7745,7 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
     // (hc_mult 4, sinkhorn 20) reading V4.1's own tensor names, so the full-model emit forks that
     // rather than starting over.
     if model_type == "deepseek_v41" || model_type == "deepseek_v41_text" {
-        panic!(
-            "deepseek_v41: no device emit yet, and this refuses rather than emitting a wrong \
-             model. The runtime side is ready except for two things -- mHC, the DSA indexer, the \
-             MXFP4 experts, the clamped SwiGLU and the CSA2 kernels (ops 180/181) all dispatch \
-             today. What the emitter still needs: (1) CSA2 emit -- the compressor runs on the 4 \
-             layers named by `kv_source_layer_ids` and every other layer READS that cache, so a \
-             per-layer compressor is the wrong shape; (2) the two-level indexer -- \
-             `index_source_layer_ids` has 8 layers but only the 4 that are also \
-             `kv_source_layer_ids` own index keys; (3) Engram at `engram_layer_ids`, which has no \
-             kernel anywhere in the tree; (4) the V4.1 config/tensor binding itself. See \
-             docs/amd/deepseek-v41-flash-mi300x.md section 5.6 for the ordered path. \
-             `--block` is not a shortcut here: `hc_mult` puts mHC on EVERY layer, so there is no \
-             mHC-free block to extract."
-        );
+        panic!("{}", dsv41_refusal(&dir));
     }
     if model_type == "glm5_next" {
         assert!(
@@ -8086,6 +8073,78 @@ pub(crate) fn require_mla_geometry(kv_lora: u32, qk_rope: u32, v_head: u32, mode
 ///
 /// Gating each flag as it is discovered is whack-a-mole. This is the general form: whatever the
 /// flags did, the STREAM is checked against what the target can run.
+/// The `deepseek_v41` refusal, with the checkpoint's own validated numbers in it.
+///
+/// The geometry comes from `nn_graph::models::config`, which parses and validates V4.1 once
+/// and is tested against the released shards -- devgen does NOT re-read the config. A
+/// checkpoint that fails to parse still gets the static half: the claim exists to keep V4.1
+/// away from the Gemma probe and the `deepseek_v3` arm, and that job does not depend on the
+/// config being readable.
+fn dsv41_refusal(dir: &std::path::Path) -> String {
+    use nn_graph::models::config::{ModelConfig, DeepSeekV41Config};
+
+    /// The released checkpoint is the MULTIMODAL wrapper, and `ModelConfig::from_json`
+    /// deliberately refuses that -- its ViT and aligner are not modeled, so it points at the
+    /// text-generation frontend instead of silently dropping the vision half. The text tower is
+    /// the `text_config` sub-object, which carries `model_type: "deepseek_v41_text"` and parses
+    /// on its own. Handing it over is not a second parser: all the geometry still goes through
+    /// nn-graph, and a flat `-text` re-export takes the first branch unchanged.
+    fn v41_of(text: &str) -> Option<DeepSeekV41Config> {
+        match ModelConfig::from_json(text) {
+            Ok(ModelConfig::DeepSeekV41(v)) => Some(v),
+            _ => None,
+        }
+    }
+    let raw = std::fs::read_to_string(dir.join("config.json")).ok();
+    let parsed: Option<DeepSeekV41Config> = raw.as_deref().and_then(|t| {
+        v41_of(t).or_else(|| {
+            let v: serde_json::Value = serde_json::from_str(t).ok()?;
+            v.get("text_config")?;
+            let tower = nn_graph::models::config::sub_config(&v, "text_config");
+            v41_of(&serde_json::to_string(&tower).ok()?)
+        })
+    });
+
+    let geometry = match parsed {
+        Some(cfg) => match cfg.validate() {
+            Ok(()) => {
+                let kv: Vec<u32> = (0..cfg.num_hidden_layers)
+                    .filter(|l| cfg.is_kv_source(*l))
+                    .collect();
+                let idx: Vec<u32> = (0..cfg.num_hidden_layers)
+                    .filter(|l| cfg.is_index_source(*l))
+                    .collect();
+                format!(
+                    " The checkpoint parses and VALIDATES: {} layers, {} kv_source layers \
+                     {kv:?} whose compressed cache all of them read, {} indexer layers {idx:?}, \
+                     engram at {:?}.",
+                    cfg.num_hidden_layers,
+                    kv.len(),
+                    idx.len(),
+                    cfg.engram_layer_ids,
+                )
+            }
+            Err(e) => format!(" The checkpoint parses but FAILS validation: {e}."),
+        },
+        None => String::new(),
+    };
+
+    format!(
+        "deepseek_v41: no device emit yet, and this refuses rather than emitting a wrong \
+         model.{geometry} The runtime side is most of the way there -- mHC, the DSA indexer, \
+         the MXFP4 experts, the clamped SwiGLU, the CSA2 kernels (ops 180/181) and Engram \
+         (ops 182/183) all dispatch today. What the EMITTER still needs: (1) CSA2 emit -- the \
+         compressor runs on the kv_source layers and every other layer READS that cache, so a \
+         per-layer compressor is the wrong shape; (2) the two-level indexer, where only the \
+         kv_source layers own index keys; (3) Engram's host side -- the tokenizer-derived \
+         n-gram hash tables, which are the one stage that is not an opcode; (4) the V4.1 \
+         tensor binding and a full-model emit. See \
+         docs/amd/deepseek-v41-flash-mi300x.md section 5.6 for the ordered path. `--block` is \
+         not a shortcut: `hc_mult` puts mHC on EVERY layer, so there is no mHC-free block to \
+         extract."
+    )
+}
+
 const GFX950_DISPATCHED: &[&str] = &[
     "PLOW_DOP_ADD_NORM",
     "PLOW_DOP_ARGMAX",
