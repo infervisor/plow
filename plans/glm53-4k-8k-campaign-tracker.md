@@ -310,6 +310,43 @@ Two openings that remain, both better than a rewrite:
    kernel per candidate value and compares the output against a reference SiLU; guessing the value
    silently computes the wrong activation. Tool: `scripts/tensile_args.py <image.elf> [substring]`.
 
+## The rewrite finds more fusion than the emitter lowers (2026-09-14)
+
+Cross-block fusion is not missing -- it is discovered and then dropped.
+
+`crates/rewrite` lowers a shape-inferred graph into egglog, runs the fusion rules to equality
+saturation and extracts the lowest-cost form. It is whole-graph, not block-local (`plan_from_all_blocks`),
+and `PLOW_EMIT_REWRITE` is default-on (#102). `egl/rules.egg` produces 28 fused kinds, several of them
+genuinely across block boundaries: `FusedNormResidualNorm` and `FusedNormResidualScaleNorm`
+(norm -> residual -> norm, spanning the sub-block seam), `FusedResidualNorm`, `FusedResidual3Norm`,
+and `FusedMaterializedResidualBlock` / `FusedMaterializedResidual3Block` (whole block).
+
+`crates/devgen/src/rewrite_lower.rs` defines exactly two lowerings: `Lowering::AddNorm`
+(`FusedResidualNorm`, `FusedResidual3Norm`) and `Lowering::NormResidualNorm`
+(`FusedNormResidualNorm`, `FusedNormResidualScaleNorm`). Every other fused kind has no devgen
+lowering -- `FusedLinearAct`, `FusedLinearBiasAct`, `FusedRmsNormSiluGate`, `FusedNormRope`,
+`FusedMlaOutGate`, `FusedMaterializedResidualBlock` and the rest appear nowhere in devgen or plowc.
+
+The caveat that keeps this honest: no rewrite lowering is NOT the same as not fused. Several are done
+by hand instead -- the MoE gate/up SiLU is inside AITER's fused kernel
+(`fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_psx_64x256.co`), and `fusepost` does GEMM + q RoPE by hand.
+The rewrite decides fusions the emitter lowers; where no lowering exists, the hand path or nothing
+applies. So the gap is an upper bound on what is being left behind, not a measured loss.
+
+Where it matters most: `FusedLinearAct` / `FusedLinearBiasAct` is exactly GEMM + bias + activation.
+The rewrite already identifies those sites, the pinned Tensile bodies already carry `bias`,
+`activationType` and a SiLU label, and plow already dispatches them -- three of the four parts exist
+and only the devgen lowering that writes those epilogue words is missing. See the epilogue map above.
+
+Two structural limits on pushing fusion further, both real and both worth respecting:
+
+- Collectives are fusion barriers. `rewrite_lower.rs`: a residual3 site's inner (combine) add "stays
+  with the MoE combine, which under TP precedes the collective".
+- A native GEMM must own its segment alone (`segment_owners`, `amd_gemm_lt.rs:164`), so anything
+  fused into a GEMM's segment has to preserve that invariant -- which an epilogue does by
+  construction and a separate op does not. That is the same invariant `packproj` broke with its
+  out-of-GEMM `ColSplit` copy.
+
 ## Rejected or parked
 
 | candidate | reason |
