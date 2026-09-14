@@ -76,6 +76,25 @@ fn prefers_ordered_decode(
             .any(|d| matches!(d.op, 30 | 31 | 91 | 92 | 114 | 115))
 }
 
+fn headnorm_rope_pack_count(insts: &[DevInst64]) -> usize {
+    let mut count = 0;
+    for next in insts.iter().take(4) {
+        if next.op != DevOp::HeadNormRope as u16 || next.t[0] == u16::MAX {
+            break;
+        }
+        let conflicts = insts[..count].iter().any(|prior| {
+            prior.t[0] == next.t[0]
+                || next.t[1..].contains(&prior.t[0])
+                || prior.t[1..].contains(&next.t[0])
+        });
+        if conflicts {
+            break;
+        }
+        count += 1;
+    }
+    count
+}
+
 /// One instruction of one program delegated to the Apple Neural Engine (rung 4): a prefill
 /// GEMM whose weights were baked into a CoreML program at load. Runs on the host thread at a
 /// segment boundary of the GPU walk; see `run_prog`.
@@ -131,6 +150,7 @@ pub struct MetalEngine {
     pso: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pso_four_rows: Option<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
     pso_single: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pso_headnorm_rope_pack: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pso_mx4: Option<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
     pso_mx4_prefill: Option<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
     conformer: Option<conformer_packet::ConformerPipelines>,
@@ -397,7 +417,16 @@ impl MetalEngine {
         let pso_single = device
             .newComputePipelineStateWithFunction_error(&func_single)
             .map_err(|e| err("pipeline single", e))?;
-        for pipeline in [&pso, &pso_single].into_iter().chain(pso_four_rows.iter()) {
+        let func_headnorm_rope_pack = specialized_lib
+            .newFunctionWithName(&NSString::from_str("plow_headnorm_rope_pack"))
+            .ok_or_else(|| err("packed headnorm-rope pipeline", "kernel missing"))?;
+        let pso_headnorm_rope_pack = device
+            .newComputePipelineStateWithFunction_error(&func_headnorm_rope_pack)
+            .map_err(|e| err("packed headnorm-rope pipeline", e))?;
+        for pipeline in [&pso, &pso_single, &pso_headnorm_rope_pack]
+            .into_iter()
+            .chain(pso_four_rows.iter())
+        {
             if pipeline.threadExecutionWidth() != 32
                 || pipeline.maxTotalThreadsPerThreadgroup() < THREADS
                 || pipeline.staticThreadgroupMemoryLength() > device.maxThreadgroupMemoryLength()
@@ -617,6 +646,7 @@ impl MetalEngine {
             pso,
             pso_four_rows,
             pso_single,
+            pso_headnorm_rope_pack,
             pso_mx4,
             pso_mx4_prefill,
             conformer,
@@ -1469,7 +1499,9 @@ impl MetalEngine {
         let n_cu = self.model.blob.n_cu as usize;
         if ordered {
             // Topological instruction order (the builder appends ops in dependency order).
-            for (ii, d) in pg.insts_host.iter().enumerate() {
+            let mut ii = 0usize;
+            while ii < pg.insts_host.len() {
+                let d = &pg.insts_host[ii];
                 let enc = cb
                     .computeCommandEncoder()
                     .ok_or_else(|| RuntimeError::Device("metal: no encoder".into()))?;
@@ -1485,21 +1517,34 @@ impl MetalEngine {
                     .pso_mx4_prefill
                     .as_ref()
                     .filter(|_| matches!(d.op, 93 | 96 | 97 | 98));
-                enc.setComputePipelineState(dedicated.or(prefill).unwrap_or(&self.pso_single));
+                let pack_count = headnorm_rope_pack_count(&pg.insts_host[ii..]);
+                let packed = (pack_count >= 2).then_some(&self.pso_headnorm_rope_pack);
+                let dispatch_blocks = if packed.is_some() {
+                    pg.insts_host[ii..ii + pack_count]
+                        .iter()
+                        .map(|next| next.blocks)
+                        .max()
+                        .unwrap_or(d.blocks)
+                } else {
+                    d.blocks
+                };
+                enc.setComputePipelineState(
+                    dedicated.or(prefill).or(packed).unwrap_or(&self.pso_single),
+                );
                 if let Some(input) = staged_input {
                     enc.useResource_usage(
                         ProtocolObject::from_ref(&**input),
                         MTLResourceUsage::Read | MTLResourceUsage::Write,
                     );
                 }
-                let sp = ii as u32;
-                // SAFETY: bindings match `plow_single`; `sp` outlives the call.
+                let params = [ii as u32, pack_count as u32];
+                // SAFETY: bindings match the selected kernel; Metal copies `params`.
                 unsafe {
                     enc.setBuffer_offset_atIndex(Some(&pg.insts), 0, 0);
                     enc.setBuffer_offset_atIndex(Some(&self.tab), 0, 7);
                     enc.setBytes_length_atIndex(
-                        NonNull::new(&sp as *const u32 as *mut c_void).unwrap(),
-                        4,
+                        NonNull::new(params.as_ptr() as *mut c_void).unwrap(),
+                        if packed.is_some() { 8 } else { 4 },
                         8,
                     );
                     enc.setBuffer_offset_atIndex(Some(&self.fault), 0, 9);
@@ -1517,7 +1562,7 @@ impl MetalEngine {
                         width: if dedicated.is_some() {
                             d.i[1] as usize / if d.op == 92 { 2 } else { 8 }
                         } else {
-                            d.blocks as usize
+                            dispatch_blocks as usize
                         },
                         height: 1,
                         depth: 1,
@@ -1529,6 +1574,7 @@ impl MetalEngine {
                     },
                 );
                 enc.endEncoding();
+                ii += pack_count.max(1);
             }
         }
         for seg in
@@ -2467,6 +2513,31 @@ mod source_tests {
             true,
             &[inst(DevOp::Gemv), inst(DevOp::GemvMxfp4)]
         ));
+    }
+
+    #[test]
+    fn headnorm_rope_pack_selects_independent_instructions() {
+        let inst = |out, input| {
+            let mut d = DevInst64 {
+                op: DevOp::HeadNormRope as u16,
+                ..DevInst64::default()
+            };
+            d.t[0] = out;
+            d.t[1] = input;
+            d
+        };
+        assert_eq!(
+            headnorm_rope_pack_count(&[inst(1, 4), inst(2, 5), inst(3, 6)]),
+            3
+        );
+        assert_eq!(
+            headnorm_rope_pack_count(&[inst(1, 4), inst(2, 1), inst(3, 6)]),
+            1
+        );
+        assert_eq!(
+            headnorm_rope_pack_count(&[inst(1, 4), inst(4, 5), inst(3, 6)]),
+            1
+        );
     }
 
     #[test]

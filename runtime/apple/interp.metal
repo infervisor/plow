@@ -3699,6 +3699,7 @@ kernel void plow_interp(device const Inst* insts [[buffer(0)]],
 // producer's stores visible, so a run that is right here and wrong in `plow_interp` is a
 // cross-threadgroup visibility problem, not an op bug.
 struct SingleParams { uint inst; };
+struct PackParams { uint inst, count; };
 kernel void plow_single(device const Inst* insts [[buffer(0)]],
                         device const ulong* tab [[buffer(7)]],
                         constant SingleParams& S [[buffer(8)]],
@@ -3716,6 +3717,16 @@ kernel void plow_single(device const Inst* insts [[buffer(0)]],
     if (tg >= in.blocks) return;
     if (!exec_op(in, tab, tg, in.blocks, tile, red, keys, lid, sg, lane))
         if (lid == 0) fault[0] = 0x40000000u | S.inst;
+}
+
+kernel void plow_headnorm_rope_pack(device const Inst* insts [[buffer(0)]],
+ device const ulong* tab [[buffer(7)]], constant PackParams& S [[buffer(8)]],
+ uint tg [[threadgroup_position_in_grid]],
+ uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    uint packed = sg / WAVES;
+    if (packed >= S.count) return;
+    Inst in = insts[S.inst + packed];
+    op_headnorm_rope<false>(in, tab, tg, in.blocks, sg % WAVES, lane);
 }
 
 kernel void plow_mx4_dedicated(device const Inst* insts [[buffer(0)]],
