@@ -1099,6 +1099,69 @@ the defect is deterministic — one prompt, one program, no mux, no admission, n
 sequence window — and reduces to bisecting numerics against the ordinary program, which is a far
 cheaper object than a scheduler.
 
+## The row-band defect is deterministic at C1 and the first chunk is already wrong (2026-09-14, job `rbfault6-chunkladder`)
+
+An exact-length chunk ladder at concurrency 1. The row-split sibling is selected only for a full
+chunk (`rowsplit_chunk_prog`: `clen == bucket_rows == 8192`), so a prompt built to an exact token
+count sets the number of times row-band runs, and prompts are token ids from the server's own
+`/tokenize` with a served-length mismatch counted as a failure, so the chunk count is provable
+rather than assumed.
+
+| length | full chunks | row-band `9e76b70bf97ee4a6` | shipping `8b15f4a28b289a72` |
+|---|---|---|---|
+| 4096 | 0 | **3/3 pass** | 3/3 pass |
+| 8192 | 1 | **0/3** | 3/3 pass |
+| 16384 | 2 | 0/3 | 3/3 pass |
+| 32768 | 4 | 0/3 | 3/3 pass |
+| 65536 | 8 | 0/3 | 3/3 pass |
+
+**Zero fault lines in both arms.** Three things follow, and they narrow the defect a long way.
+
+* The corruption is **deterministic at concurrency 1**. The mux, the admission ladder, rung
+  transitions and packed multi-sequence windows are all out of the picture. The minimal reproducer
+  is one 8192-token prompt at C1.
+* The **first chunk, at `c0 = 0`, is already wrong**. The "needs `c0 > 0`" reading that the prior /
+  band-key derivation would have supported is dead; so is the `prior`-dependent half of the
+  `band_keys` story. The band decomposition is wrong from the first launch.
+* **There is no memory fault at all without concurrency.** The APERTURE_VIOLATION that opened this
+  investigation is downstream of a wrong computation, not the defect. Concurrency only decides
+  whether the bad address lands on mapped memory (garbage) or unmapped (fault).
+
+The shipping set passing all five lengths at identical prompts is what licenses those readings: the
+harness, the packet loading, the checkpoint, the lengths and the client are jointly exonerated at
+exactly the cells where row-band fails.
+
+Worth recording precisely because it constrains the fix: the failures return **structured text**,
+not noise — `"!7.1.0.5. The1 and1.2. The3.0.5.</think>"`, `"!9 and0.5. The1.5 the0. The1.5.5.5.0"`.
+The model runs and emits plausible tokens while attending to the wrong thing. That is the signature
+of mis-indexed attention, not of reading unmapped memory, and it is the reason the C20 arms produced
+an address fault rather than merely bad answers.
+
+**Next**, queued as `rbfault7-bandsweep`: hold the chunk count at one and move the needle through
+that single chunk at the eight band centres. Under row-band rank `r` owns rows
+`[r*1024, (r+1)*1024)`, so a needle at row `at` sits in band `at // 1024`. Uniform failure across
+all eight depths indicts the whole row-band path — `emit_glm_rowband_q` and the single group-major
+`MlaMergeFold`, the two things the ordinary path never runs. A passing contiguous prefix (bands 0-1
+are exactly the two that take `BandKeys::Identity` at prior 0, while 2-7 take `Selection`) would
+instead indict the selection arm alone.
+
+**Host-side candidates already eliminated by reading, recorded so they are not re-tried:** every AQL
+packet carries the barrier bit, so intra-rank overlap cannot happen; `LoCsr::stage` already
+synchronises and is per-rank (`ranks: Vec<AmdEngine>`); `index_row0 = rank * route.rows` is correct
+because `Route::rebase` reassigns `self.rows = self.inst.i[4]`, the band; `rowsplit_launch_args` is
+unit-tested against `rowsplit_probe.cpp`'s constants and its four groups exactly tile the output;
+and a missing `plow_glm_fold_normalize_grouped` is refused at load rather than silently falling back
+to the token-major kernel.
+
+**One unguarded coupling found in passing, not the cause here.** `rowband` and `sp` are computed
+independently in `mla.rs` (`let rowband = use_rowsplit && ...` / `let sp = !raw_output && glm_sp(...)`),
+but the row-band o_proj exists only inside the `if sp` branch: with `sp` false the fold writes
+`rb.oat` while o_proj reads `n.oat`, which nothing wrote that layer. `glm_sp` is false whenever
+`t < 2048`, `packed_prefill_segments()` is set, or a token-batch band is active. The stack packet
+has `glm_seq_par = true` (production_default) so it took the correct branch, but nothing in the
+emitter enforces that, and the failure mode would be silent corruption identical to this one. An
+assert belongs there whatever the root cause turns out to be.
+
 ## Every gfx942 GEMM tile is chosen by the analytical model, and 4961 measured records sit unused (2026-09-14)
 
 `plowc tune status --gpu MI300X` states it directly:
