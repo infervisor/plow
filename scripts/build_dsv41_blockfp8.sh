@@ -9,6 +9,12 @@
 # PLOW_WG_WAVES=8 is REQUIRED, not a default: the 128x128 tile's wave decomposition assumes it,
 # and the arch header's tile constants come from plow_config.h, so -I must reach one.
 #
+# Also builds and RUNS runtime/tests/dsv41_mx_index_test.cpp, which checks the arm's scale
+# INDEXING on the host. That half needs no GPU and no ROCm, so it runs here rather than waiting
+# behind a lease -- and it is not redundant with the GPU test: it is what caught the arm reading
+# 320 bytes past the end of `attn.wkv`'s scale grid, an out-of-bounds read the GPU test exercises
+# every run but would almost certainly not fault on, since hipMalloc pads to page granularity.
+#
 # usage:  scripts/build_dsv41_blockfp8.sh OUT_DIR [PLOW_CONFIG_INCLUDE_DIR]
 #   then: perf-data/tools/gpulease -n 1 dsv41-blkfp8 OUT_DIR/dsv41_blockfp8_gfx942_test
 set -euo pipefail
@@ -35,4 +41,10 @@ c++ "$out/dsv41_blockfp8.o" \
     -o "$out/dsv41_blockfp8_gfx942_test"
 
 echo "built $out/dsv41_blockfp8_gfx942_test"
+
+# The host index check. No GPU, so run it now -- a scale-index regression should not wait for a
+# free card to be noticed.
+c++ -O2 -std=c++17 "$root/runtime/tests/dsv41_mx_index_test.cpp" -o "$out/dsv41_mx_index_test"
+"$out/dsv41_mx_index_test"
+
 echo "run:  $root/perf-data/tools/gpulease -n 1 dsv41-blkfp8 $out/dsv41_blockfp8_gfx942_test"

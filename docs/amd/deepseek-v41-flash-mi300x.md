@@ -919,6 +919,40 @@ So the ordered critical path to an 8k/90 ms number is:
    encoder must not accept `[32,32]` until an opcode exists that reads it, or it
    emits 107 against a V4.1 grid and silently rescales every output.
 
+   **A real bug in the arm, found on the HOST on 2026-09-14 and fixed.** The
+   scale-row index `nsblk[j]` carries no lane component -- one row per 32-column
+   fragment -- so it is only right if a fragment's base is 32-aligned. It is
+   (`MFMA_N` is 32 and `static_assert(BN % (WN * MFMA_N) == 0)` forces `BN/WN` to
+   be a multiple of 32), and an exhaustive host check confirms every valid column
+   takes the correct scale. But the ROW COUNT was unguarded:
+
+   > At a 128-wide N block one `BN=128` tile is exactly ONE block row, so the
+   > index can never exceed `ceil(N/128)` -- which is why the `[128,128]` sibling
+   > needs no guard. At 32 a `BN=128` tile spans FOUR block rows, so when `N` is
+   > not a multiple of `BN` the tile's upper j-groups address rows past
+   > `ceil(N/32)`.
+
+   V4.1's `attn.wkv` makes that concrete rather than hypothetical: **N = 576**
+   (512 latent + 64 rope) is not a multiple of 128, so the last tile addressed
+   rows 18 and 19 of an 18-row grid -- **320 bytes past the end of the scale
+   array**. Those fragments own no live column and their output is discarded at
+   the guarded store, but the promotion reads the byte before anything is
+   discarded. `op_gemm_common.h` now clamps the row exactly as the K axis was
+   already clamped; the default `.text` is unchanged (the clamp is inside
+   `if constexpr (WFP8MX)`) and the armed one grew 256 bytes.
+
+   **Why the GPU test would not have found it.** It already covers `N = 576`,
+   `N = 130` and `N = 33`, so it exercised the overread on every run -- but
+   `hipMalloc` pads to page granularity, so 320 bytes past a buffer end would
+   almost certainly not fault. It would have PASSED with the bug latent. An
+   out-of-bounds read is not reliably observable from the output of the kernel
+   doing it, which is the general lesson: the scale indexing is integer
+   arithmetic and belongs in a test that needs no card
+   (`runtime/tests/dsv41_mx_index_test.cpp`, 294 836 assertions over the real
+   projection shapes at both wave grids, built and run by
+   `scripts/build_dsv41_blockfp8.sh`). Removing the clamp makes it fail, which is
+   the check that it is a test at all.
+
    Remaining: run the numerics, then measure BK=32 against a BK=64 variant that
    promotes twice per tile;
 

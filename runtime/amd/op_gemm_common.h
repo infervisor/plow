@@ -600,8 +600,28 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
 #pragma unroll
                 for (int j = 0; j < SN; j++) accf[i][j] = (f32x16)(0.0f);
 #pragma unroll
-            for (int j = 0; j < SN; j++)
+            for (int j = 0; j < SN; j++) {
                 nsblk[j] = (n0 + wn * (BN / WN) + j * MFMA_N) >> (WFP8MX ? 5 : 7);
+                /* CLAMP THE N-SCALE ROW, for the same reason the K axis is clamped below, and
+                 * ONLY on the 32 grid -- where it is load-bearing rather than defensive.
+                 *
+                 * At 128 the N-scale block is exactly BN wide, so a tile maps to ONE block row
+                 * and the row count ceil(N/128) can never be exceeded: the guard would be dead
+                 * code. At 32 a BN=128 tile spans FOUR block rows, so when N is not a multiple
+                 * of BN the tile's upper j-groups address rows past ceil(N/32) -- every column
+                 * they own is >= N and discarded at the guarded store, but the promotion still
+                 * READS the scale byte before anything is discarded.
+                 *
+                 * That is an out-of-bounds global read, not a wrong number: valid columns keep
+                 * taking the right scale either way (checked exhaustively on the host). It is
+                 * DeepSeek-V4.1's `attn.wkv` that makes this real rather than theoretical --
+                 * N = 576 = 512 latent + 64 rope is not a multiple of 128, so the last tile
+                 * addresses rows 18 and 19 of an 18-row grid, 320 bytes past the end. */
+                if constexpr (WFP8MX) {
+                    const unsigned nbmax = ((N + 31u) >> 5) - 1u;
+                    if (nsblk[j] > nbmax) nsblk[j] = nbmax;
+                }
+            }
         }
         (void)KB;
 
