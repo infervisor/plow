@@ -264,16 +264,48 @@ Two openings that remain, both better than a rewrite:
    `segment_owners` (`amd_gemm_lt.rs:164`) refuses a native GEMM unless it owns its segment alone
    ("native GEMM segment contains other interpreter work", "native segment retains interpreter counter
    obligations"), so coverage is an emitter-segmentation question, not a kernel question.
-2. **The epilogue is nearly unused.** `Args.epilogue` is `[u32; 14]` and `arguments()` writes only
-   `[9..10]` (the dstD pointer); the other twelve slots go out as zero. The pinned kernel names
-   advertise `_Bias_` and `_SAV_`, so epilogue capability is compiled into the bodies plow already
-   dispatches. What each remaining slot means still has to be read off Tensile's UserArgs layout
-   before anything is built on it. If they are what the names suggest, that is fusion without
-   authoring a kernel -- what `fusepost` (-4.1 ms,
-   bit-exact, opt-in only because T3 missed its floor by 0.1 ms) and `packproj` (-8 ms in T2 13/13,
-   T3 FAIL at +73 ms purely because packing forced a `ColSplit` copy OUTSIDE the GEMM) both wanted.
-   An epilogue that writes each projection to its own destination removes packproj's copy by
-   construction.
+2. **The epilogue is nearly unused, and it can do SiLU.** Read off the image's own AMDGPU metadata
+   note (`kernarg_segment_size = 160`, matching `Args`), plow's `epilogue: [u32; 14]` is exactly
+   Tensile's post-GEMM argument block, and `arguments()` writes one field of it:
+
+   | `epilogue[]` | byte | Tensile arg | plow writes |
+   |---|---:|---|---|
+   | `[0..1]` | 104 | `AddressScaleAlphaVec` | zero |
+   | `[2..3]` | 112 | `bias` | zero |
+   | `[4]` | 120 | `biasType` | zero |
+   | `[5]` | 124 | `StrideBias` | zero |
+   | `[6]` | 128 | `activationAlpha` | zero |
+   | `[7]` | 132 | `activationBeta` | zero |
+   | `[8]` | 136 | `activationType` | zero |
+   | `[9..10]` | 140 | `dstD` | **the only one set** |
+   | `[11..12]` | 148 | `Synchronizer` | zero |
+   | `[13]` | 156 | `GSUSync` | zero |
+
+   The bodies carry `label_Activation_{None,Relu,Gelu,Sigmoid,Silu,Clamp}` plus `BiasAddrValid` and
+   `ScaleAlphaVecAddrValid`, so bias add, a per-column alpha vector and SiLU are all compiled into
+   kernels plow already launches -- reachable by writing fields that currently go out as zero, with
+   no kernel authored and no object rebuilt.
+
+   The concrete first target is the shared expert: `glm_tests.rs:4021` records that the band router
+   and the shared expert's gate/up/down are each `GemmLtPf` alone in their own segment, and the gate
+   is followed by a separate SiLU pass over its output. Folding that into `activationType` removes a
+   full read+write of the gate tensor per layer. `AddressScaleAlphaVec` is a per-column alpha vector,
+   which is the shape a per-channel dequant scale wants -- worth re-opening "FP8 block-scale prefill
+   GEMMs: no end-to-end gain" against, since the epilogue applies the scale inside the GEMM rather
+   than as a pass after it.
+
+   This is also the clean way to get what `fusepost` (-4.1 ms, bit-exact, opt-in only because T3
+   missed its floor by 0.1 ms) and `packproj` (-8 ms in T2 13/13, T3 FAIL at +73 ms purely because
+   packing forced a `ColSplit` copy OUTSIDE the GEMM) were reaching for: an epilogue that writes each
+   projection to its own destination removes packproj's copy by construction.
+
+   Checked on the descriptor plow actually dispatches, not a lookalike: the image holds 465 kernels
+   and several share a macro-tile at different kernarg sizes (an `MT256x224x64 ... AFC0` variant is
+   144 bytes), so the layout above was read off the exact pinned name
+   `MT256x224x64_MI16x16x1_SN_LDSB0_AFC1`, which is 160 bytes and carries the full epilogue.
+   Still unverified before building: the integer `activationType` expects for SiLU -- the bodies
+   dispatch activation through a PC table, so the enum has to come off the jump table rather than be
+   assumed. Tool: `scripts/tensile_args.py <image.elf> [kernel-substring]`.
 
 ## Rejected or parked
 
