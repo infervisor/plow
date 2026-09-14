@@ -49,10 +49,22 @@ def _use_system_toolchain() -> None:
     kept = [p for p in parts if p and not p.startswith("/nix/store")]
     os.environ["LD_LIBRARY_PATH"] = ":".join(kept)
 
+    # Drop /nix/store from PATH as well, not just LD_LIBRARY_PATH. `g++` does
+    # not assemble or link by itself: it execs `as` and `ld` off PATH, and the
+    # nix binutils there is built against a newer libc than the system one, so
+    # a system g++ driving a nix assembler fails with
+    #     as: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.38' not found
+    # Every tool in the chain has to come from the same side. Nothing in this
+    # job needs the nix PATH: the bench script and its python are absolute.
     rocm = os.environ.get("ROCM_PATH", "/opt/rocm/core-7.14")
-    front = [f"{rocm}/bin", f"{rocm}/llvm/bin"]
-    path = [p for p in os.environ.get("PATH", "").split(":") if p and p not in front]
-    os.environ["PATH"] = ":".join(front + path)
+    front = [f"{rocm}/bin", f"{rocm}/llvm/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+    rest = [
+        p for p in os.environ.get("PATH", "").split(":")
+        if p and p not in front
+        and not p.startswith("/nix/store")
+        and ".nix-profile" not in p
+    ]
+    os.environ["PATH"] = ":".join(front + rest)
 
     # TVM binds create_shared.get_target_triple ONCE, at `import tvm.contrib.cc`,
     # from os.environ["CXX"] -- so this has to be set before tilelang is
