@@ -200,6 +200,9 @@ pub(crate) struct Cfg {
     pub(crate) k_eq_v: bool,    // Gemma full layers share k_proj as V; Llama/Qwen false
     pub(crate) tied: bool, // reuse embed_tokens as lm_head (Gemma, Qwen); Llama has lm_head.weight
     pub(crate) prefix: String, // weight-name prefix: "model.language_model." or "model."
+    // Maximum FP32 encoder rows that may replace token embeddings during prefill. Zero means a
+    // text-only model. The replacement map and operation remain generic packet data.
+    pub(crate) encoder_overlay_rows: u32,
     // Tensor-parallel degree (Megatron sharding). 1 = single-GPU (current path, byte-identical).
     // >1 emits a DECODE-ONLY sharded blob: column-parallel q/k/v/gate/up/
     // lm_head, row-parallel o_proj/down with an XReduce all-reduce after each, attention split by
@@ -253,6 +256,9 @@ pub(crate) fn cfg_from(dir: &Path) -> Cfg {
         return cfg_gemma(&v, false);
     }
     let mt = v["model_type"].as_str().unwrap_or("");
+    if mt == "qwen3_asr" {
+        return cfg_qwen3_asr(&v);
+    }
     if mt == "gemma4_text" {
         return cfg_gemma(&v, true);
     }
@@ -262,6 +268,37 @@ pub(crate) fn cfg_from(dir: &Path) -> Cfg {
         other => panic!("unsupported model_type {other:?}"),
     };
     cfg_llama_qwen(&v, arch)
+}
+
+fn cfg_qwen3_asr(v: &Value) -> Cfg {
+    let mut text = v["thinker_config"]["text_config"].clone();
+    assert_eq!(
+        text["model_type"], "qwen3",
+        "ASR requires a Qwen3 text decoder"
+    );
+    assert_eq!(text["rope_scaling"]["rope_type"], "default");
+    assert_eq!(
+        text["rope_scaling"]["mrope_section"],
+        serde_json::json!([24, 20, 20])
+    );
+    assert_eq!(text["head_dim"], 128);
+    assert_eq!(text["hidden_act"], "silu");
+    assert_eq!(text["attention_bias"], false);
+    // ASR positions are identical on all three MRoPE axes.
+    text["rope_scaling"] = Value::Null;
+    let mut cfg = cfg_llama_qwen(&text, Arch::Qwen3);
+    cfg.prefix = "thinker.model.".into();
+    let audio = &v["thinker_config"]["audio_config"];
+    assert_eq!(
+        audio["output_dim"].as_u64(),
+        Some(u64::from(cfg.hidden)),
+        "ASR encoder output must match decoder hidden size"
+    );
+    cfg.encoder_overlay_rows = audio["max_source_positions"]
+        .as_u64()
+        .expect("ASR audio max_source_positions missing") as u32;
+    assert!(cfg.encoder_overlay_rows > 0);
+    cfg
 }
 
 /// The original Gemma-4 config parse, verbatim — do not regress it. `flat` selects
@@ -319,6 +356,7 @@ fn cfg_gemma(v: &Value, flat: bool) -> Cfg {
             "model.language_model."
         }
         .to_string(),
+        encoder_overlay_rows: 0,
         tp: 1,
         // 26B-A4B: enable_moe_block=true, num_experts=128, top_k_experts=8, moe_inter=704.
         // 12B/31B: field absent -> dense-only (moe=false).
@@ -403,6 +441,7 @@ fn cfg_gemma3(v: &Value) -> Cfg {
         theta_full: t["rope_theta"].as_f64().expect("gemma3: rope_theta"),
         rope_frac_full: 1.0,
         rope_scale,
+        encoder_overlay_rows: 0,
         attn_scale: (t["query_pre_attn_scalar"]
             .as_f64()
             .expect("gemma3: query_pre_attn_scalar") as f32)
@@ -500,6 +539,7 @@ fn cfg_llama_qwen(v: &Value, arch: Arch) -> Cfg {
         k_eq_v: false,
         tied: v["tie_word_embeddings"].as_bool().unwrap_or(false),
         prefix: "model.".to_string(),
+        encoder_overlay_rows: 0,
         tp: 1,
         moe: false, // Llama/Qwen3 dense here
         n_exp: 0,
@@ -560,5 +600,43 @@ mod gemma3_tests {
         let mut t = text_config();
         t["rope_scaling"]["rope_type"] = json!("dynamic");
         cfg_gemma3(&t);
+    }
+}
+
+#[cfg(test)]
+mod asr_tests {
+    use super::*;
+
+    fn config() -> Value {
+        serde_json::json!({"thinker_config":{
+          "audio_config":{"output_dim":2048,"max_source_positions":1500},
+          "text_config":{
+            "model_type":"qwen3","hidden_size":2048,"intermediate_size":6144,
+            "num_hidden_layers":28,"num_attention_heads":16,"num_key_value_heads":8,
+            "head_dim":128,"vocab_size":151936,"rms_norm_eps":0.000001,
+            "rope_theta":1000000,"tie_word_embeddings":true,"hidden_act":"silu",
+            "attention_bias":false,"rope_scaling":{"rope_type":"default","mrope_section":[24,20,20]}
+        }}})
+    }
+
+    #[test]
+    fn qwen3_asr_uses_nested_decoder_and_tied_head() {
+        let c = cfg_qwen3_asr(&config());
+        assert_eq!(
+            (c.hidden, c.layers, c.hd_full, c.kvh_full),
+            (2048, 28, 128, 8)
+        );
+        assert_eq!(c.prefix, "thinker.model.");
+        assert_eq!(c.encoder_overlay_rows, 1500);
+        assert!(c.tied);
+        assert!(matches!(c.rope_scale, RopeScale::None));
+    }
+
+    #[test]
+    #[should_panic]
+    fn qwen3_asr_rejects_unimplemented_rope() {
+        let mut v = config();
+        v["thinker_config"]["text_config"]["rope_scaling"]["rope_type"] = "yarn".into();
+        cfg_qwen3_asr(&v);
     }
 }

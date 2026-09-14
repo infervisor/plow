@@ -696,6 +696,8 @@ pub mod segment_roles;
 
 pub mod packed_prefill;
 
+pub mod packet_pipeline;
+
 pub mod hetero;
 pub mod hetero_channel;
 pub mod token_batch;

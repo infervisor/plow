@@ -61,6 +61,34 @@ G_K(g_gemv_fp8) {
                 plow_f2bf(dot_a_w8(x + (size_t)m * K, NULL, W + (size_t)n * K, K) * ws[n]);
 }
 
+G_K(g_gemv_qkv_fp8) {
+    (void)ctx;
+    const uint32_t M = in->i[0], K = in->i[2];
+    const uint32_t ns[] = {in->i[1], in->i[3], in->i[4]};
+    const unsigned outputs[] = {0, 3, 5}, weights[] = {2, 4, 6};
+    const plow_bf16* x = PLOW_CPU_TEN(in, T, 1);
+    uint32_t n0, n1, offset = 0;
+    g_range(ns[0] + ns[1] + ns[2], slice, nblk, &n0, &n1);
+    for (unsigned s = 0; s < 3; s++) {
+        const uint32_t lo = n0 > offset ? n0 : offset;
+        const uint32_t hi = n1 < offset + ns[s] ? n1 : offset + ns[s];
+        if (lo < hi) {
+            plow_bf16* out = PLOW_CPU_TEN(in, T, outputs[s]);
+            const uint8_t* w = PLOW_CPU_TEN(in, T, weights[s]);
+            const uint32_t h = in->i[5 + s];
+            const float* scale = h == PLOW_TENSOR_NONE ? NULL : T[h];
+            for (uint32_t m = 0; m < M; m++)
+                for (uint32_t n = lo; n < hi; n++) {
+                    const uint32_t col = n - offset;
+                    out[(size_t)m * ns[s] + col] = scale
+                        ? plow_f2bf(dot_a_w8(x + (size_t)m * K, NULL, w + (size_t)col * K, K) * scale[col])
+                        : G_QNAN;
+                }
+        }
+        offset += ns[s];
+    }
+}
+
 /* t0=fu t1=x t2=Wg t3=g_scale t4=u_scale t5=Wu i0=M i1=N i2=K i5=act */
 G_K(g_gemv_glu_fp8) {
     (void)ctx;
@@ -190,6 +218,7 @@ void plow_cpu_register_golden_fp8(plow_cpu_kernel_fn* tab) {
     tab[PLOW_DOP_MOE_EXPERT_DOWN_GEMMA_FP8] = g_moe_expert_down_gemma_fp8;
     tab[PLOW_DOP_QUANT_FP8] = g_quant_fp8;
     tab[PLOW_DOP_GEMV_FP8] = g_gemv_fp8;
+    tab[PLOW_DOP_GEMV_QKV_FP8] = g_gemv_qkv_fp8;
     tab[PLOW_DOP_GEMV_GLU_FP8] = g_gemv_glu_fp8;
     tab[PLOW_DOP_GEMM_FP8] = g_gemm_fp8;
     tab[PLOW_DOP_GEMM_MED_FP8] = g_gemm_med_fp8;

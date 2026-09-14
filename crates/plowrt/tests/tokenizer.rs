@@ -115,3 +115,58 @@ fn qwen2_class_processors_match_transformers_combining_marks() {
     }
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[cfg(feature = "hf-tokenizer")]
+#[test]
+fn qwen2_vocab_merges_preserve_added_token_ids_and_flags() {
+    use plowrt::text::tokenizer::HfTokenizer;
+    let dir = tmpdir("qwen_files");
+    let checkpoint = dir.join("checkpoint");
+    std::fs::create_dir(&checkpoint).unwrap();
+    std::fs::write(checkpoint.join("vocab.json"), r#"{"h":0,"i":1,"hi":2}"#).unwrap();
+    std::fs::write(checkpoint.join("merges.txt"), "#version: 0.2\nh i\n").unwrap();
+    let config = serde_json::json!({
+        "tokenizer_class": "Qwen2Tokenizer",
+        "added_tokens_decoder": {
+            "3": {"content":"<|audio_pad|>","special":true,"normalized":false,
+                  "single_word":false,"lstrip":false,"rstrip":false},
+            "4": {"content":"<asr_text>","special":false,"normalized":false,
+                  "single_word":false,"lstrip":false,"rstrip":false}
+        }
+    });
+    std::fs::write(checkpoint.join("tokenizer_config.json"), config.to_string()).unwrap();
+    let tok = load_tokenizer(&dir);
+    assert!(!tok.is_byte_fallback());
+    assert_eq!(tok.encode("hi<|audio_pad|><asr_text>"), vec![2, 3, 4]);
+    assert_eq!(tok.decode(&[2, 3, 4]), "hi<asr_text>");
+    let mut bad = config;
+    let marker = bad["added_tokens_decoder"]
+        .as_object_mut()
+        .unwrap()
+        .remove("4")
+        .unwrap();
+    bad["added_tokens_decoder"]["8"] = marker;
+    std::fs::write(checkpoint.join("tokenizer_config.json"), bad.to_string()).unwrap();
+    assert!(HfTokenizer::from_qwen2_files(&checkpoint).is_err());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn loads_json_chat_template_with_jinja_precedence() {
+    use plowrt::serve::template::ChatTemplate;
+    let dir = tmpdir("json_template");
+    std::fs::write(
+        dir.join("chat_template.json"),
+        r#"{"chat_template":"{{ messages[0].content }}"}"#,
+    )
+    .unwrap();
+    let messages = [serde_json::json!({"role":"system","content":"audio context"})];
+    let template = ChatTemplate::load(&dir).unwrap();
+    assert_eq!(template.render(&messages).unwrap(), "audio context");
+    std::fs::write(dir.join("chat_template.jinja"), "standalone").unwrap();
+    assert_eq!(
+        ChatTemplate::load(&dir).unwrap().render(&messages).unwrap(),
+        "standalone"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}

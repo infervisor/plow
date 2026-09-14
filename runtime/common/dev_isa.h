@@ -1392,6 +1392,32 @@ enum {
      *   i0=rpr i1=nh_l i2=d i3=nh_total i4=gate i5=n_gpu i6=slot_bytes(src offset into
      *   peer_scratch) i7=dir(0=q,1=o) */
     PLOW_DOP_XALLTOALL_HEADS = 160,
+    /* Unsigned affine Q4, group64: W=u32[N][K/8] low nibble first,
+     * S/B=bf16[N][K/64]. t0=C t1=A t2=W t3=S t4=B; i0=M i1=N i2=K,
+     * i4=a_row0 i5=c_row0. Positive K divisible by64 required; i3 must be zero.
+     * GEMV: BF16 four-input sums for bias correction, FP32 dot.
+     * GEMM: BF16-rounded (FP32 S*q+B) weights, FP32 dot, 64x64 tiles. */
+    PLOW_DOP_GEMV_AFFINE_Q4 = 161,
+    PLOW_DOP_GEMM_AFFINE_Q4 = 162,
+    /* Backend-neutral FP32 speech/vision primitives. Q8 is canonical GGUF Q8_0: one fp16 scale
+     * plus 32 signed bytes per K block. Exact operand contracts live in packet::dev::DevOp. */
+    PLOW_DOP_Q8_GEMM_F32 = 163,
+    PLOW_DOP_LAYERNORM_F32 = 164,
+    PLOW_DOP_SCALED_ADD_F32 = 165,
+    PLOW_DOP_GLU_F32 = 166,
+    PLOW_DOP_CAUSAL_DEPTHWISE_CONV1D_F32 = 167,
+    PLOW_DOP_RELATIVE_ATTENTION_F32 = 168,
+    PLOW_DOP_SILU_F32 = 169,
+    PLOW_DOP_DENSE_GEMM_F32 = 170,
+    PLOW_DOP_EMBED_F16_F32 = 171,
+    PLOW_DOP_LSTM_CELL_F32 = 172,
+    PLOW_DOP_ARGMAX_F32 = 173,
+    PLOW_DOP_RELU_F32 = 174,
+    PLOW_DOP_BROADCAST_ADD_F32 = 175,
+    PLOW_DOP_CONV2D_F32 = 176,
+    PLOW_DOP_PACK_NCFW_ROWS_F32 = 177,
+    PLOW_DOP_GROUPED_ATTENTION_F32 = 178,
+    PLOW_DOP_EMBED_OVERLAY_BF16 = 179,
 
     PLOW_DOP__COUNT
 };

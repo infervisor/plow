@@ -267,11 +267,7 @@ impl CpuServe {
             self.pos_stage[s] = p;
             self.kvlen_stage[s] = k;
         }
-        let rows = (0..self.batch)
-            .filter(|&s| self.live[s])
-            .map(|s| s + 1)
-            .max()
-            .unwrap_or(1);
+        let rows = crate::sched::rungs::occupied_extent(self.live.iter().copied()).max(1);
         let dp = self.eng.model().decode_prog_for(rows);
         let rung = self.eng.model().blob.progs[dp].t;
         if rung != self.last_rung {

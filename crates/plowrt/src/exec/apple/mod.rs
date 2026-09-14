@@ -36,9 +36,15 @@ use crate::exec::cpu::ffi::{self, Isa};
 use crate::exec::kvrow::{place_lm_head_row, rebase_chunk_rows};
 use crate::{Result, RuntimeError};
 
+pub mod asr;
+pub mod asr_conformer;
+pub mod asr_subsampling;
 #[cfg(feature = "ane")]
 pub mod channel;
+mod conformer_packet;
 pub mod hetero;
+pub mod q8;
+mod rnnt_packet;
 
 const MSL: &str = include_str!("../../../../../runtime/apple/interp.metal");
 const THREADS: usize = 1024;
@@ -84,6 +90,7 @@ struct ProgGpu {
     ctr: Buf,
     n_counter: usize,
     n_seg: u32,
+    four_row_mx4: bool,
 }
 
 /// A decode/prefill instruction whose column range is split between the GPU (the walk, on
@@ -108,7 +115,12 @@ pub struct MetalEngine {
     _device: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     pso: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pso_four_rows: Option<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
     pso_single: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pso_mx4: Option<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
+    pso_mx4_prefill: Option<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
+    conformer: Option<conformer_packet::ConformerPipelines>,
+    rnnt: Option<rnnt_packet::RnntPipelines>,
     /// `PLOW_METAL_SERIAL=1`: one instruction per dispatch (diagnostic, see `plow_single`).
     serial: bool,
     resset: Option<Retained<ProtocolObject<dyn MTLResidencySet>>>,
@@ -120,6 +132,7 @@ pub struct MetalEngine {
     fault: Buf,
     progs: Vec<ProgGpu>,
     max_ctx: usize,
+    embedding_rows: usize,
     spin_max: u32,
     pub last_run_us: f64,
     pub gpu_name: String,
@@ -179,11 +192,51 @@ fn err<E: std::fmt::Display>(what: &str, e: E) -> RuntimeError {
     RuntimeError::Device(format!("metal: {what}: {e}"))
 }
 
+#[derive(Default)]
+pub(crate) struct DecodeTuning {
+    pub qkv_dot4: bool,
+    pub single_head_work: bool,
+}
+
 impl MetalEngine {
     pub fn load(blob: &Path, checkpoint: &Path) -> Result<MetalEngine> {
+        Self::load_with_decode_tuning(blob, checkpoint, DecodeTuning::default())
+    }
+
+    pub(crate) fn load_with_decode_tuning(
+        blob: &Path,
+        checkpoint: &Path,
+        tuning: DecodeTuning,
+    ) -> Result<MetalEngine> {
         // The loader resolves CPU kernels per program (an ABI check); the table must exist.
         ffi::init(Isa::Amx)?;
         let model = CpuModel::load(blob, checkpoint)?;
+        Self::from_model(model, blob, tuning)
+    }
+
+    /// Load a self-contained, model-independent packet asset. Runtime dispatch depends only on
+    /// its opcodes and tensor table; no tokenizer, model family or KV protocol is selected.
+    pub fn load_packet(blob: &Path) -> Result<MetalEngine> {
+        ffi::init(Isa::Amx)?;
+        let model = CpuModel::load_embedded(blob)?;
+        Self::from_model(model, blob, DecodeTuning::default())
+    }
+
+    fn from_model(model: CpuModel, blob: &Path, tuning: DecodeTuning) -> Result<MetalEngine> {
+        let embedding_rows = model
+            .blob
+            .progs
+            .iter()
+            .flat_map(|p| &p.insts)
+            .filter(|d| {
+                matches!(
+                    packet::dev::DevOp::from_u16(d.op),
+                    Some(packet::dev::DevOp::Embed | packet::dev::DevOp::EmbedOverlayBf16)
+                ) && d.i[1] != 0
+            })
+            .map(|d| model.tensor(d.t[1] as usize).bytes / 2 / d.i[1] as usize)
+            .min()
+            .unwrap_or(0);
         let t0 = Instant::now();
         let device = MTLCreateSystemDefaultDevice()
             .ok_or_else(|| RuntimeError::Device("metal: no default device".into()))?;
@@ -207,22 +260,148 @@ impl MetalEngine {
         let source = channel_source.as_deref().unwrap_or(MSL);
         #[cfg(not(feature = "ane"))]
         let source = MSL;
+        let apple_config = &crate::config::RuntimeConfig::get().apple;
+        let qkv_source = apple_config
+            .qkv_dot4
+            .unwrap_or(tuning.qkv_dot4)
+            .then(|| format!("#define PLOW_QKV_DOT4 1\n{source}"));
+        let source = qkv_source.as_deref().unwrap_or(source);
+        let heads_source = apple_config
+            .decode_heads
+            .unwrap_or(tuning.single_head_work)
+            .then(|| format!("#define PLOW_DECODE_HEADS 1\n{source}"));
+        let source = heads_source.as_deref().unwrap_or(source);
+        let glu_source = apple_config
+            .glu_pair
+            .then(|| format!("#define PLOW_GLU_PAIR 1\n{source}"));
+        let source = glu_source.as_deref().unwrap_or(source);
+        let four_rows = model.batch == 4
+            && model
+                .blob
+                .progs
+                .iter()
+                .flat_map(|program| &program.insts)
+                .any(|inst| matches!(inst.op, 91 | 92) && inst.i[0] == 4);
         let lib = device
             .newLibraryWithSource_options_error(&NSString::from_str(source), Some(&opts))
             .map_err(|e| err("MSL compile", e))?;
+        let has_conformer = model
+            .blob
+            .progs
+            .iter()
+            .any(|program| conformer_packet::supports(&program.insts));
+        let conformer = if has_conformer {
+            match conformer_packet::ConformerPipelines::load(&device, &opts) {
+                Ok(pipelines) => Some(pipelines),
+                Err(error) => {
+                    tracing::warn!(%error, "metal: Conformer fast kernels unavailable; using packet interpreter");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let has_rnnt = model
+            .blob
+            .progs
+            .iter()
+            .any(|program| rnnt_packet::supports(&program.insts));
+        let rnnt = if has_rnnt {
+            match rnnt_packet::RnntPipelines::load(&device, &opts) {
+                Ok(pipelines) => Some(pipelines),
+                Err(error) => {
+                    tracing::warn!(%error, "metal: RNNT fast kernels unavailable; using packet interpreter");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let func = lib
             .newFunctionWithName(&NSString::from_str("plow_interp"))
             .ok_or_else(|| RuntimeError::Device("metal: plow_interp missing".into()))?;
         let pso = device
             .newComputePipelineStateWithFunction_error(&func)
             .map_err(|e| err("pipeline", e))?;
-        let func_single = lib
+        let four_rows_lib = if four_rows {
+            let source = format!("#define PLOW_MX4_FOUR_ROWS 1\n{source}");
+            Some(
+                device
+                    .newLibraryWithSource_options_error(&NSString::from_str(&source), Some(&opts))
+                    .map_err(|e| err("four-row MSL compile", e))?,
+            )
+        } else {
+            None
+        };
+        let specialized_lib = four_rows_lib.as_ref().unwrap_or(&lib);
+        let pso_four_rows = four_rows_lib
+            .as_ref()
+            .map(|lib| {
+                let function = lib
+                    .newFunctionWithName(&NSString::from_str("plow_interp"))
+                    .ok_or_else(|| err("four-row pipeline", "plow_interp missing"))?;
+                device
+                    .newComputePipelineStateWithFunction_error(&function)
+                    .map_err(|e| err("four-row pipeline", e))
+            })
+            .transpose()?;
+        let func_single = specialized_lib
             .newFunctionWithName(&NSString::from_str("plow_single"))
             .ok_or_else(|| RuntimeError::Device("metal: plow_single missing".into()))?;
         let pso_single = device
             .newComputePipelineStateWithFunction_error(&func_single)
             .map_err(|e| err("pipeline single", e))?;
-        let serial = crate::config::RuntimeConfig::get().apple.serial;
+        for pipeline in [&pso, &pso_single].into_iter().chain(pso_four_rows.iter()) {
+            if pipeline.threadExecutionWidth() != 32
+                || pipeline.maxTotalThreadsPerThreadgroup() < THREADS
+                || pipeline.staticThreadgroupMemoryLength() > device.maxThreadgroupMemoryLength()
+            {
+                return Err(err(
+                    "pipeline capability",
+                    "requires 32-lane SIMD groups, 1024 threads and sufficient threadgroup memory",
+                ));
+            }
+        }
+        let has_mx4 = model
+            .blob
+            .progs
+            .iter()
+            .flat_map(|program| &program.insts)
+            .any(|instruction| matches!(instruction.op, 91 | 92 | 93 | 96 | 97 | 98));
+        let pso_mx4 = if apple_config.mx4_dedicated || has_mx4 {
+            let function = specialized_lib
+                .newFunctionWithName(&NSString::from_str("plow_mx4_dedicated"))
+                .ok_or_else(|| err("MXFP4 dedicated", "missing kernel"))?;
+            let pipeline = device
+                .newComputePipelineStateWithFunction_error(&function)
+                .map_err(|e| err("MXFP4 dedicated", e))?;
+            if pipeline.threadExecutionWidth() != 32
+                || pipeline.maxTotalThreadsPerThreadgroup() < 64
+            {
+                return Err(err(
+                    "MXFP4 dedicated",
+                    "requires 32-lane SIMD and 64 threads",
+                ));
+            }
+            Some(pipeline)
+        } else {
+            None
+        };
+        let pso_mx4_prefill = pso_mx4.as_ref().and_then(|_| {
+            let function =
+                specialized_lib.newFunctionWithName(&NSString::from_str("plow_mx4_prefill"))?;
+            let pipeline = device
+                .newComputePipelineStateWithFunction_error(&function)
+                .ok()?;
+            (pipeline.threadExecutionWidth() == 32
+                && pipeline.maxTotalThreadsPerThreadgroup() >= THREADS
+                && pipeline.staticThreadgroupMemoryLength() <= device.maxThreadgroupMemoryLength())
+            .then_some(pipeline)
+        });
+        let gpu_name = device.name().to_string();
+        let matching_geometry = hwspec::registry::lookup(&gpu_name)
+            .is_some_and(|spec| spec.sm_count == model.blob.n_cu);
+        let serial = crate::config::RuntimeConfig::get().apple.serial || !matching_geometry;
 
         // Tensors: wrap the host allocations; fall back to a shared copy.
         let n = model.names.len();
@@ -294,10 +473,15 @@ impl MetalEngine {
                 ctr: shared_from(&device, &vec![0u8; (p.n_counter as usize).max(1) * 4])?,
                 n_counter: p.n_counter as usize,
                 n_seg,
+                four_row_mx4: p
+                    .insts
+                    .iter()
+                    .any(|inst| matches!(inst.op, 91 | 92) && inst.i[0] == 4),
             });
         }
 
-        // Residency: every buffer the kernels reach by address, once, on the queue.
+        // Tensor buffers are reached indirectly through the GPU address table. Buffers bound
+        // directly on each encoder are tracked by Metal and do not belong in the residency set.
         let resset = {
             let desc = MTLResidencySetDescriptor::init(MTLResidencySetDescriptor::alloc());
             match device.newResidencySetWithDescriptor_error(&desc) {
@@ -305,15 +489,6 @@ impl MetalEngine {
                     for b in &bufs {
                         set.addAllocation(ProtocolObject::<dyn MTLAllocation>::from_ref(&**b));
                     }
-                    for pg in &progs {
-                        for b in [
-                            &pg.insts, &pg.stream, &pg.ofs, &pg.len, &pg.waits, &pg.succs, &pg.ctr,
-                        ] {
-                            set.addAllocation(ProtocolObject::<dyn MTLAllocation>::from_ref(&**b));
-                        }
-                    }
-                    set.addAllocation(ProtocolObject::<dyn MTLAllocation>::from_ref(&*tab));
-                    set.addAllocation(ProtocolObject::<dyn MTLAllocation>::from_ref(&*fault));
                     set.commit();
                     set.requestResidency();
                     queue.addResidencySet(&set);
@@ -327,19 +502,9 @@ impl MetalEngine {
         };
 
         let max_ctx = model.wk.pos.map(|h| model.tensor(h).bytes / 4).unwrap_or(0);
-        let gpu_name = device.name().to_string();
-        // The blob's executor count must equal this part's GPU cores (§9: a larger grid only adds
-        // spinning threadgroups). The canonical hwspec names equal `MTLDevice.name`.
-        match hwspec::registry::lookup(&gpu_name) {
-            Some(spec) if spec.sm_count != model.blob.n_cu => tracing::warn!(
-                gpu = %gpu_name, cores = spec.sm_count, n_cu = model.blob.n_cu,
-                "blob executor count differs from this GPU's core count; emit with --gpu {:?}",
-                spec.name
-            ),
-            Some(_) => {}
-            None => {
-                tracing::warn!(gpu = %gpu_name, "no hwspec entry for this GPU; add one under crates/hwspec/src/apple")
-            }
+        if !matching_geometry {
+            tracing::info!(gpu = %gpu_name, n_cu = model.blob.n_cu,
+                "using instruction-ordered Metal dispatch for unmatched tuning geometry");
         }
         tracing::info!(
             gpu = %gpu_name,
@@ -349,6 +514,7 @@ impl MetalEngine {
             programs = progs.len(),
             n_cu = model.blob.n_cu,
             max_ctx,
+            embedding_rows,
             setup_ms = format!("{:.0}", t0.elapsed().as_secs_f64() * 1e3).as_str(),
             "metal engine ready"
         );
@@ -384,7 +550,12 @@ impl MetalEngine {
             _device: device,
             queue,
             pso,
+            pso_four_rows,
             pso_single,
+            pso_mx4,
+            pso_mx4_prefill,
+            conformer,
+            rnnt,
             serial,
             resset,
             bufs,
@@ -393,6 +564,7 @@ impl MetalEngine {
             fault,
             progs,
             max_ctx,
+            embedding_rows,
             spin_max: crate::config::RuntimeConfig::get()
                 .apple
                 .spin_max
@@ -415,6 +587,156 @@ impl MetalEngine {
 
     pub fn max_ctx(&self) -> usize {
         self.max_ctx
+    }
+
+    pub fn packet_tensor(&self, name: &str) -> Option<usize> {
+        self.model
+            .names
+            .iter()
+            .position(|candidate| candidate == name)
+    }
+
+    pub(crate) fn embedding_table_handle(&self) -> Result<usize> {
+        self.model
+            .blob
+            .progs
+            .iter()
+            .flat_map(|program| &program.insts)
+            .find(|instruction| {
+                matches!(
+                    packet::dev::DevOp::from_u16(instruction.op),
+                    Some(packet::dev::DevOp::Embed | packet::dev::DevOp::EmbedOverlayBf16)
+                )
+            })
+            .map(|instruction| instruction.t[1] as usize)
+            .ok_or_else(|| RuntimeError::Rejected("packet has no token embedding operation".into()))
+    }
+
+    pub fn write_packet_f32(&self, tensor: usize, values: &[f32]) -> Result<()> {
+        let declaration = self.model.names.get(tensor).ok_or_else(|| {
+            RuntimeError::Device(format!("packet tensor handle {tensor} is missing"))
+        })?;
+        let bytes = values
+            .len()
+            .checked_mul(4)
+            .ok_or_else(|| RuntimeError::Device("packet input size overflows".into()))?;
+        if self.model.tensor(tensor).bytes != bytes {
+            return Err(RuntimeError::Device(format!(
+                "packet tensor {} has {} bytes, input has {bytes}",
+                declaration,
+                self.model.tensor(tensor).bytes
+            )));
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                values.as_ptr().cast::<u8>(),
+                self.host_ptr(tensor),
+                bytes,
+            )
+        };
+        Ok(())
+    }
+
+    pub fn read_packet_f32(&self, tensor: usize) -> Result<Vec<f32>> {
+        self.model.names.get(tensor).ok_or_else(|| {
+            RuntimeError::Device(format!("packet tensor handle {tensor} is missing"))
+        })?;
+        let len = self.model.tensor(tensor).bytes / 4;
+        Ok(
+            unsafe {
+                std::slice::from_raw_parts(self.host_ptr(tensor).cast::<f32>(), len).to_vec()
+            },
+        )
+    }
+
+    pub fn run_packet(&mut self, program: usize) -> Result<()> {
+        if program >= self.progs.len() {
+            return Err(RuntimeError::Device(format!(
+                "packet program {program} is missing"
+            )));
+        }
+        self.run_prog(program)
+    }
+
+    /// Select compiler-ordered dispatch for packet pipelines that require progress without
+    /// cross-threadgroup spinning. The packet contract chooses this; model identity is irrelevant.
+    pub fn set_ordered_dispatch(&mut self, enabled: bool) -> Result<()> {
+        if enabled && self.hetero.is_some() {
+            return Err(RuntimeError::Rejected(
+                "ordered packet dispatch cannot use a heterogeneous lane plan".into(),
+            ));
+        }
+        self.serial = crate::config::RuntimeConfig::get().apple.serial
+            || enabled
+            || !hwspec::registry::lookup(&self.gpu_name)
+                .is_some_and(|spec| spec.sm_count == self.model.blob.n_cu);
+        Ok(())
+    }
+
+    pub fn run_packet_sequence(&mut self, programs: &[usize]) -> Result<()> {
+        for &program in programs {
+            if program >= self.progs.len() {
+                return Err(RuntimeError::Device(format!(
+                    "packet program {program} is missing"
+                )));
+            }
+        }
+        if programs.is_empty() {
+            return Ok(());
+        }
+        if self.serial || programs.iter().any(|&program| !self.gpu_only_program(program)) {
+            for &program in programs {
+                self.run_prog(program)?;
+            }
+            return Ok(());
+        }
+
+        let started = Instant::now();
+        for programs in programs.chunks(32) {
+            for &program in programs {
+                self.reset_program(program);
+            }
+            let cb = self
+                .queue
+                .commandBuffer()
+                .ok_or_else(|| RuntimeError::Device("metal: no command buffer".into()))?;
+            for &program in programs {
+                self.encode_into(
+                    program,
+                    0,
+                    u32::MAX,
+                    0,
+                    self.progs[program].n_seg,
+                    &cb,
+                    None,
+                )?;
+            }
+            cb.commit();
+            let wait = Instant::now();
+            cb.waitUntilCompleted();
+            if let Some(profile) = &mut self.profile {
+                profile.command_buffers += 1;
+                profile.gpu_wait_ms += wait.elapsed().as_secs_f64() * 1e3;
+                profile.gpu_device_ms += (cb.GPUEndTime() - cb.GPUStartTime()).max(0.0) * 1e3;
+            }
+            if cb.status() != MTLCommandBufferStatus::Completed {
+                let error = cb.error().map(|error| error.to_string()).unwrap_or_default();
+                return Err(RuntimeError::Device(format!(
+                    "metal: packet sequence command buffer status {:?}: {error}",
+                    cb.status()
+                )));
+            }
+            let fault = unsafe {
+                std::ptr::read_volatile(self.fault.contents().as_ptr() as *const u32)
+            };
+            if fault != 0 {
+                return Err(RuntimeError::Device(format!(
+                    "metal: packet sequence fault {fault:#010x}"
+                )));
+            }
+        }
+        self.last_run_us = started.elapsed().as_secs_f64() * 1e6;
+        Ok(())
     }
 
     /// `PLOW_CPU_SHARE=<pct>[:<n ops>]`: give the CPU `pct`% of the columns of the first n (default
@@ -751,9 +1073,7 @@ impl MetalEngine {
         h.ok_or_else(|| RuntimeError::Device(format!("blob declares no `{what}` tensor")))
     }
 
-    /// Copy the patched instructions in, zero the counters, dispatch every segment, wait.
-    fn run_prog(&mut self, p: usize) -> Result<()> {
-        let t0 = Instant::now();
+    fn reset_program(&mut self, p: usize) {
         let pg = &self.progs[p];
         // SAFETY: shared buffers sized at load for exactly these tables; no run in flight.
         unsafe {
@@ -769,6 +1089,27 @@ impl MetalEngine {
             );
             std::ptr::write_bytes(self.fault.contents().as_ptr() as *mut u8, 0, 64);
         }
+    }
+
+    fn gpu_only_program(&self, p: usize) -> bool {
+        if self.hetero.as_ref().is_some_and(|h| h.has_active_lanes(p))
+            || self.cpu_slots.iter().any(|s| s.prog == p)
+        {
+            return false;
+        }
+        #[cfg(feature = "ane")]
+        if self.ane.iter().any(|s| s.prog == p)
+            || self.channel.as_ref().is_some_and(|c| c.eligible(p))
+        {
+            return false;
+        }
+        true
+    }
+
+    /// Copy the patched instructions in, zero the counters, dispatch every segment, wait.
+    fn run_prog(&mut self, p: usize) -> Result<()> {
+        let t0 = Instant::now();
+        self.reset_program(p);
         #[cfg(feature = "ane")]
         if self.channel.as_ref().is_some_and(|c| c.eligible(p)) {
             let mut channel = self.channel.take().unwrap();
@@ -983,6 +1324,38 @@ impl MetalEngine {
         seg_lo: u32,
         seg_hi: u32,
     ) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
+        let cb = self
+            .queue
+            .commandBuffer()
+            .ok_or_else(|| RuntimeError::Device("metal: no command buffer".into()))?;
+        self.commit_into(p, inst_lo, inst_hi, seg_lo, seg_hi, cb, None)
+    }
+
+    fn commit_into(
+        &mut self,
+        p: usize,
+        inst_lo: u32,
+        inst_hi: u32,
+        seg_lo: u32,
+        seg_hi: u32,
+        cb: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+        staged_input: Option<&Buf>,
+    ) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
+        self.encode_into(p, inst_lo, inst_hi, seg_lo, seg_hi, &cb, staged_input)?;
+        cb.commit();
+        Ok(cb)
+    }
+
+    fn encode_into(
+        &mut self,
+        p: usize,
+        inst_lo: u32,
+        inst_hi: u32,
+        seg_lo: u32,
+        seg_hi: u32,
+        cb: &ProtocolObject<dyn MTLCommandBuffer>,
+        staged_input: Option<&Buf>,
+    ) -> Result<()> {
         // The instruction table may have been patched since the last copy.
         {
             let pg = &self.progs[p];
@@ -996,18 +1369,50 @@ impl MetalEngine {
             }
         }
         let pg = &self.progs[p];
+        if !self.serial {
+            if let Some(conformer) = self
+                .conformer
+                .as_ref()
+                .filter(|_| conformer_packet::supports(&pg.insts_host))
+            {
+                conformer.encode(&pg.insts_host, &self.bufs, cb)?;
+                return Ok(());
+            }
+            if let Some(rnnt) = self
+                .rnnt
+                .as_ref()
+                .filter(|_| rnnt_packet::supports(&pg.insts_host))
+            {
+                rnnt.encode(&pg.insts_host, &self.bufs, cb)?;
+                return Ok(());
+            }
+        }
         let n_cu = self.model.blob.n_cu as usize;
-        let cb = self
-            .queue
-            .commandBuffer()
-            .ok_or_else(|| RuntimeError::Device("metal: no command buffer".into()))?;
         if self.serial {
             // Topological instruction order (the builder appends ops in dependency order).
             for (ii, d) in pg.insts_host.iter().enumerate() {
                 let enc = cb
                     .computeCommandEncoder()
                     .ok_or_else(|| RuntimeError::Device("metal: no encoder".into()))?;
-                enc.setComputePipelineState(&self.pso_single);
+                let dedicated = self.pso_mx4.as_ref().filter(|_| {
+                    matches!(d.op, 91 | 92)
+                        && d.i[0] > 0
+                        && d.i[1] > 0
+                        && d.i[1] % 8 == 0
+                        && d.i[2] > 0
+                        && d.i[2] % 32 == 0
+                });
+                let prefill = self
+                    .pso_mx4_prefill
+                    .as_ref()
+                    .filter(|_| matches!(d.op, 93 | 96 | 97 | 98));
+                enc.setComputePipelineState(dedicated.or(prefill).unwrap_or(&self.pso_single));
+                if let Some(input) = staged_input {
+                    enc.useResource_usage(
+                        ProtocolObject::from_ref(&**input),
+                        MTLResourceUsage::Read | MTLResourceUsage::Write,
+                    );
+                }
                 let sp = ii as u32;
                 // SAFETY: bindings match `plow_single`; `sp` outlives the call.
                 unsafe {
@@ -1030,12 +1435,16 @@ impl MetalEngine {
                 }
                 enc.dispatchThreadgroups_threadsPerThreadgroup(
                     MTLSize {
-                        width: d.blocks as usize,
+                        width: if dedicated.is_some() {
+                            d.i[1] as usize / if d.op == 92 { 2 } else { 8 }
+                        } else {
+                            d.blocks as usize
+                        },
                         height: 1,
                         depth: 1,
                     },
                     MTLSize {
-                        width: THREADS,
+                        width: if dedicated.is_some() { 64 } else { THREADS },
                         height: 1,
                         depth: 1,
                     },
@@ -1051,7 +1460,18 @@ impl MetalEngine {
             let enc = cb
                 .computeCommandEncoder()
                 .ok_or_else(|| RuntimeError::Device("metal: no encoder".into()))?;
-            enc.setComputePipelineState(&self.pso);
+            let pipeline = self
+                .pso_four_rows
+                .as_ref()
+                .filter(|_| pg.four_row_mx4)
+                .unwrap_or(&self.pso);
+            enc.setComputePipelineState(pipeline);
+            if let Some(input) = staged_input {
+                enc.useResource_usage(
+                    ProtocolObject::from_ref(&**input),
+                    MTLResourceUsage::Read | MTLResourceUsage::Write,
+                );
+            }
             let bind = [
                 &pg.insts, &pg.stream, &pg.ofs, &pg.len, &pg.waits, &pg.succs, &pg.ctr, &self.tab,
             ];
@@ -1097,8 +1517,7 @@ impl MetalEngine {
             );
             enc.endEncoding();
         }
-        cb.commit();
-        Ok(cb)
+        Ok(())
     }
 
     /// The compiled prefill buckets as `(program, rows)`.
@@ -1128,6 +1547,132 @@ impl MetalEngine {
         Ok(self.read_u32(t_ids, 0))
     }
 
+    pub fn prefill_embeddings(&mut self, prompt: &[u32], embeddings: &[u16]) -> Result<u32> {
+        self.prefill_embeddings_staged(
+            prompt,
+            embeddings.len(),
+            false,
+            |_, output, _, ch, hidden, _| {
+                let source =
+                    &embeddings[ch.c0 as usize * hidden..(ch.c0 + ch.clen) as usize * hidden];
+                // The previous command buffer completed; the destination is idle.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        source.as_ptr().cast::<u8>(),
+                        output.contents().as_ptr().cast::<u8>(),
+                        source.len() * 2,
+                    );
+                }
+                Ok(())
+            },
+        )
+    }
+
+    // With a command buffer, stage only encodes. Otherwise staging must complete before returning.
+    pub(crate) fn prefill_embeddings_staged(
+        &mut self,
+        prompt: &[u32],
+        elements: usize,
+        device_stage: bool,
+        mut stage: impl FnMut(
+            Option<&ProtocolObject<dyn MTLCommandBuffer>>,
+            &Buf,
+            &Buf,
+            Chunk,
+            usize,
+            usize,
+        ) -> Result<()>,
+    ) -> Result<u32> {
+        let x = self
+            .model
+            .names
+            .iter()
+            .position(|n| n == "act.x")
+            .ok_or_else(|| err("ASR", "missing act.x"))?;
+        let buckets = self.prefill_buckets();
+        let first = *buckets
+            .first()
+            .ok_or_else(|| err("ASR", "missing prefill program"))?;
+        let embed = self.model.blob.progs[first.0]
+            .insts
+            .iter()
+            .find(|d| {
+                matches!(
+                    packet::dev::DevOp::from_u16(d.op),
+                    Some(packet::dev::DevOp::Embed | packet::dev::DevOp::EmbedOverlayBf16)
+                ) && d.t[0] as usize == x
+            })
+            .ok_or_else(|| err("ASR", "missing embedding instruction"))?;
+        let hidden = embed.i[1] as usize;
+        if hidden == 0
+            || prompt.is_empty()
+            || prompt.len() >= self.max_ctx
+            || elements != prompt.len() * hidden
+        {
+            return Err(err("ASR", "invalid prompt embedding dimensions"));
+        }
+        for ch in plan_chunks(&buckets, prompt.len() as u32) {
+            self.prepare_prefill_chunk(prompt, ch)?;
+            let inst = self.progs[ch.prog]
+                .insts_host
+                .iter_mut()
+                .find(|d| {
+                    matches!(
+                        packet::dev::DevOp::from_u16(d.op),
+                        Some(packet::dev::DevOp::Embed | packet::dev::DevOp::EmbedOverlayBf16)
+                    ) && d.t[0] as usize == x
+                })
+                .ok_or_else(|| err("ASR", "missing chunk embedding instruction"))?;
+            let table = inst.t[1] as usize;
+            inst.op = packet::dev::DevOp::Nop as u16;
+            if ch.clen as usize * hidden * 2 > self.model.tensor(x).bytes {
+                return Err(err("ASR", "embedding buffer too small"));
+            }
+            let cb = if device_stage && self.gpu_only_program(ch.prog) {
+                Some(
+                    self.queue
+                        .commandBuffer()
+                        .ok_or_else(|| err("prefill", "command buffer"))?,
+                )
+            } else {
+                None
+            };
+            stage(
+                cb.as_deref(),
+                &self.bufs[x],
+                &self.bufs[table],
+                ch,
+                hidden,
+                self.model.tensor(table).bytes / (hidden * 2),
+            )?;
+            if let Some(cb) = cb {
+                let start = Instant::now();
+                self.reset_program(ch.prog);
+                let input = self.bufs[x].clone();
+                let cb = self.commit_into(
+                    ch.prog,
+                    0,
+                    u32::MAX,
+                    0,
+                    self.progs[ch.prog].n_seg,
+                    cb,
+                    Some(&input),
+                )?;
+                let wait = Instant::now();
+                cb.waitUntilCompleted();
+                self.record_gpu_profile(&cb, wait);
+                self.last_run_us = start.elapsed().as_secs_f64() * 1e6;
+                if cb.status() != MTLCommandBufferStatus::Completed {
+                    return Err(err("prefill staging", format!("{:?}", cb.error())));
+                }
+                self.check_fault(ch.prog)?;
+            } else {
+                self.run_prog(ch.prog)?;
+            }
+        }
+        self.last_token()
+    }
+
     /// Stage a prefill chunk (inputs + instruction rebases) without running it.
     pub fn prepare_prefill_chunk(&mut self, prompt: &[u32], ch: Chunk) -> Result<()> {
         let end = ch.c0.checked_add(ch.clen);
@@ -1144,6 +1689,7 @@ impl MetalEngine {
         {
             return Err(RuntimeError::Device(format!("bad prefill chunk {ch:?}")));
         }
+        self.validate_ids(&prompt[ch.c0 as usize..end.unwrap() as usize])?;
         let (t_ids, t_pos, t_kvlen) = (
             self.need(self.model.wk.ids, "in.ids")?,
             self.need(self.model.wk.pos, "in.pos")?,
@@ -1194,6 +1740,13 @@ impl MetalEngine {
     /// Stage a decode step's inputs and instruction patches without running it; returns the
     /// decode program index.
     pub fn prepare_decode(&mut self, pos: u32, kvlen: u32, id: u32) -> Result<usize> {
+        self.validate_ids(&[id])?;
+        if pos as usize >= self.max_ctx || kvlen == 0 || kvlen as usize > self.max_ctx {
+            return Err(err(
+                "decode",
+                "position or KV length outside context allocation",
+            ));
+        }
         let b = self.model.batch;
         let t_ids = self.need(self.model.wk.ids, "in.ids")?;
         let t_pos = self.need(self.model.wk.pos, "in.pos")?;
@@ -1427,9 +1980,49 @@ impl MetalEngine {
         r
     }
 
+    pub fn prefill_slot_embeddings(
+        &mut self,
+        slot: usize,
+        prompt: &[u32],
+        embeddings: &[u16],
+    ) -> Result<u32> {
+        self.model.kv_rebase(slot)?;
+        self.refresh_tab();
+        let result = self.prefill_embeddings(prompt, embeddings);
+        self.model.kv_rebase(0)?;
+        self.refresh_tab();
+        result
+    }
+
     pub fn last_token(&self) -> Result<u32> {
         let t_ids = self.need(self.model.wk.ids, "in.ids")?;
         Ok(self.read_u32(t_ids, 0))
+    }
+
+    /// A supplied command buffer must only be encoded, not committed. Without one,
+    /// staging must finish before returning. Operand buffers must remain alive until retirement.
+    /// Errors restore the table base, but do not roll back KV writes from completed chunks.
+    pub fn prefill_slot_embeddings_staged(
+        &mut self,
+        slot: usize,
+        prompt: &[u32],
+        elements: usize,
+        device_stage: bool,
+        stage: impl FnMut(
+            Option<&ProtocolObject<dyn MTLCommandBuffer>>,
+            &Buf,
+            &Buf,
+            Chunk,
+            usize,
+            usize,
+        ) -> Result<()>,
+    ) -> Result<u32> {
+        self.model.kv_rebase(slot)?;
+        self.refresh_tab();
+        let result = self.prefill_embeddings_staged(prompt, elements, device_stage, stage);
+        self.model.kv_rebase(0)?;
+        self.refresh_tab();
+        result
     }
 
     /// One decode step for every slot on decode program `dp` (the CPU engine's contract:
@@ -1472,6 +2065,7 @@ impl MetalEngine {
                 "program {dp} is not a decode rung"
             )));
         }
+        self.validate_ids(ids)?;
         let t_ids = self.need(self.model.wk.ids, "in.ids")?;
         let t_pos = self.need(self.model.wk.pos, "in.pos")?;
         let t_kvlen = self.need(self.model.wk.kvlen, "in.kvlen")?;
@@ -1493,8 +2087,19 @@ impl MetalEngine {
     }
 
     pub fn set_token(&self, id: u32) -> Result<()> {
+        self.validate_ids(&[id])?;
         let t_ids = self.need(self.model.wk.ids, "in.ids")?;
         self.write_u32s(t_ids, 0, &[id]);
+        Ok(())
+    }
+
+    fn validate_ids(&self, ids: &[u32]) -> Result<()> {
+        if let Some(id) = ids.iter().find(|&&id| id as usize >= self.embedding_rows) {
+            return Err(err(
+                "token",
+                format!("ID {id} outside embedding rows {}", self.embedding_rows),
+            ));
+        }
         Ok(())
     }
 }
@@ -1518,4 +2123,136 @@ fn shared_from(device: &ProtocolObject<dyn MTLDevice>, bytes: &[u8]) -> Result<B
         )
     };
     Ok(b)
+}
+
+impl crate::exec::packet_runtime::PacketRuntime for MetalEngine {
+    fn begin_execution(&mut self) -> Result<()> {
+        if let Some(set) = &self.resset {
+            set.requestResidency();
+        }
+        Ok(())
+    }
+
+    fn end_execution(&mut self) -> Result<()> {
+        if let Some(set) = &self.resset {
+            set.endResidency();
+        }
+        Ok(())
+    }
+
+    fn tensor(&self, name: &str) -> Option<crate::exec::packet_runtime::PacketTensor> {
+        let handle = self.packet_tensor(name)?;
+        Some(crate::exec::packet_runtime::PacketTensor {
+            handle,
+            bytes: self.model.tensor(handle).bytes,
+        })
+    }
+
+    fn write_tensor(
+        &mut self,
+        tensor: crate::exec::packet_runtime::PacketTensor,
+        bytes: &[u8],
+    ) -> Result<()> {
+        self.model.names.get(tensor.handle).ok_or_else(|| {
+            RuntimeError::Device(format!("packet tensor handle {} is missing", tensor.handle))
+        })?;
+        crate::exec::packet_runtime::check_transfer(
+            tensor,
+            tensor.handle,
+            self.model.tensor(tensor.handle).bytes,
+            bytes.len(),
+        )?;
+        // SAFETY: the engine is exclusively borrowed, no command is in flight, and sizes match.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.host_ptr(tensor.handle), bytes.len())
+        };
+        Ok(())
+    }
+
+    fn read_tensor(
+        &self,
+        tensor: crate::exec::packet_runtime::PacketTensor,
+        bytes: &mut [u8],
+    ) -> Result<()> {
+        self.model.names.get(tensor.handle).ok_or_else(|| {
+            RuntimeError::Device(format!("packet tensor handle {} is missing", tensor.handle))
+        })?;
+        crate::exec::packet_runtime::check_transfer(
+            tensor,
+            tensor.handle,
+            self.model.tensor(tensor.handle).bytes,
+            bytes.len(),
+        )?;
+        // SAFETY: no command mutates the shared buffer while `self` is borrowed and sizes match.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.host_ptr(tensor.handle),
+                bytes.as_mut_ptr(),
+                bytes.len(),
+            )
+        };
+        Ok(())
+    }
+
+    fn copy_tensor(
+        &mut self,
+        source: crate::exec::packet_runtime::PacketTensor,
+        source_offset: usize,
+        target: crate::exec::packet_runtime::PacketTensor,
+        target_offset: usize,
+        bytes: usize,
+    ) -> Result<()> {
+        self.model.names.get(source.handle).ok_or_else(|| {
+            RuntimeError::Device(format!("packet tensor handle {} is missing", source.handle))
+        })?;
+        self.model.names.get(target.handle).ok_or_else(|| {
+            RuntimeError::Device(format!("packet tensor handle {} is missing", target.handle))
+        })?;
+        crate::exec::packet_runtime::check_copy(
+            source,
+            self.model.tensor(source.handle).bytes,
+            source_offset,
+            target,
+            self.model.tensor(target.handle).bytes,
+            target_offset,
+            bytes,
+        )?;
+        // SAFETY: both unified-memory ranges were checked and no command is in flight.
+        unsafe {
+            std::ptr::copy(
+                self.host_ptr(source.handle).add(source_offset),
+                self.host_ptr(target.handle).add(target_offset),
+                bytes,
+            )
+        };
+        Ok(())
+    }
+
+    fn run(&mut self, program: usize) -> Result<()> {
+        self.run_packet(program)
+    }
+
+    fn run_sequence(&mut self, programs: &[usize]) -> Result<()> {
+        self.run_packet_sequence(programs)
+    }
+
+    fn last_run_us(&self) -> f64 {
+        self.last_run_us
+    }
+}
+
+#[cfg(test)]
+mod source_tests {
+    use super::*;
+
+    #[test]
+    fn packet_interpreter_source_compiles() {
+        let device = MTLCreateSystemDefaultDevice().expect("Metal device");
+        let options = MTLCompileOptions::new();
+        options.setMathMode(MTLMathMode::Safe);
+        options.setLanguageVersion(MTLLanguageVersion::Version3_2);
+        device
+            .newLibraryWithSource_options_error(&NSString::from_str(MSL), Some(&options))
+            .expect("compile packet interpreter");
+    }
 }

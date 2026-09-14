@@ -56,7 +56,6 @@ kernel void chain(device atomic_uint* ctr [[buffer(0)]], device uint* result [[b
     if (lid != 0) return;
     uint it = 0;
     while (atomic_load_explicit(ctr, memory_order_relaxed) != tg && it < spin_max) it++;
-    threadgroup_barrier(mem_flags::mem_device);
     atomic_fetch_add_explicit(ctr, 1u, memory_order_relaxed);
     result[tg] = it < spin_max ? it : 0xFFFFFFFFu;
 }

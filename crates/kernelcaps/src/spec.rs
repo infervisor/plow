@@ -107,6 +107,9 @@ pub enum QuantScheme {
     BlockFp8,
     /// 4-bit weights, 8-bit activations.
     W4A8,
+    /// Unsigned affine 4-bit weights with one BF16 scale and bias per 64 elements;
+    /// activations are BF16 and accumulation is FP32.
+    AffineQ4,
     /// Plain fp4 operands with no block scale.
     Fp4,
     /// OCP MX fp8: e4m3 elements in **32-element blocks**, one shared **E8M0**

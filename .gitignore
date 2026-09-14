@@ -8,6 +8,7 @@ plans/
 .vscode/
 target/
 plow-out/
+models/
 build/.claude/worktrees/
 runtime/ubench/build/
 

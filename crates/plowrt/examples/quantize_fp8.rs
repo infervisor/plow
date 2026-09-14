@@ -1,7 +1,7 @@
 //! Weight-only per-output-channel e4m3 fp8 twin of a bf16 checkpoint — the Rust twin of
 //! `perf-data/tools/quantize_fp8.py` (per-channel mode) for hosts without torch.
 //!
-//! `cargo run --release --features cpu --example quantize_fp8 -- <src-model-dir> <out-dir> [prefix]`
+//! `cargo run --release --features cpu --example quantize_fp8 -- <src-model-dir> <out-dir> [prefix] [--head-only]`
 //!
 //! Method (settled, see the Python header): W is [N, K] row-major; scale[n] = amax(|W[n,:]|)/448
 //! (1.0 for an all-zero row); W8[n,k] = e4m3fn(W[n,k] / scale[n]) round-to-nearest-even,
@@ -79,7 +79,18 @@ fn main() {
         .next()
         .expect("usage: quantize_fp8 <src-dir> <out-dir> [prefix]")
         .into();
-    let prefix = args
+    let rest: Vec<_> = args.collect();
+    let head_only = rest.iter().any(|arg| arg == "--head-only");
+    let positional: Vec<_> = rest
+        .into_iter()
+        .filter(|arg| arg != "--head-only")
+        .collect();
+    assert!(
+        positional.len() <= 1,
+        "usage: quantize_fp8 <src-dir> <out-dir> [prefix] [--head-only]"
+    );
+    let prefix = positional
+        .into_iter()
         .next()
         .unwrap_or_else(|| "model.language_model.".to_string());
 
@@ -134,13 +145,15 @@ fn main() {
 
     // Plan in the Python's order: layer-major, PROJS order, only tensors that exist.
     let mut plan: Vec<(String, usize, usize)> = Vec::new(); // (name, N, K)
-    for l in 0..layers {
-        for p in PROJS {
-            let name = format!("{prefix}layers.{l}.{p}");
-            if let Some((_, info)) = index.get(&name) {
-                assert_eq!(info.dtype, safetensors::Dtype::BF16, "{name}: not bf16");
-                assert_eq!(info.shape.len(), 2, "{name}: not 2-D");
-                plan.push((name, info.shape[0], info.shape[1]));
+    if !head_only {
+        for l in 0..layers {
+            for p in PROJS {
+                let name = format!("{prefix}layers.{l}.{p}");
+                if let Some((_, info)) = index.get(&name) {
+                    assert_eq!(info.dtype, safetensors::Dtype::BF16, "{name}: not bf16");
+                    assert_eq!(info.shape.len(), 2, "{name}: not 2-D");
+                    plan.push((name, info.shape[0], info.shape[1]));
+                }
             }
         }
     }

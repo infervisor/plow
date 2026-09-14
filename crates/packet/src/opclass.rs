@@ -50,7 +50,9 @@ pub fn op_classes(op: DevOp) -> &'static [&'static str] {
         | DsaPoolCompress
         | DsaPoolExpand
         | DsaPoolStash
-        | DsaQQuant => &["attention"],
+        | DsaQQuant
+        | RelativeAttentionF32
+        | GroupedAttentionF32 => &["attention"],
         FlashMlaPrefillFp8 => &["attention", "native_route"],
 
         IndexScore | IndexSelect | IndexScorePf | IndexSelectPf | IndexUnionPf
@@ -101,25 +103,29 @@ pub fn op_classes(op: DevOp) -> &'static [&'static str] {
         Gemm | GemmNorm | GemmSmall | GemmMed | GemmGlu | GemmFp8 | GemmMedFp8 | GemmSmallFp8
         | GemmGluFp8 | GemmMxfp4 | GemmWide | GemmC5 | GemmMedMxfp4 | GemmSmallMxfp4
         | GemmWideMxfp4 | GemmC5Mxfp4 | GemmWideFp8 | GemmC5Fp8 | GemmFp8Blk | GemmGluMxfp4
-        | GemmSplitK | DenseGluFp8Blk => &["gemm"],
+        | GemmSplitK | DenseGluFp8Blk | GemmAffineQ4 | Q8GemmF32 | DenseGemmF32 | Conv2dF32 => {
+            &["gemm"]
+        }
         GemmLtPf | GemmBlkPf => &["gemm", "native_route"],
 
         Gemv | GemvGlu | GemvQkv | GemvFp8 | GemvGluFp8 | GemvFp8Blk | GemvSz | GemvGluSz
-        | GemvMxfp4 | GemvGluMxfp4 | GemvQkvg | GemvQkvMxfp4 | GemvQkvFp8 | GemvF32 => &["gemv"],
+        | GemvMxfp4 | GemvGluMxfp4 | GemvQkvg | GemvQkvMxfp4 | GemvQkvFp8 | GemvF32
+        | GemvAffineQ4 => &["gemv"],
 
         RmsNorm | RowRms | NormResidual | AddNorm | NormResidualNorm | LayerNorm | QwenRmsNorm
-        | QwenGatedNorm | KdaGatedNorm => &["norm"],
+        | QwenGatedNorm | KdaGatedNorm | LayerNormF32 => &["norm"],
 
         KdaConv | KdaGate | Mamba2Scan | KdaStateStep | KdaConv3 | KdaStateStepG
         | KdaConvStateStepG | KdaChunkPrepare | KdaChunkIntra | KdaChunkWu | KdaChunkCarry
         | KdaDecodeFused | QwenGdnConv | QwenGdnStep | QwenQGateSplit | QwenSigmoidGate
         | QwenGdnConvPrefill | QwenGdnQkvPrep | QwenGdnGatePrep | QwenGdnPrefill | HyperConnPre
-        | HyperConnPost => &["recurrent"],
+        | HyperConnPost | CausalDepthwiseConv1dF32 | LstmCellF32 => &["recurrent"],
 
-        Argmax | ArgmaxFin | GemvArgmax | RowGather => &["sample"],
+        Argmax | ArgmaxFin | GemvArgmax | RowGather | ArgmaxF32 => &["sample"],
 
         Nop | Residual | Glu | Embed | SoftCap | QuantFp8 | SituGlu | ZeroF32 | CastF32Bf16
-        | PerLayerInput => &["elementwise"],
+        | PerLayerInput | ScaledAddF32 | GluF32 | SiluF32 | ReluF32 | BroadcastAddF32 | EmbedF16F32
+        | EmbedOverlayBf16 | PackNcfwRowsF32 => &["elementwise"],
     }
 }
 

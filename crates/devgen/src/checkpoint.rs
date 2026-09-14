@@ -7,6 +7,99 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+pub(crate) struct TensorReader {
+    entries: HashMap<String, TensorEntry>,
+}
+
+struct TensorEntry {
+    path: PathBuf,
+    offset: u64,
+    bytes: usize,
+    dtype: String,
+}
+
+impl TensorReader {
+    pub(crate) fn open(dir: &Path) -> Result<Self, String> {
+        let mut entries = HashMap::new();
+        for path in shard_files(dir) {
+            use std::io::Read;
+            let mut file = std::fs::File::open(&path)
+                .map_err(|error| format!("{}: {error}", path.display()))?;
+            let mut length = [0; 8];
+            file.read_exact(&mut length)
+                .map_err(|error| format!("{}: {error}", path.display()))?;
+            let header_bytes = u64::from_le_bytes(length);
+            let mut bytes = vec![
+                0;
+                usize::try_from(header_bytes).map_err(|_| format!(
+                    "{}: safetensors header is too large",
+                    path.display()
+                ))?
+            ];
+            file.read_exact(&mut bytes)
+                .map_err(|error| format!("{}: {error}", path.display()))?;
+            let header: Value = serde_json::from_slice(&bytes)
+                .map_err(|error| format!("{}: bad safetensors header: {error}", path.display()))?;
+            let data_start = 8u64
+                .checked_add(header_bytes)
+                .ok_or_else(|| format!("{}: safetensors offset overflows", path.display()))?;
+            for (name, value) in header
+                .as_object()
+                .ok_or_else(|| format!("{}: safetensors header is not an object", path.display()))?
+            {
+                if name == "__metadata__" {
+                    continue;
+                }
+                let offsets = value["data_offsets"]
+                    .as_array()
+                    .filter(|offsets| offsets.len() == 2)
+                    .ok_or_else(|| format!("{name}: missing safetensors data offsets"))?;
+                let start = offsets[0]
+                    .as_u64()
+                    .ok_or_else(|| format!("{name}: invalid safetensors start offset"))?;
+                let end = offsets[1]
+                    .as_u64()
+                    .ok_or_else(|| format!("{name}: invalid safetensors end offset"))?;
+                let entry = TensorEntry {
+                    path: path.clone(),
+                    offset: data_start
+                        .checked_add(start)
+                        .ok_or_else(|| format!("{name}: safetensors offset overflows"))?,
+                    bytes: usize::try_from(
+                        end.checked_sub(start)
+                            .ok_or_else(|| format!("{name}: safetensors offsets are reversed"))?,
+                    )
+                    .map_err(|_| format!("{name}: safetensors tensor is too large"))?,
+                    dtype: value["dtype"]
+                        .as_str()
+                        .ok_or_else(|| format!("{name}: missing safetensors dtype"))?
+                        .to_owned(),
+                };
+                if entries.insert(name.clone(), entry).is_some() {
+                    return Err(format!("duplicate checkpoint tensor {name}"));
+                }
+            }
+        }
+        Ok(Self { entries })
+    }
+
+    pub(crate) fn read(&self, name: &str) -> Result<(&str, Vec<u8>), String> {
+        use std::io::{Read, Seek, SeekFrom};
+        let entry = self
+            .entries
+            .get(name)
+            .ok_or_else(|| format!("checkpoint has no {name}"))?;
+        let mut file = std::fs::File::open(&entry.path)
+            .map_err(|error| format!("{}: {error}", entry.path.display()))?;
+        file.seek(SeekFrom::Start(entry.offset))
+            .map_err(|error| format!("{}: {error}", entry.path.display()))?;
+        let mut bytes = vec![0; entry.bytes];
+        file.read_exact(&mut bytes)
+            .map_err(|error| format!("{}: {error}", entry.path.display()))?;
+        Ok((&entry.dtype, bytes))
+    }
+}
+
 /// Read the `layer_scalar` values out of the checkpoint.
 ///
 /// The RESIDUAL op takes its scale as an IMMEDIATE in the packet, not as a tensor — so the
@@ -369,6 +462,7 @@ pub(crate) fn validate_coverage(
         .map(|s| {
             s.strip_prefix("fp8/")
                 .or_else(|| s.strip_prefix("mxfp4/"))
+                .or_else(|| s.strip_prefix("affineq4/"))
                 .unwrap_or(s.as_str())
         })
         .filter(|n| n.starts_with(prefix))
