@@ -1395,6 +1395,51 @@ arm puts the carrier inside that allocation and the next step is bisecting its r
 exonerates the whole allocation in one run and moves the search to interpreter activations, the KV
 cache, or the peer reduction slots.
 
+## Clearing the sparse-MLA workspace does not undo the row-band poison, which exonerates it (2026-09-14, job `rbfault16-clearws`)
+
+The standing lead through this whole hunt was the sparse-MLA workspace: `q`, `kv`, `part`, `lse`,
+`qp`, `kp`, `last`, `splits` and the lower-half CSR are allocated in `SparseMla::load`, not in the
+packet's tensor table, so no per-sequence state clear covers any of it (`PLOW_STATE_CLEAR_DEVICE`
+only chooses how that clear runs, not what it reaches). With `rbfault15` having established that the
+trigger is any program-3 chunk in the 8192 bucket, however short, the workspace was the one piece of
+device memory both siblings share on that footing.
+
+`PLOW_GLM_ROWBAND_CLEAR_WS=1` (diagnostic, default off) zeroes every byte of that allocation and
+forgets the CSR's staged `(prior, rows)` key before every row-band dispatch, so the dispatch sees
+exactly the device state a freshly loaded server would give it. Three arms, both controls landing:
+
+| arm | sequence | 8192 depth 0.5 |
+|---|---|---|
+| `ctrl` | knob off, 4096 then 8192 | **0/3 FAIL** — the reproducer holds in this binary |
+| `clear` | knob **on**, 4096 then 8192 | **0/3 FAIL** |
+| `clearcold` | knob **on**, 8192 only | 3/3 pass — the clear is harmless by itself |
+
+Zero fault lines in all three. `clearcold` is what makes the middle arm readable: a full zero of the
+workspace on every dispatch does not itself break a correct run, so the middle arm's failure is the
+poison surviving the clear and not the clear breaking the path.
+
+**The whole allocation is exonerated in one run.** That is the point of spending a build on a
+bisection instrument rather than another black-box arm: the negative result removes nine regions at
+once, including the one every previous section had been pointing at.
+
+**What is left, and the shape it has to fit.** The carrier must be server-lifetime (not
+per-sequence), shared between the ordinary program and its row-split sibling, and **written once by
+whichever of the two first uses the 8192 bucket and never revised after** — `rbfault12` showed that
+once a row-band request has run first, later ordinary requests no longer poison anything, so it is
+first-touch and not last-writer. Three candidates remain: the interpreter activation tensors, the
+VMM-backed KV, and the peer reduction slots. So does the prefix cache, which has the right shape and
+is the only one never actually measured: `rbfault10` and `rbfault11` both tried
+`PLOW_PREFIX_CACHE=0` and both arms were void, each dying at load with
+`hsa_amd_memory_pool_allocate(1207959552 bytes)` → `HSA_STATUS_ERROR_OUT_OF_RESOURCES` seconds after
+a previous server was killed. Queued as `rbfault17-prefixcache`, which runs the cache-off arm FIRST
+on a cold machine so that a load failure there is itself a readable answer — an allocation-plan
+defect independent of VRAM pressure — rather than another void arm.
+
+Worth keeping straight: this is not a test of whether prefix REUSE corrupts the chunk. That is
+already answered no, twice — `rbfault10` showed no prefix is attached to the failing request (it
+runs `program=4 c0=0 clen=8192`, the full chunk), and `rbfault11` showed a preceding 4096 whose
+needle sits at row 0, sharing no prefix at all, poisons identically.
+
 ## The tile-campaign blocker resolves into three classes with three different owners (2026-09-14, job `gemmtune-glm53`, follow-up)
 
 The section above records 374 FAIL lines over 44 objects and stops at "it wants an owner". Building
