@@ -1,0 +1,21 @@
+{
+  "_arch": "gfx942",
+  "gemma12_gemv_glu_generic_un6": {
+    "no_scratch": true,
+    "require_min": {
+      "v_pk_fma_f32": 48
+    }
+  },
+  "gemma12_gemv_glu_runtime_un8": {
+    "scratch_max": 4,
+    "require_min": {
+      "v_pk_fma_f32": 64
+    }
+  },
+  "gemma12_gemv_glu_native_un8": {
+    "no_scratch": true,
+    "require_min": {
+      "v_pk_fma_f32": 64
+    }
+  }
+}

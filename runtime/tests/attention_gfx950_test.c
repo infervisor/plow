@@ -7,8 +7,10 @@
  *   decode  hd=256 / hd=512, split-KV + merge
  *
  * PLOW_ATTN_BENCH=1 skips the CPU oracle and times the isolated prefill wrapper. Select the
- * rung with PLOW_ATTN_HD, PLOW_ATTN_NQ, PLOW_ATTN_NSPLIT, PLOW_ATTN_WARMUP, and
- * PLOW_ATTN_ITERS. The default is Gemma HD512 at 2048 rows and eight KV splits.
+ * rung with PLOW_ATTN_HD, PLOW_ATTN_NQ, PLOW_ATTN_HEADS, PLOW_ATTN_KV_HEADS,
+ * PLOW_ATTN_WINDOW, PLOW_ATTN_NSPLIT, PLOW_ATTN_WARMUP, and PLOW_ATTN_ITERS.
+ * PLOW_ATTN_OBJECT can select a standalone candidate object. The default is Gemma HD512 at
+ * 2048 rows and eight KV splits.
  *
  * The reference is written from HF `modeling_gemma4.py` semantics, not from the
  * kernel: scale = 1.0 (there is NO 1/sqrt(head_dim)), causal is kv <= q, and the
@@ -127,7 +129,7 @@ static unsigned env_u32(const char* name, unsigned fallback) {
 static int bench_prefill(plow_hsa_kernel* k, unsigned ncu, unsigned hd, unsigned n_q,
                          unsigned n_head, unsigned n_kv_head, unsigned window,
                          unsigned nsplit, unsigned warmup, unsigned iters) {
-    if (!n_q || !nsplit || !iters) return 2;
+    if (!n_q || !n_head || !n_kv_head || n_head % n_kv_head || !nsplit || !iters) return 2;
     const unsigned n_kv = n_q;
     const size_t nq = (size_t)n_q * n_head * hd;
     const size_t nkv = (size_t)n_kv * n_kv_head * hd;
@@ -329,14 +331,70 @@ int main(void) {
     plow_hsa_device_info(H, 0, nm, &cus, &lds);
     printf("dev0: %s  CUs=%u  LDS=%u B\n\n", nm, cus, lds);
 
-    FILE* f = fopen("test_kernels.elf", "rb");
-    if (!f) { perror("test_kernels.elf"); return 1; }
+    const char* object = getenv("PLOW_ATTN_OBJECT");
+    if (!object) object = "test_kernels.elf";
+    FILE* f = fopen(object, "rb");
+    if (!f) { perror(object); return 1; }
     fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
     void* co = malloc(n);
     if (fread(co, 1, n, f) != (size_t)n) return 1;
     fclose(f);
     if (plow_hsa_load_code_object(H, 0, co, n) != 0) {
         fprintf(stderr, "load: %s\n", plow_hsa_last_error()); return 1;
+    }
+
+    if (getenv("PLOW_ATTN_BENCH")) {
+        const unsigned hd = env_u32("PLOW_ATTN_HD", 512);
+        const unsigned n_q = env_u32("PLOW_ATTN_NQ", 2048);
+        const unsigned n_head = env_u32("PLOW_ATTN_HEADS", 8);
+        const unsigned n_kv_head = env_u32("PLOW_ATTN_KV_HEADS", hd == 512 ? 1 : 4);
+        const unsigned window = env_u32("PLOW_ATTN_WINDOW", hd == 512 ? 0 : 1024);
+        const unsigned nsplit = env_u32("PLOW_ATTN_NSPLIT", 8);
+        const unsigned warmup = env_u32("PLOW_ATTN_WARMUP", 3);
+        const unsigned iters = env_u32("PLOW_ATTN_ITERS", 10);
+        const char* symbol = hd == 256 ? "gemma_flash_prefill_256"
+                           : hd == 512 ? "gemma_flash_prefill_512"
+                                       : NULL;
+        plow_hsa_kernel kernel;
+        if (!symbol || plow_hsa_get_kernel(H, 0, symbol, &kernel)) {
+            fprintf(stderr, "unsupported bench hd=%u: %s\n", hd, plow_hsa_last_error());
+            return 2;
+        }
+        const int rc = bench_prefill(&kernel, cus, hd, n_q, n_head, n_kv_head, window, nsplit,
+                                     warmup, iters);
+        plow_hsa_shutdown(H);
+        return rc;
+    }
+
+    if (getenv("PLOW_ATTN_CHECK")) {
+        const unsigned hd = env_u32("PLOW_ATTN_HD", 512);
+        const unsigned n_q = env_u32("PLOW_ATTN_NQ", 300);
+        const unsigned n_head = env_u32("PLOW_ATTN_HEADS", 8);
+        const unsigned n_kv_head = env_u32("PLOW_ATTN_KV_HEADS", hd == 512 ? 1 : 4);
+        const unsigned window = env_u32("PLOW_ATTN_WINDOW", hd == 512 ? 0 : 1024);
+        char prefill_symbol[64], merge_symbol[64], label[96];
+        if (!n_q || !n_head || !n_kv_head || n_head % n_kv_head) {
+            fprintf(stderr, "invalid check geometry: n_q=%u heads=%u kv_heads=%u\n", n_q,
+                    n_head, n_kv_head);
+            return 2;
+        }
+        snprintf(prefill_symbol, sizeof(prefill_symbol), "gemma_flash_prefill_%u", hd);
+        snprintf(merge_symbol, sizeof(merge_symbol), "gemma_flash_merge_%u", hd);
+        plow_hsa_kernel prefill, merge;
+        if ((hd != 256 && hd != 512) ||
+            plow_hsa_get_kernel(H, 0, prefill_symbol, &prefill) ||
+            plow_hsa_get_kernel(H, 0, merge_symbol, &merge)) {
+            fprintf(stderr, "unsupported check hd=%u: %s\n", hd, plow_hsa_last_error());
+            return 2;
+        }
+        for (unsigned nsplit = 1; nsplit <= 8; nsplit *= 2) {
+            snprintf(label, sizeof(label), "hd=%u n_q=%u window=%u nsplit=%u", hd, n_q,
+                     window, nsplit);
+            prefill_case(&prefill, &merge, cus, label, hd, n_q, n_q, n_head, n_kv_head,
+                         window, nsplit);
+        }
+        plow_hsa_shutdown(H);
+        return fails ? 1 : 0;
     }
 
     plow_hsa_kernel p128, m128;
@@ -365,20 +423,6 @@ int main(void) {
     }
     printf("prefill_256 LDS=%uB  prefill_512 LDS=%uB\n\n", p256.group_segment_size,
            p512.group_segment_size);
-    if (getenv("PLOW_ATTN_BENCH")) {
-        const unsigned hd = env_u32("PLOW_ATTN_HD", 512);
-        const unsigned n_q = env_u32("PLOW_ATTN_NQ", 2048);
-        const unsigned nsplit = env_u32("PLOW_ATTN_NSPLIT", 8);
-        const unsigned warmup = env_u32("PLOW_ATTN_WARMUP", 3);
-        const unsigned iters = env_u32("PLOW_ATTN_ITERS", 10);
-        int rc = 2;
-        if (hd == 512)
-            rc = bench_prefill(&p512, cus, hd, n_q, 8, 1, 0, nsplit, warmup, iters);
-        else if (hd == 256)
-            rc = bench_prefill(&p256, cus, hd, n_q, 8, 4, 1024, nsplit, warmup, iters);
-        plow_hsa_shutdown(H);
-        return rc;
-    }
     srand(13);
 
     /* D=128 (Llama/Qwen), full causal. Previously UNCOVERED — the golden suite only had
