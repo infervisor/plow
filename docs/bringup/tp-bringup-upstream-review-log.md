@@ -1308,6 +1308,96 @@ analytical cost model at tier `portable` against a demand of 40 shipping shapes 
 it requires building the objects the campaign then measures, and that build is refused at HEAD.
 Until the spill and scratch regressions are explained or fixed, the tile cell stays stale.
 
+## The row-band poison has a threshold, and it sits between 2048 and 4096 tokens (2026-09-14, jobs `rbfault13-firsttouch`, `rbfault14-threshold`)
+
+Two probes, six curve points, one reversal. Each arm is a FRESH server: one first request of the
+stated length, then the same 8192-token needle request, concurrency 1, zero fault lines throughout.
+
+| first request | program it runs | then 8192 |
+|---|---|---|
+| 128 | — | **3/3 pass** |
+| 512 | — | **3/3 pass** |
+| 2048 | — | **3/3 pass** |
+| 4096 | 3 (ordinary) | **0/3 FAIL** |
+| 8100 | 3 (ordinary, ~full row count) | **0/3 FAIL** |
+| 8192 | 4 (row-split sibling) | **3/3 pass** |
+
+**`rbfault13` was designed to separate the program from the row count, and it did.** A first
+request of 8100 tokens is within one percent of 8192, so it carries essentially the same row
+count, but `rowsplit_chunk_prog` takes the row-split sibling only when `step.clen == bucket_rows`
+and 8100 is not 8192 — so it runs the ordinary program 3. It poisons exactly like 4096. Among the
+POISONING lengths, therefore, the row count is irrelevant and the program decides. Both controls
+landed (8192 first passes 3/3, 4096 first fails 0/3), so the discriminating arm is readable.
+
+**`rbfault14` then overturned the obvious generalisation.** "Any program-3 execution poisons,
+however small" predicts that 128 tokens poison. They do not, and neither do 512 or 2048. So the
+harmless lengths are not harmless because they take a different program by construction — they are
+harmless because they are SMALL, and the boundary lies somewhere in `(2048, 4096]`.
+
+**The two readings that survive, and they put the fix in different places.**
+
+* *Bucket admission.* A 2048-token prompt may never reach the sparse 8192 bucket at all, taking a
+  smaller prefill rung, so no program-3 execution touches the shared sparse-MLA workspace and there
+  is nothing to poison. Then the boundary is an artefact of rung admission, the rule stays "any
+  program-3 execution IN THE 8192 BUCKET poisons", and the target is whatever that path writes, at
+  any size.
+* *Volume.* A 2048-token prompt does run program 3 in the 8192 bucket and is still harmless. Then
+  the size of the first request genuinely matters, the stale-tail reading survives, and the boundary
+  names how far past its own writes the row-band read runs.
+
+Neither probe recorded which program and bucket the harmless 2048 request actually took, which is
+exactly what separates them. Queued as `rbfault15-bucket`: two `PLOW_PREFILL_SEG_TIMING=1` arms that
+print `program/bucket/c0/clen` for a lone 2048 and a lone 4096 request, plus a 3072-then-8192 pair
+with segment timing OFF to bisect the boundary on the pass/fail axis. Segment timing takes the other
+branch in `amd_tp.rs`, so it is kept off the arm that judges correctness.
+
+**What this does not change.** The defect is still not a memory-safety bug (per-segment drain
+removes the APERTURE_VIOLATION and leaves the answer garbage), still deterministic at C1 with the
+first chunk at `c0 = 0` already wrong, and still unrelated to the band decomposition, the band seam,
+prefix attach or prefix sharing — all falsified earlier and not retried.
+
+## The tile-campaign blocker resolves into three classes with three different owners (2026-09-14, job `gemmtune-glm53`, follow-up)
+
+The section above records 374 FAIL lines over 44 objects and stops at "it wants an owner". Building
+two earlier trees with the same nix toolchain names the owners. Both builds are plain
+`build_gfx942.sh` runs from `git archive` exports on `/workspace`, `JOBS=8`, no other change.
+
+| build | geometry FAILs | scratch-budget FAILs | K3 MoE spill FAILs |
+|---|---|---|---|
+| HEAD | 360 | 6 | 8 |
+| `3d54bd95` (parent of `f89d3a5c`) | **0** | **0** | 8 |
+| `ee624310` (the last re-bless, 2026-09-11) | **0** | **0** | 8 |
+
+**Class 1 — the nine geometry knobs are bookkeeping, and they are one day old.** No profile in the
+committed baseline carries `GM_C5_*`, `GM_C8_*` or `GM_WD_*`; all eight profiles hold 86 keys and
+none of them is one of the nine. Upstream `f89d3a5c` ("Enable split attention in unified token
+batches", 2026-09-14 04:47) is what added them to `runtime/amd/geom_contract.h`, three days after the
+last bless. This class is a stale baseline and nothing else; re-blessing it is correct.
+
+**Class 2 — the scratch-budget regressions belong to `f89d3a5c` too.** `interp_prefill_k3` at 2632
+scratch ops against a budget of 1957 (+675, +35 %), `interp_prefill_k3_gq` at 2628 against 1953, and
+`interp_prefill_fp8kv_mla` / `interp_prefill_mla_moe` over by single digits. All six are absent at
+`3d54bd95` and appear at HEAD, so the same commit that changed `interp.hip`, `op_gemm_common.h` and
+`amd_common.h` is what moved them. This is a real regression with a name on it, one day old, and
+blessing it would be absorbing it.
+
+**Class 3 — the K3 MoE expert spills predate the last bless.** `d_moe_expert_glu_fp8_blk` at 105
+spill instructions and `d_moe_expert_down_fp8_blk` at 80, across four decode objects, are present
+at HEAD, at `3d54bd95`, AND at `ee624310` — identical counts in all three. These come from
+`no_scratch` in `scripts/asm_expect_gfx942.json`, a hand-written rule whose note reads "Both bodies
+must remain spill-free", landed 2026-08-11 and untouched since 2026-09-08. So the rule already
+failed when the baseline was last re-blessed on 2026-09-11, and `--bless` cannot silence it: it is
+an expect rule with no baseline row, checked on every object regardless of axes. The K3 MXFP4
+decode experts have been spilling to scratch through at least one bless, in a GLM decode path, and
+nobody has been building gfx942 objects often enough to see it.
+
+**What this means for the campaign.** The gate that blocks it is class 3, which is the oldest of the
+three and the only one `--bless` cannot touch. Classes 1 and 2 are both one commit old and both
+attributable. The tile cell is still stale for the reason already recorded — 4961 records over 14
+older digests, none keyed to the current family, 40 shipping shapes at 0 HIT, tier `portable`.
+
+Artefacts on `/workspace`: `objcontract-c08d1232/parent-build.log` and `.../bless-build.log`.
+
 ## MTP takes isl8192 C1 decode to 16.35 ms, and the T3 gate is red for two unrelated reasons (2026-09-14, job `spec-t3`)
 
 Three arms (ctrl / treat / ctrl2), 69.8 min, `spec_t3.py` scoring. Both controls pinned tight, so
