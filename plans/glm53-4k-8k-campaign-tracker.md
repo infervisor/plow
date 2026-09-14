@@ -424,6 +424,50 @@ configuration: spawn failed`. That was the harness, not the port -- `PLOW_VERIFY
 checkpoint K could not spawn the Lean verifier. stageD is required here; stageC rejects rule names
 this tree carries.
 
+## Toward 490 ms: the qualified emit levers stack in one packet (2026-09-14)
+
+The goal moved from 550 to 490 ms. Row-band alone puts the served `isl8192-c1` median at 529.5, so
+another ~40 ms has to come from somewhere, and landing levers one at a time cannot get there before
+the serving-set regenerations pile up. The alternative is one regeneration carrying every lever that
+is already qualified. Checkpoint K runs per emit, so whether they can coexist is answerable on CPU
+before any object is built -- and they can:
+
+| emit | packet | stamp | size |
+|---|---|---|---:|
+| knob-off baseline | `8b15f4a28b289a72` | `0x164ae4a829ecebec` | 252.98 MB |
+| row-band only | `b73d4440c2814625` | `0xcb199ced952dd0cd` | 274.49 MB |
+| G4+G3+G5+fusepost | `adb919ca12df9c56` | `0xdd1caa721c7f7a8f` | 245.91 MB |
+| the same + row-band | `9e76b70bf97ee4a6` | `0xa62d50f49ecc4f9a` | 265.60 MB |
+
+Both stacked emits returned rc=0: `PLOW_GLM_MOE_SHARED_SEED` (G4, P certificate accepted, -8.6 at
+P8192-0), `PLOW_GLM_MOE_NATIVE_ALIGN` + `PLOW_GLM_FUSE_SEAM_RN` (G3+G5, T4 PASS and retrieval 39/39
+on 2026-09-14) and `PLOW_GLM_FUSE_POST` (-4.1, bit-exact) coexist, and coexist with
+`PLOW_GLM_ROWBAND_ATTN`.
+
+The sizes are a useful cross-check rather than noise: the stack is 7.1 MB SMALLER than the knob-off
+baseline, which is what fusions should do -- G3's native align, G5's fused Residual+RmsNorm and
+fusepost's GEMM+q-RoPE each collapse ops -- while row-band adds about 20 MB of siblings in both
+variants, matching its T1 program counts.
+
+Predicted path to 490 from the 529.5 row-band figure, all from measured work:
+
+| step | ms | cumulative |
+|---|---:|---:|
+| the stack above (G4 -8.6, G3 ~-5, G5 ~-2.3...-3.3, fusepost -4.1) | ~-20 | ~510 |
+| router overlap L1 (T3 PASS; patch not yet in-tree) | -11.2 | ~499 |
+| packproj, once the Tensile epilogue removes its out-of-GEMM ColSplit copy | -8 | ~491 |
+| row-split salvage A (union in its own segment) | -6.6 | ~484 |
+
+Independence is a prediction, not a measurement: row-band deletes ATTENTION collectives (the Q/O
+all-to-all and the o_proj reduce-scatter) while router overlap targets the MoE hidden all-gather, and
+G3/G4/G5 are MoE and glue, so they act on different structures. The stacked T4 is what tests it.
+`PLOW_GLM_ROUTER_OVERLAP` is not in-tree yet; its landing patch is
+`/workspace/agband-c08d1232/router-overlap-on-2655520b.patch`, verified to apply clean to main.
+
+Note the wildcard that sits under all of these: every emit here reports `ALL dense-GEMM tile(s)
+chosen by the ANALYTICAL MODEL ... tier portable, which is what it reports when no campaign has ever
+run`. The whole ladder is being measured on unmeasured tiles.
+
 ## Rejected or parked
 
 | candidate | reason |
