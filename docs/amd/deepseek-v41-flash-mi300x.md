@@ -284,6 +284,23 @@ piece of the V4.1 attention/FFN block to an existing `DevOp` or marks it new.
 5. **Grouped output LoRA.** `wo_a` is block-diagonal over `o_groups=8`, done as
    an einsum because a plain Linear is wrong (`model.py:786`). A grouped GEMM;
    the MoE group ops are the closest existing shape but are expert-indexed.
+
+   **This does NOT gate a prefill emit (2026-09-14).** As written the item reads
+   as blocking item 3 of section 5.6's critical path, and it does not.
+   Block-diagonal over 8 groups *is* 8 ordinary GEMMs -- `wo_a` is `[8192, 4096]`
+   = 8 stacked `[o_lora_rank, heads/o_groups * head_dim]` = `[1024, 4096]`
+   blocks, so group `g` is `[T, 4096] x [4096, 1024]` and nothing fuses them but
+   dispatch count. At T=8192 ONE of those fills 304 CUs. The fused kernel earns
+   its keep at **decode**, where T=1 turns the same work into 8 tiny GEMVs and
+   the 8 dispatches are the entire cost. So: emit 8 GEMMs, measure, and write the
+   grouped kernel against the decode number rather than ahead of it.
+
+   Worth having sized while looking, because it is bigger than this doc has been
+   treating it: `wo_a` is 549.8 GFLOP/layer and `wo_b` 687.2, so together they
+   are **49.5 TFLOP of the 281.6 TFLOP 8k prefill -- 17.6%**. `o_groups *
+   o_lora_rank` = 8192 is wider than `hidden` itself, and the output projection
+   is consequently a first-order term in section 9's budget, not a detail.
+
 6. **`sparse_attn` operand shape.** `FlashGather*` is MLA-shaped
    (`Qabs`/`Qrope`/`Ckv`/`Krope`). V4.1 concatenates window KV and compressed
    KV into ONE cache and one index list (`model.py:781-783`), over a flat
@@ -620,10 +637,30 @@ because getting one wrong compiles, runs, and is a different model:
   are masked, and the test asserts the masked token comes back bit-identical
   rather than merely close.
 
-What is still missing for Engram is stage 1's host side: the compressed-token
-map, the per-layer hash multipliers and the prime bucket ranges, all built from
-the tokenizer at load time, plus the per-step cache that lets an n-gram look
-back across the prefill/decode split. No new math, and no kernel.
+What is still missing for Engram is narrower than it was. The per-layer hash
+multipliers and the prime bucket ranges have LANDED, in
+`DeepSeekV41Config::engram_hash_tables` -- see item 2 of the ordered path below
+for why the primes are derived and the multipliers are not. What remains is the
+compressed-token map and the per-step cache that lets an n-gram look back across
+the prefill/decode split. No new math, and no kernel.
+
+The token map is a PORT rather than a reimplementation, and that is worth
+stating because it looks like the opposite. `build_compressed_token_map` runs
+every token id through a `tokenizers` normalizer sequence -- NFKC, NFD,
+StripAccents, Lowercase, two regex Replaces around a private-use sentinel, Strip
+-- and collapses ids whose normalized text agrees, which is what makes `" The"`,
+`"the"` and `"THE"` hash alike. Python's `tokenizers` **is** the Rust crate
+plowrt already vendors behind the `hf-tokenizer` feature, and every one of those
+normalizers exists there under the same name, so the sequence transcribes. The
+one trap is the sentinel: a token that is exactly one space must survive `Strip`,
+which is why the reference swaps it for `\ue000` and back.
+
+Two invariants the map has to preserve, both load-bearing: the resulting vocab
+size must equal `engram_compressed_vocab_size` (99 092) because **every hash
+multiplier is derived from it** -- a mismatch silently rehashes the whole table
+rather than failing -- and a partial UTF-8 byte token (one whose decode contains
+`\ufffd`) is keyed by its RAW token string instead of its normalized text, since
+there is nothing there to normalize.
 
 **Engram is a CAPACITY problem, not a bandwidth one.** From the checkpoint:
 
@@ -734,15 +771,33 @@ So the ordered critical path to an 8k/90 ms number is:
 
 1. ~~opcodes + dispatch for `d_compress_pool` and `d_rope_inverse_o`~~ -- DONE
    (ops 180/181, verified on gfx942 hardware);
-2. ~~Engram: kernel, opcode, test~~ -- DONE for the device side (ops 182/183).
-   What remains is stage 1's host side: the compressed-token map, the per-layer
-   hash multipliers and the prime bucket ranges, all built from the tokenizer at
-   load time, plus the cache that lets an n-gram look back across the
-   prefill/decode split;
+2. ~~Engram: kernel, opcode, test~~ -- DONE for the device side (ops 182/183),
+   and the **hash tables are now done too**. The prime bucket ranges are
+   DERIVED (`DeepSeekV41Config::engram_hash_tables`) by a trial-division walk
+   that mirrors the reference's global `seen` set, and the derivation proves
+   itself: the ranges are laid end to end, so each layer's primes must sum to
+   its `engram_num_embeddings`, and both do exactly (384 006 168 and
+   384 016 682). `validate()` asserts it, so a drifting walk cannot reach a
+   lookup. The MULTIPLIERS are constants and deliberately so -- they come from
+   numpy's PCG64 via `np.random.default_rng(10007 * layer_id)`, reproducing
+   that bit-exactly in Rust fails SILENTLY (every hash merely comes out wrong),
+   and the draw is eight numbers. Any other V4.1 checkpoint gets `None` rather
+   than a guess. What remains of stage 1's host side is the compressed-token map
+   -- a direct PORT, not a reimplementation, since Python `tokenizers` *is* the
+   Rust crate plowrt already vendors behind `hf-tokenizer` and the normalizer
+   sequence (NFKC / NFD / StripAccents / Lowercase / Replace / Strip) exists
+   there under the same names -- plus the per-step cache that lets an n-gram
+   look back across the prefill/decode split;
 3. a `deepseek_v41` claim in `devgen::run_verified` with `--block` emit, the
    pattern every family since M3 has started from -- V4.1's config/tensor
    binding is the substance here, since `hc_mult = 4` puts mHC on EVERY layer
-   and there is no mHC-free block to extract;
+   and there is no mHC-free block to extract. **The binding half has landed**
+   (`crates/devgen/src/mla/dsv41.rs`): the geometry resolves through nn-graph's
+   verified parser, and every layer-0 attention shape is cross-checked against
+   the shards, which is how the absorbed-MLA fact in section 7 and the output-LoRA
+   correction in section 5.2 were found. A tensor's ABSENCE is never evidence
+   there -- a download may be partial -- so only a contradiction is reported.
+   What remains of item 3 is the emit itself;
 4. CSA2 emit (ops 180/181) and the two-level indexer in the block path. mHC
    comes along with the `glm53` emit, per the table above;
 5. full-model emit -- fork `glm53_emit_full` rather than writing one, since it
@@ -876,6 +931,19 @@ dequantizes on the way to the reference implementation, so reading dtypes off
 | `ffn.gate.bias` / `.bias_vl` | F32 | `[384]` | `bias_vl` is the image-span routing bias |
 | `embed.weight` | BF16 | `[129280, 5120]` | |
 | `vision.blocks.{B}.mlp.w1.weight` | BF16 | `[5632, 1024]` | 5632 = 2 x 2816 — fused gate+up |
+
+**There is no `kv_b` tensor, and that is the shape of the attention.** `wkv` is
+`[512, 5120]` and nothing in the 48 shards splits it -- so V4.1's MLA is FULLY
+ABSORBED: one 512-wide latent per token, shared by all 64 heads
+(`num_key_value_heads = 1`), serving as both K and V. `head_dim = 512` is
+therefore the latent width AND the full per-head q width (`wq_b` is
+`[64 * 512, 1280]`), the softmax scale is `head_dim ** -0.5` over the whole 512
+rather than over the 64 rotated dims, and the latent is REPLICATED under TP
+rather than sharded. The config does not say any of this; reading the 512 as V4's
+split latent emits a blob that loads and runs. `devgen`'s `mla::dsv41` now
+cross-checks every one of these layer-0 shapes against the shards and refuses
+loudly on a contradiction -- an absent tensor proves nothing (a download may be
+partial), so only a disagreement is reported.
 
 Two encodings therefore live in one layer, as in V4: routed experts are
 nibble-packed fp4 with an E8M0 scale per 32 along K, while every projection
