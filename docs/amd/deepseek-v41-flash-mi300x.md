@@ -500,3 +500,44 @@ No V4.1 reference exists on this box (§4), so "300 ms" cannot yet be checked
 against a second implementation. Until a container runtime or a source-built
 vLLM >= 0.30 lands, a plow number at 8k is unfalsified rather than validated,
 and should be reported that way.
+
+---
+
+## 10. Correction: the serving path is devgen, not the nn-graph builder
+
+§3 lists the bringup stages against `nn-graph`, which is right for the
+documented harness and wrong as a description of what serves a token. Checked
+rather than assumed:
+
+* `crates/devgen/Cargo.toml` has **no `nn-graph` dependency**. devgen reads
+  `model_type` out of the checkpoint's `config.json` itself
+  (`devgen/src/lib.rs:7412`) and emits a packet program from it.
+* `rewrite` is a devgen **dev-dependency**, so saturation never runs in the
+  emit path (§8).
+* GLM-5.3 and Kimi-K3 are emitted this way. `config/mod.rs` says so for K3:
+  "emitted by `devgen`, which does not go through this crate at all".
+
+So the served path is `plowc --hf-dir <ckpt> --emit devblob` -> devgen ->
+`model.pkt` -> `plowrt serve`. nn-graph + rewrite is the analysis/JIT side: it
+is what Stages 1-3 gate on, and it is where the weight manifest, the shape
+contract and the fusion decisions come from, but a V4.1 graph that builds does
+NOT by itself serve anything.
+
+### What that means for the 8k/300 ms goal
+
+devgen's DeepSeek support is `MlaArch::DeepSeek` (`devgen/src/mla.rs:10164`),
+which covers V2/V3-style MLA + MoE and is shared with the GLM and Kimi paths.
+V4.1's block is not that shape — a 512-wide MQA latent, a grouped output LoRA,
+CSA2's shared cache, mHC instead of a residual add. `mla.rs` is ~10 k lines for
+the MLA family it already serves, which is the honest scale of a V4.1 emitter.
+
+The §9 item list therefore needs one more entry, and it is the largest:
+
+| # | Piece | Scale |
+|---|---|---|
+| 7 | a devgen emitter for `deepseek_v41` | the dominant item; compare `mla.rs` at ~10 k lines for the MLA family |
+
+Items 1-6 remain worth doing in order — the IR ops and the shape contract are
+what the emitter is written against, and the object contract in §7 is what it
+binds. But "run V4.1 end to end" is gated on item 7, and no amount of
+nn-graph work reaches a served token without it.
