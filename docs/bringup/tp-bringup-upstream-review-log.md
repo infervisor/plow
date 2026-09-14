@@ -930,6 +930,39 @@ both fault => the C20 retrieval path owns it; neither => intermittent, needs rep
 **Until this resolves, row-band is not a default candidate**, and the stacked T4 result that rests
 on it (`-8.86 ms` at isl8192 C1) is provisional at depth.
 
+### The first A/B was VOID — it produced no null (2026-09-14, job `0-rbfault-probe`)
+
+Both arms faulted, and that reads as "not row-band" only if the `off` arm actually turned row-band
+off. **It did not.** The probe ran `lever-hunt-c08d1232/bin-rb/plowrt`, the binary the original job
+used, and that build predates the RUNTIME serve gate:
+
+```
+strings bin-rb/plowrt         | grep -c PLOW_GLM_ROWBAND  ->  4   (all *_ATTN, the EMIT knob)
+strings target/release/plowrt | grep -c PLOW_GLM_ROWBAND  ->  6   (adds the serve gate)
+```
+
+So `PLOW_GLM_ROWBAND=0` was a no-op and **both arms logged `row-split sibling selected prog=4`**.
+The design error is mine: the gate-off load path (`rowband_on || !rb_twin[id]`) was verified in
+CURRENT source, then exercised with the OLDER pinned binary. Nothing about causation follows from
+that run, in either direction.
+
+What it did establish, and this is worth keeping:
+
+* **The fault is reliably reproducible — four runs for four**, always under `quality.py --suite all
+  --concurrency 20`, always after the same rung walk (`rung=20 occupied=17` → `rung=8 occupied=4` →
+  `admission 20→16 at occupied_extent=19`). A deterministic repro makes the next A/B decisive
+  rather than a coin flip.
+* **Three signatures, all memory-safety class**: `HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION`
+  (`rb-retrieval`); `Memory access fault by GPU node-11 on address 0x7ef1a4199000` (v1 on);
+  `HSA_STATUS_ERROR_EXCEPTION`, an HSAIL hardware exception (v1 off).
+
+`rbfault/probe2.sh` (job `0-rbfault2`) redoes it on the CURRENT binary and the CURRENT stack packet
+`9e76b70bf97ee4a6` — the pair `conc-probe` already drove C1..C128 with zero server errors, so a
+fault under this harness is the workload's doing and not a load mismatch. Two guards this time: a
+preflight that refuses any plowrt without the serve gate, and a per-arm assertion that the sibling
+line appears exactly when the knob says it should, reporting an arm INVALID rather than scoring it.
+That assertion is precisely what v1 lacked.
+
 ## Every gfx942 GEMM tile is chosen by the analytical model, and 4961 measured records sit unused (2026-09-14)
 
 `plowc tune status --gpu MI300X` states it directly:
