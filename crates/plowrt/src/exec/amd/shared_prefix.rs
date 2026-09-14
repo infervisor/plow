@@ -388,6 +388,9 @@ impl SharedPrefix {
             );
             if crate::config::RuntimeConfig::get().vmm_deferred_reclaim() {
                 pool.enable_deferred_reclaim();
+                if crate::config::RuntimeConfig::get().vmm_release_retire() {
+                    pool.enable_release_retire();
+                }
             }
             if let Some(min_free) = crate::config::RuntimeConfig::get().vmm_cache_min_free_bytes() {
                 pool.enable_pressure_eviction(min_free);
@@ -455,6 +458,7 @@ impl SharedPrefix {
         let _ = self.flush_publish();
         for group in &self.groups {
             group.pool.release_prefix(slot);
+            group.pool.retire_released(slot);
         }
     }
 
@@ -1307,9 +1311,13 @@ mod tests {
         let layout = Layout::from_tensors(&tensors(), 3, 256).unwrap();
         let budget = (512 + 128 + 256) * 256;
         let mut cache = SharedPrefix::new(ops.clone(), layout, 0, budget).unwrap();
+        // The release-retire default maps its spare copy targets at load, off the reuse pool: no
+        // window or cache block exists yet and nothing is pooled.
+        cache.sync_reclaim();
+        let spares: u64 = cache.groups.iter().map(|g| g.pool.stats().blocks_created).sum();
         assert!(cache.groups.iter().all(|g| {
             let stats = g.pool.stats();
-            stats.blocks_created == 0 && stats.blocks_live == 0 && stats.blocks_pooled == 0
+            stats.blocks_live == 0 && stats.blocks_pooled == 0
         }));
         cache.ensure_rows(0, 256).unwrap();
         let created: u64 = cache
@@ -1337,7 +1345,7 @@ mod tests {
         cache.begin_slot(0).unwrap();
         cache.ensure_rows(0, 256).unwrap();
         assert_eq!(stat(&cache, |s| s.blocks_created), created);
-        assert_eq!(stat(&cache, |s| s.blocks_reused), created - kept);
+        assert_eq!(stat(&cache, |s| s.blocks_reused), created - spares - kept);
         drop(cache);
         let memory = ops.0.lock().unwrap();
         assert!(memory.blocks.is_empty());

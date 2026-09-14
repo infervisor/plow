@@ -563,3 +563,399 @@ fn small_vmem_handles_probe_sub_granule_sharing() {
         );
     }
 }
+
+/// `AmdTp::begin_slot`'s shared column-0 swap at GLM-5.3 TP8 shape (78 cache tracks per rank: unmap
+/// the shared block, map a private one, set_access), on every device one after another vs one
+/// thread per device in one process. Decides whether the ranks' VMM work can run in parallel or
+/// whether ROCr/KFD serializes it process-wide. `PLOW_VMM_PROBE_NGPU=8`.
+#[test]
+fn vmem_swap_serial_vs_parallel_across_devices() {
+    if !gpu_enabled() {
+        eprintln!("skipped: set PLOW_GPU_TEST=1");
+        return;
+    }
+    let n: u8 = std::env::var("PLOW_VMM_PROBE_NGPU").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    if n < 2 {
+        eprintln!("skipped: set PLOW_VMM_PROBE_NGPU >= 2");
+        return;
+    }
+    let _env = common::env_guard();
+    let blocks = 78u64;
+    let mut bes = vec![backend_arc()];
+    for d in 1..n {
+        bes.push(std::sync::Arc::new(HsaBackend::new(d).expect("device")));
+    }
+    let gran = VmmOps::granularity(&*bes[0]).expect("granularity");
+    struct Dev {
+        va: u64,
+        sets: [Vec<u64>; 2],
+        cur: usize,
+    }
+    let mut devs: Vec<Dev> = bes
+        .iter()
+        .map(|be| {
+            let va = VmmOps::reserve(&**be, blocks * gran).expect("reserve");
+            let sets = [0, 1].map(|_| {
+                (0..blocks).map(|_| VmmOps::create(&**be, gran).expect("create")).collect::<Vec<_>>()
+            });
+            for (i, &h) in sets[0].iter().enumerate() {
+                VmmOps::map(&**be, va + i as u64 * gran, gran, h).expect("map");
+                VmmOps::set_access(&**be, va + i as u64 * gran, gran).expect("set_access");
+            }
+            Dev { va, sets, cur: 0 }
+        })
+        .collect();
+    // (unmap µs, map+set_access µs) summed over the device's blocks.
+    fn swap(be: &HsaBackend, dev: &mut Dev, blocks: u64, gran: u64) -> (f64, f64) {
+        let next = 1 - dev.cur;
+        let (mut un, mut mp) = (0.0, 0.0);
+        for i in 0..blocks {
+            let va = dev.va + i * gran;
+            let t = Instant::now();
+            VmmOps::unmap(be, va, gran);
+            let t1 = Instant::now();
+            VmmOps::map(be, va, gran, dev.sets[next][i as usize]).expect("map");
+            VmmOps::set_access(be, va, gran).expect("set_access");
+            un += (t1 - t).as_secs_f64() * 1e6;
+            mp += t1.elapsed().as_secs_f64() * 1e6;
+        }
+        dev.cur = next;
+        (un, mp)
+    }
+    let per_call = |v: &[(f64, f64)]| {
+        let calls = (v.len() as u64 * blocks) as f64;
+        (v.iter().map(|x| x.0).sum::<f64>() / calls, v.iter().map(|x| x.1).sum::<f64>() / calls)
+    };
+    let (mut serial, mut parallel) = (Vec::new(), Vec::new());
+    for round in 0..8 {
+        let t = Instant::now();
+        let s: Vec<_> = bes.iter().zip(devs.iter_mut()).map(|(be, dev)| swap(be, dev, blocks, gran)).collect();
+        let serial_ms = t.elapsed().as_secs_f64() * 1e3;
+        let t = Instant::now();
+        let p: Vec<_> = std::thread::scope(|sc| {
+            let hs: Vec<_> = bes
+                .iter()
+                .zip(devs.iter_mut())
+                .map(|(be, dev)| sc.spawn(move || swap(be, dev, blocks, gran)))
+                .collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let parallel_ms = t.elapsed().as_secs_f64() * 1e3;
+        let (su, sm) = per_call(&s);
+        let (pu, pm) = per_call(&p);
+        println!(
+            "round {round}: serial {serial_ms:.2} ms (unmap {su:.0} us, map+access {sm:.0} us per block) | \
+             parallel {parallel_ms:.2} ms (unmap {pu:.0} us, map+access {pm:.0} us per block)"
+        );
+        if round > 0 {
+            serial.push(serial_ms);
+            parallel.push(parallel_ms);
+        }
+    }
+    let median = |v: &mut Vec<f64>| {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v[v.len() / 2]
+    };
+    let (sm, pm) = (median(&mut serial), median(&mut parallel));
+    println!(
+        "SWAPPROBE devices={n} blocks={blocks} granule_mib={} serial_median_ms={sm:.2} parallel_median_ms={pm:.2} speedup={:.2}",
+        gran / MIB,
+        sm / pm
+    );
+    for (be, dev) in bes.iter().zip(devs) {
+        for i in 0..blocks {
+            VmmOps::unmap(&**be, dev.va + i * gran, gran);
+        }
+        for h in dev.sets.into_iter().flatten() {
+            VmmOps::release(&**be, h);
+        }
+        VmmOps::address_free(&**be, dev.va, blocks * gran);
+    }
+}
+
+/// The steady state of the copy-out lever: every copy target is already mapped (a spare the cache
+/// evicted), so the per-request driver work is one D2D copy of 78 blocks per rank in chunks of 8,
+/// with no map and no unmap. Serial over devices vs one thread per device. `PLOW_VMM_PROBE_NGPU=8`.
+#[test]
+fn vmem_copy_into_mapped_spares_serial_vs_parallel_across_devices() {
+    if !gpu_enabled() {
+        eprintln!("skipped: set PLOW_GPU_TEST=1");
+        return;
+    }
+    let n: u8 = std::env::var("PLOW_VMM_PROBE_NGPU").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    if n < 2 {
+        eprintln!("skipped: set PLOW_VMM_PROBE_NGPU >= 2");
+        return;
+    }
+    let _env = common::env_guard();
+    let blocks = 78u64;
+    let mut bes = vec![backend_arc()];
+    for d in 1..n {
+        bes.push(std::sync::Arc::new(HsaBackend::new(d).expect("device")));
+    }
+    let gran = VmmOps::granularity(&*bes[0]).expect("granularity");
+    // (slot va, spare va, handles) per device, both ranges fully mapped once.
+    let devs: Vec<(u64, u64, Vec<u64>)> = bes
+        .iter()
+        .map(|be| {
+            let (a, b) = (
+                VmmOps::reserve(&**be, blocks * gran).expect("reserve"),
+                VmmOps::reserve(&**be, blocks * gran).expect("reserve"),
+            );
+            let hs: Vec<u64> = (0..2 * blocks).map(|_| VmmOps::create(&**be, gran).expect("create")).collect();
+            for i in 0..blocks {
+                for (va, h) in [(a, hs[i as usize]), (b, hs[(blocks + i) as usize])] {
+                    VmmOps::map(&**be, va + i * gran, gran, h).expect("map");
+                    VmmOps::set_access(&**be, va + i * gran, gran).expect("set_access");
+                }
+            }
+            (a, b, hs)
+        })
+        .collect();
+    fn copy(be: &HsaBackend, src: u64, dst: u64, blocks: u64, gran: u64) {
+        let pairs: Vec<_> = (0..blocks).map(|i| (dst + i * gran, src + i * gran, gran)).collect();
+        for chunk in pairs.chunks(8) {
+            VmmOps::copy_dtod_batch(be, chunk).expect("copy");
+        }
+    }
+    let (mut serial, mut parallel) = (Vec::new(), Vec::new());
+    for round in 0..8 {
+        let t = Instant::now();
+        for (be, &(a, b, _)) in bes.iter().zip(&devs) {
+            copy(be, a, b, blocks, gran);
+        }
+        let serial_ms = t.elapsed().as_secs_f64() * 1e3;
+        let t = Instant::now();
+        std::thread::scope(|sc| {
+            for (be, &(a, b, _)) in bes.iter().zip(&devs) {
+                sc.spawn(move || copy(be, a, b, blocks, gran));
+            }
+        });
+        let parallel_ms = t.elapsed().as_secs_f64() * 1e3;
+        println!("round {round}: serial {serial_ms:.2} ms | parallel {parallel_ms:.2} ms");
+        if round > 0 {
+            serial.push(serial_ms);
+            parallel.push(parallel_ms);
+        }
+    }
+    let median = |v: &mut Vec<f64>| {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v[v.len() / 2]
+    };
+    println!(
+        "SPAREPROBE devices={n} blocks={blocks} granule_mib={} serial_median_ms={:.2} parallel_median_ms={:.2}",
+        gran / MIB,
+        median(&mut serial),
+        median(&mut parallel)
+    );
+    for (be, (a, b, hs)) in bes.iter().zip(devs) {
+        VmmOps::unmap(&**be, a, blocks * gran);
+        VmmOps::unmap(&**be, b, blocks * gran);
+        for h in hs {
+            VmmOps::release(&**be, h);
+        }
+        VmmOps::address_free(&**be, a, blocks * gran);
+        VmmOps::address_free(&**be, b, blocks * gran);
+    }
+}
+
+/// The unmap-free alternative to that swap: leave the slot's column-0 block in place and give the
+/// cache a copy instead (map + set_access a fresh block at a cache VA, one batched D2D copy of the
+/// 78 blocks). Serial over devices vs one thread per device; the cache-VA unmap that eviction would
+/// pay later is outside the timed region. `PLOW_VMM_PROBE_NGPU=8`.
+#[test]
+fn vmem_copy_swap_serial_vs_parallel_across_devices() {
+    if !gpu_enabled() {
+        eprintln!("skipped: set PLOW_GPU_TEST=1");
+        return;
+    }
+    let n: u8 = std::env::var("PLOW_VMM_PROBE_NGPU").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    if n < 2 {
+        eprintln!("skipped: set PLOW_VMM_PROBE_NGPU >= 2");
+        return;
+    }
+    let _env = common::env_guard();
+    let blocks = 78u64;
+    let mut bes = vec![backend_arc()];
+    for d in 1..n {
+        bes.push(std::sync::Arc::new(HsaBackend::new(d).expect("device")));
+    }
+    let gran = VmmOps::granularity(&*bes[0]).expect("granularity");
+    struct Dev {
+        slot_va: u64,
+        cache_va: u64,
+        slot: Vec<u64>,
+        cache: Vec<u64>,
+    }
+    let devs: Vec<Dev> = bes
+        .iter()
+        .map(|be| {
+            let slot_va = VmmOps::reserve(&**be, blocks * gran).expect("reserve");
+            let cache_va = VmmOps::reserve(&**be, blocks * gran).expect("reserve");
+            let mk = || (0..blocks).map(|_| VmmOps::create(&**be, gran).expect("create")).collect::<Vec<_>>();
+            let (slot, cache) = (mk(), mk());
+            for (i, &h) in slot.iter().enumerate() {
+                VmmOps::map(&**be, slot_va + i as u64 * gran, gran, h).expect("map");
+                VmmOps::set_access(&**be, slot_va + i as u64 * gran, gran).expect("set_access");
+            }
+            Dev { slot_va, cache_va, slot, cache }
+        })
+        .collect();
+    // (map+set_access µs, copy µs) for the device's blocks; the cache VA is left mapped.
+    fn copy_swap(be: &HsaBackend, dev: &Dev, blocks: u64, gran: u64) -> (f64, f64) {
+        let t = Instant::now();
+        for i in 0..blocks {
+            VmmOps::map(be, dev.cache_va + i * gran, gran, dev.cache[i as usize]).expect("map");
+            VmmOps::set_access(be, dev.cache_va + i * gran, gran).expect("set_access");
+        }
+        let t1 = Instant::now();
+        let pairs: Vec<_> = (0..blocks).map(|i| (dev.cache_va + i * gran, dev.slot_va + i * gran, gran)).collect();
+        VmmOps::copy_dtod_batch(be, &pairs).expect("copy");
+        ((t1 - t).as_secs_f64() * 1e6, t1.elapsed().as_secs_f64() * 1e6)
+    }
+    let (mut serial, mut parallel) = (Vec::new(), Vec::new());
+    for round in 0..8 {
+        let t = Instant::now();
+        let s: Vec<_> = bes.iter().zip(&devs).map(|(be, dev)| copy_swap(be, dev, blocks, gran)).collect();
+        let serial_ms = t.elapsed().as_secs_f64() * 1e3;
+        for (be, dev) in bes.iter().zip(&devs) {
+            VmmOps::unmap(&**be, dev.cache_va, blocks * gran);
+        }
+        let t = Instant::now();
+        let p: Vec<_> = std::thread::scope(|sc| {
+            let hs: Vec<_> = bes
+                .iter()
+                .zip(&devs)
+                .map(|(be, dev)| sc.spawn(move || copy_swap(be, dev, blocks, gran)))
+                .collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let parallel_ms = t.elapsed().as_secs_f64() * 1e3;
+        for (be, dev) in bes.iter().zip(&devs) {
+            VmmOps::unmap(&**be, dev.cache_va, blocks * gran);
+        }
+        let sum = |v: &[(f64, f64)], f: fn(&(f64, f64)) -> f64| v.iter().map(f).sum::<f64>() / 1e3;
+        println!(
+            "round {round}: serial {serial_ms:.2} ms (maps {:.2} ms, copies {:.2} ms summed) | \
+             parallel {parallel_ms:.2} ms (maps {:.2} ms, copies {:.2} ms summed)",
+            sum(&s, |x| x.0), sum(&s, |x| x.1), sum(&p, |x| x.0), sum(&p, |x| x.1)
+        );
+        if round > 0 {
+            serial.push(serial_ms);
+            parallel.push(parallel_ms);
+        }
+    }
+    let median = |v: &mut Vec<f64>| {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v[v.len() / 2]
+    };
+    let (sm, pm) = (median(&mut serial), median(&mut parallel));
+    println!(
+        "COPYPROBE devices={n} blocks={blocks} granule_mib={} serial_median_ms={sm:.2} parallel_median_ms={pm:.2}",
+        gran / MIB
+    );
+    for (be, dev) in bes.iter().zip(devs) {
+        VmmOps::unmap(&**be, dev.slot_va, blocks * gran);
+        for h in dev.slot.into_iter().chain(dev.cache) {
+            VmmOps::release(&**be, h);
+        }
+        VmmOps::address_free(&**be, dev.slot_va, blocks * gran);
+        VmmOps::address_free(&**be, dev.cache_va, blocks * gran);
+    }
+}
+
+/// Does ROCr's per-call cost grow with the number of live vmem mappings? Copy-out v3 leaves every
+/// committed copy mapped (thousands of 2 MiB granules per rank). Times a publish-like batch of 64
+/// small D2D copies between pool allocations, one map + set_access + unmap, and one pool
+/// alloc + free, with M extra mappings of ONE handle (no extra VRAM) laid out in 64-granule
+/// regions as v3 does. Then: does one unmap span 78 adjacent granule maps (a batched teardown)?
+#[test]
+fn vmem_call_cost_vs_live_mappings() {
+    if !gpu_enabled() {
+        eprintln!("skipped: set PLOW_GPU_TEST=1");
+        return;
+    }
+    let _env = common::env_guard();
+    let be = backend();
+    let gran = VmmOps::granularity(be).expect("granularity");
+    let median = |v: &mut Vec<f64>| {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v[v.len() / 2]
+    };
+    let shared = VmmOps::create(be, gran).expect("create");
+    let chunk = 64 * 1024u64;
+    let bufs: Vec<u64> = (0..2).map(|_| VmmOps::alloc(be, 64 * chunk).expect("alloc")).collect();
+    let pairs: Vec<_> = (0..64).map(|i| (bufs[1] + i * chunk, bufs[0] + i * chunk, chunk)).collect();
+    let probe_va = VmmOps::reserve(be, gran).expect("reserve");
+    let probe_h = VmmOps::create(be, gran).expect("create");
+    let mut regions: Vec<(u64, u64)> = Vec::new();
+    let mut mapped = 0u64;
+    'grow: for target in [0u64, 1024, 4096, 8192] {
+        while mapped < target {
+            let va = VmmOps::reserve(be, 64 * gran).expect("reserve");
+            let mut n = 0;
+            for i in 0..64 {
+                if VmmOps::map(be, va + i * gran, gran, shared).is_err()
+                    || VmmOps::set_access(be, va + i * gran, gran).is_err()
+                {
+                    println!("LOOKUPPROBE map refused after {} mappings", mapped + n);
+                    regions.push((va, n));
+                    break 'grow;
+                }
+                n += 1;
+            }
+            regions.push((va, n));
+            mapped += n;
+        }
+        let (mut copy, mut swap, mut alloc) = (Vec::new(), Vec::new(), Vec::new());
+        for _ in 0..21 {
+            let t = Instant::now();
+            VmmOps::copy_dtod_batch(be, &pairs).expect("copy");
+            copy.push(t.elapsed().as_secs_f64() * 1e3);
+            let t = Instant::now();
+            VmmOps::map(be, probe_va, gran, probe_h).expect("map");
+            VmmOps::set_access(be, probe_va, gran).expect("set_access");
+            VmmOps::unmap(be, probe_va, gran);
+            swap.push(t.elapsed().as_secs_f64() * 1e6);
+            let t = Instant::now();
+            let a = VmmOps::alloc(be, 4 * MIB).expect("alloc");
+            VmmOps::free(be, a);
+            alloc.push(t.elapsed().as_secs_f64() * 1e6);
+        }
+        println!(
+            "LOOKUPPROBE mappings={mapped} copy64_ms={:.3} map_access_unmap_us={:.1} alloc_free_us={:.1}",
+            median(&mut copy),
+            median(&mut swap),
+            median(&mut alloc)
+        );
+    }
+
+    let span = 78 * gran;
+    let va = VmmOps::reserve(be, span).expect("reserve");
+    for i in 0..78 {
+        VmmOps::map(be, va + i * gran, gran, shared).expect("map");
+        VmmOps::set_access(be, va + i * gran, gran).expect("set_access");
+    }
+    let t = Instant::now();
+    VmmOps::unmap(be, va, span);
+    let range_us = t.elapsed().as_secs_f64() * 1e6;
+    let remapped = (0..78).take_while(|&i| VmmOps::map(be, va + i * gran, gran, shared).is_ok()).count();
+    println!("RANGEUNMAP granules=78 one_call_us={range_us:.1} remapped={remapped}/78");
+    for i in 0..78 {
+        VmmOps::unmap(be, va + i * gran, gran);
+    }
+    VmmOps::address_free(be, va, span);
+
+    for (va, n) in regions {
+        for i in 0..n {
+            VmmOps::unmap(be, va + i * gran, gran);
+        }
+        VmmOps::address_free(be, va, 64 * gran);
+    }
+    VmmOps::address_free(be, probe_va, gran);
+    VmmOps::release(be, probe_h);
+    VmmOps::release(be, shared);
+    for b in bufs {
+        VmmOps::free(be, b);
+    }
+}

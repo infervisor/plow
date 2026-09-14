@@ -648,6 +648,11 @@ pub struct VmmStats {
     /// Window mappings an attach found already holding the block it maps there (turn 2 in turn
     /// 1's slot) and kept in place — each one an unmap + map skipped.
     pub blocks_attach_kept: u64,
+    /// Cache-shared row-0 blocks replaced in the cache by a copy when their slot was released
+    /// ([`VmmKv::enable_release_retire`]), leaving the slot's block private.
+    pub blocks_copied_out: u64,
+    /// Spare copy targets unmapped and released because the pool held more than its spare cap.
+    pub spares_dropped: u64,
 }
 
 /// One physical sharing block: driver handle + mapping/cache refcount.
@@ -656,6 +661,8 @@ pub struct VmmStats {
 struct Block {
     handle: u64,
     refs: u32,
+    /// The copy slot `(track, index)` this block is mapped at, if it is a [`copy_out`] copy.
+    copy: Option<(u32, u32)>,
 }
 
 /// Per-cache-tensor VA reservation and its mapping table:
@@ -666,6 +673,43 @@ struct Track {
     tensor: u32,
     va: u64,
     slots: Vec<Slot>,
+    /// Copy-target VA regions of `COPY_REGION` blocks each ([`copy_out`]), reserved on demand.
+    copy: Vec<(u64, Vec<CopySlot>)>,
+}
+
+const COPY_REGION: u32 = 64;
+
+/// Mapped spare copy targets kept per track head ([`refill_spares`]), so consecutive finishes on
+/// one slot before a refill completes still copy without mapping.
+const SPARE_COLUMNS: u32 = 2;
+
+/// Spares [`refill_spares`] keeps mapped per track: `SPARE_COLUMNS` per head, fewer when the reuse
+/// pool cap could not hold them, so the load-time commit stays inside `PLOW_KV_POOL_MIB`.
+fn spare_target(s: &Shared, inner: &Inner) -> u32 {
+    let cap = s.pool_cap.load(Ordering::Relaxed) as usize;
+    let per_track = (cap / inner.tracks.len().max(1)).min(u32::MAX as usize) as u32;
+    (SPARE_COLUMNS * s.geo.kvh_full).min(per_track)
+}
+
+/// Spares a pool may hold before dropping any: the target plus one column per track. Not charged to
+/// the reuse pool, which keeps recycling retired window blocks exactly as without the knob. The
+/// extra column is what a cache eviction of one copied prefix parks; the next copy-out consumes
+/// it, so a full cache costs no unmap (v3 charged spares to the pool cap, and every such eviction
+/// queued 78 unmaps per rank into the publish that caused it: slotclear-t4-arms3).
+fn spare_cap(s: &Shared, inner: &Inner) -> usize {
+    inner.tracks.len() * (spare_target(s, inner) + s.geo.kvh_full) as usize
+}
+
+/// One block of copy-target VA ([`VmmKv::enable_release_retire`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CopySlot {
+    Empty,
+    /// Claimed by a running [`copy_out`].
+    Busy,
+    /// Maps this block for as long as it lives, whoever else maps it.
+    Held(u32),
+    /// A zero-ref handle still mapped here; the next copy-out copies into it with no driver call.
+    Spare(u64),
 }
 
 /// One window slot `(seq, head, block k)` of a track.
@@ -696,10 +740,10 @@ static ENGINE_SECTIONS: AtomicU32 = AtomicU32::new(0);
 /// the wait of whichever engine call arrives next.
 static RECLAIM_GATE: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
-struct EngineSection;
+pub(crate) struct EngineSection;
 
 impl EngineSection {
-    fn enter() -> Self {
+    pub(crate) fn enter() -> Self {
         ENGINE_SECTIONS.fetch_add(1, Ordering::AcqRel);
         Self
     }
@@ -729,6 +773,12 @@ enum Job {
     Retire(u32),
     /// Hand a zero-ref, unmapped handle back to the driver.
     Release(u64),
+    /// Give the cache copies of `seq`'s shared row-0 blocks ([`VmmKv::enable_release_retire`]).
+    CopyOut { seq: u32, generation: u64 },
+    /// Unmap and release a spare past the pool cap.
+    DropSpare { track: u32, slot: u32 },
+    /// Map spares up to the per-track target ([`refill_spares`]).
+    Refill,
     /// Reply once every job queued before this one has been processed.
     Sync(std::sync::mpsc::Sender<()>),
 }
@@ -777,6 +827,12 @@ struct Inner {
     /// zero-ref handles are released there and retired windows unmapped
     /// there. `None` = every driver call happens on the caller's thread.
     jobs: Option<std::sync::mpsc::Sender<Job>>,
+    /// A [`Job::CopyOut`] for this seq is queued or running.
+    copying: Vec<bool>,
+    /// [`CopySlot::Spare`] handles, counted against the reuse pool cap with `pooled`.
+    spares: u32,
+    /// A [`copy_out`] chunk is reading `seq`'s row-0 window mappings with the lock released.
+    copy_reading: Vec<bool>,
     /// Whole blocks mapped per sequence (uniform across tracks/heads).
     seq_blocks: Vec<u32>,
     cache: PrefixCache,
@@ -845,6 +901,9 @@ struct Shared {
     /// [`VmmKv::enable_pressure_eviction`]. Atomic: set once after construction, like
     /// `pool_cap`, so `trim_cache` (which only ever borrows `&Shared`) can read it.
     cache_min_free: AtomicU64,
+    /// How long [`VmmKv::begin_seq`] waits for a queued copy-out of its seq before swapping row 0
+    /// inline ([`VmmKv::enable_release_retire`]).
+    admission_wait_us: AtomicU64,
     /// Max handles the reuse pool may hold (0 = pooling off, the default).
     /// Set once by [`VmmKv::enable_block_pool`]; atomic only so `deref_block`
     /// can read it without threading a config borrow through `Inner`.
@@ -860,6 +919,8 @@ struct Shared {
 /// thread. Everything is reclaimed on Drop (the lifecycle-test contract).
 pub struct VmmKv {
     prefix_reuse: bool,
+    /// [`Self::enable_release_retire`].
+    release_retire: bool,
     shared: Arc<Shared>,
     premap_tx: Option<std::sync::mpsc::Sender<Job>>,
     premap_join: Option<std::thread::JoinHandle<()>>,
@@ -966,6 +1027,7 @@ impl VmmKv {
             head_span,
             cache_cap,
             cache_min_free: AtomicU64::new(0),
+            admission_wait_us: AtomicU64::new(5_000),
             pool_cap: AtomicU32::new(0),
             inner: Mutex::new(Inner {
                 tracks,
@@ -973,6 +1035,9 @@ impl VmmKv {
                 free_ids: Vec::new(),
                 pooled: Vec::new(),
                 jobs: None,
+                copying: vec![false; batch],
+                spares: 0,
+                copy_reading: vec![false; batch],
                 seq_blocks: vec![0; batch],
                 cache,
                 node_blocks: FxHashMap::default(),
@@ -993,6 +1058,7 @@ impl VmmKv {
         });
         let mut pool = VmmKv {
             prefix_reuse,
+            release_retire: false,
             shared: Arc::clone(&shared),
             premap_tx: None,
             premap_join: None,
@@ -1007,6 +1073,7 @@ impl VmmKv {
                     tensor,
                     va,
                     slots: vec![Slot::Empty; nslots],
+                    copy: Vec::new(),
                 });
             }
         }
@@ -1039,6 +1106,9 @@ impl VmmKv {
                             }
                         }
                         Job::Retire(seq) => reclaim_stale(s, seq as usize),
+                        Job::CopyOut { seq, generation } => copy_out(s, seq as usize, generation),
+                        Job::DropSpare { track, slot } => drop_spare(s, track as usize, slot),
+                        Job::Refill => refill_spares(s),
                         Job::Release(handle) => {
                             let _turn = reclaim_turn();
                             s.ops.release(handle);
@@ -1151,6 +1221,36 @@ impl VmmKv {
         }
     }
 
+    /// Move the inline row-0 unmap of a recycled slot out of admission: [`Self::retire_released`]
+    /// has the pool thread give the cache copies of the slot's shared row-0 blocks ([`copy_out`]),
+    /// so the next [`Self::begin_seq`] keeps row 0 in place. Maps the spare pool now
+    /// ([`refill_spares`], sized by the reuse pool cap). Needs [`Self::enable_deferred_reclaim`]
+    /// and the pool cap first.
+    pub fn enable_release_retire(&mut self) {
+        let inner = self.shared.inner.lock();
+        if let Some(tx) = &inner.jobs {
+            self.release_retire = true;
+            let _ = tx.send(Job::Refill);
+        }
+    }
+
+    /// The request in `seq` finished: queue its [`Job::CopyOut`] ([`Self::enable_release_retire`]).
+    pub fn retire_released(&self, seq: usize) {
+        if !self.release_retire {
+            return;
+        }
+        let s = &self.shared;
+        let mut inner = s.inner.lock();
+        if inner.copying[seq] {
+            return;
+        }
+        let generation = s.generation[seq].load(Ordering::Acquire);
+        let job = Job::CopyOut { seq: seq as u32, generation };
+        if inner.jobs.as_ref().is_some_and(|tx| tx.send(job).is_ok()) {
+            inner.copying[seq] = true;
+        }
+    }
+
     /// Test hook: route retire/release jobs to a queue nobody services, so
     /// "the reclaimer has not run yet" is a state a test can hold. The
     /// returned receiver keeps the queue open; jobs in it are dropped with it.
@@ -1216,10 +1316,32 @@ impl VmmKv {
     /// references and unmap+deref its window (cached blocks survive through
     /// the cache's own references).
     pub fn begin_seq(&self, seq: usize) {
-        let _section = EngineSection::enter();
         let s = &self.shared;
+        let t_wait = std::time::Instant::now();
+        let mut copy_pending = false;
+        if self.release_retire {
+            // A queued copy-out finishing costs copies; the inline swap it saves is ~12 ms of
+            // serialized ioctls. Outside the engine section, so the job's own driver calls run.
+            let wait = std::time::Duration::from_micros(s.admission_wait_us.load(Ordering::Relaxed));
+            let deadline = std::time::Instant::now() + wait;
+            while s.inner.lock().copying[seq] && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_micros(50));
+            }
+            copy_pending = s.inner.lock().copying[seq];
+        }
+        let copy_wait = t_wait.elapsed();
+        let _section = EngineSection::enter();
         let mut inner = s.inner.lock();
         s.generation[seq].fetch_add(1, Ordering::Release);
+        // The bump stops the next copy-out chunk; the one in flight still reads row 0, which the
+        // inline swap below may unmap.
+        let t_chunk = std::time::Instant::now();
+        while inner.copy_reading[seq] {
+            drop(inner);
+            std::thread::sleep(std::time::Duration::from_micros(20));
+            inner = s.inner.lock();
+        }
+        let chunk_wait = t_chunk.elapsed();
         release_prefix_hold(&mut inner, seq);
         let before = inner.stats;
         let t0 = std::time::Instant::now();
@@ -1242,6 +1364,9 @@ impl VmmKv {
             nodes_evicted = after.nodes_evicted - before.nodes_evicted,
             window_us = (t1 - t0).as_micros() as u64,
             trim_us = t1.elapsed().as_micros() as u64,
+            copy_wait_us = copy_wait.as_micros() as u64,
+            copy_pending,
+            chunk_wait_us = chunk_wait.as_micros() as u64,
             "vmm begin_seq"
         );
     }
@@ -2099,6 +2224,16 @@ impl Drop for VmmKv {
         let span = s.geo.batch as u64 * s.geo.kvh_full as u64 * s.head_span;
         for t in &inner.tracks {
             s.ops.address_free(t.va, span);
+            for (va, slots) in &t.copy {
+                for (i, slot) in slots.iter().enumerate() {
+                    debug_assert!(matches!(slot, CopySlot::Empty | CopySlot::Spare(_)));
+                    if let CopySlot::Spare(handle) = *slot {
+                        s.ops.unmap(va + i as u64 * s.block_bytes, s.block_bytes);
+                        s.ops.release(handle);
+                    }
+                }
+                s.ops.address_free(*va, u64::from(COPY_REGION) * s.block_bytes);
+            }
         }
     }
 }
@@ -2190,13 +2325,13 @@ fn create_block(s: &Shared, inner: &mut Inner) -> Result<u32> {
             inner.stats.blocks_pooled -= 1;
             inner.stats.blocks_reused += 1;
             inner.stats.blocks_live += 1;
-            return Ok(install_block(inner, Block { handle, refs: 1 }));
+            return Ok(install_block(inner, Block { handle, refs: 1, copy: None }));
         }
         match s.ops.create(s.block_bytes) {
             Ok(handle) => {
                 inner.stats.blocks_created += 1;
                 inner.stats.blocks_live += 1;
-                return Ok(install_block(inner, Block { handle, refs: 1 }));
+                return Ok(install_block(inner, Block { handle, refs: 1, copy: None }));
             }
             Err(e) => {
                 // A fatal fault (poisoned context) is not memory pressure —
@@ -2400,8 +2535,19 @@ fn unref_block(s: &Shared, inner: &mut Inner, id: u32) -> Option<u64> {
         return None;
     }
     let handle = b.handle;
+    let copy = b.copy.take();
     inner.stats.blocks_live -= 1;
     inner.free_ids.push(id);
+    if let Some((track, slot)) = copy {
+        *copy_slot(inner, track as usize, slot) = CopySlot::Spare(handle);
+        inner.spares += 1;
+        if inner.spares as usize > spare_cap(s, inner) {
+            if let Some(tx) = &inner.jobs {
+                let _ = tx.send(Job::DropSpare { track, slot });
+            }
+        }
+        return None;
+    }
     if inner.pooled.len() < s.pool_cap.load(Ordering::Relaxed) as usize {
         inner.pooled.push(handle);
         inner.stats.blocks_pooled += 1;
@@ -2519,6 +2665,361 @@ fn retire_window(s: &Shared, inner: &mut Inner, seq: usize) -> u32 {
         }
     }
     unmapped
+}
+
+fn copy_slot(inner: &mut Inner, track: usize, slot: u32) -> &mut CopySlot {
+    &mut inner.tracks[track].copy[(slot / COPY_REGION) as usize].1[(slot % COPY_REGION) as usize]
+}
+
+/// Claim a copy slot on `track`: a mapped spare first (if `take_spare`), else an empty slot,
+/// reserving a new region when every slot is taken. Returns `(slot, va, spare handle)`.
+fn claim_copy_slot(
+    s: &Shared,
+    inner: &mut Inner,
+    track: usize,
+    take_spare: bool,
+) -> Option<(u32, u64, Option<u64>)> {
+    let Inner { tracks, spares, .. } = inner;
+    let copy = &mut tracks[track].copy;
+    let mut empty = None;
+    for (r, (va, slots)) in copy.iter_mut().enumerate() {
+        for (i, slot) in slots.iter_mut().enumerate() {
+            match *slot {
+                CopySlot::Spare(handle) if take_spare => {
+                    *slot = CopySlot::Busy;
+                    *spares -= 1;
+                    let index = r as u32 * COPY_REGION + i as u32;
+                    return Some((index, *va + i as u64 * s.block_bytes, Some(handle)));
+                }
+                CopySlot::Empty if empty.is_none() => empty = Some((r, i)),
+                _ => {}
+            }
+        }
+    }
+    let (r, i) = match empty {
+        Some(at) => at,
+        None => {
+            let va = s.ops.reserve(u64::from(COPY_REGION) * s.block_bytes).ok()?;
+            copy.push((va, vec![CopySlot::Empty; COPY_REGION as usize]));
+            (copy.len() - 1, 0)
+        }
+    };
+    copy[r].1[i] = CopySlot::Busy;
+    Some((r as u32 * COPY_REGION + i as u32, copy[r].0 + i as u64 * s.block_bytes, None))
+}
+
+/// [`Job::DropSpare`]: unmap and release one spare while the pool holds more than its spare cap.
+/// The slot is `Busy` during the unmap, which runs with the pool lock released.
+fn drop_spare(s: &Shared, track: usize, slot: u32) {
+    let _turn = reclaim_turn();
+    let (va, handle) = {
+        let mut inner = s.inner.lock();
+        let CopySlot::Spare(handle) = *copy_slot(&mut inner, track, slot) else { return };
+        if inner.spares as usize <= spare_cap(s, &inner) {
+            return;
+        }
+        *copy_slot(&mut inner, track, slot) = CopySlot::Busy;
+        inner.spares -= 1;
+        inner.stats.spares_dropped += 1;
+        let base = inner.tracks[track].copy[(slot / COPY_REGION) as usize].0;
+        (base + u64::from(slot % COPY_REGION) * s.block_bytes, handle)
+    };
+    s.ops.unmap(va, s.block_bytes);
+    s.ops.release(handle);
+    *copy_slot(&mut s.inner.lock(), track, slot) = CopySlot::Empty;
+}
+
+fn spares_on(track: &Track) -> u32 {
+    let slots = track.copy.iter().flat_map(|(_, slots)| slots);
+    slots.filter(|slot| matches!(slot, CopySlot::Spare(_))).count() as u32
+}
+
+/// [`Job::Refill`]: map spares until every track holds [`spare_target`], so a copy-out lands in a
+/// mapped block and a request's finish issues no map. Pooled handles first, else a create. With a
+/// full cache the evicted copies already refill the target and this maps nothing. Every driver
+/// call yields to engine sections.
+fn refill_spares(s: &Shared) {
+    let bb = s.block_bytes;
+    loop {
+        let (track, slot, dst, pooled) = {
+            let mut guard = s.inner.lock();
+            let inner = &mut *guard;
+            let target = spare_target(s, inner);
+            let Some(track) = inner.tracks.iter().position(|t| spares_on(t) < target) else { return };
+            let pooled = inner.pooled.pop();
+            if pooled.is_some() {
+                inner.stats.blocks_pooled -= 1;
+            }
+            let Some((slot, dst, _)) = claim_copy_slot(s, inner, track, false) else {
+                if let Some(handle) = pooled {
+                    inner.pooled.push(handle);
+                    inner.stats.blocks_pooled += 1;
+                }
+                return;
+            };
+            (track, slot, dst, pooled)
+        };
+        let _turn = reclaim_turn();
+        let (handle, created) = match pooled {
+            Some(handle) => (handle, false),
+            None => match s.ops.create(bb) {
+                Ok(handle) => (handle, true),
+                Err(_) => {
+                    *copy_slot(&mut s.inner.lock(), track, slot) = CopySlot::Empty;
+                    return;
+                }
+            },
+        };
+        let mapped = s.ops.map(dst, bb, handle).is_ok();
+        let ok = mapped && s.ops.set_access(dst, bb).is_ok();
+        if mapped && !ok {
+            s.ops.unmap(dst, bb);
+        }
+        let mut inner = s.inner.lock();
+        if created {
+            inner.stats.blocks_created += 1;
+        }
+        if !ok {
+            *copy_slot(&mut inner, track, slot) = CopySlot::Empty;
+            drop(inner);
+            s.ops.release(handle);
+            return;
+        }
+        *copy_slot(&mut inner, track, slot) = CopySlot::Spare(handle);
+        inner.spares += 1;
+    }
+}
+
+/// [`Job::CopyOut`]. A row-0 block held by exactly `seq`'s window and one radix node gets a copy
+/// that takes over the node's reference, so the next occupant's [`retire_window`] keeps the block
+/// in place instead of unmapping it inline. No unmap on any path: a copy stays mapped at its copy
+/// slot for its whole life, and when the cache drops it the slot keeps it mapped as a spare that
+/// the next copy-out copies into without a driver call (a serialized KFD unmap is ~120 µs, and
+/// 78 of them per rank per request starved the copies they were cleaning up after). The window
+/// mapping is never touched, so a parked decode row reading it is unaffected. Each copy chunk
+/// re-checks `generation` and sets `copy_reading` under the pool lock, then copies with the lock
+/// released: a `begin_seq` bumps the generation under that lock (stopping the next chunk) and waits
+/// out the chunk in flight before its inline swap can unmap the source or row 0 is written, while
+/// publish, `ensure_rows` and map-ahead on this pool never wait on a copy (holding the lock through
+/// the copies cost C16 prefill ticks ~49 ms of deferred publish, slotclear-t4-arms3). The copies are not behind the process-wide reclaim gate: they parallelize across
+/// devices (8 devices x 78 blocks: 11.15 ms serial, 2.13 ms one thread per device) where the
+/// driver's vmem calls do not, and holding the gate made the ranks' copies and maps queue on
+/// each other past the next admission. A block commits only if the
+/// generation, the slot, its refcount and the node entry are all unchanged; an uncommitted copy
+/// target stays mapped as a spare.
+fn copy_out(s: &Shared, seq: usize, generation: u64) {
+    struct Entry {
+        track: usize,
+        head: u32,
+        node: (u32, u32),
+        index: usize,
+        old: u32,
+        slot: u32,
+        handle: Option<u64>,
+        mapped: bool,
+        pooled: bool,
+        created: bool,
+        src: u64,
+        dst: u64,
+    }
+    let kvh = s.geo.kvh_full;
+    let bb = s.block_bytes;
+    let t0 = std::time::Instant::now();
+    let mut entries = Vec::new();
+    {
+        let mut guard = s.inner.lock();
+        let inner = &mut *guard;
+        if s.generation[seq].load(Ordering::Acquire) == generation {
+            let mut want: FxHashMap<u32, (usize, u32)> = FxHashMap::default();
+            for (t, track) in inner.tracks.iter().enumerate() {
+                for h in 0..kvh {
+                    if let Slot::Live(id) = track.slots[slot_index(s, seq, h, 0)] {
+                        if inner.blocks[id as usize].refs == 2 {
+                            want.insert(id, (t, h));
+                        }
+                    }
+                }
+            }
+            let mut found = Vec::new();
+            if !want.is_empty() {
+                for (&node, ids) in &inner.node_blocks {
+                    for (index, id) in ids.iter().enumerate() {
+                        if let Some(&(track, head)) = want.get(id) {
+                            found.push((track, head, node, index, *id));
+                        }
+                    }
+                }
+            }
+            for (track, head, node, index, old) in found {
+                let Some((slot, dst, spare)) = claim_copy_slot(s, inner, track, true) else { continue };
+                let src = slot_va(s, &inner.tracks[track], seq, head, 0);
+                let (handle, pooled) = match spare {
+                    Some(handle) => (Some(handle), false),
+                    None => match inner.pooled.pop() {
+                        Some(handle) => {
+                            inner.stats.blocks_pooled -= 1;
+                            (Some(handle), true)
+                        }
+                        None => (None, false),
+                    },
+                };
+                entries.push(Entry {
+                    track,
+                    head,
+                    node,
+                    index,
+                    old,
+                    slot,
+                    handle,
+                    mapped: spare.is_some(),
+                    pooled,
+                    created: false,
+                    src,
+                    dst,
+                });
+            }
+        }
+        if entries.is_empty() {
+            inner.copying[seq] = false;
+            return;
+        }
+    }
+
+    let mut ok = true;
+    let mut maps = 0u32;
+    for e in entries.iter_mut().filter(|e| !e.mapped) {
+        let _turn = reclaim_turn();
+        let handle = match e.handle {
+            Some(handle) => handle,
+            None => match s.ops.create(bb) {
+                Ok(handle) => {
+                    e.handle = Some(handle);
+                    e.created = true;
+                    handle
+                }
+                Err(_) => {
+                    ok = false;
+                    break;
+                }
+            },
+        };
+        if s.ops.map(e.dst, bb, handle).is_err() {
+            ok = false;
+            break;
+        }
+        if s.ops.set_access(e.dst, bb).is_err() {
+            s.ops.unmap(e.dst, bb);
+            ok = false;
+            break;
+        }
+        e.mapped = true;
+        maps += 1;
+    }
+    let t1 = std::time::Instant::now();
+    if ok {
+        for chunk in entries.chunks(8) {
+            let pairs: Vec<_> = chunk.iter().map(|e| (e.dst, e.src, bb)).collect();
+            {
+                let mut inner = s.inner.lock();
+                if s.generation[seq].load(Ordering::Acquire) != generation {
+                    ok = false;
+                    break;
+                }
+                inner.copy_reading[seq] = true;
+            }
+            ok = s.ops.copy_dtod_batch(&pairs).is_ok();
+            s.inner.lock().copy_reading[seq] = false;
+            if !ok {
+                break;
+            }
+        }
+    }
+
+    let t2 = std::time::Instant::now();
+    let mut committed = 0u64;
+    let mut release = Vec::new();
+    let mut spare_state = (0u32, 0u64);
+    {
+        let mut guard = s.inner.lock();
+        let inner = &mut *guard;
+        let current = ok && s.generation[seq].load(Ordering::Acquire) == generation;
+        let cap = s.pool_cap.load(Ordering::Relaxed) as usize;
+        for e in &entries {
+            if e.created {
+                inner.stats.blocks_created += 1;
+            }
+            let Some(handle) = e.handle else {
+                *copy_slot(inner, e.track, e.slot) = CopySlot::Empty;
+                continue;
+            };
+            if current
+                && e.mapped
+                && inner.tracks[e.track].slots[slot_index(s, seq, e.head, 0)] == Slot::Live(e.old)
+                && inner.blocks[e.old as usize].refs == 2
+                && inner.node_blocks.get(&e.node).and_then(|ids| ids.get(e.index)) == Some(&e.old)
+            {
+                let copy = Some((e.track as u32, e.slot));
+                let id = install_block(inner, Block { handle, refs: 1, copy });
+                *copy_slot(inner, e.track, e.slot) = CopySlot::Held(id);
+                inner.node_blocks.get_mut(&e.node).unwrap()[e.index] = id;
+                inner.blocks[e.old as usize].refs -= 1;
+                inner.stats.blocks_live += 1;
+                inner.stats.blocks_copied_out += 1;
+                if e.pooled {
+                    inner.stats.blocks_reused += 1;
+                }
+                committed += 1;
+            } else if e.mapped {
+                *copy_slot(inner, e.track, e.slot) = CopySlot::Spare(handle);
+                inner.spares += 1;
+            } else {
+                *copy_slot(inner, e.track, e.slot) = CopySlot::Empty;
+                if inner.pooled.len() < cap {
+                    inner.pooled.push(handle);
+                    inner.stats.blocks_pooled += 1;
+                } else {
+                    release.push(handle);
+                }
+            }
+        }
+        let mut excess = (inner.spares as usize).saturating_sub(spare_cap(s, inner));
+        if let Some(tx) = inner.jobs.as_ref().filter(|_| excess > 0) {
+            'excess: for (t, track) in inner.tracks.iter().enumerate() {
+                for (r, (_, slots)) in track.copy.iter().enumerate() {
+                    for (i, slot) in slots.iter().enumerate() {
+                        if excess == 0 {
+                            break 'excess;
+                        }
+                        if matches!(slot, CopySlot::Spare(_)) {
+                            let slot = r as u32 * COPY_REGION + i as u32;
+                            let _ = tx.send(Job::DropSpare { track: t as u32, slot });
+                            excess -= 1;
+                        }
+                    }
+                }
+            }
+        }
+        inner.copying[seq] = false;
+        if let Some(tx) = &inner.jobs {
+            let _ = tx.send(Job::Refill);
+        }
+        spare_state = (inner.spares, inner.stats.spares_dropped);
+    }
+    for handle in release {
+        let _turn = reclaim_turn();
+        s.ops.release(handle);
+    }
+    tracing::debug!(
+        seq,
+        planned = entries.len(),
+        committed,
+        maps,
+        spares = spare_state.0,
+        spares_dropped = spare_state.1,
+        map_us = (t1 - t0).as_micros() as u64,
+        copy_us = (t2 - t1).as_micros() as u64,
+        "vmm copy_out"
+    );
 }
 
 /// Reclaimer half of [`retire_window`]: unmap and dereference `seq`'s stale
@@ -3325,10 +3826,31 @@ mod tests {
         strict: std::sync::atomic::AtomicBool,
         mapped: std::sync::Mutex<std::collections::HashSet<u64>>,
         violations: AtomicU64,
+        copies: AtomicU64,
+        /// Latency model in µs: `[vmem call, unmap, copy per block]` ([`MockVmm::lag`]).
+        lat_us: [AtomicU64; 3],
+        /// Runs once, at the next `map`: a test's window into a job between its steps.
+        map_hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+        /// Runs once, at the next `copy_dtod`, with the source VA.
+        copy_hook: std::sync::Mutex<Option<Box<dyn FnOnce(u64) + Send>>>,
         /// [`VmmOps::free_bytes`] override for pressure-eviction tests. `None` (the
         /// default) reproduces every real backend today: pressure mode reports
         /// "unsupported" and `trim_cache` falls back to `cache_cap`.
         free_bytes: std::sync::Mutex<Option<u64>>,
+    }
+
+    static MODEL_DRIVER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    impl MockVmm {
+        /// ROCr's shape: vmem calls serialize process-wide, D2D copies do not.
+        fn lag(&self, which: usize) {
+            let us = self.lat_us[which].load(Ordering::Relaxed);
+            if us == 0 {
+                return;
+            }
+            let _driver = (which < 2).then(|| MODEL_DRIVER.lock().unwrap_or_else(|e| e.into_inner()));
+            std::thread::sleep(std::time::Duration::from_micros(us));
+        }
     }
 
     impl VmmOps for MockVmm {
@@ -3349,6 +3871,7 @@ mod tests {
             self.address_frees.fetch_add(1, Ordering::SeqCst);
         }
         fn create(&self, _bytes: u64) -> Result<u64> {
+            self.lag(0);
             if self.fail_creates.fetch_sub(1, Ordering::SeqCst) > 0 {
                 return Err(RuntimeError::Oom("mock OOM".into()));
             }
@@ -3357,9 +3880,15 @@ mod tests {
             Ok(self.next.fetch_add(1, Ordering::SeqCst))
         }
         fn release(&self, _handle: u64) {
+            self.lag(0);
             self.releases.fetch_add(1, Ordering::SeqCst);
         }
         fn map(&self, va: u64, _bytes: u64, _handle: u64) -> Result<()> {
+            let hook = self.map_hook.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+            self.lag(0);
             // `fail_maps = k` makes the k-th upcoming map call fail, one-shot
             // (earlier calls succeed) — exercises PARTIALLY-mapped unwinds.
             if self.fail_maps.load(Ordering::SeqCst) > 0
@@ -3374,12 +3903,14 @@ mod tests {
             Ok(())
         }
         fn unmap(&self, va: u64, _bytes: u64) {
+            self.lag(1);
             self.unmaps.fetch_add(1, Ordering::SeqCst);
             if self.strict.load(Ordering::SeqCst) && !self.mapped.lock().unwrap().remove(&va) {
                 self.violations.fetch_add(1, Ordering::SeqCst);
             }
         }
         fn set_access(&self, _va: u64, _bytes: u64) -> Result<()> {
+            self.lag(0);
             if self.fail_access.load(Ordering::SeqCst) > 0
                 && self.fail_access.fetch_sub(1, Ordering::SeqCst) == 1
             {
@@ -3394,7 +3925,13 @@ mod tests {
         fn free(&self, _va: u64) {
             self.frees.fetch_add(1, Ordering::SeqCst);
         }
-        fn copy_dtod(&self, _dst: u64, _src: u64, _bytes: u64) -> Result<()> {
+        fn copy_dtod(&self, _dst: u64, src: u64, _bytes: u64) -> Result<()> {
+            let hook = self.copy_hook.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook(src);
+            }
+            self.lag(2);
+            self.copies.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
         fn free_bytes(&self) -> Option<u64> {
@@ -5260,6 +5797,590 @@ mod tests {
         }
         assert_eq!(p.stats().blocks_stale, 0);
         drop(stalled);
+        drop(p);
+        assert_balanced(&ops);
+    }
+
+    /// Seq 0 with 3 private columns, columns 0 and 1 published, request released and its
+    /// copy-out queued to a stalled reclaimer; returns the generation the job carries.
+    fn released_with_shared_row_zero(p: &mut VmmKv, pr: &[u32]) -> u64 {
+        p.enable_block_recycling(16 * 64);
+        p.enable_release_retire();
+        p.ensure_rows(0, 24).unwrap();
+        p.publish(0, pr, 4, |_| Ok(())).unwrap();
+        p.release_prefix(0);
+        p.retire_released(0);
+        assert!(p.shared.inner.lock().copying[0]);
+        p.shared.generation[0].load(Ordering::Acquire)
+    }
+
+    fn spares(p: &VmmKv) -> u32 {
+        p.shared.inner.lock().spares
+    }
+
+    /// The copy-out gives the cache copies of the released slot's shared row 0 without a single
+    /// unmap: the next occupant keeps row 0 in place, and another slot attaches the copies.
+    #[test]
+    fn release_retire_copies_shared_row_zero_so_admission_keeps_it() {
+        let ops = strict_ops();
+        let mut p = uniform_pool(ops.clone());
+        let stalled = p.stall_reclaim();
+        let pr = prompt(17);
+        let generation = released_with_shared_row_zero(&mut p, &pr);
+        copy_out(&p.shared, 0, generation);
+        let st = p.stats();
+        assert_eq!(st.blocks_copied_out, 4, "column 0 of every track");
+        assert_eq!(ops.copies.load(Ordering::SeqCst), 4);
+        assert_eq!(st.cache_blocks, 8);
+        assert_eq!(ops.unmaps.load(Ordering::SeqCst), 0, "copies stay mapped at their copy slot");
+        assert!(!p.shared.inner.lock().copying[0]);
+
+        p.begin_seq(0);
+        assert_eq!(ops.unmaps.load(Ordering::SeqCst), 0, "row 0 kept, nothing unmapped inline");
+        assert_eq!(p.stats().blocks_kept, 4);
+        assert_eq!(p.mapped_rows(0), 8);
+        p.ensure_rows(1, 1).unwrap();
+        assert_eq!(p.try_attach(1, &pr).unwrap().expect("hit").rows, 16);
+        p.finish_attach(1);
+        drop(stalled);
+        drop(p);
+        assert_balanced(&ops);
+    }
+
+    /// Steady state: the cache evicts a copied prefix, its copies become mapped spares, and the
+    /// next copy-out lands in them with no create, map or unmap.
+    #[test]
+    fn release_retire_reuses_evicted_copies_without_driver_calls() {
+        let ops = strict_ops();
+        let mut p = uniform_pool(ops.clone());
+        let stalled = p.stall_reclaim();
+        let generation = released_with_shared_row_zero(&mut p, &prompt(17));
+        copy_out(&p.shared, 0, generation);
+        {
+            let mut inner = p.shared.inner.lock();
+            while evict_one(&p.shared, &mut inner, false) {}
+        }
+        assert_eq!(spares(&p), 4);
+        assert_eq!(ops.unmaps.load(Ordering::SeqCst), 0);
+
+        p.begin_seq(0);
+        p.ensure_rows(0, 24).unwrap();
+        let other: Vec<u32> = prompt(17).iter().map(|t| t + 1000).collect();
+        p.publish(0, &other, 4, |_| Ok(())).unwrap();
+        p.release_prefix(0);
+        p.retire_released(0);
+        let generation = p.shared.generation[0].load(Ordering::Acquire);
+        let calls = |ops: &MockVmm| {
+            [&ops.creates, &ops.maps, &ops.unmaps].map(|c| c.load(Ordering::SeqCst))
+        };
+        let before = calls(&ops);
+        copy_out(&p.shared, 0, generation);
+        assert_eq!(calls(&ops), before, "copy only");
+        assert_eq!(ops.copies.load(Ordering::SeqCst), 8);
+        assert_eq!(p.stats().blocks_copied_out, 8);
+        assert_eq!(spares(&p), 0);
+        drop(stalled);
+        drop(p);
+        assert_balanced(&ops);
+    }
+
+    /// The spare pool: mapped to its per-track target, drained by copy-outs with no refill in
+    /// between (once empty, a copy-out maps its own targets), refilled back to the target.
+    #[test]
+    fn release_retire_spare_pool_exhausts_then_refills() {
+        let ops = strict_ops();
+        let mut p = uniform_pool(ops.clone());
+        p.enable_block_recycling(16 * 64);
+        let stalled = p.stall_reclaim();
+        p.enable_release_retire();
+        refill_spares(&p.shared);
+        assert_eq!(spares(&p), 8, "SPARE_COLUMNS per track, 4 tracks");
+        for round in 0..3u32 {
+            p.begin_seq(0);
+            p.ensure_rows(0, 24).unwrap();
+            let pr: Vec<u32> = prompt(17).iter().map(|t| t + round * 1000).collect();
+            p.publish(0, &pr, 4, |_| Ok(())).unwrap();
+            p.release_prefix(0);
+            p.retire_released(0);
+            let maps = ops.maps.load(Ordering::SeqCst);
+            copy_out(&p.shared, 0, p.shared.generation[0].load(Ordering::Acquire));
+            let want = if round < 2 { 0 } else { 4 };
+            assert_eq!(ops.maps.load(Ordering::SeqCst) - maps, want, "round {round}");
+        }
+        assert_eq!(p.stats().blocks_copied_out, 12);
+        assert_eq!(spares(&p), 0);
+        refill_spares(&p.shared);
+        assert_eq!(spares(&p), 8);
+        assert_eq!(ops.violations.load(Ordering::SeqCst), 0);
+        drop(stalled);
+        drop(p);
+        assert_balanced(&ops);
+    }
+
+    /// Admission arriving while its copy-out is still queued waits for the commit instead of
+    /// swapping row 0 inline.
+    #[test]
+    fn release_retire_admission_waits_for_a_pending_copy_out() {
+        let ops = strict_ops();
+        let mut p = uniform_pool(ops.clone());
+        let stalled = p.stall_reclaim();
+        let generation = released_with_shared_row_zero(&mut p, &prompt(17));
+        p.shared.admission_wait_us.store(10_000_000, Ordering::Relaxed);
+        let shared = Arc::clone(&p.shared);
+        let job = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            copy_out(&shared, 0, generation);
+        });
+        p.begin_seq(0);
+        job.join().unwrap();
+        assert_eq!(p.stats().blocks_copied_out, 4);
+        assert_eq!(p.stats().blocks_kept, 4, "row 0 kept after the wait");
+        assert_eq!(ops.unmaps.load(Ordering::SeqCst), 0);
+        drop(stalled);
+        drop(p);
+        assert_balanced(&ops);
+    }
+
+    /// CPU model of C1 back-to-back at TP8: 8 pools x 78 tracks, spare pool mapped at enable, every
+    /// pool thread live. ROCr's shape: vmem calls serialize on one process-wide lock (map, set_access,
+    /// create, release 15 µs; unmap 120 µs), copies do not (30 µs per block). A 500 ms request, then
+    /// a 25 ms finish-to-admission gap (35 ms measured). Every admission after a published occupant
+    /// must find row 0 private on every rank: no rank ever swaps it inline.
+    #[test]
+    fn release_retire_c1_model_admission_never_meets_an_uncommitted_rank() {
+        let ranks: Vec<(Arc<MockVmm>, VmmKv)> = (0..8)
+            .map(|_| {
+                let ops = Arc::new(MockVmm::default());
+                for (lat, us) in ops.lat_us.iter().zip([15, 120, 30]) {
+                    lat.store(us, Ordering::Relaxed);
+                }
+                let geo = VmmGeometry {
+                    full_layers: (0..78).collect(),
+                    kvh_full: 1,
+                    hd_full: 4,
+                    slide_layers: vec![],
+                    kvh_slide: 1,
+                    hd_slide: 4,
+                    window: 0,
+                    elem: 2,
+                    elem_slide: 2,
+                    max_ctx: 32,
+                    batch: 2,
+                };
+                let tensors: Vec<(u32, u32)> = (0..78).map(|layer| (layer, 0)).collect();
+                let mut p = VmmKv::new_tensors(ops.clone(), geo, 64, 0, &tensors).expect("pool");
+                p.enable_block_recycling(4 * 78 * 64);
+                p.enable_deferred_reclaim();
+                p.enable_release_retire();
+                (ops, p)
+            })
+            .collect();
+        for (_, p) in &ranks {
+            p.sync_reclaim();
+            assert_eq!(spares(p), 2 * 78, "spare pool mapped at enable");
+        }
+        let mut worst = std::time::Duration::ZERO;
+        for request in 0..8u32 {
+            let pr: Vec<u32> = (0..17).map(|i| request * 1000 + i).collect();
+            for (rank, (_, p)) in ranks.iter().enumerate() {
+                let kept = p.stats().blocks_kept;
+                let t = std::time::Instant::now();
+                p.begin_seq(0);
+                worst = worst.max(t.elapsed());
+                if request > 0 {
+                    assert_eq!(
+                        p.stats().blocks_kept - kept,
+                        78,
+                        "request {request} rank {rank}: row 0 swapped inline"
+                    );
+                }
+                p.ensure_rows(0, 24).unwrap();
+            }
+            for (_, p) in &ranks {
+                p.publish(0, &pr, 4, |_| Ok(())).unwrap();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            for (_, p) in &ranks {
+                p.release_prefix(0);
+                p.retire_released(0);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        println!("C1 model: worst begin_seq across ranks {worst:?}");
+        for (ops, p) in ranks {
+            p.sync_reclaim();
+            assert_eq!(p.stats().blocks_copied_out, 8 * 78, "every finish committed on every rank");
+            drop(p);
+            assert_eq!(ops.releases.load(Ordering::SeqCst), ops.creates.load(Ordering::SeqCst));
+        }
+    }
+
+    /// A full cache (every publish evicts the previous prefix): the evicted copies park as spares,
+    /// the next copy-out consumes them, so no request queues a spare drop and neither the copy-out
+    /// nor the refill maps anything. Charging spares to the reuse pool cap (v3) queued a drop for
+    /// every evicted copy.
+    #[test]
+    fn release_retire_full_cache_evictions_feed_the_next_copy_out_without_drops() {
+        let ops = strict_ops();
+        let geo = VmmGeometry {
+            full_layers: vec![0, 1],
+            kvh_full: 1,
+            hd_full: 4,
+            slide_layers: vec![],
+            kvh_slide: 1,
+            hd_slide: 4,
+            window: 0,
+            elem: 2,
+            elem_slide: 2,
+            max_ctx: 32,
+            batch: 2,
+        };
+        // One prefix (2 blocks x 4 tracks + snapshot) fits; the next publish evicts it.
+        let mut p = VmmKv::new(ops.clone(), geo, 64, 600).expect("pool");
+        p.enable_block_recycling(16 * 64);
+        let stalled = p.stall_reclaim();
+        p.enable_release_retire();
+        refill_spares(&p.shared);
+        assert_eq!(spares(&p), 8);
+        let drops = |rx: &std::sync::mpsc::Receiver<Job>| {
+            rx.try_iter().filter(|job| matches!(job, Job::DropSpare { .. })).count()
+        };
+        drops(&stalled);
+        for request in 0..6u32 {
+            p.begin_seq(0);
+            p.ensure_rows(0, 24).unwrap();
+            let pr: Vec<u32> = prompt(17).iter().map(|t| t + request * 1000).collect();
+            p.publish(0, &pr, 4, |_| Ok(())).unwrap();
+            p.release_prefix(0);
+            p.retire_released(0);
+            let maps = ops.maps.load(Ordering::SeqCst);
+            copy_out(&p.shared, 0, p.shared.generation[0].load(Ordering::Acquire));
+            refill_spares(&p.shared);
+            let (queued, mapped) = (drops(&stalled), ops.maps.load(Ordering::SeqCst) - maps);
+            if request >= 1 {
+                assert!(p.stats().nodes_evicted > 0, "request {request}: the cache must be full");
+                assert_eq!(queued, 0, "request {request}: spare drops queued");
+                assert_eq!(mapped, 0, "request {request}: copy-out or refill mapped");
+            }
+        }
+        assert_eq!(p.stats().blocks_copied_out, 6 * 4);
+        assert_eq!(p.stats().spares_dropped, 0);
+        drop(stalled);
+        drop(p);
+        assert_balanced(&ops);
+    }
+
+    /// The 4096 C1 cost of slotclear-t4-arms4-v4r on CPU: copied (8192-like) prefixes fill the cache, then
+    /// snapshot-only (4096-like, below one block) publishes evict them. No copy-out runs to consume the
+    /// returned copies, so once the one-column slack is used every evicted copied prefix queues one drop per
+    /// track (78 per rank in production: 1638 drops per rank over that cell = 21 prefixes).
+    #[test]
+    fn release_retire_snapshot_only_publishes_drop_the_copies_they_evict() {
+        let ops = strict_ops();
+        let geo = VmmGeometry {
+            full_layers: vec![0, 1],
+            kvh_full: 1,
+            hd_full: 4,
+            slide_layers: vec![],
+            kvh_slide: 1,
+            hd_slide: 4,
+            window: 0,
+            elem: 2,
+            elem_slide: 2,
+            max_ctx: 32,
+            batch: 2,
+        };
+        // Three copied prefixes (2 blocks x 4 tracks + snapshot, 516 B each) fit under 1600 B.
+        let mut p = VmmKv::new(ops.clone(), geo, 64, 1600).expect("pool");
+        p.enable_block_recycling(16 * 64);
+        let stalled = p.stall_reclaim();
+        p.enable_release_retire();
+        refill_spares(&p.shared);
+        let drops = |rx: &std::sync::mpsc::Receiver<Job>| {
+            rx.try_iter().filter(|job| matches!(job, Job::DropSpare { .. })).count()
+        };
+        for request in 0..3u32 {
+            p.begin_seq(0);
+            p.ensure_rows(0, 24).unwrap();
+            let pr: Vec<u32> = prompt(17).iter().map(|t| t + request * 1000).collect();
+            p.publish(0, &pr, 4, |_| Ok(())).unwrap();
+            p.release_prefix(0);
+            p.retire_released(0);
+            copy_out(&p.shared, 0, p.shared.generation[0].load(Ordering::Acquire));
+            refill_spares(&p.shared);
+        }
+        assert_eq!(p.stats().blocks_copied_out, 12);
+        assert_eq!(spares(&p), 8);
+        drops(&stalled);
+        let mut per_publish = Vec::new();
+        for request in 0..3u32 {
+            p.begin_seq(1);
+            p.ensure_rows(1, 8).unwrap();
+            let tokens: Vec<u32> = (0..8).map(|i| 50_000 + request * 100 + i).collect();
+            p.publish_at(1, &tokens, 7, 520, |_| Ok(())).unwrap();
+            p.release_prefix(1);
+            p.retire_released(1);
+            copy_out(&p.shared, 1, p.shared.generation[1].load(Ordering::Acquire));
+            per_publish.push(drops(&stalled));
+        }
+        assert_eq!(p.stats().blocks_copied_out, 12, "snapshot-only publishes copy nothing");
+        assert_eq!(per_publish, vec![0, 4, 4], "slack column first, then one drop per track per evicted prefix");
+        drop(stalled);
+        drop(p);
+        assert_balanced(&ops);
+    }
+
+    /// A publish flush holds an engine section: a spare drop already queued does not unmap until it ends.
+    #[test]
+    fn release_retire_spare_drop_waits_for_the_publish_section() {
+        let ops = strict_ops();
+        let mut p = uniform_pool(ops.clone());
+        let stalled = p.stall_reclaim();
+        let generation = released_with_shared_row_zero(&mut p, &prompt(17));
+        refill_spares(&p.shared);
+        copy_out(&p.shared, 0, generation);
+        {
+            let mut inner = p.shared.inner.lock();
+            while evict_one(&p.shared, &mut inner, false) {}
+        }
+        assert_eq!(spares(&p), 8);
+        // Pool cap to zero: the spare cap falls to one per track (4), so every drop proceeds.
+        p.shared.pool_cap.store(0, Ordering::Relaxed);
+        let (track, slot) = {
+            let inner = p.shared.inner.lock();
+            (0..inner.tracks.len())
+                .find_map(|t| {
+                    let slots = inner.tracks[t].copy.first()?;
+                    let i = slots.1.iter().position(|s| matches!(s, CopySlot::Spare(_)))?;
+                    Some((t, i as u32))
+                })
+                .expect("a spare")
+        };
+        let unmaps = ops.unmaps.load(Ordering::SeqCst);
+        let section = EngineSection::enter();
+        let shared = Arc::clone(&p.shared);
+        let job = std::thread::spawn(move || drop_spare(&shared, track, slot));
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert_eq!(ops.unmaps.load(Ordering::SeqCst), unmaps, "drop unmapped inside the section");
+        drop(section);
+        job.join().unwrap();
+        assert_eq!(ops.unmaps.load(Ordering::SeqCst), unmaps + 1);
+        assert_eq!(p.stats().spares_dropped, 1);
+        drop(stalled);
+        drop(p);
+        assert_balanced(&ops);
+    }
+
+    /// Copies run with the pool lock released, so publish / ensure_rows / map-ahead never wait on
+    /// them; a `begin_seq` racing a chunk in flight waits it out before its inline swap unmaps the
+    /// source, and the job's next chunk and its commit see the new generation.
+    #[test]
+    fn release_retire_copies_off_the_pool_lock_and_admission_waits_out_the_chunk() {
+        let ops = strict_ops();
+        let mut p = uniform_pool(ops.clone());
+        let stalled = p.stall_reclaim();
+        let generation = released_with_shared_row_zero(&mut p, &prompt(17));
+        p.shared.admission_wait_us.store(0, Ordering::Relaxed);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (shared, mock) = (Arc::clone(&p.shared), Arc::clone(&ops));
+        *ops.copy_hook.lock().unwrap() = Some(Box::new(move |src| {
+            entered_tx.send(shared.inner.try_lock().is_some()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(mock.mapped.lock().unwrap().contains(&src), "copy source unmapped mid-copy");
+        }));
+        let shared = Arc::clone(&p.shared);
+        let job = std::thread::spawn(move || copy_out(&shared, 0, generation));
+        assert!(entered_rx.recv().unwrap(), "pool lock held during the copy");
+        p.begin_seq(0);
+        job.join().expect("copy source stayed mapped");
+        assert_eq!(p.stats().blocks_copied_out, 0, "the new generation won");
+        assert_eq!(ops.unmaps.load(Ordering::SeqCst), 4, "shared row 0 swapped inline after the chunk");
+        assert_eq!(spares(&p), 4);
+        assert!(!p.shared.inner.lock().copy_reading[0]);
+        drop(stalled);
+        drop(p);
+        assert_balanced(&ops);
+    }
+
+    /// Re-admitted before the job runs: `begin_seq` swaps the shared row 0 inline as without the
+    /// knob, and the job, carrying the old generation, does nothing.
+    #[test]
+    fn release_retire_job_is_a_no_op_once_the_slot_is_readmitted() {
+        let ops = strict_ops();
+        let mut p = uniform_pool(ops.clone());
+        let stalled = p.stall_reclaim();
+        let pr = prompt(17);
+        let generation = released_with_shared_row_zero(&mut p, &pr);
+        p.begin_seq(0);
+        assert_eq!(ops.unmaps.load(Ordering::SeqCst), 4, "shared row 0 unmapped inline");
+        p.ensure_rows(0, 1).unwrap();
+        let calls = (ops.maps.load(Ordering::SeqCst), ops.unmaps.load(Ordering::SeqCst));
+        copy_out(&p.shared, 0, generation);
+        assert_eq!((ops.maps.load(Ordering::SeqCst), ops.unmaps.load(Ordering::SeqCst)), calls);
+        assert_eq!(ops.copies.load(Ordering::SeqCst), 0);
+        assert_eq!(p.stats().blocks_copied_out, 0);
+        assert!(!p.shared.inner.lock().copying[0]);
+        drop(stalled);
+        drop(p);
+        assert_balanced(&ops);
+    }
+
+    /// A new occupant beginning between the job's maps and its copy: the copy re-checks the
+    /// generation under the pool lock, copies and commits nothing, and keeps its targets as spares.
+    #[test]
+    fn release_retire_discards_the_copy_when_a_new_occupant_begins_mid_job() {
+        let ops = strict_ops();
+        let mut p = uniform_pool(ops.clone());
+        let stalled = p.stall_reclaim();
+        let pr = prompt(17);
+        let generation = released_with_shared_row_zero(&mut p, &pr);
+        let shared = Arc::clone(&p.shared);
+        *ops.map_hook.lock().unwrap() = Some(Box::new(move || {
+            shared.generation[0].fetch_add(1, Ordering::Release);
+        }));
+        copy_out(&p.shared, 0, generation);
+        let st = p.stats();
+        assert_eq!(ops.copies.load(Ordering::SeqCst), 0);
+        assert_eq!(st.blocks_copied_out, 0);
+        assert_eq!(st.cache_blocks, 8);
+        assert_eq!(spares(&p), 4, "the unused copy targets stay mapped as spares");
+        assert_eq!(ops.unmaps.load(Ordering::SeqCst), 0);
+        p.begin_seq(0);
+        assert_eq!(ops.unmaps.load(Ordering::SeqCst), 4, "shared row 0 inline, as without the knob");
+        drop(stalled);
+        drop(p);
+        assert_balanced(&ops);
+    }
+
+    /// Another slot attached the prefix before the job ran: row 0 is mapped by two windows, so it
+    /// is not the released slot's to take, and admission swaps it inline as before.
+    #[test]
+    fn release_retire_skips_row_zero_another_attached_slot_still_maps() {
+        let ops = strict_ops();
+        let mut p = uniform_pool(ops.clone());
+        let stalled = p.stall_reclaim();
+        let pr = prompt(17);
+        p.enable_block_recycling(16 * 64);
+        p.enable_release_retire();
+        p.ensure_rows(0, 24).unwrap();
+        p.publish(0, &pr, 4, |_| Ok(())).unwrap();
+        p.ensure_rows(1, 1).unwrap();
+        assert_eq!(p.try_attach(1, &pr).unwrap().expect("hit").rows, 16);
+        p.finish_attach(1);
+        p.release_prefix(0);
+        p.retire_released(0);
+        let generation = p.shared.generation[0].load(Ordering::Acquire);
+        copy_out(&p.shared, 0, generation);
+        assert_eq!(ops.copies.load(Ordering::SeqCst), 0);
+        assert_eq!(p.stats().blocks_copied_out, 0);
+        let unmaps = ops.unmaps.load(Ordering::SeqCst);
+        p.begin_seq(0);
+        assert_eq!(ops.unmaps.load(Ordering::SeqCst), unmaps + 4);
+        drop(stalled);
+        drop(p);
+        assert_balanced(&ops);
+    }
+
+    /// Turn 2 in turn 1's slot after a copy-out: the attach maps the copies over the kept private
+    /// row 0 and still keeps the stale column that is the published block itself.
+    #[test]
+    fn release_retire_then_same_slot_attach_remaps_only_row_zero() {
+        let ops = strict_ops();
+        let mut p = uniform_pool(ops.clone());
+        let stalled = p.stall_reclaim();
+        let pr = prompt(17);
+        let generation = released_with_shared_row_zero(&mut p, &pr);
+        copy_out(&p.shared, 0, generation);
+        p.begin_seq(0);
+        let (maps, unmaps) = (ops.maps.load(Ordering::SeqCst), ops.unmaps.load(Ordering::SeqCst));
+        assert_eq!(p.try_attach(0, &pr).unwrap().expect("hit").rows, 16);
+        assert_eq!(ops.unmaps.load(Ordering::SeqCst) - unmaps, 4, "the private row 0");
+        assert_eq!(ops.maps.load(Ordering::SeqCst) - maps, 4, "the copies");
+        assert_eq!(p.stats().blocks_attach_kept, 4, "column 1 kept in place");
+        p.finish_attach(0);
+        reclaim_stale(&p.shared, 0);
+        assert_eq!(p.stats().blocks_stale, 0);
+        drop(stalled);
+        drop(p);
+        assert_balanced(&ops);
+    }
+
+    /// Eviction before the commit (the prefix is gone, nothing commits, the released slot's row 0
+    /// became private through the eviction itself) and pressure eviction after it (the copies
+    /// are the cache's only references and park in the pool).
+    #[test]
+    fn release_retire_survives_eviction_during_and_after_the_copy() {
+        let ops = strict_ops();
+        let mut p = uniform_pool(ops.clone());
+        let stalled = p.stall_reclaim();
+        let pr = prompt(17);
+        let generation = released_with_shared_row_zero(&mut p, &pr);
+        let shared = Arc::clone(&p.shared);
+        *ops.map_hook.lock().unwrap() = Some(Box::new(move || {
+            let mut inner = shared.inner.lock();
+            while evict_one(&shared, &mut inner, false) {}
+        }));
+        copy_out(&p.shared, 0, generation);
+        let st = p.stats();
+        assert_eq!(st.blocks_copied_out, 0);
+        assert_eq!(st.cache_blocks, 0);
+        assert_eq!(spares(&p), 4);
+        let unmaps = ops.unmaps.load(Ordering::SeqCst);
+        p.begin_seq(0);
+        assert_eq!(ops.unmaps.load(Ordering::SeqCst), unmaps, "row 0 private after the eviction");
+        drop(stalled);
+        drop(p);
+        assert_balanced(&ops);
+
+        let ops = strict_ops();
+        let mut p = uniform_pool(ops.clone());
+        let stalled = p.stall_reclaim();
+        let generation = released_with_shared_row_zero(&mut p, &pr);
+        copy_out(&p.shared, 0, generation);
+        assert_eq!(p.stats().blocks_copied_out, 4);
+        *ops.free_bytes.lock().unwrap() = Some(0);
+        p.enable_pressure_eviction(1);
+        p.begin_seq(0);
+        let st = p.stats();
+        assert_eq!(st.cache_blocks, 0);
+        assert!(st.nodes_evicted >= 2);
+        assert_eq!(st.blocks_kept, 4, "row 0 still the slot's own");
+        assert_eq!(spares(&p), 4, "the evicted copies stay mapped as spares");
+        drop(stalled);
+        drop(p);
+        assert_balanced(&ops);
+    }
+
+    /// The copy-out against a live reclaimer thread, racing admission, attach, regrowth and spare
+    /// trimming on two slots (a 4-block pool cap forces `DropSpare`): no VA mapped twice or
+    /// unmapped while unmapped, every block released exactly once.
+    #[test]
+    fn release_retire_races_admission_attach_and_the_reclaimer() {
+        let ops = strict_ops();
+        let mut p = uniform_pool(ops.clone());
+        p.enable_block_recycling(4 * 64);
+        p.enable_deferred_reclaim();
+        p.enable_release_retire();
+        let pr = prompt(17);
+        p.ensure_rows(0, 24).unwrap();
+        p.publish(0, &pr, 4, |_| Ok(())).unwrap();
+        for round in 0..400 {
+            let seq = round % 2;
+            p.release_prefix(seq);
+            p.retire_released(seq);
+            if round % 3 == 0 {
+                p.sync_reclaim();
+            }
+            p.begin_seq(seq);
+            p.ensure_rows(seq, 1).unwrap();
+            if let Some(hit) = p.try_attach(seq, &pr).unwrap() {
+                assert_eq!(hit.rows, 16);
+                p.finish_attach(seq);
+            }
+            p.ensure_rows(seq, 24).unwrap();
+        }
+        p.sync_reclaim();
+        assert_eq!(ops.violations.load(Ordering::SeqCst), 0);
         drop(p);
         assert_balanced(&ops);
     }

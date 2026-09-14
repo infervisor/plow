@@ -305,6 +305,13 @@ pub struct RuntimeConfig {
     #[arg(long = "vmm-deferred-reclaim", env = "PLOW_VMM_DEFERRED_RECLAIM", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub vmm_deferred_reclaim: bool,
 
+    /// AMD shared-prefix VMM KV: when a request finishes, settle its slot's cache-shared row-0
+    /// block on the pool's background thread, so the next admission finds row 0 private instead
+    /// of paying the unmap/map inline in `begin_slot`. Needs `--vmm-deferred-reclaim`.
+    /// Default on (checkpoint P, perf-certs/rt.vmm_release_retire.json); `=0` is the rollback.
+    #[arg(long = "vmm-release-retire", env = "PLOW_VMM_RELEASE_RETIRE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub vmm_release_retire: bool,
+
     // ──────────────────────────────────────────────────────────────────────────
     // Diagnostic / observability (shared, off by default)
     // ──────────────────────────────────────────────────────────────────────────
@@ -1451,6 +1458,14 @@ impl RuntimeConfig {
         select_compat(
             self.vmm_deferred_reclaim,
             Self::env_bool("PLOW_VMM_DEFERRED_RECLAIM"),
+            !Self::is_initialized(),
+        )
+    }
+
+    pub(crate) fn vmm_release_retire(&self) -> bool {
+        select_compat(
+            self.vmm_release_retire,
+            Self::env_bool("PLOW_VMM_RELEASE_RETIRE"),
             !Self::is_initialized(),
         )
     }

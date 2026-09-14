@@ -1312,6 +1312,11 @@ impl AmdTpGroup {
 
     /// Run any deferred prefix publish on every rank; returns its wall time.
     fn flush_deferred_publish(&mut self) -> Result<u64> {
+        // Its cache evictions queue the pool threads' spare drops, whose unmaps share ROCr's process-wide
+        // lock with this publish's snapshot allocations and copies: hold them until the flush is done.
+        let _section = crate::config::RuntimeConfig::get()
+            .vmm_release_retire()
+            .then(crate::memory::vmm::EngineSection::enter);
         let t = std::time::Instant::now();
         let mut result = Ok(());
         for rank in &mut self.ranks {

@@ -48,6 +48,14 @@ const UNION_SKIP_QUALIFIED: Status = Status::Qualified {
         "docs/flags-reference.md: `=0` is the rollback",
     ],
 };
+const RELEASE_RETIRE_QUALIFIED: Status = Status::Qualified {
+    evidence: &[
+        "perf-certs/rt.vmm_release_retire.json: checkpoint P accepts 8192 C1 TTFT 757.2 -> 654.2 ms (floor 21.3), 8192 C16 TTFT 1490.7 -> 1312.7 (floor 7.3), 4096 C1 neutral within 3.5 (no whole block published, copy-out never fires), 24 serving entries not worse",
+        "review log #99: slotclear-t4-arms-v5 served A/B (ctrl/treat/ctrl2/treat2, tip default config), begin_slot clear 100 -> 0.5 ms at 8192 C1; TTFT -102.5 ms (8192 C1), -178 (8192 C16); TPOT -9.6 ms at 8192 C16; E2E -92 ms (8192 C1), -1.4 s (8192 C16); retrieval 39/39, serving guard PASS",
+        "review log #99: tradeoff at 8192 C16, decode-tick p99 +1.9 ms (the two decode ticks after a prefill run the deferred spare drops) against TPOT p99 -10 ms; drop pacing is follow-up",
+        "docs/flags-reference.md: `=0` is the rollback",
+    ],
+};
 const PROMOTED: Status = Status::Qualified {
     evidence: &["docs/flags-reference.md: a promoted default; `=false` is the rollback"],
 };
@@ -319,6 +327,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.preload", Some("PLOW_PRELOAD"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.kv_pool_mib", Some("PLOW_KV_POOL_MIB"), Layer::Runtime, USIZE, Default::Static(Val::Nat(512)), OPT_IN),
     KnobSpec::new("rt.vmm_deferred_reclaim", Some("PLOW_VMM_DEFERRED_RECLAIM"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
+    KnobSpec::new("rt.vmm_release_retire", Some("PLOW_VMM_RELEASE_RETIRE"), Layer::Runtime, Domain::Bool, ON, RELEASE_RETIRE_QUALIFIED),
     KnobSpec::new("rt.ttft_log", Some("PLOW_TTFT_LOG"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.pfx_log", Some("PLOW_PFX_LOG"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.tick_log", Some("PLOW_TICK_LOG"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
