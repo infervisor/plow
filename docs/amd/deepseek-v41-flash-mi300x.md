@@ -197,6 +197,44 @@ make it one. Two things it is still worth reading for:
 * V4-Flash-0731 DOES run on this vLLM, so it remains available as a measured
   comparison point on the same 8 cards.
 
+### 4.2 Porting the shipped reference to ROCm: how far it gets
+
+The reference is written for NVIDIA. Running it on MI300X took six fixes to
+the `nix develop` / system-ROCm toolchain seam (see the commit log), then hit
+two real gaps in tilelang's ROCm backend. Status as of 2026-09-14:
+
+| stage | state |
+|---|---|
+| model builds across TP8 | works, every attempt |
+| 501 GB MP8 checkpoint loads | works, every attempt |
+| mHC Sinkhorn kernel (`hc_split_sinkhorn`) | compiles and runs |
+| UE8M0 block scales | fixed here -- `scripts/dsv41_tl_hip_ue8m0.py` |
+| fp8 GEMM | **blocked, and not by a missing alias** |
+
+The fp8 blocker is worth stating carefully, because the cheap fix is a trap.
+tilelang raises `KeyError: dtype('float8_e4m3')` from
+`rocm/intrinsics/mfma_macro_generator.py`, whose MFMA-prefix map carries only
+`float8_e4m3fn` and `float8_e4m3fnuz` while `kernel.py:14` spells it
+`float8_e4m3`. Adding the key makes it compile. It would also be WRONG:
+
+* the checkpoint stores OCP e4m3 (`torch.float8_e4m3fn`);
+* CDNA3 reads fp8 MFMA operands as **FNUZ** -- tilelang's own header picks
+  `TILELANG_FP8_E4M3_VARIANT_FNUZ` for gfx940/941/942, and
+  `v_mfma_f32_32x32x16_fp8_fp8` assembles for gfx942 as the FNUZ form;
+* OCP bias is 7 and FNUZ bias is 8, so feeding OCP bytes to that instruction
+  is a factor-of-two error on every fp8 weight, silently.
+
+ROCm 7.14 does convert OCP on gfx942 (`__hip_cvt_float_to_fp8(..., __HIP_E4M3)`
+compiles, verified), but conversion is not what the GEMM does: it consumes the
+stored bytes directly. So a correct fp8 path on this part needs either an
+OCP->FNUZ re-encode of the weights (which loses the top binade, since the
+exponent ranges differ by 2x) or an in-kernel dequantize.
+
+This is the same shape as section 5.3's MXFP4 finding, and it has the same
+resolution: gfx950 has native OCP fp8 AND an fp4 matrix engine, so the
+reference's own dtypes land there without re-encoding. On gfx942 both the
+reference and plow need a conversion layer that does not exist yet.
+
 ## 5. Kernel extraction: what V4.1 needs against what plow has
 
 The V4 campaign left plow with most of the primitives. What follows maps each
