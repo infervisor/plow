@@ -559,6 +559,40 @@ Control reproducibility on this runtime is excellent: stack-t4 ctl 520.6 / ctl2 
 Row-band alone under this branch's plowrt is ~9 ms faster than under lever-hunt's, so the stack
 needs -29.8 ms rather than -38.4 to reach 490.
 
+## MTP and the TTFT stack are on mutually exclusive packets (2026-09-14)
+
+The goal now has three parts -- 8K C1 TTFT under 490 ms, C1 decode TPOT 25 ms, and serving
+throughput beating vLLM. The first two cannot be satisfied by one packet as things stand.
+
+`assets-c6-mtp` (packet `1f7776fd053480f7`, the one `spec-t3` measures) was emitted with
+`PLOW_GLM_SEQ_PAR=0` and `PLOW_GLM_SEQ_PAR_PROJ=0` EXPLICITLY. `emit.glm_seq_par` is a
+Production default that resolves TRUE for GLM TP8 (`knob_spec.rs:799`; the resolver test at
+`knob_spec.rs:2087` asserts it), and `emit_config.replay` omits defaults -- so its presence in
+the MTP replay block means it was deliberately overridden, while `rb-rowband` and `stack-rb`
+carry no entry and therefore run WITH sequence parallelism.
+
+`plans/mtp-spec-decode.md` gives the reason in one line: prefill-MTP runs the layer-78 block over
+all T rows to fill `kv.78`, but "under SP prefill, `xn` is valid on the rank's band only
+(`mla.rs:9452`). Refuse SP+MTP first."
+
+Consequences to hold onto:
+
+* **`spec-t3`'s TPOT win will not transfer as measured.** It runs a packet with neither SP nor
+  row-band, so its TTFT is nowhere near 519 ms and its decode step is not the decode step the
+  490 ms configuration runs. Treat it as "does MTP work and what is the accept length", not as
+  "what is C1 TPOT on the shipping packet".
+* **MTP costs TTFT.** Prefill gains a 79th layer's worth of work (about +1/78) to fill the MTP
+  KV, so turning MTP on moves the 490 ms goal away by roughly +7 ms unless the fill is deferred
+  past the first token or overlapped.
+* **The 90.7% acceptance figure is from random-token prompts with `--ignore-eos`**, which
+  generate degenerate repetitive text that MTP predicts almost for free. `spec-t3` has
+  natural-text cells precisely for this; the natural cells decide the lever.
+
+The path to holding both goals at once is to lift the SP refusal rather than to choose between
+them, and row-band is the precedent: it already makes ATTENTION run on each rank's own T/8 band.
+Either the layer-78 block runs per band the same way, or `xn` is all-gathered once before it.
+Neither is scoped yet.
+
 ## Rejected or parked
 
 | candidate | reason |
