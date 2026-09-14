@@ -228,6 +228,34 @@ inline float4 dot4_bf16(device const ushort* W, uint ldw, device const ushort* x
     return float4(simd_sum(acc.x), simd_sum(acc.y), simd_sum(acc.z), simd_sum(acc.w));
 }
 #ifdef PLOW_BF16_M2
+inline float4 dot_glu_bf16_pair(device const ushort* Wg, device const ushort* Wu,
+                               device const ushort* x, uint K, uint lane) {
+    float4 acc = 0.0f;
+    uint k = lane * 8u;
+    for (; k + 8u <= K; k += 256u) {
+        float4 x0 = bf4(*(device const ushort4*)(x + k));
+        float4 x1 = bf4(*(device const ushort4*)(x + k + 4u));
+        float4 y0 = bf4(*(device const ushort4*)(x + K + k));
+        float4 y1 = bf4(*(device const ushort4*)(x + K + k + 4u));
+        float4 g0 = bf4(*(device const ushort4*)(Wg + k));
+        float4 g1 = bf4(*(device const ushort4*)(Wg + k + 4u));
+        float4 u0 = bf4(*(device const ushort4*)(Wu + k));
+        float4 u1 = bf4(*(device const ushort4*)(Wu + k + 4u));
+        acc.x += dot(g0, x0) + dot(g1, x1);
+        acc.y += dot(u0, x0) + dot(u1, x1);
+        acc.z += dot(g0, y0) + dot(g1, y1);
+        acc.w += dot(u0, y0) + dot(u1, y1);
+    }
+    for (k = (K & ~7u) + lane; k < K; k += 32u) {
+        float xv = bf2f(x[k]), yv = bf2f(x[K + k]);
+        float gv = bf2f(Wg[k]), uv = bf2f(Wu[k]);
+        acc.x += gv * xv;
+        acc.y += uv * xv;
+        acc.z += gv * yv;
+        acc.w += uv * yv;
+    }
+    return float4(simd_sum(acc.x), simd_sum(acc.y), simd_sum(acc.z), simd_sum(acc.w));
+}
 inline void dot4_bf16_pair(device const ushort* W, uint ldw, device const ushort* x,
                           uint K, uint lane, thread float4& a0, thread float4& a1) {
     float4 acc0 = 0.0f, acc1 = 0.0f;
@@ -503,6 +531,20 @@ void op_gemv_glu(const thread Inst& in, device const ulong* tab, uint slice, uin
                 C[N + n] = f2bf(glu_pair(g.y, u.y, act, f0, f1));
                 C[2u * N + n] = f2bf(glu_pair(g.z, u.z, act, f0, f1));
                 C[3u * N + n] = f2bf(glu_pair(g.w, u.w, act, f0, f1));
+            }
+        }
+        return;
+    }
+#endif
+#ifdef PLOW_BF16_M2
+    if (M == 2u) {
+        for (uint n = n0 + sg; n < n1; n += NSG) {
+            float4 a = dot_glu_bf16_pair(Wg + n * K, Wu + n * K, x, K, lane);
+            if (bg) { float b = bf2f(bg[n]); a.x += b; a.z += b; }
+            if (bu) { float b = bf2f(bu[n]); a.y += b; a.w += b; }
+            if (lane == 0) {
+                C[n] = f2bf(glu_pair(a.x, a.y, act, f0, f1));
+                C[N + n] = f2bf(glu_pair(a.z, a.w, act, f0, f1));
             }
         }
         return;
