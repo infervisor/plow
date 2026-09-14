@@ -1846,7 +1846,8 @@ pub enum DevOp {
     /// groups and combines routed experts in BF16. Mode 0 converts the result to FP32.
     /// This is a separate numerical contract from the FP64 grouped-down path.
     /// `t0=out t1=x t2=weights t3=scales t4=meta_or_raw_routes t5=row_token t6=row_part t7=row_gate` ·
-    /// `i0=T i1=H i2=I i3=E i4=topk i5=align_tile i6=mode i7=resident_weights`. Requires an isolated native segment.
+    /// `i0=T i1=H i2=I i3=E i4=topk i5=align_tile i6=mode i7=resident_weights` ·
+    /// `j0=align_table j1=align_npart`. Requires an isolated native segment.
     /// `i6=1`: flat A16 decode, BF16 output plus eight scratch bytes, raw routing in t4,
     /// t5..t7 absent and i5=0. Combine as one BF16 partial (MoeCombinePf.i7=1).
     /// `i6=2`: sorted A8 prefill with direct BF16 output; combine as one BF16 partial.
