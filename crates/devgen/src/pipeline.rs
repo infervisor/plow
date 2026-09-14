@@ -120,10 +120,7 @@ pub fn causal_pipeline_section(
                 ("hidden".into(), u64::from(spec.hidden)),
                 ("decode_capacity".into(), u64::from(spec.decode_capacity)),
                 ("overlay_rows".into(), u64::from(spec.overlay_rows)),
-                (
-                    "ordered_dispatch".into(),
-                    u64::from(spec.ordered_dispatch),
-                ),
+                ("ordered_dispatch".into(), u64::from(spec.ordered_dispatch)),
                 ("prefill_program_count".into(), prefill_count as u64),
                 (
                     "decode_program_count".into(),

@@ -101,7 +101,7 @@ enum Failure {
 struct Layer {
     span: Span,
     input: usize,
-    residual: usize,
+    output: usize,
     weights: [Buf; 3],
     scales: [Buf; 3],
     io: PreparedNet,
@@ -115,6 +115,7 @@ pub struct Channel {
     hidden: usize,
     channels: usize,
     encoding: u32,
+    mlp_act: u32,
     layers: Vec<Layer>,
     intermediate: Buf,
     gpu_partial: Buf,
@@ -196,7 +197,7 @@ fn packed(engine: &MetalEngine, weight: &Weight, encoding: u32) -> (Matrix, Matr
 fn cache_key(weights: &[Matrix; 3], rows: u32, os: &[u8]) -> String {
     use plow_asset::mixed_step::payload_sha256 as hash;
     let mut identity = format!(
-        "channel-mlp-v1-{rows}-{}-{}",
+        "channel-mlp-v2-{rows}-{}-{}",
         hash(os),
         hash(include_bytes!("../ane_mlp.rs"))
     );
@@ -249,7 +250,7 @@ impl Channel {
         let Plan::Channel(plan) =
             plow_asset::hetero::parse(&bytes).map_err(|e| err("channel sidecar", e))?
         else {
-            return Err(err("channel sidecar", "v3 channel plan required"));
+            return Err(err("channel sidecar", "v4 channel plan required"));
         };
         engine
             .model
@@ -257,7 +258,7 @@ impl Channel {
             .with_packet_view(|p| plan.validate(p))
             .map_err(|e| err("channel plan", e))?;
         if plan.programs.len() != 1 {
-            return Err(err("channel plan", "one 128-row program required"));
+            return Err(err("channel plan", "one prefill program required"));
         }
         let config = &crate::config::RuntimeConfig::get().apple;
         let count = config.ane_mlp_layers.unwrap_or(plan.layers.len());
@@ -312,6 +313,7 @@ impl Channel {
             hidden: h,
             channels: g,
             encoding,
+            mlp_act: plan.mlp_act,
             layers: Vec::with_capacity(count),
             intermediate: buffer(rows * g * 2)?,
             gpu_partial: buffer(rows * h * 4)?,
@@ -340,7 +342,14 @@ impl Channel {
             let ane = [ag, au, ad];
             let name = cache_key(&ane, pp.call_rows, &os.stdout);
             let spec = std::panic::catch_unwind(|| {
-                mlp_spec(pp.call_rows as usize, &ane[0], &ane[1], &ane[2], 0)
+                mlp_spec(
+                    pp.call_rows as usize,
+                    &ane[0],
+                    &ane[1],
+                    &ane[2],
+                    0,
+                    plan.mlp_act,
+                )
             })
             .map_err(|_| err("channel weights", "invalid FP16 weights"))?;
             let layers = spec.layers.len();
@@ -377,11 +386,11 @@ impl Channel {
                     .iter()
                     .position(|n| n == &span.input)
                     .unwrap(),
-                residual: engine
+                output: engine
                     .model
                     .names
                     .iter()
-                    .position(|n| n == &span.residual)
+                    .position(|n| n == &span.down_output)
                     .unwrap(),
                 weights: [upload(&gpu[0])?, upload(&gpu[1])?, upload(&gpu[2])?],
                 scales: [scale(&gpu[0])?, scale(&gpu[1])?, scale(&gpu[2])?],
@@ -455,7 +464,7 @@ impl Channel {
             self.clen,
             self.hidden as u32,
             self.channels as u32,
-            self.encoding,
+            self.encoding | (self.mlp_act << 3),
         ];
         self.encode(
             &cb,
@@ -539,7 +548,7 @@ impl Channel {
                 count,
             );
         }
-        let residual = l.residual;
+        let output_handle = l.output;
         let finish = engine
             .queue
             .commandBuffer()
@@ -550,8 +559,8 @@ impl Channel {
             &[
                 &self.gpu_partial,
                 &self.ane_partial,
-                &engine.bufs[residual],
-                &engine.bufs[residual],
+                &engine.bufs[output_handle],
+                &engine.bufs[output_handle],
             ],
             &[count as u32, 1, 0, 0],
             count.div_ceil(256),

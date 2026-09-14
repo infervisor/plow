@@ -213,11 +213,7 @@ mod tests {
     fn parses_an_ordinary_list() {
         assert_eq!(
             m("0,1,2").entries,
-            vec![
-                Selector::Index(0),
-                Selector::Index(1),
-                Selector::Index(2)
-            ]
+            vec![Selector::Index(0), Selector::Index(1), Selector::Index(2)]
         );
         assert_eq!(m("0,1,2").truncated_at, None);
     }

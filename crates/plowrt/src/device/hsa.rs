@@ -1023,7 +1023,9 @@ impl HsaBackend {
                 )));
             }
             crate::device::visibility::HsaVisibility::ApplyHip { mask } => {
-                let keep = mask.apply(enumerated).expect("indices checked by hsa_visibility");
+                let keep = mask
+                    .apply(enumerated)
+                    .expect("indices checked by hsa_visibility");
                 if keep.is_empty() {
                     return Err(RuntimeError::Device(format!(
                         "HIP_VISIBLE_DEVICES={} selects no device out of the {enumerated} ROCr \

@@ -1308,8 +1308,12 @@ mod tests {
         let _target = EmitAmdGuard::set(false);
         let c = Config::parse(&fixture());
         let m = model(&c, 32768, 132, 0, false, 1);
-        let decode_ops: std::collections::BTreeSet<u16> =
-            m.progs.iter().flat_map(|p| p.insts.iter()).map(|d| d.op).collect();
+        let decode_ops: std::collections::BTreeSet<u16> = m
+            .progs
+            .iter()
+            .flat_map(|p| p.insts.iter())
+            .map(|d| d.op)
+            .collect();
         assert!(
             decode_ops.contains(&(DevOp::QwenGdnStep as u16)),
             "a decode model must carry the step op"

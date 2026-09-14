@@ -278,9 +278,11 @@ fn amd_tile_selection_follows_the_target_hwspec() {
             .iter()
             .find(|r| r.0 == op || r.1 == op || r.2 == op)
             .map(|r| match (r.0, isa.geometry()) {
-                (DevOp::Gemm, Some(g)) => {
-                    (g.gemm_tile.bm as i64, g.gemm_tile.bn as i64, g.gemm_tile.bk as i64)
-                }
+                (DevOp::Gemm, Some(g)) => (
+                    g.gemm_tile.bm as i64,
+                    g.gemm_tile.bn as i64,
+                    g.gemm_tile.bk as i64,
+                ),
                 _ => (r.3, r.4, r.5),
             })
     };

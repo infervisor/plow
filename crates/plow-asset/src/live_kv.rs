@@ -113,7 +113,8 @@ pub fn emit(packet: &Packet<'_>) -> Result<Manifest> {
     let position = handle("in.pos")?;
     let max_ctx = u32::try_from(packet.tensors[position as usize].bytes / 4)
         .map_err(|_| "context overflow")?;
-    let caches: Vec<_> = widest
+    let mut caches = BTreeMap::<[u16; 2], Cache>::new();
+    for d in widest
         .insts
         .iter()
         .filter(|d| {
@@ -122,7 +123,8 @@ pub fn emit(packet: &Packet<'_>) -> Result<Manifest> {
                 Some(DevOp::FlashDecode | DevOp::FlashDecodeFp8)
             )
         })
-        .map(|d| Cache {
+    {
+        let cache = Cache {
             pair: [d.t[3], d.t[4]],
             scales: (d.op == DevOp::FlashDecodeFp8 as u16).then_some([d.t[6], d.t[7]]),
             heads: d.i[2],
@@ -130,8 +132,14 @@ pub fn emit(packet: &Packet<'_>) -> Result<Manifest> {
             stride: d.i[3],
             window: d.i[4],
             mask: d.i[7],
-        })
-        .collect();
+        };
+        if let Some(existing) = caches.get(&cache.pair) {
+            require(existing == &cache, "conflicting shared cache geometry")?;
+        } else {
+            caches.insert(cache.pair, cache);
+        }
+    }
+    let caches: Vec<Cache> = caches.into_values().collect();
     let mut maps = Vec::new();
     for g in packet
         .generated
@@ -226,7 +234,7 @@ impl Manifest {
                     && !c.pair.contains(&self.position)
                     && !c.pair.contains(&self.kv_length)
                     && c.heads > 0
-                    && matches!(c.hd, 64 | 256 | 512)
+                    && matches!(c.hd, 64 | 128 | 256 | 512)
                     && c.stride > 0
                     && if c.window == 0 {
                         c.stride == self.max_ctx && c.mask == u32::MAX
@@ -407,7 +415,8 @@ impl Manifest {
                             && (d.i[2], d.i[6], d.i[3], d.i[4], d.i[7])
                                 == (c.heads, c.hd, c.stride, c.window, c.mask)
                     };
-                    require(valid && reads.insert(pair), "attention reader contract")?;
+                    require(valid, "attention reader contract")?;
+                    reads.insert(pair);
                 }
                 for (slot, &h) in d.t.iter().enumerate() {
                     require(
@@ -601,6 +610,7 @@ fn direct_operands(op: DevOp, d: &DevInst64, packet: &Packet<'_>) -> Result<()> 
                 | DevOp::NormResidual
                 | DevOp::NormResidualNorm
                 | DevOp::AddNorm
+                | DevOp::PerLayerInput
                 | DevOp::GemmGlu
                 | DevOp::GemvGlu
                 | DevOp::GemvQkv
@@ -618,6 +628,15 @@ fn direct_operands(op: DevOp, d: &DevInst64, packet: &Packet<'_>) -> Result<()> 
                 | DevOp::MoeDownMx
                 | DevOp::MoeGluMxPf
                 | DevOp::MoeDownMxPf
+                | DevOp::GemvMxfp4
+                | DevOp::GemvGluMxfp4
+                | DevOp::GemmMxfp4
+                | DevOp::GemmMedMxfp4
+                | DevOp::GemmSmallMxfp4
+                | DevOp::GemmWideMxfp4
+                | DevOp::GemmC5Mxfp4
+                | DevOp::GemmGluMxfp4
+                | DevOp::GemvQkvMxfp4
         ),
         "opcode has no audited direct-operand access contract",
     )

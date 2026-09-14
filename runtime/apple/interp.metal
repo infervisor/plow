@@ -76,7 +76,7 @@ inline ushort e4m3bf(uint c) {
 inline ushort4 e4m3bf4(uchar4 c) {
     return ushort4(e4m3bf(c.x), e4m3bf(c.y), e4m3bf(c.z), e4m3bf(c.w));
 }
-inline float4 bf4(ushort4 h) { return as_type<float4>(uint4(h) << 16); }
+inline float4 bf4(ushort4 h) { return float4(as_type<bfloat4>(h)); }
 
 template <typename T>
 inline device T* ten(device const ulong* tab, const thread Inst& in, uint k) {
@@ -227,6 +227,154 @@ inline float4 dot4_bf16(device const ushort* W, uint ldw, device const ushort* x
     }
     return float4(simd_sum(acc.x), simd_sum(acc.y), simd_sum(acc.z), simd_sum(acc.w));
 }
+#ifdef PLOW_BF16_M2
+inline float4 dot_glu_bf16_pair(device const ushort* Wg, device const ushort* Wu,
+                               device const ushort* x, uint K, uint lane) {
+    float4 acc = 0.0f;
+    uint k = lane * 8u;
+    for (; k + 8u <= K; k += 256u) {
+        float4 x0 = bf4(*(device const ushort4*)(x + k));
+        float4 x1 = bf4(*(device const ushort4*)(x + k + 4u));
+        float4 y0 = bf4(*(device const ushort4*)(x + K + k));
+        float4 y1 = bf4(*(device const ushort4*)(x + K + k + 4u));
+        float4 g0 = bf4(*(device const ushort4*)(Wg + k));
+        float4 g1 = bf4(*(device const ushort4*)(Wg + k + 4u));
+        float4 u0 = bf4(*(device const ushort4*)(Wu + k));
+        float4 u1 = bf4(*(device const ushort4*)(Wu + k + 4u));
+        acc.x += dot(g0, x0) + dot(g1, x1);
+        acc.y += dot(u0, x0) + dot(u1, x1);
+        acc.z += dot(g0, y0) + dot(g1, y1);
+        acc.w += dot(u0, y0) + dot(u1, y1);
+    }
+    for (k = (K & ~7u) + lane; k < K; k += 32u) {
+        float xv = bf2f(x[k]), yv = bf2f(x[K + k]);
+        float gv = bf2f(Wg[k]), uv = bf2f(Wu[k]);
+        acc.x += gv * xv;
+        acc.y += uv * xv;
+        acc.z += gv * yv;
+        acc.w += uv * yv;
+    }
+    return float4(simd_sum(acc.x), simd_sum(acc.y), simd_sum(acc.z), simd_sum(acc.w));
+}
+inline void dot4_bf16_pair(device const ushort* W, uint ldw, device const ushort* x,
+                          uint K, uint lane, thread float4& a0, thread float4& a1) {
+    float4 acc0 = 0.0f, acc1 = 0.0f;
+    uint k = lane * 8u;
+    for (; k + 8u <= K; k += 256u) {
+        float4 x0 = bf4(*(device const ushort4*)(x + k));
+        float4 x1 = bf4(*(device const ushort4*)(x + k + 4u));
+        float4 y0 = bf4(*(device const ushort4*)(x + K + k));
+        float4 y1 = bf4(*(device const ushort4*)(x + K + k + 4u));
+        for (uint r = 0; r < 4u; r++) {
+            device const ushort* w = W + r * ldw + k;
+            float4 w0 = bf4(*(device const ushort4*)w);
+            float4 w1 = bf4(*(device const ushort4*)(w + 4u));
+            acc0[r] += dot(w0, x0) + dot(w1, x1);
+            acc1[r] += dot(w0, y0) + dot(w1, y1);
+        }
+    }
+    for (k = (K & ~7u) + lane; k < K; k += 32u) {
+        float xv = bf2f(x[k]), yv = bf2f(x[K + k]);
+        for (uint r = 0; r < 4u; r++) {
+            float wv = bf2f(W[r * ldw + k]);
+            acc0[r] += wv * xv;
+            acc1[r] += wv * yv;
+        }
+    }
+    a0 = float4(simd_sum(acc0.x), simd_sum(acc0.y), simd_sum(acc0.z), simd_sum(acc0.w));
+    a1 = float4(simd_sum(acc1.x), simd_sum(acc1.y), simd_sum(acc1.z), simd_sum(acc1.w));
+}
+#endif
+#ifdef PLOW_BF16_M4
+inline float4 dot_bf16_quad(device const ushort* W, device const ushort* x,
+                           uint K, uint lane) {
+    float4 acc = 0.0f;
+    uint k = lane * 8u;
+    for (; k + 8u <= K; k += 256u) {
+        float4 w0 = bf4(*(device const ushort4*)(W + k));
+        float4 w1 = bf4(*(device const ushort4*)(W + k + 4u));
+        for (uint m = 0; m < 4u; m++) {
+            device const ushort* xm = x + m * K + k;
+            float4 x0 = bf4(*(device const ushort4*)xm);
+            float4 x1 = bf4(*(device const ushort4*)(xm + 4u));
+            acc[m] += dot(w0, x0) + dot(w1, x1);
+        }
+    }
+    for (k = (K & ~7u) + lane; k < K; k += 32u) {
+        float wv = bf2f(W[k]);
+        for (uint m = 0; m < 4u; m++) acc[m] += wv * bf2f(x[m * K + k]);
+    }
+    return float4(simd_sum(acc.x), simd_sum(acc.y), simd_sum(acc.z), simd_sum(acc.w));
+}
+inline void dot4_bf16_quad(device const ushort* W, uint ldw, device const ushort* x,
+                          uint K, uint lane, thread float4& a0, thread float4& a1,
+                          thread float4& a2, thread float4& a3) {
+    float4 acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    uint k = lane * 8u;
+    for (; k + 8u <= K; k += 256u) {
+        float4 x0 = bf4(*(device const ushort4*)(x + k));
+        float4 x1 = bf4(*(device const ushort4*)(x + k + 4u));
+        float4 y0 = bf4(*(device const ushort4*)(x + K + k));
+        float4 y1 = bf4(*(device const ushort4*)(x + K + k + 4u));
+        float4 z0 = bf4(*(device const ushort4*)(x + 2u * K + k));
+        float4 z1 = bf4(*(device const ushort4*)(x + 2u * K + k + 4u));
+        float4 t0 = bf4(*(device const ushort4*)(x + 3u * K + k));
+        float4 t1 = bf4(*(device const ushort4*)(x + 3u * K + k + 4u));
+        for (uint r = 0; r < 4u; r++) {
+            device const ushort* w = W + r * ldw + k;
+            float4 w0 = bf4(*(device const ushort4*)w);
+            float4 w1 = bf4(*(device const ushort4*)(w + 4u));
+            acc0[r] += dot(w0, x0) + dot(w1, x1);
+            acc1[r] += dot(w0, y0) + dot(w1, y1);
+            acc2[r] += dot(w0, z0) + dot(w1, z1);
+            acc3[r] += dot(w0, t0) + dot(w1, t1);
+        }
+    }
+    for (k = (K & ~7u) + lane; k < K; k += 32u) {
+        float xv = bf2f(x[k]), yv = bf2f(x[K + k]);
+        float zv = bf2f(x[2u * K + k]), tv = bf2f(x[3u * K + k]);
+        for (uint r = 0; r < 4u; r++) {
+            float wv = bf2f(W[r * ldw + k]);
+            acc0[r] += wv * xv;
+            acc1[r] += wv * yv;
+            acc2[r] += wv * zv;
+            acc3[r] += wv * tv;
+        }
+    }
+    a0 = float4(simd_sum(acc0.x), simd_sum(acc0.y), simd_sum(acc0.z), simd_sum(acc0.w));
+    a1 = float4(simd_sum(acc1.x), simd_sum(acc1.y), simd_sum(acc1.z), simd_sum(acc1.w));
+    a2 = float4(simd_sum(acc2.x), simd_sum(acc2.y), simd_sum(acc2.z), simd_sum(acc2.w));
+    a3 = float4(simd_sum(acc3.x), simd_sum(acc3.y), simd_sum(acc3.z), simd_sum(acc3.w));
+}
+#endif
+#ifdef PLOW_BF16_M8
+inline void dot_bf16_octet(device const ushort* W, device const ushort* x, uint K, uint lane,
+                          thread float4& a0, thread float4& a1) {
+    float4 acc0 = 0.0f, acc1 = 0.0f;
+    uint k = lane * 8u;
+    for (; k + 8u <= K; k += 256u) {
+        float4 w0 = bf4(*(device const ushort4*)(W + k));
+        float4 w1 = bf4(*(device const ushort4*)(W + k + 4u));
+        for (uint m = 0; m < 4u; m++) {
+            device const ushort* xm = x + m * K + k;
+            device const ushort* ym = xm + 4u * K;
+            acc0[m] += dot(w0, bf4(*(device const ushort4*)xm))
+                + dot(w1, bf4(*(device const ushort4*)(xm + 4u)));
+            acc1[m] += dot(w0, bf4(*(device const ushort4*)ym))
+                + dot(w1, bf4(*(device const ushort4*)(ym + 4u)));
+        }
+    }
+    for (k = (K & ~7u) + lane; k < K; k += 32u) {
+        float wv = bf2f(W[k]);
+        for (uint m = 0; m < 4u; m++) {
+            acc0[m] += wv * bf2f(x[m * K + k]);
+            acc1[m] += wv * bf2f(x[(m + 4u) * K + k]);
+        }
+    }
+    a0 = float4(simd_sum(acc0.x), simd_sum(acc0.y), simd_sum(acc0.z), simd_sum(acc0.w));
+    a1 = float4(simd_sum(acc1.x), simd_sum(acc1.y), simd_sum(acc1.z), simd_sum(acc1.w));
+}
+#endif
 inline float4 dot4_fp8(device const uchar* W, uint ldw, device const ushort* x, uint K, uint lane) {
     float4 acc = 0.0f;
     uint k = lane * 8u;
@@ -314,6 +462,118 @@ void op_gemv(const thread Inst& in, device const ulong* tab, uint slice, uint nb
     float eps = as_type<float>(in.fj[0]);
     uint n0, n1;
     range(N, slice, nblk, n0, n1);
+#ifdef PLOW_BF16_M8
+    if (M == 8u && norm == 0u) {
+        for (uint n = n0 + sg; n < n1; n += NSG) {
+            float4 a0, a1;
+            dot_bf16_octet(W + n * K, x, K, lane, a0, a1);
+            if (bias) {
+                float b = bf2f(bias[n]);
+                a0 += b;
+                a1 += b;
+            }
+            if (lane == 0) {
+                C[n] = f2bf(a0.x);
+                C[N + n] = f2bf(a0.y);
+                C[2u * N + n] = f2bf(a0.z);
+                C[3u * N + n] = f2bf(a0.w);
+                C[4u * N + n] = f2bf(a1.x);
+                C[5u * N + n] = f2bf(a1.y);
+                C[6u * N + n] = f2bf(a1.z);
+                C[7u * N + n] = f2bf(a1.w);
+            }
+        }
+        return;
+    }
+#endif
+#ifdef PLOW_BF16_M4
+    if (M == 8u && norm == 0u && (n0 % 4u) == 0u && (n1 % 4u) == 0u) {
+        for (uint n = n0 + sg * 4u; n + 4u <= n1; n += NSG * 4u) {
+            {
+                float4 a0, a1, a2, a3;
+                dot4_bf16_quad(W + n * K, K, x, K, lane, a0, a1, a2, a3);
+                if (bias) {
+                    float4 b = float4(bf2f(bias[n]), bf2f(bias[n + 1u]),
+                                      bf2f(bias[n + 2u]), bf2f(bias[n + 3u]));
+                    a0 += b; a1 += b; a2 += b; a3 += b;
+                }
+                if (lane == 0) {
+                    C[n] = f2bf(a0.x); C[n + 1u] = f2bf(a0.y);
+                    C[n + 2u] = f2bf(a0.z); C[n + 3u] = f2bf(a0.w);
+                    C[N + n] = f2bf(a1.x); C[N + n + 1u] = f2bf(a1.y);
+                    C[N + n + 2u] = f2bf(a1.z); C[N + n + 3u] = f2bf(a1.w);
+                    C[2u * N + n] = f2bf(a2.x); C[2u * N + n + 1u] = f2bf(a2.y);
+                    C[2u * N + n + 2u] = f2bf(a2.z); C[2u * N + n + 3u] = f2bf(a2.w);
+                    C[3u * N + n] = f2bf(a3.x); C[3u * N + n + 1u] = f2bf(a3.y);
+                    C[3u * N + n + 2u] = f2bf(a3.z); C[3u * N + n + 3u] = f2bf(a3.w);
+                }
+            }
+            {
+                float4 a0, a1, a2, a3;
+                dot4_bf16_quad(W + n * K, K, x + 4u * K, K, lane, a0, a1, a2, a3);
+                if (bias) {
+                    float4 b = float4(bf2f(bias[n]), bf2f(bias[n + 1u]),
+                                      bf2f(bias[n + 2u]), bf2f(bias[n + 3u]));
+                    a0 += b; a1 += b; a2 += b; a3 += b;
+                }
+                if (lane == 0) {
+                    C[4u * N + n] = f2bf(a0.x); C[4u * N + n + 1u] = f2bf(a0.y);
+                    C[4u * N + n + 2u] = f2bf(a0.z); C[4u * N + n + 3u] = f2bf(a0.w);
+                    C[5u * N + n] = f2bf(a1.x); C[5u * N + n + 1u] = f2bf(a1.y);
+                    C[5u * N + n + 2u] = f2bf(a1.z); C[5u * N + n + 3u] = f2bf(a1.w);
+                    C[6u * N + n] = f2bf(a2.x); C[6u * N + n + 1u] = f2bf(a2.y);
+                    C[6u * N + n + 2u] = f2bf(a2.z); C[6u * N + n + 3u] = f2bf(a2.w);
+                    C[7u * N + n] = f2bf(a3.x); C[7u * N + n + 1u] = f2bf(a3.y);
+                    C[7u * N + n + 2u] = f2bf(a3.z); C[7u * N + n + 3u] = f2bf(a3.w);
+                }
+            }
+        }
+        return;
+    }
+    if (M == 4u && norm == 0u && (n0 % 4u) == 0u && (n1 % 4u) == 0u) {
+        for (uint n = n0 + sg * 4u; n + 4u <= n1; n += NSG * 4u) {
+            float4 a0, a1, a2, a3;
+            dot4_bf16_quad(W + n * K, K, x, K, lane, a0, a1, a2, a3);
+            if (bias) {
+                float4 b = float4(bf2f(bias[n]), bf2f(bias[n + 1u]),
+                                  bf2f(bias[n + 2u]), bf2f(bias[n + 3u]));
+                a0 += b; a1 += b; a2 += b; a3 += b;
+            }
+            if (lane == 0) {
+                C[n] = f2bf(a0.x); C[n + 1u] = f2bf(a0.y);
+                C[n + 2u] = f2bf(a0.z); C[n + 3u] = f2bf(a0.w);
+                C[N + n] = f2bf(a1.x); C[N + n + 1u] = f2bf(a1.y);
+                C[N + n + 2u] = f2bf(a1.z); C[N + n + 3u] = f2bf(a1.w);
+                C[2u * N + n] = f2bf(a2.x); C[2u * N + n + 1u] = f2bf(a2.y);
+                C[2u * N + n + 2u] = f2bf(a2.z); C[2u * N + n + 3u] = f2bf(a2.w);
+                C[3u * N + n] = f2bf(a3.x); C[3u * N + n + 1u] = f2bf(a3.y);
+                C[3u * N + n + 2u] = f2bf(a3.z); C[3u * N + n + 3u] = f2bf(a3.w);
+            }
+        }
+        return;
+    }
+#endif
+#ifdef PLOW_BF16_M2
+    if (M == 2u && norm == 0u && (n0 % 4u) == 0u && (n1 % 4u) == 0u) {
+        for (uint n = n0 + sg * 4u; n + 4u <= n1; n += NSG * 4u) {
+            float4 a0, a1;
+            dot4_bf16_pair(W + n * K, K, x, K, lane, a0, a1);
+            if (bias) {
+                float4 b = float4(bf2f(bias[n]), bf2f(bias[n + 1u]),
+                                  bf2f(bias[n + 2u]), bf2f(bias[n + 3u]));
+                a0 += b;
+                a1 += b;
+            }
+            if (lane == 0) {
+                C[n] = f2bf(a0.x); C[n + 1u] = f2bf(a0.y);
+                C[n + 2u] = f2bf(a0.z); C[n + 3u] = f2bf(a0.w);
+                C[N + n] = f2bf(a1.x); C[N + n + 1u] = f2bf(a1.y);
+                C[N + n + 2u] = f2bf(a1.z); C[N + n + 3u] = f2bf(a1.w);
+            }
+        }
+        return;
+    }
+#endif
     for (uint m = 0; m < M; m++) {
         device const ushort* xm = x + m * K;
         float inv = norm == 2u ? rsqrt(row_ss(xm, K, lane) / float(K) + eps) : 1.0f;
@@ -354,6 +614,96 @@ void op_gemv_glu(const thread Inst& in, device const ulong* tab, uint slice, uin
     float f0 = as_type<float>(in.fj[0]), f1 = as_type<float>(in.fj[1]);
     uint n0, n1;
     range(N, slice, nblk, n0, n1);
+#ifdef PLOW_BF16_M8
+    if (M == 8u) {
+        for (uint n = n0 + sg; n < n1; n += NSG) {
+            float4 g0, g1, u0, u1;
+            dot_bf16_octet(Wg + n * K, x, K, lane, g0, g1);
+            dot_bf16_octet(Wu + n * K, x, K, lane, u0, u1);
+            if (bg) {
+                float b = bf2f(bg[n]);
+                g0 += b;
+                g1 += b;
+            }
+            if (bu) {
+                float b = bf2f(bu[n]);
+                u0 += b;
+                u1 += b;
+            }
+            if (lane == 0) {
+                C[n] = f2bf(glu_pair(g0.x, u0.x, act, f0, f1));
+                C[N + n] = f2bf(glu_pair(g0.y, u0.y, act, f0, f1));
+                C[2u * N + n] = f2bf(glu_pair(g0.z, u0.z, act, f0, f1));
+                C[3u * N + n] = f2bf(glu_pair(g0.w, u0.w, act, f0, f1));
+                C[4u * N + n] = f2bf(glu_pair(g1.x, u1.x, act, f0, f1));
+                C[5u * N + n] = f2bf(glu_pair(g1.y, u1.y, act, f0, f1));
+                C[6u * N + n] = f2bf(glu_pair(g1.z, u1.z, act, f0, f1));
+                C[7u * N + n] = f2bf(glu_pair(g1.w, u1.w, act, f0, f1));
+            }
+        }
+        return;
+    }
+#endif
+#ifdef PLOW_BF16_M4
+    if (M == 8u) {
+        for (uint n = n0 + sg; n < n1; n += NSG) {
+            {
+                float4 g = dot_bf16_quad(Wg + n * K, x, K, lane);
+                float4 u = dot_bf16_quad(Wu + n * K, x, K, lane);
+                if (bg) g += bf2f(bg[n]);
+                if (bu) u += bf2f(bu[n]);
+                if (lane == 0) {
+                    C[n] = f2bf(glu_pair(g.x, u.x, act, f0, f1));
+                    C[N + n] = f2bf(glu_pair(g.y, u.y, act, f0, f1));
+                    C[2u * N + n] = f2bf(glu_pair(g.z, u.z, act, f0, f1));
+                    C[3u * N + n] = f2bf(glu_pair(g.w, u.w, act, f0, f1));
+                }
+            }
+            {
+                float4 g = dot_bf16_quad(Wg + n * K, x + 4u * K, K, lane);
+                float4 u = dot_bf16_quad(Wu + n * K, x + 4u * K, K, lane);
+                if (bg) g += bf2f(bg[n]);
+                if (bu) u += bf2f(bu[n]);
+                if (lane == 0) {
+                    C[4u * N + n] = f2bf(glu_pair(g.x, u.x, act, f0, f1));
+                    C[5u * N + n] = f2bf(glu_pair(g.y, u.y, act, f0, f1));
+                    C[6u * N + n] = f2bf(glu_pair(g.z, u.z, act, f0, f1));
+                    C[7u * N + n] = f2bf(glu_pair(g.w, u.w, act, f0, f1));
+                }
+            }
+        }
+        return;
+    }
+    if (M == 4u) {
+        for (uint n = n0 + sg; n < n1; n += NSG) {
+            float4 g = dot_bf16_quad(Wg + n * K, x, K, lane);
+            float4 u = dot_bf16_quad(Wu + n * K, x, K, lane);
+            if (bg) g += bf2f(bg[n]);
+            if (bu) u += bf2f(bu[n]);
+            if (lane == 0) {
+                C[n] = f2bf(glu_pair(g.x, u.x, act, f0, f1));
+                C[N + n] = f2bf(glu_pair(g.y, u.y, act, f0, f1));
+                C[2u * N + n] = f2bf(glu_pair(g.z, u.z, act, f0, f1));
+                C[3u * N + n] = f2bf(glu_pair(g.w, u.w, act, f0, f1));
+            }
+        }
+        return;
+    }
+#endif
+#ifdef PLOW_BF16_M2
+    if (M == 2u) {
+        for (uint n = n0 + sg; n < n1; n += NSG) {
+            float4 a = dot_glu_bf16_pair(Wg + n * K, Wu + n * K, x, K, lane);
+            if (bg) { float b = bf2f(bg[n]); a.x += b; a.z += b; }
+            if (bu) { float b = bf2f(bu[n]); a.y += b; a.w += b; }
+            if (lane == 0) {
+                C[n] = f2bf(glu_pair(a.x, a.y, act, f0, f1));
+                C[N + n] = f2bf(glu_pair(a.z, a.w, act, f0, f1));
+            }
+        }
+        return;
+    }
+#endif
     for (uint n = n0 + sg; n < n1; n += NSG)
         for (uint m = 0; m < M; m++) {
 #ifdef PLOW_GLU_PAIR
@@ -666,23 +1016,19 @@ inline float4 dot4_mx4(device const uchar* W, device const uchar* S, uint ldw, u
     uint nb = K / 32u;
     for (uint b = lane; b < nb; b += 32u) {
         device const ushort* xb = x + b * 32u;
-        float xv[32];
-        for (uint j = 0; j < 8u; j++) {
-            float4 v = bf4(*(device const ushort4*)(xb + 4u * j));
-            xv[4u * j] = v.x; xv[4u * j + 1u] = v.y; xv[4u * j + 2u] = v.z; xv[4u * j + 3u] = v.w;
-        }
-        for (uint r = 0; r < 4u; r++) {
-            device const uchar* wb = W + r * ldw + b * 16u;
-            float blk = 0.0f;
-            for (uint j = 0; j < 4u; j++) {
-                uchar4 c = *(device const uchar4*)(wb + 4u * j);
-                blk += E2M1[c.x & 15u] * xv[8u * j] + E2M1[c.x >> 4] * xv[8u * j + 1u]
-                     + E2M1[c.y & 15u] * xv[8u * j + 2u] + E2M1[c.y >> 4] * xv[8u * j + 3u]
-                     + E2M1[c.z & 15u] * xv[8u * j + 4u] + E2M1[c.z >> 4] * xv[8u * j + 5u]
-                     + E2M1[c.w & 15u] * xv[8u * j + 6u] + E2M1[c.w >> 4] * xv[8u * j + 7u];
+        float4 blk = float4(0.0f);
+        for (uint j = 0; j < 4u; j++) {
+            float4 x0 = bf4(*(device const ushort4*)(xb + 8u * j));
+            float4 x1 = bf4(*(device const ushort4*)(xb + 8u * j + 4u));
+            for (uint r = 0; r < 4u; r++) {
+                uchar4 c = *(device const uchar4*)(W + r * ldw + b * 16u + 4u * j);
+                blk[r] += E2M1[c.x & 15u] * x0.x + E2M1[c.x >> 4] * x0.y
+                        + E2M1[c.y & 15u] * x0.z + E2M1[c.y >> 4] * x0.w
+                        + E2M1[c.z & 15u] * x1.x + E2M1[c.z >> 4] * x1.y
+                        + E2M1[c.w & 15u] * x1.z + E2M1[c.w >> 4] * x1.w;
             }
-            acc[r] += blk * e8m0f(S[r * lds + b]);
         }
+        for (uint r = 0; r < 4u; r++) acc[r] += blk[r] * e8m0f(S[r * lds + b]);
     }
     // Partial last block (K % 32): lane 0, scalar.
     if (lane == 0 && (K & 31u)) {
@@ -698,6 +1044,43 @@ inline float4 dot4_mx4(device const uchar* W, device const uchar* S, uint ldw, u
     }
     return float4(simd_sum(acc.x), simd_sum(acc.y), simd_sum(acc.z), simd_sum(acc.w));
 }
+#if defined(PLOW_MX4_GLU_ROWS2) || defined(PLOW_MX4_ROWS2)
+inline float2 dot2_mx4_rows(device const uchar* W, device const uchar* S,
+                           uint ldw, uint lds, device const ushort* x,
+                           uint K, uint lane) {
+    float2 acc = float2(0.0f);
+    uint nb = K / 32u;
+    for (uint b = lane; b < nb; b += 32u) {
+        device const ushort* xb = x + b * 32u;
+        float2 blk = float2(0.0f);
+        for (uint j = 0; j < 4u; j++) {
+            float4 x0 = bf4(*(device const ushort4*)(xb + 8u * j));
+            float4 x1 = bf4(*(device const ushort4*)(xb + 8u * j + 4u));
+            for (uint r = 0; r < 2u; r++) {
+                uchar4 c = *(device const uchar4*)(W + r * ldw + b * 16u + 4u * j);
+                blk[r] += E2M1[c.x & 15u] * x0.x + E2M1[c.x >> 4] * x0.y
+                        + E2M1[c.y & 15u] * x0.z + E2M1[c.y >> 4] * x0.w
+                        + E2M1[c.z & 15u] * x1.x + E2M1[c.z >> 4] * x1.y
+                        + E2M1[c.w & 15u] * x1.z + E2M1[c.w >> 4] * x1.w;
+            }
+        }
+        acc.x += blk.x * e8m0f(S[b]);
+        acc.y += blk.y * e8m0f(S[lds + b]);
+    }
+    if (lane == 0 && (K & 31u)) {
+        uint k0 = nb * 32u;
+        for (uint r = 0; r < 2u; r++) {
+            float blk = 0.0f;
+            for (uint k = k0; k < K; k++) {
+                uchar c = W[r * ldw + (k >> 1)];
+                blk += E2M1[(k & 1u) ? (c >> 4) : (c & 15u)] * bf2f(x[k]);
+            }
+            acc[r] += blk * e8m0f(S[r * lds + nb]);
+        }
+    }
+    return float2(simd_sum(acc.x), simd_sum(acc.y));
+}
+#endif
 #ifdef PLOW_MX4_FOUR_ROWS
 inline float4 dot_mx4_quad(device const uchar* W, device const uchar* S, device const ushort* x, uint K, uint lane) {
     float acc = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
@@ -813,6 +1196,24 @@ void op_gemv_mxfp4(const thread Inst& in, device const ulong* tab, uint slice, u
         }
         return;
     }
+#ifdef PLOW_MX4_ROWS2
+    if (M == 1u) {
+        uint n = n0 + sg * 2u;
+        for (; n + 2u <= n1; n += NSG * 2u) {
+            float2 a = dot2_mx4_rows(W + n * ldw, S + n * lds,
+                                     ldw, lds, x, K, lane);
+            if (lane == 0) {
+                C[n] = f2bf(a.x);
+                C[n + 1u] = f2bf(a.y);
+            }
+        }
+        for (; n < n1; n++) {
+            float acc = dot_mx4(W + n * ldw, S + n * lds, x, K, lane);
+            if (lane == 0) C[n] = f2bf(acc);
+        }
+        return;
+    }
+#endif
     for (uint m = 0; m < M; m++) {
         uint n = n0 + sg * 4u;
         for (; n + 4u <= n1; n += NSG * 4u) {
@@ -864,12 +1265,109 @@ void op_gemv_glu_mxfp4(const thread Inst& in, device const ulong* tab, uint slic
         }
         return;
     }
+#ifdef PLOW_MX4_GLU_ROWS2
+    if (M == 1u) {
+        uint n = n0 + sg * 2u;
+        for (; n + 2u <= n1; n += NSG * 2u) {
+            float2 g = dot2_mx4_rows(Wg + n * ldw, Sg + n * lds,
+                                     ldw, lds, x, K, lane);
+            float2 u = dot2_mx4_rows(Wu + n * ldw, Su + n * lds,
+                                     ldw, lds, x, K, lane);
+            if (lane == 0) {
+                C[n] = f2bf(glu_pair(g.x, u.x, act, f0, f1));
+                C[n + 1u] = f2bf(glu_pair(g.y, u.y, act, f0, f1));
+            }
+        }
+        for (; n < n1; n++) {
+            float g = dot_mx4(Wg + n * ldw, Sg + n * lds, x, K, lane);
+            float u = dot_mx4(Wu + n * ldw, Su + n * lds, x, K, lane);
+            if (lane == 0) C[n] = f2bf(glu_pair(g, u, act, f0, f1));
+        }
+        return;
+    }
+#endif
     for (uint n = n0 + sg; n < n1; n += NSG)
         for (uint m = 0; m < M; m++) {
             float g = dot_mx4(Wg + n * ldw, Sg + n * lds, x + m * K, K, lane);
             float u = dot_mx4(Wu + n * ldw, Su + n * lds, x + m * K, K, lane);
             if (lane == 0) C[m * N + n] = f2bf(glu_pair(g, u, act, f0, f1));
         }
+}
+
+// Per-block E8M0 scale rows are tensor handles in i5/i6/i7.
+void op_gemv_qkv_mxfp4(const thread Inst& in, device const ulong* tab, uint slice, uint nblk, uint sg, uint lane) {
+    uint M = in.i[0], K = in.i[2];
+    uint Ns[3] = {in.i[1], in.i[3], in.i[4]};
+    device const ushort* x = ten<ushort>(tab, in, 1);
+    device ushort* Cs[3] = {ten<ushort>(tab, in, 0), ten<ushort>(tab, in, 3), ten<ushort>(tab, in, 5)};
+    device const uchar* Ws[3] = {ten<uchar>(tab, in, 2), ten<uchar>(tab, in, 4), ten<uchar>(tab, in, 6)};
+    uint ldw = K / 2u, lds = (K + 31u) / 32u;
+    for (uint s = 0; s < 3; s++) {
+        uint lo, hi;
+        range(Ns[s], slice, nblk, lo, hi);
+        if (lo < hi) {
+            uint h = in.i[5 + s];
+            device const uchar* scales = h == TNONE ? (device const uchar*)0
+                                                     : reinterpret_cast<device const uchar*>(tab[h]);
+            if (!scales) {
+                for (uint m = 0; m < M; m++)
+                    for (uint n = lo + sg; n < hi; n += NSG)
+                        if (lane == 0) Cs[s][m * Ns[s] + n] = ushort(0x7fc1);
+                continue;
+            }
+#ifdef PLOW_MX4_FOUR_ROWS
+            if (M == 4 && (K % 32u) == 0 && (lo % 4u) == 0 && (hi % 4u) == 0) {
+                for (uint n = lo + sg * 4u; n + 4u <= hi; n += NSG * 4u) {
+                    float4 a0, a1, a2, a3;
+                    dot4_mx4_quad(Ws[s] + n * ldw, scales + n * lds, ldw, lds, x,
+                                  K, lane, a0, a1, a2, a3);
+                    if (lane == 0) {
+                        Cs[s][n] = f2bf(a0.x); Cs[s][n+1] = f2bf(a0.y);
+                        Cs[s][n+2] = f2bf(a0.z); Cs[s][n+3] = f2bf(a0.w);
+                        Cs[s][Ns[s]+n] = f2bf(a1.x); Cs[s][Ns[s]+n+1] = f2bf(a1.y);
+                        Cs[s][Ns[s]+n+2] = f2bf(a1.z); Cs[s][Ns[s]+n+3] = f2bf(a1.w);
+                        Cs[s][2u*Ns[s]+n] = f2bf(a2.x); Cs[s][2u*Ns[s]+n+1] = f2bf(a2.y);
+                        Cs[s][2u*Ns[s]+n+2] = f2bf(a2.z); Cs[s][2u*Ns[s]+n+3] = f2bf(a2.w);
+                        Cs[s][3u*Ns[s]+n] = f2bf(a3.x); Cs[s][3u*Ns[s]+n+1] = f2bf(a3.y);
+                        Cs[s][3u*Ns[s]+n+2] = f2bf(a3.z); Cs[s][3u*Ns[s]+n+3] = f2bf(a3.w);
+                    }
+                }
+                continue;
+            }
+#endif
+            if (M == 2 && (K % 32u) == 0 && (lo % 4u) == 0 && (hi % 4u) == 0) {
+                for (uint n = lo + sg * 4u; n + 4u <= hi; n += NSG * 4u) {
+                    float4 a0, a1;
+                    dot4_mx4_pair(Ws[s] + n * ldw, scales + n * lds, ldw, lds, x,
+                                  K, lane, a0, a1);
+                    if (lane == 0) {
+                        Cs[s][n] = f2bf(a0.x); Cs[s][n+1] = f2bf(a0.y);
+                        Cs[s][n+2] = f2bf(a0.z); Cs[s][n+3] = f2bf(a0.w);
+                        Cs[s][Ns[s]+n] = f2bf(a1.x); Cs[s][Ns[s]+n+1] = f2bf(a1.y);
+                        Cs[s][Ns[s]+n+2] = f2bf(a1.z); Cs[s][Ns[s]+n+3] = f2bf(a1.w);
+                    }
+                }
+                continue;
+            }
+            for (uint m = 0; m < M; m++) {
+                uint n = lo + sg * 4u;
+                for (; n + 4u <= hi; n += NSG * 4u) {
+                    float4 a = dot4_mx4(Ws[s] + n * ldw, scales + n * lds,
+                                           ldw, lds, x + m * K, K, lane);
+                    if (lane == 0) {
+                        device ushort* out = Cs[s] + m * Ns[s] + n;
+                        out[0] = f2bf(a.x); out[1] = f2bf(a.y);
+                        out[2] = f2bf(a.z); out[3] = f2bf(a.w);
+                    }
+                }
+                for (; n < hi; n++) {
+                    float a = dot_mx4(Ws[s] + n * ldw, scales + n * lds,
+                                         x + m * K, K, lane);
+                    if (lane == 0) Cs[s][m * Ns[s] + n] = f2bf(a);
+                }
+            }
+        }
+    }
 }
 
 // ---- v3 tiles: bf16 staging in 8x8 blocks, K chunks of 32, 128-wide sub-tiles ---------------------
@@ -1439,6 +1937,7 @@ void op_headnorm_rope(const thread Inst& in, device const ulong* tab, uint slice
     device const float* cosb = ten<float>(tab, in, 3);
     device const float* sinb = ten<float>(tab, in, 4);
     device const int* pos = ten<int>(tab, in, 5);
+    device const int* pfslot = FP8 ? (device const int*)0 : ten<int>(tab, in, 6);
     uint ntok = in.i[0], nhead = in.i[1], hd = in.i[2], out_row0 = in.i[3];
     uint skip_norm = in.i[4], n_batch_kv = in.i[6];
     uint out_stride = in.fj[1], kv_mask = in.fj[2];
@@ -1454,7 +1953,8 @@ void op_headnorm_rope(const thread Inst& in, device const ulong* tab, uint slice
         uint position = pos ? uint(pos[t]) : out_row0 + t;
         device const ushort* xr = x + (t * nhead + hh) * hd;
         ulong obase = out_stride
-            ? (n_batch_kv != 0u ? (ulong(t * nhead + hh) * out_stride + (position & kv_mask)) * hd
+            ? (pfslot ? (ulong(uint(pfslot[t]) * nhead + hh) * out_stride + (position & kv_mask)) * hd
+              : n_batch_kv != 0u ? (ulong(t * nhead + hh) * out_stride + (position & kv_mask)) * hd
                                 : (ulong(hh) * out_stride + ((out_row0 + t) & kv_mask)) * hd)
             : (ulong(out_row0 + t) * nhead + hh) * hd;
         float v[16];
@@ -1587,7 +2087,8 @@ inline ushort kv_raw(device const uchar* row, uint d) { return f2bf(e4m3_exact(r
 
 template <uint D, typename KV>
 void flash_prefill_tile(const thread Inst& in, device const ulong* tab, uint slice, uint nblk,
-                        threadgroup float* tile, uint sg, uint lane) {
+                        threadgroup float* tile, uint sg, uint lane,
+                        device const int* requests) {
     device float* Opart = ten<float>(tab, in, 0);
     device float* mlpart = ten<float>(tab, in, 1);
     device const ushort* Q = ten<ushort>(tab, in, 2);
@@ -1609,20 +2110,40 @@ void flash_prefill_tile(const thread Inst& in, device const ulong* tab, uint sli
     threadgroup float* scratch = tile + 4192 + sg * 64u;
     uint work = ((nq + 31u) / 32u) * nh * splits;
     for (uint w = slice; w < work; w += nblk) {
-        uint sp = w % splits, h = (w / splits) % nh, qb = w / (splits * nh) * 32u;
+        uint sp = w % splits, h = (w / splits) % nh;
+        uint global_qb = w / (splits * nh) * 32u;
+        uint qb = global_qb, qrow0 = 0u, rnq = nq, rnkv = nkv, rpos = pos, slot = 0u;
+        if (requests) {
+            int owner = -1;
+            for (int r = 0; r < requests[0]; r++) {
+                int off = 1 + 4 * r;
+                int row0 = requests[off], len = requests[off + 1];
+                if (int(global_qb) >= row0 && int(global_qb) < row0 + len) {
+                    owner = r;
+                    qrow0 = uint(row0);
+                    qb = global_qb - qrow0;
+                    rnq = uint(len);
+                    slot = uint(requests[off + 2]);
+                    rnkv = uint(requests[off + 3]);
+                    rpos = rnkv - rnq;
+                    break;
+                }
+            }
+            if (owner < 0 || qb + min(32u, nq - global_qb) > rnq) continue;
+        }
         uint isa_qb = qb / FA_BQ_TILE * FA_BQ_TILE;
-        uint end = min(pos + isa_qb + FA_BQ_TILE, nkv);
-        uint first = window && pos + isa_qb >= window ? pos + isa_qb - window + 1u : 0u;
+        uint end = min(rpos + isa_qb + FA_BQ_TILE, rnkv);
+        uint first = window && rpos + isa_qb >= window ? rpos + isa_qb - window + 1u : 0u;
         uint lo = first / FA_BKV * FA_BKV;
         uint tiles = end > lo ? (end - lo + FA_BKV - 1u) / FA_BKV : 0u;
         uint per = (tiles + splits - 1u) / splits;
         uint hi = min(lo + (sp + 1u) * per * FA_BKV, end);
         lo += sp * per * FA_BKV;
         // Preserve the ISA's split ownership, but skip tiles masked for every query here.
-        uint valid_first = window && pos + qb >= window ? pos + qb - window + 1u : 0u;
+        uint valid_first = window && rpos + qb >= window ? rpos + qb - window + 1u : 0u;
         lo = max(lo, valid_first / FA_BKV * FA_BKV);
-        hi = min(hi, pos + min(qb + 32u, nq));
-        ulong base = ulong(h / gqa) * stride;
+        hi = min(hi, rpos + min(qb + 32u, rnq));
+        ulong base = ulong(slot * nkh + h / gqa) * stride;
         simdgroup_float8x8 out[D / 64u];
         for (uint dc = 0; dc < D / 64u; dc++) out[dc] = simdgroup_float8x8(0.0f);
         float m = NEG_INF, l = 0.0f;
@@ -1632,7 +2153,9 @@ void flash_prefill_tile(const thread Inst& in, device const ulong* tab, uint sli
             for (uint dc = 0; dc < D; dc += 64u) {
                 for (uint e = lid; e < 32u * 64u; e += NT) {
                     uint r = e / 64u, d = dc + e % 64u;
-                    qs[e] = qb + r < nq ? Q[(ulong(qb + r) * nh + h) * D + d] : ushort(0);
+                    qs[e] = qb + r < rnq
+                        ? Q[(ulong(qrow0 + qb + r) * nh + h) * D + d]
+                        : ushort(0);
                     kvs[e] = kb + r < hi ? kv_raw(K + (base + ((kb + r) & mask)) * D, d) : ushort(0);
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1648,8 +2171,8 @@ void flash_prefill_tile(const thread Inst& in, device const ulong* tab, uint sli
             }
             if (sg < 16u) simdgroup_store(score, scores + (sg / 4u) * 8u * 32u + (sg % 4u) * 8u, 32u);
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            uint qpos = pos + qb + sg, key = kb + lane;
-            bool valid = qb + sg < nq && key < hi && key <= qpos && (!window || qpos - key < window);
+            uint qpos = rpos + qb + sg, key = kb + lane;
+            bool valid = qb + sg < rnq && key < hi && key <= qpos && (!window || qpos - key < window);
             float s = scores[sg * 32u + lane] * scale;
             if (sizeof(KV) == 1u && key < hi) s *= KS[base + (key & mask)];
             s = valid ? s : NEG_INF;
@@ -1694,9 +2217,9 @@ void flash_prefill_tile(const thread Inst& in, device const ulong* tab, uint sli
             simdgroup_store(out[dc], scratch, 8u);
             simdgroup_barrier(mem_flags::mem_threadgroup);
             for (uint e = lane; e < 64u; e += 32u) {
-                uint qr = sg / 8u * 8u + e / 8u, q = qb + qr;
+                uint qr = sg / 8u * 8u + e / 8u, q = qrow0 + qb + qr;
                 uint d = dc * 64u + sg % 8u * 8u + e % 8u;
-                if (q < nq) {
+                if (qb + qr < rnq) {
                     if (splits == 1u && O) {
                         float den = state[32u + qr];
                         O[(ulong(q) * nh + h) * D + d] = f2bf(den > 0.0f ? scratch[e] / den : 0.0f);
@@ -1705,8 +2228,8 @@ void flash_prefill_tile(const thread Inst& in, device const ulong* tab, uint sli
             }
             simdgroup_barrier(mem_flags::mem_threadgroup);
         }
-        if (!(splits == 1u && O) && qb + sg < nq && lane == 0) {
-            ulong off = ((ulong(qb + sg) * nh + h) * splits + sp) * 2u;
+        if (!(splits == 1u && O) && qb + sg < rnq && lane == 0) {
+            ulong off = ((ulong(qrow0 + qb + sg) * nh + h) * splits + sp) * 2u;
             mlpart[off] = m; mlpart[off + 1u] = l;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1740,12 +2263,55 @@ inline void attend_rows(device const ushort* q, device const KV* kbase, device c
 // t0=Opart t1=mlpart t2=Q t3=K t4=V t5=O_final?  i0=n_q i1=n_kv i2=n_head i3=n_kv_head i4=q_pos0 i5=window
 // i6=hd i7=nsplit  f0=scale fj1=kv_stride fj2=kv_mask
 template <typename KV>
+void flash_prefill_packed(const thread Inst& in, device const ulong* tab, uint slice, uint nblk,
+                          uint sg, uint lane, device const int* requests) {
+    device const ushort* Q = ten<ushort>(tab, in, 2);
+    device const KV* K = ten<KV>(tab, in, 3);
+    device const KV* V = ten<KV>(tab, in, 4);
+    device ushort* O = ten<ushort>(tab, in, 5);
+    uint nq = in.i[0], nh = in.i[2], nkh = in.i[3], window = in.i[5], D = in.i[6];
+    uint stride = in.fj[1], mask = in.fj[2], gqa = nh / nkh;
+    float scale = as_type<float>(in.fj[0]);
+    if (!O || in.i[7] != 1u || D > 512u || (D & 31u)) return;
+    uint total = nq * nh, per = D / 32u;
+    for (uint w0 = slice * WAVES; w0 < total; w0 += nblk * WAVES) {
+        uint w = w0 + sg;
+        if (sg >= WAVES || w >= total) continue;
+        uint qi = w / nh, h = w % nh;
+        int owner = -1, row0 = 0, len = 0, slot = 0, end = 0;
+        for (int r = 0; r < requests[0]; r++) {
+            int off = 1 + 4 * r;
+            int first = requests[off], count = requests[off + 1];
+            if (int(qi) >= first && int(qi) < first + count) {
+                owner = r; row0 = first; len = count;
+                slot = requests[off + 2]; end = requests[off + 3];
+                break;
+            }
+        }
+        if (owner < 0) continue;
+        uint qpos = uint(end - len + int(qi) - row0);
+        uint lo = window && qpos + 1u > window ? qpos + 1u - window : 0u;
+        uint hkv = h / gqa;
+        ulong base = ulong(uint(slot) * nkh + hkv) * stride;
+        device const ushort* q = Q + (ulong(qi) * nh + h) * D;
+        float m = NEG_INF, l = 0.0f, acc[16];
+        for (uint j = 0; j < 16; j++) acc[j] = 0.0f;
+        attend_rows(q, K + base * D, V + base * D, nullptr, nullptr, D, mask, scale,
+                    lo, qpos + 1u, qpos, window, true, lane, acc, m, l);
+        float inv = l > 0.0f ? 1.0f / l : 0.0f;
+        device ushort* out = O + (ulong(qi) * nh + h) * D;
+        for (uint j = 0; j < per; j++) out[lane + 32u * j] = f2bf(acc[j] * inv);
+    }
+}
+
+template <typename KV>
 void op_flash_prefill(const thread Inst& in, device const ulong* tab, uint slice, uint nblk, threadgroup float* tile, uint sg, uint lane) {
+    device const int* requests = sizeof(KV) == 2u ? ten<int>(tab, in, 6) : (device const int*)0;
     switch (in.i[6]) {
-        case 64: flash_prefill_tile<64, KV>(in, tab, slice, nblk, tile, sg, lane); return;
-        case 128: flash_prefill_tile<128, KV>(in, tab, slice, nblk, tile, sg, lane); return;
-        case 256: flash_prefill_tile<256, KV>(in, tab, slice, nblk, tile, sg, lane); return;
-        case 512: flash_prefill_tile<512, KV>(in, tab, slice, nblk, tile, sg, lane); return;
+        case 64: flash_prefill_tile<64, KV>(in, tab, slice, nblk, tile, sg, lane, requests); return;
+        case 128: flash_prefill_tile<128, KV>(in, tab, slice, nblk, tile, sg, lane, requests); return;
+        case 256: flash_prefill_tile<256, KV>(in, tab, slice, nblk, tile, sg, lane, requests); return;
+        case 512: flash_prefill_tile<512, KV>(in, tab, slice, nblk, tile, sg, lane, requests); return;
     }
     device float* Opart = ten<float>(tab, in, 0);
     device float* mlpart = ten<float>(tab, in, 1);
@@ -1831,7 +2397,7 @@ void op_flash_decode(const thread Inst& in, device const ulong* tab, uint slice,
     if (D > 512u || (D & 31u) || nsplit == 0u) return;
     uint gqa = n_head / n_kv_head;
 #ifdef PLOW_DECODE_HEADS
-    uint gf = 1u;
+    uint gf = n_batch == 1u ? 1u : (gqa % FA_GF == 0u ? FA_GF : 1u);
 #else
     uint gf = gqa % FA_GF == 0u ? FA_GF : 1u;
 #endif
@@ -3031,6 +3597,7 @@ bool exec_op(const thread Inst& in, device const ulong* tab, uint slice, uint nb
         case 113: op_gemm_glu(in, tab, slice, nblk, 2u, tile, lid, sg, lane); return true;
         case 91: op_gemv_mxfp4(in, tab, slice, nblk, sg, lane); return true;
         case 92: op_gemv_glu_mxfp4(in, tab, slice, nblk, sg, lane); return true;
+        case 114: op_gemv_qkv_mxfp4(in, tab, slice, nblk, sg, lane); return true;
         case 100: op_gemm(in, tab, slice, nblk, 128, 256, true, tile, lid, sg, lane); return true;
         case 101: op_gemm(in, tab, slice, nblk, 192, 256, true, tile, lid, sg, lane); return true;
         case 20: op_gemm_glu(in, tab, slice, nblk, 0u, tile, lid, sg, lane); return true;
@@ -3132,6 +3699,7 @@ kernel void plow_interp(device const Inst* insts [[buffer(0)]],
 // producer's stores visible, so a run that is right here and wrong in `plow_interp` is a
 // cross-threadgroup visibility problem, not an op bug.
 struct SingleParams { uint inst; };
+struct PackParams { uint inst, count; };
 kernel void plow_single(device const Inst* insts [[buffer(0)]],
                         device const ulong* tab [[buffer(7)]],
                         constant SingleParams& S [[buffer(8)]],
@@ -3149,6 +3717,16 @@ kernel void plow_single(device const Inst* insts [[buffer(0)]],
     if (tg >= in.blocks) return;
     if (!exec_op(in, tab, tg, in.blocks, tile, red, keys, lid, sg, lane))
         if (lid == 0) fault[0] = 0x40000000u | S.inst;
+}
+
+kernel void plow_headnorm_rope_pack(device const Inst* insts [[buffer(0)]],
+ device const ulong* tab [[buffer(7)]], constant PackParams& S [[buffer(8)]],
+ uint tg [[threadgroup_position_in_grid]],
+ uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    uint packed = sg / WAVES;
+    if (packed >= S.count) return;
+    Inst in = insts[S.inst + packed];
+    op_headnorm_rope<false>(in, tab, tg, in.blocks, sg % WAVES, lane);
 }
 
 kernel void plow_mx4_dedicated(device const Inst* insts [[buffer(0)]],

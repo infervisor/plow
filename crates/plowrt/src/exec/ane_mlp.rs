@@ -139,9 +139,62 @@ pub fn to_bf(x: f32) -> u16 {
     (b.wrapping_add(0x7fff + ((b >> 16) & 1)) >> 16) as u16
 }
 
-pub fn mlp_spec(rows: usize, gate: &Matrix, up: &Matrix, down: &Matrix, deep_k: usize) -> NetSpec {
+pub fn mlp_spec(
+    rows: usize,
+    gate: &Matrix,
+    up: &Matrix,
+    down: &Matrix,
+    deep_k: usize,
+    mlp_act: u32,
+) -> NetSpec {
     let (h, c) = (gate.k, gate.n);
     assert_eq!((up.n, up.k, down.n, down.k), (c, h, h, c));
+    let mut layers = vec![
+        Layer::InnerProduct {
+            input: "x".into(),
+            output: "g".into(),
+            k: h,
+            n: c,
+            w_f16: gate.half(),
+        },
+        Layer::InnerProduct {
+            input: "x".into(),
+            output: "u".into(),
+            k: h,
+            n: c,
+            w_f16: up.half(),
+        },
+    ];
+    if mlp_act == 0 {
+        layers.push(Layer::Gelu {
+            input: "g".into(),
+            output: "a".into(),
+        });
+    } else {
+        layers.push(Layer::Sigmoid {
+            input: "g".into(),
+            output: "s".into(),
+        });
+        layers.push(Layer::Mul {
+            a: "g".into(),
+            b: "s".into(),
+            output: "a".into(),
+        });
+    }
+    layers.extend([
+        Layer::Mul {
+            a: "a".into(),
+            b: "u".into(),
+            output: "z".into(),
+        },
+        Layer::InnerProduct {
+            input: "z".into(),
+            output: "y".into(),
+            k: c,
+            n: h,
+            w_f16: down.half(),
+        },
+    ]);
     let mut spec = NetSpec {
         inputs: vec![("x".into(), h)],
         outputs: vec![("y".into(), h)],
@@ -150,43 +203,7 @@ pub fn mlp_spec(rows: usize, gate: &Matrix, up: &Matrix, down: &Matrix, deep_k: 
         range: false,
         out_range: false,
         w8: false,
-        layers: vec![
-            Layer::InnerProduct {
-                input: "x".into(),
-                output: "g".into(),
-                k: h,
-                n: c,
-                w_f16: gate.half(),
-            },
-            Layer::InnerProduct {
-                input: "x".into(),
-                output: "u".into(),
-                k: h,
-                n: c,
-                w_f16: up.half(),
-            },
-            Layer::Sigmoid {
-                input: "g".into(),
-                output: "s".into(),
-            },
-            Layer::Mul {
-                a: "g".into(),
-                b: "s".into(),
-                output: "a".into(),
-            },
-            Layer::Mul {
-                a: "a".into(),
-                b: "u".into(),
-                output: "z".into(),
-            },
-            Layer::InnerProduct {
-                input: "z".into(),
-                output: "y".into(),
-                k: c,
-                n: h,
-                w_f16: down.half(),
-            },
-        ],
+        layers,
     };
     if deep_k > 0 && deep_k < c {
         assert_eq!(deep_k % 128, 0);
@@ -296,6 +313,44 @@ mod tests {
     }
 
     #[test]
+    fn activation_graph_matches_geglu_and_swiglu() {
+        let matrix = |n, k| Matrix {
+            n,
+            k,
+            encoding: 0,
+            data: vec![0; n * k * 2],
+            scales: vec![],
+        };
+        let gate = matrix(128, 64);
+        let down = matrix(64, 128);
+        let geglu = mlp_spec(1, &gate, &gate, &down, 0, 0);
+        assert!(matches!(
+            &geglu.layers[2],
+            Layer::Gelu { input, output } if input == "g" && output == "a"
+        ));
+        assert!(matches!(
+            &geglu.layers[3],
+            Layer::Mul { a, b, output } if a == "a" && b == "u" && output == "z"
+        ));
+        assert_eq!(geglu.layers.len(), 5);
+
+        let swiglu = mlp_spec(1, &gate, &gate, &down, 0, 1);
+        assert!(matches!(
+            &swiglu.layers[2],
+            Layer::Sigmoid { input, output } if input == "g" && output == "s"
+        ));
+        assert!(matches!(
+            &swiglu.layers[3],
+            Layer::Mul { a, b, output } if a == "g" && b == "s" && output == "a"
+        ));
+        assert!(matches!(
+            &swiglu.layers[4],
+            Layer::Mul { a, b, output } if a == "a" && b == "u" && output == "z"
+        ));
+        assert_eq!(swiglu.layers.len(), 6);
+    }
+
+    #[test]
     fn deep_k_graph_covers_down_columns_and_reduces_in_graph() {
         let matrix = |n, k| Matrix {
             n,
@@ -309,7 +364,7 @@ mod tests {
         let gate = matrix(640, 128);
         let down = matrix(128, 640);
         for chunk in [0, 128, 256, 512, 1024] {
-            let spec = mlp_spec(91, &gate, &gate, &down, chunk);
+            let spec = mlp_spec(91, &gate, &gate, &down, chunk, 1);
             let mut slices = Vec::new();
             let mut products = Vec::new();
             let mut sums = 0;

@@ -298,6 +298,10 @@ pub struct KernelTable {
 }
 
 impl KernelTable {
+    pub(crate) fn empty() -> Self {
+        Self { fns: Vec::new() }
+    }
+
     /// Resolve every distinct op in `ops`. `Err` lists the ops with no kernel
     /// at the active tier (deduplicated, ascending) so the loader can name them.
     pub fn resolve(ops: impl Iterator<Item = u16>) -> std::result::Result<Self, Vec<u16>> {

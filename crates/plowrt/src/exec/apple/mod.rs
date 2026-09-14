@@ -29,7 +29,7 @@ use objc2_metal::{
     MTLCreateSystemDefaultDevice, MTLDevice, MTLLanguageVersion, MTLLibrary, MTLMathMode,
     MTLResidencySet, MTLResidencySetDescriptor, MTLResourceOptions, MTLResourceUsage, MTLSize,
 };
-use packet::dev::DevInst64;
+use packet::dev::{DevInst64, DevOp, PrefillSpan};
 
 use crate::exec::cpu::engine::{plan_chunks, Chunk, CpuModel};
 use crate::exec::cpu::ffi::{self, Isa};
@@ -60,6 +60,39 @@ struct Params {
     spin_max: u32,
     inst_lo: u32,
     inst_hi: u32,
+}
+
+fn prefers_ordered_decode(
+    program: usize,
+    decode_start: usize,
+    gpu_only: bool,
+    insts: &[DevInst64],
+) -> bool {
+    program >= decode_start
+        && gpu_only
+        && insts.iter().any(|d| matches!(d.op, 10 | 19 | 22))
+        && !insts
+            .iter()
+            .any(|d| matches!(d.op, 30 | 31 | 91 | 92 | 114 | 115))
+}
+
+fn headnorm_rope_pack_count(insts: &[DevInst64]) -> usize {
+    let mut count = 0;
+    for next in insts.iter().take(4) {
+        if next.op != DevOp::HeadNormRope as u16 || next.t[0] == u16::MAX {
+            break;
+        }
+        let conflicts = insts[..count].iter().any(|prior| {
+            prior.t[0] == next.t[0]
+                || next.t[1..].contains(&prior.t[0])
+                || prior.t[1..].contains(&next.t[0])
+        });
+        if conflicts {
+            break;
+        }
+        count += 1;
+    }
+    count
 }
 
 /// One instruction of one program delegated to the Apple Neural Engine (rung 4): a prefill
@@ -117,6 +150,7 @@ pub struct MetalEngine {
     pso: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pso_four_rows: Option<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
     pso_single: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pso_headnorm_rope_pack: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pso_mx4: Option<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
     pso_mx4_prefill: Option<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
     conformer: Option<conformer_packet::ConformerPipelines>,
@@ -149,6 +183,7 @@ pub struct MetalEngine {
     #[cfg(feature = "ane")]
     pub channel: Option<channel::Channel>,
     pub profile: Option<ExecutionProfile>,
+    packed_prefill: Option<plow_asset::packed_prefill::Manifest>,
 }
 
 // SAFETY: Metal and CoreML objects are thread-safe per Apple's documentation, and the serve
@@ -186,6 +221,17 @@ impl crate::serve::cpu_serve::SlotEngine for MetalEngine {
     fn describe(&self) -> String {
         format!("metal gpu={} n_cu={}", self.gpu_name, self.model.blob.n_cu)
     }
+    fn packed_prefill(&self) -> bool {
+        self.packed_prefill.is_some()
+    }
+    fn prefill_packed(
+        &mut self,
+        prog: usize,
+        spans: &[PrefillSpan],
+        prompts: &[&[u32]],
+    ) -> Result<Vec<u32>> {
+        MetalEngine::prefill_packed(self, prog, spans, prompts)
+    }
 }
 
 fn err<E: std::fmt::Display>(what: &str, e: E) -> RuntimeError {
@@ -210,7 +256,7 @@ impl MetalEngine {
     ) -> Result<MetalEngine> {
         // The loader resolves CPU kernels per program (an ABI check); the table must exist.
         ffi::init(Isa::Amx)?;
-        let model = CpuModel::load(blob, checkpoint)?;
+        let model = CpuModel::load_for_device(blob, Some(checkpoint))?;
         Self::from_model(model, blob, tuning)
     }
 
@@ -218,7 +264,7 @@ impl MetalEngine {
     /// its opcodes and tensor table; no tokenizer, model family or KV protocol is selected.
     pub fn load_packet(blob: &Path) -> Result<MetalEngine> {
         ffi::init(Isa::Amx)?;
-        let model = CpuModel::load_embedded(blob)?;
+        let model = CpuModel::load_for_device(blob, None)?;
         Self::from_model(model, blob, DecodeTuning::default())
     }
 
@@ -275,6 +321,26 @@ impl MetalEngine {
             .glu_pair
             .then(|| format!("#define PLOW_GLU_PAIR 1\n{source}"));
         let source = glu_source.as_deref().unwrap_or(source);
+        let mx4_glu_rows2_source = apple_config
+            .mx4_glu_rows2
+            .then(|| format!("#define PLOW_MX4_GLU_ROWS2 1\n{source}"));
+        let source = mx4_glu_rows2_source.as_deref().unwrap_or(source);
+        let mx4_rows2_source = apple_config
+            .mx4_rows2
+            .then(|| format!("#define PLOW_MX4_ROWS2 1\n{source}"));
+        let source = mx4_rows2_source.as_deref().unwrap_or(source);
+        let bf16_m2_source = apple_config
+            .bf16_m2
+            .then(|| format!("#define PLOW_BF16_M2 1\n{source}"));
+        let source = bf16_m2_source.as_deref().unwrap_or(source);
+        let bf16_m4_source = apple_config
+            .bf16_m4
+            .then(|| format!("#define PLOW_BF16_M4 1\n{source}"));
+        let source = bf16_m4_source.as_deref().unwrap_or(source);
+        let bf16_m8_source = apple_config
+            .bf16_m8
+            .then(|| format!("#define PLOW_BF16_M8 1\n{source}"));
+        let source = bf16_m8_source.as_deref().unwrap_or(source);
         let four_rows = model.batch == 4
             && model
                 .blob
@@ -351,7 +417,16 @@ impl MetalEngine {
         let pso_single = device
             .newComputePipelineStateWithFunction_error(&func_single)
             .map_err(|e| err("pipeline single", e))?;
-        for pipeline in [&pso, &pso_single].into_iter().chain(pso_four_rows.iter()) {
+        let func_headnorm_rope_pack = specialized_lib
+            .newFunctionWithName(&NSString::from_str("plow_headnorm_rope_pack"))
+            .ok_or_else(|| err("packed headnorm-rope pipeline", "kernel missing"))?;
+        let pso_headnorm_rope_pack = device
+            .newComputePipelineStateWithFunction_error(&func_headnorm_rope_pack)
+            .map_err(|e| err("packed headnorm-rope pipeline", e))?;
+        for pipeline in [&pso, &pso_single, &pso_headnorm_rope_pack]
+            .into_iter()
+            .chain(pso_four_rows.iter())
+        {
             if pipeline.threadExecutionWidth() != 32
                 || pipeline.maxTotalThreadsPerThreadgroup() < THREADS
                 || pipeline.staticThreadgroupMemoryLength() > device.maxThreadgroupMemoryLength()
@@ -537,6 +612,25 @@ impl MetalEngine {
                 "cannot combine serial, row, per-op ANE or CPU offload",
             ));
         }
+        let packed_prefill = {
+            let raw = std::fs::read(blob).map_err(|e| err("packed prefill asset", e))?;
+            model
+                .blob
+                .reserved_metadata(&raw, plow_asset::packed_prefill::SECTION)?
+                .map(|bytes| {
+                    let manifest: plow_asset::packed_prefill::Manifest =
+                        serde_json::from_slice(bytes).map_err(|e| err("packed prefill", e))?;
+                    model
+                        .blob
+                        .with_packet_view(|packet| {
+                            let live = plow_asset::live_kv::emit(packet)?;
+                            manifest.validate(packet, &live)
+                        })
+                        .map_err(|e| err("packed prefill contract", e))?;
+                    Ok::<_, RuntimeError>(manifest)
+                })
+                .transpose()?
+        };
         let mut engine = MetalEngine {
             #[cfg(feature = "ane")]
             ane,
@@ -552,6 +646,7 @@ impl MetalEngine {
             pso,
             pso_four_rows,
             pso_single,
+            pso_headnorm_rope_pack,
             pso_mx4,
             pso_mx4_prefill,
             conformer,
@@ -572,6 +667,7 @@ impl MetalEngine {
             last_run_us: 0.0,
             profile: None,
             gpu_name,
+            packed_prefill,
         };
         #[cfg(feature = "ane")]
         if channel_enabled {
@@ -684,7 +780,11 @@ impl MetalEngine {
         if programs.is_empty() {
             return Ok(());
         }
-        if self.serial || programs.iter().any(|&program| !self.gpu_only_program(program)) {
+        if self.serial
+            || programs
+                .iter()
+                .any(|&program| !self.gpu_only_program(program))
+        {
             for &program in programs {
                 self.run_prog(program)?;
             }
@@ -720,15 +820,17 @@ impl MetalEngine {
                 profile.gpu_device_ms += (cb.GPUEndTime() - cb.GPUStartTime()).max(0.0) * 1e3;
             }
             if cb.status() != MTLCommandBufferStatus::Completed {
-                let error = cb.error().map(|error| error.to_string()).unwrap_or_default();
+                let error = cb
+                    .error()
+                    .map(|error| error.to_string())
+                    .unwrap_or_default();
                 return Err(RuntimeError::Device(format!(
                     "metal: packet sequence command buffer status {:?}: {error}",
                     cb.status()
                 )));
             }
-            let fault = unsafe {
-                std::ptr::read_volatile(self.fault.contents().as_ptr() as *const u32)
-            };
+            let fault =
+                unsafe { std::ptr::read_volatile(self.fault.contents().as_ptr() as *const u32) };
             if fault != 0 {
                 return Err(RuntimeError::Device(format!(
                     "metal: packet sequence fault {fault:#010x}"
@@ -1369,7 +1471,14 @@ impl MetalEngine {
             }
         }
         let pg = &self.progs[p];
-        if !self.serial {
+        let bf16_decode = prefers_ordered_decode(
+            p,
+            self.model.dec_ix,
+            self.gpu_only_program(p),
+            &pg.insts_host,
+        );
+        let ordered = self.serial || bf16_decode;
+        if !ordered {
             if let Some(conformer) = self
                 .conformer
                 .as_ref()
@@ -1388,9 +1497,11 @@ impl MetalEngine {
             }
         }
         let n_cu = self.model.blob.n_cu as usize;
-        if self.serial {
+        if ordered {
             // Topological instruction order (the builder appends ops in dependency order).
-            for (ii, d) in pg.insts_host.iter().enumerate() {
+            let mut ii = 0usize;
+            while ii < pg.insts_host.len() {
+                let d = &pg.insts_host[ii];
                 let enc = cb
                     .computeCommandEncoder()
                     .ok_or_else(|| RuntimeError::Device("metal: no encoder".into()))?;
@@ -1406,21 +1517,34 @@ impl MetalEngine {
                     .pso_mx4_prefill
                     .as_ref()
                     .filter(|_| matches!(d.op, 93 | 96 | 97 | 98));
-                enc.setComputePipelineState(dedicated.or(prefill).unwrap_or(&self.pso_single));
+                let pack_count = headnorm_rope_pack_count(&pg.insts_host[ii..]);
+                let packed = (pack_count >= 2).then_some(&self.pso_headnorm_rope_pack);
+                let dispatch_blocks = if packed.is_some() {
+                    pg.insts_host[ii..ii + pack_count]
+                        .iter()
+                        .map(|next| next.blocks)
+                        .max()
+                        .unwrap_or(d.blocks)
+                } else {
+                    d.blocks
+                };
+                enc.setComputePipelineState(
+                    dedicated.or(prefill).or(packed).unwrap_or(&self.pso_single),
+                );
                 if let Some(input) = staged_input {
                     enc.useResource_usage(
                         ProtocolObject::from_ref(&**input),
                         MTLResourceUsage::Read | MTLResourceUsage::Write,
                     );
                 }
-                let sp = ii as u32;
-                // SAFETY: bindings match `plow_single`; `sp` outlives the call.
+                let params = [ii as u32, pack_count as u32];
+                // SAFETY: bindings match the selected kernel; Metal copies `params`.
                 unsafe {
                     enc.setBuffer_offset_atIndex(Some(&pg.insts), 0, 0);
                     enc.setBuffer_offset_atIndex(Some(&self.tab), 0, 7);
                     enc.setBytes_length_atIndex(
-                        NonNull::new(&sp as *const u32 as *mut c_void).unwrap(),
-                        4,
+                        NonNull::new(params.as_ptr() as *mut c_void).unwrap(),
+                        if packed.is_some() { 8 } else { 4 },
                         8,
                     );
                     enc.setBuffer_offset_atIndex(Some(&self.fault), 0, 9);
@@ -1438,7 +1562,7 @@ impl MetalEngine {
                         width: if dedicated.is_some() {
                             d.i[1] as usize / if d.op == 92 { 2 } else { 8 }
                         } else {
-                            d.blocks as usize
+                            dispatch_blocks as usize
                         },
                         height: 1,
                         depth: 1,
@@ -1450,13 +1574,12 @@ impl MetalEngine {
                     },
                 );
                 enc.endEncoding();
+                ii += pack_count.max(1);
             }
         }
-        for seg in (if self.serial { 0 } else { seg_lo })..(if self.serial {
-            0
-        } else {
-            seg_hi.min(pg.n_seg)
-        }) {
+        for seg in
+            (if ordered { 0 } else { seg_lo })..(if ordered { 0 } else { seg_hi.min(pg.n_seg) })
+        {
             let enc = cb
                 .computeCommandEncoder()
                 .ok_or_else(|| RuntimeError::Device("metal: no encoder".into()))?;
@@ -1980,6 +2103,131 @@ impl MetalEngine {
         r
     }
 
+    fn prefill_packed(
+        &mut self,
+        prog: usize,
+        spans: &[PrefillSpan],
+        prompts: &[&[u32]],
+    ) -> Result<Vec<u32>> {
+        let manifest = self
+            .packed_prefill
+            .clone()
+            .ok_or_else(|| RuntimeError::Rejected("Metal packed prefill is not enabled".into()))?;
+        if spans.len() < 2 || spans.len() != prompts.len() {
+            return Err(RuntimeError::Rejected(
+                "invalid Metal packed prefill members".into(),
+            ));
+        }
+        let rung = self
+            .model
+            .blob
+            .progs
+            .get(prog)
+            .filter(|p| p.role.is_prefill_bucket())
+            .map(|p| p.t as usize)
+            .ok_or_else(|| RuntimeError::Rejected("invalid Metal packed prefill program".into()))?;
+        let mut requests = Vec::with_capacity(spans.len());
+        let frontiers = vec![0u32; self.model.batch];
+        let mut total = 0usize;
+        for (span, prompt) in spans.iter().zip(prompts) {
+            if span.row0 as usize != total
+                || span.n_rows as usize != prompt.len()
+                || span.kv_row0 != 0
+                || span.kv_len != span.n_rows
+                || span.slot as usize >= self.model.batch
+            {
+                return Err(RuntimeError::Rejected(
+                    "unsupported Metal packed prefill span".into(),
+                ));
+            }
+            requests.push(plow_asset::packed_prefill::Request {
+                slot: span.slot as usize,
+                start: 0,
+                len: prompt.len(),
+                prompt: prompt.len(),
+            });
+            total = total
+                .checked_add(prompt.len())
+                .ok_or_else(|| RuntimeError::Rejected("packed row overflow".into()))?;
+        }
+        if total > rung {
+            return Err(RuntimeError::Rejected(
+                "packed rows exceed Metal rung".into(),
+            ));
+        }
+        let plan = plow_asset::packed_prefill::plan(&requests, &frontiers, rung, self.max_ctx)
+            .map_err(RuntimeError::Rejected)?;
+        let ids_h = self.need(self.model.wk.ids, "in.ids")?;
+        let pos_h = self.need(self.model.wk.pos, "in.pos")?;
+        let kvlen_h = self.need(self.model.wk.kvlen, "in.kvlen")?;
+        let mut ids = vec![0u32; rung];
+        for (span, prompt) in spans.iter().zip(prompts) {
+            let row = span.row0 as usize;
+            ids[row..row + prompt.len()].copy_from_slice(prompt);
+        }
+        self.write_u32s(ids_h, 0, &ids);
+        self.write_u32s(
+            pos_h,
+            0,
+            &plan.positions.iter().map(|&x| x as u32).collect::<Vec<_>>(),
+        );
+        self.write_u32s(
+            manifest.slot as usize,
+            0,
+            &plan.slots.iter().map(|&x| x as u32).collect::<Vec<_>>(),
+        );
+        self.write_u32s(
+            manifest.request as usize,
+            0,
+            &plan.table.iter().map(|&x| x as u32).collect::<Vec<_>>(),
+        );
+        self.write_u32s(
+            kvlen_h,
+            0,
+            &[spans.iter().map(|s| s.kv_len).max().unwrap_or(1)],
+        );
+
+        let original = self.progs[prog].insts_host.clone();
+        let mut tail = None;
+        for (i, d) in self.progs[prog].insts_host.iter_mut().enumerate() {
+            match DevOp::from_u16(d.op) {
+                Some(DevOp::HeadNormRope) if d.fj[1] != 0 => d.t[6] = manifest.slot,
+                Some(DevOp::FlashPrefill) => d.t[6] = manifest.request,
+                Some(DevOp::Argmax) => tail = Some(i.saturating_sub(1)),
+                _ => {}
+            }
+        }
+        let tail = tail.ok_or_else(|| RuntimeError::Rejected("packed prefill tail".into()))?;
+        self.progs[prog].insts_host[tail].i[4] = (total - 1) as u32;
+        #[cfg(feature = "ane")]
+        let original_channel_clen = self.channel.as_ref().map(|channel| channel.clen);
+        #[cfg(feature = "ane")]
+        if let Some(channel) = &mut self.channel {
+            channel.clen = total as u32;
+        }
+        let result = (|| {
+            self.run_prog(prog)?;
+            let mut tokens = vec![0u32; spans.len()];
+            for index in (0..spans.len()).rev() {
+                if index + 1 != spans.len() {
+                    let row = spans[index].row0 + spans[index].n_rows - 1;
+                    self.progs[prog].insts_host[tail].i[4] = row;
+                    for inst in tail..=tail + 2 {
+                        self.run_inst(prog, inst)?;
+                    }
+                }
+                tokens[index] = self.read_u32(ids_h, 0);
+            }
+            Ok(tokens)
+        })();
+        self.progs[prog].insts_host = original;
+        #[cfg(feature = "ane")]
+        if let (Some(channel), Some(clen)) = (&mut self.channel, original_channel_clen) {
+            channel.clen = clen;
+        }
+        result
+    }
+
     pub fn prefill_slot_embeddings(
         &mut self,
         slot: usize,
@@ -2246,13 +2494,71 @@ mod source_tests {
     use super::*;
 
     #[test]
+    fn ordered_decode_selects_gpu_only_bf16_rungs() {
+        let inst = |op: DevOp| DevInst64 {
+            op: op as u16,
+            ..DevInst64::default()
+        };
+        assert!(prefers_ordered_decode(
+            3,
+            3,
+            true,
+            &[inst(DevOp::Gemv), inst(DevOp::GemvGlu)]
+        ));
+        assert!(!prefers_ordered_decode(2, 3, true, &[inst(DevOp::Gemv)]));
+        assert!(!prefers_ordered_decode(3, 3, false, &[inst(DevOp::Gemv)]));
+        assert!(!prefers_ordered_decode(
+            3,
+            3,
+            true,
+            &[inst(DevOp::Gemv), inst(DevOp::GemvMxfp4)]
+        ));
+    }
+
+    #[test]
+    fn headnorm_rope_pack_selects_independent_instructions() {
+        let inst = |out, input| {
+            let mut d = DevInst64 {
+                op: DevOp::HeadNormRope as u16,
+                ..DevInst64::default()
+            };
+            d.t[0] = out;
+            d.t[1] = input;
+            d
+        };
+        assert_eq!(
+            headnorm_rope_pack_count(&[inst(1, 4), inst(2, 5), inst(3, 6)]),
+            3
+        );
+        assert_eq!(
+            headnorm_rope_pack_count(&[inst(1, 4), inst(2, 1), inst(3, 6)]),
+            1
+        );
+        assert_eq!(
+            headnorm_rope_pack_count(&[inst(1, 4), inst(4, 5), inst(3, 6)]),
+            1
+        );
+    }
+
+    #[test]
     fn packet_interpreter_source_compiles() {
         let device = MTLCreateSystemDefaultDevice().expect("Metal device");
         let options = MTLCompileOptions::new();
         options.setMathMode(MTLMathMode::Safe);
         options.setLanguageVersion(MTLLanguageVersion::Version3_2);
-        device
-            .newLibraryWithSource_options_error(&NSString::from_str(MSL), Some(&options))
-            .expect("compile packet interpreter");
+        for source in [
+            MSL.to_owned(),
+            format!("#define PLOW_MX4_GLU_ROWS2 1\n{MSL}"),
+            format!(
+                "#define PLOW_MX4_GLU_ROWS2 1\n#define PLOW_MX4_ROWS2 1\n{MSL}"
+            ),
+            format!("#define PLOW_BF16_M2 1\n{MSL}"),
+            format!("#define PLOW_BF16_M4 1\n{MSL}"),
+            format!("#define PLOW_BF16_M8 1\n{MSL}"),
+        ] {
+            device
+                .newLibraryWithSource_options_error(&NSString::from_str(&source), Some(&options))
+                .expect("compile packet interpreter");
+        }
     }
 }

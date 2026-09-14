@@ -831,7 +831,11 @@ impl Capabilities {
     ///
     /// `RowGather` is deliberately absent from `descriptor_aware`: the object has the arm, but
     /// this route emits no terminal segment, so [`Self::can_run_output`] must keep saying no.
-    pub fn amd_dense_gqa(target: impl Into<String>, row_capacity: u32, sample_capacity: u32) -> Self {
+    pub fn amd_dense_gqa(
+        target: impl Into<String>,
+        row_capacity: u32,
+        sample_capacity: u32,
+    ) -> Self {
         Capabilities {
             target: target.into(),
             descriptor_version: TOKEN_BATCH_VERSION,

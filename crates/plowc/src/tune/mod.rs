@@ -240,7 +240,10 @@ fn warn_if_root_disagrees_with_the_compiler(
     println!("  compiler probes         : {}", compiler_root.display());
     match dense_gemm_tuning_build(&compiler_root, isa) {
         Ok(theirs) if theirs.label() == reported.label() => {
-            println!("  both fingerprint {} — the two checkouts agree, so this", theirs.label());
+            println!(
+                "  both fingerprint {} — the two checkouts agree, so this",
+                theirs.label()
+            );
             println!("  is cosmetic. Records published here remain selectable.");
         }
         Ok(theirs) => {

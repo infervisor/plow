@@ -307,7 +307,11 @@ mod tests {
                 continue;
             }
             let back = f32::from_bits((f32_to_bf16_bits(v) as u32) << 16);
-            assert_eq!(v.to_bits(), back.to_bits(), "{b:#04x} = {v} lost bits in bf16");
+            assert_eq!(
+                v.to_bits(),
+                back.to_bits(),
+                "{b:#04x} = {v} lost bits in bf16"
+            );
         }
         // Anchors, read off the format rather than off this implementation.
         assert_eq!(t[0x00], 0.0);

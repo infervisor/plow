@@ -159,7 +159,10 @@ pub struct Message {
 impl Message {
     /// The message's text, empty when absent.
     pub fn text(&self) -> String {
-        self.content.as_ref().map(Content::as_text).unwrap_or_default()
+        self.content
+            .as_ref()
+            .map(Content::as_text)
+            .unwrap_or_default()
     }
 
     /// Whether this message carries an image part.

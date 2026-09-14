@@ -957,6 +957,9 @@ pub fn spawn(
                     _ = preempt_wake.notified() => continue,
                     _ = turn.take(dt) => {}
                 }
+                if dt.ordered() && crate::config::RuntimeConfig::get().tick_log {
+                    tracing::info!(%slug, "co-scheduled packet tick begin");
+                }
             }
             if preempt_seen.load(Ordering::Acquire) {
                 continue;
@@ -999,6 +1002,9 @@ pub fn spawn(
             };
 
             let ms = t_service_start.elapsed().as_secs_f64() * 1e3;
+            if co_scheduled && crate::config::RuntimeConfig::get().tick_log {
+                tracing::info!(%slug, elapsed_ms = ms, "co-scheduled packet tick complete");
+            }
 
             match joined {
                 Ok((

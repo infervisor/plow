@@ -98,15 +98,32 @@ pub enum PlacementError {
     NoDevices,
     /// A model's TP degree does not divide the visible device count, so no
     /// contiguous run of that width exists.
-    NoRunOfWidth { slug: String, tp: u32, visible: usize },
+    NoRunOfWidth {
+        slug: String,
+        tp: u32,
+        visible: usize,
+    },
     /// An explicit `--device` named an ordinal with no group starting there.
-    UnknownDevice { slug: String, device: u32 },
+    UnknownDevice {
+        slug: String,
+        device: u32,
+    },
     /// `--place explicit` and a model did not name a device.
-    MissingDevice { slug: String },
+    MissingDevice {
+        slug: String,
+    },
     /// A TP model was pinned to a group of the wrong width.
-    DegreeMismatch { slug: String, tp: u32, degree: u32 },
+    DegreeMismatch {
+        slug: String,
+        tp: u32,
+        degree: u32,
+    },
     /// Nothing on the node has room for this model, even empty.
-    WontFitAnywhere { slug: String, required: u64, capacity: u64 },
+    WontFitAnywhere {
+        slug: String,
+        required: u64,
+        capacity: u64,
+    },
 }
 
 impl fmt::Display for PlacementError {
@@ -361,7 +378,11 @@ mod tests {
 
     #[test]
     fn spread_puts_each_model_on_its_own_device() {
-        let models = vec![spec("a", 20 * GIB), spec("b", 20 * GIB), spec("c", 20 * GIB)];
+        let models = vec![
+            spec("a", 20 * GIB),
+            spec("b", 20 * GIB),
+            spec("c", 20 * GIB),
+        ];
         let l = assign(&models, &groups(4, 80 * GIB), Place::Spread).unwrap();
         assert_eq!(l.assignment, vec![0, 1, 2]);
     }
@@ -385,7 +406,11 @@ mod tests {
 
     #[test]
     fn pack_fills_a_device_before_moving_on() {
-        let models = vec![spec("a", 30 * GIB), spec("b", 30 * GIB), spec("c", 30 * GIB)];
+        let models = vec![
+            spec("a", 30 * GIB),
+            spec("b", 30 * GIB),
+            spec("c", 30 * GIB),
+        ];
         let l = assign(&models, &groups(2, 80 * GIB), Place::Pack).unwrap();
         // a+b = 60 ≤ 80 so both land on 0; c would make 90, so it moves to 1.
         assert_eq!(l.assignment, vec![0, 0, 1]);
@@ -396,7 +421,10 @@ mod tests {
     fn spread_and_pack_disagree_on_the_same_input() {
         let models = vec![spec("a", 10 * GIB), spec("b", 10 * GIB)];
         let g = groups(2, 80 * GIB);
-        assert_eq!(assign(&models, &g, Place::Spread).unwrap().assignment, [0, 1]);
+        assert_eq!(
+            assign(&models, &g, Place::Spread).unwrap().assignment,
+            [0, 1]
+        );
         assert_eq!(assign(&models, &g, Place::Pack).unwrap().assignment, [0, 0]);
     }
 
@@ -460,7 +488,11 @@ mod tests {
     /// switches models within a group, so "does not all fit at once" is normal.
     #[test]
     fn pack_still_places_everything_when_nothing_has_room_to_spare() {
-        let models = vec![spec("a", 70 * GIB), spec("b", 70 * GIB), spec("c", 70 * GIB)];
+        let models = vec![
+            spec("a", 70 * GIB),
+            spec("b", 70 * GIB),
+            spec("c", 70 * GIB),
+        ];
         let l = assign(&models, &groups(2, 80 * GIB), Place::Pack).unwrap();
         assert!(l.assignment.iter().all(|&g| g < 2));
     }
