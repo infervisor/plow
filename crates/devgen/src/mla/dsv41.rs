@@ -50,6 +50,12 @@ pub(crate) struct Dsv41Cfg {
     pub hc_mult: u32,
     pub hc_sinkhorn_iters: u32,
     pub sliding_window: u32,
+    /// The validated config itself. Kept rather than fully flattened so that derived quantities
+    /// -- the ue8m0 block grid, `compressor_has_gate`, `engram_rows` -- have exactly ONE
+    /// definition, in nn-graph, where they are already tested against the released shards. A
+    /// second copy of the `[32, 32]` grid here is precisely how V4's `[128, 128]` would creep back
+    /// in on a checkpoint that does not use it.
+    pub raw: nn_graph::models::config::DeepSeekV41Config,
 }
 
 #[allow(dead_code)]
@@ -135,6 +141,7 @@ pub(crate) fn cfg_dsv41(dir: &Path) -> Result<Dsv41Cfg, String> {
         hc_mult: c.hc_mult,
         hc_sinkhorn_iters: c.hc_sinkhorn_iters,
         sliding_window: c.sliding_window,
+        raw: c,
     })
 }
 
@@ -233,4 +240,146 @@ pub(crate) fn dsv41_gaps(c: &Dsv41Cfg) -> Vec<String> {
             c.hc_mult, c.hc_sinkhorn_iters
         ),
     ]
+}
+
+/// One weight the emit binds: the checkpoint name (without the `layers.{l}.` prefix) and its
+/// size in BYTES.
+///
+/// Bytes rather than elements because that is what `Builder::tensor` takes and what a shard
+/// header can be checked against directly. The dtype is folded in here rather than carried
+/// alongside: `F8_E4M3`, `F8_E8M0` and the nibble-packed `I8` expert weights are all 1 byte per
+/// stored element, `BF16` is 2 and `F32` is 4, and conflating those is how a tensor table ends up
+/// half the size it should be with no error until the load reads past a buffer.
+pub(crate) type LayerTensor = (String, u64);
+
+fn f8(name: &str, elems: u64) -> LayerTensor {
+    (name.to_string(), elems)
+}
+fn bf16(name: &str, elems: u64) -> LayerTensor {
+    (name.to_string(), elems * 2)
+}
+fn f32t(name: &str, elems: u64) -> LayerTensor {
+    (name.to_string(), elems * 4)
+}
+
+/// Every tensor layer `l` carries, as `(name, bytes)`.
+///
+/// The OPTIONAL groups are the whole difficulty of this checkpoint and none of them are stated
+/// directly by the config -- they are derived (`kv_source_layer_ids` gives a compressor,
+/// `index_source_layer_ids` gives indexer queries, only the intersection gives indexer KEYS), and
+/// each derivation is a place to read V4.1 as V4. `dsv41_layer_tensors_match_the_shards` asserts
+/// the derivations reproduce what is actually on disk, layer by layer, for all 40.
+pub(crate) fn dsv41_layer_tensors(c: &Dsv41Cfg, l: u32) -> Vec<LayerTensor> {
+    let (hidden, heads, hd) = (c.hidden as u64, c.heads as u64, c.head_dim as u64);
+    let q_lora = c.q_lora as u64;
+    let (g, orow, ocol) = c.wo_a_groups();
+    let (g, orow, ocol) = (g as u64, orow as u64, ocol as u64);
+    // The ue8m0 scale grid comes from the CONFIG's own `weight_block_size` via nn-graph, not
+    // from a constant here: V4.1 is [32, 32] where V4 was [128, 128], and a second copy of that
+    // number in devgen is how the wrong one survives a checkpoint change.
+    let blk = |r: u64, cdim: u64| {
+        let [a, b] = c.raw.fp8_scale_shape(r as i64, cdim as i64);
+        (a * b) as u64
+    };
+    let mxblk = |out: u64, inf: u64| {
+        let [a, b] = c.raw.mxfp4_scale_shape(out as i64, inf as i64);
+        (a * b) as u64
+    };
+    let mut t = vec![
+        bf16("attn_norm.weight", hidden),
+        bf16("ffn_norm.weight", hidden),
+        // One sink per head, and F32 where plow's FlashMerge `t3` slot is bf16.
+        f32t("attn.attn_sink", heads),
+        bf16("attn.q_norm.weight", q_lora),
+        bf16("attn.kv_norm.weight", hd),
+        f8("attn.wq_a.weight", q_lora * hidden),
+        f8("attn.wq_a.scale", blk(q_lora, hidden)),
+        f8("attn.wq_b.weight", heads * hd * q_lora),
+        f8("attn.wq_b.scale", blk(heads * hd, q_lora)),
+        // The single latent: 512 wide, shared by every head. No kv_b exists.
+        f8("attn.wkv.weight", hd * hidden),
+        f8("attn.wkv.scale", blk(hd, hidden)),
+        f8("attn.wo_a.weight", g * orow * ocol),
+        f8("attn.wo_a.scale", blk(g * orow, ocol)),
+        f8("attn.wo_b.weight", hidden * g * orow),
+        f8("attn.wo_b.scale", blk(hidden, g * orow)),
+    ];
+
+    // mHC, on EVERY layer -- which is why there is no mHC-free block to extract.
+    let mix = ((2 + c.hc_mult) * c.hc_mult) as u64;
+    for side in ["attn", "ffn"] {
+        t.push(f32t(&format!("hc_{side}_fn"), mix * c.hc_mult as u64 * hidden));
+        t.push(f32t(&format!("hc_{side}_base"), mix));
+        t.push(f32t(&format!("hc_{side}_scale"), 3));
+    }
+
+    // MoE. The routed experts are MXFP4 (two nibbles per byte, so the stored row is half as wide);
+    // the SHARED expert is block-FP8, not fp4 -- one layer, two encodings.
+    let inter = c.moe_inter as u64;
+    t.push(bf16("ffn.gate.weight", c.n_exp as u64 * hidden));
+    t.push(f32t("ffn.gate.bias", c.n_exp as u64));
+    // The image-span routing bias: a SECOND bias, used for vl tokens (`noaux_tc_for_vl`).
+    t.push(f32t("ffn.gate.bias_vl", c.n_exp as u64));
+    for e in 0..c.n_exp as u64 {
+        for w in ["w1", "w3"] {
+            t.push(f8(&format!("ffn.experts.{e}.{w}.weight"), inter * hidden / 2));
+            t.push(f8(&format!("ffn.experts.{e}.{w}.scale"), mxblk(inter, hidden)));
+        }
+        t.push(f8(&format!("ffn.experts.{e}.w2.weight"), hidden * inter / 2));
+        t.push(f8(&format!("ffn.experts.{e}.w2.scale"), mxblk(hidden, inter)));
+    }
+    for w in ["w1", "w3"] {
+        t.push(f8(&format!("ffn.shared_experts.{w}.weight"), inter * hidden));
+        t.push(f8(&format!("ffn.shared_experts.{w}.scale"), blk(inter, hidden)));
+    }
+    t.push(f8("ffn.shared_experts.w2.weight", hidden * inter));
+    t.push(f8("ffn.shared_experts.w2.scale", blk(hidden, inter)));
+
+    // CSA2: only the kv_source layers own a compressor, and every other layer READS its cache.
+    // BF16 where `model.py:446` declares f32 -- the shard wins (section 7).
+    if c.kv_source.contains(&l) {
+        t.push(bf16("attn.compressor.wkv.weight", hd * hidden));
+        t.push(bf16("attn.compressor.norm.weight", hd));
+        // Layer 20 runs at ratio 1, which is a plain projection with NO softmax gate -- so the
+        // gate is not simply "every compressor has one".
+        if c.raw.compressor_has_gate(l) {
+            t.push(bf16("attn.compressor.wgate.weight", hd * hidden));
+        }
+    }
+
+    // The two-level indexer. Queries on 8 layers; KEYS only where a compressor lives, because the
+    // index key is derived from the compressor's latent.
+    if c.index_source.contains(&l) {
+        let (ih, idim) = (c.index_heads as u64, c.index_dim as u64);
+        t.push(f8("attn.indexer.wq_b.weight", ih * idim * q_lora));
+        t.push(f8("attn.indexer.wq_b.scale", blk(ih * idim, q_lora)));
+        t.push(bf16("attn.indexer.weights_proj.weight", ih * hidden));
+        if c.kv_source.contains(&l) {
+            t.push(bf16("attn.indexer.wk.weight", idim * hd));
+            t.push(bf16("attn.indexer.k_norm.weight", idim));
+        }
+    }
+
+    // Engram, on 2 layers. `embed` is the 98 GB table; `q_weight`/`k_weight` are [hc_mult, hidden]
+    // -- one row per hyper-connection copy, which is what op 182 takes as `qw`/`kw`.
+    if let Some(rows) = c.raw.engram_rows(l) {
+        let rows = rows as u64;
+        let (ehd, ehe) = (c.raw.engram_head_dim as u64, c.raw.engram_n_heads as u64);
+        t.push(f8("engram.embed.weight", rows * ehd));
+        // The scale is ue8m0 at a 32-element block along the ROW, which is why `engram.embed.scale`
+        // is [rows, 8] for a 256-wide row rather than [rows, 2] as V4's [128, 128] would give.
+        t.push(f8("engram.embed.scale", rows * ehd.div_ceil(32)));
+        let wkv_out = hidden * (c.hc_mult as u64 + 1);
+        // The `wkv` GEMM consumes ALL the gathered rows flattened, not one head's worth: a token
+        // fetches `(max_ngram - 1) * n_heads` = 24 rows of `head_dim`, so the input is 24 * 256 =
+        // 6144. Sizing this as `n_heads * head_dim` gives 2048 and a tensor a third of the right
+        // size, which is what `dsv41_layer_tensors_match_the_shards` caught.
+        let cols = (c.raw.engram_max_ngram_size as u64 - 1) * ehe;
+        let wkv_in = cols * ehd;
+        t.push(f8("engram.wkv.weight", wkv_out * wkv_in));
+        t.push(f8("engram.wkv.scale", blk(wkv_out, wkv_in)));
+        t.push(bf16("engram.q_weight", c.hc_mult as u64 * hidden));
+        t.push(bf16("engram.k_weight", c.hc_mult as u64 * hidden));
+    }
+    t
 }

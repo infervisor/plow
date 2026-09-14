@@ -11137,5 +11137,9 @@ mod glm_tests;
 mod kimi_tests;
 
 #[cfg(test)]
+#[path = "mla/dsv41_tests.rs"]
+mod dsv41_tests;
+
+#[cfg(test)]
 #[path = "mla/nemotron_tests.rs"]
 mod nemotron_tests;
