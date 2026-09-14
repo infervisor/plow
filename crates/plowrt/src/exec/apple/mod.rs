@@ -62,6 +62,20 @@ struct Params {
     inst_hi: u32,
 }
 
+fn prefers_ordered_decode(
+    program: usize,
+    decode_start: usize,
+    gpu_only: bool,
+    insts: &[DevInst64],
+) -> bool {
+    program >= decode_start
+        && gpu_only
+        && insts.iter().any(|d| matches!(d.op, 10 | 19 | 22))
+        && !insts
+            .iter()
+            .any(|d| matches!(d.op, 30 | 31 | 91 | 92 | 114 | 115))
+}
+
 /// One instruction of one program delegated to the Apple Neural Engine (rung 4): a prefill
 /// GEMM whose weights were baked into a CoreML program at load. Runs on the host thread at a
 /// segment boundary of the GPU walk; see `run_prog`.
@@ -1427,7 +1441,14 @@ impl MetalEngine {
             }
         }
         let pg = &self.progs[p];
-        if !self.serial {
+        let bf16_decode = prefers_ordered_decode(
+            p,
+            self.model.dec_ix,
+            self.gpu_only_program(p),
+            &pg.insts_host,
+        );
+        let ordered = self.serial || bf16_decode;
+        if !ordered {
             if let Some(conformer) = self
                 .conformer
                 .as_ref()
@@ -1446,7 +1467,7 @@ impl MetalEngine {
             }
         }
         let n_cu = self.model.blob.n_cu as usize;
-        if self.serial {
+        if ordered {
             // Topological instruction order (the builder appends ops in dependency order).
             for (ii, d) in pg.insts_host.iter().enumerate() {
                 let enc = cb
@@ -1510,11 +1531,9 @@ impl MetalEngine {
                 enc.endEncoding();
             }
         }
-        for seg in (if self.serial { 0 } else { seg_lo })..(if self.serial {
-            0
-        } else {
-            seg_hi.min(pg.n_seg)
-        }) {
+        for seg in
+            (if ordered { 0 } else { seg_lo })..(if ordered { 0 } else { seg_hi.min(pg.n_seg) })
+        {
             let enc = cb
                 .computeCommandEncoder()
                 .ok_or_else(|| RuntimeError::Device("metal: no encoder".into()))?;
@@ -2427,6 +2446,28 @@ impl crate::exec::packet_runtime::PacketRuntime for MetalEngine {
 #[cfg(test)]
 mod source_tests {
     use super::*;
+
+    #[test]
+    fn ordered_decode_selects_gpu_only_bf16_rungs() {
+        let inst = |op: DevOp| DevInst64 {
+            op: op as u16,
+            ..DevInst64::default()
+        };
+        assert!(prefers_ordered_decode(
+            3,
+            3,
+            true,
+            &[inst(DevOp::Gemv), inst(DevOp::GemvGlu)]
+        ));
+        assert!(!prefers_ordered_decode(2, 3, true, &[inst(DevOp::Gemv)]));
+        assert!(!prefers_ordered_decode(3, 3, false, &[inst(DevOp::Gemv)]));
+        assert!(!prefers_ordered_decode(
+            3,
+            3,
+            true,
+            &[inst(DevOp::Gemv), inst(DevOp::GemvMxfp4)]
+        ));
+    }
 
     #[test]
     fn packet_interpreter_source_compiles() {
