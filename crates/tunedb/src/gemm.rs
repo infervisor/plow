@@ -276,4 +276,32 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn sweep_rungs_force_body_inlining() {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../runtime/amd/test_kernels.hip");
+        let src = std::fs::read_to_string(&p).expect("test_kernels.hip");
+        for macro_name in ["GEMM_VARIANT", "GEMM_FP8_VARIANT", "GEMM_MXFP4_VARIANT"] {
+            let start = src
+                .find(&format!("#define {macro_name}"))
+                .unwrap_or_else(|| panic!("missing {macro_name}"));
+            let body = &src[start..src[start..].find("\n#if").map_or(src.len(), |n| start + n)];
+            assert!(
+                body.contains("__attribute__((flatten))"),
+                "{macro_name} may outline a rung and benchmark call-boundary scratch"
+            );
+        }
+        let glu = src
+            .find("void gemma_gemm_glu_bf16(")
+            .expect("direct GEMM+GLU wrapper");
+        assert!(
+            src[glu.saturating_sub(160)..glu].contains("__attribute__((flatten))"),
+            "direct GEMM+GLU wrapper must expose its own register budget"
+        );
+        assert!(src.contains("void gemma_gemm_glu_bf16_outlined("));
+        assert!(src.contains("__attribute__((noinline)) void d_gemm_glu_outlined_probe("));
+        assert!(src.contains("GEMM_GLU_VARIANT(gemma_gemm_glu_bf16_c2"));
+        assert!(!src.contains("GEMM_GLU_VARIANT(gemma_gemm_glu_bf16_c5"));
+    }
 }
