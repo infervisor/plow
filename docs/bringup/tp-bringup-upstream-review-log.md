@@ -1491,6 +1491,54 @@ the healthy arm, so it cancels out of a request-scoped diff and appears only in 
 one. If the diff is empty the decision is silent, and the candidates get instrumented by hand
 instead of guessed at.
 
+## The healthy and poisoned servers agree on every logged decision, so the divergence is silent (2026-09-14, job `rbfault18-logdiff`)
+
+Two servers, identical but for the order of the first request, both at `RUST_LOG=debug`:
+`bandfirst` issues one 8192 request and passes 3/3; `ordfirst` issues one 4096 and then the same
+8192 and fails 0/3. Their logs were then compared on the SET of normalized message shapes —
+timestamps, ANSI, hex, integers and floats collapsed — so two lines that say the same thing about
+different numbers fall together.
+
+| scope | only in `bandfirst` | only in `ordfirst` |
+|---|---|---|
+| the 8192 request | 4 shapes | 0 |
+| **everything after load** | **0** | **0** |
+
+The four request-scoped shapes are an artefact of the window, not a difference: engine-thread
+pinning, the decode-ladder rung, `PLOW_RAGGED_CHUNK` and `prefill chunk policy` are all emitted
+once per server, and in `bandfirst` the 8192 IS the first request while in `ordfirst` they were
+emitted during the 4096. The whole-server row is the real comparison and it is **empty in both
+directions**.
+
+`prefill chunk policy` was the promising one — a decision logged once per server, naming
+`launch_rows` and `max_chunk` — so its values were compared directly rather than through the
+normalizer. They are identical:
+
+```
+PLOW_RAGGED_CHUNK: fewest-launch cover, last chunk runs at its real row count
+                   buckets=[128, 512, 2048, 8192, 8192, 1, 2, 4, 8, 16]
+prefill chunk policy launch_rows=416 overridden=false ragged=true max_chunk=8192
+                     requested_max_chunk=4294967295 buckets=[128, 512, 2048, 8192]
+```
+
+**So the two servers agree on every decision they narrate, and the divergence is not reflected in
+any log line.** Combined with `rbfault16`'s exoneration of the sparse-MLA workspace, continuing to
+ask "which buffer" by clearing candidates one at a time is now an expensive way to guess.
+
+**Change the question: which part of the OUTPUT is wrong?** The row-split sibling does not treat
+its eight bands alike. At 8192 the chunk has `prior = 0` and 1024 rows per rank, so
+`band_keys(prior, rank, rows)` gives rank 0 the Identity CSR at `band_prior = 0`, rank 1 the same
+CSR at 1024, and ranks 2-7 the Selection path — `self.kp` from the pack kernel plus the `IndexTpPf`
+index tensor at `index_row0`. Two code paths inside one dispatch, split at a known row.
+
+`rbfault7` put a needle at each of the eight band centres and found all eight, 24/24 — but on a
+COLD server, which is the healthy order, so it says nothing about the poisoned one. Queued as
+`rbfault19-whichband`: the same sweep after a 4096, with the cold sweep as the control. All eight
+wrong means the defect is common to both branches or upstream of the dispatch; only ranks 2-7 means
+the Selection branch; only ranks 0-1 would point back at the CSR, which would be surprising given
+`rbfault16` zeroed that buffer and forgot its staged key on every dispatch without helping. Any
+other split names the quantity by where the boundary falls. Client-side only — no build, no knob.
+
 ## The tile-campaign blocker resolves into three classes with three different owners (2026-09-14, job `gemmtune-glm53`, follow-up)
 
 The section above records 374 FAIL lines over 44 objects and stops at "it wants an owner". Building
