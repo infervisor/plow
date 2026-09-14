@@ -76,7 +76,7 @@ inline ushort e4m3bf(uint c) {
 inline ushort4 e4m3bf4(uchar4 c) {
     return ushort4(e4m3bf(c.x), e4m3bf(c.y), e4m3bf(c.z), e4m3bf(c.w));
 }
-inline float4 bf4(ushort4 h) { return as_type<float4>(uint4(h) << 16); }
+inline float4 bf4(ushort4 h) { return float4(as_type<bfloat4>(h)); }
 
 template <typename T>
 inline device T* ten(device const ulong* tab, const thread Inst& in, uint k) {
