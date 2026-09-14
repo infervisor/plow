@@ -366,12 +366,14 @@ pub(super) fn load_kernels(
         let field = image
             .get_mut(spec.kernarg_offset..spec.kernarg_offset + 4)
             .ok_or_else(|| RuntimeError::Device("hipBLASLt descriptor is outside object".into()))?;
-        if field != [0; 4] {
+        let encoded = args_bytes.to_le_bytes();
+        if field == [0; 4] {
+            field.copy_from_slice(&encoded);
+        } else if field != encoded {
             return Err(RuntimeError::Device(
                 "hipBLASLt descriptor differs from qualified ABI".into(),
             ));
         }
-        field.copy_from_slice(&args_bytes.to_le_bytes());
     }
     let module = EngineDevice::module_load(be, &image)?;
     let mut kernels = Vec::new();
@@ -581,7 +583,7 @@ mod tests {
 
     #[test]
     fn lt_arguments_preserve_live_rows_and_inline_abi() {
-        let mut specs: Vec<KernelSpec> =
+        let specs: Vec<KernelSpec> =
             serde_json::from_str(include_str!("../../../../runtime/amd/glm_lt_gfx942.json"))
                 .unwrap();
         for (n, k) in [(2048, 6144), (512, 6144), (4096, 2048)] {
@@ -628,6 +630,11 @@ mod tests {
         ))
         .unwrap();
         specs.extend(ext);
+        let gemma: Vec<KernelSpec> = serde_json::from_str(include_str!(
+            "../../../../runtime/amd/gemma_lt_bias_gfx942.json"
+        ))
+        .unwrap();
+        specs.extend(gemma);
         specs
     }
 
@@ -723,15 +730,22 @@ mod tests {
         }
     }
 
-    /// `load_kernels` patches each descriptor once and refuses one it already patched, so no
-    /// kernel may appear in two spec lists: a shared kernel is reused by index.
+    /// A descriptor shared by two qualified routes must describe the same kernel ABI. The loader
+    /// patches it once and accepts the identical already-patched value on the second route.
     #[test]
-    fn spec_lists_name_each_descriptor_once() {
+    fn aliased_descriptors_have_one_abi() {
         let specs = all_specs();
-        let mut offsets: Vec<_> = specs.iter().map(|s| s.kernarg_offset).collect();
-        offsets.sort_unstable();
-        offsets.dedup();
-        assert_eq!(offsets.len(), specs.len());
+        for (ix, spec) in specs.iter().enumerate() {
+            for alias in &specs[..ix] {
+                if alias.kernarg_offset == spec.kernarg_offset {
+                    assert_eq!(alias.name, spec.name);
+                    assert_eq!(
+                        (alias.lds, alias.mt_i, alias.mt_j),
+                        (spec.lds, spec.mt_i, spec.mt_j)
+                    );
+                }
+            }
+        }
     }
 
     #[test]
