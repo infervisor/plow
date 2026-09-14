@@ -301,6 +301,58 @@ piece of the V4.1 attention/FFN block to an existing `DevOp` or marks it new.
    o_lora_rank` = 8192 is wider than `hidden` itself, and the output projection
    is consequently a first-order term in section 9's budget, not a detail.
 
+5b. **Block-FP8 at `[32, 32]` with E8M0 scales — THE REAL GATE ON THE
+   PROJECTIONS, found 2026-09-14.** Every block-FP8 kernel in plow assumes a
+   `[128, 128]` f32 scale grid. V4.1's is `[32, 32]` and its scales are **ue8m0
+   bytes, not f32**. Both halves are checkable from the shards: `attn.wq_a.weight`
+   is `[1280, 5120]` and its `.scale` is `F8_E8M0 [40, 160]` = `1280/32` x
+   `5120/32`.
+
+   This is not a corner. It is **112.0 TFLOP, 39.8% of the 8k prefill** — every
+   projection in the model:
+
+   | affected | TFLOP | note |
+   |---|---|---|
+   | `attn_proj` | 82.98 | `wq_a`, `wq_b`, `wkv`, `wo_a`, `wo_b` |
+   | `shared_expert` | 23.19 | the shared expert is block-FP8, not fp4 |
+   | `engram_proj` | 5.15 | `engram.wkv`, scale `[800, 192]` |
+   | `indexer_proj` | 0.71 | `indexer.wq_b`, scale `[128, 40]` |
+   | **total** | **112.03** | **39.8%** |
+
+   The routed experts are NOT affected — they are MXFP4, a different fetch path.
+
+   Both numbers are load-bearing in the kernel, not cosmetic. `d_gemm_t`'s
+   block-FP8 promotion reads `bsblk[nsblk[j] * KB + kb]` with
+   `KB = (K + 127) >> 7` and `nsblk = n >> 7`, and it fires on
+   `(kt & 1) == 1` because — as its own comment says — "a 128-element K scale
+   block is exactly two BK=64 tiles, so the boundary always falls **between**
+   k-tiles, outside every MFMA burst and outside the ping-pong's barrier pairs".
+   At a 32-element block that property is GONE: one BK=64 tile spans two scale
+   blocks, so the promotion lands *inside* the MFMA burst. `op_gemm_common.h`
+   states the convention is shared by ops 44, 47 and 85/86 — "one convention,
+   three kernels" — so this is a family-wide assumption, not one kernel's.
+
+   devgen already refuses it, loudly and for the right reason
+   (`mla_ckpt_enc`): "the 128 is not a parameter anywhere in this emitter —
+   `div_ceil(128)` is written into every scale-grid size". So V4.1 stops here
+   whatever else is built, and no amount of emit plumbing gets past it.
+
+   **The encouraging half: plow already reads exactly V4.1's scale convention,
+   just on the wrong operand.** The MXFP4 B-fetch takes "E8M0 scale rows
+   `wscale` (K/32 bytes/row)" — group 32, E8M0, byte-wide, which is V4.1's
+   convention precisely. So the work is to apply the fp4 path's scale handling
+   to an e4m3 weight rather than to invent a scheme: `GM_BLK_BK` is already a
+   `#define` and setting it to 32 makes one k-tile exactly one scale block
+   (promotion every tile, `kb = kt`), at the cost of halving the K step. That
+   trade needs measuring, not assuming, and it is the FIRST thing a GPU lease
+   should be spent on — it gates 40% of the budget and it is a kernel question,
+   answerable on one card without any of the emit.
+
+   The two alternatives are worse and should be named so they are not
+   rediscovered: requantizing to `[128, 128]` at load is LOSSY (one scale
+   replacing 16 changes the numerics of every projection), and dequantizing to
+   bf16 doubles the projection weight bytes and gives up the fp8 fetch rate.
+
 6. **`sparse_attn` operand shape.** `FlashGather*` is MLA-shaped
    (`Qabs`/`Qrope`/`Ckv`/`Krope`). V4.1 concatenates window KV and compressed
    KV into ONE cache and one index list (`model.py:781-783`), over a flat
@@ -792,7 +844,24 @@ the emit path reads a config again:
   refused wrapper's text tower needs exactly it, and copying the ten lines into
   each one is how the rule drifts.
 
+**The ordering changed on 2026-09-14, and the new item 0 is not an emit item.**
+V4.1's block-FP8 grid is `[32, 32]` with ue8m0 scales; every block-FP8 kernel in
+plow assumes `[128, 128]` with f32 scales, and `mla_ckpt_enc` refuses anything
+else outright. That gates **39.8% of the 8k prefill** -- every projection in the
+model -- and no amount of emit plumbing reaches it, because the refusal fires at
+checkpoint-quant time. See item 5b of section 5.2 for the mechanism and for why
+it is more tractable than it first looks (the MXFP4 fetch path already reads
+group-32 E8M0 scale rows; `GM_BLK_BK` is already a `#define`).
+
+It is also the item best suited to the scarce resource. It is a KERNEL question
+answerable on ONE card with no emit at all, where items 3-5 need a whole model
+and eight. When a lease comes free, spend it here first.
+
 So the ordered critical path to an 8k/90 ms number is:
+
+0. **block-FP8 at `[32, 32]` with E8M0 scales** -- a scale-handling arm on the
+   existing block-FP8 GEMM, borrowing the MXFP4 path's group-32 E8M0 row
+   convention. Gates 112.0 TFLOP of 281.6;
 
 1. ~~opcodes + dispatch for `d_compress_pool` and `d_rope_inverse_o`~~ -- DONE
    (ops 180/181, verified on gfx942 hardware);

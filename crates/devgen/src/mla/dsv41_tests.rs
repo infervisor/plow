@@ -205,3 +205,99 @@ fn engram_tables_dominate_the_weight_budget() {
         "engram should be >40% of the per-layer weight bytes"
     );
 }
+
+/// V4.1's block-FP8 grid is `[32, 32]` with ue8m0 scales, and plow's every block-FP8 kernel
+/// assumes `[128, 128]` with f32 scales. This pins BOTH halves from the shards.
+///
+/// It is the gate on 39.8% of the 8k prefill — every projection in the model — and it is a
+/// KERNEL problem, not an emit problem: `mla_ckpt_enc` refuses a non-`[128, 128]` checkpoint
+/// outright, so no amount of emit plumbing reaches it. Asserted here rather than left to section
+/// 5.2's prose because the scale grid is exactly the kind of fact that reads as a detail: the
+/// shapes are self-consistent, nothing is missing, and the only way to notice is to divide.
+#[test]
+fn the_block_fp8_grid_is_32_not_128_and_the_scales_are_e8m0() {
+    let Some((cfg, hdr)) = checkpoint() else {
+        return;
+    };
+    assert_eq!(
+        cfg.raw.quantization_config.weight_block_size,
+        [32, 32],
+        "V4.1 quantizes at [32, 32]; V4 was [128, 128] and plow's kernels are written to the latter"
+    );
+
+    // Every projection, checked by DIVISION: the scale grid is the weight shape over the block.
+    // And every one of them is F8_E8M0 — a BYTE-wide scale, where `d_gemm_fp8_blk` takes
+    // `const float* wscale`. Two independent mismatches, either of which alone would be fatal.
+    let projections = [
+        "attn.wq_a",
+        "attn.wq_b",
+        "attn.wkv",
+        "attn.wo_a",
+        "attn.wo_b",
+        "ffn.shared_experts.w1",
+        "ffn.shared_experts.w2",
+        "ffn.shared_experts.w3",
+    ];
+    for p in projections {
+        let w = format!("layers.0.{p}.weight");
+        let sc = format!("layers.0.{p}.scale");
+        let (wdt, wshape) = hdr.get(&w).unwrap_or_else(|| panic!("{w} missing"));
+        let (sdt, sshape) = hdr.get(&sc).unwrap_or_else(|| panic!("{sc} missing"));
+        assert_eq!(wdt, "F8_E4M3", "{w}");
+        assert_eq!(sdt, "F8_E8M0", "{sc} is a ue8m0 BYTE, not the f32 the kernel expects");
+        assert_eq!(
+            *sshape,
+            vec![(wshape[0] + 31) / 32, (wshape[1] + 31) / 32],
+            "{sc} must be the [32, 32] grid over {wshape:?}"
+        );
+        // ...and it is emphatically NOT the [128, 128] grid plow would index it as.
+        assert_ne!(
+            *sshape,
+            vec![(wshape[0] + 127) / 128, (wshape[1] + 127) / 128],
+            "{sc} happens to match a [128,128] grid too — the test proves nothing for this shape"
+        );
+    }
+
+    // The two layer-conditional projections carry the same grid.
+    for (layer, name) in [(1u32, "engram.wkv"), (2, "attn.indexer.wq_b")] {
+        let w = format!("layers.{layer}.{name}.weight");
+        let sc = format!("layers.{layer}.{name}.scale");
+        let (_, wshape) = hdr.get(&w).unwrap_or_else(|| panic!("{w} missing"));
+        let (sdt, sshape) = hdr.get(&sc).unwrap_or_else(|| panic!("{sc} missing"));
+        assert_eq!(sdt, "F8_E8M0");
+        assert_eq!(*sshape, vec![(wshape[0] + 31) / 32, (wshape[1] + 31) / 32]);
+    }
+
+    // The routed experts are the exception, and naming it keeps the scope honest: they are MXFP4
+    // at group 32 along K only, which is a path plow ALREADY has — so the 39.8% figure excludes
+    // the 49.4% of the prefill that the routed experts are.
+    let (edt, eshape) = hdr.get("layers.0.ffn.experts.0.w1.weight").expect("expert w1");
+    let (esdt, esshape) = hdr.get("layers.0.ffn.experts.0.w1.scale").expect("expert w1 scale");
+    assert_eq!(edt, "I8", "routed experts are nibble-packed fp4 in an I8 container");
+    assert_eq!(esdt, "F8_E8M0");
+    // [2304, 160]: full rows, K/32 columns — a per-32-along-K group, NOT a 2-D block.
+    assert_eq!(*esshape, vec![eshape[0], (eshape[1] * 2 + 31) / 32]);
+}
+
+/// The refusal must NAME the block-FP8 gate, and name it first.
+///
+/// A reader who runs the emit and gets a list of missing emit features would reasonably start
+/// building them. They would then hit `mla_ckpt_enc`'s refusal with all of that work done, because
+/// the grid is a kernel problem that no emit reaches. Ordering the gap list is the fix.
+#[test]
+fn the_refusal_leads_with_the_block_fp8_gate() {
+    let Some((cfg, _)) = checkpoint() else {
+        return;
+    };
+    let gaps = super::dsv41::dsv41_gaps(&cfg);
+    assert!(
+        gaps[0].contains("block-FP8") && gaps[0].contains("[32, 32]"),
+        "the block-FP8 grid gates every projection and must come first; got: {}",
+        gaps[0]
+    );
+    assert!(
+        gaps[0].contains("39.8%"),
+        "...and should say how much of the prefill it gates; got: {}",
+        gaps[0]
+    );
+}

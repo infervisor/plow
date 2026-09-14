@@ -193,7 +193,20 @@ pub(crate) fn dsv41_shard_check(c: &Dsv41Cfg, dir: &Path) -> Vec<String> {
 /// `docs/amd/deepseek-v41-flash-mi300x.md` section 5.6.
 pub(crate) fn dsv41_gaps(c: &Dsv41Cfg) -> Vec<String> {
     let in_per_group = c.heads * c.head_dim / c.o_groups;
+    let [ob, ib] = c.raw.quantization_config.weight_block_size;
     vec![
+        // FIRST, because it gates every projection in the model and no emit plumbing gets past it.
+        format!(
+            "block-FP8 at [{ob}, {ib}] with ue8m0 scales: every block-FP8 kernel in plow assumes a \
+             [128, 128] f32 grid (`bsblk[nsblk * KB + kb]`, `KB = (K+127)>>7`, `nsblk = n>>7`, one \
+             convention shared by ops 44/47/85/86), and `mla_ckpt_enc` refuses anything else. That \
+             is 112.0 TFLOP, 39.8% of the 8k prefill -- wq_a/wq_b/wkv/wo_a/wo_b, the shared \
+             expert, engram.wkv and indexer.wq_b. The promotion fires between k-tiles only because \
+             a 128-element K block is exactly two BK=64 tiles; at {ib} it lands inside the MFMA \
+             burst. The MXFP4 fetch path ALREADY reads group-32 E8M0 scale rows, so the work is to \
+             apply that scale handling to an e4m3 weight, not to invent a scheme (GM_BLK_BK is \
+             already a #define). Routed experts are unaffected -- they are MXFP4"
+        ),
         format!(
             "CSA2 emit: the compressor runs on the {} kv_source layers {:?} and every one of the \
              {} layers READS that cache, so a per-layer compressor is the wrong shape (ops \
