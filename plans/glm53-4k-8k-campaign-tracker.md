@@ -641,6 +641,51 @@ Still unverified here: that plow's `n.xn` and vLLM's recycled tensor agree numer
 the plan's P2 gate (layer-78 hidden and top-1 against `DeepSeekMTPModel` on the same prompts),
 and it should be run before anyone ports the emit.
 
+## Stacked-lever T4: PASS, and the levers cannibalise each other (2026-09-14)
+
+Four arms, three cells, three metrics, zero failed requests. No arm worse than the control mean
+beyond its floor, so the P serving gate passes. `ctl`/`ctl2` = row-band alone (`b73d4440`),
+`treat`/`treat2` = row-band + G4 + G3 + G5 + fusepost (`9e76b70b`), ONE plowrt for every arm.
+
+| cell | metric | pooled effect | floor | x floor |
+|---|---|---:|---:|---|
+| **isl8192-c1** | TTFT | **-8.86** | 5.42 | 1.6 |
+| isl8192-c16 | TTFT | -18.21 | 5.84 | 3.1 |
+| isl8192-c16 | TPOT | -1.21 | 2.12 | 0.6 (not beyond) |
+| **isl4096-c1** | TTFT | **-13.33** | 3.36 | **4.0** |
+
+**Goal cell 519.8 -> 509.8 ms. The 490 ms target is NOT met, by 19.8 ms.**
+
+**The headline finding is that the levers are not additive, and at 8192 they are worse than
+not-additive.** Priced separately the stack is G4 -8.6, G3 ~-5, G5 ~-2.3...-3.3 and fusepost
+-4.1, about -20 total. It delivers -8.86 at 8192. Worse, at 4096 -- where `FUSE_POST_SCOPE` is
+`rows: (8192, 8192)` so fusepost is NOT in the packet's path at all -- the same stack delivers
+**-13.33**, half again as much. Adding a lever priced at -4.1 made the total SMALLER. At floors
+of 3.4 and 5.4 that is not noise.
+
+The mechanism is presumably that G3's native align, G5's fused Residual+RmsNorm and fusepost's
+GEMM+q-RoPE all collapse ops in the same MoE/glue region, so each one's saving is partly the
+saving the next one was going to make; fusepost, arriving last and only at 8192, may also be
+displacing a better hipBLASLt pick. Row-band is the counter-example that proves the point: it
+deletes ATTENTION collectives, is structurally disjoint from all of them, and stacked cleanly.
+
+Two consequences for how this campaign should pick levers:
+
+* **Stop adding levers that act on the same structure.** The remaining ladder (router overlap
+  -11.2, packproj -8) is priced the same separate way and should be expected to under-deliver by
+  a similar fraction when combined with what is already in the packet.
+* **Next experiment is a SUBTRACTION, not an addition:** emit G3+G4+G5 WITHOUT fusepost and
+  re-run the 8192 cells. If 8192 then behaves like 4096 that is ~4 ms recovered and it identifies
+  the toxic pairing. One CPU emit, no new objects if the tensor set is unchanged.
+
+Caveat on the goal cell specifically: its harness null is `ctl2 - ctl -3.2 [-7.0, -1.0]`, which
+does NOT contain zero -- real control-to-control drift at exactly the cell the goal is judged on.
+The floor absorbs it and the effect still clears at 1.6x, but `isl4096-c1` (4.0x, null contains
+0) and `isl8192-c16` (3.1x, null contains 0) are cleaner reads than the goal number itself.
+
+TPOT is unchanged everywhere beyond its floor, as expected for prefill-only levers: the C1 decode
+goal gets nothing from this packet.
+
 ## Rejected or parked
 
 | candidate | reason |
