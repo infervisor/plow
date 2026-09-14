@@ -11120,6 +11120,9 @@ pub(crate) fn nemotron_emit_block(
 mod kimi_k3;
 pub(crate) use kimi_k3::{k3_emit_full, kimi_k3_emit};
 
+mod dsv41;
+pub(crate) use dsv41::{cfg_dsv41, dsv41_gaps, dsv41_shard_check};
+
 // ===== tests moved from lib.rs (module breakdown): access mla internals directly =====
 #[cfg(test)]
 #[path = "mla/ckpt_quant_tests.rs"]

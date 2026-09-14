@@ -143,3 +143,87 @@ fn the_refusal_carries_the_real_checkpoints_validated_geometry() {
         );
     }
 }
+
+/// Helper: the refusal text for the REAL checkpoint, or `None` when the shards are absent.
+fn real_checkpoint_message() -> Option<String> {
+    let hf = std::path::PathBuf::from("/workspace/models/DeepSeek-V4.1-Flash");
+    if !hf.join("config.json").exists() {
+        eprintln!("skipping: DeepSeek-V4.1-Flash not present");
+        return None;
+    }
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let err = std::panic::catch_unwind(move || emit(hf)).unwrap_err();
+    std::panic::set_hook(hook);
+    Some(
+        err.downcast_ref::<String>()
+            .cloned()
+            .or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default(),
+    )
+}
+
+/// The attention shape, which is the thing the config does NOT say and the shards do.
+///
+/// V4.1's MLA is fully absorbed: `wkv` is `[512, 5120]` and there is no `kv_b` tensor anywhere in
+/// the 48 shards. So the 512 is one latent per token shared by all 64 heads
+/// (`num_key_value_heads = 1`) acting as both K and V -- NOT a per-head width, and not something
+/// to shard under TP. Reading it as V4's split latent is the misread this whole claim exists to
+/// prevent, and it would produce a blob that loads and runs.
+#[test]
+fn the_refusal_states_the_absorbed_mla_and_the_grouped_output_lora() {
+    let Some(msg) = real_checkpoint_message() else {
+        return;
+    };
+    for needle in ["FULLY ABSORBED", "512-wide latent", "no kv_b tensor", "64 heads"] {
+        assert!(
+            msg.contains(needle),
+            "the refusal should state {needle:?} -- it is read from the shards, not the config; \
+             got: {msg}"
+        );
+    }
+    // 8 x 1024, the output LoRA, whose block-diagonal structure is why a plain Linear is wrong.
+    assert!(
+        msg.contains("grouped output LoRA (8 x 1024)"),
+        "the refusal should report o_groups x o_lora_rank; got: {msg}"
+    );
+}
+
+/// The shard cross-check must find NOTHING to complain about on the released checkpoint.
+///
+/// This is the half of the contract that can fail loudly: `dsv41_shard_check` compares every
+/// layer-0 attention tensor against what the config implies, and the refusal prepends a WARNING
+/// when they disagree. On the real checkpoint they agree, so the warning must be absent -- and if
+/// this test ever starts failing, the config and the tensors have diverged and the geometry in the
+/// refusal is not this checkpoint's.
+#[test]
+fn the_shards_do_not_contradict_the_config() {
+    let Some(msg) = real_checkpoint_message() else {
+        return;
+    };
+    assert!(
+        !msg.contains("shards CONTRADICT"),
+        "the released checkpoint's tensors should match its config; got: {msg}"
+    );
+}
+
+/// The grouped output LoRA is NOT a blocker for a prefill emit, and the refusal has to say so.
+///
+/// Section 5.2 lists it under "new kernel work", which is true for DECODE (T=1 turns it into 8
+/// tiny GEMVs that want one fused dispatch). It is NOT true for prefill: block-diagonal over 8
+/// groups is 8 ordinary GEMMs of [T, 4096] x [4096, 1024], and at T=8192 one of those alone fills
+/// 304 CUs. Left unstated, the item reads as gating item 3 of the critical path when it does not.
+#[test]
+fn the_output_lora_is_marked_not_a_prefill_blocker() {
+    let Some(msg) = real_checkpoint_message() else {
+        return;
+    };
+    assert!(
+        msg.contains("NOT a blocker for a PREFILL emit"),
+        "the refusal should say the grouped output LoRA does not gate a prefill emit; got: {msg}"
+    );
+    assert!(
+        msg.contains("DECODE optimisation"),
+        "...and should say where the fused kernel actually pays; got: {msg}"
+    );
+}
