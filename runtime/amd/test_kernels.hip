@@ -207,6 +207,9 @@ GEMM_FP8_VARIANT(gemm_fp8_c3, 128, 128, 64)
 #if GM_TILE_FITS(64, 128, 64)
 GEMM_FP8_VARIANT(gemm_fp8_c4, 64, 128, 64)
 #endif
+#if GM_TILE_FITS(64, 128, 128)
+GEMM_FP8_VARIANT(gemm_fp8_e2, 64, 128, 128)
+#endif
 #if GM_TILE_FITS(192, 256, 64)
 GEMM_FP8_VARIANT(gemm_fp8_c5, 192, 256, 64) /* the Qwen prefill tile, vs bf16 c5 */
 #endif
@@ -247,6 +250,9 @@ GEMM_MXFP4_VARIANT(gemm_mxfp4_c3, 128, 128, 64)
 #endif
 #if GM_TILE_FITS(64, 128, 64)
 GEMM_MXFP4_VARIANT(gemm_mxfp4_c4, 64, 128, 64)
+#endif
+#if GM_TILE_FITS(64, 128, 128)
+GEMM_MXFP4_VARIANT(gemm_mxfp4_e2, 64, 128, 128)
 #endif
 #if GM_TILE_FITS(192, 256, 64)
 GEMM_MXFP4_VARIANT(gemm_mxfp4_c5, 192, 256, 64)

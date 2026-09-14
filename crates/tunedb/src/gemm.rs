@@ -80,7 +80,7 @@ pub fn amd_tuning_cell(spec: &hwspec::GpuSpec) -> String {
 ///
 /// Part of the staleness key, so a record checked by a weaker oracle cannot be served to a
 /// caller expecting this one.
-pub const GEMM_ORACLE: &str = "gemm-f64-dot-spotcheck-v1";
+pub const GEMM_ORACLE: &str = "gemm-f64-dot-spotcheck-runtime-tile-v2";
 
 /// The op-case key a GEMM measurement is filed and looked up under.
 ///

@@ -76,24 +76,24 @@ static const struct { const char* sym; unsigned bm, bn, bk; } TILES[] = {
 };
 #define NTILES ((int)(sizeof TILES / sizeof TILES[0]))
 
-/* The MXFP4 (w4a16) ladder: the FIVE SELECTABLE rungs and nothing else.
+/* The MXFP4 (w4a16) ladder plus the CDNA3 small-rung geometry.
  *
- * Deliberately not the twelve-entry bf16 list. `tunedb::gemm_rung_opcode` maps exactly these
- * five tiles to `Gemm*Mxfp4` opcodes; the calibration-only tiles (320x128, 384x128, 128x384,
- * 192x128) have no mxfp4 dispatch arm, so measuring them would produce rows ingest can only
- * throw away. `test_kernels.hip`'s GEMM_MXFP4_VARIANT list is the other half of this pair. */
-static const struct { const char* sym; unsigned bm, bn; } MXTILES[] = {
-    {"gemm_mxfp4_c0", 256, 256}, {"gemm_mxfp4_c2", 128, 256}, {"gemm_mxfp4_c3", 128, 128},
-    {"gemm_mxfp4_c4", 64, 128},  {"gemm_mxfp4_c5", 192, 256},
+ * Deliberately not the twelve-entry bf16 list. Ingest matches these probes against the live
+ * inventory; calibration-only tiles have no mxfp4 dispatch arm and are omitted.
+ * `test_kernels.hip`'s GEMM_MXFP4_VARIANT list is the other half of this pair. */
+static const struct { const char* sym; unsigned bm, bn, bk; } MXTILES[] = {
+    {"gemm_mxfp4_c0", 256, 256, 64}, {"gemm_mxfp4_c2", 128, 256, 64},
+    {"gemm_mxfp4_c3", 128, 128, 64}, {"gemm_mxfp4_c4", 64, 128, 64},
+    {"gemm_mxfp4_e2", 64, 128, 128}, {"gemm_mxfp4_c5", 192, 256, 64},
 };
 #define NMXTILES ((int)(sizeof MXTILES / sizeof MXTILES[0]))
 
-/* The W8A8 (fp8 weights AND fp8 activations) ladder: the same five selectable rungs
- * `tunedb::RUNGS` maps to `Gemm*Fp8`, and nothing else. Same reasoning as MXTILES — a
- * calibration-only tile has no fp8 dispatch arm, so a row for it can only be discarded. */
-static const struct { const char* sym; unsigned bm, bn; } F8TILES[] = {
-    {"gemm_fp8_c0", 256, 256}, {"gemm_fp8_c2", 128, 256}, {"gemm_fp8_c3", 128, 128},
-    {"gemm_fp8_c4", 64, 128},  {"gemm_fp8_c5", 192, 256},
+/* The W8A8 ladder plus the CDNA3 small-rung geometry. Ingest matches these probes against
+ * the live inventory, so c4 is selectable on gfx950 and e2 is selectable on gfx942. */
+static const struct { const char* sym; unsigned bm, bn, bk; } F8TILES[] = {
+    {"gemm_fp8_c0", 256, 256, 64}, {"gemm_fp8_c2", 128, 256, 64},
+    {"gemm_fp8_c3", 128, 128, 64}, {"gemm_fp8_c4", 64, 128, 64},
+    {"gemm_fp8_e2", 64, 128, 128}, {"gemm_fp8_c5", 192, 256, 64},
 };
 #define NF8TILES ((int)(sizeof F8TILES / sizeof F8TILES[0]))
 
@@ -304,7 +304,7 @@ int main(int argc, char** argv) {
         const char* sym = mx ? MXTILES[t].sym : (f8 ? F8TILES[t].sym : TILES[t].sym);
         const unsigned tbm = mx ? MXTILES[t].bm : (f8 ? F8TILES[t].bm : TILES[t].bm);
         const unsigned tbn = mx ? MXTILES[t].bn : (f8 ? F8TILES[t].bn : TILES[t].bn);
-        const unsigned tbk = (mx || f8) ? 64u : TILES[t].bk;
+        const unsigned tbk = mx ? MXTILES[t].bk : (f8 ? F8TILES[t].bk : TILES[t].bk);
         plow_hsa_kernel k;
         if (plow_hsa_get_kernel(H, 0, sym, &k) != 0) continue;
         /* A NaN sentinel makes incomplete tile coverage fail instead of inheriting a prior result. */
