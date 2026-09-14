@@ -54,8 +54,23 @@ def _use_system_toolchain() -> None:
     path = [p for p in os.environ.get("PATH", "").split(":") if p and p not in front]
     os.environ["PATH"] = ":".join(front + path)
 
-from model import ModelArgs, Transformer  # from the checkpoint's inference/
-from generate import load_model
+    # TVM binds create_shared.get_target_triple ONCE, at `import tvm.contrib.cc`,
+    # from os.environ["CXX"] -- so this has to be set before tilelang is
+    # imported, not later. An unset or broken CXX leaves the triple empty and
+    # every export_library dies on
+    #     AssertionError: Target triple should not be empty
+    # which surfaces only after the kernel has compiled. /usr/bin/g++ answers
+    # -dumpmachine with x86_64-linux-gnu and matches the system glibc above.
+    if os.path.exists("/usr/bin/g++"):
+        os.environ.setdefault("CXX", "/usr/bin/g++")
+
+
+# Must run BEFORE `model` pulls in tilelang -> tvm, which freezes both the
+# compiler used for host-side linking and the target triple at import time.
+_use_system_toolchain()
+
+from model import ModelArgs, Transformer  # noqa: E402  -- see above
+from generate import load_model  # noqa: E402
 
 
 def main() -> None:
@@ -70,7 +85,6 @@ def main() -> None:
     p.add_argument("--target-ms", type=float, default=90.0)
     p.add_argument("--json-out", default="")
     args_cli = p.parse_args()
-    _use_system_toolchain()
 
     world_size = int(os.getenv("WORLD_SIZE", "1"))
     rank = int(os.getenv("RANK", "0"))
