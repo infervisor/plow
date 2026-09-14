@@ -686,6 +686,68 @@ The floor absorbs it and the effect still clears at 1.6x, but `isl4096-c1` (4.0x
 TPOT is unchanged everywhere beyond its floor, as expected for prefill-only levers: the C1 decode
 goal gets nothing from this packet.
 
+## TTFT is 8% segment-launch overhead, and the row-20 ceiling is written twice (2026-09-14)
+
+**Where the 8192 C1 TTFT actually goes.** `PLOW_TTFT_LOG=1` on the stack packet, medians over 10
+requests (`ttftgap/probe.sh`):
+
+| phase | ms | % of TTFT |
+|---|---:|---:|
+| tokenize (HF BPE) | 15.53 | 3.1 |
+| prefill total (engine thread) | ~480 | 97.2 |
+| ... `enqueue_segment` (AQL launch) | **39.81** | **8.0** |
+| ... `drain` (host barrier, the GPU) | 431.27 | 87.6 |
+| `begin_slot` | 0.27 | 0.1 |
+| first-token detok + send | 0.02 | 0.0 |
+| UNACCOUNTED (HTTP, axum, SSE) | 0.06 | 0.0 |
+
+Two corrections to what this campaign believed. The rung board priced roughly 33 ms "outside the
+engine" at 8192 (tokenize 8.6-17, an untimed handler->first-SSE remainder 10-16, upload, JSON);
+measured now, host admission is about 15 ms total and the untimed remainder is **0.055 ms**.
+`begin_slot` is 0.27 ms, so `PLOW_VMM_RELEASE_RETIRE` genuinely fixed the 98-134 ms clear.
+
+The real non-GPU cost is **`enqueue_segment`: 39.8 ms to launch 1414 segments, about 28 us each,
+8% of TTFT and nearly twice the remaining gap to 490.** Segment count is not just a structural
+tax on token-batch bodies -- it is already the largest addressable non-GPU item in the shipping
+configuration. Any change that halves segments is worth about 20 ms of TTFT on the host side
+alone, before any GPU effect.
+
+This reframes review log #63's "deficit is structural: 1314 vs 625 segments": at 28 us a segment
+a body adds roughly 19 ms of pure enqueue, which is most of its measured -6.6% tok/s. A unified
+prefill/decode rung ladder only pays if it REDUCES segment count.
+
+`PLOW_ENCODE_FAST=1` moved tokenize 15.53 -> 13.69 ms median (TTFT 499.13 -> 496.99), consistent
+with the documented 12.3 -> 11.1, but at n=10 against a 9.8-19.9 ms spread it is directional, not
+resolved. Ids are identical to the default `encode`, so it cannot change a token.
+
+**Decode rungs above 20: three walls, not one.** Emitting ladders 32/64/128 (`wide-ladder`,
+`defaults` probes) gives `1,2,4,8,16,20` rc=0 (baseline packet `8b15f4a2`) and everything wider
+aborting, in this order:
+
+1. `mla.rs:4763` -- `PLOW_GLM_SELECT_LOCAL`'s radix selection asserts
+   `matches!(rows, 2|4|8|16|20)`. A production default worth +10.6% C20 / -19% median ITL.
+2. `mla.rs:4121` (with select_local off) -- `sparse && fp8kv` asserts
+   `nh_l == 8 && dk == 512 && dr == 64 && rows <= 20 && glm_gf(ctx, nh_l) == 4`.
+3. `exec/amd/object.rs:2146` -- the same `rows > 20`, again, at LOAD.
+
+So `rows <= 20` is written in the emitter AND the loader, on top of `build_gfx942.sh` capping
+`PLOW_GEMV_MM` at 16 (a wider width refuses without `PLOW_GEMV_WALK=1`) and the objects needing
+to exist at those widths. That is the Band64 project, whose route the rung board still records as
+"none" after three T2 load refusals, and 128 is past even its `SPARSE_FP8_DECODE_ROW_MAX=64`
+design.
+
+**Packed-prefill siblings emit clean and are worth a T4.** `emit.emit_packed_prefill` is already
+a Qualified production default (`true` on gfx942 with the `packed_prefill_siblings` cap,
+evidence: ordinary programs byte-identical with the siblings). It is off for us only because
+`GLM53_RECIPE` -- documented as mirroring the build.json replay rather than as an independent
+judgement -- pins it false, following the a7596da2 recipe. The recorded reason to hold it was
+"packed prefill + token-batch bodies stay opt-in UNTIL SPAN-AWARE 8192 LANDS", and span-aware
+8192 plus final-chunk packing both landed. Emitted on top of the stack it is accepted by
+checkpoint K: `packedpf-rb` `4b505c63a9540501` / `0xb0670117e48b8979`, and alone
+`packedpf-bare` `b7c2d5f2fac2639a` / `0x573a11097fea18b3`. Note this is REQUEST packing and is a
+different mechanism from the token-batch bodies that measured -6.6% tok/s; it needs objects and a
+T4 before any flip.
+
 ## Rejected or parked
 
 | candidate | reason |
