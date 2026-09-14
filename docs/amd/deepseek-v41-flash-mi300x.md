@@ -905,8 +905,22 @@ So the ordered critical path to an 8k/90 ms number is:
    new template parameter on a `d_gemm_t` every GEMM in the tree instantiates.
    `runtime/tests/dsv41_blockfp8_gfx942_test.hip` is built and queued: it checks
    the real projection shapes plus ragged tails and an `N = 33` case against a
-   reference that decodes e4m3 and ue8m0 from first principles. Remaining: run
-   it, then measure BK=32 against a BK=64 variant that promotes twice per tile;
+   reference that decodes e4m3 and ue8m0 from first principles.
+
+   **The ISA half has landed too** -- `PLOW_DOP_GEMM_FP8_MX` (184), behind
+   `PLOW_DSV41_BLKFP8`, checked in both directions: axis-off leaves the
+   interpreter's `.text` byte-identical to the commit before it (the dispatch
+   case sits in the hot switch, where an extra case can perturb every other op's
+   codegen, so "it compiled" would not have caught it), and axis-on grows it by
+   5 632 bytes and exports `plow_dsv41_blkfp8_arm` -- without which a misspelled
+   `#if` leaves the arm dead and the build green. A SEPARATE opcode from 107 and
+   not a flag on it, because the scale operand TYPE differs (ue8m0 bytes against
+   f32) and binding the wrong one faults nowhere. Ordering was the point: the
+   encoder must not accept `[32,32]` until an opcode exists that reads it, or it
+   emits 107 against a V4.1 grid and silently rescales every output.
+
+   Remaining: run the numerics, then measure BK=32 against a BK=64 variant that
+   promotes twice per tile;
 
 1. ~~opcodes + dispatch for `d_compress_pool` and `d_rope_inverse_o`~~ -- DONE
    (ops 180/181, verified on gfx942 hardware);
@@ -956,6 +970,33 @@ So the ordered critical path to an 8k/90 ms number is:
 5. full-model emit -- fork `glm53_emit_full` rather than writing one, since it
    already does prefill buckets plus decode rungs with the mHC wiring V4.1
    needs.
+
+   **What "fork it" actually costs, measured 2026-09-14 rather than assumed.**
+   `glm53_emit_full` itself is only 82 lines, which is what made this look like a
+   one-line item. It is a driver; the work is in what it threads together:
+
+   | callee | lines | for V4.1 |
+   |---|--:|---|
+   | `declare_glm_rows_batched` | **1 182** | a REWRITE, not a copy -- V4.1's tensors differ throughout. Guided by `dsv41_layer_tensors`, whose contract is already pinned against all 96 085 shard tensors, so the target is specified even though the code is not written |
+   | `emit_glm53_program` | 168 | a driver too; the per-layer emitters under it are the real bulk |
+   | `declare_glm53` | 66 | shared scratch |
+   | `glm_emit_block` (item 3's `--block` sibling) | 61 | the smaller entry point, and the right one to land first |
+
+   So item 5 is low thousands of lines, not a fork in the cheap sense. It is
+   still the right shape -- the structure and the mHC wiring carry over -- but it
+   should be planned as a multi-session build.
+
+   **And it is blocked on something that is NOT plumbing.** `MoeEnc` carries ONE
+   weight encoding for a whole run, threaded as `enc` through
+   `declare_glm_rows_batched` and `emit_glm53_program` alike, and
+   `mla_moe_enc_env` enforces that outright ("a run is ALL-mxfp4 or ALL-fp8 or
+   ALL-bf16; pick one"). V4.1 is **mixed** -- block-FP8 `[32,32]` dense
+   projections, fp4 routed experts, stated by its own `expert_dtype: "fp4"`. So
+   the enum has to change MEANING (one encoding per run -> one per weight class)
+   before the fork has anything coherent to thread. `MoeEnc` is referenced 239 times
+   across the crates (205 of them naming a variant), so this is a question about
+   what the type MEANS, and it wants deciding before the rewrite rather than
+   during it. See item 5b.
 
 Only after 5 does an end-to-end number exist to measure against 90 ms. The
 roofline (section 9) says the target is reachable at 28.9% of matrix peak and
