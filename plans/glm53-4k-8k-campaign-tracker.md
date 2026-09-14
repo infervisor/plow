@@ -593,6 +593,54 @@ them, and row-band is the precedent: it already makes ATTENTION run on each rank
 Either the layer-78 block runs per band the same way, or `xn` is all-gathered once before it.
 Neither is scoped yet.
 
+## SP+MTP looks liftable: the handoff hidden is already gathered (2026-09-14)
+
+The previous section recorded that MTP and the TTFT stack sit on mutually exclusive packets
+because `plans/mtp-spec-decode.md` refuses SP+MTP: prefill-MTP wants `xn` over all T rows and
+under SP each rank holds only its band. Reading the reference implementation changes the
+estimate, because the refusal turns on a question the plan left open -- whether MTP recycles the
+PRE- or POST-final-norm hidden -- and vLLM answers it.
+
+`deepseek_mtp.py` `DeepSeekMultiTokenPredictorLayer.forward` ends:
+
+    hidden_states = residual + hidden_states  # pre-final-norm (logits hidden)
+    if self.mtp_block.use_sequence_parallel_moe:
+        hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
+        hidden_states = hidden_states[: positions.shape[0]]
+    # Recycle the post-final-norm hidden into the next draft step.
+    # compute_logits applies shared_head (== final norm) to the pre-norm
+    # element, so logits and the recycle each get exactly one final-norm.
+    # Matches SGLang's deepseek_nextn.
+    return hidden_states, self.shared_head(hidden_states)
+
+Two things follow.
+
+**The recycle is POST-final-norm.** Element 0 is pre-norm and goes to `compute_logits`, which
+applies `shared_head` itself; element 1 is already normed and is what the next draft step
+consumes as `previous_hidden_states` (`hnorm` then runs on it inside MTP). The plan's family
+table calls `h_t` the "target pre-norm final hidden", and that is the imprecise line; the plan's
+own note at the recycle-point risk ("vLLM DeepSeek/GLM-DSA recycles post-norm") is the correct
+one.
+
+**Plow already produces exactly that tensor, gathered, under SP.** The prefill tail calls
+`glm_sp_norm_gather` (`mla.rs:5138`), which RMSNorms this rank's band into peer slot 3 and then
+`emit_xall_gather`s `(out, t * h, 3 * n.slot_b)` -- so `n.xn` is the full T x h POST-final-norm
+hidden on every rank, which is precisely what prefill-MTP needs to fill `kv.78`. **No new
+collective is required for the handoff.** Lifting the refusal looks like an emission-ordering
+change: emit the layer-78 block after the tail gather rather than against a band-only `xn`.
+
+Note also that vLLM runs MTP WITH sequence-parallel MoE -- the all-gather above is the MTP
+block's own SP handling -- so SP and MTP coexisting is not novel, it is what the reference does.
+
+This does not make MTP free for the 490 ms goal: prefill still gains a 79th layer's work to fill
+the MTP KV (about +1/78, roughly +7 ms on a 520 ms TTFT) unless that fill is deferred past the
+first published token or overlapped. But it removes the "needs a new T x h all-gather" cost from
+the estimate, which was the expensive branch.
+
+Still unverified here: that plow's `n.xn` and vLLM's recycled tensor agree numerically. That is
+the plan's P2 gate (layer-78 hidden and top-1 against `DeepSeekMTPModel` on the same prompts),
+and it should be run before anyone ports the emit.
+
 ## Rejected or parked
 
 | candidate | reason |
