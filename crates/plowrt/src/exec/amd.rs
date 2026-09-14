@@ -6064,9 +6064,17 @@ pub struct AmdEngine {
     kv_slot_stride: Vec<(usize, u64)>,
     /// Which sequence slot the KV pointers are currently rebased onto.
     kv_slot: usize,
-    /// `PLOW_AMD_RAGGED_SEAMS`: per prefill program, the band rows its `@band` views are
-    /// currently bound for (absent = the load-time `t / tp` binding).
-    band_rows_bound: std::collections::HashMap<usize, u32>,
+    /// `PLOW_AMD_RAGGED_SEAMS`: per `@band{t}` FAMILY, the band rows those views are currently
+    /// bound for (absent = the load-time `t / tp` binding).
+    ///
+    /// Keyed by `t`, NOT by program. The views live in the one global `tens_table`, and
+    /// [`ragged_band_views`] finds them by the name tag `@band{t}` — so every program of the same
+    /// bucket rows shares them, the row-split sibling included. Keying this by program let a
+    /// ragged ordinary chunk rebind the shared views and record it under its own key; the sibling
+    /// then found no entry of its own, assumed the load-time binding, and skipped the restore —
+    /// running all eight bands on the ragged chunk's base addresses. In bounds, no fault, and
+    /// wrong until the server died.
+    band_rows_bound: std::collections::HashMap<u32, u32>,
     /// `(tensor, per-slot bytes)` for the CARRIED recurrent state — KDA `state`
     /// and `conv_state`, per-slot strided, `blkres` excluded for the reason
     /// [`AmdEngine::begin_slot`] gives. This is what a prefix snapshot copies.
@@ -12994,17 +13002,20 @@ impl AmdEngine {
         )
     }
 
-    /// `PLOW_AMD_RAGGED_SEAMS`: bind program `prog`'s `@band` views for bands of `b` rows per
-    /// rank. One table upload when the binding changes; a full chunk after a ragged one
-    /// restores the load-time layout. Runs where `patch_prefill_rows` runs: after the previous
-    /// chunk has drained, and decode programs read no band view.
+    /// `PLOW_AMD_RAGGED_SEAMS`: bind the `@band{t}` views for bands of `b` rows per rank, where
+    /// `t` is `prog`'s bucket rows. One table upload when the binding changes; a full chunk after
+    /// a ragged one restores the load-time layout. Runs where `patch_prefill_rows` runs: after the
+    /// previous chunk has drained, and decode programs read no band view.
+    ///
+    /// The views are global, shared by every program at the same `t` — so the memo is keyed by
+    /// `t`. See `band_rows_bound`.
     fn rebind_band_views(&mut self, prog: usize, b: u32) -> Result<()> {
         let Some(tp) = self.tp else {
             return Ok(());
         };
         let t = self.progs[prog].t;
         let loaded = t / tp.n_gpu.max(1);
-        if self.band_rows_bound.get(&prog).copied().unwrap_or(loaded) == b
+        if self.band_rows_bound.get(&t).copied().unwrap_or(loaded) == b
             || t < 2
             || t % tp.n_gpu != 0
         {
@@ -13020,7 +13031,7 @@ impl AmdEngine {
             self.tens_table[i * 8..i * 8 + 8].copy_from_slice(&addr.to_le_bytes());
         }
         EngineDevice::upload(&*self.be, &self.d_tens, 0, &self.tens_table)?;
-        self.band_rows_bound.insert(prog, b);
+        self.band_rows_bound.insert(t, b);
         Ok(())
     }
 

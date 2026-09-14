@@ -4616,6 +4616,69 @@ fn ragged_seams_rebind_band_views_to_the_live_band() {
     }
 }
 
+/// The `@band{t}` views are ONE global family shared by every program at that `t` -- the
+/// row-split sibling included -- so the "already bound" memo must be keyed by `t`, not by
+/// program.
+///
+/// This is the row-band wrong-answer defect. A ragged ordinary chunk (clen 4096 in the 8192
+/// bucket) rebinds the shared views to 512 rows per rank. The row-split sibling then runs a
+/// FULL 8192 chunk, which is never ragged, so it asks for the load-time 1024. Keyed by program
+/// it found no entry of its own, took the `unwrap_or(loaded)` default, concluded it was already
+/// bound and skipped the restore -- leaving all eight bands reading the ragged chunk's base
+/// addresses. In bounds, no fault, and wrong for the life of the server. Keyed by `t` the
+/// mismatch is visible and the restore is issued.
+#[test]
+fn ragged_seams_band_view_memo_is_keyed_by_band_family_not_program() {
+    const T: u32 = 8192;
+    const TP: u32 = 8;
+    const LOADED: u32 = T / TP; // 1024
+    const RAGGED: u32 = 512; // ragged_band_rows(4096, 8192, 8)
+    let names: Vec<String> = ["act.xmid", "act.xmid@band8192"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let bases = [0x1000_0000u64, 0];
+    let row = 6144u64 * 2;
+    let lens = [T as u64 * row, LOADED as u64 * row];
+
+    assert_eq!(ragged_band_rows(4096, T, TP), RAGGED);
+
+    // Skipping the restore is not benign: on every rank but 0 the ragged views address a
+    // different row than the load-time ones, and they are the SAME tensor slot, so whichever
+    // binding was uploaded last is what every program at this `t` reads.
+    for rank in 1..TP {
+        let ragged = ragged_band_views(&names, &bases, &lens, T, TP, rank, RAGGED);
+        let loaded = ragged_band_views(&names, &bases, &lens, T, TP, rank, LOADED);
+        assert_ne!(ragged[0].1, loaded[0].1, "rank {rank}");
+        assert_eq!(ragged[0].0, loaded[0].0, "one tensor slot, so one overwrites the other");
+    }
+
+    // `rebind_band_views`'s decision, over the sequence that poisons: the ordinary program binds
+    // the ragged band, then the row-split sibling asks for the load-time band at the same `t`.
+    fn rebind(bound: &mut std::collections::HashMap<u32, u32>, t: u32, b: u32) -> bool {
+        let needed = bound.get(&t).copied().unwrap_or(t / TP) != b;
+        if needed {
+            bound.insert(t, b);
+        }
+        needed
+    }
+    let mut bound = std::collections::HashMap::new();
+    assert!(rebind(&mut bound, T, RAGGED), "the ragged ordinary chunk binds the shared views");
+    assert!(
+        rebind(&mut bound, T, LOADED),
+        "the sibling MUST restore them, though it wants the load-time band"
+    );
+    assert!(
+        !rebind(&mut bound, T, LOADED),
+        "and must not upload again while they already hold it"
+    );
+
+    // A different bucket is a different `@band{t}` family and is unaffected either way.
+    assert!(!rebind(&mut bound, 2048, 2048 / TP), "an exact 2048 rung never rebinds");
+    assert!(rebind(&mut bound, 2048, 64), "a ragged 2048 chunk binds its own family");
+    assert_eq!(bound.get(&T).copied(), Some(LOADED), "the 8192 family is untouched by it");
+}
+
 #[test]
 fn ragged_sparse_prefill_keeps_selection_and_flash_layouts_equal() {
     const T: u32 = 8192;

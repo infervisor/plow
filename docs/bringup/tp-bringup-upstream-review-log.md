@@ -1580,6 +1580,85 @@ clen=8192` with no prefix attached, which establishes the CHUNK is right; it say
 what `route.kv_len` was. If instead every field matches, the inputs agree and the corruption is in
 the tensors those addresses point at, which is a different set of things to instrument.
 
+## The row-band defect is a shared `@band` view memo keyed by the wrong thing (2026-09-14, jobs `rbfault20-dispatchnums`, `rbfault21-bandmemo-fix`)
+
+`rbfault20` printed, per rank per dispatch, every quantity `enqueue_window_rowsplit` derives. On a
+healthy server and on one poisoned by a single preceding 4096 they are **identical on all eight
+ranks** — `rows=1024 kv_len=8192 kv_base=0 row0=0 prior=0 route_kv_len=8192 local_index=true
+index_row0=0`, ranks 0-1 `identity@0` / `identity@1024`, ranks 2-7 `selection` — while the healthy
+arm passes 3/3 and the poisoned arm fails 0/3. The named hypothesis (a stale `w.kv_len` shifting
+`prior` and sending all ranks down Selection) is **falsified**: `prior` is 0 in both.
+
+So the addresses and the geometry are right and the corruption is in what they point at. It is:
+
+**`rebind_band_views`'s "already bound" memo was keyed by PROGRAM, but the views it guards are
+global and shared by band FAMILY.** `ragged_band_views` finds the views by the name tag
+`@band{t}`, and they live in the one `tens_table` — so every program at the same bucket rows
+shares them, the row-split sibling included. The sequence that poisons:
+
+| step | program | clen | ragged? | wants `b` | memo (keyed by prog) | effect |
+|---|---|---|---|---|---|---|
+| 1 | ordinary | 4096 | yes | 512 | no entry, default 1024 ≠ 512 | **rebinds the shared views to 512**, records under its own key |
+| 2 | row-band sibling | 8192 | never | 1024 | no entry of its own, default 1024 == 1024 | **skips the restore** — runs on step 1's addresses |
+
+`ragged_band_views`' own doc says `b = t / tp` reproduces the load-time binding, so the restore
+path existed; the per-program key is what stopped it ever being issued for the sibling.
+
+It accounts for every measurement this hunt made, which is why it is the answer and not another
+candidate:
+
+* `rbfault19` — all eight bands wrong together, across both `band_keys` arms. The views are the
+  per-rank band BASE ADDRESSES, so all eight move at once and neither arm is implicated.
+* `rbfault20` — every host-side dispatch field identical. The corruption is in the device tensor
+  table, which that trace does not print.
+* `rbfault16` — zeroing the entire sparse-MLA workspace and forgetting the staged CSR changed
+  nothing. Wrong buffer entirely.
+* `rbfault12` — row-band first poisons nothing. The ordinary program rebinds whenever its OWN `b`
+  changes, so it is always right; only the sibling skips.
+* `rbfault15` — 128 / 512 / 2048 harmless, 3072 the first length that poisons. An exact rung is
+  never ragged and never rebinds; 3072 is the first length admitted to the 8192 bucket RAGGED, and
+  a ragged chunk is exactly what writes the shared table. The "volume threshold" of `rbfault14`
+  was never a threshold.
+* "In bounds, deterministic, no fault, permanent" — the addresses are legal, just the wrong band,
+  and nothing ever restores them.
+
+The fix keys `band_rows_bound` by `t`. Unit test
+`ragged_seams_band_view_memo_is_keyed_by_band_family_not_program` asserts both halves: that the
+ragged and load-time views are the same tensor slot at different addresses (so skipping the
+restore is not benign), and that the poisoning sequence now issues the restore.
+
+This is a live defect for RAGGED SEAMS generally, not only for row-band: any two programs sharing
+a `@band{t}` family could desynchronise the same way. Row-band is simply the first pair where one
+sibling never goes ragged and so never re-derives the binding for itself.
+
+## The tile campaign passes, and the shipping demand is 40 shapes, not 56 (2026-09-14, job `gemmtune-glm53-r3`)
+
+`gemmtune-glm53-r3` completed rc=0 in 10.1 min with both fixes in place — the packet-scoped object
+build (no `PLOW_OCC4`) that passes the contract over all 53 objects, and `--replay-knobs` on step 4
+that keeps the emit off `mla.rs:5461`. Step 5's gating test
+`gfx942_measurements_reach_the_compiler` passes, and step 6 reports **40 distinct shapes,
+40 HIT / 0 MISS** at digest `gfx942-97116a9dc1be9326`. The emit's own line is the one that matters:
+
+    tunedb: all 2598 dense-GEMM tile(s) chosen BY MEASUREMENT
+
+against the `>>> tunedb: ALL ... chosen by the ANALYTICAL MODEL. This build is UNMEASURED` that
+every GLM emit carried before. The cell is no longer stale and the packets are no longer
+`portable`.
+
+**Correcting the previous entry.** The commit that added `--replay-knobs` recorded "under the true
+shipping knobs the demand is 56 distinct shapes ... the 40 recorded earlier came from a neighbour
+compile". That is backwards. Re-deriving the demand both ways at the same digest:
+
+| env | tiles | demand | coverage |
+|---|---|---|---|
+| serving (`PLOW_MLA_PF_V2/AITER`, `PLOW_UNISEG=0`, replay) | 2598 | 40 | 40 HIT / 0 MISS |
+| step 4's (`GLM_MOE_CORESIDENT=2 GLM_SHARED_CUS=48 GLM_SHARD_HEAD=1 PLOW_MLA_PREFILL=full`, replay) | 3918 | 56 | 0 HIT / 56 MISS |
+
+3918 tiles against 2598 is a different compile, not a different reading of one. The 56 is the
+neighbour; 40 is what ships. Coverage is unaffected either way, because the store is keyed by the
+OBJECT digest and the objects were built packet-scoped: step 4's env only chose which shapes to
+time, and the 40 the shipping emit asks for are all among them.
+
 ## The tile-campaign blocker resolves into three classes with three different owners (2026-09-14, job `gemmtune-glm53`, follow-up)
 
 The section above records 374 FAIL lines over 44 objects and stops at "it wants an owner". Building
