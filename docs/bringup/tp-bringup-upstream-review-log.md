@@ -1201,6 +1201,62 @@ script observes `PLOW_MLA_PREFILL=full` with no replay (48 shapes), a neighbour 
 ships (40) — and "48 ought to be a superset of 40" is the reasoning that let this cell go stale in
 the first place.
 
+## The row-band defect is triggered by a PRECEDING request, not by the prompt (2026-09-14, jobs `rbfault7`, `rbfault8`, `rbfault9`)
+
+Three hypotheses died to get here, and the reproducer at the end is three requests long.
+
+**The contradiction that opened it.** Same packet `9e76b70bf97ee4a6`, same binary, same 8192-token
+single-chunk prompts:
+
+| job | what it issued | 8192 result |
+|---|---|---|
+| `rbfault6` | lengths 4096, 8192, 16384, 32768, 65536 against ONE server | **0/3 fail** |
+| `rbfault7` | length 8192 only, fresh server, needle at 8 band centres | 24/24 pass |
+| `rbfault8` | length 8192 only, fresh server, needle at 11 exact rows | 33/33 pass |
+
+**Hypotheses falsified, recorded so they are not retried.**
+
+* *A whole-path error in row-band* (band q, the grouped fold, the band o_proj). Cannot survive
+  `rbfault7`: eight needles, one per band centre, all found.
+* *A band-seam straddle.* `rbfault8` placed needles at absolute row `B-8` for all seven band
+  boundaries so a ~17-token needle provably spans each one: **21/21 straddling cells passed**,
+  alongside 12/12 mid-band controls, identical to the shipping control. The mechanism this
+  suggested — a band's edge rows attending across the boundary before the neighbouring rank's k/v
+  is visible — is withdrawn with it.
+* *`c0 > 0` / the prior and band-key derivation.* Already dead from `rbfault6`: the first chunk at
+  `c0 = 0` failed there.
+
+**What the three runs actually differ in** is that `rbfault6` issued OTHER REQUESTS FIRST. Every
+prompt in this suite is the same filler repeated, so its 4096 and 8192 prompts share about two
+thousand leading tokens, while `rbfault7`/`rbfault8` prompts diverge at the needle and share only a
+few hundred. `rbfault9` tests that directly, three arms each on its own fresh server:
+
+| arm | sequence | 8192 depth 0.5 |
+|---|---|---|
+| `rb-cold` | row-band, ONLY the 8192 request | **3/3 pass** |
+| `rb-after4k` | row-band, 4096 first, then the same 8192 | **0/3 fail** |
+| `ship-after4k` | shipping, identical two-step | 3/3 pass, both steps |
+
+Zero fault lines in every arm, and the 4096 request passes everywhere. **The identical 8192 prompt
+passes cold and fails after a preceding request, on the row-band packet only.**
+
+**The reproducer is now minimal:** start a row-band server, send one 4096-token request, send an
+8192-token request sharing a prefix with it, read garbage
+(`"! The2. If1 answer:1.0.0.0.0.0.0.0."`). Three requests, concurrency 1, deterministic, no fault.
+
+**What this exonerates.** The band decomposition, the band seam, the 16-head grouped attention, the
+single group-major fold, the mux, admission, rung transitions and concurrency. It also explains why
+every host-side structural candidate read clean, and why the original APERTURE_VIOLATION only ever
+appeared at C20 — that is where slot reuse is heaviest, so it is the same trigger with a bad address
+landing on unmapped memory instead of mapped.
+
+**Next**, queued as `rbfault10-prefix`, two arms on the failing sequence: one with
+`PLOW_PREFILL_SEG_TIMING=1` to print `program/bucket/c0/clen` and say whether the row-split sibling
+is selected at all on the second request — if an attached prefix leaves `clen = 4096`, then
+`rowsplit_chunk_prog`'s `clen == bucket_rows` means row-band never runs on the failing request and
+the defect is in what the row-band PACKET does on the prefix path, not in the row-band chunk — and
+one with `PLOW_PREFIX_CACHE=0`, which is both the attribution and, if it passes, a mitigation.
+
 ## `build_gfx942.sh` cannot produce a contract-passing build at HEAD, which blocks the tile campaign (2026-09-14, job `gemmtune-glm53`)
 
 The GLM gfx942 GEMM tile campaign cannot run, for a reason that has nothing to do with tiles. Two
