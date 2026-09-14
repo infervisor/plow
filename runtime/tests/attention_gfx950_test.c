@@ -6,6 +6,10 @@
  *   prefill hd=512, GQA 8:1, full causal          <- the global layers
  *   decode  hd=256 / hd=512, split-KV + merge
  *
+ * PLOW_ATTN_BENCH=1 skips the CPU oracle and times the isolated prefill wrapper. Select the
+ * rung with PLOW_ATTN_HD, PLOW_ATTN_NQ, PLOW_ATTN_NSPLIT, PLOW_ATTN_WARMUP, and
+ * PLOW_ATTN_ITERS. The default is Gemma HD512 at 2048 rows and eight KV splits.
+ *
  * The reference is written from HF `modeling_gemma4.py` semantics, not from the
  * kernel: scale = 1.0 (there is NO 1/sqrt(head_dim)), causal is kv <= q, and the
  * sliding window is INCLUSIVE of the current token (0 <= q-kv <= window-1).
@@ -17,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 typedef unsigned short bf16;
 static float bf2f(bf16 b) { unsigned u = (unsigned)b << 16; float f; memcpy(&f, &u, 4); return f; }
@@ -107,6 +112,64 @@ static void check(const char* what, const bf16* got, const float* want, size_t n
 
 static plow_hsa* H;
 static void* dev(size_t b) { return plow_hsa_alloc(H, 0, b); }
+
+static uint64_t now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static unsigned env_u32(const char* name, unsigned fallback) {
+    const char* value = getenv(name);
+    return value ? (unsigned)strtoul(value, NULL, 10) : fallback;
+}
+
+static int bench_prefill(plow_hsa_kernel* k, unsigned ncu, unsigned hd, unsigned n_q,
+                         unsigned n_head, unsigned n_kv_head, unsigned window,
+                         unsigned nsplit, unsigned warmup, unsigned iters) {
+    if (!n_q || !nsplit || !iters) return 2;
+    const unsigned n_kv = n_q;
+    const size_t nq = (size_t)n_q * n_head * hd;
+    const size_t nkv = (size_t)n_kv * n_kv_head * hd;
+    bf16* hQ = plow_hsa_alloc_host(H, nq * 2);
+    bf16* hK = plow_hsa_alloc_host(H, nkv * 2);
+    bf16* hV = plow_hsa_alloc_host(H, nkv * 2);
+    if (!hQ || !hK || !hV) return 1;
+    for (size_t i = 0; i < nq; i++) hQ[i] = f2bf((float)(i % 31) * 0.001f);
+    for (size_t i = 0; i < nkv; i++) {
+        hK[i] = f2bf((float)(i % 29) * 0.001f);
+        hV[i] = f2bf((float)(i % 23) * 0.01f);
+    }
+    void *dQ = dev(nq * 2), *dK = dev(nkv * 2), *dV = dev(nkv * 2);
+    void* dOp = dev((size_t)n_q * n_head * nsplit * hd * sizeof(float));
+    void* dMl = dev((size_t)n_q * n_head * nsplit * 2 * sizeof(float));
+    if (!dQ || !dK || !dV || !dOp || !dMl) return 1;
+    plow_hsa_copy_h2d(H, 0, dQ, hQ, nq * 2);
+    plow_hsa_copy_h2d(H, 0, dK, hK, nkv * 2);
+    plow_hsa_copy_h2d(H, 0, dV, hV, nkv * 2);
+    struct __attribute__((packed)) {
+        void *op, *ml; const void *q, *k, *v;
+        unsigned n_q, n_kv, n_head, n_kv_head, q_pos0, window; float scale; unsigned nsplit;
+    } a = {dOp, dMl, dQ, dK, dV, n_q, n_kv, n_head, n_kv_head, 0, window, 1.0f, nsplit};
+
+    for (unsigned i = 0; i < warmup; i++) {
+        if (plow_hsa_launch(H, 0, k, ncu * PLOW_WG_THREADS, 1, 1, PLOW_WG_THREADS, 1, 1, 0,
+                            &a, sizeof(a)) != 0) return 1;
+        plow_hsa_wait(H, 0);
+    }
+    const uint64_t begin = now_ns();
+    for (unsigned i = 0; i < iters; i++) {
+        if (plow_hsa_launch(H, 0, k, ncu * PLOW_WG_THREADS, 1, 1, PLOW_WG_THREADS, 1, 1, 0,
+                            &a, sizeof(a)) != 0) return 1;
+        plow_hsa_wait(H, 0);
+    }
+    const double ms = (double)(now_ns() - begin) / 1.0e6 / iters;
+    printf("BENCH hd=%u nq=%u heads=%u kv_heads=%u window=%u nsplit=%u iters=%u ms=%.6f\n",
+           hd, n_q, n_head, n_kv_head, window, nsplit, iters, ms);
+    plow_hsa_free(H, dQ); plow_hsa_free(H, dK); plow_hsa_free(H, dV);
+    plow_hsa_free(H, dOp); plow_hsa_free(H, dMl);
+    return 0;
+}
 
 /* `sink_mag` != 0 runs the ATTENTION-SINK merge: per-head sinks are drawn in
  * [-sink_mag, +sink_mag] and `mk` must be a *_sinks merge kernel (four pointers, not three). */
@@ -302,6 +365,20 @@ int main(void) {
     }
     printf("prefill_256 LDS=%uB  prefill_512 LDS=%uB\n\n", p256.group_segment_size,
            p512.group_segment_size);
+    if (getenv("PLOW_ATTN_BENCH")) {
+        const unsigned hd = env_u32("PLOW_ATTN_HD", 512);
+        const unsigned n_q = env_u32("PLOW_ATTN_NQ", 2048);
+        const unsigned nsplit = env_u32("PLOW_ATTN_NSPLIT", 8);
+        const unsigned warmup = env_u32("PLOW_ATTN_WARMUP", 3);
+        const unsigned iters = env_u32("PLOW_ATTN_ITERS", 10);
+        int rc = 2;
+        if (hd == 512)
+            rc = bench_prefill(&p512, cus, hd, n_q, 8, 1, 0, nsplit, warmup, iters);
+        else if (hd == 256)
+            rc = bench_prefill(&p256, cus, hd, n_q, 8, 4, 1024, nsplit, warmup, iters);
+        plow_hsa_shutdown(H);
+        return rc;
+    }
     srand(13);
 
     /* D=128 (Llama/Qwen), full causal. Previously UNCOVERED — the golden suite only had

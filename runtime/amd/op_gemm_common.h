@@ -235,6 +235,11 @@
 #ifndef GM_PRIO
 #define GM_PRIO 1
 #endif
+/* FP8 has twice the MFMA K width and a different LDS/MFMA issue balance. Keep its priority
+ * schedule independently selectable so a CDNA3 FP8 win cannot perturb BF16 code generation. */
+#ifndef GM_PRIO8
+#define GM_PRIO8 GM_PRIO
+#endif
 /* Two-deep global prefetch (Tensile's PGR2), in a second bank of staging registers.
  *
  * MEASURED AND REJECTED on gfx942, and the reason is register pressure, not prefetch depth.
@@ -1516,7 +1521,7 @@ __device__ void d_gemm_fp8_t(bf16* __restrict__ C, const unsigned char* __restri
      * and 64x128 at M=128 172 -> 148. Off by default; the knob stays so it can be re-priced if
      * the fp8 accumulator ever shrinks. */
     constexpr bool PLR = (GM_PLR8) && !CLBAR; /* local-register fragment prefetch */
-    constexpr bool PRIO = (GM_PRIO) != 0;
+    constexpr bool PRIO = (GM_PRIO8) != 0;
 
     static_assert(APT % 8 == 0 && BPT % 8 == 0, "tile must stage in 8-byte (8-fp8) units");
     static_assert(BM % (WM * MFMA_M) == 0 && BN % (WN * MFMA_N) == 0, "tile must fit the wave grid");

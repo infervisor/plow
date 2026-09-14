@@ -56,6 +56,12 @@
     } while (0)
 
 /* ---- arch-DEFAULTED knobs. `#ifndef`-guarded, so -D wins; PLOW_GEOM_MARK'd in geom_contract.h. */
+/* The K64 FP8 MFMA does not need the priority boost used by the BF16 ping-pong. Across the
+ * Gemma-4 12B/31B M1024 ladder, priority-off wins all 2K/4K/8K production metrics and leaves
+ * BF16 instruction selection unchanged. */
+#ifndef GM_PRIO8
+#define GM_PRIO8 0
+#endif
 /* Overridable at compile time so plowc can bucket the tile per shape without an ISA
  * change, and so a Qwen prefill object can be built with -DGM_BM=192 (see the sweep above).
  * Keep in sync with GFX950_TILES in crates/plowc/src/bin/gemma4.rs. */

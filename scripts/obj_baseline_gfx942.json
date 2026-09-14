@@ -124,7 +124,18 @@
    "GV_MFMA4_YT_M2": 1,
    "PLOW_GEMV_MM": 1,
    "FA_LDS_DMA": 0,
-   "GM_BM": 192
+   "GM_BM": 192,
+   "GM_C5_BK": 64,
+   "GM_WD_BK": 64,
+   "GM_C8_BM": 128,
+   "GM_WD_BN": 256,
+   "FA_QCH_D512": 16,
+   "GM_C5_BM": 192,
+   "GM_C8_BK": 64,
+   "GM_C8_BN": 384,
+   "GM_C5_BN": 256,
+   "GM_WD_BM": 128,
+   "GM_PRIO8": 0
   },
   "p1": {
    "FA_DC": 128,
@@ -212,7 +223,18 @@
    "GV_UNROLL_GLU": 6,
    "FA_DEC_V_UNROLL": 8,
    "FA_DEC_WPEU": 2,
-   "GM_BK": 64
+   "GM_BK": 64,
+   "GM_C5_BK": 64,
+   "GM_WD_BK": 64,
+   "GM_C8_BM": 128,
+   "GM_WD_BN": 256,
+   "FA_QCH_D512": 16,
+   "GM_C5_BM": 192,
+   "GM_C8_BK": 64,
+   "GM_C8_BN": 384,
+   "GM_C5_BN": 256,
+   "GM_WD_BM": 128,
+   "GM_PRIO8": 0
   },
   "p2": {
    "FA_MLA_PF2_BKV": 32,
@@ -300,7 +322,18 @@
    "GV_MFMA4_YT_M2": 1,
    "PLOW_GEMV_MM": 1,
    "FA_LDS_DMA": 0,
-   "GM_BM": 64
+   "GM_BM": 64,
+   "GM_C5_BK": 64,
+   "GM_WD_BK": 64,
+   "GM_C8_BM": 128,
+   "GM_WD_BN": 256,
+   "FA_QCH_D512": 16,
+   "GM_C5_BM": 192,
+   "GM_C8_BK": 64,
+   "GM_C8_BN": 384,
+   "GM_C5_BN": 256,
+   "GM_WD_BM": 128,
+   "GM_PRIO8": 0
   },
   "p3": {
    "FA_MLA_PF2_BKV": 32,
@@ -388,7 +421,18 @@
    "GV_MFMA4_YT_M2": 1,
    "PLOW_GEMV_MM": 4,
    "FA_LDS_DMA": 0,
-   "GM_BM": 64
+   "GM_BM": 64,
+   "GM_C5_BK": 64,
+   "GM_WD_BK": 64,
+   "GM_C8_BM": 128,
+   "GM_WD_BN": 256,
+   "FA_QCH_D512": 16,
+   "GM_C5_BM": 192,
+   "GM_C8_BK": 64,
+   "GM_C8_BN": 384,
+   "GM_C5_BN": 256,
+   "GM_WD_BM": 128,
+   "GM_PRIO8": 0
   },
   "p4": {
    "FA_LAZY_RESCALE": 0,
@@ -476,7 +520,18 @@
    "GM_PGR2": 0,
    "GM_CLBAR": 0,
    "GV_MFMA4_UN_M4": 2,
-   "GV_NT": 1
+   "GV_NT": 1,
+   "GM_C5_BK": 64,
+   "GM_WD_BK": 64,
+   "GM_C8_BM": 128,
+   "GM_WD_BN": 256,
+   "FA_QCH_D512": 16,
+   "GM_C5_BM": 192,
+   "GM_C8_BK": 64,
+   "GM_C8_BN": 384,
+   "GM_C5_BN": 256,
+   "GM_WD_BM": 128,
+   "GM_PRIO8": 0
   },
   "p5": {
    "FA_MLA_PF2_BKV": 32,
@@ -564,7 +619,18 @@
    "GV_MFMA4_YT_M2": 1,
    "PLOW_GEMV_MM": 1,
    "FA_LDS_DMA": 0,
-   "GM_BM": 64
+   "GM_BM": 64,
+   "GM_C5_BK": 64,
+   "GM_WD_BK": 64,
+   "GM_C8_BM": 128,
+   "GM_WD_BN": 256,
+   "FA_QCH_D512": 16,
+   "GM_C5_BM": 192,
+   "GM_C8_BK": 64,
+   "GM_C8_BN": 384,
+   "GM_C5_BN": 256,
+   "GM_WD_BM": 128,
+   "GM_PRIO8": 0
   },
   "p6": {
    "FA_MERGE_UNROLL4": 1,
@@ -583,7 +649,7 @@
    "FA_MLA_PF2_FASTBF": 1,
    "GV_RS_MAXNCH": 8,
    "FA_DEC_KUNROLL": 8,
-   "FA_FASTMASK": 0,
+   "FA_FASTMASK": 1,
    "GV_MFMA4_UN_M4": 2,
    "FA_MLA_PF2_FRAME": 8,
    "GV_DMA": 0,
@@ -652,7 +718,18 @@
    "GV_BLOCKED": 1,
    "GV_UNROLL_GLU_MXFP4": 2,
    "MPF_BK": 64,
-   "PLOW_GEMV_MM": 4
+   "PLOW_GEMV_MM": 4,
+   "GM_C5_BK": 64,
+   "GM_WD_BK": 64,
+   "GM_C8_BM": 128,
+   "GM_WD_BN": 256,
+   "FA_QCH_D512": 16,
+   "GM_C5_BM": 192,
+   "GM_C8_BK": 64,
+   "GM_C8_BN": 384,
+   "GM_C5_BN": 256,
+   "GM_WD_BM": 128,
+   "GM_PRIO8": 0
   },
   "p7": {}
  },
@@ -2903,19 +2980,21 @@
     "GM_BM": "256",
     "GM_BN": "128",
     "FA_DC": "256",
-    "FA_DBUF": "1"
+    "FA_DBUF": "1",
+    "PLOW_WAVE_RED_DPP": "1",
+    "FA_FASTMASK": "1"
    },
-   "vgpr": 416,
-   "agpr": 160,
+   "vgpr": 412,
+   "agpr": 156,
    "lds": 64544,
    "occ": 1,
    "meta_spill": 0,
-   "isa_spill": 1199,
-   "unmetered_spill": 1156,
+   "isa_spill": 1211,
+   "unmetered_spill": 1168,
    "meta_lies": {
     "plow_interp_tokbatch_gfx942": 43
    },
-   "bpermute": 2662,
+   "bpermute": 842,
    "lds16": 288,
    "arms": {
     "d_flash_merge": [
@@ -2939,20 +3018,22 @@
     "GM_BN": "128",
     "FA_DC": "256",
     "FA_DBUF": "1",
+    "PLOW_WAVE_RED_DPP": "1",
+    "FA_FASTMASK": "1",
     "PLOW_GLOBAL_QUEUE": "1",
     "PLOW_GQ_BATCH": "1"
    },
-   "vgpr": 418,
-   "agpr": 162,
+   "vgpr": 414,
+   "agpr": 158,
    "lds": 64544,
    "occ": 1,
    "meta_spill": 0,
-   "isa_spill": 1196,
-   "unmetered_spill": 1156,
+   "isa_spill": 1208,
+   "unmetered_spill": 1168,
    "meta_lies": {
     "plow_interp_tokbatch_gfx942_gq": 40
    },
-   "bpermute": 2662,
+   "bpermute": 842,
    "lds16": 288,
    "arms": {
     "d_flash_merge": [

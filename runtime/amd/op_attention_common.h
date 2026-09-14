@@ -218,6 +218,15 @@
 #ifndef FA_DBUF
 #define FA_DBUF 0
 #endif
+/* The smaller HD512 Q-fragment live range wins every 2K/4K/8K metric for packet-stamped FP8
+ * bundles, but regresses BF16 at 2K. Keep generic/test and BF16 objects on the original chunk. */
+#ifndef FA_QCH_D512
+#if defined(PLOW_PACKET_HAS_GEMM_FP8) && PLOW_PACKET_HAS_GEMM_FP8
+#define FA_QCH_D512 8
+#else
+#define FA_QCH_D512 16
+#endif
+#endif
 /* Direct-to-LDS K/V staging (see [LDS-DMA-4B]). Default OFF: the register path is what every
  * shipped object is measured on. */
 #ifndef FA_LDS_DMA
@@ -444,8 +453,9 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
          *     the co-resident GEMM+flash interpreter to 260 regs -> 1 wave/SIMD -> INVALID_ISA under
          *     waves_per_eu(2,2). QCH=2 (still | 8) trims 8 VGPR to land at occ=2; the only cost is
          *     re-reading the L2-resident Q tile twice as often, negligible at D=128. D>=256 keeps 4. */
-        constexpr int QCH = (PLOW_WAVES <= 4) ? (FA_DBUF ? (NK < 16 ? NK : 16) : NK)
-                                              : (NK <= 8 ? 2 : 4);
+        constexpr int QCH = (PLOW_WAVES <= 4)
+                                ? (FA_DBUF ? (D == 512 ? FA_QCH_D512 : (NK < 16 ? NK : 16)) : NK)
+                                : (NK <= 8 ? 2 : 4);
         constexpr bool QHOIST = (QCH == NK);
         static_assert(NK % QCH == 0, "Q fragment chunk must divide the k-steps");
 
