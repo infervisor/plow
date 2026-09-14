@@ -468,6 +468,48 @@ Note the wildcard that sits under all of these: every emit here reports `ALL den
 chosen by the ANALYTICAL MODEL ... tier portable, which is what it reports when no campaign has ever
 run`. The whole ladder is being measured on unmeasured tiles.
 
+## Row-band served T4: PASS, and the 550 ms goal is met (2026-09-14)
+
+Four arms, three metrics, four cells, zero failed requests anywhere. No arm is worse than the control
+mean beyond its floor, so the P serving gate passes.
+
+| cell | metric | pooled effect | floor | x floor |
+|---|---|---:|---:|---|
+| **isl8192-c1** | TTFT | **-84.4** | 4.93 | **17.1** |
+| isl8192-c16 | TTFT | -166.3 | 5.04 | 33.0 |
+| isl8192-c16 | TPOT | -9.3 | 1.85 | 5.0 |
+| isl8192-c16 | E2E | -1375.9 | 289.6 | 4.8 |
+| isl4096-c1 | TTFT | +2.4 | 7.58 | 0.3 (not worse) |
+| isl65536-c1 | TTFT | -1208.9 | 47.7 | 25.3 |
+| isl65536-c1 | E2E | -1263.7 | 56.5 | 22.4 |
+
+**Goal cell 613.4 -> 528.4 ms.** The arms reproduce almost exactly: controls 613.9 / 612.9, treatments
+529.5 / 528.4, so the effect is about 84x the harness's own null.
+
+Three things this settles that earlier rounds could not.
+
+**The 4096 cell is not a regression.** Mid-run the treat arm read +4.0 ms against ctl and that looked
+like a real cost. `ctl2` then came in at 361.0, a control-to-control drift of +4.3, with treat sitting
+BETWEEN the two controls. Scored properly the effect is +2.43 at 0.3x floor. The byte-identical
+program argument holds after all, and the lesson is that a two-arm read of a small effect is worth
+nothing without the second control.
+
+**Long context does not bind, it benefits.** The `isl65536-c1` cell was added expecting row-band's
+fixed replicated weights to squeeze KV as context grew. Instead it is the largest win in the run:
+TTFT -1208.9 ms (-23%), E2E -1263.7, zero failures, and the server log prices the cost exactly --
+`replicated_gib=29.25`, `free_gib=55.58` per rank against the control's 83.44, with no refusal, no
+OOM and the same ten warnings as the control. The compute saving scales with attention work while the
+memory cost stays flat. Caveat: that cell is concurrency 1, so it shows long context works, not long
+context under load.
+
+**The T4 describes the committed port, not just the export.** Emitting in-tree reproduces
+`b73d4440c2814625` byte for byte, and the knob-off packet stays `8b15f4a2`.
+
+Ledger: 48 entries appended. Remaining for a default flip: retrieval with the arm on (the harness
+gate now points at these four PASS markers) and checkpoint P.
+
+Against the 490 ms target that replaced 550, row-band alone leaves 38.4 ms. `stack-t4` follows.
+
 ## Rejected or parked
 
 | candidate | reason |
