@@ -1201,6 +1201,57 @@ script observes `PLOW_MLA_PREFILL=full` with no replay (48 shapes), a neighbour 
 ships (40) — and "48 ought to be a superset of 40" is the reasoning that let this cell go stale in
 the first place.
 
+## `build_gfx942.sh` cannot produce a contract-passing build at HEAD, which blocks the tile campaign (2026-09-14, job `gemmtune-glm53`)
+
+The GLM gfx942 GEMM tile campaign cannot run, for a reason that has nothing to do with tiles. Two
+separate breakages, found in order.
+
+**First, the two scripts had drifted apart.** `rebench_tune_gemm_gfx942.sh` step 1/5 overrode
+`PLOW_HIPCC=/opt/rocm-7.2.4/bin/hipcc`, and its header documented, as an environment rule "learned
+the expensive way", that `build_gfx942.sh` runs OUTSIDE nix with the system hipcc. That is now
+backwards: `build_gfx942.sh` refuses unless `IN_NIX_SHELL` is set, `PLOW_TOOLCHAIN_LABEL` is
+`rocm-7.14.0-nix`, and hipcc, clang-offload-bundler and llvm-readelf all resolve into `/nix/store`.
+The override is exactly what trips that guard, so the campaign died at step 1/5 in 0.0 min with
+`FAIL: hipcc must resolve into /nix/store`. Fixed by building step 1 under `nix develop` with the
+flake's own tools, the way steps 2-5 already run plowc.
+
+**Second, and this is the blocker.** With the toolchain right, the objects build and the audit at
+the bottom of `build_gfx942.sh` then refuses them: **374 FAIL lines over 44 objects**. Most are one
+bookkeeping class — geometry profile `p4` records `GM_BK/BM/BN`, `GM_BLK_*`, `GM_MD_*`, `GM_SM_*`
+but none of `GM_C5_*`, `GM_C8_*`, `GM_WD_*`, nine knobs HEAD now compiles. But the rest are not
+bookkeeping:
+
+```
+d_moe_expert_glu_fp8_blk:  105 spill instructions, expected none   (4 objects)
+d_moe_expert_down_fp8_blk:  80 spill instructions, expected none   (4 objects)
+interp_prefill_k3:        2632 scratch ops > budget 1957           (+675, +35 %)
+interp_prefill_k3_gq:     2628 scratch ops > budget 1953
+interp_prefill_fp8kv_mla: 1440 scratch ops > budget 1434
+interp_prefill_mla_moe:   2077 scratch ops > budget 2076
+```
+
+**These were not blessed away, deliberately.** `--bless` is the documented mechanism and the diff
+is meant to be the review, so blessing was the obvious move and was very nearly taken — on a
+four-object sample that showed only the nine missing knobs and two budgets over by one. Enumerating
+all 44 objects is what changed the answer: a bless here would absorb a 35 % scratch blowup and 105
+spill instructions in a MoE decode kernel into a committed contract, which is the exact regression
+class the contract exists to catch. It needs an owner's decision and probably a fix, not a re-bless.
+
+**Why the shipping set does not show this.** Every shipping object audits as
+`built with different axes than the baseline records; resource and arm budgets not compared`, so
+`want` is `None` and the whole resource/spill/geometry comparison is SKIPPED for it — its `PASS` is
+the absence of a check, not the presence of one. The freshly built objects match the baseline's
+recorded axes (baseline `lds=64560` equals the fresh build's, against the shipping set's `64568`),
+so they are the first gfx942 objects in a while to actually be measured against the contract, and
+they fail it. The same row differs materially between the two builds: `interp_prefill_mla_moe` is
+2139 ISA ops shipping versus 2077 fresh.
+
+**Consequence for the campaign.** The store still holds 4961 gfx942 records across 14 older digests,
+none keyed to the current family, so every GEMM tile in every GLM packet is still chosen by the
+analytical cost model at tier `portable` against a demand of 40 shipping shapes at 0 HIT. Refreshing
+it requires building the objects the campaign then measures, and that build is refused at HEAD.
+Until the spill and scratch regressions are explained or fixed, the tile cell stays stale.
+
 ## MTP takes isl8192 C1 decode to 16.35 ms, and the T3 gate is red for two unrelated reasons (2026-09-14, job `spec-t3`)
 
 Three arms (ctrl / treat / ctrl2), 69.8 min, `spec_t3.py` scoring. Both controls pinned tight, so
