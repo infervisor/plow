@@ -153,3 +153,153 @@ change that a V4 measurement cannot show.
 
 Unblocking a real V4.1 number needs a container runtime plus
 `vllm/vllm-openai-rocm:nightly`, or a from-source ROCm build of vLLM >= 0.30.
+
+---
+
+## 5. Kernel extraction: what V4.1 needs against what plow has
+
+The V4 campaign left plow with most of the primitives. What follows maps each
+piece of the V4.1 attention/FFN block to an existing `DevOp` or marks it new.
+"Exists" means the op is in `crates/packet/src/dev.rs` with a slot contract in
+`slots.rs`; it does **not** mean an emitter reaches it (none does — see §3).
+
+### 5.1 Already covered
+
+| V4.1 piece | reference | plow op | note |
+|---|---|---|---|
+| mHC Sinkhorn split | `model.py:948` | `HyperConnPre` | computes pre/post/comb from `mixes` and applies pre. Contract change needed — §6.1 |
+| mHC expand + residual mix | `model.py:962` | `HyperConnPost` | `t=[new_residual, x_out, residual, post_mix, comb_mix]` — matches `hc_post` |
+| attention sink | `model.py:639` | `FlashMerge` `t3=sinks` | already an unscaled per-head logit joining the denominator. V4.1's is f32, plow's slot is bf16 |
+| indexer score over pooled K | `model.py:527` | `IndexScoreKpool` | `t=[Score, Qfp8, Qscale, Kfp8, Kscale, W, kv_len]`, `W` = `weights_proj` |
+| indexer top-k select | — | `IndexSelect` / `IndexSelectPf` | |
+| indexer q quant | `kernel.py:41` | `DsaQQuant` | per-row Hadamard + fp8 |
+| sparse gathered attention | `kernel.py:311` | `FlashGatherPrefill` / `FlashGatherDecode` | operand shape differs — §5.2 |
+| MXFP4 routed experts | `model.py:830` | `MoeGluMx` / `MoeDownMx` (+`Pf`) | w4a16 arms; V4.1 is w4a8, same gap V4 records |
+| clamped SwiGLU | `model.py:841` | `Glu` `f1=limit` | `swiglu_limit` 10.0 |
+| sqrtsoftplus / noaux_tc routing | `model.py:809` | `MoeRouterTopk` + `MoeAlignPf` | |
+| block-FP8 projections | — | `GemmFp8Blk` / `GemvFp8Blk` / `GemmBlkPf` | grid is a packet immediate, so `[32,32]` needs no new body |
+| learned-pool KV compressor | `model.py:429` | `d_v4_compress` (`runtime/amd/op_compress.h`) | per-channel softmax pool + learned RMSNorm + post-norm RoPE. Epilogue differs — §5.2 |
+
+### 5.2 New kernel work
+
+1. **FP4 KV cache at group 16 with E4M3 scales.** `_compress_kv` stores the
+   latent as real fp4 via `fp4_act_quant(latent, 16, scale_dtype=e4m3)`
+   (`model.py:758`). Every fp4 path in plow is OCP MXFP4 — group **32**, scale
+   **E8M0** (`interp.hip:2521,2530,2545`), and `op_compress.h`'s epilogue
+   fake-quantizes in blocks of 64 with a power-of-two scale and round-trips
+   back to bf16. V4.1 wants a different group, a different scale type, and a
+   real fp4 store that the attention kernel then reads. This is the single
+   biggest new kernel item, and it is what buys the ~890 B/token cache.
+2. **Ratio-1 compressor.** No softmax gate, no fp32 promotion — just
+   `norm(wkv(x))` (`model.py:459`). Not a new kernel body: a Gemm + RmsNorm,
+   or a `coff`-style mode flag on the existing compressor. But 20 of 40 layers
+   take this path, so it must not be emitted as a degenerate ratio-1 pool.
+3. **Two-level candidate selection.** `IndexUnionPf` unions top-k index sets,
+   but nothing selects `candidate_topk_blocks=2048` blocks of
+   `candidate_block_size=8` at layer 20 and restricts later indexers to them.
+4. **Engram lookup.** A gather over a 384M-row fp8 table with per-row scales
+   (`ParallelEngramEmbedding`, `model.py:296`), then an n-gram-keyed q/k
+   weighting into `dim * (hc_mult + 1)`. `RowGather` covers the gather shape
+   only; the hashing and the weighted combine are new.
+5. **Grouped output LoRA.** `wo_a` is block-diagonal over `o_groups=8`, done as
+   an einsum because a plain Linear is wrong (`model.py:786`). A grouped GEMM;
+   the MoE group ops are the closest existing shape but are expert-indexed.
+6. **`sparse_attn` operand shape.** `FlashGather*` is MLA-shaped
+   (`Qabs`/`Qrope`/`Ckv`/`Krope`). V4.1 concatenates window KV and compressed
+   KV into ONE cache and one index list (`model.py:781-783`), over a flat
+   512-wide latent with `num_key_value_heads=1`. Either a new arm or a
+   re-specification of the existing one.
+7. **Inverse RoPE on O.** `apply_rotary_emb(o[..., -rd:], freqs_cis, True)`
+   (`model.py:783`) — the V4 campaign reports a kernel for this; it needs a
+   packet slot on the V4.1 path.
+
+## 6. Pipelining changes
+
+These are the changes that are NOT kernel bodies — they are dataflow and
+scheduling, and each breaks an assumption the current emitter and runtime
+make.
+
+### 6.1 mHC is single-pass: the mix crosses a sublayer boundary
+
+`HyperConnPre` today computes the mixes and immediately applies `pre` to
+produce `layer_input` — correct for V4, where a sublayer's mix is its own. In
+V4.1 each sublayer's `hc_mixes` produces the `pre` used by the **next**
+sublayer, and `Block.forward` returns `ffn_pre` for the next BLOCK
+(`model.py:968-995`):
+
+```
+attn_pre, attn_post, attn_comb = hc_mixes(x, hc_attn_*)   # for the FFN
+x = hc_pre(x, pre_mix)                                     # from the PREVIOUS block
+... attention ...
+ffn_pre, ffn_post, ffn_comb = hc_mixes(x, hc_ffn_*)        # for the NEXT block
+x = hc_pre(x, attn_pre)                                    # from THIS block's attention
+return x, ffn_pre
+```
+
+The math is unchanged. What changes is the contract: `HyperConnPre` must take
+an incoming `pre_mix` tensor for `layer_input` and emit its own `pre_mix` as
+an extra output. That makes `pre_mix` a **loop-carried value across layers** —
+the graph gains an edge that the per-layer block structure does not currently
+carry, and layer 0 needs a seeded initial `pre_mix`.
+
+### 6.2 CSA2 publishes state across layers
+
+`SharedAttentionRuntime` (`model.py:1166`) is a mutable object carrying
+`compress_kv` and `topk_idxs`. A `kv_source` layer writes it; every later
+layer reads it until the next source overwrites it. Concretely, with
+`kv_source_layer_ids = [2, 8, 14, 20]`:
+
+* layers 0-1 have `compress_ratio = 0` and run **sliding window only** — no
+  compressed read at all;
+* layer 2 compresses and publishes; layers 3-7 read layer 2's cache;
+* layer 8 republishes, and so on; layers 21-39 all read layer 20's.
+
+Two consequences. First, the KV cache is **not per-layer**: there are 4
+compressed caches for 40 layers, plus a 128-entry window ring per layer. Any
+allocator that sizes KV as `layers x ctx x width` over-allocates by ~10x and,
+worse, gives each layer its own buffer so the sharing never happens. Second,
+`topk_idxs` is published by the 8 `index_source` layers and reused by the
+layers between them (`_compress_topk_idxs` returns `shared_attn.topk_idxs`
+unchanged when `not self.is_index_source`) — so 32 of 40 layers do **no**
+index work at all. An emitter that runs an indexer per layer is doing 5x the
+selection work and will not match the reference.
+
+### 6.3 The compressed cache grows at a variable rate
+
+During decode the compressor returns `None` until a group completes
+(`model.py:477`): a ratio-2 layer appends a compressed entry every 2 steps,
+ratio-1 every step. So the compressed cache length is
+`(start_pos + seqlen) // ratio`, and the partial group lives in
+`kv_state`/`score_state` across steps. The decode packet program is re-emitted
+per step in plow, so "is this step a pool boundary" is answerable — this is
+exactly the case `op_compress.h`'s decode mode already handles — but the
+**cache length is now layer-group-dependent**, and the attention packet's
+`kv_len` must come from the publishing layer, not from the global position.
+
+### 6.4 SWA Bounded Replay changes what prefix caching can reuse
+
+The window KV is a 128-entry **ring buffer** written modulo `win`
+(`model.py:718`), not an append-only cache. The model card's "SWA Bounded
+Replay reconstructs missing SWA KV states by replaying only the most recent
+n_win tokens" means a resumed sequence does not need its full window history
+persisted — it can be rebuilt from the last 128 tokens. That is a serving-shape
+win (it is where the 1/8 persistent footprint comes from) but it means the
+prefix cache stores compressed entries plus a replay tail, not per-layer window
+KV. `crates/plowrt/src/memory/prefix.rs` assumes the latter shape.
+
+### 6.5 The encoder/decoder split is a static partition, not a new control flow
+
+Layers 0-19 run at ratio 2, layers 20-39 at ratio 1, and layer 20 is both the
+last KV source and the candidate source. Nothing about this needs dynamic
+control flow — every mode is fixed per layer at compile time by
+`compress_ratios`, `kv_source_layer_ids` and `index_source_layer_ids`. So the
+CED structure costs the emitter a per-layer role table, not a scheduler
+change. The scheduler changes are §6.2-6.4.
+
+### 6.6 Order within the block is load-bearing
+
+`_compress_kv` runs the indexer **before** writing the cache, because the
+indexer needs the pre-RoPE latent and the write applies RoPE in place
+(`model.py:748-750`, and the reference comments the read-after-write at
+`model.py:762`). An emitter that reorders the compressor's cache write ahead
+of the indexer reads roped keys and silently produces wrong indices.
