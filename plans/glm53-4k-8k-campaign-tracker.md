@@ -347,6 +347,40 @@ Two structural limits on pushing fusion further, both real and both worth respec
   construction and a separate op does not. That is the same invariant `packproj` broke with its
   out-of-GEMM `ColSplit` copy.
 
+## Router overlap level 1: T3 PASSED and sat unreported (2026-09-14)
+
+Second recovered result of the day, found the same way as the dense-exact flip -- by reading the
+queue's own `done/` directory instead of trusting the tracker's "queued". `agband-t3-l1` ran this
+morning (`done/1789248838-z9i5-agband-t3-l1`, rc=0, 9.9 min) and passed every rung:
+
+| rung | ctrl | treat | ctrl2 | treat - mean(ctrl) | floor | |
+|---|---:|---:|---:|---:|---:|---|
+| P8192-0 | 582.3 | 571.1 | 582.2 | **-11.2** | 4.4 | PASS |
+| P8192-S | 650.4 | 637.5 | 650.8 | **-13.1** | 3.0 | PASS |
+| P4096-S | 381.5 | 369.1 | 381.3 | **-12.3** | 1.1 | PASS |
+
+`RUNG GATE PASS`, and the independent sweep sanity agrees (8192: ctl 585.9 / treat 574.4 / ctl2 585.7;
+73728: 5592.4 / 5482.1 / 5597.5). Spread is tight -- 0.17-0.29% at 8192.
+
+The T3 measures time only; the values gate for this lever was the T2 (act.xn2 / act.xn / act.tab /
+logits at the ctl-vs-ctl2 floor, argmax equal), and T1 had the knob-off packet byte-identical with
+checkpoint S accepted for both levels. So level 1 now has K, S, T2 values, and a three-rung T3.
+
+Two things worth noting. First, -11.2 ms at P8192-0 lands exactly on the T2 prediction (150 us/layer
+over 75 MoE layers), which is the rarer outcome -- most levers shrink between T2 and T3. Second,
+P4096-S -12.3 ms means this one transfers to the 4K rung essentially undiminished, unlike row-band,
+whose 4096 cell was provably non-attributable. It is currently the best-evidenced answer to "what
+from the 8K work helps 4K".
+
+Remaining for the flip: a served T4 plus retrieval, then checkpoint P. Landing patch is cut on
+86da9dc3 (`/workspace/agband-c08d1232/router-overlap-on-2655520b.patch`, verified to apply clean to
+main). No kernel, runtime, object or collective change, and the packet stamp is unchanged, so the
+T4 needs a serving set emitted from the level-1 packet against the existing objects.
+
+Paired with G4 MoE shared seed (P certificate already accepted, -8.6 ms at P8192-0, waiting only on a
+serving-set regeneration), these two are -19.8 ms at the goal cell's prior from work that is already
+done rather than proposed.
+
 ## Rejected or parked
 
 | candidate | reason |
