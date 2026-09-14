@@ -27,24 +27,32 @@ import torch.distributed as dist
 from transformers import AutoTokenizer
 
 
-def _unnix_ld_path() -> None:
-    """Drop the nix entries from LD_LIBRARY_PATH now that torch is imported.
+def _use_system_toolchain() -> None:
+    """Point tilelang's JIT at ONE consistent toolchain: the system ROCm.
 
-    The vllm-python wrapper puts nix glibc/gcc first so `import torch` resolves;
-    those libraries are mapped by the time this runs. But tilelang JIT-compiles
-    its HIP kernels at the first call of every kernel shape and SHELLS OUT to do
-    it, and the child `sh` then loads the same nix glibc against the system
-    loader:
+    tilelang compiles every kernel shape on first call, shelling out to plain
+    `hipcc` off PATH (tilelang/contrib/hipcc.py). Under `nix develop` -- which
+    is how the shared gpuq runner starts a job -- that resolves to the nix
+    hipcc, while the vllm-python wrapper puts nix glibc first on
+    LD_LIBRARY_PATH so `import torch` resolves. The two halves have to agree,
+    and mixing them fails either way round:
 
-        sh: symbol lookup error: .../glibc-2.42-67/lib/libc.so.6:
-            undefined symbol: __tunable_is_initialized, version GLIBC_PRIVATE
+      nix glibc + system sh   -> sh: symbol lookup error: libc.so.6:
+                                 undefined symbol: __tunable_is_initialized
+      system glibc + nix hipcc -> *** stack smashing detected ***
 
-    which fails every kernel compile and so every forward. Keep the ROCm entry
-    -- torch still dlopens from it -- and drop only /nix/store.
+    torch's libraries are already mapped by the time main() runs, so dropping
+    the nix entries costs nothing here. Keep the ROCm entry, which torch still
+    dlopens from, and put the system ROCm bin first so `hipcc` matches it.
     """
     parts = os.environ.get("LD_LIBRARY_PATH", "").split(":")
     kept = [p for p in parts if p and not p.startswith("/nix/store")]
     os.environ["LD_LIBRARY_PATH"] = ":".join(kept)
+
+    rocm = os.environ.get("ROCM_PATH", "/opt/rocm/core-7.14")
+    front = [f"{rocm}/bin", f"{rocm}/llvm/bin"]
+    path = [p for p in os.environ.get("PATH", "").split(":") if p and p not in front]
+    os.environ["PATH"] = ":".join(front + path)
 
 from model import ModelArgs, Transformer  # from the checkpoint's inference/
 from generate import load_model
@@ -59,9 +67,10 @@ def main() -> None:
     p.add_argument("--warmup-len", type=int, default=256)
     p.add_argument("--decode-steps", type=int, default=8)
     p.add_argument("--max-seq-len", type=int, default=16384)
+    p.add_argument("--target-ms", type=float, default=90.0)
     p.add_argument("--json-out", default="")
     args_cli = p.parse_args()
-    _unnix_ld_path()
+    _use_system_toolchain()
 
     world_size = int(os.getenv("WORLD_SIZE", "1"))
     rank = int(os.getenv("RANK", "0"))
@@ -150,8 +159,8 @@ def main() -> None:
             "decode_steps": args_cli.decode_steps,
             "tpot_ms_mean": round(tpot * 1e3, 2),
             "tpot_ms_min": round(min(steps) * 1e3, 2),
-            "target_ttft_s": 0.300,
-            "over_target_x": round(ttft / 0.300, 2),
+            "target_ttft_s": args_cli.target_ms / 1e3,
+            "over_target_x": round(ttft / (args_cli.target_ms / 1e3), 2),
         }
         say(json.dumps(result, indent=2))
         if args_cli.json_out:
