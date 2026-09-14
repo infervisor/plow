@@ -12,7 +12,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
 use plowrt::config::RuntimeConfig;
 use plowrt::device::{self, Backend};
@@ -470,6 +470,36 @@ enum Cmd {
         format: String,
     },
 
+    /// Checkpoint S: compare a base and a variant packet (and, for a runtime knob, the route a
+    /// workload takes) against the knob's declared scope. CPU only.
+    ///
+    /// For an emit knob pass the two emitted asset directories; for a runtime knob pass one
+    /// directory twice with `--workload`. `--values OFF,ON` equal (or omitted) checks identity.
+    KnobScope {
+        #[arg(long)]
+        base: PathBuf,
+        #[arg(long)]
+        variant: PathBuf,
+        /// Registry id, e.g. `emit.glm_pf_small_cus` or `rt.tail_sparse_ctx`.
+        #[arg(long)]
+        knob: String,
+        #[arg(long)]
+        values: Option<String>,
+        /// Route workload JSON: `{"prefill": [{"id", "from", "to"}], "decode": [rows]}`.
+        #[arg(long)]
+        workload: Option<PathBuf>,
+        /// Model type, when `build.json` names none.
+        #[arg(long)]
+        model: Option<String>,
+        /// Write the report here instead of stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Check against this scope (a JSON array of allowances) instead of the declared one, to
+        /// draft a scope.
+        #[arg(long)]
+        scope_json: Option<PathBuf>,
+    },
+
     // ── asset distribution ────────────────────────────────────────────────
     /// Fetch a model's assets into the local store. Contacts no server.
     Pull {
@@ -607,12 +637,15 @@ impl SelectArgs {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|err| err.exit());
     let filter =
         tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
     let filter_str = format!("{filter}");
+    // `op-audit --format json` writes a document to stdout; the startup banner
+    // would land inside it. Same reason `bench` logs to stderr.
     let structured_output = match &cli.cmd {
-        Cmd::Bench { .. } | Cmd::OpAudit { .. } => true,
+        Cmd::Bench { .. } | Cmd::OpAudit { .. } | Cmd::KnobScope { .. } => true,
         #[cfg(any(
             all(feature = "cpu", feature = "gguf"),
             all(feature = "metal", target_os = "macos")
@@ -712,6 +745,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 runtime = ?RuntimeConfig::global(),
                 environment = ?runtime_environment(),
                 "resolved serve configuration"
+            );
+            // The REPLAY line, separate from the Debug dump above on purpose: that dump is every
+            // knob at its resolved value plus every ambient PLOW_* var (PLOW_HIPCC, PLOW_NVCC,
+            // toolchain paths), which records the machine rather than the decision. This one is
+            // only what this serve chose away from the tree's defaults, in the spelling that sets
+            // it again — greppable out of a log a campaign already keeps.
+            tracing::info!(
+                replay = ?plowrt::config::serve_replay(&matches),
+                "serve replay — the runtime half of build.json's emit_config.replay"
             );
             serve(
                 assets,
@@ -814,6 +856,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             program,
             format,
         } => op_audit_cmd(blob, table, program, format),
+        Cmd::KnobScope {
+            base,
+            variant,
+            knob,
+            values,
+            workload,
+            model,
+            out,
+            scope_json,
+        } => knob_scope_cmd(base, variant, knob, values, workload, model, out, scope_json),
         Cmd::Devices {
             tp,
             hidden,
@@ -1589,12 +1641,13 @@ fn amd_bench(
             // dumped nothing and the caller saw an empty range report rather than an error.
             if let Some(spec) = plowrt::config::RuntimeConfig::get().amd.dump_act.as_ref() {
                 for one in spec.split(',').filter(|s| !s.is_empty()) {
-                    if let Some((name, path)) = one.split_once(':') {
+                    if let Some((name, rest)) = one.split_once(':') {
+                        let (path, limit) = dump_act_path(rest);
                         let n = e
                             .tensor_bytes(name)
                             .ok_or_else(|| format!("PLOW_DUMP_ACT: no tensor {name}"))?
                             as usize;
-                        let mut buf = vec![0u8; n];
+                        let mut buf = vec![0u8; limit.map_or(n, |l| l.min(n))];
                         e.read_tensor(name, &mut buf)?;
                         std::fs::write(format!("{path}.{tag}.bin"), &buf)?;
                     }
@@ -1746,6 +1799,15 @@ fn amd_bench(
 /// samples fluent-looking ids from its own shard, so agreement is the only thing
 /// that distinguishes a working all-reduce from a plausible wrong one. It is
 /// therefore asserted on every step rather than at the end.
+/// `PLOW_DUMP_ACT` entry tail `path[:bytes]`: a trailing `:bytes` dumps only the tensor's leading
+/// bytes -- e.g. the KV rows a prompt wrote, where the rest of a demand-mapped ring may be unmapped.
+fn dump_act_path(rest: &str) -> (&str, Option<usize>) {
+    match rest.rsplit_once(':') {
+        Some((path, n)) if !path.is_empty() && n.parse::<usize>().is_ok() => (path, n.parse().ok()),
+        _ => (rest, None),
+    }
+}
+
 /// Write the packet trace, if `PLOW_TRACE_RAW` asked for one.
 ///
 /// A FUNCTION rather than three copies of the same `if let`, because every copy so far has been on
@@ -1844,17 +1906,23 @@ fn amd_bench_tp(
         // dumped once per tag, later tags overwrite-with-suffix like the logits do.
         if let Some(spec) = plowrt::config::RuntimeConfig::get().amd.dump_act.as_ref() {
             for one in spec.split(',').filter(|s| !s.is_empty()) {
-                if let Some((name, path)) = one.split_once(':') {
+                if let Some((name, rest)) = one.split_once(':') {
+                    let (path, limit) = dump_act_path(rest);
                     let n = g
                         .rank(0)
                         .tensor_bytes(name)
                         .ok_or_else(|| format!("PLOW_DUMP_ACT: no tensor {name}"))?
                         as usize;
-                    let mut buf = vec![0u8; n];
+                    let mut buf = vec![0u8; limit.map_or(n, |l| l.min(n))];
                     g.rank(0).read_tensor(name, &mut buf)?;
                     std::fs::write(format!("{path}.{tag}.bin"), &buf)?;
                 }
             }
+        }
+        if let Some(dir) = plowrt::config::RuntimeConfig::get().amd.dump_kv.as_ref() {
+            let mut len = [0u8; 4];
+            g.rank(0).read_tensor("in.kvlen", &mut len)?;
+            g.rank(0).dump_slot_kv(dir, tag, 0, u32::from_le_bytes(len))?;
         }
         let Some(dir) = &dump_logits else {
             return Ok(());
@@ -2447,6 +2515,88 @@ fn devices(
 /// packed token batch, `1` when any opcode is refused. That makes the audit
 /// usable as a gate in the enablement of a (family, backend) pair, which is what
 /// the plan asks of it — not just as something to read.
+#[cfg(feature = "hsa")]
+fn knob_routes(
+    knob: &str,
+    (off, on): (&str, &str),
+    base: &plowrt::knob_scope::Packet,
+    variant: &plowrt::knob_scope::Packet,
+    workload: &plowrt::knob_scope::Workload,
+) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+    use plowrt::knob_scope as ks;
+    let (mut k_off, mut k_on) = (ks::RouteKnobs::default(), ks::RouteKnobs::default());
+    if knob.starts_with("rt.") {
+        k_off.set(knob, off)?;
+        k_on.set(knob, on)?;
+    }
+    Ok(ks::route_steps(
+        &ks::route(base, workload, k_off)?,
+        &ks::route(variant, workload, k_on)?,
+    ))
+}
+
+#[cfg(not(feature = "hsa"))]
+fn knob_routes(
+    _: &str,
+    _: (&str, &str),
+    _: &plowrt::knob_scope::Packet,
+    _: &plowrt::knob_scope::Packet,
+    _: &plowrt::knob_scope::Workload,
+) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+    Err("the route trace plans the AMD serve: build plowrt with --features hsa".into())
+}
+
+fn knob_scope_cmd(
+    base: PathBuf,
+    variant: PathBuf,
+    knob: String,
+    values: Option<String>,
+    workload: Option<PathBuf>,
+    model: Option<String>,
+    out: Option<PathBuf>,
+    scope_json: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use plowrt::knob_scope as ks;
+    let (off, on) = match values.as_deref() {
+        Some(v) => v.split_once(',').ok_or("--values wants OFF,ON")?,
+        None => ("", ""),
+    };
+    let delta: Vec<String> = if off != on { vec![knob.clone()] } else { Vec::new() };
+    let a = ks::extract(&base)?;
+    let b = if variant == base { None } else { Some(ks::extract(&variant)?) };
+    let b = b.as_ref().unwrap_or(&a);
+    let model = model
+        .or_else(|| a.model.clone())
+        .ok_or("the packet names no model (build.json knobs.target); pass --model")?;
+    let routes = match workload {
+        None => Vec::new(),
+        Some(w) => {
+            let w: ks::Workload = serde_json::from_slice(&std::fs::read(&w)?)?;
+            knob_routes(&knob, (off, on), &a, b, &w)?
+        }
+    };
+    let mut payload =
+        ks::payload(&model, &delta, ks::declared_scope(&knob), ks::pairs(&a, b)?, routes);
+    if let Some(p) = scope_json {
+        payload["scope"] = serde_json::from_slice(&std::fs::read(p)?)?;
+    }
+    let cert = lean_verify::checkpoints::scope::check_scope(&payload)?;
+    let report = serde_json::json!({
+        "knob": knob, "values": [off, on], "base": base, "variant": variant,
+        "ok": cert.ok, "notes": cert.notes, "reason": cert.reason,
+    });
+    let text = serde_json::to_string_pretty(&report)?;
+    match out {
+        Some(o) => std::fs::write(o, &text)?,
+        None => println!("{text}"),
+    }
+    if cert.ok {
+        Ok(())
+    } else {
+        Err(format!("checkpoint S rejected {knob}: {}", cert.reason.unwrap_or_default()).into())
+    }
+}
+
 fn op_audit_cmd(
     blob_path: Option<PathBuf>,
     table: bool,
@@ -2973,10 +3123,11 @@ async fn bringup_runtime(
             // Per-model footprint and TP degree, both from the blob header.
             let granularity = cuda.granularity()?;
             let mut specs: Vec<ModelSpec> = Vec::with_capacity(models.len());
-            for (slug, dir, _) in &models {
-                let plan = plowrt::serve::manager::BlobPlan::from_dir_with_granularity(
+            for (slug, dir, checkpoint) in &models {
+                let plan = plowrt::serve::manager::BlobPlan::from_dir_with_device(
                     dir,
-                    Some(granularity),
+                    Some((granularity, cuda.compute_capability())),
+                    Some(checkpoint),
                 )?;
                 specs.push(ModelSpec {
                     slug: slug.clone(),
@@ -3254,6 +3405,9 @@ async fn bringup_runtime(
                     }
                 },
                 spin_us: cpu.spin_us,
+                // The served model takes the live topology; only a head pool
+                // narrows it to a reservation.
+                topology: None,
             };
             tracing::info!(
                 %slug, blob = %blob.display(), checkpoint = %ckpt.display(), ?opts,
@@ -3422,6 +3576,7 @@ async fn bench(
     if let Some(mux) = state.mux(model) {
         mux.drain().await;
     }
+    plowrt::obs::pfx::report();
     let diagnostics =
         engine_diagnostics.then(|| plowrt::serve::bench::finish_engine_diagnostics(&state, model));
     #[cfg(feature = "hsa")]

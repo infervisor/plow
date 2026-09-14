@@ -149,6 +149,68 @@ fn sub_granularity_slots_share_aligned_backing() {
     ops.empty();
 }
 
+#[test]
+fn releasing_shared_granules_waits_for_the_last_slot_and_remaps_cleanly() {
+    let granularity = 2 << 20;
+    let ops = Arc::new(Mock::with_granularity(granularity));
+    let tensors = [LiveRingTensor {
+        tensor: 3,
+        slot_bytes: 1 << 20,
+    }];
+    let mut rings = VmmRings::new(ops.clone(), &tensors, 3).unwrap();
+    for slot in 0..3 {
+        rings.ensure_slot(slot).unwrap();
+    }
+    assert_eq!(rings.stats().resident_bytes, 2 * granularity);
+
+    rings.release_slot(0);
+    assert_eq!(rings.stats().resident_bytes, 2 * granularity);
+    assert_eq!(ops.0.lock().unwrap().mapped.len(), 2);
+    rings.release_slot(1);
+    assert_eq!(rings.stats().resident_bytes, granularity);
+    assert_eq!(ops.0.lock().unwrap().mapped.len(), 1);
+    rings.release_slot(2);
+    assert_eq!(rings.stats().resident_bytes, 0);
+    assert_eq!(rings.stats().mapped_slots, 0);
+    assert!(ops.0.lock().unwrap().mapped.is_empty());
+
+    rings.ensure_slot(1).unwrap();
+    assert_eq!(rings.stats().resident_bytes, granularity);
+    assert_eq!(rings.stats().mapped_slots, 1);
+    rings.release_slot(1);
+    assert_eq!(rings.stats().resident_bytes, 0);
+    drop(rings);
+    ops.empty();
+}
+
+#[test]
+fn failed_slot_mapping_rolls_back_shared_granule_references() {
+    let granularity = 2 << 20;
+    let ops = Arc::new(Mock::with_granularity(granularity));
+    let tensors = [
+        LiveRingTensor {
+            tensor: 3,
+            slot_bytes: 1 << 20,
+        },
+        LiveRingTensor {
+            tensor: 8,
+            slot_bytes: granularity,
+        },
+    ];
+    let mut rings = VmmRings::new(ops.clone(), &tensors, 2).unwrap();
+    rings.ensure_slot(0).unwrap();
+    let stats = rings.stats();
+    ops.fail(Call::Create, 1);
+    assert!(rings.ensure_slot(1).is_err());
+    assert_eq!(rings.stats(), stats);
+
+    rings.release_slot(0);
+    assert_eq!(rings.stats().resident_bytes, 0);
+    assert!(ops.0.lock().unwrap().mapped.is_empty());
+    drop(rings);
+    ops.empty();
+}
+
 fn tensors() -> [LiveRingTensor; 2] {
     [
         LiveRingTensor {
@@ -160,6 +222,34 @@ fn tensors() -> [LiveRingTensor; 2] {
             slot_bytes: 256,
         },
     ]
+}
+
+#[test]
+fn release_reclaims_exclusive_slots_and_repairs_prefix_tracking() {
+    let ops = Arc::new(Mock::default());
+    let mut rings = VmmRings::new(ops.clone(), &tensors(), 4).unwrap();
+    rings.ensure_prefix(4).unwrap();
+    assert_eq!(rings.stats().resident_bytes, 4 * 384);
+
+    rings.release_slot(1);
+    assert_eq!(rings.stats().resident_bytes, 3 * 384);
+    assert_eq!(rings.stats().mapped_slots, 3);
+    assert_eq!(rings.stats().mapped_prefix, 1);
+    rings.release_slot(1);
+    assert_eq!(rings.stats().resident_bytes, 3 * 384);
+
+    rings.ensure_prefix(4).unwrap();
+    assert_eq!(rings.stats().resident_bytes, 4 * 384);
+    assert_eq!(rings.stats().mapped_slots, 4);
+    assert_eq!(rings.stats().mapped_prefix, 4);
+    for slot in 0..4 {
+        rings.release_slot(slot);
+    }
+    assert_eq!(rings.stats().resident_bytes, 0);
+    assert_eq!(rings.stats().mapped_slots, 0);
+    assert_eq!(rings.stats().mapped_prefix, 0);
+    drop(rings);
+    ops.empty();
 }
 
 #[test]
@@ -318,6 +408,69 @@ fn actual_packet_ring_prefix_reservations() {
         "{path}: {} ring tensors, {per_slot} bytes per physical slot, retained prefix1/4/16 passed",
         layout.ring_tensors.len()
     );
+    drop(rings);
+    ops.empty();
+}
+
+#[test]
+#[ignore = "CPU actual FP8 KV packet; set TEST_LIVE_RING_PACKET"]
+fn actual_fp8_packet_scale_slots_share_pages_without_changing_stride() {
+    use std::collections::BTreeSet;
+    let path = std::env::var("TEST_LIVE_RING_PACKET").unwrap();
+    let blob = crate::asset::devblob::DevBlob::parse(&std::fs::read(&path).unwrap()).unwrap();
+    let manifest = blob.with_packet_view(plow_asset::live_kv::emit).unwrap();
+    assert!(manifest.caches.iter().any(|c| c.scales.is_some()));
+    let layout = LiveKvLayout::from_manifest(&blob, &manifest).unwrap();
+    assert_eq!(layout.geometry.batch, 16);
+    assert_eq!(
+        blob.decode_progs().iter().map(|p| p.t).collect::<Vec<_>>(),
+        [1, 2, 4, 8, 16]
+    );
+    assert_eq!(
+        blob.prefill_progs().iter().map(|p| p.t).collect::<Vec<_>>(),
+        [128, 512, 1024]
+    );
+    let granularity = 2 << 20;
+    assert!(layout
+        .ring_tensors
+        .iter()
+        .any(|t| t.slot_bytes < granularity));
+    let ops = Arc::new(Mock::with_granularity(granularity));
+    let mut rings = VmmRings::new(ops.clone(), &layout.ring_tensors, 16).unwrap();
+    let mut slots = BTreeSet::new();
+    let expected = |slots: &BTreeSet<usize>| -> u64 {
+        layout
+            .ring_tensors
+            .iter()
+            .map(|t| {
+                assert_eq!(t.slot_bytes * 16, blob.tensors[t.tensor].bytes);
+                let pages: BTreeSet<_> = slots
+                    .iter()
+                    .flat_map(|&slot| {
+                        let start = slot as u64 * t.slot_bytes;
+                        start / granularity..(start + t.slot_bytes).div_ceil(granularity)
+                    })
+                    .collect();
+                pages.len() as u64 * granularity
+            })
+            .sum()
+    };
+    for slot in [15, 0, 7, 3] {
+        rings.ensure_slot(slot).unwrap();
+        slots.insert(slot);
+        assert_eq!(rings.stats().resident_bytes, expected(&slots));
+        assert_eq!(rings.stats().mapped_slots, slots.len());
+        let calls = ops.calls();
+        rings.ensure_slot(slot).unwrap();
+        assert_eq!(ops.calls(), calls);
+    }
+    for width in [1, 2, 4, 8, 16] {
+        rings.ensure_prefix(width).unwrap();
+        slots.extend(0..width);
+        assert_eq!(rings.stats().resident_bytes, expected(&slots));
+    }
+    eprintln!("{path}: {} whole-slot KV/scale tensors, {} resident bytes; all rungs and out-of-order slots passed",
+        layout.ring_tensors.len(), rings.stats().resident_bytes);
     drop(rings);
     ops.empty();
 }

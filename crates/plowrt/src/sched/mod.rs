@@ -2,10 +2,17 @@
 
 pub mod admission;
 pub mod batching;
+/// Queue-driven CPU prefill: whether a waiting request's prompt head runs on
+/// the host, how long it may be, and when contention disarms the pool.
+// Allowed dead until the head pool drives it.
+#[allow(dead_code)]
+pub mod het;
 pub mod mdq;
 pub mod multistep;
 pub mod prefill;
 pub mod rungs;
+pub mod slo;
+pub mod step;
 
 use crate::asset::{Bucket, ModelBundle, Phase};
 use crate::exec::counters::CounterPool;

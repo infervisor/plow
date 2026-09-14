@@ -135,9 +135,11 @@ fn vector_add_end_to_end() {
         Some(&stream),
     )
     .unwrap();
+    be.memcpy_dtod_async(d_b.base, d_c.base, (N * 4) as u64, &stream)
+        .unwrap();
     // SAFETY: as above — the readback retires before the synchronize returns.
     unsafe {
-        be.memcpy_dtoh_async(pin.as_mut_slice(), d_c.base, &stream)
+        be.memcpy_dtoh_async(pin.as_mut_slice(), d_b.base, &stream)
             .unwrap();
     }
     be.event_record(&ev_end, &stream).unwrap();

@@ -182,7 +182,7 @@ pub fn validate(blob: &Packet<'_>) -> Result<Option<Validated>> {
     let mut used = BTreeSet::new();
     for g in &blob.programs[lo..] {
         check(
-            !g.packed_prefill_only && g.rows > 0,
+            !g.role.is_packed_sibling() && g.rows > 0,
             "packed or empty decode program",
         )?;
         check(
@@ -689,7 +689,9 @@ mod tests {
         let m = fixture(8, false);
         crate::program::with_model(&m, |p| {
             let mut programs = p.programs.to_vec();
-            programs[0].packed_prefill_only = true;
+            programs[0].role = packet::devbuild::ProgramRole::PackedSibling {
+                of_rows: programs[0].rows,
+            };
             let packet = Packet {
                 programs: &programs,
                 ..*p

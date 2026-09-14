@@ -53,8 +53,8 @@ unfolds via `Plow.Rewrite.expand` to exactly its unfused composition, and each
 rule's soundness is a definitional-equality (`rfl`) theorem `Plow.Rewrite.rule_*`
 in [`Plow/Rewrite.lean`](../../lean-plow/Plow/Rewrite.lean). `checkA` submits the
 list of fired rule names and rejects any name not in the closed enumeration
-`Plow.Rewrite.soundRules`. Today that table holds 19 entries, one per `rule_*`
-theorem, mirroring the 19 `; rule:` annotations in `rules.egg`.
+`Plow.Rewrite.soundRules`. Today that table holds 29 entries, one per `rule_*`
+theorem, mirroring the 29 `; rule:` annotations in `rules.egg`.
 
 ### Checkpoint B — Tile partition validity
 `checkB` runs `checkTileCandidate` over each candidate: positive dims, each tile

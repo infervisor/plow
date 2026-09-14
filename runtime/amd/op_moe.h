@@ -148,6 +148,11 @@ __device__ __forceinline__ unsigned moe_bound_topk(unsigned char* table, unsigne
 #define PLOW_MOE_ENC_BF16   0u
 #define PLOW_MOE_ENC_FP8BLK 1u
 #define PLOW_MOE_ENC_MXFP4  2u
+/* compressed-tensors `pack-quantized` int4: symmetric, group_size 32, an unsigned nibble with an
+ * offset of 8, and one BF16 scale per group. Kimi-K2.7-Code's routed experts. Shares the mxfp4
+ * arm's 16-byte-per-32-values load and lane order (the containers are byte-identical); differs in
+ * the element decode and in the scale's TYPE. See [INT4-G32-DECODE] in amd_common.h. */
+#define PLOW_MOE_ENC_INT4G32 3u
 
 /* GLU activation, matching op_elementwise.h / the Rust reference. act: 0 = gelu_tanh, 1 = silu. */
 #define PLOW_MOE_ACT_GELU_TANH 0u
@@ -1069,6 +1074,58 @@ __device__ __forceinline__ void moe_down_lg_rows(
 }
 
 
+/* INT4 group-32 wave-reduced dot of ONE output channel — the int4 twin of wave_dot_mxfp4, for
+ * the DECODE experts.                                                      [INT4-G32-DECODE]
+ *
+ * The weight walk is the mxfp4 one VERBATIM: 16 bytes per lane is 32 int4 is exactly one group,
+ * so `k>>5` indexes both the fragment and its scale, and no scale varies inside a fragment. What
+ * differs is the scale's TYPE — one BF16 per group here against an E8M0 byte — which is why the
+ * row arrives as `const bf16*` rather than through `e8m0_to_f32`.
+ *
+ * `xsum` IS COMPUTED HERE rather than hoisted, and that is a known cost, not an oversight: the
+ * bias term of the offset-8 decode needs sum(x) over the fragment (see int4_dot32), and the same
+ * activation fragment is re-dotted against every routed expert row, so a caller that walks rows
+ * in the inner loop can compute it once and pass it down. Correctness first; the hoist is a
+ * measured optimisation and belongs with the walk that owns the row loop. */
+__device__ __forceinline__ float wave_dot_int4_g32(const bf16* x, const unsigned char* Wrow,
+                                                   const bf16* srow, unsigned K, unsigned lane) {
+    const unsigned step = PLOW_WAVE * 32; /* 64 lanes x 32 int4 = 2048 K per pass */
+    const unsigned nchunk = (K + step - 1) / step;
+    const PLOW_GLOB fp4v32* const W = (const PLOW_GLOB fp4v32*)(const PLOW_GLOB void*)Wrow;
+    float acc = 0.0f;
+    for (unsigned c = 0; c < nchunk; c++) {
+        const unsigned k = c * step + lane * 32;
+        if (k + 32u <= K) {
+            const bf16v8 x0 = ld_glob8(x + k), x1 = ld_glob8(x + k + 8);
+            const bf16v8 x2 = ld_glob8(x + k + 16), x3 = ld_glob8(x + k + 24);
+            float xsum = 0.0f;
+            const bf16v8 xs[4] = {x0, x1, x2, x3};
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                bf16v8_pairs xp{xs[i]};
+#pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    /* bf16 -> f32 is a 16-bit shift, not a numeric conversion. */
+                    const unsigned xu = __builtin_bit_cast(unsigned, xp.p[j]);
+                    float a, b;
+                    unsigned t = xu << 16;
+                    __builtin_memcpy(&a, &t, 4);
+                    t = xu & 0xffff0000u;
+                    __builtin_memcpy(&b, &t, 4);
+                    xsum += a + b;
+                }
+            }
+            const unsigned su = __builtin_bit_cast(unsigned short, srow[k >> 5]);
+            float sf;
+            const unsigned st = su << 16;
+            __builtin_memcpy(&sf, &st, 4);
+            const int4_frag32 wf = int4_prep32(W[k >> 5], sf);
+            acc = int4_dot32(wf, x0, x1, x2, x3, xsum, acc);
+        }
+    }
+    return wave_sum(acc);
+}
+
 /* ONE quantized-expert dot, encoding selected at runtime. PLOW_MOE_ENC_* as on ops 85/86.
  * `srow_f` is the block-fp8 scale row (f32), `srow_b` the MXFP4 E8M0 row; the caller passes
  * whichever its encoding uses and the other is ignored.
@@ -1098,6 +1155,11 @@ __device__ __forceinline__ float wave_dot_enc(unsigned enc, const bf16* x,
                                               const unsigned char* srow_b, unsigned K,
                                               unsigned lane) {
     if (enc == PLOW_MOE_ENC_MXFP4) return wave_dot_mxfp4(x, Wrow, srow_b, K, lane);
+    /* int4 g32 rides `srow_b` because it is the BYTE row operand and this encoding's scale is a
+     * BF16 per group — 2 bytes at stride K/32 — not an E8M0 byte. No signature change, and the
+     * fp8 f32 row stays untouched. */
+    if (enc == PLOW_MOE_ENC_INT4G32)
+        return wave_dot_int4_g32(x, Wrow, (const bf16*)(const void*)srow_b, K, lane);
     if (enc != PLOW_MOE_ENC_FP8BLK) return __builtin_nanf(""); /* POISON — see the note above */
     return wave_dot_fp8_blk(x, Wrow, srow_f, K, lane);
 }
@@ -2056,6 +2118,11 @@ __device__ __forceinline__ double mpf_det_q(float v) {
  * read (rows `rowbase + 0 .. rowbase + MPF_BM-1`, which `d_moe_align_pf` initialises over the
  * whole padded range), the same dwords reach the same elements, and the arithmetic is
  * untouched. DOWN arm only -- GLU passes `row_partidx = row_gate = nullptr`. */
+/* CEILING INSTRUMENT ONLY -- see the note at its use site in d_moe_group_pf_t. Default off. */
+#ifndef PLOW_MOE_PF_ABL
+#define PLOW_MOE_PF_ABL 0
+#endif
+
 #ifndef PLOW_MOE_PF_EPI
 #define PLOW_MOE_PF_EPI 0
 #endif
@@ -2134,7 +2201,24 @@ __device__ void d_moe_router_topk_pf(unsigned char* table, const bf16* logit, co
                                       * to `tid2eid` in a PLOW_MOE_PF_DET build. That is a
                                       * compile error here only because the types differ. */
                                      const int32_t* tid2eid = nullptr,
-                                     const int32_t* token_ids = nullptr
+                                     const int32_t* token_ids = nullptr,
+                                     /* SHARED-EXPERT FOLD (i5, PLOW_GLM_MOE_SHARED_FOLD). 0 on
+                                      * every blob emitted before it and on every decode blob.
+                                      *
+                                      * 1 makes this tail write `k+1` slots per token: the same
+                                      * top-k over the same `n_exp` logits, then a CONSTANT slot
+                                      * `{expert n_exp, gate 1.0f}`. GLM's shared expert is
+                                      * shape-identical to a routed expert and every token passes
+                                      * through it with weight 1, so as a routing SLOT it is
+                                      * exactly that — which is why the align/sort chain below and
+                                      * the fused MoE call need to know nothing about it beyond
+                                      * being told `n_exp+1` and `k+1`.
+                                      *
+                                      * The SELECTION is untouched, deliberately: the callee still
+                                      * sees `n_exp` and `k`, so a folded and an unfolded packet
+                                      * route every token to the same routed experts with the same
+                                      * gates, and differ only by the appended slot. */
+                                     unsigned shared_tail = 0
                                      ) {
 #if PLOW_MOE_PF_ATOMIC
     /* PLOW_MOE_PF_ATOMIC: zero the [T,H] f32 accumulator op 86 will atomically add into. This
@@ -2171,9 +2255,14 @@ __device__ void d_moe_router_topk_pf(unsigned char* table, const bf16* logit, co
         const bf16* lrow = (flags & 8u)
                                ? (const bf16*)((const float*)logit + (size_t)tok * n_exp)
                                : logit + (size_t)tok * n_exp;
-        d_moe_router_topk(table + (size_t)tok * k * 8, lrow, bias, n_exp, k, flags, route_scale,
+        unsigned char* trow = table + (size_t)tok * (k + shared_tail) * 8;
+        d_moe_router_topk(trow, lrow, bias, n_exp, k, flags, route_scale,
                           0, 1, lds, n_group, topk_group, tid2eid,
                           token_ids ? token_ids[tok] : 0);
+        if (shared_tail && threadIdx.x == 0) {
+            *(unsigned*)(trow + (size_t)k * 8) = n_exp;
+            *(float*)(trow + (size_t)k * 8 + 4) = 1.0f;
+        }
         __syncthreads(); /* the callee reuses `lds` for scores/keys on the next token */
     }
 }
@@ -2637,8 +2726,23 @@ __device__ void d_moe_group_pf_t(void* __restrict__ Cout, const bf16* __restrict
     const unsigned total_tiles = (unsigned)tilep[n_exp];
     const unsigned tn = (N + NB - 1u) / NB;
     const unsigned n_tiles = total_tiles * tn;
-    const unsigned NT = (K + MPF_BK - 1u) / MPF_BK; /* k-tiles */
-    const unsigned KB = (K + 127u) >> 7;            /* scale blocks along K */
+    /* CEILING INSTRUMENT ONLY (-DPLOW_MOE_PF_ABL=1): cap the k-loop at ONE tile. WRONG OUTPUT
+     * by construction -- it computes a 1/NT slice of each dot product -- and it must never
+     * touch a serve asset. It exists to answer the one question the segment timer cannot:
+     * the `interpreter` segment is 8,254 ms of a 70k prefill and it holds the MoE and dense
+     * GEMMs, the router, the gather/scatter, the norms AND the TP collectives, so a GEMM rate
+     * derived from it is a claim about all of them at once. Ablated minus full is the k-loop's
+     * own share: gemm1 runs NT=96 tiles and `down` NT=4 (K = moe_intermediate/TP = 256), so
+     * the delta is ~99% of gemm1's and ~75% of down's inner work with every fixed cost --
+     * staging, routing, epilogue, collectives -- still paid. That is what decides whether a
+     * faster grouped GEMM can reach this target or whether the term is somewhere else. */
+    const unsigned NT_full = (K + MPF_BK - 1u) / MPF_BK; /* k-tiles */
+#if PLOW_MOE_PF_ABL
+    const unsigned NT = NT_full > 1u ? 1u : NT_full;
+#else
+    const unsigned NT = NT_full;
+#endif
+    const unsigned KB = (K + 127u) >> 7; /* scale blocks along K */
 
 #define MPF_ASM(b) (lds + (b) * MPF_TILE)
 #define MPF_BSM(b) (lds + (b) * MPF_TILE + MPF_BM * MPF_STRIDE)
@@ -4727,6 +4831,10 @@ __device__ void d_moe_group_down_pf(float* part, const bf16* fu, const unsigned 
  * op_gemm.h's capacity marker: any object built from this source HAS the arms. */
 extern "C" __device__ unsigned plow_moe_pf_part16_arm = 1;
 extern "C" __device__ unsigned plow_moe_pf_a8_arm = 1;
+/* Op 83's `i[5]` shared-expert tail. Same unconditional-marker reasoning, and the same silence
+ * without it: the `k+1`th slot would never be written, so the shared expert would drop out of a
+ * packet whose combine has already given up its `shared` operand. */
+extern "C" __device__ unsigned plow_moe_shared_fold_arm = 1;
 #if PLOW_MOE_PF_A4W4 && !defined(PLOW_MOE_A4W4_STAGE2_BENCH)
 extern "C" __device__ unsigned plow_moe_pf_a4w4_arm = 1;
 #endif
@@ -4743,6 +4851,15 @@ extern "C" __device__ unsigned plow_moe_pf_atomic_arm = 1;
  * the `part` scatter branch with Cout pointing at a [T,H] f64 accumulator -- a k/2-fold heap
  * overrun -- and op 87 would read f64 bytes as f32. */
 extern "C" __device__ unsigned plow_moe_pf_det_arm = 1;
+#endif
+
+/* -DPLOW_COMBINE_VEC=1: the 8-wide arm of d_moe_combine_pf below; PLOW_COMBINE_VEC_U rows of
+ * 16 B loads in flight per thread. Default off: the shipped object is byte-identical. */
+#ifndef PLOW_COMBINE_VEC
+#define PLOW_COMBINE_VEC 0
+#endif
+#ifndef PLOW_COMBINE_VEC_U
+#define PLOW_COMBINE_VEC_U 2
 #endif
 
 /* --- op 87: T-TOKEN COMBINE (PLOW_DOP_MOE_COMBINE_PF) --------------------------------------
@@ -4765,6 +4882,76 @@ __device__ void d_moe_combine_pf(bf16* out, const bf16* residual, const bf16* sh
     const size_t gid = (size_t)slice * PLOW_THREADS + threadIdx.x;
     const size_t stride = (size_t)nblk * PLOW_THREADS;
     const bf16* part_h = (const bf16*)part; /* part16: DOWN scattered bf16, same slot layout */
+#if PLOW_COMBINE_VEC
+    /* 8-WIDE ARM (-DPLOW_COMBINE_VEC=1, k == 1 only, so `part` is one contiguous [T*H] stream —
+     * every native-MoE and PLOW_MOE_PF_DET blob). The scalar loop below issues ONE 2 B or 4 B load
+     * per operand per iteration and waits on it: at T=8192/H=6144 that is 323 dependent HBM
+     * round trips per thread, 0.44 ms for 300-400 MB (0.9 TB/s). This arm loads 16 B per operand,
+     * U iterations ahead. Per element the f32 sum is the SAME operands in the SAME order
+     * (residual, shared, part) rounded once, so it is bit-identical to the scalar loop. */
+    if (k == 1u && (H & 7u) == 0u
+#if PLOW_MOE_PF_DET
+        && !det
+#endif
+    ) {
+        constexpr unsigned U = PLOW_COMBINE_VEC_U;
+        const size_t vt = total >> 3;
+        const auto* rg = as_glob(residual);
+        const auto* sg = as_glob(shared);
+        const auto* ph = as_glob(part_h);
+        const float4* pf = (const float4*)part;
+        auto* og = as_glob(out);
+        auto body = [&](size_t v, const bf16v8& vr, const bf16v8& vs, const bf16v8& vp,
+                        const float4& f0, const float4& f1) {
+            const float pfv[8] = {f0.x, f0.y, f0.z, f0.w, f1.x, f1.y, f1.z, f1.w};
+            bf16v8 o;
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                float acc = residual ? bf2f(vr[j]) : 0.0f;
+                if (shared) acc += bf2f(vs[j]);
+                acc += part16 ? bf2f(vp[j]) : pfv[j];
+                o[j] = f2bf(acc);
+            }
+            st_glob8(og + v * 8, o);
+        };
+        size_t v = gid;
+        for (; v + (U - 1) * stride < vt; v += U * stride) {
+            bf16v8 vr[U], vs[U], vp[U];
+            float4 f0[U], f1[U];
+#pragma unroll
+            for (unsigned u = 0; u < U; u++) {
+                const size_t e = (v + u * stride) * 8;
+                vr[u] = residual ? ld_glob8(rg + e) : bf16v8_zero();
+                vs[u] = shared ? ld_glob8(sg + e) : bf16v8_zero();
+                if (part16) {
+                    vp[u] = ld_glob8(ph + e);
+                    f0[u] = f1[u] = make_float4(0.f, 0.f, 0.f, 0.f);
+                } else {
+                    vp[u] = bf16v8_zero();
+                    f0[u] = pf[(v + u * stride) * 2];
+                    f1[u] = pf[(v + u * stride) * 2 + 1];
+                }
+            }
+#pragma unroll
+            for (unsigned u = 0; u < U; u++) body(v + u * stride, vr[u], vs[u], vp[u], f0[u], f1[u]);
+        }
+        for (; v < vt; v += stride) {
+            const size_t e = v * 8;
+            const bf16v8 vr = residual ? ld_glob8(rg + e) : bf16v8_zero();
+            const bf16v8 vs = shared ? ld_glob8(sg + e) : bf16v8_zero();
+            bf16v8 vp = bf16v8_zero();
+            float4 f0 = make_float4(0.f, 0.f, 0.f, 0.f), f1 = f0;
+            if (part16) {
+                vp = ld_glob8(ph + e);
+            } else {
+                f0 = pf[v * 2];
+                f1 = pf[v * 2 + 1];
+            }
+            body(v, vr, vs, vp, f0, f1);
+        }
+        return;
+    }
+#endif
     for (size_t i = gid; i < total; i += stride) {
         const unsigned tok = (unsigned)(i / H), h = (unsigned)(i - (size_t)tok * H);
         float acc = residual ? bf2f(residual[i]) : 0.0f; /* optional — see d_moe_combine */
@@ -5676,10 +5863,9 @@ __device__ void d_moe_combine_norm_gemma_pf(bf16* out, const float* part, const 
  * WHY W8A8 DECODES TO bf16 INSTEAD OF USING THE fp8 MATRIX CORE, and it is not a shortcut.
  * Every e4m3 value is exact in bf16 (3 mantissa bits into 7) and every e4m3 x e4m3 product is
  * exact in f32, so decode-then-bf16-MFMA computes the SAME products as an fp8 MFMA and differs
- * only in accumulation grouping. On CDNA3 it also costs nothing: the part's fp8 matrix core is
- * K=16 and runs at the SAME MACs/cycle as its bf16 one (amd_arch.h), so the 2x an fp8 core buys
- * on CDNA4 does not exist here — fp8 buys memory footprint, which this path keeps in full. And
- * it side-steps the e4m3fnuz/OCP divergence in the matrix core entirely.
+ * only in accumulation grouping. This preserves the compact weight stream but forgoes CDNA3's
+ * 2x theoretical fp8 compute throughput. A native fp8 arm must account for the FNUZ/OCP
+ * difference (amd_arch.h) and qualify its full staging and epilogue costs against this path.
  *
  * `Ain` is bf16* when W8A8 is false and unsigned char* when it is true. `ascale` is the A-side
  * per-row f32 scale (per TOKEN on the GLU arm, indexed by row_token; per GATHERED ROW on the

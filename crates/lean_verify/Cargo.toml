@@ -12,3 +12,5 @@ thiserror.workspace = true
 
 [dev-dependencies]
 schedule = { workspace = true }
+plow-asset = { workspace = true }
+proptest = "1"

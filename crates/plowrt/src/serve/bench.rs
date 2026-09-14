@@ -217,6 +217,9 @@ pub struct Report {
     pub tpot_ms: Option<Distribution>,
     pub itl_ms: Option<Distribution>,
     pub e2e_ms: Distribution,
+    /// Attainment of `PLOW_TTFT_SLO_MS` / `PLOW_TBT_SLO_MS`; absent when neither is set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slo: Option<SloReport>,
     pub output_checksum: String,
     pub artifacts: ArtifactReport,
     pub runtime: serde_json::Value,
@@ -329,6 +332,45 @@ pub struct SchedulerReport {
     pub mean_batch_size: f64,
     pub rejected: u64,
     pub admit_shed: u64,
+}
+
+/// Per-request SLO attainment. TBT is judged on each request's mean inter-token time (TPOT);
+/// the per-token distribution is `itl_ms`.
+#[derive(Clone, Debug, Serialize)]
+pub struct SloReport {
+    pub tbt_target_ms: Option<f64>,
+    pub ttft_target_ms: Option<f64>,
+    pub ttft_met: usize,
+    pub tbt_met: usize,
+    /// Requests meeting every set target.
+    pub met: usize,
+    /// `met / completed`.
+    pub goodput_share: f64,
+    /// `met` per second of the measured run.
+    pub goodput_rps: f64,
+}
+
+fn slo_report(targets: crate::sched::slo::Targets, results: &[RequestResult], secs: f64) -> Option<SloReport> {
+    if !targets.active() {
+        return None;
+    }
+    let (mut ttft_met, mut tbt_met, mut met) = (0, 0, 0);
+    for r in results {
+        let tpot = r.tpot.map_or(0.0, ms);
+        let (ttft_ok, tbt_ok) = crate::sched::slo::attained(targets, ms(r.ttft), tpot);
+        ttft_met += usize::from(ttft_ok);
+        tbt_met += usize::from(tbt_ok);
+        met += usize::from(ttft_ok && tbt_ok);
+    }
+    Some(SloReport {
+        tbt_target_ms: targets.tbt_ms,
+        ttft_target_ms: targets.ttft_ms,
+        ttft_met,
+        tbt_met,
+        met,
+        goodput_share: met as f64 / results.len().max(1) as f64,
+        goodput_rps: if secs > 0.0 { met as f64 / secs } else { 0.0 },
+    })
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -448,17 +490,6 @@ pub async fn run_prefill_sweep(
     for input in &cfg.inputs {
         validate_input(input, vocab)?;
     }
-    let runtime = crate::config::RuntimeConfig::get();
-    let prefix_cache = match state.execset.backend().vendor() {
-        Some(hwspec::Vendor::Nvidia) => runtime.nv.vmm_prefix,
-        Some(hwspec::Vendor::Amd) => runtime.nv.prefix_cache,
-        _ => false,
-    };
-    if prefix_cache {
-        return Err(RuntimeError::Msg(
-            "bench prefill sweep requires cold prompts; disable --prefix-cache/--vmm-prefix".into(),
-        ));
-    }
     let mux = state
         .mux(&cfg.model)
         .ok_or_else(|| RuntimeError::Msg(format!("no model mux for '{}'", cfg.model)))?;
@@ -468,6 +499,12 @@ pub async fn run_prefill_sweep(
             .gpu_engine(&cfg.model)
             .ok_or_else(|| RuntimeError::Msg(format!("no GPU engine for '{}'", cfg.model)))?;
         let engine = engine.lock();
+        if engine.prefix_cache_enabled() {
+            return Err(RuntimeError::Msg(
+                "bench prefill sweep requires cold prompts; disable --prefix-cache/--vmm-prefix"
+                    .into(),
+            ));
+        }
         Some(EngineReport {
             batch_capacity: engine.batch(),
             decode_rungs: engine.decode_rungs(),
@@ -482,7 +519,6 @@ pub async fn run_prefill_sweep(
     let mut request_offset = 0usize;
     for input in &cfg.inputs {
         if cfg.warmup_requests > 0 {
-            crate::obs::Metrics::add(&state.metrics.requests, cfg.warmup_requests as u64);
             let warmup = drive(
                 &mux,
                 input,
@@ -498,7 +534,6 @@ pub async fn run_prefill_sweep(
             request_offset += cfg.warmup_requests;
         }
 
-        crate::obs::Metrics::add(&state.metrics.requests, cfg.repetitions as u64);
         let measured_offset = request_offset;
         let started = Instant::now();
         let results = drive(&mux, input, vocab, 1, cfg.repetitions, 1, measured_offset).await?;
@@ -603,7 +638,6 @@ pub async fn run(state: &AppState, cfg: Config) -> Result<Report> {
     let engine = None;
 
     if cfg.warmup_requests > 0 {
-        crate::obs::Metrics::add(&state.metrics.requests, cfg.warmup_requests as u64);
         let warmup = drive(
             &mux,
             &cfg.input,
@@ -617,13 +651,12 @@ pub async fn run(state: &AppState, cfg: Config) -> Result<Report> {
         validate(&warmup, cfg.output_tokens)?;
     }
 
-    let metrics = &state.metrics;
+    let metrics = state.model_metrics(&cfg.model);
     let batch_count_before = metrics.batch_count.load(Ordering::Relaxed);
     let batch_sum_before = metrics.batch_size_sum.load(Ordering::Relaxed);
     let rejected_before = metrics.rejected.load(Ordering::Relaxed);
     let admit_shed_before = metrics.admit_shed.load(Ordering::Relaxed);
     let rung_switches_before = metrics.decode_rung_switches.load(Ordering::Relaxed);
-    crate::obs::Metrics::add(&state.metrics.requests, cfg.requests as u64);
     let started = Instant::now();
     let results = drive(
         &mux,
@@ -704,6 +737,7 @@ pub async fn run(state: &AppState, cfg: Config) -> Result<Report> {
         tpot_ms: distribution(tpot),
         itl_ms: distribution(itl),
         e2e_ms: distribution(e2e).expect("one result"),
+        slo: slo_report(crate::config::RuntimeConfig::get().slo_targets(), &results, secs),
         output_checksum: checksum(&results),
         artifacts,
         runtime: cfg.runtime,

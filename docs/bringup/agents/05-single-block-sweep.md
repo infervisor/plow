@@ -70,6 +70,7 @@ Use the narrowest existing harness that preserves the behavior being tuned:
 | packet planning | `scripts/block_sim.sh` |
 | block numerics | the family C oracle or `plowrt amd-block`; `block_run check` is smoke only |
 | broad NVIDIA object/packet grid | `scripts/tune_decode_sweep.sh --block ... --block-run ...` |
+| exact Gemma-4 CUDA/AMD rung kernels | `scripts/gemma4_h100_kernel_tuner.py`; despite the legacy name it accepts `sm*` and `gfx*` resource identities and uses one control-anchored, counter-gated, occurrence-weighted `rung_rollup` |
 | Gemma block timing | `examples/block_run bench` |
 | MLA-family timing | `scripts/k3_block_sweep.sh` or `scripts/glm52_block_sweep_gfx942.sh` |
 | reference block and per-op floor | `scripts/block_layer_bench.py`, `block_op_bench.py`, then `block_compare.py` |
@@ -80,6 +81,56 @@ the exact semantic boundary is missing. Do not create a model- or
 experiment-named runner merely to vary flags. Run the broad context, batch,
 warp, register, and packet-rung grid here; send only 2–3 finalists to
 `step_bench`, and only a gated winner to serving.
+
+## Native-kernel inner-loop contract
+
+Apply this contract to every CUDA or HIP body exercised by the selected
+single-block harness. CUDA's warp is 32 lanes. CDNA's wavefront is 64 lanes;
+its LDS still has 32 four-byte banks, so a wave64 access is serviced in two
+32-lane phases. Do not copy a CUDA launch or swizzle constant to AMD without
+re-deriving it for that geometry.
+
+* Inner-loop branches must be warp- or wave-uniform. Predication at ragged
+  boundaries is allowed, but profile it separately from the steady-state tile.
+* Adjacent lanes must issue adjacent, naturally aligned global accesses. A
+  deliberate gather must name its reuse/cache argument and be measured against
+  a coalesced staging alternative.
+* Shared-memory/LDS layouts must be padded or swizzled to avoid bank conflicts.
+  Confirm with `ncu` on CUDA and `rocprof` plus the compiled LDS instruction
+  census on AMD.
+* Reject new local/scratch traffic. CUDA uses ptxas/SASS spill loads and stores;
+  AMD uses ISA `scratch_load_*`/`scratch_store_*`, because AMDGPU metadata can
+  report zero spill while the instructions are present. Re-check occupancy
+  after any `__launch_bounds__`, VGPR/AGPR, register, or arena change.
+* Minimize `__syncthreads()`/`s_barrier`. Every retained barrier needs a
+  producer-consumer dependency; no lane may diverge around it.
+* Reduce in warp/wave or shared memory before a global atomic. Hot loops may
+  issue at most one global atomic per independent warp/wave result unless an
+  exact-shape A/B proves a different decomposition wins.
+* Qualify non-aliasing pointers with `__restrict__`. If the packet contract
+  intentionally aliases buffers, state that invariant at the call boundary and
+  leave those parameters unqualified.
+* Device `printf` is forbidden in production objects. Use counter buffers or a
+  separately built trace object.
+
+For each packet-derived kernel case, run the same loop: build a hash-distinct
+object; audit symbols, resources, and ISA; run the deterministic exact-shape
+oracle; collect branch, global-memory, LDS/shared-memory, barrier, atomic, and
+occupancy counters; then run rotated control/candidate timing. CUDA uses
+`scripts/gemma4_h100_kernel_tuner.py` for this loop. AMD uses the same tuner and
+packet case inventory, with `scripts/asm_audit.py` as the authoritative
+scratch/resource screen. A source inspection or compiler resource remark alone
+does not close a case. Record a rejection at its exact rung and continue to the
+next kernel; never promote one winner across unrelated M/N/K, attention, live-KV,
+or packed-topology cells.
+
+In the tuner spec, bind `source_contract.device_printf_calls=0` and set
+`source_contract.pointer_aliasing` to `restrict` or `intentional-alias`. Put
+exact-shape profiler ceilings in `anti_pattern_limits` using
+`inner_loop_divergent_branches`, `uncoalesced_global_transactions`,
+`shared_bank_conflicts`, `barrier_stall_cycles`, and `global_atomics`. The
+benchmark record must return every named counter; exceeding a ceiling rejects
+the arm before timing can promote it.
 
 ## Procedure
 
@@ -164,6 +215,13 @@ Run repeated control/candidate pairs in reversed order, evict L2 symmetrically,
 and retain SM-clock/power telemetry. Any chosen attention split, warp count, or
 register budget must be encoded by geometry/rung in compiler packet metadata;
 do not add model-name branches or runtime environment knobs.
+
+Close a rung from the inside out: exact operator → exact unfused/fused semantic
+sequence → packet role → isolated block. Preserve the same packet digest,
+object hash, input seed, cache state, and control/candidate trial order in the
+record. Rank follow-up work by occurrence-weighted block savings. A candidate
+that wins alone but loses after its segment launch or role transition stays a
+rejected search result and does not enter TuneDB.
 
 ### 5. Anchor and attribute
 

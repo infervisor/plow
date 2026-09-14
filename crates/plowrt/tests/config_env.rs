@@ -22,6 +22,8 @@ fn env_zero_and_one_mean_false_and_true() {
     std::env::set_var("PLOW_PF_INTERLEAVE", "1024");
     std::env::set_var("PLOW_PF_DEFER_DECODE", "1");
     std::env::set_var("PLOW_PF_BATCH", "1");
+    std::env::set_var("PLOW_PREFIX_CACHE", "0");
+    std::env::set_var("PLOW_VMM_CACHE_MIB", "512");
     std::env::set_var("PLOW_TP_PREFILL_SEGMENT_MAJOR", "0");
     std::env::set_var("PLOW_ANE_MLP", "1");
     std::env::set_var("PLOW_METAL_SERIAL", "0");
@@ -39,11 +41,13 @@ fn env_zero_and_one_mean_false_and_true() {
     );
     assert_eq!(c.kv_pool_mib, 256);
     assert_eq!(c.nv.pf_seg_pure.as_deref(), Some("fp8"));
-    assert_eq!(c.nv.pf_chunk, 4096);
-    assert_eq!(c.nv.pf_chunk_rows(), 4096);
-    assert_eq!(c.nv.pf_interleave, 1024);
-    assert!(c.nv.pf_defer_decode);
-    assert!(c.nv.pf_batch);
+    assert_eq!(c.pf_chunk, 4096);
+    assert_eq!(c.pf_chunk_rows(), 4096);
+    assert_eq!(c.pf_interleave, Some(1024));
+    assert!(c.pf_defer_decode);
+    assert_eq!(c.pf_batch, Some(true));
+    assert!(!c.prefix_cache);
+    assert_eq!(c.vmm_cache_mib, Some(512));
     assert!(!c.amd.tp_prefill_segment_major);
     assert!(c.apple.ane_mlp);
     assert!(!c.apple.serial);
@@ -58,4 +62,24 @@ fn env_zero_and_one_mean_false_and_true() {
     );
     assert_eq!(c.apple.ane_mlp_fail.as_deref(), Some("after_join"));
     assert_eq!(c.apple.backend.as_deref(), Some("cpu"));
+
+    use clap::{Args, FromArgMatches};
+    let matches = RuntimeConfig::augment_args(clap::Command::new("plowrt"))
+        .subcommand(clap::Command::new("serve"))
+        .try_get_matches_from([
+            "plowrt",
+            "serve",
+            "--pf-interleave",
+            "0",
+            "--amd-hsaco-lowrung",
+            "",
+        ])
+        .unwrap();
+    let resolved = RuntimeConfig::from_arg_matches(&matches).unwrap();
+    let replay = plowrt::config::serve_replay(&matches);
+    assert_eq!(resolved.pf_interleave, Some(0));
+    assert_eq!(replay["PLOW_PF_INTERLEAVE"], "0");
+    assert_eq!(replay["PLOW_PF_CHUNK"], "4096");
+    assert_eq!(replay["PLOW_HSACO_LOWRUNG"], "");
+    assert!(!replay.contains_key("PLOW_TP_NO_AUDIT"));
 }

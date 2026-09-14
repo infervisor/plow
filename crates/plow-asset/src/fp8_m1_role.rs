@@ -293,7 +293,7 @@ pub fn validate_all(packet: &Packet<'_>, program: usize, pcs: &[usize]) -> Resul
     )?;
     let g = packet.programs.get(program).ok_or("program index")?;
     require(
-        g.rows == 1 && !g.packed_prefill_only && g.l2_domains == 0,
+        g.rows == 1 && !g.role.is_packed_sibling() && g.l2_domains == 0,
         "decode geometry",
     )?;
     let mut stream = g.stream.to_vec();

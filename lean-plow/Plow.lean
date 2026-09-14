@@ -5,6 +5,12 @@ import Plow.TransitiveReduction
 import Plow.Memory
 import Plow.KvPool
 import Plow.Verify
+import Plow.Knobs.Schema
+import Plow.Knobs.Formula
+import Plow.Knobs.Resolve
+import Plow.Knobs.Consistency
+import Plow.Knobs.Scope
+import Plow.Knobs.Ledger
 import Plow.CLI.Schema
 import Plow.CLI.Payload
 import Plow.CLI.Checkpoints

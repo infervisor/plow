@@ -194,6 +194,14 @@ if [ "${PLOW_BUILD_W8A8:-0}" = "1" ]; then
   PF_EXTRA="$PF_EXTRA -DPLOW_NV_W8A8=1 -DPGM90_FP8_PROMOTE=${PLOW_W8A8_PROMOTE:-1}"
 fi
 
+if [ "${PLOW_BUILD_FA_GQA2_PAIR:-0}" = "1" ] &&
+   { [ "${PLOW_BUILD_SEG:-0}" != "1" ] || [ "${PLOW_BUILD_FA512:-0}" != "1" ] ||
+     [ "${PLOW_BUILD_FA_WGITEM:-0}" != "1" ] ||
+     [ "${PLOW_BUILD_FA_HD256:-0}" != "1" ]; }; then
+  echo "FATAL: PLOW_BUILD_FA_GQA2_PAIR requires SEG=1, FA512=1, FA_WGITEM=1 and FA_HD256=1" >&2
+  exit 1
+fi
+
 # PLOW_BUILD_SEG=1: ALSO build the segmented-prefill object pair (T9c/T10 design,
 # first wired on Hopper by the gh200 prefill campaign):
 #   <out>_pfseg.cubin   — the FAT segmented object (every prefill arm, occ-1); runs the
@@ -268,6 +276,12 @@ if [ "${PLOW_BUILD_SEG:-0}" = "1" ]; then
   if [ "${PLOW_BUILD_GEMM_WS384:-0}" = "1" ]; then
     GEMM_ONLY_GATE="-DPLOW_NV_GEMM_ONLY=1 -DPGM90_UNI_BN256=1 -DPLOW_NV_SEG_WS384=1"
   fi
+  # Exact Gemma-4-12B M512 output/down projection object. BN128 exposes 120 tiles on
+  # H100 and the six-stage ring hides the long-K TMA latency; the consumers write BF16
+  # directly, so there is no split workspace or reduction launch.
+  if [ "${PLOW_BUILD_GEMM_M512_BF16:-0}" = "1" ]; then
+    GEMM_ONLY_GATE="-DPLOW_NV_GEMM_ONLY=1 -DPLOW_NV_TMA_GEMM=1 -DPGM90_UNI_BN256=1 -DPLOW_NV_SEG_WS384=1 -DPLOW_NV_SEG_M128N128=1 -DPGM90_WS384_BN=128 -DPGM90_UNI256_NS=6 -DPGM90_WS384_ISSUE_CURSOR=1 -DPGM90_WS384_PREFETCH=1"
+  fi
   if [ "${PLOW_BUILD_GEMM_SMALL_BF16:-0}" = "1" ]; then
     GEMM_ONLY_GATE="-DPLOW_NV_GEMM_ONLY=1 -DPLOW_NV_SEG_OCC1=1 -DPLOW_NV_TMA_GEMM=1 -DPLOW_NV_SEG_SMALL_BF16=1"
   fi
@@ -302,6 +316,13 @@ if [ "${PLOW_BUILD_SEG:-0}" = "1" ]; then
     if [ "${PLOW_BUILD_FA_HD256:-0}" = "1" ]; then
       FA_WG="$FA_WG -DPLOW_NV_FA_ONLY_HD256=1"
     fi
+    if [ "${PLOW_BUILD_FA_HD256_ONLY:-0}" = "1" ]; then
+      [ "${PLOW_BUILD_FA_HD256:-0}" = "1" ] || {
+        echo "FATAL: PLOW_BUILD_FA_HD256_ONLY requires PLOW_BUILD_FA_HD256=1" >&2
+        exit 1
+      }
+      FA_WG="$FA_WG -DPLOW_NV_FA_ONLY_HD256_ONLY=1"
+    fi
     # PLOW_BUILD_FA_WGITEM=1 (T30): warpgroup-per-work-item hd256 flash (forces BKV=32).
     if [ "${PLOW_BUILD_FA_WGITEM:-0}" = "1" ]; then
       FA_WG="$FA_WG -DPLOW_NV_FA_WGITEM=1"
@@ -322,13 +343,44 @@ if [ "${PLOW_BUILD_SEG:-0}" = "1" ]; then
     echo "built $OUT_PFFA ($(stat -c%s "$OUT_PFFA") B)"
 
     OUT_PFATTN="${OUT%.cubin}_pfattn_hd512.cubin"
+    PFATTN_WGMMA_FLAGS=()
+    if [ "${PLOW_BUILD_PFATTN_WGMMA:-0}" = 1 ]; then
+      PFATTN_WGMMA_FLAGS=(-DPLOW_NV_FA512_WG=1 -DPLOW_NV_FA_GF=2 -DPLOW_NV_FA_WPR=1
+        -DPLOW_NV_FA_QK_UNROLL="${PLOW_BUILD_PFATTN_QK_UNROLL:-32}"
+        -DPLOW_NV_PACKED_REQUEST=1 -DPLOW_NV_PACKED_FA_WGMMA=1 -DPLOW_NV_PACKED_FA_TMA=1)
+    fi
     "${NVENV[@]}" \
       "$NVCC" -std=c++17 -arch=sm_90a -O3 -cubin \
       -I "$HERE/runtime/common" -I "$HERE/runtime/nvidia" \
+      "${PFATTN_WGMMA_FLAGS[@]}" \
       -o "$OUT_PFATTN" "$HERE/runtime/nvidia/interp_sm90a_pfattn_hd512.cu"
     "${NVENV[@]}" \
       cuobjdump -symbols "$OUT_PFATTN" | grep -q "plow_sm90a_pfattn_hd512" || { echo "FATAL: pfattn hd512 symbol missing" >&2; exit 1; }
     echo "built $OUT_PFATTN ($(stat -c%s "$OUT_PFATTN") B)"
+
+    if [ "${PLOW_BUILD_FA_GQA2_PAIR:-0}" = "1" ]; then
+      OUT_PFGQA2="${OUT%.cubin}_pfpackedfa256_gqa2.cubin"
+      GQA2_PADDING=""
+      if [ "${PLOW_BUILD_MASKED_PADDING:-0}" = "1" ]; then
+        GQA2_PADDING="-DPLOW_NV_MASKED_PADDING=1"
+      fi
+      "${NVENV[@]}" \
+        "$NVCC" -std=c++17 -arch=sm_90a -O3 -cubin \
+        -I "$HERE/runtime/common" -I "$HERE/runtime/nvidia" \
+        -DPLOW_NV_PREFILL=1 -DPLOW_NV_SEGMENTS=1 -DPLOW_NV_FA_ONLY=1 \
+        -DPLOW_NV_FA_ONLY_HD256=1 -DPLOW_NV_FA_ONLY_HD256_EXACT=1 \
+        -DPLOW_NV_FA_WGITEM=1 -DPLOW_NV_FA_GQA2_PAIR=1 \
+        -DPLOW_NV_PACKED_REQUEST=1 -DPLOW_NV_PACKED_FA_WGMMA=1 \
+        -DPLOW_NV_PACKED_FA_TMA=1 -DPLOW_NV_GEMMA=1 -DPLOW_NV_FA_GF=2 \
+        -DPLOW_NV_EMBED_SMEM=1 $GQA2_PADDING $GEMMA_GATE $FLASH_EXTRA $PF_EXTRA \
+        -o "$OUT_PFGQA2" "$SRC"
+      "${NVENV[@]}" cuobjdump -symbols "$OUT_PFGQA2" | \
+        grep -q "_Z23interp_sm90a_pfpackedfa11PlowProgram" || {
+          echo "FATAL: packed HD256 GQA2 attention kernel missing" >&2
+          exit 1
+        }
+      echo "built $OUT_PFGQA2 ($(stat -c%s "$OUT_PFGQA2") B)"
+    fi
   fi
 fi
 
@@ -379,6 +431,18 @@ if ! "${NVENV[@]}" \
   exit 1
 fi
 echo "built $OUT_PF ($(stat -c%s "$OUT_PF") B), kernel $KSYM_PF present"
+
+OUT_W8A16_M1="${OUT%.cubin}_pfgemm_w8a16_m1.cubin"
+"${NVENV[@]}" \
+  "$NVCC" -std=c++17 -arch=sm_90a -O3 -cubin \
+  -I "$HERE/runtime/common" -I "$HERE/runtime/nvidia" \
+  -o "$OUT_W8A16_M1" "$HERE/runtime/nvidia/interp_sm90a_pfgemm_w8a16_m1.cu"
+"${NVENV[@]}" cuobjdump -symbols "$OUT_W8A16_M1" | \
+  grep -q plow_sm90a_pfgemm_w8a16_m1 || {
+    echo "FATAL: native W8A16 M1 role kernel missing in $OUT_W8A16_M1" >&2
+    exit 1
+  }
+echo "built $OUT_W8A16_M1 ($(stat -c%s "$OUT_W8A16_M1") B)"
 
 # fp8-KV variants (rtx-19 E3, PLOW_BUILD_FP8KV=1): same two objects + -DPLOW_FP8_KV=1, which
 # compiles in the e4m3 KV op-arms (HEADNORM_ROPE_FP8 / FLASH_DECODE_FP8). The default objects above

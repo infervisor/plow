@@ -15,11 +15,46 @@ import Plow.Sram
 import Plow.Wire
 import Plow.Rewrite
 import Plow.TilePartition
+import Plow.Knobs.Consistency
+import Plow.Knobs.Scope
+import Plow.Knobs.Ledger
 
 namespace Plow.CLI.Checkpoints
 
 open Lean (Json)
 open Plow.CLI Plow.Verify
+
+/-! ## Checkpoint K: knob consistency. -/
+
+/-- Resolve the knob sources against the registry and target, and check every constraint.
+    Backed by `Plow.Knobs.checkK_sound`; the registry-consistency and record-agreement checks
+    around it are instance checks. -/
+def checkK (payload : Json) : Certificate :=
+  match Plow.Knobs.runK payload with
+  | .ok notes => ok "K" notes
+  | .error msg => reject "K" msg
+
+/-! ## Checkpoint S: knob scope. -/
+
+/-- Compare a base and a variant packet program by program against a knob's declared scope.
+    Backed by `Plow.Knobs.Scope.checkS_sound`, `diff_complete`, `off_identity`,
+    `untouched_rungs` and `route_untouched`. -/
+def checkS (payload : Json) : Certificate :=
+  match Plow.Knobs.Scope.runS payload with
+  | .ok notes => ok "S" notes
+  | .error msg => reject "S" msg
+
+/-! ## Checkpoint P: performance certificate for a default flip. -/
+
+/-- Decide a flip from ledger measurements: untouched rungs keep their digests, touched rungs
+    improve beyond the control-vs-control floor, tier 4 is not worse, numeric changes carry
+    passing facts. A floor that cannot be computed is `insufficient_evidence`, never a pass.
+    Backed by `Plow.Knobs.Ledger.checkP_sound`, `insufficient_blocks`, `flip_non_regression`,
+    `carry_over` and `per_rung_argmin`. -/
+def checkP (payload : Json) : Certificate :=
+  match Plow.Knobs.Ledger.runP payload with
+  | .ok notes => ok "P" notes
+  | .error msg => reject "P" msg
 
 /-! ## Checkpoint A: Rewrite rule soundness (§5.10-A). -/
 

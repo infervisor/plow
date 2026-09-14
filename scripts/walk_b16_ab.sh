@@ -1,9 +1,21 @@
 #!/usr/bin/env bash
-# §6g-WALK PHASE B: DOES THE WALK AT MM=8 RECOVER B=16?
+# §6g-WALK PHASE B: DOES THE WALK AT MM=8 RECOVER B=16?  ANSWERED 2026-09-08: NO.
 #
 # The falsifiable prediction the walk study left, verbatim: "the walk at MM=8 serving t=16
 # should recover B=16 from 142.4 back toward 202.3, because it restores both fusions and the
 # non-spilling rung. If it does not, §5 is wrong and the B=16 loss is something else."
+#
+# IT DOES NOT, AND §5 IS WRONG. Measured on gfx942 / MI300X at n_cu 304, blob and object
+# matched at each width (`amd-bench --batched`, ctx 1024): B=8/MM=8 130.7 tok/s, B=16/MM=16
+# 163.3, B=16/MM=8-walking 143.8. The walk lands 12% BELOW the plain MM=16 object, and B=16
+# is a 25% WIN over B=8 rather than the 30% regression the pair above records. Claim 2 in the
+# arm list below could not have held on this part either: gfx942's decode arena is 15,360
+# halves, not 73,728, so `min(MM, t) * 5376` overflows it at every MM >= 3 and the B=16 blob
+# is BYTE-IDENTICAL with the walk on and off. See devgen::gemv_staged_rows and
+# docs/amd/gemma4-31b-mi300x.md, "Decode concurrency 16 and 32", for the full table.
+#
+# The script is kept as the recipe for the three arms; its default paths are the authoring
+# host's and must be overridden (CKPT/AB/PLOWC/PLOWRT/WALK_*_HSACO).
 #
 # §6g-BATCH's device ceiling (Gemma-4-31B bf16, TP1, `amd-bench --batched`, blob AND objects
 # matched at each B): 57.9 / 106.5 / 141.7 / **202.3** / 142.4 tok/s at B=1/2/4/8/16. This
@@ -20,8 +32,9 @@
 # The walk arm differs from b16ctl in THREE ways at once, and they cannot be separated by this
 # experiment — say so rather than attribute the result to one of them:
 #   1. no MM=16 accumulator spill (16 -> 4 scratch ops, per the build's own register readback)
-#   2. `fuse_qkv` and `glu_fused` come back on, because `gemv_staged_rows` bounds the LDS
-#      staging at min(MM,t)*hidden = 8*5376 = 43008 <= 73728 instead of 16*5376 = 86016
+#   2. FALSIFIED ON gfx942 (see header): `fuse_qkv` and `glu_fused` would come back only
+#      against the gfx950 arena, 8*5376 = 43008 <= 73728. gfx942's is 15,360, so neither
+#      arm has them and the two blobs are byte-identical
 #   3. i_decode.co is 552 KB instead of 848 KB (-35%), and §6g-GF8-REGRESSION established that
 #      decode-object SIZE alone can cost +32% inside the persistent megakernel
 # A positive result confirms the composite, not §5's mechanism specifically.

@@ -49,6 +49,8 @@ int cuStreamDestroy_v2(void) { return 0; }
 int cuStreamSynchronize(void) { return 0; }
 int cuMemcpyHtoDAsync_v2(void) { return 0; }
 int cuMemcpyDtoHAsync_v2(void) { return 0; }
+int cuMemcpyDtoDAsync_v2(void) { return 0; }
+int cuMemcpy3DAsync_v2(void) { return 0; }
 int cuMemsetD8Async(void) { return 0; }
 int cuEventCreate(void) { return 0; }
 int cuEventDestroy_v2(void) { return 0; }

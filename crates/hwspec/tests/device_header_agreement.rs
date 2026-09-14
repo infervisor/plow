@@ -2,8 +2,9 @@
 //!
 //! `hwspec::IsaLevel::geometry` states the GEMM arena the interpreter object
 //! will actually have. Nothing in the type system ties that to the object: the
-//! authority is `runtime/amd/op_gemm.h`'s arch-conditional defaults, re-cut for
-//! the shipped gfx942 decode profile by `scripts/build_gfx942.sh`. When the two
+//! authority is the per-arch defaults in `runtime/amd/op_gemm_gfx942.h` /
+//! `op_gemm_gfx950.h` (falling back to `op_gemm_common.h` for a knob both arches
+//! share), re-cut for the shipped gfx942 decode profile by `scripts/build_gfx942.sh`. When the two
 //! disagreed — the host held CDNA4's 73,728 halves while gfx942's decode object
 //! holds 15,360 — the emitter fused a 19-row batch onto an arena that holds
 //! four, and the symptom was fluent-but-wrong text, not a build error.
@@ -48,10 +49,12 @@ fn strip_comments(src: &str) -> String {
     out
 }
 
-/// The `(CDNA4, CDNA3)` defaults of an `#ifndef NAME ... #endif` guard in
-/// `op_gemm.h`.
+/// The `(CDNA4, CDNA3)` defaults of an `#ifndef NAME ... #endif` guard in a
+/// device header.
 ///
-/// The shape being read is exactly the two the header uses:
+/// The shape being read is exactly the two the headers use (`amd_arch.h` still
+/// keys on `PLOW_CDNA4` inside the guard; the split GEMM arch files state one
+/// value each):
 ///
 /// ```text
 /// #ifndef GM_BM          #ifndef GM_BN
@@ -69,7 +72,7 @@ fn header_default(src: &str, name: &str) -> (u32, u32) {
     let guard = format!("#ifndef {name}\n");
     let start = src
         .find(&guard)
-        .unwrap_or_else(|| panic!("op_gemm.h has no `#ifndef {name}` guard"))
+        .unwrap_or_else(|| panic!("no `#ifndef {name}` guard in the header"))
         + guard.len();
     // Walk to the `#endif` that closes the guard, tracking nesting.
     let mut depth = 1usize;
@@ -140,16 +143,34 @@ fn geometry(isa: IsaLevel) -> ArchGeometry {
         .unwrap_or_else(|| panic!("{} has no geometry", isa.arch_flag()))
 }
 
-/// The default tile and the stage-buffer policy, against the header that sets
+/// The `(CDNA4, CDNA3)` default of a GEMM knob after the arch split: each arch
+/// file states its own value under its own `#ifndef`; a knob absent from the arch
+/// file takes `op_gemm_common.h`'s shared fallback, exactly as the preprocessor
+/// does (the arch file is included first).
+fn gemm_default(name: &str) -> (u32, u32) {
+    let common = strip_comments(&read("runtime/amd/op_gemm_common.h"));
+    let pick = |arch: &str| {
+        let h = strip_comments(&read(arch));
+        if h.contains(&format!("#ifndef {name}\n")) {
+            header_default(&h, name)
+        } else {
+            header_default(&common, name)
+        }
+    };
+    let (cdna4, _) = pick("runtime/amd/op_gemm_gfx950.h");
+    let (_, cdna3) = pick("runtime/amd/op_gemm_gfx942.h");
+    (cdna4, cdna3)
+}
+
+/// The default tile and the stage-buffer policy, against the headers that set
 /// them. This is the assertion that would have failed while `GM_LDS_HALVES` was
 /// CDNA4-only on the host.
 #[test]
 fn prefill_tile_and_dbuf_match_op_gemm_h() {
-    let h = strip_comments(&read("runtime/amd/op_gemm.h"));
-    let (bm4, bm3) = header_default(&h, "GM_BM");
-    let (bn4, bn3) = header_default(&h, "GM_BN");
-    let (bk4, bk3) = header_default(&h, "GM_BK");
-    let (db4, db3) = header_default(&h, "GM_DBUF");
+    let (bm4, bm3) = gemm_default("GM_BM");
+    let (bn4, bn3) = gemm_default("GM_BN");
+    let (bk4, bk3) = gemm_default("GM_BK");
+    let (db4, db3) = gemm_default("GM_DBUF");
 
     let g3 = geometry(IsaLevel::Gfx942);
     let g4 = geometry(IsaLevel::Gfx950);
@@ -161,7 +182,7 @@ fn prefill_tile_and_dbuf_match_op_gemm_h() {
             bn: bn3,
             bk: bk3
         },
-        "gfx942 default tile disagrees with op_gemm.h's !PLOW_CDNA4 arm"
+        "gfx942 default tile disagrees with op_gemm_gfx942.h"
     );
     assert_eq!(
         g4.gemm_tile,
@@ -170,7 +191,7 @@ fn prefill_tile_and_dbuf_match_op_gemm_h() {
             bn: bn4,
             bk: bk4
         },
-        "gfx950 default tile disagrees with op_gemm.h's PLOW_CDNA4 arm"
+        "gfx950 default tile disagrees with op_gemm_gfx950.h"
     );
     assert_eq!(g3.gemm_stage_buffers, db3, "gfx942 GM_DBUF");
     assert_eq!(g4.gemm_stage_buffers, db4, "gfx950 GM_DBUF");

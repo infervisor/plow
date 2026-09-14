@@ -144,7 +144,6 @@ pub async fn completions(
     }
     gen.seed = req.seed;
 
-    crate::obs::Metrics::inc(&state.metrics.requests);
     let (Some(mux), Ok(bundle)) = (state.mux(&req.model), state.registry.get(&req.model)) else {
         return crate::serve::api_error(
             axum::http::StatusCode::NOT_FOUND,
@@ -154,6 +153,7 @@ pub async fn completions(
             Some("model".into()),
         );
     };
+    let ingress = mux.ingress();
     // OpenAI's four prompt forms. Token-id prompts skip the tokenizer entirely;
     // batches are refused explicitly rather than silently serving element 0.
     let batch_refusal = || {
@@ -220,10 +220,9 @@ pub async fn completions(
         arrived: std::time::Instant::now(),
         respond: tx,
     };
-    if let Err(err) = mux.submit(job) {
+    if let Err(err) = mux.submit_arrived(job, t_arrive, Some(ingress)) {
         return match err {
             crate::serve::mux::SubmitError::Full(_) => {
-                crate::obs::Metrics::inc(&state.metrics.rejected);
                 crate::serve::api_error(
                     axum::http::StatusCode::TOO_MANY_REQUESTS,
                     "model request queue full",

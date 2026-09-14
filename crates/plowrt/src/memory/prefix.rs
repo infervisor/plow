@@ -407,6 +407,54 @@ impl PrefixCache {
         Some((owner, blk))
     }
 
+    /// Unlink the tail of the path named by `hashes[..from_depth]`, working backward from
+    /// `from_depth - 1`, evicting each node that is currently a zero-ref **leaf** (never an
+    /// interior node — same "would orphan a child" rule [`Self::evict_lru`] enforces), and
+    /// stopping at the first node that is not (still referenced, e.g. by another sequence
+    /// that attached to it, or not a leaf) or once `keep` is reached. Returns the evicted
+    /// `(owner_seq, block_idx)` identities, deepest first, so the caller can reclaim whatever
+    /// physical storage each one names.
+    ///
+    /// The targeted counterpart of [`Self::evict_lru`]'s global pick: used when a SPECIFIC
+    /// path's tail must go (an "orphaned" suffix this caller does not hold and cannot trust),
+    /// not whichever leaf happens to be globally least-recently-used elsewhere in the tree.
+    pub fn evict_tail(&mut self, hashes: &[BlockHash], from_depth: usize, keep: usize) -> Vec<(u32, u32)> {
+        let mut path: Vec<NodeId> = Vec::with_capacity(from_depth);
+        let mut cur: Option<NodeId> = None;
+        for h in hashes.iter().take(from_depth) {
+            let next = match cur {
+                None => self.roots.get(h).copied(),
+                Some(p) => self.nodes[p as usize].children.get(h).copied(),
+            };
+            match next {
+                Some(n) => {
+                    path.push(n);
+                    cur = Some(n);
+                }
+                None => break, // the path doesn't reach this deep; nothing further to unlink
+            }
+        }
+        let mut evicted = Vec::new();
+        while path.len() > keep {
+            let id = *path.last().unwrap();
+            let n = &self.nodes[id as usize];
+            if n.evicted || n.refs != 0 || !n.children.is_empty() {
+                break;
+            }
+            let (parent, owner, blk) = (n.parent, n.owner_seq, n.block_idx);
+            match parent {
+                Some(p) => self.nodes[p as usize].children.retain(|_, v| *v != id),
+                None => self.roots.retain(|_, v| *v != id),
+            }
+            self.nodes[id as usize].refs = 0;
+            self.nodes[id as usize].children.clear();
+            self.nodes[id as usize].evicted = true;
+            evicted.push((owner, blk));
+            path.pop();
+        }
+        evicted
+    }
+
     /// Number of nodes ever allocated (including evicted tombstones).
     pub fn len(&self) -> usize {
         self.nodes.len()
@@ -551,6 +599,34 @@ mod tests {
             None,
             "an evicted node must not be evicted again"
         );
+    }
+
+    #[test]
+    fn evict_tail_unlinks_the_orphaned_suffix_and_stops_at_a_referenced_node() {
+        let mut c = cache();
+        let h: Vec<BlockHash> = (0..4).collect();
+        c.insert(&h, &toks(&h), 0, 0); // refs 1 on all 4, held by "seq 0"
+        c.release(&h, 4); // seq 0 retires: nothing referenced now
+        assert_eq!(
+            c.evict_tail(&h, 4, 0),
+            vec![(0, 3), (0, 2), (0, 1), (0, 0)],
+            "wholly unreferenced: the entire suffix down to `keep` unlinks, deepest first"
+        );
+        assert_eq!(c.lookup(&h, &toks(&h)).blocks, 0, "nothing left to find");
+
+        // Rebuild, then have a DIFFERENT sequence hold a reference partway through.
+        c.insert(&h, &toks(&h), 1, 0);
+        c.release(&h, 4);
+        let held_path = &h[..2];
+        let m = c.lookup(held_path, &toks(held_path)); // bumps refs on blocks 0-1
+        assert_eq!(m.blocks, 2);
+        assert_eq!(
+            c.evict_tail(&h, 4, 0),
+            vec![(1, 3), (1, 2)],
+            "stops at block 1: it is still referenced, so blocks 0-1 must survive"
+        );
+        assert_eq!(c.lookup(&h, &toks(&h)).blocks, 2, "the referenced prefix is intact");
+        c.release(held_path, 2);
     }
 
     #[test]

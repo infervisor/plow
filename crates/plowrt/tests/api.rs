@@ -59,6 +59,50 @@ async fn body_string(resp: axum::response::Response) -> String {
     String::from_utf8(bytes.to_vec()).unwrap()
 }
 
+async fn token_prompt(app: &axum::Router, prompt: serde_json::Value) -> (StatusCode, String) {
+    let body = serde_json::json!({"model": "api-model", "prompt": prompt, "max_tokens": 1});
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    (resp.status(), body_string(resp).await)
+}
+
+#[tokio::test]
+async fn token_id_prompts_outside_the_vocabulary_are_refused() {
+    let app = make_app();
+    for prompt in [serde_json::json!([65, 256]), serde_json::json!([[4294967295u32]])] {
+        let (status, body) = token_prompt(&app, prompt).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("outside the vocabulary size 256"), "{body}");
+        assert!(body.contains("invalid_prompt"), "{body}");
+    }
+    assert_eq!(token_prompt(&app, serde_json::json!([65, 255])).await.0, StatusCode::OK);
+}
+
+#[cfg(feature = "hf-tokenizer")]
+#[tokio::test]
+async fn hf_tokenizer_vocab_bounds_token_id_prompts() {
+    let json = r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],
+        "normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,"decoder":null,
+        "model":{"type":"WordLevel","vocab":{"hello":0,"world":1,"[UNK]":2},"unk_token":"[UNK]"}}"#;
+    let app = make_app_with_tokenizer(Some(json));
+    for _ in 0..2 {
+        let (status, body) = token_prompt(&app, serde_json::json!([0, 3])).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("prompt token id 3 is outside the vocabulary size 3"), "{body}");
+        assert_eq!(token_prompt(&app, serde_json::json!([0, 2])).await.0, StatusCode::OK);
+    }
+}
+
 #[tokio::test]
 async fn lists_models() {
     let resp = make_app()

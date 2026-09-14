@@ -640,6 +640,7 @@ impl CpuModel {
         strict: bool,
     ) -> Result<CpuModel> {
         let t0 = Instant::now();
+        crate::knob_spec::check_assets(blob_path)?;
         let raw = std::fs::read(blob_path)
             .map_err(|e| RuntimeError::Device(format!("read {}: {e}", blob_path.display())))?;
         // L2-domain placement is accepted: the CPU interpreter dispatches per
@@ -1002,6 +1003,38 @@ impl CpuModel {
     pub fn table_ptr(&self, h: usize) -> *mut c_void {
         // SAFETY: `h` indexes the table (validated at load); quiescent point.
         unsafe { *self.table.as_ptr().add(h) }
+    }
+
+    /// Read-only view of `len` bytes at `off` inside tensor `handle`.
+    ///
+    /// The head prefill's KV rows are already host memory, so a handoff reads
+    /// its source straight out of the tensor rather than staging a copy of it.
+    ///
+    /// Addresses the tensor's BASE allocation, NOT [`Self::table_ptr`], which
+    /// may be slot-rebased by [`Self::kv_rebase`]. A handoff plan already
+    /// carries the slot in its offset, so reading through the rebased pointer
+    /// would apply the slot twice.
+    ///
+    /// Bounds-checked because the caller's offsets come from a plan derived
+    /// from the OTHER packet's declarations, and the whole point of the KV
+    /// contract is that the two agreeing is checked rather than assumed.
+    pub fn tensor_range(&self, handle: usize, off: u64, len: u64) -> Result<&[u8]> {
+        let t = self
+            .tensors
+            .get(handle)
+            .ok_or_else(|| RuntimeError::Rejected(format!("tensor handle {handle} out of range")))?;
+        let end = off.checked_add(len).ok_or_else(|| {
+            RuntimeError::Rejected(format!("tensor {handle} range {off}+{len} overflows"))
+        })?;
+        if end > t.bytes as u64 {
+            return Err(RuntimeError::Rejected(format!(
+                "tensor {handle} range {off}+{len} past its {} bytes",
+                t.bytes
+            )));
+        }
+        // SAFETY: `handle` indexes this model's own allocation, the range is
+        // inside it, and `&self` keeps it alive and unwritten for the borrow.
+        Ok(unsafe { std::slice::from_raw_parts(t.as_ptr().add(off as usize), len as usize) })
     }
 
     /// Decode rungs (sequence widths), ascending, one per decode program.
@@ -1371,7 +1404,7 @@ mod placement_tests {
         }
         DevProg {
             t: 1,
-            packed_prefill_only: false,
+            role: packet::devbuild::ProgramRole::DecodeRung { rows: 1 },
             n_counter: 0,
             insts: Vec::new(),
             stream,
@@ -1658,6 +1691,12 @@ pub struct CpuEngineOpts {
     pub numa: NumaMode,
     pub isa: Isa,
     pub spin_us: u32,
+    /// Cores this engine's workers may use. `None` = the live topology.
+    ///
+    /// Set by the prefill-head pool to its reservation, so `WorkerPool` places
+    /// heads inside it with the machinery it already has and the serving path's
+    /// cores are simply not in the set it can see.
+    pub topology: Option<Topology>,
 }
 
 impl Default for CpuEngineOpts {
@@ -1667,6 +1706,7 @@ impl Default for CpuEngineOpts {
             numa: NumaMode::Auto,
             isa: Isa::Amx,
             spin_us: 2000,
+            topology: None,
         }
     }
 }
@@ -1752,7 +1792,7 @@ impl CpuEngine {
         opts: &CpuEngineOpts,
     ) -> Result<CpuEngine> {
         let isa = ffi::init(opts.isa)?;
-        let topo = Topology::detect();
+        let topo = opts.topology.clone().unwrap_or_else(Topology::detect);
         if let NumaMode::Nodes(requested) = &opts.numa {
             if requested.is_empty() || requested.iter().any(|n| !topo.nodes.contains(n)) {
                 return Err(RuntimeError::Device(format!(

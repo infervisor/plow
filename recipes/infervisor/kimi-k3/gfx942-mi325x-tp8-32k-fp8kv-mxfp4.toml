@@ -61,7 +61,10 @@ produces = ["model-idx-derived-00001.safetensors"]
 
 [objects]
 script = "scripts/build_gfx942.sh"
-env = { PLOW_DECODE_BATCH = "32", PLOW_GEMV_MM = "16", PLOW_GEMV_WALK = "1", PLOW_K3_DECODE_MXFP4_PROJ = "0", JOBS = "8" }
+# `PLOW_DECODE_TIERS = ""`: an UNSET value now auto-builds lowrung{1,2,4,8} from
+# the wide object's defines, which the explicit `[[objects.lowrung]]` entries
+# below would then overwrite with theirs — last writer wins. Empty = build none.
+env = { PLOW_DECODE_BATCH = "32", PLOW_GEMV_MM = "16", PLOW_GEMV_WALK = "1", PLOW_K3_DECODE_MXFP4_PROJ = "0", PLOW_DECODE_TIERS = "", JOBS = "8" }
 
 # The ladder's narrow rungs. Each is a PARTIAL object directory, valid only as a
 # rung override: `PLOW_ROWS_ONLY` builds one stem, and the grouped override is

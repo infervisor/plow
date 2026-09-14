@@ -39,6 +39,17 @@ fn gemm(op: DevOp) -> bool {
     )
 }
 
+fn fp8_gemm(op: DevOp) -> bool {
+    matches!(
+        op,
+        DevOp::GemmFp8
+            | DevOp::GemmSmallFp8
+            | DevOp::GemmMedFp8
+            | DevOp::GemmWideFp8
+            | DevOp::GemmC5Fp8
+    )
+}
+
 fn split_norm_residual_norm(inst: &DevInst64, rows: u32) -> Result<[DevInst64; 2]> {
     if inst.i[0] != rows
         || inst.i[1] == 0
@@ -169,14 +180,14 @@ pub(crate) fn synthesize(
         || blob.n_cu > u16::MAX as u32
     {
         return Err(reject(
-            "requires single-GPU dense BF16 with at least two slots",
+            "requires single-GPU dense direct-BF16-KV with at least two slots",
         ));
     }
     let decode = blob
         .progs
         .iter()
         .filter(|p| {
-            !p.packed_prefill_only
+            !p.role.is_packed_sibling()
                 && p.insts.iter().any(|i| i.op == DevOp::FlashDecode as u16)
                 && !p.insts.iter().any(|i| i.op == DevOp::FlashPrefill as u16)
         })
@@ -187,7 +198,7 @@ pub(crate) fn synthesize(
         .progs
         .iter()
         .filter(|p| {
-            !p.packed_prefill_only
+            !p.role.is_packed_sibling()
                 && p.t > 1
                 && p.insts.iter().any(|i| i.op == DevOp::FlashPrefill as u16)
         })
@@ -203,7 +214,7 @@ pub(crate) fn synthesize(
         .progs
         .iter()
         .filter(|p| {
-            !p.packed_prefill_only
+            !p.role.is_packed_sibling()
                 && p.insts.iter().any(|i| i.op == DevOp::FlashDecode as u16)
                 && !p.insts.iter().any(|i| i.op == DevOp::FlashPrefill as u16)
         })
@@ -329,7 +340,12 @@ pub(crate) fn synthesize(
                     index += 1;
                     continue;
                 }
-                DevOp::Embed | DevOp::RmsNorm | DevOp::NormResidual | DevOp::GemmGlu => {
+                DevOp::Embed
+                | DevOp::RmsNorm
+                | DevOp::NormResidual
+                | DevOp::GemmGlu
+                | DevOp::GemmGluFp8
+                | DevOp::QuantFp8 => {
                     if inst.i[0] != source.t {
                         return Err(reject("body row count mismatch"));
                     }
@@ -451,6 +467,14 @@ pub(crate) fn synthesize(
                     if !keep {
                         inst.op = DevOp::Gemm as u16;
                     }
+                }
+                code if fp8_gemm(code) => {
+                    if inst.i[0] != source.t || inst.i[3] != 0 || inst.i[4] != 0 || inst.i[5] != 0 {
+                        return Err(reject("FP8 GEMM row role mismatch"));
+                    }
+                    // FP8 packets select Small/Med/Wide/C5 independently for every projection
+                    // and prefill rung. The token-batch object carries every selected arm, so
+                    // retain the packet's tile instead of collapsing it onto one generic GEMM.
                 }
                 DevOp::SoftCap => {
                     inst.i[0] = inst.i[0]

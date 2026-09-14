@@ -186,7 +186,9 @@ pub enum DevOp {
     FlashMerge = 13,
     /// As [`DevOp::Gemm`], 64x128 tile.
     GemmSmall = 14,
-    /// As [`DevOp::Gemm`], 128x128 tile.
+    /// As [`DevOp::Gemm`], 128x128 tile. `t3=cos? t4=sin? t5=pos?` · `i3=rope_off`: a present
+    /// `pos` applies the interleaved hd-64 RoPE to columns `[rope_off, N)` in the store
+    /// (`PLOW_GLM_FUSE_POST`).
     GemmMed = 15,
     /// `t0=out t1=a t2=b t3=gamma?` · `i0=rows i1=feat` · `f0=eps f1=scale`, computing
     /// `out = (a + RMSNorm(b, gamma)) * scale` — Gemma's sandwich tail in ONE packet instead
@@ -310,9 +312,10 @@ pub enum DevOp {
     /// Per-row (per-token) fp8 activation quant — the w8a8 prefill's activation half.
     /// `a_scale[m] = rowmax|x[m,:]|/448`, `xq[m,k] = round_e4m3(x[m,k]/a_scale[m])`.
     /// Emitted once per activation, reused by every fp8 GEMM.
-    /// `t3/t4` (T11, `PLOW_QNORM_FUSE=1`): fused GLU producer — `x` becomes an OUTPUT,
-    /// the packet computes `fu = act(gate)*up` (bf16-rounded, exactly what [`DevOp::Glu`]
-    /// writes) then quantizes it; token-identical to the split form (needs a t3/t4-aware cubin).
+    /// `t3/t4` (T11, `PLOW_QNORM_FUSE=1` or `PLOW_GLU_QUANT_FUSE=1`): fused GLU producer —
+    /// `x` becomes an OUTPUT, the packet computes `fu = act(gate)*up` (bf16-rounded, exactly
+    /// what [`DevOp::Glu`] writes) then quantizes it; token-identical to the split form (needs a
+    /// t3/t4-aware cubin).
     QuantFp8 = 32,
     /// `t0=C t1=A(fp8) t2=B(fp8) t3=a_scale(f32[M]) t4=w_scale(f32[N])` · `i0=M i1=N i2=K i4=a_row0`.
     /// The fp8 (w8a8) prefill twin of [`DevOp::Gemm`]: BOTH operands fp8 e4m3. NOTE the 2x-rate MFMA
@@ -609,7 +612,8 @@ pub enum DevOp {
     /// killing the separate merge pass, its `Olat` HBM round-trip, and one dependency gate.
     /// Validated (rms ~0.004 vs the merge→fold sequence); ~1.1-1.24x on the MLA chain, composing
     /// with the ctx-scaled nsplit to 1.59x at 32k. `t0=O(v_head) t1=Opart(f32) t2=mlpart(f32)
-    /// t3=Wuv` · `i0=n_batch i1=n_head i2=V i4=nsplit`.
+    /// t3=Wuv` · `i0=n_batch i1=n_head i2=V i4=nsplit i5=native_fp32`.
+    /// `native_fp32=1` selects isolated gfx942 TP8 prefill GEMMs.
     MlaMergeFold = 57,
 
     // ===== DSA lightning indexer (GLM-5.2 GlmMoeDsa; sparse-attn-design.md §3.1, arXiv 2512.02556
@@ -634,8 +638,10 @@ pub enum DevOp {
     /// unset/zero, and the dispatch site treats zero as 1, so no existing blob's behavior changes)
     /// divides the live `kv_len` down to whatever granularity `len_max`/`Score` were emitted in
     /// (pool-granular under kpool). `t0=idx(i32) t1=Score(f32) t2=gHist(u32[7*256]) t3=gCtl(u32[3])
-    /// t4=kv_len(i32)` · `i0=len_max i1=top_k i2=pool_size`. Host zeroes gHist/gCtl once; the kernel
-    /// leaves them clean for relaunch.
+    /// t4=kv_len(i32)` · `i0=len_max i1=top_k i2=pool_size i3=batch_row i4=local_rows`.
+    /// Host zeroes gHist/gCtl once; the kernel leaves them clean for relaunch. `i4=1` selects independent rows,
+    /// one workgroup per row (`row=i3+slice`), using LDS-only selection. This unpooled
+    /// mode leaves t2/t3 unused and pads short rows with -1; i4=0 keeps cooperative selection.
     IndexSelect = 59,
 
     /// LayerNorm WITH bias + mean-subtract over `feat` (`d_layernorm_bias`) — the DSA indexer key-norm
@@ -796,7 +802,11 @@ pub enum DevOp {
     /// bit-identical PER TOKEN to the decode router by construction. The `[T,n_exp]` logit matrix is
     /// an ordinary [`DevOp::Gemm`], already in the prefill bucket; only this tail was missing.
     /// `t0=table[T*k] t1=logit(bf16[T,n_exp]) t2=atom_acc? t3=bias` ·
-    /// `i0=atom_h i1=n_exp i2=k i3=flags i4=T` · `f0=route_scale`.
+    /// `i0=atom_h i1=n_exp i2=k i3=flags i4=T i5=shared_tail` · `f0=route_scale`.
+    ///
+    /// `i5` is PLOW_GLM_MOE_SHARED_FOLD: 1 makes the table `[T*(k+1)]`, each token's last slot the
+    /// constant `{expert n_exp, gate 1.0}` — the shared expert routed as one more expert. The
+    /// top-k selection itself is unchanged. 0 on every other blob.
     ///
     /// `t2`/`i0` are PLOW_MOE_PF_ATOMIC's fused-MoE accumulator: when set, this packet also zeroes
     /// `atom_acc[T, atom_h]` f32 before the top-k loop, because it is the earliest packet of the
@@ -1217,7 +1227,10 @@ pub enum DevOp {
     /// second pass — where a per-tensor scale would have to be chosen before the context exists.
     /// `t0=Opart(f32) t1=mlpart(f32) t2=Qabs t3=Qrope t4=Ckv t5=Krope t6=kv_len(i32) t7=kv_scale` ·
     /// `i0=n_batch i1=n_head i2=kv_stride i3=window i4=nsplit i5=kv_mask i6=krot_fp8 i7=gf` ·
-    /// `f0=scale`.
+    /// `f0=scale` · `j0=selected_handle_plus_one`.
+    /// Sparse extension: `j0=selected_handle_plus_one` identifies the idx tensor;
+    /// i6 carries top_k. Zero j0 is dense.
+    /// Sparse FP8 requires BF16 rope and a compatible object marker.
     FlashMlaDecodeFp8 = 109,
     /// FP8-KV twin of [`DevOp::FlashMlaPrefill`]. Same operands as [`DevOp::FlashMlaDecodeFp8`]
     /// with `i4 = n_tok` instead of `nsplit` — the same slot reuse the bf16 MLA prefill makes,
@@ -1225,7 +1238,9 @@ pub enum DevOp {
     /// `PLOW_MLA_PREFILL`.
     /// `t0=Opart(f32) t1=mlpart(f32) t2=Qabs t3=Qrope t4=Ckv t5=Krope t6=kv_len(i32) t7=kv_scale` ·
     /// `i0=n_batch i1=n_head i2=kv_stride i3=window i4=n_tok i5=kv_mask i6=krot_fp8 i7=gf` ·
-    /// `f0=scale`.
+    /// `f0=scale` · `j0=selected_handle_plus_one`.
+    /// Sparse extension: `j0=selected_handle_plus_one` identifies the union tensor;
+    /// i6 carries union capacity.
     FlashMlaPrefillFp8 = 110,
     /// KDA short conv over all THREE streams in one packet — [`DevOp::KdaConv`] merged along the
     /// CHANNEL axis, which is its output axis.
@@ -1827,45 +1842,95 @@ pub enum DevOp {
     /// `t0=x t1=Wg t2=Wp t3=gamma_post t4=ple t5=hn_out? t6=gamma_next?` ·
     /// `i0=T i1=H i2=P i3=col0 i4=stride` · `f0=eps f1=layer_scalar`.
     PerLayerInput = 155,
+    /// Native gfx942 A8 block-FP8 MoE prefill. Quantizes BF16 input in 128-element
+    /// groups and combines routed experts in BF16. Mode 0 converts the result to FP32.
+    /// This is a separate numerical contract from the FP64 grouped-down path.
+    /// `t0=out t1=x t2=weights t3=scales t4=meta_or_raw_routes t5=row_token t6=row_part t7=row_gate` ·
+    /// `i0=T i1=H i2=I i3=E i4=topk i5=align_tile i6=mode i7=resident_weights`. Requires an isolated native segment.
+    /// `i6=1`: flat A16 decode, BF16 output plus eight scratch bytes, raw routing in t4,
+    /// t5..t7 absent and i5=0. Combine as one BF16 partial (MoeCombinePf.i7=1).
+    /// `i6=2`: sorted A8 prefill with direct BF16 output; combine as one BF16 partial.
+    /// `i7=1`: resident 16x32 weights, gate/up interleaved by expert followed by down;
+    /// scales are doubled for FNUZ. All consumers of these tables must use this layout.
+    MoeAiterFp8Pf = 156,
+    /// Native gfx942 TP8 query-partitioned DSA score, top-k and raw index gather.
+    /// `t0=idx t1=score t2=q t3=k t4=w t5=kv_len t6=peer_slot` ·
+    /// `i0=T i1=ctx i2=topk i3=tp i4=slot_bytes i5=enter_gate i6=complete_gate` · `f0=scale`.
+    /// Requires an isolated native segment and three consecutive system-scope arrival gates.
+    IndexTpPf = 157,
+    /// Native gfx942 BF16 projection using qualified hipBLASLt assembly.
+    /// `t0=out t1=x t2=weight` · `i0=T i1=N i2=K i3=mode` (0 prefill rows, 1 decode rung, 2 the
+    /// sequence-parallel band's fixed `i0=T/tp` rows). Requires an isolated native segment.
+    GemmLtPf = 158,
+    /// Native gfx942 W8A8 block-scale FP8 projection using AITER's pre-shuffled assembly.
+    /// `t0=out t1=x t2=weight t3=w_scale t4=xq t5=x_scale t6=bias` · `i0=T i1=N i2=K i3=quantize`.
+    /// `i3=1` first quantizes the BF16 `x` into `xq`/`x_scale` (128-element groups, FNUZ);
+    /// `i3=0` reads the `xq`/`x_scale` an earlier instruction quantized from the same `x`.
+    /// Requires an isolated native segment.
+    GemmBlkPf = 159,
+    /// Row-split sparse attention's cross-GPU head/row transpose
+    /// (`reports/rowsplit-attention-design.md` §3.1 steps 2 and 4). Pull form, one wave (64
+    /// lanes) per peer, 16-byte accesses, one-workgroup rendezvous — modelled on
+    /// [`DevOp::XAllGather`]'s AITER access pattern (measured 225.6 GB/s combined at a
+    /// 48-workgroup cap, `runtime/tests/tp_alltoall_bench.c`). TP8 only: the wave-per-peer map
+    /// (`p = (wave + rank) % nranks`) assumes 8 waves.
+    ///
+    /// `dir=0` (Q form): this rank's own peer-visible source is `[T][nh_l][d]` (all `T` rows,
+    /// this rank's `nh_l` heads, contiguous per row). Rank `rank` pulls, from every peer `p`,
+    /// `p`'s row band `[rank*rpr, (rank+1)*rpr)` — a CONTIGUOUS run in `p`'s source — into the
+    /// LOCAL `dst = [rpr][nh_total][d]` at head offset `p*nh_l` (strided across rows).
+    ///
+    /// `dir=1` (O form): this rank's own peer-visible source is `[rpr][nh_total][d]` (this
+    /// rank's row band, every head). Rank `rank` pulls, from every peer `p`, `p`'s head slice
+    /// `[rank*nh_l, (rank+1)*nh_l)` at each of `p`'s `rpr` rows — STRIDED in `p`'s source —
+    /// into the LOCAL `dst = [T][nh_l][d]` at row band `[p*rpr, (p+1)*rpr)` (contiguous).
+    ///
+    /// A pure permutation (no arithmetic): a copied element is byte-exact against the source
+    /// word. This op moves bytes only — the row-split attention it composes with is not
+    /// bit-identical against the head-sharded route, but that comes from a different
+    /// accumulation order in the attention kernel, not from this op.
+    /// `t0=dst` · `i0=rpr i1=nh_l i2=d i3=nh_total i4=gate i5=n_gpu i6=slot_bytes(src offset
+    /// into peer_scratch) i7=dir(0=q,1=o)`.
+    XAllToAllHeads = 160,
     /// Affine unsigned Q4, group64, BF16 scale/bias; decode uses BF16 four-input
     /// bias-correction sums and FP32 dot accumulation.
     /// `t0=C t1=A t2=W t3=scale t4=bias` · `i0=M i1=N i2=K i4=a_row0 i5=c_row0`.
     /// K must be positive and divisible by64; i3 is reserved and must be zero.
-    GemvAffineQ4 = 156,
+    GemvAffineQ4 = 161,
     /// Affine Q4 prefill: reconstruct FP32 scale*q+bias, round weights to BF16,
     /// then FP32 accumulate. Same operands as GemvAffineQ4; 64x64 output tiles.
     /// `t0=C t1=A t2=W t3=scale t4=bias` · `i0=M i1=N i2=K i4=a_row0 i5=c_row0`.
-    GemmAffineQ4 = 157,
+    GemmAffineQ4 = 162,
     /// GGUF Q8_0 projection with FP32 activations and output. The weight is `[N,K]` in canonical
     /// 34-byte blocks (FP16 scale followed by 32 signed bytes); optional FP32 bias is added before
     /// `activation` (0 = identity, 1 = SiLU).
     /// `t0=C(f32) t1=A(f32) t2=W(q8_0) t3=bias?` ·
     /// `i0=M i1=N i2=K i3=activation i4=a_row0`.
-    Q8GemmF32 = 158,
+    Q8GemmF32 = 163,
     /// FP32 LayerNorm with population variance and optional FP32 affine parameters.
     /// Numerical flag `i2` bit 0 rounds each output to BF16; bit 1 computes mean and variance
     /// with ordered FP32 accumulation.
     /// `t0=out t1=x t2=gamma? t3=beta?` · `i0=rows i1=feat i2=flags` · `f0=eps`.
-    LayerNormF32 = 159,
+    LayerNormF32 = 164,
     /// FP32 scaled residual update: `out = a + scale * b`; output may alias either input.
     /// Numerical flag `i1` bit 0 rounds the result to BF16.
     /// `t0=out t1=a t2=b` · `i0=n i1=flags` · `f0=scale`.
-    ScaledAddF32 = 160,
+    ScaledAddF32 = 165,
     /// FP32 gated linear unit over packed `[rows,2*width]`: `out = first * sigmoid(second)`.
     /// `t0=out t1=x` · `i0=rows i1=width`.
-    GluF32 = 161,
+    GluF32 = 166,
     /// FP32 causal depthwise convolution with FP16 `[channels,kernel]` weights and zero left pad.
     /// `t0=out t1=x t2=weight(f16)` · `i0=rows i1=channels i2=kernel`.
-    CausalDepthwiseConv1dF32 = 162,
+    CausalDepthwiseConv1dF32 = 167,
     /// FP32 relative-position attention. Q/K/V/position/context are `[rows,width]`, position has
     /// `2*rows-1` rows, and u/v are `[heads,width/heads]`. `left_chunks = u32::MAX` selects full
     /// attention; otherwise keys span the query chunk and `left_chunks` preceding chunks.
     /// `t0=context t1=query t2=key t3=value t4=position t5=bias_u t6=bias_v` ·
     /// `i0=rows i1=width i2=heads i3=chunk_size i4=left_chunks`.
-    RelativeAttentionF32 = 163,
+    RelativeAttentionF32 = 168,
     /// Elementwise FP32 SiLU: `out = x / (1 + exp(-x))`; output may alias input.
     /// `t0=out t1=x` · `i0=n`.
-    SiluF32 = 164,
+    SiluF32 = 169,
     /// Dense FP32 projection with optional FP32 bias and activation (0 = identity, 1 = ReLU).
     /// The weight is row-major `[N,K]`. A nonzero `weight_stride` addresses rows with that
     /// stride and also adds the weight at `implicit_onehot_col`, allowing a compiler to fuse an
@@ -1874,20 +1939,20 @@ pub enum DevOp {
     /// row-major BF16 weights instead of FP32.
     /// `t0=C t1=A t2=W t3=bias?` ·
     /// `i0=M i1=N i2=K i3=activation i4=a_row0 i5=weight_stride? i6=implicit_onehot_col i7=flags`.
-    DenseGemmF32 = 165,
+    DenseGemmF32 = 170,
     /// Gather one FP16 embedding row and convert it to FP32.
     /// `t0=out(f32) t1=table(f16) t2=token(u32)` · `i0=vocab i1=width`.
-    EmbedF16F32 = 166,
+    EmbedF16F32 = 171,
     /// One FP32 LSTM cell after the input and recurrent projections have been summed. Gates are
     /// contiguous `[input,forget,cell,output]`. `t0=h_new t1=c_new t2=gates t3=c_prev` · `i0=width`.
-    LstmCellF32 = 167,
+    LstmCellF32 = 172,
     /// Row-wise FP32 argmax. `t0=ids(u32) t1=x(f32)` · `i0=rows i1=width`.
-    ArgmaxF32 = 168,
+    ArgmaxF32 = 173,
     /// Elementwise FP32 ReLU; output may alias input. `t0=out t1=x` · `i0=n`.
-    ReluF32 = 169,
+    ReluF32 = 174,
     /// Add one FP32 vector to every row of a matrix. Output may alias the matrix.
     /// `t0=out t1=matrix t2=vector` · `i0=rows i1=width`.
-    BroadcastAddF32 = 170,
+    BroadcastAddF32 = 175,
     /// FP32 2D convolution with FP16/FP32 weights and FP32 bias. Flag bit 0 selects depthwise,
     /// bit 1 applies ReLU, bits 2..3 select output layout, bits 4..5 select input layout
     /// (`0=NHWC, 1=NFCW, 2=NCFW`), bit 6 selects FP32 weights, and bit 7 applies erf-GELU with
@@ -1895,11 +1960,11 @@ pub enum DevOp {
     /// `t0=out t1=x t2=weight t3=bias(f32)` ·
     /// `i0=in_frames i1=in_width i2=in_channels i3=out_channels i4=kernel i5=stride
     /// i6=pad_before i7=pad_after j0=flags j1=batch`.
-    Conv2dF32 = 171,
+    Conv2dF32 = 176,
     /// Pack an NCFW convolution tensor into row-major `[rows,channels*frames]`. Rows advance
     /// through width within each batch; a short final batch may be omitted.
     /// `t0=out t1=x` · `i0=rows i1=channels i2=frames i3=width i4=batches`.
-    PackNcfwRowsF32 = 172,
+    PackNcfwRowsF32 = 177,
     /// FP32 self-attention within fixed, non-overlapping row groups. Q/K/V/context are
     /// `[rows,width]`; `head_width` divides width and `group_rows` (at most 256) is the maximum
     /// number of keys visible to a query. Numerical flag `i4` bit 0 rounds each dot product to
@@ -1908,7 +1973,7 @@ pub enum DevOp {
     /// that value are padding and are neither read nor written.
     /// `t0=context t1=query t2=key t3=value t4=valid_rows?` ·
     /// `i0=rows i1=width i2=head_width i3=group_rows i4=flags`.
-    GroupedAttentionF32 = 173,
+    GroupedAttentionF32 = 178,
     /// Gather BF16 token embeddings and replace selected rows with BF16-rounded FP32 overlay
     /// rows. `overlay_index[row] == u32::MAX` selects `table[tokens[row]]`; every other value
     /// selects that overlay row. This is the generic encoder-to-decoder handoff for audio,
@@ -1916,7 +1981,7 @@ pub enum DevOp {
     /// `t0=out(bf16[rows,width]) t1=table(bf16[vocab,width]) t2=tokens(u32[rows])
     /// t3=overlay(f32[overlay_rows,width]) t4=overlay_index(u32[rows])` ·
     /// `i0=rows i1=width i2=vocab i3=overlay_rows`.
-    EmbedOverlayBf16 = 174,
+    EmbedOverlayBf16 = 179,
 }
 
 /// GLU-family `act` code for GPT-OSS's `swiglu_oai` (pair form, `f0 = alpha`, `f1 = limit`).
@@ -2088,6 +2153,11 @@ impl DevOp {
         DevOp::MoeDownMxPf,
         DevOp::RowGather,
         DevOp::PerLayerInput,
+        DevOp::MoeAiterFp8Pf,
+        DevOp::IndexTpPf,
+        DevOp::GemmLtPf,
+        DevOp::GemmBlkPf,
+        DevOp::XAllToAllHeads,
         DevOp::GemvAffineQ4,
         DevOp::GemmAffineQ4,
         DevOp::Q8GemmF32,
@@ -2283,6 +2353,11 @@ impl DevOp {
             DevOp::MoeDownMxPf => "PLOW_DOP_MOE_DOWN_MX_PF",
             DevOp::RowGather => "PLOW_DOP_ROW_GATHER",
             DevOp::PerLayerInput => "PLOW_DOP_PER_LAYER_INPUT",
+            DevOp::MoeAiterFp8Pf => "PLOW_DOP_MOE_AITER_FP8_PF",
+            DevOp::IndexTpPf => "PLOW_DOP_INDEX_TP_PF",
+            DevOp::GemmLtPf => "PLOW_DOP_GEMM_LT_PF",
+            DevOp::GemmBlkPf => "PLOW_DOP_GEMM_BLK_PF",
+            DevOp::XAllToAllHeads => "PLOW_DOP_XALLTOALL_HEADS",
             DevOp::GemvAffineQ4 => "PLOW_DOP_GEMV_AFFINE_Q4",
             DevOp::GemmAffineQ4 => "PLOW_DOP_GEMM_AFFINE_Q4",
             DevOp::Q8GemmF32 => "PLOW_DOP_Q8_GEMM_F32",
@@ -2343,10 +2418,13 @@ impl DevOp {
     /// collision-at-merge as 111 -> 113, resolved the same way (renumber the later merge).
     /// 154 -> 155 for `RowGather = 154` (the unified token batch's terminal row selection).
     /// 155 -> 156 for `PerLayerInput = 155` (Gemma-4 E-series per-layer inputs).
-    /// 156 -> 158 for affine Q4 matrix operations.
-    /// 173 -> 174 for backend-neutral grouped FP32 attention.
-    /// 174 -> 175 for backend-neutral multimodal embedding overlay.
-    pub const COUNT: u16 = 175;
+    /// 160 -> 161 for `XAllToAllHeads = 160` (row-split sparse attention's cross-GPU
+    /// head/row transpose).
+    /// 161 -> 163 for affine Q4 matrix operations. The speech/vision ops were numbered from
+    /// 156 on main; merging them after the gfx942 ops at 156-160 moved every one up by 5.
+    /// 178 -> 179 for backend-neutral grouped FP32 attention.
+    /// 179 -> 180 for backend-neutral multimodal embedding overlay.
+    pub const COUNT: u16 = 180;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///
@@ -2488,7 +2566,97 @@ pub struct DevInst64 {
     pub i: [u32; 8],
 }
 
+impl DevInst64 {
+    pub fn is_mapless_w8a16_gemm(&self) -> bool {
+        [DevOp::GemmFp8, DevOp::GemmMedFp8, DevOp::GemmSmallFp8]
+            .iter()
+            .any(|op| self.op == *op as u16)
+            && self.t[..3].iter().all(|&t| t != TENSOR_NONE16)
+            && self.t[3] == TENSOR_NONE16
+            && self.t[4] != TENSOR_NONE16
+            && self.i[0] > 0
+            && self.i[1] > 0
+            && self.i[2] > 0
+            && self.i[2] % 8 == 0
+            && self.i[6] == 0
+            && self.i[7] == 0
+    }
+
+    pub fn is_hd256_gqa2_sliding_prefill(&self) -> bool {
+        self.op == DevOp::FlashPrefill as u16
+            && self.i[2] == 16
+            && self.i[3] == 8
+            && self.i[5] == 1024
+            && self.i[6] == 256
+            && self.i[7] == 1
+            && self.t[5] != TENSOR_NONE16
+    }
+}
+
+#[cfg(test)]
+mod w8a16_tests {
+    use super::*;
+
+    #[test]
+    fn mapless_w8a16_requires_bf16_activation_and_channel_scale() {
+        let mut inst = DevInst64::default();
+        inst.op = DevOp::GemmFp8 as u16;
+        inst.t = [
+            0,
+            1,
+            2,
+            TENSOR_NONE16,
+            3,
+            TENSOR_NONE16,
+            TENSOR_NONE16,
+            TENSOR_NONE16,
+        ];
+        inst.i = [128, 2048, 3840, 0, 0, 0, 0, 0];
+        assert!(inst.is_mapless_w8a16_gemm());
+        for (slot, value) in [(3, 4), (4, TENSOR_NONE16), (1, TENSOR_NONE16)] {
+            let mut invalid = inst;
+            invalid.t[slot] = value;
+            assert!(!invalid.is_mapless_w8a16_gemm());
+        }
+        for (slot, value) in [(0, 0), (1, 0), (2, 0), (2, 3850), (6, 4), (7, 5)] {
+            let mut invalid = inst;
+            invalid.i[slot] = value;
+            assert!(!invalid.is_mapless_w8a16_gemm());
+        }
+        inst.op = DevOp::Gemm as u16;
+        assert!(!inst.is_mapless_w8a16_gemm());
+    }
+
+    #[test]
+    fn hd256_gqa2_sliding_prefill_requires_exact_geometry() {
+        let mut inst = DevInst::default();
+        inst.op = DevOp::FlashPrefill as u16;
+        inst.i = [0, 0, 16, 8, 0, 1024, 256, 1];
+        inst.t[5] = 1;
+        assert!(inst.is_hd256_gqa2_sliding_prefill());
+        assert!(inst.pack().is_hd256_gqa2_sliding_prefill());
+
+        for (slot, value) in [(3, 1), (5, 0), (6, 512), (7, 2)] {
+            let mut invalid = inst;
+            invalid.i[slot] = value;
+            assert!(!invalid.is_hd256_gqa2_sliding_prefill());
+        }
+        inst.op = DevOp::FlashPrefillFp8 as u16;
+        assert!(!inst.is_hd256_gqa2_sliding_prefill());
+    }
+}
+
 impl DevInst {
+    pub fn is_hd256_gqa2_sliding_prefill(&self) -> bool {
+        self.op == DevOp::FlashPrefill as u16
+            && self.i[2] == 16
+            && self.i[3] == 8
+            && self.i[5] == 1024
+            && self.i[6] == 256
+            && self.i[7] == 1
+            && self.t[5] != TENSOR_NONE
+    }
+
     /// Pack to the 64-byte wire format. Panics on a tensor handle that overflows
     /// the u16 wire slot or an op that populates both members of the `fj[1]`
     /// overlay — both are compiler bugs, not runtime conditions.

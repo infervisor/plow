@@ -72,7 +72,12 @@ __global__ void k_gemm_glu(bf16* C, const bf16* A, const bf16* Wg, const bf16* W
 
 struct Shape { const char* name; unsigned N, K; int glu; };
 static const Shape SHAPES[] = {
-#ifdef PLOW_BENCH_GEMM_ODOWN
+#ifdef PLOW_BENCH_GEMMA4_ALL
+    {"gate_or_up",15360,3840,0}, {"local_k_or_v",2048,3840,0},
+    {"down",3840,15360,0}, {"local_q",4096,3840,0},
+    {"local_o",3840,4096,0}, {"global_q",8192,3840,0},
+    {"global_k_or_v",512,3840,0}, {"global_o",3840,8192,0},
+#elif defined(PLOW_BENCH_GEMM_ODOWN)
     {"g12_o_local",3840,4096,0}, {"g12_o_full",3840,8192,0}, {"g12_down",3840,15360,0},
     {"g31_o_local",5376,8192,0}, {"g31_o_full",5376,16384,0}, {"g31_down",5376,21504,0},
     {"qwen_o",5120,6144,0}, {"qwen_down",5120,17408,0}, {"tail",3906,648,0},
@@ -216,7 +221,10 @@ static void cold_flush() {}
 static bf16* dev_bf16(size_t n) {
     bf16* d; CK(cudaMalloc(&d, n*sizeof(bf16)));
 #if defined(PLOW_BENCH_WS384) || defined(PLOW_BENCH_QWEN_GEMV)
-    static unsigned seed = 1;
+    static unsigned seed = [] {
+        const char* value = std::getenv("PLOW_BENCH_SEED");
+        return value ? (unsigned)std::strtoul(value, nullptr, 10) : 1u;
+    }();
     init_nonconstant<<<256, 256>>>(d, n, seed++);
     CK(cudaGetLastError());
 #else
@@ -387,7 +395,9 @@ static void bench_cublas(unsigned M) {
         const unsigned smem = PGM90_TMA_ARENA * sizeof(bf16);
         CK(cudaFuncSetAttribute(k_m64, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
 #else
-        const unsigned smem = PGM90_U256_ARENA * sizeof(bf16);
+        const unsigned smem = PGM90_WS384_ARENA * sizeof(bf16);
+        cudaFuncAttributes ws384_attr{};
+        CK(cudaFuncGetAttributes(&ws384_attr, k_ws384));
         CK(cudaFuncSetAttribute(k_ws384, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
 #endif
         std::vector<CUtensorMap> maps{bf16_map(A, M, s.K)};
@@ -564,7 +574,15 @@ int main(int argc, char** argv) {
     printf("Hopper ws384 BF16 vs cuBLASLt SMs=%d\n", P);
     if (prop.major != 9) { printf("ws384 comparison requires Hopper\n"); return 2; }
     if (argc > 1) bench_cublas(M);
-    else for (unsigned rows : {128u, 1024u, 4096u}) bench_cublas(rows);
+    else {
+#ifdef PLOW_BENCH_GEMMA4_ALL
+        for (unsigned rows : {1u, 2u, 4u, 8u, 16u, 32u, 64u, 128u, 256u,
+                              512u, 1024u, 2048u, 4096u, 8192u})
+            bench_cublas(rows);
+#else
+        for (unsigned rows : {128u, 1024u, 4096u}) bench_cublas(rows);
+#endif
+    }
 #else
     printf("PGM_BN=%d PGM_BN_GLU=%d PGM_BM=%d SMs=%d M=%u\n", PGM_BN, PGM_BN_GLU, PGM_BM, P, M);
     bench_plow(M, (unsigned)P);

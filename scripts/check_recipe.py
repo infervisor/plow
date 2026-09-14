@@ -78,7 +78,13 @@ def check_emit(recipe: dict, build_json: dict) -> list[str]:
 # Knobs whose effect lands under another define. `build_gfx942.sh` turns
 # `PLOW_DECODE_BATCH` into the GEMV width cap `GVMM`, emitted as
 # `-DPLOW_GEMV_MM=<n>`, so checking for the knob's own name would always miss.
-INDIRECT = {"PLOW_DECODE_BATCH": "PLOW_GEMV_MM", "PLOW_DECODE_TIER": "PLOW_GEMV_MM"}
+# `PLOW_K3_DECODE_GROUPED=1` puts the grouped A4W4 body on the K3 decode rows
+# (`$AX_K3_DECODE_A4W4`), whose first define is `-DPLOW_MOE_PF_A4W4=1`.
+INDIRECT = {
+    "PLOW_DECODE_BATCH": "PLOW_GEMV_MM",
+    "PLOW_DECODE_TIER": "PLOW_GEMV_MM",
+    "PLOW_K3_DECODE_GROUPED": "PLOW_MOE_PF_A4W4",
+}
 
 
 def check_objects(recipe: dict, defines: dict) -> list[str]:
@@ -121,6 +127,26 @@ def check_objects(recipe: dict, defines: dict) -> list[str]:
                 f"either the knob does not reach a define or the objects are from another build"
             )
     return notes
+
+
+def check_lowrung_tiers(recipe: dict) -> list[str]:
+    """Explicit `[[objects.lowrung]]` rungs and an UNSET `PLOW_DECODE_TIERS` collide.
+
+    build_gfx942.sh treats an unset PLOW_DECODE_TIERS as "auto": it builds lowrung{1,2,4,8}
+    from the wide object's -D set, and the recipe's explicit rungs then rebuild the same
+    directories with their own defines — last writer wins, and build_defines.json records
+    whichever ran last. A recipe that drives its own rungs must say so with an empty value.
+    """
+    obj = recipe.get("objects") or {}
+    if not obj.get("lowrung"):
+        return []
+    if "PLOW_DECODE_TIERS" in (obj.get("env") or {}):
+        return []
+    return [
+        "objects: [[objects.lowrung]] entries with PLOW_DECODE_TIERS unset in [objects].env; "
+        "build_gfx942.sh auto-builds lowrung{1,2,4,8} first and the explicit rungs overwrite "
+        'them. Set PLOW_DECODE_TIERS = "" (drive the rungs yourself) or list the tiers.'
+    ]
 
 
 def check_target(recipe: dict, build_json: dict, weights: dict) -> None:
@@ -210,6 +236,7 @@ def check(recipe_path: Path, bundle: Path | None, objects: Path | None, strict: 
         return check_provenance(recipe, strict)
 
     notes += check_provenance(recipe, strict)
+    notes += check_lowrung_tiers(recipe)
 
     if bundle:
         bj = pd.load_json(bundle / "build.json") if (bundle / "build.json").exists() else {}
@@ -290,7 +317,12 @@ def self_test() -> None:
             json.dumps({"network": "kimi-k3", "num_gpus": 8, "parallel": "tp"})
         )
         (objects / "build_defines.json").write_text(
-            json.dumps({"interp_decode": "-DPLOW_ARCH_SUFFIX=gfx942 -DPLOW_GEMV_MM=16"})
+            json.dumps(
+                {
+                    "interp_decode": "-DPLOW_ARCH_SUFFIX=gfx942 -DPLOW_GEMV_MM=16",
+                    "interp_decode_k3": "-DPLOW_ARCH_SUFFIX=gfx942 -DPLOW_GEMV_MM=16 -DPLOW_MOE_PF_A4W4=1",
+                }
+            )
         )
         (objects / "i.elf").write_bytes(b"an object")
 
@@ -304,7 +336,8 @@ def self_test() -> None:
             "plow_git": head,
             "target": {"isa": "gfx942", "units": 304, "num_gpus": 8, "parallel": "tp"},
             "emit": {"env": {"PLOW_FP8_KV": "1", "PLOW_MLA_PF_V2": "1"}},
-            "objects": {"env": {"PLOW_GEMV_MM": "16"}},
+            # `PLOW_K3_DECODE_GROUPED` reaches the object as -DPLOW_MOE_PF_A4W4 (INDIRECT).
+            "objects": {"env": {"PLOW_GEMV_MM": "16", "PLOW_K3_DECODE_GROUPED": "1"}},
             "measured": {"tok_s": 131.162},
             "artifacts": {"i.elf": pd.sha256_file(objects / "i.elf")},
         }
@@ -330,6 +363,23 @@ def self_test() -> None:
             raise AssertionError("accepted a contradicted emit knob")
         except pd.Fail as e:
             assert "contradictory PLOW_FP8_KV" in str(e), e
+
+        # Explicit rungs with PLOW_DECODE_TIERS unset would be overwritten by the
+        # script's auto-built tiers: reported. Stating the knob (even empty) is fine.
+        rung = json.loads(json.dumps(good))
+        rung["objects"]["lowrung"] = [{"max": 1, "env": {"PLOW_DECODE_BATCH": "1"}}]
+        notes = check(write(rung), bundle, objects, strict=False)
+        assert any("PLOW_DECODE_TIERS unset" in n for n in notes), notes
+        rung["objects"]["env"]["PLOW_DECODE_TIERS"] = ""
+        notes = check(write(rung), bundle, objects, strict=False)
+        assert not any("PLOW_DECODE_TIERS unset" in n for n in notes), notes
+
+        # An objects knob that reaches no define is reported (it is what
+        # `scripts/tests/test_recipe_objects_env.py` turns into a failure).
+        bad = json.loads(json.dumps(good))
+        bad["objects"]["env"]["PLOW_INVENTED"] = "1"
+        notes = check(write(bad), bundle, objects, strict=False)
+        assert any("PLOW_INVENTED" in n and "no object's -D set" in n for n in notes), notes
 
         # A knob the build never saw.
         bad = json.loads(json.dumps(good))

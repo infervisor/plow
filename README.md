@@ -39,7 +39,7 @@ model, formal verification, multi-GPU. Build-system rationale:
 [`docs/flags-reference.md`](docs/flags-reference.md).
 
 ASR architecture: [packet pipelines for Qwen3-ASR and Nemotron
-RNNT](docs/arch/18-asr-pipelines.md). Commands, protocol and validation details:
+RNNT](docs/arch/20-asr-pipelines.md). Commands, protocol and validation details:
 [ASR runtime guide](docs/runtime/asr.md).
 
 Bringing up a new model: a staged playbook — operator IR → rewrite rules →

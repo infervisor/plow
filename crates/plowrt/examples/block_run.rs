@@ -677,7 +677,12 @@ mod cuda {
             )?;
             println!("  wrote raw tensor dumps to {}", dir.display());
         }
-        if let Some(profile) = e.trace_summary()? {
+        let profile = if e.has_prefill() {
+            e.trace_summary_pf()?
+        } else {
+            e.trace_summary()?
+        };
+        if let Some(profile) = profile {
             println!("{profile}");
         }
         if ok {

@@ -1332,6 +1332,19 @@ __device__ void d_flash_merge(__nv_bfloat16* __restrict__ O, const float* __rest
 #ifndef PLOW_NV_FA_TMA
 #define PLOW_NV_FA_TMA 0
 #endif
+#ifndef PLOW_NV_FA_TMA_ROW_WARP
+#define PLOW_NV_FA_TMA_ROW_WARP 0
+#endif
+#ifndef PLOW_NV_FA_TMA_DESC
+#define PLOW_NV_FA_TMA_DESC 0
+#endif
+#ifndef PLOW_NV_FA_SCORE_SWIZZLE
+#define PLOW_NV_FA_SCORE_SWIZZLE 0
+#endif
+#define FA_PX4_SCORE_STRIDE(BKV) ((BKV) + (PLOW_NV_FA_SCORE_SWIZZLE ? 4 : 0))
+#define FA_PX4_SCORE_INDEX(ROW, COL, BKV)                                                           \
+    ((ROW) * FA_PX4_SCORE_STRIDE(BKV) +                                                            \
+     (PLOW_NV_FA_SCORE_SWIZZLE ? ((COL) ^ ((ROW) & 1)) : (COL)))
 #define FA_PX4_ELIGIBLE(HD) (PLOW_NV_FA_PIPE && PLOW_NV_FA_PX4 && (HD) == 512)
 /* ---- fp8-KV FAST-prefill staging (beat-fp8-prefill Exp1) ------------------------------------
  * The PIPE=1 cp.async ring cannot dequant e4m3 inline, so the fp8 arm stages RAW e4m3 bytes into
@@ -1396,9 +1409,14 @@ __device__ void d_flash_merge(__nv_bfloat16* __restrict__ O, const float* __rest
  * fp8 (PLOW_FP8_KV) additionally reserves the raw-e4m3 Ks8/Vs8 staging pair; the fp8mma arm
  * (PLOW_NV_FA_FP8MMA) swaps the dead bf16 Ks for Qs8+qsc (FA_PX4_KS_OR_Q8_FLOATS). */
 #define FA_PX4_SMEM_FLOATS(HD, BQ, BKV)                                                             \
-    (4 + 2 * (BQ) * (BKV) +                                                                         \
+    (4 + 2 * (BQ) * FA_PX4_SCORE_STRIDE(BKV) +                                                      \
      ((BQ) * ((HD) + FA_PRE_PAD) + (BKV) * ((HD) + FA_PRE_PAD) + 1) / 2 +                           \
      FA_PX4_KS_OR_Q8_FLOATS(HD, BQ, BKV) + FA_FP8_STAGE_FLOATS(HD, BKV))
+#define FA_PX4_TMA_DESC_SMEM_FLOATS(HD, BQ, BKV)                                                    \
+    (((4 + 2 * (BQ) * FA_PX4_SCORE_STRIDE(BKV) +                                                   \
+       ((BQ) * ((HD) + FA_PRE_PAD) + 1) / 2 + 255) &                                               \
+      ~255) +                                                                                       \
+     (BKV) * (HD))
 /* ---- PX-8: e4m3 P.V at BKV=32 (perf-data/px8-flash-fp8-pv.md) --------------------------------
  * The px4 fp8mma arm runs QK as mma.m16n8k32.e4m3 but dequants V to fp16 for a m16n8k16 P.V, so
  * the P.V costs 4x the tensor-core time of the QK for the same MACs. PX-8 makes it e4m3 too:
@@ -1481,9 +1499,11 @@ __device__ void d_flash_merge(__nv_bfloat16* __restrict__ O, const float* __rest
  * fp8-KV arm, and every sm_120a build — is untouched and byte-identical. */
 #if defined(PLOW_NV_HOPPER)
 #include "op_attention_sm90.cuh"
+/* Single-stage BF16 WGMMA never dispatches the legacy layout. */
 #define FA_PRE_SMEM_FLOATS(HD, BQ, BKV)                                                             \
     (FA_SM90_WG_ELIGIBLE(HD, BQ, BKV) && PLOW_NV_FA_PIPE                                            \
-         ? (FA_SM90_PRE_FLOATS(HD, BQ, BKV) > FA_PRE_SMEM_BASE(HD, BQ, BKV)                         \
+         ? ((FA_SM90_STAGES(HD, BKV) == 1 ||                                                      \
+             FA_SM90_PRE_FLOATS(HD, BQ, BKV) > FA_PRE_SMEM_BASE(HD, BQ, BKV))                       \
                 ? FA_SM90_PRE_FLOATS(HD, BQ, BKV)                                                   \
                 : FA_PRE_SMEM_BASE(HD, BQ, BKV))                                                    \
          : FA_PRE_SMEM_BASE(HD, BQ, BKV))
@@ -1812,12 +1832,40 @@ __device__ __forceinline__ void fa_cp_bulk_g2s(void* smem_dst, const void* gmem_
                  : "memory");
 }
 
+__device__ __forceinline__ void fa_cp_bulk_tensor_3d_g2s(
+    void* smem_dst, const void* map, int x, int y, int z, void* bar) {
+    const unsigned d = (unsigned)__cvta_generic_to_shared(smem_dst);
+    const unsigned b = (unsigned)__cvta_generic_to_shared(bar);
+    asm volatile("cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes "
+                 "[%0], [%1, {%2, %3, %4}], [%5];\n" ::
+                     "r"(d), "l"(map), "r"(x), "r"(y), "r"(z), "r"(b)
+                 : "memory");
+}
+
+template <int HD, int BKV>
+__device__ __forceinline__ __nv_bfloat16* fa_tma_sw128_at(
+    __nv_bfloat16* base, int row, int col) {
+    const int col64 = col & 63;
+    const int chunk = (col64 >> 3) ^ (row & 7);
+    return base + (col >> 6) * BKV * 64 + row * 64 + chunk * 8 + (col64 & 7);
+}
+
+template <int HD, int BKV>
+__device__ __forceinline__ const __nv_bfloat16* fa_tma_sw128_at(
+    const __nv_bfloat16* base, int row, int col) {
+    return fa_tma_sw128_at<HD, BKV>(const_cast<__nv_bfloat16*>(base), row, col);
+}
+
 /* PX-4 hd512 FULL-layer body. Same contract as d_flash_prefill (dispatched from it).
+ * TMA_DESC stages K/V through rank-3 tensor maps into the 128-byte-swizzled fragment layout;
+ * the QK, softmax, and PV arithmetic order is unchanged.
  * FP8KV (beat-fp8-prefill Exp1): the K/V cache is e4m3 (1 byte/elem) + a PER-ROW f32 dequant
  * scale. Raw bytes are cp.async-staged into Ks8/Vs8, dequanted (unscaled) to the bf16 Ks/Vs the
  * mma reads; the K-scale post-multiplies the score tile per kv column, the V-scale folds into the
  * P fragment — identical numerics to the PIPE=0 reference arm (d_flash_prefill FP8KV). */
-template <int HD, int BQ, int BKV, bool FP8KV = false>
+template <int HD, int BQ, int BKV, bool FP8KV = false, int THREADS = PLOW_NV_THREADS,
+          bool TMA_DESC = false, bool TMA_ELIDE_CTA_AFTER_WAIT = false,
+          bool SNAKE_WORK = false>
 __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict__ mlpart,
                                     const __nv_bfloat16* __restrict__ Q,
                                     const __nv_bfloat16* __restrict__ K,
@@ -1827,13 +1875,19 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
                                     unsigned window, unsigned nsplit, unsigned kv_stride,
                                     unsigned kv_mask, float scale, unsigned slice, unsigned nblk,
                                     float* lds, const float* __restrict__ k_scale = nullptr,
-                                    const float* __restrict__ v_scale = nullptr) {
-    static_assert(HD == 512 && BQ == 32 && BKV == 16, "px4 arm is the hd512 FULL-layer tiling");
-    static_assert((int)PLOW_NV_WARPS == 8, "px4 warp grids assume 8 warps");
+                                    const float* __restrict__ v_scale = nullptr,
+                                    const void* tma_maps = nullptr) {
+    static_assert(HD == 512 && (BQ == 32 || BQ == 64) && BKV == 16,
+                  "px4 arm requires the hd512/BKV16 tiling");
+    static_assert(THREADS == BQ * 8, "px4 needs one warp per query/kv/hd partition");
+    static_assert(!TMA_DESC || (!FP8KV && PLOW_NV_FA_TMA),
+                  "descriptor staging requires the BF16 TMA arm");
+    static_assert(!TMA_ELIDE_CTA_AFTER_WAIT || TMA_DESC,
+                  "post-wait CTA barrier elision requires descriptor TMA");
     constexpr int PAD = FA_PRE_PAD;
-    /* QK: 8 warps = 2(khalf: hd 0..255 / 256..511) x 2(query 16-row half) x 2(kv 8-col half). */
+    /* QK: 2(khalf) x BQ/16(query groups) x 2(kv halves). */
     constexpr int KSTEPS_H = HD / 2 / 16; /* 16 k16 steps per hd half */
-    /* P.V: 2 query-warp-rows x 4 hd-warp-cols (as T4/T5); softmax rides this partition. */
+    /* P.V: BQ/16 query-warp-rows x 4 hd-warp-cols; softmax rides this partition. */
     constexpr int WPV_N = 4;
     constexpr int HDW = HD / WPV_N;  /* 128 */
     constexpr int NJ_PV = HDW / 8;   /* 16 */
@@ -1842,9 +1896,9 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
 
     unsigned long long* mbar = (unsigned long long*)lds; /* [0]=K, [1]=V (TMA arm only) */
     (void)mbar;
-    float* SsA = lds + 4;                                /* [BQ][BKV] scores, hd 0..255 */
-    float* SsB = SsA + BQ * BKV;                         /* [BQ][BKV] scores, hd 256..511 */
-    __nv_bfloat16* Qs = (__nv_bfloat16*)(SsB + BQ * BKV); /* [BQ][HD+PAD] */
+    float* SsA = lds + 4; /* [BQ][FA_PX4_SCORE_STRIDE(BKV)] scores, hd 0..255 */
+    float* SsB = SsA + BQ * FA_PX4_SCORE_STRIDE(BKV); /* scores, hd 256..511 */
+    __nv_bfloat16* Qs = (__nv_bfloat16*)(SsB + BQ * FA_PX4_SCORE_STRIDE(BKV));
     constexpr int PAD8 = FA_FP8_PAD8_K; /* fp8 staging row pad (32; see FA_FP8_PAD8) */
     __nv_bfloat16* Ks;      /* [BKV][HD+PAD] natural (bf16 arms; DEAD under fp8mma) */
     __nv_bfloat16* Vs;      /* [BKV][HD+PAD] natural */
@@ -1881,6 +1935,11 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
         Ks8 = (unsigned char*)(Vs + BKV * (HD + PAD));
         Vs8 = Ks8 + BKV * (HD + PAD8);
     }
+    if constexpr (TMA_DESC) {
+        const uintptr_t after_q = reinterpret_cast<uintptr_t>(Qs + BQ * (HD + PAD));
+        Ks = reinterpret_cast<__nv_bfloat16*>((after_q + 1023u) & ~uintptr_t(1023u));
+        Vs = Ks + BKV * HD;
+    }
     (void)qsc_s;
     (void)ksc_s;
     (void)vsc_s;
@@ -1893,13 +1952,29 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
     const unsigned n_qt = (seq_q + BQ - 1) / BQ;
     const unsigned n_work = n_qt * n_head * nsplit;
     const float lscale = FA_SCALE(scale);
-    const int qk_kh = warp >> 2, qk_wm = (warp >> 1) & 1, qk_wn = warp & 1;
+    constexpr int QK_WARPS_PER_HALF = (BQ / 16) * 2;
+    const int qk_kh = warp / QK_WARPS_PER_HALF;
+    const int qk_wm = (warp % QK_WARPS_PER_HALF) >> 1;
+    const int qk_wn = warp & 1;
     const int pv_wm = warp >> 2, pv_wn = warp & 3;
     /* This lane's softmax/P.V ownership: rows r0 / r0+8 of the q-tile, kv cols c0,c0+1,c0+8,c0+9. */
     const int r0 = pv_wm * 16 + (lane >> 2);
     const int c0 = (lane & 3) * 2;
 
-    for (unsigned w = slice; w < n_work; w += nblk) {
+    for (unsigned ordinal = slice, wave = 0; ordinal < n_work;
+         ordinal += nblk, ++wave) {
+        unsigned w = ordinal;
+        if constexpr (SNAKE_WORK) {
+            /* Pair the light and heavy causal waves assigned to a CTA. Reversing odd waves
+             * changes only the order of independent (query tile, head) work items; each item's
+             * BKV16 accumulation order and output address remain unchanged. */
+            if (seq_q == 4096u && q_pos0 == 0u && (wave & 1u)) {
+                const unsigned wave_base = ordinal - slice;
+                const unsigned remaining = n_work - wave_base;
+                const unsigned wave_count = remaining < nblk ? remaining : nblk;
+                w = wave_base + wave_count - 1u - slice;
+            }
+        }
         const unsigned sp = w % nsplit;
         const unsigned h = (w / nsplit) % n_head;
         const unsigned qt = w / (nsplit * n_head);
@@ -1924,7 +1999,7 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
         }
 
         __syncthreads(); /* previous item's Qs/Ks/Vs/Ss reads done before restage */
-        for (int idx = tid; idx < BQ * HD; idx += (int)PLOW_NV_THREADS) {
+        for (int idx = tid; idx < BQ * HD; idx += THREADS) {
             int r = idx / HD, c = idx % HD;
             __nv_bfloat16 v = __float2bfloat16(0.f);
             if (q0 + r < seq_q) v = Qh[(size_t)r * n_head * HD + c];
@@ -1932,7 +2007,8 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
         }
 #if PLOW_NV_FA_FP8MMA && defined(PLOW_FP8_KV)
         /* fp8mma (Lever A): quantize Q -> e4m3 ONCE per q-tile (amortized over the whole KV loop).
-         * 8 warps x 4 rows each; 8 lanes per row cover HD/8=64 elems. Per-row amax -> qinv, the
+         * THREADS/32 warps x 4 rows each; 8 lanes per row cover HD/8=64 elems.
+         * Per-row amax -> qinv, the
          * inverse scale lands in qsc_s and multiplies the score with the k-scale (both factor out
          * of the e4m3 dot exactly as the decode/GEMM w8a8 scales do). Zero rows (pad) => qinv 0 =>
          * stored bytes 0, scale 0 — masked columns aside, a zero Q row yields zero scores. */
@@ -1982,6 +2058,8 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
             fa_mbar_init(&mbar[0], 1);
             fa_mbar_init(&mbar[1], 1);
         }
+        if constexpr (TMA_DESC)
+            asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
         unsigned kph = 0, vph = 0; /* mbarrier phase counters (one flip per stage) */
 #endif
 
@@ -2009,27 +2087,72 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
 #error "PLOW_NV_FA_TMA staging is bf16-only; build fp8-KV prefill with PLOW_NV_FA_PIPE=0"
 #endif
         /* TMA staging: one cp.async.bulk per contiguous [kv][hd] row, counted on mbar[K|V].
+         * The BQ64/BKV16 object distributes those row transfers over one warp; issuing all 16
+         * from lane zero leaves the TMA path on the critical path at the exact 4K/8K shapes.
          * Ragged tail V rows are ZEROED (stale smem could hold NaN bits; 0*NaN != 0 in the mma).
          * Ragged K rows only feed masked score columns, which the softmax never reads. */
         auto stageK = [&](unsigned kv0) {
             const unsigned nrows = (hi > kv0) ? ((hi - kv0 < (unsigned)BKV) ? hi - kv0 : (unsigned)BKV) : 0;
+            if constexpr (TMA_DESC) {
+                if (tid == 0) {
+                    fa_mbar_expect_tx(&mbar[0], BKV * HD * 2);
+#pragma unroll
+                    for (int c = 0; c < HD; c += 64)
+                        fa_cp_bulk_tensor_3d_g2s(
+                            fa_tma_sw128_at<HD, BKV>(Ks, 0, c), tma_maps, c,
+                            int(kv0 & kv_mask), int(hkv), &mbar[0]);
+                }
+                return;
+            }
+#if PLOW_NV_FA_TMA_ROW_WARP
+            static_assert(BKV <= 32, "row-warp TMA staging requires at most one warp of rows");
+            if (tid == 0) fa_mbar_expect_tx(&mbar[0], nrows * HD * 2);
+            __syncwarp();
+            if ((unsigned)tid < nrows)
+                fa_cp_bulk_g2s(&Ks[tid * (HD + PAD)],
+                               Kb + (size_t)((kv0 + (unsigned)tid) & kv_mask) * HD,
+                               HD * 2, &mbar[0]);
+#else
             if (tid == 0) {
                 fa_mbar_expect_tx(&mbar[0], nrows * HD * 2);
                 for (unsigned r = 0; r < nrows; r++)
                     fa_cp_bulk_g2s(&Ks[r * (HD + PAD)], Kb + (size_t)((kv0 + r) & kv_mask) * HD,
                                    HD * 2, &mbar[0]);
             }
+#endif
         };
         auto stageV = [&](unsigned kv0) {
             const unsigned nrows = (hi > kv0) ? ((hi - kv0 < (unsigned)BKV) ? hi - kv0 : (unsigned)BKV) : 0;
+            if constexpr (TMA_DESC) {
+                if (tid == 0) {
+                    fa_mbar_expect_tx(&mbar[1], BKV * HD * 2);
+                    const char* const vmap = static_cast<const char*>(tma_maps) + 128;
+#pragma unroll
+                    for (int c = 0; c < HD; c += 64)
+                        fa_cp_bulk_tensor_3d_g2s(
+                            fa_tma_sw128_at<HD, BKV>(Vs, 0, c), vmap, c,
+                            int(kv0 & kv_mask), int(hkv), &mbar[1]);
+                }
+                return;
+            }
+#if PLOW_NV_FA_TMA_ROW_WARP
+            static_assert(BKV <= 32, "row-warp TMA staging requires at most one warp of rows");
+            if (tid == 0) fa_mbar_expect_tx(&mbar[1], nrows * HD * 2);
+            __syncwarp();
+            if ((unsigned)tid < nrows)
+                fa_cp_bulk_g2s(&Vs[tid * (HD + PAD)],
+                               Vb + (size_t)((kv0 + (unsigned)tid) & kv_mask) * HD,
+                               HD * 2, &mbar[1]);
+#else
             if (tid == 0) {
                 fa_mbar_expect_tx(&mbar[1], nrows * HD * 2);
                 for (unsigned r = 0; r < nrows; r++)
                     fa_cp_bulk_g2s(&Vs[r * (HD + PAD)], Vb + (size_t)((kv0 + r) & kv_mask) * HD,
                                    HD * 2, &mbar[1]);
             }
+#endif
             if (nrows < (unsigned)BKV)
-                for (int idx = tid; idx < (BKV - (int)nrows) * HD; idx += (int)PLOW_NV_THREADS) {
+                for (int idx = tid; idx < (BKV - (int)nrows) * HD; idx += THREADS) {
                     int r = (int)nrows + idx / HD, c = idx % HD;
                     Vs[r * (HD + PAD) + c] = __float2bfloat16(0.f);
                 }
@@ -2041,7 +2164,7 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
         constexpr int HCH8 = HD / 16;
         auto stageK = [&](unsigned kv0) {
             if constexpr (FP8KV) {
-                for (int L = tid; L < BKV * HCH8; L += (int)PLOW_NV_THREADS) {
+                for (int L = tid; L < BKV * HCH8; L += THREADS) {
                     int r = L / HCH8, c16 = (L % HCH8) * 16;
                     unsigned kv = kv0 + (unsigned)r;
                     bool in = (kv < hi);
@@ -2049,7 +2172,7 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
                     fa_cp_async_cg16(&Ks8[r * (HD + PAD8) + c16], g, in ? 16 : 0);
                 }
             } else {
-                for (int L = tid; L < BKV * HCH; L += (int)PLOW_NV_THREADS) {
+                for (int L = tid; L < BKV * HCH; L += THREADS) {
                     int r = L / HCH, c8 = (L % HCH) * 8;
                     unsigned kv = kv0 + (unsigned)r;
                     bool in = (kv < hi);
@@ -2061,7 +2184,7 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
         };
         auto stageV = [&](unsigned kv0) {
             if constexpr (FP8KV) {
-                for (int L = tid; L < BKV * HCH8; L += (int)PLOW_NV_THREADS) {
+                for (int L = tid; L < BKV * HCH8; L += THREADS) {
                     int r = L / HCH8, c16 = (L % HCH8) * 16;
                     unsigned kv = kv0 + (unsigned)r;
                     bool in = (kv < hi);
@@ -2069,7 +2192,7 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
                     fa_cp_async_cg16(&Vs8[r * (HD + PAD8) + c16], g, in ? 16 : 0);
                 }
             } else {
-                for (int L = tid; L < BKV * HCH; L += (int)PLOW_NV_THREADS) {
+                for (int L = tid; L < BKV * HCH; L += THREADS) {
                     int r = L / HCH, c8 = (L % HCH) * 8;
                     unsigned kv = kv0 + (unsigned)r;
                     bool in = (kv < hi);
@@ -2083,14 +2206,14 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
          * (reuses the exact fp8v8->bf16v8 idiom). Scales apply later (K post-mma, V into P). The
          * caller fences Ks8/Vs8 visible (post-wait __syncthreads) before and Ks/Vs after. */
         auto dequantK = [&]() {
-            for (int L = tid; L < BKV * HCH; L += (int)PLOW_NV_THREADS) {
+            for (int L = tid; L < BKV * HCH; L += THREADS) {
                 int r = L / HCH, c8 = (L % HCH) * 8;
                 bf16v8 d = fp8v8_to_bf16v8(ld_glob_fp8v8(&Ks8[r * (HD + PAD8) + c8]));
                 *(uint4*)&Ks[r * (HD + PAD) + c8] = *(const uint4*)&d;
             }
         };
         auto dequantV = [&]() {
-            for (int L = tid; L < BKV * HCH; L += (int)PLOW_NV_THREADS) {
+            for (int L = tid; L < BKV * HCH; L += THREADS) {
                 int r = L / HCH, c8 = (L % HCH) * 8;
                 bf16v8 d = fp8v8_to_bf16v8(ld_glob_fp8v8(&Vs8[r * (HD + PAD8) + c8]));
                 *(uint4*)&Vs[r * (HD + PAD) + c8] = *(const uint4*)&d;
@@ -2136,7 +2259,7 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
             }
 #endif
             FA_PX4_WAIT_K();
-            __syncthreads();
+            if constexpr (!TMA_ELIDE_CTA_AFTER_WAIT) __syncthreads();
 #if !(PLOW_NV_FA_FP8MMA && defined(PLOW_FP8_KV)) && !PLOW_NV_FA_TMA
             /* fp8 NO-GO arm: K[t] landed as raw e4m3 in Ks8 — dequant (unscaled) to bf16 Ks
              * before QK. The fp8mma arm (Lever A) consumes Ks8 RAW below: no pass, no barrier.
@@ -2148,7 +2271,7 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
             }
 #endif
 
-            /* S = Q.K^T, all 8 warps: this warp contracts one HD HALF for a 16(query) x 8(kv)
+            /* S = Q.K^T, all warps: this warp contracts one HD HALF for a 16(query) x 8(kv)
              * block; the halves land in SsA/SsB and are summed at the softmax read. */
             {
                 float acc[4] = {0.f, 0.f, 0.f, 0.f};
@@ -2203,7 +2326,10 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
                         {
                             const int n = qk_wn * 8 + (lane & 7);
                             const int kcol = khoff + kf * 16 + ((lane >> 3) & 1) * 8;
-                            fa_ldmatrix_x2(bf, &Ks[n * (HD + PAD) + kcol]);
+                            const __nv_bfloat16* const kp =
+                                TMA_DESC ? fa_tma_sw128_at<HD, BKV>(Ks, n, kcol)
+                                         : &Ks[n * (HD + PAD) + kcol];
+                            fa_ldmatrix_x2(bf, kp);
                         }
                         fa_mma(acc, af, bf, acc);
                     }
@@ -2217,10 +2343,17 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
                     const float ks0 = ksc_s[kc0] * lscale, ks1 = ksc_s[kc0 + 1] * lscale;
                     const int qlo = qk_wm * 16 + (lane / 4);
                     const float q0s = qsc_s[qlo], q1s = qsc_s[qlo + 8];
+#if PLOW_NV_FA_SCORE_SWIZZLE
+                    Sdst[FA_PX4_SCORE_INDEX(qlo, kc0, BKV)] = acc[0] * ks0 * q0s;
+                    Sdst[FA_PX4_SCORE_INDEX(qlo, kc0 + 1, BKV)] = acc[1] * ks1 * q0s;
+                    Sdst[FA_PX4_SCORE_INDEX(qlo + 8, kc0, BKV)] = acc[2] * ks0 * q1s;
+                    Sdst[FA_PX4_SCORE_INDEX(qlo + 8, kc0 + 1, BKV)] = acc[3] * ks1 * q1s;
+#else
                     *(float2*)&Sdst[qlo * BKV + kc0] =
                         make_float2(acc[0] * ks0 * q0s, acc[1] * ks1 * q0s);
                     *(float2*)&Sdst[(qlo + 8) * BKV + kc0] =
                         make_float2(acc[2] * ks0 * q1s, acc[3] * ks1 * q1s);
+#endif
                 } else
 #endif
 #pragma unroll
@@ -2236,7 +2369,7 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
                         const unsigned kvr = kv0 + (unsigned)kc;
                         if (kvr < hi) sc = ksc[kvr & kv_mask];
                     }
-                    Sdst[qr * BKV + kc] = acc[e] * lscale * sc;
+                    Sdst[FA_PX4_SCORE_INDEX(qr, kc, BKV)] = acc[e] * lscale * sc;
                 }
             }
             __syncthreads(); /* Ss halves published; Ks free for K[t+1] */
@@ -2260,7 +2393,7 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
                  * activation magnitude, comfortably fp16; P then stays UNSCALED in [0,1] and
                  * the softmax path drops its per-element scale entirely). Vs holds half. */
                 constexpr int HCH8 = HD / 16;
-                for (int L = tid; L < BKV * HCH8; L += (int)PLOW_NV_THREADS) {
+                for (int L = tid; L < BKV * HCH8; L += THREADS) {
                     const int r = L / HCH8, c16 = (L % HCH8) * 16;
                     const __half2 vs2 = __float2half2_rn(vsc_s[r]);
                     const uint4 raw = *(const uint4*)&Vs8[r * (HD + PAD8) + c16];
@@ -2306,10 +2439,21 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
 #if PLOW_NV_FA_FP8MMA && defined(PLOW_FP8_KV)
                     if constexpr (FP8KV) {
                         /* col pairs (c0,c0+1) and (c0+8,c0+9) are adjacent: 4 LDS.64. */
+#if PLOW_NV_FA_SCORE_SWIZZLE
+                        const float2 a0 = make_float2(SsA[FA_PX4_SCORE_INDEX(row, c0, BKV)],
+                                                     SsA[FA_PX4_SCORE_INDEX(row, c0 + 1, BKV)]);
+                        const float2 b0 = make_float2(SsB[FA_PX4_SCORE_INDEX(row, c0, BKV)],
+                                                     SsB[FA_PX4_SCORE_INDEX(row, c0 + 1, BKV)]);
+                        const float2 a1 = make_float2(SsA[FA_PX4_SCORE_INDEX(row, c0 + 8, BKV)],
+                                                     SsA[FA_PX4_SCORE_INDEX(row, c0 + 9, BKV)]);
+                        const float2 b1 = make_float2(SsB[FA_PX4_SCORE_INDEX(row, c0 + 8, BKV)],
+                                                     SsB[FA_PX4_SCORE_INDEX(row, c0 + 9, BKV)]);
+#else
                         const float2 a0 = *(const float2*)&SsA[row * BKV + c0];
                         const float2 b0 = *(const float2*)&SsB[row * BKV + c0];
                         const float2 a1 = *(const float2*)&SsA[row * BKV + c0 + 8];
                         const float2 b1 = *(const float2*)&SsB[row * BKV + c0 + 8];
+#endif
                         s[0] = a0.x + b0.x; s[1] = a0.y + b0.y;
                         s[2] = a1.x + b1.x; s[3] = a1.y + b1.y;
 #pragma unroll
@@ -2329,7 +2473,9 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
                         const int kv = (int)kv0 + col;
                         bool masked = ((unsigned)col >= rmax) || (kv > qabs);
                         if (window) masked |= ((unsigned)(qabs - kv) >= window);
-                        s[ci] = masked ? FA_NEG_INF : SsA[row * BKV + col] + SsB[row * BKV + col];
+                        s[ci] = masked ? FA_NEG_INF
+                                       : SsA[FA_PX4_SCORE_INDEX(row, col, BKV)] +
+                                             SsB[FA_PX4_SCORE_INDEX(row, col, BKV)];
                         mx = fmaxf(mx, s[ci]);
                     }
                     mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 1));
@@ -2415,7 +2561,20 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
             }
 #else
             FA_PX4_WAIT_V();
-            __syncthreads(); /* all threads' V rows visible */
+            if constexpr (TMA_DESC) {
+                for (int idx = tid; idx < (BKV - (int)rmax) * HD; idx += THREADS) {
+                    const int row = (int)rmax + idx / HD;
+                    const int col = idx % HD;
+                    *fa_tma_sw128_at<HD, BKV>(Vs, row, col) = __float2bfloat16(0.0f);
+                }
+            }
+            if constexpr (!TMA_ELIDE_CTA_AFTER_WAIT) {
+                __syncthreads(); /* all threads' V rows visible */
+            } else if (rmax < (unsigned)BKV) {
+                /* Every consumer waited on the descriptor transaction itself. Only a ragged
+                 * tail needs a CTA rendezvous because its zero fill is distributed by thread. */
+                __syncthreads();
+            }
 #if !PLOW_NV_FA_TMA
             /* fp8: V[t] landed as raw e4m3 in Vs8 — dequant (unscaled; V-scale is folded into P). */
             if constexpr (FP8KV) {
@@ -2430,7 +2589,12 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
 #pragma unroll
             for (int nj = 0; nj < NJ_PV; nj++) {
                 unsigned bf[2];
-                fa_ldmatrix_x2_trans(bf, &Vs[(lane % 16) * (HD + PAD) + pv_wn * HDW + nj * 8]);
+                const int vrow = lane % 16;
+                const int vcol = pv_wn * HDW + nj * 8;
+                const __nv_bfloat16* const vp =
+                    TMA_DESC ? fa_tma_sw128_at<HD, BKV>(Vs, vrow, vcol)
+                             : &Vs[vrow * (HD + PAD) + vcol];
+                fa_ldmatrix_x2_trans(bf, vp);
 #if PLOW_NV_FA_FP8MMA && defined(PLOW_FP8_KV)
                 if constexpr (FP8KV) fa_mma_f16(oacc[nj], af_pv, bf, oacc[nj]);
                 else fa_mma(oacc[nj], af_pv, bf, oacc[nj]);
@@ -3655,15 +3819,41 @@ __device__ void d_flash_prefill_mux(const int* __restrict__ req, float* __restri
 #if PLOW_NV_PACKED_REQUEST
     if (req) {
         const unsigned count=(unsigned)req[0];
+#if defined(PLOW_NV_HOPPER) && PLOW_NV_FA_PIPE && defined(PLOW_NV_PACKED_FA_WGMMA) && PLOW_NV_PACKED_FA_WGMMA
+        if constexpr (FA_SM90_WG_ELIGIBLE(HD, BQ, BKV)) {
+            if (O && nsplit == 1) {
+                // Packed mapkv holds per-slot pointers, not a CUtensorMap pair.
+#if defined(PLOW_NV_PACKED_FA_TMA) && PLOW_NV_PACKED_FA_TMA
+                const void* packed_maps = mapkv;
+#else
+                const void* packed_maps = nullptr;
+#endif
+                d_flash_prefill<HD,BQ,BKV>(Opart,mlpart,Q,K,V,O,seq_q,seq_kv,
+                    n_head,n_kv_head,q_pos0,window,nsplit,kv_stride,kv_mask,
+                    scale,slice,nblk,lds,req,packed_maps);
+                const unsigned real=req[1+4*(count-1)]+req[2+4*(count-1)];
+                const size_t begin=(size_t)real*n_head*HD, end=(size_t)seq_q*n_head*HD;
+                for (size_t i=begin+(size_t)slice*blockDim.x+threadIdx.x;i<end;i+=(size_t)nblk*blockDim.x)
+                    O[i]=__float2bfloat16(0.0f);
+                return;
+            }
+        }
+#endif
         for (unsigned r=0; r<count; ++r) {
             const unsigned q0=req[1+4*r], qlen=req[2+4*r], slot=req[3+4*r], kvlen=req[4+4*r];
             const size_t qoff=(size_t)q0*n_head*HD;
             const size_t kvoff=(size_t)slot*n_kv_head*kv_stride*HD;
+#if PLOW_NV_FA_PIPE
             const void* descriptor=mapkv ? (const void*)((const uint64_t*)mapkv)[slot] : nullptr;
+#endif
             d_flash_prefill<HD,BQ,BKV>(Opart+qoff*nsplit,
                 mlpart+(size_t)q0*n_head*nsplit*2, Q+qoff,K+kvoff,V+kvoff,
                 O ? O+qoff : nullptr,qlen,kvlen,n_head,n_kv_head,kvlen-qlen,
-                window,nsplit,kv_stride,kv_mask,scale,slice,nblk,lds,nullptr,descriptor);
+                window,nsplit,kv_stride,kv_mask,scale,slice,nblk,lds
+#if PLOW_NV_FA_PIPE
+                ,nullptr,descriptor
+#endif
+            );
             __syncthreads();
         }
         if (O) {
@@ -3710,6 +3900,61 @@ __device__ void d_flash_prefill_mux(const int* __restrict__ req, float* __restri
         }
     }
 }
+
+#if PLOW_FP8_KV && PLOW_NV_PACKED_REQUEST
+template <int HD>
+__device__ void d_flash_prefill_fp8_mux(
+    const int* __restrict__ req, float* __restrict__ Opart, float* __restrict__ mlpart,
+    const __nv_bfloat16* __restrict__ Q, const uint8_t* __restrict__ K,
+    const uint8_t* __restrict__ V, __nv_bfloat16* __restrict__ O,
+    const float* __restrict__ k_scale, const float* __restrict__ v_scale,
+    unsigned seq_q, unsigned seq_kv, unsigned n_head, unsigned n_kv_head,
+    unsigned q_pos0, unsigned window, unsigned nsplit, unsigned kv_stride,
+    unsigned kv_mask, float scale, unsigned slice, unsigned nblk, float* lds) {
+    const unsigned count = req ? (unsigned)req[0] : 1;
+    for (unsigned r = 0; r < count; ++r) {
+        const unsigned q0 = req ? (unsigned)req[1 + 4*r] : 0;
+        const unsigned qlen = req ? (unsigned)req[2 + 4*r] : seq_q;
+        const unsigned slot = req ? (unsigned)req[3 + 4*r] : 0;
+        const unsigned kvlen = req ? (unsigned)req[4 + 4*r] : seq_kv;
+        const unsigned pos0 = req ? kvlen - qlen : q_pos0;
+        const size_t qoff = (size_t)q0 * n_head * HD;
+        const size_t soff = (size_t)slot * n_kv_head * kv_stride;
+        // KV offsets are bytes; scale offsets count F32 rows.
+#define PLOW_FP8_REQUEST_ARGS \
+        Opart + qoff * nsplit, mlpart + (size_t)q0 * n_head * nsplit * 2, Q + qoff, \
+        (const __nv_bfloat16*)(K + soff * HD), (const __nv_bfloat16*)(V + soff * HD), \
+        O ? O + qoff : nullptr, qlen, kvlen, n_head, n_kv_head, pos0, window, nsplit, \
+        kv_stride, kv_mask, scale, slice, nblk, lds, k_scale + soff, v_scale + soff
+#if PLOW_NV_FA_PIPE
+#if PLOW_NV_FA_FP8MMA
+        if constexpr (HD == 256) {
+            d_flash_prefill_px23<256, 64, 32>(PLOW_FP8_REQUEST_ARGS);
+        } else {
+#if PLOW_NV_FA_FP8PV
+            d_flash_prefill_px8<512, 32, 32, true>(PLOW_FP8_REQUEST_ARGS);
+#else
+            d_flash_prefill_px4<512, 32, 16, true>(PLOW_FP8_REQUEST_ARGS);
+#endif
+        }
+#else
+        __trap();
+#endif
+#else
+        d_flash_prefill<HD, HD == 256 ? 64 : 32, HD == 256 ? 32 : 16, true>(PLOW_FP8_REQUEST_ARGS);
+#endif
+#undef PLOW_FP8_REQUEST_ARGS
+        __syncthreads();
+    }
+    if (req && O) {
+        const unsigned real = req[1 + 4*(count-1)] + req[2 + 4*(count-1)];
+        const size_t end = (size_t)seq_q * n_head * HD;
+        for (size_t i = (size_t)real * n_head * HD + (size_t)slice * blockDim.x + threadIdx.x;
+             i < end; i += (size_t)nblk * blockDim.x)
+            O[i] = __float2bfloat16(0.0f);
+    }
+}
+#endif
 
 #if PLOW_MIXED_STEP
 template <int HD, int BQ, int BKV>

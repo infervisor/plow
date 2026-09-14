@@ -94,7 +94,7 @@ int main(int argc, char** argv) {
         NSString* src = [NSString stringWithContentsOfFile:@(argv[1]) encoding:NSUTF8StringEncoding error:&error];
         assert(src);
         // Select one partition so the shared CPU cases can verify exclusive ownership.
-        src = [src stringByAppendingString:@"\nkernel void affine_check(device const Inst* ins [[buffer(0)]], device const ulong* tab [[buffer(7)]], device uint* fault [[buffer(9)]], constant uint& slice [[buffer(10)]], uint lid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) { threadgroup float tile[TILE_FLOATS]; Inst in=ins[0]; op_affine_q4(in,tab,slice,in.blocks,in.op==157,tile,lid,sg,lane); }\n"];
+        src = [src stringByAppendingString:@"\nkernel void affine_check(device const Inst* ins [[buffer(0)]], device const ulong* tab [[buffer(7)]], device uint* fault [[buffer(9)]], constant uint& slice [[buffer(10)]], uint lid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) { threadgroup float tile[TILE_FLOATS]; Inst in=ins[0]; op_affine_q4(in,tab,slice,in.blocks,in.op==162,tile,lid,sg,lane); }\n"];
         MTLCompileOptions* opts = [MTLCompileOptions new];
         opts.mathMode = MTLMathModeSafe; opts.languageVersion = MTLLanguageVersion3_2;
         id<MTLLibrary> lib = [dev newLibraryWithSource:src options:opts error:&error];

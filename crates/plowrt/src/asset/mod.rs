@@ -28,6 +28,9 @@ pub mod checkpoint;
 #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
 pub use checkpoint::Checkpoint;
 pub mod devblob;
+/// Packet extensions: finding `extension.pkt` beside a serving directory and applying the
+/// six-rule load contract in `plow_asset::extension` (docs/arch/19, phases 2 and 3).
+pub mod extension;
 #[cfg(feature = "gguf")]
 pub mod gguf;
 /// The DSA lightning indexer's fp8 -> bf16 upcast. Gated with `checkpoint` for the same

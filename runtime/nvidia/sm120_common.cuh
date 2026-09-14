@@ -17,6 +17,7 @@
  */
 #pragma once
 #include "op_attention.cuh"
+#include <cuda_fp8.h>
 
 /* Block geometry. The interpreter launches __launch_bounds__(256,1), so these are fixed. */
 #define PLOW_NV_LANE 32u
@@ -31,6 +32,10 @@ __device__ __forceinline__ bf16v8 bf16v8_zero() {
     bf16v8 r;
     *(uint4*)&r = make_uint4(0u, 0u, 0u, 0u);
     return r;
+}
+
+__device__ __forceinline__ unsigned short pack_fp8_e4m3(float lo, float hi) {
+    return (unsigned short)__nv_cvt_float2_to_fp8x2(make_float2(lo, hi), __NV_SATFINITE, __NV_E4M3);
 }
 
 /* Block-wide f32 sum over 8 warps of 32. `part` is >= PLOW_NV_WARPS floats of smem.

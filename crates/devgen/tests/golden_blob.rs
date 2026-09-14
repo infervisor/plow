@@ -1192,3 +1192,119 @@ fn the_occupancy_floor_is_configurable() {
     // A floor of 100 demands a perfectly packed dispatch, which this tiny fixture is not.
     assert!(findings("100", "floor_full") > 0);
 }
+
+// ===== PLOW_EMIT_REWRITE ==========================================================================
+//
+// The egglog rewrite's extracted fused graph decides each residual/norm seam. On these fixtures every
+// seam the hand arms fuse is a rule site, so knob on (default or explicit) must be the hand blob byte
+// for byte, `=0` must ignore the sites entirely, and the default without sites falls back to the hand
+// fusions.
+
+fn emit_rewrite(dir: &Path, knob: Option<&str>, sites: Option<devgen::RewriteSites>) -> Vec<u8> {
+    let env: Vec<(&str, &str)> = knob.map(|v| ("PLOW_EMIT_REWRITE", v)).into_iter().collect();
+    let _env = EnvScope::set(&env);
+    let out = dir.join("model.pkt");
+    devgen::run(devgen::EmitArgs {
+        dir: dir.to_path_buf(),
+        ctx: 512,
+        out: out.to_str().unwrap().to_string(),
+        n_cu: 128,
+        tp: 1,
+        block_spec: None,
+        embed_cubin: None,
+        embed_hsaco: None,
+        rope_gen: true,
+        l2_layout: None,
+        gpu: String::new(),
+        arch: String::new(),
+        emit_cfg: None,
+        whole_graph_fusions: devgen::WholeGraphFusionDecisions {
+            rewrite_sites: sites,
+            ..Default::default()
+        },
+    });
+    std::fs::read(&out).unwrap()
+}
+
+fn fixture_sites(dir: &Path) -> devgen::RewriteSites {
+    let json = std::fs::read_to_string(dir.join("config.json")).unwrap();
+    rewrite::fused_sites_for_config(&json).unwrap()
+}
+
+#[test]
+fn emit_rewrite_on_reproduces_the_hand_seams_and_off_ignores_the_sites() {
+    let _g = emit_guard();
+    let fixtures: [(&str, fn(&Path)); 3] = [
+        ("qwen3", write_qwen3_config),
+        ("llama", write_llama_config),
+        ("gemma4", write_gemma_config),
+    ];
+    for (name, write) in fixtures {
+        let dir = tempdir(&format!("emit_rewrite_{name}"));
+        write(&dir);
+        let hand = fnv1a(&emit(&dir, 512, 128, 1));
+        let sites = fixture_sites(&dir);
+        assert_eq!(
+            fnv1a(&emit_rewrite(&dir, None, Some(sites.clone()))),
+            hand,
+            "{name}: default (on)"
+        );
+        assert_eq!(
+            fnv1a(&emit_rewrite(&dir, Some("0"), Some(sites.clone()))),
+            hand,
+            "{name}: knob 0"
+        );
+        assert_eq!(
+            fnv1a(&emit_rewrite(&dir, Some("1"), Some(sites))),
+            hand,
+            "{name}: the rule-driven seams are not the hand seams"
+        );
+    }
+}
+
+#[test]
+fn emit_rewrite_unfuses_a_seam_the_rewrite_did_not_extract() {
+    let _g = emit_guard();
+    let dir = tempdir("emit_rewrite_missing_site");
+    write_qwen3_config(&dir);
+    let hand = fnv1a(&emit(&dir, 512, 128, 1));
+    let mut sites = fixture_sites(&dir);
+    for seam in [
+        "model.layers.1.post_attention_layernorm.weight",
+        "model.layers.1.input_layernorm.weight",
+        "model.norm.weight",
+    ] {
+        let mut dropped = sites.clone();
+        assert!(
+            dropped.get_mut("FusedResidualNorm").unwrap().remove(seam),
+            "{seam} is not a FusedResidualNorm site: {sites:?}"
+        );
+        assert_ne!(
+            fnv1a(&emit_rewrite(&dir, Some("1"), Some(dropped))),
+            hand,
+            "{seam}"
+        );
+    }
+    // Sites of a kind no lowering reads change nothing.
+    sites.remove("SwiGLU");
+    sites.remove("FusedNormLinear");
+    assert_eq!(fnv1a(&emit_rewrite(&dir, Some("1"), Some(sites))), hand);
+}
+
+#[test]
+fn emit_rewrite_default_without_the_rewrite_keeps_the_hand_fusions() {
+    let _g = emit_guard();
+    let dir = tempdir("emit_rewrite_default_no_sites");
+    write_qwen3_config(&dir);
+    let hand = fnv1a(&emit_rewrite(&dir, Some("0"), None));
+    assert_eq!(fnv1a(&emit_rewrite(&dir, None, None)), hand);
+}
+
+#[test]
+#[should_panic(expected = "needs the compiler's rewrite sites")]
+fn emit_rewrite_explicit_refuses_to_emit_without_the_rewrite() {
+    let _g = emit_guard();
+    let dir = tempdir("emit_rewrite_no_sites");
+    write_qwen3_config(&dir);
+    emit_rewrite(&dir, Some("1"), None);
+}

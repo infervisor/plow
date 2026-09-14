@@ -65,6 +65,7 @@ api! {
     cublasLtMatmulPreferenceDestroy: fn(Handle) -> Status,
     cublasLtMatmulPreferenceSetAttribute: fn(Handle, i32, *const c_void, usize) -> Status,
     cublasLtMatmulAlgoGetHeuristic: fn(Handle, Handle, Handle, Handle, Handle, Handle, Handle, i32, *mut Heuristic, *mut i32) -> Status,
+    cublasLtMatmulAlgoCheck: fn(Handle, Handle, Handle, Handle, Handle, Handle, *const Algo, *mut Heuristic) -> Status,
     cublasLtMatmul: fn(Handle, Handle, *const c_void, *const c_void, Handle, *const c_void, Handle, *const c_void, *const c_void, Handle, *mut c_void, Handle, *const Algo, *mut c_void, usize, Handle) -> Status,
 }
 
@@ -103,10 +104,25 @@ impl Lt {
         }))
     }
 
-    pub(crate) fn plan(self: &Arc<Self>, m: u32, n: u32, k: u32, weight: u64) -> Result<Arc<Plan>> {
+    pub(crate) fn plan(
+        self: &Arc<Self>,
+        m: u32,
+        n: u32,
+        k: u32,
+        weight: u64,
+        template: Option<&Plan>,
+    ) -> Result<Arc<Plan>> {
+        if template.is_some_and(|p| {
+            !Arc::ptr_eq(self, &p.lt) || p.shape.0 < m || (p.shape.1, p.shape.2) != (n, k)
+        }) {
+            return Err(RuntimeError::Rejected(
+                "cuBLASLt rung template geometry differs".into(),
+            ));
+        }
         self.be.bind()?;
         let mut plan = Plan {
             lt: self.clone(),
+            shape: (m, n, k),
             desc: 0,
             w: 0,
             a: 0,
@@ -143,6 +159,29 @@ impl Lt {
                     "Lt layout",
                 )?;
                 *dst = raw as usize;
+            }
+            if let Some(template) = template {
+                plan.algo = template.algo;
+                let mut result = Heuristic::default();
+                check(
+                    (self.api.cublasLtMatmulAlgoCheck)(
+                        self.handle as Handle,
+                        plan.desc as Handle,
+                        plan.w as Handle,
+                        plan.a as Handle,
+                        plan.c as Handle,
+                        plan.c as Handle,
+                        &plan.algo,
+                        &mut result,
+                    ),
+                    "Lt rung algorithm",
+                )?;
+                if result.state != 0 || result.workspace > self.workspace.len as usize {
+                    return Err(RuntimeError::Rejected(
+                        "cuBLASLt widest algorithm cannot serve narrower rung".into(),
+                    ));
+                }
+                return Ok(Arc::new(plan));
             }
             let mut pref = std::ptr::null_mut();
             check(
@@ -215,6 +254,7 @@ impl Drop for Lt {
 
 pub(crate) struct Plan {
     lt: Arc<Lt>,
+    shape: (u32, u32, u32),
     desc: usize,
     w: usize,
     a: usize,

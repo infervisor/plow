@@ -1,0 +1,200 @@
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+#include "dev_isa.h"
+
+#define PLOW_NV_HOPPER 1
+#define PLOW_NV_GEMMA 1
+#define PLOW_NV_GEMMA_HNR_BF16 1
+#define PLOW_NV_PACKED_REQUEST 1
+#define PLOW_NV_MASKED_PADDING 1
+#include "op_norm.cuh"
+
+using bf16 = __nv_bfloat16;
+#define CK(call) do { const auto e = (call); if (e != cudaSuccess) { \
+    std::fprintf(stderr, "%s: %s\n", #call, cudaGetErrorString(e)); std::exit(2); } } while (0)
+#define CD(call) do { if ((call) != CUDA_SUCCESS) { \
+    std::fprintf(stderr, "%s failed\n", #call); std::exit(2); } } while (0)
+static const char* writer_image = nullptr;
+
+template<class T> static T* upload(const std::vector<T>& host) {
+    T* device;
+    CK(cudaMalloc(&device, host.size() * sizeof(T)));
+    CK(cudaMemcpy(device, host.data(), host.size() * sizeof(T), cudaMemcpyHostToDevice));
+    return device;
+}
+
+static void run_writer(const std::vector<void*>& tensors, unsigned rows, unsigned heads,
+                       unsigned hd, unsigned stride) {
+    CUmodule module; CUfunction function;
+    CD(cuModuleLoad(&module, writer_image));
+    CD(cuModuleGetFunction(&function, module, "_Z24interp_sm90a_pfpackedseg11PlowProgram"));
+    auto global = [&](const char* name) {
+        CUdeviceptr ptr; size_t bytes; unsigned value;
+        CD(cuModuleGetGlobal(&ptr, &bytes, module, name));
+        if (bytes != sizeof(value)) std::exit(2);
+        CD(cuMemcpyDtoH(&value, ptr, bytes)); return value;
+    };
+    if (global("plow_pf_request_abi") != 2 || global("plow_pf_fp8_request_abi") != 1 ||
+        global("plow_pf_masked_padding_abi") != 1 || global("plow_pf_fp8_masked_padding_abi") != 1)
+        std::exit(2);
+    const unsigned smem = global("plow_arena_bytes_pfpackedseg");
+    CD(cuFuncSetAttribute(function, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem));
+    std::vector<void*> allocations;
+    auto put = [&](const auto& host) {
+        auto* p = upload(host); allocations.push_back(p); return p;
+    };
+    constexpr unsigned blocks = 132;
+    PlowDevInst inst{};
+    inst.op = PLOW_DOP_HEADNORM_ROPE_FP8; inst.blocks = blocks;
+    for (unsigned t = 0; t < 8; ++t) inst.t[t] = t;
+    inst.i[0] = rows; inst.i[1] = heads; inst.i[2] = hd;
+    inst.fj[0].f = 1e-6f; inst.fj[1].u = stride; inst.fj[2].u = 2047;
+    std::vector<PlowStreamEnt> stream(blocks);
+    for (unsigned i = 0; i < blocks; ++i) {
+        stream[i].slice = i; stream[i].wait_len = 1; stream[i].succ_len = 1;
+    }
+    PlowProgram prog{};
+    prog.insts = put(std::vector<PlowDevInst>{inst});
+    prog.tensors = put(tensors); prog.gq_stream = put(stream);
+    prog.gq_seg_ofs = put(std::vector<unsigned>{0, blocks});
+    prog.gq_cursor = put(std::vector<unsigned>(PLOW_CTR_STRIDE));
+    prog.waits = put(std::vector<PlowWait>{{0, blocks}});
+    prog.succs = put(std::vector<unsigned>{1});
+    std::vector<unsigned> counters(2 * PLOW_CTR_STRIDE); counters[0] = blocks;
+    prog.counters = put(counters);
+    void* args[]{&prog};
+    CD(cuLaunchKernel(function, blocks, 1, 1, 256, 1, 1, smem, nullptr, args, nullptr));
+    CK(cudaDeviceSynchronize());
+    unsigned completed;
+    CK(cudaMemcpy(&completed, PLOW_CTR(prog.counters, 1), sizeof(completed), cudaMemcpyDeviceToHost));
+    if (completed != blocks) { std::fprintf(stderr, "incomplete writer counter\n"); std::exit(1); }
+    for (void* p : allocations) CK(cudaFree(p));
+    CD(cuModuleUnload(module));
+}
+
+template<int HD>
+__global__ void write_rows(bf16* out, const bf16* x, const bf16* gamma,
+                          const float* cosb, const float* sinb, const int* pos,
+                          const int* slot, unsigned rows, unsigned heads, unsigned stride) {
+    d_headnorm_rope<HD>(out, x, gamma, cosb, sinb, pos, rows, heads, 1e-6f,
+                       0, stride, 2047, 0, blockIdx.x, gridDim.x, 0, slot);
+}
+
+template<int HD> static void check(unsigned rows, unsigned heads) {
+    constexpr unsigned stride = 2048;
+    const auto sentinel = __float2bfloat16(13.0f);
+    std::vector<bf16> x(size_t(rows) * heads * HD);
+    for (size_t i = 0; i < x.size(); ++i)
+        x[i] = __float2bfloat16(float(int(i % 131) - 65) / 67.0f);
+    std::vector<bf16> kv(size_t(3) * heads * stride * HD, sentinel), expected = kv;
+    std::vector<bf16> query(x.size()), gamma(HD, __float2bfloat16(1.0f));
+    std::vector<float> cosb(size_t(20480) * HD / 2, 1.0f), sinb(cosb.size(), 0.0f);
+    std::vector<int> slots(rows, -1), positions(rows, 0);
+    for (unsigned t = 0; t < 16; ++t) {
+        slots[t] = t < 7 ? 2 : 0;
+        positions[t] = t < 7 ? 16381 + t : 2040 + t - 7;
+    }
+    bf16* dx = upload(x), *dkv = upload(kv), *dq = upload(query), *dg = upload(gamma);
+    float* dc = upload(cosb), *ds = upload(sinb);
+    int* dp = upload(positions), *dslot = upload(slots);
+    CK(cudaMemset(dq, 0xff, x.size() * sizeof(bf16)));
+    write_rows<HD><<<132, PLOW_NV_THREADS>>>(dq, dx, dg, dc, ds, dp, dslot, rows, heads, 0);
+    CK(cudaGetLastError());
+    write_rows<HD><<<132, PLOW_NV_THREADS>>>(dkv, dx, dg, dc, ds, dp, dslot, rows, heads, stride);
+    CK(cudaGetLastError());
+    CK(cudaDeviceSynchronize());
+    CK(cudaMemcpy(query.data(), dq, query.size() * sizeof(bf16), cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(kv.data(), dkv, kv.size() * sizeof(bf16), cudaMemcpyDeviceToHost));
+    for (auto v : query) if (!std::isfinite(__bfloat162float(v))) {
+        std::fprintf(stderr, "query padding was not computed\n"); std::exit(1);
+    }
+    for (unsigned t = 0; t < 16; ++t) for (unsigned h = 0; h < heads; ++h) {
+        const size_t dst = ((size_t(slots[t]) * heads + h) * stride + (positions[t] & 2047)) * HD;
+        std::copy_n(query.data() + (size_t(t) * heads + h) * HD, HD, expected.data() + dst);
+    }
+    if (std::memcmp(kv.data(), expected.data(), kv.size() * sizeof(bf16))) {
+        std::fprintf(stderr, "FAIL rows=%u HD=%d heads=%u\n", rows, HD, heads); std::exit(1);
+    }
+    for (void* p : {static_cast<void*>(dx), static_cast<void*>(dkv), static_cast<void*>(dq),
+                   static_cast<void*>(dg), static_cast<void*>(dc), static_cast<void*>(ds),
+                   static_cast<void*>(dp), static_cast<void*>(dslot)}) CK(cudaFree(p));
+    std::printf("PASS rows=%u HD=%d heads=%u: ragged slots, ring wrap, untouched KV, query padding\n",
+                rows, HD, heads);
+}
+
+template<int HD>
+__global__ void write_fp8_rows(uint8_t* out, float* scale, const bf16* x,
+                              const bf16* gamma, const float* cosb, const float* sinb,
+                              const int* pos, const int* slot, unsigned rows,
+                              unsigned heads, unsigned stride) {
+    d_headnorm_rope_fp8<HD>(out, scale, x, gamma, cosb, sinb, pos, rows, heads,
+                            1e-6f, 0, stride, 2047, 0, blockIdx.x, gridDim.x, 0, slot);
+}
+
+template<int HD> static void check_fp8(unsigned rows, unsigned heads) {
+    constexpr unsigned stride = 2048, real_rows = 16;
+    std::vector<bf16> x(size_t(rows) * heads * HD), gamma(HD, __float2bfloat16(1.0f));
+    for (size_t i = 0; i < x.size(); ++i)
+        x[i] = __float2bfloat16(float(int(i % 131) - 65) / 67.0f);
+    std::vector<int> slots(rows, -1), positions(rows, 0);
+    for (unsigned t = 0; t < real_rows; ++t) {
+        slots[t] = t < 7 ? 2 : 0;
+        positions[t] = t < 7 ? 16381 + t : 2040 + t - 7;
+    }
+    std::vector<float> cosb(size_t(20480) * HD / 2, 1.0f), sinb(cosb.size(), 0.0f);
+    std::vector<uint8_t> got(size_t(3) * heads * stride * HD, 0xa5), expected = got;
+    std::vector<float> scales(size_t(3) * heads * stride, -13.0f), expected_scales = scales;
+    auto* dx = upload(x); auto* dg = upload(gamma);
+    auto* dp = upload(positions); auto* ds = upload(slots);
+    auto* dc = upload(cosb); auto* dn = upload(sinb);
+    auto* dout = upload(got); auto* dref = upload(expected);
+    auto* dscale = upload(scales); auto* drscale = upload(expected_scales);
+    write_fp8_rows<HD><<<132, PLOW_NV_THREADS>>>(dref, drscale, dx, dg, dc, dn, dp, ds,
+                                               real_rows, heads, stride);
+    CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
+    if (writer_image)
+        run_writer({dout, dx, dg, dc, dn, dp, dscale, ds}, rows, heads, HD, stride);
+    else
+        write_fp8_rows<HD><<<132, PLOW_NV_THREADS>>>(dout, dscale, dx, dg, dc, dn, dp, ds,
+                                                  rows, heads, stride);
+    CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
+    CK(cudaMemcpy(got.data(), dout, got.size(), cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(expected.data(), dref, expected.size(), cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(scales.data(), dscale, scales.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(expected_scales.data(), drscale, scales.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    bool ok = got == expected && scales == expected_scales;
+    std::vector<bool> written(scales.size(), false);
+    for (unsigned t = 0; t < real_rows; ++t) for (unsigned h = 0; h < heads; ++h)
+        written[(size_t(slots[t]) * heads + h) * stride + (positions[t] & 2047)] = true;
+    for (size_t row = 0; row < scales.size(); ++row) {
+        if (written[row]) ok &= std::isfinite(scales[row]) && scales[row] > 0.0f;
+        else {
+            ok &= scales[row] == -13.0f;
+            for (unsigned d = 0; d < HD; ++d) ok &= got[row * HD + d] == 0xa5;
+        }
+    }
+    if (!ok) { std::fprintf(stderr, "FAIL FP8 rows=%u HD=%d\n", rows, HD); std::exit(1); }
+    for (void* p : {static_cast<void*>(dx), static_cast<void*>(dg), static_cast<void*>(dp),
+                   static_cast<void*>(ds), static_cast<void*>(dc), static_cast<void*>(dn),
+                   static_cast<void*>(dout), static_cast<void*>(dref), static_cast<void*>(dscale),
+                   static_cast<void*>(drscale)}) CK(cudaFree(p));
+    std::printf("PASS FP8 rows=%u HD=%d heads=%u: exact real rows, untouched KV and scales\n",
+                rows, HD, heads);
+}
+
+int main(int argc, char** argv) {
+    if (argc > 2) return 2;
+    if (argc == 2) writer_image = argv[1];
+    for (unsigned rows : {128, 512, 1024, 2048, 4096, 8192}) {
+        check<256>(rows, 8);
+        check<512>(rows, 1);
+        check_fp8<256>(rows, 8);
+        check_fp8<512>(rows, 1);
+    }
+}

@@ -76,6 +76,14 @@ this file set carries its rationale inline, and prose about an arch is not a con
 (`constexpr bool DIRECT = PLOW_CDNA4 && …`). The largest op file, `op_attention.h`, carries 7 sites
 in 5,121 lines. **There is no op body where arch conditionals are a structural feature of the code.**
 
+Since the GEMM/attention arch split those sites no longer sit in the bodies at all: `op_gemm.h` and
+`op_attention.h` are selectors that include `op_<op>_gfx942.h` or `op_<op>_gfx950.h` by
+`PLOW_CDNA4`, the arch file states every arch-defaulted knob and arch policy macro
+(`PLOW_GM_DIRECT_STAGE`, `PLOW_GM_FP8_PACK2`, `GM8_FIX8`, `PLOW_GV_UN_FP8_KDIV`) and then includes
+`op_<op>_common.h`, which keys on those macros only. The count of `PLOW_CDNA4` sites in the shared
+bodies is zero; the objects are byte-identical either side of the split (`.text` compared per object
+for every gfx942 and gfx950 object the build scripts emit).
+
 Re-measure with this rule before reopening §6 — not on the impression that "there are a lot of
 `#if`s", because there are 31 in 24,373 lines.
 
@@ -118,7 +126,7 @@ one source of truth rather than independently maintained:
 |---|---|---|
 | host model (the source of truth) | `hwspec::IsaLevel::geometry()` | — |
 | device-side ceiling | `PLOW_LDS_MAX_BYTES` in `amd_arch.h` | header-agreement test |
-| device-side tile / stage default | `#if PLOW_CDNA4` in `op_gemm.h` | header-agreement test |
+| device-side tile / stage default | `#ifndef GM_BM` / `GM_DBUF` in `op_gemm_gfx942.h` and `op_gemm_gfx950.h` | header-agreement test |
 | shipped decode profile | `PLOW_OCC4` branch in `build_gfx942.sh` | header-agreement test |
 | probe recipe | `AMD_PREFILL_DEFINES_CDNA3` in `kernelcaps` | `cdna3_recipe_matches_the_arch_geometry` |
 | packet `requires`, emitter fusion gate | `devgen::manifest`, `devgen::gm_lds_halves()` | derived — no literals |
@@ -134,9 +142,9 @@ one source of truth rather than independently maintained:
 ### 3.3 The build scripts own the PROFILE
 
 Which object gets which arm — `PLOW_OCC4`, `PLOW_L2HIER`, `PLOW_MOE_DEC_LG`. These are per-part
-*decisions*, not per-part *code*, and they belong where the object is built. `op_gemm.h` defaults to
-the CDNA3 tile off `PLOW_CDNA4` for exactly this reason: a build that forgets a flag still gets a
-tile that fits, rather than one that fails the LDS limit at link time.
+*decisions*, not per-part *code*, and they belong where the object is built. `op_gemm_gfx942.h`
+defaults the CDNA3 tile for exactly this reason: a build that forgets a flag still gets a tile that
+fits, rather than one that fails the LDS limit at link time.
 
 ---
 
@@ -188,8 +196,9 @@ it regardless; a runtime `MAX_CHUNK` constant shadowing the packet's own `shapes
 config field parsed but read nowhere while the code read the environment variable directly. In every
 case the duplicate worked and the original rotted.
 
-**The guards.** `crates/hwspec/tests/device_header_agreement.rs` reads `op_gemm.h`, `amd_arch.h` and
-`build_gfx942.sh` **as text** and fails when the host table disagrees. Text rather than the
+**The guards.** `crates/hwspec/tests/device_header_agreement.rs` reads `op_gemm_gfx942.h`,
+`op_gemm_gfx950.h` (falling back to `op_gemm_common.h`), `amd_arch.h` and `build_gfx942.sh` **as
+text** and fails when the host table disagrees. Text rather than the
 preprocessor is deliberate: `kernelcaps` already probes these macros through hipcc, and a check that
 needs a toolchain is a check that gets skipped on the machine where the edit is made.
 

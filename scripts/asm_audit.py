@@ -230,7 +230,10 @@ WORKERS = int(os.environ.get("PLOW_AUDIT_JOBS", "8"))
 # Class 1. The headers whose `#ifndef`-guarded knobs geom_contract.h must mark, and the
 # namespaces that count as geometry. Both are asserted against the source, so a knob added
 # to one of these headers without a marker fails the build rather than silently opting out.
-GEOM_HEADERS = ["amd_arch.h", "op_attention.h", "op_moe.h", "op_gemm.h"]
+GEOM_HEADERS = ["amd_arch.h", "op_moe.h",
+                "op_attention.h", "op_attention_common.h", "op_attention_gfx942.h",
+                "op_attention_gfx950.h",
+                "op_gemm.h", "op_gemm_common.h", "op_gemm_gfx942.h", "op_gemm_gfx950.h"]
 GEOM_NS = re.compile(r"^(GM|FA|GV|MPF)_[A-Z0-9_]*$")
 # The numeric PLOW_ knobs build_gfx942.sh passes as raw `-D`. `PLOW_*` at large is a
 # capability axis (PLOW_FP8, PLOW_K3) whose presence is already checked by the marker

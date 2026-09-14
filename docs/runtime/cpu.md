@@ -78,7 +78,7 @@ the CLI wins over the environment. `plowrt serve --help` prints them under the
 | `--cpu-mxfp4-dir DIR` | `PLOW_MXFP4_DIR` | unset | Directory holding the MXFP4 weight twin (`mxfp4/<name>` plus `_scale` rows, from `perf-data/tools/quantize_mxfp4.py`). |
 | `--fp8-dir DIR` | `PLOW_FP8_DIR` | unset | The fp8 weight twin. Runtime-wide rather than CPU-specific, but this is how a CPU bundle gets W8A16/W8A8 weights. |
 | `--cpu-global-queue=B` | `PLOW_CPU_GQ` | `false` | Take the blob's op-major global work queue, windowed per segment and locality domain, instead of static per-cu streams. **Measured ~2x slower** on the EPYC 9654; kept for A/B where the static partition is a poor fit. |
-| `--cpu-l2-place=B` | `PLOW_CPU_L2_PLACE` | `false` | Place executors by the packet's L2 locality domains instead of `cu % nodes`. **Measured 1.5x slower** and never faster — see the [placement report](../../perf-data/cpu-numa-placement/epyc9654-avx512/README.md). Inert on a blob carrying no domains, and the balance guard declines a losing plan even when this is on. |
+| `--cpu-l2-place=B` | `PLOW_CPU_L2_PLACE` | `false` | Place executors by the packet's L2 locality domains instead of `cu % nodes`. **Measured 1.5x slower** and never faster (placement report in the `perf-data/cpu-numa-placement` campaign, kept out of source control). Inert on a blob carrying no domains, and the balance guard declines a losing plan even when this is on. |
 
 The last two default to off because they were measured worse, not because they are
 unfinished. Both are safe to flip for an A/B on a different host; neither changes
@@ -150,8 +150,8 @@ caps `n_cu` at 256, because the per-domain slice count is a nine-bit field.
 
 Executors are placed on node `cu % nodes`. Placing them by the packet's L2
 locality domains instead is implemented behind `--cpu-l2-place` and is **off**,
-because it measured 1.5x slower and never faster; see the
-[placement report](../../perf-data/cpu-numa-placement/epyc9654-avx512/README.md).
+because it measured 1.5x slower and never faster (placement report in the
+`perf-data/cpu-numa-placement` campaign, kept out of source control).
 
 The reason is worth keeping, because the idea is superficially attractive and the
 obvious rescue does not work. An L2 domain says which slices share a *GPU* cache.
@@ -245,17 +245,17 @@ nix develop --command cargo test -p plowrt --features cpu --lib live_numa_policy
 The full Gemma-4-26B BF16 network passed HTTP generation, streaming, four-client
 concurrency, 932-token multi-chunk prefill, disconnect recovery, and the direct
 slot lifecycle test on this host. Four longer responses produced 512 tokens in
-16.225 seconds with 96 AVX-512 workers. See the
-[run report](../../perf-data/cpu-gemma26b/epyc9654-avx512/README.md) for summarized results,
-commands, and the observed imbalance in physical NUMA placement.
+16.225 seconds with 96 AVX-512 workers. The `perf-data/cpu-gemma26b` run report (kept out
+of source control) has the summarized results, commands, and the observed imbalance in
+physical NUMA placement.
 
 The full 48-layer Gemma-4-12B BF16 network also passed the HTTP checks with both
 96 and 192 physical cores. The all-core run verified 24 pinned workers per NUMA
 node and measured 3.33 output tokens/s serially or 11.34 tokens/s at concurrency
-four. See the [12B report](../../perf-data/cpu-gemma/epyc9654-avx512/README.md)
-for first-token latency, prefill measurements, and the limits of this comparison.
+four. The `perf-data/cpu-gemma` 12B report (kept out of source control) has first-token
+latency, prefill measurements, and the limits of this comparison.
 
-The [release experiment report](../../perf-data/cpu-release/epyc9654-avx512/README.md)
+The `perf-data/cpu-release` experiment report (kept out of source control)
 adds BF16/W8A16/W8A8 answer comparisons, near-capacity context checks, a 256-request
 26B FP8 soak, and repeated NUMA measurements at fixed worker count. At 24 workers,
 distributed placement reduced 12B decode latency by 2.3–2.6x versus node 0. The

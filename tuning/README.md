@@ -64,6 +64,7 @@ which is the whole argument for the check.
 |---|---|---|
 | `amd/gfx950/mi350x` | dense BF16/MXFP4 GEMM tiles plus exact-cell decode MLA split count | 242 GEMM cells and B1/B8 8K attention qualified |
 | `nvidia/sm_90a/h100-nvl` | interpreter dispatch floor | measured, see below |
+| `nvidia/sm_90a/h100-sxm5` | Gemma-4 HD256 BKV32 BF16 prefill attention at M4096/M8192 | 21 exact packet cells qualified |
 | `nvidia/sm_120a/rtx-5090` | prefill GEMM tile (`prefill_tile_measurement.jsonl`) | measured, see below |
 
 ### `amd/gfx950/mi350x`

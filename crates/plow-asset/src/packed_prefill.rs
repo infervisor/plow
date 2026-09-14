@@ -6,6 +6,12 @@ use std::collections::BTreeSet;
 pub const SECTION: &str = "packed_prefill";
 pub const CAPABILITY: &str = "plow_pf_request_abi";
 pub const CAPABILITY_VALUE: u32 = 2;
+pub const MASKED_PADDING_CAPABILITY: &str = "plow_pf_masked_padding_abi";
+pub const FP8_MASKED_PADDING_CAPABILITY: &str = "plow_pf_fp8_masked_padding_abi";
+pub const FP8_CAPABILITY: &str = "plow_pf_fp8_request_abi";
+pub const FP8_CAPABILITY_VALUE: u32 = 1;
+// FP8 attention uses t6/t7 for scales; tagged i4 carries the request handle.
+pub const FP8_REQUEST_TAG: u32 = 1 << 31;
 type Result<T> = std::result::Result<T, String>;
 fn need(ok: bool, text: &str) -> Result<()> {
     if ok {
@@ -21,7 +27,10 @@ fn downstream_merge(insts: &[DevInst64], pc: usize) -> Result<&DevInst64> {
     let mut merges = insts[pc + 1..]
         .iter()
         .take_while(|m| {
-            !(m.op == DevOp::FlashPrefill as u16 && m.t[..2].iter().any(|h| d.t[..2].contains(h)))
+            !(matches!(
+                DevOp::from_u16(m.op),
+                Some(DevOp::FlashPrefill | DevOp::FlashPrefillFp8)
+            ) && m.t[..2].iter().any(|h| d.t[..2].contains(h)))
         })
         .filter(|m| m.op == DevOp::FlashMerge as u16 && m.t[1] == d.t[0] && m.t[2] == d.t[1]);
     let merge = merges
@@ -40,16 +49,76 @@ pub struct Map {
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_request_rows: Option<u32>,
     pub slot: u16,
     pub request: u16,
     pub maps: Vec<Map>,
     pub programs: Vec<String>,
 }
 impl Manifest {
+    pub fn validate_object(
+        &self,
+        mut read_capability: impl FnMut(&str) -> Option<u32>,
+    ) -> Result<()> {
+        need(matches!(self.version, 1 | 2), "object manifest version")?;
+        if self.max_request_rows.is_some() {
+            need(
+                read_capability(MASKED_PADDING_CAPABILITY) == Some(1),
+                "object requires masked padding ABI1",
+            )?;
+            if self.version == 2 {
+                need(
+                    read_capability(FP8_MASKED_PADDING_CAPABILITY) == Some(1),
+                    "object requires FP8 masked padding ABI1",
+                )?;
+            }
+        }
+        need(
+            read_capability(CAPABILITY) == Some(CAPABILITY_VALUE),
+            "object requires packed request ABI2",
+        )?;
+        if self.version == 2 {
+            need(
+                read_capability(FP8_CAPABILITY) == Some(FP8_CAPABILITY_VALUE),
+                "object requires FP8 request ABI1",
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Bind a validated prefill instruction, or restore its ordinary request operands.
+    pub fn bind_request(&self, d: &mut DevInst64, packed: bool) {
+        let slot = if packed { self.slot } else { TENSOR_NONE16 };
+        let request = if packed { self.request } else { TENSOR_NONE16 };
+        match DevOp::from_u16(d.op) {
+            Some(DevOp::HeadNormRope) => d.t[6] = slot,
+            Some(DevOp::HeadNormRopeFp8) => d.t[7] = slot,
+            Some(DevOp::FlashPrefill) => {
+                d.t[6] = request;
+                for map in &self.maps {
+                    if d.t[7] == if packed { map.original } else { map.slots } {
+                        d.t[7] = if packed { map.slots } else { map.original };
+                        break;
+                    }
+                }
+            }
+            Some(DevOp::FlashPrefillFp8) => {
+                d.i[4] = if packed {
+                    FP8_REQUEST_TAG | u32::from(self.request)
+                } else {
+                    0
+                };
+            }
+            Some(DevOp::FlashMerge) => d.t[7] = request,
+            _ => {}
+        }
+    }
+
     pub fn validate(&self, p: &Packet<'_>, live: &live_kv::Manifest) -> Result<()> {
         live.validate(p)?;
         need(
-            self.version == 1 && !p.tp && p.prefill_count > 0,
+            self.version == live.version && !p.tp && p.prefill_count > 0,
             "version/topology",
         )?;
         need(
@@ -62,10 +131,22 @@ impl Manifest {
             .max()
             .unwrap();
         need(rows <= i32::MAX as u32, "row index width")?;
+        let write_rows = self.max_request_rows.unwrap_or(rows);
+        if self.max_request_rows.is_some() {
+            need(
+                write_rows > 0
+                    && write_rows <= rows
+                    && p.programs[..p.prefill_count]
+                        .iter()
+                        .any(|g| g.rows == write_rows),
+                "request limit must match a prefill rung",
+            )?;
+        }
         for cache in &live.caches {
             need(
                 cache.window == 0
-                    || u64::from(cache.stride) >= u64::from(cache.window) + u64::from(rows) - 1,
+                    || u64::from(cache.stride)
+                        >= u64::from(cache.window) + u64::from(write_rows) - 1,
                 "ring must retain the attention window across all padded KV writes",
             )?;
         }
@@ -107,15 +188,6 @@ impl Manifest {
         need(
             originals == live.maps.iter().map(|m| m.handle as u16).collect(),
             "descriptor table coverage",
-        )?;
-        need(
-            !p.programs.iter().flat_map(|g| g.insts).any(|d| {
-                matches!(
-                    DevOp::from_u16(d.op),
-                    Some(DevOp::HeadNormRopeFp8 | DevOp::FlashPrefillFp8 | DevOp::FlashDecodeFp8)
-                )
-            }),
-            "FP8 KV is unsupported",
         )?;
         need(
             !p.programs.iter().flat_map(|g| g.insts).any(|d| {
@@ -170,11 +242,13 @@ impl Manifest {
                     continue;
                 }
                 let op = DevOp::from_u16(d.op).ok_or("packed opcode")?;
-                if op == DevOp::FlashPrefill {
+                if matches!(op, DevOp::FlashPrefill | DevOp::FlashPrefillFp8) {
                     flash_sites += 1;
                     need(
-                        matches!(d.i[6], 256 | 512) && d.i[7] > 0 && d.t[6] == TENSOR_NONE16,
-                        "BF16 attention contract",
+                        matches!(d.i[6], 256 | 512)
+                            && d.i[7] > 0
+                            && (op == DevOp::FlashPrefillFp8 || d.t[6] == TENSOR_NONE16),
+                        "attention contract",
                     )?;
                     let product = |xs: &[u32], bytes: u64| -> Result<u64> {
                         xs.iter().try_fold(bytes, |n, &x| {
@@ -237,8 +311,9 @@ impl Manifest {
                     }
                     need(covering == 1, "attention segment coverage")?;
                 }
-                if op == DevOp::HeadNormRope {
-                    need(d.t[6] == TENSOR_NONE16, "existing slot map")?;
+                if matches!(op, DevOp::HeadNormRope | DevOp::HeadNormRopeFp8) {
+                    let slot_operand = if op == DevOp::HeadNormRopeFp8 { 7 } else { 6 };
+                    need(d.t[slot_operand] == TENSOR_NONE16, "existing slot map")?;
                     slot_writers += usize::from(d.fj[1] != 0);
                 }
                 if op == DevOp::FlashMerge {
@@ -278,6 +353,16 @@ pub fn plan(
     bucket: usize,
     max_ctx: usize,
 ) -> Result<Plan> {
+    plan_with_limit(requests, frontiers, bucket, max_ctx, None)
+}
+
+pub fn plan_with_limit(
+    requests: &[Request],
+    frontiers: &[u32],
+    bucket: usize,
+    max_ctx: usize,
+    max_request_rows: Option<u32>,
+) -> Result<Plan> {
     need(
         !requests.is_empty()
             && requests.len() <= frontiers.len()
@@ -295,6 +380,10 @@ pub fn plan(
         mapped_ends: Vec::with_capacity(requests.len()),
     };
     for r in requests {
+        need(
+            max_request_rows.is_none_or(|limit| r.len <= limit as usize),
+            "request exceeds compiled chunk limit",
+        )?;
         need(
             r.slot < frontiers.len() && seen.insert(r.slot) && r.slot <= i32::MAX as usize,
             "physical slot or duplicate",
@@ -317,6 +406,11 @@ pub fn plan(
         total = next;
     }
     let padding = bucket - total;
+    if max_request_rows.is_some() {
+        out.slots.resize(bucket, -1);
+        out.positions.resize(bucket, 0);
+        return Ok(out);
+    }
     let (padding_index, padding_request, padded) = requests
         .iter()
         .enumerate()
@@ -338,6 +432,152 @@ pub fn plan(
 mod tests {
     use super::*;
     #[test]
+    fn masked_padding_requires_dtype_specific_object_capabilities() {
+        for version in [1, 2] {
+            for masked in [None, Some(0), Some(1), Some(2)] {
+                for fp8_masked in [None, Some(0), Some(1), Some(2)] {
+                    let manifest = Manifest {
+                        version,
+                        max_request_rows: Some(1024),
+                        slot: 0,
+                        request: 1,
+                        maps: vec![],
+                        programs: vec![],
+                    };
+                    assert_eq!(
+                        manifest
+                            .validate_object(|name| match name {
+                                CAPABILITY => Some(CAPABILITY_VALUE),
+                                FP8_CAPABILITY => Some(FP8_CAPABILITY_VALUE),
+                                MASKED_PADDING_CAPABILITY => masked,
+                                FP8_MASKED_PADDING_CAPABILITY => fp8_masked,
+                                _ => None,
+                            })
+                            .is_ok(),
+                        masked == Some(1) && (version == 1 || fp8_masked == Some(1)),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn masked_padding_never_extends_a_real_requests_kv_writes() {
+        let request = Request {
+            slot: 1,
+            start: 15360,
+            len: 1024,
+            prompt: 16384,
+        };
+        let p = plan_with_limit(&[request], &[0, 15360], 8192, 16384, Some(1024)).unwrap();
+        assert_eq!(p.table, [1, 0, 1024, 1, 16384]);
+        assert_eq!(p.mapped_ends, [(1, 16384)]);
+        assert!(p.slots[..1024].iter().all(|&slot| slot == 1));
+        assert_eq!(p.positions[..1024], (15360..16384).collect::<Vec<_>>());
+        assert!(p.slots[1024..].iter().all(|&slot| slot == -1));
+        assert!(p.positions[1024..].iter().all(|&pos| pos == 0));
+        assert!(plan(&[request], &[0, 15360], 8192, 16384).is_err());
+        assert!(
+            plan_with_limit(&[request], &[0, 15360], 8192, 16384, Some(512))
+                .unwrap_err()
+                .contains("compiled chunk limit")
+        );
+        assert!(
+            plan_with_limit(&[request, request], &[0, 15360], 8192, 16384, Some(1024))
+                .unwrap_err()
+                .contains("duplicate")
+        );
+    }
+
+    #[test]
+    fn legacy_manifest_does_not_emit_a_request_limit() {
+        let bytes = br#"{"version":1,"slot":0,"request":1,"maps":[],"programs":[]}"#;
+        let manifest: Manifest = serde_json::from_slice(bytes).unwrap();
+        assert_eq!(manifest.max_request_rows, None);
+        assert_eq!(serde_json::to_vec(&manifest).unwrap(), bytes);
+    }
+
+    #[test]
+    fn object_contract_refuses_missing_or_incompatible_fp8_bindings() {
+        for (version, base, fp8, valid) in [
+            (1, Some(2), None, true),
+            (1, Some(2), Some(1), true),
+            (1, Some(1), None, false),
+            (2, Some(2), Some(1), true),
+            (2, Some(2), None, false),
+            (2, Some(1), Some(1), false),
+            (2, None, Some(1), false),
+            (2, Some(2), Some(2), false),
+            (3, Some(2), Some(1), false),
+        ] {
+            let m = Manifest {
+                max_request_rows: None,
+                version,
+                slot: 0,
+                request: 1,
+                maps: Vec::new(),
+                programs: Vec::new(),
+            };
+            assert_eq!(
+                m.validate_object(|name| if name == CAPABILITY { base } else { fp8 })
+                    .is_ok(),
+                valid,
+                "version={version} base={base:?} fp8={fp8:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "CPU cubin inspection; set TEST_PACKED_FP8_CUBINS to colon-separated paths"]
+    fn fp8_objects_advertise_both_request_contracts() {
+        let paths = std::env::var_os("TEST_PACKED_FP8_CUBINS").unwrap();
+        let paths: Vec<_> = std::env::split_paths(&paths).collect();
+        assert!(!paths.is_empty());
+        for path in paths {
+            let image = std::fs::read(&path).unwrap();
+            assert_eq!(
+                crate::cubin::global_u32(&image, CAPABILITY),
+                Some(CAPABILITY_VALUE),
+                "{}",
+                path.display()
+            );
+            assert_eq!(
+                crate::cubin::global_u32(&image, FP8_CAPABILITY),
+                Some(FP8_CAPABILITY_VALUE),
+                "{}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "CPU cubin inspection; set TEST_PACKED_FP8_MASKED_CUBIN"]
+    fn fp8_masked_object_advertises_fixed_writer() {
+        let path = std::env::var_os("TEST_PACKED_FP8_MASKED_CUBIN").unwrap();
+        let image = std::fs::read(path).unwrap();
+        let manifest = Manifest {
+            version: 2,
+            max_request_rows: Some(1024),
+            slot: 0,
+            request: 1,
+            maps: vec![],
+            programs: vec![],
+        };
+        manifest
+            .validate_object(|n| crate::cubin::global_u32(&image, n))
+            .unwrap();
+        assert!(manifest
+            .validate_object(|n| {
+                if n == FP8_MASKED_PADDING_CAPABILITY {
+                    None
+                } else {
+                    crate::cubin::global_u32(&image, n)
+                }
+            })
+            .is_err());
+    }
+
+    #[test]
     fn layer_scratch_reuse_requires_a_merge_before_overwrite() {
         let mut flash = DevInst64 {
             op: DevOp::FlashPrefill as u16,
@@ -356,6 +596,11 @@ mod tests {
         assert!(downstream_merge(&[flash, flash, merge], 0).is_err());
         assert!(downstream_merge(&[merge, flash], 1).is_err());
         assert!(downstream_merge(&[flash, merge, merge], 0).is_err());
+        let mut fp8 = flash;
+        fp8.op = DevOp::FlashPrefillFp8 as u16;
+        assert!(downstream_merge(&[fp8, merge, flash, merge], 0).is_ok());
+        assert!(downstream_merge(&[fp8, flash, merge], 0).is_err());
+        assert!(downstream_merge(&[flash, fp8, merge], 0).is_err());
     }
     #[test]
     fn ragged_physical_slots_and_padding() {

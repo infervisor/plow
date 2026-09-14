@@ -194,6 +194,53 @@ fn completion_scatter_is_failure_atomic_and_reuses_storage() {
     assert_eq!(storage(&staging), before);
 }
 
+/// The shared request contract stages the leading-band plan and delivers `(request, id)` pairs
+/// — the CUDA route's delivery shape — and a positional stage cannot be delivered that way.
+#[test]
+fn request_staging_delivers_by_logical_id_and_refuses_after_a_positional_stage() {
+    use plow_asset::token_batch::{Phase, Request, Selection};
+    let mut staging = MixedStepStaging::with_capacity(8, 4, 4);
+    let mut frontiers = [0, 4, 8, 12];
+    let generations = [1, 1, 1, 1];
+    let req = |id: u32, slot: u32, phase: Phase, tokens: &'static [u32], prompt_len: u32| Request {
+        id,
+        slot,
+        state_slot: slot,
+        generation: 1,
+        phase,
+        tokens,
+        prompt_len,
+        selection: Selection::default(),
+    };
+    // A decode on slot 1 and a prompt completing on slot 3: two leading rows, ids not slots.
+    let requests = [
+        req(7, 1, Phase::Decode, &[5], 4),
+        req(9, 3, Phase::Prefill, &[10, 11], 14),
+    ];
+    staging
+        .stage_requests(&requests, &frontiers, &generations, 8, 64, 5)
+        .unwrap();
+    let mut out = vec![(u32::MAX, u32::MAX)];
+    staging
+        .finish_requests_after_device_success(&mut frontiers, &[42, 43], &mut out)
+        .unwrap();
+    assert_eq!(out, [(7, 42), (9, 43)]);
+    assert_eq!(frontiers, [0, 5, 8, 14]);
+
+    let d = [decode(1, 1, 5)];
+    let p = [prefill(3, 3, 14, &[10])];
+    staging.stage(&d, &p, &frontiers, 8, 64, 5).unwrap();
+    assert!(matches!(
+        staging.finish_requests_after_device_success(&mut frontiers, &[1], &mut out),
+        Err(StageError::OutputRows { .. })
+    ));
+    assert_eq!(
+        frontiers,
+        [0, 5, 8, 14],
+        "a refused delivery commits nothing"
+    );
+}
+
 // ================================================================================================
 // Unified token batch staging
 // ================================================================================================

@@ -1193,6 +1193,12 @@ static __device__ void d_gemm_fp8(__nv_bfloat16* __restrict__ C, const __nv_bflo
                        const uint8_t* __restrict__ B, const float* __restrict__ scale, unsigned m,
                        unsigned n, unsigned k, unsigned a_row0, unsigned slice, unsigned nblk,
                        __nv_bfloat16* arena) {
+#if defined(PLOW_NV_HOPPER) && defined(PLOW_NV_W8A16_WGMMA) && PLOW_NV_W8A16_WGMMA
+    if (k != 0 && k % 8 == 0) {
+        d_gemm_sm90_impl<false>(C, A, B, m, n, k, a_row0, slice, nblk, arena, nullptr, scale);
+        return;
+    }
+#endif
     __nv_bfloat16* As = arena;                                 /* [STAGES][BM][ASTRIDE] bf16 */
     uint8_t* Bs8 = (uint8_t*)(As + PGM_STAGES * PGM_ABUF);     /* [STAGES][BN][BK] e4m3 ring */
     __nv_bfloat16* Bbf = (__nv_bfloat16*)(((size_t)(Bs8 + PGM_STAGES * PGM_B8BUF) + 15) & ~(size_t)15);
@@ -2092,10 +2098,93 @@ static __device__ void d_gemm_glu_w8a8(__nv_bfloat16* __restrict__ C, const uint
  * `x` is an OUTPUT — the warp computes fu = act(gate)*up inline (bf16-rounded, exactly what
  * the separate Glu packet would have written), stores it, and quantizes from the rounded
  * value, deleting the Glu packet + its gate + the full inter-width fu re-read per layer. */
+/* Exact wide-row prefill shapes use the whole CTA on fewer rows. Max is associative and the
+ * element conversion is unchanged, so the row scales and FP8 bytes remain identical. */
+template <unsigned WPR>
+static __device__ __noinline__ void d_quant_fp8_wpr(uint8_t* __restrict__ xq,
+                                      const __nv_bfloat16* __restrict__ x,
+                                      float* __restrict__ ascale, unsigned M, unsigned K,
+                                      unsigned slice, unsigned nblk, float* part) {
+    static_assert((WPR == 4 || WPR == 8) && PLOW_NV_WARPS >= WPR && PLOW_NV_WARPS % WPR == 0,
+                  "supported quant row groups");
+    constexpr unsigned groups = PLOW_NV_WARPS / WPR;
+    const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
+    const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
+    const unsigned group = warp / WPR;
+    const unsigned sub = warp % WPR;
+    for (unsigned wave = 0;; wave++) {
+        const unsigned row0 = slice + wave * groups * nblk;
+        if (row0 >= M) break;
+        const unsigned mm = row0 + group * nblk;
+        const bool active = mm < M;
+        const size_t row = (size_t)mm * K;
+        float amax = 0.0f;
+        if (active) {
+            for (unsigned kk = (sub * 32u + lane) * 8u; kk < K; kk += WPR * 256u) {
+                const bf16v8 v = ld_glob8(x + row + kk);
+#pragma unroll
+                for (int j = 0; j < 8; j++)
+                    amax = fmaxf(amax, fabsf(__bfloat162float(v.x[j])));
+            }
+        }
+        amax = warp_max32(amax);
+        if (lane == 0) part[warp] = amax;
+        __syncthreads();
+        if (lane == 0) {
+            amax = 0.0f;
+#pragma unroll
+            for (unsigned w = 0; w < WPR; w++)
+                amax = fmaxf(amax, part[group * WPR + w]);
+        }
+        amax = __shfl_sync(0xffffffffu, amax, 0);
+#if defined(PLOW_NV_QUANT_FP8_VLLM) && PLOW_NV_QUANT_FP8_VLLM
+        const float as = fmaxf(__fdiv_rn(amax, 448.0f), 1.0f / (448.0f * 512.0f));
+#else
+        const float as = fmaxf(amax * (1.0f / 448.0f), 1e-12f);
+        const float inv = 1.0f / as;
+#endif
+        if (active && sub == 0 && lane == 0) ascale[mm] = as;
+        if (active) {
+            for (unsigned kk = (sub * 32u + lane) * 8u; kk < K; kk += WPR * 256u) {
+                const bf16v8 v = ld_glob8(x + row + kk);
+                uint2 q8;
+                unsigned short* q2 = (unsigned short*)&q8;
+#pragma unroll
+                for (int j = 0; j < 4; j++) {
+#if defined(PLOW_NV_QUANT_FP8_VLLM) && PLOW_NV_QUANT_FP8_VLLM
+                    const float lo = __fdiv_rn(__bfloat162float(v.x[2 * j]), as);
+                    const float hi = __fdiv_rn(__bfloat162float(v.x[2 * j + 1]), as);
+                    q2[j] = pack_fp8_e4m3(fmaxf(-448.0f, fminf(lo, 448.0f)),
+                                           fmaxf(-448.0f, fminf(hi, 448.0f)));
+#else
+                    q2[j] = pack_fp8_e4m3(__bfloat162float(v.x[2 * j]) * inv,
+                                           __bfloat162float(v.x[2 * j + 1]) * inv);
+#endif
+                }
+                *(uint2*)(xq + row + kk) = q8;
+            }
+        }
+        __syncthreads();
+    }
+}
+
 static __device__ void d_quant_fp8(uint8_t* __restrict__ xq, __nv_bfloat16* __restrict__ x,
                             float* __restrict__ ascale, unsigned M, unsigned K, unsigned slice,
                             unsigned nblk, const __nv_bfloat16* __restrict__ gate = nullptr,
-                            const __nv_bfloat16* __restrict__ up = nullptr, unsigned act = 0) {
+                            const __nv_bfloat16* __restrict__ up = nullptr, unsigned act = 0,
+                            float* part = nullptr) {
+#if defined(PLOW_NV_QUANT_WPR) && PLOW_NV_QUANT_WPR
+    if (!gate && part) {
+        if (K == 15360u) {
+            d_quant_fp8_wpr<8>(xq, x, ascale, M, K, slice, nblk, part);
+            return;
+        }
+        if (K == 4096u) {
+            d_quant_fp8_wpr<4>(xq, x, ascale, M, K, slice, nblk, part);
+            return;
+        }
+    }
+#endif
     const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
     const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
     const unsigned per = (M + nblk - 1) / nblk;
@@ -2152,18 +2241,21 @@ static __device__ void d_quant_fp8(uint8_t* __restrict__ xq, __nv_bfloat16* __re
         if (v8) {
             for (unsigned kk = lane * 8u; kk < K; kk += 256u) {
                 const bf16v8 v = ld_glob8(x + row + kk);
-                uint8_t q8[8];
+                uint2 q8;
+                unsigned short* q2 = (unsigned short*)&q8;
 #pragma unroll
-                for (int j = 0; j < 8; j++) {
+                for (int j = 0; j < 4; j++) {
 #if defined(PLOW_NV_QUANT_FP8_VLLM) && PLOW_NV_QUANT_FP8_VLLM
-                    const float scaled = __fdiv_rn(__bfloat162float(v.x[j]), as);
-                    __nv_fp8_e4m3 q(fmaxf(-448.0f, fminf(scaled, 448.0f)));
+                    const float lo = __fdiv_rn(__bfloat162float(v.x[2 * j]), as);
+                    const float hi = __fdiv_rn(__bfloat162float(v.x[2 * j + 1]), as);
+                    q2[j] = pack_fp8_e4m3(fmaxf(-448.0f, fminf(lo, 448.0f)),
+                                           fmaxf(-448.0f, fminf(hi, 448.0f)));
 #else
-                    __nv_fp8_e4m3 q(__bfloat162float(v.x[j]) * inv);
+                    q2[j] = pack_fp8_e4m3(__bfloat162float(v.x[2 * j]) * inv,
+                                           __bfloat162float(v.x[2 * j + 1]) * inv);
 #endif
-                    q8[j] = *(const uint8_t*)&q;
                 }
-                *(uint2*)(xq + row + kk) = *(const uint2*)q8;
+                *(uint2*)(xq + row + kk) = q8;
             }
         } else {
             for (unsigned kk = lane; kk < K; kk += 32u) {
@@ -2647,11 +2739,34 @@ __device__ __forceinline__ void gemv_rows_fp8(__nv_bfloat16* __restrict__ C,
     }
 }
 
+#ifndef PLOW_NV_FP8_DECODE_MMA
+#define PLOW_NV_FP8_DECODE_MMA 0
+#endif
+#if PLOW_NV_FP8_DECODE_MMA && defined(PLOW_NV_HOPPER) && PLOW_NV_HOPPER
+#include "op_gemv_fp8_mma.cuh"
+#endif
+
+#ifndef PLOW_NV_FP8_DECODE_WGMMA
+#define PLOW_NV_FP8_DECODE_WGMMA 0
+#endif
+#if PLOW_NV_FP8_DECODE_WGMMA && defined(PLOW_NV_HOPPER) && PLOW_NV_HOPPER && !PLOW_NV_PREFILL
+#define PLOW_NV_FP8_DECODE_WGMMA_ACTIVE 1
+#include "op_gemv_fp8_wgmma.cuh"
+#else
+#define PLOW_NV_FP8_DECODE_WGMMA_ACTIVE 0
+#endif
+
 /* Non-arena overload: standalone test kernels that don't run in the persistent interpreter.
  * MM ladder {1,2,4,8} + block-walk for M>8, identical shape to d_gemv. */
 static __device__ void d_gemv_fp8(__nv_bfloat16* __restrict__ C, const __nv_bfloat16* __restrict__ x,
                            const uint8_t* __restrict__ W, const float* __restrict__ scale,
                            unsigned M, unsigned N, unsigned K, unsigned slice, unsigned nblk) {
+#if PLOW_NV_FP8_DECODE_MMA && defined(PLOW_NV_HOPPER) && PLOW_NV_HOPPER
+    if (M >= 8 && K && !(K % 256) && blockDim.x == 256) {
+        d_gemv_fp8_mma<false>(C, x, W, nullptr, scale, nullptr, M, N, K, 0, slice, nblk);
+        return;
+    }
+#endif
     gemv_walk(M, [&](auto mm, unsigned m0, unsigned rows) {
         gemv_rows_fp8<decltype(mm)::v>(C + (size_t)m0 * N, x + (size_t)m0 * K, W, scale, rows, N,
                                        K, slice, nblk);
@@ -2663,6 +2778,13 @@ static __device__ void d_gemv_fp8(__nv_bfloat16* __restrict__ C, const __nv_bflo
                            const uint8_t* __restrict__ W, const float* __restrict__ scale,
                            unsigned M, unsigned N, unsigned K, unsigned slice, unsigned nblk,
                            __nv_bfloat16* __restrict__ arena) {
+#if PLOW_NV_FP8_DECODE_WGMMA_ACTIVE
+    if (gemv_fp8_wgmma_supported(M, K)) {
+        if (M == 8) d_gemv_fp8_wgmma<8, false>(C, x, W, nullptr, scale, nullptr, M, N, K, slice, nblk, arena);
+        else d_gemv_fp8_wgmma<16, false>(C, x, W, nullptr, scale, nullptr, M, N, K, slice, nblk, arena);
+        return;
+    }
+#endif
     /* The arena stages ONE x row; B>1 decode has M rows, so fall back to the batched global
      * path (same rule as bf16 d_gemv). Without this the fp8 arms silently computed row 0 only. */
     if (M > 1) { d_gemv_fp8(C, x, W, scale, M, N, K, slice, nblk); return; }
@@ -2811,6 +2933,12 @@ static __device__ void d_gemv_glu_fp8(__nv_bfloat16* __restrict__ C, const __nv_
                                const float* __restrict__ sg, const float* __restrict__ su,
                                unsigned M, unsigned N, unsigned K, unsigned act, unsigned slice,
                                unsigned nblk) {
+#if PLOW_NV_FP8_DECODE_MMA && defined(PLOW_NV_HOPPER) && PLOW_NV_HOPPER
+    if (M >= 16 && K && !(K % 256) && blockDim.x == 256) {
+        d_gemv_fp8_mma<true>(C, x, Wg, Wu, sg, su, M, N, K, act, slice, nblk);
+        return;
+    }
+#endif
     gemv_walk(M, [&](auto mm, unsigned m0, unsigned rows) {
         gemv_glu_rows_fp8<decltype(mm)::v>(C + (size_t)m0 * N, x + (size_t)m0 * K, Wg, Wu, sg, su,
                                            rows, N, K, act, slice, nblk);
@@ -2904,6 +3032,13 @@ static __device__ void d_gemv_glu_fp8(__nv_bfloat16* __restrict__ C, const __nv_
                                const float* __restrict__ sg, const float* __restrict__ su,
                                unsigned M, unsigned N, unsigned K, unsigned act, unsigned slice,
                                unsigned nblk, __nv_bfloat16* __restrict__ arena) {
+#if PLOW_NV_FP8_DECODE_WGMMA_ACTIVE
+    if (gemv_fp8_wgmma_supported(M, K) && act == PLOW_ACT_GELU_TANH_) {
+        if (M == 8) d_gemv_fp8_wgmma<8, true>(C, x, Wg, Wu, sg, su, M, N, K, slice, nblk, arena);
+        else d_gemv_fp8_wgmma<16, true>(C, x, Wg, Wu, sg, su, M, N, K, slice, nblk, arena);
+        return;
+    }
+#endif
     /* B>1: the arena holds one x row only — fall back to the batched global path. */
     if (M > 1) { d_gemv_glu_fp8(C, x, Wg, Wu, sg, su, M, N, K, act, slice, nblk); return; }
     __nv_bfloat16* xs = arena;

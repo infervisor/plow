@@ -17,7 +17,7 @@ fn ordinary_assets() -> Option<(PathBuf, Vec<u32>, usize)> {
     let mut buckets: Vec<_> = blob
         .prefill_progs()
         .iter()
-        .filter(|program| !program.packed_prefill_only && program.t > batch)
+        .filter(|program| !program.role.is_packed_sibling() && program.t > batch)
         .map(|program| program.t)
         .collect();
     buckets.sort_unstable();

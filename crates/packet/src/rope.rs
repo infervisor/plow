@@ -25,6 +25,9 @@
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum RopeScale {
     None,
+    Linear {
+        factor: f64,
+    },
     Llama3 {
         factor: f64,
         low: f64,
@@ -43,6 +46,34 @@ pub enum RopeScale {
         orig: f64,
         truncate: bool,
     },
+    /// DeepSeek-family YaRN (DeepSeek-V2/V3, Kimi-K2/K2.7). The frequency interpolation is
+    /// bit-identical to [`RopeScale::Yarn`]; only the attention factor differs, and it differs
+    /// because the family carries TWO mscale knobs where HF's generic YaRN carries none:
+    ///
+    /// ```text
+    /// _mscale = yarn_get_mscale(factor, mscale) / yarn_get_mscale(factor, mscale_all_dim)
+    /// ```
+    ///
+    /// (`modeling_deepseek.py`, `DeepseekV3YarnRotaryEmbedding`). When the two are equal — which
+    /// is every shipped config in this tree, both 1.0 on Kimi-K2.7-Code — the ratio is exactly
+    /// **1.0**, NOT the `0.1*ln(factor)+1` that [`RopeScale::mscale`] returns for generic YaRN.
+    /// At `factor=64` that is 1.0 vs 1.4159, a 41.6% error multiplied into every cos and sin.
+    ///
+    /// The family's `0.1*ln(factor)+1` term is not discarded, it lives somewhere else: the same
+    /// model folds `yarn_get_mscale(factor, mscale_all_dim)^2` into `softmax_scale`. That is an
+    /// attention-scale concern, not a table concern, so it is applied by the emitter (see
+    /// `GlmCfg::attn_scale`) and deliberately not here.
+    ///
+    /// Represented as a distinct variant rather than a flag on `Yarn` so that the wire constant
+    /// is distinct too: an older reader meets an unknown `scale` and refuses the blob, instead
+    /// of silently materialising the generic-YaRN table for a DeepSeek checkpoint.
+    YarnDeepSeek {
+        factor: f64,
+        beta_fast: f64,
+        beta_slow: f64,
+        orig: f64,
+        truncate: bool,
+    },
 }
 
 impl RopeScale {
@@ -51,7 +82,30 @@ impl RopeScale {
     pub fn mscale(self) -> f64 {
         match self {
             RopeScale::Yarn { factor, .. } if factor > 1.0 => 0.1 * factor.ln() + 1.0,
+            // YarnDeepSeek is 1.0 BY CONSTRUCTION, not by omission: see the variant's doc.
             _ => 1.0,
+        }
+    }
+
+    /// The frequency-interpolation twin of this scheme — the form `inv_freq` implements.
+    /// `YarnDeepSeek` differs from `Yarn` only in [`RopeScale::mscale`], so it borrows the
+    /// interpolation rather than restating it, and the two can never drift apart.
+    fn freq_form(self) -> RopeScale {
+        match self {
+            RopeScale::YarnDeepSeek {
+                factor,
+                beta_fast,
+                beta_slow,
+                orig,
+                truncate,
+            } => RopeScale::Yarn {
+                factor,
+                beta_fast,
+                beta_slow,
+                orig,
+                truncate,
+            },
+            other => other,
         }
     }
 }
@@ -70,8 +124,9 @@ impl RopeScale {
 /// (`dim == hd`), which is what every YaRN checkpoint here ships.
 fn inv_freq(j: usize, hd: u32, theta: f64, scale: RopeScale) -> f64 {
     let inv = 1.0 / theta.powf(2.0 * j as f64 / hd as f64);
-    match scale {
+    match scale.freq_form() {
         RopeScale::None => inv,
+        RopeScale::Linear { factor } => inv / factor,
         RopeScale::Llama3 {
             factor,
             low,
@@ -113,6 +168,8 @@ fn inv_freq(j: usize, hd: u32, theta: f64, scale: RopeScale) -> f64 {
             let ramp = ((j as f64 - lo) / (hi - lo)).clamp(0.0, 1.0);
             (inv / factor) * ramp + inv * (1.0 - ramp)
         }
+        // `freq_form` rewrites YarnDeepSeek to Yarn above; it never reaches here.
+        RopeScale::YarnDeepSeek { .. } => unreachable!("freq_form maps YarnDeepSeek to Yarn"),
     }
 }
 
@@ -203,9 +260,10 @@ pub const GEN_TMAP_E4M3: u32 = 5;
 /// [`GenTensor::kind`]: a 256-byte K/V tensor-map PAIR for the flash-prefill TMA stager
 /// (K's rank-3 map at +0, V's at +128 — FLASH_PREFILL has ONE spare t[] slot, so the pair
 /// rides in one buffer). Each map: bf16, rank-3 {hd, ring_rows, n_kv_head}, 128B swizzle,
-/// box {64, BKV=32, 1}. Field reuse: `ctx` = ring rows, `hd` = head_dim, `aux` = K tensor
-/// handle, `scale` = V tensor handle, `frac` = n_kv_head (f64 carrying a small integer).
-/// Same zero-placeholder contract as the other TMAP kinds.
+/// box {64, BKV, 1}. Field reuse: `ctx` = ring rows, `hd` = head_dim, `aux` = K tensor
+/// handle, `scale` = V tensor handle, `frac` = n_kv_head and `factor` = BKV. Legacy
+/// recipes carry `factor=0`, meaning BKV=32. Same zero-placeholder contract as the other
+/// TMAP kinds.
 pub const GEN_TMAP_KV_PAIR: u32 = 6;
 
 /// [`GenTensor::scale`]: no inv_freq rescaling (Gemma / Qwen / GLM).
@@ -215,6 +273,12 @@ pub const ROPE_SCALE_LLAMA3: u32 = 1;
 /// [`GenTensor::scale`]: YaRN ([`RopeScale::Yarn`]). Field reuse: `factor`, `orig`,
 /// `low = beta_fast`, `high = beta_slow`, `aux` bit 0 = truncate. Mirrors `PLOW_ROPE_SCALE_YARN`.
 pub const ROPE_SCALE_YARN: u32 = 2;
+/// [`GenTensor::scale`]: DeepSeek-family YaRN ([`RopeScale::YarnDeepSeek`]) — same field reuse as
+/// [`ROPE_SCALE_YARN`], attention factor 1.0 instead of `0.1*ln(factor)+1`. A DISTINCT constant
+/// on purpose: a reader that predates it falls into `GenTensor::generate`'s refuse arm rather
+/// than materialising the generic-YaRN table for a DeepSeek/Kimi checkpoint.
+pub const ROPE_SCALE_YARN_DS: u32 = 3;
+pub const ROPE_SCALE_LINEAR: u32 = 4;
 
 /// A recipe for one tensor the runtime materialises at bind time instead of
 /// reading from the blob's init section. Mirrors `PlowGenTensor` in
@@ -279,6 +343,11 @@ impl GenTensor {
             return Some(vec![0u8; 256]);
         }
         let scale = match self.scale {
+            ROPE_SCALE_LINEAR if self.factor.is_finite() && self.factor > 0.0 => {
+                RopeScale::Linear {
+                    factor: self.factor,
+                }
+            }
             ROPE_SCALE_LLAMA3 => RopeScale::Llama3 {
                 factor: self.factor,
                 low: self.low,
@@ -286,6 +355,13 @@ impl GenTensor {
                 orig: self.orig,
             },
             ROPE_SCALE_YARN => RopeScale::Yarn {
+                factor: self.factor,
+                beta_fast: self.low,
+                beta_slow: self.high,
+                orig: self.orig,
+                truncate: self.aux & 1 == 1,
+            },
+            ROPE_SCALE_YARN_DS => RopeScale::YarnDeepSeek {
                 factor: self.factor,
                 beta_fast: self.low,
                 beta_slow: self.high,
@@ -316,6 +392,13 @@ impl GenTensor {
     pub fn rope_pair(ctx: u32, hd: u32, theta: f64, frac: f64, scale: RopeScale) -> [GenTensor; 2] {
         let (skind, factor, low, high, orig, aux) = match scale {
             RopeScale::None => (ROPE_SCALE_NONE, 0.0, 0.0, 0.0, 0.0, 0),
+            RopeScale::Linear { factor } => {
+                assert!(
+                    factor.is_finite() && factor > 0.0,
+                    "invalid linear RoPE factor"
+                );
+                (ROPE_SCALE_LINEAR, factor, 0.0, 0.0, 0.0, 0)
+            }
             RopeScale::Llama3 {
                 factor,
                 low,
@@ -330,6 +413,20 @@ impl GenTensor {
                 truncate,
             } => (
                 ROPE_SCALE_YARN,
+                factor,
+                beta_fast,
+                beta_slow,
+                orig,
+                truncate as u32,
+            ),
+            RopeScale::YarnDeepSeek {
+                factor,
+                beta_fast,
+                beta_slow,
+                orig,
+                truncate,
+            } => (
+                ROPE_SCALE_YARN_DS,
                 factor,
                 beta_fast,
                 beta_slow,
@@ -378,6 +475,17 @@ impl GenTensor {
         hd: u32,
         n_kv_head: u32,
     ) -> GenTensor {
+        Self::tmap_kv_pair_box(k_target, v_target, ring_rows, hd, n_kv_head, 32)
+    }
+
+    pub fn tmap_kv_pair_box(
+        k_target: u32,
+        v_target: u32,
+        ring_rows: u32,
+        hd: u32,
+        n_kv_head: u32,
+        box_rows: u32,
+    ) -> GenTensor {
         GenTensor {
             tensor: 0,
             kind: GEN_TMAP_KV_PAIR,
@@ -387,7 +495,11 @@ impl GenTensor {
             scale: v_target,
             theta: 0.0,
             frac: n_kv_head as f64,
-            factor: 0.0,
+            factor: if box_rows == 32 {
+                0.0
+            } else {
+                box_rows as f64
+            },
             low: 0.0,
             high: 0.0,
             orig: 0.0,
@@ -443,6 +555,36 @@ impl GenTensor {
 mod tests {
     use super::*;
 
+    #[test]
+    fn linear_scaling_matches_fractional_positions_and_recipe() {
+        let factor = 8.0;
+        let hd = 256;
+        let theta = 1_000_000.0;
+        let scale = RopeScale::Linear { factor };
+        let (cos, sin) = rope_tables(1025, hd, theta, 1.0, scale);
+        for pos in [0, 1, 7, 8, 1024] {
+            for j in [0, 1, 63, 127] {
+                let angle = (pos as f64 / factor) / theta.powf(2.0 * j as f64 / hd as f64);
+                let offset = (pos * (hd as usize / 2) + j) * 4;
+                assert_eq!(
+                    &cos[offset..offset + 4],
+                    &(angle.cos() as f32).to_le_bytes()
+                );
+                assert_eq!(
+                    &sin[offset..offset + 4],
+                    &(angle.sin() as f32).to_le_bytes()
+                );
+            }
+        }
+        let [gc, gs] = GenTensor::rope_pair(1025, hd, theta, 1.0, scale);
+        assert_eq!(gc.scale, ROPE_SCALE_LINEAR);
+        assert_eq!(gc.generate().unwrap(), cos);
+        assert_eq!(gs.generate().unwrap(), sin);
+        for factor in [0.0, -1.0, f64::INFINITY, f64::NAN] {
+            assert!(GenTensor { factor, ..gc }.generate().is_none());
+        }
+    }
+
     /// A recipe must reproduce `rope_tables` byte-for-byte — that equality is the
     /// entire safety argument for not shipping the expanded table.
     #[test]
@@ -450,6 +592,50 @@ mod tests {
         // Gemma-4 full layers: partial rotary, so this also covers the NoPE tail.
         let (cos, sin) = rope_tables(512, 512, 1_000_000.0, 0.25, RopeScale::None);
         let [gc, gs] = GenTensor::rope_pair(512, 512, 1_000_000.0, 0.25, RopeScale::None);
+        assert_eq!(gc.generate().unwrap(), cos);
+        assert_eq!(gs.generate().unwrap(), sin);
+    }
+
+    /// DeepSeek-family YaRN at Kimi-K2.7-Code's shipped parameters: same frequencies as generic
+    /// YaRN, attention factor 1.0 instead of 1.4159. The 41.6% gap between those two is the whole
+    /// reason the variant exists, so pin both halves.
+    #[test]
+    fn yarn_deepseek_keeps_yarn_freqs_and_drops_the_attention_factor() {
+        let k27 = |f: f64| (f, 32.0, 1.0, 4096.0, true);
+        let (factor, beta_fast, beta_slow, orig, truncate) = k27(64.0);
+        let generic = RopeScale::Yarn {
+            factor,
+            beta_fast,
+            beta_slow,
+            orig,
+            truncate,
+        };
+        let ds = RopeScale::YarnDeepSeek {
+            factor,
+            beta_fast,
+            beta_slow,
+            orig,
+            truncate,
+        };
+        // The attention factors differ, and by exactly the documented amount.
+        assert!((generic.mscale() - (0.1 * 64f64.ln() + 1.0)).abs() < 1e-12);
+        assert_eq!(ds.mscale(), 1.0);
+        // The FREQUENCIES are identical — only the scalar differs. Compare the tables with the
+        // generic one's mscale divided back out, which must land on the DeepSeek one exactly.
+        let (cg, _) = rope_tables(64, 64, 50_000.0, 1.0, generic);
+        let (cd, _) = rope_tables(64, 64, 50_000.0, 1.0, ds);
+        let m = generic.mscale() as f32;
+        for (a, b) in cg.chunks_exact(4).zip(cd.chunks_exact(4)) {
+            let (a, b) = (
+                f32::from_le_bytes(a.try_into().unwrap()),
+                f32::from_le_bytes(b.try_into().unwrap()),
+            );
+            assert!((a / m - b).abs() < 1e-5, "{a} / {m} != {b}");
+        }
+        // And the recipe round-trips through the ABI under the new scale constant.
+        let [gc, gs] = GenTensor::rope_pair(64, 64, 50_000.0, 1.0, ds);
+        assert_eq!(gc.scale, ROPE_SCALE_YARN_DS);
+        let (cos, sin) = rope_tables(64, 64, 50_000.0, 1.0, ds);
         assert_eq!(gc.generate().unwrap(), cos);
         assert_eq!(gs.generate().unwrap(), sin);
     }
@@ -561,5 +747,15 @@ mod tests {
         // all-zero: the ENGINE overwrites it at bind time, and a zero descriptor fed to
         // TMA would fault rather than compute — never silently serve.
         assert_eq!(g.generate().unwrap(), vec![0u8; 128]);
+    }
+
+    #[test]
+    fn kv_tmap_recipe_keeps_legacy_bkv32_and_encodes_other_boxes() {
+        let legacy = GenTensor::tmap_kv_pair(7, 8, 16384, 512, 1);
+        let bkv16 = GenTensor::tmap_kv_pair_box(7, 8, 16384, 512, 1, 16);
+        assert_eq!(legacy.factor, 0.0);
+        assert_eq!(bkv16.factor, 16.0);
+        assert_eq!(bkv16.byte_len(), 256);
+        assert_eq!(bkv16.generate().unwrap(), vec![0u8; 256]);
     }
 }

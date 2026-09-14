@@ -23,11 +23,24 @@ pub struct EngineThread {
 
 impl EngineThread {
     /// Spawn the named worker thread. It exits when the handle drops.
+    ///
+    /// Pins itself to the serving reservation when heterogeneous prefill is
+    /// configured. The serving path is pinned FIRST and deliberately: reserving
+    /// cores for the head pool while the thread being protected floats reserves
+    /// nothing. With the feature off the reservation is empty and no affinity
+    /// call is made, so the default build places this thread exactly as before.
     pub fn spawn(name: String) -> EngineThread {
         let (tx, rx) = std::sync::mpsc::channel::<Job>();
         std::thread::Builder::new()
             .name(name)
             .spawn(move || {
+                #[cfg(feature = "cpu")]
+                {
+                    let serving = &crate::exec::affinity::plan().serving;
+                    if !serving.is_empty() {
+                        crate::exec::affinity::pin(serving);
+                    }
+                }
                 while let Ok(job) = rx.recv() {
                     job();
                 }

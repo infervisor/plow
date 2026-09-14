@@ -236,6 +236,13 @@ struct Cli {
           require_equals = true, default_missing_value = "true")]
     lean_oracle_devblob: bool,
 
+    /// Skip checkpoint K, the knob-consistency certificate. On by default: a rejection, or no
+    /// runnable `plow_verify`, fails the emit. Bring-up only: `build.json` records
+    /// `knobs.K = "skipped"`: plowrt serves it with a warning, `scripts/freeze_serving_set.sh`
+    /// refuses to freeze it.
+    #[arg(long, default_value_t = false)]
+    no_knob_verify: bool,
+
     /// Drop counters already covered by resource-order (§8.1 counter
     /// elimination). Provably safe by the DAG-side theorem; combined with
     /// `--lean-verify`, the reduced schedule is cross-checked per bucket.
@@ -440,6 +447,18 @@ enum Cmd {
     /// plowc --hf-dir /path/to/kimi-k3 viz --port 8384
     /// ```
     Viz(VizCli),
+
+    /// Checkpoint S for one knob: emit the recipe given by the flags BEFORE the word
+    /// `knob-scope` with the knob at each of two values, then compare the packets against the
+    /// knob's declared scope with `plowrt knob-scope`.
+    ///
+    /// ```text
+    /// plowc --hf-dir <ckpt> ... --replay-knobs <build.json> knob-scope \
+    ///     --knob emit.glm_pf_small_cus --values ,auto
+    /// ```
+    ///
+    /// A runtime knob (`rt.*`) emits once and compares the route of `--workload`.
+    KnobScope(KnobScopeCli),
 }
 
 /// `plowc tune <action>`.
@@ -534,6 +553,100 @@ struct TuneCli {
     /// digests. `gemm_c4` regressed ~0.30 and nothing reported it.
     #[arg(long, default_value_t = 0.10, value_name = "FRACTION")]
     threshold: f64,
+}
+
+/// `plowc knob-scope`.
+#[derive(Args, Debug)]
+struct KnobScopeCli {
+    /// Registry id: `emit.<field>` or `rt.<field>`.
+    #[arg(long)]
+    knob: String,
+    /// `OFF,ON`; an empty side leaves the env var unset.
+    #[arg(long)]
+    values: String,
+    /// Route workload JSON, required for a runtime knob.
+    #[arg(long)]
+    workload: Option<PathBuf>,
+    /// The plowrt binary; defaults to the one beside this plowc.
+    #[arg(long)]
+    plowrt: Option<PathBuf>,
+    /// Where the packets and `scope-<knob>.json` go.
+    #[arg(long, default_value = "knob-scope")]
+    dir: PathBuf,
+}
+
+fn run_knob_scope(k: &KnobScopeCli) -> Result<PathBuf, String> {
+    let (off, on) = k.values.split_once(',').ok_or("--values wants OFF,ON")?;
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let at = argv
+        .iter()
+        .position(|a| a == "knob-scope")
+        .ok_or("knob-scope must follow the emit flags")?;
+    let mut emit = Vec::with_capacity(at);
+    let mut flags = argv[..at].iter();
+    while let Some(a) = flags.next() {
+        if a == "--out" {
+            flags.next();
+        } else if !a.to_string_lossy().starts_with("--out=") {
+            emit.push(a.clone());
+        }
+    }
+    let runtime = k.knob.starts_with("rt.");
+    let env = if runtime {
+        None
+    } else {
+        let spec = devgen::knob_spec::EMIT
+            .iter()
+            .chain(devgen::knob_spec::RAW_ENV)
+            .find(|s| s.id == k.knob)
+            .ok_or_else(|| format!("{} is not a registered emit knob", k.knob))?;
+        Some(spec.env.ok_or_else(|| format!("{} has no env var to set", k.knob))?)
+    };
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&k.dir).map_err(|e| format!("{}: {e}", k.dir.display()))?;
+    let emit_one = |tag: &str, value: &str| -> Result<PathBuf, String> {
+        let out = k.dir.join(tag);
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.args(&emit).arg("--out").arg(&out);
+        if let Some(env) = env {
+            if value.is_empty() {
+                cmd.env_remove(env);
+            } else {
+                cmd.env(env, value);
+            }
+        }
+        let status = cmd.status().map_err(|e| format!("{}: {e}", exe.display()))?;
+        if status.success() {
+            Ok(out)
+        } else {
+            Err(format!("the {tag} emit failed: {status}"))
+        }
+    };
+    let (base, variant) = if runtime {
+        let packet = emit_one("packet", "")?;
+        (packet.clone(), packet)
+    } else {
+        (emit_one("off", off)?, emit_one("on", on)?)
+    };
+    let plowrt = k.plowrt.clone().unwrap_or_else(|| exe.with_file_name("plowrt"));
+    let report = k.dir.join(format!("scope-{}.json", k.knob));
+    let mut cmd = std::process::Command::new(&plowrt);
+    cmd.args(["knob-scope", "--knob", &k.knob, "--values", &k.values])
+        .arg("--base")
+        .arg(&base)
+        .arg("--variant")
+        .arg(&variant)
+        .arg("--out")
+        .arg(&report);
+    if let Some(w) = &k.workload {
+        cmd.arg("--workload").arg(w);
+    }
+    let status = cmd.status().map_err(|e| format!("{}: {e}", plowrt.display()))?;
+    if status.success() {
+        Ok(report)
+    } else {
+        Err(format!("checkpoint S rejected {} (report: {})", k.knob, report.display()))
+    }
 }
 
 /// `plowc viz` — serve or dump the nn-graph visualization.
@@ -780,6 +893,19 @@ fn main() -> ExitCode {
         };
     }
 
+    if let Some(Cmd::KnobScope(k)) = &cli.cmd {
+        return match run_knob_scope(k) {
+            Ok(report) => {
+                info!(report = %report.display(), "checkpoint S accepted");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                error!(error = %e, "knob-scope failed");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     if let Some(Cmd::Viz(v)) = &cli.cmd {
         return match run_viz(v, &cli) {
             Ok(()) => ExitCode::SUCCESS,
@@ -842,6 +968,46 @@ fn fusion_coverage_hook(
     })
 }
 
+/// The rewrite's fused sites for `PLOW_EMIT_REWRITE`, or `None` to keep the hand fusions.
+fn rewrite_sites(
+    dir: &std::path::Path,
+    explicit: bool,
+) -> Result<Option<devgen::RewriteSites>, String> {
+    let sites = std::fs::read_to_string(dir.join("config.json"))
+        .map_err(|e| rewrite::SitesError::Unavailable(format!("config.json: {e}")))
+        .and_then(|json| rewrite::fused_sites_for_config(&json));
+    resolve_rewrite_sites(sites, explicit)
+}
+
+/// A default-on knob cannot refuse an emit: a missing rewrite falls back to the hand fusions
+/// unless `PLOW_EMIT_REWRITE=1` was set explicitly.
+fn resolve_rewrite_sites(
+    sites: Result<rewrite::FusedSites, rewrite::SitesError>,
+    explicit: bool,
+) -> Result<Option<devgen::RewriteSites>, String> {
+    match sites {
+        Ok(sites) => {
+            info!(
+                kinds = sites.len(),
+                sites = sites.values().map(|w| w.len()).sum::<usize>(),
+                "PLOW_EMIT_REWRITE: devgen lowers the extracted fused graph"
+            );
+            Ok(Some(sites))
+        }
+        Err(e) if explicit => Err(format!(
+            "PLOW_EMIT_REWRITE=1: no whole-graph rewrite for this checkpoint: {e}"
+        )),
+        Err(e @ rewrite::SitesError::Unavailable(_)) => {
+            info!(error = %e, "PLOW_EMIT_REWRITE: rewrite unavailable for this architecture; emitting the hand fusions");
+            Ok(None)
+        }
+        Err(e) => {
+            warn!(error = %e, "PLOW_EMIT_REWRITE: the rewrite failed; emitting the hand fusions");
+            Ok(None)
+        }
+    }
+}
+
 fn whole_graph_fusion_decisions(
     coverage: Option<&fusion_coverage::FusionCoverage>,
     tp: u32,
@@ -883,6 +1049,32 @@ fn lean_unavailable_reason() -> Option<&'static str> {
             Some("no `plow_verify` binary (set PLOW_VERIFY_BIN, or `lake build` in lean-plow/)")
         }
     }
+}
+
+/// Checkpoint K is fatal: a rejection and an unusable `plow_verify` both abort the emit, unlike the
+/// ordering certificate's degrade. `--no-knob-verify` is the way past it.
+#[cfg(feature = "lean-verify")]
+fn install_knob_verifier() {
+    devgen::knob_spec::install_verifier(|payload| {
+        match lean_verify::checkpoints::knobs::check_knobs(payload) {
+            Ok(cert) if cert.ok => Ok(cert.notes.unwrap_or_default()),
+            Ok(cert) => Err(cert.reason.unwrap_or_else(|| "no reason given".into())),
+            Err(e) if e.is_binary_unusable() => Err(format!(
+                "{e}; build it with `nix develop -c lake build` in lean-plow/, or pass \
+                 --no-knob-verify (bring-up only)"
+            )),
+            Err(e) => Err(e.to_string()),
+        }
+    });
+}
+
+#[cfg(not(feature = "lean-verify"))]
+fn install_knob_verifier() {
+    devgen::knob_spec::install_verifier(|_| {
+        Err("plowc was built without the `lean-verify` feature; pass --no-knob-verify \
+             (bring-up only)"
+            .into())
+    });
 }
 
 #[cfg(feature = "lean-verify")]
@@ -1300,11 +1492,18 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
     };
     // Candidate eligibility comes only from full-graph analysis. Qualification
     // remains an explicit experiment until the network gate promotes it.
-    let whole_graph_fusions = whole_graph_fusion_decisions(
+    let mut whole_graph_fusions = whole_graph_fusion_decisions(
         fusion_coverage.as_ref(),
         tp,
         cli.experiment_parallel_linear2,
     );
+    // `PLOW_EMIT_REWRITE` (default on): devgen lowers the extracted fused graph at the seams a rule
+    // covers. Without a rewrite for this checkpoint the emit keeps the hand fusions, exactly as
+    // `=0` does; only an explicit `=1` refuses.
+    if cli.emit_cfg.emit_rewrite {
+        let explicit = devgen::emit_config::explicitly_set("emit_rewrite");
+        whole_graph_fusions.rewrite_sites = rewrite_sites(&dir, explicit)?;
+    }
 
     // The Lean gates on the devblob path. BOTH ARE ON BY DEFAULT (disable with
     // `--no-lean-verify` / `--no-lean-oracle`, one switch each, no coupling).
@@ -1432,6 +1631,14 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
                 .unwrap_or_else(|| "tuning".to_string())
         },
     );
+    if cli.segmented {
+        devgen::knob_spec::note_cap("segmented");
+    }
+    if cli.no_knob_verify {
+        devgen::knob_spec::disable("disabled on the command line (--no-knob-verify)");
+    } else {
+        install_knob_verifier();
+    }
     devgen::run_verified(
         devgen::EmitArgs {
             dir: dir.clone(),
@@ -2353,6 +2560,53 @@ fn run_viz(v: &VizCli, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 mod cli_tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn emit_rewrite_falls_back_by_default_and_refuses_only_when_explicit() {
+        let unavailable = || Err(rewrite::SitesError::Unavailable("no builder".into()));
+        let failed = || Err(rewrite::SitesError::Rewrite("extraction".into()));
+        assert_eq!(resolve_rewrite_sites(unavailable(), false), Ok(None));
+        assert_eq!(resolve_rewrite_sites(failed(), false), Ok(None));
+        assert!(resolve_rewrite_sites(unavailable(), true)
+            .unwrap_err()
+            .contains("no builder"));
+        assert!(resolve_rewrite_sites(failed(), true)
+            .unwrap_err()
+            .contains("extraction"));
+        let sites: rewrite::FusedSites =
+            [("FusedResidualNorm".to_string(), ["w".to_string()].into())]
+                .into_iter()
+                .collect();
+        for explicit in [false, true] {
+            assert_eq!(
+                resolve_rewrite_sites(Ok(sites.clone()), explicit),
+                Ok(Some(sites.clone()))
+            );
+        }
+    }
+
+    #[test]
+    fn emit_rewrite_sites_come_from_the_checkpoint_graph_or_not_at_all() {
+        let dir = std::env::temp_dir().join(format!("plowc-emit-rewrite-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"model_type": "llama", "vocab_size": 1000, "hidden_size": 256,
+                "intermediate_size": 512, "num_hidden_layers": 2, "num_attention_heads": 4,
+                "num_key_value_heads": 2, "rms_norm_eps": 1e-5, "rope_theta": 500000.0}"#,
+        )
+        .unwrap();
+        let sites = rewrite_sites(&dir, true).unwrap().unwrap();
+        assert!(sites["FusedResidualNorm"].contains("model.norm.weight"));
+
+        std::fs::write(dir.join("config.json"), r#"{"model_type": "gpt_oss"}"#).unwrap();
+        assert_eq!(rewrite_sites(&dir, false), Ok(None));
+        assert!(rewrite_sites(&dir, true).is_err());
+
+        std::fs::remove_file(dir.join("config.json")).unwrap();
+        assert_eq!(rewrite_sites(&dir, false), Ok(None));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn mixed_fusion_has_no_compiler_options() {

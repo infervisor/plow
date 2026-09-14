@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://plow.dev/schemas/perf-ledger-entry-v1.schema.json",
+  "title": "Plow performance ledger entry (checkpoint P input)",
+  "description": "One arm's measurement of one rung on one metric. A treatment names its control and its repeated control, measured in the same job on the same hardware. Written by scripts/ledger_append.py to /workspace/plow-ledger/ledger.jsonl.",
+  "type": "object",
+  "required": [
+    "id", "date", "job", "harness", "hardware", "rung", "recipe_digest", "knob_delta",
+    "metric", "better", "stats"
+  ],
+  "properties": {
+    "id": { "$ref": "#/$defs/nonempty" },
+    "date": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" },
+    "job": { "$ref": "#/$defs/nonempty" },
+    "harness": { "enum": ["proto", "attrib", "bench", "serve-ab"] },
+    "hardware": {
+      "type": "object",
+      "required": ["box", "rocm", "driver", "firmware"],
+      "properties": {
+        "box": { "$ref": "#/$defs/nonempty" },
+        "rocm": { "$ref": "#/$defs/nonempty" },
+        "driver": { "type": ["string", "null"] },
+        "firmware": { "type": ["string", "null"] }
+      }
+    },
+    "rung": {
+      "type": "object",
+      "required": ["digest", "role", "rows", "prior", "topology"],
+      "properties": {
+        "digest": {
+          "$ref": "#/$defs/nonempty",
+          "description": "The rung digest (checkpoint S) or, for a serving metric, the serving configuration's label."
+        },
+        "role": { "$ref": "#/$defs/nonempty" },
+        "rows": { "type": "integer", "minimum": 0 },
+        "prior": { "type": "integer", "minimum": 0 },
+        "topology": { "$ref": "#/$defs/nonempty" }
+      }
+    },
+    "recipe_digest": { "type": "string" },
+    "knob_delta": { "type": "object" },
+    "metric": { "$ref": "#/$defs/nonempty" },
+    "better": { "enum": ["lower", "higher"] },
+    "stats": {
+      "type": "object",
+      "required": ["n", "median"],
+      "properties": {
+        "n": { "type": "integer", "minimum": 1 },
+        "median": { "type": "number" },
+        "mad": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Absent in a stats-only record from a harness that did not keep samples; checkpoint P then reports insufficient_evidence."
+        },
+        "p95": { "type": "number" }
+      }
+    },
+    "samples": { "type": "array", "items": { "type": "number" } },
+    "control_of": { "$ref": "#/$defs/nonempty" },
+    "repeat_control_of": { "$ref": "#/$defs/nonempty" },
+    "reference": { "type": "string" }
+  },
+  "dependentRequired": {
+    "control_of": ["repeat_control_of"],
+    "repeat_control_of": ["control_of"]
+  },
+  "$defs": {
+    "nonempty": { "type": "string", "minLength": 1 }
+  }
+}

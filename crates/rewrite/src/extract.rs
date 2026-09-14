@@ -46,7 +46,54 @@ impl FusedGraph {
     pub fn contains(&self, op: &str) -> bool {
         self.nodes.iter().any(|n| n.op == op)
     }
+
+    /// Every fused node's kind and anchors: its own `Weight` operands or, for a kind with none
+    /// (`SwiGLU`), its operands' own weights. A weight name is the one identity an extracted term
+    /// shares with an emitter, which names tensors by checkpoint name.
+    pub fn sites(&self) -> FusedSites {
+        let own = |i: usize| -> Vec<&str> {
+            self.nodes[i]
+                .args
+                .iter()
+                .filter_map(|a| match a {
+                    Arg::Node(j) if self.nodes[*j].op == "Weight" => {
+                        match self.nodes[*j].args.first() {
+                            Some(Arg::Str(s)) => Some(s.as_str()),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut sites = FusedSites::new();
+        for (i, node) in self.nodes.iter().enumerate() {
+            if !is_fused(&node.op) {
+                continue;
+            }
+            let mut anchors = own(i);
+            if anchors.is_empty() {
+                anchors = node
+                    .args
+                    .iter()
+                    .filter_map(|a| match a {
+                        Arg::Node(j) => Some(own(*j)),
+                        _ => None,
+                    })
+                    .flatten()
+                    .collect();
+            }
+            sites
+                .entry(node.op.clone())
+                .or_default()
+                .extend(anchors.into_iter().map(str::to_string));
+        }
+        sites
+    }
 }
+
+/// Fused kind → the checkpoint weight names anchoring its instances ([`FusedGraph::sites`]).
+pub type FusedSites = std::collections::BTreeMap<String, std::collections::BTreeSet<String>>;
 
 fn is_leaf(op: &str) -> bool {
     op == "Input" || op == "Weight"
@@ -70,6 +117,9 @@ pub(crate) fn is_fused(op: &str) -> bool {
             | "FusedResidualNorm"
             | "FusedResidualZeroCenteredNorm"
             | "FusedResidualLayerNorm"
+            | "FusedResidual3Norm"
+            | "FusedNormResidualNorm"
+            | "FusedNormResidualScaleNorm"
             | "FusedGroupNormActConv3d"
             | "FusedGroupNormActConv3dBias"
             | "FusedLinearAct"
@@ -148,8 +198,14 @@ impl egglog::extract::CostModel<num::BigInt> for BigTreeAdditiveCost {
     }
 }
 
-/// Build the full egglog program, run it, and extract the fused graph.
-pub fn run(schema: &str, rules: &str, lets: &str, root: &str) -> Result<FusedGraph, ExtractError> {
+/// Build the full egglog program, run it, and extract the fused graph: one term per root from one
+/// extractor, hash-consed into one DAG. `FusedGraph::root` is the last root.
+pub fn run(
+    schema: &str,
+    rules: &str,
+    lets: &str,
+    roots: &[String],
+) -> Result<FusedGraph, ExtractError> {
     // Two deliberate choices, both load-bearing for memory:
     //
     // * `(run-schedule (saturate (run)))` instead of the old `(run 100)`: the
@@ -171,28 +227,44 @@ pub fn run(schema: &str, rules: &str, lets: &str, root: &str) -> Result<FusedGra
         .parse_and_run_program(None, &program)
         .map_err(|e| ExtractError::Egglog(e.to_string()))?;
 
-    let (sort, value) = egraph
-        .eval_expr(&egglog::prelude::exprs::var(root))
-        .map_err(|e| ExtractError::Egglog(e.to_string()))?;
+    let mut values = Vec::with_capacity(roots.len());
+    for root in roots {
+        values.push(
+            egraph
+                .eval_expr(&egglog::prelude::exprs::var(root))
+                .map_err(|e| ExtractError::Egglog(e.to_string()))?,
+        );
+    }
+    let sort = values
+        .last()
+        .map(|(sort, _)| sort.clone())
+        .ok_or_else(|| ExtractError::Egglog("no root to extract".into()))?;
     // Extract under `BigTreeAdditiveCost` rather than egglog's default. Same
     // cost function, arbitrary precision: see [`BigTreeAdditiveCost`] — the
     // default saturates `u64` on any residual model past ~21 layers and then
     // aborts the process during reconstruction.
     let extractor = egglog::extract::Extractor::<num::BigInt>::compute_costs_from_rootsorts(
-        Some(vec![sort.clone()]),
+        Some(vec![sort]),
         &egraph,
         BigTreeAdditiveCost,
     );
     let mut termdag = egglog::TermDag::default();
-    let (_cost, tid) = extractor
-        .extract_best_with_sort(&egraph, &mut termdag, value, sort)
-        .ok_or_else(|| ExtractError::Egglog("no extractable term for the graph root".into()))?;
-    term_to_graph(&termdag, tid)
+    let mut tids = Vec::with_capacity(values.len());
+    for (sort, value) in values {
+        let (_cost, tid) = extractor
+            .extract_best_with_sort(&egraph, &mut termdag, value, sort)
+            .ok_or_else(|| ExtractError::Egglog("no extractable term for the graph root".into()))?;
+        tids.push(tid);
+    }
+    term_to_graph(&termdag, &tids)
 }
 
 // --- TermDag → hash-consed FusedGraph ---------------------------------------
 
-fn term_to_graph(td: &egglog::TermDag, root: egglog::TermId) -> Result<FusedGraph, ExtractError> {
+fn term_to_graph(
+    td: &egglog::TermDag,
+    roots: &[egglog::TermId],
+) -> Result<FusedGraph, ExtractError> {
     use egglog::{ast::Literal, Term};
 
     let mut g = FusedGraph::default();
@@ -200,7 +272,7 @@ fn term_to_graph(td: &egglog::TermDag, root: egglog::TermId) -> Result<FusedGrap
     let mut memo: std::collections::HashMap<egglog::TermId, Arg> = std::collections::HashMap::new();
     // Iterative post-order: the unrolled model is a >1000-deep chain, too deep
     // to recurse over safely.
-    let mut stack: Vec<(egglog::TermId, bool)> = vec![(root, false)];
+    let mut stack: Vec<(egglog::TermId, bool)> = roots.iter().rev().map(|&r| (r, false)).collect();
     while let Some((id, ready)) = stack.pop() {
         if memo.contains_key(&id) {
             continue;
@@ -247,6 +319,9 @@ fn term_to_graph(td: &egglog::TermDag, root: egglog::TermId) -> Result<FusedGrap
             }
         }
     }
+    let root = *roots
+        .last()
+        .ok_or_else(|| ExtractError::Parse("no root term".into()))?;
     match memo[&root] {
         Arg::Node(i) => {
             g.root = i;

@@ -29,6 +29,8 @@ minijinja = { version = "2", default-features = false, features = ["builtins", "
 # the workspace lock via egglog with the same features, so it adds no build.
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 plow-asset = { workspace = true }
+# Checkpoint S at `plowrt knob-scope` (serde and thiserror only).
+lean_verify = { workspace = true }
 packet = { workspace = true }
 hwspec = { workspace = true }
 costmodel = { workspace = true }
@@ -62,6 +64,7 @@ rustfft = "6"
 # Optional: real tokenizer + checkpoint reader. Off by default so the skeleton
 # builds fast and offline; a byte-fallback tokenizer stands in when absent.
 tokenizers = { version = "0.20", optional = true }
+rayon = { version = "1", optional = true }
 safetensors = { version = "0.4", optional = true }
 hf-hub = { workspace = true, optional = true }
 # Asset distribution (`dist` feature): an HTTP client for the registry and zstd
@@ -107,7 +110,7 @@ metal = ["cpu", "dep:objc2", "dep:objc2-metal", "dep:objc2-foundation"]
 ane = ["metal", "dep:objc2-core-ml"]
 # Real Hugging Face tokenizer (loads a model's `tokenizer.json`). Enable this
 # alone for tokenization without pulling the checkpoint/download deps.
-hf-tokenizer = ["dep:tokenizers"]
+hf-tokenizer = ["dep:tokenizers", "dep:rayon"]
 # Real HF tokenizer + safetensors weight loading + hub downloads.
 hub = ["hf-tokenizer", "dep:safetensors", "dep:hf-hub"]
 # Fetch compiled assets from a registry: `pull`, `load`, `upgrade`, `search`.
@@ -129,7 +132,7 @@ cuda = ["dep:libloading", "dep:safetensors", "hf-tokenizer"]
 # tokenizer produces silent garbage rather than an error (measured on the CUDA
 # side, 2026-07-19). The features stay symmetric so an AMD serve cannot inherit
 # a failure mode the NVIDIA one was fixed for.
-hsa = ["dep:libloading", "dep:safetensors", "hf-tokenizer"]
+hsa = ["dep:libloading", "dep:libc", "dep:safetensors", "hf-tokenizer"]
 # Generic GGUF asset reader; it is independent of the execution backend.
 gguf = ["dep:gguf-rs-lib"]
 # In-process adapter for NVIDIA NeMo-Speech's stable ASR C ABI. The selected
