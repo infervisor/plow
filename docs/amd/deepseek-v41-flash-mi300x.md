@@ -637,12 +637,12 @@ because getting one wrong compiles, runs, and is a different model:
   are masked, and the test asserts the masked token comes back bit-identical
   rather than merely close.
 
-What is still missing for Engram is narrower than it was. The per-layer hash
-multipliers and the prime bucket ranges have LANDED, in
-`DeepSeekV41Config::engram_hash_tables` -- see item 2 of the ordered path below
-for why the primes are derived and the multipliers are not. What remains is the
-compressed-token map and the per-step cache that lets an n-gram look back across
-the prefill/decode split. No new math, and no kernel.
+**Engram's host side is DONE as of 2026-09-14**, in
+`crates/plowrt/src/text/engram.rs`: the compressed-token map, the n-gram hash,
+and the per-step cache that lets a lookback cross the prefill/decode split. The
+hash tables it uses are `DeepSeekV41Config::engram_hash_tables` -- see item 2 of
+the ordered path below for why the primes are derived and the multipliers are
+not.
 
 The token map is a PORT rather than a reimplementation, and that is worth
 stating because it looks like the opposite. `build_compressed_token_map` runs
@@ -655,12 +655,29 @@ normalizers exists there under the same name, so the sequence transcribes. The
 one trap is the sentinel: a token that is exactly one space must survive `Strip`,
 which is why the reference swaps it for `\ue000` and back.
 
-Two invariants the map has to preserve, both load-bearing: the resulting vocab
-size must equal `engram_compressed_vocab_size` (99 092) because **every hash
-multiplier is derived from it** -- a mismatch silently rehashes the whole table
-rather than failing -- and a partial UTF-8 byte token (one whose decode contains
-`\ufffd`) is keyed by its RAW token string instead of its normalized text, since
-there is nothing there to normalize.
+It verifies against the CONFIG rather than against itself. The map produces
+exactly **99 092** compressed ids, which is `engram_compressed_vocab_size` on the
+nose -- and that number is not a bound, it is what every hash multiplier was
+drawn against, so a map that differed would silently rehash the whole table
+rather than fail. `EngramHasher::new` refuses the mismatch for that reason. The
+other invariant: a partial UTF-8 byte token (one whose decode contains `\ufffd`)
+is keyed by its RAW token string, since there is nothing there to normalize --
+normalizing the replacement character merges every such token into one.
+
+The hash itself is pinned against an independent Python transcription of
+`inference/engram.py` run on the released config: two implementations of one
+spec, rather than one checked against itself.
+
+**The lookback LATCHES, and the window edge is worth pinning.** A dead token
+blocks lookback THROUGH itself, and because the n-grams have different reaches it
+blocks the long ones further along the sequence than the short ones. With
+`max_ngram = 4`, position `p` sees positions `p` through `p-3`. So for a dead
+token at position 2: at position 4 the 2-gram is clear of it while the 3- and
+4-grams are not, and at position 5 only the 4-gram still reaches it. A lookback
+that stopped at the masked position itself, or one that failed to latch after the
+first block, reproduces the short n-grams correctly and gets the long ones wrong
+-- which is why the tests assert on all three reaches rather than on the masked
+position alone.
 
 **Engram is a CAPACITY problem, not a bandwidth one.** From the checkpoint:
 
@@ -787,7 +804,10 @@ So the ordered critical path to an 8k/90 ms number is:
    Rust crate plowrt already vendors behind `hf-tokenizer` and the normalizer
    sequence (NFKC / NFD / StripAccents / Lowercase / Replace / Strip) exists
    there under the same names -- plus the per-step cache that lets an n-gram
-   look back across the prefill/decode split;
+   look back across the prefill/decode split. **Both landed on 2026-09-14**
+   (`crates/plowrt/src/text/engram.rs`), so item 2 is complete but for the
+   gfx942 hardware run of ops 182/183, which is still queued behind a GPU
+   lease;
 3. a `deepseek_v41` claim in `devgen::run_verified` with `--block` emit, the
    pattern every family since M3 has started from -- V4.1's config/tensor
    binding is the substance here, since `hc_mult = 4` puts mHC on EVERY layer
