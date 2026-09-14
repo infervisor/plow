@@ -444,6 +444,61 @@ That is the single largest open design question for a sub-120 ms number, and
 it is orthogonal to the fp4 dequant: even a perfect MXFP4 unpack feeding a
 BM=192 tile leaves a third of the matrix engine idle on the average expert.
 
+### 5.6 The plow path to 90 ms, and the one kernel that gates it
+
+Target moved to 90 ms on 2026-09-14. `scripts/dsv41_roofline.py --target-ms 90`
+puts that at **28.9%** of matrix peak as built with collectives exposed, 23.6%
+if they overlap -- inside plow's own 35-55% gfx942 GEMM band. So unlike 70 ms,
+90 ms needs no fp8 expert kernel and no change of part.
+
+What it does need is an expert path that exists. Two items, in order:
+
+**1. A grouped MXFP4 prefill body for gfx942.** The ASM audit (5.3) found no
+MXFP4 grouped-MoE kernel in any servable object. The source says why, and says
+it deliberately: `d_moe_group_glu_pf` (`runtime/amd/op_moe.h:4739`) takes an
+`enc`, routes `PLOW_MOE_ENC_MXFP4` to `d_moe_group_pf_a4w4` under
+`PLOW_MOE_PF_A4W4`, and otherwise calls `moe_pf_refuse` -- "No body for this
+encoding in THIS object -- refuse, do not alias onto bf16."
+
+A4W4 is correctly unavailable here: `amd_arch.h` gates it on `PLOW_HAS_MX_MMA`
+= CDNA4, because fp4 on BOTH operands needs the scaled f8f6f4 matrix core that
+CDNA3 does not have. But that is not the only way to run mxfp4 experts, and
+`amd_arch.h:364-370` already draws the distinction: in **w4a16** fp4 is only a
+WEIGHT ENCODING, dequantized to bf16 before it reaches the matrix core, and
+that lowers to CDNA3 fine. Kimi-K3's routed experts run exactly this way.
+
+Every primitive is already in the tree and already verified:
+
+* `plow_fp4x8_to_f16x4` -- fp4 -> packed f16, matching CDNA4's native
+  `cvt_scalef32_pk_bf16_fp4` VALUE FOR VALUE, with a nibble-order oracle
+  (`runtime/tests/k3_mxfp4_nibble_*`) pinning the lane order;
+* the E8M0 scale is free -- a lane's b128 weight load is 16 bytes = 32 fp4 =
+  exactly one MX block, so one load consumes one scale byte and no cross-lane
+  reshuffle exists;
+* `GEMM_MXFP4_VARIANT` shows the shape: it is the SAME templated `d_gemm_t` as
+  the bf16 rung with the w4a16 B-fetch flag set, staging bf16 into the same
+  LDS halves.
+
+So the work is an `enc == PLOW_MOE_ENC_MXFP4` arm on `d_moe_group_pf_t` that
+dequants in the B-fetch, not a new kernel. It is verifiable without a GPU:
+`asm_audit.py` asserts the instruction selection, and 5.3's table gives the
+numbers to beat -- the fp8 grouped kernels run burst 3 at 16/32 wait-stalled
+with 112 spill ops, while a well-written gfx942 fp8 GEMM reaches burst 23 at
+4/48.
+
+**Dequant is not the bottleneck, so this is worth doing.** Reading every expert
+weight once at 8k is 543.6 B fp4 elements; `plow_fp4x8_to_f16x4` converts 8 per
+handful of VALU ops, so the whole dequant is well under a millisecond against
+13.3 ms of bf16 MFMA for the same weights. The fp4 encoding buys the memory
+traffic (5.3) and costs almost nothing in arithmetic.
+
+**2. A `deepseek_v41` route through devgen.** `crates/devgen/src/lib.rs` routes
+`glm5_next`, `glm_moe_dsa`, `kimi_k3`, and `kimi_k2`/`deepseek_v2`/
+`deepseek_v3`; there is no `deepseek_v4` or `deepseek_v41` arm, and the
+DeepSeek arm wires only `--block` (a full-model emit panics). That is the
+larger item, and it is section 10's point restated: serving goes through
+devgen, so this is the path a 90 ms number has to come out of.
+
 ## 6. Pipelining changes
 
 These are the changes that are NOT kernel bodies — they are dataflow and
