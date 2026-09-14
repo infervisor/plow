@@ -692,9 +692,17 @@ position alone.
 
 384 M rows x 256 fp8 is **98.3 GB per layer, 196.6 GB for the two** -- about 41%
 of the 475.3 GiB checkpoint, which is what "the checkpoint's largest tensors by
-far" means concretely. It fits 8x192 GB comfortably (24.6 GB/rank sharded), but
-it is the single biggest term in the memory plan and nothing else in this doc
-has been accounting for it.
+far" means concretely. It is the single biggest term in the memory plan and
+nothing else in this doc had been accounting for it.
+
+**Correct that to 202.8 GB (2026-09-14).** The 196.6 GB is the tables ALONE. Their
+ue8m0 scales add **6.1 GB** on top, because `weight_block_size` is `[32, 32]` and
+the rows are 256 wide: 8 scale bytes ride with every 256 weight bytes, a 3.1%
+surcharge applied to the largest tensors in the checkpoint. It still fits 8x192 GB
+(25.4 GB/rank sharded), but a capacity plan drawn from the weight figure is 6 GB
+short before anything else is allocated. `engram_tables_dominate_the_weight_budget`
+(`crates/devgen/src/mla/dsv41_tests.rs`) asserts both halves and the 1/32 ratio
+between them, so the surcharge cannot quietly go missing again.
 
 The TRAFFIC is negligible and does not move section 9's roofline. A token reads
 `n_heads` rows of `head_dim` fp8 = 2 KB; at 8k tokens over two layers that is
@@ -817,7 +825,18 @@ So the ordered critical path to an 8k/90 ms number is:
    the shards, which is how the absorbed-MLA fact in section 7 and the output-LoRA
    correction in section 5.2 were found. A tensor's ABSENCE is never evidence
    there -- a download may be partial -- so only a contradiction is reported.
-   What remains of item 3 is the emit itself;
+
+   The TENSOR contract has landed with it: `dsv41_layer_tensors` gives the
+   `(name, bytes)` list for every weight a layer carries, and
+   `dsv41_layer_tensors_match_the_shards` checks it against all 96 085 shard
+   tensors in BOTH directions -- nothing declared the shards lack, nothing in
+   the shards left unbound. The second direction is not symmetry for its own
+   sake: dropping `ffn.gate.bias_vl` (the image-span routing bias, no V4
+   analogue) passes the first check perfectly. It found two errors on its first
+   run, including an `engram.wkv` input sized `n_heads * head_dim` = 2048 where
+   this very section already said 6144 -- the prose was right and the code was
+   wrong, which is the argument for writing the check before the emit rather
+   than after it. What remains of item 3 is the emit itself;
 4. CSA2 emit (ops 180/181) and the two-level indexer in the block path. mHC
    comes along with the `glm53` emit, per the table above;
 5. full-model emit -- fork `glm53_emit_full` rather than writing one, since it
