@@ -85,12 +85,34 @@ def main():
     ap.add_argument("--arch", default="gfx942")
     ap.add_argument("--label", default="")
     ap.add_argument("--res", default="")
+    ap.add_argument("--symbol", action="append", default=[],
+                    help="audit one exact function; repeat for multiple vendor kernels")
     a = ap.parse_args()
 
     with tempfile.TemporaryDirectory() as tmp:
         elf = isa.unbundle(a.co, a.arch, tmp)
-        counts = {s.name: bucket(s) for s in isa.counts(elf, a.arch)}
+        selected = ([isa.count_symbol(elf, name, a.arch) for name in a.symbol]
+                    if a.symbol else isa.counts(elf, a.arch))
+        counts = {s.name: bucket(s) for s in selected}
+        object_meta = isa.notes(elf)
     meta = meta_from_remarks(a.res)
+    for name in counts:
+        if name in meta or name not in object_meta:
+            continue
+        note = object_meta[name]
+        waves = max(1, int(note.get("max_flat_workgroup_size", 64)) // 64)
+        lds = int(note.get("group_segment_fixed_size", 0))
+        meta[name] = {
+            "VGPRs": str(note.get("vgpr_count", 0)),
+            "AGPRs": str(note.get("agpr_count", 0)),
+            "SGPRs": str(note.get("sgpr_count", 0)),
+            "LDS Size [bytes/block]": str(lds),
+            "Occupancy [waves/SIMD]": str(isa.occupancy(
+                int(note.get("vgpr_count", 0)), lds, waves, a.arch)),
+            "ScratchSize [bytes/lane]": str(note.get("private_segment_fixed_size", 0)),
+            "VGPRs Spill": str(note.get("vgpr_spill_count", 0)),
+            "SGPRs Spill": str(note.get("sgpr_spill_count", 0)),
+        }
 
     arms = sorted(k for k in counts if not k.startswith("kx_") and counts[k]["total"] > 1)
     print(f"\nISA  variant '{a.label}'  {os.path.basename(a.co)}  [{a.arch}]")

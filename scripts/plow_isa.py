@@ -232,6 +232,39 @@ def counts(path, arch=None):
                       f"objdump {path}"))
 
 
+def count_symbol(path, name, arch=None):
+    """Count one exact function, including local-label regions in zero-sized vendor symbols."""
+    arch = arch or elf_arch(path)
+    funcs = sorted({(value, ndx, sym) for value, _, typ, ndx, sym in _symtab(path)
+                    if typ == "FUNC" and ndx != "UND"})
+    hits = sorted({(value, ndx) for value, ndx, sym in funcs if sym == name})
+    if len(hits) != 1:
+        sys.exit(f"plow_isa: {path}: expected one function named {name}, found {len(hits)}")
+    start, section = hits[0]
+    stops = [value for value, ndx, _ in funcs if ndx == section and value > start]
+    argv = [tool("llvm-objdump"), "-d", f"--mcpu={arch}", f"--start-address={start}"]
+    if stops:
+        argv.append(f"--stop-address={min(stops)}")
+    argv.append(path)
+    parts = parse(_run(argv, f"objdump symbol {name} from {path}"))
+    if not parts:
+        sys.exit(f"plow_isa: {path}: no instructions for {name}")
+    out = Sym(name)
+    for part in parts:
+        out.insn.update(part.insn)
+        out.fam.update(part.fam)
+        out.mfma.update(part.mfma)
+        out.fmt.update(part.fmt)
+        for mnemonic, formats in part.fmt_on.items():
+            out.fmt_on.setdefault(mnemonic, Counter()).update(formats)
+        out.spill += part.spill
+        out.narrow_ds += part.narrow_ds
+        out.total += part.total
+        out.burst = max(out.burst, part.burst)
+        out.stalled += part.stalled
+    return out
+
+
 # The AMDHSA note is msgpack printed by llvm-readelf as a YAML-ish block: a list under
 # `amdhsa.kernels`, one record per kernel, whose fields are `.name`, `.vgpr_count` and so on.
 # A record starts at the first field of a new list item; `.name` may appear anywhere in it,
