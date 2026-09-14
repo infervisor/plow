@@ -26,7 +26,12 @@ Three facts drive the answer and none of them are obvious from the config:
      8k is 268 MB on a ratio-1 layer -- larger than any weight tensor in the
      model.
 
+Caveat on --part MI355X: hwspec marks its MFMA throughput and xGMI bandwidth
+as DATASHEET peaks, not measured, unlike MI300X's HBM. And EFF_LO/EFF_HI are
+plow's gfx942 GEMM band, so applying them to gfx950 is extrapolation.
+
 Usage:  python3 scripts/dsv41_roofline.py [--tokens 8192] [--gpus 8]
+                [--part MI300X|MI355X] [--target-ms 300]
 """
 
 import argparse
@@ -39,19 +44,24 @@ HF = os.environ.get("DSV41_HF", "/workspace/models/DeepSeek-V4.1-Flash")
 # crates/hwspec/src/amd/mi300.rs. `mma` is MACs/cycle/matrix-core; CDNA3 has 4
 # matrix cores per CU, so peak = CUs * 4 * MACs * 2 FLOP/MAC * clock. That
 # reproduces the published 1307.4 (bf16) / 2614.9 (fp8) TFLOP/s dense exactly.
-CUS = 304
 MATRIX_CORES_PER_CU = 4
-CLOCK_HZ = 2.10e9
-MACS = {"bf16": 256, "fp8": 512, "fp4": None}
-HBM_MEASURED = 4091.9e9          # bandwidth_measured, not the 5325e9 datasheet
-XGMI_PER_GPU = 896.0e9           # interconnect.per_gpu_bandwidth
+PARTS = {
+    # crates/hwspec/src/amd/mi300.rs -- no fp4 matrix engine at all.
+    "MI300X": dict(cus=304, clock=2.10e9, hbm=4091.9e9, xgmi=896.0e9,
+                   macs={"bf16": 256, "fp8": 512, "fp4": None}),
+    # crates/hwspec/src/amd/mi350.rs -- gfx950 doubles every tier against CDNA3
+    # and adds fp4 at 2048, i.e. 4x bf16. HBM measured 6200, not the 8000 peak.
+    "MI355X": dict(cus=256, clock=2.40e9, hbm=6200.0e9, xgmi=1075.0e9,
+                   macs={"bf16": 512, "fp8": 1024, "fp4": 2048}),
+}
+PART = PARTS["MI300X"]
 
 
 def peak_flops(dtype):
-    m = MACS[dtype]
+    m = PART["macs"][dtype]
     if m is None:
         return None
-    return CUS * MATRIX_CORES_PER_CU * m * 2 * CLOCK_HZ
+    return PART["cus"] * MATRIX_CORES_PER_CU * m * 2 * PART["clock"]
 
 
 # Sustained fraction of dense matrix peak for a well-tuned GEMM of these shapes
@@ -65,9 +75,15 @@ def main():
     ap.add_argument("--tokens", type=int, default=8192)
     ap.add_argument("--gpus", type=int, default=8)
     ap.add_argument("--target-ms", type=float, default=300.0)
+    ap.add_argument("--part", choices=sorted(PARTS), default="MI300X")
     ap.add_argument("--json-out", default="")
     a = ap.parse_args()
     T, G = a.tokens, a.gpus
+
+    global PART
+    PART = PARTS[a.part]
+    HBM_MEASURED = PART["hbm"]
+    XGMI_PER_GPU = PART["xgmi"]
 
     c = json.load(open(os.path.join(HF, "config.json")))["text_config"]
     H = c["hidden_size"]                      # 5120
@@ -215,7 +231,7 @@ def main():
     t_mem = total_bytes / hbm
     t_coll = total_coll / xgmi
 
-    print(f"DeepSeek-V4.1-Flash roofline -- {T} token prefill on {G}x MI300X (gfx942)")
+    print(f"DeepSeek-V4.1-Flash roofline -- {T} token prefill on {G}x {a.part}")
     print(f"  source: {HF}/config.json + safetensors headers; hwspec MI300X\n")
 
     print("FLOPs")
@@ -268,10 +284,14 @@ def main():
     # -- half of fp8. Price the experts there and the rest at fp8.
     expert_flops = f["routed_expert"] + f["shared_expert"]
     other_flops = total_flops - expert_flops
-    t_built_peak = expert_flops / bf16_peak + other_flops / fp8_peak
+    expert_rate = peak_flops("fp4")
+    expert_rate = expert_rate * G if expert_rate else bf16_peak
+    t_built_peak = expert_flops / expert_rate + other_flops / fp8_peak
     b_lo = max(t_built_peak / EFF_HI, t_mem)
     b_hi = max(t_built_peak / EFF_LO, t_mem) + t_coll
-    print("\n  As built (experts at the bf16 MFMA the mxfp4 kernels actually issue)")
+    lbl = ("experts at NATIVE fp4 MFMA" if PART["macs"]["fp4"]
+           else "experts at the bf16 MFMA the mxfp4 kernels actually issue")
+    print(f"\n  As built ({lbl})")
     print(f"    compute @100%          {t_built_peak*1e3:>10.1f} ms")
     print(f"    AS-BUILT floor         {b_lo*1e3:>7.0f} - {b_hi*1e3:.0f} ms"
           f"   headroom {300/(b_lo*1e3):.1f}x - {300/(b_hi*1e3):.1f}x")
@@ -283,7 +303,7 @@ def main():
     tgt = a.target_ms / 1e3
     print(f"\nBudget for a {a.target_ms:.0f} ms target")
     print(f"  {'':<26}{'exposed coll':>14}{'overlapped':>13}")
-    for label, peak_t in (("as built (experts bf16)", t_built_peak),
+    for label, peak_t in ((f"as built ({a.part})", t_built_peak),
                           ("if experts reach fp8", total_flops / fp8_peak)):
         need_x = peak_t / max(tgt - t_coll, 1e-9)
         need_o = peak_t / tgt
