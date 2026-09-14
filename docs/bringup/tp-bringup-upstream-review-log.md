@@ -992,6 +992,44 @@ One arm only, since the positive is established. Clean => row-band convicted. Fa
 exonerated AND the shipping set has a memory-safety fault under concurrent retrieval, which is the
 bigger problem and wants escalating on its own.
 
+### VERDICT: the null is clean — ROW-BAND IS THE CAUSE (2026-09-14, job `0-rbfault3-null`)
+
+```
+preflight ok: shipping set 8b15f4a28b289a72, no OBJECT16 (row_split_ready false by construction)
+   quality rc=0
+   sibling selected: 0   (MUST be 0 for this to be a null)
+   fault lines:      0
+== NULL CLEAN => ROW-BAND CONVICTED.
+```
+
+The shipping set ran the identical suite — same `quality.py --suite all --concurrency 20`, same
+client, same 67 000-token tails — **clean, with a passing quality run**. It also walked the same
+rung transitions the faulting arms did (`decode admission rung from=16 to=8 occupied_extent=20`,
+then `rung=20 occupied=20`), so the rung/admission machinery is exonerated as well. Against the
+established positive (`rbfault2` `on`: VALID, FAULTED), the lever is the only difference.
+
+**Consequences.**
+
+* Row-band causes a memory-safety fault under concurrent retrieval. It is not a default candidate
+  and not a merge candidate until fixed.
+* **The stacked T4 result is withdrawn as a shippable finding.** `-8.86 ms` at isl8192 C1 was
+  measured on `9e76b70bf97ee4a6`, and `rbfault2` showed that packet faults under C20 retrieval. The
+  number stands as a measurement of what row-band would buy; it does not stand as a result we can
+  take.
+* Row-band now has **two** separate defects: this one, and the broken `PLOW_GLM_ROWBAND=0` rollback
+  (twins bound to address 0 as a poison pointer, and something dereferences one at load — the fault
+  address `0x13000` is that base plus an offset, so the comment "nothing may read it, because the
+  siblings that would are never dispatched" is false).
+* The shipping set is healthy under this workload, which is worth recording in its own right: 18/18
+  base, 21/21 tail, zero faults at C20 with 67k tails.
+
+**Where to look next**, stated as a lead and not a conclusion: the fault needs C20 with mixed
+lengths, and does not appear in the C1/C16 fixed-shape T4 cells. Under row-band each rank owns rows
+`[rank*T/8, (rank+1)*T/8)` of the chunk; the sparse-MLA span path that feeds it is per-sequence. A
+band that spans rows belonging to more than one packed sequence, or that indexes a KV slot from the
+wrong member, would produce exactly this signature. That is the first thing to check, before the
+`rowsplit_prior_ok` / `band_keys` gate, which reads correctly in isolation.
+
 ## Every gfx942 GEMM tile is chosen by the analytical model, and 4961 measured records sit unused (2026-09-14)
 
 `plowc tune status --gpu MI300X` states it directly:
