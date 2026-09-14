@@ -419,6 +419,9 @@ pub struct AppleRuntimeConfig {
     /// Reuse plain BF16 projection weights across two decode rows.
     #[arg(long = "metal-bf16-m2", env = "PLOW_METAL_BF16_M2", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub bf16_m2: bool,
+    /// Reuse plain BF16 projection weights across four decode rows.
+    #[arg(long = "metal-bf16-m4", env = "PLOW_METAL_BF16_M4", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub bf16_m4: bool,
     /// CPU decode column share: percent[:instruction count].
     #[arg(long = "apple-cpu-share", env = "PLOW_CPU_SHARE", global = true)]
     pub cpu_share: Option<String>,

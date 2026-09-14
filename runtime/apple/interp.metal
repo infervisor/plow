@@ -257,6 +257,48 @@ inline void dot4_bf16_pair(device const ushort* W, uint ldw, device const ushort
     a1 = float4(simd_sum(acc1.x), simd_sum(acc1.y), simd_sum(acc1.z), simd_sum(acc1.w));
 }
 #endif
+#ifdef PLOW_BF16_M4
+inline void dot4_bf16_quad(device const ushort* W, uint ldw, device const ushort* x,
+                          uint K, uint lane, thread float4& a0, thread float4& a1,
+                          thread float4& a2, thread float4& a3) {
+    float4 acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    uint k = lane * 8u;
+    for (; k + 8u <= K; k += 256u) {
+        float4 x0 = bf4(*(device const ushort4*)(x + k));
+        float4 x1 = bf4(*(device const ushort4*)(x + k + 4u));
+        float4 y0 = bf4(*(device const ushort4*)(x + K + k));
+        float4 y1 = bf4(*(device const ushort4*)(x + K + k + 4u));
+        float4 z0 = bf4(*(device const ushort4*)(x + 2u * K + k));
+        float4 z1 = bf4(*(device const ushort4*)(x + 2u * K + k + 4u));
+        float4 t0 = bf4(*(device const ushort4*)(x + 3u * K + k));
+        float4 t1 = bf4(*(device const ushort4*)(x + 3u * K + k + 4u));
+        for (uint r = 0; r < 4u; r++) {
+            device const ushort* w = W + r * ldw + k;
+            float4 w0 = bf4(*(device const ushort4*)w);
+            float4 w1 = bf4(*(device const ushort4*)(w + 4u));
+            acc0[r] += dot(w0, x0) + dot(w1, x1);
+            acc1[r] += dot(w0, y0) + dot(w1, y1);
+            acc2[r] += dot(w0, z0) + dot(w1, z1);
+            acc3[r] += dot(w0, t0) + dot(w1, t1);
+        }
+    }
+    for (k = (K & ~7u) + lane; k < K; k += 32u) {
+        float xv = bf2f(x[k]), yv = bf2f(x[K + k]);
+        float zv = bf2f(x[2u * K + k]), tv = bf2f(x[3u * K + k]);
+        for (uint r = 0; r < 4u; r++) {
+            float wv = bf2f(W[r * ldw + k]);
+            acc0[r] += wv * xv;
+            acc1[r] += wv * yv;
+            acc2[r] += wv * zv;
+            acc3[r] += wv * tv;
+        }
+    }
+    a0 = float4(simd_sum(acc0.x), simd_sum(acc0.y), simd_sum(acc0.z), simd_sum(acc0.w));
+    a1 = float4(simd_sum(acc1.x), simd_sum(acc1.y), simd_sum(acc1.z), simd_sum(acc1.w));
+    a2 = float4(simd_sum(acc2.x), simd_sum(acc2.y), simd_sum(acc2.z), simd_sum(acc2.w));
+    a3 = float4(simd_sum(acc3.x), simd_sum(acc3.y), simd_sum(acc3.z), simd_sum(acc3.w));
+}
+#endif
 inline float4 dot4_fp8(device const uchar* W, uint ldw, device const ushort* x, uint K, uint lane) {
     float4 acc = 0.0f;
     uint k = lane * 8u;
@@ -344,6 +386,30 @@ void op_gemv(const thread Inst& in, device const ulong* tab, uint slice, uint nb
     float eps = as_type<float>(in.fj[0]);
     uint n0, n1;
     range(N, slice, nblk, n0, n1);
+#ifdef PLOW_BF16_M4
+    if (M == 4u && norm == 0u && (n0 % 4u) == 0u && (n1 % 4u) == 0u) {
+        for (uint n = n0 + sg * 4u; n + 4u <= n1; n += NSG * 4u) {
+            float4 a0, a1, a2, a3;
+            dot4_bf16_quad(W + n * K, K, x, K, lane, a0, a1, a2, a3);
+            if (bias) {
+                float4 b = float4(bf2f(bias[n]), bf2f(bias[n + 1u]),
+                                  bf2f(bias[n + 2u]), bf2f(bias[n + 3u]));
+                a0 += b; a1 += b; a2 += b; a3 += b;
+            }
+            if (lane == 0) {
+                C[n] = f2bf(a0.x); C[n + 1u] = f2bf(a0.y);
+                C[n + 2u] = f2bf(a0.z); C[n + 3u] = f2bf(a0.w);
+                C[N + n] = f2bf(a1.x); C[N + n + 1u] = f2bf(a1.y);
+                C[N + n + 2u] = f2bf(a1.z); C[N + n + 3u] = f2bf(a1.w);
+                C[2u * N + n] = f2bf(a2.x); C[2u * N + n + 1u] = f2bf(a2.y);
+                C[2u * N + n + 2u] = f2bf(a2.z); C[2u * N + n + 3u] = f2bf(a2.w);
+                C[3u * N + n] = f2bf(a3.x); C[3u * N + n + 1u] = f2bf(a3.y);
+                C[3u * N + n + 2u] = f2bf(a3.z); C[3u * N + n + 3u] = f2bf(a3.w);
+            }
+        }
+        return;
+    }
+#endif
 #ifdef PLOW_BF16_M2
     if (M == 2u && norm == 0u && (n0 % 4u) == 0u && (n1 % 4u) == 0u) {
         for (uint n = n0 + sg * 4u; n + 4u <= n1; n += NSG * 4u) {
