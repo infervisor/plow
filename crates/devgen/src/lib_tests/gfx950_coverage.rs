@@ -181,6 +181,21 @@ fn covered_opcodes_pass_and_nvidia_is_never_checked() {
                 blocks: 1,
                 ..Default::default()
             },
+            packet::dev::DevInst {
+                op: DevOp::GemmLtPf as u16,
+                blocks: 1,
+                ..Default::default()
+            },
+            packet::dev::DevInst {
+                op: DevOp::GemmBlkPf as u16,
+                blocks: 1,
+                ..Default::default()
+            },
+            packet::dev::DevInst {
+                op: DevOp::MoeAiterFp8Pf as u16,
+                blocks: 1,
+                ..Default::default()
+            },
         ],
         stream: vec![],
         stream_ofs: vec![],

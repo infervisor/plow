@@ -6680,14 +6680,18 @@ impl AmdEngine {
         }
         let has_gemm_lt = |p: &DevProg| p.insts.iter().any(|d| d.op == DevOp::GemmLtPf as u16);
         let use_gemm_lt = blob.progs.iter().any(has_gemm_lt);
+        let gemma_gemm_lt = blob.progs.iter().flat_map(|p| &p.insts).any(|d| {
+            d.op == DevOp::GemmLtPf as u16 && d.i[3] == 3
+        });
         if use_gemm_lt
             && (arch != "gfx942"
-                || tp.is_none_or(|b| b.n_gpu != 8)
-                || !blob.progs.iter().all(amd_gemm_lt::modes_match))
+                || !amd_gemm_lt::topology_matches(
+                    &blob.progs,
+                    tp.as_ref().map(|b| b.n_gpu),
+                ))
         {
             return Err(RuntimeError::Device(
-                "hipBLASLt projection requires gfx942 TP8 and a matching prefill/decode mode"
-                    .into(),
+                "hipBLASLt projection requires a qualified gfx942 topology and mode".into(),
             ));
         }
         let has_gemm_blk = |p: &DevProg| p.insts.iter().any(|d| d.op == DevOp::GemmBlkPf as u16);
@@ -8559,7 +8563,12 @@ impl AmdEngine {
             None => None,
         };
         let gemm_lt = if use_gemm_lt {
-            Some(amd_gemm_lt::GemmLt::load(&be, &hsaco_dir, &mut modules)?)
+            Some(amd_gemm_lt::GemmLt::load(
+                &be,
+                &hsaco_dir,
+                gemma_gemm_lt,
+                &mut modules,
+            )?)
         } else {
             None
         };

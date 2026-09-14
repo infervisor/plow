@@ -4105,6 +4105,35 @@ fn emit_phase(
                 }
             });
         }
+        if !gemv_family
+            && !fp8
+            && !mx4_pf
+            && emit_config::active().gemma_gemm_lt
+            && amd
+            && amd_target::active().1 == hwspec::IsaLevel::Gfx942
+            && c.arch == config::Arch::Gemma4
+            && c.tp == 1
+            && c.hidden == 5376
+            && c.inter == 21504
+            && n_cu == 304
+            && matches!(m, 2048 | 4096 | 8192)
+            && matches!(
+                (m, nn, k),
+                (2048, 5376, 8192 | 21504) | (4096 | 8192, 5376, 8192 | 16384 | 21504)
+            )
+        {
+            let counter = b.emit(DevOp::GemmLtPf, vec![0], deps, |d| {
+                d.t[0] = out;
+                d.t[1] = a;
+                d.t[2] = w;
+                d.i[0] = m;
+                d.i[1] = nn;
+                d.i[2] = k;
+                d.i[3] = 3;
+            });
+            b.isolate(counter);
+            return counter;
+        }
         let fold = gemv_family && gamma != TENSOR_NONE;
         let op = if gemv_family {
             DevOp::Gemv
@@ -8197,6 +8226,13 @@ const GFX950_DISPATCHED: &[&str] = &[
     "PLOW_DOP_XREDUCE_ADD_NORM",
 ];
 
+/// Opcodes executed by isolated `AmdEngine` segments instead of `interp.hip`.
+const AMD_HOST_DISPATCHED: &[&str] = &[
+    "PLOW_DOP_GEMM_BLK_PF",
+    "PLOW_DOP_GEMM_LT_PF",
+    "PLOW_DOP_MOE_AITER_FP8_PF",
+];
+
 /// Refuse a packet carrying an opcode the gfx950 interpreter has no arm for.
 ///
 /// Coarse ON PURPOSE: "is there a `case` anywhere in interp.hip", not "is there one under the
@@ -8266,7 +8302,10 @@ fn check_gfx950_opcode_coverage(m: &Model, amd: bool) {
                 continue;
             };
             let c = op.c_name();
-            if !GFX950_DISPATCHED.contains(&c) && !missing.contains(&c) {
+            if !GFX950_DISPATCHED.contains(&c)
+                && !AMD_HOST_DISPATCHED.contains(&c)
+                && !missing.contains(&c)
+            {
                 missing.push(c);
             }
         }

@@ -778,6 +778,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.qwen_w8a8_prefill", Some("PLOW_QWEN_W8A8_PREFILL"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.decode_cublaslt", Some("PLOW_EMIT_DECODE_CUBLASLT"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.prefill_cublaslt", Some("PLOW_EMIT_PREFILL_CUBLASLT"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("emit.gemma_gemm_lt", Some("PLOW_GEMMA_GEMM_LT"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.decode_native_tc", Some("PLOW_EMIT_DECODE_NATIVE_TC"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.qwen_fuse_ab", Some("PLOW_QWEN_FUSE_AB"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.qwen_fuse_mlp", Some("PLOW_QWEN_FUSE_MLP"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
