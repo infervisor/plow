@@ -969,6 +969,40 @@ script observes `PLOW_MLA_PREFILL=full` with no replay (48 shapes), a neighbour 
 ships (40) — and "48 ought to be a superset of 40" is the reasoning that let this cell go stale in
 the first place.
 
+## MTP takes isl8192 C1 decode to 16.35 ms, and the T3 gate is red for two unrelated reasons (2026-09-14, job `spec-t3`)
+
+Three arms (ctrl / treat / ctrl2), 69.8 min, `spec_t3.py` scoring. Both controls pinned tight, so
+the treat deltas are readable.
+
+| cell | ctrl / **treat** / ctrl2 TPOT ms | spread | Δ | verdict |
+|---|---|---|---|---|
+| isl1024-c1 | 40.20 / **12.55** / 40.15 | 0.05 | −68.8% | FAIL (ttft) |
+| isl1024-c4 | 42.96 / **31.02** / 42.91 | 0.05 | −27.8% | PASS |
+| **isl8192-c1** | 42.99 / **16.35** / 42.95 | 0.03 | **−62.0%** | **PASS** |
+| isl8192-c4 | 51.20 / **40.78** / 51.17 | 0.03 | −20.3% | PASS |
+
+* **The goal cell passes at 16.35 ms against a 25 ms target**, with tok/s 21.3 → 48.8 and TTFT
+  1007.2 → 947.2. Acceptance 2568/2955 = 86.9%, 3.42 committed per verify over 1059 verifies.
+* **What the number is**: time per COMMITTED token. The decode tick is not faster; it commits ~3.4
+  tokens. The 2.3× tok/s says the amortisation is real end to end, but it is amortisation.
+* **Quality holds**: retrieval treat **18/18 base, 21/21 tail**; GSM8K ctrl 98/100 vs treat 97/100
+  (tolerance 3). Both PASS. `treat server error lines: 0`, `ctrl2 server error lines: 0`.
+
+The overall `T3 FAIL` has two causes, and only one of them is MTP's. Reading `spec_t3.py:80`, the
+printed booleans are the `*_ok` flags — **True means that criterion passed**:
+
+1. **All four natural-text cells fail on `failed` alone** (`tpot True, ttft True, failed False`).
+   The natural client failed on **every arm, controls included** — `gate C1: 2/16 ok` on ctrl2,
+   `1/16` on treat, `gate C4: 4/32 ok` on both — while both servers logged zero error lines. That is
+   a client-side defect in `nat_client.py`, not a property of the lever; those cells carry no signal
+   in either direction and should not be read as evidence against MTP.
+2. **`isl1024-c1` fails on `ttft`**: 194.4 → 242.3 ms, +48 ms / +25%. This one IS MTP's and is the
+   real finding in the red gate — at short context there is too little decode to amortise the draft
+   cost against. Note it does not appear at 8192, where TTFT improved.
+
+Next: fix `nat_client.py` before re-running T3, and decide whether MTP should be gated by prompt
+length (the isl1024 TTFT regression is exactly the shape a length gate would remove).
+
 ## Artefact policy (applied on every merge)
 
 Raw measurement files pushed upstream are removed here before the branch goes to main:
