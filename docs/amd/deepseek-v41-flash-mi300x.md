@@ -537,9 +537,36 @@ no packet can reach them:
   output's last `rd` dims (`runtime/tests/dsv4_ops_gfx942_test.hip`,
   `[DSV4-IROPE]`). Same: test-only.
 
-Wiring these is the standard add-an-opcode flow -- `dev_isa.h` enum (next free
-slot is 180), an `interp.hip` case, the presence macro, and the `DevOp` mirrors
-in `devgen` and `plowrt`. No new math.
+**Both are wired as of 2026-09-14** -- `PLOW_DOP_COMPRESS_POOL = 180` and
+`PLOW_DOP_ROPE_INVERSE_O = 181`, behind a `PLOW_DSV4_CSA2` build axis that
+defaults off, with a `plow_dsv4_csa2_arm` marker the loader requires before it
+will accept a CSA2 packet. With the axis off the gfx942 interpreter's `.text` is
+byte-identical to what it was before; with it on the object grows ~20 KB.
+
+`d_rope_inverse_o` gained an optional `pos` tensor in the process. It took
+`pos0` as an immediate, which cannot work for decode -- the packet stream is
+built once and replayed -- and every other rope op in the tree reads the
+device-resident counter instead (`d_headnorm_rope`'s `t5`, `d_compress_pool`'s
+own `pos`). Verified on gfx942 hardware: `dsv4_ops_gfx942_test` passes with 0
+failures after the change, including the inverse rotation at `pos0 = 0` and
+`pos0 = 1000` (worst relative error 3.9e-03 against the host reference, which
+is bf16 rounding), alongside the V4 router's sqrtsoftplus and hash arms, the
+mHC head gate, and the clamped SwiGLU at act code 4.
+
+`compress_pool_gfx942_test` passes on gfx942 as well, 0 failures across all
+eleven cases and **exact** (0.00e+00 relative error) on every one: both template
+arms (the fp8 path and the `ROTATE` Hadamard-rotated fp4 path), both the
+prefill form and the decode form, at `out_base` 0/2/3/5, and -- the case that
+matters most for op 180's contract -- the three decode calls at a position that
+is NOT a `ratio` boundary, each of which correctly writes nothing at all. That
+gate is why `t7 = pos` is the decode form rather than a patched immediate.
+
+One trap worth recording, because it cost a build cycle and would have shipped
+silently: the first placement of the two `case` arms was inside `interp.hip`'s
+`#if PLOW_K3` region, so they compiled to nothing in a non-K3 object. Nothing
+failed -- the object simply did not grow. What caught it was diffing the armed
+object's `.text` against the unarmed one and finding them identical, which is
+the same check that proves the axis-off path unchanged. Run both directions.
 
 One piece has **nothing at all**: **Engram**. `engram_layer_ids` names layers 1
 and 14; each carries an fp8 table of `engram_num_embeddings` rows of
