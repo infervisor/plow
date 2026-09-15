@@ -1005,10 +1005,10 @@ pub(crate) fn emit_dsv41_attn_core(
 /// `crates/plowrt/src/exec/amd.rs` matches this string literally to bind the tensor into the peer
 /// region instead of local VRAM. Renaming it here silently un-peers the buffer.
 pub(crate) const PEER_SLOT_O: &str = "act.og_tp";
-/// Peer slot 2, where the shared expert's down projection writes its partial. Slot 1
-/// (`act.dg_tp`) is the routed combine's and slot 0 is attention's; see `emit_dsv41_ffn_shared`
-/// for why this one cannot share either.
-pub(crate) const PEER_SLOT_SHARED: &str = "act.ug_tp";
+/// Where the shared expert's down projection writes its partial: SLOT 0, the same one attention
+/// used earlier in the layer. See `emit_dsv41_ffn_shared` for why reusing it is safe here and why
+/// a third slot is not available.
+pub(crate) const PEER_SLOT_SHARED: &str = PEER_SLOT_O;
 /// Peer slot 1, the routed-expert combine's partial. The GLM MoE body writes `GlmTn::dg_tp` and
 /// reduces it, and a `TENSOR_NONE` there would make the combine write nothing at tp>1.
 pub(crate) const PEER_SLOT_MOE: &str = "act.dg_tp";
@@ -1195,14 +1195,25 @@ pub(crate) fn emit_dsv41_ffn_shared(
         // and it has to land where peers can read it. `d_xreduce` sums `peer_scratch[r] + slot`
         // over every rank and never reads `out`, so a partial written to an ordinary arena tensor
         // contributes nothing and the reduce returns the sum of whatever else is at that offset.
-        // SLOT 2 (`act.ug_tp`), not slot 0: slot 0 is this same layer's attention partial, and
-        // passing the attention reduce only proves every peer ARRIVED, not that every peer has
-        // finished READING -- a fast rank would overwrite slot 0 under a slow peer. K3 reuses
-        // slot 0 safely only because its shared expert is ordered after a SECOND collective
-        // (`k3.rs:1609`); V4.1's shared expert runs before the MoE combine, so it cannot be.
+        //
+        // SLOT 0, reusing attention's, because THERE ARE ONLY TWO SLOTS TO SPEND. The host does not
+        // read a slot count from the packet: `DevBlob::parse` recovers `slot_bytes` as `max(i[2])`
+        // over the collectives (`devblob.rs:191`, "slot A carries 0 and slot B carries the" unit),
+        // so an op passing `2 * slot_b` does not buy a third slot -- it redefines the UNIT as
+        // twice what every other op meant by it, and the host then binds `act.dg_tp` at
+        // `2 * slot_b` while the combine reads `slot_b`. That is what this emit did on its first
+        // TP8 run: every reduce past attention read an offset nothing was bound at, and the run
+        // came back with 2498560 NaN and a 30-second collective timeout on every iteration.
+        //
+        // Reusing slot 0 is safe HERE for the reason K3's could not be (`k3.rs:1609`): K3's worry
+        // is a ONE-SHOT gate, which says every peer ARRIVED and not that every peer finished
+        // READING. Attention's reduce is `XReduceTwoShot` -- reduce-scatter then all-gather -- so
+        // a rank cannot complete it until every peer has both contributed and published its band,
+        // which is exactly "finished reading slot 0". `AmdTpGroup::run_rung` also drains every rank
+        // between segments, and the two reduces are in different segments.
         sh_part: if tp == 1 {
-            // A group of one has nothing to reduce, and slot 2 does not exist at tp=1 (the host
-            // maps no peer region), so the down projection writes the output directly.
+            // A group of one has nothing to reduce, and there is no peer region at tp=1, so the
+            // down projection writes the output directly.
             b.tensor(&format!("act.l{l}.sh_out"), (t as u64) * (hidden as u64) * 2)
         } else {
             b.tensor(PEER_SLOT_SHARED, (t as u64) * (hidden as u64) * 2)
@@ -1279,9 +1290,9 @@ pub(crate) fn emit_dsv41_ffn_shared(
         act.sh_out,
         t * hidden,
         tp,
-        // Byte offset, not an index: the host binds `act.ug_tp` at `scratch_base + 2 * slot_b`
-        // (`exec/amd.rs:8838`) and `slot_b` is the blob's `t * hidden * 2`.
-        2 * t * hidden * 2,
+        // SLOT 0. The unit the host recovers is `max(i[2])` across the packet, and the routed
+        // combine's `n.slot_b` is what sets it; anything larger here would move that unit.
+        0,
     );
     (act, c_xr)
 }

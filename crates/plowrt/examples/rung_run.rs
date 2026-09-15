@@ -119,6 +119,10 @@ mod hsa {
         let mut prog = 0usize;
         let mut exit = String::from("act.hc_residual_a");
         let mut entry = String::from("act.hc_residual_a");
+        // Comma-separated activation names to report after ONE launch, in the order given. The
+        // question a non-finite exit raises is not "is it wrong" but "WHERE does it first go
+        // wrong", and a layer is 35 ops deep -- reading the exit alone cannot answer that.
+        let mut probe = String::new();
         while let Some(a) = args.next() {
             match a.as_str() {
                 "--checkpoint" => checkpoint = args.next().map(PathBuf::from),
@@ -127,6 +131,7 @@ mod hsa {
                 "--prog" => prog = args.next().ok_or("--prog needs a value")?.parse()?,
                 "--exit" => exit = args.next().ok_or("--exit needs a value")?,
                 "--entry" => entry = args.next().ok_or("--entry needs a value")?,
+                "--probe" => probe = args.next().ok_or("--probe needs a value")?,
                 other => return Err(format!("unknown argument {other}").into()),
             }
         }
@@ -207,6 +212,36 @@ mod hsa {
                  trap — the dispatch `default:` leaves the buffer untouched — so an all-zero exit \
                  is what a missing arm looks like."
             );
+        }
+
+        // The probe, in dataflow order: the FIRST name whose stats are not finite is the op to
+        // look at, and everything after it is downstream noise.
+        if !probe.is_empty() {
+            println!("probe (dataflow order; the first non-finite row is the one that matters):");
+            for name in probe.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                let Some(b) = g.rank(0).tensor_bytes(name) else {
+                    println!("  {name:32} NOT DECLARED");
+                    continue;
+                };
+                let mut buf = vec![0u8; b as usize];
+                if let Err(e) = g.rank(0).read_tensor(name, &mut buf) {
+                    println!("  {name:32} unreadable: {e}");
+                    continue;
+                }
+                let st = stats(&buf);
+                println!(
+                    "  {name:32} {:>10} elems  min {:>14.5}  max {:>14.5}  mean {:>14.6}  \
+                     zero {:>8}  NaN {:>8}  Inf {:>8}{}",
+                    st.n,
+                    st.min,
+                    st.max,
+                    st.mean,
+                    st.zero,
+                    st.nan,
+                    st.inf,
+                    if st.nan > 0 || st.inf > 0 { "  <-- NON-FINITE" } else { "" }
+                );
+            }
         }
 
         let mut us: Vec<f64> = Vec::with_capacity(iters as usize);
