@@ -1042,6 +1042,12 @@ impl AmdTpGroup {
         let mut i = 0usize;
         let t0 = dstep::on().then(std::time::Instant::now);
         let mut launched_at: Option<std::time::Instant> = None;
+        // Prepare every rank's complete packet chain before publishing any doorbell. Ringing each
+        // segment as it is written lets an early GPU run ahead of the host's segment-major loop;
+        // at wide rungs that can put peers in different collective segments.
+        for e in &*ranks {
+            e.begin_decode_replay(dp)?;
+        }
         self.group.launch_token(self.reset, |_| {
             if let (Some(t0), None) = (t0, launched_at) {
                 let now = std::time::Instant::now();
@@ -1061,6 +1067,9 @@ impl AmdTpGroup {
             let e = &mut ranks[rank];
             let k = e.decode_kernel_for(dp);
             e.enqueue_decode_segment(dp, seg, k)?;
+        }
+        for e in &*ranks {
+            e.commit_decode_replay()?;
         }
         if let Some(z) = launched_at {
             dstep::ENQUEUE.add(z.elapsed().as_nanos() as u64);

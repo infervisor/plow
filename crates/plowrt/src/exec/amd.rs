@@ -12214,6 +12214,27 @@ impl AmdEngine {
         self.prog_dispatch(p).launches()
     }
 
+    fn decode_segment_launches(&self, p: usize, seg: usize) -> usize {
+        match self.progs[p].decode_routes.get(seg) {
+            Some(DecodeSegmentRoute::SparseMlaDecode(route)) if route.active => 3,
+            Some(DecodeSegmentRoute::MoeAiter(route)) => route.launches() as usize,
+            Some(DecodeSegmentRoute::GroupedMoeMxfp4 { .. }) => 2,
+            Some(_) => 1,
+            None => 0,
+        }
+    }
+
+    pub(crate) fn begin_decode_replay(&self, p: usize) -> Result<()> {
+        let packets = (0..self.decode_launches(p))
+            .map(|seg| self.decode_segment_launches(p, seg))
+            .sum();
+        self.be.begin_dispatch_chain(packets)
+    }
+
+    pub(crate) fn commit_decode_replay(&self) -> Result<()> {
+        self.be.commit_dispatch_chain()
+    }
+
     pub(crate) fn graph_phase_replay(&self, p: usize) -> bool {
         self.progs[p]
             .prefill_routes
