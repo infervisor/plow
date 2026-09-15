@@ -1570,11 +1570,15 @@ printf '%s\n' "${ROWS[@]}" | while IFS='|' read -r stem axes; do
   case "$stem" in
     interp_decode*) echo "${stem}_gq|$axes $AX_GQ $AX_DECODE_GQ" ;;
     *)
+      pf_place=""
+      if [ -n "$AX_PREFILL_PLACE" ] && [[ "$axes" != *"-DPLOW_L2_PLACE_DISPATCH=1"* ]]; then
+        pf_place="$AX_PREFILL_PLACE"
+      fi
       pf_hier=""
-      if [[ "$axes" == *"-DPLOW_L2_PLACE_DISPATCH=1"* ]] && [ "${PLOW_GATE_HIER_PF:-1}" != 0 ]; then
+      if [ -n "$AX_PREFILL_PLACE" ] && [ "${PLOW_GATE_HIER_PF:-1}" != 0 ]; then
         pf_hier="-DPLOW_GATE_HIER=1"
       fi
-      echo "${stem}_gq|$axes $AX_GQ $pf_hier"
+      echo "${stem}_gq|$axes $AX_GQ $pf_place $pf_hier"
       ;;
   esac
 done | xargs -P "$JOBS" -I{} bash -c 'IFS="|" read -r s a <<< "{}"; one "$s" $a'
@@ -1599,11 +1603,15 @@ fi
     case "$stem" in
       interp_decode*) gq_axes="$axes $AX_GQ $AX_DECODE_GQ" ;;
       *)
+        pf_place=""
+        if [ -n "$AX_PREFILL_PLACE" ] && [[ "$axes" != *"-DPLOW_L2_PLACE_DISPATCH=1"* ]]; then
+          pf_place="$AX_PREFILL_PLACE"
+        fi
         pf_hier=""
-        if [[ "$axes" == *"-DPLOW_L2_PLACE_DISPATCH=1"* ]] && [ "${PLOW_GATE_HIER_PF:-1}" != 0 ]; then
+        if [ -n "$AX_PREFILL_PLACE" ] && [ "${PLOW_GATE_HIER_PF:-1}" != 0 ]; then
           pf_hier="-DPLOW_GATE_HIER=1"
         fi
-        gq_axes="$axes $AX_GQ $pf_hier"
+        gq_axes="$axes $AX_GQ $pf_place $pf_hier"
         ;;
     esac
     for pair in "$stem|$axes" "${stem}_gq|$gq_axes"; do

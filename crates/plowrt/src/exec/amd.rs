@@ -7584,6 +7584,12 @@ impl AmdEngine {
                     markers
                 )));
             }
+            if sched_prefill == Sched::GlobalQueue
+                && prefill_l2_placed
+                && !syms.contains(&L2_DISPATCH_SYM)
+            {
+                return Err(RuntimeError::Device(l2_pairing_refusal(&path, phase)));
+            }
             check_interpreter_waves(
                 elf_symbol_u32(&image, "plow_geom_PLOW_WG_WAVES"), phase, &path,
             )?;
