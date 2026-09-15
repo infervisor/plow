@@ -18,13 +18,12 @@
 //! # Decode and prefill do NOT have the same shape
 //!
 //! Decode normally is one dispatch per rank, so "launch all, drain all" is the whole story.
-//! The narrow standalone-raw decode path is segmented: its first segment is launched on every
-//! rank before any later segment is submitted, later launches are enqueued segment-major across
-//! ranks, and every rank's queue preserves that identical order. The raw segment has no local or
-//! cross-rank counter obligations; interpreter collectives retain distinct cross-rank gates, and
-//! the exact cross-rank counter audit remains mandatory every token. A 64-step TP8 stress run on
-//! 2026-09-03 passed that audit and all-rank token agreement. This does not permit per-rank
-//! submission, where one rank can run ahead of its peers.
+//! The narrow standalone-raw decode path is segmented. Every rank's entire AQL chain is reserved
+//! before the first segment is written, the queues are filled independently, and no doorbell is
+//! published until every rank is complete. Every rank's queue preserves local segment order; the
+//! raw segment has no local or cross-rank counter obligations, interpreter collectives retain
+//! distinct cross-rank gates, and the exact cross-rank counter audit remains mandatory every
+//! token. A 64-step TP8 stress run on 2026-09-03 passed that audit and all-rank token agreement.
 //! `runtime/tests/tp_decode.c` records the failure verbatim:
 //!
 //! > Per-rank-all-segments let the ranks desync — a lagging rank made peers time
@@ -1028,7 +1027,6 @@ impl AmdTpGroup {
         // dates the boundary exactly and leaves the ordering discipline in the
         // one place that owns it.
         let ranks = &mut self.ranks;
-        let n_ranks = ranks.len();
         let n_segments = ranks[0].decode_launches(dp);
         if let Some(rank) = ranks
             .iter()
@@ -1059,14 +1057,36 @@ impl AmdTpGroup {
             i += 1;
             e.enqueue_decode_segment(dp, 0, k)
         })?;
-        // Segment-major, all ranks, with no intermediate drain. `launch_token` submitted segment
-        // zero on every rank first; then each rank's AQL barrier packets preserve the same local
-        // segment order. Raw routes have no counter obligations, interpreter collectives retain
-        // distinct xctr gates, and the mandatory per-token audit detects a deadline bail.
-        for (seg, rank) in segment_major_order(n_segments, n_ranks).skip(n_ranks) {
-            let e = &mut ranks[rank];
-            let k = e.decode_kernel_for(dp);
-            e.enqueue_decode_segment(dp, seg, k)?;
+        // All queues were reserved above and publish no doorbell until every fill completes.
+        // Their only ordering requirement is local segment order, so fill the eight independent
+        // rank queues in parallel. This removes the serialized host submission term without
+        // allowing an early rank to enter a collective before its peers are ready.
+        if n_segments > 1 {
+            std::thread::scope(|scope| -> Result<()> {
+                let handles: Vec<_> = ranks
+                    .iter_mut()
+                    .enumerate()
+                    .map(|(rank, e)| {
+                        scope.spawn(move || -> Result<()> {
+                            let k = e.decode_kernel_for(dp);
+                            for seg in 1..n_segments {
+                                e.enqueue_decode_segment(dp, seg, k).map_err(|err| {
+                                    RuntimeError::Device(format!(
+                                        "rank {rank} decode replay segment {seg}: {err}"
+                                    ))
+                                })?;
+                            }
+                            Ok(())
+                        })
+                    })
+                    .collect();
+                for handle in handles {
+                    handle.join().map_err(|_| {
+                        RuntimeError::Device("decode replay fill thread panicked".into())
+                    })??;
+                }
+                Ok(())
+            })?;
         }
         for e in &*ranks {
             e.commit_decode_replay()?;
@@ -2540,7 +2560,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_segments_enqueue_segment_major_across_tp_ranks() {
+    fn segment_major_order_visits_every_rank_before_the_next_segment() {
         assert_eq!(
             segment_major_order(3, 4).collect::<Vec<_>>(),
             [
