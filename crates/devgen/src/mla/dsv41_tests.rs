@@ -1041,3 +1041,42 @@ fn the_routed_experts_run_glms_prefill_body_at_v41_shapes() {
         "the grouped down GEMM (op 86) must be emitted too"
     );
 }
+
+/// The attention core's widths, against the SHARDS rather than the config prose.
+///
+/// This is the fact that decides which flash kernel V4.1 can use, and it is one where V4.1 differs
+/// from DeepSeek-V3 in a way that reads as a typo. V3 carries a 512 latent PLUS a separate 64-wide
+/// rope strip, so its per-head query is 576 and it wants `<DK=512, DR=64>`. V4.1's query and latent
+/// are both 512 with the rope inside, so it wants `<512, 0>` over a pre-rotated row. Taking V3's
+/// shape here reads 64 bytes past every latent row and still produces fluent output.
+#[test]
+fn the_attention_core_is_512_wide_with_the_rope_inside_it() {
+    let Some((cfg, _)) = checkpoint() else {
+        return;
+    };
+    let (hd, nope, rope) = super::dsv41::dsv41_attn_core_shape(&cfg);
+    assert_eq!(hd, 512);
+    assert_eq!(rope, 64, "qk_rope_head_dim");
+    assert_eq!(nope, 448, "and it is INSIDE head_dim, so nope is 448 and not 512");
+    // The latent is one 512-wide row for all 64 heads: wkv is [512, hidden], not [576, hidden].
+    let t = super::dsv41::dsv41_layer_tensors(&cfg, 0);
+    let wkv = t
+        .iter()
+        .find(|x| x.0 == "attn.wkv.weight")
+        .expect("attn.wkv.weight");
+    assert_eq!(
+        wkv.1,
+        hd as u64 * cfg.hidden as u64,
+        "the latent is head_dim wide; a 576 here would be V3's separate-rope shape"
+    );
+    // V is the WHOLE latent, which is the only way the output LoRA's width closes.
+    let (groups, _orow, ocol) = cfg.wo_a_groups();
+    assert_eq!(
+        ocol,
+        cfg.heads * hd / groups,
+        "O is head_dim per head, so wo_a reads 64*512/8 = 4096 per group"
+    );
+    assert_eq!(ocol, 4096);
+    // The config carries no kv_lora_rank at all -- there is nothing to read a V3 shape out of.
+    assert!(cfg.raw.q_lora_rank > 0);
+}

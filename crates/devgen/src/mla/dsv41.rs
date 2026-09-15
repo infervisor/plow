@@ -1042,6 +1042,51 @@ pub(crate) enum Part {
     Todo,
 }
 
+/// What the attention core needs, and the one thing in the way.
+///
+/// Read off the checkpoint, not the config prose: `attn.wkv.weight` is `[512, 5120]` and
+/// `attn.wq_b.weight` is `[32768, 1280]` = 64 heads x 512. So both the query and the shared latent
+/// are 512 wide, and `qk_rope_head_dim` 64 lives INSIDE that 512 (448 nope + 64 rope). There is no
+/// separate `k_rot` tensor and no `kv_lora_rank` key in the config at all.
+///
+/// That is NOT DeepSeek-V3's shape, which is what makes this worth writing down. V3 and GLM carry
+/// `kv_lora_rank` 512 as the latent AND a separate 64-wide rope strip, so their per-head query is
+/// 576 and the kernel is `d_flash_mla_prefill<DK=512, DR=64>` -- `DR` being the EXTRA width
+/// appended to K for scoring. V4.1 appends nothing.
+///
+/// Where the widths land:
+///   * score over the full 512 (448 unrotated, 64 rotated)
+///   * V is the whole 512 latent, so O is 512 per head -- which is exactly the 64*512/8 = 4096
+///     that `wo_a` reads per group, and the arithmetic only closes if V is the full latent
+///   * therefore `DK = 512, DR = 0`: the shipped `<512, 0>` NoPE arm, IF the rope is already applied
+///
+/// **The blocker is that "if", and it is a SUFFIX rope.** The reference rotates the last `rd` dims
+/// everywhere -- `apply_rotary_emb(q[..., -rd:], ...)` at `inference/model.py:772`, and the same
+/// `[..., -rd:]` slice for `kv` (706), the compressor latent (758) and the sliding-window pair
+/// (1059, 1061). Nothing in this tree rotates an interior range: `d_headnorm_rope` is templated on
+/// `HD` and pairs `(i, i + HD/2)` across the WHOLE head vector, and `d_qwen_headnorm_rope`, which
+/// does carry a separate `rotary` count, applies it as the PREFIX (`if (lane < rotary)`) and copies
+/// the rest through. V4.1 needs `[448, 512)` of a 512-wide row. Slicing the strip into its own
+/// tensor is not available either -- the tensor table binds a name to a whole checkpoint tensor,
+/// the same wall `emit_dsv41_out_lora_tp1` hits.
+///
+/// So this is one bounded kernel change -- a rotary OFFSET, turning `lane < rotary` into
+/// `lane - off < rotary`, so the prefix form is `off = 0` and every existing blob is unchanged --
+/// plus a gfx942 numerics run. It is NOT a new `<DK, DR>` instantiation: only `<512, 64>` and
+/// `<512, 0>` are built and V4.1 wants one that already exists.
+/// Missing capability: `rope_interior_range`.
+///
+/// The output side needs the same offset with the rotation INVERTED: `model.py:781` and `:1068`
+/// run `apply_rotary_emb(o[..., -rd:], freqs_cis, True)` on the attention output before the output
+/// LoRA reads it. Op 181 already does inverse RoPE; it needs the same interior range.
+///
+/// Emitting `<512, 64>` here instead would read 64 bytes past every latent row and still produce
+/// fluent output, which is the failure this rung refuses on purpose.
+pub(crate) fn dsv41_attn_core_shape(c: &Dsv41Cfg) -> (u32, u32, u32) {
+    let nope = c.head_dim - c.qk_rope;
+    (c.head_dim, nope, c.qk_rope)
+}
+
 /// The ops one layer needs, in dataflow order, each marked done or not.
 ///
 /// Per LAYER rather than per model because the optional groups differ: only the kv_source layers
@@ -1058,7 +1103,10 @@ pub(crate) fn dsv41_layer_parts(c: &Dsv41Cfg, l: u32) -> Vec<(&'static str, Part
     if c.index_source.contains(&l) {
         p.push(("indexer queries (two-level)", Part::Todo));
     }
-    p.push(("attention core (absorbed MLA over the 512 latent)", Part::Todo));
+    p.push((
+        "attention core -- needs an INTERIOR rope (see `dsv41_attn_core_shape`)",
+        Part::Todo,
+    ));
     p.push(("output projection wo_a + wo_b (op 184)", Part::Done));
     p.push(("output all-reduce (XReduce, wo_b is input-parallel)", Part::Done));
     p.push(("ffn_norm", Part::Done));
