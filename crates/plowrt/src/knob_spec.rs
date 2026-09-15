@@ -1181,6 +1181,7 @@ mod tests {
 
         let rt = runtime_config();
         let mut k = production_knobs();
+        k["values"]["emit.glm_seq_par"] = true.into();
         k["values"]["emit.glm_xr_band"] = 2.into();
         let err = check_knobs(&k, &rt).unwrap_err();
         assert!(err.contains("seq_par_excludes_two_shot_seams"), "{err}");
@@ -1264,6 +1265,7 @@ mod tests {
         assert!(err.contains("did not verify"), "{err}");
 
         let mut violating = skipped;
+        violating["values"]["emit.glm_seq_par"] = true.into();
         violating["values"]["emit.glm_xr_band"] = 2.into();
         let err = check_knobs(&violating, &rt).unwrap_err();
         assert!(err.contains("seq_par_excludes_two_shot_seams"), "{err}");
