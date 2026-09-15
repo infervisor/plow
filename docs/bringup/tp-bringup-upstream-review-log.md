@@ -1642,6 +1642,63 @@ This is a live defect for RAGGED SEAMS generally, not only for row-band: any two
 a `@band{t}` family could desynchronise the same way. Row-band is simply the first pair where one
 sibling never goes ragged and so never re-derives the binding for itself.
 
+## The 8192 chunk has no dominant cost, and the two open prefill projections are stale by a large factor (2026-09-15, job `segattrib-8192`)
+
+With every non-GPU route to the remaining 22 ms closed, the question became which part of the
+drain to attack. `PLOW_PREFILL_SEG_TIMING=1` on the stack packet, one 8192 request, summed by
+segment family over the single 8192-bucket chunk (`program=4 c0=0 clen=8192`):
+
+| family | critical (inflated) | share | segments | enqueue |
+|---|---|---|---|---|
+| `interpreter` | 397.38 ms | **24.8%** | 1218 | 22.20 |
+| `moe_aiter_fp8` | 372.64 ms | **23.3%** | 225 | 22.15 |
+| `gemm_lt` | 354.78 ms | **22.1%** | 2268 | 38.90 |
+| `mla_sparse_aiter` | 343.28 ms | **21.4%** | 234 | 26.23 |
+| `mla_fold` | 101.72 ms | 6.3% | 234 | 10.61 |
+| `index_tp` | 32.10 ms | 2.0% | 63 | 3.14 |
+| TOTAL | 1601.90 ms | | 4242 | 123.24 |
+
+**The totals are inflated and must not be quoted as latency.** `amd_tp.rs:1754` computes
+`segment_major = ... && !segment_timing`, so the instrument disables the segment-major path and
+forces an all-rank `drain()` after every one of the 4242 segments. The total is 3.7x the real
+431 ms drain. The SHARES are the result.
+
+**The profile is flat.** Four families sit within 3.4 points of each other, 21.4% to 24.8%. There
+is no hot spot to delete. Against the real 431 ms drain the shares scale to roughly `interpreter`
+107 ms, `moe_aiter_fp8` 100, `gemm_lt` 95, `mla_sparse_aiter` 92, `mla_fold` 27, `index_tp` 9. The
+goal needs 22 ms, which is 5.1% of the drain — so it takes **a 20-25% improvement in one of the
+big four**, or a smaller win taken from several at once. Nothing below `mla_fold` can close it
+even if deleted outright.
+
+**Both open prefill tasks are mis-scaled against this, and should be re-derived before either is
+resourced.**
+
+* **#25, FP8 block-scale prefill GEMMs via CK/AITER, projected -70..95 ms/chunk.** The family it
+  targets, `gemm_lt`, is only about 95 ms of the drain in total. The projection is the whole
+  family, which would require the GEMMs to become free. It also names the destination as if the
+  GEMMs were not already there: `gemm_lt` IS the hipBLASLt adapter path
+  (`glm_lt_gfx942.elf` / `glm_fold_lt_gfx942.elf`), so part of that move has already happened and
+  the remaining headroom is whatever CK/AITER beats hipBLASLt by, not the family's whole cost.
+* **#26, sequence-parallel collective seams, projected -150 ms/chunk.** Collectives do not appear
+  as a family at all here — `XReduceScatter` and `XAllGather` are interpreter ops, so they are
+  inside `interpreter`'s 107 ms. A -150 ms projection exceeds the entire family that contains
+  them. Both numbers date from the era when the chunk was ~1511 ms; the chunk is now 431 ms and
+  the earlier wins (two-shot all-reduce, the shared-expert fold, the W_uv fold, row-band) have
+  already taken most of what they were projecting.
+
+**`gemm_lt` is worth a second look for a different reason.** It carries 2268 of the 4242 segments
+— more than half of all segments — for 22.1% of the time, so its per-segment cost is the lowest of
+the big four. That many segments at that granularity is itself a candidate: fewer, larger
+dispatches would cut per-segment overhead without touching the arithmetic. That is a launch-shape
+question, not a kernel question, and it is the one lever this table suggests that nothing has tried.
+
+**Caveat on all of the above.** This is a relative attribution taken on a distorted path, and the
+per-segment barrier does not fall evenly across families — a family of many small segments pays
+the barrier more often than one of few large segments, which likely inflates `gemm_lt`'s share
+(2268 segments) relative to `moe_aiter_fp8`'s (225). The ranking of the big four should be treated
+as "all four are comparable", not as a strict order, and any lever it points at still needs a
+paired T4 on the undistorted path before it counts.
+
 ## The encode split does NOT survive pairing, and a T4 that scores only its controls can be fooled (2026-09-15, job `encode-t4`)
 
 `hostpath-probe` put `PLOW_ENCODE_THREADS=32` at -4.8 ms and said it needed a real A/B to claim.
