@@ -1714,6 +1714,19 @@ impl AmdTpGroup {
         for e in &mut self.ranks {
             e.rearm_prog(p)?;
         }
+        // THE CROSS-GPU COUNTERS, ONCE, BEFORE ANY RANK IS DISPATCHED.
+        //
+        // `prefill_chunk` does this and `run_rung` did not, and the symptom was not a hang: every
+        // `XReduceTwoShot` in the layer COMPLETED and wrote ZEROS. The attention output, the shared
+        // expert's output and the FFN's were all exactly zero, so the layer returned its input
+        // unchanged -- finite, plausible, and nothing at all. A stale arrival count lets a gate
+        // pass before any peer has published its partial, and the sum is then over a region no one
+        // wrote.
+        //
+        // Once for the whole launch, not per segment: the counters are indexed per collective, and
+        // re-zeroing between segments would erase the arrivals of a gate the next segment is still
+        // waiting on.
+        self.group.zero_xctr()?;
         let launches = self.ranks[0].prog_dispatch(p).launches();
         if launches == 0 {
             return Err(RuntimeError::Device(format!(
