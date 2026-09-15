@@ -420,6 +420,14 @@ fn the_declaration_binds_every_listed_weight_under_its_checkpoint_name() {
         assert!(!listed.is_empty(), "layer {l} must carry weights");
         let mut seen = std::collections::BTreeSet::new();
         for (suffix, sz) in &listed {
+            // The routed experts are the one group the PACKET does not declare: they are bound
+            // through `ffn.expert_weight_table` by `bind_packed_experts`, which resolves the
+            // checkpoint's own names itself. See
+            // `the_routed_experts_are_bound_through_the_packed_table`.
+            if suffix.starts_with("ffn.experts.") {
+                assert!(*sz > 0, "{suffix:?} is zero bytes");
+                continue;
+            }
             let h = w.get(l, suffix);
             assert!(seen.insert(h), "layer {l} reused handle {h} for {suffix:?}");
             assert_eq!(
@@ -429,6 +437,13 @@ fn the_declaration_binds_every_listed_weight_under_its_checkpoint_name() {
                  matches no shard and the op reads zeros"
             );
             assert!(*sz > 0, "{suffix:?} is zero bytes");
+        }
+        for table in ["ffn.expert_weight_table", "ffn.expert_scale_table"] {
+            assert_eq!(
+                b.tensor_name(w.get(l, table)),
+                format!("layers.{l}.{table}"),
+                "the loader finds these by suffix; any other spelling binds no experts at all"
+            );
         }
     }
 }
@@ -1342,7 +1357,7 @@ fn the_layer_zero_rung_is_a_topological_program() {
     };
     let _guard = crate::test_env::env_guard();
     let (m, desc) = super::dsv41::emit_dsv41_block(&cfg, 0, 8, 304, 2048, 256);
-    assert_eq!(m.progs.len(), 1, "one prefill program");
+    assert_eq!(m.progs.len(), 2, "one prefill bucket plus the empty decode placeholder");
     let p = &m.progs[0];
     assert!(!p.insts.is_empty());
     for (i, d) in p.insts.iter().enumerate() {
@@ -1369,4 +1384,168 @@ fn the_layer_zero_rung_is_a_topological_program() {
     }
     assert_eq!(desc.programs.prefill_buckets, vec![256]);
     assert_eq!(desc.dims.heads, Some(cfg.heads as i64));
+}
+
+/// Slots of `t[]` an op WRITES. Everything else it reads.
+///
+/// Only the ops layer 0 emits, and only where the answer is not slot 0. Ops absent from this list
+/// write `t[0]` and nothing else, which is the convention `slots.rs` documents for all but a
+/// handful. A wrong entry makes `every_activation_read_is_written_by_something` too permissive, so
+/// each one names the `slots.rs` row it came from.
+fn written_slots(op: u16) -> &'static [usize] {
+    match op {
+        // t = [post_mix, comb_mix, layer_input, mixes, residual, hc_scale, hc_base]
+        o if o == DevOp::HyperConnPre as u16 => &[0, 1, 2],
+        // t = [meta, table, row_token, row_partidx, row_gate] -- the align pass FILLS the three
+        // row arrays and the meta header; only `table` is an input.
+        o if o == DevOp::MoeAlignPf as u16 => &[0, 2, 3, 4],
+        // t = [fu_g, xn2, ewt, est, meta, row_token] + `fu_scale` on slot 7 (not named in
+        // `slots.rs`, whose row stops at 6, but written by the arm).
+        o if o == DevOp::MoeGroupGluPf as u16 => &[0, 7],
+        // `t0=Opart(f32) t1=mlpart(f32)` -- the split-K partial AND its running max/lse pair, both
+        // written, both read back by `FlashMerge`.
+        o if o == DevOp::FlashMlaPrefill as u16 => &[0, 1],
+        _ => &[0],
+    }
+}
+
+/// NOTHING reads an activation no op ever writes.
+///
+/// The bug this exists for: `emit_dsv41_moe` handed GLM's body an `xmid` -- GLM's post-attention
+/// residual -- that this emitter has no equivalent of, so the layer ended in
+/// `Residual(xnext, xmid, moe_out)` over a buffer nobody had written. It did not fault and it did
+/// not fail any shape check; it read whatever the arena held. The fix was `raw_output: true`,
+/// which is what an mHC layer wants anyway, since `HyperConnPost` is what re-joins the residual.
+///
+/// Weights, the block entry and the host-filled inputs are exempt by name. Everything else that
+/// appears on an op's READ slot must appear on some op's WRITE slot.
+#[test]
+fn every_activation_read_is_written_by_something() {
+    let Some((cfg, _)) = checkpoint() else {
+        return;
+    };
+    let _guard = crate::test_env::env_guard();
+    let (m, _) = super::dsv41::emit_dsv41_block(&cfg, 0, 8, 304, 2048, 256);
+    let p = &m.progs[0];
+    let name = |h: u32| m.tensors[h as usize].name.as_str();
+
+    let mut written: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+    for d in &p.insts {
+        for &s in written_slots(d.op) {
+            if d.t[s] != packet::dev::TENSOR_NONE {
+                written.insert(d.t[s]);
+            }
+        }
+    }
+    for d in &p.insts {
+        let w = written_slots(d.op);
+        for (s, &h) in d.t.iter().enumerate() {
+            if h == packet::dev::TENSOR_NONE || w.contains(&s) {
+                continue;
+            }
+            let n = name(h);
+            // Weights carry the checkpoint's `layers.N.` prefix; `in.*` is host-filled; `act.x` is
+            // the block entry the harness uploads.
+            if n.starts_with("layers.") || n.starts_with("in.") || n == "act.x" {
+                continue;
+            }
+            assert!(
+                written.contains(&h),
+                "op {:?} reads `{n}` at slot {s}, and no op in the program writes it -- \
+                 the layer would compute from whatever the arena happened to hold",
+                d.op
+            );
+        }
+    }
+}
+
+/// The routed experts reach the GPU through the LOADER'S PACKED TABLE, not through 2304 declared
+/// checkpoint tensors.
+///
+/// `bind_packed_experts` finds `{pfx}expert_weight_table`, reads the expert count off its declared
+/// size (`bytes / 24`), resolves the checkpoint's spelling, and packs every expert's slice into one
+/// buffer. Binding `ffn.experts.0.w1.weight` into `GlmLW::ewt` instead -- which is what this
+/// emitter did first -- points the grouped GEMM's pointer table at fp4 mantissas, and declaring the
+/// 2304 individual tensors uploads 1.7 GB per layer per rank that no op reads.
+#[test]
+fn the_routed_experts_are_bound_through_the_packed_table() {
+    let Some((cfg, _)) = checkpoint() else {
+        return;
+    };
+    let _guard = crate::test_env::env_guard();
+    let (m, _) = super::dsv41::emit_dsv41_block(&cfg, 0, 8, 304, 2048, 256);
+
+    for suffix in ["expert_weight_table", "expert_scale_table"] {
+        let t = m
+            .tensors
+            .iter()
+            .find(|t| t.name == format!("layers.0.ffn.{suffix}"))
+            .unwrap_or_else(|| panic!("layers.0.ffn.{suffix} must be declared"));
+        // `bind_packed_experts` DERIVES the expert count from this, so the size is the contract.
+        assert_eq!(
+            t.bytes,
+            cfg.n_exp as u64 * 24,
+            "[E][3] u64, and the loader reads E back as bytes/24"
+        );
+    }
+    assert!(
+        !m.tensors.iter().any(|t| t.name.contains(".experts.")),
+        "no per-expert checkpoint tensor may be declared; the packed buffer is what ops read"
+    );
+
+    // And the grouped arms must actually point AT the tables.
+    let ewt = m
+        .tensors
+        .iter()
+        .position(|t| t.name == "layers.0.ffn.expert_weight_table")
+        .unwrap() as u32;
+    let est = m
+        .tensors
+        .iter()
+        .position(|t| t.name == "layers.0.ffn.expert_scale_table")
+        .unwrap() as u32;
+    for op in [DevOp::MoeGroupGluPf, DevOp::MoeGroupDownPf] {
+        let d = m.progs[0]
+            .insts
+            .iter()
+            .find(|d| d.op == op as u16)
+            .unwrap_or_else(|| panic!("{op:?} is not emitted"));
+        assert_eq!([d.t[2], d.t[3]], [ewt, est], "{op:?} reads the two tables");
+    }
+}
+
+/// The rung is a PREFILL bucket, and it says outright that it cannot decode.
+///
+/// `derive_roles` reads a parent blob's roles positionally -- `decode_rung_lo` puts the boundary at
+/// `len - 1` -- so a ONE-program blob has no prefill bucket at all and a host filtering on
+/// `is_prefill_bucket()` finds nothing to run. The trailing decode program is EMPTY because V4.1
+/// has no decode emit; `block.json`'s `decode_t: 0` says the same thing, and this test fails if
+/// either half changes without the other.
+#[test]
+fn the_rung_is_a_prefill_bucket_and_states_it_cannot_decode() {
+    let Some((cfg, _)) = checkpoint() else {
+        return;
+    };
+    let _guard = crate::test_env::env_guard();
+    let (m, desc) = super::dsv41::emit_dsv41_block(&cfg, 0, 8, 304, 2048, 512);
+    assert_eq!(m.prog_t, vec![512, 1], "one prefill bucket, then the decode slot");
+
+    let roles =
+        packet::devbuild::derive_roles(&m.prog_t, packet::devbuild::RoleSource::Positional, |_| 0);
+    assert!(
+        roles[0].is_prefill_bucket(),
+        "the work is a PREFILL bucket, got {:?}",
+        roles[0]
+    );
+    assert!(roles[1].is_decode_rung());
+
+    assert!(
+        m.progs[1].insts.is_empty(),
+        "the decode program is a placeholder; a real one must also set block.json's decode_t"
+    );
+    assert_eq!(
+        desc.programs.decode_t, 0,
+        "and the descriptor must agree it cannot decode"
+    );
+    assert_eq!(desc.programs.prefill_buckets, vec![512]);
 }

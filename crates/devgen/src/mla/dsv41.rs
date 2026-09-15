@@ -406,6 +406,22 @@ pub(crate) fn declare_dsv41_weights(
     let mut per_layer = vec![std::collections::BTreeMap::new(); c.layers as usize];
     let mut bytes = 0u64;
     for &l in layers {
+        // The two tables the grouped-GEMM arms actually read. `bind_packed_experts` finds them by
+        // the `expert_weight_table` / `expert_scale_table` suffix, takes the expert count from the
+        // declared size (`bytes / 24`), resolves the checkpoint's own spelling, and PACKS every
+        // expert's slice into one buffer -- so the 2304 per-expert checkpoint tensors must NOT be
+        // declared. Declaring them would upload 1.7 GB per layer per rank that no op reads, beside
+        // the packed copy that every op does.
+        let ewt = b.tensor(
+            &format!("layers.{l}.ffn.expert_weight_table"),
+            (c.n_exp as u64) * 3 * 8,
+        );
+        let est = b.tensor(
+            &format!("layers.{l}.ffn.expert_scale_table"),
+            (c.n_exp as u64) * 3 * 8,
+        );
+        per_layer[l as usize].insert("ffn.expert_weight_table".to_string(), ewt);
+        per_layer[l as usize].insert("ffn.expert_scale_table".to_string(), est);
         for (suffix, full) in dsv41_layer_tensors(c, l) {
             // `dsv41_layer_tensors` is the CHECKPOINT contract, checked against the shards at
             // full size. What a PACKET declares is this rank's share, which is a different
@@ -432,13 +448,22 @@ pub(crate) fn declare_dsv41_weights(
                     ),
                 }
             };
+            // `bytes` is the WEIGHT BUDGET -- what this rank must hold -- so the routed experts
+            // count here even though they are not declared. They are resident either way; the
+            // packed buffer is where, not whether.
+            bytes += sz;
+            if is_routed_expert(&suffix, "w1")
+                || is_routed_expert(&suffix, "w2")
+                || is_routed_expert(&suffix, "w3")
+            {
+                continue;
+            }
             let h = b.tensor(&format!("layers.{l}.{suffix}"), sz);
             let prev = per_layer[l as usize].insert(suffix.clone(), h);
             assert!(
                 prev.is_none(),
                 "layer {l} declared {suffix:?} twice; `dsv41_layer_tensors` must not repeat a name"
             );
-            bytes += sz;
         }
     }
     Dsv41Weights { per_layer, bytes }
@@ -758,8 +783,11 @@ pub(crate) fn emit_dsv41_moe(
     lw.bias = w.get(l, "ffn.gate.bias");
     // The routed-expert weight and scale TABLES. The grouped GEMM resolves each expert's base from
     // these rather than taking 384 operands, which is why one handle stands for 384 tensors.
-    lw.ewt = w.get(l, "ffn.experts.0.w1.weight");
-    lw.est = w.get(l, "ffn.experts.0.w1.scale");
+    // The pointer tables, NOT expert 0's weight. These are `[n_exp][3]` u64 device addresses that
+    // `bind_packed_experts` fills at load; pointing them at a real checkpoint tensor would have the
+    // grouped GEMM read fp4 mantissas as if they were pointers.
+    lw.ewt = w.get(l, "ffn.expert_weight_table");
+    lw.est = w.get(l, "ffn.expert_scale_table");
     // The shared expert is emitted separately (`emit_dsv41_ffn_shared`): it is block-FP8 on the
     // [32,32] grid while these are MXFP4, so it cannot fold into the routed table -- which is the
     // same mixed-encoding fact `glm_shared_fold` refuses on (`enc == Fp8Blk`).
@@ -767,9 +795,12 @@ pub(crate) fn emit_dsv41_moe(
     n.lw = vec![lw];
     n.shared = shared.0;
     n.xn2 = xn2;
-    n.xnext = x_out;
-    n.xmid = b.tensor(&format!("act.l{l}.moe_xmid"), (t as u64) * (c.hidden as u64) * 2);
-    n.attn = b.tensor(&format!("act.l{l}.moe_attn"), (t as u64) * (c.hidden as u64) * 2);
+    // RAW OUTPUT: the body writes the FFN's own answer into `n.attn` and adds NO residual. That is
+    // what an mHC layer needs -- `HyperConnPost` is what mixes this back into the residual stream,
+    // and the ordinary path's `x_out = xmid + ffn` would add a second, wrong one on top of it. It
+    // is not a cosmetic difference: `xmid` is the post-attention residual in GLM's layout and this
+    // emitter has no such buffer, so the plain path read a tensor nothing had written.
+    n.attn = x_out;
     n.rlogit = b.tensor(
         &format!("act.l{l}.rlogit"),
         (t as u64) * (c.n_exp as u64) * 2,
@@ -811,7 +842,7 @@ pub(crate) fn emit_dsv41_moe(
         c_norm,
         xgate,
         cus,
-        false,
+        true, // raw_output -- see `n.attn` above
         shared_pre,
         super::router_flag::SQRTSOFTPLUS
             | super::router_flag::BIAS
@@ -1439,13 +1470,31 @@ pub(crate) fn emit_dsv41_block(
     let prog = b.finish();
     let out_name = if ri == 0 { "act.hc_residual_a" } else { "act.hc_residual_b" };
     let tensors = prog.tensors.clone();
+
+    // A TRAILING, DELIBERATELY EMPTY DECODE PROGRAM.
+    //
+    // `derive_roles` reads a parent blob's roles POSITIONALLY: `decode_rung_lo` puts the boundary
+    // at `len - 1`, so the last program is always a decode rung and a ONE-program blob has no
+    // prefill bucket at all. The rung emitted above is prefill -- 1024 rows of it -- and a host
+    // filtering on `role.is_prefill_bucket()` would find nothing to run.
+    //
+    // It is EMPTY rather than a copy of the prefill program or a guessed decode chain. V4.1 has no
+    // decode emit yet: layer 0 is sliding-window over a KV ring nothing here allocates, and the
+    // mHC residual is carried between calls by state this rung does not declare. `block.json` says
+    // `decode_t: 0` to match, and `the_rung_states_it_cannot_decode` pins the pair, so a real
+    // decode emit has to update both or fail.
+    let mut db = Builder::new(n_cu);
+    db.adopt_tensors(prog.tensors.clone());
+    let decode = db.finish();
+    assert!(decode.insts.is_empty(), "the decode placeholder must stay empty");
+
     let m = crate::Model {
         n_cu,
         target: 0,
         tensors,
-        progs: vec![prog],
+        progs: vec![prog, decode],
+        prog_t: vec![t, 1],
         kv_row_insts: Vec::new(),
-        prog_t: vec![t],
         gen,
     };
     use plow_asset::*;

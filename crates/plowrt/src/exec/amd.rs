@@ -3990,11 +3990,16 @@ fn resolve_expert_names(
     ckpt: &crate::asset::checkpoint::Checkpoint,
     pfx: &str,
 ) -> Result<ExpertNames> {
-    const TEMPLATES: [([&str; 3], &str); 2] = [
+    const TEMPLATES: [([&str; 3], &str); 3] = [
         (["gate_proj", "up_proj", "down_proj"], ".weight"),
         (["w1", "w3", "w2"], ".weight_packed"),
+        // DeepSeek-V4.1-Flash: `w1`/`w3`/`w2` with a PLAIN `.weight` payload and a `.scale` grid,
+        // which is neither of the two above. LAST, so it can only be reached once the other two
+        // have missed -- a checkpoint carrying `gate_proj.weight` still resolves as it always did,
+        // and one carrying `w1.weight_packed` still prefers the packed spelling over this one.
+        (["w1", "w3", "w2"], ".weight"),
     ];
-    const SCALES: [&str; 2] = [".weight_scale_inv", ".weight_scale"];
+    const SCALES: [&str; 3] = [".weight_scale_inv", ".weight_scale", ".scale"];
     let base = pfx.strip_prefix("moe.").unwrap_or(pfx);
     let mut tried: Vec<String> = Vec::new();
     for sub in ["", "mlp.", "block_sparse_moe."] {
