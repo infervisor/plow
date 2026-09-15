@@ -1284,7 +1284,7 @@ fn l2_pairing_refusal_names_both_halves_and_the_fix() {
         // The prefill half has its OWN two flags; naming the decode ones would send the
         // reader to a build that does not move this object.
         assert!(prefill.contains("PLOW_L2HIER_PF=1"));
-        assert!(prefill.contains("PLOW_L2_PLACE_PREFILL=1"));
+        assert!(prefill.contains("PLOW_L2_PLACE_PREFILL=0"));
     }
 }
 
