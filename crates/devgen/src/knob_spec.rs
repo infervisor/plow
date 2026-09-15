@@ -758,6 +758,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.moe_combine_lean", Some("PLOW_MOE_COMBINE_LEAN"), Layer::Emit, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("emit.attnres_f32mix", Some("PLOW_ATTNRES_F32MIX"), Layer::Emit, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("emit.moe_align_par", Some("PLOW_MOE_ALIGN_PAR"), Layer::Emit, Domain::Bool, ON, PROMOTED),
+    KnobSpec::new("emit.dsv41_ops", Some("PLOW_DSV41_OPS"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.seq_par_seams", Some("PLOW_SEQ_PAR_SEAMS"), Layer::Emit, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("emit.moe_prefill_ep", Some("PLOW_MOE_PREFILL_EP"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.moe_pf_det", Some("PLOW_MOE_PF_DET"), Layer::Emit, Domain::Bool, OFF, OPT_IN),

@@ -1483,6 +1483,13 @@ pub(crate) fn emit_dsv41_block(
     let _ = emit_dsv41_mhc_post(&mut b, c, &mhc, xnext, ri, t, &[c_moe]);
     ri ^= 1;
 
+    // PLOW_DSV41_OPS=<n>: emit only the first n ops of the layer. A profiling cut, not a
+    // feature -- the run times of successive prefixes difference into a per-op cost, which is
+    // the only way to get one out of a megakernel interpreter.
+    if let Some(n) = crate::emit_config::active().dsv41_ops {
+        b.truncate_ops(n as usize);
+        eprintln!("  PLOW_DSV41_OPS={n}: emitting a PREFIX of the layer, for profiling only");
+    }
     let prog = b.finish();
     let out_name = if ri == 0 { "act.hc_residual_a" } else { "act.hc_residual_b" };
     let tensors = prog.tensors.clone();

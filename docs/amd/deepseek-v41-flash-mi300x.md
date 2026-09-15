@@ -1579,37 +1579,73 @@ Two defects stood between the emit and these numbers, both fixed:
     not prove it. Invisible at T=1024, which keeps its MLA segment in the
     prefill object; at T=8192 the segment routes to the four-wave flash object.
 
-### 12.1 The performance gap is ~870x and it is not the tile map
+### 12.1 The performance gap is ~870x and NOTHING I removed changed it
 
 Against a per-layer roofline near 1.95 ms (7.04 TFLOP/layer, 8 GPUs, 35% of
 matrix peak), 1697 ms is ~870x off. Forty layers at this cost is 68 s against
-the campaign's 90 ms target for the whole model. THE TARGET IS NOT CLOSE, and
-the reason is not tuning.
+the campaign's 90 ms target for the whole model. THE TARGET IS NOT CLOSE.
 
-WHAT THE SCALING SAYS. 1024 -> 8192 tokens is 8x the context and 10.7x the
-time: 155 us/token/layer at 1k against 207 us/token/layer at 8k. Cost is very
-nearly LINEAR in T, so the quadratic term -- attention -- is not what dominates.
-The per-token work is: the dense projections, the shared expert, and the 384
-routed experts.
+CORRECTION. An earlier revision of this section blamed the fp4 simulation --
+`PLOW_HAS_MX_MMA` is `PLOW_CDNA4`, gfx942 is CDNA3, so the MXFP4 experts run
+`d_moe_group_pf_a4w4`'s dequantize-to-bf16 arm. That fact is true and the
+inference from it was wrong, and the arithmetic should have caught it first:
+the MoE is ~532 GFLOP per rank per layer, so 1697 ms is 0.024% of matrix peak.
+A simulated dequant path costs a factor of a few, not four thousand.
 
-ONE STRUCTURAL CAUSE IS CONFIRMED. `PLOW_HAS_MX_MMA` is `PLOW_CDNA4`
-(`runtime/amd/amd_arch.h:35`) and gfx942 is CDNA3, so `d_moe_group_pf_a4w4`
-compiles its SIMULATED arm: every fp4 weight block is dequantized to bf16 in
-LDS staging before an ordinary bf16 MFMA. V4.1's routed experts are MXFP4 and
-are the majority of the layer's FLOPs. There is no fp4 matrix core on MI300X to
-run them on, so this is a property of the hardware against the checkpoint's
-encoding, not a kernel that needs tuning.
+WHAT THE MEASUREMENTS SAY. Every one of these changes ONE variable and leaves
+every weight shape alone, so the same checkpoint loads unchanged:
 
-WHAT IT IS NOT. `mpf_expert_of_tile` defaults to a linear walk of `tilep[]`,
-which at 6-of-384 routing is ~384 dependent global loads per tile -- an obvious
-suspect, and wrong. Building the prefill objects with
-`PLOW_MOE_TILE_BINSEARCH=1` and A/B-ing them at T=8192 gives 1694.6 ms against
-1696.8 ms, a 0.13% difference with a bit-identical exit. The change was reverted
-rather than shipped on a hypothesis it does not support.
+| variant | what it removes | median at T=8192 |
+|---|---|---|
+| baseline | -- | 1733 ms |
+| `num_experts_per_tok` 6 -> 1 | 6x the routed-expert work | 1699 ms |
+| `sliding_window` 128 -> 32 | 4x the attention work | 1701 ms |
+| `hc_sinkhorn_iters` 20 -> 2 | 10x the mHC iteration | 1697 ms |
+| `PLOW_MOE_TILE_BINSEARCH=1` | the O(n_exp) tile->expert walk | 1695 ms |
+| `PLOW_XR_NOWAIT=1` | BOTH collective rendezvous waits | 1697 ms |
 
-The remaining gap is unprofiled. plowrt has no per-op timing on the rung path,
-and identifying where 1.7 s goes needs one before any more guesses are worth
-running.
+Every row is within 2% of the baseline. The top-k row is the strongest of them:
+it provably removes 5/6 of the gathered rows the grouped GEMMs process, and it
+buys nothing. `PLOW_XR_NOWAIT` is the ceiling instrument and its output is
+garbage by construction (126 M NaN), which confirms it took effect -- deleting
+the collectives' synchronization entirely is also free.
+
+Two rows are WEAKER EVIDENCE than they look and are recorded that way: if
+`FlashMlaPrefill` ignores the window bits in `i[3]`, or `HyperConnPre` does not
+read the iteration count from the packet, then those runs never reduced any work
+and prove nothing. Only the top-k and NOWAIT rows are load-bearing.
+
+NOT A TIMEOUT, now actually checked. `interp.hip` passes the collectives a null
+status word and a 1 s `PLOW_XCTR_DEADLINE_TICKS`; on timeout the op returns
+WITHOUT reducing and `out` keeps its previous value, silently and finitely. At
+1.7 s per layer that was a live hypothesis and it would also have invalidated
+the correctness claim above. `run_rung` now calls `TpGroup::audit_xctr` after
+its drain, as `prefill_chunk` and the decode path always have, and the audit
+PASSES at both T=1024 and T=8192: every cross-GPU gate reads its expected
+arrival count. The reduces really do happen.
+
+SO IT IS NOT: routed-expert compute, the tile map, collective synchronization,
+collective timeouts, and -- weakly -- attention or the mHC iteration. The cost
+is linear in T (8x the context costs 10.7x the time; 155 us/token at 1k against
+207 us/token at 8k) with no fixed component, and immune to removing parallel
+work. That combination is the signature of SERIALIZATION rather than throughput:
+work proportional to T being done by a grid that is not covering it. No
+bandwidth argument reaches 1.7 s either -- the whole arena is ~2.5 GB and the
+layer would have to touch it at 4 GB/s against 5.3 TB/s of HBM.
+
+WHAT WOULD SETTLE IT. Two instruments, neither available here yet:
+  * CU scaling. Emitting at `--n-cu 76` and running on the 304-CU device is
+    refused by the runtime's n_cu guard, and `PLOW_OVERSUB=1` covers the
+    oversubscribed direction, not this one. If a quarter of the CUs costs the
+    same, the grid is not the parallel agent it is assumed to be.
+  * Per-op device timing. The interpreter is a megakernel, so one launch covers
+    34 ops and a kernel profiler reports one number. `PLOW_DSV41_OPS=<n>` was
+    added here to emit prefixes and difference their run times, but it only
+    reaches prefixes that still contain a collective: `DevBlob::parse` recovers
+    `slot_bytes` as `max(i[2])`, and under the two-slot design only the FINAL
+    reduce carries a non-zero one, so any cut before op 32 loads as
+    `slot_bytes = 0` and is refused. Cutting usefully needs that recovery to
+    stop being a max over the stream.
 
 ### 12.2 What is still not demonstrated
 

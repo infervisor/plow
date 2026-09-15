@@ -1838,6 +1838,23 @@ impl Builder {
         chains.len()
     }
 
+    /// Drop every op after the first `n`, for BISECTION.
+    ///
+    /// A diagnostic, and the only sound direction to cut: dependencies point BACKWARDS, so no
+    /// surviving op can reference one this drops, and `finish` then computes waits and successors
+    /// over the remaining prefix exactly as if the emitter had stopped there. Cutting anywhere
+    /// but the tail would leave a dangling counter.
+    ///
+    /// Exists because a per-op cost on real hardware cannot be had any other way on this stack:
+    /// the interpreter is a MEGAKERNEL, so one launch covers the whole layer and a kernel-level
+    /// profiler reports one number for 34 ops. Emitting prefixes and differencing their run times
+    /// is the profiler.
+    pub fn truncate_ops(&mut self, n: usize) {
+        if n < self.ops.len() {
+            self.ops.truncate(n);
+        }
+    }
+
     pub fn finish(mut self) -> Program {
         let knobs = knobs();
         if let Some(degree) = self.moe_prefill_ep_degree {

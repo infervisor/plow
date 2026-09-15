@@ -1783,6 +1783,19 @@ impl AmdTpGroup {
         for e in &self.ranks {
             e.drain()?;
         }
+        // DID THE COLLECTIVES ACTUALLY REDUCE? `interp.hip` passes the collectives a null status
+        // word and a 1 s `PLOW_XCTR_DEADLINE_TICKS`; on timeout the op RETURNS WITHOUT REDUCING
+        // and `out` keeps whatever it held before. Nothing faults, nothing is logged, and the
+        // result stays finite and plausible -- so a rung run that reports "no NaN, no Inf" has
+        // said nothing at all about whether its three reduces happened. `prefill_chunk` and the
+        // decode path have audited this on every step all along; `run_rung` was the one driver
+        // that did not, which made it the one driver whose numbers could not be trusted.
+        //
+        // Skipped for a truncated run: a segment cap deliberately leaves later gates unsignalled,
+        // and auditing those would report the cut rather than a timeout.
+        if max_segs == usize::MAX && self.audit {
+            self.group.audit_xctr(&self.gate_expect[p])?;
+        }
         Ok(())
     }
 
