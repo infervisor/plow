@@ -90,7 +90,7 @@ fn native_prefill_scratch_is_sized_for_emitted_fallbacks() {
         81920,
         &[0, 3],
         8192,
-        20,
+        32,
         MoeEnc::Fp8Blk,
         &[128, 512, 2048, 8192],
     );
