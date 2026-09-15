@@ -1080,7 +1080,7 @@ fn glm_decode_glue_cus_gives_the_key_norm_one_workgroup_per_row() {
             ("PLOW_GLM_SELECT_LOCAL", "1"),
             ("PLOW_GLM_DECODE_GLUE_CUS", glue),
         ]);
-        for rows in [2, 8, 20] {
+        for rows in [2, 8, 32] {
             let mut b = Builder::new(304);
             b.adopt_tensors(tensors.clone());
             let ready = b.emit(DevOp::Nop, vec![0], &[], |_| {});
@@ -1094,7 +1094,7 @@ fn glm_decode_glue_cus_gives_the_key_norm_one_workgroup_per_row() {
                 0,
                 ctx,
                 rows,
-                20,
+                32,
                 MoeEnc::Fp8Blk,
                 &(0..304).collect::<Vec<_>>(),
                 c.eps as f32,
@@ -2967,8 +2967,8 @@ fn glm_decode_gemm_group_reorders_native_gemms_without_changing_work() {
         x.sort();
         y.sort();
         assert_eq!(x, y, "rows={rows}: the reorder must keep the same instructions");
-        // The shared expert splits into native gate/up halves + Glu only past its LDS fit (rows
-        // 16/20); below it, or with no native GEMM, there is nothing to move.
+        // The shared expert splits into native gate/up halves + Glu only at row 16; below it,
+        // or with no native GEMM, there is nothing to move.
         if !a.iter().any(|i| i.0 == lt) || !a.iter().any(|i| i.0 == DevOp::Glu as u16) {
             assert_eq!(pa, pb, "rows={rows}: nothing to group, no reorder");
             continue;
@@ -2999,7 +2999,7 @@ fn glm_decode_gemm_group_reorders_native_gemms_without_changing_work() {
             "rows={rows}: top-k and Glu share a segment"
         );
     }
-    assert_eq!(native_rungs, 2);
+    assert_eq!(native_rungs, 1);
 }
 
 #[test]
