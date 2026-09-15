@@ -1844,6 +1844,118 @@ Units note carried from the correction above: `dec_segs` counts SEGMENTS; an act
 to any per-packet figure.
 
 
+## The decode rung crossover has NOT moved, and the GEMV's instruction levers are exhausted (2026-09-15, job `decode-rungsweep` + CPU-only ISA scan)
+
+Two questions, one answered on hardware and one in the shipped ISA: is the 1293-segment native-GEMM
+rung actually the right choice, and is there an instruction-level or producer/consumer win left in
+the low-batch GEMV?
+
+### The rung sweep: the default is right, by 9-19 ms
+
+`PLOW_AMD_DECODE_MIN_RUNG` swept at isl8192 C1, one server per arm, 3 prompts x 192 output tokens,
+`dec_segs` read from `PLOW_TICK_LOG` as the check that the knob actually changed program:
+
+| arm | TPOT ms | TTFT ms | dec_segs | tick ms | errors |
+|---|---|---|---|---|---|
+| min_rung 1 | 50.55 | 514.2 | 151 | 50.328 | 0 |
+| min_rung 2 | 55.83 | 514.8 | 151 | 55.453 | 0 |
+| min_rung 4 | 60.42 | 513.8 | 151 | 60.178 | 0 |
+| **min_rung 8 (default)** | **41.19** | 510.8 | **1293** | 40.030 | 0 |
+
+Every arm is valid — the segment count moved exactly as the offline `disasm` predicted (151 below
+rung 8, 1293 at it), and no arm logged an error or a cross-rank disagreement.
+
+**The hypothesis is falsified and the default's justification still holds.** `config.rs:835` records
+41.4 ms on rung 8 against 51.9 on rung 1; this re-measures **41.19 against 50.55** after NUMA-local
+kernarg, the VRAM kernarg ring, the W_uv fold, FP8 sparse-MLA keys and
+`PLOW_GLM_DECODE_GEMM_GROUP` all landed. The crossover did not move.
+
+**And it settles the dispatch-count question directly.** Rung 4 runs 151 segments — 8.6x FEWER than
+rung 8's 1293 — and is **19.2 ms SLOWER**. Whatever per-segment dispatch overhead costs, the
+arithmetic difference between the two program shapes dwarfs it. Fewer dispatches is not the same as
+faster, and this is the counter-example in the shipped ladder.
+
+It also reproduces the documented mechanism independently: TPOT gets monotonically WORSE from rung 1
+to 2 to 4 (50.55 -> 55.83 -> 60.42) at a CONSTANT 151 segments. Same dispatches, more activation
+rows, worse time — exactly `op_gemm_common.h`'s "~24 VALU ops per 16 bytes of weight PER ACTIVATION
+ROW ... at batch 4 the arithmetic is 4x while the bytes are 1x, and the body crosses from
+memory-bound to issue-bound."
+
+Cross-check on the earlier extrapolation: at 12.7 us/segment, rung 8 would carry 16.4 ms of
+dispatch overhead and rung 4 only 1.9 ms, implying non-dispatch work of 24.8 ms vs 58.5 ms — the
+hipBLASLt path doing the same arithmetic 2.4x better. That is consistent with the in-tree
+measurement of plow's GEMV streaming weights at 839 GB/s against vLLM's 2111 GB/s.
+
+### The GEMV scan: every instruction lever is already built, measured, and bounded
+
+`gemv_rows` and its siblings are not on the production decode path at all — rung 20 sends the
+projections to hipBLASLt as `GemmLtPf` x832 — but the scan matters because it says what a
+plow-native low-batch GEMM would have to beat.
+
+**The arithmetic is emulated, and that is a hardware fact.** `v_dot2c_f32_bf16` is CDNA4;
+gfx942 has the fp16 dot but NOT the bf16 one (`amd_arch.h:143`), so `plow_dot2_bf16` widens to f32
+and issues two FMAs — 6 VALU ops per bf16 PAIR, 24 per 16 bytes of weight. Confirmed in the shipped
+object (`interp_decode_fp8kv.elf`, per-function `llvm-objdump`):
+
+| function | insts | 16B loads | ds_read_b128 | f32 FMA | MFMA | shift/mask | scratch | max load clause |
+|---|---|---|---|---|---|---|---|---|
+| `d_gemv_fp8_blk` | 21330 | 139 | 127 | 2871 | **0** | **7152** | 88 | 2 |
+| `d_gemv_fp8` | 13175 | 174 | 181 | 4274 | **0** | 3121 | 182 | 2 |
+| `d_gemv_qkv_fp8` | 10877 | 97 | 198 | 2999 | **0** | 2606 | 140 | 2 |
+| `d_gemv_fp8_nrn` | 6704 | 8 | 159 | 2014 | **0** | 1697 | 77 | 1 |
+| `d_gemv_glu` | 6249 | 11 | 61 | 996 | **0** | 550 | **1191** | 10 |
+| `d_gemv_qkvg` | 2818 | 3 | 80 | 651 | **0** | 729 | 70 | 1 |
+
+The six GEMV bodies are **61153 of the object's 66573 instructions — 92%**. Zero MFMA anywhere, and
+the shift/mask column is the bf16 widening: `d_gemv_fp8_blk` issues 7152 shifts and masks against
+2871 FMAs.
+
+**What has already been tried, with its measured result:**
+
+| lever | knob | outcome |
+|---|---|---|
+| collapse the emulated dot to one op (wrong answer, prices the ceiling) | `GV_HACK_CHEAPDOT` | **-3.2% of the token — this is the hard ceiling on ANY dot-instruction change** |
+| MFMA GEMV at M=1, 32x32 diagonal mapping | `GV_MFMA` | correct, faster standalone (3152 vs 2900 GB/s), **loses 1.6%** in-model: 15 dependent MFMAs per row with nothing to hide ~32 cycles each |
+| MFMA GEMV batched, `v_mfma_f32_4x4x4bf16_1k` (vLLM `wvSplitK_hf_sml_` shape) | `GV_MFMA4` | built, OFF — it REDEFINES the reference arithmetic, so bit identity is impossible by construction; a model-owner call, not a perf one |
+| delete the whole cross-lane reduction (wrong answer) | `GV_HACK_NOSUM` | 0.16% |
+| SGPR descriptors to kill the load waterfall | `GV_USCALAR`/`GV_URSRC` | ~0 — at M=1 the issue pipe is only ~23% busy |
+| in-flight load depth | `GV_UNROLL_M4=6`, `_M8=3` | tuned and shipped: 4.8x at M=8 and 9.1x at M=16 over a flat 11 |
+| R-column split (more in-flight WORK) | `GV_RS_WIDE=1` | shipped, -0.96 ms of 27.29 at T=4 |
+| 16-byte wide LDS staging | `stage_x_lds` | shipped, 1.02-1.27x per packet |
+| **producer/consumer DMA ring, global->LDS with zero VGPRs** | `GV_DMA` | **built and LOST: 16.8 baseline -> 18.4 (ring16/batch8), 19.3 (ring16/batch4), 27.3 (ring4/batch1)** |
+
+**Direct-to-LDS is blocked by the hardware anyway.** CDNA3's `global_load_lds` moves 1, 2 or 4 bytes
+per lane; the 12- and 16-byte forms are CDNA4 (`amd_common.h:333`, `op_gemm_gfx942.h:34`). The
+zero-VGPR ring that would make a deep producer/consumer pipeline free does not exist at the width
+this loop needs on this chip.
+
+**One in-tree claim does not reproduce, and it is the one the `GV_DMA` autopsy rests on.** That
+autopsy dismisses its own premise by asserting the compiler already emits "TWENTY back-to-back
+`global_load_dwordx4` ... ~20 KB in flight per wave held in `v[108:167]` ... staggered `s_waitcnt
+vmcnt(7), vmcnt(6), vmcnt(5)` ... It NEVER drains." On the shipped object that is not what is there:
+the longest back-to-back 16-byte load clause in any GEMV body is **10** (and 1-2 in five of the
+six), and the `vmcnt` mass sits on **full drains** — `d_gemv_glu` waits `vmcnt(0)` 660 times out of
+710 (93% draining), `d_gemv_fp8` 224 of 315 (71%). The autopsy may have been reading a different
+object or a different build; either way its "there was no hole to fill" conclusion is not supported
+by what ships today. That does NOT resurrect `GV_DMA` — the measured 16.8 -> 18.4 loss stands on
+its own, and the hardware limit above caps what a rewrite could do — but the stated REASON for the
+loss should not be carried forward as established.
+
+**What the ISA does show is spill.** `d_gemv_glu` spends **1191 of its 6249 instructions (19%) on
+scratch**, by far the largest concentration in the object, and the whole kernel carries 6384 bytes
+per lane of scratch at the 256-VGPR cap (2 waves/SIMD). The register wall is the same one that
+blocked the MFMA arm's second accumulator and hand-rolled software pipelining. If anything in this
+body is worth another look it is the spill, not the dot instruction and not the load issue pattern.
+
+### Conclusion
+
+The low-batch GEMV has no instruction lever left worth taking: the ceiling on all dot-arithmetic
+changes is a measured 3.2%, the MFMA arms lose or change the numerics, the producer/consumer ring
+lost and its clean form needs CDNA4 hardware, and the path is not in production regardless. The
+sweep says production is already on the better arithmetic by 9-19 ms. Goal 2 will not be reached
+inside this kernel family.
+
+
 ## The 8192 chunk has no dominant cost, and the two open prefill projections are stale by a large factor (2026-09-15, job `segattrib-8192`)
 
 With every non-GPU route to the remaining 22 ms closed, the question became which part of the
