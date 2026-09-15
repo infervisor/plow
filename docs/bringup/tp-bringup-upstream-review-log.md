@@ -1642,6 +1642,50 @@ This is a live defect for RAGGED SEAMS generally, not only for row-band: any two
 a `@band{t}` family could desynchronise the same way. Row-band is simply the first pair where one
 sibling never goes ragged and so never re-derives the binding for itself.
 
+## The measured tiles are SLOWER at every rung, so the store must not reach the shipping packet (2026-09-15, job `tileab-rungs-t4`)
+
+The 8192-only A/B found nothing (+0.8 ms inside a 0.9 ms drift). 8192 is the rung where M is
+largest and the tile choice matters least, so the same paired question was asked at all four
+prefill rungs, one server per arm benched at each length in turn:
+
+| rung | ctrl | treat | ctrl2 | drift | delta | verdict |
+|---|---|---|---|---|---|---|
+| 128 | 96.1 | 96.5 | 96.1 | 0.0 | +0.4 | slower |
+| 512 | 352.9 | 360.7 | 353.5 | 0.6 | **+7.6** | slower |
+| 2048 | 427.9 | 435.3 | 427.6 | 0.2 | **+7.5** | slower |
+| 8192 | 952.1 | 957.8 | 953.9 | 1.9 | **+4.8** | slower |
+
+Measurement-chosen tiles lose at every rung, by more than that rung's own drift everywhere except
+128, where the effect is real but sub-millisecond. **The store must not reach the shipping packet**:
+re-emitting with `PLOW_TUNEDB` live would cost 5-8 ms per prefill rung.
+
+**The harness caveat, stated because it matters.** This probe's own tie-check FAILED: 8192 reads
+952 ms here against 586 ms in the single-rung run. The difference is rung ordering — here 8192 is
+benched fourth, on a server that has already served 128, 512 and 2048, so its slot and cache state
+are not a cold server's. The absolute numbers in this table are therefore NOT comparable to
+`tileab-ttft-t4b`'s, and none of them are goal numbers. The PAIRED comparison inside the table is
+unaffected: all three arms ran the identical sequence in the identical order, which is the whole
+reason the design runs the control twice.
+
+**Why measurement can lose to the model, which is the part worth understanding.** `tune gemm`
+times each shape in isolation and picks the fastest tile for that shape alone. The packet then
+runs those tiles inside a whole program, where the choice interacts with everything around it:
+L2 residency across neighbouring ops, occupancy against the co-resident MoE, and the launch
+geometry of the dispatch it sits in. The measured set also changes OPCODE at some shapes
+(`512x6144x256`: `GemmMed 128x128` to `GemmSmall 64x128`), which changes how many tiles the
+dispatch has to place and therefore how it fills. A per-shape optimum that does not compose is
+exactly what this measures, and the analytical model — which prices the dispatch, not the kernel —
+evidently composes better on this packet.
+
+So the campaign's worth is what it always was minus the speed claim: `pick_tile` now reports a
+truthful tier instead of `portable` over a dead cell, and a shape where the model picks badly
+would now be visible. It is diagnostic infrastructure, not a lever. **Tiles are closed as a route
+to 490 ms.**
+
+The open question it leaves is whether a tile campaign that measured shapes IN PROGRAM CONTEXT
+(or that only overrode the model where it beats it by more than the drift) would do better. That
+is a different campaign from the one `rebench_tune_gemm_gfx942.sh` runs.
+
 ## The measured tiles do not move 8192 TTFT, and the shipping packet never had them anyway (2026-09-15, jobs `tileab-ttft-t4`, `tileab-ttft-t4b`)
 
 Two facts, in the order they matter.
