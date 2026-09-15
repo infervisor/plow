@@ -887,13 +887,43 @@ group-32 E8M0 scale rows; `GM_BLK_BK` is already a `#define`).
 
 It is also the item best suited to the scarce resource. It is a KERNEL question
 answerable on ONE card with no emit at all, where items 3-5 need a whole model
-and eight. When a lease comes free, spend it here first.
+and eight.
+
+**On getting a card at all, corrected 2026-09-15.** A long-lived `gpuq-runner`
+holds a `gpulease -n 8` on the whole box and schedules everyone's work from a
+FIFO -- it is not squatting, it IS the scheduler. Raw `gpulease` requests can
+never win against it and simply time out; this cost most of a day of "the GPUs
+are blocked" before anyone read what the holder was. Submit instead:
+
+```
+/root/.claude/jobs/c08d1232/tmp/gpuq/submit.sh <label> <ngpu> <command...>
+```
+
+`ngpu=1` is auto-tagged *quick* and sorts ahead of full campaigns, so a kernel
+harness starts within minutes. One trap: the runner launches every job as
+`nix develop --command <argv>`, so a binary built with the SYSTEM toolchain loads
+the dev shell's `libstdc++` against the older system glibc and dies in the loader
+with `GLIBC_2.38 not found` -- `rc=1` and no kernel output, which reads as a test
+failure and is not one. Build test binaries inside `nix develop`; its ROCm is
+7.14, the same version as the lab tree.
 
 So the ordered critical path to an 8k/90 ms number is:
 
-0. **block-FP8 at `[32, 32]` with E8M0 scales** -- gates 112.0 TFLOP of 281.6.
-   **The arm is WRITTEN (`d_gemm_t<WFP8MX>` / `d_gemm_fp8_mx`) and verified
-   offline; its NUMERICS ARE UNVERIFIED** because no GPU came free. It runs at
+0. ~~**block-FP8 at `[32, 32]` with E8M0 scales**~~ -- **DONE, VERIFIED ON
+   gfx942 HARDWARE 2026-09-15.** Gates 112.0 TFLOP of 281.6. The arm
+   (`d_gemm_t<WFP8MX>` / `d_gemm_fp8_mx`), its opcode (184) and the N-row clamp
+   all landed, and `dsv41_blockfp8_gfx942_test` passes **12 of 12** cases on a
+   real card: every V4.1 projection shape plus ragged M/N and `N = 33`. Worst
+   relative error across all twelve is **3.4-3.8e-03**, which is bf16's own
+   relative epsilon (2^-8 = 3.9e-03) -- i.e. the OUTPUT DTYPE's rounding, not
+   error in the arm. That distinction is the point: a misread scale is wrong by a
+   POWER OF TWO (the ue8m0 exponent), not by a fraction of an ulp, so this
+   residual is positive evidence the scale path is right rather than merely
+   "close enough". `N = 576` -- the `attn.wkv` shape that carried the
+   out-of-bounds read -- passes with the clamped binary.
+
+   The historical note below is kept because the offline checks are what made the
+   hardware run a formality rather than a discovery. It runs at
    BK=32, where one k-tile is exactly one scale block, so the promotion is every
    tile and still lands outside the MFMA burst. Offline it compiles, issues
    `v_mfma_f32_32x32x8_bf16`, reads the scale with `global_load_ubyte` (not
@@ -975,9 +1005,13 @@ So the ordered critical path to an 8k/90 ms number is:
    sequence (NFKC / NFD / StripAccents / Lowercase / Replace / Strip) exists
    there under the same names -- plus the per-step cache that lets an n-gram
    look back across the prefill/decode split. **Both landed on 2026-09-14**
-   (`crates/plowrt/src/text/engram.rs`), so item 2 is complete but for the
-   gfx942 hardware run of ops 182/183, which is still queued behind a GPU
-   lease;
+   (`crates/plowrt/src/text/engram.rs`). **The gfx942 hardware run landed
+   2026-09-15 and item 2 is now COMPLETE**: `dsv4_ops_gfx942_test` passes 16 of
+   16 -- engram gate+mix (182) at three shapes with the masked token provably
+   untouched, the engram gathered table read (183) at `blk = 32` with every
+   masked element zero over 35 798 non-zero reads, inverse RoPE (181), clamped
+   SwiGLU, and the SHIPPED router arms unmoved at worst gate rel ~1e-07, which is
+   the check that none of this disturbed what already works;
 3. a `deepseek_v41` claim in `devgen::run_verified` with `--block` emit, the
    pattern every family since M3 has started from -- V4.1's config/tensor
    binding is the substance here, since `hc_mult = 4` puts mHC on EVERY layer
