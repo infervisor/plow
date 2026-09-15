@@ -1657,9 +1657,19 @@ fn glm_glu_halves(cus: &[u32]) -> (Vec<u32>, Vec<u32>) {
 // expert counts (the header note above). Costs ~25 MB/rank of fu_g at T=8192, n_exp=256.
 pub(crate) const MPF_BM: u32 = 128;
 
-/// Router flags: bit0 sigmoid, bit1 norm_topk, bit2 apply e_score_correction_bias to SELECTION
-/// only (DeepSeek/GLM noaux_tc). Mirrors FLAGS in the B4 harness.
-const GLM_ROUTER_FLAGS: u32 = 1 | 2 | 4;
+/// `i[3]` on the router ops, bit by bit. Mirrors FLAGS in the B4 harness.
+pub(crate) mod router_flag {
+    pub(crate) const SIGMOID: u32 = 1;
+    pub(crate) const NORM_TOPK: u32 = 2;
+    pub(crate) const BIAS: u32 = 4;
+    pub(crate) const F32_LOGIT: u32 = 8;
+    pub(crate) const HASH_SELECT: u32 = 16;
+    pub(crate) const SQRTSOFTPLUS: u32 = 32;
+}
+
+/// GLM/DeepSeek-V3/Kimi: sigmoid scoring, normalised gates, and a selection bias.
+const GLM_ROUTER_FLAGS: u32 =
+    router_flag::SIGMOID | router_flag::NORM_TOPK | router_flag::BIAS;
 /// Expert/shared GLU activation = SiLU (SwiGLU). Mirrors ACT in the B4 harness.
 const GLM_ACT_SILU: u32 = 1;
 

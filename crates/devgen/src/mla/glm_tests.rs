@@ -45,6 +45,28 @@ fn band_only_reads(insts: &[crate::DevInst], names: &[&str]) -> Vec<String> {
     bad
 }
 
+#[test]
+fn router_flag_bits_do_not_collide() {
+    use crate::mla::router_flag as f;
+    let named = [
+        ("SIGMOID", f::SIGMOID),
+        ("NORM_TOPK", f::NORM_TOPK),
+        ("BIAS", f::BIAS),
+        ("F32_LOGIT", f::F32_LOGIT),
+        ("HASH_SELECT", f::HASH_SELECT),
+        ("SQRTSOFTPLUS", f::SQRTSOFTPLUS),
+    ];
+    for (i, (na, a)) in named.iter().enumerate() {
+        assert_eq!(a.count_ones(), 1, "{na} must be a single bit, got {a:#b}");
+        for (nb, b) in &named[i + 1..] {
+            assert_ne!(a, b, "{na} and {nb} share bit {a:#b}");
+        }
+    }
+    assert_ne!(super::GLM_ROUTER_FLAGS & f::SIGMOID, 0);
+    assert_ne!(super::GLM_ROUTER_FLAGS & f::BIAS, 0);
+    assert_eq!(super::GLM_ROUTER_FLAGS & f::SQRTSOFTPLUS, 0);
+}
+
 /// The production recipe (glm53-tp8-90a1b438's recorded knobs; seams, band projections and the
 /// W_uv fold by production default), emitted whole: dense and MoE layers, full and shared
 /// indexers, every bucket with its tail, and the decode rungs. No program reads rows only one

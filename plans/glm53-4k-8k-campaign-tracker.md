@@ -19,6 +19,25 @@ Detailed log: `docs/bringup/tp-bringup-upstream-review-log.md` (rows #81–#99);
   process, plus retrieval 39/39.
 - A default flips only after T4 passes and checkpoint P certifies every touched rung (#90).
 
+## 70K/C20 host review (2026-09-15)
+
+- Exact 100-prompt baseline on the current stack: row-band on 88.76 output tok/s; row-band off
+  90.11. Off returns 29.25 GiB/rank and removes nearly all KV admission deferrals, but worsens
+  median TPOT from 129.86 to 198.09 ms. Capacity is not the throughput gap.
+- The KV path already reserves stable virtual addresses and maps physical 2 MiB blocks at the
+  frontier. Admission must reserve prompt + output logical rows until active-sequence KV offload
+  or preemption exists; optimistic admission alone would defer the OOM instead of solving it.
+- A wider 32768 prefill step budget was prototyped as four existing 8192 launches. Paired 20-prompt
+  screens: row-band on 82.28 → 82.87 tok/s with median TTFT +3.3 s; row-band off 76.06 → 75.67
+  with median TTFT +4.9 s; P99 ITL regressed. Rejected and removed. Keep one standard 8192 launch
+  per AMD tick.
+- Mux fix retained: bounded KV wait queue, backfill past oversized waiters, accurate queue depth and
+  one arrival-rate update per ingress event. This prevents head-of-line idle slots but does not
+  change the prefill-bound ceiling.
+- Next structural kernel lever remains a plow-owned grouped block-FP8 MoE kernel with a ≥256-row
+  expert tile. The pinned AITER family has no tile wider than 64; the old generic MPF_BM=128 result
+  was only −5.1% vs its EPI-off control and remained slower than shipped BM64/EPI-on.
+
 ## Target matrix
 
 | rung / metric | baseline | 50% target | current best (opt-in) |
@@ -752,6 +771,7 @@ T4 before any flip.
 
 | candidate | reason |
 |---|---|
+| Router/hidden-gather overlap level 1 | T3 saved 11.2 ms/P8192, but exact T4 100×70K/C20 regressed output 93.31 → 91.94 tok/s (−1.47%), median TTFT 58.678 → 58.746 s, TPOT 126.65 → 128.55 ms, ITL 51.37 → 51.43 ms. Keep opt-in. |
 | Plow GEMM tiles, split-K, grid (#87) | hipBLASLt wins every prefill shape on one clock; plow keeps GEMV at decode 1–2 |
 | Decode kernel re-pick (#88) | T2 −7.7 ms predicted; T3 +0.5 ms measured |
 | G2 router pre-all-gather | −1.2 ms, inside the 4.3 ms floor |
@@ -809,6 +829,18 @@ Row-split attention (`PLOW_GLM_ROWSPLIT_ATTN`, rowsplit agent, −40…−75 ms 
 packproj reconciliation: the band-width `ColSplit` calls (78 per 8192 program) cost 480–547 µs each, which explains ≈ 40 of the 50–73 ms. With the fixed kernel it predicts D20 −2.0 ms/step and prefill −3.5…+0.6 ms (unresolvable), so `packproj-t3b` decides it as a decode lever.
 
 ## Side findings
+
+- Exact 100×70K/C20 on the corrected host mux, row-band on: 100/0, 93.31 output tok/s,
+  median TTFT 58.678 s, TPOT 126.65 ms, ITL 51.37 ms. This is +5.1% over the prior 88.76
+  tok/s run; live metrics showed 13 admitted + 7 queued at the 966,018-row KV budget with no OOM.
+- GLM router correctness blocker: `GLM_ROUTER_FLAGS` used bit 2 for bias while `op_moe.h`
+  also decoded it as sqrtsoftplus. GLM therefore used the wrong gate transform on every normal
+  split prefill/decode route. The fix moves sqrtsoftplus to bit 5 and pins distinct named bits.
+  All interpreter objects must be rebuilt, then retrieval/output and performance rebaselined.
+- Dtype audit vs vLLM found two more gaps: GLM router logits must be FP32 (current `rlogit` is
+  BF16 and no BF16×BF16→FP32 producer exists), and the indexer Q/K cache should use dynamic FP8
+  plus scales (current pool=1 path is BF16). The latter is expected to save about 3.4 GiB/rank
+  at 70K/C20 and about 182 MB/rank of index-K reads per decode token over 21 full-index layers.
 
 - MTP speculative decoding (full depth): gate B PASS after fixing draft steps 2+ reusing step 1's top-k over a longer
   kv_len (read a −1 selection row → GPU fault). Acceptance 739/815 drafted (90.7%), 3.68 committed tokens per verify
