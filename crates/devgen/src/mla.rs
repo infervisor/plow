@@ -1872,9 +1872,33 @@ fn glm_glu_halves(cus: &[u32]) -> (Vec<u32>, Vec<u32>) {
 // expert counts (the header note above). Costs ~25 MB/rank of fu_g at T=8192, n_exp=256.
 pub(crate) const MPF_BM: u32 = 128;
 
-/// Router flags: bit0 sigmoid, bit1 norm_topk, bit2 apply e_score_correction_bias to SELECTION
-/// only (DeepSeek/GLM noaux_tc). Mirrors FLAGS in the B4 harness.
-const GLM_ROUTER_FLAGS: u32 = 1 | 2 | 4;
+/// `i[3]` on the router ops, bit by bit. Mirrors FLAGS in the B4 harness.
+///
+/// Named rather than spelled `1 | 2 | 4` because these bits are a WIRE contract split across two
+/// files -- `interp.hip` reads some, `op_moe.h` reads others -- and the last arm added to
+/// `op_moe.h` took a bit the dispatch was already using, which silently changed the score
+/// transform for every model that binds a router bias. A bit with a name is a bit somebody has to
+/// look up before reusing.
+pub(crate) mod router_flag {
+    /// Score transform `sigmoid(logit)`. Clear means softmax, unless [`SQRTSOFTPLUS`] is set.
+    pub(crate) const SIGMOID: u32 = 1;
+    /// Renormalise the top-k gates to sum to 1 (`norm_topk_prob`).
+    pub(crate) const NORM_TOPK: u32 = 2;
+    /// `t3` carries `e_score_correction_bias`. Read by the DISPATCH to bind the pointer; the
+    /// kernel then applies it to SELECTION only (DeepSeek/GLM noaux_tc).
+    pub(crate) const BIAS: u32 = 4;
+    /// The router logit is f32, not bf16 (DeepSeek-V4).
+    pub(crate) const F32_LOGIT: u32 = 8;
+    /// Indices come from a `[vocab][k]` table, with no scoring stage (DeepSeek-V4 hash layers).
+    pub(crate) const HASH_SELECT: u32 = 16;
+    /// Score transform `sqrt(softplus(logit))` (DeepSeek-V4's `scoring_func`). Overrides
+    /// [`SIGMOID`]. **Bit 5, not bit 2** -- see the `[DSV4-ROUTE]` note in `op_moe.h`.
+    pub(crate) const SQRTSOFTPLUS: u32 = 32;
+}
+
+/// GLM/DeepSeek-V3/Kimi: sigmoid scoring, normalised gates, and a selection bias.
+const GLM_ROUTER_FLAGS: u32 =
+    router_flag::SIGMOID | router_flag::NORM_TOPK | router_flag::BIAS;
 /// Expert/shared GLU activation = SiLU (SwiGLU). Mirrors ACT in the B4 harness.
 const GLM_ACT_SILU: u32 = 1;
 

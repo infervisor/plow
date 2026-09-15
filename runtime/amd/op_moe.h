@@ -411,11 +411,23 @@ __device__ void d_moe_router_topk(unsigned char* table, const bf16* logit, const
     const bool norm_topk = (flags & 2u) != 0;
     /* DeepSeek-V4 arms. All three default off, so every GLM / DeepSeek-V3 / Qwen / Mixtral /
      * Kimi packet is byte-identical to before them.  [DSV4-ROUTE]
-     *   bit 2  SQRTSOFTPLUS  score = sqrt(softplus(logit)) (model.py:576, config
+     *
+     * SQRTSOFTPLUS IS BIT 5, NOT BIT 2. It was bit 2 when these arms landed, and bit 2 was
+     * already taken: `interp.hip` uses it to decide whether `t3` is bound as the
+     * `e_score_correction_bias` pointer at all, which is what `GLM_ROUTER_FLAGS`' third bit has
+     * always meant. The kernel read only bits 0-1 then, so the bit looked free from in here. The
+     * result was that every packet asking for its bias -- GLM-5.2, GLM-5.3, DeepSeek-V3, Kimi --
+     * silently got sqrt(softplus(.)) scoring instead of the sigmoid it asked for, and the claim
+     * above that they were byte-identical was false for exactly the models that set it. One wire
+     * bit cannot mean two things; the newer meaning moved.
+     *   bit 5  SQRTSOFTPLUS  score = sqrt(softplus(logit)) (model.py:576, config
      *                        `scoring_func: "sqrtsoftplus"`). A third transform beside sigmoid
      *                        and softmax: non-negative like sigmoid but UNBOUNDED above. The
      *                        absolute scale is discarded by norm_topk, but the relative
      *                        weighting and the ordering under +bias are not.
+     *   bit 2  BIAS BOUND    `t3` is the `e_score_correction_bias` tensor. Read by the DISPATCH
+     *                        (`interp.hip`), not here -- from in here a null `bias` says the same
+     *                        thing. Listed so the next arm does not take it for free again.
      *   bit 3  F32 LOGIT     `logit` is f32, not bf16. V4 computes the router logit in fp32
      *                        end to end (model.py:570 upcasts the bf16 gate weight); rounding
      *                        it to bf16 before the transform can flip the selection ranking,
@@ -424,7 +436,7 @@ __device__ void d_moe_router_topk(unsigned char* table, const bf16* logit, const
      *                        indices = tid2eid[token_id] (model.py:562,578), a [vocab][k]
      *                        lookup. The GATE still comes from the score path, so the logit
      *                        GEMV still runs and everything after selection is unchanged. */
-    const bool sqrtsp = (flags & 4u) != 0;
+    const bool sqrtsp = (flags & 32u) != 0;
     const bool f32log = (flags & 8u) != 0;
     const bool hashsel = (flags & 16u) != 0;
     const unsigned tid = threadIdx.x;

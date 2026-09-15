@@ -890,3 +890,67 @@ fn the_mhc_pair_is_glm53s_hyper_connection_at_v41s_own_constants() {
     assert_eq!(post.i[1], cfg.hc_mult);
     assert_eq!(post.i[2], cfg.hidden);
 }
+
+/// The router flag bits are a wire contract split across two files, and they must not collide.
+///
+/// `interp.hip` reads bit 2 to decide whether `t3` is bound as the `e_score_correction_bias`
+/// pointer; `op_moe.h` reads the other bits to pick the score transform. When the DeepSeek-V4 arms
+/// landed they took bit 2 for `sqrtsoftplus` -- which the kernel could not see was occupied,
+/// because the dispatch reads it and the kernel does not. Every packet that asked for its bias
+/// (GLM-5.2, GLM-5.3, DeepSeek-V3, Kimi) therefore got sqrt(softplus(.)) scoring instead of the
+/// sigmoid it asked for, silently: both transforms are monotone, so the top-k SELECTION still
+/// looked sane and only the gate WEIGHTS were wrong.
+///
+/// This pins the three properties that would have caught it.
+#[test]
+fn router_flag_bits_do_not_collide() {
+    use crate::mla::router_flag as f;
+    // 1. Every bit is distinct. A duplicate here IS the bug.
+    let named = [
+        ("SIGMOID", f::SIGMOID),
+        ("NORM_TOPK", f::NORM_TOPK),
+        ("BIAS", f::BIAS),
+        ("F32_LOGIT", f::F32_LOGIT),
+        ("HASH_SELECT", f::HASH_SELECT),
+        ("SQRTSOFTPLUS", f::SQRTSOFTPLUS),
+    ];
+    for (i, (na, a)) in named.iter().enumerate() {
+        assert_eq!(a.count_ones(), 1, "{na} must be a single bit, got {a:#b}");
+        for (nb, b) in &named[i + 1..] {
+            assert_ne!(a, b, "{na} and {nb} are the same bit ({a:#b}) -- one wire bit, two meanings");
+        }
+    }
+    // 2. GLM asks for SIGMOID scoring, and must not accidentally select another transform.
+    assert_eq!(
+        super::GLM_ROUTER_FLAGS & f::SQRTSOFTPLUS,
+        0,
+        "GLM/DeepSeek-V3/Kimi score with sigmoid; setting the sqrtsoftplus bit changes every \
+         routing gate in the model and nothing faults"
+    );
+    assert_ne!(super::GLM_ROUTER_FLAGS & f::SIGMOID, 0);
+    // 3. And it still binds its bias -- the bit whose meaning was taken.
+    assert_ne!(
+        super::GLM_ROUTER_FLAGS & f::BIAS,
+        0,
+        "noaux_tc needs e_score_correction_bias bound at t3"
+    );
+}
+
+/// V4.1 scores with `sqrtsoftplus`, so the emit may not reuse GLM's flags wholesale.
+///
+/// Both are `noaux_tc` top-k with a selection bias and normalised gates, which makes the two
+/// configurations look interchangeable; the scoring function is the one field that differs, and it
+/// is the field that decides every gate weight.
+#[test]
+fn v41_scores_with_sqrtsoftplus_not_sigmoid() {
+    let Some((cfg, _)) = checkpoint() else {
+        return;
+    };
+    assert_eq!(
+        cfg.raw.scoring_func, "sqrtsoftplus",
+        "if this checkpoint ever says sigmoid, the emit's flags must follow it"
+    );
+    assert_eq!(cfg.raw.topk_method, "noaux_tc");
+    // Group-limited routing is the identity here: no n_group/topk_group in the config at all.
+    assert!(cfg.raw.norm_topk_prob);
+}
