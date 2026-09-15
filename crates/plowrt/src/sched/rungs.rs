@@ -8,6 +8,8 @@ const WIDEN_UTIL: f64 = 0.85;
 const NARROW_UTIL: f64 = 0.60;
 const NARROW_TICKS: u32 = 32;
 const MIN_DWELL_TICKS: u32 = 64;
+const MIN_THROUGHPUT_SAMPLES: u64 = 4;
+const THROUGHPUT_HYSTERESIS: f64 = 1.03;
 
 /// Number of leading slots a decode dispatch must cover.
 ///
@@ -43,6 +45,7 @@ pub enum RungReason {
     Backlog,
     Slo,
     Utilization,
+    Throughput,
     LowLoad,
 }
 
@@ -198,14 +201,20 @@ impl RungController {
             .occupied_extent
             .saturating_add(load.queued)
             .min(self.rungs.width(self.rungs.len() - 1));
-        let seat = self.rungs.covering(demanded);
+        let demand_seat = self.rungs.covering(demanded);
+        let seat = self.throughput_seat(demand_seat);
         let mut reason = if actual > self.target {
             RungReason::Occupied
         } else {
             RungReason::Hold
         };
 
-        if load.queued > 0 && seat > self.target {
+        if seat < demand_seat && seat < self.target {
+            self.target = seat;
+            self.dwell_ticks = 0;
+            self.low_load_ticks = 0;
+            reason = RungReason::Throughput;
+        } else if load.queued > 0 && seat > self.target {
             let wait = self.projected_wait_ms(self.target, load);
             let slo = load.slo_ms.max(8.0 * self.service_ms(self.target));
             self.target = seat;
@@ -284,6 +293,22 @@ impl RungController {
         let waves = load.queued.div_ceil(width.max(1));
         load.oldest_wait_ms.max(0.0) + waves as f64 * self.service_ms(rung)
     }
+
+    fn throughput_seat(&self, demand_seat: usize) -> usize {
+        if demand_seat == 0
+            || self.stats[demand_seat].samples < MIN_THROUGHPUT_SAMPLES
+            || self.stats[demand_seat - 1].samples < MIN_THROUGHPUT_SAMPLES
+        {
+            return demand_seat;
+        }
+        let capacity = |rung: usize| self.rungs.width(rung) as f64 * 1000.0 / self.step_ms(rung);
+        let demanded_capacity = capacity(demand_seat);
+        (0..demand_seat)
+            .filter(|&rung| self.stats[rung].samples >= MIN_THROUGHPUT_SAMPLES)
+            .max_by(|&a, &b| capacity(a).total_cmp(&capacity(b)))
+            .filter(|&rung| capacity(rung) > demanded_capacity * THROUGHPUT_HYSTERESIS)
+            .unwrap_or(demand_seat)
+    }
 }
 
 #[cfg(test)]
@@ -352,6 +377,35 @@ mod tests {
         let d = c.decide(load(1, 5));
         assert_eq!(c.width(d.admission), 7);
         assert_eq!(d.reason, RungReason::Backlog);
+    }
+
+    #[test]
+    fn backlog_stays_on_the_faster_sampled_standard_rung() {
+        let mut c = controller(&[1, 2, 4, 8, 16, 32]);
+        for _ in 0..MIN_THROUGHPUT_SAMPLES {
+            c.observe_decode(4, 55.0, NonZeroUsize::MIN);
+            c.observe_decode(5, 125.0, NonZeroUsize::MIN);
+        }
+        c.target = 5;
+        let d = c.decide(load(20, 80));
+        assert_eq!(c.width(d.admission), 16);
+        assert_eq!(d.reason, RungReason::Throughput);
+    }
+
+    #[test]
+    fn throughput_cap_waits_for_adjacent_samples_and_a_real_gain() {
+        let mut c = controller(&[1, 8, 16, 32]);
+        for _ in 0..MIN_THROUGHPUT_SAMPLES {
+            c.observe_decode(3, 125.0, NonZeroUsize::MIN);
+        }
+        let admission = c.decide(load(20, 80)).admission;
+        assert_eq!(c.width(admission), 32);
+
+        for _ in 0..MIN_THROUGHPUT_SAMPLES {
+            c.observe_decode(2, 63.0, NonZeroUsize::MIN);
+        }
+        let admission = c.decide(load(20, 80)).admission;
+        assert_eq!(c.width(admission), 32);
     }
 
     #[test]
