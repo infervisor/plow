@@ -120,6 +120,24 @@ fn dispatched_list_matches_the_amd_interpreter() {
         );
 }
 
+#[test]
+fn gemm_f32_standard_decode_ladder_uses_one_numeric_path() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.join("runtime/amd/interp.hip"))
+        .filter(|p| p.exists());
+    let Some(path) = path else {
+        eprintln!("interp.hip not found — skipping (source checkout only)");
+        return;
+    };
+    let src = std::fs::read_to_string(path).unwrap();
+    assert!(src.contains("#define PLOW_GEMM_F32_STANDARD_DECODE_MAX_ROWS 32u"));
+    assert!(src.contains(
+        "PLOW_RUNTIME_ROWS(in->i[0]) <= PLOW_GEMM_F32_STANDARD_DECODE_MAX_ROWS"
+    ));
+}
+
 /// The gate refuses an opcode with no AMD arm. `GemvArgmax` is the real instance: it has no
 /// `case` in interp.hip, and `PLOW_FUSE_ARGMAX=1` emits it — a decode would have argmaxed over
 /// an untouched buffer and returned token 0 every step, with no fault anywhere.

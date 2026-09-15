@@ -3977,14 +3977,16 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
             break;
 #endif
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMM_F32
+#define PLOW_GEMM_F32_STANDARD_DECODE_MAX_ROWS 32u
         case PLOW_DOP_GEMM_F32:
-            if (PLOW_RUNTIME_ROWS(in->i[0]) <= 20)
+            if (PLOW_RUNTIME_ROWS(in->i[0]) <= PLOW_GEMM_F32_STANDARD_DECODE_MAX_ROWS)
                 d_gemv_bf16_f32((float*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
                                  PLOW_RUNTIME_ROWS(in->i[0]), in->i[1], in->i[2], slice, nblk);
             else
                 d_gemm_f32((float*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
                            PLOW_RUNTIME_ROWS(in->i[0]), in->i[1], in->i[2], slice, nblk, sm->gm);
             break;
+#undef PLOW_GEMM_F32_STANDARD_DECODE_MAX_ROWS
 #endif
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMM_SMALL
         case PLOW_DOP_GEMM_SMALL:
