@@ -288,6 +288,19 @@ impl ServeEngine {
         }
     }
 
+    /// What the device can back, so the mux admits on KV bytes instead of free slots alone.
+    /// `None` = admit on slots, the behaviour every non-AMD engine keeps.
+    pub fn kv_admission_budget(&self) -> Option<crate::sched::admission::KvBudget> {
+        match self {
+            #[cfg(feature = "cuda")]
+            ServeEngine::Cuda(_) => None,
+            #[cfg(feature = "hsa")]
+            ServeEngine::Amd(e) => e.kv_admission_budget(),
+            #[cfg(feature = "cpu")]
+            ServeEngine::Cpu(_) => None,
+        }
+    }
+
     pub fn prefix_cache_enabled(&self) -> bool {
         match self {
             #[cfg(feature = "cuda")]
@@ -1487,6 +1500,12 @@ mod amd_serve {
 
         pub fn decode_rungs(&self) -> &[u32] {
             &self.decode_rungs
+        }
+
+        /// Rank 0's budget. The ranks are symmetric — the same packet, the same shard shape and
+        /// the same KV geometry on every one — so one rank's figure is the group's.
+        pub fn kv_admission_budget(&self) -> Option<crate::sched::admission::KvBudget> {
+            self.ranks.rank0().kv_admission()
         }
 
         pub fn overlap_evidence(&self) -> Vec<AmdOverlapRankEvidence> {

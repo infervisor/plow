@@ -481,6 +481,29 @@ pub fn spawn(
     let (tx, mut rx) = mpsc::channel::<MuxMsg>(ingress_capacity);
     tracing::info!(%slug, capacity, ingress_capacity, "mux capacity resolved");
 
+    // WHAT THE DEVICE CAN BACK, taken once like `gpu_shape` above. Admission used free SLOTS
+    // alone, which is right at 8k prompts and fatal at 70k: 20 x 70,000 rows wants 72.1 GiB of
+    // a 55.59 GiB budget, and the overcommit arrived as an async queue fault instead of as
+    // backpressure. `None` keeps slot-count admission for every engine without a budget.
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
+    let kv_budget = state
+        .gpu_engine(&slug)
+        .and_then(|e| e.lock().kv_admission_budget());
+    #[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
+    let kv_budget: Option<crate::sched::admission::KvBudget> = None;
+    if let Some(b) = kv_budget {
+        tracing::info!(
+            %slug,
+            bytes_per_token = b.bytes_per_token,
+            budget_gib = b.budget_bytes as f64 / (1u64 << 30) as f64,
+            max_rows = b.max_rows(),
+            "mux: KV-capacity admission armed"
+        );
+    }
+    // One job held back because its KV did not fit. Retried ahead of anything newer, so the
+    // budget never reorders the queue.
+    let mut deferred: Option<(Job, Instant)> = None;
+
     // Per-model KV arena from the first decode bucket that declares paging
     // (all rungs share the same paging shape). `None` when no bucket carries
     // KvPaging (test bundles / attention-less models) — admission then skips
@@ -633,8 +656,9 @@ pub fn spawn(
                 note_dequeued(&msg, &metrics);
                 match msg {
                     MuxMsg::Job(job, arrived) => {
-                        admit_into(
+                        deferred = admit_into(
                             &mut slots,
+                            usize::MAX,
                             job,
                             arrived,
                             &mut load,
@@ -642,6 +666,7 @@ pub fn spawn(
                             arena.as_ref(),
                             &metrics,
                             &health,
+                            kv_budget,
                         );
                     }
                     MuxMsg::Drain(done) => {
@@ -714,11 +739,26 @@ pub fn spawn(
             // Non-blocking drain: fill every idle slot the queue can serve.
             // A short hold when we still have empty slots and no live work
             // yet keeps us from waking up on a single arrival amid a burst.
+            // FIFO: whatever the budget held back goes first, before any newer arrival.
+            if let Some((job, arrived)) = deferred.take() {
+                deferred = admit_into(
+                    &mut slots,
+                    admission_limit,
+                    job,
+                    arrived,
+                    &mut load,
+                    &mut last_arrival,
+                    arena.as_ref(),
+                    &metrics,
+                    &health,
+                    kv_budget,
+                );
+            }
             let idle = slots[..admission_limit]
                 .iter()
                 .filter(|s| s.is_none())
                 .count();
-            if !draining && idle > 0 {
+            if !draining && deferred.is_none() && idle > 0 {
                 let lambda = load.lambda.get();
                 // Only hold when the slot table is empty (cold-start burst);
                 // if any slot is already live, spinning up the tick delivers
@@ -738,7 +778,9 @@ pub fn spawn(
                     Metrics::inc(&metrics.hold_count);
                     let deadline =
                         Instant::now() + std::time::Duration::from_secs_f64(hold_ms / 1000.0);
-                    while slots[..admission_limit].iter().any(|s| s.is_none()) {
+                    while deferred.is_none()
+                        && slots[..admission_limit].iter().any(|s| s.is_none())
+                    {
                         let remaining = deadline.saturating_duration_since(Instant::now());
                         if remaining.is_zero() {
                             break;
@@ -748,8 +790,9 @@ pub fn spawn(
                                 note_dequeued(&msg, &metrics);
                                 match msg {
                                     MuxMsg::Job(job, arrived) => {
-                                        admit_into(
-                                            &mut slots[..admission_limit],
+                                        deferred = admit_into(
+                                            &mut slots,
+                                            admission_limit,
                                             job,
                                             arrived,
                                             &mut load,
@@ -757,7 +800,11 @@ pub fn spawn(
                                             arena.as_ref(),
                                             &metrics,
                                             &health,
+                                            kv_budget,
                                         );
+                                        if deferred.is_some() {
+                                            break;
+                                        }
                                         if cfg.idle_dispatch
                                             && rx.is_empty()
                                             && ingress_seen.load(Ordering::Relaxed) == 0
@@ -778,21 +825,31 @@ pub fn spawn(
                     }
                 }
                 // Any additional pending arrivals (no wait).
-                while !draining && slots[..admission_limit].iter().any(|s| s.is_none()) {
+                while !draining
+                    && deferred.is_none()
+                    && slots[..admission_limit].iter().any(|s| s.is_none())
+                {
                     match rx.try_recv() {
                         Ok(msg) => {
                             note_dequeued(&msg, &metrics);
                             match msg {
-                                MuxMsg::Job(job, arrived) => admit_into(
-                                    &mut slots[..admission_limit],
-                                    job,
-                                    arrived,
-                                    &mut load,
-                                    &mut last_arrival,
-                                    arena.as_ref(),
-                                    &metrics,
-                                    &health,
-                                ),
+                                MuxMsg::Job(job, arrived) => {
+                                    deferred = admit_into(
+                                        &mut slots,
+                                        admission_limit,
+                                        job,
+                                        arrived,
+                                        &mut load,
+                                        &mut last_arrival,
+                                        arena.as_ref(),
+                                        &metrics,
+                                        &health,
+                                        kv_budget,
+                                    );
+                                    if deferred.is_some() {
+                                        break;
+                                    }
+                                }
                                 MuxMsg::Drain(done) => {
                                     draining = true;
                                     drain_done = Some(done);
@@ -1132,8 +1189,17 @@ fn note_dequeued(msg: &MuxMsg, metrics: &Metrics) {
 /// footprint upfront. On KV OOM the request is dropped with a typed error —
 /// the mux doesn't hold the slot open under memory pressure. The prompt
 /// arrives pre-tokenized (see [`Job::prompt_ids`]).
+/// Returns the job UNADMITTED when the KV budget cannot back it yet; the caller holds it and
+/// retries before taking anything newer. That is the whole backpressure mechanism: a request
+/// the device cannot back stays in the queue instead of being dispatched into a fault.
+///
+/// `limit` bounds which slots a NEW request may take (the decode-rung admission window); the
+/// budget is charged over every live slot, including those above the limit, because their KV is
+/// just as resident.
+#[allow(clippy::too_many_arguments)]
 fn admit_into(
     slots: &mut [Option<Slot>],
+    limit: usize,
     job: Job,
     arrived: Instant,
     load: &mut LoadEstimator,
@@ -1141,7 +1207,8 @@ fn admit_into(
     arena: Option<&SharedKvState>,
     metrics: &Arc<Metrics>,
     health: &EngineHealth,
-) {
+    kv_budget: Option<crate::sched::admission::KvBudget>,
+) -> Option<(Job, Instant)> {
     // A dead engine cannot serve anyone — reject up front with the fault that
     // killed it (fatal DeviceFault → 503), instead of admitting into a
     // poisoned context. The poisoning itself was logged once; this stays at
@@ -1154,7 +1221,7 @@ fn admit_into(
             .try_send(StreamChunk::Err(crate::RuntimeError::DeviceFault {
                 info: info.clone(),
             }));
-        return;
+        return None;
     }
 
     // Refresh λ from the inter-arrival gap.
@@ -1176,7 +1243,10 @@ fn admit_into(
         load.lambda.update(1.0);
     }
 
-    let Some(idx) = slots.iter().position(|s| s.is_none()) else {
+    let Some(idx) = slots[..limit.min(slots.len())]
+        .iter()
+        .position(|s| s.is_none())
+    else {
         // Capacity exhausted — reject fast rather than sitting on the request.
         tracing::warn!(
             capacity = slots.len(),
@@ -1192,10 +1262,48 @@ fn admit_into(
             .try_send(StreamChunk::Err(crate::RuntimeError::Rejected(
                 "engine at capacity — no free slot".into(),
             )));
-        return;
+        return None;
     };
 
     let seq_upper = (job.prompt_ids.len() + job.gen.max_tokens.max(1)) as i64;
+
+    // KV CAPACITY, charged over every live slot and not just the admission window.
+    if let Some(budget) = kv_budget {
+        let want = seq_upper.max(0) as u64;
+        let committed: u64 = slots
+            .iter()
+            .flatten()
+            .map(|s| (s.prompt_ids.len() + s.gen.max_tokens.max(1)) as u64)
+            .sum();
+        if !budget.fits(0, want) {
+            // Nothing will ever free enough: deferring would wedge the queue behind it, so
+            // this one is answered now. Distinct from max_ctx, which bounds the PROMPT — this
+            // bounds prompt + generation against what this device was left after the load.
+            tracing::warn!(
+                want,
+                max_rows = budget.max_rows(),
+                "mux: request exceeds the whole KV budget — rejected"
+            );
+            Metrics::inc(&metrics.rejected);
+            let _ = job
+                .respond
+                .try_send(StreamChunk::Err(crate::RuntimeError::ContextLength(format!(
+                    "request reserves {want} tokens; this device can back {} across all \
+                     concurrent sequences",
+                    budget.max_rows()
+                ))));
+            return None;
+        }
+        if !budget.fits(committed, want) {
+            tracing::debug!(
+                want,
+                committed,
+                max_rows = budget.max_rows(),
+                "mux: KV budget full — request stays queued"
+            );
+            return Some((job, arrived));
+        }
+    }
 
     let kv = if let Some(arena) = arena {
         match arena.lock().arena.allocate_slot(seq_upper) {
@@ -1208,7 +1316,7 @@ fn admit_into(
                     .try_send(StreamChunk::Err(crate::RuntimeError::Oom(format!(
                         "kv: {e}"
                     ))));
-                return;
+                return None;
             }
         }
     } else {
@@ -1238,6 +1346,7 @@ fn admit_into(
         cached_tokens: 0,
         kv,
     });
+    None
 }
 
 /// Return a slot's KV blocks to the arena (no-op when the slot never got one).

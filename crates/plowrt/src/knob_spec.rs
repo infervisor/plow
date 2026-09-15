@@ -60,6 +60,16 @@ const PROMOTED: Status = Status::Qualified {
     evidence: &["docs/flags-reference.md: a promoted default; `=false` is the rollback"],
 };
 
+/// KV-capacity admission. The mux admitted on free SLOTS alone, so a device that can back
+/// ~15 concurrent 70k sequences was handed 20 and faulted instead of applying backpressure.
+const KV_ADMIT_DEFAULT: Status = Status::Candidate {
+    evidence: &[
+        "review log: job 70k-fault2 arm C, 20 x 70,000 on a fresh server, HSA_STATUS_ERROR_OUT_OF_RESOURCES after occupied_extent=20; the C1 and C4 arms clean, and arm D clean through three 8192 steps before the same cell faulted",
+        "the same run's load log: 55,296 B per token per rank, 55.59 GiB free after load, so 20 x 70,000 rows wants 72.1 GiB against a 55.59 GiB budget",
+        "docs/flags-reference.md: `=0` is the rollback to slot-count-only admission",
+    ],
+};
+
 /// Pressure eviction armed by default. The cache previously trimmed only on its static 5%
 /// budget, so it never reacted to real device pressure however little was free.
 const PRESSURE_EVICTION_DEFAULT: Status = Status::Candidate {
@@ -339,6 +349,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.encode_split_min", Some("PLOW_ENCODE_SPLIT_MIN"), Layer::Runtime, U32, UNSET, OPT_IN),
     KnobSpec::new("rt.vmm_cache_memory_utilization", Some("PLOW_VMM_CACHE_MEMORY_UTILIZATION"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("0.05")), OPT_IN),
     KnobSpec::new("rt.vmm_cache_min_free_mib", Some("PLOW_VMM_CACHE_MIN_FREE_MIB"), Layer::Runtime, U32, UNSET, PRESSURE_EVICTION_DEFAULT),
+    KnobSpec::new("rt.kv_admit_headroom", Some("PLOW_KV_ADMIT_HEADROOM"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("0.9")), KV_ADMIT_DEFAULT),
     KnobSpec::new("rt.amd_prefix_fine_rows", Some("PLOW_AMD_PREFIX_FINE_ROWS"), Layer::Runtime, U32, UNSET, PREFIX_CACHE_CANDIDATE),
     KnobSpec::new("rt.mla_pf_row_split", Some("PLOW_MLA_PF_ROW_SPLIT"), Layer::Runtime, Domain::Bool, ON, ROW_SPLIT_QUALIFIED),
     KnobSpec::new("rt.mla_pf_row_split_native_lo", Some("PLOW_MLA_PF_ROW_SPLIT_NATIVE_LO"), Layer::Runtime, Domain::Bool, ON, NATIVE_LO_QUALIFIED),

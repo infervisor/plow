@@ -962,6 +962,13 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-phase-objects", env = "PLOW_PHASE_OBJECTS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub phase_objects: bool,
 
+    /// Fraction of the free-after-load device memory the mux may commit to admitted
+    /// sequences' KV. Below 1.0 so transient prefill workspaces and allocator fragmentation
+    /// are not competing with a budget that already counts every byte. `0` disables the
+    /// KV-capacity gate and admits on free slots alone, which is what crashed 20x70k.
+    #[arg(long = "kv-admit-headroom", env = "PLOW_KV_ADMIT_HEADROOM", default_value_t = 0.9, value_parser = clap::value_parser!(f64), global = true)]
+    pub kv_admit_headroom: f64,
+
     /// VMM-backed KV on ROCr: reserve virtual address space for `max_ctx`, map physical pages
     /// at each sequence's frontier instead of carving the whole rectangle. Requires
     /// `hsa_amd_vmem_*`; every failure path warns and falls back to the flat carve.
@@ -1480,6 +1487,16 @@ impl RuntimeConfig {
                 ((device_bytes as f64 * Self::VMM_CACHE_MIN_FREE_FRACTION) as u64) >> 20 << 20,
             ),
         }
+    }
+
+    /// `--kv-admit-headroom`, clamped to a sane range. 0 disables the gate.
+    pub(crate) fn kv_admit_headroom(&self) -> f64 {
+        select_compat(
+            self.amd.kv_admit_headroom,
+            Self::env_parse("PLOW_KV_ADMIT_HEADROOM"),
+            !Self::is_initialized(),
+        )
+        .clamp(0.0, 1.0)
     }
 
     /// Fraction of device memory the prefix cache keeps free by default. 4% is ~7.7 GiB on a

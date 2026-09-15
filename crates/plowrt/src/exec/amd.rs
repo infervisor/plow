@@ -6040,6 +6040,9 @@ pub struct AmdEngine {
     t_active: Option<usize>,
     t_logits: Option<usize>,
     max_ctx: usize,
+    /// What this rank's device can back, so the mux admits on KV bytes and not on free
+    /// slots alone. `None` when the driver would not report free memory at load.
+    kv_admission: Option<crate::sched::admission::KvBudget>,
 
     weights_bound: bool,
     /// Decode batch — the number of sequences one decode dispatch advances.
@@ -10333,6 +10336,41 @@ impl AmdEngine {
             replicated_gib = replicated as f64 / (1u64 << 30) as f64,
             "device memory after load"
         );
+        // KV ADMISSION BUDGET. The mux admitted on free SLOTS alone, so 20 concurrent 70k
+        // sequences were dispatched onto a device that can back about 15 of them, and the
+        // overcommit surfaced as an async queue fault (OUT_OF_RESOURCES / aperture violation)
+        // rather than as backpressure. Measured on the faulting run: KV is 55,296 B per token
+        // per rank (84.375 GiB of pools over max_ctx 81920 x batch 20), the load left 55.59
+        // GiB free, and 20 x 70,000 rows wants 72.1 GiB.
+        //
+        // Declared bytes, not resident: the pools reserve VA for `max_ctx` and map physical at
+        // each sequence's frontier, so this is exactly the cost of letting every admitted
+        // sequence run to the context it reserved. `free` is what the driver reports after the
+        // load, so weights, workspaces and the prefix cache are already subtracted.
+        let kv_admission = free.and_then(|free| {
+            let kv_bytes: u64 = blob
+                .tensors
+                .iter()
+                .filter(|t| t.name.starts_with("kv."))
+                .map(|t| t.bytes)
+                .sum();
+            let rows = (max_ctx as u64).checked_mul(batch as u64)?;
+            let per_token = kv_bytes.checked_div(rows).filter(|&b| b > 0)?;
+            let budget = (free as f64 * crate::config::RuntimeConfig::get().kv_admit_headroom())
+                as u64;
+            tracing::info!(
+                rank,
+                per_token,
+                free_gib = free as f64 / (1u64 << 30) as f64,
+                budget_gib = budget as f64 / (1u64 << 30) as f64,
+                max_rows = budget / per_token,
+                "KV admission budget"
+            );
+            Some(crate::sched::admission::KvBudget {
+                bytes_per_token: per_token,
+                budget_bytes: budget,
+            })
+        });
         if replicated > 0 {
             match free {
                 Some(f) if f < replicated + (8 << 30) => {
@@ -10538,6 +10576,7 @@ impl AmdEngine {
             t_active,
             t_logits,
             max_ctx,
+            kv_admission,
             weights_bound: ckpt.is_some(),
             batch,
             tens_table: table,
@@ -10662,6 +10701,11 @@ impl AmdEngine {
 
     pub fn arch(&self) -> &str {
         &self.arch
+    }
+
+    /// This rank's KV admission budget, or `None` when free memory was unreadable at load.
+    pub fn kv_admission(&self) -> Option<crate::sched::admission::KvBudget> {
+        self.kv_admission
     }
 
     pub fn max_ctx(&self) -> usize {
