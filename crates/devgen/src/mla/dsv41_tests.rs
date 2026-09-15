@@ -1583,12 +1583,23 @@ fn the_rung_is_a_prefill_bucket_and_states_it_cannot_decode() {
 /// It used to emit the left end alone -- `block_spec.split("..").next()` -- so `--block 0..39`
 /// wrote a blob byte-identical to `--block 0` and said nothing. A whole-model request answered
 /// with one layer is exactly the silently-wrong artifact this emitter refuses everywhere else.
+///
+/// SYNTHETIC `compress_ratios`. Only layer 0 is emittable on the real config (see
+/// `a_layer_that_reads_the_compressed_cache_is_not_done`), so there is no range of real layers to
+/// chain yet. Zeroing the ratios makes layers 3..7 window-only, which is what the chain LOOP needs
+/// to be exercised; it is a statement about the loop, not about the model.
 #[test]
 fn a_block_range_emits_every_layer_in_it_chained() {
-    let Some((cfg, _)) = checkpoint() else {
+    let Some((mut cfg, _)) = checkpoint() else {
         return;
     };
     let _guard = crate::test_env::env_guard();
+    cfg.raw.compress_ratios = vec![0; cfg.raw.compress_ratios.len()];
+    assert!(
+        (3..=7).all(|l| super::dsv41::dsv41_emit_block_plan(&cfg, l).is_ok()),
+        "the synthetic config must make 3..7 emittable, or this tests nothing"
+    );
+
     let (one, d1) = super::dsv41::emit_dsv41_block(&cfg, &[3], 8, 304, 2048, 256);
     let (five, d5) = super::dsv41::emit_dsv41_block(&cfg, &[3, 4, 5, 6, 7], 8, 304, 2048, 256);
     let n1 = one.progs[0].insts.len();
@@ -1613,4 +1624,42 @@ fn a_block_range_emits_every_layer_in_it_chained() {
     assert_eq!(d1.weights.prefix, "layers.3.");
     assert_eq!(d5.weights.prefix, "layers.");
     assert_eq!(d5.layer, 3, "the descriptor names the first layer of the chain");
+}
+
+/// Reading the shared CSA2 cache is a PART, and a layer that needs it is not done.
+///
+/// `kv_source` says who WRITES the cache -- 4 layers. `compress_ratios[l]` says which cache layer
+/// `l` READS, and only 0 means "sliding window only". The parts table used to consult the writer
+/// list alone, so all 38 reader layers were reported COMPLETE while the emit dispatched
+/// `FlashMlaPrefill` with `KV_MASK_NONE` and nothing but the 128-token window. A refusal that
+/// says "done" about a layer attending over a fraction of its keys is worse than no refusal, so
+/// the reader side is pinned here by layer id.
+#[test]
+fn a_layer_that_reads_the_compressed_cache_is_not_done() {
+    let Some((cfg, _)) = checkpoint() else {
+        return;
+    };
+    let needs = |l: u32| {
+        super::dsv41::dsv41_layer_parts(&cfg, l)
+            .iter()
+            .any(|(n, st)| n.starts_with("compressed-KV attention") && *st == super::dsv41::Part::Todo)
+    };
+
+    // Only layers 0 and 1 are window-only; compress_ratios is [0, 0, 2 x18, 1 x20, 0, 0, 0] and
+    // the trailing three entries are DSpark blocks, not layers.
+    assert!(!needs(0), "layer 0 is window-only");
+    assert!(!needs(1), "layer 1 is window-only");
+    for l in 2..cfg.layers {
+        assert!(needs(l), "layer {l} reads the compressed cache and must say so");
+    }
+
+    // And the reader side is NOT the writer side: layer 3 reads without owning a compressor.
+    assert!(!cfg.kv_source.contains(&3));
+    assert!(needs(3), "a pure reader still needs the read emitted");
+
+    // The consequence, stated as the count so a regression is loud: exactly one layer emits.
+    let emits = (0..cfg.layers)
+        .filter(|l| super::dsv41::dsv41_emit_block_plan(&cfg, *l).is_ok())
+        .count();
+    assert_eq!(emits, 1, "only layer 0 is fully emitted today");
 }

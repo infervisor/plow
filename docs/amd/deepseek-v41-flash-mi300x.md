@@ -1895,7 +1895,13 @@ which is what the latency-bound ops want) and costs GEMM efficiency on the ops t
 compute-bound — the shared expert and the projections, 2.7 ms of the layer. Worth measuring, not
 worth assuming.
 
-### 12.7 Multi-layer: `--block l..r` chains, and 31 of 40 layers emit today
+### 12.7 Multi-layer: `--block l..r` chains
+
+> **The "31 of 40 layers emit" claim in this section is RETRACTED by §12.9.** The parts table was
+> reporting the CSA2 WRITE side only, so 38 reader layers were marked complete while the emit gave
+> them sliding-window attention and nothing else. The true count is **1 of 40**. The chaining work
+> and the 5-layer timing below both stand; what they measure does not include the compressed-KV
+> read those layers owe.
 
 **`--block 0..39` used to silently emit layer 0.** The spec was parsed with
 `block_spec.split("..").next()` -- the left end alone -- so a whole-model request produced a blob
@@ -1939,6 +1945,48 @@ pass on gfx942. What is missing is the emit around them."* The eight-subsystem l
 in this document is the **model-level** refusal from the nn-graph path, which is not the path that
 serves; the rung path's gap is the CSA2 compressor emit, the two-level indexer emit, and Engram's
 emit for layer 1.
+
+### 12.9 The parts table was reporting the write side of CSA2 only
+
+Chasing "which layers emit" turned up a hole in the refusal itself, which matters more than the
+count it produced.
+
+`kv_source_layer_ids` says who **writes** the shared compressed cache -- 4 layers.
+`compress_ratios[l]` says which cache layer `l` **reads**, and `0` is the only value meaning
+"sliding window only". The config module says so in its own header -- *"In V4 a nonzero
+`compress_ratios[l]` meant layer `l` runs its own compressor. In V4.1 it does not: only
+`kv_source_layer_ids` compress, and every other layer reads that cache"* -- and `Dsv41Cfg` repeats
+it on the field: *"Layers owning a CSA2 compressor. EVERY other layer READS their cache."* The
+module header even warns the two *"disagree by construction"* and are *"easy to MISREAD"*.
+
+`dsv41_layer_parts` consulted the writer list alone. So every layer that merely READS the cache was
+reported **complete**, while `emit_dsv41_attn_core` dispatched `FlashMlaPrefill` with
+`d.i[5] = KV_MASK_NONE` and nothing but the 128-token window. `compress_ratios` for this checkpoint
+is `[0, 0, 2 x18, 1 x20, 0, 0, 0]` (the trailing three are DSpark blocks, not layers), so **38 of
+40 layers** were attending over a fraction of the keys they owe and being certified done for it.
+
+That is the exact "loads, runs, and produces fluent-looking garbage" outcome this emitter's refusal
+exists to prevent -- produced *by* the refusal, which is the worst place for it. The table now asks
+`attn_kind(l)`, an accessor that already existed and that nothing consulted:
+
+| | before | after |
+|---|---|---|
+| layers that emit | 31 of 40 | **1 of 40** (layer 0) |
+
+Layers 0 and 1 are the only genuinely window-only ones; layer 1 also needs Engram. A test pins the
+reader side by layer id and pins the count at 1, so this cannot silently reopen.
+
+**What this costs the numbers above.** §12.7's 5-layer chain (23.12 ms/layer) is still a real
+measurement of the ops that were in it, and the chaining machinery is still right -- but those
+layers were missing their compressed-KV attention, so **23.1 ms/layer is a floor, not the layer
+cost**, and the 925 ms projection is an under-estimate of the real model. It also means that
+packet can no longer be emitted, which is correct.
+
+**And it moves the end-to-end gap.** It is not "9 layers need two emits" -- it is: 38 layers need
+the compressed-KV attention read, 4 need the compressor that writes it, 8 need indexer queries,
+2 need Engram. The kernels for the write side exist (ops 180/181, 182/183, 184 all pass on gfx942);
+the read side additionally needs the top-k gather wired into the attention core, for which
+`FlashGatherPrefill` (op 55) is the intended kernel and is already built and dispatched.
 
 ### 12.2 What is still not demonstrated
 

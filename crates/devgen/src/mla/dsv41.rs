@@ -1679,6 +1679,25 @@ pub(crate) fn dsv41_layer_parts(c: &Dsv41Cfg, l: u32) -> Vec<(&'static str, Part
         "attention core (interior rope + windowed absorbed MLA + sink merge)",
         Part::Done,
     ));
+    // THE READ SIDE OF CSA2, which this table used to omit entirely.
+    //
+    // `kv_source` says who WRITES the shared cache -- 4 layers. `compress_ratios[l]` says which
+    // cache layer `l` READS, and 0 is the only value meaning "sliding window only". They
+    // "disagree by construction" (this module's own header), and the table consulted the writer
+    // list alone: every layer that merely reads the cache was marked fully Done, and the emit
+    // above dispatches `FlashMlaPrefill` with `KV_MASK_NONE` and nothing but the 128-token
+    // window. That is 38 of 40 layers silently attending over a fraction of what they should --
+    // exactly the "loads, runs, produces fluent-looking garbage" outcome the refusal exists to
+    // prevent, produced BY the refusal saying the layer was complete.
+    //
+    // Only layers 0 and 1 are genuinely window-only (`compress_ratios` is [0, 0, 2 x18, 1 x20,
+    // 0, 0, 0] -- the trailing three are the DSpark blocks, not layers).
+    if !matches!(c.raw.attn_kind(l), nn_graph::models::config::V41Attn::Window) {
+        p.push((
+            "compressed-KV attention (reads the shared CSA2 cache; compress_ratios != 0)",
+            Part::Todo,
+        ));
+    }
     p.push(("output projection wo_a + wo_b (op 184)", Part::Done));
     p.push(("output all-reduce (XReduce, wo_b is input-parallel)", Part::Done));
     p.push(("ffn_norm", Part::Done));
