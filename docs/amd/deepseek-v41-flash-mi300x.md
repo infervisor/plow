@@ -2211,6 +2211,89 @@ rearrangement of a shipped GLM/V4 one, with identical tensor shapes, bound onto 
 marked Done. Shape agreement is not evidence. The next candidates to check the same way are the
 indexer's two-level selection and the Engram gate.
 
+### 12.13 The mHC fix on hardware, and 2.8 ms out of the mHC's own GEMV
+
+The §12.12 fix is not a paper change: the packet was re-emitted, three objects built against it,
+and all three run on 8x MI300X at T=8192, TP8.
+
+**The fix is free.** Arm 0 -- the same `d_gemv_f32` the 23.3 ms was measured with, now with
+`pre_mode` wired -- lands at **23272 us median**, against 23272 us before. One f32 store and one
+f32 load per token per sublayer against 5120-wide bf16 traffic is noise, as predicted. The exit is
+finite and stable: `min -2.73438  max 3.53125  mean -0.000708  zero 0  NaN 0  Inf 0`.
+
+**And the arms are bit-identical, demonstrated rather than argued.** All three objects produce the
+exit above to the last printed digit. That is the check that matters for a knob that reassigns
+which wave owns which `(m, n)`.
+
+#### `GemvF32` was reading `x` eight times
+
+§12.4 found this op and cut it 827 -> 3156 us per packet. It was still the largest single item in
+the trace, and 3156 us for a `[8192, 24] = [8192, 20480] x [20480, 24]` GEMV is ~50x off what its
+335 MB of `x` should cost. The reason is in the arm §12.4 wrote: a BLOCK owns a row and its eight
+waves each take four column slots, so **each of the eight waves reads the whole row** -- 2.7 GB of
+`x` traffic where the tensor is 335 MB, held together only by L1.
+
+Five candidate arms, built and measured because reading cannot rank them -- and two of the five
+came out backwards from the reading:
+
+| arm | who owns what | `GemvF32` (2 pk) | layer median |
+|---|---|---|---|
+| 0 (was shipped) | block per row, 4 column slots per wave, one aliased at N=24 | 6311 us | 23272 us |
+| 1 | the same, alias removed (3 contiguous columns per wave) | 6300 us | 23284 us |
+| 2 | wave per row, N swept in groups of 8 | 3429 us | 20465 us |
+| 3 | wave per row, all 24 columns in registers -- `x` read ONCE | 8136 us | 25207 us |
+| **4 (now default)** | **flattened `(row, column group)` index** | **3362 us** | **20416 us** |
+
+**Arm 1 is the negative result.** Removing the aliased slot deletes a quarter of the FMAs and a
+quarter of the W reads and changes nothing (6311 -> 6300 us, inside run-to-run noise). So neither
+the VALU nor W was the constraint -- the alias was already free, because W is 1.97 MB and lives in
+L2.
+
+**Arm 2 is worth 2.8 ms on the layer**, 12%. A wave owning its own row re-reads that row once per
+column group -- three passes at N=24 rather than eight -- trading inter-wave spatial reuse for
+intra-wave temporal reuse. Every other op in the trace is unchanged within noise, which is what
+makes this attributable rather than a whole-layer wobble:
+
+| op | arm 0 | arm 2 |
+|---|---|---|
+| GEMV_F32 | 6311 | **3429** |
+| MOE_GROUP_DOWN_PF | 3002 | 3038 |
+| GEMM_FP8_MX (8 pk) | 2510 | 2512 |
+| HYPER_CONN_PRE | 2474 | 2509 |
+| MOE_GROUP_GLU_PF | 2152 | 2143 |
+| XREDUCE2 (3 pk) | 1916 | 2071 |
+| FLASH_MLA_PREFILL | 1462 | 1404 |
+| **body total** | **22603** | **19869** |
+
+**Arm 3 is the instructive failure.** It makes the largest traffic cut available -- every column in
+registers, so `x` is read once per row rather than three times -- and is the WORST of the five, 30%
+slower than the arm it was meant to beat and slower than the one that shipped. 24 live floats per
+lane on a kernel already at the 256-VGPR cap with 122 spills do not fit, the accumulators go to
+scratch, and the spill traffic costs more than the `x` re-reads it saves. The trace says so
+directly: the straggler goes 460 -> 917 us per packet. The object's reported VGPR/spill/LDS numbers
+are IDENTICAL to arm 2's (256 / 122 / 64720) -- the global allocation was already at the cap, so
+the extra pressure shows up only as more scratch traffic inside this one op and not in the summary
+the build prints. Reading the build log would have cleared this arm.
+
+**Arm 4's rationale was right and its payoff was small.** Arm 2 gives a wave whole rows, and 8192
+rows over 304 x 8 = 2432 waves is 3.37 each, so the waves that get 4 set the op's time -- 18.7% of
+the machine idle at the tail, against 3.7% for arm 0's 8192/304 = 26.9 rows per block. Flattening
+`(row, column group)` into one index over 8192 x 3 = 24576 items is 10.1 per wave, and the
+straggler does halve exactly as predicted, 460 -> 201 us. But the op only gains 2% (3429 -> 3362),
+so the ragged tail was never the main cost either. Arm 4 is the default because it is the best
+measured and its tail behaviour should compound less in a long chain, not because 2% matters.
+
+**Where the remaining 3362 us is: still unexplained.** It is ~50x off the 63 us that 335 MB of `x`
+at HBM bandwidth would cost. Three hypotheses have now been tested and priced -- wasted FMA/W work
+(arm 1: free), `x` re-read count (arms 2/3: real but bounded by register pressure), tail raggedness
+(arm 4: real but 2%) -- and together they account for a 1.9x cut, not a 50x one. The occupancy cap
+in §12.8 (LDS pins this kernel at 1 workgroup per CU, 2 waves per SIMD) is the remaining suspect
+and is not addressable from inside this op.
+
+**What this does NOT change.** 20.4 ms/layer x 40 is ~817 ms against a 90 ms target, still ~9x off,
+and it is a floor measured on a layer that is missing its compressed-KV attention entirely. The
+performance half of the goal is not close, and this is an honest 12%, not a step toward it.
+
 ### 12.2 What is still not demonstrated
 
   * ONE layer, not 40. The whole-model emit is still blocked on the subsystems

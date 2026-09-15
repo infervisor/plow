@@ -2074,6 +2074,13 @@ pub enum DevOp {
     /// t3=ids(i32[T][n_cols])` · `i0=T i1=n_cols i2=head_dim i3=blk i4=vocab_start
     /// i5=part_rows`.
     ///
+    /// `i4 = `[`TENSOR_NONE_I`] means DERIVE the shard base as `rank * i5`. One program
+    /// serves all eight ranks, so the emitter cannot write `vocab_start` as an immediate
+    /// -- and does not need to patch it per rank either, since the interpreter has
+    /// `prog.rank`. `ParallelEngramEmbedding` places rank `r` at `r * part_num_embeddings`
+    /// and nowhere else (`model.py:303-305`), so this is the placement rather than a
+    /// convention. An explicit `i4` still wins, which is what a single-rank test passes.
+    ///
     /// The output is laid out flat as one `n_cols * head_dim` row per token, which is
     /// exactly what the `wkv` GEMM consumes, so no reshape sits between them.
     ///

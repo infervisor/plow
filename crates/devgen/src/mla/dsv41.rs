@@ -328,10 +328,22 @@ pub(crate) fn dsv41_shard_of(suffix: &str) -> Option<Shard> {
         // `engram.embed` CANNOT be replicated: the two tables are 202.8 GB and an MI300X has 192 GB
         // of HBM, so a replicated copy does not fit on one GPU at all. Row-split is the only
         // placement that fits (25.35 GB per rank), which makes this OutSplit by capacity rather
-        // than by preference. `engram.wkv`/`q_weight`/`k_weight` are deliberately NOT listed: their
-        // sharding follows from how the row gather exchanges between ranks, and that is not
-        // designed yet. They live on layers 1 and 14 only, so layer 0 does not meet them.
+        // than by preference. `ParallelEngramEmbedding` shards exactly this way and no other way
+        // (`model.py:296-325`): `part_num_embeddings = ceil(rows / world_size)` -- 384 006 168 / 8
+        // = 48 000 771, no ragged last shard -- `vocab_start = rank * part`, an out-of-shard id
+        // contributes zeros, and the ranks are summed by an `all_reduce` of the VALUES.
         "engram.embed.weight" | "engram.embed.scale" => OutSplit,
+        // ...and everything downstream of that all-reduce is REPLICATED, which the reference
+        // settles rather than leaves open: `self.wkv = Linear(...)` (`model.py:345`) is the plain
+        // class, not `ColumnParallelLinear` or `RowParallelLinear`, and `q_weight`/`k_weight` are
+        // plain `nn.Parameter`s of `[hc_mult, dim]`. Replicated costs 157 MB per rank per engram
+        // layer for `wkv` and 40 KB for the gate weights -- nothing against the 12.29 GB table
+        // slice beside it. An earlier note here said this "follows from how the row gather
+        // exchanges between ranks, and that is not designed yet"; it does not, because the
+        // exchange is the embed's own all-reduce and it happens before `wkv` ever runs.
+        "engram.wkv.weight" | "engram.wkv.scale" | "engram.q_weight" | "engram.k_weight" => {
+            Replicated
+        }
         _ => return None,
     })
 }

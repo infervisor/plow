@@ -5135,6 +5135,181 @@ __device__ void d_gemv_f32(float* __restrict__ C, const bf16* __restrict__ x,
      * K in the same order. Only WHICH wave owns (m, n) changes, and no caller depends on that --
      * `GemvF32` is RowClass::A and the packet is coarse, so every block waits on the same counter
      * and none of them claims a designated row band. */
+#ifndef PLOW_GEMV_F32_ARM
+/* Who owns which (row, column) of the wide-M arm. 0 = a BLOCK owns a row and each of its 8 waves
+ * takes 4 column slots, one of which aliases at N=24. 1 = the same with the alias removed.
+ * 2 = a WAVE owns a row and sweeps N in groups of 8. 3 = a wave owns a row and carries every
+ * column at once, so x is read once. 4 = arm 2's traffic over a flattened (row, column group)
+ * index, for the tail balance.
+ *
+ * ALL FIVE ARE BIT-IDENTICAL -- an output is still one wave's `wave_sum` over the same
+ * lane-strided K in the same order, and only WHICH wave owns (m, n) changes. Demonstrated, not
+ * argued: all five produce the same layer exit to the last printed digit.
+ *
+ * MEASURED on 8x MI300X, V4.1 layer 0 at T=8192 (N=24, K=20480), `d_gemv_f32` over the layer's
+ * two packets and the layer median:
+ *
+ *     arm 0   block per row, 4 slots, 1 aliased      6311 us    23272 us
+ *     arm 1   the same, alias removed                6300 us    23284 us
+ *     arm 2   wave per row, groups of 8              3429 us    20465 us
+ *     arm 3   wave per row, all 24 in registers      8136 us    25207 us
+ *     arm 4   flattened (row, column group)          3362 us    20416 us   <- default
+ *
+ * Two of these are results reading would have got backwards. Arm 1 deletes a quarter of the FMAs
+ * and a quarter of the W reads and changes NOTHING, because W is 1.97 MB and lives in L2 -- the
+ * alias was already free. Arm 3 reads x once instead of three times, the largest traffic cut
+ * available, and is the WORST of the five: 24 live floats per lane on a kernel already at the
+ * 256-VGPR cap spill, and the spill traffic costs more than the x re-reads it saves (the straggler
+ * goes 460 -> 917 us per packet). Arm 4 beats arm 2 by the margin its rationale predicts and for
+ * the reason it predicts -- the straggler halves, 460 -> 201 us -- but only 2%, so the ragged tail
+ * was never the main cost either.
+ *
+ * At 3362 us this is still ~50x off the 63 us that 335 MB of x at HBM bandwidth would cost, so
+ * the op is not done; it is measured. */
+#define PLOW_GEMV_F32_ARM 4
+#endif
+
+#if PLOW_GEMV_F32_ARM == 3
+    /* WAVE PER ROW, WHOLE ROW IN REGISTERS. Arm 2 still sweeps `xm` once per column group -- three
+     * passes at N=24. Carrying every column at once reads it ONCE, which is the floor for this
+     * shape: 335 MB of x is the whole tensor, and W (24 x 20480 x 4 = 1.97 MB) is small enough to
+     * stay in L2 across every row.
+     *
+     * The cost is `NA` live floats per lane on a megakernel that is already at the 256-VGPR cap.
+     * The trip counts are compile-time so the accumulators can stay in registers rather than
+     * scratch; `N > NA` falls through to the arms below rather than reading off the end. */
+    {
+        constexpr unsigned NA = 24u; /* V4.1's mHC mix width, (2 + hc_mult) * hc_mult */
+        if (M >= nblk && N <= NA) {
+            for (unsigned m = slice * PLOW_WAVES + wave; m < M; m += nblk * PLOW_WAVES) {
+                const bf16* const xm = x + (size_t)m * K;
+                float* const cm = C + (size_t)m * N;
+                float a[NA];
+#pragma unroll
+                for (unsigned j = 0; j < NA; j++) a[j] = 0.0f;
+                for (unsigned k = lane; k < K; k += PLOW_WAVE) {
+                    const float xv = bf2f(xm[k]);
+#pragma unroll
+                    for (unsigned j = 0; j < NA; j++)
+                        /* A column past N reads column 0 again -- in cache, and its accumulator is
+                         * dropped unstored -- so the unrolled body stays branch-free. */
+                        a[j] += xv * W[(size_t)(j < N ? j : 0u) * K + k];
+                }
+#pragma unroll
+                for (unsigned j = 0; j < NA; j++) a[j] = wave_sum(a[j]);
+                if (lane == 0) {
+#pragma unroll
+                    for (unsigned j = 0; j < NA; j++)
+                        if (j < N) cm[j] = a[j];
+                }
+            }
+            return;
+        }
+    }
+#elif PLOW_GEMV_F32_ARM == 4
+    /* ARM 2's TRAFFIC, BETTER BALANCED. Arm 2 gives a wave whole ROWS, and 8192 rows over
+     * 304 x 8 = 2432 waves is 3.37 each -- so the wave that gets 4 sets the op's time and 18.7% of
+     * the machine idles at the tail. Measured: the straggler doubled, 230 -> 460 us per packet.
+     *
+     * Flattening (row, column group) into ONE index is the same memory traffic -- a wave still
+     * re-reads its row once per group -- over 8192 x 3 = 24576 items, which is 10.1 per wave
+     * instead of 3.37, so the ragged tail costs 8.9% rather than 18.7%. */
+    {
+        constexpr unsigned CG = 8u; /* columns per group, as arm 2 */
+        if (M >= nblk) {
+            const unsigned groups = (N + CG - 1u) / CG;
+            const unsigned items = M * groups;
+            for (unsigned it = slice * PLOW_WAVES + wave; it < items; it += nblk * PLOW_WAVES) {
+                const unsigned m = it / groups, n0 = (it % groups) * CG;
+                const bf16* const xm = x + (size_t)m * K;
+                float* const cm = C + (size_t)m * N;
+                const float* wp[CG];
+                float a[CG];
+                for (unsigned j = 0; j < CG; j++) {
+                    const unsigned nj = n0 + j;
+                    wp[j] = W + (size_t)(nj < N ? nj : n0) * K;
+                    a[j] = 0.0f;
+                }
+                for (unsigned k = lane; k < K; k += PLOW_WAVE) {
+                    const float xv = bf2f(xm[k]);
+                    for (unsigned j = 0; j < CG; j++) a[j] += xv * wp[j][k];
+                }
+                for (unsigned j = 0; j < CG; j++) a[j] = wave_sum(a[j]);
+                if (lane == 0) {
+                    for (unsigned j = 0; j < CG; j++)
+                        if (n0 + j < N) cm[n0 + j] = a[j];
+                }
+            }
+            return;
+        }
+    }
+#elif PLOW_GEMV_F32_ARM == 2
+    /* WAVE PER ROW. The shipped arm has all 8 waves of a block sweep ONE row, so the row is read
+     * eight times and held together only by L1. Here each wave owns its own row and re-reads it
+     * once per column group -- 3 passes at N=24 rather than 8 -- trading inter-wave spatial reuse
+     * for intra-wave temporal reuse. Eight accumulators, not 24: the megakernel is already at the
+     * 256-VGPR cap with 122 spills, so a full-N accumulator set would pay for this op's traffic
+     * out of every other op's register budget. */
+    if (M >= nblk) {
+        for (unsigned m = slice * PLOW_WAVES + wave; m < M; m += nblk * PLOW_WAVES) {
+            const bf16* const xm = x + (size_t)m * K;
+            float* const cm = C + (size_t)m * N;
+            for (unsigned n0 = 0; n0 < N; n0 += 8u) {
+                const float* wp[8];
+                float a[8];
+                for (unsigned j = 0; j < 8u; j++) {
+                    const unsigned nj = n0 + j;
+                    /* A slot past N aliases n0: it re-reads a row already in cache, its
+                     * accumulator is dropped unstored, and the k loop stays branch-free. */
+                    wp[j] = W + (size_t)(nj < N ? nj : n0) * K;
+                    a[j] = 0.0f;
+                }
+                for (unsigned k = lane; k < K; k += PLOW_WAVE) {
+                    const float xv = bf2f(xm[k]);
+                    for (unsigned j = 0; j < 8u; j++) a[j] += xv * wp[j][k];
+                }
+                for (unsigned j = 0; j < 8u; j++) a[j] = wave_sum(a[j]);
+                if (lane == 0) {
+                    for (unsigned j = 0; j < 8u; j++)
+                        if (n0 + j < N) cm[n0 + j] = a[j];
+                }
+            }
+        }
+        return;
+    }
+#elif PLOW_GEMV_F32_ARM == 1
+    /* NO ALIAS SLOT. At N=24 over 8 waves the shipped arm's fourth slot always aliases, so a
+     * quarter of the FMAs and a quarter of the W reads are thrown away. Three CONTIGUOUS columns
+     * per wave instead: exact at N=24, and the tail predicate covers every other N. */
+    if (M >= nblk) {
+        for (unsigned m = slice; m < M; m += nblk) {
+            const bf16* const xm = x + (size_t)m * K;
+            float* const cm = C + (size_t)m * N;
+            for (unsigned n0 = wave * 3u; n0 < N; n0 += PLOW_WAVES * 3u) {
+                const unsigned n1 = n0 + 1u, n2 = n0 + 2u;
+                const float* const w0 = W + (size_t)n0 * K;
+                const float* const w1 = W + (size_t)(n1 < N ? n1 : n0) * K;
+                const float* const w2 = W + (size_t)(n2 < N ? n2 : n0) * K;
+                float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f;
+                for (unsigned k = lane; k < K; k += PLOW_WAVE) {
+                    const float xv = bf2f(xm[k]);
+                    a0 += xv * w0[k];
+                    a1 += xv * w1[k];
+                    a2 += xv * w2[k];
+                }
+                a0 = wave_sum(a0);
+                a1 = wave_sum(a1);
+                a2 = wave_sum(a2);
+                if (lane == 0) {
+                    cm[n0] = a0;
+                    if (n1 < N) cm[n1] = a1;
+                    if (n2 < N) cm[n2] = a2;
+                }
+            }
+        }
+        return;
+    }
+#endif
     if (M >= nblk) {
         for (unsigned m = slice; m < M; m += nblk) {
             const bf16* const xm = x + (size_t)m * K;

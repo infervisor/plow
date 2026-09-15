@@ -853,6 +853,14 @@ if [ -n "${PLOW_WPE:-}" ]; then
   AX_PREFILL="$AX_PREFILL -DPLOW_WPE=${PLOW_WPE}"
 fi
 
+# PLOW_GEMV_F32_ARM picks how d_gemv_f32's wide-M arm splits (row, column) across waves -- see
+# op_gemm_common.h. All three arms are bit-identical; they differ in HBM traffic and in how much
+# work a wave has to hide latency behind, which only hardware can rank. Unset keeps the object
+# byte-identical to arm 0, the shipped one.
+if [ -n "${PLOW_GEMV_F32_ARM:-}" ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_GEMV_F32_ARM=${PLOW_GEMV_F32_ARM}"
+fi
+
 # Diagnostic-only XREDUCE2 / XREDUCE phase timeline in PlowTraceRec. Never a serve asset.
 if [ "${PLOW_XR_TRACE_PHASES:-0}" = 1 ]; then
   AX_PREFILL="$AX_PREFILL -DPLOW_XR_TRACE_PHASES=1"
