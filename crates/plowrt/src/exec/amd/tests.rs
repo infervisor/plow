@@ -4,6 +4,14 @@ use crate::exec::kvrow::KDA_ROW_COUNT_OPS;
 use packet::dev::PREFILL_SPAN_RESET_STATE;
 
 #[test]
+fn vmm_kv_is_automatic_only_for_an_impossible_flat_slab() {
+    assert!(!select_vmm_kv(None, false));
+    assert!(select_vmm_kv(None, true));
+    assert!(select_vmm_kv(Some(true), false));
+    assert!(!select_vmm_kv(Some(false), true));
+}
+
+#[test]
 fn map_ahead_rows_covers_the_decode_row_and_the_next_chunk() {
     let max = 202_752;
     assert_eq!(map_ahead_rows(8192, true, None, max), Some(8193));

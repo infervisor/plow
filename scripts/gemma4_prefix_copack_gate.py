@@ -144,6 +144,7 @@ def main():
     record = {
         "schema": "plowrt.production-gate.v1",
         "packet_sha256": packet_sha256,
+        "plowrt_sha256": hashlib.sha256(Path(args.plowrt).read_bytes()).hexdigest(),
         "features": {
             "prefix_cache": True,
             "continuous_batching": True,

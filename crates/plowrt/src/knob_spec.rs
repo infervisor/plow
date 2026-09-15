@@ -396,7 +396,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.attnres_f32mix_grid", Some("PLOW_ATTNRES_F32MIX_GRID"), Layer::Runtime, U32, UNSET, DIAG),
     KnobSpec::new("rt.moe_prefill_ep_max_extra_bytes", Some("PLOW_MOE_PREFILL_EP_MAX_EXTRA_BYTES"), Layer::Runtime, USIZE, UNSET, DIAG),
     KnobSpec::new("rt.phase_objects", Some("PLOW_PHASE_OBJECTS"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
-    KnobSpec::new("rt.vmm_kv", Some("PLOW_VMM_KV"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("rt.vmm_kv", Some("PLOW_VMM_KV"), Layer::Runtime, Domain::Bool, UNSET, OPT_IN),
     KnobSpec::new("rt.kv_map_ahead", Some("PLOW_KV_MAP_AHEAD"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.kv_map_next_chunk", Some("PLOW_KV_MAP_NEXT_CHUNK"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.publish_defer", Some("PLOW_AMD_PUBLISH_DEFER"), Layer::Runtime, Domain::Bool, ON, PROMOTED),

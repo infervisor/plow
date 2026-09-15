@@ -6081,6 +6081,10 @@ fn discover_lowrung_tiers(hsaco_dir: &Path, object: &str) -> Option<String> {
     })
 }
 
+fn select_vmm_kv(configured: Option<bool>, required: bool) -> bool {
+    configured.unwrap_or(required)
+}
+
 impl AmdEngine {
     pub fn overlap_evidence(&self, rank: usize) -> AmdOverlapRankEvidence {
         let range = |name: String, address_space, start, len: u64| AmdOwnedRange {
@@ -6166,8 +6170,8 @@ impl AmdEngine {
     ///
     /// Every failure is a warn + `None` — the flat path is always correct, so a
     /// missing `config.json` or a geometry the blob does not match must not
-    /// stop the engine loading. Off by default (`--amd-vmm-kv` /
-    /// `PLOW_VMM_KV=1`).
+    /// stop the engine loading. The route is automatic when the flat tensor slab
+    /// exceeds VRAM; `--amd-vmm-kv=true|false` / `PLOW_VMM_KV=1|0` overrides it.
     ///
     /// Only FULL-attention `kv.{l}.k`/`.v` are backed. Sliding-window rings are
     /// bounded by `window`, not by context, so they have nothing to grow into,
@@ -6178,9 +6182,14 @@ impl AmdEngine {
         blob: &DevBlob,
         checkpoint: Option<&Path>,
         batch: usize,
+        required: bool,
     ) -> Option<VmmKv> {
-        if !crate::config::RuntimeConfig::get().amd.vmm_kv {
+        let configured = crate::config::RuntimeConfig::get().amd.vmm_kv;
+        if !select_vmm_kv(configured, required) {
             return None;
+        }
+        if configured.is_none() {
+            tracing::info!("flat tensor slab exceeds VRAM; enabling VMM KV");
         }
         if !be.has_vmm() {
             tracing::warn!("PLOW_VMM_KV=1 but this ROCr has no hsa_amd_vmem_* — vmm off");
@@ -8672,6 +8681,24 @@ impl AmdEngine {
         // Must precede the tensor loop: it decides whether each full-layer KV
         // tensor gets an allocation or a view onto the pool's VA reservation.
         let config = crate::config::RuntimeConfig::get();
+        let is_peer_slot = |name: &str| {
+            matches!(
+                (tp.is_some(), name),
+                (true, "act.og_tp")
+                    | (true, "act.dg_tp")
+                    | (true, "act.ug_tp")
+                    | (true, "act.h2_tp")
+                    | (true, "act.xe_tp")
+                    | (true, "act.rt_tp")
+            )
+        };
+        let is_band_view = |name: &str| tp.is_some() && name.contains("@band");
+        let flat_slab_bytes: u64 = blob
+            .tensors
+            .iter()
+            .filter(|td| !is_peer_slot(&td.name) && !is_band_view(&td.name))
+            .map(|td| slab_carve(td.bytes))
+            .sum();
         let shared_requested = config.prefix_cache && config.amd.shared_prefix != Some(false);
         let shared_layout = if shared_requested && arch == "gfx942" && be.has_vmm() && !config.fusion {
             blob.tensors.iter().find(|t| t.name == "in.pos")
@@ -8690,7 +8717,13 @@ impl AmdEngine {
                 crate::memory::vmm::kv_pool_cap())
         }).transpose()?;
         let vmm = if shared_prefix.is_none() {
-            Self::vmm_bringup(&be, &blob, checkpoint, max_decode_batch as usize)
+            Self::vmm_bringup(
+                &be,
+                &blob,
+                checkpoint,
+                max_decode_batch as usize,
+                flat_slab_bytes > be.vram_bytes(),
+            )
         } else {
             None
         };
@@ -8755,21 +8788,9 @@ impl AmdEngine {
         //     have every rank reduce slots its peers never wrote.
         //   * full-layer KV under VMM — the pool's VA reservation, mapped lazily
         //     at the per-sequence frontier.
-        let is_peer_slot = |name: &str| {
-            matches!(
-                (tp.is_some(), name),
-                (true, "act.og_tp")
-                    | (true, "act.dg_tp")
-                    | (true, "act.ug_tp")
-                    | (true, "act.h2_tp")
-                    | (true, "act.xe_tp")
-                    | (true, "act.rt_tp")
-            )
-        };
         // Rank-relative BAND VIEWS (`<base>@band<t>`, sequence-parallel seams): rows
         // `[rank*t/tp, (rank+1)*t/tp)` of an already-bound base, i.e. `base + rank * bytes`.
         // Storage belongs to the base, so they are views like the peer slots.
-        let is_band_view = |name: &str| tp.is_some() && name.contains("@band");
         let slab_bytes: u64 = blob
             .tensors
             .iter()

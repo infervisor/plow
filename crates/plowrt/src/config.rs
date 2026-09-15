@@ -946,9 +946,10 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-phase-objects", env = "PLOW_PHASE_OBJECTS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub phase_objects: bool,
 
-    /// VMM-backed KV on ROCr (opt-in, requires hsa_amd_vmem_*).
-    #[arg(long = "amd-vmm-kv", env = "PLOW_VMM_KV", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub vmm_kv: bool,
+    /// VMM-backed KV on ROCr. Automatic when a flat tensor slab cannot fit;
+    /// an explicit true/false forces the route (requires hsa_amd_vmem_*).
+    #[arg(long = "amd-vmm-kv", env = "PLOW_VMM_KV", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub vmm_kv: Option<bool>,
 
     /// Map the KV block after a prefill chunk's last row while the chunk drains, so the
     /// decode that follows never maps on the engine thread (`PLOW_KV_MAP_AHEAD=0` disables).
@@ -1846,6 +1847,19 @@ mod tests {
         for (flag, expected) in [("--amd-shared-prefix", true), ("--amd-shared-prefix=false", false)] {
             let matches = command.clone().try_get_matches_from(["test", flag]).unwrap();
             assert_eq!(super::RuntimeConfig::from_arg_matches(&matches).unwrap().amd.shared_prefix,
+                Some(expected));
+        }
+    }
+
+    #[test]
+    fn amd_vmm_kv_defaults_to_auto_and_accepts_explicit_overrides() {
+        use clap::{Args, FromArgMatches};
+        let command = super::AmdRuntimeConfig::augment_args(clap::Command::new("test"));
+        assert!(command.get_arguments().find(|arg| arg.get_id() == "vmm_kv")
+            .unwrap().get_default_values().is_empty());
+        for (flag, expected) in [("--amd-vmm-kv", true), ("--amd-vmm-kv=false", false)] {
+            let matches = command.clone().try_get_matches_from(["test", flag]).unwrap();
+            assert_eq!(super::AmdRuntimeConfig::from_arg_matches(&matches).unwrap().vmm_kv,
                 Some(expected));
         }
     }
