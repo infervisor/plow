@@ -1229,6 +1229,59 @@ pub(crate) enum MoeEnc {
     Int4G32 = 3,
 }
 
+/// How the DENSE projections are quantized on disk, which decides WHICH dense GEMM opcode the
+/// emitter may use.
+///
+/// **Deliberately NOT a [`MoeEnc`] variant.** `MoeEnc` travels in an `i[]` slot on the grouped
+/// expert ops ([`MoeEnc::PREFILL_SLOT`] / [`MoeEnc::DECODE_SLOT`]) and names the EXPERT weights;
+/// the kernel reads the slot and branches. A dense GEMM has no such slot and needs none, because
+/// the OPCODE is the encoding: op 107 reads an f32 `[128,128]` grid, op 184 reads a ue8m0
+/// `[32,32]` one. Putting this in `MoeEnc` would add a wire value that no kernel reads and invite
+/// exactly the substitution op 184 exists to prevent.
+///
+/// It exists because DeepSeek-V4.1 is the first checkpoint here whose dense and expert weights
+/// are quantized DIFFERENTLY -- `weight_block_size [32,32]` with `expert_dtype: "fp4"` -- so a
+/// single encoding per run stopped being able to describe a checkpoint. See [`CkptEnc`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DenseEnc {
+    /// Unquantized. The historical case.
+    Bf16,
+    /// Block-fp8 e4m3 on a `[128, 128]` grid with **f32** scales -> [`DevOp::GemmFp8Blk`] (107).
+    /// GLM-5.2/5.3 and DeepSeek-V4.
+    Fp8Blk128,
+    /// Block-fp8 e4m3 on a `[32, 32]` grid with **ue8m0 byte** scales ->
+    /// [`DevOp::GemmFp8Mx`] (184). DeepSeek-V4.1, and 39.8% of its 8k prefill.
+    Fp8Mx32,
+}
+
+/// What a checkpoint says its weights are, PER WEIGHT CLASS.
+///
+/// Before V4.1 every family here was uniform, so one [`MoeEnc`] described a whole run and
+/// `mla_moe_enc_env` could assert as much ("a run is ALL-mxfp4 or ALL-fp8 or ALL-bf16; pick
+/// one"). V4.1 breaks that: its routed experts are fp4 while its dense projections are block-fp8.
+/// This carries both rather than forcing a collapse that has no correct answer.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CkptEnc {
+    /// Routed-expert weights. What [`MoeEnc`] has always meant.
+    pub(crate) expert: MoeEnc,
+    /// Dense projections. Equal in spirit to `expert` on every family before V4.1.
+    pub(crate) dense: DenseEnc,
+}
+
+impl CkptEnc {
+    /// True when one [`MoeEnc`] can still describe the whole run, i.e. every family before V4.1.
+    /// The emitters that thread a single `enc` are correct exactly when this holds.
+    pub(crate) fn is_uniform(self) -> bool {
+        matches!(
+            (self.expert, self.dense),
+            (MoeEnc::Bf16, DenseEnc::Bf16)
+                | (MoeEnc::Fp8Blk, DenseEnc::Fp8Blk128)
+                | (MoeEnc::Mxfp4, DenseEnc::Bf16)
+                | (MoeEnc::Int4G32, DenseEnc::Bf16)
+        )
+    }
+}
+
 impl MoeEnc {
     /// The `i[]` slot the encoding travels in on the PREFILL grouped ops (85/86). There `n_exp` is
     /// `i[2]`, so `i[3]` was free.
@@ -7724,7 +7777,7 @@ fn mxfp4_bf16_exceptions() -> &'static [&'static str] {
 ///     field would read "bfloat16" off an fp8 checkpoint and be confidently wrong.
 ///
 /// So this reads `quantization_config` and nothing else.
-fn mla_ckpt_enc(dir: &Path) -> Option<MoeEnc> {
+fn mla_ckpt_enc_full(dir: &Path) -> Option<CkptEnc> {
     let v: Value = serde_json::from_slice(&std::fs::read(dir.join("config.json")).ok()?).ok()?;
     // A multimodal wrapper nests `quantization_config` under `text_config` with the rest of the
     // text geometry. Reading only the root found NOTHING on such a checkpoint and returned None,
@@ -7761,23 +7814,19 @@ fn mla_ckpt_enc(dir: &Path) -> Option<MoeEnc> {
         // actual gap is three separate things. Name them instead.
         let scale_fmt = q.get("scale_fmt").and_then(|m| m.as_str()).unwrap_or("");
         let expert_dtype = q.get("expert_dtype").and_then(|m| m.as_str()).unwrap_or("");
-        assert!(
-            !(blk == vec![32, 32] && scale_fmt == "ue8m0"),
-            "this is a DeepSeek-V4.1 checkpoint (weight_block_size [32,32], scale_fmt ue8m0, \
-             expert_dtype {expert_dtype:?}) and the gap is in THIS EMITTER, not in the kernels -- \
-             `PLOW_DOP_GEMM_FP8_MX` (184) and its `d_gemm_t<WFP8MX>` arm already exist. Three \
-             distinct things are missing here, and the block size is only the first:\n  \
-             (1) every scale-grid size in this emitter is written div_ceil(128); V4.1's is \
-             div_ceil(32), so each grid is 16x the elements;\n  \
-             (2) the grid ELEMENT TYPE differs -- V4.1's entries are ue8m0 BYTES, op 107's are \
-             f32. That is why 184 is a separate opcode and not a flag: binding a V4.1 grid to 107 \
-             faults nowhere, it just rescales every output;\n  \
-             (3) expert_dtype is fp4 while the dense projections are block-fp8, so this checkpoint \
-             is MIXED. `MoeEnc` carries ONE encoding for a whole run (`mla_moe_enc_env` refuses \
-             mxfp4 and fp8 together in so many words), and V4.1 needs both at once -- which is a \
-             change to what the enum MEANS, not another variant on it.\n\
-             Missing capability: `ckpt_quant_fp8_blk32_ue8m0_mixed_fp4_experts`."
-        );
+        // DeepSeek-V4.1: [32,32] ue8m0 dense, fp4 experts. A FACT the parse can now state, so
+        // it returns rather than panicking. The refusal moved to `mla_ckpt_enc`, which is where
+        // the assumption that actually fails lives -- collapsing this to ONE encoding.
+        if blk == vec![32, 32] && scale_fmt == "ue8m0" {
+            assert_eq!(
+                expert_dtype, "fp4",
+                "a [32,32]/ue8m0 checkpoint with expert_dtype {expert_dtype:?} is not a shape \
+                 this has seen: V4.1's routed experts are fp4 and its dense projections are \
+                 block-fp8, and the mixed reading below assumes exactly that pairing. Missing \
+                 capability: `ckpt_quant_fp8_blk32_experts_{expert_dtype}`."
+            );
+            return Some(CkptEnc { expert: MoeEnc::Mxfp4, dense: DenseEnc::Fp8Mx32 });
+        }
         assert!(
             blk == vec![128, 128],
             "checkpoint quantization_config.weight_block_size = {blk:?}, but every scale-grid size \
@@ -7785,7 +7834,7 @@ fn mla_ckpt_enc(dir: &Path) -> Option<MoeEnc> {
              of the wrong shape against weights that look fine. Missing capability: \
              `fp8_block_size_{blk:?}`."
         );
-        return Some(MoeEnc::Fp8Blk);
+        return Some(CkptEnc { expert: MoeEnc::Fp8Blk, dense: DenseEnc::Fp8Blk128 });
     }
     // compressed-tensors `pack-quantized` int4 (Kimi-K2.7-Code's routed experts). Every field is
     // CHECKED rather than assumed, because each one that differs is a different kernel: the
@@ -7814,7 +7863,11 @@ fn mla_ckpt_enc(dir: &Path) -> Option<MoeEnc> {
             fmt == "pack-quantized" && ty == "int" && sym && bits == 4 && group == 32,
             "checkpoint compressed-tensors weights are format={fmt:?} type={ty:?}              symmetric={sym} num_bits={bits} group_size={group}; the int4 arm reads              pack-quantized int4, symmetric, group_size 32 and nothing else. Missing              capability: `ckpt_quant_ct_{ty}{bits}_g{group}`."
         );
-        return Some(MoeEnc::Int4G32);
+        // Kimi-K2.7-Code: int4 routed experts, and nothing here says the DENSE projections are
+        // quantized at all -- `config_groups` covers the experts. Unchanged from what this
+        // returned before the split, which was Int4G32 for the whole checkpoint and a dense path
+        // that never asked.
+        return Some(CkptEnc { expert: MoeEnc::Int4G32, dense: DenseEnc::Bf16 });
     }
     // Anything else is a quantization we cannot emit. REFUSE rather than fall back to bf16: the
     // weights on disk are not bf16, so a bf16 packet is a WRONG packet, not an unoptimised one —
@@ -7826,6 +7879,30 @@ fn mla_ckpt_enc(dir: &Path) -> Option<MoeEnc> {
          an unquantized checkpoint. Emitting bf16 here would ask the loader to bind bf16 weights \
          that do not exist in this checkpoint."
     )
+}
+
+/// The single [`MoeEnc`] that describes a whole run, or a refusal when no such thing exists.
+///
+/// Every caller here threads ONE encoding through both the declaration and the emit, which is
+/// correct exactly while a checkpoint is uniform. [`mla_ckpt_enc_full`] reads what the checkpoint
+/// actually says per weight class; this collapses that to the one value the existing emitters
+/// take, and REFUSES when the collapse would be a lie rather than picking a side.
+fn mla_ckpt_enc(dir: &Path) -> Option<MoeEnc> {
+    let ck = mla_ckpt_enc_full(dir)?;
+    assert!(
+        ck.is_uniform(),
+        "this checkpoint quantizes its DENSE projections and its ROUTED EXPERTS differently \
+         (dense {:?}, experts {:?}) -- DeepSeek-V4.1's shape -- and every emitter on this path \
+         threads ONE `MoeEnc` through the declaration and the emit alike. There is no honest \
+         single value to return: answering with the expert encoding would declare bf16 or fp4 \
+         scale grids for projections that are block-fp8 on disk, and answering with the dense one \
+         would do the reverse to the experts. Take `mla_ckpt_enc_full` and carry both. The \
+         kernels are NOT the gap -- `DevOp::GemmFp8Mx` (184) and `d_gemm_t<WFP8MX>` exist and \
+         pass on gfx942. Missing capability: `emit_mixed_dense_expert_encoding`.",
+        ck.dense,
+        ck.expert
+    );
+    Some(ck.expert)
 }
 
 /// The MoE weight encoding an emit run asks for, from the environment.
