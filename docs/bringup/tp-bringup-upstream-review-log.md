@@ -1881,6 +1881,62 @@ Units note carried from the correction above: `dec_segs` counts SEGMENTS; an act
 to any per-packet figure.
 
 
+## Production end-to-end, all via `vllm bench serve`: 203.7 tok/s peak, both latency goals still open, and a new 70k/C20 aperture fault (2026-09-15, job `e2e-prod`)
+
+One server, production defaults, five arms against the same load so every number is comparable.
+Packet `9e76b70bf97ee4a6`, row-band serve gate on, no other campaign knob set.
+
+| arm | C | isl | TTFT ms | TPOT ms | out tok/s | total tok/s | per-stream tok/s |
+|---|---|---|---|---|---|---|---|
+| c1 | 1 | 8192 | **513.9** | **40.55** | 23.5 | 776.0 | 24.7 |
+| c8 | 8 | 8192 | 1042.3 | 55.41 | 134.5 | 4438.5 | 18.0 |
+| **c20** | 20 | 8192 | 1051.8 | 92.78 | **203.7** | 6721.2 | 10.8 |
+| c32 | 32 | 8192 | 16088.0 | 98.45 | 198.0 | 6535.4 | 10.2 |
+| c20-70k | 20 | 70000 | — | — | — | — | server faulted, see below |
+
+**Goal 1 — 8K C1 TTFT < 490 ms: NOT MET at 513.9 ms (+23.9).** Unchanged in substance from the
+512.0 ms measured on the fixed stack; the gap is the same structural ~22-24 ms.
+
+**Goal 2 — C1 decode TPOT 25 ms: NOT MET at 40.55 ms (+15.55), i.e. 24.7 tok/s per stream.**
+Consistent with the 41.19 ms the rung sweep measured independently an hour earlier.
+
+**Goal 3 — throughput.** Peak aggregate output is **203.7 tok/s at C20**, with the knee between
+C20 and C32: pushing to C32 loses throughput (198.0) and destroys TTFT (1.05 s to 16.1 s), which is
+queueing, not compute. **The 140 tok/s mark is passed at 8K prompts** — already 134.5 at C8 and
+203.7 at C20, with no MTP and no speculative decoding.
+
+**Reconciling 203.7 with the ~82 tok/s on record.** Entry 69's tier-4 measured 75.6/81.7/76.3 out
+tok/s and projected ~87-88 — but at **70,000-token** prompts, which are prefill-dominated: at C20
+those arms spend most of their GPU time on 8192-row prefill chunks, not on decode ticks. The two
+numbers describe different workloads and neither supersedes the other. Quote the prompt length with
+the throughput or the figure is meaningless.
+
+**Goal 3 is still not ADJUDICATED, only measured on one side.** There is no vLLM arm in this run:
+both vLLM arms still die with `illegal memory access` on Worker_TP3/TP6 for this model. "Beats
+vLLM" remains unmeasured rather than met, and that should not be softened — 203.7 tok/s is plow's
+absolute number, not a comparison.
+
+### New defect: aperture violation at 70k / C20
+
+The fifth arm faulted the GPU and the server dumped core:
+
+```
+Queue error: HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION:
+  The agent attempted to access memory beyond the largest legal address.
+Queue at 0x7ffc80036000 inactivated due to async error
+```
+
+The last lines before it are decode-ladder rung transitions under changing load —
+`20 -> 16` (LowLoad), `16 -> 8` (LowLoad), `8 -> 16` (Utilization), `16 -> 20` (Backlog, queued=18),
+then `rung=8 occupied=1`, `rung=16 occupied=9`, then the fault. The four 8192 arms that ran before
+it on the same server were clean, including their own rung transitions, so the trigger involves the
+70k context specifically rather than rung switching alone.
+
+This is NOT a known-good configuration failing in a new way to be waved off: entry 69 ran
+20 x 70k/700 at C20 to completion. Either something since has regressed it, or the fault is
+load-timing dependent and that earlier run was lucky. It needs a reproduction before any claim
+either way — and it means the long-context throughput cell currently has no number at all.
+
 ## The decode rung crossover has NOT moved, and the GEMV's instruction levers are exhausted (2026-09-15, job `decode-rungsweep` + CPU-only ISA scan)
 
 Two questions, one answered on hardware and one in the shipped ISA: is the 1293-segment native-GEMM
