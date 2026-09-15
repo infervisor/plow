@@ -41,11 +41,17 @@ Detailed log: `docs/bringup/tp-bringup-upstream-review-log.md` (rows #81–#99);
   16/16 through decode rung 20: 80.19 output tok/s, median TTFT 39.88 s, median TPOT 98.84 ms.
 - The earlier exact 100-prompt compact run faulted at decode rung 16 with only 9 occupied, before
   slot turnover. A deterministic capacity or compact-scratch OOB is therefore not established:
-  both the long-prefill and sustained C16 gates pass. Do not loosen admission from the current
-  conservative 13-request 70K cap until the mixed C20/N100 fault is isolated.
+  the long-prefill and sustained C16 gates pass. A 32-prompt 70K/700/C20 turnover gate also passed
+  32/32: 86.90 output tok/s, median TTFT 54.20 s, median TPOT 116.54 ms. Do not loosen admission
+  from the current conservative 13-request 70K cap until the mixed C20/N100 fault is isolated.
 - The historical ordinary-8192 -> row-band poisoning is not an open workspace bug. `rbfault16`
   already disproved the sparse-MLA clear hypothesis; `rbfault21` identified and verified the
   shared `@band` view memo fix (`f584a1e0`).
+- Do not rebase the old 26-file MTP experiment as-is. Its measured speedup is confounded by four
+  correctness gaps against vLLM: normalized rather than raw recurrent state, an extra BF16
+  projection rounding, BF16 rather than FP32 router logits, and no position-0 embedding mask.
+  Standard decode rung widths remain, but MTP-on also rewrites their bodies with EXTEND and draft
+  roles. Correct and oracle-gate these points before using its performance numbers.
 - Next structural kernel lever remains a plow-owned grouped block-FP8 MoE kernel with a ≥256-row
   expert tile. The pinned AITER family has no tile wider than 64; the old generic MPF_BM=128 result
   was only −5.1% vs its EPI-off control and remained slower than shipped BM64/EPI-on.
