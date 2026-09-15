@@ -755,9 +755,8 @@ extern "C" __device__ unsigned plow_prefill_nrn_consumer_1 = 1;
 #define PLOW_GATE_HIER 0
 #endif
 #if PLOW_GATE_HIER &&                                                                    \
-    (!defined(PLOW_BUCKET_DECODE) || !PLOW_BUCKET_DECODE || !PLOW_GLOBAL_QUEUE ||        \
-     !defined(PLOW_L2_PLACE_DISPATCH) || !PLOW_L2_PLACE_DISPATCH)
-#error "PLOW_GATE_HIER requires a decode global-queue object with L2-domain dispatch"
+    (!PLOW_GLOBAL_QUEUE || !defined(PLOW_L2_PLACE_DISPATCH) || !PLOW_L2_PLACE_DISPATCH)
+#error "PLOW_GATE_HIER requires a global-queue object with L2-domain dispatch"
 #endif
 #if PLOW_GATE_HIER
 extern "C" __device__ unsigned plow_gate_hier_1 = 1;

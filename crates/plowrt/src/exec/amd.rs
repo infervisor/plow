@@ -6917,6 +6917,8 @@ impl AmdEngine {
         // rungs disagree runs the hierarchy on some ticks and not others.
         let mut decode_objects = 0usize;
         let mut decode_objects_gate_hier = 0usize;
+        let mut prefill_objects = 0usize;
+        let mut prefill_objects_gate_hier = 0usize;
         let mut dense_flash_object = false;
         type LK = (HsaKernel, bool);
         let mut load_one_in = |phase: Phase,
@@ -6995,6 +6997,9 @@ impl AmdEngine {
             if phase == Phase::Decode {
                 decode_objects += 1;
                 decode_objects_gate_hier += usize::from(syms.contains(&GATE_HIER_SYM));
+            } else {
+                prefill_objects += 1;
+                prefill_objects_gate_hier += usize::from(syms.contains(&GATE_HIER_SYM));
             }
             let packed_prefill_abi = syms.contains(&PACKED_PREFILL_ABI_SYM);
             let dense = syms.contains(&"plow_packed_prefill_dense_consumers_1");
@@ -9939,6 +9944,29 @@ impl AmdEngine {
         log_gate_hier_status(
             &blob.progs,
             decode_objects != 0 && decode_objects_gate_hier == decode_objects,
+        );
+        if prefill_objects_gate_hier != 0 && prefill_objects_gate_hier != prefill_objects {
+            return Err(RuntimeError::Device(format!(
+                "mixed prefill gate protocols: {prefill_objects_gate_hier} of \
+                 {prefill_objects} selected prefill/flash objects carry `{GATE_HIER_SYM}`"
+            )));
+        }
+        let prefill_hier_armed =
+            prefill_objects != 0 && prefill_objects_gate_hier == prefill_objects;
+        let prefill_hier_firing = prefill_hier_armed
+            && blob.progs.iter().filter(|p| !p.role.is_decode_rung()).any(|p| {
+                p.l2_domains != 0
+                    && p.gq_stream.iter().any(|e| {
+                        let nper = (e.flags & packet::dev::SE_NPER_MASK)
+                            >> packet::dev::SE_NPER_SHIFT;
+                        nper > 1 && e.flags & (packet::dev::SE_FINE | SE_XCTR) == 0
+                    })
+            });
+        tracing::info!(
+            armed = prefill_hier_armed,
+            firing = prefill_hier_firing,
+            objects = prefill_objects,
+            "prefill L2 hierarchical gate"
         );
         // Packet trace (`PLOW_TRACE_RAW=<path>`). Zeroed once at allocation so
         // an entry the run never reaches reads as a zero record rather than as

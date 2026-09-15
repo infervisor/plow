@@ -8882,19 +8882,10 @@ fn emit_dense_gqa(
         }
     }
 
-    // PREFILL PLACEMENT IS OFF BY DEFAULT ON AMD, and that is what makes the DECODE placement
-    // usable at all. `PLOW_L2_PLACE` already defaults ON for gfx942/gfx950, but
-    // `scripts/build_gfx942.sh` gates `-DPLOW_L2_PLACE_DISPATCH` on the PREFILL objects behind
-    // `PLOW_L2HIER_PF`, which is off — so `plowrt` REFUSES a blob whose prefill programs are
-    // placed, and the only way past that was `PLOW_L2_PLACE=0`, which throws away the decode
-    // half too. That is how the shipped Gemma-4-31B blob came to be unplaced (`PLOWDEV\x09`,
-    // not `\x0b`) with `PLOW_GATE_HIER` compiled into the decode object and INERT at run time:
-    // the hierarchy's precondition is `prog.l2_domains != 0`. Measured cost of that accident,
-    // Gemma-4-31B BF16 TP1 MI300X, served, medians of six: TPOT +4.7% to +8.0%.
-    // An explicit `PLOW_L2_PLACE_PREFILL=1` still asks for it (pair it with `PLOW_L2HIER_PF=1`
-    // objects); NVIDIA is unchanged, where one cooperative launch reads no wave class.
-    let l2_place_prefill = ecfg.l2_place_prefill
-        && (!amd || std::env::var_os("PLOW_L2_PLACE_PREFILL").is_some());
+    // Placement preserves the ordered segment as the outer queue axis and adds one window per
+    // physical L2 domain inside it. The gfx942 object recipe now ships the matching prefill axis,
+    // so the model-level default can apply to both phases without an environment-only exception.
+    let l2_place_prefill = ecfg.l2_place_prefill;
     let mut progs = Vec::new();
     let mut tlist = Vec::new();
     let mut hetero_progs: Vec<hetero::ProgPlan> = Vec::new();

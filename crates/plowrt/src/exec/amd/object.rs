@@ -2339,11 +2339,10 @@ pub(super) fn l2_pairing_refusal(path: &Path, phase: Phase) -> String {
         ),
         Phase::Prefill | Phase::Flash => (
             "prefill",
-            "no PLOW_L2_PLACE_PREFILL=1, which is the AMD default and leaves decode \
-             placement on",
+            "PLOW_L2_PLACE_PREFILL=0 at emit, which leaves decode placement on",
             "scripts/build_gfx942.sh PLOW_L2HIER_PF=1, which puts -DPLOW_L2_PLACE_DISPATCH on \
-             the prefill rows (the flash rows already carry it); build_gfx950.sh passes it on \
-             both under PLOW_L2_PLACE=1",
+             the prefill rows (the flash rows already carry it) — this is the default; \
+             build_gfx950.sh passes it on both under PLOW_L2_PLACE=1",
         ),
     };
     format!(
@@ -2366,10 +2365,10 @@ pub(super) fn check_gate_hier_object(
     if !syms.contains(&GATE_HIER_SYM) {
         return Ok(());
     }
-    if phase != Phase::Decode || sched != Sched::GlobalQueue || !syms.contains(&L2_DISPATCH_SYM) {
+    if sched != Sched::GlobalQueue || !syms.contains(&L2_DISPATCH_SYM) {
         return Err(RuntimeError::Device(format!(
             "{} advertises `{GATE_HIER_SYM}`, but hierarchical gates are valid only for a \
-             decode global-queue object carrying `{L2_DISPATCH_SYM}`",
+             global-queue object carrying `{L2_DISPATCH_SYM}` (phase {phase:?})",
             path.display()
         )));
     }

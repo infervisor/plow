@@ -1165,10 +1165,12 @@ fn packed_prefill_requires_abi_on_every_routed_object() {
 }
 
 #[test]
-fn hierarchical_gate_marker_requires_decode_gq_and_l2_capability() {
+fn hierarchical_gate_marker_requires_gq_and_l2_capability() {
     let object = Path::new("interp_decode_gq.elf");
     let valid = [GATE_HIER_SYM, L2_DISPATCH_SYM];
     assert!(check_gate_hier_object(&valid, object, Phase::Decode, Sched::GlobalQueue).is_ok());
+    assert!(check_gate_hier_object(&valid, object, Phase::Prefill, Sched::GlobalQueue).is_ok());
+    assert!(check_gate_hier_object(&valid, object, Phase::Flash, Sched::GlobalQueue).is_ok());
     assert!(
         check_gate_hier_object(&[L2_DISPATCH_SYM], object, Phase::Prefill, Sched::Static).is_ok()
     );
@@ -1180,11 +1182,7 @@ fn hierarchical_gate_marker_requires_decode_gq_and_l2_capability() {
             Phase::Decode,
             Sched::Static,
         ),
-        (
-            &[GATE_HIER_SYM, L2_DISPATCH_SYM][..],
-            Phase::Prefill,
-            Sched::GlobalQueue,
-        ),
+        (&[GATE_HIER_SYM][..], Phase::Prefill, Sched::GlobalQueue),
     ] {
         let message = check_gate_hier_object(syms, object, phase, sched)
             .expect_err("invalid hierarchical-gate object must be refused")

@@ -749,30 +749,23 @@ case "${PLOW_DSA_SELECT_SPLIT:-0}" in
   *) echo "FAIL: PLOW_DSA_SELECT_SPLIT must be 0 or 1" >&2; exit 2 ;;
 esac
 
-# OPT-IN (PLOW_L2HIER_PF=1): L2-DOMAIN DISPATCH ON THE PREFILL ROWS, for blobs emitted with
-# PLOW_L2_PLACE_PREFILL=1 (which is NOT the AMD default -- see crates/devgen/src/lib.rs).
+# PLOW_L2HIER_PF=1: L2-DOMAIN DISPATCH ON THE PREFILL ROWS, for blobs emitted with
+# PLOW_L2_PLACE_PREFILL=1. Both default on for gfx942; either remains an A/B rollback.
 # Without this the prefill objects lack the axis and plowrt refuses a prefill-placed blob. The
 # FLASH rows already carry it unconditionally (AX_FLASH above), which is why Gemma's split
 # prefill program only needs this one knob.
 #
-# PLACEMENT ONLY, and that is a hard limit rather than caution. This block used to add
-# `-DPLOW_GATE_HIER=1` as well, and an object built that way DOES NOT COMPILE: the guard at the
-# top of interp.hip is
-#     #if PLOW_GATE_HIER && (!PLOW_BUCKET_DECODE || !PLOW_GLOBAL_QUEUE || !PLOW_L2_PLACE_DISPATCH)
-#     #error "PLOW_GATE_HIER requires a decode global-queue object with L2-domain dispatch"
-# and AX_PREFILL carries -DPLOW_BUCKET_DECODE=0. Verified by compiling the row by hand: one
-# error, no object. plowrt's `check_gate_hier_object` refuses the same pairing a second time at
-# load. So the two-level gate is DECODE-ONLY by construction, and the hierarchy half of
-# "PLOW_L2HIER_PF" was never buildable; what remains here is the placement half.
-#
-# MEASURED AND NOT DEFAULTED. With these objects a prefill-placed Gemma-4-31B blob (dense, whose
+# With these objects a prefill-placed Gemma-4-31B blob (dense, whose
 # prefill program spans the prefill AND flash objects -- the shape recorded above as hanging
 # amd-bench) runs to completion in normal wall time and moves TTFT -1.4/-2.1/-6.2% at 128/2048/8192
-# tokens solo, with one reproducible +3.2% at 2048/conc-4 and decode untouched. Left opt-in for
-# blast radius, not for the number: it makes every prefill object in a tree incompatible with a
-# default emit. docs/amd/gemma4-31b-mi300x.md has the table.
-if [ "${PLOW_L2HIER_PF:-0}" = 1 ]; then
-  AX_PREFILL="$AX_PREFILL -DPLOW_L2_PLACE_DISPATCH=1"
+# tokens solo, with one reproducible +3.2% at 2048/conc-4 and decode untouched.
+#
+# PLOW_GATE_HIER_PF controls the hierarchy independently for A/B. It is added only to GQ twins
+# whose base row carries L2 placement; static and unplaced objects remain compatible.
+AX_PREFILL_PLACE=""
+if [ "${PLOW_L2HIER_PF:-1}" = 1 ]; then
+  AX_PREFILL_PLACE="-DPLOW_L2_PLACE_DISPATCH=1"
+  AX_PREFILL="$AX_PREFILL $AX_PREFILL_PLACE"
 fi
 
 # OPT-IN (PLOW_MLA_PF_QK1=1): MLA prefill computes QK^T + softmax on ONE wave per M-tile
@@ -1447,7 +1440,7 @@ ROWS=(
   # at concurrency 1 with `--amd-token-batch-solo` (no packing at all, so the prefill chunk
   # alone) 7168 goes -24.8% -> -6.5% and its TTFT +64.8% -> +13.0%.
   # `TB_GM_BM`/`TB_GM_BN` stay overridable so the A/B that found this is one env away.
-  "interp_tokbatch|-DPLOW_TOKEN_BATCH=1 -DPLOW_MIXED_STEP=1 -DPLOW_BUCKET_DECODE=0 -DPLOW_WG_WAVES=4 -DPLOW_GEMV_MM=4 -DGM_BM=${TB_GM_BM:-256} -DGM_BN=${TB_GM_BN:-128} -DFA_DC=256 -DFA_DBUF=1 $AX_TOKEN_BATCH_REDUCE $AX_TOKEN_BATCH_LDS_DMA $AX_TOKEN_BATCH_FP8 $AX_TOKEN_BATCH_PRUNE"
+  "interp_tokbatch|-DPLOW_TOKEN_BATCH=1 -DPLOW_MIXED_STEP=1 -DPLOW_BUCKET_DECODE=0 -DPLOW_WG_WAVES=4 -DPLOW_GEMV_MM=4 -DGM_BM=${TB_GM_BM:-256} -DGM_BN=${TB_GM_BN:-128} -DFA_DC=256 -DFA_DBUF=1 $AX_PREFILL_PLACE $AX_TOKEN_BATCH_REDUCE $AX_TOKEN_BATCH_LDS_DMA $AX_TOKEN_BATCH_FP8 $AX_TOKEN_BATCH_PRUNE"
   "interp_prefill_fp8|$AX_PREFILL $AX_FP8"
   "interp_decode_fp8|$AX_DECODE $AX_FP8"
   "interp_prefill_fp8kv|$AX_PREFILL $AX_FP8 $AX_FP8KV"
@@ -1576,7 +1569,13 @@ printf '%s\n' "${ROWS[@]}" | while IFS='|' read -r stem axes; do
   echo "$stem|$axes"
   case "$stem" in
     interp_decode*) echo "${stem}_gq|$axes $AX_GQ $AX_DECODE_GQ" ;;
-    *) echo "${stem}_gq|$axes $AX_GQ" ;;
+    *)
+      pf_hier=""
+      if [[ "$axes" == *"-DPLOW_L2_PLACE_DISPATCH=1"* ]] && [ "${PLOW_GATE_HIER_PF:-1}" != 0 ]; then
+        pf_hier="-DPLOW_GATE_HIER=1"
+      fi
+      echo "${stem}_gq|$axes $AX_GQ $pf_hier"
+      ;;
   esac
 done | xargs -P "$JOBS" -I{} bash -c 'IFS="|" read -r s a <<< "{}"; one "$s" $a'
 fi
@@ -1599,7 +1598,13 @@ fi
     stem="${row%%|*}"; axes="${row#*|}"
     case "$stem" in
       interp_decode*) gq_axes="$axes $AX_GQ $AX_DECODE_GQ" ;;
-      *) gq_axes="$axes $AX_GQ" ;;
+      *)
+        pf_hier=""
+        if [[ "$axes" == *"-DPLOW_L2_PLACE_DISPATCH=1"* ]] && [ "${PLOW_GATE_HIER_PF:-1}" != 0 ]; then
+          pf_hier="-DPLOW_GATE_HIER=1"
+        fi
+        gq_axes="$axes $AX_GQ $pf_hier"
+        ;;
     esac
     for pair in "$stem|$axes" "${stem}_gq|$gq_axes"; do
       printf '%s "%s": "-DPLOW_ARCH_SUFFIX=%s%s %s%s"' "$sep" "${pair%%|*}" "$ARCH" "$AX_CONFIG_JSON" "$(echo ${pair#*|})" "${AX_EXTRA:+ $AX_EXTRA}"
