@@ -1642,6 +1642,49 @@ This is a live defect for RAGGED SEAMS generally, not only for row-band: any two
 a `@band{t}` family could desynchronise the same way. Row-band is simply the first pair where one
 sibling never goes ragged and so never re-derives the binding for itself.
 
+## The host path has about 5 ms in it, not 33, and the VRAM kernarg ring must stay (2026-09-15, job `hostpath-probe`)
+
+The 22 ms gap to 490 needed a lever structurally disjoint from everything already in the packet,
+and the host admission path was the candidate. It is much smaller than the campaign believed.
+
+**The retraction first.** Earlier notes called prefill enqueue "8% of TTFT, the largest
+addressable non-GPU item". That is wrong, for two independent reasons the probe's header sets out:
+`PF_SEGMENTS.tally()` counts ONE rank's segments, so the 39.81 ms covers 1414 x 8 = 11312 AQL
+packets at 3.52 us each, not 28 us; and the COUNT column reads 1 for both `enqueue_segment` and
+`drain`, meaning one uninterrupted enqueue of all 11312 packets and one drain at the end. The
+doorbell rings per packet against a 4096-deep queue, so the GPU is running from packet 0 while the
+host is still submitting — it finishes 39.9 ms in against 474 ms of GPU work, 12x ahead. **Deleting
+the entire enqueue cost would move TTFT by roughly zero.** Of the host items only tokenize is real.
+
+Five arms, medians of the main phase at isl8192-c1 on the stack packet:
+
+| arm | knobs | median TTFT | vs base |
+|---|---|---|---|
+| `base` | — | 499.27 ms | — |
+| `et8` | `PLOW_ENCODE_THREADS=8 PLOW_ENCODE_FAST=1` | 497.06 ms | **-2.2** |
+| `et32` | `=32`, `PLOW_ENCODE_SPLIT_MIN=1024` | **494.43 ms** | **-4.8** |
+| `kh` | `PLOW_AMD_KERNARG_VRAM=0` | 515.61 ms | **+16.3** |
+| `both` | et32 + kh | 497.09 ms | -2.2 |
+
+**`kh` is decisively bad and the mechanism is visible.** The phase table shows `enqueue` at
+4.75 ms in every other arm and **21.96 ms** under `kh` — a 17.2 ms increase that accounts for the
+whole regression. So the per-launch BAR readback that `publish_device_kernarg` does is not a cost
+worth removing; removing the VRAM ring *adds* 17 ms of enqueue. The landed default from tasks
+#43/#44 is right, and `both` shows the two levers partly cancelling, as this campaign keeps finding
+for levers that touch the same region.
+
+**The encode split is worth a few ms and needs a real T4 to claim.** -4.8 ms at 32 threads is the
+right sign and the mechanism is sound (the rayon `encode_split` path, whose `split_safe` predicate
+GLM-5.3's tokenizer passes clause by clause, on a ~32 KB prompt), and `PLOW_ENCODE_FAST` is
+ids-identical so it cannot change a token. But this probe is a MEASUREMENT, not an A/B: eight
+prompts per arm, no repeated control, and its own header says it resolves a 10 ms phase rather
+than a 1 ms one. A -4.8 ms effect is below what it can convict on.
+
+**Arithmetic on the goal.** The end-to-end cell is 512.0 ms and the goal is 490. Even if the full
+-4.8 ms survives a paired T4, that is 507 ms — still 17 ms over. **The host path cannot close this
+gap by itself**, and with tiles already ruled out, the remaining 17 ms has to come from the 431 ms
+`drain`, which is GPU work: the prefill chunk itself.
+
 ## `PLOW_*_DECODE_DENSE_EXACT` passes its TPOT claim on a paired T4, and the T4's FAIL is TTFT drift (2026-09-15, jobs `dxflip-t4r-{a-ctl,b-treat,c-ctl2,d-treat2}`)
 
 Row 100 landed the dense-exact decode twin opt-in on a single T3 (TPOT 37.72/35.93/37.70,
