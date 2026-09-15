@@ -691,6 +691,7 @@ pub fn spawn(
                     MuxMsg::Drain(done) => {
                         // No in-flight work; signal immediately.
                         let _ = done.send(());
+                        reject_pending_after_drain(&mut rx, &metrics);
                         break;
                     }
                 }
@@ -724,10 +725,14 @@ pub fn spawn(
                     });
                 let mean_output_tokens = if n == 0 { 1.0 } else { sum as f64 / n as f64 };
                 let before = controller.admission_limit();
+                let oldest_wait_ms = waiting
+                    .front()
+                    .map(|(_, arrived)| arrived.elapsed().as_secs_f64() * 1000.0)
+                    .unwrap_or(0.0);
                 let decision = controller.decide(RungLoad {
                     occupied_extent,
                     queued,
-                    oldest_wait_ms: 0.0,
+                    oldest_wait_ms,
                     arrival_rps: load.lambda.get(),
                     mean_output_tokens,
                     slo_ms: cfg.slo_ms,
@@ -808,6 +813,7 @@ pub fn spawn(
                     0.0
                 };
                 if hold_ms > 0.0 {
+                    turn.release();
                     Metrics::add(&metrics.hold_ms_sum, hold_ms as u64);
                     Metrics::inc(&metrics.hold_count);
                     let deadline =
@@ -1227,6 +1233,25 @@ fn note_dequeued(msg: &MuxMsg, metrics: &Metrics) {
     }
 }
 
+fn reject_pending_after_drain(rx: &mut mpsc::Receiver<MuxMsg>, metrics: &Metrics) {
+    while let Ok(msg) = rx.try_recv() {
+        note_dequeued(&msg, metrics);
+        match msg {
+            MuxMsg::Drain(done) => {
+                let _ = done.send(());
+            }
+            MuxMsg::Job(job, _) => {
+                Metrics::inc(&metrics.rejected);
+                let _ = job
+                    .respond
+                    .try_send(StreamChunk::Err(crate::RuntimeError::Rejected(
+                        "model is draining — retry".into(),
+                    )));
+            }
+        }
+    }
+}
+
 fn note_arrival(
     now: Instant,
     load: &mut LoadEstimator,
@@ -1267,6 +1292,10 @@ fn admit_into(
     health: &EngineHealth,
     kv_budget: Option<crate::sched::admission::KvBudget>,
 ) -> Option<(Job, Instant)> {
+    if job.respond.is_closed() {
+        return None;
+    }
+
     // A dead engine cannot serve anyone — reject up front with the fault that
     // killed it (fatal DeviceFault → 503), instead of admitting into a
     // poisoned context. The poisoning itself was logged once; this stays at
@@ -4624,6 +4653,52 @@ mod tests {
             Err(SubmitError::Closed(_))
         ));
         assert_eq!(metrics.queued_requests.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn idle_drain_rejects_pending_jobs_and_answers_followup_drains() {
+        let metrics = Metrics::default();
+        let (tx, mut rx) = mpsc::channel(4);
+        let (respond, mut chunks) = crate::serve::stream::channel();
+        let job = Job {
+            prompt_ids: vec![1],
+            gen: GenParams::default(),
+            arrived: Instant::now(),
+            respond,
+        };
+        metrics.queued_requests.store(1, Ordering::Relaxed);
+        assert!(tx.try_send(MuxMsg::Job(job, Instant::now())).is_ok());
+        let (done, mut done_rx) = tokio::sync::oneshot::channel();
+        assert!(tx.try_send(MuxMsg::Drain(done)).is_ok());
+
+        reject_pending_after_drain(&mut rx, &metrics);
+
+        assert_eq!(metrics.queued_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.rejected.load(Ordering::Relaxed), 1);
+        assert!(matches!(
+            chunks.try_recv(),
+            Ok(StreamChunk::Err(crate::RuntimeError::Rejected(_)))
+        ));
+        assert!(matches!(done_rx.try_recv(), Ok(())));
+    }
+
+    #[test]
+    fn disconnected_job_is_not_admitted() {
+        let metrics = Arc::new(Metrics::default());
+        let mut slots: Vec<Option<Slot>> = std::iter::once_with(|| None).collect();
+
+        assert!(admit_into(
+            &mut slots,
+            1,
+            test_job(),
+            Instant::now(),
+            None,
+            &metrics,
+            &EngineHealth::Healthy,
+            None,
+        )
+        .is_none());
+        assert!(slots[0].is_none());
     }
 
     fn fault(fatal: bool) -> crate::DeviceErrorInfo {

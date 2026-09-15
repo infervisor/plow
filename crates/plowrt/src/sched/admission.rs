@@ -143,13 +143,13 @@ impl KvBudget {
         self.block_groups[..self.block_group_count as usize]
             .iter()
             .fold(0u64, |total, group| {
-                // Row zero of every slot/group is mapped before free memory is sampled.
-                let extra_blocks = rows
+                // Construction reserves VA only. Every physical block a request may grow
+                // into must therefore be funded by admission.
+                let blocks = rows
                     .saturating_add(group.block_rows - 1)
                     .checked_div(group.block_rows)
-                    .unwrap_or(u64::MAX)
-                    .saturating_sub(1);
-                total.saturating_add(extra_blocks.saturating_mul(group.block_bytes))
+                    .unwrap_or(u64::MAX);
+                total.saturating_add(blocks.saturating_mul(group.block_bytes))
             })
     }
 
@@ -216,7 +216,9 @@ mod kv_budget_tests {
         // 20 x 70,000: arms C and D, both faulted on hardware.
         assert!(!b.fits(19 * 70_000, 70_000));
         // The knee sits where the arithmetic says: ~13 at 0.9 headroom of 55.59 GiB.
-        let n = (1..=20).take_while(|i| b.fits((i - 1) as u64 * 70_000, 70_000)).count();
+        let n = (1..=20)
+            .take_while(|i| b.fits((i - 1) as u64 * 70_000, 70_000))
+            .count();
         assert_eq!(n, 13, "max concurrent 70k sequences");
     }
 
@@ -233,7 +235,7 @@ mod kv_budget_tests {
     }
 
     #[test]
-    fn block_rounded_glm_budget_admits_fourteen_70k_sequences() {
+    fn block_rounded_glm_budget_admits_twelve_70k_sequences() {
         let free = (55.58984375f64 * (1u64 << 30) as f64) as u64;
         let b = KvBudget::linear(55_608, (free as f64 * 0.9) as u64)
             .with_block_groups(&[
@@ -245,11 +247,11 @@ mod kv_budget_tests {
 
         assert_eq!(
             b.bytes_for_rows(1),
-            0,
-            "the prepaid first column is not charged twice"
+            177 * (2 << 20),
+            "the first physical block in every group is charged"
         );
-        assert!(b.fits_requests(std::iter::repeat_n(70_700, 14)));
-        assert!(!b.fits_requests(std::iter::repeat_n(70_700, 15)));
+        assert!(b.fits_requests(std::iter::repeat_n(70_700, 12)));
+        assert!(!b.fits_requests(std::iter::repeat_n(70_700, 13)));
     }
 
     #[test]
@@ -257,7 +259,8 @@ mod kv_budget_tests {
         let b = KvBudget::linear(1, 2 << 20)
             .with_block_groups(&[(4_096, 2 << 20)])
             .unwrap();
-        assert!(b.fits_requests([4_096, 4_096]));
-        assert!(!b.fits_requests([4_097, 4_097]));
+        assert!(b.fits_requests([4_096]));
+        assert!(!b.fits_requests([4_096, 4_096]));
+        assert!(!b.fits_requests([4_097]));
     }
 }
