@@ -5274,7 +5274,7 @@ fn emit_phase(
                 d.j[1] = kvm; // head-major; RING on a sliding layer
             })
         };
-        if !gemv_family && emit_config::active().packed_prefill_on() {
+        if !gemv_family && b.packed_prefill_segments() {
             b.isolate(c_fa);
         }
         // When fused, flash_prefill already wrote the normalized bf16 to n.at, so there is no
@@ -8898,11 +8898,28 @@ fn emit_dense_gqa(
     let mut tlist = Vec::new();
     let mut hetero_progs: Vec<hetero::ProgPlan> = Vec::new();
     let mut channel_progs = Vec::new();
-    for &t in &buckets {
+    let packed_prefill = amd
+        && matches!(c.arch, Arch::Gemma3 | Arch::Gemma4)
+        && ecfg.packed_prefill_on();
+    let prefill_plan: Vec<(u32, bool)> = buckets
+        .iter()
+        .copied()
+        .map(|t| (t, false))
+        .chain(
+            packed_prefill
+                .then_some(&buckets)
+                .into_iter()
+                .flatten()
+                .copied()
+                .map(|t| (t, true)),
+        )
+        .collect();
+    for (t, packed) in prefill_plan {
         if c.moe && !moe_pf {
             break;
         } // MoE without prefill: decode-only blob
         let mut b = Builder::new(n_cu);
+        b.set_packed_prefill_segments(packed);
         b.set_fuse_materialized_residual_inputs(ecfg.fuse_residual_input);
         b.adopt_tensors(tensors.clone());
         b.set_l2_placement(l2_layout.filter(|_| l2_place_prefill));
@@ -8973,7 +8990,11 @@ fn emit_dense_gqa(
             });
         }
         progs.push(b.finish());
-        tlist.push(t);
+        tlist.push(if packed {
+            packet::devbuild::packed_prefill_program_t(t)
+        } else {
+            t
+        });
     }
     let mut kv_rows = Vec::new();
     // `dbatch` is the SAME clamped(1,32) value used by declare() above — emission and

@@ -44,13 +44,26 @@ env \
     --hf-dir "$hf_dir" --gpu MI300X --arch gfx942 --n-cu 304 \
     --max-ctx 16512 --emit devblob --out "$stage/assets"
 
+python3 "$repo/scripts/check_gemma4_gfx942_assets.py" \
+  "$stage/assets/build.json" "$precision"
+
 PLOW_HSACO_CONFIG="$stage/assets" \
   "$repo/scripts/build_gfx942.sh" "$stage/hsaco"
+
+for rung in 1 2 4; do
+  [ -f "$stage/hsaco/lowrung$rung/interp_decode.elf" ] || {
+    echo "FAIL: decode tier object lowrung$rung/interp_decode.elf is missing" >&2
+    exit 2
+  }
+done
 
 git -C "$repo" rev-parse HEAD > "$stage/source-commit.txt"
 ( cd "$hf_dir" && find . -maxdepth 1 -type f -print0 | sort -z | xargs -0 sha256sum ) \
   > "$stage/CHECKPOINT_SHA256SUMS"
-( cd "$stage" && sha256sum assets/model.pkt assets/build.json hsaco/*.elf > SHA256SUMS )
+( cd "$stage" && {
+    find assets hsaco -type f -print0 | sort -z | xargs -0 sha256sum
+    sha256sum source-commit.txt CHECKPOINT_SHA256SUMS
+  } > SHA256SUMS )
 mv "$stage" "$output"
 trap - EXIT
 echo ">>> reproducible bundle: $output"
