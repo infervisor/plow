@@ -1769,6 +1769,43 @@ streams it. The next structural cut is that `GemvF32` is really an 8192x24x20480
 196 608 independent wave-level dot products with no register reuse; a tiled GEMM would read `x` and
 `W` once each. That is an emit change (pick a GEMM opcode when `rows` is large), not a kernel one.
 
+### 12.5 The nulls re-run, and where the 26 ms goes
+
+Two of §12.1's null results, re-run against the 26 ms layer. Both were real all along; a 5 ms
+effect simply cannot be seen under a 1654 ms op.
+
+| ablation | at 1.7 s | at 26 ms | what it prices |
+|---|---|---|---|
+| `hc_sinkhorn_iters` 20 -> 2 | 1697 vs 1733 ms (null) | 30.34 -> 25.49 ms | the serial mHC Sinkhorn |
+| routed top-k 6 -> 1 | 1699 vs 1733 ms (null) | 26.06 -> 21.27 ms | the grouped MXFP4 experts |
+
+Both ablations demonstrably took: the exit moves (`min -2.45312` and `min -2.75000` against the
+real `-2.68750`), which is the check that separates "the knob did nothing" from "the knob was not
+read". **Any null result recorded before §12.4 should be treated as unmeasured, not as negative.**
+
+Top-1 saving 4.79 ms puts the routed MoE at about **5.7 ms per layer** at top-6, which scales with
+routed work as a compute-bound op should. The arithmetic floor is 435 GFLOP/rank/layer against
+MI300X's ~1307 TFLOPS bf16, i.e. **333 us** -- so the grouped A4W4 GEMM is running at roughly **6%
+of peak**. That is the CDNA3 arm, which dequantizes fp4 to bf16 in staging because `PLOW_HAS_MX_MMA`
+is `PLOW_CDNA4`; gfx942 has no native MX MMA. This is the first measurement that actually supports
+attributing cost to the fp4 simulation -- §12.1 retracted an earlier attribution that was made
+without one, and that retraction was correct at the time.
+
+**The 26 ms layer, by subsystem:**
+
+| subsystem | cost | share |
+|---|---|---|
+| mHC (`GemvF32` + `HyperConnPre` + `HyperConnPost`) | 12.1 ms | 48% |
+| routed MoE (grouped GLU + DOWN + combine) | 5.7 ms | 22% |
+| shared expert + dense projections (`GEMM_FP8_MX`, `GEMM_MED`) | 2.7 ms | 11% |
+| collectives (`XREDUCE2` x3) | 1.9 ms | 7% |
+| attention (`FLASH_MLA_PREFILL` + `FLASH_MERGE`) | 1.8 ms | 7% |
+| norms, RoPE, router, align | 1.1 ms | 4% |
+
+Reaching 90 ms for 40 layers needs 2.25 ms per layer, so it is not one more op: it needs the mHC
+restructured (a tiled GEMM for `GemvF32`, and `HyperConnPost`'s 335 MB write), the A4W4 arm lifted
+off 6% of peak, and the whole-model emit that §12.2 lists. None of those is small.
+
 **The gap is now 11.6x, not 870x.** 40 layers x 26.0 ms = 1.04 s against 90 ms. That over-counts a
 whole-model emit, which overlaps seams this measures in isolation, and it under-counts everything
 in §12.2 that is still not emitted.
