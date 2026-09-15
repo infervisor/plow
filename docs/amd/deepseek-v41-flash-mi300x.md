@@ -1649,6 +1649,14 @@ WHAT WOULD SETTLE IT. Two instruments, neither available here yet:
 
 ### 12.3 Where the 1.7 s actually is: a per-op profile
 
+> **RETRACTED IN §12.4.** The conclusion below -- that the shortfall is UNIFORM across every op,
+> and that no single stage explains it -- is WRONG, and so is the claim in its last paragraph that
+> attributing time inside the megakernel "needs a device-side timer inside the interpreter loop,
+> which this tree does not have". The tree has one. With it, 97.6% of the layer turned out to be a
+> single op. The prefix table below is still accurate as far as it goes; it was just too coarse to
+> see that prefix 14 and prefix 23 each contain exactly one `GemvF32`. §12.4 has the measurement.
+
+
 The interpreter is a MEGAKERNEL -- `--segs 1` times the same as uncapped, so the whole 34-op
 layer is ONE cooperative launch and no kernel profiler can attribute inside it. `PLOW_DSV41_OPS`
 emits PREFIXES of the layer; differencing their run times is the profiler. T=8192, TP8:
@@ -1693,6 +1701,77 @@ out as the cause of that: the activation arena is `vram_pool`, i.e. ordinary coa
 NEXT, and stated as hypotheses rather than findings: the megakernel's per-op cross-workgroup
 synchronization at 304 workgroups, or a specific pathology in the three mHC kernels. Separating
 those needs a device-side timer inside the interpreter loop, which this tree does not have.
+
+### 12.4 It was one op, and the layer is now 26 ms
+
+`PLOW_TRACE_RAW` allocates a `PlowTraceRec[n_stream]`; the interpreter already stamps
+`s_memrealtime` at arrive/ready/end for every (workgroup, packet); `AmdEngine::trace_write` dumps
+it and `scripts/k3_trace_report.py` reduces it. The prefill path was wired for this deliberately.
+`rung_run` simply had no way to ask -- it does now, with `--trace <path>`. The first trace, T=8192:
+
+| op | packets | body | share |
+|---|---|---|---|
+| `GEMV_F32` | 2 | 1 654 174 us | **97.6%** |
+| `XREDUCE2` | 3 | 18 116 us | 1.1% |
+| `HYPER_CONN_PRE` | 2 | 6 446 us | 0.4% |
+| everything else | 27 | 15 108 us | 0.9% |
+
+Not uniform at all. The ~4 GB/s figure in §12.3 was a whole-layer traffic estimate divided by a
+wall time that ONE op owned; there was never a shortfall spread across the layer to explain.
+
+**The bug.** `d_gemv_f32` parallelises over N alone:
+
+    for (m = 0; m < M; m++)
+        for (n = slice * PLOW_WAVES + wave; n < N; n += nblk * PLOW_WAVES)
+
+Its own header claims it is "grid-strided over N ... and over M for a batched/prefill caller", but
+the M loop has no stride. The op was written for GLM-5.3's DSA indexer at M=1..3, N=32. V4.1's mHC
+dispatches the SAME opcode at **M=8192, N=24, K=20480**, where the n-stride is 2432 and waves
+24..2431 get nothing: three of 304 workgroups computed the entire product while 301 fell through.
+
+Three fixes, each measured on 8x MI300X at T=8192 / TP8, each leaving the output bit-identical:
+
+| change | median | vs prev |
+|---|---|---|
+| baseline | 1698.9 ms | |
+| `d_gemv_f32` wide-M arm (block owns a row, wave owns a column) | 38.2 ms | 44.5x |
+| four columns per pass over `x` instead of one | 30.3 ms | 1.26x |
+| mHC Sinkhorn's 4x4 in lane-0 registers, not LDS | 26.0 ms | 1.16x |
+
+**65x cumulative, and no bit moved** -- every arm reports exit `min -2.68750 / max 3.53125 /
+mean -0.000708 / 0 NaN / 0 Inf`. That is by construction, not luck: an output is still one wave's
+`wave_sum` over the same lane-strided K in the same order, and the Sinkhorn copy is generated from
+the shipped block by substitution rather than retyped.
+
+The Sinkhorn cost was priced by ablation BEFORE it was fixed: `hc_sinkhorn_iters` 20 -> 2, same
+weights and objects, only the packet operand changing, moved the layer 30.34 -> 25.49 ms. The
+register fix recovered 4.27 of those 4.85 ms. (The same ablation at 1.7 s read as a null result --
+a 5 ms effect is invisible under a 1654 ms op. Several of §12.1's null results are that kind of
+null, and are worth re-running now that the layer is 26 ms.)
+
+**Where the 26 ms sits now**, per the trace:
+
+| op | packets | body | note |
+|---|---|---|---|
+| `GEMV_F32` | 2 | 6 268 us | 8 waves each sweep the whole 40 KB row -> 2.7 GB of x traffic |
+| `HYPER_CONN_POST` | 2 | 3 477 us | |
+| `MOE_GROUP_DOWN_PF` | 1 | 2 982 us | |
+| `GEMM_FP8_MX` | 8 | 2 524 us | |
+| `HYPER_CONN_PRE` | 2 | 2 396 us | |
+| `MOE_GROUP_GLU_PF` | 1 | 2 149 us | |
+| `XREDUCE2` | 3 | 1 873 us | |
+| `FLASH_MLA_PREFILL` | 1 | 1 492 us | |
+| rest | 14 | 2 167 us | |
+
+The mHC trio -- `GemvF32`, `HyperConnPre`, `HyperConnPost` -- is 12.1 of 25.3 ms, **48%**, and it
+is this model's own addition: `hc_mult=4` makes the residual stream 335 MB at 8k and every mHC op
+streams it. The next structural cut is that `GemvF32` is really an 8192x24x20480 GEMM being run as
+196 608 independent wave-level dot products with no register reuse; a tiled GEMM would read `x` and
+`W` once each. That is an emit change (pick a GEMM opcode when `rows` is large), not a kernel one.
+
+**The gap is now 11.6x, not 870x.** 40 layers x 26.0 ms = 1.04 s against 90 ms. That over-counts a
+whole-model emit, which overlaps seams this measures in isolation, and it under-counts everything
+in §12.2 that is still not emitted.
 
 ### 12.2 What is still not demonstrated
 
