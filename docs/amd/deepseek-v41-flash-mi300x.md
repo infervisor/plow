@@ -1054,17 +1054,34 @@ So the ordered critical path to an 8k/90 ms number is:
    still the right shape -- the structure and the mHC wiring carry over -- but it
    should be planned as a multi-session build.
 
-   **And it is blocked on something that is NOT plumbing.** `MoeEnc` carries ONE
-   weight encoding for a whole run, threaded as `enc` through
-   `declare_glm_rows_batched` and `emit_glm53_program` alike, and
+   ~~**And it is blocked on something that is NOT plumbing.**~~ **RESOLVED
+   2026-09-15.** `MoeEnc` carries ONE weight encoding for a whole run, threaded as
+   `enc` through `declare_glm_rows_batched` and `emit_glm53_program` alike, and
    `mla_moe_enc_env` enforces that outright ("a run is ALL-mxfp4 or ALL-fp8 or
    ALL-bf16; pick one"). V4.1 is **mixed** -- block-FP8 `[32,32]` dense
-   projections, fp4 routed experts, stated by its own `expert_dtype: "fp4"`. So
-   the enum has to change MEANING (one encoding per run -> one per weight class)
-   before the fork has anything coherent to thread. `MoeEnc` is referenced 239 times
-   across the crates (205 of them naming a variant), so this is a question about
-   what the type MEANS, and it wants deciding before the rewrite rather than
-   during it. See item 5b.
+   projections, fp4 routed experts, stated by its own `expert_dtype: "fp4"`.
+
+   The fix was **not** a new `MoeEnc` variant, and that is the part worth keeping.
+   `MoeEnc` travels in an `i[]` slot on the grouped expert ops and the kernel
+   BRANCHES on it; a dense GEMM has no such slot and needs none, because the
+   OPCODE is the encoding -- 107 reads an f32 `[128,128]` grid, 184 a ue8m0
+   `[32,32]` one. A variant would have added a wire value no kernel reads and
+   invited exactly the substitution op 184 exists to prevent. So the dense
+   encoding is its own type, off the wire:
+
+   ```rust
+   enum DenseEnc { Bf16, Fp8Blk128, Fp8Mx32 }
+   struct CkptEnc { expert: MoeEnc, dense: DenseEnc }   // + is_uniform()
+   ```
+
+   and the PARSE was split from the COLLAPSE. `mla_ckpt_enc_full` returns what the
+   checkpoint SAYS and now succeeds for V4.1 -- a fact, not a capability --
+   while `mla_ckpt_enc` returns the single value today's emitters thread and
+   REFUSES when collapsing would be a lie (`emit_mixed_dense_expert_encoding`).
+   V4.1 used to die inside the parse, which meant the fork could not get a typed
+   fact out of it; now it is refused one level up, at the assumption that actually
+   fails. None of `MoeEnc`'s 239 references moved and the uniform families are
+   unchanged.
 
 Only after 5 does an end-to-end number exist to measure against 90 ms. The
 roofline (section 9) says the target is reachable at 28.9% of matrix peak and
