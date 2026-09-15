@@ -246,6 +246,74 @@ pub(crate) fn dsv41_gaps(c: &Dsv41Cfg) -> Vec<String> {
     ]
 }
 
+/// Every WEIGHT handle for a V4.1 layer, keyed by the checkpoint name without its
+/// `layers.{l}.` prefix.
+///
+/// A map rather than a struct of named fields, which is the opposite of what
+/// `declare_glm_rows_batched` does, and deliberate. GLM's declaration computes each shape inline,
+/// so naming the fields is how it stays readable. V4.1's shapes come from
+/// [`dsv41_layer_tensors`], which is already checked against all 96 085 shard tensors in both
+/// directions -- so the list IS the contract, and a struct would be a second, hand-maintained copy
+/// of it that can drift. Ask by the name the checkpoint uses.
+///
+/// This carries weights ONLY. Activation scratch is deliberately absent: its shapes follow the
+/// emit's dataflow (what is fused, what is split per bucket, what survives a seam) rather than the
+/// checkpoint, so declaring it before the emit exists would be guessing at the answer.
+pub(crate) struct Dsv41Weights {
+    /// `per_layer[l]` maps a suffix like `attn.wq_a.weight` to its tensor handle.
+    per_layer: Vec<std::collections::BTreeMap<String, u32>>,
+    /// Total declared bytes, which is what a capacity claim is checked against.
+    pub(crate) bytes: u64,
+}
+
+impl Dsv41Weights {
+    /// The handle for one weight, or a panic naming what was asked for.
+    ///
+    /// Panics rather than returning `Option` because every caller is an emit site that cannot
+    /// proceed without the handle: a `TENSOR_NONE` fallback would bind a null pointer and the
+    /// kernel would read it, which is the silent-wrongness shape this whole path avoids.
+    pub(crate) fn get(&self, layer: u32, suffix: &str) -> u32 {
+        *self.per_layer[layer as usize].get(suffix).unwrap_or_else(|| {
+            panic!(
+                "layer {layer} has no weight {suffix:?}. `dsv41_layer_tensors` decides what a \
+                 layer carries and it is checked against the shards, so this is a typo or a \
+                 tensor this layer genuinely does not have -- the optional groups (compressor, \
+                 indexer keys, engram) are on specific layers only"
+            )
+        })
+    }
+
+    /// Whether a layer carries an optional weight, for the groups that are not on every layer.
+    pub(crate) fn has(&self, layer: u32, suffix: &str) -> bool {
+        self.per_layer[layer as usize].contains_key(suffix)
+    }
+}
+
+/// Declare every weight the given layers bind, in checkpoint order.
+///
+/// The names carry their full `layers.{l}.` prefix into the tensor table, because that is what the
+/// loader matches against the shards -- the suffix is only the lookup key on this side.
+pub(crate) fn declare_dsv41_weights(
+    b: &mut Builder,
+    c: &Dsv41Cfg,
+    layers: &[u32],
+) -> Dsv41Weights {
+    let mut per_layer = vec![std::collections::BTreeMap::new(); c.layers as usize];
+    let mut bytes = 0u64;
+    for &l in layers {
+        for (suffix, sz) in dsv41_layer_tensors(c, l) {
+            let h = b.tensor(&format!("layers.{l}.{suffix}"), sz);
+            let prev = per_layer[l as usize].insert(suffix.clone(), h);
+            assert!(
+                prev.is_none(),
+                "layer {l} declared {suffix:?} twice; `dsv41_layer_tensors` must not repeat a name"
+            );
+            bytes += sz;
+        }
+    }
+    Dsv41Weights { per_layer, bytes }
+}
+
 /// One weight the emit binds: the checkpoint name (without the `layers.{l}.` prefix) and its
 /// size in BYTES.
 ///

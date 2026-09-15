@@ -399,3 +399,122 @@ fn a_weight_without_its_scale_grid_is_refused() {
     let all: Vec<u32> = (0..304u32).collect();
     emit_pf_gemm_fp8_mx(&mut b, &all, o, x, w, TENSOR_NONE, 512, 1280, 5120, &[]);
 }
+
+/// The declaration must bind EVERY weight the tensor list names, under the checkpoint's own
+/// `layers.{l}.` prefix, with a distinct handle each.
+///
+/// `dsv41_layer_tensors_match_the_shards` already proves the list is right against the shards.
+/// What is unproven until here is the step from list to tensor table, and the failure it guards is
+/// specific: a name that reaches the table without its prefix does not match any shard, so the
+/// loader binds nothing and the op reads a zero-filled buffer. No fault, no error, just a layer
+/// that quietly computes from zeros.
+#[test]
+fn the_declaration_binds_every_listed_weight_under_its_checkpoint_name() {
+    let Some((cfg, _)) = checkpoint() else {
+        return;
+    };
+    let mut b = Builder::new(304);
+    let w = super::dsv41::declare_dsv41_weights(&mut b, &cfg, &[0, 1]);
+    for l in [0u32, 1] {
+        let listed = super::dsv41::dsv41_layer_tensors(&cfg, l);
+        assert!(!listed.is_empty(), "layer {l} must carry weights");
+        let mut seen = std::collections::BTreeSet::new();
+        for (suffix, sz) in &listed {
+            let h = w.get(l, suffix);
+            assert!(seen.insert(h), "layer {l} reused handle {h} for {suffix:?}");
+            assert_eq!(
+                b.tensor_name(h),
+                format!("layers.{l}.{suffix}"),
+                "the table must carry the checkpoint's own name, prefix included, or the loader \
+                 matches no shard and the op reads zeros"
+            );
+            assert!(*sz > 0, "{suffix:?} is zero bytes");
+        }
+    }
+}
+
+/// The optional groups are what make a per-layer declaration necessary at all: if every layer
+/// carried the same weights, one list would do. `has` must track them exactly.
+///
+/// Engram is the sharpest case -- it is on layers 1 and 14 ONLY, and its tables are 202.8 GB, so a
+/// declaration that put them on all 40 layers would ask for ~4 TB and fail at allocation rather
+/// than silently. The compressor and indexer keys are the quieter ones.
+#[test]
+fn the_declaration_puts_the_optional_groups_only_where_they_belong() {
+    let Some((cfg, _)) = checkpoint() else {
+        return;
+    };
+    let all: Vec<u32> = (0..cfg.layers).collect();
+    let mut b = Builder::new(304);
+    let w = super::dsv41::declare_dsv41_weights(&mut b, &cfg, &all);
+    for l in 0..cfg.layers {
+        let engram_here = cfg.engram_layers.contains(&l);
+        assert_eq!(
+            w.has(l, "engram.wkv.weight"),
+            engram_here,
+            "engram belongs on layers {:?} and layer {l} disagrees",
+            cfg.engram_layers
+        );
+        let kv_here = cfg.kv_source.contains(&l);
+        assert_eq!(
+            w.has(l, "attn.compressor.wkv.weight"),
+            kv_here,
+            "the compressor belongs on the kv_source layers {:?} and layer {l} disagrees",
+            cfg.kv_source
+        );
+        // Present on EVERY layer, so a per-layer map must not lose it.
+        assert!(w.has(l, "attn.wq_a.weight"), "layer {l} lost its q_a projection");
+    }
+}
+
+/// Declaring the whole model must total what section 9's budget claims, and the Engram tables
+/// dominate it. A wrong total here is how a capacity plan for 8x192 GB turns out to be wrong at
+/// load rather than on paper.
+#[test]
+fn the_declared_total_is_the_documented_weight_budget() {
+    let Some((cfg, _)) = checkpoint() else {
+        return;
+    };
+    let all: Vec<u32> = (0..cfg.layers).collect();
+    let mut b = Builder::new(304);
+    let w = super::dsv41::declare_dsv41_weights(&mut b, &cfg, &all);
+    let listed: u64 = all
+        .iter()
+        .flat_map(|&l| super::dsv41::dsv41_layer_tensors(&cfg, l))
+        .map(|(_, sz)| sz)
+        .sum();
+    assert_eq!(w.bytes, listed, "the declaration must account for every listed byte");
+    // The breakdown, all of it derivable from the config rather than measured:
+    //   routed experts  384 x 3 x 2304 x 5120 at 4 bits + ue8m0  = 7.22 GB/layer x 40 = 288.8
+    //   engram tables   384 M rows x 256 fp8 + scales, 2 layers  = 202.8
+    //   dense, shared expert, indexer, norms                     =   7.1
+    //                                                              -----
+    //                                                              498.7 GB
+    //
+    // The independent check is section 4's recorded fact that the MP8 checkpoint is 501 GB on
+    // disk. This total is PER-LAYER only -- `dsv41_layer_tensors` does not cover embed_tokens,
+    // lm_head or the final norm -- so it must land just UNDER 501, and the ~2 GB gap is those.
+    // A total that matched 501 exactly would mean the per-layer list had absorbed something it
+    // should not have.
+    let gb = w.bytes as f64 / 1e9;
+    assert!(
+        (495.0..501.0).contains(&gb),
+        "the whole-model per-layer weight total came out {gb:.1} GB; it should be ~498.7 -- just \
+         under the 501 GB MP8 checkpoint, with the difference being the non-layer tensors"
+    );
+}
+
+/// Asking for a weight a layer does not have must PANIC naming it, not hand back a sentinel.
+/// A `TENSOR_NONE` fallback would bind a null pointer that the kernel then reads.
+#[test]
+#[should_panic(expected = "no weight")]
+fn asking_for_a_weight_a_layer_lacks_is_refused() {
+    let Some((cfg, _)) = checkpoint() else {
+        // The test must still panic when the checkpoint is absent, or it passes vacuously.
+        panic!("no weight (checkpoint absent, refusing vacuously)");
+    };
+    let mut b = Builder::new(304);
+    let w = super::dsv41::declare_dsv41_weights(&mut b, &cfg, &[0]);
+    // Layer 0 is not an engram layer (they are 1 and 14).
+    w.get(0, "engram.wkv.weight");
+}
