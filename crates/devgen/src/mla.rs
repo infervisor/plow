@@ -102,6 +102,23 @@ pub(crate) struct GlmCfg {
     has_dsa: bool,
 }
 impl GlmCfg {
+    fn expert_shard_layout(&self) -> Option<packet::moe_ep::Moe2dLayout> {
+        if !self.ep {
+            return None;
+        }
+        assert!(self.tp > 1, "GLM_EP requires a multi-rank TP world");
+        let layout = packet::moe_ep::Moe2dLayout {
+            world_size: self.tp,
+            expert_degree: self.tp,
+        };
+        layout
+            .validate(self.n_exp, self.moe_inter)
+            .unwrap_or_else(|reason| {
+                panic!("GLM_EP expert-id shard geometry is invalid: {reason}")
+            });
+        Some(layout)
+    }
+
     /// Full per-head qk width = nope + rope = 256. The attention softmax scale is
     /// 1/sqrt of THIS (0.0625) — NOT 1/sqrt(128); the absorbed MLA keeps the full-width scale.
     fn qk_head(&self) -> u32 {
@@ -9453,6 +9470,7 @@ fn glm_emit_full(
     let dbatch: u32 = *rungs.last().expect("decode_rungs is non-empty");
     let mut c = cfg_glm(dir);
     c.tp = tp;
+    let _expert_shard = c.expert_shard_layout();
     // --glm-layers cap truncates the model to the first N layers — a single-GPU smoke test of the
     // decode LOOP mechanics (embed/chain/KV-row patch/argmax/multi-step) that fits without TP or
     // all 78 layers' weights. Default = full 0..77 (layer 78 = MTP, skipped).
@@ -10239,6 +10257,7 @@ pub(crate) fn glm_build_block_pf(
     enc: MoeEnc,
 ) -> (Model, plow_asset::BlockDescriptor) {
     use plow_asset::*;
+    let _expert_shard = c.expert_shard_layout();
     let layers: Vec<u32> = block.clone().map(|l| l as u32).collect();
     // A whole-layer prefill needs a T-row FFN for EVERY layer in the block. Both kinds now have
     // one: MoE layers on the grouped expert arms, dense layers on those SAME arms with degenerate
