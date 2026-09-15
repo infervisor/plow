@@ -1647,6 +1647,53 @@ WHAT WOULD SETTLE IT. Two instruments, neither available here yet:
     `slot_bytes = 0` and is refused. Cutting usefully needs that recovery to
     stop being a max over the stream.
 
+### 12.3 Where the 1.7 s actually is: a per-op profile
+
+The interpreter is a MEGAKERNEL -- `--segs 1` times the same as uncapped, so the whole 34-op
+layer is ONE cooperative launch and no kernel profiler can attribute inside it. `PLOW_DSV41_OPS`
+emits PREFIXES of the layer; differencing their run times is the profiler. T=8192, TP8:
+
+| prefix | what it adds | median | delta |
+|---|---|---|---|
+| 14 | mHC pre + attention + o-proj + **reduce #1** | 850 ms | 850 |
+| 23 | + mHC post/pre + shared expert + **reduce #2** | 1700 ms | +850 |
+| 25 | + router GEMM + top-k | 1696 ms | ~0 |
+| 29 | + the four align packets | 1696 ms | ~0 |
+| 30 | + grouped GLU | 1763 ms | ~0 (noise) |
+| 31 | + grouped DOWN | 1705 ms | ~0 (noise) |
+| 34 | + combine + **reduce #3** + mHC post | 1917 ms | +212 |
+
+THE WHOLE MoE IS FREE. Router, align, the grouped GLU and the grouped DOWN together move the
+number by less than the run-to-run spread, which is the same answer the top-k experiment gave
+from the other direction. Everything is in ops 0-22.
+
+AND IT IS NOT THE COLLECTIVES EITHER, though they sit in both expensive segments:
+
+  * `PLOW_XR_NOWAIT=1` deletes both two-shot rendezvous waits: 1697 ms (output garbage, which is
+    how we know the arm changed).
+  * `PLOW_XR_SCHED=twoshot` against the default `aiter` -- the same data movement on a different
+    schedule, 1002 us vs 728 us apart in the reference bench -- measures 1687.7 vs 1687.2 ms.
+  * `TpGroup::audit_xctr` passes, so no reduce is timing out and silently skipping.
+
+A collective whose schedule, synchronization and completion all fail to move the number is not
+where the time is; it is merely what sits at the segment boundaries.
+
+WHAT IS LEFT IS THE mHC. Ops 0, 1, 14, 15, 16 and 33 -- `GemvF32`, `HyperConnPre`,
+`HyperConnPost` -- are the only things in ops 0-22 not already excluded, and they are the ops
+this model added. They stream `act.hc_residual_a`, which at `hc_mult=4`, T=8192 is 335 MB, about
+2.8 GB of traffic per layer per rank between them. That should cost ~0.5 ms.
+
+THE SHORTFALL IS UNIFORM, WHICH IS THE REAL CLUE. Summing the layer's traffic (mHC 2.8 GB, the
+expert weights, `act.part` written and read at 1 GB each) gives ~7 GB against 1.7 s: **~4 GB/s
+where the HBM does 5,300 GB/s**, and the same ~5 GB/s falls out of the T=1024 point. Every op is
+slow by about the same factor, which is why removing any ONE stage's work changes nothing. Ruled
+out as the cause of that: the activation arena is `vram_pool`, i.e. ordinary coarse-grained VRAM
+(`device/hsa.rs:1443`), not the fine-grained host-coherent path, so this is not a placement bug.
+
+NEXT, and stated as hypotheses rather than findings: the megakernel's per-op cross-workgroup
+synchronization at 304 workgroups, or a specific pathology in the three mHC kernels. Separating
+those needs a device-side timer inside the interpreter loop, which this tree does not have.
+
 ### 12.2 What is still not demonstrated
 
   * ONE layer, not 40. The whole-model emit is still blocked on the subsystems

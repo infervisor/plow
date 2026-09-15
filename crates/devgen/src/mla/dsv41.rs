@@ -413,11 +413,11 @@ pub(crate) fn declare_dsv41_weights(
         // declared. Declaring them would upload 1.7 GB per layer per rank that no op reads, beside
         // the packed copy that every op does.
         let ewt = b.tensor(
-            &format!("layers.{l}.ffn.expert_weight_table"),
+            &format!("layers.{l}.ffn.expert_weight_table{}", prof_table_suffix()),
             (c.n_exp as u64) * 3 * 8,
         );
         let est = b.tensor(
-            &format!("layers.{l}.ffn.expert_scale_table"),
+            &format!("layers.{l}.ffn.expert_scale_table{}", prof_table_suffix()),
             (c.n_exp as u64) * 3 * 8,
         );
         per_layer[l as usize].insert("ffn.expert_weight_table".to_string(), ewt);
@@ -1124,9 +1124,51 @@ pub(crate) fn emit_dsv41_attn_out(
         act.o,
         t * c.hidden,
         tp,
-        0,
+        early_reduce_slot(t, c.hidden),
     );
     (act, c_xr)
+}
+
+/// Suffix for the packed-expert table names: EMPTY in a real packet.
+///
+/// Under a `PLOW_DSV41_OPS` cut that lands before the grouped GLU, the tables are still DECLARED
+/// -- truncation drops instructions, not tensors -- and `bind_packed_experts` then refuses the
+/// blob: "expert_weight_table is declared but no decode instruction streams experts through it".
+/// The refusal is right; the profiling blob simply has no MoE left. Renaming the tables takes
+/// them out of that scan, since it keys on the exact `expert_weight_table` suffix.
+///
+/// `_moe2` specifically, and the choice is forced from both sides: `is_host_filled_table` must
+/// still MATCH the name (or the loader hunts the checkpoint for a weight by that name and fails
+/// with "MISSING WEIGHT"), while `bind_packed_experts`' layer scan must NOT -- it strips the exact
+/// `expert_weight_table` suffix, which `..._moe2` does not end with. The stage-2 companion lookup
+/// that does use `_moe2` only runs for a prefix the layer scan already found, and it finds none.
+///
+/// Profiling only, and only below the GLU cut: a real packet must keep the real names or its
+/// experts never get packed.
+fn prof_table_suffix() -> &'static str {
+    match crate::emit_config::active().dsv41_ops {
+        Some(n) if n < 30 => "_moe2",
+        _ => "",
+    }
+}
+
+/// Slot for the two EARLY reduces (attention, shared expert): 0 in a real packet.
+///
+/// Under `PLOW_DSV41_OPS` it becomes `slot_b` instead, and ONLY so that a truncated packet still
+/// loads. `DevBlob::parse` recovers `slot_bytes` as `max(i[2])` over the collectives, and in the
+/// shipped two-slot layout the ROUTED COMBINE's reduce is the only one carrying a non-zero
+/// `i[2]` -- so a prefix cut anywhere before it recovers `slot_bytes = 0` and the TP loader
+/// refuses the blob ("partial slot is 0 B, not a multiple of hidden*2"). Putting the early
+/// reduces at `slot_b` keeps the max non-zero for every prefix that contains one.
+///
+/// It is a PROFILING CUT, not an alternative design: with this on, two reduces share `slot_b`
+/// and the layer's numerics are not the model's. `emit_dsv41_block` prints the warning.
+fn early_reduce_slot(t: u32, hidden: u32) -> u32 {
+    if crate::emit_config::active().dsv41_ops.is_some() {
+        t * hidden * 2
+    } else {
+        0
+    }
 }
 
 /// V4.1's GLU is the CLAMPED SwiGLU, `PLOW_ACT_SWIGLU_CLAMP_` in `op_elementwise.h`.
@@ -1292,7 +1334,7 @@ pub(crate) fn emit_dsv41_ffn_shared(
         tp,
         // SLOT 0. The unit the host recovers is `max(i[2])` across the packet, and the routed
         // combine's `n.slot_b` is what sets it; anything larger here would move that unit.
-        0,
+        early_reduce_slot(t, hidden),
     );
     (act, c_xr)
 }
@@ -1488,7 +1530,11 @@ pub(crate) fn emit_dsv41_block(
     // the only way to get one out of a megakernel interpreter.
     if let Some(n) = crate::emit_config::active().dsv41_ops {
         b.truncate_ops(n as usize);
-        eprintln!("  PLOW_DSV41_OPS={n}: emitting a PREFIX of the layer, for profiling only");
+        eprintln!(
+            "  PLOW_DSV41_OPS={n}: emitting a PREFIX of the layer, for profiling only. The two \
+             early reduces move to slot_b so a truncated packet still loads, so this blob's \
+             NUMERICS ARE NOT THE MODEL'S -- time it, do not read it."
+        );
     }
     let prog = b.finish();
     let out_name = if ri == 0 { "act.hc_residual_a" } else { "act.hc_residual_b" };
