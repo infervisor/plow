@@ -841,6 +841,11 @@ packproj reconciliation: the band-width `ColSplit` calls (78 per 8192 program) c
   BF16 and no BF16×BF16→FP32 producer exists), and the indexer Q/K cache should use dynamic FP8
   plus scales (current pool=1 path is BF16). The latter is expected to save about 3.4 GiB/rank
   at 70K/C20 and about 182 MB/rank of index-K reads per decode token over 21 full-index layers.
+- Production AITER/shared-seed scratch now sizes emitted fallbacks instead of the widest generic
+  MoE path: `part` 1,610,612,736 → 201,326,592 B, `fu_g` 50,200,576 → 25,555,968 B,
+  `shared` 100,663,296 → 6,291,456 B, and the unused 100,663,296 B `zero_h` is gone. Recovery
+  = 1,628,965,888 B/rank (1.517 GiB). The full standard ladder emits with all Lean ordering/LDS
+  checks passing; 66 GLM tests pass. Packet stamp remains `0xa62d50f49ecc4f9a` so objects are reusable.
 
 - MTP speculative decoding (full depth): gate B PASS after fixing draft steps 2+ reusing step 1's top-k over a longer
   kv_len (read a −1 selection row → GPU fault). Acceptance 739/815 drafted (90.7%), 3.68 committed tokens per verify

@@ -67,6 +67,39 @@ fn router_flag_bits_do_not_collide() {
     assert_eq!(super::GLM_ROUTER_FLAGS & f::SQRTSOFTPLUS, 0);
 }
 
+#[test]
+fn native_prefill_scratch_is_sized_for_emitted_fallbacks() {
+    let _guard = crate::test_env::env_guard();
+    let _env = crate::test_env::EnvScope::set(&[
+        ("PLOW_GLM_MOE_AITER", "1"),
+        ("PLOW_GLM_MOE_RESIDENT", "1"),
+        ("PLOW_GLM_MOE_SHARED_SEED", "1"),
+        ("PLOW_GLM_GEMM_LT", "1"),
+        ("PLOW_GLM_GEMM_LT_PF_EXT", "o_proj,band,shared"),
+        ("PLOW_GLM_SEQ_PAR", "1"),
+        ("PLOW_EMIT_PACKED_PREFILL", "0"),
+        ("PLOW_UNISEG", "0"),
+    ]);
+    let mut c = glm_ref_cfg();
+    c.tp = 8;
+    let mut b = Builder::new(304);
+    let n = declare_glm_rows_batched_for_prefill(
+        &mut b,
+        &c,
+        81920,
+        &[0, 3],
+        8192,
+        20,
+        MoeEnc::Fp8Blk,
+        &[128, 512, 2048, 8192],
+    );
+    let tensors = b.tensors();
+    assert_eq!(tensors[n.part as usize].bytes, 8192 * 6144 * 4);
+    assert_eq!(tensors[n.fu_g as usize].bytes, (8192 + 127) * 1536 * 2);
+    assert_eq!(tensors[n.shared as usize].bytes, 512 * 6144 * 2);
+    assert!(tensors.iter().all(|t| t.name != "act.zero_h"));
+}
+
 /// The production recipe (glm53-tp8-90a1b438's recorded knobs; seams, band projections and the
 /// W_uv fold by production default), emitted whole: dense and MoE layers, full and shared
 /// indexers, every bucket with its tail, and the decode rungs. No program reads rows only one

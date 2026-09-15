@@ -873,7 +873,9 @@ pub(crate) fn glm53_emit_full(
         .unwrap_or(1);
     let layers: Vec<u32> = (0..c.layers).collect();
     let mut tb = Builder::new(n_cu);
-    let n = declare_glm_rows_batched(&mut tb, &c, ctx, &layers, max_rows, dbatch, enc);
+    let n = declare_glm_rows_batched_for_prefill(
+        &mut tb, &c, ctx, &layers, max_rows, dbatch, enc, &pf,
+    );
     let s = declare_glm53(&mut tb, &c, max_rows, dbatch, n.pos);
     let mut tensors = tb.tensors();
     let gen = tb.gen_tensors();
@@ -1828,7 +1830,6 @@ pub(crate) struct GlmTn {
     // TP peer partials + zero residual (TENSOR_NONE at tp==1)
     og_tp: u32,
     dg_tp: u32,
-    zero_h: u32,
     /// Byte offset of peer partial slot **B** (`dg_tp`) inside the peer-scratch region — the
     /// `i[2]` operand of every FFN `XReduce`/`XReduceTwoShot` this tensor set emits.
     ///
@@ -1995,6 +1996,20 @@ pub(crate) fn declare_glm_rows_batched(
     rows: u32,
     dbatch: u32,
     enc: MoeEnc,
+) -> GlmTn {
+    declare_glm_rows_batched_for_prefill(b, c, ctx, layer_ids, rows, dbatch, enc, &[])
+}
+
+#[allow(clippy::too_many_arguments)]
+fn declare_glm_rows_batched_for_prefill(
+    b: &mut Builder,
+    c: &GlmCfg,
+    ctx: u32,
+    layer_ids: &[u32],
+    rows: u32,
+    dbatch: u32,
+    enc: MoeEnc,
+    prefill_rows: &[u32],
 ) -> GlmTn {
     let dbatch = dbatch.max(1);
     let sp_seams = c.tp > 1 && rows >= GLM_SP_MIN_ROWS && emit_config::active().glm_seq_par();
@@ -2164,7 +2179,33 @@ pub(crate) fn declare_glm_rows_batched(
     } else {
         TENSOR_NONE
     };
-    let shared = ac(b, "shared", rows * h as u64 * BF16);
+    let native_moe = enc == MoeEnc::Fp8Blk
+        && (emit_config::active().glm_moe_aiter()
+            || emit_config::active().glm_moe_resident());
+    let has_dense = layer_ids.iter().copied().any(|l| c.is_dense(l));
+    let compact_native_scratch = native_moe
+        && has_dense
+        && !prefill_rows.is_empty()
+        && !emit_config::active().packed_prefill_on();
+    let shared_rows = if compact_native_scratch {
+        let lt = glm_lt_pf_ext();
+        let seedable = emit_config::active().glm_moe_shared_seed
+            && lt.shared
+            && !fold
+            && tp > 1
+            && emit_config::active().glm_seq_par()
+            && !emit_config::active().no_xreduce;
+        prefill_rows
+            .iter()
+            .copied()
+            .filter(|&r| !seedable || r < GLM_SP_MIN_ROWS || r % tp != 0)
+            .max()
+            .unwrap_or(1)
+            .max(dbatch) as u64
+    } else {
+        rows
+    };
+    let shared = ac(b, "shared", shared_rows * h as u64 * BF16);
     // Routed-expert gate/up buffer: full moe_inter width per slot under EP (whole experts), else TP shard.
     let fu = ac(b, "fu", (tk * imoe_e) as u64 * BF16);
     let dfu = ac(b, "dfu", di_l as u64 * BF16);
@@ -2178,7 +2219,15 @@ pub(crate) fn declare_glm_rows_batched(
         MoePfFuse::Det => rows * h as u64 * 8,
         MoePfFuse::None => rows * (tk * h) as u64 * F32,
     };
-    let part = ac(b, "part", part_pf.max((tk * h) as u64 * F32));
+    let part_bytes = if compact_native_scratch {
+        let dense_pf = rows * h as u64 * F32;
+        let native_pf = shared_rows * h as u64 * BF16;
+        let decode = (dbatch as u64 * h as u64 * F32).max((tk * h) as u64 * F32);
+        dense_pf.max(native_pf).max(decode)
+    } else {
+        part_pf.max((tk * h) as u64 * F32)
+    };
+    let part = ac(b, "part", part_bytes);
     // Grouped MoE prefill scratch. `MPF_MAX_ROWS(T,k,n_exp) = T*k + n_exp*(MPF_BM-1)` is the padded
     // gathered-row bound: the align op pads each expert's row range up to a whole MPF_BM tile, so
     // every expert can waste at most MPF_BM-1 rows. Sizing this from T*k alone is an out-of-bounds
@@ -2194,6 +2243,11 @@ pub(crate) fn declare_glm_rows_batched(
             let fug_bytes = match enc {
                 MoeEnc::Mxfp4 => pad_rows * (imoe_e / 2) as u64,
                 _ => pad_rows * imoe_e as u64 * BF16,
+            };
+            let fug_bytes = if compact_native_scratch {
+                (rows + u64::from(MPF_BM - 1)) * di_l as u64 * BF16
+            } else {
+                fug_bytes
             };
             const ALIGN_BLOCKS: u64 = 64;
             let align_extra = if emit_config::active().moe_align_par && rows >= 1024 {
@@ -2228,8 +2282,8 @@ pub(crate) fn declare_glm_rows_batched(
     let amax = ac(b, "amax.part", dbatch as u64 * AMAX_BLOCKS as u64 * 8);
     // TP peer-mapped partials (§7a) — only under sharding; the host binds these into peer scratch at
     // offset 0 / slot_b so the row-parallel o_proj + MoE/dense down write peer-visible partials that
-    // XReduce sums. zero_h is a persistent zero buffer used as the MoeCombine residual under TP (the
-    // real residual xmid is added AFTER the all-reduce, so it is not summed N times).
+    // XReduce sums. The combine uses a null residual under TP (the real residual xmid is added
+    // AFTER the all-reduce, so it is not summed N times).
     // og_tp is the o_proj partial on BOTH phases — prefill all-reduces a [T,hidden] partial through
     // XReduceTwoShot, so it is row-dimensioned. dg_tp only ever carries the
     // decode FFN partial (the prefill FFN has no kernel), so it stays one row.
@@ -2244,11 +2298,6 @@ pub(crate) fn declare_glm_rows_batched(
     // buffer to everything that reads `bytes`.
     let dg_tp = if tp > 1 {
         ac(b, "dg_tp", rows * h as u64 * BF16)
-    } else {
-        TENSOR_NONE
-    };
-    let zero_h = if tp > 1 {
-        b.tensor_init("act.zero_h", vec![0u8; rows as usize * h as usize * 2])
     } else {
         TENSOR_NONE
     };
@@ -3122,7 +3171,6 @@ pub(crate) fn declare_glm_rows_batched(
         amax,
         og_tp,
         dg_tp,
-        zero_h,
         // Slot A is [0, rows*h*2); slot B starts where it ends. `rows == 1` (a decode-only emit)
         // gives `h*2`, the value every shipped decode blob already carries.
         slot_b: rows as u32 * h * BF16 as u32,
@@ -7620,7 +7668,7 @@ fn emit_glm_moe_ffn_prefill(
                 } else {
                     b.emit(DevOp::MoeCombinePf, all.clone(), &[c_shd, c_d], |d| {
                         d.t[0] = n.dg_tp;
-                        // TENSOR_NONE, not `n.zero_h`. Under TP the combine's residual must be ZERO
+                        // Under TP the combine's residual must be ZERO
                         // (xmid is added after the all-reduce, or XReduce would sum it tp times) —
                         // and `d_moe_combine_pf` ALREADY spells zero as a null pointer
                         // (`residual ? bf2f(residual[i]) : 0.0f`). Naming a [T,H] bf16 buffer of
@@ -8957,7 +9005,7 @@ pub(crate) fn emit_glm_moe_ffn(
     };
     // 34 combine: sum shared + Σ gate·expert (f32 acc, fixed slot order). Under TP shared/part are
     //   PARTIALS, so the combine residual must NOT be xmid (it would be summed N times by XReduce);
-    //   it writes the partial (residual = zero_h) into dg_tp, XReduce all-reduces into n.attn, and a
+    //   it writes the partial (null residual) into dg_tp, XReduce all-reduces into n.attn, and a
     //   Residual then adds the real xmid -> x_out. tp==1 keeps the fused xmid combine (byte-identical).
     let mut deps = Vec::with_capacity(1 + downs.len());
     deps.push(c_shd);
@@ -8966,7 +9014,7 @@ pub(crate) fn emit_glm_moe_ffn(
     if tp > 1 && !no_xr {
         let c_cmb = b.emit(DevOp::MoeCombine, elem_cus(&all, h), &deps, |d| {
             d.t[0] = n.dg_tp;
-            d.t[1] = n.zero_h;
+            d.t[1] = TENSOR_NONE;
             d.t[2] = if raw_output { n.attn } else { n.shared };
             d.t[3] = n.part;
             d.i[0] = h;
@@ -9458,7 +9506,9 @@ fn glm_emit_full(
     // serves every program. max_rows == 1 reproduces `declare_glm` exactly, which is what keeps a
     // decode-only emit byte-identical to one from before this path existed. `dbatch` widens only
     // the KV rings, `in.kvlen`, the lm_head tail and the flash partials — see the declare's doc.
-    let tn = declare_glm_rows_batched(&mut tb, &c, ctx, &layers, max_rows, dbatch, enc);
+    let tn = declare_glm_rows_batched_for_prefill(
+        &mut tb, &c, ctx, &layers, max_rows, dbatch, enc, &pf,
+    );
     let mut tensors = tb.tensors();
     let gen = tb.gen_tensors();
 
