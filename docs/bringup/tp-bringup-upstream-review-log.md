@@ -1642,6 +1642,36 @@ This is a live defect for RAGGED SEAMS generally, not only for row-band: any two
 a `@band{t}` family could desynchronise the same way. Row-band is simply the first pair where one
 sibling never goes ragged and so never re-derives the binding for itself.
 
+## `PLOW_*_DECODE_DENSE_EXACT` passes its TPOT claim on a paired T4, and the T4's FAIL is TTFT drift (2026-09-15, jobs `dxflip-t4r-{a-ctl,b-treat,c-ctl2,d-treat2}`)
+
+Row 100 landed the dense-exact decode twin opt-in on a single T3 (TPOT 37.72/35.93/37.70,
+-1.78 ms, -4.7%). The four-arm paired T4 reproduces that with proper confidence intervals and
+extends it to concurrency 16:
+
+| cell | arm TPOT medians (ctl / treat / ctl2 / treat2) | pooled TPOT effect | floor | out tok/s | twin fires |
+|---|---|---|---|---|---|
+| isl1024-c1 | 37.85 / 36.01 / 37.78 / 36.00 | **-1.802** [-1.892, -1.712] | 0.122 | 25.92 -> 27.2 (**+4.8%**) | 1.000 |
+| isl1024-c16 | 55.01 / 52.19 / 54.67 / 51.88 | **-2.879** [-2.914, -2.846] | 1.023 | 282.2 -> 298 (**+5.6%**) | 1.000 |
+| isl8192-c1 | 42.32 / 41.88 / 42.05 / 41.92 | -0.354 [-0.472, -0.237] | 0.493 | 21.18 -> 21.41 | **0.000** |
+
+Zero failed requests in all arms of all cells, and the controls never fire the twin.
+
+**The TPOT claim holds and is bigger at concurrency.** Both short-context cells beat their
+checkpoint-P floor by more than an order of magnitude, and C16 — which row 100 never measured — is
+the larger win at -2.88 ms and +5.6% out tok/s.
+
+**The scorer's `T4 FAIL` is a TTFT verdict, and the harness fails its own control.** Every FAIL
+line is TTFT, the intervals straddle zero by wide margins (`+3.0 [-28.0, +31.6]` at C16), the
+point effects are -1.7 to +2.0 ms against floors of 1.0 to 8.4 ms, and `ctl2-ctl` is flagged
+`DRIFT (harness suspect)` in all three cells. A control that cannot reproduce itself cannot
+convict the treatment. Read as: TPOT faster beyond floor, TTFT not resolvable by this harness.
+
+**It is not a lever for the 8K goal.** At isl8192-c1 the twin fires 0/4064 times in every arm, so
+the dense-exact program is never selected — exactly what row 100 predicted ("no step of a
+long-prompt workload qualifies"), now measured directly. Its TPOT effect there, -0.35 ms, is
+inside its own 0.49 ms floor. The lever belongs to short-context serving throughput, not to the
+490 ms cell.
+
 ## The 8K goal cell, end to end and CORRECT under mixed traffic, is 512.0 ms (2026-09-15, job `e2e-fixed-8k`)
 
 `stack-t4` measured 509.8 ms cold 8192 TTFT on this packet, but on a binary carrying the `@band`
