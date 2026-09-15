@@ -9,9 +9,6 @@ output="${2:?$usage}"
 precision="${3:?$usage}"
 profile="${4:?$usage}"
 kv_precision="${5:-bf16}"
-# 18K covers a 16K prompt plus decode and keeps Gemma's 1024-byte full-KV
-# head window divisible by gfx942 ROCr's 2 MiB VMM granule.
-max_ctx=18432
 
 [ -n "${IN_NIX_SHELL:-}" ] || {
   echo "FAIL: run through nix develop --command" >&2
@@ -21,6 +18,13 @@ max_ctx=18432
 hf_dir="$(cd "$hf_dir" && pwd)"
 case "$precision" in bf16|fp8) ;; *) echo "FAIL: precision must be bf16 or fp8" >&2; exit 2;; esac
 case "$kv_precision" in bf16|fp8-kv) ;; *) echo "FAIL: KV precision must be bf16 or fp8-kv" >&2; exit 2;; esac
+# Both cover a 16K prompt plus decode. Each full-KV head window is an exact
+# multiple of gfx942 ROCr's 2 MiB VMM granule (1024 B/row BF16, 512 B/row FP8).
+if [ "$kv_precision" = fp8-kv ]; then
+  max_ctx=20480
+else
+  max_ctx=18432
+fi
 case "$profile" in
   c128)
     decode_batch=128
