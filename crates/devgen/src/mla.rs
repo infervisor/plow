@@ -1731,7 +1731,7 @@ struct GlmLW {
     wofold: u32, // DERIVED fused W_uv·W_o (NH*DK -> H), prefill ofold arm only; else NONE
     gpost: u32, // post_attention_layernorm
     // MoE (sparse layers): router + shared expert + the two loader-filled pointer tables.
-    wr_f32: u32, // mlp.gate.derived.f32.weight [E,H] f32, matching vLLM's gate parameter
+    wr: u32, // mlp.gate.weight [E,H] bf16; router accumulation/output remain f32
     bias: u32, // mlp.gate.e_score_correction_bias [E] f32
     shg: u32,  // shared_experts.gate_proj
     shu: u32,  // shared_experts.up_proj
@@ -2821,10 +2821,10 @@ fn declare_glm_rows_batched_for_prefill(
                 TENSOR_NONE
             },
             gpost: t(b, "post_attention_layernorm.weight", h as u64 * BF16),
-            wr_f32: if dense {
+            wr: if dense {
                 TENSOR_NONE
             } else {
-                t(b, "mlp.gate.derived.f32.weight", e as u64 * h as u64 * F32)
+                tw(b, "mlp.gate.weight", e as u64, h as u64)
             },
             bias: if dense {
                 TENSOR_NONE
@@ -7354,7 +7354,7 @@ fn emit_glm_moe_ffn_prefill(
         let cs = b.emit(DevOp::GemmF32, all.clone(), &[dep], |d| {
             d.t[0] = lb;
             d.t[1] = xb;
-            d.t[2] = w.wr_f32;
+            d.t[2] = w.wr;
             d.i[0] = tb;
             d.i[1] = e;
             d.i[2] = h;
@@ -7365,7 +7365,7 @@ fn emit_glm_moe_ffn_prefill(
         let cs = b.emit(DevOp::GemmF32, all.clone(), &[c_rn2], |d| {
             d.t[0] = n.rlogit;
             d.t[1] = n.xn2;
-            d.t[2] = w.wr_f32;
+            d.t[2] = w.wr;
             d.i[0] = t;
             d.i[1] = e;
             d.i[2] = h;
@@ -8290,13 +8290,13 @@ fn emit_glm_moe_ffn_rows(
     // Router score at M = rows, then the PREFILL top-k tail (the decode tail under a token loop,
     // bit-identical per token) and the align/sort that the grouped ops read.
     let c_score = b.emit(
-        DevOp::GemvF32,
-        glm_decode_gemv_cus(&all, DevOp::GemvF32, e, h),
+        DevOp::GemmF32,
+        glm_decode_gemv_cus(&all, DevOp::GemmF32, e, h),
         &[c_rn2],
         |d| {
             d.t[0] = n.rlogit;
             d.t[1] = n.xn2;
-            d.t[2] = w.wr_f32;
+            d.t[2] = w.wr;
             d.i[0] = rows;
             d.i[1] = e;
             d.i[2] = h;
@@ -8773,10 +8773,10 @@ pub(crate) fn emit_glm_moe_ffn(
         "GLM_ROUTER_OLD cannot represent GLM's FP32 router logits"
     );
     let c_router = {
-        let c_score = b.emit(DevOp::GemvF32, router_cus.clone(), &[c_rn2], |d| {
+        let c_score = b.emit(DevOp::GemmF32, router_cus.clone(), &[c_rn2], |d| {
             d.t[0] = n.rlogit;
             d.t[1] = n.xn2;
-            d.t[2] = w.wr_f32;
+            d.t[2] = w.wr;
             d.i[0] = 1;
             d.i[1] = e;
             d.i[2] = h;

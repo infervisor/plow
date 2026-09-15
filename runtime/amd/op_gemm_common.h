@@ -346,7 +346,7 @@ __device__ __forceinline__ unsigned gm_remap(unsigned lin, unsigned n_tiles, uns
 #endif
 template <int BM, int BN, int BK, int WM, int WN, bool NORM, int SWZ = GM_SWZ, int WGM = GM_WGM,
           bool PP = (GM_PP != 0), bool KEXACT = true, bool GLU = false, bool WFP4 = false,
-          bool WFP8BLK = false, bool WFP32 = false, bool CF32 = false
+          bool WFP8BLK = false, bool CF32 = false
 #if PLOW_GLM_FUSE_POST
           , bool ROPE = false
 #endif
@@ -407,8 +407,6 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
     static_assert(!WFP8BLK || !NORM, "block-fp8 weights + fused RMSNorm-A is not emitted");
     static_assert(!WFP8BLK || !GLU, "block-fp8 gate|up is emitted as two GEMMs + Glu, not fused");
     static_assert(!WFP8BLK || !WFP4, "one weight encoding at a time");
-    static_assert(!WFP32 || (!WFP4 && !WFP8BLK && !GLU && !NORM),
-                  "the fp32-expanded weight arm is a plain projection");
     static_assert(!CF32 || (!GLU
 #if PLOW_GLM_FUSE_POST
                             && !ROPE
@@ -528,8 +526,7 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
      * 64x128 231 -> 268, 128x128 317 -> 378, 128x256 359 -> 451.
      * gfx950 is untouched: PLOW_CDNA4 is 1 there, the builtin is real, and DBUF=2 gives the DMA
      * its idle buffer to stream into a cluster ahead. */
-    constexpr bool DIRECT =
-        PLOW_GM_DIRECT_STAGE && !NORM && !GLU && KEXACT && !WFP4 && !WFP8BLK && !WFP32;
+    constexpr bool DIRECT = PLOW_GM_DIRECT_STAGE && !NORM && !GLU && KEXACT && !WFP4 && !WFP8BLK;
     /* Two-deep GLOBAL prefetch, the register-bank analogue of Tensile's PGR2. Only reachable on
      * the single-buffered register-staging path -- with two LDS buffers the DMA already has the
      * idle buffer to stream into, and DIRECT has no register bank to double. */
@@ -616,11 +613,6 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
             } else {                                                                          \
                 _Pragma("unroll") for (int j = 0; j < 8; j++) ra[it * 8 + j] = 0;             \
             }                                                                                 \
-        } else if constexpr (WFP32) {                                                        \
-            const float* wf = reinterpret_cast<const float*>(bsrc);                          \
-            if (r < N) _Pragma("unroll") for (int j = 0; j < 8; j++)                        \
-                rb[it * 8 + j] = f2bf(wf[(size_t)r * K + kk + j]);                            \
-            else _Pragma("unroll") for (int j = 0; j < 8; j++) rb[it * 8 + j] = 0;          \
         } else if constexpr (KEXACT) {                                                        \
             if (r < M) *(bf16v8*)&ra[it * 8] = ld_glob8(as_glob(A) + (size_t)r * K + kk);     \
             else _Pragma("unroll") for (int j = 0; j < 8; j++) ra[it * 8 + j] = 0;            \
@@ -1073,16 +1065,13 @@ __device__ void d_gemm(bf16* C, const bf16* A, const bf16* B, unsigned M, unsign
                                                        nblk, lds);
 }
 
-/* GLM's checkpoint gate is bf16, but vLLM materializes it as fp32 and computes fp32 router
- * logits. Prep writes that exact bf16->fp32 expansion. Loading it back to bf16 here is exact, so
- * the bf16 MFMA products equal fp32 products of the widened operands; only the output store stays
- * fp32. This retains the prefill GEMM throughput shape instead of sending 8192 rows through the
- * scalar decode GEMV. */
-__device__ void d_gemm_f32(float* C, const bf16* A, const float* B, unsigned M, unsigned N,
+/* GLM's gate is stored in BF16. BF16 MFMA products are exact in FP32; retaining the FP32
+ * accumulator at the output matches the reference precision boundary without a duplicate weight. */
+__device__ void d_gemm_f32(float* C, const bf16* A, const bf16* B, unsigned M, unsigned N,
                            unsigned K, unsigned slice, unsigned nblk, bf16* lds) {
     d_gemm_t<GM_BM, GM_BN, GM_BK, GM_WM, GM_WN, false, GM_SWZ, GM_WGM, (GM_PP != 0), true,
-             false, false, false, true, true>((bf16*)C, A, (const bf16*)B, nullptr, nullptr, M, N,
-                                              K, slice, nblk, lds);
+             false, false, false, true>((bf16*)C, A, B, nullptr, nullptr, M, N, K, slice, nblk,
+                                        lds);
 }
 
 /* MXFP4 (w4a16) PREFILL GEMM. A is bf16 activations, W is packed-2/byte fp4 weights (row stride
@@ -1296,9 +1285,9 @@ __device__ void d_gemm_med_rope(bf16* C, const bf16* A, const bf16* B, unsigned 
                                 const float* rcos, const float* rsin, const int* rpos,
                                 unsigned roff) {
     d_gemm_t<GM_MD_BM, GM_MD_BN, GM_MD_BK, GM_WM, GM_WN, false, GM_SWZ, GM_WGM, (GM_PP != 0), true,
-             false, false, false, true>(C, A, B, nullptr, nullptr, M, N, K, slice, nblk, lds,
-                                        nullptr, 0, nullptr, nullptr, nullptr, rcos, rsin, rpos,
-                                        roff);
+             false, false, false, false, true>(C, A, B, nullptr, nullptr, M, N, K, slice, nblk,
+                                               lds, nullptr, 0, nullptr, nullptr, nullptr, rcos,
+                                               rsin, rpos, roff);
 }
 #endif
 __device__ void d_gemm_wide(bf16* C, const bf16* A, const bf16* B, unsigned M, unsigned N,
@@ -5061,6 +5050,24 @@ __device__ void d_gemv_f32(float* __restrict__ C, const bf16* __restrict__ x,
             const float* const wn = W + (size_t)n * K;
             float acc = 0.0f;
             for (unsigned k = lane; k < K; k += PLOW_WAVE) acc += bf2f(xm[k]) * wn[k];
+            acc = wave_sum(acc);
+            if (lane == 0) cm[n] = acc;
+        }
+    }
+}
+
+__device__ void d_gemv_bf16_f32(float* __restrict__ C, const bf16* __restrict__ x,
+                                const bf16* __restrict__ W, unsigned M, unsigned N, unsigned K,
+                                unsigned slice, unsigned nblk) {
+    const unsigned wave = threadIdx.x / PLOW_WAVE;
+    const unsigned lane = threadIdx.x % PLOW_WAVE;
+    for (unsigned m = 0; m < M; m++) {
+        const bf16* const xm = x + (size_t)m * K;
+        float* const cm = C + (size_t)m * N;
+        for (unsigned n = slice * PLOW_WAVES + wave; n < N; n += nblk * PLOW_WAVES) {
+            const bf16* const wn = W + (size_t)n * K;
+            float acc = 0.0f;
+            for (unsigned k = lane; k < K; k += PLOW_WAVE) acc += bf2f(xm[k]) * bf2f(wn[k]);
             acc = wave_sum(acc);
             if (lane == 0) cm[n] = acc;
         }

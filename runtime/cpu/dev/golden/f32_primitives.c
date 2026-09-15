@@ -172,7 +172,7 @@ G_K(g_gemm_f32) {
     (void)ctx;
     float* out = PLOW_CPU_TEN(in, T, 0);
     const plow_bf16* x = PLOW_CPU_TEN(in, T, 1);
-    const float* weight = PLOW_CPU_TEN(in, T, 2);
+    const plow_bf16* weight = PLOW_CPU_TEN(in, T, 2);
     const uint32_t m = in->i[0], n = in->i[1], k = in->i[2];
     uint32_t lo, hi;
     g_range(n, slice, nblk, &lo, &hi);
@@ -181,7 +181,7 @@ G_K(g_gemm_f32) {
             float sum = 0.0f;
             for (uint32_t inner = 0; inner < k; inner++)
                 sum += plow_bf2f(x[(size_t)row * k + inner]) *
-                       weight[(size_t)column * k + inner];
+                       plow_bf2f(weight[(size_t)column * k + inner]);
             out[(size_t)row * n + column] = sum;
         }
     }

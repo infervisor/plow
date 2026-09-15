@@ -192,8 +192,7 @@ fn stream_shape(op: DevOp) -> Option<(u32, u32)> {
     use DevOp::*;
     // (weight streams, half-bytes per weight element)
     Some(match op {
-        Gemv | GemvSz | GemvArgmax | GemvF32 | GemmNorm => (1, 4),
-        GemmF32 => (1, 8),
+        Gemv | GemvSz | GemvArgmax | GemvF32 | GemmNorm | GemmF32 => (1, 4),
         GemvQkv | GemvQkvg => (3, 4),
         GemvGlu | GemvGluSz | GemmGlu => (2, 4),
         GemvFp8 | GemvFp8Blk => (1, 2),

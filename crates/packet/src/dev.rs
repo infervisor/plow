@@ -1994,10 +1994,8 @@ pub enum DevOp {
     /// t3=overlay(f32[overlay_rows,width]) t4=overlay_index(u32[rows])` ·
     /// `i0=rows i1=width i2=vocab i3=overlay_rows`.
     EmbedOverlayBf16 = 179,
-    /// GLM router projection with vLLM's precision boundary. The source checkpoint gate is BF16,
-    /// but prep preserves an FP32-expanded copy because vLLM loads the gate into an FP32 Linear.
-    /// Inputs remain BF16 values widened exactly at multiply; accumulation and output are FP32.
-    /// `t0=C(f32[M,N]) t1=A(bf16[M,K]) t2=W(f32[N,K])` · `i0=M i1=N i2=K`.
+    /// BF16 projection with an FP32 accumulator/output, used for GLM router logits.
+    /// `t0=C(f32[M,N]) t1=A(bf16[M,K]) t2=W(bf16[N,K])` · `i0=M i1=N i2=K`.
     GemmF32 = 180,
 }
 

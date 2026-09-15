@@ -86,25 +86,6 @@ def main():
         n = _write_filtered(lambda w: P.prep_layer(idx, cfg, w, 512, L, 511), path)
         print(f"[lite] layer {L}: {n} derived tensors in {time.time()-t0:.1f}s")
 
-    # Existing complete layer shards predate the FP32 router contract and are intentionally
-    # resumable, so do not rewrite 69 GB of prepared data. A later-sorting sidecar supplies the
-    # exact BF16->FP32 gate expansion and shadows nothing else.
-    sparse = [L for L in layers if L >= cfg.first_k_dense_replace]
-    prepared = P._index_shards(args.out)
-    for L in sparse:
-        name = f"model.layers.{L}.mlp.gate.derived.f32.weight"
-        if name in prepared:
-            continue
-        router_path = os.path.join(args.out, f"zzz-router-f32-{L:05d}.safetensors")
-        def add_router(w, L=L, name=name):
-            gate = P.load_tensor(idx, f"model.layers.{L}.mlp.gate.weight")
-            w.add(name, "F32", [cfg.n_routed_experts, cfg.hidden_size],
-                  cfg.n_routed_experts * cfg.hidden_size * 4,
-                  P.p_f32(gate.float().cpu().numpy()))
-        t0 = time.time()
-        _write_filtered(add_router, router_path)
-        print(f"[lite] layer {L}: fp32 router in {time.time()-t0:.1f}s")
-
     # 3. globals (embed / final norm / lm_head).
     gpath = os.path.join(args.out, "zz-globals.safetensors")
     ok, _ = _shard_ok(gpath)

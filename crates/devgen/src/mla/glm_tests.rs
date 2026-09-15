@@ -612,7 +612,7 @@ fn ref_sequence(use_fp8: bool) -> Vec<u16> {
         Gemv,           // o_proj
         Residual,       // x_mid
         RmsNorm,        // post_attention_layernorm
-        GemvF32,        // router SCORE GEMV (bf16 input, f32-expanded weight and f32 output)
+        GemmF32,        // router score, BF16 operands with FP32 accumulation/output
         MoeRouterTopk,  // router tail: sigmoid+bias+norm_topk+scale (1-CU bit-exact selection)
         GemvGlu,        // shared expert gate|up
         Gemv,           // shared expert down
@@ -2968,7 +2968,7 @@ fn glm_decode_gemm_group_reorders_native_gemms_without_changing_work() {
             .unwrap();
         assert_eq!(
             (b[topk - 3].0, b[topk - 3].1, b[topk - 3].2),
-            (DevOp::GemvF32 as u16, 256, 6144),
+            (DevOp::GemmF32 as u16, 256, 6144),
             "rows={rows}: FP32 router must lead the projection run"
         );
         assert!(
@@ -4074,7 +4074,7 @@ fn glm_seq_par_proj_routes_on_the_band() {
     assert_eq!(score.i[0], tb);
     assert_eq!(name(score.t[1]), "act.xn2@band8192");
     assert_eq!(p.tensors[score.t[0] as usize].bytes, tb as u64 * c.n_exp as u64 * 4);
-    assert_eq!(name(score.t[2]), "model.layers.3.mlp.gate.derived.f32.weight");
+    assert_eq!(name(score.t[2]), "model.layers.3.mlp.gate.weight");
     assert_ne!(router.i[3] & router_flag::F32_LOGIT, 0);
     let ag: Vec<_> = p.insts.iter().filter(|d| is(d, DevOp::XAllGather)).collect();
     assert_eq!(ag.len(), 3, "entry projections, post-attention norm, route table");

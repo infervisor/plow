@@ -464,10 +464,7 @@ mod f32_packet_tests {
     fn glm_router_projection_widens_bf16_inputs_and_keeps_f32_logits() {
         init(Isa::Scalar).unwrap();
         let input = [0x3f81u16, 0x4000, 0xbf80, 0x3f00, 0xc000, 0x4040];
-        let weight = [
-            1.0078125f32, -2.0, 0.5,
-            -0.25, 4.0, 2.0,
-        ];
+        let weight = [0x3f81u16, 0xc000, 0x3f00, 0xbe80, 0x4080, 0x4000];
         let mut logits = [0.0f32; 4];
         let mut table = vec![std::ptr::null_mut(); 3];
         table[0] = logits.as_mut_ptr().cast();
@@ -484,7 +481,7 @@ mod f32_packet_tests {
                 expected[row * 2 + column] = (0..3)
                     .map(|inner| {
                         f32::from_bits(u32::from(input[row * 3 + inner]) << 16)
-                            * weight[column * 3 + inner]
+                            * f32::from_bits(u32::from(weight[column * 3 + inner]) << 16)
                     })
                     .sum();
             }

@@ -11,7 +11,7 @@
 #   - dequantised bf16 q_a_proj / o_proj / shared-expert gate/up/down,
 #   - block-fp8 routed experts (gate/up/down .weight + .weight_scale_inv) copied VERBATIM (fp8 bytes
 #     + f32 scale grids, no dequant),
-#   - bf16 norms + bf16 and fp32-expanded router gate copies + f32 correction bias.
+#   - bf16 norms + router gate.weight + f32 e_score_correction_bias.
 # The rope fold at a FIXED position (index_pos) is the documented milestone-1 simplification
 # single-token validation. Milestone-3 multi-token decode replaces the
 # fold with the dynamic interleaved-RoPE op (kernels branch).
@@ -249,11 +249,9 @@ def prep_layer(idx, cfg, w, L, layer, pos):
         return dict(H=H, NH=NH, DK=DK, DR=DR, dense_inter=cfg.intermediate_size, pos=pos,
                     eps=EPS, scale=QKH ** -0.5)
 
-    # --- router (checkpoint bf16 gate + vLLM-compatible fp32-expanded gate + f32 bias) ---
-    gate = load_tensor(idx, P + "mlp.gate.weight")
-    w.add(P + "mlp.gate.weight", "BF16", [E, H], E * H * 2, p_bf16(gate))
-    w.add(P + "mlp.gate.derived.f32.weight", "F32", [E, H], E * H * 4,
-          p_f32(gate.float().cpu().numpy()))
+    # --- router (bf16 gate + f32 correction bias) ---
+    w.add(P + "mlp.gate.weight", "BF16", [E, H], E * H * 2,
+          p_bf16(load_tensor(idx, P + "mlp.gate.weight")))
     w.add(P + "mlp.gate.e_score_correction_bias", "F32", [E], E * 4,
           p_f32(load_tensor(idx, P + "mlp.gate.e_score_correction_bias").float().cpu().numpy()))
 
