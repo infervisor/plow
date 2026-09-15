@@ -663,9 +663,9 @@ fn the_rung_plan_is_per_layer_and_names_what_is_emitted() {
         .collect();
     assert_eq!(
         done.len(),
-        5,
-        "attention projections, output projection, the output all-reduce, ffn_norm and the shared \
-         expert are emitted; this count is the \
+        7,
+        "mhc_pre/mhc_post, the attention projections, the output projection, its all-reduce, \
+         ffn_norm and the shared expert are emitted; this count is the \
          thing that grows as bricks land, so it is asserted exactly rather than as a lower bound"
     );
     // And the rung still REFUSES, because a partial blob would run and produce garbage.
@@ -821,4 +821,72 @@ fn the_shared_expert_uses_the_clamped_swiglu_not_plain_silu() {
         p.waits[d.wait_ofs as usize..d.wait_ofs as usize + d.wait_len as usize].to_vec()
     };
     assert_eq!(gates(gate), gates(up), "gate and up are parallel, not serialised");
+}
+
+/// V4.1's mHC is GLM-5.3's hyper-connection, and the emit must carry V4.1's OWN constants.
+///
+/// The two families agree today (`hc_mult` 4, 20 Sinkhorn iterations, `hc_eps` 1e-6), which is why
+/// the algorithm is shared -- but agreement is a fact about these two checkpoints, not a law. GLM
+/// had the numbers inlined as literals; if V4.1 silently inherited them, a checkpoint that changed
+/// `hc_mult` would read the wrong rows of `hc_*_fn` and still produce output. So this asserts the
+/// emitted packet against the CONFIG, not against 4 and 20.
+#[test]
+fn the_mhc_pair_is_glm53s_hyper_connection_at_v41s_own_constants() {
+    let Some((cfg, _)) = checkpoint() else {
+        return;
+    };
+    let _guard = crate::test_env::env_guard();
+    let mut b = Builder::new(304);
+    let w = super::dsv41::declare_dsv41_weights(&mut b, &cfg, &[0], cfg.o_groups);
+    let t = 512u32;
+    let m = super::dsv41::declare_dsv41_mhc(&mut b, &cfg, t);
+    let c_pre = super::dsv41::emit_dsv41_mhc_pre(&mut b, &cfg, &w, &m, 0, false, 0, t, &[]);
+    let raw = b.tensor("act.raw", (t as u64) * (cfg.hidden as u64) * 2);
+    super::dsv41::emit_dsv41_mhc_post(&mut b, &cfg, &m, raw, 0, t, &[c_pre]);
+    let p = b.finish();
+
+    let mix = (2 + cfg.hc_mult) * cfg.hc_mult;
+    let gv = p
+        .insts
+        .iter()
+        .find(|d| d.op == DevOp::GemvF32 as u16)
+        .expect("the mix GEMV");
+    assert_eq!(gv.i[1], mix, "the mix matrix is (2 + hc_mult) * hc_mult rows");
+    assert_eq!(
+        gv.i[2],
+        cfg.hc_mult * cfg.hidden,
+        "and it reads the whole expanded residual, hc_mult copies of hidden"
+    );
+
+    let pre = p
+        .insts
+        .iter()
+        .find(|d| d.op == DevOp::HyperConnPre as u16)
+        .expect("HyperConnPre");
+    assert_eq!(pre.i[1], cfg.hc_mult, "hc_mult from the config");
+    assert_eq!(pre.i[2], cfg.hidden);
+    assert_eq!(
+        pre.i[3], cfg.hc_sinkhorn_iters,
+        "Sinkhorn iterations from the config, not GLM's inlined 20"
+    );
+    assert_eq!(pre.f[0], cfg.eps);
+    assert_eq!(pre.f[1], cfg.raw.hc_eps, "hc_eps is its own epsilon, not rms_norm_eps");
+    // rms_norm_eps is 1e-20 on this checkpoint and hc_eps is 1e-6 -- 14 orders apart, so
+    // confusing them is not a rounding difference.
+    assert_ne!(cfg.eps, cfg.raw.hc_eps);
+
+    let post = p
+        .insts
+        .iter()
+        .find(|d| d.op == DevOp::HyperConnPost as u16)
+        .expect("HyperConnPost");
+    assert_eq!(post.t[1], raw, "the sublayer output goes back through POST");
+    assert_eq!(
+        [post.t[0], post.t[2]],
+        [m.residual[1], m.residual[0]],
+        "POST writes the OTHER residual copy: it mixes across all hc_mult rows, so writing in \
+         place would read rows it had already overwritten"
+    );
+    assert_eq!(post.i[1], cfg.hc_mult);
+    assert_eq!(post.i[2], cfg.hidden);
 }

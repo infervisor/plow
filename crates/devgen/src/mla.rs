@@ -599,6 +599,109 @@ fn declare_glm53(b: &mut Builder, c: &GlmCfg, rows: u32, dbatch: u32, pos: u32) 
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Everything the mHC / hyper-connection pair reads and writes, as handles.
+///
+/// Split out from `GlmCfg`/`Glm53State` so DeepSeek-V4.1 can emit the SAME op pair against its own
+/// tensors. That is not a coincidence to be papered over: V4.1's `hc_mult` is 4, its
+/// `hc_sinkhorn_iters` is 20 and its `hc_eps` is 1e-6 -- the exact constants GLM-5.3 had inlined as
+/// literals -- so the two families run one algorithm and this is it, with the literals promoted to
+/// arguments so neither family can drift from the other by accident.
+pub(crate) struct MhcHandles {
+    /// `hc_{attn,ffn}_fn`, f32 `[mix][hc_mult][hidden]`.
+    pub(crate) fn_w: u32,
+    /// `hc_{attn,ffn}_base`, f32 `[mix]`.
+    pub(crate) base: u32,
+    /// `hc_{attn,ffn}_scale`, f32 `[3]`.
+    pub(crate) scale: u32,
+    /// The expanded residual stream, `[rows][hc_mult][hidden]`.
+    pub(crate) residual: u32,
+    /// Scratch: the `[rows][mix]` mix matrix, then the pre-op's two outputs.
+    pub(crate) mixes: u32,
+    pub(crate) post_mix: u32,
+    pub(crate) comb_mix: u32,
+    /// Where the collapsed sublayer input lands.
+    pub(crate) layer_input: u32,
+}
+
+/// The mHC PRE half: mix the `hc_mult` residual copies down into one sublayer input.
+///
+/// `mix` is `(2 + hc_mult) * hc_mult` -- `pre` at `[0, hc_mult)`, `post` at `[hc_mult, 2*hc_mult)`
+/// and the flattened `[hc_mult, hc_mult]` combine matrix after them (`nn-graph/src/op.rs:287`).
+/// Passing a `mix` computed any other way silently reads the wrong rows of `fn_w`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_mhc_pre(
+    b: &mut Builder,
+    h: &MhcHandles,
+    hidden: u32,
+    hc_mult: u32,
+    sinkhorn: u32,
+    eps: f32,
+    hc_eps: f32,
+    rows: u32,
+    deps: &[u32],
+) -> u32 {
+    let mix = (2 + hc_mult) * hc_mult;
+    let cm = b.emit(DevOp::GemvF32, b.all(), deps, |d| {
+        d.t[0] = h.mixes;
+        d.t[1] = h.residual;
+        d.t[2] = h.fn_w;
+        d.i[0] = rows;
+        d.i[1] = mix;
+        d.i[2] = hc_mult * hidden;
+    });
+    b.emit(
+        DevOp::HyperConnPre,
+        (0..rows.min(b.n_cu())).collect(),
+        &[cm],
+        |d| {
+            d.t[0] = h.post_mix;
+            d.t[1] = h.comb_mix;
+            d.t[2] = h.layer_input;
+            d.t[3] = h.mixes;
+            d.t[4] = h.residual;
+            d.t[5] = h.scale;
+            d.t[6] = h.base;
+            d.i[0] = rows;
+            d.i[1] = hc_mult;
+            d.i[2] = hidden;
+            d.i[3] = sinkhorn;
+            d.f[0] = eps;
+            d.f[1] = hc_eps;
+        },
+    )
+}
+
+/// The mHC POST half: scatter the sublayer's output back across the `hc_mult` residual copies.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_mhc_post(
+    b: &mut Builder,
+    out: u32,
+    raw: u32,
+    residual: u32,
+    post_mix: u32,
+    comb_mix: u32,
+    hidden: u32,
+    hc_mult: u32,
+    rows: u32,
+    deps: &[u32],
+) -> u32 {
+    b.emit(
+        DevOp::HyperConnPost,
+        (0..rows.min(b.n_cu())).collect(),
+        deps,
+        |d| {
+            d.t[0] = out;
+            d.t[1] = raw;
+            d.t[2] = residual;
+            d.t[3] = post_mix;
+            d.t[4] = comb_mix;
+            d.i[0] = rows;
+            d.i[1] = hc_mult;
+            d.i[2] = hidden;
+        },
+    )
+}
+
 fn emit_glm53_hc_pre(
     b: &mut Builder,
     c: &GlmCfg,
@@ -610,34 +713,17 @@ fn emit_glm53_hc_pre(
     dep: u32,
 ) -> u32 {
     let w = &s.hc[layer];
-    let cm = b.emit(DevOp::GemvF32, b.all(), &[dep], |d| {
-        d.t[0] = s.mixes;
-        d.t[1] = residual;
-        d.t[2] = if ffn { w.ffn_fn } else { w.attn_fn };
-        d.i[0] = rows;
-        d.i[1] = 24;
-        d.i[2] = 4 * c.hidden;
-    });
-    b.emit(
-        DevOp::HyperConnPre,
-        (0..rows.min(b.n_cu())).collect(),
-        &[cm],
-        |d| {
-            d.t[0] = s.post_mix;
-            d.t[1] = s.comb_mix;
-            d.t[2] = s.layer_input;
-            d.t[3] = s.mixes;
-            d.t[4] = residual;
-            d.t[5] = if ffn { w.ffn_scale } else { w.attn_scale };
-            d.t[6] = if ffn { w.ffn_base } else { w.attn_base };
-            d.i[0] = rows;
-            d.i[1] = 4;
-            d.i[2] = c.hidden;
-            d.i[3] = 20;
-            d.f[0] = c.eps;
-            d.f[1] = 1e-6;
-        },
-    )
+    let h = MhcHandles {
+        fn_w: if ffn { w.ffn_fn } else { w.attn_fn },
+        base: if ffn { w.ffn_base } else { w.attn_base },
+        scale: if ffn { w.ffn_scale } else { w.attn_scale },
+        residual,
+        mixes: s.mixes,
+        post_mix: s.post_mix,
+        comb_mix: s.comb_mix,
+        layer_input: s.layer_input,
+    };
+    emit_mhc_pre(b, &h, c.hidden, 4, 20, c.eps, 1e-6, rows, &[dep])
 }
 
 fn emit_glm53_hc_post(
@@ -650,20 +736,17 @@ fn emit_glm53_hc_post(
     rows: u32,
     dep: u32,
 ) -> u32 {
-    b.emit(
-        DevOp::HyperConnPost,
-        (0..rows.min(b.n_cu())).collect(),
+    emit_mhc_post(
+        b,
+        out,
+        raw,
+        residual,
+        s.post_mix,
+        s.comb_mix,
+        c.hidden,
+        4,
+        rows,
         &[dep],
-        |d| {
-            d.t[0] = out;
-            d.t[1] = raw;
-            d.t[2] = residual;
-            d.t[3] = s.post_mix;
-            d.t[4] = s.comb_mix;
-            d.i[0] = rows;
-            d.i[1] = 4;
-            d.i[2] = c.hidden;
-        },
     )
 }
 

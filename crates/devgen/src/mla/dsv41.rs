@@ -573,6 +573,108 @@ pub(crate) fn emit_dsv41_attn_proj(
     (act, c_kv)
 }
 
+/// The mHC residual stream and its scratch, shared by every layer.
+///
+/// V4.1's mHC is GLM-5.3's hyper-connection: the same `HyperConnPre`/`HyperConnPost` pair over the
+/// same constants (`hc_mult` 4, 20 Sinkhorn iterations, `hc_eps` 1e-6), so this binds V4.1's
+/// tensors to [`super::emit_mhc_pre`]/[`super::emit_mhc_post`] rather than emitting a second copy
+/// of the algorithm.
+///
+/// The residual is a PING-PONG pair, not one buffer. Each sublayer reads one copy and the POST
+/// writes the other, because `HyperConnPost` mixes the sublayer's output back across all `hc_mult`
+/// copies -- writing in place would have it read rows it had already overwritten.
+pub(crate) struct Dsv41Mhc {
+    pub(crate) residual: [u32; 2],
+    pub(crate) layer_input: u32,
+    pub(crate) mixes: u32,
+    pub(crate) post_mix: u32,
+    pub(crate) comb_mix: u32,
+}
+
+/// Declare the mHC stream for `t` rows. `mix` is `(2 + hc_mult) * hc_mult`, the same derivation
+/// `dsv41_layer_tensors` sizes `hc_*_fn` with -- one formula, so the weight and the scratch cannot
+/// disagree about how many mix rows there are.
+pub(crate) fn declare_dsv41_mhc(b: &mut Builder, c: &Dsv41Cfg, t: u32) -> Dsv41Mhc {
+    let (r, n, w) = (t as u64, c.hc_mult as u64, c.hidden as u64);
+    let mix = (2 + n) * n;
+    Dsv41Mhc {
+        residual: [
+            b.tensor("act.hc_residual_a", r * n * w * 2),
+            b.tensor("act.hc_residual_b", r * n * w * 2),
+        ],
+        layer_input: b.tensor("act.hc_layer_input", r * w * 2),
+        mixes: b.tensor("act.hc_mixes", r * mix * 4),
+        post_mix: b.tensor("act.hc_post_mix", r * n * 4),
+        comb_mix: b.tensor("act.hc_comb_mix", r * n * n * 4),
+    }
+}
+
+/// The mHC PRE half for one sublayer: collapse the residual copies into `m.layer_input`.
+///
+/// `ffn` picks which of the layer's TWO mHC weight sets to use. Every layer carries both
+/// (`hc_attn_*` and `hc_ffn_*`), which is why there is no mHC-free block to extract from this
+/// model and why the rung has to emit it before anything downstream is meaningful.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_dsv41_mhc_pre(
+    b: &mut Builder,
+    c: &Dsv41Cfg,
+    w: &Dsv41Weights,
+    m: &Dsv41Mhc,
+    l: u32,
+    ffn: bool,
+    ri: usize,
+    t: u32,
+    deps: &[u32],
+) -> u32 {
+    let side = if ffn { "ffn" } else { "attn" };
+    let h = super::MhcHandles {
+        fn_w: w.get(l, &format!("hc_{side}_fn")),
+        base: w.get(l, &format!("hc_{side}_base")),
+        scale: w.get(l, &format!("hc_{side}_scale")),
+        residual: m.residual[ri],
+        mixes: m.mixes,
+        post_mix: m.post_mix,
+        comb_mix: m.comb_mix,
+        layer_input: m.layer_input,
+    };
+    super::emit_mhc_pre(
+        b,
+        &h,
+        c.hidden,
+        c.hc_mult,
+        c.hc_sinkhorn_iters,
+        c.eps,
+        c.raw.hc_eps,
+        t,
+        deps,
+    )
+}
+
+/// The mHC POST half: mix `raw` back across the residual copies, into the OTHER buffer.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_dsv41_mhc_post(
+    b: &mut Builder,
+    c: &Dsv41Cfg,
+    m: &Dsv41Mhc,
+    raw: u32,
+    ri: usize,
+    t: u32,
+    deps: &[u32],
+) -> u32 {
+    super::emit_mhc_post(
+        b,
+        m.residual[ri ^ 1],
+        raw,
+        m.residual[ri],
+        m.post_mix,
+        m.comb_mix,
+        c.hidden,
+        c.hc_mult,
+        t,
+        deps,
+    )
+}
+
 /// The o_proj TP partial's tensor name, fixed by `plowrt`'s peer-slot table (slot 0).
 ///
 /// `crates/plowrt/src/exec/amd.rs` matches this string literally to bind the tensor into the peer
@@ -823,7 +925,7 @@ pub(crate) enum Part {
 /// completable long before the whole model is.
 pub(crate) fn dsv41_layer_parts(c: &Dsv41Cfg, l: u32) -> Vec<(&'static str, Part)> {
     let mut p = vec![
-        ("mhc_pre (ops 128/129)", Part::Todo),
+        ("mhc_pre (ops 128/129)", Part::Done),
         ("attn_norm + q_a/q_b/wkv projections (op 184)", Part::Done),
     ];
     if c.kv_source.contains(&l) {
@@ -841,7 +943,7 @@ pub(crate) fn dsv41_layer_parts(c: &Dsv41Cfg, l: u32) -> Vec<(&'static str, Part
     }
     p.push(("moe router + routed experts (ops 85/86, MXFP4)", Part::Todo));
     p.push(("shared expert (op 184 + clamped SwiGLU)", Part::Done));
-    p.push(("mhc_post", Part::Todo));
+    p.push(("mhc_post", Part::Done));
     p
 }
 
