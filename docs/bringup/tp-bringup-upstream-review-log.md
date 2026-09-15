@@ -1642,6 +1642,49 @@ This is a live defect for RAGGED SEAMS generally, not only for row-band: any two
 a `@band{t}` family could desynchronise the same way. Row-band is simply the first pair where one
 sibling never goes ragged and so never re-derives the binding for itself.
 
+## The encode split does NOT survive pairing, and a T4 that scores only its controls can be fooled (2026-09-15, job `encode-t4`)
+
+`hostpath-probe` put `PLOW_ENCODE_THREADS=32` at -4.8 ms and said it needed a real A/B to claim.
+The four-arm paired T4, 32 prompts per arm at isl8192-c1 on the stack packet:
+
+| arm | knobs confirmed live | median TTFT | mean | p99 |
+|---|---|---|---|---|
+| `ctl` | `encode_fast: false, encode_threads: None` | 498.52 | 509.99 | 682.21 |
+| `treat` | `encode_fast: true, encode_threads: Some(32)` | 498.26 | 503.57 | 582.53 |
+| `ctl2` | `encode_fast: false, encode_threads: None` | 498.64 | 500.78 | 537.39 |
+| `treat2` | `encode_fast: true, encode_threads: Some(32)` | 492.67 | 497.79 | 536.88 |
+
+The scorer printed `VERDICT: REAL ... -3.11 ms`. **That verdict is wrong and the arms show why.**
+
+* The two CONTROLS agree to **0.12 ms**.
+* The two arms of the SAME TREATMENT disagree by **5.59 ms** — 47x the control drift.
+* Against the control mean, `treat` is **-0.32 ms** (nothing at all) and `treat2` is **-5.91 ms**.
+  The reported -3.11 is one null arm averaged with one outlier arm.
+* The p99 tail falls monotonically with RUN ORDER across the whole job: 682 -> 583 -> 537 -> 537.
+  Arm position is confounded with treatment, and the two controls happen to agree at the median
+  while their distributions do not.
+
+**Verdict: not convictable.** The encode split is neither established nor refuted at 8192; what is
+established is that this measurement cannot tell. It is also worth noting the knobs were confirmed
+live in every arm (the probe greps the resolved config), so this is not a silently-unset arm.
+
+**The design flaw, fixed.** The probe floored the effect on the control-to-control gap alone. That
+is only half the floor: two arms of the same treatment must also agree, or an outlier in one of
+them becomes an "effect". The scorer now computes `tspread = |treat - treat2|`, floors on
+`max(drift, tspread)`, and refuses the comparison outright when `tspread > 3 * drift`. **Every
+other four-arm T4 in this campaign that scored its floor from controls only is open to the same
+error** — `dxflip`'s scorer computes its P floor from `|med ctl - med ctl2| + 2*max(MAD)`, which
+has the same blind spot, though its TPOT effects (-1.8 and -2.9 ms against floors of 0.12 and 1.02)
+are large enough and its two treat arms close enough (36.007 vs 35.997; 52.190 vs 51.875) that the
+conclusion there survives the stricter rule.
+
+**Where this leaves the goal.** The end-to-end cell is 512.0 ms against 490, and the host path is
+now closed as a route to it: enqueue is off the critical path by construction, the kernarg ring
+must stay in VRAM (removing it costs +17 ms of enqueue), and the encode split cannot be shown to
+help. Tiles are closed. **The remaining 22 ms has to come out of the 431 ms drain — the prefill
+chunk on the GPU** — which is where tasks #25 (FP8 block-scale prefill GEMMs, -70..95 ms/chunk
+projected) and #26 (sequence-parallel collective seams, -150 ms/chunk projected) already point.
+
 ## The host path has about 5 ms in it, not 33, and the VRAM kernarg ring must stay (2026-09-15, job `hostpath-probe`)
 
 The 22 ms gap to 490 needed a lever structurally disjoint from everything already in the packet,
