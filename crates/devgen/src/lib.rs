@@ -8882,10 +8882,10 @@ fn emit_dense_gqa(
         }
     }
 
-    // Placement preserves the ordered segment as the outer queue axis and adds one window per
-    // physical L2 domain inside it. The gfx942 object recipe now ships the matching prefill axis,
-    // so the model-level default can apply to both phases without an environment-only exception.
-    let l2_place_prefill = ecfg.l2_place_prefill;
+    // Dense-GQA AMD prefill placement remains explicit until that path is separately qualified.
+    // GLM has its own placed builder and default below in `mla.rs`.
+    let l2_place_prefill = ecfg.l2_place_prefill
+        && (!amd || std::env::var_os("PLOW_L2_PLACE_PREFILL").is_some());
     let mut progs = Vec::new();
     let mut tlist = Vec::new();
     let mut hetero_progs: Vec<hetero::ProgPlan> = Vec::new();

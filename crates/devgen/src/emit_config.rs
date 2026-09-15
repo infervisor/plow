@@ -819,8 +819,8 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_PF_WIDE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_pf_wide: bool,
 
-    /// Per-XCD CU placement for the GLM prefill chain.
-    #[arg(long, env = "PLOW_GLM_PLACE_PF", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    /// Per-XCD CU placement for the GLM prefill chain. Default on; pass `=0` for rollback.
+    #[arg(long, env = "PLOW_GLM_PLACE_PF", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_place_pf: bool,
 
     /// Band count for a prefill TP seam (2..=8; unset/1 = the unbanded emit).
@@ -1343,7 +1343,7 @@ impl EmitConfig {
             dense_pf_ns: env_u32("PLOW_DENSE_PF_NS"),
             pf_floor: env_bool("PLOW_PF_FLOOR"),
             glm_pf_wide: env_opt_out("PLOW_GLM_PF_WIDE"),
-            glm_place_pf: env_bool("PLOW_GLM_PLACE_PF"),
+            glm_place_pf: env_opt_out("PLOW_GLM_PLACE_PF"),
             glm_xr_band: env_u32("PLOW_GLM_XR_BAND"),
             glm_xr_band_cus: env_u32("PLOW_GLM_XR_BAND_CUS"),
             attnres_decode_mwg: env_u32("PLOW_ATTNRES_DECODE_MWG"),
