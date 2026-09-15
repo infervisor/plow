@@ -2086,6 +2086,7 @@ op 180 computes, and turns §12.10's three READ claims into measured ones:
 | the same with a nonzero `ape` | max err 1.65 |
 | ratio-1 (layer 20) as a plain projection + norm | **max err 0.000e+00** |
 | fake-quant with an E4M3 scale vs a power-of-two scale, both fp4 at block 16 | max err 0.875, **15.3% of latent amax** |
+| quant span `d` vs `d - rd` (rope tail left bf16) | max err 0.406 |
 
 So: op 180's pooling, its per-channel slot softmax and its post-norm ARE V4.1's compressor once
 `ape` is omitted and the overlap transform is off -- exactly, not approximately. `ape` is not
@@ -2097,10 +2098,31 @@ That also fixes the tolerance question a hardware test has to answer: the epilog
 (fake-quant vs the unquantized latent is 0.75 here), so a test asserts against the QUANTIZED
 reference, not the pre-quant latent.
 
+**Three kernel differences, not one.** §12.10 named the scale format. Reading op 180's body against
+the reference, with the oracle to price each one, there are three, and all three are in the
+epilogue rather than the pooling:
+
+  1. **Scale format.** `plow_round_scale` rounds to a power of two (V4); V4.1 wants E4M3.
+     Worth 15.3% of the latent's amax.
+  2. **Quant span.** op 180's attention arm quantizes `[0, d - rd)` -- *"rope dims stay bf16 for
+     positional precision"*, citing V4's `model.py:510`. V4.1 quantizes the WHOLE latent
+     (`fp4_act_quant(latent, 16, True, ...)`, no slice, `model.py:760`), and `_window_kv`'s own
+     docstring says the window K is *"quantized over the whole post-RoPE vector, RoPE tail
+     included"*. Worth 0.406 here.
+  3. **No tap between norm and rope.** op 180's body is pool -> norm -> rope -> quant -> store with
+     no exit in the middle. V4.1's `Compressor.forward` **returns the latent before RoPE** because
+     the indexer consumes the unrotated form, and only then does `Attention` rope and quantize it
+     (`_compress_kv`, 738-762). So the 4 kv_source layers cannot get their index keys out of op 180
+     as it stands -- it needs a stop-after-norm mode, or to be split in two.
+
+(1) and (2) are small, local and now covered by the oracle. (3) is a factorization change, and it
+is the one that would have been found late and painfully: everything upstream of it matches
+exactly, so an emit built on op 180 would work right up until the indexer needed its input.
+
 **What this changes.** "Nothing can be signed off on numerics" was the stated reason for not
 building the emit. It is no longer true for the compressor, and the same harness extends to the
 indexer and the gather -- both are plain PyTorch in the reference. The bar now exists; what remains
-is the work in §12.10 against it.
+is the work in §12.10 against it, plus these three.
 
 ### 12.2 What is still not demonstrated
 

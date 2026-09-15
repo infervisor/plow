@@ -140,12 +140,26 @@ def main():
     d_q = (q_e4m3.float() - lat.float()).abs().max().item()
     print(f"[5] fake-quant(e4m3) vs unquantized latent                : max|err| = {d_q:.3e}")
 
+    # THE QUANT SPAN. op 180's attention arm quantizes [0, d-rd) only -- "rope dims stay bf16
+    # for positional precision", citing V4's model.py:510. V4.1 quantizes the WHOLE latent:
+    # `fp4_act_quant(latent, 16, True, ...)` with no slice (model.py:760), and `_window_kv`'s
+    # own docstring says the window K is "quantized over the whole post-RoPE vector, RoPE tail
+    # included" (701). Rope dims left in bf16 are simply not quantized, so they differ by the
+    # full quantization error on that tail.
+    full = fake_quant(lat, QBLK, "e4m3")
+    partial = lat.float().clone()
+    partial[..., : D - RD] = fake_quant(lat[..., : D - RD], QBLK, "e4m3").float()
+    d_span = (full.float() - partial).abs().max().item()
+    print(f"[6] quant span d vs d-rd (rope tail left bf16)            : max|err| = {d_span:.3e}")
+    ok5 = d_span > 1e-3
+
     print()
     checks = {
         "op180 with ape=0, coff=1 IS V4.1's compressor": ok1,
         "ape is not zero-equivalent (so it must be omitted, not passed)": ok2,
         "ratio 1 is a plain projection with no gate": ok3,
         "the scale format is a REAL difference, not a rounding detail": ok4,
+        "the quant SPAN differs too: V4.1 quantizes the rope tail, V4 does not": ok5,
     }
     for k, v in checks.items():
         print(f"  {'PASS' if v else 'FAIL'}  {k}")
