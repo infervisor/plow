@@ -661,7 +661,12 @@ fn the_rung_plan_is_per_layer_and_names_what_is_emitted() {
         .iter()
         .filter(|(_, st)| *st == super::dsv41::Part::Done)
         .collect();
-    assert_eq!(done.len(), 1, "the projection chain is the one part that is emitted");
+    assert_eq!(
+        done.len(),
+        2,
+        "the attention projections and the output projection are emitted; this count is the \
+         thing that grows as bricks land, so it is asserted exactly rather than as a lower bound"
+    );
     // And the rung still REFUSES, because a partial blob would run and produce garbage.
     let err = super::dsv41::dsv41_emit_block_plan(&cfg, plain).unwrap_err();
     assert!(err.contains("fluent-looking garbage"), "the refusal must say why: {err}");
@@ -669,4 +674,64 @@ fn the_rung_plan_is_per_layer_and_names_what_is_emitted() {
         err.contains("kernels are NOT the gap"),
         "and must not read as a kernel gap, since ops 180-184 all pass on gfx942: {err}"
     );
+}
+
+/// The output projection at TP8, where the grouped LoRA costs nothing extra.
+///
+/// `heads / o_groups` is 64/8 = 8, so one rank owns exactly one group: its heads are
+/// `o_group_in_features` = 4096 wide, its `wo_a` slice is [1024, 4096], and the GEMM is ordinary.
+/// The group count and the TP degree being the same number is what makes the block-diagonal
+/// structure free in the configuration this model is actually served in.
+#[test]
+fn the_output_projection_is_two_ordinary_gemms_at_tp8() {
+    let Some((cfg, _)) = checkpoint() else {
+        return;
+    };
+    let _guard = crate::test_env::env_guard();
+    let (groups, orow, ocol) = cfg.wo_a_groups();
+    assert_eq!(groups, 8);
+    assert_eq!(ocol, cfg.heads * cfg.head_dim / groups, "one rank's share of the heads");
+    let mut b = Builder::new(304);
+    let w = super::dsv41::declare_dsv41_weights(&mut b, &cfg, &[0]);
+    let all: Vec<u32> = (0..304u32).collect();
+    let t = 512u32;
+    let attn_out = b.tensor("act.attn_out", (t as u64) * (ocol as u64) * 2);
+    let (act, _) =
+        super::dsv41::emit_dsv41_attn_out(&mut b, &cfg, &w, &all, 0, groups, attn_out, t, &[]);
+    let p = b.finish();
+    let g: Vec<_> = p
+        .insts
+        .iter()
+        .filter(|d| d.op == DevOp::GemmFp8Mx as u16)
+        .collect();
+    assert_eq!(g.len(), 2, "wo_a for this rank's group, then wo_b");
+    let oa = g.iter().find(|d| d.t[0] == act.o_a).unwrap();
+    assert_eq!([oa.i[1], oa.i[2]], [orow, ocol], "wo_a is [o_lora_rank, one group's heads]");
+    let ob = g.iter().find(|d| d.t[0] == act.o).unwrap();
+    assert_eq!(
+        [ob.i[1], ob.i[2]],
+        [cfg.hidden, cfg.wo_b_in()],
+        "wo_b reads every group's LoRA output concatenated"
+    );
+    assert_eq!(cfg.wo_b_in(), groups * orow, "which is o_groups * o_lora_rank");
+}
+
+/// At TP1 it must REFUSE, not silently do one eighth of the work.
+///
+/// Eight GEMMs need eight weight handles, and the tensor table binds a name to a WHOLE checkpoint
+/// tensor -- there is no sub-tensor view. Inventing a name like `attn.wo_a.weight.g3` would match
+/// no shard and the loader's answer to that has historically been a zero fill, so the layer would
+/// compute from zeros and still produce output.
+#[test]
+#[should_panic(expected = "emit_dsv41_out_lora_tp1")]
+fn the_output_projection_refuses_at_tp1_rather_than_doing_one_group() {
+    let Some((cfg, _)) = checkpoint() else {
+        panic!("emit_dsv41_out_lora_tp1 (checkpoint absent, refusing vacuously)");
+    };
+    let _guard = crate::test_env::env_guard();
+    let mut b = Builder::new(304);
+    let w = super::dsv41::declare_dsv41_weights(&mut b, &cfg, &[0]);
+    let all: Vec<u32> = (0..304u32).collect();
+    let attn_out = b.tensor("act.attn_out", 512 * 4096 * 2);
+    super::dsv41::emit_dsv41_attn_out(&mut b, &cfg, &w, &all, 0, 1, attn_out, 512, &[]);
 }

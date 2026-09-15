@@ -443,6 +443,100 @@ pub(crate) fn emit_dsv41_attn_proj(
     (act, c_kv)
 }
 
+/// Scratch for the output side: the per-group LoRA output and the projected residual.
+pub(crate) struct Dsv41OutAct {
+    /// This rank's output-LoRA group, `[T][o_lora_rank]` bf16.
+    pub(crate) o_a: u32,
+    /// `wo_b`'s input: every group's LoRA output concatenated, `[T][o_groups * o_lora_rank]` bf16.
+    /// At TP > 1 this is the all-gather destination; at TP 1 `o_a` IS the whole of it.
+    pub(crate) o_cat: u32,
+    /// The projected residual contribution, `[T][hidden]` bf16.
+    pub(crate) o: u32,
+}
+
+/// Emit the attention OUTPUT projection: the grouped LoRA down-projection then `wo_b`.
+///
+/// # The grouped LoRA is free at TP8, and that is not a coincidence
+///
+/// `wo_a` is block-diagonal over `o_groups` -- `[8192, 4096]` is 8 stacked `[1024, 4096]`, and the
+/// reference spells it `einsum("bsgd,grd->bsgr")`. A single dense GEMM CANNOT do that: a dense
+/// `[T, 32768] x [8192, 32768]` would need a weight 8x larger than the one on disk, and the
+/// missing 7/8 is exactly the block-diagonal saving.
+///
+/// But `heads / o_groups` is `64 / 8` = 8, so at **TP8 one rank owns exactly one group**: its
+/// share of the heads is `o_group_in_features` = 4096 wide, its slice of `wo_a` is `[1024, 4096]`,
+/// and the GEMM is ORDINARY. The group count and the tensor-parallel degree are the same number,
+/// so the structure that would need 8 GEMMs at TP1 needs one per rank at TP8 -- which is the
+/// configuration this model is served in.
+///
+/// At TP1 this refuses rather than pretending. Eight GEMMs would need eight weight handles, and
+/// the tensor table binds a name to a whole checkpoint tensor -- there is no sub-tensor view -- so
+/// a TP1 path needs either a grouped-GEMM opcode or a loader that can bind a slice. Neither
+/// exists, and inventing a name like `wo_a.g3` would bind nothing and read zeros.
+pub(crate) fn emit_dsv41_attn_out(
+    b: &mut Builder,
+    c: &Dsv41Cfg,
+    w: &Dsv41Weights,
+    cus: &[u32],
+    l: u32,
+    tp: u32,
+    attn_out: u32,
+    t: u32,
+    deps: &[u32],
+) -> (Dsv41OutAct, u32) {
+    let (groups, orow, ocol) = c.wo_a_groups();
+    assert_eq!(
+        tp, groups,
+        "the output LoRA is block-diagonal over {groups} groups and this emit maps ONE group to \
+         one rank, so it needs tp == o_groups (tp is {tp}). At tp=1 the same weight is 8 separate \
+         GEMMs over 8 slices of one checkpoint tensor, and the tensor table has no sub-tensor \
+         view to express that -- it would need a grouped-GEMM opcode or a slicing loader. \
+         Missing capability: `emit_dsv41_out_lora_tp{tp}`."
+    );
+    let act = Dsv41OutAct {
+        o_a: b.tensor(&format!("act.l{l}.o_a"), (t as u64) * (orow as u64) * 2),
+        o_cat: b.tensor(
+            &format!("act.l{l}.o_cat"),
+            (t as u64) * (groups as u64) * (orow as u64) * 2,
+        ),
+        o: b.tensor(&format!("act.l{l}.o"), (t as u64) * (c.hidden as u64) * 2),
+    };
+    // This rank's group: [T, ocol] x [orow, ocol]^T -> [T, orow].
+    let c_oa = emit_pf_gemm_fp8_mx(
+        b,
+        cus,
+        act.o_a,
+        attn_out,
+        w.get(l, "attn.wo_a.weight"),
+        w.get(l, "attn.wo_a.scale"),
+        t,
+        orow,
+        ocol,
+        deps,
+    );
+    // `wo_b` reads EVERY group, so the ranks must exchange before it -- 5.87 GB of the 14.8 GB
+    // each rank moves over xGMI per 8k prefill (section 9), a real term in the 90 ms budget.
+    //
+    // NOT emitted here, deliberately. `XAllGather` takes up to three destinations with slot-based
+    // sources (`i[5..8]` are src slots, `i[3]` a gate, `i[4]` n_gpu), which is a contract to read
+    // rather than infer; a collective wired from a guess moves the wrong bytes and the GEMM after
+    // it still runs. It is its own part in the rung plan until that is done, so `o_cat` is
+    // declared and left unfilled rather than silently aliased to this rank's slice.
+    let c_ob = emit_pf_gemm_fp8_mx(
+        b,
+        cus,
+        act.o,
+        act.o_cat,
+        w.get(l, "attn.wo_b.weight"),
+        w.get(l, "attn.wo_b.scale"),
+        t,
+        c.hidden,
+        c.wo_b_in(),
+        &[c_oa],
+    );
+    (act, c_ob)
+}
+
 /// One sublayer a V4.1 rung has to emit, and whether it is emitted yet.
 ///
 /// This exists so the answer to "what is missing" comes from RUNNING plowc rather than from
@@ -472,7 +566,8 @@ pub(crate) fn dsv41_layer_parts(c: &Dsv41Cfg, l: u32) -> Vec<(&'static str, Part
         p.push(("indexer queries (two-level)", Part::Todo));
     }
     p.push(("attention core (absorbed MLA over the 512 latent)", Part::Todo));
-    p.push(("output projection wo_a (grouped) + wo_b (op 184)", Part::Todo));
+    p.push(("output projection wo_a + wo_b (op 184)", Part::Done));
+    p.push(("output all-gather across o_groups (XAllGather)", Part::Todo));
     p.push(("ffn_norm", Part::Todo));
     if c.engram_layers.contains(&l) {
         p.push(("engram gate + embed (ops 182/183)", Part::Todo));
