@@ -659,6 +659,171 @@ pub(crate) fn declare_dsv41_mhc(b: &mut Builder, c: &Dsv41Cfg, t: u32) -> Dsv41M
     }
 }
 
+/// Engram's scratch, declared only for a chain that contains an engram layer.
+///
+/// `ids` is an INPUT, not an activation: the n-gram hash is integer work over token ids alone
+/// (`crates/plowrt/src/text/engram.rs`), so it arrives host-built like `in.pos`.
+pub(crate) struct Dsv41Engram {
+    /// This rank's contribution to the gather, `[T][n_cols * head_dim]` bf16, in PEER SLOT 0 --
+    /// the table is row-split so a rank writes zeros for every id outside its shard, and the
+    /// all-reduce below is what makes the row whole. Reusing attention's slot is safe for the same
+    /// reason the shared expert's reuse is: Engram runs at the TOP of the layer and its reduce has
+    /// completed before attention's begins. It is WIDER than attention's use of the slot (6144 vs
+    /// hidden=5120), which costs nothing because `Builder::tensor` takes the max on re-declaration.
+    pub(crate) part: u32,
+    /// The summed gather, which is what `wkv` consumes.
+    pub(crate) emb: u32,
+    /// `wkv`'s output: `hc_mult` keys then ONE shared value, `[T][(hc_mult + 1) * hidden]` bf16.
+    pub(crate) kv: u32,
+    /// `[T][n_cols]` i32, the n-gram row ids. GLOBAL ids, not shard-local: op 183 does the
+    /// signed subtract itself so one uploaded tensor serves every rank.
+    pub(crate) ids: u32,
+}
+
+/// Declare Engram's scratch for `t` rows. `None` when no layer in the chain has an Engram.
+pub(crate) fn declare_dsv41_engram(
+    b: &mut Builder,
+    c: &Dsv41Cfg,
+    layers: &[u32],
+    t: u32,
+) -> Option<Dsv41Engram> {
+    if !layers.iter().any(|l| c.engram_layers.contains(l)) {
+        return None;
+    }
+    let (r, cols, hd) = (t as u64, engram_cols(c) as u64, c.raw.engram_head_dim as u64);
+    let n = c.hc_mult as u64;
+    Some(Dsv41Engram {
+        part: b.tensor(PEER_SLOT_O, r * cols * hd * 2),
+        emb: b.tensor("act.engram_emb", r * cols * hd * 2),
+        kv: b.tensor("act.engram_kv", r * (n + 1) * c.hidden as u64 * 2),
+        ids: b.tensor("in.engram_ids", r * cols * 4),
+    })
+}
+
+/// `n_hash_cols` -- `(max_ngram_size - 1) * n_heads`, 24 for this checkpoint.
+///
+/// ONE derivation, shared by the tensor table, the scratch and the emit, because three copies of
+/// `(n - 1) * heads` is three chances to disagree about how wide a row of `wkv`'s input is.
+pub(crate) fn engram_cols(c: &Dsv41Cfg) -> u32 {
+    (c.raw.engram_max_ngram_size - 1) * c.raw.engram_n_heads
+}
+
+/// Engram: the n-gram lookup written into the residual stream, BEFORE the block.
+///
+/// # This runs ahead of `mhc_pre`, not inside the FFN
+///
+/// `Block.__init__` constructs `self.engram` but `Block.forward` never calls it.
+/// `Transformer.forward` does, in the layer loop and ahead of the block (`model.py:1262-1267`),
+/// so op 182 is in place on the hc-EXPANDED stream `[T][hc_mult][hidden]` before this layer's mHC
+/// collapses it. See `dsv41_layer_parts` for what that cost when the table said otherwise.
+///
+/// # Four ops, and the all-reduce is the reference's own
+///
+///   1. **op 183**, the gather. The table is 384 006 168 rows of 256 fp8 -- 98.31 GB, so a
+///      replicated copy does not fit on a 192 GB MI300X at all -- and is row-split. A rank writes
+///      ZEROS for any id outside its shard.
+///   2. **`XReduce`**, which sums those shards. This is `ParallelEngramEmbedding.forward`'s own
+///      `dist.all_reduce(values)` (`model.py:323-324`), not an artifact of this emit, and it is
+///      why the gather lands in a peer slot rather than in ordinary VRAM.
+///   3. **op 184**, `wkv`. Block-fp8 at a `[32, 32]` ue8m0 grid, `[T][6144] -> [T][25600]`. The
+///      reduce comes BEFORE it, as the reference has it. `wkv` is linear and bias-free so the two
+///      orders agree in exact arithmetic, but reducing after would quantize partial sums, and it
+///      would also reduce a tensor four times wider.
+///   4. **op 182**, the gate and mix, in place on the residual.
+///
+/// `token_mask` is `TENSOR_NONE`: it selects image spans, which take part in no n-gram, and a
+/// text-only prefill has none. A VL path must pass it -- a masked token has to pass through
+/// UNTOUCHED, which is not the same as adding a zero value.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_dsv41_engram(
+    b: &mut Builder,
+    c: &Dsv41Cfg,
+    w: &Dsv41Weights,
+    cus: &[u32],
+    e: &Dsv41Engram,
+    l: u32,
+    tp: u32,
+    t: u32,
+    residual: u32,
+    xgate: &mut u32,
+    deps: &[u32],
+) -> u32 {
+    let cols = engram_cols(c);
+    let hd = c.raw.engram_head_dim as u32;
+    let rows = c
+        .raw
+        .engram_rows(l)
+        .expect("emit_dsv41_engram called for a layer with no engram table");
+    // `part_num_embeddings = ceil(num_embeddings / world_size)`, model.py:303. The interpreter
+    // derives THIS rank's base as `rank * part_rows` -- see `DevOp::EngramEmbed`'s i4 sentinel.
+    let part_rows = (rows as u64).div_ceil(tp as u64);
+    assert!(
+        part_rows <= u32::MAX as u64,
+        "engram shard of {part_rows} rows does not fit an i32 row index"
+    );
+
+    let c_gather = b.emit(DevOp::EngramEmbed, cus.to_vec(), deps, |d| {
+        d.t[0] = e.part;
+        d.t[1] = w.get(l, "engram.embed.weight");
+        d.t[2] = w.get(l, "engram.embed.scale");
+        d.t[3] = e.ids;
+        d.i[0] = t;
+        d.i[1] = cols;
+        d.i[2] = hd;
+        // `weight_block_size` is [32, 32] for V4.1, NOT the [128, 128] V4 used. A wrong value
+        // rescales every lookup and faults nowhere -- so it comes off the config, not a literal.
+        d.i[3] = c.raw.quantization_config.weight_block_size[1] as u32;
+        d.i[4] = TENSOR_NONE_I; // derive the shard base from the rank
+        d.i[5] = part_rows as u32;
+    });
+
+    let xr = super::xr_cus_capped(b.n_cu(), cus);
+    let c_xr = crate::emit_xreduce(
+        b,
+        xgate,
+        false,
+        &xr,
+        c_gather,
+        e.emb,
+        t * cols * hd,
+        tp,
+        early_reduce_slot(t, cols * hd),
+    );
+
+    let kv_out = c.hidden * (c.hc_mult + 1);
+    let c_kv = super::emit_pf_gemm_fp8_mx(
+        b,
+        cus,
+        e.kv,
+        e.emb,
+        w.get(l, "engram.wkv.weight"),
+        w.get(l, "engram.wkv.scale"),
+        t,
+        kv_out,
+        cols * hd,
+        &[c_xr],
+    );
+
+    // ONE WORKGROUP PER TOKEN, as `d_engram_gate`'s header requires: its three reductions per hc
+    // copy are over `hidden` and want the whole workgroup. Same grid rule as `HyperConnPre`.
+    b.emit(
+        DevOp::EngramGate,
+        (0..t.min(b.n_cu())).collect(),
+        &[c_kv],
+        |d| {
+            d.t[0] = residual;
+            d.t[1] = e.kv;
+            d.t[2] = w.get(l, "engram.q_weight");
+            d.t[3] = w.get(l, "engram.k_weight");
+            d.t[4] = TENSOR_NONE; // no token_mask: text-only prefill has no image spans
+            d.i[0] = t;
+            d.i[1] = c.hc_mult;
+            d.i[2] = c.hidden;
+            d.f[0] = c.eps;
+        },
+    )
+}
+
 /// The mHC PRE half for one sublayer: collapse the residual copies into `m.layer_input`.
 ///
 /// `ffn` picks which of the layer's TWO mHC weight sets to use. Every layer carries both
@@ -1534,6 +1699,7 @@ pub(crate) fn emit_dsv41_block(
     let cos = tb.tensor_gen("in.cos", cos_t.byte_len(), cos_t);
     let sin = tb.tensor_gen("in.sin", sin_t.byte_len(), sin_t);
     let mhc = declare_dsv41_mhc(&mut tb, c, t);
+    let engram = declare_dsv41_engram(&mut tb, c, layers, t);
     let tensors = tb.tensors();
     let gen = tb.gen_tensors();
 
@@ -1567,6 +1733,27 @@ pub(crate) fn emit_dsv41_block(
     // half, so it must advance twice per layer and never reset. See `emit_dsv41_mhc_pre`.
     let mut pi = 0usize;
     for &l in layers {
+        // BEFORE the block, in place on the residual stream's hc copies -- `Transformer.forward`
+        // runs Engram in the layer loop ahead of `layer(...)`, not inside it (model.py:1262-1267).
+        // Its completion becomes the mHC pre's only dependency, so the chain stays a chain.
+        if c.engram_layers.contains(&l) {
+            let e = engram
+                .as_ref()
+                .expect("declare_dsv41_engram saw this layer in `layers`");
+            deps = vec![emit_dsv41_engram(
+                &mut b,
+                c,
+                &w,
+                &all,
+                e,
+                l,
+                tp,
+                t,
+                mhc.residual[ri],
+                &mut xgate,
+                &deps,
+            )];
+        }
         let c_pre = emit_dsv41_mhc_pre(&mut b, c, &w, &mhc, l, false, ri, pi, t, &deps);
         pi += 1;
         let (proj, c_proj) =
@@ -1740,8 +1927,8 @@ pub(crate) fn dsv41_layer_parts(c: &Dsv41Cfg, l: u32) -> Vec<(&'static str, Part
     // whole of what is left here is placement and plumbing.
     if c.engram_layers.contains(&l) {
         p.push((
-            "engram gate + embed (ops 182/183), BEFORE mhc_pre, in place on the hc stream",
-            Part::Todo,
+            "engram gather + all-reduce + wkv + gate (ops 183/184/182), BEFORE mhc_pre",
+            Part::Done,
         ));
     }
 

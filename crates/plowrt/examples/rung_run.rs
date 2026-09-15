@@ -211,6 +211,27 @@ mod hsa {
                 let rows = (x_bytes / 2 / 5120 / 4) as u32;
                 g.rank_mut(r).write_tensor("in.kvlen", &rows.to_le_bytes())?;
             }
+            // V4.1 ENGRAM (layers 1 and 14): the n-gram row ids. Host-built in a real run, from
+            // token ids alone -- `plowrt::text::engram::EngramHasher`. A rung has no prompt, so
+            // this is the same kind of stand-in as the seeded entry: ids spread over the WHOLE
+            // table, which is also what a real hash produces and what exercises the row-split.
+            // Every rank gets the SAME ids, because op 183 subtracts its own shard base; a rank
+            // seeded differently would gather different rows and the all-reduce would sum rows
+            // from eight unrelated n-grams.
+            if let Some(b) = g.rank(r).tensor_bytes("in.engram_ids") {
+                // `engram_num_embeddings` for both layers, from the checkpoint's config.
+                const ENGRAM_ROWS: u64 = 384_006_168;
+                let mut st = 0x9E3779B97F4A7C15u64;
+                let ids: Vec<u8> = (0..b / 4)
+                    .flat_map(|_| {
+                        st ^= st << 13;
+                        st ^= st >> 7;
+                        st ^= st << 17;
+                        ((st % ENGRAM_ROWS) as i32).to_le_bytes()
+                    })
+                    .collect();
+                g.rank_mut(r).write_tensor("in.engram_ids", &ids)?;
+            }
         }
 
         // Warm-up, then timed. The first launch pays for object load and page-in, which is a real

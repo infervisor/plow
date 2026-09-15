@@ -1457,7 +1457,16 @@ fn every_activation_read_is_written_by_something() {
         return;
     };
     let _guard = crate::test_env::env_guard();
-    let (m, _) = super::dsv41::emit_dsv41_block(&cfg, &[0], 8, 304, 2048, 256);
+    // BOTH emittable layers. Layer 1 is not layer 0 plus a bit: it opens with the Engram gather,
+    // its all-reduce and `wkv`, and those introduce `in.engram_ids` and two activations that
+    // nothing else in the layer writes.
+    for block in [&[0u32][..], &[1u32][..]] {
+        every_activation_read_is_written_for(&cfg, block);
+    }
+}
+
+fn every_activation_read_is_written_for(cfg: &super::dsv41::Dsv41Cfg, block: &[u32]) {
+    let (m, _) = super::dsv41::emit_dsv41_block(cfg, block, 8, 304, 2048, 256);
     let p = &m.progs[0];
     let name = |h: u32| m.tensors[h as usize].name.as_str();
 
@@ -1483,8 +1492,8 @@ fn every_activation_read_is_written_by_something() {
             }
             assert!(
                 written.contains(&h),
-                "op {:?} reads `{n}` at slot {s}, and no op in the program writes it -- \
-                 the layer would compute from whatever the arena happened to hold",
+                "layer(s) {block:?}: op {:?} reads `{n}` at slot {s}, and no op in the program \
+                 writes it -- the layer would compute from whatever the arena happened to hold",
                 d.op
             );
         }
@@ -1671,6 +1680,101 @@ fn engram_is_the_first_part_of_its_layer_not_an_ffn_one() {
     }
 }
 
+/// Layer 1 opens with Engram: gather, all-reduce, `wkv`, gate -- and only then the mHC.
+///
+/// The all-reduce is `ParallelEngramEmbedding.forward`'s own `dist.all_reduce` (`model.py:323`),
+/// not an artifact of this emit: the table is 98.31 GB and row-split because it cannot be
+/// replicated on a 192 GB card, so a rank's gather is a partial by construction. Dropping it would
+/// leave every rank with 1/8th of each row and fault nowhere.
+///
+/// The order `gather -> reduce -> wkv` is the reference's. `wkv` is linear and bias-free so
+/// reducing after would agree in exact arithmetic, but it would quantize partial sums and reduce a
+/// tensor four times wider (25600 vs 6144).
+#[test]
+fn layer_one_opens_with_the_engram_gather_and_its_all_reduce() {
+    let Some((cfg, _)) = checkpoint() else {
+        return;
+    };
+    let _guard = crate::test_env::env_guard();
+    let t = 256u32;
+    let (m, _) = super::dsv41::emit_dsv41_block(&cfg, &[1], 8, 304, 2048, t);
+    let p = &m.progs[0];
+    let name = |h: u32| m.tensors[h as usize].name.as_str();
+
+    let ops: Vec<u16> = p.insts.iter().map(|d| d.op).collect();
+    let first = |o: DevOp| ops.iter().position(|&x| x == o as u16);
+
+    let gather = first(DevOp::EngramEmbed).expect("layer 1 gathers");
+    let wkv = first(DevOp::GemmFp8Mx).expect("layer 1 projects the gather");
+    let gate = first(DevOp::EngramGate).expect("layer 1 gates");
+    let mhc = first(DevOp::HyperConnPre).expect("layer 1 has an mHC");
+    assert_eq!(gather, 0, "the gather is the layer's FIRST op -- Engram precedes the block");
+    assert!(gather < wkv && wkv < gate, "gather -> wkv -> gate");
+    assert!(gate < mhc, "Engram completes before mhc_pre collapses the copies");
+
+    // The all-reduce sits BETWEEN the gather and wkv, and it is a real collective over the
+    // gather's width, not a copy.
+    // Whichever collective `emit_xreduce` picks -- the two-shot one on this size -- what matters
+    // is that a cross-rank sum happens here at all.
+    let collective = [
+        DevOp::XReduce as u16,
+        DevOp::XReduceScatter as u16,
+        DevOp::XReduceTwoShot as u16,
+    ];
+    let red = ops[gather..wkv]
+        .iter()
+        .position(|o| collective.contains(o))
+        .map(|i| i + gather)
+        .expect("the row-split gather MUST be all-reduced before wkv");
+    let cols = super::dsv41::engram_cols(&cfg) * cfg.raw.engram_head_dim as u32;
+    assert_eq!(cols, 6144, "(max_ngram_size - 1) * n_heads * head_dim");
+    assert_eq!(
+        p.insts[red].i[0],
+        t * cols,
+        "the reduce covers the whole [T][n_cols * head_dim] gather"
+    );
+
+    // The gather is a PARTIAL and must land in the peer region, which is keyed by name.
+    assert_eq!(name(p.insts[gather].t[0]), super::dsv41::PEER_SLOT_O);
+    // ...and the slot is sized for the WIDER of its two users: 6144 here against hidden = 5120.
+    let slot = m
+        .tensors
+        .iter()
+        .find(|x| x.name == super::dsv41::PEER_SLOT_O)
+        .expect("peer slot 0 is declared");
+    assert_eq!(slot.bytes, u64::from(t) * u64::from(cols) * 2);
+
+    // One program serves all eight ranks, so the shard base cannot be an immediate.
+    assert_eq!(
+        p.insts[gather].i[4],
+        packet::dev::TENSOR_NONE_I,
+        "vocab_start must be derived from prog.rank, not written as a constant"
+    );
+    let rows = cfg.raw.engram_rows(1).expect("layer 1 has a table");
+    assert_eq!(p.insts[gather].i[5], (rows as u64).div_ceil(8) as u32);
+    assert_eq!(p.insts[gather].i[3], 32, "V4.1's block size is 32, not V4's 128");
+
+    // The gate is IN PLACE on the residual stream's hc copies -- the tensor mhc_pre then reads.
+    assert_eq!(name(p.insts[gate].t[0]), "act.hc_residual_a");
+    assert_eq!(p.insts[gate].i[1], cfg.hc_mult);
+    assert_eq!(p.insts[gate].i[2], cfg.hidden);
+    assert_eq!(
+        p.insts[gate].t[4],
+        packet::dev::TENSOR_NONE,
+        "no token_mask on a text-only prefill; a VL path must pass one"
+    );
+
+    // Layer 0 has none of this.
+    let (m0, _) = super::dsv41::emit_dsv41_block(&cfg, &[0], 8, 304, 2048, t);
+    assert!(
+        !m0.progs[0]
+            .insts
+            .iter()
+            .any(|d| d.op == DevOp::EngramEmbed as u16),
+        "layer 0 has no engram table and must not gather"
+    );
+}
+
 /// V4.1's mHC is CROSS-SUBLAYER: every `hc_pre` collapses with the PREVIOUS sublayer's `pre`.
 ///
 /// `Block.forward` (`model.py:965-996`) takes `pre_mix` as an ARGUMENT -- the previous block's
@@ -1763,9 +1867,16 @@ fn a_layer_that_reads_the_compressed_cache_is_not_done() {
     assert!(!cfg.kv_source.contains(&3));
     assert!(needs(3), "a pure reader still needs the read emitted");
 
-    // The consequence, stated as the count so a regression is loud: exactly one layer emits.
-    let emits = (0..cfg.layers)
+    // The consequence, stated as the SET and not just the count, so that a regression naming the
+    // wrong layers is as loud as one changing how many. Layers 0 and 1 are the two whose
+    // `compress_ratio` is 0; layer 1 additionally carries an Engram, which is now emitted.
+    let emits: Vec<u32> = (0..cfg.layers)
         .filter(|l| super::dsv41::dsv41_emit_block_plan(&cfg, *l).is_ok())
-        .count();
-    assert_eq!(emits, 1, "only layer 0 is fully emitted today");
+        .collect();
+    assert_eq!(
+        emits,
+        vec![0, 1],
+        "exactly the two window-only layers emit; every other layer is missing its compressed-KV \
+         attention, and layer 14's Engram is not enough on its own"
+    );
 }
