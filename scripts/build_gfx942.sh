@@ -796,8 +796,16 @@ fi
 # worst case over all of them, so two more full-column-wave bodies must not be forced on the
 # GLM / V3 blobs that never emit a NoPE packet. Without it the NoPE bit still TRAPS, so a
 # blob that needs the arm and an object that lacks it is a hard stop, not a wrong answer.
+# THE PF2 SPELLING IS THE ONE THAT MATTERS, and setting only the other name shipped an object
+# the loader refuses. `interp.hip` emits the marker plowrt looks for --
+# `plow_mla_pf2_nope_arm` -- under `#if PLOW_MLA_PF2_NOPE_ARM`, and its compatibility shim runs
+# ONE WAY: `#ifndef PLOW_MLA_PF_NOPE_ARM / #define PLOW_MLA_PF_NOPE_ARM PLOW_MLA_PF2_NOPE_ARM`.
+# Defining the non-2 name therefore satisfies the body and leaves the MARKER undefined, so the
+# object compiles the arm and cannot prove it: a V4.1 rung at T=8192 routes its NoPE MLA segment
+# to the flash object and the load dies with "has no zero-rope V2 arm". Define the pf2 name and
+# the shim gives the other for free.
 if [ "${PLOW_MLA_PF_NOPE:-0}" = 1 ]; then
-  AX_FLASH="$AX_FLASH -DPLOW_MLA_PF_NOPE_ARM=1"
+  AX_FLASH="$AX_FLASH -DPLOW_MLA_PF2_NOPE_ARM=1"
 fi
 
 # OPT-IN (PLOW_DSA_IDX64=1): the 64-index-head arm of the DSA prefill indexer score (op 117).
