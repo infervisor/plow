@@ -1309,12 +1309,7 @@ fn admit_into(
     // KV CAPACITY, charged over every live slot and not just the admission window.
     if let Some(budget) = kv_budget {
         let want = seq_upper.max(0) as u64;
-        let committed: u64 = slots
-            .iter()
-            .flatten()
-            .map(|s| (s.prompt_ids.len() + s.gen.max_tokens.max(1)) as u64)
-            .sum();
-        if !budget.fits(0, want) {
+        if !budget.fits_requests([want]) {
             // Nothing will ever free enough: deferring would wedge the queue behind it, so
             // this one is answered now. Distinct from max_ctx, which bounds the PROMPT — this
             // bounds prompt + generation against what this device was left after the load.
@@ -1326,17 +1321,22 @@ fn admit_into(
             Metrics::inc(&metrics.rejected);
             let _ = job
                 .respond
-                .try_send(StreamChunk::Err(crate::RuntimeError::ContextLength(format!(
-                    "request reserves {want} tokens; this device can back {} across all \
+                .try_send(StreamChunk::Err(crate::RuntimeError::ContextLength(
+                    format!(
+                        "request reserves {want} tokens; this device can back {} across all \
                      concurrent sequences",
-                    budget.max_rows()
-                ))));
+                        budget.max_rows()
+                    ),
+                )));
             return None;
         }
-        if !budget.fits(committed, want) {
+        let committed = slots
+            .iter()
+            .flatten()
+            .map(|s| (s.prompt_ids.len() + s.gen.max_tokens.max(1)) as u64);
+        if !budget.fits_requests(committed.chain(std::iter::once(want))) {
             tracing::debug!(
                 want,
-                committed,
                 max_rows = budget.max_rows(),
                 "mux: KV budget full — request stays queued"
             );

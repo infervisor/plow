@@ -242,6 +242,21 @@ pub(super) struct SharedPrefix {
     fine_ceiling: u32,
 }
 
+impl SharedPrefix {
+    pub(super) fn admission_block_groups(&self) -> Vec<(u64, u64)> {
+        self.groups
+            .iter()
+            .map(|group| {
+                let block_rows = u64::from(group.pool.block_rows());
+                let block_bytes = block_rows
+                    .saturating_mul(group.pool.geometry().row_bytes())
+                    .saturating_mul(group.tensors.len() as u64);
+                (block_rows, block_bytes)
+            })
+            .collect()
+    }
+}
+
 struct DeferredPublish {
     slot: usize,
     prompt: Arc<[u32]>,

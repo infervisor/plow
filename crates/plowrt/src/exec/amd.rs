@@ -10366,10 +10366,20 @@ impl AmdEngine {
                 max_rows = budget / per_token,
                 "KV admission budget"
             );
-            Some(crate::sched::admission::KvBudget {
-                bytes_per_token: per_token,
-                budget_bytes: budget,
-            })
+            let linear = crate::sched::admission::KvBudget::linear(per_token, budget);
+            let exact = shared_prefix
+                .as_ref()
+                .and_then(|prefix| linear.with_block_groups(&prefix.admission_block_groups()));
+            if let Some(exact) = exact {
+                tracing::info!(
+                    rank,
+                    groups = exact.block_group_count,
+                    "KV admission uses physical block geometry"
+                );
+                Some(exact)
+            } else {
+                Some(linear)
+            }
         });
         if replicated > 0 {
             match free {
