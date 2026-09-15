@@ -842,6 +842,17 @@ if [ "${PLOW_XR_NOWAIT:-0}" = 1 ]; then
   AX_PREFILL="$AX_PREFILL -DPLOW_XR_NOWAIT=1"
 fi
 
+# PLOW_WPE on the PREFILL object. The decode arms already set this (see the AX_DECODE blocks
+# above); prefill never did, so it takes the default PLOW_WAVES/4 = 2 waves/SIMD and the
+# 256-register budget. That is the right default for a megakernel whose allocation is the union of
+# every op, and it is also why V4.1's mHC GemvF32 is latency-bound: 320 iterations of dependent
+# loads with only two waves on a SIMD to cover them. Raising this forces the allocator lower and it
+# will spill; whether the extra latency hiding outruns the spill is the measurement, exactly as
+# interp.hip's PLOW_WPE note says. Unset keeps the object byte-identical.
+if [ -n "${PLOW_WPE:-}" ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_WPE=${PLOW_WPE}"
+fi
+
 # Diagnostic-only XREDUCE2 / XREDUCE phase timeline in PlowTraceRec. Never a serve asset.
 if [ "${PLOW_XR_TRACE_PHASES:-0}" = 1 ]; then
   AX_PREFILL="$AX_PREFILL -DPLOW_XR_TRACE_PHASES=1"

@@ -1837,6 +1837,35 @@ off 6% of peak, and the whole-model emit that §12.2 lists. None of those is sma
 whole-model emit, which overlaps seams this measures in isolation, and it under-counts everything
 in §12.2 that is still not emitted.
 
+### 12.8 Occupancy is capped by LDS, not by the register budget
+
+§12.6 left `GemvF32` latency-bound: 320 iterations of dependent loads at 2 waves/SIMD with nothing
+to hide them behind. The obvious lever is `PLOW_WPE`, which `interp.hip` documents as exactly this
+measurement -- "Raising this forces the allocator under 128 VGPRs; it will spill, and whether the
+extra latency hiding outruns the spill is the measurement." The decode arms already set it; prefill
+never did, so it took the default `PLOW_WAVES/4 = 2`. Wiring it through to `AX_PREFILL` (default
+unset, so an ordinary build is unchanged):
+
+| waves/EU | VGPR | spills | private seg | median |
+|---|---|---|---|---|
+| 2 (default) | 256 | 122 | 1124 B | **23.25 ms** |
+| 3 | 216 | 0 | 1816 B | 24.31 ms |
+| 4 | 176 | 0 | 2632 B | 24.43 ms |
+
+**Both are slower, and the spills going to ZERO did not help.** The reason is that
+`waves_per_eu` never bought any occupancy: `group_segment_fixed_size` is **64 720 B** of the CU's
+64 KiB LDS, so exactly ONE workgroup is resident per CU no matter what the register allocator
+does. Eight waves over four SIMDs is 2 waves/SIMD, and that is fixed by the arena. All the hint
+changed was the register budget, and the extra scratch traffic cost ~4%.
+
+**So the lever for this megakernel's occupancy is LDS, not registers.** Getting two workgroups per
+CU (4 waves/SIMD, and real latency hiding for every latency-bound op in the layer, not just
+`GemvF32`) needs the prefill arena under 32 KiB. `op_gemm_common.h` puts the smallest tile the
+fused-GLU `SN==2` assert allows at 8 waves at 128x256x32 = 30 720 B, which would fit twice over --
+so the 64 720 B is the GEMM arena plus the MoE staging buffers, and the question is whether the
+prefill arena can be sized separately the way `PLOW_DEC_ARENA_HALVES` already sizes decode's.
+That is the next experiment worth running, and it is a bigger one than anything in §12.4-12.6.
+
 ### 12.7 Multi-layer: `--block l..r` chains, and 31 of 40 layers emit today
 
 **`--block 0..39` used to silently emit layer 0.** The spec was parsed with
