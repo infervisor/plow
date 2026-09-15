@@ -3240,14 +3240,22 @@ fn derive_raw_mla_v2_segments(prog: &DevProg) -> Result<Vec<bool>> {
 
 fn packed_family_segments_cover(prog: &DevProg, families: &[u8], wanted: &[u8]) -> bool {
     let mut seen = false;
+    let packed = prog.role.is_packed_sibling() || prog.role.is_token_batch_body();
+    let band = prog.role.token_batch_band().filter(|&b| b > 0);
     let covered = prog.stream.iter().all(|e| {
         let Some(in_) = prog.insts.get(e.inst as usize) else {
             return false;
         };
-        let expected = if in_.op == DevOp::RmsNorm as u16
+        let norm = in_.op == DevOp::RmsNorm as u16
             || in_.op == DevOp::HeadNormRope as u16
-            || in_.op == DevOp::HeadNormRopeFp8 as u16
+            || in_.op == DevOp::HeadNormRopeFp8 as u16;
+        let expected = if norm
+            && packed
+            && in_.i[0] != prog.t
+            && Some(in_.i[0]) != band
         {
+            0
+        } else if norm {
             5
         } else if in_.op == DevOp::FlashMlaPrefill as u16
             || in_.op == DevOp::FlashMlaPrefillFp8 as u16

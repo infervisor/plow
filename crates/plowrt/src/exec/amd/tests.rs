@@ -5680,10 +5680,13 @@ fn token_batch_seam_norms_stay_on_the_primary_object() {
         inst(DevOp::FlashMlaPrefillFp8, 8192),
     ];
     let body = ProgramRole::TokenBatchBody { band: 32, rows: 8192 };
+    let body_prog = prog(body, insts(), &[0, 1, 2, 3]);
+    let body_families = derive_packed_segment_families(&body_prog).unwrap();
     assert_eq!(
-        derive_packed_segment_families(&prog(body, insts(), &[0, 1, 2, 3])).unwrap(),
+        body_families,
         [5, 5, 0, 6]
     );
+    assert!(packed_family_segments_cover(&body_prog, &body_families, &[5, 6]));
     let mixed = prog(
         body,
         vec![inst(DevOp::RmsNorm, 1024), inst(DevOp::HeadNormRope, 8192)],
