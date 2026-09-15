@@ -3674,11 +3674,15 @@ mod tests {
         ] {
             let case = format!("        case {}:", op.c_name());
             let guard = format!(
-                "#if !PLOW_DECODE_INVENTORY_PRUNE || {}\n{case}",
+                "#if !PLOW_DECODE_INVENTORY_PRUNE || {}",
                 op.c_name().replace("PLOW_DOP_", "PLOW_HAS_")
             );
+            let direct = format!("{guard}\n{case}");
+            let named_bound = format!(
+                "{guard}\n#define PLOW_GEMM_F32_STANDARD_DECODE_MAX_ROWS 32u\n{case}"
+            );
             assert!(
-                src.contains(&guard),
+                src.contains(&direct) || (op == DevOp::GemmF32 && src.contains(&named_bound)),
                 "{} is not inventory-gated",
                 op.c_name()
             );

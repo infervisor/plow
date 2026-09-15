@@ -313,8 +313,8 @@ fn dense_exact_rungs_join_the_production_emit_beside_an_unchanged_ladder() {
     let _guard = crate::test_env::env_guard();
     let (off_t, off_p, off_x, off_m) = emit_dense_exact_fixture(false);
     let (on_t, on_p, on_x, on_m) = emit_dense_exact_fixture(true);
-    let rungs = [1u32, 2, 4, 8, 16, 20];
-    let de_rungs = [8u32, 16, 20];
+    let rungs = [1u32, 2, 4, 8, 16, 32];
+    let de_rungs = [8u32, 16, 32];
     assert!(off_t.iter().all(|&t| !is_dense_exact_program(t)));
     let lo = decode_rung_lo(&off_t);
     assert_eq!(off_t[lo..], rungs);
