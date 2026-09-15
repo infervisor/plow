@@ -1866,6 +1866,35 @@ so the 64 720 B is the GEMM arena plus the MoE staging buffers, and the question
 prefill arena can be sized separately the way `PLOW_DEC_ARENA_HALVES` already sizes decode's.
 That is the next experiment worth running, and it is a bigger one than anything in §12.4-12.6.
 
+What sets the 64 720 B is NOT the attention tile, which was the obvious guess: every prefill
+object measures the same arena, including `interp_prefill.elf`, which has no MLA arm at all.
+
+| object | LDS |
+|---|---|
+| `interp_prefill` (no MLA) | 64 720 B |
+| `interp_prefill_mla` | 64 720 B |
+| `interp_prefill_mla_moe` | 64 720 B |
+| `interp_prefill_fp8kv_k3_moe_a4w4` (the one that runs) | 64 720 B |
+| `interp_flash` (4 waves) | 58 368 B |
+
+`raw` is `max(PLOW_GM_ARENA, FA_LDS_HALVES(512), PLOW_MLA_PF_HALVES)`, and the GEMM arena is what
+wins. **It cannot be shrunk from the build**: the packet PINS the tile, and the build refuses a
+mismatched object --
+
+    FAIL: packet requires GM_BM=192 but GM_BM=128 is set in the environment
+
+which is the right refusal (a smaller arena against a packet emitted for a 192-row tile would
+read past the allocation, the exact failure mode `op_moe.h` records as having shipped once
+already). So the arena is an EMIT-side choice: `pick_tile` picks `GM_BM=192`, and moving it means
+changing what the emitter selects for this shape, then rebuilding both sides together. There is no
+emit knob for it today, and `pick_tile` is shared with every other model, so this is a real change
+with a real blast radius rather than a flag flip.
+
+And it is a TRADE, not a free win: a smaller tile buys a second workgroup per CU (4 waves/SIMD,
+which is what the latency-bound ops want) and costs GEMM efficiency on the ops that are already
+compute-bound — the shared expert and the projections, 2.7 ms of the layer. Worth measuring, not
+worth assuming.
+
 ### 12.7 Multi-layer: `--block l..r` chains, and 31 of 40 layers emit today
 
 **`--block 0..39` used to silently emit layer 0.** The spec was parsed with
