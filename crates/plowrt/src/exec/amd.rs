@@ -5825,6 +5825,18 @@ struct AmdProg {
     bank: CounterBankState,
 }
 
+fn program_hier_base(p: &DevProg) -> u32 {
+    // Token-batch bodies shrink packet block counts to the live row set at dispatch. Their
+    // emitted NPER values describe the full rung, so a hierarchical rendezvous would wait for
+    // slices that the patched packet no longer launches. Keep the per-XCD queue windows, but use
+    // the ordinary per-workgroup gate until NPER is patched with the body.
+    if p.l2_domains == 0 || p.role.is_token_batch_body() {
+        return 0;
+    }
+    p.n_counter
+        .saturating_sub(3 * p.insts.len() as u32 * p.l2_domains)
+}
+
 struct AmdGq {
     d_stream: DeviceMem,
     d_seg_ofs: DeviceMem,
@@ -9886,11 +9898,7 @@ impl AmdEngine {
                 // Zero unless the program is L2-placed: without per-domain windows there is no
                 // `nper`, the emitter allocates no scratch, and the interpreter reads 0 as
                 // "no hierarchy".
-                hier_base: if p.l2_domains != 0 {
-                    (p.n_counter).saturating_sub(3 * p.insts.len() as u32 * p.l2_domains)
-                } else {
-                    0
-                },
+                hier_base: program_hier_base(p),
                 ctr_span,
                 bank: CounterBankState::new(),
             });

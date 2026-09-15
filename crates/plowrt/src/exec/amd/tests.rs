@@ -1256,6 +1256,17 @@ fn gate_hier_status_separates_armed_from_firing() {
     assert!(!GateHierStatus::of(&unplaced, false).firing);
 }
 
+#[test]
+fn token_batch_body_keeps_xcd_placement_without_static_hierarchy_count() {
+    let mut placed = gate_hier_probe(8, 38);
+    placed.n_counter = 1000;
+    assert_eq!(program_hier_base(&placed), 976);
+
+    placed.role = packet::devbuild::ProgramRole::TokenBatchBody { band: 32, rows: 128 };
+    assert_eq!(placed.l2_domains, 8);
+    assert_eq!(program_hier_base(&placed), 0);
+}
+
 /// The refusal has to name BOTH halves and the two ways out — the emit-side flag and the
 /// object-side flag are different names in different files.
 #[test]
