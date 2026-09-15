@@ -2621,28 +2621,137 @@ pages only for the live context, instead of carving the full rectangle up front.
 default, needs `hsa_amd_vmem_*`; every failure path warns and falls back to the flat carve. Only
 the full-attention `kv.{l}.k` / `kv.{l}.v` tensors are VMM-backed.
 
-Why it is large on this packet. The flat carve is **84.85 GiB per rank** — ckv 60.94, krot 15.23,
-kidx 8.20, scale 0.48 — for `max_ctx` 81,920 rows × 20 slots, i.e. 55,608 B per token per rank.
-At the 8192-token goal cell that is 8.49 GiB useful and **76.37 GiB reserved-and-unused per
-rank**. The saving ratio is `max_ctx / live_ctx`, so it is *largest exactly at the cell the
-campaign is trying to win*, and shrinks to nothing at 70k.
+The KV declaration on this packet is **84.375 GiB per rank** — ckv 60.9375, krot 15.234375, kidx
+8.203125 — for `max_ctx` 81,920 rows × 20 slots, i.e. **55,296 B per token per rank**.
+
+> **CORRECTED the same day.** I first wrote that 76.37 GiB of this was "reserved-and-unused" HBM
+> at the 8192 cell. That was wrong, and wrong in a way worth naming: those are DECLARED TENSOR
+> BYTES, which is the *virtual* reservation, not an allocation. The production log reports them
+> as `va_gib` on three VMM pools per rank, and the physical pages are mapped at each sequence's
+> frontier. So the growth this section credits to `PLOW_VMM_KV` was already running — through the
+> shared-prefix pool, not through that knob, which `vmm_bringup` only reaches when
+> `shared_prefix.is_none()`. The figure is still the right one for ADMISSION, where it prices
+> what an admitted sequence may grow into; it was never idle memory waiting to be reclaimed. See
+> "The 70k/C20 fault is an unchecked KV overcommit" below.
 
 Measured, B=8 at ~1k context: 75.55 vs 83.05 GiB resident, 7.50 of 10.0 GiB reclaimed, TPOT
-unchanged (38.0 vs 39.0 ms). It buys memory, not latency — but memory is what the 70k/C20 arm ran
-out of room in.
+unchanged (38.0 vs 39.0 ms). It buys memory, not latency.
 
 ### What this changes
 
-* Packing is not a tuning knob away. Reaching it needs, in order: convert `HeadNormRope` /
-  `HeadNormRopeFp8` to the batched-ring form (`i6 != 0`), give the MLA prefill and sparse-index
-  ops a per-row query position instead of a shared `n_tok`, resolve `XReduceScatter`'s class-A
-  refusal, emit packed-prefill siblings, and only then halve `PLOW_PF_CHUNK` so two chunks fit one
-  rung. Any single one of those left undone keeps the route inert.
+* Packing is not a tuning knob away, but it is closer than this section first claimed. **The one
+  hard wall was not real**: `XReduceScatter`'s class-A `refuse` came from a stale `no_body`
+  classifier entry — `d_xreduce_scatter_mega` is `op_collective.h:1668`, dispatched at
+  `interp.hip:5832`, and this very packet runs 78–156 of them per rung correctly. With that
+  corrected, **every remaining blocker on every rung is class C / needs-conversion**, and none of
+  them needs a kernel written from scratch:
+  * `HeadNormRope` / `HeadNormRopeFp8` — the kernel already has the batched-ring form, so this is
+    an emitter flip to `i6 != 0`;
+  * `FlashMlaPrefillFp8` / `IndexUnionPf` / `IndexTpPf` — the shared-`n_tok` query position, which
+    is exactly what `PLOW_PACKED_SPARSE_PF` was built to cover, and whose two prerequisites
+    (`PLOW_GLM_INDEX_TP`, FP8 KV) the shipping recipe **already sets**.
+  What the shipping packet is actually missing is `PLOW_EMIT_PACKED_PREFILL`, recorded as
+  `false` in its own `build.json`. So the route is a re-emit plus an object build plus
+  qualification, then halving `PLOW_PF_CHUNK` so two chunks fit one rung.
 * Every "packed prefill" claim about this packet — mine included — should be read as describing an
   unexercised path until an `AMD packed prefill fired` line exists to anchor it.
-* `rt.vmm_cache_min_free_mib` should be armed by default; the contract already guarantees a safe
-  degradation on backends that cannot report free bytes. That is a default flip, so it needs its
-  own Tier-4 A/B before it ships.
+* `rt.vmm_cache_min_free_mib` is now armed by default (4% of the device, `=0` the rollback); the
+  contract already guaranteed safe degradation on backends that cannot report free bytes.
+
+## The 70k/C20 fault is an unchecked KV overcommit, and admission counted slots instead of bytes (2026-09-15, job `70k-fault2`)
+
+Four arms, each on its own fresh server, and the verdicts are unambiguous:
+
+| arm | cell | result |
+| --- | --- | --- |
+| A | 1 × 70,000 | clean — 4 requests, median TTFT 4.71 s |
+| B | 4 × 70,000 | clean — 8 requests, median TTFT 6.59 s |
+| C | 20 × 70,000, **first on the server** | **FAULT** |
+| D | 8192 ×3 then 20 × 70,000 | **FAULT**, after all three 8192 steps ran clean |
+
+C faulting on a fresh server kills the accumulated-state hypothesis outright, and D's three
+clean 8192 steps before the same cell confirm it from the other side. The trigger is
+concurrency × long context, somewhere between C4 and C20.
+
+### The arithmetic closes exactly
+
+Everything needed is in the faulting server's own load log, which is the part worth keeping:
+
+* three VMM pools per rank, `va_gib` **60.9375 + 15.234375 + 8.203125 = 84.375 GiB**, over
+  `max_ctx=81920 × batch=20` = 1,638,400 row-slots → **55,296 bytes per token per rank**;
+* `device memory after load rank=N free_gib=55.58984375` on every rank.
+
+| cell | rows | KV wanted | vs 55.59 GiB free |
+| --- | --- | --- | --- |
+| 20 × 8,192 | 163,840 | 8.4 GiB | fits — this is every clean run ever measured |
+| 1 × 70,000 | 70,000 | 3.6 GiB | fits (arm A) |
+| 4 × 70,000 | 280,000 | 14.4 GiB | fits (arm B) |
+| **20 × 70,000** | **1,400,000** | **72.1 GiB** | **short by 16.5 GiB** |
+
+Maximum backable concurrency at 70,000 is about **15 sequences**; the server admits 20. The
+final error is `HSA_STATUS_ERROR_OUT_OF_RESOURCES` — "the runtime failed to allocate the
+necessary resources" — arriving after `occupied_extent=20` with the decode rung ladder walking
+20 → 16 → 8 trying to cope. The `APERTURE_VIOLATION` seen in `e2e-prod` is the same overcommit
+surfacing at a different allocation, not a second bug.
+
+### What was actually wrong
+
+`admit_into` (`serve/mux.rs`) chose a slot with
+
+```rust
+let Some(idx) = slots.iter().position(|s| s.is_none()) else { /* reject */ };
+```
+
+Slot count, nothing else. A KV-capacity gate *does* exist three lines later —
+`arena.allocate_slot(seq_upper)`, which sheds cleanly with `RuntimeError::Oom` — but `arena` is
+built from `bundle…map.kv_paging`, and only the CUDA paged path declares that. On AMD `arena` is
+`None`, so **nothing bounded admission by memory at all** and the overcommit reached the device
+as an async queue fault instead of as backpressure.
+
+This is worth stating plainly because it is the difference between a serving stack and a
+benchmark harness: the request that could not be backed was not rejected, not queued, not
+degraded. It was dispatched, and it took the process with it.
+
+### The fix, and why it needs no new queue
+
+The engine now prices its own KV at load — `KvBudget { bytes_per_token, budget_bytes }`, the
+second being `PLOW_KV_ADMIT_HEADROOM` (0.9) of the free-after-load bytes — and the mux charges
+every live slot's reserved rows (`prompt + max_tokens`) against it before admitting.
+
+The queue was already there. Jobs wait in the ingress `mpsc` and are drained only when a slot
+frees, so a request that does not fit is simply *handed back*: `admit_into` returns it, the mux
+holds it in one `deferred` slot and retries it **ahead of anything newer** on the next tick.
+FIFO is preserved, no request is rejected, and the drain loops stop while one is held rather
+than reordering around it.
+
+One case must not be deferred: a request whose reservation exceeds the *entire* budget can
+never fit, and holding it would wedge the queue behind it forever. That one is answered with a
+context-length error naming what the device can back. Note this is a different bound from
+`max_ctx`, which limits the PROMPT; this limits prompt + generation against what the load left.
+
+`KvBudget::fits` is unit-tested directly against the measured cell, which is the only reason to
+trust it: the arms that ran clean on hardware are admissible, the two that faulted are not, and
+the knee lands at 13 concurrent 70,000-token sequences at the default headroom.
+
+### Two things this changes about how to read the rest of this log
+
+* **`PLOW_VMM_KV` was never the lever it looked like.** `vmm_bringup` runs only when
+  `shared_prefix.is_none()`, and the prefix cache is selected in production — so the growable,
+  frontier-mapped KV has been running all along through the shared-prefix pool, and the knob
+  would have been inert. It now defaults on so the no-prefix-cache fallback matches.
+* **An earlier entry called the 84.375 GiB figure "reserved-and-unused" HBM.** That was wrong:
+  it is `va_gib`, virtual address space, and the physical pages are mapped at each sequence's
+  frontier. Declared tensor bytes are the VA reservation, not an allocation. The number is still
+  the right one for *admission* — it prices what an admitted sequence may grow into — but it was
+  never idle memory waiting to be reclaimed.
+
+### What this does not fix
+
+The budget bounds admission; it does not make 20 × 70,000 *run*. That cell now completes with a
+queued tail instead of a core dump, at lower concurrency than requested. Raising real
+long-context concurrency needs either more free memory after load (the prefix cache's static
+budget is the obvious donor, which is why pressure eviction is now armed) or fewer bytes per
+token.
 
 ## Artefact policy (applied on every merge)
 
