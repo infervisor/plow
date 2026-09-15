@@ -621,6 +621,45 @@ pub(crate) struct MhcHandles {
     pub(crate) comb_mix: u32,
     /// Where the collapsed sublayer input lands.
     pub(crate) layer_input: u32,
+    /// Whose `pre` gates the collapse. GLM-5.3 and V4.1 disagree; see [`MhcPre`].
+    pub(crate) pre: MhcPre,
+}
+
+/// Which sublayer's `pre` coefficients gate `hc_pre`'s collapse of the residual copies.
+///
+/// The two models this op serves differ here and the shapes do not show it: both derive `pre` from
+/// `mixes[0..hc_mult)` and both collapse with an `hc_mult`-vector, so picking wrong yields a model
+/// that runs and is wrong. Making it an enum rather than a bool means a new caller has to say which
+/// it is.
+#[derive(Clone, Copy)]
+pub(crate) enum MhcPre {
+    /// GLM-5.3: the `pre` this same sublayer just derived.
+    Own,
+    /// DeepSeek-V4.1: the PREVIOUS sublayer's, read from `pair` half `in_half`, while this
+    /// sublayer publishes its own into the other half. `Block.forward` collapses attention with
+    /// the previous block's `ffn_pre` and the FFN with this block's `attn_pre`
+    /// (`model.py:965-996`).
+    Deferred {
+        /// One `[2, rows, hc_mult]` f32 tensor holding both halves -- `HyperConnPre` has already
+        /// spent 7 of the descriptor's 8 tensor slots.
+        pair: u32,
+        in_half: u32,
+    },
+    /// The model's FIRST sublayer, where V4.1 has no previous `pre` and `make_identity_pre_mix`
+    /// supplies a one-hot on copy 0 instead (`model.py:1159-1163`). Still publishes.
+    Seed { pair: u32, in_half: u32 },
+}
+
+impl MhcPre {
+    /// `(pre_pair, i4 = pre_in_half, i5 = pre_mode)`, matching `PLOW_HC_PRE_*` in
+    /// `runtime/amd/op_hyperconn.h`.
+    fn operands(self) -> (u32, u32, u32) {
+        match self {
+            MhcPre::Own => (TENSOR_NONE, 0, 0),
+            MhcPre::Seed { pair, in_half } => (pair, in_half, 1),
+            MhcPre::Deferred { pair, in_half } => (pair, in_half, 2),
+        }
+    }
 }
 
 /// The mHC PRE half: mix the `hc_mult` residual copies down into one sublayer input.
@@ -641,6 +680,7 @@ pub(crate) fn emit_mhc_pre(
     deps: &[u32],
 ) -> u32 {
     let mix = (2 + hc_mult) * hc_mult;
+    let (pre_pair, pre_in_half, pre_mode) = h.pre.operands();
     let cm = b.emit(DevOp::GemvF32, b.all(), deps, |d| {
         d.t[0] = h.mixes;
         d.t[1] = h.residual;
@@ -661,10 +701,13 @@ pub(crate) fn emit_mhc_pre(
             d.t[4] = h.residual;
             d.t[5] = h.scale;
             d.t[6] = h.base;
+            d.t[7] = pre_pair;
             d.i[0] = rows;
             d.i[1] = hc_mult;
             d.i[2] = hidden;
             d.i[3] = sinkhorn;
+            d.i[4] = pre_in_half;
+            d.i[5] = pre_mode;
             d.f[0] = eps;
             d.f[1] = hc_eps;
         },
@@ -722,6 +765,7 @@ fn emit_glm53_hc_pre(
         post_mix: s.post_mix,
         comb_mix: s.comb_mix,
         layer_input: s.layer_input,
+        pre: MhcPre::Own,
     };
     emit_mhc_pre(b, &h, c.hidden, 4, 20, c.eps, 1e-6, rows, &[dep])
 }

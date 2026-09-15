@@ -853,7 +853,7 @@ fn the_mhc_pair_is_glm53s_hyper_connection_at_v41s_own_constants() {
     let w = super::dsv41::declare_dsv41_weights(&mut b, &cfg, &[0], cfg.o_groups);
     let t = 512u32;
     let m = super::dsv41::declare_dsv41_mhc(&mut b, &cfg, t);
-    let c_pre = super::dsv41::emit_dsv41_mhc_pre(&mut b, &cfg, &w, &m, 0, false, 0, t, &[]);
+    let c_pre = super::dsv41::emit_dsv41_mhc_pre(&mut b, &cfg, &w, &m, 0, false, 0, 0, t, &[]);
     let raw = b.tensor("act.raw", (t as u64) * (cfg.hidden as u64) * 2);
     super::dsv41::emit_dsv41_mhc_post(&mut b, &cfg, &m, raw, 0, t, &[c_pre]);
     let p = b.finish();
@@ -1422,8 +1422,12 @@ fn the_layer_zero_rung_is_a_topological_program() {
 /// each one names the `slots.rs` row it came from.
 fn written_slots(op: u16) -> &'static [usize] {
     match op {
-        // t = [post_mix, comb_mix, layer_input, mixes, residual, hc_scale, hc_base]
-        o if o == DevOp::HyperConnPre as u16 => &[0, 1, 2],
+        // t = [post_mix, comb_mix, layer_input, mixes, residual, hc_scale, hc_base, pre_pair].
+        // Slot 7 is BOTH: the op publishes the `pre` it derived into half `pre_in_half ^ 1` and
+        // (in `PRE_DEFER`) reads the other half, which the previous sublayer wrote. Listing it as
+        // written is what lets the chain's FIRST sublayer -- `PRE_SEED`, which only publishes --
+        // be the writer that satisfies every later reader.
+        o if o == DevOp::HyperConnPre as u16 => &[0, 1, 2, 7],
         // t = [meta, table, row_token, row_partidx, row_gate] -- the align pass FILLS the three
         // row arrays and the meta header; only `table` is an input.
         o if o == DevOp::MoeAlignPf as u16 => &[0, 2, 3, 4],
@@ -1624,6 +1628,67 @@ fn a_block_range_emits_every_layer_in_it_chained() {
     assert_eq!(d1.weights.prefix, "layers.3.");
     assert_eq!(d5.weights.prefix, "layers.");
     assert_eq!(d5.layer, 3, "the descriptor names the first layer of the chain");
+}
+
+/// V4.1's mHC is CROSS-SUBLAYER: every `hc_pre` collapses with the PREVIOUS sublayer's `pre`.
+///
+/// `Block.forward` (`model.py:965-996`) takes `pre_mix` as an ARGUMENT -- the previous block's
+/// `ffn_pre` -- and collapses attention with it, then collapses the FFN with this block's
+/// `attn_pre`, returning `ffn_pre` for the next block. The class docstring states it: "the
+/// coefficients a sublayer computes are used by the *next* one". `Transformer.forward` seeds the
+/// chain with `make_identity_pre_mix`, a ONE-HOT on copy 0 (`model.py:1159-1163`).
+///
+/// GLM-5.3's `hc_pre`, which this emit binds onto, collapses with the `pre` the SAME sublayer just
+/// derived, and nothing in the shapes distinguishes the two -- both are an `hc_mult`-vector over
+/// the same residual. `scripts/dsv41_mhc_oracle.py` prices the difference at 51.9% relative on
+/// LAYER 0 ALONE, because V4.1 feeds layer 0's attention residual copy 0 while the same-sublayer
+/// ordering feeds it a learned mix off `hc_attn_fn`. That is a model that loads, runs, and is
+/// wrong, so the half indices are pinned here rather than left to the emitter's arithmetic.
+#[test]
+fn the_mhc_pre_gate_comes_from_the_previous_sublayer() {
+    let Some((mut cfg, _)) = checkpoint() else {
+        return;
+    };
+    let _guard = crate::test_env::env_guard();
+    cfg.raw.compress_ratios = vec![0; cfg.raw.compress_ratios.len()];
+
+    let (m, _) = super::dsv41::emit_dsv41_block(&cfg, &[3, 4], 8, 304, 2048, 256);
+    let pre: Vec<_> = m.progs[0]
+        .insts
+        .iter()
+        .filter(|d| d.op == DevOp::HyperConnPre as u16)
+        .collect();
+    assert_eq!(
+        pre.len(),
+        4,
+        "two layers is four mHC sublayers -- attention and FFN each have one"
+    );
+
+    // `PLOW_HC_PRE_*` in `runtime/amd/op_hyperconn.h`: 0 OWN (GLM-5.3), 1 SEED, 2 DEFER.
+    let modes: Vec<u32> = pre.iter().map(|d| d.i[5]).collect();
+    assert_eq!(
+        modes,
+        vec![1, 2, 2, 2],
+        "the chain's first sublayer seeds with the one-hot and every later one defers; a `0` here          is GLM-5.3's same-sublayer ordering, which is 51.9% wrong on layer 0 alone"
+    );
+
+    // Sublayer k reads half k%2 and publishes into the other, so the halves alternate. Two
+    // consecutive sublayers reading the same half would have the second one read its own output.
+    let halves: Vec<u32> = pre.iter().map(|d| d.i[4]).collect();
+    assert_eq!(halves, vec![0, 1, 0, 1], "the pre_pair halves must alternate");
+
+    let pair = pre[0].t[7];
+    assert_ne!(pair, packet::dev::TENSOR_NONE, "pre_pair must be bound");
+    assert!(
+        pre.iter().all(|d| d.t[7] == pair),
+        "every sublayer shares ONE pre_pair tensor -- the deferral is a handoff through it"
+    );
+    assert_eq!(m.tensors[pair as usize].name, "act.hc_pre_pair");
+    assert_eq!(
+        m.tensors[pair as usize].bytes,
+        2 * 256 * u64::from(cfg.hc_mult) * 4, // t = 256; emit_dsv41_block takes ctx then t
+        "both halves live in one tensor: [2][t][hc_mult] f32"
+    );
 }
 
 /// Reading the shared CSA2 cache is a PART, and a layer that needs it is not done.

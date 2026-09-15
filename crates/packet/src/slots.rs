@@ -261,7 +261,7 @@ const DOC: &[S] = &[
     S { op: DevOp::GemvQkvMxfp4, t: &["q_out", "x", "W_q", "k_out", "W_k", "v_out", "W_v"], i: &["M", "Nq", "K", "Nk", "Nv", "S_q", "S_k", "S_v"], f: &[], j: &[] },
     // Same demotion: i5/i6/i7 are the three f32[N] dequant-scale TENSOR HANDLES.
     S { op: DevOp::GemvQkvFp8, t: &["q_out", "x", "W_q", "k_out", "W_k", "v_out", "W_v"], i: &["M", "Nq", "K", "Nk", "Nv", "S_q", "S_k", "S_v"], f: &[], j: &[] },
-    S { op: DevOp::HyperConnPre, t: &["post_mix", "comb_mix", "layer_input", "mixes", "residual", "hc_scale", "hc_base"], i: &["T", "n", "hidden", "sinkhorn_repeat"], f: &["rms_eps", "hc_eps"], j: &[] },
+    S { op: DevOp::HyperConnPre, t: &["post_mix", "comb_mix", "layer_input", "mixes", "residual", "hc_scale", "hc_base", "pre_pair"], i: &["T", "n", "hidden", "sinkhorn_repeat", "pre_in_half", "pre_mode"], f: &["rms_eps", "hc_eps"], j: &[] },
     S { op: DevOp::HyperConnPost, t: &["new_residual", "x_out", "residual", "post_mix", "comb_mix"], i: &["T", "n", "hidden", "mode"], f: &[], j: &[] },
     S { op: DevOp::DsaPoolCompress, t: &["compressed_k", "compressed_scale", "slot_k", "slot_score", "ape", "pos"], i: &["n_pools", "pool_size", "head_dim", "chunk_base"], f: &[], j: &[] },
     S { op: DevOp::DsaPoolExpand, t: &["out", "pool_ids", "kv_len"], i: &["rows", "n_groups", "pool_size"], f: &[], j: &[] },

@@ -3631,7 +3631,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
             d_hyperconn_pre((float*)TEN(0), (float*)TEN(1), (bf16*)TEN(2), (const float*)TEN(3),
                             (const bf16*)TEN(4), (const float*)TEN(5), (const float*)TEN(6),
                             in->i[0], in->i[1], in->i[2], in->i[3], in->fj[0].f, in->fj[1].f, slice,
-                            nblk, sm->part);
+                            nblk, sm->part, false, (float*)TEN(7), in->i[4], in->i[5]);
             break;
         case PLOW_DOP_HYPER_CONN_POST:
             d_hyperconn_post((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),

@@ -622,6 +622,10 @@ pub(crate) struct Dsv41Mhc {
     pub(crate) mixes: u32,
     pub(crate) post_mix: u32,
     pub(crate) comb_mix: u32,
+    /// The CROSS-SUBLAYER `pre` gates, `[2][t][hc_mult]` f32 -- both halves in one tensor because
+    /// `HyperConnPre` has 8 tensor slots and already used 7. Sublayer `k` reads half `k % 2` and
+    /// publishes into the other, so consecutive sublayers alternate. See [`super::MhcPre`].
+    pub(crate) pre_pair: u32,
 }
 
 /// Declare the mHC stream for `t` rows. `mix` is `(2 + hc_mult) * hc_mult`, the same derivation
@@ -639,6 +643,7 @@ pub(crate) fn declare_dsv41_mhc(b: &mut Builder, c: &Dsv41Cfg, t: u32) -> Dsv41M
         mixes: b.tensor("act.hc_mixes", r * mix * 4),
         post_mix: b.tensor("act.hc_post_mix", r * n * 4),
         comb_mix: b.tensor("act.hc_comb_mix", r * n * n * 4),
+        pre_pair: b.tensor("act.hc_pre_pair", 2 * r * n * 4),
     }
 }
 
@@ -647,6 +652,21 @@ pub(crate) fn declare_dsv41_mhc(b: &mut Builder, c: &Dsv41Cfg, t: u32) -> Dsv41M
 /// `ffn` picks which of the layer's TWO mHC weight sets to use. Every layer carries both
 /// (`hc_attn_*` and `hc_ffn_*`), which is why there is no mHC-free block to extract from this
 /// model and why the rung has to emit it before anything downstream is meaningful.
+///
+/// # `pi` -- V4.1's mHC is CROSS-SUBLAYER, GLM-5.3's is not
+///
+/// `pi` is the sublayer's index in the emitted chain, counting BOTH halves of every layer:
+/// `2 * (layer index within the chain) + (ffn as usize)`. It picks which half of `m.pre_pair`
+/// this sublayer reads, because V4.1 gates `hc_pre` with the coefficients the PREVIOUS sublayer
+/// produced -- attention with the previous block's `ffn_pre`, the FFN with this block's
+/// `attn_pre` (`model.py:965-996`, and the `Block` docstring says it outright). Binding V4.1
+/// onto GLM's same-sublayer ordering was worth 51.9% relative error on layer 0 ALONE, measured
+/// by `scripts/dsv41_mhc_oracle.py`; `post` and `comb` are same-sublayer in both and unchanged.
+///
+/// `pi == 0` uses [`super::MhcPre::Seed`], the one-hot on copy 0 that `make_identity_pre_mix`
+/// supplies before the model's first block (`model.py:1159-1163`). For a chain that starts at
+/// layer 0 that IS the model; for a rung starting elsewhere it is the rung's synthetic entry, of
+/// a piece with the synthetic residual stream the harness uploads into `act.hc_residual_a`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_dsv41_mhc_pre(
     b: &mut Builder,
@@ -656,6 +676,7 @@ pub(crate) fn emit_dsv41_mhc_pre(
     l: u32,
     ffn: bool,
     ri: usize,
+    pi: usize,
     t: u32,
     deps: &[u32],
 ) -> u32 {
@@ -669,6 +690,14 @@ pub(crate) fn emit_dsv41_mhc_pre(
         post_mix: m.post_mix,
         comb_mix: m.comb_mix,
         layer_input: m.layer_input,
+        pre: {
+            let (pair, in_half) = (m.pre_pair, (pi % 2) as u32);
+            if pi == 0 {
+                super::MhcPre::Seed { pair, in_half }
+            } else {
+                super::MhcPre::Deferred { pair, in_half }
+            }
+        },
     };
     super::emit_mhc_pre(
         b,
@@ -1522,8 +1551,12 @@ pub(crate) fn emit_dsv41_block(
     // The previous layer's last op. Empty for the first, so a one-layer chain emits exactly the
     // instruction stream it did before this was a loop.
     let mut deps: Vec<u32> = Vec::new();
+    // The sublayer index, counting attention and FFN separately: it is what picks the `pre_pair`
+    // half, so it must advance twice per layer and never reset. See `emit_dsv41_mhc_pre`.
+    let mut pi = 0usize;
     for &l in layers {
-        let c_pre = emit_dsv41_mhc_pre(&mut b, c, &w, &mhc, l, false, ri, t, &deps);
+        let c_pre = emit_dsv41_mhc_pre(&mut b, c, &w, &mhc, l, false, ri, pi, t, &deps);
+        pi += 1;
         let (proj, c_proj) =
             emit_dsv41_attn_proj(&mut b, c, &w, &all, l, tp, mhc.layer_input, t, &[c_pre]);
         let (core, c_core) = emit_dsv41_attn_core(
@@ -1534,7 +1567,8 @@ pub(crate) fn emit_dsv41_block(
         let c_post = emit_dsv41_mhc_post(&mut b, c, &mhc, _out.o, ri, t, &[c_out]);
         ri ^= 1;
 
-        let c_pre2 = emit_dsv41_mhc_pre(&mut b, c, &w, &mhc, l, true, ri, t, &[c_post]);
+        let c_pre2 = emit_dsv41_mhc_pre(&mut b, c, &w, &mhc, l, true, ri, pi, t, &[c_post]);
+        pi += 1;
         let (ffn, c_sh) = emit_dsv41_ffn_shared(
             &mut b, c, &w, &all, l, tp, mhc.layer_input, t, &mut xgate, &[c_pre2],
         );
@@ -1665,8 +1699,19 @@ pub(crate) fn emit_dsv41_block(
 /// carry a compressor, only two carry Engram. A rung that picks its layer well can therefore be
 /// completable long before the whole model is.
 pub(crate) fn dsv41_layer_parts(c: &Dsv41Cfg, l: u32) -> Vec<(&'static str, Part)> {
+    // "mhc_pre" here means the CROSS-SUBLAYER one. It read Done for as long as this emit bound
+    // V4.1 onto GLM-5.3's same-sublayer `hc_pre`, which `scripts/dsv41_mhc_oracle.py` prices at
+    // 51.9% relative on layer 0 alone -- V4.1 collapses layer 0's attention with a ONE-HOT
+    // (`make_identity_pre_mix`) where that emit used a learned mix off `hc_attn_fn`. It is Done
+    // again only because `MhcPre::{Seed, Deferred}` now carries the deferral; a caller that
+    // reverts to `MhcPre::Own` makes this line a lie.
+    //
+    // STILL MISSING, and NOT per-layer so it has no row here: the model's TAIL. After the last
+    // block `Transformer.forward` spends the dangling `ffn_pre` on one final `hc_pre`
+    // (`model.py:1268`). A block emit's output is the residual stream, so nothing is wrong yet,
+    // but a whole-model emit owes that collapse.
     let mut p = vec![
-        ("mhc_pre (ops 128/129)", Part::Done),
+        ("mhc_pre (ops 128/129, cross-sublayer `pre`)", Part::Done),
         ("attn_norm + q_a/q_b/wkv projections (op 184)", Part::Done),
     ];
     if c.kv_source.contains(&l) {

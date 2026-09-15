@@ -89,6 +89,11 @@ __device__ __forceinline__ void hc_normalize(float* v, unsigned base, unsigned s
 }
 #endif
 
+/* `pre_mode` for `d_hyperconn_pre` — see the note inside it. */
+#define PLOW_HC_PRE_OWN 0u
+#define PLOW_HC_PRE_SEED 1u
+#define PLOW_HC_PRE_DEFER 2u
+
 /* op 121 — hyper-connections pre-block. See the file header for the shape of the whole
  * thing; this computes `(post_mix, comb_mix, layer_input)` from `mixes` (an ordinary
  * Gemv/Gemm's output — the projection itself is NOT this op's job) and `residual`.
@@ -103,7 +108,32 @@ __device__ void d_hyperconn_pre(float* __restrict__ post_mix, float* __restrict_
                                 const float* __restrict__ hc_base, unsigned T, unsigned n,
                                 unsigned hidden, unsigned sinkhorn_repeat, float rms_eps,
                                 float hc_eps, unsigned slice, unsigned nblk, float* part,
-                                bool head_only = false) {
+                                bool head_only = false, float* __restrict__ pre_pair = nullptr,
+                                unsigned pre_in_half = 0, unsigned pre_mode = PLOW_HC_PRE_OWN) {
+    /* PRE_MODE -- WHICH SUBLAYER'S `pre` GATES THE COLLAPSE.
+     *
+     * GLM-5.3 and DeepSeek-V4.1 disagree here, and the disagreement is invisible in the shapes:
+     * both derive `pre` from `mixes[0..n)` and both collapse `residual` with an n-vector, so the
+     * wrong one runs silently and produces a fluent, wrong model.
+     *
+     *   PLOW_HC_PRE_OWN (GLM-5.3)  reduction 2 gates with the `pre` THIS call just computed.
+     *   PLOW_HC_PRE_SEED (V4.1, first sublayer of the model)  gates with a one-hot on copy 0 --
+     *       `make_identity_pre_mix`, model.py:1159-1163 -- and publishes its own `pre` for the
+     *       next sublayer.
+     *   PLOW_HC_PRE_DEFER (V4.1, everywhere else)  gates with the PREVIOUS sublayer's `pre`, read
+     *       from `pre_pair` half `pre_in_half`, and publishes its own into the other half.
+     *       V4.1's `Block.forward` (model.py:965-996): attention collapses with the previous
+     *       block's `ffn_pre`, the FFN collapses with this block's `attn_pre`. The class docstring
+     *       states it outright -- "the coefficients a sublayer computes are used by the *next*
+     *       one". Priced at 51.9% relative on layer 0 alone by `scripts/dsv41_mhc_oracle.py`.
+     *
+     * `pre_pair` is ONE tensor holding both halves, `[2][T][n]` f32, because `HyperConnPre`
+     * already spends 7 of the descriptor's 8 tensor slots. A sublayer reads half `pre_in_half`
+     * and writes half `pre_in_half ^ 1`, so consecutive sublayers alternate and never alias:
+     * within a call the read and the write are to different halves at the same `t`.
+     *
+     * `post` and `comb` are same-sublayer in BOTH models (the oracle measures 0.000e+00), so
+     * nothing below this comment changes for them. */
     /* HEAD_ONLY — DeepSeek-V4's LEARNED GATED n -> 1 tower exit (`hc_head`,
      * model.py:709-717), which is this op's `layer_input` half and nothing else:
      *
@@ -145,6 +175,10 @@ __device__ void d_hyperconn_pre(float* __restrict__ post_mix, float* __restrict_
             for (unsigned j = 0; j < n; j++) {
                 const float v = (mrow[j] * inv) * hc_scale[0] + hc_base[j];
                 logits[j] = 1.0f / (1.0f + expf(-v)) + hc_eps;
+            }
+            if (pre_mode != PLOW_HC_PRE_OWN) {
+                float* const po = pre_pair + (size_t)(pre_in_half ^ 1u) * T * n + (size_t)t * n;
+                for (unsigned j = 0; j < n; j++) po[j] = logits[j];
             }
         }
         if (threadIdx.x == 0 && !head_only) {
@@ -290,9 +324,18 @@ __device__ void d_hyperconn_pre(float* __restrict__ post_mix, float* __restrict_
          * scalar per stream, broadcast from LDS): layer_input[d] = sum_i pre_mix[i] *
          * residual[i][d], parallel over d. UNNORMED — the caller chains a plain RmsNorm
          * with the block's real layernorm weight afterward, same as KDA's `prenormed`. */
+        /* The gate goes to registers once per token rather than being re-read per `d`: for
+         * PRE_DEFER it would otherwise be an HBM read inside the inner loop. `n` is 4 here (see
+         * the file header -- `logits[24]`/`comb_lds[16]` are sized for it). */
+        float g[4];
+        for (unsigned i = 0; i < n; i++) {
+            g[i] = pre_mode == PLOW_HC_PRE_OWN     ? logits[i]
+                   : pre_mode == PLOW_HC_PRE_SEED  ? (i == 0 ? 1.0f : 0.0f)
+                                                   : pre_pair[(size_t)pre_in_half * T * n + (size_t)t * n + i];
+        }
         for (unsigned d = threadIdx.x; d < hidden; d += PLOW_THREADS) {
             float acc = 0.0f;
-            for (unsigned i = 0; i < n; i++) acc += logits[i] * bf2f(rrow[(size_t)i * hidden + d]);
+            for (unsigned i = 0; i < n; i++) acc += g[i] * bf2f(rrow[(size_t)i * hidden + d]);
             layer_input[(size_t)t * hidden + d] = f2bf(acc);
         }
         __syncthreads(); /* `part`/`logits`/`comb_lds` reused by the next token this workgroup handles */

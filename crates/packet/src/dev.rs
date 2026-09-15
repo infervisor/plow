@@ -1549,11 +1549,30 @@ pub enum DevOp {
     /// something this op should bake in. `mhc_no_norm_weight` (unset in GLM-5.3-Flash's
     /// config, defaults false) selects whether the caller chains that norm at all.
     ///
+    /// `pre_mode` picks WHOSE `pre` gates the collapse, and the two models it serves
+    /// disagree. GLM-5.3 (`pre_mode=0`, `PRE_OWN`) gates with the `pre` this same call
+    /// derives. DeepSeek-V4.1's mHC is CROSS-SUBLAYER: `Block.forward` collapses
+    /// attention with the PREVIOUS block's `ffn_pre` and the FFN with this block's
+    /// `attn_pre`, and the class docstring says so outright — "the coefficients a
+    /// sublayer computes are used by the *next* one" (`model.py:965-996`). So V4.1 uses
+    /// `pre_mode=2` (`PRE_DEFER`), reading `pre_pair` half `pre_in_half` and publishing
+    /// its own `pre` into the other half, with `pre_mode=1` (`PRE_SEED`) on the model's
+    /// FIRST sublayer, where `make_identity_pre_mix` supplies a one-hot on copy 0
+    /// (`model.py:1159-1163`). Nothing distinguishes the two in the shapes, so the wrong
+    /// mode is the "finite, fluent and wrong" failure this file's other notes warn about;
+    /// `scripts/dsv41_mhc_oracle.py` prices it at 51.9% relative on layer 0 alone.
+    ///
+    /// `pre_pair` is ONE `[2,T,n]` f32 tensor rather than a separate in and out, because
+    /// the descriptor has 8 tensor slots and this op already spent 7. Consecutive
+    /// sublayers alternate halves; a call's read and write are to different halves.
+    /// `post` and `comb` stay same-sublayer in both models.
+    ///
     /// `t0=post_mix(out,[T,n]f32) t1=comb_mix(out,[T,n,n]f32)
     /// t2=layer_input(out,[T,hidden]bf16,UNNORMED) t3=mixes(in,[T,n3]f32, the Gemv/Gemm
     /// projection's raw output) t4=residual(in,[T,n,hidden]bf16) t5=hc_scale(in,[3]f32)
-    /// t6=hc_base(in,[n3]f32)` · `i0=T i1=n i2=hidden i3=sinkhorn_repeat` ·
-    /// `f0=rms_eps f1=hc_eps`.
+    /// t6=hc_base(in,[n3]f32) t7=pre_pair(in/out,[2,T,n]f32, TENSOR_NONE when
+    /// pre_mode=0)` · `i0=T i1=n i2=hidden i3=sinkhorn_repeat i4=pre_in_half
+    /// i5=pre_mode` · `f0=rms_eps f1=hc_eps`.
     HyperConnPre = 128,
     /// GLM5-Next's hyper-connections (mHC) post-block — the companion to
     /// [`DevOp::HyperConnPre`], ported the same way from `mhc_post_torch`.

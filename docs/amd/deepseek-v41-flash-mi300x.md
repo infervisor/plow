@@ -2124,6 +2124,93 @@ building the emit. It is no longer true for the compressor, and the same harness
 indexer and the gather -- both are plain PyTorch in the reference. The bar now exists; what remains
 is the work in §12.10 against it, plus these three.
 
+### 12.12 The mHC is CROSS-SUBLAYER, and layer 0 was wrong too
+
+The three §12.11 differences are all in the CSA2 compressor, a part the tree already marked
+`Todo`. This one is in a part it marked **Done**, and the part that dominates the 23.3 ms:
+`HyperConnPre` + `GemvF32` + `HyperConnPost` are 9320 us of it, 48%.
+
+`Block.forward` (`inference/model.py:965-996`) takes `pre_mix` as an **argument**:
+
+```python
+residual = x
+attn_pre, attn_post, attn_comb = self.hc_mixes(x, self.hc_attn_fn, ...)
+x = self.hc_pre(x, pre_mix)        # <- the PREVIOUS block's ffn_pre
+x = self.attn_norm(x); x = self.attn(...)
+x = self.hc_post(x, residual, attn_post, attn_comb)   # post/comb ARE same-sublayer
+residual = x
+ffn_pre, ffn_post, ffn_comb = self.hc_mixes(x, self.hc_ffn_fn, ...)
+x = self.hc_pre(x, attn_pre)       # <- THIS block's attention pre
+...
+return x, ffn_pre                  # <- to the NEXT block
+```
+
+The class docstring states it outright -- *"The coefficients a sublayer computes are used by the
+\*next\* one"* -- and `Transformer.forward` (1260-1268) seeds the chain with
+`make_identity_pre_mix`, a **one-hot** on copy 0, then spends the dangling `ffn_pre` on one final
+`hc_pre` after the last layer.
+
+GLM-5.3's hyper-connection does not do this: `d_hyperconn_pre` derives `pre` and consumes it in the
+same call (`op_hyperconn.h`, lane-0 block then reduction 2), and `MhcHandles` had no field for an
+incoming `pre_mix`. `emit_dsv41_mhc_pre` binds V4.1 onto that op, so V4.1 inherited GLM's ordering.
+**Nothing in the shapes distinguishes them** -- both derive `pre` from `mixes[0..hc_mult)`, both
+collapse the same residual with an `hc_mult`-vector -- which is why it survived the parts table,
+the topological-program test and the activation read/write test.
+
+`scripts/dsv41_mhc_oracle.py` prices it instead of asserting it. Same weights, same input, f64,
+only the ordering varies:
+
+| check | result |
+|---|---|
+| **layer 0 alone**, V4.1 ordering vs GLM ordering | **51.9% relative** |
+| plow's layer-0 attention input vs `residual[0]` (what V4.1 feeds it) | 140.6% relative |
+| 3 layers chained | 36.6% relative |
+| `post`/`comb` under the two orderings | **0.000e+00** -- same-sublayer in both |
+| bump layer 0's `hc_ffn_base[pre]`: residual moves? | 0.000e+00 (no) |
+| ... and layer 1's attention input moves? | 99.2% (yes) -- a real cross-layer dependency |
+| the `[2,T,hc]` ping-pong half arithmetic vs the reference chain | **0.000e+00** |
+
+The last pair is the one that rules out a renaming: perturbing only the `pre` rows of layer 0's FFN
+mix leaves the residual stream bit-identical and still moves layer 1's attention input, because
+that input is gated by coefficients layer 0's FFN produced.
+
+**The fix.** `pre_mode` on op 128, three arms: `PRE_OWN` (GLM, unchanged), `PRE_SEED` (V4.1's first
+sublayer, the one-hot) and `PRE_DEFER` (read the previous sublayer's `pre`). In devgen it is
+`MhcPre::{Own, Seed, Deferred}` -- an enum rather than a bool, so a new caller has to say which
+model it is. The gates travel in ONE `[2, T, hc_mult]` f32 tensor, `act.hc_pre_pair`, because
+`HyperConnPre` had already spent 7 of the descriptor's 8 tensor slots; sublayer `k` reads half
+`k % 2` and publishes into the other, so consecutive sublayers alternate and a call's read and
+write never touch the same half. `the_mhc_pre_gate_comes_from_the_previous_sublayer` pins the mode
+and half sequence of a 2-layer chain (`[1,2,2,2]`, `[0,1,0,1]`), so reverting to `MhcPre::Own` is
+now a test failure rather than a 52% numerical error.
+
+**What this changes about the count.** §12.9 corrected "31 of 40 layers" to "1 of 40". For the
+duration between that correction and this fix, the honest count was **0 of 40**: layer 0 emitted,
+but with the wrong mHC ordering, so the 23.3 ms in §12.4-12.8 was measured on a graph that is not
+the model. The *timing* stands -- the fix adds one f32 store and one f32 load per token per
+sublayer against 5120-wide bf16 traffic, so it is noise -- but the numerics of every run before
+this commit were not V4.1's.
+
+**What is NOT verified.** The oracle checks the SCHEME -- including the half arithmetic, replayed
+through a `[2, T, hc_mult]` buffer indexed exactly as `d_hyperconn_pre` indexes it, which
+reproduces the reference chain to 0.000e+00 in f64. It does not check the HIP. The gfx942 object
+compiles (all 53 rows, `interp_prefill_fp8kv_k3_moe_a4w4` among them), but the `PRE_SEED` and
+`PRE_DEFER` arms have not run on hardware: `hyperconn_sinkhorn_gfx942_test.hip` exercises only
+`PRE_OWN` through the defaulted parameters, and the standalone HIP test link is broken on this box
+(`arc4random@GLIBC_2.36`, nix ROCm lld vs system glibc -- §4.2). A `rung_run` timing pass would
+exercise the arms but cannot check their numerics, since there is still no full-layer parity
+harness.
+
+**Still missing, and not per-layer.** The model's tail: after the last block, `Transformer.forward`
+spends the dangling `ffn_pre` on a final `hc_pre` (`model.py:1268`). A block emit's output is the
+residual stream, so nothing is wrong today, but a whole-model emit owes that collapse.
+
+**The pattern, for the third time.** §12.9 (the CSA2 read side), §12.11 item 3 (the tap between
+norm and rope) and this one are all the same shape: a V4.1 subsystem that is *structurally* a
+rearrangement of a shipped GLM/V4 one, with identical tensor shapes, bound onto the shipped op and
+marked Done. Shape agreement is not evidence. The next candidates to check the same way are the
+indexer's two-level selection and the Engram gate.
+
 ### 12.2 What is still not demonstrated
 
   * ONE layer, not 40. The whole-model emit is still blocked on the subsystems
