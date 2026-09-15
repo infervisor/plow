@@ -1640,6 +1640,64 @@ fn emit_pf_gemm_fp8_blk(
     })
 }
 
+/// One DENSE prefill GEMM against DeepSeek-V4.1's `[32, 32]` **ue8m0** block-fp8 weights —
+/// [`DevOp::GemmFp8Mx`] (184). The twin of [`emit_pf_gemm_fp8_blk`], and deliberately a separate
+/// function for the same reason it is a separate opcode.
+///
+/// `C[t, nn] bf16 = A[t, k] bf16 · W[nn, k] e4m3`, with the checkpoint's own
+/// `[ceil(N/32)][ceil(K/32)]` ue8m0 **byte** grid at `t[3]`. The kernel indexes it
+/// `S[nsblk * ceil(K/32) + kb]` — see `d_gemm_t<WFP8MX>` in `runtime/amd/op_gemm_common.h`.
+///
+/// # Why not a flag on op 107
+///
+/// 107 reads **f32** entries over a grid blocked 128 on both axes; this reads **bytes** over one
+/// blocked 32. Handing 107 a V4.1 scale handle does not fault — it rescales every output by a
+/// number read out of the wrong type at the wrong stride, and the model merely gets worse. The
+/// encoding lives in the opcode so that mismatch is a load-time refusal instead of a silent one.
+///
+/// # What gates the shapes
+///
+/// `K % 32 == 0`, and unlike 107's `K % 64` this is not a margin the checkpoint happens to
+/// satisfy — it is the same fact twice. The kernel is the KEXACT instantiation at `BK = 32`, and
+/// a V4.1 scale grid could not exist at all unless K were a whole number of 32-blocks, so any K
+/// reaching here with a remainder means the grid bound to `t[3]` is not this weight's.
+///
+/// A ragged N is fine (guarded per element, and the kernel clamps its N-scale row so a tile whose
+/// upper j-groups sit past `ceil(N/32)` does not read off the end — `attn.wkv` at N = 576 is
+/// exactly that case). Only K is unforgiving.
+fn emit_pf_gemm_fp8_mx(
+    b: &mut Builder,
+    cus: &[u32],
+    out: u32,
+    x: u32,
+    wt: u32,
+    sc: u32,
+    t: u32,
+    nn: u32,
+    k: u32,
+    deps: &[u32],
+) -> u32 {
+    // Same pairing rule as 107: a block-fp8 weight whose scale handle is TENSOR_NONE is a null
+    // pointer inside the kernel's promotion, i.e. a fault or garbage rather than a wrong number.
+    assert!(
+        wt != TENSOR_NONE && sc != TENSOR_NONE,
+        "GemmFp8Mx needs BOTH the e4m3 weight bytes and the ue8m0 scale grid (weight={wt},          scale={sc}); they are declared as a pair and neither is optional"
+    );
+    assert!(
+        k % 32 == 0,
+        "GemmFp8Mx needs K % 32 == 0 (K = {k}); the kernel is the KEXACT instantiation at BK=32,          and a V4.1 [32,32] scale grid could not exist for a K with a remainder — so this says          the grid bound here is not this weight's, not merely that the tail is ragged"
+    );
+    b.emit(DevOp::GemmFp8Mx, cus.to_vec(), deps, |d| {
+        d.t[0] = out;
+        d.t[1] = x;
+        d.t[2] = wt;
+        d.t[3] = sc;
+        d.i[0] = t;
+        d.i[1] = nn;
+        d.i[2] = k;
+    })
+}
+
 /// `GLM_SHARED_GLU_SPLIT=1` — run `GLM_LINEAR_FP8`'s shared gate/up as TWO CO-RESIDENT
 /// `GEMV_FP8_BLK` (44) halves + a `Glu` (5) instead of ONE `DENSE_GLU_FP8_BLK` (47).
 ///

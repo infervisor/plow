@@ -195,17 +195,19 @@ pub(crate) fn dsv41_gaps(c: &Dsv41Cfg) -> Vec<String> {
     let in_per_group = c.heads * c.head_dim / c.o_groups;
     let [ob, ib] = c.raw.quantization_config.weight_block_size;
     vec![
-        // FIRST, because it gates every projection in the model and no emit plumbing gets past it.
+        // FIRST, because it is now the whole remaining job. The kernel gate that used to lead this
+        // list is CLOSED: op 184 / d_gemm_t<WFP8MX> reads the [{ob}, {ib}] ue8m0 grid, passes 12/12
+        // on gfx942, and `emit_pf_gemm_fp8_mx` emits it. What is left is the emitter around it.
         format!(
-            "block-FP8 at [{ob}, {ib}] with ue8m0 scales: every block-FP8 kernel in plow assumes a \
-             [128, 128] f32 grid (`bsblk[nsblk * KB + kb]`, `KB = (K+127)>>7`, `nsblk = n>>7`, one \
-             convention shared by ops 44/47/85/86), and `mla_ckpt_enc` refuses anything else. That \
-             is 112.0 TFLOP, 39.8% of the 8k prefill -- wq_a/wq_b/wkv/wo_a/wo_b, the shared \
-             expert, engram.wkv and indexer.wq_b. The promotion fires between k-tiles only because \
-             a 128-element K block is exactly two BK=64 tiles; at {ib} it lands inside the MFMA \
-             burst. The MXFP4 fetch path ALREADY reads group-32 E8M0 scale rows, so the work is to \
-             apply that scale handling to an e4m3 weight, not to invent a scheme (GM_BLK_BK is \
-             already a #define). Routed experts are unaffected -- they are MXFP4"
+            "full-model emit: there is no `declare_dsv41_rows_batched` and no \
+             `emit_dsv41_program`. Fork `glm53_emit_full`, which already does prefill buckets plus \
+             decode rungs with mHC at V4.1's own constants (hc_mult={}, sinkhorn={}) -- but the \
+             driver is 82 lines and the work is under it: `declare_glm_rows_batched` is 1182 lines \
+             and V4.1's is a REWRITE, not a copy, since the tensors differ throughout. The target \
+             is fully specified -- `dsv41_layer_tensors` is checked against all 96 085 shard \
+             tensors in both directions -- so this is a long job, not an open question. Start from \
+             `glm_emit_block`'s 61-line --block sibling",
+            c.hc_mult, c.hc_sinkhorn_iters
         ),
         format!(
             "CSA2 emit: the compressor runs on the {} kv_source layers {:?} and every one of the \
@@ -220,12 +222,6 @@ pub(crate) fn dsv41_gaps(c: &Dsv41Cfg) -> Vec<String> {
              index KEYS, because keys derive from the compressor latent",
             c.index_source.len(),
             c.kv_source.len()
-        ),
-        format!(
-            "Engram host side: the tokenizer-derived compressed-token map and the per-step lookback \
-             cache, for layers {:?}. The hash tables themselves are done \
-             (DeepSeekV41Config::engram_hash_tables); device ops 182/183 dispatch",
-            c.engram_layers
         ),
         format!(
             "grouped output LoRA: wo_a is block-diagonal, {} groups of [{}, {}]. NOT a blocker for \
@@ -246,11 +242,6 @@ pub(crate) fn dsv41_gaps(c: &Dsv41Cfg) -> Vec<String> {
              cache and one index list over a flat {}-wide latent with num_key_value_heads=1, where \
              FlashGather* is MLA-shaped (Qabs/Qrope/Ckv/Krope)",
             c.head_dim
-        ),
-        format!(
-            "full-model emit: fork glm53_emit_full, which already emits prefill buckets plus decode \
-             rungs with mHC at V4.1's own constants (hc_mult={}, sinkhorn={})",
-            c.hc_mult, c.hc_sinkhorn_iters
         ),
     ]
 }

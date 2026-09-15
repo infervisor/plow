@@ -279,25 +279,123 @@ fn the_block_fp8_grid_is_32_not_128_and_the_scales_are_e8m0() {
     assert_eq!(*esshape, vec![eshape[0], (eshape[1] * 2 + 31) / 32]);
 }
 
-/// The refusal must NAME the block-FP8 gate, and name it first.
+/// The refusal must lead with what is ACTUALLY missing, and a closed gate must leave the list.
 ///
-/// A reader who runs the emit and gets a list of missing emit features would reasonably start
-/// building them. They would then hit `mla_ckpt_enc`'s refusal with all of that work done, because
-/// the grid is a kernel problem that no emit reaches. Ordering the gap list is the fix.
+/// This test used to assert the opposite -- that the block-FP8 grid came first -- and it was right
+/// to, because a reader who started building emit features would otherwise have hit
+/// `mla_ckpt_enc`'s refusal with all that work done. That gate is now CLOSED: op 184 and
+/// `d_gemm_t<WFP8MX>` read the [32,32] ue8m0 grid, pass 12/12 on gfx942, and `emit_pf_gemm_fp8_mx`
+/// emits it.
+///
+/// A stale gap list is worse than a short one. It sends the next reader to solve a solved problem
+/// and buries the real one, so the check is now BOTH directions: the emit leads, and the kernel
+/// gate is gone entirely.
 #[test]
-fn the_refusal_leads_with_the_block_fp8_gate() {
+fn the_refusal_leads_with_the_emit_and_the_closed_kernel_gate_is_gone() {
     let Some((cfg, _)) = checkpoint() else {
         return;
     };
     let gaps = super::dsv41::dsv41_gaps(&cfg);
     assert!(
-        gaps[0].contains("block-FP8") && gaps[0].contains("[32, 32]"),
-        "the block-FP8 grid gates every projection and must come first; got: {}",
+        gaps[0].contains("full-model emit"),
+        "the emit is the whole remaining job and must come first; got: {}",
         gaps[0]
     );
     assert!(
-        gaps[0].contains("39.8%"),
-        "...and should say how much of the prefill it gates; got: {}",
+        gaps[0].contains("declare_dsv41_rows_batched"),
+        "...and should name what does not exist rather than gesture at a fork; got: {}",
         gaps[0]
     );
+    let joined = gaps.join("\n");
+    assert!(
+        !joined.contains("block-FP8 at ["),
+        "the block-FP8 grid gate is closed (op 184, verified on gfx942) and must not still be \
+         listed as missing:\n{joined}"
+    );
+    assert!(
+        !joined.contains("Engram host side"),
+        "the Engram host side landed (crates/plowrt/src/text/engram.rs) and must not still be \
+         listed as missing:\n{joined}"
+    );
+    // The gaps that ARE still real must survive, or this test would pass on an empty list.
+    assert!(joined.contains("CSA2 emit"), "CSA2 emit is still missing:\n{joined}");
+    assert!(joined.contains("two-level indexer"), "the indexer is still missing:\n{joined}");
+}
+
+/// The op-184 emit primitive, pinned the way `glm_linear_fp8_prefill_routes_to_the_block_fp8_gemm`
+/// pins 107's: as a PURE function, not by setting a knob. The knob is process-global env state and
+/// cargo runs tests in parallel threads, so a sibling that counts tensors would see this one's
+/// handles appear under it.
+///
+/// What actually matters here is the ROUTE. A V4.1 projection must reach [`DevOp::GemmFp8Mx`] and
+/// never [`DevOp::GemmFp8Blk`]: 107 would not fault on these operands, it would read the ue8m0
+/// bytes as f32 at a 128-block stride and rescale every output. Pinning the opcode is pinning the
+/// difference between a wrong model and a right one.
+#[test]
+fn a_v41_projection_routes_to_op_184_and_never_to_107() {
+    let _guard = crate::test_env::env_guard();
+    let mut b = Builder::new(304);
+    // attn.wq_a: [1280, 5120] e4m3 with a [40, 160] ue8m0 grid -- the real shard shapes.
+    let w = b.tensor("attn.wq_a.weight", 1280 * 5120);
+    let sc = b.tensor("attn.wq_a.scale", 40 * 160);
+    let x = b.tensor("act.x", 512 * 5120 * BF16);
+    let o = b.tensor("act.q_a", 512 * 1280 * BF16);
+    let all: Vec<u32> = (0..304u32).collect();
+    emit_pf_gemm_fp8_mx(&mut b, &all, o, x, w, sc, 512, 1280, 5120, &[]);
+    let p = b.finish();
+    assert_eq!(p.insts.len(), 1);
+    let d = &p.insts[0];
+    assert_eq!(
+        d.op,
+        DevOp::GemmFp8Mx as u16,
+        "a [32,32] ue8m0 projection must NOT reach op 107, which would read the byte grid as f32"
+    );
+    assert_eq!([d.t[0], d.t[1], d.t[2], d.t[3]], [o, x, w, sc]);
+    assert_eq!([d.i[0], d.i[1], d.i[2]], [512, 1280, 5120]);
+}
+
+/// `attn.wkv` is N = 576 -- 512 latent + 64 rope -- which is NOT a multiple of the 128-wide tile.
+/// It is the shape that exposed the kernel's out-of-bounds N-scale read, so it earns an emit-side
+/// pin too: a ragged N must be emitted, not refused. Only K is unforgiving here.
+#[test]
+fn a_ragged_n_is_emitted_because_only_k_is_unforgiving() {
+    let _guard = crate::test_env::env_guard();
+    let mut b = Builder::new(304);
+    let w = b.tensor("attn.wkv.weight", 576 * 5120);
+    let sc = b.tensor("attn.wkv.scale", 18 * 160);
+    let x = b.tensor("act.x", 512 * 5120 * BF16);
+    let o = b.tensor("act.kv", 512 * 576 * BF16);
+    let all: Vec<u32> = (0..304u32).collect();
+    emit_pf_gemm_fp8_mx(&mut b, &all, o, x, w, sc, 512, 576, 5120, &[]);
+    assert_eq!(b.finish().insts.len(), 1, "N = 576 is a real V4.1 shape, not an error");
+}
+
+/// A K with a remainder does not mean "ragged tail" here, it means the grid bound to t[3] is not
+/// this weight's -- a V4.1 scale grid cannot exist for such a K. Refuse rather than emit a GEMM
+/// that would read past each weight row into the next output channel with no fault.
+#[test]
+#[should_panic(expected = "not this weight's")]
+fn a_k_that_is_not_a_whole_number_of_32_blocks_is_refused() {
+    let _guard = crate::test_env::env_guard();
+    let mut b = Builder::new(304);
+    let w = b.tensor("w.weight", 1280 * 5121);
+    let sc = b.tensor("w.scale", 40 * 161);
+    let x = b.tensor("act.x", 512 * 5121 * BF16);
+    let o = b.tensor("act.o", 512 * 1280 * BF16);
+    let all: Vec<u32> = (0..304u32).collect();
+    emit_pf_gemm_fp8_mx(&mut b, &all, o, x, w, sc, 512, 1280, 5121, &[]);
+}
+
+/// The scale handle is not optional: a TENSOR_NONE there is a null pointer in the kernel's
+/// promotion. The two handles are declared as a pair; refuse rather than emit half of one.
+#[test]
+#[should_panic(expected = "neither is optional")]
+fn a_weight_without_its_scale_grid_is_refused() {
+    let _guard = crate::test_env::env_guard();
+    let mut b = Builder::new(304);
+    let w = b.tensor("w.weight", 1280 * 5120);
+    let x = b.tensor("act.x", 512 * 5120 * BF16);
+    let o = b.tensor("act.o", 512 * 1280 * BF16);
+    let all: Vec<u32> = (0..304u32).collect();
+    emit_pf_gemm_fp8_mx(&mut b, &all, o, x, w, TENSOR_NONE, 512, 1280, 5120, &[]);
 }
