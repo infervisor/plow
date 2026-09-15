@@ -267,6 +267,7 @@ if [ -n "${PLOW_HSACO_CONFIG:-}" ]; then
       PLOW_KDA_CONV_STEP_DB) [ "$val" = 1 ] && : "${PLOW_K3_KDA_CONV_STEP_DB:=1}" ;;
       PLOW_MOE_PF_ATOMIC)    [ "$val" = 1 ] && : "${PLOW_MOE_PF_ATOMIC:=1}" ;;
       PLOW_MOE_PF_DET)       [ "$val" = 1 ] && : "${PLOW_MOE_PF_DET:=1}" ;;
+      PLOW_DSV41_BLKFP8)     [ "$val" = 1 ] && : "${PLOW_DSV41_BLKFP8:=1}" ;;
       PLOW_GLM_FUSE_QNORM)   [ "$val" = 1 ] && : "${PLOW_GLM_FUSE_QNORM:=1}" ;;
       PLOW_GLM_FUSE_POST)    [ "$val" = 1 ] && : "${PLOW_GLM_FUSE_POST:=1}" ;;
       PLOW_GLM_FUSE_SEAM_RN) [ "$val" = 1 ] && : "${PLOW_GLM_FUSE_SEAM_RN:=1}" ;;
@@ -1113,6 +1114,21 @@ if [ "${PLOW_MOE_PF_DET:-1}" != 0 ]; then
   if [ "${PLOW_DECODE_BATCH:-1}" -gt 1 ]; then
     AX_DECODE="$AX_DECODE -DPLOW_MOE_PF_DET=${PLOW_MOE_PF_DET:-1}"
   fi
+fi
+
+# OPT-IN (PLOW_DSV41_BLKFP8=1): op 184, the [32,32] block-FP8 GEMM DeepSeek-V4.1-Flash's dense
+# and shared-expert projections are stored in. It is a separate opcode from op 107 rather than a
+# field on it -- `const unsigned char*` against `const float*`, over a grid blocked 32 on both axes
+# instead of 128 -- so the arm is additive and costs nothing when the packet does not ask for it.
+#
+# PREFILL ROWS ONLY: `exec_gemm_fp8_mx` lives inside `#if PLOW_BUCKET_PREFILL` (interp.hip:2681).
+#
+# Marker-checked, not silently skipped. `plow_dsv41_blkfp8_arm` is the symbol plowrt looks for, and
+# without it the load is REFUSED by name -- which is what a V4.1 rung did here on its first attempt.
+# The refusal is the point: the AMD dispatch `default:` does not trap, so an unbuilt arm would leave
+# every block-FP8 projection's output untouched and the prefill would complete with garbage.
+if [ "${PLOW_DSV41_BLKFP8:-0}" = 1 ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_DSV41_BLKFP8=1"
 fi
 
 # CEILING INSTRUMENT ONLY (PLOW_MLA_PF2_ABL=1..4): the V2 MLA prefill's ablation probes —
