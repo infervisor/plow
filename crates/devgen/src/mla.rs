@@ -11279,7 +11279,7 @@ mod kimi_k3;
 pub(crate) use kimi_k3::{k3_emit_full, kimi_k3_emit};
 
 mod dsv41;
-pub(crate) use dsv41::{cfg_dsv41, dsv41_gaps, dsv41_shard_check};
+pub(crate) use dsv41::{cfg_dsv41, dsv41_emit_block_plan, dsv41_gaps, dsv41_shard_check};
 
 // ===== tests moved from lib.rs (module breakdown): access mla internals directly =====
 #[cfg(test)]

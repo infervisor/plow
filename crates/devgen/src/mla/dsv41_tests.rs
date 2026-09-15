@@ -623,3 +623,50 @@ fn the_latent_and_the_query_are_parallel_branches_off_the_same_norm() {
          chain, which computes identical numbers and is simply slower"
     );
 }
+
+/// The rung plan must be PER-LAYER, because that is what makes a rung reachable before the whole
+/// model is: layer 0 carries 8 parts, layer 1 adds Engram, layer 2 adds the compressor and the
+/// indexer. A plan that reported the same list everywhere would hide the fact that the cheapest
+/// rung is a plain layer, not a kv_source one.
+///
+/// This is the answer to "what is missing" that comes from RUNNING plowc rather than from reading
+/// prose, so it is worth a test that the counts actually differ and that the list shrinks as work
+/// lands (the emitted set is non-empty today, and every part named in it is real).
+#[test]
+fn the_rung_plan_is_per_layer_and_names_what_is_emitted() {
+    let Some((cfg, _)) = checkpoint() else {
+        return;
+    };
+    let n = |l: u32| super::dsv41::dsv41_layer_parts(&cfg, l).len();
+    let plain = *cfg
+        .kv_source
+        .iter()
+        .chain(cfg.engram_layers.iter())
+        .max()
+        .map(|_| &0u32)
+        .unwrap_or(&0);
+    assert!(!cfg.engram_layers.contains(&plain) && !cfg.kv_source.contains(&plain));
+    let eng = cfg.engram_layers[0];
+    let kv = cfg.kv_source[0];
+    assert!(
+        n(plain) < n(eng) && n(eng) < n(kv),
+        "a plain layer must be the cheapest rung: got plain={} engram={} kv_source={}",
+        n(plain),
+        n(eng),
+        n(kv)
+    );
+    // The projections ARE emitted, so the plan must say so rather than reporting everything todo.
+    let parts = super::dsv41::dsv41_layer_parts(&cfg, plain);
+    let done: Vec<_> = parts
+        .iter()
+        .filter(|(_, st)| *st == super::dsv41::Part::Done)
+        .collect();
+    assert_eq!(done.len(), 1, "the projection chain is the one part that is emitted");
+    // And the rung still REFUSES, because a partial blob would run and produce garbage.
+    let err = super::dsv41::dsv41_emit_block_plan(&cfg, plain).unwrap_err();
+    assert!(err.contains("fluent-looking garbage"), "the refusal must say why: {err}");
+    assert!(
+        err.contains("kernels are NOT the gap"),
+        "and must not read as a kernel gap, since ops 180-184 all pass on gfx942: {err}"
+    );
+}

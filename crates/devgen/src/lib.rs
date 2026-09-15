@@ -7745,6 +7745,35 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
     // (hc_mult 4, sinkhorn 20) reading V4.1's own tensor names, so the full-model emit forks that
     // rather than starting over.
     if model_type == "deepseek_v41" || model_type == "deepseek_v41_text" {
+        // A RUNG request (`--block L`, or PLOW_LAYERS=single:L) gets the per-layer plan rather
+        // than the whole-model refusal. The two say different things and the difference is the
+        // point: the model-level message lists what the EMITTER lacks, while a rung names which
+        // parts of ONE layer are emitted and which are not -- which is the thing that shrinks as
+        // work lands, and the thing gpuq's tier-3 bring-up path actually asks for.
+        //
+        // It still refuses. A rung that emitted only the parts that exist would load, run and
+        // produce fluent-looking garbage, which is worse than not emitting.
+        let single = emit_config::active().layer_cfg().2;
+        if let Some(l) = block_spec
+            .as_deref()
+            .and_then(|s| s.split("..").next())
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .or(single)
+        {
+            // A config that does not parse is a DIFFERENT failure from an unemitted part, and
+            // saying so keeps a checkpoint problem from reading as missing emit work.
+            let c = mla::cfg_dsv41(&dir)
+                .unwrap_or_else(|e| panic!("deepseek_v41 --block {l}: the config does not parse, \
+                     so there is nothing to plan a rung against: {e}"));
+            match mla::dsv41_emit_block_plan(&c, l) {
+                Ok(parts) => panic!(
+                    "deepseek_v41 layer {l}: every part is emitted ({}) but no writer is wired \
+                     yet. Missing capability: `emit_dsv41_block_writer`.",
+                    parts.len()
+                ),
+                Err(report) => panic!("{report}"),
+            }
+        }
         panic!("{}", dsv41_refusal(&dir));
     }
     if model_type == "glm5_next" {

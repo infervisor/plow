@@ -443,6 +443,96 @@ pub(crate) fn emit_dsv41_attn_proj(
     (act, c_kv)
 }
 
+/// One sublayer a V4.1 rung has to emit, and whether it is emitted yet.
+///
+/// This exists so the answer to "what is missing" comes from RUNNING plowc rather than from
+/// reading the source and hoping the prose kept up. `dsv41_gaps` describes the shape of the work;
+/// this enumerates it per layer against the config, so a rung either emits or says precisely
+/// which of its parts does not.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Part {
+    Done,
+    Todo,
+}
+
+/// The ops one layer needs, in dataflow order, each marked done or not.
+///
+/// Per LAYER rather than per model because the optional groups differ: only the kv_source layers
+/// carry a compressor, only two carry Engram. A rung that picks its layer well can therefore be
+/// completable long before the whole model is.
+pub(crate) fn dsv41_layer_parts(c: &Dsv41Cfg, l: u32) -> Vec<(&'static str, Part)> {
+    let mut p = vec![
+        ("mhc_pre (ops 128/129)", Part::Todo),
+        ("attn_norm + q_a/q_b/wkv projections (op 184)", Part::Done),
+    ];
+    if c.kv_source.contains(&l) {
+        p.push(("csa2 compressor (ops 180/181)", Part::Todo));
+    }
+    if c.index_source.contains(&l) {
+        p.push(("indexer queries (two-level)", Part::Todo));
+    }
+    p.push(("attention core (absorbed MLA over the 512 latent)", Part::Todo));
+    p.push(("output projection wo_a (grouped) + wo_b (op 184)", Part::Todo));
+    p.push(("ffn_norm", Part::Todo));
+    if c.engram_layers.contains(&l) {
+        p.push(("engram gate + embed (ops 182/183)", Part::Todo));
+    }
+    p.push(("moe router + routed experts (ops 85/86, MXFP4)", Part::Todo));
+    p.push(("shared expert (op 184)", Part::Todo));
+    p.push(("mhc_post", Part::Todo));
+    p
+}
+
+/// Emit ONE layer as a ladder rung, or refuse naming exactly what is not emitted yet.
+///
+/// The target is `plowc --block L` / `PLOW_LAYERS=single:L`, which is gpuq's tier-3 bring-up path.
+/// A rung is explicitly a VALIDATION artifact and not a serving model -- the same contract
+/// `glm_emit_block` has -- so it may be narrower than the full emit, but it must never be WRONG:
+/// a blob missing its attention core would load and run and produce fluent-looking garbage, which
+/// is the exact failure this campaign has spent its time avoiding. So the refusal is the feature
+/// until every part is done.
+///
+/// Returns `Ok` with the finished parts once there are none left, `Err` with a per-part report
+/// otherwise.
+pub(crate) fn dsv41_emit_block_plan(c: &Dsv41Cfg, l: u32) -> Result<Vec<&'static str>, String> {
+    assert!(
+        l < c.layers,
+        "layer {l} is out of range for a {}-layer model",
+        c.layers
+    );
+    let parts = dsv41_layer_parts(c, l);
+    let todo: Vec<&str> = parts
+        .iter()
+        .filter(|(_, st)| *st == Part::Todo)
+        .map(|(n, _)| *n)
+        .collect();
+    if todo.is_empty() {
+        return Ok(parts.iter().map(|(n, _)| *n).collect());
+    }
+    let done: Vec<&str> = parts
+        .iter()
+        .filter(|(_, st)| *st == Part::Done)
+        .map(|(n, _)| *n)
+        .collect();
+    Err(format!(
+        "deepseek_v41 layer {l} cannot be emitted as a rung yet: {} of {} parts are done.\n\
+         \n  emitted:\n{}\n  not emitted:\n{}\n\
+         \nA rung is a validation artifact, not a serving model, so it MAY be narrower than the \
+         full emit -- but it must not be wrong. A blob missing its attention core loads, runs, and \
+         produces fluent-looking garbage, so this refuses instead of writing one.\n\
+         The kernels are NOT the gap: ops 180/181, 182/183 and 184 all exist and pass on gfx942. \
+         What is missing is the emit around them. Missing capability: `emit_dsv41_block`.",
+        done.len(),
+        parts.len(),
+        done.iter()
+            .map(|n| format!("    + {n}\n"))
+            .collect::<String>(),
+        todo.iter()
+            .map(|n| format!("    - {n}\n"))
+            .collect::<String>(),
+    ))
+}
+
 /// One weight the emit binds: the checkpoint name (without the `layers.{l}.` prefix) and its
 /// size in BYTES.
 ///
