@@ -10044,10 +10044,17 @@ impl AmdEngine {
 
         // --- pinned staging --------------------------------------------------
         let n_dec_inst = blob.progs[decode].insts.len();
-        let mut h_inst =
-            EngineDevice::host_alloc_pinned(&*be, n_dec_inst * std::mem::size_of::<DevInst64>())?;
-        h_inst
-            .as_mut_slice()
+        // `.max(1)`: a single-block PREFILL RUNG carries an EMPTY decode program -- `derive_roles`
+        // is positional, so the placeholder is what makes the rung's real work classify as a
+        // prefill bucket -- and `hsa_amd_memory_pool_allocate` refuses a zero-byte request with
+        // HSA_STATUS_ERROR_INVALID_ARGUMENT rather than returning a null. One unused instruction's
+        // worth of pinned staging is cheaper than a special case, and the copy below is a no-op at
+        // length zero.
+        let mut h_inst = EngineDevice::host_alloc_pinned(
+            &*be,
+            n_dec_inst.max(1) * std::mem::size_of::<DevInst64>(),
+        )?;
+        h_inst.as_mut_slice()[..n_dec_inst * std::mem::size_of::<DevInst64>()]
             .copy_from_slice(as_bytes(&blob.progs[decode].insts));
         // Prefill stages ids AND pos for a whole chunk, so this must hold
         // 2 * max_bucket_T * 4 bytes. Sizing it at a fixed 64 KiB silently
