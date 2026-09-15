@@ -5139,12 +5139,40 @@ __device__ void d_gemv_f32(float* __restrict__ C, const bf16* __restrict__ x,
         for (unsigned m = slice; m < M; m += nblk) {
             const bf16* const xm = x + (size_t)m * K;
             float* const cm = C + (size_t)m * N;
-            for (unsigned n = wave; n < N; n += PLOW_WAVES) {
-                const float* const wn = W + (size_t)n * K;
-                float acc = 0.0f;
-                for (unsigned k = lane; k < K; k += PLOW_WAVE) acc += bf2f(xm[k]) * wn[k];
-                acc = wave_sum(acc);
-                if (lane == 0) cm[n] = acc;
+            /* FOUR COLUMNS PER PASS over x, not one. A column's dot product reads the whole
+             * `xm` row, so one-at-a-time reads the row once per column -- 24 times at V4.1's
+             * N=24, which is 8 GB of x traffic where the tensor is 335 MB. Carrying four
+             * accumulators against one `bf2f(xm[k])` cuts that by four and gives the VALU four
+             * independent FMA chains instead of one dependent one. */
+            for (unsigned n0 = wave; n0 < N; n0 += PLOW_WAVES * 4u) {
+                const unsigned n1 = n0 + PLOW_WAVES;
+                const unsigned n2 = n0 + 2u * PLOW_WAVES;
+                const unsigned n3 = n0 + 3u * PLOW_WAVES;
+                /* A tail slot with no column of its own ALIASES n0: it re-reads a row already
+                 * in cache, its accumulator is dropped unstored, and the k loop stays
+                 * branch-free. N=24 over 8 waves leaves exactly one such slot per wave. */
+                const float* const w0 = W + (size_t)n0 * K;
+                const float* const w1 = W + (size_t)(n1 < N ? n1 : n0) * K;
+                const float* const w2 = W + (size_t)(n2 < N ? n2 : n0) * K;
+                const float* const w3 = W + (size_t)(n3 < N ? n3 : n0) * K;
+                float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+                for (unsigned k = lane; k < K; k += PLOW_WAVE) {
+                    const float xv = bf2f(xm[k]);
+                    a0 += xv * w0[k];
+                    a1 += xv * w1[k];
+                    a2 += xv * w2[k];
+                    a3 += xv * w3[k];
+                }
+                a0 = wave_sum(a0);
+                a1 = wave_sum(a1);
+                a2 = wave_sum(a2);
+                a3 = wave_sum(a3);
+                if (lane == 0) {
+                    cm[n0] = a0;
+                    if (n1 < N) cm[n1] = a1;
+                    if (n2 < N) cm[n2] = a2;
+                    if (n3 < N) cm[n3] = a3;
+                }
             }
         }
         return;
