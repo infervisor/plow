@@ -2622,23 +2622,18 @@ fn run_one_tick(
                             })
                         })
                         .count();
-                    // ADMIT ONLY A STEP THAT IS ACTUALLY BATCHING SOMETHING.
+                    // ADMIT ONLY A STEP THAT ACTUALLY PACKS PREFILLS.
                     //
                     // `feeds + completing > 0` is the CORRECTNESS floor: without a sampled row
-                    // there is no output segment to run. `>= 2` is the policy on top of it:
-                    // a prompt admitted alone does no cross-request packing and may run a rung
-                    // with fewer attention workgroups than ordinary execution would pick —
-                    // measured on Gemma-4 31B at concurrency 1, -3.5% throughput and -35% TTFT
-                    // at 512 input, -10.5% and -48.8% at 2048 — for no packing at all, because
-                    // there is nothing to pack it with. The ordinary route already samples a
-                    // completing prompt's last row in its own prefill program with no extra
-                    // pass, so there is nothing to win there either.
+                    // there is no output segment to run. Two prefill members is the policy on
+                    // top of it. Decode rows do not make a lone prefill a packed-prefill step:
+                    // at 70K/C20, fusing decode with one full 8192-row member was 4.5% slower
+                    // than the ordinary independent paths.
                     //
                     // `--amd-token-batch-solo` restores the unconditional form, which is what
                     // the first campaign measured; it exists so the policy stays falsifiable.
-                    let members = feeds.len() + pack.len();
                     if feeds.len() + completing > 0
-                        && (members >= 2
+                        && (pack.len() >= 2
                             || crate::config::RuntimeConfig::get().amd.token_batch_solo)
                     {
                         chosen = Some((rows, pack));
