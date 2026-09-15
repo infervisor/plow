@@ -1630,6 +1630,47 @@ fn a_block_range_emits_every_layer_in_it_chained() {
     assert_eq!(d5.layer, 3, "the descriptor names the first layer of the chain");
 }
 
+/// Engram runs BEFORE the block, on the hc-expanded stream -- not inside the FFN sublayer.
+///
+/// `Block.__init__` constructs `self.engram`, which is what makes an FFN-sublayer position look
+/// right, but `Block.forward` never calls it. `Transformer.forward` does, in the layer loop and
+/// ahead of the block (`model.py:1262-1267`), so op 182 is in place on `[T, hc_mult, dim]` --
+/// the residual stream's copies -- before this layer's `mhc_pre` collapses them. An emit built off
+/// the old row order would have handed it the post-attention activation instead, which is a
+/// different tensor of a different rank.
+///
+/// Ops 182/183 themselves ARE the reference's -- `scripts/dsv41_engram_oracle.py` measures
+/// 0.000e+00 on the embed (including the signed out-of-shard compare) and 2.2e-16 on the gate --
+/// so placement and plumbing is the whole of what layers 1 and 14 are still missing.
+#[test]
+fn engram_is_the_first_part_of_its_layer_not_an_ffn_one() {
+    let Some((cfg, _)) = checkpoint() else {
+        return;
+    };
+    let _guard = crate::test_env::env_guard();
+
+    let eng: Vec<u32> = (0..cfg.layers)
+        .filter(|l| cfg.engram_layers.contains(l))
+        .collect();
+    assert_eq!(eng, vec![1, 14], "the checkpoint's engram_layer_ids");
+
+    for l in 0..cfg.layers {
+        let parts = super::dsv41::dsv41_layer_parts(&cfg, l);
+        let at = parts.iter().position(|(n, _)| n.starts_with("engram"));
+        let mhc = parts
+            .iter()
+            .position(|(n, _)| n.starts_with("mhc_pre"))
+            .expect("every layer has an mhc_pre part");
+        if eng.contains(&l) {
+            let at = at.unwrap_or_else(|| panic!("layer {l} is an engram layer and has no engram part"));
+            assert_eq!(at, 0, "layer {l}: engram is the FIRST part -- it precedes the block");
+            assert!(at < mhc, "layer {l}: engram must precede mhc_pre, not follow ffn_norm");
+        } else {
+            assert!(at.is_none(), "layer {l} is not an engram layer");
+        }
+    }
+}
+
 /// V4.1's mHC is CROSS-SUBLAYER: every `hc_pre` collapses with the PREVIOUS sublayer's `pre`.
 ///
 /// `Block.forward` (`model.py:965-996`) takes `pre_mix` as an ARGUMENT -- the previous block's

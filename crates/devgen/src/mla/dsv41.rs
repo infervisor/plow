@@ -1710,10 +1710,31 @@ pub(crate) fn dsv41_layer_parts(c: &Dsv41Cfg, l: u32) -> Vec<(&'static str, Part
     // block `Transformer.forward` spends the dangling `ffn_pre` on one final `hc_pre`
     // (`model.py:1268`). A block emit's output is the residual stream, so nothing is wrong yet,
     // but a whole-model emit owes that collapse.
-    let mut p = vec![
-        ("mhc_pre (ops 128/129, cross-sublayer `pre`)", Part::Done),
-        ("attn_norm + q_a/q_b/wkv projections (op 184)", Part::Done),
-    ];
+    let mut p = vec![];
+
+    // ENGRAM RUNS BEFORE THE BLOCK, NOT INSIDE IT. This row used to sit between `ffn_norm` and the
+    // MoE, which is where a reading of `Block.__init__` puts it -- the module is constructed on
+    // the Block. But `Block.forward` never calls it. `Transformer.forward` does, in the layer
+    // loop and BEFORE the block:
+    //
+    //     if layer.engram is not None:
+    //         h = layer.engram(h, engram_hashes[:, :, layer.engram.layer_hash_index, :], mask)
+    //     h, pre_mix = layer(h, start_pos, pre_mix, image_mask)   # model.py:1262-1267
+    //
+    // so it reads and writes the hc-EXPANDED residual stream (`[T, hc_mult, dim]`, op 182 is in
+    // place on it) before this layer's mHC pre ever runs -- not the post-attention activation an
+    // FFN-sublayer position would hand it. `scripts/dsv41_engram_oracle.py` confirms ops 182/183
+    // themselves are the reference's, to 0.000e+00 on the embed and 2.2e-16 on the gate, so the
+    // whole of what is left here is placement and plumbing.
+    if c.engram_layers.contains(&l) {
+        p.push((
+            "engram gate + embed (ops 182/183), BEFORE mhc_pre, in place on the hc stream",
+            Part::Todo,
+        ));
+    }
+
+    p.push(("mhc_pre (ops 128/129, cross-sublayer `pre`)", Part::Done));
+    p.push(("attn_norm + q_a/q_b/wkv projections (op 184)", Part::Done));
     if c.kv_source.contains(&l) {
         p.push(("csa2 compressor (ops 180/181)", Part::Todo));
     }
@@ -1746,9 +1767,6 @@ pub(crate) fn dsv41_layer_parts(c: &Dsv41Cfg, l: u32) -> Vec<(&'static str, Part
     p.push(("output projection wo_a + wo_b (op 184)", Part::Done));
     p.push(("output all-reduce (XReduce, wo_b is input-parallel)", Part::Done));
     p.push(("ffn_norm", Part::Done));
-    if c.engram_layers.contains(&l) {
-        p.push(("engram gate + embed (ops 182/183)", Part::Todo));
-    }
     p.push(("moe router + routed experts (ops 85/86, MXFP4)", Part::Done));
     p.push(("shared expert (op 184 + clamped SwiGLU)", Part::Done));
     p.push(("mhc_post", Part::Done));
