@@ -16,6 +16,7 @@ def main():
     parser.add_argument("build_json", type=Path)
     parser.add_argument("precision", choices=("bf16", "fp8"))
     parser.add_argument("profile", choices=("c128", "wide"))
+    parser.add_argument("kv_precision", choices=("bf16", "fp8-kv"), nargs="?", default="bf16")
     args = parser.parse_args()
     build = json.loads(args.build_json.read_text())
 
@@ -23,10 +24,11 @@ def main():
     require(build.get("n_cu") == 304, "asset CU count is not MI300X's 304")
     precision = build.get("precision", {})
     expected = (
-        {"weight_enc": "bf16", "act_enc": "bf16", "kv_enc": "bf16"}
+        {"weight_enc": "bf16", "act_enc": "bf16"}
         if args.precision == "bf16"
-        else {"weight_enc": "fp8", "act_enc": "mixed", "kv_enc": "bf16"}
+        else {"weight_enc": "fp8", "act_enc": "mixed"}
     )
+    expected["kv_enc"] = "fp8" if args.kv_precision == "fp8-kv" else "bf16"
     for axis, value in expected.items():
         require(precision.get(axis) == value, f"{axis} is not {value}")
 
@@ -74,6 +76,8 @@ def main():
         "PLOW_L2_PLACE_PREFILL": "0",
         "PLOW_MAX_CHUNK": str(expected_prefill[-1]),
     }
+    if args.kv_precision == "fp8-kv":
+        required_replay["PLOW_FP8_KV"] = "1"
     for name, value in required_replay.items():
         require(str(replay.get(name)) == value, f"emit replay does not pin {name}={value}")
 

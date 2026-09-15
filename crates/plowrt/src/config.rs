@@ -1855,12 +1855,22 @@ mod tests {
     fn amd_vmm_kv_defaults_to_auto_and_accepts_explicit_overrides() {
         use clap::{Args, FromArgMatches};
         let command = super::AmdRuntimeConfig::augment_args(clap::Command::new("test"));
-        assert!(command.get_arguments().find(|arg| arg.get_id() == "vmm_kv")
-            .unwrap().get_default_values().is_empty());
+        assert!(
+            command
+                .get_arguments()
+                .find(|arg| arg.get_id() == "vmm_kv")
+                .unwrap()
+                .get_default_values()
+                .is_empty()
+        );
         for (flag, expected) in [("--amd-vmm-kv", true), ("--amd-vmm-kv=false", false)] {
             let matches = command.clone().try_get_matches_from(["test", flag]).unwrap();
-            assert_eq!(super::AmdRuntimeConfig::from_arg_matches(&matches).unwrap().vmm_kv,
-                Some(expected));
+            assert_eq!(
+                super::AmdRuntimeConfig::from_arg_matches(&matches)
+                    .unwrap()
+                    .vmm_kv,
+                Some(expected)
+            );
         }
     }
 

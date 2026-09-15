@@ -3,11 +3,12 @@
 set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-usage="usage: $0 <hf-dir> <output-dir> <bf16|fp8> <c128|wide>"
+usage="usage: $0 <hf-dir> <output-dir> <bf16|fp8> <c128|wide> [bf16|fp8-kv]"
 hf_dir="${1:?$usage}"
 output="${2:?$usage}"
 precision="${3:?$usage}"
 profile="${4:?$usage}"
+kv_precision="${5:-bf16}"
 # 18K covers a 16K prompt plus decode and keeps Gemma's 1024-byte full-KV
 # head window divisible by gfx942 ROCr's 2 MiB VMM granule.
 max_ctx=18432
@@ -19,6 +20,7 @@ max_ctx=18432
 [ -f "$hf_dir/config.json" ] || { echo "FAIL: $hf_dir/config.json is missing" >&2; exit 2; }
 hf_dir="$(cd "$hf_dir" && pwd)"
 case "$precision" in bf16|fp8) ;; *) echo "FAIL: precision must be bf16 or fp8" >&2; exit 2;; esac
+case "$kv_precision" in bf16|fp8-kv) ;; *) echo "FAIL: KV precision must be bf16 or fp8-kv" >&2; exit 2;; esac
 case "$profile" in
   c128)
     decode_batch=128
@@ -50,6 +52,9 @@ precision_env=()
 if [ "$precision" = fp8 ]; then
   precision_env=(PLOW_FP8=1 PLOW_W8A8=1)
 fi
+if [ "$kv_precision" = fp8-kv ]; then
+  precision_env+=(PLOW_FP8_KV=1)
+fi
 
 env \
   PLOW_DECODE_BATCH="$decode_batch" \
@@ -64,7 +69,7 @@ env \
     --max-ctx "$max_ctx" --emit devblob --out "$stage/assets"
 
 python3 "$repo/scripts/check_gemma4_gfx942_assets.py" \
-  "$stage/assets/build.json" "$precision" "$profile"
+  "$stage/assets/build.json" "$precision" "$profile" "$kv_precision"
 
 PLOW_HSACO_CONFIG="$stage/assets" \
   "$repo/scripts/build_gfx942.sh" "$stage/hsaco"
@@ -87,6 +92,7 @@ printf '%s\n' "$source_commit" > "$stage/source-commit.txt"
   printf 'source_remote=%s\n' "$(git -C "$repo" remote get-url origin)"
   printf 'precision=%s\n' "$precision"
   printf 'profile=%s\n' "$profile"
+  printf 'kv_precision=%s\n' "$kv_precision"
   printf 'max_ctx=%s\n' "$max_ctx"
   printf 'nix=%s\n' "$(nix --version)"
   cargo --version
@@ -105,13 +111,14 @@ printf '%s\n' \
   "expected_commit=$source_commit" \
   "precision=$precision" \
   "profile=$profile" \
+  "kv_precision=$kv_precision" \
   '[ "$(git -C "$repo" rev-parse HEAD)" = "$expected_commit" ] || {' \
   '  echo "FAIL: checkout must be at $expected_commit" >&2' \
   '  exit 2' \
   '}' \
   '( cd "$hf_dir" && sha256sum -c "$bundle/CHECKPOINT_SHA256SUMS" )' \
   'exec nix develop "$repo" --command "$repo/scripts/build_gemma4_gfx942_assets.sh" \' \
-  '  "$hf_dir" "$output" "$precision" "$profile"' \
+  '  "$hf_dir" "$output" "$precision" "$profile" "$kv_precision"' \
   > "$stage/REPRODUCE.sh"
 chmod +x "$stage/REPRODUCE.sh"
 ( cd "$stage" && {
