@@ -1082,6 +1082,26 @@ pub(crate) enum Part {
 ///
 /// Emitting `<512, 64>` here instead would read 64 bytes past every latent row and still produce
 /// fluent output, which is the failure this rung refuses on purpose.
+/// EVERY layer attends over a sliding window, and that is the cheapest fact in this model.
+///
+/// `inference/model.py:78` states it outright -- "every layer attends over a sliding window, and
+/// may add compressed KV on top" -- with `window_size` 128 and a per-layer `compress_ratios` where
+/// 0 means window-only. Layer 0 is window-only: `kv_source_layer_ids` is [2, 8, 14, 20].
+///
+/// So layer 0's attention is O(T * 128), not O(T^2). At 8k and tp=8 that is
+/// `8192 * 128 * 8 heads * 512 * 4` = 17.2 GFLOP per rank, against 4.4 TFLOP for the full causal
+/// form across the ranks -- roughly 32x less work. The attention core is NOT where the 90 ms goes;
+/// the projections (82.98 TFLOP) and the experts (139.16 + 23.19) are.
+///
+/// And it needs no new kernel. `get_window_topk_idxs` (`model.py:410`) materialises exactly a
+/// `[b, m, topk] int32` table -- "sparse_attn needs real [b, m, topk] int32 memory" -- which is the
+/// shape [`DevOp::FlashGatherPrefill`] already takes in `t7` with `top_k` in `i6`. The window is a
+/// selection table whose rows happen to be contiguous, so the sparse gather arm GLM's DSA path
+/// already uses serves it directly. `-1` marks a slot before the sequence started.
+///
+/// That reframes "SWA Bounded Replay" from a kernel feature to a table to fill. What remains is
+/// building the table and the emit around it -- and the decode ring form
+/// (`model.py:422`, oldest-first over a `start_pos % window` rotation), which prefill does not need.
 pub(crate) fn dsv41_attn_core_shape(c: &Dsv41Cfg) -> (u32, u32, u32) {
     let nope = c.head_dim - c.qk_rope;
     (c.head_dim, nope, c.qk_rope)

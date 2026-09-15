@@ -1080,3 +1080,24 @@ fn the_attention_core_is_512_wide_with_the_rope_inside_it() {
     // The config carries no kv_lora_rank at all -- there is nothing to read a V3 shape out of.
     assert!(cfg.raw.q_lora_rank > 0);
 }
+
+/// Layer 0 is window-only, which is what makes its attention cheap.
+///
+/// `compress_ratios` 0 means sliding window with no compressed KV on top, and only the
+/// `kv_source` layers carry a compressor. Getting this wrong the other way -- emitting full causal
+/// attention -- is not incorrect output, it is 32x the attention work for the same answer, which
+/// is the kind of mistake that shows up only as a missed latency target.
+#[test]
+fn layer_zero_attends_over_the_window_only() {
+    let Some((cfg, _)) = checkpoint() else {
+        return;
+    };
+    assert!(!cfg.kv_source.contains(&0), "layer 0 owns no compressor");
+    assert_eq!(cfg.kv_source, vec![2, 8, 14, 20]);
+    assert_eq!(cfg.sliding_window, 128, "the window every layer attends over");
+    // The window is smaller than an 8k prefill by the factor that matters.
+    let t = 8192u64;
+    let full = t * t / 2;
+    let win = t * cfg.sliding_window as u64;
+    assert!(win * 30 < full, "the window must be the cheap form, not a detail");
+}
