@@ -1642,7 +1642,7 @@ This is a live defect for RAGGED SEAMS generally, not only for row-band: any two
 a `@band{t}` family could desynchronise the same way. Row-band is simply the first pair where one
 sibling never goes ragged and so never re-derives the binding for itself.
 
-## The packet counter protocol is batchable but off the critical path in BOTH regimes; decode's problem is 1293 dispatches per token (2026-09-15, job `ctrpipe-decode`)
+## The packet counter protocol is batchable but off the critical path in BOTH regimes; decode's problem is 1293 segments per token (2026-09-15, job `ctrpipe-decode`)
 
 **The protocol.** Every AQL dispatch pays, on the host, in `device/hsa.rs` `dispatch`: a write-index
 reserve (or `chain_next` fetch_add inside a prepared chain); the kernarg write, and with the
@@ -1672,26 +1672,44 @@ not. `PLOW_TICK_LOG=1` at isl8192 C1, 1017 steady-state ticks:
 | tick total | 40.035 ms |
 | decode portion | 40.032 ms |
 | **other (host)** | **0.003 ms** |
-| dispatches per tick, rank 0 | **1293** |
+| segments per tick, rank 0 (`dec_segs`) | **1293** |
 | in-flight AFTER enqueue | **632** |
 | in-flight after re-arm | 589 |
 
 `obs/tick.rs` states the reading rule itself: "large = the GPU is behind the host, so the enqueue
-and re-arm overlap it; near 0 = the GPU waited on the host." At 632 of 1293 — 49% — the host
+and re-arm overlap it; near 0 = the GPU waited on the host." At 632 packets against 1293 segments the host
 finishes with **632 dispatches of runway still queued**. It is ahead, then waits. Shaving host
 enqueue time lengthens the runway; it does not shorten the tick. The counter adds themselves are
 1293 x 8 = 10344 atomics per tick, perhaps 0.5-1.0 ms of host time, entirely hidden behind 40 ms of
 GPU work. Host work outside the decode call is 3 microseconds.
 
-**The number that matters is 1293.** That is dispatches per rank PER DECODE TOKEN — about 16.6 per
-layer over 78 layers — and the tick is 40.03 ms, so **31 microseconds per dispatch**. At batch 1 the
-kernels are tiny, so a substantial share of that is per-dispatch launch and packet-processor
-latency rather than arithmetic. Goal 2 wants 40.5 ms down to 25.
+**The number that matters is 1293.** That is `dec_segs` — rank 0's decode SEGMENTS per token,
+`prog_dispatch(dp).launches()`, about 16.6 per layer over 78 layers — and the tick is 40.03 ms, so
+**31 microseconds per segment**. At batch 1 the kernels are tiny, so a substantial share of that is
+per-dispatch launch and packet-processor latency rather than arithmetic. Goal 2 wants 40.5 ms down
+to 25.
 
-So the decode lever is **the dispatch COUNT, not the cost of issuing one**: fusing ops so the tick
-emits fewer, larger dispatches, or using the graph/phase-replay path
-(`graph_phase_replay` / `begin_graph_phase_replay`, already in `amd_tp.rs`) so the packets are not
-rebuilt per tick at all. Making each dispatch cheaper to ISSUE is measurably not the problem.
+Two corrections to the units, made after re-reading the call path:
+
+* **Segments are not packets, and packets are the larger number.** `dec_segs` counts segments;
+  `in_flight()` counts AQL packets against `done_signal`. `enqueue_decode_segment` emits ONE packet
+  for the interpreter and MLA routes but **two** for an active `SparseMlaDecode`
+  (`self.seg_launches += 2`, `amd.rs:12212`). So packets per token per rank are ≥ 1293 and 31 µs is
+  per SEGMENT — an upper bound on per-packet cost, not the cost itself. The ratio printed as
+  `in-flight / segs = 0.49` is likewise packets over segments, mixed units: read it as "the host
+  finished with 632 packets still queued", which is the claim that carries the conclusion, not as a
+  percentage of anything.
+* **Graph phase replay is a PREFILL mechanism and is not available to the decode tick.**
+  `graph_phase_replay` tests `progs[p].prefill_routes` for `GraphPhaseXReduceWaveRs`
+  (`amd.rs:12110`), and both call sites are prefill-side: `run_segmented` (`amd.rs:12466`) and
+  `token_batch_body_step_inner` / `prefill` (`amd_tp.rs:1506`, `:1758`). The plain decode tick goes
+  `submit_decode_batched_at` → `enqueue_decode_segment` → `decode_routes` and consults no replay
+  path at all. Naming it as a ready-made decode lever was wrong. The nearest real options are to
+  route decode rows through the token-batch body (task #52), which DOES reach replay, or to build a
+  decode-side equivalent.
+
+So the decode lever is **the dispatch COUNT, not the cost of issuing one**: fuse ops so the tick
+emits fewer, larger dispatches. Making each dispatch cheaper to ISSUE is measurably not the problem.
 
 **Recommendation on the counter batch itself:** implement it only as tidiness or if a future
 regime turns host-bound, not as a latency lever. It has no measured effect available to it on
