@@ -26,6 +26,7 @@ mkdir -p "$(dirname "$output")"
 stage="$(mktemp -d "$(dirname "$output")/.gemma4-gfx942.XXXXXX")"
 trap 'rm -rf "$stage"' EXIT
 mkdir -p "$stage/assets"
+source_commit="$(git -C "$repo" rev-parse HEAD)"
 
 precision_env=()
 if [ "$precision" = fp8 ]; then
@@ -57,12 +58,44 @@ for rung in 1 2 4; do
   }
 done
 
-git -C "$repo" rev-parse HEAD > "$stage/source-commit.txt"
-( cd "$hf_dir" && find . -maxdepth 1 -type f -print0 | sort -z | xargs -0 sha256sum ) \
+printf '%s\n' "$source_commit" > "$stage/source-commit.txt"
+( cd "$hf_dir" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum ) \
   > "$stage/CHECKPOINT_SHA256SUMS"
+( cd "$hf_dir" && find . -type l -printf '%p -> %l\n' | LC_ALL=C sort ) \
+  > "$stage/CHECKPOINT_SYMLINKS"
+{
+  printf 'source_commit=%s\n' "$source_commit"
+  printf 'source_remote=%s\n' "$(git -C "$repo" remote get-url origin)"
+  printf 'precision=%s\n' "$precision"
+  printf 'nix=%s\n' "$(nix --version)"
+  cargo --version
+  rustc --version --verbose
+  printf 'hipcc=%s\n' "$(command -v hipcc)"
+  hipcc --version
+} > "$stage/TOOLCHAIN.txt"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  '' \
+  'repo="${1:?usage: $0 <plow-checkout> <hf-checkpoint> <output-dir>}"' \
+  'hf_dir="${2:?usage: $0 <plow-checkout> <hf-checkpoint> <output-dir>}"' \
+  'output="${3:?usage: $0 <plow-checkout> <hf-checkpoint> <output-dir>}"' \
+  'bundle="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"' \
+  "expected_commit=$source_commit" \
+  "precision=$precision" \
+  '[ "$(git -C "$repo" rev-parse HEAD)" = "$expected_commit" ] || {' \
+  '  echo "FAIL: checkout must be at $expected_commit" >&2' \
+  '  exit 2' \
+  '}' \
+  '( cd "$hf_dir" && sha256sum -c "$bundle/CHECKPOINT_SHA256SUMS" )' \
+  'exec nix develop "$repo" --command "$repo/scripts/build_gemma4_gfx942_assets.sh" \' \
+  '  "$hf_dir" "$output" "$precision"' \
+  > "$stage/REPRODUCE.sh"
+chmod +x "$stage/REPRODUCE.sh"
 ( cd "$stage" && {
     find assets hsaco -type f -print0 | sort -z | xargs -0 sha256sum
-    sha256sum source-commit.txt CHECKPOINT_SHA256SUMS
+    sha256sum source-commit.txt CHECKPOINT_SHA256SUMS CHECKPOINT_SYMLINKS \
+      TOOLCHAIN.txt REPRODUCE.sh
   } > SHA256SUMS )
 mv "$stage" "$output"
 trap - EXIT
