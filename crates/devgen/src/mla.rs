@@ -10919,7 +10919,7 @@ pub(crate) fn glm_emit_block(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn dsv41_emit_block(
     dir: &Path,
-    l: u32,
+    layers: &[u32],
     ctx: u32,
     t: u32,
     out: &str,
@@ -10929,8 +10929,9 @@ pub(crate) fn dsv41_emit_block(
     target: &str,
     verify: Option<&crate::VerifyHook>,
 ) {
+    let l = layers[0];
     let c = dsv41::cfg_dsv41(dir).unwrap_or_else(|e| panic!("deepseek_v41 --block {l}: {e}"));
-    let (mut m, desc) = dsv41::emit_dsv41_block(&c, l, tp, n_cu, ctx, t);
+    let (mut m, desc) = dsv41::emit_dsv41_block(&c, layers, tp, n_cu, ctx, t);
     let section = write_block_descriptor(out, &desc);
     if !rope_gen {
         m.bake_gen();
@@ -10938,7 +10939,13 @@ pub(crate) fn dsv41_emit_block(
     let lean = crate::apply_verify_gate(&m, verify);
     std::fs::write(out, m.to_blob_v6(&[section])).unwrap();
     eprintln!(
-        "deepseek_v41 --block {l}: {} prefill ops at T={t}, tp={tp}, window={} -> {out}",
+        "deepseek_v41 --block {}: {} layers, {} prefill ops at T={t}, tp={tp}, window={} -> {out}",
+        if layers.len() == 1 {
+            format!("{l}")
+        } else {
+            format!("{}..{}", l, layers[layers.len() - 1])
+        },
+        layers.len(),
         m.progs.first().map(|p| p.insts.len()).unwrap_or(0),
         c.sliding_window
     );

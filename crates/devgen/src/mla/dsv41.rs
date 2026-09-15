@@ -1435,33 +1435,47 @@ pub(crate) fn dsv41_attn_core_shape(c: &Dsv41Cfg) -> (u32, u32, u32) {
 /// Layer 0 only, for now. Every other layer adds a group this does not emit: a compressor
 /// (2, 8, 14, 20), indexer queries (those plus 24, 28, 32, 36) or an Engram table (1, 14). The
 /// refusal names which.
+/// Emit a CHAIN of layers into one program.
+///
+/// `layers` is the `--block l..r` range, in order. A layer's output tensor IS its input tensor --
+/// `act.hc_residual_a`, because `ri` flips twice per layer -- so the chain needs no copy and no
+/// extra buffer between layers; each layer's last op is simply the next layer's dependency.
+///
+/// The weight table was already per-layer (`Dsv41Weights::per_layer` is indexed by layer id and
+/// `declare_dsv41_weights` already took a slice), so a chain declares every layer's tensors and the
+/// body picks its own by `l` exactly as a single-layer emit did. A one-element slice reproduces the
+/// previous behaviour.
 pub(crate) fn emit_dsv41_block(
     c: &Dsv41Cfg,
-    l: u32,
+    layers: &[u32],
     tp: u32,
     n_cu: u32,
     ctx: u32,
     t: u32,
 ) -> (crate::Model, plow_asset::BlockDescriptor) {
-    let parts = dsv41_layer_parts(c, l);
-    let todo: Vec<&str> = parts
-        .iter()
-        .filter(|(_, st)| *st == Part::Todo)
-        .map(|(n, _)| *n)
-        .collect();
-    assert!(
-        todo.is_empty(),
-        "layer {l} cannot be emitted as a rung: {} of {} parts are missing -- {todo:?}. \
-         Missing capability: `emit_dsv41_block_l{l}`.",
-        todo.len(),
-        parts.len()
-    );
+    assert!(!layers.is_empty(), "--block needs at least one layer");
+    let l = layers[0];
+    for &li in layers {
+        let parts = dsv41_layer_parts(c, li);
+        let todo: Vec<&str> = parts
+            .iter()
+            .filter(|(_, st)| *st == Part::Todo)
+            .map(|(n, _)| *n)
+            .collect();
+        assert!(
+            todo.is_empty(),
+            "layer {li} cannot be emitted as a rung: {} of {} parts are missing -- {todo:?}. \
+             Missing capability: `emit_dsv41_block_l{li}`.",
+            todo.len(),
+            parts.len()
+        );
+    }
     let (hd, _nope, rope) = dsv41_attn_core_shape(c);
     let nh_l = c.heads / tp;
 
     let mut tb = Builder::new(n_cu);
     tb.set_tensor_dedup(true);
-    let w = declare_dsv41_weights(&mut tb, c, &[l], tp);
+    let w = declare_dsv41_weights(&mut tb, c, layers, tp);
     let xnext = tb.tensor("act.xnext", (t as u64) * (c.hidden as u64) * 2);
     let pos = tb.tensor("in.pos", (ctx as u64) * 4);
     let kvlen = tb.tensor("in.kvlen", 4);
@@ -1505,25 +1519,34 @@ pub(crate) fn emit_dsv41_block(
     // no output offset on the op to write the copies one at a time with. And the seed was a
     // RUNG-ONLY fiction in the first place -- in a whole model the embedding produces this stream
     // -- so the honest entry for a rung is the stream, not a hidden state plus a fake expansion.
-    let c_pre = emit_dsv41_mhc_pre(&mut b, c, &w, &mhc, l, false, ri, t, &[]);
-    let (proj, c_proj) = emit_dsv41_attn_proj(&mut b, c, &w, &all, l, tp, mhc.layer_input, t, &[c_pre]);
-    let (core, c_core) = emit_dsv41_attn_core(
-        &mut b, c, &w, &all, l, tp, proj.q, proj.kv, kvlen, pos, cos, sin, t, ctx, &[c_proj],
-    );
-    let (_out, c_out) =
-        emit_dsv41_attn_out(&mut b, c, &w, &all, l, tp, core.o, t, &mut xgate, &[c_core]);
-    let c_post = emit_dsv41_mhc_post(&mut b, c, &mhc, _out.o, ri, t, &[c_out]);
-    ri ^= 1;
+    // The previous layer's last op. Empty for the first, so a one-layer chain emits exactly the
+    // instruction stream it did before this was a loop.
+    let mut deps: Vec<u32> = Vec::new();
+    for &l in layers {
+        let c_pre = emit_dsv41_mhc_pre(&mut b, c, &w, &mhc, l, false, ri, t, &deps);
+        let (proj, c_proj) =
+            emit_dsv41_attn_proj(&mut b, c, &w, &all, l, tp, mhc.layer_input, t, &[c_pre]);
+        let (core, c_core) = emit_dsv41_attn_core(
+            &mut b, c, &w, &all, l, tp, proj.q, proj.kv, kvlen, pos, cos, sin, t, ctx, &[c_proj],
+        );
+        let (_out, c_out) =
+            emit_dsv41_attn_out(&mut b, c, &w, &all, l, tp, core.o, t, &mut xgate, &[c_core]);
+        let c_post = emit_dsv41_mhc_post(&mut b, c, &mhc, _out.o, ri, t, &[c_out]);
+        ri ^= 1;
 
-    let c_pre2 = emit_dsv41_mhc_pre(&mut b, c, &w, &mhc, l, true, ri, t, &[c_post]);
-    let (ffn, c_sh) = emit_dsv41_ffn_shared(
-        &mut b, c, &w, &all, l, tp, mhc.layer_input, t, &mut xgate, &[c_pre2],
-    );
-    let c_moe = emit_dsv41_moe(
-        &mut b, c, &w, l, tp, t, xnext, ffn.xn, c_sh, (ffn.sh_out, c_sh), &mut xgate, &all,
-    );
-    let _ = emit_dsv41_mhc_post(&mut b, c, &mhc, xnext, ri, t, &[c_moe]);
-    ri ^= 1;
+        let c_pre2 = emit_dsv41_mhc_pre(&mut b, c, &w, &mhc, l, true, ri, t, &[c_post]);
+        let (ffn, c_sh) = emit_dsv41_ffn_shared(
+            &mut b, c, &w, &all, l, tp, mhc.layer_input, t, &mut xgate, &[c_pre2],
+        );
+        let c_moe = emit_dsv41_moe(
+            &mut b, c, &w, l, tp, t, xnext, ffn.xn, c_sh, (ffn.sh_out, c_sh), &mut xgate, &all,
+        );
+        // CAPTURED, not discarded: it is the next layer's only dependency, and the thing that
+        // makes the chain a chain rather than 40 layers racing on one residual buffer.
+        let c_layer = emit_dsv41_mhc_post(&mut b, c, &mhc, xnext, ri, t, &[c_moe]);
+        ri ^= 1;
+        deps = vec![c_layer];
+    }
 
     // PLOW_DSV41_OPS=<n>: emit only the first n ops of the layer. A profiling cut, not a
     // feature -- the run times of successive prefixes difference into a per-op cost, which is
@@ -1617,7 +1640,13 @@ pub(crate) fn emit_dsv41_block(
         weights: BlockWeights {
             mode: "symlink".into(),
             ckpt: "DeepSeek-V4.1-Flash".into(),
-            prefix: format!("layers.{l}."),
+            // A chain draws on every layer it emits, so naming one of them would send a reader
+            // looking for a single-layer blob.
+            prefix: if layers.len() == 1 {
+                format!("layers.{l}.")
+            } else {
+                "layers.".to_string()
+            },
         },
         programs: BlockPrograms {
             // Prefill only. There is no decode program: the rung exists to prove the prefill

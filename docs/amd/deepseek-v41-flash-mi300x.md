@@ -1837,6 +1837,51 @@ off 6% of peak, and the whole-model emit that §12.2 lists. None of those is sma
 whole-model emit, which overlaps seams this measures in isolation, and it under-counts everything
 in §12.2 that is still not emitted.
 
+### 12.7 Multi-layer: `--block l..r` chains, and 31 of 40 layers emit today
+
+**`--block 0..39` used to silently emit layer 0.** The spec was parsed with
+`block_spec.split("..").next()` -- the left end alone -- so a whole-model request produced a blob
+**byte-identical** to `--block 0` (md5 `3344f59e...` both ways) with no diagnostic. That is the
+silently-wrong artifact this emitter refuses everywhere else, and it is also why §12's "40 layers
+at this cost" was arithmetic rather than a measurement.
+
+A range now means `l..=r`, every layer in it is plan-checked before anything is written, and a
+malformed range is refused rather than narrowed. The chain itself was a small change because the
+pieces were already there: `Dsv41Weights::per_layer` is indexed by layer id, `declare_dsv41_weights`
+already took a slice, and a layer's output tensor IS its input tensor (`act.hc_residual_a`, because
+`ri` flips twice per layer), so layers need no copy between them -- each layer's last op is simply
+the next layer's dependency.
+
+**The chain runs.** Layers 3..7, one program, 170 ops, T=8192, TP8:
+
+| | median | per layer |
+|---|---|---|
+| 1 layer (layer 0) | 23.28 ms | 23.28 ms |
+| 5 layers (3..7) | 115.62 ms | **23.12 ms** |
+
+So per-layer x N was a sound model after all: layers compose with no measurable seam cost, and the
+40-layer projection is **925 ms**, not a guess. The exit stays finite (0 NaN, 0 Inf) though its
+range grows from +-2.69 to +-410 over five layers -- expected from `PLOW_HC_POST_MULT = 2.0`
+compounding on a synthetic seed with no embedding to anchor it, and NOT evidence of correctness
+either way. There is still no parity check.
+
+**What is actually missing for end to end**, which is much narrower than §12.2's list suggested.
+Running the planner over all 40 layers: **31 emit today**. The 9 that refuse are layers
+**1, 2, 8, 14, 20, 24, 28, 32, 36** -- exactly `kv_source_layer_ids` [2, 8, 14, 20] union the
+indexer layers [2, 8, 14, 20, 24, 28, 32, 36] union Engram [1, 14]. Each is missing 2 of its 11
+parts, and the refusal says the rest is done:
+
+    layer 2: 9 of 11 parts are done.
+      not emitted:
+        - csa2 compressor (ops 180/181)
+        - indexer queries (two-level)
+
+with, in its own words, *"The kernels are NOT the gap: ops 180/181, 182/183 and 184 all exist and
+pass on gfx942. What is missing is the emit around them."* The eight-subsystem list quoted earlier
+in this document is the **model-level** refusal from the nn-graph path, which is not the path that
+serves; the rung path's gap is the CSA2 compressor emit, the two-level indexer emit, and Engram's
+emit for layer 1.
+
 ### 12.2 What is still not demonstrated
 
   * ONE layer, not 40. The whole-model emit is still blocked on the subsystems

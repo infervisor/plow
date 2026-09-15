@@ -1216,7 +1216,7 @@ fn every_tp_weight_is_read_at_the_width_it_was_declared() {
         return;
     };
     let _guard = crate::test_env::env_guard();
-    let (m, _) = super::dsv41::emit_dsv41_block(&cfg, 0, 8, 304, 2048, 256);
+    let (m, _) = super::dsv41::emit_dsv41_block(&cfg, &[0], 8, 304, 2048, 256);
     let byname = |h: u32| m.tensors[h as usize].name.clone();
 
     // The q UP projection: OutSplit over heads, so 8 of 64 heads per rank.
@@ -1279,7 +1279,7 @@ fn the_shared_experts_partial_lands_in_a_peer_slot_and_is_summed() {
     };
     let _guard = crate::test_env::env_guard();
     let t = 256u32;
-    let (m, _) = super::dsv41::emit_dsv41_block(&cfg, 0, 8, 304, 2048, t);
+    let (m, _) = super::dsv41::emit_dsv41_block(&cfg, &[0], 8, 304, 2048, t);
     let p = &m.progs[0];
     let byname = |h: u32| m.tensors[h as usize].name.clone();
 
@@ -1337,7 +1337,7 @@ fn the_routed_combine_writes_a_real_peer_slot() {
         return;
     };
     let _guard = crate::test_env::env_guard();
-    let (m, _) = super::dsv41::emit_dsv41_block(&cfg, 0, 8, 304, 2048, 256);
+    let (m, _) = super::dsv41::emit_dsv41_block(&cfg, &[0], 8, 304, 2048, 256);
     let dg = m
         .tensors
         .iter()
@@ -1365,7 +1365,7 @@ fn the_layer_zero_rung_is_a_topological_program() {
         return;
     };
     let _guard = crate::test_env::env_guard();
-    let (m, desc) = super::dsv41::emit_dsv41_block(&cfg, 0, 8, 304, 2048, 256);
+    let (m, desc) = super::dsv41::emit_dsv41_block(&cfg, &[0], 8, 304, 2048, 256);
     assert_eq!(m.progs.len(), 2, "one prefill bucket plus the empty decode placeholder");
     let p = &m.progs[0];
     assert!(!p.insts.is_empty());
@@ -1453,7 +1453,7 @@ fn every_activation_read_is_written_by_something() {
         return;
     };
     let _guard = crate::test_env::env_guard();
-    let (m, _) = super::dsv41::emit_dsv41_block(&cfg, 0, 8, 304, 2048, 256);
+    let (m, _) = super::dsv41::emit_dsv41_block(&cfg, &[0], 8, 304, 2048, 256);
     let p = &m.progs[0];
     let name = |h: u32| m.tensors[h as usize].name.as_str();
 
@@ -1501,7 +1501,7 @@ fn the_routed_experts_are_bound_through_the_packed_table() {
         return;
     };
     let _guard = crate::test_env::env_guard();
-    let (m, _) = super::dsv41::emit_dsv41_block(&cfg, 0, 8, 304, 2048, 256);
+    let (m, _) = super::dsv41::emit_dsv41_block(&cfg, &[0], 8, 304, 2048, 256);
 
     for suffix in ["expert_weight_table", "expert_scale_table"] {
         let t = m
@@ -1555,7 +1555,7 @@ fn the_rung_is_a_prefill_bucket_and_states_it_cannot_decode() {
         return;
     };
     let _guard = crate::test_env::env_guard();
-    let (m, desc) = super::dsv41::emit_dsv41_block(&cfg, 0, 8, 304, 2048, 512);
+    let (m, desc) = super::dsv41::emit_dsv41_block(&cfg, &[0], 8, 304, 2048, 512);
     assert_eq!(m.prog_t, vec![512, 1], "one prefill bucket, then the decode slot");
 
     let roles =
@@ -1576,4 +1576,41 @@ fn the_rung_is_a_prefill_bucket_and_states_it_cannot_decode() {
         "and the descriptor must agree it cannot decode"
     );
     assert_eq!(desc.programs.prefill_buckets, vec![512]);
+}
+
+/// `--block l..r` emits EVERY layer in the range, chained.
+///
+/// It used to emit the left end alone -- `block_spec.split("..").next()` -- so `--block 0..39`
+/// wrote a blob byte-identical to `--block 0` and said nothing. A whole-model request answered
+/// with one layer is exactly the silently-wrong artifact this emitter refuses everywhere else.
+#[test]
+fn a_block_range_emits_every_layer_in_it_chained() {
+    let Some((cfg, _)) = checkpoint() else {
+        return;
+    };
+    let _guard = crate::test_env::env_guard();
+    let (one, d1) = super::dsv41::emit_dsv41_block(&cfg, &[3], 8, 304, 2048, 256);
+    let (five, d5) = super::dsv41::emit_dsv41_block(&cfg, &[3, 4, 5, 6, 7], 8, 304, 2048, 256);
+    let n1 = one.progs[0].insts.len();
+    let n5 = five.progs[0].insts.len();
+    assert_eq!(
+        n5,
+        n1 * 5,
+        "a five-layer chain must be five layers of ops ({n1} each), not {n5}"
+    );
+
+    // Every layer's weights are declared, not just the first: the chain reads `layers.7.` too.
+    assert!(
+        five.tensors.iter().any(|t| t.name.starts_with("layers.7.")),
+        "the last layer of the chain must have its weights declared"
+    );
+    assert!(
+        !one.tensors.iter().any(|t| t.name.starts_with("layers.7.")),
+        "a one-layer emit must NOT declare another layer's weights"
+    );
+
+    // A single layer names its own weights; a chain cannot, because it draws on all of them.
+    assert_eq!(d1.weights.prefix, "layers.3.");
+    assert_eq!(d5.weights.prefix, "layers.");
+    assert_eq!(d5.layer, 3, "the descriptor names the first layer of the chain");
 }

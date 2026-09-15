@@ -7754,18 +7754,44 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
         // It still refuses. A rung that emitted only the parts that exist would load, run and
         // produce fluent-looking garbage, which is worse than not emitting.
         let single = emit_config::active().layer_cfg().2;
-        if let Some(l) = block_spec
+        // `--block l..r` MEANS l..=r. It used to take `split("..").next()`, i.e. the left end
+        // alone, so `--block 0..39` silently emitted layer 0 and wrote a blob byte-identical to
+        // `--block 0` -- a whole-model request answered with one layer and no diagnostic. A
+        // malformed range is refused rather than narrowed, for the same reason.
+        let layers: Option<Vec<u32>> = block_spec
             .as_deref()
-            .and_then(|s| s.split("..").next())
-            .and_then(|s| s.trim().parse::<u32>().ok())
-            .or(single)
-        {
+            .map(|s| {
+                let p: Vec<&str> = s.split("..").map(str::trim).collect();
+                let bad = || panic!("--block {s:?}: expected `l` or `l..r` with l <= r");
+                match p.as_slice() {
+                    [one] => vec![one.parse::<u32>().unwrap_or_else(|_| bad())],
+                    [lo, hi] => {
+                        let (lo, hi) = (
+                            lo.parse::<u32>().unwrap_or_else(|_| bad()),
+                            hi.parse::<u32>().unwrap_or_else(|_| bad()),
+                        );
+                        if lo > hi {
+                            bad();
+                        }
+                        (lo..=hi).collect()
+                    }
+                    _ => panic!("--block {s:?}: expected `l` or `l..r` with l <= r"),
+                }
+            })
+            .or_else(|| single.map(|l| vec![l]));
+        if let Some(layers) = layers {
+            let l = layers[0];
             // A config that does not parse is a DIFFERENT failure from an unemitted part, and
             // saying so keeps a checkpoint problem from reading as missing emit work.
             let c = mla::cfg_dsv41(&dir)
                 .unwrap_or_else(|e| panic!("deepseek_v41 --block {l}: the config does not parse, \
                      so there is nothing to plan a rung against: {e}"));
-            match mla::dsv41_emit_block_plan(&c, l) {
+            // Every layer, not just the first: a range whose tail is unemittable must say so
+            // before it writes a blob that is short some layers.
+            let plan = layers
+                .iter()
+                .try_fold((), |_, &li| mla::dsv41_emit_block_plan(&c, li).map(|_| ()));
+            match plan {
                 Ok(_) => {
                     // Every part of this layer is emitted, so write the rung. The prefill width
                     // is the largest requested bucket; `ctx` bounds the rope tables.
@@ -7775,7 +7801,7 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
                         .copied()
                         .unwrap_or_else(|| ctx.min(1024));
                     mla::dsv41_emit_block(
-                        &dir, l, ctx, t, &out, n_cu, tp, rope_gen, &arch, verify.as_ref(),
+                        &dir, &layers, ctx, t, &out, n_cu, tp, rope_gen, &arch, verify.as_ref(),
                     );
                     return;
                 }
