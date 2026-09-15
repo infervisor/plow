@@ -663,8 +663,9 @@ fn the_rung_plan_is_per_layer_and_names_what_is_emitted() {
         .collect();
     assert_eq!(
         done.len(),
-        2,
-        "the attention projections and the output projection are emitted; this count is the \
+        4,
+        "attention projections, output projection, ffn_norm and the shared expert are emitted; \
+         this count is the \
          thing that grows as bricks land, so it is asserted exactly rather than as a lower bound"
     );
     // And the rung still REFUSES, because a partial blob would run and produce garbage.
@@ -734,4 +735,60 @@ fn the_output_projection_refuses_at_tp1_rather_than_doing_one_group() {
     let all: Vec<u32> = (0..304u32).collect();
     let attn_out = b.tensor("act.attn_out", 512 * 4096 * 2);
     super::dsv41::emit_dsv41_attn_out(&mut b, &cfg, &w, &all, 0, 1, attn_out, 512, &[]);
+}
+
+/// The shared expert, against the real weights, with the CLAMPED SwiGLU.
+///
+/// The act code is the thing worth pinning. Every other family in this emitter uses
+/// `GLM_ACT_SILU` (1); V4.1 uses `PLOW_ACT_SWIGLU_CLAMP_` (4) with the limit from the config on
+/// `f[1]`. Emitting act 1 here would drop the clamp and fault nowhere — the gfx942 run of this
+/// arm measured 3160 of 4096 elements actually clamped, so it changes the numbers on most of
+/// them.
+#[test]
+fn the_shared_expert_uses_the_clamped_swiglu_not_plain_silu() {
+    let Some((cfg, _)) = checkpoint() else {
+        return;
+    };
+    let _guard = crate::test_env::env_guard();
+    let mut b = Builder::new(304);
+    let w = super::dsv41::declare_dsv41_weights(&mut b, &cfg, &[0]);
+    let all: Vec<u32> = (0..304u32).collect();
+    let t = 512u32;
+    let x = b.tensor("act.x", (t as u64) * (cfg.hidden as u64) * 2);
+    let (act, _) = super::dsv41::emit_dsv41_ffn_shared(&mut b, &cfg, &w, &all, 0, x, t, &[]);
+    let p = b.finish();
+
+    let glu = p
+        .insts
+        .iter()
+        .find(|d| d.op == DevOp::Glu as u16)
+        .expect("the shared expert needs a GLU");
+    assert_eq!(glu.i[1], 4, "PLOW_ACT_SWIGLU_CLAMP_, not GLM_ACT_SILU (1)");
+    assert_eq!(
+        glu.f[1], cfg.raw.swiglu_limit,
+        "the clamp limit rides f[1] and comes from the config, not a constant"
+    );
+    assert_eq!([glu.t[1], glu.t[2]], [act.sh_gate, act.sh_up]);
+
+    // Three op-184 GEMMs: gate, up, down. The shared expert is block-FP8, NOT fp4 — that is what
+    // makes this checkpoint mixed, and routing it to the MXFP4 expert path would be the error.
+    let g: Vec<_> = p
+        .insts
+        .iter()
+        .filter(|d| d.op == DevOp::GemmFp8Mx as u16)
+        .collect();
+    assert_eq!(g.len(), 3, "gate, up and down are all block-fp8 dense GEMMs");
+    assert!(
+        p.insts.iter().all(|d| d.op != DevOp::MoeGroupGluPf as u16),
+        "the SHARED expert is not a routed expert; it must not reach the grouped MoE path"
+    );
+    // Gate and up share an input and must not be chained.
+    let gate = g.iter().find(|d| d.t[0] == act.sh_gate).unwrap();
+    let up = g.iter().find(|d| d.t[0] == act.sh_up).unwrap();
+    assert_eq!(gate.t[1], act.xn);
+    assert_eq!(up.t[1], act.xn);
+    let gates = |d: &DevInst| -> Vec<packet::dev::Wait> {
+        p.waits[d.wait_ofs as usize..d.wait_ofs as usize + d.wait_len as usize].to_vec()
+    };
+    assert_eq!(gates(gate), gates(up), "gate and up are parallel, not serialised");
 }

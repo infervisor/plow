@@ -537,6 +537,115 @@ pub(crate) fn emit_dsv41_attn_out(
     (act, c_ob)
 }
 
+/// V4.1's GLU is the CLAMPED SwiGLU, `PLOW_ACT_SWIGLU_CLAMP_` in `op_elementwise.h`.
+///
+/// Not `GLM_ACT_SILU` (1), which every other family in this emitter uses. The clamp limit is a
+/// config field (`swiglu_limit`, 10.0 on the released checkpoint) and rides `f[1]`; emitting act 1
+/// here would drop the clamp silently, and the gfx942 test that covers this arm measured
+/// 3160 of 4096 elements actually clamped, so the difference is not academic.
+const DSV41_ACT_SWIGLU_CLAMP: u32 = 4;
+
+/// Scratch for the FFN's pre-norm and the shared expert.
+pub(crate) struct Dsv41FfnAct {
+    /// Residual after the FFN RMSNorm, `[T][hidden]` bf16.
+    pub(crate) xn: u32,
+    /// Shared-expert gate and up, each `[T][moe_inter]` bf16.
+    pub(crate) sh_gate: u32,
+    pub(crate) sh_up: u32,
+    /// After the clamped SwiGLU, `[T][moe_inter]` bf16.
+    pub(crate) sh_act: u32,
+    /// Shared-expert output, `[T][hidden]` bf16.
+    pub(crate) sh_out: u32,
+}
+
+/// Emit the FFN pre-norm and the SHARED expert (not the routed ones).
+///
+/// The shared expert is block-FP8 on the `[32, 32]` ue8m0 grid like every other dense projection,
+/// which is why it is 23.19 TFLOP of the 8k prefill and why it lands here on op 184 rather than
+/// with the routed experts. The ROUTED experts are MXFP4 on ops 85/86 -- a different fetch path
+/// entirely, and the reason this checkpoint needs a mixed encoding at all.
+///
+/// Gate and up are emitted as TWO GEMMs plus a `Glu`, not one fused `GemmGlu`. There is no fused
+/// block-fp8-at-32 GLU arm: `d_gemm_t<WFP8MX>` static_asserts `!GLU` outright, because the
+/// promotion into a second accumulator every 32 K already costs what the fusion would save. The
+/// GLM emitter measured the equivalent split at -0.017 ms, i.e. nothing.
+pub(crate) fn emit_dsv41_ffn_shared(
+    b: &mut Builder,
+    c: &Dsv41Cfg,
+    w: &Dsv41Weights,
+    cus: &[u32],
+    l: u32,
+    x: u32,
+    t: u32,
+    deps: &[u32],
+) -> (Dsv41FfnAct, u32) {
+    let (hidden, inter) = (c.hidden, c.moe_inter);
+    let act = Dsv41FfnAct {
+        xn: b.tensor(&format!("act.l{l}.ffn_xn"), (t as u64) * (hidden as u64) * 2),
+        sh_gate: b.tensor(&format!("act.l{l}.sh_gate"), (t as u64) * (inter as u64) * 2),
+        sh_up: b.tensor(&format!("act.l{l}.sh_up"), (t as u64) * (inter as u64) * 2),
+        sh_act: b.tensor(&format!("act.l{l}.sh_act"), (t as u64) * (inter as u64) * 2),
+        sh_out: b.tensor(&format!("act.l{l}.sh_out"), (t as u64) * (hidden as u64) * 2),
+    };
+    let all = cus.to_vec();
+    let eps = c.eps;
+    let c_xn = b.emit(DevOp::RmsNorm, all.clone(), deps, |d| {
+        d.t[0] = act.xn;
+        d.t[1] = x;
+        d.t[2] = w.get(l, "ffn_norm.weight");
+        d.i[0] = t;
+        d.i[1] = hidden;
+        d.f[0] = eps;
+    });
+    // Gate and up read the SAME input and have no dependence on each other.
+    let c_g = emit_pf_gemm_fp8_mx(
+        b,
+        cus,
+        act.sh_gate,
+        act.xn,
+        w.get(l, "ffn.shared_experts.w1.weight"),
+        w.get(l, "ffn.shared_experts.w1.scale"),
+        t,
+        inter,
+        hidden,
+        &[c_xn],
+    );
+    let c_u = emit_pf_gemm_fp8_mx(
+        b,
+        cus,
+        act.sh_up,
+        act.xn,
+        w.get(l, "ffn.shared_experts.w3.weight"),
+        w.get(l, "ffn.shared_experts.w3.scale"),
+        t,
+        inter,
+        hidden,
+        &[c_xn],
+    );
+    let limit = c.raw.swiglu_limit;
+    let c_act = b.emit(DevOp::Glu, all.clone(), &[c_g, c_u], |d| {
+        d.t[0] = act.sh_act;
+        d.t[1] = act.sh_gate;
+        d.t[2] = act.sh_up;
+        d.i[0] = t * inter;
+        d.i[1] = DSV41_ACT_SWIGLU_CLAMP;
+        d.f[1] = limit;
+    });
+    let c_down = emit_pf_gemm_fp8_mx(
+        b,
+        cus,
+        act.sh_out,
+        act.sh_act,
+        w.get(l, "ffn.shared_experts.w2.weight"),
+        w.get(l, "ffn.shared_experts.w2.scale"),
+        t,
+        hidden,
+        inter,
+        &[c_act],
+    );
+    (act, c_down)
+}
+
 /// One sublayer a V4.1 rung has to emit, and whether it is emitted yet.
 ///
 /// This exists so the answer to "what is missing" comes from RUNNING plowc rather than from
@@ -568,12 +677,12 @@ pub(crate) fn dsv41_layer_parts(c: &Dsv41Cfg, l: u32) -> Vec<(&'static str, Part
     p.push(("attention core (absorbed MLA over the 512 latent)", Part::Todo));
     p.push(("output projection wo_a + wo_b (op 184)", Part::Done));
     p.push(("output all-gather across o_groups (XAllGather)", Part::Todo));
-    p.push(("ffn_norm", Part::Todo));
+    p.push(("ffn_norm", Part::Done));
     if c.engram_layers.contains(&l) {
         p.push(("engram gate + embed (ops 182/183)", Part::Todo));
     }
     p.push(("moe router + routed experts (ops 85/86, MXFP4)", Part::Todo));
-    p.push(("shared expert (op 184)", Part::Todo));
+    p.push(("shared expert (op 184 + clamped SwiGLU)", Part::Done));
     p.push(("mhc_post", Part::Todo));
     p
 }
