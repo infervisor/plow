@@ -8,6 +8,9 @@ hf_dir="${1:?$usage}"
 output="${2:?$usage}"
 precision="${3:?$usage}"
 profile="${4:?$usage}"
+# 18K covers a 16K prompt plus decode and keeps Gemma's 1024-byte full-KV
+# head window divisible by gfx942 ROCr's 2 MiB VMM granule.
+max_ctx=18432
 
 [ -n "${IN_NIX_SHELL:-}" ] || {
   echo "FAIL: run through nix develop --command" >&2
@@ -58,7 +61,7 @@ env \
   "${precision_env[@]}" \
   "$repo/target/release/plowc" \
     --hf-dir "$hf_dir" --gpu MI300X --arch gfx942 --n-cu 304 \
-    --max-ctx 16512 --emit devblob --out "$stage/assets"
+    --max-ctx "$max_ctx" --emit devblob --out "$stage/assets"
 
 python3 "$repo/scripts/check_gemma4_gfx942_assets.py" \
   "$stage/assets/build.json" "$precision" "$profile"
@@ -84,6 +87,7 @@ printf '%s\n' "$source_commit" > "$stage/source-commit.txt"
   printf 'source_remote=%s\n' "$(git -C "$repo" remote get-url origin)"
   printf 'precision=%s\n' "$precision"
   printf 'profile=%s\n' "$profile"
+  printf 'max_ctx=%s\n' "$max_ctx"
   printf 'nix=%s\n' "$(nix --version)"
   cargo --version
   rustc --version --verbose
