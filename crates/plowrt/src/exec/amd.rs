@@ -3207,6 +3207,35 @@ fn derive_packed_segment_families(prog: &DevProg) -> Result<Vec<u8>> {
         .collect())
 }
 
+/// Pure sequence-parallel seam norms operate on rank-local `@band<T>` views. Their row index is
+/// local to the rank, not the packed plan, so the primary interpreter must not resolve it through
+/// the global packed span table.
+fn derive_packed_plain_segments(prog: &DevProg) -> Result<Vec<bool>> {
+    let n_seg = prog
+        .stream
+        .iter()
+        .map(|e| e.seg as usize + 1)
+        .max()
+        .unwrap_or(1);
+    let packed = prog.role.is_packed_sibling() || prog.role.is_token_batch_body();
+    let band = prog.role.token_batch_band().filter(|&b| b > 0);
+    let mut plain = vec![packed; n_seg];
+    let mut seen = vec![false; n_seg];
+    for e in &prog.stream {
+        let inst = prog.insts.get(e.inst as usize).ok_or_else(|| {
+            RuntimeError::Device(format!("stream entry references instruction {}", e.inst))
+        })?;
+        let norm = inst.op == DevOp::RmsNorm as u16
+            || inst.op == DevOp::HeadNormRope as u16
+            || inst.op == DevOp::HeadNormRopeFp8 as u16;
+        let seam = norm && inst.i[0] != prog.t && Some(inst.i[0]) != band;
+        let seg = e.seg as usize;
+        plain[seg] &= seam;
+        seen[seg] |= seam;
+    }
+    Ok(plain.into_iter().zip(seen).map(|(p, s)| p && s).collect())
+}
+
 /// Segments eligible for the dedicated gfx950 MLA V2+SV object.
 ///
 /// That object intentionally contains only the dense bf16 opcode. A gathered MLA instruction
@@ -5817,6 +5846,8 @@ struct AmdProg {
     /// `[n_seg]` pure packed-consumer family: 5=MLA norm/cache, 6=MLA flash,
     /// 7=serial KDA, 0=not safely routable to a family object.
     packed_seg_family: Vec<u8>,
+    /// Pure rank-local seam norms. Their local band rows must not consume global packed spans.
+    packed_plain_segment: Vec<bool>,
     /// Pure dense bf16 MLA segments eligible for the dedicated gfx950 V2+SV object.
     raw_mla_v2_segment: Vec<bool>,
     /// Global-queue tables; `None` when the blob carries no GQ appendix.
@@ -9714,6 +9745,7 @@ impl AmdEngine {
                 }
             }
             let packed_seg_family = derive_packed_segment_families(p)?;
+            let packed_plain_segment = derive_packed_plain_segments(p)?;
             let raw_mla_v2_segment = derive_raw_mla_v2_segments(p)?;
             let packed_sparse_error = if (p.role.is_packed_sibling()
                 || p.role.is_token_batch_body())
@@ -9901,6 +9933,7 @@ impl AmdEngine {
                 small_mla_split_sites,
                 small_mla_split_segments,
                 packed_seg_family,
+                packed_plain_segment,
                 raw_mla_v2_segment,
                 gq,
                 l2_domains: p.l2_domains,
@@ -11459,9 +11492,12 @@ impl AmdEngine {
     /// Build the kernarg block for program `p` at segment `seg`.
     fn kernarg(&self, p: usize, seg: u32) -> DevProgram {
         let g = &self.progs[p];
+        let binding = self
+            .packed_prefill
+            .filter(|_| !g.packed_plain_segment.get(seg as usize).copied().unwrap_or(false));
         let (prefill_spans, prefill_parked, n_prefill_spans, n_prefill_rows) =
             packed_prefill_kernarg(
-                self.packed_prefill,
+                binding,
                 p,
                 self.d_prefill_spans.base,
                 self.d_prefill_parked.base,
@@ -11514,7 +11550,7 @@ impl AmdEngine {
             n_prefill_rows,
             // Unified token batch: the shared descriptor, only while a slot-band body is staged
             // for THIS program. NULL is the documented "every existing path, bit for bit" value.
-            token_batch: match (self.packed_prefill, self.d_token_batch.as_ref()) {
+            token_batch: match (binding, self.d_token_batch.as_ref()) {
                 (Some(b), Some(d)) if b.prog == p && b.token_batch => d.base,
                 _ => 0,
             },

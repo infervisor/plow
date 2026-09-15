@@ -5686,6 +5686,10 @@ fn token_batch_seam_norms_stay_on_the_primary_object() {
         body_families,
         [5, 5, 0, 6]
     );
+    assert_eq!(
+        derive_packed_plain_segments(&body_prog).unwrap(),
+        [false, false, true, false]
+    );
     assert!(packed_family_segments_cover(&body_prog, &body_families, &[5, 6]));
     let mixed = prog(
         body,
@@ -5693,11 +5697,11 @@ fn token_batch_seam_norms_stay_on_the_primary_object() {
         &[0, 0],
     );
     assert!(derive_packed_segment_families(&mixed).is_err());
+    assert_eq!(derive_packed_plain_segments(&mixed).unwrap(), [false]);
     let plain = ProgramRole::PrefillBucket { rows: 8192 };
-    assert_eq!(
-        derive_packed_segment_families(&prog(plain, insts(), &[0, 1, 2, 3])).unwrap(),
-        [5, 5, 5, 6]
-    );
+    let plain_prog = prog(plain, insts(), &[0, 1, 2, 3]);
+    assert_eq!(derive_packed_segment_families(&plain_prog).unwrap(), [5, 5, 5, 6]);
+    assert_eq!(derive_packed_plain_segments(&plain_prog).unwrap(), [false; 4]);
 }
 
 #[test]
