@@ -295,8 +295,14 @@ impl RungController {
     }
 
     fn throughput_seat(&self, demand_seat: usize) -> usize {
-        if demand_seat == 0
-            || self.stats[demand_seat].samples < MIN_THROUGHPUT_SAMPLES
+        if demand_seat == 0 {
+            return demand_seat;
+        }
+        let widest = self.rungs.len() - 1;
+        if demand_seat == widest && self.stats[demand_seat].samples < MIN_THROUGHPUT_SAMPLES {
+            return demand_seat - 1;
+        }
+        if self.stats[demand_seat].samples < MIN_THROUGHPUT_SAMPLES
             || self.stats[demand_seat - 1].samples < MIN_THROUGHPUT_SAMPLES
         {
             return demand_seat;
@@ -393,6 +399,14 @@ mod tests {
     }
 
     #[test]
+    fn cold_saturated_backlog_bootstraps_on_the_penultimate_rung() {
+        let mut c = controller(&[1, 2, 4, 8, 16, 32]);
+        let d = c.decide(load(1, 99));
+        assert_eq!(c.width(d.admission), 16);
+        assert_eq!(d.reason, RungReason::Backlog);
+    }
+
+    #[test]
     fn throughput_cap_waits_for_adjacent_samples_and_a_real_gain() {
         let mut c = controller(&[1, 8, 16, 32]);
         for _ in 0..MIN_THROUGHPUT_SAMPLES {
@@ -411,7 +425,7 @@ mod tests {
     #[test]
     fn narrowing_changes_admission_before_high_slots_drain() {
         let mut c = controller(&[1, 4, 16]);
-        c.decide(load(1, 15));
+        c.target = 2;
         assert_eq!(c.admission_limit(), 16);
         for _ in 0..64 {
             c.decide(load(12, 0));
