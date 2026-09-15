@@ -1438,6 +1438,14 @@ fn backend_amd(
     // PLOW_K3 skips all of it through the non-trapping `default:` and returns fluent output from
     // a model that is missing most of itself.
     if has("AttnRes")
+        // DeepSeek-V4.1's mHC. Not Kimi ops and not KDA, but they live inside the same
+        // `#if PLOW_K3` block (interp.hip:3485-3887), so the axis that compiles them is the same
+        // one -- and the failure is the one this rule's header describes, on a model where the
+        // hyper-connection IS the residual stream. Without the arm, `HyperConnPost` writes
+        // nothing, every layer's residual stays whatever the seed left, and the run completes.
+        || has("HyperConnPre")
+        || has("HyperConnPost")
+        || has("GemvF32")
         || has("SituGlu")
         || has("MlaOutGate")
         || has("KdaStateStep")

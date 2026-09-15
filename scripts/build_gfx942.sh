@@ -1131,6 +1131,27 @@ if [ "${PLOW_DSV41_BLKFP8:-0}" = 1 ]; then
   AX_PREFILL="$AX_PREFILL -DPLOW_DSV41_BLKFP8=1"
 fi
 
+# OPT-IN (PLOW_PREFILL_K3=1): compile the `#if PLOW_K3` block into the ORDINARY prefill rows.
+#
+# `AX_K3` / `AX_MLA_K3` already carry the axis, but only onto the `_k3` stems, and those are the
+# objects a Kimi-K3 packet loads. DeepSeek-V4.1 loads `interp_prefill_mla_moe` and needs three ops
+# out of that same block -- `HyperConnPre`, `HyperConnPost` and `GemvF32`, which are its mHC, not
+# anything of Kimi's. They are inside `#if PLOW_K3` (interp.hip:3485-3887), so today the only way
+# to reach them from an MLA object is to compile the whole axis in.
+#
+# NOT DRIVEN FROM THE PACKET'S `requires`, deliberately. A K3 packet also requires PLOW_K3, and
+# auto-mapping it here would start compiling the axis into every ordinary prefill row of every K3
+# build -- objects those packets never load, and the axis is default-0 precisely because its arms
+# are expensive to inline. That is a decision about every K3 build, so it is stated on the command
+# line rather than inferred.
+#
+# FOLLOW-UP: the narrow fix is an `#if PLOW_MHC` around just the three ops, so a V4.1 object can
+# have its hyper-connection without KDA's register pressure. That is a change to interp.hip's
+# guard structure and is not this.
+if [ "${PLOW_PREFILL_K3:-0}" = 1 ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_K3=1 -DGV_UNROLL=14"
+fi
+
 # CEILING INSTRUMENT ONLY (PLOW_MLA_PF2_ABL=1..4): the V2 MLA prefill's ablation probes —
 # one cost term deleted each (op_attention.h d_flash_mla_prefill_v2): 1 = no K-slab stage,
 # 2 = no QK MFMA, 3 = no softmax math, 4 = no PV. WRONG OUTPUT by construction, never a
