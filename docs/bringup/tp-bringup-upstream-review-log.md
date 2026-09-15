@@ -2503,6 +2503,147 @@ printed booleans are the `*_ok` flags — **True means that criterion passed**:
 Next: fix `nat_client.py` before re-running T3, and decide whether MTP should be gated by prompt
 length (the isl1024 TTFT regression is exactly the shape a length gate would remove).
 
+## Prefill packing is REFUSED on every program of the shipping packet; prefix caching is already on, but its eviction never arms (2026-09-15, CPU-only `op-audit` + production log audit)
+
+Three questions, three answers. The first one overturns something this campaign has been
+assuming, including in my own earlier write-ups.
+
+### 1. Packed prefill has never fired, and cannot fire on this packet
+
+`serve/mux.rs:2856` keeps a `std::sync::Once` whose only job is to separate two claims its own
+comment refuses to conflate:
+
+> ONE info line the first time it actually fires. "Armed" (the load-time line in exec/amd.rs) and
+> "firing" are different claims, and only the second one is evidence that a measured delta belongs
+> to this feature.
+
+`AMD packed prefill fired` appears **0 times** in both production server logs on disk
+(`e2eprod/runs-e2eprod/server.log`, `decoderung/runs-rungsweep/rung8.server.log`). That alone is
+an absence, so it is not the finding. These are:
+
+**The load-time route report is also absent, which localises the reason.**
+`report_packed_prefill_route` (`exec/amd.rs:10591`) logs in *all three* of its outcome branches —
+two `warn!`, one `info!` — every one of them visible at `RUST_LOG=info`. Neither log has any of
+them. The single path that produces no output is the early return at `:10596`:
+
+```rust
+if !route && cfg.pf_batch.is_none() {
+    // No siblings, no explicit opt-in: an ordinary packet on the default mux.
+    return;
+}
+```
+
+So `packed_prefill_route_armed()` was **false**. `rt.packed_prefill_route` is UNSET, which means
+AUTO — follow the packet — and the packet's answer is no. UNSET is automatic, not off; here
+automatic resolves to off because there are no packed-prefill topology siblings to resolve.
+
+**The packet itself refuses, by name and by count.** `plowrt op-audit <packet>` exits 1:
+
+```
+T=128 [REFUSED]  T=512 [REFUSED]  T=2048 [REFUSED]  T=8192 [REFUSED]  T=8192 [REFUSED]
+T=1 [REFUSED]  T=2 [REFUSED]  T=4 [REFUSED]  T=8 [REFUSED]  T=16 [REFUSED]  T=20 [REFUSED]
+```
+
+All eleven programs, prefill and decode. The blockers on the production 8192 prefill rung:
+
+| opcode | count | class | why it refuses |
+| --- | --- | --- | --- |
+| `HeadNormRope` (3) | 120–198 | C / needs-conversion | `i3=out_row0` with `i6=n_batch_kv == 0` |
+| `HeadNormRopeFp8` (37) | 78 | C / needs-conversion | same shape |
+| `FlashMlaPrefillFp8` (110) | 78 | C / needs-conversion | `i4=n_tok` shared across rows; `q_pos0 = kv_len[b] - n_tok` |
+| `XReduceScatter` (25) | 78–156 | A / **refuse** | `i0=n` |
+| `IndexUnionPf` (119) | 21 | C / needs-conversion | `q_pos0 = kv_len[0] - n_tok` (`op_attention.h:5474`) |
+| `IndexTpPf` (157) | 21 | C / needs-conversion | `kv_len[0] - T` isolated; `PlowKvSpan` table under packing |
+
+Only one of these is a hard wall. `XReduceScatter` is class A / **refuse** — not convertible from
+here. Everything else is class C / needs-conversion, and `HeadNormRope` even carries its own
+route out: *"class B when `i6 != 0` (batch-major ring at `t5=pos[t]`)"*. The attention family
+(`FlashMlaPrefillFp8`, `IndexUnionPf`, `IndexTpPf`) all fail the same way — they derive one query
+position from a single shared `n_tok`, so one launch cannot serve two sequences.
+
+**Two further gates, each independently sufficient**, so fixing the opcodes alone would still not
+make packing fire at the production shape:
+
+* *A pack needs two chunks in one rung.* `sched/prefill.rs:381` states it as arithmetic, not
+  policy: "Dense co-packing is arithmetic, not a feature flag... A chunk sized AT the widest rung
+  therefore admits exactly one span, the mux's `packed.len() >= 2` test fails, and packing
+  silently never runs." Its test asserts `pack_at(8192).spans().len() == 1` and
+  `pack_at(4096).spans().len() == 2`. The gfx942 ladder tops out at 8192; `PLOW_PF_CHUNK` unset
+  becomes `u32::MAX` (`serve/engine.rs:1442`), i.e. the widest rung. Production sits exactly on
+  the unpackable point.
+* *A prompt's final chunk is never packable.* `packable_prefill_step` (`serve/engine.rs:985`)
+  requires `cur.next + 1 < cur.steps.len()`, because the last chunk produces a token. An
+  8192-token prompt at an 8192 chunk is one step, which is also its last. `sched/step.rs:282`
+  names this shape outright: "The default shape on the GLM-5.3 TP8 packet: 8192-row planned
+  chunks (**unpackable** — the rung is a sparse bucket)."
+
+**Correction to my earlier note in this log.** I reported packing "armed" off the knob values —
+`rt.token_batch` ON/PROMOTED, `pf_batch_amd()` → `unwrap_or(true)`, `rt.packed_prefill_route`
+UNSET = AUTO. Those knobs are all permissive and that part stands. What I had not checked was
+whether the packet answers AUTO with yes. It does not, and the op-audit is the direct evidence,
+not the log absence. Consequence: **no number this campaign has ever recorded contains a packing
+effect**, because the path has never run. Nothing measured is invalidated; the feature simply is
+not in any of it.
+
+The unified token-batch route is a *different* feature and it IS firing —
+`route="unified-token-batch/dense-gqa"` appears on every rank in both logs. Do not read this
+section as an indictment of that.
+
+### 2. Prefix caching is already on; what is off is eviction under real pressure
+
+`rt.prefix_cache` is ON/PROMOTED, and the production log confirms it at runtime, not just at
+config time: `AMD prefix cache selection requested=true selected=true`. There is nothing to
+enable.
+
+The defect is one layer down. `pool.enable_pressure_eviction(min_free)`
+(`exec/amd/shared_prefix.rs:396`) is called only `if let Some(min_free) = ...
+vmm_cache_min_free_bytes()`, and `rt.vmm_cache_min_free_mib` is UNSET, so it is **never called**.
+The only trim trigger left is the static budget `rt.vmm_cache_memory_utilization` = 0.05 (~9.6 GB
+of 192). The cache therefore trims at a fixed 5% whether the device has 100 GiB free or 2 —
+it never reacts to actual device pressure.
+
+The backend supports the feature it is not being asked for: `device/hsa.rs:3717` implements
+`free_bytes()` from `HSA_AMD_AGENT_INFO_MEMORY_AVAIL`, "not a snapshot this process keeps itself,
+so it reflects every other consumer of the device's VRAM too", degrading to `None` on any query
+failure. And `memory/vmm.rs:1209`'s contract makes arming it safe on *either* backend: "a backend
+that cannot report `free_bytes` (the default) makes this a no-op and `trim_cache` keeps using
+`cache_cap`, so requesting pressure mode on an unsupported backend degrades to today's behaviour
+rather than disabling eviction outright."
+
+This is #53's "eviction on real pressure", now localised to one unset knob and one uncalled line.
+It is also the most plausible lever on the 70k/C20 aperture fault, where the requirement is that
+the cache evict or the request queue — never that the process die.
+
+### 3. What `PLOW_VMM_KV` does, and what it is worth here
+
+VMM-backed KV on ROCr: it reserves *virtual* address space for `max_ctx` but maps *physical*
+pages only for the live context, instead of carving the full rectangle up front. Opt-in, off by
+default, needs `hsa_amd_vmem_*`; every failure path warns and falls back to the flat carve. Only
+the full-attention `kv.{l}.k` / `kv.{l}.v` tensors are VMM-backed.
+
+Why it is large on this packet. The flat carve is **84.85 GiB per rank** — ckv 60.94, krot 15.23,
+kidx 8.20, scale 0.48 — for `max_ctx` 81,920 rows × 20 slots, i.e. 55,608 B per token per rank.
+At the 8192-token goal cell that is 8.49 GiB useful and **76.37 GiB reserved-and-unused per
+rank**. The saving ratio is `max_ctx / live_ctx`, so it is *largest exactly at the cell the
+campaign is trying to win*, and shrinks to nothing at 70k.
+
+Measured, B=8 at ~1k context: 75.55 vs 83.05 GiB resident, 7.50 of 10.0 GiB reclaimed, TPOT
+unchanged (38.0 vs 39.0 ms). It buys memory, not latency — but memory is what the 70k/C20 arm ran
+out of room in.
+
+### What this changes
+
+* Packing is not a tuning knob away. Reaching it needs, in order: convert `HeadNormRope` /
+  `HeadNormRopeFp8` to the batched-ring form (`i6 != 0`), give the MLA prefill and sparse-index
+  ops a per-row query position instead of a shared `n_tok`, resolve `XReduceScatter`'s class-A
+  refusal, emit packed-prefill siblings, and only then halve `PLOW_PF_CHUNK` so two chunks fit one
+  rung. Any single one of those left undone keeps the route inert.
+* Every "packed prefill" claim about this packet — mine included — should be read as describing an
+  unexercised path until an `AMD packed prefill fired` line exists to anchor it.
+* `rt.vmm_cache_min_free_mib` should be armed by default; the contract already guarantees a safe
+  degradation on backends that cannot report free bytes. That is a default flip, so it needs its
+  own Tier-4 A/B before it ships.
+
 ## Artefact policy (applied on every merge)
 
 Raw measurement files pushed upstream are removed here before the branch goes to main:
