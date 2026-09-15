@@ -1687,6 +1687,27 @@ fn emit_pf_gemm_fp8_mx(
         k % 32 == 0,
         "GemmFp8Mx needs K % 32 == 0 (K = {k}); the kernel is the KEXACT instantiation at BK=32,          and a V4.1 [32,32] scale grid could not exist for a K with a remainder — so this says          the grid bound here is not this weight's, not merely that the tail is ragged"
     );
+    // THE OPERAND MUST BE THE SHAPE WE ARE ABOUT TO CLAIM IT IS. A weight declared at one size
+    // and read at another does not fault: the kernel reads whatever is at the handle, so a
+    // full-size [8192, 4096] wo_a read with a per-rank N = 1024 hands EVERY rank group 0's rows
+    // instead of its own. Checked here because it is cheap, and because it already happened once.
+    let wb = b.tensor_bytes(wt);
+    assert_eq!(
+        wb,
+        nn as u64 * k as u64,
+        "GemmFp8Mx weight {:?} is declared {wb} bytes but this emit reads it as [{nn}, {k}] e4m3 \
+         = {} bytes. A per-rank shape against a full-size declaration gives every rank the first \
+         shard of the weight, silently.",
+        b.tensor_name(wt),
+        nn as u64 * k as u64
+    );
+    let sb = b.tensor_bytes(sc);
+    let want_sc = (nn as u64).div_ceil(32) * (k as u64).div_ceil(32);
+    assert_eq!(
+        sb, want_sc,
+        "GemmFp8Mx scale {:?} is declared {sb} bytes but a [{nn}, {k}] ue8m0 grid is {want_sc}",
+        b.tensor_name(sc)
+    );
     b.emit(DevOp::GemmFp8Mx, cus.to_vec(), deps, |d| {
         d.t[0] = out;
         d.t[1] = x;

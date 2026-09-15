@@ -246,6 +246,109 @@ pub(crate) fn dsv41_gaps(c: &Dsv41Cfg) -> Vec<String> {
     ]
 }
 
+/// How one weight divides across tensor-parallel ranks.
+///
+/// Every tensor is `[out, in]`. `Replicated` means each rank holds the whole thing; `OutSplit`
+/// means rank `r` holds rows `[r*out/tp, (r+1)*out/tp)`; `InSplit` means it holds columns
+/// `[r*in/tp, (r+1)*in/tp)` and the results are reduced afterwards.
+///
+/// Stated per tensor rather than inferred, because the inference is wrong for this model in two
+/// places and both are silent. `wkv` LOOKS column-parallel and is not -- the absorbed latent is
+/// one 512-wide row shared by all 64 heads, so every rank needs all of it (`num_key_value_heads`
+/// is 1, and there is no `kv_b` to expand). `wq_a` looks shardable and is not -- the q-LoRA rank
+/// is shared across heads, so the split can only happen at `wq_b`, after the rank.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub(crate) enum Shard {
+    Replicated,
+    OutSplit,
+    InSplit,
+}
+
+/// The TP sharding of every weight this emit binds today.
+///
+/// Returns `None` for a tensor whose sharding has not been established. At `tp > 1` that is a
+/// REFUSAL rather than a default: guessing `Replicated` wastes memory but guessing a split gives
+/// every rank a fraction of a weight it needed whole, and the model merely gets worse.
+pub(crate) fn dsv41_shard_of(suffix: &str) -> Option<Shard> {
+    use Shard::*;
+    Some(match suffix {
+        // Norms are per-feature over the full hidden width; every rank normalises its own copy.
+        "attn_norm.weight" | "ffn_norm.weight" | "attn.q_norm.weight" | "attn.kv_norm.weight" => {
+            Replicated
+        }
+        // The q-LoRA DOWN projection. The rank (1280) is shared across heads, so there is nothing
+        // head-shaped to split here; the head split happens at wq_b below.
+        "attn.wq_a.weight" | "attn.wq_a.scale" => Replicated,
+        // The q UP projection: [heads * head_dim, q_lora], column-parallel by head.
+        "attn.wq_b.weight" | "attn.wq_b.scale" => OutSplit,
+        // THE ABSORBED LATENT IS REPLICATED. One 512-wide row serves all 64 heads as both K and
+        // V, so a rank holding 1/8 of it could not attend with the heads it owns. Section 7.
+        "attn.wkv.weight" | "attn.wkv.scale" => Replicated,
+        // The output LoRA. Block-diagonal over o_groups, and o_groups == 8 == tp, so rank r's
+        // OutSplit rows [r*1024, (r+1)*1024) ARE group r's [1024, 4096] block -- the grouped
+        // structure and the tensor-parallel split are the same cut.
+        "attn.wo_a.weight" | "attn.wo_a.scale" => OutSplit,
+        // wo_b reduces over every group's LoRA output, so it splits on the INPUT and the ranks
+        // reduce afterwards.
+        "attn.wo_b.weight" | "attn.wo_b.scale" => InSplit,
+        // Shared expert: gate/up are column-parallel over the intermediate, down reduces over it.
+        "ffn.shared_experts.w1.weight"
+        | "ffn.shared_experts.w1.scale"
+        | "ffn.shared_experts.w3.weight"
+        | "ffn.shared_experts.w3.scale" => OutSplit,
+        "ffn.shared_experts.w2.weight" | "ffn.shared_experts.w2.scale" => InSplit,
+        // One sink per head, so it follows the heads.
+        "attn.attn_sink" => OutSplit,
+        // The ROUTER is replicated: every rank scores every expert, because a rank that saw only
+        // its own 48 experts could not pick the global top-6. 384 * 5120 bf16 is 3.9 MB, so the
+        // replication costs nothing worth splitting for.
+        "ffn.gate.weight" | "ffn.gate.bias" | "ffn.gate.bias_vl" => Replicated,
+        // The routed experts under the DEFAULT (TP) placement: gate/up column-parallel over
+        // `moe_inter`, down reducing over it, exactly like the shared expert. `PLOW_MOE_PREFILL_EP`
+        // would instead give each rank 384/8 = 48 WHOLE experts, which is a different answer for
+        // these names -- but it is opt-in and OFF by default (`knob_spec.rs:762`), and this emit
+        // does not implement it, so the default is what is encoded here.
+        _ if is_routed_expert(suffix, "w1") || is_routed_expert(suffix, "w3") => OutSplit,
+        _ if is_routed_expert(suffix, "w2") => InSplit,
+        // mHC mixes the RESIDUAL stream, which is replicated -- restoring it is what the reduce
+        // after `wo_b` is for. These are f32 and tiny; the largest is [mix, hc_mult, hidden].
+        "hc_attn_fn" | "hc_attn_base" | "hc_attn_scale" | "hc_ffn_fn" | "hc_ffn_base"
+        | "hc_ffn_scale" => Replicated,
+        // The CSA2 compressor produces THE LATENT, and the latent is replicated for the same
+        // reason `attn.wkv` is: one 512-wide row serves all 64 heads.
+        "attn.compressor.wkv.weight"
+        | "attn.compressor.norm.weight"
+        | "attn.compressor.wgate.weight" => Replicated,
+        // Indexer queries are per index-head (32 of them, 4 per rank at tp=8).
+        "attn.indexer.wq_b.weight"
+        | "attn.indexer.wq_b.scale"
+        | "attn.indexer.weights_proj.weight" => OutSplit,
+        // The index KEY is derived from the compressor's latent and is likewise one shared row.
+        "attn.indexer.wk.weight" | "attn.indexer.k_norm.weight" => Replicated,
+        // `engram.embed` CANNOT be replicated: the two tables are 202.8 GB and an MI300X has 192 GB
+        // of HBM, so a replicated copy does not fit on one GPU at all. Row-split is the only
+        // placement that fits (25.35 GB per rank), which makes this OutSplit by capacity rather
+        // than by preference. `engram.wkv`/`q_weight`/`k_weight` are deliberately NOT listed: their
+        // sharding follows from how the row gather exchanges between ranks, and that is not
+        // designed yet. They live on layers 1 and 14 only, so layer 0 does not meet them.
+        "engram.embed.weight" | "engram.embed.scale" => OutSplit,
+        _ => return None,
+    })
+}
+
+/// `ffn.experts.<e>.<w>.{weight,scale}` for a given `w`, for any expert index.
+fn is_routed_expert(suffix: &str, w: &str) -> bool {
+    let Some(rest) = suffix.strip_prefix("ffn.experts.") else {
+        return false;
+    };
+    let Some((e, tail)) = rest.split_once('.') else {
+        return false;
+    };
+    !e.is_empty()
+        && e.bytes().all(|b| b.is_ascii_digit())
+        && (tail == format!("{w}.weight") || tail == format!("{w}.scale"))
+}
+
 /// Every WEIGHT handle for a V4.1 layer, keyed by the checkpoint name without its
 /// `layers.{l}.` prefix.
 ///
@@ -297,11 +400,38 @@ pub(crate) fn declare_dsv41_weights(
     b: &mut Builder,
     c: &Dsv41Cfg,
     layers: &[u32],
+    tp: u32,
 ) -> Dsv41Weights {
+    assert!(tp >= 1, "tp must be at least 1");
     let mut per_layer = vec![std::collections::BTreeMap::new(); c.layers as usize];
     let mut bytes = 0u64;
     for &l in layers {
-        for (suffix, sz) in dsv41_layer_tensors(c, l) {
+        for (suffix, full) in dsv41_layer_tensors(c, l) {
+            // `dsv41_layer_tensors` is the CHECKPOINT contract, checked against the shards at
+            // full size. What a PACKET declares is this rank's share, which is a different
+            // number whenever the tensor splits -- and the loader binds rank r's slice to it.
+            let sz = if tp == 1 {
+                full
+            } else {
+                match dsv41_shard_of(&suffix) {
+                    Some(Shard::Replicated) => full,
+                    Some(Shard::OutSplit) | Some(Shard::InSplit) => {
+                        assert_eq!(
+                            full % tp as u64,
+                            0,
+                            "layer {l} {suffix:?} is {full} bytes, which tp={tp} does not divide"
+                        );
+                        full / tp as u64
+                    }
+                    None => panic!(
+                        "layer {l} {suffix:?} has no established TP sharding, so a tp={tp} \
+                         declaration cannot size it. Guessing Replicated wastes memory; guessing \
+                         a split hands every rank a fraction of a weight it needed whole and the \
+                         model merely gets worse. Add it to `dsv41_shard_of`. Missing \
+                         capability: `dsv41_shard_{suffix}`."
+                    ),
+                }
+            };
             let h = b.tensor(&format!("layers.{l}.{suffix}"), sz);
             let prev = per_layer[l as usize].insert(suffix.clone(), h);
             assert!(
@@ -443,14 +573,26 @@ pub(crate) fn emit_dsv41_attn_proj(
     (act, c_kv)
 }
 
+/// The o_proj TP partial's tensor name, fixed by `plowrt`'s peer-slot table (slot 0).
+///
+/// `crates/plowrt/src/exec/amd.rs` matches this string literally to bind the tensor into the peer
+/// region instead of local VRAM. Renaming it here silently un-peers the buffer.
+pub(crate) const PEER_SLOT_O: &str = "act.og_tp";
+
 /// Scratch for the output side: the per-group LoRA output and the projected residual.
 pub(crate) struct Dsv41OutAct {
     /// This rank's output-LoRA group, `[T][o_lora_rank]` bf16.
     pub(crate) o_a: u32,
-    /// `wo_b`'s input: every group's LoRA output concatenated, `[T][o_groups * o_lora_rank]` bf16.
-    /// At TP > 1 this is the all-gather destination; at TP 1 `o_a` IS the whole of it.
-    pub(crate) o_cat: u32,
-    /// The projected residual contribution, `[T][hidden]` bf16.
+    /// This rank's PARTIAL `[T][hidden]` bf16. It is a partial, not an output: it is only group
+    /// `r`'s contribution, and no rank's copy is the answer until the reduce runs.
+    ///
+    /// It MUST be declared as `act.og_tp`. The name is the contract: `plowrt` binds exactly six
+    /// names into the TP peer region (`exec/amd.rs`'s `is_peer_slot`), `act.og_tp` being slot 0,
+    /// the o_proj partial. Any other name is an ordinary device-local activation, and then every
+    /// rank's `XReduce` sums peer slots its peers never wrote -- which that code's own comment
+    /// describes as "a wrong token, with no fault and no message".
+    pub(crate) o_part: u32,
+    /// The projected residual contribution after the all-reduce, `[T][hidden]` bf16.
     pub(crate) o: u32,
 }
 
@@ -473,6 +615,17 @@ pub(crate) struct Dsv41OutAct {
 /// the tensor table binds a name to a whole checkpoint tensor -- there is no sub-tensor view -- so
 /// a TP1 path needs either a grouped-GEMM opcode or a loader that can bind a slice. Neither
 /// exists, and inventing a name like `wo_a.g3` would bind nothing and read zeros.
+///
+/// # `wo_b` reduces, it does not gather
+///
+/// Rank `r` produces group `r`'s `[T, 1024]`, which is exactly input columns
+/// `[r*1024, (r+1)*1024)` of `wo_b` -- so `wo_b` is INPUT-parallel and the ranks sum afterwards.
+/// The tempting alternative (all-gather the eight groups, then run the full `[5120, 8192]` GEMM on
+/// every rank) is what this emit used to do and it is 8x the arithmetic: 687 GFLOP per rank per
+/// layer instead of 86, which over 40 layers is 27.5 TFLOP against a 281.6 TFLOP budget -- a ~10%
+/// inflation of the whole model's compute, bought for nothing. The reduce is GLM's
+/// [`crate::emit_xreduce`], which already picks the bandwidth-optimal two-shot for prefill and the
+/// latency-optimal one-shot for decode.
 pub(crate) fn emit_dsv41_attn_out(
     b: &mut Builder,
     c: &Dsv41Cfg,
@@ -482,6 +635,7 @@ pub(crate) fn emit_dsv41_attn_out(
     tp: u32,
     attn_out: u32,
     t: u32,
+    xgate: &mut u32,
     deps: &[u32],
 ) -> (Dsv41OutAct, u32) {
     let (groups, orow, ocol) = c.wo_a_groups();
@@ -495,10 +649,9 @@ pub(crate) fn emit_dsv41_attn_out(
     );
     let act = Dsv41OutAct {
         o_a: b.tensor(&format!("act.l{l}.o_a"), (t as u64) * (orow as u64) * 2),
-        o_cat: b.tensor(
-            &format!("act.l{l}.o_cat"),
-            (t as u64) * (groups as u64) * (orow as u64) * 2,
-        ),
+        // NOT per-layer: the name is fixed by the runtime's peer-slot table, and the reduce
+        // consumes the partial in the same layer that writes it, so one buffer serves all 40.
+        o_part: b.tensor(PEER_SLOT_O, (t as u64) * (c.hidden as u64) * 2),
         o: b.tensor(&format!("act.l{l}.o"), (t as u64) * (c.hidden as u64) * 2),
     };
     // This rank's group: [T, ocol] x [orow, ocol]^T -> [T, orow].
@@ -514,27 +667,32 @@ pub(crate) fn emit_dsv41_attn_out(
         ocol,
         deps,
     );
-    // `wo_b` reads EVERY group, so the ranks must exchange before it -- 5.87 GB of the 14.8 GB
-    // each rank moves over xGMI per 8k prefill (section 9), a real term in the 90 ms budget.
-    //
-    // NOT emitted here, deliberately. `XAllGather` takes up to three destinations with slot-based
-    // sources (`i[5..8]` are src slots, `i[3]` a gate, `i[4]` n_gpu), which is a contract to read
-    // rather than infer; a collective wired from a guess moves the wrong bytes and the GEMM after
-    // it still runs. It is its own part in the rung plan until that is done, so `o_cat` is
-    // declared and left unfilled rather than silently aliased to this rank's slice.
+    // This rank's SLICE of wo_b: [T, orow] x [hidden, orow]^T -> a [T, hidden] PARTIAL.
     let c_ob = emit_pf_gemm_fp8_mx(
         b,
         cus,
-        act.o,
-        act.o_cat,
+        act.o_part,
+        act.o_a,
         w.get(l, "attn.wo_b.weight"),
         w.get(l, "attn.wo_b.scale"),
         t,
         c.hidden,
-        c.wo_b_in(),
+        orow,
         &[c_oa],
     );
-    (act, c_ob)
+    let xr = super::xr_cus_capped(b.n_cu(), cus);
+    let c_xr = crate::emit_xreduce(
+        b,
+        xgate,
+        false,
+        &xr,
+        c_ob,
+        act.o,
+        t * c.hidden,
+        tp,
+        0,
+    );
+    (act, c_xr)
 }
 
 /// V4.1's GLU is the CLAMPED SwiGLU, `PLOW_ACT_SWIGLU_CLAMP_` in `op_elementwise.h`.
@@ -676,7 +834,7 @@ pub(crate) fn dsv41_layer_parts(c: &Dsv41Cfg, l: u32) -> Vec<(&'static str, Part
     }
     p.push(("attention core (absorbed MLA over the 512 latent)", Part::Todo));
     p.push(("output projection wo_a + wo_b (op 184)", Part::Done));
-    p.push(("output all-gather across o_groups (XAllGather)", Part::Todo));
+    p.push(("output all-reduce (XReduce, wo_b is input-parallel)", Part::Done));
     p.push(("ffn_norm", Part::Done));
     if c.engram_layers.contains(&l) {
         p.push(("engram gate + embed (ops 182/183)", Part::Todo));

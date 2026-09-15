@@ -414,7 +414,7 @@ fn the_declaration_binds_every_listed_weight_under_its_checkpoint_name() {
         return;
     };
     let mut b = Builder::new(304);
-    let w = super::dsv41::declare_dsv41_weights(&mut b, &cfg, &[0, 1]);
+    let w = super::dsv41::declare_dsv41_weights(&mut b, &cfg, &[0, 1], 1);
     for l in [0u32, 1] {
         let listed = super::dsv41::dsv41_layer_tensors(&cfg, l);
         assert!(!listed.is_empty(), "layer {l} must carry weights");
@@ -446,7 +446,7 @@ fn the_declaration_puts_the_optional_groups_only_where_they_belong() {
     };
     let all: Vec<u32> = (0..cfg.layers).collect();
     let mut b = Builder::new(304);
-    let w = super::dsv41::declare_dsv41_weights(&mut b, &cfg, &all);
+    let w = super::dsv41::declare_dsv41_weights(&mut b, &cfg, &all, 1);
     for l in 0..cfg.layers {
         let engram_here = cfg.engram_layers.contains(&l);
         assert_eq!(
@@ -477,7 +477,7 @@ fn the_declared_total_is_the_documented_weight_budget() {
     };
     let all: Vec<u32> = (0..cfg.layers).collect();
     let mut b = Builder::new(304);
-    let w = super::dsv41::declare_dsv41_weights(&mut b, &cfg, &all);
+    let w = super::dsv41::declare_dsv41_weights(&mut b, &cfg, &all, 1);
     let listed: u64 = all
         .iter()
         .flat_map(|&l| super::dsv41::dsv41_layer_tensors(&cfg, l))
@@ -514,7 +514,7 @@ fn asking_for_a_weight_a_layer_lacks_is_refused() {
         panic!("no weight (checkpoint absent, refusing vacuously)");
     };
     let mut b = Builder::new(304);
-    let w = super::dsv41::declare_dsv41_weights(&mut b, &cfg, &[0]);
+    let w = super::dsv41::declare_dsv41_weights(&mut b, &cfg, &[0], 1);
     // Layer 0 is not an engram layer (they are 1 and 14).
     w.get(0, "engram.wkv.weight");
 }
@@ -537,7 +537,7 @@ fn the_attention_projection_chain_emits_against_the_real_weights() {
     };
     let _guard = crate::test_env::env_guard();
     let mut b = Builder::new(304);
-    let w = super::dsv41::declare_dsv41_weights(&mut b, &cfg, &[0]);
+    let w = super::dsv41::declare_dsv41_weights(&mut b, &cfg, &[0], 1);
     let all: Vec<u32> = (0..304u32).collect();
     let t = 512u32;
     let x = b.tensor("act.x", (t as u64) * (cfg.hidden as u64) * 2);
@@ -597,7 +597,7 @@ fn the_latent_and_the_query_are_parallel_branches_off_the_same_norm() {
     };
     let _guard = crate::test_env::env_guard();
     let mut b = Builder::new(304);
-    let w = super::dsv41::declare_dsv41_weights(&mut b, &cfg, &[0]);
+    let w = super::dsv41::declare_dsv41_weights(&mut b, &cfg, &[0], 1);
     let all: Vec<u32> = (0..304u32).collect();
     let t = 512u32;
     let x = b.tensor("act.x", (t as u64) * (cfg.hidden as u64) * 2);
@@ -663,9 +663,9 @@ fn the_rung_plan_is_per_layer_and_names_what_is_emitted() {
         .collect();
     assert_eq!(
         done.len(),
-        4,
-        "attention projections, output projection, ffn_norm and the shared expert are emitted; \
-         this count is the \
+        5,
+        "attention projections, output projection, the output all-reduce, ffn_norm and the shared \
+         expert are emitted; this count is the \
          thing that grows as bricks land, so it is asserted exactly rather than as a lower bound"
     );
     // And the rung still REFUSES, because a partial blob would run and produce garbage.
@@ -693,12 +693,16 @@ fn the_output_projection_is_two_ordinary_gemms_at_tp8() {
     assert_eq!(groups, 8);
     assert_eq!(ocol, cfg.heads * cfg.head_dim / groups, "one rank's share of the heads");
     let mut b = Builder::new(304);
-    let w = super::dsv41::declare_dsv41_weights(&mut b, &cfg, &[0]);
+    // Declared at tp=8, because the emit reads this rank's SHARE of wo_a. Declaring full-size
+    // here and reading a per-rank shape is exactly the bug the operand check now catches.
+    let w = super::dsv41::declare_dsv41_weights(&mut b, &cfg, &[0], groups);
     let all: Vec<u32> = (0..304u32).collect();
     let t = 512u32;
     let attn_out = b.tensor("act.attn_out", (t as u64) * (ocol as u64) * 2);
     let (act, _) =
-        super::dsv41::emit_dsv41_attn_out(&mut b, &cfg, &w, &all, 0, groups, attn_out, t, &[]);
+        super::dsv41::emit_dsv41_attn_out(
+            &mut b, &cfg, &w, &all, 0, groups, attn_out, t, &mut 0, &[],
+        );
     let p = b.finish();
     let g: Vec<_> = p
         .insts
@@ -708,13 +712,38 @@ fn the_output_projection_is_two_ordinary_gemms_at_tp8() {
     assert_eq!(g.len(), 2, "wo_a for this rank's group, then wo_b");
     let oa = g.iter().find(|d| d.t[0] == act.o_a).unwrap();
     assert_eq!([oa.i[1], oa.i[2]], [orow, ocol], "wo_a is [o_lora_rank, one group's heads]");
-    let ob = g.iter().find(|d| d.t[0] == act.o).unwrap();
+    // wo_b is INPUT-parallel: this rank multiplies its own group's [T, orow] by its own
+    // [hidden, orow] slice and the ranks SUM. Reading the full wo_b_in() here would be the
+    // all-gather form, which is 8x the arithmetic for the same answer.
+    let ob = g.iter().find(|d| d.t[0] == act.o_part).unwrap();
     assert_eq!(
         [ob.i[1], ob.i[2]],
-        [cfg.hidden, cfg.wo_b_in()],
-        "wo_b reads every group's LoRA output concatenated"
+        [cfg.hidden, orow],
+        "wo_b reads THIS rank's group only, and the all-reduce sums the eight partials"
     );
-    assert_eq!(cfg.wo_b_in(), groups * orow, "which is o_groups * o_lora_rank");
+    assert_eq!(cfg.wo_b_in(), groups * orow, "the full wo_b input is o_groups * o_lora_rank");
+    // And the sum is actually emitted -- a partial nobody reduces is silently 1/8 of the answer.
+    let xr: Vec<_> = p
+        .insts
+        .iter()
+        .filter(|d| d.op == DevOp::XReduce as u16 || d.op == DevOp::XReduceTwoShot as u16)
+        .collect();
+    assert_eq!(xr.len(), 1, "exactly one all-reduce closes the output projection");
+    assert_eq!(xr[0].t[0], act.o, "the reduce writes the layer's o, not the partial");
+    assert_eq!(xr[0].i[0], t * cfg.hidden, "it reduces the whole [T, hidden] partial");
+    assert_eq!(xr[0].i[1], groups, "over all 8 ranks");
+    // The peer-slot NAME is the contract: plowrt binds `act.og_tp` into the peer region and every
+    // other name into local VRAM, where the peers' slots are never written.
+    assert_eq!(
+        p.tensors[act.o_part as usize].name,
+        super::dsv41::PEER_SLOT_O,
+        "the partial must be declared under the runtime's peer-slot name"
+    );
+    assert!(
+        p.insts.iter().all(|d| d.op != DevOp::XAllGather as u16),
+        "no all-gather: gathering the eight groups and running the full wo_b on every rank is \
+         687 GFLOP per rank per layer instead of 86"
+    );
 }
 
 /// At TP1 it must REFUSE, not silently do one eighth of the work.
@@ -731,10 +760,11 @@ fn the_output_projection_refuses_at_tp1_rather_than_doing_one_group() {
     };
     let _guard = crate::test_env::env_guard();
     let mut b = Builder::new(304);
-    let w = super::dsv41::declare_dsv41_weights(&mut b, &cfg, &[0]);
+    let w = super::dsv41::declare_dsv41_weights(&mut b, &cfg, &[0], 1);
     let all: Vec<u32> = (0..304u32).collect();
     let attn_out = b.tensor("act.attn_out", 512 * 4096 * 2);
-    super::dsv41::emit_dsv41_attn_out(&mut b, &cfg, &w, &all, 0, 1, attn_out, 512, &[]);
+    super::dsv41::emit_dsv41_attn_out(&mut b, &cfg, &w, &all, 0, 1, attn_out, 512, &mut 0, &[]);
+    unreachable!("tp=1 must have been refused above");
 }
 
 /// The shared expert, against the real weights, with the CLAMPED SwiGLU.
@@ -751,7 +781,7 @@ fn the_shared_expert_uses_the_clamped_swiglu_not_plain_silu() {
     };
     let _guard = crate::test_env::env_guard();
     let mut b = Builder::new(304);
-    let w = super::dsv41::declare_dsv41_weights(&mut b, &cfg, &[0]);
+    let w = super::dsv41::declare_dsv41_weights(&mut b, &cfg, &[0], 1);
     let all: Vec<u32> = (0..304u32).collect();
     let t = 512u32;
     let x = b.tensor("act.x", (t as u64) * (cfg.hidden as u64) * 2);

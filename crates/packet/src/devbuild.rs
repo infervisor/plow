@@ -970,6 +970,16 @@ impl Builder {
         &self.tensors[h as usize].name
     }
 
+    /// The declared size of handle `h`, in bytes.
+    ///
+    /// For emitters that want to check an operand against the shape they are about to pass in
+    /// `i[]`. A weight declared at one size and read at another is the silent-wrongness case: the
+    /// kernel reads whatever is at the handle, so a full-size tensor read with a per-rank N gives
+    /// every rank the FIRST shard of the weight instead of its own, with no fault anywhere.
+    pub fn tensor_bytes(&self, h: u32) -> u64 {
+        self.tensors[h as usize].bytes
+    }
+
     /// Declare a tensor whose contents the compiler already knows (e.g. RoPE tables).
     pub fn tensor_init(&mut self, name: &str, init: Vec<u8>) -> u32 {
         self.tensors.push(TensorDecl {
