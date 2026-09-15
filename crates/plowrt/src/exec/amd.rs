@@ -6725,6 +6725,10 @@ impl AmdEngine {
             && blob
                 .prefill_phase()
                 .any(amd_gemma4_glu::program_fp8_candidate);
+        let wants_gemma4_down = arch == "gfx942"
+            && blob
+                .prefill_phase()
+                .any(amd_gemma4_glu::program_down_candidate);
         // Weights and scale grids the route binds in its own layout (shuffled, doubled).
         let gemm_blk_bound = if use_gemm_blk {
             amd_gemm_blk::bound_weights(&blob.progs)?
@@ -8603,6 +8607,7 @@ impl AmdEngine {
                 &hsaco_dir,
                 blob.n_cu,
                 wants_gemma4_glu_fp8,
+                wants_gemma4_down,
                 &mut modules,
             )?
         } else {
@@ -9436,14 +9441,14 @@ impl AmdEngine {
                             program = prog_ix,
                             rows = p.t,
                             segments = route_count,
-                            "native Gemma-4 GemmGlu route enabled"
+                            "native Gemma-4 dense GEMM route enabled"
                         );
                     }
                     for (seg, route) in gemma4_glu_routes.into_iter().enumerate() {
                         if let Some(route) = route {
                             if !matches!(prefill_routes[seg], PrefillSegmentRoute::Interpreter) {
                                 return Err(RuntimeError::Device(
-                                    "native Gemma-4 GemmGlu overlaps another route".into(),
+                                    "native Gemma-4 dense GEMM overlaps another route".into(),
                                 ));
                             }
                             prefill_routes[seg] = PrefillSegmentRoute::Gemma4Glu(route);
@@ -11504,7 +11509,7 @@ impl AmdEngine {
             self.progs[p].prefill_routes.get(seg).copied()
         {
             let kernel = self.gemma4_glu.as_ref().ok_or_else(|| {
-                RuntimeError::Device("native Gemma-4 GemmGlu route has no loaded kernel".into())
+                RuntimeError::Device("native Gemma-4 dense GEMM route has no loaded kernel".into())
             })?;
             kernel.enqueue(&self.be, route, &self.tens_table)?;
             self.seg_launches += 1;

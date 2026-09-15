@@ -28,49 +28,81 @@ enum Precision {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Tile {
-    C2,
-    C5,
+enum Kind {
+    Glu,
+    Down,
 }
 
-fn model(inst: &DevInst64) -> Option<Model> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tile {
+    C2,
+    C3,
+    C5,
+    C6,
+}
+
+fn classify(inst: &DevInst64) -> Option<(Model, Kind)> {
     match (inst.i[1], inst.i[2]) {
-        (15_360, 3_840) => Some(Model::Gemma12),
-        (21_504, 5_376) => Some(Model::Gemma31),
+        (15_360, 3_840) => Some((Model::Gemma12, Kind::Glu)),
+        (21_504, 5_376) => Some((Model::Gemma31, Kind::Glu)),
+        (3_840, 15_360) => Some((Model::Gemma12, Kind::Down)),
+        (5_376, 21_504) => Some((Model::Gemma31, Kind::Down)),
         _ => None,
     }
 }
 
-fn candidate(inst: &DevInst64) -> bool {
-    matches!(
-        DevOp::from_u16(inst.op),
-        Some(DevOp::GemmGlu | DevOp::GemmGluFp8)
-    ) && model(inst).is_some()
+fn precision(inst: &DevInst64) -> Option<Precision> {
+    match DevOp::from_u16(inst.op) {
+        Some(
+            DevOp::Gemm
+            | DevOp::GemmMed
+            | DevOp::GemmSmall
+            | DevOp::GemmWide
+            | DevOp::GemmC5
+            | DevOp::GemmGlu,
+        ) => Some(Precision::Bf16),
+        Some(
+            DevOp::GemmFp8
+            | DevOp::GemmMedFp8
+            | DevOp::GemmSmallFp8
+            | DevOp::GemmWideFp8
+            | DevOp::GemmC5Fp8
+            | DevOp::GemmGluFp8,
+        ) => Some(Precision::Fp8),
+        _ => None,
+    }
 }
 
 fn native(inst: &DevInst64) -> bool {
-    let common = candidate(inst)
-        && inst.i[4] == 0
-        && inst.i[5] == 0
-        && inst.fj == [0; 3]
-        && inst.t[7] == TENSOR_NONE16;
-    let bf16 = inst.op == DevOp::GemmGlu as u16
-        && inst.i[3] == 0
-        && inst.i[6..] == [0; 2]
-        && inst.t[3..5] == [TENSOR_NONE16; 2]
-        && inst.t[6..] == [TENSOR_NONE16; 2];
-    let fp8 = inst.op == DevOp::GemmGluFp8 as u16
-        && inst.i[3] == 0
-        && inst.i[6..] == [0; 2]
-        && inst.t[..7].iter().all(|&tensor| tensor != TENSOR_NONE16);
-    common && (bf16 || fp8)
-}
-
-fn precision(inst: &DevInst64) -> Precision {
-    if inst.op == DevOp::GemmGluFp8 as u16 {
-        Precision::Fp8
-    } else {
-        Precision::Bf16
+    let Some((_, kind)) = classify(inst) else {
+        return false;
+    };
+    match (kind, precision(inst)) {
+        (Kind::Glu, Some(Precision::Bf16)) => {
+            inst.op == DevOp::GemmGlu as u16
+                && inst.i[3..] == [0; 5]
+                && inst.fj == [0; 3]
+                && inst.t[3..5] == [TENSOR_NONE16; 2]
+                && inst.t[6..] == [TENSOR_NONE16; 2]
+        }
+        (Kind::Glu, Some(Precision::Fp8)) => {
+            inst.op == DevOp::GemmGluFp8 as u16
+                && inst.i[3..] == [0; 5]
+                && inst.fj == [0; 3]
+                && inst.t[..7].iter().all(|&tensor| tensor != TENSOR_NONE16)
+                && inst.t[7] == TENSOR_NONE16
+        }
+        (Kind::Down, Some(Precision::Bf16)) => {
+            inst.i[3..] == [0; 5]
+                && inst.t[..3].iter().all(|&tensor| tensor != TENSOR_NONE16)
+                && inst.t[3..] == [TENSOR_NONE16; 5]
+        }
+        (Kind::Down, Some(Precision::Fp8)) => {
+            inst.i[3..] == [0; 5]
+                && inst.t[..5].iter().all(|&tensor| tensor != TENSOR_NONE16)
+                && inst.t[5..] == [TENSOR_NONE16; 3]
+        }
+        _ => false,
     }
 }
 
@@ -94,14 +126,28 @@ pub(super) fn program_fp8_candidate(prog: &DevProg) -> bool {
         && prog
             .insts
             .iter()
-            .any(|inst| native(inst) && precision(inst) == Precision::Fp8)
+            .any(|inst| native(inst) && precision(inst) == Some(Precision::Fp8))
 }
 
-fn tile(model: Model, rows: u32) -> Tile {
-    match model {
-        Model::Gemma12 if rows <= 4096 => Tile::C2,
-        Model::Gemma31 if rows <= 1024 => Tile::C2,
-        Model::Gemma12 | Model::Gemma31 => Tile::C5,
+pub(super) fn program_down_candidate(prog: &DevProg) -> bool {
+    program_candidate(prog)
+        && prog
+            .insts
+            .iter()
+            .any(|inst| native(inst) && classify(inst).is_some_and(|(_, k)| k == Kind::Down))
+}
+
+fn tile(model: Model, kind: Kind, precision: Precision, rows: u32) -> Tile {
+    match (model, kind, precision, rows) {
+        (Model::Gemma12, Kind::Down, Precision::Bf16, 8192) => Tile::C6,
+        (Model::Gemma12, Kind::Down, _, _) => Tile::C2,
+        (Model::Gemma31, Kind::Down, Precision::Bf16, _) => Tile::C5,
+        (Model::Gemma31, Kind::Down, Precision::Fp8, 4096) => Tile::C3,
+        (Model::Gemma31, Kind::Down, Precision::Fp8, rows) if rows <= 2048 => Tile::C5,
+        (Model::Gemma31, Kind::Down, _, _) => Tile::C2,
+        (Model::Gemma12, Kind::Glu, _, rows) if rows <= 4096 => Tile::C2,
+        (Model::Gemma31, Kind::Glu, _, rows) if rows <= 1024 => Tile::C2,
+        (Model::Gemma12 | Model::Gemma31, Kind::Glu, _, _) => Tile::C5,
     }
 }
 
@@ -112,6 +158,7 @@ pub(super) struct Route {
     rows: u32,
     model: Model,
     precision: Precision,
+    kind: Kind,
     tile: Tile,
 }
 
@@ -119,11 +166,11 @@ impl Route {
     pub fn rebase(&mut self, rows: u32) -> Result<()> {
         if rows == 0 || rows > self.capacity {
             return Err(RuntimeError::Device(
-                "native Gemma-4 GemmGlu exceeds row capacity".into(),
+                "native Gemma-4 dense GEMM exceeds row capacity".into(),
             ));
         }
         self.rows = rows;
-        self.tile = tile(self.model, rows);
+        self.tile = tile(self.model, self.kind, self.precision, rows);
         Ok(())
     }
 }
@@ -144,28 +191,28 @@ pub(super) fn routes(
         return Ok(out);
     };
     for (ix, inst) in prog.insts.iter().enumerate().filter(|(_, i)| native(i)) {
-        let err = |s: &str| RuntimeError::Device(format!("native Gemma-4 GemmGlu {ix}: {s}"));
-        let model = model(inst).unwrap();
+        let err = |s: &str| RuntimeError::Device(format!("native Gemma-4 dense GEMM {ix}: {s}"));
+        let (model, kind) = classify(inst).unwrap();
         if inst.i[0] != prog.t {
             return Err(err(
-                "requires an exact 1K/2K/4K/8K bias-free BF16 Gemma gate/up projection",
+                "requires an exact 1K/2K/4K/8K bias-free Gemma projection",
             ));
         }
         let mut handles = BTreeSet::new();
-        let precision = precision(inst);
+        let precision = precision(inst).unwrap();
         let (m, n, k) = (
             u64::from(prog.t),
             u64::from(inst.i[1]),
             u64::from(inst.i[2]),
         );
-        let operands: Vec<(u16, u64)> = match precision {
-            Precision::Bf16 => vec![
+        let operands: Vec<(u16, u64)> = match (kind, precision) {
+            (Kind::Glu, Precision::Bf16) => vec![
                 (inst.t[0], m * n * 2),
                 (inst.t[1], m * k * 2),
                 (inst.t[2], n * k * 2),
                 (inst.t[5], n * k * 2),
             ],
-            Precision::Fp8 => vec![
+            (Kind::Glu, Precision::Fp8) => vec![
                 (inst.t[0], m * n * 2),
                 (inst.t[1], m * k),
                 (inst.t[2], n * k),
@@ -173,6 +220,18 @@ pub(super) fn routes(
                 (inst.t[4], n * 4),
                 (inst.t[5], n * k),
                 (inst.t[6], n * 4),
+            ],
+            (Kind::Down, Precision::Bf16) => vec![
+                (inst.t[0], m * n * 2),
+                (inst.t[1], m * k * 2),
+                (inst.t[2], n * k * 2),
+            ],
+            (Kind::Down, Precision::Fp8) => vec![
+                (inst.t[0], m * n * 2),
+                (inst.t[1], m * k),
+                (inst.t[2], n * k),
+                (inst.t[3], m * 4),
+                (inst.t[4], n * 4),
             ],
         };
         for (handle, bytes) in operands {
@@ -192,7 +251,8 @@ pub(super) fn routes(
             rows: prog.t,
             model,
             precision,
-            tile: tile(model, prog.t),
+            kind,
+            tile: tile(model, kind, precision, prog.t),
         });
     }
     Ok(out)
@@ -200,7 +260,7 @@ pub(super) fn routes(
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct Args {
+struct GluArgs {
     out: u64,
     input: u64,
     gate: u64,
@@ -210,7 +270,20 @@ struct Args {
     k: u32,
     act: u32,
 }
-const _: () = assert!(std::mem::size_of::<Args>() == 48);
+const _: () = assert!(std::mem::size_of::<GluArgs>() == 48);
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct LinearArgs {
+    out: u64,
+    input: u64,
+    weight: u64,
+    rows: u32,
+    n: u32,
+    k: u32,
+    reserved: u32,
+}
+const _: () = assert!(std::mem::size_of::<LinearArgs>() == 40);
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -229,6 +302,21 @@ struct Fp8Args {
 }
 const _: () = assert!(std::mem::size_of::<Fp8Args>() == 72);
 
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct Fp8LinearArgs {
+    out: u64,
+    input: u64,
+    weight: u64,
+    input_scale: u64,
+    weight_scale: u64,
+    rows: u32,
+    n: u32,
+    k: u32,
+    reserved: u32,
+}
+const _: () = assert!(std::mem::size_of::<Fp8LinearArgs>() == 56);
+
 pub(super) struct Gemma4Glu {
     c2: HsaKernel,
     c5_12: HsaKernel,
@@ -237,6 +325,16 @@ pub(super) struct Gemma4Glu {
     fp8_c5_12: Option<HsaKernel>,
     fp8_c2_31: Option<HsaKernel>,
     fp8_c5_31: Option<HsaKernel>,
+    down_c2_12: Option<HsaKernel>,
+    down_c5_12: Option<HsaKernel>,
+    down_c6_12: Option<HsaKernel>,
+    down_c2_31: Option<HsaKernel>,
+    down_c5_31: Option<HsaKernel>,
+    down_fp8_c2_12: Option<HsaKernel>,
+    down_fp8_c5_12: Option<HsaKernel>,
+    down_fp8_c2_31: Option<HsaKernel>,
+    down_fp8_c3_31: Option<HsaKernel>,
+    down_fp8_c5_31: Option<HsaKernel>,
     n_cu: u32,
 }
 
@@ -246,6 +344,7 @@ impl Gemma4Glu {
         dir: &Path,
         n_cu: u32,
         need_fp8: bool,
+        need_down: bool,
         modules: &mut Vec<Module>,
     ) -> Result<Option<Self>> {
         let path = dir.join(OBJECT);
@@ -283,6 +382,23 @@ impl Gemma4Glu {
                 }
             }
         }
+        if need_down {
+            for marker in [
+                "plow_gemma4_down_128x256x64_1",
+                "plow_gemma4_down_192x256x64_1",
+                "plow_gemma4_down_320x128x64_1",
+                "plow_gemma4_down_fp8_128x256x128_1",
+                "plow_gemma4_down_fp8_128x128x128_1",
+                "plow_gemma4_down_fp8_192x256x128_1",
+            ] {
+                if !symbols.contains(&marker) {
+                    return Err(RuntimeError::Device(format!(
+                        "{} lacks required marker `{marker}`",
+                        path.display()
+                    )));
+                }
+            }
+        }
         let module = EngineDevice::module_load(be, &image)?;
         let c2 = EngineDevice::get_function(be, &module, "plow_gemma4_gemm_glu_c2_gfx942")?;
         let c5_12 = EngineDevice::get_function(be, &module, "plow_gemma4_12b_gemm_glu_c5_gfx942")?;
@@ -296,6 +412,21 @@ impl Gemma4Glu {
         let fp8_c5_12 = load_fp8("plow_gemma4_12b_gemm_glu_fp8_c5_gfx942")?;
         let fp8_c2_31 = load_fp8("plow_gemma4_31b_gemm_glu_fp8_c2_gfx942")?;
         let fp8_c5_31 = load_fp8("plow_gemma4_31b_gemm_glu_fp8_c5_gfx942")?;
+        let load_down = |name| {
+            need_down
+                .then(|| EngineDevice::get_function(be, &module, name))
+                .transpose()
+        };
+        let down_c2_12 = load_down("plow_gemma4_12b_down_c2_gfx942")?;
+        let down_c5_12 = load_down("plow_gemma4_12b_down_c5_gfx942")?;
+        let down_c6_12 = load_down("plow_gemma4_12b_down_c6_gfx942")?;
+        let down_c2_31 = load_down("plow_gemma4_31b_down_c2_gfx942")?;
+        let down_c5_31 = load_down("plow_gemma4_31b_down_c5_gfx942")?;
+        let down_fp8_c2_12 = load_down("plow_gemma4_12b_down_fp8_c2_gfx942")?;
+        let down_fp8_c5_12 = load_down("plow_gemma4_12b_down_fp8_c5_gfx942")?;
+        let down_fp8_c2_31 = load_down("plow_gemma4_31b_down_fp8_c2_gfx942")?;
+        let down_fp8_c3_31 = load_down("plow_gemma4_31b_down_fp8_c3_gfx942")?;
+        let down_fp8_c5_31 = load_down("plow_gemma4_31b_down_fp8_c5_gfx942")?;
         for (name, kernel, lds) in [
             ("C2", c2, C2_LDS),
             ("12B C5", c5_12, C5_LDS),
@@ -308,6 +439,31 @@ impl Gemma4Glu {
             {
                 return Err(RuntimeError::Device(format!(
                     "Gemma-4 GemmGlu {name} resource ABI mismatch: kernarg={kernarg}, LDS={}, private={}",
+                    HsaBackend::kernel_lds_bytes(&kernel),
+                    kernel.private_segment_size()
+                )));
+            }
+        }
+        for (name, kernel, lds, kernargs) in [
+            ("12B down C2", down_c2_12, C2_LDS, [40, 296]),
+            ("12B down C5", down_c5_12, C5_LDS, [40, 296]),
+            ("12B down C6", down_c6_12, C5_LDS, [40, 296]),
+            ("31B down C2", down_c2_31, C2_LDS, [40, 296]),
+            ("31B down C5", down_c5_31, C5_LDS, [40, 296]),
+            ("12B down FP8 C2", down_fp8_c2_12, 49_152, [56, 312]),
+            ("12B down FP8 C5", down_fp8_c5_12, 57_344, [56, 312]),
+            ("31B down FP8 C2", down_fp8_c2_31, 49_152, [56, 312]),
+            ("31B down FP8 C3", down_fp8_c3_31, 32_768, [56, 312]),
+            ("31B down FP8 C5", down_fp8_c5_31, 57_344, [56, 312]),
+        ] {
+            let Some(kernel) = kernel else { continue };
+            let kernarg = kernel.kernarg_size();
+            if !kernargs.contains(&kernarg)
+                || kernel.private_segment_size() != 0
+                || HsaBackend::kernel_lds_bytes(&kernel) != lds
+            {
+                return Err(RuntimeError::Device(format!(
+                    "Gemma-4 {name} resource ABI mismatch: kernarg={kernarg}, LDS={}, private={}",
                     HsaBackend::kernel_lds_bytes(&kernel),
                     kernel.private_segment_size()
                 )));
@@ -341,6 +497,16 @@ impl Gemma4Glu {
             fp8_c5_12,
             fp8_c2_31,
             fp8_c5_31,
+            down_c2_12,
+            down_c5_12,
+            down_c6_12,
+            down_c2_31,
+            down_c5_31,
+            down_fp8_c2_12,
+            down_fp8_c5_12,
+            down_fp8_c2_31,
+            down_fp8_c3_31,
+            down_fp8_c5_31,
             n_cu,
         }))
     }
@@ -350,9 +516,9 @@ impl Gemma4Glu {
             let at = usize::from(handle) * 8;
             u64::from_le_bytes(tensor_table[at..at + 8].try_into().unwrap())
         };
-        match route.precision {
-            Precision::Bf16 => {
-                let args = Args {
+        match (route.kind, route.precision) {
+            (Kind::Glu, Precision::Bf16) => {
+                let args = GluArgs {
                     out: pointer(route.inst.t[0]),
                     input: pointer(route.inst.t[1]),
                     gate: pointer(route.inst.t[2]),
@@ -364,12 +530,14 @@ impl Gemma4Glu {
                 };
                 let kernel = match (route.model, route.tile) {
                     (Model::Gemma12 | Model::Gemma31, Tile::C2) => self.c2,
+                    (_, Tile::C3) => unreachable!("C3 is only qualified for FP8 down"),
+                    (_, Tile::C6) => unreachable!("C6 is only qualified for BF16 down"),
                     (Model::Gemma12, Tile::C5) => self.c5_12,
                     (Model::Gemma31, Tile::C5) => self.c5_31,
                 };
                 be.launch(kernel, self.n_cu, 512, 0, bytemuck::bytes_of(&args))?;
             }
-            Precision::Fp8 => {
+            (Kind::Glu, Precision::Fp8) => {
                 let args = Fp8Args {
                     out: pointer(route.inst.t[0]),
                     input: pointer(route.inst.t[1]),
@@ -387,10 +555,62 @@ impl Gemma4Glu {
                     (Model::Gemma12, Tile::C2) => self.fp8_c2_12,
                     (Model::Gemma12, Tile::C5) => self.fp8_c5_12,
                     (Model::Gemma31, Tile::C2) => self.fp8_c2_31,
+                    (_, Tile::C3) => unreachable!("C3 is only qualified for FP8 down"),
+                    (_, Tile::C6) => unreachable!("C6 is only qualified for BF16 down"),
                     (Model::Gemma31, Tile::C5) => self.fp8_c5_31,
                 }
                 .ok_or_else(|| {
                     RuntimeError::Device("native Gemma-4 FP8 GLU kernel was not loaded".into())
+                })?;
+                be.launch(kernel, self.n_cu, 512, 0, bytemuck::bytes_of(&args))?;
+            }
+            (Kind::Down, Precision::Bf16) => {
+                let args = LinearArgs {
+                    out: pointer(route.inst.t[0]),
+                    input: pointer(route.inst.t[1]),
+                    weight: pointer(route.inst.t[2]),
+                    rows: route.rows,
+                    n: route.inst.i[1],
+                    k: route.inst.i[2],
+                    reserved: 0,
+                };
+                let kernel = match (route.model, route.tile) {
+                    (Model::Gemma12, Tile::C2) => self.down_c2_12,
+                    (Model::Gemma12, Tile::C5) => self.down_c5_12,
+                    (Model::Gemma12, Tile::C6) => self.down_c6_12,
+                    (Model::Gemma31, Tile::C2) => self.down_c2_31,
+                    (_, Tile::C3) => unreachable!("C3 is only qualified for FP8 down"),
+                    (Model::Gemma31, Tile::C5) => self.down_c5_31,
+                    (Model::Gemma31, Tile::C6) => unreachable!("31B BF16 down uses C5"),
+                }
+                .ok_or_else(|| {
+                    RuntimeError::Device("native Gemma-4 down kernel was not loaded".into())
+                })?;
+                be.launch(kernel, self.n_cu, 512, 0, bytemuck::bytes_of(&args))?;
+            }
+            (Kind::Down, Precision::Fp8) => {
+                let args = Fp8LinearArgs {
+                    out: pointer(route.inst.t[0]),
+                    input: pointer(route.inst.t[1]),
+                    weight: pointer(route.inst.t[2]),
+                    input_scale: pointer(route.inst.t[3]),
+                    weight_scale: pointer(route.inst.t[4]),
+                    rows: route.rows,
+                    n: route.inst.i[1],
+                    k: route.inst.i[2],
+                    reserved: 0,
+                };
+                let kernel = match (route.model, route.tile) {
+                    (Model::Gemma12, Tile::C2) => self.down_fp8_c2_12,
+                    (Model::Gemma12, Tile::C5) => self.down_fp8_c5_12,
+                    (Model::Gemma31, Tile::C2) => self.down_fp8_c2_31,
+                    (Model::Gemma31, Tile::C3) => self.down_fp8_c3_31,
+                    (Model::Gemma31, Tile::C5) => self.down_fp8_c5_31,
+                    (Model::Gemma12, Tile::C3) => unreachable!("12B down uses C2"),
+                    (_, Tile::C6) => unreachable!("C6 is only qualified for BF16 down"),
+                }
+                .ok_or_else(|| {
+                    RuntimeError::Device("native Gemma-4 FP8 down kernel was not loaded".into())
                 })?;
                 be.launch(kernel, self.n_cu, 512, 0, bytemuck::bytes_of(&args))?;
             }
@@ -482,6 +702,55 @@ mod tests {
         (prog, tensors)
     }
 
+    fn down_fixture(rows: u32, n: u32, k: u32, precision: Precision) -> (DevProg, Vec<DevTensor>) {
+        let (mut prog, _) = fixture(rows, n, k);
+        let fp8 = precision == Precision::Fp8;
+        prog.insts[0].op = if fp8 {
+            DevOp::GemmFp8 as u16
+        } else {
+            DevOp::Gemm as u16
+        };
+        prog.insts[0].t = if fp8 {
+            [0, 1, 2, 3, 4, TENSOR_NONE16, TENSOR_NONE16, TENSOR_NONE16]
+        } else {
+            [
+                0,
+                1,
+                2,
+                TENSOR_NONE16,
+                TENSOR_NONE16,
+                TENSOR_NONE16,
+                TENSOR_NONE16,
+                TENSOR_NONE16,
+            ]
+        };
+        let bytes = if fp8 {
+            vec![
+                u64::from(rows) * u64::from(n) * 2,
+                u64::from(rows) * u64::from(k),
+                u64::from(n) * u64::from(k),
+                u64::from(rows) * 4,
+                u64::from(n) * 4,
+            ]
+        } else {
+            vec![
+                u64::from(rows) * u64::from(n) * 2,
+                u64::from(rows) * u64::from(k) * 2,
+                u64::from(n) * u64::from(k) * 2,
+            ]
+        };
+        let tensors = bytes
+            .into_iter()
+            .enumerate()
+            .map(|(i, bytes)| DevTensor {
+                name: i.to_string(),
+                bytes,
+                init: None,
+            })
+            .collect();
+        (prog, tensors)
+    }
+
     #[test]
     fn exact_gemma_shapes_select_qualified_tiles() {
         for (n, k, model) in [
@@ -549,5 +818,39 @@ mod tests {
                 assert!(result.unwrap()[0].is_none(), "case {case}");
             }
         }
+    }
+
+    #[test]
+    fn exact_down_shapes_select_measured_tiles() {
+        for (n, k, model) in [
+            (3_840, 15_360, Model::Gemma12),
+            (5_376, 21_504, Model::Gemma31),
+        ] {
+            for precision in [Precision::Bf16, Precision::Fp8] {
+                for rows in [1024, 2048, 4096, 8192] {
+                    let (prog, tensors) = down_fixture(rows, n, k, precision);
+                    assert!(program_down_candidate(&prog));
+                    assert_eq!(program_fp8_candidate(&prog), precision == Precision::Fp8);
+                    let route = routes(&prog, &tensors, 1).unwrap()[0].unwrap();
+                    assert_eq!(
+                        (route.model, route.kind, route.precision),
+                        (model, Kind::Down, precision)
+                    );
+                    let expected = match (model, precision, rows) {
+                        (Model::Gemma12, Precision::Bf16, 8192) => Tile::C6,
+                        (Model::Gemma12, _, _) => Tile::C2,
+                        (Model::Gemma31, Precision::Bf16, _) => Tile::C5,
+                        (Model::Gemma31, Precision::Fp8, 4096) => Tile::C3,
+                        (Model::Gemma31, Precision::Fp8, 8192) => Tile::C2,
+                        (Model::Gemma31, Precision::Fp8, _) => Tile::C5,
+                    };
+                    assert_eq!(route.tile, expected);
+                }
+            }
+        }
+
+        let (mut prog, tensors) = down_fixture(4096, 3_840, 15_360, Precision::Fp8);
+        prog.insts[0].t[4] = TENSOR_NONE16;
+        assert!(routes(&prog, &tensors, 1).unwrap()[0].is_none());
     }
 }

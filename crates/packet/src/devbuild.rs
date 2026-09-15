@@ -1894,24 +1894,52 @@ impl Builder {
         if self.native_gemma4_glu_segments && l2_place.is_none() {
             for op in &mut self.ops {
                 let inst = &op.inst;
-                let shape = matches!(inst.i[0], 1024 | 2048 | 4096 | 8192)
+                let rows = matches!(inst.i[0], 1024 | 2048 | 4096 | 8192);
+                let glu_shape = rows
                     && matches!((inst.i[1], inst.i[2]), (15_360, 3_840) | (21_504, 5_376));
+                let down_shape = rows
+                    && matches!((inst.i[1], inst.i[2]), (3_840, 15_360) | (5_376, 21_504));
                 let common = inst.i[4] == 0
                     && inst.i[5] == 0
                     && inst.f.iter().all(|value| value.to_bits() == 0)
                     && inst.j == [0; 2];
-                let bf16 = inst.op == DevOp::GemmGlu as u16
+                let bf16_glu = inst.op == DevOp::GemmGlu as u16
                     && inst.i[3] == 0
                     && inst.i[6..] == [0; 2]
                     && inst.t[3..5] == [TENSOR_NONE; 2]
                     && inst.t[6..] == [TENSOR_NONE; 2];
-                let fp8 = inst.op == DevOp::GemmGluFp8 as u16
+                let fp8_glu = inst.op == DevOp::GemmGluFp8 as u16
                     && inst.i[3] == 0
                     && inst.i[6..] == [0; 2]
                     && inst.t[..7].iter().all(|&tensor| tensor != TENSOR_NONE)
                     && inst.t[7] == TENSOR_NONE;
-                let abi = common && (bf16 || fp8);
-                if shape && abi && op.cus.len() == n_cu {
+                let bf16_down = matches!(
+                    DevOp::from_u16(inst.op),
+                    Some(
+                        DevOp::Gemm
+                            | DevOp::GemmMed
+                            | DevOp::GemmSmall
+                            | DevOp::GemmWide
+                            | DevOp::GemmC5
+                    )
+                ) && inst.i[3..] == [0; 5]
+                    && inst.t[..3].iter().all(|&tensor| tensor != TENSOR_NONE)
+                    && inst.t[3..] == [TENSOR_NONE; 5];
+                let fp8_down = matches!(
+                    DevOp::from_u16(inst.op),
+                    Some(
+                        DevOp::GemmFp8
+                            | DevOp::GemmMedFp8
+                            | DevOp::GemmSmallFp8
+                            | DevOp::GemmWideFp8
+                            | DevOp::GemmC5Fp8
+                    )
+                ) && inst.i[3..] == [0; 5]
+                    && inst.t[..5].iter().all(|&tensor| tensor != TENSOR_NONE)
+                    && inst.t[5..] == [TENSOR_NONE; 3];
+                let glu = glu_shape && common && (bf16_glu || fp8_glu);
+                let down = down_shape && (bf16_down || fp8_down);
+                if (glu || down) && op.cus.len() == n_cu {
                     op.isolated = true;
                     native_gemma4_glu = true;
                 }
@@ -5226,7 +5254,7 @@ mod xreduce_wave_rs_segment_tests {
 mod gemma4_glu_segment_tests {
     use super::*;
 
-    fn program(l2: bool, rows: u32, fp8: bool) -> Program {
+    fn program(l2: bool, rows: u32, fp8: bool, down: bool) -> Program {
         let mut b = Builder::new(8);
         b.deny_uniseg();
         b.set_native_gemma4_glu_segments(true);
@@ -5240,15 +5268,29 @@ mod gemma4_glu_segment_tests {
         let all = b.all();
         let before = b.emit(DevOp::Nop, all.clone(), &[], |_| {});
         let glu = b.emit(
-            if fp8 {
-                DevOp::GemmGluFp8
-            } else {
-                DevOp::GemmGlu
+            match (fp8, down) {
+                (true, true) => DevOp::GemmFp8,
+                (true, false) => DevOp::GemmGluFp8,
+                (false, true) => DevOp::Gemm,
+                (false, false) => DevOp::GemmGlu,
             },
             all.clone(),
             &[before],
             |d| {
-                if fp8 {
+                if down && fp8 {
+                    d.t = [0, 1, 2, 3, 4, TENSOR_NONE, TENSOR_NONE, TENSOR_NONE];
+                } else if down {
+                    d.t = [
+                        0,
+                        1,
+                        2,
+                        TENSOR_NONE,
+                        TENSOR_NONE,
+                        TENSOR_NONE,
+                        TENSOR_NONE,
+                        TENSOR_NONE,
+                    ];
+                } else if fp8 {
                     d.t = [0, 1, 2, 3, 4, 5, 6, TENSOR_NONE];
                 } else {
                     d.t = [
@@ -5262,7 +5304,11 @@ mod gemma4_glu_segment_tests {
                         TENSOR_NONE,
                     ];
                 }
-                d.i = [rows, 15_360, 3_840, 0, 0, 0, 0, 0];
+                d.i = if down {
+                    [rows, 3_840, 15_360, 0, 0, 0, 0, 0]
+                } else {
+                    [rows, 15_360, 3_840, 0, 0, 0, 0, 0]
+                };
             },
         );
         b.emit(DevOp::Nop, all, &[glu], |_| {});
@@ -5271,26 +5317,30 @@ mod gemma4_glu_segment_tests {
 
     #[test]
     fn exact_gfx942_glu_is_a_counter_free_raw_segment() {
-        for fp8 in [false, true] {
-            for rows in [1024, 2048, 4096, 8192] {
-                let p = program(false, rows, fp8);
-                let segment = p.stream.iter().find(|e| e.inst == 1).unwrap().seg;
-                assert!(p
-                    .stream
-                    .iter()
-                    .filter(|e| e.seg == segment)
-                    .all(|e| e.inst == 1 && e.wait_len == 0 && e.succ_len == 0));
-                assert!(p.insts.iter().all(|d| d.wait_len == 0 && d.succ_len == 0));
+        for down in [false, true] {
+            for fp8 in [false, true] {
+                for rows in [1024, 2048, 4096, 8192] {
+                    let p = program(false, rows, fp8, down);
+                    let segment = p.stream.iter().find(|e| e.inst == 1).unwrap().seg;
+                    assert!(p
+                        .stream
+                        .iter()
+                        .filter(|e| e.seg == segment)
+                        .all(|e| e.inst == 1 && e.wait_len == 0 && e.succ_len == 0));
+                    assert!(p.insts.iter().all(|d| d.wait_len == 0 && d.succ_len == 0));
+                }
             }
         }
     }
 
     #[test]
     fn l2_placement_keeps_the_interpreter_counter_protocol() {
-        for fp8 in [false, true] {
-            let p = program(true, 1024, fp8);
-            assert_ne!(p.insts[1].wait_len, 0);
-            assert_ne!(p.insts[1].succ_len, 0);
+        for down in [false, true] {
+            for fp8 in [false, true] {
+                let p = program(true, 1024, fp8, down);
+                assert_ne!(p.insts[1].wait_len, 0);
+                assert_ne!(p.insts[1].succ_len, 0);
+            }
         }
     }
 }
